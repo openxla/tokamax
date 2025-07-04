@@ -1,0 +1,150 @@
+# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Dot product attention API."""
+
+from collections.abc import Callable, Sequence
+from typing import Any, Final, Literal, TypeAlias
+
+import immutabledict
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import quantization
+from tokamax._src.ops.attention import base
+from tokamax._src.ops.attention import jax_nn
+from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention
+from tokamax._src.ops.attention import pallas_triton_flash_attention
+from tokamax._src.ops.attention import xla_chunked
+
+
+QuantizedArray = quantization.QuantizedArray
+Implementation: TypeAlias = Literal[
+    "mosaic", "triton", "cudnn", "xla", "xla_chunked"
+]
+
+# TODO(sbodenstein): Should this be larger on TPU?
+_XLA_CHUNK_SIZE: Final[int] = 128
+
+IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
+    immutabledict.immutabledict(
+        mosaic=pallas_mosaic_gpu_flash_attention.PallasMosaicGpuFlashAttention(
+            vjp=base.DotProductAttentionVjp()  # TODO(cjfj): Use Triton VJP?
+        ),
+        triton=pallas_triton_flash_attention.PallasTritonFlashAttention(),
+        cudnn=jax_nn.JaxNnDotProductAttention(implementation="cudnn"),
+        xla=base.DotProductAttention(),
+        xla_chunked=xla_chunked.XlaChunkedDotProductAttention(
+            chunk_size=_XLA_CHUNK_SIZE
+        ),
+    )
+)
+
+# TODO(sbodenstein): Should xla_chunked be used instead of xla for very big
+# sequences lengths? Eg. where xla OOMs.
+_DEFAULT_IMPLEMENTATION = ("mosaic", "triton", "xla")
+
+
+def dot_product_attention(
+    query: Float[Array | QuantizedArray, "*B T N H"],
+    key: Float[Array | QuantizedArray, "*B S K H"],
+    value: Float[Array | QuantizedArray, "*B S K h"],
+    bias: Float[Array, "*#B #N #T #S"] | None = None,
+    mask: Bool[Array, "*#B #N #T #S"] | None = None,
+    *,
+    scale: float | None = None,
+    is_causal: bool = False,
+    query_seq_lengths: Int[Array, "*#B"] | None = None,
+    key_value_seq_lengths: Int[Array, "*#B"] | None = None,
+    local_window_size: int | tuple[int, int] | None = None,
+    implementation: Implementation | Sequence[Implementation] | None = None,
+) -> Float[Array, "*B T N h"]:  # pylint: disable=g-doc-args
+  """Scaled dot product attention function.
+
+  See `jax.nn.dot_product_attention` for more details.
+
+  The `jax.nn.dot_product_attention` API is extended here as follows:
+    - Support for additional batch dimensions.
+    - Support for quantized `query`, `key`, and `value` arrays.
+    - Support for different output head dimension (`h`).
+
+  Memory usage: for `implementation='xla'`, memory usage scales
+  quadratically in sequence length, whilst scaling linearly
+  for all other implementations. `implementation='xla_chunked'` is taken from
+  https://arxiv.org/abs/2112.05682, and has similar memory usage to
+  `implementation='triton'` and `implementation='mosaic'`, but will typically
+  be slower than `implementation='xla'`.
+
+  Args:
+    implementation: The implementation to use. By default, `None` is used, which
+      will automatically select the best available backend, and is guaranteed to
+      work on all platforms. If a sequence is passed, the first implementation
+      that doesn't raise a `NotImplementedError` is used.
+
+  Returns:
+    An array of the attention output.
+  """
+  if implementation is None:
+    implementation = _DEFAULT_IMPLEMENTATION
+
+  if not isinstance(implementation, (tuple, list)):
+    implementation = (implementation,)
+  elif not implementation:
+    raise ValueError("`implementation` must not be an empty sequence.")
+
+  if scale is None:
+    scale = base.AUTO
+
+  if query_seq_lengths is not None:
+    query_seq_lengths = query_seq_lengths[:, None, None]
+  if key_value_seq_lengths is not None:
+    key_value_seq_lengths = key_value_seq_lengths[:, None, None]
+
+  mask = base.Mask(
+      mask,
+      is_causal=is_causal,
+      q_end=query_seq_lengths,
+      k_end=key_value_seq_lengths,
+  )
+
+  if isinstance(local_window_size, int):
+    local_window_size = (local_window_size, local_window_size)
+
+  if local_window_size is not None:
+    k_indices = jnp.arange(key.shape[-3])
+    before, after = local_window_size
+    mask &= base.Mask(k_start=k_indices - before, k_end=k_indices + (after + 1))
+
+  errors = []
+  for impl in implementation:
+    if isinstance(impl, str):
+      if impl not in IMPLEMENTATIONS:
+        raise ValueError(f"Unknown implementation: {impl}")
+      impl = IMPLEMENTATIONS[impl]
+
+    try:
+      return impl(
+          query,
+          key,
+          value,
+          bias=bias,
+          mask=mask,
+          logits_scale=scale,
+      )
+    except NotImplementedError as e:
+      if len(implementation) == 1:
+        raise
+      errors.append(e)
+
+  raise ExceptionGroup("all implementations failed", errors)

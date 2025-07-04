@@ -1,0 +1,205 @@
+# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Utilities for numerics."""
+
+from collections.abc import Callable, Sequence
+import dataclasses
+import functools
+from typing import Any, TypeAlias
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+PyTree: TypeAlias = Any
+
+
+@dataclasses.dataclass(frozen=True)
+class NumericSummary:
+  """Summary properties of an array."""
+
+  has_inf: bool
+  has_nan: bool
+  min: float
+  max: float
+  mean: float
+  mean_abs: float
+
+
+@dataclasses.dataclass(frozen=True)
+class DiffSummary:
+  """Summary of the difference of two arrays."""
+
+  max_absolute_diff_values: tuple[float, float]
+  percent_close: float
+  allclose: bool
+
+  @property
+  def max_absolute_diff(self) -> float:
+    a, b = self.max_absolute_diff_values
+    return abs(a - b)
+
+
+# Defaults taken from:
+# https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.isclose.html
+def array_diff_summary(
+    expected: jax.Array | np.ndarray,
+    actual: jax.Array | np.ndarray,
+    rtol: float = 1e-05,
+    atol: float = 1e-08,
+    equal_nan: bool = False,
+) -> DiffSummary:
+  """Produce a summary of the numerics of two arrays."""
+
+  if expected.shape != actual.shape:
+    raise ValueError('Arrays x and y must have the same shape.')
+  if expected.dtype.name != actual.dtype.name:
+    raise ValueError('Arrays x and y must have the same dtype.')
+
+  # Calculate statistics with increased precision.
+  expected = np.array(expected).astype(np.float64)
+  actual = np.array(actual).astype(np.float64)
+
+  abs_diff = np.abs(expected - actual)
+  # It's useful logging out the values that caused the max absolute
+  # difference.
+  max_diff_index = np.nanargmax(abs_diff) if equal_nan else np.argmax(abs_diff)
+
+  expected_max_val = float(np.ravel(expected)[max_diff_index])
+  actual_max_val = float(np.ravel(actual)[max_diff_index])
+
+  # Note: this is not symmetric: "For finite values, isclose uses the following
+  # equation to test whether two floating point values are equivalent:
+  # absolute(a - b) <= (atol + rtol * absolute(b)). Unlike the built-in
+  # math.isclose, the above equation is not symmetric in a and b – it assumes
+  # b is the reference value."
+  # https://numpy.org/doc/stable/reference/generated/numpy.isclose.html#numpy.isclose
+  # As allclose calls isclose, the order matters.
+  num_close = np.sum(
+      np.isclose(
+          actual,
+          expected,
+          rtol=rtol,
+          atol=atol,
+          equal_nan=equal_nan,
+      )
+  )
+  percent_close = num_close / actual.size
+
+  return DiffSummary(
+      max_absolute_diff_values=(expected_max_val, actual_max_val),
+      percent_close=percent_close,
+      allclose=num_close == actual.size,
+  )
+
+
+def array_numeric_summary(x: jax.Array) -> NumericSummary:
+  """Produce a numerical summary of an array."""
+  # Convert to numpy fp64 array to avoid issues with XLA:GPU numerics.
+  x = np.array(x).astype(np.float64)
+  return NumericSummary(
+      has_inf=np.isinf(x).any(),
+      has_nan=np.isnan(x).any(),
+      min=np.nanmin(x),
+      max=np.nanmax(x),
+      mean=np.nanmean(x),
+      mean_abs=np.nanmean(np.abs(x)),
+  )
+
+
+RngKey: TypeAlias = jax.Array
+Shape: TypeAlias = Sequence[int]
+
+
+@functools.partial(
+    jax.tree_util.register_dataclass,
+    data_fields=('value',),
+    meta_fields=('initializer',),
+)
+@dataclasses.dataclass(frozen=True)
+class InitializableArray:
+  """An array with an initializer.
+
+  The initializer is serialized with the op, allowing data-dependent ops to be
+  benchmarked / autotuned with representative data.
+  """
+
+  value: jax.Array
+  initializer: Callable[[RngKey, Shape, jax.typing.DTypeLike], jax.Array]
+
+
+def const_initializer(values, key, shape, dtype):
+  del key  # Unused.
+  values = jnp.array(values, dtype=dtype)
+  assert values.shape == shape
+  return values
+
+
+def _int_initializer(key, shape, dtype):
+  """Default int initializer for `random_initialize`."""
+  dtype = jnp.dtype(dtype)
+  # TODO(sbodenstein): Choose this value in a more principled way.
+  maxval = min(jnp.iinfo(dtype).max + 1, 128)
+  minval = max(jnp.iinfo(dtype).min, -maxval)
+  # `jax.random.randint` doesn't currently support int4.
+  # TODO(cjfj): Remove this when int4 is supported.
+  dtype_ = jnp.int8 if dtype.name in ('int4', 'uint4') else dtype
+  return jax.random.randint(
+      key, shape=shape, minval=minval, maxval=maxval, dtype=dtype_
+  ).astype(dtype)
+
+
+def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
+  """Randomly-initialize `ShapeDtypeStruct` objects.
+
+  Arguments:
+    x: a PyTree.
+    seed: the random seed to initialize the arrays.
+
+  Returns:
+    A new PyTree with each `ShapeDtypeStruct` object replaced by a randomly
+    initialized jax.Array.
+  """
+
+  key = jax.random.PRNGKey(seed)
+
+  def init_with_layout(x):
+    if isinstance(x, InitializableArray):
+      if not isinstance(x.value, jax.ShapeDtypeStruct):
+        return x.value
+      x, init = x.value, x.initializer
+    elif isinstance(x, jax.ShapeDtypeStruct):
+      dtype = jnp.dtype(x.dtype)
+
+      if 'float' in dtype.name:
+        init = jax.random.normal
+      elif dtype.name == 'bool':
+        init = lambda key, shape, _: jax.random.bernoulli(key, shape=shape)
+      elif 'int' in dtype.name:
+        init = _int_initializer
+      else:
+        raise NotImplementedError(f'dtype {dtype.name} not supported.')
+    else:
+      return x
+
+    if x.sharding is not None:
+      init = jax.jit(init, static_argnums=(1, 2), out_shardings=x.format)
+
+    nonlocal key
+    curr_key, key = jax.random.split(key)
+    return init(curr_key, x.shape, x.dtype)
+
+  is_leaf = lambda x: isinstance(x, InitializableArray)
+  return jax.tree.map(init_with_layout, x, is_leaf=is_leaf)

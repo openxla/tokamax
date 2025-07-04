@@ -1,0 +1,223 @@
+# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""XLA implementation of chunked scaled dot-product attention (https://arxiv.org/abs/2112.05682).
+
+It allows XLA Attention to use memory linearly wrt the sequence length, plus it
+gives more similar numerics to FlashAttention.
+"""
+
+import dataclasses
+import functools
+
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import jaxtyping
+from tokamax._src.ops import op
+from tokamax._src.ops.attention import base
+
+
+Mask = base.Mask
+QuantizedArray = base.QuantizedArray
+
+
+@jaxtyping.jaxtyped
+def _attend_chunk(
+    q: Float[Array, "*B T H D"],
+    k: Float[Array, "*B t #H D"],
+    v: Float[Array, "*B t #H d"],
+    accum: Float[Array, "*B T H d"],
+    x_max: Float[Array, "*B H T"],
+    denom: Float[Array, "*B H T"],
+    *,
+    precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+    logits_dtype: jnp.dtype,
+    logits_scale: float,
+    bias: Float[Array, "*#B #H #T #t"] | None,
+    logits_soft_cap: float | None,
+    mask: Bool[Array, "*#B #H #T #t"] | None,
+    dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
+    dropout_rate: float,
+) -> tuple[
+    Float[Array, "*B T H d"], Float[Array, "*B H T"], Float[Array, "*B H T"]
+]:
+  """Computes a chunk of attention."""
+  q_k_dot_precision, weights_v_dot_precision = precision
+  # TODO(cjfj): Can we be more efficient for multi-query attention?
+  logits = jnp.einsum(
+      "...qhd,...khd->...hqk",
+      q,
+      k,
+      precision=q_k_dot_precision,
+      preferred_element_type=q_k_dot_precision.accumulation_type,
+  ).astype(logits_dtype)
+
+  logits *= logits_scale
+
+  if bias is not None:
+    logits += bias
+
+  if logits_soft_cap is not None:
+    logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
+
+  if mask is not None:
+    mask_value = float(jnp.finfo(logits.dtype).min)
+    logits = jnp.where(jnp.asarray(mask), logits, mask_value)
+
+  loc_x_max = jnp.max(logits, axis=-1)
+  new_x_max = jnp.maximum(x_max, loc_x_max)
+  weights = jnp.exp(logits - new_x_max[..., None])
+  alpha = jnp.exp(x_max - new_x_max)
+
+  x_max = new_x_max
+  accum *= alpha.swapaxes(-1, -2)[..., None]
+  denom = (denom * alpha) + weights.sum(axis=-1)
+
+  if dropout_mask is not None:
+    weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
+
+  weights = weights.astype(v.dtype)
+  accum += jnp.einsum(
+      "...hqk,...khd->...qhd",
+      weights,
+      v,
+      precision=weights_v_dot_precision,
+      preferred_element_type=weights_v_dot_precision.accumulation_type,
+  )
+  return accum, x_max, denom
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class XlaChunkedDotProductAttention(
+    base.DotProductAttention[op.NullConfig, None]
+):
+  """XLA chunked dot product attention function."""
+
+  chunk_size: int
+
+  @jaxtyping.jaxtyped
+  def _fwd(
+      self,
+      q: Float[Array | QuantizedArray, "*B T H D"],
+      k: Float[Array | QuantizedArray, "*B t h D"],
+      v: Float[Array | QuantizedArray, "*B t h d"],
+      *,
+      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      logits_dtype: jnp.dtype,
+      logits_scale: float,
+      bias: Float[Array, "*#B #H #T #t"] | None,
+      logits_soft_cap: float | None,
+      mask: Mask,
+      dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
+      dropout_rate: float,
+      q_indices: Int[Array, "*#B #H T"] | None,
+      k_indices: Int[Array, "*#B #H t"] | None,
+      normalize_output: bool,
+      return_residuals: bool,
+      config: op.NullConfig,
+  ) -> tuple[Float[Array, "*B T H d"], None]:
+    if return_residuals:
+      raise NotImplementedError("`return_residuals=True` not supported.")
+
+    q, k, v = map(base.as_array, (q, k, v))
+    if k.shape[-2] not in (1, q.shape[-2]):
+      repeats = q.shape[-2] // k.shape[-2]
+      k = jnp.repeat(k, repeats, axis=-2)
+      v = jnp.repeat(v, repeats, axis=-2)
+
+    *b, seq_q, h, _ = q.shape
+    *_, seq_k, _, d_out = v.shape
+
+    q_len_or_indices = seq_q if q_indices is None else q_indices
+    k_len_or_indices = seq_k if k_indices is None else k_indices
+    mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+
+    def get_chunk(x, idx, size, axis):
+      if x is None:
+        return None
+      if x.shape[axis] == 1:
+        return x
+      return jax.lax.dynamic_slice_in_dim(x, idx, size, axis)
+
+    def q_loop_fn(q_chunk_idx, _, *, q_chunk_size):
+      def get_q_chunk(x, axis):
+        return get_chunk(x, q_chunk_idx, q_chunk_size, axis)
+
+      q_chunk = get_q_chunk(q, -3)
+      bias_chunk = get_q_chunk(bias, -2)
+      mask_chunk = get_q_chunk(mask, -2)
+      dropout_mask_chunk = get_q_chunk(dropout_mask, -2)
+
+      intermediates_shape = (*b, h, q_chunk.shape[-3])
+      acc = jnp.zeros(q_chunk.shape[:-1] + (d_out,), jnp.float32)
+      x_max = jnp.full(intermediates_shape, float("-inf"))
+      denom = jnp.zeros(intermediates_shape, jnp.float32)
+
+      def kv_loop_fn(_, carry, *, kv_chunk_size):
+        kv_chunk_idx, accum, x_max, denom = carry
+
+        def get_kv_chunk(x, axis):
+          return get_chunk(x, kv_chunk_idx, kv_chunk_size, axis)
+
+        out = _attend_chunk(
+            q_chunk,
+            get_kv_chunk(k, -3),
+            get_kv_chunk(v, -3),
+            accum,
+            x_max,
+            denom,
+            bias=get_kv_chunk(bias_chunk, -1),
+            mask=get_kv_chunk(mask_chunk, -1),
+            dropout_mask=get_kv_chunk(dropout_mask_chunk, -1),
+            precision=precision,
+            logits_dtype=logits_dtype,
+            logits_scale=logits_scale,
+            logits_soft_cap=logits_soft_cap,
+            dropout_rate=dropout_rate,
+        )
+        return kv_chunk_idx + kv_chunk_size, *out
+
+      even_chunks = seq_k // self.chunk_size
+      carry = (0, acc, x_max, denom)
+
+      # Main kv loop
+      if seq_k >= self.chunk_size:
+        loop_fn = functools.partial(kv_loop_fn, kv_chunk_size=self.chunk_size)
+        carry = jax.lax.fori_loop(0, even_chunks, loop_fn, carry)
+
+      # Remainder kv loop
+      if (k_remainder := (seq_k % self.chunk_size)) != 0:
+        carry = kv_loop_fn(even_chunks + 1, carry, kv_chunk_size=k_remainder)
+
+      # Final normalization by the denominator.
+      _, acc, _, denom = carry
+      out = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
+      return q_chunk_idx + q_chunk_size, out.astype(q.dtype)
+
+    q_chunk_idx, out = 0, None
+
+    # Main q loop
+    if seq_q >= self.chunk_size:
+      loop_fn = functools.partial(q_loop_fn, q_chunk_size=self.chunk_size)
+      length = seq_q // self.chunk_size
+      q_chunk_idx, out = jax.lax.scan(loop_fn, init=0, length=length)
+      out = out[..., None, :, :, :].swapaxes(0, -4).reshape((*b, -1, h, d_out))
+
+    # Remainder q loop
+    if (q_remainder := (seq_q % self.chunk_size)) != 0:
+      _, rem_out = q_loop_fn(q_chunk_idx, None, q_chunk_size=q_remainder)
+      out = rem_out if out is None else jnp.concatenate([out, rem_out], axis=-3)
+
+    return out, None

@@ -1,0 +1,64 @@
+# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Benchmarks for attention implementations."""
+
+import functools
+
+from absl import app
+from absl import flags
+import google_benchmark
+from tokamax._src import benchmarking
+from tokamax._src.ops.attention import base
+from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as pallas_mgpu_flash_attention
+from tokamax._src.ops.attention import pallas_triton_flash_attention as pallas_attn
+from tokamax._src.ops.attention import bench_arg_specs
+
+
+_IMPLS = dict(
+    triton=pallas_attn.PallasTritonFlashAttention(),
+    xla=base.DotProductAttention(),
+)
+
+_BENCHMARK_IMPLS_FWD = flags.DEFINE_list(
+    'benchmark_impls_fwd',
+    ','.join(_IMPLS),
+    'List of implementations to benchmark forward only.',
+)
+_BENCHMARK_IMPLS_FWD_BWD = flags.DEFINE_list(
+    'benchmark_impls_fwd_bwd',
+    'triton,xla',
+    'List of implementations to benchmark forward and backward.',
+)
+_register_benchmark = functools.partial(
+    benchmarking.get_benchmark_registrar(_IMPLS),
+    iterations=10,
+    raise_on_error=False,
+)
+
+
+def _register_benchmarks():
+  """Registers benchmarks."""
+  for name, kwargs in bench_arg_specs.ARG_SPECS.items():
+    for impl_name in _BENCHMARK_IMPLS_FWD.value:
+      _register_benchmark(name, impl_name, kwargs)
+
+  for name, kwargs in bench_arg_specs.ARG_SPECS.items():
+    for impl_name in _BENCHMARK_IMPLS_FWD_BWD.value:
+      _register_benchmark(name, impl_name, kwargs, mode='forward_and_vjp')
+
+
+if __name__ == '__main__':
+  app.call_after_init(_register_benchmarks)
+  google_benchmark.main()
