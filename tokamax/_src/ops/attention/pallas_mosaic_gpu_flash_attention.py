@@ -322,8 +322,9 @@ def _fwd(
         l_i *= alpha
         p_ = p.astype(q.dtype)
 
+        plgpu.barrier_arrive(schedule_barrier)
         plgpu.barrier_wait(v_barriers.at[slot])
-        perform_schedule_barrier()
+        plgpu.barrier_wait(schedule_barrier)
 
         l_i += p.sum(axis=1)
 
