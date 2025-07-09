@@ -140,7 +140,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       else:
         bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
         bkwargs["return_residuals"] = return_res
-        arguments = ba.signature.bind(*bargs, **bkwargs).arguments
+        arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
       ba = BoundArguments(self, arguments)
 
       args, kwargs = jax.tree.map(
@@ -205,7 +205,8 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       self, *args: _P.args, return_residuals: bool = False, **kwargs: _P.kwargs
   ) -> "BoundArguments":
     """Binds the op to the given arguments."""
-    ba = self.signature.bind(*args, return_residuals=return_residuals, **kwargs)
+    sig = self._fwd_signature
+    ba = sig.bind(*args, return_residuals=return_residuals, **kwargs)
     ba.apply_defaults()
     return BoundArguments(self, ba.arguments)
 
@@ -268,6 +269,14 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
   @property
   def signature(self) -> inspect.Signature:
     """Infers signature of the op."""
+    # Use `bind` if available (to get default values), otherwise use `_fwd` and
+    # infer the signature.
+    if self.bind.__func__ is not Op.bind:
+      return inspect.signature(self.bind)
+    return self._fwd_signature
+
+  @property
+  def _fwd_signature(self) -> inspect.Signature:
     sig = inspect.signature(self._fwd)
     params = sig.parameters.copy()
     del params["config"]
@@ -298,7 +307,7 @@ class BoundArguments(Generic[_Config, _Key]):
 
   @property
   def signature(self) -> inspect.Signature:
-    return self.op.signature
+    return self.op._fwd_signature  # pylint: disable=protected-access
 
   @property
   def args(self) -> tuple[Any, ...]:
@@ -311,12 +320,12 @@ class BoundArguments(Generic[_Config, _Key]):
   @property
   def _bound_args(self) -> inspect.BoundArguments:
     arguments = jax.tree.map(_as_unbatched, self.arguments)
-    return inspect.BoundArguments(self.op.signature, arguments)
+    return inspect.BoundArguments(self.signature, arguments)
 
   @property
   def batched(self) -> batching.Batched[inspect.BoundArguments]:
     arguments = jax.tree.map(_as_batched, self.arguments)
-    ba = inspect.BoundArguments(self.op.signature, arguments)
+    ba = inspect.BoundArguments(self.signature, arguments)
     return batching.Batched(ba)
 
   @property
