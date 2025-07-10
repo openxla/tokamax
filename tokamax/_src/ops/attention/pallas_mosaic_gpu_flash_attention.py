@@ -250,11 +250,12 @@ def _fwd(
         def compute_qk(acc_ref):
           k_smem_T = plgpu.transpose_ref(k_smem.at[slot], (1, 0))  # pylint: disable=invalid-name
           plgpu.wgmma(acc_ref, q_smem, k_smem_T)
-          perform_schedule_barrier()
+          plgpu.barrier_arrive(schedule_barrier)
           return acc_ref[...]
 
         s = pl.run_scoped(compute_qk, plgpu.ACC(block_q_kv, jnp.float32))
         plgpu.barrier_arrive(k_consumed_barriers.at[slot])
+        plgpu.barrier_wait(schedule_barrier)
         s *= logits_scale
 
         if bias_ref is not None:
