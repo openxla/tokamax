@@ -223,7 +223,6 @@ def _fwd(
       q_slice = pl.ds(q_seq_off + wg_idx * block_q, block_q)
       q_barrier = q_barriers.at[wg_idx]
       plgpu.copy_gmem_to_smem(q_ref.at[q_slice, q_head], q_smem, q_barrier)
-      plgpu.barrier_wait(q_barrier)
 
       l_i = plgpu.layout_cast(jnp.zeros((block_q,), jnp.float32), L.WGMMA_ROW)
       m_i = plgpu.layout_cast(jnp.full_like(l_i, -jnp.inf), L.WGMMA_ROW)
@@ -239,6 +238,7 @@ def _fwd(
       k_start = load_k_range(k_start_ref)
       k_end = load_k_range(k_end_ref)
 
+      plgpu.barrier_wait(q_barrier)
       first_tma_slot = lax.rem(min_kv_step, stages)
       plgpu.barrier_wait(k_barriers.at[first_tma_slot])
       pl.when(wg_idx == 1)(perform_schedule_barrier)
