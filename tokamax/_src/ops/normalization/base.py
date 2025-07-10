@@ -14,17 +14,20 @@
 # ==============================================================================
 """Normalization op."""
 
+from collections.abc import Callable
 import types
-from typing import Any, TypeVar, cast
+from typing import Any, TypeAlias, TypeVar
 
 import jax
+from jax.experimental.pallas import fuser
 import jax.numpy as jnp
 from tokamax._src.ops import op
 
 
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
-Residuals = tuple[jax.Array | None, jax.Array]  # mean, rstddev
+FusedInputArray: TypeAlias = fuser.Fusion[[], jax.Array]  # pytype: disable=invalid-annotation
+Residuals: TypeAlias = tuple[jax.Array | None, jax.Array]  # mean, rstddev
 
 
 class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
@@ -32,7 +35,7 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 
   def bind(
       self,
-      x: jax.Array,
+      x: jax.Array | Callable[[], jax.Array],
       scale: jax.Array | None,
       offset: jax.Array | None,
       *,
@@ -41,7 +44,6 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       scale_offset: float = 0.0,
       subtract_mean: bool = True,
       return_residuals: bool = False,
-      **kwargs,
   ) -> op.BoundArguments:
     """Binds normalization op to the given arguments.
 
@@ -62,13 +64,12 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       subtract_mean: If `True`, use standard variance calculation. If `False`,
         assume mean is zero (i.e. RMS norm).
       return_residuals: If `True`, return the residuals.
-      **kwargs: Implementation-specific keyword arguments.
 
     Returns:
       The bound arguments.
     """
-    params = locals()
-    params |= cast(dict[str, Any], params.pop("kwargs"))
+    if callable(x) and not isinstance(x, fuser.Fusion):
+      x = fuser.Fusion(x, ((), {}), jax.eval_shape(x))
 
     if scale is not None:
       (scale_dim,) = scale.shape
@@ -83,11 +84,20 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
             "`offset` must have the same length as `x` along `axis`."
         )
 
-    return op.Op.bind(**params)
+    return super().bind(
+        x=x,
+        scale=scale,
+        offset=offset,
+        axis=axis,
+        epsilon=epsilon,
+        scale_offset=scale_offset,
+        subtract_mean=subtract_mean,
+        return_residuals=return_residuals,
+    )
 
   def _fwd(
       self,
-      x: jax.Array,
+      x: jax.Array | FusedInputArray,
       scale: jax.Array | None,
       offset: jax.Array | None,
       *,
@@ -98,6 +108,8 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       return_residuals: bool,
       config: _Config,
   ) -> tuple[jax.Array, Residuals | None]:
+    if callable(x):
+      x = x()
     axis = axis if axis >= 0 else (x.ndim + axis)
     # Always calculate in at least `float32` precision.
     y = x.astype(jnp.promote_types(x.dtype, jnp.float32))

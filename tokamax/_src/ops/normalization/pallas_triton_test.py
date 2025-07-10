@@ -42,11 +42,9 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
 
     y_expected = jax.nn.standardize(x * pre_scale, epsilon=epsilon) * scale
     y_expected += offset
-
     y_actual = self._norm_fn(
-        x, scale, offset, epsilon=epsilon, pre_scale=pre_scale
+        lambda: x * pre_scale, scale, offset, epsilon=epsilon
     )
-
     chex.assert_trees_all_close(y_actual, y_expected, atol=1e-6)
 
   @parameterized.parameters(
