@@ -349,25 +349,17 @@ def _fwd(
       if kv_seq_len % block_kv:
         raise ValueError(f"{kv_seq_len=} must be a multiple of {block_kv=}")
 
-      acc, m_i, l_i = lax.fori_loop(
-          min_kv_step,
-          max_kv_step - 2 * is_causal,
-          kv_loop,
-          (acc, m_i, l_i),
-      )
-      if is_causal:
+      # If `is_causal`, the last iteration is split out, with masking enabled.
+      hi = max_kv_step - (2 - wg_idx) * is_causal
+      acc, m_i, l_i = lax.fori_loop(min_kv_step, hi, kv_loop, (acc, m_i, l_i))
 
-        def wg0_kv_epilogue():
-          carry = kv_loop(max_kv_step - 2, (acc, m_i, l_i), do_causal=True)
+      if is_causal:
+        acc, m_i, l_i = kv_loop(hi, (acc, m_i, l_i), do_causal=True)
+
+        @pl.when(wg_idx == 0)
+        def wg0_kv_epilogue():  # pylint: disable=unused-variable
           perform_schedule_barrier()  # Allow wg1 to progress.
           perform_schedule_barrier()
-          return carry
-
-        def wg1_kv_epilogue():
-          carry = kv_loop(max_kv_step - 2, (acc, m_i, l_i), do_causal=False)
-          return kv_loop(max_kv_step - 1, carry, do_causal=True)
-
-        acc, m_i, l_i = lax.cond(wg_idx == 0, wg0_kv_epilogue, wg1_kv_epilogue)
 
       pl.when(wg_idx == 0)(perform_schedule_barrier)
 
