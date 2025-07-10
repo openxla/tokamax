@@ -321,11 +321,18 @@ def _fwd(
         l_i *= alpha
         p_ = p.astype(q.dtype)
 
+        # Can't fully explain why, but empirically the ordering here influences
+        # the performance of the final kernel quite significantly.
+        if p_sum_before_barriers := (head_dim <= 128):
+          l_i += p.sum(axis=1)
+          acc, l_i, m_i, p_ = lax.optimization_barrier((acc, l_i, m_i, p_))
+
         plgpu.barrier_arrive(schedule_barrier)
         plgpu.barrier_wait(v_barriers.at[slot])
         plgpu.barrier_wait(schedule_barrier)
 
-        l_i += p.sum(axis=1)
+        if not p_sum_before_barriers:
+          l_i += p.sum(axis=1)
 
         def compute_pv(acc_ref):
           plgpu.wgmma(acc_ref, p_, v_smem.at[slot])
