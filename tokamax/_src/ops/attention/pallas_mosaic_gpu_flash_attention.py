@@ -247,69 +247,69 @@ def _fwd(
         acc, m_i, l_i = carry
         slot = lax.rem(kv_step, stages)
 
-        def compute_scores(s_ref):
+        def compute_qk(acc_ref):
           k_smem_T = plgpu.transpose_ref(k_smem.at[slot], (1, 0))  # pylint: disable=invalid-name
-          plgpu.wgmma(s_ref, q_smem, k_smem_T)
+          plgpu.wgmma(acc_ref, q_smem, k_smem_T)
           perform_schedule_barrier()
-          s = s_ref[...] * logits_scale
+          return acc_ref[...]
 
-          if bias_ref is not None:
-            bias_barrier_idx = bias_mask_barriers_idx + slot
-            plgpu.barrier_wait(bias_barriers.at[bias_barrier_idx])
-            bias = bias_smem.at[wg_idx, slot][...]
-            plgpu.barrier_arrive(bias_consumed_barriers.at[bias_barrier_idx])
-            s += bias.astype(s.dtype)
-
-          if logits_soft_cap is not None:
-            s = logits_soft_cap * jnp.tanh(s / logits_soft_cap)
-
-          if use_base2:
-            s *= math.log2(math.e)
-
-          if do_causal or use_k_ranges or mask_ref is not None:
-            if s.shape[0] != s.shape[1]:
-              raise NotImplementedError("Masking only supports square blocks.")
-
-            iota = lambda d: plgpu.broadcasted_iota(
-                jnp.int32, s.shape, dimension=d, layout=L.WGMMA
-            )
-            # TODO(cjfj): Calculate mask as boolean array?
-            mask = jnp.zeros_like(s)
-            f32_min = jnp.full_like(mask, float(jnp.finfo(jnp.float32).min))
-            mask_fn = lambda cond, mask: jnp.where(cond, mask, f32_min)
-            bcast = lambda x, d=0: lax.broadcast_in_dim(x, s.shape, (d,))
-
-            if do_causal:
-              mask = mask_fn(iota(0) >= iota(1), mask)
-            if use_k_ranges:
-              block_kv_iota = iota(1) + (kv_step * block_kv)
-
-              if k_start_ref is not None:
-                assert isinstance(k_start, jax.Array)
-                mask = mask_fn(bcast(k_start) <= block_kv_iota, mask)
-              if k_end_ref is not None:
-                assert isinstance(k_end, jax.Array)
-                mask = mask_fn(bcast(k_end) > block_kv_iota, mask)
-            if mask_ref is not None:
-              if bcast_mask_q:
-                i = (mask_bidx, mask_hidx, pl.ds(kv_step * block_kv, block_kv))
-                m = plgpu.load(mask_ref, i, layout=L.WGMMA_COL, optimized=False)
-                mask = mask_fn(bcast(m, 1), mask)
-              elif bcast_mask_k:
-                mask_slice_q = pl.ds(mask_q_seq_off + wg_idx * block_q, block_q)
-                i = (mask_slice_q, mask_hidx, 0)
-                m = plgpu.load(mask_ref, i, layout=L.WGMMA_ROW, optimized=False)
-                mask = mask_fn(bcast(m), mask)
-              else:
-                barrier_idx = bias_mask_barriers_idx + slot
-                plgpu.barrier_wait(mask_barriers.at[barrier_idx])
-                mask = mask_fn(mask_smem.at[wg_idx, slot][...], mask)
-                plgpu.barrier_arrive(mask_consumed_barriers.at[barrier_idx])
-            s += mask
-          return s
-
-        s = pl.run_scoped(compute_scores, plgpu.ACC(block_q_kv, jnp.float32))
+        s = pl.run_scoped(compute_qk, plgpu.ACC(block_q_kv, jnp.float32))
         plgpu.barrier_arrive(k_consumed_barriers.at[slot])
+        s *= logits_scale
+
+        if bias_ref is not None:
+          bias_barrier_idx = bias_mask_barriers_idx + slot
+          plgpu.barrier_wait(bias_barriers.at[bias_barrier_idx])
+          bias = bias_smem.at[wg_idx, slot][...]
+          plgpu.barrier_arrive(bias_consumed_barriers.at[bias_barrier_idx])
+          s += bias.astype(s.dtype)
+
+        if logits_soft_cap is not None:
+          s = logits_soft_cap * jnp.tanh(s / logits_soft_cap)
+
+        if use_base2:
+          s *= math.log2(math.e)
+
+        if do_causal or use_k_ranges or mask_ref is not None:
+          if s.shape[0] != s.shape[1]:
+            raise NotImplementedError("Masking only supports square blocks.")
+
+          iota = lambda d: plgpu.broadcasted_iota(
+              jnp.int32, s.shape, dimension=d, layout=L.WGMMA
+          )
+          # TODO(cjfj): Calculate mask as boolean array?
+          mask = jnp.zeros_like(s)
+          f32_min = jnp.full_like(mask, float(jnp.finfo(jnp.float32).min))
+          mask_fn = lambda cond, mask: jnp.where(cond, mask, f32_min)
+          bcast = lambda x, d=0: lax.broadcast_in_dim(x, s.shape, (d,))
+
+          if do_causal:
+            mask = mask_fn(iota(0) >= iota(1), mask)
+          if use_k_ranges:
+            block_kv_iota = iota(1) + (kv_step * block_kv)
+
+            if k_start_ref is not None:
+              assert isinstance(k_start, jax.Array)
+              mask = mask_fn(bcast(k_start) <= block_kv_iota, mask)
+            if k_end_ref is not None:
+              assert isinstance(k_end, jax.Array)
+              mask = mask_fn(bcast(k_end) > block_kv_iota, mask)
+          if mask_ref is not None:
+            if bcast_mask_q:
+              i = (mask_bidx, mask_hidx, pl.ds(kv_step * block_kv, block_kv))
+              m = plgpu.load(mask_ref, i, layout=L.WGMMA_COL, optimized=False)
+              mask = mask_fn(bcast(m, 1), mask)
+            elif bcast_mask_k:
+              mask_slice_q = pl.ds(mask_q_seq_off + wg_idx * block_q, block_q)
+              i = (mask_slice_q, mask_hidx, 0)
+              m = plgpu.load(mask_ref, i, layout=L.WGMMA_ROW, optimized=False)
+              mask = mask_fn(bcast(m), mask)
+            else:
+              barrier_idx = bias_mask_barriers_idx + slot
+              plgpu.barrier_wait(mask_barriers.at[barrier_idx])
+              mask = mask_fn(mask_smem.at[wg_idx, slot][...], mask)
+              plgpu.barrier_arrive(mask_consumed_barriers.at[barrier_idx])
+          s += mask
 
         # Softmax
         exp = jnp.exp2 if use_base2 else jnp.exp
