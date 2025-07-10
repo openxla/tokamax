@@ -113,9 +113,10 @@ def ragged_dot_non_quantized_kernel_body(
             pl.ds(group_info.block_start + smem_start, const_rows_len),
             pl.ds(ni * config.block_n, config.block_n),
         ]
-        plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice)
+        plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice, commit_group=False)
 
       smem_start += group_info.actual_size & const_rows_len
+    plgpu.commit_smem_to_gmem_group()
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 

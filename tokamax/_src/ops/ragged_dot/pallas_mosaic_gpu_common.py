@@ -188,10 +188,11 @@ def store_acc_transposed(
           pl.ds(group_info.block_start + offset, size),
           pl.ds(ni * config.block_n, config.block_n),
       ]
-      plgpu.copy_smem_to_gmem(o_smem, o_gref_slice)
+      plgpu.copy_smem_to_gmem(o_smem, o_gref_slice, commit_group=False)
 
     offset += group_info.actual_size & size
     size //= 2
+  plgpu.commit_smem_to_gmem_group()
   plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 
