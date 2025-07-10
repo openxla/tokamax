@@ -270,9 +270,8 @@ def _fwd(
             if s.shape[0] != s.shape[1]:
               raise NotImplementedError("Masking only supports square blocks.")
 
-            # TODO(cjfj): Should the dtype be `int32`?
             iota = lambda d: plgpu.broadcasted_iota(
-                s.dtype, s.shape, dimension=d, layout=L.WGMMA
+                jnp.int32, s.shape, dimension=d, layout=L.WGMMA
             )
             # TODO(cjfj): Calculate mask as boolean array?
             mask = jnp.zeros_like(s)
