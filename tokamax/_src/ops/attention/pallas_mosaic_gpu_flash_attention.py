@@ -354,18 +354,16 @@ def _fwd(
         def wg0_kv_epilogue():
           carry = kv_loop(max_kv_step - 2, (acc, m_i, l_i), do_causal=True)
           # No-op pass to allow wg1 to progress.
+          perform_schedule_barrier()
           slot = (max_kv_step - 1) % stages
-          perform_schedule_barrier()
-          plgpu.barrier_arrive(k_consumed_barriers.at[slot])
-          perform_schedule_barrier()
           bias_mask_slot = bias_mask_barriers_idx + slot
           if bias_ref is not None:
             plgpu.barrier_arrive(bias_consumed_barriers.at[bias_mask_slot])
-            perform_schedule_barrier()
           if mask_ref is not None:
             plgpu.barrier_arrive(mask_consumed_barriers.at[bias_mask_slot])
-            perform_schedule_barrier()
+          plgpu.barrier_arrive(k_consumed_barriers.at[slot])
           plgpu.barrier_arrive(v_consumed_barriers.at[slot])
+          perform_schedule_barrier()
           return carry
 
         def wg1_kv_epilogue():
