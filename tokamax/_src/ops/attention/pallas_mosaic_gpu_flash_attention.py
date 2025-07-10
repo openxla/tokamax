@@ -188,8 +188,7 @@ def _fwd(
         ref = k_start_min_ref if bcast_num_heads else k_start_min_ref.at[q_head]
         k_start_min = plgpu.load(ref, idx, layout=L.WG_SPLAT)
         assert isinstance(k_start_min, jax.Array)
-        # TODO(giorgioa): Why do we need to subtract 2?
-        min_kv_step = lax.max(min_kv_step, k_start_min - 2)
+        min_kv_step = lax.max(min_kv_step, k_start_min)
       if k_end_max_ref is not None:
         bcast_num_heads = k_end_max_ref.ndim == 1
         ref = k_end_max_ref if bcast_num_heads else k_end_max_ref.at[q_head]
@@ -412,15 +411,13 @@ def _fwd(
             ref.at[*ds], smem.at[smem_slot], barrier=barrs.at[barr_slot]
         )
 
-      def kv_async_load(step, ref, smem, barrs, cons_barrs=None, slot=None):
-        slot = step if slot is None else slot
+      def kv_async_load(step, slot, ref, smem, barrs, cons_barrs=None):
         slice_ = (pl.ds(kv_batch_off + step * block_kv, block_kv), kv_head)
         async_load(slice_, ref, smem, barrs, cons_barrs, slot, None)
 
-      def mask_async_load(step, ref, smem, barrs, cons_barrs=None, slot=None):
+      def mask_async_load(step, slot, ref, smem, barrs, cons_barrs=None):
         if ref is None or bcast_mask_q or bcast_mask_k:
           return
-        slot = step if slot is None else slot
         for wg in range(2):
           qs = pl.ds(mask_q_seq_off + wg * block_q, block_q)
           slice_ = (qs, mask_hidx, pl.ds(step * block_kv, block_kv))
@@ -428,10 +425,9 @@ def _fwd(
           barr_slot = wg * max_stages + slot
           async_load(slice_, ref, smem, barrs, cons_barrs, smem_slot, barr_slot)
 
-      def bias_async_load(step, ref, smem, barrs, cons_barrs=None, slot=None):
+      def bias_async_load(step, slot, ref, smem, barrs, cons_barrs=None):
         if ref is None:
           return
-        slot = step if slot is None else slot
         for wg in range(2):
           qs = pl.ds(bias_q_seq_off + wg * block_q, block_q)
           slice_ = (qs, bias_hidx, pl.ds(step * block_kv, block_kv))
@@ -443,18 +439,19 @@ def _fwd(
 
         @pl.when(i < stages)
         def _preload_kv_bias_mask():
-          tma_slot = lax.rem(min_kv_step + i, stages)
-          kv_async_load(tma_slot, k_ref, k_smem, k_barriers)
-          bias_async_load(tma_slot, bias_ref, bias_smem, bias_barriers)
-          mask_async_load(tma_slot, mask_ref, mask_smem, mask_barriers)
-          kv_async_load(tma_slot, v_ref, v_smem, v_barriers)
+          step = min_kv_step + i
+          slot = lax.rem(step, stages)
+          kv_async_load(step, slot, k_ref, k_smem, k_barriers)
+          bias_async_load(step, slot, bias_ref, bias_smem, bias_barriers)
+          mask_async_load(step, slot, mask_ref, mask_smem, mask_barriers)
+          kv_async_load(step, slot, v_ref, v_smem, v_barriers)
 
       @pl.loop(min_kv_step, max_kv_step - stages)
       def _kv_loop(kv_step):
         tma_step = kv_step + stages
         tma_slot = lax.rem(kv_step, stages)
         closed = lambda fn, ref, smem, barrs, cons_barrs: fn(
-            tma_step, ref, smem, barrs, cons_barrs, tma_slot
+            tma_step, tma_slot, ref, smem, barrs, cons_barrs
         )
 
         closed(kv_async_load, k_ref, k_smem, k_barriers, k_consumed_barriers)
