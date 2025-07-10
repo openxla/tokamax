@@ -238,13 +238,13 @@ def _fwd(
       k_end = load_k_range(k_end_ref)
 
       plgpu.barrier_wait(q_barrier)
-      first_tma_slot = lax.rem(min_kv_step, stages)
+      first_tma_slot = lax.rem(min_kv_step, max_stages)
       plgpu.barrier_wait(k_barriers.at[first_tma_slot])
       pl.when(wg_idx == 1)(perform_schedule_barrier)
 
       def kv_loop(kv_step, carry, *, do_causal=False):
         acc, m_i, l_i = carry
-        slot = lax.rem(kv_step, stages)
+        slot = lax.rem(kv_step, max_stages)
 
         def compute_qk(acc_ref):
           k_smem_T = plgpu.transpose_ref(k_smem.at[slot], (1, 0))  # pylint: disable=invalid-name
@@ -340,7 +340,7 @@ def _fwd(
 
           @pl.when(wait_step < max_kv_step)
           def wait():
-            plgpu.barrier_wait(k_barriers.at[lax.rem(wait_step, stages)])
+            plgpu.barrier_wait(k_barriers.at[lax.rem(wait_step, max_stages)])
 
         acc = pl.run_state(compute_pv)(plgpu.ACC.init(acc))
         plgpu.barrier_arrive(v_consumed_barriers.at[slot])
@@ -423,7 +423,7 @@ def _fwd(
         @pl.when(i < stages)
         def _preload_kv_bias_mask():
           step = min_kv_step + i
-          slot = lax.rem(step, stages)
+          slot = lax.rem(step, max_stages)
           kv_async_load(step, slot, k_ref, k_smem, k_barriers)
           bias_async_load(step, slot, bias_ref, bias_smem, bias_barriers)
           mask_async_load(step, slot, mask_ref, mask_smem, mask_barriers)
@@ -432,7 +432,7 @@ def _fwd(
       @pl.loop(min_kv_step, max_kv_step - stages)
       def _kv_loop(kv_step):
         tma_step = kv_step + stages
-        tma_slot = lax.rem(kv_step, stages)
+        tma_slot = lax.rem(kv_step, max_stages)
         closed = lambda fn, ref, smem, barrs, cons_barrs: fn(
             tma_step, tma_slot, ref, smem, barrs, cons_barrs
         )
