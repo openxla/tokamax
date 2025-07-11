@@ -86,7 +86,7 @@ def layer_norm(
   elif not implementation:
     raise ValueError('`implementation` must not be an empty sequence.')
 
-  # TODO(sbodenstein): switch to using the offline autotuned result for the
+  # TODO: switch to using the offline autotuned result for the
   # the None automatic case.
 
   errors = []

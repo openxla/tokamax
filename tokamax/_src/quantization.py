@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 
 
-# TODO(cjfj): Add support for offsets?
+# TODO: Add support for offsets?
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class QuantizedArray:
@@ -66,7 +66,7 @@ def quantize_as(
     tile_preprocessor: Callable[[jax.Array], jax.Array] | None = None,
 ) -> Callable[[jax.Array], QuantizedArray]:
   """Returns a function that quantizes a JAX array as the given `dtype`."""
-  # TODO(cjfj): Support unsigned integers?
+  # TODO: Support unsigned integers?
   if not jnp.issubdtype(dtype, jnp.signedinteger):
     raise ValueError("`dtype` must be a signed integer.")
 

@@ -14,6 +14,9 @@
 # ==============================================================================
 """Pydantic types and utilities."""
 
+import dataclasses
+import enum
+import importlib
 import inspect
 import types
 import typing
@@ -38,6 +41,51 @@ PowerOfTwo: TypeAlias = Annotated[
 ]
 
 
+def _serialize_module_member(x) -> str:
+  return f'{x.__module__}.{x.__name__}'
+
+
+def _validate_module_member(x) -> Any:
+  if not isinstance(x, str):
+    return x
+  module_name, name = x.rsplit('.', 1)
+  # TODO: Create allowlist of modules.
+  return getattr(importlib.import_module(module_name), name)
+
+
+# pytype: disable=invalid-annotation
+def annotate(typ) -> Any:
+  """Annotates types with serializers and validators, as necessary."""
+  if typing.get_origin(typ) is Union or isinstance(typ, types.UnionType):
+    return Union[tuple(map(annotate, typing.get_args(typ)))]
+  if typing.get_origin(typ) is type:
+    return Annotated[
+        typ,
+        pydantic.PlainSerializer(_serialize_module_member),
+        pydantic.PlainValidator(_validate_module_member),
+    ]
+  # The default enum serialization, using the value, often leads to an ambiguous
+  # serialization within unions, so use the name instead (also more readable).
+  if issubclass(typ, enum.Enum):
+
+    def validate_enum(x):
+      if isinstance(x, typ):
+        return x
+      if not isinstance(x, str):
+        raise ValueError(f'Invalid enum name: {x}')
+      try:
+        return typ[x]
+      except KeyError as e:
+        raise ValueError('Invalid enum name') from e
+
+    return Annotated[
+        typ,
+        pydantic.PlainSerializer(lambda e: e.name),
+        pydantic.PlainValidator(validate_enum),
+    ]
+  return typ
+
+
 _SHORT_DTYPE_NAMES_MAP: Final[
     immutabledict.immutabledict[str, jax.typing.DTypeLike]
 ] = immutabledict.immutabledict(
@@ -57,8 +105,10 @@ _SHORT_DTYPE_NAMES_MAP: Final[
 )
 
 
-# TODO(cjfj): Support `BatchedShapeDtype`.
-def _serialize_shape_dtype(x: jax.ShapeDtypeStruct) -> str:
+# TODO: Support `BatchedShapeDtype`.
+def _serialize_shape_dtype(x) -> str:
+  if not isinstance(x, jax.ShapeDtypeStruct):
+    raise ValueError(f'Invalid ShapeDtype: {x}')
   return jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
 
 
@@ -79,17 +129,43 @@ ShapeDtype = Annotated[
 ]
 
 
-def _abstractify(typ):
+def _abstractify_dataclass(cls):
+  """Converts `jax.Array` fields to `ShapeDtype`."""
+  fields = dataclasses.fields(cls)
+  config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+  new_fields = tuple((f.name, abstractify(f.type), f) for f in fields)
+  new_cls = dataclasses.make_dataclass(cls.__name__, new_fields)
+  new_cls.__pydantic_config__ = config
+  adapter = pydantic.TypeAdapter(new_cls)
+
+  def validate(x):
+    if isinstance(x, cls):
+      return x
+    return cls(**dataclasses.asdict(adapter.validate_python(x)))
+
+  return Annotated[
+      cls,
+      pydantic.PlainSerializer(adapter.dump_python),
+      pydantic.PlainValidator(validate),
+  ]
+
+
+def abstractify(typ):
   """Converts `jax.Array` types to `ShapeDtype`."""
   if typing.get_origin(typ) is Annotated:
-    typ = typ.__origin__
-  if typing.get_origin(typ) is Union:
-    return Union[tuple(map(_abstractify, typing.get_args(typ)))]
-  if isinstance(typ, types.UnionType):
-    return Union[tuple(map(_abstractify, typ.__args__))]
-  if typ is jax.Array or issubclass(typ, jaxtyping.AbstractArray):
+    return Annotated[abstractify(typ.__origin__), *typ.__metadata__]
+  if typing.get_origin(typ) is Union or isinstance(typ, types.UnionType):
+    return Union[tuple(map(abstractify, typing.get_args(typ)))]
+  if issubclass(typ, jaxtyping.AbstractArray):
+    typ = typ.array_type
+  if typ is jax.Array:
     return ShapeDtype
+  if dataclasses.is_dataclass(typ):
+    return _abstractify_dataclass(typ)
   return typ
+
+
+# pytype: enable=invalid-annotation
 
 
 def get_arg_spec_model(
@@ -101,7 +177,7 @@ def get_arg_spec_model(
     if p.annotation is inspect.Parameter.empty:
       annotation = Any
     else:
-      annotation = _abstractify(p.annotation)
+      annotation = abstractify(annotate(p.annotation))
     default = ... if p.default is inspect.Parameter.empty else p.default
     params[param_name] = (annotation, default)
 

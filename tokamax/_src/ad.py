@@ -98,7 +98,7 @@ def get_vjp_taking_residuals(
   if not banned_vars.isdisjoint(tangent_vars):
     return None
 
-  # TODO(cjfj): Remove unneeded eqns?
+  # TODO: Remove unneeded eqns?
   # Create jaxpr for the VJP function, with the new inputs, outputs, and eqns.
   invars = residual_vars + cotangent_vars
   jaxpr = jaxpr.replace(

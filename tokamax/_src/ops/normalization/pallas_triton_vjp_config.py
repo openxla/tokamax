@@ -75,8 +75,8 @@ def get_key(
     **kwargs,
 ) -> Key:
   """Returns the lookup key for the given args."""
-  # TODO(cjfj): Canonicalize shape to two dimensions?
-  # TODO(cjfj): Cap the shape at a given size?
+  # TODO: Canonicalize shape to two dimensions?
+  # TODO: Cap the shape at a given size?
   del out, dout  # Unused.
   if kwargs.pop('return_residuals'):
     raise NotImplementedError('`return_residuals` not supported.')

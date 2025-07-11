@@ -23,8 +23,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
-from mlir.dialects import arith
-from mlir.dialects import memref
+from jax._src.lib.mlir.dialects import arith
+from jax._src.lib.mlir.dialects import memref
 import pydantic
 
 
@@ -134,7 +134,7 @@ def dequant(s_ref, w):
   return scaled_w(s_ref, w.astype(s_ref.dtype))
 
 
-# TODO(cperivol): Unify this with the non_quant store.
+# TODO: Unify this with the non_quant store.
 def store_acc_transposed(
     acc,
     o_gmem,
@@ -274,7 +274,7 @@ def ragged_kernel(
       loop_body(0, tuple(map(lax.axis_index, ("block_n", "m", "remainder_n"))))
 
   if config.persistent:
-    # TODO(cperivol): Detect this number from device.
+    # TODO: Detect this number from device.
     grid = (132,)
     grid_names = ("sm",)
   else:

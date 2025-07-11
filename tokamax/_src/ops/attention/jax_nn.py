@@ -22,12 +22,14 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src import quantization
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 
 
 Mask = base.Mask
 QuantizedArray = quantization.QuantizedArray
+PagingInfo = base.PagingInfo
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -51,6 +53,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
+      paging_info: PagingInfo | None,
       q_indices: Int[Array, "*#B #H T"] | None,
       k_indices: Int[Array, "*#B #H t"] | None,
       normalize_output: bool,
@@ -71,6 +74,8 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       raise NotImplementedError("`normalize_output=False` not supported.")
     if return_residuals:
       raise NotImplementedError("`return_residuals=True` not supported.")
+    if paging_info is not None:
+      raise NotImplementedError("Paged attention not supported.")
 
     q, k, v = map(base.as_array, (q, k, v))
 
@@ -97,12 +102,10 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
     mask = mask.as_array(q_len_or_indices, k_len_or_indices)
 
     *batch, seq_len_q, num_heads, head_dim = q.shape
-    head_dim_out = v.shape[-1]
+    *_, seq_len_k, _, head_dim_out = v.shape
 
-    def pad_head_dim(x):
-      head_dim_padding = max(head_dim, head_dim_out) - x.shape[-1]
-      return jnp.pad(x, (*((0, 0),) * (x.ndim - 1), (0, head_dim_padding)))
-
+    max_head_dim = max(head_dim, head_dim_out)
+    pad_head_dim = lambda x: shape_lib.pad_dim_to(x, max_head_dim, -1)
     q, k, v = map(pad_head_dim, (q, k, v))
 
     def flatten_batch(x, rank=q.ndim):
@@ -116,6 +119,13 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
     query_seq_lengths = flatten_batch(query_seq_lengths, len(batch))
     key_value_seq_lengths = flatten_batch(key_value_seq_lengths, len(batch))
 
+    # CuDNN doesn't support mask/bias implicitly broadcast along sequences.
+    if self.implementation == "cudnn":
+      if bias is not None:
+        bias = jnp.broadcast_to(bias, (*bias.shape[:-2], seq_len_q, seq_len_k))
+      if mask is not None:
+        mask = jnp.broadcast_to(mask, (*mask.shape[:-2], seq_len_q, seq_len_k))
+
     with jax.default_matmul_precision(str(precision[0])):
       out = jax.nn.dot_product_attention(
           q,
@@ -127,6 +137,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
           scale=logits_scale,
           query_seq_lengths=query_seq_lengths,
           key_value_seq_lengths=key_value_seq_lengths,
+          implementation=self.implementation,
       )
     out = out.reshape(*batch, seq_len_q, num_heads, out.shape[-1])
     return out[..., :head_dim_out], None

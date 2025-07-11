@@ -72,7 +72,7 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
 
   def _load_cache(self, device_kind: DeviceKind) -> DeviceAutotuningCache:
     del device_kind  # Unused.
-    return {}  # TODO(cjfj): Implement.
+    return {}  # TODO: Implement.
 
 
 def _compile(fn_factory, config, args, kwargs, *, seed=None):

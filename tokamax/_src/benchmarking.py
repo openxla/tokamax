@@ -30,7 +30,7 @@ from tokamax._src import batching
 from tokamax._src import numerics
 from tokamax._src import utils
 
-# TODO(rdyro): Support xprof once it's programmatically available in jaxlib.
+# TODO: Support xprof once it's programmatically available in jaxlib.
 xprof_session = None
 profile_data = None
 
@@ -311,7 +311,7 @@ _TIMERS: dict[str, Callable[[Callable[[T], Any], T], Timer]] = {
     'hermetic_xprof': hermetic_xprof_timer,
 }
 
-# TODO(rdyro): TPU default should be 'xprof', fix once it's supported outside.
+# TODO: TPU default should be 'xprof', fix once it's supported outside.
 _DEFAULT_TIMING_METHOD = {'gpu': 'cupti', 'tpu': 'wallclock'}
 _FALLBACK_TIMING_METHOD = 'wallclock'
 
@@ -338,7 +338,7 @@ def compile_benchmark(
   lowered = f.lower(x)
   lowering_time = time.perf_counter() - start_time
   start_time = time.perf_counter()
-  f_compiled = lowered.compile()  # TODO(giorgioa): Add test.
+  f_compiled = lowered.compile()  # TODO: Add test.
   compile_time = time.perf_counter() - start_time
 
   def runner(x: T, *, iterations: int = 5, method: str | None = None):
@@ -363,7 +363,7 @@ def compile_benchmark(
           jax.default_backend(), _FALLBACK_TIMING_METHOD
       )
 
-    # TODO(rdyro): Check if default_backend() is the best way to get the device.
+    # TODO: Check if default_backend() is the best way to get the device.
     if method == 'cuda_events':
       if jax.default_backend() != 'gpu':
         raise ValueError('CUDA events are only supported on GPU.')
@@ -395,7 +395,7 @@ def compile_benchmark(
   return runner
 
 
-# TODO(cjfj): Add support for autotuning VJP.
+# TODO: Add support for autotuning VJP.
 def get_impl_and_metadata(
     impls: dict[str, Callable[..., Any]], impl_name: str, *args, **kwargs
 ) -> tuple[Callable[..., Any], dict[str, Any]]:

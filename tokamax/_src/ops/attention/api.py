@@ -34,13 +34,13 @@ Implementation: TypeAlias = Literal[
     "mosaic", "triton", "cudnn", "xla", "xla_chunked"
 ]
 
-# TODO(sbodenstein): Should this be larger on TPU?
+# TODO: Should this be larger on TPU?
 _XLA_CHUNK_SIZE: Final[int] = 128
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(
         mosaic=pallas_mosaic_gpu_flash_attention.PallasMosaicGpuFlashAttention(
-            vjp=base.DotProductAttentionVjp()  # TODO(cjfj): Use Triton VJP?
+            vjp=base.DotProductAttentionVjp()  # TODO: Use Triton VJP?
         ),
         triton=pallas_triton_flash_attention.PallasTritonFlashAttention(),
         cudnn=jax_nn.JaxNnDotProductAttention(implementation="cudnn"),
@@ -51,7 +51,7 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     )
 )
 
-# TODO(sbodenstein): Should xla_chunked be used instead of xla for very big
+# TODO: Should xla_chunked be used instead of xla for very big
 # sequences lengths? Eg. where xla OOMs.
 _DEFAULT_IMPLEMENTATION = ("mosaic", "triton", "xla")
 

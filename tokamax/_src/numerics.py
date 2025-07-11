@@ -150,11 +150,11 @@ def const_initializer(values, key, shape, dtype):
 def _int_initializer(key, shape, dtype):
   """Default int initializer for `random_initialize`."""
   dtype = jnp.dtype(dtype)
-  # TODO(sbodenstein): Choose this value in a more principled way.
+  # TODO: Choose this value in a more principled way.
   maxval = min(jnp.iinfo(dtype).max + 1, 128)
   minval = max(jnp.iinfo(dtype).min, -maxval)
   # `jax.random.randint` doesn't currently support int4.
-  # TODO(cjfj): Remove this when int4 is supported.
+  # TODO: Remove this when int4 is supported.
   dtype_ = jnp.int8 if dtype.name in ('int4', 'uint4') else dtype
   return jax.random.randint(
       key, shape=shape, minval=minval, maxval=maxval, dtype=dtype_

@@ -89,7 +89,7 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
     g_ref = jax.value_and_grad(lambda *args: f(*args).sum())
     g_remat = jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
     g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
-    # TODO(b/392558289): Re-enable checks after bug is fixed.
+    # TODO: Re-enable checks after bug is fixed.
     _ = """
     hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
     self.assertEqual(hlo.count('name = "pallas_layer_norm"'), 1)
@@ -129,7 +129,7 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
         jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
     )
     g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
-    # TODO(b/392558289): Re-enable checks after bug is fixed.
+    # TODO: Re-enable checks after bug is fixed.
     _ = """
     hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
     self.assertEqual(
