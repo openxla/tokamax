@@ -10,7 +10,8 @@ on:
     branches:
       - main
 
-permissions: {}
+permissions:
+  contents: read
 # We should cancel the previous run if it's still running and there is a new commit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -21,13 +22,13 @@ concurrency:
 jobs: 
   build:
     # Pick a single GPU machine to test on. In the future, we should add TPU machines once those tests are submitted to the public repo.
-    runs-on: 'linux-x86-g2-16-l4-1gpu'
+    runs-on: 'linux-x86-a3-8g-h100-1gpu'
     defaults:
       run:
         shell: bash
     container:
     # Docker image will include CUDA and cuDNN for Tokamax.
-      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda12.8-cudnn9.8.'
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda12.8-cudnn9.8'
     timeout-minutes: 60
     steps:
       - name: Checkout Tokamax
@@ -41,9 +42,6 @@ jobs:
           python3.11 -m uv pip --version
           python3.11 -m uv pip install --upgrade -r requirements.txt
           python3.11 -m uv pip freeze
-
       - name: Test project with unittest
         run: |
-          python3.11 -m unittest discover \
-              --start-directory "tokamax" \
-              --pattern "*_test.py"
+          pytest --ignore-glob='*/test_base.py' tokamax

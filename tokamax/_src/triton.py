@@ -18,7 +18,7 @@ import jax
 from tokamax._src import config as config_lib
 
 
-# TODO(sbodenstein): this should be maintained inside jax-triton.
+# TODO: this should be maintained inside jax-triton.
 def has_triton_support() -> bool:
   """Returns True if Triton is supported by the default JAX device."""
   if config_lib.cross_compile.value:
@@ -27,7 +27,7 @@ def has_triton_support() -> bool:
   if jax.default_backend() != 'gpu':
     return False
 
-  # TODO(b/422870746): A temporary workaround for Pathways arrays not having a
+  # TODO: A temporary workaround for Pathways arrays not having a
   # compute_capability attribute.
   if jax.default_backend() == 'gpu':
     if not hasattr(jax.devices()[0], 'compute_capability'):

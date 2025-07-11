@@ -123,7 +123,7 @@ def _fwd_kernel_impl(
 
   def get_values_and_scales(x):
     if isinstance(x, QuantizedArray):
-      # TODO(giorgioa): Allow scales dimensions to be non-broadcastable.
+      # TODO: Allow scales dimensions to be non-broadcastable.
       return x.values, x.scales
     return x, None
 
@@ -161,7 +161,7 @@ def _fwd_kernel_impl(
   q_scales = [None] * split_d
 
   for i in range(split_d):
-    slice_d = pl.dslice(i * block_d, block_d)
+    slice_d = block.ds(i, block_d)
     q[i] = q_ref.at[:, slice_d].load()
     q[i], q_scales[i] = _rescale(
         q[i], q_scales_ref, None, slice_d, quantize_qk_dot, sm_scale
@@ -174,14 +174,14 @@ def _fwd_kernel_impl(
     accs, m_i, l_i = carry
 
     start_k = i * block_k
-    slice_k = pl.dslice(start_k, block_k)
+    slice_k = pl.ds(start_k, block_k)
     span_k = start_k + jnp.arange(block_k)
     use_mask_k = k_ref.shape[0] % block_k != 0
     s = jnp.zeros([block_m, block_k], dtype=jnp.float32)
 
     for i in range(split_d):
       assert q[i] is not None
-      slice_d = pl.dslice(i * block_d, block_d)
+      slice_d = block.ds(i, block_d)
       k = k_ref.at[slice_k, slice_d].load()
       k, k_scales = _rescale(k, k_scales_ref, slice_k, slice_d, quantize_qk_dot)
 
@@ -201,16 +201,16 @@ def _fwd_kernel_impl(
     if use_base2:
       # NOTE: This rescaling must happen after the bias add and soft-cap, but
       # before the attention masking (as the multiplication will cause `-inf`s).
-      # TODO(cjfj): Scale `q` instead if no bias or tanh clipping (we could
+      # TODO: Scale `q` instead if no bias or tanh clipping (we could
       # scale `logits_soft_cap` by the same factor).
       s *= np.log2(np.e)
 
     # See base class for explanation of why this is not `-inf`.
     mask_value = float(jnp.finfo(jnp.float32).min)
 
-    # TODO(cjfj): Use `s += tl.where(mask, 0, -inf)` instead (exploiting FMA)?
+    # TODO: Use `s += tl.where(mask, 0, -inf)` instead (exploiting FMA)?
     if mask_ref is not None:
-      # TODO(giorgioa): Could we pack 8 mask elements into one int8 mask element
+      # TODO: Could we pack 8 mask elements into one int8 mask element
       # and then unpack inside the kernel? This would decrease host->device
       # memory transfers, but increase per-thread compute.
       mask_slice_k = slice_k if (mask_ref.shape[-1] > 1) else slice(None)
@@ -254,7 +254,7 @@ def _fwd_kernel_impl(
       p *= dropout_mask.astype(p.dtype) / (1 - dropout_rate)
 
     for i in range(split_d_out):
-      slice_d = pl.dslice(i * block_d_out, block_d_out)
+      slice_d = block.ds(i, block_d_out)
       v = v_ref.at[slice_k, slice_d].load(bounds_check=(True, False))
       v, _ = _rescale(v, v_scales_ref, slice_k, slice_d)
       accs[i] += pl.dot(p.astype(v.dtype), v, precision=weights_v_dot_precision)
@@ -292,8 +292,7 @@ def _fwd_kernel_impl(
   if m_ref is not None:
     m_ref.store(m_i)
   for i in range(split_d_out):
-    slice_d = pl.dslice(i * block_d_out, block_d_out)
-    out_ref.at[:, slice_d].store(accs[i].astype(out_ref.dtype))
+    out_ref.at[:, block.ds(i, block_d_out)].store(accs[i].astype(out_ref.dtype))
 
 
 @jaxtyping.jaxtyped
@@ -330,7 +329,7 @@ def _fwd(
   kernel = functools.partial(
       _fwd_kernel,
       block_k=config.block_k,
-      # TODO(giorgioa): Try to use a for loop around the whole kernel rather
+      # TODO: Try to use a for loop around the whole kernel rather
       # than having a list of tiles for acc and q. M and L will be computed only
       # in the first iteration.
       block_d=config.block_d,
@@ -348,7 +347,7 @@ def _fwd(
   )
 
   block_q = config.block_q
-  # TODO(giorgioa): Could these just be multiple of block_d[_out]?
+  # TODO: Could these just be multiple of block_d[_out]?
   head_dim_pow2 = pl.next_power_of_2(head_dim)
   head_dim_out_pow2 = pl.next_power_of_2(head_dim_out)
   q_index_map = lambda i, j: (j, i, 0)
@@ -497,9 +496,9 @@ def _can_have_block_d(*args):
     if isinstance(arg, QuantizedArray) and any(
         s not in (1, v) for v, s in zip(arg.values.shape, arg.scales.shape)
     ):
-      return False  # TODO(giorgioa): Make block_d work with subchannel quant.
+      return False  # TODO: Make block_d work with subchannel quant.
     if pl.next_power_of_2(arg.shape[-1]) != arg.shape[-1]:
-      return False  # TODO(giorgioa): Make block_d work with non-pow2 head_dims.
+      return False  # TODO: Make block_d work with non-pow2 head_dims.
   return True
 
 
@@ -564,8 +563,8 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       if logits_soft_cap is not None:
         # If we cast the softmax output down to f16, we need to ensure that this
         # also doesn't cause {under,over}flow.
-        # FIXME(cjfj): Check for f16 dot operations.
-        # TODO(cjfj): This value is very conservative and could be relaxed.
+        # FIXME: Check for f16 dot operations.
+        # TODO: This value is very conservative and could be relaxed.
         use_stable_softmax = logits_soft_cap > 60.0
 
     mask, is_causal, q_start, q_end, k_start, k_end = _decompose_mask(
@@ -600,7 +599,7 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
     args = (q, k, v, bias, mask, dropout_mask, q_start, q_end, k_start, k_end)
 
     if (split_k := config.split_k) > 1:
-      # TODO(cjfj): Handle `is_causal`.
+      # TODO: Handle `is_causal`.
       if is_causal:
         raise ValueError("`is_causal` not supported with `split_k` > 1.")
 

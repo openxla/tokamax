@@ -12,24 +12,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Attention benchmark argument specifications."""
-
-import jax
-import jax.numpy as jnp
-
-
-ARG_SPECS = dict(
-    # FIXME: More dtypes.
-    mixtral_8x7b_bf16=dict(
-        q=jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
-        k=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
-        v=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
-        is_causal=True,
-    ),
-    deepseek2_16b_bf16=dict(
-        q=jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-        k=jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-        v=jax.ShapeDtypeStruct((512, 1024, 16, 128), jnp.bfloat16),
-        is_causal=True,
-    ),
-)

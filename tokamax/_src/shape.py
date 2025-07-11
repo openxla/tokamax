@@ -12,24 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Attention benchmark argument specifications."""
+"""Shape utilities."""
 
 import jax
+from jax.experimental import pallas as pl
 import jax.numpy as jnp
 
 
-ARG_SPECS = dict(
-    # FIXME: More dtypes.
-    mixtral_8x7b_bf16=dict(
-        q=jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
-        k=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
-        v=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
-        is_causal=True,
-    ),
-    deepseek2_16b_bf16=dict(
-        q=jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-        k=jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-        v=jax.ShapeDtypeStruct((512, 1024, 16, 128), jnp.bfloat16),
-        is_causal=True,
-    ),
-)
+def pad_dim_to(x: jax.Array, n: int, axis: int) -> jax.Array:
+  """Pads `x` to size `n` along `axis`."""
+  if (padding := n - x.shape[axis]) == 0:
+    return x
+  if padding < 0:
+    raise ValueError(f"Cannot pad {x.shape[axis]} to smaller size {n}")
+  pad_width = [(0, 0)] * x.ndim
+  pad_width[axis] = (0, padding)
+  return jnp.pad(x, pad_width)
+
+
+def pad_to_next_multiple_of(x: jax.Array, m: int, axis: int = 0) -> jax.Array:
+  """Pads `x` to the next multiple of `m` along `axis`."""
+  return pad_dim_to(x, pl.cdiv(x.shape[axis], m) * m, axis)

@@ -55,7 +55,7 @@ def _attend_chunk(
 ]:
   """Computes a chunk of attention."""
   q_k_dot_precision, weights_v_dot_precision = precision
-  # TODO(cjfj): Can we be more efficient for multi-query attention?
+  # TODO: Can we be more efficient for multi-query attention?
   logits = jnp.einsum(
       "...qhd,...khd->...hqk",
       q,
@@ -105,7 +105,7 @@ class XlaChunkedDotProductAttention(
 ):
   """XLA chunked dot product attention function."""
 
-  chunk_size: int
+  chunk_size: int = 128
 
   @jaxtyping.jaxtyped
   def _fwd(

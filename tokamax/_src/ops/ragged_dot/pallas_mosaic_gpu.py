@@ -31,7 +31,7 @@ Config = common.Config
 QuantizedArray = quantization.QuantizedArray
 
 
-# TODO(cperivol): Natively support mk,ekn->mn.
+# TODO: Natively support mk,ekn->mn.
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
   """Pallas-Mosaic-GPU ragged dot implementation.
@@ -41,7 +41,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
 
   def __post_init__(self):
     if self.vjp is None:
-      # TODO(cjfj): Use kernel for vjp.
+      # TODO: Use kernel for vjp.
       object.__setattr__(self, "vjp", base.vjp)
 
   def _fwd(

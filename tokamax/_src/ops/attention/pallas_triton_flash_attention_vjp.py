@@ -119,7 +119,7 @@ def _bwd_dkdv(
     if mask_ref is not None:
       dsT = jnp.where(m == mask_value, 0.0, dsT)
 
-    # TODO(cjfj): Would this be better in `_bwd_dq`? Benchmark it.
+    # TODO: Would this be better in `_bwd_dq`? Benchmark it.
     if ds_ref is not None:
       ds_ref.at[span_m, span_n].store(dsT.T.astype(ds_ref.dtype))
 
@@ -203,10 +203,10 @@ def _bwd_dq(
 
 
 def _zero_ds(ds_ref, lo, hi, *, block_m: int, block_n: int):
-  span_n = pl.ds(pl.program_id(0) * block_n, block_n)
+  span_n = block.ds(pl.program_id(0), block_n)
 
   def body(i, _):
-    span_m = pl.ds(i * block_m, block_m)
+    span_m = block.ds(i, block_m)
     ds_ref.at[span_m, span_n].store(jnp.zeros((block_m, block_n), ds_ref.dtype))
 
   return jax.lax.fori_loop(lo, hi, body, None)
@@ -390,7 +390,7 @@ def _bwd(
   seq_len_k, num_heads_k, head_dim_out = v.shape
 
   m, l = residuals
-  # TODO(sbodenstein): check whether this contributes significantly, and use
+  # TODO: check whether this contributes significantly, and use
   # kernel if it does.
   delta = jnp.sum((out * dout).astype(jnp.float32), axis=-1).swapaxes(-2, -1)
 
@@ -439,7 +439,7 @@ def _bwd(
   dq_block_shape = (config.block_m2, None, head_dim_pow2)
   dk_block_shape = (config.block_n1, None, head_dim_pow2)
   dv_block_shape = (config.block_n1, None, head_dim_out_pow2)
-  # TODO(cjfj): Do partial reduction in kernel if bias bcast in a sequence dim.
+  # TODO: Do partial reduction in kernel if bias bcast in a sequence dim.
   ds_block_shape = (None, seq_len_q, seq_len_k)
   ds_index_map = lambda i, j: (j, 0, 0)
   out_specs = (
@@ -558,7 +558,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    # TODO(cjfj): Heuristics.
+    # TODO: Heuristics.
     return Config(
         block_m1=32,
         block_n1=64,

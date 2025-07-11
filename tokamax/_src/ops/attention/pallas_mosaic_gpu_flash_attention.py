@@ -27,8 +27,11 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src import quantization
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
+from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention_vjp as vjp
+from tokamax._src.pallas import block
 
 
 # pylint: disable=cell-var-from-loop
@@ -37,6 +40,9 @@ from tokamax._src.ops.attention import base
 DotPrecisionLike = lax.Precision | lax.DotAlgorithmPreset
 QuantizedArray = quantization.QuantizedArray
 Residuals = base.Residuals
+_WGMMA_ROW = plgpu.Layout.WGMMA_ROW
+_WGMMA_COL = plgpu.Layout.WGMMA_COL
+_WG_SPLAT = plgpu.Layout.WG_SPLAT
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,21 +84,18 @@ def _fwd(
   as_4d = lambda x: jax.lax.collapse(jax.lax.broadcast_to_rank(x, 4), 0, -3)
   q, k, v = map(as_4d, (q, k, v))
 
-  batch_size, q_seq_len, num_q_heads, head_dim = q.shape
+  batch_size, q_seq_len, num_q_heads, _ = q.shape
   _, kv_seq_len, num_kv_heads, head_dim_out = v.shape
-  orig_head_dim = head_dim
   orig_head_dim_out = head_dim_out
 
   if num_q_heads % num_kv_heads:
     raise ValueError(f"{num_q_heads=} must be divisible by and {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
-  if head_dim % 64:
-    head_dim = pl.cdiv(orig_head_dim, 64) * 64
-    pad = lambda x: jnp.pad(x, (*[(0, 0)] * 3, (0, head_dim - orig_head_dim)))
-    q, k = map(pad, (q, k))
-  if head_dim_out % 64:
-    head_dim_out = pl.cdiv(orig_head_dim_out, 64) * 64
-    v = jnp.pad(v, (*[(0, 0)] * 3, (0, head_dim_out - orig_head_dim_out)))
+
+  pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
+  q, k, v = map(pad_head_dim, (q, k, v))
+  head_dim = q.shape[-1]
+  head_dim_out = v.shape[-1]
 
   max_stages = min(config.num_stages, kv_seq_len // config.block_kv)
   block_q_kv = block_q, block_kv = config.block_q, config.block_kv
@@ -102,40 +105,17 @@ def _fwd(
         f"{q_seq_len=} must be a multiple of {block_q * 2=}"
     )
 
-  # Fold the batch dimension into the seq dimension and we will do the index
-  # arithmetic by hand in the kernel because mgpu can't handle too high rank
-  # slices.
-  # TODO(giorgioa): Fold num_heads as well.
-  q, k, v = map(lambda x: jax.lax.collapse(x, 0, 2), (q, k, v))
-
   logits_shape = (batch_size, num_q_heads, q_seq_len, kv_seq_len)
   if bias is not None:
     bias = jnp.broadcast_to(as_4d(bias), logits_shape)
-    bias = jnp.swapaxes(bias, -2, -3)  # [B, T, H, t]
-    bias = jax.lax.collapse(bias, 0, 2)  # [B*T, H, t]
 
   if mask is not None:
-    mask = as_4d(mask)
-    bcast_mask_dims = [d == 1 for d in mask.shape]
-    bcast_mask_b, bcast_mask_h, bcast_mask_q, bcast_mask_k = bcast_mask_dims
-    if bcast_mask_q and bcast_mask_k:
-      raise NotImplementedError("Broadcast on both sequences not supported.")
-    mask = jnp.swapaxes(mask, -2, -3)  # [B, T, H, t]
-    mask = jax.lax.collapse(mask, 0, 2)  # [B*T, H, t]
-    mask = mask.astype(jnp.int8)
+    mask = as_4d(mask).astype(jnp.int8)
 
-  # TODO(giorgioa): Avoid broadcast.
-  def broadcast_and_collapse(x):
-    if x.shape[-2] == 1:
-      return jnp.broadcast_to(x, (batch_size, 1, q_seq_len)).flatten()  # [b*t]
-    x = jnp.broadcast_to(x, (batch_size, num_q_heads, q_seq_len))  # [b, h, t]
-    x = jnp.swapaxes(x, -2, -3)  # [h, b, t]
-    return jax.lax.collapse(x, -2)  # [h, b*t]
-
-  k_start = None if k_start is None else broadcast_and_collapse(k_start)
-  k_end = None if k_end is None else broadcast_and_collapse(k_end)
-
-  L: TypeAlias = plgpu.Layout
+  # TODO: Avoid broadcast.
+  bcast = lambda x: jnp.broadcast_to(x, (batch_size, x.shape[-2], q_seq_len))
+  k_start = None if k_start is None else bcast(k_start)
+  k_end = None if k_end is None else bcast(k_end)
 
   def kernel(
       q_ref,
@@ -148,17 +128,17 @@ def _fwd(
       k_start_min_ref,
       k_end_max_ref,
       out_ref,
-      *residual_gmem_refs,
+      *residual_refs,
       scoped,
   ):
-    bidx = lax.axis_index("batch")
-    qidx = lax.axis_index("q_tiles")
-    q_head = lax.axis_index("heads")
+    b_idx = lax.axis_index("batch")
+    q_idx = lax.axis_index("q_tiles")
+    h_idx = lax.axis_index("heads")
     wg_idx = lax.axis_index("wg")
 
     (
-        ((q_smems, o_smems), k_smem, v_smem, bias_smem, mask_smem),
-        residual_smem_buffers,
+        (q_smems, k_smem, v_smem, o_smems, *residual_smems),
+        (bias_smems, mask_smems),
         (q_barriers, k_barriers, v_barriers, bias_barriers, mask_barriers),
         (
             k_consumed_barriers,
@@ -179,67 +159,58 @@ def _fwd(
     max_kv_step = kv_seq_len // block_kv
 
     if is_causal:
-      max_kv_step = lax.min(max_kv_step, 2 * (qidx + 1))
+      max_kv_step = lax.min(max_kv_step, 2 * (q_idx + 1))
     if use_k_ranges:
-      idx = bidx * num_q_tiles + qidx
-
       if k_start_min_ref is not None:
-        bcast_num_heads = k_start_min_ref.ndim == 1
-        ref = k_start_min_ref if bcast_num_heads else k_start_min_ref.at[q_head]
-        k_start_min = plgpu.load(ref, idx, layout=L.WG_SPLAT)
-        assert isinstance(k_start_min, jax.Array)
+        idx = (b_idx, 0 if (k_start_min_ref.shape[1] == 1) else h_idx, q_idx)
+        k_start_min = plgpu.load(k_start_min_ref, idx, layout=_WG_SPLAT)
         min_kv_step = lax.max(min_kv_step, k_start_min)
       if k_end_max_ref is not None:
-        bcast_num_heads = k_end_max_ref.ndim == 1
-        ref = k_end_max_ref if bcast_num_heads else k_end_max_ref.at[q_head]
-        k_end_max = plgpu.load(ref, idx, layout=L.WG_SPLAT)
-        assert isinstance(k_end_max, jax.Array)
+        idx = (b_idx, 0 if (k_end_max_ref.shape[1] == 1) else h_idx, q_idx)
+        k_end_max = plgpu.load(k_end_max_ref, idx, layout=_WG_SPLAT)
         max_kv_step = lax.min(max_kv_step, k_end_max)
 
-    stages = lax.min(max_stages, max_kv_step - min_kv_step)
-    stages = lax.max(1, stages)
+    if mask_ref is None:
+      bcast_mask_q = bcast_mask_k = mask_b_idx = mask_h_idx = None
+    else:
+      bcast_dims = [d == 1 for d in mask_ref.shape]
+      bcast_mask_b, bcast_mask_h, bcast_mask_q, bcast_mask_k = bcast_dims
+      if bcast_mask_q and bcast_mask_k:
+        raise NotImplementedError("Mask broadcast on both sequences.")
 
-    q_seq_off = bidx * q_seq_len + qidx * (2 * block_q)
-    bias_mask_barriers_idx = wg_idx * max_stages
-
-    if mask_ref is not None:
-      mask_bidx = 0 if bcast_mask_b else bidx
-      mask_hidx = 0 if bcast_mask_h else q_head
-      mask_q_seq_off = mask_bidx * q_seq_len + qidx * (2 * block_q)
-
-    if bias_ref is not None:
-      bias_bidx = bidx
-      bias_hidx = q_head
-      bias_q_seq_off = bias_bidx * q_seq_len + qidx * (2 * block_q)
+      mask_b_idx = 0 if bcast_mask_b else b_idx
+      mask_h_idx = 0 if bcast_mask_h else h_idx
 
     @pl.when(wg_idx < 2)
-    def compute_wg():
+    def _compute_wg():
+      qs = block.ds(2 * q_idx + wg_idx, block_q)
 
       plgpu.set_max_registers(232, action="increase")
       q_smem, o_smem = q_smems.at[wg_idx], o_smems.at[wg_idx]
-      residual_smem = [ref.at[wg_idx] for ref in residual_smem_buffers]
+      residual_smem = [ref.at[wg_idx] for ref in residual_smems]
 
-      q_slice = pl.ds(q_seq_off + wg_idx * block_q, block_q)
       q_barrier = q_barriers.at[wg_idx]
-      plgpu.copy_gmem_to_smem(q_ref.at[q_slice, q_head], q_smem, q_barrier)
+      plgpu.copy_gmem_to_smem(q_ref.at[b_idx, qs, h_idx], q_smem, q_barrier)
 
-      l_i = plgpu.layout_cast(jnp.zeros((block_q,), jnp.float32), L.WGMMA_ROW)
-      m_i = plgpu.layout_cast(jnp.full_like(l_i, -jnp.inf), L.WGMMA_ROW)
+      l_i = plgpu.layout_cast(jnp.zeros((block_q,), jnp.float32), _WGMMA_ROW)
+      m_i = plgpu.layout_cast(jnp.full_like(l_i, -jnp.inf), _WGMMA_ROW)
       acc = jnp.zeros((block_q, head_dim_out), jnp.float32)
-      acc = plgpu.layout_cast(acc, L.WGMMA)
+      acc = plgpu.layout_cast(acc, plgpu.Layout.WGMMA)
 
       def load_k_range(ref):
         if ref is None:
           return None
-        slice_ = (q_slice,) if ref.ndim == 1 else (q_head, q_slice)
-        return plgpu.load(ref, slice_, layout=L.WGMMA_ROW, optimized=False)
+        idx = (b_idx, 0 if (ref.shape[1] == 1) else h_idx, qs)
+        return plgpu.load(ref, idx, layout=_WGMMA_ROW, optimized=False)
 
       k_start = load_k_range(k_start_ref)
       k_end = load_k_range(k_end_ref)
 
       plgpu.barrier_wait(q_barrier)
-      first_tma_slot = lax.rem(min_kv_step, max_stages)
-      plgpu.barrier_wait(k_barriers.at[first_tma_slot])
+      @pl.when(max_kv_step > min_kv_step)
+      def _():
+        plgpu.barrier_wait(k_barriers.at[lax.rem(min_kv_step, max_stages)])
+
       pl.when(wg_idx == 1)(perform_schedule_barrier)
 
       def kv_loop(kv_step, carry, *, do_causal=False):
@@ -258,10 +229,10 @@ def _fwd(
         s *= logits_scale
 
         if bias_ref is not None:
-          bias_barrier_idx = bias_mask_barriers_idx + slot
-          plgpu.barrier_wait(bias_barriers.at[bias_barrier_idx])
-          bias = bias_smem.at[wg_idx, slot][...]
-          plgpu.barrier_arrive(bias_consumed_barriers.at[bias_barrier_idx])
+          bias_smem = bias_smems.at[slot, block.ds(wg_idx, block_q)]
+          plgpu.barrier_wait(bias_barriers.at[slot])
+          bias = bias_smem[...]
+          plgpu.barrier_arrive(bias_consumed_barriers.at[slot])
           s += bias.astype(s.dtype)
 
         if logits_soft_cap is not None:
@@ -275,9 +246,9 @@ def _fwd(
             raise NotImplementedError("Masking only supports square blocks.")
 
           iota = lambda d: plgpu.broadcasted_iota(
-              jnp.int32, s.shape, dimension=d, layout=L.WGMMA
+              jnp.int32, s.shape, dimension=d, layout=plgpu.Layout.WGMMA
           )
-          # TODO(cjfj): Calculate mask as boolean array?
+          # TODO: Calculate mask as boolean array?
           mask = jnp.zeros_like(s)
           f32_min = jnp.full_like(mask, float(jnp.finfo(jnp.float32).min))
           mask_fn = lambda cond, mask: jnp.where(cond, mask, f32_min)
@@ -294,21 +265,21 @@ def _fwd(
             if k_end_ref is not None:
               assert isinstance(k_end, jax.Array)
               mask = mask_fn(bcast(k_end) > block_kv_iota, mask)
+
           if mask_ref is not None:
             if bcast_mask_q:
-              i = (mask_bidx, mask_hidx, pl.ds(kv_step * block_kv, block_kv))
-              m = plgpu.load(mask_ref, i, layout=L.WGMMA_COL, optimized=False)
+              i = (mask_b_idx, mask_h_idx, 0, block.ds(kv_step, block_kv))
+              m = plgpu.load(mask_ref, i, layout=_WGMMA_COL, optimized=False)
               mask = mask_fn(bcast(m, 1), mask)
             elif bcast_mask_k:
-              mask_slice_q = pl.ds(mask_q_seq_off + wg_idx * block_q, block_q)
-              i = (mask_slice_q, mask_hidx, 0)
-              m = plgpu.load(mask_ref, i, layout=L.WGMMA_ROW, optimized=False)
+              i = (mask_b_idx, mask_h_idx, qs, 0)
+              m = plgpu.load(mask_ref, i, layout=_WGMMA_ROW, optimized=False)
               mask = mask_fn(bcast(m), mask)
             else:
-              barrier_idx = bias_mask_barriers_idx + slot
-              plgpu.barrier_wait(mask_barriers.at[barrier_idx])
-              mask = mask_fn(mask_smem.at[wg_idx, slot][...], mask)
-              plgpu.barrier_arrive(mask_consumed_barriers.at[barrier_idx])
+              mask_smem = mask_smems.at[slot, block.ds(wg_idx, block_q)]
+              plgpu.barrier_wait(mask_barriers.at[slot])
+              mask = mask_fn(mask_smem[...], mask)
+              plgpu.barrier_arrive(mask_consumed_barriers.at[slot])
           s += mask
 
         # Softmax
@@ -339,7 +310,7 @@ def _fwd(
           wait_step = kv_step + 1
 
           @pl.when(wait_step < max_kv_step)
-          def wait():
+          def _():
             plgpu.barrier_wait(k_barriers.at[lax.rem(wait_step, max_stages)])
 
         acc = pl.run_state(compute_pv)(plgpu.ACC.init(acc))
@@ -357,8 +328,8 @@ def _fwd(
         acc, m_i, l_i = kv_loop(hi, (acc, m_i, l_i), do_causal=True)
 
         @pl.when(wg_idx == 0)
-        def wg0_kv_epilogue():  # pylint: disable=unused-variable
-          perform_schedule_barrier()  # Allow wg1 to progress.
+        def _unblock_wg1():
+          perform_schedule_barrier()
           perform_schedule_barrier()
 
       pl.when(wg_idx == 0)(perform_schedule_barrier)
@@ -366,189 +337,166 @@ def _fwd(
       if return_residuals:
         residual_smem[0][...], residual_smem[1][...] = m_i, l_i
         plgpu.commit_smem()
-        for smem, gmem in zip(residual_smem, residual_gmem_refs):
-          plgpu.copy_smem_to_gmem(smem, gmem.at[q_head, q_slice])
+        for smem, gmem in zip(residual_smem, residual_refs):
+          plgpu.copy_smem_to_gmem(smem, gmem.at[b_idx, h_idx, qs])
 
       l_i += float(jnp.finfo(jnp.float32).tiny)
 
       if normalize_output:
-        # TODO(apaszke): Invert and multiply to avoid expensive divisions.
+        # TODO: Invert and multiply to avoid expensive divisions.
         acc /= lax.broadcast_in_dim(l_i, (block_q, head_dim_out), [0])
 
       o_smem[...] = acc.astype(q.dtype)  # pytype: disable=attribute-error
       plgpu.commit_smem()
-      plgpu.copy_smem_to_gmem(o_smem, out_ref.at[q_slice, q_head])
+      plgpu.copy_smem_to_gmem(o_smem, out_ref.at[b_idx, qs, h_idx])
       plgpu.wait_smem_to_gmem(0)
 
     @pl.when(wg_idx == 2)
-    def memory_wg():
+    def _memory_wg():
       plgpu.set_max_registers(40, action="decrease")
-      kv_batch_off = bidx * kv_seq_len
-      kv_head = lax.div(q_head, q_heads_per_kv_head)
+      kv_head = lax.div(h_idx, q_heads_per_kv_head)
 
-      def async_load(ds, ref, smem, barrs, cons_barrs, smem_slot, barr_slot):
-        barr_slot = smem_slot if barr_slot is None else barr_slot
-        if cons_barrs is not None:
-          plgpu.barrier_wait(cons_barrs.at[barr_slot])
-        plgpu.copy_gmem_to_smem(
-            ref.at[*ds], smem.at[smem_slot], barrier=barrs.at[barr_slot]
-        )
+      def kv_async_load(slot, ref, ks, smem, barriers):
+        idx = (b_idx, ks, kv_head)
+        plgpu.copy_gmem_to_smem(ref.at[idx], smem.at[slot], barriers.at[slot])
 
-      def kv_async_load(step, slot, ref, smem, barrs, cons_barrs=None):
-        slice_ = (pl.ds(kv_batch_off + step * block_kv, block_kv), kv_head)
-        async_load(slice_, ref, smem, barrs, cons_barrs, slot, None)
+      def bias_async_load(slot, ref, ks, smem, barriers):
+        idx = (b_idx, h_idx, block.ds(q_idx, 2 * block_q), ks)
+        plgpu.copy_gmem_to_smem(ref.at[idx], smem.at[slot], barriers.at[slot])
 
-      def mask_async_load(step, slot, ref, smem, barrs, cons_barrs=None):
-        if ref is None or bcast_mask_q or bcast_mask_k:
-          return
-        for wg in range(2):
-          qs = pl.ds(mask_q_seq_off + wg * block_q, block_q)
-          slice_ = (qs, mask_hidx, pl.ds(step * block_kv, block_kv))
-          smem_slot = (wg, slot)
-          barr_slot = wg * max_stages + slot
-          async_load(slice_, ref, smem, barrs, cons_barrs, smem_slot, barr_slot)
+      def mask_async_load(slot, ref, ks, smem, barriers):
+        idx = (mask_b_idx, mask_h_idx, block.ds(q_idx, 2 * block_q), ks)
+        plgpu.copy_gmem_to_smem(ref.at[idx], smem.at[slot], barriers.at[slot])
 
-      def bias_async_load(step, slot, ref, smem, barrs, cons_barrs=None):
-        if ref is None:
-          return
-        for wg in range(2):
-          qs = pl.ds(bias_q_seq_off + wg * block_q, block_q)
-          slice_ = (qs, bias_hidx, pl.ds(step * block_kv, block_kv))
-          smem_slot = (wg, slot)
-          barr_slot = wg * max_stages + slot
-          async_load(slice_, ref, smem, barrs, cons_barrs, smem_slot, barr_slot)
+      async_mask = not (mask_ref is None or bcast_mask_q or bcast_mask_k)
 
+      # TODO: Reorder loads to match order of consumption.
       for i in range(max_stages):
 
-        @pl.when(i < stages)
+        @pl.when(i < (max_kv_step - min_kv_step))
         def _preload_kv_bias_mask():
           step = min_kv_step + i
           slot = lax.rem(step, max_stages)
-          kv_async_load(step, slot, k_ref, k_smem, k_barriers)
-          bias_async_load(step, slot, bias_ref, bias_smem, bias_barriers)
-          mask_async_load(step, slot, mask_ref, mask_smem, mask_barriers)
-          kv_async_load(step, slot, v_ref, v_smem, v_barriers)
+          ks = block.ds(step, block_kv)
+          kv_async_load(slot, k_ref, ks, k_smem, k_barriers)
+          if bias_ref is not None:
+            bias_async_load(slot, bias_ref, ks, bias_smems, bias_barriers)
+          if async_mask:
+            mask_async_load(slot, mask_ref, ks, mask_smems, mask_barriers)
+          kv_async_load(slot, v_ref, ks, v_smem, v_barriers)
 
-      @pl.loop(min_kv_step, max_kv_step - stages)
+      @pl.loop(min_kv_step, max_kv_step - max_stages)
       def _kv_loop(kv_step):
-        tma_step = kv_step + stages
-        tma_slot = lax.rem(kv_step, max_stages)
-        closed = lambda fn, ref, smem, barrs, cons_barrs: fn(
-            tma_step, tma_slot, ref, smem, barrs, cons_barrs
-        )
+        slot = lax.rem(kv_step, max_stages)
+        ks = block.ds(kv_step + max_stages, block_kv)
+        plgpu.barrier_wait(k_consumed_barriers.at[slot])
+        kv_async_load(slot, k_ref, ks, k_smem, k_barriers)
+        if bias_ref is not None:
+          plgpu.barrier_wait(bias_consumed_barriers.at[slot])
+          bias_async_load(slot, bias_ref, ks, bias_smems, bias_barriers)
+        if async_mask:
+          plgpu.barrier_wait(mask_consumed_barriers.at[slot])
+          mask_async_load(slot, mask_ref, ks, mask_smems, mask_barriers)
+        plgpu.barrier_wait(v_consumed_barriers.at[slot])
+        kv_async_load(slot, v_ref, ks, v_smem, v_barriers)
 
-        closed(kv_async_load, k_ref, k_smem, k_barriers, k_consumed_barriers)
-        # Load bias before mask
-        bias_args = bias_ref, bias_smem, bias_barriers, bias_consumed_barriers
-        closed(bias_async_load, *bias_args)
-        mask_args = mask_ref, mask_smem, mask_barriers, mask_consumed_barriers
-        closed(mask_async_load, *mask_args)
-        closed(kv_async_load, v_ref, v_smem, v_barriers, v_consumed_barriers)
+  def entry(*refs):
+    compute_wgs = 2
 
-  def run(refs):
-    mesh = plgpu.Mesh(
-        grid=(batch_size, num_q_tiles, num_q_heads),
-        grid_names=("batch", "q_tiles", "heads"),
-        num_threads=3,
-        thread_name="wg",
+    def tiled_smem(shape, dtype):
+      elem_bytes = jnp.dtype(dtype).itemsize
+      swizzle_elems = min(shape[-1], 128 // elem_bytes)
+      tiling = plgpu.TilingTransform((8, swizzle_elems))
+      swizzle = plgpu.SwizzleTransform(swizzle_elems * elem_bytes)
+      return plgpu.SMEM(shape, dtype, transforms=(tiling, swizzle))
+
+    q_scratch = tiled_smem((compute_wgs, block_q, head_dim), q.dtype)
+    k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype)
+    v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype)
+    o_scratch = tiled_smem((compute_wgs, block_q, head_dim_out), q.dtype)
+    l_scratch = m_scratch = plgpu.SMEM((compute_wgs, block_q), jnp.float32)
+
+    q_barriers = plgpu.Barrier(num_barriers=compute_wgs)
+    kv_barriers = plgpu.Barrier(num_barriers=max_stages)
+    kv_consumed_barriers = plgpu.Barrier(
+        num_arrivals=compute_wgs, num_barriers=max_stages
     )
+    schedule_barrier = plgpu.Barrier(num_arrivals=compute_wgs)
 
-    @pl.core_map(mesh, compiler_params=plgpu.CompilerParams(approx_math=True))
-    def kernel_entry():
-      compute_wgs = 2
-
-      def tiled_smem(shape, dtype):
-        elem_bytes = jnp.dtype(dtype).itemsize
-        swizzle_elems = min(shape[-1], 128 // elem_bytes)
-        tiling = plgpu.TilingTransform((8, swizzle_elems))
-        swizzle = plgpu.SwizzleTransform(swizzle_elems * elem_bytes)
-        return plgpu.SMEM(shape, dtype, transforms=(tiling, swizzle))
-
-      # SMEM scratch buffers
-      l_scratch = m_scratch = plgpu.SMEM((compute_wgs, block_q), jnp.float32)
-      qo_scratch = plgpu.RefUnion(
-          tiled_smem((compute_wgs, block_q, head_dim), q.dtype),
-          tiled_smem((compute_wgs, block_q, head_dim_out), q.dtype),
+    if bias is None:
+      bias_scratch = None
+      bias_barriers = None
+      bias_consumed_barriers = None
+    else:
+      bias_scratch = tiled_smem(
+          (max_stages, compute_wgs * block_q, block_kv), bias.dtype
       )
-      k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype)
-      v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype)
-
-      # Barriers
-      q_barriers = plgpu.Barrier(num_barriers=compute_wgs)
-      kv_barriers = plgpu.Barrier(num_barriers=max_stages)
-      kv_consumed_barriers = plgpu.Barrier(
+      bias_barriers = plgpu.Barrier(num_barriers=max_stages)
+      bias_consumed_barriers = plgpu.Barrier(
           num_arrivals=compute_wgs, num_barriers=max_stages
       )
-      schedule_barrier = plgpu.Barrier(num_arrivals=compute_wgs)
 
-      # Mask scratch buffer/barriers
-      num_barriers = compute_wgs * max_stages
-      if mask is None:
-        mask_scratch = None
-        mask_barriers = None
-        mask_consumed_barriers = None
-      else:
-        mask_scratch = tiled_smem(
-            (compute_wgs, max_stages, block_q, block_kv), jnp.int8
-        )
-        mask_barriers = plgpu.Barrier(num_barriers=num_barriers)
-        mask_consumed_barriers = plgpu.Barrier(num_barriers=num_barriers)
-
-      # Bias scratch buffer/barriers
-      if bias is None:
-        bias_scratch = None
-        bias_barriers = None
-        bias_consumed_barriers = None
-      else:
-        bias_scratch = tiled_smem(
-            (compute_wgs, max_stages, block_q, block_kv), bias.dtype
-        )
-        bias_barriers = plgpu.Barrier(num_barriers=num_barriers)
-        bias_consumed_barriers = plgpu.Barrier(num_barriers=num_barriers)
-      pl.run_scoped(
-          lambda *args: kernel(*refs, scoped=args),
-          (qo_scratch, k_scratch, v_scratch, bias_scratch, mask_scratch),
-          (l_scratch, m_scratch) if return_residuals else (),
-          (q_barriers, kv_barriers, kv_barriers, bias_barriers, mask_barriers),
-          (
-              kv_consumed_barriers,
-              kv_consumed_barriers,
-              bias_consumed_barriers,
-              mask_consumed_barriers,
-          ),
-          schedule_barrier,
-          collective_axes="wg",
+    if mask is None or mask.shape[-2] == 1 or mask.shape[-1] == 1:
+      mask_scratch = None
+      mask_barriers = None
+      mask_consumed_barriers = None
+    else:
+      mask_scratch = tiled_smem(
+          (max_stages, compute_wgs * block_q, block_kv), jnp.int8
+      )
+      mask_barriers = plgpu.Barrier(num_barriers=max_stages)
+      mask_consumed_barriers = plgpu.Barrier(
+          num_arrivals=compute_wgs, num_barriers=max_stages
       )
 
-  outs = (jnp.full((*q.shape[:-1], head_dim_out), jnp.inf, q.dtype),)
-  if return_residuals:
-    residuals_shape = (num_q_heads, batch_size * q_seq_len)
-    m_i = jnp.full(residuals_shape, -jnp.inf, dtype=jnp.float32)
-    l_i = jnp.full(residuals_shape, 0, dtype=jnp.float32)
-    outs += (m_i, l_i)
+    pl.run_scoped(
+        lambda *args: kernel(*refs, scoped=args),
+        plgpu.RefUnion(
+            (q_scratch, k_scratch, v_scratch),
+            (o_scratch, ((l_scratch, m_scratch) if return_residuals else ())),
+        ),
+        (bias_scratch, mask_scratch),
+        (q_barriers, kv_barriers, kv_barriers, bias_barriers, mask_barriers),
+        (
+            kv_consumed_barriers,
+            kv_consumed_barriers,
+            bias_consumed_barriers,
+            mask_consumed_barriers,
+        ),
+        schedule_barrier,
+        collective_axes="wg",
+    )
 
   def preprocess_k_range(reduction_fn, x):
     if x is None:
       return None
     reshape = lambda x, d: x.reshape((*x.shape[:-1], x.shape[-1] // d, d))
-    # Pre-reduce the k_start/k_end to a single value per q_block.
-    x = reduction_fn(reshape(x, block_q), axis=-1)
-    # The kernel processes 2 q_blocks per thread-block (one per warpgroup), so
-    # we need to reduce over two q_blocks.
-    x = reduction_fn(reshape(x, 2), axis=-1)
-    # Finally, perform the division by block_kv to get the number of steps.
-    round_ = jnp.floor if reduction_fn == jnp.min else jnp.ceil
-    return round_(x / block_kv).astype(jnp.int32)
+    # Pre-reduce the k_start/k_end to a single value per `2 * block_q` (as each
+    # warpgroup processes a q-block and share the same k/v blocks).
+    x = reduction_fn(reshape(x, 2 * block_q), axis=-1)
+    return (x // block_kv) if reduction_fn == jnp.min else pl.cdiv(x, block_kv)
 
   k_start_min = preprocess_k_range(jnp.min, k_start)
   k_end_max = preprocess_k_range(jnp.max, k_end)
 
-  _, _, _, _, _, _, _, _, _, out, *residuals = pl.run_state(run)(
-      (q, k, v, bias, mask, k_start, k_end, k_start_min, k_end_max, *outs)
-  )
+  out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), q.dtype)]
+  if return_residuals:
+    residuals_shape = (batch_size, num_q_heads, q_seq_len)
+    out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
+
+  out, *residuals = plgpu.kernel(
+      entry,
+      out_shape=out_shape,
+      grid=(batch_size, num_q_tiles, num_q_heads),
+      grid_names=("batch", "q_tiles", "heads"),
+      num_threads=3,
+      thread_name="wg",
+      compiler_params=plgpu.CompilerParams(approx_math=True),
+  )(q, k, v, bias, mask, k_start, k_end, k_start_min, k_end_max)
+
   out = out.reshape(*orig_q_shape[:-1], out.shape[-1])[..., :orig_head_dim_out]
   residuals = tuple(
-      jnp.moveaxis(res.reshape(-1, *orig_q_shape[:-3], q_seq_len), 0, -2)
+      res.reshape(*orig_q_shape[:-3], num_q_heads, q_seq_len)
       for res in residuals
   )
   return out, (residuals if return_residuals else None)
@@ -565,7 +513,7 @@ def _decompose_mask(mask, q, k):
   mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
 
   # Fold is_causal into k_end to avoid conflicts (and allow sharding).
-  # TODO(giorgioa): Fold is_causal into k_end only if k_end is not None.
+  # TODO: Fold is_causal into k_end only if k_end is not None.
   if is_causal:
     k_end_ = jnp.arange(q.shape[-3]) + 1
     k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
@@ -591,6 +539,11 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   """Flash attention with Mosaic GPU."""
 
   use_base2: bool = False
+
+  def __post_init__(self):
+    if self.vjp is None:
+      vjp_ = vjp.PallasMosaicGpuFlashAttentionVjp(use_base2=self.use_base2)
+      object.__setattr__(self, "vjp", vjp_)
 
   @jaxtyping.jaxtyped
   def _fwd(
@@ -629,9 +582,9 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     if k_indices is not None:
       raise NotImplementedError("k_indices is not implemented")
 
-    # TODO(giorgioa): Support in-kernel dequantization.
+    # TODO: Support in-kernel dequantization.
     q, k, v = map(base.as_array, (q, k, v))
-    # FIXME(cjfj): We shouldn't silently downcast types.
+    # FIXME: We shouldn't silently downcast types.
     k = k.astype(q.dtype)
     v = v.astype(q.dtype)
 
@@ -663,5 +616,5 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   def _get_heuristics_config(self, ba: op.BoundArguments):
     del ba
     # This is a pretty good option that works for most cases.
-    # TODO(cperivol): for larger embed dimensions we can probably guess better.
+    # TODO: for larger embed dimensions we can probably guess better.
     return Config(block_q=64, block_kv=64, num_stages=2)

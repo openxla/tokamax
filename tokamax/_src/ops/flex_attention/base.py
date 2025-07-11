@@ -179,7 +179,7 @@ class FlexAttention(
     if q_sharding is None:
       return fwd_closed(q, k, v, dropout_mask)
 
-    # TODO(cjfj): Support sharding.
+    # TODO: Support sharding.
     raise NotImplementedError("Sharding is not supported yet.")
 
   def bind(

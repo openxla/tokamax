@@ -417,7 +417,7 @@ class DotProductAttention(
         return QuantizedArray(axes, axes)  # pytype: disable=wrong-arg-types
       return axes
 
-    # TODO(cjfj): Derive this from the type annotations.
+    # TODO: Derive this from the type annotations.
     in_axes = (
         qkv_axes(q, [*batch_axes, seq_q_axis, heads_axis, head_dim_axis]),
         qkv_axes(k, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),

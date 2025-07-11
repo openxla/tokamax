@@ -60,7 +60,7 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
 
   @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
   def test_bench(self, _):
-    # TODO(cjfj): Fix tolerance and enable tests.
+    # TODO: Fix tolerance and enable tests.
     self.skipTest(
         "Accuracy for triton pallas is slightly less than mgpu. We need to"
         " figure out how to fix it or to increase the tolerance."

@@ -75,7 +75,9 @@ class RaggedDotTest(parameterized.TestCase):
       chex.assert_trees_all_close(rhs_grad, rhs_grad_gt)
 
     with self.subTest("correct_implementation_used"):
-      opspecs = hlo_utils.get_opspecs(f.lower(lhs, rhs))
+      opspecs = hlo_utils.get_opspecs(
+          f.lower(lhs, rhs), include_xla_kernels=False
+      )
       mosaic_impl = api.IMPLEMENTATIONS["mosaic"].__class__
       triton_impl = api.IMPLEMENTATIONS["triton"].__class__
       match implementation:
@@ -100,14 +102,14 @@ class RaggedDotImplementationTest(test_base.RaggedDotTestBase):
     dot_fn = functools.partial(api.ragged_dot, implementation=implementation)
     super().__init__(*args, dot_fn=dot_fn)
 
-  # TODO(b/422076048): Remove this once the bug is fixed.
+  # TODO: Remove this once the bug is fixed.
   # Note that these tests can be slow on CPU. Either keep disabled, or modify
   # the tests to run faster.
   def setUp(self):
     if jax.default_backend() == "cpu":
       self.skipTest("Test disabled on CPU.")
 
-    # TODO(b/422084662): XLA:TPU is not respecting the new precision API.
+    # TODO: XLA:TPU is not respecting the new precision API.
     # As Tokamax converts jax.lax.Precision.HIGHEST to BF16_BF16_F32_X6 on TPU,
     # this causes numerical inconsistencies with the tests using
     # jax.lax.Precision.HIGHEST.
@@ -117,7 +119,7 @@ class RaggedDotImplementationTest(test_base.RaggedDotTestBase):
     super().setUp()
 
   def test_bench_32_m32_n1024_k4096_bf16xi4(self):
-    self.skipTest("TODO(cjfj): Fix tolerance and re-enable.")
+    self.skipTest("TODO: Fix tolerance and re-enable.")
 
 
 class RaggedDotMosaicTest(RaggedDotImplementationTest):
@@ -134,14 +136,14 @@ class RaggedDotMosaicTest(RaggedDotImplementationTest):
         )
 
       if kwargs.get("preferred_element_type"):
-        self.skipTest("TODO(cperivol): Support preferred_element_type.")
+        self.skipTest("TODO: Support preferred_element_type.")
 
       if lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize):
-        self.skipTest("TODO(cperivol): Support tile aligned K dimension.")
+        self.skipTest("TODO: Support tile aligned K dimension.")
 
       if isinstance(rhs, QuantizedArray) and rhs.tile_shape != (1, 256, 1):
         self.skipTest(
-            "TODO(cperivol): Only scaling tile supported is (1, 256, 1) got:"
+            "TODO: Only scaling tile supported is (1, 256, 1) got:"
             f" {rhs.tile_shape}."
         )
 
@@ -167,7 +169,7 @@ class RaggedDotTritonTest(RaggedDotImplementationTest):
 
   @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
   def test_bench(self, _):
-    # TODO(cjfj): Fix tolerance and enable tests.
+    # TODO: Fix tolerance and enable tests.
     self.skipTest(
         "Accuracy for triton pallas is slightly less than mgpu. We need to"
         " figure out how to fix it or to increase the tolerance."

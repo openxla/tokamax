@@ -33,6 +33,14 @@ _zip = functools.partial(zip, strict=True)
 Indexer: TypeAlias = int | slice | pl.Slice | jax.Array
 
 
+def dslice(idx: int | jax.Array, size: int) -> slice | pl.Slice:
+  """Returns a block-aligned `pl.Slice`."""
+  return pl.dslice(idx * size, size)
+
+
+ds = dslice
+
+
 def _is_scalar_indexer(idx: Indexer) -> bool:
   return isinstance(idx, int) or (isinstance(idx, jax.Array) and idx.ndim == 0)
 
@@ -119,7 +127,7 @@ class BlockRef:
       bcast_axes = [a for a in range(self.ndim) if a != len(masks)]
 
       if isinstance(dim_idx, jax.Array):
-        # TODO(cjfj): Support multi-dimensional indices.
+        # TODO: Support multi-dimensional indices.
         if dim_idx.ndim > 1:
           raise ValueError("Only one-dimensional indices are supported.")
         masks.append(jnp.expand_dims(dim_idx < (bound - start_idx), bcast_axes))
@@ -181,7 +189,7 @@ class BlockRef:
       # it means that block is only read by one program ID. It is not likely to
       # be beneficial to keep the values in the cache. Here, we simply check if
       # the index mapping contains every program ID.
-      # TODO(cjfj): Can we detect more complicated functions of the program IDs?
+      # TODO: Can we detect more complicated functions of the program IDs?
       pids = _pids()
       start_idxs = tuple(map(id, self.spec.index_map(*pids)))
       if all(pid in start_idxs for pid in map(id, pids)):

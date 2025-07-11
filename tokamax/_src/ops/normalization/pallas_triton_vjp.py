@@ -171,7 +171,7 @@ class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
     )
 
   def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
-    # TODO(cjfj): Use batched args.
+    # TODO: Use batched args.
     return pallas_triton_vjp_config.get_key(*ba.args, **ba.kwargs)
 
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:

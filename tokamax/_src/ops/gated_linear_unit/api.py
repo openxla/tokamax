@@ -25,7 +25,7 @@ from tokamax._src import triton
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu
 
-# TODO(stzeng): Add Pallas-Mosaic-GPU implementation when it is ready.
+# TODO: Add Pallas-Mosaic-GPU implementation when it is ready.
 Implementation: TypeAlias = Literal['triton', 'xla']
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (

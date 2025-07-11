@@ -20,7 +20,7 @@ from typing import TypeAlias
 
 import jax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import fuser
+from tokamax._src.pallas import local_fuser as fuser
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from tokamax._src.ops import op
@@ -186,7 +186,7 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
     )
 
   def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
-    # TODO(cjfj): Use batched args.
+    # TODO: Use batched args.
     return pallas_triton_config.get_key(*ba.args, **ba.kwargs)
 
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:

@@ -38,7 +38,7 @@ def _broadcast_prefix(prefix_tree, full_tree):
   return result
 
 
-# TODO(cjfj): `ParamSpec` -> `TypeVarTuple` when pytype supports it.
+# TODO: `ParamSpec` -> `TypeVarTuple` when pytype supports it.
 def vmap_maybe_bcast(f: Callable[_P, _T], in_axes: Any) -> Callable[_P, _T]:
   """`vmap`s `f` over (possibly broadcast) axes of its arguments."""
 

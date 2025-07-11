@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from tokamax._src.ops.attention import api
 
 
-# TODO(cjfj): Check that the requested implementation is used.
+# TODO: Check that the requested implementation is used.
 class DotProductAttentionTest(parameterized.TestCase):
   IMPL = None
   SUPPORTS_VMAP = True

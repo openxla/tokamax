@@ -22,6 +22,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src import quantization
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 
@@ -99,10 +100,8 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
     *batch, seq_len_q, num_heads, head_dim = q.shape
     head_dim_out = v.shape[-1]
 
-    def pad_head_dim(x):
-      head_dim_padding = max(head_dim, head_dim_out) - x.shape[-1]
-      return jnp.pad(x, (*((0, 0),) * (x.ndim - 1), (0, head_dim_padding)))
-
+    max_head_dim = max(head_dim, head_dim_out)
+    pad_head_dim = lambda x: shape_lib.pad_dim_to(x, max_head_dim, -1)
     q, k, v = map(pad_head_dim, (q, k, v))
 
     def flatten_batch(x, rank=q.ndim):

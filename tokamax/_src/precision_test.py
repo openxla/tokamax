@@ -35,7 +35,7 @@ class PrecisionTest(parameterized.TestCase):
       ),
   )
   def test_precision_equivalence(self, dtype, precision_old):
-    # TODO(b/369559588)
+    # TODO
     if jax.default_backend() == 'cpu':
       self.skipTest('New precision API broken on CPU.')
 
@@ -73,7 +73,7 @@ class PrecisionTest(parameterized.TestCase):
   @parameterized.parameters(None, jax.lax.Precision.DEFAULT, 'BF16_BF16_F32_X6')
   def test_precision_jax_default(self, default_precision):
 
-    # TODO(b/369559588)
+    # TODO
     if jax.default_backend() == 'cpu':
       self.skipTest('New precision API broken on CPU.')
 

@@ -8,12 +8,17 @@ dynamic = ["version"]
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-  "absl-py>=3.0",
-  "jax>=0.4.24",
-  "jaxlib>=0.4.24",
-  "chex>=0.1.81",
-  "triton>=3.0.0",
-  "nvidia-cudnn-cu12>=9.0.0",
-  "jax[cuda12]>=0.4.0",
-  "jax[tpu]>= 0.4.0",
-]
+"absl-py>=2.3.0",
+"jax[cuda12, tpu]",
+"jaxlib",
+"chex>=0.1.81",
+"triton>=3.0.0",
+"nvidia-cudnn-cu12>=9.0.0",
+"jax-triton",
+"jaxtyping>=0.3",
+"typeguard==2.13.3",
+"google-benchmark>=1.9.0",
+"pydantic>=2.11.0",
+"torch_xla[pallas]",
+"xprof", 
+"pytest",]

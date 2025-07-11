@@ -12,24 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Attention benchmark argument specifications."""
 
-import jax
-import jax.numpy as jnp
+"""Public API for fuser. Workaround until fuser is in JAX OSS."""
 
-
-ARG_SPECS = dict(
-    # FIXME: More dtypes.
-    mixtral_8x7b_bf16=dict(
-        q=jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
-        k=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
-        v=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
-        is_causal=True,
-    ),
-    deepseek2_16b_bf16=dict(
-        q=jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-        k=jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-        v=jax.ShapeDtypeStruct((512, 1024, 16, 128), jnp.bfloat16),
-        is_causal=True,
-    ),
-)
+from jax._src.pallas.fuser.block_spec import get_fusion_values as get_fusion_values
+from jax._src.pallas.fuser.block_spec import make_scalar_prefetch_handler as make_scalar_prefetch_handler
+from jax._src.pallas.fuser.block_spec import pull_block_spec as pull_block_spec
+from jax._src.pallas.fuser.block_spec import push_block_spec as push_block_spec
+from jax._src.pallas.fuser.custom_evaluate import evaluate as evaluate
+from jax._src.pallas.fuser.fusible import fusible as fusible
+from jax._src.pallas.fuser.fusion import Fusion as Fusion
+from jax._src.pallas.fuser.jaxpr_fusion import fuse as fuse

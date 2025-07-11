@@ -363,7 +363,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       out_dtype = preferred_element_type
 
     if ragged_dot_dimension_numbers == _DLHS_RAGGED_DOT_DIM_NUMS:
-      rhs = jnp.swapaxes(rhs, -1, -2)  # TODO(cjfj): Fuse transpose into kernel.
+      rhs = jnp.swapaxes(rhs, -1, -2)  # TODO: Fuse transpose into kernel.
       ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
     if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
@@ -394,8 +394,8 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
     raise NotImplementedError("Unsupported `ragged_dot_dimension_numbers`.")
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    m = ba.args[0].shape[0]  # TODO(cjfj): Respect ragged dot dim nums.
-    return Config(  # TODO(cjfj): Create heuristics.
+    m = ba.args[0].shape[0]  # TODO: Respect ragged dot dim nums.
+    return Config(  # TODO: Create heuristics.
         block_m=min(128, pl.next_power_of_2(m)),
         block_n=128,
         block_k=32,

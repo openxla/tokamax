@@ -148,7 +148,7 @@ def body(
     )
 
   # The memory WG does not arrive at the run so we release it here.
-  # TODO(cperivol): Change the run_scoped() API so this is not
+  # TODO: Change the run_scoped() API so this is not
   # necessary.
   @pl.when(wg == 2)
   def _():
