@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions: {}
+# We should cancel the previous run if it's still running and there is a new commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# These jobs should build the Tokamax wheel and run the tests on Google Cloud resources. Rigth now
+# all the jobs are GPU jobs and TPU ones will be added later.
+jobs: 
+  build:
+    # Pick a single GPU machine to test on. In the future, we should add TPU machines once those tests are submitted to the public repo.
+    runs-on: 'linux-x86-g2-16-l4-1gpu'
+    defaults:
+      run:
+        shell: bash
+    container:
+    # Docker image will include CUDA and cuDNN for Tokamax.
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda12.8-cudnn9.8.'
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          python3.11 -m uv pip install --upgrade pip
+          python3.11 -m uv pip --version
+          python3.11 -m uv pip install --upgrade -r requirements.txt
+          python3.11 -m uv pip freeze
+
+      - name: Test project with unittest
+        run: |
+          python3.11 -m unittest discover \
+              --start-directory "tokamax" \
+              --pattern "*_test.py"
