@@ -202,6 +202,30 @@ class Mask:
 CAUSAL_MASK = Mask(is_causal=True)
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class PagingInfo:
+  """Information about the paged kv cache.
+
+  Attributes:
+    num_active_pages: Number of pages that each query needs to attend over.
+    active_page_indices: Sequence of page indices to attend over for each query.
+      MP indicates the maximum number of page indices in a sequence.
+    lengths: Length of each page in the paged kv cache, independently of which
+      query it belongs to.
+
+  Note:
+    - "Each query" means one per batch element in the `q` array.
+    - `is_causal`, `k_start` and `k_end` are invalid when paging is used. Each
+      page is assumed to be valid from the start of its sequence, up to its
+      corresponding `length`.
+  """
+
+  num_active_pages: Int[Array, "*#B"]
+  active_page_indices: Int[Array, "*#B MP"]
+  lengths: Int[Array, "*#b"]
+
+
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 # The attention residuals come from the softmax calculation:
@@ -219,8 +243,8 @@ class DotProductAttention(
   def __call__(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      k: Float[Array | QuantizedArray, "*b t h D"],
+      v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: (
           DotPrecisionLike | tuple[DotPrecisionLike, DotPrecisionLike]
@@ -233,10 +257,11 @@ class DotProductAttention(
       is_causal: bool = ...,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = ...,
       dropout_rate: float = ...,
+      paging_info: PagingInfo | None = None,
       q_sharding: jax.sharding.NamedSharding | None = ...,
       k_sharding: jax.sharding.NamedSharding | None = ...,
       q_indices: Int[Array, "*#B #H T"] | None = ...,
-      k_indices: Int[Array, "*#B #H t"] | None = ...,
+      k_indices: Int[Array, "*#b #H t"] | None = ...,
       normalize_output: bool = ...,
       return_residuals: Literal[False] = ...,
   ) -> Float[Array, "*B T H d"]:
@@ -246,8 +271,8 @@ class DotProductAttention(
   def __call__(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      k: Float[Array | QuantizedArray, "*b t h D"],
+      v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: (
           DotPrecisionLike | tuple[DotPrecisionLike, DotPrecisionLike]
@@ -260,10 +285,11 @@ class DotProductAttention(
       is_causal: bool = ...,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = ...,
       dropout_rate: float = ...,
+      paging_info: PagingInfo | None = None,
       q_sharding: jax.sharding.NamedSharding | None = ...,
       k_sharding: jax.sharding.NamedSharding | None = ...,
       q_indices: Int[Array, "*#B #H T"] | None = ...,
-      k_indices: Int[Array, "*#B #h t"] | None = ...,
+      k_indices: Int[Array, "*#b #h t"] | None = ...,
       normalize_output: bool = ...,
       return_residuals: Literal[True] = ...,
   ) -> tuple[Float[Array, "*B T H d"], Residuals]:
@@ -273,8 +299,8 @@ class DotProductAttention(
   def __call__(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      k: Float[Array | QuantizedArray, "*b t h D"],
+      v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: (
           DotPrecisionLike | tuple[DotPrecisionLike, DotPrecisionLike]
@@ -287,10 +313,11 @@ class DotProductAttention(
       is_causal: bool = False,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = None,
       dropout_rate: float = 0.0,
+      paging_info: PagingInfo | None = None,
       q_sharding: jax.sharding.NamedSharding | None = None,
       k_sharding: jax.sharding.NamedSharding | None = None,
       q_indices: Int[Array, "*#B #H T"] | None = None,
-      k_indices: Int[Array, "*#B #h t"] | None = None,
+      k_indices: Int[Array, "*#b #h t"] | None = None,
       normalize_output: bool = True,
       return_residuals: bool = False,
   ) -> Float[Array, "*B T H d"] | tuple[Float[Array, "*B T H d"], Residuals]:
@@ -313,8 +340,10 @@ class DotProductAttention(
           - query heads [0, 1] see key/value head 0
           - query heads [2, 3] see key/value head 1
           - etc.
-      k: Key array of shape `[batch, seq_len_kv, num_heads_kv, head_dim]`.
-      v: Value array of shape `[batch, seq_len_kv, num_heads_kv, head_dim]`.
+      k: Key array of shape `[batch, seq_len_kv, num_heads_kv, head_dim]`. If
+        `paging_info` is not None, the "batch" dimensions correspond to pages.
+      v: Value array of shape `[batch, seq_len_kv, num_heads_kv, head_dim]`. If
+        `paging_info` is not None, the "batch" dimensions correspond to pages.
       precision: The precision for the dot products. Either a tuple `(
         q_k_dot_precision, p_v_dot_precision)` or a single precision applied to
         both dot products.
@@ -339,6 +368,7 @@ class DotProductAttention(
       dropout_mask: Optional boolean mask, applied after softmax calculation.
       dropout_rate: If `dropout_mask` is not `None`, weights will be scaled by
         `1 / (1 - dropout_rate)` after the dropout mask is applied.
+      paging_info: Information about the paged kv cache.
       q_sharding: NamedSharding for `q`. Sharding information for the other
         tensors will be inferred by this.
       k_sharding: NamedSharding for `k` and also `v`. If `None`,
@@ -358,7 +388,9 @@ class DotProductAttention(
     mask = type(self).bind(**params).kwargs["mask"]
     del is_causal  # Combined into `mask`.
 
-    def fwd_closed(q, k, v, bias, mask, dropout_mask, q_indices, k_indices):
+    def fwd_closed(
+        q, k, v, bias, mask, dropout_mask, paging_info, q_indices, k_indices
+    ):
       return op.Op.__call__(
           self,
           q,
@@ -372,6 +404,7 @@ class DotProductAttention(
           mask=mask,
           dropout_mask=dropout_mask,
           dropout_rate=dropout_rate,
+          paging_info=paging_info,
           q_indices=q_indices,
           k_indices=k_indices,
           normalize_output=normalize_output,
@@ -379,7 +412,9 @@ class DotProductAttention(
       )
 
     if q_sharding is None:
-      return fwd_closed(q, k, v, bias, mask, dropout_mask, q_indices, k_indices)
+      return fwd_closed(
+          q, k, v, bias, mask, dropout_mask, paging_info, q_indices, k_indices
+      )
 
     mesh, q_spec = q_sharding.mesh, q_sharding.spec
 
@@ -390,6 +425,7 @@ class DotProductAttention(
     q_axes = tuple(q_spec) + (None,) * (q.ndim - len(q_spec))
     *batch_axes, seq_q_axis, heads_axis, head_dim_axis = q_axes
     if k_sharding is None:
+      k_batch_axes = batch_axes
       k_heads_axis = heads_axis
       seq_k_axis = None
     else:
@@ -397,7 +433,7 @@ class DotProductAttention(
         raise ValueError("q_sharding and k_sharding must have the same mesh.")
       k_spec = k_sharding.spec
       k_axes = tuple(k_spec) + (None,) * (k.ndim - len(k_spec))
-      *_, seq_k_axis, k_heads_axis, k_head_dim_axis = k_axes
+      *k_batch_axes, seq_k_axis, k_heads_axis, k_head_dim_axis = k_axes
       if seq_k_axis is not None and mesh.shape[seq_k_axis] != 1:
         raise ValueError("Sharding along seq_k_axis unsupported.")
       if k_head_dim_axis is not None and mesh.shape[k_head_dim_axis] != 1:
@@ -417,7 +453,7 @@ class DotProductAttention(
         return QuantizedArray(axes, axes)  # pytype: disable=wrong-arg-types
       return axes
 
-    # TODO(cjfj): Derive this from the type annotations.
+    # TODO: Derive this from the type annotations.
     in_axes = (
         qkv_axes(q, [*batch_axes, seq_q_axis, heads_axis, head_dim_axis]),
         qkv_axes(k, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),
@@ -432,6 +468,7 @@ class DotProductAttention(
             k_end=[*batch_axes, k_heads_axis, seq_q_axis],
         ),
         [*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # dropout_mask
+        PagingInfo([*batch_axes], [*batch_axes, None], [*k_batch_axes]),
         [*batch_axes, heads_axis, seq_q_axis],  # q_indices
         [*batch_axes, k_heads_axis, seq_k_axis],  # k_indices
     )
@@ -457,13 +494,15 @@ class DotProductAttention(
           fwd_closed, mesh, in_specs, out_specs, check_rep=False
       )(*args)
 
-    return fwd_sharded(q, k, v, bias, mask, dropout_mask, q_indices, k_indices)
+    return fwd_sharded(
+        q, k, v, bias, mask, dropout_mask, paging_info, q_indices, k_indices
+    )
 
   def bind(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      k: Float[Array | QuantizedArray, "*b t h D"],
+      v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: (
           DotPrecisionLike | tuple[DotPrecisionLike, DotPrecisionLike]
@@ -476,10 +515,11 @@ class DotProductAttention(
       is_causal: bool = False,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = None,
       dropout_rate: float = 0.0,
+      paging_info: PagingInfo | None = None,
       q_sharding: jax.sharding.NamedSharding | None = None,
       k_sharding: jax.sharding.NamedSharding | None = None,
       q_indices: Int[Array, "*#B #H T"] | None = None,
-      k_indices: Int[Array, "*#B #h t"] | None = None,
+      k_indices: Int[Array, "*#b #h t"] | None = None,
       normalize_output: bool = True,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
@@ -489,6 +529,9 @@ class DotProductAttention(
 
     if (dropout_rate != 0.0) and (dropout_mask is None):
       raise ValueError("`dropout_mask` can't be None if `dropout_rate` != 0.0")
+
+    if paging_info is None and k.shape[:-3] != q.shape[:-3]:
+      raise ValueError("`k` batch size must be the same as `q`.")
 
     if not isinstance(precision, tuple):
       precision = (precision, precision)
@@ -529,6 +572,7 @@ class DotProductAttention(
         mask=mask,
         dropout_mask=dropout_mask,
         dropout_rate=dropout_rate,
+        paging_info=paging_info,
         q_indices=q_indices,
         k_indices=k_indices,
         normalize_output=normalize_output,
@@ -539,8 +583,8 @@ class DotProductAttention(
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      k: Float[Array | QuantizedArray, "*b t h D"],
+      v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       logits_dtype: jnp.dtype,
@@ -550,8 +594,9 @@ class DotProductAttention(
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
+      paging_info: PagingInfo | None,
       q_indices: Int[Array, "*#B #H T"] | None,
-      k_indices: Int[Array, "*#B #h t"] | None,
+      k_indices: Int[Array, "*#b #h t"] | None,
       normalize_output: bool,
       return_residuals: bool,
       config: _Config,
@@ -613,6 +658,24 @@ def as_array(x: jax.Array | QuantizedArray) -> jax.Array:
   return x.recompose() if isinstance(x, QuantizedArray) else x
 
 
+def needs_stable_softmax(
+    logits_dtype: DTypeLike, logits_soft_cap: float | None
+) -> bool:
+  """Returns `True` if stable softmax is needed."""
+  # Typically, softmax is calculated using the stable softmax algorithm, which
+  # subtracts the maximum value before the exponential. This eliminates the
+  # possibility of overflow to infinity, while hopefully keeping underflows to
+  # zero minimal.
+  #
+  # If we are using tanh clipping, the range of (non-masked) softmax inputs is
+  # bound to `[-logits_soft_cap, logits_soft_cap]`, so {under,over}flow may be
+  # avoided without subtracting the maximum value.
+  if jnp.dtype(logits_dtype) not in (jnp.float32, jnp.bfloat16):
+    return True
+  # TODO: This value is very conservative and could be relaxed.
+  return True if logits_soft_cap is None else logits_soft_cap > 60.0
+
+
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
 def _softmax(x: jax.Array, normalize: bool) -> tuple[jax.Array, Residuals]:
   """Computes softmax, possibly using residual from the forward pass."""
@@ -641,8 +704,8 @@ def _softmax_jvp(normalize, primals, tangents):
 
 class DotProductAttentionGrads(TypedDict):
   q: Float[Array, "*B T H D"]
-  k: Float[Array, "*B t h D"]
-  v: Float[Array, "*B t h d"]
+  k: Float[Array, "*b t h D"]
+  v: Float[Array, "*b t h d"]
   bias: NotRequired[Float[Array, "*#B #H #T #t"] | None]
 
 
@@ -658,8 +721,8 @@ class DotProductAttentionVjp(
       out: Float[Array, "*B T H d"],
       dout: Float[Array, "*B T H d"],
       q: Float[Array, "*B T H D"],
-      k: Float[Array, "*B t h D"],
-      v: Float[Array, "*B t h d"],
+      k: Float[Array, "*b t h D"],
+      v: Float[Array, "*b t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       logits_dtype: jnp.dtype,
@@ -669,8 +732,9 @@ class DotProductAttentionVjp(
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
+      paging_info: PagingInfo | None,
       q_indices: Int[Array, "*#B #H T"] | None,
-      k_indices: Int[Array, "*#B #H t"] | None,
+      k_indices: Int[Array, "*#b #H t"] | None,
       normalize_output: bool,
       return_residuals: bool,
       config: _Config,
@@ -680,6 +744,10 @@ class DotProductAttentionVjp(
 
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
+    if paging_info is not None:
+      raise NotImplementedError("Paged attention is not supported in VJP.")
+    if q.shape[:-3] != k.shape[:-3]:
+      raise ValueError("q and k must have the same batch dimensions.")
 
     def attend(q, k, v, bias):
       out, softmax_residual = DotProductAttention()._fwd(  # pylint: disable=protected-access
@@ -694,18 +762,39 @@ class DotProductAttentionVjp(
           mask=mask,
           dropout_mask=dropout_mask,
           dropout_rate=dropout_rate,
+          paging_info=paging_info,
           q_indices=q_indices,
           k_indices=k_indices,
           normalize_output=normalize_output,
           return_residuals=True,
           config=None,
       )
-      residuals_ = (q, k, v, bias, mask, dropout_mask, q_indices, k_indices)
+      residuals_ = (
+          q,
+          k,
+          v,
+          bias,
+          mask,
+          dropout_mask,
+          paging_info,
+          q_indices,
+          k_indices,
+      )
       residuals_ += (out, softmax_residual)
       return out, residuals_
 
     vjp = ad.get_vjp_taking_residuals(attend, q, k, v, bias)
-    residuals_ = (q, k, v, bias, mask, dropout_mask, q_indices, k_indices)
+    residuals_ = (
+        q,
+        k,
+        v,
+        bias,
+        mask,
+        dropout_mask,
+        paging_info,
+        q_indices,
+        k_indices,
+    )
     residuals_ += (out, residuals)
     dq, dk, dv, dbias = vjp(residuals_, dout)
     return DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None

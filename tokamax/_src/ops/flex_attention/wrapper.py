@@ -29,6 +29,7 @@ from tokamax._src.ops.flex_attention import base
 Mask = attn_base.Mask
 Residuals = attn_base.Residuals
 QuantizedArray = quantization.QuantizedArray
+PagingInfo = attn_base.PagingInfo
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -52,6 +53,7 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
+      paging_info: PagingInfo | None,
       q_indices: Int[Array, "*#B #H T"] | None,
       k_indices: Int[Array, "*#B #H t"] | None,
       normalize_output: bool,
@@ -59,6 +61,9 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
       config: op.NullConfig,
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     del config  # Unused.
+
+    if paging_info is not None:
+      raise NotImplementedError("Paged attention not supported.")
 
     def score_mod(logits):
       logits = logits.astype(logits_dtype) * logits_scale

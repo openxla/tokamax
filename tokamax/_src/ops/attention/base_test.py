@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Test for attention base classes."""
 
 from absl.testing import absltest
 import chex
@@ -20,6 +19,7 @@ import jax
 from jax import export
 import jax.numpy as jnp
 from tokamax._src.ops.attention import base
+from tokamax._src.ops.attention import test_base
 
 
 class MaskTest(absltest.TestCase):
@@ -114,6 +114,29 @@ class MaskTest(absltest.TestCase):
         [[[1, 0, 0, 0], [1, 1, 0, 0], [0, 0, 1, 0], [0, 0, 1, 1]]], dtype=bool
     )
     chex.assert_trees_all_equal(actual, expected)
+
+
+class DotProductAttentionTest(test_base.AttentionTestBase):
+
+  def __init__(self, *args, vjp=None):
+    super().__init__(*args, attention_fn=base.DotProductAttention(vjp=vjp))
+
+  def _run_test(self, q_shape, *args, dtype=jnp.float32, **kwargs):
+    if q_shape[1] >= 16384:
+      self.skipTest("XLA seems to fail for so long sequences (b/384038935)")
+
+    impl_kwargs = kwargs.pop("impl_kwargs", {})
+    if dtype == jnp.float32:
+      impl_kwargs["precision"] = jax.lax.Precision.HIGHEST
+    super()._run_test(
+        q_shape, *args, dtype=dtype, impl_kwargs=impl_kwargs, **kwargs
+    )
+
+
+class DotProductAttentionWithExplicitVjpTest(DotProductAttentionTest):
+
+  def __init__(self, *args):
+    super().__init__(*args, vjp=base.DotProductAttentionVjp())
 
 
 if __name__ == "__main__":

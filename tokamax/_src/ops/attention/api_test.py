@@ -19,10 +19,15 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
+from tokamax._src import mosaic_gpu
+from tokamax._src import triton as triton_lib
 from tokamax._src.ops.attention import api
 
 
-# TODO(cjfj): Check that the requested implementation is used.
+_CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
+
+
+# TODO: Check that the requested implementation is used.
 class DotProductAttentionTest(parameterized.TestCase):
   IMPL = None
   SUPPORTS_VMAP = True
@@ -37,6 +42,16 @@ class DotProductAttentionTest(parameterized.TestCase):
   def testDotProductAttention(self, dtype, group_num, use_vmap):
     if use_vmap and not self.SUPPORTS_VMAP:
       self.skipTest('vmap not supported')
+    if self.IMPL == 'mosaic' and not mosaic_gpu.has_mosaic_gpu_support():
+      self.skipTest(
+          'Skip test. Mosaic implementation is not supported on this platform.'
+      )
+    if self.IMPL == 'triton' and not triton_lib.has_triton_support():
+      self.skipTest(
+          'Skip test. Triton implementation is not supported on this platform.'
+      )
+    if jax.default_backend() == 'tpu' and self.IMPL == 'cudnn':
+      self.skipTest(f'{self.IMPL} not supported on TPU')
 
     B, S, T, N, H, G = 2, 128, 128, 4, 64, group_num
     keys = jax.random.split(jax.random.PRNGKey(0), 5)
@@ -85,11 +100,23 @@ class DotProductAttentionTest(parameterized.TestCase):
       ],
   )
   def testDotProductAttentionMask(self, mask_mode):
+    if self.IMPL == 'mosaic' and not mosaic_gpu.has_mosaic_gpu_support():
+      self.skipTest(
+          'Skip test. Mosaic implementation is not supported on this platform.'
+      )
+    if self.IMPL == 'triton' and not triton_lib.has_triton_support():
+      self.skipTest(
+          'Skip test. Triton implementation is not supported on this platform.'
+      )
+    # TODO: Fix test for 'xla_chunked' on TPU.
+    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
+      self.skipTest(f'{self.IMPL} not supported on TPU')
     if isinstance(mask_mode, str):
       mask_mode = (mask_mode,)
 
     dtype = jnp.bfloat16
-    B, S, T, N, H = 2, 128, 128, 4, 64
+    cudnn_bias = self.IMPL == 'cudnn' and 'bias' in mask_mode
+    B, S, T, N, H = (1 if cudnn_bias else 2), 128, 128, 4, 64
     keys = jax.random.split(jax.random.PRNGKey(0), 4)
     Q = jax.random.normal(keys[0], (B, T, N, H), dtype)
     K = jax.random.normal(keys[1], (B, S, N, H), dtype)
@@ -109,7 +136,9 @@ class DotProductAttentionTest(parameterized.TestCase):
       mask = custom_mask[None, None, :, :]
     if 'bias' in mask_mode:
       # Tokamax calculates dbias in f32, so use an f32 bias to reduce ref error.
-      bias = jax.random.normal(keys[4], (1, N, T, S), jnp.float32)
+      # When CuDNN is used, the bias in f32 causes NaNs.
+      bias_dtype = dtype if cudnn_bias else jnp.float32
+      bias = jax.random.normal(keys[4], (1, N, T, S), bias_dtype)
     if 'sliding_window' in mask_mode:
       window_size = (3, 2) if is_causal else (3, 0)
 
@@ -164,8 +193,21 @@ class DotProductAttentionTest(parameterized.TestCase):
 
   @parameterized.product(batch_size=[1, 16], use_vmap=[False, True])
   def testDotProductAttentionBiasGradient(self, batch_size, use_vmap):
+    if self.IMPL == 'mosaic' and not mosaic_gpu.has_mosaic_gpu_support():
+      self.skipTest(
+          'Skip test. Mosaic implementation is not supported on this platform.'
+      )
+    if self.IMPL == 'triton' and not triton_lib.has_triton_support():
+      self.skipTest(
+          'Skip test. Triton implementation is not supported on this platform.'
+      )
+    # TODO: Fix test for 'xla_chunked' on TPU.
+    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
+      self.skipTest(f'{self.IMPL} not supported on TPU')
     if use_vmap and not self.SUPPORTS_VMAP:
       self.skipTest('vmap not supported')
+    if self.IMPL == 'cudnn' and batch_size != 1:
+      self.skipTest('batch_size != 1 not supported for bias gradient in cudnn')
 
     dtype = jnp.bfloat16
     B, S, N, H = batch_size, 128, 4, 64
@@ -246,6 +288,15 @@ class DotProductAttentionCudnnTest(DotProductAttentionTest):
 
   def testMemoryScaling(self):
     self.skipTest('Memory scaling guarantees not made for this implementation')
+
+  def test_impl_in_hlo(self):
+    if jax.default_backend() == 'tpu':
+      self.skipTest('CudNN not supported on TPU')
+    fn = functools.partial(api.dot_product_attention, implementation=self.IMPL)
+    x = jnp.empty((2, 256, 4, 64), dtype=jnp.bfloat16)
+    lowered = jax.jit(fn).lower(x, x, x)
+    hlo_text = lowered.compiler_ir(dialect='hlo').as_hlo_text()
+    self.assertIn(_CUDNN_CUSTOM_CALL_TARGET, hlo_text)
 
 
 class DotProductAttentionXlaTest(DotProductAttentionTest):

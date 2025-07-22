@@ -57,14 +57,14 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
         )
 
       if kwargs.get("preferred_element_type") is not None:
-        self.skipTest("TODO(cperivol): Support preferred_element_type.")
+        self.skipTest("TODO: Support preferred_element_type.")
 
       if lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize):
-        self.skipTest("TODO(cperivol): Support tile aligned K dimension.")
+        self.skipTest("TODO: Support tile aligned K dimension.")
 
       if isinstance(rhs, QuantizedArray) and rhs.tile_shape != (1, 256, 1):
         self.skipTest(
-            "TODO(cperivol): Only scaling tile supported is (1, 256, 1) got:"
+            "TODO: Only scaling tile supported is (1, 256, 1) got:"
             f" {rhs.tile_shape}."
         )
 

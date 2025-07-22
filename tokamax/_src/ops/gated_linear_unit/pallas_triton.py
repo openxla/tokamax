@@ -48,7 +48,7 @@ def _gated_linear_unit_kernel(
   """Pallas GLU kernel."""
 
   def body(i, acc):
-    k_span = pl.ds(i * block_k, block_k)
+    k_span = block.ds(i, block_k)
     x = x_ref.at[:, k_span].load(bounds_check=(False, True))
     w = weights_ref.at[k_span, 0].load(bounds_check=(True, False))
     v = weights_ref.at[k_span, 1].load(bounds_check=(True, False))
@@ -189,7 +189,7 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
     return fn(x, weights)
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    x, weights = ba.args  # TODO(cjfj): Use batched args.
+    x, weights = ba.args  # TODO: Use batched args.
     m = math.prod(x.shape[:-1])
     n = weights.shape[2]
     if n >= m:  # Prefer `block_n` > `block_m`.

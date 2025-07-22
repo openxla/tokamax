@@ -72,13 +72,17 @@ class GatedLinearUnitTest(parameterized.TestCase):
       chex.assert_trees_all_close(out, out_golden)
 
     with self.subTest("correct_implementation_used"):
-      opspecs = hlo_utils.get_opspecs(f.lower(lhs, rhs))
+      opspecs = hlo_utils.get_opspecs(
+          f.lower(lhs, rhs), include_xla_kernels=implementation == "xla"
+      )
       triton_impl = api.IMPLEMENTATIONS["triton"].__class__
       match implementation:
         case "triton":
           self.assertIsInstance(opspecs[0].op, triton_impl)
         case "xla":
-          self.assertEmpty(opspecs)
+          self.assertIsInstance(
+              opspecs[0].op, api.IMPLEMENTATIONS["xla"].__class__
+          )
         case None:
           if jax.default_backend() == "gpu":
             # Ensure either a Triton or Mosaic kernel is used.

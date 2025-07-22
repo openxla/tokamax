@@ -17,7 +17,6 @@
 import abc
 import collections
 from collections.abc import Callable
-import contextlib
 import copy
 import dataclasses
 import inspect
@@ -168,7 +167,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
         arrays, out, residuals = residuals
         dout = dout[0] if return_residuals else dout
         args, kwargs = args_tree.unflatten(merge(arrays, other))
-        # TODO(cjfj): Keep track of initializable arrays in VJP also.
+        # TODO: Keep track of initializable arrays in VJP also.
         args, kwargs = jax.tree.map(
             lambda x: x.value if _is_initializable_array(x) else x,
             (args, kwargs),
@@ -371,7 +370,7 @@ class BoundArguments(Generic[_Config, _Key]):
     Returns:
       A config for the op.
     """
-    # TODO(cjfj): Add logging.
+    # TODO: Add logging.
     if (config := self.op.config) is not None:
       return config
 

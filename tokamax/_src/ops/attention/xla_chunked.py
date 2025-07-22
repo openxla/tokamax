@@ -25,12 +25,14 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 
 
 Mask = base.Mask
 QuantizedArray = base.QuantizedArray
+PagingInfo = base.PagingInfo
 
 
 @jaxtyping.jaxtyped
@@ -55,7 +57,7 @@ def _attend_chunk(
 ]:
   """Computes a chunk of attention."""
   q_k_dot_precision, weights_v_dot_precision = precision
-  # TODO(cjfj): Can we be more efficient for multi-query attention?
+  # TODO: Can we be more efficient for multi-query attention?
   logits = jnp.einsum(
       "...qhd,...khd->...hqk",
       q,
@@ -99,20 +101,203 @@ def _attend_chunk(
   return accum, x_max, denom
 
 
+@jaxtyping.jaxtyped
+def _attend_chunked(
+    q: Float[Array | QuantizedArray, "*B T H D"],
+    k: Float[Array | QuantizedArray, "*B t #H D"],
+    v: Float[Array | QuantizedArray, "*B t #H d"],
+    *,
+    precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+    logits_dtype: jnp.dtype,
+    logits_scale: float,
+    bias: Float[Array, "*#B #H #T #t"] | None,
+    logits_soft_cap: float | None,
+    mask: Mask,
+    dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
+    dropout_rate: float,
+    paging_info: PagingInfo | None,
+    q_indices: Int[Array, "*#B #H T"] | None,
+    k_indices: Int[Array, "*#B #H t"] | None,
+    normalize_output: bool,
+    chunk_size: int,
+) -> tuple[Float[Array, "*B T H d"], None]:
+  """Computes chunked attention."""
+  if paging_info is not None:
+    raise NotImplementedError("Paged attention not supported.")
+
+  *b, seq_q, h, _ = q.shape
+  *_, seq_k, _, d_out = v.shape
+
+  q_len_or_indices = seq_q if q_indices is None else q_indices
+  k_len_or_indices = seq_k if k_indices is None else k_indices
+  mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+
+  def get_chunk(x, idx, size, axis):
+    if x is None:
+      return None
+    if x.shape[axis] == 1:
+      return x
+    return jax.lax.dynamic_slice_in_dim(x, idx, size, axis)
+
+  def q_loop_fn(q_chunk_idx, _, *, q_chunk_size):
+    def get_q_chunk(x, axis):
+      return get_chunk(x, q_chunk_idx, q_chunk_size, axis)
+
+    q_chunk = get_q_chunk(q, -3)
+    bias_chunk = get_q_chunk(bias, -2)
+    mask_chunk = get_q_chunk(mask, -2)
+    dropout_mask_chunk = get_q_chunk(dropout_mask, -2)
+
+    intermediates_shape = (*b, h, q_chunk.shape[-3])
+    acc = jnp.zeros(q_chunk.shape[:-1] + (d_out,), jnp.float32)
+    x_max = jnp.full(intermediates_shape, float("-inf"))
+    denom = jnp.zeros(intermediates_shape, jnp.float32)
+
+    def kv_loop_fn(_, carry, *, kv_chunk_size):
+      kv_chunk_idx, accum, x_max, denom = carry
+
+      def get_kv_chunk(x, axis):
+        return get_chunk(x, kv_chunk_idx, kv_chunk_size, axis)
+
+      out = _attend_chunk(
+          q_chunk,
+          get_kv_chunk(k, -3),
+          get_kv_chunk(v, -3),
+          accum,
+          x_max,
+          denom,
+          bias=get_kv_chunk(bias_chunk, -1),
+          mask=get_kv_chunk(mask_chunk, -1),
+          dropout_mask=get_kv_chunk(dropout_mask_chunk, -1),
+          precision=precision,
+          logits_dtype=logits_dtype,
+          logits_scale=logits_scale,
+          logits_soft_cap=logits_soft_cap,
+          dropout_rate=dropout_rate,
+      )
+      return kv_chunk_idx + kv_chunk_size, *out
+
+    even_chunks = seq_k // chunk_size
+    carry = (0, acc, x_max, denom)
+
+    # Main kv loop
+    if seq_k >= chunk_size:
+      loop_fn = functools.partial(kv_loop_fn, kv_chunk_size=chunk_size)
+      carry = jax.lax.fori_loop(0, even_chunks, loop_fn, carry)
+
+    # Remainder kv loop
+    if (k_remainder := (seq_k % chunk_size)) != 0:
+      carry = kv_loop_fn(even_chunks + 1, carry, kv_chunk_size=k_remainder)
+
+    # Final normalization by the denominator.
+    _, acc, _, denom = carry
+    out = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
+    return q_chunk_idx + q_chunk_size, out.astype(q.dtype)
+
+  q_chunk_idx, out = 0, None
+
+  # Main q loop
+  if seq_q >= chunk_size:
+    loop_fn = functools.partial(q_loop_fn, q_chunk_size=chunk_size)
+    length = seq_q // chunk_size
+    q_chunk_idx, out = jax.lax.scan(loop_fn, init=0, length=length)
+    out = shape_lib.einshape("q...thd->...(qt)hd")(out)
+
+  # Remainder q loop
+  if (q_remainder := (seq_q % chunk_size)) != 0:
+    _, rem_out = q_loop_fn(q_chunk_idx, None, q_chunk_size=q_remainder)
+    out = rem_out if out is None else jnp.concatenate([out, rem_out], axis=-3)
+
+  return out, None
+
+
+@jaxtyping.jaxtyped
+def _attend_paged(
+    q: Float[Array | QuantizedArray, "*B T H D"],
+    k: Float[Array | QuantizedArray, "*b t #H D"],
+    v: Float[Array | QuantizedArray, "*b t #H d"],
+    *,
+    precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+    logits_dtype: jnp.dtype,
+    logits_scale: float,
+    bias: Float[Array, "*#B #H #T #t"] | None,
+    logits_soft_cap: float | None,
+    mask: Mask,
+    dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
+    dropout_rate: float,
+    paging_info: PagingInfo | None,
+    q_indices: Int[Array, "*#B #H T"] | None,
+    k_indices: Int[Array, "*#B #H t"] | None,
+    normalize_output: bool,
+    chunk_size: int,
+) -> tuple[Float[Array, "*B T H d"], None]:
+  """Computes paged attention."""
+  del q_indices  # Unused.
+  assert paging_info is not None
+
+  if mask or any(x is not None for x in (bias, dropout_mask, k_indices)):
+    raise NotImplementedError("Paging only supports qkv as inputs.")
+
+  _, seq_q, h, _ = q.shape
+
+  def bq_loop_fn(bidx, q_batch):
+    num_pages = paging_info.num_active_pages[bidx]
+    page_indices = paging_info.active_page_indices[bidx]
+
+    def sq_loop_fn(_, q_chunk):
+      intermediates_shape = (h, q_chunk.shape[0])
+      acc = jnp.zeros(q_chunk.shape[:-1] + (v.shape[-1],), jnp.float32)
+      x_max = jnp.full(intermediates_shape, float("-inf"))
+      denom = jnp.zeros(intermediates_shape, jnp.float32)
+
+      def kv_loop_fn(i, carry):
+        accum, x_max, denom = carry
+        return _attend_chunk(
+            q_chunk,
+            k[page_indices[i]],
+            v[page_indices[i]],
+            accum,
+            x_max,
+            denom,
+            bias=None,
+            mask=None,
+            dropout_mask=None,
+            precision=precision,
+            logits_dtype=logits_dtype,
+            logits_scale=logits_scale,
+            logits_soft_cap=logits_soft_cap,
+            dropout_rate=dropout_rate,
+        )
+
+      # KV loop
+      carry = jax.lax.fori_loop(0, num_pages, kv_loop_fn, (acc, x_max, denom))
+
+      # Final normalization by the denominator.
+      acc, _, denom = carry
+      out = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
+      return -1, out.astype(q.dtype)
+
+    q_batch = q_batch.reshape(seq_q // chunk_size, chunk_size, h, -1)
+    _, out = jax.lax.scan(sq_loop_fn, init=0, xs=q_batch)
+    return bidx + 1, out.reshape(seq_q, *out.shape[2:])
+
+  return jax.lax.scan(bq_loop_fn, init=0, xs=q)[1], None
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class XlaChunkedDotProductAttention(
     base.DotProductAttention[op.NullConfig, None]
 ):
   """XLA chunked dot product attention function."""
 
-  chunk_size: int
+  chunk_size: int = 128
 
   @jaxtyping.jaxtyped
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      k: Float[Array | QuantizedArray, "*b t h D"],
+      v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       logits_dtype: jnp.dtype,
@@ -122,6 +307,7 @@ class XlaChunkedDotProductAttention(
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
+      paging_info: PagingInfo | None,
       q_indices: Int[Array, "*#B #H T"] | None,
       k_indices: Int[Array, "*#B #H t"] | None,
       normalize_output: bool,
@@ -137,87 +323,22 @@ class XlaChunkedDotProductAttention(
       k = jnp.repeat(k, repeats, axis=-2)
       v = jnp.repeat(v, repeats, axis=-2)
 
-    *b, seq_q, h, _ = q.shape
-    *_, seq_k, _, d_out = v.shape
-
-    q_len_or_indices = seq_q if q_indices is None else q_indices
-    k_len_or_indices = seq_k if k_indices is None else k_indices
-    mask = mask.as_array(q_len_or_indices, k_len_or_indices)
-
-    def get_chunk(x, idx, size, axis):
-      if x is None:
-        return None
-      if x.shape[axis] == 1:
-        return x
-      return jax.lax.dynamic_slice_in_dim(x, idx, size, axis)
-
-    def q_loop_fn(q_chunk_idx, _, *, q_chunk_size):
-      def get_q_chunk(x, axis):
-        return get_chunk(x, q_chunk_idx, q_chunk_size, axis)
-
-      q_chunk = get_q_chunk(q, -3)
-      bias_chunk = get_q_chunk(bias, -2)
-      mask_chunk = get_q_chunk(mask, -2)
-      dropout_mask_chunk = get_q_chunk(dropout_mask, -2)
-
-      intermediates_shape = (*b, h, q_chunk.shape[-3])
-      acc = jnp.zeros(q_chunk.shape[:-1] + (d_out,), jnp.float32)
-      x_max = jnp.full(intermediates_shape, float("-inf"))
-      denom = jnp.zeros(intermediates_shape, jnp.float32)
-
-      def kv_loop_fn(_, carry, *, kv_chunk_size):
-        kv_chunk_idx, accum, x_max, denom = carry
-
-        def get_kv_chunk(x, axis):
-          return get_chunk(x, kv_chunk_idx, kv_chunk_size, axis)
-
-        out = _attend_chunk(
-            q_chunk,
-            get_kv_chunk(k, -3),
-            get_kv_chunk(v, -3),
-            accum,
-            x_max,
-            denom,
-            bias=get_kv_chunk(bias_chunk, -1),
-            mask=get_kv_chunk(mask_chunk, -1),
-            dropout_mask=get_kv_chunk(dropout_mask_chunk, -1),
-            precision=precision,
-            logits_dtype=logits_dtype,
-            logits_scale=logits_scale,
-            logits_soft_cap=logits_soft_cap,
-            dropout_rate=dropout_rate,
-        )
-        return kv_chunk_idx + kv_chunk_size, *out
-
-      even_chunks = seq_k // self.chunk_size
-      carry = (0, acc, x_max, denom)
-
-      # Main kv loop
-      if seq_k >= self.chunk_size:
-        loop_fn = functools.partial(kv_loop_fn, kv_chunk_size=self.chunk_size)
-        carry = jax.lax.fori_loop(0, even_chunks, loop_fn, carry)
-
-      # Remainder kv loop
-      if (k_remainder := (seq_k % self.chunk_size)) != 0:
-        carry = kv_loop_fn(even_chunks + 1, carry, kv_chunk_size=k_remainder)
-
-      # Final normalization by the denominator.
-      _, acc, _, denom = carry
-      out = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
-      return q_chunk_idx + q_chunk_size, out.astype(q.dtype)
-
-    q_chunk_idx, out = 0, None
-
-    # Main q loop
-    if seq_q >= self.chunk_size:
-      loop_fn = functools.partial(q_loop_fn, q_chunk_size=self.chunk_size)
-      length = seq_q // self.chunk_size
-      q_chunk_idx, out = jax.lax.scan(loop_fn, init=0, length=length)
-      out = out[..., None, :, :, :].swapaxes(0, -4).reshape((*b, -1, h, d_out))
-
-    # Remainder q loop
-    if (q_remainder := (seq_q % self.chunk_size)) != 0:
-      _, rem_out = q_loop_fn(q_chunk_idx, None, q_chunk_size=q_remainder)
-      out = rem_out if out is None else jnp.concatenate([out, rem_out], axis=-3)
-
-    return out, None
+    attn_fn = _attend_chunked if paging_info is None else _attend_paged
+    return attn_fn(
+        q,
+        k,
+        v,
+        precision=precision,
+        logits_dtype=logits_dtype,
+        logits_scale=logits_scale,
+        bias=bias,
+        logits_soft_cap=logits_soft_cap,
+        mask=mask,
+        dropout_mask=dropout_mask,
+        dropout_rate=dropout_rate,
+        paging_info=paging_info,
+        q_indices=q_indices,
+        k_indices=k_indices,
+        normalize_output=normalize_output,
+        chunk_size=self.chunk_size,
+    )

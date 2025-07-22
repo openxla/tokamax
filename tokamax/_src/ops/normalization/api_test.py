@@ -75,7 +75,10 @@ class LayerNormTest(parameterized.TestCase):
       chex.assert_trees_all_close(out, out_golden)
 
     with self.subTest("correct_implementation_used"):
-      opspecs = hlo_utils.get_opspecs(norm_fn.lower(x, scale, offset))
+      opspecs = hlo_utils.get_opspecs(
+          norm_fn.lower(x, scale, offset),
+          include_xla_kernels=(implementation == "xla"),
+      )
       triton_impl = api.IMPLEMENTATIONS["triton"].__class__
       triton_vjp_impl = _IMPLEMENTATIONS_VJP["triton"].__class__
       match implementation:
@@ -83,7 +86,9 @@ class LayerNormTest(parameterized.TestCase):
           self.assertIsInstance(opspecs[0].op, triton_impl)
           self.assertIsInstance(opspecs[1].op, triton_vjp_impl)
         case "xla":
-          self.assertEmpty(opspecs)
+          self.assertIsInstance(
+              opspecs[0].op, api.IMPLEMENTATIONS["xla"].__class__
+          )
         case None:
           if jax.default_backend() == "gpu":
             # Ensure the Triton implementation is used.

@@ -30,7 +30,7 @@ SPEC_SHAPES = dict(
         [4096] + [0] * 7,
     ),
     memory_bound=(8, 8, 4096, 4096, jnp.bfloat16, jnp.bfloat16),
-    # FIXME(cjfj): Use correct dtypes.
+    # FIXME: Use correct dtypes.
     mixtral_8x7b=(8, 8192, 14336, 4096, jnp.bfloat16, jnp.bfloat16),
 )
 

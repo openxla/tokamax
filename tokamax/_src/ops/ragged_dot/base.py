@@ -85,7 +85,7 @@ class GroupSizes(numerics.InitializableArray):
     return cls(value, initializer=aux_data)
 
 
-# TODO(cjfj): Move to a common location.
+# TODO: Move to a common location.
 class _HashablePartial(functools.partial):
   """A `functools.partial` that is hashable."""
 
@@ -122,10 +122,10 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     if ragged_dot_dimension_numbers is None:
-      # TODO(cjfj): Support batch dims on LHS and/or RHS?
+      # TODO: Support batch dims on LHS and/or RHS?
       ragged_dot_dimension_numbers = DEFAULT_RAGGED_DOT_DIM_NUMS
 
-    # TODO(cjfj): Create representative values for other ragged dot dim numbers.
+    # TODO: Create representative values for other ragged dot dim numbers.
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
       if not isinstance(group_sizes, numerics.InitializableArray):
         representative_sizes = [lhs.shape[0] // rhs.shape[0]] * rhs.shape[0]

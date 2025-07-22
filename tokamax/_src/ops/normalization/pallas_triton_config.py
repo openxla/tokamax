@@ -64,7 +64,7 @@ def get_key(
     **kwargs,
 ) -> Key:
   """Returns the lookup key for the given args."""
-  # TODO(cjfj): Cap the shape at a given size?
+  # TODO: Cap the shape at a given size?
   key = immutabledict.immutabledict(
       x=jax.ShapeDtypeStruct(canonicalize_shape(x.shape, axis), x.dtype),
       scale=_maybe_shape(scale),

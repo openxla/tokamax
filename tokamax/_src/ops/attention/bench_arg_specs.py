@@ -19,7 +19,7 @@ import jax.numpy as jnp
 
 
 ARG_SPECS = dict(
-    # FIXME(cjfj): More dtypes.
+    # FIXME: More dtypes.
     mixtral_8x7b_bf16=dict(
         q=jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
         k=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),

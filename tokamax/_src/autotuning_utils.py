@@ -14,12 +14,13 @@
 # ==============================================================================
 """Utilities for autotuning Tokamax ops."""
 
+import collections
 from collections.abc import Callable, Mapping
 import inspect
-from typing import Any, Final
-
+from typing import Any, Final, Sequence, TypeVar
 from absl import logging
 import immutabledict
+from tokamax._src import autotuning
 from tokamax._src.ops import op as op_base
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
@@ -40,6 +41,7 @@ API_IMPLEMENTATIONS: Final[
     attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,
 })
 
+_Config = TypeVar('_Config')
 
 def get_op_api_implementations(
     op: op_base.Op,
@@ -84,3 +86,28 @@ def get_all_api_implementations_with_specs(
 
   args = op_spec.arguments
   return tuple(op_base.BoundArguments(op, args) for op in implementations.values())  # pytype: disable=wrong-arg-types
+
+
+def autotune_all_captured_ops(
+    bound_args_list: Sequence[op_base.BoundArguments],
+) -> list[tuple[op_base.BoundArguments, autotuning.AutotuningData[Any]]]:
+  """Autotunes all captured ops.
+
+  Args:
+    bound_args_list: The opspec tuple that will be autotuned. Should be obtained
+      by calling `get_all_api_implementations_with_specs`.
+
+  Returns:
+    A list of (bound_args, autotuning results). Each entry in the
+    list corresponds to a different spec of the op and its autotuning results.
+  """
+  autotuned_results = []
+  for opspec in bound_args_list:
+    try:
+      autotuned_data = opspec.autotune()
+    except Exception:
+      logging.exception('Failed to autotune for op %s', opspec.op)
+      continue
+
+    autotuned_results.append((opspec, autotuned_data))
+  return autotuned_results
