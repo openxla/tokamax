@@ -183,6 +183,8 @@ def _bwd(
 
       delta = plgpu.load(delta_smem, (), layout=L.WGMMA.reduce(1))  # [block_q]
       m = plgpu.load(m_smem, (), layout=L.WGMMA.reduce(1))  # [block_q]
+      if use_base2:
+        m *= math.log2(math.e)
       l = plgpu.load(l_smem, (), layout=L.WGMMA.reduce(1))  # [block_q]
       dq_acc = plgpu.layout_cast(
           jnp.full((block_q, head_dim), 0, dtype=jnp.float32), L.WGMMA,
@@ -329,6 +331,7 @@ def _bwd(
       s_scale = logits_scale
       if use_base2:
         s_scale *= math.log2(math.e)
+        m *= math.log2(math.e)
 
       sT *= s_scale
 

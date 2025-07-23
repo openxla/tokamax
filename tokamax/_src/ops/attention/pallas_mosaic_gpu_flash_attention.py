@@ -334,6 +334,8 @@ def _fwd(
       pl.when(wg_idx == 0)(perform_schedule_barrier)
 
       if return_residuals:
+        if use_base2:
+          m_i *= (1 / math.log2(math.e))
         residual_smem[0][...], residual_smem[1][...] = m_i, l_i
         plgpu.commit_smem()
         for smem, gmem in zip(residual_smem, residual_refs):
@@ -537,7 +539,7 @@ _SUPPORTED_PRECISIONS = (
 class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   """Flash attention with Mosaic GPU."""
 
-  use_base2: bool = False
+  use_base2: bool = True
   use_stable_softmax: bool | type[base.AUTO] = base.AUTO
 
   def __post_init__(self):
