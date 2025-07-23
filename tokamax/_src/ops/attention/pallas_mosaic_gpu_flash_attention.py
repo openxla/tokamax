@@ -45,7 +45,6 @@ PagingInfo = base.PagingInfo
 _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_ROW = plgpu.Layout.WGMMA_ROW
 _WGMMA_COL = plgpu.Layout.WGMMA_COL
-_WG_SPLAT = plgpu.Layout.WG_SPLAT
 
 
 @dataclasses.dataclass(frozen=True)
@@ -93,7 +92,7 @@ def _fwd(
   orig_head_dim_out = head_dim_out
 
   if num_q_heads % num_kv_heads:
-    raise ValueError(f"{num_q_heads=} must be divisible by and {num_kv_heads=}")
+    raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
 
   pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
@@ -141,15 +140,14 @@ def _fwd(
     wg_idx = lax.axis_index("wg")
 
     (
-        (q_smems, k_smem, v_smem, o_smems, *residual_smems),
-        (bias_smems, mask_smems),
-        (q_barriers, k_barriers, v_barriers, bias_barriers, mask_barriers),
-        (
-            k_consumed_barriers,
-            v_consumed_barriers,
-            bias_consumed_barriers,
-            mask_consumed_barriers,
-        ),
+        (q_smems, k_smems, v_smems, o_smems, *residual_smems),
+        q_barriers,
+        bias_smems,
+        mask_smems,
+        (k_barriers, k_consumed_barriers),
+        (v_barriers, v_consumed_barriers),
+        (bias_barriers, bias_consumed_barriers),
+        (mask_barriers, mask_consumed_barriers),
         schedule_barrier,
     ) = scoped
 
@@ -194,9 +192,7 @@ def _fwd(
       qs = block.ds(2 * q_idx + wg_idx, block_q)
 
       plgpu.set_max_registers(232, action="increase")
-      q_smem, o_smem = q_smems.at[wg_idx], o_smems.at[wg_idx]
-      residual_smem = [ref.at[wg_idx] for ref in residual_smems]
-
+      q_smem = q_smems.at[wg_idx]
       q_barrier = q_barriers.at[wg_idx]
       plgpu.copy_gmem_to_smem(q_ref.at[b_idx, qs, h_idx], q_smem, q_barrier)
 
@@ -229,7 +225,7 @@ def _fwd(
         slot = lax.rem(kv_step, max_stages)
 
         def compute_qk(acc_ref):
-          k_smem_T = plgpu.transpose_ref(k_smem.at[slot], (1, 0))  # pylint: disable=invalid-name
+          k_smem_T = plgpu.transpose_ref(k_smems.at[slot], (1, 0))  # pylint: disable=invalid-name
           plgpu.wgmma(acc_ref, q_smem, k_smem_T)
           plgpu.barrier_arrive(schedule_barrier)
           return acc_ref[...]
@@ -241,9 +237,8 @@ def _fwd(
         scale = logits_scale
 
         if bias_ref is not None:
-          bias_smem = bias_smems.at[slot, block.ds(wg_idx, block_q)]
           plgpu.barrier_wait(bias_barriers.at[slot])
-          bias = bias_smem[...]
+          bias = bias_smems[slot, block.ds(wg_idx, block_q)]
           plgpu.barrier_arrive(bias_consumed_barriers.at[slot])
           s = s * scale + bias.astype(s.dtype)
           scale = 1.0
@@ -291,9 +286,8 @@ def _fwd(
             mask = plgpu.load(mask_ref, idx, layout=_WGMMA_ROW, optimized=False)
             mask = lax.broadcast_in_dim(mask, s.shape, [0])
           else:
-            mask_smem = mask_smems.at[slot, block.ds(wg_idx, block_q)]
             plgpu.barrier_wait(mask_barriers.at[slot])
-            mask = mask_smem[...]
+            mask = mask_smems[slot, block.ds(wg_idx, block_q)]
             plgpu.barrier_arrive(mask_consumed_barriers.at[slot])
           s = jnp.where(mask, s, mask_value)
 
@@ -323,7 +317,7 @@ def _fwd(
           l_i += p.sum(axis=1)
 
         def compute_pv(acc_ref):
-          plgpu.wgmma(acc_ref, p_, v_smem.at[slot])
+          plgpu.wgmma(acc_ref, p_, v_smems.at[slot])
           wait_step = kv_step + 1
 
           @pl.when(wait_step < max_kv_step)
@@ -355,12 +349,13 @@ def _fwd(
       pl.when(wg_idx == 0)(perform_schedule_barrier)
 
       if return_residuals:
-        if use_base2:
-          m_i *= (1 / math.log2(math.e))
-        residual_smem[0][...], residual_smem[1][...] = m_i, l_i
+        m_smem, l_smem = (smems.at[wg_idx] for smems in residual_smems)
+        m_smem[...] = (m_i * (1 / math.log2(math.e))) if use_base2 else m_i
+        l_smem[...] = l_i
         plgpu.commit_smem()
-        for smem, gmem in zip(residual_smem, residual_refs):
-          plgpu.copy_smem_to_gmem(smem, gmem.at[b_idx, h_idx, qs])
+        m_ref, l_ref = residual_refs
+        plgpu.copy_smem_to_gmem(m_smem, m_ref.at[b_idx, h_idx, qs])
+        plgpu.copy_smem_to_gmem(l_smem, l_ref.at[b_idx, h_idx, qs])
 
       l_i += float(jnp.finfo(jnp.float32).tiny)
 
@@ -368,6 +363,7 @@ def _fwd(
         # TODO: Invert and multiply to avoid expensive divisions.
         acc /= lax.broadcast_in_dim(l_i, acc.shape, [0])
 
+      o_smem = o_smems.at[wg_idx]
       o_smem[...] = acc.astype(q.dtype)  # pytype: disable=attribute-error
       plgpu.commit_smem()
       plgpu.copy_smem_to_gmem(o_smem, out_ref.at[b_idx, qs, h_idx])
@@ -377,22 +373,17 @@ def _fwd(
     def _memory_wg():
       plgpu.set_max_registers(40, action="decrease")
       kv_head = lax.div(h_idx, q_heads_per_kv_head)
+      qs = block.ds(q_idx, 2 * block_q)
+      k_ref_ = k_ref.at[b_idx, :, kv_head]
+      v_ref_ = v_ref.at[b_idx, :, kv_head]
+      bias_ref_ = None if bias_ref is None else bias_ref.at[b_idx, h_idx, qs]
+      if mask_smems is None:
+        mask_ref_ = None
+      else:
+        mask_ref_ = mask_ref.at[mask_b_idx, mask_h_idx, qs]
 
-      def kv_async_load(slot, ref, ks, smem, barriers):
-        idx = (b_idx, ks, kv_head)
-        plgpu.copy_gmem_to_smem(ref.at[idx], smem.at[slot], barriers.at[slot])
+      cp = plgpu.copy_gmem_to_smem
 
-      def bias_async_load(slot, ref, ks, smem, barriers):
-        idx = (b_idx, h_idx, block.ds(q_idx, 2 * block_q), ks)
-        plgpu.copy_gmem_to_smem(ref.at[idx], smem.at[slot], barriers.at[slot])
-
-      def mask_async_load(slot, ref, ks, smem, barriers):
-        idx = (mask_b_idx, mask_h_idx, block.ds(q_idx, 2 * block_q), ks)
-        plgpu.copy_gmem_to_smem(ref.at[idx], smem.at[slot], barriers.at[slot])
-
-      async_mask = not (mask_ref is None or bcast_mask_q or bcast_mask_k)
-
-      # TODO: Reorder loads to match order of consumption.
       for i in range(max_stages):
 
         @pl.when(i < (max_kv_step - min_kv_step))
@@ -400,27 +391,27 @@ def _fwd(
           step = min_kv_step + i
           slot = lax.rem(step, max_stages)
           ks = block.ds(step, block_kv)
-          kv_async_load(slot, k_ref, ks, k_smem, k_barriers)
-          if bias_ref is not None:
-            bias_async_load(slot, bias_ref, ks, bias_smems, bias_barriers)
-          if async_mask:
-            mask_async_load(slot, mask_ref, ks, mask_smems, mask_barriers)
-          kv_async_load(slot, v_ref, ks, v_smem, v_barriers)
+          cp(k_ref_.at[ks], k_smems.at[slot], k_barriers.at[slot])
+          if bias_ref_ is not None:
+            cp(bias_ref_.at[:, ks], bias_smems.at[slot], bias_barriers.at[slot])
+          if mask_ref_ is not None:
+            cp(mask_ref_.at[:, ks], mask_smems.at[slot], mask_barriers.at[slot])
+          cp(v_ref_.at[ks], v_smems.at[slot], v_barriers.at[slot])
 
       @pl.loop(min_kv_step, max_kv_step - max_stages)
       def _kv_loop(kv_step):
         slot = lax.rem(kv_step, max_stages)
         ks = block.ds(kv_step + max_stages, block_kv)
         plgpu.barrier_wait(k_consumed_barriers.at[slot])
-        kv_async_load(slot, k_ref, ks, k_smem, k_barriers)
-        if bias_ref is not None:
+        cp(k_ref_.at[ks], k_smems.at[slot], k_barriers.at[slot])
+        if bias_ref_ is not None:
           plgpu.barrier_wait(bias_consumed_barriers.at[slot])
-          bias_async_load(slot, bias_ref, ks, bias_smems, bias_barriers)
-        if async_mask:
+          cp(bias_ref_.at[:, ks], bias_smems.at[slot], bias_barriers.at[slot])
+        if mask_ref_ is not None:
           plgpu.barrier_wait(mask_consumed_barriers.at[slot])
-          mask_async_load(slot, mask_ref, ks, mask_smems, mask_barriers)
+          cp(mask_ref_.at[:, ks], mask_smems.at[slot], mask_barriers.at[slot])
         plgpu.barrier_wait(v_consumed_barriers.at[slot])
-        kv_async_load(slot, v_ref, ks, v_smem, v_barriers)
+        cp(v_ref_.at[ks], v_smems.at[slot], v_barriers.at[slot])
 
   def entry(*refs):
     compute_wgs = 2
@@ -439,37 +430,14 @@ def _fwd(
     l_scratch = m_scratch = plgpu.SMEM((compute_wgs, block_q), jnp.float32)
 
     q_barriers = plgpu.Barrier(num_barriers=compute_wgs)
-    kv_barriers = plgpu.Barrier(num_barriers=max_stages)
-    kv_consumed_barriers = plgpu.Barrier(
-        num_arrivals=compute_wgs, num_barriers=max_stages
+    kv_barriers = (
+        plgpu.Barrier(num_barriers=max_stages),
+        plgpu.Barrier(num_barriers=max_stages, num_arrivals=compute_wgs),
     )
     schedule_barrier = plgpu.Barrier(num_arrivals=compute_wgs)
 
-    if bias is None:
-      bias_scratch = None
-      bias_barriers = None
-      bias_consumed_barriers = None
-    else:
-      bias_scratch = tiled_smem(
-          (max_stages, compute_wgs * block_q, block_kv), bias.dtype
-      )
-      bias_barriers = plgpu.Barrier(num_barriers=max_stages)
-      bias_consumed_barriers = plgpu.Barrier(
-          num_arrivals=compute_wgs, num_barriers=max_stages
-      )
-
-    if mask is None or mask.shape[-2] == 1 or mask.shape[-1] == 1:
-      mask_scratch = None
-      mask_barriers = None
-      mask_consumed_barriers = None
-    else:
-      mask_scratch = tiled_smem(
-          (max_stages, compute_wgs * block_q, block_kv), jnp.int8
-      )
-      mask_barriers = plgpu.Barrier(num_barriers=max_stages)
-      mask_consumed_barriers = plgpu.Barrier(
-          num_arrivals=compute_wgs, num_barriers=max_stages
-      )
+    bias_mask_smem_shape = (max_stages, compute_wgs * block_q, block_kv)
+    no_async_mask = mask is None or mask.shape[-2] == 1 or mask.shape[-1] == 1
 
     pl.run_scoped(
         lambda *args: kernel(*refs, scoped=args),
@@ -477,14 +445,13 @@ def _fwd(
             (q_scratch, k_scratch, v_scratch),
             (o_scratch, ((l_scratch, m_scratch) if return_residuals else ())),
         ),
-        (bias_scratch, mask_scratch),
-        (q_barriers, kv_barriers, kv_barriers, bias_barriers, mask_barriers),
-        (
-            kv_consumed_barriers,
-            kv_consumed_barriers,
-            bias_consumed_barriers,
-            mask_consumed_barriers,
-        ),
+        q_barriers,
+        None if bias is None else tiled_smem(bias_mask_smem_shape, bias.dtype),
+        None if no_async_mask else tiled_smem(bias_mask_smem_shape, jnp.int8),
+        kv_barriers,
+        kv_barriers,
+        (None, None) if bias is None else kv_barriers,
+        (None, None) if no_async_mask is None else kv_barriers,
         schedule_barrier,
         collective_axes="wg",
     )
