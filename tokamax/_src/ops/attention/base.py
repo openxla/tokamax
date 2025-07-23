@@ -41,7 +41,7 @@ DotPrecisionLike = jax.lax.Precision | jax.lax.DotAlgorithmPreset
 QuantizedArray = quantization.QuantizedArray
 
 
-@jax.tree_util.register_pytree_node_class
+@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Mask:
   """An attention mask.
@@ -91,29 +91,7 @@ class Mask:
   q_end: Int[Array, "*#B #t"] | None = None
   k_start: Int[Array, "*#B #T"] | None = None
   k_end: Int[Array, "*#B #T"] | None = None
-  is_causal: bool = False
-
-  def tree_flatten(self):
-    return (
-        self.bool_mask,
-        self.q_start,
-        self.q_end,
-        self.k_start,
-        self.k_end,
-    ), (self.is_causal,)
-
-  @classmethod
-  def tree_unflatten(cls, aux, children) -> Self:
-    (is_causal,) = aux
-    bool_mask, q_start, q_end, k_start, k_end = children
-    return cls(
-        bool_mask,
-        q_start=q_start,
-        q_end=q_end,
-        k_start=k_start,
-        k_end=k_end,
-        is_causal=is_causal,
-    )
+  is_causal: bool = dataclasses.field(default=False, metadata=dict(static=True))
 
   def as_array(
       self,
