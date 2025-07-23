@@ -129,8 +129,8 @@ def _fwd(
       mask_ref,
       k_start_ref,
       k_end_ref,
-      k_start_min_ref,
-      k_end_max_ref,
+      k_start_minmax_refs,
+      k_end_minmax_refs,
       out_ref,
       *residual_refs,
       scoped,
@@ -162,14 +162,21 @@ def _fwd(
 
     if is_causal:
       max_kv_step = lax.min(max_kv_step, 2 * (q_idx + 1))
-    if k_start_min_ref is not None:
-      idx = (b_idx, 0 if (k_start_min_ref.shape[1] == 1) else h_idx, q_idx)
-      k_start_min = plgpu.load(k_start_min_ref, idx, layout=_WG_SPLAT)
-      min_kv_step = lax.max(min_kv_step, k_start_min)
-    if k_end_max_ref is not None:
-      idx = (b_idx, 0 if (k_end_max_ref.shape[1] == 1) else h_idx, q_idx)
-      k_end_max = plgpu.load(k_end_max_ref, idx, layout=_WG_SPLAT)
-      max_kv_step = lax.min(max_kv_step, k_end_max)
+
+    def load_k_minmax(ref):
+      return ref[b_idx, 0 if (ref.shape[1] == 1) else h_idx, q_idx]
+
+    if k_start_minmax_refs is None:
+      k_start_max = None
+    else:
+      k_start_min, k_start_max = map(load_k_minmax, k_start_minmax_refs)
+      min_kv_step = lax.max(min_kv_step, lax.div(k_start_min, block_kv))
+
+    if k_end_minmax_refs is None:
+      k_end_min = None
+    else:
+      k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_refs)
+      max_kv_step = lax.min(max_kv_step, pl.cdiv(k_end_max, block_kv))
 
     if mask_ref is None:
       bcast_mask_q = bcast_mask_k = mask_b_idx = mask_h_idx = None
@@ -253,22 +260,31 @@ def _fwd(
         def iota(d):
           return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=_WGMMA)
 
-        q_idxs = (2 * q_idx + wg_idx) * block_q + iota(0)
-        k_idxs = kv_step * block_kv + iota(1)
+        k_base = kv_step * block_kv
         mask_value = float(jnp.finfo(jnp.float32).min)
 
         if do_causal:
+          q_idxs = (2 * q_idx + wg_idx) * block_q + iota(0)
+          k_idxs = k_base + iota(1)
           s = jnp.where(q_idxs >= k_idxs, s, mask_value)
-        if k_start_ref is not None:
+
+        def apply_k_start():
           k_start_ = lax.broadcast_in_dim(k_start, s.shape, [0])
-          s = jnp.where(k_idxs >= k_start_, s, mask_value)
-        if k_end_ref is not None:
+          return jnp.where(k_base + iota(1) >= k_start_, s, mask_value)
+
+        if k_start is not None:
+          s = lax.cond(k_base < k_start_max, apply_k_start, lambda: s)
+
+        def apply_k_end():
           k_end_ = lax.broadcast_in_dim(k_end, s.shape, [0])
-          s = jnp.where(k_idxs < k_end_, s, mask_value)
+          return jnp.where(k_base + iota(1) < k_end_, s, mask_value)
+
+        if k_end is not None:
+          s = lax.cond(k_base + block_kv > k_end_min, apply_k_end, lambda: s)
 
         if mask_ref is not None:
           if bcast_mask_q:
-            idx = (mask_b_idx, mask_h_idx, 0, block.ds(kv_step, block_kv))
+            idx = (mask_b_idx, mask_h_idx, 0, pl.ds(k_base, block_kv))
             mask = plgpu.load(mask_ref, idx, layout=_WGMMA_COL, optimized=False)
           elif bcast_mask_k:
             idx = (mask_b_idx, mask_h_idx, qs, 0)
@@ -473,17 +489,19 @@ def _fwd(
         collective_axes="wg",
     )
 
-  def preprocess_k_range(reduction_fn, x):
-    if x is None:
-      return None
-    reshape = lambda x, d: x.reshape((*x.shape[:-1], x.shape[-1] // d, d))
-    # Pre-reduce the k_start/k_end to a single value per `2 * block_q` (as each
-    # warpgroup processes a q-block and share the same k/v blocks).
-    x = reduction_fn(reshape(x, 2 * block_q), axis=-1)
-    return (x // block_kv) if reduction_fn == jnp.min else pl.cdiv(x, block_kv)
+  # Pre-reduce the k_start/k_end to a single value per `2 * block_q` (as compute
+  # warpgroups share the same k/v blocks).
+  if k_start is None:
+    k_start_minmax = None
+  else:
+    k_start_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_start)
+    k_start_minmax = (jnp.min(k_start_, -1), jnp.max(k_start_, -1))
 
-  k_start_min = preprocess_k_range(jnp.min, k_start)
-  k_end_max = preprocess_k_range(jnp.max, k_end)
+  if k_end is None:
+    k_end_minmax = None
+  else:
+    k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end)
+    k_end_minmax = (jnp.min(k_end_, -1), jnp.max(k_end_, -1))
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), q.dtype)]
   if return_residuals:
@@ -498,7 +516,7 @@ def _fwd(
       num_threads=3,
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(approx_math=True),
-  )(q, k, v, bias, mask, k_start, k_end, k_start_min, k_end_max)
+  )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
   out = out.reshape(*orig_q_shape[:-1], out.shape[-1])[..., :orig_head_dim_out]
   residuals = tuple(
