@@ -230,20 +230,25 @@ def _fwd(
         s = pl.run_scoped(compute_qk, plgpu.ACC(block_q_kv, jnp.float32))
         plgpu.barrier_arrive(k_consumed_barriers.at[slot])
         plgpu.barrier_wait(schedule_barrier)
-        s *= logits_scale
+
+        scale = logits_scale
 
         if bias_ref is not None:
           bias_smem = bias_smems.at[slot, block.ds(wg_idx, block_q)]
           plgpu.barrier_wait(bias_barriers.at[slot])
           bias = bias_smem[...]
           plgpu.barrier_arrive(bias_consumed_barriers.at[slot])
-          s += bias.astype(s.dtype)
+          s = s * scale + bias.astype(s.dtype)
+          scale = 1.0
 
         if logits_soft_cap is not None:
-          s = logits_soft_cap * jnp.tanh(s / logits_soft_cap)
+          s = jnp.tanh(s * (scale / logits_soft_cap))
+          scale = logits_soft_cap
 
         if use_base2:
-          s *= math.log2(math.e)
+          scale *= math.log2(math.e)
+
+        s *= scale
 
         def iota(d):
           return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=_WGMMA)
