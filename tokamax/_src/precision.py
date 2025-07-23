@@ -106,6 +106,7 @@ def to_dot_algorithm_preset(
     return precision
 
   if a_dtype != b_dtype:
+    # TODO: Support this case.
     raise ValueError("Cannot infer precision if operand types differ.")
   dtype = jnp.dtype(a_dtype)
 

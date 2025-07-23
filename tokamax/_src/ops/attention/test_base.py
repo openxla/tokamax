@@ -30,6 +30,7 @@ from tokamax._src import numerics
 from tokamax._src import quantization
 from tokamax._src import test_utils
 from tokamax._src.ops.attention import base
+from tokamax._src.ops.attention import xla_chunked
 from tokamax._src.ops.attention import bench_arg_specs
 
 
@@ -102,14 +103,11 @@ def _run_test(
     mask = mask.as_array(q.shape[-3], k.shape[-3])
 
   if mask is not None:
+    fully_masked_rows = jnp.sum(jnp.swapaxes(mask, -2, -3) == 0, axis=-1)
+    output_mask = jnp.where(fully_masked_rows, 0.0, 1.0)[..., None]
 
     def apply_output_mask(impl):
-      def impl_with_mask(*args, **kwargs):
-        fully_masked_rows = jnp.sum(jnp.swapaxes(mask, -2, -3) == 0, axis=-1)
-        output_mask = jnp.where(fully_masked_rows, 0.0, 1.0)
-        return impl(*args, **kwargs) * output_mask[..., None]
-
-      return impl_with_mask
+      return lambda *args, **kwargs: impl(*args, **kwargs) * output_mask
 
     impl = apply_output_mask(impl)
     ref_impl = apply_output_mask(ref_impl)
@@ -751,14 +749,13 @@ class AttentionTestBase(parameterized.TestCase):
     return_residuals = spec.get("return_residuals", False)
     logits_soft_cap = spec.get("logits_soft_cap")
 
-    if k.shape[-3] > (32 * 1024):
-      # TODO: Could we use xla_chunked?
-      self.skipTest("XLA reference does not support very large contexts.")
-
     get_first_output = lambda out: out[0] if return_residuals else out
     impl = lambda *a, **kw: get_first_output(self._attention_fn(*a, **kw))
 
-    if logits_soft_cap:
+    if k.shape[-3] > (32 * 1024):
+      ref_impl = xla_chunked.XlaChunkedDotProductAttention()
+      ref_kwargs = dict(precision=jax.lax.DotAlgorithmPreset.F32_F32_F32)
+    elif logits_soft_cap:
       ref_impl = _ref_impl_tanh
       ref_kwargs = dict(logits_soft_cap=logits_soft_cap)
     else:
