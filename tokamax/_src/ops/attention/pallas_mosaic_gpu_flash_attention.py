@@ -360,8 +360,8 @@ def _fwd(
       l_i += float(jnp.finfo(jnp.float32).tiny)
 
       if normalize_output:
-        # TODO: Invert and multiply to avoid expensive divisions.
-        acc /= lax.broadcast_in_dim(l_i, acc.shape, [0])
+        # TODO: Use `reciprocal`?
+        acc *= lax.broadcast_in_dim(1 / l_i, acc.shape, [0])
 
       o_smem = o_smems.at[wg_idx]
       o_smem[...] = acc.astype(q.dtype)  # pytype: disable=attribute-error
