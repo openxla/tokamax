@@ -89,6 +89,9 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
   def test_quantized_int4(self, test_name, kwargs):
     self.skipTest("Unsupported head_dim > 128.")
 
+  def test_bench_veo3(self, *_):
+    self.skipTest("Unsupported head_dim > 128.")
+
   @parameterized.parameters(*test_base.base_names_and_params("test_vmap"))
   def test_vmap(self, test_name, kwargs):
     kwargs = eval(f"dict{kwargs}")  # pylint: disable=eval-used
