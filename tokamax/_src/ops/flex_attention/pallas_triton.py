@@ -154,7 +154,7 @@ def _fwd_kernel(
           i if b is None else pl.ds(i * b, b)
           for i, b in zip(idx, spec.block_shape, strict=True)
       )
-      return pl.load(ref, idx)  # TODO: Masking.
+      return pl.load(ref, idx)
 
     # TODO: Lift loop invariant mod function values out of loop.
     score_mod_values = jax.tree.map(
@@ -195,9 +195,7 @@ def _fwd_kernel(
       dropout_mask_slice_k = (
           slice_k if (dropout_mask_ref.shape[-1] > 1) else slice(None)
       )
-      dropout_mask = pl.load(
-          dropout_mask_ref, (slice(None), dropout_mask_slice_k)
-      )
+      dropout_mask = pl.load(dropout_mask_ref, (slice(None), dropout_mask_slice_k))
       p *= dropout_mask.astype(p.dtype) / (1 - dropout_rate)
 
     for j in range(split_d_out):

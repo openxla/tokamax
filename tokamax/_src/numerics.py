@@ -14,9 +14,8 @@
 # ==============================================================================
 """Utilities for numerics."""
 
-from collections.abc import Callable, Sequence
+import abc
 import dataclasses
-import functools
 from typing import Any, TypeAlias
 
 import jax
@@ -120,39 +119,48 @@ def array_numeric_summary(x: jax.Array) -> NumericSummary:
 
 
 RngKey: TypeAlias = jax.Array
-Shape: TypeAlias = Sequence[int]
 
 
-@functools.partial(
-    jax.tree_util.register_dataclass,
-    data_fields=('value',),
-    meta_fields=('initializer',),
-)
-@dataclasses.dataclass(frozen=True)
-class InitializableArray:
-  """An array with an initializer.
+class ArrayInitializer(abc.ABC):
+  """A callable that returns an array."""
 
-  The initializer is serialized with the op, allowing data-dependent ops to be
-  benchmarked / autotuned with representative data.
-  """
+  @abc.abstractmethod
+  def __call__(self, key: RngKey) -> jax.Array:
+    ...
 
-  value: jax.Array
-  initializer: Callable[[RngKey, Shape, jax.typing.DTypeLike], jax.Array]
+  @property
+  @abc.abstractmethod
+  def shape(self) -> tuple[int, ...]:
+    ...
 
-
-def const_initializer(values, key, shape, dtype):
-  del key  # Unused.
-  values = jnp.array(values, dtype=dtype)
-  assert values.shape == shape
-  return values
+  @property
+  @abc.abstractmethod
+  def dtype(self) -> jnp.dtype:
+    ...
 
 
-def _int_initializer(key, shape, dtype):
+class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
+  """A abstract array with a known range."""
+
+  def __init__(self, shape, dtype, minval, maxval):
+    jax.ShapeDtypeStruct.__init__(self, shape, dtype)
+    self.minval = minval
+    self.maxval = maxval
+
+  def __call__(self, key: RngKey) -> jax.Array:
+    return _int_initializer(
+        key, self.shape, self.dtype, self.minval, self.maxval
+    )
+
+
+def _int_initializer(key, shape, dtype, minval=None, maxval=None):
   """Default int initializer for `random_initialize`."""
   dtype = jnp.dtype(dtype)
   # TODO: Choose this value in a more principled way.
-  maxval = min(jnp.iinfo(dtype).max + 1, 128)
-  minval = max(jnp.iinfo(dtype).min, -maxval)
+  if maxval is None:
+    maxval = min(jnp.iinfo(dtype).max + 1, 128)
+  if minval is None:
+    minval = max(jnp.iinfo(dtype).min, -maxval)
   # `jax.random.randint` doesn't currently support int4.
   # TODO: Remove this when int4 is supported.
   dtype_ = jnp.int8 if dtype.name in ('int4', 'uint4') else dtype
@@ -176,30 +184,28 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
   key = jax.random.PRNGKey(seed)
 
   def init_with_layout(x):
-    if isinstance(x, InitializableArray):
-      if not isinstance(x.value, jax.ShapeDtypeStruct):
-        return x.value
-      x, init = x.value, x.initializer
+    if isinstance(x, ArrayInitializer):
+      init = x
     elif isinstance(x, jax.ShapeDtypeStruct):
       dtype = jnp.dtype(x.dtype)
 
       if 'float' in dtype.name:
-        init = jax.random.normal
+        init = lambda key: jax.random.normal(key, shape=x.shape, dtype=dtype)
       elif dtype.name == 'bool':
-        init = lambda key, shape, _: jax.random.bernoulli(key, shape=shape)
+        init = lambda key: jax.random.bernoulli(key, shape=x.shape)
       elif 'int' in dtype.name:
-        init = _int_initializer
+        init = lambda key: _int_initializer(key, x.shape, dtype)
       else:
         raise NotImplementedError(f'dtype {dtype.name} not supported.')
     else:
       return x
 
-    if x.sharding is not None:
-      init = jax.jit(init, static_argnums=(1, 2), out_shardings=x.format)
+    if getattr(x, 'sharding', None) is not None:
+      init = jax.jit(init, out_shardings=x.format)
 
     nonlocal key
     curr_key, key = jax.random.split(key)
-    return init(curr_key, x.shape, x.dtype)
+    return init(curr_key)
 
-  is_leaf = lambda x: isinstance(x, InitializableArray)
+  is_leaf = lambda x: isinstance(x, ArrayInitializer)
   return jax.tree.map(init_with_layout, x, is_leaf=is_leaf)

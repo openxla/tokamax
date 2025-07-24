@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 
 
-ARG_SPECS = dict(
+TEST_SPECS_DICT = dict(
     # FIXME: More dtypes.
     mixtral_8x7b_bf16=dict(
         q=jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
@@ -33,3 +33,5 @@ ARG_SPECS = dict(
         is_causal=True,
     ),
 )
+
+ARG_SPECS = {k: lambda v=v: v.copy() for k, v in TEST_SPECS_DICT.items()}

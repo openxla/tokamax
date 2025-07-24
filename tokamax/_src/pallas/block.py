@@ -313,7 +313,7 @@ def pallas_call(
       out_shape_, out_specs_ = map(_as_tuple, (out_shape, out_specs))
       out_refs = jax.tree.map(_block_ref, out_refs, out_shape_, out_specs_)
 
-      # Patch `pl.load` and `pl.store` to allow `BlockRef` to be passed.
+      # Patch `plgpu.load` and `plgpu.store` to allow `BlockRef` to be passed.
       # `mock.patch` is not thread-safe, so hold the lock while patching.
       def ld_st(fn, ref, *args, **kwargs):
         if isinstance(ref, BlockRef):

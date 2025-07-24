@@ -250,9 +250,7 @@ def _fwd_kernel_impl(
       dropout_mask_slice_k = (
           slice_k if (dropout_mask_ref.shape[-1] > 1) else slice(None)
       )
-      dropout_mask = pl.load(
-          dropout_mask_ref, (slice(None), dropout_mask_slice_k)
-      )
+      dropout_mask = pl.load(dropout_mask_ref, (slice(None), dropout_mask_slice_k))
       p *= dropout_mask.astype(p.dtype) / (1 - dropout_rate)
 
     for i in range(split_d_out):

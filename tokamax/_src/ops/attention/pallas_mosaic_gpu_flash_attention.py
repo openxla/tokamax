@@ -147,7 +147,7 @@ def _fwd(
         mask_smems,
         (k_barriers, k_consumed_barriers),
         (v_barriers, v_consumed_barriers),
-        (bias_barriers, bias_consumed_barriers),
+        bias_barriers,
         (mask_barriers, mask_consumed_barriers),
         schedule_barrier,
     ) = scoped
@@ -156,26 +156,30 @@ def _fwd(
       plgpu.barrier_arrive(schedule_barrier)
       plgpu.barrier_wait(schedule_barrier)
 
-    min_kv_step = 0
-    max_kv_step = kv_seq_len // block_kv
+    def get_kv_ranges():
+      min_kv_step = 0
+      max_kv_step = kv_seq_len // block_kv
 
-    if is_causal:
-      max_kv_step = lax.min(max_kv_step, 2 * (q_idx + 1))
+      if is_causal:
+        q_max = (q_idx + 1) * (2 * block_q)
+        max_kv_step = lax.min(max_kv_step, pl.cdiv(q_max, block_kv))
 
-    def load_k_minmax(ref):
-      return ref[b_idx, 0 if (ref.shape[1] == 1) else h_idx, q_idx]
+      def load_k_minmax(ref):
+        return ref[b_idx, 0 if (ref.shape[1] == 1) else h_idx, q_idx]
 
-    if k_start_minmax_refs is None:
-      k_start_max = None
-    else:
-      k_start_min, k_start_max = map(load_k_minmax, k_start_minmax_refs)
-      min_kv_step = lax.max(min_kv_step, lax.div(k_start_min, block_kv))
+      if k_start_minmax_refs is None:
+        k_start_max = None
+      else:
+        k_start_min, k_start_max = map(load_k_minmax, k_start_minmax_refs)
+        min_kv_step = lax.max(min_kv_step, lax.div(k_start_min, block_kv))
 
-    if k_end_minmax_refs is None:
-      k_end_min = None
-    else:
-      k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_refs)
-      max_kv_step = lax.min(max_kv_step, pl.cdiv(k_end_max, block_kv))
+      if k_end_minmax_refs is None:
+        k_end_min = None
+      else:
+        k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_refs)
+        max_kv_step = lax.min(max_kv_step, pl.cdiv(k_end_max, block_kv))
+
+      return min_kv_step, max_kv_step, k_start_max, k_end_min
 
     if mask_ref is None:
       bcast_mask_q = bcast_mask_k = mask_b_idx = mask_h_idx = None
@@ -214,6 +218,7 @@ def _fwd(
 
       k_start = load_k_range(k_start_ref)
       k_end = load_k_range(k_end_ref)
+      min_kv_step, max_kv_step, k_start_max, k_end_min = get_kv_ranges()
 
       plgpu.barrier_wait(q_barrier)
       @pl.when(max_kv_step > min_kv_step)
@@ -229,19 +234,21 @@ def _fwd(
         def compute_qk(acc_ref):
           k_smem_T = plgpu.transpose_ref(k_smems.at[slot], (1, 0))  # pylint: disable=invalid-name
           plgpu.wgmma(acc_ref, q_smem, k_smem_T)
+          if bias_ref is None:
+            bias = None
+          else:
+            plgpu.barrier_wait(bias_barriers.at[slot])
+            bias = bias_smems[slot, block.ds(wg_idx, block_q)]
           plgpu.barrier_arrive(schedule_barrier)
-          return acc_ref[...]
+          return acc_ref[...], bias
 
-        s = pl.run_scoped(compute_qk, plgpu.ACC(block_q_kv, jnp.float32))
+        s, bias = pl.run_scoped(compute_qk, plgpu.ACC(block_q_kv, jnp.float32))
         plgpu.barrier_arrive(k_consumed_barriers.at[slot])
         plgpu.barrier_wait(schedule_barrier)
 
         scale = logits_scale
 
-        if bias_ref is not None:
-          plgpu.barrier_wait(bias_barriers.at[slot])
-          bias = bias_smems[slot, block.ds(wg_idx, block_q)]
-          plgpu.barrier_arrive(bias_consumed_barriers.at[slot])
+        if bias is not None:
           s = s * scale + bias.astype(s.dtype)
           scale = 1.0
 
@@ -334,9 +341,6 @@ def _fwd(
       hi = max_kv_step
 
       if is_causal:
-        if block_q != block_kv:  # TODO: Fix this.
-          raise NotImplementedError("Causal masking requires square blocks.")
-
         hi = lax.min(hi, lax.div(q_base, block_kv))
         if bias_ref is not None:
           hi = 0  # TODO: Fix this workaround for compiler bug.
@@ -389,6 +393,7 @@ def _fwd(
         mask_ref_ = mask_ref.at[mask_b_idx, mask_h_idx, qs]
 
       cp = plgpu.copy_gmem_to_smem
+      min_kv_step, max_kv_step, _, _ = get_kv_ranges()
 
       for i in range(max_stages):
 
@@ -411,7 +416,6 @@ def _fwd(
         plgpu.barrier_wait(k_consumed_barriers.at[slot])
         cp(k_ref_.at[ks], k_smems.at[slot], k_barriers.at[slot])
         if bias_ref_ is not None:
-          plgpu.barrier_wait(bias_consumed_barriers.at[slot])
           cp(bias_ref_.at[:, ks], bias_smems.at[slot], bias_barriers.at[slot])
         if mask_ref_ is not None:
           plgpu.barrier_wait(mask_consumed_barriers.at[slot])
@@ -456,7 +460,8 @@ def _fwd(
         None if no_async_mask else tiled_smem(bias_mask_smem_shape, jnp.int8),
         kv_barriers,
         kv_barriers,
-        (None, None) if bias is None else kv_barriers,
+        # bias doesn't need a consumed barrier as it is implied by k consumed.
+        None if bias is None else kv_barriers[0],
         (None, None) if no_async_mask is None else kv_barriers,
         schedule_barrier,
         collective_axes="wg",
@@ -484,8 +489,8 @@ def _fwd(
   out, *residuals = plgpu.kernel(
       entry,
       out_shape=out_shape,
-      grid=(num_q_heads, num_q_tiles, batch_size),
-      grid_names=("heads", "q_tiles", "batch"),
+      grid=(batch_size, num_q_tiles, num_q_heads),
+      grid_names=("batch", "q_tiles", "heads"),
       num_threads=3,
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(approx_math=True),
@@ -632,7 +637,35 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     )
 
   def _get_heuristics_config(self, ba: op.BoundArguments):
-    del ba
+    q, k, v = ba.batched.args
+    seq_len_k, _, head_dim = k.shape[-3:]
+    head_dim_out = v.shape[-1]
+
+    mask = ba.batched.kwargs["mask"]
+    q_indices = ba.batched.kwargs["q_indices"]
+    k_indices = ba.batched.kwargs["k_indices"]
+    mask, *_ = jax.eval_shape(_decompose_mask, mask, q, k, q_indices, k_indices)
+
+    def shared_mem_usage_bytes(block_q, block_kv, num_stages):
+      bytes_per_stage = (
+          block_kv * head_dim * jnp.finfo(k.dtype).bits // 8
+          + block_kv * head_dim_out * jnp.finfo(v.dtype).bits // 8
+      )
+      if (bias := ba.kwargs["bias"]) is not None:
+        bytes_per_stage += (
+            2 * block_q * block_kv * jnp.finfo(bias.dtype).bits // 8
+        )
+      # FIXME: This is an overestimate for broadcast masks.
+      if mask is not None:
+        bytes_per_stage += 2 * block_q * block_kv
+      return (
+          2 * block_q * head_dim * jnp.finfo(q.dtype).bits // 8
+          + num_stages * bytes_per_stage
+          + 1000  # Add some extra for barriers.
+      )
+
+    if seq_len_k % 128 == 0 and shared_mem_usage_bytes(64, 128, 2) < 227 * 1024:
+      return Config(block_q=64, block_kv=128, num_stages=2)
+
     # This is a pretty good option that works for most cases.
-    # TODO: for larger embed dimensions we can probably guess better.
     return Config(block_q=64, block_kv=64, num_stages=2)

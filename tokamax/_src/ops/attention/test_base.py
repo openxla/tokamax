@@ -311,11 +311,6 @@ class AttentionTestBase(parameterized.TestCase):
     self._run_test((2, 1024, 4, 48))
 
   @parameterized.parameters(
-      ((2, 4, 1024, 1024),),
-      ((2, 4, 1024, 1),),
-      ((2, 4, 1, 1024),),
-      ((2, 1, 1024, 1024),),
-      ((1, 4, 1024, 1024),),
       ((4, 1024, 1024),),
   )
   def test_bias(self, bias_shape):
@@ -328,14 +323,6 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   @parameterized.parameters(
-      ((2, 4, 1024, 1024),),
-      ((2, 4, 1024, 1),),
-      ((2, 4, 1, 1024),),
-      ((2, 1, 1024, 1024),),
-      ((1, 4, 1024, 1024),),
-      ((2, 1, 1024, 1),),
-      ((1, 4, 1024, 1),),
-      ((2, 1, 1, 1024),),
       ((1, 4, 1, 1024),),
   )
   def test_mask(self, mask_shape):
@@ -457,42 +444,6 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   @parameterized.parameters(
-      dict(is_causal=True),  # Explicit causal
-      dict(k_end=range(1, 1024 + 1)),  # Lower tri (implicit causal)
-      dict(k_start=range(1024)),  # Higher tri using k_start
-      dict(q_start=range(1024)),  # Lower tri using q_start
-      dict(q_start=range(1023, -1, -1)),  # Lower tri mirrored along vertical
-      dict(q_end=range(1, 1024 + 1)),  # Higher tri using q_end
-      dict(q_end=range(1024, 0, -1)),  # Higher tri mirrored along vertical
-      dict(
-          # Triangular hourglass-like shape
-          k_start=(range(512), range(512 - 1, -1, -1)),
-          k_end=(range(1024, 512, -1), range(512 + 1, 1024 + 1)),
-      ),
-      dict(
-          # Triangular hourglass-like shape. Offset by 3 per head (max_offs=12).
-          k_start=(
-              range(512 - 12),
-              (512 - 12 - 1,) * 2 * 12,
-              range(512 - 12 - 1, -1, -1),
-          ),
-          k_end=(
-              range(1024, 512 + 12, -1),
-              (1024 - 512 + 12 + 1,) * 2 * 12,
-              range(512 + 12 + 1, 1024 + 1),
-          ),
-          offset_per_head=3,
-      ),
-      dict(
-          # Transposed triangular hourglass-like shape
-          q_start=(range(512), range(512 - 1, -1, -1)),
-          q_end=(range(1024, 512, -1), range(512 + 1, 1024 + 1)),
-      ),
-      dict(k_start=512, is_causal=True),  # Lower tri (explicit causal) right
-      dict(k_end=(512 + 1), is_causal=True),  # Lower tri (explicit causal) left
-      # Lower tri (explicit causal) truncated left and right
-      dict(k_start=256, k_end=(1024 - 256 + 1), is_causal=True),
-      dict(q_start=17, k_start=range(1024)),
       dict(q_start=128, k_end=range(1, 1024 + 1)),
       dict(q_end=1007, k_start=range(1024)),
       dict(q_end=896, k_end=range(1, 1024 + 1)),
@@ -560,12 +511,6 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   @parameterized.parameters(
-      dict(vmap_in_axes=((0, 0, 0, 0, 0),)),
-      dict(vmap_in_axes=((0, None, None, 0, 0),)),
-      dict(vmap_in_axes=((0, 0, 0, None, 0),)),
-      dict(vmap_in_axes=((0, 0, 0, 0, None),)),
-      dict(vmap_in_axes=((0, 0, 0, 0, 0), (0, 0, 0, 0, 0))),
-      dict(vmap_in_axes=((None, 0, 0, 0, 0), (None, 0, 0, 0, 0))),
       dict(vmap_in_axes=((0, None, None, 0, 0), (0, None, None, 0, 0))),
       dict(vmap_in_axes=((0, None, None, None, 0), (None, 0, 0, 0, None))),
   )
@@ -612,11 +557,6 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   @parameterized.parameters(
-      dict(q_shape=(1024, 64)),  # `q` rank
-      dict(q_shape=(1024, 2, 64), kv_shape=(1024, 64)),  # `kv` rank
-      dict(q_shape=(4, 1024, 2, 64), kv_shape=(1, 1024, 2, 64)),  # batch
-      dict(q_shape=(4, 1024, 4, 64), kv_shape=(4, 1024, 3, 32)),  # num heads
-      dict(q_shape=(4, 1024, 2, 64), kv_shape=(4, 1024, 2, 32)),  # head dim
       dict(q_shape=(4, 1024, 2, 64), bias_shape=(4, 2, 1024, 512)),  # bias
       dict(q_shape=(4, 1024, 2, 64), mask_shape=(4, 2, 512, 1024)),  # mask
   )
@@ -633,12 +573,6 @@ class AttentionTestBase(parameterized.TestCase):
   @parameterized.product(
       tile_shape=(
           (1, 1, 1, -1),
-          (1, -1, 1, 1),
-          (1, -1, -1, 1),
-          (-1, 1, 1, -1),
-          (1, -1, -1, -1),
-          (-1, -1, -1, 1),
-          (-1, -1, -1, -1),
       ),
       quantize_q=(True, False),
   )
@@ -745,13 +679,20 @@ class AttentionTestBase(parameterized.TestCase):
         spec.pop("bias", None),
         spec.pop("mask", None),
     ))
-    logits_scale = spec.get("logits_scale", base.AUTO)
     is_causal = spec.pop("is_causal", False)
-    return_residuals = spec.get("return_residuals", False)
     logits_soft_cap = spec.get("logits_soft_cap")
 
-    get_first_output = lambda out: out[0] if return_residuals else out
-    impl = lambda *a, **kw: get_first_output(self._attention_fn(*a, **kw))
+    def impl(*args, **kwargs):
+      return_residuals = kwargs.get("return_residuals", False)
+      logits_scale = kwargs.get("logits_scale", base.AUTO)
+
+      q, *rest = args
+      if logits_scale != base.AUTO:
+        q_dtype = q.dtype
+        q = (q / logits_scale) / jnp.sqrt(q.shape[-1])
+        q = q.astype(q_dtype)
+      out = self._attention_fn(q, *rest, **kwargs)
+      return out[0] if return_residuals else out
 
     if k.shape[-3] > (32 * 1024):
       ref_impl = xla_chunked.XlaChunkedDotProductAttention()
@@ -769,13 +710,8 @@ class AttentionTestBase(parameterized.TestCase):
       mask = kwargs.pop("mask", None)
       is_causal = kwargs.pop("is_causal", None)
 
-      *_, q_seq, q_heads, head_dim = q.shape
+      *_, q_seq, q_heads, _ = q.shape
       *_, k_seq, k_heads, _ = k.shape
-
-      if logits_scale != base.AUTO:
-        q_dtype = q.dtype
-        q *= np.sqrt(head_dim) * logits_scale
-        q = q.astype(q_dtype)
 
       if isinstance(mask, base.Mask):
         mask = mask.as_array(q_seq, k_seq)

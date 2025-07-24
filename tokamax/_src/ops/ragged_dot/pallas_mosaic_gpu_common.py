@@ -227,9 +227,9 @@ def ragged_kernel(
 
   num_compute_threads = 1 if thread_axis is None else 2
   inner_grid = (
-      config.grid_block_n,
-      pl.cdiv(m, config.block_m) + g - 1,
       pl.cdiv(n, config.grid_block_n * config.block_n * num_compute_threads),
+      pl.cdiv(m, config.block_m) + g - 1,
+      config.grid_block_n,
   )
 
   def kernel_body(group_sizes_gmem, *args):
@@ -237,7 +237,7 @@ def ragged_kernel(
       group_sizes = [
           group_sizes_gmem[i] for i in range(group_sizes_gmem.shape[0])
       ]
-      block_ni, mi, remainder_ni = idx
+      remainder_ni, mi, block_ni = idx
       mi += m_offset
       ni = (
           block_ni
@@ -271,7 +271,7 @@ def ragged_kernel(
           functools.partial(loop_body, pl.cdiv(m, config.block_m))
       )
     else:
-      loop_body(0, tuple(map(lax.axis_index, ("block_n", "m", "remainder_n"))))
+      loop_body(0, tuple(map(lax.axis_index, ("remainder_n", "m", "block_n",))))
 
   if config.persistent:
     # TODO: Detect this number from device.
@@ -279,7 +279,7 @@ def ragged_kernel(
     grid_names = ("sm",)
   else:
     grid = inner_grid
-    grid_names = ("block_n", "m", "remainder_n")
+    grid_names = ("remainder_n", "m", "block_n")
 
   return plgpu.kernel(
       kernel_body,

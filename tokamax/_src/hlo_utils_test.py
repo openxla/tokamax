@@ -12,24 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import collections
+import dataclasses
 import functools
 import json
 import math
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import chex
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 import jax_triton as jt
 from tokamax._src import batching
+from tokamax._src import benchmarking
 from tokamax._src import hlo_utils
 from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import numerics
-from tokamax._src.ops import op
 from tokamax._src.ops.attention import api as attention_api
+from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
@@ -185,53 +187,6 @@ class DumpHloLibTest(parameterized.TestCase):
 
     # TODO: add tests for axis once this is in the Pallas HLO.
 
-  def test_gated_linear_unit_mosaic_gpu(
-      self,
-  ):
-
-    if not mgpu_lib.has_mosaic_gpu_support():
-      self.skipTest("Can't run mosaic gpu. Maybe you are not on h100")
-
-    dtype = jnp.bfloat16
-    config = dict(input_shape=(64, 128), out_size=128)
-
-    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0), 2)
-    input_shape = config['input_shape']
-    n = config['out_size']
-    (_, k) = input_shape
-    weight_shape = (k, 2, n)
-
-    x = jax.random.normal(key=rng0, shape=input_shape, dtype=dtype)
-    w = jax.random.normal(key=rng1, shape=weight_shape, dtype=dtype)
-
-    @jax.jit
-    def swiglu(x, w):
-      return mosaic_glu.MosaicGpuGatedLinearUnit()(
-          x=x, weights=w, activation=jax.nn.swish
-      )
-
-    kernels = hlo_utils.get_kernel_info(
-        swiglu.lower(x, w), include_xla_kernels=False
-    )
-
-    self.assertLen(kernels, 1)
-    kernel = kernels[0]
-    self.assertIsInstance(kernel, hlo_utils.MosaicGpuKernelInfo)
-
-    self.assertEqual(
-        kernel.inputs,
-        (
-            jax.ShapeDtypeStruct(shape=input_shape, dtype=dtype),
-            jax.ShapeDtypeStruct(shape=weight_shape, dtype=dtype),
-        ),
-    )
-
-    # Note: currently a bug in swiglu that produces two outputs. The second
-    # one is spurious and will be removed.
-    self.assertEqual(
-        kernel.outputs, (jax.ShapeDtypeStruct(shape=(64, 128), dtype=dtype),)
-    )
-
   def test_jax_triton_simple(self):
 
     if jax.default_backend() != 'gpu':
@@ -317,7 +272,7 @@ class DumpHloLibTest(parameterized.TestCase):
 
     def norm_and_glu(x, scale, offset):
       normalized_x = pt_normalization(x, scale, offset)
-      glu_x = mosaic_glu.MosaicGpuGatedLinearUnit()(
+      glu_x = pl_triton_glu.PallasTritonGatedLinearUnit()(
           x=normalized_x, weights=weights, activation=jax.nn.swish
       )
       return jnp.sum(glu_x)
@@ -346,7 +301,9 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertEqual(op_specs[0].arguments['offset'], bs_128_bf16)
     self.assertEqual(op_specs[0].arguments['axis'], -1)
 
-    self.assertIsInstance(op_specs[1].op, mosaic_glu.MosaicGpuGatedLinearUnit)
+    self.assertIsInstance(
+        op_specs[1].op, pl_triton_glu.PallasTritonGatedLinearUnit
+    )
     self.assertEqual(op_specs[1].arguments['x'], bs_64x128_bf16)
     self.assertEqual(op_specs[1].arguments['weights'], bs_128x2x128_bf16)
     self.assertIsNone(op_specs[1].arguments['precision'])
@@ -378,132 +335,55 @@ class DumpHloLibTest(parameterized.TestCase):
     op_specs = hlo_utils.get_opspecs(sin_cos_lowered)
     self.assertEmpty(op_specs)
 
-  def test_opspecs_round_trip(self):
-
+  def test_normalization_spec_round_trip(self):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
     # TODO: Add a test for vmap.
-
-    normalization_bound_args = op.BoundArguments(
-        op=pl_norm.PallasTritonNormalization(),
-        arguments=collections.OrderedDict({
-            'x': batching.BatchedShapeDtype(
-                (128, 256), jnp.bfloat16, vmap_axes=()
-            ),
-            'scale': batching.BatchedShapeDtype(
-                (256,), jnp.bfloat16, vmap_axes=()
-            ),
-            'offset': batching.BatchedShapeDtype(
-                (256,), jnp.bfloat16, vmap_axes=()
-            ),
-        }),
+    op = pl_norm.PallasTritonNormalization()
+    ba = op.bind(  # pytype: disable=wrong-arg-types
+        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
     )
 
-    def test_fn(kwargs):
-      return normalization_bound_args.op(**kwargs)
+    fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
+    fn_lowered = jax.jit(fn).lower(x)
+    (ba2,) = hlo_utils.get_opspecs(fn_lowered, include_xla_kernels=False)
+    self.assertEqual(ba, ba2)
 
-    normalization_concrete_args = numerics.random_initialize(
-        normalization_bound_args.arguments
-    )
-
-    normalization_fn_lowered = jax.jit(test_fn).lower(
-        normalization_concrete_args
-    )
-    output = normalization_fn_lowered.compile()(normalization_concrete_args)
-    op_specs = hlo_utils.get_opspecs(
-        normalization_fn_lowered, include_xla_kernels=False
-    )
-    self.assertLen(op_specs, 1)
-    self.assertIsInstance(op_specs[0].op, pl_norm.PallasTritonNormalization)
-    self.assertEqual(
-        op_specs[0].arguments['x'], normalization_bound_args.arguments['x']
-    )
-    self.assertEqual(
-        op_specs[0].arguments['scale'],
-        normalization_bound_args.arguments['scale'],
-    )
-    self.assertEqual(
-        op_specs[0].arguments['offset'],
-        normalization_bound_args.arguments['offset'],
-    )
-
-    # Run the op_spec again and get the output.
-    def second_normalization_fn(kwargs):
-      return op_specs[0].op(**kwargs)
-
-    output_2 = (
-        jax.jit(second_normalization_fn)
-        .lower(normalization_concrete_args)
-        .compile()(normalization_concrete_args)
-    )
-
-    # This should match the output of the original op.
-    diff_summary = numerics.array_diff_summary(output, output_2)
+    expected = fn_lowered.compile()(x)
+    fn2, x2 = benchmarking.standardize_function(ba2.op, kwargs=ba2.arguments)
+    diff_summary = numerics.array_diff_summary(expected, jax.jit(fn2)(x2))
     self.assertGreater(diff_summary.percent_close * 100, 99.99)
 
-    partial_const = functools.partial(
-        numerics.const_initializer, jnp.array([128] * 8, jnp.uint32)
-    )
-    # Do a second run with ragged dot
-    initializer = numerics.InitializableArray(
-        value=batching.BatchedShapeDtype((8,), jnp.uint32, vmap_axes=()),
-        initializer=partial_const,
+  def test_ragged_dot_spec_round_trip(self):
+    if jax.default_backend() != 'gpu':
+      self.skipTest('This test only runs on GPU.')
+
+    op = pl_ragged_dot.PallasTritonRaggedDot()
+    ba = op.bind(  # pytype: disable=wrong-arg-types
+        jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),
+        group_sizes=[128] * 8,
     )
 
-    ragged_dot_bound_args = op.BoundArguments(
-        op=pl_ragged_dot.PallasTritonRaggedDot(),
-        arguments=collections.OrderedDict({
-            'lhs': batching.BatchedShapeDtype(
-                (1024, 128), jnp.bfloat16, vmap_axes=()
-            ),
-            'rhs': batching.BatchedShapeDtype(
-                (8, 128, 256), jnp.bfloat16, vmap_axes=()
-            ),
-            'group_sizes': initializer,
-        }),
-    )
+    fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
+    fn_lowered = jax.jit(fn).lower(x)
+    (ba2,) = hlo_utils.get_opspecs(fn_lowered, include_xla_kernels=False)
+    fn2, x2 = benchmarking.standardize_function(ba2.op, kwargs=ba2.arguments)
 
-    def test_fn_ragged_dot(kwargs):
-      return ragged_dot_bound_args.op(**kwargs)
+    ba.arguments.pop('group_sizes')
+    actual = ba2.arguments.pop('group_sizes')
+    chex.assert_trees_all_equal(actual.value, jnp.array([128] * 8, jnp.int32))
+    self.assertEqual(actual.representative_value, (128,) * 8)
 
-    ragged_dot_concrete_args = numerics.random_initialize(
-        ragged_dot_bound_args.arguments
-    )
-    test_ragged_dot_lowered = jax.jit(test_fn_ragged_dot).lower(
-        ragged_dot_concrete_args
-    )
-    ragged_dot_output = test_ragged_dot_lowered.compile()(
-        ragged_dot_concrete_args
-    )
-    op_specs = hlo_utils.get_opspecs(
-        test_ragged_dot_lowered, include_xla_kernels=False
-    )
-    self.assertLen(op_specs, 1)
-    self.assertIsInstance(op_specs[0].op, pl_ragged_dot.PallasTritonRaggedDot)
-    self.assertEqual(
-        op_specs[0].arguments['lhs'], ragged_dot_bound_args.arguments['lhs']
-    )
-    self.assertEqual(
-        op_specs[0].arguments['rhs'], ragged_dot_bound_args.arguments['rhs']
-    )
-    self.assertEqual(
-        op_specs[0].arguments['group_sizes'].value,
-        ragged_dot_bound_args.arguments['group_sizes'].value,
-    )
+    object.__setattr__(ba.op, 'vjp', None)
+    object.__setattr__(ba2.op, 'vjp', None)
+    self.assertEqual(ba, ba2)
 
-    def second_ragged_dot_fn(kwargs):
-      return op_specs[0].op(**kwargs)
-
-    ragged_dot_output_2 = (
-        jax.jit(second_ragged_dot_fn)
-        .lower(ragged_dot_concrete_args)
-        .compile()(ragged_dot_concrete_args)
-    )
-
-    diff_summary = numerics.array_diff_summary(
-        ragged_dot_output, ragged_dot_output_2
-    )
+    expected = fn_lowered.compile()(x)
+    diff_summary = numerics.array_diff_summary(expected, jax.jit(fn2)(x2))
     self.assertGreater(diff_summary.percent_close * 100, 99.99)
 
   def test_empty_opspecs_from_triton_kernel(self):

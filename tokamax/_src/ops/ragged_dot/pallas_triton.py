@@ -32,6 +32,7 @@ from tokamax._src.pallas import block
 
 Residuals = base.Residuals
 QuantizedArray = quantization.QuantizedArray
+GroupSizes = base.GroupSizes
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -345,7 +346,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       lhs: jax.Array | QuantizedArray,
       rhs: jax.Array | QuantizedArray,
       *,
-      group_sizes: jax.Array,
+      group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
       precision: jax.lax.DotAlgorithmPreset,
       preferred_element_type: jnp.dtype | None,

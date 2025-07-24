@@ -32,7 +32,6 @@ from tokamax._src import autotuning
 from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src import config as config_lib
-from tokamax._src import numerics
 from tokamax._src import serialization
 from tokamax._src import utils
 
@@ -142,15 +141,10 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
         arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
       ba = BoundArguments(self, arguments)
 
-      args, kwargs = jax.tree.map(
-          lambda x: x.value if _is_initializable_array(x) else x,
-          (args, kwargs),
-          is_leaf=_is_initializable_array,
-      )
-
       # Serialize args into the HLO to allow for, e.g., offline autotuning.
       encoder_cls = serialization.JsonEncoder
-      json_str = json.dumps(arguments, cls=encoder_cls, separators=(",", ":"))
+      abstract = _abstractify(arguments)
+      json_str = json.dumps(abstract, cls=encoder_cls, separators=(",", ":"))
       full_name = self.__module__ + "." + self.__class__.__name__
 
       with jax.named_scope(f"tokamax:{full_name}({json_str})"):
@@ -167,12 +161,6 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
         arrays, out, residuals = residuals
         dout = dout[0] if return_residuals else dout
         args, kwargs = args_tree.unflatten(merge(arrays, other))
-        # TODO: Keep track of initializable arrays in VJP also.
-        args, kwargs = jax.tree.map(
-            lambda x: x.value if _is_initializable_array(x) else x,
-            (args, kwargs),
-            is_leaf=_is_initializable_array,
-        )
         kwargs.pop("return_residuals")
         grads = self.vjp(residuals, out, dout, *args, **kwargs)  # pytype: disable=wrong-arg-count
 
@@ -243,8 +231,8 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
         if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
     )
     return immutabledict.immutabledict((
-        *zip(pos_arg_names, jax.tree.map(_abstractify, ba.args), strict=True),
-        *jax.tree.map(_abstractify, ba.kwargs).items(),
+        *zip(pos_arg_names, _abstractify(ba.args), strict=True),
+        *_abstractify(ba.kwargs).items(),
     ))
 
   def _get_autotuning_configs(self, ba: "BoundArguments") -> set[_Config]:
@@ -451,10 +439,20 @@ class BoundArguments(Generic[_Config, _Key]):
     return dict(residuals=residuals, out=out, dout=out) | ba.arguments
 
 
-def _abstractify(x):
-  if isinstance(x, (jax.Array, jax.ShapeDtypeStruct)):
-    return jax.ShapeDtypeStruct(x.shape, x.dtype)
-  return x
+custom_abstractify_mappings = {}
+
+
+def _abstractify(pytree):
+  def abstractify_leaf(x):
+    if (fn := custom_abstractify_mappings.get(type(x))) is not None:
+      return fn(x)
+    # FIXME: Handle `BatchedShapeDtype` correctly.
+    if isinstance(x, (jax.Array, jax.ShapeDtypeStruct)):
+      return jax.ShapeDtypeStruct(x.shape, x.dtype)
+    return x
+
+  is_leaf = lambda x: (type(x) in custom_abstractify_mappings)
+  return jax.tree.map(abstractify_leaf, pytree, is_leaf=is_leaf)
 
 
 def _is_shaped(x):
@@ -479,7 +477,3 @@ def _as_unbatched(x):
   if _is_batched(x):
     return jax.ShapeDtypeStruct(x.inner_shape, x.dtype)
   return x
-
-
-def _is_initializable_array(x):
-  return isinstance(x, numerics.InitializableArray)
