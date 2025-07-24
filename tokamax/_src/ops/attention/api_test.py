@@ -116,7 +116,7 @@ class DotProductAttentionTest(parameterized.TestCase):
 
     dtype = jnp.bfloat16
     cudnn_bias = self.IMPL == 'cudnn' and 'bias' in mask_mode
-    B, S, T, N, H = (1 if cudnn_bias else 2), 128, 128, 4, 64
+    B, S, T, N, H = (1 if cudnn_bias else 2), 256, 256, 4, 64
     keys = jax.random.split(jax.random.PRNGKey(0), 4)
     Q = jax.random.normal(keys[0], (B, T, N, H), dtype)
     K = jax.random.normal(keys[1], (B, S, N, H), dtype)

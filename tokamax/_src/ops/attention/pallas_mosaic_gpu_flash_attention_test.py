@@ -42,6 +42,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       attention_fn=None,
       supports_decode=False,
       supports_bias=True,
+      supports_indices=True,
       supports_vjp=False,
       supports_mask=True,
       supports_tanh_clipping=True,
@@ -50,7 +51,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     attention_fn = (
         attention_fn or flash_attention.PallasMosaicGpuFlashAttention()
     )
-    self._supports_decode = supports_decode
     super().__init__(
         *args,
         attention_fn=attention_fn,
@@ -58,13 +58,14 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         supports_vjp=supports_vjp,
         supports_mask=supports_mask,
         supports_tanh_clipping=supports_tanh_clipping,
-        supports_indices=False,
+        supports_indices=supports_indices,
         supports_dropout=False,
         supports_cross_attention=True,
         supports_precisions=False,
         supports_vmap=False,
-        supports_is_causal=supports_is_causal
+        supports_is_causal=supports_is_causal,
     )
+    self._supports_decode = supports_decode
 
   def _run_test_with_inputs(self, q, k, v, *args, **kwargs):
     # PallasMosaicGpuFlashAttention doesn't support high precisions,
@@ -85,12 +86,25 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     kwargs["atol"] = 0.007 if "bias" in kwargs else 0.0045
     super()._run_test_with_inputs(q, k, v, *args, **kwargs)
 
+  def test_causal_mask(self):
+    # TODO: Investigate why it's less accurate with causal mask.
+    with _atol_ctx(0.01):
+      super().test_causal_mask()
+
   def test_causal_mask_cross_attention0(self):
     with _atol_ctx(0.01):
       super().test_causal_mask_cross_attention0()  # pytype: disable=attribute-error
 
   def test_causal_mask_cross_attention1(self):
     self.skipTest("TODO: Support k-sequence non-multiple of block_kv.")
+
+  def test_causal_mask_q_indices(self):
+    with _atol_ctx(0.015):
+      super().test_causal_mask_q_indices()
+
+  def test_causal_mask_k_indices(self):
+    with _atol_ctx(0.015):
+      super().test_causal_mask_k_indices()
 
   @parameterized.parameters(*test_base.base_names_and_params("test_mask_api"))
   def test_mask_api(self, test_name, kwargs):
@@ -102,11 +116,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
     with _atol_ctx(0.01):
       getattr(super(), test_name)()
-
-  def test_causal_mask(self):
-    # TODO: Investigate why it's less accurate with causal mask.
-    with _atol_ctx(0.01):
-      super().test_causal_mask()
 
   def test_padding_mask_with_nans(self):
     self.skipTest("TODO: Fix.")

@@ -15,6 +15,7 @@
 """Flash attention with Mosaic GPU."""
 
 import dataclasses
+import functools
 import math
 from typing import Any, TypeAlias
 
@@ -189,7 +190,8 @@ def _fwd(
 
     @pl.when(wg_idx < 2)
     def _compute_wg():
-      qs = block.ds(2 * q_idx + wg_idx, block_q)
+      q_base = (2 * q_idx + wg_idx) * block_q
+      qs = pl.ds(q_base, block_q)
 
       plgpu.set_max_registers(232, action="increase")
       q_smem = q_smems.at[wg_idx]
@@ -259,9 +261,7 @@ def _fwd(
         mask_value = float(jnp.finfo(jnp.float32).min)
 
         if do_causal:
-          q_idxs = (2 * q_idx + wg_idx) * block_q + iota(0)
-          k_idxs = k_base + iota(1)
-          s = jnp.where(q_idxs >= k_idxs, s, mask_value)
+          s = jnp.where(q_base + iota(0) >= k_base + iota(1), s, mask_value)
 
         def apply_k_start():
           k_start_ = lax.broadcast_in_dim(k_start, s.shape, [0])
@@ -331,20 +331,26 @@ def _fwd(
       if kv_seq_len % block_kv:
         raise ValueError(f"{kv_seq_len=} must be a multiple of {block_kv=}")
 
-      # If `is_causal`, the last iteration is split out, with masking enabled.
-      hi = max_kv_step - (2 - wg_idx) * is_causal
-      acc, m_i, l_i = lax.fori_loop(min_kv_step, hi, kv_loop, (acc, m_i, l_i))
+      hi = max_kv_step
 
       if is_causal:
         if block_q != block_kv:  # TODO: Fix this.
           raise NotImplementedError("Causal masking requires square blocks.")
 
-        acc, m_i, l_i = kv_loop(hi, (acc, m_i, l_i), do_causal=True)
+        hi = lax.min(hi, lax.div(q_base, block_kv))
+        if bias_ref is not None:
+          hi = 0  # TODO: Fix this workaround for compiler bug.
 
-        @pl.when(wg_idx == 0)
-        def _unblock_wg1():
-          perform_schedule_barrier()
-          perform_schedule_barrier()
+      carry = lax.fori_loop(min_kv_step, hi, kv_loop, (acc, m_i, l_i))
+
+      causal_kv_loop = functools.partial(kv_loop, do_causal=True)
+      # TODO: This cond should be redundant, but without it we hit a weird
+      # compiler bug.
+      acc, m_i, l_i = lax.cond(
+          hi < max_kv_step,
+          lambda: lax.fori_loop(hi, max_kv_step, causal_kv_loop, carry),
+          lambda: carry,
+      )
 
       pl.when(wg_idx == 0)(perform_schedule_barrier)
 
@@ -496,25 +502,35 @@ def _fwd(
 Key: TypeAlias = immutabledict.immutabledict[str, Any]
 
 
-def _decompose_mask(mask, q, k):
+def _decompose_mask(mask, q, k, q_indices, k_indices):
   """Decomposes `mask` into a mask array, `is_causal`, `k_start` and `k_end`."""
   if mask is None:
     return None, False, None, None
 
-  mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
+  is_causal = False
+  k_start = None
+  k_end = None
 
-  # Fold is_causal into k_end to avoid conflicts (and allow sharding).
-  # TODO: Fold is_causal into k_end only if k_end is not None.
-  if is_causal:
-    k_end_ = jnp.arange(q.shape[-3]) + 1
-    k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
-    is_causal = False
+  if k_indices is None:
+    mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
 
-  bcast_rank2 = lambda x: None if x is None else jax.lax.broadcast_to_rank(x, 2)
-  k_start = bcast_rank2(k_start)
-  k_end = bcast_rank2(k_end)
+    # Fold `is_causal` into `k_end`. If `q_indices` is not `None`, then this is
+    # necessary for correctness. Otherwise, it is a performance optimization.
+    if is_causal and (q_indices is not None or k_end is not None):
+      if q_indices is None:
+        q_indices = jnp.arange(q.shape[-3])
+      k_end_ = q_indices + 1
+      k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
+      is_causal = False
 
-  mask = mask.as_array(q.shape[-3], k.shape[-3])
+    if k_start is not None:
+      k_start = jax.lax.broadcast_to_rank(k_start, 2)
+    if k_end is not None:
+      k_end = jax.lax.broadcast_to_rank(k_end, 2)
+
+  q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
+  k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
+  mask = mask.as_array(q_len_or_indices, k_len_or_indices)
   return mask, is_causal, k_start, k_end
 
 
@@ -572,10 +588,6 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       raise NotImplementedError("`logits_dtype` must be float32.")
     if dropout_mask is not None:
       raise NotImplementedError("dropout is not supported.")
-    if q_indices is not None:
-      raise NotImplementedError("q_indices is not implemented")
-    if k_indices is not None:
-      raise NotImplementedError("k_indices is not implemented")
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
 
@@ -591,7 +603,9 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     if weights_v_dot_precision not in _SUPPORTED_PRECISIONS:
       raise NotImplementedError(f" {weights_v_dot_precision=} not supported")
 
-    mask, is_causal, k_start, k_end = _decompose_mask(mask, q, k)
+    mask, is_causal, k_start, k_end = _decompose_mask(
+        mask, q, k, q_indices, k_indices
+    )
 
     use_stable_softmax = self.use_stable_softmax
     if use_stable_softmax is base.AUTO:
