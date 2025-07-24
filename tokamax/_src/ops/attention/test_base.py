@@ -745,6 +745,7 @@ class AttentionTestBase(parameterized.TestCase):
         spec.pop("bias", None),
         spec.pop("mask", None),
     ))
+    logits_scale = spec.get("logits_scale", base.AUTO)
     is_causal = spec.pop("is_causal", False)
     return_residuals = spec.get("return_residuals", False)
     logits_soft_cap = spec.get("logits_soft_cap")
@@ -768,8 +769,13 @@ class AttentionTestBase(parameterized.TestCase):
       mask = kwargs.pop("mask", None)
       is_causal = kwargs.pop("is_causal", None)
 
-      *_, q_seq, q_heads, _ = q.shape
+      *_, q_seq, q_heads, head_dim = q.shape
       *_, k_seq, k_heads, _ = k.shape
+
+      if logits_scale != base.AUTO:
+        q_dtype = q.dtype
+        q *= np.sqrt(head_dim) * logits_scale
+        q = q.astype(q_dtype)
 
       if isinstance(mask, base.Mask):
         mask = mask.as_array(q_seq, k_seq)
