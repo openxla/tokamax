@@ -24,6 +24,7 @@ from unittest import mock
 
 import jax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 
 
@@ -200,7 +201,7 @@ class BlockRef:
       other = None
     elif other is None:
       other = 0
-    return pl.load(self.ref, (), mask=mask, other=other, **kwargs)
+    return plgpu.load(self.ref, mask=mask, other=other, **kwargs)
 
   def store(self, val: jax.Array, **kwargs):
     """Stores a block with `mask=inbounds_mask()`."""
@@ -208,7 +209,7 @@ class BlockRef:
       mask = kwargs.pop("mask", None)
     else:
       mask &= kwargs.pop("mask", True)
-    pl.store(self.ref, (), val, mask=mask, **kwargs)
+    plgpu.store(self.ref, val, mask=mask, **kwargs)
 
   def __getattr__(self, name: str) -> Any:
     return getattr(self.ref, name)
@@ -313,7 +314,7 @@ def pallas_call(
       out_shape_, out_specs_ = map(_as_tuple, (out_shape, out_specs))
       out_refs = jax.tree.map(_block_ref, out_refs, out_shape_, out_specs_)
 
-      # Patch `pl.load` and `pl.store` to allow `BlockRef` to be passed.
+      # Patch `plgpu.load` and `plgpu.store` to allow `BlockRef` to be passed.
       # `mock.patch` is not thread-safe, so hold the lock while patching.
       def ld_st(fn, ref, *args, **kwargs):
         if isinstance(ref, BlockRef):
@@ -322,8 +323,12 @@ def pallas_call(
 
       with (
           _PL_LOAD_STORE_PATCH_LOCK,
-          mock.patch.object(pl, "load", functools.partial(ld_st, pl.load)),
-          mock.patch.object(pl, "store", functools.partial(ld_st, pl.store)),
+          mock.patch.object(
+              plgpu, "load", functools.partial(ld_st, plgpu.load)
+          ),
+          mock.patch.object(
+              plgpu, "store", functools.partial(ld_st, plgpu.store)
+          ),
       ):
         return kernel(*in_refs, *out_refs)
 

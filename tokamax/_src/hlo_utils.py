@@ -25,7 +25,7 @@ from google.protobuf import json_format
 import immutabledict
 import jax
 from jax.interpreters.mlir import ir
-from jaxlib.gpu import triton_pb2
+from jax.jaxlib.gpu import triton_pb2
 import jax.numpy as jnp
 from tokamax._src import serialization
 from tokamax._src.ops import op
