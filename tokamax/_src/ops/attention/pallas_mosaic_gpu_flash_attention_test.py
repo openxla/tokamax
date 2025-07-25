@@ -47,6 +47,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       supports_mask=True,
       supports_tanh_clipping=True,
       supports_is_causal=True,
+      supports_vmap=True,
   ):
     attention_fn = (
         attention_fn or flash_attention.PallasMosaicGpuFlashAttention()
@@ -62,7 +63,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         supports_dropout=False,
         supports_cross_attention=True,
         supports_precisions=False,
-        supports_vmap=False,
+        supports_vmap=supports_vmap,
         supports_is_causal=supports_is_causal,
     )
     self._supports_decode = supports_decode
