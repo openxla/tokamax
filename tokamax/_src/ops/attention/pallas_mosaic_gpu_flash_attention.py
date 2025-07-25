@@ -147,7 +147,7 @@ def _fwd(
         mask_smems,
         (k_barriers, k_consumed_barriers),
         (v_barriers, v_consumed_barriers),
-        (bias_barriers, bias_consumed_barriers),
+        bias_barriers,
         (mask_barriers, mask_consumed_barriers),
         schedule_barrier,
     ) = scoped
@@ -233,19 +233,21 @@ def _fwd(
         def compute_qk(acc_ref):
           k_smem_T = plgpu.transpose_ref(k_smems.at[slot], (1, 0))  # pylint: disable=invalid-name
           plgpu.wgmma(acc_ref, q_smem, k_smem_T)
+          if bias_ref is None:
+            bias = None
+          else:
+            plgpu.barrier_wait(bias_barriers.at[slot])
+            bias = bias_smems[slot, block.ds(wg_idx, block_q)]
           plgpu.barrier_arrive(schedule_barrier)
-          return acc_ref[...]
+          return acc_ref[...], bias
 
-        s = pl.run_scoped(compute_qk, plgpu.ACC(block_q_kv, jnp.float32))
+        s, bias = pl.run_scoped(compute_qk, plgpu.ACC(block_q_kv, jnp.float32))
         plgpu.barrier_arrive(k_consumed_barriers.at[slot])
         plgpu.barrier_wait(schedule_barrier)
 
         scale = logits_scale
 
-        if bias_ref is not None:
-          plgpu.barrier_wait(bias_barriers.at[slot])
-          bias = bias_smems[slot, block.ds(wg_idx, block_q)]
-          plgpu.barrier_arrive(bias_consumed_barriers.at[slot])
+        if bias is not None:
           s = s * scale + bias.astype(s.dtype)
           scale = 1.0
 
@@ -416,7 +418,6 @@ def _fwd(
         plgpu.barrier_wait(k_consumed_barriers.at[slot])
         cp(k_ref_.at[ks], k_smems.at[slot], k_barriers.at[slot])
         if bias_ref_ is not None:
-          plgpu.barrier_wait(bias_consumed_barriers.at[slot])
           cp(bias_ref_.at[:, ks], bias_smems.at[slot], bias_barriers.at[slot])
         if mask_ref_ is not None:
           plgpu.barrier_wait(mask_consumed_barriers.at[slot])
@@ -461,7 +462,8 @@ def _fwd(
         None if no_async_mask else tiled_smem(bias_mask_smem_shape, jnp.int8),
         kv_barriers,
         kv_barriers,
-        (None, None) if bias is None else kv_barriers,
+        # bias doesn't need a consumed barrier as it is implied by k consumed.
+        None if bias is None else kv_barriers[0],
         (None, None) if no_async_mask is None else kv_barriers,
         schedule_barrier,
         collective_axes="wg",
