@@ -156,26 +156,29 @@ def _fwd(
       plgpu.barrier_arrive(schedule_barrier)
       plgpu.barrier_wait(schedule_barrier)
 
-    min_kv_step = 0
-    max_kv_step = kv_seq_len // block_kv
+    def get_kv_ranges():
+      min_kv_step = 0
+      max_kv_step = kv_seq_len // block_kv
 
-    if is_causal:
-      max_kv_step = lax.min(max_kv_step, 2 * (q_idx + 1))
+      if is_causal:
+        max_kv_step = lax.min(max_kv_step, 2 * (q_idx + 1))
 
-    def load_k_minmax(ref):
-      return ref[b_idx, 0 if (ref.shape[1] == 1) else h_idx, q_idx]
+      def load_k_minmax(ref):
+        return ref[b_idx, 0 if (ref.shape[1] == 1) else h_idx, q_idx]
 
-    if k_start_minmax_refs is None:
-      k_start_max = None
-    else:
-      k_start_min, k_start_max = map(load_k_minmax, k_start_minmax_refs)
-      min_kv_step = lax.max(min_kv_step, lax.div(k_start_min, block_kv))
+      if k_start_minmax_refs is None:
+        k_start_max = None
+      else:
+        k_start_min, k_start_max = map(load_k_minmax, k_start_minmax_refs)
+        min_kv_step = lax.max(min_kv_step, lax.div(k_start_min, block_kv))
 
-    if k_end_minmax_refs is None:
-      k_end_min = None
-    else:
-      k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_refs)
-      max_kv_step = lax.min(max_kv_step, pl.cdiv(k_end_max, block_kv))
+      if k_end_minmax_refs is None:
+        k_end_min = None
+      else:
+        k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_refs)
+        max_kv_step = lax.min(max_kv_step, pl.cdiv(k_end_max, block_kv))
+
+      return min_kv_step, max_kv_step, k_start_max, k_end_min
 
     if mask_ref is None:
       bcast_mask_q = bcast_mask_k = mask_b_idx = mask_h_idx = None
@@ -214,6 +217,7 @@ def _fwd(
 
       k_start = load_k_range(k_start_ref)
       k_end = load_k_range(k_end_ref)
+      min_kv_step, max_kv_step, k_start_max, k_end_min = get_kv_ranges()
 
       plgpu.barrier_wait(q_barrier)
       @pl.when(max_kv_step > min_kv_step)
@@ -389,6 +393,7 @@ def _fwd(
         mask_ref_ = mask_ref.at[mask_b_idx, mask_h_idx, qs]
 
       cp = plgpu.copy_gmem_to_smem
+      min_kv_step, max_kv_step, _, _ = get_kv_ranges()
 
       for i in range(max_stages):
 
