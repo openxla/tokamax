@@ -491,8 +491,8 @@ def _fwd(
   out, *residuals = plgpu.kernel(
       entry,
       out_shape=out_shape,
-      grid=(num_q_heads, num_q_tiles, batch_size),
-      grid_names=("heads", "q_tiles", "batch"),
+      grid=(batch_size, num_q_tiles, num_q_heads),
+      grid_names=("batch", "q_tiles", "heads"),
       num_threads=3,
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(approx_math=True),
