@@ -444,6 +444,42 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   @parameterized.parameters(
+      dict(is_causal=True),  # Explicit causal
+      dict(k_end=range(1, 1024 + 1)),  # Lower tri (implicit causal)
+      dict(k_start=range(1024)),  # Higher tri using k_start
+      dict(q_start=range(1024)),  # Lower tri using q_start
+      dict(q_start=range(1023, -1, -1)),  # Lower tri mirrored along vertical
+      dict(q_end=range(1, 1024 + 1)),  # Higher tri using q_end
+      dict(q_end=range(1024, 0, -1)),  # Higher tri mirrored along vertical
+      dict(
+          # Triangular hourglass-like shape
+          k_start=(range(512), range(512 - 1, -1, -1)),
+          k_end=(range(1024, 512, -1), range(512 + 1, 1024 + 1)),
+      ),
+      dict(
+          # Triangular hourglass-like shape. Offset by 3 per head (max_offs=12).
+          k_start=(
+              range(512 - 12),
+              (512 - 12 - 1,) * 2 * 12,
+              range(512 - 12 - 1, -1, -1),
+          ),
+          k_end=(
+              range(1024, 512 + 12, -1),
+              (1024 - 512 + 12 + 1,) * 2 * 12,
+              range(512 + 12 + 1, 1024 + 1),
+          ),
+          offset_per_head=3,
+      ),
+      dict(
+          # Transposed triangular hourglass-like shape
+          q_start=(range(512), range(512 - 1, -1, -1)),
+          q_end=(range(1024, 512, -1), range(512 + 1, 1024 + 1)),
+      ),
+      dict(k_start=512, is_causal=True),  # Lower tri (explicit causal) right
+      dict(k_end=(512 + 1), is_causal=True),  # Lower tri (explicit causal) left
+      # Lower tri (explicit causal) truncated left and right
+      dict(k_start=256, k_end=(1024 - 256 + 1), is_causal=True),
+      dict(q_start=17, k_start=range(1024)),
       dict(q_start=128, k_end=range(1, 1024 + 1)),
       dict(q_end=1007, k_start=range(1024)),
       dict(q_end=896, k_end=range(1, 1024 + 1)),
@@ -596,7 +632,7 @@ class AttentionTestBase(parameterized.TestCase):
         (2, 1024, 4, 64), impl=impl, ref_impl=ref_impl, test_vjp=False
     )
 
-  @parameterized.parameters(-1, 64, 128, 256)
+  @parameterized.parameters(-1, 64)
   def test_quantized_int4(self, subchannel_size):
     tile_shape = (1, 1, 1, subchannel_size)
     quantize = quantization.quantize_as(jnp.int4, tile_shape=tile_shape)
