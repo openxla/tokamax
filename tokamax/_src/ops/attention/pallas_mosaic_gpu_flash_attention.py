@@ -161,7 +161,8 @@ def _fwd(
       max_kv_step = kv_seq_len // block_kv
 
       if is_causal:
-        max_kv_step = lax.min(max_kv_step, 2 * (q_idx + 1))
+        q_max = (q_idx + 1) * (2 * block_q)
+        max_kv_step = lax.min(max_kv_step, pl.cdiv(q_max, block_kv))
 
       def load_k_minmax(ref):
         return ref[b_idx, 0 if (ref.shape[1] == 1) else h_idx, q_idx]
@@ -340,9 +341,6 @@ def _fwd(
       hi = max_kv_step
 
       if is_causal:
-        if block_q != block_kv:  # TODO: Fix this.
-          raise NotImplementedError("Causal masking requires square blocks.")
-
         hi = lax.min(hi, lax.div(q_base, block_kv))
         if bias_ref is not None:
           hi = 0  # TODO: Fix this workaround for compiler bug.
@@ -639,7 +637,35 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     )
 
   def _get_heuristics_config(self, ba: op.BoundArguments):
-    del ba
+    q, k, v = ba.batched.args
+    seq_len_k, _, head_dim = k.shape[-3:]
+    head_dim_out = v.shape[-1]
+
+    mask = ba.batched.kwargs["mask"]
+    q_indices = ba.batched.kwargs["q_indices"]
+    k_indices = ba.batched.kwargs["k_indices"]
+    mask, *_ = jax.eval_shape(_decompose_mask, mask, q, k, q_indices, k_indices)
+
+    def shared_mem_usage_bytes(block_q, block_kv, num_stages):
+      bytes_per_stage = (
+          block_kv * head_dim * jnp.finfo(k.dtype).bits // 8
+          + block_kv * head_dim_out * jnp.finfo(v.dtype).bits // 8
+      )
+      if (bias := ba.kwargs["bias"]) is not None:
+        bytes_per_stage += (
+            2 * block_q * block_kv * jnp.finfo(bias.dtype).bits // 8
+        )
+      # FIXME: This is an overestimate for broadcast masks.
+      if mask is not None:
+        bytes_per_stage += 2 * block_q * block_kv
+      return (
+          2 * block_q * head_dim * jnp.finfo(q.dtype).bits // 8
+          + num_stages * bytes_per_stage
+          + 1000  # Add some extra for barriers.
+      )
+
+    if seq_len_k % 128 == 0 and shared_mem_usage_bytes(64, 128, 2) < 227 * 1024:
+      return Config(block_q=64, block_kv=128, num_stages=2)
+
     # This is a pretty good option that works for most cases.
-    # TODO: for larger embed dimensions we can probably guess better.
     return Config(block_q=64, block_kv=64, num_stages=2)

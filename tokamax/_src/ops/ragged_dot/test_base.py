@@ -43,7 +43,7 @@ def ref(lhs, rhs, group_sizes, preferred_element_type=None):
   return jax.lax.ragged_dot(
       lhs,
       rhs,
-      group_sizes=group_sizes,
+      group_sizes=jnp.asarray(group_sizes),
       precision=precision,
       preferred_element_type=preferred_element_type,
   )
@@ -150,7 +150,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     b = jax.random.normal(rng1, (num_groups, k, n))
     group_sizes = jnp.array([m // num_groups] * num_groups, jnp.int32)
     expected = ref(a, b, group_sizes=group_sizes)
-    group_sizes = base.GroupSizes(group_sizes, [1] * num_groups)
+    group_sizes = base.GroupSizes(group_sizes, (1,) * num_groups)
     actual = self._dot_fn(a, b, group_sizes=group_sizes)  # pytype: disable=wrong-arg-types
     chex.assert_trees_all_close(actual, expected, atol=5e-2)
 
@@ -159,7 +159,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     kwargs = numerics.random_initialize(spec)
     expected = ref(**kwargs)
     actual = self._dot_fn(**kwargs)
-    count = sum(spec["group_sizes"].initializer.args[0])
+    count = sum(spec["group_sizes"].representative_value)
     chex.assert_trees_all_close(
         actual[:count], expected[:count], atol=0.05, rtol=0.05
     )

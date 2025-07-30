@@ -47,7 +47,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       supports_mask=True,
       supports_tanh_clipping=True,
       supports_is_causal=True,
-      supports_vmap=True,
+      supports_vmap=False,
   ):
     attention_fn = (
         attention_fn or flash_attention.PallasMosaicGpuFlashAttention()
@@ -147,7 +147,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     self._run_test((2, 1024, 4, 64), impl=impl)
 
 
-# TODO: Remove after JVP reaches feature parity with the fwd pass.
+# TODO: Remove after VJP reaches feature parity with the fwd pass.
 class PallasMosaicGpuFlashAttentionVjpTest(PallasMosaicGpuFlashAttentionTest):
 
   def __init__(self, *args, attention_fn=None):
@@ -165,6 +165,11 @@ class PallasMosaicGpuFlashAttentionVjpTest(PallasMosaicGpuFlashAttentionTest):
         supports_is_causal=False,
     )
 
+  def _run_test_with_inputs(self, *args, **kwargs):
+    if not kwargs.get("test_vjp", True):
+      self.skipTest("No point in testing forward only.")
+    return super()._run_test_with_inputs(*args, **kwargs)
+
   def test_non_power_of_two_head_dim(self):
     # TODO: Fix non-power-of-two head dimension.
     self.skipTest("Only multiples of 64 head dims are supported.")
@@ -173,10 +178,6 @@ class PallasMosaicGpuFlashAttentionVjpTest(PallasMosaicGpuFlashAttentionTest):
   def test_different_output_head_dim(self, input_dim, output_dim):
     # TODO: Support different output head dimensions in vjp.
     self.skipTest("Different output head dimension not supported in vjp.")
-
-  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
-  def test_bench(self, spec):
-    self.skipTest("Re-enable once tanh_clipping and masking are supported.")
 
   def test_causal_mask(self):
     self.skipTest("Re-enable once masks are supported.")

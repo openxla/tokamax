@@ -22,9 +22,9 @@ import numpy as np
 from tokamax._src import numerics
 
 if jax.__version_info__ >= (0, 6, 3):
-  DLL = layout.Layout
+  Layout = layout.Layout
 else:
-  DLL = layout.DeviceLocalLayout  # type: ignore
+  Layout = layout.DeviceLocalLayout  # type: ignore
 
 jax.config.update('jax_threefry_partitionable', False)
 
@@ -109,35 +109,19 @@ class NumericsTest(parameterized.TestCase):
   @parameterized.parameters(jnp.bool_, jnp.float32, jnp.int32, jnp.uint8)
   def test_random_initialize_layout(self, dtype):
     shape = (2, 3, 4)
-    dll = DLL((1, 2, 0), ())
     no_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
-    dll_layout = layout.Format(dll, no_sharding)
-    spec_with_layout = jax.ShapeDtypeStruct(shape, dtype, sharding=dll_layout)
+    format_ = layout.Format(Layout((1, 2, 0), ()), no_sharding)
+    spec_with_layout = jax.ShapeDtypeStruct(shape, dtype, sharding=format_)
     actual = numerics.random_initialize(spec_with_layout)
     expected = numerics.random_initialize(jax.ShapeDtypeStruct(shape, dtype))
     chex.assert_trees_all_close(actual, expected)
-    self.assertEqual(actual.format, dll_layout)
+    self.assertEqual(actual.format, format_)
 
-  def test_initializable_array(self):
-    x = numerics.InitializableArray(
-        value=jnp.zeros((2, 3)),
-        initializer=lambda _, shape, dtype: jnp.ones(shape, dtype),
-    )
-    expected = jnp.zeros((2, 3))
-    chex.assert_trees_all_equal(numerics.random_initialize(x), expected)
-
-    x = numerics.InitializableArray(
-        value=jax.ShapeDtypeStruct((2, 3), jnp.float32),
-        initializer=lambda _, shape, dtype: jnp.ones(shape, dtype),
-    )
-    chex.assert_trees_all_equal(numerics.random_initialize(x), jnp.ones((2, 3)))
-
-    x = numerics.InitializableArray(
-        value=jax.ShapeDtypeStruct((2, 3), jnp.float32),
-        initializer=jax.random.normal,
-    )
-    expected = numerics.random_initialize(x.value)
-    chex.assert_trees_all_equal(numerics.random_initialize(x), expected)
+  def test_ranged_array_initializer(self):
+    x = numerics.RangedArrayInitializer((128, 128), jnp.int32, 3, 7)
+    x = numerics.random_initialize(x)
+    self.assertEqual(jnp.min(x), 3)
+    self.assertEqual(jnp.max(x), 6)
 
 
 if __name__ == '__main__':

@@ -19,6 +19,8 @@ import contextlib
 import dataclasses
 import datetime
 import inspect
+import pathlib
+import tempfile
 import time
 from typing import Any, Literal, TypeAlias, TypeVar
 
@@ -33,6 +35,7 @@ from tokamax._src import utils
 # TODO: Support xprof once it's programmatically available in jaxlib.
 xprof_session = None
 profile_data = None
+from tokamax._src import xplane_pb2  # pylint: disable=g-bad-import-order
 
 
 PyTree = Any
@@ -91,13 +94,16 @@ class XprofProfileSession(contextlib.AbstractContextManager):
   Note: In case of multiple XLA Ops, the one with the most events is used.
   """
 
-  def __init__(self, hermetic: bool = True):
+  def __init__(self, hermetic: bool = True, use_jax_profiler: bool = False):
     """Initializer.
 
     Arguments:
       hermetic: If False, creates XProf server session, with the URL accessible
         via self.xprof_url. If True (default), `self.xprof_url=None` and this
         context manager is hermetic.
+      jax_profiler: Profile with the jax.profiler API writing a temporary
+        profile file instead of invoking xprof directly. If False (default),
+        profile with xprof directly.
     """
 
     if jax.default_backend() == 'cpu':
@@ -107,6 +113,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     self._xprof_session = None
     self._hermetic = hermetic
     self.xprof_url: str | None = None
+    self._jax_profiler_mode = use_jax_profiler
+    if xprof_session is None or profile_data is None:
+      self._jax_profiler_mode = True
+    self._profile_tempdir: tempfile.TemporaryDirectory[str] | None = None
 
   @property
   def total_op_time(self) -> datetime.timedelta:
@@ -119,10 +129,13 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     for xplane in profile.planes:
       if xplane.name.startswith('/device:'):
         for xline in xplane.lines:
-          if 'XLA Ops' in xline.name:
+          # OSS select all lines
+          if self._jax_profiler_mode or 'XLA Ops' in xline.name:
             xla_xlines.append(xline)
 
-    if not xla_xlines:
+    all_events = sum([list(x.events) for x in xla_xlines], [])
+
+    if not xla_xlines or not all_events:  # len(all_events) == 0
       msg = (
           'No XLA device code executed in the context manager. Check that JAX'
           ' functions inside the context are blocked using'
@@ -132,46 +145,70 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         msg += ' Check also that build flag `--config=cuda` is used.'
       raise ValueError(msg)
 
-    xla_xline = max(xla_xlines, key=lambda x: len(list(x.events)))
-    # WARNING: If there are nested ops in the trace, duration_ns will
-    # count time both in the parent and children ops.
-    duration_ns = sum(e.duration_ns for e in xla_xline.events)
+    if self._jax_profiler_mode:
+      t_starts = [e.offset_ps / 1e3 for e in all_events]
+      t_ends = [(e.offset_ps + e.duration_ps) / 1e3 for e in all_events]
+    else:
+      t_starts = [e.start_ns for e in all_events]
+      t_ends = [e.start_ns + e.duration_ns for e in all_events]
+    duration_ns = max(t_ends) - min(t_starts)
 
     # timedelta will round to the nearest microsecond, which is the smallest
     # time resolution supported by this object.
     return datetime.timedelta(microseconds=duration_ns / 1000.0)
 
   def __enter__(self):
-    if profile_data is None or xprof_session is None:
-      raise ValueError('Xprof modules are missing, cannot use xprof profile.')
-    assert profile_data is not None
-    assert xprof_session is not None
-
-    self._xprof_session = xprof_session.XprofSession()
-    try:
-      self._xprof_session.start_session(
-          enable_python_tracer=False,
-          host_trace_level=2,
-      )
-    except Exception as e:
-      raise RuntimeError('Unable to start xprof session.') from e
+    if self._jax_profiler_mode:
+      try:
+        self._profile_tempdir = tempfile.TemporaryDirectory(
+            prefix='tokamax_xprof_profile_'
+        )
+        jax.profiler.start_trace(self._profile_tempdir.name)
+      except Exception as e:
+        raise RuntimeError('Unable to start jax profiling session.') from e
+    else:
+      if profile_data is None or xprof_session is None:
+        raise ValueError('Xprof modules are missing, cannot use xprof profile.')
+      self._xprof_session = xprof_session.XprofSession()
+      try:
+        self._xprof_session.start_session(
+            enable_python_tracer=False,
+            host_trace_level=2,
+        )
+      except Exception as e:
+        raise RuntimeError('Unable to start xprof session.') from e
     return self
 
   def __exit__(self, exc_type, exc_value, exc_tb):
-    assert profile_data is not None and self._xprof_session is not None
-
     del exc_type, exc_tb
-    if self._xprof_session is None:
-      raise AssertionError('__exit__ called without a prior call to __enter__')
-    if self._hermetic:
-      xspace = self._xprof_session.end_session_and_get_xspace()
-    else:
-      xspace, url = self._xprof_session.end_session_and_get_xspace_and_url()
-      self.xprof_url = url
 
-    self._profile = profile_data.ProfileData.from_serialized_xspace(
-        xspace.SerializeToString()
-    )
+    if self._jax_profiler_mode:
+      jax.profiler.stop_trace()
+      assert self._profile_tempdir is not None, 'Profile tempdir should be set.'
+      profile_paths = list(
+          pathlib.Path(self._profile_tempdir.name).glob('**/*.xplane.pb')
+      )
+      assert len(profile_paths) == 1, 'Expected exactly one profile file.'
+      profile_path = profile_paths[0]
+      self._profile = xplane_pb2.XSpace()
+      self._profile.ParseFromString(profile_path.read_bytes())
+      self._profile_tempdir.cleanup()
+      self._profile_tempdir = None
+    else:
+      assert profile_data is not None and self._xprof_session is not None
+      if self._xprof_session is None:
+        raise AssertionError(
+            '__exit__ called without a prior call to __enter__'
+        )
+      if self._hermetic:
+        xspace = self._xprof_session.end_session_and_get_xspace()
+      else:
+        xspace, url = self._xprof_session.end_session_and_get_xspace_and_url()
+        self.xprof_url = url
+
+      self._profile = profile_data.ProfileData.from_serialized_xspace(
+          xspace.SerializeToString()
+      )
 
 
 def standardize_function(
@@ -209,10 +246,10 @@ def standardize_function(
   ba = inspect.signature(f).bind(*args, **({} if kwargs is None else kwargs))
   ba.apply_defaults()
 
-  is_leaf = lambda x: isinstance(x, numerics.InitializableArray)
+  is_leaf = lambda x: isinstance(x, numerics.ArrayInitializer)
   args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs), is_leaf=is_leaf)
   is_array = lambda x: isinstance(
-      x, (jax.Array, numerics.InitializableArray, jax.ShapeDtypeStruct)
+      x, (jax.Array, numerics.ArrayInitializer, jax.ShapeDtypeStruct)
   )
   arrays, other, merge = utils.split_merge(is_array, args_flat)
 
@@ -233,16 +270,6 @@ def standardize_function(
 
   if seed is not None:
     arrays = numerics.random_initialize(arrays, seed=seed)
-  else:
-    # Initializable arrays are recognized as traceable objects by jax
-    # facilities (eg. kernel.lower(...)). For that reason we need to
-    # initialize them.
-    is_init_array = lambda x: isinstance(x, numerics.InitializableArray)
-    arrays = jax.tree.map(
-        lambda x: numerics.random_initialize(x) if is_init_array(x) else x,
-        arrays,
-        is_leaf=is_init_array,
-    )
 
   if mode == 'forward':
     func = forward

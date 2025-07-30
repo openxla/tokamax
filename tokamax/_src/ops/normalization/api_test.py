@@ -16,7 +16,6 @@ from collections.abc import Callable, Mapping
 import functools
 import typing
 from typing import Final
-from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -37,6 +36,11 @@ _IMPLEMENTATIONS_VJP: Mapping[str, Callable[..., jax.Array]] = dict(
     xla=base.NormalizationVjp(),
     triton=pl_norm_vjp.PallasTritonNormalizationVjp(),
 )
+
+import sys
+from absl import flags
+FLAGS = flags.FLAGS
+FLAGS(sys.argv[2:])  # Parse absl flags before absltest.main()
 
 
 def _get_input_data(shape, dtype=jnp.bfloat16):

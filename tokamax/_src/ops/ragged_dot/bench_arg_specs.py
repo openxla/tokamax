@@ -44,7 +44,7 @@ def _make_spec(num_groups, m, n, k, lhs_dtype, rhs_dtype, group_sizes=None):
     assert len(group_sizes) == num_groups
   group_sizes = base.GroupSizes(  # pytype: disable=wrong-arg-types
       jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
-      representative_value=group_sizes,
+      representative_value=tuple(group_sizes),
   )
   return dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
 

@@ -1,6 +1,6 @@
 [project]
 name = "tokamax"
-authors = [{
+authors = [
   {name = "Ani Udipi", email = "udipi@google.com"},
   {name = "Chris Jones", email = "cjfj@google.com"},
   {name = "Christos Perivolaropoulos", email = "cperivol@google.com"},
@@ -8,9 +8,9 @@ authors = [{
   {name = "Gleb Pobudzey", email = "pobudzey@google.com"},
   {name = "Robert Dyro", email = "rdyro@google.com"},
   {name = "Sebastian Bodenstein", email = "sbodenstein@google.com"},
-  {name = "Selim Seferbekov", email = "selimsef@google.com"}
-  {name = "Stanley Tzeng", email = "stzeng@google.com"}
-}]
+  {name = "Selim Seferbekov", email = "selimsef@google.com"},
+  {name = "Stanley Tzeng", email = "stzeng@google.com"},
+]
 
 description = "A Pallas Custom Kernel Library."
 readme = "README.md"
@@ -30,5 +30,10 @@ dependencies = [
 "google-benchmark>=1.9.0",
 "pydantic>=2.11.0",
 "torch_xla[pallas]",
-"xprof", 
-"pytest",]
+"xprof",
+"pytest",
+"einshape",
+"tensorflow",
+"flax",
+"pytest-xdist",
+"protobuf",]

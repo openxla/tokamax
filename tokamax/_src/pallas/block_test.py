@@ -19,7 +19,6 @@ from absl.testing import parameterized
 import chex
 import jax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from tokamax._src.pallas import block
 
@@ -77,7 +76,7 @@ class BlockTest(parameterized.TestCase):
     def kernel(x_ref, mask_ref):
       mask = x_ref.inbounds_mask()
       self.assertEqual(mask.shape, expected_mask_shape)
-      plgpu.store(mask_ref, jnp.broadcast_to(mask, mask_ref.shape))
+      pl.store(mask_ref, (), jnp.broadcast_to(mask, mask_ref.shape))
 
     grid = []
     out_shape = []
@@ -112,13 +111,13 @@ class BlockTest(parameterized.TestCase):
     def kernel(x_ref, mask0_ref, mask1_ref, mask_ref):
       x_ref = x_ref.at[-32:, 1, pl.dslice(100, 16)]
       mask0, mask1 = x_ref.inbounds_masks
-      plgpu.store(mask0_ref, mask0)
-      plgpu.store(mask1_ref, mask1)
+      pl.store(mask0_ref, (), mask0)
+      pl.store(mask1_ref, (), mask1)
       mask0 = x_ref.inbounds_mask(bounds_check=(True, False))
       mask1 = x_ref.inbounds_mask(bounds_check=(False, True))
       self.assertEqual(mask0.shape, (32, 1))
       self.assertEqual(mask1.shape, (1, 16))
-      plgpu.store(mask_ref, x_ref.inbounds_mask())
+      pl.store(mask_ref, (), x_ref.inbounds_mask())
 
     x = jnp.ones((99, 3, 111))
     mask0, mask1, mask = block.pallas_call(

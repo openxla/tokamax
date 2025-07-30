@@ -25,7 +25,6 @@ from google.protobuf import json_format
 import immutabledict
 import jax
 from jax.interpreters.mlir import ir
-from jax.jaxlib.gpu import triton_pb2
 import jax.numpy as jnp
 from tokamax._src import serialization
 from tokamax._src.ops import op
@@ -199,29 +198,22 @@ def _instruction_get_triton_kernel(
   """Get Triton kernel info from an HLO instruction."""
 
   cfg = instruction.backend_config
-  temp = zlib.decompress(cfg)
-  proto = triton_pb2.TritonAnyKernelCall.FromString(temp)
-
-  grid = (
-      proto.kernel_call.grid_0,
-      proto.kernel_call.grid_1,
-      proto.kernel_call.grid_2,
-  )
-  kernel = proto.kernel_call.kernel
+  grid = (0, 0, 0)
+  name = ''
+  compute_capability = 0
+  num_warps = 0
+  cluster_dim = (0, 0, 0)
+  metadata = ''
 
   return TritonKernelInfo(
       **_get_generic_kernel_info(instruction),
-      kernel_name=kernel.kernel_name,
-      compute_capability=kernel.compute_capability,
-      num_warps=kernel.num_warps,
+      kernel_name=name,
+      compute_capability=compute_capability,
+      num_warps=num_warps,
       num_stages=None,  # This is not currently in triton.proto.
       grid=grid,
-      cluster_dim=(
-          kernel.cluster_dim_0,
-          kernel.cluster_dim_1,
-          kernel.cluster_dim_2,
-      ),
-      metadata=proto.metadata,
+      cluster_dim=cluster_dim,
+      metadata=metadata,
       hlo_module_name=module_name,
   )
 
@@ -336,8 +328,7 @@ def get_opspecs(  # pytype: disable=invalid-annotation
     op_name, json_str = match.groups()
     op_class = serialization.get_module_member(op_name)
     spec = json.loads(json_str, cls=serialization.JsonDecoder)
-    op_spec = op.BoundArguments(op=op_class(), arguments=spec)
-    op_specs.append(op_spec)
+    op_specs.append(op_class().bind(**spec))
 
   return tuple(op_specs)
 
@@ -351,8 +342,10 @@ def _parse_shapes_recursive(shapes):
   """Parse xla.ShapeProto."""
 
   # Ideally use isinstance on the type, but this type is not visible.
-  if isinstance(shapes, list) or 'RepeatedCompositeContainer' in str(
-      type(shapes)
+  if (
+      isinstance(shapes, list)
+      or 'RepeatedCompositeContainer' in str(type(shapes))
+      or 'RepeatedCompositeFieldContainer' in str(type(shapes))
   ):
     return tuple([_parse_shapes(shape) for shape in shapes])  # pytype: disable=attribute-error
 

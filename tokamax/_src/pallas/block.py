@@ -24,7 +24,6 @@ from unittest import mock
 
 import jax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 
 
@@ -201,7 +200,7 @@ class BlockRef:
       other = None
     elif other is None:
       other = 0
-    return plgpu.load(self.ref, mask=mask, other=other, **kwargs)
+    return pl.load(self.ref, (), mask=mask, other=other, **kwargs)
 
   def store(self, val: jax.Array, **kwargs):
     """Stores a block with `mask=inbounds_mask()`."""
@@ -209,7 +208,7 @@ class BlockRef:
       mask = kwargs.pop("mask", None)
     else:
       mask &= kwargs.pop("mask", True)
-    plgpu.store(self.ref, val, mask=mask, **kwargs)
+    pl.store(self.ref, (), val, mask=mask, **kwargs)
 
   def __getattr__(self, name: str) -> Any:
     return getattr(self.ref, name)
@@ -323,12 +322,8 @@ def pallas_call(
 
       with (
           _PL_LOAD_STORE_PATCH_LOCK,
-          mock.patch.object(
-              plgpu, "load", functools.partial(ld_st, plgpu.load)
-          ),
-          mock.patch.object(
-              plgpu, "store", functools.partial(ld_st, plgpu.store)
-          ),
+          mock.patch.object(pl, "load", functools.partial(ld_st, pl.load)),
+          mock.patch.object(pl, "store", functools.partial(ld_st, pl.store)),
       ):
         return kernel(*in_refs, *out_refs)
 

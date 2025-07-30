@@ -15,13 +15,14 @@
 """Ragged dot base class."""
 
 from collections.abc import Callable, Sequence
+import dataclasses
 import functools
 import types
 from typing import Any, TypeVar
 
 import jax
 import jax.numpy as jnp
-from tokamax._src import numerics
+import numpy as np
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
@@ -40,8 +41,12 @@ DEFAULT_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
 )
 
 
-@jax.tree_util.register_pytree_node_class
-class GroupSizes(numerics.InitializableArray):
+_STATIC = dataclasses.field(metadata=dict(static=True))
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class GroupSizes:
   """A group sizes array with representative values.
 
   `ragged_dot` performance is sensitive to the distribution of the group sizes,
@@ -50,56 +55,32 @@ class GroupSizes(numerics.InitializableArray):
   distribution of group sizes. This allows `ragged_dot` to be benchmarked /
   autotuned with representative data.
   """
+  value: jax.Array
+  representative_value: tuple[int, ...] = _STATIC
 
-  def __init__(
-      self,
-      value: jax.Array,
-      representative_value: Sequence[int] = (),
-      *,
-      initializer=None,
-  ):
-    if initializer is None:
-      if not representative_value:
-        raise ValueError("Must specify `representative_value`.")
+  def __post_init__(self):
+    (num_groups,) = self.value.shape
+    if len(self.representative_value) != num_groups:
+      raise ValueError(
+          "Representative value must have the same length as the group sizes."
+      )
 
-      (num_groups,) = value.shape
-      rep_values = tuple(representative_value)
+    if not isinstance(self.value, jax.Array):
+      value = np.asarray(self.representative_value, np.int32)
+      object.__setattr__(self, "value", value)
 
-      if len(rep_values) != num_groups:
-        raise ValueError(
-            f"Group sizes array {value.shape} does not match"
-            f" {len(rep_values)} representative values."
-        )
-      initializer = _HashablePartial(numerics.const_initializer, rep_values)
-    elif representative_value:
-      raise ValueError("`representative_value` and `initializer` both present.")
+    if not np.issubdtype(self.value.dtype, np.integer):
+      raise ValueError("Group sizes must be integers.")
 
-    super().__init__(value, initializer)
-
-  def tree_flatten(self):
-    return (self.value,), self.initializer
-
-  @classmethod
-  def tree_unflatten(cls, aux_data, children):
-    (value,) = children
-    return cls(value, initializer=aux_data)
+  def __jax_array__(self):
+    return self.value
 
 
-# TODO: Move to a common location.
-class _HashablePartial(functools.partial):
-  """A `functools.partial` that is hashable."""
+def _abstractify_group_sizes(sizes: GroupSizes) -> tuple[int, ...]:
+  return sizes.representative_value
 
-  def __eq__(self, other):
-    return (
-        type(other) is _HashablePartial
-        and self.func.__code__ == other.func.__code__
-        and self.args == other.args
-        and self.keywords == other.keywords
-    )
 
-  def __hash__(self):
-    keywords = tuple(sorted(self.keywords.items(), key=lambda kv: kv[0]))
-    return hash((self.func.__code__, self.args, keywords))
+op.custom_abstractify_mappings[GroupSizes] = _abstractify_group_sizes
 
 
 class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
@@ -113,7 +94,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       lhs: jax.Array | QuantizedArray,
       rhs: jax.Array | QuantizedArray,
       *,
-      group_sizes: jax.Array | GroupSizes,
+      group_sizes: jax.Array | GroupSizes | Sequence[int],
       ragged_dot_dimension_numbers: (
           jax.lax.RaggedDotDimensionNumbers | None
       ) = None,
@@ -125,10 +106,14 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       # TODO: Support batch dims on LHS and/or RHS?
       ragged_dot_dimension_numbers = DEFAULT_RAGGED_DOT_DIM_NUMS
 
+    if isinstance(group_sizes, (tuple, list)):
+      group_sizes = tuple(group_sizes)
+      group_sizes = GroupSizes(jnp.array(group_sizes, jnp.int32), group_sizes)
+
     # TODO: Create representative values for other ragged dot dim numbers.
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
-      if not isinstance(group_sizes, numerics.InitializableArray):
-        representative_sizes = [lhs.shape[0] // rhs.shape[0]] * rhs.shape[0]
+      if not isinstance(group_sizes, GroupSizes):
+        representative_sizes = (lhs.shape[0] // rhs.shape[0],) * rhs.shape[0]
         group_sizes = GroupSizes(group_sizes, representative_sizes)
 
     if preferred_element_type is not None:
@@ -150,7 +135,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       lhs: jax.Array | QuantizedArray,
       rhs: jax.Array | QuantizedArray,
       *,
-      group_sizes: jax.Array,
+      group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
       precision: jax.lax.DotAlgorithmPreset,
       preferred_element_type: jnp.dtype | None,
@@ -164,6 +149,9 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 
     if isinstance(rhs, QuantizedArray):
       rhs = rhs.recompose()
+
+    if isinstance(group_sizes, GroupSizes):
+      group_sizes = jnp.array(group_sizes)
 
     out = jax.lax.ragged_dot_general(
         lhs,
@@ -187,8 +175,8 @@ def vjp(
     ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
     precision: jax.lax.DotAlgorithmPreset,
     preferred_element_type: jnp.dtype | None,
-    dlhs_ragged_dot: Callable[..., jax.Array] = jax.lax.ragged_dot_general,
-    drhs_ragged_dot: Callable[..., jax.Array] = jax.lax.ragged_dot_general,
+    dlhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
+    drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
 ) -> tuple[jax.Array, jax.Array]:
   """Ragged dot VJP."""
   del out, preferred_element_type  # Unused.

@@ -29,6 +29,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_kernel as quant_ws
 
 Config = common.Config
 QuantizedArray = quantization.QuantizedArray
+GroupSizes = base.GroupSizes
 
 
 # TODO: Natively support mk,ekn->mn.
@@ -49,7 +50,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
       lhs: jax.Array | QuantizedArray,
       rhs: jax.Array | QuantizedArray,
       *,
-      group_sizes: jax.Array,
+      group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
       precision: jax.lax.DotAlgorithmPreset,
       preferred_element_type: jnp.dtype | None,
@@ -75,6 +76,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
         fn = quant_kernel.ragged_dot_quantized_kernel
     else:
       fn = non_quant_kernel.ragged_dot_non_quantized_kernel
+
+    if isinstance(group_sizes, GroupSizes):
+      group_sizes = jnp.array(group_sizes)
 
     if preferred_element_type is None:
       preferred_element_type = jnp.result_type(lhs.dtype, rhs.dtype)
