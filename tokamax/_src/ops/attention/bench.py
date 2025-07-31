@@ -51,7 +51,7 @@ _BENCHMARK_IMPLS_FWD_BWD = flags.DEFINE_list(
 )
 _register_benchmark = functools.partial(
     benchmarking.get_benchmark_registrar(_IMPLS),
-    iterations=10,
+    iterations=3,
     raise_on_error=False,
 )
 
