@@ -201,13 +201,13 @@ class DotProductAttentionTest(parameterized.TestCase):
       self.skipTest(
           'Skip test. Triton implementation is not supported on this platform.'
       )
-    if self.IMPL == 'cudnn':
-      self.skipTest('cudnn bias gradient calculation is flaky.')
     # TODO: Fix test for 'xla_chunked' on TPU.
-    if jax.default_backend() == 'tpu' and self.IMPL == 'xla_chunked':
+    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
       self.skipTest(f'{self.IMPL} not supported on TPU')
     if use_vmap and not self.SUPPORTS_VMAP:
       self.skipTest('vmap not supported')
+    if self.IMPL == 'cudnn' and batch_size != 1:
+      self.skipTest('batch_size != 1 not supported for bias gradient in cudnn')
 
     dtype = jnp.bfloat16
     B, S, N, H = batch_size, 128, 4, 64
