@@ -377,7 +377,7 @@ def _fwd(
       o_smem[...] = acc.astype(q.dtype)  # pytype: disable=attribute-error
       plgpu.commit_smem()
       plgpu.copy_smem_to_gmem(o_smem, out_ref.at[b_idx, qs, h_idx])
-      plgpu.wait_smem_to_gmem(0)
+      plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     @pl.when(wg_idx == 2)
     def _memory_wg():
