@@ -336,13 +336,6 @@ def _bwd_kernel(
     dq_ref.store((dq * sm_scale).astype(dq_ref.dtype))
 
 
-def _sum_f32(x, *args, **kwargs):
-  """Sums `x` in at least float32 precision."""
-  x = jnp.asarray(x)
-  sum_dtype = jnp.promote_types(x.dtype, jnp.float32)
-  return jnp.sum(x.astype(sum_dtype), *args, **kwargs).astype(x.dtype)
-
-
 @dataclasses.dataclass(frozen=True)
 class Config:
   block_m1: int
@@ -476,8 +469,8 @@ def _bwd(
 
   if num_heads_k < num_heads_q:
     sum_shape = dk.shape[:-2] + (num_heads_k, num_heads_q // num_heads_k, -1)
-    dk = _sum_f32(dk.reshape(sum_shape), axis=-2)
-    dv = _sum_f32(dv.reshape(sum_shape), axis=-2)
+    dk = jnp.sum(dk.reshape(sum_shape), axis=-2)
+    dv = jnp.sum(dv.reshape(sum_shape), axis=-2)
 
   return dq, dk, dv, ds
 
@@ -558,7 +551,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       dbias = None
     else:
       broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
-      dbias = _sum_f32(ds, axis=broadcast_bias_axes, keepdims=True)
+      dbias = jnp.sum(ds, axis=broadcast_bias_axes, keepdims=True)
       dbias = dbias.reshape(orig_bias_shape)
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
