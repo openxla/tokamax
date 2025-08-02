@@ -141,7 +141,8 @@ def _fwd(
     wg_idx = lax.axis_index("wg")
 
     (
-        (q_smems, k_smems, v_smems, o_smems, *residual_smems),
+        (q_smems, k_smems, o_smems, *residual_smems),
+        v_smems,
         q_barriers,
         bias_smems,
         mask_smems,
@@ -452,9 +453,10 @@ def _fwd(
     pl.run_scoped(
         lambda *args: kernel(*refs, scoped=args),
         plgpu.RefUnion(
-            (q_scratch, k_scratch, v_scratch),
+            (q_scratch, k_scratch),
             (o_scratch, ((l_scratch, m_scratch) if return_residuals else ())),
         ),
+        v_scratch,  # wg1 may still access v as wg0 writes to {o,l,m}_scratch.
         q_barriers,
         None if bias is None else tiled_smem(bias_mask_smem_shape, bias.dtype),
         None if no_async_mask else tiled_smem(bias_mask_smem_shape, jnp.int8),
