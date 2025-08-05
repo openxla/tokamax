@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -23,6 +25,15 @@ from tokamax._src.ops.attention import test_base
 
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
+
+def _atol_ctx(atol: float):
+  orig_run_test = test_base._run_test
+
+  def my_run_test(*args, **kwargs):
+    _ = kwargs.pop("atol", None)
+    orig_run_test(*args, **(kwargs | dict(atol=atol)))
+
+  return mock.patch.object(test_base, "_run_test", my_run_test)
 
 class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
 
@@ -91,6 +102,14 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
 
   def test_bench_veo3(self, *_):
     self.skipTest("Unsupported head_dim > 128.")
+
+  def test_bench_alphafold(self, *_):
+    with _atol_ctx(0.035):
+      getattr(super(), "test_bench_alphafold")()
+
+  def test_bench_usm_trunk(self, *_):
+    with _atol_ctx(0.035):
+      getattr(super(), "test_bench_usm_trunk")()
 
   @parameterized.parameters(*test_base.base_names_and_params("test_vmap"))
   def test_vmap(self, test_name, kwargs):

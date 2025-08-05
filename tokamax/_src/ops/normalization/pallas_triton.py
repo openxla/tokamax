@@ -84,6 +84,7 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
 
   # If `None`, `input_output_alias = not return_residuals`.
   input_output_alias: bool | None = None
+  supports_symbolic_shapes: bool = False
 
   def __post_init__(self):
     if self.vjp is None:

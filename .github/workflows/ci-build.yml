@@ -42,8 +42,13 @@ jobs:
           python3.11 -m uv pip --version
           python3.11 -m uv pip install --upgrade -r requirements.txt
           python3.11 -m uv pip freeze
-      - name: Test project with unittest
+      - name: Test Tokamax ops with unittest
         run: |
           export JAX_ENABLE_X64=0
           export JAX_TRACEBACK_FILTERING=off
-          pytest --ignore-glob='*/test_base.py' tokamax
+          pytest -s --ignore-glob='*/test_base.py' tokamax/_src/ops
+      - name: Test Tokamax utils with unittest
+        run: |
+          export JAX_ENABLE_X64=0
+          export JAX_TRACEBACK_FILTERING=off
+          pytest -s --ignore-glob='tokamax/_src/ops/*' tokamax

@@ -54,20 +54,14 @@ def ragged_dot_quantized_kernel_body(
       # Tiling along the reduction dimension. This overlaps to some extent
       # scaling/casting with wgmma.
       assert w.shape[1] % x_swizzle_elems == 0
-      # TODO: Enable WGMMA tiling again. At some point upstream LLVM
-      # changes caused this technique to cause illegal instruction errors or
-      # silent numerical failures. It's highly likely that it's a ptxas bug
-      # that was uncovered through small changes in PTX.
-      # mma_k_tile = x_swizzle_elems
-      mma_k_tile = w.shape[1]
-      steps = w.shape[1] // mma_k_tile
+      steps = w.shape[1] // x_swizzle_elems
       if steps == 1:
         # The LHS registers are reused in each loop. Synchronizing here is
         # the only way to make sure they are not overwritten.
         plgpu.wgmma_wait(0)
 
       for j in range(steps):
-        sl = slice(j * mma_k_tile, (j + 1) * mma_k_tile)
+        sl = slice(j * x_swizzle_elems, (j + 1) * x_swizzle_elems)
         plgpu.wgmma(
             acc_ref,
             common.dequant(s_smem.at[0], w[:, sl]),

@@ -14,24 +14,20 @@
 # ==============================================================================
 
 from absl.testing import absltest
-from absl.testing import parameterized
-from tokamax._src.ops.attention import test_base
-from tokamax._src.ops.flex_attention import pallas_triton
-from tokamax._src.ops.flex_attention import wrapper_test_base
+import jax
+import jax.numpy as jnp
+from tokamax._src import shape
 
 
-class WrappedFlexAttentionTest(wrapper_test_base.WrappedFlexAttentionTestBase):
+class ShapeTest(absltest.TestCase):
 
-  def __init__(self, *args):
-    super().__init__(
-        *args,
-        flex_attn=pallas_triton.PallasTritonFlexAttention(),
-        supports_vjp=False,  # TODO: Support VJP.
-    )
+  def test_contains_symbolic_shape(self):
+    (a,) = jax.export.symbolic_shape('a')
+    x1 = {'a': jax.ShapeDtypeStruct((2, 3, a), jnp.bfloat16), 'b': (2, 3)}
+    x2 = {'a': jax.ShapeDtypeStruct((2, 3, 3), jnp.bfloat16), 'b': (2, 3)}
+    self.assertTrue(shape.contains_symbolic_shape(x1))
+    self.assertFalse(shape.contains_symbolic_shape(x2))
 
-  @parameterized.parameters(*test_base.base_names_and_params("test_vmap"))
-  def test_vmap(self, *_):
-    self.skipTest("TODO: Fix `vmap` support.")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
   absltest.main()

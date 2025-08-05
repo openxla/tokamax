@@ -22,8 +22,7 @@ import dataclasses
 import inspect
 import json
 import re
-from typing import Any, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
-
+from typing import Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
 from absl import logging
 import immutabledict
 import jax
@@ -33,6 +32,7 @@ from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src import config as config_lib
 from tokamax._src import serialization
+from tokamax._src import shape
 from tokamax._src import utils
 
 
@@ -100,6 +100,10 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
   # input array arguments not in the dict will have gradients set to zeros.
   vjp: Callable[Concatenate[_Residuals, _T, _T, _P], Any] | None = None
 
+  # Whether an op allows abstract inputs with `jax.export.symbolic_shape`
+  # instances in array shapes.
+  supports_symbolic_shapes: ClassVar[bool] = True
+
   @overload
   def __call__(
       self,
@@ -122,6 +126,12 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       self, *args: _P.args, return_residuals: bool = False, **kwargs: _P.kwargs
   ) -> _T | tuple[_T, _Residuals]:
     """Applies the operation with the given arguments."""
+
+    if not self.supports_symbolic_shapes and shape.contains_symbolic_shape(
+        (args, kwargs)
+    ):
+      raise NotImplementedError("This op does not support symbolic shapes.")
+
     bind = cast(Callable[_P, Any], self.bind)  # Work around pytype bug.
     ba = bind(*args, **kwargs)
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
@@ -142,9 +152,12 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       ba = BoundArguments(self, arguments)
 
       # Serialize args into the HLO to allow for, e.g., offline autotuning.
-      encoder_cls = serialization.JsonEncoder
-      abstract = _abstractify(arguments)
-      json_str = json.dumps(abstract, cls=encoder_cls, separators=(",", ":"))
+      try:
+        encoder_cls = serialization.JsonEncoder
+        abstract = _abstractify(arguments)
+        json_str = json.dumps(abstract, cls=encoder_cls, separators=(",", ":"))
+      except TypeError:
+        json_str = "{}"
       full_name = self.__module__ + "." + self.__class__.__name__
 
       with jax.named_scope(f"tokamax:{full_name}({json_str})"):

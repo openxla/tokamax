@@ -188,6 +188,7 @@ class DumpHloLibTest(parameterized.TestCase):
     # TODO: add tests for axis once this is in the Pallas HLO.
 
   def test_jax_triton_simple(self):
+    self.skipTest('This test is not supported on OSS due to CUDA backend issues.')
 
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
@@ -387,6 +388,7 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertGreater(diff_summary.percent_close * 100, 99.99)
 
   def test_empty_opspecs_from_triton_kernel(self):
+    self.skipTest('This test is not supported on OSS due to CUDA backend issues.')
 
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')

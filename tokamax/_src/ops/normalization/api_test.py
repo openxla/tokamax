@@ -20,6 +20,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
+from jax import export
 import jax.numpy as jnp
 from tokamax._src import hlo_utils
 from tokamax._src import triton
@@ -77,6 +78,37 @@ class LayerNormTest(parameterized.TestCase):
 
     with self.subTest("value"):
       chex.assert_trees_all_close(out, out_golden)
+
+    with self.subTest("symbolic serialization"):
+      (a,) = export.symbolic_shape("a")
+      x_shape = jax.ShapeDtypeStruct((a, 32), x.dtype)
+      param_shape = jax.ShapeDtypeStruct(scale.shape, x.dtype)
+
+      if implementation == "triton":
+        with self.assertRaisesRegex(Exception, "all implementations failed"):
+          export.export(
+              norm_fn,
+              disabled_checks=[
+                  export.DisabledSafetyCheck.custom_call(
+                      hlo_utils.TRITON_PALLAS_KEY
+                  )
+              ],
+          )(x_shape, param_shape, param_shape)
+        # Change shape to non-symbolic to test standard export.
+        x_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+
+      exported = export.export(
+          norm_fn,
+          disabled_checks=[
+              export.DisabledSafetyCheck.custom_call(
+                  hlo_utils.TRITON_PALLAS_KEY
+              )
+          ],
+      )(x_shape, param_shape, param_shape)
+      serialized: bytearray = exported.serialize()
+      rehydrated_norm: export.Exported = export.deserialize(serialized)
+      out_rehydrated = jax.jit(rehydrated_norm.call)(x, scale, offset)
+      chex.assert_trees_all_close(out_rehydrated, out_golden)
 
     with self.subTest("correct_implementation_used"):
       opspecs = hlo_utils.get_opspecs(

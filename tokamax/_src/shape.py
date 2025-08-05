@@ -15,12 +15,17 @@
 """Shape utilities."""
 
 import functools
+from typing import Any, TypeAlias
 
 from einshape.src.jax import jax_ops as einshape_jax
 import jax
+from jax import export
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
 
+
+PyTree = Any
+SymbolicDim: TypeAlias = type(export.symbolic_shape("_a")[0])  # pytype: disable=invalid-annotation
 
 einshape = lambda eq, **kw: functools.partial(einshape_jax.einshape, eq, **kw)
 
@@ -39,3 +44,17 @@ def pad_dim_to(x: jax.Array, n: int, axis: int) -> jax.Array:
 def pad_to_next_multiple_of(x: jax.Array, m: int, axis: int = 0) -> jax.Array:
   """Pads `x` to the next multiple of `m` along `axis`."""
   return pad_dim_to(x, pl.cdiv(x.shape[axis], m) * m, axis)
+
+
+def contains_symbolic_shape(args: PyTree) -> bool:
+  """Returns whether the given PyTree contains symbolic shapes."""
+
+  args = jax.tree.leaves(args)
+  for x in args:
+    # This could match a variety of types, such as jax.ShapeDtypeStruct,
+    # JitTracer, GradTracer, etc.
+    if hasattr(x, "shape") and isinstance(x.shape, tuple):
+      for s in x.shape:
+        if isinstance(s, SymbolicDim):
+          return True
+  return False

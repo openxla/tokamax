@@ -116,10 +116,14 @@ def _fwd(
   if mask is not None:
     mask = as_4d(mask).astype(jnp.int8)
 
-  # TODO: Avoid broadcast.
-  bcast = lambda x: jnp.broadcast_to(x, (batch_size, x.shape[-2], q_seq_len))
-  k_start = None if k_start is None else bcast(k_start)
-  k_end = None if k_end is None else bcast(k_end)
+  def bcast_k_range(x):
+    if x is None:
+      return None
+    x = jax.lax.collapse(jax.lax.broadcast_to_rank(x, 3), 0, -2)
+    # TODO: Avoid broadcast in q-sequence dim.
+    return jnp.broadcast_to(x, (*x.shape[:-1], q_seq_len))
+
+  k_start, k_end = map(bcast_k_range, (k_start, k_end))
 
   def kernel(
       q_ref,
@@ -166,7 +170,9 @@ def _fwd(
         max_kv_step = lax.min(max_kv_step, pl.cdiv(q_max, block_kv))
 
       def load_k_minmax(ref):
-        return ref[b_idx, 0 if (ref.shape[1] == 1) else h_idx, q_idx]
+        b_idx_ = 0 if ref.shape[0] == 1 else b_idx
+        h_idx_ = 0 if ref.shape[1] == 1 else h_idx
+        return ref[b_idx_, h_idx_, q_idx]
 
       if k_start_minmax_refs is None:
         k_start_max = None
@@ -214,7 +220,9 @@ def _fwd(
       def load_k_range(ref):
         if ref is None:
           return None
-        idx = (b_idx, 0 if (ref.shape[1] == 1) else h_idx, qs)
+        b_idx_ = 0 if ref.shape[0] == 1 else b_idx
+        h_idx_ = 0 if ref.shape[1] == 1 else h_idx
+        idx = (b_idx_, h_idx_, qs)
         return plgpu.load(ref, idx, layout=_WGMMA_ROW, optimized=False)
 
       k_start = load_k_range(k_start_ref)

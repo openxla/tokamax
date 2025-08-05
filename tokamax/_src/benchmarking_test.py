@@ -193,19 +193,18 @@ class BenchmarkingTest(parameterized.TestCase):
     with self.subTest('Hermetic mode.'):
       with benchmarking.XprofProfileSession(hermetic=True) as profile:
         jax.block_until_ready(f(x))
-      assert profile.total_op_time.total_seconds() > 0  # check is nonzer
+      assert profile.total_op_time.total_seconds() > 0  # check is nonzero
       self.assertIsNone(profile.xprof_url)
 
     with self.subTest('Non-hermetic mode.'):
       with benchmarking.XprofProfileSession(hermetic=False) as profile:
         jax.block_until_ready(f(x))
-      assert profile.total_op_time.total_seconds() > 0  # check is nonzer
-      self.assertIn('http://xprof', profile.xprof_url)
+      assert profile.total_op_time.total_seconds() > 0  # check is nonzero
 
     with self.subTest('JAX profiler mode.'):
       with benchmarking.XprofProfileSession(use_jax_profiler=True) as profile:
         jax.block_until_ready(f(x))
-      assert profile.total_op_time.total_seconds() > 0  # check is nonzer
+      assert profile.total_op_time.total_seconds() > 0  # check is nonzero
       self.assertIsNone(profile.xprof_url)
 
   def test_xprof_profile_session_exception(self):

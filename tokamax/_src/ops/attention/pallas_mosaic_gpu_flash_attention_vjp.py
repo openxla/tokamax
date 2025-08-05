@@ -37,6 +37,9 @@ PagingInfo = base.PagingInfo
 
 L: TypeAlias = plgpu.Layout
 
+_WGMMA = plgpu.Layout.WGMMA
+_WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
+_WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 
 @dataclasses.dataclass(frozen=True)
 class Config:
@@ -45,7 +48,7 @@ class Config:
   block_q_dq: int
   block_kv_dq: int
   num_stages: int = 2
-  compute_wgs: int = 1
+  compute_wgs: int = 2
 
   def __post_init__(self):
     if self.block_q_dkv % 64:
@@ -54,6 +57,16 @@ class Config:
       raise ValueError(f"{self.block_kv_dkv=} must be a multiple of 64")
     if self.num_stages < 2:
       raise ValueError(f"{self.num_stages=} must be at least 2")
+
+
+def find_swizzle(dim_size_bits: int, what: str) -> int:
+  for swizzle_bytes in (128, 64, 32, 16):
+    if dim_size_bits % (swizzle_bytes * 8) == 0:
+      return swizzle_bytes
+  raise ValueError(
+      f"No valid out swizzle for {what}: its minor dimension has"
+      f" {dim_size_bits} bits, which is not a multiple of 128."
+  )
 
 
 @jaxtyping.jaxtyped
@@ -65,6 +78,9 @@ def _bwd(
     out: Float[Array, "*B T H d"],
     dout: Float[Array, "*B T H d"],
     *,
+    mask: Bool[Array, "*#B #H #T #t"] | None,
+    k_start: Int[Array, "*#B #H #T"] | None,
+    k_end: Int[Array, "*#B #H #T"] | None,
     logits_scale: float,
     use_base2: bool,
     config: Config,
@@ -131,6 +147,14 @@ def _bwd(
         f"{kv_seq_len=} must be a multiple of {config.block_kv_dq=}"
     )
 
+  if mask is not None:
+    mask = as_4d(mask).astype(jnp.int8)
+
+  # TODO: Avoid broadcast.
+  bcast = lambda x: jnp.broadcast_to(x, (batch_size, x.shape[-2], q_seq_len))
+  k_start = None if k_start is None else bcast(k_start)
+  k_end = None if k_end is None else bcast(k_end)
+
   swizzle = 128
   transforms = (
       plgpu.TilingTransform((8, swizzle // q.dtype.itemsize)),
@@ -142,8 +166,23 @@ def _bwd(
 
   exp = jnp.exp2 if use_base2 else jnp.exp
 
-  def kernel_dq(q_ref, k_ref, v_ref, dout_ref, m_ref, l_ref, delta_ref, dq_ref,
-                smem_buffers, buffer_barriers, block_q: int, block_kv: int):
+  def kernel_dq(
+      q_ref,
+      k_ref,
+      v_ref,
+      dout_ref,
+      m_ref,
+      l_ref,
+      delta_ref,
+      mask_ref,
+      k_start_ref,
+      k_end_ref,
+      dq_ref,
+      smem_buffers,
+      buffer_barriers,
+      block_q: int,
+      block_kv: int,
+  ):
     b_idx = lax.axis_index("batch")
     q_idx = lax.axis_index("q_tiles")
     q_head = lax.axis_index("heads")
@@ -154,6 +193,18 @@ def _bwd(
     q_barriers, dout_barriers, m_barriers, l_barriers, delta_barriers = (
         buffer_barriers
     )
+    if mask_ref is None:
+      mask_b_idx = mask_h_idx = bcast_mask_q = bcast_mask_k = None
+    else:
+      bcast_dims = [d == 1 for d in mask_ref.shape]
+      bcast_mask_b, bcast_mask_h, bcast_mask_q, bcast_mask_k = bcast_dims
+      if bcast_mask_q and bcast_mask_k:
+        raise NotImplementedError("Mask broadcast on both sequences.")
+
+      mask_b_idx = 0 if bcast_mask_b else b_idx
+      mask_h_idx = 0 if bcast_mask_h else q_head
+
+    async_mask = mask_ref is not None and not (bcast_mask_q or bcast_mask_k)
 
     def compute_thread(pipeline_callback):
       q_smem = q_smems.at[wg_idx]
@@ -189,17 +240,38 @@ def _bwd(
       dq_acc = plgpu.layout_cast(
           jnp.full((block_q, head_dim), 0, dtype=jnp.float32), L.WGMMA,
       )
-      dq, _, _, _ = pipeline_callback((dq_acc, m, l, delta))
+      def load_k_range(ref):
+        if ref is None:
+          return None
+        qs = pl.ds(q_seq_base, block_q)
+        idx = (b_idx, 0 if (ref.shape[1] == 1) else q_head, qs)
+        return plgpu.load(ref, idx, layout=_WGMMA_ROW, optimized=False)
+
+      k_start = load_k_range(k_start_ref)
+      k_end = load_k_range(k_end_ref)
+      dq, _, _, _, _, _ = pipeline_callback(
+          (dq_acc, m, l, delta, k_start, k_end)
+      )
       q_smem[...] = dq.astype(dtype)
       plgpu.commit_smem()
       plgpu.copy_smem_to_gmem(q_smem, dq_ref.at[q_slice])
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     def kv_pipeline(
-        _, k_smem, v_smem, k_consumed_barrier, v_consumed_barrier, carry
+        index,
+        k_smem,
+        v_smem,
+        mask_smems,
+        k_consumed_barrier,
+        v_consumed_barrier,
+        mask_consumed_barrier,
+        carry,
     ):
+      kv_step = index[0]
+      kv_base = kv_step * block_kv
+      q_seq_base = q_idx * (compute_wgs * block_q) + wg_idx * block_q
       q_smem, dout_smem = q_smems.at[wg_idx], dout_smems.at[wg_idx]
-      (dq_acc, m, l, delta) = carry
+      (dq_acc, m, l, delta, k_start, k_end) = carry
 
       def compute_s(acc_ref):
         plgpu.wgmma(acc_ref, q_smem, plgpu.transpose_ref(k_smem, (1, 0)))
@@ -212,6 +284,34 @@ def _bwd(
         s_scale *= math.log2(math.e)
 
       s *= s_scale
+
+      mask_value = float(jnp.finfo(jnp.float32).min)
+
+      def iota(d):
+        return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=_WGMMA)
+
+      if k_start is not None:
+        _start = lax.broadcast_in_dim(k_start, s.shape, [0])
+        s = jnp.where(kv_base + iota(1) >= _start, s, mask_value)
+
+      if k_end is not None:
+        _end = lax.broadcast_in_dim(k_end, s.shape, [0])
+        s = jnp.where(kv_base + iota(1) < _end, s, mask_value)
+
+      if mask_ref is not None:
+        if bcast_mask_q:
+          idx = (0, pl.ds(kv_step * block_kv, block_kv))
+          mask = plgpu.load(mask_ref, idx, layout=_WGMMA_COL, optimized=False)
+        elif bcast_mask_k:
+          idx = (pl.ds(q_seq_base, block_q), 0)
+          mask = plgpu.load(mask_ref, idx, layout=_WGMMA_ROW, optimized=False)
+          mask = lax.broadcast_in_dim(mask, s.shape, [0])
+        else:
+          mask = mask_smems[pl.ds(wg_idx * block_q, block_q)]
+          if mask_consumed_barrier is not None:
+            plgpu.barrier_arrive(mask_consumed_barrier)
+
+        s = jnp.where(mask, s, mask_value)
 
       broadcast = lambda x: lax.broadcast_in_dim(x, (block_q, block_kv), [0])
       p = exp(s - broadcast(m)) / broadcast(l)
@@ -234,7 +334,22 @@ def _bwd(
       dq_acc = pl.run_state(compute_dq)(plgpu.ACC.init(dq_acc))
       plgpu.barrier_arrive(k_consumed_barrier)
 
-      return (dq_acc, m, l, delta)
+      return (dq_acc, m, l, delta, k_start, k_end)
+
+    if async_mask:
+      mask_swizzle = find_swizzle(8 * block_kv, "mask")
+      mask_transforms = (
+          plgpu.TilingTransform((8, mask_swizzle)),
+          plgpu.SwizzleTransform(mask_swizzle),
+      )
+
+      mask_in_spec = plgpu.BlockSpec(
+          block_shape=(compute_wgs * block_q, block_kv),
+          index_map=lambda i: (q_idx, i),
+          transforms=mask_transforms,
+      )
+    else:
+      mask_in_spec = None
 
     pipeline = plgpu.emit_pipeline_warp_specialized(
         kv_pipeline,
@@ -249,25 +364,60 @@ def _bwd(
             plgpu.BlockSpec(  # k
                 block_shape=(block_kv, head_dim),
                 index_map=lambda i: (i, 0),
-                transforms=transforms),
+                transforms=transforms,
+            ),
             plgpu.BlockSpec(  # v
                 block_shape=(block_kv, head_dim),
                 index_map=lambda i: (i, 0),
-                transforms=transforms),
-        ])
+                transforms=transforms,
+            ),
+            mask_in_spec,
+        ],
+    )
     k_ref = k_ref.at[b_idx, :, kv_head, :]
     v_ref = v_ref.at[b_idx, :, kv_head, :]
-    pipeline(k_ref, v_ref)
+    if mask_ref is not None:
+      mask_ref = mask_ref.at[mask_b_idx, mask_h_idx, :, :]
 
-  def kernel_dkv(q_ref, k_ref, v_ref, dout_ref, m_ref, l_ref, delta_ref,
-                 dk_ref, dv_ref, smem_buffers, buffer_barriers, block_q: int,
-                 block_kv: int):
+    pipeline(k_ref, v_ref, mask_ref if async_mask else None)
+
+  def kernel_dkv(
+      q_ref,
+      k_ref,
+      v_ref,
+      dout_ref,
+      m_ref,
+      l_ref,
+      delta_ref,
+      mask_ref,
+      k_start_ref,
+      k_end_ref,
+      dk_ref,
+      dv_ref,
+      smem_buffers,
+      buffer_barriers,
+      block_q: int,
+      block_kv: int,
+  ):
     b_idx = lax.axis_index("batch")
     kv_idx = lax.axis_index("num_kv_tiles")
     q_head = lax.axis_index("heads")
     wg_idx = lax.axis_index("wg")
     (k_smems, v_smems) = smem_buffers
     (k_barriers, v_barriers) = buffer_barriers
+
+    if mask_ref is None:
+      mask_b_idx = mask_h_idx = bcast_mask_q = bcast_mask_k = None
+    else:
+      bcast_dims = [d == 1 for d in mask_ref.shape]
+      bcast_mask_b, bcast_mask_h, bcast_mask_k, bcast_mask_q = bcast_dims
+      if bcast_mask_q and bcast_mask_k:
+        raise NotImplementedError("Mask broadcast on both sequences.")
+
+      mask_b_idx = 0 if bcast_mask_b else b_idx
+      mask_h_idx = 0 if bcast_mask_h else q_head
+
+    async_mask = mask_ref is not None and not (bcast_mask_q or bcast_mask_k)
 
     def compute_thread(pipeline_callback):
       k_smem, v_smem = k_smems.at[wg_idx], v_smems.at[wg_idx]
@@ -298,19 +448,24 @@ def _bwd(
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     def q_pipeline(
-        _,
+        index,
         q_smem,
         dout_smem,
         m_smem,
         l_smem,
         delta_smem,
+        mask_smems,
         q_consumed_barrier,
         dout_consumed_barrier,
         m_consumed_barrier,
         l_consumed_barrier,
         delta_consumed_barrier,
+        mask_consumed_barrier,
         carry,
     ):
+      q_step = index[0]
+      q_seq_base = q_step * block_q
+      kv_seq_base = kv_idx * (compute_wgs * block_kv) + wg_idx * block_kv
       k_smem, v_smem = k_smems.at[wg_idx], v_smems.at[wg_idx]
       dk_acc, dv_acc = carry
 
@@ -334,6 +489,41 @@ def _bwd(
         m *= math.log2(math.e)
 
       sT *= s_scale
+
+      mask_value = float(jnp.finfo(jnp.float32).min)
+
+      def load_k_range(ref):
+        qs = pl.ds(q_seq_base, block_q)
+        idx = (b_idx, 0 if (ref.shape[1] == 1) else q_head, qs)
+        return plgpu.load(ref, idx, layout=_WGMMA_COL, optimized=False)
+
+      def iota(d):
+        return plgpu.broadcasted_iota(jnp.int32, sT.shape, d, layout=_WGMMA)
+
+      if k_start_ref is not None:
+        k_start = load_k_range(k_start_ref)
+        _start = lax.broadcast_in_dim(k_start, sT.shape, [1])
+        sT = jnp.where(kv_seq_base + iota(0) >= _start, sT, mask_value)
+
+      if k_end_ref is not None:
+        k_end = load_k_range(k_end_ref)
+        _end = lax.broadcast_in_dim(k_end, sT.shape, [1])
+        sT = jnp.where(kv_seq_base + iota(0) < _end, sT, mask_value)
+
+      if mask_ref is not None:
+        if bcast_mask_q:
+          idx = (pl.ds(kv_seq_base, block_kv), 0)
+          mask = plgpu.load(mask_ref, idx, layout=_WGMMA_ROW, optimized=False)
+          mask = lax.broadcast_in_dim(mask, sT.shape, [0])
+        elif bcast_mask_k:
+          idx = (0, pl.ds(q_step * block_q, block_q))
+          mask = plgpu.load(mask_ref, idx, layout=_WGMMA_COL, optimized=False)
+        else:
+          mask = mask_smems[pl.ds(wg_idx * block_kv, block_kv)]
+          if mask_consumed_barrier is not None:
+            plgpu.barrier_arrive(mask_consumed_barrier)
+
+        sT = jnp.where(mask, sT, mask_value)
 
       pT = exp(sT - broadcast(m)) / broadcast(l)
 
@@ -366,6 +556,20 @@ def _bwd(
 
       return (dk_acc, dv_acc)
 
+    if async_mask:
+      mask_swizzle = find_swizzle(8 * block_q, "mask")
+      mask_transforms = (
+          plgpu.TilingTransform((8, mask_swizzle)),
+          plgpu.SwizzleTransform(mask_swizzle),
+      )
+      mask_in_spec = plgpu.BlockSpec(
+          block_shape=(compute_wgs * block_kv, block_q),
+          index_map=lambda i: (kv_idx, i),
+          transforms=mask_transforms,
+      )
+    else:
+      mask_in_spec = None
+
     pipeline = plgpu.emit_pipeline_warp_specialized(
         q_pipeline,
         grid=(num_q_tiles_in_dkv,),
@@ -389,6 +593,7 @@ def _bwd(
             plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
             plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
             plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
+            mask_in_spec,
         ],
     )
     q_ref = q_ref.at[b_idx, :, q_head, :]
@@ -396,7 +601,17 @@ def _bwd(
     m_ref = m_ref.at[b_idx, q_head, :]
     l_ref = l_ref.at[b_idx, q_head, :]
     delta_ref = delta_ref.at[b_idx, q_head, :]
-    pipeline(q_ref, dout_ref, m_ref, l_ref, delta_ref)
+    if mask_ref is not None:
+      mask_ref = mask_ref.at[mask_b_idx, mask_h_idx, :, :]
+
+    pipeline(
+        q_ref,
+        dout_ref,
+        m_ref,
+        l_ref,
+        delta_ref,
+        mask_ref if async_mask else None,
+    )
 
   q_scratch = dout_scratch = plgpu.SMEM(
       (compute_wgs, config.block_q_dq, head_dim),
@@ -421,7 +636,7 @@ def _bwd(
       grid_names=("heads", "q_tiles", "batch"),
       num_threads=compute_wgs + 1,
       thread_name="wg",
-  )(q, k, v, dout, m, l, delta)
+  )(q, k, v, dout, m, l, delta, mask, k_start, k_end)
 
   k_scratch = v_scratch = plgpu.SMEM(
       (compute_wgs, config.block_kv_dkv, head_dim),
@@ -431,6 +646,10 @@ def _bwd(
   out_shape_kv = jax.ShapeDtypeStruct(
       (batch_size, kv_seq_len, num_q_heads, head_dim), dtype=k.dtype
   )
+  # TODO: Fuse transpose in the kernel.
+  if mask is not None:
+    mask = mask.swapaxes(-1, -2)
+
   dk, dv = plgpu.kernel(
       functools.partial(
           kernel_dkv, block_q=config.block_q_dkv, block_kv=config.block_kv_dkv
@@ -445,7 +664,7 @@ def _bwd(
       grid_names=("heads", "num_kv_tiles", "batch"),
       num_threads=compute_wgs + 1,
       thread_name="wg",
-  )(q, k, v, dout, m, l, delta)
+  )(q, k, v, dout, m, l, delta, mask, k_start, k_end)
 
   if q_heads_per_kv_head > 1:
     sum_shape = (*k.shape[:-1], q_heads_per_kv_head, head_dim)
@@ -457,6 +676,25 @@ def _bwd(
   dv = dv.reshape(*orig_kv_shape)
 
   return dq, dk, dv
+
+
+def _decompose_mask(mask, q, k):
+  """Decomposes `mask` into a mask array, `is_causal`, `k_start` and `k_end`."""
+  if mask is None:
+    return None, False, None, None
+
+  mask, k_start, k_end = mask.take("k_start", "k_end")
+
+  if k_start is not None:
+    k_start = jax.lax.broadcast_to_rank(k_start, 2)
+
+  if k_end is not None:
+    k_end = jax.lax.broadcast_to_rank(k_end, 2)
+
+  # TODO: Extract k_start, k_end, is_causal from the mask.
+
+  mask = mask.as_array(q.shape[-3], k.shape[-3])
+  return mask, None, k_start, k_end
 
 
 _SUPPORTED_PRECISIONS = (
@@ -518,10 +756,6 @@ class PallasMosaicGpuFlashAttentionVjp(
     if logits_soft_cap is not None:
       raise ValueError("`logits_soft_cap` not supported.")
 
-    # TODO: Add support for `mask`.
-    if mask != base.Mask(None):
-      raise ValueError("`mask` not supported.")
-
     if dropout_mask is not None:
       raise NotImplementedError("dropout is not supported.")
 
@@ -534,6 +768,11 @@ class PallasMosaicGpuFlashAttentionVjp(
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
 
+    mask, is_causal, k_start, k_end = _decompose_mask(mask, q, k)
+
+    # TODO: Add support for `is_causal`
+    del is_causal
+
     q_k_dot_precision, weights_v_dot_precision = precision
     if q_k_dot_precision not in _SUPPORTED_PRECISIONS:
       raise NotImplementedError(f"{q_k_dot_precision=} not supported")
@@ -541,7 +780,13 @@ class PallasMosaicGpuFlashAttentionVjp(
       raise NotImplementedError(f" {weights_v_dot_precision=} not supported")
 
     f = functools.partial(
-        _bwd, logits_scale=logits_scale, use_base2=self.use_base2, config=config
+        _bwd,
+        mask=mask,
+        k_start=k_start,
+        k_end=k_end,
+        logits_scale=logits_scale,
+        use_base2=self.use_base2,
+        config=config,
     )
 
     args = (q, k, v, residuals, out, dout)

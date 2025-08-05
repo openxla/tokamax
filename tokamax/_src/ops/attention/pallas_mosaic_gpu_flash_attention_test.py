@@ -115,6 +115,21 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       if jnp.any(k_start > jnp.arange(1, 1024 + 1)):
         self.skipTest("k_start > causality diagonal currently unsupported.")
 
+    with _atol_ctx(0.02):
+      getattr(super(), test_name)()
+
+  def test_padding_mask(self):
+    with _atol_ctx(0.01):
+      super().test_padding_mask()
+
+  def test_local_attention_mask(self):
+    with _atol_ctx(0.01):
+      super().test_local_attention_mask()
+
+  @parameterized.parameters(
+      *test_base.base_names_and_params("test_vmap")
+  )
+  def test_vmap(self, test_name, kwargs):
     with _atol_ctx(0.01):
       getattr(super(), test_name)()
 
@@ -159,10 +174,12 @@ class PallasMosaicGpuFlashAttentionVjpTest(PallasMosaicGpuFlashAttentionTest):
         *args,
         attention_fn=attention_fn,
         supports_bias=False,
+        supports_indices=False,
         supports_vjp=True,
-        supports_mask=False,
+        supports_mask=True,
         supports_tanh_clipping=False,
         supports_is_causal=False,
+        supports_vmap=False,
     )
 
   def _run_test_with_inputs(self, *args, **kwargs):
@@ -179,12 +196,9 @@ class PallasMosaicGpuFlashAttentionVjpTest(PallasMosaicGpuFlashAttentionTest):
     # TODO: Support different output head dimensions in vjp.
     self.skipTest("Different output head dimension not supported in vjp.")
 
-  def test_causal_mask(self):
-    self.skipTest("Re-enable once masks are supported.")
-
-  @parameterized.parameters(512, 539)
-  def test_causal_mask_cross_attention(self, seq_len_k):
-    self.skipTest("Re-enable once masks are supported.")
+  def test_local_attention_mask(self):
+    with _atol_ctx(0.03):
+      super().test_local_attention_mask()
 
 # TODO: Add manual partitioning test.
 

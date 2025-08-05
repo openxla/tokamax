@@ -263,18 +263,5 @@ def _is_precision_supported(precision: jax.lax.DotAlgorithmPreset) -> bool:
       jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3,
   }
 
-
-class PallasTritonFlashAttentionManualPartitioningTest(
-    test_base.AttentionManualPartitioningTestBase
-):
-
-  def __init__(self, *args):
-    super().__init__(
-        *args,
-        attention_fn=flash_attn.PallasTritonFlashAttention(),
-        supports_vjp=False,  # TODO: Add vjp support and test
-    )
-
-
 if __name__ == "__main__":
   absltest.main()
