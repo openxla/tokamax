@@ -717,6 +717,11 @@ class AttentionTestBase(parameterized.TestCase):
     ))
     is_causal = spec.pop("is_causal", False)
     logits_soft_cap = spec.get("logits_soft_cap")
+    unnormalized = not spec.get("normalize_output", True)
+
+    if unnormalized:
+      # ensure that we return residuals to normalize the output
+      spec["return_residuals"] = True
 
     def impl(*args, **kwargs):
       return_residuals = kwargs.get("return_residuals", False)
@@ -728,7 +733,11 @@ class AttentionTestBase(parameterized.TestCase):
         q = (q / logits_scale) / jnp.sqrt(q.shape[-1])
         q = q.astype(q_dtype)
       out = self._attention_fn(q, *rest, **kwargs)
-      return out[0] if return_residuals else out
+      attn = out[0] if return_residuals else out
+      if unnormalized:
+        _, (_, l) = out
+        attn /= jnp.swapaxes(l, -1, -2)[..., None]
+      return attn
 
     if k.shape[-3] > (32 * 1024):
       ref_impl = xla_chunked.XlaChunkedDotProductAttention()

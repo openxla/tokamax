@@ -215,7 +215,6 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
         test_vjp=False,
     )
 
-
 class PallasTritonFlashAttentionWithPallasTritonVjpTest(
     test_base.AttentionTestBase
 ):
