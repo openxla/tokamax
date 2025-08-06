@@ -391,10 +391,10 @@ def _fwd(
     @pl.when(wg_idx == 2)
     def _memory_wg():
       plgpu.set_max_registers(40, action="decrease")
-      kv_head = lax.div(h_idx, q_heads_per_kv_head)
+      kv_h_idx = lax.div(h_idx, q_heads_per_kv_head)
       qs = block.ds(q_idx, 2 * block_q)
-      k_ref_ = k_ref.at[b_idx, :, kv_head]
-      v_ref_ = v_ref.at[b_idx, :, kv_head]
+      k_ref_ = k_ref.at[b_idx, :, kv_h_idx]
+      v_ref_ = v_ref.at[b_idx, :, kv_h_idx]
       bias_ref_ = None if bias_ref is None else bias_ref.at[b_idx, h_idx, qs]
       if mask_smems is None:
         mask_ref_ = None
