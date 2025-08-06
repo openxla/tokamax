@@ -28,16 +28,6 @@ from jax._src.lib.mlir.dialects import memref
 import pydantic
 
 
-def find_swizzle(dim_size_bits: int, what: str) -> int:
-  for swizzle_bytes in (128, 64, 32, 16):
-    if dim_size_bits % (swizzle_bytes * 8) == 0:
-      return swizzle_bytes
-  raise ValueError(
-      f"No valid out swizzle for {what}: its minor dimension has"
-      f" {dim_size_bits} bits, which is not a multiple of 128"
-  )
-
-
 class Config(pydantic.BaseModel, frozen=True):
   block_m: pydantic.conint(multiple_of=8, gt=0)
   block_n: pydantic.PositiveInt
@@ -160,7 +150,7 @@ def store_acc_transposed(
     o_smem_swizzled: The swizzled shared memory array to use.
   """
   out_elem_bits = jnp.finfo(o_gmem.dtype).bits
-  swizzle_out = find_swizzle(out_elem_bits * config.block_n, "out")
+  swizzle_out = plgpu.find_swizzle(out_elem_bits * config.block_n, "out")
   out_swizzle_elems = (swizzle_out * 8) // out_elem_bits
 
   o_smem_t = o_smem_swizzled.reshape(config.block_m // 8, 1, 8, config.block_n)

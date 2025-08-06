@@ -42,8 +42,8 @@ def ragged_dot_quantized_kernel_body(
   x_elem_bits = jnp.finfo(x_gmem.dtype).bits
   w_elem_bits = jnp.iinfo(weights_gmem.dtype).bits
 
-  swizzle_w = common.find_swizzle(w_elem_bits * config.block_k, "lhs")
-  swizzle_x = common.find_swizzle(x_elem_bits * config.block_k, "rhs")
+  swizzle_w = plgpu.find_swizzle(w_elem_bits * config.block_k, "lhs")
+  swizzle_x = plgpu.find_swizzle(x_elem_bits * config.block_k, "rhs")
 
   x_swizzle_elems = (swizzle_x * 8) // x_elem_bits
   w_swizzle_elems = (swizzle_w * 8) // w_elem_bits
@@ -104,7 +104,7 @@ def ragged_dot_quantized_kernel_body(
 
   acc = pl.run_scoped(acc_scope, plgpu.ACC((config.block_n, config.block_m)))
   out_elem_bits = jnp.finfo(o_gmem.dtype).bits
-  swizzle_out = common.find_swizzle(out_elem_bits * config.block_n, "out")
+  swizzle_out = plgpu.find_swizzle(out_elem_bits * config.block_n, "out")
   smem = plgpu.SMEM(
       (config.block_m, config.block_n),
       dtype=o_gmem.dtype,
