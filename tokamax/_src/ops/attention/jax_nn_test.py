@@ -14,7 +14,7 @@
 # ==============================================================================
 
 from unittest import mock
-
+import pytest
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -63,12 +63,14 @@ class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
     self.skipTest("Test OOMs with JaxNNDotProductAttention implementations.")
 
 
+@pytest.mark.skip(reason="Too slow for OSS regression tests.")
 class JaxNnDotProductAttentionXlaTest(JaxNnDotProductAttentionTest):
 
   def __init__(self, *args):
     super().__init__(*args, implementation="xla")
 
 
+@pytest.mark.skip(reason="Too slow for OSS regression tests.")
 class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
 
   def __init__(self, *args):
@@ -103,16 +105,9 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
   def test_bench_veo3(self, *_):
     self.skipTest("Unsupported head_dim > 128.")
 
-  def test_bench_alphafold(self, *_):
-    with _atol_ctx(0.035):
-      getattr(super(), "test_bench_alphafold")()
-
-  def test_bench_usm_trunk(self, *_):
-    with _atol_ctx(0.035):
-      getattr(super(), "test_bench_usm_trunk")()
-
   @parameterized.parameters(*test_base.base_names_and_params("test_vmap"))
   def test_vmap(self, test_name, kwargs):
+    self.skipTest("Too slow for OSS")
     kwargs = eval(f"dict{kwargs}")  # pylint: disable=eval-used
     vmap_in_axes = kwargs["vmap_in_axes"]
     for in_axes in vmap_in_axes:

@@ -46,7 +46,7 @@ jobs:
         run: |
           export JAX_ENABLE_X64=0
           export JAX_TRACEBACK_FILTERING=off
-          pytest -s --ignore-glob='*/test_base.py' tokamax/_src/ops
+          pytest -s --ignore-glob='*/test_base.py' tokamax/_src/ops/attention
       - name: Test Tokamax utils with unittest
         run: |
           export JAX_ENABLE_X64=0

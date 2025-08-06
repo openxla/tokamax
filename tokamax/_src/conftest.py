@@ -25,5 +25,5 @@ import pytest
 def tokamax_testing_setup():
   """Parse absl flags and disable x64 for JAX."""
   jax.config.update('jax_enable_x64', False)
-  flags.FLAGS(sys.argv[2:])
+  flags.FLAGS(sys.argv[:1])
   yield
