@@ -239,6 +239,10 @@ def _fwd(
       def kv_loop(kv_step, carry, *, do_causal=False):
         acc, m_i, l_i = carry
         slot = lax.rem(kv_step, max_stages)
+        k_base = kv_step * block_kv
+
+        def iota(d):
+          return plgpu.broadcasted_iota(jnp.int32, block_q_kv, d, layout=_WGMMA)
 
         def compute_qk(acc_ref):
           k_smem_T = plgpu.transpose_ref(k_smems.at[slot], (1, 0))  # pylint: disable=invalid-name
@@ -249,9 +253,11 @@ def _fwd(
             plgpu.barrier_wait(bias_barriers.at[slot])
             bias = bias_smems[slot, block.ds(wg_idx, block_q)]
           plgpu.barrier_arrive(schedule_barrier)
-          return acc_ref[...], bias
+          mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
+          return acc_ref[...], bias, mask
 
-        s, bias = pl.run_scoped(compute_qk, plgpu.ACC(block_q_kv, jnp.float32))
+        acc_type = plgpu.ACC(block_q_kv, jnp.float32)
+        s, bias, mask = pl.run_scoped(compute_qk, acc_type)
         plgpu.barrier_arrive(k_consumed_barriers.at[slot])
         plgpu.barrier_wait(schedule_barrier)
 
@@ -270,14 +276,10 @@ def _fwd(
 
         s *= scale
 
-        def iota(d):
-          return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=_WGMMA)
-
-        k_base = kv_step * block_kv
         mask_value = float(jnp.finfo(jnp.float32).min)
 
-        if do_causal:
-          s = jnp.where(q_base + iota(0) >= k_base + iota(1), s, mask_value)
+        if mask is not None:
+          s = jnp.where(mask, s, mask_value)
 
         def apply_k_start():
           k_start_ = lax.broadcast_in_dim(k_start, s.shape, [0])
