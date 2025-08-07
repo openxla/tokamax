@@ -21,8 +21,11 @@ import jax.numpy as jnp
 import pydantic
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import utils
+from tokamax._src.ops import op as op_base
 from tokamax._src.ops.attention import base as attn_base
+from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 from tokamax._src.ops.attention import bench_arg_specs as attn_arg_specs
+from tokamax._src.ops.ragged_dot import bench_arg_specs as ragged_dot_arg_specs
 
 
 def _eval_shape(spec):
@@ -89,16 +92,24 @@ class PydanticTest(parameterized.TestCase):
     adapter = pydantic.TypeAdapter(pydantic_lib.abstractify(_MyDataclass))
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
-  # TODO: Add tests for other ops.
   @parameterized.named_parameters(
       ("attention", attn_base.DotProductAttention, attn_arg_specs),
+      ("ragged_dot", ragged_dot_base.RaggedDot, ragged_dot_arg_specs),
   )
   def test_arg_specs_roundtrip(self, op_cls, arg_specs):
     model = pydantic_lib.get_arg_spec_model("ArgSpec", op_cls().signature)
     for name, spec in arg_specs.ARG_SPECS.items():
       with self.subTest(name):
-        spec = model(**_eval_shape(spec))
+        spec = model(**op_base._abstractify(_eval_shape(spec)))
         spec_roundtrip = model.model_validate_json(spec.model_dump_json())
+        # Convert lists to tuples.
+        spec_roundtrip = spec_roundtrip.model_copy(
+            update={
+                k: tuple(v)
+                for k, v in spec_roundtrip.model_dump().items()
+                if isinstance(v, list)
+            }
+        )
         self.assertEqual(spec, spec_roundtrip)
 
 

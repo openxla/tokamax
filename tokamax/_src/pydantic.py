@@ -90,6 +90,7 @@ _SHORT_DTYPE_NAMES_MAP: Final[
     immutabledict.immutabledict[str, jax.typing.DTypeLike]
 ] = immutabledict.immutabledict(
     bool=bool,
+    i4=jnp.int4,
     i8=np.int8,
     i16=np.int16,
     i32=np.int32,
@@ -133,10 +134,18 @@ def _abstractify_dataclass(cls):
   """Converts `jax.Array` fields to `ShapeDtype`."""
   fields = dataclasses.fields(cls)
   config = pydantic.ConfigDict(arbitrary_types_allowed=True)
-  new_fields = tuple((f.name, abstractify(f.type), f) for f in fields)
+  # `Field.type` may be a string, rather than a resolved type, so we need to
+  # use `typing.get_type_hints` to get the actual type.
+  hints = typing.get_type_hints(cls)
+  new_fields = tuple((f.name, abstractify(hints[f.name]), f) for f in fields)
   new_cls = dataclasses.make_dataclass(cls.__name__, new_fields)
   new_cls.__pydantic_config__ = config
   adapter = pydantic.TypeAdapter(new_cls)
+
+  def serialize(x):
+    if not isinstance(x, cls):
+      raise ValueError(f'Invalid {cls.__name__}: {x}')
+    return adapter.dump_python(x)
 
   def validate(x):
     if isinstance(x, cls):
@@ -145,7 +154,7 @@ def _abstractify_dataclass(cls):
 
   return Annotated[
       cls,
-      pydantic.PlainSerializer(adapter.dump_python),
+      pydantic.PlainSerializer(serialize),
       pydantic.PlainValidator(validate),
   ]
 
