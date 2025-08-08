@@ -350,11 +350,8 @@ def _fwd(
         raise ValueError(f"{kv_seq_len=} must be a multiple of {block_kv=}")
 
       hi = max_kv_step
-
       if is_causal:
         hi = lax.min(hi, lax.div(q_base, block_kv))
-        if bias_ref is not None:
-          hi = 0  # TODO: Fix this workaround for compiler bug.
 
       carry = lax.fori_loop(min_kv_step, hi, kv_loop, (acc, m_i, l_i))
 
