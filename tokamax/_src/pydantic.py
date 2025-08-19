@@ -14,6 +14,7 @@
 # ==============================================================================
 """Pydantic types and utilities."""
 
+from collections.abc import Callable
 import dataclasses
 import enum
 import importlib
@@ -42,7 +43,9 @@ PowerOfTwo: TypeAlias = Annotated[
 
 
 def _serialize_module_member(x) -> str:
-  return f'{x.__module__}.{x.__name__}'
+  module_name = inspect.getmodule(x).__name__
+  name = getattr(x, '__name__', str(x))
+  return name if module_name == 'builtins' else f'{module_name}.{name}'
 
 
 def _validate_module_member(x) -> Any:
@@ -59,6 +62,12 @@ def annotate(typ) -> Any:
   if typing.get_origin(typ) is Union or isinstance(typ, types.UnionType):
     return Union[tuple(map(annotate, typing.get_args(typ)))]
   if typing.get_origin(typ) is type:
+    return Annotated[
+        typ,
+        pydantic.PlainSerializer(_serialize_module_member),
+        pydantic.PlainValidator(_validate_module_member),
+    ]
+  if typing.get_origin(typ) is Callable:
     return Annotated[
         typ,
         pydantic.PlainSerializer(_serialize_module_member),

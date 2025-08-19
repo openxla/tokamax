@@ -25,31 +25,27 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 def ragged_dot_quantized_kernel_body(
     group_info,
-    mi,
     ni,
-    weights_gmem,
+    w_gmem,
     x_gmem,
-    scales_gmem,
+    w_scales_gmem,
     o_gmem,
     *,
     config: common.Config,
 ):
   """Pallas kernel for ragged dot with quantized RHS."""
-
-  del mi
+  block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
   m, k = x_gmem.shape
 
   x_elem_bits = jnp.finfo(x_gmem.dtype).bits
-  w_elem_bits = jnp.iinfo(weights_gmem.dtype).bits
-
-  swizzle_w = plgpu.find_swizzle(w_elem_bits * config.block_k, "lhs")
-  swizzle_x = plgpu.find_swizzle(x_elem_bits * config.block_k, "rhs")
-
+  w_elem_bits = jnp.iinfo(w_gmem.dtype).bits
+  swizzle_w = common.find_swizzle(w_elem_bits * block_k, "lhs")
+  swizzle_x = common.find_swizzle(x_elem_bits * block_k, "rhs")
   x_swizzle_elems = (swizzle_x * 8) // x_elem_bits
   w_swizzle_elems = (swizzle_w * 8) // w_elem_bits
 
-  def acc_scope(acc_ref):
-    def compute(_, w_smem, x_smem, s_smem):
+  def compute_acc(acc_ref):
+    def pipeline_body(_, w_smem, x_smem, w_scales_smem):
       w = w_smem[...]
       # Tiling along the reduction dimension. This overlaps to some extent
       # scaling/casting with wgmma.
@@ -61,14 +57,12 @@ def ragged_dot_quantized_kernel_body(
         plgpu.wgmma_wait(0)
 
       for j in range(steps):
-        sl = slice(j * x_swizzle_elems, (j + 1) * x_swizzle_elems)
-        plgpu.wgmma(
-            acc_ref,
-            common.dequant(s_smem.at[0], w[:, sl]),
-            plgpu.transpose_ref(x_smem.at[:, sl], (1, 0)),
-        )
+        ks = slice(j * x_swizzle_elems, (j + 1) * x_swizzle_elems)
+        w_ = common.dequant(w_scales_smem.at[0], w[:, ks])
+        plgpu.wgmma(acc_ref, w_, plgpu.transpose_ref(x_smem.at[:, ks], (1, 0)))
         plgpu.wgmma_wait(1)
 
+    gi = group_info.group_id
     x_transforms = (
         plgpu.TilingTransform((8, x_swizzle_elems)),
         plgpu.SwizzleTransform(swizzle_x),
@@ -77,90 +71,63 @@ def ragged_dot_quantized_kernel_body(
         plgpu.TilingTransform((8, w_swizzle_elems)),
         plgpu.SwizzleTransform(swizzle_w),
     )
+    x_spec = plgpu.BlockSpec(
+        (block_m, block_k), lambda ki: (0, ki), transforms=x_transforms
+    )
+    w_spec = plgpu.BlockSpec(
+        (block_n, block_k), lambda ki: (ni, ki), transforms=w_transforms
+    )
+    w_scales_spec = plgpu.BlockSpec((1, block_n), lambda ki: (ki, ni))
     plgpu.emit_pipeline(
-        compute,
-        grid=(k // config.block_k,),
-        in_specs=(
-            plgpu.BlockSpec(
-                (config.block_n, config.block_k),
-                lambda k_idx: (ni, k_idx),
-                transforms=w_transforms,
-            ),
-            plgpu.BlockSpec(
-                (config.block_m, config.block_k),
-                lambda k_idx: (group_info.block, k_idx),
-                transforms=x_transforms,
-            ),
-            plgpu.BlockSpec((1, config.block_n), lambda k_idx: (k_idx, ni)),
-        ),
+        pipeline_body,
+        grid=(k // block_k,),
+        in_specs=(w_spec, x_spec, w_scales_spec),
         max_concurrent_steps=config.num_stages,
         delay_release=1,
     )(
-        weights_gmem.at[group_info.group_id],
-        x_gmem,
-        scales_gmem.at[group_info.group_id],
+        w_gmem.at[gi],
+        x_gmem.at[pl.ds(group_info.offset, block_m)],
+        w_scales_gmem.at[gi],
     )
     return acc_ref[...]
 
-  acc = pl.run_scoped(acc_scope, plgpu.ACC((config.block_n, config.block_m)))
+  acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
   out_elem_bits = jnp.finfo(o_gmem.dtype).bits
-  swizzle_out = plgpu.find_swizzle(out_elem_bits * config.block_n, "out")
-  smem = plgpu.SMEM(
-      (config.block_m, config.block_n),
-      dtype=o_gmem.dtype,
-      transforms=(plgpu.SwizzleTransform(swizzle_out),),
+  swizzle_out = common.find_swizzle(out_elem_bits * block_n, "out")
+  transforms = (plgpu.SwizzleTransform(swizzle_out),)
+  store = functools.partial(
+      common.store_acc_transposed, acc, o_gmem, ni, m, group_info, config
   )
-  pl.run_scoped(
-      functools.partial(
-          common.store_acc_transposed, acc, o_gmem, ni, m, group_info, config
-      ),
-      smem,
-  )
+  smem = plgpu.SMEM((block_m, block_n), o_gmem.dtype, transforms=transforms)
+  pl.run_scoped(store, smem)
 
 
 def ragged_dot_quantized_kernel(
     lhs: jax.Array,
-    rhs_quantized: quantization.QuantizedArray,
+    rhs: quantization.QuantizedArray,
     group_sizes: jax.Array,
     out_dtype: jnp.dtype,
     config: common.Config,
 ) -> jax.Array:
   """Returns the Pallas kernel for quantized ragged dot."""
 
-  if rhs_quantized.tile_shape != (1, config.block_k, 1):
+  m, k = lhs.shape
+  g, k2, n = rhs.shape
+  assert k == k2
+
+  if rhs.tile_shape != (1, config.block_k, 1):
     raise NotImplementedError(
         "Only scaling tile supported is (1, config.block_k, 1) got:"
-        f" {rhs_quantized.tile_shape}."
+        f" {rhs.tile_shape}."
     )
 
-  weights, scales, x = (
-      rhs_quantized.values.transpose(0, 2, 1),
-      rhs_quantized.scales,
-      lhs,
-  )
-  (num_groups, n, k_weights), (m, k_x) = weights.shape, x.shape
-  if k_weights != k_x:
+  if group_sizes.shape[0] != g:
     raise ValueError(
-        f"Contraction dim mismatch: weights.shape[-1]={k_weights},"
-        f" x.shape[-1]={k_x}"
-    )
-  if group_sizes.shape[0] != num_groups:
-    raise ValueError(
-        "Expected group_sizes to have shape"
-        f" {(num_groups,)} but got {group_sizes.shape}"
+        f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
     )
 
-  body = functools.partial(
-      ragged_dot_quantized_kernel_body,
-      config=config,
-  )
-
+  body = functools.partial(ragged_dot_quantized_kernel_body, config=config)
   kernel = common.ragged_kernel(
-      body,
-      g=num_groups,
-      m=m,
-      n=n,
-      out_dtype=out_dtype,
-      config=config,
+      body, g=g, m=m, n=n, out_dtype=out_dtype, config=config
   )
-  return kernel(group_sizes, weights, x, scales)
+  return kernel(group_sizes, rhs.values.transpose(0, 2, 1), lhs, rhs.scales)

@@ -94,7 +94,6 @@ class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
       scale_offset: float,
       subtract_mean: bool,
       return_residuals: bool,
-      pre_scale: jax.Array | None = None,
       config: Config,
   ) -> tuple[tuple[jax.Array, jax.Array | None, jax.Array | None], None]:
     """Computes normalization VJP `(dx, dscale, doffset)`."""
@@ -102,9 +101,6 @@ class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
 
     if return_residuals:
       raise NotImplementedError('`return_residuals` not supported.')
-
-    if pre_scale is not None:
-      raise NotImplementedError('`pre_scale` not supported.')
 
     mean, rstddev = residuals
     if (mean is not None) != subtract_mean:

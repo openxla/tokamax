@@ -22,7 +22,6 @@ import importlib
 import inspect
 import json
 from typing import Any
-
 import jax
 import jax.numpy as jnp
 import pydantic
@@ -47,6 +46,16 @@ class JsonEncoder(json.JSONEncoder):
       return dict(__cls=_cls_key(type(o)), **fields)
 
     if dataclasses.is_dataclass(o):
+      if o.__class__.__name__ == "BoundArguments":
+        class_full_path = (
+            o.op.__class__.__module__ + "." + o.op.__class__.__name__
+        )
+        vjp_full_path = o.op.vjp.__module__ + "." + o.op.vjp.__class__.__name__
+        fields = dataclasses.asdict(o)
+        fields["tokamax_op"] = class_full_path
+        fields["tokamax_op_vjp"] = vjp_full_path
+        return dict(__cls=_cls_key(type(o)), **fields)
+
       fields = dataclasses.asdict(o)
       return dict(__cls=_cls_key(type(o)), **fields)
 
@@ -107,9 +116,22 @@ def _cls_key(cls) -> str:
   return ".".join((cls.__module__, cls.__name__))
 
 
+def _bound_arguments_handler(o, cls_key):
+  cls = get_module_member(cls_key)
+  class_full_path = o.pop("tokamax_op")
+  vjp_full_path = o.pop("tokamax_op_vjp")
+  op_config = o.pop("op")
+  vjp = get_module_member(vjp_full_path)(**op_config.pop("vjp"))
+  op = get_module_member(class_full_path)(**{"vjp": vjp, **op_config})
+  final_cls = cls(**{"op": op, "arguments": o["arguments"]})
+  return final_cls
+
+
 def _get_handler(cls_key):
   """Returns a handler for a class."""
   cls = get_module_member(cls_key)
+  if "BoundArguments" in cls.__name__:
+    return _bound_arguments_handler
   if dataclasses.is_dataclass(cls) or (cls in _CLASS_FIELD_NAMES):
     return lambda o: cls(**o)
   if issubclass(cls, pydantic.BaseModel):
@@ -141,6 +163,8 @@ def _object_hook(o: dict[str, Any]) -> Any:
 
   if (handler := _HANDLERS.get(cls_key)) is None:
     _HANDLERS[cls_key] = handler = _get_handler(cls_key)
+  if "BoundArguments" in cls_key:
+    return handler(o, cls_key)
   return handler(o)
 
 

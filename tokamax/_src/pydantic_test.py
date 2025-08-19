@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from collections.abc import Callable
 import dataclasses
 
 from absl.testing import absltest
@@ -80,6 +81,9 @@ class PydanticTest(parameterized.TestCase):
       (jax.lax.PrecisionLike, jax.lax.Precision.DEFAULT),
       (jax.lax.PrecisionLike, jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
       (jax.lax.PrecisionLike, "highest"),
+      (Callable[[jax.Array], jax.Array], jax.nn.swish),
+      (Callable[[jax.Array], jax.Array], jax.nn.sigmoid),
+      (Callable[[jax.Array], jax.Array], jnp.tanh),
   )
   def test_annotated_roundtrip(self, typ, data):
     config = pydantic.ConfigDict(arbitrary_types_allowed=True)

@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-
+from typing import ClassVar
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
@@ -120,6 +120,7 @@ def _fwd_kernel_impl(
     q_k_dot_precision: jax.lax.DotAlgorithmPreset,
     weights_v_dot_precision: jax.lax.DotAlgorithmPreset,
     normalize_output: bool,
+    pack_mask: bool,
 ):
   """Pallas MHA forward kernel implementation."""
 
@@ -212,11 +213,14 @@ def _fwd_kernel_impl(
 
     # TODO: Use `s += tl.where(mask, 0, -inf)` instead (exploiting FMA)?
     if mask_ref is not None:
-      # TODO: Could we pack 8 mask elements into one int8 mask element
-      # and then unpack inside the kernel? This would decrease host->device
-      # memory transfers, but increase per-thread compute.
-      mask_slice_k = slice_k if (mask_ref.shape[-1] > 1) else slice(None)
-      mask = pl.load(mask_ref, (slice(None), mask_slice_k))
+      if pack_mask:
+        mask_slice_k = pl.ds(start_k // 8, block_k // 8)
+        mask = plgpu.load(mask_ref.at[:, mask_slice_k])
+        mask = jnp.repeat(mask, 8, axis=-1)
+        mask = mask & (1 << (jnp.arange(block_k) % 8))
+      else:
+        mask_slice_k = slice_k if (mask_ref.shape[-1] > 1) else slice(None)
+        mask = pl.load(mask_ref, (slice(None), mask_slice_k))
       s = jnp.where(mask, s, mask_value)
 
     if q_start is not None:
@@ -326,6 +330,10 @@ def _fwd(
   seq_len_q, num_heads_q, head_dim = q.shape
   seq_len_k, num_heads_k, head_dim_out = v.shape
 
+  pack_mask = config.pack_mask and mask is not None and mask.shape[-1] != 1
+  if pack_mask:
+    mask = jnp.packbits(mask, axis=-1, bitorder="little")
+
   kernel = functools.partial(
       _fwd_kernel,
       block_k=config.block_k,
@@ -344,6 +352,7 @@ def _fwd(
       q_k_dot_precision=q_k_dot_precision,
       weights_v_dot_precision=weights_v_dot_precision,
       normalize_output=normalize_output,
+      pack_mask=pack_mask,
   )
 
   block_q = config.block_q
@@ -383,7 +392,8 @@ def _fwd(
     return pl.BlockSpec(block_shape, index_map)
 
   def bias_mask_spec(x):
-    return spec(x, lambda i, j: (i, j, 0), (None, block_q, seq_len_k))
+    seq_k = x.shape[-1] if x is not None else None
+    return spec(x, lambda i, j: (i, j, 0), (None, block_q, seq_k))
 
   def range_k_spec(x):
     return spec(x, lambda i, j: (i, j), (None, block_q))
@@ -511,12 +521,14 @@ class Config:
   block_d: int | None = None
   block_d_out: int | None = None
   split_k: int = 1
+  pack_mask: bool = False
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
   """Pallas-Triton FlashAttention implementation."""
 
+  supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = False
   use_stable_softmax: bool | type[base.AUTO] = base.AUTO
 

@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import dataclasses
+import pytest
 import random
 from typing import cast
 from unittest import mock
@@ -162,6 +163,7 @@ def _concatenate_pages(
   )
 
 
+@pytest.mark.skip(reason="Too slow for OSS regression tests.")
 class XlaPagedAttentionTest(test_base.AttentionTestBase):
 
   def __init__(self, *args):

@@ -60,7 +60,6 @@ def get_key(
     *,
     axis: int,
     return_residuals: bool = False,
-    pre_scale: jax.Array | None = None,
     **kwargs,
 ) -> Key:
   """Returns the lookup key for the given args."""
@@ -73,7 +72,6 @@ def get_key(
       has_scale_offset=kwargs.pop('scale_offset') != 0.0,
       subtract_mean=kwargs.pop('subtract_mean'),
       return_residuals=return_residuals,
-      pre_scale=_maybe_shape(pre_scale),
   )
   assert not kwargs, f'Unhandled kwargs: {kwargs}'
   return key
@@ -89,7 +87,6 @@ def get_heuristics_config(
     offset: jax.Array | None,
     *,
     axis: int,
-    pre_scale: jax.Array | None = None,
     block_size_per_warp: int = 1024,
     vmap_axis_sizes: tuple[int, ...],
     **_,
@@ -99,7 +96,7 @@ def get_heuristics_config(
   # We get diminishing returns, and worse load-balancing, with `block_m > 32`.
   # `block_m == 1` appears best whenever not reducing in trailing axis.
   block_m = 32 if x.ndim == 2 else 1
-  if scale is None and offset is None and pre_scale is None:
+  if scale is None and offset is None:
     block_m = 1  # There is no oportunity to re-use data.
 
   block_size = block_m * pl.next_power_of_2(x.shape[1])

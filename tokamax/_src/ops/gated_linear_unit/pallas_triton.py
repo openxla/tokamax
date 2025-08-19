@@ -18,7 +18,7 @@ from collections.abc import Callable
 import dataclasses
 import functools
 import math
-
+from typing import ClassVar
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
@@ -101,6 +101,8 @@ def _get_best_block_size(m: int, n: int) -> tuple[int, int, int]:
 @dataclasses.dataclass(frozen=True)
 class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
   """Pallas-Triton gated linear unit."""
+
+  supports_symbolic_shapes: ClassVar[bool] = False
 
   def _fwd(
       self,

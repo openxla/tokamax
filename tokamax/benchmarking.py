@@ -14,6 +14,7 @@
 # ==============================================================================
 """Utilities for benchmarking."""
 
+# pylint: disable=g-multiple-import,useless-import-alias, g-importing-member, unused-import
 from tokamax._src.benchmarking import (
     BenchmarkData as BenchmarkData,
     compile_benchmark as compile_benchmark,

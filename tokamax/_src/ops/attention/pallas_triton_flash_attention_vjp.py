@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-
+from typing import ClassVar
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
@@ -478,6 +478,8 @@ def _bwd(
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   """Pallas-Triton FlashAttention VJP implementation."""
+
+  supports_symbolic_shapes: ClassVar[bool] = False
 
   def _fwd(
       self,

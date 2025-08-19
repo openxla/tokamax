@@ -14,11 +14,12 @@
 # ==============================================================================
 
 from absl.testing import absltest
-import immutabledict
 import jax
+from jax.experimental import pallas as pl
 import jax.numpy as jnp
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
+from tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common import GroupInfo
 from tokamax._src.ops.ragged_dot import test_base
 
 
@@ -62,16 +63,63 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
       if lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize):
         self.skipTest("TODO: Support tile aligned K dimension.")
 
-      if isinstance(rhs, QuantizedArray) and rhs.tile_shape != (1, 256, 1):
+      device_kind = jax.devices()[0].device_kind.lower()
+      if "b200" in device_kind:
+        config = pallas_mosaic_gpu.Config(
+            block_m=128,
+            block_n=128,
+            block_k=256,
+            num_stages=2,
+            split_k=1,
+            collective=True,
+            persistent=True,
+        )
+        if not isinstance(rhs, QuantizedArray):
+          self.skipTest("TODO: Only QuantizedArray supported.")
+        if (lhs.dtype, rhs.values.dtype) != (jnp.bfloat16, jnp.int4):
+          self.skipTest(
+              "TODO: Only mixed precision bfloat16 x int4"
+              f" supported, got: {lhs.dtype=} {rhs.dtype=}."
+          )
+        if (
+            rhs.tile_shape[0] != 1
+            or rhs.tile_shape[1] < _CONFIG.block_k
+            or rhs.tile_shape[2] != 1
+        ):
+          self.skipTest(
+              "TODO: Only k tile quantization is supported, got:"
+              f" {rhs.tile_shape}."
+          )
+      elif isinstance(rhs, QuantizedArray) and rhs.tile_shape != (
+          1,
+          _CONFIG.block_k,
+          1,
+      ):
         self.skipTest(
-            "TODO: Only scaling tile supported is (1, 256, 1) got:"
-            f" {rhs.tile_shape}."
+            "TODO:(cperivol): Only scaling tile supported is (1, block_k, 1)"
+            f" got: {rhs.tile_shape} (block_k={_CONFIG.block_k})."
         )
 
       return op.with_config(config or _CONFIG)(lhs, rhs, **kwargs)
 
     super().__init__(*args, dot_fn=fn)
 
+class GroupInfoTest(absltest.TestCase):
+  def test_number_of_steps(self):
+    grp_sizes = jnp.array((1,0,1) + (0,) * (128 - 3),)
+    grpi = GroupInfo.create(
+        group_sizes = grp_sizes,
+        tile_size = 64
+    )
+    self.assertEqual(grpi.total_steps, 2)
+    self.assertEqual(grpi.bsize, 1)
+    self.assertEqual(grpi.group_id, 0)
+    g1 = grpi.to_step(grp_sizes, jnp.int32(1))
+    self.assertEqual(g1.group_id, 2)
+    self.assertEqual(g1.bsize, 1)
+    for i in range(2, 128):
+      gi = grpi.to_step(grp_sizes, jnp.int32(i))
+      self.assertEqual(gi.bsize, 0, i)
 
 if __name__ == "__main__":
   absltest.main()

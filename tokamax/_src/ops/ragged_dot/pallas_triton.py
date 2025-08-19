@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import math
-
+from typing import ClassVar
 import jax
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
@@ -332,6 +332,7 @@ _DLHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
 class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
   """Pallas-Triton ragged dot implementation."""
 
+  supports_symbolic_shapes: ClassVar[bool] = False
   split_k_intermediate_dtype: jax.typing.DTypeLike | None = None
 
   def __post_init__(self):

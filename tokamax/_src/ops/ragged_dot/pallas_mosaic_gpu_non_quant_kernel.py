@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 """Ragged dot Pallas-Mosaic-GPU Non-Quantized Kernel."""
-from collections.abc import Sequence
 import functools
 import math
 
@@ -30,7 +29,6 @@ QuantizedArray = quantization.QuantizedArray
 
 def ragged_dot_non_quantized_kernel_body(
     group_info,
-    mi,
     ni,
     lhs_gmem,
     rhs_gmem,
@@ -42,80 +40,71 @@ def ragged_dot_non_quantized_kernel_body(
 ):
   """Pallas kernel body for non-quantized ragged dot."""
 
-  del mi
   m, k = lhs_gmem.shape
   out_elem_bits = jnp.finfo(out_dtype).bits
   elem_bits = jnp.finfo(lhs_gmem.dtype).bits
   swizzle_elems = swizzle * 8 // elem_bits
   out_swizzle_elems = swizzle * 8 // out_elem_bits
+
+  block_m, block_n = config.block_m, config.block_n
   block_k = min(k, config.block_k)
   if block_k % swizzle_elems:
     raise ValueError(
         f"block_k {block_k} must be a multiple of swizzle_elems {swizzle_elems}"
     )
 
-  def acc_scope(acc_ref):
+  def compute_acc(acc_ref):
     transforms = (
         plgpu.TilingTransform((8, swizzle_elems)),
         plgpu.SwizzleTransform(swizzle),
     )
+    lhs_spec = plgpu.BlockSpec(
+        (block_m, block_k), lambda ki: (0, ki), transforms=transforms
+    )
+    rhs_spec = plgpu.BlockSpec(
+        (block_k, block_n), lambda ki: (ki, ni), transforms=transforms
+    )
     plgpu.emit_pipeline(
-        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(
-            acc_ref, lhs_smem, rhs_smem
-        ),
+        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc_ref, lhs_smem, rhs_smem),
         grid=(k // block_k,),
-        in_specs=[
-            plgpu.BlockSpec(
-                (config.block_m, block_k),
-                lambda k_idx: (group_info.block, k_idx),
-                transforms=transforms,
-            ),
-            plgpu.BlockSpec(
-                (block_k, config.block_n),
-                lambda k_idx: (k_idx, ni),
-                transforms=transforms,
-            ),
-        ],
+        in_specs=(lhs_spec, rhs_spec),
         max_concurrent_steps=config.num_stages,
         delay_release=1,
-    )(lhs_gmem, rhs_gmem.at[group_info.group_id])
+    )(
+        lhs_gmem.at[pl.ds(group_info.offset, block_m)],
+        rhs_gmem.at[group_info.group_id],
+    )
     return acc_ref[...]
 
-  acc = pl.run_scoped(acc_scope, plgpu.ACC((config.block_m, config.block_n)))
+  acc = pl.run_scoped(compute_acc, plgpu.ACC((block_m, block_n)))
 
-  store_transforms = (
+  transforms = (
       plgpu.TilingTransform((1, out_swizzle_elems)),
       plgpu.SwizzleTransform(swizzle),
   )
+  o_smem_type = plgpu.SMEM((block_m, block_n), out_dtype, transforms=transforms)
 
-  @functools.partial(
-      pl.run_scoped,
-      o_smem=plgpu.SMEM(
-          (config.block_m, config.block_n),
-          dtype=out_dtype,
-          transforms=store_transforms,
-      ),
-  )
+  @functools.partial(pl.run_scoped, o_smem=o_smem_type)
   def _store_scope(o_smem):
     o_smem[...] = acc.astype(out_dtype)
     plgpu.commit_smem()
 
-    smem_start = group_info.start_within_block
-    remaining_rows = min(config.block_m, m)
+    smem_start = group_info.in_block_offset
+    remaining_rows = min(block_m, m)
     while remaining_rows > 0:
       const_rows_len = 1 << int(math.log2(remaining_rows))
       remaining_rows //= 2
 
-      @pl.when(group_info.actual_size & const_rows_len != 0)
+      @pl.when(group_info.bsize & const_rows_len != 0)
       def _():
         o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
-        o_gref_slice = o_gmem.at[
-            pl.ds(group_info.block_start + smem_start, const_rows_len),
-            pl.ds(ni * config.block_n, config.block_n),
+        o_gmem_slice = o_gmem.at[
+            pl.ds(group_info.offset + smem_start, const_rows_len),
+            pl.ds(ni * block_n, block_n),
         ]
-        plgpu.copy_smem_to_gmem(o_smem_slice, o_gref_slice, commit_group=False)
+        plgpu.copy_smem_to_gmem(o_smem_slice, o_gmem_slice, commit_group=False)
 
-      smem_start += group_info.actual_size & const_rows_len
+      smem_start += group_info.bsize & const_rows_len
     plgpu.commit_smem_to_gmem_group()
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
@@ -129,12 +118,10 @@ def ragged_dot_non_quantized_kernel(
 ) -> jax.Array:
   """Pallas kernel for ragged dot with non-quantized inputs."""
 
-  if not isinstance(lhs, jax.Array):
-    # This case (QuantizedArray, jax.Array) is not handled.
-    # It's unlikely to be useful as typically weights (rhs) are quantized.
-    raise NotImplementedError(
-        "If rhs is jax.Array, lhs must also be jax.Array."
-    )
+  m, k = lhs.shape
+  g, k2, n = rhs.shape
+  assert k == k2
+
   if lhs.dtype != rhs.dtype:
     raise ValueError(
         f"lhs and rhs must have the same dtype. Got {lhs.dtype=} and"
@@ -147,19 +134,11 @@ def ragged_dot_non_quantized_kernel(
     )
 
   elem_bits = jnp.finfo(lhs.dtype).bits
-  swizzle = plgpu.find_swizzle(elem_bits * config.block_k, "lhs")
-  m, k_lhs = lhs.shape
-  g, k_rhs, n = rhs.shape
+  swizzle = common.find_swizzle(elem_bits * config.block_k, "lhs")
 
   if group_sizes.shape[0] != g:
     raise ValueError(
         f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
-    )
-
-  if k_lhs != k_rhs:
-    raise ValueError(
-        f"LHS contraction dim ({k_lhs}) must match RHS contraction dim"
-        f" ({k_rhs})"
     )
 
   body_fn = functools.partial(

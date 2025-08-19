@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import math
-from typing import Any, TypeAlias
+from typing import Any, ClassVar, TypeAlias
 
 import immutabledict
 import jax
@@ -126,23 +126,23 @@ def _fwd(
   k_start, k_end = map(bcast_k_range, (k_start, k_end))
 
   def kernel(
-      q_ref,
-      k_ref,
-      v_ref,
-      bias_ref,
-      mask_ref,
-      k_start_ref,
-      k_end_ref,
-      k_start_minmax_refs,
-      k_end_minmax_refs,
-      out_ref,
-      *residual_refs,
+      q_gmem,
+      k_gmem,
+      v_gmem,
+      bias_gmem,
+      mask_gmem,
+      k_start_gmem,
+      k_end_gmem,
+      k_start_minmax_gmems,
+      k_end_minmax_gmems,
+      out_gmem,
+      *residual_gmems,
       scoped,
   ):
-    b_idx = lax.axis_index("batch")
-    q_idx = lax.axis_index("q_tiles")
-    h_idx = lax.axis_index("heads")
-    wg_idx = lax.axis_index("wg")
+    bi = lax.axis_index("batch")
+    qi = lax.axis_index("q_tiles")
+    hi = lax.axis_index("heads")
+    wg = lax.axis_index("wg")
 
     (
         (q_smems, k_smems, o_smems, *residual_smems),
@@ -162,52 +162,50 @@ def _fwd(
       plgpu.barrier_wait(schedule_barrier)
 
     def get_kv_ranges():
-      min_kv_step = 0
-      max_kv_step = kv_seq_len // block_kv
+      lb = 0
+      ub = kv_seq_len // block_kv
 
       if is_causal:
-        q_max = (q_idx + 1) * (2 * block_q)
-        max_kv_step = lax.min(max_kv_step, pl.cdiv(q_max, block_kv))
+        q_max = (qi + 1) * (2 * block_q)
+        ub = lax.min(ub, pl.cdiv(q_max, block_kv))
 
-      def load_k_minmax(ref):
-        b_idx_ = 0 if ref.shape[0] == 1 else b_idx
-        h_idx_ = 0 if ref.shape[1] == 1 else h_idx
-        return ref[b_idx_, h_idx_, q_idx]
+      def load_k_minmax(x):
+        return x[0 if x.shape[0] == 1 else bi, 0 if x.shape[1] == 1 else hi, qi]
 
-      if k_start_minmax_refs is None:
+      if k_start_minmax_gmems is None:
         k_start_max = None
       else:
-        k_start_min, k_start_max = map(load_k_minmax, k_start_minmax_refs)
-        min_kv_step = lax.max(min_kv_step, lax.div(k_start_min, block_kv))
+        k_start_min, k_start_max = map(load_k_minmax, k_start_minmax_gmems)
+        lb = lax.max(lb, lax.div(k_start_min, block_kv))
 
-      if k_end_minmax_refs is None:
+      if k_end_minmax_gmems is None:
         k_end_min = None
       else:
-        k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_refs)
-        max_kv_step = lax.min(max_kv_step, pl.cdiv(k_end_max, block_kv))
+        k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_gmems)
+        ub = lax.min(ub, pl.cdiv(k_end_max, block_kv))
 
-      return min_kv_step, max_kv_step, k_start_max, k_end_min
+      return lb, ub, k_start_max, k_end_min
 
-    if mask_ref is None:
-      bcast_mask_q = bcast_mask_k = mask_b_idx = mask_h_idx = None
+    if mask_gmem is None:
+      bcast_mask_q = bcast_mask_k = bi_mask = hi_mask = None
     else:
-      bcast_dims = [d == 1 for d in mask_ref.shape]
+      bcast_dims = [d == 1 for d in mask_gmem.shape]
       bcast_mask_b, bcast_mask_h, bcast_mask_q, bcast_mask_k = bcast_dims
       if bcast_mask_q and bcast_mask_k:
         raise NotImplementedError("Mask broadcast on both sequences.")
 
-      mask_b_idx = 0 if bcast_mask_b else b_idx
-      mask_h_idx = 0 if bcast_mask_h else h_idx
+      bi_mask = 0 if bcast_mask_b else bi
+      hi_mask = 0 if bcast_mask_h else hi
 
-    @pl.when(wg_idx < 2)
+    @pl.when(wg < 2)
     def _compute_wg():
-      q_base = (2 * q_idx + wg_idx) * block_q
+      q_base = (2 * qi + wg) * block_q
       qs = pl.ds(q_base, block_q)
 
       plgpu.set_max_registers(232, action="increase")
-      q_smem = q_smems.at[wg_idx]
-      q_barrier = q_barriers.at[wg_idx]
-      plgpu.copy_gmem_to_smem(q_ref.at[b_idx, qs, h_idx], q_smem, q_barrier)
+      q_smem = q_smems.at[wg]
+      q_barrier = q_barriers.at[wg]
+      plgpu.copy_gmem_to_smem(q_gmem.at[bi, qs, hi], q_smem, q_barrier)
 
       l_i = plgpu.layout_cast(jnp.zeros((block_q,), jnp.float32), _WGMMA_ROW)
       if use_stable_softmax:
@@ -220,45 +218,44 @@ def _fwd(
       def load_k_range(ref):
         if ref is None:
           return None
-        b_idx_ = 0 if ref.shape[0] == 1 else b_idx
-        h_idx_ = 0 if ref.shape[1] == 1 else h_idx
+        b_idx_ = 0 if ref.shape[0] == 1 else bi
+        h_idx_ = 0 if ref.shape[1] == 1 else hi
         idx = (b_idx_, h_idx_, qs)
         return plgpu.load(ref, idx, layout=_WGMMA_ROW, optimized=False)
 
-      k_start = load_k_range(k_start_ref)
-      k_end = load_k_range(k_end_ref)
-      min_kv_step, max_kv_step, k_start_max, k_end_min = get_kv_ranges()
+      k_start = load_k_range(k_start_gmem)
+      k_end = load_k_range(k_end_gmem)
+      lb, ub, k_start_max, k_end_min = get_kv_ranges()
 
       plgpu.barrier_wait(q_barrier)
-      @pl.when(max_kv_step > min_kv_step)
+      @pl.when(ub > lb)
       def _():
-        plgpu.barrier_wait(k_barriers.at[lax.rem(min_kv_step, max_stages)])
+        plgpu.barrier_wait(k_barriers.at[lax.rem(lb, max_stages)])
 
-      pl.when(wg_idx == 1)(perform_schedule_barrier)
+      pl.when(wg == 1)(perform_schedule_barrier)
 
-      def kv_loop(kv_step, carry, *, do_causal=False):
+      def loop_body(ki, carry, *, do_causal=False):
         acc, m_i, l_i = carry
-        slot = lax.rem(kv_step, max_stages)
-        k_base = kv_step * block_kv
+        si = lax.rem(ki, max_stages)
+        k_base = ki * block_kv
 
         def iota(d):
           return plgpu.broadcasted_iota(jnp.int32, block_q_kv, d, layout=_WGMMA)
 
         def compute_qk(acc_ref):
-          k_smem_T = plgpu.transpose_ref(k_smems.at[slot], (1, 0))  # pylint: disable=invalid-name
-          plgpu.wgmma(acc_ref, q_smem, k_smem_T)
-          if bias_ref is None:
+          plgpu.wgmma(acc_ref, q_smem, k_smems.at[si].T)
+          if bias_gmem is None:
             bias = None
           else:
-            plgpu.barrier_wait(bias_barriers.at[slot])
-            bias = bias_smems[slot, block.ds(wg_idx, block_q)]
+            plgpu.barrier_wait(bias_barriers.at[si])
+            bias = bias_smems[si, block.ds(wg, block_q)]
           plgpu.barrier_arrive(schedule_barrier)
           mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
           return acc_ref[...], bias, mask
 
         acc_type = plgpu.ACC(block_q_kv, jnp.float32)
         s, bias, mask = pl.run_scoped(compute_qk, acc_type)
-        plgpu.barrier_arrive(k_consumed_barriers.at[slot])
+        plgpu.barrier_arrive(k_consumed_barriers.at[si])
         plgpu.barrier_wait(schedule_barrier)
 
         scale = logits_scale
@@ -295,18 +292,19 @@ def _fwd(
         if k_end is not None:
           s = lax.cond(k_base + block_kv > k_end_min, apply_k_end, lambda: s)
 
-        if mask_ref is not None:
+        if mask_gmem is not None:
+          load_unopt = functools.partial(plgpu.load, optimized=False)
           if bcast_mask_q:
-            idx = (mask_b_idx, mask_h_idx, 0, pl.ds(k_base, block_kv))
-            mask = plgpu.load(mask_ref, idx, layout=_WGMMA_COL, optimized=False)
+            idx = (bi_mask, hi_mask, 0, pl.ds(k_base, block_kv))
+            mask = load_unopt(mask_gmem, idx, layout=_WGMMA_COL)
           elif bcast_mask_k:
-            idx = (mask_b_idx, mask_h_idx, qs, 0)
-            mask = plgpu.load(mask_ref, idx, layout=_WGMMA_ROW, optimized=False)
+            idx = (bi_mask, hi_mask, qs, 0)
+            mask = load_unopt(mask_gmem, idx, layout=_WGMMA_ROW)
             mask = lax.broadcast_in_dim(mask, s.shape, [0])
           else:
-            plgpu.barrier_wait(mask_barriers.at[slot])
-            mask = mask_smems[slot, block.ds(wg_idx, block_q)]
-            plgpu.barrier_arrive(mask_consumed_barriers.at[slot])
+            plgpu.barrier_wait(mask_barriers.at[si])
+            mask = mask_smems[si, block.ds(wg, block_q)]
+            plgpu.barrier_arrive(mask_consumed_barriers.at[si])
           s = jnp.where(mask, s, mask_value)
 
         exp = jnp.exp2 if use_base2 else jnp.exp
@@ -328,52 +326,50 @@ def _fwd(
           acc, l_i, m_i, p_ = lax.optimization_barrier((acc, l_i, m_i, p_))
 
         plgpu.barrier_arrive(schedule_barrier)
-        plgpu.barrier_wait(v_barriers.at[slot])
+        plgpu.barrier_wait(v_barriers.at[si])
         plgpu.barrier_wait(schedule_barrier)
 
         if not p_sum_before_barriers:
           l_i += p.sum(axis=1)
 
         def compute_pv(acc_ref):
-          plgpu.wgmma(acc_ref, p_, v_smems.at[slot])
-          wait_step = kv_step + 1
+          plgpu.wgmma(acc_ref, p_, v_smems.at[si])
 
-          @pl.when(wait_step < max_kv_step)
+          @pl.when(ki + 1 < ub)
           def _():
-            plgpu.barrier_wait(k_barriers.at[lax.rem(wait_step, max_stages)])
+            plgpu.barrier_wait(k_barriers.at[lax.rem(ki + 1, max_stages)])
 
         acc = pl.run_state(compute_pv)(plgpu.ACC.init(acc))
-        plgpu.barrier_arrive(v_consumed_barriers.at[slot])
+        plgpu.barrier_arrive(v_consumed_barriers.at[si])
         return acc, m_i, l_i
 
       if kv_seq_len % block_kv:
         raise ValueError(f"{kv_seq_len=} must be a multiple of {block_kv=}")
 
-      hi = max_kv_step
       if is_causal:
-        hi = lax.min(hi, lax.div(q_base, block_kv))
+        causal_loop_body = functools.partial(loop_body, do_causal=True)
+        ub_no_causal = lax.min(ub, lax.div(q_base, block_kv))
+        carry = lax.fori_loop(lb, ub_no_causal, loop_body, (acc, m_i, l_i))
+        # TODO: This cond should be redundant, but without it we hit a
+        # weird compiler bug.
+        acc, m_i, l_i = lax.cond(
+            ub_no_causal < ub,
+            lambda: lax.fori_loop(ub_no_causal, ub, causal_loop_body, carry),
+            lambda: carry,
+        )
+      else:
+        acc, m_i, l_i = lax.fori_loop(lb, ub, loop_body, (acc, m_i, l_i))
 
-      carry = lax.fori_loop(min_kv_step, hi, kv_loop, (acc, m_i, l_i))
-
-      causal_kv_loop = functools.partial(kv_loop, do_causal=True)
-      # TODO: This cond should be redundant, but without it we hit a weird
-      # compiler bug.
-      acc, m_i, l_i = lax.cond(
-          hi < max_kv_step,
-          lambda: lax.fori_loop(hi, max_kv_step, causal_kv_loop, carry),
-          lambda: carry,
-      )
-
-      pl.when(wg_idx == 0)(perform_schedule_barrier)
+      pl.when(wg == 0)(perform_schedule_barrier)
 
       if return_residuals:
-        m_smem, l_smem = (smems.at[wg_idx] for smems in residual_smems)
+        m_smem, l_smem = (smems.at[wg] for smems in residual_smems)
         m_smem[...] = (m_i * (1 / math.log2(math.e))) if use_base2 else m_i
         l_smem[...] = l_i
         plgpu.commit_smem()
-        m_ref, l_ref = residual_refs
-        plgpu.copy_smem_to_gmem(m_smem, m_ref.at[b_idx, h_idx, qs])
-        plgpu.copy_smem_to_gmem(l_smem, l_ref.at[b_idx, h_idx, qs])
+        m_gmem, l_gmem = residual_gmems
+        plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[bi, hi, qs])
+        plgpu.copy_smem_to_gmem(l_smem, l_gmem.at[bi, hi, qs])
 
       l_i += float(jnp.finfo(jnp.float32).tiny)
 
@@ -381,55 +377,54 @@ def _fwd(
         # TODO: Use `reciprocal`?
         acc *= lax.broadcast_in_dim(1 / l_i, acc.shape, [0])
 
-      o_smem = o_smems.at[wg_idx]
+      o_smem = o_smems.at[wg]
       o_smem[...] = acc.astype(q.dtype)  # pytype: disable=attribute-error
       plgpu.commit_smem()
-      plgpu.copy_smem_to_gmem(o_smem, out_ref.at[b_idx, qs, h_idx])
+      plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[bi, qs, hi])
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-    @pl.when(wg_idx == 2)
+    @pl.when(wg == 2)
     def _memory_wg():
       plgpu.set_max_registers(40, action="decrease")
-      kv_h_idx = lax.div(h_idx, q_heads_per_kv_head)
-      qs = block.ds(q_idx, 2 * block_q)
-      k_ref_ = k_ref.at[b_idx, :, kv_h_idx]
-      v_ref_ = v_ref.at[b_idx, :, kv_h_idx]
-      bias_ref_ = None if bias_ref is None else bias_ref.at[b_idx, h_idx, qs]
+      hi_kv = lax.div(hi, q_heads_per_kv_head)
+      qs = block.ds(qi, 2 * block_q)
       if mask_smems is None:
-        mask_ref_ = None
+        mask_gmem_ = None
       else:
-        mask_ref_ = mask_ref.at[mask_b_idx, mask_h_idx, qs]
+        mask_gmem_ = mask_gmem.at[bi_mask, hi_mask, qs]
 
-      cp = plgpu.copy_gmem_to_smem
-      min_kv_step, max_kv_step, _, _ = get_kv_ranges()
+      def cp(gmem, smems, barriers, si):
+        plgpu.copy_gmem_to_smem(gmem, smems.at[si], barriers.at[si])
+
+      lb, ub, _, _ = get_kv_ranges()
 
       for i in range(max_stages):
 
-        @pl.when(i < (max_kv_step - min_kv_step))
+        @pl.when(i < (ub - lb))
         def _preload_kv_bias_mask():
-          step = min_kv_step + i
-          slot = lax.rem(step, max_stages)
-          ks = block.ds(step, block_kv)
-          cp(k_ref_.at[ks], k_smems.at[slot], k_barriers.at[slot])
-          if bias_ref_ is not None:
-            cp(bias_ref_.at[:, ks], bias_smems.at[slot], bias_barriers.at[slot])
-          if mask_ref_ is not None:
-            cp(mask_ref_.at[:, ks], mask_smems.at[slot], mask_barriers.at[slot])
-          cp(v_ref_.at[ks], v_smems.at[slot], v_barriers.at[slot])
+          ki = lb + i
+          ks = block.ds(ki, block_kv)
+          si = lax.rem(ki, max_stages)
+          cp(k_gmem.at[bi, ks, hi_kv], k_smems, k_barriers, si)
+          if bias_gmem is not None:
+            cp(bias_gmem.at[bi, hi, qs, ks], bias_smems, bias_barriers, si)
+          if mask_gmem_ is not None:
+            cp(mask_gmem_.at[:, ks], mask_smems, mask_barriers, si)
+          cp(v_gmem.at[bi, ks, hi_kv], v_smems, v_barriers, si)
 
-      @pl.loop(min_kv_step, max_kv_step - max_stages)
-      def _kv_loop(kv_step):
-        slot = lax.rem(kv_step, max_stages)
-        ks = block.ds(kv_step + max_stages, block_kv)
-        plgpu.barrier_wait(k_consumed_barriers.at[slot])
-        cp(k_ref_.at[ks], k_smems.at[slot], k_barriers.at[slot])
-        if bias_ref_ is not None:
-          cp(bias_ref_.at[:, ks], bias_smems.at[slot], bias_barriers.at[slot])
-        if mask_ref_ is not None:
-          plgpu.barrier_wait(mask_consumed_barriers.at[slot])
-          cp(mask_ref_.at[:, ks], mask_smems.at[slot], mask_barriers.at[slot])
-        plgpu.barrier_wait(v_consumed_barriers.at[slot])
-        cp(v_ref_.at[ks], v_smems.at[slot], v_barriers.at[slot])
+      @pl.loop(lb, ub - max_stages)
+      def _kv_loop(ki):
+        si = lax.rem(ki, max_stages)
+        ks = block.ds(ki + max_stages, block_kv)
+        plgpu.barrier_wait(k_consumed_barriers.at[si])
+        cp(k_gmem.at[bi, ks, hi_kv], k_smems, k_barriers, si)
+        if bias_gmem is not None:
+          cp(bias_gmem.at[bi, hi, qs, ks], bias_smems, bias_barriers, si)
+        if mask_gmem_ is not None:
+          plgpu.barrier_wait(mask_consumed_barriers.at[si])
+          cp(mask_gmem_.at[:, ks], mask_smems, mask_barriers, si)
+        plgpu.barrier_wait(v_consumed_barriers.at[si])
+        cp(v_gmem.at[bi, ks, hi_kv], v_smems, v_barriers, si)
 
   def entry(*refs):
     compute_wgs = 2
@@ -559,6 +554,7 @@ _SUPPORTED_PRECISIONS = (
 class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   """Flash attention with Mosaic GPU."""
 
+  supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = True
   use_stable_softmax: bool | type[base.AUTO] = base.AUTO
 

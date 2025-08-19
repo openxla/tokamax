@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-
+from typing import ClassVar
 import jax
 from jax.experimental import pallas as pl
 from tokamax._src.pallas import local_fuser as fuser
@@ -431,6 +431,7 @@ class Config:
 class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
   """Pallas-Triton FlexAttention implementation."""
 
+  supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = False
   use_stable_softmax: bool = True
 

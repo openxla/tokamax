@@ -82,7 +82,6 @@ def get_key(
     raise NotImplementedError('`return_residuals` not supported.')
   kwargs.pop('epsilon')
   kwargs.pop('subtract_mean')
-  kwargs.pop('pre_scale')
 
   mean, rstddev = residuals
   x_shape = _canonicalize_shape(x.shape, axis)

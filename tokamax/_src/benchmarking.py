@@ -101,7 +101,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       hermetic: If False, creates XProf server session, with the URL accessible
         via self.xprof_url. If True (default), `self.xprof_url=None` and this
         context manager is hermetic.
-      jax_profiler: Profile with the jax.profiler API writing a temporary
+      use_jax_profiler: Profile with the jax.profiler API writing a temporary
         profile file instead of invoking xprof directly. If False (default),
         profile with xprof directly.
     """
@@ -368,7 +368,9 @@ def compile_benchmark(
   f_compiled = lowered.compile()  # TODO: Add test.
   compile_time = time.perf_counter() - start_time
 
-  def runner(x: T, *, iterations: int = 5, method: str | None = None):
+  def runner(
+      x: T, *, iterations: int = 5, method: str | None = None
+  ) -> BenchmarkData:
     """Runs the compiled benchmark.
 
     Args:

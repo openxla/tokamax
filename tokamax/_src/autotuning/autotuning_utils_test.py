@@ -20,8 +20,8 @@ from absl import logging
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
-from tokamax._src import autotuning_utils
 from tokamax._src import hlo_utils
+from tokamax._src.autotuning import autotuning_utils
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
 from tokamax._src.ops.normalization import base as normalization_base
@@ -141,6 +141,7 @@ class AutotuningUtilsTest(absltest.TestCase):
     self.assertNotEmpty(best_config)
 
   def test_autotuning_all_captured_ops(self):
+    self.skipTest('Deprecated in favor of API testsuite.')
     op_specs = get_norm_glu_opspecs(x_shape=(64, 128))
     op_specs_2 = get_norm_glu_opspecs(x_shape=(128, 256))
     # TODO: Revise this test when more Tokamax ops support autotuning.

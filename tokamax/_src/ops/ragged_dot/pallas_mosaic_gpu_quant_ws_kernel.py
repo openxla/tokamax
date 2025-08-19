@@ -14,7 +14,6 @@
 # ==============================================================================
 """Ragged dot Pallas-Mosaic-GPU Non-Quantized Kernel."""
 import functools
-import dataclasses
 
 import jax
 from jax import lax
@@ -30,85 +29,73 @@ QuantizedArray = quantization.QuantizedArray
 
 def body(
     group_info: common.GroupInfo,
-    mi,
     ni,
-    weights_gmem,
+    w_gmem,
     x_gmem,
-    scales_gmem,
+    w_scales_gmem,
     o_gmem,
     schedule_barrier,
     *,
     config: common.Config,
 ):
   """The main kernel function for ragged dot-product."""
-  del mi
+  block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
 
   m = x_gmem.shape[0]
-  w_elem_bits = jnp.iinfo(weights_gmem.dtype).bits
   x_elem_bits = jnp.dtype(x_gmem.dtype).itemsize * 8
+  w_elem_bits = jnp.iinfo(w_gmem.dtype).bits
   out_elem_bits = jnp.dtype(o_gmem.dtype).itemsize * 8
 
   # K is the contiguous dimension
   try:
-    swizzle_w = plgpu.find_swizzle(w_elem_bits * config.block_k, "lhs")
+    swizzle_w = common.find_swizzle(w_elem_bits * block_k, "lhs")
   except ValueError as e:
     raise NotImplementedError("No possible swizzle.") from e
-  swizzle_x = plgpu.find_swizzle(x_elem_bits * config.block_k, "rhs")
-  swizzle_out = plgpu.find_swizzle(out_elem_bits * config.block_n, "out")
+  swizzle_x = common.find_swizzle(x_elem_bits * block_k, "rhs")
+  swizzle_out = common.find_swizzle(out_elem_bits * block_n, "out")
 
   x_swizzle_elems = (swizzle_x * 8) // x_elem_bits
   w_swizzle_elems = (swizzle_w * 8) // w_elem_bits
 
   wg = lax.axis_index("wg")
-  off = lax.select(wg == 0, 0, config.block_n)
+  ns = pl.ds(wg * block_n, block_n)
 
   def schedule():
     plgpu.barrier_arrive(schedule_barrier)
     plgpu.barrier_wait(schedule_barrier)
 
-  def store_scope(acc, o_smem_swizzled):
-    assert config.block_n % 8 == 0
-    o_smem_swizzled = o_smem_swizzled.at[wg]
-    common.store_acc_transposed(
-        acc, o_gmem, ni * 2 + wg, m, group_info, config, o_smem_swizzled
-    )
-
-  def accumulator_carry(cb):
-    acc = pl.run_scoped(
-        lambda acc_ref: cb(acc_ref)[...],
-        plgpu.ACC((config.block_n, config.block_m)),
-    )
-    pl.run_scoped(
-        functools.partial(store_scope, acc),
-        plgpu.SMEM(
-            (2, config.block_m, config.block_n),
-            dtype=o_gmem.dtype,
-            transforms=(plgpu.SwizzleTransform(swizzle_out),),
-        ),
-        collective_axes=("wg",),
-    )
-
-  def compute_acc_ref(_, w_smem, x_smem, s_smem, acc_ref):
-    w_smem = w_smem.at[pl.ds(off, config.block_n)]
-    s_smem = s_smem.at[0, pl.ds(off, config.block_n)]
+  def pipeline_body(_, w_smem, x_smem, w_scales_smem, acc_ref):
     pl.when(wg == 0)(schedule)
     plgpu.wgmma_wait(0)
-    w = w_smem[...]
-    w = common.dequant(s_smem, w)
+    w = common.dequant(w_scales_smem.at[0, ns], w_smem[ns])
     schedule()
-    plgpu.wgmma(
-        acc_ref,
-        w,
-        plgpu.transpose_ref(x_smem, (1, 0)),
-    )
+    plgpu.wgmma(acc_ref, w, plgpu.transpose_ref(x_smem, (1, 0)))
     pl.when(wg == 1)(schedule)
     return acc_ref
+
+  def pipeline_context(cb):
+    acc = pl.run_scoped(
+        lambda acc_ref: cb(acc_ref)[...], plgpu.ACC((block_n, block_m))
+    )
+
+    def store_acc(o_smem):
+      assert block_n % 8 == 0
+      common.store_acc_transposed(
+          acc, o_gmem, 2 * ni + wg, m, group_info, config, o_smem.at[wg]
+      )
+
+    transforms = (plgpu.SwizzleTransform(swizzle_out),)
+    o_smem_type = plgpu.SMEM(
+        (2, block_m, block_n), o_gmem.dtype, transforms=transforms
+    )
+    pl.run_scoped(store_acc, o_smem_type, collective_axes=("wg",))
 
   try:
     swizzle_w_transform = plgpu.SwizzleTransform(swizzle_w)
   except ValueError as e:
     raise NotImplementedError(f"{swizzle_w=} unsupported.") from e
 
+  gi = group_info.group_id
   x_transforms = (
       plgpu.TilingTransform((8, x_swizzle_elems)),
       plgpu.SwizzleTransform(swizzle_x),
@@ -117,34 +104,28 @@ def body(
       plgpu.TilingTransform((8, w_swizzle_elems)),
       swizzle_w_transform,
   )
-  k_steps = weights_gmem.shape[2] // config.block_k
+  x_spec = plgpu.BlockSpec(
+      (block_m, block_k), lambda ki: (0, ki), transforms=x_transforms
+  )
+  w_spec = plgpu.BlockSpec(
+      (2 * block_n, block_k), lambda ki: (ni, ki), transforms=w_transforms
+  )
+  w_scales_spec = plgpu.BlockSpec((1, 2 * block_n), lambda ki: (ki, ni))
+
   with jax.named_scope("pipeline"):
     plgpu.emit_pipeline_warp_specialized(
-        compute_acc_ref,
+        pipeline_body,
         num_compute_wgs=2,
         wg_axis="wg",
         memory_registers=168 if config.persistent else 40,
-        grid=(k_steps,),
-        out_specs=[],
-        compute_context=accumulator_carry,
-        in_specs=[
-            plgpu.BlockSpec(
-                (config.block_n * 2, config.block_k),
-                lambda k: (ni, k),
-                transforms=w_transforms,
-            ),
-            plgpu.BlockSpec(
-                (config.block_m, config.block_k),
-                lambda k: (group_info.block, k),
-                transforms=x_transforms,
-            ),
-            plgpu.BlockSpec((1, config.block_n * 2), lambda k: (k, ni)),
-        ],
+        grid=(w_gmem.shape[2] // block_k,),
+        compute_context=pipeline_context,
+        in_specs=(w_spec, x_spec, w_scales_spec),
         max_concurrent_steps=max(config.num_stages // 2, 2),
     )(
-        weights_gmem.at[group_info.group_id],
-        x_gmem,
-        scales_gmem.at[group_info.group_id],
+        w_gmem.at[gi],
+        x_gmem.at[pl.ds(group_info.offset, block_m)],
+        w_scales_gmem.at[gi],
     )
 
   # The memory WG does not arrive at the run so we release it here.
@@ -152,7 +133,9 @@ def body(
   # necessary.
   @pl.when(wg == 2)
   def _():
-    pl.run_scoped(lambda _: None, plgpu.SMEM((), jnp.float32), collective_axes="wg")
+    pl.run_scoped(
+        lambda _: None, plgpu.SMEM((), jnp.float32), collective_axes="wg"
+    )
 
 
 def ragged_dot_quantized_ws_kernel(
@@ -164,24 +147,19 @@ def ragged_dot_quantized_ws_kernel(
 ) -> jax.Array:
   """Returns the Pallas kernel for quantized ragged dot."""
 
+  m, k = lhs.shape
+  g, k2, n = rhs.shape
+  assert k == k2
+
   if rhs.tile_shape != (1, config.block_k, 1):
     raise NotImplementedError(
         "Only scaling tile supported is (1, block_k, 1) got:"
         f" {rhs.tile_shape} (block_k={config.block_k})."
     )
 
-  weights, scales, x = rhs.values.transpose(0, 2, 1), rhs.scales, lhs
-  (num_groups, n, k), (m, k2) = weights.shape, x.shape
-  assert k == k2
-
-  if k != k2:
+  if group_sizes.shape[0] != g:
     raise ValueError(
-        f"Contraction dim mismatch: weights.shape[-1]={k}, x.shape[-1]={k2}"
-    )
-  if group_sizes.shape[0] != num_groups:
-    raise ValueError(
-        "Expected group_sizes to have shape"
-        f" {(num_groups,)} but got {group_sizes.shape}"
+        f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
     )
 
   def kernel_entry(*args):
@@ -195,11 +173,11 @@ def ragged_dot_quantized_ws_kernel(
 
   kernel = common.ragged_kernel(
       kernel_entry,
-      g=num_groups,
+      g=g,
       m=m,
       n=n,
       out_dtype=out_dtype,
       config=config,
       thread_axis="wg",
   )
-  return kernel(group_sizes, weights, x, scales)
+  return kernel(group_sizes, rhs.values.transpose(0, 2, 1), lhs, rhs.scales)

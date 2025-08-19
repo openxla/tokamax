@@ -379,7 +379,7 @@ class BoundArguments(Generic[_Config, _Key]):
       return heuristics_config
 
     if check_autotuning_cache:
-      if (data := self.cached_autotuning_data) is not None:
+      if (data := self.cached_autotuning_data) is not None and data.items():
         return data.fastest_config  # pytype: disable=unbound-type-param
 
     if autotune_configs is not None:

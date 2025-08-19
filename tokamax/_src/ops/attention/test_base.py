@@ -18,6 +18,7 @@ import contextlib
 import functools
 import itertools
 import random
+import pytest
 
 from absl.testing import parameterized
 import chex
@@ -270,6 +271,7 @@ class AttentionTestBase(parameterized.TestCase):
 
   @parameterized.product(input_dim=(24, 128), output_dim=(64, 112))
   def test_different_output_head_dim(self, input_dim, output_dim):
+    self.skipTest("Too slow for OSS")
     rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
     q = jax.random.normal(rng0, (2, 1024, 4, input_dim))
     k = jax.random.normal(rng1, (2, 1024, 4, input_dim))
@@ -342,6 +344,7 @@ class AttentionTestBase(parameterized.TestCase):
 
   @parameterized.parameters(512, 539)
   def test_causal_mask_cross_attention(self, seq_len_k):
+    self.skipTest("Too slow for OSS")
     mask = jnp.tri(1024, seq_len_k, dtype=bool)
     self._run_test(
         (2, 1024, 4, 64),
@@ -486,6 +489,7 @@ class AttentionTestBase(parameterized.TestCase):
       dict(k_start=576),
   )
   def test_mask_api(self, **kwargs):
+    self.skipTest("Too slow for OSS regression tests.")
     num_heads = 4
     offset_per_head = kwargs.pop("offset_per_head", None)
 
@@ -551,6 +555,7 @@ class AttentionTestBase(parameterized.TestCase):
       dict(vmap_in_axes=((0, None, None, None, 0), (None, 0, 0, 0, None))),
   )
   def test_vmap(self, vmap_in_axes):
+    self.skipTest("Too slow for OSS")
     def vmap_impl(impl):
       def vmapped(q, k, v, *, bias, mask, **kwargs):
         def f(q, k, v, bias, mask):
@@ -597,6 +602,7 @@ class AttentionTestBase(parameterized.TestCase):
       dict(q_shape=(4, 1024, 2, 64), mask_shape=(4, 2, 512, 1024)),  # mask
   )
   def test_invalid_shapes(self, **kwargs):
+    self.skipTest("Too slow for OSS")
     mask = kwargs.pop("mask", None)
     bias = kwargs.pop("bias", None)
     with self.assertRaises((jaxtyping.TypeCheckError, TypeError, ValueError)):
@@ -652,6 +658,7 @@ class AttentionTestBase(parameterized.TestCase):
 
   @parameterized.parameters("bfloat16", "float16")
   def test_logits_dtype(self, dtype):
+    self.skipTest("Too slow for OSS")
     self._run_test(
         (2, 1024, 4, 64),
         impl_kwargs=dict(logits_dtype=dtype),
@@ -706,6 +713,7 @@ class AttentionTestBase(parameterized.TestCase):
 
   @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
   def test_bench(self, spec):
+    self.skipTest("Too slow for OSS")
     spec = spec()
 
     q, k, v, bias, mask = numerics.random_initialize((

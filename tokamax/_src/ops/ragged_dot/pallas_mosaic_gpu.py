@@ -15,8 +15,10 @@
 """Ragged dot Pallas-Mosaic-GPU implementation."""
 
 import dataclasses
+from typing import ClassVar
 
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import mosaic_gpu as mosaic_gpu_lib
 from tokamax._src import quantization
@@ -25,6 +27,7 @@ from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel as non_quant_kernel
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel as quant_kernel
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel_blackwell as quant_kernel_blackwell
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_kernel as quant_ws_kernel
 
 Config = common.Config
@@ -39,6 +42,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
 
   The kernel is optimized for physical layout `mk,enk->mn`.
   """
+
+  supports_symbolic_shapes: ClassVar[bool] = False
 
   def __post_init__(self):
     if self.vjp is None:
@@ -70,7 +75,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
       lhs = lhs.recompose()
 
     if isinstance(rhs, QuantizedArray):
-      if config.warp_specialized:
+      if "b200" in backend.get_default_device().device_kind.lower():
+        fn = quant_kernel_blackwell.ragged_dot_gpu_quant_blackwell_kernel
+      elif config.warp_specialized:
         fn = quant_ws_kernel.ragged_dot_quantized_ws_kernel
       else:
         fn = quant_kernel.ragged_dot_quantized_kernel
@@ -94,6 +101,16 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> common.Config:
     _, rhs = ba.args
+    device_kind = backend.get_default_device().device_kind.lower()
+    if "b200" in device_kind:
+      return common.Config(
+          block_m=128,
+          block_n=128,
+          block_k=256,
+          num_stages=2,
+          split_k=1,
+          grid_block_n=1,
+      )
     return common.Config(
         block_m=64,
         block_n=64,
@@ -124,26 +141,70 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
 
-    for persistent in [True, False]:
-      for ws in warp_specialized:
-        for block_k in [128, 256]:
-          if (block_k * rhs_dtype_bits) % (128 * 8) or (
-              block_k * lhs_dtype_bits
-          ) % (128 * 8):
-            continue
-          for block_m in [128, 64]:
-            for num_stages in [4, 2, 1]:
-              for grid_block_n in [1, 2, 4, 8]:
-                configs.add(
-                    common.Config(
-                        block_m=block_m,
-                        block_n=out_swizzle_elems,
-                        block_k=block_k,
-                        num_stages=num_stages,
-                        split_k=1,
-                        grid_block_n=grid_block_n,
-                        warp_specialized=ws,
-                        persistent=persistent
-                    )
-                )
+    device_kind = backend.get_default_device().device_kind.lower()
+    if "h100" in device_kind:
+      for persistent in [True, False]:
+        for ws in warp_specialized:
+          for block_k in [128, 256]:
+            if (block_k * rhs_dtype_bits) % (128 * 8) or (
+                block_k * lhs_dtype_bits
+            ) % (128 * 8):
+              continue
+            for block_m in [128, 64]:
+              for num_stages in [4, 2, 1]:
+                for grid_block_n in [1, 2, 4, 8]:
+                  configs.add(
+                      common.Config(
+                          block_m=block_m,
+                          block_n=out_swizzle_elems,
+                          block_k=block_k,
+                          num_stages=num_stages,
+                          split_k=1,
+                          grid_block_n=grid_block_n,
+                          warp_specialized=ws,
+                          persistent=persistent,
+                      )
+                  )
+    elif "b200" in device_kind:
+      # Configs for prefill
+      block_m = 128
+      block_n = 128
+      for block_k in [128, 256]:
+        for num_stages in [2, 3]:
+          configs.add(
+              common.Config(
+                  block_m=block_m,
+                  block_n=block_n,
+                  block_k=block_k,
+                  num_stages=num_stages,
+                  split_k=1,
+                  grid_block_n=1,
+                  warp_specialized=True,
+                  persistent=False,
+                  collective=True,
+              )
+          )
+
+      # Config for generate
+      for block_m in [8, 16, 32]:
+        for num_stages in [2, 3]:
+          for grid_block_n in [1, 4, 8]:
+            for persistent in [False, True]:
+              configs.add(
+                  common.Config(
+                      block_m=block_m,
+                      block_n=128,
+                      block_k=256,
+                      num_stages=num_stages,
+                      split_k=1,
+                      grid_block_n=grid_block_n,
+                      warp_specialized=True,
+                      persistent=persistent,
+                      collective=False,
+                  )
+              )
+    else:
+      raise ValueError(
+          f"Autotuning not supported for device kind: {device_kind}"
+      )
     return configs

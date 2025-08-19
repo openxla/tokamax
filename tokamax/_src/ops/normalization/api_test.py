@@ -41,7 +41,7 @@ _IMPLEMENTATIONS_VJP: Mapping[str, Callable[..., jax.Array]] = dict(
 import sys
 from absl import flags
 FLAGS = flags.FLAGS
-FLAGS(sys.argv[2:])  # Parse absl flags before absltest.main()
+FLAGS(sys.argv[:1])  # Parse absl flags before absltest.main()
 
 
 def _get_input_data(shape, dtype=jnp.bfloat16):
