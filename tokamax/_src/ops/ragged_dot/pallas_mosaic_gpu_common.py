@@ -15,10 +15,11 @@
 
 """Common Pallas Mosaic GPU utilities."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 import dataclasses
 import functools
-from typing import Self
+import math
+from typing import TypeVar, overload, Self
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
@@ -37,6 +38,65 @@ def find_swizzle(dim_size_bits: int, what: str) -> int:
       f"No valid out swizzle for {what}: its minor dimension has"
       f" {dim_size_bits} bits, which is not a multiple of 128."
   )
+
+_T = TypeVar("_T")
+
+@overload
+def nd_loop(
+    grid: Sequence[int],
+    *,
+    collective_axes: Sequence[Hashable] | Hashable,
+    tiling: Sequence[int] | None = None,
+    init_carry: _T
+) -> Callable[[Callable[[Sequence[jax.Array], _T], _T]], _T]:
+  ...
+def nd_loop(grid, *, collective_axes,
+            tiling=None,
+            init_carry=None,
+            include_wave_step=False):
+  axis_index = lax.axis_index(collective_axes)
+  axis_size = lax.axis_size(collective_axes)
+  if tiling:
+    if len(grid) != len(tiling):
+      raise ValueError(f"{tiling=} and {grid=} must have same length.")
+    if any(dim % tile != 0 for dim, tile in zip(grid, tiling, strict=True)):
+      raise ValueError(f"Tiling {tiling} does not divide grid {grid}.")
+    tile_grid = tuple(
+        dim // tile for dim, tile in zip(grid, tiling, strict=True))
+    grid = (*tile_grid, *tiling)
+  grid_size = math.prod(grid)
+  def decorator(body):
+    def wrapper(wave_step, carry):
+      nonlocal body
+      step = wave_step * axis_size + axis_index
+      # The loop below is conceptually ``jnp.unravel_index``, but it uses
+      # ``lax`` APIs instead of ``jax.numpy`` to minimize the number of
+      # primitives used.
+      index = []
+      for grid_dim in reversed(grid):
+        grid_dim = lax.convert_element_type(grid_dim, step.dtype)
+        index.append(lax.rem(step, grid_dim))
+        step = lax.div(step, grid_dim)
+      index.reverse()
+      if tiling:
+        # Recompute index as if the grid was not tiled.
+        tile_indices, subtile_indices = index[:len(tiling)], index[len(tiling):]
+        untiled_index = []
+        for sub_idx, tile_idx, tile_dim in zip(
+            subtile_indices, tile_indices, tiling, strict=True):
+          untiled_index.append(sub_idx + tile_idx * tile_dim)
+        index = untiled_index
+      if include_wave_step:
+        body = functools.partial(body, wave_step=wave_step)
+      if init_carry is None:
+        body(tuple(index))
+      else:
+        return body(tuple(index), carry=carry)
+    upper = lax.div(grid_size, axis_size) + lax.convert_element_type(
+        axis_index < grid_size % axis_size, axis_index.dtype
+    )
+    return lax.fori_loop(0, upper, wrapper, init_carry)
+  return decorator
 
 
 class Config(pydantic.BaseModel, frozen=True):
@@ -312,7 +372,7 @@ def ragged_kernel(
       inner_grid_l = list(inner_grid)
       # Now we know the exact number of steps required.
       inner_grid_l[1] = initial_group_info.total_steps
-      plgpu.nd_loop(
+      nd_loop(
           tuple(inner_grid_l),
           collective_axes="sm",
           init_carry=initial_group_info,

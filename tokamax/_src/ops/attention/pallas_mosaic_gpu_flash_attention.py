@@ -243,7 +243,8 @@ def _fwd(
           return plgpu.broadcasted_iota(jnp.int32, block_q_kv, d, layout=_WGMMA)
 
         def compute_qk(acc_ref):
-          plgpu.wgmma(acc_ref, q_smem, k_smems.at[si].T)
+          k_smem_T = plgpu.transpose_ref(k_smems.at[si], (1, 0))  # pylint: disable=invalid-name
+          plgpu.wgmma(acc_ref, q_smem, k_smem_T)
           if bias_gmem is None:
             bias = None
           else:
