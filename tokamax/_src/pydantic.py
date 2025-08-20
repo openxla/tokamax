@@ -174,7 +174,9 @@ def abstractify(typ):
     return Annotated[abstractify(typ.__origin__), *typ.__metadata__]
   if typing.get_origin(typ) is Union or isinstance(typ, types.UnionType):
     return Union[tuple(map(abstractify, typing.get_args(typ)))]
-  if issubclass(typ, jaxtyping.AbstractArray):
+  if typing.get_origin(typ) is tuple:
+    return tuple[tuple(map(abstractify, typing.get_args(typ)))]
+  if isinstance(typ, type) and issubclass(typ, jaxtyping.AbstractArray):
     typ = typ.array_type
   if typ is jax.Array:
     return ShapeDtype

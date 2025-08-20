@@ -96,6 +96,15 @@ class PydanticTest(parameterized.TestCase):
     adapter = pydantic.TypeAdapter(pydantic_lib.abstractify(_MyDataclass))
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
+  def test_abstract_tuple_roundtrip(self):
+    shape = jax.ShapeDtypeStruct((1, 2), dtype=jnp.float32)
+    data = (shape, 42)
+    config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+    adapter = pydantic.TypeAdapter(
+        pydantic_lib.abstractify(tuple[jax.Array, int]), config=config
+    )
+    self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+
   @parameterized.named_parameters(
       ("attention", attn_base.DotProductAttention, attn_arg_specs),
       ("ragged_dot", ragged_dot_base.RaggedDot, ragged_dot_arg_specs),
