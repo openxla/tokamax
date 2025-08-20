@@ -27,13 +27,14 @@ from absl import logging
 import immutabledict
 import jax
 import jax.numpy as jnp
-from tokamax._src import autotuning
 from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src import config as config_lib
 from tokamax._src import serialization
 from tokamax._src import shape
 from tokamax._src import utils
+from tokamax._src.autotuning import autotuner as autotuner_lib
+from tokamax._src.autotuning import cache as autotuning_cache
 
 
 _P = ParamSpec("_P")
@@ -41,7 +42,8 @@ _T = TypeVar("_T")
 _Residuals = TypeVar("_Residuals")
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
-DeviceKind = autotuning.DeviceKind
+AutotuningData = autotuner_lib.AutotuningData
+DeviceKind = autotuning_cache.DeviceKind
 
 
 class NullConfig:
@@ -215,13 +217,14 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 
   def get_autotuning_cache(
       self, device_kind: DeviceKind | None = None
-  ) -> dict[_Key, autotuning.AutotuningData[_Config]]:
+  ) -> dict[_Key, AutotuningData[_Config]]:
     self_no_vjp = copy.copy(self)
     object.__setattr__(self_no_vjp, "vjp", None)
     if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
       # PascalCase to snake_case.
       name = re.sub(r"(?!^)([A-Z])", r"_\1", type(self).__name__).lower()
-      _AUTOTUNING_CACHE[self_no_vjp] = cache = autotuning.AutotuningCache(name)
+      cache = autotuning_cache.AutotuningCache(name)
+      _AUTOTUNING_CACHE[self_no_vjp] = cache
     if device_kind is None:
       device_kind = jax.devices()[0].device_kind
     return cache[device_kind]
@@ -284,7 +287,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 
 
 _AUTOTUNING_CACHE: dict[
-    Op, dict[DeviceKind, dict[Any, autotuning.AutotuningData[Any]]]
+    Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]
 ] = {}
 
 
@@ -403,7 +406,7 @@ class BoundArguments(Generic[_Config, _Key]):
     return self.op._get_autotuning_cache_key(self)  # pylint: disable=protected-access
 
   @property
-  def cached_autotuning_data(self) -> autotuning.AutotuningData[_Config] | None:
+  def cached_autotuning_data(self) -> AutotuningData[_Config] | None:
     """Returns autotuning data from the cache, if available."""
     key = self.autotuning_cache_key
     try:
@@ -426,9 +429,9 @@ class BoundArguments(Generic[_Config, _Key]):
   def autotune(
       self,
       configs: set[_Config] | type[AUTO] = AUTO,
-      autotuner: autotuning.Autotuner = autotuning.Autotuner(),
+      autotuner: autotuner_lib.Autotuner = autotuner_lib.Autotuner(),
       cache_results: bool = True,
-  ) -> autotuning.AutotuningData[_Config]:
+  ) -> AutotuningData[_Config]:
     """Autotunes the op with the bound arguments."""
     if configs is AUTO:
       configs = self.autotuning_configs

@@ -15,14 +15,14 @@
 import functools
 import json
 
-from absl import flags
-from absl import logging
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 from tokamax._src import serialization
-from tokamax._src.autotuning import api as autotuning_api
+from tokamax._src.autotuning import api
+from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
+from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 
 from tensorflow.compiler.xla.service import hlo_pb2
@@ -56,11 +56,21 @@ def get_lowered_norm_and_glu(x_shape):
 
 class AutotuningTest(absltest.TestCase):
 
+  def test_get_op_implementations(self):
+    self.assertDictEqual(
+        api.get_op_implementations(pl_norm.PallasTritonNormalization()),
+        dict(norm_api.IMPLEMENTATIONS),
+    )
+    self.assertDictEqual(
+        api.get_op_implementations(pl_glu.PallasTritonGatedLinearUnit()),
+        dict(glu_api.IMPLEMENTATIONS),
+    )
+
   def test_get_bound_args_from_lowered(self):
     x_shape = (64, 128)
     f_lowered = get_lowered_norm_and_glu(x_shape)
 
-    bound_args = autotuning_api.get_bound_args(f_lowered)
+    bound_args = api.get_bound_args(f_lowered)
     self.assertLen(bound_args, 2)
     self.assertIsInstance(bound_args[0].op, pl_norm.PallasTritonNormalization)
     self.assertIsInstance(bound_args[1].op, pl_glu.PallasTritonGatedLinearUnit)
@@ -90,7 +100,7 @@ class AutotuningTest(absltest.TestCase):
     # Replicate the HLO modules multiple times to ensure that the bound args are
     # unique.
     hlo_modules = hlo_modules * 10
-    bound_args = autotuning_api.get_bound_args(hlo_modules)
+    bound_args = api.get_bound_args(hlo_modules)
     self.assertLen(bound_args, 2)
     self.assertIsInstance(bound_args[0].op, pl_norm.PallasTritonNormalization)
     self.assertIsInstance(bound_args[1].op, pl_glu.PallasTritonGatedLinearUnit)
@@ -99,29 +109,27 @@ class AutotuningTest(absltest.TestCase):
     x_shape = (64, 128)
     f_lowered = get_lowered_norm_and_glu(x_shape)
 
-    autotuned_results = autotuning_api.autotune(
-        autotuning_api.get_bound_args(f_lowered),
-        all_implementations=False,
+    autotuned_results = api.autotune(
+        api.get_bound_args(f_lowered), all_implementations=False
     )
-    self.assertLen(autotuned_results.result, 2)
+    self.assertLen(autotuned_results.data, 2)
     self.assertIsInstance(
-        autotuned_results.result[0][0].op, pl_norm.PallasTritonNormalization
+        autotuned_results.data[0][0].op, pl_norm.PallasTritonNormalization
     )
     self.assertIsInstance(
-        autotuned_results.result[1][0].op, pl_glu.PallasTritonGatedLinearUnit
+        autotuned_results.data[1][0].op, pl_glu.PallasTritonGatedLinearUnit
     )
 
     # TODO For GLU, we need to remove the activation argument from the
     # bound args because jitted JAX functions cannot be serialized.
-    if "activation" in autotuned_results.result[1][0].arguments:
-      del autotuned_results.result[1][0].arguments["activation"]
+    if "activation" in autotuned_results.data[1][0].arguments:
+      del autotuned_results.data[1][0].arguments["activation"]
 
-    all_api_autotuned_results = autotuning_api.autotune(
-        autotuning_api.get_bound_args(f_lowered),
-        all_implementations=True,
+    all_api_autotuned_results = api.autotune(
+        api.get_bound_args(f_lowered), all_implementations=True
     )
     self.assertGreaterEqual(
-        len(all_api_autotuned_results.result), len(autotuned_results.result)
+        len(all_api_autotuned_results.data), len(autotuned_results.data)
     )
 
 

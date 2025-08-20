@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tokamax Autotuning."""
+"""Tokamax autotuner."""
 from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent import futures
 from concurrent.futures import process
 import dataclasses
-from typing import Any, ParamSpec, Self, TypeAlias, TypeVar, cast
+from typing import Any, ParamSpec, Self, TypeVar, cast
 
 from absl import logging
 import immutabledict
@@ -28,10 +28,8 @@ from tokamax._src import numerics
 
 
 _Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
 _P = ParamSpec("_P")
 BenchmarkData = benchmarking.BenchmarkData
-DeviceKind = str
 
 
 class AutotuningData(immutabledict.immutabledict[_Config, BenchmarkData]):
@@ -50,29 +48,6 @@ class AutotuningData(immutabledict.immutabledict[_Config, BenchmarkData]):
   def prune(self) -> Self:
     config = self.fastest_config
     return AutotuningData({config: self[config]})
-
-
-DeviceAutotuningCache: TypeAlias = dict[Any, AutotuningData[Any]]
-
-
-class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
-  """Cache of autotuning data.
-
-  Autotuning data is read lazily from the cache files upon first access. The
-  directory containing the cache files can be specified using TODO!!!
-  """
-
-  def __init__(self, op_name):
-    super().__init__()
-    self._op_name = op_name
-
-  def __missing__(self, device_kind: DeviceKind) -> DeviceAutotuningCache:
-    self[device_kind] = (cache := self._load_cache(device_kind))
-    return cache
-
-  def _load_cache(self, device_kind: DeviceKind) -> DeviceAutotuningCache:
-    del device_kind  # Unused.
-    return {}  # TODO: Implement.
 
 
 def _compile(fn_factory, config, args, kwargs, *, seed=None):
