@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import dataclasses
 import functools
 import json
 
@@ -80,7 +81,9 @@ class AutotuningTest(absltest.TestCase):
       # TODO For GLU, we need to remove the activation argument from the
       # bound args because jitted JAX functions cannot be serialized.
       if "activation" in bound_arg.arguments:
-        del bound_arg.arguments["activation"]
+        arguments = dict(bound_arg.arguments)
+        arguments.pop("activation")
+        bound_arg = dataclasses.replace(bound_arg, arguments=arguments)
       dump_str = json.dumps(bound_arg, cls=serialization.JsonEncoder)
       loaded_bound_arg = json.loads(dump_str, cls=serialization.JsonDecoder)
       self.maxDiff = None
@@ -123,7 +126,14 @@ class AutotuningTest(absltest.TestCase):
     # TODO For GLU, we need to remove the activation argument from the
     # bound args because jitted JAX functions cannot be serialized.
     if "activation" in autotuned_results.data[1][0].arguments:
-      del autotuned_results.data[1][0].arguments["activation"]
+      data = list(autotuned_results.data)
+      arguments = dict(data[1][0].arguments)
+      arguments.pop("activation")
+      new_bound_arg = dataclasses.replace(data[1][0], arguments=arguments)
+      data[1] = (new_bound_arg, data[1][1])
+      autotuned_results = dataclasses.replace(
+          autotuned_results, data=tuple(data)
+      )
 
     all_api_autotuned_results = api.autotune(
         api.get_bound_args(f_lowered), all_implementations=True

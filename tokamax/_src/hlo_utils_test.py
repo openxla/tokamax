@@ -374,14 +374,17 @@ class DumpHloLibTest(parameterized.TestCase):
     (ba2,) = hlo_utils.get_opspecs(fn_lowered, include_xla_kernels=False)
     fn2, x2 = benchmarking.standardize_function(ba2.op, kwargs=ba2.arguments)
 
-    ba.arguments.pop('group_sizes')
-    actual = ba2.arguments.pop('group_sizes')
+    arguments = dict(ba.arguments)
+    arguments.pop('group_sizes')
+    arguments2 = dict(ba2.arguments)
+    actual = arguments2.pop('group_sizes')
+    self.assertEqual(arguments, arguments2)
     chex.assert_trees_all_equal(actual.value, jnp.array([128] * 8, jnp.int32))
     self.assertEqual(actual.representative_value, (128,) * 8)
 
     object.__setattr__(ba.op, 'vjp', None)
     object.__setattr__(ba2.op, 'vjp', None)
-    self.assertEqual(ba, ba2)
+    self.assertEqual(ba.op, ba2.op)
 
     expected = fn_lowered.compile()(x)
     diff_summary = numerics.array_diff_summary(expected, jax.jit(fn2)(x2))
