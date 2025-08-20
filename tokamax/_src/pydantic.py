@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Pydantic types and utilities."""
-
+import builtins
 from collections.abc import Callable
 import dataclasses
 import enum
@@ -51,9 +51,26 @@ def _serialize_module_member(x) -> str:
 def _validate_module_member(x) -> Any:
   if not isinstance(x, str):
     return x
-  module_name, name = x.rsplit('.', 1)
+  parts = x.rsplit('.', 1)
+  if len(parts) == 1:
+    try:
+      return getattr(builtins, x)
+    except AttributeError as e:
+      raise ValueError(f'Invalid `builtins` member: {x}') from e
+  module_name, name = parts
   # TODO: Create allowlist of modules.
   return getattr(importlib.import_module(module_name), name)
+
+
+def _validate_np_dtype(x) -> np.dtype:
+  return x if isinstance(x, np.dtype) else np.dtype(x)
+
+
+NumpyDtype = Annotated[
+    np.dtype,
+    pydantic.PlainSerializer(lambda dtype: dtype.name),
+    pydantic.PlainValidator(_validate_np_dtype),
+]
 
 
 # pytype: disable=invalid-annotation
@@ -92,6 +109,8 @@ def annotate(typ) -> Any:
         pydantic.PlainSerializer(lambda e: e.name),
         pydantic.PlainValidator(validate_enum),
     ]
+  if issubclass(typ, np.dtype):
+    return NumpyDtype
   return typ
 
 

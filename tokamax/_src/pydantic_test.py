@@ -78,6 +78,11 @@ class PydanticTest(parameterized.TestCase):
 
   @parameterized.parameters(
       (type[_Foo], _Foo),
+      (jnp.dtype, jnp.dtype("int8")),
+      (jax.typing.DTypeLike, "int32"),
+      (jax.typing.DTypeLike, jnp.float32),
+      (jax.typing.DTypeLike, jnp.dtype("bfloat16")),
+      (jax.typing.DTypeLike, float),
       (jax.lax.PrecisionLike, jax.lax.Precision.DEFAULT),
       (jax.lax.PrecisionLike, jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
       (jax.lax.PrecisionLike, "highest"),
