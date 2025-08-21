@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src import precision as precision_utils
 from tokamax._src import quantization
+from tokamax._src import triton as triton_lib
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_triton_flash_attention as flash_attn
 from tokamax._src.ops.attention import test_base
@@ -40,6 +41,7 @@ class _F32PrecisionXlaAttentionVjp(base.DotProductAttentionVjp):
     )
 
 
+@absltest.skipIf(not triton_lib.has_triton_support(), "Triton not supported on this backend.") 
 class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
 
   def __init__(self, *args):

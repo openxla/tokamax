@@ -13,11 +13,15 @@
 # limitations under the License.
 # ==============================================================================
 """Test base for wrapped FlexAttention ops."""
+
+from absl.testing import absltest
+import jax
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.flex_attention import base
 from tokamax._src.ops.flex_attention import wrapper
 
 
+@absltest.skipIf(jax.default_backend() != "gpu", "Unsupported backend.")
 class WrappedFlexAttentionTestBase(test_base.AttentionTestBase):
   """Test base for wrapped FlexAttention ops."""
 

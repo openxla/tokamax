@@ -23,7 +23,9 @@ jobs:
   build:
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu']
+        runner: [
+          #'linux-x86-a3-8g-h100-1gpu', 
+          'linux-x86-ct6e-44-1tpu',]
         pytest_command: ['pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ tokamax/_src/ops',
                          'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/api_test.py',
                          'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/base_test.py',
