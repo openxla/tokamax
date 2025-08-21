@@ -15,18 +15,35 @@
 import dataclasses
 import functools
 import json
+import types
+from typing import Any
 
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
+from tokamax._src import benchmarking
 from tokamax._src import serialization
 from tokamax._src.autotuning import api
+from tokamax._src.autotuning import autotuner
+from tokamax._src.ops import op as op_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
 from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 
 from tensorflow.compiler.xla.service import hlo_pb2
+
+
+_HEURISTICS_CONFIG = object()
+
+
+class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, object, Any]):
+
+  def _fwd(self, x, y, *, return_residuals, config):
+    ...
+
+  def _get_heuristics_config(self, ba: op_base.BoundArguments) -> object:
+    return _HEURISTICS_CONFIG
 
 
 @jax.jit
@@ -141,6 +158,52 @@ class AutotuningTest(absltest.TestCase):
     self.assertGreaterEqual(
         len(all_api_autotuned_results.data), len(autotuned_results.data)
     )
+
+  def test_autotuning_result_context(self):
+    op = _FakeOp()
+    ba = op.bind(jnp.zeros((1, 2)), jnp.zeros((3,)))
+    ba2 = op.bind(jnp.zeros((4, 5)), jnp.zeros((6,)))
+    device_kind = jax.devices()[0].device_kind
+    bmark_data = benchmarking.BenchmarkData(
+        compile_time_ms=0.0,
+        lower_time_ms=0.0,
+        evaluation_times_ms=(0.0,),
+        metadata={},
+    )
+    config0 = object()
+    config1 = object()
+    config2 = object()
+    config3 = object()
+    data0 = autotuner.AutotuningData({config0: bmark_data})
+    data1 = autotuner.AutotuningData({config1: bmark_data})
+    data2 = autotuner.AutotuningData({config2: bmark_data})
+    data3 = autotuner.AutotuningData({config3: bmark_data})
+    op.get_autotuning_cache(device_kind)[ba2.autotuning_cache_key] = data3
+    result0 = api.AutotuningResult(device_kind, ((ba, data0), (ba2, data2)))
+    result1 = api.AutotuningResult(device_kind, ((ba, data1),))
+
+    orig_data = ba.cached_autotuning_data
+    orig_data2 = ba2.cached_autotuning_data
+    self.assertEqual(ba.default_config, _HEURISTICS_CONFIG)
+    self.assertEqual(ba2.default_config, config3)
+    with result0:
+      self.assertEqual(ba.cached_autotuning_data, data0)
+      self.assertEqual(ba.default_config, config0)
+      self.assertEqual(ba2.cached_autotuning_data, data2)
+      self.assertEqual(ba2.default_config, config2)
+      with result1:
+        self.assertEqual(ba.cached_autotuning_data, data1)
+        self.assertEqual(ba.default_config, config1)
+        self.assertEqual(ba2.cached_autotuning_data, data2)
+        self.assertEqual(ba2.default_config, config2)
+      self.assertEqual(ba.cached_autotuning_data, data0)
+      self.assertEqual(ba.default_config, config0)
+      self.assertEqual(ba2.cached_autotuning_data, data2)
+      self.assertEqual(ba2.default_config, config2)
+    self.assertEqual(ba.cached_autotuning_data, orig_data)
+    self.assertEqual(ba.default_config, _HEURISTICS_CONFIG)
+    self.assertEqual(ba2.cached_autotuning_data, orig_data2)
+    self.assertEqual(ba2.default_config, config3)
 
 
 if __name__ == "__main__":

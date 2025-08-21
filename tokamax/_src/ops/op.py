@@ -21,10 +21,13 @@ import dataclasses
 import inspect
 import json
 import re
+import threading
 from typing import Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
+
 from absl import logging
 import immutabledict
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
@@ -225,7 +228,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       cache = autotuning_cache.AutotuningCache(name)
       _AUTOTUNING_CACHE[self_no_vjp] = cache
     if device_kind is None:
-      device_kind = jax.devices()[0].device_kind
+      device_kind = backend.get_default_device().device_kind
     return cache[device_kind]
 
   @abc.abstractmethod
@@ -288,6 +291,15 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 _AUTOTUNING_CACHE: dict[
     Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]
 ] = {}
+_AUTOTUNING_CACHE_OVERLAY = threading.local()
+
+
+def get_autotuning_cache_overlay() -> (
+    list[dict[Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]]]
+):
+  if (overlay := getattr(_AUTOTUNING_CACHE_OVERLAY, "stack", None)) is None:
+    _AUTOTUNING_CACHE_OVERLAY.stack = overlay = []
+  return overlay
 
 
 class AUTO:
@@ -411,7 +423,14 @@ class BoundArguments(Generic[_Config, _Key]):
   @property
   def cached_autotuning_data(self) -> AutotuningData[_Config] | None:
     """Returns autotuning data from the cache, if available."""
+    device_kind = backend.get_default_device().device_kind
     key = self.autotuning_cache_key
+
+    for overlay in reversed(get_autotuning_cache_overlay()):
+      data = overlay.get(self.op, {}).get(device_kind, {}).get(key)
+      if data is not None:
+        return data
+
     try:
       return self.op.get_autotuning_cache()[key]
     except KeyError:

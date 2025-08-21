@@ -44,10 +44,17 @@ HloComputation: TypeAlias = (
 )
 
 
-# TODO: Add context manager in a separate CL.
 @dataclasses.dataclass(frozen=True)
 class AutotuningResult:
-  """Context manager for autotuning results."""
+  """Autotuning results.
+
+  `AutotuningResult`s can be used as a context manager, whereby it will act as
+  an overlay for the autotuning cache within the scope of the context; i.e. the
+  `AutotuningResult` will be checked first for a matching config, but it will
+  fallback to the default autotuning cache if not found. Multiple
+  `AutotuningResult`s contexts can be stacked, with the innermost one taking
+  precedence.
+  """
 
   device_kind: str
   data: tuple[tuple[op_base.BoundArguments, autotuner.AutotuningData[Any]], ...]
@@ -66,6 +73,17 @@ class AutotuningResult:
   @classmethod
   def loads(cls, json_str: str) -> Self:
     return cls(**json.loads(json_str, cls=serialization.JsonDecoder))
+
+  def __enter__(self):
+    overlay = {}
+    for ba, data in self.data:
+      key = ba.autotuning_cache_key
+      overlay.setdefault(ba.op, {}).setdefault(self.device_kind, {})[key] = data
+    op_base.get_autotuning_cache_overlay().append(overlay)
+    return self
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    op_base.get_autotuning_cache_overlay().pop()
 
 
 def get_bound_args(
