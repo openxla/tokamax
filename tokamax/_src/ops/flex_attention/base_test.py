@@ -15,7 +15,14 @@
 
 from absl.testing import absltest
 from tokamax._src.ops.flex_attention import base
+from tokamax._src.ops.flex_attention import test_base
 from tokamax._src.ops.flex_attention import wrapper_test_base
+
+
+class FlexAttentionTest(test_base.FlexAttentionTestBase):
+
+  def __init__(self, *args):
+    super().__init__(*args, flex_attn=base.FlexAttention())
 
 
 class WrappedFlexAttentionTest(wrapper_test_base.WrappedFlexAttentionTestBase):

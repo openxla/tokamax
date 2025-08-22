@@ -15,7 +15,6 @@
 """Pallas-Triton normalization op configuration."""
 
 from collections.abc import Sequence
-import dataclasses
 import math
 from typing import Any, TypeAlias
 
@@ -23,13 +22,14 @@ import immutabledict
 import jax
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
+import pydantic
+from tokamax._src import pydantic as pydantic_lib
 
 
-@dataclasses.dataclass(frozen=True)
-class Config:
-  block_m: int
-  block_n: int | None
-  num_warps: int
+class Config(pydantic.BaseModel, frozen=True):
+  block_m: pydantic_lib.PowerOfTwo
+  block_n: pydantic_lib.PowerOfTwo | None
+  num_warps: pydantic_lib.PowerOfTwo
 
 
 Key: TypeAlias = immutabledict.immutabledict[str, Any]

@@ -15,12 +15,20 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
-from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.flex_attention import pallas_triton
+from tokamax._src.ops.flex_attention import test_base
 from tokamax._src.ops.flex_attention import wrapper_test_base
 
 
-class WrappedFlexAttentionTest(wrapper_test_base.WrappedFlexAttentionTestBase):
+class PallasTritonFlexAttentionTest(test_base.FlexAttentionTestBase):
+
+  def __init__(self, *args):
+    super().__init__(*args, flex_attn=pallas_triton.PallasTritonFlexAttention())
+
+
+class WrappedPallasTritonFlexAttentionTest(
+    wrapper_test_base.WrappedFlexAttentionTestBase
+):
 
   def __init__(self, *args):
     super().__init__(
@@ -29,9 +37,12 @@ class WrappedFlexAttentionTest(wrapper_test_base.WrappedFlexAttentionTestBase):
         supports_vjp=False,  # TODO: Support VJP.
     )
 
-  @parameterized.parameters(*test_base.base_names_and_params("test_vmap"))
+  @parameterized.parameters(
+      *wrapper_test_base.base_names_and_params("test_vmap")
+  )
   def test_vmap(self, *_):
     self.skipTest("TODO: Fix `vmap` support.")
+
 
 if __name__ == "__main__":
   absltest.main()

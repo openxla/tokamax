@@ -15,6 +15,7 @@
 """Normalization test base."""
 
 import functools
+import inspect
 import math
 
 from absl.testing import parameterized
@@ -22,6 +23,8 @@ import chex
 import jax
 import jax.numpy as jnp
 from tokamax._src import test_utils
+from tokamax._src.ops.normalization import base
+from tokamax._src.ops.normalization import bench_arg_specs
 
 
 # pylint: disable=missing-function-docstring
@@ -175,6 +178,13 @@ class NormalizationTestBase(parameterized.TestCase):
     chex.assert_trees_all_close(dscale_actual, dscale_expected, atol=atol)
     atol = atols[x.dtype] * 25 * float(jnp.sqrt(math.prod(param_bcast_dims)))
     chex.assert_trees_all_close(doffset_actual, doffset_expected, atol=atol)
+
+  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
+  def test_bench(self, kwargs):
+    ba = inspect.signature(base.Normalization.__call__).bind(None, **kwargs)
+    ba.apply_defaults()
+    ba.arguments.pop('return_residuals')
+    self._run_test(*ba.args[1:], **ba.kwargs)
 
 
 def base_names_and_params(test_name: str) -> list[tuple[str, str]]:
