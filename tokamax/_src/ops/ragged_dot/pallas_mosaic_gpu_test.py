@@ -104,6 +104,11 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
 
     super().__init__(*args, dot_fn=fn)
 
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
+
 class GroupInfoTest(absltest.TestCase):
   def test_number_of_steps(self):
     grp_sizes = jnp.array((1,0,1) + (0,) * (128 - 3),)

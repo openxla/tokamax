@@ -30,6 +30,11 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
   def __init__(self, *args):
     super().__init__(*args, norm_fn=pallas_triton.PallasTritonNormalization())
 
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
+
   def test_layer_norm_with_pre_scale(self):
     rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
 

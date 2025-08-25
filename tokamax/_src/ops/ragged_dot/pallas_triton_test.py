@@ -16,6 +16,7 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import jax
 import jax.numpy as jnp
 from tokamax._src.ops.ragged_dot import pallas_triton
 from tokamax._src.ops.ragged_dot import test_base
@@ -26,6 +27,11 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
 
   def __init__(self, *args):
     super().__init__(*args, dot_fn=pallas_triton.PallasTritonRaggedDot())
+
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
 
   @parameterized.parameters(2, 4)
   def test_split_k(self, split_k):

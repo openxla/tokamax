@@ -22,6 +22,8 @@ from jax.experimental import pallas as pl
 import jax.numpy as jnp
 from tokamax._src.pallas import block
 
+_SKIP_TPU_TEST_REASON = "Test broken on TPU due to blockspec shape TPU constraints."
+
 
 class BlockTest(parameterized.TestCase):
 
@@ -33,6 +35,9 @@ class BlockTest(parameterized.TestCase):
       ((16, 16, None), (16,), (slice(None), 3)),
   )
   def test_block_ref_bounds(self, block_shape, expected_bounds, at=None):
+    if jax.default_backend() == "tpu":
+      self.skipTest(_SKIP_TPU_TEST_REASON)
+
     def kernel(x_ref, _):
       if at is not None:
         x_ref = x_ref.at[at]
@@ -50,6 +55,8 @@ class BlockTest(parameterized.TestCase):
       ((32, 16, None), (True,), (slice(None), 3)),
   )
   def test_block_ref_bounds_checked(self, block_shape, expect_checked, at=None):
+    if jax.default_backend() == "tpu":
+      self.skipTest(_SKIP_TPU_TEST_REASON)
     def kernel(x_ref, _):
       if at is not None:
         x_ref = x_ref.at[at]
@@ -66,6 +73,9 @@ class BlockTest(parameterized.TestCase):
       ((None, 64, None), True),
   )
   def test_block_ref_inbounds_mask(self, block_shape, use_grid_spec=False):
+    if jax.default_backend() == "tpu":
+      self.skipTest(_SKIP_TPU_TEST_REASON)
+
     x = jnp.ones((99, 144, 222))
     expected_mask_shape = tuple(
         1 if dim % block_dim == 0 else block_dim
@@ -108,6 +118,9 @@ class BlockTest(parameterized.TestCase):
     chex.assert_trees_all_equal(call(x), expected)
 
   def test_block_ref_at_masks(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest(_SKIP_TPU_TEST_REASON)
+
     def kernel(x_ref, mask0_ref, mask1_ref, mask_ref):
       x_ref = x_ref.at[-32:, 1, pl.dslice(100, 16)]
       mask0, mask1 = x_ref.inbounds_masks

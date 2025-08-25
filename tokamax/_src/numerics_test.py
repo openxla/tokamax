@@ -67,7 +67,11 @@ class NumericsTest(parameterized.TestCase):
     self.assertEqual(summary.has_nan, True)
     self.assertLess(abs(summary.max - 3.4), 0.0001)
 
+  # TODO: Make this test work for TPU. This test is broken on TPU.
   def test_random_initialize_consistency(self):
+    if jax.default_backend() == 'tpu':
+      self.skipTest('Test broken on TPU')
+
     # To allow numerics comparisons over time, the random initializer should
     # always produce the same results.
 
@@ -111,6 +115,9 @@ class NumericsTest(parameterized.TestCase):
 
   @parameterized.parameters(jnp.bool_, jnp.float32, jnp.int32, jnp.uint8)
   def test_random_initialize_layout(self, dtype):
+    if jax.default_backend() == 'tpu':
+      self.skipTest('Test broken on TPU')
+
     shape = (2, 3, 4)
     no_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
     format_ = layout.Format(Layout((1, 2, 0), ()), no_sharding)

@@ -48,6 +48,11 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
         *args, attention_fn=flash_attn.PallasTritonFlashAttention(vjp=vjp)
     )
 
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
+
   def _run_test(
       self,
       q_shape,

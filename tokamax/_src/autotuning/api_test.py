@@ -72,7 +72,13 @@ def get_lowered_norm_and_glu(x_shape):
   return f_lowered
 
 
+# TODO: Make autotuning work for both GPU and TPU.
 class AutotuningTest(absltest.TestCase):
+
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+    super().setUp()
 
   def test_get_op_implementations(self):
     self.assertDictEqual(

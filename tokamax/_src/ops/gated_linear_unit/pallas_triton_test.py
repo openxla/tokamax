@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 from absl.testing import absltest
+import jax
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
 from tokamax._src.ops.gated_linear_unit import test_base
 
@@ -22,6 +22,12 @@ class PallasTritonGatedLinearUnitTest(test_base.GatedLinearUnitTestBase):
 
   def __init__(self, *args):
     super().__init__(*args, glu_fn=pl_glu.PallasTritonGatedLinearUnit())
+
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
+
 
 
 if __name__ == "__main__":

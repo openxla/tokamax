@@ -13,20 +13,34 @@
 # limitations under the License.
 # ==============================================================================
 from absl.testing import absltest
+import jax
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import test_base
 
 
+# TODO: Make ragged dot base test work for both GPU and TPU.
 class RaggedDotTest(test_base.RaggedDotTestBase):
 
   def __init__(self, *args):
     super().__init__(*args, dot_fn=base.RaggedDot())
+
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Disabled for now due to numeric issues.")
+    super().setUp()
+
 
 
 class RaggedDotWithExplicitVjpTest(test_base.RaggedDotTestBase):
 
   def __init__(self, *args):
     super().__init__(*args, dot_fn=base.RaggedDot(vjp=base.vjp))
+
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Disabled for now due to numeric issues.")
+    super().setUp()
+
 
 
 if __name__ == "__main__":

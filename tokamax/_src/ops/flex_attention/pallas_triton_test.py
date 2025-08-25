@@ -15,6 +15,7 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import jax
 from tokamax._src.ops.flex_attention import pallas_triton
 from tokamax._src.ops.flex_attention import test_base
 from tokamax._src.ops.flex_attention import wrapper_test_base
@@ -24,6 +25,11 @@ class PallasTritonFlexAttentionTest(test_base.FlexAttentionTestBase):
 
   def __init__(self, *args):
     super().__init__(*args, flex_attn=pallas_triton.PallasTritonFlexAttention())
+
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
 
 
 class WrappedPallasTritonFlexAttentionTest(
@@ -36,6 +42,11 @@ class WrappedPallasTritonFlexAttentionTest(
         flex_attn=pallas_triton.PallasTritonFlexAttention(),
         supports_vjp=False,  # TODO: Support VJP.
     )
+
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
 
   @parameterized.parameters(
       *wrapper_test_base.base_names_and_params("test_vmap")

@@ -23,15 +23,19 @@ jobs:
   build:
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu']
-        pytest_command: ['pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ tokamax/_src/ops',
-                         'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/api_test.py',
+        runner: [
+          'linux-x86-a3-8g-h100-1gpu',
+          'linux-x86-ct6e-44-1tpu',]
+        pytest_command: [
                          'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/base_test.py',
+                         'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/api_test.py',
                          'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/pallas_mosaic_gpu_flash_attention_test.py',
                          'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/pallas_triton_flash_attention_test.py',
                          'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/jax_nn_test.py',
                          'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/xla_chunked_test.py',
-                         'pytest -s --ignore-glob="tokamax/_src/ops/*" tokamax']
+                         'pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ tokamax/_src/ops',
+                         'pytest -s --ignore-glob="tokamax/_src/ops/*" tokamax',
+                        ]
     # Pick a single GPU machine to test on. In the future, we should add TPU machines once those tests are submitted to the public repo.
     runs-on: ${{ matrix.runner }}
     defaults:
