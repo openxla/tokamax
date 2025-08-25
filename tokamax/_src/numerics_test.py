@@ -27,6 +27,9 @@ else:
   Layout = layout.DeviceLocalLayout  # type: ignore
 
 jax.config.update('jax_threefry_partitionable', False)
+# TODO: b/440341158 - Fix tests and remove this.
+if hasattr(jax.config, 'jax_safer_randint'):
+  jax.config.update('jax_safer_randint', False)
 
 
 class NumericsTest(parameterized.TestCase):
