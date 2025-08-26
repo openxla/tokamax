@@ -19,7 +19,7 @@ import types
 from typing import Any, TypeAlias, TypeVar
 
 import jax
-from tokamax._src.pallas import local_fuser as fuser
+from jax.experimental.pallas import fuser
 import jax.numpy as jnp
 from tokamax._src.ops import op
 

@@ -20,7 +20,7 @@ from typing import TypeAlias
 
 import jax
 from jax.experimental import pallas as pl
-from tokamax._src.pallas import local_fuser as fuser
+from jax.experimental.pallas import fuser
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from tokamax._src.ops import op
