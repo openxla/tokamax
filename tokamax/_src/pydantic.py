@@ -42,13 +42,13 @@ PowerOfTwo: TypeAlias = Annotated[
 ]
 
 
-def _serialize_module_member(x) -> str:
+def _serialize_named_object(x) -> str:
   module_name = inspect.getmodule(x).__name__
   name = getattr(x, '__name__', str(x))
   return name if module_name == 'builtins' else f'{module_name}.{name}'
 
 
-def _validate_module_member(x) -> Any:
+def _validate_named_object(x) -> Any:
   if not isinstance(x, str):
     return x
   parts = x.rsplit('.', 1)
@@ -62,11 +62,16 @@ def _validate_module_member(x) -> Any:
   return getattr(importlib.import_module(module_name), name)
 
 
+_EnumSerializer = pydantic.PlainSerializer(lambda e: e.name)
+_NamedObjectSerializer = pydantic.PlainSerializer(_serialize_named_object)
+_NamedObjectValidator = pydantic.PlainValidator(_validate_named_object)
+
+
 def _validate_np_dtype(x) -> np.dtype:
   return x if isinstance(x, np.dtype) else np.dtype(x)
 
 
-NumpyDtype = Annotated[
+NumpyDtype: TypeAlias = Annotated[
     np.dtype,
     pydantic.PlainSerializer(lambda dtype: dtype.name),
     pydantic.PlainValidator(_validate_np_dtype),
@@ -78,22 +83,11 @@ def annotate(typ) -> Any:
   """Annotates types with serializers and validators, as necessary."""
   if typing.get_origin(typ) is Union or isinstance(typ, types.UnionType):
     return Union[tuple(map(annotate, typing.get_args(typ)))]
-  if typing.get_origin(typ) is type:
-    return Annotated[
-        typ,
-        pydantic.PlainSerializer(_serialize_module_member),
-        pydantic.PlainValidator(_validate_module_member),
-    ]
-  if typing.get_origin(typ) is Callable:
-    return Annotated[
-        typ,
-        pydantic.PlainSerializer(_serialize_module_member),
-        pydantic.PlainValidator(_validate_module_member),
-    ]
+  if typing.get_origin(typ) in (type, Callable):
+    return Annotated[typ, _NamedObjectSerializer, _NamedObjectValidator]
   # The default enum serialization, using the value, often leads to an ambiguous
   # serialization within unions, so use the name instead (also more readable).
   if issubclass(typ, enum.Enum):
-
     def validate_enum(x):
       if isinstance(x, typ):
         return x
@@ -104,11 +98,8 @@ def annotate(typ) -> Any:
       except KeyError as e:
         raise ValueError('Invalid enum name') from e
 
-    return Annotated[
-        typ,
-        pydantic.PlainSerializer(lambda e: e.name),
-        pydantic.PlainValidator(validate_enum),
-    ]
+    validator = pydantic.PlainValidator(validate_enum)
+    return Annotated[typ, _EnumSerializer, validator]
   if issubclass(typ, np.dtype):
     return NumpyDtype
   return typ
