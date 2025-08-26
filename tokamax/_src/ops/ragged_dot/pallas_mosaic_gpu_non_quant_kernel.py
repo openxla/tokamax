@@ -139,7 +139,8 @@ def ragged_dot_non_quantized_kernel(
     )
 
   elem_bits = jnp.finfo(lhs.dtype).bits
-  swizzle = common.find_swizzle(elem_bits * config.block_k, "lhs")
+  swizzle = plgpu.find_swizzle(elem_bits * config.block_k, "lhs")
+
 
   if group_sizes.shape[0] != g:
     raise ValueError(

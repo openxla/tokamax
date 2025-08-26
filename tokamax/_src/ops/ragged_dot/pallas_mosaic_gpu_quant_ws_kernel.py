@@ -48,11 +48,11 @@ def body(
 
   # K is the contiguous dimension
   try:
-    swizzle_w = common.find_swizzle(w_elem_bits * block_k, "lhs")
+    swizzle_w = plgpu.find_swizzle(w_elem_bits * block_k, "lhs")
   except ValueError as e:
     raise NotImplementedError("No possible swizzle.") from e
-  swizzle_x = common.find_swizzle(x_elem_bits * block_k, "rhs")
-  swizzle_out = common.find_swizzle(out_elem_bits * block_n, "out")
+  swizzle_x = plgpu.find_swizzle(x_elem_bits * block_k, "rhs")
+  swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
 
   x_swizzle_elems = (swizzle_x * 8) // x_elem_bits
   w_swizzle_elems = (swizzle_w * 8) // w_elem_bits
