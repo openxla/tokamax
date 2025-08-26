@@ -33,7 +33,8 @@ class FlexAttentionTestBase(absltest.TestCase):
     self._flex_attn = flex_attn
 
   def test_bias_upscale(self):
-    self.skipTest("Removed until Pallas Fuser is updated.")
+    if jax.__version_info__ < (0, 7, 2):
+      self.skipTest("Requires JAX 0.7.2 or later.")
 
     rng0, rng1, rng2, rng3 = jax.random.split(jax.random.PRNGKey(0), 4)
     q = jax.random.normal(rng0, (2, 512, 4, 64))
