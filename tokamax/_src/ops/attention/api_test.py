@@ -18,7 +18,9 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
+from jax import export
 import jax.numpy as jnp
+from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu
 from tokamax._src import triton as triton_lib
 from tokamax._src.ops.attention import api
@@ -86,6 +88,41 @@ class DotProductAttentionTest(parameterized.TestCase):
     chex.assert_trees_all_close(dQ_ans, dQ_ref, rtol=0.01, atol=0.01)
     chex.assert_trees_all_close(dK_ans, dK_ref, rtol=0.01, atol=0.01)
     chex.assert_trees_all_close(dV_ans, dV_ref, rtol=0.01, atol=0.01)
+
+  def test_symbolic_export(self):
+    if self.IMPL != 'xla':
+      self.skipTest('Symbolic export only supported for XLA.')
+
+    x = jax.random.normal(jax.random.PRNGKey(0), (2, 16, 4, 64), jnp.bfloat16)
+    batch, seq_len, num_heads, num_channels = x.shape
+    bias = jax.random.normal(
+        jax.random.PRNGKey(1), (batch, num_heads, 1, seq_len), jnp.bfloat16
+    )
+
+    @jax.jit
+    def f(x, bias):
+      return api.dot_product_attention(x, x, x, bias=bias, implementation='xla')
+
+    out = f(x, bias)
+
+    b_symbolic, seq_symbolic = export.symbolic_shape('b,s')
+
+    x_shape = jax.ShapeDtypeStruct(
+        (b_symbolic, seq_symbolic, num_heads, num_channels), x.dtype
+    )
+    b_shape = jax.ShapeDtypeStruct(
+        (b_symbolic, num_heads, 1, seq_symbolic), bias.dtype
+    )
+
+    # Disable jaxtyping to due to
+    # https://github.com/patrick-kidger/jaxtyping/issues/338
+    with jaxtyping.disable_jaxtyping():
+      exported = export.export(f)(x_shape, b_shape)
+
+    serialized = exported.serialize()
+    f_roundtrip = export.deserialize(serialized)
+    out_roundtrip = jax.jit(f_roundtrip.call)(x, bias)
+    chex.assert_trees_all_close(out, out_roundtrip)
 
   @parameterized.product(
       mask_mode=[

@@ -12,27 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""jaxtyping utilities."""
 
-import contextlib
+from absl.testing import absltest
+from absl.testing import parameterized
 import jax.numpy as jnp
-import jaxtyping
-from jaxtyping import Array, Int  # pylint: disable=g-importing-member,g-multiple-import
-import numpy as np
-import typeguard
+import jaxtyping as jt
+from jaxtyping import Array, Float  # pylint: disable=g-importing-member,g-multiple-import
+from tokamax._src import jaxtyping
 
 
-ScalarInt = Int[Array, ""] | Int[np.generic, ""] | Int[jnp.generic, ""]
-jaxtyped = jaxtyping.jaxtyped(typechecker=typeguard.typechecked)
+@jaxtyping.jaxtyped
+def f(x: Float[Array, "A B"]) -> Float[Array, "A B"]:
+  return x**2
 
 
-@contextlib.contextmanager
-def disable_jaxtyping():
-  """Disables jaxtyping for the duration of the context."""
+class JaxtypingTest(parameterized.TestCase):
 
-  current_context = jaxtyping.config.jaxtyping_disable
-  try:
-    jaxtyping.config.update("jaxtyping_disable", True)
-    yield
-  finally:
-    jaxtyping.config.update("jaxtyping_disable", current_context)
+  def test_disable_jaxtyping(self):
+    x = jnp.ones((2, 2, 2))
+
+    with self.assertRaises(jt.TypeCheckError):
+      f(x).block_until_ready()
+
+    with jaxtyping.disable_jaxtyping():
+      f(x).block_until_ready()
+
+    with self.assertRaises(jt.TypeCheckError):
+      f(x).block_until_ready()
+
+
+if __name__ == "__main__":
+  absltest.main()
