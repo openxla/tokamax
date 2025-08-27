@@ -143,6 +143,12 @@ class PydanticTest(parameterized.TestCase):
     adapter = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[_MyDataclass2])
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
+  def test_dict_roundtrip(self):
+    data = {_MyDataclass2(foo=42, bar="baz"): "blah"}
+    adapter = pydantic.TypeAdapter(pydantic_lib.Dict[_MyDataclass2, str])
+    self.assertEqual(data, adapter.validate_python(adapter.dump_python(data)))
+    self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+
   @parameterized.named_parameters(
       ("attention", attn_base.DotProductAttention, attn_arg_specs),
       ("normalization", norm_base.Normalization, norm_arg_specs),
