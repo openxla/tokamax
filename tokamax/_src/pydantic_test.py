@@ -24,8 +24,10 @@ from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import utils
 from tokamax._src.ops import op as op_base
 from tokamax._src.ops.attention import base as attn_base
+from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 from tokamax._src.ops.attention import bench_arg_specs as attn_arg_specs
+from tokamax._src.ops.normalization import bench_arg_specs as norm_arg_specs
 from tokamax._src.ops.ragged_dot import bench_arg_specs as ragged_dot_arg_specs
 
 
@@ -112,6 +114,7 @@ class PydanticTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
       ("attention", attn_base.DotProductAttention, attn_arg_specs),
+      ("normalization", norm_base.Normalization, norm_arg_specs),
       ("ragged_dot", ragged_dot_base.RaggedDot, ragged_dot_arg_specs),
   )
   def test_arg_specs_roundtrip(self, op_cls, arg_specs):
