@@ -29,9 +29,11 @@ import immutabledict
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
+import pydantic
 from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src import config as config_lib
+from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import serialization
 from tokamax._src import shape
 from tokamax._src import utils
@@ -504,6 +506,31 @@ class _HashableArray:
   def __hash__(self) -> int:
     # NOTE: Highly likely to conflicts, but not a problem for our purposes.
     return hash((self.value.shape, self.value.dtype))
+
+
+class BoundArgumentsModel(pydantic.BaseModel):
+  """Pydantic model for serializing `BoundArguments`."""
+
+  model_config = pydantic.ConfigDict(from_attributes=True)
+
+  op: pydantic_lib.AnyInstanceOf[Op]
+  arguments: dict[str, Any]
+
+  @pydantic.field_serializer("arguments")
+  def serialize_arguments(self, value: dict[str, Any]) -> dict[str, Any]:
+    model_name = f"{type(self.op).__name__}Spec"
+    spec_model = pydantic_lib.get_arg_spec_model(model_name, self.op.signature)  # pytype: disable=attribute-error
+    return spec_model(**value).model_dump()
+
+  @pydantic.field_validator("arguments", mode="before")
+  @classmethod
+  def validate_args(
+      cls, value: dict[str, Any], info: pydantic.ValidationInfo
+  ) -> dict[str, Any]:
+    op = info.data["op"]
+    model_name = f"{type(op).__name__}Spec"
+    spec_model = pydantic_lib.get_arg_spec_model(model_name, op.signature)
+    return dict(spec_model.model_validate(value))
 
 
 custom_abstractify_mappings = {}

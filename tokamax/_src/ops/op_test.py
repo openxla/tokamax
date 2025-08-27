@@ -31,7 +31,7 @@ _AUTOTUNE_CONFIG = object()
 
 class _FakeOp(op.Op[Any, jax.Array, types.NoneType, object, Any]):
 
-  def _fwd(self, x, y, *, return_residuals, config):
+  def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
     assert not return_residuals
     assert x.shape == y.shape, f"{x.shape} != {y.shape}"
     return x + y, None
@@ -141,6 +141,14 @@ class BoundArgumentsTest(absltest.TestCase):
     y = jnp.ones((1, 2))
     y1 = jnp.ones((1, 2))
     self.assertEqual(hash(_FakeOp().bind(x, y)), hash(_FakeOp().bind(x1, y1)))
+
+  def test_json_roundtrip(self):
+    x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=(0, 1))
+    y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=(0, 1))
+    ba = _FakeOp().bind(x, y)
+    json_data = op.BoundArgumentsModel.model_validate(ba).model_dump_json()
+    ba_roundtrip = op.BoundArgumentsModel.model_validate_json(json_data)
+    self.assertEqual(ba, op.BoundArguments(**dict(ba_roundtrip)))
 
 
 if __name__ == "__main__":
