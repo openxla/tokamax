@@ -44,8 +44,8 @@ QuantizedArray = quantization.QuantizedArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
 _WGMMA = plgpu.Layout.WGMMA
-_WGMMA_ROW = plgpu.Layout.WGMMA_ROW
-_WGMMA_COL = plgpu.Layout.WGMMA_COL
+_WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
+_WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 
 
 @dataclasses.dataclass(frozen=True)
