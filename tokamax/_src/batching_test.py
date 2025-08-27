@@ -99,8 +99,8 @@ class BatchingTest(parameterized.TestCase):
     self.assertEqual(seen_batched_args[-1], expected_batched_args)
     self.assertEqual(seen_batched_kwargs[-1], expected_batched_kwargs)
 
-  def test_simple_equality(self):
-    x_jax = jax.ShapeDtypeStruct((3, 4), jnp.float32)
+  def test_batched_shape_dtype_equality(self):
+    x = jax.ShapeDtypeStruct((3, 4), jnp.float32)
     x_batched = batching.BatchedShapeDtype((3, 4), jnp.float32, vmap_axes=())
     x_batched_vmap = batching.BatchedShapeDtype(
         (3, 4), jnp.float32, vmap_axes=(0,)
@@ -108,12 +108,12 @@ class BatchingTest(parameterized.TestCase):
 
     self.assertEqual(x_batched, x_batched)
     self.assertEqual(x_batched_vmap, x_batched_vmap)
-
-    self.assertEqual(x_batched, x_jax)
-    self.assertEqual(x_jax, x_batched)
-
+    self.assertEqual(x_batched, x)
+    self.assertEqual(x, x_batched)
     self.assertNotEqual(x_batched, x_batched_vmap)
     self.assertNotEqual(x_batched_vmap, x_batched)
+    self.assertNotEqual(x, x_batched_vmap)
+    self.assertNotEqual(x_batched_vmap, x)
 
 
 if __name__ == '__main__':

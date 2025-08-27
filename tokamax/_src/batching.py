@@ -127,10 +127,9 @@ class BatchedShapeDtype(jax.ShapeDtypeStruct):
   def __eq__(self, other):
     if not isinstance(other, jax.ShapeDtypeStruct):
       return False
-    return super().__eq__(other) and (
-        not isinstance(other, BatchedShapeDtype)
-        or (self.vmap_axes == other.vmap_axes)
-    )
+    if isinstance(other, BatchedShapeDtype):
+      return super().__eq__(other) and (self.vmap_axes == other.vmap_axes)
+    return super().__eq__(other) and not self.vmap_axes
 
   def __hash__(self):
     return hash((super().__hash__(), self.vmap_axes))
