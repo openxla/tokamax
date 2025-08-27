@@ -20,6 +20,7 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import pydantic
+from tokamax._src import batching
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import utils
 from tokamax._src.ops import op as op_base
@@ -96,6 +97,17 @@ class PydanticTest(parameterized.TestCase):
     config = pydantic.ConfigDict(arbitrary_types_allowed=True)
     adapter = pydantic.TypeAdapter(pydantic_lib.annotate(typ), config=config)
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+
+  @parameterized.parameters(
+      (jax.ShapeDtypeStruct((1, 2), jnp.float32)),
+      (jax.ShapeDtypeStruct((3, 4), jnp.int4),),
+      (batching.BatchedShapeDtype((5, 6, 7), jnp.int8, vmap_axes=(0, 1)),),
+      (batching.BatchedShapeDtype((8, 9), jnp.int8, vmap_axes=()),),
+  )
+  def test_shape_dtype_roundtrip(self, shape):
+    config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+    adapter = pydantic.TypeAdapter(pydantic_lib.ShapeDtype, config=config)
+    self.assertEqual(shape, adapter.validate_json(adapter.dump_json(shape)))
 
   def test_abstract_dataclass_roundtrip(self):
     shape = jax.ShapeDtypeStruct((1, 2), dtype=jnp.float32)

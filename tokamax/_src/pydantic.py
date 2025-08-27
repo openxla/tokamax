@@ -19,6 +19,7 @@ import dataclasses
 import enum
 import importlib
 import inspect
+import re
 import types
 import typing
 from typing import Annotated, Any, Final, TypeAlias, Union
@@ -29,6 +30,7 @@ import jax.numpy as jnp
 import jaxtyping
 import numpy as np
 import pydantic
+from tokamax._src import batching
 
 
 def _int_power_of_two(n: int) -> int:
@@ -125,23 +127,35 @@ _SHORT_DTYPE_NAMES_MAP: Final[
 )
 
 
-# TODO: Support `BatchedShapeDtype`.
 def _serialize_shape_dtype(x) -> str:
   if not isinstance(x, jax.ShapeDtypeStruct):
     raise ValueError(f'Invalid ShapeDtype: {x}')
-  return jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
+  s = jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
+  if not (isinstance(x, batching.BatchedShapeDtype) and x.vmap_axes):
+    return s
+  axes_str = str(Axes.dump_json(x.vmap_axes), 'utf-8')
+  return ''.join([s, '{vmap_axes=', axes_str, '}'])
+
+
+_SHAPE_DTYPE_PATTERN = re.compile(r'(.*?)(\[.*?\])(\{vmap_axes=(\[.*\])\})?')
 
 
 def _validate_shape_dtype(x) -> jax.ShapeDtypeStruct:
   if isinstance(x, jax.ShapeDtypeStruct):
     return x
-  elif not isinstance(x, str) or (idx := x.find('[')) == -1:
+  if not isinstance(x, str) or (match := _SHAPE_DTYPE_PATTERN.match(x)) is None:
     raise ValueError(f'Invalid ShapeDtype: {x}')
-  shape = Shape.validate_json(x[idx:])
-  return jax.ShapeDtypeStruct(shape, _SHORT_DTYPE_NAMES_MAP[x[:idx]])
+  dtype_str, shape_str, _, vmap_axes_str = match.groups()
+  shape = Shape.validate_json(shape_str)
+  dtype = _SHORT_DTYPE_NAMES_MAP[dtype_str]
+  if vmap_axes_str is None:
+    return jax.ShapeDtypeStruct(shape, dtype)
+  vmap_axes = Axes.validate_json(vmap_axes_str)
+  return batching.BatchedShapeDtype(shape, dtype, vmap_axes=vmap_axes)
 
 
 Shape = pydantic.TypeAdapter(tuple[int, ...])
+Axes = pydantic.TypeAdapter(tuple[int, ...])
 ShapeDtype = Annotated[
     jax.ShapeDtypeStruct,
     pydantic.PlainSerializer(_serialize_shape_dtype),
