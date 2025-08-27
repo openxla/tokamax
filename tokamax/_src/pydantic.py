@@ -22,7 +22,7 @@ import inspect
 import re
 import types
 import typing
-from typing import Annotated, Any, Final, TypeAlias, Union
+from typing import Annotated, Any, Final, Generic, TypeAlias, TypeVar, Union
 
 import immutabledict
 import jax
@@ -210,6 +210,36 @@ def abstractify(typ):
 
 
 # pytype: enable=invalid-annotation
+
+
+_T = TypeVar('_T')
+
+
+class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
+  """Annotates a type, allowing serialization of any instance of the given type.
+
+  The value is serialized with the type name, allowing it to be deserialized
+  as the corresponding type.
+  """
+
+  @classmethod
+  def __class_getitem__(cls, base_type: type[_T]) -> type[_T]:  # pylint: disable=arguments-renamed
+    def serialize(value: _T, handler) -> dict[str, Any]:
+      data = handler(value)
+      data['__type'] = _serialize_named_object(type(value))
+      return data
+
+    def validate(data: _T | dict[str, Any]) -> _T:
+      if isinstance(data, base_type):
+        return data
+      ty: type[_T] = _validate_named_object(data.pop('__type'))  # pytype: disable=attribute-error
+      return pydantic.TypeAdapter(ty).validate_python(data)
+
+    return Annotated[
+        pydantic.InstanceOf[base_type],  # pytype: disable=unsupported-operands
+        pydantic.WrapSerializer(serialize),
+        pydantic.PlainValidator(validate),
+    ]
 
 
 def get_arg_spec_model(

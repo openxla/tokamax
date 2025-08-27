@@ -58,6 +58,17 @@ class _MyDataclass:
   metadata: int
 
 
+@dataclasses.dataclass(frozen=True)
+class _MyDataclass2:
+  foo: int
+  bar: str
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _MyDataclass2Sub(_MyDataclass2):
+  baz: int
+
+
 class _Foo:
   pass
 
@@ -122,6 +133,14 @@ class PydanticTest(parameterized.TestCase):
     adapter = pydantic.TypeAdapter(
         pydantic_lib.abstractify(tuple[jax.Array, int]), config=config
     )
+    self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+
+  @parameterized.parameters(
+      (_MyDataclass2(foo=42, bar="baz"),),
+      (_MyDataclass2Sub(foo=42, bar="baz", baz=43),),
+  )
+  def test_any_instance_of_roundtrip(self, data):
+    adapter = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[_MyDataclass2])
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
   @parameterized.named_parameters(
