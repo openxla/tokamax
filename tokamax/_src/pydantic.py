@@ -22,7 +22,7 @@ import inspect
 import re
 import types
 import typing
-from typing import Annotated, Any, Final, Generic, TypeAlias, TypeVar, Union
+from typing import Annotated, Any, Final, Generic, TypeAlias, TypeVar, Union, cast
 
 import immutabledict
 import jax
@@ -225,18 +225,16 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
   @classmethod
   def __class_getitem__(cls, base_type: type[_T]) -> type[_T]:  # pylint: disable=arguments-renamed
     def serialize(value: _T, handler) -> dict[str, Any]:
-      data = handler(value)
-      data['__type'] = _serialize_named_object(type(value))
-      return data
+      return dict(__type=_serialize_named_object(type(value))) | handler(value)
 
-    def validate(data: _T | dict[str, Any]) -> _T:
+    def validate(data: Any) -> _T:
       if isinstance(data, base_type):
         return data
-      ty: type[_T] = _validate_named_object(data.pop('__type'))  # pytype: disable=attribute-error
+      ty = _validate_named_object(cast(dict[str, Any], data).pop('__type'))
       return pydantic.TypeAdapter(ty).validate_python(data)
 
     return Annotated[
-        pydantic.InstanceOf[base_type],  # pytype: disable=unsupported-operands
+        pydantic.InstanceOf[pydantic.SerializeAsAny[base_type]],  # pytype: disable=unsupported-operands
         pydantic.WrapSerializer(serialize),
         pydantic.PlainValidator(validate),
     ]

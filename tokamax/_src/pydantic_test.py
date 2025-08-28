@@ -141,6 +141,7 @@ class PydanticTest(parameterized.TestCase):
   )
   def test_any_instance_of_roundtrip(self, data):
     adapter = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[_MyDataclass2])
+    self.assertEqual(data, adapter.validate_python(adapter.dump_python(data)))
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
   def test_dict_roundtrip(self):
