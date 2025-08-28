@@ -430,7 +430,7 @@ class Config:
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
   """Pallas-Triton FlexAttention implementation."""
-
+  config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = False
   use_stable_softmax: bool = True

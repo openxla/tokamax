@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import TypeAlias
+from typing import ClassVar, TypeAlias
 
 import jax
 from jax.experimental import pallas as pl
@@ -79,6 +79,7 @@ def _normalization_vjp_kernel(
 @dataclasses.dataclass(frozen=True)
 class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
   """Pallas-Triton normalization VJP."""
+  config_cls: ClassVar[type[Config]] = Config
 
   def _fwd(
       self,

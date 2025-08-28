@@ -713,7 +713,7 @@ class PallasMosaicGpuFlashAttentionVjp(
     base.DotProductAttentionVjp[Config, None]
 ):
   """Pallas-Triton FlashAttention VJP implementation."""
-
+  config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = False
 

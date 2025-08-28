@@ -101,7 +101,7 @@ def _get_best_block_size(m: int, n: int) -> tuple[int, int, int]:
 @dataclasses.dataclass(frozen=True)
 class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
   """Pallas-Triton gated linear unit."""
-
+  config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
 
   def _fwd(

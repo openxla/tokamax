@@ -14,7 +14,7 @@
 # ==============================================================================
 
 import types
-from typing import Any
+from typing import Any, ClassVar
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -30,6 +30,7 @@ _AUTOTUNE_CONFIG = object()
 
 
 class _FakeOp(op.Op[Any, jax.Array, types.NoneType, object, Any]):
+  config_cls: ClassVar[type[object]] = object
 
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
     assert not return_residuals

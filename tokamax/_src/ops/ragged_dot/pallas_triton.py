@@ -331,7 +331,7 @@ _DLHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
   """Pallas-Triton ragged dot implementation."""
-
+  config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   split_k_intermediate_dtype: jax.typing.DTypeLike | None = None
 

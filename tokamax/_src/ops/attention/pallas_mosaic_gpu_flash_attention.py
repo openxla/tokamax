@@ -554,7 +554,7 @@ _SUPPORTED_PRECISIONS = (
 @dataclasses.dataclass(frozen=True)
 class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   """Flash attention with Mosaic GPU."""
-
+  config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = True
   use_stable_softmax: bool | type[base.AUTO] = base.AUTO

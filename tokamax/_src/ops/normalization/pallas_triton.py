@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import TypeAlias
+from typing import ClassVar, TypeAlias
 
 import jax
 from jax.experimental import pallas as pl
@@ -81,10 +81,10 @@ def _normalization_kernel(
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasTritonNormalization(base.Normalization[Config, Key]):
   """Pallas-Triton normalization op."""
-
+  config_cls: ClassVar[type[Config]] = Config
+  supports_symbolic_shapes: ClassVar[bool] = False
   # If `None`, `input_output_alias = not return_residuals`.
   input_output_alias: bool | None = None
-  supports_symbolic_shapes: bool = False
 
   def __post_init__(self):
     if self.vjp is None:

@@ -96,6 +96,10 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       `_get_autotuning_configs`.
     - Optionally, set a default `vjp` function.
   """
+  config_cls: ClassVar[type[_Config]] = NullConfig
+  # Whether an op allows abstract inputs with `jax.export.symbolic_shape`
+  # instances in array shapes.
+  supports_symbolic_shapes: ClassVar[bool] = True
 
   config: _Config | None = None
   _: dataclasses.KW_ONLY
@@ -105,10 +109,6 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
   # argument, or a dict `{"argname": gradient, ...}`. If a dict is returned, any
   # input array arguments not in the dict will have gradients set to zeros.
   vjp: Callable[Concatenate[_Residuals, _T, _T, _P], Any] | None = None
-
-  # Whether an op allows abstract inputs with `jax.export.symbolic_shape`
-  # instances in array shapes.
-  supports_symbolic_shapes: ClassVar[bool] = True
 
   @overload
   def __call__(

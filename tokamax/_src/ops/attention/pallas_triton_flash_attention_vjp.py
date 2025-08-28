@@ -478,7 +478,7 @@ def _bwd(
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   """Pallas-Triton FlashAttention VJP implementation."""
-
+  config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
 
   def _fwd(

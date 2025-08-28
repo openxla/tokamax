@@ -527,7 +527,7 @@ class Config:
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
   """Pallas-Triton FlashAttention implementation."""
-
+  config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = False
   use_stable_softmax: bool | type[base.AUTO] = base.AUTO
