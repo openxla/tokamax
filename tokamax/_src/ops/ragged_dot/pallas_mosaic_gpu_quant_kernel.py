@@ -72,18 +72,27 @@ def ragged_dot_quantized_kernel_body(
         plgpu.SwizzleTransform(swizzle_w),
     )
     x_spec = plgpu.BlockSpec(
-        (block_m, block_k), lambda ki: (0, ki), transforms=x_transforms
+        (block_m, block_k),
+        lambda ki: (0, ki),
+        transforms=x_transforms,
+        delay_release=1,
     )
     w_spec = plgpu.BlockSpec(
-        (block_n, block_k), lambda ki: (ni, ki), transforms=w_transforms
+        (block_n, block_k),
+        lambda ki: (ni, ki),
+        transforms=w_transforms,
+        delay_release=1,
     )
-    w_scales_spec = plgpu.BlockSpec((1, block_n), lambda ki: (ki, ni))
+    w_scales_spec = plgpu.BlockSpec(
+        (1, block_n),
+        lambda ki: (ki, ni),
+        delay_release=1,
+    )
     plgpu.emit_pipeline(
         pipeline_body,
         grid=(k // block_k,),
         in_specs=(w_spec, x_spec, w_scales_spec),
         max_concurrent_steps=config.num_stages,
-        delay_release=1,
     )(
         w_gmem.at[gi],
         x_gmem.at[pl.ds(group_info.offset, block_m)],
