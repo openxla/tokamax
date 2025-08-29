@@ -17,6 +17,7 @@ import builtins
 from collections.abc import Callable
 import dataclasses
 import enum
+import functools
 import importlib
 import inspect
 import re
@@ -213,6 +214,7 @@ def abstractify(typ):
 
 
 _T = TypeVar('_T')
+get_adapter = functools.lru_cache(pydantic.TypeAdapter)
 
 
 class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
@@ -231,7 +233,7 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
       if isinstance(data, base_type):
         return data
       ty = _validate_named_object(cast(dict[str, Any], data).pop('__type'))
-      return pydantic.TypeAdapter(ty).validate_python(data)
+      return get_adapter(ty).validate_python(data)
 
     return Annotated[
         pydantic.InstanceOf[pydantic.SerializeAsAny[base_type]],  # pytype: disable=unsupported-operands
@@ -255,7 +257,7 @@ class Dict(Generic[_K, _V]):
   @classmethod
   def __class_getitem__(cls, params: tuple[type[_K], type[_V]]) -> type[dict[_K, _V]]:  # pylint: disable=arguments-renamed
     key_cls, value_cls = params
-    adapter = pydantic.TypeAdapter(key_cls)
+    adapter = get_adapter(key_cls)
 
     def serialize(value: dict[_K, _V]) -> dict[str, _V]:
       return {str(adapter.dump_json(k), 'utf-8'): v for k, v in value.items()}
