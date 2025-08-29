@@ -20,6 +20,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+import pydantic
 from tokamax._src import batching
 from tokamax._src import config as config_lib
 from tokamax._src.ops import op
@@ -147,9 +148,8 @@ class BoundArgumentsTest(absltest.TestCase):
     x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=(0, 1))
     y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=(0, 1))
     ba = _FakeOp().bind(x, y)
-    json_data = op.BoundArgumentsModel.model_validate(ba).model_dump_json()
-    ba_roundtrip = op.BoundArgumentsModel.model_validate_json(json_data)
-    self.assertEqual(ba, op.BoundArguments(**dict(ba_roundtrip)))
+    adapter = pydantic.TypeAdapter(op.PydanticBoundArguments)
+    self.assertEqual(ba, adapter.validate_json(adapter.dump_json(ba)))
 
 
 if __name__ == "__main__":

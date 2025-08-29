@@ -18,11 +18,12 @@ import abc
 from collections.abc import Callable, Mapping
 import copy
 import dataclasses
+import functools
 import inspect
 import json
 import re
 import threading
-from typing import Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
+from typing import Annotated, Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
 
 from absl import logging
 import immutabledict
@@ -493,6 +494,8 @@ class BoundArguments(Generic[_Config, _Key]):
   def __hash__(self) -> int:
     return hash((self.op, immutabledict.immutabledict(self._hash_args)))
 
+  __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class _HashableArray:
@@ -508,30 +511,31 @@ class _HashableArray:
     return hash((self.value.shape, self.value.dtype))
 
 
-class BoundArgumentsModel(pydantic.BaseModel):
-  """Pydantic model for serializing `BoundArguments`."""
+_ANY_OP_ADAPTER = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[Op])
 
-  model_config = pydantic.ConfigDict(from_attributes=True)
 
-  op: pydantic_lib.AnyInstanceOf[Op]
-  arguments: dict[str, Any]
+@functools.lru_cache
+def _get_arg_spec_model(op: Op) -> type[pydantic.BaseModel]:
+  model_name = f"{type(op).__name__}Spec"
+  return pydantic_lib.get_arg_spec_model(model_name, op.signature)
 
-  @pydantic.field_serializer("arguments")
-  def serialize_arguments(self, value: dict[str, Any]) -> dict[str, Any]:
-    model_name = f"{type(self.op).__name__}Spec"
-    spec_model = pydantic_lib.get_arg_spec_model(model_name, self.op.signature)  # pytype: disable=attribute-error
-    return spec_model(**value).model_dump()
 
-  @pydantic.field_validator("arguments", mode="before")
-  @classmethod
-  def validate_args(
-      cls, value: dict[str, Any], info: pydantic.ValidationInfo
-  ) -> dict[str, Any]:
-    op = info.data["op"]
-    model_name = f"{type(op).__name__}Spec"
-    spec_model = pydantic_lib.get_arg_spec_model(model_name, op.signature)
-    return dict(spec_model.model_validate(value))
+def _serialize_bound_args(value: BoundArguments) -> dict[str, Any]:
+  arguments = _get_arg_spec_model(value.op)(**value.arguments)
+  return dict(op=_ANY_OP_ADAPTER.dump_python(value.op), arguments=arguments)
 
+
+def _validate_bound_args(data: dict[str, Any]) -> BoundArguments:
+  op = _ANY_OP_ADAPTER.validate_python(data["op"])
+  arguments = dict(_get_arg_spec_model(op)(**data["arguments"]))
+  return BoundArguments(op, arguments)
+
+
+PydanticBoundArguments = Annotated[
+    BoundArguments[_Config, _Key],
+    pydantic.PlainSerializer(_serialize_bound_args),
+    pydantic.PlainValidator(_validate_bound_args),
+]
 
 custom_abstractify_mappings = {}
 
