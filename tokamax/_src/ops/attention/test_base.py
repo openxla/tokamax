@@ -174,7 +174,7 @@ def _ref_impl_tanh(
   attn_weights = jnp.einsum("...qhd,...khd->...hqk", q, k, precision=precision)
   if bias is not None:
     attn_weights += bias
-  attn_weights = logits_soft_cap * jnp.tanh(attn_weights / logits_soft_cap)
+  attn_weights = logits_soft_cap * jnp.tanh(attn_weights / logits_soft_cap)  # pytype: disable=unsupported-operands,wrong-arg-types  # jax-operator-types
   if mask is not None:
     min_value = float(jnp.finfo(attn_weights.dtype).min)
     attn_weights = jnp.where(mask, attn_weights, min_value)

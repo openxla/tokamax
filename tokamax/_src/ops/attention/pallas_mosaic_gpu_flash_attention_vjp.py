@@ -549,7 +549,7 @@ def _bwd(
       delta = plgpu.load(delta_smem, (), layout=L.WGMMA.reduce(0))
       plgpu.barrier_arrive(delta_consumed_barrier)
 
-      dsT = pT * (dpT - broadcast(delta))
+      dsT = pT * (dpT - broadcast(delta))  # pytype: disable=wrong-arg-types  # jax-operator-types
       dsT *= logits_scale
 
       def compute_dk(acc_ref):
