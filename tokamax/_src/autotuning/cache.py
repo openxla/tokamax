@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 """Tokamax autotuning cache."""
-from __future__ import annotations
-
 from typing import Any, TypeAlias
 
 from tokamax._src.autotuning import autotuner
@@ -32,9 +30,9 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
   directory containing the cache files can be specified using TODO!!!
   """
 
-  def __init__(self, op_name: str):
+  def __init__(self, op):
     super().__init__()
-    self._op_name = op_name
+    self.op = op
 
   def __missing__(self, device_kind: DeviceKind) -> DeviceAutotuningCache:
     self[device_kind] = (cache := self._load_cache(device_kind))

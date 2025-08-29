@@ -21,7 +21,6 @@ import dataclasses
 import functools
 import inspect
 import json
-import re
 import threading
 from typing import Annotated, Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
 
@@ -226,9 +225,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     self_no_vjp = copy.copy(self)
     object.__setattr__(self_no_vjp, "vjp", None)
     if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
-      # PascalCase to snake_case.
-      name = re.sub(r"(?!^)([A-Z])", r"_\1", type(self).__name__).lower()
-      cache = autotuning_cache.AutotuningCache(name)
+      cache = autotuning_cache.AutotuningCache(self_no_vjp)
       _AUTOTUNING_CACHE[self_no_vjp] = cache
     if device_kind is None:
       device_kind = backend.get_default_device().device_kind

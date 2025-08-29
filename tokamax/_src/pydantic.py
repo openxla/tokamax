@@ -14,7 +14,7 @@
 # ==============================================================================
 """Pydantic types and utilities."""
 import builtins
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import dataclasses
 import enum
 import functools
@@ -88,6 +88,8 @@ def annotate(typ) -> Any:
     return Union[tuple(map(annotate, typing.get_args(typ)))]
   if typing.get_origin(typ) in (type, Callable):
     return Annotated[typ, _NamedObjectSerializer, _NamedObjectValidator]
+  if typing.get_origin(typ) is Sequence:
+    return Annotated[typ, pydantic.AfterValidator(tuple)]
   # The default enum serialization, using the value, often leads to an ambiguous
   # serialization within unions, so use the name instead (also more readable).
   if issubclass(typ, enum.Enum):
@@ -246,7 +248,7 @@ _K = TypeVar('_K')
 _V = TypeVar('_V')
 
 
-class Dict(Generic[_K, _V]):
+class Dict(dict[_K, _V]):
   """Annotates a dictionary to allow JSON serialization.
 
   JSON requires dictionary keys to be strings. Pydantic will coerce non-string
