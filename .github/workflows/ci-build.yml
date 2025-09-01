@@ -20,7 +20,7 @@ concurrency:
 # These jobs should build the Tokamax wheel and run the tests on Google Cloud resources. Rigth now
 # all the jobs are GPU jobs and TPU ones will be added later.
 jobs: 
-  build:
+  tokamax-presubmit:
     strategy:
       matrix:
         runner: [
@@ -36,7 +36,6 @@ jobs:
                          'pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ tokamax/_src/ops',
                          'pytest -s --ignore-glob="tokamax/_src/ops/*" tokamax',
                         ]
-    name: "Tokamax Presubmit"
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
