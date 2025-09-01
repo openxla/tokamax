@@ -28,7 +28,6 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention
 from tokamax._src.ops.attention import pallas_triton_flash_attention
 from tokamax._src.ops.attention import xla_chunked
 
-
 QuantizedArray = quantization.QuantizedArray
 Implementation: TypeAlias = Literal[
     "mosaic", "triton", "cudnn", "xla", "xla_chunked"
@@ -69,6 +68,7 @@ def dot_product_attention(
     key_value_seq_lengths: Int[Array, "*#B"] | None = None,
     local_window_size: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
+    precision: jax.lax.PrecisionLike = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> Float[Array, "*B T N h"]:  # pylint: disable=g-doc-args
   """Scaled dot product attention function.
@@ -89,8 +89,9 @@ def dot_product_attention(
 
   Args:
     logits_soft_cap: If not `None`, perform `logits = logits_soft_cap *
-        tanh(logits / logits_soft_cap)`, where `logits` are `scale *
-        query @ key.T + bias`.
+      tanh(logits / logits_soft_cap)`, where `logits` are `scale * query @ key.T
+      + bias`.
+    precision: The precision to use for the dot products.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -145,6 +146,7 @@ def dot_product_attention(
           bias=bias,
           mask=mask,
           logits_scale=scale,
+          precision=precision,
           logits_soft_cap=logits_soft_cap,
       )
     except NotImplementedError as e:

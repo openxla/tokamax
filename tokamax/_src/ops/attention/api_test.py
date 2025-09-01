@@ -339,6 +339,23 @@ class DotProductAttentionCudnnTest(DotProductAttentionTest):
 class DotProductAttentionXlaTest(DotProductAttentionTest):
   IMPL = 'xla'
 
+  def test_precision(self):
+    if jax.default_backend() == 'cpu':
+      self.skipTest('XLA:CPU does not properly respect precision.')
+
+    x = jax.random.normal(jax.random.PRNGKey(0), (1, 16, 2, 16), jnp.float32)
+
+    @functools.partial(jax.jit, static_argnames=['precision'])
+    def f(x, precision):
+      return api.dot_product_attention(
+          x, x, x, implementation='xla', precision=precision
+      )
+
+    out_1 = f(x, jax.lax.Precision.HIGHEST)
+    out_2 = f(x, jax.lax.DotAlgorithmPreset.BF16_BF16_F32)
+    equal = bool(jnp.array_equal(out_1, out_2))
+    self.assertFalse(equal)
+
 
 class DotProductAttentionXlaChunkedTest(DotProductAttentionTest):
   IMPL = 'xla_chunked'

@@ -37,7 +37,6 @@ class AUTO:  # Used as a sentinel value.
   pass
 
 
-DotPrecisionLike = jax.lax.Precision | jax.lax.DotAlgorithmPreset
 QuantizedArray = quantization.QuantizedArray
 
 
@@ -225,7 +224,8 @@ class DotProductAttention(
       v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: (
-          DotPrecisionLike | tuple[DotPrecisionLike, DotPrecisionLike]
+          jax.lax.PrecisionLike
+          | tuple[jax.lax.PrecisionLike, jax.lax.PrecisionLike]
       ) = ...,
       logits_dtype: DTypeLike | type[AUTO] = ...,
       logits_scale: float | type[AUTO] = ...,
@@ -253,7 +253,8 @@ class DotProductAttention(
       v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: (
-          DotPrecisionLike | tuple[DotPrecisionLike, DotPrecisionLike]
+          jax.lax.PrecisionLike
+          | tuple[jax.lax.PrecisionLike, jax.lax.PrecisionLike]
       ) = ...,
       logits_dtype: DTypeLike | type[AUTO] = ...,
       logits_scale: float | type[AUTO] = ...,
@@ -281,7 +282,8 @@ class DotProductAttention(
       v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: (
-          DotPrecisionLike | tuple[DotPrecisionLike, DotPrecisionLike]
+          jax.lax.PrecisionLike
+          | tuple[jax.lax.PrecisionLike, jax.lax.PrecisionLike]
       ) = jax.lax.Precision.DEFAULT,
       logits_dtype: DTypeLike | type[AUTO] = AUTO,
       logits_scale: float | type[AUTO] = AUTO,
@@ -483,7 +485,8 @@ class DotProductAttention(
       v: Float[Array | QuantizedArray, "*b t h d"],
       *,
       precision: (
-          DotPrecisionLike | tuple[DotPrecisionLike, DotPrecisionLike]
+          jax.lax.PrecisionLike
+          | tuple[jax.lax.PrecisionLike, jax.lax.PrecisionLike]
       ) = jax.lax.Precision.DEFAULT,
       logits_dtype: DTypeLike | type[AUTO] = AUTO,
       logits_scale: float | type[AUTO] = AUTO,
