@@ -34,6 +34,10 @@ class JaxtypingTest(parameterized.TestCase):
     with self.assertRaises(jt.TypeCheckError):
       f(x).block_until_ready()
 
+    with self.assertRaises(jt.TypeCheckError):
+      with jaxtyping.disable_jaxtyping(disable=False):
+        f(x).block_until_ready()
+
     with jaxtyping.disable_jaxtyping():
       f(x).block_until_ready()
 

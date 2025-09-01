@@ -27,12 +27,12 @@ jaxtyped = jaxtyping.jaxtyped(typechecker=typeguard.typechecked)
 
 
 @contextlib.contextmanager
-def disable_jaxtyping():
+def disable_jaxtyping(disable: bool = True):
   """Disables jaxtyping for the duration of the context."""
 
   current_context = jaxtyping.config.jaxtyping_disable
   try:
-    jaxtyping.config.update("jaxtyping_disable", True)
+    jaxtyping.config.update("jaxtyping_disable", disable)
     yield
   finally:
     jaxtyping.config.update("jaxtyping_disable", current_context)
