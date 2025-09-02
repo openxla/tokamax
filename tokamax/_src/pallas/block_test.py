@@ -22,7 +22,10 @@ from jax.experimental import pallas as pl
 import jax.numpy as jnp
 from tokamax._src.pallas import block
 
-_SKIP_TPU_TEST_REASON = "Test broken on TPU due to blockspec shape TPU constraints."
+_SKIP_TPU_TEST_REASON = (
+    "Test broken on TPU due to blockspec shape TPU constraints. Will fix in"
+    " separate update."
+)
 
 
 class BlockTest(parameterized.TestCase):
