@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import dataclasses
-import functools
-import json
 import types
 from typing import Any
 
@@ -22,7 +19,6 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 from tokamax._src import benchmarking
-from tokamax._src import serialization
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_base
@@ -48,12 +44,9 @@ class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, object, Any]):
 
 @jax.jit
 def tokamax_norm_and_glu(x, scale, offset, weights):
-  pt_normalization = functools.partial(
-      pl_norm.PallasTritonNormalization(), axis=(-1)
-  )
-  normalized_x = pt_normalization(x, scale, offset)
+  norm_x = pl_norm.PallasTritonNormalization()(x, scale, offset)
   glu_x = pl_glu.PallasTritonGatedLinearUnit()(
-      x=normalized_x, weights=weights, activation=jax.nn.swish
+      x=norm_x, weights=weights, activation=jax.nn.swish
   )
   return jnp.sum(glu_x)
 
@@ -70,6 +63,23 @@ def get_lowered_norm_and_glu(x_shape):
 
   f_lowered = tokamax_norm_and_glu.lower(x, scale, offset, weights)
   return f_lowered
+
+
+def get_expected_bound_args(x_shape):
+  return (
+      pl_norm.PallasTritonNormalization().bind(  # pytype: disable=wrong-arg-types
+          x=jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16),
+          scale=jax.ShapeDtypeStruct((x_shape[-1],), dtype=jnp.bfloat16),
+          offset=jax.ShapeDtypeStruct((x_shape[-1],), dtype=jnp.bfloat16),
+      ),
+      pl_glu.PallasTritonGatedLinearUnit().bind(  # pytype: disable=wrong-arg-types
+          x=jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16),
+          weights=jax.ShapeDtypeStruct(
+              (x_shape[-1], 2, x_shape[-1]), dtype=jnp.bfloat16
+          ),
+          activation=jax.nn.swish,
+      ),
+  )
 
 
 # TODO: Make autotuning work for both GPU and TPU.
@@ -92,31 +102,14 @@ class AutotuningTest(absltest.TestCase):
 
   def test_get_bound_args_from_lowered(self):
     x_shape = (64, 128)
+    expected = get_expected_bound_args(x_shape)
     f_lowered = get_lowered_norm_and_glu(x_shape)
+    self.assertEqual(api.get_bound_args(f_lowered), expected)
 
-    bound_args = api.get_bound_args(f_lowered)
-    self.assertLen(bound_args, 2)
-    self.assertIsInstance(bound_args[0].op, pl_norm.PallasTritonNormalization)
-    self.assertIsInstance(bound_args[1].op, pl_glu.PallasTritonGatedLinearUnit)
-
-    # Test Serialization/Deserialization round trip.
-    for bound_arg in bound_args:
-      # TODO For GLU, we need to remove the activation argument from the
-      # bound args because jitted JAX functions cannot be serialized.
-      if "activation" in bound_arg.arguments:
-        arguments = dict(bound_arg.arguments)
-        arguments.pop("activation")
-        bound_arg = dataclasses.replace(bound_arg, arguments=arguments)
-      dump_str = json.dumps(bound_arg, cls=serialization.JsonEncoder)
-      loaded_bound_arg = json.loads(dump_str, cls=serialization.JsonDecoder)
-      self.maxDiff = None
-      self.assertEqual(bound_arg.op, loaded_bound_arg.op)
-      self.assertEqual(bound_arg.arguments, loaded_bound_arg.arguments)
-
-  def test_get_bound_args(self):
+  def test_get_bound_args_from_hlo(self):
     x_shape = (64, 128)
+    expected = get_expected_bound_args(x_shape)
     f_lowered = get_lowered_norm_and_glu(x_shape)
-
     hlo_modules = f_lowered.compile().runtime_executable().hlo_modules()
     hlo_modules = [
         hlo_pb2.HloModuleProto.FromString(hlo.as_serialized_hlo_module_proto())
@@ -126,44 +119,25 @@ class AutotuningTest(absltest.TestCase):
     # Replicate the HLO modules multiple times to ensure that the bound args are
     # unique.
     hlo_modules = hlo_modules * 10
-    bound_args = api.get_bound_args(hlo_modules)
-    self.assertLen(bound_args, 2)
-    self.assertIsInstance(bound_args[0].op, pl_norm.PallasTritonNormalization)
-    self.assertIsInstance(bound_args[1].op, pl_glu.PallasTritonGatedLinearUnit)
+    self.assertEqual(api.get_bound_args(hlo_modules), expected)
 
   def test_autotune(self):
     x_shape = (64, 128)
+    expected_bound_args = get_expected_bound_args(x_shape)
     f_lowered = get_lowered_norm_and_glu(x_shape)
+    bound_args = api.get_bound_args(f_lowered)
+    result = api.autotune(bound_args, all_implementations=False)
+    self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+    self.assertEqual(tuple(x[0] for x in result.data), expected_bound_args)
 
-    autotuned_results = api.autotune(
-        api.get_bound_args(f_lowered), all_implementations=False
-    )
-    self.assertLen(autotuned_results.data, 2)
-    self.assertIsInstance(
-        autotuned_results.data[0][0].op, pl_norm.PallasTritonNormalization
-    )
-    self.assertIsInstance(
-        autotuned_results.data[1][0].op, pl_glu.PallasTritonGatedLinearUnit
-    )
+    result_all_impls = api.autotune(api.get_bound_args(f_lowered))
+    self.assertGreaterEqual(len(result_all_impls.data), len(result.data))
 
-    # TODO For GLU, we need to remove the activation argument from the
-    # bound args because jitted JAX functions cannot be serialized.
-    if "activation" in autotuned_results.data[1][0].arguments:
-      data = list(autotuned_results.data)
-      arguments = dict(data[1][0].arguments)
-      arguments.pop("activation")
-      new_bound_arg = dataclasses.replace(data[1][0], arguments=arguments)
-      data[1] = (new_bound_arg, data[1][1])
-      autotuned_results = dataclasses.replace(
-          autotuned_results, data=tuple(data)
-      )
-
-    all_api_autotuned_results = api.autotune(
-        api.get_bound_args(f_lowered), all_implementations=True
-    )
-    self.assertGreaterEqual(
-        len(all_api_autotuned_results.data), len(autotuned_results.data)
-    )
+    tempfile = self.create_tempfile("autotuning_results.json")
+    with open(tempfile.full_path, "w") as f:
+      result_all_impls.dump(f)
+    with open(tempfile.full_path, "r") as f:
+      self.assertEqual(result_all_impls, api.AutotuningResult.load(f))
 
   def test_autotuning_result_context(self):
     op = _FakeOp()

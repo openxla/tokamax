@@ -50,6 +50,7 @@ AutotuningData = autotuner_lib.AutotuningData
 DeviceKind = autotuning_cache.DeviceKind
 
 
+@dataclasses.dataclass(frozen=True)  # Make it serializable with pydantic.
 class NullConfig:
   ...
 

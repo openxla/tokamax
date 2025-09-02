@@ -46,6 +46,8 @@ class AutotuningData(immutabledict.immutabledict[_Config, BenchmarkData]):
     return min(self.items(), key=key_fn)[0]
 
   def prune(self) -> Self:
+    if not self:
+      return self
     config = self.fastest_config
     return AutotuningData({config: self[config]})
 

@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Autotuning API."""
+
 from collections.abc import Callable, Mapping
 import dataclasses
 import inspect
-import json
-from typing import Any, Final, Self, Sequence, TypeAlias
+from typing import Annotated, Any, Final, Self, Sequence, TypeAlias
 
 from absl import logging
 import immutabledict
 import jax
+import pydantic
+from tokamax._src import benchmarking
 from tokamax._src import hlo_utils
-from tokamax._src import serialization
+from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_base
 from tokamax._src.ops.attention import api as attention_api
@@ -42,6 +45,34 @@ HloComputation: TypeAlias = (
     | hlo_pb2.HloModuleProto
     | Sequence[hlo_pb2.HloModuleProto]
 )
+BoundArgsAutotuningData: TypeAlias = tuple[
+    op_base.BoundArguments, autotuner.AutotuningData[Any]
+]
+
+
+def _serialize_bound_args_autotuning_data(
+    value: BoundArgsAutotuningData,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+  ba, data = value
+  ba_dict = _BOUND_ARGS_ADAPTER.dump_python(ba)
+  del ba_dict["op"]["config"]
+  del ba_dict["op"]["vjp"]
+  data_adapter = pydantic_lib.get_adapter(
+      pydantic_lib.Dict[ba.op.config_cls, benchmarking.BenchmarkData]
+  )
+  return ba_dict, data_adapter.dump_python(data)
+
+
+def _validate_bound_args_autotuning_data(value: Any) -> BoundArgsAutotuningData:
+  ba, data = value
+  if isinstance(ba, op_base.BoundArguments):
+    assert isinstance(data, autotuner.AutotuningData)
+    return ba, data
+  ba = _BOUND_ARGS_ADAPTER.validate_python(ba)
+  data_adapter = pydantic_lib.get_adapter(
+      pydantic_lib.Dict[ba.op.config_cls, benchmarking.BenchmarkData]
+  )
+  return ba, autotuner.AutotuningData(data_adapter.validate_python(data))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,22 +88,28 @@ class AutotuningResult:
   """
 
   device_kind: str
-  data: tuple[tuple[op_base.BoundArguments, autotuner.AutotuningData[Any]], ...]
+  data: tuple[
+      Annotated[
+          BoundArgsAutotuningData,
+          pydantic.PlainSerializer(_serialize_bound_args_autotuning_data),
+          pydantic.PlainValidator(_validate_bound_args_autotuning_data),
+      ],
+      ...
+  ]
 
   def dump(self, fp):
     fp.write(self.dumps())
 
   def dumps(self) -> str:
-    data = {"device_kind": self.device_kind, "data": self.data}
-    return json.dumps(data, cls=serialization.JsonEncoder)
+    return str(_AUTOTUNING_RESULT_ADAPTER.dump_json(self), "utf-8")
 
   @classmethod
   def load(cls, fp) -> Self:
     return cls.loads(fp.read())
 
   @classmethod
-  def loads(cls, json_str: str) -> Self:
-    return cls(**json.loads(json_str, cls=serialization.JsonDecoder))
+  def loads(cls, json_data: str) -> Self:
+    return _AUTOTUNING_RESULT_ADAPTER.validate_json(json_data)
 
   def __enter__(self):
     overlay = {}
@@ -84,6 +121,12 @@ class AutotuningResult:
 
   def __exit__(self, exc_type, exc_value, traceback):
     op_base.get_autotuning_cache_overlay().pop()
+
+  __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+
+
+_AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
+_BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(op_base.PydanticBoundArguments)
 
 
 def get_bound_args(
@@ -181,7 +224,7 @@ def autotune(
   for bound_arg in bound_args:
     try:
       data.append((bound_arg, bound_arg.autotune()))
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
       logging.exception("Failed to autotune for op %s", bound_arg.op)
       if not ignore_errors:
         raise
