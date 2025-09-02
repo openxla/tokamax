@@ -161,14 +161,6 @@ class PydanticTest(parameterized.TestCase):
       with self.subTest(name):
         spec = model(**op_base._abstractify(_eval_shape(spec)))
         spec_roundtrip = model.model_validate_json(spec.model_dump_json())
-        # Convert lists to tuples.
-        spec_roundtrip = spec_roundtrip.model_copy(
-            update={
-                k: tuple(v)
-                for k, v in spec_roundtrip.model_dump().items()
-                if isinstance(v, list)
-            }
-        )
         self.assertEqual(spec, spec_roundtrip)
 
 
