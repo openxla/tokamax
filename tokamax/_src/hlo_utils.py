@@ -24,6 +24,7 @@ import zlib
 from google.protobuf import json_format
 import immutabledict
 import jax
+from jax import export
 from jax.interpreters.mlir import ir
 import jax.numpy as jnp
 from tokamax._src import serialization
@@ -31,10 +32,17 @@ from tokamax._src.ops import op
 
 from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
-TRITON_PALLAS_KEY: Final[str] = '__gpu$xla.gpu.triton'
-MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
-MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
-TRITON_KEY: Final[str] = 'triton_kernel_call'
+_TRITON_PALLAS_KEY: Final[str] = '__gpu$xla.gpu.triton'
+_MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
+_MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
+_TRITON_KEY: Final[str] = 'triton_kernel_call'
+
+DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
+    export.DisabledSafetyCheck.custom_call(_TRITON_PALLAS_KEY),
+    export.DisabledSafetyCheck.custom_call(_MOSAIC_GPU_KEY),
+    export.DisabledSafetyCheck.custom_call(_MOSAIC_TPU_KEY),
+    export.DisabledSafetyCheck.custom_call(_TRITON_KEY),
+)
 
 _HLO_JAX_DTYPE_MAP: Final[immutabledict.immutabledict[str, type(Any)]] = (
     immutabledict.immutabledict({
@@ -223,10 +231,10 @@ _KERNEL_GETTER: Final[
         str, Callable[[hlo_pb2.HloInstructionProto, str], KernelInfoBase]
     ]
 ] = immutabledict.immutabledict({
-    MOSAIC_GPU_KEY: _instruction_get_mosaic_gpu_kernel,
-    MOSAIC_TPU_KEY: _instruction_get_mosaic_tpu_kernel,
-    TRITON_PALLAS_KEY: _instruction_get_pallas_kernel,
-    TRITON_KEY: _instruction_get_triton_kernel,
+    _MOSAIC_GPU_KEY: _instruction_get_mosaic_gpu_kernel,
+    _MOSAIC_TPU_KEY: _instruction_get_mosaic_tpu_kernel,
+    _TRITON_PALLAS_KEY: _instruction_get_pallas_kernel,
+    _TRITON_KEY: _instruction_get_triton_kernel,
 })
 
 

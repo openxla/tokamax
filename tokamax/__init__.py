@@ -16,6 +16,7 @@
 
 # pylint: disable=g-importing-member,useless-import-alias
 from tokamax import config as config
+from tokamax._src.hlo_utils import DISABLE_JAX_EXPORT_CHECKS as DISABLE_JAX_EXPORT_CHECKS
 from tokamax._src.ops.attention.api import dot_product_attention as dot_product_attention
 from tokamax._src.ops.gated_linear_unit.api import gated_linear_unit as gated_linear_unit
 from tokamax._src.ops.normalization.api import layer_norm as layer_norm

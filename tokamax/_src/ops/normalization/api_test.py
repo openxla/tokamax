@@ -88,22 +88,14 @@ class LayerNormTest(parameterized.TestCase):
         with self.assertRaisesRegex(Exception, "all implementations failed"):
           export.export(
               norm_fn,
-              disabled_checks=[
-                  export.DisabledSafetyCheck.custom_call(
-                      hlo_utils.TRITON_PALLAS_KEY
-                  )
-              ],
+              disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
           )(x_shape, param_shape, param_shape)
         # Change shape to non-symbolic to test standard export.
         x_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
 
       exported = export.export(
           norm_fn,
-          disabled_checks=[
-              export.DisabledSafetyCheck.custom_call(
-                  hlo_utils.TRITON_PALLAS_KEY
-              )
-          ],
+          disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
       )(x_shape, param_shape, param_shape)
       serialized: bytearray = exported.serialize()
       rehydrated_norm: export.Exported = export.deserialize(serialized)
