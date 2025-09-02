@@ -109,9 +109,8 @@ def _fwd(
         f"{q_seq_len=} must be a multiple of {block_q * 2=}"
     )
 
-  logits_shape = (batch_size, num_q_heads, q_seq_len, kv_seq_len)
   if bias is not None:
-    bias = jnp.broadcast_to(as_4d(bias), logits_shape)
+    bias = as_4d(bias)
 
   if mask is not None:
     mask = as_4d(mask).astype(jnp.int8)
@@ -186,17 +185,6 @@ def _fwd(
 
       return lb, ub, k_start_max, k_end_min
 
-    if mask_gmem is None:
-      bcast_mask_q = bcast_mask_k = bi_mask = hi_mask = None
-    else:
-      bcast_dims = [d == 1 for d in mask_gmem.shape]
-      bcast_mask_b, bcast_mask_h, bcast_mask_q, bcast_mask_k = bcast_dims
-      if bcast_mask_q and bcast_mask_k:
-        raise NotImplementedError("Mask broadcast on both sequences.")
-
-      bi_mask = 0 if bcast_mask_b else bi
-      hi_mask = 0 if bcast_mask_h else hi
-
     @pl.when(wg < 2)
     def _compute_wg():
       q_base = (2 * qi + wg) * block_q
@@ -242,14 +230,28 @@ def _fwd(
         def iota(d):
           return plgpu.broadcasted_iota(jnp.int32, block_q_kv, d, layout=_WGMMA)
 
+        def load_bias_mask(gmem, smems, barriers):
+          if gmem is None:
+            return None
+          bi_ = 0 if gmem.shape[0] == 1 else bi
+          hi_ = 0 if gmem.shape[1] == 1 else hi
+          if gmem.shape[-2] == 1:
+            if gmem.shape[-1] == 1:
+              raise NotImplementedError("Broadcast on both sequences.")
+            idx = (bi_, hi_, 0, pl.ds(k_base, block_kv))
+            x = plgpu.load(gmem, idx, layout=_WGMMA_COL, optimized=False)
+            return lax.broadcast_in_dim(x, block_q_kv, [1])
+          if gmem.shape[-1] == 1:
+            idx = (bi_, hi_, qs, 0)
+            x = plgpu.load(gmem, idx, layout=_WGMMA_ROW, optimized=False)
+            return lax.broadcast_in_dim(x, block_q_kv, [0])
+          plgpu.barrier_wait(barriers.at[si])
+          return smems[si, block.ds(wg, block_q)]
+
         def compute_qk(acc_ref):
           k_smem_T = plgpu.transpose_ref(k_smems.at[si], (1, 0))  # pylint: disable=invalid-name
           plgpu.wgmma(acc_ref, q_smem, k_smem_T)
-          if bias_gmem is None:
-            bias = None
-          else:
-            plgpu.barrier_wait(bias_barriers.at[si])
-            bias = bias_smems[si, block.ds(wg, block_q)]
+          bias = load_bias_mask(bias_gmem, bias_smems, bias_barriers)
           plgpu.barrier_arrive(schedule_barrier)
           mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
           return acc_ref[...], bias, mask
@@ -293,18 +295,9 @@ def _fwd(
         if k_end is not None:
           s = lax.cond(k_base + block_kv > k_end_min, apply_k_end, lambda: s)
 
-        if mask_gmem is not None:
-          load_unopt = functools.partial(plgpu.load, optimized=False)
-          if bcast_mask_q:
-            idx = (bi_mask, hi_mask, 0, pl.ds(k_base, block_kv))
-            mask = load_unopt(mask_gmem, idx, layout=_WGMMA_COL)
-          elif bcast_mask_k:
-            idx = (bi_mask, hi_mask, qs, 0)
-            mask = load_unopt(mask_gmem, idx, layout=_WGMMA_ROW)
-            mask = lax.broadcast_in_dim(mask, s.shape, [0])
-          else:
-            plgpu.barrier_wait(mask_barriers.at[si])
-            mask = mask_smems[si, block.ds(wg, block_q)]
+        mask = load_bias_mask(mask_gmem, mask_smems, mask_barriers)
+        if mask is not None:
+          if mask_consumed_barriers is not None:
             plgpu.barrier_arrive(mask_consumed_barriers.at[si])
           s = jnp.where(mask, s, mask_value)
 
@@ -389,10 +382,20 @@ def _fwd(
       plgpu.set_max_registers(40, action="decrease")
       hi_kv = lax.div(hi, q_heads_per_kv_head)
       qs = block.ds(qi, 2 * block_q)
+
+      if bias_smems is None:
+        bias_gmem_ = None
+      else:
+        bias_bi = 0 if bias_gmem.shape[0] == 1 else bi
+        bias_hi = 0 if bias_gmem.shape[1] == 1 else hi
+        bias_gmem_ = bias_gmem.at[bias_bi, bias_hi, qs]
+
       if mask_smems is None:
         mask_gmem_ = None
       else:
-        mask_gmem_ = mask_gmem.at[bi_mask, hi_mask, qs]
+        mask_bi = 0 if mask_gmem.shape[0] == 1 else bi
+        mask_hi = 0 if mask_gmem.shape[1] == 1 else hi
+        mask_gmem_ = mask_gmem.at[mask_bi, mask_hi, qs]
 
       def cp(gmem, smems, barriers, si):
         plgpu.copy_gmem_to_smem(gmem, smems.at[si], barriers.at[si])
@@ -407,8 +410,8 @@ def _fwd(
           ks = block.ds(ki, block_kv)
           si = lax.rem(ki, max_stages)
           cp(k_gmem.at[bi, ks, hi_kv], k_smems, k_barriers, si)
-          if bias_gmem is not None:
-            cp(bias_gmem.at[bi, hi, qs, ks], bias_smems, bias_barriers, si)
+          if bias_gmem_ is not None:
+            cp(bias_gmem_.at[:, ks], bias_smems, bias_barriers, si)
           if mask_gmem_ is not None:
             cp(mask_gmem_.at[:, ks], mask_smems, mask_barriers, si)
           cp(v_gmem.at[bi, ks, hi_kv], v_smems, v_barriers, si)
@@ -419,8 +422,8 @@ def _fwd(
         ks = block.ds(ki + max_stages, block_kv)
         plgpu.barrier_wait(k_consumed_barriers.at[si])
         cp(k_gmem.at[bi, ks, hi_kv], k_smems, k_barriers, si)
-        if bias_gmem is not None:
-          cp(bias_gmem.at[bi, hi, qs, ks], bias_smems, bias_barriers, si)
+        if bias_gmem_ is not None:
+          cp(bias_gmem_.at[:, ks], bias_smems, bias_barriers, si)
         if mask_gmem_ is not None:
           plgpu.barrier_wait(mask_consumed_barriers.at[si])
           cp(mask_gmem_.at[:, ks], mask_smems, mask_barriers, si)
@@ -451,6 +454,7 @@ def _fwd(
     schedule_barrier = plgpu.Barrier(num_arrivals=compute_wgs)
 
     bias_mask_smem_shape = (max_stages, compute_wgs * block_q, block_kv)
+    no_async_bias = bias is None or bias.shape[-2] == 1 or bias.shape[-1] == 1
     no_async_mask = mask is None or mask.shape[-2] == 1 or mask.shape[-1] == 1
 
     pl.run_scoped(
@@ -461,12 +465,12 @@ def _fwd(
         ),
         v_scratch,  # wg1 may still access v as wg0 writes to {o,l,m}_scratch.
         q_barriers,
-        None if bias is None else tiled_smem(bias_mask_smem_shape, bias.dtype),
+        None if no_async_bias else tiled_smem(bias_mask_smem_shape, bias.dtype),
         None if no_async_mask else tiled_smem(bias_mask_smem_shape, jnp.int8),
         kv_barriers,
         kv_barriers,
         # bias doesn't need a consumed barrier as it is implied by k consumed.
-        None if bias is None else kv_barriers[0],
+        None if no_async_bias else kv_barriers[0],
         (None, None) if no_async_mask is None else kv_barriers,
         schedule_barrier,
         collective_axes="wg",
