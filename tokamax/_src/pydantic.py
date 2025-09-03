@@ -244,36 +244,6 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
     ]
 
 
-_K = TypeVar('_K')
-_V = TypeVar('_V')
-
-
-class Dict(dict[_K, _V]):
-  """Annotates a dictionary to allow JSON serialization.
-
-  JSON requires dictionary keys to be strings. Pydantic will coerce non-string
-  keys to strings, which is valid JSON, but doesn't allow for the values to be
-  deserialized. This annotation serializes the keys in a reversible way.
-  """
-
-  @classmethod
-  def __class_getitem__(cls, params: tuple[type[_K], type[_V]]) -> type[dict[_K, _V]]:  # pylint: disable=arguments-renamed
-    key_cls, value_cls = params
-    adapter = get_adapter(key_cls)
-
-    def serialize(value: dict[_K, _V]) -> dict[str, _V]:
-      return {str(adapter.dump_json(k), 'utf-8'): v for k, v in value.items()}
-
-    def validate(data: dict[str, _V]) -> dict[_K, _V]:
-      return {adapter.validate_json(k): v for k, v in data.items()}
-
-    return Annotated[
-        dict[key_cls, value_cls],
-        pydantic.PlainSerializer(serialize),
-        pydantic.BeforeValidator(validate),
-    ]
-
-
 def get_arg_spec_model(
     name: str, signature: inspect.Signature
 ) -> type[pydantic.BaseModel]:

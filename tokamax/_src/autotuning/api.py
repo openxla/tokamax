@@ -58,9 +58,9 @@ def _serialize_bound_args_autotuning_data(
   del ba_dict["op"]["config"]
   del ba_dict["op"]["vjp"]
   data_adapter = pydantic_lib.get_adapter(
-      pydantic_lib.Dict[ba.op.config_cls, benchmarking.BenchmarkData]
+      dict[pydantic.Json[ba.op.config_cls], benchmarking.BenchmarkData]
   )
-  return ba_dict, data_adapter.dump_python(data)
+  return ba_dict, data_adapter.dump_python(dict(data), round_trip=True)
 
 
 def _validate_bound_args_autotuning_data(value: Any) -> BoundArgsAutotuningData:
@@ -70,7 +70,7 @@ def _validate_bound_args_autotuning_data(value: Any) -> BoundArgsAutotuningData:
     return ba, data
   ba = _BOUND_ARGS_ADAPTER.validate_python(ba)
   data_adapter = pydantic_lib.get_adapter(
-      pydantic_lib.Dict[ba.op.config_cls, benchmarking.BenchmarkData]
+      dict[pydantic.Json[ba.op.config_cls], benchmarking.BenchmarkData]
   )
   return ba, autotuner.AutotuningData(data_adapter.validate_python(data))
 
