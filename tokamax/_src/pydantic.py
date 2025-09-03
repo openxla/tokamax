@@ -31,6 +31,7 @@ import jax.numpy as jnp
 import jaxtyping
 import numpy as np
 import pydantic
+from pydantic_core import core_schema as cs
 from tokamax._src import batching
 
 
@@ -65,7 +66,6 @@ def _validate_named_object(x) -> Any:
   return getattr(importlib.import_module(module_name), name)
 
 
-_EnumSerializer = pydantic.PlainSerializer(lambda e: e.name)
 _NamedObjectSerializer = pydantic.PlainSerializer(_serialize_named_object)
 _NamedObjectValidator = pydantic.PlainValidator(_validate_named_object)
 
@@ -90,21 +90,8 @@ def annotate(typ) -> Any:
     return Annotated[typ, _NamedObjectSerializer, _NamedObjectValidator]
   if typing.get_origin(typ) is Sequence:
     return Annotated[typ, pydantic.AfterValidator(tuple)]
-  # The default enum serialization, using the value, often leads to an ambiguous
-  # serialization within unions, so use the name instead (also more readable).
   if issubclass(typ, enum.Enum):
-    def validate_enum(x):
-      if isinstance(x, typ):
-        return x
-      if not isinstance(x, str):
-        raise ValueError(f'Invalid enum name: {x}')
-      try:
-        return typ[x]
-      except KeyError as e:
-        raise ValueError('Invalid enum name') from e
-
-    validator = pydantic.PlainValidator(validate_enum)
-    return Annotated[typ, _EnumSerializer, validator]
+    return Annotated[typ, EnumByName]
   if issubclass(typ, np.dtype):
     return NumpyDtype
   return typ
@@ -242,6 +229,19 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
         pydantic.WrapSerializer(serialize),
         pydantic.PlainValidator(validate),
     ]
+
+
+# Use the enum name, rather than the value, for serialization. This improves the
+# readability of the JSON, and disambiguates enums within a union.
+EnumByName = pydantic.GetPydanticSchema(
+    lambda ty, _handler: cs.no_info_wrap_validator_function(
+        lambda v, handler: (v if isinstance(v, ty) else ty[handler(v)]),
+        cs.literal_schema(list(ty.__members__)),
+        serialization=cs.plain_serializer_function_ser_schema(
+            lambda e: e.name, when_used='json'
+        ),
+    )
+)
 
 
 def get_arg_spec_model(
