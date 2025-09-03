@@ -10,6 +10,11 @@ on:
     branches:
       - main
 
+# Constants for the workflow that are shared across jobs.
+env:
+  JAX_ENABLE_X64: 0
+  JAX_TRACEBACK_FILTERING: off
+
 permissions:
   contents: read
 # We should cancel the previous run if it's still running and there is a new commit.
@@ -17,25 +22,46 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
-# These jobs should build the Tokamax wheel and run the tests on Google Cloud resources. Rigth now
-# all the jobs are GPU jobs and TPU ones will be added later.
+# These jobs should build Tokamax and run the tests on Google Cloud resources.
 jobs: 
-  tokamax-presubmit:
+  tokamax-presubmit-attention-tests:
     strategy:
       matrix:
-        runner: [
-          'linux-x86-a3-8g-h100-1gpu',
-          'linux-x86-ct6e-44-1tpu',]
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
         pytest_command: [
-                         'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/base_test.py',
-                         'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/api_test.py',
-                         'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/pallas_mosaic_gpu_flash_attention_test.py',
-                         'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/pallas_triton_flash_attention_test.py',
-                         'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/jax_nn_test.py',
-                         'pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/xla_chunked_test.py',
-                         'pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ tokamax/_src/ops',
-                         'pytest -s --ignore-glob="tokamax/_src/ops/*" tokamax',
+                         'base_test.py',
+                         'api_test.py',
+                         'pallas_mosaic_gpu_flash_attention_test.py',
+                         'pallas_triton_flash_attention_test.py',
+                         'jax_nn_test.py',
+                         'xla_chunked_test.py',
                         ]
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda12.8-cudnn9.8'
+    timeout-minutes: 300
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          python3.11 -m uv pip install --upgrade pip 
+          python3.11 -m uv pip --version
+          python3.11 -m uv pip install --upgrade -r requirements.txt
+          python3.11 -m uv pip freeze
+      - name: Test Tokamax ops with unittest
+        run: |
+          pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/${{ matrix.pytest_command }}
+
+  tokamax-presubmit-ops-tests:
+    strategy:
+      matrix:
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -52,14 +78,41 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3.11 -m uv pip install --upgrade pip
+          python3.11 -m uv pip install --upgrade pip 
           python3.11 -m uv pip --version
           python3.11 -m uv pip install --upgrade -r requirements.txt
           python3.11 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
-          export JAX_ENABLE_X64=0
-          export JAX_TRACEBACK_FILTERING=off
-          ${{ matrix.pytest_command }}
+          pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ tokamax/_src/ops
+
+  tokamax-presubmit:
+    strategy:
+      matrix:
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    container:
+    # Docker image will include CUDA and cuDNN for Tokamax.
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda12.8-cudnn9.8'
+    timeout-minutes: 300
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          python3.11 -m uv pip install --upgrade pip 
+          python3.11 -m uv pip --version
+          python3.11 -m uv pip install --upgrade -r requirements.txt
+          python3.11 -m uv pip freeze
+      - name: Test Tokamax ops with unittest
+        run: |
+          pytest -s --ignore-glob="tokamax/_src/ops/*" tokamax
+
 
 
