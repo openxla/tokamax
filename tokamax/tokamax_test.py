@@ -25,7 +25,10 @@ from tokamax import autotuning
 
 class TokamaxTest(absltest.TestCase):
 
-  def test_full_example(self):
+  # TODO: Add a test for TPU.
+  def test_full_example_gpu(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Current test only runs on GPU.")
 
     def loss(x, scale):
       x = tokamax.layer_norm(
