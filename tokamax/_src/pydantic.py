@@ -238,7 +238,7 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
       return get_adapter(ty).validate_python(data)
 
     return Annotated[
-        pydantic.InstanceOf[pydantic.SerializeAsAny[base_type]],  # pytype: disable=unsupported-operands
+        pydantic.SerializeAsAny[base_type],  # pytype: disable=unsupported-operands
         pydantic.WrapSerializer(serialize),
         pydantic.PlainValidator(validate),
     ]
