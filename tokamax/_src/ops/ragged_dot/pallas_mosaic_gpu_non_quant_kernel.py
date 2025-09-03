@@ -29,6 +29,7 @@ QuantizedArray = quantization.QuantizedArray
 
 def ragged_dot_non_quantized_kernel_body(
     group_info,
+    mi,
     ni,
     lhs_gmem,
     rhs_gmem,
@@ -40,6 +41,7 @@ def ragged_dot_non_quantized_kernel_body(
 ):
   """Pallas kernel body for non-quantized ragged dot."""
 
+  del mi
   m, k = lhs_gmem.shape
   out_elem_bits = jnp.finfo(out_dtype).bits
   elem_bits = jnp.finfo(lhs_gmem.dtype).bits
@@ -54,12 +56,13 @@ def ragged_dot_non_quantized_kernel_body(
     )
 
   def compute_acc(acc_ref):
+    mi = group_info.block
     transforms = (
         plgpu.TilingTransform((8, swizzle_elems)),
         plgpu.SwizzleTransform(swizzle),
     )
     lhs_spec = plgpu.BlockSpec(
-        (block_m, block_k), lambda ki: (0, ki), transforms=transforms
+        (block_m, block_k), lambda ki: (mi, ki), transforms=transforms
     )
     rhs_spec = plgpu.BlockSpec(
         (block_k, block_n), lambda ki: (ki, ni), transforms=transforms
@@ -69,10 +72,8 @@ def ragged_dot_non_quantized_kernel_body(
         grid=(k // block_k,),
         in_specs=(lhs_spec, rhs_spec),
         max_concurrent_steps=config.num_stages,
-    )(
-        lhs_gmem.at[pl.ds(group_info.offset, block_m)],
-        rhs_gmem.at[group_info.group_id],
-    )
+        delay_release=1,
+    )(lhs_gmem, rhs_gmem.at[group_info.group_id])
     return acc_ref[...]
 
   acc = pl.run_scoped(compute_acc, plgpu.ACC((block_m, block_n)))
@@ -88,22 +89,22 @@ def ragged_dot_non_quantized_kernel_body(
     o_smem[...] = acc.astype(out_dtype)
     plgpu.commit_smem()
 
-    smem_start = group_info.in_block_offset
+    smem_start = group_info.start_within_block
     remaining_rows = min(block_m, m)
     while remaining_rows > 0:
       const_rows_len = 1 << int(math.log2(remaining_rows))
       remaining_rows //= 2
 
-      @pl.when(group_info.bsize & const_rows_len != 0)
+      @pl.when(group_info.actual_size & const_rows_len != 0)
       def _():
         o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
         o_gmem_slice = o_gmem.at[
-            pl.ds(group_info.offset + smem_start, const_rows_len),
+            pl.ds(group_info.block_start + smem_start, const_rows_len),
             pl.ds(ni * block_n, block_n),
         ]
         plgpu.copy_smem_to_gmem(o_smem_slice, o_gmem_slice, commit_group=False)
 
-      smem_start += group_info.bsize & const_rows_len
+      smem_start += group_info.actual_size & const_rows_len
     plgpu.commit_smem_to_gmem_group()
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
@@ -156,4 +157,17 @@ def ragged_dot_non_quantized_kernel(
       out_dtype=out_dtype,
       config=config,
   )
-  return kernel(group_sizes, lhs, rhs)
+  group_info = common.GroupInfo.create(
+      group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
+  )
+  return kernel(
+      group_info.group_id,
+      group_info.block,
+      group_info.block_start,
+      group_info.actual_start,
+      group_info.actual_end,
+      group_info.start_within_block,
+      group_info.actual_size,
+      lhs,
+      rhs,
+  )
