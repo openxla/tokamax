@@ -1,6 +1,7 @@
 # Tokamax
 
 [![CI](https://github.com/openxla/tokamax/actions/workflows/ci-build.yml/badge.svg)](https://github.com/openxla/tokamax/actions/workflows/ci-build.yml)
+[![PyPI version](https://img.shields.io/pypi/v/tokamax)](https://pypi.org/project/tokamax/)
 
 Tokamax is a library of custom accelerator kernels, supporting both NVIDIA GPUs and Google [TPUs]( https://cloud.google.com/tpu/docs/intro-to-tpu). Tokamax provides state-of-the-art custom kernel implementations built on top of [JAX](https://docs.jax.dev/en/latest/index.html) and [Pallas](https://docs.jax.dev/en/latest/pallas/index.html).
 
