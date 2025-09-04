@@ -204,6 +204,7 @@ def autotune(
   Returns:
     An `AutotuningResult` of the autotuned ops.
   """
+  # TODO: Implement `ignore_cache=True`.
   if ignore_cache:
     raise NotImplementedError("`ignore_cache=True` is not implemented.")
 
