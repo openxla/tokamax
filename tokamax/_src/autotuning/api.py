@@ -51,16 +51,17 @@ BoundArgsAutotuningData: TypeAlias = tuple[
 
 
 def _serialize_bound_args_autotuning_data(
-    value: BoundArgsAutotuningData,
+    value: BoundArgsAutotuningData, info
 ) -> tuple[dict[str, Any], dict[str, Any]]:
   ba, data = value
-  ba_dict = _BOUND_ARGS_ADAPTER.dump_python(ba)
-  del ba_dict["op"]["config"]
-  del ba_dict["op"]["vjp"]
+  ba_data = _BOUND_ARGS_ADAPTER.dump_python(ba, mode=info.mode)
+  del ba_data["op"]["config"]
+  del ba_data["op"]["vjp"]
   data_adapter = pydantic_lib.get_adapter(
       dict[pydantic.Json[ba.op.config_cls], benchmarking.BenchmarkData]
   )
-  return ba_dict, data_adapter.dump_python(dict(data), round_trip=True)
+  data = data_adapter.dump_python(dict(data), round_trip=True, mode=info.mode)
+  return ba_data, data
 
 
 def _validate_bound_args_autotuning_data(value: Any) -> BoundArgsAutotuningData:

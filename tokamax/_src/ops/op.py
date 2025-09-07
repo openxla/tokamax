@@ -518,9 +518,10 @@ def _get_arg_spec_model(op: Op) -> type[pydantic.BaseModel]:
   return pydantic_lib.get_arg_spec_model(model_name, op.signature)
 
 
-def _serialize_bound_args(value: BoundArguments) -> dict[str, Any]:
+def _serialize_bound_args(value: BoundArguments, info) -> dict[str, Any]:
+  op_data = _ANY_OP_ADAPTER.dump_python(value.op, mode=info.mode)
   arguments = _get_arg_spec_model(value.op)(**value.arguments)
-  return dict(op=_ANY_OP_ADAPTER.dump_python(value.op), arguments=arguments)
+  return dict(op=op_data, arguments=arguments)
 
 
 def _validate_bound_args(data: dict[str, Any]) -> BoundArguments:

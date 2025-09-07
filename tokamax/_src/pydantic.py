@@ -13,12 +13,10 @@
 # limitations under the License.
 # ==============================================================================
 """Pydantic types and utilities."""
-import builtins
 from collections.abc import Callable, Sequence
 import dataclasses
 import enum
 import functools
-import importlib
 import inspect
 import re
 import types
@@ -46,30 +44,6 @@ PowerOfTwo: TypeAlias = Annotated[
 ]
 
 
-def _serialize_named_object(x) -> str:
-  module_name = inspect.getmodule(x).__name__
-  name = getattr(x, '__name__', str(x))
-  return name if module_name == 'builtins' else f'{module_name}.{name}'
-
-
-def _validate_named_object(x) -> Any:
-  if not isinstance(x, str):
-    return x
-  parts = x.rsplit('.', 1)
-  if len(parts) == 1:
-    try:
-      return getattr(builtins, x)
-    except AttributeError as e:
-      raise ValueError(f'Invalid `builtins` member: {x}') from e
-  module_name, name = parts
-  # TODO: Create allowlist of modules.
-  return getattr(importlib.import_module(module_name), name)
-
-
-_NamedObjectSerializer = pydantic.PlainSerializer(_serialize_named_object)
-_NamedObjectValidator = pydantic.PlainValidator(_validate_named_object)
-
-
 def _validate_np_dtype(x) -> np.dtype:
   return x if isinstance(x, np.dtype) else np.dtype(x)
 
@@ -81,13 +55,25 @@ NumpyDtype: TypeAlias = Annotated[
 ]
 
 
+if not typing.TYPE_CHECKING:
+  # `ImportString._serialize` has a bug where it returns `None` for
+  # types that have a `.name` attribute, so we patch it here
+  # (https://github.com/pydantic/pydantic/issues/12218).
+  _ORIG_IMPORT_STRING_SERIALIZE = pydantic.ImportString._serialize  # pylint: disable=protected-access
+
+  def _serialize(v: Any) -> str:
+    return v if (data := _ORIG_IMPORT_STRING_SERIALIZE(v)) is None else data
+
+  pydantic.ImportString._serialize = _serialize  # pylint: disable=protected-access
+
+
 # pytype: disable=invalid-annotation
 def annotate(typ) -> Any:
   """Annotates types with serializers and validators, as necessary."""
   if typing.get_origin(typ) is Union or isinstance(typ, types.UnionType):
     return Union[tuple(map(annotate, typing.get_args(typ)))]
   if typing.get_origin(typ) in (type, Callable):
-    return Annotated[typ, _NamedObjectSerializer, _NamedObjectValidator]
+    return Annotated[typ, pydantic.ImportString]
   if typing.get_origin(typ) is Sequence:
     return Annotated[typ, pydantic.AfterValidator(tuple)]
   if issubclass(typ, enum.Enum):
@@ -204,6 +190,7 @@ def abstractify(typ):
 
 _T = TypeVar('_T')
 get_adapter = functools.lru_cache(pydantic.TypeAdapter)
+_TYPE_ADAPTER = get_adapter(pydantic.ImportString[type])
 
 
 class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
@@ -215,13 +202,16 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
 
   @classmethod
   def __class_getitem__(cls, base_type: type[_T]) -> type[_T]:  # pylint: disable=arguments-renamed
-    def serialize(value: _T, handler) -> dict[str, Any]:
-      return dict(__type=_serialize_named_object(type(value))) | handler(value)
+
+    def serialize(value: _T, handler, info) -> dict[str, Any]:
+      ty = _TYPE_ADAPTER.dump_python(type(value), mode=info.mode)
+      return dict(__type=ty) | handler(value)
 
     def validate(data: Any) -> _T:
       if isinstance(data, base_type):
         return data
-      ty = _validate_named_object(cast(dict[str, Any], data).pop('__type'))
+      data = cast(dict[str, Any], data)
+      ty = _TYPE_ADAPTER.validate_python(data.pop('__type'))
       return get_adapter(ty).validate_python(data)
 
     return Annotated[

@@ -107,6 +107,7 @@ class PydanticTest(parameterized.TestCase):
   def test_annotated_roundtrip(self, typ, data):
     config = pydantic.ConfigDict(arbitrary_types_allowed=True)
     adapter = pydantic.TypeAdapter(pydantic_lib.annotate(typ), config=config)
+    self.assertEqual(data, adapter.validate_python(adapter.dump_python(data)))
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
   @parameterized.parameters(
