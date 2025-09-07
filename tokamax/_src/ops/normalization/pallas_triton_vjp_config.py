@@ -14,6 +14,7 @@
 # ==============================================================================
 """Pallas-Triton normalization VJP configuration."""
 
+import dataclasses
 from typing import TypeAlias
 
 import immutabledict
@@ -24,7 +25,8 @@ from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_config
 
 
-class Config(pydantic.BaseModel, frozen=True):
+@pydantic.dataclasses.dataclass(frozen=True)
+class Config:
   block_m: pydantic_lib.PowerOfTwo
   block_n: pydantic_lib.PowerOfTwo | None
   num_warps: pydantic_lib.PowerOfTwo
@@ -48,7 +50,7 @@ def get_heuristics_config(
   config = pallas_triton_config.get_heuristics_config(
       x, scale, offset, block_size_per_warp=2048, **kwargs
   )
-  return Config(**dict(config))
+  return Config(**dataclasses.asdict(config))
 
 
 _canonicalize_shape = pallas_triton_config.canonicalize_shape

@@ -29,7 +29,8 @@ from jax._src.lib.mlir.dialects import memref
 import pydantic
 
 
-class Config(pydantic.BaseModel, frozen=True):
+@pydantic.dataclasses.dataclass(frozen=True)
+class Config:
   block_m: pydantic.conint(multiple_of=8, gt=0)
   block_n: pydantic.PositiveInt
   block_k: pydantic.PositiveInt
