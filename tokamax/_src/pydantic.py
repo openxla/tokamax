@@ -32,6 +32,7 @@ import numpy as np
 import pydantic
 from pydantic_core import core_schema as cs
 from tokamax._src import batching
+from typing_extensions import TypedDict  # Required for Python <3.12.
 
 
 def _int_power_of_two(n: int) -> int:
@@ -192,9 +193,10 @@ ShapeDtype = Annotated[
     pydantic.PlainValidator(_validate_shape_dtype),
 ]
 # pytype: enable=invalid-annotation
+_T = TypeVar('_T')
 
 
-class TypeAdapter(pydantic.TypeAdapter):
+class TypeAdapter(pydantic.TypeAdapter[_T], Generic[_T]):
   """`TypeAdapter` where serialization info is be passed to `dump_python`.
 
   The `mode` and `round_trip` attributes from the `SerializationInfo` are
@@ -209,7 +211,6 @@ class TypeAdapter(pydantic.TypeAdapter):
     return super().dump_python(instance, **kwargs)
 
 
-_T = TypeVar('_T')
 get_adapter = functools.lru_cache(TypeAdapter)
 _TYPE_ADAPTER = get_adapter(pydantic.ImportString[type])
 
@@ -258,16 +259,15 @@ EnumByName = pydantic.GetPydanticSchema(
 
 def get_arg_spec_model(
     name: str, signature: inspect.Signature
-) -> type[pydantic.BaseModel]:
-  """Returns a Pydantic model for the given `inspect.Signature`."""
-  params = {}
+) -> type[dict[str, Any]]:
+  """Returns a new `TypedDict` type for the given `inspect.Signature`."""
+  fields = {}
   for param_name, p in signature.parameters.items():
     if p.annotation is inspect.Parameter.empty:
       annotation = Any
     else:
       annotation = annotate(p.annotation)
-    default = ... if p.default is inspect.Parameter.empty else p.default
-    params[param_name] = (annotation, default)
-
-  config = pydantic.ConfigDict(arbitrary_types_allowed=True, frozen=True)
-  return pydantic.create_model(name, __config__=config, **params)
+    fields[param_name] = annotation
+  ty = TypedDict(name, fields, total=False)  # pytype: disable=wrong-arg-types
+  ty.__pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+  return ty

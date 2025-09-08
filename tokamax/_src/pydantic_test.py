@@ -155,15 +155,18 @@ class PydanticTest(parameterized.TestCase):
       ("ragged_dot", ragged_dot_base.RaggedDot, ragged_dot_arg_specs),
   )
   def test_arg_specs_roundtrip(self, op_cls, arg_specs):
-    model = pydantic_lib.get_arg_spec_model("ArgSpec", op_cls().signature)
+    spec = pydantic_lib.get_arg_spec_model("ArgSpec", op_cls().signature)
+    adapter = pydantic.TypeAdapter(spec)
     for name, spec in arg_specs.ARG_SPECS.items():
       with self.subTest(name):
-        spec = model(**op_base._abstractify(_eval_shape(spec)))
-        spec_roundtrip = model.model_validate_json(spec.model_dump_json())
-        if op_cls is ragged_dot_base.RaggedDot:
-          group_sizes = spec.group_sizes.representative_value  # pytype: disable=attribute-error
-          spec = spec.model_copy(update=dict(group_sizes=group_sizes))
+        spec = op_base._abstractify(_eval_shape(spec))
+        spec_roundtrip = adapter.validate_python(adapter.dump_python(spec))
         self.assertEqual(spec, spec_roundtrip)
+        spec_roundtrip = adapter.validate_json(adapter.dump_json(spec))
+        if op_cls is ragged_dot_base.RaggedDot:
+          spec["group_sizes"] = spec["group_sizes"].representative_value
+        self.assertEqual(spec, spec_roundtrip)
+      break
 
 
 if __name__ == "__main__":

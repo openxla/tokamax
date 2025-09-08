@@ -477,20 +477,21 @@ class BoundArguments(Generic[_Config, _Key]):
 
 
 @functools.lru_cache
-def _get_arg_spec_model(op: Op) -> type[pydantic.BaseModel]:
-  model_name = f"{type(op).__name__}Spec"
-  return pydantic_lib.get_arg_spec_model(model_name, op._fwd_signature)  # pylint: disable=protected-access
+def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
+  spec = pydantic_lib.get_arg_spec_model(f"{type(op).__name__}Spec", op._fwd_signature)  # pylint: disable=protected-access
+  return pydantic_lib.get_adapter(spec)
 
 
 def _serialize_bound_args(value: BoundArguments, info) -> dict[str, Any]:
-  op_data = _ANY_OP_ADAPTER.dump_python(value.op, mode=info.mode)
-  arguments = _get_arg_spec_model(value.op)(**value.arguments)
+  op_data = _ANY_OP_ADAPTER.dump_python(value.op, info)
+  arg_spec_adapter = _get_arg_spec_adapter(value.op)
+  arguments = arg_spec_adapter.dump_python(dict(value.arguments), info)
   return dict(op=op_data, arguments=arguments)
 
 
 def _validate_bound_args(data: dict[str, Any]) -> BoundArguments:
   op = _ANY_OP_ADAPTER.validate_python(data["op"])
-  arguments = dict(_get_arg_spec_model(op)(**data["arguments"]))
+  arguments = _get_arg_spec_adapter(op).validate_python(data["arguments"])
   return BoundArguments(op, arguments)
 
 
@@ -499,8 +500,8 @@ PydanticBoundArguments = Annotated[
     pydantic.PlainSerializer(_serialize_bound_args),
     pydantic.PlainValidator(_validate_bound_args),
 ]
-_ANY_OP_ADAPTER = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[Op])
-BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(PydanticBoundArguments)
+_ANY_OP_ADAPTER = pydantic_lib.get_adapter(pydantic_lib.AnyInstanceOf[Op])
+BOUND_ARGS_ADAPTER = pydantic_lib.get_adapter(PydanticBoundArguments)
 
 
 def _abstractify(pytree):
