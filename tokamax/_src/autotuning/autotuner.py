@@ -19,10 +19,12 @@ from collections.abc import Callable
 from concurrent import futures
 from concurrent.futures import process
 import dataclasses
+import typing
 from typing import Any, ParamSpec, Self, TypeVar, cast
 
 from absl import logging
 import immutabledict
+from pydantic_core import core_schema as cs
 from tokamax._src import benchmarking
 from tokamax._src import numerics
 
@@ -50,6 +52,21 @@ class AutotuningData(immutabledict.immutabledict[_Config, BenchmarkData]):
       return self
     config = self.fastest_config
     return AutotuningData({config: self[config]})
+
+  @classmethod
+  def __get_pydantic_core_schema__(cls, source, handler):
+    assert typing.get_origin(source) is cls
+    key_schema = handler.generate_schema(typing.get_args(source)[0])
+    value_schema = handler.generate_schema(BenchmarkData)
+    dict_schema = cs.dict_schema(cs.json_schema(key_schema), value_schema)
+    to_cls_schema = cs.no_info_plain_validator_function(cls)
+    from_dict_schema = cs.chain_schema([dict_schema, to_cls_schema])
+    return cs.union_schema(
+        [cs.is_instance_schema(cls), from_dict_schema],
+        serialization=cs.wrap_serializer_function_ser_schema(
+            lambda d, handler: handler(dict(d)), schema=dict_schema
+        ),
+    )
 
 
 def _compile(fn_factory, config, args, kwargs, *, seed=None):

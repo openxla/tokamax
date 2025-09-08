@@ -57,10 +57,9 @@ def _serialize_bound_args_autotuning_data(
   ba_data = _BOUND_ARGS_ADAPTER.dump_python(ba, mode=info.mode)
   del ba_data["op"]["config"]
   del ba_data["op"]["vjp"]
-  data_adapter = pydantic_lib.get_adapter(
-      dict[pydantic.Json[ba.op.config_cls], benchmarking.BenchmarkData]
-  )
-  data = data_adapter.dump_python(dict(data), round_trip=True, mode=info.mode)
+  config_cls = ba.op.config_cls
+  data_adapter = pydantic_lib.get_adapter(autotuner.AutotuningData[config_cls])
+  data = data_adapter.dump_python(data, round_trip=True, mode=info.mode)
   return ba_data, data
 
 
@@ -70,9 +69,8 @@ def _validate_bound_args_autotuning_data(value: Any) -> BoundArgsAutotuningData:
     assert isinstance(data, autotuner.AutotuningData)
     return ba, data
   ba = _BOUND_ARGS_ADAPTER.validate_python(ba)
-  data_adapter = pydantic_lib.get_adapter(
-      dict[pydantic.Json[ba.op.config_cls], benchmarking.BenchmarkData]
-  )
+  config_cls = ba.op.config_cls
+  data_adapter = pydantic_lib.get_adapter(autotuner.AutotuningData[config_cls])
   return ba, autotuner.AutotuningData(data_adapter.validate_python(data))
 
 
@@ -122,8 +120,6 @@ class AutotuningResult:
 
   def __exit__(self, exc_type, exc_value, traceback):
     op_base.get_autotuning_cache_overlay().pop()
-
-  __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
 
 _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
