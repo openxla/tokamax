@@ -20,7 +20,6 @@ import jax
 from jax import export
 import jax.numpy as jnp
 import tokamax
-from tokamax import autotuning
 
 
 class TokamaxTest(absltest.TestCase):
@@ -70,7 +69,8 @@ class TokamaxTest(absltest.TestCase):
       chex.assert_trees_all_close(out, out_roundtrip)
 
     with self.subTest("Autotune"):
-      autotune_res = autotuning.autotune(f_vjp_lowered)
+      autotune_res = tokamax.autotune(f_vjp_lowered)
+      self.assertIsInstance(autotune_res, tokamax.AutotuningResult)
       with autotune_res:
         out_autotuned = f_vjp(x, scale)
         chex.assert_trees_all_close(out, out_autotuned)
