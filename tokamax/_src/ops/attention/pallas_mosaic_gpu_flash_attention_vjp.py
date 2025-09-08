@@ -41,6 +41,7 @@ _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 
+
 @dataclasses.dataclass(frozen=True)
 class Config:
   block_q_dkv: int
@@ -238,8 +239,10 @@ def _bwd(
         m *= math.log2(math.e)
       l = plgpu.load(l_smem, (), layout=L.WGMMA.reduce(1))  # [block_q]
       dq_acc = plgpu.layout_cast(
-          jnp.full((block_q, head_dim), 0, dtype=jnp.float32), L.WGMMA,
+          jnp.full((block_q, head_dim), 0, dtype=jnp.float32),
+          L.WGMMA,
       )
+
       def load_k_range(ref):
         if ref is None:
           return None
@@ -433,10 +436,12 @@ def _bwd(
       plgpu.barrier_wait(k_barriers.at[wg_idx])
       plgpu.barrier_wait(v_barriers.at[wg_idx])
       dk_acc = plgpu.layout_cast(
-          jnp.full((block_kv, head_dim), 0, dtype=jnp.float32), L.WGMMA,
+          jnp.full((block_kv, head_dim), 0, dtype=jnp.float32),
+          L.WGMMA,
       )
       dv_acc = plgpu.layout_cast(
-          jnp.full((block_kv, head_dim), 0, dtype=jnp.float32), L.WGMMA,
+          jnp.full((block_kv, head_dim), 0, dtype=jnp.float32),
+          L.WGMMA,
       )
       (dk, dv) = pipeline_callback((dv_acc, dk_acc))
       k_smem[...] = dk.astype(k.dtype)
@@ -445,9 +450,11 @@ def _bwd(
       plgpu.commit_smem()
       kv_out_slice = (b_idx, pl.ds(kv_seq_base, block_kv), q_head)
       plgpu.copy_smem_to_gmem(
-          k_smem, dk_ref.at[kv_out_slice], commit_group=False)
+          k_smem, dk_ref.at[kv_out_slice], commit_group=False
+      )
       plgpu.copy_smem_to_gmem(
-          v_smem, dv_ref.at[kv_out_slice], commit_group=False)
+          v_smem, dv_ref.at[kv_out_slice], commit_group=False
+      )
       plgpu.commit_smem_to_gmem_group()
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
@@ -539,7 +546,8 @@ def _bwd(
         plgpu.wgmma(dpT_acc_ref, v_smem, plgpu.transpose_ref(dout_smem, (1, 0)))
 
       zeros = plgpu.layout_cast(
-          jnp.full((block_kv, block_q), 0, dtype=jnp.float32), L.WGMMA,
+          jnp.full((block_kv, block_q), 0, dtype=jnp.float32),
+          L.WGMMA,
       )
       dv_acc, dpT = pl.run_state(_compute)(
           (plgpu.ACC.init(dv_acc), plgpu.ACC.init(zeros))
@@ -713,6 +721,7 @@ class PallasMosaicGpuFlashAttentionVjp(
     base.DotProductAttentionVjp[Config, None]
 ):
   """Pallas-Triton FlashAttention VJP implementation."""
+
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = False
