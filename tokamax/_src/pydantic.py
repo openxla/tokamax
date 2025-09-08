@@ -194,8 +194,23 @@ ShapeDtype = Annotated[
 # pytype: enable=invalid-annotation
 
 
+class TypeAdapter(pydantic.TypeAdapter):
+  """`TypeAdapter` where serialization info is be passed to `dump_python`.
+
+  The `mode` and `round_trip` attributes from the `SerializationInfo` are
+  forwarded to the `dump_python` method of the underlying `TypeAdapter`.
+  """
+
+  def dump_python(
+      self, instance: Any, info: pydantic.SerializationInfo, **kwargs
+  ) -> Any:
+    kwargs.setdefault('mode', info.mode)
+    kwargs.setdefault('round_trip', info.round_trip)
+    return super().dump_python(instance, **kwargs)
+
+
 _T = TypeVar('_T')
-get_adapter = functools.lru_cache(pydantic.TypeAdapter)
+get_adapter = functools.lru_cache(TypeAdapter)
 _TYPE_ADAPTER = get_adapter(pydantic.ImportString[type])
 
 
@@ -210,9 +225,9 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
   def __class_getitem__(cls, base_type: type[_T]) -> type[_T]:  # pylint: disable=arguments-renamed
 
     def serialize(value: _T, info) -> dict[str, Any]:
-      ty = _TYPE_ADAPTER.dump_python(type(value), mode=info.mode)
+      ty = _TYPE_ADAPTER.dump_python(type(value), info)
       data_adapter = get_adapter(annotate(type(value)))
-      return dict(__type=ty) | data_adapter.dump_python(value, mode=info.mode)
+      return dict(__type=ty) | data_adapter.dump_python(value, info)
 
     def validate(data: Any) -> _T:
       if isinstance(data, base_type):

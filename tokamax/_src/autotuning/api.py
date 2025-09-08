@@ -54,12 +54,12 @@ def _serialize_bound_args_autotuning_data(
     value: BoundArgsAutotuningData, info
 ) -> tuple[dict[str, Any], dict[str, Any]]:
   ba, data = value
-  ba_data = _BOUND_ARGS_ADAPTER.dump_python(ba, mode=info.mode)
+  ba_data = _BOUND_ARGS_ADAPTER.dump_python(ba, info)
   del ba_data["op"]["config"]
   del ba_data["op"]["vjp"]
   config_cls = ba.op.config_cls
   data_adapter = pydantic_lib.get_adapter(autotuner.AutotuningData[config_cls])
-  data = data_adapter.dump_python(data, round_trip=True, mode=info.mode)
+  data = data_adapter.dump_python(data, info, round_trip=True)
   return ba_data, data
 
 
@@ -123,7 +123,7 @@ class AutotuningResult:
 
 
 _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
-_BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(op_base.PydanticBoundArguments)
+_BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_base.PydanticBoundArguments)
 
 
 def get_bound_args(
