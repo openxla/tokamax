@@ -28,6 +28,7 @@ import immutabledict
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
+import numpy as np
 import pydantic
 from tokamax._src import batching
 from tokamax._src import benchmarking
@@ -504,7 +505,7 @@ BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(PydanticBoundArguments)
 
 def _abstractify(pytree):
   def abstractify_leaf(x):
-    if isinstance(x, jax.Array):
+    if isinstance(x, (jax.Array, np.ndarray)):
       return jax.ShapeDtypeStruct(x.shape, x.dtype)
     return x
 

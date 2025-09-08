@@ -159,7 +159,7 @@ _SHORT_DTYPE_NAMES_MAP: Final[
 
 def _serialize_shape_dtype(x) -> str:
   if not isinstance(x, jax.ShapeDtypeStruct):
-    raise ValueError(f'Invalid ShapeDtype: {x}')
+    raise ValueError(f'Invalid ShapeDtype: {type(x)}')
   s = jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
   if not (isinstance(x, batching.BatchedShapeDtype) and x.vmap_axes):
     return s
