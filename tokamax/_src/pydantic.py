@@ -68,19 +68,65 @@ if not typing.TYPE_CHECKING:
 
 
 # pytype: disable=invalid-annotation
-def annotate(typ) -> Any:
+def annotate(typ: Any) -> Any:
   """Annotates types with serializers and validators, as necessary."""
+  # Move `str` to the end of the union.
+  if typ == jax.typing.DTypeLike:
+    typ = type[Any] | np.dtype | str
+  elif typ == jax.typing.DTypeLike | None:
+    typ = type[Any] | np.dtype | str | None
+
+  if typing.get_origin(typ) is Annotated:
+    return Annotated[annotate(typ.__origin__), *typ.__metadata__]
   if typing.get_origin(typ) is Union or isinstance(typ, types.UnionType):
     return Union[tuple(map(annotate, typing.get_args(typ)))]
+  if typing.get_origin(typ) is tuple:
+    return tuple[tuple(map(annotate, typing.get_args(typ)))]
   if typing.get_origin(typ) in (type, Callable):
     return Annotated[typ, pydantic.ImportString]
   if typing.get_origin(typ) is Sequence:
     return Annotated[typ, pydantic.AfterValidator(tuple)]
-  if issubclass(typ, enum.Enum):
-    return Annotated[typ, EnumByName]
-  if issubclass(typ, np.dtype):
-    return NumpyDtype
+  if isinstance(typ, type):
+    if issubclass(typ, jaxtyping.AbstractArray):
+      typ = typ.array_type
+    if typ is jax.Array:
+      return ShapeDtype
+    if issubclass(typ, enum.Enum):
+      return Annotated[typ, EnumByName]
+    if issubclass(typ, np.dtype):
+      return NumpyDtype
+  if dataclasses.is_dataclass(typ):
+    return _annotate_dataclass(typ)
   return typ
+
+
+def _annotate_dataclass(cls):
+  """Annotates dataclass fields."""
+  fields = dataclasses.fields(cls)
+  config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+  # `Field.type` may be a string, rather than a resolved type, so we need to
+  # use `typing.get_type_hints` to get the actual type.
+  hints = typing.get_type_hints(cls)
+  new_fields = tuple((f.name, annotate(hints[f.name]), f) for f in fields)
+  new_cls = dataclasses.make_dataclass(cls.__name__, new_fields)
+  new_cls.__pydantic_config__ = config
+  adapter = pydantic.TypeAdapter(new_cls)
+
+  def serialize(x, info) -> dict[str, Any]:
+    if not isinstance(x, cls):
+      raise ValueError(f'Invalid {cls.__name__}: {x}')
+    return adapter.dump_python(x, mode=info.mode)
+
+  def validate(x):
+    if isinstance(x, cls):
+      return x
+    return cls(**dataclasses.asdict(adapter.validate_python(x)))
+
+  return Annotated[
+      cls,
+      pydantic.PlainSerializer(serialize),
+      pydantic.PlainValidator(validate),
+  ]
 
 
 _SHORT_DTYPE_NAMES_MAP: Final[
@@ -137,54 +183,6 @@ ShapeDtype = Annotated[
     pydantic.PlainSerializer(_serialize_shape_dtype),
     pydantic.PlainValidator(_validate_shape_dtype),
 ]
-
-
-def _abstractify_dataclass(cls):
-  """Converts `jax.Array` fields to `ShapeDtype`."""
-  fields = dataclasses.fields(cls)
-  config = pydantic.ConfigDict(arbitrary_types_allowed=True)
-  # `Field.type` may be a string, rather than a resolved type, so we need to
-  # use `typing.get_type_hints` to get the actual type.
-  hints = typing.get_type_hints(cls)
-  new_fields = tuple((f.name, abstractify(hints[f.name]), f) for f in fields)
-  new_cls = dataclasses.make_dataclass(cls.__name__, new_fields)
-  new_cls.__pydantic_config__ = config
-  adapter = pydantic.TypeAdapter(new_cls)
-
-  def serialize(x):
-    if not isinstance(x, cls):
-      raise ValueError(f'Invalid {cls.__name__}: {x}')
-    return adapter.dump_python(x)
-
-  def validate(x):
-    if isinstance(x, cls):
-      return x
-    return cls(**dataclasses.asdict(adapter.validate_python(x)))
-
-  return Annotated[
-      cls,
-      pydantic.PlainSerializer(serialize),
-      pydantic.PlainValidator(validate),
-  ]
-
-
-def abstractify(typ):
-  """Converts `jax.Array` types to `ShapeDtype`."""
-  if typing.get_origin(typ) is Annotated:
-    return Annotated[abstractify(typ.__origin__), *typ.__metadata__]
-  if typing.get_origin(typ) is Union or isinstance(typ, types.UnionType):
-    return Union[tuple(map(abstractify, typing.get_args(typ)))]
-  if typing.get_origin(typ) is tuple:
-    return tuple[tuple(map(abstractify, typing.get_args(typ)))]
-  if isinstance(typ, type) and issubclass(typ, jaxtyping.AbstractArray):
-    typ = typ.array_type
-  if typ is jax.Array:
-    return ShapeDtype
-  if dataclasses.is_dataclass(typ):
-    return _abstractify_dataclass(typ)
-  return typ
-
-
 # pytype: enable=invalid-annotation
 
 
@@ -203,20 +201,21 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
   @classmethod
   def __class_getitem__(cls, base_type: type[_T]) -> type[_T]:  # pylint: disable=arguments-renamed
 
-    def serialize(value: _T, handler, info) -> dict[str, Any]:
+    def serialize(value: _T, info) -> dict[str, Any]:
       ty = _TYPE_ADAPTER.dump_python(type(value), mode=info.mode)
-      return dict(__type=ty) | handler(value)
+      data_adapter = get_adapter(annotate(type(value)))
+      return dict(__type=ty) | data_adapter.dump_python(value, mode=info.mode)
 
     def validate(data: Any) -> _T:
       if isinstance(data, base_type):
         return data
       data = cast(dict[str, Any], data)
       ty = _TYPE_ADAPTER.validate_python(data.pop('__type'))
-      return get_adapter(ty).validate_python(data)
+      return get_adapter(annotate(ty)).validate_python(data)
 
     return Annotated[
-        pydantic.SerializeAsAny[base_type],  # pytype: disable=unsupported-operands
-        pydantic.WrapSerializer(serialize),
+        base_type,
+        pydantic.PlainSerializer(serialize),
         pydantic.PlainValidator(validate),
     ]
 
@@ -243,7 +242,7 @@ def get_arg_spec_model(
     if p.annotation is inspect.Parameter.empty:
       annotation = Any
     else:
-      annotation = abstractify(annotate(p.annotation))
+      annotation = annotate(p.annotation)
     default = ... if p.default is inspect.Parameter.empty else p.default
     params[param_name] = (annotation, default)
 

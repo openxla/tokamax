@@ -25,8 +25,10 @@ from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import utils
 from tokamax._src.ops import op as op_base
 from tokamax._src.ops.attention import base as attn_base
+from tokamax._src.ops.attention import pallas_triton_flash_attention as pl_attn
 from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
+from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
 from tokamax._src.ops.attention import bench_arg_specs as attn_arg_specs
 from tokamax._src.ops.normalization import bench_arg_specs as norm_arg_specs
 from tokamax._src.ops.ragged_dot import bench_arg_specs as ragged_dot_arg_specs
@@ -56,17 +58,6 @@ def _eval_shape(spec):
 class _MyDataclass:
   array: jax.Array
   metadata: int
-
-
-@dataclasses.dataclass(frozen=True)
-class _MyDataclass2:
-  foo: int
-  bar: str
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class _MyDataclass2Sub(_MyDataclass2):
-  baz: int
 
 
 class _Foo:
@@ -124,7 +115,7 @@ class PydanticTest(parameterized.TestCase):
   def test_abstract_dataclass_roundtrip(self):
     shape = jax.ShapeDtypeStruct((1, 2), dtype=jnp.float32)
     data = _MyDataclass(array=shape, metadata=42)  # pytype: disable=wrong-arg-types
-    adapter = pydantic.TypeAdapter(pydantic_lib.abstractify(_MyDataclass))
+    adapter = pydantic.TypeAdapter(pydantic_lib.annotate(_MyDataclass))
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
   def test_abstract_tuple_roundtrip(self):
@@ -132,18 +123,31 @@ class PydanticTest(parameterized.TestCase):
     data = (shape, 42)
     config = pydantic.ConfigDict(arbitrary_types_allowed=True)
     adapter = pydantic.TypeAdapter(
-        pydantic_lib.abstractify(tuple[jax.Array, int]), config=config
+        pydantic_lib.annotate(tuple[jax.Array, int]), config=config
     )
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
   @parameterized.parameters(
-      (_MyDataclass2(foo=42, bar="baz"),),
-      (_MyDataclass2Sub(foo=42, bar="baz", baz=43),),
+      (attn_base.DotProductAttention(),),
+      (pl_attn.PallasTritonFlashAttention(),),
+      (pl_attn.PallasTritonFlashAttention(use_stable_softmax=True),),
+      (ragged_dot_base.RaggedDot(),),
+      (pl_ragged_dot.PallasTritonRaggedDot(),),
+      (
+          pl_ragged_dot.PallasTritonRaggedDot(
+              split_k_intermediate_dtype=jnp.float32
+          ),
+      ),
   )
-  def test_any_instance_of_roundtrip(self, data):
-    adapter = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[_MyDataclass2])
-    self.assertEqual(data, adapter.validate_python(adapter.dump_python(data)))
-    self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+  def test_any_instance_of_op_roundtrip(self, op):
+    adapter = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[op_base.Op])
+    object.__setattr__(op, "vjp", None)
+    op_roundtrip = adapter.validate_python(adapter.dump_python(op))
+    object.__setattr__(op_roundtrip, "vjp", None)
+    self.assertEqual(op, op_roundtrip)
+    op_roundtrip = adapter.validate_json(adapter.dump_json(op))
+    object.__setattr__(op_roundtrip, "vjp", None)
+    self.assertEqual(op, op_roundtrip)
 
   @parameterized.named_parameters(
       ("attention", attn_base.DotProductAttention, attn_arg_specs),

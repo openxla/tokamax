@@ -288,6 +288,8 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     del params["config"]
     return sig.replace(parameters=tuple(params.values()))
 
+  __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+
 
 _AUTOTUNING_CACHE: dict[
     Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]
