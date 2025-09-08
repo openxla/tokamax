@@ -309,7 +309,7 @@ class AUTO:
   ...
 
 
-@dataclasses.dataclass(frozen=True, init=False, eq=False)
+@dataclasses.dataclass(frozen=True, init=False)
 class BoundArguments(Generic[_Config, _Key]):
   """Bound arguments for an op's `__call__` method."""
 
@@ -479,36 +479,7 @@ class BoundArguments(Generic[_Config, _Key]):
     out, residuals = jax.eval_shape(f, x)
     return dict(residuals=residuals, out=out, dout=out) | ba.arguments
 
-  @property
-  def _hash_args(self):
-    def make_hashable(x):
-      return _HashableArray(x) if isinstance(x, jax.Array) else x
-
-    return jax.tree.map(make_hashable, dict(self.arguments))
-
-  def __eq__(self, other) -> bool:
-    if not isinstance(other, BoundArguments):
-      return False
-    return self.op == other.op and self._hash_args == other._hash_args
-
-  def __hash__(self) -> int:
-    return hash((self.op, immutabledict.immutabledict(self._hash_args)))
-
   __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class _HashableArray:
-  value: jax.Array
-
-  def __eq__(self, other) -> bool:
-    if not isinstance(other, _HashableArray):
-      return False
-    return bool((self.value == other.value).all())
-
-  def __hash__(self) -> int:
-    # NOTE: Highly likely to conflicts, but not a problem for our purposes.
-    return hash((self.value.shape, self.value.dtype))
 
 
 _ANY_OP_ADAPTER = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[Op])

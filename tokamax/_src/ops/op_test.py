@@ -123,26 +123,10 @@ class BoundArgumentsTest(absltest.TestCase):
     self.assertEqual(_FakeOp().bind(x, y), _FakeOp().bind(x, y))
     self.assertNotEqual(_FakeOp().bind(x, y), _FakeOp().bind(x, y2))
 
-  def test_equals_array(self):
-    x = jnp.zeros((1, 3, 2))
-    x1 = jnp.zeros((1, 3, 2))
-    x2 = jnp.ones((1, 3, 2))
-    y = jnp.ones((1, 2))
-    y1 = jnp.ones((1, 2))
-    self.assertEqual(_FakeOp().bind(x, y), _FakeOp().bind(x1, y1))
-    self.assertNotEqual(_FakeOp().bind(x, y), _FakeOp().bind(x2, y1))
-
   def test_hash(self):
     x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=(0, 1))
     y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=(0, 1))
     self.assertEqual(hash(_FakeOp().bind(x, y)), hash(_FakeOp().bind(x, y)))
-
-  def test_hash_array(self):
-    x = jnp.zeros((1, 3, 2))
-    x1 = jnp.zeros((1, 3, 2))
-    y = jnp.ones((1, 2))
-    y1 = jnp.ones((1, 2))
-    self.assertEqual(hash(_FakeOp().bind(x, y)), hash(_FakeOp().bind(x1, y1)))
 
   def test_json_roundtrip(self):
     x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=(0, 1))

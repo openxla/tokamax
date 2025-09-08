@@ -16,7 +16,6 @@
 
 from collections.abc import Callable, Sequence
 import dataclasses
-import functools
 import types
 from typing import Any, TypeVar
 
@@ -74,6 +73,14 @@ class GroupSizes:
 
   def __jax_array__(self):
     return self.value
+
+  def __eq__(self, other) -> bool:
+    return isinstance(other, GroupSizes) and (
+        self.representative_value == other.representative_value
+    )
+
+  def __hash__(self) -> int:
+    return hash(self.representative_value)
 
 
 def _abstractify_group_sizes(sizes: GroupSizes) -> tuple[int, ...]:
