@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import dataclasses
 import types
 from typing import Any, ClassVar
 
@@ -23,26 +24,60 @@ import jax.numpy as jnp
 import pydantic
 from tokamax._src import batching
 from tokamax._src import config as config_lib
-from tokamax._src.ops import op
+from tokamax._src import utils
+from tokamax._src.ops import op as op_base
+from tokamax._src.ops.attention import base as attn_base
+from tokamax._src.ops.attention import pallas_triton_flash_attention as pl_attn
+from tokamax._src.ops.normalization import base as norm_base
+from tokamax._src.ops.ragged_dot import base as ragged_dot_base
+from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+from tokamax._src.ops.attention import bench_arg_specs as attn_arg_specs
+from tokamax._src.ops.normalization import bench_arg_specs as norm_arg_specs
+from tokamax._src.ops.ragged_dot import bench_arg_specs as ragged_dot_arg_specs
 
 
-_HEURISTICS_CONFIG = object()
-_AUTOTUNE_CONFIG = object()
+def _eval_shape(spec):
+  if not callable(spec):
+    return spec
+
+  other = [None]
+  merge = [None]
+  out_tree = [None]
+
+  def f():
+    out = spec()
+    out_flat, out_tree[0] = jax.tree.flatten(out)
+    is_array = lambda x: isinstance(x, jax.Array)
+    arrays, other[0], merge[0] = utils.split_merge(is_array, out_flat)
+    return arrays
+
+  shapes = jax.eval_shape(f)
+  assert out_tree[0] is not None and merge[0] is not None
+  return out_tree[0].unflatten(merge[0](shapes, other[0]))
 
 
-class _FakeOp(op.Op[Any, jax.Array, types.NoneType, object, Any]):
-  config_cls: ClassVar[type[object]] = object
+@dataclasses.dataclass(frozen=True)
+class _FakeOpConfig:
+  blah: int
+
+
+_HEURISTICS_CONFIG = _FakeOpConfig(1)
+_AUTOTUNE_CONFIG = _FakeOpConfig(2)
+
+
+class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
+  config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
 
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
     assert not return_residuals
     assert x.shape == y.shape, f"{x.shape} != {y.shape}"
     return x + y, None
 
-  def _get_heuristics_config(self, ba: op.BoundArguments):
+  def _get_heuristics_config(self, ba: op_base.BoundArguments):
     del ba  # Unused.
     return _HEURISTICS_CONFIG
 
-  def _get_autotuning_configs(self, ba: op.BoundArguments):
+  def _get_autotuning_configs(self, ba: op_base.BoundArguments):
     del ba  # Unused.
     return {_AUTOTUNE_CONFIG}
 
@@ -61,11 +96,11 @@ class OpTest(parameterized.TestCase):
     self.assertIs(ba.get_config(), _HEURISTICS_CONFIG)
     self.assertEmpty(cache)
     config = ba.get_config(
-        autotune_configs=op.AUTO, cache_autotuning_results=False
+        autotune_configs=op_base.AUTO, cache_autotuning_results=False
     )
     self.assertIs(config, _AUTOTUNE_CONFIG)
     self.assertEmpty(cache)
-    tune_config = object()
+    tune_config = _FakeOpConfig(3)
     config = ba.get_config(
         autotune_configs={tune_config}, cache_autotuning_results=False
     )
@@ -93,7 +128,7 @@ class OpTest(parameterized.TestCase):
   def test_autotune(self):
     cache = _FakeOp().get_autotuning_cache()
     cache.clear()
-    config = object()
+    config = _FakeOpConfig(3)
     x = jnp.zeros((1, 2))
     y = jnp.ones((1, 2))
     results = _FakeOp().bind(x, y).autotune({config}, cache_results=False)
@@ -107,14 +142,14 @@ class OpTest(parameterized.TestCase):
       ((1,), (None,)), ((0, 0), (0, None)), ((1, 0), (None, 0))
   )
   def test_autotune_vmap(self, x_vmap_axes, y_vmap_axes):
-    config = object()
+    config = _FakeOpConfig(4)
     x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=x_vmap_axes)
     y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=y_vmap_axes)
     results = _FakeOp().bind(x, y).autotune({config})
     self.assertIs(results.fastest_config, config)
 
 
-class BoundArgumentsTest(absltest.TestCase):
+class BoundArgumentsTest(parameterized.TestCase):
 
   def test_equals(self):
     x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=(0, 1))
@@ -128,12 +163,46 @@ class BoundArgumentsTest(absltest.TestCase):
     y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=(0, 1))
     self.assertEqual(hash(_FakeOp().bind(x, y)), hash(_FakeOp().bind(x, y)))
 
-  def test_json_roundtrip(self):
-    x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=(0, 1))
-    y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=(0, 1))
-    ba = _FakeOp().bind(x, y)
-    adapter = pydantic.TypeAdapter(op.PydanticBoundArguments)
-    self.assertEqual(ba, adapter.validate_json(adapter.dump_json(ba)))
+  @parameterized.named_parameters(
+      ("attention", attn_base.DotProductAttention(), attn_arg_specs),
+      ("pl_attn", pl_attn.PallasTritonFlashAttention(), attn_arg_specs),
+      (
+          "pl_attn_stable_softmax",
+          pl_attn.PallasTritonFlashAttention(use_stable_softmax=True),
+          attn_arg_specs,
+      ),
+      ("normalization", norm_base.Normalization(), norm_arg_specs),
+      ("ragged_dot", ragged_dot_base.RaggedDot(), ragged_dot_arg_specs),
+      (
+          "pl_ragged_dot",
+          pl_ragged_dot.PallasTritonRaggedDot(),
+          ragged_dot_arg_specs,
+      ),
+      (
+          "pl_ragged_dot_split_k_intermediate_dtype",
+          pl_ragged_dot.PallasTritonRaggedDot(
+              split_k_intermediate_dtype=jnp.float32
+          ),
+          ragged_dot_arg_specs,
+      ),
+  )
+  def test_roundtrip(self, op, arg_specs):
+    object.__setattr__(op, "vjp", None)
+    adapter = pydantic.TypeAdapter(
+        op_base.PydanticBoundArguments,
+        config=pydantic.ConfigDict(arbitrary_types_allowed=True),
+    )
+    for name, spec in arg_specs.ARG_SPECS.items():
+      with self.subTest(name):
+        ba = op.bind(**_eval_shape(spec))
+        abstract_args = op_base._abstractify(dict(ba.arguments))
+        ba = op_base.BoundArguments(op, abstract_args)
+        ba_roundtrip = adapter.validate_python(adapter.dump_python(ba))
+        object.__setattr__(ba_roundtrip.op, "vjp", None)
+        self.assertEqual(ba, ba_roundtrip)
+        ba_roundtrip = adapter.validate_json(adapter.dump_json(ba))
+        object.__setattr__(ba_roundtrip.op, "vjp", None)
+        self.assertEqual(ba, ba_roundtrip)
 
 
 if __name__ == "__main__":

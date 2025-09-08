@@ -22,6 +22,7 @@ from typing import Any, TypeVar
 import jax
 import jax.numpy as jnp
 import numpy as np
+from pydantic_core import core_schema as cs
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
@@ -82,12 +83,22 @@ class GroupSizes:
   def __hash__(self) -> int:
     return hash(self.representative_value)
 
-
-def _abstractify_group_sizes(sizes: GroupSizes) -> tuple[int, ...]:
-  return sizes.representative_value
-
-
-op.custom_abstractify_mappings[GroupSizes] = _abstractify_group_sizes
+  @classmethod
+  def __get_pydantic_core_schema__(cls, source, handler):
+    del handler  # Unused.
+    assert source is cls
+    serialize = lambda x: x.representative_value
+    validate = lambda x: cls(jax.ShapeDtypeStruct([len(x)], jnp.int32), x)  # pytype: disable=wrong-arg-types
+    from_ints_schema = cs.chain_schema([
+        cs.tuple_schema([cs.int_schema()], variadic_item_index=0),
+        cs.no_info_plain_validator_function(validate),
+    ])
+    instance_schema = cs.is_instance_schema(cls)
+    return cs.json_or_python_schema(
+        json_schema=from_ints_schema,
+        python_schema=cs.union_schema([instance_schema, from_ints_schema]),
+        serialization=cs.plain_serializer_function_ser_schema(serialize),
+    )
 
 
 class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):

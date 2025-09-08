@@ -16,7 +16,6 @@
 
 from collections.abc import Callable, Sequence
 import dataclasses
-import json
 import re
 from typing import Any, Final
 import zlib
@@ -27,8 +26,7 @@ import jax
 from jax import export
 from jax.interpreters.mlir import ir
 import jax.numpy as jnp
-from tokamax._src import serialization
-from tokamax._src.ops import op
+from tokamax._src.ops import op as op_base
 
 from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
@@ -76,7 +74,7 @@ _XLA_NOISE_OPCODES: Final[set[str]] = {
 }
 
 _TOKAMAX_NAME: Final[str] = 'tokamax'
-_PATTERN: Final[re.Pattern[str]] = re.compile(r'tokamax:([\w\.]+)\(({.+})\)')
+_PATTERN: Final[re.Pattern[str]] = re.compile(r'tokamax:({.+})')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -320,7 +318,7 @@ def get_opspecs(  # pytype: disable=invalid-annotation
         | Sequence[hlo_pb2.HloModuleProto],
     ),
     include_xla_kernels: bool = True,
-) -> tuple[op.BoundArguments, ...]:
+) -> tuple[op_base.BoundArguments, ...]:
   """Returns a tuple of BoundArguments for all Tokamax ops in the HLO."""
 
   kernels = get_kernel_info(x, include_xla_kernels=include_xla_kernels)
@@ -333,10 +331,8 @@ def get_opspecs(  # pytype: disable=invalid-annotation
     # jit(tokamax_norm_and_glu)/convert_element_type.
     if match is None:
       continue
-    op_name, json_str = match.groups()
-    op_class = serialization.get_module_member(op_name)
-    spec = json.loads(json_str, cls=serialization.JsonDecoder)
-    op_specs.append(op_class().bind(**spec))
+    (json_data,) = match.groups()
+    op_specs.append(op_base.BOUND_ARGS_ADAPTER.validate_json(json_data))
 
   return tuple(op_specs)
 

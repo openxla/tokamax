@@ -25,6 +25,7 @@ from typing import Annotated, Any, Final, Generic, TypeAlias, TypeVar, Union, ca
 
 import immutabledict
 import jax
+from jax.experimental.pallas import fuser
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
@@ -68,36 +69,43 @@ if not typing.TYPE_CHECKING:
 
 
 # pytype: disable=invalid-annotation
-def annotate(typ: Any) -> Any:
+def annotate(ty: Any) -> Any:
   """Annotates types with serializers and validators, as necessary."""
   # Move `str` to the end of the union.
-  if typ == jax.typing.DTypeLike:
-    typ = type[Any] | np.dtype | str
-  elif typ == jax.typing.DTypeLike | None:
-    typ = type[Any] | np.dtype | str | None
+  if ty == jax.typing.DTypeLike:
+    ty = type[Any] | np.dtype | str
+  elif ty == jax.typing.DTypeLike | None:
+    ty = type[Any] | np.dtype | str | None
 
-  if typing.get_origin(typ) is Annotated:
-    return Annotated[annotate(typ.__origin__), *typ.__metadata__]
-  if typing.get_origin(typ) is Union or isinstance(typ, types.UnionType):
-    return Union[tuple(map(annotate, typing.get_args(typ)))]
-  if typing.get_origin(typ) is tuple:
-    return tuple[tuple(map(annotate, typing.get_args(typ)))]
-  if typing.get_origin(typ) in (type, Callable):
-    return Annotated[typ, pydantic.ImportString]
-  if typing.get_origin(typ) is Sequence:
-    return Annotated[typ, pydantic.AfterValidator(tuple)]
-  if isinstance(typ, type):
-    if issubclass(typ, jaxtyping.AbstractArray):
-      typ = typ.array_type
-    if typ is jax.Array:
+  if isinstance(ty, type):
+    if issubclass(ty, jaxtyping.AbstractArray):
+      ty = ty.array_type
+    if ty is jax.Array:
       return ShapeDtype
-    if issubclass(typ, enum.Enum):
-      return Annotated[typ, EnumByName]
-    if issubclass(typ, np.dtype):
+    if issubclass(ty, enum.Enum):
+      return Annotated[ty, EnumByName]
+    if issubclass(ty, np.dtype):
       return NumpyDtype
-  if dataclasses.is_dataclass(typ):
-    return _annotate_dataclass(typ)
-  return typ
+
+  origin = typing.get_origin(ty) or ty
+  if hasattr(origin, '__get_pydantic_core_schema__'):
+    return ty
+  if origin is Annotated:
+    return Annotated[annotate(ty.__origin__), *ty.__metadata__]
+  if origin is Union or isinstance(ty, types.UnionType):
+    return Union[tuple(map(annotate, typing.get_args(ty)))]
+  if origin is tuple:
+    return tuple[tuple(map(annotate, typing.get_args(ty)))]
+  if origin in (type, Callable):
+    return pydantic.ImportString[ty]
+  if origin is Sequence:
+    return Annotated[ty, pydantic.AfterValidator(tuple)]
+  if origin is fuser.Fusion:
+    # TODO: Add support for serializing `Fusion`s.
+    return Annotated[ty, pydantic.PlainSerializer(str, return_type=str)]
+  if dataclasses.is_dataclass(origin):
+    return _annotate_dataclass(origin)
+  return ty
 
 
 def _annotate_dataclass(cls):

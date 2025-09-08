@@ -20,7 +20,6 @@ import copy
 import dataclasses
 import functools
 import inspect
-import json
 import threading
 from typing import Annotated, Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
 
@@ -34,7 +33,6 @@ from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src import config as config_lib
 from tokamax._src import pydantic as pydantic_lib
-from tokamax._src import serialization
 from tokamax._src import shape
 from tokamax._src import utils
 from tokamax._src.autotuning import autotuner as autotuner_lib
@@ -151,23 +149,18 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       kwargs["return_residuals"] = return_res
       ba = self.bind(*args, **kwargs)
       if batched_args is None:
-        arguments = jax.tree.map(_abstractify, dict(ba.arguments))
+        arguments = ba.arguments
       else:
         bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
         bkwargs["return_residuals"] = return_res
         arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
-      ba = BoundArguments(self, arguments)
-
       # Serialize args into the HLO to allow for, e.g., offline autotuning.
-      try:
-        encoder_cls = serialization.JsonEncoder
-        abstract = _abstractify(dict(arguments))
-        json_str = json.dumps(abstract, cls=encoder_cls, separators=(",", ":"))
-      except TypeError:
-        json_str = "{}"
-      full_name = self.__module__ + "." + self.__class__.__name__
+      self_no_vjp = copy.copy(self)
+      object.__setattr__(self_no_vjp, "vjp", None)
+      ba = BoundArguments(self_no_vjp, _abstractify(dict(arguments)))
+      json_data = str(BOUND_ARGS_ADAPTER.dump_json(ba), "utf-8")
 
-      with jax.named_scope(f"tokamax:{full_name}({json_str})"):
+      with jax.named_scope(f"tokamax:{json_data}"):
         out, residuals = self._fwd(*args, config=ba.default_config, **kwargs)
       ret = (out, residuals) if return_residuals else out
       return ret, (arrays, out, residuals)
@@ -482,13 +475,10 @@ class BoundArguments(Generic[_Config, _Key]):
   __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
 
-_ANY_OP_ADAPTER = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[Op])
-
-
 @functools.lru_cache
 def _get_arg_spec_model(op: Op) -> type[pydantic.BaseModel]:
   model_name = f"{type(op).__name__}Spec"
-  return pydantic_lib.get_arg_spec_model(model_name, op.signature)
+  return pydantic_lib.get_arg_spec_model(model_name, op._fwd_signature)  # pylint: disable=protected-access
 
 
 def _serialize_bound_args(value: BoundArguments, info) -> dict[str, Any]:
@@ -508,21 +498,17 @@ PydanticBoundArguments = Annotated[
     pydantic.PlainSerializer(_serialize_bound_args),
     pydantic.PlainValidator(_validate_bound_args),
 ]
-
-custom_abstractify_mappings = {}
+_ANY_OP_ADAPTER = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[Op])
+BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(PydanticBoundArguments)
 
 
 def _abstractify(pytree):
   def abstractify_leaf(x):
-    if (fn := custom_abstractify_mappings.get(type(x))) is not None:
-      return fn(x)
-    # FIXME: Handle `BatchedShapeDtype` correctly.
-    if isinstance(x, (jax.Array, jax.ShapeDtypeStruct)):
+    if isinstance(x, jax.Array):
       return jax.ShapeDtypeStruct(x.shape, x.dtype)
     return x
 
-  is_leaf = lambda x: (type(x) in custom_abstractify_mappings)
-  return jax.tree.map(abstractify_leaf, pytree, is_leaf=is_leaf)
+  return jax.tree.map(abstractify_leaf, pytree)
 
 
 def _is_shaped(x):

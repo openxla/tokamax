@@ -160,6 +160,9 @@ class PydanticTest(parameterized.TestCase):
       with self.subTest(name):
         spec = model(**op_base._abstractify(_eval_shape(spec)))
         spec_roundtrip = model.model_validate_json(spec.model_dump_json())
+        if op_cls is ragged_dot_base.RaggedDot:
+          group_sizes = spec.group_sizes.representative_value  # pytype: disable=attribute-error
+          spec = spec.model_copy(update=dict(group_sizes=group_sizes))
         self.assertEqual(spec, spec_roundtrip)
 
 
