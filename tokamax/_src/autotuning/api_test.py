@@ -28,7 +28,7 @@ from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
 from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 
-from tensorflow.compiler.xla.service import hlo_pb2
+from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
 
 _HEURISTICS_CONFIG = object()
@@ -43,44 +43,24 @@ class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, object, Any]):
     return _HEURISTICS_CONFIG
 
 
-@jax.jit
-def tokamax_norm_and_glu(x, scale, offset, weights):
-  norm_x = pl_norm.PallasTritonNormalization()(x, scale, offset)
-  glu_x = pl_glu.PallasTritonGatedLinearUnit()(
-      x=norm_x, weights=weights, activation=jax.nn.swish
+def get_lowered_fn_and_expected_bound_args(x_shape):
+  norm = pl_norm.PallasTritonNormalization()
+  glu = pl_glu.PallasTritonGatedLinearUnit()
+
+  def f(x, scale, offset, weights):
+    return glu(norm(x, scale, offset), weights, activation=jax.nn.swish)
+
+  d = x_shape[-1]
+  x = jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16)
+  scale = jax.ShapeDtypeStruct((d,), dtype=jnp.bfloat16)
+  offset = jax.ShapeDtypeStruct((d,), dtype=jnp.bfloat16)
+  weights = jax.ShapeDtypeStruct((d, 2, d), dtype=jnp.bfloat16)
+  f_lowered = jax.jit(f).lower(x, scale, offset, weights)
+  expected_bound_args = (
+      norm.bind(x, scale, offset),  # pytype: disable=wrong-arg-types
+      glu.bind(x, weights, activation=jax.nn.swish),  # pytype: disable=wrong-arg-types
   )
-  return jnp.sum(glu_x)
-
-
-def get_lowered_norm_and_glu(x_shape):
-  (key1, key2, key3, key4) = jax.random.split(jax.random.PRNGKey(0), 4)
-  param_shape = (x_shape[-1],)
-  x = jax.random.normal(key=key1, shape=x_shape, dtype=jnp.bfloat16)
-  scale = jax.random.normal(key=key2, shape=param_shape, dtype=jnp.bfloat16)
-  offset = jax.random.normal(key=key3, shape=param_shape, dtype=jnp.bfloat16)
-  weights = jax.random.normal(
-      key=key4, shape=(x_shape[-1], 2, x_shape[-1]), dtype=jnp.bfloat16
-  )
-
-  f_lowered = tokamax_norm_and_glu.lower(x, scale, offset, weights)
-  return f_lowered
-
-
-def get_expected_bound_args(x_shape):
-  return (
-      pl_norm.PallasTritonNormalization().bind(  # pytype: disable=wrong-arg-types
-          x=jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16),
-          scale=jax.ShapeDtypeStruct((x_shape[-1],), dtype=jnp.bfloat16),
-          offset=jax.ShapeDtypeStruct((x_shape[-1],), dtype=jnp.bfloat16),
-      ),
-      pl_glu.PallasTritonGatedLinearUnit().bind(  # pytype: disable=wrong-arg-types
-          x=jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16),
-          weights=jax.ShapeDtypeStruct(
-              (x_shape[-1], 2, x_shape[-1]), dtype=jnp.bfloat16
-          ),
-          activation=jax.nn.swish,
-      ),
-  )
+  return f_lowered, expected_bound_args
 
 
 # TODO: Make autotuning work for both GPU and TPU.
@@ -102,25 +82,19 @@ class AutotuningTest(absltest.TestCase):
     )
 
   def test_get_bound_args_from_lowered(self):
-    x_shape = (64, 128)
-    expected = get_expected_bound_args(x_shape)
-    f_lowered = get_lowered_norm_and_glu(x_shape)
+    f_lowered, expected = get_lowered_fn_and_expected_bound_args((64, 128))
     self.assertEqual(api.get_bound_args(f_lowered), expected)
 
   def test_get_bound_args_from_hlo(self):
-    x_shape = (64, 128)
-    expected = get_expected_bound_args(x_shape)
-    f_lowered = get_lowered_norm_and_glu(x_shape)
+    f_lowered, expected = get_lowered_fn_and_expected_bound_args((64, 128))
     hlo_modules = f_lowered.compile().runtime_executable().hlo_modules()
     hlo_modules = [
         hlo_pb2.HloModuleProto.FromString(hlo.as_serialized_hlo_module_proto())
         for hlo in hlo_modules
     ]
-
     # Replicate the HLO modules multiple times to ensure that the bound args are
     # unique.
-    hlo_modules = hlo_modules * 10
-    self.assertEqual(api.get_bound_args(hlo_modules), expected)
+    self.assertEqual(api.get_bound_args(hlo_modules * 10), expected)
 
   def test_get_bound_args_unique(self):
     def f(x, weights):
@@ -141,22 +115,20 @@ class AutotuningTest(absltest.TestCase):
     self.assertCountEqual(api.get_bound_args(f_lowered), expected)
 
   def test_autotune(self):
-    x_shape = (64, 128)
-    expected_bound_args = get_expected_bound_args(x_shape)
-    f_lowered = get_lowered_norm_and_glu(x_shape)
-    bound_args = api.get_bound_args(f_lowered)
-    result = api.autotune(bound_args, all_implementations=False)
+    f_lowered, expected = get_lowered_fn_and_expected_bound_args((64, 128))
+    result = api.autotune(f_lowered, all_implementations=False)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
-    self.assertEqual(tuple(x[0] for x in result.data), expected_bound_args)
+    self.assertEqual(tuple(x[0] for x in result.data), expected)
 
-    result_all_impls = api.autotune(api.get_bound_args(f_lowered))
-    self.assertGreaterEqual(len(result_all_impls.data), len(result.data))
+    result = api.autotune(f_lowered)
+    self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+    self.assertContainsSubset(expected, tuple(x[0] for x in result.data))
 
     tempfile = self.create_tempfile("autotuning_results.json")
     with open(tempfile.full_path, "w") as f:
-      result_all_impls.dump(f)
+      result.dump(f)
     with open(tempfile.full_path, "r") as f:
-      self.assertEqual(result_all_impls, api.AutotuningResult.load(f))
+      self.assertEqual(result, api.AutotuningResult.load(f))
 
   def test_autotuning_result_context(self):
     op = _FakeOp()
