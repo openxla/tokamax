@@ -145,6 +145,11 @@ class DotProductAttentionTest(parameterized.TestCase):
       self.skipTest(
           'Skip test. Triton implementation is not supported on this platform.'
       )
+    # TODO: Remove once bias for Mosaic is supported.
+    if (mask_mode == 'bias' or 'bias' in mask_mode) and (
+        self.IMPL == 'mosaic' or self.IMPL is None
+    ):
+      self.skipTest('Mosaic not supported for bias at the moment.')
     # TODO: Fix test for 'xla_chunked' on TPU.
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
       self.skipTest(f'{self.IMPL} not supported on TPU')
@@ -238,6 +243,10 @@ class DotProductAttentionTest(parameterized.TestCase):
       self.skipTest(
           'Skip test. Triton implementation is not supported on this platform.'
       )
+    # TODO: Remove once bias for Mosaic is supported.
+    if self.IMPL == 'mosaic' or self.IMPL is None:
+      self.skipTest('Mosaic not supported for bias gradient at the moment.')
+
     # TODO: Fix test for 'xla_chunked' on TPU.
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
       self.skipTest(f'{self.IMPL} not supported on TPU')

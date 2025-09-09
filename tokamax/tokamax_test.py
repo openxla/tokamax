@@ -20,6 +20,12 @@ import jax
 from jax import export
 import jax.numpy as jnp
 import tokamax
+from tokamax._src.autotuning import api as autotuning
+from tokamax._src.ops.attention import api as attention_api
+from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention_vjp
+from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp
+from tokamax._src.ops.normalization import api as norm_api
+from tokamax._src.ops.normalization import pallas_triton_vjp
 
 
 class TokamaxTest(absltest.TestCase):
@@ -67,6 +73,19 @@ class TokamaxTest(absltest.TestCase):
       f_vjp_roundtrip = export.deserialize(serialized)
       out_roundtrip = jax.jit(f_vjp_roundtrip.call)(x, scale)
       chex.assert_trees_all_close(out, out_roundtrip)
+
+    with self.subTest("has_correct_kernels"):
+      arg_specs = autotuning.get_bound_args(f_vjp_lowered)
+      ops = set(a.op.__class__ for a in arg_specs)
+      ops_expected = set([
+          attention_api.IMPLEMENTATIONS["triton"].__class__,
+          attention_api.IMPLEMENTATIONS["mosaic"].__class__,
+          norm_api.IMPLEMENTATIONS["triton"].__class__,
+          pallas_triton_flash_attention_vjp.PallasTritonFlashAttentionVjp,
+          pallas_mosaic_gpu_flash_attention_vjp.PallasMosaicGpuFlashAttentionVjp,
+          pallas_triton_vjp.PallasTritonNormalizationVjp,
+      ])
+      self.assertContainsSubset(ops_expected, ops)
 
     with self.subTest("Autotune"):
       autotune_res = tokamax.autotune(f_vjp_lowered)

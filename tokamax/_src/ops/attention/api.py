@@ -16,7 +16,6 @@
 
 from collections.abc import Callable, Sequence
 from typing import Any, Final, Literal, TypeAlias
-
 import immutabledict
 import jax
 import jax.numpy as jnp
@@ -38,9 +37,7 @@ _XLA_CHUNK_SIZE: Final[int] = 128
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(
-        mosaic=pallas_mosaic_gpu_flash_attention.PallasMosaicGpuFlashAttention(
-            vjp=base.DotProductAttentionVjp()  # TODO: Use Triton VJP?
-        ),
+        mosaic=pallas_mosaic_gpu_flash_attention.PallasMosaicGpuFlashAttention(),
         triton=pallas_triton_flash_attention.PallasTritonFlashAttention(),
         cudnn=jax_nn.JaxNnDotProductAttention(implementation="cudnn"),
         xla=base.DotProductAttention(),
