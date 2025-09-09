@@ -27,6 +27,7 @@ from jax.experimental import pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -42,22 +43,14 @@ _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 
 
-@dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True)
 class Config:
-  block_q_dkv: int
-  block_kv_dkv: int
-  block_q_dq: int
-  block_kv_dq: int
-  num_stages: int = 2
-  compute_wgs: int = 2
-
-  def __post_init__(self):
-    if self.block_q_dkv % 64:
-      raise ValueError(f"{self.block_q_dkv=} must be a multiple of 64")
-    if self.block_kv_dkv % 64:
-      raise ValueError(f"{self.block_kv_dkv=} must be a multiple of 64")
-    if self.num_stages < 2:
-      raise ValueError(f"{self.num_stages=} must be at least 2")
+  block_q_dkv: pydantic.conint(multiple_of=64, gt=0)
+  block_kv_dkv: pydantic.conint(multiple_of=64, gt=0)
+  block_q_dq: pydantic.PositiveInt
+  block_kv_dq: pydantic.PositiveInt
+  num_stages: pydantic.conint(gt=1) = 2
+  compute_wgs: pydantic.PositiveInt = 2
 
 
 def find_swizzle(dim_size_bits: int, what: str) -> int:
