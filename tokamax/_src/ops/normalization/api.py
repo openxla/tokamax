@@ -49,17 +49,20 @@ def layer_norm(
     subtract_mean: bool = True,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> jax.Array:
-  """Layer Normalization (https://arxiv.org/abs/1607.06450).
+  """Normalization layer.
 
-  FP16/BF16 inputs will first be upcasted to FP32, and all computations will be
-  done in FP32. The result will be casted back down before returning.
+  Implements LayerNorm (https://arxiv.org/abs/1607.06450), and RMSNorm
+  (https://arxiv.org/abs/1910.07467) if `subtract_mean=False`.
+
+  FP16/BF16 inputs will first be upcast to FP32, and all computations will be
+  done in FP32. The result will downcasted to the input data type.
 
   Arguments:
-    x: The input array.
-    scale: An optional one-dimensional array of scale factors.
-    offset: An optional one-dimensional array of offsets.
-    axis: The axis along which to normalize. Default is the -1.
-    epsilon: Epsilon value added to te denominator to avoid division by zero.
+    x: The array to be normalized.
+    scale: An optional one-dimensional array of length `x.shape[axis]`.
+    offset: An optional one-dimensional array of length `x.shape[axis]`.
+    axis: The axis along which to normalize. Default is `-1`.
+    epsilon: Epsilon value added to the denominator to avoid division by zero.
       Default is 1e-6.
     scale_offset: An offset added to the scale factors before scaling. Default
       is 0.0.
@@ -76,7 +79,7 @@ def layer_norm(
     ExceptionGroup: if all implementations fail with their error messages.
 
   Returns:
-    The normalized array.
+    The normalized array with the same shape as the input `x`.
   """
   if implementation is None:
     implementation = _DEFAULT_IMPLEMENTATION
