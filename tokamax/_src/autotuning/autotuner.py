@@ -160,7 +160,7 @@ class Autotuner:
             logging.exception("Config failed: %s", config)
           else:
             results[config] = data
-            logging.info(
+            logging.debug(
                 "%s: lowering time (ms): %f, compile time (ms): %f, "
                 "execution times (ms): %s, median: %f",
                 config,
@@ -176,7 +176,7 @@ class Autotuner:
     results = AutotuningData(results)
     if results:
       config = results.fastest_config
-      logging.info(
+      logging.debug(
           "best config is %s (median execution time: %f ms)",
           config,
           results[config].median_evaluation_time_ms,
