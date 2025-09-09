@@ -23,6 +23,7 @@ from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
+from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
 from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
@@ -120,6 +121,24 @@ class AutotuningTest(absltest.TestCase):
     # unique.
     hlo_modules = hlo_modules * 10
     self.assertEqual(api.get_bound_args(hlo_modules), expected)
+
+  def test_get_bound_args_unique(self):
+    def f(x, weights):
+      x = glu_api.gated_linear_unit(x, weights, implementation="triton")
+      x = glu_api.gated_linear_unit(x, weights, implementation="triton")
+      x = glu_api.gated_linear_unit(x, weights, implementation="xla")
+      return x
+
+    shapes = dict(
+        x=jax.ShapeDtypeStruct((64, 128), dtype=jnp.bfloat16),
+        weights=jax.ShapeDtypeStruct((128, 2, 128), dtype=jnp.bfloat16),
+    )
+    bound_arg0 = pl_glu.PallasTritonGatedLinearUnit().bind(**shapes)  # pytype: disable=wrong-arg-types
+    bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)  # pytype: disable=wrong-arg-types
+    assert bound_arg0.autotuning_cache_key == bound_arg1.autotuning_cache_key
+    expected = (bound_arg0, bound_arg1)
+    f_lowered = jax.jit(f).lower(**shapes)
+    self.assertCountEqual(api.get_bound_args(f_lowered), expected)
 
   def test_autotune(self):
     x_shape = (64, 128)

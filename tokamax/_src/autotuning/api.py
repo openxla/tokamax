@@ -154,10 +154,9 @@ def get_bound_args(
   unique_bound_args = []
   for bound_arg in hlo_utils.get_opspecs(hlo_modules):
     key = bound_arg.autotuning_cache_key
-    if key not in seen_keys:
-      seen_keys.add(key)
+    if (bound_arg.op, key) not in seen_keys:
+      seen_keys.add((bound_arg.op, key))
       unique_bound_args.append(bound_arg)
-
   return tuple(unique_bound_args)
 
 
