@@ -34,7 +34,7 @@ class GatedLinearUnitTest(test_base.GatedLinearUnitTestBase):
   @parameterized.product(
       dtype=[jnp.bfloat16, jnp.float32, jnp.float64],
       precision=[
-          # TODO: enable this once figured out why this gives large
+          # TODO: Enable this after figuring out why it gives large
           # differences on A100/H100 on FP32.
           # jax.lax.Precision.DEFAULT,
           jax.lax.Precision.HIGH,
