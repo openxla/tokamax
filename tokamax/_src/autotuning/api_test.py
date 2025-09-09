@@ -124,6 +124,9 @@ class AutotuningTest(absltest.TestCase):
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
     self.assertContainsSubset(expected, tuple(x[0] for x in result.data))
 
+    res_round_trip = api.AutotuningResult.loads(result.dumps())
+    self.assertEqual(result, res_round_trip)
+
     tempfile = self.create_tempfile("autotuning_results.json")
     with open(tempfile.full_path, "w") as f:
       result.dump(f)
