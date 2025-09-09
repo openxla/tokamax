@@ -26,6 +26,7 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu
 from tokamax._src import quantization
@@ -48,19 +49,11 @@ _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 
 
-@dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True)
 class Config:
-  block_q: int = 64
-  block_kv: int = 64
-  num_stages: int = 2
-
-  def __post_init__(self):
-    if self.block_q % 64:
-      raise ValueError(f"{self.block_q=} must be a multiple of 64")
-    if self.block_kv % 64:
-      raise ValueError(f"{self.block_kv=} must be a multiple of 64")
-    if self.num_stages < 2:
-      raise ValueError(f"{self.num_stages=} must be at least 2")
+  block_q: pydantic.conint(multiple_of=64, gt=0) = 64
+  block_kv: pydantic.conint(multiple_of=64, gt=0) = 64
+  num_stages: pydantic.conint(gt=1) = 2
 
 
 @jaxtyping.jaxtyped
@@ -216,6 +209,7 @@ def _fwd(
       lb, ub, k_start_max, k_end_min = get_kv_ranges()
 
       plgpu.barrier_wait(q_barrier)
+
       @pl.when(ub > lb)
       def _():
         plgpu.barrier_wait(k_barriers.at[lax.rem(lb, max_stages)])
@@ -558,6 +552,7 @@ _SUPPORTED_PRECISIONS = (
 @dataclasses.dataclass(frozen=True)
 class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   """Flash attention with Mosaic GPU."""
+
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = True
