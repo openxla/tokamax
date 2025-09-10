@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import dataclasses
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -124,6 +126,12 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def test_base2(self):
     impl = flash_attention.PallasMosaicGpuFlashAttention(use_base2=True)
     self._run_test((2, 1024, 4, 64), impl=impl)
+
+  def test_unstable_softmax(self):
+    # pytype: disable=wrong-arg-types
+    impl = dataclasses.replace(self._attention_fn, use_stable_softmax=False)
+    self._run_test((2, 1024, 4, 64), impl=impl)
+
 
 # TODO: Add manual partitioning test.
 

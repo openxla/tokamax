@@ -192,7 +192,7 @@ def _fwd(
       if use_stable_softmax:
         m_i = plgpu.layout_cast(jnp.full_like(l_i, -jnp.inf), _WGMMA_ROW)
       else:
-        m_i = 0.0
+        m_i = plgpu.layout_cast(jnp.full_like(l_i, 0.0), _WGMMA_ROW)
       acc = jnp.zeros((block_q, head_dim_out), jnp.float32)
       acc = plgpu.layout_cast(acc, _WGMMA)
 
