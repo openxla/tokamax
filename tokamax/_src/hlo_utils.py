@@ -356,7 +356,7 @@ def _parse_shapes_recursive(shapes):
   # Ideally use isinstance on the type, but this type is not visible.
   elif 'ShapeProto' in str(type(shapes)):
     shapes = json_format.MessageToDict(shapes)
-    if shapes['elementType'] == 'TUPLE':
+    if shapes['elementType'] == 'TUPLE' and 'tupleShapes' in shapes:
       return tuple(_process_shape(shape) for shape in shapes['tupleShapes'])
     else:
       return _process_shape(shapes)

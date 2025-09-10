@@ -37,6 +37,8 @@ from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
 import triton
 import triton.language as tl
 
+from tensorflow.compiler.xla import xla_data_pb2
+from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
 def add_vectors_kernel(x_ref, y_ref, o_ref):
   x, y = x_ref[...], y_ref[...]
@@ -459,6 +461,22 @@ class DumpHloLibTest(parameterized.TestCase):
         batching.BatchedShapeDtype(shape=x.shape, dtype=x.dtype, vmap_axes=()),
         opspec.arguments['q'],
     )
+
+  def test_empty_tuple_shape(self):
+    """Tests to make sure that empty tuple shapes throw ValueError."""
+
+    hlo_instruction = hlo_pb2.HloInstructionProto()
+    hlo_instruction.name = 'tuple'
+    hlo_instruction.opcode = 'tuple'
+    hlo_instruction.shape.element_type = 'TUPLE'
+    self.assertRaises(
+        ValueError, hlo_utils._parse_shapes, hlo_instruction.shape
+    )
+
+    hlo_instruction.shape.tuple_shapes.append(
+        xla_data_pb2.ShapeProto(element_type=xla_data_pb2.F32, dimensions=[1])
+    )
+    self.assertNotEmpty(hlo_utils._parse_shapes(hlo_instruction.shape))
 
 
 if __name__ == '__main__':
