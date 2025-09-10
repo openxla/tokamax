@@ -15,11 +15,9 @@
 
 from absl.testing import absltest
 import jax
-from jax.experimental import pallas as pl
 import jax.numpy as jnp
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
-from tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common import GroupInfo
 from tokamax._src.ops.ragged_dot import test_base
 
 
@@ -109,22 +107,6 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
       self.skipTest("Not supported on TPUs.")
     super().setUp()
 
-class GroupInfoTest(absltest.TestCase):
-  def test_number_of_steps(self):
-    grp_sizes = jnp.array((1,0,1) + (0,) * (128 - 3),)
-    grpi = GroupInfo.create(
-        group_sizes = grp_sizes,
-        tile_size = 64
-    )
-    self.assertEqual(grpi.total_steps, 2)
-    self.assertEqual(grpi.bsize, 1)
-    self.assertEqual(grpi.group_id, 0)
-    g1 = grpi.to_step(grp_sizes, jnp.int32(1))
-    self.assertEqual(g1.group_id, 2)
-    self.assertEqual(g1.bsize, 1)
-    for i in range(2, 128):
-      gi = grpi.to_step(grp_sizes, jnp.int32(i))
-      self.assertEqual(gi.bsize, 0, i)
 
 if __name__ == "__main__":
   absltest.main()

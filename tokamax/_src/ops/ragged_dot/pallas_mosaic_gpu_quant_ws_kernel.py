@@ -29,6 +29,7 @@ QuantizedArray = quantization.QuantizedArray
 
 def body(
     group_info: common.GroupInfo,
+    mi,
     ni,
     w_gmem,
     x_gmem,
@@ -39,6 +40,7 @@ def body(
     config: common.Config,
 ):
   """The main kernel function for ragged dot-product."""
+  del mi
   block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
 
   m = x_gmem.shape[0]
@@ -95,6 +97,7 @@ def body(
   except ValueError as e:
     raise NotImplementedError(f"{swizzle_w=} unsupported.") from e
 
+  mi = group_info.block
   gi = group_info.group_id
   x_transforms = (
       plgpu.TilingTransform((8, x_swizzle_elems)),
@@ -105,7 +108,7 @@ def body(
       swizzle_w_transform,
   )
   x_spec = plgpu.BlockSpec(
-      (block_m, block_k), lambda ki: (0, ki), transforms=x_transforms
+      (block_m, block_k), lambda ki: (mi, ki), transforms=x_transforms
   )
   w_spec = plgpu.BlockSpec(
       (2 * block_n, block_k), lambda ki: (ni, ki), transforms=w_transforms
@@ -122,11 +125,7 @@ def body(
         compute_context=pipeline_context,
         in_specs=(w_spec, x_spec, w_scales_spec),
         max_concurrent_steps=max(config.num_stages // 2, 2),
-    )(
-        w_gmem.at[gi],
-        x_gmem.at[pl.ds(group_info.offset, block_m)],
-        w_scales_gmem.at[gi],
-    )
+    )(w_gmem.at[gi], x_gmem, w_scales_gmem.at[gi])
 
   # The memory WG does not arrive at the run so we release it here.
   # TODO: Change the run_scoped() API so this is not
@@ -180,4 +179,18 @@ def ragged_dot_quantized_ws_kernel(
       config=config,
       thread_axis="wg",
   )
-  return kernel(group_sizes, rhs.values.transpose(0, 2, 1), lhs, rhs.scales)
+  group_info = common.GroupInfo.create(
+      group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
+  )
+  return kernel(
+      group_info.group_id,
+      group_info.block,
+      group_info.block_start,
+      group_info.actual_start,
+      group_info.actual_end,
+      group_info.start_within_block,
+      group_info.actual_size,
+      rhs.values.transpose(0, 2, 1),
+      lhs,
+      rhs.scales,
+  )
