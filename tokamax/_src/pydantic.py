@@ -52,8 +52,8 @@ def _validate_np_dtype(x) -> np.dtype:
 
 NumpyDtype: TypeAlias = Annotated[
     np.dtype,
-    pydantic.PlainSerializer(lambda dtype: dtype.name),
     pydantic.PlainValidator(_validate_np_dtype),
+    pydantic.PlainSerializer(lambda dtype: dtype.name),
 ]
 
 
@@ -129,8 +129,8 @@ def _annotate_dataclass(cls):
 
   return Annotated[
       cls,
-      pydantic.PlainSerializer(serialize),
       pydantic.PlainValidator(validate),
+      pydantic.PlainSerializer(serialize),
   ]
 
 
@@ -185,8 +185,8 @@ Shape = pydantic.TypeAdapter(tuple[int, ...])
 Axes = pydantic.TypeAdapter(tuple[int, ...])
 ShapeDtype = Annotated[
     jax.ShapeDtypeStruct,
-    pydantic.PlainSerializer(_serialize_shape_dtype),
     pydantic.PlainValidator(_validate_shape_dtype),
+    pydantic.PlainSerializer(_serialize_shape_dtype),
 ]
 # pytype: enable=invalid-annotation
 _T = TypeVar('_T')

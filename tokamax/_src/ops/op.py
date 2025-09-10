@@ -497,8 +497,8 @@ def _validate_bound_args(data: dict[str, Any]) -> BoundArguments:
 
 PydanticBoundArguments = Annotated[
     BoundArguments[_Config, _Key],
-    pydantic.PlainSerializer(_serialize_bound_args),
     pydantic.PlainValidator(_validate_bound_args),
+    pydantic.PlainSerializer(_serialize_bound_args),
 ]
 _ANY_OP_ADAPTER = pydantic_lib.get_adapter(pydantic_lib.AnyInstanceOf[Op])
 BOUND_ARGS_ADAPTER = pydantic_lib.get_adapter(PydanticBoundArguments)

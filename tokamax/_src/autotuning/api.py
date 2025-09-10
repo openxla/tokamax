@@ -90,10 +90,10 @@ class AutotuningResult:
   data: tuple[
       Annotated[
           BoundArgsAutotuningData,
-          pydantic.PlainSerializer(_serialize_bound_args_autotuning_data),
           pydantic.PlainValidator(_validate_bound_args_autotuning_data),
+          pydantic.PlainSerializer(_serialize_bound_args_autotuning_data),
       ],
-      ...
+      ...,
   ]
 
   def dump(self, fp):
