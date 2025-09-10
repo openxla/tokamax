@@ -17,7 +17,8 @@
 import contextlib
 import functools
 import itertools
-import random
+from unittest import mock
+import sys
 import pytest
 
 from absl.testing import parameterized
@@ -157,6 +158,12 @@ def _run_test(
     actual_grads2 = dict(zip(grad_names, vjp_fn(dout.astype(actual.dtype))))
     chex.assert_trees_all_equal(actual, actual2)
     chex.assert_trees_all_equal(actual_grads, actual_grads2)
+
+
+def override_test_args(**kwargs):
+  orig_run_test = _run_test
+  run_test = lambda *a, **kw: orig_run_test(*a, **(kw | kwargs))
+  return mock.patch.object(sys.modules[__name__], "_run_test", run_test)
 
 
 def _ref_impl_tanh(

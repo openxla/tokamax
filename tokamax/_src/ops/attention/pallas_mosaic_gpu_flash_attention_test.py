@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from unittest import mock
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -23,18 +21,6 @@ import pytest
 from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as flash_attention
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import bench_arg_specs
-
-
-def _atol_ctx(atol: float, atol_grads: float | None = None):
-  orig_run_test = test_base._run_test
-
-  def my_run_test(*args, **kwargs):
-    kwargs["atol"] = atol
-    if atol_grads is not None:
-      kwargs["atol_grads"] = atol_grads
-    orig_run_test(*args, **kwargs)
-
-  return mock.patch.object(test_base, "_run_test", my_run_test)
 
 
 @pytest.mark.skip(reason="Too slow for OSS regression tests.")
@@ -103,11 +89,11 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
   def test_causal_mask(self):
     # TODO: Investigate why it's less accurate with causal mask.
-    with _atol_ctx(0.006):
+    with test_base.override_test_args(atol=0.006):
       super().test_causal_mask()
 
   def test_causal_mask_cross_attention0(self):
-    with _atol_ctx(0.006):
+    with test_base.override_test_args(atol=0.006):
       super().test_causal_mask_cross_attention0()  # pytype: disable=attribute-error
 
   def test_causal_mask_cross_attention1(self):
@@ -121,7 +107,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     self.skipTest("TODO: Enable benchmark tests.")
 
   def test_normalize_output(self):
-    with _atol_ctx(0.02):
+    with test_base.override_test_args(atol=0.02):
       super().test_normalize_output()
 
   def test_base2(self):

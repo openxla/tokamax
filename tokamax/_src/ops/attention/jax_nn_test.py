@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from unittest import mock
 import pytest
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -25,15 +24,6 @@ from tokamax._src.ops.attention import test_base
 
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
-
-def _atol_ctx(atol: float):
-  orig_run_test = test_base._run_test
-
-  def my_run_test(*args, **kwargs):
-    _ = kwargs.pop("atol", None)
-    orig_run_test(*args, **(kwargs | dict(atol=atol)))
-
-  return mock.patch.object(test_base, "_run_test", my_run_test)
 
 class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
 
