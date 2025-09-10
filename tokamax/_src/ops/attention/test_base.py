@@ -102,7 +102,11 @@ def _run_test(
   ref_kwargs.setdefault("precision", jax.lax.Precision.HIGHEST)
 
   if isinstance(mask := (impl_kwargs | kwargs).get("mask"), base.Mask):
-    mask = mask.as_array(q.shape[-3], k.shape[-3])
+    q_indices = impl_kwargs.get("q_indices", None)
+    k_indices = impl_kwargs.get("k_indices", None)
+    q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
+    k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
+    mask = mask.as_array(q_len_or_indices, k_len_or_indices)
 
   if mask is not None:
     is_fully_masked = jnp.all(jnp.swapaxes(mask, -2, -3) == 0, axis=-1)
