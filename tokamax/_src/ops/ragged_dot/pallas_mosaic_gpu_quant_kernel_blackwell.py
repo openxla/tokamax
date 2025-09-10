@@ -15,7 +15,6 @@
 """Ragged dot Pallas-Mosaic-GPU Quantized Kernel (Blackwell)."""
 
 import functools
-from typing import Sequence
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
@@ -35,52 +34,6 @@ _MMA_WARP = 0
 _STORE_WARP = 1
 _TMA_WARP = 4
 _TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
-
-
-def group_info(
-    group_sizes: Sequence[jax.Array], tile: int, tid_size: int
-):
-  """Get the group info for the current block."""
-
-  tile = jnp.int32(tile)
-  # We usually only have very few groups, so we unroll the loop processing
-  # them. Normally we'd break out of the loop early, once we'd have found our
-  # boundary, but we can't do that when unrolling, so we rely on many selects
-  # to mask out the epilogue of the loop.
-  tid = jnp.arange(0, tid_size)
-  cuts = group_end = group_start = block = group = end = jnp.zeros_like(
-      tid, dtype=jnp.int32
-  )
-
-  for i, group_size in enumerate(group_sizes):
-    # Start/end are inclusive
-    start = end
-    end = start + group_size
-    final = end - 1
-    # How many times has a block been cut so far? This indicates how
-    # many more blocks are required along the dimension.
-    start_block = lax.div(start, tile)
-    final_block = lax.div(final, tile)
-    block_end = final_block + 1
-    tid_begin = start_block + cuts
-    tid_end = block_end + cuts
-    cuts += (end % tile != 0)
-    # How many blocks after is our block?
-    this_is_group = (tid_begin <= tid) & (tid < tid_end)
-    block = lax.select(this_is_group, tid - tid_begin + start_block, block)
-    group = lax.select(
-        this_is_group, jnp.full_like(tid, i, dtype=jnp.int32), group
-    )
-    group_start = lax.select(this_is_group, start, group_start)
-    group_end = lax.select(this_is_group, end, group_end)
-
-  block_start = block * tile
-  actual_start = jnp.maximum(group_start, block_start)
-  actual_end = jnp.minimum(group_end, block_start + tile)
-  start_within_block = actual_start - block_start
-  # The size can be negative if the tid is out of bounds, so we clamp it to 0.
-  actual_size = jnp.maximum(jnp.int32(0), actual_end - actual_start)
-  return (block, group, start_within_block, actual_size, block_start)
 
 
 def dequant(s_ref, w):
@@ -156,6 +109,10 @@ def ragged_dot_gpu_quant_blackwell_kernel(
   w_swizzle_elems = (w_swizzle * 8) // w_elem_bits
   # num_stages must be less than or equal to the number of blocks
   num_stages = min(num_stages, k_w // block_k)
+
+  group_info = common.GroupInfo.create(
+      group_sizes, block_m, pl.cdiv(m, block_m) + num_groups - 1
+  )
 
   def kernel(*refs, scoped):
     (
@@ -499,7 +456,9 @@ def ragged_dot_gpu_quant_blackwell_kernel(
       x,
       w,
       w_scales,
-      *group_info(
-          group_sizes, block_m, pl.cdiv(m, block_m) + num_groups - 1
-      )
+      group_info.block,
+      group_info.group_id,
+      group_info.start_within_block,
+      group_info.actual_size,
+      group_info.block_start,
   )

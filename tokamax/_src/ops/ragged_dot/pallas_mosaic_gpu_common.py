@@ -18,7 +18,6 @@
 from collections.abc import Callable, Sequence
 import dataclasses
 import functools
-from typing import Self
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
@@ -42,121 +41,70 @@ class Config:
   collective: bool = False  # B200 collective MMA
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class GroupInfo:
   """Information regarding the group being processed in a block."""
-  tile_size: int
-  gmem_tile_size: int
-  # Part of the block occupied by the current group.
-  bsize: jax.Array
-  current_step: jax.Array
+
   group_id: jax.Array
-  in_block_offset: jax.Array
-  offset: jax.Array
-  remaining_rows_in_group: jax.Array
-  total_steps: jax.Array
-
-  @staticmethod
-  def steps(group_sizes, tile_size) -> jax.Array:
-    """Calculates the total number of steps for all groups."""
-    # sum(cdiv(cumsum(group_sizes) % 8 + group_sizes, tile_size))
-    off = steps = jnp.int32(0)
-    for i in range(len(group_sizes)):
-      grp = jnp.int32(group_sizes[i])
-      steps += jnp.where(grp == 0, 0, pl.cdiv(grp + off % 8, tile_size))
-      off += grp
-
-    return steps
-
-  def next_single_step(self, group_sizes) -> "GroupInfo":
-    """Advances the group info to the next step."""
-    finished = self.remaining_rows_in_group <= self.bsize
-    group_id, remaining_rows_in_group = lax.cond(
-        finished,
-        functools.partial(self.next_nonzero_group, group_sizes, self.group_id),
-        lambda: (self.group_id, self.remaining_rows_in_group - self.bsize),
-    )
-    offset = self.offset + self.bsize + self.in_block_offset
-    in_block_offset = lax.rem(offset, self.gmem_tile_size)
-    in_block_offset = jnp.where(finished, in_block_offset, jnp.int32(0))
-    bsize = jnp.where(
-        group_id >= len(group_sizes),
-        jnp.int32(0),
-        jnp.minimum(
-            remaining_rows_in_group, self.tile_size - in_block_offset
-        )
-    )
-    return dataclasses.replace(
-        self,
-        group_id=group_id,
-        bsize=bsize,
-        offset=lax.div(offset, self.gmem_tile_size) * self.gmem_tile_size,
-        remaining_rows_in_group=remaining_rows_in_group,
-        current_step=self.current_step + 1,
-        in_block_offset=in_block_offset,
-    )
-
-  def reset(self, group_sizes):
-    """Restores this object to its original state after flattening.
-
-    Args:
-      group_sizes: The group sizes array.
-
-    Returns:
-      A new `GroupInfo` object.
-    """
-    zero = jnp.int32(0)
-    grp0 = jnp.int32(group_sizes[0])
-    return dataclasses.replace(
-        self,
-        remaining_rows_in_group=grp0,
-        group_id=zero,
-        bsize=jnp.minimum(grp0, self.tile_size),
-        offset=zero,
-        current_step=zero,
-        in_block_offset=zero,
-    )
-
-  @staticmethod
-  def next_nonzero_group(group_sizes, cur_id) -> tuple[jax.Array, jax.Array]:
-    def cond_fn(state):
-      i, size = state
-      return (i < group_sizes.shape[0]) & (size == 0)
-
-    def body_fn(state):
-      i = state[0] + 1
-      return i, jnp.int32(group_sizes[i])
-
-    return lax.while_loop(
-        cond_fn, body_fn, (cur_id + 1, jnp.int32(group_sizes[cur_id + 1]))
-    )
-
-  def to_step(self, group_sizes, step: jax.Array) -> Self:
-    loop_body = lambda _, x: x.next_single_step(group_sizes)
-    return lax.cond(
-        step >= self.current_step,
-        lambda: lax.fori_loop(self.current_step, step, loop_body, self),
-        lambda: lax.fori_loop(0, step, loop_body, self.reset(group_sizes)),
-    )
+  block: jax.Array
+  block_start: jax.Array
+  actual_start: jax.Array
+  actual_end: jax.Array
+  start_within_block: jax.Array
+  actual_size: jax.Array
 
   @classmethod
   def create(
-      cls, group_sizes: jax.Array, tile_size: int, gmem_tile_size: int = 8
-  ) -> Self:
+      cls, group_sizes: Sequence[jax.Array], tile: int, tid_size: int
+  ) -> "GroupInfo":
     """Get the group info for the current block."""
-    zero = jnp.int32(0)
-    grp0 = jnp.int32(group_sizes[0])
+
+    tile = jnp.int32(tile)
+    # We usually only have very few groups, so we unroll the loop processing
+    # them. Normally we'd break out of the loop early, once we'd have found our
+    # boundary, but we can't do that when unrolling, so we rely on many selects
+    # to mask out the epilogue of the loop.
+    tid = jnp.arange(0, tid_size)
+    cuts = group_end = group_start = block = group = end = jnp.zeros_like(
+        tid, dtype=jnp.int32
+    )
+
+    for i, group_size in enumerate(group_sizes):
+      # Start/end are inclusive
+      start = end
+      end = start + group_size
+      final = end - 1
+      # How many times has a block been cut so far? This indicates how
+      # many more blocks are required along the dimension.
+      start_block = lax.div(start, tile)
+      final_block = lax.div(final, tile)
+      block_end = final_block + 1
+      tid_begin = start_block + cuts
+      tid_end = block_end + cuts
+      cuts += (end % tile != 0)
+      # How many blocks after is our block?
+      this_is_group = (tid_begin <= tid) & (tid < tid_end)
+      block = lax.select(this_is_group, tid - tid_begin + start_block, block)
+      group = lax.select(
+          this_is_group, jnp.full_like(tid, i, dtype=jnp.int32), group
+      )
+      group_start = lax.select(this_is_group, start, group_start)
+      group_end = lax.select(this_is_group, end, group_end)
+
+    block_start = block * tile
+    actual_start = jnp.maximum(group_start, block_start)
+    actual_end = jnp.minimum(group_end, block_start + tile)
+    start_within_block = actual_start - block_start
+    # The size can be negative if the tid is out of bounds, so we clamp it to 0.
+    actual_size = jnp.maximum(jnp.int32(0), actual_end - actual_start)
     return cls(
-        tile_size=tile_size,
-        remaining_rows_in_group=grp0,
-        group_id=zero,
-        bsize=jnp.minimum(grp0, tile_size),
-        offset=zero,
-        current_step=zero,
-        total_steps=cls.steps(group_sizes, tile_size),
-        in_block_offset=zero,
-        gmem_tile_size=gmem_tile_size,
+        group_id=group,
+        block=block,
+        block_start=block_start,
+        actual_start=actual_start,
+        actual_end=actual_end,
+        start_within_block=start_within_block,
+        actual_size=actual_size,
     )
 
 
@@ -223,20 +171,21 @@ def store_acc_transposed(
   )
   # Write out the largest power of two rows first, then the next largest,
   # etc. This allows us to coalesce writes as much as possible.
-  offset = group_info.in_block_offset
+  offset = group_info.start_within_block
   size = 1 << (min(config.block_m, m).bit_length() - 1)
   while size > 0:
-    @pl.when(group_info.bsize & size != 0)
+
+    @pl.when(group_info.actual_size & size != 0)
     def _():
       o_smem = o_smem0.at[pl.ds(offset, size)]
       o_smem = plgpu.untile_ref(o_smem, (out_swizzle_elems,))
       o_gref_slice = o_gmem.at[
-          pl.ds(group_info.offset + offset, size),
+          pl.ds(group_info.block_start + offset, size),
           pl.ds(ni * config.block_n, config.block_n),
       ]
       plgpu.copy_smem_to_gmem(o_smem, o_gref_slice, commit_group=False)
 
-    offset += group_info.bsize & size
+    offset += group_info.actual_size & size
     size //= 2
   plgpu.commit_smem_to_gmem_group()
   plgpu.wait_smem_to_gmem(0, wait_read_only=True)
@@ -273,18 +222,24 @@ def ragged_kernel(
 
   num_compute_threads = 1 if thread_axis is None else 2
   inner_grid = (
-      config.grid_block_n,
-      pl.cdiv(m, config.block_m) + g - 1,
       pl.cdiv(n, config.grid_block_n * config.block_n * num_compute_threads),
+      pl.cdiv(m, config.block_m) + g - 1,
+      config.grid_block_n,
   )
 
-  def kernel_body(group_sizes_gmem, *args):
-    initial_group_info = GroupInfo.create(group_sizes_gmem, config.block_m)
-    def loop_body(
-        idx: Sequence[jax.Array], carry: GroupInfo
-    ):
-      group_info = carry
-      block_ni, step, remainder_ni = idx
+  def kernel_body(
+      group_id_gmem,
+      block_gmem,
+      block_start_gmem,
+      actual_start_gmem,
+      actual_end_gmem,
+      start_within_block_gmem,
+      actual_size_gmem,
+      *args,
+  ):
+    def loop_body(m_offset, idx: Sequence[jax.Array]):
+      remainder_ni, mi, block_ni = idx
+      mi += m_offset
       ni = (
           block_ni
           * pl.cdiv(
@@ -292,27 +247,36 @@ def ragged_kernel(
           )
           + remainder_ni
       )
-      group_info = group_info.to_step(group_sizes_gmem, step)
-      @pl.when(group_info.bsize > 0)
-      def _():
-        body(group_info, ni, *args)
+      group_info = GroupInfo(
+          group_id=group_id_gmem[mi],
+          block=block_gmem[mi],
+          block_start=block_start_gmem[mi],
+          actual_start=actual_start_gmem[mi],
+          actual_end=actual_end_gmem[mi],
+          start_within_block=start_within_block_gmem[mi],
+          actual_size=actual_size_gmem[mi],
+      )
 
-      return group_info
+      @pl.when(group_info.actual_size > 0)
+      def _():
+        body(group_info, mi, ni, *args)
 
     if config.persistent:
+      # We stratify the grid: first emit a number of blocks that have
+      # definitely work to do. Then schedule blocks that may be
+      # noops. This way we lower the chances that noop bocks are
+      # scheduled to the same SM.
       inner_grid_l = list(inner_grid)
-      # Now we know the exact number of steps required.
-      inner_grid_l[1] = initial_group_info.total_steps
-      plgpu.nd_loop(
-          tuple(inner_grid_l),
-          collective_axes="sm",
-          init_carry=initial_group_info,
-      )(loop_body)
-    else:
-      loop_body(
-          tuple(map(lax.axis_index, ("remainder_n", "m", "block_n"))),
-          initial_group_info,
+      inner_grid_l[1] = pl.cdiv(m, config.block_m)
+      plgpu.nd_loop(tuple(inner_grid_l), collective_axes="sm")(
+          functools.partial(loop_body, 0)
       )
+      inner_grid_l[1] = g - 1
+      plgpu.nd_loop(tuple(inner_grid_l), collective_axes="sm")(
+          functools.partial(loop_body, pl.cdiv(m, config.block_m))
+      )
+    else:
+      loop_body(0, tuple(map(lax.axis_index, ("remainder_n", "m", "block_n",))))
 
   if config.persistent:
     # TODO: Detect this number from device.
