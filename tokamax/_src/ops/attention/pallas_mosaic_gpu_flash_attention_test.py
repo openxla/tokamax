@@ -33,7 +33,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       supports_decode=False,
       supports_bias=True,
       supports_indices=True,
-      supports_vjp=False,
+      supports_vjp=True,
       supports_mask=True,
       supports_tanh_clipping=True,
       supports_is_causal=True,
@@ -85,15 +85,26 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
     kwargs["ref_impl"] = wrapped_ref_impl
     kwargs["atol"] = 0.0045 if bias is None else 0.007
+
+    if (
+        bias is not None
+        or (q.shape[-1] != v.shape[-1])
+        or (q.shape[-1] % 64 != 0)
+        or impl_kwargs.get("q_indices", None) is not None
+        or impl_kwargs.get("k_indices", None) is not None
+        or not impl_kwargs.get("normalize_output", True)
+    ):
+      kwargs["test_vjp"] = False
+
     super()._run_test_with_inputs(q, k, v, bias=bias, **kwargs)
 
   def test_causal_mask(self):
     # TODO: Investigate why it's less accurate with causal mask.
-    with test_base.override_test_args(atol=0.006):
+    with test_base.override_test_args(atol=0.006, atol_grads=0.025):
       super().test_causal_mask()
 
   def test_causal_mask_cross_attention0(self):
-    with test_base.override_test_args(atol=0.006):
+    with test_base.override_test_args(atol=0.006, atol_grads=0.015):
       super().test_causal_mask_cross_attention0()  # pytype: disable=attribute-error
 
   def test_causal_mask_cross_attention1(self):
