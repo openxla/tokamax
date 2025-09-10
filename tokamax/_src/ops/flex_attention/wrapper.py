@@ -15,11 +15,13 @@
 """`DotProductAttention` wrapper for `FlexAttention`."""
 
 import dataclasses
+from typing import Annotated
 
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import pydantic
 from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base as attn_base
@@ -36,7 +38,7 @@ PagingInfo = attn_base.PagingInfo
 class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
   """`DotProductAttention` implementation wrapping a `FlexAttention`."""
 
-  impl: base.FlexAttention
+  impl: Annotated[base.FlexAttention, pydantic.AnyInstanceOf]
 
   @jaxtyping.jaxtyped
   def _fwd(

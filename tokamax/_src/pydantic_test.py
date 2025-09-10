@@ -59,6 +59,8 @@ class _MyDataclass:
   array: jax.Array
   metadata: int
 
+  __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+
 
 class _Foo:
   pass
@@ -116,6 +118,7 @@ class PydanticTest(parameterized.TestCase):
     shape = jax.ShapeDtypeStruct((1, 2), dtype=jnp.float32)
     data = _MyDataclass(array=shape, metadata=42)  # pytype: disable=wrong-arg-types
     adapter = pydantic.TypeAdapter(pydantic_lib.annotate(_MyDataclass))
+    self.assertEqual(data, adapter.validate_python(adapter.dump_python(data)))
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
   def test_abstract_tuple_roundtrip(self):

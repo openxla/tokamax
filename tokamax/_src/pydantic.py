@@ -111,25 +111,21 @@ def annotate(ty: Any) -> Any:
 
 def _annotate_dataclass(cls):
   """Annotates dataclass fields."""
-  fields = dataclasses.fields(cls)
-  config = pydantic.ConfigDict(arbitrary_types_allowed=True)
   # `Field.type` may be a string, rather than a resolved type, so we need to
   # use `typing.get_type_hints` to get the actual type.
-  hints = typing.get_type_hints(cls)
-  new_fields = tuple((f.name, annotate(hints[f.name]), f) for f in fields)
-  new_cls = dataclasses.make_dataclass(cls.__name__, new_fields)
-  new_cls.__pydantic_config__ = config
-  adapter = pydantic.TypeAdapter(new_cls)
+  hints = typing.get_type_hints(cls, include_extras=True)
+  fields = {f.name: annotate(hints[f.name]) for f in dataclasses.fields(cls)}
+  ty = TypedDict(cls.__name__, fields, total=False)  # pytype: disable=wrong-arg-types
+  ty.__pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+  adapter = get_adapter(ty)
 
   def serialize(x, info) -> dict[str, Any]:
     if not isinstance(x, cls):
       raise ValueError(f'Invalid {cls.__name__}: {x}')
-    return adapter.dump_python(x, mode=info.mode)
+    return adapter.dump_python(dataclasses.asdict(x), info)
 
   def validate(x):
-    if isinstance(x, cls):
-      return x
-    return cls(**dataclasses.asdict(adapter.validate_python(x)))
+    return x if isinstance(x, cls) else cls(**adapter.validate_python(x))
 
   return Annotated[
       cls,
