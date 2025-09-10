@@ -21,7 +21,7 @@ import inspect
 import re
 import types
 import typing
-from typing import Annotated, Any, Final, Generic, TypeAlias, TypeVar, Union, cast
+from typing import Annotated, Any, Final, Generic, TypeAlias, TypeVar, Union
 
 import immutabledict
 import jax
@@ -212,7 +212,6 @@ class TypeAdapter(pydantic.TypeAdapter[_T], Generic[_T]):
 
 
 get_adapter = functools.lru_cache(TypeAdapter)
-_TYPE_ADAPTER = get_adapter(pydantic.ImportString[type])
 
 
 class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
@@ -223,25 +222,34 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
   """
 
   @classmethod
-  def __class_getitem__(cls, base_type: type[_T]) -> type[_T]:  # pylint: disable=arguments-renamed
+  def __class_getitem__(cls, item: _T) -> _T:
+    return Annotated[item, cls()]
 
-    def serialize(value: _T, info) -> dict[str, Any]:
-      ty = _TYPE_ADAPTER.dump_python(type(value), info)
-      data_adapter = get_adapter(annotate(type(value)))
-      return dict(__type=ty) | data_adapter.dump_python(value, info)
+  @classmethod
+  def __get_pydantic_core_schema__(cls, source, handler):
+    assert source is not cls
+    type_schema = handler.generate_schema(pydantic.ImportString[type])
+    dict_schema = cs.typed_dict_schema(
+        dict(__type=cs.typed_dict_field(type_schema)),
+        extra_behavior='allow',
+        extras_schema=cs.any_schema(),
+    )
 
-    def validate(data: Any) -> _T:
-      if isinstance(data, base_type):
-        return data
-      data = cast(dict[str, Any], data)
-      ty = _TYPE_ADAPTER.validate_python(data.pop('__type'))
-      return get_adapter(annotate(ty)).validate_python(data)
+    def serialize(value, handler, info) -> dict[str, Any]:
+      data = get_adapter(annotate(type(value))).dump_python(value, info)
+      return dict(__type=handler(type(value))) | data
 
-    return Annotated[
-        base_type,
-        pydantic.PlainSerializer(serialize),
-        pydantic.PlainValidator(validate),
-    ]
+    def validate(value: dict[str, Any]) -> Any:
+      return get_adapter(annotate(value.pop('__type'))).validate_python(value)
+
+    to_cls_schema = cs.no_info_plain_validator_function(validate)
+    from_dict_schema = cs.chain_schema([dict_schema, to_cls_schema])
+    return cs.union_schema(
+        [cs.is_instance_schema(source), from_dict_schema],
+        serialization=cs.wrap_serializer_function_ser_schema(
+            serialize, info_arg=True, schema=type_schema
+        ),
+    )
 
 
 # Use the enum name, rather than the value, for serialization. This improves the
