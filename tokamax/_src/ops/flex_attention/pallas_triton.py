@@ -24,7 +24,9 @@ from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
+import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.flex_attention import base
@@ -417,19 +419,20 @@ def _can_have_block_d(*args):
   return True
 
 
-@dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True)
 class Config:
-  block_q: int
-  block_k: int
-  num_stages: int
-  num_warps: int
-  block_d: int | None = None
-  block_d_out: int | None = None
+  block_q: pydantic.PositiveInt
+  block_k: pydantic.PositiveInt
+  num_stages: pydantic.PositiveInt
+  num_warps: pydantic_lib.PowerOfTwo
+  block_d: pydantic.PositiveInt | None = None
+  block_d_out: pydantic.PositiveInt | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
   """Pallas-Triton FlexAttention implementation."""
+
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = False

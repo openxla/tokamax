@@ -27,7 +27,8 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.pallas import block
-
+import pydantic
+from tokamax._src import pydantic as pydantic_lib
 
 Mask = base.Mask
 Residuals = base.Residuals
@@ -338,12 +339,12 @@ def _bwd_kernel(
 
 @dataclasses.dataclass(frozen=True)
 class Config:
-  block_m1: int
-  block_n1: int
-  block_m2: int
-  block_n2: int
-  num_stages: int
-  num_warps: int
+  block_m1: pydantic.PositiveInt
+  block_n1: pydantic.PositiveInt
+  block_m2: pydantic.PositiveInt
+  block_n2: pydantic.PositiveInt
+  num_stages: pydantic.PositiveInt
+  num_warps: pydantic_lib.PowerOfTwo
 
 
 @jaxtyping.jaxtyped

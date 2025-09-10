@@ -23,15 +23,16 @@ from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
+import pydantic
 from tokamax._src import batching
 from tokamax._src import jaxtyping
+from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import quantization
 from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp as vjp
 from tokamax._src.pallas import block
-
 
 Mask = base.Mask
 QuantizedArray = quantization.QuantizedArray
@@ -512,21 +513,22 @@ def _can_have_block_d(*args):
   return True
 
 
-@dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True)
 class Config:
-  block_q: int
-  block_k: int
-  num_stages: int
-  num_warps: int
-  block_d: int | None = None
-  block_d_out: int | None = None
-  split_k: int = 1
+  block_q: pydantic.PositiveInt
+  block_k: pydantic.PositiveInt
+  num_stages: pydantic.PositiveInt
+  num_warps: pydantic_lib.PowerOfTwo
+  block_d: pydantic.PositiveInt | None = None
+  block_d_out: pydantic.PositiveInt | None = None
+  split_k: pydantic.PositiveInt = 1
   pack_mask: bool = False
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
   """Pallas-Triton FlashAttention implementation."""
+
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = False
