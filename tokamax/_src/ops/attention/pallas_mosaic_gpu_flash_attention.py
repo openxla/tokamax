@@ -338,8 +338,8 @@ def _fwd(
         causal_loop_body = functools.partial(loop_body, do_causal=True)
         ub_no_causal = lax.min(ub, lax.div(q_base, block_kv))
         carry = lax.fori_loop(lb, ub_no_causal, loop_body, (acc, m_i, l_i))
-        # TODO: This cond should be redundant, but without it we hit a
-        # weird compiler bug.
+        # TODO: This cond should be redundant, but without it we
+        # hit a weird compiler bug.
         acc, m_i, l_i = lax.cond(
             ub_no_causal < ub,
             lambda: lax.fori_loop(ub_no_causal, ub, causal_loop_body, carry),
@@ -603,7 +603,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
     # TODO: Support in-kernel dequantization.
     q, k, v = map(base.as_array, (q, k, v))
-    # FIXME: We shouldn't silently downcast types.
+    # TODO: Avoid silently downcasting types.
     k = k.astype(q.dtype)
     v = v.astype(q.dtype)
 

@@ -19,7 +19,7 @@ import jax.numpy as jnp
 
 
 TEST_SPECS_DICT = dict(
-    # FIXME: More dtypes.
+    # TODO: Add more dtypes.
     mixtral_8x7b_bf16=dict(
         q=jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
         k=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),

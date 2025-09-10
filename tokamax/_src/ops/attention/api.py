@@ -32,7 +32,7 @@ Implementation: TypeAlias = Literal[
     "mosaic", "triton", "cudnn", "xla", "xla_chunked"
 ]
 
-# TODO: Should this be larger on TPU?
+# TODO: Investigate if `_XLA_CHUNK_SIZE` should be larger on TPU.
 _XLA_CHUNK_SIZE: Final[int] = 128
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
@@ -47,8 +47,8 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     )
 )
 
-# TODO: Should xla_chunked be used instead of xla for very big
-# sequences lengths? Eg. where xla OOMs.
+# TODO: Investigate if xla_chunked be used instead of xla for very
+# big sequences lengths. Eg. where xla OOMs.
 _DEFAULT_IMPLEMENTATION = ("mosaic", "triton", "xla")
 
 
