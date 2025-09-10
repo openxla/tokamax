@@ -25,12 +25,14 @@ from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import bench_arg_specs
 
 
-def _atol_ctx(atol: float):
+def _atol_ctx(atol: float, atol_grads: float | None = None):
   orig_run_test = test_base._run_test
 
   def my_run_test(*args, **kwargs):
-    _ = kwargs.pop("atol", None)
-    orig_run_test(*args, **(kwargs | dict(atol=atol)))
+    kwargs["atol"] = atol
+    if atol_grads is not None:
+      kwargs["atol_grads"] = atol_grads
+    orig_run_test(*args, **kwargs)
 
   return mock.patch.object(test_base, "_run_test", my_run_test)
 
@@ -70,32 +72,42 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     )
     self._supports_decode = supports_decode
 
-  def _run_test_with_inputs(self, q, k, v, *args, **kwargs):
+  def _run_test_with_inputs(self, q, k, v, bias=None, **kwargs):
     # PallasMosaicGpuFlashAttention doesn't support high precisions,
     # (logits_dtype != f32) and f32 inputs. Override the arguments instead of
     # disabling basicaly most of the tests.
-    kwargs["impl_kwargs"] = kwargs.get("impl_kwargs", {}) | dict(
-        precision=jax.lax.DotAlgorithmPreset.DEFAULT,
-        logits_dtype=jnp.float32,
-    )
+    impl_kwargs = kwargs.setdefault("impl_kwargs", {})
+    impl_kwargs["precision"] = jax.lax.DotAlgorithmPreset.DEFAULT
+    impl_kwargs["logits_dtype"] = jnp.float32
+    ref_impl = kwargs.get("ref_impl", test_base.nn.dot_product_attention)
 
-    cast = (
-        lambda x: x.astype(jnp.bfloat16)
-        if isinstance(x, jax.Array) and x.dtype == jnp.float32
-        else x
-    )
-    impl = kwargs.get("impl", self._attention_fn)
-    kwargs["impl"] = lambda *args, **kwargs: impl(*map(cast, args), **kwargs)
-    kwargs["atol"] = 0.007 if "bias" in kwargs else 0.0045
-    super()._run_test_with_inputs(q, k, v, *args, **kwargs)
+    def as_bf16(x):
+      if isinstance(x, jax.Array) and x.dtype == jnp.float32:
+        return x.astype(jnp.bfloat16)
+      return x
+
+    q, k, v, bias = map(as_bf16, (q, k, v, bias))
+
+    def wrapped_ref_impl(q, k, v, *, bias=None, **kwargs):
+      def as_f32(x):
+        if isinstance(x, jax.Array):
+          return x.astype(jnp.promote_types(x.dtype, jnp.float32))
+        return x
+
+      q, k, v, bias = map(as_f32, (q, k, v, bias))
+      return ref_impl(q, k, v, bias=bias, **kwargs)
+
+    kwargs["ref_impl"] = wrapped_ref_impl
+    kwargs["atol"] = 0.0045 if bias is None else 0.007
+    super()._run_test_with_inputs(q, k, v, bias=bias, **kwargs)
 
   def test_causal_mask(self):
     # TODO: Investigate why it's less accurate with causal mask.
-    with _atol_ctx(0.01):
+    with _atol_ctx(0.006):
       super().test_causal_mask()
 
   def test_causal_mask_cross_attention0(self):
-    with _atol_ctx(0.01):
+    with _atol_ctx(0.006):
       super().test_causal_mask_cross_attention0()  # pytype: disable=attribute-error
 
   def test_causal_mask_cross_attention1(self):
@@ -109,7 +121,8 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     self.skipTest("TODO: Enable benchmark tests.")
 
   def test_normalize_output(self):
-    self.skipTest("TODO: Fix precision when `normalize_output=False`.")
+    with _atol_ctx(0.02):
+      super().test_normalize_output()
 
   def test_base2(self):
     impl = flash_attention.PallasMosaicGpuFlashAttention(use_base2=True)
