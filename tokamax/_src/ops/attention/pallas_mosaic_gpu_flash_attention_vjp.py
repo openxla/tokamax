@@ -683,23 +683,34 @@ def _bwd(
   return dq, dk, dv
 
 
-def _decompose_mask(mask, q, k):
-  """Decomposes `mask` into a mask array, `is_causal`, `k_start` and `k_end`."""
+def _decompose_mask(mask, q, k, q_indices, k_indices):
+  """Decomposes `mask` into a mask array, `k_start` and `k_end`."""
   if mask is None:
-    return None, False, None, None
+    return None, None, None
 
-  mask, k_start, k_end = mask.take("k_start", "k_end")
+  k_start = None
+  k_end = None
 
-  if k_start is not None:
-    k_start = jax.lax.broadcast_to_rank(k_start, 2)
+  if k_indices is None:
+    mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
 
-  if k_end is not None:
-    k_end = jax.lax.broadcast_to_rank(k_end, 2)
+    # TODO: Support not folding `is_causal` into `k_end`.
+    # Fold `is_causal` into `k_end`.
+    if is_causal:
+      if q_indices is None:
+        q_indices = jnp.arange(q.shape[-3])
+      k_end_ = q_indices + 1
+      k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
 
-  # TODO: Extract k_start, k_end, is_causal from the mask.
+    if k_start is not None:
+      k_start = jax.lax.broadcast_to_rank(k_start, 2)
+    if k_end is not None:
+      k_end = jax.lax.broadcast_to_rank(k_end, 2)
 
-  mask = mask.as_array(q.shape[-3], k.shape[-3])
-  return mask, None, k_start, k_end
+  q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
+  k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
+  mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+  return mask, k_start, k_end
 
 
 _SUPPORTED_PRECISIONS = (
@@ -766,19 +777,10 @@ class PallasMosaicGpuFlashAttentionVjp(
     if dropout_mask is not None:
       raise NotImplementedError("dropout is not supported.")
 
-    if q_indices is not None:
-      raise NotImplementedError("q_indices is not implemented.")
-
-    if k_indices is not None:
-      raise NotImplementedError("k_indices is not implemented.")
-
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
 
-    mask, is_causal, k_start, k_end = _decompose_mask(mask, q, k)
-
-    # TODO: Add support for `is_causal`
-    del is_causal
+    mask, k_start, k_end = _decompose_mask(mask, q, k, q_indices, k_indices)
 
     q_k_dot_precision, weights_v_dot_precision = precision
     if q_k_dot_precision not in _SUPPORTED_PRECISIONS:
