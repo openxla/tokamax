@@ -14,6 +14,7 @@
 # ==============================================================================
 from collections.abc import Callable
 import dataclasses
+from typing import Annotated
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -110,8 +111,9 @@ class PydanticTest(parameterized.TestCase):
       (batching.BatchedShapeDtype((8, 9), jnp.int8, vmap_axes=()),),
   )
   def test_shape_dtype_roundtrip(self, shape):
-    config = pydantic.ConfigDict(arbitrary_types_allowed=True)
-    adapter = pydantic.TypeAdapter(pydantic_lib.ShapeDtype, config=config)
+    ty = Annotated[jax.Array, pydantic_lib.ShapeDtype]
+    adapter = pydantic.TypeAdapter(ty)
+    self.assertEqual(shape, adapter.validate_python(adapter.dump_python(shape)))
     self.assertEqual(shape, adapter.validate_json(adapter.dump_json(shape)))
 
   def test_abstract_dataclass_roundtrip(self):
@@ -169,7 +171,6 @@ class PydanticTest(parameterized.TestCase):
         if op_cls is ragged_dot_base.RaggedDot:
           spec["group_sizes"] = spec["group_sizes"].representative_value
         self.assertEqual(spec, spec_roundtrip)
-      break
 
 
 if __name__ == "__main__":

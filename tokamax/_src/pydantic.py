@@ -21,7 +21,7 @@ import inspect
 import re
 import types
 import typing
-from typing import Annotated, Any, Final, Generic, TypeAlias, TypeVar, Union
+from typing import Annotated, Any, Generic, TypeAlias, TypeVar, Union
 
 import immutabledict
 import jax
@@ -30,6 +30,7 @@ import jax.numpy as jnp
 import jaxtyping
 import numpy as np
 import pydantic
+import pydantic_core
 from pydantic_core import core_schema as cs
 from tokamax._src import batching
 from typing_extensions import TypedDict  # Required for Python <3.12.
@@ -82,7 +83,7 @@ def annotate(ty: Any) -> Any:
     if issubclass(ty, jaxtyping.AbstractArray):
       ty = ty.array_type
     if ty is jax.Array:
-      return ShapeDtype
+      return Annotated[ty, ShapeDtype]
     if issubclass(ty, enum.Enum):
       return Annotated[ty, EnumByName]
     if issubclass(ty, np.dtype):
@@ -108,62 +109,9 @@ def annotate(ty: Any) -> Any:
     return Annotated[ty, Dataclass]
   return ty
 
-
-_SHORT_DTYPE_NAMES_MAP: Final[
-    immutabledict.immutabledict[str, jax.typing.DTypeLike]
-] = immutabledict.immutabledict(
-    bool=bool,
-    i4=jnp.int4,
-    i8=np.int8,
-    i16=np.int16,
-    i32=np.int32,
-    i64=np.int64,
-    u8=np.uint8,
-    u16=np.uint16,
-    u32=np.uint32,
-    u64=np.uint64,
-    f16=np.float16,
-    f32=np.float32,
-    f64=np.float64,
-    bf16=jnp.bfloat16,
-)
-
-
-def _serialize_shape_dtype(x) -> str:
-  if not isinstance(x, jax.ShapeDtypeStruct):
-    raise ValueError(f'Invalid ShapeDtype: {type(x)}')
-  s = jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
-  if not (isinstance(x, batching.BatchedShapeDtype) and x.vmap_axes):
-    return s
-  axes_str = str(Axes.dump_json(x.vmap_axes), 'utf-8')
-  return ''.join([s, '{vmap_axes=', axes_str, '}'])
-
-
-_SHAPE_DTYPE_PATTERN = re.compile(r'(.*?)(\[.*?\])(\{vmap_axes=(\[.*\])\})?')
-
-
-def _validate_shape_dtype(x) -> jax.ShapeDtypeStruct:
-  if isinstance(x, jax.ShapeDtypeStruct):
-    return x
-  if not isinstance(x, str) or (match := _SHAPE_DTYPE_PATTERN.match(x)) is None:
-    raise ValueError(f'Invalid ShapeDtype: {x}')
-  dtype_str, shape_str, _, vmap_axes_str = match.groups()
-  shape = Shape.validate_json(shape_str)
-  dtype = _SHORT_DTYPE_NAMES_MAP[dtype_str]
-  if vmap_axes_str is None:
-    return jax.ShapeDtypeStruct(shape, dtype)
-  vmap_axes = Axes.validate_json(vmap_axes_str)
-  return batching.BatchedShapeDtype(shape, dtype, vmap_axes=vmap_axes)
-
-
-Shape = pydantic.TypeAdapter(tuple[int, ...])
-Axes = pydantic.TypeAdapter(tuple[int, ...])
-ShapeDtype = Annotated[
-    jax.ShapeDtypeStruct,
-    pydantic.PlainValidator(_validate_shape_dtype),
-    pydantic.PlainSerializer(_serialize_shape_dtype),
-]
 # pytype: enable=invalid-annotation
+
+
 _T = TypeVar('_T')
 
 
@@ -256,6 +204,78 @@ EnumByName = pydantic.GetPydanticSchema(
         ),
     )
 )
+
+
+class ShapeDtype:
+  """Serializes `jax.Array`-like types to an abstract representation."""
+
+  PATTERN = re.compile(r'(.*?)(\[.*?\])(\{vmap_axes=(\[.*\])\})?')
+  SHORT_DTYPE_NAMES_MAP = immutabledict.immutabledict(
+      bool=bool,
+      i4=jnp.int4,
+      i8=np.int8,
+      i16=np.int16,
+      i32=np.int32,
+      i64=np.int64,
+      u8=np.uint8,
+      u16=np.uint16,
+      u32=np.uint32,
+      u64=np.uint64,
+      f16=np.float16,
+      f32=np.float32,
+      f64=np.float64,
+      bf16=jnp.bfloat16,
+  )
+
+  @classmethod
+  def __get_pydantic_core_schema__(cls, source, handler):
+    del handler  # Unused.
+    assert source in (jax.Array, jax.ShapeDtypeStruct)
+    ints_schema = cs.tuple_schema([cs.int_schema()], variadic_item_index=0)
+    ints_serializer = pydantic_core.SchemaSerializer(ints_schema)
+
+    def serialize(x, info) -> Any:
+      # We don't want match other types with `shape` and `dtype` attributes.
+      if not isinstance(x, (jax.Array, jax.ShapeDtypeStruct)):
+        raise ValueError(f'Invalid ShapeDtype: {type(x)}')
+      if info.mode == 'python':
+        return x
+      s = jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
+      if isinstance(x, batching.BatchedShapeDtype) and x.vmap_axes:
+        vmap_axes_str = str(ints_serializer.to_json(x.vmap_axes), 'utf-8')
+        return f'{s}{{vmap_axes={vmap_axes_str}}}'
+      return s
+
+    def to_shape_dtype(value: str, handler) -> jax.ShapeDtypeStruct:
+      if (match := cls.PATTERN.match(value)) is None:
+        raise ValueError(f'Invalid ShapeDtype: {value}')
+      dtype, shape, _, vmap_axes = handler(match.groups())
+      dtype = cls.SHORT_DTYPE_NAMES_MAP[dtype]
+      if vmap_axes is None:
+        return jax.ShapeDtypeStruct(shape, dtype)
+      return batching.BatchedShapeDtype(shape, dtype, vmap_axes=vmap_axes)
+
+    groups_schema = cs.tuple_schema([
+        cs.any_schema(),
+        cs.json_schema(ints_schema),
+        cs.any_schema(),
+        cs.nullable_schema(cs.json_schema(ints_schema)),
+    ])
+    from_str_schema = cs.chain_schema([
+        cs.str_schema(),
+        cs.no_info_wrap_validator_function(to_shape_dtype, groups_schema),
+    ])
+    return cs.json_or_python_schema(
+        json_schema=from_str_schema,
+        python_schema=cs.union_schema([
+            cs.is_instance_schema(source),
+            cs.is_instance_schema(jax.ShapeDtypeStruct),
+            from_str_schema,
+        ]),
+        serialization=cs.plain_serializer_function_ser_schema(
+            serialize, info_arg=True
+        ),
+    )
 
 
 def get_arg_spec_model(
