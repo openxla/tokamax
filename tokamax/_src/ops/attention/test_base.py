@@ -537,11 +537,14 @@ class AttentionTestBase(parameterized.TestCase):
         ),
     )
 
-  def test_tanh_clipping(self):
+  @parameterized.parameters(True, False)
+  def test_tanh_clipping(self, use_bias):
+    if use_bias and not self._supports_bias:
+      self.skipTest("Bias not supported")
     self._run_test(
         (2, 1024, 4, 64),
         # Check we perform clipping after bias.
-        bias_shape=(2, 4, 1024, 1024) if self._supports_bias else None,
+        bias_shape=(2, 4, 1024, 1024) if use_bias else None,
         ref_impl=_ref_impl_tanh,
         expect_supported=self._supports_tanh_clipping,
         logits_soft_cap=10.0,

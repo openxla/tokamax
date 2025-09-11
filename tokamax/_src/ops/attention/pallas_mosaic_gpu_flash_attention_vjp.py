@@ -77,6 +77,7 @@ def _bwd(
     k_start: Int[Array, "*#B #H #T"] | None,
     k_end: Int[Array, "*#B #H #T"] | None,
     logits_scale: float,
+    logits_soft_cap: float | None,
     use_base2: bool,
     config: Config,
 ) -> tuple[
@@ -273,12 +274,16 @@ def _bwd(
         return acc_ref[...]
 
       s = pl.run_scoped(compute_s, plgpu.ACC((block_q, block_kv), jnp.float32))
+      s *= logits_scale
 
-      s_scale = logits_scale
+      if logits_soft_cap is not None:
+        logits = jnp.tanh(s / logits_soft_cap)
+        s = logits_soft_cap * logits
+
+      # NOTE: This rescaling must happen after the soft-cap but before the
+      # attention masking (as the multiplication will cause `-inf`s).
       if use_base2:
-        s_scale *= math.log2(math.e)
-
-      s *= s_scale
+        s *= math.log2(math.e)
 
       mask_value = float(jnp.finfo(jnp.float32).min)
 
@@ -321,6 +326,8 @@ def _bwd(
       plgpu.barrier_arrive(v_consumed_barrier)
 
       ds = p * (dp - lax.broadcast_in_dim(delta, (block_q, block_kv), [0]))
+      if logits_soft_cap is not None:
+        ds *= 1 - jnp.pow(logits, 2)
       ds *= logits_scale
 
       def compute_dq(acc_ref):
@@ -485,13 +492,17 @@ def _bwd(
       sT = pl.run_scoped(
           compute_sT, plgpu.ACC((block_kv, block_q), jnp.float32)
       )
+      sT *= logits_scale
 
-      s_scale = logits_scale
+      if logits_soft_cap is not None:
+        logits = jnp.tanh(sT / logits_soft_cap)
+        sT = logits_soft_cap * logits
+
+      # NOTE: This rescaling must happen after the soft-cap but before the
+      # attention masking (as the multiplication will cause `-inf`s).
       if use_base2:
-        s_scale *= math.log2(math.e)
+        sT *= math.log2(math.e)
         m *= math.log2(math.e)
-
-      sT *= s_scale
 
       mask_value = float(jnp.finfo(jnp.float32).min)
 
@@ -550,6 +561,8 @@ def _bwd(
       plgpu.barrier_arrive(delta_consumed_barrier)
 
       dsT = pT * (dpT - broadcast(delta))  # pytype: disable=wrong-arg-types  # jax-operator-types
+      if logits_soft_cap is not None:
+        dsT *= 1 - jnp.pow(logits, 2)
       dsT *= logits_scale
 
       def compute_dk(acc_ref):
@@ -781,10 +794,6 @@ class PallasMosaicGpuFlashAttentionVjp(
     if bias is not None:
       raise ValueError("`bias` not supported.")
 
-    # TODO: Add support for `logits_soft_cap`.
-    if logits_soft_cap is not None:
-      raise ValueError("`logits_soft_cap` not supported.")
-
     if dropout_mask is not None:
       raise NotImplementedError("dropout is not supported.")
 
@@ -805,6 +814,7 @@ class PallasMosaicGpuFlashAttentionVjp(
         k_start=k_start,
         k_end=k_end,
         logits_scale=logits_scale,
+        logits_soft_cap=logits_soft_cap,
         use_base2=self.use_base2,
         config=config,
     )
