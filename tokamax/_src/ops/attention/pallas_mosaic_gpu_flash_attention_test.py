@@ -113,7 +113,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     self.skipTest("TODO: Enable benchmark tests.")
 
   def test_normalize_output(self):
-    with test_base.override_test_args(atol=0.025):
+    with test_base.override_test_args(atol=0.02):
       super().test_normalize_output()
 
   def test_base2(self):
@@ -121,8 +121,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     self._run_test((2, 1024, 4, 64), impl=impl)
 
   def test_unstable_softmax(self):
-    # pytype: disable=wrong-arg-types
-    impl = dataclasses.replace(self._attention_fn, use_stable_softmax=False)
+    impl = dataclasses.replace(self._attention_fn, use_stable_softmax=False)  # pytype: disable=wrong-arg-types
     self._run_test((2, 1024, 4, 64), impl=impl)
 
 
