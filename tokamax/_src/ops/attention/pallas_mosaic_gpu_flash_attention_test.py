@@ -91,7 +91,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     if (
         bias is not None
         or (q.shape[-1] != v.shape[-1])
-        or (q.shape[-1] % 64 != 0)
         or not impl_kwargs.get("normalize_output", True)
     ):
       kwargs["test_vjp"] = False

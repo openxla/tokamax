@@ -29,6 +29,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 
@@ -84,14 +85,17 @@ def _bwd(
     Float[Array, "*B t h d"],  # dv
 ]:
   orig_q_shape = q.shape
-  orig_kv_shape = k.shape
+  orig_k_shape = k.shape
+  orig_v_shape = v.shape
   as_ndim = lambda x, ndim: jax.lax.collapse(
       jax.lax.broadcast_to_rank(x, ndim), 0, -ndim + 1
   )
   as_3d = lambda x: as_ndim(x, 3)
   as_4d = lambda x: as_ndim(x, 4)
+  pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
 
   q, k, v, out, dout = map(as_4d, (q, k, v, out, dout))
+  q, k, v, out, dout = map(pad_head_dim, (q, k, v, out, dout))
   m, l = map(as_3d, residuals)
 
   batch_size, q_seq_len, num_q_heads, head_dim = q.shape
@@ -108,8 +112,6 @@ def _bwd(
     raise NotImplementedError(
         f"Only f16 and bf16 are supported, got dtype: {dtype}"
     )
-  if head_dim % 64:
-    raise ValueError(f"{head_dim=} must be divisible by 64")
   if num_q_heads % num_kv_heads:
     raise ValueError(f"{num_q_heads=} must be divisible by and {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
@@ -676,10 +678,9 @@ def _bwd(
     dk = dk.reshape(sum_shape).astype(jnp.float32).sum(axis=-2).astype(dk.dtype)
     dv = dv.reshape(sum_shape).astype(jnp.float32).sum(axis=-2).astype(dv.dtype)
 
-  dq = dq.reshape(*orig_q_shape)
-  dk = dk.reshape(*orig_kv_shape)
-  dv = dv.reshape(*orig_kv_shape)
-
+  dq = dq[..., : orig_q_shape[-1]].reshape(*orig_q_shape)
+  dk = dk[..., : orig_k_shape[-1]].reshape(*orig_k_shape)
+  dv = dv[..., : orig_v_shape[-1]].reshape(*orig_v_shape)
   return dq, dk, dv
 
 
