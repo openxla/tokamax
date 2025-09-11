@@ -105,33 +105,8 @@ def annotate(ty: Any) -> Any:
     # TODO: Add support for serializing `Fusion`s.
     return Annotated[ty, pydantic.PlainSerializer(str, return_type=str)]
   if dataclasses.is_dataclass(origin):
-    return _annotate_dataclass(origin)
+    return Annotated[ty, Dataclass]
   return ty
-
-
-def _annotate_dataclass(cls):
-  """Annotates dataclass fields."""
-  # `Field.type` may be a string, rather than a resolved type, so we need to
-  # use `typing.get_type_hints` to get the actual type.
-  hints = typing.get_type_hints(cls, include_extras=True)
-  fields = {f.name: annotate(hints[f.name]) for f in dataclasses.fields(cls)}
-  ty = TypedDict(cls.__name__, fields, total=False)  # pytype: disable=wrong-arg-types
-  ty.__pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
-  adapter = get_adapter(ty)
-
-  def serialize(x, info) -> dict[str, Any]:
-    if not isinstance(x, cls):
-      raise ValueError(f'Invalid {cls.__name__}: {x}')
-    return adapter.dump_python(dataclasses.asdict(x), info)
-
-  def validate(x):
-    return x if isinstance(x, cls) else cls(**adapter.validate_python(x))
-
-  return Annotated[
-      cls,
-      pydantic.PlainValidator(validate),
-      pydantic.PlainSerializer(serialize),
-  ]
 
 
 _SHORT_DTYPE_NAMES_MAP: Final[
@@ -246,6 +221,28 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
             serialize, info_arg=True, schema=type_schema
         ),
     )
+
+
+class Dataclass:
+  """Annotates the fields of a dataclass."""
+
+  @classmethod
+  def __get_pydantic_core_schema__(cls, source, handler):
+    schema = handler.resolve_ref_schema(handler(source))
+    assert schema['type'] == 'dataclass'
+    args_schema = schema['schema']
+    assert args_schema['type'] == 'dataclass-args'
+
+    origin = typing.get_origin(source) or source
+    hints = typing.get_type_hints(origin, include_extras=True)
+    for field in args_schema['fields']:
+      assert field['type'] == 'dataclass-field'
+      ty = hints[field['name']]
+      if (annotated_ty := annotate(ty)) != ty:
+        if field['schema']['type'] == 'default':  # Retain default values.
+          field = field['schema']
+        field['schema'] = handler.generate_schema(annotated_ty)
+    return schema
 
 
 # Use the enum name, rather than the value, for serialization. This improves the
