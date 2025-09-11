@@ -18,10 +18,12 @@ from typing import Any
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
+import tokamax
 from tokamax._src import benchmarking
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_base
+from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu

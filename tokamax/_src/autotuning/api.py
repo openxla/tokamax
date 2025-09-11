@@ -23,7 +23,6 @@ from absl import logging
 import immutabledict
 import jax
 import pydantic
-from tokamax._src import benchmarking
 from tokamax._src import hlo_utils
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.autotuning import autotuner
@@ -44,6 +43,8 @@ HloComputation: TypeAlias = (
     jax.stages.Lowered
     | hlo_pb2.HloModuleProto
     | Sequence[hlo_pb2.HloModuleProto]
+    | hlo_pb2.HloProto
+    | Sequence[hlo_pb2.HloProto]
 )
 BoundArgsAutotuningData: TypeAlias = tuple[
     op_base.BoundArguments, autotuner.AutotuningData[Any]
@@ -137,18 +138,8 @@ def get_bound_args(
   Returns:
     A tuple of unique BoundArguments for all Tokamax ops in x.
   """
-  if isinstance(x, hlo_pb2.HloModuleProto):
-    hlo_modules = (x,)
-  elif isinstance(x, (list, tuple)):
-    hlo_modules = tuple(x)
-  elif isinstance(x, jax.stages.Lowered):
-    hlo_modules = tuple(
-        hlo_pb2.HloModuleProto.FromString(hlo.as_serialized_hlo_module_proto())
-        for hlo in x.compile().runtime_executable().hlo_modules()
-    )
-  else:
-    raise ValueError(f"Unsupported HLO computation type {type(x)}")
 
+  hlo_modules = _get_hlo_modules(x)
   # Filter out bound args so that only unique ones remain.
   seen_keys = set()
   unique_bound_args = []
@@ -158,6 +149,31 @@ def get_bound_args(
       seen_keys.add((bound_arg.op, key))
       unique_bound_args.append(bound_arg)
   return tuple(unique_bound_args)
+
+
+_convert_hlo_module = (
+    lambda x: x.hlo_module if isinstance(x, hlo_pb2.HloProto) else x
+)
+
+
+def _get_hlo_modules(
+    x: HloComputation,
+) -> tuple[hlo_pb2.HloModuleProto, ...]:
+  """Converts x to a tuple of HLO module protos."""
+
+  if isinstance(x, hlo_pb2.HloModuleProto):
+    return (x,)
+  elif isinstance(x, hlo_pb2.HloProto):
+    return (x.hlo_module,)
+  elif isinstance(x, (tuple, list)):
+    return tuple(_convert_hlo_module(hlo) for hlo in x)
+  elif isinstance(x, jax.stages.Lowered):
+    return tuple(
+        hlo_pb2.HloModuleProto.FromString(hlo.as_serialized_hlo_module_proto())
+        for hlo in x.compile().runtime_executable().hlo_modules()
+    )
+  else:
+    raise ValueError(f"Unsupported HLO computation type {type(x)}")
 
 
 _API_IMPLEMENTATIONS: Final[
