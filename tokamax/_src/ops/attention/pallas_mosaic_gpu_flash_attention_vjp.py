@@ -99,10 +99,7 @@ def _bwd(
   m, l = map(as_3d, residuals)
 
   batch_size, q_seq_len, num_q_heads, head_dim = q.shape
-  _, kv_seq_len, num_kv_heads, _ = k.shape
-  kv_shape = (batch_size, kv_seq_len, num_kv_heads, head_dim)
-  if k.shape != kv_shape:
-    raise ValueError(f"Expected {k.shape=} to be {kv_shape} (inferred from q).")
+  _, kv_seq_len, num_kv_heads, head_dim_out = v.shape
   if (dtype := q.dtype) != k.dtype or dtype != v.dtype:
     raise ValueError(
         f"q, k, and v should all have the same dtype, got: {q.dtype},"
@@ -369,7 +366,7 @@ def _bwd(
                 transforms=transforms,
             ),
             plgpu.BlockSpec(  # v
-                block_shape=(block_kv, head_dim),
+                block_shape=(block_kv, head_dim_out),
                 index_map=lambda i: (i, 0),
                 transforms=transforms,
             ),
@@ -435,10 +432,10 @@ def _bwd(
           L.WGMMA,
       )
       dv_acc = plgpu.layout_cast(
-          jnp.full((block_kv, head_dim), 0, dtype=jnp.float32),
+          jnp.full((block_kv, head_dim_out), 0, dtype=jnp.float32),
           L.WGMMA,
       )
-      (dk, dv) = pipeline_callback((dv_acc, dk_acc))
+      dk, dv = pipeline_callback((dk_acc, dv_acc))
       k_smem[...] = dk.astype(k.dtype)
       v_smem[...] = dv.astype(v.dtype)
 
@@ -593,7 +590,7 @@ def _bwd(
                 transforms=transforms,
             ),
             plgpu.BlockSpec(  # dout
-                block_shape=(block_q, head_dim),
+                block_shape=(block_q, head_dim_out),
                 index_map=lambda i: (i, 0),
                 transforms=transforms,
             ),
@@ -620,9 +617,14 @@ def _bwd(
         mask_ref if async_mask else None,
     )
 
-  q_scratch = dout_scratch = plgpu.SMEM(
+  q_scratch = plgpu.SMEM(
       (compute_wgs, config.block_q_dq, head_dim),
       q.dtype,
+      transforms=transforms,
+  )
+  dout_scratch = plgpu.SMEM(
+      (compute_wgs, config.block_q_dq, head_dim_out),
+      dout.dtype,
       transforms=transforms,
   )
   m_scratch = l_scratch = delta_scratch = plgpu.SMEM(
@@ -645,14 +647,20 @@ def _bwd(
       thread_name="wg",
   )(q, k, v, dout, m, l, delta, mask, k_start, k_end)
 
-  k_scratch = v_scratch = plgpu.SMEM(
+  k_scratch = plgpu.SMEM(
       (compute_wgs, config.block_kv_dkv, head_dim),
       k.dtype,
       transforms=transforms,
   )
-  out_shape_kv = jax.ShapeDtypeStruct(
-      (batch_size, kv_seq_len, num_q_heads, head_dim), dtype=k.dtype
+  v_scratch = plgpu.SMEM(
+      (compute_wgs, config.block_kv_dkv, head_dim_out),
+      v.dtype,
+      transforms=transforms,
   )
+  # `dk` and `dv` outputs have `num_q_heads` heads (reduced below if necessary).
+  dk_shape = (batch_size, kv_seq_len, num_q_heads, head_dim)
+  dv_shape = (batch_size, kv_seq_len, num_q_heads, head_dim_out)
+
   # TODO: Fuse transpose in the kernel.
   if mask is not None:
     mask = mask.swapaxes(-1, -2)
@@ -661,7 +669,10 @@ def _bwd(
       functools.partial(
           kernel_dkv, block_q=config.block_q_dkv, block_kv=config.block_kv_dkv
       ),
-      out_shape=[out_shape_kv, out_shape_kv],
+      out_shape=(
+          jax.ShapeDtypeStruct(dk_shape, k.dtype),
+          jax.ShapeDtypeStruct(dv_shape, v.dtype),
+      ),
       scratch_shapes=[
           (k_scratch, v_scratch),  # type: ignore
           (plgpu.Barrier(num_barriers=compute_wgs),) * 2,  # type: ignore
@@ -674,9 +685,8 @@ def _bwd(
   )(q, k, v, dout, m, l, delta, mask, k_start, k_end)
 
   if q_heads_per_kv_head > 1:
-    sum_shape = (*k.shape[:-1], q_heads_per_kv_head, head_dim)
-    dk = dk.reshape(sum_shape).astype(jnp.float32).sum(axis=-2).astype(dk.dtype)
-    dv = dv.reshape(sum_shape).astype(jnp.float32).sum(axis=-2).astype(dv.dtype)
+    dk = dk.reshape(*k.shape[:-1], q_heads_per_kv_head, -1).sum(axis=-2)
+    dv = dv.reshape(*v.shape[:-1], q_heads_per_kv_head, -1).sum(axis=-2)
 
   dq = dq[..., : orig_q_shape[-1]].reshape(*orig_q_shape)
   dk = dk[..., : orig_k_shape[-1]].reshape(*orig_k_shape)
