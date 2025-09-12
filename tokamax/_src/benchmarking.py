@@ -32,10 +32,7 @@ from tokamax._src import batching
 from tokamax._src import numerics
 from tokamax._src import utils
 
-# TODO: Support xprof once it's programmatically available in jaxlib.
-xprof_session = None
-profile_data = None
-from tokamax._src import xplane_pb2  # pylint: disable=g-bad-import-order
+xprof_session, profile_data = None, None  # stubs for internal benchmarking
 
 
 PyTree = Any
@@ -145,12 +142,8 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         msg += ' Check also that build flag `--config=cuda` is used.'
       raise ValueError(msg)
 
-    if self._jax_profiler_mode:
-      t_starts = [e.offset_ps / 1e3 for e in all_events]
-      t_ends = [(e.offset_ps + e.duration_ps) / 1e3 for e in all_events]
-    else:
-      t_starts = [e.start_ns for e in all_events]
-      t_ends = [e.start_ns + e.duration_ns for e in all_events]
+    t_starts = [e.start_ns for e in all_events]
+    t_ends = [e.start_ns + e.duration_ns for e in all_events]
     duration_ns = max(t_ends) - min(t_starts)
 
     # timedelta will round to the nearest microsecond, which is the smallest
@@ -190,8 +183,9 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       )
       assert len(profile_paths) == 1, 'Expected exactly one profile file.'
       profile_path = profile_paths[0]
-      self._profile = xplane_pb2.XSpace()
-      self._profile.ParseFromString(profile_path.read_bytes())
+      self._profile = jax.profiler.ProfileData.from_serialized_xspace(
+          profile_path.read_bytes()
+      )
       self._profile_tempdir.cleanup()
       self._profile_tempdir = None
     else:
@@ -338,8 +332,7 @@ _TIMERS: dict[str, Callable[[Callable[[T], Any], T], Timer]] = {
     'hermetic_xprof': hermetic_xprof_timer,
 }
 
-# TODO: TPU default should be 'xprof', fix once it's supported outside.
-_DEFAULT_TIMING_METHOD = {'gpu': 'cupti', 'tpu': 'wallclock'}
+_DEFAULT_TIMING_METHOD = {'gpu': 'cupti', 'tpu': 'xprof'}
 _FALLBACK_TIMING_METHOD = 'wallclock'
 
 
@@ -387,22 +380,25 @@ def compile_benchmark(
     Returns:
       A `BenchmarkData` object.
     """
+    concrete_inputs = [z for z in jax.tree.leaves(x)
+                       if isinstance(z, jax.Array) and jax.core.is_concrete(z)]
+    if concrete_inputs:
+      platform = list(concrete_inputs[0].devices())[0].platform
+    else:
+      platform = jax.default_backend()
     if method is None:
-      method = _DEFAULT_TIMING_METHOD.get(
-          jax.default_backend(), _FALLBACK_TIMING_METHOD
-      )
+      method = _DEFAULT_TIMING_METHOD.get(platform, _FALLBACK_TIMING_METHOD)
 
-    # TODO: Check if default_backend() is the best way to get the device.
     if method == 'cuda_events':
-      if jax.default_backend() != 'gpu':
+      if platform != 'gpu':
         raise ValueError('CUDA events are only supported on GPU.')
       f_ = f  # CUDA events needs to `jit` the function.
     elif method == 'cupti':
-      if jax.default_backend() != 'gpu':
+      if platform != 'gpu':
         raise ValueError('CUPTI profiler is only supported on GPU.')
       f_ = f_compiled
     elif method in ('hermmetic_xprof', 'xprof'):
-      if jax.default_backend() not in ('gpu', 'tpu'):
+      if platform not in ('gpu', 'tpu'):
         raise ValueError('XProf profiling is only supported on GPU or TPU.')
       f_ = f_compiled
     else:
