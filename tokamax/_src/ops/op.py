@@ -291,12 +291,12 @@ _AUTOTUNING_CACHE: dict[
 _AUTOTUNING_CACHE_OVERLAY = threading.local()
 
 
-def get_autotuning_cache_overlay() -> (
-    list[dict[Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]]]
-):
-  if (overlay := getattr(_AUTOTUNING_CACHE_OVERLAY, "stack", None)) is None:
-    _AUTOTUNING_CACHE_OVERLAY.stack = overlay = []
-  return overlay
+def get_autotuning_cache_overlay_state() -> Any:
+  if not hasattr(_AUTOTUNING_CACHE_OVERLAY, "stack"):
+    _AUTOTUNING_CACHE_OVERLAY.stack = []
+    if jax.version.__version_info__ >= (0, 7, 2):
+      _AUTOTUNING_CACHE_OVERLAY.context = jax.make_user_context(())
+  return _AUTOTUNING_CACHE_OVERLAY
 
 
 class AUTO:
@@ -423,7 +423,7 @@ class BoundArguments(Generic[_Config, _Key]):
     device_kind = backend.get_default_device().device_kind
     key = self.autotuning_cache_key
 
-    for overlay in reversed(get_autotuning_cache_overlay()):
+    for overlay in reversed(get_autotuning_cache_overlay_state().stack):
       data = overlay.get(self.op, {}).get(device_kind, {}).get(key)
       if data is not None:
         return data

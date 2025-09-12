@@ -17,6 +17,7 @@ from typing import Any
 
 from absl.testing import absltest
 import jax
+import jax.experimental
 import jax.numpy as jnp
 import tokamax
 from tokamax._src import benchmarking
@@ -39,7 +40,7 @@ _HEURISTICS_CONFIG = object()
 class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, object, Any]):
 
   def _fwd(self, x, y, *, return_residuals, config):
-    ...
+    return x + y, None
 
   def _get_heuristics_config(self, ba: op_base.BoundArguments) -> object:
     return _HEURISTICS_CONFIG
@@ -180,6 +181,54 @@ class AutotuningTest(absltest.TestCase):
     self.assertEqual(ba.default_config, _HEURISTICS_CONFIG)
     self.assertEqual(ba2.cached_autotuning_data, orig_data2)
     self.assertEqual(ba2.default_config, config3)
+
+  def test_autotuning_result_context_retraced(self):
+    if jax.version.__version_info__ < (0, 7, 2):
+      self.skipTest("Requires JAX >= 0.7.2.")
+
+    op = _FakeOp()
+    orig_fwd = op._fwd
+    traced_configs = []
+    called_configs = []
+
+    def my_fwd(x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
+      traced_configs.append(config)
+      jax.experimental.io_callback(lambda: called_configs.append(config), None)
+      return orig_fwd(x, y, return_residuals=return_residuals, config=config)
+
+    op._fwd = my_fwd
+    x = jnp.zeros((1, 2))
+    y = jnp.zeros((2,))
+    ba = op.bind(x, y)
+    device_kind = jax.devices()[0].device_kind
+    bmark_data = benchmarking.BenchmarkData(
+        compile_time_ms=0.0,
+        lower_time_ms=0.0,
+        evaluation_times_ms=(0.0,),
+        metadata={},
+    )
+    config0 = object()
+    config1 = object()
+    data0 = autotuner.AutotuningData({config0: bmark_data})
+    data1 = autotuner.AutotuningData({config1: bmark_data})
+    result0 = api.AutotuningResult(device_kind, ((ba, data0),))
+    result1 = api.AutotuningResult(device_kind, ((ba, data1),))
+    f = jax.jit(op)
+
+    # Register context hook before first call, so first and last are identical.
+    _ = op_base.get_autotuning_cache_overlay_state()
+    _ = f(x, y)
+    with result0:
+      _ = f(x, y)
+      with result1:
+        _ = f(x, y)
+      _ = f(x, y)
+    _ = f(x, y)
+    self.assertEqual(traced_configs, [_HEURISTICS_CONFIG, config0, config1])
+    self.assertEqual(
+        called_configs,
+        [_HEURISTICS_CONFIG, config0, config1, config0, _HEURISTICS_CONFIG],
+    )
 
 
 if __name__ == "__main__":
