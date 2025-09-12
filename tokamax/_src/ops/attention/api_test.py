@@ -332,8 +332,12 @@ class DotProductAttentionTritonTest(DotProductAttentionTest):
 class DotProductAttentionCudnnTest(DotProductAttentionTest):
   IMPL = 'cudnn'
 
-  def testMemoryScaling(self):
+  def testMemoryScaling0(self):
     self.skipTest('Memory scaling guarantees not made for this implementation')
+
+  def testMemoryScaling1(self):
+    self.skipTest('Memory scaling guarantees not made for this implementation')
+
 
   def test_impl_in_hlo(self):
     if jax.default_backend() == 'tpu':
