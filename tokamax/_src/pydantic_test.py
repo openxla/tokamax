@@ -67,6 +67,23 @@ class _Foo:
   pass
 
 
+_PL_ATTN_CFG = pl_attn.Config(block_q=64, block_k=64, num_stages=2, num_warps=4)
+_PL_DOT_CFG = pl_ragged_dot.Config(
+    block_m=128, block_n=128, block_k=32, num_stages=2
+)
+_OPS = (
+    attn_base.DotProductAttention(),
+    pl_attn.PallasTritonFlashAttention(),
+    pl_attn.PallasTritonFlashAttention(use_stable_softmax=True),
+    pl_attn.PallasTritonFlashAttention(config=_PL_ATTN_CFG),
+    ragged_dot_base.RaggedDot(),
+    pl_ragged_dot.PallasTritonRaggedDot(),
+    pl_ragged_dot.PallasTritonRaggedDot(
+        config=_PL_DOT_CFG, split_k_intermediate_dtype=jnp.float32
+    ),
+)
+
+
 class PydanticTest(parameterized.TestCase):
 
   def test_power_of_two(self):
@@ -132,18 +149,18 @@ class PydanticTest(parameterized.TestCase):
     )
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
-  @parameterized.parameters(
-      (attn_base.DotProductAttention(),),
-      (pl_attn.PallasTritonFlashAttention(),),
-      (pl_attn.PallasTritonFlashAttention(use_stable_softmax=True),),
-      (ragged_dot_base.RaggedDot(),),
-      (pl_ragged_dot.PallasTritonRaggedDot(),),
-      (
-          pl_ragged_dot.PallasTritonRaggedDot(
-              split_k_intermediate_dtype=jnp.float32
-          ),
-      ),
-  )
+  @parameterized.parameters(*_OPS)
+  def test_op_roundtrip(self, op):
+    adapter = pydantic.TypeAdapter(pydantic_lib.annotate(type(op)))
+    object.__setattr__(op, "vjp", None)
+    op_roundtrip = adapter.validate_python(adapter.dump_python(op))
+    object.__setattr__(op_roundtrip, "vjp", None)
+    self.assertEqual(op, op_roundtrip)
+    op_roundtrip = adapter.validate_json(adapter.dump_json(op))
+    object.__setattr__(op_roundtrip, "vjp", None)
+    self.assertEqual(op, op_roundtrip)
+
+  @parameterized.parameters(*_OPS)
   def test_any_instance_of_op_roundtrip(self, op):
     adapter = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[op_base.Op])
     object.__setattr__(op, "vjp", None)

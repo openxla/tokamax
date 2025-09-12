@@ -149,9 +149,7 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
     assert source is not cls
     type_schema = handler.generate_schema(pydantic.ImportString[type])
     dict_schema = cs.typed_dict_schema(
-        dict(__type=cs.typed_dict_field(type_schema)),
-        extra_behavior='allow',
-        extras_schema=cs.any_schema(),
+        dict(__type=cs.typed_dict_field(type_schema)), extra_behavior='allow'
     )
 
     def serialize(value, handler, info) -> dict[str, Any]:

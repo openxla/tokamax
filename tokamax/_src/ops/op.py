@@ -110,6 +110,12 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
   # input array arguments not in the dict will have gradients set to zeros.
   vjp: Callable[Concatenate[_Residuals, _T, _T, _P], Any] | None = None
 
+  @classmethod
+  def __init_subclass__(cls, *args, **kwargs):
+    super().__init_subclass__(*args, **kwargs)
+    # Pydantic fails to infer the type of `config`, so give it some help.
+    cls.__annotations__["config"] = cls.config_cls | None
+
   @overload
   def __call__(
       self,
