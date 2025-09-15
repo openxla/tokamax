@@ -466,7 +466,7 @@ class BoundArguments(Generic[_Config, _Key]):
 
     ba = batched if (batched := self.batched).vmap_axis_sizes else self
     args, kwargs = ba.args, ba.kwargs
-    logging.info("Autotuning %s(%s)", self.op, self.arguments)
+    logging.debug("Autotuning %s(%s)", self.op, self.arguments)
     data = autotuner.autotune(self.op.with_config, configs, *args, **kwargs)
     if cache_results:
       d = self.op.get_autotuning_cache()
