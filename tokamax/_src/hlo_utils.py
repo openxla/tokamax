@@ -342,6 +342,7 @@ def _parse_shapes(shapes) -> tuple[jax.ShapeDtypeStruct, ...]:
   return tuple(jax.tree.leaves(out))
 
 
+# TODO: HLO Protos for TPU have a different format for its ShapeProto with different attributes.Fix this for TPU HLOs in a separate update.
 def _parse_shapes_recursive(shapes):
   """Parse xla.ShapeProto."""
 

@@ -17,3 +17,4 @@ tensorflow
 flax
 pytest-xdist
 protobuf
+qwix@git+https://github.com/google/qwix.git

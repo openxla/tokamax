@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 import functools
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -27,6 +26,7 @@ from tokamax._src.ops.ragged_dot import api
 from tokamax._src.ops.ragged_dot import test_base
 from tokamax._src.ops.ragged_dot import bench_arg_specs
 
+# TODO: Add test for QWIX quantization.
 QuantizedArray = quantization.QuantizedArray
 
 
@@ -46,15 +46,33 @@ class RaggedDotTest(parameterized.TestCase):
     if implementation == "triton" and not triton.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
 
-    if implementation == "mosaic" and not mosaic_gpu.has_mosaic_gpu_support():
-      self.skipTest("Mosaic not supported on this platform.")
+    # Current default backend if implementation is None is "mosaic".
+    if implementation == "mosaic" or implementation is None:
+      if (
+          jax.default_backend() == "gpu"
+          and not mosaic_gpu.has_mosaic_gpu_support()
+      ):
+        self.skipTest("Mosaic not supported on this platform.")
+
+      if jax.default_backend() == "cpu":
+        self.skipTest("No Mosaic support on CPU.")
 
     lhs, rhs, group_sizes = _get_input_data(num_experts=8, m=128, k=64, n=128)
 
+    ragged_dot_fn = (
+        functools.partial(api.ragged_dot, preferred_element_type=jnp.bfloat16)
+        if jax.default_backend() == "tpu"
+        else api.ragged_dot
+    )
     @jax.jit
     @functools.partial(jax.value_and_grad, argnums=(0, 1))
     def f(lhs, rhs):
-      out = api.ragged_dot(lhs, rhs, group_sizes, implementation=implementation)
+      out = ragged_dot_fn(
+          lhs,
+          rhs,
+          group_sizes,
+          implementation=implementation,
+      )
       return jnp.sum(out)
 
     @jax.jit
@@ -75,10 +93,13 @@ class RaggedDotTest(parameterized.TestCase):
       chex.assert_trees_all_close(rhs_grad, rhs_grad_gt)
 
     with self.subTest("correct_implementation_used"):
+      # TODO: HLO Utils does not work correctly for TPU HLO shapes yet. Will be fixed in a follow up.
+      if jax.default_backend() == "tpu":
+        self.skipTest("Only works for GPU at the moment.")
       opspecs = hlo_utils.get_opspecs(
           f.lower(lhs, rhs), include_xla_kernels=False
       )
-      mosaic_impl = api.IMPLEMENTATIONS["mosaic"].__class__
+      mosaic_impl = api.IMPLEMENTATIONS["mosaic_gpu"].__class__
       triton_impl = api.IMPLEMENTATIONS["triton"].__class__
       match implementation:
         case "triton":
@@ -154,6 +175,17 @@ class RaggedDotMosaicTest(RaggedDotImplementationTest):
   def setUp(self):
     if jax.default_backend() != "gpu":
       self.skipTest("Only run on GPU.")
+    super().setUp()
+
+
+class RaggedDotMosaicTpuTest(RaggedDotImplementationTest):
+
+  def __init__(self, *args):
+    super().__init__(*args, implementation="mosaic")
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only run on TPU.")
     super().setUp()
 
 

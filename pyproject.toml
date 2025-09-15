@@ -36,4 +36,6 @@ dependencies = [
 "tensorflow",
 "flax",
 "pytest-xdist",
-"protobuf",]
+"protobuf",
+"qwix@git+https://github.com/google/qwix.git",
+]

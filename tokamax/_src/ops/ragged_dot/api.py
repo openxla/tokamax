@@ -23,6 +23,7 @@ from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-i
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
+from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import pallas_triton
 
 GroupSizes = base.GroupSizes
@@ -32,7 +33,8 @@ Implementation: TypeAlias = Literal["mosaic", "triton", "xla"]
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(
-        mosaic=pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(),
+        mosaic_gpu=pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(),
+        mosaic_tpu=pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(),
         triton=pallas_triton.PallasTritonRaggedDot(),
         xla=base.RaggedDot(),
     )
@@ -92,8 +94,11 @@ def ragged_dot(
   errors = []
   for impl in implementation:
     if isinstance(impl, str):
+      if impl == "mosaic":
+        impl = f"mosaic_{jax.default_backend()}"
       if impl not in IMPLEMENTATIONS:
         raise ValueError(f"Unknown implementation: {impl}")
+
       impl = IMPLEMENTATIONS[impl]
 
     try:
