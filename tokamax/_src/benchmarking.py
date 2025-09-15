@@ -424,43 +424,6 @@ def compile_benchmark(
   return runner
 
 
-# TODO: Add support for autotuning VJP.
-def get_impl_and_metadata(
-    impls: dict[str, Callable[..., Any]], impl_name: str, *args, **kwargs
-) -> tuple[Callable[..., Any], dict[str, Any]]:
-  """Returns the implementation for the given name and arguments.
-
-  If the implementation in an `Op`, the name can be given a suffix indicating
-  the config mode, e.g. ':heuristics' or ':autotuned'.
-
-  Args:
-    impls: A mapping from implementation name to implementation.
-    impl_name: The name of the implementation.
-    *args: Positional arguments to bind.
-    **kwargs: Keyword arguments to bind.
-  """
-  impl_name, _, config_mode = impl_name.partition(':')
-  impl = impls[impl_name]
-  if not hasattr(impl, 'bind'):
-    if config_mode:
-      raise ValueError('Config modes are only supported for `Op`s.')
-    return impl, {}
-
-  ba = impl.bind(*args, **kwargs)
-  match config_mode:
-    case '':
-      config = ba.get_config()
-    case 'heuristics':
-      config = ba.heuristics_config
-    case 'autotuned':
-      config = (ba.cached_autotuning_data or ba.autotune()).fastest_config
-    case 'autotuned_ignore_cache':
-      config = ba.autotune().fastest_config
-    case _:
-      raise ValueError(f'Unsupported config mode: {config_mode}')
-  return impl.with_config(config), dict(config=config)  # pytype: disable=attribute-error
-
-
 def register_benchmark(
     name: str,
     impl_name: str,
