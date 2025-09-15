@@ -362,7 +362,7 @@ def compile_benchmark(
   lowered = f.lower(x)
   lowering_time = time.perf_counter() - start_time
   start_time = time.perf_counter()
-  f_compiled = lowered.compile()  # TODO: Add test.
+  f_compiled = lowered.compile()
   compile_time = time.perf_counter() - start_time
 
   def runner(
