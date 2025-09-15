@@ -78,11 +78,11 @@ cross_compile = _ConfigOption(
     flags.DEFINE_bool(
         "tokamax_cross_compile",
         False,
-        "With this option the user can disable checks like `has_triton_support()`"
-        " and `has_mosaic_gpu_support()` that check that the correct hardware is"
-        " present. It is possible that the machine where kernels are lowered and"
-        " compiled is not the same as the machine where they are run."
-        " `has_mosaic_gpu_support()` that check that the correct hardware is"
-        " present.",
+        "With this option the user can disable checks like"
+        " `has_triton_support()` and `has_mosaic_gpu_support()` that check that"
+        " the correct hardware is present. It is possible that the machine"
+        " where kernels are lowered and compiled is not the same as the machine"
+        " where they are run. `has_mosaic_gpu_support()` that check that the"
+        " correct hardware is present.",
     )
 )
