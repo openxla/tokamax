@@ -35,6 +35,7 @@ from tokamax._src.ops.normalization import api as normalization_api
 from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
+import tqdm
 
 from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
@@ -214,6 +215,7 @@ def autotune(
     ignore_cache: bool = False,
     ignore_errors: bool = False,
     all_implementations: bool = True,
+    progress_bar: bool = True,
 ) -> AutotuningResult:
   """Autotunes all captured ops in x.
 
@@ -222,6 +224,7 @@ def autotune(
     ignore_cache: Whether to ignore the autotuningcache and re-autotune.
     ignore_errors: Whether to ignore errors when autotuning.
     all_implementations: Whether to autotune all implementations of the op.
+    progress_bar: Whether to show a progress bar (default: `True`).
 
   Returns:
     An `AutotuningResult` of the autotuned ops.
@@ -244,7 +247,20 @@ def autotune(
     )
 
   data = []
-  for bound_arg in bound_args:
+  if progress_bar:
+    bound_args = tqdm.tqdm(
+        bound_args,
+        desc="Autotuning",
+        unit=" op calls",
+    )
+
+  total_configs = _count_configs(bound_args)
+  for bound_arg in tqdm.tqdm(
+      bound_args,
+      desc="Autotuning",
+      unit=" op calls",
+      postfix={"Total microbenchmarks": total_configs},
+  ):
     try:
       data.append((bound_arg, bound_arg.autotune()))
     except Exception:  # pylint: disable=broad-exception-caught
@@ -254,3 +270,10 @@ def autotune(
 
   device_kind = jax.devices()[0].device_kind
   return AutotuningResult(device_kind, tuple(data))
+
+
+def _count_configs(bound_args: tuple[op_base.BoundArguments, ...]) -> int:
+  """Returns the number of unique configs in the given bound arguments."""
+  # For ops without explicit configs, we consider there to be a single config.
+  count = lambda x: len(x) if x else 1
+  return sum(count(ba.autotuning_configs) for ba in bound_args)
