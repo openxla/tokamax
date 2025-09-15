@@ -617,14 +617,7 @@ class AttentionTestBase(parameterized.TestCase):
   )
   def test_invalid_shapes(self, **kwargs):
     self.skipTest("Too slow for OSS")
-    mask = kwargs.pop("mask", None)
-    bias = kwargs.pop("bias", None)
-    with self.assertRaises((jaxtyping.TypeCheckError, TypeError, ValueError)):
-      self._run_test(
-          **kwargs,
-          expect_supported=(self._supports_mask or mask is None)
-          and (self._supports_bias or bias is None),
-      )
+    self._run_test(**kwargs, expect_supported=False)
 
   @parameterized.product(
       tile_shape=(
