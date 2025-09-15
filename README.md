@@ -148,3 +148,27 @@ of standard StableHLO. Tokamax makes two serialization guarantees:
 2.  Tokamax gives the same
     [compatibility guarantees as JAX](https://docs.jax.dev/en/latest/export/export.html#compatibility-guarantees-for-custom-calls):
     6 month backward compatibility.
+
+### Benchmarking
+
+JAX Python overhead is often much larger than the actual accelerator kernel
+execution time. This means the usual approach of timing
+`jax.block_until_ready(f_grad(x, scale))` won't be useful. Tokamax has utilities
+for only measuring accelerator execution time:
+
+```python
+from tokamax import benchmarking
+
+f_std, args = benchmarking.standardize_function(f, kwargs={'x': x, 'scale': scale})
+run = benchmarking.compile_benchmark(f_std, args)
+bench: benchmarking.BenchmarkData = run(args)
+```
+
+There are different measurement techniques: for example, on GPU, there is the
+[CUPTI profiler](https://docs.nvidia.com/cupti) that can be specified via
+`run(args, method='cupti')`. This instruments the kernel and adds some a small
+overhead. Using `run(args, method='cuda_events')` uses CUDA synchronization
+events to measure the device execution time. The default `run(args,
+method=None)` allows Tokamax to choose the method, and works for both TPU and
+GPU. Benchmark noise can be reduced by increasing the number of iterations
+`run(args, iterations=10)`.

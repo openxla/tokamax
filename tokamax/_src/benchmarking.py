@@ -43,6 +43,10 @@ Timer: TypeAlias = Callable[[bool], tuple[float, dict[str, Any]]]
 T = TypeVar('T')
 RetT: TypeAlias = T | list[jax.Array] | tuple[T, list[jax.Array]]
 
+TimingMethod: TypeAlias = Literal[
+    'wallclock', 'cuda_events', 'cupti', 'xprof', 'hermetic_xprof'
+]
+
 
 @jax.custom_vjp
 def _optimization_barrier(x: T) -> T:
@@ -362,7 +366,7 @@ def compile_benchmark(
   compile_time = time.perf_counter() - start_time
 
   def runner(
-      x: T, *, iterations: int = 5, method: str | None = None
+      x: T, *, iterations: int = 5, method: TimingMethod | None = None
   ) -> BenchmarkData:
     """Runs the compiled benchmark.
 
