@@ -13,14 +13,17 @@
 # limitations under the License.
 # ==============================================================================
 import dataclasses
+import functools
 import types
 from typing import Any
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 import jax.experimental
 import jax.numpy as jnp
 import tokamax
+from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
@@ -52,28 +55,43 @@ class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
     return _HEURISTICS_CONFIG
 
 
-def get_lowered_fn_and_expected_bound_args(x_shape):
+def get_lowered_fn_and_expected_bound_args(x_shape, vmap=False):
+  eps = 0.32
+  activation = jax.nn.swish
+
   norm = pl_norm.PallasTritonNormalization()
+  norm_f = functools.partial(norm, epsilon=eps)
   glu = pl_glu.PallasTritonGatedLinearUnit()
+  glu_f = functools.partial(glu, activation=activation)
+
+  if vmap:
+    norm_f = jax.vmap(norm, in_axes=(0, None, None))
+    glu_f = jax.vmap(glu_f, in_axes=(0, None))
 
   def f(x, scale, offset, weights):
-    return glu(norm(x, scale, offset), weights, activation=jax.nn.swish)
+    return glu_f(norm_f(x, scale, offset), weights)
 
   d = x_shape[-1]
-  x = jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16)
-  scale = jax.ShapeDtypeStruct((d,), dtype=jnp.bfloat16)
-  offset = jax.ShapeDtypeStruct((d,), dtype=jnp.bfloat16)
-  weights = jax.ShapeDtypeStruct((d, 2, d), dtype=jnp.bfloat16)
+  array_type = batching.BatchedShapeDtype if vmap else jax.ShapeDtypeStruct
+  x_batch = {"vmap_axes": (0,)} if vmap else {}
+  other_batch = {"vmap_axes": (None,)} if vmap else {}
+
+  x = array_type(x_shape, dtype=jnp.bfloat16, **x_batch)
+  scale = array_type((d,), dtype=jnp.bfloat16, **other_batch)
+  offset = array_type((d,), dtype=jnp.bfloat16, **other_batch)
+  weights = array_type((d, 2, d), dtype=jnp.bfloat16, **x_batch)
+
   f_lowered = jax.jit(f).lower(x, scale, offset, weights)
+
   expected_bound_args = (
-      norm.bind(x, scale, offset),  # pytype: disable=wrong-arg-types
+      norm.bind(x, scale, offset, epsilon=eps),  # pytype: disable=wrong-arg-types
       glu.bind(x, weights, activation=jax.nn.swish),  # pytype: disable=wrong-arg-types
   )
   return f_lowered, expected_bound_args
 
 
 # TODO: Make autotuning work for both GPU and TPU.
-class AutotuningTest(absltest.TestCase):
+class AutotuningTest(parameterized.TestCase):
 
   def setUp(self):
     if jax.default_backend() == "tpu":
@@ -90,9 +108,23 @@ class AutotuningTest(absltest.TestCase):
         dict(glu_api.IMPLEMENTATIONS),
     )
 
-  def test_get_bound_args_from_lowered(self):
-    f_lowered, expected = get_lowered_fn_and_expected_bound_args((64, 128))
-    self.assertEqual(api.get_bound_args(f_lowered), expected)
+  @parameterized.parameters(False, True)
+  def test_get_bound_args_from_lowered(self, vmap):
+
+    # TODO: re-enable once the serialization bug is fixed.
+    if vmap:
+      self.skipTest("Vmap serialization is currently broken.")
+
+    x_shape = (64, 128)
+    batch_size = 2
+    if vmap:
+      x_shape = (batch_size,) + x_shape
+
+    f_lowered, expected = get_lowered_fn_and_expected_bound_args(
+        x_shape, vmap=vmap
+    )
+    actual = api.get_bound_args(f_lowered)
+    self.assertEqual(actual, expected)
 
   def test_get_bound_args_from_hlo(self):
     f_lowered, expected = get_lowered_fn_and_expected_bound_args((64, 128))
