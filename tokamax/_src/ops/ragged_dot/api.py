@@ -19,6 +19,7 @@ from typing import Any, Final, Literal, TypeAlias
 
 import immutabledict
 import jax
+from jax.extend import backend
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
@@ -95,7 +96,11 @@ def ragged_dot(
   for impl in implementation:
     if isinstance(impl, str):
       if impl == "mosaic":
-        impl = f"mosaic_{jax.default_backend()}"
+        impl = (
+            "mosaic_gpu"
+            if "NVIDIA" in backend.get_default_device().device_kind
+            else "mosaic_tpu"
+        )
       if impl not in IMPLEMENTATIONS:
         raise ValueError(f"Unknown implementation: {impl}")
 
