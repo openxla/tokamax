@@ -163,6 +163,7 @@ class AutotuningTest(parameterized.TestCase):
 
     result = api.autotune(f_lowered)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+    # TODO: Test that we autotune against all implementations.
     self.assertContainsSubset(expected, tuple(x[0] for x in result.data))
 
     res_round_trip = api.AutotuningResult.loads(result.dumps())
