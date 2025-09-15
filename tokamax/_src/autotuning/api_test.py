@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import dataclasses
 import types
 from typing import Any
 
@@ -34,15 +35,20 @@ from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
 
-_HEURISTICS_CONFIG = object()
+@dataclasses.dataclass(frozen=True)
+class _FakeOpConfig:
+  foo: int
 
 
-class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, object, Any]):
+_HEURISTICS_CONFIG = _FakeOpConfig(42)
 
-  def _fwd(self, x, y, *, return_residuals, config):
+
+class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
+
+  def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
     return x + y, None
 
-  def _get_heuristics_config(self, ba: op_base.BoundArguments) -> object:
+  def _get_heuristics_config(self, ba: op_base.BoundArguments) -> _FakeOpConfig:
     return _HEURISTICS_CONFIG
 
 
@@ -147,10 +153,7 @@ class AutotuningTest(absltest.TestCase):
         evaluation_times_ms=(0.0,),
         metadata={},
     )
-    config0 = object()
-    config1 = object()
-    config2 = object()
-    config3 = object()
+    config0, config1, config2, config3 = map(_FakeOpConfig, range(4))
     data0 = autotuner.AutotuningData({config0: bmark_data})
     data1 = autotuner.AutotuningData({config1: bmark_data})
     data2 = autotuner.AutotuningData({config2: bmark_data})
@@ -207,8 +210,8 @@ class AutotuningTest(absltest.TestCase):
         evaluation_times_ms=(0.0,),
         metadata={},
     )
-    config0 = object()
-    config1 = object()
+    config0 = _FakeOpConfig(0)
+    config1 = _FakeOpConfig(1)
     data0 = autotuner.AutotuningData({config0: bmark_data})
     data1 = autotuner.AutotuningData({config1: bmark_data})
     result0 = api.AutotuningResult(device_kind, ((ba, data0),))

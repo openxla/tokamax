@@ -152,6 +152,8 @@ def get_bound_args(
   seen_keys = set()
   unique_bound_args = []
   for bound_arg in hlo_utils.get_opspecs(hlo_modules):
+    # The chosen config is serialized into the HLO - remove it here.
+    object.__setattr__(bound_arg.op, "config", None)
     key = bound_arg.autotuning_cache_key
     if (bound_arg.op, key) not in seen_keys:
       seen_keys.add((bound_arg.op, key))

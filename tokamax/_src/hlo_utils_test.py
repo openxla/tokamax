@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import dataclasses
 import functools
 import json
 import math
@@ -352,6 +353,8 @@ class DumpHloLibTest(parameterized.TestCase):
     fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
     fn_lowered = jax.jit(fn).lower(x)
     (ba2,) = hlo_utils.get_opspecs(fn_lowered, include_xla_kernels=False)
+    self.assertEqual(ba.default_config, ba2.op.config)
+    object.__setattr__(ba2.op, 'config', None)
     self.assertEqual(ba, ba2)
 
     expected = fn_lowered.compile()(x)
@@ -383,7 +386,9 @@ class DumpHloLibTest(parameterized.TestCase):
     chex.assert_trees_all_equal(actual.value, jnp.array([128] * 8, jnp.int32))
     self.assertEqual(actual.representative_value, (128,) * 8)
 
+    self.assertEqual(ba.default_config, ba2.op.config)
     object.__setattr__(ba.op, 'vjp', None)
+    object.__setattr__(ba2.op, 'config', None)
     object.__setattr__(ba2.op, 'vjp', None)
     self.assertEqual(ba.op, ba2.op)
 

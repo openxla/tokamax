@@ -155,20 +155,23 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       args, kwargs = args_tree.unflatten(merge(arrays, other))
       kwargs["return_residuals"] = return_res
       ba = self.bind(*args, **kwargs)
-      if batched_args is None:
-        arguments = ba.arguments
-      else:
+      if batched_args is not None:
         bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
         bkwargs["return_residuals"] = return_res
         arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
+        ba = BoundArguments(self, arguments)
+
+      config = ba.default_config
+
       # Serialize args into the HLO to allow for, e.g., offline autotuning.
-      self_no_vjp = copy.copy(self)
-      object.__setattr__(self_no_vjp, "vjp", None)
-      ba = BoundArguments(self_no_vjp, _abstractify(dict(arguments)))
-      json_data = str(BOUND_ARGS_ADAPTER.dump_json(ba), "utf-8")
+      json_op = copy.copy(self)
+      object.__setattr__(json_op, "config", config)
+      object.__setattr__(json_op, "vjp", None)
+      json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
+      json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
 
       with jax.named_scope(f"tokamax:{json_data}"):
-        out, residuals = self._fwd(*args, config=ba.default_config, **kwargs)
+        out, residuals = self._fwd(*args, config=config, **kwargs)
       ret = (out, residuals) if return_residuals else out
       return ret, (arrays, out, residuals)
 
