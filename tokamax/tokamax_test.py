@@ -56,26 +56,26 @@ class TokamaxTest(absltest.TestCase):
         dtype=jnp.bfloat16,
     )
 
-    f_vjp = jax.jit(jax.grad(loss))
-    f_vjp_lowered = f_vjp.lower(x, scale)
+    f_grad = jax.jit(jax.grad(loss))
+    f_grad_lowered = f_grad.lower(x, scale)
 
-    out = f_vjp(x, scale)
+    out = f_grad(x, scale)
 
     with self.subTest("DISABLE_JAX_EXPORT_CHECKS"):
       exported = export.export(
-          f_vjp,
+          f_grad,
           disabled_checks=tokamax.DISABLE_JAX_EXPORT_CHECKS,
       )(
           jax.ShapeDtypeStruct(x.shape, x.dtype),
           jax.ShapeDtypeStruct(scale.shape, scale.dtype),
       )
       serialized = exported.serialize()
-      f_vjp_roundtrip = export.deserialize(serialized)
-      out_roundtrip = jax.jit(f_vjp_roundtrip.call)(x, scale)
+      f_grad_roundtrip = export.deserialize(serialized)
+      out_roundtrip = jax.jit(f_grad_roundtrip.call)(x, scale)
       chex.assert_trees_all_close(out, out_roundtrip)
 
     with self.subTest("has_correct_kernels"):
-      arg_specs = autotuning.get_bound_args(f_vjp_lowered)
+      arg_specs = autotuning.get_bound_args(f_grad_lowered)
       ops = set(a.op.__class__ for a in arg_specs)
       ops_expected = set([
           attention_api.IMPLEMENTATIONS["triton"].__class__,
@@ -88,10 +88,10 @@ class TokamaxTest(absltest.TestCase):
       self.assertContainsSubset(ops_expected, ops)
 
     with self.subTest("Autotune"):
-      autotune_res = tokamax.autotune(f_vjp_lowered)
+      autotune_res = tokamax.autotune(f_grad_lowered)
       self.assertIsInstance(autotune_res, tokamax.AutotuningResult)
       with autotune_res:
-        out_autotuned = f_vjp(x, scale)
+        out_autotuned = f_grad(x, scale)
         chex.assert_trees_all_close(out, out_autotuned)
 
 
