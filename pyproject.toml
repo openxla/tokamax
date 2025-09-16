@@ -15,28 +15,28 @@ authors = [
 description = "A Pallas Custom Kernel Library."
 readme = "README.md"
 dynamic = ["version"]
-license = { file = "LICENSE" }
+license = {file = "LICENSE"}
 requires-python = ">=3.11"
 dependencies = [
-"absl-py>=2.3.0",
-"jax[cuda12, tpu]",
-"jaxlib",
-"chex>=0.1.81",
-"triton>=3.0.0",
-"nvidia-cudnn-cu12>=9.0.0",
-"jax-triton",
-"jaxtyping>=0.3",
-"typeguard==2.13.3",
-"google-benchmark>=1.9.0",
-"pydantic>=2.11.0",
-"torch_xla[pallas]",
-"xprof",
-"pytest",
-"einshape",
-"tensorflow",
-"flax",
-"pytest-xdist",
-"protobuf",
-"qwix@git+https://github.com/google/qwix.git",
-"tqdm"
+    "absl-py>=2.3.0",
+    "chex>=0.1.81",
+    "einshape",
+    "flax",
+    "google-benchmark>=1.9.0",
+    "jax-triton",
+    "jax[cuda12, tpu]",
+    "jaxlib",
+    "jaxtyping>=0.3",
+    "nvidia-cudnn-cu12>=9.0.0",
+    "protobuf",
+    "pydantic>=2.11.0",
+    "pytest-xdist",
+    "pytest",
+    "qwix@git+https://github.com/google/qwix.git",
+    "tensorflow",
+    "torch_xla[pallas]",
+    "tqdm",
+    "triton>=3.0.0",
+    "typeguard==2.13.3",
+    "xprof",
 ]
