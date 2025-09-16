@@ -69,7 +69,7 @@ def _attend_chunk(
   logits *= logits_scale
 
   if bias is not None:
-    logits += bias
+    logits += bias.astype(logits.dtype)
 
   if logits_soft_cap is not None:
     logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
@@ -78,6 +78,7 @@ def _attend_chunk(
     mask_value = float(jnp.finfo(logits.dtype).min)
     logits = jnp.where(jnp.asarray(mask), logits, mask_value)
 
+  logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
   loc_x_max = jnp.max(logits, axis=-1)
   new_x_max = jnp.maximum(x_max, loc_x_max)
   weights = jnp.exp(logits - new_x_max[..., None])

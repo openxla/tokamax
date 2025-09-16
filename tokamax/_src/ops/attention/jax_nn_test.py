@@ -49,7 +49,7 @@ class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
       kwargs["expect_supported"] = False
     super()._run_test_with_inputs(*args, **kwargs)
 
-  def test_bench_deepseek2_16b_bf16(self, *_):
+  def test_bench_deepseek2_16b_bf16(self):
     self.skipTest("Test OOMs with JaxNNDotProductAttention implementations.")
 
 
@@ -75,25 +75,14 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
       cast = lambda x: None if x is None else x.astype(jnp.bfloat16)
       return orig_impl(cast(q), cast(k), cast(v), bias=cast(bias), **kwargs)
 
-    atol = 0.025 if "bias" in kwargs else 0.015
-    super()._run_test_with_inputs(*args, **kwargs | dict(impl=impl, atol=atol))
-
-  @parameterized.parameters(False, True)
-  def test_flax_mha_compatibility(self, broadcast_dropout):
-    del broadcast_dropout  # Unused.
-    self.skipTest("fp32 dtype not supported.")
+    kwargs["impl"] = impl
+    kwargs["atol"] = 0.025 if "bias" in kwargs else 0.015
+    if args[0].shape[-1] > 128:
+      kwargs["expect_supported"] = False
+    super()._run_test_with_inputs(*args, **kwargs)
 
   def test_padding_mask_with_nans(self):
     self.skipTest("Unsupported.")
-
-  @parameterized.parameters(
-      *test_base.base_names_and_params("test_quantized_int4")
-  )
-  def test_quantized_int4(self, test_name, kwargs):
-    self.skipTest("Unsupported head_dim > 128.")
-
-  def test_bench_veo3(self, *_):
-    self.skipTest("Unsupported head_dim > 128.")
 
   @parameterized.parameters(*test_base.base_names_and_params("test_vmap"))
   def test_vmap(self, test_name, kwargs):

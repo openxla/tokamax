@@ -118,8 +118,18 @@ def _run_test(
     impl = apply_output_mask(impl)
     ref_impl = apply_output_mask(ref_impl)
 
+  # Upcast all floating point inputs to f32 for reference implementation.
+  def f32_ref_impl(*args, _ref_impl=ref_impl, **kwargs):
+    def as_f32(x):
+      if isinstance(x, jax.Array) and jnp.issubdtype(x.dtype, jnp.floating):
+        return x.astype(jnp.promote_types(x.dtype, jnp.float32))
+      return x
+
+    args, kwargs = jax.tree.map(as_f32, (args, kwargs))
+    return _ref_impl(*args, **kwargs)
+
   impl = functools.partial(impl, **kwargs, **impl_kwargs)
-  ref_impl = functools.partial(ref_impl, **kwargs, **ref_kwargs)
+  ref_impl = functools.partial(f32_ref_impl, **kwargs, **ref_kwargs)
 
   # Forwards inference.
   actual = jax.jit(impl)(q, k, v, bias=bias)
@@ -141,17 +151,16 @@ def _run_test(
 
   if rng is None:
     rng = jax.random.PRNGKey(42)
-  dout = jax.random.normal(rng, expected.shape, dtype=expected.dtype)
+  dout = jax.random.normal(rng, expected.shape, dtype=actual.dtype)
+  ref_dout = dout.astype(expected.dtype)
 
   # Backwards.
   if atol_grads is None:
     atol_grads = max(2 * atol, 5e-6)
 
   grad_names = ("dq", "dk", "dv", "dbias")
-  actual_grads = dict(
-      zip(grad_names, vjp_fn(dout.astype(actual.dtype)), strict=True)
-  )
-  expected_grads = dict(zip(grad_names, ref_vjp_fn(dout), strict=True))
+  actual_grads = dict(zip(grad_names, vjp_fn(dout), strict=True))
+  expected_grads = dict(zip(grad_names, ref_vjp_fn(ref_dout), strict=True))
   rtol_grads = max(atol_grads / 10, 1e-6)
   chex.assert_trees_all_close(
       actual_grads, expected_grads, atol=atol_grads, rtol=rtol_grads
@@ -159,7 +168,7 @@ def _run_test(
 
   if test_vjp_deterministic:
     actual2, vjp_fn = jax.vjp(wrap(impl), q, k, v, bias)
-    actual_grads2 = dict(zip(grad_names, vjp_fn(dout.astype(actual.dtype))))
+    actual_grads2 = dict(zip(grad_names, vjp_fn(dout)))
     chex.assert_trees_all_equal(actual, actual2)
     chex.assert_trees_all_equal(actual_grads, actual_grads2)
 
@@ -182,17 +191,15 @@ def _ref_impl_tanh(
 ):
   """Reference implementation for tanh attention."""
   q /= jnp.sqrt(q.shape[-1])
-  attn_weights = jnp.einsum("...qhd,...khd->...hqk", q, k, precision=precision)
+  logits = jnp.einsum("...qhd,...khd->...hqk", q, k, precision=precision)
   if bias is not None:
-    attn_weights += bias
-  attn_weights = logits_soft_cap * jnp.tanh(attn_weights / logits_soft_cap)  # pytype: disable=unsupported-operands,wrong-arg-types  # jax-operator-types
+    logits += bias
+  if logits_soft_cap is not None:
+    logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
   if mask is not None:
-    min_value = float(jnp.finfo(attn_weights.dtype).min)
-    attn_weights = jnp.where(mask, attn_weights, min_value)
-  attn_weights = jax.nn.softmax(attn_weights)
-  return jnp.einsum(
-      "...hqk,...khd->...qhd", attn_weights, v, precision=precision
-  )
+    logits = jnp.where(mask, logits, float(jnp.finfo(logits.dtype).min))
+  weights = jax.nn.softmax(logits)
+  return jnp.einsum("...hqk,...khd->...qhd", weights, v, precision=precision)
 
 
 # pylint: disable=missing-function-docstring
@@ -331,7 +338,6 @@ class AttentionTestBase(parameterized.TestCase):
         (2, 1024, 4, 64),
         bias_shape=bias_shape,
         atol=5e-6,
-        atol_grads=2e-5,
         expect_supported=self._supports_bias,
     )
 
@@ -670,7 +676,7 @@ class AttentionTestBase(parameterized.TestCase):
         (2, 1024, 4, 64),
         impl_kwargs=dict(logits_dtype=dtype),
         dtype=dtype,
-        atol=({"float16": 5e-4, "bfloat16": 5e-3})[dtype],
+        atol=({"float16": 1e-3, "bfloat16": 1e-2})[dtype],
         expect_supported=self._supports_logits_dtype,
     )
 
@@ -686,9 +692,7 @@ class AttentionTestBase(parameterized.TestCase):
         (2, 1024, 4, 64),
         impl_kwargs=dict(logits_scale=1.0, normalize_output=False),
         ref_impl=ref_impl,
-        dtype=jnp.float32,
         atol=1e-5,
-        atol_grads=3e-5,
     )
 
   def test_partial_attention(self):
@@ -795,8 +799,8 @@ class AttentionTestBase(parameterized.TestCase):
         self._supports_vjp and not is_quantized and q.shape[-2] == k.shape[-2]
     )
 
-    atol = {jnp.float32: 2e-6, jnp.bfloat16: 5e-2}[q.dtype.type]
-    atol_grads = {jnp.float32: 2e-5, jnp.bfloat16: 0.3}[q.dtype.type]
+    atol = {jnp.float32: 2e-6, jnp.bfloat16: 2e-2}[q.dtype.type]
+    atol_grads_bias = {jnp.float32: 2e-5, jnp.bfloat16: 5e-2}[q.dtype.type]
     try:
       self._run_test_with_inputs(
           q,
@@ -810,7 +814,7 @@ class AttentionTestBase(parameterized.TestCase):
           ref_impl=ref_impl_,
           ref_kwargs=ref_kwargs,
           atol=atol,
-          atol_grads=None if bias is None else atol_grads,
+          atol_grads=None if bias is None else atol_grads_bias,
           expect_supported=expect_supported,
           test_vjp=test_vjp,
       )

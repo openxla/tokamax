@@ -24,19 +24,8 @@ from absl.testing import parameterized
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import xla_chunked
-
-
-def _atol_grads_ctx(atol_grads: float):
-  orig_run_test = test_base._run_test
-
-  def my_run_test(*args, **kwargs):
-    kwargs["atol_grads"] = atol_grads
-    orig_run_test(*args, **kwargs)
-
-  return mock.patch.object(test_base, "_run_test", my_run_test)
 
 
 class XlaChunkedAttentionTest(test_base.AttentionTestBase):
@@ -62,16 +51,16 @@ class XlaChunkedAttentionTest(test_base.AttentionTestBase):
       self.skipTest("Residuals unsupported with XLA chunked attention.")
     super()._run_test_with_inputs(*args, **kwargs)
 
-  def test_logits_dtype1(self):
-    with _atol_grads_ctx(2e-3):
-      super().test_logits_dtype1()  # pytype: disable=attribute-error
-
   @parameterized.parameters(31, 123, 256, 2048)
   def test_chunk_sizes(self, chunk_size):
     op = cast(xla_chunked.XlaChunkedDotProductAttention, self._attention_fn)
     mocked_impl = dataclasses.replace(op, chunk_size=chunk_size)
     with mock.patch.object(self, "_attention_fn", mocked_impl):
       self._run_test((2, 1024, 4, 64))
+
+  def test_normalize_output(self):
+    with test_base.override_test_args(atol_grads=3e-5):
+      super().test_normalize_output()  # pytype: disable=attribute-error
 
 
 def _split_into_pages(unpadded_k, unpadded_v, max_num_pages, max_page_size):
