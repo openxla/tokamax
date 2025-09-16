@@ -176,3 +176,7 @@ events to measure the device execution time. The default `run(args,
 method=None)` allows Tokamax to choose the method, and works for both TPU and
 GPU. Benchmark noise can be reduced by increasing the number of iterations
 `run(args, iterations=10)`.
+
+## Disclaimer
+
+This is not an official Google product.
