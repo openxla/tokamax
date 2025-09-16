@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for extracting kernel information from HLO."""
-
 from collections.abc import Callable, Sequence
 import dataclasses
 import re
@@ -384,7 +383,8 @@ def _process_shape(shape: dict[str, Any]) -> jax.ShapeDtypeStruct:
     raise ValueError(f'Unsupported element type: {shape["elementType"]}')
   dtype = _HLO_JAX_DTYPE_MAP[shape['elementType']]
   if 'dimensions' not in shape:
-    raise ValueError(f'Unsupported shape: {shape}')
+    # If there are no dimensions, the shape is a scalar.
+    return jax.ShapeDtypeStruct(shape=(), dtype=dtype)
   shape = tuple([int(i) for i in shape['dimensions']])
   return jax.ShapeDtypeStruct(shape=shape, dtype=dtype)
 

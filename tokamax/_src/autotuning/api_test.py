@@ -82,13 +82,7 @@ def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
   return f, (x, scale, offset, weights), expected_bound_args
 
 
-# TODO: Make autotuning work for both GPU and TPU.
 class AutotuningTest(parameterized.TestCase):
-
-  def setUp(self):
-    if jax.default_backend() == "tpu":
-      self.skipTest("Currently only supported on GPU.")
-    super().setUp()
 
   def test_get_op_implementations(self):
     self.assertDictEqual(
@@ -101,11 +95,17 @@ class AutotuningTest(parameterized.TestCase):
     )
 
   def test_get_bound_args_from_callable(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
     f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
     self.assertEqual(api.get_bound_args(f, *args), expected)
 
   @parameterized.parameters(False, True)
   def test_get_bound_args_from_lowered(self, vmap):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
     x_shape = (2, 64, 128) if vmap else (64, 128)
     f, args, expected = get_fn_and_args_and_expected_bound_args(x_shape, vmap)
     f_lowered = jax.jit(f).lower(*args)
@@ -113,6 +113,9 @@ class AutotuningTest(parameterized.TestCase):
     self.assertEqual(actual, expected)
 
   def test_get_bound_args_from_hlo(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
     f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
     f_lowered = jax.jit(f).lower(*args)
     hlo_modules = f_lowered.compile().runtime_executable().hlo_modules()
@@ -125,6 +128,9 @@ class AutotuningTest(parameterized.TestCase):
     self.assertEqual(api.get_bound_args(hlo_modules * 10), expected)
 
   def test_get_bound_args_unique(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
     def f(x, weights):
       x = glu_api.gated_linear_unit(x, weights, implementation="triton")
       x = glu_api.gated_linear_unit(x, weights, implementation="triton")
@@ -143,6 +149,9 @@ class AutotuningTest(parameterized.TestCase):
     self.assertCountEqual(api.get_bound_args(f_lowered), expected)
 
   def test_get_bound_args_vjp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
     glu = pl_glu.PallasTritonGatedLinearUnit()
     act = jax.nn.swish
     f = functools.partial(glu, activation=act)
@@ -158,6 +167,9 @@ class AutotuningTest(parameterized.TestCase):
     self.assertCountEqual(actual, (bound_arg, vjp_bound_arg))
 
   def test_autotune(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
     f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
     result = api.autotune(f, *args, all_implementations=False)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
@@ -225,7 +237,10 @@ class AutotuningTest(parameterized.TestCase):
     self.assertEqual(ba2.cached_autotuning_data, orig_data2)
     self.assertEqual(ba2.default_config, config3)
 
+  # TODO: Figure out why this test fails on TPU.
   def test_autotuning_result_context_retraced(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
     if jax.version.__version_info__ < (0, 7, 2):
       self.skipTest("Requires JAX >= 0.7.2.")
 
@@ -272,6 +287,36 @@ class AutotuningTest(parameterized.TestCase):
         called_configs,
         [_HEURISTICS_CONFIG, config0, config1, config0, _HEURISTICS_CONFIG],
     )
+
+  def test_ragged_dot_autotuning(self):
+    """Tests for autotuning of ragged dot. Works on both TPU and GPU."""
+
+    def _get_ragged_dot_input_data(num_experts, m, k, n, dtype=jnp.bfloat16):
+      rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
+      lhs = jax.random.normal(rng0, (m, k), dtype=dtype)
+      rhs = jax.random.normal(rng1, (num_experts, k, n), dtype=dtype)
+      group_sizes = jnp.array([m // num_experts] * num_experts, jnp.uint32)
+      return (lhs, rhs, group_sizes)
+
+    @jax.jit
+    def f(lhs, rhs, group_sizes):
+      return tokamax.ragged_dot(
+          lhs,
+          rhs,
+          group_sizes,
+          implementation="mosaic",
+          preferred_element_type=jnp.bfloat16,
+      )
+
+    lhs, rhs, group_sizes = _get_ragged_dot_input_data(
+        num_experts=8, m=128, k=128, n=128
+    )
+    ragged_dot_lowered = f.lower(lhs, rhs, group_sizes=group_sizes)
+    result = api.autotune(ragged_dot_lowered, all_implementations=False)
+    self.assertNotEmpty(result.data)
+    for _, data in result.data:
+      for _, benchmark in data.items():
+        self.assertGreater(benchmark.median_evaluation_time_ms, 0.0)
 
 
 if __name__ == "__main__":
