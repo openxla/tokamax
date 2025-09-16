@@ -156,6 +156,21 @@ class AutotuningTest(parameterized.TestCase):
     f_lowered = jax.jit(f).lower(**shapes)
     self.assertCountEqual(api.get_bound_args(f_lowered), expected)
 
+  def test_get_bound_args_vjp(self):
+    glu = pl_glu.PallasTritonGatedLinearUnit()
+    act = jax.nn.swish
+    f = functools.partial(glu, activation=act)
+    g = jax.value_and_grad(lambda x, weights: f(x, weights).sum())  # pytype: disable=attribute-error
+
+    x_shape = (64, 128)
+    d = x_shape[-1]
+    x = jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16)
+    weights = jax.ShapeDtypeStruct((d, 2, d), dtype=jnp.bfloat16)
+    actual = api.get_bound_args(jax.jit(g).lower(x, weights))
+    bound_arg = glu.bind(x, weights, activation=act, return_residuals=True)  # pytype: disable=wrong-arg-types
+    vjp_bound_arg = glu.vjp.bind(**bound_arg.vjp_arg_spec)  # pytype: disable=attribute-error
+    self.assertCountEqual(actual, (bound_arg, vjp_bound_arg))
+
   def test_autotune(self):
     f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
     result = api.autotune(f, *args, all_implementations=False)

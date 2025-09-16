@@ -481,7 +481,11 @@ class BoundArguments(Generic[_Config, _Key]):
     kwargs = ba.kwargs | dict(return_residuals=True)
     f, x = benchmarking.standardize_function(self.op, *ba.args, kwargs=kwargs)
     out, residuals = jax.eval_shape(f, x)
-    return dict(residuals=residuals, out=out, dout=out) | ba.arguments
+    vjp_arg_spec = dict(ba.arguments)
+    vjp_arg_spec["residuals"] = residuals
+    vjp_arg_spec["out"] = vjp_arg_spec["dout"] = out
+    vjp_arg_spec["return_residuals"] = False
+    return vjp_arg_spec
 
   __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
 

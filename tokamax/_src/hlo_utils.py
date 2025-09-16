@@ -74,7 +74,6 @@ _XLA_NOISE_OPCODES: Final[set[str]] = {
 }
 
 _TOKAMAX_NAME: Final[str] = 'tokamax'
-_PATTERN: Final[re.Pattern[str]] = re.compile(r'tokamax:({.+})')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -326,12 +325,27 @@ def get_opspecs(  # pytype: disable=invalid-annotation
   for kernel in kernels:
     if not _is_tokamax_kernel(kernel):
       continue
-    match = _PATTERN.search(kernel.op_name)
+    marker = _TOKAMAX_NAME + ':'
+    idx = kernel.op_name.find(marker)
     # For XLA kernels, sometimes the op info is not present, eg.
     # jit(tokamax_norm_and_glu)/convert_element_type.
-    if match is None:
+    if idx == -1:
       continue
-    (json_data,) = match.groups()
+    json_data = kernel.op_name[idx + len(marker):]
+    count = 0
+    # A VJP op may have multiple op specs in the HLO. Find the position of the
+    # end brace for the first op spec. We only return the first op (the VJP), as
+    # the forward op will be present in the HLO elsewhere.
+    for i, c in enumerate(json_data):
+      if c == '{':
+        count += 1
+      if c == '}':
+        count -= 1
+        if count < 1:
+          # This might mean that we have more end braces than opening braces,
+          # but in that case the `validate_json` call below will fail.
+          json_data = json_data[:i + 1]
+          break
     op_specs.append(op_base.BOUND_ARGS_ADAPTER.validate_json(json_data))
 
   return tuple(op_specs)
