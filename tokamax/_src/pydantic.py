@@ -229,8 +229,9 @@ class ShapeDtype:
   def __get_pydantic_core_schema__(cls, source, handler):
     del handler  # Unused.
     assert source in (jax.Array, jax.ShapeDtypeStruct)
-    ints_schema = cs.tuple_schema([cs.int_schema()], variadic_item_index=0)
-    ints_serializer = pydantic_core.SchemaSerializer(ints_schema)
+    tuple_schema = lambda s: cs.tuple_schema([s], variadic_item_index=0)
+    vmap_axes_schema = tuple_schema(cs.nullable_schema(cs.int_schema()))
+    vmap_axes_serializer = pydantic_core.SchemaSerializer(vmap_axes_schema)
 
     def serialize(x, info) -> Any:
       # We don't want match other types with `shape` and `dtype` attributes.
@@ -240,7 +241,7 @@ class ShapeDtype:
         return x
       s = jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
       if isinstance(x, batching.BatchedShapeDtype) and x.vmap_axes:
-        vmap_axes_str = str(ints_serializer.to_json(x.vmap_axes), 'utf-8')
+        vmap_axes_str = str(vmap_axes_serializer.to_json(x.vmap_axes), 'utf-8')
         return f'{s}{{vmap_axes={vmap_axes_str}}}'
       return s
 
@@ -255,9 +256,9 @@ class ShapeDtype:
 
     groups_schema = cs.tuple_schema([
         cs.any_schema(),
-        cs.json_schema(ints_schema),
+        cs.json_schema(tuple_schema(cs.int_schema())),
         cs.any_schema(),
-        cs.nullable_schema(cs.json_schema(ints_schema)),
+        cs.nullable_schema(cs.json_schema(vmap_axes_schema)),
     ])
     from_str_schema = cs.chain_schema([
         cs.str_schema(),

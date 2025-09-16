@@ -56,34 +56,28 @@ class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
 
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
-  eps = 0.32
-  activation = jax.nn.swish
-
   norm = pl_norm.PallasTritonNormalization()
-  norm_f = functools.partial(norm, epsilon=eps)
   glu = pl_glu.PallasTritonGatedLinearUnit()
-  glu_f = functools.partial(glu, activation=activation)
-
-  if vmap:
-    norm_f = jax.vmap(norm, in_axes=(0, None, None))
-    glu_f = jax.vmap(glu_f, in_axes=(0, None))
+  eps = 0.32
+  act = jax.nn.swish
 
   def f(x, scale, offset, weights):
-    return glu_f(norm_f(x, scale, offset), weights)
+    return glu(norm(x, scale, offset, epsilon=eps), weights, activation=act)
 
   d = x_shape[-1]
-  array_type = batching.BatchedShapeDtype if vmap else jax.ShapeDtypeStruct
-  x_batch = {"vmap_axes": (0,)} if vmap else {}
-  other_batch = {"vmap_axes": (None,)} if vmap else {}
+  x = jax.ShapeDtypeStruct(x_shape, jnp.bfloat16)
+  scale = jax.ShapeDtypeStruct((d,), jnp.bfloat16)
+  offset = jax.ShapeDtypeStruct((d,), jnp.bfloat16)
+  weights = jax.ShapeDtypeStruct((d, 2, d), jnp.bfloat16)
 
-  x = array_type(x_shape, dtype=jnp.bfloat16, **x_batch)
-  scale = array_type((d,), dtype=jnp.bfloat16, **other_batch)
-  offset = array_type((d,), dtype=jnp.bfloat16, **other_batch)
-  weights = array_type((d, 2, d), dtype=jnp.bfloat16, **x_batch)
-
+  if vmap:
+    ax = (0, None, None, None)
+    f = jax.vmap(f, in_axes=ax)
+    as_batched = lambda x, a: batching.BatchedShapeDtype(x.shape, x.dtype, (a,))
+    x, scale, offset, weights = map(as_batched, (x, scale, offset, weights), ax)
   expected_bound_args = (
       norm.bind(x, scale, offset, epsilon=eps),  # pytype: disable=wrong-arg-types
-      glu.bind(x, weights, activation=jax.nn.swish),  # pytype: disable=wrong-arg-types
+      glu.bind(x, weights, activation=act),  # pytype: disable=wrong-arg-types
   )
   return f, (x, scale, offset, weights), expected_bound_args
 
@@ -112,15 +106,7 @@ class AutotuningTest(parameterized.TestCase):
 
   @parameterized.parameters(False, True)
   def test_get_bound_args_from_lowered(self, vmap):
-    # TODO: re-enable once the serialization bug is fixed.
-    if vmap:
-      self.skipTest("Vmap serialization is currently broken.")
-
-    x_shape = (64, 128)
-    batch_size = 2
-    if vmap:
-      x_shape = (batch_size,) + x_shape
-
+    x_shape = (2, 64, 128) if vmap else (64, 128)
     f, args, expected = get_fn_and_args_and_expected_bound_args(x_shape, vmap)
     f_lowered = jax.jit(f).lower(*args)
     actual = api.get_bound_args(f_lowered)

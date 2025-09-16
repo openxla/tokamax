@@ -125,7 +125,8 @@ class PydanticTest(parameterized.TestCase):
       (jax.ShapeDtypeStruct((1, 2), jnp.float32)),
       (jax.ShapeDtypeStruct((3, 4), jnp.int4),),
       (batching.BatchedShapeDtype((5, 6, 7), jnp.int8, vmap_axes=(0, 1)),),
-      (batching.BatchedShapeDtype((8, 9), jnp.int8, vmap_axes=()),),
+      (batching.BatchedShapeDtype((8, 9), jnp.int8, vmap_axes=(None,)),),
+      (batching.BatchedShapeDtype((10, 11), jnp.int8, vmap_axes=()),),
   )
   def test_shape_dtype_roundtrip(self, shape):
     ty = Annotated[jax.Array, pydantic_lib.ShapeDtype]
