@@ -17,7 +17,7 @@
 from collections.abc import Callable, Mapping
 import dataclasses
 import inspect
-from typing import Annotated, Any, Final, Self, Sequence, TypeAlias
+from typing import Annotated, Any, Final, ParamSpec, Self, Sequence, TypeAlias
 
 from absl import logging
 import immutabledict
@@ -134,21 +134,35 @@ class AutotuningResult:
 
 _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
 _BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_base.PydanticBoundArguments)
+_P = ParamSpec("_P")
 
 
 def get_bound_args(
-    x: HloComputation,
+    f: (
+        Callable[_P, Any]
+        | HloComputation
+    ),
+    *args: _P.args,
+    **kwargs: _P.kwargs,
 ) -> tuple[op_base.BoundArguments, ...]:
-  """Returns a tuple of unique BoundArguments for all Tokamax ops in x.
+  """Returns a tuple of unique BoundArguments for all Tokamax ops in `f`.
 
   Args:
-    x: Either an HLO computation or an XprofId.
+    f: A callable, an HLO computation, or an XprofId.
+    *args: Positional arguments to `f` (only valid if `f` is callable).
+    **kwargs: Keyword arguments to `f` (only valid if `f` is callable).
 
   Returns:
-    A tuple of unique BoundArguments for all Tokamax ops in x.
+    A tuple of unique BoundArguments for all Tokamax ops in `f`.
   """
+  if callable(f):
+    if not isinstance(f, jax.stages.Wrapped):
+      f = jax.jit(f)
+    f = f.lower(*args, **kwargs)
+  elif args or kwargs:
+    raise ValueError("`args` / `kwargs` are only supported if `f` is callable.")
 
-  hlo_modules = _get_hlo_modules(x)
+  hlo_modules = _get_hlo_modules(f)
   # Filter out bound args so that only unique ones remain.
   seen_keys = set()
   unique_bound_args = []
@@ -211,7 +225,12 @@ def get_op_implementations(op: op_base.Op) -> dict[str, Callable[..., Any]]:
 
 
 def autotune(
-    x: Sequence[op_base.BoundArguments] | HloComputation,
+    f: (
+        Callable[..., Any]
+        | Sequence[op_base.BoundArguments]
+        | HloComputation
+    ),
+    *args,
     ignore_cache: bool = False,
     ignore_errors: bool = False,
     all_implementations: bool = True,
@@ -220,7 +239,10 @@ def autotune(
   """Autotunes all captured ops in x.
 
   Args:
-    x: Either a list of bound arguments or an HLO computation.
+    f: A callable, a list of bound arguments, or an HLO computation.
+    *args: Positional arguments to `f` (only valid if `f` is callable). NOTE -
+      To autotune a callable with keyword arguments, pass the results of
+      `tokamax.get_bound_args(f, *args, **kwargs)` to `autotune`.
     ignore_cache: Whether to ignore the autotuningcache and re-autotune.
     ignore_errors: Whether to ignore errors when autotuning.
     all_implementations: Whether to autotune all implementations of the op.
@@ -233,10 +255,12 @@ def autotune(
   if ignore_cache:
     raise NotImplementedError("`ignore_cache=True` is not implemented.")
 
-  if isinstance(x, (list, tuple)) and isinstance(x[0], op_base.BoundArguments):
-    bound_args = tuple(x)
+  if isinstance(f, (list, tuple)) and isinstance(f[0], op_base.BoundArguments):
+    if args:
+      raise ValueError("`args` are only supported if `f` is callable.")
+    bound_args = tuple(f)
   else:
-    bound_args = get_bound_args(x)
+    bound_args = get_bound_args(f, *args)  # pytype: disable=paramspec-error
 
   if all_implementations:
     bound_args = tuple(
@@ -268,6 +292,7 @@ def autotune(
       if not ignore_errors:
         raise
 
+  # TODO: Infer device kind from array arguments.
   device_kind = jax.devices()[0].device_kind
   return AutotuningResult(device_kind, tuple(data))
 

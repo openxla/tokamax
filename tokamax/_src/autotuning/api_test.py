@@ -55,7 +55,7 @@ class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
     return _HEURISTICS_CONFIG
 
 
-def get_lowered_fn_and_expected_bound_args(x_shape, vmap=False):
+def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
   eps = 0.32
   activation = jax.nn.swish
 
@@ -81,13 +81,11 @@ def get_lowered_fn_and_expected_bound_args(x_shape, vmap=False):
   offset = array_type((d,), dtype=jnp.bfloat16, **other_batch)
   weights = array_type((d, 2, d), dtype=jnp.bfloat16, **x_batch)
 
-  f_lowered = jax.jit(f).lower(x, scale, offset, weights)
-
   expected_bound_args = (
       norm.bind(x, scale, offset, epsilon=eps),  # pytype: disable=wrong-arg-types
       glu.bind(x, weights, activation=jax.nn.swish),  # pytype: disable=wrong-arg-types
   )
-  return f_lowered, expected_bound_args
+  return f, (x, scale, offset, weights), expected_bound_args
 
 
 # TODO: Make autotuning work for both GPU and TPU.
@@ -108,9 +106,12 @@ class AutotuningTest(parameterized.TestCase):
         dict(glu_api.IMPLEMENTATIONS),
     )
 
+  def test_get_bound_args_from_callable(self):
+    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    self.assertEqual(api.get_bound_args(f, *args), expected)
+
   @parameterized.parameters(False, True)
   def test_get_bound_args_from_lowered(self, vmap):
-
     # TODO: re-enable once the serialization bug is fixed.
     if vmap:
       self.skipTest("Vmap serialization is currently broken.")
@@ -120,14 +121,14 @@ class AutotuningTest(parameterized.TestCase):
     if vmap:
       x_shape = (batch_size,) + x_shape
 
-    f_lowered, expected = get_lowered_fn_and_expected_bound_args(
-        x_shape, vmap=vmap
-    )
+    f, args, expected = get_fn_and_args_and_expected_bound_args(x_shape, vmap)
+    f_lowered = jax.jit(f).lower(*args)
     actual = api.get_bound_args(f_lowered)
     self.assertEqual(actual, expected)
 
   def test_get_bound_args_from_hlo(self):
-    f_lowered, expected = get_lowered_fn_and_expected_bound_args((64, 128))
+    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    f_lowered = jax.jit(f).lower(*args)
     hlo_modules = f_lowered.compile().runtime_executable().hlo_modules()
     hlo_modules = [
         hlo_pb2.HloModuleProto.FromString(hlo.as_serialized_hlo_module_proto())
@@ -156,7 +157,12 @@ class AutotuningTest(parameterized.TestCase):
     self.assertCountEqual(api.get_bound_args(f_lowered), expected)
 
   def test_autotune(self):
-    f_lowered, expected = get_lowered_fn_and_expected_bound_args((64, 128))
+    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    result = api.autotune(f, *args, all_implementations=False)
+    self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+    self.assertEqual(tuple(x[0] for x in result.data), expected)
+
+    f_lowered = jax.jit(f).lower(*args)
     result = api.autotune(f_lowered, all_implementations=False)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
     self.assertEqual(tuple(x[0] for x in result.data), expected)

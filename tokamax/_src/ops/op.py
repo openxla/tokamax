@@ -429,6 +429,7 @@ class BoundArguments(Generic[_Config, _Key]):
   @property
   def cached_autotuning_data(self) -> AutotuningData[_Config] | None:
     """Returns autotuning data from the cache, if available."""
+    # TODO: Infer device kind from array arguments.
     device_kind = backend.get_default_device().device_kind
     key = self.autotuning_cache_key
 
