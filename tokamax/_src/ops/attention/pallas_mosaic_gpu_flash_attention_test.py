@@ -60,7 +60,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     )
     self._supports_decode = supports_decode
 
-  def _run_test_with_inputs(self, q, k, v, bias=None, **kwargs):
+  def _run_test_with_inputs(self, q, k, v, *, bias=None, **kwargs):
     # PallasMosaicGpuFlashAttention doesn't support high precisions,
     # (logits_dtype != f32) and f32 inputs. Override the arguments instead of
     # disabling basicaly most of the tests.
@@ -79,6 +79,8 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     if bias is not None or not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
 
+    if (q.ndim < 3) or (q.shape[-3] % 128 != 0) and not self._supports_decode:
+      kwargs["expect_supported"] = False
     super()._run_test_with_inputs(q, k, v, bias=bias, **kwargs)
 
   def test_causal_mask(self):
@@ -96,10 +98,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def test_padding_mask_with_nans(self):
     self.skipTest("TODO: Fix.")
 
-  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
-  def test_bench(self, spec):
-    self.skipTest("TODO: Enable benchmark tests.")
-
   def test_normalize_output(self):
     with test_base.override_test_args(atol=0.02):
       super().test_normalize_output()
@@ -111,6 +109,17 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def test_unstable_softmax(self):
     impl = dataclasses.replace(self._attention_fn, use_stable_softmax=False)  # pytype: disable=wrong-arg-types
     self._run_test((2, 1024, 4, 64), impl=impl)
+
+  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
+  def test_bench(self, spec):
+    suffix = [k for k, v in bench_arg_specs.ARG_SPECS.items() if v == spec][0]
+    try:
+      with test_base.override_test_args(atol=0.02):
+        getattr(super(), "test_bench_" + suffix)()
+    except ValueError as e:
+      if "exceeds available shared memory" in str(e):
+        self.skipTest(f"Test exceeds shared memory capacity: {e}")
+      raise
 
 
 # TODO: Add manual partitioning test.
