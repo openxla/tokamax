@@ -118,6 +118,10 @@ autotune_result_json: str = autotune_result.dumps()
 autotune_result = tokamax.AutotuningResult.loads(autotune_result_json)
 ```
 
+Users can autotune their own kernels with `tokamax.autotune` by inheriting from
+the `tokamax.Op` class and overriding the `tokamax.Op._get_autotuning_configs`
+method to define the autotuning search-space.
+
 Note that autotuning is fundamentally non-deterministic: measuring kernel
 execution times is noisy. As different configs chosen during autotuning can lead
 to different numerics, this is a potential source of numerical non-determinism.
