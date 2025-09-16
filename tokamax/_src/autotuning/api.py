@@ -133,7 +133,7 @@ class AutotuningResult:
 
 
 _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
-_BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_base.PydanticBoundArguments)
+_BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_base.BoundArguments)
 _P = ParamSpec("_P")
 
 

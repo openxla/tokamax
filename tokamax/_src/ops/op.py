@@ -21,7 +21,7 @@ import dataclasses
 import functools
 import inspect
 import threading
-from typing import Annotated, Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
+from typing import Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
 
 from absl import logging
 import immutabledict
@@ -30,6 +30,7 @@ from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
 import pydantic
+from pydantic_core import core_schema as cs
 from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src import config as config_lib
@@ -487,7 +488,34 @@ class BoundArguments(Generic[_Config, _Key]):
     vjp_arg_spec["return_residuals"] = False
     return vjp_arg_spec
 
-  __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+  @classmethod
+  def __get_pydantic_core_schema__(cls, source, handler):
+    assert source is cls
+    op_schema = handler.generate_schema(pydantic_lib.AnyInstanceOf[Op])
+    dict_fields = dict(
+        op=cs.typed_dict_field(op_schema),
+        arguments=cs.typed_dict_field(cs.any_schema()),
+    )
+    dict_schema = cs.typed_dict_schema(dict_fields)
+
+    def serialize(value, handler, info) -> dict[str, Any]:
+      arg_spec_adapter = _get_arg_spec_adapter(value.op)
+      arguments = arg_spec_adapter.dump_python(dict(value.arguments), info)
+      return dict(op=handler(value.op), arguments=arguments)
+
+    def validate(value: dict[str, Any]) -> Any:
+      op = value["op"]
+      arguments = _get_arg_spec_adapter(op).validate_python(value["arguments"])
+      return BoundArguments(op, arguments)
+
+    to_cls_schema = cs.no_info_plain_validator_function(validate)
+    from_dict_schema = cs.chain_schema([dict_schema, to_cls_schema])
+    return cs.union_schema(
+        [cs.is_instance_schema(cls), from_dict_schema],
+        serialization=cs.wrap_serializer_function_ser_schema(
+            serialize, info_arg=True, schema=op_schema
+        ),
+    )
 
 
 @functools.lru_cache
@@ -496,26 +524,7 @@ def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
   return pydantic_lib.get_adapter(spec)
 
 
-def _serialize_bound_args(value: BoundArguments, info) -> dict[str, Any]:
-  op_data = _ANY_OP_ADAPTER.dump_python(value.op, info)
-  arg_spec_adapter = _get_arg_spec_adapter(value.op)
-  arguments = arg_spec_adapter.dump_python(dict(value.arguments), info)
-  return dict(op=op_data, arguments=arguments)
-
-
-def _validate_bound_args(data: dict[str, Any]) -> BoundArguments:
-  op = _ANY_OP_ADAPTER.validate_python(data["op"])
-  arguments = _get_arg_spec_adapter(op).validate_python(data["arguments"])
-  return BoundArguments(op, arguments)
-
-
-PydanticBoundArguments = Annotated[
-    BoundArguments[_Config, _Key],
-    pydantic.PlainValidator(_validate_bound_args),
-    pydantic.PlainSerializer(_serialize_bound_args),
-]
-_ANY_OP_ADAPTER = pydantic_lib.get_adapter(pydantic_lib.AnyInstanceOf[Op])
-BOUND_ARGS_ADAPTER = pydantic_lib.get_adapter(PydanticBoundArguments)
+BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(BoundArguments)
 
 
 def _abstractify(pytree):

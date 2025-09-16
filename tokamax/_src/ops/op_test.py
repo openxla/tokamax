@@ -188,10 +188,7 @@ class BoundArgumentsTest(parameterized.TestCase):
   )
   def test_roundtrip(self, op, arg_specs):
     object.__setattr__(op, "vjp", None)
-    adapter = pydantic.TypeAdapter(
-        op_base.PydanticBoundArguments,
-        config=pydantic.ConfigDict(arbitrary_types_allowed=True),
-    )
+    adapter = op_base.BOUND_ARGS_ADAPTER
     for name, spec in arg_specs.ARG_SPECS.items():
       with self.subTest(name):
         ba = op.bind(**_eval_shape(spec))
