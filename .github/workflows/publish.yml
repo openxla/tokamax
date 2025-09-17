@@ -20,7 +20,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    timeout-minutes: 300
     steps:
     - name: Checkout Tokamax
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
