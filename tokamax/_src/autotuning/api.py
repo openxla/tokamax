@@ -119,16 +119,14 @@ class AutotuningResult:
       overlay.setdefault(ba.op, {}).setdefault(self.device_kind, {})[key] = data
     state = op_base.get_autotuning_cache_overlay_state()
     state.stack.append(overlay)
-    if jax.version.__version_info__ >= (0, 7, 2):
-      context = state.context(state.context.value + (id(self),))
-      context.__enter__()
-      object.__setattr__(self, "_context", context)
+    context = state.context(state.context.value + (id(self),))
+    context.__enter__()
+    object.__setattr__(self, "_context", context)
     return self
 
   def __exit__(self, exc_type, exc_value, traceback):
-    if jax.version.__version_info__ >= (0, 7, 2):
-      self._context.__exit__(exc_type, exc_value, traceback)  # pytype: disable=attribute-error
-      object.__delattr__(self, "_context")
+    self._context.__exit__(exc_type, exc_value, traceback)  # pytype: disable=attribute-error
+    object.__delattr__(self, "_context")
     op_base.get_autotuning_cache_overlay_state().stack.pop()
 
 
