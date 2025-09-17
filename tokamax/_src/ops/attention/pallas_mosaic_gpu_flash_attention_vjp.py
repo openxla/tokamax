@@ -54,16 +54,6 @@ class Config:
   compute_wgs: pydantic.PositiveInt = 2
 
 
-def find_swizzle(dim_size_bits: int, what: str) -> int:
-  for swizzle_bytes in (128, 64, 32, 16):
-    if dim_size_bits % (swizzle_bytes * 8) == 0:
-      return swizzle_bytes
-  raise ValueError(
-      f"No valid out swizzle for {what}: its minor dimension has"
-      f" {dim_size_bits} bits, which is not a multiple of 128."
-  )
-
-
 @jaxtyping.jaxtyped
 def _bwd(
     q: Float[Array, "*B T H D"],
@@ -339,11 +329,7 @@ def _bwd(
       return (dq_acc, m, l, delta, k_start, k_end)
 
     if async_mask:
-      # copybara: strip_begin(remove-next-jax-release)
       mask_swizzle = plgpu.find_swizzle(8 * block_kv, "mask")
-      # copybara: strip_end_and_replace_begin
-      # mask_swizzle = find_swizzle(8 * block_kv, "mask")
-      # # copybara: replace_end
       mask_transforms = (
           plgpu.TilingTransform((8, mask_swizzle)),
           plgpu.SwizzleTransform(mask_swizzle),
@@ -574,7 +560,7 @@ def _bwd(
       return (dk_acc, dv_acc)
 
     if async_mask:
-      mask_swizzle = find_swizzle(8 * block_q, "mask")
+      mask_swizzle = plgpu.find_swizzle(8 * block_q, "mask")
       mask_transforms = (
           plgpu.TilingTransform((8, mask_swizzle)),
           plgpu.SwizzleTransform(mask_swizzle),
