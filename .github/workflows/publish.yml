@@ -33,10 +33,10 @@ jobs:
 
     - name: Install dependencies
       run: |
-        python -m uv pip install --upgrade pip
-        python -m uv pip --version
-        python -m uv pip install --upgrade -r requirements.txt
-        python -m uv pip freeze
+        python -m pip install --upgrade pip
+        python -m pip --version
+        python -m pip install --upgrade -r requirements.txt
+        python -m pip freeze
 
     # Publish the package
     - name: Build Tokamax
