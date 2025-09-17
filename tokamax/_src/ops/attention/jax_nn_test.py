@@ -84,6 +84,9 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
   def test_padding_mask_with_nans(self):
     self.skipTest("Unsupported.")
 
+  def test_bench_veo3(self):
+    self.skipTest("Numerical issue in CuDNN for head_dim=256.")
+
   @parameterized.parameters(*test_base.base_names_and_params("test_vmap"))
   def test_vmap(self, test_name, kwargs):
     self.skipTest("Too slow for OSS")
