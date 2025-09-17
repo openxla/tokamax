@@ -98,8 +98,7 @@ out = f_grad(x, scale)
 To get the best performance, autotune all Tokamax kernels in `f_grad`:
 
 ```python
-lowered = f_grad.lower(x, scale)
-autotune_result: tokamax.AutotuningResult = tokamax.autotune(lowered)
+autotune_result: tokamax.AutotuningResult = tokamax.autotune(f, x, scale)
 ```
 
 `autotune_result` can be used as a context-manager, using the autotuned configs

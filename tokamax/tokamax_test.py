@@ -58,8 +58,6 @@ class TokamaxTest(absltest.TestCase):
     )
 
     f_grad = jax.jit(jax.grad(loss))
-    f_grad_lowered = f_grad.lower(x, scale)
-
     out = f_grad(x, scale)
 
     with self.subTest("DISABLE_JAX_EXPORT_CHECKS"):
@@ -76,7 +74,7 @@ class TokamaxTest(absltest.TestCase):
       chex.assert_trees_all_close(out, out_roundtrip)
 
     with self.subTest("has_correct_kernels"):
-      arg_specs = autotuning.get_bound_args(f_grad_lowered)
+      arg_specs = autotuning.get_bound_args(f_grad, x, scale)
       ops = set(a.op.__class__ for a in arg_specs)
       ops_expected = set([
           attention_api.IMPLEMENTATIONS["triton"].__class__,
@@ -89,7 +87,7 @@ class TokamaxTest(absltest.TestCase):
       self.assertContainsSubset(ops_expected, ops)
 
     with self.subTest("Autotune"):
-      autotune_res = tokamax.autotune(f_grad_lowered)
+      autotune_res = tokamax.autotune(f_grad, x, scale)
       self.assertIsInstance(autotune_res, tokamax.AutotuningResult)
       with autotune_res:
         out_autotuned = f_grad(x, scale)
