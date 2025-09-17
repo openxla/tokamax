@@ -17,19 +17,27 @@ jobs:
     permissions:
       # IMPORTANT: this permission is mandatory for trusted publishing
       id-token: write
-
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 300
     steps:
     - name: Checkout Tokamax
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       with:
         persist-credentials: false
 
+    - name: Install Python 3.11
+    - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
+      with:
+        python-version: 3.11
+
     - name: Install dependencies
       run: |
-        python3.11 -m uv pip install --upgrade pip
-        python3.11 -m uv pip --version
-        python3.11 -m uv pip install --upgrade -r requirements.txt
-        python3.11 -m uv pip freeze
+        python -m uv pip install --upgrade pip
+        python -m uv pip --version
+        python -m uv pip install --upgrade -r requirements.txt
+        python -m uv pip freeze
 
     # Publish the package
     - name: Build Tokamax
