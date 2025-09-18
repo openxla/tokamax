@@ -681,8 +681,10 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   def test_normalize_output(self):
-    def ref_impl(q, k, v, *, bias, precision):
+
+    def ref_impl(q, k, v, *, bias, mask=None, precision):
       assert bias is None
+      assert mask is None
       einsum = functools.partial(jnp.einsum, precision=precision)
       s = einsum("...qhd,...khd->...hqk", q, k)
       p_unnormalized = jnp.exp(s - jnp.max(s, axis=-1, keepdims=True))

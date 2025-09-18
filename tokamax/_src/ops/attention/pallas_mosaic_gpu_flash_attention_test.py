@@ -72,7 +72,8 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       return x
 
     q, k, v, bias = map(as_bf16, (q, k, v, bias))
-    kwargs["atol"] = 0.0045 if bias is None else 0.007
+    atol = kwargs.get("atol", 0.0)
+    kwargs["atol"] = max(atol, 0.0045 if bias is None else 0.007)
 
     if bias is not None or not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
