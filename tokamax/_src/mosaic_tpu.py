@@ -14,9 +14,9 @@
 # ==============================================================================
 """Mosaic-TPU utils."""
 
-import re
 from typing import Final
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 
 
@@ -35,7 +35,7 @@ _SUPPORTED_TPU_GENERATIONS: Final[dict[str, int]] = {
 
 def tpu_generation() -> int:
   """Generation number of the currently attached TPU."""
-  device_kind = jax.devices()[0].device_kind
+  device_kind = backend.get_default_device().device_kind
   try:
     return _SUPPORTED_TPU_GENERATIONS[device_kind]
   except KeyError as e:
