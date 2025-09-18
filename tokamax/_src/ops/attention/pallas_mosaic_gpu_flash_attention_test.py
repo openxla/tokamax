@@ -20,7 +20,7 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import pytest
-from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as flash_attention
+from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as fa
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import bench_arg_specs
 
@@ -41,9 +41,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       supports_is_causal=True,
       supports_vmap=False,
   ):
-    attention_fn = (
-        attention_fn or flash_attention.PallasMosaicGpuFlashAttention()
-    )
+    attention_fn = attention_fn or fa.PallasMosaicGpuFlashAttention()
     super().__init__(
         *args,
         attention_fn=attention_fn,
@@ -103,12 +101,13 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       super().test_normalize_output()
 
   def test_base2(self):
-    impl = flash_attention.PallasMosaicGpuFlashAttention(use_base2=True)
+    impl = fa.PallasMosaicGpuFlashAttention(use_base2=True)
     self._run_test((2, 1024, 4, 64), impl=impl)
 
   def test_unstable_softmax(self):
-    impl = dataclasses.replace(self._attention_fn, use_stable_softmax=False)  # pytype: disable=wrong-arg-types
-    self._run_test((2, 1024, 4, 64), impl=impl)
+    if isinstance(self._attention_fn, fa.PallasMosaicGpuFlashAttention):
+      impl = dataclasses.replace(self._attention_fn, use_stable_softmax=False)
+      self._run_test((2, 1024, 4, 64), impl=impl)
 
   @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
   def test_bench(self, spec):
