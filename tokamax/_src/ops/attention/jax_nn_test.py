@@ -49,9 +49,6 @@ class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
       kwargs["expect_supported"] = False
     super()._run_test_with_inputs(*args, **kwargs)
 
-  def test_bench_deepseek2_16b_bf16(self):
-    self.skipTest("Test OOMs with JaxNNDotProductAttention implementations.")
-
 
 @pytest.mark.skip(reason="Too slow for OSS regression tests.")
 class JaxNnDotProductAttentionXlaTest(JaxNnDotProductAttentionTest):

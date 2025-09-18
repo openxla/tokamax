@@ -143,6 +143,8 @@ def _run_test(
   if not test_vjp:
     return
 
+  del actual, expected  # Free device memory.
+
   # Forwards training.
   wrap = lambda f: lambda q, k, v, bias: f(q, k, v, bias=bias)
   actual, vjp_fn = jax.vjp(wrap(impl), q, k, v, bias)
@@ -153,6 +155,7 @@ def _run_test(
     rng = jax.random.PRNGKey(42)
   dout = jax.random.normal(rng, expected.shape, dtype=actual.dtype)
   ref_dout = dout.astype(expected.dtype)
+  del expected, ref_kwargs, ref_impl  # Free device memory.
 
   # Backwards.
   if atol_grads is None:
@@ -165,6 +168,7 @@ def _run_test(
   chex.assert_trees_all_close(
       actual_grads, expected_grads, atol=atol_grads, rtol=rtol_grads
   )
+  del expected_grads, vjp_fn, ref_vjp_fn  # Free device memory.
 
   if test_vjp_deterministic:
     actual2, vjp_fn = jax.vjp(wrap(impl), q, k, v, bias)
