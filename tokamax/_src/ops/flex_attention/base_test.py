@@ -30,6 +30,11 @@ class WrappedFlexAttentionTest(wrapper_test_base.WrappedFlexAttentionTestBase):
   def __init__(self, *args):
     super().__init__(*args, flex_attn=base.FlexAttention())
 
+  # Allow for non-deterministic XLA reference in OSS (b/445821600).
+  def test_normalize_output(self):
+    with wrapper_test_base.test_base.override_test_args(atol=5e-5):
+      super().test_normalize_output()
+
 
 if __name__ == "__main__":
   absltest.main()
