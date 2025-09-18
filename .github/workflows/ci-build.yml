@@ -9,6 +9,8 @@ on:
   pull_request:
     branches:
       - main
+  # Event manually triggered (in the Github UI)
+  workflow_dispatch:
 
 # Constants for the workflow that are shared across jobs.
 env:
