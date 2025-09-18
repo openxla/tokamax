@@ -20,7 +20,7 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
-from tokamax._src import hlo_utils
+from tokamax import autotuning
 from tokamax._src import mosaic_gpu
 from tokamax._src import triton
 from tokamax._src.ops.gated_linear_unit import api
@@ -71,26 +71,25 @@ class GatedLinearUnitTest(parameterized.TestCase):
     with self.subTest("value"):
       chex.assert_trees_all_close(out, out_golden)
 
+    args = autotuning.get_bound_args(f.lower(lhs, rhs))
+    self.assertLen(args, 1)
+
+    self.assertEqual(lhs.dtype, jnp.bfloat16)
+    self.assertEqual(
+        args[0].arguments["precision"],
+        jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+    )
+
     with self.subTest("correct_implementation_used"):
-      opspecs = hlo_utils.get_opspecs(
-          f.lower(lhs, rhs), include_xla_kernels=implementation == "xla"
-      )
-      triton_impl = api.IMPLEMENTATIONS["triton"].__class__
-      match implementation:
-        case "triton":
-          self.assertIsInstance(opspecs[0].op, triton_impl)
-        case "xla":
-          self.assertIsInstance(
-              opspecs[0].op, api.IMPLEMENTATIONS["xla"].__class__
+      op = args[0].op
+      if implementation is None:
+        if jax.default_backend() == "gpu":
+          # Ensure either a Triton or Mosaic kernel is used.
+          self.assertTrue(
+              isinstance(op, api.IMPLEMENTATIONS["triton"].__class__)
           )
-        case None:
-          if jax.default_backend() == "gpu":
-            # Ensure either a Triton or Mosaic kernel is used.
-            self.assertTrue(
-                isinstance(opspecs[0].op, triton_impl)
-            )
-        case _:
-          raise ValueError(f"Unknown implementation: {implementation}")
+      else:
+        self.assertIsInstance(op, api.IMPLEMENTATIONS[implementation].__class__)
 
 
 class GatedLinearUnitTritonTest(test_base.GatedLinearUnitTestBase):
