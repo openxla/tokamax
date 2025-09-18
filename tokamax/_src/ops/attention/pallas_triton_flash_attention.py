@@ -212,7 +212,6 @@ def _fwd_kernel_impl(
     # See base class for explanation of why this is not `-inf`.
     mask_value = float(jnp.finfo(jnp.float32).min)
 
-    # TODO: Use `s += tl.where(mask, 0, -inf)` instead (exploiting FMA)?
     if mask_ref is not None:
       if pack_mask:
         mask_slice_k = pl.ds(start_k // 8, block_k // 8)
