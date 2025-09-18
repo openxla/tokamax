@@ -22,7 +22,6 @@ import chex
 import jax
 from jax import random
 import jax.numpy as jnp
-from qwix import pallas as qpl
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as ops
 from tokamax._src.ops.ragged_dot import test_base

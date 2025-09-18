@@ -27,7 +27,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from qwix import pallas as qpl
 from tokamax._src import mosaic_tpu as common
 
 
@@ -319,7 +318,7 @@ LutFn = Callable[[int, int, int], Optional[tuple[int, int, int]]]
 )
 def gmm(
     lhs: jax.Array,
-    rhs: jax.Array | qpl.QArray,
+    rhs: jax.Array,
     group_sizes: jax.Array,
     preferred_element_type: jnp.dtype,
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
@@ -346,8 +345,6 @@ def gmm(
   Returns:
     A 2d, jax.Array with shape [m, n].
   """
-  is_quantized = isinstance(rhs, qpl.QArray)
-
   if existing_out is not None:
     assert isinstance(existing_out, jax.Array)
     expected_dtype = existing_out.dtype
@@ -402,8 +399,8 @@ def gmm(
   def kernel(
       group_metadata,
       group_offset,
-      lhs: jax.Array | qpl.QArray,
-      rhs: jax.Array | qpl.QArray,
+      lhs: jax.Array,
+      rhs: jax.Array,
       existing_out,
       out,
       acc_scratch,
@@ -457,25 +454,10 @@ def gmm(
         mask_k_rem_lhs = lambda x: x
         mask_k_rem_rhs = lambda x: x
 
-      if isinstance(lhs, qpl.QArray):
-        # Let qx: QArray, qx = quant(x, 8 , ...)
-        # qx.dequant() == qx.qvalue * qx.scale ~= x
-        # Thus, setting qvalue to zero is equivalent to setting original tensor
-        # to zero.
-        loaded_lhs = dataclasses.replace(
-            lhs[...], qvalue=mask_k_rem_lhs(lhs.qvalue[...])
-        )
-      else:
-        loaded_lhs = mask_k_rem_lhs(lhs[...]).astype(input_dtype)
+      loaded_lhs = mask_k_rem_lhs(lhs[...]).astype(input_dtype)
+      loaded_rhs = mask_k_rem_rhs(rhs[...]).astype(input_dtype)
 
-      if isinstance(rhs, qpl.QArray):
-        loaded_rhs = dataclasses.replace(
-            rhs[...], qvalue=mask_k_rem_rhs(rhs.qvalue[...])
-        )
-      else:
-        loaded_rhs = mask_k_rem_rhs(rhs[...]).astype(input_dtype)
-
-      dot_general = qpl.dot_general if is_quantized else jax.lax.dot_general
+      dot_general = jax.lax.dot_general
       if transpose_rhs:
         dot_general_dims = (((1,), (1,)), ((), ()))
       else:
@@ -527,9 +509,6 @@ def gmm(
   else:
     in_out_block_spec = out_block_spec
     existing_out_arg_index = 6
-    # adding one more input because of scale factor of quantized tensor.
-    if isinstance(rhs, qpl.QArray):
-      existing_out_arg_index += 1
     input_output_aliases = {existing_out_arg_index: 0}
 
   lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
@@ -539,12 +518,7 @@ def gmm(
     rhs_block_spec = pl.BlockSpec((None, tk, tn), rhs_transform_indices)
 
   lhs_bytes = lhs.size * lhs.itemsize
-  if isinstance(rhs, qpl.QArray):
-    rhs_bytes = (
-        k * n
-    ) * rhs.qvalue.itemsize  # ignore scale factor as its size marginal.
-  else:
-    rhs_bytes = (k * n) * rhs.itemsize  # We don't read all of rhs
+  rhs_bytes = (k * n) * rhs.itemsize  # We don't read all of rhs
 
   out_bytes = (m * n) * jnp.dtype(preferred_element_type).itemsize
   max_active_tiles = group_metadata[1].size
@@ -555,8 +529,7 @@ def gmm(
   cost_estimate = pl.CostEstimate(
       flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
   )
-  pallas_call_fn = qpl.pallas_call if is_quantized else pl.pallas_call
-  call_gmm = pallas_call_fn(
+  call_gmm = pl.pallas_call(
       kernel,
       out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
       grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -715,38 +688,24 @@ def tgmm(
           tm=tm,
           tn=tk,
       )
-      if isinstance(lhs, qpl.QArray):
-        loaded_lhs = dataclasses.replace(
-            lhs[...],
-            qvalue=lax.select(
-                lhs_mask[...], lhs.qvalue[...], jnp.zeros_like(lhs.qvalue)
-            ).swapaxes(0, 1),
-        )
-      else:
-        loaded_lhs = lhs[...]
-        loaded_lhs = (
-            lax.select(
-                lhs_mask[...],
-                loaded_lhs.astype(jnp.float32),
-                jnp.zeros_like(lhs, jnp.float32),
-            )
-            .astype(input_dtype)
-            .swapaxes(0, 1)
-        )
-      if isinstance(rhs, qpl.QArray):
-        loaded_rhs = dataclasses.replace(
-            rhs[...],
-            qvalue=lax.select(
-                rhs_mask[...], rhs.qvalue[...], jnp.zeros_like(rhs.qvalue)
-            ),
-        )
-      else:
-        loaded_rhs = rhs[...]
-        loaded_rhs = lax.select(
-            rhs_mask[...],
-            loaded_rhs.astype(jnp.float32),
-            jnp.zeros_like(rhs, jnp.float32),
-        ).astype(input_dtype)
+
+      loaded_lhs = lhs[...]
+      loaded_lhs = (
+          lax.select(
+              lhs_mask[...],
+              loaded_lhs.astype(jnp.float32),
+              jnp.zeros_like(lhs, jnp.float32),
+          )
+          .astype(input_dtype)
+          .swapaxes(0, 1)
+      )
+
+      loaded_rhs = rhs[...]
+      loaded_rhs = lax.select(
+          rhs_mask[...],
+          loaded_rhs.astype(jnp.float32),
+          jnp.zeros_like(rhs, jnp.float32),
+      ).astype(input_dtype)
       dot = lax.dot
       acc_scratch[...] += dot(
           loaded_lhs,

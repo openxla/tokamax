@@ -22,7 +22,6 @@ from absl import logging
 import jax
 import jax.numpy as jnp
 import pydantic
-from qwix import pallas as qpl
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
@@ -58,7 +57,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   def _fwd(  # pytype: disable=signature-mismatch
       self,
       lhs: jax.Array,
-      rhs: jax.Array | qpl.QArray,
+      rhs: jax.Array,
       *,
       group_sizes: jax.Array | base.GroupSizes,
       ragged_dot_dimension_numbers: (
@@ -81,10 +80,8 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     # TODO: Once we know customer precision requirements, we should
     # use that instead of float32. This is a temporary solution to unblock
     # testing.
-
-    rhs_array = rhs.qvalue if isinstance(rhs, qpl.QArray) else rhs
     if preferred_element_type is None:
-      preferred_element_type = jnp.result_type(lhs.dtype, rhs_array.dtype)
+      preferred_element_type = jnp.result_type(lhs.dtype, rhs.dtype)
 
     out = backend.gmm(
         lhs,
@@ -128,7 +125,7 @@ def PallasMosaicTpuRaggedDotVjp(
     out: jax.Array,
     dout: jax.Array,
     lhs: jax.Array,
-    rhs: jax.Array | qpl.QArray,
+    rhs: jax.Array,
     *,
     group_sizes: jax.Array | base.GroupSizes,
     ragged_dot_dimension_numbers: (
@@ -144,7 +141,6 @@ def PallasMosaicTpuRaggedDotVjp(
   group_offset = jnp.array(0, dtype=jnp.int32)
   transpose_rhs = False
   interpret = False
-  rhs_array = rhs.qvalue if isinstance(rhs, qpl.QArray) else rhs
   if isinstance(group_sizes, base.GroupSizes):
     group_sizes = jnp.array(group_sizes)
 
@@ -162,7 +158,7 @@ def PallasMosaicTpuRaggedDotVjp(
       lhs.swapaxes(0, 1),
       dout,
       group_sizes,
-      preferred_element_type=rhs_array.dtype,
+      preferred_element_type=rhs.dtype,
       tiling=tiling,
       group_offset=group_offset,
       num_actual_groups=rhs.shape[0],

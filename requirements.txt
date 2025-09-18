@@ -12,7 +12,6 @@ protobuf
 pydantic>=2.11.0
 pytest
 pytest-xdist
-qwix@git+https://github.com/google/qwix.git
 tensorflow
 torch_xla[pallas]
 tqdm
