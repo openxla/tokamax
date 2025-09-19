@@ -22,6 +22,7 @@ from typing import Annotated, Any, Final, ParamSpec, Self, Sequence, TypeAlias
 from absl import logging
 import immutabledict
 import jax
+from jax.extend import backend
 import pydantic
 from tokamax._src import hlo_utils
 from tokamax._src import pydantic as pydantic_lib
@@ -260,6 +261,15 @@ def autotune(
   else:
     bound_args = get_bound_args(f, *args)  # pytype: disable=paramspec-error
 
+  device_kinds = map(op_base.infer_device_kind, bound_args)
+  device_kinds = {k for k in device_kinds if k is not None}
+  if not device_kinds:
+    device_kind = backend.get_default_device().device_kind
+  elif len(device_kinds) == 1:
+    device_kind = device_kinds.pop()
+  else:
+    raise ValueError(f"Multiple device kinds found: {device_kinds}")
+
   if all_implementations:
     bound_args = tuple(
         op_base.BoundArguments(op, ba.arguments)  # pylint: disable=g-complex-comprehension
@@ -290,8 +300,6 @@ def autotune(
       if not ignore_errors:
         raise
 
-  # TODO: Infer device kind from array arguments.
-  device_kind = jax.devices()[0].device_kind
   return AutotuningResult(device_kind, tuple(data))
 
 

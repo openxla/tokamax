@@ -430,8 +430,9 @@ class BoundArguments(Generic[_Config, _Key]):
   @property
   def cached_autotuning_data(self) -> AutotuningData[_Config] | None:
     """Returns autotuning data from the cache, if available."""
-    # TODO: Infer device kind from array arguments.
-    device_kind = backend.get_default_device().device_kind
+    device_kind = infer_device_kind(self)
+    if device_kind is None:
+      device_kind = backend.get_default_device().device_kind
     key = self.autotuning_cache_key
 
     for overlay in reversed(get_autotuning_cache_overlay_state().stack):
@@ -525,6 +526,19 @@ def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
 
 
 BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(BoundArguments)
+
+
+def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
+  """Infers the device kind from bound array arguments."""
+  device_kinds = set()
+  for x in jax.tree.leaves(dict(ba.arguments)):
+    if isinstance(x, jax.Array):
+      device_kinds |= {d.device_kind for d in x.devices()}
+  if not device_kinds:
+    return None
+  if len(device_kinds) == 1:
+    return device_kinds.pop()
+  raise ValueError(f"Multiple device kinds found: {device_kinds}")
 
 
 def _abstractify(pytree):
