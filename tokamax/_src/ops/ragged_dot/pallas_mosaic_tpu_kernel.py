@@ -20,6 +20,7 @@ from collections.abc import Callable
 import dataclasses
 import functools
 from functools import partial
+import json
 from typing import Any, Literal, Optional, Tuple
 
 import jax
@@ -529,7 +530,16 @@ def gmm(
   cost_estimate = pl.CostEstimate(
       flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
   )
-  call_gmm = pl.pallas_call(
+  kernel_name = f"gmm_tiles_{tm}x{tk}x{tn}"
+  if transpose_rhs:
+    kernel_name += "_transpose_rhs"
+  metadata = dict(
+      prefer_element_type=jnp.dtype(preferred_element_type).name,
+      tiling=dict(tile_m=tm, tile_k=tk, tile_n=tn),
+      transpose_rhs=transpose_rhs,
+  )
+  pallas_call_fn = pl.pallas_call
+  call_gmm = pallas_call_fn(
       kernel,
       out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
       grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -549,15 +559,12 @@ def gmm(
       ),
       interpret=interpret,
       cost_estimate=cost_estimate,
+      name=kernel_name,
+      metadata=dict(xprof_metadata=json.dumps(metadata)),
   )
 
-  out = call_gmm(
-      group_metadata,
-      group_offset,
-      lhs,
-      rhs,
-      existing_out,
-  )
+  with jax.named_scope(kernel_name):
+    out = call_gmm(group_metadata, group_offset, lhs, rhs, existing_out)
   if existing_out is None and num_current_groups < num_total_groups:
     out = _zero_uninitialized_memory(
         out,
@@ -622,8 +629,8 @@ def tgmm(
       num_actual_groups if num_actual_groups is not None else num_groups
   )
 
-  # If tiling is callable, look up the problem dimensions in the LUT. If no tuned
-  # tile dimensions are available throw an error.
+  # If tiling is callable, look up the problem dimensions in the LUT. If no
+  # tuned tile dimensions are available throw an error.
   if callable(tiling):
     tiling = tiling(m, k, n)
 
@@ -771,7 +778,13 @@ def tgmm(
   )
   lhs = lhs.swapaxes(0, 1)
 
+  kernel_name = f"tgmm_tiles_{tm}x{tk}x{tn}"
   pallas_call_fn = pl.pallas_call
+  metadata = dict(
+      tiling=dict(tile_m=tm, tile_k=tk, tile_n=tn),
+      prefer_element_type=jnp.dtype(preferred_element_type).name,
+      num_actual_groups=num_actual_groups
+  )
   call_gmm = pallas_call_fn(
       kernel,
       out_shape=jax.ShapeDtypeStruct(
@@ -794,13 +807,10 @@ def tgmm(
       ),
       interpret=interpret,
       cost_estimate=cost_estimate,
+      name=kernel_name,
+      metadata=dict(xprof_metadata=json.dumps(metadata)),
   )
 
-  out = call_gmm(
-      group_metadata,
-      group_offset,
-      lhs,
-      rhs,
-      existing_out,
-  )
+  with jax.named_scope(kernel_name):
+    out = call_gmm(group_metadata, group_offset, lhs, rhs, existing_out)
   return out
