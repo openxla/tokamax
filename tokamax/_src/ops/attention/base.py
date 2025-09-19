@@ -653,7 +653,7 @@ def needs_stable_softmax(
   # avoided without subtracting the maximum value.
   if jnp.dtype(logits_dtype) not in (jnp.float32, jnp.bfloat16):
     return True
-  # TODO: This value is very conservative and could be relaxed.
+  # NOTE: This value is very conservative and could be relaxed.
   return True if logits_soft_cap is None else logits_soft_cap > 60.0
 
 
