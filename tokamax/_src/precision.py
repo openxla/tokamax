@@ -144,6 +144,8 @@ def to_dot_algorithm_preset(
     case jnp.float32:
       new_precision = _F32_DOT_PRECISION_MAP[backend][precision]
       return jax.lax.DotAlgorithmPreset[new_precision]
+    case jnp.float64:
+      return jax.lax.DotAlgorithmPreset.F64_F64_F64
     case _:
       raise ValueError(f"Unsupported dtype: {dtype}")
 
