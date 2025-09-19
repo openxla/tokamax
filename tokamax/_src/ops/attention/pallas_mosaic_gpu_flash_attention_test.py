@@ -74,8 +74,9 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     q, k, v, bias = map(as_bf16, (q, k, v, bias))
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045 if bias is None else 0.007)
+    kwargs["atol_grads"] = None if bias is None else 0.03
 
-    if bias is not None or not impl_kwargs.get("normalize_output", True):
+    if not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
 
     if (q.ndim < 3) or (q.shape[-3] % 128 != 0) and not self._supports_decode:
@@ -113,8 +114,12 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
   def test_bench(self, spec):
     suffix = [k for k, v in bench_arg_specs.ARG_SPECS.items() if v == spec][0]
+    if spec().get("bias") is None or spec()["q"].dtype == jnp.float32:
+      atol_grads = None
+    else:
+      atol_grads = 0.15
     try:
-      with test_base.override_test_args(atol=0.02):
+      with test_base.override_test_args(atol=0.02, atol_grads=atol_grads):
         getattr(super(), "test_bench_" + suffix)()
     except ValueError as e:
       if "exceeds available shared memory" in str(e):

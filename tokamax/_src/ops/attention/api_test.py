@@ -145,11 +145,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       self.skipTest(
           'Skip test. Triton implementation is not supported on this platform.'
       )
-    # TODO: Remove once bias for Mosaic is supported.
-    if (mask_mode == 'bias' or 'bias' in mask_mode) and (
-        self.IMPL == 'mosaic' or self.IMPL is None
-    ):
-      self.skipTest('Mosaic not supported for bias at the moment.')
     # TODO: Fix test for 'xla_chunked' on TPU.
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
       self.skipTest(f'{self.IMPL} not supported on TPU')
@@ -243,9 +238,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       self.skipTest(
           'Skip test. Triton implementation is not supported on this platform.'
       )
-    # TODO: Remove once bias for Mosaic is supported.
-    if self.IMPL == 'mosaic' or self.IMPL is None:
-      self.skipTest('Mosaic not supported for bias gradient at the moment.')
 
     # TODO: Fix test for 'xla_chunked' on TPU.
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
@@ -313,16 +305,6 @@ class DotProductAttentionTest(parameterized.TestCase):
 
 class DotProductAttentionMosaicTest(DotProductAttentionTest):
   IMPL = 'mosaic'
-  SUPPORTS_VMAP = False
-
-  def testDotProductAttentionMask6(self):
-    self.skipTest('"mosaic" implementation does not support bias and vmap')
-
-  def testDotProductAttentionBiasGradient1(self):
-    self.skipTest('"mosaic" implementation does not support bias and vmap')
-
-  def testDotProductAttentionBiasGradient3(self):
-    self.skipTest('"mosaic" implementation does not support bias and vmap')
 
 
 class DotProductAttentionTritonTest(DotProductAttentionTest):
@@ -337,7 +319,6 @@ class DotProductAttentionCudnnTest(DotProductAttentionTest):
 
   def testMemoryScaling1(self):
     self.skipTest('Memory scaling guarantees not made for this implementation')
-
 
   def test_impl_in_hlo(self):
     if jax.default_backend() == 'tpu':

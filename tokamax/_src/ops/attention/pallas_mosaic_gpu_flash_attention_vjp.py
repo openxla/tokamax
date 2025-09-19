@@ -63,6 +63,7 @@ def _bwd(
     out: Float[Array, "*B T H d"],
     dout: Float[Array, "*B T H d"],
     *,
+    bias: Float[Array, "*#B #H #T #t"] | None,
     mask: Bool[Array, "*#B #H #T #t"] | None,
     k_start: Int[Array, "*#B #H #T"] | None,
     k_end: Int[Array, "*#B #H #T"] | None,
@@ -74,6 +75,7 @@ def _bwd(
     Float[Array, "*B T H D"],  # dq
     Float[Array, "*B t h D"],  # dk
     Float[Array, "*B t h d"],  # dv
+    Float[Array, "*#B #H #T #t"] | None,  # dbias
 ]:
   orig_q_shape = q.shape
   orig_k_shape = k.shape
@@ -131,6 +133,9 @@ def _bwd(
         f"{kv_seq_len=} must be a multiple of {config.block_kv_dq=}"
     )
 
+  if bias is not None:
+    orig_bias_shape = bias.shape
+    bias = as_4d(bias)
   if mask is not None:
     mask = as_4d(mask).astype(jnp.int8)
 
@@ -150,6 +155,46 @@ def _bwd(
 
   exp = jnp.exp2 if use_base2 else jnp.exp
 
+  def bias_mask_info(x_ref, b_idx, q_head, name):
+    if x_ref is None:
+      return (None,) * 4 + (False,)
+    bcast_b, bcast_h, bcast_q, bcast_k = [d == 1 for d in x_ref.shape]
+    if bcast_q and bcast_k:
+      raise NotImplementedError(f"{name} broadcast on both sequences.")
+    b_idx = 0 if bcast_b else b_idx
+    h_idx = 0 if bcast_h else q_head
+    return b_idx, h_idx, bcast_q, bcast_k, not (bcast_q or bcast_k)
+
+  def load_bias_mask(
+      s, x_ref, smems, smem_idx, barrier, bcast_q_slice, bcast_k_slice
+  ):
+    if x_ref is None:
+      return None
+    if bcast_q_slice is not None:
+      x = plgpu.load(x_ref, bcast_q_slice, layout=_WGMMA_COL, optimized=False)
+      return lax.broadcast_in_dim(x, s.shape, [1])
+    if bcast_k_slice is not None:
+      x = plgpu.load(x_ref, bcast_k_slice, layout=_WGMMA_ROW, optimized=False)
+      return lax.broadcast_in_dim(x, s.shape, [0])
+    if barrier is not None:
+      plgpu.barrier_arrive(barrier)
+    return smems[smem_idx]
+
+  def bias_mask_async_spec(x_ref, is_async, block_q, block_kv, idx, name):
+    if not is_async:
+      return None
+    bytes_ = jnp.dtype(x_ref.dtype).itemsize
+    swizzle = plgpu.find_swizzle(8 * bytes_ * block_kv, name)
+    transforms = (
+        plgpu.TilingTransform((8, swizzle // bytes_)),
+        plgpu.SwizzleTransform(swizzle),
+    )
+    return plgpu.BlockSpec(
+        block_shape=(compute_wgs * block_q, block_kv),
+        index_map=lambda i: (idx, i),
+        transforms=transforms,
+    )
+
   def kernel_dq(
       q_ref,
       k_ref,
@@ -158,10 +203,12 @@ def _bwd(
       m_ref,
       l_ref,
       delta_ref,
+      bias_ref,
       mask_ref,
       k_start_ref,
       k_end_ref,
       dq_ref,
+      ds_ref,
       smem_buffers,
       buffer_barriers,
       block_q: int,
@@ -177,18 +224,13 @@ def _bwd(
     q_barriers, dout_barriers, m_barriers, l_barriers, delta_barriers = (
         buffer_barriers
     )
-    if mask_ref is None:
-      mask_b_idx = mask_h_idx = bcast_mask_q = bcast_mask_k = None
-    else:
-      bcast_dims = [d == 1 for d in mask_ref.shape]
-      bcast_mask_b, bcast_mask_h, bcast_mask_q, bcast_mask_k = bcast_dims
-      if bcast_mask_q and bcast_mask_k:
-        raise NotImplementedError("Mask broadcast on both sequences.")
 
-      mask_b_idx = 0 if bcast_mask_b else b_idx
-      mask_h_idx = 0 if bcast_mask_h else q_head
-
-    async_mask = mask_ref is not None and not (bcast_mask_q or bcast_mask_k)
+    bias_b_idx, bias_h_idx, bcast_bias_q, bcast_bias_k, async_bias = (
+        bias_mask_info(bias_ref, b_idx, q_head, "bias")
+    )
+    mask_b_idx, mask_h_idx, bcast_mask_q, bcast_mask_k, async_mask = (
+        bias_mask_info(mask_ref, b_idx, q_head, "mask")
+    )
 
     def compute_thread(pipeline_callback):
       q_smem = q_smems.at[wg_idx]
@@ -243,13 +285,17 @@ def _bwd(
       plgpu.copy_smem_to_gmem(q_smem, dq_ref.at[q_slice])
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
+    # TODO: If bias/mask are broadcast along k, we can load outside the
+    # pipeline as they are not dependent on kv_step.
     def kv_pipeline(
         index,
         k_smem,
         v_smem,
+        bias_smems,
         mask_smems,
         k_consumed_barrier,
         v_consumed_barrier,
+        bias_consumed_barrier,
         mask_consumed_barrier,
         carry,
     ):
@@ -259,6 +305,9 @@ def _bwd(
       q_smem, dout_smem = q_smems.at[wg_idx], dout_smems.at[wg_idx]
       (dq_acc, m, l, delta, k_start, k_end) = carry
 
+      qs = pl.ds(q_seq_base, block_q)
+      ks = pl.ds(kv_base, block_kv)
+
       def compute_s(acc_ref):
         plgpu.wgmma(acc_ref, q_smem, plgpu.transpose_ref(k_smem, (1, 0)))
         return acc_ref[...]
@@ -266,11 +315,23 @@ def _bwd(
       s = pl.run_scoped(compute_s, plgpu.ACC((block_q, block_kv), jnp.float32))
       s *= logits_scale
 
+      bias = load_bias_mask(
+          s=s,
+          x_ref=bias_ref,
+          smems=bias_smems,
+          smem_idx=pl.ds(wg_idx * block_q, block_q),
+          barrier=bias_consumed_barrier,
+          bcast_q_slice=(0, ks) if bcast_bias_q else None,
+          bcast_k_slice=(qs, 0) if bcast_bias_k else None,
+      )
+      if bias is not None:
+        s += bias
+
       if logits_soft_cap is not None:
         logits = jnp.tanh(s / logits_soft_cap)
         s = logits_soft_cap * logits
 
-      # NOTE: This rescaling must happen after the soft-cap but before the
+      # NOTE: This rescaling must happen after bias and soft-cap but before the
       # attention masking (as the multiplication will cause `-inf`s).
       if use_base2:
         s *= math.log2(math.e)
@@ -288,19 +349,16 @@ def _bwd(
         _end = lax.broadcast_in_dim(k_end, s.shape, [0])
         s = jnp.where(kv_base + iota(1) < _end, s, mask_value)
 
-      if mask_ref is not None:
-        if bcast_mask_q:
-          idx = (0, pl.ds(kv_step * block_kv, block_kv))
-          mask = plgpu.load(mask_ref, idx, layout=_WGMMA_COL, optimized=False)
-        elif bcast_mask_k:
-          idx = (pl.ds(q_seq_base, block_q), 0)
-          mask = plgpu.load(mask_ref, idx, layout=_WGMMA_ROW, optimized=False)
-          mask = lax.broadcast_in_dim(mask, s.shape, [0])
-        else:
-          mask = mask_smems[pl.ds(wg_idx * block_q, block_q)]
-          if mask_consumed_barrier is not None:
-            plgpu.barrier_arrive(mask_consumed_barrier)
-
+      mask = load_bias_mask(
+          s=s,
+          x_ref=mask_ref,
+          smems=mask_smems,
+          smem_idx=pl.ds(wg_idx * block_q, block_q),
+          barrier=mask_consumed_barrier,
+          bcast_q_slice=(0, ks) if bcast_mask_q else None,
+          bcast_k_slice=(qs, 0) if bcast_mask_k else None,
+      )
+      if mask is not None:
         s = jnp.where(mask, s, mask_value)
 
       broadcast = lambda x: lax.broadcast_in_dim(x, (block_q, block_kv), [0])
@@ -318,6 +376,11 @@ def _bwd(
       ds = p * (dp - lax.broadcast_in_dim(delta, (block_q, block_kv), [0]))
       if logits_soft_cap is not None:
         ds *= 1 - jnp.pow(logits, 2)
+
+      if ds_ref is not None:
+        # TODO: Make this store non-blocking.
+        ds_ref[b_idx, q_head, qs, ks] = ds.astype(ds_ref.dtype)
+
       ds *= logits_scale
 
       def compute_dq(acc_ref):
@@ -328,20 +391,12 @@ def _bwd(
 
       return (dq_acc, m, l, delta, k_start, k_end)
 
-    if async_mask:
-      mask_swizzle = plgpu.find_swizzle(8 * block_kv, "mask")
-      mask_transforms = (
-          plgpu.TilingTransform((8, mask_swizzle)),
-          plgpu.SwizzleTransform(mask_swizzle),
-      )
-
-      mask_in_spec = plgpu.BlockSpec(
-          block_shape=(compute_wgs * block_q, block_kv),
-          index_map=lambda i: (q_idx, i),
-          transforms=mask_transforms,
-      )
-    else:
-      mask_in_spec = None
+    bias_in_spec = bias_mask_async_spec(
+        bias_ref, async_bias, block_q, block_kv, q_idx, "bias"
+    )
+    mask_in_spec = bias_mask_async_spec(
+        mask_ref, async_mask, block_q, block_kv, q_idx, "mask"
+    )
 
     pipeline = plgpu.emit_pipeline_warp_specialized(
         kv_pipeline,
@@ -363,15 +418,23 @@ def _bwd(
                 index_map=lambda i: (i, 0),
                 transforms=transforms,
             ),
+            bias_in_spec,
             mask_in_spec,
         ],
     )
     k_ref = k_ref.at[b_idx, :, kv_head, :]
     v_ref = v_ref.at[b_idx, :, kv_head, :]
+    if bias_ref is not None:
+      bias_ref = bias_ref.at[bias_b_idx, bias_h_idx, :, :]
     if mask_ref is not None:
       mask_ref = mask_ref.at[mask_b_idx, mask_h_idx, :, :]
 
-    pipeline(k_ref, v_ref, mask_ref if async_mask else None)
+    pipeline(
+        k_ref,
+        v_ref,
+        bias_ref if async_bias else None,
+        mask_ref if async_mask else None,
+    )
 
   def kernel_dkv(
       q_ref,
@@ -381,6 +444,7 @@ def _bwd(
       m_ref,
       l_ref,
       delta_ref,
+      bias_ref,
       mask_ref,
       k_start_ref,
       k_end_ref,
@@ -398,18 +462,12 @@ def _bwd(
     (k_smems, v_smems) = smem_buffers
     (k_barriers, v_barriers) = buffer_barriers
 
-    if mask_ref is None:
-      mask_b_idx = mask_h_idx = bcast_mask_q = bcast_mask_k = None
-    else:
-      bcast_dims = [d == 1 for d in mask_ref.shape]
-      bcast_mask_b, bcast_mask_h, bcast_mask_k, bcast_mask_q = bcast_dims
-      if bcast_mask_q and bcast_mask_k:
-        raise NotImplementedError("Mask broadcast on both sequences.")
-
-      mask_b_idx = 0 if bcast_mask_b else b_idx
-      mask_h_idx = 0 if bcast_mask_h else q_head
-
-    async_mask = mask_ref is not None and not (bcast_mask_q or bcast_mask_k)
+    bias_b_idx, bias_h_idx, bcast_bias_k, bcast_bias_q, async_bias = (
+        bias_mask_info(bias_ref, b_idx, q_head, "bias")
+    )
+    mask_b_idx, mask_h_idx, bcast_mask_k, bcast_mask_q, async_mask = (
+        bias_mask_info(mask_ref, b_idx, q_head, "mask")
+    )
 
     def compute_thread(pipeline_callback):
       k_smem, v_smem = k_smems.at[wg_idx], v_smems.at[wg_idx]
@@ -443,6 +501,8 @@ def _bwd(
       plgpu.commit_smem_to_gmem_group()
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
+    # TODO: If bias/mask are broadcast along q, we can load outside the
+    # pipeline as they are not dependent on q_step.
     def q_pipeline(
         index,
         q_smem,
@@ -450,12 +510,14 @@ def _bwd(
         m_smem,
         l_smem,
         delta_smem,
+        bias_smems,
         mask_smems,
         q_consumed_barrier,
         dout_consumed_barrier,
         m_consumed_barrier,
         l_consumed_barrier,
         delta_consumed_barrier,
+        bias_consumed_barrier,
         mask_consumed_barrier,
         carry,
     ):
@@ -464,6 +526,9 @@ def _bwd(
       kv_seq_base = kv_idx * (compute_wgs * block_kv) + wg_idx * block_kv
       k_smem, v_smem = k_smems.at[wg_idx], v_smems.at[wg_idx]
       dk_acc, dv_acc = carry
+
+      qs = pl.ds(q_seq_base, block_q)
+      ks = pl.ds(kv_seq_base, block_kv)
 
       def compute_sT(acc_ref):
         plgpu.wgmma(acc_ref, k_smem, plgpu.transpose_ref(q_smem, (1, 0)))
@@ -480,11 +545,23 @@ def _bwd(
       )
       sT *= logits_scale
 
+      bias = load_bias_mask(
+          s=sT,
+          x_ref=bias_ref,
+          smems=bias_smems,
+          smem_idx=pl.ds(wg_idx * block_q, block_q),
+          barrier=bias_consumed_barrier,
+          bcast_q_slice=(0, qs) if bcast_bias_k else None,
+          bcast_k_slice=(ks, 0) if bcast_bias_q else None,
+      )
+      if bias is not None:
+        sT += bias
+
       if logits_soft_cap is not None:
         logits = jnp.tanh(sT / logits_soft_cap)
         sT = logits_soft_cap * logits
 
-      # NOTE: This rescaling must happen after the soft-cap but before the
+      # NOTE: This rescaling must happen after bias and soft-cap but before the
       # attention masking (as the multiplication will cause `-inf`s).
       if use_base2:
         sT *= math.log2(math.e)
@@ -510,19 +587,16 @@ def _bwd(
         _end = lax.broadcast_in_dim(k_end, sT.shape, [1])
         sT = jnp.where(kv_seq_base + iota(0) < _end, sT, mask_value)
 
-      if mask_ref is not None:
-        if bcast_mask_q:
-          idx = (pl.ds(kv_seq_base, block_kv), 0)
-          mask = plgpu.load(mask_ref, idx, layout=_WGMMA_ROW, optimized=False)
-          mask = lax.broadcast_in_dim(mask, sT.shape, [0])
-        elif bcast_mask_k:
-          idx = (0, pl.ds(q_step * block_q, block_q))
-          mask = plgpu.load(mask_ref, idx, layout=_WGMMA_COL, optimized=False)
-        else:
-          mask = mask_smems[pl.ds(wg_idx * block_kv, block_kv)]
-          if mask_consumed_barrier is not None:
-            plgpu.barrier_arrive(mask_consumed_barrier)
-
+      mask = load_bias_mask(
+          s=sT,
+          x_ref=mask_ref,
+          smems=mask_smems,
+          smem_idx=pl.ds(wg_idx * block_q, block_q),
+          barrier=mask_consumed_barrier,
+          bcast_q_slice=(0, qs) if bcast_mask_k else None,
+          bcast_k_slice=(ks, 0) if bcast_mask_q else None,
+      )
+      if mask is not None:
         sT = jnp.where(mask, sT, mask_value)
 
       pT = exp(sT - broadcast(m)) / broadcast(l)
@@ -559,19 +633,12 @@ def _bwd(
 
       return (dk_acc, dv_acc)
 
-    if async_mask:
-      mask_swizzle = plgpu.find_swizzle(8 * block_q, "mask")
-      mask_transforms = (
-          plgpu.TilingTransform((8, mask_swizzle)),
-          plgpu.SwizzleTransform(mask_swizzle),
-      )
-      mask_in_spec = plgpu.BlockSpec(
-          block_shape=(compute_wgs * block_kv, block_q),
-          index_map=lambda i: (kv_idx, i),
-          transforms=mask_transforms,
-      )
-    else:
-      mask_in_spec = None
+    bias_in_spec = bias_mask_async_spec(
+        bias_ref, async_bias, block_kv, block_q, kv_idx, "bias"
+    )
+    mask_in_spec = bias_mask_async_spec(
+        mask_ref, async_mask, block_kv, block_q, kv_idx, "mask"
+    )
 
     pipeline = plgpu.emit_pipeline_warp_specialized(
         q_pipeline,
@@ -596,6 +663,7 @@ def _bwd(
             plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
             plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
             plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
+            bias_in_spec,
             mask_in_spec,
         ],
     )
@@ -604,6 +672,8 @@ def _bwd(
     m_ref = m_ref.at[b_idx, q_head, :]
     l_ref = l_ref.at[b_idx, q_head, :]
     delta_ref = delta_ref.at[b_idx, q_head, :]
+    if bias_ref is not None:
+      bias_ref = bias_ref.at[bias_b_idx, bias_h_idx, :, :]
     if mask_ref is not None:
       mask_ref = mask_ref.at[mask_b_idx, mask_h_idx, :, :]
 
@@ -613,6 +683,7 @@ def _bwd(
         m_ref,
         l_ref,
         delta_ref,
+        bias_ref if async_bias else None,
         mask_ref if async_mask else None,
     )
 
@@ -629,12 +700,17 @@ def _bwd(
   m_scratch = l_scratch = delta_scratch = plgpu.SMEM(
       (compute_wgs, config.block_q_dq), jnp.float32
   )
+  if bias is None:
+    ds_out_shape = None
+  else:
+    ds_out_shape = (batch_size, num_q_heads, kv_seq_len, q_seq_len)
+    ds_out_shape = jax.ShapeDtypeStruct(ds_out_shape, bias.dtype)
   # TODO: Optionally fuse the dq and dkv kernels.
-  dq = plgpu.kernel(
+  dq, ds = plgpu.kernel(
       functools.partial(
           kernel_dq, block_q=config.block_q_dq, block_kv=config.block_kv_dq
       ),
-      out_shape=q,
+      out_shape=(q, ds_out_shape),
       scratch_shapes=[
           (q_scratch, dout_scratch, m_scratch, l_scratch, delta_scratch),  # type: ignore
           (plgpu.Barrier(num_barriers=compute_wgs),) * 5,  # type: ignore
@@ -644,7 +720,7 @@ def _bwd(
       grid_names=("heads", "q_tiles", "batch"),
       num_threads=compute_wgs + 1,
       thread_name="wg",
-  )(q, k, v, dout, m, l, delta, mask, k_start, k_end)
+  )(q, k, v, dout, m, l, delta, bias, mask, k_start, k_end)
 
   k_scratch = plgpu.SMEM(
       (compute_wgs, config.block_kv_dkv, head_dim),
@@ -661,6 +737,7 @@ def _bwd(
   dv_shape = (batch_size, kv_seq_len, num_q_heads, head_dim_out)
 
   # TODO: Fuse transpose in the kernel.
+  bias_ = None if bias is None else bias.swapaxes(-1, -2)
   if mask is not None:
     mask = mask.swapaxes(-1, -2)
 
@@ -681,7 +758,7 @@ def _bwd(
       grid_names=("heads", "num_kv_tiles", "batch"),
       num_threads=compute_wgs + 1,
       thread_name="wg",
-  )(q, k, v, dout, m, l, delta, mask, k_start, k_end)
+  )(q, k, v, dout, m, l, delta, bias_, mask, k_start, k_end)
 
   if q_heads_per_kv_head > 1:
     dk = dk.reshape(*k.shape[:-1], q_heads_per_kv_head, -1).sum(axis=-2)
@@ -690,7 +767,13 @@ def _bwd(
   dq = dq[..., : orig_q_shape[-1]].reshape(*orig_q_shape)
   dk = dk[..., : orig_k_shape[-1]].reshape(*orig_k_shape)
   dv = dv[..., : orig_v_shape[-1]].reshape(*orig_v_shape)
-  return dq, dk, dv
+
+  if bias is None:
+    dbias = None
+  else:
+    broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
+    dbias = jnp.sum(ds, axis=broadcast_bias_axes).reshape(orig_bias_shape)
+  return dq, dk, dv, dbias
 
 
 def _decompose_mask(mask, q, k, q_indices, k_indices):
@@ -776,10 +859,6 @@ class PallasMosaicGpuFlashAttentionVjp(
     if logits_dtype != jnp.float32:
       raise NotImplementedError("`logits_dtype` must be float32.")
 
-    # TODO: Add support for `bias`.
-    if bias is not None:
-      raise ValueError("`bias` not supported.")
-
     if dropout_mask is not None:
       raise NotImplementedError("dropout is not supported.")
 
@@ -796,6 +875,7 @@ class PallasMosaicGpuFlashAttentionVjp(
 
     f = functools.partial(
         _bwd,
+        bias=bias,
         mask=mask,
         k_start=k_start,
         k_end=k_end,
@@ -807,8 +887,8 @@ class PallasMosaicGpuFlashAttentionVjp(
 
     args = (q, k, v, residuals, out, dout)
 
-    dq, dk, dv = f(*args)
-    return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=None), None
+    dq, dk, dv, dbias = f(*args)
+    return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     return Config(
