@@ -113,6 +113,10 @@ class Autotuner:
     executor = self.executor_fn()
     executor_args = {}
     timeout = self.timeout_seconds
+    if not configs:
+      logging.debug("No configs to autotune for %s, skipping.", fn_factory)
+      return AutotuningData({})
+
     if self.compile_executor_fn is not None:
       if isinstance(executor, process.ProcessPoolExecutor):
         raise ValueError(
@@ -182,5 +186,5 @@ class Autotuner:
           results[config].median_evaluation_time_ms,
       )
     else:
-      logging.error("all configs failed")
+      logging.error("all configs failed for %s", fn_factory)
     return results
