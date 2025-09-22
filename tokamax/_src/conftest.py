@@ -15,6 +15,7 @@
 
 """Pytest configuration for Tokamax."""
 
+import os
 import sys
 from absl import flags
 import jax
@@ -27,4 +28,8 @@ def tokamax_testing_setup():
   # TODO: Remove this once x64 is supported.
   jax.config.update('jax_enable_x64', False)
   flags.FLAGS(sys.argv[:1])
+  os.environ['XLA_FLAGS'] = os.environ.get('XLA_FLAGS', '') + (
+      ' --xla_gpu_deterministic_ops=True '
+      ' --xla_gpu_exclude_nondeterministic_ops=True'
+  )
   yield
