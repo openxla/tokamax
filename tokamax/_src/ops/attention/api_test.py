@@ -32,7 +32,6 @@ _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 # TODO: Check that the requested implementation is used.
 class DotProductAttentionTest(parameterized.TestCase):
   IMPL = None
-  SUPPORTS_VMAP = True
 
   # Tests derived from JAX `nn_test`.
   # pylint: disable=invalid-name
@@ -42,8 +41,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       use_vmap=[False, True],
   )
   def testDotProductAttention(self, dtype, group_num, use_vmap):
-    if use_vmap and not self.SUPPORTS_VMAP:
-      self.skipTest('vmap not supported')
     if self.IMPL == 'mosaic' and not mosaic_gpu.has_mosaic_gpu_support():
       self.skipTest(
           'Skip test. Mosaic implementation is not supported on this platform.'
@@ -242,8 +239,6 @@ class DotProductAttentionTest(parameterized.TestCase):
     # TODO: Fix test for 'xla_chunked' on TPU.
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
       self.skipTest(f'{self.IMPL} not supported on TPU')
-    if use_vmap and not self.SUPPORTS_VMAP:
-      self.skipTest('vmap not supported')
     if self.IMPL == 'cudnn' and batch_size != 1:
       self.skipTest('batch_size != 1 not supported for bias gradient in cudnn')
 
