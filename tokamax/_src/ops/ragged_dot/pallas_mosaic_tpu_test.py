@@ -22,6 +22,7 @@ import chex
 import jax
 from jax import random
 import jax.numpy as jnp
+from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as ops
 from tokamax._src.ops.ragged_dot import test_base
@@ -130,6 +131,24 @@ class PallasMosaicTpuRaggedDotTest(absltest.TestCase):
 
   def test_bench_memory_bound(self):
     self.skipTest("GPU Only test.")
+
+  def test_maxtext_config(self):
+    # Test to ensure that we can get the correct config for a specific model.
+    # For this test we are using jax.ShapeDtypeStruct instead of jax.Array
+    # because jax.Array would trigger OOM for our tests.
+    tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+    maxtext_config = tpu_ragged_dot._get_heuristics_config(
+        op.BoundArguments(
+            op=tpu_ragged_dot,
+            arguments={
+                "lhs": jax.ShapeDtypeStruct((262144, 7168), dtype=jnp.bfloat16),
+                "rhs": jax.ShapeDtypeStruct(
+                    (256, 7168, 2048), dtype=jnp.bfloat16
+                ),
+            },
+        )
+    )
+    self.assertEqual(maxtext_config.gmm_tiling, (256, 7168, 512))
 
 
 if __name__ == "__main__":

@@ -34,9 +34,9 @@ class Config:
   """Pallas Mosaic TPU Ragged Dot config."""
 
   gmm_tiling: tuple[
-      conint(ge=128, multiple_of=8),
-      conint(ge=128, multiple_of=8),
-      conint(ge=128, multiple_of=8),
+      conint(ge=128, multiple_of=8),  # tile m
+      conint(ge=128, multiple_of=8),  # tile k
+      conint(ge=128, multiple_of=8),  # tile n
   ]
 
 
@@ -98,7 +98,20 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     return out, None
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba  # Unused.
+    lhs = ba.arguments["lhs"]
+    rhs = ba.arguments["rhs"]
+
+    # Check to see if lhs and rhs match a specific kernel of interest, if so
+    # use the offline autotuned config.
+    m = lhs.shape[0]
+    k = lhs.shape[1]
+    n = rhs.shape[2]
+    g = rhs.shape[0]
+    if m == 262144 and n == 2048 and k == 7168 and g == 256:
+      # This config has been autotuned offline..
+      return Config(
+          gmm_tiling=(256, 7168, 512),
+      )
     # For now, return a basic tile config.
     return Config(
         gmm_tiling=(128, 128, 128),
@@ -137,7 +150,18 @@ def PallasMosaicTpuRaggedDotVjp(
     drhs_ragged_dot: Callable[..., jax.Array] = base.RaggedDot(),
 ) -> tuple[tuple[jax.Array, jax.Array], None]:
   del residual, preferred_element_type
-  tiling = (128, 128, 128)
+  lhs_tiling = rhs_tiling = (128, 128, 128)
+
+  # TODO: formally add autotuning to the vjp.
+  m = lhs.shape[0]
+  k = lhs.shape[1]
+  n = rhs.shape[2]
+  g = rhs.shape[0]
+  if m == 262144 and n == 2048 and k == 7168 and g == 256:
+    # This config has been autotuned for a specific model of interest.
+    lhs_tiling = (256, 2048, 1792)
+    rhs_tiling = (512, 1024, 2048)
+
   group_offset = jnp.array(0, dtype=jnp.int32)
   transpose_rhs = False
   interpret = False
@@ -149,7 +173,7 @@ def PallasMosaicTpuRaggedDotVjp(
       rhs,
       group_sizes=group_sizes,
       preferred_element_type=lhs.dtype,
-      tiling=tiling,
+      tiling=lhs_tiling,
       group_offset=group_offset,
       transpose_rhs=not transpose_rhs,
       interpret=interpret,
@@ -159,7 +183,7 @@ def PallasMosaicTpuRaggedDotVjp(
       dout,
       group_sizes,
       preferred_element_type=rhs.dtype,
-      tiling=tiling,
+      tiling=rhs_tiling,
       group_offset=group_offset,
       num_actual_groups=rhs.shape[0],
       interpret=interpret,
