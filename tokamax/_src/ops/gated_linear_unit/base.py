@@ -22,7 +22,9 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-importing-member,g-multiple-import
 from tokamax._src import ad
 from tokamax._src import jaxtyping
+from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
+
 
 _T = TypeVar('_T')
 _Config = TypeVar('_Config')
@@ -38,14 +40,35 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     if (self.vjp is None) and (type(self) is not GatedLinearUnit):  # pylint: disable=unidiomatic-typecheck
       object.__setattr__(self, 'vjp', GatedLinearUnitVjp())
 
+  def bind(
+      self,
+      x: jax.Array,
+      weights: jax.Array,
+      *,
+      activation: Callable[[jax.Array], jax.Array] | None = None,
+      precision: jax.lax.PrecisionLike = None,
+      return_residuals: bool = False,
+  ) -> op.BoundArguments:
+    """Binds the arguments for the gated linear unit function."""
+
+    return super().bind(
+        x=x,
+        weights=weights,
+        activation=activation,
+        precision=precision_lib.to_dot_algorithm_preset(
+            x.dtype, weights.dtype, precision
+        ),
+        return_residuals=return_residuals,
+    )
+
   @jaxtyping.jaxtyped
   def _fwd(
       self,
       x: Float[Array, '*B M K'],
       weights: Float[Array, 'K 2 N'],
       *,
-      activation: Callable[[jax.Array], jax.Array] | None = None,
-      precision: jax.lax.PrecisionLike = None,
+      activation: Callable[[jax.Array], jax.Array] | None,
+      precision: jax.lax.DotAlgorithmPreset,
       return_residuals: bool,
       config: _Config,
   ) -> tuple[Float[Array, '*B M N'], Residuals | None]:
@@ -57,9 +80,8 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       x: the input array.
       weights: the combined weights array.
       activation: optional activation function.
-      precision: specifies the matrix multiplication precision. Either `None`
-        (default), which means the default precision for the backend, or a
-        `jax.lax.Precision` enum.
+      precision: a `jax.lax.DotAlgorithmPreset` that specifies the matrix
+        multiplication precision.
       return_residuals: if True, returns the residuals in addition to the
         output.
       config: the configuration of the op.
@@ -126,7 +148,7 @@ class GatedLinearUnitVjp(
       weights: Float[Array, 'K 2 N'],
       *,
       activation: Callable[[jax.Array], jax.Array] | None,
-      precision: jax.lax.PrecisionLike,
+      precision: jax.lax.DotAlgorithmPreset,
       return_residuals: bool,
       config: _Config,
   ) -> tuple[tuple[Float[Array, '*B M K'], Float[Array, 'K 2 N']], None]:

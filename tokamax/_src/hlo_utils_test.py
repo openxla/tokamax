@@ -41,6 +41,7 @@ import triton.language as tl
 from tensorflow.compiler.xla import xla_data_pb2
 from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
+
 def add_vectors_kernel(x_ref, y_ref, o_ref):
   x, y = x_ref[...], y_ref[...]
   o_ref[...] = x + y
@@ -309,7 +310,10 @@ class DumpHloLibTest(parameterized.TestCase):
     )
     self.assertEqual(op_specs[1].arguments['x'], bs_64x128_bf16)
     self.assertEqual(op_specs[1].arguments['weights'], bs_128x2x128_bf16)
-    self.assertIsNone(op_specs[1].arguments['precision'])
+    self.assertEqual(
+        op_specs[1].arguments['precision'],
+        jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+    )
     self.assertFalse(op_specs[1].arguments['return_residuals'])
 
     # Test VJP ops.

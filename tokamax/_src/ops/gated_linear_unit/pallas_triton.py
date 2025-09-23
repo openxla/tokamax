@@ -101,6 +101,7 @@ def _get_best_block_size(m: int, n: int) -> tuple[int, int, int]:
 @dataclasses.dataclass(frozen=True)
 class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
   """Pallas-Triton gated linear unit."""
+
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
 
@@ -109,8 +110,8 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
       x: Float[Array, '*B M K'],
       weights: Float[Array, 'K 2 N'],
       *,
-      activation: Callable[[jax.Array], jax.Array] | None = None,
-      precision: jax.lax.PrecisionLike = None,
+      activation: Callable[[jax.Array], jax.Array] | None,
+      precision: jax.lax.DotAlgorithmPreset,
       return_residuals: bool,
       config: Config,
   ) -> tuple[Float[Array, '*B M N'], Residuals | None]:
