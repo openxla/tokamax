@@ -93,7 +93,8 @@ class RaggedDotTest(parameterized.TestCase):
       chex.assert_trees_all_close(rhs_grad, rhs_grad_gt)
 
     with self.subTest("correct_implementation_used"):
-      # TODO: HLO Utils does not work correctly for TPU HLO shapes yet. Will be fixed in a follow up.
+      # TODO: HLO Utils does not work correctly for TPU HLO shapes
+      # yet. Will be fixed in a follow up.
       if jax.default_backend() == "tpu":
         self.skipTest("Only works for GPU at the moment.")
       opspecs = hlo_utils.get_opspecs(
@@ -139,9 +140,6 @@ class RaggedDotImplementationTest(test_base.RaggedDotTestBase):
 
     super().setUp()
 
-  def test_bench_32_m32_n1024_k4096_bf16xi4(self):
-    self.skipTest("TODO: Fix tolerance and re-enable.")
-
 
 class RaggedDotMosaicTest(RaggedDotImplementationTest):
 
@@ -150,25 +148,22 @@ class RaggedDotMosaicTest(RaggedDotImplementationTest):
     dot_fn = self._dot_fn
 
     def fn(lhs, rhs, **kwargs):
+      if (
+          (lhs.dtype == jnp.bfloat16)
+          and (lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0)
+          and (
+              not isinstance(rhs, QuantizedArray)
+              or (
+                  (rhs.tile_shape == (1, 256, 1))
+                  and kwargs.get("preferred_element_type") is None
+              )
+          )
+      ):
+        return dot_fn(lhs, rhs, **kwargs)
 
-      if lhs.dtype != jnp.bfloat16:
-        self.skipTest(
-            f"Non-bfloat16 not supported by mgpu kernel ({lhs.dtype=})."
-        )
-
-      if kwargs.get("preferred_element_type"):
-        self.skipTest("TODO: Support preferred_element_type.")
-
-      if lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize):
-        self.skipTest("TODO: Support tile aligned K dimension.")
-
-      if isinstance(rhs, QuantizedArray) and rhs.tile_shape != (1, 256, 1):
-        self.skipTest(
-            "TODO: Only scaling tile supported is (1, 256, 1) got:"
-            f" {rhs.tile_shape}."
-        )
-
-      return dot_fn(lhs, rhs, **kwargs)
+      with self.assertRaises(NotImplementedError) as e:
+        _ = dot_fn(lhs, rhs, **kwargs)
+      self.skipTest(f"Test not supported: {e.msg}")
 
     self._dot_fn = fn
 
