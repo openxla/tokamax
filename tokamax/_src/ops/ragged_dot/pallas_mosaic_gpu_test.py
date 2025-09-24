@@ -40,26 +40,10 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
     op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
 
     def fn(lhs, rhs, *, config=None, **kwargs):
-      if not isinstance(lhs, jax.Array):
-        self.skipTest(
-            f"MGPU Kernel only supports jax.Arrays for lhs, got: {lhs}."
-        )
-
-      if lhs.dtype != jnp.bfloat16:
-        self.skipTest(
-            f"Non-bfloat16 not supported by mgpu kernel ({lhs.dtype=})."
-        )
-
-      if lhs.dtype != rhs.dtype:
-        self.skipTest(
-            f"lhs.dtype={lhs.dtype} must be equal to rhs.dtype={rhs.dtype}"
-        )
-
-      if kwargs.get("preferred_element_type") is not None:
-        self.skipTest("TODO: Support preferred_element_type.")
-
-      if lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize):
-        self.skipTest("TODO: Support tile aligned K dimension.")
+      expect_supported = (
+          (lhs.dtype == rhs.dtype == jnp.bfloat16)
+          and (lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0)
+      )
 
       device_kind = jax.devices()[0].device_kind.lower()
       if "b200" in device_kind:
@@ -72,33 +56,27 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
             collective=True,
             persistent=True,
         )
-        if not isinstance(rhs, QuantizedArray):
-          self.skipTest("TODO: Only QuantizedArray supported.")
-        if (lhs.dtype, rhs.values.dtype) != (jnp.bfloat16, jnp.int4):
-          self.skipTest(
-              "TODO: Only mixed precision bfloat16 x int4"
-              f" supported, got: {lhs.dtype=} {rhs.dtype=}."
-          )
         if (
-            rhs.tile_shape[0] != 1
-            or rhs.tile_shape[1] < _CONFIG.block_k
-            or rhs.tile_shape[2] != 1
+            not isinstance(rhs, QuantizedArray)
+            or (rhs.values.dtype != jnp.int4)
+            or (rhs.tile_shape[0] != 1)
+            or (rhs.tile_shape[1] < _CONFIG.block_k)
+            or (rhs.tile_shape[2] != 1)
         ):
-          self.skipTest(
-              "TODO: Only k tile quantization is supported, got:"
-              f" {rhs.tile_shape}."
-          )
-      elif isinstance(rhs, QuantizedArray) and rhs.tile_shape != (
-          1,
-          _CONFIG.block_k,
-          1,
-      ):
-        self.skipTest(
-            "TODO:(cperivol): Only scaling tile supported is (1, block_k, 1)"
-            f" got: {rhs.tile_shape} (block_k={_CONFIG.block_k})."
-        )
+          expect_supported = False
+      elif isinstance(rhs, QuantizedArray):
+        if (
+            rhs.tile_shape != (1, _CONFIG.block_k, 1)
+            or kwargs.get("preferred_element_type") is not None
+        ):
+          expect_supported = False
 
-      return op.with_config(config or _CONFIG)(lhs, rhs, **kwargs)
+      if expect_supported:
+        return op.with_config(config or _CONFIG)(lhs, rhs, **kwargs)
+
+      with self.assertRaises(NotImplementedError) as e:
+        _ = op.with_config(config or _CONFIG)(lhs, rhs, **kwargs)
+      self.skipTest(f"Test not supported: {e.msg}")
 
     super().__init__(*args, dot_fn=fn)
 
