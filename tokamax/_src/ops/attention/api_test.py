@@ -41,16 +41,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       use_vmap=[False, True],
   )
   def testDotProductAttention(self, dtype, group_num, use_vmap):
-    if self.IMPL == 'mosaic' and not mosaic_gpu.has_mosaic_gpu_support():
-      self.skipTest(
-          'Skip test. Mosaic implementation is not supported on this platform.'
-      )
-    if self.IMPL == 'triton' and not triton_lib.has_triton_support():
-      self.skipTest(
-          'Skip test. Triton implementation is not supported on this platform.'
-      )
-    if jax.default_backend() == 'tpu' and self.IMPL == 'cudnn':
-      self.skipTest(f'{self.IMPL} not supported on TPU')
 
     B, S, T, N, H, G = 2, 128, 128, 4, 64, group_num
     keys = jax.random.split(jax.random.PRNGKey(0), 5)
@@ -141,16 +131,8 @@ class DotProductAttentionTest(parameterized.TestCase):
       ],
   )
   def testDotProductAttentionMask(self, mask_mode):
-    if self.IMPL == 'mosaic' and not mosaic_gpu.has_mosaic_gpu_support():
-      self.skipTest(
-          'Skip test. Mosaic implementation is not supported on this platform.'
-      )
-    if self.IMPL == 'triton' and not triton_lib.has_triton_support():
-      self.skipTest(
-          'Skip test. Triton implementation is not supported on this platform.'
-      )
     # TODO: Fix test for 'xla_chunked' on TPU.
-    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
+    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
       self.skipTest(f'{self.IMPL} not supported on TPU')
     if isinstance(mask_mode, str):
       mask_mode = (mask_mode,)
@@ -234,17 +216,8 @@ class DotProductAttentionTest(parameterized.TestCase):
 
   @parameterized.product(batch_size=[1, 16], use_vmap=[False, True])
   def testDotProductAttentionBiasGradient(self, batch_size, use_vmap):
-    if self.IMPL == 'mosaic' and not mosaic_gpu.has_mosaic_gpu_support():
-      self.skipTest(
-          'Skip test. Mosaic implementation is not supported on this platform.'
-      )
-    if self.IMPL == 'triton' and not triton_lib.has_triton_support():
-      self.skipTest(
-          'Skip test. Triton implementation is not supported on this platform.'
-      )
-
     # TODO: Fix test for 'xla_chunked' on TPU.
-    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked', 'cudnn'):
+    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
       self.skipTest(f'{self.IMPL} not supported on TPU')
     if self.IMPL == 'cudnn' and batch_size != 1:
       self.skipTest('batch_size != 1 not supported for bias gradient in cudnn')
@@ -308,13 +281,30 @@ class DotProductAttentionTest(parameterized.TestCase):
 class DotProductAttentionMosaicTest(DotProductAttentionTest):
   IMPL = 'mosaic'
 
+  def setUp(self):
+    super().setUp()
+    if not mosaic_gpu.has_mosaic_gpu_support():
+      self.skipTest(
+          'Skip test. Mosaic implementation is not supported on this platform.'
+      )
+
 
 class DotProductAttentionTritonTest(DotProductAttentionTest):
   IMPL = 'triton'
 
+  def setUp(self):
+    super().setUp()
+    if not triton_lib.has_triton_support():
+      self.skipTest('Triton not supported on this platform.')
+
 
 class DotProductAttentionCudnnTest(DotProductAttentionTest):
   IMPL = 'cudnn'
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != 'gpu':
+      self.skipTest(f'cuDNN only supported on GPU, not {jax.default_backend()}')
 
   def testMemoryScaling0(self):
     self.skipTest('Memory scaling guarantees not made for this implementation')
@@ -323,8 +313,6 @@ class DotProductAttentionCudnnTest(DotProductAttentionTest):
     self.skipTest('Memory scaling guarantees not made for this implementation')
 
   def test_impl_in_hlo(self):
-    if jax.default_backend() == 'tpu':
-      self.skipTest('CudNN not supported on TPU')
     fn = functools.partial(api.dot_product_attention, implementation=self.IMPL)
     x = jnp.empty((2, 256, 4, 64), dtype=jnp.bfloat16)
     lowered = jax.jit(fn).lower(x, x, x)
