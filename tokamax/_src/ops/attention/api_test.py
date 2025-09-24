@@ -20,6 +20,7 @@ import chex
 import jax
 from jax import export
 import jax.numpy as jnp
+from tokamax import autotuning
 from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu
 from tokamax._src import triton as triton_lib
@@ -29,7 +30,6 @@ from tokamax._src.ops.attention import api
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
 
-# TODO: Check that the requested implementation is used.
 class DotProductAttentionTest(parameterized.TestCase):
   IMPL = None
 
@@ -85,6 +85,13 @@ class DotProductAttentionTest(parameterized.TestCase):
     chex.assert_trees_all_close(dQ_ans, dQ_ref, rtol=0.01, atol=0.01)
     chex.assert_trees_all_close(dK_ans, dK_ref, rtol=0.01, atol=0.01)
     chex.assert_trees_all_close(dV_ans, dV_ref, rtol=0.01, atol=0.01)
+
+    args = autotuning.get_bound_args(sdpa_ans, Q, K, V, bias, mask)
+    self.assertLen(args, 1)
+
+    if self.IMPL is not None:
+      impl = api.IMPLEMENTATIONS[self.IMPL]
+      self.assertIsInstance(args[0].op, impl.__class__)
 
   def test_symbolic_export(self):
     if self.IMPL != 'xla':
