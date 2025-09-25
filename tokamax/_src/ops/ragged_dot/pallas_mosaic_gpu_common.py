@@ -136,7 +136,6 @@ def store_acc_transposed(
     ni: jax.Array,
     m: int,
     group_info: GroupInfo,
-    config: Config,
     o_smem_swizzled,
 ):
   """Stores the accumulator into the output gmem.
@@ -151,15 +150,15 @@ def store_acc_transposed(
     ni: The current n index.
     m: The total m dimension.
     group_info: The group info for the current block.
-    config: The kernel config.
     o_smem_swizzled: The swizzled shared memory array to use.
   """
+  block_n, block_m = acc.shape
   out_elem_bits = jnp.finfo(o_gmem.dtype).bits
-  swizzle_out = plgpu.find_swizzle(out_elem_bits * config.block_n, "out")
+  swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
   out_swizzle_elems = (swizzle_out * 8) // out_elem_bits
 
-  o_smem_t = o_smem_swizzled.reshape(config.block_m // 8, 1, 8, config.block_n)
-  o_smem_t = plgpu.untile_ref(o_smem_t, (8, config.block_n))
+  o_smem_t = o_smem_swizzled.reshape(block_m // 8, 1, 8, block_n)
+  o_smem_t = plgpu.untile_ref(o_smem_t, (8, block_n))
   o_smem_t = plgpu.transpose_ref(o_smem_t, (1, 0))
   o_smem_t[...] = plgpu.layout_cast(
       acc.astype(o_gmem.dtype), plgpu.Layout.WGMMA_TRANSPOSED
@@ -167,12 +166,12 @@ def store_acc_transposed(
   plgpu.commit_smem()
   del o_smem_t
   o_smem0 = o_smem_swizzled.reshape(
-      config.block_m, config.block_n // out_swizzle_elems, out_swizzle_elems
+      block_m, block_n // out_swizzle_elems, out_swizzle_elems
   )
   # Write out the largest power of two rows first, then the next largest,
   # etc. This allows us to coalesce writes as much as possible.
   offset = group_info.start_within_block
-  size = 1 << (min(config.block_m, m).bit_length() - 1)
+  size = 1 << (min(block_m, m).bit_length() - 1)
   while size > 0:
 
     @pl.when(group_info.actual_size & size != 0)
@@ -181,7 +180,7 @@ def store_acc_transposed(
       o_smem = plgpu.untile_ref(o_smem, (out_swizzle_elems,))
       o_gref_slice = o_gmem.at[
           pl.ds(group_info.block_start + offset, size),
-          pl.ds(ni * config.block_n, config.block_n),
+          pl.ds(ni * block_n, block_n),
       ]
       plgpu.copy_smem_to_gmem(o_smem, o_gref_slice, commit_group=False)
 

@@ -83,7 +83,7 @@ def body(
     def store_acc(o_smem):
       assert block_n % 8 == 0
       common.store_acc_transposed(
-          acc, o_gmem, 2 * ni + wg, m, group_info, config, o_smem.at[wg]
+          acc, o_gmem, 2 * ni + wg, m, group_info, o_smem.at[wg]
       )
 
     transforms = (plgpu.SwizzleTransform(swizzle_out),)
