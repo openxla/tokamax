@@ -14,7 +14,7 @@ authors = [
 
 description = "A Pallas Custom Kernel Library."
 readme = "README.md"
-version = "0.0.1"
+version = "0.0.2"
 license = {file = "LICENSE"}
 requires-python = ">=3.11"
 dependencies = [
@@ -33,7 +33,6 @@ dependencies = [
     "pytest-xdist",
     "pytest",
     "tensorflow",
-    "torch_xla[pallas]",
     "tqdm",
     "triton>=3.0.0",
     "typeguard==2.13.3",

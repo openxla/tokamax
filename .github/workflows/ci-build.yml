@@ -52,10 +52,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3.11 -m uv pip install --upgrade pip 
-          python3.11 -m uv pip --version
-          python3.11 -m uv pip install --upgrade -r requirements.txt
-          python3.11 -m uv pip freeze
+          python3.12 -m uv pip install --upgrade pip 
+          python3.12 -m uv pip --version
+          python3.12 -m uv pip install --upgrade -r requirements.txt
+          python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
           pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/${{ matrix.pytest_command }}
@@ -80,10 +80,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3.11 -m uv pip install --upgrade pip 
-          python3.11 -m uv pip --version
-          python3.11 -m uv pip install --upgrade -r requirements.txt
-          python3.11 -m uv pip freeze
+          python3.12 -m uv pip install --upgrade pip 
+          python3.12 -m uv pip --version
+          python3.12 -m uv pip install --upgrade -r requirements.txt
+          python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
           pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ tokamax/_src/ops
@@ -108,10 +108,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3.11 -m uv pip install --upgrade pip 
-          python3.11 -m uv pip --version
-          python3.11 -m uv pip install --upgrade -r requirements.txt
-          python3.11 -m uv pip freeze
+          python3.12 -m uv pip install --upgrade pip 
+          python3.12 -m uv pip --version
+          python3.12 -m uv pip install --upgrade -r requirements.txt
+          python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
           pytest -s --ignore-glob="tokamax/_src/ops/*" tokamax
