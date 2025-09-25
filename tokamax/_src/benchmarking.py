@@ -341,6 +341,7 @@ _FALLBACK_TIMING_METHOD = 'wallclock'
 
 
 def _get_metadata(lowered: jax.stages.Lowered) -> dict[str, Any]:
+  del lowered  # Unused.
   return {}  # Overridden internally.
 
 
