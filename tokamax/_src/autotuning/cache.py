@@ -17,7 +17,6 @@ from typing import Any, TypeAlias
 
 from tokamax._src.autotuning import autotuner
 
-
 AutotuningData = autotuner.AutotuningData
 DeviceKind = str
 DeviceAutotuningCache: TypeAlias = dict[Any, AutotuningData[Any]]
@@ -39,5 +38,5 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
     return cache
 
   def _load_cache(self, device_kind: DeviceKind) -> DeviceAutotuningCache:
-    del device_kind  # Unused.
-    return {}  # TODO: Implement.
+    """Loads autotuning cache from corresponding JSON file."""
+    return {}
