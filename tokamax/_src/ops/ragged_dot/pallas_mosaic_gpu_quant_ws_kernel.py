@@ -156,7 +156,7 @@ def ragged_dot_quantized_ws_kernel(
         f" {rhs.tile_shape} (block_k={config.block_k})."
     )
 
-  if group_sizes.shape[0] != g:
+  if group_sizes.shape != (g,):
     raise ValueError(
         f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
     )

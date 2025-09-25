@@ -86,7 +86,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
     raise ValueError(
         f"Contraction dim mismatch: weights.shape[1]={k_w}, x.shape[-1]={k_x}"
     )
-  if group_sizes.shape[0] != num_groups:
+  if group_sizes.shape != (num_groups,):
     raise ValueError(
         "Expected group_sizes to have shape"
         f" {(num_groups,)} but got {group_sizes.shape}"
