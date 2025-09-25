@@ -157,17 +157,18 @@ def store_acc_transposed(
   swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
   out_swizzle_elems = (swizzle_out * 8) // out_elem_bits
 
-  o_smem_t = o_smem_swizzled.reshape(block_m // 8, 1, 8, block_n)
-  o_smem_t = plgpu.untile_ref(o_smem_t, (8, block_n))
-  o_smem_t = plgpu.transpose_ref(o_smem_t, (1, 0))
-  o_smem_t[...] = plgpu.layout_cast(
+  if out_swizzle_elems != block_n:
+    raise ValueError(
+        f"Expected out_swizzle_elems ({out_swizzle_elems}) to equal block_n"
+        f" ({block_n})"
+    )
+
+  o_smem = o_smem_swizzled.reshape(block_m // 8, 1, 8, block_n)
+  o_smem = plgpu.untile_ref(o_smem, (8, block_n))
+  o_smem.T[...] = plgpu.layout_cast(
       acc.astype(o_gmem.dtype), plgpu.Layout.WGMMA_TRANSPOSED
   )
   plgpu.commit_smem()
-  del o_smem_t
-  o_smem0 = o_smem_swizzled.reshape(
-      block_m, block_n // out_swizzle_elems, out_swizzle_elems
-  )
   # Write out the largest power of two rows first, then the next largest,
   # etc. This allows us to coalesce writes as much as possible.
   offset = group_info.start_within_block
@@ -176,13 +177,12 @@ def store_acc_transposed(
 
     @pl.when(group_info.actual_size & size != 0)
     def _():
-      o_smem = o_smem0.at[pl.ds(offset, size)]
-      o_smem = plgpu.untile_ref(o_smem, (out_swizzle_elems,))
-      o_gref_slice = o_gmem.at[
+      o_smem_ = o_smem_swizzled.at[pl.ds(offset, size)]
+      o_gmem_ = o_gmem.at[
           pl.ds(group_info.block_start + offset, size),
           pl.ds(ni * block_n, block_n),
       ]
-      plgpu.copy_smem_to_gmem(o_smem, o_gref_slice, commit_group=False)
+      plgpu.copy_smem_to_gmem(o_smem_, o_gmem_, commit_group=False)
 
     offset += group_info.actual_size & size
     size //= 2
