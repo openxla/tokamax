@@ -152,7 +152,6 @@ def ragged_dot_gpu_quant_blackwell_kernel(
         block_ni, tid_m, remainder_ni, cluster_idx = idx
       else:
         block_ni, tid_m, remainder_ni = idx
-        cluster_idx = 0
       tid_m += m_offset
       ni = block_ni * pl.cdiv(n, block_n * grid_block_n) + remainder_ni
       mi = block_gmem[tid_m]

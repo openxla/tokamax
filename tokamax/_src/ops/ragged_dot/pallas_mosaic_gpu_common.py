@@ -275,7 +275,8 @@ def ragged_kernel(
           functools.partial(loop_body, pl.cdiv(m, config.block_m))
       )
     else:
-      loop_body(0, tuple(map(lax.axis_index, ("remainder_n", "m", "block_n",))))
+      loop_body(0,
+        tuple(map(lax.axis_index, ("remainder_n", "m", "block_n",))))
 
   if config.persistent:
     # TODO: Detect this number from device.
