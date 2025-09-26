@@ -22,18 +22,18 @@ from absl.testing import parameterized
 import jax
 import jax.experimental
 import jax.numpy as jnp
-import tokamax
 from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_base
-from tokamax._src.ops.attention import api as attention_api
+from tokamax._src.ops.attention import api as attn_api
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
 from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
+from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 
 from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
@@ -300,7 +300,7 @@ class AutotuningTest(parameterized.TestCase):
 
     @jax.jit
     def f(lhs, rhs, group_sizes):
-      return tokamax.ragged_dot(
+      return ragged_dot_api.ragged_dot(
           lhs,
           rhs,
           group_sizes,
