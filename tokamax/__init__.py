@@ -15,6 +15,8 @@
 """A library of accelerator kernels."""
 
 # pylint: disable=g-importing-member,useless-import-alias
+from tokamax import autotuning as autotuning
+from tokamax import benchmarking as benchmarking
 from tokamax import config as config
 from tokamax._src.autotuning.api import autotune as autotune
 from tokamax._src.autotuning.api import AutotuningResult as AutotuningResult

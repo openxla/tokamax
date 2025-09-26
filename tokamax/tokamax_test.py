@@ -20,7 +20,6 @@ import jax
 from jax import export
 import jax.numpy as jnp
 import tokamax
-from tokamax import benchmarking
 from tokamax._src.autotuning import api as autotuning
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention_vjp
@@ -94,10 +93,8 @@ class TokamaxTest(absltest.TestCase):
         chex.assert_trees_all_close(out, out_autotuned)
 
     with self.subTest("Benchmark"):
-      f_std, args = benchmarking.standardize_function(f_grad, x, scale)
-      bench: benchmarking.BenchmarkData = benchmarking.compile_benchmark(
-          f_std, args
-      )(args)
+      f_std, args = tokamax.benchmarking.standardize_function(f_grad, x, scale)
+      bench = tokamax.benchmarking.compile_benchmark(f_std, args)(args)
       self.assertGreater(bench.median_evaluation_time_ms, 0.0)
 
 

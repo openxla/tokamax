@@ -160,11 +160,10 @@ execution time. This means the usual approach of timing
 for only measuring accelerator execution time:
 
 ```python
-from tokamax import benchmarking
 
-f_std, args = benchmarking.standardize_function(f, kwargs={'x': x, 'scale': scale})
-run = benchmarking.compile_benchmark(f_std, args)
-bench: benchmarking.BenchmarkData = run(args)
+f_std, args = tokamax.benchmarking.standardize_function(f, kwargs={'x': x, 'scale': scale})
+run = tokamax.benchmarking.compile_benchmark(f_std, args)
+bench: tokamax.benchmarking.BenchmarkData = run(args)
 ```
 
 There are different measurement techniques: for example, on GPU, there is the
