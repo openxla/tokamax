@@ -15,10 +15,10 @@
 """Pallas Mosaic TPU Megablox."""
 
 import dataclasses
-import functools
+from functools import partial  # pylint: disable=g-importing-member
+import itertools
 import types
-from typing import Any, Callable, Literal, Sequence, Tuple, TypeVar
-from absl import logging
+from typing import ClassVar
 import jax
 import jax.numpy as jnp
 import pydantic
@@ -26,21 +26,65 @@ from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
 
-conint = pydantic.conint
+TilingTuple = tuple[
+    pydantic.conint(ge=128, multiple_of=128),  # tile_m
+    pydantic.conint(ge=128, multiple_of=128),  # tile_k
+    pydantic.conint(ge=128, multiple_of=128),  # tile_n
+]
+
+Residuals = types.NoneType
+
+LUTKey = tuple[
+    pydantic.PositiveInt,  # m
+    pydantic.PositiveInt,  # k
+    pydantic.PositiveInt,  # n
+    pydantic.PositiveInt,  # g
+]
+LUTValue = TilingTuple
 
 
 @pydantic.dataclasses.dataclass(frozen=True)
 class Config:
   """Pallas Mosaic TPU Ragged Dot config."""
 
-  gmm_tiling: tuple[
-      conint(ge=128, multiple_of=8),  # tile m
-      conint(ge=128, multiple_of=8),  # tile k
-      conint(ge=128, multiple_of=8),  # tile n
-  ]
+  gmm_tiling: TilingTuple = (128, 128, 128)
+  gmm_rhs_transpose_tiling: TilingTuple | None = None
+  tgmm_tiling: TilingTuple | None = None
+  interpret: bool = False
 
 
-Residuals = types.NoneType
+# A temporary lookup table for optimized configs.
+# TODO: formally add autotuning to the vjp.
+GMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
+    (262144, 7168, 2048, 256): (256, 7168, 512),
+}
+GMM_RHS_TRANSPOSE_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
+    (262144, 7168, 2048, 256): (256, 2048, 1792),
+}
+TGMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
+    (262144, 7168, 2048, 256): (512, 1024, 2048)
+}
+
+# Ragged dot dimension numbers supported by the megablox kernel.
+DEFAULT_RAGGED_DOT_DIM_NUMS = base.DEFAULT_RAGGED_DOT_DIM_NUMS
+
+DLHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(([1], [2]), ([], [])),
+    lhs_ragged_dimensions=[0],
+    rhs_group_dimensions=[0],
+)
+
+DRHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(([0], [0]), ([], [])),
+    lhs_ragged_dimensions=[0],
+    rhs_group_dimensions=[],
+)
+
+UNSUPPORTED_DIMENSIONS_MSG = (
+    "Specified ragged_dot_dimension_numbers not supported. Supported"
+    f" dimensions include: {DEFAULT_RAGGED_DOT_DIM_NUMS},"
+    f" {DLHS_RAGGED_DOT_DIM_NUMS}, {DRHS_RAGGED_DOT_DIM_NUMS}"
+)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -50,9 +94,17 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   TPU Implementation of the Megablocks Paper https://arxiv.org/abs/2211.15841.
   """
 
+  config_cls: ClassVar[type[Config]] = Config
+
   def __post_init__(self):
     if self.vjp is None:
-      object.__setattr__(self, "vjp", PallasMosaicTpuRaggedDotVjp)
+      # Avoid infinite recursion.
+      fn = lambda *args, **kw: PallasMosaicTpuRaggedDot(  # pylint: disable=unnecessary-lambda
+          config=self.config
+      )(*args, **kw)
+      object.__setattr__(
+          self, "vjp", partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)
+      )
 
   def _fwd(  # pytype: disable=signature-mismatch
       self,
@@ -63,136 +115,89 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       ragged_dot_dimension_numbers: (
           jax.lax.RaggedDotDimensionNumbers | None
       ) = None,
-      precision: jax.lax.DotAlgorithmPreset,
-      preferred_element_type: jax.typing.DTypeLike,
+      precision: jax.lax.DotAlgorithmPreset | None = None,
+      preferred_element_type: jax.typing.DTypeLike | None = None,
       return_residuals: bool = False,
       config: Config,
   ) -> tuple[jax.Array, None]:
-    # TODO: Support more ragged_dot_dimension_numbers configurations.
-    del precision
-    tiling = config.gmm_tiling
-    if ragged_dot_dimension_numbers != base.DEFAULT_RAGGED_DOT_DIM_NUMS:
-      raise NotImplementedError(
-          "Only default `ragged_dot_dimension_numbers` supported."
-      )
+    # TODO: Support more ragged_dot_dimension_numbers
+    # configurations.
+    del precision, return_residuals
     if isinstance(group_sizes, base.GroupSizes):
       group_sizes = jnp.array(group_sizes)
-    # TODO: Once we know customer precision requirements, we should
-    # use that instead of float32. This is a temporary solution to unblock
-    # testing.
     if preferred_element_type is None:
-      preferred_element_type = jnp.result_type(lhs.dtype, rhs.dtype)
+      preferred_element_type = jnp.promote_types(lhs.dtype, rhs.dtype)
 
-    out = backend.gmm(
-        lhs,
-        rhs,
-        group_sizes=group_sizes,
-        preferred_element_type=preferred_element_type,
-        tiling=tiling,
-        group_offset=None,
-        existing_out=None,
-        transpose_rhs=False,
-        interpret=False,
-    )
-
+    if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
+      out = backend.gmm(
+          lhs,
+          rhs,
+          group_sizes=group_sizes,
+          preferred_element_type=preferred_element_type,
+          tiling=config.gmm_tiling,
+          existing_out=None,
+          transpose_rhs=False,
+          interpret=config.interpret,  # pytype: disable=attribute-error
+      )
+    elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:
+      out = backend.gmm(
+          lhs,
+          rhs,
+          group_sizes=group_sizes,
+          preferred_element_type=preferred_element_type,
+          tiling=config.gmm_rhs_transpose_tiling or config.gmm_tiling,
+          transpose_rhs=True,
+          interpret=config.interpret,  # pytype: disable=attribute-error
+      )
+    elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:
+      out = backend.tgmm(
+          lhs.swapaxes(0, 1),
+          rhs,
+          group_sizes=group_sizes,
+          preferred_element_type=preferred_element_type,
+          tiling=config.tgmm_tiling or config.gmm_tiling,
+          interpret=config.interpret,  # pytype: disable=attribute-error
+      )
+    else:
+      raise NotImplementedError(UNSUPPORTED_DIMENSIONS_MSG)
     return out, None
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    lhs = ba.arguments["lhs"]
-    rhs = ba.arguments["rhs"]
-
-    # Check to see if lhs and rhs match a specific kernel of interest, if so
-    # use the offline autotuned config.
-    m = lhs.shape[0]
-    k = lhs.shape[1]
-    n = rhs.shape[2]
-    g = rhs.shape[0]
-    if m == 262144 and n == 2048 and k == 7168 and g == 256:
-      # This config has been autotuned offline..
-      return Config(
-          gmm_tiling=(256, 7168, 512),
-      )
-    # For now, return a basic tile config.
-    return Config(
-        gmm_tiling=(128, 128, 128),
+    lhs, rhs = ba.arguments["lhs"], ba.arguments["rhs"]
+    ragged_dot_dimension_numbers = ba.arguments.get(
+        "ragged_dot_dimension_numbers", DEFAULT_RAGGED_DOT_DIM_NUMS
     )
+    default_config = Config()
+    if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
+      (m, k), (g, _, n) = lhs.shape, rhs.shape
+      return Config(gmm_tiling=GMM_TILING_TUNED_LUT.get(
+          (m, k, n, g), default_config.gmm_tiling
+      ))
+    elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:
+      grad = lhs
+      (m, n), (g, k, _) = grad.shape, rhs.shape  # lhs is out
+      return Config(
+          gmm_rhs_transpose_tiling=GMM_RHS_TRANSPOSE_TILING_TUNED_LUT.get(
+              (m, k, n, g), default_config.gmm_tiling
+          )
+      )
+    elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:
+      group_sizes = ba.arguments["group_sizes"]
+      grad = rhs
+      if isinstance(group_sizes, base.GroupSizes):
+        group_sizes = jnp.array(group_sizes)
+      (m, k), (_, n), g = lhs.shape, grad.shape, group_sizes.shape[0]
+      return Config(tgmm_tiling=TGMM_TILING_TUNED_LUT.get(
+          (m, k, n, g), default_config.gmm_tiling
+      ))
+    else:
+      raise NotImplementedError(UNSUPPORTED_DIMENSIONS_MSG)
 
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     del ba  # Unused.
-    # TODO: Add more configs.
-    configs = set()
-    tile_range = range(128, 1024, 128)
-    for m in tile_range:
-      for n in tile_range:
-        for k in tile_range:
-          configs.add(
-              Config(
-                  gmm_tiling=(m, n, k),
-              )
-          )
-    return configs
+    tile_range = [128]  # TODO: Add more configs.
+    return set(
+        Config(gmm_tiling=(tile_m, tile_k, tile_n))
+        for tile_m, tile_k, tile_n in itertools.product(*([tile_range] * 3))
+    )
 
-
-def PallasMosaicTpuRaggedDotVjp(
-    residual: Residuals,
-    out: jax.Array,
-    dout: jax.Array,
-    lhs: jax.Array,
-    rhs: jax.Array,
-    *,
-    group_sizes: jax.Array | base.GroupSizes,
-    ragged_dot_dimension_numbers: (
-        jax.lax.RaggedDotDimensionNumbers | None
-    ) = None,
-    precision: jax.lax.DotAlgorithmPreset,
-    preferred_element_type: jax.typing.DTypeLike,
-    dlhs_ragged_dot: Callable[..., jax.Array] = base.RaggedDot(),
-    drhs_ragged_dot: Callable[..., jax.Array] = base.RaggedDot(),
-) -> tuple[tuple[jax.Array, jax.Array], None]:
-  del residual, preferred_element_type
-  lhs_tiling = rhs_tiling = (128, 128, 128)
-
-  # TODO: formally add autotuning to the vjp.
-  m = lhs.shape[0]
-  k = lhs.shape[1]
-  n = rhs.shape[2]
-  g = rhs.shape[0]
-  if m == 262144 and n == 2048 and k == 7168 and g == 256:
-    # This config has been autotuned for a specific model of interest.
-    lhs_tiling = (256, 2048, 1792)
-    rhs_tiling = (512, 1024, 2048)
-
-  group_offset = jnp.array(0, dtype=jnp.int32)
-  transpose_rhs = False
-  interpret = False
-  if isinstance(group_sizes, base.GroupSizes):
-    group_sizes = jnp.array(group_sizes)
-
-  grad_lhs = backend.gmm(
-      dout,
-      rhs,
-      group_sizes=group_sizes,
-      preferred_element_type=lhs.dtype,
-      tiling=lhs_tiling,
-      group_offset=group_offset,
-      transpose_rhs=not transpose_rhs,
-      interpret=interpret,
-  )
-  grad_rhs = backend.tgmm(
-      lhs.swapaxes(0, 1),
-      dout,
-      group_sizes,
-      preferred_element_type=rhs.dtype,
-      tiling=rhs_tiling,
-      group_offset=group_offset,
-      num_actual_groups=rhs.shape[0],
-      interpret=interpret,
-  )
-
-  # NOTE: If the rhs transposition is fused into the forward pass we need to
-  # return the transpose of the rhs gradient that we calculated above.
-  #
-  # TODO: Fuse this transposition into the tgmm.
-  grad_rhs = grad_rhs.swapaxes(1, 2) if transpose_rhs else grad_rhs
-  # return grad_lhs, grad_rhs, None, None, grad
-  return (grad_lhs, grad_rhs), None

@@ -57,6 +57,14 @@ class RaggedDotTestBase(parameterized.TestCase):
     super().__init__(*args)
     self._dot_fn = dot_fn
 
+    # Allow redefining the tolerance in subclasses.
+    self.tol = dict(atol=5e-2)
+
+    # Allow redefining the numerical comparison metric in subclasses.
+    self.assert_close = lambda a, b, **tol: chex.assert_trees_all_close(
+        a, b, **dict(self.tol, **tol)
+    )
+
   @parameterized.parameters(jnp.bfloat16, jnp.float32)
   def test_simple(self, dtype):
     rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
@@ -66,7 +74,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     group_sizes = jnp.array([m // num_groups] * num_groups, jnp.uint32)
 
     actual = self._dot_fn(a, b, group_sizes=group_sizes)
-    chex.assert_trees_all_close(actual, ref(a, b, group_sizes), atol=5e-2)
+    self.assert_close(actual, ref(a, b, group_sizes))
 
   def test_padded(self):
     rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
@@ -81,7 +89,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     expected = ref(a, b, group_sizes)
     actual = self._dot_fn(a, b, group_sizes=group_sizes)
     count = sum(group_sizes)
-    chex.assert_trees_all_close(actual[:count], expected[:count], atol=5e-2)
+    self.assert_close(actual[:count], expected[:count])
 
   @parameterized.product(
       dtype=("int8", "int4"),
@@ -109,7 +117,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     expected = ref(a, b_quant.recompose(), group_sizes)
     actual = self._dot_fn(a_quant, b_quant, group_sizes=group_sizes)
     count = sum(group_sizes)
-    chex.assert_trees_all_close(actual[:count], expected[:count], atol=5e-2)
+    self.assert_close(actual[:count], expected[:count])
 
   @parameterized.parameters(None, jnp.bfloat16, jnp.float32)
   def test_preferred_element_type(self, out_type):
@@ -124,7 +132,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     )
     expected = ref(a, b, group_sizes, preferred_element_type=out_type)
     self.assertEqual(actual.dtype, expected.dtype)
-    chex.assert_trees_all_close(actual, expected, atol=5e-2)
+    self.assert_close(actual, expected)
 
   @parameterized.parameters((8, 1024, 128, 256), (8, 128, 64, 128))
   def test_vjp(self, num_groups, m, k, n):
@@ -134,14 +142,14 @@ class RaggedDotTestBase(parameterized.TestCase):
     group_sizes = jnp.array([m // num_groups] * num_groups, jnp.uint32)
     f = functools.partial(self._dot_fn, group_sizes=group_sizes)
     f_ref = functools.partial(ref, group_sizes=group_sizes)
-    chex.assert_trees_all_close(f(a, b), f_ref(a, b), atol=5e-2)
+    self.assert_close(f(a, b), f_ref(a, b))
 
     actual, f_vjp = jax.vjp(f, a, b)
     expected, f_ref_vjp = jax.vjp(f_ref, a, b)
-    chex.assert_trees_all_close(actual, expected, atol=5e-2)
+    self.assert_close(actual, expected)
 
     dout = jax.random.normal(rng2, (m, n), dtype=expected.dtype)
-    chex.assert_trees_all_close(f_vjp(dout), f_ref_vjp(dout), atol=5e-2)
+    self.assert_close(f_vjp(dout), f_ref_vjp(dout))
 
   def test_group_sizes(self):
     rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
@@ -152,7 +160,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     expected = ref(a, b, group_sizes=group_sizes)
     group_sizes = base.GroupSizes(group_sizes, (1,) * num_groups)
     actual = self._dot_fn(a, b, group_sizes=group_sizes)  # pytype: disable=wrong-arg-types
-    chex.assert_trees_all_close(actual, expected, atol=5e-2)
+    self.assert_close(actual, expected)
 
   @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
   def test_bench(self, spec):
@@ -160,9 +168,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     expected = ref(**kwargs)
     actual = self._dot_fn(**kwargs)
     count = sum(spec["group_sizes"].representative_value)
-    chex.assert_trees_all_close(
-        actual[:count], expected[:count], atol=0.05, rtol=0.05
-    )
+    self.assert_close(actual[:count], expected[:count], atol=0.05, rtol=0.05)
 
 
 def base_names_and_params(test_name: str) -> list[tuple[str, str]]:

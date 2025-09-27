@@ -214,7 +214,8 @@ def make_group_metadata(
   # such that they're ignored by the subsequent histogram. Also filter out any
   # group which is empty.
   #
-  # TODO: Invert the 'partial_tile_mask' predicates to be more clear.
+  # TODO: Invert the 'partial_tile_mask' predicates to be more
+  # clear.
   partial_tile_mask = jnp.logical_or(
       (group_offsets[:-1] % tm) == 0, group_sizes == 0
   )
@@ -372,8 +373,8 @@ def gmm(
   if transpose_rhs:
     n = rhs.shape[1]
 
-  # If tiling is callable, look up the problem dimensions in the LUT. If no tuned
-  # tile dimensions are available throw an error.
+  # If tiling is callable, look up the problem dimensions in the LUT. If no
+  # tuned tile dimensions are available throw an error.
   if callable(tiling):
     tiling = tiling(m, k, n)
 
