@@ -102,7 +102,9 @@ def vmap_split(
 class BatchedShapeDtype(jax.ShapeDtypeStruct):
   """A container for the shape, dtype, and vmap axes of an array."""
 
-  def __init__(self, shape, dtype, vmap_axes):
+  vmap_axes: tuple[int | None, ...]
+
+  def __init__(self, shape, dtype, vmap_axes: tuple[int | None, ...]):
     super().__init__(shape, dtype)
     self.vmap_axes = vmap_axes
 
