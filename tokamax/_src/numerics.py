@@ -161,12 +161,10 @@ def _int_initializer(key, shape, dtype, minval=None, maxval=None):
     maxval = min(jnp.iinfo(dtype).max + 1, 128)
   if minval is None:
     minval = max(jnp.iinfo(dtype).min, -maxval)
-  # `jax.random.randint` doesn't currently support int4.
-  # TODO: Remove this when int4 is supported.
-  dtype_ = jnp.int8 if dtype.name in ('int4', 'uint4') else dtype
+
   return jax.random.randint(
-      key, shape=shape, minval=minval, maxval=maxval, dtype=dtype_
-  ).astype(dtype)
+      key, shape=shape, minval=minval, maxval=maxval, dtype=dtype
+  )
 
 
 def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
