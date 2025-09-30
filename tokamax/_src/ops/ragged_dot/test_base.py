@@ -19,6 +19,7 @@ import functools
 from absl.testing import parameterized
 import chex
 import jax
+from jax.experimental import checkify
 import jax.numpy as jnp
 from tokamax._src import numerics
 from tokamax._src import quantization
@@ -161,6 +162,20 @@ class RaggedDotTestBase(parameterized.TestCase):
     group_sizes = base.GroupSizes(group_sizes, (1,) * num_groups)
     actual = self._dot_fn(a, b, group_sizes=group_sizes)  # pytype: disable=wrong-arg-types
     self.assert_close(actual, expected)
+
+  @parameterized.parameters(((2, 3, -1, 4),), ((1022, 1, 1, 1),))
+  def test_invalid_group_sizes(self, group_sizes):
+    if jax.version.__version_info__ < (0, 8, 0):
+      self.skipTest("Requires JAX 0.8.0 or later.")
+
+    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
+    num_groups, m, k, n = 4, 1024, 128, 256
+    a = jax.random.normal(rng0, (m, k), dtype=jnp.bfloat16)
+    b = jax.random.normal(rng1, (num_groups, k, n), dtype=jnp.bfloat16)
+    fn = jax.jit(checkify.checkify(self._dot_fn))
+    with self.assertRaises(checkify.JaxRuntimeError):
+      err, _ = fn(a, b, group_sizes=jnp.array(group_sizes, jnp.int32))
+      err.throw()
 
   @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
   def test_bench(self, spec):
