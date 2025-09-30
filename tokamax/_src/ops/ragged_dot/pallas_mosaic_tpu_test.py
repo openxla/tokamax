@@ -17,18 +17,18 @@
 from functools import partial  # pylint: disable=g-importing-member
 import itertools
 import math
-from absl.testing import absltest, parameterized  # pylint: disable=g-importing-member
+
+from absl.testing import absltest
+from absl.testing import parameterized
 import chex
 import jax
 from jax import random
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
 
-QuantizedArray = quantization.QuantizedArray
 
 TESTCASE_SAMPLES = 16
 
@@ -94,8 +94,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
   def __init__(self, *args):
 
     def fn(lhs, rhs, *, config=None, **kwargs):
-      lhs = lhs.recompose() if isinstance(lhs, QuantizedArray) else lhs
-      rhs = rhs.recompose() if isinstance(rhs, QuantizedArray) else rhs
       if any(s < 128 for s in (tuple(lhs.shape) + tuple(rhs.shape))):
         self.skipTest(f"Skipping ragged dot inputs, {lhs.shape=} {rhs.shape=},"
                       " that are too small for TPU.")

@@ -22,6 +22,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 import pydantic
+from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
@@ -32,6 +33,7 @@ TilingTuple = tuple[
     pydantic.conint(ge=128, multiple_of=128),  # tile_n
 ]
 
+QuantizedArray = quantization.QuantizedArray
 Residuals = types.NoneType
 
 LUTKey = tuple[
@@ -106,10 +108,10 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           self, "vjp", partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)
       )
 
-  def _fwd(  # pytype: disable=signature-mismatch
+  def _fwd(
       self,
-      lhs: jax.Array,
-      rhs: jax.Array,
+      lhs: jax.Array | QuantizedArray,
+      rhs: jax.Array | QuantizedArray,
       *,
       group_sizes: jax.Array | base.GroupSizes,
       ragged_dot_dimension_numbers: (
@@ -120,9 +122,15 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool = False,
       config: Config,
   ) -> tuple[jax.Array, None]:
+    del precision, return_residuals  # Unused.
+
+    if isinstance(lhs, QuantizedArray):
+      lhs = lhs.recompose()
+    if isinstance(rhs, QuantizedArray):
+      rhs = rhs.recompose()
+
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
-    del precision, return_residuals
     if isinstance(group_sizes, base.GroupSizes):
       group_sizes = jnp.array(group_sizes)
     if preferred_element_type is None:
@@ -200,4 +208,3 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         Config(gmm_tiling=(tile_m, tile_k, tile_n))
         for tile_m, tile_k, tile_n in itertools.product(*([tile_range] * 3))
     )
-
