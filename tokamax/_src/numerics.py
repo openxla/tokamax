@@ -156,7 +156,6 @@ class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
 def _int_initializer(key, shape, dtype, minval=None, maxval=None):
   """Default int initializer for `random_initialize`."""
   dtype = jnp.dtype(dtype)
-  # TODO: Choose this value in a more principled way.
   if maxval is None:
     maxval = min(jnp.iinfo(dtype).max + 1, 128)
   if minval is None:
