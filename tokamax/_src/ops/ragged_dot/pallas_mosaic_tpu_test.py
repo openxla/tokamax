@@ -33,7 +33,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
   def __init__(self, *args):
 
     def fn(lhs, rhs, *, config=None, **kwargs):
-      if any(s < 128 for s in (tuple(lhs.shape) + tuple(rhs.shape))):
+      if any(s < 128 for s in (tuple(lhs.shape) + tuple(rhs.shape[1:]))):
         self.skipTest(f"Skipping ragged dot inputs, {lhs.shape=} {rhs.shape=},"
                       " that are too small for TPU.")
       return pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)(
@@ -44,12 +44,15 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     self.tol = dict(atol=1e-2, rtol=0)
 
     def assert_close(a, b, **tol):
-      l2_diff = jnp.linalg.norm(a - b, axis=-1)
-      l2_norm = jnp.maximum(jnp.linalg.norm(b, axis=-1), 1e-6)
-      l2_rel = l2_diff / l2_norm
-      chex.assert_trees_all_close(
-          l2_rel, jnp.zeros_like(l2_rel), **dict(self.tol, **tol)
-      )
+
+      def l2_rel(a, b):
+        l2_diff = jnp.linalg.norm(a - b, axis=-1)
+        l2_norm = jnp.maximum(jnp.linalg.norm(b, axis=-1), 1e-6)
+        return l2_diff / l2_norm
+
+      l2_rel = jax.tree.map(l2_rel, a, b)
+      expected = jax.tree.map(jnp.zeros_like, l2_rel)
+      chex.assert_trees_all_close(l2_rel, expected, **dict(self.tol, **tol))
 
     self.assert_close = assert_close
 
