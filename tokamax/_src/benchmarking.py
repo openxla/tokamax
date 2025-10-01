@@ -471,7 +471,9 @@ def register_benchmark(
     if metadata:
       label += f', {metadata}'
 
-    state.set_iteration_time(median / 1e3)
+    while state:
+      state.set_iteration_time(median / 1e3)
+
     state.set_label(label)
     if items_processed_fn is not None:
       state.items_processed = items_processed_fn(**kwargs_)
