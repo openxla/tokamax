@@ -18,10 +18,9 @@ from absl.testing import absltest
 import chex
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops import op
+from tokamax._src.ops import op as op_base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
-
 
 
 # TODO : Add QWIX tests for ragged dot once QWIX is in Ragged Dot.
@@ -33,12 +32,14 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
   def __init__(self, *args):
 
     def fn(lhs, rhs, *, config=None, **kwargs):
-      if any(s < 128 for s in (tuple(lhs.shape) + tuple(rhs.shape[1:]))):
-        self.skipTest(f"Skipping ragged dot inputs, {lhs.shape=} {rhs.shape=},"
-                      " that are too small for TPU.")
-      return pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)(
-          lhs, rhs, **kwargs
-      )
+      op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
+
+      if lhs.shape[0] % 128 == 0:
+        return op(lhs, rhs, **kwargs)
+
+      with self.assertRaises(NotImplementedError) as e:
+        _ = op(lhs, rhs, **kwargs)
+      self.skipTest(f"Test not supported: {e.msg}")
 
     super().__init__(*args, dot_fn=fn)
     self.tol = dict(atol=1e-2, rtol=0)
@@ -70,7 +71,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     # because jax.Array would trigger OOM for our tests.
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
     maxtext_config = tpu_ragged_dot._get_heuristics_config(
-        op.BoundArguments(
+        op_base.BoundArguments(
             op=tpu_ragged_dot,
             arguments={
                 "lhs": jax.ShapeDtypeStruct((262144, 7168), dtype=jnp.bfloat16),
