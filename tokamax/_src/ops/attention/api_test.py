@@ -158,8 +158,9 @@ class DotProductAttentionTest(parameterized.TestCase):
       custom_mask = jnp.tril(jnp.ones((T, S), dtype=jnp.bool_))
       mask = custom_mask[None, None, :, :]
     if 'bias' in mask_mode:
-      # TODO: Tokamax calculates dbias in f32, so use an f32 bias
-      # to reduce ref error. When CuDNN is used, the bias in f32 causes NaNs.
+      # Tokamax calculates dbias in f32, so use an f32 bias
+      # to reduce ref error. When CuDNN is used, the bias in f32 causes NaNs
+      # (see https://github.com/jax-ml/jax/issues/32242).
       bias_dtype = dtype if cudnn_bias else jnp.float32
       bias = jax.random.normal(keys[4], (1, N, T, S), bias_dtype)
     if 'sliding_window' in mask_mode:
