@@ -143,8 +143,6 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           group_sizes=group_sizes,
           preferred_element_type=preferred_element_type,
           tiling=config.gmm_tiling,
-          existing_out=None,
-          transpose_rhs=False,
           interpret=config.interpret,  # pytype: disable=attribute-error
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:

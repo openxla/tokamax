@@ -325,7 +325,6 @@ def gmm(
     preferred_element_type: jnp.dtype,
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
     group_offset: jax.Array | None = None,
-    existing_out: jax.Array | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
 ) -> jax.Array:
@@ -339,7 +338,6 @@ def gmm(
     tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
     group_offset: The group in group sizes to start computing from. This is
       particularly useful for when rhs num_groups is sharded.
-    existing_out: Existing output to write to.
     transpose_rhs: True if the rhs needs to be transposed.
     interpret: Whether or not to run the kernel in interpret mode, helpful for
       testing and debugging.
@@ -347,13 +345,6 @@ def gmm(
   Returns:
     A 2d, jax.Array with shape [m, n].
   """
-  if existing_out is not None:
-    assert isinstance(existing_out, jax.Array)
-    expected_dtype = existing_out.dtype
-    if expected_dtype != preferred_element_type:
-      raise ValueError(
-          "Existing output dtype must match preferred_element_type."
-      )
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
   else:
@@ -403,11 +394,10 @@ def gmm(
       group_offset,
       lhs: jax.Array,
       rhs: jax.Array,
-      existing_out,
       out,
       acc_scratch,
   ):
-    group_offsets, group_ids, m_tile_ids = group_metadata
+    group_offsets, group_ids, _ = group_metadata
     del group_offsets, group_ids, group_offset
 
     grid_id = pl.program_id(1)
@@ -416,18 +406,6 @@ def gmm(
     @pl.when(k_i == 0)
     def _zero_acc():
       acc_scratch[...] = jnp.zeros_like(acc_scratch)
-
-      if existing_out is not None:
-        prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
-        is_first_processed_group = grid_id == 0
-        m_tile_changed = m_tile_ids[grid_id] != m_tile_ids[prev_grid_id]
-        first_time_seeing_out = jnp.logical_or(
-            is_first_processed_group, m_tile_changed
-        )
-
-        @pl.when(first_time_seeing_out)
-        def _init_out():
-          out[...] = existing_out[...]
 
     def mask_k_rem(x: jax.Array, *, dim: int):
       if k_rem == 0:
@@ -504,20 +482,12 @@ def gmm(
     del k_i, group_offsets, group_ids, group_offset
     return m_tile_ids[grid_id], n_i
 
-  out_block_spec = pl.BlockSpec((tm, tn), out_transform_indices)
-  if existing_out is None:
-    in_out_block_spec: Any = None
-    input_output_aliases = {}
-  else:
-    in_out_block_spec = out_block_spec
-    existing_out_arg_index = 6
-    input_output_aliases = {existing_out_arg_index: 0}
-
   lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
   if transpose_rhs:
     rhs_block_spec = pl.BlockSpec((None, tn, tk), rhs_transform_indices)
   else:
     rhs_block_spec = pl.BlockSpec((None, tk, tn), rhs_transform_indices)
+  out_block_spec = pl.BlockSpec((tm, tn), out_transform_indices)
 
   lhs_bytes = lhs.size * lhs.itemsize
   rhs_bytes = (k * n) * rhs.itemsize  # We don't read all of rhs
@@ -545,16 +515,11 @@ def gmm(
       out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
-          in_specs=[
-              lhs_block_spec,
-              rhs_block_spec,
-              in_out_block_spec,
-          ],
+          in_specs=[lhs_block_spec, rhs_block_spec],
           out_specs=out_block_spec,
           grid=(tiles_n, num_active_tiles, tiles_k),
           scratch_shapes=[pltpu.VMEM((tm, tn), jnp.float32)],
       ),
-      input_output_aliases=input_output_aliases,
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "arbitrary", "arbitrary")
       ),
@@ -565,8 +530,8 @@ def gmm(
   )
 
   with jax.named_scope(kernel_name):
-    out = call_gmm(group_metadata, group_offset, lhs, rhs, existing_out)
-  if existing_out is None and num_current_groups < num_total_groups:
+    out = call_gmm(group_metadata, group_offset, lhs, rhs)
+  if num_current_groups < num_total_groups:
     out = _zero_uninitialized_memory(
         out,
         start_group=group_offset[0],
@@ -593,7 +558,6 @@ def tgmm(
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
     group_offset: jax.Array | None = None,
     num_actual_groups: int | None = None,
-    existing_out: jax.Array | None = None,
     interpret: bool = False,
 ) -> jax.Array:
   """Compute lhs[:, sizes[i-1]:sizes[i]] @ rhs[sizes[i-1]:sizes[i], :].
@@ -608,7 +572,6 @@ def tgmm(
       particularly useful for when rhs num_groups is sharded.
     num_actual_groups: For when num_groups is sharded and we should only compute
       the groups that are local, starting from group_offset.
-    existing_out: Existing output to write to.
     interpret: Whether or not to run the kernel in interpret mode, helpful for
       testing and debugging.
 
@@ -659,7 +622,6 @@ def tgmm(
       group_offset,
       lhs,
       rhs,
-      existing_out,
       out,
       acc_scratch,
   ):
@@ -729,10 +691,7 @@ def tgmm(
 
     @pl.when(group_is_changing)
     def _store_accum():
-      to_store = acc_scratch[...]
-      if existing_out is not None:
-        to_store += existing_out[...].astype(jnp.float32)
-      out[...] = to_store.astype(preferred_element_type)
+      out[...] = acc_scratch[...].astype(preferred_element_type)
 
   def lhs_transform_indices(n_i, k_i, grid_id, group_metadata, group_offset):
     # lhs is (m, k). Load the [tm, tk] matrix for this m-tile.
@@ -757,16 +716,9 @@ def tgmm(
     # "unsharded" domain.
     return group_ids[grid_id] - group_offset[0], k_i, n_i
 
-  out_block_spec = pl.BlockSpec((None, tk, tn), out_transform_indices)
-  if existing_out is None:
-    in_out_block_spec: Any = None
-    input_output_aliases = {}
-  else:
-    in_out_block_spec = out_block_spec
-    input_output_aliases = {6: 0}
-
   lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
   rhs_block_spec = pl.BlockSpec((tm, tn), rhs_transform_indices)
+  out_block_spec = pl.BlockSpec((None, tk, tn), out_transform_indices)
 
   lhs_bytes = lhs.size * lhs.itemsize
   rhs_bytes = rhs.size * rhs.itemsize
@@ -793,16 +745,11 @@ def tgmm(
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
-          in_specs=[
-              lhs_block_spec,
-              rhs_block_spec,
-              in_out_block_spec,
-          ],
+          in_specs=[lhs_block_spec, rhs_block_spec],
           out_specs=out_block_spec,
           grid=(tiles_n, tiles_k, num_active_tiles),
           scratch_shapes=[pltpu.VMEM((tk, tn), jnp.float32)],
       ),
-      input_output_aliases=input_output_aliases,
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "arbitrary", "arbitrary")
       ),
@@ -813,5 +760,4 @@ def tgmm(
   )
 
   with jax.named_scope(kernel_name):
-    out = call_gmm(group_metadata, group_offset, lhs, rhs, existing_out)
-  return out
+    return call_gmm(group_metadata, group_offset, lhs, rhs)
