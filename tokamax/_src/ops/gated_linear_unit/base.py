@@ -31,6 +31,7 @@ _Config = TypeVar('_Config')
 _Key = TypeVar('_Key')
 _FwdFn = Callable[[jax.Array, jax.Array], _T]
 Residuals: TypeAlias = Float[Array, '*B M 2 N']
+CanonicalPrecision = precision_lib.CanonicalPrecision
 
 
 class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
@@ -55,9 +56,7 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         x=x,
         weights=weights,
         activation=activation,
-        precision=precision_lib.to_dot_algorithm_preset(
-            x.dtype, weights.dtype, precision
-        ),
+        precision=precision_lib.canonicalize_precision(precision),
         return_residuals=return_residuals,
     )
 
@@ -68,7 +67,7 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       weights: Float[Array, 'K 2 N'],
       *,
       activation: Callable[[jax.Array], jax.Array] | None,
-      precision: jax.lax.DotAlgorithmPreset,
+      precision: CanonicalPrecision,
       return_residuals: bool,
       config: _Config,
   ) -> tuple[Float[Array, '*B M N'], Residuals | None]:
@@ -80,8 +79,7 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       x: the input array.
       weights: the combined weights array.
       activation: optional activation function.
-      precision: a `jax.lax.DotAlgorithmPreset` that specifies the matrix
-        multiplication precision.
+      precision: the matrix multiplication precision.
       return_residuals: if True, returns the residuals in addition to the
         output.
       config: the configuration of the op.
@@ -148,7 +146,7 @@ class GatedLinearUnitVjp(
       weights: Float[Array, 'K 2 N'],
       *,
       activation: Callable[[jax.Array], jax.Array] | None,
-      precision: jax.lax.DotAlgorithmPreset,
+      precision: CanonicalPrecision,
       return_residuals: bool,
       config: _Config,
   ) -> tuple[tuple[Float[Array, '*B M K'], Float[Array, 'K 2 N']], None]:

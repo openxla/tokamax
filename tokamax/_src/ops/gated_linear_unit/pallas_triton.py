@@ -111,7 +111,7 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
       weights: Float[Array, 'K 2 N'],
       *,
       activation: Callable[[jax.Array], jax.Array] | None,
-      precision: jax.lax.DotAlgorithmPreset,
+      precision: base.CanonicalPrecision,
       return_residuals: bool,
       config: Config,
   ) -> tuple[Float[Array, '*B M N'], Residuals | None]:
