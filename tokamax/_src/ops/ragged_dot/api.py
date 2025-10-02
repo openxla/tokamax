@@ -25,23 +25,30 @@ from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
-from tokamax._src.ops.ragged_dot import pallas_triton
 
 GroupSizes = base.GroupSizes
 QuantizedArray = quantization.QuantizedArray
 Implementation: TypeAlias = Literal["mosaic", "triton", "xla"]
 
 
-IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(
-        mosaic_gpu=pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(),
-        mosaic_tpu=pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(),
-        triton=pallas_triton.PallasTritonRaggedDot(),
-        xla=base.RaggedDot(),
-    )
+IMPLEMENTATIONS = dict(
+    mosaic_gpu=pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(),
+    mosaic_tpu=pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(),
+    xla=base.RaggedDot(),
 )
 
-_DEFAULT_IMPLEMENTATION = ("mosaic", "triton", "xla")
+try:
+  from tokamax._src.ops.ragged_dot import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["triton"] = pallas_triton.PallasTritonRaggedDot()
+  _DEFAULT_IMPLEMENTATION = ("mosaic", "triton", "xla")
+except ImportError:
+  _DEFAULT_IMPLEMENTATION = ("mosaic", "xla")
+
+
+IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
+    immutabledict.immutabledict(IMPLEMENTATIONS)
+)
 
 
 def ragged_dot(

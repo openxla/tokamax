@@ -100,8 +100,8 @@ class RaggedDotTest(parameterized.TestCase):
       opspecs = hlo_utils.get_opspecs(
           f.lower(lhs, rhs), include_xla_kernels=False
       )
-      mosaic_impl = api.IMPLEMENTATIONS["mosaic_gpu"].__class__
-      triton_impl = api.IMPLEMENTATIONS["triton"].__class__
+      mosaic_impl = type(api.IMPLEMENTATIONS.get("mosaic_gpu"))
+      triton_impl = type(api.IMPLEMENTATIONS.get("triton"))
       match implementation:
         case "triton":
           self.assertIsInstance(opspecs[0].op, triton_impl)
