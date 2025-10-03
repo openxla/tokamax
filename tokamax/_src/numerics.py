@@ -167,15 +167,19 @@ def _int_initializer(key, shape, dtype, minval=None, maxval=None):
 
 
 def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
-  """Randomly-initialize `ShapeDtypeStruct` objects.
+  """Randomly initialize all abstract arrays in a PyTree.
+
+  Abstract arrays can be represented as `ShapeDtypeStruct` or
+  `BatchedShapeDtype` objects. All `ArrayInitializer` callables will be replaced
+  by the output of the call.
 
   Arguments:
     x: a PyTree.
     seed: the random seed to initialize the arrays.
 
   Returns:
-    A new PyTree with each `ShapeDtypeStruct` object replaced by a randomly
-    initialized jax.Array.
+    A new PyTree with each abstract array replaced by a randomly initialized
+    `jax.Array`.
   """
 
   key = jax.random.PRNGKey(seed)

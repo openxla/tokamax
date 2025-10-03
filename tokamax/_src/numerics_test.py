@@ -19,6 +19,7 @@ import jax
 from jax.experimental import layout
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src import batching
 from tokamax._src import numerics
 
 if jax.__version_info__ >= (0, 6, 3):
@@ -34,7 +35,7 @@ class NumericsTest(parameterized.TestCase):
   def test_initializer_consistency(self):
     kwargs = {
         'u': 'test',
-        'x': jax.ShapeDtypeStruct((3, 4), jnp.float32),
+        'x': batching.BatchedShapeDtype((3, 4), jnp.float32, vmap_axes=(0,)),
         'y': 3.4,
         'z': jax.ShapeDtypeStruct((4,), jnp.bool_),
     }
@@ -132,6 +133,21 @@ class NumericsTest(parameterized.TestCase):
     x = numerics.random_initialize(x)
     self.assertEqual(jnp.min(x), 3)
     self.assertEqual(jnp.max(x), 6)
+
+  def test_seed(self):
+    shape = (16, 16)
+    a = batching.BatchedShapeDtype(shape, jnp.int4, vmap_axes=(0,))
+    b = jax.ShapeDtypeStruct(shape, jnp.int4)
+
+    a_random = numerics.random_initialize(a)
+    b_random = numerics.random_initialize(b)
+    chex.assert_trees_all_equal(a_random, b_random)
+
+    a_random_2 = numerics.random_initialize(a, seed=8)
+    b_random_2 = numerics.random_initialize(b, seed=8)
+    chex.assert_trees_all_equal(a_random_2, b_random_2)
+
+    self.assertFalse(jnp.array_equal(a_random, a_random_2))
 
 
 if __name__ == '__main__':
