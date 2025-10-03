@@ -67,11 +67,7 @@ class NumericsTest(parameterized.TestCase):
     self.assertEqual(summary.has_nan, True)
     self.assertLess(abs(summary.max - 3.4), 0.0001)
 
-  # TODO: Make this test work for TPU. This test is broken on TPU.
   def test_random_initialize_consistency(self):
-    if jax.default_backend() == 'tpu':
-      self.skipTest('Test broken on TPU')
-
     # To allow numerics comparisons over time, the random initializer should
     # always produce the same results.
 
@@ -96,22 +92,19 @@ class NumericsTest(parameterized.TestCase):
         lambda x: np.sum(np.array(x).astype(np.float64)), kwargs
     )
 
-    # jax.random.randint algorithm changed in JAX v0.7.2
-    safer_randint = getattr(jax.config, 'jax_safer_randint', False)
-
     kwargs_expected = {
-        'bfloat16': np.float64(10.931640625),
-        'bool': np.float64(28.0),
-        'float16': np.float64(3.2483978271484375),
-        'float32': np.float64(-5.48963075876236),
-        'int32': np.float64(415.0),
-        'int4': np.float64(-67.0) if safer_randint else np.float64(7.0),
-        'int64': np.float64(-419.0),
-        'int8': np.float64(936.0) if safer_randint else np.float64(987.0),
-        'uint32': np.float64(3460.0),
-        'uint4': np.float64(351.0) if safer_randint else np.float64(371.0),
-        'uint64': np.float64(3657.0),
-        'uint8': np.float64(3280.0) if safer_randint else np.float64(3021.0),
+        'bfloat16': np.float64(-2.4604949951171875),
+        'bool': np.float64(23.0),
+        'float16': np.float64(-1.642547607421875),
+        'float32': np.float64(8.68816682882607),
+        'int32': np.float64(50.0),
+        'int4': np.float64(-22.0),
+        'int64': np.float64(966.0),
+        'int8': np.float64(204.0),
+        'uint32': np.float64(3145.0),
+        'uint4': np.float64(380.0),
+        'uint64': np.float64(3317.0),
+        'uint8': np.float64(3216.0),
     }
 
     chex.assert_trees_all_close(kwargs, kwargs_expected)
