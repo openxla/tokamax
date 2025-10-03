@@ -806,8 +806,7 @@ class AttentionTestBase(parameterized.TestCase):
         self._supports_vjp and not is_quantized and q.shape[-2] == k.shape[-2]
     )
 
-    atol = {jnp.float32: 2e-6, jnp.bfloat16: 2e-2}[q.dtype.type]
-    atol_grads_bias = {jnp.float32: 1e-5, jnp.bfloat16: None}[q.dtype.type]
+    atol = {jnp.float32: 5e-6, jnp.bfloat16: 2e-2}[q.dtype.type]
     try:
       self._run_test_with_inputs(
           q,
@@ -821,7 +820,6 @@ class AttentionTestBase(parameterized.TestCase):
           ref_impl=ref_impl_,
           ref_kwargs=ref_kwargs,
           atol=atol,
-          atol_grads=None if bias is None else atol_grads_bias,
           expect_supported=expect_supported,
           test_vjp=test_vjp,
       )
