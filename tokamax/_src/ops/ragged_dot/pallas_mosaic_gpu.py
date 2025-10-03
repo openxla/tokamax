@@ -42,6 +42,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
 
   The kernel is optimized for physical layout `mk,enk->mn`.
   """
+
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
 
