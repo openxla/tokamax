@@ -23,27 +23,38 @@ from jax.extend import backend
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
-from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 
 GroupSizes = base.GroupSizes
 QuantizedArray = quantization.QuantizedArray
 Implementation: TypeAlias = Literal["mosaic", "triton", "xla"]
 
-
-IMPLEMENTATIONS = dict(
-    mosaic_gpu=pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(),
-    mosaic_tpu=pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(),
-    xla=base.RaggedDot(),
-)
+IMPLEMENTATIONS = dict(xla=base.RaggedDot())
+_DEFAULT_IMPLEMENTATION = ("xla",)
 
 try:
   from tokamax._src.ops.ragged_dot import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
   IMPLEMENTATIONS["triton"] = pallas_triton.PallasTritonRaggedDot()
-  _DEFAULT_IMPLEMENTATION = ("mosaic", "triton", "xla")
+  _DEFAULT_IMPLEMENTATION = ("triton",) + _DEFAULT_IMPLEMENTATION
 except ImportError:
-  _DEFAULT_IMPLEMENTATION = ("mosaic", "xla")
+  pass
+
+try:
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["mosaic_gpu"] = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
+  _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+  if "mosaic" not in _DEFAULT_IMPLEMENTATION:
+    _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
 
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
