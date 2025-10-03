@@ -20,90 +20,101 @@ from typing import Final
 import jax
 import jax.numpy as jnp
 
-SUPPORTED_PRECISIONS: Final[tuple[jax.lax.DotAlgorithmPreset, ...]] = (
-    jax.lax.DotAlgorithmPreset.F16_F16_F32,
-    jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
-    jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
-    jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
-    jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X9,
-    jax.lax.DotAlgorithmPreset.F32_F32_F32,
-    jax.lax.DotAlgorithmPreset.TF32_TF32_F32,
-    jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3,
+
+DotAlgorithm = jax.lax.DotAlgorithm
+DotAlgorithmPreset = jax.lax.DotAlgorithmPreset
+Precision = jax.lax.Precision
+PrecisionLike = jax.lax.PrecisionLike
+DTypeLike = jax.typing.DTypeLike
+
+
+SUPPORTED_PRECISIONS: Final[tuple[DotAlgorithmPreset, ...]] = (
+    DotAlgorithmPreset.F16_F16_F32,
+    DotAlgorithmPreset.BF16_BF16_F32,
+    DotAlgorithmPreset.BF16_BF16_F32_X3,
+    DotAlgorithmPreset.BF16_BF16_F32_X6,
+    DotAlgorithmPreset.BF16_BF16_F32_X9,
+    DotAlgorithmPreset.F32_F32_F32,
+    DotAlgorithmPreset.TF32_TF32_F32,
+    DotAlgorithmPreset.TF32_TF32_F32_X3,
 )
 
-_F32_DOT_PRECISION_MAP: Final[dict[str, dict[jax.lax.Precision, str]]] = dict(
+_F32_DOT_PRECISION_MAP: Final[dict[str, dict[Precision, str]]] = dict(
     tpu={
-        jax.lax.Precision.DEFAULT: "BF16_BF16_F32",
-        jax.lax.Precision.HIGH: "BF16_BF16_F32_X3",
-        jax.lax.Precision.HIGHEST: "BF16_BF16_F32_X6",
+        Precision.DEFAULT: "BF16_BF16_F32",
+        Precision.HIGH: "BF16_BF16_F32_X3",
+        Precision.HIGHEST: "BF16_BF16_F32_X6",
     },
     gpu_old={
-        jax.lax.Precision.DEFAULT: "F32_F32_F32",
-        jax.lax.Precision.HIGH: "F32_F32_F32",
-        jax.lax.Precision.HIGHEST: "F32_F32_F32",
+        Precision.DEFAULT: "F32_F32_F32",
+        Precision.HIGH: "F32_F32_F32",
+        Precision.HIGHEST: "F32_F32_F32",
     },
     gpu={
-        jax.lax.Precision.DEFAULT: "TF32_TF32_F32",
-        jax.lax.Precision.HIGH: "TF32_TF32_F32",
-        jax.lax.Precision.HIGHEST: "F32_F32_F32",
+        Precision.DEFAULT: "TF32_TF32_F32",
+        Precision.HIGH: "TF32_TF32_F32",
+        Precision.HIGHEST: "F32_F32_F32",
     },
     cpu={
-        jax.lax.Precision.DEFAULT: "F32_F32_F32",
-        jax.lax.Precision.HIGH: "F32_F32_F32",
-        jax.lax.Precision.HIGHEST: "F32_F32_F32",
+        Precision.DEFAULT: "F32_F32_F32",
+        Precision.HIGH: "F32_F32_F32",
+        Precision.HIGHEST: "F32_F32_F32",
     },
 )
 
 
-def _canonicalize_precision(
-    precision: jax.lax.PrecisionLike,
-) -> jax.lax.DotAlgorithmPreset | jax.lax.Precision:
-  """Converts a `str` to a `DotAlgorithmPreset` or `Precision`."""
+CanonicalPrecision = (
+    tuple[Precision, Precision] | DotAlgorithm | DotAlgorithmPreset
+)
+
+
+def canonicalize_precision(precision: PrecisionLike) -> CanonicalPrecision:
+  """Canonicalizes a `PrecisionLike`."""
 
   if precision is None:
-    precision = jax.config.jax_default_matmul_precision
-    precision = precision or jax.lax.Precision.DEFAULT
-
-  if isinstance(precision, tuple):
-    if len(precision) != 2:
-      raise ValueError(f"Expected 2 elements in tuple, got {len(precision)}.")
-    if precision[0] != precision[1]:
-      raise NotImplementedError("Only identical precision pairs are supported.")
-    precision = precision[0]
-
-  if isinstance(precision, jax.lax.DotAlgorithm):
-    raise NotImplementedError("`DotAlgorithm` is not yet supported.")
-
-  if isinstance(precision, (jax.lax.DotAlgorithmPreset, jax.lax.Precision)):
-    return precision
-  elif isinstance(precision, str):
-    if precision in jax.lax.DotAlgorithmPreset.__members__:
-      return jax.lax.DotAlgorithmPreset[precision]
+    if (precision := jax.config.jax_default_matmul_precision) is None:
+      return Precision.DEFAULT, Precision.DEFAULT
+  if isinstance(precision, str):
+    if precision in DotAlgorithmPreset.__members__:
+      return DotAlgorithmPreset[precision]
     try:
       # jax.lax.Precision supports aliases like 'fastest' for
       # jax.lax.Precision.DEFAULT. Can only tell whether a string is a valid
       # alias by trying the constructor.
-      return jax.lax.Precision(precision)
+      return (Precision(precision),) * 2
     except ValueError:
       raise ValueError(  # pylint: disable=raise-missing-from
           f"Unsupported enum value: {precision}. Must be refer to either"
           " a `jax.lax.DotAlgorithmPreset` or a `jax.lax.Precision` enum."
       )
-  else:
-    raise ValueError(f"Invalid precision: {precision}")
+  if isinstance(precision, Precision):
+    return precision, precision
+  if isinstance(precision, (DotAlgorithm, DotAlgorithmPreset)):
+    return precision
+  if isinstance(precision, (list, tuple)) and len(precision) == 2:
+    p0, p1 = precision
+    if isinstance(p0, Precision) and isinstance(p1, Precision):
+      return precision
+    if isinstance(p0, str) and isinstance(p1, str):
+      return Precision(p0), Precision(p1)
+  raise ValueError(f"Invalid precision: {precision}")
 
 
 def to_dot_algorithm_preset(
-    a_dtype: jax.typing.DTypeLike,
-    b_dtype: jax.typing.DTypeLike,
-    precision: jax.lax.PrecisionLike,
-) -> jax.lax.DotAlgorithmPreset:
+    a_dtype: DTypeLike, b_dtype: DTypeLike, precision: PrecisionLike
+) -> DotAlgorithmPreset:
   """Converts a `PrecisionLike` to a `DotAlgorithmPreset`."""
 
-  precision = _canonicalize_precision(precision)
+  precision = canonicalize_precision(precision)
 
-  if isinstance(precision, jax.lax.DotAlgorithmPreset):
+  if isinstance(precision, DotAlgorithmPreset):
     return precision
+  if isinstance(precision, DotAlgorithm):
+    raise NotImplementedError("`DotAlgorithm` is not supported.")
+  if precision[0] != precision[1]:
+    raise NotImplementedError("Mismatched `Precision`s not supported.")
+
+  precision = precision[0]
 
   if a_dtype != b_dtype:
     # TODO: Support this case.
@@ -126,31 +137,44 @@ def to_dot_algorithm_preset(
     case jnp.float16:
       if backend == "tpu":
         match precision:
-          case jax.lax.Precision.DEFAULT | None:
-            return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-          case jax.lax.Precision.HIGH:
-            return jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3
-          case jax.lax.Precision.HIGHEST:
-            return jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
+          case Precision.DEFAULT | None:
+            return DotAlgorithmPreset.BF16_BF16_F32
+          case Precision.HIGH:
+            return DotAlgorithmPreset.BF16_BF16_F32_X3
+          case Precision.HIGHEST:
+            return DotAlgorithmPreset.BF16_BF16_F32_X6
           case _:
             raise ValueError(f"Unexpected precision {precision}")
       else:
-        return jax.lax.DotAlgorithmPreset.F16_F16_F32
+        return DotAlgorithmPreset.F16_F16_F32
     case jnp.bfloat16:
       if backend == "gpu_old":
-        return jax.lax.DotAlgorithmPreset.F32_F32_F32
+        return DotAlgorithmPreset.F32_F32_F32
       else:
-        return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+        return DotAlgorithmPreset.BF16_BF16_F32
     case jnp.float32:
       new_precision = _F32_DOT_PRECISION_MAP[backend][precision]
-      return jax.lax.DotAlgorithmPreset[new_precision]
+      return DotAlgorithmPreset[new_precision]
     case jnp.float64:
-      return jax.lax.DotAlgorithmPreset.F64_F64_F64
+      return DotAlgorithmPreset.F64_F64_F64
     case _:
       raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-def precision_input_dtype(precision: jax.lax.DotAlgorithmPreset) -> jnp.dtype:
+def is_default(
+    a_dtype: DTypeLike, b_dtype: DTypeLike, precision: PrecisionLike
+) -> bool:
+  """Returns whether the given precision is equivalent to `DEFAULT`."""
+  if precision in (Precision.DEFAULT, DotAlgorithmPreset.DEFAULT):
+    return True
+  try:
+    default = to_dot_algorithm_preset(a_dtype, b_dtype, Precision.DEFAULT)
+    return to_dot_algorithm_preset(a_dtype, b_dtype, precision) == default
+  except (ValueError, NotImplementedError):
+    return False
+
+
+def precision_input_dtype(precision: DotAlgorithmPreset) -> jnp.dtype:
   """Returns the input dtype for the given precision."""
   dtypes = precision.supported_lhs_types
   if dtypes is None:

@@ -21,6 +21,7 @@ import jax
 from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import mosaic_gpu as mosaic_gpu_lib
+from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
@@ -58,11 +59,12 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
       *,
       group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
-      precision: jax.lax.DotAlgorithmPreset,
+      precision: base.CanonicalPrecision,
       preferred_element_type: jnp.dtype | None,
       return_residuals: bool,
       config: common.Config,
   ) -> tuple[jax.Array, None]:
+    del return_residuals  # Unused.
 
     if not mosaic_gpu_lib.has_mosaic_gpu_support():
       raise NotImplementedError("Mosaic not supported on this platform.")
@@ -71,6 +73,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
       raise NotImplementedError(
           "Only default `ragged_dot_dimension_numbers` supported."
       )
+
+    if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+      raise NotImplementedError(f"{precision=} not supported.")
 
     if isinstance(lhs, QuantizedArray):
       lhs = lhs.recompose()

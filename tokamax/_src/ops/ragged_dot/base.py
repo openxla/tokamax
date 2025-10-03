@@ -33,6 +33,7 @@ _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 Residuals = types.NoneType
 QuantizedArray = quantization.QuantizedArray
+CanonicalPrecision = precision_lib.CanonicalPrecision
 
 
 DEFAULT_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
@@ -149,9 +150,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         rhs,
         group_sizes=group_sizes,
         ragged_dot_dimension_numbers=ragged_dot_dimension_numbers,
-        precision=precision_lib.to_dot_algorithm_preset(
-            lhs.dtype, rhs.dtype, precision
-        ),
+        precision=precision_lib.canonicalize_precision(precision),
         preferred_element_type=preferred_element_type,
         return_residuals=return_residuals,
     )
@@ -163,7 +162,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       *,
       group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
-      precision: jax.lax.DotAlgorithmPreset,
+      precision: CanonicalPrecision,
       preferred_element_type: jnp.dtype | None,
       return_residuals: bool,
       config: _Config,
@@ -199,7 +198,7 @@ def vjp(
     *,
     group_sizes: jax.Array,
     ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
-    precision: jax.lax.DotAlgorithmPreset,
+    precision: CanonicalPrecision,
     preferred_element_type: jnp.dtype | None,
     dlhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),

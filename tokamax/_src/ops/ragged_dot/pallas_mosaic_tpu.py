@@ -22,6 +22,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 import pydantic
+from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
@@ -114,15 +115,16 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       rhs: jax.Array | QuantizedArray,
       *,
       group_sizes: jax.Array | base.GroupSizes,
-      ragged_dot_dimension_numbers: (
-          jax.lax.RaggedDotDimensionNumbers | None
-      ) = None,
-      precision: jax.lax.DotAlgorithmPreset | None = None,
-      preferred_element_type: jax.typing.DTypeLike | None = None,
+      ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers | None,
+      precision: base.CanonicalPrecision,
+      preferred_element_type: jax.typing.DTypeLike | None,
       return_residuals: bool = False,
       config: Config,
   ) -> tuple[jax.Array, None]:
-    del precision, return_residuals  # Unused.
+    del return_residuals  # Unused.
+
+    if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+      raise NotImplementedError(f"{precision=} not supported.")
 
     if isinstance(lhs, QuantizedArray):
       lhs = lhs.recompose()
