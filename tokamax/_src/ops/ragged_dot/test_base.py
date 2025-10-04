@@ -177,8 +177,9 @@ class RaggedDotTestBase(parameterized.TestCase):
       err, _ = fn(a, b, group_sizes=jnp.array(group_sizes, jnp.int32))
       err.throw()
 
-  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
-  def test_bench(self, spec):
+  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
+  def test_bench(self, arg_spec):
+    spec = arg_spec.args
     kwargs = numerics.random_initialize(spec)
     expected = ref(**kwargs)
     actual = self._dot_fn(**kwargs)

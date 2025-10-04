@@ -64,7 +64,7 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
     with mock.patch.object(self, "_dot_fn", split_k_dot):
       self.test_quantized0()  # pytype: disable=attribute-error
 
-  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
+  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
   def test_bench(self, _):
     # TODO: Fix tolerance and enable tests.
     self.skipTest(

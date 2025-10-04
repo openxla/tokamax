@@ -179,8 +179,9 @@ class NormalizationTestBase(parameterized.TestCase):
     atol = atols[x.dtype] * 25 * float(jnp.sqrt(math.prod(param_bcast_dims)))
     chex.assert_trees_all_close(doffset_actual, doffset_expected, atol=atol)
 
-  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
-  def test_bench(self, kwargs):
+  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
+  def test_bench(self, arg_spec):
+    kwargs = arg_spec.args
     ba = inspect.signature(base.Normalization.__call__).bind(None, **kwargs)
     ba.apply_defaults()
     ba.arguments.pop('return_residuals')

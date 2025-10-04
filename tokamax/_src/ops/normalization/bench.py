@@ -46,12 +46,16 @@ def _register_benchmarks():
       benchmarking.register_benchmark, iterations=10
   )
 
-  for name, kwargs in bench_arg_specs.ARG_SPECS.items():
+  for arg_spec in bench_arg_specs.ARG_SPECS:
+    name = arg_spec.name
+    kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD.value:
       impl = _IMPLS[impl_name]
       register_benchmark(name, impl_name, impl, kwargs)
 
-  for name, kwargs in bench_arg_specs.ARG_SPECS_FWD_BWD.items():
+  for arg_spec in bench_arg_specs.ARG_SPECS:
+    name = arg_spec.name
+    kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD_BWD.value:
       impl = _IMPLS[impl_name]
       register_benchmark(name, impl_name, impl, kwargs, mode='forward_and_vjp')

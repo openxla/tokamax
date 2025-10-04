@@ -194,7 +194,7 @@ class RaggedDotTritonTest(RaggedDotImplementationTest):
       self.skipTest("Only run on GPU.")
     super().setUp()
 
-  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
+  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
   def test_bench(self, _):
     # TODO: Fix tolerance and enable tests.
     self.skipTest(

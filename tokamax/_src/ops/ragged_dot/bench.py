@@ -93,7 +93,9 @@ def _transpose_rhs(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
 
 def _register_benchmarks():
   """Registers benchmarks."""
-  for name, spec in bench_arg_specs.ARG_SPECS.items():
+  for arg_spec in bench_arg_specs.ARG_SPECS:
+    name = arg_spec.name
+    spec = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS.value:
       if 'mosaic' in impl_name and (
           not mgpu_lib.has_mosaic_gpu_support()

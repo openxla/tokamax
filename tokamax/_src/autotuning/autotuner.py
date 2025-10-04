@@ -182,5 +182,5 @@ class Autotuner:
           results[config].median_evaluation_time_ms,
       )
     else:
-      logging.error("all configs failed")
+      logging.error("all configs failed for %s", fn_factory)
     return results

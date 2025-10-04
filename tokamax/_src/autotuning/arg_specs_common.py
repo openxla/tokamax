@@ -16,22 +16,36 @@
 """Common functionality for autotuning argument specs."""
 
 import dataclasses
-from typing import Final, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
-METADATA_KEY: Final[str] = '$__tokamax_metadata'
-
-
-NamedProjects: TypeAlias = Literal[
+ProjectName: TypeAlias = Literal[
     'alphafold'
+    'deepseek2',
+    'mixtral',
 ]
+
+# Tags are used to quickly identify different workloads for the same op.
+# forward_only models are models that only require forward passes - meaning no
+# vjp tuning is required.
+# mlcompass models are models that are tracked by mlcompass. These are all
+# internal models.
+# primary models are models that are considered the "primary" models for the
+# PA.
+Tag: TypeAlias = Literal['primary']
 
 
 @dataclasses.dataclass(frozen=True)
-class ArgMetadata:
-  """Metadata for an op argument.
+class ArgSpec:
+  """Argument specification for an op with metadata.
 
   Attributes:
-    project: The project the shapes came from.
+    args: The argument specification.
+    project: The project the argument specification comes from.
+    name: The name of the argument specification.
+    tags: Tags for the argument specification.
   """
 
-  project: NamedProjects
+  args: dict[str, Any]
+  project: ProjectName | None = None
+  name: str | None = None
+  tags: tuple[Tag, ...] = tuple()

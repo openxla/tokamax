@@ -13,7 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
-from typing import Any, Final
+from typing import Final
+from tokamax._src.autotuning import arg_specs_common as common
+from tokamax._src.ops.ragged_dot import bench_arg_specs
 
-
-ARGS: Final[tuple[dict[str, Any], ...]] = ()
+ARGS: Final[tuple[common.ArgSpec, ...]] = bench_arg_specs.ARG_SPECS

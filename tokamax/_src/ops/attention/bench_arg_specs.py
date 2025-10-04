@@ -14,24 +14,34 @@
 # ==============================================================================
 """Attention benchmark argument specifications."""
 
+from typing import Final
+
 import jax
 import jax.numpy as jnp
+from tokamax._src.autotuning import arg_specs_common as common
 
 
-TEST_SPECS_DICT = dict(
-    # TODO: Add more dtypes.
-    mixtral_8x7b_bf16=dict(
-        q=jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
-        k=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
-        v=jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
-        is_causal=True,
+ARG_SPECS: Final[tuple[common.ArgSpec, ...]] = (
+    common.ArgSpec(
+        args={
+            'q': jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
+            'k': jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
+            'v': jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
+            'is_causal': True,
+        },
+        project='mixtral',
+        name='mixtral_8x7b_bf16',
+        tags=('primary',),
     ),
-    deepseek2_16b_bf16=dict(
-        q=jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-        k=jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-        v=jax.ShapeDtypeStruct((512, 1024, 16, 128), jnp.bfloat16),
-        is_causal=True,
+    common.ArgSpec(
+        args={
+            'q': jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
+            'k': jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
+            'v': jax.ShapeDtypeStruct((512, 1024, 16, 128), jnp.bfloat16),
+            'is_causal': True,
+        },
+        project='deepseek2',
+        name='deepseek2_16b_bf16',
+        tags=('primary',),
     ),
 )
-
-ARG_SPECS = {k: lambda v=v: v.copy() for k, v in TEST_SPECS_DICT.items()}

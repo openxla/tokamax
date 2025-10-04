@@ -111,16 +111,19 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       impl = dataclasses.replace(self._attention_fn, use_stable_softmax=False)
       self._run_test((2, 1024, 4, 64), impl=impl)
 
-  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
-  def test_bench(self, spec):
-    suffix = [k for k, v in bench_arg_specs.ARG_SPECS.items() if v == spec][0]
-    if spec().get("bias") is None or spec()["q"].dtype == jnp.float32:
+  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
+  def test_bench(self, arg_spec):
+
+    if (
+        arg_spec.args.get("bias") is None
+        or arg_spec.args["q"].dtype == jnp.float32
+    ):
       atol_grads = None
     else:
       atol_grads = 0.15
     try:
       with test_base.override_test_args(atol=0.02, atol_grads=atol_grads):
-        getattr(super(), "test_bench_" + suffix)()
+        super().run_test(arg_spec.args)
     except ValueError as e:
       if "exceeds available shared memory" in str(e):
         self.skipTest(f"Test exceeds shared memory capacity: {e}")

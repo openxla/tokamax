@@ -728,10 +728,12 @@ class AttentionTestBase(parameterized.TestCase):
         expect_supported=self._supports_cross_attention,
     )
 
-  @parameterized.named_parameters(bench_arg_specs.ARG_SPECS.items())
-  def test_bench(self, spec):
+  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
+  def test_bench(self, arg_spec):
+    self.run_test(arg_spec.args)
+
+  def run_test(self, spec):
     self.skipTest("Too slow for OSS")
-    spec = spec()
 
     q, k, v, bias, mask = numerics.random_initialize((
         spec.pop("q"),

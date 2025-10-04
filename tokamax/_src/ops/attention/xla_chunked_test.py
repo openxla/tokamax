@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import xla_chunked
+from tokamax._src.ops.attention import bench_arg_specs
 
 
 class XlaChunkedAttentionTest(test_base.AttentionTestBase):

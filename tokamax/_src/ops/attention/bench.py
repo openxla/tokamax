@@ -58,11 +58,15 @@ _register_benchmark = functools.partial(
 
 def _register_benchmarks():
   """Registers benchmarks."""
-  for name, kwargs in bench_arg_specs.ARG_SPECS.items():
+  for arg_spec in bench_arg_specs.ARG_SPECS:
+    name = arg_spec.name
+    kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD.value:
       _register_benchmark(name, impl_name, kwargs)
 
-  for name, kwargs in bench_arg_specs.ARG_SPECS.items():
+  for arg_spec in bench_arg_specs.ARG_SPECS:
+    name = arg_spec.name
+    kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD_BWD.value:
       _register_benchmark(name, impl_name, kwargs, mode='forward_and_vjp')
 

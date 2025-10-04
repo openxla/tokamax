@@ -14,16 +14,18 @@
 # ==============================================================================
 """Normalization benchmark argument specifications."""
 
-from typing import Any
+from typing import Any, Final
 
 import jax
-
+from tokamax._src.autotuning import arg_specs_common as common
 
 ShapedArray = jax.ShapeDtypeStruct
 
 
 def _make_argspec(
     *,
+    name,
+    project,
     x_shape,
     dtype,
     axis=-1,
@@ -32,37 +34,68 @@ def _make_argspec(
     has_offset=None,
     param_dtype=None,
     **kwargs,
-) -> dict[str, Any]:
+) -> common.ArgSpec:
   """Make argspec from shapes and kwargs."""
   if has_offset is None:
     has_offset = subtract_mean
   if param_dtype is None:
     param_dtype = dtype
 
-  return dict(
-      x=ShapedArray(x_shape, dtype),
-      scale=ShapedArray((x_shape[axis],), param_dtype) if has_scale else None,
-      offset=ShapedArray((x_shape[axis],), param_dtype) if has_offset else None,
-      axis=axis,
-      subtract_mean=subtract_mean,
-      **kwargs,
+  return common.ArgSpec(
+      args={
+          'x': ShapedArray(x_shape, dtype),
+          'scale': (
+              ShapedArray((x_shape[axis],), param_dtype) if has_scale else None
+          ),
+          'offset': (
+              ShapedArray((x_shape[axis],), param_dtype) if has_offset else None
+          ),
+          'axis': axis,
+          'subtract_mean': subtract_mean,
+          **kwargs,
+      },
+      project=project,
+      name=name,
+      tags=('primary',),
   )
 
 
-ARG_SPECS = dict(
-    alphafold_384res_64chan=_make_argspec(
-        x_shape=(384, 384, 64), dtype='bfloat16', param_dtype='float32'
+ARG_SPECS: Final[tuple[common.ArgSpec, ...]] = (
+    _make_argspec(
+        name='alphafold_384res_64chan',
+        project='alphafold',
+        x_shape=(384, 384, 64),
+        dtype='bfloat16',
+        param_dtype='float32',
     ),
-    alphafold_384res_128chan=_make_argspec(
-        x_shape=(384, 384, 128), dtype='bfloat16', param_dtype='float32'
+    _make_argspec(
+        name='alphafold_384res_128chan',
+        project='alphafold',
+        x_shape=(384, 384, 128),
+        dtype='bfloat16',
+        param_dtype='float32',
     ),
-    alphafold_768res_128chan=_make_argspec(
-        x_shape=(768, 768, 128), dtype='bfloat16', param_dtype='float32'
+    _make_argspec(
+        name='alphafold_768res_128chan',
+        project='alphafold',
+        x_shape=(768, 768, 128),
+        dtype='bfloat16',
+        param_dtype='float32',
     ),
-    alphafold_384res_128chan_axis0=_make_argspec(
-        x_shape=(128, 384, 384), dtype='bfloat16', param_dtype='float32', axis=0
+    _make_argspec(
+        name='alphafold_384res_128chan_axis0',
+        project='alphafold',
+        x_shape=(128, 384, 384),
+        dtype='bfloat16',
+        param_dtype='float32',
+        axis=0,
     ),
-    alphafold_768res_128chan_axis0=_make_argspec(
-        x_shape=(128, 768, 768), dtype='bfloat16', param_dtype='float32', axis=0
+    _make_argspec(
+        name='alphafold_768res_128chan_axis0',
+        project='alphafold',
+        x_shape=(128, 768, 768),
+        dtype='bfloat16',
+        param_dtype='float32',
+        axis=0,
     ),
 )

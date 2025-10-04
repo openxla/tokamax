@@ -189,7 +189,10 @@ class BoundArgumentsTest(parameterized.TestCase):
   def test_roundtrip(self, op, arg_specs):
     object.__setattr__(op, "vjp", None)
     adapter = op_base.BOUND_ARGS_ADAPTER
-    for name, spec in arg_specs.ARG_SPECS.items():
+    arg_specs = arg_specs.ARG_SPECS
+    for arg_spec in arg_specs:
+      name = arg_spec.name
+      spec = arg_spec.args
       with self.subTest(name):
         ba = op.bind(**_eval_shape(spec))
         abstract_args = op_base._abstractify(dict(ba.arguments))

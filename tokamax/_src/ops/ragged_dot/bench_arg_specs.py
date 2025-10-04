@@ -16,8 +16,8 @@
 
 import jax
 import jax.numpy as jnp
+from tokamax._src.autotuning import arg_specs_common as common
 from tokamax._src.ops.ragged_dot import base
-
 
 SPEC_SHAPES = dict(
     compute_bound=(
@@ -35,7 +35,9 @@ SPEC_SHAPES = dict(
 )
 
 
-def _make_spec(num_groups, m, n, k, lhs_dtype, rhs_dtype, group_sizes=None):
+def _make_spec(
+    name, num_groups, m, n, k, lhs_dtype, rhs_dtype, group_sizes=None
+):
   lhs = jax.ShapeDtypeStruct((m, k), lhs_dtype)
   rhs = jax.ShapeDtypeStruct((num_groups, k, n), rhs_dtype)
   if group_sizes is None:
@@ -46,7 +48,12 @@ def _make_spec(num_groups, m, n, k, lhs_dtype, rhs_dtype, group_sizes=None):
       jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
       representative_value=tuple(group_sizes),
   )
-  return dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
+  return common.ArgSpec(
+      name=name,
+      args=dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes),
+      project='mixtral',
+      tags=('primary',),
+  )
 
 
-ARG_SPECS = {name: _make_spec(*args) for name, args in SPEC_SHAPES.items()}
+ARG_SPECS = tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())

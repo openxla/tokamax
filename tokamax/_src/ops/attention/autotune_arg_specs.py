@@ -21,55 +21,66 @@ from jax import ShapeDtypeStruct  # pylint: disable=g-importing-member
 from jax.lax import DotAlgorithmPreset  # pylint: disable=g-importing-member
 import jax.numpy as jnp
 from tokamax._src.autotuning import arg_specs_common as common
+from tokamax._src.ops.attention import bench_arg_specs
 from tokamax._src.ops.attention.base import Mask  # pylint: disable=g-importing-member
 
-METADATA_KEY = common.METADATA_KEY
-ArgMetadata = common.ArgMetadata
 
-ARGS: Final[tuple[dict[str, Any], ...]] = (
-    {
-        'q': ShapeDtypeStruct(shape=(384, 384, 4, 32), dtype=jnp.bfloat16),
-        'k': ShapeDtypeStruct(shape=(384, 384, 4, 32), dtype=jnp.bfloat16),
-        'v': ShapeDtypeStruct(shape=(384, 384, 4, 32), dtype=jnp.bfloat16),
-        'precision': (
-            DotAlgorithmPreset.BF16_BF16_F32,
-            DotAlgorithmPreset.BF16_BF16_F32,
-        ),
-        'logits_scale': 0.1767766952966369,
-        'bias': ShapeDtypeStruct(shape=(1, 4, 384, 384), dtype=jnp.bfloat16),
-        'mask': Mask(
-            bool_mask=ShapeDtypeStruct(shape=(384, 1, 1, 384), dtype=bool),
-        ),
-        METADATA_KEY: ArgMetadata(project='alphafold'),
-    },
-    {
-        'q': ShapeDtypeStruct(shape=(384, 384, 4, 64), dtype=jnp.bfloat16),
-        'k': ShapeDtypeStruct(shape=(384, 384, 4, 64), dtype=jnp.bfloat16),
-        'v': ShapeDtypeStruct(shape=(384, 384, 4, 64), dtype=jnp.bfloat16),
-        'precision': (
-            DotAlgorithmPreset.BF16_BF16_F32,
-            DotAlgorithmPreset.BF16_BF16_F32,
-        ),
-        'logits_scale': 0.1767766952966369,
-        'bias': ShapeDtypeStruct(shape=(1, 4, 384, 384), dtype=jnp.bfloat16),
-        'mask': Mask(
-            bool_mask=ShapeDtypeStruct(shape=(384, 1, 1, 384), dtype=bool),
-        ),
-        METADATA_KEY: ArgMetadata(project='alphafold'),
-    },
-    {
-        'q': ShapeDtypeStruct(shape=(768, 768, 4, 64), dtype=jnp.bfloat16),
-        'k': ShapeDtypeStruct(shape=(768, 768, 4, 64), dtype=jnp.bfloat16),
-        'v': ShapeDtypeStruct(shape=(768, 768, 4, 64), dtype=jnp.bfloat16),
-        'precision': (
-            DotAlgorithmPreset.BF16_BF16_F32,
-            DotAlgorithmPreset.BF16_BF16_F32,
-        ),
-        'logits_scale': 0.1767766952966369,
-        'bias': ShapeDtypeStruct(shape=(1, 4, 768, 768), dtype=jnp.bfloat16),
-        'mask': Mask(
-            bool_mask=ShapeDtypeStruct(shape=(768, 1, 1, 768), dtype=bool),
-        ),
-        METADATA_KEY: ArgMetadata(project='alphafold'),
-    },
-)
+ARGS: Final[tuple[common.ArgSpec, ...]] = (
+    common.ArgSpec(
+        args={
+            'q': ShapeDtypeStruct(shape=(384, 384, 4, 32), dtype=jnp.bfloat16),
+            'k': ShapeDtypeStruct(shape=(384, 384, 4, 32), dtype=jnp.bfloat16),
+            'v': ShapeDtypeStruct(shape=(384, 384, 4, 32), dtype=jnp.bfloat16),
+            'precision': (
+                DotAlgorithmPreset.BF16_BF16_F32,
+                DotAlgorithmPreset.BF16_BF16_F32,
+            ),
+            'logits_scale': 0.1767766952966369,
+            'bias': ShapeDtypeStruct(
+                shape=(1, 4, 384, 384), dtype=jnp.bfloat16
+            ),
+            'mask': Mask(
+                bool_mask=ShapeDtypeStruct(shape=(384, 1, 1, 384), dtype=bool),
+            ),
+        },
+        project='alphafold',
+    ),
+    common.ArgSpec(
+        args={
+            'q': ShapeDtypeStruct(shape=(384, 384, 4, 64), dtype=jnp.bfloat16),
+            'k': ShapeDtypeStruct(shape=(384, 384, 4, 64), dtype=jnp.bfloat16),
+            'v': ShapeDtypeStruct(shape=(384, 384, 4, 64), dtype=jnp.bfloat16),
+            'precision': (
+                DotAlgorithmPreset.BF16_BF16_F32,
+                DotAlgorithmPreset.BF16_BF16_F32,
+            ),
+            'logits_scale': 0.1767766952966369,
+            'bias': ShapeDtypeStruct(
+                shape=(1, 4, 384, 384), dtype=jnp.bfloat16
+            ),
+            'mask': Mask(
+                bool_mask=ShapeDtypeStruct(shape=(384, 1, 1, 384), dtype=bool),
+            ),
+        },
+        project='alphafold',
+    ),
+    common.ArgSpec(
+        args={
+            'q': ShapeDtypeStruct(shape=(768, 768, 4, 64), dtype=jnp.bfloat16),
+            'k': ShapeDtypeStruct(shape=(768, 768, 4, 64), dtype=jnp.bfloat16),
+            'v': ShapeDtypeStruct(shape=(768, 768, 4, 64), dtype=jnp.bfloat16),
+            'precision': (
+                DotAlgorithmPreset.BF16_BF16_F32,
+                DotAlgorithmPreset.BF16_BF16_F32,
+            ),
+            'logits_scale': 0.1767766952966369,
+            'bias': ShapeDtypeStruct(
+                shape=(1, 4, 768, 768), dtype=jnp.bfloat16
+            ),
+            'mask': Mask(
+                bool_mask=ShapeDtypeStruct(shape=(768, 1, 1, 768), dtype=bool),
+            ),
+        },
+        project='alphafold',
+    ),
+) + bench_arg_specs.ARG_SPECS
