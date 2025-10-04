@@ -17,3 +17,4 @@ tqdm
 triton>=3.0.0
 typeguard==2.13.3
 xprof
+hypothesis
