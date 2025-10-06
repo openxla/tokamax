@@ -32,6 +32,8 @@ class QuantizedArray:
 
   def recompose(self) -> jax.Array:
     """Returns the original array values."""
+    assert isinstance(self.values, jax.Array)
+    assert isinstance(self.scales, jax.Array)
     scales = self.scales
     for i, tile_dim in enumerate(self.tile_shape):
       if tile_dim != 1:
@@ -67,10 +69,13 @@ def quantize_as(
 ) -> Callable[[jax.Array], QuantizedArray]:
   """Returns a function that quantizes a JAX array as the given `dtype`."""
   # TODO: Support unsigned integers?
-  if not jnp.issubdtype(dtype, jnp.signedinteger):
-    raise ValueError("`dtype` must be a signed integer.")
+  if not (jnp.issubdtype(dtype, jnp.signedinteger)
+          or jnp.issubdtype(dtype, jnp.floating)):
+    raise ValueError("`dtype` must be a signed integer or a floating point"
+                     f" type, but got {dtype}")
 
-  iinfo = jnp.iinfo(dtype)
+  info_fn = jnp.iinfo if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo
+  info = info_fn(dtype)
 
   def quantize_tile(tile):
     if tile_preprocessor is not None:
@@ -78,9 +83,10 @@ def quantize_as(
 
     # Choose the smallest possible scale factor that allows that quantized
     # values to cover the full range.
-    scale = jnp.max(
-        jnp.maximum(tile / iinfo.max, tile / iinfo.min), keepdims=True
-    )
+    # finfo min/max can be in the queried dtype, so cast them to the tile dtype.
+    min_val = jnp.array(info.min, dtype=tile.dtype)
+    max_val = jnp.array(info.max, dtype=tile.dtype)
+    scale = jnp.max(jnp.maximum(tile / max_val, tile / min_val), keepdims=True)
     return (tile / scale).astype(dtype), scale
 
   def quantize_array(values, tile_shape=tile_shape):

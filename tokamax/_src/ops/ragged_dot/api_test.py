@@ -57,7 +57,12 @@ class RaggedDotTest(parameterized.TestCase):
       if jax.default_backend() == "cpu":
         self.skipTest("No Mosaic support on CPU.")
 
-    lhs, rhs, group_sizes = _get_input_data(num_experts=8, m=128, k=64, n=128)
+    if jax.default_backend() == "tpu":
+      lhs, rhs, group_sizes = _get_input_data(
+          num_experts=8, m=256, k=128, n=128  # TPU needs shapes >= 128
+      )
+    else:
+      lhs, rhs, group_sizes = _get_input_data(num_experts=8, m=128, k=64, n=128)
 
     ragged_dot_fn = (
         functools.partial(api.ragged_dot, preferred_element_type=jnp.bfloat16)

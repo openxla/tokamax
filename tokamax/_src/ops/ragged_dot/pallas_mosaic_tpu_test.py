@@ -18,9 +18,45 @@ from absl.testing import absltest
 import chex
 import jax
 import jax.numpy as jnp
+from tokamax._src import quantization
 from tokamax._src.ops import op as op_base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
+
+
+QuantizedArray = quantization.QuantizedArray
+
+
+def _is_scale_tiling_along_reduction(
+    x: QuantizedArray, axis: int, min_tiling: int
+) -> bool:
+  all_equal = all(
+      s1 == s2 for i, (s1, s2) in enumerate(zip(x.values.shape, x.scales.shape))
+      if i != (axis % x.ndim)
+  )
+  scale_tiling = x.values.shape[axis] // x.scales.shape[axis]
+  return all_equal and scale_tiling >= min_tiling
+
+
+def _is_config_supported(
+    lhs: jax.Array | QuantizedArray,
+    rhs: jax.Array | QuantizedArray,
+    config: pallas_mosaic_tpu.Config,
+) -> bool:
+  (m, k), (_, _, n) = lhs.shape, rhs.shape
+  if (m < config.gmm_tiling[0]
+      or k < config.gmm_tiling[1]
+      or n < config.gmm_tiling[2]):
+    return False
+  if (isinstance(lhs, QuantizedArray)
+      and not _is_scale_tiling_along_reduction(
+          lhs, 1, config.gmm_tiling[1])):
+    return False
+  if (isinstance(rhs, QuantizedArray)
+      and not _is_scale_tiling_along_reduction(
+          rhs, 1, config.gmm_tiling[1])):
+    return False
+  return True
 
 
 # TODO : Add QWIX tests for ragged dot once QWIX is in Ragged Dot.
@@ -32,9 +68,11 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
   def __init__(self, *args):
 
     def fn(lhs, rhs, *, config=None, **kwargs):
+      config = config or pallas_mosaic_tpu.Config()
       op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
 
-      if lhs.shape[0] % 128 == 0:
+      # skip unsupported tiling and quantization
+      if _is_config_supported(lhs, rhs, config):
         return op(lhs, rhs, **kwargs)
 
       with self.assertRaises(NotImplementedError) as e:
