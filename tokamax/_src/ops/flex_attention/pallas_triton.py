@@ -435,7 +435,6 @@ class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
-  supports_batched_args_capture: ClassVar[bool] = True
   use_base2: bool = False
   use_stable_softmax: bool = True
 
