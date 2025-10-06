@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import dataclasses
 import functools
 import json
 import math
+from typing import cast
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -256,83 +256,61 @@ class DumpHloLibTest(parameterized.TestCase):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
-    # TODO: Find a better place to put the kernel spec rather than
-    #  embedded in the name of the op.
+    norm_op = pl_norm.PallasTritonNormalization()
+    glu_op = pl_triton_glu.PallasTritonGatedLinearUnit()
 
     # Create a string of Tokamax ops in Jax, lower it to HLO, and extract the
     # kernel spec from the name of the kernel.
     (key1, key2, key3, key4) = jax.random.split(jax.random.PRNGKey(0), 4)
-    pt_normalization = functools.partial(
-        pl_norm.PallasTritonNormalization(), axis=(-1)
-    )
     x_shape = (64, 128)
     param_shape = (x_shape[-1],)
-    x = jax.random.normal(key=key1, shape=x_shape, dtype=jnp.bfloat16)
-    scale = jax.random.normal(key=key2, shape=param_shape, dtype=jnp.bfloat16)
-    offset = jax.random.normal(key=key3, shape=param_shape, dtype=jnp.bfloat16)
-    weights = jax.random.normal(
-        key=key4, shape=(128, 2, 128), dtype=jnp.bfloat16
-    )
+    x = jax.random.normal(key1, x_shape, jnp.bfloat16)
+    scale = jax.random.normal(key2, param_shape, jnp.bfloat16)
+    offset = jax.random.normal(key3, param_shape, jnp.bfloat16)
+    weights = jax.random.normal(key4, (128, 2, 128), jnp.bfloat16)
 
-    def norm_and_glu(x, scale, offset):
-      normalized_x = pt_normalization(x, scale, offset)
-      glu_x = pl_triton_glu.PallasTritonGatedLinearUnit()(
-          x=normalized_x, weights=weights, activation=jax.nn.swish
-      )
-      return jnp.sum(glu_x)
+    def norm_and_glu(x, scale, offset, weights):
+      x = norm_op(x, scale, offset)
+      return jnp.sum(glu_op(x, weights, activation=jax.nn.swish))
 
-    f_lowered = jax.jit(norm_and_glu).lower(x, scale, offset)
-
+    f_lowered = jax.jit(norm_and_glu).lower(x, scale, offset, weights)
     op_specs = hlo_utils.get_opspecs(f_lowered)
 
-    # Golden BatchedShapeDtype values.
-    bs_128_bf16 = batching.BatchedShapeDtype(
-        shape=param_shape, dtype=jnp.bfloat16, vmap_axes=()
+    norm_spec = norm_op.bind(  # pytype: disable=wrong-arg-types
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
     )
-    bs_128x2x128_bf16 = batching.BatchedShapeDtype(
-        shape=(128, 2, 128), dtype=jnp.bfloat16, vmap_axes=()
+    glu_spec = glu_op.bind(  # pytype: disable=wrong-arg-types
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),
+        activation=jax.nn.swish,
     )
-    bs_64x1_fp32 = batching.BatchedShapeDtype(
-        shape=(64, 1), dtype=jnp.float32, vmap_axes=()
-    )
-    bs_64x128_bf16 = batching.BatchedShapeDtype(
-        shape=(64, 128), dtype=jnp.bfloat16, vmap_axes=()
-    )
-    self.assertLen(op_specs, 2)
-    self.assertIsInstance(op_specs[0].op, pl_norm.PallasTritonNormalization)
-    self.assertEqual(op_specs[0].arguments['x'], bs_64x128_bf16)
-    self.assertEqual(op_specs[0].arguments['scale'], bs_128_bf16)
-    self.assertEqual(op_specs[0].arguments['offset'], bs_128_bf16)
-    self.assertEqual(op_specs[0].arguments['axis'], -1)
 
-    self.assertIsInstance(
-        op_specs[1].op, pl_triton_glu.PallasTritonGatedLinearUnit
-    )
-    self.assertEqual(op_specs[1].arguments['x'], bs_64x128_bf16)
-    self.assertEqual(op_specs[1].arguments['weights'], bs_128x2x128_bf16)
-    self.assertEqual(
-        op_specs[1].arguments['precision'],
-        jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
-    )
-    self.assertFalse(op_specs[1].arguments['return_residuals'])
+    self.assertEqual(op_specs[0].op.config, norm_spec.default_config)
+    self.assertEqual(op_specs[1].op.config, glu_spec.default_config)
+    object.__setattr__(op_specs[0].op, 'config', None)
+    object.__setattr__(op_specs[1].op, 'config', None)
+    self.assertEqual(op_specs, (norm_spec, glu_spec))
 
     # Test VJP ops.
-    def norm_vjp(x, scale, offset):
-      norm_x = pt_normalization(x, scale, offset)
-      return jnp.sum(norm_x)
-
+    norm_vjp = lambda x, scale, offset: jnp.sum(norm_op(x, scale, offset))
     norm_lowered = jax.jit(jax.value_and_grad(norm_vjp)).lower(x, scale, offset)
     op_specs = hlo_utils.get_opspecs(norm_lowered, include_xla_kernels=False)
-    self.assertLen(op_specs, 2)
-    self.assertIsInstance(op_specs[0].op, pl_norm.PallasTritonNormalization)
-    self.assertIsInstance(
-        op_specs[1].op, pl_norm_vjp.PallasTritonNormalizationVjp
+
+    norm_spec = norm_op.bind(  # pytype: disable=wrong-arg-types
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        return_residuals=True,
     )
-    self.assertEqual(
-        op_specs[1].arguments['residuals'], (bs_64x1_fp32, bs_64x1_fp32)
-    )
-    self.assertEqual(op_specs[1].arguments['out'], bs_64x128_bf16)
-    self.assertEqual(op_specs[1].arguments['dout'], bs_64x128_bf16)
+    norm_vjp_op = cast(pl_norm_vjp.PallasTritonNormalizationVjp, norm_op.vjp)
+    norm_vjp_spec = norm_vjp_op.bind(**norm_spec.vjp_arg_spec)
+    self.assertEqual(op_specs[0].op.config, norm_spec.default_config)
+    self.assertEqual(op_specs[1].op.config, norm_vjp_spec.default_config)
+    object.__setattr__(op_specs[0].op, 'config', None)
+    object.__setattr__(op_specs[1].op, 'config', None)
+    self.assertEqual(op_specs, (norm_spec, norm_vjp_spec))
 
     # Lastly, test a regular jax function. This should not return any op specs.
     def sin_cos(x):

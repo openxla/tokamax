@@ -77,7 +77,7 @@ class GatedLinearUnitTest(parameterized.TestCase):
     self.assertEqual(lhs.dtype, jnp.bfloat16)
     self.assertEqual(
         args[0].arguments["precision"],
-        jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+        (jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT),
     )
 
     with self.subTest("correct_implementation_used"):
