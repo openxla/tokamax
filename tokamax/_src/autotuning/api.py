@@ -231,7 +231,6 @@ def autotune(
     ),
     *args,
     ignore_cache: bool = False,
-    ignore_errors: bool = False,
     all_implementations: bool = True,
     progress_bar: bool = True,
 ) -> AutotuningResult:
@@ -243,7 +242,6 @@ def autotune(
       To autotune a callable with keyword arguments, pass the results of
       `tokamax.get_bound_args(f, *args, **kwargs)` to `autotune`.
     ignore_cache: Whether to ignore the autotuningcache and re-autotune.
-    ignore_errors: Whether to ignore errors when autotuning.
     all_implementations: Whether to autotune all implementations of the op.
     progress_bar: Whether to show a progress bar (default: `True`).
 
@@ -297,8 +295,6 @@ def autotune(
       data.append((bound_arg, bound_arg.autotune()))
     except Exception:  # pylint: disable=broad-exception-caught
       logging.exception("Failed to autotune for op %s", bound_arg.op)
-      if not ignore_errors:
-        raise
 
   return AutotuningResult(device_kind, tuple(data))
 
