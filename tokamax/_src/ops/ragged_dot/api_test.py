@@ -24,7 +24,6 @@ from tokamax._src import quantization
 from tokamax._src import triton
 from tokamax._src.ops.ragged_dot import api
 from tokamax._src.ops.ragged_dot import test_base
-from tokamax._src.ops.ragged_dot import bench_arg_specs
 
 # TODO: Add test for QWIX quantization.
 QuantizedArray = quantization.QuantizedArray
@@ -199,7 +198,7 @@ class RaggedDotTritonTest(RaggedDotImplementationTest):
       self.skipTest("Only run on GPU.")
     super().setUp()
 
-  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
+  @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
   def test_bench(self, _):
     # TODO: Fix tolerance and enable tests.
     self.skipTest(

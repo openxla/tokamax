@@ -27,6 +27,9 @@ from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import bench_arg_specs
 
 
+NAMED_ARG_SPECS = {s.full_name: s.args for s in bench_arg_specs.ARG_SPECS}
+
+
 # pylint: disable=missing-function-docstring
 class NormalizationTestBase(parameterized.TestCase):
   """Base class for normalization op tests."""
@@ -179,9 +182,8 @@ class NormalizationTestBase(parameterized.TestCase):
     atol = atols[x.dtype] * 25 * float(jnp.sqrt(math.prod(param_bcast_dims)))
     chex.assert_trees_all_close(doffset_actual, doffset_expected, atol=atol)
 
-  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
-  def test_bench(self, arg_spec):
-    kwargs = arg_spec.args
+  @parameterized.named_parameters(NAMED_ARG_SPECS.items())
+  def test_bench(self, kwargs):
     ba = inspect.signature(base.Normalization.__call__).bind(None, **kwargs)
     ba.apply_defaults()
     ba.arguments.pop('return_residuals')

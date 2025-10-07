@@ -30,7 +30,7 @@ ARG_SPECS: Final[tuple[common.ArgSpec, ...]] = (
             'is_causal': True,
         },
         project='mixtral',
-        name='mixtral_8x7b_bf16',
+        name='8x7b_bf16',
         tags=('primary',),
     ),
     common.ArgSpec(
@@ -41,7 +41,7 @@ ARG_SPECS: Final[tuple[common.ArgSpec, ...]] = (
             'is_causal': True,
         },
         project='deepseek2',
-        name='deepseek2_16b_bf16',
+        name='16b_bf16',
         tags=('primary',),
     ),
 )

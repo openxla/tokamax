@@ -180,10 +180,9 @@ class PydanticTest(parameterized.TestCase):
   def test_arg_specs_roundtrip(self, op_cls, arg_specs):
     spec = pydantic_lib.get_arg_spec_model("ArgSpec", op_cls().signature)
     adapter = pydantic.TypeAdapter(spec)
-    for arg in arg_specs.ARG_SPECS:
-      name = arg.name
-      spec = arg.args
-      with self.subTest(name):
+    for arg_spec in arg_specs.ARG_SPECS:
+      spec = arg_spec.args
+      with self.subTest(arg_spec.full_name):
         spec = op_base._abstractify(_eval_shape(spec))
         spec_roundtrip = adapter.validate_python(adapter.dump_python(spec))
         self.assertEqual(spec, spec_roundtrip)

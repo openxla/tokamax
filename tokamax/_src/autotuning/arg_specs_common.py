@@ -49,3 +49,8 @@ class ArgSpec:
   project: ProjectName | None = None
   name: str | None = None
   tags: tuple[Tag, ...] = tuple()
+
+  @property
+  def full_name(self) -> str:
+    """The full name (including project name)."""
+    return '_'.join(filter(None, (self.project, self.name)))

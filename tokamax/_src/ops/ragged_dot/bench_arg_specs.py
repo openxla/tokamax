@@ -19,8 +19,8 @@ import jax.numpy as jnp
 from tokamax._src.autotuning import arg_specs_common as common
 from tokamax._src.ops.ragged_dot import base
 
-SPEC_SHAPES = dict(
-    compute_bound=(
+SPEC_SHAPES = {
+    'compute_bound': (
         8,
         4096,
         4096,
@@ -29,14 +29,22 @@ SPEC_SHAPES = dict(
         jnp.bfloat16,
         [4096] + [0] * 7,
     ),
-    memory_bound=(8, 8, 4096, 4096, jnp.bfloat16, jnp.bfloat16),
+    'memory_bound': (8, 8, 4096, 4096, jnp.bfloat16, jnp.bfloat16),
     # FIXME: Use correct dtypes.
-    mixtral_8x7b=(8, 8192, 14336, 4096, jnp.bfloat16, jnp.bfloat16),
-)
+    '8x7b': (8, 8192, 14336, 4096, jnp.bfloat16, jnp.bfloat16, None, 'mixtral'),
+}
 
 
 def _make_spec(
-    name, num_groups, m, n, k, lhs_dtype, rhs_dtype, group_sizes=None
+    name,
+    num_groups,
+    m,
+    n,
+    k,
+    lhs_dtype,
+    rhs_dtype,
+    group_sizes=None,
+    project=None,
 ):
   lhs = jax.ShapeDtypeStruct((m, k), lhs_dtype)
   rhs = jax.ShapeDtypeStruct((num_groups, k, n), rhs_dtype)
@@ -51,7 +59,7 @@ def _make_spec(
   return common.ArgSpec(
       name=name,
       args=dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes),
-      project='mixtral',
+      project=project,
       tags=('primary',),
   )
 

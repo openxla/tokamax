@@ -20,7 +20,6 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.ragged_dot import pallas_triton
 from tokamax._src.ops.ragged_dot import test_base
-from tokamax._src.ops.ragged_dot import bench_arg_specs
 
 
 class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
@@ -64,7 +63,7 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
     with mock.patch.object(self, "_dot_fn", split_k_dot):
       self.test_quantized0()  # pytype: disable=attribute-error
 
-  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
+  @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
   def test_bench(self, _):
     # TODO: Fix tolerance and enable tests.
     self.skipTest(

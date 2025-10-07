@@ -47,14 +47,12 @@ def _register_benchmarks():
   )
 
   for arg_spec in bench_arg_specs.ARG_SPECS:
-    name = arg_spec.name
-    kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD.value:
       impl = _IMPLS[impl_name]
-      register_benchmark(name, impl_name, impl, kwargs)
+      register_benchmark(arg_spec.full_name, impl_name, impl, arg_spec.args)
 
   for arg_spec in bench_arg_specs.ARG_SPECS:
-    name = arg_spec.name
+    name = arg_spec.full_name
     kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD_BWD.value:
       impl = _IMPLS[impl_name]

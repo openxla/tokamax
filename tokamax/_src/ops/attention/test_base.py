@@ -206,6 +206,9 @@ def _ref_impl_tanh(
   return jnp.einsum("...hqk,...khd->...qhd", weights, v, precision=precision)
 
 
+NAMED_ARG_SPECS = {s.full_name: s.args for s in bench_arg_specs.ARG_SPECS}
+
+
 # pylint: disable=missing-function-docstring
 class AttentionTestBase(parameterized.TestCase):
   """Base class for attention tests."""
@@ -728,11 +731,8 @@ class AttentionTestBase(parameterized.TestCase):
         expect_supported=self._supports_cross_attention,
     )
 
-  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
-  def test_bench(self, arg_spec):
-    self.run_test(arg_spec.args)
-
-  def run_test(self, spec):
+  @parameterized.named_parameters(NAMED_ARG_SPECS.items())
+  def test_bench(self, spec):
     self.skipTest("Too slow for OSS")
 
     q, k, v, bias, mask = numerics.random_initialize((

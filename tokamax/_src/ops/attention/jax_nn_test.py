@@ -14,14 +14,12 @@
 # ==============================================================================
 
 import pytest
-from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import test_base
-from tokamax._src.ops.attention import bench_arg_specs
 
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
@@ -40,14 +38,12 @@ class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
 
   def _run_test_with_inputs(self, *args, **kwargs):
     impl_kwargs = kwargs.get("impl_kwargs", {})
-    logging.info("impl_kwargs: %s", impl_kwargs)
     # pytype: disable=attribute-error
     if (
         (impl_kwargs.get("logits_dtype") not in (None, jnp.float32))
         or not impl_kwargs.get("normalize_output", True)
         or impl_kwargs.get("return_residuals", False)
     ):
-      logging.info("Set to false %s", impl_kwargs)
       # pytype: enable=attribute-error
       kwargs["expect_supported"] = False
     super()._run_test_with_inputs(*args, **kwargs)
@@ -78,14 +74,13 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
     kwargs["impl"] = impl
     kwargs["atol"] = 0.025 if "bias" in kwargs else 0.015
     if args[0].shape[-1] > 128:
-      logging.info("Set to false %s args: %s", kwargs, args[0].shape)
       kwargs["expect_supported"] = False
     super()._run_test_with_inputs(*args, **kwargs)
 
   def test_padding_mask_with_nans(self):
     self.skipTest("Unsupported.")
 
-  def test_bench_veo3(self):
+  def test_bench_veo3_veo3(self):
     self.skipTest("Numerical issue in CuDNN for head_dim=256.")
 
   @parameterized.parameters(*test_base.base_names_and_params("test_vmap"))

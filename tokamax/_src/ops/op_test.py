@@ -191,9 +191,8 @@ class BoundArgumentsTest(parameterized.TestCase):
     adapter = op_base.BOUND_ARGS_ADAPTER
     arg_specs = arg_specs.ARG_SPECS
     for arg_spec in arg_specs:
-      name = arg_spec.name
       spec = arg_spec.args
-      with self.subTest(name):
+      with self.subTest(arg_spec.full_name):
         ba = op.bind(**_eval_shape(spec))
         abstract_args = op_base._abstractify(dict(ba.arguments))
         ba = op_base.BoundArguments(op, abstract_args)

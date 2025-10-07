@@ -50,6 +50,9 @@ def ref(lhs, rhs, group_sizes, preferred_element_type=None):
   )
 
 
+NAMED_ARG_SPECS = {s.full_name: s.args for s in bench_arg_specs.ARG_SPECS}
+
+
 # pylint: disable=missing-function-docstring
 class RaggedDotTestBase(parameterized.TestCase):
   """Base class for ragged dot op tests."""
@@ -177,9 +180,8 @@ class RaggedDotTestBase(parameterized.TestCase):
       err, _ = fn(a, b, group_sizes=jnp.array(group_sizes, jnp.int32))
       err.throw()
 
-  @parameterized.parameters(*bench_arg_specs.ARG_SPECS)
-  def test_bench(self, arg_spec):
-    spec = arg_spec.args
+  @parameterized.named_parameters(NAMED_ARG_SPECS.items())
+  def test_bench(self, spec):
     kwargs = numerics.random_initialize(spec)
     expected = ref(**kwargs)
     actual = self._dot_fn(**kwargs)
