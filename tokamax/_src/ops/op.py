@@ -20,8 +20,10 @@ import copy
 import dataclasses
 import functools
 import inspect
+import sys
 import threading
 from typing import Any, ClassVar, Concatenate, Final, Generic, Literal, ParamSpec, Self, TypeVar, cast, overload
+from unittest import mock
 
 from absl import logging
 import immutabledict
@@ -101,6 +103,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
   # Whether an op allows abstract inputs with `jax.export.symbolic_shape`
   # instances in array shapes.
   supports_symbolic_shapes: ClassVar[bool] = True
+  supports_batched_args_capture: ClassVar[bool] = True
 
   config: _Config | None = None
   _: dataclasses.KW_ONLY
@@ -148,7 +151,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     bind = cast(Callable[_P, Any], self.bind)  # Work around pytype bug.
     ba = bind(*args, **kwargs)
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
-    is_array = lambda x: isinstance(x, jax.Array)
+    is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
     arrays, other, merge = utils.split_merge(is_array, args_flat)
 
     @self._capture_batched_args
@@ -172,6 +175,26 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
 
       with jax.named_scope(f"tokamax:{json_data}"):
+        if return_res and self.vjp is None and batched_args is not None:
+
+          def fwd_flat(*arrays):
+            args, kwargs = args_tree.unflatten(merge(arrays, other))
+            kwargs["return_residuals"] = return_residuals
+            return self._fwd(*args, config=config, **kwargs)
+
+          try:
+            out, f_vjp, residuals = jax.vjp(fwd_flat, *arrays, has_aux=True)
+          except Exception as e:  # pylint: disable=broad-except
+            out, residuals = fwd_flat(*arrays)
+
+            def f_vjp(_, e=e):
+              raise NotImplementedError("vjp not implemented") from e
+
+            f_vjp = jax.tree_util.Partial(f_vjp)  # Make pytree compatible.
+
+          ret = (out, residuals) if return_residuals else out
+          return ret, f_vjp
+
         out, residuals = self._fwd(*args, config=config, **kwargs)
       ret = (out, residuals) if return_residuals else out
       return ret, (arrays, out, residuals)
@@ -179,37 +202,52 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     def f(*arrays):
       return fwd(*arrays, return_res=return_residuals)[0]
 
-    if self.vjp is not None:
+    # We must wrap the op in a `custom_vjp`, even if no `vjp` function is
+    # provided, as we use `custom_batching` to capture the batched arguments,
+    # and `custom_batching` doesn't support `jax.vjp`.
+    if self.vjp is None:
+      if not self.supports_batched_args_capture:
+        return f(*arrays)
 
-      def bwd(residuals, dout):
-        arrays, out, residuals = residuals
-        dout = dout[0] if return_residuals else dout
-        args, kwargs = args_tree.unflatten(merge(arrays, other))
-        kwargs.pop("return_residuals")
-        grads = self.vjp(residuals, out, dout, *args, **kwargs)  # pytype: disable=wrong-arg-count
-
-        if isinstance(grads, dict):
-          grads_ba = ba.signature.bind_partial(**grads)
-        else:
-          grads_ba = ba.signature.bind_partial(*grads)
-
-        # Check that grads is tree with same structure as args.
-        dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
-
-        for k, v in kwargs.items():
-          if (dv := grads_ba.kwargs.get(k)) is None:
-            # Set any missing grads to zeros.
-            zeros_like = lambda x: jnp.zeros_like(x) if is_array(x) else x
-            grads_ba.arguments[k] = jax.tree.map(zeros_like, v)
-          else:
-            # Check that grads is tree with same structure as kwarg value.
-            grads_ba.arguments[k] = jax.tree.map(lambda _, g: g, v, dv)
-
-        return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
-
+      bwd = lambda f_vjp, dout: f_vjp(dout[0] if return_residuals else dout)
       f = jax.custom_vjp(f)
       f.defvjp(fwd, bwd, optimize_remat=True)
+      # This is a hack to work around the pytree shape consistency checks
+      # performed by `custom_batching`. As we are returning a new function
+      # instance (the `vjp`), these checks fail, though the result is valid.
+      custom_batching = sys.modules[jax.custom_batching.custom_vmap.__module__]
+      empty = lambda *_: None
+      with mock.patch.object(custom_batching, "check_vmap_rule_trees", empty):
+        return f(*arrays)
 
+    def bwd(residuals, dout):  # pylint: disable=function-redefined
+      arrays, out, residuals = residuals
+      dout = dout[0] if return_residuals else dout
+      args, kwargs = args_tree.unflatten(merge(arrays, other))
+      kwargs.pop("return_residuals")
+      grads = self.vjp(residuals, out, dout, *args, **kwargs)  # pytype: disable=wrong-arg-count
+
+      if isinstance(grads, dict):
+        grads_ba = ba.signature.bind_partial(**grads)
+      else:
+        grads_ba = ba.signature.bind_partial(*grads)
+
+      # Check that grads is tree with same structure as args.
+      dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
+
+      for k, v in kwargs.items():
+        if (dv := grads_ba.kwargs.get(k)) is None:
+          # Set any missing grads to zeros.
+          zeros_like = lambda x: jnp.zeros_like(x) if is_array(x) else x
+          grads_ba.arguments[k] = jax.tree.map(zeros_like, v)
+        else:
+          # Check that grads is tree with same structure as kwarg value.
+          grads_ba.arguments[k] = jax.tree.map(lambda _, g: g, v, dv)
+
+      return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
+
+    f = jax.custom_vjp(f)
+    f.defvjp(fwd, bwd, optimize_remat=True)
     return f(*arrays)
 
   def bind(
@@ -264,17 +302,9 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     return set()
 
   def _capture_batched_args(self, fn: Callable[..., _T]) -> Callable[..., _T]:
-    try:
-      config = self._get_heuristics_config(None)  # pytype: disable=wrong-arg-types
-      if config is _NULL_CONFIG:
-        # `custom_vmap` doesn't currently support JVP / VJP. In order to reduce
-        # the chance of hitting issues, we avoid its use for ops without a
-        # config, as they do not use the `batched_args` anyway.
-        return lambda *args, **kwargs: fn(*args, batched_args=None, **kwargs)
-    except Exception:  # pylint: disable=broad-exception-caught
-      pass
-
-    return batching.capture_batched_args(fn)
+    if self.supports_batched_args_capture:
+      return batching.capture_batched_args(fn)
+    return lambda *args, **kwargs: fn(*args, batched_args=None, **kwargs)
 
   @property
   def signature(self) -> inspect.Signature:
@@ -324,11 +354,6 @@ class BoundArguments(Generic[_Config, _Key]):
     object.__setattr__(self, "op", op)
     immutable_args = immutabledict.immutabledict(arguments)
     object.__setattr__(self, "arguments", immutable_args)
-
-    args_flat = jax.tree.leaves(arguments)
-    has_batched = any(map(_is_batched, args_flat))
-    if has_batched and any(map(_is_non_batched_shaped, args_flat)):
-      raise ValueError("Cannot bind both batched and non-batched shapes")
 
   @property
   def signature(self) -> inspect.Signature:
@@ -550,25 +575,14 @@ def _abstractify(pytree):
   return jax.tree.map(abstractify_leaf, pytree)
 
 
-def _is_shaped(x):
-  return isinstance(x, (jax.Array, jax.ShapeDtypeStruct, jax.core.ShapedArray))
-
-
-def _is_batched(x):
-  return isinstance(x, batching.BatchedShapeDtype)
-
-
-def _is_non_batched_shaped(x):
-  return _is_shaped(x) and not _is_batched(x)
-
-
 def _as_batched(x):
-  if _is_non_batched_shaped(x):
-    return batching.BatchedShapeDtype(x.shape, x.dtype, ())
+  if hasattr(x, "shape") and hasattr(x, "dtype"):
+    if not isinstance(x, batching.BatchedShapeDtype):
+      return batching.BatchedShapeDtype(x.shape, x.dtype, ())
   return x
 
 
 def _as_unbatched(x):
-  if _is_batched(x):
+  if isinstance(x, batching.BatchedShapeDtype):
     return jax.ShapeDtypeStruct(x.inner_shape, x.dtype)
   return x
