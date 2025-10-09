@@ -21,8 +21,11 @@ from typing import Any, TypeAlias
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src import quantization
+
 
 PyTree: TypeAlias = Any
+QuantizedArray = quantization.QuantizedArray
 
 
 @dataclasses.dataclass(frozen=True)
@@ -187,6 +190,24 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
   def init_with_layout(x):
     if isinstance(x, ArrayInitializer):
       init = x
+    elif isinstance(x, QuantizedArray):
+      abstract_values = isinstance(x.values, jax.ShapeDtypeStruct)
+      abstract_scales = isinstance(x.scales, jax.ShapeDtypeStruct)
+
+      if abstract_values and abstract_scales:
+
+        def init(key):
+          val = jax.random.normal(key, shape=x.shape, dtype=x.dtype)
+          qdtype = x.values.dtype
+          return quantization.quantize_as(qdtype, tile_shape=x.tile_shape)(val)
+
+      elif not abstract_values and not abstract_scales:
+        return x
+      else:
+        raise ValueError(
+            '`QuantizedArray` values and scales must both be abstract or both'
+            ' concrete.'
+        )
     elif isinstance(x, jax.ShapeDtypeStruct):
       dtype = jnp.dtype(x.dtype)
 
@@ -208,5 +229,5 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     curr_key, key = jax.random.split(key)
     return init(curr_key)
 
-  is_leaf = lambda x: isinstance(x, ArrayInitializer)
+  is_leaf = lambda x: isinstance(x, (ArrayInitializer, QuantizedArray))
   return jax.tree.map(init_with_layout, x, is_leaf=is_leaf)
