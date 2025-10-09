@@ -100,9 +100,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       self.skipTest("Only supported on TPUs.")
     super().setUp()
 
-  def test_bench_memory_bound(self):
-    self.skipTest("GPU Only test.")
-
   def test_maxtext_config(self):
     # Test to ensure that we can get the correct config for a specific model.
     # For this test we are using jax.ShapeDtypeStruct instead of jax.Array
