@@ -34,6 +34,7 @@ _Key = TypeVar("_Key")
 Residuals = types.NoneType
 QuantizedArray = quantization.QuantizedArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
+_DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset
 
 
 DEFAULT_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
@@ -178,6 +179,16 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.array(group_sizes)
 
+    # NOTE: `preferred_element_type` changes the accumulation type when using
+    # `jax.lax.Precision`. It would be easier to always convert the precision to
+    # `DotAlgorithmPreset`, but `ragged_dot_general` doesn't yet support
+    # `DotAlgorithmPreset` (https://github.com/jax-ml/jax/issues/32207).
+    # TODO: Remove once the above is fixed.
+    out_dtype = preferred_element_type or jnp.result_type(lhs, rhs)
+    if not isinstance(precision, _DotAlgorithmLike):
+      is_integer = jnp.issubdtype(out_dtype, jnp.integer)
+      acc_dtype = jnp.int32 if is_integer else jnp.float32
+      preferred_element_type = jnp.promote_types(out_dtype, acc_dtype)
     out = jax.lax.ragged_dot_general(
         lhs,
         rhs,
@@ -185,7 +196,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         ragged_dot_dimension_numbers=ragged_dot_dimension_numbers,
         precision=precision,
         preferred_element_type=preferred_element_type,
-    )
+    ).astype(out_dtype)
     return out, None
 
 
