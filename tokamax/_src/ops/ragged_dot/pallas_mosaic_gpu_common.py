@@ -136,7 +136,7 @@ def store_acc_transposed(
     ni: jax.Array,
     m: int,
     group_info: GroupInfo,
-    o_smem_swizzled,
+    o_smem,
 ):
   """Stores the accumulator into the output gmem.
 
@@ -150,12 +150,13 @@ def store_acc_transposed(
     ni: The current n index.
     m: The total m dimension.
     group_info: The group info for the current block.
-    o_smem_swizzled: The swizzled shared memory array to use.
+    o_smem: The shared memory reference.
   """
   block_n, block_m = acc.shape
   out_elem_bits = jnp.finfo(o_gmem.dtype).bits
   swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
   out_swizzle_elems = (swizzle_out * 8) // out_elem_bits
+  o_smem_swizzled = plgpu.unswizzle_ref(o_smem, swizzle_out)
 
   if out_swizzle_elems != block_n:
     raise ValueError(

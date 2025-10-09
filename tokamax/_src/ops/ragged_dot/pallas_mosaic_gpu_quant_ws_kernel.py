@@ -46,7 +46,6 @@ def body(
   m = x_gmem.shape[0]
   x_elem_bits = jnp.dtype(x_gmem.dtype).itemsize * 8
   w_elem_bits = jnp.iinfo(w_gmem.dtype).bits
-  out_elem_bits = jnp.dtype(o_gmem.dtype).itemsize * 8
 
   # K is the contiguous dimension
   try:
@@ -54,7 +53,6 @@ def body(
   except ValueError as e:
     raise NotImplementedError("No possible swizzle.") from e
   swizzle_x = plgpu.find_swizzle(x_elem_bits * block_k, "rhs")
-  swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
 
   x_swizzle_elems = (swizzle_x * 8) // x_elem_bits
   w_swizzle_elems = (swizzle_w * 8) // w_elem_bits
@@ -86,10 +84,7 @@ def body(
           acc, o_gmem, 2 * ni + wg, m, group_info, o_smem.at[wg]
       )
 
-    transforms = (plgpu.SwizzleTransform(swizzle_out),)
-    o_smem_type = plgpu.SMEM(
-        (2, block_m, block_n), o_gmem.dtype, transforms=transforms
-    )
+    o_smem_type = plgpu.SMEM((2, block_m, block_n), o_gmem.dtype)
     pl.run_scoped(store_acc, o_smem_type, collective_axes=("wg",))
 
   try:

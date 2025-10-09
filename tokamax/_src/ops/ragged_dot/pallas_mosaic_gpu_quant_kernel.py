@@ -100,14 +100,10 @@ def ragged_dot_quantized_kernel_body(
     return acc_ref[...]
 
   acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
-  out_elem_bits = jnp.finfo(o_gmem.dtype).bits
-  swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
-  transforms = (plgpu.SwizzleTransform(swizzle_out),)
   store = functools.partial(
       common.store_acc_transposed, acc, o_gmem, ni, m, group_info
   )
-  smem = plgpu.SMEM((block_m, block_n), o_gmem.dtype, transforms=transforms)
-  pl.run_scoped(store, smem)
+  pl.run_scoped(store, plgpu.SMEM((block_m, block_n), o_gmem.dtype))
 
 
 def ragged_dot_quantized_kernel(
