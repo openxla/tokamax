@@ -115,12 +115,7 @@ def to_dot_algorithm_preset(
     raise NotImplementedError("Mismatched `Precision`s not supported.")
 
   precision = precision[0]
-
-  if a_dtype != b_dtype:
-    # TODO: Support this case.
-    raise ValueError("Cannot infer precision if operand types differ.")
-  dtype = jnp.dtype(a_dtype)
-
+  dtype = jnp.result_type(a_dtype, b_dtype)
   backend = jax.default_backend()
   if backend == "gpu":
     device = jax.devices()[0]
