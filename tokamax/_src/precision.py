@@ -14,6 +14,7 @@
 # ==============================================================================
 """Precision classes and utilities."""
 
+import functools
 import logging
 from typing import Final
 
@@ -175,3 +176,23 @@ def precision_input_dtype(precision: DotAlgorithmPreset) -> jnp.dtype:
   if dtypes is None:
     raise ValueError(f"Could not obtain input dtype for {precision=}.")
   return jnp.dtype(dtypes[0])
+
+
+def default_output_dtype_from_input_dtypes(*dtypes):
+  """Given several dtypes, returns the default output dtype."""
+  if len(dtypes) == 0:  # pylint: disable=g-explicit-length-test
+    return jnp.float32
+  try:
+    # Attempt to find the output through automatic binary dtype promotion rules.
+    return functools.reduce(jnp.promote_types, dtypes, jnp.bfloat16)
+  except:  # TypePromotionError # pylint: disable=bare-except
+    # If no automatic promotion rules are available, start with bfloat16 and
+    # pick the bitwidth-largest floating point dtype from inputs.
+    def promote_dtypes(a_dtype, b_dtype):
+      if (jnp.dtype(b_dtype).itemsize > jnp.dtype(a_dtype).itemsize
+          and jnp.issubdtype(b_dtype, jnp.floating)):
+        return jnp.dtype(b_dtype)
+      else:
+        return jnp.dtype(a_dtype)
+
+    return functools.reduce(promote_dtypes, dtypes, jnp.dtype(jnp.bfloat16))

@@ -62,12 +62,14 @@ class QuantizedArray:
 
 
 def quantize_as(
-    dtype: jnp.dtype,
+    dtype: jax.typing.DTypeLike,
     *,
     tile_shape: Sequence[int] | None = None,
     tile_preprocessor: Callable[[jax.Array], jax.Array] | None = None,
+    scale_dtype: jax.typing.DTypeLike | None = None,
 ) -> Callable[[jax.Array], QuantizedArray]:
   """Returns a function that quantizes a JAX array as the given `dtype`."""
+  dtype = jnp.dtype(dtype)
   # TODO: Support unsigned integers?
   if not (jnp.issubdtype(dtype, jnp.signedinteger)
           or jnp.issubdtype(dtype, jnp.floating)):
@@ -87,7 +89,10 @@ def quantize_as(
     min_val = jnp.array(info.min, dtype=tile.dtype)
     max_val = jnp.array(info.max, dtype=tile.dtype)
     scale = jnp.max(jnp.maximum(tile / max_val, tile / min_val), keepdims=True)
-    return (tile / scale).astype(dtype), scale
+    values = (tile / scale).astype(dtype)
+    if scale_dtype is not None:
+      scale = scale.astype(scale_dtype)
+    return values, scale
 
   def quantize_array(values, tile_shape=tile_shape):
     if tile_shape is None:

@@ -17,20 +17,18 @@
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
 import itertools
+import logging
 import types
 from typing import ClassVar
 import jax
 import jax.numpy as jnp
 import pydantic
-from tokamax._src import mosaic_tpu as common
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
 
-QuantizedArray = quantization.QuantizedArray
-quantize_as = quantization.quantize_as
 
 TilingTuple = tuple[
     pydantic.conint(ge=128, multiple_of=128),  # tile_m
@@ -109,15 +107,19 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   """
 
   config_cls: ClassVar[type[Config]] = Config
-  quantized_dot: bool = False
-  qdtype: str | None = None  # None means hardware default
+  qdtype: jax.typing.DTypeLike | None = None
   interpret: bool = False
 
   def __post_init__(self):
+    qdtype: str | None = (
+        self.qdtype if self.qdtype is None else jnp.dtype(self.qdtype).name
+    )
     if self.vjp is None:
       # Avoid infinite recursion.
       fn = lambda *args, **kw: PallasMosaicTpuRaggedDot(  # pylint: disable=unnecessary-lambda
-          config=self.config
+          config=self.config,
+          qdtype=qdtype,
+          interpret=self.interpret,
       )(*args, **kw)
       object.__setattr__(
           self, "vjp", partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)
@@ -138,40 +140,45 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     del return_residuals  # Unused.
 
     if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
-      raise NotImplementedError(f"{precision=} not supported.")
+      logging.warning("Requested precision `%s`, but mosaic TPU ragged dot does"
+                      " not currently support this precision. Proceeding with"
+                      " default precision.", str(precision))
 
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
 
-    if any(size < 128 for size in tuple(lhs.shape) + tuple(rhs.shape[-2:])):
+    if any(  # pallas mosaic TPU requires all non-expert dimensions to be >= 128
+        size < 128 for size in tuple(lhs.shape[-2:]) + tuple(rhs.shape[-2:])
+    ):
       raise NotImplementedError(
           f"RaggedDot inputs must be >= 128, but {lhs.shape=}, {rhs.shape=}"
       )
 
-    qdtype = self.qdtype
-    if qdtype is None:
-      qdtype = common.default_quant_dot_dtype()
-    quantize_fn = partial(quantize_as, jnp.dtype(qdtype))
+    def maybe_quantize(x, tile_shape):
+      if isinstance(x, QuantizedArray) or self.qdtype is None:
+        return x
+      return quantization.quantize_as(self.qdtype, tile_shape=tile_shape)(x)
 
     if isinstance(group_sizes, base.GroupSizes):
       group_sizes = jnp.array(group_sizes)
+
     if preferred_element_type is None:
-      preferred_element_type = jnp.promote_types(lhs.dtype, rhs.dtype)
+      preferred_element_type = (
+          precision_lib.default_output_dtype_from_input_dtypes(
+              lhs.dtype, rhs.dtype
+          )
+      )
 
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
       # STRATEGY 1: full-channel quantization along the reduction dimension
-      if self.quantized_dot and not isinstance(lhs, QuantizedArray):
-        lhs = quantize_fn(tile_shape=(1, lhs.shape[1]))(lhs)
-      if self.quantized_dot and not isinstance(rhs, QuantizedArray):
-        rhs = quantize_fn(tile_shape=(1, rhs.shape[1], 1))(rhs)
-
+      lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
+      rhs = maybe_quantize(rhs, (1, rhs.shape[1], 1))
       out = backend.gmm(
           lhs,
           rhs,
           group_sizes=group_sizes,
-          preferred_element_type=preferred_element_type,
+          out_dtype=preferred_element_type,
           tiling=config.gmm_tiling,
-          transpose_rhs=False,
           interpret=self.interpret,  # pytype: disable=attribute-error
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
@@ -183,34 +190,23 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           indices = _group_sizes_to_indices(group_sizes, m=lhs.shape[0])
           lhs *= jnp.take_along_axis(rhs.scales[:, 0, :], indices[:, None], 0)
           rhs = rhs.values
-          lhs = quantize_fn(tile_shape=(1, lhs.shape[1]))(lhs)
+          lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
         else:
-          rhs = rhs.recompose()
-          if self.quantized_dot and not isinstance(rhs, QuantizedArray):
-            rhs = quantize_fn(tile_shape=(1, 1, rhs.shape[2]))(rhs)
+          rhs = maybe_quantize(rhs.recompose(), (1, 1, rhs.shape[2]))
       else:
-        if self.quantized_dot and not isinstance(lhs, QuantizedArray):
-          lhs = quantize_fn(tile_shape=(1, lhs.shape[1]))(lhs)
-        if self.quantized_dot and not isinstance(rhs, QuantizedArray):
-          rhs = quantize_fn(tile_shape=(1, 1, rhs.shape[2]))(rhs)
+        lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
+        rhs = maybe_quantize(rhs, (1, 1, rhs.shape[2]))
       out = backend.gmm(
           lhs,
           rhs,
           group_sizes=group_sizes,
-          preferred_element_type=preferred_element_type,
+          out_dtype=preferred_element_type,
           tiling=config.gmm_rhs_transpose_tiling or config.gmm_tiling,
           transpose_rhs=True,
           interpret=self.interpret,  # pytype: disable=attribute-error
       )
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
-      if isinstance(lhs, jax.Array):
-        lhs_trans = lhs.mT
-      elif isinstance(lhs, QuantizedArray):
-        lhs_trans = dataclasses.replace(lhs, values=lhs.values.mT,
-                                        scales=lhs.scales.mT)
-      else:
-        raise ValueError(f"Unsupported lhs: {jax.tree.map(jax.typeof, lhs)}")
-
+      lhs_trans = jax.tree.map(lambda x: x.mT, lhs)
       # here, handle fast-path special cases that arise in backwards gmm
       if isinstance(lhs_trans, QuantizedArray) and isinstance(rhs, jax.Array):
         if lhs_trans.scales.shape[0] == 1:
@@ -221,20 +217,16 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           lhs_trans = lhs_trans.values
         else:
           lhs_trans = lhs_trans.recompose()
-          if self.quantized_dot and not isinstance(lhs_trans, QuantizedArray):
-            lhs_trans = quantize_fn(
-                tile_shape=(1, lhs_trans.shape[1]))(lhs_trans)
+          lhs_trans = maybe_quantize(lhs_trans, (1, lhs_trans.shape[1]))
       else:
-        if self.quantized_dot and not isinstance(lhs_trans, QuantizedArray):
-          lhs_trans = quantize_fn(tile_shape=(1, lhs_trans.shape[1]))(lhs_trans)
-        if self.quantized_dot and not isinstance(rhs, QuantizedArray):
-          rhs = quantize_fn(tile_shape=(rhs.shape[0], 1))(rhs)
+        lhs_trans = maybe_quantize(lhs_trans, (1, lhs_trans.shape[1]))
+        rhs = maybe_quantize(rhs, (rhs.shape[0], 1))
 
       out = backend.tgmm(
           lhs_trans,
           rhs,
           group_sizes=group_sizes,
-          preferred_element_type=preferred_element_type,
+          out_dtype=preferred_element_type,
           tiling=config.tgmm_tiling or config.gmm_tiling,
           interpret=self.interpret,  # pytype: disable=attribute-error
       )

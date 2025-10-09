@@ -35,14 +35,12 @@ QuantizedArray = quantization.QuantizedArray
 
 
 def _validate_args(
-    *,
     lhs: jax.Array | QuantizedArray,
     rhs: jax.Array | QuantizedArray,
     group_sizes: jax.Array,
+    *,
     expected_rhs_dims: int = 3,
-) -> tuple[jax.Array | QuantizedArray,
-           jax.Array | QuantizedArray,
-           jnp.dtype]:
+) -> jax.Array:
   """Validates the arguments for the gmm function."""
   # Validate 'lhs'.
   if lhs.ndim != 2:
@@ -62,8 +60,7 @@ def _validate_args(
     raise ValueError(
         f"Expected 32-bit integer 'group_sizes' but got {group_sizes.dtype}."
     )
-
-  return lhs, group_sizes, common.select_input_dtype(lhs, rhs)
+  return group_sizes
 
 
 def _calculate_num_tiles(x: int, tx: int) -> int:
@@ -80,21 +77,20 @@ def _calculate_irregular_num_tiles(x: int, tx: int) -> tuple[int, int]:
   return tiles, rem
 
 
-def _get_quant_dot_operands_and_dtype(
-    lhs: jax.Array | QuantizedArray,
-    rhs: jax.Array | QuantizedArray,
-) -> tuple[jax.Array, jax.Array, jnp.dtype]:
-  """Discover the accumulation type: e.g., fp8 -> fp32 and int8 -> int32."""
-  qdtype, lhs_, rhs_ = None, lhs, rhs
-  if isinstance(lhs, QuantizedArray):
-    lhs_, qdtype = lhs.values, lhs.values.dtype
-  if isinstance(rhs, QuantizedArray):
-    rhs_, qdtype = rhs.values, rhs.values.dtype
-  assert qdtype is not None
+def _dot_operands_and_accumulation_dtype(
+    lhs: jax.Array | QuantizedArray, rhs: jax.Array | QuantizedArray
+):
+  """Discover the accumulation type: e.g., fp8 -> fp32 and int8 -> int32.
 
+  Returns:
+    lhs: the left operand to the dot product.
+    rhs: the right operand to the dot product.
+    dtype: the accumulation dtype.
+  """
+  lhs_ = lhs.values if isinstance(lhs, QuantizedArray) else lhs
+  rhs_ = rhs.values if isinstance(rhs, QuantizedArray) else rhs
   if (jnp.issubdtype(lhs_.dtype, jnp.integer)
-      and jnp.issubdtype(rhs_.dtype, jnp.integer)
-      and qdtype.name.startswith("int")):
+      and jnp.issubdtype(rhs_.dtype, jnp.integer)):
     return lhs_, rhs_, jnp.int32
   else:
     return lhs_, rhs_, jnp.float32
@@ -327,14 +323,13 @@ def _zero_uninitialized_memory(
   return jnp.where(valid_mask[:, None], out, 0)
 
 
-
 LutFn = Callable[[int, int, int], Optional[tuple[int, int, int]]]
 
 
 @functools.partial(
     jax.jit,
     static_argnames=[
-        "preferred_element_type",
+        "out_dtype",
         "tiling",
         "transpose_rhs",
         "interpret",
@@ -344,7 +339,7 @@ def gmm(
     lhs: jax.Array | QuantizedArray,
     rhs: jax.Array | QuantizedArray,
     group_sizes: jax.Array,
-    preferred_element_type: jnp.dtype,
+    out_dtype: jnp.dtype,
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
     group_offset: jax.Array | None = None,
     transpose_rhs: bool = False,
@@ -356,7 +351,7 @@ def gmm(
     lhs: A 2d, jax.Array with shape [m, k].
     rhs: A 3d, jax.Array with shape [num_groups, k, n].
     group_sizes: A 1d, jax.Array with shape [num_groups] and jnp.int32 dtype.
-    preferred_element_type: jnp.dtype, the element type for the output matrix.
+    out_dtype: jnp.dtype, the element type for the output matrix.
     tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
     group_offset: The group in group sizes to start computing from. This is
       particularly useful for when rhs num_groups is sharded.
@@ -367,6 +362,8 @@ def gmm(
   Returns:
     A 2d, jax.Array with shape [m, n].
   """
+  group_sizes = _validate_args(lhs, rhs, group_sizes)
+
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
   else:
@@ -377,10 +374,6 @@ def gmm(
     group_offset = group_offset[None]
   num_current_groups = rhs.shape[0]
   num_total_groups = group_sizes.shape[0]
-
-  lhs, group_sizes, input_dtype = _validate_args(
-      lhs=lhs, rhs=rhs, group_sizes=group_sizes
-  )
 
   # Gather shape information.
   m, k, n = (lhs.shape[0], lhs.shape[1], rhs.shape[2])
@@ -413,9 +406,9 @@ def gmm(
   def kernel(
       group_metadata,
       group_offset,
-      lhs_ref: jax.Array | QuantizedArray,
-      rhs_ref: jax.Array | QuantizedArray,
-      out,
+      lhs_ref,
+      rhs_ref,
+      out_ref,
       acc_scratch,
   ):
     if transpose_rhs:
@@ -450,22 +443,6 @@ def gmm(
         return dataclasses.replace(x, values=jnp.where(mask, x.values, 0))
       return jnp.where(mask, x, 0)
 
-    def _scale_output(out, scale, axis):
-      repeats = out.shape[axis] // scale.shape[axis]
-      return out * pltpu.repeat(scale, repeats, axis)
-
-    def _store_accum():
-      mask = _get_store_mask(
-          grid_id=grid_id,
-          group_metadata=group_metadata,
-          tn=tn,
-          tm=tm,
-      )
-      to_store = acc_scratch[...]
-      out[...] = jax.lax.select(
-          mask[...], to_store, out[...].astype(jnp.float32)
-      ).astype(preferred_element_type)
-
     def _accum(is_last_k_tile):
       with jax.named_scope(f"accum-last_k_tile={is_last_k_tile}"):
         lhs = jax.tree.map(lambda x: x[...], lhs_ref)
@@ -473,29 +450,28 @@ def gmm(
         rhs = jax.tree.map(lambda x: x[...], rhs_ref)
         rhs = mask_k_rem(rhs, dim=rhs_dim) if is_last_k_tile else rhs
 
-        if isinstance(lhs, QuantizedArray) or isinstance(rhs, QuantizedArray):
-          # discover the accumulation type, fp8 -> fp32 and int8 -> int32
-          lhs_, rhs_, acc_qdtype = _get_quant_dot_operands_and_dtype(lhs, rhs)
-          out = dot_general(lhs_, rhs_, acc_qdtype)
+        def scale_out(out, scale, axis):
+          repeats = out.shape[axis] // scale.shape[axis]
+          return out * pltpu.repeat(scale, repeats, axis)
 
-          if isinstance(lhs, QuantizedArray):
-            out = _scale_output(out, lhs.scales, lhs_dim)
-          if isinstance(rhs, QuantizedArray):
-            rhs_scales = rhs.scales.T if transpose_rhs else rhs.scales
-            out = _scale_output(out, rhs_scales, 0)  # always 0
-        else:
-          out = dot_general(lhs, rhs, jnp.float32)
-
+        lhs_, rhs_, acc_qdtype = _dot_operands_and_accumulation_dtype(lhs, rhs)
+        out = dot_general(lhs_, rhs_, acc_qdtype)
+        if isinstance(lhs, QuantizedArray):
+          out = scale_out(out, lhs.scales, lhs_dim)
+        if isinstance(rhs, QuantizedArray):
+          rhs_scales = rhs.scales.T if transpose_rhs else rhs.scales
+          out = scale_out(out, rhs_scales, 0)  # always 0
         acc_scratch[...] += out.astype(acc_scratch.dtype)
 
         if is_last_k_tile:
-          _store_accum()
+          mask = _get_store_mask(
+              grid_id=grid_id, group_metadata=group_metadata, tn=tn, tm=tm
+          )
+          acc = acc_scratch[...]
+          acc = jax.lax.select(mask, acc, out_ref[...].astype(acc.dtype))
+          out_ref[...] = acc.astype(out_dtype)
 
-    lax.cond(
-        k_i == tiles_k - 1,
-        partial(_accum, True),
-        partial(_accum, False),
-    )
+    lax.cond(k_i == tiles_k - 1, partial(_accum, True), partial(_accum, False))
 
   def lhs_transform_indices(n_i, grid_id, k_i, group_metadata, group_offset):
     # lhs is (m, k). Load the [tm, tk] matrix for this m-tile.
@@ -546,7 +522,7 @@ def gmm(
   else:
     rhs_bytes = k * n * rhs.itemsize
 
-  out_bytes = (m * n) * jnp.dtype(preferred_element_type).itemsize
+  out_bytes = (m * n) * jnp.dtype(out_dtype).itemsize
   max_active_tiles = group_metadata[1].size
   bytes_accessed = (
       (lhs_bytes * tiles_n) + (rhs_bytes * max_active_tiles) + out_bytes
@@ -559,14 +535,14 @@ def gmm(
   if transpose_rhs:
     kernel_name += "_transpose_rhs"
   metadata = dict(
-      prefer_element_type=jnp.dtype(preferred_element_type).name,
+      prefer_element_type=jnp.dtype(out_dtype).name,
       tiling=dict(tile_m=tm, tile_k=tk, tile_n=tn),
       transpose_rhs=transpose_rhs,
   )
   pallas_call_fn = common.custom_buffered_pallas_call
   call_gmm = pallas_call_fn(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
+      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
           in_specs=[lhs_block_spec, rhs_block_spec],
@@ -599,7 +575,7 @@ def gmm(
 @functools.partial(
     jax.jit,
     static_argnames=[
-        "preferred_element_type",
+        "out_dtype",
         "tiling",
         "num_actual_groups",
         "interpret",
@@ -609,7 +585,7 @@ def tgmm(
     lhs: jax.Array | QuantizedArray,
     rhs: jax.Array | QuantizedArray,
     group_sizes: jax.Array,
-    preferred_element_type: jnp.dtype,
+    out_dtype: jnp.dtype,
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
     group_offset: jax.Array | None = None,
     num_actual_groups: int | None = None,
@@ -621,7 +597,7 @@ def tgmm(
     lhs: A 2d, jax.Array with shape [k, m].
     rhs: A 2d, jax.Array with shape [m, n].
     group_sizes: A 1d, jax.Array with shape [num_groups] and jnp.int32 dtype.
-    preferred_element_type: jnp.dtype, the element type for the output matrix.
+    out_dtype: jnp.dtype, the element type for the output matrix.
     tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
     group_offset: The group in group sizes to start computing from. This is
       particularly useful for when rhs num_groups is sharded.
@@ -633,13 +609,12 @@ def tgmm(
   Returns:
     A  3d, jax.Array with shape [num_groups, k, n].
   """
+  group_sizes = _validate_args(lhs, rhs, group_sizes, expected_rhs_dims=2)
+
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
   else:
     group_offset = group_offset[None]
-  lhs, group_sizes, input_dtype = _validate_args(
-      lhs=lhs, rhs=rhs, group_sizes=group_sizes, expected_rhs_dims=2
-  )
 
   # Gather shape information.
   k, m, n = (lhs.shape[0], lhs.shape[1], rhs.shape[1])
@@ -679,10 +654,6 @@ def tgmm(
       visit_empty_groups=True,
   )
 
-  def _scale_output(out, scale, axis):
-    repeats = out.shape[axis] // scale.shape[axis]
-    return out * pltpu.repeat(scale, repeats, axis)
-
   def mask_fn(mask, x):
     if isinstance(x, QuantizedArray):
       return dataclasses.replace(x, values=jnp.where(mask, x.values, 0))
@@ -719,10 +690,9 @@ def tgmm(
     @pl.when(dont_skip)
     def _do():
       opts = dict(grid_id=grid_id, group_metadata=group_metadata, tm=tm)
-      dot = lambda x, y, preferred_element_type=preferred_element_type: lax.dot(
+      dot = lambda x, y, preferred_element_type: lax.dot(
           x, y, preferred_element_type=preferred_element_type
       )
-
       lhs_mask = _get_store_mask(**opts, tn=tk)
       lhs = jax.tree.map(lambda x: x[...], lhs_ref)
       lhs = mask_fn(lhs_mask, lhs)
@@ -731,15 +701,16 @@ def tgmm(
       rhs = jax.tree.map(lambda x: x[...], rhs_ref)
       rhs = mask_fn(rhs_mask, rhs)
 
-      if isinstance(lhs, QuantizedArray) or isinstance(rhs, QuantizedArray):
-        lhs_, rhs_, acc_qdtype = _get_quant_dot_operands_and_dtype(lhs, rhs)
-        out = dot(lhs_.T, rhs_, acc_qdtype)
-        if isinstance(lhs, QuantizedArray):  # if lhs is not natively quant
-          out = _scale_output(out, lhs.scales.T, 1)
-        if isinstance(rhs, QuantizedArray):  # if rhs is not natively quant
-          out = _scale_output(out, rhs.scales, 0)
-      else:
-        out = dot(lhs.T, rhs, jnp.float32)
+      def scale_out(out, scale, axis):
+        repeats = out.shape[axis] // scale.shape[axis]
+        return out * pltpu.repeat(scale, repeats, axis)
+
+      lhs_, rhs_, acc_qdtype = _dot_operands_and_accumulation_dtype(lhs, rhs)
+      out = dot(lhs_.T, rhs_, acc_qdtype)
+      if isinstance(lhs, QuantizedArray):  # if lhs is not natively quant
+        out = scale_out(out, lhs.scales.T, 1)
+      if isinstance(rhs, QuantizedArray):  # if rhs is not natively quant
+        out = scale_out(out, rhs.scales, 0)
       acc_scratch[...] += out.astype(acc_scratch.dtype)
 
     is_end_of_grid = grid_id == (pl.num_programs(2) - 1)
@@ -750,7 +721,7 @@ def tgmm(
 
     @pl.when(group_is_changing)
     def _store_accum():
-      out_ref[...] = acc_scratch[...].astype(preferred_element_type)
+      out_ref[...] = acc_scratch[...].astype(out_dtype)
 
   def lhs_transform_indices(n_i, k_i, grid_id, group_metadata, group_offset):
     # lhs is (m, k). Load the [tm, tk] matrix for this m-tile.
@@ -796,7 +767,7 @@ def tgmm(
     )
   else:
     rhs_bytes = rhs.size * rhs.itemsize
-  out_bytewidth = jnp.dtype(preferred_element_type).itemsize
+  out_bytewidth = jnp.dtype(out_dtype).itemsize
   out_bytes = (num_actual_groups * k * n) * out_bytewidth
   bytes_accessed = (lhs_bytes * tiles_n) + (rhs_bytes * tiles_k) + out_bytes
   flops = 2 * m * k * n
@@ -808,14 +779,12 @@ def tgmm(
   pallas_call_fn = pl.pallas_call
   metadata = dict(
       tiling=dict(tile_m=tm, tile_k=tk, tile_n=tn),
-      prefer_element_type=jnp.dtype(preferred_element_type).name,
-      num_actual_groups=num_actual_groups
+      prefer_element_type=jnp.dtype(out_dtype).name,
+      num_actual_groups=num_actual_groups,
   )
   call_gmm = pallas_call_fn(
       kernel,
-      out_shape=jax.ShapeDtypeStruct(
-          (num_actual_groups, k, n), preferred_element_type
-      ),
+      out_shape=jax.ShapeDtypeStruct((num_actual_groups, k, n), out_dtype),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
           in_specs=[lhs_block_spec, rhs_block_spec],

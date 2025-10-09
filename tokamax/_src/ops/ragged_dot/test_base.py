@@ -41,6 +41,10 @@ def ref(lhs, rhs, group_sizes, preferred_element_type=None):
   else:
     precision = None
 
+  if lhs.dtype != rhs.dtype:
+    input_dtype = jnp.result_type(lhs.dtype, rhs.dtype)
+    lhs, rhs = lhs.astype(input_dtype), rhs.astype(input_dtype)
+
   return jax.lax.ragged_dot(
       lhs,
       rhs,
@@ -112,12 +116,16 @@ class RaggedDotTestBase(parameterized.TestCase):
     )
 
     if a_tile_shape is not None:
-      a_quant = quantization.quantize_as(dtype, tile_shape=a_tile_shape)(a)
+      a_quant = quantization.quantize_as(
+          dtype, tile_shape=a_tile_shape, scale_dtype=a.dtype
+      )(a)
       a = a_quant.recompose()
     else:
       a_quant = a
 
-    b_quant = quantization.quantize_as(dtype, tile_shape=b_tile_shape)(b)
+    b_quant = quantization.quantize_as(
+        dtype, tile_shape=b_tile_shape, scale_dtype=b.dtype
+    )(b)
     expected = ref(a, b_quant.recompose(), group_sizes)
     actual = self._dot_fn(a_quant, b_quant, group_sizes=group_sizes)
     count = sum(group_sizes)
