@@ -655,10 +655,6 @@ def flash_attention_kernel(
       assert max_logits_ref.shape == (bq, NUM_LANES)
       max_logits_ref[...] = m_scratch_ref[...].astype(max_logits_ref.dtype)
 
-    m_scratch_ref[...] = jnp.zeros_like(m_scratch_ref)
-    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
-    o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
-
 
 def _div(dividend: int, divisor: int):
   if divisor == 1:
@@ -1226,7 +1222,6 @@ def _flash_attention_dq_kernel(
   @pl.when(should_write)
   def end():
     dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
-    dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
 
 
 def _splash_attention_bwd_dq(
@@ -1630,15 +1625,8 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(should_write)
   def end():
-    dk = dk_alias[...]
-    dv = dv_alias[...]
-    dk_ref[...] = dk + dk_scratch_ref[...].astype(dk_ref.dtype)
-    dv_ref[...] = dv + dv_scratch_ref[...].astype(dv_ref.dtype)
-    if dq_scratch_ref is not None:
-      dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
-
-    dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
-    dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
+    dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
+    dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
 
 
 def _splash_attention_bwd_dkv(
@@ -1817,11 +1805,19 @@ def _splash_attention_bwd_dkv(
   else:
     dq = dq_spec = dq_shape = dq_scratch = None
 
+  if q_heads_per_kv_head == 1:
+    dk_type = k.dtype
+    dv_type = v.dtype
+  else:
+    # Keep gradients in fp32 when accumulating over head groups.
+    dk_type = jnp.float32
+    dv_type = jnp.float32
+
   in_specs += [dq_spec, dk_spec, dv_spec]
   out_shapes = [
       dq_shape,
-      jax.ShapeDtypeStruct(k.shape, jnp.float32),
-      jax.ShapeDtypeStruct(v.shape, jnp.float32),
+      jax.ShapeDtypeStruct(k.shape, dk_type),
+      jax.ShapeDtypeStruct(v.shape, dv_type),
   ]
   out_specs = [dq_spec, dk_spec, dv_spec]
 
@@ -1830,8 +1826,8 @@ def _splash_attention_bwd_dkv(
   else:
     grid_size = (kv_seq_len // bkv) * q_steps
 
-  dk = jnp.zeros(k.shape, dtype=jnp.float32)
-  dv = jnp.zeros(v.shape, dtype=jnp.float32)
+  dk = jnp.zeros(k.shape, dtype=dk_type)
+  dv = jnp.zeros(v.shape, dtype=dv_type)
 
   kernel = functools.partial(
       _flash_attention_dkv_kernel,
