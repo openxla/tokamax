@@ -66,11 +66,11 @@ def body(
 
   def pipeline_body(_, w_smem, x_smem, w_scales_smem, acc_ref):
     pl.when(wg == 0)(schedule)
-    plgpu.wgmma_wait(0)
     w = common.dequant(w_scales_smem.at[0, ns], w_smem[ns])
     schedule()
     plgpu.wgmma(acc_ref, w, plgpu.transpose_ref(x_smem, (1, 0)))
     pl.when(wg == 1)(schedule)
+    plgpu.wgmma_wait(0)
     return acc_ref
 
   def pipeline_context(cb):
