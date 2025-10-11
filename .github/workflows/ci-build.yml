@@ -52,9 +52,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3.12 -m uv pip install --upgrade pip 
+          python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install --upgrade -r requirements.txt
+          python3.12 -m uv pip install -e .[cuda,tpu,test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
@@ -80,9 +80,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3.12 -m uv pip install --upgrade pip 
+          python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install --upgrade -r requirements.txt
+          python3.12 -m uv pip install -e .[cuda,tpu,test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
@@ -108,9 +108,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3.12 -m uv pip install --upgrade pip 
+          python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install --upgrade -r requirements.txt
+          python3.12 -m uv pip install -e .[cuda,tpu,test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
@@ -137,9 +137,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python3.12 -m uv pip install --upgrade pip 
+          python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install --upgrade -r requirements.txt
+          python3.12 -m uv pip install -e .[cuda,tpu,test]
           python3.12 -m uv pip freeze
           python3.12 -m uv pip install -U --pre jax jaxlib libtpu requests -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
       - name: Test Tokamax ops with unittest

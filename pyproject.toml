@@ -22,21 +22,32 @@ dependencies = [
     "absl-py>=2.3.0",
     "chex>=0.1.81",
     "einshape",
-    "flax",
     "google-benchmark>=1.9.0",
-    "jax-triton",
-    "jax[cuda12, tpu]>=0.7.2",
+    "jax>=0.7.2",
     "jaxlib>=0.7.2",
     "jaxtyping>=0.3",
-    "nvidia-cudnn-cu12>=9.0.0",
     "protobuf",
     "pydantic>=2.11.0",
-    "pytest-xdist",
-    "pytest",
     "tensorflow",
     "tqdm",
-    "triton>=3.0.0",
     "typeguard==2.13.3",
     "xprof",
     "hypothesis",
+    "jax-triton",
+]
+[project.optional-dependencies]
+test = [
+    "pytest-xdist",
+    "pytest",
+    "flax",
+]
+
+cuda = [
+    "jax[cuda12]>=0.7.2",
+    "nvidia-cudnn-cu12>=9.0.0",
+    "triton>=3.0.0",
+]
+
+tpu = [
+    "jax[tpu]>=0.7.2",
 ]
