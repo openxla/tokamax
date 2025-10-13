@@ -40,7 +40,7 @@ class DotProductAttentionTest(parameterized.TestCase):
       group_num=[1, 2, 4],
       use_vmap=[False, True],
   )
-  def testDotProductAttention(self, dtype, group_num, use_vmap):
+  def test_dot_product_attention(self, dtype, group_num, use_vmap):
 
     B, S, T, N, H, G = 2, 128, 128, 4, 64, group_num
     keys = jax.random.split(jax.random.PRNGKey(0), 5)
@@ -216,7 +216,7 @@ class DotProductAttentionTest(parameterized.TestCase):
     chex.assert_trees_all_close(dbias_ans, dbias_ref, rtol=0.05, atol=0.05)
 
   @parameterized.product(batch_size=[1, 16], use_vmap=[False, True])
-  def testDotProductAttentionBiasGradient(self, batch_size, use_vmap):
+  def test_dot_product_attention_bias_gradient(self, batch_size, use_vmap):
     # TODO: Fix test for 'xla_chunked' on TPU.
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
       self.skipTest(f'{self.IMPL} not supported on TPU')
@@ -306,12 +306,6 @@ class DotProductAttentionCudnnTest(DotProductAttentionTest):
     super().setUp()
     if jax.default_backend() != 'gpu':
       self.skipTest(f'cuDNN only supported on GPU, not {jax.default_backend()}')
-
-  def testMemoryScaling0(self):
-    self.skipTest('Memory scaling guarantees not made for this implementation')
-
-  def testMemoryScaling1(self):
-    self.skipTest('Memory scaling guarantees not made for this implementation')
 
   def test_impl_in_hlo(self):
     fn = functools.partial(api.dot_product_attention, implementation=self.IMPL)
