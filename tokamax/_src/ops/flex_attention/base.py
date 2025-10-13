@@ -16,7 +16,7 @@
 
 from collections.abc import Callable
 import functools
-from typing import Any, ClassVar, Literal, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 import jax
 import jax.numpy as jnp
@@ -43,7 +43,6 @@ class FlexAttention(
     op.Op[Any, Float[Array, "*B T H d"], Residuals, _Config, _Key]
 ):
   """FlexAttention function."""
-  supports_batched_args_capture: ClassVar[bool] = False
 
   # We override `__call__` in order to handle sharding at the top level.
   @overload

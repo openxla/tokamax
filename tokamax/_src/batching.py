@@ -22,7 +22,6 @@ from typing import Any, Generic, ParamSpec, TypeVar
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from tokamax._src import utils
 
 
@@ -177,7 +176,7 @@ def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
   def wrapped(*args, batched_args=None, **kwargs):
     ba = bind(*args, batched_args=batched_args, **kwargs)
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
-    is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
+    is_array = lambda x: isinstance(x, jax.Array)
     arrays, other, merge = utils.split_merge(is_array, args_flat)
 
     if batched_args is None:
