@@ -145,7 +145,7 @@ def ragged_dot_quantized_kernel(
       group_info.actual_end,
       group_info.start_within_block,
       group_info.actual_size,
-      rhs.values.transpose(0, 2, 1),
+      rhs.values.mT,
       lhs,
       rhs.scales,
   )

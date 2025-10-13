@@ -75,11 +75,8 @@ def ragged_dot_gpu_quant_blackwell_kernel(
     block_m *= 2
     block_n *= 2
 
-  w, w_scales, x = (
-      rhs.values.transpose(0, 2, 1),
-      rhs.scales,
-      lhs,
-  )
+  w, w_scales, x = (rhs.values.mT, rhs.scales, lhs)
+
   (num_groups, n, k_w), (m, k_x) = w.shape, x.shape
   tile_k = k_w // w_scales.shape[1]
   if k_w != k_x:
