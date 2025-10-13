@@ -104,15 +104,17 @@ def canonicalize_precision(precision: PrecisionLike) -> CanonicalPrecision:
 def to_dot_algorithm_preset(
     a_dtype: DTypeLike, b_dtype: DTypeLike, precision: PrecisionLike
 ) -> DotAlgorithmPreset:
-  """Converts a `PrecisionLike` to a `DotAlgorithmPreset`."""
+  """Converts a `PrecisionLike` to a (non-`DEFAULT`) `DotAlgorithmPreset`."""
 
   precision = canonicalize_precision(precision)
 
-  if isinstance(precision, DotAlgorithmPreset):
+  if precision == DotAlgorithmPreset.DEFAULT:
+    precision = (Precision.DEFAULT, Precision.DEFAULT)
+  elif isinstance(precision, DotAlgorithmPreset):
     return precision
-  if isinstance(precision, DotAlgorithm):
+  elif isinstance(precision, DotAlgorithm):
     raise NotImplementedError("`DotAlgorithm` is not supported.")
-  if precision[0] != precision[1]:
+  elif precision[0] != precision[1]:
     raise NotImplementedError("Mismatched `Precision`s not supported.")
 
   precision = precision[0]
