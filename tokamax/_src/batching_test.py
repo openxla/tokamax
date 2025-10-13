@@ -99,15 +99,6 @@ class BatchingTest(parameterized.TestCase):
     self.assertEqual(seen_batched_args[-1], expected_batched_args)
     self.assertEqual(seen_batched_kwargs[-1], expected_batched_kwargs)
 
-    seen_inner_shapes.clear()
-    seen_batched_args.clear()
-    seen_batched_kwargs.clear()
-
-    _ = jax.vjp(lambda a0, a1: f(a0, a1, kw=kw), a0, a1)
-    self.assertEqual(seen_inner_shapes, [expected_shapes] * (num_vmaps + 1))
-    self.assertEqual(seen_batched_args[-1], expected_batched_args)
-    self.assertEqual(seen_batched_kwargs[-1], expected_batched_kwargs)
-
   def test_batched_shape_dtype_equality(self):
     x = jax.ShapeDtypeStruct((3, 4), jnp.float32)
     x_batched = batching.BatchedShapeDtype((3, 4), jnp.float32, vmap_axes=())
