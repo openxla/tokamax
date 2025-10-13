@@ -16,7 +16,18 @@
 from collections.abc import Callable, Sequence
 from typing import TypeVar
 
+
 T = TypeVar('T')
+
+
+def exact_div(a: int | tuple[int, str], b: int | tuple[int, str]) -> int:
+  """Returns `a // b`, raising a `ValueError` if there is a remainder."""
+  a, a_name = (a, '`a`') if isinstance(a, int) else a
+  b, b_name = (b, '`b`') if isinstance(b, int) else b
+  quotient, remainder = divmod(a, b)
+  if remainder:
+    raise ValueError(f'{a_name} ({a}) must divide exactly by {b_name} ({b})')
+  return quotient
 
 
 # Adapted from jax._src.util.split_merge in JAX v0.6.0.

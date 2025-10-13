@@ -19,6 +19,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+from tokamax._src import utils
 
 
 # TODO: Add support for offsets?
@@ -116,10 +117,9 @@ def quantize_as(
 
       if tile_dim == 1:
         values_tiled_shape.append(dim)
-      elif dim % tile_dim == 0:
-        values_tiled_shape.extend((tile_dim, dim // tile_dim))
       else:
-        raise ValueError("Input shape must divide exactly by `tile_shape`.")
+        n = utils.exact_div((dim, "`values.shape`"), (tile_dim, "`tile_shape`"))
+        values_tiled_shape.extend((tile_dim, n))
 
       axis = -len(values_tiled_shape)
       fn = jax.vmap(fn, in_axes=axis, out_axes=(axis, axis))
