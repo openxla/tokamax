@@ -51,6 +51,11 @@ LOG2E_INV = 1 / LOG2E
 
 # mypy: ignore-errors
 
+def _not(x: jax.Array | bool) -> jax.Array | bool:
+  if isinstance(x, jax.Array):
+    return jnp.logical_not(x)
+  return not x
+
 
 class SegmentIds(NamedTuple):
   """SegmentIds for Q and KV sequences.
@@ -1473,7 +1478,6 @@ def _flash_attention_dkv_kernel(
     mask_ref,
     q_sequence_ref,
     # aliases
-    dq_alias,
     dk_alias,
     dv_alias,
     # Outputs
@@ -1491,6 +1495,7 @@ def _flash_attention_dkv_kernel(
     bkv_compute: int,
     bkv: int,
     mask_function: MaskFunctionType | None,
+    q_heads_per_kv_head: int,
     config: SplashConfig,
 ):
   del mask_next_ref, active_cols_ref
@@ -1503,12 +1508,14 @@ def _flash_attention_dkv_kernel(
   if block_mask_ref is not None:
     kv_index = active_rows_ref[grid_idx].astype(jnp.int32)
     should_not_mask = block_mask_ref[grid_idx].astype(jnp.int32) != 1
+    should_run = block_mask_ref[grid_idx].astype(jnp.int32) != 0
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
   else:
     q_index = grid_idx % q_steps
     kv_index = grid_idx // q_steps
     should_not_mask = False
+    should_run = True
     should_initialize = q_index == 0
     should_write = q_index == q_steps - 1
 
@@ -1521,6 +1528,9 @@ def _flash_attention_dkv_kernel(
   # (first Q_heads to 'see' a new KV_head).
   # The gradient output buffers should be written for Q_heads 1, 3, 5, 7 (last
   # Q_heads to 'see' the current KV_head).
+
+  q_head = pl.program_id(0)
+  first_q_head_in_kv_group = lax.rem(q_head, q_heads_per_kv_head) == 0
 
   @pl.when(should_initialize)
   def init():
@@ -1601,30 +1611,37 @@ def _flash_attention_dkv_kernel(
       else:
         # Compute block size == memory block size
         assert dq_ref is not None
-        dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
+        dq_ref[...] = dq.astype(dq_ref.dtype)
 
   if dq_scratch_ref is not None:
     dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
+  elif dq_ref is not None:
+    dq_ref[...] = jnp.zeros_like(dq_ref)
 
   num_iters = (
       k_ref.shape[0 if config.k_layout is HEAD_DIM_MINOR else 1] // bkv_compute
   )
 
-  @pl.when(should_not_mask)
+  @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
     lax.fori_loop(0, num_iters, body, None, unroll=True)
 
-  @pl.when(~should_not_mask)
+  @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
   def _():
     lax.fori_loop(
         0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
     )
   if dq_scratch_ref is not None:
     assert dq_ref is not None
-    dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
+    dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
-  @pl.when(should_write)
-  def end():
+  @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
+  def _():
+    dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
+    dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
+
+  @pl.when(jnp.logical_and(should_write, _not(first_q_head_in_kv_group)))
+  def _():
     dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
     dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
 
@@ -1797,28 +1814,23 @@ def _splash_attention_bwd_dkv(
     dq_index_map = unravel(lambda h, i, j, *_: (j, h, i, 0))
     dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
     dq_shape = jax.ShapeDtypeStruct((kv_seq_len // bkv, *q.shape), jnp.float32)
-    dq = jnp.zeros_like(dq_shape)
     if bkv == bkv_compute:
       dq_scratch = None
     else:
       dq_scratch = pltpu.VMEM((bq, head_dim_qk), jnp.float32)
   else:
-    dq = dq_spec = dq_shape = dq_scratch = None
+    dq_spec = dq_shape = dq_scratch = None
 
-  if q_heads_per_kv_head == 1:
-    dk_type = k.dtype
-    dv_type = v.dtype
-  else:
-    # Keep gradients in fp32 when accumulating over head groups.
-    dk_type = jnp.float32
-    dv_type = jnp.float32
+  # TODO: Investigate compiler bug with bf16 dtypes.
+  dk_type = jnp.float32
+  dv_type = jnp.float32
 
-  in_specs += [dq_spec, dk_spec, dv_spec]
   out_shapes = [
       dq_shape,
       jax.ShapeDtypeStruct(k.shape, dk_type),
       jax.ShapeDtypeStruct(v.shape, dv_type),
   ]
+  in_specs += [dk_spec, dv_spec]
   out_specs = [dq_spec, dk_spec, dv_spec]
 
   if mask_info.num_active_blocks is not None:
@@ -1826,9 +1838,8 @@ def _splash_attention_bwd_dkv(
   else:
     grid_size = (kv_seq_len // bkv) * q_steps
 
-  dk = jnp.zeros(k.shape, dtype=dk_type)
-  dv = jnp.zeros(v.shape, dtype=dv_type)
-
+  dk = lax.empty(k.shape, dtype=dk_type)
+  dv = lax.empty(v.shape, dtype=dv_type)
   kernel = functools.partial(
       _flash_attention_dkv_kernel,
       mask_value=mask_value,
@@ -1838,6 +1849,7 @@ def _splash_attention_bwd_dkv(
       config=config,
       bkv=bkv,
       mask_function=mask_function,
+      q_heads_per_kv_head=q_heads_per_kv_head,
   )
 
   kernel_name = get_kernel_name(
@@ -1880,9 +1892,9 @@ def _splash_attention_bwd_dkv(
   ]
   num_args = sum(1 for x in args if x is not None)
   if config.use_fused_bwd_kernel:
-    input_output_aliases = {num_args + i: i for i in (0, 1, 2)}
+    input_output_aliases = {num_args: 1, num_args + 1: 2}
   else:
-    input_output_aliases = {num_args + i: i for i in (0, 1)}
+    input_output_aliases = {num_args: 0, num_args + 1: 1}
 
   scratch_shapes = [
       dq_scratch,
@@ -1914,7 +1926,7 @@ def _splash_attention_bwd_dkv(
         name=kernel_name,
         interpret=config.interpret,
         metadata=metadata,
-    )(*args, dq, dk, dv)
+    )(*args, dk, dv)
   if config.use_fused_bwd_kernel:
     assert dq_unreduced is not None
     dq = dq_unreduced.sum(axis=0)
@@ -2202,6 +2214,7 @@ def _make_splash_attention(
         mask,
         (bq_dkv, bkv_dkv),
         is_dkv=True,
+        return_dynamic_grid=False,
     )
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 

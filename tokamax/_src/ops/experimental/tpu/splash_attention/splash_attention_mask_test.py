@@ -796,8 +796,12 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     self._assert_mask_info_match(mask_info, expected_mask_info)
     self._assert_mask_info_match(mask_info_dkv, expected_mask_info)
 
-  @parameterized.parameters((True,), (False,))
-  def test_rectangular_wide_causal_mask(self, is_lazy_mask: bool):
+  @parameterized.product(
+      is_lazy_mask=[True, False], return_dynamic_grid=[True, False]
+  )
+  def test_rectangular_wide_causal_mask(
+      self, is_lazy_mask: bool, return_dynamic_grid: bool
+  ):
     sequence_lengths = (64, 128)
     block_shape = (16, 16)
 
@@ -808,8 +812,10 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
           mask_lib.make_causal_mask(sequence_lengths)
       )
 
-    mask_info, mask_info_dkv, mask_function = self._process_mask(
-        causal_mask, block_shape
+    args = (causal_mask, block_shape)
+    mask_info, mask_function = mask_info_lib.process_mask(*args)
+    mask_info_dkv, _ = mask_info_lib.process_mask_dkv(
+        *args, return_dynamic_grid=return_dynamic_grid
     )
     if is_lazy_mask:
       self.assertIsNotNone(mask_function)
@@ -851,25 +857,71 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
           np.arange(sequence_lengths[0], dtype=np.int32),
       )
 
-    expected_causal_mask_next_dkv = np.array(
+    if return_dynamic_grid:
+      expected_causal_mask_next_dkv = np.array(
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.int8
-    )
-    expected_active_rows_dkv = np.array(
-        [0, 0, 0, 0, 1, 1, 1, 2, 2, 3], dtype=np.int8
-    )
-    expected_active_cols_dkv = np.array(
-        [0, 1, 2, 3, 1, 2, 3, 2, 3, 3], dtype=np.int8
-    )
-    expected_causal_block_mask = np.array(
-        [1, 2, 2, 2, 1, 2, 2, 1, 2, 1], dtype=np.int8
-    )
+      )
+      expected_active_rows_dkv = np.array(
+          [0, 0, 0, 0, 1, 1, 1, 2, 2, 3], dtype=np.int8
+      )
+      expected_active_cols_dkv = np.array(
+          [0, 1, 2, 3, 1, 2, 3, 2, 3, 3], dtype=np.int8
+      )
+      expected_causal_block_mask_dkv = np.array(
+          [1, 2, 2, 2, 1, 2, 2, 1, 2, 1], dtype=np.int8
+      )
+      expected_num_active_blocks_dkv = np.array([10], dtype=np.int32)
+    else:
+      expected_causal_mask_next_dkv = np.zeros((32,), dtype=np.int8)
+      expected_active_rows_dkv = np.array(
+          [
+              [0, 0, 0, 0],
+              [1, 1, 1, 1],
+              [2, 2, 2, 2],
+              [3, 3, 3, 3],
+              [4, 4, 4, 4],
+              [5, 5, 5, 5],
+              [6, 6, 6, 6],
+              [7, 7, 7, 7],
+          ],
+          dtype=np.int8,
+      ).flatten()
+
+      expected_active_cols_dkv = np.array(
+          [
+              [0, 1, 2, 3],
+              [0, 1, 2, 3],
+              [0, 1, 2, 3],
+              [0, 1, 2, 3],
+              [0, 1, 2, 3],
+              [0, 1, 2, 3],
+              [0, 1, 2, 3],
+              [0, 1, 2, 3],
+          ],
+          dtype=np.int8,
+      ).flatten()
+
+      expected_causal_block_mask_dkv = np.array(
+          [
+              [1, 2, 2, 2],
+              [0, 1, 2, 2],
+              [0, 0, 1, 2],
+              [0, 0, 0, 1],
+              [0, 0, 0, 0],
+              [0, 0, 0, 0],
+              [0, 0, 0, 0],
+              [0, 0, 0, 0],
+          ],
+          dtype=np.int8,
+      ).flatten()
+      expected_num_active_blocks_dkv = np.array([32], dtype=np.int32)
 
     expected_mask_info_dkv = mask_info_lib.MaskInfo(
         expected_causal_mask_next_dkv if not is_lazy_mask else None,
         expected_active_rows_dkv,
         expected_active_cols_dkv,
-        expected_causal_block_mask,
-        expected_num_active_blocks,
+        expected_causal_block_mask_dkv,
+        expected_num_active_blocks_dkv,
         np.expand_dims(
             np.tril(np.ones(block_shape, dtype=np.int8)), 0
         ).swapaxes(-1, -2)

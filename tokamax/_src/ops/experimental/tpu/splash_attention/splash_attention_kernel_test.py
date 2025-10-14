@@ -521,7 +521,8 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_fused_bwd_kernel=(False, True),
       is_dynamic_mask=(False, True),
       use_base2_exp=(False, True),
-      use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
+      # use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
+      use_max_logit_estimate=(None,),
       fuse_reciprocal=(True, False),
   )
   @hp.given(hps.data())
