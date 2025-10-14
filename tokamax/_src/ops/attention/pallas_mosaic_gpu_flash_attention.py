@@ -51,6 +51,7 @@ _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 
 @pydantic.dataclasses.dataclass(frozen=True)
 class Config:
+  # TODO: Relax constraints to multiple of 32.
   block_q: pydantic.conint(multiple_of=64, gt=0) = 64
   block_kv: pydantic.conint(multiple_of=64, gt=0) = 64
   num_stages: pydantic.conint(gt=1) = 2
@@ -674,3 +675,24 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
     # This is a pretty good option that works for most cases.
     return Config(block_q=64, block_kv=64, num_stages=2)
+
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    q, k, _ = ba.args
+    block_qs = set([
+        min(x, pl.next_power_of_2(q.shape[-3] // 2))
+        for x in [64, 128, 256]
+        if q.shape[-3] % (x * 2) == 0  # 2 * block_q must divide seq_len_q.
+    ])
+    block_kvs = set([
+        min(x, pl.next_power_of_2(k.shape[-3]))
+        for x in [64, 128, 256]
+        if k.shape[-3] % x == 0  # block_kv must divide seq_len_kv.
+    ])
+    configs = set()
+    for block_q in block_qs:
+      for block_kv in block_kvs:
+        for num_stages in [2, 3, 4]:
+          configs.add(
+              Config(block_q=block_q, block_kv=block_kv, num_stages=num_stages)
+          )
+    return configs

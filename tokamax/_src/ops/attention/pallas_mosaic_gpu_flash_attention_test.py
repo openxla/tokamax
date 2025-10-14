@@ -125,6 +125,17 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         self.skipTest(f"Test exceeds shared memory capacity: {e}")
       raise
 
+  def test_autotune(self):
+    # Test that all autotuning configs yield reasonable results.
+    assert isinstance(self._attention_fn, fa.PallasMosaicGpuFlashAttention)
+    q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 64))
+    bound_args = self._attention_fn.bind(q, k, v)
+    configs = self._attention_fn._get_autotuning_configs(bound_args)
+    self.assertNotEmpty(configs)
+    for config in configs:
+      impl = fa.PallasMosaicGpuFlashAttention(config)
+      self._run_test_with_inputs(q, k, v, impl=impl)
+
 
 # TODO: Add manual partitioning test.
 
