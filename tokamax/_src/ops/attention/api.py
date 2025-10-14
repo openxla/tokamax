@@ -20,7 +20,6 @@ import immutabledict
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
-from tokamax._src import jaxtyping
 from tokamax._src import quantization
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
@@ -53,7 +52,6 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
 _DEFAULT_IMPLEMENTATION = ("mosaic", "triton", "xla")
 
 
-@jaxtyping.jaxtyped
 def dot_product_attention(
     query: Float[Array | QuantizedArray, "*B T N H"],
     key: Float[Array | QuantizedArray, "*B S K H"],

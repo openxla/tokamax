@@ -21,7 +21,6 @@ from absl import logging
 import immutabledict
 import jax
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
-from tokamax._src import jaxtyping
 from tokamax._src import triton
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu
@@ -39,7 +38,6 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
 _DEFAULT_IMPLEMENTATION = ('triton', 'xla')
 
 
-@jaxtyping.jaxtyped
 def gated_linear_unit(
     x: Float[Array, '*B M K'],
     weights: Float[Array, 'K 2 N'],
