@@ -97,6 +97,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       `_get_autotuning_configs`.
     - Optionally, set a default `vjp` function.
   """
+
   config_cls: ClassVar[type[_Config]] = NullConfig
   # Whether an op allows abstract inputs with `jax.export.symbolic_shape`
   # instances in array shapes.
@@ -512,7 +513,9 @@ class BoundArguments(Generic[_Config, _Key]):
     """Returns VJP arg specification for this op and arguments."""
     ba = batched if (batched := self.batched).vmap_axis_sizes else self
     kwargs = ba.kwargs | dict(return_residuals=True)
-    f, x = benchmarking.standardize_function(self.op, *ba.args, kwargs=kwargs)
+    f, x = benchmarking.standardize_function(
+        self.op, *ba.args, kwargs=kwargs, seed=None
+    )
     out, residuals = jax.eval_shape(f, x)
     vjp_arg_spec = dict(ba.arguments)
     vjp_arg_spec["residuals"] = residuals
