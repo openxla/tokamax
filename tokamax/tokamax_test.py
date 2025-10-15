@@ -91,7 +91,15 @@ class TokamaxTest(absltest.TestCase):
       with autotune_res:
         out_autotuned = f_grad(x, scale)
         # TODO: Reduce tolerance once mgpu attention supports higher precision.
-        chex.assert_trees_all_close(out, out_autotuned, atol=0.9)
+        def l2_rel(a, b):
+          l2_diff = jnp.linalg.norm(a - b, axis=-1)
+          l2_norm = jnp.maximum(jnp.linalg.norm(b, axis=-1), 1e-6)
+          return l2_diff / l2_norm
+
+        l2_rel_diff = l2_rel(out, out_autotuned)
+        chex.assert_trees_all_close(
+            jnp.zeros_like(l2_rel_diff), l2_rel_diff, atol=5e-2
+        )
 
     with self.subTest("Benchmark"):
       f_std, args = tokamax.benchmarking.standardize_function(f_grad, x, scale)
