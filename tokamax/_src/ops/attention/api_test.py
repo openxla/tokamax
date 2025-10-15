@@ -21,6 +21,7 @@ import jax
 from jax import export
 import jax.numpy as jnp
 from tokamax import autotuning
+from tokamax._src import batching
 from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu
 from tokamax._src import triton as triton_lib
@@ -82,6 +83,14 @@ class DotProductAttentionTest(parameterized.TestCase):
     if self.IMPL is not None:
       impl = api.IMPLEMENTATIONS[self.IMPL]
       self.assertIsInstance(args[0].op, impl.__class__)
+
+    array_type = (
+        batching.BatchedShapeDtype if use_vmap else jax.ShapeDtypeStruct
+    )
+    args = args[0].arguments
+    self.assertIsInstance(args['q'], array_type)
+    self.assertIsInstance(args['k'], array_type)
+    self.assertIsInstance(args['v'], array_type)
 
   def test_symbolic_export(self):
     if self.IMPL != 'xla':

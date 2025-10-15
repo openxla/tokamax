@@ -101,6 +101,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
   # Whether an op allows abstract inputs with `jax.export.symbolic_shape`
   # instances in array shapes.
   supports_symbolic_shapes: ClassVar[bool] = True
+  supports_batched_args_capture: ClassVar[bool] = True
 
   config: _Config | None = None
   _: dataclasses.KW_ONLY
@@ -148,17 +149,17 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     bind = cast(Callable[_P, Any], self.bind)  # Work around pytype bug.
     ba = bind(*args, **kwargs)
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
-    is_array = lambda x: isinstance(x, jax.Array)
+    is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
     arrays, other, merge = utils.split_merge(is_array, args_flat)
 
     @self._capture_batched_args
-    def fwd(*arrays, batched_args, return_res=True):
+    def fwd(*arrays, batched_args, fwd_res=True):
       args, kwargs = args_tree.unflatten(merge(arrays, other))
-      kwargs["return_residuals"] = return_res
+      kwargs["return_residuals"] = fwd_res or return_residuals
       ba = self.bind(*args, **kwargs)
       if batched_args is not None:
         bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
-        bkwargs["return_residuals"] = return_res
+        bkwargs["return_residuals"] = fwd_res or return_residuals
         arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
         ba = BoundArguments(self, arguments)
 
@@ -172,16 +173,55 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
 
       with jax.named_scope(f"tokamax:{json_data}"):
+        if fwd_res and self.vjp is None and batched_args is not None:
+
+          def fwd_flat(*arrays):
+            args, kwargs = args_tree.unflatten(merge(arrays, other))
+            kwargs["return_residuals"] = return_residuals
+            return self._fwd(*args, config=config, **kwargs)
+
+          try:
+            out, f_vjp, residuals = jax.vjp(fwd_flat, *arrays, has_aux=True)
+
+            # This is a hack to work around the pytree shape consistency checks
+            # performed by `custom_batching`. As we are returning a new function
+            # instance (the `vjp`), these checks fail, though it will work.
+            assert isinstance(f_vjp, jax.tree_util.Partial)
+            assert len(f_vjp.args) == 1
+            assert not f_vjp.keywords
+            assert isinstance(f_vjp.args[0], jax.tree_util.Partial)
+            arg = f_vjp.args[0]
+            arg = jax.tree_util.Partial(_AlwaysEqual(arg.func), *arg.args)
+            f_vjp = jax.tree_util.Partial(_AlwaysEqual(f_vjp.func), arg)
+          except Exception as e:  # pylint: disable=broad-except
+            out, residuals = fwd_flat(*arrays)
+
+            def f_vjp(_, e=e):
+              raise NotImplementedError("vjp not implemented") from e
+
+            f_vjp = jax.tree_util.Partial(_AlwaysEqual(f_vjp))
+
+          ret = (out, residuals) if return_residuals else out
+          return ret, f_vjp
+
         out, residuals = self._fwd(*args, config=config, **kwargs)
       ret = (out, residuals) if return_residuals else out
       return ret, (arrays, out, residuals)
 
     def f(*arrays):
-      return fwd(*arrays, return_res=return_residuals)[0]
+      return fwd(*arrays, fwd_res=False)[0]
 
-    if self.vjp is not None:
+    if self.vjp is None:
+      if not self.supports_batched_args_capture:
+        return f(*arrays)
 
-      def bwd(residuals, dout):
+      # We must wrap the op in a `custom_vjp`, even if no `vjp` function is
+      # provided, as we use `custom_batching` to capture the batched arguments,
+      # and `custom_batching` doesn't support `jax.vjp`.
+      bwd = lambda f_vjp, dout: f_vjp(dout[0] if return_residuals else dout)
+    else:
+
+      def bwd(residuals, dout):  # pylint: disable=function-redefined
         arrays, out, residuals = residuals
         dout = dout[0] if return_residuals else dout
         args, kwargs = args_tree.unflatten(merge(arrays, other))
@@ -207,9 +247,8 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 
         return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
 
-      f = jax.custom_vjp(f)
-      f.defvjp(fwd, bwd, optimize_remat=True)
-
+    f = jax.custom_vjp(f)
+    f.defvjp(fwd, bwd, optimize_remat=True)
     return f(*arrays)
 
   def bind(
@@ -264,17 +303,9 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     return set()
 
   def _capture_batched_args(self, fn: Callable[..., _T]) -> Callable[..., _T]:
-    try:
-      config = self._get_heuristics_config(None)  # pytype: disable=wrong-arg-types
-      if config is _NULL_CONFIG:
-        # `custom_vmap` doesn't currently support JVP / VJP. In order to reduce
-        # the chance of hitting issues, we avoid its use for ops without a
-        # config, as they do not use the `batched_args` anyway.
-        return lambda *args, **kwargs: fn(*args, batched_args=None, **kwargs)
-    except Exception:  # pylint: disable=broad-exception-caught
-      pass
-
-    return batching.capture_batched_args(fn)
+    if self.supports_batched_args_capture:
+      return batching.capture_batched_args(fn)
+    return lambda *args, **kwargs: fn(*args, batched_args=None, **kwargs)
 
   @property
   def signature(self) -> inspect.Signature:
@@ -324,11 +355,6 @@ class BoundArguments(Generic[_Config, _Key]):
     object.__setattr__(self, "op", op)
     immutable_args = immutabledict.immutabledict(arguments)
     object.__setattr__(self, "arguments", immutable_args)
-
-    args_flat = jax.tree.leaves(arguments)
-    has_batched = any(map(_is_batched, args_flat))
-    if has_batched and any(map(_is_non_batched_shaped, args_flat)):
-      raise ValueError("Cannot bind both batched and non-batched shapes")
 
   @property
   def signature(self) -> inspect.Signature:
@@ -519,6 +545,19 @@ class BoundArguments(Generic[_Config, _Key]):
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _AlwaysEqual:
+  """A class that is always equal to another instance of itself."""
+
+  value: Any
+
+  def __call__(self, *args, **kwargs) -> Any:
+    return self.value(*args, **kwargs)
+
+  def __eq__(self, other):
+    return isinstance(other, _AlwaysEqual)
+
+
 @functools.lru_cache
 def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
   spec = pydantic_lib.get_arg_spec_model(f"{type(op).__name__}Spec", op._fwd_signature)  # pylint: disable=protected-access
@@ -550,25 +589,14 @@ def _abstractify(pytree):
   return jax.tree.map(abstractify_leaf, pytree)
 
 
-def _is_shaped(x):
-  return isinstance(x, (jax.Array, jax.ShapeDtypeStruct, jax.core.ShapedArray))
-
-
-def _is_batched(x):
-  return isinstance(x, batching.BatchedShapeDtype)
-
-
-def _is_non_batched_shaped(x):
-  return _is_shaped(x) and not _is_batched(x)
-
-
 def _as_batched(x):
-  if _is_non_batched_shaped(x):
-    return batching.BatchedShapeDtype(x.shape, x.dtype, ())
+  if hasattr(x, "shape") and hasattr(x, "dtype"):
+    if not isinstance(x, batching.BatchedShapeDtype):
+      return batching.BatchedShapeDtype(x.shape, x.dtype, ())
   return x
 
 
 def _as_unbatched(x):
-  if _is_batched(x):
+  if isinstance(x, batching.BatchedShapeDtype):
     return jax.ShapeDtypeStruct(x.inner_shape, x.dtype)
   return x
