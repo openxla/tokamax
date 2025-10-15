@@ -843,7 +843,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
           expected_active_cols,
           expected_causal_block_mask,
           expected_num_active_blocks,
-          np.expand_dims(np.tril(np.ones(block_shape, dtype=np.int8)), 0),
+          np.tri(*block_shape, dtype=np.int8)[None, ...],
           None,
       )
     else:
@@ -922,7 +922,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_active_cols_dkv,
         expected_causal_block_mask_dkv,
         expected_num_active_blocks_dkv,
-        np.expand_dims(np.tril(np.ones(block_shape, dtype=np.int8)), 0).mT
+        np.tri(*block_shape, dtype=np.int8).T[None, ...]
         if not is_lazy_mask
         else None,
         np.arange(sequence_lengths[0], dtype=np.int32)
@@ -972,7 +972,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_active_cols,
         expected_causal_block_mask,
         expected_num_active_blocks,
-        np.expand_dims(np.tril(np.ones(block_shape, dtype=np.int8)), 0)
+        np.tri(*block_shape, dtype=np.int8)[None, ...]
         if not is_lazy_mask
         else None,
         np.arange(sequence_lengths[0], dtype=np.int32)
@@ -1002,7 +1002,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_active_cols_dkv,
         expected_causal_block_mask_dkv,
         expected_num_active_blocks,
-        np.expand_dims(np.tril(np.ones(block_shape, dtype=np.int8)), 0).mT
+        np.tri(*block_shape, dtype=np.int8).T[None, ...]
         if not is_lazy_mask
         else None,
         np.arange(sequence_lengths[0], dtype=np.int32)
@@ -1212,7 +1212,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     expected_num_active_blocks = np.array([10, 10], dtype=np.int32)
 
     expected_partial_mask_blocks = np.stack([
-        np.tril(np.ones(block_shape, dtype=np.int8)),
+        np.tri(*block_shape, dtype=np.int8),
         np.triu(
             np.tri(*block_shape, window_size, dtype=np.int8),
             -window_size,
