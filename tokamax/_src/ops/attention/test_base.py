@@ -712,7 +712,7 @@ class AttentionTestBase(parameterized.TestCase):
       def run_partial_attention(i):
         chunk = lambda x: x[..., i * chunk_size : (i + 1) * chunk_size, :, :]
         o, (m, l) = self._attention_fn(q, chunk(k), chunk(v), **kwargs)
-        return o, m.swapaxes(-1, -2)[..., None], l.swapaxes(-1, -2)[..., None]
+        return o, m.mT[..., None], l.mT[..., None]
 
       outs = [run_partial_attention(i) for i in range(num_chunks)]
       outs, maxes, sums = tuple(zip(*outs))

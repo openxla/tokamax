@@ -362,7 +362,7 @@ def _process_dynamic_mask(
   mask_next = jnp.where(block_mask == 1, mask_next, 0)
 
   if is_dkv:
-    partial_mask_blocks = partial_mask_blocks.swapaxes(-1, -2)
+    partial_mask_blocks = partial_mask_blocks.mT
 
   def _downcast(array: jax.Array, max_value: int) -> jax.Array:
     if array.size == 0:

@@ -387,7 +387,7 @@ def _bwd(
   m, l = residuals
   # TODO: check whether this contributes significantly, and use
   # kernel if it does.
-  delta = jnp.sum((out * dout).astype(jnp.float32), axis=-1).swapaxes(-2, -1)
+  delta = jnp.sum((out * dout).astype(jnp.float32), axis=-1).mT
 
   kernel = functools.partial(
       _bwd_kernel,

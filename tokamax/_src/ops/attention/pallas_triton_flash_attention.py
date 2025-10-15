@@ -626,11 +626,11 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       m_max = jnp.max(m, axis=-3, keepdims=True)
       alpha = jnp.exp(m - m_max)
       l_sum = jnp.sum(l * alpha, axis=-3)
-      alpha = alpha.swapaxes(-2, -1)[..., None]
+      alpha = alpha.mT[..., None]
       # Avoid NaNs where `out` is infinity.
       out = jnp.where(alpha == 0.0, 0.0, out * alpha)
       out = jnp.sum(out.astype(jnp.float32), axis=-4)
-      out = (out / l_sum.swapaxes(-2, -1)[..., None]).astype(q.dtype)
+      out = (out / l_sum.mT[..., None]).astype(q.dtype)
       residuals = (jnp.squeeze(m_max, -3), l_sum)
     return out, (residuals if return_residuals else None)
 

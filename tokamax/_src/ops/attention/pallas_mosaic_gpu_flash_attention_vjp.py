@@ -737,9 +737,9 @@ def _bwd(
   dv_shape = (batch_size, kv_seq_len, num_q_heads, head_dim_out)
 
   # TODO: Fuse transpose in the kernel.
-  bias_ = None if bias is None else bias.swapaxes(-1, -2)
+  bias_ = None if bias is None else bias.mT
   if mask is not None:
-    mask = mask.swapaxes(-1, -2)
+    mask = mask.mT
 
   dk, dv = plgpu.kernel(
       functools.partial(

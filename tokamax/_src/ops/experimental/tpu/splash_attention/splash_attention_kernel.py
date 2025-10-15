@@ -982,9 +982,9 @@ def _splash_attention_forward(
         bounds_start,
         bounds_end,
         fwd_mask_info.block_mask,
-        q if q_layout == QKVLayout.HEAD_DIM_MINOR else q.swapaxes(-1, -2),
-        k if k_layout == QKVLayout.HEAD_DIM_MINOR else k.swapaxes(-1, -2),
-        v if v_layout == QKVLayout.HEAD_DIM_MINOR else v.swapaxes(-1, -2),
+        q if q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT,
+        k if k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
+        v if v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
         q_segment_ids,
         kv_segment_ids,
         fwd_mask_info.partial_mask_blocks,
@@ -1418,9 +1418,9 @@ def _splash_attention_bwd_dq(
           )
       )
   }
-  q_ = q if config.q_layout == QKVLayout.HEAD_DIM_MINOR else q.swapaxes(-1, -2)
-  k_ = k if config.k_layout == QKVLayout.HEAD_DIM_MINOR else k.swapaxes(-1, -2)
-  v_ = v if config.v_layout == QKVLayout.HEAD_DIM_MINOR else v.swapaxes(-1, -2)
+  q_ = q if config.q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT
+  k_ = k if config.k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT
+  v_ = v if config.v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT
   with jax.named_scope(kernel_name):
     _, dq = pl.pallas_call(
         kernel,
@@ -1879,9 +1879,9 @@ def _splash_attention_bwd_dkv(
       bounds_end,
       mask_info.block_mask,
       # inputs
-      q if config.q_layout == QKVLayout.HEAD_DIM_MINOR else q.swapaxes(-1, -2),
-      k if config.k_layout == QKVLayout.HEAD_DIM_MINOR else k.swapaxes(-1, -2),
-      v if config.v_layout == QKVLayout.HEAD_DIM_MINOR else v.swapaxes(-1, -2),
+      q if config.q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT,
+      k if config.k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
+      v if config.v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
       q_segment_ids,
       kv_segment_ids,
       logsumexp,

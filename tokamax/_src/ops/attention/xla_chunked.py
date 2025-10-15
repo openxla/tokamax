@@ -85,7 +85,7 @@ def _attend_chunk(
   alpha = jnp.exp(x_max - new_x_max)
 
   x_max = new_x_max
-  accum *= alpha.swapaxes(-1, -2)[..., None]
+  accum *= alpha.mT[..., None]
   denom = (denom * alpha) + weights.sum(axis=-1)
 
   if dropout_mask is not None:
@@ -192,7 +192,7 @@ def _attend_chunked(
 
     # Final normalization by the denominator.
     _, acc, _, denom = carry
-    out = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
+    out = acc / denom.mT[..., None] if normalize_output else acc
     return q_chunk_idx + q_chunk_size, out.astype(q.dtype)
 
   q_chunk_idx, out = 0, None
@@ -275,7 +275,7 @@ def _attend_paged(
 
       # Final normalization by the denominator.
       acc, _, denom = carry
-      out = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
+      out = acc / denom.mT[..., None] if normalize_output else acc
       return -1, out.astype(q.dtype)
 
     q_batch = q_batch.reshape(seq_q // chunk_size, chunk_size, h, -1)

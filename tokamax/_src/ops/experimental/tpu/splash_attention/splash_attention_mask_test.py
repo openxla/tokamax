@@ -922,9 +922,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_active_cols_dkv,
         expected_causal_block_mask_dkv,
         expected_num_active_blocks_dkv,
-        np.expand_dims(
-            np.tril(np.ones(block_shape, dtype=np.int8)), 0
-        ).swapaxes(-1, -2)
+        np.expand_dims(np.tril(np.ones(block_shape, dtype=np.int8)), 0).mT
         if not is_lazy_mask
         else None,
         np.arange(sequence_lengths[0], dtype=np.int32)
@@ -1004,7 +1002,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_active_cols_dkv,
         expected_causal_block_mask_dkv,
         expected_num_active_blocks,
-        np.expand_dims(np.tril(np.ones(block_shape, dtype=np.int8)), 0).swapaxes(-1, -2)
+        np.expand_dims(np.tril(np.ones(block_shape, dtype=np.int8)), 0).mT
         if not is_lazy_mask
         else None,
         np.arange(sequence_lengths[0], dtype=np.int32)
@@ -1093,9 +1091,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_active_cols_dkv,
         expected_local_block_mask_dkv,
         expected_num_active_blocks,
-        expected_partial_mask_blocks.swapaxes(-1, -2)
-        if not is_lazy_mask
-        else None,
+        expected_partial_mask_blocks.mT if not is_lazy_mask else None,
         np.arange(sequence_lengths[0], dtype=np.int32)
         if is_lazy_mask
         else None,
@@ -1166,7 +1162,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_active_cols_dkv,
         expected_local_block_mask,
         expected_num_active_blocks,
-        expected_partial_mask_blocks.swapaxes(-1, -2) if not is_lazy_mask else None,
+        expected_partial_mask_blocks.mT if not is_lazy_mask else None,
         np.arange(sequence_lengths[0], dtype=np.int32)
         if is_lazy_mask
         else None,
@@ -1256,7 +1252,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_active_cols_dkv,
         expected_block_mask_dkv,
         expected_num_active_blocks,
-        expected_partial_mask_blocks.swapaxes(-1, -2),
+        expected_partial_mask_blocks.mT,
         None,
     )
 
@@ -1354,7 +1350,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_active_cols_dkv,
         expected_block_mask_dkv,
         expected_num_active_blocks,
-        expected_partial_mask_blocks.swapaxes(-1, -2),
+        expected_partial_mask_blocks.mT,
         None,
     )
 
