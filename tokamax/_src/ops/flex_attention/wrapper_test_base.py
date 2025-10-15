@@ -13,9 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 """Test base for wrapped FlexAttention ops."""
-from tokamax._src import test_utils
-
 import jax
+from tokamax._src import test_utils
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.flex_attention import base
 from tokamax._src.ops.flex_attention import wrapper
