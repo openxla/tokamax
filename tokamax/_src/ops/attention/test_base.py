@@ -735,6 +735,7 @@ class AttentionTestBase(parameterized.TestCase):
   def test_bench(self, spec):
     self.skipTest("Too slow for OSS")
 
+    spec = dict(spec)  # We need to take a copy to avoid modifying other tests.
     q, k, v, bias, mask = numerics.random_initialize((
         spec.pop("q"),
         spec.pop("k"),
