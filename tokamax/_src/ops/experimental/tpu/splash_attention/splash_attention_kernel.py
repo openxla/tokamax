@@ -306,6 +306,11 @@ class SplashConfig:
   use_base2_exp: bool = True
   max_logit_const: float | None = None
   interpret: bool = False
+  # The fused bwd kernel accumulates dq at every grid step. To safely avoid
+  # read/write conflicts we conservatively avoid *any* in-kernel reductions.
+  # This parameter allows to override this behavior and specifies the number of
+  # reduction steps. For now, only 3 or all the kv steps are supported.
+  dq_reduction_steps: int | None = None
 
   def __post_init__(self):
     if self.block_kv_compute is None:
@@ -317,6 +322,12 @@ class SplashConfig:
         raise ValueError(
             "Block sizes for dq kernel are not needed with a fused kernel."
         )
+
+    if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
+      raise ValueError(
+          f"Invalid dq_reduction_steps: {self.dq_reduction_steps}, only 3 or"
+          " None are supported."
+      )
 
   @property
   def has_backward_blocks(self) -> bool:
@@ -1478,6 +1489,7 @@ def _flash_attention_dkv_kernel(
     mask_ref,
     q_sequence_ref,
     # aliases
+    dq_alias,
     dk_alias,
     dv_alias,
     # Outputs
@@ -1611,10 +1623,15 @@ def _flash_attention_dkv_kernel(
       else:
         # Compute block size == memory block size
         assert dq_ref is not None
-        dq_ref[...] = dq.astype(dq_ref.dtype)
+        if dq_alias is not None:
+          dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
+        else:
+          dq_ref[...] = dq.astype(dq_ref.dtype)
 
   if dq_scratch_ref is not None:
     dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
+  elif dq_alias is not None:
+    dq_ref[...] = dq_alias[...]
   elif dq_ref is not None:
     dq_ref[...] = jnp.zeros_like(dq_ref)
 
@@ -1633,7 +1650,10 @@ def _flash_attention_dkv_kernel(
     )
   if dq_scratch_ref is not None:
     assert dq_ref is not None
-    dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
+    if dq_alias is not None:
+      dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
+    else:
+      dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
   @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
   def _():
@@ -1810,16 +1830,28 @@ def _splash_attention_bwd_dkv(
     q_sequence = None
     in_specs.append(None)
 
+  dq_reduction_steps = config.dq_reduction_steps
+  kv_steps = kv_seq_len // bkv
+  if kv_steps <= 3 and dq_reduction_steps == 3:
+    dq_reduction_steps = None
+
+  dq_spec = dq_shape = dq_scratch = dq = dq_alias_spec = None
   if config.use_fused_bwd_kernel:
-    dq_index_map = unravel(lambda h, i, j, *_: (j, h, i, 0))
-    dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
-    dq_shape = jax.ShapeDtypeStruct((kv_seq_len // bkv, *q.shape), jnp.float32)
+    if dq_reduction_steps is None:
+      dq_index_map = unravel(lambda h, i, j, *_: (j, h, i, 0))
+      dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
+      dq_shape = jax.ShapeDtypeStruct((kv_steps, *q.shape), jnp.float32)
+    elif dq_reduction_steps == 3:
+      dq_index_map = unravel(lambda h, i, j, *_: (j % 3, h, i, 0))
+      dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
+      dq_alias_spec = dq_spec
+      dq_shape = jax.ShapeDtypeStruct((3, *q.shape), jnp.float32)
+      dq = jnp.zeros_like(dq_shape)
+
     if bkv == bkv_compute:
       dq_scratch = None
     else:
       dq_scratch = pltpu.VMEM((bq, head_dim_qk), jnp.float32)
-  else:
-    dq_spec = dq_shape = dq_scratch = None
 
   # TODO: Investigate compiler bug with bf16 dtypes.
   dk_type = jnp.float32
@@ -1830,7 +1862,7 @@ def _splash_attention_bwd_dkv(
       jax.ShapeDtypeStruct(k.shape, dk_type),
       jax.ShapeDtypeStruct(v.shape, dv_type),
   ]
-  in_specs += [dk_spec, dv_spec]
+  in_specs += [dq_alias_spec, dk_spec, dv_spec]
   out_specs = [dq_spec, dk_spec, dv_spec]
 
   if mask_info.num_active_blocks is not None:
@@ -1892,7 +1924,10 @@ def _splash_attention_bwd_dkv(
   ]
   num_args = sum(1 for x in args if x is not None)
   if config.use_fused_bwd_kernel:
-    input_output_aliases = {num_args: 1, num_args + 1: 2}
+    if dq_reduction_steps == 3:
+      input_output_aliases = {num_args: 0, num_args + 1: 1, num_args + 2: 2}
+    else:
+      input_output_aliases = {num_args: 1, num_args + 1: 2}
   else:
     input_output_aliases = {num_args: 0, num_args + 1: 1}
 
@@ -1926,7 +1961,7 @@ def _splash_attention_bwd_dkv(
         name=kernel_name,
         interpret=config.interpret,
         metadata=metadata,
-    )(*args, dk, dv)
+    )(*args, dq, dk, dv)
   if config.use_fused_bwd_kernel:
     assert dq_unreduced is not None
     dq = dq_unreduced.sum(axis=0)

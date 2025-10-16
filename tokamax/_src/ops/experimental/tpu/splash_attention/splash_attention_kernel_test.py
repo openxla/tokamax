@@ -524,6 +524,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       # use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
       use_max_logit_estimate=(None,),
       fuse_reciprocal=(True, False),
+      dq_reduction_steps=(None, 3),
   )
   @hp.given(hps.data())
   def test_splash_attention_bwd(
@@ -536,6 +537,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_base2_exp,
       use_max_logit_estimate,
       fuse_reciprocal,
+      dq_reduction_steps,
       data,
   ):
     # TODO: Re-enable once dynamic masks are fixed.
@@ -590,6 +592,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         attn_logits_soft_cap=attn_logits_soft_cap,
         interpret=self.INTERPRET,
         use_base2_exp=use_base2_exp,
+        dq_reduction_steps=dq_reduction_steps,
     )
     if is_mqa:
       if not is_dynamic_mask:
