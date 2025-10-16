@@ -17,7 +17,7 @@
 import dataclasses
 from functools import lru_cache  # pylint: disable=g-importing-member
 from functools import partial  # pylint: disable=g-importing-member
-from typing import Final, Any, Callable
+from typing import Final, Any, Callable, Sequence
 
 import jax
 import jax.experimental.pallas as pl
@@ -128,7 +128,7 @@ def custom_buffered_pallas_call(
     out_shape: jax.ShapeDtypeStruct,
     grid_spec: pltpu.PrefetchScalarGridSpec,
     compiler_params: pltpu.CompilerParams,
-    input_buffer_count: list[int] | None = None,
+    input_buffer_count: Sequence[int] | None = None,
     **kw,
 ):
   # pylint: disable=invalid-name

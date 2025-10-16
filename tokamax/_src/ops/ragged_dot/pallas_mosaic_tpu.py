@@ -35,6 +35,7 @@ TilingTuple = tuple[
     pydantic.conint(ge=128, multiple_of=128),  # tile_k
     pydantic.conint(ge=128, multiple_of=128),  # tile_n
 ]
+InputBufferCount = pydantic.conint(ge=1, le=3, multiple_of=1)
 
 QuantizedArray = quantization.QuantizedArray
 Residuals = types.NoneType
@@ -44,8 +45,9 @@ LUTKey = tuple[
     pydantic.PositiveInt,  # k
     pydantic.PositiveInt,  # n
     pydantic.PositiveInt,  # g
+    bool,  # is_quantized
 ]
-LUTValue = TilingTuple
+LUTValue = tuple[TilingTuple, InputBufferCount]
 
 
 def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
@@ -63,18 +65,28 @@ class Config:
   gmm_tiling: TilingTuple = (128, 128, 128)
   gmm_rhs_transpose_tiling: TilingTuple | None = None
   tgmm_tiling: TilingTuple | None = None
+  input_buffer_count: InputBufferCount = 2
 
 
 # A temporary lookup table for optimized configs.
 # TODO: formally add autotuning to the vjp.
 GMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
-    (262144, 7168, 2048, 256): (256, 7168, 512),
+    (262144, 7168, 2048, 256, False): ((256, 7168, 512), 2),
+    (262144, 7168, 2048, 256, True): ((128, 7168, 2048), 2),
+    (262144, 2048, 7168, 256, False): ((128, 2048, 3584), 2),
+    (262144, 2048, 7168, 256, True): ((256, 2048, 3584), 3),
 }
 GMM_RHS_TRANSPOSE_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
-    (262144, 7168, 2048, 256): (256, 2048, 1792),
+    (262144, 7168, 2048, 256, False): ((256, 2048, 1792), 2),
+    (262144, 7168, 2048, 256, True): ((256, 2048, 3584), 2),
+    (262144, 2048, 7168, 256, False): ((256, 7168, 512), 2),
+    (262144, 2048, 7168, 256, True): ((256, 7168, 1024), 2),
 }
 TGMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
-    (262144, 7168, 2048, 256): (512, 1024, 2048)
+    (262144, 7168, 2048, 256, False): ((512, 1024, 2048), 3),
+    (262144, 7168, 2048, 256, True): ((512, 1024, 2048), 2),
+    (262144, 2048, 7168, 256, False): ((256, 2048, 1024), 3),
+    (262144, 2048, 7168, 256, True): ((512, 512, 3584), 2),
 }
 
 # Ragged dot dimension numbers supported by the megablox kernel.
@@ -180,6 +192,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           out_dtype=preferred_element_type,
           tiling=config.gmm_tiling,
           interpret=self.interpret,  # pytype: disable=attribute-error
+          input_buffer_count=config.input_buffer_count,
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
       # here, handle fast-path special cases that arise in backwards gmm
@@ -204,6 +217,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           tiling=config.gmm_rhs_transpose_tiling or config.gmm_tiling,
           transpose_rhs=True,
           interpret=self.interpret,  # pytype: disable=attribute-error
+          input_buffer_count=config.input_buffer_count,
       )
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
       lhs_trans = jax.tree.map(lambda x: x.mT, lhs)
@@ -229,6 +243,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           out_dtype=preferred_element_type,
           tiling=config.tgmm_tiling or config.gmm_tiling,
           interpret=self.interpret,  # pytype: disable=attribute-error
+          input_buffer_count=config.input_buffer_count,
       )
     else:
       raise NotImplementedError(
@@ -238,32 +253,48 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     lhs, rhs = ba.arguments["lhs"], ba.arguments["rhs"]
+
+    # this is generally an incorrect assumption, but ok for a heuristic
+    is_quantized = (isinstance(lhs, QuantizedArray)
+                    or isinstance(rhs, QuantizedArray))
+
     ragged_dot_dimension_numbers = ba.arguments.get(
         "ragged_dot_dimension_numbers", DEFAULT_RAGGED_DOT_DIM_NUMS
     )
     default_config = Config()
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
       (m, k), (g, _, n) = lhs.shape, rhs.shape
-      return Config(gmm_tiling=GMM_TILING_TUNED_LUT.get(
-          (m, k, n, g), default_config.gmm_tiling
-      ))
+      lut_key = (m, k, n, g, is_quantized)
+      if lut_key in GMM_TILING_TUNED_LUT:
+        gmm_tiling, input_buffer_count = GMM_TILING_TUNED_LUT[lut_key]
+        return Config(gmm_tiling=gmm_tiling,
+                      input_buffer_count=input_buffer_count)
+      return default_config
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:
       grad = lhs
       (m, n), (g, k, _) = grad.shape, rhs.shape  # lhs is out
-      return Config(
-          gmm_rhs_transpose_tiling=GMM_RHS_TRANSPOSE_TILING_TUNED_LUT.get(
-              (m, k, n, g), default_config.gmm_tiling
-          )
-      )
+      lut_key = (m, k, n, g, is_quantized)
+      if lut_key in GMM_RHS_TRANSPOSE_TILING_TUNED_LUT:
+        gmm_rhs_transpose_tiling, input_buffer_count = (
+            GMM_RHS_TRANSPOSE_TILING_TUNED_LUT[lut_key]
+        )
+        return Config(
+            gmm_rhs_transpose_tiling=gmm_rhs_transpose_tiling,
+            input_buffer_count=input_buffer_count,
+        )
+      return default_config
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:
       group_sizes = ba.arguments["group_sizes"]
       grad = rhs
       if isinstance(group_sizes, base.GroupSizes):
         group_sizes = jnp.array(group_sizes)
       (m, k), (_, n), g = lhs.shape, grad.shape, group_sizes.shape[0]
-      return Config(tgmm_tiling=TGMM_TILING_TUNED_LUT.get(
-          (m, k, n, g), default_config.gmm_tiling
-      ))
+      lut_key = (m, k, n, g, is_quantized)
+      if lut_key in TGMM_TILING_TUNED_LUT:
+        tgmm_tiling, input_buffer_count = TGMM_TILING_TUNED_LUT[lut_key]
+        return Config(tgmm_tiling=tgmm_tiling,
+                      input_buffer_count=input_buffer_count)
+      return default_config
     else:
       raise NotImplementedError(
           UNSUPPORTED_DIMENSIONS_MSG.format(ragged_dot_dimension_numbers)

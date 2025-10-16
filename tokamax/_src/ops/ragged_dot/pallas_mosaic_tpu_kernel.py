@@ -266,6 +266,7 @@ _TilingFn = Callable[[int, int, int], tuple[int, int, int] | None]
         "tiling",
         "transpose_rhs",
         "interpret",
+        "input_buffer_count",
     ],
 )
 def gmm(
@@ -274,6 +275,7 @@ def gmm(
     group_sizes: jax.Array,
     out_dtype: jnp.dtype,
     tiling: tuple[int, int, int] | _TilingFn | None = (128, 128, 128),
+    input_buffer_count: int = 2,
     group_offset: jax.Array | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
@@ -456,6 +458,7 @@ def gmm(
       cost_estimate=cost_estimate,
       name=kernel_name,
       metadata=dict(xprof_metadata=json.dumps(metadata)),
+      input_buffer_count=(input_buffer_count, 2),  # rhs always default buffered
   )
 
   with jax.named_scope(kernel_name):
@@ -477,6 +480,7 @@ def gmm(
         "tiling",
         "num_actual_groups",
         "interpret",
+        "input_buffer_count",
     ],
 )
 def tgmm(
@@ -485,6 +489,7 @@ def tgmm(
     group_sizes: jax.Array,
     out_dtype: jnp.dtype,
     tiling: tuple[int, int, int] | _TilingFn | None = (128, 128, 128),
+    input_buffer_count: int = 2,
     group_offset: jax.Array | None = None,
     num_actual_groups: int | None = None,
     interpret: bool = False,
@@ -637,7 +642,7 @@ def tgmm(
       prefer_element_type=jnp.dtype(out_dtype).name,
       num_actual_groups=num_actual_groups,
   )
-  call_gmm = pl.pallas_call(
+  call_gmm = common.custom_buffered_pallas_call(
       kernel,
       out_shape=jax.ShapeDtypeStruct((num_actual_groups, k, n), out_dtype),
       grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -654,6 +659,7 @@ def tgmm(
       cost_estimate=cost_estimate,
       name=kernel_name,
       metadata=dict(xprof_metadata=json.dumps(metadata)),
+      input_buffer_count=(input_buffer_count, input_buffer_count),
   )
 
   with jax.named_scope(kernel_name):
