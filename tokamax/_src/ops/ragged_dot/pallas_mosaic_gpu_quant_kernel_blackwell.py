@@ -144,11 +144,12 @@ def ragged_dot_gpu_quant_blackwell_kernel(
     num_k_iters = pl.cdiv(k, block_k)
 
     # TODO: use emit_pipeline_warp_specialized, improve it if needed.
-    def mn_loop(m_offset, idx, carry):
+    def mn_loop(m_offset, loop_info: plgpu.NDLoopInfo, carry):
       if collective:
-        block_ni, tid_m, remainder_ni, cluster_idx = idx
+        block_ni, tid_m, remainder_ni, cluster_idx = loop_info.index
       else:
-        block_ni, tid_m, remainder_ni = idx
+        block_ni, tid_m, remainder_ni = loop_info.index
+        cluster_idx = 0
       tid_m += m_offset
       ni = block_ni * pl.cdiv(n, block_n * grid_block_n) + remainder_ni
       mi = block_gmem[tid_m]

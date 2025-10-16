@@ -237,8 +237,8 @@ def ragged_kernel(
       actual_size_gmem,
       *args,
   ):
-    def loop_body(m_offset, idx: Sequence[jax.Array]):
-      remainder_ni, mi, block_ni = idx
+    def loop_body(m_offset, loop_info: plgpu.NDLoopInfo):
+      remainder_ni, mi, block_ni = loop_info.index
       mi += m_offset
       ni = (
           block_ni
