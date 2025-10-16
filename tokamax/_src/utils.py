@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Tokamax utility functions."""
 
 from collections.abc import Callable, Sequence
-from typing import TypeVar
+from typing import Any, TypeVar
+
+import jax
 
 
-T = TypeVar('T')
+_T = TypeVar('_T')
 
 
 def exact_div(a: int | tuple[int, str], b: int | tuple[int, str]) -> int:
@@ -30,16 +33,32 @@ def exact_div(a: int | tuple[int, str], b: int | tuple[int, str]) -> int:
   return quotient
 
 
+def is_array_like(x: Any) -> bool:
+  """Returns whether `x` is an array-like value."""
+  return hasattr(x, 'shape') and hasattr(x, 'dtype')
+
+
+def flatten_arrays(
+    x: _T, is_leaf: Callable[[Any], bool] | None = None
+) -> tuple[list[Any], Callable[[Sequence[Any]], _T]]:
+  """Flattens value to a list of "array-like" values and recompose function."""
+  flat, tree = jax.tree.flatten(x, is_leaf=is_leaf)
+  arrays, other, merge = split_merge(is_array_like, flat)
+  recompose = lambda arrays: tree.unflatten(merge(arrays, other))
+  return arrays, recompose
+
+
 # Adapted from jax._src.util.split_merge in JAX v0.6.0.
 def split_merge(
-    predicate: Callable[[T], bool],
-    xs: Sequence[T]
-) -> tuple[list[T], list[T], Callable[[Sequence[T], Sequence[T]], list[T]]]:
+    predicate: Callable[[_T], bool], xs: Sequence[_T]
+) -> tuple[
+    list[_T], list[_T], Callable[[Sequence[_T], Sequence[_T]], list[_T]]
+]:
   """Splits a sequence based on a predicate, and returns a merge function."""
   sides = list(map(predicate, xs))
   lhs = [x for x, s in zip(xs, sides) if s]
   rhs = [x for x, s in zip(xs, sides) if not s]
-  def merge(new_lhs: Sequence[T], new_rhs: Sequence[T]) -> list[T]:
+  def merge(new_lhs: Sequence[_T], new_rhs: Sequence[_T]) -> list[_T]:
     out = []
     for s in sides:
       if s:
