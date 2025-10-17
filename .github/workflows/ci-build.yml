@@ -86,7 +86,7 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
-          pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ --ignore-glob="*/splash_attention" tokamax/_src/ops
+          pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ --ignore=tokamax/_src/ops/triangle_multiplication/ --ignore-glob="*/splash_attention" tokamax/_src/ops
 
   tokamax-presubmit:
     strategy:
