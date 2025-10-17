@@ -1542,7 +1542,6 @@ def _flash_attention_dkv_kernel(
   # Q_heads to 'see' the current KV_head).
 
   q_head = pl.program_id(0)
-  first_q_head_in_kv_group = lax.rem(q_head, q_heads_per_kv_head) == 0
 
   @pl.when(should_initialize)
   def init():
@@ -1655,15 +1654,20 @@ def _flash_attention_dkv_kernel(
     else:
       dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
-  @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
-  def _():
+  if q_heads_per_kv_head == 1:
     dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
     dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
+  else:
+    first_q_head_in_kv_group = lax.rem(q_head, q_heads_per_kv_head) == 0
+    @pl.when(jnp.logical_and(should_write, first_q_head_in_kv_group))
+    def _():
+      dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
+      dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
 
-  @pl.when(jnp.logical_and(should_write, _not(first_q_head_in_kv_group)))
-  def _():
-    dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
-    dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
+    @pl.when(jnp.logical_and(should_write, _not(first_q_head_in_kv_group)))
+    def _():
+      dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
+      dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
 
 
 def _splash_attention_bwd_dkv(
@@ -1862,16 +1866,22 @@ def _splash_attention_bwd_dkv(
       jax.ShapeDtypeStruct(k.shape, dk_type),
       jax.ShapeDtypeStruct(v.shape, dv_type),
   ]
-  in_specs += [dq_alias_spec, dk_spec, dv_spec]
+  in_specs += [dq_alias_spec]
+
+  if q_heads_per_kv_head != 1:
+    # in/out aliasing to accumulate within kv groups.
+    in_specs += [dk_spec, dv_spec]
+    dk = lax.empty(k.shape, dtype=dk_type)
+    dv = lax.empty(v.shape, dtype=dv_type)
+  else:
+    in_specs += [None, None]
+    dk, dv = None, None
   out_specs = [dq_spec, dk_spec, dv_spec]
 
   if mask_info.num_active_blocks is not None:
     grid_size = mask_info.num_active_blocks[0]
   else:
     grid_size = (kv_seq_len // bkv) * q_steps
-
-  dk = lax.empty(k.shape, dtype=dk_type)
-  dv = lax.empty(v.shape, dtype=dv_type)
   kernel = functools.partial(
       _flash_attention_dkv_kernel,
       mask_value=mask_value,
@@ -1923,12 +1933,16 @@ def _splash_attention_bwd_dkv(
       q_sequence,
   ]
   num_args = sum(1 for x in args if x is not None)
+  input_output_aliases = {}
   if config.use_fused_bwd_kernel:
     if dq_reduction_steps == 3:
-      input_output_aliases = {num_args: 0, num_args + 1: 1, num_args + 2: 2}
-    else:
+      if q_heads_per_kv_head != 1:
+        input_output_aliases = {num_args: 0, num_args + 1: 1, num_args + 2: 2}
+      else:
+        input_output_aliases = {num_args: 0}
+    elif q_heads_per_kv_head != 1:
       input_output_aliases = {num_args: 1, num_args + 1: 2}
-  else:
+  elif q_heads_per_kv_head != 1:
     input_output_aliases = {num_args: 0, num_args + 1: 1}
 
   scratch_shapes = [
