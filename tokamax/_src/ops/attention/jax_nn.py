@@ -15,6 +15,7 @@
 """`jax.nn.dot_product_attention` implementation of `DotProductAttention`."""
 
 import dataclasses
+import math
 from typing import Literal
 
 import jax
@@ -83,19 +84,19 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
     if q_indices is None and k_indices is None:
       mask, is_causal = mask.take("is_causal")
 
-    query_seq_lengths = None
+    q_seq_lengths = None
     if q_indices is None and (q_end := mask.q_end) is not None:
       q_end = jax.lax.broadcast_to_rank(q_end, q.ndim - 1)
       if q_end.shape[-2:] == (1, 1):
         mask, _ = mask.take("q_end")
-        query_seq_lengths = q_end[..., 0, 0]
+        q_seq_lengths = q_end[..., 0, 0]
 
-    key_value_seq_lengths = None
+    kv_seq_lengths = None
     if k_indices is None and (k_end := mask.k_end) is not None:
       k_end = jax.lax.broadcast_to_rank(k_end, q.ndim - 1)
       if k_end.shape[-2:] == (1, 1):
         mask, _ = mask.take("k_end")
-        key_value_seq_lengths = k_end[..., 0, 0]
+        kv_seq_lengths = k_end[..., 0, 0]
 
     q_len_or_indices = q_indices if q_indices is not None else q.shape[-3]
     k_len_or_indices = k_indices if k_indices is not None else k.shape[-3]
@@ -108,16 +109,17 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
     pad_head_dim = lambda x: shape_lib.pad_dim_to(x, max_head_dim, -1)
     q, k, v = map(pad_head_dim, (q, k, v))
 
-    def flatten_batch(x, rank=q.ndim):
+    def flatten_batch(x, rank=q.ndim, always_bcast=False):
       if x is None:
         return None
       x = jax.lax.broadcast_to_rank(x, rank)
-      x = jnp.broadcast_to(x, (*batch, *x.shape[len(batch) :]))
+      if always_bcast or math.prod(x.shape[: len(batch)]) > 1:
+        x = jnp.broadcast_to(x, (*batch, *x.shape[len(batch) :]))
       return jax.lax.collapse(x, 0, len(batch))
 
     q, k, v, bias, mask = map(flatten_batch, (q, k, v, bias, mask))
-    query_seq_lengths = flatten_batch(query_seq_lengths, len(batch))
-    key_value_seq_lengths = flatten_batch(key_value_seq_lengths, len(batch))
+    q_seq_lengths = flatten_batch(q_seq_lengths, len(batch), True)
+    kv_seq_lengths = flatten_batch(kv_seq_lengths, len(batch), True)
 
     # CuDNN doesn't support mask/bias implicitly broadcast along sequences.
     if self.implementation == "cudnn":
@@ -135,8 +137,8 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
           mask=mask,
           is_causal=is_causal,
           scale=logits_scale,
-          query_seq_lengths=query_seq_lengths,
-          key_value_seq_lengths=key_value_seq_lengths,
+          query_seq_lengths=q_seq_lengths,
+          key_value_seq_lengths=kv_seq_lengths,
           implementation=self.implementation,
       )
     out = out.reshape(*batch, seq_len_q, num_heads, out.shape[-1])
