@@ -100,7 +100,7 @@ class Autotuner:
       futures.ThreadPoolExecutor
   )
   executor_fn: Callable[[], futures.Executor] = _SyncExecutor
-  timeout_seconds: float = 60.0
+  timeout_seconds: float = 120.0
 
   def autotune(
       self,
