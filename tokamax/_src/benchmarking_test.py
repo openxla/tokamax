@@ -131,8 +131,15 @@ class BenchmarkingTest(parameterized.TestCase):
 
     f_vmap = jax.vmap(f_orig, in_axes=(0, (None, 0)))
     f_vmap = jax.vmap(f_vmap, in_axes=(0, (1, None)))
-    x, y = numerics.random_initialize((x, y), seed=seed)
-    chex.assert_trees_all_equal(f_vmap(x, y), f(args))
+    x_init, y_init = numerics.random_initialize((x, y), seed=seed)
+    chex.assert_trees_all_equal(f_vmap(x_init, y_init), f(args))
+
+    _, args_abstract = benchmarking.standardize_function(
+        f_orig, x, y, seed=None
+    )
+    self.assertEqual(args_abstract[0].__class__, jax.ShapeDtypeStruct)
+    out_shape = jax.eval_shape(f, args_abstract)
+    chex.assert_trees_all_equal_shapes(out_shape, f(args))
 
   @parameterized.parameters(benchmarking._TIMERS.keys())
   def test_compile_benchmark(self, method):

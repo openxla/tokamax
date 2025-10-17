@@ -217,7 +217,9 @@ def standardize_function(
         'forward', 'forward_res', 'vjp', 'forward_and_vjp'
     ] = 'forward',
     seed: int | None = 0,
-) -> tuple[Callable[[list[jax.Array]], RetT], list[jax.Array]]:
+) -> tuple[
+    Callable[[list[jax.Array]], RetT], list[jax.Array | jax.ShapeDtypeStruct]
+]:
   """Creates a standardized function for testing and benchmarking.
 
   Any jax.ShapeDtypeStruct in kwargs is initialized randomly. In addition,
@@ -235,7 +237,8 @@ def standardize_function(
       'forward_and_vjp' computes a full forward and VJP pass. Note that 'vjp'
       will bake in all intermediates into the HLO, which can cause OOM errors.
     seed: The seed used for initializing arrays. If `None`, the arguments are
-      not initialized.
+      not initialized, but any `batching.BatchedShapeDtype` objects are
+      conformed to `jax.ShapeDtypeStruct`s.
 
   Returns:
     A tuple `(new_function, array_args)`, where `array_args` is a list of all
@@ -266,7 +269,17 @@ def standardize_function(
       for in_axes in reversed(list(zip(*array_vmap_axes, strict=True))):
         forward = jax.vmap(forward, in_axes=(list(in_axes),))
 
-  if seed is not None:
+  if seed is None:
+    # `standardize_function` should be idempotent, but the vmaps added to
+    # functions with `BatchedShapeDtype` arguments would be added twice unless
+    # `BatchedShapeDtype` is converted to `jax.ShapeDtypeStruct`s.
+    def convert_batched(x):
+      if isinstance(x, batching.BatchedShapeDtype):
+        return jax.ShapeDtypeStruct(x.shape, x.dtype)
+      return x
+
+    arrays = [convert_batched(x) for x in arrays]
+  else:
     arrays = numerics.random_initialize(arrays, seed=seed)
 
   if mode == 'forward':
@@ -383,8 +396,11 @@ def compile_benchmark(
     Returns:
       A `BenchmarkData` object.
     """
-    concrete_inputs = [z for z in jax.tree.leaves(x)
-                       if isinstance(z, jax.Array) and jax.core.is_concrete(z)]
+    concrete_inputs = [
+        z
+        for z in jax.tree.leaves(x)
+        if isinstance(z, jax.Array) and jax.core.is_concrete(z)
+    ]
     if concrete_inputs:
       platform = list(concrete_inputs[0].devices())[0].platform
     else:
