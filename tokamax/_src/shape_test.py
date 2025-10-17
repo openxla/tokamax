@@ -14,12 +14,20 @@
 # ==============================================================================
 
 from absl.testing import absltest
+import chex
 import jax
 import jax.numpy as jnp
 from tokamax._src import shape
 
 
 class ShapeTest(absltest.TestCase):
+
+  def test_upcast_broadcast(self):
+    x = jnp.ones((3,), jnp.bfloat16)
+    with shape.upcast_broadcast():
+      y, vjp_fn = jax.vjp(lambda x: jnp.broadcast_to(x, (1024, 3)), x)
+    dy = jax.random.normal(jax.random.PRNGKey(0), y.shape, jnp.bfloat16)
+    chex.assert_trees_all_equal(vjp_fn(dy), (jnp.sum(dy, axis=0),))
 
   def test_contains_symbolic_shape(self):
     (a,) = jax.export.symbolic_shape('a')
