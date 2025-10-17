@@ -23,6 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
+from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_config
@@ -215,3 +216,6 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
           config = Config(block_m=block_m, block_n=None, num_warps=num_warps)
           configs.add(config)
     return configs
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return triton_lib.has_triton_support(device)

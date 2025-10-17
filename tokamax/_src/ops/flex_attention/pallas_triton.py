@@ -28,6 +28,7 @@ import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import quantization
+from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.flex_attention import base
 from tokamax._src.pallas import block
@@ -522,3 +523,6 @@ class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
                 )
             )
     return configs
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return triton_lib.has_triton_support(device)

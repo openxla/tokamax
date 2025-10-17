@@ -15,15 +15,18 @@
 """Mosaic-GPU utils."""
 
 import jax
+from jax.extend import backend
 from tokamax._src import config as config_lib
 
 
-def has_mosaic_gpu_support() -> bool:
+def has_mosaic_gpu_support(device: jax.Device | None = None) -> bool:
   if config_lib.cross_compile.value:
     return True
+  if device is None:
+    device = backend.get_default_device()
 
-  if jax.default_backend() != 'gpu':
+  if device.platform != 'gpu':
     return False
 
   # Only currently supported for Hopper and above.
-  return float(jax.devices()[0].compute_capability) >= 9.0
+  return float(device.compute_capability) >= 9.0

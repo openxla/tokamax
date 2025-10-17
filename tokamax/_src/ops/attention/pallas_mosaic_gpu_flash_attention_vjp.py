@@ -29,6 +29,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mosaic_gpu_lib
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -898,3 +899,6 @@ class PallasMosaicGpuFlashAttentionVjp(
         block_kv_dq=64,
         num_stages=2,
     )
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return mosaic_gpu_lib.has_mosaic_gpu_support(device)

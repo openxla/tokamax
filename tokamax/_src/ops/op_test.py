@@ -111,6 +111,7 @@ class OpTest(parameterized.TestCase):
     config = ba.get_config(check_autotuning_cache=False)
     self.assertIs(config, _HEURISTICS_CONFIG)
     self.assertIs(ba.get_config(), tune_config)
+    self.assertTrue(_FakeOp().supported_on(jax.devices()[0]))
 
   def test_default_config(self):
     cache = _FakeOp().get_autotuning_cache()

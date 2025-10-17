@@ -24,6 +24,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-importing-member,g-multiple-import
+from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.pallas import block
@@ -206,3 +207,6 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
         num_warps=4,
         num_stages=4,
     )
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return triton_lib.has_triton_support(device)

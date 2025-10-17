@@ -22,6 +22,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
+from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_config
@@ -193,3 +194,6 @@ class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
         elif 2 * block_m * dout_shape[1] <= _NUM_REGISTERS_PER_SM:
           configs.add(config)
     return configs
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return triton_lib.has_triton_support(device)

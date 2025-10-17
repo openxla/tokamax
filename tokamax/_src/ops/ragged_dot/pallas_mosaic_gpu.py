@@ -214,3 +214,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
           f"Autotuning not supported for device kind: {device_kind}"
       )
     return configs
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return mosaic_gpu_lib.has_mosaic_gpu_support(device)

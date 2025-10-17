@@ -439,3 +439,6 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
                     )
                 )
     return configs
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return triton_lib.has_triton_support(device)

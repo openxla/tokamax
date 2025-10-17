@@ -141,3 +141,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       )
     out = out.reshape(*batch, seq_len_q, num_heads, out.shape[-1])
     return out[..., :head_dim_out], None
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return self.implementation != "cudnn" or device.platform == "gpu"
+

@@ -325,6 +325,11 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 
   __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
+  def supported_on(self, device: jax.Device) -> bool:
+    """Returns whether this op runs on the given device."""
+    del device  # Unused.
+    return True
+
 
 _AUTOTUNING_CACHE: dict[
     Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]

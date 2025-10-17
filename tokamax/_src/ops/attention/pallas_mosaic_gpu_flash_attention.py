@@ -676,6 +676,9 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     # This is a pretty good option that works for most cases.
     return Config(block_q=64, block_kv=64, num_stages=2)
 
+  def supported_on(self, device: jax.Device) -> bool:
+    return mosaic_gpu.has_mosaic_gpu_support(device)
+
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     q, k, _ = ba.args
     block_qs = set([

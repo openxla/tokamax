@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import batching
 from tokamax._src import jaxtyping
+from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.pallas import block
@@ -570,3 +571,6 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
         num_warps=4,
         num_stages=2,  # 5,
     )
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return triton_lib.has_triton_support(device)

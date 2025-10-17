@@ -23,6 +23,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 import pydantic
+from tokamax._src import mosaic_tpu
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
@@ -307,3 +308,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         Config(gmm_tiling=(tile_m, tile_k, tile_n))
         for tile_m, tile_k, tile_n in itertools.product(*([tile_range] * 3))
     )
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu" and mosaic_tpu.tpu_generation() >= 5
+
