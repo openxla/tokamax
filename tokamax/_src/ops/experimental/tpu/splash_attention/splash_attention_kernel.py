@@ -1844,12 +1844,14 @@ def _splash_attention_bwd_dkv(
     if dq_reduction_steps is None:
       dq_index_map = unravel(lambda h, i, j, *_: (j, h, i, 0))
       dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
-      dq_shape = jax.ShapeDtypeStruct((kv_steps, *q.shape), jnp.float32)
+      # Only accumulate in fp32 if there's a small number of reduction steps.
+      q_dtype = q.dtype if kv_steps <= 4 else jnp.float32
+      dq_shape = jax.ShapeDtypeStruct((kv_steps, *q.shape), q_dtype)
     elif dq_reduction_steps == 3:
       dq_index_map = unravel(lambda h, i, j, *_: (j % 3, h, i, 0))
       dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
       dq_alias_spec = dq_spec
-      dq_shape = jax.ShapeDtypeStruct((3, *q.shape), jnp.float32)
+      dq_shape = jax.ShapeDtypeStruct((3, *q.shape), q.dtype)
       dq = jnp.zeros_like(dq_shape)
 
     if bkv == bkv_compute:
@@ -1857,9 +1859,13 @@ def _splash_attention_bwd_dkv(
     else:
       dq_scratch = pltpu.VMEM((bq, head_dim_qk), jnp.float32)
 
-  # TODO: Investigate compiler bug with bf16 dtypes.
-  dk_type = jnp.float32
-  dv_type = jnp.float32
+  if q_heads_per_kv_head == 1:
+    dk_type = k.dtype
+    dv_type = v.dtype
+  else:
+    # Keep gradients in fp32 when accumulating over head groups.
+    dk_type = jnp.float32
+    dv_type = jnp.float32
 
   out_shapes = [
       dq_shape,
