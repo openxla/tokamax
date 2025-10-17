@@ -15,7 +15,7 @@ authors = [
 
 description = "A Pallas Custom Kernel Library."
 readme = "README.md"
-version = "0.0.2"
+version = "0.0.3"
 license = {file = "LICENSE"}
 requires-python = ">=3.11"
 dependencies = [
@@ -23,8 +23,8 @@ dependencies = [
     "chex>=0.1.81",
     "einshape",
     "google-benchmark>=1.9.0",
-    "jax>=0.7.2",
-    "jaxlib>=0.7.2",
+    "jax>=0.8.0",
+    "jaxlib>=0.8.0",
     "jaxtyping>=0.3",
     "protobuf",
     "pydantic>=2.11.0",
@@ -43,11 +43,11 @@ test = [
 ]
 
 cuda = [
-    "jax[cuda12]>=0.7.2",
+    "jax[cuda12]>=0.8.0",
     "nvidia-cudnn-cu12>=9.0.0",
     "triton>=3.0.0",
 ]
 
 tpu = [
-    "jax[tpu]>=0.7.2",
+    "jax[tpu]>=0.8.0",
 ]
