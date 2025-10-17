@@ -167,11 +167,7 @@ class DotProductAttentionTest(parameterized.TestCase):
       custom_mask = jnp.tril(jnp.ones((T, S), dtype=jnp.bool_))
       mask = custom_mask[None, None, :, :]
     if 'bias' in mask_mode:
-      # Tokamax calculates dbias in f32, so use an f32 bias
-      # to reduce ref error. When CuDNN is used, the bias in f32 causes NaNs
-      # (see https://github.com/jax-ml/jax/issues/32242).
-      bias_dtype = dtype if cudnn_bias else jnp.float32
-      bias = jax.random.normal(keys[4], (1, N, T, S), bias_dtype)
+      bias = jax.random.normal(keys[4], (1, N, T, S), dtype)
     if 'sliding_window' in mask_mode:
       window_size = (3, 2) if is_causal else (3, 0)
 
@@ -229,8 +225,6 @@ class DotProductAttentionTest(parameterized.TestCase):
     # TODO: Fix test for 'xla_chunked' on TPU.
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
       self.skipTest(f'{self.IMPL} not supported on TPU')
-    if self.IMPL == 'cudnn' and batch_size != 1:
-      self.skipTest('batch_size != 1 not supported for bias gradient in cudnn')
 
     dtype = jnp.bfloat16
     B, S, N, H = batch_size, 128, 4, 64
