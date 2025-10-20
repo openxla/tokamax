@@ -555,8 +555,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       dbias = None
     else:
       broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
-      dbias = jnp.sum(ds, axis=broadcast_bias_axes, keepdims=True)
-      dbias = dbias.reshape(orig_bias_shape)
+      dbias = jnp.sum(ds, axis=broadcast_bias_axes).reshape(orig_bias_shape)
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
