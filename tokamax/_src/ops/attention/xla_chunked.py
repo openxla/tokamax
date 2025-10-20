@@ -88,6 +88,7 @@ def _attend_chunk(
     logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
     loc_x_max = jnp.max(logits, axis=-1)
     new_x_max = jnp.maximum(x_max, loc_x_max)
+    new_x_max = jax.lax.stop_gradient(new_x_max)
     weights = jnp.exp(logits - new_x_max[..., None])
     alpha = jnp.exp(x_max - new_x_max)
 
