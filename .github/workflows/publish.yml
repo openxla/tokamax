@@ -36,7 +36,7 @@ jobs:
         python -m pip install --upgrade pip
         python -m pip --version
         python -m pip install build
-        python -m pip install install -e .[cuda,tpu,test]
+        python -m pip install -e .[cuda,tpu,test]
         python -m pip freeze
 
     # Publish the package
