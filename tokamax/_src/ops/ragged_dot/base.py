@@ -27,6 +27,7 @@ from pydantic_core import core_schema as cs
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
+from typing_extensions import override
 
 
 _Config = TypeVar("_Config")
@@ -110,6 +111,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   For use in MegaBlocks-style models: https://arxiv.org/abs/2211.15841.
   """
 
+  @override
   def bind(
       self,
       lhs: jax.Array | QuantizedArray,
@@ -156,6 +158,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         return_residuals=return_residuals,
     )
 
+  @override
   def _fwd(
       self,
       lhs: jax.Array | QuantizedArray,

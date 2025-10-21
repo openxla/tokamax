@@ -17,6 +17,7 @@
 import dataclasses
 import functools
 from typing import ClassVar
+
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
@@ -32,6 +33,7 @@ from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.flex_attention import base
 from tokamax._src.pallas import block
+from typing_extensions import override
 
 ScoreMod = base.ScoreMod
 MaskMod = base.MaskMod
@@ -441,6 +443,7 @@ class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
   use_stable_softmax: bool = True
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
@@ -478,6 +481,7 @@ class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
         normalize_output=normalize_output,
     )
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     q, k, v = ba.args
     *_, seq_len_q, _, head_dim = q.shape
@@ -506,6 +510,7 @@ class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
         num_stages=num_stages,
     )
 
+  @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     q, k, _ = ba.args
     clamp = lambda lo, x, hi: max(lo, min(x, hi))
@@ -524,5 +529,6 @@ class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
             )
     return configs
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return triton_lib.has_triton_support(device)

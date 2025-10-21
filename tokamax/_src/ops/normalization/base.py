@@ -22,6 +22,7 @@ import jax
 from jax.experimental.pallas import fuser
 import jax.numpy as jnp
 from tokamax._src.ops import op
+from typing_extensions import override
 
 
 _Config = TypeVar("_Config")
@@ -33,6 +34,7 @@ Residuals: TypeAlias = tuple[jax.Array | None, jax.Array]  # mean, rstddev
 class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   """Normalization op."""
 
+  @override
   def bind(
       self,
       x: jax.Array | Callable[[], jax.Array],
@@ -95,6 +97,7 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         return_residuals=return_residuals,
     )
 
+  @override
   def _fwd(
       self,
       x: jax.Array | FusedInputArray,
@@ -135,6 +138,7 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 class NormalizationVjp(op.Op[Any, Any, types.NoneType, _Config, _Key]):
   """Normalization VJP."""
 
+  @override
   def _fwd(
       self,
       residuals: Residuals,

@@ -26,6 +26,7 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.flex_attention import base
+from typing_extensions import override
 
 
 Mask = attn_base.Mask
@@ -41,6 +42,7 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
   impl: Annotated[base.FlexAttention, pydantic.AnyInstanceOf]
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],

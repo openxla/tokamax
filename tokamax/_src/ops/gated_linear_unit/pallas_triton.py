@@ -19,6 +19,7 @@ import dataclasses
 import functools
 import math
 from typing import ClassVar
+
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
@@ -29,6 +30,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.pallas import block
 from tokamax._src.pallas import grid
+from typing_extensions import override
 
 
 Residuals = base.Residuals
@@ -106,6 +108,7 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
 
+  @override
   def _fwd(
       self,
       x: Float[Array, '*B M K'],
@@ -192,6 +195,7 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
     fn = self._with_vmap(fn, fallback_to_sequential=False)
     return fn(x, weights)
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     x, weights = ba.args  # TODO: Use batched args.
     m = math.prod(x.shape[:-1])
@@ -208,5 +212,6 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
         num_stages=4,
     )
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return triton_lib.has_triton_support(device)

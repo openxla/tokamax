@@ -29,6 +29,7 @@ from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_config
 from tokamax._src.ops.normalization import pallas_triton_vjp
 from tokamax._src.pallas import block
+from typing_extensions import override
 
 
 Config: TypeAlias = pallas_triton_config.Config
@@ -92,6 +93,7 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
       vjp = pallas_triton_vjp.PallasTritonNormalizationVjp()
       object.__setattr__(self, 'vjp', vjp)
 
+  @override
   def _fwd(
       self,
       x: jax.Array | FusedInputArray,
@@ -182,15 +184,18 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
 
     return y, (mean, rstddev) if return_residuals else None
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     return pallas_triton_config.get_heuristics_config(
         *ba.args, vmap_axis_sizes=ba.batched.vmap_axis_sizes, **ba.kwargs
     )
 
+  @override
   def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
     # TODO: Use batched args.
     return pallas_triton_config.get_key(*ba.args, **ba.kwargs)
 
+  @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     x = ba.args[0]
     axis = ba.kwargs['axis']
@@ -217,5 +222,6 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
           configs.add(config)
     return configs
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return triton_lib.has_triton_support(device)

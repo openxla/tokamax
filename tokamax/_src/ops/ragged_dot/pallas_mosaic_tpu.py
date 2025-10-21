@@ -20,6 +20,7 @@ import itertools
 import logging
 import types
 from typing import ClassVar
+
 import jax
 import jax.numpy as jnp
 import pydantic
@@ -29,6 +30,7 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
+from typing_extensions import override
 
 
 TilingTuple = tuple[
@@ -138,6 +140,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           self, "vjp", partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)
       )
 
+  @override
   def _fwd(
       self,
       lhs: jax.Array | QuantizedArray,
@@ -252,6 +255,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       )
     return out, None
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     lhs, rhs = ba.arguments["lhs"], ba.arguments["rhs"]
 
@@ -301,6 +305,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           UNSUPPORTED_DIMENSIONS_MSG.format(ragged_dot_dimension_numbers)
       )
 
+  @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     lhs, rhs = ba.arguments["lhs"], ba.arguments["rhs"]
 
@@ -318,5 +323,6 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         )
     )
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return device.platform == "tpu" and mosaic_tpu.tpu_generation() >= 5

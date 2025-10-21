@@ -24,6 +24,7 @@ from tokamax._src import ad
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
+from typing_extensions import override
 
 
 _T = TypeVar('_T')
@@ -41,6 +42,7 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     if (self.vjp is None) and (type(self) is not GatedLinearUnit):  # pylint: disable=unidiomatic-typecheck
       object.__setattr__(self, 'vjp', GatedLinearUnitVjp())
 
+  @override
   def bind(
       self,
       x: jax.Array,
@@ -61,6 +63,7 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     )
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       x: Float[Array, '*B M K'],
@@ -137,6 +140,7 @@ class GatedLinearUnitVjp(
 ):
   """Gated linear unit VJP."""
 
+  @override
   def _fwd(
       self,
       residuals: Residuals,

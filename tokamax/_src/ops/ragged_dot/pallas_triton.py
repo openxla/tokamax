@@ -18,6 +18,7 @@ import dataclasses
 import functools
 import math
 from typing import ClassVar
+
 import jax
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
@@ -28,6 +29,7 @@ from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.pallas import block
+from typing_extensions import override
 
 
 Residuals = base.Residuals
@@ -342,6 +344,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       vjp = functools.partial(base.vjp, dlhs_ragged_dot=f, drhs_ragged_dot=f)
       object.__setattr__(self, "vjp", vjp)
 
+  @override
   def _fwd(
       self,
       lhs: jax.Array | QuantizedArray,
@@ -395,6 +398,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
 
     raise NotImplementedError("Unsupported `ragged_dot_dimension_numbers`.")
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     m = ba.args[0].shape[0]  # TODO: Respect ragged dot dim nums.
     return Config(  # TODO: Create heuristics.
@@ -405,6 +409,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
         num_stages=4,
     )
 
+  @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     lhs, rhs = ba.args
     m, k = lhs.shape
@@ -440,5 +445,6 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
                 )
     return configs
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return triton_lib.has_triton_support(device)

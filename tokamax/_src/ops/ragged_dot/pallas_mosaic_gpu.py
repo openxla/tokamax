@@ -30,6 +30,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel as non_qua
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel as quant_kernel
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel_blackwell as quant_kernel_blackwell
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_kernel as quant_ws_kernel
+from typing_extensions import override
 
 Config = common.Config
 QuantizedArray = quantization.QuantizedArray
@@ -52,6 +53,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
       # TODO: Use kernel for vjp.
       object.__setattr__(self, "vjp", base.vjp)
 
+  @override
   def _fwd(
       self,
       lhs: jax.Array | QuantizedArray,
@@ -105,6 +107,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
     )
     return out, None
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> common.Config:
     _, rhs = ba.args
     device_kind = backend.get_default_device().device_kind.lower()
@@ -126,6 +129,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
         grid_block_n=1,
     )
 
+  @override
   def _get_autotuning_configs(
       self, ba: op.BoundArguments
   ) -> set[common.Config]:
@@ -215,5 +219,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
       )
     return configs
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return mosaic_gpu_lib.has_mosaic_gpu_support(device)

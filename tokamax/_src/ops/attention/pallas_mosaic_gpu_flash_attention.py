@@ -35,6 +35,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention_vjp as vjp
 from tokamax._src.pallas import block
+from typing_extensions import override
 
 
 # pylint: disable=cell-var-from-loop
@@ -565,6 +566,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       object.__setattr__(self, "vjp", vjp_)
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
@@ -642,6 +644,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         config=config,
     )
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments):
     q, k, v = ba.batched.args
     seq_len_k, _, head_dim = k.shape[-3:]
@@ -676,9 +679,11 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     # This is a pretty good option that works for most cases.
     return Config(block_q=64, block_kv=64, num_stages=2)
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return mosaic_gpu.has_mosaic_gpu_support(device)
 
+  @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     q, k, _ = ba.args
     block_qs = set([

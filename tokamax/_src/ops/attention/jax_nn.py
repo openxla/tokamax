@@ -26,6 +26,7 @@ from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
+from typing_extensions import override
 
 
 Mask = base.Mask
@@ -40,6 +41,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
   implementation: Literal["xla", "cudnn"] | None = None
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
@@ -144,6 +146,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
     out = out.reshape(*batch, seq_len_q, num_heads, out.shape[-1])
     return out[..., :head_dim_out], None
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return self.implementation != "cudnn" or device.platform == "gpu"
 

@@ -31,6 +31,7 @@ from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
+from typing_extensions import override
 
 
 class AUTO:  # Used as a sentinel value.
@@ -478,6 +479,7 @@ class DotProductAttention(
         q, k, v, bias, mask, dropout_mask, paging_info, q_indices, k_indices
     )
 
+  @override
   def bind(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
@@ -561,6 +563,7 @@ class DotProductAttention(
     )
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
@@ -696,6 +699,7 @@ class DotProductAttentionVjp(
   """Dot product attention VJP."""
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       residuals: Residuals,

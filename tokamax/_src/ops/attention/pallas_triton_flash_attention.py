@@ -17,6 +17,7 @@
 import dataclasses
 import functools
 from typing import ClassVar
+
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
@@ -33,6 +34,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp as vjp
 from tokamax._src.pallas import block
+from typing_extensions import override
 
 Mask = base.Mask
 QuantizedArray = quantization.QuantizedArray
@@ -538,6 +540,7 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       object.__setattr__(self, "vjp", vjp.PallasTritonFlashAttentionVjp())
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
@@ -634,6 +637,7 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       residuals = (jnp.squeeze(m_max, -3), l_sum)
     return out, (residuals if return_residuals else None)
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     q, k, v = ba.args[:3]
     *_, seq_len_q, _, head_dim = q.shape
@@ -662,6 +666,7 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
         num_stages=num_stages,
     )
 
+  @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     q, k, _ = ba.args
     clamp = lambda lo, x, hi: max(lo, min(x, hi))
@@ -680,5 +685,6 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
             )
     return configs
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return triton_lib.has_triton_support(device)

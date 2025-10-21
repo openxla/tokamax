@@ -17,19 +17,21 @@
 import dataclasses
 import functools
 from typing import ClassVar
+
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import pydantic
 from tokamax._src import batching
 from tokamax._src import jaxtyping
+from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.pallas import block
-import pydantic
-from tokamax._src import pydantic as pydantic_lib
+from typing_extensions import override
 
 Mask = base.Mask
 Residuals = base.Residuals
@@ -483,6 +485,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
 
+  @override
   def _fwd(
       self,
       residuals: Residuals,
@@ -558,6 +561,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       dbias = jnp.sum(ds, axis=broadcast_bias_axes).reshape(orig_bias_shape)
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     # TODO: Heuristics.
     return Config(
@@ -571,5 +575,6 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
         num_stages=2,  # 5,
     )
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return triton_lib.has_triton_support(device)

@@ -28,6 +28,7 @@ from tokamax._src import jaxtyping
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
+from typing_extensions import override
 
 
 Mask = base.Mask
@@ -294,6 +295,7 @@ class XlaChunkedDotProductAttention(
   chunk_size: int = 128
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],

@@ -30,6 +30,7 @@ dependencies = [
     "pydantic>=2.11.0",
     "tensorflow",
     "tqdm",
+    "typing_extensions>=4.5.0",
     "typeguard==2.13.3",
     "xprof",
     "hypothesis",

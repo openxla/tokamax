@@ -33,6 +33,7 @@ from tokamax._src import mosaic_gpu as mosaic_gpu_lib
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
+from typing_extensions import override
 
 Mask = base.Mask
 Residuals = base.Residuals
@@ -825,6 +826,7 @@ class PallasMosaicGpuFlashAttentionVjp(
   use_base2: bool = False
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       residuals: Residuals,
@@ -891,6 +893,7 @@ class PallasMosaicGpuFlashAttentionVjp(
     dq, dk, dv, dbias = f(*args)
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
+  @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     return Config(
         block_q_dkv=64,
@@ -900,5 +903,6 @@ class PallasMosaicGpuFlashAttentionVjp(
         num_stages=2,
     )
 
+  @override
   def supported_on(self, device: jax.Device) -> bool:
     return mosaic_gpu_lib.has_mosaic_gpu_support(device)

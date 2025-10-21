@@ -25,6 +25,7 @@ from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
+from typing_extensions import override
 
 
 QuantizedArray = quantization.QuantizedArray
@@ -183,6 +184,7 @@ class FlexAttention(
     # TODO: Support sharding.
     raise NotImplementedError("Sharding is not supported yet.")
 
+  @override
   def bind(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
@@ -234,6 +236,7 @@ class FlexAttention(
     )
 
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       q: Float[Array | QuantizedArray, "*B T H D"],
