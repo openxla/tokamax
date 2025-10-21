@@ -73,7 +73,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     q, k, v, bias = map(as_bf16, (q, k, v, bias))
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045 if bias is None else 0.007)
-    kwargs["atol_grads"] = None if bias is None else 0.03
+    kwargs["atol_grads"] = None if bias is None else 0.02
 
     if not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
@@ -84,11 +84,11 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
   def test_causal_mask(self):
     # TODO: Investigate why it's less accurate with causal mask.
-    with test_base.override_test_args(atol=0.006, atol_grads=0.015):
+    with test_base.override_test_args(atol=0.006):
       super().test_causal_mask()
 
   def test_causal_mask_cross_attention0(self):
-    with test_base.override_test_args(atol=0.006, atol_grads=0.015):
+    with test_base.override_test_args(atol=0.006):
       super().test_causal_mask_cross_attention0()  # pytype: disable=attribute-error
 
   def test_causal_mask_cross_attention1(self):
@@ -113,10 +113,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
     suffix = [k for k, v in test_base.NAMED_ARG_SPECS.items() if v == spec][0]
-    if spec.get("bias") is None or spec["q"].dtype == jnp.float32:
-      atol_grads = None
-    else:
-      atol_grads = 0.15
+    atol_grads = None if spec.get("bias") is None else 0.1
     try:
       with test_base.override_test_args(atol=0.02, atol_grads=atol_grads):
         getattr(super(), "test_bench_" + suffix)()

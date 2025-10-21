@@ -17,8 +17,9 @@
 import contextlib
 import functools
 import itertools
-from unittest import mock
 import sys
+from unittest import mock
+
 import pytest
 
 from absl.testing import parameterized
@@ -26,7 +27,6 @@ import chex
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
-import jaxtyping
 import numpy as np
 from tokamax._src import numerics
 from tokamax._src import quantization
@@ -118,27 +118,27 @@ def _run_test(
     impl = apply_output_mask(impl)
     ref_impl = apply_output_mask(ref_impl)
 
-  # Upcast all floating point inputs to f32 for reference implementation.
-  def f32_ref_impl(*args, _ref_impl=ref_impl, **kwargs):
-    def as_f32(x):
-      if isinstance(x, jax.Array) and jnp.issubdtype(x.dtype, jnp.floating):
-        return x.astype(jnp.promote_types(x.dtype, jnp.float32))
-      return x
-
-    args, kwargs = jax.tree.map(as_f32, (args, kwargs))
-    return _ref_impl(*args, **kwargs)
-
   impl = functools.partial(impl, **kwargs, **impl_kwargs)
-  ref_impl = functools.partial(f32_ref_impl, **kwargs, **ref_kwargs)
+  ref_impl = functools.partial(ref_impl, **kwargs, **ref_kwargs)
+
+  wrap = lambda f: lambda q, k, v, bias: f(q, k, v, bias=bias)
+  impl, ref_impl = map(wrap, (impl, ref_impl))
+
+  def as_f32(x):
+    if isinstance(x, jax.Array) and jnp.issubdtype(x.dtype, jnp.floating):
+      return x.astype(jnp.promote_types(x.dtype, jnp.float32))
+    return x
+
+  ref_inputs = jax.tree.map(as_f32, (q, k, v, bias))
 
   # Forwards inference.
-  actual = jax.jit(impl)(q, k, v, bias=bias)
-  expected = jax.jit(ref_impl)(q, k, v, bias=bias)
+  actual = jax.jit(impl)(q, k, v, bias)
+  expected = jax.jit(ref_impl)(*ref_inputs)
   rtol = max(atol / 10, 1e-6)
   chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
   if test_deterministic:
-    chex.assert_trees_all_equal(actual, jax.jit(impl)(q, k, v, bias=bias))
+    chex.assert_trees_all_equal(actual, jax.jit(impl)(q, k, v, bias))
 
   if not test_vjp:
     return
@@ -146,16 +146,15 @@ def _run_test(
   del actual, expected  # Free device memory.
 
   # Forwards training.
-  wrap = lambda f: lambda q, k, v, bias: f(q, k, v, bias=bias)
-  actual, vjp_fn = jax.vjp(wrap(impl), q, k, v, bias)
-  expected, ref_vjp_fn = jax.vjp(wrap(ref_impl), q, k, v, bias)
+  actual, vjp_fn = jax.vjp(impl, q, k, v, bias)
+  expected, ref_vjp_fn = jax.vjp(ref_impl, *ref_inputs)
   chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
   if rng is None:
     rng = jax.random.PRNGKey(42)
   dout = jax.random.normal(rng, expected.shape, dtype=actual.dtype)
   ref_dout = dout.astype(expected.dtype)
-  del expected, ref_kwargs, ref_impl  # Free device memory.
+  del expected, ref_kwargs, ref_impl, ref_inputs  # Free device memory.
 
   # Backwards.
   if atol_grads is None:
@@ -171,7 +170,7 @@ def _run_test(
   del expected_grads, vjp_fn, ref_vjp_fn  # Free device memory.
 
   if test_vjp_deterministic:
-    actual2, vjp_fn = jax.vjp(wrap(impl), q, k, v, bias)
+    actual2, vjp_fn = jax.vjp(impl, q, k, v, bias)
     actual_grads2 = dict(zip(grad_names, vjp_fn(dout)))
     chex.assert_trees_all_equal(actual, actual2)
     chex.assert_trees_all_equal(actual_grads, actual_grads2)
@@ -618,7 +617,6 @@ class AttentionTestBase(parameterized.TestCase):
         impl=vmap_impl(self._attention_fn),
         ref_impl=vmap_impl(nn.dot_product_attention),
         atol=3e-6,
-        atol_grads=2e-5,
         expect_supported=(
             self._supports_bias and self._supports_mask and self._supports_vmap
         ),
@@ -809,7 +807,7 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
     atol = {jnp.float32: 2e-6, jnp.bfloat16: 2e-2}[q.dtype.type]
-    atol_grads_bias = {jnp.float32: 2e-5, jnp.bfloat16: 5e-2}[q.dtype.type]
+    atol_grads_bias = {jnp.float32: 1e-5, jnp.bfloat16: None}[q.dtype.type]
     try:
       self._run_test_with_inputs(
           q,
