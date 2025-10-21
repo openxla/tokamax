@@ -31,7 +31,8 @@ def _is_scale_tiling_along_reduction(
     x: QuantizedArray, axis: int, min_tiling: int
 ) -> bool:
   all_equal = all(
-      s1 == s2 for i, (s1, s2) in enumerate(zip(x.values.shape, x.scales.shape))
+      s1 == s2
+      for i, (s1, s2) in enumerate(zip(x.values.shape, x.scales.shape))
       if i != (axis % x.ndim)
   )
   scale_tiling = x.values.shape[axis] // x.scales.shape[axis]
@@ -44,17 +45,19 @@ def _is_config_supported(
     config: pallas_mosaic_tpu.Config,
 ) -> bool:
   (m, k), (_, _, n) = lhs.shape, rhs.shape
-  if (m < config.gmm_tiling[0]
+  if (
+      m < config.gmm_tiling[0]
       or k < config.gmm_tiling[1]
-      or n < config.gmm_tiling[2]):
+      or n < config.gmm_tiling[2]
+  ):
     return False
-  if (isinstance(lhs, QuantizedArray)
-      and not _is_scale_tiling_along_reduction(
-          lhs, 1, config.gmm_tiling[1])):
+  if isinstance(lhs, QuantizedArray) and not _is_scale_tiling_along_reduction(
+      lhs, 1, config.gmm_tiling[1]
+  ):
     return False
-  if (isinstance(rhs, QuantizedArray)
-      and not _is_scale_tiling_along_reduction(
-          rhs, 1, config.gmm_tiling[1])):
+  if isinstance(rhs, QuantizedArray) and not _is_scale_tiling_along_reduction(
+      rhs, 1, config.gmm_tiling[1]
+  ):
     return False
   return True
 
@@ -117,6 +120,18 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
         )
     )
     self.assertEqual(maxtext_config.gmm_tiling, (256, 7168, 512))
+
+  def test_autotuning_configs(self):
+    tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+    ba = op_base.BoundArguments(
+        op=tpu_ragged_dot,
+        arguments={
+            "lhs": jax.ShapeDtypeStruct((262144, 7168), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((256, 7168, 2048), dtype=jnp.bfloat16),
+        },
+    )
+    autotuning_configs = ba.autotuning_configs
+    self.assertGreaterEqual(len(autotuning_configs), 3 * 3 * 3)
 
 
 if __name__ == "__main__":
