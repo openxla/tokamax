@@ -38,6 +38,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       supports_mask=True,
       supports_tanh_clipping=True,
       supports_is_causal=True,
+      supports_f32_inputs=True,
       supports_vmap=False,
   ):
     attention_fn = attention_fn or fa.PallasMosaicGpuFlashAttention()
@@ -56,21 +57,31 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         supports_is_causal=supports_is_causal,
     )
     self._supports_decode = supports_decode
+    self._supports_f32_inputs = supports_f32_inputs
 
   def _run_test_with_inputs(self, q, k, v, *, bias=None, **kwargs):
-    # PallasMosaicGpuFlashAttention doesn't support high precisions,
-    # (logits_dtype != f32) and f32 inputs. Override the arguments instead of
-    # disabling basicaly most of the tests.
+    # PallasMosaicGpuFlashAttention doesn't support high precisions and
+    # (logits_dtype != f32). Override the arguments instead of disabling
+    # basically most of the tests.
     impl_kwargs = kwargs.setdefault("impl_kwargs", {})
-    impl_kwargs["precision"] = jax.lax.DotAlgorithmPreset.DEFAULT
     impl_kwargs["logits_dtype"] = jnp.float32
+    qk_prec, wv_prec = (jax.lax.DotAlgorithmPreset.DEFAULT,) * 2
+    if q.dtype == jnp.float32 or k.dtype == jnp.float32:
+      qk_prec = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    if v.dtype == jnp.float32:
+      wv_prec = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    impl_kwargs["precision"] = (qk_prec, wv_prec)
 
-    def as_bf16(x):
+    def recast(x):
       if isinstance(x, jax.Array) and x.dtype == jnp.float32:
-        return x.astype(jnp.bfloat16)
+        x = x.astype(jnp.bfloat16)
+        if self._supports_f32_inputs:
+          x = x.astype(jnp.float32)
       return x
 
-    q, k, v, bias = map(as_bf16, (q, k, v, bias))
+    # This backend casts to bfloat16 internally, so we recast inputs to bfloat16
+    # and back to avoid precision loss with the reference implementation.
+    q, k, v, bias = map(recast, (q, k, v, bias))
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045 if bias is None else 0.007)
     kwargs["atol_grads"] = None if bias is None else 0.02
@@ -84,7 +95,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
   def test_causal_mask(self):
     # TODO: Investigate why it's less accurate with causal mask.
-    with test_base.override_test_args(atol=0.006):
+    with test_base.override_test_args(atol=0.006, atol_grads=0.025):
       super().test_causal_mask()
 
   def test_causal_mask_cross_attention0(self):

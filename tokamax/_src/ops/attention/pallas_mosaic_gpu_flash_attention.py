@@ -71,6 +71,7 @@ def _fwd(
     is_causal: bool,
     logits_soft_cap: float | None,
     logits_scale: float,
+    out_dtype: jnp.dtype,
     normalize_output: bool,
     return_residuals: bool,
     use_base2: bool,
@@ -307,7 +308,7 @@ def _fwd(
           l_i *= alpha
         else:
           p = exp(s)
-        p_ = p.astype(q.dtype)
+        p_ = p.astype(v.dtype)
 
         # Can't fully explain why, but empirically the ordering here influences
         # the performance of the final kernel quite significantly.
@@ -368,7 +369,7 @@ def _fwd(
         acc *= lax.broadcast_in_dim(1 / l_i, acc.shape, [0])
 
       o_smem = o_smems.at[wg]
-      o_smem[...] = acc.astype(q.dtype)  # pytype: disable=attribute-error
+      o_smem[...] = acc.astype(o_smem.dtype)
       plgpu.commit_smem()
       plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[bi, qs, hi])
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
@@ -439,7 +440,7 @@ def _fwd(
     q_scratch = tiled_smem((compute_wgs, block_q, head_dim), q.dtype)
     k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype)
     v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype)
-    o_scratch = tiled_smem((compute_wgs, block_q, head_dim_out), q.dtype)
+    o_scratch = tiled_smem((compute_wgs, block_q, head_dim_out), out_dtype)
     l_scratch = m_scratch = plgpu.SMEM((compute_wgs, block_q), jnp.float32)
 
     q_barriers = plgpu.Barrier(num_barriers=compute_wgs)
@@ -486,7 +487,7 @@ def _fwd(
     k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end)
     k_end_minmax = (jnp.min(k_end_, -1), jnp.max(k_end_, -1))
 
-  out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), q.dtype)]
+  out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:
     residuals_shape = (batch_size, num_q_heads, q_seq_len)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
@@ -544,13 +545,6 @@ def _decompose_mask(mask, q, k, q_indices, k_indices):
   return mask, is_causal, k_start, k_end
 
 
-_SUPPORTED_PRECISIONS = (
-    lax.DotAlgorithmPreset.DEFAULT,
-    lax.DotAlgorithmPreset.BF16_BF16_F32,
-    lax.DotAlgorithmPreset.F16_F16_F32,
-)
-
-
 @dataclasses.dataclass(frozen=True)
 class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   """Flash attention with Mosaic GPU."""
@@ -592,11 +586,9 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     if not mosaic_gpu.has_mosaic_gpu_support():
       raise NotImplementedError("Mosaic GPU not supported on this platform.")
 
-    if jnp.dtype(q.dtype) not in map(jnp.dtype, [jnp.float16, jnp.bfloat16]):
-      raise NotImplementedError(
-          f"Only f16 and bf16 are supported, got dtype: {q.dtype}"
-      )
-
+    supported_dtypes = (jnp.float32, jnp.float16, jnp.bfloat16)
+    if any(dt not in supported_dtypes for dt in [x.dtype for x in (q, k, v)]):
+      raise NotImplementedError("Only f32, f16 and bf16 inputs are supported.")
     if logits_dtype != jnp.float32:
       raise NotImplementedError("`logits_dtype` must be float32.")
     if dropout_mask is not None:
@@ -606,15 +598,27 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
     # TODO: Support in-kernel dequantization.
     q, k, v = map(base.as_array, (q, k, v))
-    # TODO: Avoid silently downcasting types.
-    k = k.astype(q.dtype)
-    v = v.astype(q.dtype)
+    out_dtype = q.dtype
+
+    def cast(x, precision):
+      msg = lambda dt: f"Only {dt} supported for {precision=}, got {x.dtype=}"
+      if precision == lax.DotAlgorithmPreset.DEFAULT:
+        if x.dtype not in (jnp.float16, jnp.bfloat16):
+          raise NotImplementedError(msg("f16 and bf16"))
+        return x
+      if x.dtype not in precision.supported_lhs_types:
+        raise NotImplementedError(msg(precision.supported_lhs_types))
+      if precision == lax.DotAlgorithmPreset.BF16_BF16_F32:
+        return x.astype(jnp.bfloat16)
+      if precision == lax.DotAlgorithmPreset.F16_F16_F32:
+        return x.astype(jnp.float16)
+      raise NotImplementedError(f"Unsupported {precision=}")
 
     q_k_dot_precision, weights_v_dot_precision = precision
-    if q_k_dot_precision not in _SUPPORTED_PRECISIONS:
-      raise NotImplementedError(f"{q_k_dot_precision=} not supported")
-    if weights_v_dot_precision not in _SUPPORTED_PRECISIONS:
-      raise NotImplementedError(f" {weights_v_dot_precision=} not supported")
+    # TODO: Avoid silently downcasting types.
+    q = cast(q, q_k_dot_precision)
+    k = cast(k, q_k_dot_precision)
+    v = cast(v, weights_v_dot_precision)
 
     mask, is_causal, k_start, k_end = _decompose_mask(
         mask, q, k, q_indices, k_indices
@@ -637,6 +641,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         is_causal=is_causal,
         logits_soft_cap=logits_soft_cap,
         logits_scale=logits_scale,
+        out_dtype=out_dtype,
         normalize_output=normalize_output,
         return_residuals=return_residuals,
         use_base2=self.use_base2,
@@ -654,11 +659,13 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     q_indices = ba.batched.kwargs["q_indices"]
     k_indices = ba.batched.kwargs["k_indices"]
     mask, *_ = jax.eval_shape(_decompose_mask, mask, q, k, q_indices, k_indices)
+    # 32-bit floats are downcast to 16-bit before the kernel call.
+    dtype_bits = jnp.finfo(jnp.bfloat16).bits
 
     def shared_mem_usage_bytes(block_q, block_kv, num_stages):
       bytes_per_stage = (
-          block_kv * head_dim * jnp.finfo(k.dtype).bits // 8
-          + block_kv * head_dim_out * jnp.finfo(v.dtype).bits // 8
+          block_kv * head_dim * dtype_bits // 8
+          + block_kv * head_dim_out * dtype_bits // 8
       )
       if (bias := ba.kwargs["bias"]) is not None:
         bytes_per_stage += (
@@ -668,7 +675,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       if mask is not None:
         bytes_per_stage += 2 * block_q * block_kv
       return (
-          2 * block_q * head_dim * jnp.finfo(q.dtype).bits // 8
+          2 * block_q * head_dim * dtype_bits // 8
           + num_stages * bytes_per_stage
           + 1000  # Add some extra for barriers.
       )

@@ -100,10 +100,6 @@ def _bwd(
         f"q, k, and v should all have the same dtype, got: {q.dtype},"
         f" {k.dtype}, {v.dtype}"
     )
-  if jnp.dtype(dtype) not in (jnp.float16, jnp.bfloat16):
-    raise NotImplementedError(
-        f"Only f16 and bf16 are supported, got dtype: {dtype}"
-    )
   if num_q_heads % num_kv_heads:
     raise ValueError(f"{num_q_heads=} must be divisible by and {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
@@ -147,8 +143,8 @@ def _bwd(
   k_end = None if k_end is None else bcast(k_end)
 
   swizzle = 128
-  transforms = (
-      plgpu.TilingTransform((8, swizzle // q.dtype.itemsize)),
+  transforms = lambda dt: (
+      plgpu.TilingTransform((8, swizzle // dt.itemsize)),
       plgpu.SwizzleTransform(swizzle),
   )
   delta = jnp.einsum(
@@ -413,12 +409,12 @@ def _bwd(
             plgpu.BlockSpec(  # k
                 block_shape=(block_kv, head_dim),
                 index_map=lambda i: (i, 0),
-                transforms=transforms,
+                transforms=transforms(k.dtype),
             ),
             plgpu.BlockSpec(  # v
                 block_shape=(block_kv, head_dim_out),
                 index_map=lambda i: (i, 0),
-                transforms=transforms,
+                transforms=transforms(v.dtype),
             ),
             bias_in_spec,
             mask_in_spec,
@@ -655,12 +651,12 @@ def _bwd(
             plgpu.BlockSpec(  # q
                 block_shape=(block_q, head_dim),
                 index_map=lambda i: (i, 0),
-                transforms=transforms,
+                transforms=transforms(q.dtype),
             ),
             plgpu.BlockSpec(  # dout
                 block_shape=(block_q, head_dim_out),
                 index_map=lambda i: (i, 0),
-                transforms=transforms,
+                transforms=transforms(dout.dtype),
             ),
             plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
             plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
@@ -692,12 +688,12 @@ def _bwd(
   q_scratch = plgpu.SMEM(
       (compute_wgs, config.block_q_dq, head_dim),
       q.dtype,
-      transforms=transforms,
+      transforms=transforms(q.dtype),
   )
   dout_scratch = plgpu.SMEM(
       (compute_wgs, config.block_q_dq, head_dim_out),
       dout.dtype,
-      transforms=transforms,
+      transforms=transforms(dout.dtype),
   )
   m_scratch = l_scratch = delta_scratch = plgpu.SMEM(
       (compute_wgs, config.block_q_dq), jnp.float32
@@ -727,12 +723,12 @@ def _bwd(
   k_scratch = plgpu.SMEM(
       (compute_wgs, config.block_kv_dkv, head_dim),
       k.dtype,
-      transforms=transforms,
+      transforms=transforms(k.dtype),
   )
   v_scratch = plgpu.SMEM(
       (compute_wgs, config.block_kv_dkv, head_dim_out),
       v.dtype,
-      transforms=transforms,
+      transforms=transforms(v.dtype),
   )
   # `dk` and `dv` outputs have `num_q_heads` heads (reduced below if necessary).
   dk_shape = (batch_size, kv_seq_len, num_q_heads, head_dim)
@@ -808,13 +804,6 @@ def _decompose_mask(mask, q, k, q_indices, k_indices):
   return mask, k_start, k_end
 
 
-_SUPPORTED_PRECISIONS = (
-    lax.DotAlgorithmPreset.DEFAULT,
-    lax.DotAlgorithmPreset.BF16_BF16_F32,
-    lax.DotAlgorithmPreset.F16_F16_F32,
-)
-
-
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicGpuFlashAttentionVjp(
     base.DotProductAttentionVjp[Config, None]
@@ -870,11 +859,26 @@ class PallasMosaicGpuFlashAttentionVjp(
 
     mask, k_start, k_end = _decompose_mask(mask, q, k, q_indices, k_indices)
 
+    def cast(x, precision):
+      msg = lambda dt: f"Only {dt} supported for {precision=}, got {x.dtype=}"
+      if precision == lax.DotAlgorithmPreset.DEFAULT:
+        if x.dtype not in (jnp.float16, jnp.bfloat16):
+          raise NotImplementedError(msg("f16 and bf16"))
+        return x
+      if x.dtype not in precision.supported_lhs_types:
+        raise NotImplementedError(msg(precision.supported_lhs_types))
+      if precision == lax.DotAlgorithmPreset.BF16_BF16_F32:
+        return x.astype(jnp.bfloat16)
+      if precision == lax.DotAlgorithmPreset.F16_F16_F32:
+        return x.astype(jnp.float16)
+      raise NotImplementedError(f"Unsupported {precision=}")
+
     q_k_dot_precision, weights_v_dot_precision = precision
-    if q_k_dot_precision not in _SUPPORTED_PRECISIONS:
-      raise NotImplementedError(f"{q_k_dot_precision=} not supported")
-    if weights_v_dot_precision not in _SUPPORTED_PRECISIONS:
-      raise NotImplementedError(f" {weights_v_dot_precision=} not supported")
+    # TODO: Avoid silently downcasting types.
+    q = cast(q, q_k_dot_precision)
+    k = cast(k, q_k_dot_precision)
+    v = cast(v, weights_v_dot_precision)
+    dout = cast(dout, weights_v_dot_precision)
 
     f = functools.partial(
         _bwd,
