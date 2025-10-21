@@ -603,7 +603,7 @@ class DotProductAttention(
     logits *= logits_scale
 
     if bias is not None:
-      logits += bias
+      logits = (logits + bias).astype(logits.dtype)
 
     if logits_soft_cap is not None:
       logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
