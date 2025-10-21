@@ -549,6 +549,9 @@ def _process_mask(
       active_cols = _downcast_to_small_type(active_cols)
       block_mask = _downcast_to_small_type(block_mask)
 
+    if not return_dynamic_grid:
+      active_rows = active_cols = None
+
   assert (mask_function is not None) == (q_sequence is not None)
   # When the mask can be computed inside the kernel with a mask_function,
   # there is no need to load it from memory. So mask_next and

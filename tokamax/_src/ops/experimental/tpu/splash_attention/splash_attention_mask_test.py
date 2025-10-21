@@ -873,34 +873,8 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
       expected_num_active_blocks_dkv = np.array([10], dtype=np.int32)
     else:
       expected_causal_mask_next_dkv = np.zeros((32,), dtype=np.int8)
-      expected_active_rows_dkv = np.array(
-          [
-              [0, 0, 0, 0],
-              [1, 1, 1, 1],
-              [2, 2, 2, 2],
-              [3, 3, 3, 3],
-              [4, 4, 4, 4],
-              [5, 5, 5, 5],
-              [6, 6, 6, 6],
-              [7, 7, 7, 7],
-          ],
-          dtype=np.int8,
-      ).flatten()
-
-      expected_active_cols_dkv = np.array(
-          [
-              [0, 1, 2, 3],
-              [0, 1, 2, 3],
-              [0, 1, 2, 3],
-              [0, 1, 2, 3],
-              [0, 1, 2, 3],
-              [0, 1, 2, 3],
-              [0, 1, 2, 3],
-              [0, 1, 2, 3],
-          ],
-          dtype=np.int8,
-      ).flatten()
-
+      expected_active_rows_dkv = None
+      expected_active_cols_dkv = None
       expected_causal_block_mask_dkv = np.array(
           [
               [1, 2, 2, 2],

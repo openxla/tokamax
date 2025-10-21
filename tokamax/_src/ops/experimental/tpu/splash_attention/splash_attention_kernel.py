@@ -1517,19 +1517,24 @@ def _flash_attention_dkv_kernel(
     attn_logits_soft_cap *= LOG2E
   grid_idx = pl.program_id(1)
 
-  if block_mask_ref is not None:
+  if active_rows_ref is not None:
+    assert bounds_start_ref is not None
+    assert bounds_end_ref is not None
     kv_index = active_rows_ref[grid_idx].astype(jnp.int32)
-    should_not_mask = block_mask_ref[grid_idx].astype(jnp.int32) != 1
-    should_run = block_mask_ref[grid_idx].astype(jnp.int32) != 0
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
   else:
     q_index = grid_idx % q_steps
     kv_index = grid_idx // q_steps
-    should_not_mask = False
-    should_run = True
     should_initialize = q_index == 0
     should_write = q_index == q_steps - 1
+
+  if block_mask_ref is not None:
+    should_not_mask = block_mask_ref[grid_idx].astype(jnp.int32) != 1
+    should_run = block_mask_ref[grid_idx].astype(jnp.int32) != 0
+  else:
+    should_not_mask = False
+    should_run = True
 
   # TODO: Update docstring explaining the accumulation logic
 
