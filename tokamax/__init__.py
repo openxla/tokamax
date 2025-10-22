@@ -25,6 +25,7 @@ from tokamax._src.hlo_utils import DISABLE_JAX_EXPORT_CHECKS as DISABLE_JAX_EXPO
 from tokamax._src.ops.attention.api import dot_product_attention as dot_product_attention
 from tokamax._src.ops.gated_linear_unit.api import gated_linear_unit as gated_linear_unit
 from tokamax._src.ops.normalization.api import layer_norm as layer_norm
+from tokamax._src.ops.op import BoundArguments as BoundArguments
 from tokamax._src.ops.op import Op as Op
 from tokamax._src.ops.ragged_dot.api import ragged_dot as ragged_dot
 from tokamax._src.quantization import QuantizedArray as QuantizedArray
