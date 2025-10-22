@@ -68,7 +68,7 @@ def body(
     pl.when(wg == 0)(schedule)
     w = common.dequant(w_scales_smem.at[0, ns], w_smem[ns])
     schedule()
-    plgpu.wgmma(acc_ref, w, plgpu.transpose_ref(x_smem, (1, 0)))
+    plgpu.wgmma(acc_ref, w, x_smem.T)
     pl.when(wg == 1)(schedule)
     plgpu.wgmma_wait(0)
     return acc_ref

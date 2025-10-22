@@ -251,7 +251,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
             plgpu.tcgen05_mma(
                 acc_tmem,
                 w_bf16_tmem.at[:, pl.ds(slot * block_k, block_k)],
-                plgpu.transpose_ref(x_smem.at[slot], (1, 0)),
+                x_smem.at[slot].T,
                 tcgen05_barrier.at[slot],
                 accumulate=(ki > 0),
                 collective_axis="x" if collective else None,
@@ -283,15 +283,12 @@ def ragged_dot_gpu_quant_blackwell_kernel(
               lax.fori_loop(0, num_k_iters, _mma, None)
 
           plgpu.barrier_wait(mma_done_barrier)
-          out_smem_t = plgpu.transpose_ref(out_smem, (1, 0))
           acc = plgpu.async_load_tmem(acc_tmem)
           plgpu.wait_load_tmem()
-          acc = acc.astype(out_smem_t.dtype)
-          out_smem_t[...] = plgpu.layout_cast(
-              acc, plgpu.Layout.TCGEN05_TRANSPOSED
+          out_smem.T[...] = plgpu.layout_cast(
+              acc.astype(out_smem.dtype), plgpu.Layout.TCGEN05_TRANSPOSED
           )
           plgpu.commit_smem()
-          del out_smem_t
 
           @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
           def _():

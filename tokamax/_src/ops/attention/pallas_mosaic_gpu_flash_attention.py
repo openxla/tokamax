@@ -246,8 +246,7 @@ def _fwd(
           return smems[si, block.ds(wg, block_q)]
 
         def compute_qk(acc_ref):
-          k_smem_T = plgpu.transpose_ref(k_smems.at[si], (1, 0))  # pylint: disable=invalid-name
-          plgpu.wgmma(acc_ref, q_smem, k_smem_T)
+          plgpu.wgmma(acc_ref, q_smem, k_smems.at[si].T)
           bias = load_bias_mask(bias_gmem, bias_smems, bias_barriers)
           plgpu.barrier_arrive(schedule_barrier)
           mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None

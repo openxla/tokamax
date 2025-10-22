@@ -308,7 +308,7 @@ def _bwd(
       ks = pl.ds(kv_base, block_kv)
 
       def compute_s(acc_ref):
-        plgpu.wgmma(acc_ref, q_smem, plgpu.transpose_ref(k_smem, (1, 0)))
+        plgpu.wgmma(acc_ref, q_smem, k_smem.T)
         return acc_ref[...]
 
       s = pl.run_scoped(compute_s, plgpu.ACC((block_q, block_kv), jnp.float32))
@@ -364,7 +364,7 @@ def _bwd(
       p = exp(s - broadcast(m)) / broadcast(l)
 
       def compute_dp(acc_ref):
-        plgpu.wgmma(acc_ref, dout_smem, plgpu.transpose_ref(v_smem, (1, 0)))
+        plgpu.wgmma(acc_ref, dout_smem, v_smem.T)
         return acc_ref[...]
 
       dp = pl.run_scoped(
@@ -530,7 +530,7 @@ def _bwd(
       ks = pl.ds(kv_seq_base, block_kv)
 
       def compute_sT(acc_ref):
-        plgpu.wgmma(acc_ref, k_smem, plgpu.transpose_ref(q_smem, (1, 0)))
+        plgpu.wgmma(acc_ref, k_smem, q_smem.T)
         return acc_ref[...]
 
       m = plgpu.load(m_smem, (), layout=L.WGMMA.reduce(0))
@@ -605,7 +605,7 @@ def _bwd(
         # synchronization from two `wgmma.wait_group` calls.
         dv_acc_ref, dpT_acc_ref = refs
         plgpu.wgmma(dv_acc_ref, pT.astype(dtype), dout_smem)
-        plgpu.wgmma(dpT_acc_ref, v_smem, plgpu.transpose_ref(dout_smem, (1, 0)))
+        plgpu.wgmma(dpT_acc_ref, v_smem, dout_smem.T)
 
       zeros = plgpu.layout_cast(
           jnp.full((block_kv, block_q), 0, dtype=jnp.float32),

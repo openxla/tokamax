@@ -61,7 +61,7 @@ def ragged_dot_quantized_kernel_body(
       for j in range(steps):
         ks = slice(j * x_swizzle_elems, (j + 1) * x_swizzle_elems)
         w_ = common.dequant(w_scales_smem.at[0], w[:, ks])
-        plgpu.wgmma(acc_ref, w_, plgpu.transpose_ref(x_smem.at[:, ks], (1, 0)))
+        plgpu.wgmma(acc_ref, w_, x_smem.at[:, ks].T)
         plgpu.wgmma_wait(1)
 
     mi = group_info.block
