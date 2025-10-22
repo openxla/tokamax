@@ -58,49 +58,67 @@ def _attend_chunk(
 ]:
   """Computes a chunk of attention."""
   q_k_dot_precision, weights_v_dot_precision = precision
-  # TODO: Can we be more efficient for multi-query attention?
-  logits = jnp.einsum(
-      "...qhd,...khd->...hqk",
-      q,
-      k,
-      precision=q_k_dot_precision,
-      preferred_element_type=logits_dtype,
+  bias = jnp.array([]) if bias is None else bias
+
+  @functools.partial(jax.remat, prevent_cse=False)
+  def chunk(q, k, v, bias, mask, accum, x_max, denom):
+    bias = bias if len(bias) else None
+
+    # TODO: Can we be more efficient for multi-query attention?
+    logits = jnp.einsum(
+        "...qhd,...khd->...hqk",
+        q,
+        k,
+        precision=q_k_dot_precision,
+        preferred_element_type=logits_dtype,
+    )
+
+    logits *= logits_scale
+
+    if bias is not None:
+      logits = (logits + bias).astype(logits.dtype)
+
+    if logits_soft_cap is not None:
+      logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
+
+    if mask is not None:
+      mask_value = float(jnp.finfo(logits.dtype).min)
+      logits = jnp.where(jnp.asarray(mask), logits, mask_value)
+
+    logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
+    loc_x_max = jnp.max(logits, axis=-1)
+    new_x_max = jnp.maximum(x_max, loc_x_max)
+    weights = jnp.exp(logits - new_x_max[..., None])
+    alpha = jnp.exp(x_max - new_x_max)
+
+    x_max = new_x_max
+    accum *= alpha.mT[..., None]
+    denom = (denom * alpha) + weights.sum(axis=-1)
+
+    if dropout_mask is not None:
+      weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
+
+    weights = weights.astype(v.dtype)
+    accum += jnp.einsum(
+        "...hqk,...khd->...qhd",
+        weights,
+        v,
+        precision=weights_v_dot_precision,
+        preferred_element_type=accum.dtype,
+    )
+
+    return accum, x_max, denom
+
+  return chunk(
+      q=q,
+      k=k,
+      v=v,
+      bias=bias,
+      mask=mask,
+      accum=accum,
+      x_max=x_max,
+      denom=denom,
   )
-
-  logits *= logits_scale
-
-  if bias is not None:
-    logits = (logits + bias).astype(logits.dtype)
-
-  if logits_soft_cap is not None:
-    logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
-
-  if mask is not None:
-    mask_value = float(jnp.finfo(logits.dtype).min)
-    logits = jnp.where(jnp.asarray(mask), logits, mask_value)
-
-  logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
-  loc_x_max = jnp.max(logits, axis=-1)
-  new_x_max = jnp.maximum(x_max, loc_x_max)
-  weights = jnp.exp(logits - new_x_max[..., None])
-  alpha = jnp.exp(x_max - new_x_max)
-
-  x_max = new_x_max
-  accum *= alpha.mT[..., None]
-  denom = (denom * alpha) + weights.sum(axis=-1)
-
-  if dropout_mask is not None:
-    weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
-
-  weights = weights.astype(v.dtype)
-  accum += jnp.einsum(
-      "...hqk,...khd->...qhd",
-      weights,
-      v,
-      precision=weights_v_dot_precision,
-      preferred_element_type=accum.dtype,
-  )
-  return accum, x_max, denom
 
 
 @jaxtyping.jaxtyped

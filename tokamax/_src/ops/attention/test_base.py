@@ -375,6 +375,7 @@ class AttentionTestBase(parameterized.TestCase):
         impl_kwargs=dict(is_causal=True),
         ref_kwargs=dict(mask=mask),
         expect_supported=self._supports_cross_attention,
+        atol=1e-5
     )
 
   def test_causal_mask_q_indices(self):
