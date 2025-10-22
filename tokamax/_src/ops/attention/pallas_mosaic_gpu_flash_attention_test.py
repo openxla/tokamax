@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as fa
+from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
 
 
@@ -41,7 +42,11 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       supports_f32_inputs=True,
       supports_vmap=False,
   ):
-    attention_fn = attention_fn or fa.PallasMosaicGpuFlashAttention()
+    if attention_fn is None:
+      vjp = fa_vjp.PallasMosaicGpuFlashAttentionVjp(
+          dbias_intermediate_dtype=jnp.float32
+      )
+      attention_fn = fa.PallasMosaicGpuFlashAttention(vjp=vjp)
     super().__init__(
         *args,
         attention_fn=attention_fn,
@@ -83,7 +88,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     # and back to avoid precision loss with the reference implementation.
     q, k, v, bias = map(recast, (q, k, v, bias))
     atol = kwargs.get("atol", 0.0)
-    kwargs["atol"] = max(atol, 0.0045 if bias is None else 0.007)
+    kwargs["atol"] = max(atol, 0.0045)
     kwargs["atol_grads"] = None if bias is None else 0.02
 
     if not impl_kwargs.get("normalize_output", True):
@@ -124,9 +129,8 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
     suffix = [k for k, v in test_base.NAMED_ARG_SPECS.items() if v == spec][0]
-    atol_grads = None if spec.get("bias") is None else 0.1
     try:
-      with test_base.override_test_args(atol=0.02, atol_grads=atol_grads):
+      with test_base.override_test_args(atol=0.02):
         getattr(super(), "test_bench_" + suffix)()
     except ValueError as e:
       if "exceeds available shared memory" in str(e):

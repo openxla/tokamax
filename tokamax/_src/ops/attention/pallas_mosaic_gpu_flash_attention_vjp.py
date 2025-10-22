@@ -72,6 +72,7 @@ def _bwd(
     logits_scale: float,
     logits_soft_cap: float | None,
     use_base2: bool,
+    dbias_intermediate_dtype: jax.typing.DTypeLike | None,
     config: Config,
 ) -> tuple[
     Float[Array, "*B T H D"],  # dq
@@ -702,7 +703,9 @@ def _bwd(
     ds_out_shape = None
   else:
     ds_out_shape = (batch_size, num_q_heads, kv_seq_len, q_seq_len)
-    ds_out_shape = jax.ShapeDtypeStruct(ds_out_shape, bias.dtype)
+    if dbias_intermediate_dtype is None or (ds_out_shape == bias.shape):
+      dbias_intermediate_dtype = bias.dtype
+    ds_out_shape = jax.ShapeDtypeStruct(ds_out_shape, dbias_intermediate_dtype)
   # TODO: Optionally fuse the dq and dkv kernels.
   dq, ds = plgpu.kernel(
       functools.partial(
@@ -812,7 +815,8 @@ class PallasMosaicGpuFlashAttentionVjp(
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
-  use_base2: bool = False
+  use_base2: bool = True
+  dbias_intermediate_dtype: jax.typing.DTypeLike | None = None
 
   @jaxtyping.jaxtyped
   @override
@@ -889,6 +893,7 @@ class PallasMosaicGpuFlashAttentionVjp(
         logits_scale=logits_scale,
         logits_soft_cap=logits_soft_cap,
         use_base2=self.use_base2,
+        dbias_intermediate_dtype=self.dbias_intermediate_dtype,
         config=config,
     )
 
