@@ -300,6 +300,9 @@ class SplashConfig:
   k_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
   v_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
 
+  fwd_cost_estimate: pl.CostEstimate | None = None
+  bwd_cost_estimate: pl.CostEstimate | None = None
+
   residual_checkpoint_name: str | None = None  # whether to checkpoint outputs
   attn_logits_soft_cap: float | None = None
   fuse_reciprocal: bool = True  # whether to compute o / lse inside the kernel
@@ -909,7 +912,7 @@ def _splash_attention_forward(
       partial_mask_blocks: jax.Array | None,
       out_shapes: list[jax.ShapeDtypeStruct],
       mask_sparsity: float,
-  ) -> pl.CostEstimate | None:
+  ) -> pl.CostEstimate:
     num_q_heads, q_seq_len, head_dim_qk = q.shape
     kv_seq_len, head_dim_v = v.shape[-2:]
 
@@ -942,7 +945,9 @@ def _splash_attention_forward(
       kv_segment_ids,
       fwd_mask_info.partial_mask_blocks,
   ]
-  cost_estimate = _fwd_cost_estimate(*vmem_inputs, out_shapes, fwd_mask_sparsity)
+  cost_estimate = config.fwd_cost_estimate or _fwd_cost_estimate(
+      *vmem_inputs, out_shapes, fwd_mask_sparsity
+  )
 
   if fwd_mask_info.num_active_blocks is not None:
     grid_size = fwd_mask_info.num_active_blocks[0]
@@ -1984,6 +1989,7 @@ def _splash_attention_bwd_dkv(
             dimension_semantics=("arbitrary", "arbitrary"),
         ),
         name=kernel_name,
+        cost_estimate=config.bwd_cost_estimate,
         interpret=config.interpret,
         metadata=metadata,
     )(*args, dq, dk, dv)
