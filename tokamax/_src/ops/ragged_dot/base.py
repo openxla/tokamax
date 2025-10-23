@@ -20,7 +20,6 @@ import types
 from typing import Any, TypeVar
 
 import jax
-from jax.experimental import checkify
 import jax.numpy as jnp
 import numpy as np
 from pydantic_core import core_schema as cs
@@ -138,13 +137,6 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       if not isinstance(group_sizes, GroupSizes):
         representative_sizes = (lhs.shape[0] // rhs.shape[0],) * rhs.shape[0]
         group_sizes = GroupSizes(group_sizes, representative_sizes)
-
-      # Checkify requires fix in JAX 0.8.0 to work with `custom_vjp`.
-      if jax.version.__version_info__ >= (0, 8, 0):
-        gs = group_sizes.value
-        dbg_check = checkify.debug_check
-        dbg_check(jnp.all(gs >= 0), "Negative group size.")
-        dbg_check(jnp.sum(gs) <= lhs.shape[0], "Group size sum > num rows.")
 
     if preferred_element_type is not None:
       preferred_element_type = jnp.dtype(preferred_element_type)
