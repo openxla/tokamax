@@ -23,8 +23,6 @@ from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-impo
 from tokamax._src import quantization
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
-from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention
-from tokamax._src.ops.attention import pallas_triton_flash_attention
 from tokamax._src.ops.attention import xla_chunked
 
 QuantizedArray = quantization.QuantizedArray
@@ -35,21 +33,37 @@ Implementation: TypeAlias = Literal[
 # TODO: Investigate if `_XLA_CHUNK_SIZE` should be larger on TPU.
 _XLA_CHUNK_SIZE: Final[int] = 128
 
-IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(
-        mosaic=pallas_mosaic_gpu_flash_attention.PallasMosaicGpuFlashAttention(),
-        triton=pallas_triton_flash_attention.PallasTritonFlashAttention(),
-        cudnn=jax_nn.JaxNnDotProductAttention(implementation="cudnn"),
-        xla=base.DotProductAttention(),
-        xla_chunked=xla_chunked.XlaChunkedDotProductAttention(
-            chunk_size=_XLA_CHUNK_SIZE
-        ),
-    )
+IMPLEMENTATIONS = dict(
+    cudnn=jax_nn.JaxNnDotProductAttention(implementation="cudnn"),
+    xla=base.DotProductAttention(),
+    xla_chunked=xla_chunked.XlaChunkedDotProductAttention(
+        chunk_size=_XLA_CHUNK_SIZE
+    ),
 )
-
 # TODO: Investigate if xla_chunked be used instead of xla for very
 # big sequences lengths. Eg. where xla OOMs.
-_DEFAULT_IMPLEMENTATION = ("mosaic", "triton", "xla")
+_DEFAULT_IMPLEMENTATION = ("xla",)
+
+try:
+  from tokamax._src.ops.attention import pallas_triton_flash_attention as pl_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["triton"] = pl_triton.PallasTritonFlashAttention()
+  _DEFAULT_IMPLEMENTATION = ("triton",) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as pl_mgpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["mosaic"] = pl_mgpu.PallasMosaicGpuFlashAttention()
+  _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
+
+
+IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
+    immutabledict.immutabledict(IMPLEMENTATIONS)
+)
 
 
 def dot_product_attention(
