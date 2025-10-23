@@ -51,8 +51,9 @@ class XlaChunkedAttentionTest(test_base.AttentionTestBase):
       self.skipTest("Residuals unsupported with XLA chunked attention.")
     super()._run_test_with_inputs(*args, **kwargs)
 
-  @parameterized.parameters(31, 123, 256, 2048)
-  def test_chunk_sizes(self, chunk_size):
+  @parameterized.parameters(31, 123, 256, 2048, (64, 128), (128, 64))
+  def test_chunk_sizes(self, *chunk_size):
+    chunk_size = chunk_size[0] if len(chunk_size) == 1 else chunk_size
     op = cast(xla_chunked.XlaChunkedDotProductAttention, self._attention_fn)
     mocked_impl = dataclasses.replace(op, chunk_size=chunk_size)
     with mock.patch.object(self, "_attention_fn", mocked_impl):

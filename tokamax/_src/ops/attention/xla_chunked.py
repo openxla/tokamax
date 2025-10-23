@@ -139,7 +139,7 @@ def _attend_chunked(
     q_indices: Int[Array, "*#B #H T"] | None,
     k_indices: Int[Array, "*#B #H t"] | None,
     normalize_output: bool,
-    chunk_size: int,
+    chunk_size: tuple[int, int],
 ) -> tuple[Float[Array, "*B T H d"], None]:
   """Computes chunked attention."""
   if paging_info is not None:
@@ -147,6 +147,8 @@ def _attend_chunked(
 
   *b, seq_q, h, _ = q.shape
   *_, seq_k, _, d_out = v.shape
+
+  q_chunk_size, kv_chunk_size = chunk_size
 
   q_len_or_indices = seq_q if q_indices is None else q_indices
   k_len_or_indices = seq_k if k_indices is None else k_indices
@@ -197,16 +199,16 @@ def _attend_chunked(
       )
       return kv_chunk_idx + kv_chunk_size, *out
 
-    even_chunks = seq_k // chunk_size
+    even_chunks = seq_k // kv_chunk_size
     carry = (0, acc, x_max, denom)
 
     # Main kv loop
-    if seq_k >= chunk_size:
-      loop_fn = functools.partial(kv_loop_fn, kv_chunk_size=chunk_size)
+    if seq_k >= kv_chunk_size:
+      loop_fn = functools.partial(kv_loop_fn, kv_chunk_size=kv_chunk_size)
       carry = jax.lax.fori_loop(0, even_chunks, loop_fn, carry)
 
     # Remainder kv loop
-    if (k_remainder := (seq_k % chunk_size)) != 0:
+    if (k_remainder := (seq_k % kv_chunk_size)) != 0:
       carry = kv_loop_fn(even_chunks + 1, carry, kv_chunk_size=k_remainder)
 
     # Final normalization by the denominator.
@@ -217,14 +219,14 @@ def _attend_chunked(
   q_chunk_idx, out = 0, None
 
   # Main q loop
-  if seq_q >= chunk_size:
-    loop_fn = functools.partial(q_loop_fn, q_chunk_size=chunk_size)
-    length = seq_q // chunk_size
+  if seq_q >= q_chunk_size:
+    loop_fn = functools.partial(q_loop_fn, q_chunk_size=q_chunk_size)
+    length = seq_q // q_chunk_size
     q_chunk_idx, out = jax.lax.scan(loop_fn, init=0, length=length)
     out = shape_lib.einshape("q...thd->...(qt)hd")(out)
 
   # Remainder q loop
-  if (q_remainder := (seq_q % chunk_size)) != 0:
+  if (q_remainder := (seq_q % q_chunk_size)) != 0:
     _, rem_out = q_loop_fn(q_chunk_idx, None, q_chunk_size=q_remainder)
     out = rem_out if out is None else jnp.concatenate([out, rem_out], axis=-3)
 
@@ -310,7 +312,8 @@ class XlaChunkedDotProductAttention(
 ):
   """XLA chunked dot product attention function."""
 
-  chunk_size: int = 128
+  # Single chunk size or tuple of (q, kv) chunk sizes.
+  chunk_size: int | tuple[int, int] = 128
 
   @jaxtyping.jaxtyped
   @override
@@ -344,7 +347,17 @@ class XlaChunkedDotProductAttention(
       k = jnp.repeat(k, repeats, axis=-2)
       v = jnp.repeat(v, repeats, axis=-2)
 
-    attn_fn = _attend_chunked if paging_info is None else _attend_paged
+    is_paged = paging_info is not None
+    single_chunk = isinstance(self.chunk_size, int)
+    if is_paged and not single_chunk:
+      raise ValueError("Paged attention does not support multiple chunk sizes.")
+
+    if not is_paged and single_chunk:
+      chunk_size = (self.chunk_size,) * 2
+    else:
+      chunk_size = self.chunk_size
+
+    attn_fn = _attend_paged if is_paged else _attend_chunked
     return attn_fn(
         q,
         k,
@@ -361,5 +374,5 @@ class XlaChunkedDotProductAttention(
         q_indices=q_indices,
         k_indices=k_indices,
         normalize_output=normalize_output,
-        chunk_size=self.chunk_size,
+        chunk_size=chunk_size,
     )
