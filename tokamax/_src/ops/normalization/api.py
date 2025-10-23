@@ -22,20 +22,25 @@ import immutabledict
 import jax
 from tokamax._src import triton
 from tokamax._src.ops.normalization import base
-from tokamax._src.ops.normalization import pallas_triton as pl_norm
 
 
 Implementation: TypeAlias = Literal['xla', 'triton']
 
+IMPLEMENTATIONS = dict(xla=base.Normalization())
+_DEFAULT_IMPLEMENTATION = ('xla',)
+
+try:
+  from tokamax._src.ops.normalization import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonNormalization()
+  _DEFAULT_IMPLEMENTATION = ('triton',) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
+
+
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(
-        xla=base.Normalization(),
-        triton=pl_norm.PallasTritonNormalization(),
-    )
+    immutabledict.immutabledict(IMPLEMENTATIONS)
 )
-
-
-_DEFAULT_IMPLEMENTATION = ('triton', 'xla')
 
 
 def layer_norm(
