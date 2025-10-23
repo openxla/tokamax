@@ -23,19 +23,25 @@ import jax
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import triton
 from tokamax._src.ops.gated_linear_unit import base
-from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu
 
 # TODO: Add Pallas-Mosaic-GPU implementation.
 Implementation: TypeAlias = Literal['triton', 'xla']
 
-IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(
-        xla=base.GatedLinearUnit(),
-        triton=pl_triton_glu.PallasTritonGatedLinearUnit(),
-    )
-)
+IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
+_DEFAULT_IMPLEMENTATION = ('xla',)
 
-_DEFAULT_IMPLEMENTATION = ('triton', 'xla')
+try:
+  from tokamax._src.ops.gated_linear_unit import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
+  _DEFAULT_IMPLEMENTATION = ('triton',) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
+
+
+IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
+    immutabledict.immutabledict(IMPLEMENTATIONS)
+)
 
 
 def gated_linear_unit(
