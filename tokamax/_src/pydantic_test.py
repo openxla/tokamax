@@ -30,9 +30,9 @@ from tokamax._src.ops.attention import pallas_triton_flash_attention as pl_attn
 from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
-from tokamax._src.ops.attention import bench_arg_specs as attn_arg_specs
-from tokamax._src.ops.normalization import bench_arg_specs as norm_arg_specs
-from tokamax._src.ops.ragged_dot import bench_arg_specs as ragged_dot_arg_specs
+from tokamax._src.ops.attention import arg_specs as attn_arg_specs
+from tokamax._src.ops.normalization import arg_specs as norm_arg_specs
+from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
 
 
 def _eval_shape(spec):

@@ -26,7 +26,7 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as mgpu
 from tokamax._src.ops.attention import pallas_triton_flash_attention as triton_attn
 from tokamax._src.ops.flex_attention import pallas_triton as triton_flex
 from tokamax._src.ops.flex_attention import wrapper
-from tokamax._src.ops.attention import bench_arg_specs
+from tokamax._src.ops.attention import arg_specs
 
 
 _IMPLS = dict(
@@ -58,11 +58,11 @@ _register_benchmark = functools.partial(
 
 def _register_benchmarks():
   """Registers benchmarks."""
-  for arg_spec in bench_arg_specs.ARG_SPECS:
+  for arg_spec in arg_specs.ARG_SPECS:
     for impl_name in _BENCHMARK_IMPLS_FWD.value:
       _register_benchmark(arg_spec.full_name, impl_name, arg_spec.args)
 
-  for arg_spec in bench_arg_specs.ARG_SPECS:
+  for arg_spec in arg_specs.ARG_SPECS:
     name = arg_spec.full_name
     kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD_BWD.value:

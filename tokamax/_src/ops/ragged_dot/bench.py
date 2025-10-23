@@ -28,7 +28,7 @@ from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu as pl_mgpu
 from tokamax._src.ops.ragged_dot import pallas_triton
-from tokamax._src.ops.ragged_dot import bench_arg_specs
+from tokamax._src.ops.ragged_dot import arg_specs
 
 if jax.__version_info__ >= (0, 6, 3):
   DLL = layout.Layout
@@ -93,7 +93,7 @@ def _transpose_rhs(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
 
 def _register_benchmarks():
   """Registers benchmarks."""
-  for arg_spec in bench_arg_specs.ARG_SPECS:
+  for arg_spec in arg_specs.ARG_SPECS:
     name = arg_spec.full_name
     spec = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS.value:

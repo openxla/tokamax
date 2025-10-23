@@ -33,7 +33,7 @@ from tokamax._src import quantization
 from tokamax._src import test_utils
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import xla_chunked
-from tokamax._src.ops.attention import bench_arg_specs
+from tokamax._src.ops.attention import arg_specs
 
 
 def _create_inputs(
@@ -205,7 +205,7 @@ def _ref_impl_tanh(
   return jnp.einsum("...hqk,...khd->...qhd", weights, v, precision=precision)
 
 
-NAMED_ARG_SPECS = {s.full_name: s.args for s in bench_arg_specs.ARG_SPECS}
+NAMED_ARG_SPECS = {s.full_name: s.args for s in arg_specs.ARG_SPECS}
 
 
 # pylint: disable=missing-function-docstring

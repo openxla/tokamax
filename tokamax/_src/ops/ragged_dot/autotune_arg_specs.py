@@ -15,6 +15,6 @@
 
 from typing import Final
 from tokamax._src.autotuning import arg_spec as common
-from tokamax._src.ops.ragged_dot import bench_arg_specs
+from tokamax._src.ops.ragged_dot import arg_specs
 
-ARGS: Final[tuple[common.ArgSpec, ...]] = bench_arg_specs.ARG_SPECS
+ARGS: Final[tuple[common.ArgSpec, ...]] = arg_specs.ARG_SPECS

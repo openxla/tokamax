@@ -20,7 +20,7 @@ from jax import ShapeDtypeStruct  # pylint: disable=g-importing-member
 from jax.lax import DotAlgorithmPreset  # pylint: disable=g-importing-member
 import jax.numpy as jnp
 from tokamax._src.autotuning import arg_spec
-from tokamax._src.ops.attention import bench_arg_specs
+from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention.base import Mask  # pylint: disable=g-importing-member
 
 
@@ -82,4 +82,4 @@ ARGS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         },
         project='alphafold',
     ),
-) + bench_arg_specs.ARG_SPECS
+) + arg_specs.ARG_SPECS

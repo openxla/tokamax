@@ -25,7 +25,7 @@ from tokamax._src import numerics
 from tokamax._src import quantization
 from tokamax._src import test_utils
 from tokamax._src.ops.ragged_dot import base
-from tokamax._src.ops.ragged_dot import bench_arg_specs
+from tokamax._src.ops.ragged_dot import arg_specs
 
 
 def ref(lhs, rhs, group_sizes, preferred_element_type=None):
@@ -54,7 +54,7 @@ def ref(lhs, rhs, group_sizes, preferred_element_type=None):
   )
 
 
-NAMED_ARG_SPECS = {s.full_name: s.args for s in bench_arg_specs.ARG_SPECS}
+NAMED_ARG_SPECS = {s.full_name: s.args for s in arg_specs.ARG_SPECS}
 
 
 # pylint: disable=missing-function-docstring

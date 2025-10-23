@@ -21,7 +21,7 @@ import google_benchmark
 from tokamax._src import benchmarking
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
-from tokamax._src.ops.normalization import bench_arg_specs
+from tokamax._src.ops.normalization import arg_specs
 
 
 _IMPLS = dict(
@@ -46,12 +46,12 @@ def _register_benchmarks():
       benchmarking.register_benchmark, iterations=10
   )
 
-  for arg_spec in bench_arg_specs.ARG_SPECS:
+  for arg_spec in arg_specs.ARG_SPECS:
     for impl_name in _BENCHMARK_IMPLS_FWD.value:
       impl = _IMPLS[impl_name]
       register_benchmark(arg_spec.full_name, impl_name, impl, arg_spec.args)
 
-  for arg_spec in bench_arg_specs.ARG_SPECS:
+  for arg_spec in arg_specs.ARG_SPECS:
     name = arg_spec.full_name
     kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD_BWD.value:
