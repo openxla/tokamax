@@ -773,7 +773,8 @@ def _bwd(
     dbias = None
   else:
     broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
-    dbias = jnp.sum(ds, axis=broadcast_bias_axes).reshape(orig_bias_shape)
+    dbias = jnp.sum(ds, axis=broadcast_bias_axes)
+    dbias = dbias.astype(bias.dtype).reshape(orig_bias_shape)
   return dq, dk, dv, dbias
 
 
