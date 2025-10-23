@@ -14,10 +14,10 @@
 # ==============================================================================
 """Normalization benchmark argument specifications."""
 
-from typing import Any, Final
+from typing import Final
 
 import jax
-from tokamax._src.autotuning import arg_specs_common as common
+from tokamax._src.autotuning import arg_spec
 
 ShapedArray = jax.ShapeDtypeStruct
 
@@ -34,14 +34,14 @@ def _make_argspec(
     has_offset=None,
     param_dtype=None,
     **kwargs,
-) -> common.ArgSpec:
+) -> arg_spec.ArgSpec:
   """Make argspec from shapes and kwargs."""
   if has_offset is None:
     has_offset = subtract_mean
   if param_dtype is None:
     param_dtype = dtype
 
-  return common.ArgSpec(
+  return arg_spec.ArgSpec(
       args={
           'x': ShapedArray(x_shape, dtype),
           'scale': (
@@ -60,7 +60,7 @@ def _make_argspec(
   )
 
 
-ARG_SPECS: Final[tuple[common.ArgSpec, ...]] = (
+ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     _make_argspec(
         name='alphafold_384res_64chan',
         project='alphafold',

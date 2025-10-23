@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Common functionality for autotuning argument specs."""
+"""Autotuning argument spec."""
 
 import dataclasses
 from typing import Any, Literal, TypeAlias

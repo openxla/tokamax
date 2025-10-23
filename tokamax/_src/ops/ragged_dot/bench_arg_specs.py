@@ -16,7 +16,7 @@
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.autotuning import arg_specs_common as common
+from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.ragged_dot import base
 
 SPEC_SHAPES = {
@@ -56,7 +56,7 @@ def _make_spec(
       jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
       representative_value=tuple(group_sizes),
   )
-  return common.ArgSpec(
+  return arg_spec.ArgSpec(
       name=name,
       args=dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes),
       project=project,

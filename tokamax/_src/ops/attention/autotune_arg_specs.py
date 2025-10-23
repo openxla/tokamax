@@ -15,18 +15,17 @@
 
 """Attention args for autotuning."""
 
-from typing import Any
 from typing import Final
 from jax import ShapeDtypeStruct  # pylint: disable=g-importing-member
 from jax.lax import DotAlgorithmPreset  # pylint: disable=g-importing-member
 import jax.numpy as jnp
-from tokamax._src.autotuning import arg_specs_common as common
+from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.attention import bench_arg_specs
 from tokamax._src.ops.attention.base import Mask  # pylint: disable=g-importing-member
 
 
-ARGS: Final[tuple[common.ArgSpec, ...]] = (
-    common.ArgSpec(
+ARGS: Final[tuple[arg_spec.ArgSpec, ...]] = (
+    arg_spec.ArgSpec(
         args={
             'q': ShapeDtypeStruct(shape=(384, 384, 4, 32), dtype=jnp.bfloat16),
             'k': ShapeDtypeStruct(shape=(384, 384, 4, 32), dtype=jnp.bfloat16),
@@ -45,7 +44,7 @@ ARGS: Final[tuple[common.ArgSpec, ...]] = (
         },
         project='alphafold',
     ),
-    common.ArgSpec(
+    arg_spec.ArgSpec(
         args={
             'q': ShapeDtypeStruct(shape=(384, 384, 4, 64), dtype=jnp.bfloat16),
             'k': ShapeDtypeStruct(shape=(384, 384, 4, 64), dtype=jnp.bfloat16),
@@ -64,7 +63,7 @@ ARGS: Final[tuple[common.ArgSpec, ...]] = (
         },
         project='alphafold',
     ),
-    common.ArgSpec(
+    arg_spec.ArgSpec(
         args={
             'q': ShapeDtypeStruct(shape=(768, 768, 4, 64), dtype=jnp.bfloat16),
             'k': ShapeDtypeStruct(shape=(768, 768, 4, 64), dtype=jnp.bfloat16),

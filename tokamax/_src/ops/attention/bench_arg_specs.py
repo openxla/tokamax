@@ -18,11 +18,11 @@ from typing import Final
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.autotuning import arg_specs_common as common
+from tokamax._src.autotuning import arg_spec
 
 
-ARG_SPECS: Final[tuple[common.ArgSpec, ...]] = (
-    common.ArgSpec(
+ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
+    arg_spec.ArgSpec(
         args={
             'q': jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
             'k': jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
@@ -33,7 +33,7 @@ ARG_SPECS: Final[tuple[common.ArgSpec, ...]] = (
         name='8x7b_bf16',
         tags=('primary',),
     ),
-    common.ArgSpec(
+    arg_spec.ArgSpec(
         args={
             'q': jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
             'k': jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),

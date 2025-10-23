@@ -14,6 +14,6 @@
 # ==============================================================================
 
 from typing import Final
-from tokamax._src.autotuning import arg_specs_common as common
+from tokamax._src.autotuning import arg_spec as common
 
 ARGS: Final[tuple[common.ArgSpec, ...]] = ()
