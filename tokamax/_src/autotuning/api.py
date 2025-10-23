@@ -278,29 +278,19 @@ def autotune(
 
   data = []
   if progress_bar:
+    # For ops without explicit configs, we consider there to be a single config.
+    num_configs = lambda ba: len(cfgs) if (cfgs := ba.autotuning_configs) else 1
     bound_args = tqdm.tqdm(
         bound_args,
         desc="Autotuning",
         unit=" op calls",
+        postfix={"Total microbenchmarks": sum(map(num_configs, bound_args))},
     )
 
-  total_configs = _count_configs(bound_args)
-  for bound_arg in tqdm.tqdm(
-      bound_args,
-      desc="Autotuning",
-      unit=" op calls",
-      postfix={"Total microbenchmarks": total_configs},
-  ):
+  for bound_arg in bound_args:
     try:
       data.append((bound_arg, bound_arg.autotune()))
     except Exception:  # pylint: disable=broad-exception-caught
       logging.exception("Failed to autotune for op %s", bound_arg.op)
 
   return AutotuningResult(device_kind, tuple(data))
-
-
-def _count_configs(bound_args: tuple[op_base.BoundArguments, ...]) -> int:
-  """Returns the number of unique configs in the given bound arguments."""
-  # For ops without explicit configs, we consider there to be a single config.
-  count = lambda x: len(x) if x else 1
-  return sum(count(ba.autotuning_configs) for ba in bound_args)
