@@ -25,7 +25,8 @@ import jax.numpy as jnp
 from tokamax._src import precision as precision_utils
 from tokamax._src import quantization
 from tokamax._src.ops.attention import base
-from tokamax._src.ops.attention import pallas_triton_flash_attention as flash_attn
+from tokamax._src.ops.attention import pallas_triton_flash_attention as fa
+from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
 
 
@@ -44,21 +45,14 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
 
   def __init__(self, *args):
     vjp = _F32PrecisionXlaAttentionVjp()
-    super().__init__(
-        *args, attention_fn=flash_attn.PallasTritonFlashAttention(vjp=vjp)
-    )
+    super().__init__(*args, attention_fn=fa.PallasTritonFlashAttention(vjp=vjp))
 
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
     super().setUp()
 
-  def _run_test(
-      self,
-      q_shape,
-      *args,
-      **kwargs,
-  ):
+  def _run_test(self, q_shape, *args, **kwargs):
     if q_shape[1] >= 32768:
       self.skipTest("Triton seems to fail for so long sequences (b/384038935)")
 
@@ -66,9 +60,9 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
 
   def test_block_d(self):
     """Tests `block_d != None` with quantization and different head_dim_out."""
-    assert isinstance(self._attention_fn, flash_attn.PallasTritonFlashAttention)
+    assert isinstance(self._attention_fn, fa.PallasTritonFlashAttention)
     quantize = quantization.quantize_as(jnp.int8, tile_shape=(1, 1, 1, -1))
-    config = flash_attn.Config(
+    config = fa.Config(
         block_q=64,
         block_k=64,
         block_d=64,
@@ -92,9 +86,9 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
 
   @parameterized.parameters(1, 2)
   def test_small_block_q(self, block_q: int):
-    Config: TypeAlias = flash_attn.Config
+    Config: TypeAlias = fa.Config
     config = Config(block_q=block_q, block_k=64, num_warps=4, num_stages=2)
-    assert isinstance(self._attention_fn, flash_attn.PallasTritonFlashAttention)
+    assert isinstance(self._attention_fn, fa.PallasTritonFlashAttention)
     self._run_test((2, 256, 2, 64), impl=self._attention_fn.with_config(config))
 
   @parameterized.parameters(2, 3, 4)
@@ -102,12 +96,12 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
     self.skipTest("Too slow for OSS")
     quantize = quantization.quantize_as(jnp.int8, tile_shape=(1, 1, 1, -1))
     quant_dequant = lambda x: quantize(x).recompose()
-    assert isinstance(self._attention_fn, flash_attn.PallasTritonFlashAttention)
+    assert isinstance(self._attention_fn, fa.PallasTritonFlashAttention)
 
     def impl(q, k, v, **kwargs):
       k = quantize(k)
       v = quantize(v)
-      config = flash_attn.Config(
+      config = fa.Config(
           block_q=64, block_k=64, num_warps=4, num_stages=2, split_k=split_k
       )
       return self._attention_fn.with_config(config)(q, k, v, **kwargs)
@@ -128,15 +122,17 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
         test_vjp=False,
     )
 
+
 @pytest.mark.skip(reason="Too slow for OSS regression tests.")
 class PallasTritonFlashAttentionWithPallasTritonVjpTest(
     test_base.AttentionTestBase
 ):
 
   def __init__(self, *args):
-    super().__init__(
-        *args, attention_fn=flash_attn.PallasTritonFlashAttention()
+    vjp = fa_vjp.PallasTritonFlashAttentionVjp(
+        dbias_intermediate_dtype=jnp.float32
     )
+    super().__init__(*args, attention_fn=fa.PallasTritonFlashAttention(vjp=vjp))
 
   def _run_test_with_inputs(self, *args, expect_supported=True, **kwargs):
     if kwargs.get("test_vjp", True):

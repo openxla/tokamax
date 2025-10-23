@@ -369,6 +369,7 @@ def _bwd(
     is_causal: bool,
     dropout_rate: float,
     weights_v_dot_precision: jax.lax.DotAlgorithmPreset,
+    dbias_intermediate_dtype: jax.typing.DTypeLike | None,
     config: Config,
 ) -> tuple[
     Float[Array, "T H D"],  # dq
@@ -448,12 +449,18 @@ def _bwd(
   )
   dk_shape = (seq_len_k, num_heads_q, head_dim)
   dv_shape = (seq_len_k, num_heads_q, head_dim_out)
-  ds_shape = (num_heads_q, seq_len_q, seq_len_k)
+  if bias is None:
+    ds_shape_dtype = None
+  else:
+    ds_shape = (num_heads_q, seq_len_q, seq_len_k)
+    if dbias_intermediate_dtype is None or (ds_shape == bias.shape):
+      dbias_intermediate_dtype = bias.dtype
+    ds_shape_dtype = jax.ShapeDtypeStruct(ds_shape, dbias_intermediate_dtype)
   out_shapes = (
       q,
       jax.ShapeDtypeStruct(dk_shape, k.dtype),
       jax.ShapeDtypeStruct(dv_shape, v.dtype),
-      None if bias is None else jax.ShapeDtypeStruct(ds_shape, bias.dtype),
+      ds_shape_dtype,
   )
 
   grid_dkdv = pl.cdiv(seq_len_k, config.block_n1)
@@ -484,6 +491,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   """Pallas-Triton FlashAttention VJP implementation."""
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
+  dbias_intermediate_dtype: jax.typing.DTypeLike | None = None
 
   @override
   def _fwd(
@@ -539,6 +547,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
         logits_soft_cap=logits_soft_cap,
         q_k_dot_precision=q_k_dot_precision,
         weights_v_dot_precision=weights_v_dot_precision,
+        dbias_intermediate_dtype=self.dbias_intermediate_dtype,
     )
 
     def broadcast_to_rank(x, rank):
@@ -558,7 +567,8 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       dbias = None
     else:
       broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
-      dbias = jnp.sum(ds, axis=broadcast_bias_axes).reshape(orig_bias_shape)
+      dbias = jnp.sum(ds, axis=broadcast_bias_axes)
+      dbias = dbias.astype(bias.dtype).reshape(orig_bias_shape)
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
   @override
