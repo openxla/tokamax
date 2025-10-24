@@ -73,7 +73,7 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
 
     def impl(q, k, v, **kwargs):
       k, v = map(quantize, (k, v))
-      return self._attention_fn.with_config(config)(q, k, v, **kwargs)
+      return self._attention_fn.replace(config=config)(q, k, v, **kwargs)
 
     def ref_impl(q, k, v, **kwargs):
       k, v = map(lambda x: quantize(x).recompose(), (k, v))
@@ -89,7 +89,8 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
     Config: TypeAlias = fa.Config
     config = Config(block_q=block_q, block_k=64, num_warps=4, num_stages=2)
     assert isinstance(self._attention_fn, fa.PallasTritonFlashAttention)
-    self._run_test((2, 256, 2, 64), impl=self._attention_fn.with_config(config))
+    impl = self._attention_fn.replace(config=config)
+    self._run_test((2, 256, 2, 64), impl=impl)
 
   @parameterized.parameters(2, 3, 4)
   def test_split_k(self, split_k):
@@ -104,7 +105,7 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
       config = fa.Config(
           block_q=64, block_k=64, num_warps=4, num_stages=2, split_k=split_k
       )
-      return self._attention_fn.with_config(config)(q, k, v, **kwargs)
+      return self._attention_fn.replace(config=config)(q, k, v, **kwargs)
 
     def ref_impl(q, k, v, **kwargs):
       k = quant_dequant(k)

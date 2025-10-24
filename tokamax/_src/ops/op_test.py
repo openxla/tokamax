@@ -188,7 +188,7 @@ class BoundArgumentsTest(parameterized.TestCase):
       ),
   )
   def test_roundtrip(self, op, arg_specs):
-    object.__setattr__(op, "vjp", None)
+    op = op.replace(vjp=None)
     adapter = op_base.BOUND_ARGS_ADAPTER
     arg_specs = arg_specs.ARG_SPECS
     for arg_spec in arg_specs:
@@ -197,12 +197,10 @@ class BoundArgumentsTest(parameterized.TestCase):
         ba = op.bind(**_eval_shape(spec))
         abstract_args = op_base._abstractify(dict(ba.arguments))
         ba = op_base.BoundArguments(op, abstract_args)
-        ba_roundtrip = adapter.validate_python(adapter.dump_python(ba))
-        object.__setattr__(ba_roundtrip.op, "vjp", None)
-        self.assertEqual(ba, ba_roundtrip)
-        ba_roundtrip = adapter.validate_json(adapter.dump_json(ba))
-        object.__setattr__(ba_roundtrip.op, "vjp", None)
-        self.assertEqual(ba, ba_roundtrip)
+        ba2 = adapter.validate_python(adapter.dump_python(ba))
+        self.assertEqual(ba, ba2.replace(op=ba2.op.replace(vjp=None)))
+        ba3 = adapter.validate_json(adapter.dump_json(ba))
+        self.assertEqual(ba, ba3.replace(op=ba3.op.replace(vjp=None)))
 
 
 if __name__ == "__main__":

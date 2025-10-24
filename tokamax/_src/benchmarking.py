@@ -504,10 +504,10 @@ def get_benchmark_registrar(
 
   def registrar(name, impl_name, kwargs, **bmark_kwargs):
     impl = impls[impl_name]
-    if hasattr(impl, 'bind') and hasattr(impl, 'with_config'):
+    if hasattr(impl, 'bind') and hasattr(impl, 'replace'):
       kwargs_ = kwargs() if callable(kwargs) else kwargs
       config = impl.bind(**kwargs_).default_config
-      impl = impl.with_config(config)
+      impl = impl.replace(config=config)
       is_null_config = type(config).__name__ == 'NullConfig'
       metadata = None if is_null_config else dict(config=config)
     else:

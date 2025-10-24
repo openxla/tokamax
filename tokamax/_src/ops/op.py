@@ -80,7 +80,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
   For example, to retrieve a config from the autotuning cache:
   ```python
   config = op.bind(*args, **kwargs).cached_autotuning_data.fastest_config
-  op = op.with_config(config)
+  op = op.replace(config=config)
   ```
 
   Implementors of new ops should do the following:
@@ -167,9 +167,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       config = ba.default_config
 
       # Serialize args into the HLO to allow for, e.g., offline autotuning.
-      json_op = copy.copy(self)
-      object.__setattr__(json_op, "config", config)
-      object.__setattr__(json_op, "vjp", None)
+      json_op = self.replace(config=config, vjp=None)
       json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
       json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
 
@@ -261,14 +259,18 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     ba.apply_defaults()
     return BoundArguments(self, ba.arguments)
 
-  def with_config(self, config: _Config) -> Self:
-    return dataclasses.replace(self, config=config)
+  def replace(self, **kwargs) -> Self:
+    new_op = dataclasses.replace(self, **kwargs)
+    # NOTE: We cannot just use `dataclasses.replace(self, vjp=vjp)` when `vjp`
+    # is `None`, as many ops will set a default VJP in `__post_init__`.
+    if "vjp" in kwargs:
+      object.__setattr__(new_op, "vjp", kwargs["vjp"])
+    return new_op
 
   def get_autotuning_cache(
       self, device_kind: DeviceKind | None = None
   ) -> dict[_Key, AutotuningData[_Config]]:
-    self_no_vjp = copy.copy(self)
-    object.__setattr__(self_no_vjp, "vjp", None)
+    self_no_vjp = self.replace(vjp=None)
     if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
       cache = autotuning_cache.AutotuningCache(self_no_vjp)
       _AUTOTUNING_CACHE[self_no_vjp] = cache
@@ -502,7 +504,8 @@ class BoundArguments(Generic[_Config, _Key]):
     ba = batched if (batched := self.batched).vmap_axis_sizes else self
     args, kwargs = ba.args, ba.kwargs
     logging.debug("Autotuning %s(%s)", self.op, self.arguments)
-    data = autotuner.autotune(self.op.with_config, configs, *args, **kwargs)
+    op_with_config = lambda config: self.op.replace(config=config)
+    data = autotuner.autotune(op_with_config, configs, *args, **kwargs)
     if cache_results:
       d = self.op.get_autotuning_cache()
       d[self.autotuning_cache_key] = data
@@ -551,6 +554,8 @@ class BoundArguments(Generic[_Config, _Key]):
             serialize, info_arg=True, schema=op_schema
         ),
     )
+
+  replace = dataclasses.replace
 
 
 @dataclasses.dataclass(frozen=True)

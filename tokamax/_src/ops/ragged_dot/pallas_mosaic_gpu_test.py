@@ -72,10 +72,10 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
           expect_supported = False
 
       if expect_supported:
-        return op.with_config(config or _CONFIG)(lhs, rhs, **kwargs)
+        return op.replace(config=config or _CONFIG)(lhs, rhs, **kwargs)
 
       with self.assertRaises(NotImplementedError) as e:
-        _ = op.with_config(config or _CONFIG)(lhs, rhs, **kwargs)
+        _ = op.replace(config=config or _CONFIG)(lhs, rhs, **kwargs)
       self.skipTest(f"Test not supported: {e.msg}")
 
     super().__init__(*args, dot_fn=fn)
