@@ -249,7 +249,6 @@ def block_sizes_strategy(
     q_seq_len: int,
     kv_seq_len: int,
     include_bwd_blocks: bool = False,
-    use_fused_bwd_kernel: bool = False,
 ) -> splash.SplashConfig:
   all_block_shapes = [128, 256, 512]
   q_layout = draw(hps.sampled_from(splash.QKVLayout))
@@ -276,11 +275,6 @@ def block_sizes_strategy(
       draw(hps.sampled_from(q_valid_block_shapes)),
       draw(hps.sampled_from(kv_valid_block_shapes)),
   )
-  if use_fused_bwd_kernel:
-    bq_dq, bkv_dq = None, None
-  else:
-    bq_dq = draw(hps.sampled_from(q_valid_block_shapes))
-    bkv_dq = draw(hps.sampled_from(kv_valid_block_shapes))
   block_kv_dkv_compute = draw(
       hps.sampled_from(
           [None, *[b for b in kv_valid_block_shapes if b <= bkv_dkv]]
@@ -293,9 +287,6 @@ def block_sizes_strategy(
       block_q_dkv=bq_dkv,
       block_kv_dkv=bkv_dkv,
       block_kv_dkv_compute=block_kv_dkv_compute,
-      block_q_dq=bq_dq,
-      block_kv_dq=bkv_dq,
-      use_fused_bwd_kernel=use_fused_bwd_kernel,
       **layouts,
   )
 
@@ -518,7 +509,6 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       is_mqa=(False, True),
       is_segmented=(False, True),
       downcast_smem_data=(False, True),
-      use_fused_bwd_kernel=(False, True),
       is_dynamic_mask=(False, True),
       use_base2_exp=(False, True),
       # use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
@@ -532,7 +522,6 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       is_mqa,
       is_segmented,
       downcast_smem_data,
-      use_fused_bwd_kernel,
       is_dynamic_mask,
       use_base2_exp,
       use_max_logit_estimate,
@@ -582,8 +571,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     if is_dynamic_mask:
       mask = jnp.array(mask[:, :])
     config = data.draw(
-        block_sizes_strategy(q_seq_len, kv_seq_len, include_bwd_blocks=True,
-                             use_fused_bwd_kernel=use_fused_bwd_kernel)
+        block_sizes_strategy(q_seq_len, kv_seq_len, include_bwd_blocks=True)
     )
 
     config = dataclasses.replace(
