@@ -70,8 +70,8 @@ def _attend_chunk(
         q,
         k,
         precision=q_k_dot_precision,
-        preferred_element_type=logits_dtype,
-    )
+        preferred_element_type=q_k_dot_precision.accumulation_type,
+    ).astype(logits_dtype)
 
     logits *= logits_scale
 
@@ -104,8 +104,8 @@ def _attend_chunk(
         weights,
         v,
         precision=weights_v_dot_precision,
-        preferred_element_type=accum.dtype,
-    )
+        preferred_element_type=weights_v_dot_precision.accumulation_type,
+    ).astype(accum.dtype)
 
     return accum, x_max, denom
 

@@ -600,8 +600,8 @@ class DotProductAttention(
         q,
         k,
         precision=q_k_dot_precision,
-        preferred_element_type=logits_dtype,
-    )
+        preferred_element_type=q_k_dot_precision.accumulation_type,
+    ).astype(logits_dtype)
 
     logits *= logits_scale
 
@@ -633,8 +633,8 @@ class DotProductAttention(
         weights,
         v,
         precision=weights_v_dot_precision,
-        preferred_element_type=q.dtype,
-    )
+        preferred_element_type=weights_v_dot_precision.accumulation_type,
+    ).astype(q.dtype)
     return out, (softmax_residuals if return_residuals else None)
 
 
