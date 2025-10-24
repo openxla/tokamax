@@ -18,11 +18,6 @@
 import dataclasses
 from typing import Any, Literal, TypeAlias
 
-ProjectName: TypeAlias = Literal[
-    'alphafold'
-    'deepseek2',
-    'mixtral',
-]
 
 # Tags are used to quickly identify different workloads for the same op.
 # forward_only models are models that only require forward passes - meaning no
@@ -46,7 +41,7 @@ class ArgSpec:
   """
 
   args: dict[str, Any]
-  project: ProjectName | None = None
+  project: str | None = None
   name: str | None = None
   tags: tuple[Tag, ...] = tuple()
 
