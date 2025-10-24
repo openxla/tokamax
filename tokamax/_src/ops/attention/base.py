@@ -627,7 +627,6 @@ class DotProductAttention(
     if dropout_mask is not None:
       weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
 
-    weights = weights.astype(v.dtype)
     out = jnp.einsum(
         "...hqk,...khd->...qhd",
         weights,

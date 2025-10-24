@@ -98,7 +98,6 @@ def _attend_chunk(
     if dropout_mask is not None:
       weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
 
-    weights = weights.astype(v.dtype)
     accum += jnp.einsum(
         "...hqk,...khd->...qhd",
         weights,
