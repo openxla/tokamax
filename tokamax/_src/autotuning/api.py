@@ -210,17 +210,26 @@ _API_IMPLEMENTATIONS: Final[
 })
 
 
-def get_op_implementations(op: op_base.Op) -> dict[str, Callable[..., Any]]:
+def get_op_implementations(
+    op: op_base.Op,
+    device: jax.Device | None = None,
+) -> dict[str, Callable[..., Any]]:
   """Returns all implementations of the given op.
 
   Args:
     op: The op for which to get the implementations.
+    device: The device to get implementations for. If not provided, all
+      implementations will be returned.
 
   Returns:
     An (implementation name, implementation) mapping.
   """
   mro = inspect.getmro(op.__class__)
-  return dict(_API_IMPLEMENTATIONS.get(mro[mro.index(op_base.Op) - 1], {}))
+  impls = dict(_API_IMPLEMENTATIONS.get(mro[mro.index(op_base.Op) - 1], {}))
+
+  if device is not None:
+    impls = {k: v for k, v in impls.items() if v.supported_on(device)}  # pytype: disable=attribute-error
+  return impls
 
 
 def autotune(
@@ -242,7 +251,8 @@ def autotune(
       To autotune a callable with keyword arguments, pass the results of
       `tokamax.get_bound_args(f, *args, **kwargs)` to `autotune`.
     ignore_cache: Whether to ignore the autotuningcache and re-autotune.
-    all_implementations: Whether to autotune all implementations of the op.
+    all_implementations: Whether to autotune all implementations of the op that
+      is tunable on the current device.
     progress_bar: Whether to show a progress bar (default: `True`).
 
   Returns:
@@ -269,10 +279,11 @@ def autotune(
     raise ValueError(f"Multiple device kinds found: {device_kinds}")
 
   if all_implementations:
+    default_device = backend.get_default_device()
     bound_args = tuple(
         op_base.BoundArguments(op, ba.arguments)  # pylint: disable=g-complex-comprehension
         for ba in bound_args
-        for op in get_op_implementations(ba.op).values()
+        for op in get_op_implementations(ba.op, device=default_device).values()
         if isinstance(op, op_base.Op)
     )
 
