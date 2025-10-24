@@ -18,9 +18,12 @@ from collections.abc import Sequence
 from typing import Final, Literal, TypeAlias
 
 import jax
+import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
-from tokamax._src.ops.triangle_multiplication import base
+from tokamax._src import shape as shape_lib
+from tokamax._src.ops.gated_linear_unit import api as glu_api
+from tokamax._src.ops.normalization import api as norm_api
 
 
 Implementation: TypeAlias = Literal["xla"]
@@ -87,17 +90,49 @@ def triangle_multiplication(
   if tuple(implementation) != ("xla",):
     raise NotImplementedError("Only XLA implementation is supported.")
 
-  return base.TriangleMultiplication()(
-      x=x,
-      mask=mask,
-      gate_projection_weights=gate_projection_weights,
-      projection_out_weights=projection_out_weights,
-      gate_out_weights=gate_out_weights,
-      layernorm_in_scale=layernorm_in_scale,
-      layernorm_in_offset=layernorm_in_offset,
-      layernorm_out_scale=layernorm_out_scale,
-      layernorm_out_offset=layernorm_out_offset,
-      triangle_type=triangle_type,
-      precision=precision,
+  mask = mask[..., None]
+
+  c_dim = x.shape[-1]
+  h_dim = gate_projection_weights.shape[2]
+
+  gate_projection_weights = gate_projection_weights.reshape(c_dim, 2, -1)
+
+  left_act = norm_api.layer_norm(
+      x,
+      scale=layernorm_in_scale,
+      offset=layernorm_in_offset,
       epsilon=epsilon,
+      axis=-1,
+      implementation=implementation,
   )
+
+  proj_act = glu_api.gated_linear_unit(
+      left_act,
+      gate_projection_weights,
+      activation=jax.nn.sigmoid,
+      precision=precision,
+      implementation=implementation,
+  )
+  proj_act = mask * proj_act
+
+  proj_act = shape_lib.einshape("ij(dc)->dcij", d=2, c=h_dim)(proj_act)
+  left_proj_act, right_proj_act = proj_act
+
+  equation = "cik,cjk->ijc" if triangle_type == "outgoing" else "ckj,cki->ijc"
+  act = jnp.einsum(equation, left_proj_act, right_proj_act, precision=precision)
+
+  act = norm_api.layer_norm(
+      act,
+      scale=layernorm_out_scale,
+      offset=layernorm_out_offset,
+      epsilon=epsilon,
+      axis=-1,
+      implementation=implementation,
+  )
+
+  act = jnp.dot(act, projection_out_weights, precision=precision)
+
+  gate_values = jnp.dot(left_act, gate_out_weights, precision=precision)
+  act *= jax.nn.sigmoid(gate_values)
+
+  return act
