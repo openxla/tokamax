@@ -44,7 +44,7 @@ def _make_spec(
     lhs_dtype,
     rhs_dtype,
     group_sizes=None,
-    project=None,
+    project='',
 ):
   lhs = jax.ShapeDtypeStruct((m, k), lhs_dtype)
   rhs = jax.ShapeDtypeStruct((num_groups, k, n), rhs_dtype)

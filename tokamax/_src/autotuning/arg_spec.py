@@ -41,11 +41,11 @@ class ArgSpec:
   """
 
   args: dict[str, Any]
-  project: str | None = None
-  name: str | None = None
-  tags: tuple[Tag, ...] = tuple()
+  project: str = ''
+  name: str = ''
+  tags: tuple[Tag, ...] = ()
 
   @property
   def full_name(self) -> str:
     """The full name (including project name)."""
-    return '_'.join(filter(None, (self.project, self.name)))
+    return '_'.join(filter(bool, (self.project, self.name)))
