@@ -17,6 +17,7 @@
 
 from collections.abc import Callable, Sequence
 import dataclasses
+import enum
 import functools
 import jax
 from jax import lax
@@ -26,6 +27,11 @@ import jax.numpy as jnp
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import memref
 import pydantic
+
+
+class MatmulDimension(enum.IntEnum):
+  M = 0
+  N = 1
 
 
 @pydantic.dataclasses.dataclass(frozen=True)
@@ -39,6 +45,8 @@ class Config:
   warp_specialized: bool = True
   persistent: bool = True
   collective: bool = False  # B200 collective MMA
+  grid_minor_dim: MatmulDimension = MatmulDimension.N
+  grid_tile_width: int = 1
 
 
 @dataclasses.dataclass(frozen=True)

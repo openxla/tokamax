@@ -30,6 +30,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel as non_qua
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel as quant_kernel
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel_blackwell as quant_kernel_blackwell
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_kernel as quant_ws_kernel
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel_blackwell as non_quant_kernel_blackwell
 from typing_extensions import override
 
 Config = common.Config
@@ -82,15 +83,36 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
     if isinstance(lhs, QuantizedArray):
       lhs = lhs.recompose()
 
-    if isinstance(rhs, QuantizedArray):
-      if "b200" in backend.get_default_device().device_kind.lower():
+    device_kind = backend.get_default_device().device_kind.lower()
+    is_hopper = "h100" in device_kind or "h200" in device_kind
+    is_blackwell = "b200" in device_kind
+    is_rhs_quantized = isinstance(rhs, QuantizedArray)
+
+    if is_rhs_quantized:
+      if is_hopper:
+        if config.warp_specialized:
+          fn = quant_ws_kernel.ragged_dot_quantized_ws_kernel
+        else:
+          fn = quant_kernel.ragged_dot_quantized_kernel
+      elif is_blackwell:
         fn = quant_kernel_blackwell.ragged_dot_gpu_quant_blackwell_kernel
-      elif config.warp_specialized:
-        fn = quant_ws_kernel.ragged_dot_quantized_ws_kernel
       else:
-        fn = quant_kernel.ragged_dot_quantized_kernel
+        raise NotImplementedError(
+            "Quantized kernel is not supported on this"
+            f" platform({device_kind})."
+        )
     else:
-      fn = non_quant_kernel.ragged_dot_non_quantized_kernel
+      if is_hopper:
+        fn = non_quant_kernel.ragged_dot_non_quantized_kernel
+      elif is_blackwell:
+        fn = (
+            non_quant_kernel_blackwell.ragged_dot_gpu_non_quant_blackwell_kernel
+        )
+      else:
+        raise NotImplementedError(
+            "Non-quantized kernel is not supported on this"
+            f" platform({device_kind})."
+        )
 
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.array(group_sizes)
@@ -110,16 +132,32 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> common.Config:
     _, rhs = ba.args
+    quantized = isinstance(rhs, quantization.QuantizedArray)
     device_kind = backend.get_default_device().device_kind.lower()
     if "b200" in device_kind:
-      return common.Config(
-          block_m=128,
-          block_n=128,
-          block_k=256,
-          num_stages=2,
-          split_k=1,
-          grid_block_n=1,
-      )
+      if quantized:
+        return common.Config(
+            block_m=128,
+            block_n=128,
+            block_k=256,
+            num_stages=2,
+            split_k=1,
+            grid_block_n=1,
+        )
+      else:
+        return common.Config(
+            block_m=64,
+            block_n=128,
+            block_k=256,
+            num_stages=2,
+            split_k=1,
+            grid_block_n=1,
+            warp_specialized=True,
+            persistent=False,
+            collective=True,
+            grid_minor_dim=common.MatmulDimension.M,
+            grid_tile_width=4,
+        )
     return common.Config(
         block_m=64,
         block_n=64,
