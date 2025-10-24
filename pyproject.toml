@@ -20,7 +20,7 @@ license = {file = "LICENSE"}
 requires-python = ">=3.11"
 dependencies = [
     "absl-py>=2.3.0",
-    "chex>=0.1.81",
+    "chex>=0.1.91",
     "einshape",
     "google-benchmark>=1.9.0",
     "jax>=0.8.0",
