@@ -1461,6 +1461,7 @@ def _splash_attention_bwd_dkv(
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   kv_seq_len, head_dim_v = v.shape[-2:]
   num_kv_heads = 1 if is_mqa else k.shape[0]
+  dynamic_grid = config.dq_reduction_steps == 3
 
   bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)
   if bq > q_seq_len:
@@ -1617,6 +1618,8 @@ def _splash_attention_bwd_dkv(
     q_dtype = q.dtype if kv_steps <= 4 else jnp.float32
     dq_shape = jax.ShapeDtypeStruct((kv_steps, *q.shape), q_dtype)
   elif dq_reduction_steps == 3:
+    # Create a circular buffer to accumulate query gradients in-place. With
+    # double-buffering, it can only be safely done every 3 steps.
     dq_index_map = unravel(lambda h, i, j, *_: (j % 3, h, i, 0))
     dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
     dq_alias_spec = dq_spec
@@ -1643,7 +1646,19 @@ def _splash_attention_bwd_dkv(
   ]
   in_specs += [dq_alias_spec]
 
-  if q_heads_per_kv_head != 1:
+  if dynamic_grid:
+    prefix = () if is_mqa else (None,)
+    if q_heads_per_kv_head == 1:
+      # We don't need to pipeline over the inputs aliases because we don't write to them.
+      dk_alias_spec = pl.BlockSpec(prefix + (bq, head_dim_qk), lambda *_: (0,) * k.ndim)
+      dv_alias_spec = pl.BlockSpec(prefix + (bq, head_dim_v), lambda *_: (0,) * v.ndim)
+    else:
+      dk_alias_spec = dk_spec
+      dv_alias_spec = dv_spec
+    in_specs += [dk_alias_spec, dv_alias_spec]
+    dk = jnp.zeros(k.shape, dtype=dk_type)
+    dv = jnp.zeros(v.shape, dtype=dv_type)
+  elif q_heads_per_kv_head != 1:
     # in/out aliasing to accumulate within kv groups.
     in_specs += [dk_spec, dv_spec]
     dk = lax.empty(k.shape, dtype=dk_type)
@@ -1710,7 +1725,7 @@ def _splash_attention_bwd_dkv(
   num_args = sum(1 for x in args if x is not None)
   input_output_aliases = {}
   if dq_reduction_steps == 3:
-    if q_heads_per_kv_head != 1:
+    if dynamic_grid or q_heads_per_kv_head != 1:
       input_output_aliases = {num_args: 0, num_args + 1: 1, num_args + 2: 2}
     else:
       input_output_aliases = {num_args: 0}
@@ -1970,7 +1985,6 @@ def _make_splash_attention(
       (config.block_q, config.block_kv),
   )
   fwd_mask_sparsity = float(np.mean(fwd_mask_info.block_mask != 0))
-
   fwd_mask_info = tree_util.tree_map(jnp.array, fwd_mask_info)
 
   dkv_mask_info = None
@@ -1980,7 +1994,7 @@ def _make_splash_attention(
         mask,
         (bq_dkv, bkv_dkv),
         is_dkv=True,
-        return_dynamic_grid=False,
+        return_dynamic_grid=config.dq_reduction_steps == 3,
     )
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 
