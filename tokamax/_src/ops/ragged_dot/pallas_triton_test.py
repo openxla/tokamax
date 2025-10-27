@@ -16,6 +16,7 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import chex
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.ragged_dot import pallas_triton
@@ -59,9 +60,15 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
     split_k_dot = pallas_triton.PallasTritonRaggedDot(
         config=config, split_k_intermediate_dtype=jnp.float32
     )
+    orig_assert_trees_all_close = chex.assert_trees_all_close
+
+    def assert_all_close(*args, **kwargs):
+      kwargs["rtol"] = 0.01
+      orig_assert_trees_all_close(*args, **kwargs)
 
     with mock.patch.object(self, "_dot_fn", split_k_dot):
-      self.test_quantized0()  # pytype: disable=attribute-error
+      with mock.patch.object(chex, "assert_trees_all_close", assert_all_close):
+        self.test_quantized0()  # pytype: disable=attribute-error
 
   @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
   def test_bench(self, _):

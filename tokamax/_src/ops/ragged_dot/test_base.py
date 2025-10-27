@@ -20,6 +20,7 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tokamax._src import numerics
 from tokamax._src import quantization
 from tokamax._src import test_utils
@@ -74,27 +75,29 @@ class RaggedDotTestBase(parameterized.TestCase):
         a, b, **dict(self.tol, **tol)
     )
 
+  def _create_inputs(self, num_groups, m, k, n, dtype, random_groups=False):
+    rng = np.random.default_rng(sum(self._testMethodName.encode()))
+    a = jnp.array(rng.standard_normal((m, k), np.float32), dtype)
+    b = jnp.array(rng.standard_normal((num_groups, k, n), np.float32), dtype)
+    if random_groups:
+      group_sizes = rng.integers(0, m // num_groups, (num_groups,), np.int32)
+      group_sizes = jnp.array(group_sizes)
+    else:
+      group_sizes = jnp.array([m // num_groups] * num_groups, jnp.uint32)
+    return a, b, group_sizes
+
   @parameterized.parameters(jnp.bfloat16, jnp.float32)
   def test_simple(self, dtype):
-    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
     num_groups, m, k, n = 8, 1024, 128, 256
-    a = jax.random.normal(rng0, (m, k), dtype=dtype)
-    b = jax.random.normal(rng1, (num_groups, k, n), dtype=dtype)
-    group_sizes = jnp.array([m // num_groups] * num_groups, jnp.uint32)
-
+    a, b, group_sizes = self._create_inputs(num_groups, m, k, n, dtype)
     actual = self._dot_fn(a, b, group_sizes=group_sizes)
     self.assert_close(actual, ref(a, b, group_sizes))
 
   def test_padded(self):
-    rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
     num_groups, m, k, n = 8, 1024, 128, 256
-    a = jax.random.normal(rng0, (m, k))
-    b = jax.random.normal(rng1, (num_groups, k, n))
-    max_group_size = m // num_groups
-    group_sizes = jax.random.randint(
-        rng2, (num_groups,), 0, max_group_size, dtype=jnp.uint32
+    a, b, group_sizes = self._create_inputs(
+        num_groups, m, k, n, jnp.float32, random_groups=True
     )
-
     expected = ref(a, b, group_sizes)
     actual = self._dot_fn(a, b, group_sizes=group_sizes)
     count = sum(group_sizes)
@@ -107,13 +110,9 @@ class RaggedDotTestBase(parameterized.TestCase):
   )
   def test_quantized(self, dtype, a_tile_shape, b_tile_shape):
     dtype = jnp.dtype(dtype)
-    rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
     num_groups, m, k, n = 8, 512, 256, 512
-    a = jax.random.normal(rng0, (m, k), dtype=jnp.bfloat16)
-    b = jax.random.normal(rng1, (num_groups, k, n), dtype=jnp.bfloat16)
-    max_group_size = m // num_groups
-    group_sizes = jax.random.randint(
-        rng2, (num_groups,), 0, max_group_size, dtype=jnp.uint32
+    a, b, group_sizes = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16, random_groups=True
     )
 
     if a_tile_shape is not None:
@@ -134,12 +133,8 @@ class RaggedDotTestBase(parameterized.TestCase):
 
   @parameterized.parameters(None, jnp.bfloat16, jnp.float32)
   def test_preferred_element_type(self, out_type):
-    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
     num_groups, m, k, n = 8, 1024, 128, 256
-    a = jax.random.normal(rng0, (m, k), dtype=jnp.bfloat16)
-    b = jax.random.normal(rng1, (num_groups, k, n), dtype=jnp.bfloat16)
-    group_sizes = jnp.array([m // num_groups] * num_groups, jnp.uint32)
-
+    a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
     actual = self._dot_fn(
         a, b, group_sizes=group_sizes, preferred_element_type=out_type
     )
@@ -149,10 +144,7 @@ class RaggedDotTestBase(parameterized.TestCase):
 
   @parameterized.parameters((8, 1024, 128, 256), (8, 128, 64, 128))
   def test_vjp(self, num_groups, m, k, n):
-    rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
-    a = jax.random.normal(rng0, (m, k))
-    b = jax.random.normal(rng1, (num_groups, k, n))
-    group_sizes = jnp.array([m // num_groups] * num_groups, jnp.uint32)
+    a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.float32)
     f = functools.partial(self._dot_fn, group_sizes=group_sizes)
     f_ref = functools.partial(ref, group_sizes=group_sizes)
     self.assert_close(f(a, b), f_ref(a, b))
@@ -161,15 +153,12 @@ class RaggedDotTestBase(parameterized.TestCase):
     expected, f_ref_vjp = jax.vjp(f_ref, a, b)
     self.assert_close(actual, expected)
 
-    dout = jax.random.normal(rng2, (m, n), dtype=expected.dtype)
-    self.assert_close(f_vjp(dout), f_ref_vjp(dout))
+    dout = jax.nn.standardize(expected).astype(actual.dtype)
+    self.assert_close(f_vjp(dout), f_ref_vjp(dout.astype(expected.dtype)))
 
   def test_group_sizes(self):
-    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
     num_groups, m, k, n = 8, 1024, 128, 256
-    a = jax.random.normal(rng0, (m, k))
-    b = jax.random.normal(rng1, (num_groups, k, n))
-    group_sizes = jnp.array([m // num_groups] * num_groups, jnp.int32)
+    a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.float32)
     expected = ref(a, b, group_sizes=group_sizes)
     group_sizes = base.GroupSizes(group_sizes, (1,) * num_groups)
     actual = self._dot_fn(a, b, group_sizes=group_sizes)  # pytype: disable=wrong-arg-types
