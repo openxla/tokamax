@@ -181,17 +181,17 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 
           try:
             out, f_vjp, residuals = jax.vjp(fwd_flat, *arrays, has_aux=True)
-
-            # This is a hack to work around the pytree shape consistency checks
-            # performed by `custom_batching`. As we are returning a new function
-            # instance (the `vjp`), these checks fail, though it will work.
-            assert isinstance(f_vjp, jax.tree_util.Partial)
-            assert len(f_vjp.args) == 1
-            assert not f_vjp.keywords
-            assert isinstance(f_vjp.args[0], jax.tree_util.Partial)
-            arg = f_vjp.args[0]
-            arg = jax.tree_util.Partial(_AlwaysEqual(arg.func), *arg.args)
-            f_vjp = jax.tree_util.Partial(_AlwaysEqual(f_vjp.func), arg)
+            if not jax.config.jax_vjp3:
+              # This is a hack to work around the pytree shape consistency
+              # checks performed by `custom_batching`. As we are returning a new
+              # function instance (`vjp`), the checks fail, though it'll work.
+              assert isinstance(f_vjp, jax.tree_util.Partial)
+              assert len(f_vjp.args) == 1
+              assert not f_vjp.keywords
+              assert isinstance(f_vjp.args[0], jax.tree_util.Partial)
+              arg = f_vjp.args[0]
+              arg = jax.tree_util.Partial(_AlwaysEqual(arg.func), *arg.args)
+              f_vjp = jax.tree_util.Partial(_AlwaysEqual(f_vjp.func), arg)
           except Exception as e:  # pylint: disable=broad-except
             out, residuals = fwd_flat(*arrays)
 
