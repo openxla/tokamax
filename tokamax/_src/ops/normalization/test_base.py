@@ -27,7 +27,9 @@ from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import arg_specs
 
 
-NAMED_ARG_SPECS = {s.full_name: s.args for s in arg_specs.ARG_SPECS}
+NAMED_ARG_SPECS = {
+    s.full_name: s.args for s in arg_specs.ARG_SPECS if "primary" in s.tags
+}
 
 
 # pylint: disable=missing-function-docstring

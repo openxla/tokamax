@@ -205,7 +205,9 @@ def _ref_impl_tanh(
   return jnp.einsum("...hqk,...khd->...qhd", weights, v, precision=precision)
 
 
-NAMED_ARG_SPECS = {s.full_name: s.args for s in arg_specs.ARG_SPECS}
+NAMED_ARG_SPECS = {
+    s.full_name: s.args for s in arg_specs.ARG_SPECS if "primary" in s.tags
+}
 
 
 # pylint: disable=missing-function-docstring

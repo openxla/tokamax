@@ -12,21 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Attention benchmark argument specifications."""
+"""Attention argument specifications."""
 
 from typing import Final
 
 import jax
 import jax.numpy as jnp
 from tokamax._src.autotuning import arg_spec
+from tokamax._src.ops.attention import base
+
+
+ShapeDtype = jax.ShapeDtypeStruct
+Mask = base.Mask
 
 
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     arg_spec.ArgSpec(
         args={
-            'q': jax.ShapeDtypeStruct((32, 4096, 32, 128), jnp.bfloat16),
-            'k': jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
-            'v': jax.ShapeDtypeStruct((32, 4096, 8, 128), jnp.bfloat16),
+            'q': ShapeDtype((32, 4096, 32, 128), jnp.bfloat16),
+            'k': ShapeDtype((32, 4096, 8, 128), jnp.bfloat16),
+            'v': ShapeDtype((32, 4096, 8, 128), jnp.bfloat16),
             'is_causal': True,
         },
         project='mixtral',
@@ -35,13 +40,43 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     ),
     arg_spec.ArgSpec(
         args={
-            'q': jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-            'k': jax.ShapeDtypeStruct((512, 1024, 16, 192), jnp.bfloat16),
-            'v': jax.ShapeDtypeStruct((512, 1024, 16, 128), jnp.bfloat16),
+            'q': ShapeDtype((512, 1024, 16, 192), jnp.bfloat16),
+            'k': ShapeDtype((512, 1024, 16, 192), jnp.bfloat16),
+            'v': ShapeDtype((512, 1024, 16, 128), jnp.bfloat16),
             'is_causal': True,
         },
         project='deepseek2',
         name='16b_bf16',
         tags=('primary',),
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'q': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
+            'k': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
+            'v': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
+            'bias': ShapeDtype((1, 4, 384, 384), jnp.bfloat16),
+            'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
+        },
+        project='alphafold',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'q': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
+            'k': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
+            'v': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
+            'bias': ShapeDtype((1, 4, 384, 384), jnp.bfloat16),
+            'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
+        },
+        project='alphafold',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'q': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
+            'k': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
+            'v': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
+            'bias': ShapeDtype((1, 4, 768, 768), jnp.bfloat16),
+            'mask': Mask(ShapeDtype((768, 1, 1, 768), bool)),
+        },
+        project='alphafold',
     ),
 )
