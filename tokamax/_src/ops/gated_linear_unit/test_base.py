@@ -17,13 +17,13 @@
 import functools
 import math
 
-from absl import logging
 from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
 from tokamax._src import mosaic_gpu
 from tokamax._src import triton
+
 
 # pylint: disable=missing-function-docstring
 class GatedLinearUnitTestBase(parameterized.TestCase):
