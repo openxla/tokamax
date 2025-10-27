@@ -121,14 +121,11 @@ def array_numeric_summary(x: jax.Array) -> NumericSummary:
   )
 
 
-RngKey: TypeAlias = jax.Array
-
-
 class ArrayInitializer(abc.ABC):
   """A callable that returns an array."""
 
   @abc.abstractmethod
-  def __call__(self, key: RngKey) -> jax.Array:
+  def __call__(self, rng: np.random.Generator) -> np.ndarray | jax.Array:
     ...
 
   @property
@@ -150,23 +147,20 @@ class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
     self.minval = minval
     self.maxval = maxval
 
-  def __call__(self, key: RngKey) -> jax.Array:
+  def __call__(self, rng: np.random.Generator) -> np.ndarray:
     return _int_initializer(
-        key, self.shape, self.dtype, self.minval, self.maxval
+        rng, self.shape, self.dtype, self.minval, self.maxval
     )
 
 
-def _int_initializer(key, shape, dtype, minval=None, maxval=None):
+def _int_initializer(rng, shape, dtype, minval=None, maxval=None):
   """Default int initializer for `random_initialize`."""
-  dtype = jnp.dtype(dtype)
+  iinfo = jnp.iinfo(jnp.dtype(dtype))
   if maxval is None:
-    maxval = min(jnp.iinfo(dtype).max + 1, 128)
+    maxval = min(iinfo.max + 1, 128)
   if minval is None:
-    minval = max(jnp.iinfo(dtype).min, -maxval)
-
-  return jax.random.randint(
-      key, shape=shape, minval=minval, maxval=maxval, dtype=dtype
-  )
+    minval = max(iinfo.min, -maxval)
+  return rng.integers(minval, maxval, shape).astype(dtype)
 
 
 def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
@@ -184,23 +178,20 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     A new PyTree with each abstract array replaced by a randomly initialized
     `jax.Array`.
   """
-
-  key = jax.random.PRNGKey(seed)
+  rng = np.random.default_rng(seed)
 
   def init_with_layout(x):
     if isinstance(x, ArrayInitializer):
-      init = x
-    elif isinstance(x, QuantizedArray):
+      return jax.device_put(x(rng))
+    if isinstance(x, QuantizedArray):
       abstract_values = isinstance(x.values, jax.ShapeDtypeStruct)
       abstract_scales = isinstance(x.scales, jax.ShapeDtypeStruct)
 
       if abstract_values and abstract_scales:
-
-        def init(key):
-          val = jax.random.normal(key, shape=x.shape, dtype=x.dtype)
-          qdtype = x.values.dtype
-          return quantization.quantize_as(qdtype, tile_shape=x.tile_shape)(val)
-
+        dtype = jnp.promote_types(x.dtype, jnp.float32)
+        values = rng.standard_normal(size=x.shape, dtype=dtype).astype(x.dtype)
+        qdtype = x.values.dtype
+        return quantization.quantize_as(qdtype, tile_shape=x.tile_shape)(values)
       elif not abstract_values and not abstract_scales:
         return x
       else:
@@ -208,26 +199,24 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
             '`QuantizedArray` values and scales must both be abstract or both'
             ' concrete.'
         )
-    elif isinstance(x, jax.ShapeDtypeStruct):
-      dtype = jnp.dtype(x.dtype)
-
-      if 'float' in dtype.name:
-        init = lambda key: jax.random.normal(key, shape=x.shape, dtype=dtype)
-      elif dtype.name == 'bool':
-        init = lambda key: jax.random.bernoulli(key, shape=x.shape)
-      elif 'int' in dtype.name:
-        init = lambda key: _int_initializer(key, x.shape, dtype)
-      else:
-        raise NotImplementedError(f'dtype {dtype.name} not supported.')
-    else:
+    if not isinstance(x, jax.ShapeDtypeStruct):
       return x
 
-    if getattr(x, 'sharding', None) is not None:
-      init = jax.jit(init, out_shardings=x.format)
+    dtype = jnp.dtype(x.dtype)
 
-    nonlocal key
-    curr_key, key = jax.random.split(key)
-    return init(curr_key)
+    if 'float' in dtype.name:
+      dtype_ = jnp.promote_types(dtype, jnp.float32)
+      y = rng.standard_normal(size=x.shape, dtype=dtype_).astype(dtype)
+    elif dtype.name == 'bool':
+      y = rng.binomial(n=1, p=0.5, size=x.shape).astype(dtype)
+    elif 'int' in dtype.name:
+      y = _int_initializer(rng, x.shape, dtype)
+    else:
+      raise NotImplementedError(f'dtype {dtype.name} not supported.')
+
+    sharding = getattr(x, 'sharding', None)
+    # TODO: Can we consolidate `device_put` into a single call?
+    return jax.device_put(y, None if sharding is None else x.format)
 
   is_leaf = lambda x: isinstance(x, (ArrayInitializer, QuantizedArray))
   return jax.tree.map(init_with_layout, x, is_leaf=is_leaf)

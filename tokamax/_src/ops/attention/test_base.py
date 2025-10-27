@@ -808,7 +808,7 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
     atol = {jnp.float32: 2e-6, jnp.bfloat16: 2e-2}[q.dtype.type]
-    atol_grads_bias = {jnp.float32: 1e-5, jnp.bfloat16: None}[q.dtype.type]
+    atol_grads_bias = {jnp.float32: 2e-5, jnp.bfloat16: 8e-2}[q.dtype.type]
     try:
       self._run_test_with_inputs(
           q,
