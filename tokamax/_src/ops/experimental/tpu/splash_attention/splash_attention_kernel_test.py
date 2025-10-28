@@ -51,8 +51,6 @@ hp.settings.load_profile(name="deterministic")
 partial = functools.partial
 Draw = TypeVar("Draw", bound=Callable[[hps.SearchStrategy[Any]], Any])
 
-LOG2E = math.log2(math.e)
-
 
 @hps.composite
 def segment_ids_strategy(draw, seq_len: int) -> splash.SegmentIds:
@@ -479,20 +477,17 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         attn_logits_soft_cap=attn_logits_soft_cap,
     )
 
-    o, (logsumexp, max_logits) = attn(
+    o, stats = attn(
         q, k, v, segment_ids, max_logit_value=max_logit_value
     )
 
-    o_ref, (logsumexp_ref, max_logits_ref) = attn_ref(
+    o_ref, stats_ref = attn_ref(
         q.astype(jnp.float32),
         k.astype(jnp.float32),
         v.astype(jnp.float32),
         jnp.array(mask[:, :]),
         segment_ids,
     )
-    if use_base2_exp:
-      logsumexp_ref *= LOG2E
-      max_logits_ref *= LOG2E
 
     if (use_base2_exp or use_max_logit_estimate is not None
         or not fuse_reciprocal):
@@ -501,9 +496,11 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       o_rtol, res_tol = dict(atol=4e-3, rtol=3e-3), dict(atol=1e-3, rtol=3e-3)
 
     self._assert_allclose(o, o_ref, **o_rtol)
-    self._assert_allclose(logsumexp, logsumexp_ref, **res_tol)
+    self._assert_allclose(stats["logsumexp"],
+                          stats_ref["logsumexp"], **res_tol)
     if use_max_logit_estimate is None:
-      self._assert_allclose(max_logits, max_logits_ref, **res_tol)
+      self._assert_allclose(stats["max_logits"],
+                            stats_ref["max_logits"], **res_tol)
 
   @parameterized.product(
       is_mqa=(False, True),
@@ -609,7 +606,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     o, attn_vjp = jax.vjp(partial(attn, max_logit_value=max_logit_value),
                           q, k, v, segment_ids)
     q32, k32, v32 = jax.tree.map(lambda x: x.astype(jnp.float32), (q, k, v))
-    o_ref, (logsumexp, max_logits) = splash.attention_reference(
+    o_ref, stats_ref = splash.attention_reference(
         q32,
         k32,
         v32,
@@ -619,7 +616,6 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         save_residuals=True,
         attn_logits_soft_cap=attn_logits_soft_cap,
     )
-    del max_logits
     atol = 1e-2 if (use_base2_exp or max_logit_value is not None) else 5e-3
     self._assert_allclose(o, o_ref, atol=atol, rtol=5e-3)
 
@@ -656,7 +652,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         v32,
         segment_ids,
         o.astype(jnp.float32),
-        logsumexp,
+        stats_ref["logsumexp"],
         do.astype(jnp.float32),
     )
     if is_mqa:

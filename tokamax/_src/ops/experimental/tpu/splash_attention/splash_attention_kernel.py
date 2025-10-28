@@ -83,7 +83,7 @@ class SegmentIds(NamedTuple):
 
 # Return type of SplashAttention function that implements the custom vjp rule.
 SplashCustomReturnType = (
-    jax.Array | tuple[jax.Array, tuple[jax.Array, jax.Array]]
+    jax.Array | tuple[jax.Array, dict[str, jax.Array]]
 )
 
 SplashResidualsType = tuple[
@@ -145,7 +145,7 @@ def _attention_reference_impl(
 
   if save_residuals:
     logsumexp = m + jnp.log(l)
-    return o, (logsumexp, m)
+    return o, {"logsumexp": logsumexp, "max_logits": m}
   return o
 
 
@@ -1020,7 +1020,9 @@ def _splash_attention_forward(
           logsumexp, name=config.residual_checkpoint_name
       )
   if save_residuals:
-    return out, (logsumexp, max_logits)
+    stats = {"logsumexp": logsumexp, "max_logits": max_logits}
+    stats = jax.tree.map(jax.lax.stop_gradient, stats)
+    return out, stats
   return out
 
 
@@ -1058,7 +1060,7 @@ def _splash_attention_custom(
   # device.
   del dkv_mask_info
 
-  return _splash_attention_forward(  # pytype: disable=wrong-arg-types
+  ret = _splash_attention_forward(  # pytype: disable=wrong-arg-types
       fwd_mask_info,
       q,
       k,
@@ -1072,6 +1074,14 @@ def _splash_attention_custom(
       fwd_mask_sparsity=fwd_mask_sparsity,
       max_logit_value=max_logit_value,
   )
+  if save_residuals:
+    out, stats = ret
+    if config.use_base2_exp:  # for user, output values in natural base
+      stats["logsumexp"] = stats["logsumexp"] / LOG2E
+      stats["max_logits"] = stats["max_logits"] / LOG2E
+    return out, stats
+  else:
+    return ret
 
 
 def _splash_attention_fwd(
@@ -1089,10 +1099,12 @@ def _splash_attention_fwd(
     fwd_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
 ) -> tuple[tuple[jax.Array], SplashResidualsType]:
-  if save_residuals:
-    raise NotImplementedError("Higher-order AD not supported.")
 
-  out, (logsumexp, max_logits) = _splash_attention_forward(  # pytype: disable=wrong-arg-types
+  # TODO: add some higher order AD check that isn't save_residuals based.
+  # if save_residuals:
+  #   raise NotImplementedError("Higher-order AD not supported.")
+
+  out, stats = _splash_attention_forward(  # pytype: disable=wrong-arg-types
       fwd_mask_info,
       q,
       k,
@@ -1106,16 +1118,15 @@ def _splash_attention_fwd(
       fwd_mask_sparsity=fwd_mask_sparsity,
       max_logit_value=max_logit_value,
   )
-  del max_logits
-  return out, (
-      q,
-      k,
-      v,
-      segment_ids,
-      out,
-      logsumexp,
-      dkv_mask_info,
-  )
+  logsumexp = stats["logsumexp"]  # save in the config base for the bwd pass
+  if config.use_base2_exp:  # for user, output values in natural base
+    stats["logsumexp"] = stats["logsumexp"] / LOG2E
+    stats["max_logits"] = stats["max_logits"] / LOG2E
+  residuals = q, k, v, segment_ids, out, logsumexp, dkv_mask_info
+  if save_residuals:
+    return (out, stats), residuals
+  else:
+    return out, residuals
 
 
 def _flash_attention_dq_kernel(
@@ -1789,7 +1800,7 @@ def _splash_attention_bwd(
     SegmentIds | None,  # segment_ids
     jax.Array | None,   # max_logit_estimate
 ]:
-  del save_residuals, fwd_mask_sparsity
+  del fwd_mask_sparsity
   if not config.has_backward_blocks:
     raise ValueError("Need to specify backward blocks.")
   bq_dkv, bkv_dkv_memory, bkv_dkv_compute = (
@@ -1797,15 +1808,11 @@ def _splash_attention_bwd(
       config.block_kv_dkv,
       config.block_kv_dkv_compute,
   )
-  (
-      q,
-      k,
-      v,
-      segment_ids,
-      o,
-      logsumexp,
-      dkv_mask_info,
-  ) = res
+  q, k, v, segment_ids, o, logsumexp, dkv_mask_info = res
+
+  # # if we're receiving sensitivities for stats
+  # if not isinstance(do, jax.Array):
+  #   do = do[0]
 
   # di: [num_heads, q_seq_len]
   di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))  # pytype: disable=attribute-error
@@ -1904,8 +1911,7 @@ class SplashAttentionKernel:
         self.fwd_mask_info,
         self.dkv_mask_info,
         *args,
-        **kwargs,
-        **self.kwargs,
+        **dict(self.kwargs, **kwargs),
     )
 
   def manual_sharding_spec(self, sharding: jax.sharding.NamedSharding):
