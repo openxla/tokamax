@@ -76,9 +76,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
 
       # skip unsupported tiling and quantization
-      if _is_config_supported(lhs, rhs, config) and precision_lib.is_default(
-          lhs.dtype, rhs.dtype, kwargs.get("precision")
-      ):
+      if _is_config_supported(lhs, rhs, config):
         return op(lhs, rhs, **kwargs)
 
       with self.assertRaises(NotImplementedError) as e:

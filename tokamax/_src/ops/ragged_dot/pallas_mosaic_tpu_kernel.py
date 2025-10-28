@@ -26,8 +26,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src import mosaic_tpu as common
+from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 
+CanonicalPrecision = precision_lib.CanonicalPrecision
 QuantizedArray = quantization.QuantizedArray
 
 
@@ -286,6 +288,7 @@ _TilingFn = Callable[[int, int, int], tuple[int, int, int] | None]
 @functools.partial(
     jax.jit,
     static_argnames=[
+        "precision",
         "out_dtype",
         "tiling",
         "transpose_rhs",
@@ -301,6 +304,7 @@ def gmm(
     lhs: jax.Array | QuantizedArray,
     rhs: jax.Array | QuantizedArray,
     group_sizes: jax.Array,
+    precision: CanonicalPrecision,
     out_dtype: jnp.dtype,
     tiling: tuple[int, int, int] | _TilingFn | None = (128, 128, 128),
     input_buffer_count: int = 2,
@@ -318,6 +322,7 @@ def gmm(
   Args:
     lhs: A 2d, jax.Array with shape [m, k].
     rhs: A 3d, jax.Array with shape [num_groups, k, n].
+    precision: The precision to use for the dot operation.
     group_sizes: A 1d, jax.Array with shape [num_groups] and jnp.int32 dtype.
     out_dtype: jnp.dtype, the element type for the output matrix.
     tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
@@ -379,6 +384,7 @@ def gmm(
       x,
       y,
       dimension_numbers=dimension_numbers,
+      precision=precision,
       preferred_element_type=preferred_element_type,
   )
 
@@ -529,6 +535,7 @@ def gmm(
 @functools.partial(
     jax.jit,
     static_argnames=[
+        "precision",
         "out_dtype",
         "tiling",
         "num_actual_groups",
@@ -544,6 +551,7 @@ def tgmm(
     lhs: jax.Array | QuantizedArray,
     rhs: jax.Array | QuantizedArray,
     group_sizes: jax.Array,
+    precision: CanonicalPrecision,
     out_dtype: jnp.dtype,
     tiling: tuple[int, int, int] | _TilingFn | None = (128, 128, 128),
     input_buffer_count: int = 2,
@@ -562,6 +570,7 @@ def tgmm(
     lhs: A 2d, jax.Array with shape [k, m].
     rhs: A 2d, jax.Array with shape [m, n].
     group_sizes: A 1d, jax.Array with shape [num_groups] and jnp.int32 dtype.
+    precision: The precision to use for the dot operation.
     out_dtype: jnp.dtype, the element type for the output matrix.
     tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
     input_buffer_count: The buffering count to use for inputs lhs and rhs.
@@ -621,7 +630,7 @@ def tgmm(
   )
 
   dot = lambda x, y, preferred_element_type: lax.dot(
-      x, y, preferred_element_type=preferred_element_type
+      x, y, precision=precision, preferred_element_type=preferred_element_type
   )
 
   def kernel(group_metadata, _, lhs_ref, rhs_ref, out_ref, acc_scratch):

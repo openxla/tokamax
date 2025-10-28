@@ -158,9 +158,6 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   ) -> tuple[jax.Array, None]:
     del return_residuals  # Unused.
 
-    if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
-      raise NotImplementedError(f"{precision=} not supported.")
-
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
 
@@ -194,6 +191,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           lhs,
           rhs,
           group_sizes=group_sizes,
+          precision=precision,
           out_dtype=preferred_element_type,
           tiling=config.gmm_tiling,
           interpret=self.interpret,  # pytype: disable=attribute-error
@@ -218,6 +216,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           lhs,
           rhs,
           group_sizes=group_sizes,
+          precision=precision,
           out_dtype=preferred_element_type,
           tiling=config.gmm_rhs_transpose_tiling or config.gmm_tiling,
           transpose_rhs=True,
@@ -245,6 +244,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           lhs_trans,
           rhs,
           group_sizes=group_sizes,
+          precision=precision,
           out_dtype=preferred_element_type,
           tiling=config.tgmm_tiling or config.gmm_tiling,
           interpret=self.interpret,  # pytype: disable=attribute-error
