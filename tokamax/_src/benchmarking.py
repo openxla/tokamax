@@ -34,6 +34,9 @@ from tokamax._src import utils
 
 xprof_session, profile_data = None, None  # stubs for internal benchmarking
 
+BenchmarkMode: TypeAlias = Literal[
+    'forward', 'forward_res', 'vjp', 'forward_and_vjp'
+]
 
 PyTree = Any
 
@@ -213,9 +216,7 @@ def standardize_function(
     f: Callable[..., T],
     *args: PyTree,
     kwargs: Mapping[str, PyTree] | None = None,
-    mode: Literal[
-        'forward', 'forward_res', 'vjp', 'forward_and_vjp'
-    ] = 'forward',
+    mode: BenchmarkMode = 'forward',
     seed: int | None = 0,
 ) -> tuple[
     Callable[[list[jax.Array]], RetT], list[jax.Array | jax.ShapeDtypeStruct]

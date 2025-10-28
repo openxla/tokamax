@@ -21,7 +21,6 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
-import pydantic
 from tokamax._src import batching
 from tokamax._src import config as config_lib
 from tokamax._src import utils

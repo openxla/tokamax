@@ -486,11 +486,22 @@ class BoundArguments(Generic[_Config, _Key]):
     """Returns the configs used for autotuning when `AUTO` is specified."""
     return self.op._get_autotuning_configs(self)  # pylint: disable=protected-access
 
-  def benchmark(self) -> benchmarking.BenchmarkData:
-    """Benchmarks the op with the bound arguments."""
+  def benchmark(
+      self, mode: benchmarking.BenchmarkMode = "forward"
+  ) -> benchmarking.BenchmarkData:
+    """Benchmarks the op with the bound arguments.
+    
+    Args:
+      mode: The benchmarking mode to use. Defaults to `forward`.
+
+    Returns:
+      A `BenchmarkData` object containing the benchmark results.
+    """
     ba = batched if (batched := self.batched).vmap_axis_sizes else self
     kwargs = ba.kwargs
-    f, x = benchmarking.standardize_function(self.op, *ba.args, kwargs=kwargs)
+    f, x = benchmarking.standardize_function(
+        self.op, *ba.args, kwargs=kwargs, mode=mode
+    )
     return benchmarking.compile_benchmark(f, x)(x)
 
   def autotune(
