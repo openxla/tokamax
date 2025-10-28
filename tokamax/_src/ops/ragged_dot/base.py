@@ -20,6 +20,7 @@ import types
 from typing import Any, TypeVar
 
 import jax
+from jax.experimental import checkify
 import jax.numpy as jnp
 import numpy as np
 from pydantic_core import core_schema as cs
@@ -104,11 +105,14 @@ class GroupSizes:
     )
 
 
+@dataclasses.dataclass(frozen=True)
 class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   """Ragged dot base class.
 
   For use in MegaBlocks-style models: https://arxiv.org/abs/2211.15841.
   """
+  _: dataclasses.KW_ONLY
+  checkify_group_sizes: bool = False
 
   @override
   def bind(
@@ -137,6 +141,12 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       if not isinstance(group_sizes, GroupSizes):
         representative_sizes = (lhs.shape[0] // rhs.shape[0],) * rhs.shape[0]
         group_sizes = GroupSizes(group_sizes, representative_sizes)
+
+      if self.checkify_group_sizes:
+        gs = group_sizes.value
+        dbg_check = checkify.debug_check
+        dbg_check(jnp.all(gs >= 0), "Negative group size.")
+        dbg_check(jnp.sum(gs) <= lhs.shape[0], "Group size sum > num rows.")
 
     if preferred_element_type is not None:
       preferred_element_type = jnp.dtype(preferred_element_type)

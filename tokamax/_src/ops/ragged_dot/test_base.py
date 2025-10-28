@@ -14,11 +14,13 @@
 # ==============================================================================
 """Ragged dot test base."""
 
+import dataclasses
 import functools
 
 from absl.testing import parameterized
 import chex
 import jax
+from jax.experimental import checkify
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src import numerics
@@ -163,6 +165,19 @@ class RaggedDotTestBase(parameterized.TestCase):
     group_sizes = base.GroupSizes(group_sizes, (1,) * num_groups)
     actual = self._dot_fn(a, b, group_sizes=group_sizes)  # pytype: disable=wrong-arg-types
     self.assert_close(actual, expected)
+
+  @parameterized.parameters(((2, 3, -1, 4),), ((1022, 1, 1, 1),))
+  def test_invalid_group_sizes(self, group_sizes):
+    if not isinstance(self._dot_fn, base.RaggedDot):
+      self.skipTest("Requires a bare `RaggedDot` implementation.")
+
+    num_groups, m, k, n = 4, 1024, 128, 256
+    a, b, _ = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
+    fn = dataclasses.replace(self._dot_fn, checkify_group_sizes=True)
+    fn = jax.jit(checkify.checkify(fn))
+    with self.assertRaises(checkify.JaxRuntimeError):
+      err, _ = fn(a, b, group_sizes=jnp.array(group_sizes, jnp.int32))
+      err.throw()
 
   @parameterized.named_parameters(NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
