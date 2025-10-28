@@ -151,42 +151,33 @@ class RaggedDotMosaicTest(RaggedDotImplementationTest):
 
   def __init__(self, *args):
     super().__init__(*args, implementation="mosaic")
-    dot_fn = self._dot_fn
 
-    def fn(lhs, rhs, **kwargs):
-      if (
-          (lhs.dtype == jnp.bfloat16)
-          and (lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0)
-          and (
-              not isinstance(rhs, QuantizedArray)
-              or (
-                  (rhs.tile_shape == (1, 256, 1))
-                  and kwargs.get("preferred_element_type") is None
-              )
-          )
-      ):
-        return dot_fn(lhs, rhs, **kwargs)
+    if jax.default_backend() == "gpu":
+      dot_fn = self._dot_fn
 
-      with self.assertRaises(NotImplementedError) as e:
-        _ = dot_fn(lhs, rhs, **kwargs)
-      self.skipTest(f"Test not supported: {e.msg}")
+      def fn(lhs, rhs, **kwargs):
+        if (
+            (lhs.dtype == jnp.bfloat16)
+            and (lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0)
+            and (
+                not isinstance(rhs, QuantizedArray)
+                or (
+                    (rhs.tile_shape == (1, 256, 1))
+                    and kwargs.get("preferred_element_type") is None
+                )
+            )
+        ):
+          return dot_fn(lhs, rhs, **kwargs)
 
-    self._dot_fn = fn
+        with self.assertRaises(NotImplementedError) as e:
+          _ = dot_fn(lhs, rhs, **kwargs)
+        self.skipTest(f"Test not supported: {e.msg}")
 
-  def setUp(self):
-    if jax.default_backend() != "gpu":
-      self.skipTest("Only run on GPU.")
-    super().setUp()
-
-
-class RaggedDotMosaicTpuTest(RaggedDotImplementationTest):
-
-  def __init__(self, *args):
-    super().__init__(*args, implementation="mosaic")
+      self._dot_fn = fn
 
   def setUp(self):
-    if jax.default_backend() != "tpu":
-      self.skipTest("Only run on TPU.")
+    if jax.default_backend() not in ("gpu", "tpu"):
+      self.skipTest("Only run on GPU and TPU.")
     super().setUp()
 
 
