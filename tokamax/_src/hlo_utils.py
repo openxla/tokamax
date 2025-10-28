@@ -15,7 +15,6 @@
 """Utilities for extracting kernel information from HLO."""
 from collections.abc import Callable, Sequence
 import dataclasses
-import re
 from typing import Any, Final
 import zlib
 
@@ -330,7 +329,7 @@ def get_opspecs(  # pytype: disable=invalid-annotation
     # jit(tokamax_norm_and_glu)/convert_element_type.
     if idx == -1:
       continue
-    json_data = kernel.op_name[idx + len(marker):]
+    json_data = kernel.op_name[idx + len(marker) :]
     count = 0
     # A VJP op may have multiple op specs in the HLO. Find the position of the
     # end brace for the first op spec. We only return the first op (the VJP), as
@@ -343,7 +342,7 @@ def get_opspecs(  # pytype: disable=invalid-annotation
         if count < 1:
           # This might mean that we have more end braces than opening braces,
           # but in that case the `validate_json` call below will fail.
-          json_data = json_data[:i + 1]
+          json_data = json_data[: i + 1]
           break
     op_specs.append(op_base.BOUND_ARGS_ADAPTER.validate_json(json_data))
 
@@ -355,7 +354,6 @@ def _parse_shapes(shapes) -> tuple[jax.ShapeDtypeStruct, ...]:
   return tuple(jax.tree.leaves(out))
 
 
-# TODO: HLO Protos for TPU have a different format for its ShapeProto with different attributes.Fix this for TPU HLOs in a separate update.
 def _parse_shapes_recursive(shapes):
   """Parse xla.ShapeProto."""
 

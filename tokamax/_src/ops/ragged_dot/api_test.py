@@ -68,6 +68,7 @@ class RaggedDotTest(parameterized.TestCase):
         if jax.default_backend() == "tpu"
         else api.ragged_dot
     )
+
     @jax.jit
     @functools.partial(jax.value_and_grad, argnums=(0, 1))
     def f(lhs, rhs):
@@ -97,14 +98,15 @@ class RaggedDotTest(parameterized.TestCase):
       chex.assert_trees_all_close(rhs_grad, rhs_grad_gt)
 
     with self.subTest("correct_implementation_used"):
-      # TODO: HLO Utils does not work correctly for TPU HLO shapes
-      # yet. Will be fixed in a follow up.
-      if jax.default_backend() == "tpu":
-        self.skipTest("Only works for GPU at the moment.")
+
       opspecs = hlo_utils.get_opspecs(
           f.lower(lhs, rhs), include_xla_kernels=False
       )
-      mosaic_impl = type(api.IMPLEMENTATIONS.get("mosaic_gpu"))
+      if jax.default_backend() == "tpu":
+        mosaic_impl = type(api.IMPLEMENTATIONS.get("mosaic_tpu"))
+      else:
+        mosaic_impl = type(api.IMPLEMENTATIONS.get("mosaic_gpu"))
+
       triton_impl = type(api.IMPLEMENTATIONS.get("triton"))
       match implementation:
         case "triton":
