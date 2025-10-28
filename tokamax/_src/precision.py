@@ -159,11 +159,18 @@ def to_dot_algorithm_preset(
       raise ValueError(f"Unsupported dtype: {dtype}")
 
 
+_DEFAULT_PRECISIONS = (
+    (Precision.DEFAULT, Precision.DEFAULT),
+    DotAlgorithmPreset.DEFAULT,
+)
+
+
 def is_default(
     a_dtype: DTypeLike, b_dtype: DTypeLike, precision: PrecisionLike
 ) -> bool:
   """Returns whether the given precision is equivalent to `DEFAULT`."""
-  if precision in (Precision.DEFAULT, DotAlgorithmPreset.DEFAULT):
+  precision = canonicalize_precision(precision)
+  if precision in _DEFAULT_PRECISIONS:
     return True
   try:
     default = to_dot_algorithm_preset(a_dtype, b_dtype, Precision.DEFAULT)

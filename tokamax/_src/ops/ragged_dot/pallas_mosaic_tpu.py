@@ -159,9 +159,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     del return_residuals  # Unused.
 
     if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
-      logging.warning("Requested precision `%s`, but mosaic TPU ragged dot does"
-                      " not currently support this precision. Proceeding with"
-                      " default precision.", str(precision))
+      raise NotImplementedError(f"{precision=} not supported.")
 
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.

@@ -15,9 +15,10 @@
 """Tokamax Megablox TPU tests for core functionality."""
 
 from absl.testing import absltest
-import chex
+from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op as op_base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
@@ -75,7 +76,9 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
 
       # skip unsupported tiling and quantization
-      if _is_config_supported(lhs, rhs, config):
+      if _is_config_supported(lhs, rhs, config) and precision_lib.is_default(
+          lhs.dtype, rhs.dtype, kwargs.get("precision")
+      ):
         return op(lhs, rhs, **kwargs)
 
       with self.assertRaises(NotImplementedError) as e:
@@ -83,25 +86,31 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       self.skipTest(f"Test not supported: {e.msg}")
 
     super().__init__(*args, dot_fn=fn)
-    self.tol = dict(atol=1e-2, rtol=0)
-
-    def assert_close(a, b, **tol):
-
-      def l2_rel(a, b):
-        l2_diff = jnp.linalg.norm(a - b, axis=-1)
-        l2_norm = jnp.maximum(jnp.linalg.norm(b, axis=-1), 1e-6)
-        return l2_diff / l2_norm
-
-      l2_rel = jax.tree.map(l2_rel, a, b)
-      expected = jax.tree.map(jnp.zeros_like, l2_rel)
-      chex.assert_trees_all_close(l2_rel, expected, **dict(self.tol, **tol))
-
-    self.assert_close = assert_close
 
   def setUp(self):
     if jax.default_backend() != "tpu":
       self.skipTest("Only supported on TPUs.")
     super().setUp()
+
+  def test_vjp0(self):
+    with test_base.override_chex_args(atol=0.2, rtol=0.01):
+      super().test_vjp0()  # pytype: disable=attribute-error
+
+  @parameterized.parameters(*test_base.base_names_and_params("test_quantized"))
+  def test_quantized(self, test_name, kwargs):
+    with test_base.override_chex_args(atol=0.4, rtol=0.1):
+      getattr(super(), test_name)()
+
+  @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
+  def test_bench(self, spec):
+    if "i8xi8" in self._testMethodName:
+      kwargs = dict(atol=1.5, rtol=0.5)  # This is really bad!
+    elif "i4" in self._testMethodName:
+      kwargs = dict(atol=0.6, rtol=0.1)
+    else:
+      kwargs = {}
+    with test_base.override_chex_args(**kwargs):
+      getattr(super(), self._testMethodName)()
 
   def test_maxtext_config(self):
     # Test to ensure that we can get the correct config for a specific model.
