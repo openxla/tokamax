@@ -33,10 +33,13 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
 from typing_extensions import override
 
 
+# Tiling on TPU technically needs to be a multiple of 128, but it's possible to
+# request a "full tile" of an array equal to the full axis size and that doesn't
+# require a multiple of 128. In the same case, tiles < 128 are allowed.
 TilingTuple = tuple[
-    pydantic.conint(ge=128, multiple_of=128),  # tile_m
-    pydantic.conint(ge=128, multiple_of=128),  # tile_k
-    pydantic.conint(ge=128, multiple_of=128),  # tile_n
+    pydantic.PositiveInt,  # tile_m
+    pydantic.PositiveInt,  # tile_k
+    pydantic.PositiveInt,  # tile_n
 ]
 InputBufferCount = pydantic.conint(ge=1, le=3, multiple_of=1)
 

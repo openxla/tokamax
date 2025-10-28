@@ -89,35 +89,70 @@ def default_quant_dot_dtype() -> jnp.dtype:
 
 
 def quant_block_spec(
-    x: QuantizedArray,
-    x_spec: pl.BlockSpec,
-    axis: int,
-    fragment: int | None = None
+    x: QuantizedArray, x_spec: pl.BlockSpec, reduction_axis: int
 ) -> tuple[QuantizedArray, QuantizedArray]:
   """Broadcast scales so that they are addressable by Pallas via a BlockSpec."""
-  axis = axis % x.ndim
-
-  # `fragment` is the lowest addressable unit in a dimension (8, 128) for last 2
-  if fragment is None:
-    fragment = {
-        x.ndim - 1: LANES, x.ndim - 2: _sublane_size(),
-    }.get(axis, 1)
-
+  reduction_axis = reduction_axis % x.ndim
   block_shape = list(x_spec.block_shape)
-  scale_block_shape = block_shape[:axis] + [fragment] + block_shape[axis+1:]
-  scales_tile = pl.cdiv(x.values.shape[axis], x.scales.shape[axis])
-  if scales_tile % block_shape[axis] != 0:
+
+  # Check 1: the reduction axis x tiling includes only 1 scale per x tile.
+  elements_per_scale = pl.cdiv(
+      x.values.shape[reduction_axis], x.scales.shape[reduction_axis]
+  )
+  reduction_tile = block_shape[reduction_axis]
+  if elements_per_scale % reduction_tile:  # tile too large or spans scales
     raise NotImplementedError(
-        f"{block_shape[axis]=} must divide {scales_tile=} for"
-        f" {jax.tree.map(jax.typeof, x)=} with {axis=}"
+        f"{reduction_tile=} must be less than {elements_per_scale=} and"
+        f" must divide {elements_per_scale=} evenly. Failed for"
+        f" {jax.tree.map(jax.typeof, x)=} with {reduction_axis=}"
     )
 
+  # How many x elements per each scale scalar.
+  els_per_scale = [pl.cdiv(xs, ss) for xs, ss
+                   in zip(x.values.shape, x.scales.shape)]
+
+  # Check 2: ensure that for subtiles, x tiles evenly divide elements per scale.
+  if any(
+      (1 if xb is None else xb) < eps and eps % (1 if xb is None else xb) != 0
+      for eps, xb in zip(els_per_scale, block_shape)
+  ):
+    raise NotImplementedError(
+        f"{els_per_scale=} must be divisible by {block_shape=} tiles for"
+        f" {jax.tree.map(jax.typeof, x)=}"
+    )
+
+  # How many steps to linger on the same scales tile before incrementing.
+  tile_steps = [
+      max(1, eps // (1 if xb is None else xb))
+      for xb, eps in zip(block_shape, els_per_scale)
+  ]
+
+  # Compute how large a scales tile should be.
+  scale_block_shape = [None if xb is None else max(xb // eps, 1)
+                       for xb, eps in zip(block_shape, els_per_scale)]
+
+  # Ensure that scale tiles are individually addressable, repeat if necessary.
+  min_sizes = [{x.ndim - 1: LANES, x.ndim - 2: _sublane_size()}.get(i, 1)
+               for i in range(x.ndim)]
+  scales = x.scales
+  for i, st in enumerate(scale_block_shape):
+    size = 1 if st is None else st
+    if size < min_sizes[i]:
+      if st is None:
+        raise NotImplementedError(f"{st=} must be >= 1 to tile it with None")
+      scale_block_shape[i] = min_sizes[i]
+      if min_sizes[i] % st != 0:
+        raise NotImplementedError(
+            f"{min_sizes[i]=} must be divisible by scale tile {st=} in"
+            f" {x.scales.shape=} for broadcasting to make addressable."
+        )
+      scales = jnp.repeat(scales, min_sizes[i] // st, axis=i)
+
+  # Construct the index map for the scales tiles and create the BlockSpec.
   def idx_map(*args):
     idxs = list(x_spec.index_map(*args))
-    tile_size = x_spec.block_shape[axis]
-    return idxs[:axis] + [idxs[axis] * tile_size // scales_tile] + idxs[axis+1:]
+    return tuple(i // tile_step for i, tile_step in zip(idxs, tile_steps))
 
-  scales = jnp.repeat(x.scales, fragment, axis=axis)
   sspec = pl.BlockSpec(scale_block_shape, idx_map)
   x = dataclasses.replace(x, scales=scales)
   return x, QuantizedArray(x_spec, sspec)  # pytype: disable=wrong-arg-types
