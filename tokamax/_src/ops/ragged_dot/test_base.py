@@ -110,6 +110,21 @@ class RaggedDotTestBase(parameterized.TestCase):
     count = sum(group_sizes)
     chex.assert_trees_all_close(actual[:count], expected[:count])
 
+  def test_zero_group_sizes(self):
+    num_groups, m, k, n = 8, 1024, 128, 256
+    a, b, group_sizes = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16, random_groups=True
+    )
+
+    # Test all possible patterns of zero group sizes.
+    for i in range(2**num_groups):
+      group_sizes_ = jnp.where(jnp.unpackbits(jnp.uint8(i)), group_sizes, 0)
+      with self.subTest(f"group_sizes={group_sizes_.tolist()}"):
+        expected = ref(a, b, group_sizes_)
+        actual = self._dot_fn_f32(a, b, group_sizes=group_sizes_)
+        count = sum(group_sizes_)
+        chex.assert_trees_all_close(actual[:count], expected[:count])
+
   @parameterized.product(
       dtype=("int8", "int4"),
       a_tile_shape=(None, (1, 128), (1, 16), (256, 1), (16, 1)),
