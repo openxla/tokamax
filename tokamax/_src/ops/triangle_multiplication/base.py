@@ -29,8 +29,8 @@ from tokamax._src.ops.normalization import base as norm_base
 from typing_extensions import override
 
 
-_Config = TypeVar('_Config')
-_Key = TypeVar('_Key')
+_Config = TypeVar("_Config")
+_Key = TypeVar("_Key")
 Residuals: TypeAlias = types.NoneType
 CanonicalPrecision = precision_lib.CanonicalPrecision
 

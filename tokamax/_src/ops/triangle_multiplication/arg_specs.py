@@ -12,8 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Triangle multiplication argument specifications."""
 
+import itertools
 from typing import Final
+
+import jax
+import jax.numpy as jnp
 from tokamax._src.autotuning import arg_spec
 
-ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = ()
+ShapeDtype = jax.ShapeDtypeStruct
+
+
+def _create_arg_spec(seq_len: int, triangle_type: str) -> arg_spec.ArgSpec:
+  return arg_spec.ArgSpec(
+      dict(
+          x=ShapeDtype((seq_len, seq_len, 64), jnp.bfloat16),
+          mask=ShapeDtype((seq_len, seq_len), jnp.bool_),
+          gate_projection_weights=ShapeDtype((64, 2, 64, 2), jnp.bfloat16),
+          projection_out_weights=ShapeDtype((64, 64), jnp.bfloat16),
+          gate_out_weights=ShapeDtype((64, 64), jnp.bfloat16),
+          layernorm_in_scale=ShapeDtype((64,), jnp.bfloat16),
+          layernorm_in_offset=ShapeDtype((64,), jnp.bfloat16),
+          layernorm_out_scale=ShapeDtype((64,), jnp.bfloat16),
+          layernorm_out_offset=ShapeDtype((64,), jnp.bfloat16),
+          triangle_type=triangle_type,
+      ),
+      project='alphafold',
+  )
+
+ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = tuple(
+    _create_arg_spec(n, t)
+    for n, t in itertools.product(
+        (384, 640, 1024, 2048),
+        ('outgoing', 'incoming')
+    )
+)
