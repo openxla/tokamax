@@ -422,7 +422,7 @@ def _can_have_block_d(*args):
   return True
 
 
-@pydantic.dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True)
 class Config:
   block_q: pydantic.PositiveInt
   block_k: pydantic.PositiveInt

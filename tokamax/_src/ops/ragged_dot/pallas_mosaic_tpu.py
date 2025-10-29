@@ -64,7 +64,7 @@ def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
   return jnp.sum(inc[:, None] * mask, axis=0)
 
 
-@pydantic.dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True)
 class Config:
   """Pallas Mosaic TPU Ragged Dot config."""
 

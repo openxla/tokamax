@@ -26,7 +26,7 @@ import pydantic
 from tokamax._src import pydantic as pydantic_lib
 
 
-@pydantic.dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True)
 class Config:
   block_m: pydantic_lib.PowerOfTwo
   block_n: pydantic_lib.PowerOfTwo | None

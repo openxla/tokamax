@@ -50,7 +50,7 @@ _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 
 
-@pydantic.dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True)
 class Config:
   # TODO: Relax constraints to multiple of 32.
   block_q: pydantic.conint(multiple_of=64, gt=0) = 64

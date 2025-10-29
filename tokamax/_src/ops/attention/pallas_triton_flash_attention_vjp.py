@@ -340,7 +340,7 @@ def _bwd_kernel(
     dq_ref.store((dq * sm_scale).astype(dq_ref.dtype))
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class Config:
   block_m1: pydantic.PositiveInt
   block_n1: pydantic.PositiveInt

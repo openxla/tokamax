@@ -25,7 +25,7 @@ from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_config
 
 
-@pydantic.dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True)
 class Config:
   block_m: pydantic_lib.PowerOfTwo
   block_n: pydantic_lib.PowerOfTwo | None
