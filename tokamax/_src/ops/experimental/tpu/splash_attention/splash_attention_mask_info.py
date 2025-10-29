@@ -213,24 +213,17 @@ def _get_mask_info(
 
   q_block_count, q_mod = divmod(q_seq_shard_size, q_block_size)
   kv_block_count, kv_mod = divmod(kv_seq_len, kv_block_size)
-  total_blocks = q_block_count * kv_block_count
 
   assert q_mod == 0
   assert kv_mod == 0
 
-  blocked_shape = (
-      (kv_block_count, q_block_count)
-      if is_dkv
-      else (q_block_count, kv_block_count)
-  )
-  active_coords = []
   partial_blocks = {}
-  block_mask = np.zeros(blocked_shape, dtype=jnp.int32)
-  for idx in np.ndindex(blocked_shape):
-    if is_dkv:
-      kv_idx, q_idx = idx
-    else:
-      q_idx, kv_idx = idx
+  block_mask = np.zeros((q_block_count, kv_block_count), dtype=jnp.int32)
+  if is_dkv:
+    block_mask = block_mask.swapaxes(-1, -2)
+
+  for idx in np.ndindex(block_mask.shape):
+    q_idx, kv_idx = idx if not is_dkv else (idx[1], idx[0])
     chunk = mask[(
         slice(
             q_seq_start + q_idx * q_block_size,
@@ -239,7 +232,6 @@ def _get_mask_info(
         slice(kv_idx * kv_block_size, (kv_idx + 1) * kv_block_size),
     )]
     if chunk.any():
-      active_coords.append(idx)
       if not chunk.all():
         block_mask[idx] = 1
         coord_global = (q_idx + blocked_q_seq_start, kv_idx)
@@ -247,47 +239,35 @@ def _get_mask_info(
       else:
         block_mask[idx] = 2
 
-  active_rows, active_cols, mask_next = [], [], []
   # If the mask is completely zero'd out return freshly initialized outputs.
   if not partial_blocks:
-    return mask_next
+    return []
 
   mask_coords_iter = iter(list(partial_blocks.keys()))
   first_m = coord_m = next(mask_coords_iter)
 
-  for idx in np.ndindex(blocked_shape):
-    if return_dynamic_grid and block_mask[idx] == 0:
-      # Empty compute blocks need to processed in the backwards pass to
-      # initialize outputs.
-      continue
+  if return_dynamic_grid:
+    active_indices = np.argwhere(block_mask > 0)
+    active_rows = active_indices[:, 0].astype(np.int32)
+    active_cols = active_indices[:, 1].astype(np.int32)
+    block_mask = block_mask[block_mask > 0]
+    grid_size = active_rows.size
+  else:
+    active_indices = np.ndindex(block_mask.shape)
+    active_rows = active_cols = grid_size = None
 
-    is_next_mask = idx > coord_m
+  mask_next = []
+  for idx in active_indices:
+    is_next_mask = tuple(idx) > tuple(coord_m)
     if is_next_mask:
       try:
         coord_m = next(mask_coords_iter)  # type: ignore
       except StopIteration:
         coord_m = first_m
-
-    active_rows.append(idx[0])
-    active_cols.append(idx[1])
     mask_next.append(partial_blocks[coord_m])
-
-  # TODO: resize all arrays to the maximum of grid sizes in each shard.
+  mask_next = np.array(mask_next, dtype=np.int32)
   flat_block_mask = block_mask.flatten()
 
-  if return_dynamic_grid:
-    flat_block_mask = flat_block_mask[flat_block_mask != 0]
-
-  assert len(active_rows) == len(active_cols) == len(mask_next)
-  grid_size = len(active_rows)
-
-  pad_length = total_blocks - flat_block_mask.size
-  active_rows = np.pad(np.array(active_rows, dtype=np.int32), (0, pad_length))
-  active_cols = np.pad(np.array(active_cols, dtype=np.int32), (0, pad_length))
-  mask_next = np.pad(np.array(mask_next, dtype=np.int32), (0, pad_length))
-  flat_block_mask = np.pad(
-      np.array(flat_block_mask, dtype=np.int32), (0, pad_length)
-  )
   return active_rows, active_cols, mask_next, flat_block_mask, grid_size
 
 
@@ -536,21 +516,32 @@ def _process_mask(
         for shard_idx in range(q_seq_shards)
     ])
 
-    # Concatenate the sequence shards.
-    active_rows = np.concatenate(active_rows_slices, axis=0)
-    active_cols = np.concatenate(active_cols_slices, axis=0)
+    if return_dynamic_grid:
+      # Pad each slice to the largest number of active blocks in any shard.
+      max_size = max(num_active_blocks)
+      pad_slice = lambda arr: np.pad(arr, (0, max_size - arr.shape[0]))
+      active_rows_slices = list(map(pad_slice, active_rows_slices))
+      active_cols_slices = list(map(pad_slice, active_cols_slices))
+      mask_next_slices = list(map(pad_slice, mask_next_slices))
+      block_mask_slices = list(map(pad_slice, block_mask_slices))
+
+      # Concatenate the sequence shards.
+      active_rows = np.concatenate(active_rows_slices, axis=0)
+      active_cols = np.concatenate(active_cols_slices, axis=0)
+      num_active_blocks = np.array(num_active_blocks, dtype=np.int32)
+
+      if downcast_smem_data:
+        active_rows = _downcast_to_small_type(active_rows)
+        active_cols = _downcast_to_small_type(active_cols)
+    else:
+      active_rows = active_cols = num_active_blocks = None
+
     mask_next = np.concatenate(mask_next_slices, axis=0)
     block_mask = np.concatenate(block_mask_slices, axis=0)
-    num_active_blocks = np.array(num_active_blocks, dtype=np.int32)
 
     if downcast_smem_data:
       mask_next = _downcast_to_small_type(mask_next)
-      active_rows = _downcast_to_small_type(active_rows)
-      active_cols = _downcast_to_small_type(active_cols)
       block_mask = _downcast_to_small_type(block_mask)
-
-    if not return_dynamic_grid:
-      active_rows = active_cols = None
 
   assert (mask_function is not None) == (q_sequence is not None)
   # When the mask can be computed inside the kernel with a mask_function,
