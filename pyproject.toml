@@ -31,7 +31,6 @@ dependencies = [
     "typing_extensions>=4.5.0",
     "typeguard==2.13.3",
     "xprof",
-    "hypothesis",
 ]
 [project.optional-dependencies]
 test = [
@@ -52,4 +51,5 @@ cuda = [
 
 tpu = [
     "jax[tpu]>=0.8.0",
+    "hypothesis",
 ]
