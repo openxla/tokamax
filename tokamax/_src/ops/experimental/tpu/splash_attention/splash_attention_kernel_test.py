@@ -18,7 +18,6 @@ from __future__ import annotations
 from collections.abc import Callable
 import dataclasses
 import functools
-import math
 from typing import Any, TypeVar
 
 from absl.testing import absltest

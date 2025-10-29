@@ -855,18 +855,19 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
 
     if return_dynamic_grid:
       expected_causal_mask_next_dkv = np.array(
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.int8
+          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.int8
       )
+      # The grid is extended to visit ampty rows to initialize dk/dv.
       expected_active_rows_dkv = np.array(
-          [0, 0, 0, 0, 1, 1, 1, 2, 2, 3], dtype=np.int8
+          [0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 4, 5, 6, 7], dtype=np.int8
       )
       expected_active_cols_dkv = np.array(
-          [0, 1, 2, 3, 1, 2, 3, 2, 3, 3], dtype=np.int8
+          [0, 1, 2, 3, 1, 2, 3, 2, 3, 3, 0, 0, 0, 0], dtype=np.int8
       )
       expected_causal_block_mask_dkv = np.array(
-          [1, 2, 2, 2, 1, 2, 2, 1, 2, 1], dtype=np.int8
+          [1, 2, 2, 2, 1, 2, 2, 1, 2, 1, 0, 0, 0, 0], dtype=np.int8
       )
-      expected_num_active_blocks_dkv = np.array([10], dtype=np.int32)
+      expected_num_active_blocks_dkv = np.array([14], dtype=np.int32)
     else:
       expected_causal_mask_next_dkv = np.zeros((32,), dtype=np.int8)
       expected_active_rows_dkv = None

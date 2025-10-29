@@ -247,7 +247,15 @@ def _get_mask_info(
   first_m = coord_m = next(mask_coords_iter)
 
   if return_dynamic_grid:
-    active_indices = np.argwhere(block_mask > 0)
+    active_mask = block_mask > 0
+    if is_dkv:
+      # If an entire row is masked then that kv output tile won't be visited.
+      # We extend the grid to visit these tiles to initialize them.
+      empty_rows = np.all(block_mask == 0, axis=-1)
+      first_col = np.arange(block_mask.shape[1]) == 0
+      active_mask |= (empty_rows[:, None] & first_col)
+
+    active_indices = np.argwhere(active_mask)
     active_rows = active_indices[:, 0].astype(np.int32)
     active_cols = active_indices[:, 1].astype(np.int32)
     block_mask = block_mask[block_mask > 0]

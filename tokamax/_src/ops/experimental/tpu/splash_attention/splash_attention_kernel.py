@@ -1657,19 +1657,7 @@ def _splash_attention_bwd_dkv(
   ]
   in_specs += [dq_alias_spec]
 
-  if dynamic_grid:
-    prefix = () if is_mqa else (None,)
-    if q_heads_per_kv_head == 1:
-      # We don't need to pipeline over the inputs aliases because we don't write to them.
-      dk_alias_spec = pl.BlockSpec(prefix + (bq, head_dim_qk), lambda *_: (0,) * k.ndim)
-      dv_alias_spec = pl.BlockSpec(prefix + (bq, head_dim_v), lambda *_: (0,) * v.ndim)
-    else:
-      dk_alias_spec = dk_spec
-      dv_alias_spec = dv_spec
-    in_specs += [dk_alias_spec, dv_alias_spec]
-    dk = jnp.zeros(k.shape, dtype=dk_type)
-    dv = jnp.zeros(v.shape, dtype=dv_type)
-  elif q_heads_per_kv_head != 1:
+  if q_heads_per_kv_head != 1:
     # in/out aliasing to accumulate within kv groups.
     in_specs += [dk_spec, dv_spec]
     dk = lax.empty(k.shape, dtype=dk_type)
@@ -1736,7 +1724,7 @@ def _splash_attention_bwd_dkv(
   num_args = sum(1 for x in args if x is not None)
   input_output_aliases = {}
   if dq_reduction_steps == 3:
-    if dynamic_grid or q_heads_per_kv_head != 1:
+    if q_heads_per_kv_head != 1:
       input_output_aliases = {num_args: 0, num_args + 1: 1, num_args + 2: 2}
     else:
       input_output_aliases = {num_args: 0}
