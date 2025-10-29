@@ -16,6 +16,8 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from scipy import special
 from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.ragged_dot import base
 
@@ -33,6 +35,16 @@ SPEC_SHAPES = {
     # FIXME: Use correct dtypes.
     '8x7b': (8, 8192, 14336, 4096, jnp.bfloat16, jnp.bfloat16, None, 'mixtral'),
 }
+
+
+def _generate_group_sizes(target_m: int, g: int) -> tuple[int, ...]:
+  """Generate group sizes for a given target m."""
+  np.random.seed(0)
+  repr_val = np.random.uniform(size=(g,))
+  repr_val = np.random.binomial(1, 0.9, (g,)) * repr_val
+  repr_val = np.int32((repr_val / np.sum(repr_val)) * target_m)
+  repr_val[0] += target_m - np.sum(repr_val)
+  return tuple(map(int, repr_val))
 
 
 def _make_spec(
@@ -64,4 +76,24 @@ def _make_spec(
   )
 
 
-ARG_SPECS = tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())
+ARG_SPECS = (
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(262144, 7168), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(256, 7168, 2048), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(  # pytype: disable=wrong-arg-types
+                jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
+                representative_value=_generate_group_sizes(
+                    target_m=262144, g=256
+                ),
+            ),
+        },
+        project='maxtext',
+        name='deepseek-v3',
+        tags=('long',),
+    ),
+) + tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())
