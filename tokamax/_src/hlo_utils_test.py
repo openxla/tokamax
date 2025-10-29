@@ -24,7 +24,6 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
-import jax_triton as jt
 from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src import hlo_utils
@@ -35,8 +34,6 @@ from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
-import triton
-import triton.language as tl
 
 from tensorflow.compiler.xla import xla_data_pb2
 from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
@@ -190,67 +187,6 @@ class DumpHloLibTest(parameterized.TestCase):
 
     # TODO: add tests for axis once this is in the Pallas HLO.
 
-  def test_jax_triton_simple(self):
-    self.skipTest('This test is not supported on OSS due to CUDA backend issues.')
-
-    if jax.default_backend() != 'gpu':
-      self.skipTest('This test only runs on GPU.')
-
-    metadata = {'test': 1, 'test2': 'two'}
-    metadata_json = bytes(json.dumps(metadata), 'utf-8')
-    num_warps = 2
-
-    @triton.jit
-    def add_kernel(
-        x_ptr,
-        y_ptr,
-        output_ptr,
-        block_size: tl.constexpr,
-    ):
-      """Adds two vectors."""
-      pid = tl.program_id(axis=0)
-      block_start = pid * block_size
-      offsets = block_start + tl.arange(0, block_size)
-      mask = offsets < 8
-      x = tl.load(x_ptr + offsets, mask=mask)
-      y = tl.load(y_ptr + offsets, mask=mask)
-      output = x + y
-      tl.store(output_ptr + offsets, output, mask=mask)
-
-    @jax.jit
-    def add_jax_triton(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-      out_shape = jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype)
-      block_size = 8
-      grid = (triton.cdiv(x.size, block_size),)
-      return jt.triton_call(
-          x,
-          y,
-          kernel=add_kernel,
-          out_shape=out_shape,
-          grid=grid,
-          block_size=block_size,
-          num_warps=num_warps,
-          serialized_metadata=metadata_json,
-          name='add_kernel_jax_triton',
-      )
-
-    x = jnp.arange(8)
-    y = jnp.arange(8, 16)
-
-    kernels = hlo_utils.get_kernel_info(
-        add_jax_triton.lower(x, y), include_xla_kernels=False
-    )
-    self.assertLen(kernels, 1)
-    kernels = kernels[0]
-    self.assertIsInstance(kernels, hlo_utils.TritonKernelInfo)
-    self.assertEqual(kernels.kernel_name, 'add_kernel')
-
-    metadata_load = json.loads(kernels.metadata)
-    self.assertEqual(metadata_load, metadata)
-    self.assertEqual(kernels.num_warps, num_warps)
-    self.assertEqual(kernels.grid, (1, 1, 1))
-    self.assertEqual(kernels.compute_capability, jt.get_compute_capability(0))
-
   def test_get_opspecs_from_lowered_jax(self):
 
     if jax.default_backend() != 'gpu':
@@ -377,51 +313,6 @@ class DumpHloLibTest(parameterized.TestCase):
     expected = fn_lowered.compile()(x)
     diff_summary = numerics.array_diff_summary(expected, jax.jit(fn2)(x2))
     self.assertGreater(diff_summary.percent_close * 100, 99.99)
-
-  def test_empty_opspecs_from_triton_kernel(self):
-    self.skipTest('This test is not supported on OSS due to CUDA backend issues.')
-
-    if jax.default_backend() != 'gpu':
-      self.skipTest('This test only runs on GPU.')
-
-    # A non-Tokamax kernel should not return any op specs from a lowered Jax
-    # function.
-    @triton.jit
-    def non_tokamax_add_kernel(
-        x_ptr,
-        y_ptr,
-        output_ptr,
-        block_size: tl.constexpr,
-    ):
-      """Adds two vectors."""
-      pid = tl.program_id(axis=0)
-      block_start = pid * block_size
-      offsets = block_start + tl.arange(0, block_size)
-      mask = offsets < 8
-      x = tl.load(x_ptr + offsets, mask=mask)
-      y = tl.load(y_ptr + offsets, mask=mask)
-      output = x + y
-      tl.store(output_ptr + offsets, output, mask=mask)
-
-    @jax.jit
-    def add_jax_triton(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-      out_shape = jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype)
-      block_size = 8
-      grid = (triton.cdiv(x.size, block_size),)
-      return jt.triton_call(
-          x,
-          y,
-          kernel=non_tokamax_add_kernel,
-          out_shape=out_shape,
-          grid=grid,
-          block_size=block_size,
-          name='add_kernel_jax_triton',
-      )
-
-    x = jnp.arange(8)
-    y = jnp.arange(8, 16)
-    kernels = hlo_utils.get_opspecs(add_jax_triton.lower(x, y))
-    self.assertEmpty(kernels)
 
   @parameterized.parameters(
       ['mosaic', 'triton', 'xla', 'xla_chunked', 'cudnn', None]

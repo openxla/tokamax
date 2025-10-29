@@ -33,7 +33,6 @@ dependencies = [
     "typeguard==2.13.3",
     "xprof",
     "hypothesis",
-    "jax-triton",
 ]
 [project.optional-dependencies]
 test = [
@@ -49,7 +48,6 @@ bench = [
 cuda = [
     "jax[cuda12]>=0.8.0",
     "nvidia-cudnn-cu12>=9.0.0",
-    "triton>=3.0.0",
 ]
 
 tpu = [
