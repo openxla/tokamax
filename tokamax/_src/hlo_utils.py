@@ -195,32 +195,6 @@ def _instruction_get_mosaic_tpu_kernel(
   )
 
 
-def _instruction_get_triton_kernel(
-    instruction: hlo_pb2.HloInstructionProto, module_name: str
-) -> TritonKernelInfo:
-  """Get Triton kernel info from an HLO instruction."""
-
-  cfg = instruction.backend_config
-  grid = (0, 0, 0)
-  name = ''
-  compute_capability = 0
-  num_warps = 0
-  cluster_dim = (0, 0, 0)
-  metadata = ''
-
-  return TritonKernelInfo(
-      **_get_generic_kernel_info(instruction),
-      kernel_name=name,
-      compute_capability=compute_capability,
-      num_warps=num_warps,
-      num_stages=None,  # This is not currently in triton.proto.
-      grid=grid,
-      cluster_dim=cluster_dim,
-      metadata=metadata,
-      hlo_module_name=module_name,
-  )
-
-
 _KERNEL_GETTER: Final[
     immutabledict.immutabledict[
         str, Callable[[hlo_pb2.HloInstructionProto, str], KernelInfoBase]
@@ -229,7 +203,6 @@ _KERNEL_GETTER: Final[
     _MOSAIC_GPU_KEY: _instruction_get_mosaic_gpu_kernel,
     _MOSAIC_TPU_KEY: _instruction_get_mosaic_tpu_kernel,
     _TRITON_PALLAS_KEY: _instruction_get_pallas_kernel,
-    _TRITON_KEY: _instruction_get_triton_kernel,
 })
 
 
