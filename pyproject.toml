@@ -22,7 +22,6 @@ dependencies = [
     "absl-py>=2.3.0",
     "chex>=0.1.91",
     "einshape",
-    "google-benchmark>=1.9.0",
     "jax>=0.8.0",
     "jaxlib>=0.8.0",
     "jaxtyping>=0.3",
@@ -41,6 +40,10 @@ test = [
     "pytest-xdist",
     "pytest",
     "flax",
+]
+
+bench = [
+    "google-benchmark>=1.9.0",
 ]
 
 cuda = [

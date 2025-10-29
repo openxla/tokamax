@@ -24,7 +24,6 @@ import tempfile
 import time
 from typing import Any, Literal, TypeAlias, TypeVar
 
-import google_benchmark
 import jax
 from jax.experimental.mosaic.gpu import profiler
 import numpy as np
@@ -459,6 +458,9 @@ def register_benchmark(
   bmark_name = f'{name}_{mode}_{impl_name}'
   if metadata is None:
     metadata = {}
+
+  # Import lazily, allowing this module to be used without `google_benchmark`.
+  import google_benchmark  # pylint: disable=g-import-not-at-top
 
   @google_benchmark.option.unit(google_benchmark.kMicrosecond)
   @google_benchmark.option.use_manual_time()
