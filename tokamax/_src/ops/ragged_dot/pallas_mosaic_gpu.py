@@ -27,10 +27,10 @@ from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel as non_quant_kernel
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel_blackwell as non_quant_kernel_blackwell
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel as quant_kernel
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel_blackwell as quant_kernel_blackwell
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_kernel as quant_ws_kernel
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel_blackwell as non_quant_kernel_blackwell
 from typing_extensions import override
 
 Config = common.Config
