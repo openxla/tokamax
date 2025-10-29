@@ -23,6 +23,7 @@ import jax
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
+from qwix import pallas as qpl
 from tokamax._src import batching
 from tokamax._src import quantization
 from tokamax._src import triton as triton_lib
@@ -33,7 +34,7 @@ from typing_extensions import override
 
 
 Residuals = base.Residuals
-QuantizedArray = quantization.QuantizedArray
+QArray = base.QArray
 GroupSizes = base.GroupSizes
 
 
@@ -136,8 +137,8 @@ def _ragged_dot_kernel(
 
 
 def _ragged_dot(
-    lhs: jax.Array | QuantizedArray,
-    rhs: jax.Array | QuantizedArray,
+    lhs: jax.Array | QArray,
+    rhs: jax.Array | QArray,
     *,
     group_sizes: jax.Array,
     ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
@@ -180,23 +181,23 @@ def _ragged_dot(
 
   lhs_scales = None
   lhs_scales_spec = None
-  if isinstance(lhs, QuantizedArray):
-    if lhs.tile_shape[0] == 1:
-      lhs, lhs_scales = lhs.values, lhs.scales
+  if isinstance(lhs, QArray):
+    if (lhs.scale.shape[0] == lhs.shape[0]) and lhs.zero_point is None:
+      lhs, lhs_scales = lhs.qvalue, lhs.scale
       index_map = lambda _, __, e: (0, 0)
       lhs_scales_spec = pl.BlockSpec(lhs_scales.shape, index_map)
     else:
-      lhs = lhs.recompose()
+      lhs = qpl.dequantize(lhs)
 
   rhs_scales = None
   rhs_scales_spec = None
-  if isinstance(rhs, quantization.QuantizedArray):
-    if rhs.tile_shape[0] == 1:
-      rhs, rhs_scales = rhs.values, rhs.scales
+  if isinstance(rhs, QArray):
+    if (rhs.scale.shape[0] == rhs.shape[0]) and rhs.zero_point is None:
+      rhs, rhs_scales = rhs.qvalue, rhs.scale
       index_map = lambda _, __, e: (e, 0, 0)
       rhs_scales_spec = pl.BlockSpec((None, *rhs_scales.shape[1:]), index_map)
     else:
-      rhs = rhs.recompose()
+      rhs = qpl.dequantize(rhs)
 
   kernel = functools.partial(
       _ragged_dot_kernel,
@@ -270,8 +271,8 @@ _RAGGED_CONTRACTING_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
 
 
 def _ragged_contracting_dim_dot(
-    lhs: jax.Array | QuantizedArray,
-    rhs: jax.Array | QuantizedArray,
+    lhs: jax.Array | QArray,
+    rhs: jax.Array | QArray,
     *,
     group_sizes: jax.Array,
     ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
@@ -295,11 +296,7 @@ def _ragged_contracting_dim_dot(
   block_k = config.block_k
   block_n = config.block_n
 
-  if isinstance(lhs, QuantizedArray):
-    lhs = lhs.recompose()
-
-  if isinstance(rhs, QuantizedArray):
-    rhs = rhs.recompose()
+  lhs, rhs = map(quantization.as_array, (lhs, rhs))
 
   def f(lhs, rhs, lo, hi):
     kernel = functools.partial(
@@ -353,8 +350,8 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
   @override
   def _fwd(
       self,
-      lhs: jax.Array | QuantizedArray,
-      rhs: jax.Array | QuantizedArray,
+      lhs: jax.Array | QArray,
+      rhs: jax.Array | QArray,
       *,
       group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
@@ -369,7 +366,10 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       raise NotImplementedError("Triton not supported on this platform.")
 
     if preferred_element_type is None:
-      out_dtype = jnp.promote_types(lhs.dtype, rhs.dtype)
+      out_dtype = jnp.promote_types(
+          lhs.scale.dtype if isinstance(lhs, QArray) else lhs.dtype,
+          rhs.scale.dtype if isinstance(rhs, QArray) else rhs.dtype,
+      )
     else:
       out_dtype = preferred_element_type
 

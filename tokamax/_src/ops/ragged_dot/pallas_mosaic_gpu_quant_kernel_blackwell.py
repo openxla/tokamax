@@ -26,7 +26,6 @@ from jax._src.lib.mlir.dialects import memref
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
-QuantizedArray = quantization.QuantizedArray
 
 _MMA_WG = 0
 _MEMORY_WG = 1
@@ -55,12 +54,14 @@ def dequant(s_ref, w):
 
 def ragged_dot_gpu_quant_blackwell_kernel(
     lhs: jax.Array,
-    rhs: QuantizedArray,
+    rhs: quantization.QArray,
     group_sizes: jax.Array,
     out_dtype,
     config: common.Config,
 ) -> jax.Array:
   """Pallas kernel for ragged dot with GPU quantization."""
+  assert rhs.zero_point is None
+
   block_m = config.block_m
   block_n = config.block_n
   block_k = config.block_k
@@ -75,7 +76,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
     block_m *= 2
     block_n *= 2
 
-  w, w_scales, x = (rhs.values.mT, rhs.scales, lhs)
+  w, w_scales, x = (rhs.qvalue.mT, rhs.scale, lhs)
 
   (num_groups, n, k_w), (m, k_x) = w.shape, x.shape
   tile_k = k_w // w_scales.shape[1]

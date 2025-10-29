@@ -25,17 +25,18 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from qwix import pallas as qpl
 from tokamax._src import mosaic_tpu as common
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 
 CanonicalPrecision = precision_lib.CanonicalPrecision
-QuantizedArray = quantization.QuantizedArray
+QArray = quantization.QArray
 
 
 def _validate_args(
-    lhs: jax.Array | QuantizedArray,
-    rhs: jax.Array | QuantizedArray,
+    lhs: jax.Array | QArray,
+    rhs: jax.Array | QArray,
     group_sizes: jax.Array,
     *,
     expected_rhs_dims: int = 3,
@@ -269,9 +270,7 @@ def _quantize_as(x, qdtype: jnp.dtype, axis: int, scale: float | None):
     inv_scales = jnp.broadcast_to(1.0 / scales, x.shape)
   else:  # compile-time (static) quantization scale
     scales, inv_scales = scale, 1.0 / scale
-  return quantization.QuantizedArray(
-      jnp.round(x * inv_scales).astype(qdtype), scales
-  )
+  return QArray(jnp.round(x * inv_scales).astype(qdtype), scales)
 
 
 def _scale_out_by_scale(out: jax.Array, scales: jax.Array, axis: int):
@@ -301,8 +300,8 @@ _TilingFn = Callable[[int, int, int], tuple[int, int, int] | None]
     ],
 )
 def gmm(
-    lhs: jax.Array | QuantizedArray,
-    rhs: jax.Array | QuantizedArray,
+    lhs: jax.Array | QArray,
+    rhs: jax.Array | QArray,
     group_sizes: jax.Array,
     precision: CanonicalPrecision,
     out_dtype: jnp.dtype,
@@ -343,6 +342,11 @@ def gmm(
     A 2d, jax.Array with shape [m, n].
   """
   group_sizes = _validate_args(lhs, rhs, group_sizes)
+
+  if isinstance(lhs, QArray) and lhs.zero_point is not None:
+    lhs = qpl.dequantize(lhs)
+  if isinstance(rhs, QArray) and rhs.zero_point is not None:
+    rhs = qpl.dequantize(rhs)
 
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
@@ -402,19 +406,19 @@ def gmm(
         rhs = jax.tree.map(lambda x: x[...], rhs_ref)
 
         # optional dynamic quantization within the kernel
-        if lhs_qdtype is not None and not isinstance(lhs, QuantizedArray):
+        if lhs_qdtype is not None and not isinstance(lhs, QArray):
           lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
-        if rhs_qdtype is not None and not isinstance(rhs, QuantizedArray):
+        if rhs_qdtype is not None and not isinstance(rhs, QArray):
           rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
 
         # unpack quantized arrays for dot operation
         scales = []
-        if isinstance(lhs, QuantizedArray):
-          scales.append((lhs.scales, 1))
-          lhs = lhs.values
-        if isinstance(rhs, QuantizedArray):
-          scales.append((rhs.scales.T if transpose_rhs else rhs.scales, 0))
-          rhs = rhs.values
+        if isinstance(lhs, QArray):
+          scales.append((lhs.scale, 1))
+          lhs = lhs.qvalue
+        if isinstance(rhs, QArray):
+          scales.append((rhs.scale.T if transpose_rhs else rhs.scale, 0))
+          rhs = rhs.qvalue
 
         # mask values if the current tile extends beyond reduction axis size
         if is_last_k_tile and (k_rem := k % tk) != 0:
@@ -474,15 +478,15 @@ def gmm(
     rhs_block_spec = pl.BlockSpec((None, tk, tn), rhs_index_map)
   out_block_spec = pl.BlockSpec((tm, tn), out_index_map)
 
-  if isinstance(lhs, QuantizedArray):
+  if isinstance(lhs, QArray):
     lhs, lhs_block_spec = common.quant_block_spec(lhs, lhs_block_spec, 1)
-  if isinstance(rhs, QuantizedArray):
+  if isinstance(rhs, QArray):
     rhs_axis = 2 if transpose_rhs else 1
     rhs, rhs_block_spec = common.quant_block_spec(rhs, rhs_block_spec, rhs_axis)
 
   lhs_bytes = jax.tree.reduce(lambda acc, x: acc + x.size * x.itemsize, lhs, 0)
-  if isinstance(rhs, QuantizedArray):
-    rhs_bytes = (k * n) * rhs.values.itemsize  # We don't read all of rhs
+  if isinstance(rhs, QArray):
+    rhs_bytes = (k * n) * rhs.qvalue.itemsize  # We don't read all of rhs
   else:
     rhs_bytes = k * n * rhs.itemsize
 
@@ -548,8 +552,8 @@ def gmm(
     ],
 )
 def tgmm(
-    lhs: jax.Array | QuantizedArray,
-    rhs: jax.Array | QuantizedArray,
+    lhs: jax.Array | QArray,
+    rhs: jax.Array | QArray,
     group_sizes: jax.Array,
     precision: CanonicalPrecision,
     out_dtype: jnp.dtype,
@@ -591,6 +595,11 @@ def tgmm(
     A  3d, jax.Array with shape [num_groups, k, n].
   """
   group_sizes = _validate_args(lhs, rhs, group_sizes, expected_rhs_dims=2)
+
+  if isinstance(lhs, QArray) and lhs.zero_point is not None:
+    lhs = qpl.dequantize(lhs)
+  if isinstance(rhs, QArray) and rhs.zero_point is not None:
+    rhs = qpl.dequantize(rhs)
 
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
@@ -652,19 +661,19 @@ def tgmm(
       rhs = jax.tree.map(lambda x: x[...], rhs_ref)
 
       # optional dynamic quantization within the kernel
-      if lhs_qdtype is not None and not isinstance(lhs, QuantizedArray):
+      if lhs_qdtype is not None and not isinstance(lhs, QArray):
         lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
-      if rhs_qdtype is not None and not isinstance(rhs, QuantizedArray):
+      if rhs_qdtype is not None and not isinstance(rhs, QArray):
         rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
 
       # unpack quantized arrays for dot operation
       scales = []
-      if isinstance(lhs, QuantizedArray):
-        scales.append((lhs.scales.T, 1))
-        lhs = lhs.values
-      if isinstance(rhs, QuantizedArray):
-        scales.append((rhs.scales, 0))
-        rhs = rhs.values
+      if isinstance(lhs, QArray):
+        scales.append((lhs.scale.T, 1))
+        lhs = lhs.qvalue
+      if isinstance(rhs, QArray):
+        scales.append((rhs.scale, 0))
+        rhs = rhs.qvalue
 
       kwargs = dict(grid_id=grid_id, group_metadata=group_metadata, tm=tm)
       lhs = jnp.where(_get_store_mask(**kwargs, tn=tk), lhs, 0)
@@ -712,9 +721,9 @@ def tgmm(
   rhs_block_spec = pl.BlockSpec((tm, tn), rhs_index_map)
   out_block_spec = pl.BlockSpec((None, tk, tn), out_index_map)
 
-  if isinstance(lhs, QuantizedArray):
+  if isinstance(lhs, QArray):
     lhs, lhs_block_spec = common.quant_block_spec(lhs, lhs_block_spec, 0)
-  if isinstance(rhs, QuantizedArray):
+  if isinstance(rhs, QArray):
     rhs, rhs_block_spec = common.quant_block_spec(rhs, rhs_block_spec, 0)
 
   lhs_bytes = jax.tree.reduce(lambda acc, x: acc + x.size * x.itemsize, lhs, 0)

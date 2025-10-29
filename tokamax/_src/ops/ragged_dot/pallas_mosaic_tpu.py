@@ -17,13 +17,13 @@
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
 import itertools
-import logging
 import types
 from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 import pydantic
+from qwix import pallas as qpl
 from tokamax._src import mosaic_tpu
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
@@ -43,7 +43,7 @@ TilingTuple = tuple[
 ]
 InputBufferCount = pydantic.conint(ge=1, le=3, multiple_of=1)
 
-QuantizedArray = quantization.QuantizedArray
+QArray = base.QArray
 Residuals = types.NoneType
 
 LUTKey = tuple[
@@ -146,8 +146,8 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   @override
   def _fwd(
       self,
-      lhs: jax.Array | QuantizedArray,
-      rhs: jax.Array | QuantizedArray,
+      lhs: jax.Array | QArray,
+      rhs: jax.Array | QArray,
       *,
       group_sizes: jax.Array | base.GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers | None,
@@ -169,9 +169,10 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       )
 
     def maybe_quantize(x, tile_shape):
-      if isinstance(x, QuantizedArray) or self.qdtype is None:
+      if isinstance(x, QArray) or self.qdtype is None:
         return x
-      return quantization.quantize_as(self.qdtype, tile_shape=tile_shape)(x)
+      x = quantization.quantize_as(self.qdtype, tile_shape=tile_shape)(x)
+      return quantization.as_qarray(x)
 
     if isinstance(group_sizes, base.GroupSizes):
       group_sizes = jnp.array(group_sizes)
@@ -179,7 +180,8 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     if preferred_element_type is None:
       preferred_element_type = (
           precision_lib.default_output_dtype_from_input_dtypes(
-              lhs.dtype, rhs.dtype
+              lhs.scale.dtype if isinstance(lhs, QArray) else lhs.dtype,
+              rhs.scale.dtype if isinstance(rhs, QArray) else rhs.dtype,
           )
       )
 
@@ -199,16 +201,16 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
       # here, handle fast-path special cases that arise in backwards gmm
-      if isinstance(lhs, jax.Array) and isinstance(rhs, QuantizedArray):
-        if rhs.scales.shape[1] == 1:
+      if isinstance(lhs, jax.Array) and isinstance(rhs, QArray):
+        if rhs.scale.shape[1] == 1:
           # STRATEGY 1: full-channel quantization along the reduction dimension
           # here, apply rhs scales to lhs and compute with rhs quant values
           indices = _group_sizes_to_indices(group_sizes, m=lhs.shape[0])
-          lhs *= jnp.take_along_axis(rhs.scales[:, 0, :], indices[:, None], 0)
-          rhs = rhs.values
+          lhs *= jnp.take_along_axis(rhs.scale[:, 0, :], indices[:, None], 0)
+          rhs = rhs.qvalue
           lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
         else:
-          rhs = maybe_quantize(rhs.recompose(), (1, 1, rhs.shape[2]))
+          rhs = maybe_quantize(qpl.dequantize(rhs), (1, 1, rhs.shape[2]))
       else:
         lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
         rhs = maybe_quantize(rhs, (1, 1, rhs.shape[2]))
@@ -226,15 +228,15 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
       lhs_trans = jax.tree.map(lambda x: x.mT, lhs)
       # here, handle fast-path special cases that arise in backwards gmm
-      if isinstance(lhs_trans, QuantizedArray) and isinstance(rhs, jax.Array):
-        if lhs_trans.scales.shape[0] == 1:
+      if isinstance(lhs_trans, QArray) and isinstance(rhs, jax.Array):
+        if lhs_trans.scale.shape[0] == 1:
           # STRATEGY 1: full-channel quantization along the reduction dimension
           # here, apply lhs scales to rhs and compute with lhs quant values
           # lhs_trans = quant[k, m], scale[1, m] and rhs/dout = float[m, n]
-          rhs *= lhs_trans.scales.mT
-          lhs_trans = lhs_trans.values
+          rhs *= lhs_trans.scale.mT
+          lhs_trans = lhs_trans.qvalue
         else:
-          lhs_trans = lhs_trans.recompose()
+          lhs_trans = qpl.dequantize(lhs_trans)
           lhs_trans = maybe_quantize(lhs_trans, (1, lhs_trans.shape[1]))
       else:
         lhs_trans = maybe_quantize(lhs_trans, (1, lhs_trans.shape[1]))
@@ -261,8 +263,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     lhs, rhs = ba.arguments["lhs"], ba.arguments["rhs"]
 
     # this is generally an incorrect assumption, but ok for a heuristic
-    is_quantized = (isinstance(lhs, QuantizedArray)
-                    or isinstance(rhs, QuantizedArray))
+    is_quantized = isinstance(lhs, QArray) or isinstance(rhs, QArray)
 
     ragged_dot_dimension_numbers = ba.arguments.get(
         "ragged_dot_dimension_numbers", DEFAULT_RAGGED_DOT_DIM_NUMS

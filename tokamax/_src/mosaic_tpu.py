@@ -15,20 +15,21 @@
 """Mosaic-TPU utils."""
 
 import dataclasses
-from functools import lru_cache  # pylint: disable=g-importing-member
-from functools import partial  # pylint: disable=g-importing-member
-from typing import Final, Any, Callable, Sequence
+import functools
+from typing import Any, Callable, Final, Sequence
 
 import jax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 from jax.extend import backend
 import jax.numpy as jnp
+from qwix import pallas as qpl
 
-from tokamax._src.quantization import QuantizedArray  # pylint: disable=g-importing-member
+
+QArray = qpl.QArray
 
 LANES = 128
-_sublane_size = lru_cache(lambda: 16 if tpu_generation() >= 7 else 8)
+_sublane_size = functools.lru_cache(lambda: 16 if tpu_generation() >= 7 else 8)
 
 
 # TODO: Add tests for this file.
@@ -89,15 +90,15 @@ def default_quant_dot_dtype() -> jnp.dtype:
 
 
 def quant_block_spec(
-    x: QuantizedArray, x_spec: pl.BlockSpec, reduction_axis: int
-) -> tuple[QuantizedArray, QuantizedArray]:
+    x: QArray, x_spec: pl.BlockSpec, reduction_axis: int
+) -> tuple[QArray, QArray]:
   """Broadcast scales so that they are addressable by Pallas via a BlockSpec."""
   reduction_axis = reduction_axis % x.ndim
   block_shape = list(x_spec.block_shape)
 
   # Check 1: the reduction axis x tiling includes only 1 scale per x tile.
   elements_per_scale = pl.cdiv(
-      x.values.shape[reduction_axis], x.scales.shape[reduction_axis]
+      x.qvalue.shape[reduction_axis], x.scale.shape[reduction_axis]
   )
   reduction_tile = block_shape[reduction_axis]
   if elements_per_scale % reduction_tile:  # tile too large or spans scales
@@ -108,8 +109,9 @@ def quant_block_spec(
     )
 
   # How many x elements per each scale scalar.
-  els_per_scale = [pl.cdiv(xs, ss) for xs, ss
-                   in zip(x.values.shape, x.scales.shape)]
+  els_per_scale = [
+      pl.cdiv(xs, ss) for xs, ss in zip(x.qvalue.shape, x.scale.shape)
+  ]
 
   # Check 2: ensure that for subtiles, x tiles evenly divide elements per scale.
   if any(
@@ -134,7 +136,7 @@ def quant_block_spec(
   # Ensure that scale tiles are individually addressable, repeat if necessary.
   min_sizes = [{x.ndim - 1: LANES, x.ndim - 2: _sublane_size()}.get(i, 1)
                for i in range(x.ndim)]
-  scales = x.scales
+  scale = x.scale
   for i, st in enumerate(scale_block_shape):
     size = 1 if st is None else st
     if size < min_sizes[i]:
@@ -144,18 +146,19 @@ def quant_block_spec(
       if min_sizes[i] % st != 0:
         raise NotImplementedError(
             f"{min_sizes[i]=} must be divisible by scale tile {st=} in"
-            f" {x.scales.shape=} for broadcasting to make addressable."
+            f" {x.scale.shape=} for broadcasting to make addressable."
         )
-      scales = jnp.repeat(scales, min_sizes[i] // st, axis=i)
+      scale = jnp.repeat(scale, min_sizes[i] // st, axis=i)
 
   # Construct the index map for the scales tiles and create the BlockSpec.
   def idx_map(*args):
     idxs = list(x_spec.index_map(*args))
     return tuple(i // tile_step for i, tile_step in zip(idxs, tile_steps))
 
-  sspec = pl.BlockSpec(scale_block_shape, idx_map)
-  x = dataclasses.replace(x, scales=scales)
-  return x, QuantizedArray(x_spec, sspec)  # pytype: disable=wrong-arg-types
+  scale_spec = pl.BlockSpec(scale_block_shape, idx_map)
+  spec = dataclasses.replace(x, qvalue=x_spec, scale=scale_spec)  # pytype: disable=wrong-arg-types
+  x = dataclasses.replace(x, scale=scale)
+  return x, spec
 
 
 def custom_buffered_pallas_call(
@@ -201,7 +204,7 @@ def custom_buffered_pallas_call(
 
       # unpack the smem prefetch values and bind them to the inspecs
       smem_refs = args_refs[1:num_scalar_prefetch+1]
-      _bind_smem = partial(_augment_blockspec, smem_refs=smem_refs)
+      _bind_smem = functools.partial(_augment_blockspec, smem_refs=smem_refs)
       in_specs_ = jax.tree.map(_bind_smem, grid_spec.in_specs)
       if input_buffer_count is not None:
         if len(input_buffer_count) != len(in_specs_):
@@ -211,7 +214,7 @@ def custom_buffered_pallas_call(
           )
 
         in_specs_ = tuple(
-            jax.tree.map(partial(_bind_pipeline, count=c), spec)
+            jax.tree.map(functools.partial(_bind_pipeline, count=c), spec)
             for spec, c in zip(in_specs_, input_buffer_count)
         )
       out_specs_ = jax.tree.map(_bind_smem, grid_spec.out_specs)
@@ -223,13 +226,13 @@ def custom_buffered_pallas_call(
       scratch_refs = args_refs[num_scalar_prefetch + args_len + 1:]
 
       # bind smem and scratch to the pipeline body
-      _pipeline = lambda *args: kernel(*smem_refs, *args, *scratch_refs)
-
       # specify dimension semantic from the scalar prefetch grid and emit
-      dim_sem = compiler_params.dimension_semantics
-      _emit_pipeline = partial(pltpu.emit_pipeline, dimension_semantics=dim_sem)
-      _emit_pipeline(
-          _pipeline, grid=grid, in_specs=in_specs_, out_specs=out_specs_
+      pltpu.emit_pipeline(
+          lambda *args: kernel(*smem_refs, *args, *scratch_refs),
+          grid=grid,
+          in_specs=in_specs_,
+          out_specs=out_specs_,
+          dimension_semantics=compiler_params.dimension_semantics,
       )(*input_output_refs)
 
     bs_smem = pl.BlockSpec(memory_space=pltpu.SMEM)

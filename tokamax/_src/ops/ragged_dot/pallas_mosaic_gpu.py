@@ -20,6 +20,7 @@ from typing import ClassVar
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
+from qwix import pallas as qpl
 from tokamax._src import mosaic_gpu as mosaic_gpu_lib
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
@@ -34,7 +35,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_kernel as quant_ws
 from typing_extensions import override
 
 Config = common.Config
-QuantizedArray = quantization.QuantizedArray
+QArray = base.QArray
 GroupSizes = base.GroupSizes
 
 
@@ -57,8 +58,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
   @override
   def _fwd(
       self,
-      lhs: jax.Array | QuantizedArray,
-      rhs: jax.Array | QuantizedArray,
+      lhs: jax.Array | QArray,
+      rhs: jax.Array | QArray,
       *,
       group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
@@ -77,16 +78,20 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
           "Only default `ragged_dot_dimension_numbers` supported."
       )
 
-    if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+    lhs_dtype = lhs.scale.dtype if isinstance(lhs, QArray) else lhs.dtype
+    rhs_dtype = rhs.scale.dtype if isinstance(rhs, QArray) else rhs.dtype
+    if not precision_lib.is_default(lhs_dtype, rhs_dtype, precision):
       raise NotImplementedError(f"{precision=} not supported.")
 
-    if isinstance(lhs, QuantizedArray):
-      lhs = lhs.recompose()
+    lhs = quantization.as_array(lhs)
+    # None of the kernels support zero point yet.
+    if isinstance(rhs, QArray) and rhs.zero_point is not None:
+      rhs = qpl.dequantize(rhs)
 
     device_kind = backend.get_default_device().device_kind.lower()
     is_hopper = "h100" in device_kind or "h200" in device_kind
     is_blackwell = "b200" in device_kind
-    is_rhs_quantized = isinstance(rhs, QuantizedArray)
+    is_rhs_quantized = isinstance(rhs, QArray)
 
     if is_rhs_quantized:
       if is_hopper:
@@ -118,7 +123,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
       group_sizes = jnp.array(group_sizes)
 
     if preferred_element_type is None:
-      preferred_element_type = jnp.result_type(lhs.dtype, rhs.dtype)
+      preferred_element_type = jnp.promote_types(lhs_dtype, rhs_dtype)
 
     out = fn(
         lhs,
@@ -158,10 +163,14 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
             grid_minor_dim=common.MatmulDimension.M,
             grid_tile_width=4,
         )
+    if isinstance(rhs, QArray):
+      block_k = quantization.get_tile_shape(rhs)[1]
+    else:
+      block_k = 128
     return common.Config(
         block_m=64,
         block_n=64,
-        block_k=rhs.tile_shape[1] if isinstance(rhs, QuantizedArray) else 128,
+        block_k=block_k,
         num_stages=4,
         split_k=1,
         grid_block_n=1,

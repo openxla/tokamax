@@ -108,21 +108,23 @@ def ragged_dot_quantized_kernel_body(
 
 def ragged_dot_quantized_kernel(
     lhs: jax.Array,
-    rhs: quantization.QuantizedArray,
+    rhs: quantization.QArray,
     group_sizes: jax.Array,
     out_dtype: jnp.dtype,
     config: common.Config,
 ) -> jax.Array:
   """Returns the Pallas kernel for quantized ragged dot."""
+  assert rhs.zero_point is None
 
   m, k = lhs.shape
   g, k2, n = rhs.shape
   assert k == k2
 
-  if rhs.tile_shape != (1, config.block_k, 1):
+  rhs_tile_shape = quantization.get_tile_shape(rhs)
+  if rhs_tile_shape != (1, config.block_k, 1):
     raise NotImplementedError(
         "Only scaling tile supported is (1, config.block_k, 1) got:"
-        f" {rhs.tile_shape}."
+        f" {rhs_tile_shape}."
     )
 
   if group_sizes.shape != (g,):
@@ -145,7 +147,7 @@ def ragged_dot_quantized_kernel(
       group_info.actual_end,
       group_info.start_within_block,
       group_info.actual_size,
-      rhs.values.mT,
+      rhs.qvalue.mT,
       lhs,
-      rhs.scales,
+      rhs.scale,
   )

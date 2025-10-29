@@ -24,6 +24,7 @@ from jax.experimental import checkify
 import jax.numpy as jnp
 import numpy as np
 from pydantic_core import core_schema as cs
+from qwix import pallas as qpl
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
@@ -33,6 +34,7 @@ from typing_extensions import override
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 Residuals = types.NoneType
+QArray = qpl.QArray
 QuantizedArray = quantization.QuantizedArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
 _DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset
@@ -117,8 +119,8 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   @override
   def bind(
       self,
-      lhs: jax.Array | QuantizedArray,
-      rhs: jax.Array | QuantizedArray,
+      lhs: jax.Array | QuantizedArray | QArray,
+      rhs: jax.Array | QuantizedArray | QArray,
       *,
       group_sizes: jax.Array | GroupSizes | Sequence[int],
       ragged_dot_dimension_numbers: (
@@ -128,6 +130,11 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       preferred_element_type: jax.typing.DTypeLike | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
+    if isinstance(lhs, QuantizedArray):
+      lhs = quantization.as_qarray(lhs)
+    if isinstance(rhs, QuantizedArray):
+      rhs = quantization.as_qarray(rhs)
+
     if ragged_dot_dimension_numbers is None:
       # TODO: Support batch dims on LHS and/or RHS?
       ragged_dot_dimension_numbers = DEFAULT_RAGGED_DOT_DIM_NUMS
@@ -163,8 +170,8 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   @override
   def _fwd(
       self,
-      lhs: jax.Array | QuantizedArray,
-      rhs: jax.Array | QuantizedArray,
+      lhs: jax.Array | QArray,
+      rhs: jax.Array | QArray,
       *,
       group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
@@ -175,11 +182,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   ) -> tuple[jax.Array, Residuals]:
     del config  # Unused.
 
-    if isinstance(lhs, QuantizedArray):
-      lhs = lhs.recompose()
-
-    if isinstance(rhs, QuantizedArray):
-      rhs = rhs.recompose()
+    lhs, rhs = map(quantization.as_array, (lhs, rhs))
 
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.array(group_sizes)
