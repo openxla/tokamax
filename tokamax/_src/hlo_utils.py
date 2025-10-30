@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for extracting kernel information from HLO."""
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 import dataclasses
 from typing import Any, Final
 import zlib
@@ -28,13 +28,13 @@ from tokamax._src.ops import op as op_base
 
 from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
-_TRITON_PALLAS_KEY: Final[str] = '__gpu$xla.gpu.triton'
+_PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
 _MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
 _MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
 _TRITON_KEY: Final[str] = 'triton_kernel_call'
 
 DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
-    export.DisabledSafetyCheck.custom_call(_TRITON_PALLAS_KEY),
+    export.DisabledSafetyCheck.custom_call(_PALLAS_TRITON_KEY),
     export.DisabledSafetyCheck.custom_call(_MOSAIC_GPU_KEY),
     export.DisabledSafetyCheck.custom_call(_MOSAIC_TPU_KEY),
     export.DisabledSafetyCheck.custom_call(_TRITON_KEY),
@@ -70,7 +70,6 @@ _XLA_NOISE_OPCODES: Final[set[str]] = {
     'reduce',
     'bitcast',
 }
-
 _TOKAMAX_NAME: Final[str] = 'tokamax'
 
 
@@ -95,9 +94,9 @@ class TritonKernelInfo(KernelInfoBase):
   num_warps: int
   grid: tuple[int, int, int]
   num_stages: int | None
-  cluster_dim: tuple[int, int, int] | None
+  cluster_dim: tuple[int, int, int]
   compute_capability: int | None
-  metadata: bytes | None
+  metadata: bytes
 
 
 # TODO: Add fields for Mosaic TPU kernel information.
@@ -116,20 +115,6 @@ class TokamaxXlaKernelInfo(KernelInfoBase):
   """Tokamax XLA kernel information."""
 
 
-def _is_tokamax_kernel(
-    kernel: hlo_pb2.HloInstructionProto | KernelInfoBase,
-) -> bool:
-  """Returns True if a kernel is a Tokamax kernel."""
-  if isinstance(kernel, hlo_pb2.HloInstructionProto):
-    op_name = kernel.metadata.op_name
-  elif isinstance(kernel, KernelInfoBase):
-    op_name = kernel.op_name
-  else:
-    raise ValueError(f'Unsupported kernel type {type(kernel)}')
-
-  return _TOKAMAX_NAME in op_name
-
-
 def _get_generic_kernel_info(
     instruction: hlo_pb2.HloInstructionProto,
 ) -> dict[str, Any]:
@@ -144,55 +129,27 @@ def _get_generic_kernel_info(
   )
 
 
-def _instruction_get_pallas_kernel(
+def _get_pallas_kernel_info(
     instruction: hlo_pb2.HloInstructionProto, module_name: str
 ) -> TritonKernelInfo:
   """Get Pallas kernel info from an HLO instruction."""
-
-  mlir_ctx = ir.Context()
-
-  def parse_ctx(name):
-    backend_config = instruction.backend_config.decode('utf-8')
-    return ir.DictAttr.parse(backend_config, mlir_ctx)[name].value
-
-  grid = (
-      parse_ctx('grid_x'),
-      parse_ctx('grid_y'),
-      parse_ctx('grid_z'),
-  )
+  ctx = ir.Context()
+  config = ir.DictAttr.parse(instruction.backend_config.decode('utf-8'), ctx)
   return TritonKernelInfo(
       **_get_generic_kernel_info(instruction),
-      kernel_name=parse_ctx('name'),
-      num_warps=parse_ctx('num_warps'),
-      num_stages=parse_ctx('num_stages'),
-      grid=grid,
+      kernel_name=config['name'].value,
+      num_warps=config['num_warps'].value,
+      num_stages=config['num_stages'].value,
+      grid=tuple(config[f'grid_{dim}'].value for dim in ('x', 'y', 'z')),
       hlo_module_name=module_name,
       compute_capability=None,
-      cluster_dim=None,
-      metadata=None,
+      cluster_dim=(1, 1, 1),
+      metadata=b'',
   )
 
 
-def _instruction_get_mosaic_gpu_kernel(
-    instruction: hlo_pb2.HloInstructionProto, module_name: str
-) -> MosaicGpuKernelInfo:
-  """Get Mosaic GPU kernel info from an HLO instruction."""
-
-  return MosaicGpuKernelInfo(
-      **_get_generic_kernel_info(instruction),
-      hlo_module_name=module_name,
-  )
-
-
-def _instruction_get_mosaic_tpu_kernel(
-    instruction: hlo_pb2.HloInstructionProto, module_name: str
-) -> MosaicTpuKernelInfo:
-  """Get Mosaic GPU kernel info from an HLO instruction."""
-
-  return MosaicTpuKernelInfo(
-      **_get_generic_kernel_info(instruction),
-      hlo_module_name=module_name,
-  )
+def _kernel_info_getter(cls):
+  return lambda i, m: cls(**_get_generic_kernel_info(i), hlo_module_name=m)
 
 
 _KERNEL_GETTER: Final[
@@ -200,30 +157,18 @@ _KERNEL_GETTER: Final[
         str, Callable[[hlo_pb2.HloInstructionProto, str], KernelInfoBase]
     ]
 ] = immutabledict.immutabledict({
-    _MOSAIC_GPU_KEY: _instruction_get_mosaic_gpu_kernel,
-    _MOSAIC_TPU_KEY: _instruction_get_mosaic_tpu_kernel,
-    _TRITON_PALLAS_KEY: _instruction_get_pallas_kernel,
+    _MOSAIC_GPU_KEY: _kernel_info_getter(MosaicGpuKernelInfo),
+    _MOSAIC_TPU_KEY: _kernel_info_getter(MosaicTpuKernelInfo),
+    _PALLAS_TRITON_KEY: _get_pallas_kernel_info,
 })
-
-
-def _get_kernel_from_instruction(
-    instruction: hlo_pb2.HloInstructionProto, module_name: str
-) -> KernelInfoBase:
-  target = getattr(instruction, 'custom_call_target', None)
-  if (getter := _KERNEL_GETTER.get(target)) is not None:
-    return getter(instruction, module_name)
-  else:
-    return TokamaxXlaKernelInfo(
-        **_get_generic_kernel_info(instruction),
-        hlo_module_name=module_name,
-    )
+_get_tokamax_xla_kernel_info = _kernel_info_getter(TokamaxXlaKernelInfo)
 
 
 def get_kernel_info(
     x: (
-        hlo_pb2.HloModuleProto
+        jax.stages.Lowered
+        | hlo_pb2.HloModuleProto
         | Sequence[hlo_pb2.HloModuleProto]
-        | jax.stages.Lowered
     ),
     include_xla_kernels: bool = True,
 ) -> tuple[KernelInfoBase, ...]:
@@ -237,48 +182,29 @@ def get_kernel_info(
   Returns:
     A tuple of KernelInfoBase objects.
   """
-
   if isinstance(x, jax.stages.Lowered):
-    out = _get_kernel_info_from_lowered(x)
+    # TODO: Figure out how to obtain this without serializing and
+    # deserializing.
+    hlos = [
+        hlo_pb2.HloModuleProto.FromString(hlo.as_serialized_hlo_module_proto())
+        for hlo in x.compile().runtime_executable().hlo_modules()
+    ]
+  elif isinstance(x, hlo_pb2.HloModuleProto):
+    hlos = [x]
   else:
-    out = _get_kernel_info_from_hlo(x)
+    hlos = x
 
-  if include_xla_kernels:
-    return out
-  else:
-    return tuple(
-        kernel for kernel in out if not isinstance(kernel, TokamaxXlaKernelInfo)
-    )
-
-
-def _get_kernel_info_from_hlo(
-    hlo: hlo_pb2.HloModuleProto | Sequence[hlo_pb2.HloModuleProto],
-) -> tuple[KernelInfoBase, ...]:
-  """Extracts accelerator kernel information from an HLO module."""
-
-  hlos = [hlo] if isinstance(hlo, hlo_pb2.HloModuleProto) else hlo
-  out = []
-
+  infos = []
   for hlo in hlos:
-    module_name = hlo.name
-    for instruction in _get_instructions(hlo):
-      out.append(_get_kernel_from_instruction(instruction, module_name))
+    for computation in hlo.computations:
+      for instruction in computation.instructions:
+        target = getattr(instruction, 'custom_call_target', None)
+        if (getter := _KERNEL_GETTER.get(target)) is not None:
+          infos.append(getter(instruction, hlo.name))
+        elif include_xla_kernels and _is_tokamax_xla_hlo(instruction):
+          infos.append(_get_tokamax_xla_kernel_info(instruction, hlo.name))
 
-  return tuple(out)
-
-
-def _get_kernel_info_from_lowered(
-    f: jax.stages.Lowered,
-) -> tuple[KernelInfoBase, ...]:
-  """Extracts accelerator kernel information from a lowered JITted function."""
-  hlos = f.compile().runtime_executable().hlo_modules()
-  # TODO: Figure out how to obtain this without serializing and
-  # deserializing.
-  hlos = [
-      hlo_pb2.HloModuleProto.FromString(hlo.as_serialized_hlo_module_proto())
-      for hlo in hlos
-  ]
-  return _get_kernel_info_from_hlo(hlos)
+  return tuple(infos)
 
 
 def get_opspecs(  # pytype: disable=invalid-annotation
@@ -291,11 +217,8 @@ def get_opspecs(  # pytype: disable=invalid-annotation
 ) -> tuple[op_base.BoundArguments, ...]:
   """Returns a tuple of BoundArguments for all Tokamax ops in the HLO."""
 
-  kernels = get_kernel_info(x, include_xla_kernels=include_xla_kernels)
   op_specs = []
-  for kernel in kernels:
-    if not _is_tokamax_kernel(kernel):
-      continue
+  for kernel in get_kernel_info(x, include_xla_kernels=include_xla_kernels):
     marker = _TOKAMAX_NAME + ':'
     idx = kernel.op_name.find(marker)
     # For XLA kernels, sometimes the op info is not present, eg.
@@ -323,71 +246,42 @@ def get_opspecs(  # pytype: disable=invalid-annotation
 
 
 def _parse_shapes(shapes) -> tuple[jax.ShapeDtypeStruct, ...]:
-  out = _parse_shapes_recursive(shapes)
-  return tuple(jax.tree.leaves(out))
+  return tuple(jax.tree.leaves(_parse_shapes_recursive(shapes)))
 
 
 def _parse_shapes_recursive(shapes):
   """Parse xla.ShapeProto."""
 
-  # Ideally use isinstance on the type, but this type is not visible.
-  if (
-      isinstance(shapes, list)
-      or 'RepeatedCompositeContainer' in str(type(shapes))
-      or 'RepeatedCompositeFieldContainer' in str(type(shapes))
-  ):
-    return tuple([_parse_shapes(shape) for shape in shapes])  # pytype: disable=attribute-error
+  if isinstance(shapes, Iterable):
+    return tuple(map(_parse_shapes, shapes))
 
   # Ideally use isinstance on the type, but this type is not visible.
-  elif 'ShapeProto' in str(type(shapes)):
-    shapes = json_format.MessageToDict(shapes)
-    if shapes['elementType'] == 'TUPLE' and 'tupleShapes' in shapes:
-      return tuple(_process_shape(shape) for shape in shapes['tupleShapes'])
-    else:
-      return _process_shape(shapes)
-  else:
+  if 'ShapeProto' not in str(type(shapes)):
     raise ValueError(f'Unsupported shape type {type(shapes)}')
+
+  shapes = json_format.MessageToDict(shapes)
+  if shapes['elementType'] == 'TUPLE' and 'tupleShapes' in shapes:
+    return tuple(map(_process_shape, shapes['tupleShapes']))
+  return _process_shape(shapes)
 
 
 def _process_shape(shape: dict[str, Any]) -> jax.ShapeDtypeStruct:
   if shape['elementType'] not in _HLO_JAX_DTYPE_MAP:
     raise ValueError(f'Unsupported element type: {shape["elementType"]}')
   dtype = _HLO_JAX_DTYPE_MAP[shape['elementType']]
-  if 'dimensions' not in shape:
-    # If there are no dimensions, the shape is a scalar.
-    return jax.ShapeDtypeStruct(shape=(), dtype=dtype)
-  shape = tuple([int(i) for i in shape['dimensions']])
-  return jax.ShapeDtypeStruct(shape=shape, dtype=dtype)
+  shape = tuple(map(int, shape.get('dimensions', ())))
+  return jax.ShapeDtypeStruct(shape, dtype)
 
 
-def _is_tokamax_xla_hlo(
-    hlo_instruction_proto: hlo_pb2.HloInstructionProto,
-) -> bool:
+def _is_tokamax_xla_hlo(instruction: hlo_pb2.HloInstructionProto) -> bool:
   """Whether the HLO instruction is a Tokamax XLA op."""
-
-  if hlo_instruction_proto.opcode in _XLA_NOISE_OPCODES:
+  if instruction.opcode in _XLA_NOISE_OPCODES:
     return False
 
   try:
     # This can raise a ValueError if there is no 'dimensions' field. Filter
     # out such ops.
-    _parse_shapes(hlo_instruction_proto.shape)
-    return _is_tokamax_kernel(hlo_instruction_proto)
+    _parse_shapes(instruction.shape)
   except ValueError:
     return False
-
-
-def _collect_hlo(hlo_instruction_proto: hlo_pb2.HloInstructionProto) -> bool:
-  """Whether to collect the HLO instruction."""
-
-  return (
-      hlo_instruction_proto.custom_call_target in _KERNEL_GETTER
-      or _is_tokamax_xla_hlo(hlo_instruction_proto)
-  )
-
-
-def _get_instructions(hlo_module_proto):
-  instructions = []
-  for computation in hlo_module_proto.computations:
-    instructions.extend(computation.instructions)
-  return list(filter(_collect_hlo, instructions))
+  return _TOKAMAX_NAME in instruction.metadata.op_name
