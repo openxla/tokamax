@@ -19,17 +19,11 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
-from qwix import pallas as qpl
+import qwix
 from tokamax._src import utils
 
 
-QArray = qpl.QArray
-
-
-# TODO: Remove this function when next Qwix version is available.
-def get_tile_shape(x: QArray) -> tuple[int, ...]:
-  """Returns the tile shape of a QArray."""
-  return tuple(utils.exact_div(a, b) for a, b in zip(x.shape, x.scale.shape))
+QArray = qwix.QArray
 
 
 # TODO: Add support for offsets?
@@ -83,7 +77,7 @@ def as_qarray(x: QuantizedArray | QArray) -> QArray:
 
 def as_array(x: jax.Array | QuantizedArray | QArray) -> jax.Array:
   """Converts value to a JAX array."""
-  return x if isinstance(x, jax.Array) else qpl.dequantize(as_qarray(x))
+  return x if isinstance(x, jax.Array) else qwix.dequantize(as_qarray(x))
 
 
 def quantize_as(

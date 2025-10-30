@@ -25,7 +25,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from qwix import pallas as qpl
+import qwix
 from tokamax._src import mosaic_tpu as common
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
@@ -344,9 +344,9 @@ def gmm(
   group_sizes = _validate_args(lhs, rhs, group_sizes)
 
   if isinstance(lhs, QArray) and lhs.zero_point is not None:
-    lhs = qpl.dequantize(lhs)
+    lhs = qwix.dequantize(lhs)
   if isinstance(rhs, QArray) and rhs.zero_point is not None:
-    rhs = qpl.dequantize(rhs)
+    rhs = qwix.dequantize(rhs)
 
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
@@ -597,9 +597,9 @@ def tgmm(
   group_sizes = _validate_args(lhs, rhs, group_sizes, expected_rhs_dims=2)
 
   if isinstance(lhs, QArray) and lhs.zero_point is not None:
-    lhs = qpl.dequantize(lhs)
+    lhs = qwix.dequantize(lhs)
   if isinstance(rhs, QArray) and rhs.zero_point is not None:
-    rhs = qpl.dequantize(rhs)
+    rhs = qwix.dequantize(rhs)
 
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)

@@ -23,10 +23,10 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 from jax.extend import backend
 import jax.numpy as jnp
-from qwix import pallas as qpl
+import qwix
 
 
-QArray = qpl.QArray
+QArray = qwix.QArray
 
 LANES = 128
 _sublane_size = functools.lru_cache(lambda: 16 if tpu_generation() >= 7 else 8)

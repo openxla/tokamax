@@ -23,7 +23,7 @@ import jax
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
-from qwix import pallas as qpl
+import qwix
 from tokamax._src import batching
 from tokamax._src import quantization
 from tokamax._src import triton as triton_lib
@@ -187,7 +187,7 @@ def _ragged_dot(
       index_map = lambda _, __, e: (0, 0)
       lhs_scales_spec = pl.BlockSpec(lhs_scales.shape, index_map)
     else:
-      lhs = qpl.dequantize(lhs)
+      lhs = qwix.dequantize(lhs)
 
   rhs_scales = None
   rhs_scales_spec = None
@@ -197,7 +197,7 @@ def _ragged_dot(
       index_map = lambda _, __, e: (e, 0, 0)
       rhs_scales_spec = pl.BlockSpec((None, *rhs_scales.shape[1:]), index_map)
     else:
-      rhs = qpl.dequantize(rhs)
+      rhs = qwix.dequantize(rhs)
 
   kernel = functools.partial(
       _ragged_dot_kernel,
@@ -366,10 +366,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       raise NotImplementedError("Triton not supported on this platform.")
 
     if preferred_element_type is None:
-      out_dtype = jnp.promote_types(
-          lhs.scale.dtype if isinstance(lhs, QArray) else lhs.dtype,
-          rhs.scale.dtype if isinstance(rhs, QArray) else rhs.dtype,
-      )
+      out_dtype = jnp.promote_types(lhs.dtype, rhs.dtype)
     else:
       out_dtype = preferred_element_type
 

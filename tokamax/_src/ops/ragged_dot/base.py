@@ -24,7 +24,7 @@ from jax.experimental import checkify
 import jax.numpy as jnp
 import numpy as np
 from pydantic_core import core_schema as cs
-from qwix import pallas as qpl
+import qwix
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
@@ -34,7 +34,7 @@ from typing_extensions import override
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 Residuals = types.NoneType
-QArray = qpl.QArray
+QArray = qwix.QArray
 QuantizedArray = quantization.QuantizedArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
 _DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset

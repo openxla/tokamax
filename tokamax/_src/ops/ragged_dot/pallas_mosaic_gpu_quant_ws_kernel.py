@@ -143,11 +143,10 @@ def ragged_dot_quantized_ws_kernel(
   g, k2, n = rhs.shape
   assert k == k2
 
-  rhs_tile_shape = quantization.get_tile_shape(rhs)
-  if rhs_tile_shape != (1, config.block_k, 1):
+  if rhs.scale_tile_shape != (1, config.block_k, 1):
     raise NotImplementedError(
         "Only scaling tile supported is (1, block_k, 1) got:"
-        f" {rhs_tile_shape} (block_k={config.block_k})."
+        f" {rhs.scale_tile_shape} (block_k={config.block_k})."
     )
 
   if group_sizes.shape != (g,):

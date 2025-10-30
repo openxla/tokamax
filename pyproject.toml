@@ -26,7 +26,7 @@ dependencies = [
     "jaxtyping>=0.3",
     "protobuf",
     "pydantic>=2.11.0",
-    "qwix>=0.1.1",
+    "qwix>=0.1.2",
     "tensorflow",
     "tqdm",
     "typing_extensions>=4.5.0",

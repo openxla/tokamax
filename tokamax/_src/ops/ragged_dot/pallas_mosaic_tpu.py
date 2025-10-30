@@ -23,7 +23,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 import pydantic
-from qwix import pallas as qpl
+import qwix
 from tokamax._src import mosaic_tpu
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
@@ -180,8 +180,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     if preferred_element_type is None:
       preferred_element_type = (
           precision_lib.default_output_dtype_from_input_dtypes(
-              lhs.scale.dtype if isinstance(lhs, QArray) else lhs.dtype,
-              rhs.scale.dtype if isinstance(rhs, QArray) else rhs.dtype,
+              lhs.dtype, rhs.dtype
           )
       )
 
@@ -210,7 +209,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           rhs = rhs.qvalue
           lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
         else:
-          rhs = maybe_quantize(qpl.dequantize(rhs), (1, 1, rhs.shape[2]))
+          rhs = maybe_quantize(qwix.dequantize(rhs), (1, 1, rhs.shape[2]))
       else:
         lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
         rhs = maybe_quantize(rhs, (1, 1, rhs.shape[2]))
@@ -236,7 +235,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           rhs *= lhs_trans.scale.mT
           lhs_trans = lhs_trans.qvalue
         else:
-          lhs_trans = qpl.dequantize(lhs_trans)
+          lhs_trans = qwix.dequantize(lhs_trans)
           lhs_trans = maybe_quantize(lhs_trans, (1, lhs_trans.shape[1]))
       else:
         lhs_trans = maybe_quantize(lhs_trans, (1, lhs_trans.shape[1]))
