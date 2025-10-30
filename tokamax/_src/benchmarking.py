@@ -97,7 +97,12 @@ class XprofProfileSession(contextlib.AbstractContextManager):
   Note: In case of multiple XLA Ops, the one with the most events is used.
   """
 
-  def __init__(self, hermetic: bool = True, use_jax_profiler: bool = False):
+  def __init__(
+      self,
+      hermetic: bool = True,
+      use_jax_profiler: bool = False,
+      **xprof_session_kwargs,
+  ):
     """Initializer.
 
     Arguments:
@@ -107,6 +112,8 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       use_jax_profiler: Profile with the jax.profiler API writing a temporary
         profile file instead of invoking xprof directly. If False (default),
         profile with xprof directly.
+      **xprof_session_kwargs: Additional keyword arguments to pass to
+        `xprof_session.start_session`.
     """
 
     if jax.default_backend() == 'cpu':
@@ -120,6 +127,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     if xprof_session is None or profile_data is None:
       self._jax_profiler_mode = True
     self._profile_tempdir: tempfile.TemporaryDirectory[str] | None = None
+    self._xprof_session_kwargs = xprof_session_kwargs
 
   @property
   def total_op_time(self) -> datetime.timedelta:
@@ -173,6 +181,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         self._xprof_session.start_session(
             enable_python_tracer=False,
             host_trace_level=2,
+            **self._xprof_session_kwargs,
         )
       except Exception as e:
         raise RuntimeError('Unable to start xprof session.') from e
