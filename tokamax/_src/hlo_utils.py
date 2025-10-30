@@ -18,7 +18,6 @@ import dataclasses
 from typing import Any, Final, TypeAlias
 import zlib
 
-from google.protobuf import json_format
 import immutabledict
 import jax
 from jax import export
@@ -119,15 +118,11 @@ class TokamaxXlaKernelInfo(KernelInfoBase):
 
 
 def _parse_shape(shape) -> XlaShape:
-  return _process_shape(json_format.MessageToDict(shape))
-
-
-def _process_shape(shape: dict[str, Any]) -> XlaShape:
-  if shape['elementType'] == 'TUPLE':
-    return tuple(map(_process_shape, shape.get('tupleShapes', ())))
-  dtype = _HLO_JAX_DTYPE_MAP[shape['elementType']]
-  shape = tuple(map(int, shape.get('dimensions', ())))
-  return jax.ShapeDtypeStruct(shape, dtype)
+  elem_type_enum = shape.DESCRIPTOR.fields_by_name['element_type'].enum_type
+  elem_type = elem_type_enum.values_by_number[shape.element_type].name
+  if elem_type == 'TUPLE':
+    return tuple(map(_parse_shape, shape.tuple_shapes))
+  return jax.ShapeDtypeStruct(shape.dimensions, _HLO_JAX_DTYPE_MAP[elem_type])
 
 
 def _get_generic_kernel_info(

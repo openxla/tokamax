@@ -24,7 +24,6 @@ dependencies = [
     "jax>=0.8.0",
     "jaxlib>=0.8.0",
     "jaxtyping>=0.3",
-    "protobuf",
     "pydantic>=2.11.0",
     "qwix>=0.1.2",
     "tensorflow",
