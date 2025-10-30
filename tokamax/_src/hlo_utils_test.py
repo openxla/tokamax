@@ -98,8 +98,7 @@ class DumpHloLibTest(parameterized.TestCase):
     )
     self.assertIsInstance(kernel_info, expected_class)
     self.assertEqual(
-        kernel_info.outputs,
-        (jax.ShapeDtypeStruct(shape=(8,), dtype=jnp.int32),),
+        kernel_info.output, jax.ShapeDtypeStruct(shape=(8,), dtype=jnp.int32)
     )
 
   def test_simple_pallas_triton(self):
@@ -135,17 +134,11 @@ class DumpHloLibTest(parameterized.TestCase):
 
     self.assertEqual(kernel_2.grid, (8, 1, 1))
 
-  @parameterized.product(
-      axis=(-1,),
-  )
-  def test_pallas_norm(
-      self,
-      axis,
-  ):
-
+  def test_pallas_norm(self):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
+    axis = -1
     dtype = jnp.bfloat16
     x_shape = (16, 64, 128)
     param_shape = (x_shape[axis],)
@@ -174,7 +167,7 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertEqual(vjp.kernel_name, 'pallas_layer_norm_vjp')
 
     self.assertLen(forward.inputs, 3)
-    self.assertLen(forward.outputs, 3)
+    self.assertLen(forward.output, 3)
 
     # `x` is canonicalized to a 3D shape.
     x_canonical_shape = (math.prod(x_shape[:-1]), x_shape[-1], 1)
@@ -339,22 +332,6 @@ class DumpHloLibTest(parameterized.TestCase):
         batching.BatchedShapeDtype(shape=x.shape, dtype=x.dtype, vmap_axes=()),
         opspec.arguments['q'],
     )
-
-  def test_empty_tuple_shape(self):
-    """Tests to make sure that empty tuple shapes throw ValueError."""
-
-    hlo_instruction = hlo_pb2.HloInstructionProto()
-    hlo_instruction.name = 'tuple'
-    hlo_instruction.opcode = 'tuple'
-    hlo_instruction.shape.element_type = 'TUPLE'
-    self.assertRaises(
-        ValueError, hlo_utils._parse_shapes, hlo_instruction.shape
-    )
-
-    hlo_instruction.shape.tuple_shapes.append(
-        xla_data_pb2.ShapeProto(element_type=xla_data_pb2.F32, dimensions=[1])
-    )
-    self.assertNotEmpty(hlo_utils._parse_shapes(hlo_instruction.shape))
 
 
 if __name__ == '__main__':

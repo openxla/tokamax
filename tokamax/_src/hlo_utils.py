@@ -13,9 +13,9 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for extracting kernel information from HLO."""
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 import dataclasses
-from typing import Any, Final
+from typing import Any, Final, TypeAlias
 import zlib
 
 from google.protobuf import json_format
@@ -73,13 +73,16 @@ _XLA_NOISE_OPCODES: Final[set[str]] = {
 _TOKAMAX_NAME: Final[str] = 'tokamax'
 
 
+XlaShape: TypeAlias = jax.ShapeDtypeStruct | tuple['XlaShape', ...]
+
+
 @dataclasses.dataclass(frozen=True)
 class KernelInfoBase:
   """Kernel information base class."""
 
   name: str
-  inputs: tuple[jax.ShapeDtypeStruct, ...]
-  outputs: tuple[jax.ShapeDtypeStruct, ...]
+  inputs: tuple[XlaShape, ...]
+  output: XlaShape
   op_name: str
   source_file: str
   source_line: int
@@ -115,6 +118,18 @@ class TokamaxXlaKernelInfo(KernelInfoBase):
   """Tokamax XLA kernel information."""
 
 
+def _parse_shape(shape) -> XlaShape:
+  return _process_shape(json_format.MessageToDict(shape))
+
+
+def _process_shape(shape: dict[str, Any]) -> XlaShape:
+  if shape['elementType'] == 'TUPLE':
+    return tuple(map(_process_shape, shape.get('tupleShapes', ())))
+  dtype = _HLO_JAX_DTYPE_MAP[shape['elementType']]
+  shape = tuple(map(int, shape.get('dimensions', ())))
+  return jax.ShapeDtypeStruct(shape, dtype)
+
+
 def _get_generic_kernel_info(
     instruction: hlo_pb2.HloInstructionProto,
 ) -> dict[str, Any]:
@@ -124,8 +139,8 @@ def _get_generic_kernel_info(
       source_line=instruction.metadata.source_line,
       source_file=instruction.metadata.source_file,
       op_name=instruction.metadata.op_name,
-      inputs=_parse_shapes(instruction.operand_shapes_with_layout),
-      outputs=_parse_shapes(instruction.shape),
+      inputs=tuple(map(_parse_shape, instruction.operand_shapes_with_layout)),
+      output=_parse_shape(instruction.shape),
   )
 
 
@@ -201,8 +216,10 @@ def get_kernel_info(
         target = getattr(instruction, 'custom_call_target', None)
         if (getter := _KERNEL_GETTER.get(target)) is not None:
           infos.append(getter(instruction, hlo.name))
-        elif include_xla_kernels and _is_tokamax_xla_hlo(instruction):
-          infos.append(_get_tokamax_xla_kernel_info(instruction, hlo.name))
+        elif include_xla_kernels:
+          is_noise = instruction.opcode in _XLA_NOISE_OPCODES
+          if (not is_noise) and _TOKAMAX_NAME in instruction.metadata.op_name:
+            infos.append(_get_tokamax_xla_kernel_info(instruction, hlo.name))
 
   return tuple(infos)
 
@@ -243,45 +260,3 @@ def get_opspecs(  # pytype: disable=invalid-annotation
     op_specs.append(op_base.BOUND_ARGS_ADAPTER.validate_json(json_data))
 
   return tuple(op_specs)
-
-
-def _parse_shapes(shapes) -> tuple[jax.ShapeDtypeStruct, ...]:
-  return tuple(jax.tree.leaves(_parse_shapes_recursive(shapes)))
-
-
-def _parse_shapes_recursive(shapes):
-  """Parse xla.ShapeProto."""
-
-  if isinstance(shapes, Iterable):
-    return tuple(map(_parse_shapes, shapes))
-
-  # Ideally use isinstance on the type, but this type is not visible.
-  if 'ShapeProto' not in str(type(shapes)):
-    raise ValueError(f'Unsupported shape type {type(shapes)}')
-
-  shapes = json_format.MessageToDict(shapes)
-  if shapes['elementType'] == 'TUPLE' and 'tupleShapes' in shapes:
-    return tuple(map(_process_shape, shapes['tupleShapes']))
-  return _process_shape(shapes)
-
-
-def _process_shape(shape: dict[str, Any]) -> jax.ShapeDtypeStruct:
-  if shape['elementType'] not in _HLO_JAX_DTYPE_MAP:
-    raise ValueError(f'Unsupported element type: {shape["elementType"]}')
-  dtype = _HLO_JAX_DTYPE_MAP[shape['elementType']]
-  shape = tuple(map(int, shape.get('dimensions', ())))
-  return jax.ShapeDtypeStruct(shape, dtype)
-
-
-def _is_tokamax_xla_hlo(instruction: hlo_pb2.HloInstructionProto) -> bool:
-  """Whether the HLO instruction is a Tokamax XLA op."""
-  if instruction.opcode in _XLA_NOISE_OPCODES:
-    return False
-
-  try:
-    # This can raise a ValueError if there is no 'dimensions' field. Filter
-    # out such ops.
-    _parse_shapes(instruction.shape)
-  except ValueError:
-    return False
-  return _TOKAMAX_NAME in instruction.metadata.op_name
