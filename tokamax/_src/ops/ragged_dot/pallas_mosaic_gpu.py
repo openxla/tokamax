@@ -31,6 +31,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel as non_qua
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel_blackwell as non_quant_kernel_blackwell
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel as quant_kernel
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel_blackwell as quant_kernel_blackwell
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_async_store_kernel as quant_ws_async_store_kernel
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_kernel as quant_ws_kernel
 from typing_extensions import override
 
@@ -93,7 +94,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
 
     if is_rhs_quantized:
       if is_hopper:
-        if config.warp_specialized:
+        if config.async_store:
+          fn = quant_ws_async_store_kernel.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
+        elif config.warp_specialized:
           fn = quant_ws_kernel.ragged_dot_quantized_ws_kernel
         else:
           fn = quant_kernel.ragged_dot_quantized_kernel
@@ -194,28 +197,68 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
 
     device_kind = backend.get_default_device().device_kind.lower()
     if "h100" in device_kind:
+      # For prefill
       for persistent in [True, False]:
-        for ws in warp_specialized:
-          for block_k in [128, 256]:
-            if (block_k * rhs_dtype_bits) % (128 * 8) or (
-                block_k * lhs_dtype_bits
-            ) % (128 * 8):
-              continue
-            for block_m in [128, 64]:
-              for num_stages in [4, 2, 1]:
-                for grid_block_n in [1, 2, 4, 8]:
-                  configs.add(
-                      common.Config(
-                          block_m=block_m,
-                          block_n=out_swizzle_elems,
-                          block_k=block_k,
-                          num_stages=num_stages,
-                          split_k=1,
-                          grid_block_n=grid_block_n,
-                          warp_specialized=ws,
-                          persistent=persistent,
+        for async_store in [True, False]:
+          for ws in warp_specialized:
+            for block_k in [128, 256]:
+              if (block_k * rhs_dtype_bits) % (128 * 8) or (
+                  block_k * lhs_dtype_bits
+              ) % (128 * 8):
+                continue
+              for block_m in [128, 64]:
+                for num_stages in [4, 2, 1]:
+                  for grid_minor_dim in [
+                      common.MatmulDimension.M,
+                      common.MatmulDimension.N,
+                  ]:
+                    for grid_tile_width in [1, 2, 4, 8]:
+                      configs.add(
+                          common.Config(
+                              block_m=block_m,
+                              block_n=out_swizzle_elems,
+                              block_k=block_k,
+                              num_stages=num_stages,
+                              split_k=1,
+                              async_store=async_store,
+                              warp_specialized=ws,
+                              persistent=persistent,
+                              grid_block_n=grid_tile_width,
+                              grid_minor_dim=grid_minor_dim,
+                              grid_tile_width=grid_tile_width,
+                          )
                       )
-                  )
+      # For generate
+      for persistent in [True, False]:
+        for async_store in [True, False]:
+          for ws in warp_specialized:
+            for block_k in [128, 256]:
+              if (block_k * rhs_dtype_bits) % (128 * 8) or (
+                  block_k * lhs_dtype_bits
+              ) % (128 * 8):
+                continue
+              for block_m in [64, 32, 16]:
+                for num_stages in [4]:
+                  for grid_minor_dim in [
+                      common.MatmulDimension.M,
+                      common.MatmulDimension.N,
+                  ]:
+                    for grid_tile_width in [1, 2, 4, 8]:
+                      configs.add(
+                          common.Config(
+                              block_m=block_m,
+                              block_n=out_swizzle_elems,
+                              block_k=block_k,
+                              num_stages=num_stages,
+                              split_k=1,
+                              async_store=async_store,
+                              warp_specialized=ws,
+                              persistent=persistent,
+                              grid_block_n=grid_tile_width,
+                              grid_minor_dim=grid_minor_dim,
+                              grid_tile_width=grid_tile_width,
+                          )
+                      )
     elif "b200" in device_kind:
       # Configs for prefill
       block_m = 128

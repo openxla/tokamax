@@ -36,6 +36,7 @@ class MatmulDimension(enum.IntEnum):
 
 @pydantic.dataclasses.dataclass(frozen=True)
 class Config:
+  """Configuration for the ragged dot kernel."""
   block_m: pydantic.conint(multiple_of=8, gt=0)
   block_n: pydantic.PositiveInt
   block_k: pydantic.PositiveInt
@@ -44,8 +45,12 @@ class Config:
   grid_block_n: pydantic.PositiveInt = 1
   warp_specialized: bool = True
   persistent: bool = True
-  collective: bool = False  # B200 collective MMA
+  async_store: bool = False
+  # B200 collective MMA
+  collective: bool = False
+  # indicates the fastest changing dim.
   grid_minor_dim: MatmulDimension = MatmulDimension.N
+  # The width of tiles along the fastest changing dim.
   grid_tile_width: int = 1
 
 
