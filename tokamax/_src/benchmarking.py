@@ -358,7 +358,7 @@ _TIMERS: dict[str, Callable[[Callable[[T], Any], T], Timer]] = {
     'hermetic_xprof': hermetic_xprof_timer,
 }
 
-_DEFAULT_TIMING_METHOD = {'gpu': 'cupti', 'tpu': 'xprof'}
+_DEFAULT_TIMING_METHOD = {'gpu': 'cupti', 'tpu': 'hermetic_xprof'}
 _FALLBACK_TIMING_METHOD = 'wallclock'
 
 

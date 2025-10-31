@@ -311,12 +311,11 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     lhs, rhs = ba.arguments["lhs"], ba.arguments["rhs"]
 
     (m, k), (g, _, n) = lhs.shape, rhs.shape
-    tile_range = [128]  # TODO: Add more configs.
     # Based on some empirical TPU tiling performance. Create a reasonable
     # tiling search space.
-    tile_m_range = range(128, 1024, 128)
-    tile_k_range = range(128, k, 128)
-    tile_n_range = range(128, int(n / 2), 128)
+    tile_m_range = range(128, 1024 + 128, 128)
+    tile_k_range = range(128, k + 128, 128)
+    tile_n_range = range(128, int(n / 2) + 128, 128)
     return set(
         Config(gmm_tiling=(tile_m, tile_k, tile_n))
         for tile_m, tile_k, tile_n in itertools.product(
