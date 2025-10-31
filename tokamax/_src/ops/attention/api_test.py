@@ -24,6 +24,7 @@ from tokamax import autotuning
 from tokamax._src import batching
 from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu
+from tokamax._src import shape as shape_lib
 from tokamax._src import triton as triton_lib
 from tokamax._src.ops.attention import api
 
@@ -62,8 +63,10 @@ class DotProductAttentionTest(parameterized.TestCase):
 
     # For testing purposes, we call the non-GQA version without vmap in the
     # reference code
-    K_ref = jnp.repeat(K, G, axis=2)
-    V_ref = jnp.repeat(V, G, axis=2)
+    with shape_lib.upcast_broadcast():
+      K_ref = jnp.repeat(K, G, axis=2)
+      V_ref = jnp.repeat(V, G, axis=2)
+
     out_ref, sdpa_vjp_ref = jax.vjp(sdpa_ref, Q, K_ref, V_ref, bias, mask)
     out_ans, sdpa_vjp_ans = jax.vjp(sdpa_ans, Q, K, V, bias, mask)
 

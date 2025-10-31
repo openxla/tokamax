@@ -18,6 +18,7 @@ from absl.testing import absltest
 import chex
 import jax
 import jax.numpy as jnp
+from tokamax._src import shape as shape_lib
 
 
 # pylint: disable=missing-function-docstring
@@ -42,7 +43,9 @@ class FlexAttentionTestBase(absltest.TestCase):
     v = jax.random.normal(rng2, (2, 512, 4, 64))
     bias = jax.random.normal(rng3, (2, 1, 256, 128))
 
-    upscale_bias = lambda x: jnp.repeat(jnp.repeat(x, 2, axis=-2), 4, axis=-1)
+    def upscale_bias(x):
+      with shape_lib.upcast_broadcast():
+        return jnp.repeat(jnp.repeat(x, 2, axis=-2), 4, axis=-1)
 
     with jax.default_matmul_precision("highest"):
       expected = jax.nn.dot_product_attention(q, k, v, bias=upscale_bias(bias))

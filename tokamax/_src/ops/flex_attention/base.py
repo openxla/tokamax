@@ -17,13 +17,13 @@
 from collections.abc import Callable
 import functools
 from typing import Any, ClassVar, Literal, TypeVar, overload
-
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from typing_extensions import override
 
@@ -44,6 +44,7 @@ class FlexAttention(
     op.Op[Any, Float[Array, "*B T H d"], Residuals, _Config, _Key]
 ):
   """FlexAttention function."""
+
   supports_batched_args_capture: ClassVar[bool] = False
 
   # We override `__call__` in order to handle sharding at the top level.
@@ -257,8 +258,10 @@ class FlexAttention(
     q, k, v = map(as_array, (q, k, v))
     if k.shape[-2] not in (1, q.shape[-2]):
       repeats = q.shape[-2] // k.shape[-2]
-      k = jnp.repeat(k, repeats, axis=-2)
-      v = jnp.repeat(v, repeats, axis=-2)
+
+      with shape_lib.upcast_broadcast():
+        k = jnp.repeat(k, repeats, axis=-2)
+        v = jnp.repeat(v, repeats, axis=-2)
 
     q_k_dot_precision, weights_v_dot_precision = precision
 

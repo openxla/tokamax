@@ -128,8 +128,10 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 
     param_bcast_axes = [a for a in range(x.ndim) if a != axis]
     if scale is not None:
+      scale = scale.astype(y.dtype)
       y *= jnp.expand_dims(scale + scale_offset, param_bcast_axes)
     if offset is not None:
+      offset = offset.astype(y.dtype)
       y += jnp.expand_dims(offset, param_bcast_axes)
 
     return y.astype(x.dtype), (mean, rstddev) if return_residuals else None

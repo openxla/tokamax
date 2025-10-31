@@ -20,7 +20,6 @@ gives more similar numerics to FlashAttention.
 
 import dataclasses
 import functools
-
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
@@ -343,8 +342,10 @@ class XlaChunkedDotProductAttention(
     q, k, v = map(base.as_array, (q, k, v))
     if k.shape[-2] not in (1, q.shape[-2]):
       repeats = q.shape[-2] // k.shape[-2]
-      k = jnp.repeat(k, repeats, axis=-2)
-      v = jnp.repeat(v, repeats, axis=-2)
+
+      with shape_lib.upcast_broadcast():
+        k = jnp.repeat(k, repeats, axis=-2)
+        v = jnp.repeat(v, repeats, axis=-2)
 
     is_paged = paging_info is not None
     single_chunk = isinstance(self.chunk_size, int)

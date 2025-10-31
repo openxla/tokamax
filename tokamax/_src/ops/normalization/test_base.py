@@ -150,8 +150,10 @@ class NormalizationTestBase(parameterized.TestCase):
       param_bcast_axes = list(range(x.ndim))
       del param_bcast_axes[axis]
       if scale is not None:
+        scale = scale.astype(y.dtype)
         y *= jnp.expand_dims(scale + scale_offset, param_bcast_axes)
       if offset is not None:
+        offset = offset.astype(y.dtype)
         y += jnp.expand_dims(offset, param_bcast_axes)
       return y.astype(x.dtype)
 

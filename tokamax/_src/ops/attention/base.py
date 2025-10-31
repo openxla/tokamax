@@ -19,7 +19,6 @@ import functools
 import math
 import types
 from typing import Any, Literal, NotRequired, Self, TypeVar, TypedDict, overload
-
 import jax
 from jax import export
 from jax.experimental import shard_map
@@ -30,6 +29,7 @@ from tokamax._src import ad
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from typing_extensions import override
 
@@ -590,8 +590,10 @@ class DotProductAttention(
     q, k, v = map(as_array, (q, k, v))
     if k.shape[-2] not in (1, q.shape[-2]):
       repeats = q.shape[-2] // k.shape[-2]
-      k = jnp.repeat(k, repeats, axis=-2)
-      v = jnp.repeat(v, repeats, axis=-2)
+
+      with shape_lib.upcast_broadcast():
+        k = jnp.repeat(k, repeats, axis=-2)
+        v = jnp.repeat(v, repeats, axis=-2)
 
     q_k_dot_precision, weights_v_dot_precision = precision
 
