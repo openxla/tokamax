@@ -35,9 +35,6 @@ from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
 
-from tensorflow.compiler.xla import xla_data_pb2
-from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
-
 
 def add_vectors_kernel(x_ref, y_ref, o_ref):
   x, y = x_ref[...], y_ref[...]
