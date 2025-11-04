@@ -390,18 +390,19 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_base2_exp=(False, True),
       use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
       fuse_reciprocal=(True, False),
+      use_sinks=(False, True),
   )
   @hp.given(hps.data())
   def test_splash_attention_fwd(self, is_mqa, is_segmented, is_dynamic_mask,
                                 use_base2_exp, use_max_logit_estimate,
-                                fuse_reciprocal, data):
+                                fuse_reciprocal, use_sinks, data):
     # TODO: Re-enable once dynamic masks are fixed.
     if is_dynamic_mask:
       self.skipTest("Dynamic masks not supported.")
 
     seed = data.draw(seed_strategy())
     key = random.key(seed)
-    k1, k2, k3 = random.split(key, 3)
+    k1, k2, k3, k_sinks = random.split(key, 4)
 
     (
         q_seq_len,
@@ -428,6 +429,9 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       v = random.uniform(
           k3, (num_kv_heads, kv_seq_len, head_dim_v), dtype=dtype
       )
+    sinks = None
+    if use_sinks:
+      sinks = random.uniform(k_sinks, (num_q_heads,), dtype=dtype)
 
     segment_ids = None
     if is_segmented:
@@ -477,7 +481,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
 
     o, stats = attn(
-        q, k, v, segment_ids, max_logit_value=max_logit_value
+        q, k, v, segment_ids, sinks, max_logit_value=max_logit_value
     )
 
     o_ref, stats_ref = attn_ref(
@@ -486,15 +490,19 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         v.astype(jnp.float32),
         jnp.array(mask[:, :]),
         segment_ids,
+        sinks,
     )
 
-    if (use_base2_exp or use_max_logit_estimate is not None
-        or not fuse_reciprocal):
-      o_rtol, res_tol = dict(atol=8e-3, rtol=3e-3), dict(atol=1e-3, rtol=3e-3)
+    res_tol = dict(atol=1e-3, rtol=3e-3)
+    if use_sinks:
+      o_tol = dict(atol=1e-2, rtol=1e-2)
+    elif (use_base2_exp or use_max_logit_estimate is not None
+          or not fuse_reciprocal):
+      o_tol = dict(atol=8e-3, rtol=3e-3)
     else:
-      o_rtol, res_tol = dict(atol=4e-3, rtol=3e-3), dict(atol=1e-3, rtol=3e-3)
+      o_tol = dict(atol=4e-3, rtol=3e-3)
 
-    self._assert_allclose(o, o_ref, **o_rtol)
+    self._assert_allclose(o, o_ref, **o_tol)
     self._assert_allclose(stats["logsumexp"],
                           stats_ref["logsumexp"], **res_tol)
     if use_max_logit_estimate is None:
@@ -510,6 +518,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       # use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
       use_max_logit_estimate=(None,),
       fuse_reciprocal=(True, False),
+      use_sinks=(False, True),
       dq_reduction_steps=(None, 3),
   )
   @hp.given(hps.data())
@@ -523,6 +532,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_max_logit_estimate,
       fuse_reciprocal,
       dq_reduction_steps,
+      use_sinks,
       data,
   ):
     # TODO: Re-enable once dynamic masks are fixed.
@@ -530,7 +540,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       self.skipTest("Dynamic masks not supported.")
     seed = data.draw(seed_strategy())
     key = random.key(seed)
-    k1, k2, k3, k4 = random.split(key, 4)
+    k1, k2, k3, k4, k_sinks = random.split(key, 5)
 
     (
         q_seq_len,
@@ -557,6 +567,9 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       v = random.uniform(
           k3, (num_kv_heads, kv_seq_len, head_dim_v), dtype=dtype
       )
+    sinks = None
+    if use_sinks:
+      sinks = random.uniform(k_sinks, (num_q_heads,), dtype=dtype)
 
     segment_ids = None
     if is_segmented:
@@ -603,7 +616,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     attn = make_mask_fn(mask)
 
     o, attn_vjp = jax.vjp(partial(attn, max_logit_value=max_logit_value),
-                          q, k, v, segment_ids)
+                          q, k, v, segment_ids, sinks)
     q32, k32, v32 = jax.tree.map(lambda x: x.astype(jnp.float32), (q, k, v))
     o_ref, stats_ref = splash.attention_reference(
         q32,
@@ -611,45 +624,55 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         v32,
         jnp.array(mask[:, :]),
         segment_ids,
+        sinks,
         is_mqa=is_mqa,
         save_residuals=True,
         attn_logits_soft_cap=attn_logits_soft_cap,
     )
-    atol = 1e-2 if (use_base2_exp or max_logit_value is not None) else 5e-3
-    self._assert_allclose(o, o_ref, atol=atol, rtol=5e-3)
+    if use_sinks:
+      o_tol = dict(atol=1e-2, rtol=1e-2)
+    elif (use_base2_exp or use_max_logit_estimate is not None
+          or not fuse_reciprocal):
+      o_tol = dict(atol=8e-3, rtol=1e-2)
+    else:
+      o_tol = dict(atol=4e-3, rtol=3e-3)
+    self._assert_allclose(o, o_ref, **o_tol)
 
     do = random.uniform(k4, o.shape, dtype=o.dtype)
-    dq, dk, dv, _ = attn_vjp(do)
+    dq, dk, dv, _, dsinks = attn_vjp(do)
 
     def bwd(
-        mask, q, k, v, segment_ids, o, logsumexp, do
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        mask, q, k, v, segment_ids, sinks, o, logsumexp, do
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
       attn_ref = partial(
           splash._attention_reference_custom_bwd,
           backward_impl="flash",
           attn_logits_soft_cap=attn_logits_soft_cap,
       )
-      dq, dk, dv, _, _ = attn_ref(do, q, k, v, mask, segment_ids, o, logsumexp)
-      return dq, dk, dv
+      dq, dk, dv, _, _, dsinks = attn_ref(
+          do, q, k, v, mask, segment_ids, sinks, o, logsumexp
+      )
+      return dq, dk, dv, dsinks
 
     is_grouped = not is_mqa and num_kv_heads < num_q_heads
     assert num_q_heads % num_kv_heads == 0
     head_multiplier = num_q_heads // num_kv_heads
     if is_mqa:
-      bwd = jax.vmap(bwd, in_axes=(None, 0, None, None, None, 0, 0, 0))
+      bwd = jax.vmap(bwd, in_axes=(None, 0, None, None, None, 0, 0, 0, 0))
     else:
-      bwd = jax.vmap(bwd, in_axes=(None, 0, 0, 0, None, 0, 0, 0))
+      bwd = jax.vmap(bwd, in_axes=(None, 0, 0, 0, None, 0, 0, 0, 0))
       # Interleave the KV heads to match the corresponding Q heads.
       if is_grouped:
         k32 = jnp.repeat(k32, head_multiplier, axis=0)
         v32 = jnp.repeat(v32, head_multiplier, axis=0)
 
-    dq_ref, dk_ref, dv_ref = bwd(
+    dq_ref, dk_ref, dv_ref, dsinks_ref = bwd(
         mask[:, :],
         q32,
         k32,
         v32,
         segment_ids,
+        sinks,
         o.astype(jnp.float32),
         stats_ref["logsumexp"],
         do.astype(jnp.float32),
@@ -670,6 +693,8 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     self._assert_allclose(dq, dq_ref, atol=dq_atol, rtol=3e-2)
     self._assert_allclose(dk, dk_ref, atol=dk_atol, rtol=3e-2)
     self._assert_allclose(dv, dv_ref, atol=dv_atol, rtol=3e-2)
+    if use_sinks:
+      self._assert_allclose(dsinks, dsinks_ref, atol=4e-3, rtol=4e-3)
 
 
 if __name__ == "__main__":

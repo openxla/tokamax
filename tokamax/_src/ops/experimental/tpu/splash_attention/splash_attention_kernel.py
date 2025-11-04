@@ -91,6 +91,7 @@ SplashResidualsType = tuple[
     jax.Array,  # k
     jax.Array,  # v
     Optional[SegmentIds],  # segment_ids
+    Optional[jax.Array],  # sinks
     jax.Array,  # out
     jax.Array,  # logsumexp
     Optional[MaskInfo],  # dkv_mask_info
@@ -120,6 +121,7 @@ def _attention_reference_impl(
     v: jax.Array,
     mask: jax.Array,
     segment_ids: SegmentIds | None,
+    sinks: jax.Array | None,
     mask_value: float,
     save_residuals: bool,
     attn_logits_soft_cap: float | None,
@@ -135,10 +137,15 @@ def _attention_reference_impl(
     logits = jnp.tanh(logits / attn_logits_soft_cap)
     logits = logits * attn_logits_soft_cap
 
+  if sinks is not None:
+    assert sinks.shape == ()  # should already be vmapped
+
   logits = jnp.where(mask, logits, mask_value)
   m = logits.max(axis=-1)
+  sinks = None if sinks is None else sinks.astype(logits.dtype)
+  m = m if sinks is None else jnp.maximum(m, sinks)
   s = jnp.exp(logits - m[..., None])
-  l = s.sum(axis=-1)
+  l = s.sum(axis=-1) + (0 if sinks is None else jnp.exp(sinks - m))
   p = s / l[..., None]
 
   o = jnp.einsum("st,td->sd", p, v.astype(jnp.float32))
@@ -156,12 +163,13 @@ def _attention_reference_custom_bwd(
     v,
     mask,
     segment_ids,
+    sinks,
     o,
     logsumexp,
     mask_value: float = DEFAULT_MASK_VALUE,
     backward_impl: str = "vanilla",
     attn_logits_soft_cap: float | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, None, None]:
+) -> tuple[jax.Array, jax.Array, jax.Array, None, None, jax.Array | None]:
   uncapped_logits = jnp.einsum(
       "qc,kc->qk", q, k, preferred_element_type=jnp.float32
   )
@@ -199,7 +207,12 @@ def _attention_reference_custom_bwd(
     ds = g + g * d
   dk = jnp.einsum("sd,st->td", q.astype(jnp.float32), ds).astype(k.dtype)
   dq = jnp.einsum("st,td->sd", ds, k.astype(jnp.float32)).astype(q.dtype)
-  return dq, dk, dv, None, None
+  dsinks = None
+  if sinks is not None:
+    sinks_exp = -jnp.exp(sinks[..., None, None].astype(jnp.float32)
+                         - logsumexp[..., None].astype(jnp.float32))
+    dsinks = jnp.sum(sinks_exp.astype(o.dtype) * o * do, axis=(-1, -2))
+  return dq, dk, dv, None, None, dsinks
 
 
 @partial(
@@ -217,6 +230,7 @@ def attention_reference(
     v: jax.Array,
     mask: jax.Array,
     segment_ids: SegmentIds | None = None,
+    sinks: jax.Array | None = None,
     *,
     is_mqa: bool,
     mask_value: float = DEFAULT_MASK_VALUE,
@@ -232,7 +246,7 @@ def attention_reference(
   )
 
   if is_mqa:
-    func = jax.vmap(attn_impl, in_axes=(0, None, None, None, None))
+    func = jax.vmap(attn_impl, in_axes=(0, None, None, None, None, 0))
   else:
     # In grouped attention (1 < num_kv_heads && num_kv_heads < num_q_heads).
     # We interleave the KV heads across the Q heads.
@@ -251,9 +265,9 @@ def attention_reference(
       k = jnp.repeat(k, repeats=q_heads_per_kv, axis=0)
       v = jnp.repeat(v, repeats=q_heads_per_kv, axis=0)
 
-    func = jax.vmap(attn_impl, in_axes=(0, 0, 0, None, None))
+    func = jax.vmap(attn_impl, in_axes=(0, 0, 0, None, None, 0))
 
-  out = func(q, k, v, mask, segment_ids)
+  out = func(q, k, v, mask, segment_ids, sinks)
   return out
 
 
@@ -489,6 +503,7 @@ def flash_attention_kernel(
     v_ref,
     q_segment_ids_ref,
     kv_segment_ids_ref,
+    sinks_ref,
     mask_ref,
     q_sequence_ref,
     max_logit_value_ref,
@@ -545,11 +560,25 @@ def flash_attention_kernel(
   @pl.when(should_initialize)
   def init():
     o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
-    if max_logit_estimate is None:
+
+    sink = None
+    if sinks_ref is not None:
+      sink = sinks_ref[0, h].astype(m_scratch_ref.dtype)
+
+    if sinks_ref is None and max_logit_estimate is None:
       m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
-    else:
+      l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+    elif sinks_ref is None and max_logit_estimate is not None:
       m_scratch_ref[...] = jnp.full_like(m_scratch_ref, max_logit_estimate)
-    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+      l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+    elif sinks_ref is not None and max_logit_estimate is None:
+      m_scratch_ref[...] = jnp.full_like(m_scratch_ref, sink)
+      l_scratch_ref[...] = jnp.ones_like(l_scratch_ref)
+    else:  # sinks_ref is not None and max_logit_estimate is not None
+      exp = jnp.exp2 if config.use_base2_exp else jnp.exp
+      m_scratch_ref[...] = jnp.full_like(m_scratch_ref, max_logit_estimate)
+      l_scratch_ref[...] = exp(
+          sink - jnp.full_like(l_scratch_ref, max_logit_estimate))
 
   def body(kv_compute_index, _, has_partial_mask=False):
     slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
@@ -682,6 +711,7 @@ def _splash_attention_forward(
     k: jax.Array,
     v: jax.Array,
     segment_ids: SegmentIds | None,
+    sinks: jax.Array | None,
     mask_value: float,
     is_mqa: bool,
     config: SplashConfig,
@@ -822,6 +852,18 @@ def _splash_attention_forward(
   else:
     in_specs += [None, None]
     q_segment_ids = kv_segment_ids = None
+
+  if sinks is not None:
+    assert sinks.shape == (num_q_heads,), f"{sinks.shape=} != {num_q_heads=}"
+    # align sinks to sublanes to allow vmap and shard_map over the kernel
+    in_specs += [
+        pl.BlockSpec((NUM_SUBLANES, num_q_heads), lambda h, i, j, *_: (0, 0),
+                     memory_space=pltpu.SMEM)
+    ]
+    sinks = jnp.broadcast_to(sinks.astype(jnp.float32)[None, :],
+                             (NUM_SUBLANES, num_q_heads))
+  else:
+    in_specs += [None]
 
   if fwd_mask_info.partial_mask_blocks is not None:
     in_specs.append(pl.BlockSpec((None, bq, bkv), mask_index_map))
@@ -997,6 +1039,7 @@ def _splash_attention_forward(
         v if v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
         q_segment_ids,
         kv_segment_ids,
+        sinks,
         fwd_mask_info.partial_mask_blocks,
         q_sequence,
         max_logit_value,
@@ -1041,6 +1084,7 @@ def _splash_attention_custom(
     k: jax.Array,
     v: jax.Array,
     segment_ids: SegmentIds | None,
+    sinks: jax.Array | None,
     save_residuals: bool,
     mask_value: float,
     is_mqa: bool,
@@ -1066,6 +1110,7 @@ def _splash_attention_custom(
       k,
       v,
       segment_ids,
+      sinks,
       mask_value=mask_value,
       is_mqa=is_mqa,
       config=config,
@@ -1091,6 +1136,7 @@ def _splash_attention_fwd(
     k: jax.Array,
     v: jax.Array,
     segment_ids: SegmentIds | None,
+    sinks: jax.Array | None,
     save_residuals: bool,
     mask_value: float,
     is_mqa: bool,
@@ -1110,6 +1156,7 @@ def _splash_attention_fwd(
       k,
       v,
       segment_ids,
+      sinks,
       mask_value=mask_value,
       is_mqa=is_mqa,
       config=config,
@@ -1122,7 +1169,7 @@ def _splash_attention_fwd(
   if config.use_base2_exp:  # for user, output values in natural base
     stats["logsumexp"] = stats["logsumexp"] / LOG2E
     stats["max_logits"] = stats["max_logits"] / LOG2E
-  residuals = q, k, v, segment_ids, out, logsumexp, dkv_mask_info
+  residuals = q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info
   if save_residuals:
     return (out, stats), residuals
   else:
@@ -1808,6 +1855,7 @@ def _splash_attention_bwd(
     jax.Array,  # k
     jax.Array,  # v
     SegmentIds | None,  # segment_ids
+    jax.Array | None,  # segment_ids
     jax.Array | None,   # max_logit_estimate
 ]:
   del save_residuals, fwd_mask_sparsity
@@ -1818,11 +1866,7 @@ def _splash_attention_bwd(
       config.block_kv_dkv,
       config.block_kv_dkv_compute,
   )
-  q, k, v, segment_ids, o, logsumexp, dkv_mask_info = res
-
-  # # if we're receiving sensitivities for stats
-  # if not isinstance(do, jax.Array):
-  #   do = do[0]
+  q, k, v, segment_ids, sinks, o, logsumexp, dkv_mask_info = res
 
   # di: [num_heads, q_seq_len]
   di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))  # pytype: disable=attribute-error
@@ -1843,6 +1887,12 @@ def _splash_attention_bwd(
       mask_function=mask_function,
       config=config,
   )
+  dsinks = None
+  if sinks is not None:
+    logsumexp_ = (logsumexp / LOG2E) if config.use_base2_exp else logsumexp
+    sinks_exp = -jnp.exp(sinks[..., None, None].astype(jnp.float32)
+                         - logsumexp_[..., None].astype(jnp.float32))
+    dsinks = jnp.sum(sinks_exp.astype(o.dtype) * o * do, axis=(-1, -2))
   # Match the signature of the fwd function.
   assert dq is not None
   return (
@@ -1852,6 +1902,7 @@ def _splash_attention_bwd(
       dk,  # k
       dv,  # v
       None,  # segment_ids
+      dsinks,  # sinks
       None,  # max_logit_estimate
   )
 
@@ -1877,6 +1928,7 @@ def _splash_attention(
     k: jax.Array,
     v: jax.Array,
     segment_ids: SegmentIds | None = None,
+    sinks: jax.Array | None = None,
     *,
     is_mqa: bool,
     config: SplashConfig | None,
@@ -1893,6 +1945,7 @@ def _splash_attention(
       k,
       v,
       segment_ids,
+      sinks,
       mask_value=mask_value,
       is_mqa=is_mqa,
       save_residuals=save_residuals,
