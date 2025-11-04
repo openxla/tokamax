@@ -273,13 +273,24 @@ def _quantize_as(x, qdtype: jnp.dtype, axis: int, scale: float | None):
   return QArray(jnp.round(x * inv_scales).astype(qdtype), scales)
 
 
-def _scale_out_by_scale(out: jax.Array, scales: jax.Array, axis: int):
+def _scale_out_by_scale(
+    out: jax.Array, scales: jax.Array, axis: int | None = None
+):
   if isinstance(scales, float):
     out *= scales
   else:
-    out *= pltpu.repeat(scales, out.shape[axis] // scales.shape[axis], axis)
+    if axis is None:  # scale all axes
+      if any(s1 % s2 != 0 for s1, s2 in zip(
+          out.shape, scales.shape, strict=True
+      )):
+        raise ValueError(f"{scales=} cannot be broadcast to {out=} because the"
+                         " scales shape cannot be broadcast.")
+      for ax, (s1, s2) in enumerate(zip(out.shape, scales.shape, strict=True)):
+        scales = pltpu.repeat(scales, s1 // s2, ax)
+      out *= scales
+    else:
+      out *= pltpu.repeat(scales, out.shape[axis] // scales.shape[axis], axis)
   return out
-
 
 _TilingFn = Callable[[int, int, int], tuple[int, int, int] | None]
 
@@ -433,7 +444,9 @@ def gmm(
 
         # apply scales to the output if the inputs were quantized
         for scale, axis in scales:
-          out = _scale_out_by_scale(out, scale, axis)
+          # broadcast on all axes in case non-reduction dims are quantized
+          del axis
+          out = _scale_out_by_scale(out, scale, None)
 
         # accumulate and possibly store the output
         acc_scratch[...] += out.astype(acc_scratch.dtype)
@@ -685,7 +698,9 @@ def tgmm(
 
       # apply scales to the output if the inputs were quantized
       for scale, axis in scales:
-        out = _scale_out_by_scale(out, scale, axis)
+        # broadcast on all axes in case non-reduction dims are quantized
+        del axis
+        out = _scale_out_by_scale(out, scale, None)
 
       acc_scratch[...] += out.astype(acc_scratch.dtype)
 
