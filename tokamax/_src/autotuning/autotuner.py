@@ -68,7 +68,6 @@ class AutotuningData(immutabledict.immutabledict[_Config, BenchmarkData]):
         ),
     )
 
-
 def _compile(fn_factory, config, args, kwargs, *, seed=None):
   fn = fn_factory(config)
   fn, x = benchmarking.standardize_function(fn, *args, kwargs=kwargs, seed=seed)
@@ -107,7 +106,7 @@ class Autotuner:
       fn_factory: Callable[[_Config], Callable[_P, Any]],
       configs: set[_Config],
       *args: _P.args,
-      **kwargs: _P.kwargs
+      **kwargs: _P.kwargs,
   ) -> AutotuningData[_Config]:
     """Autotunes over configs for the given arguments."""
     executor = self.executor_fn()

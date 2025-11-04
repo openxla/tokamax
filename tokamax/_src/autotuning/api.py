@@ -130,6 +130,34 @@ class AutotuningResult:
     object.__delattr__(self, "_context")
     op_base.get_autotuning_cache_overlay_state().stack.pop()
 
+  def __or__(self, other: "AutotuningResult") -> "AutotuningResult":
+    """Returns a new AutotuningResult that is the merge of `self` and `other`.
+
+    When there are multiple BoundArguments with the same autotuning cache key,
+    the autotuning data for that key will be merged with data from the
+    right-hand side taking precedence.
+
+    Args:
+      other: The AutotuningResult to combine with `self`.
+
+    Returns:
+      A new AutotuningResult that is the merge of `self` and `other`.
+
+    Raises:
+      ValueError: If the device kinds of `self` and `other` do not match.
+    """
+    if self.device_kind != other.device_kind:
+      raise ValueError("Device kinds do not match.")
+    data = {ba.autotuning_cache_key: (ba, d) for ba, d in self.data}
+
+    for new_ba, new_data in other.data:
+      key = new_ba.autotuning_cache_key
+      ba, d = data.setdefault(key, (new_ba, new_data))
+      if d is not new_data:
+        data[key] = (ba, d | new_data)
+
+    return AutotuningResult(self.device_kind, tuple(data.values()))
+
 
 _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
 _BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_base.BoundArguments)

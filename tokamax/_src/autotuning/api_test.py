@@ -257,6 +257,20 @@ class AutotuningTest(parameterized.TestCase):
     self.assertEqual(ba2.cached_autotuning_data, orig_data2)
     self.assertEqual(ba2.default_config, config3)
 
+    # Test that the two results can be combined.
+    combined_result = result0 | result1
+    self.assertEqual(combined_result.device_kind, result1.device_kind)
+    expected_ba_cache_keys = [
+        b.autotuning_cache_key for b, _ in combined_result.data
+    ]
+    self.assertIn(ba.autotuning_cache_key, expected_ba_cache_keys)
+    self.assertIn(ba2.autotuning_cache_key, expected_ba_cache_keys)
+
+    expected_data = ((ba, data0 | data1), (ba2, data2))
+    combined_data_1, combined_data_2 = combined_result.data
+    self.assertEqual(expected_data[0][1], combined_data_1[1])
+    self.assertEqual(expected_data[1][1], combined_data_2[1])
+
   # TODO: Figure out why this test fails on TPU.
   def test_autotuning_result_context_retraced(self):
     if jax.default_backend() == "tpu":
