@@ -59,7 +59,7 @@ class GroupInfo:
   """Information regarding the group being processed in a block."""
 
   group_id: jax.Array
-  block: jax.Array
+  block: jax.Array  | None
   block_start: jax.Array
   actual_start: jax.Array
   actual_end: jax.Array
@@ -120,6 +120,67 @@ class GroupInfo:
         actual_size=actual_size,
     )
 
+  @classmethod
+  def create_aligned(
+      cls,
+      group_sizes: Sequence[jax.Array],
+      tile: int,
+      tid_size: int,
+      align_tile: int = 8,
+      noops_at_end: bool = True,
+  ) -> "GroupInfo":
+    """Creates a GroupInfo instance with block-aligned task assignments.
+
+    This method calculates task assignments for processing a ragged tensor,
+    ensuring that each block starts at an offset aligned with `align_tile`.
+
+    Example:
+     group_sizes=[17, 31, 24], block_m=32
+     The `create` method will generate 5 blocks, starting at [ 0, 0, 32, 32, 64]
+     `create_aligned` with align_tile=8 we will generate just three blocks at
+     [0,  16,  48], thus avoiding wasting compute.
+
+
+    Args:
+      group_sizes: A sequence of jax.Array, where each element is the size of a
+        group.
+      tile: The size of the processing tile (e.g., block_m).
+      tid_size: Max number of tasks available - usually calculated as
+        `pl.cdiv(m, block_m) + len(group_sizes) - 1`.
+      align_tile: The alignment boundary for the start of each block. Block
+        starts will be multiples of this value. Defaults to 8.
+      noops_at_end: If True, tasks that result in no actual work (actual_size ==
+        0) are moved to the end of the task list. Defaults to True.
+
+    Returns:
+      A GroupInfo instance containing the calculated information for each task.
+      Note, that block array is always None.
+    """
+    (
+        group_idx,
+        global_m_start,
+        offset_in_block,
+        actual_size,
+        _,
+    ) = calculate_group_info_tasks(
+        group_sizes,
+        max_tasks=tid_size,
+        block_m=tile,
+        align_block_size=align_tile,
+        noops_at_end=noops_at_end,
+    )
+    actual_start = global_m_start + offset_in_block
+    actual_end = global_m_start + offset_in_block + actual_size
+    return cls(
+        group_idx,
+        None,
+        global_m_start,
+        actual_start,
+        actual_end,
+        offset_in_block,
+        actual_size,
+    )
+
 
 def dequant(s_ref, w):
   """Dequantize the array `w` using a 1D ref `s_ref`."""
@@ -140,6 +201,58 @@ def dequant(s_ref, w):
     return w.foreach(scale, create_array=True)
 
   return scaled_w(s_ref, w.astype(s_ref.dtype))
+
+
+def calculate_group_info_tasks(
+    group_sizes: Sequence[jax.Array],
+    max_tasks: int,
+    block_m: int,
+    align_block_size: int = 8,
+    noops_at_end: bool = True,
+):
+  """Calculates task assignments for processing a ragged tensor with specified block alignment."""
+  group_sizes = jnp.asarray(group_sizes).astype(jnp.int32)
+  group_starts = jnp.pad(jnp.cumsum(group_sizes)[:-1], (1, 0))
+  group_ends = group_starts + group_sizes
+  aligned_starts = lax.div(group_starts, align_block_size) * align_block_size
+  blocks_per_group = pl.cdiv(group_ends - aligned_starts, block_m)
+  group_range = jnp.arange(group_sizes.shape[0])
+  group_idx = jnp.repeat(
+      group_range,
+      axis=0,
+      repeats=blocks_per_group,
+      total_repeat_length=max_tasks,
+  )
+
+  block_starts_per_group = jnp.pad(jnp.cumsum(blocks_per_group)[:-1], (1, 0))
+  cta_group_block_start = block_starts_per_group[group_idx]
+  cta_id = jnp.arange(max_tasks)
+  inside_block_idx = cta_id - cta_group_block_start
+  global_m_start = aligned_starts[group_idx] + block_m * inside_block_idx
+  actual_m_start = jnp.maximum(global_m_start, group_starts[group_idx])
+  global_m_end = global_m_start + block_m
+  actual_m_end = jnp.minimum(global_m_end, group_ends[group_idx])
+  offset_in_block = actual_m_start - global_m_start
+  actual_size = jnp.maximum(0, actual_m_end - actual_m_start)
+  non_empty_mask = actual_size > 0
+  if noops_at_end:
+    noop_group_pos = 1024*1024
+    idx = jnp.argsort(noop_group_pos * (1 - (actual_size > 0)) + group_idx)
+    return (
+        group_idx[idx],
+        global_m_start[idx],
+        offset_in_block[idx],
+        actual_size[idx],
+        non_empty_mask.sum(),
+    )
+  else:
+    return (
+        group_idx,
+        global_m_start,
+        offset_in_block,
+        actual_size,
+        non_empty_mask.sum(),
+    )
 
 
 # TODO: Unify this with the non_quant store.
