@@ -63,7 +63,7 @@ def ragged_dot_quantized_ws_async_store_kernel(
   g, k2, _ = rhs.shape
   w, w_scales, x = (rhs.qvalue.mT, rhs.scale, lhs)
   (_, n, k_w), (m, k_x) = w.shape, x.shape
-  group_info = common.GroupInfo.create(
+  group_info = common.GroupInfo.create_aligned(
       group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
   )
   block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
@@ -94,7 +94,7 @@ def ragged_dot_quantized_ws_async_store_kernel(
         x_gmem,
         w_gmem,
         w_scales_gmem,
-        block_gmem,
+        _,
         group_id_gmem,
         start_within_block_gmem,
         actual_size_gmem,
@@ -128,7 +128,6 @@ def ragged_dot_quantized_ws_async_store_kernel(
       ni = n_index
 
       with jax.named_scope("load group_info"):
-        mi = block_gmem[tid_m]
         group_id = group_id_gmem[tid_m]
         start_within_block = start_within_block_gmem[tid_m]
         actual_size = actual_size_gmem[tid_m]
@@ -138,7 +137,7 @@ def ragged_dot_quantized_ws_async_store_kernel(
       def do_tma_x(ki, slot):
         plgpu.copy_gmem_to_smem(
             x_gmem.at[
-                pl.ds(mi * block_m, block_m),
+                pl.ds(block_start, block_m),
                 pl.ds(ki * block_k, block_k),
             ],
             x_smem.at[slot],

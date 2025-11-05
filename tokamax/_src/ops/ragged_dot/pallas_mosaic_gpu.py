@@ -237,7 +237,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
                   block_k * lhs_dtype_bits
               ) % (128 * 8):
                 continue
-              for block_m in [64, 32, 16]:
+              for block_m in [64, 32, 24, 16]:
                 for num_stages in [4]:
                   for grid_minor_dim in [
                       common.MatmulDimension.M,
