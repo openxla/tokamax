@@ -25,6 +25,8 @@ from tokamax._src.ops.triangle_multiplication import base
 
 Implementation: TypeAlias = Literal["xla"]
 
+IMPLEMENTATIONS = dict(xla=base.TriangleMultiplication())
+
 
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = ("xla",)
 
@@ -54,8 +56,8 @@ def triangle_multiplication(
   Args:
     x: The input array of shape `[N, N, C]`.
     mask: A boolean mask of shape `[N, N]`.
-    gate_projection_weights: Fused weights for gate and projection layers
-      `[C, 2, H, 2]`.
+    gate_projection_weights: Fused weights for gate and projection layers `[C,
+      2, H, 2]`.
     projection_out_weights: Weights for the output projection layer `[H, D]`.
     gate_out_weights: Weights for the output gate layer `[C, D]`.
     layernorm_in_scale: Scale for the input layer normalization `[C]`.
@@ -87,7 +89,8 @@ def triangle_multiplication(
   if tuple(implementation) != ("xla",):
     raise NotImplementedError("Only XLA implementation is supported.")
 
-  return base.TriangleMultiplication()(
+  impl = IMPLEMENTATIONS["xla"]
+  return impl(
       x=x,
       mask=mask,
       gate_projection_weights=gate_projection_weights,
