@@ -128,11 +128,10 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
   @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
-    suffix = [k for k, v in test_base.NAMED_ARG_SPECS.items() if v == spec][0]
     atol_grads = None if spec.get("bias") is None else 0.04
     try:
       with test_base.override_test_args(atol=0.02, atol_grads=atol_grads):
-        getattr(super(), "test_bench_" + suffix)()
+        getattr(super(), self._testMethodName)()
     except ValueError as e:
       if "exceeds available shared memory" in str(e):
         self.skipTest(f"Test exceeds shared memory capacity: {e}")
