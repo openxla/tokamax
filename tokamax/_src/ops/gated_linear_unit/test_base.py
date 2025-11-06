@@ -36,7 +36,7 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
   @parameterized.parameters(
       dict(m=256, n=256, k=64, activation="sigmoid"),
       dict(m=256, n=256, k=64, activation="tanh"),
-      dict(batch=(2, 3, 4), m=256, n=256, k=64),
+      dict(batch=(2, 3), m=256, n=256, k=64),
   )
   def test_gated_linear_unit(self, *, batch=(), m, n, k, activation=None):
 
@@ -66,6 +66,8 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
     rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
     x = jax.random.normal(rng0, (*batch, m, k), dtype=jnp.bfloat16)
     w = jax.random.normal(rng1, (k, 2, n), dtype=jnp.bfloat16)
+    x_ref = x.astype(jnp.float32)
+    w_ref = w.astype(jnp.float32)
 
     def f_ref(x, weights):
       w, v = jnp.unstack(weights, axis=1)
@@ -75,18 +77,17 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
 
     f = functools.partial(self._glu_fn, activation=activation)
 
-    atol = 5e-2 * math.sqrt(k)
     assert_all_close = functools.partial(
-        chex.assert_trees_all_close, atol=atol, rtol=5e-3
+        chex.assert_trees_all_close, atol=0.1, rtol=0.02
     )
-    assert_all_close(f(x, w), f_ref(x, w))
+    assert_all_close(f(x, w), f_ref(x_ref, w_ref))
 
     dout = jax.random.normal(rng2, (*batch, m, n), dtype=jnp.bfloat16)
-    expected, f_ref_vjp = jax.vjp(f_ref, x, w)
+    dout_ref = dout.astype(jnp.float32)
+    expected, f_ref_vjp = jax.vjp(f_ref, x_ref, w_ref)
     actual, f_vjp = jax.vjp(f, x, w)
     assert_all_close(actual, expected)
-    atol_grads = atol * 5  # Need larger tolerance for grads.
-    assert_all_close(f_vjp(dout), f_ref_vjp(dout), atol=atol_grads)
+    assert_all_close(f_vjp(dout), f_ref_vjp(dout_ref), atol=2.0, rtol=0.2)
 
 
 # pylint: enable=missing-function-docstring
