@@ -23,7 +23,7 @@ import jax
 from jax import export
 from jax.interpreters.mlir import ir
 import jax.numpy as jnp
-from tokamax._src.ops import op as op_base
+from tokamax._src.ops import op as op_lib
 
 from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
@@ -226,7 +226,7 @@ def get_opspecs(  # pytype: disable=invalid-annotation
         | Sequence[hlo_pb2.HloModuleProto],
     ),
     include_xla_kernels: bool = True,
-) -> tuple[op_base.BoundArguments, ...]:
+) -> tuple[op_lib.BoundArguments, ...]:
   """Returns a tuple of BoundArguments for all Tokamax ops in the HLO."""
 
   op_specs = []
@@ -252,6 +252,6 @@ def get_opspecs(  # pytype: disable=invalid-annotation
           # but in that case the `validate_json` call below will fail.
           json_data = json_data[: i + 1]
           break
-    op_specs.append(op_base.BOUND_ARGS_ADAPTER.validate_json(json_data))
+    op_specs.append(op_lib.BOUND_ARGS_ADAPTER.validate_json(json_data))
 
   return tuple(op_specs)

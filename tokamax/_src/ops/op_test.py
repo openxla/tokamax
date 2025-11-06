@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import config as config_lib
 from tokamax._src import utils
-from tokamax._src.ops import op as op_base
+from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.attention import pallas_triton_flash_attention as pl_attn
 from tokamax._src.ops.normalization import base as norm_base
@@ -64,7 +64,7 @@ _HEURISTICS_CONFIG = _FakeOpConfig(1)
 _AUTOTUNE_CONFIG = _FakeOpConfig(2)
 
 
-class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
+class _FakeOp(op_lib.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
   config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
 
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
@@ -72,11 +72,11 @@ class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
     assert x.shape == y.shape, f"{x.shape} != {y.shape}"
     return x + y, None
 
-  def _get_heuristics_config(self, ba: op_base.BoundArguments):
+  def _get_heuristics_config(self, ba: op_lib.BoundArguments):
     del ba  # Unused.
     return _HEURISTICS_CONFIG
 
-  def _get_autotuning_configs(self, ba: op_base.BoundArguments):
+  def _get_autotuning_configs(self, ba: op_lib.BoundArguments):
     del ba  # Unused.
     return {_AUTOTUNE_CONFIG}
 
@@ -95,7 +95,7 @@ class OpTest(parameterized.TestCase):
     self.assertIs(ba.get_config(), _HEURISTICS_CONFIG)
     self.assertEmpty(cache)
     config = ba.get_config(
-        autotune_configs=op_base.AUTO, cache_autotuning_results=False
+        autotune_configs=op_lib.AUTO, cache_autotuning_results=False
     )
     self.assertIs(config, _AUTOTUNE_CONFIG)
     self.assertEmpty(cache)
@@ -188,14 +188,14 @@ class BoundArgumentsTest(parameterized.TestCase):
   )
   def test_roundtrip(self, op, arg_specs):
     op = op.replace(vjp=None)
-    adapter = op_base.BOUND_ARGS_ADAPTER
+    adapter = op_lib.BOUND_ARGS_ADAPTER
     arg_specs = arg_specs.ARG_SPECS
     for arg_spec in arg_specs:
       spec = arg_spec.args
       with self.subTest(arg_spec.full_name):
         ba = op.bind(**_eval_shape(spec))
-        abstract_args = op_base._abstractify(dict(ba.arguments))
-        ba = op_base.BoundArguments(op, abstract_args)
+        abstract_args = op_lib._abstractify(dict(ba.arguments))
+        ba = op_lib.BoundArguments(op, abstract_args)
         ba2 = adapter.validate_python(adapter.dump_python(ba))
         self.assertEqual(ba, ba2.replace(op=ba2.op.replace(vjp=None)))
         ba3 = adapter.validate_json(adapter.dump_json(ba))

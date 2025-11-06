@@ -27,7 +27,7 @@ import pydantic
 from tokamax._src import hlo_utils
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.autotuning import autotuner
-from tokamax._src.ops import op as op_base
+from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
@@ -49,7 +49,7 @@ HloComputation: TypeAlias = (
     | Sequence[hlo_pb2.HloProto]
 )
 BoundArgsAutotuningData: TypeAlias = tuple[
-    op_base.BoundArguments, autotuner.AutotuningData[Any]
+    op_lib.BoundArguments, autotuner.AutotuningData[Any]
 ]
 
 
@@ -68,7 +68,7 @@ def _serialize_bound_args_autotuning_data(
 
 def _validate_bound_args_autotuning_data(value: Any) -> BoundArgsAutotuningData:
   ba, data = value
-  if isinstance(ba, op_base.BoundArguments):
+  if isinstance(ba, op_lib.BoundArguments):
     assert isinstance(data, autotuner.AutotuningData)
     return ba, data
   ba = _BOUND_ARGS_ADAPTER.validate_python(ba)
@@ -118,7 +118,7 @@ class AutotuningResult:
     for ba, data in self.data:
       key = ba.autotuning_cache_key
       overlay.setdefault(ba.op, {}).setdefault(self.device_kind, {})[key] = data
-    state = op_base.get_autotuning_cache_overlay_state()
+    state = op_lib.get_autotuning_cache_overlay_state()
     state.stack.append(overlay)
     context = state.context(state.context.value + (id(self),))
     context.__enter__()
@@ -128,7 +128,7 @@ class AutotuningResult:
   def __exit__(self, exc_type, exc_value, traceback):
     self._context.__exit__(exc_type, exc_value, traceback)  # pytype: disable=attribute-error
     object.__delattr__(self, "_context")
-    op_base.get_autotuning_cache_overlay_state().stack.pop()
+    op_lib.get_autotuning_cache_overlay_state().stack.pop()
 
   def __or__(self, other: "AutotuningResult") -> "AutotuningResult":
     """Returns a new AutotuningResult that is the merge of `self` and `other`.
@@ -160,7 +160,7 @@ class AutotuningResult:
 
 
 _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
-_BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_base.BoundArguments)
+_BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_lib.BoundArguments)
 _P = ParamSpec("_P")
 
 
@@ -171,7 +171,7 @@ def get_bound_args(
     ),
     *args: _P.args,
     **kwargs: _P.kwargs,
-) -> tuple[op_base.BoundArguments, ...]:
+) -> tuple[op_lib.BoundArguments, ...]:
   """Returns a tuple of unique BoundArguments for all Tokamax ops in `f`.
 
   Args:
@@ -229,7 +229,7 @@ def _get_hlo_modules(
 
 
 _API_IMPLEMENTATIONS: Final[
-    Mapping[type[op_base.Op], Mapping[str, Callable[..., Any]]]
+    Mapping[type[op_lib.Op], Mapping[str, Callable[..., Any]]]
 ] = immutabledict.immutabledict({
     normalization_base.Normalization: normalization_api.IMPLEMENTATIONS,
     glu_base.GatedLinearUnit: glu_api.IMPLEMENTATIONS,
@@ -239,7 +239,7 @@ _API_IMPLEMENTATIONS: Final[
 
 
 def get_op_implementations(
-    op: op_base.Op,
+    op: op_lib.Op,
     device: jax.Device | None = None,
 ) -> dict[str, Callable[..., Any]]:
   """Returns all implementations of the given op.
@@ -253,7 +253,7 @@ def get_op_implementations(
     An (implementation name, implementation) mapping.
   """
   mro = inspect.getmro(op.__class__)
-  impls = dict(_API_IMPLEMENTATIONS.get(mro[mro.index(op_base.Op) - 1], {}))
+  impls = dict(_API_IMPLEMENTATIONS.get(mro[mro.index(op_lib.Op) - 1], {}))
 
   if device is not None:
     impls = {k: v for k, v in impls.items() if v.supported_on(device)}  # pytype: disable=attribute-error
@@ -263,7 +263,7 @@ def get_op_implementations(
 def autotune(
     f: (
         Callable[..., Any]
-        | Sequence[op_base.BoundArguments]
+        | Sequence[op_lib.BoundArguments]
         | HloComputation
     ),
     *args,
@@ -290,14 +290,14 @@ def autotune(
   if ignore_cache:
     raise NotImplementedError("`ignore_cache=True` is not implemented.")
 
-  if isinstance(f, (list, tuple)) and isinstance(f[0], op_base.BoundArguments):
+  if isinstance(f, (list, tuple)) and isinstance(f[0], op_lib.BoundArguments):
     if args:
       raise ValueError("`args` are only supported if `f` is callable.")
     bound_args = tuple(f)
   else:
     bound_args = get_bound_args(f, *args)  # pytype: disable=paramspec-error
 
-  device_kinds = map(op_base.infer_device_kind, bound_args)
+  device_kinds = map(op_lib.infer_device_kind, bound_args)
   device_kinds = {k for k in device_kinds if k is not None}
   if not device_kinds:
     device_kind = backend.get_default_device().device_kind
@@ -309,10 +309,10 @@ def autotune(
   if all_implementations:
     default_device = backend.get_default_device()
     bound_args = tuple(
-        op_base.BoundArguments(op, ba.arguments)  # pylint: disable=g-complex-comprehension
+        op_lib.BoundArguments(op, ba.arguments)  # pylint: disable=g-complex-comprehension
         for ba in bound_args
         for op in get_op_implementations(ba.op, device=default_device).values()
-        if isinstance(op, op_base.Op)
+        if isinstance(op, op_lib.Op)
     )
 
   data = []

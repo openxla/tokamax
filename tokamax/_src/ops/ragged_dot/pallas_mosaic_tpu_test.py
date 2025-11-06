@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
-from tokamax._src.ops import op as op_base
+from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
 
@@ -116,7 +116,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     # because jax.Array would trigger OOM for our tests.
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
     maxtext_config = tpu_ragged_dot._get_heuristics_config(
-        op_base.BoundArguments(
+        op_lib.BoundArguments(
             op=tpu_ragged_dot,
             arguments={
                 "lhs": jax.ShapeDtypeStruct((262144, 7168), dtype=jnp.bfloat16),
@@ -130,7 +130,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
 
   def test_autotuning_configs(self):
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
-    ba = op_base.BoundArguments(
+    ba = op_lib.BoundArguments(
         op=tpu_ragged_dot,
         arguments={
             "lhs": jax.ShapeDtypeStruct((262144, 7168), dtype=jnp.bfloat16),

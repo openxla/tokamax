@@ -24,7 +24,7 @@ import pydantic
 from tokamax._src import batching
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import utils
-from tokamax._src.ops import op as op_base
+from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.attention import pallas_triton_flash_attention as pl_attn
 from tokamax._src.ops.normalization import base as norm_base
@@ -163,7 +163,7 @@ class PydanticTest(parameterized.TestCase):
 
   @parameterized.parameters(*_OPS)
   def test_any_instance_of_op_roundtrip(self, op):
-    adapter = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[op_base.Op])
+    adapter = pydantic.TypeAdapter(pydantic_lib.AnyInstanceOf[op_lib.Op])
     object.__setattr__(op, "vjp", None)
     op_roundtrip = adapter.validate_python(adapter.dump_python(op))
     object.__setattr__(op_roundtrip, "vjp", None)
@@ -183,7 +183,7 @@ class PydanticTest(parameterized.TestCase):
     for arg_spec in arg_specs.ARG_SPECS:
       spec = arg_spec.args
       with self.subTest(arg_spec.full_name):
-        spec = op_base._abstractify(_eval_shape(spec))
+        spec = op_lib._abstractify(_eval_shape(spec))
         spec_roundtrip = adapter.validate_python(adapter.dump_python(spec))
         self.assertEqual(spec, spec_roundtrip)
         spec_roundtrip = adapter.validate_json(adapter.dump_json(spec))

@@ -27,7 +27,7 @@ from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
-from tokamax._src.ops import op as op_base
+from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attn_api
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
@@ -49,12 +49,12 @@ class _FakeOpConfig:
 _HEURISTICS_CONFIG = _FakeOpConfig(42)
 
 
-class _FakeOp(op_base.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
+class _FakeOp(op_lib.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
 
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
     return x + y, None
 
-  def _get_heuristics_config(self, ba: op_base.BoundArguments) -> _FakeOpConfig:
+  def _get_heuristics_config(self, ba: op_lib.BoundArguments) -> _FakeOpConfig:
     return _HEURISTICS_CONFIG
 
 
@@ -308,7 +308,7 @@ class AutotuningTest(parameterized.TestCase):
     f = jax.jit(op)
 
     # Register context hook before first call, so first and last are identical.
-    _ = op_base.get_autotuning_cache_overlay_state()
+    _ = op_lib.get_autotuning_cache_overlay_state()
     _ = f(x, y)
     with result0:
       _ = f(x, y)
