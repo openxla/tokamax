@@ -272,12 +272,10 @@ class AttentionTestBase(parameterized.TestCase):
     kwargs.setdefault("impl_supports_precisions", self._supports_precisions)
     kwargs.setdefault("test_vjp", self._supports_vjp)
 
-    if expect_supported:
-      context = contextlib.nullcontext()
-    else:
-      context = self.assertRaises(Exception)
+    with contextlib.ExitStack() as stack:
+      if not expect_supported:
+        stack.enter_context(self.assertRaises(Exception))
 
-    with context:
       _run_test(*args, **kwargs)
 
   @parameterized.parameters(jnp.float32, jnp.bfloat16, jnp.float16)
@@ -942,12 +940,10 @@ class AttentionManualPartitioningTestBase(parameterized.TestCase):
         or mesh.shape.get(self._ATTENTION_AXES[-2], 1) == 1
     )
 
-    if expect_supported:
-      context = contextlib.nullcontext()
-    else:
-      context = self.assertRaises(Exception)
+    with contextlib.ExitStack() as stack:
+      if not expect_supported:
+        stack.enter_context(self.assertRaises(Exception))
 
-    with context:
       _run_test(q, k, v, bias=bias, rng=rng, **kwargs)
 
   @parameterized.parameters(*_PARTITION_AXES)
