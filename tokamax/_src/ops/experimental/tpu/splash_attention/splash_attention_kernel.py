@@ -327,6 +327,8 @@ class SplashConfig:
   # This parameter allows to override this behavior and specifies the number of
   # reduction steps. For now, only 3 or all the kv steps are supported.
   dq_reduction_steps: int | None = None
+  # An experimental scheduler that sometimes produces better softmax overlap.
+  use_experimental_scheduler: bool = False
 
   def __post_init__(self):
     if self.block_kv_compute is None:
@@ -1021,6 +1023,11 @@ def _splash_attention_forward(
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary"),
+            flags={
+                "XLA_TPU_FORCE_LP_LLO_SCHEDULER": (
+                    config.use_experimental_scheduler
+                )
+            },
         ),
         out_shape=out_shapes,
         name=kernel_name,
