@@ -422,7 +422,7 @@ def _can_have_block_d(*args):
   return True
 
 
-@pydantic.dataclasses.dataclass(frozen=True, kw_only=True)
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
   block_q: pydantic.PositiveInt
   block_k: pydantic.PositiveInt
@@ -432,7 +432,7 @@ class Config:
   block_d_out: pydantic.PositiveInt | None = None
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
   """Pallas-Triton FlexAttention implementation."""
 

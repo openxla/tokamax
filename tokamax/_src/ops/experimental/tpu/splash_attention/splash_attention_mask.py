@@ -130,7 +130,7 @@ def make_random_mask(
   return np.random.binomial(n=1, p=1.0 - sparsity, size=shape).astype(np.bool_)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class LogicalOr(Mask):
   left: Mask
   right: Mask
@@ -152,7 +152,7 @@ class LogicalOr(Mask):
     return hash((type(self),) + (self.left, self.right))
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class LogicalAnd(Mask):
   left: Mask
   right: Mask
@@ -438,7 +438,7 @@ class LocalMask(_ComputableMask):
     ))
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class NumpyMask(Mask):
   """A mask backed by a dense numpy array."""
 
@@ -477,7 +477,7 @@ def _fill_slice(inp_slice: slice, size: int) -> slice:
   return slice(start, stop, None)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class FullMask(Mask):
   """Lazy full mask, allows all tokens to attend to all other tokens."""
 

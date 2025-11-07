@@ -76,7 +76,7 @@ def _gated_linear_unit_kernel(
   out_ref.store(out.astype(out_ref.dtype))
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
   block_m: int
   block_n: int
@@ -101,7 +101,7 @@ def _get_best_block_size(m: int, n: int) -> tuple[int, int, int]:
   return block_m, block_n, block_k
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
   """Pallas-Triton gated linear unit."""
 

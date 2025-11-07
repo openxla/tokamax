@@ -91,7 +91,7 @@ class _SyncExecutor(futures.Executor):
     return future
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Autotuner:
   """Autotuner for configurable JAX functions."""
 

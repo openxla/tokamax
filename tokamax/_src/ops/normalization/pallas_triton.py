@@ -80,7 +80,7 @@ def _normalization_kernel(
   y_ref.store(x.astype(y_ref.dtype))
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasTritonNormalization(base.Normalization[Config, Key]):
   """Pallas-Triton normalization op."""
   config_cls: ClassVar[type[Config]] = Config

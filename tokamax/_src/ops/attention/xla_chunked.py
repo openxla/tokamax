@@ -304,7 +304,7 @@ def _attend_paged(
   return jax.lax.scan(bq_loop_fn, init=0, xs=q)[1], None
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class XlaChunkedDotProductAttention(
     base.DotProductAttention[op.NullConfig, None]
 ):

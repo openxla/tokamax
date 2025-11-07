@@ -42,7 +42,7 @@ QuantizedArray = quantization.QuantizedArray
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class Mask:
   """An attention mask.
 
@@ -181,7 +181,7 @@ CAUSAL_MASK = Mask(is_causal=True)
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class PagingInfo:
   """Information about the paged kv cache.
 

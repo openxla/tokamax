@@ -28,7 +28,7 @@ QArray = qwix.QArray
 
 # TODO: Add support for offsets?
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class QuantizedArray:
   """A quantized JAX array with a scale factor for each tile."""
 

@@ -34,7 +34,7 @@ class MatmulDimension(enum.IntEnum):
   N = 1
 
 
-@pydantic.dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True, slots=True)
 class Config:
   """Configuration for the ragged dot kernel."""
   block_m: pydantic.conint(multiple_of=8, gt=0)
@@ -54,7 +54,7 @@ class Config:
   grid_tile_width: int = 1
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class GroupInfo:
   """Information regarding the group being processed in a block."""
 

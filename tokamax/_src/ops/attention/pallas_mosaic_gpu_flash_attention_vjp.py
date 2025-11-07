@@ -46,7 +46,7 @@ _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 
 
-@pydantic.dataclasses.dataclass(frozen=True, kw_only=True)
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
   block_q_dkv: pydantic.conint(multiple_of=64, gt=0)
   block_kv_dkv: pydantic.conint(multiple_of=64, gt=0)
@@ -808,7 +808,7 @@ def _decompose_mask(mask, q, k, q_indices, k_indices):
   return mask, k_start, k_end
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasMosaicGpuFlashAttentionVjp(
     base.DotProductAttentionVjp[Config, None]
 ):

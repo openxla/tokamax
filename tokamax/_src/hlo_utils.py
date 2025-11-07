@@ -75,7 +75,7 @@ _TOKAMAX_NAME: Final[str] = 'tokamax'
 XlaShape: TypeAlias = jax.ShapeDtypeStruct | tuple['XlaShape', ...]
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class KernelInfoBase:
   """Kernel information base class."""
 
@@ -88,7 +88,7 @@ class KernelInfoBase:
   hlo_module_name: str
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class TritonKernelInfo(KernelInfoBase):
   """Triton kernel information."""
 
@@ -102,17 +102,17 @@ class TritonKernelInfo(KernelInfoBase):
 
 
 # TODO: Add fields for Mosaic TPU kernel information.
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class MosaicTpuKernelInfo(KernelInfoBase):
   """Mosaic TPU kernel information."""
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class MosaicGpuKernelInfo(KernelInfoBase):
   """Mosaic GPU kernel information."""
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class TokamaxXlaKernelInfo(KernelInfoBase):
   """Tokamax XLA kernel information."""
 

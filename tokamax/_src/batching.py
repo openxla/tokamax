@@ -144,7 +144,7 @@ def _unique_not_none_value(*args):
   return value
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class Batched(Generic[_T]):
   """Wrapper for `vmap` axes on some values."""
 

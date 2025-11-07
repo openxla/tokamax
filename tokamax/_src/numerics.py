@@ -28,7 +28,7 @@ PyTree: TypeAlias = Any
 QuantizedArray = quantization.QuantizedArray
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class NumericSummary:
   """Summary properties of an array."""
 
@@ -40,7 +40,7 @@ class NumericSummary:
   mean_abs: float
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class DiffSummary:
   """Summary of the difference of two arrays."""
 

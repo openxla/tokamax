@@ -40,7 +40,7 @@ def _option_override_scope(name, value):
       setattr(_STATE, name, prev_value)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _ConfigOption(Generic[_T]):
   """A configuration option."""
 

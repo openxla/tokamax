@@ -78,7 +78,7 @@ def _normalization_vjp_kernel(
   dx_ref.store(((dout + dx1 + dx2) * rstddev).astype(dx_ref.dtype))
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
   """Pallas-Triton normalization VJP."""
   config_cls: ClassVar[type[Config]] = Config

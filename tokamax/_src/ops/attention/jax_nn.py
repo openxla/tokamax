@@ -34,7 +34,7 @@ QuantizedArray = quantization.QuantizedArray
 PagingInfo = base.PagingInfo
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
   """`jax.nn.dot_product_attention` implementation."""
 
@@ -149,4 +149,3 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
   @override
   def supported_on(self, device: jax.Device) -> bool:
     return self.implementation != "cudnn" or device.platform == "gpu"
-

@@ -113,7 +113,6 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
   # input array arguments not in the dict will have gradients set to zeros.
   vjp: Callable[Concatenate[_Residuals, _T, _T, _P], Any] | None = None
 
-  @classmethod
   def __init_subclass__(cls, *args, **kwargs):
     super().__init_subclass__(*args, **kwargs)
     # Pydantic fails to infer the type of `config`, so give it some help.
@@ -354,7 +353,7 @@ class AUTO:
   ...
 
 
-@dataclasses.dataclass(frozen=True, init=False)
+@dataclasses.dataclass(frozen=True, init=False, slots=True)
 class BoundArguments(Generic[_Config, _Key]):
   """Bound arguments for an op's `__call__` method."""
 
@@ -571,7 +570,7 @@ class BoundArguments(Generic[_Config, _Key]):
   replace = dataclasses.replace
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _AlwaysEqual:
   """A class that is always equal to another instance of itself."""
 

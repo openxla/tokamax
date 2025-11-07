@@ -51,7 +51,7 @@ _STATIC = dataclasses.field(metadata=dict(static=True))
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class GroupSizes:
   """A group sizes array with representative values.
 

@@ -41,7 +41,7 @@ GroupSizes = base.GroupSizes
 
 
 # TODO: Natively support mk,ekn->mn.
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
   """Pallas-Mosaic-GPU ragged dot implementation.
 

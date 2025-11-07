@@ -35,7 +35,7 @@ QuantizedArray = quantization.QuantizedArray
 PagingInfo = attn_base.PagingInfo
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
   """`DotProductAttention` implementation wrapping a `FlexAttention`."""
 

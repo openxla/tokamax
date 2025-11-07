@@ -340,7 +340,7 @@ def _bwd_kernel(
     dq_ref.store((dq * sm_scale).astype(dq_ref.dtype))
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
   block_m1: pydantic.PositiveInt
   block_n1: pydantic.PositiveInt
@@ -486,7 +486,7 @@ def _bwd(
   return dq, dk, dv, ds
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   """Pallas-Triton FlashAttention VJP implementation."""
   config_cls: ClassVar[type[Config]] = Config

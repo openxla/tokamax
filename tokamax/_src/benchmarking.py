@@ -61,7 +61,7 @@ _optimization_barrier.defvjp(
 )
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class BenchmarkData:
   """Time and memory benchmarking data."""
 

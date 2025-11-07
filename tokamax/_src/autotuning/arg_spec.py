@@ -29,7 +29,7 @@ from typing import Any, Literal, TypeAlias
 Tag: TypeAlias = Literal['primary']
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ArgSpec:
   """Argument specification for an op with metadata.
 

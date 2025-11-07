@@ -55,7 +55,7 @@ def _pids() -> tuple[jax.Array, ...]:
   return tuple(pids)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class BlockRef:
   """A reference to data with a `BlockSpec`.
 
@@ -237,7 +237,7 @@ class BlockRef:
     return self.ref.transforms[0]
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class BlockRefIndexer:
   """Indexer into a `BlockRef`."""
 

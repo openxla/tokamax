@@ -38,7 +38,7 @@ QArray = base.QArray
 GroupSizes = base.GroupSizes
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
   block_m: int
   block_n: int
@@ -333,7 +333,7 @@ _DLHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
 )
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
   """Pallas-Triton ragged dot implementation."""
   config_cls: ClassVar[type[Config]] = Config
