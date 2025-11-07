@@ -60,12 +60,22 @@ class NumericsTest(parameterized.TestCase):
     expected = 3.4 + 20.0 if equal_nan else np.nan
     chex.assert_trees_all_close(summary_diff.max_absolute_diff, expected)
     self.assertFalse(summary_diff.allclose)
+    self.assertTrue(np.isnan(summary_diff.l2_diff))
 
     summary = numerics.array_numeric_summary(x)
 
     self.assertEqual(summary.has_inf, False)
     self.assertEqual(summary.has_nan, True)
     self.assertLess(abs(summary.max - 3.4), 0.0001)
+
+  def test_array_diff_summary_no_nan(self):
+    x = jnp.array([2.0, 2.0], dtype=jnp.float32)
+    y = np.array([-1.0, -2.0], dtype=np.float32)
+
+    summary_diff = numerics.array_diff_summary(x, y)
+    self.assertEqual(summary_diff.max_absolute_diff_values, (2.0, -2.0))
+    self.assertEqual(summary_diff.max_absolute_diff, 4.0)
+    self.assertEqual(summary_diff.l2_diff, 5.0)
 
   def test_random_initialize_consistency(self):
     # To allow numerics comparisons over time, the random initializer should

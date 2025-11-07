@@ -47,6 +47,7 @@ class DiffSummary:
   max_absolute_diff_values: tuple[float, float]
   percent_close: float
   allclose: bool
+  l2_diff: float
 
   @property
   def max_absolute_diff(self) -> float:
@@ -74,7 +75,10 @@ def array_diff_summary(
   expected = np.array(expected).astype(np.float64)
   actual = np.array(actual).astype(np.float64)
 
-  abs_diff = np.abs(expected - actual)
+  diff = expected - actual
+  abs_diff = np.abs(diff)
+  l2_diff = float(np.linalg.norm(diff))
+
   # It's useful logging out the values that caused the max absolute
   # difference.
   max_diff_index = np.nanargmax(abs_diff) if equal_nan else np.argmax(abs_diff)
@@ -104,6 +108,7 @@ def array_diff_summary(
       max_absolute_diff_values=(expected_max_val, actual_max_val),
       percent_close=percent_close,
       allclose=num_close == actual.size,
+      l2_diff=l2_diff,
   )
 
 
