@@ -13,8 +13,16 @@
 # limitations under the License.
 # ==============================================================================
 """Tokamax autotuning cache."""
-from typing import Any, TypeAlias
 
+from importlib import resources
+import re
+from typing import Annotated
+from typing import Any, Final, TypeAlias
+
+from absl import logging
+import immutabledict
+import pydantic
+from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.autotuning import autotuner
 
 AutotuningData = autotuner.AutotuningData
@@ -22,11 +30,43 @@ DeviceKind = str
 DeviceAutotuningCache: TypeAlias = dict[Any, AutotuningData[Any]]
 
 
+_CACHE_PATHS: Final[tuple[str, ...]] = (
+    "data/autotuning",
+)
+
+
+def _get_cache_json(base_dir: str, device_kind: DeviceKind, op_name: str):
+  """Returns the JSON string of the autotuning cache for the given device and op."""
+
+  path = resources.files("tokamax").joinpath(
+      base_dir, device_kind, f"{op_name}.json"
+  )
+  try:
+    return path.read_text()
+  except FileNotFoundError:
+    logging.info("Autotuning cache file not found: %s", path)
+    return "{}"
+
+
+def _get_cache_adapter(op) -> pydantic.TypeAdapter:
+  model_name = f"{type(op).__name__}Spec"
+  spec = pydantic_lib.get_arg_spec_model(model_name, op._fwd_signature)  # pylint: disable=protected-access
+  return pydantic.TypeAdapter(
+      dict[
+          Annotated[
+              pydantic.Json[spec],
+              pydantic.AfterValidator(lambda d: immutabledict.immutabledict(d)),  # pylint: disable=unnecessary-lambda
+              pydantic.WrapSerializer(lambda d, handler: handler(dict(d))),
+          ],
+          autotuner.AutotuningData[op.config_cls],
+      ]
+  )
+
+
 class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
   """Cache of autotuning data.
 
-  Autotuning data is read lazily from the cache files upon first access. The
-  directory containing the cache files can be specified using TODO!!!
+  Autotuning data is read lazily from the cache files upon first access.
   """
 
   def __init__(self, op):
@@ -38,5 +78,27 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
     return cache
 
   def _load_cache(self, device_kind: DeviceKind) -> DeviceAutotuningCache:
-    """Loads autotuning cache from corresponding JSON file."""
-    return {}
+    """Loads autotuning cache from corresponding JSON files."""
+
+    device_kind = device_kind.lower().replace(" ", "_")
+    # Convert to snake case.
+    op_name = re.sub(r"(?!^)([A-Z])", r"_\1", type(self.op).__name__).lower()
+
+    out = {}
+    for base_dir in _CACHE_PATHS:
+      path = resources.files("tokamax").joinpath(
+          base_dir, device_kind, f"{op_name}.json"
+      )
+      try:
+        json_data = path.read_text()
+      except FileNotFoundError:
+        logging.info("Autotuning cache file not found: %s", path)
+        json_data = "{}"
+      # Cache paths later in the list will override earlier ones.
+      out |= {
+          self.op.bind(**k).autotuning_cache_key: cache
+          for k, cache in _get_cache_adapter(self.op)
+          .validate_json(json_data)
+          .items()
+      }
+    return out
