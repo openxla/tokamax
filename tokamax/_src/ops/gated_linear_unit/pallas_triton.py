@@ -28,6 +28,7 @@ from jaxtyping import Array, Float  # pylint: disable=g-importing-member,g-multi
 from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base
+from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 from tokamax._src.pallas import block
 from tokamax._src.pallas import grid
 from typing_extensions import override
@@ -112,7 +113,7 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
   def _fwd(
       self,
       x: Float[Array, '*B M K'],
-      weights: Float[Array, 'K 2 N'],
+      weights: FusedWeights | UnfusedWeights,
       *,
       activation: Callable[[jax.Array], jax.Array] | None,
       precision: base.CanonicalPrecision,
@@ -129,6 +130,11 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
     block_m = config.block_m
     block_n = config.block_n
     block_k = config.block_k
+
+    # TODO: Avoid stacking weights.
+    weights = (
+        jnp.stack(weights, axis=1) if isinstance(weights, tuple) else weights
+    )
 
     def fn(x, weights):
       out_shape = x.shape[:-1] + (weights.shape[-1],)
@@ -199,7 +205,7 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     x, weights = ba.args  # TODO: Use batched args.
     m = math.prod(x.shape[:-1])
-    n = weights.shape[2]
+    n = weights[0].shape[-1] if isinstance(weights, tuple) else weights.shape[2]
     if n >= m:  # Prefer `block_n` > `block_m`.
       block_m, block_n, block_k = _get_best_block_size(m, n)
     else:

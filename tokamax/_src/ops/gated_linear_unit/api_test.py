@@ -40,8 +40,11 @@ def _get_input_data(m, k, n, dtype=jnp.bfloat16):
 
 class GatedLinearUnitTest(parameterized.TestCase):
 
-  @parameterized.parameters(*_IMPLEMENTATIONS)
-  def test_basic_api(self, implementation):
+  @parameterized.product(
+      implementation=_IMPLEMENTATIONS,
+      use_tuple_weights=[True, False],
+  )
+  def test_basic_api(self, implementation, use_tuple_weights):
     if implementation == "triton" and not triton.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
 
@@ -64,6 +67,9 @@ class GatedLinearUnitTest(parameterized.TestCase):
           x, weights, activation=jax.nn.sigmoid, implementation="xla"
       )
       return jnp.sum(out)
+
+    if use_tuple_weights:
+      rhs = jnp.unstack(rhs, axis=1)
 
     out = f(lhs, rhs)
     out_golden = f_xla(lhs, rhs)

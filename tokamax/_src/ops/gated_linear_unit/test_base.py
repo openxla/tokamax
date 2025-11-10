@@ -15,7 +15,6 @@
 """Gated Linear Unit test base."""
 
 import functools
-import math
 
 from absl.testing import parameterized
 import chex
@@ -37,8 +36,11 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
       dict(m=256, n=256, k=64, activation="sigmoid"),
       dict(m=256, n=256, k=64, activation="tanh"),
       dict(batch=(2, 3), m=256, n=256, k=64),
+      dict(m=256, n=256, k=64, use_tuple_weights=True),
   )
-  def test_gated_linear_unit(self, *, batch=(), m, n, k, activation=None):
+  def test_gated_linear_unit(
+      self, *, batch=(), m, n, k, activation=None, use_tuple_weights=False
+  ):
 
     if isinstance(self._glu_fn, functools.partial):
       keywords = self._glu_fn.keywords
@@ -69,13 +71,23 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
     x_ref = x.astype(jnp.float32)
     w_ref = w.astype(jnp.float32)
 
+    if use_tuple_weights:
+      w = jnp.unstack(w, axis=1)
+      w_ref = jnp.unstack(w_ref, axis=1)
+
     def f_ref(x, weights):
-      w, v = jnp.unstack(weights, axis=1)
+      if isinstance(weights, tuple):
+        w, v = weights
+      else:
+        w, v = jnp.unstack(weights, axis=1)
       gates = jnp.matmul(x, w, precision=jax.lax.Precision.HIGHEST)
       projection = jnp.matmul(x, v, precision=jax.lax.Precision.HIGHEST)
       return projection * (gates if activation is None else activation(gates))
 
-    f = functools.partial(self._glu_fn, activation=activation)
+    f = functools.partial(
+        self._glu_fn,
+        activation=activation,
+    )
 
     assert_all_close = functools.partial(
         chex.assert_trees_all_close, atol=0.1, rtol=0.02

@@ -29,6 +29,5 @@ class PallasTritonGatedLinearUnitTest(test_base.GatedLinearUnitTestBase):
     super().setUp()
 
 
-
 if __name__ == "__main__":
   absltest.main()

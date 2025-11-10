@@ -31,6 +31,8 @@ _T = TypeVar('_T')
 _Config = TypeVar('_Config')
 _Key = TypeVar('_Key')
 _FwdFn = Callable[[jax.Array, jax.Array], _T]
+FusedWeights: TypeAlias = Float[Array, 'K 2 N']
+UnfusedWeights: TypeAlias = tuple[Float[Array, 'K N'], Float[Array, 'K N']]
 Residuals: TypeAlias = Float[Array, '*B M 2 N']
 CanonicalPrecision = precision_lib.CanonicalPrecision
 
@@ -45,8 +47,8 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   @override
   def bind(
       self,
-      x: jax.Array,
-      weights: jax.Array,
+      x: Float[Array, '*B M K'],
+      weights: FusedWeights | UnfusedWeights,
       *,
       activation: Callable[[jax.Array], jax.Array] | None = None,
       precision: jax.lax.PrecisionLike = None,
@@ -67,7 +69,7 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   def _fwd(
       self,
       x: Float[Array, '*B M K'],
-      weights: Float[Array, 'K 2 N'],
+      weights: FusedWeights | UnfusedWeights,
       *,
       activation: Callable[[jax.Array], jax.Array] | None,
       precision: CanonicalPrecision,
@@ -80,7 +82,9 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 
     Args:
       x: the input array.
-      weights: the combined weights array.
+      weights: the weights for the linear transformations. Can be a single fused
+        array of shape `(K, 2, N)`, or a tuple of unfused arrays, each of shape
+        `(K, N)`.
       activation: optional activation function.
       precision: the matrix multiplication precision.
       return_residuals: if True, returns the residuals in addition to the
@@ -91,6 +95,22 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       The output array.
     """
     del config  # Unused.
+    if isinstance(weights, tuple):
+      gate_weights, projection_weights = weights
+      projection = jnp.matmul(x, projection_weights, precision=precision)
+      gate = jnp.matmul(x, gate_weights, precision=precision)
+      dtype = jnp.promote_types(x.dtype, jnp.float32)
+      if return_residuals:
+        y = jnp.stack([gate, projection], axis=gate.ndim - 1)
+      else:
+        y = None
+      gate = gate.astype(dtype)
+      projection = projection.astype(dtype)
+      if activation is not None:
+        gate = activation(gate)
+      out = (gate * projection).astype(x.dtype)
+      return out, y
+
     y = jnp.einsum('...k,kjn->...jn', x, weights, precision=precision)
     # Apply activation and compute product of FP8/FP16/BF16 in FP32.
     dtype = jnp.promote_types(x.dtype, jnp.float32)
@@ -132,7 +152,10 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 class GatedLinearUnitVjp(
     op.Op[
         Any,
-        tuple[Float[Array, '*B M K'], Float[Array, 'K 2 N']],
+        tuple[
+            Float[Array, '*B M K'],
+            FusedWeights | UnfusedWeights,
+        ],
         Any,
         _Config,
         _Key,
@@ -146,14 +169,20 @@ class GatedLinearUnitVjp(
       residuals: Residuals,
       out: Float[Array, '*B M N'],
       dout: Float[Array, '*B M N'],
-      x: Float[Array, 'M K'],
-      weights: Float[Array, 'K 2 N'],
+      x: Float[Array, '*B M K'],
+      weights: FusedWeights | UnfusedWeights,
       *,
       activation: Callable[[jax.Array], jax.Array] | None,
       precision: CanonicalPrecision,
       return_residuals: bool,
       config: _Config,
-  ) -> tuple[tuple[Float[Array, '*B M K'], Float[Array, 'K 2 N']], None]:
+  ) -> tuple[
+      tuple[
+          Float[Array, '*B M K'],
+          FusedWeights | UnfusedWeights,
+      ],
+      None,
+  ]:
     """Gated linear unit VJP."""
     if return_residuals:
       raise NotImplementedError('`return_residuals=True` is not supported.')

@@ -23,6 +23,7 @@ import jax
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import triton
 from tokamax._src.ops.gated_linear_unit import base
+from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 
 # TODO: Add Pallas-Mosaic-GPU implementation.
 Implementation: TypeAlias = Literal['triton', 'xla']
@@ -46,7 +47,7 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
 
 def gated_linear_unit(
     x: Float[Array, '*B M K'],
-    weights: Float[Array, 'K 2 N'],
+    weights: FusedWeights | UnfusedWeights,
     *,
     activation: Callable[[jax.Array], jax.Array] | None = None,
     precision: jax.lax.PrecisionLike = None,
@@ -54,7 +55,7 @@ def gated_linear_unit(
 ) -> Float[Array, '*B M N']:
   """Applies a gated linear unit (https://arxiv.org/abs/1612.08083).
 
-  Computes `activation(x @ weight[:, 0]) * x @ weight[:, 1]`.
+  Computes `activation(x @ w_gate) * (x @ w_up)`.
 
   This is SwiGLU when `activation=jax.nn.swish`, GEGLU when
   `activation=jax.nn.gelu`, REGLU when `activation=jax.nn.relu`, and GLU when
@@ -62,7 +63,9 @@ def gated_linear_unit(
 
   Args:
     x: the input array.
-    weights: the combined weight array.
+    weights: the weights for the linear transformations. Can be a single fused
+      array of shape `(K, 2, N)`, or a tuple of unfused arrays, each of shape
+      `(K, N)`.
     activation: optional activation function.
     precision: specifies the matrix multiplication precision. Either `None`
       (default), which means the default precision for the backend, or
@@ -100,12 +103,6 @@ def gated_linear_unit(
       if impl not in IMPLEMENTATIONS:
         raise ValueError(f'Unknown implementation: {impl}')
       fn = IMPLEMENTATIONS[impl]
-
-    if x.dtype.name != weights.dtype.name:
-      raise ValueError(
-          f'Input and weight must have the same dtype. {x.dtype} !='
-          f' {weights.dtype}'
-      )
 
     try:
       return fn(x, weights, activation=activation, precision=precision)
