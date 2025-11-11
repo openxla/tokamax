@@ -153,7 +153,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       rhs: jax.Array | QArray,
       *,
       group_sizes: jax.Array | base.GroupSizes,
-      ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers | None,
+      ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
       precision: base.CanonicalPrecision,
       preferred_element_type: jax.typing.DTypeLike | None,
       return_residuals: bool = False,
@@ -311,9 +311,8 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    lhs, rhs = ba.arguments["lhs"], ba.arguments["rhs"]
-
-    (m, k), (g, _, n) = lhs.shape, rhs.shape
+    lhs, rhs = ba.args
+    (_, k), (_, _, n) = lhs.shape, rhs.shape
     # Based on some empirical TPU tiling performance. Create a reasonable
     # tiling search space.
     tile_m_range = range(128, 1024 + 128, 128)
