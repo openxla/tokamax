@@ -14,6 +14,7 @@
 # ==============================================================================
 from absl.testing import absltest
 import jax
+import jax.numpy as jnp
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
 from tokamax._src.ops.gated_linear_unit import test_base
 
@@ -28,6 +29,18 @@ class PallasTritonGatedLinearUnitTest(test_base.GatedLinearUnitTestBase):
       self.skipTest("Not supported on TPUs.")
     super().setUp()
 
+  def test_autotuning_search_space(self):
+    m = 256
+    n = 256
+    k = 64
+    glu = pl_glu.PallasTritonGatedLinearUnit()
+    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0), 2)
+    x = jax.random.normal(rng0, (m, k), dtype=jnp.bfloat16)
+    w = jax.random.normal(rng1, (k, 2, n), dtype=jnp.bfloat16)
+
+    glu_bound_args = glu.bind(x, w)
+    autotuning_configs = glu_bound_args.autotuning_configs
+    self.assertNotEmpty(autotuning_configs)
 
 if __name__ == "__main__":
   absltest.main()
