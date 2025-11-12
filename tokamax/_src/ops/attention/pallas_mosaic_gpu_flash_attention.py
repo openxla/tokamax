@@ -99,11 +99,7 @@ def _fwd(
 
   max_stages = min(config.num_stages, kv_seq_len // config.block_kv)
   block_q_kv = block_q, block_kv = config.block_q, config.block_kv
-  num_q_tiles, rem = divmod(q_seq_len, block_q * 2)
-  if rem:
-    raise NotImplementedError(
-        f"{q_seq_len=} must be a multiple of {block_q * 2=}"
-    )
+  num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
 
   if bias is not None:
     bias = as_4d(bias)

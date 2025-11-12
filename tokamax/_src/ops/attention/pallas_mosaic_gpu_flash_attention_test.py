@@ -91,11 +91,10 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     kwargs["atol"] = max(atol, 0.0045)
     kwargs["atol_grads"] = None if bias is None else 0.02
 
-    if not impl_kwargs.get("normalize_output", True):
+    normalize_output = impl_kwargs.get("normalize_output", True)
+    if q.ndim < 3 or (q.shape[-3] % 128 != 0) or not normalize_output:
       kwargs["test_vjp"] = False
 
-    if (q.ndim < 3) or (q.shape[-3] % 128 != 0) and not self._supports_decode:
-      kwargs["expect_supported"] = False
     super()._run_test_with_inputs(q, k, v, bias=bias, **kwargs)
 
   def test_causal_mask(self):
