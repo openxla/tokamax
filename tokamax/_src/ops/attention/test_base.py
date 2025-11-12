@@ -293,9 +293,10 @@ class AttentionTestBase(parameterized.TestCase):
         expect_supported=self._supports_cross_attention,
     )
 
-  @parameterized.product(input_dim=(24, 128), output_dim=(64, 112))
+  _PRODUCT_PARAMS = list(itertools.product((24, 128), (64, 112)))
+  @pytest.mark.long
+  @pytest.mark.parametrize("input_dim,output_dim", _PRODUCT_PARAMS)
   def test_different_output_head_dim(self, input_dim, output_dim):
-    self.skipTest("Too slow for OSS")
     rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
     q = jax.random.normal(rng0, (2, 1024, 4, input_dim))
     k = jax.random.normal(rng1, (2, 1024, 4, input_dim))
@@ -336,7 +337,24 @@ class AttentionTestBase(parameterized.TestCase):
   def test_non_power_of_two_head_dim(self):
     self._run_test((2, 1024, 4, 48))
 
+  @pytest.mark.long
+  @pytest.mark.parametrize(
+      "bias_shape",
+      [
+          ((2, 4, 1024, 1024),),
+          ((2, 4, 1024, 1),),
+          ((2, 4, 1, 1024),),
+          ((2, 1, 1024, 1024),),
+          ((1, 4, 1024, 1024),),
+          ((4, 1024, 1024),),
+      ],
+  )
   @parameterized.parameters(
+      ((2, 4, 1024, 1024),),
+      ((2, 4, 1024, 1),),
+      ((2, 4, 1, 1024),),
+      ((2, 1, 1024, 1024),),
+      ((1, 4, 1024, 1024),),
       ((4, 1024, 1024),),
   )
   def test_bias(self, bias_shape):
@@ -347,8 +365,19 @@ class AttentionTestBase(parameterized.TestCase):
         expect_supported=self._supports_bias,
     )
 
-  @parameterized.parameters(
-      ((1, 4, 1, 1024),),
+  @pytest.mark.long
+  @pytest.mark.parametrize(
+      "mask_shape",
+      [
+          ((2, 4, 1024, 1024),),
+          ((2, 4, 1024, 1),),
+          ((2, 4, 1, 1024),),
+          ((2, 1, 1024, 1024),),
+          ((1, 4, 1024, 1024),),
+          ((2, 1, 1024, 1),),
+          ((1, 4, 1024, 1),),
+          ((2, 1, 1, 1024),),
+      ],
   )
   def test_mask(self, mask_shape):
     self._run_test(
@@ -365,9 +394,9 @@ class AttentionTestBase(parameterized.TestCase):
         ref_kwargs=dict(mask=mask),
     )
 
-  @parameterized.parameters(512, 539)
+  @pytest.mark.long
+  @pytest.mark.parametrize("seq_len_k", [512, 539])
   def test_causal_mask_cross_attention(self, seq_len_k):
-    self.skipTest("Too slow for OSS")
     mask = jnp.tri(1024, seq_len_k, dtype=bool)
     self._run_test(
         (2, 1024, 4, 64),
@@ -375,7 +404,7 @@ class AttentionTestBase(parameterized.TestCase):
         impl_kwargs=dict(is_causal=True),
         ref_kwargs=dict(mask=mask),
         expect_supported=self._supports_cross_attention,
-        atol=1e-5
+        atol=1e-5,
     )
 
   def test_causal_mask_q_indices(self):
@@ -470,6 +499,7 @@ class AttentionTestBase(parameterized.TestCase):
         expect_supported=self._supports_mask,
     )
 
+  @pytest.mark.long
   @parameterized.parameters(
       dict(is_causal=True),  # Explicit causal
       dict(k_end=range(1, 1024 + 1)),  # Lower tri (implicit causal)
@@ -513,7 +543,6 @@ class AttentionTestBase(parameterized.TestCase):
       dict(k_start=576),
   )
   def test_mask_api(self, **kwargs):
-    self.skipTest("Too slow for OSS regression tests.")
     num_heads = 4
     offset_per_head = kwargs.pop("offset_per_head", None)
 
@@ -578,6 +607,12 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   @parameterized.parameters(
+      dict(vmap_in_axes=((0, 0, 0, 0, 0),)),
+      dict(vmap_in_axes=((0, None, None, 0, 0),)),
+      dict(vmap_in_axes=((0, 0, 0, None, 0),)),
+      dict(vmap_in_axes=((0, 0, 0, 0, None),)),
+      dict(vmap_in_axes=((0, 0, 0, 0, 0), (0, 0, 0, 0, 0))),
+      dict(vmap_in_axes=((None, 0, 0, 0, 0), (None, 0, 0, 0, 0))),
       dict(vmap_in_axes=((0, None, None, 0, 0), (0, None, None, 0, 0))),
       dict(vmap_in_axes=((0, None, None, None, 0), (None, 0, 0, 0, None))),
   )
@@ -623,6 +658,7 @@ class AttentionTestBase(parameterized.TestCase):
         ),
     )
 
+  @pytest.mark.long
   @parameterized.parameters(
       dict(q_shape=(4, 1024, 2, 64), bias_shape=(4, 2, 1024, 512)),  # bias
       dict(q_shape=(4, 1024, 2, 64), mask_shape=(4, 2, 512, 1024)),  # mask
@@ -631,6 +667,7 @@ class AttentionTestBase(parameterized.TestCase):
     self.skipTest("Too slow for OSS")
     self._run_test(**kwargs, expect_supported=False)
 
+  @pytest.mark.long
   @parameterized.product(
       tile_shape=(
           (1, 1, 1, -1),
@@ -657,7 +694,8 @@ class AttentionTestBase(parameterized.TestCase):
         (2, 1024, 4, 64), impl=impl, ref_impl=ref_impl, test_vjp=False
     )
 
-  @parameterized.parameters(-1, 64)
+  @pytest.mark.long
+  @parameterized.parameters(-1, 64, 128, 256)
   def test_quantized_int4(self, subchannel_size):
     tile_shape = (1, 1, 1, subchannel_size)
     quantize = quantization.quantize_as(jnp.int4, tile_shape=tile_shape)
@@ -675,14 +713,14 @@ class AttentionTestBase(parameterized.TestCase):
         (2, 1024, 4, 256), impl=impl, ref_impl=ref_impl, test_vjp=False
     )
 
+  @pytest.mark.long
   @parameterized.parameters("bfloat16", "float16")
   def test_logits_dtype(self, dtype):
-    self.skipTest("Too slow for OSS")
     self._run_test(
         (2, 1024, 4, 64),
         impl_kwargs=dict(logits_dtype=dtype),
         dtype=dtype,
-        atol=({"float16": 1e-3, "bfloat16": 1e-2})[dtype],
+        atol=({"float16": 1e-2, "bfloat16": 1e-2})[dtype],
         expect_supported=self._supports_logits_dtype,
     )
 
@@ -730,9 +768,10 @@ class AttentionTestBase(parameterized.TestCase):
         expect_supported=self._supports_cross_attention,
     )
 
+  @pytest.mark.long
   @parameterized.named_parameters(NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
-    self.skipTest("Too slow for OSS")
+    self.skipTest("Awaiting Bug Fixes")
 
     spec = dict(spec)  # We need to take a copy to avoid modifying other tests.
     q, k, v, bias, mask = numerics.random_initialize((

@@ -53,3 +53,6 @@ tpu = [
     "jax[tpu]>=0.8.0",
     "hypothesis",
 ]
+
+[tool.pytest.ini_options]
+markers = ["long: tests that will take a long time to run and are used in weekly runs"]

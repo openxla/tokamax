@@ -36,6 +36,11 @@ class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
         supports_vjp=supports_vjp,
     )
 
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
+
   def _run_test_with_inputs(self, *args, **kwargs):
     impl_kwargs = kwargs.get("impl_kwargs", {})
     # pytype: disable=attribute-error
@@ -62,6 +67,11 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
   def __init__(self, *args):
     # TODO: Vjp has many restrictions. Work around and enable tests.
     super().__init__(*args, supports_vjp=False, implementation="cudnn")
+    
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
 
   def _run_test_with_inputs(self, *args, **kwargs):
     # CuDNN doesn't support f32 inputs.

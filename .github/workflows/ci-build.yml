@@ -58,7 +58,7 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
-          pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/${{ matrix.pytest_command }}
+          pytest -s -m "not long" --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/${{ matrix.pytest_command }}
 
   tokamax-presubmit-ops-tests:
     strategy:
@@ -86,7 +86,7 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
-          pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ --ignore-glob="*/splash_attention" tokamax/_src/ops
+          pytest -s -m "not long" --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ --ignore-glob="*/splash_attention" tokamax/_src/ops
 
   tokamax-presubmit:
     strategy:
@@ -114,5 +114,5 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
-          pytest -s --ignore-glob="tokamax/_src/ops/*" tokamax
+          pytest -s -m "not long" --ignore-glob="tokamax/_src/ops/*" tokamax
 

@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import xla_chunked
+import pytest
 
 
 class XlaChunkedAttentionTest(test_base.AttentionTestBase):
@@ -244,6 +245,7 @@ class XlaPagedAttentionTest(test_base.AttentionTestBase):
   def test_normalize_output(self):
     self.skipTest("Reference implementation doesn't support masks.")
 
+  @pytest.mark.skip(reason="Too slow for OSS regression tests.")
   @parameterized.parameters(
       *test_base.base_names_and_params("test_invalid_shapes")
   )
