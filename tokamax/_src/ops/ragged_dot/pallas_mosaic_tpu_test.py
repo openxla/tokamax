@@ -23,6 +23,7 @@ from tokamax._src import quantization
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
+from typing_extensions import override
 
 
 QuantizedArray = quantization.QuantizedArray
@@ -94,10 +95,10 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     with test_base.override_chex_args(atol=0.2, rtol=0.01):
       super().test_vjp0()  # pytype: disable=attribute-error
 
-  @parameterized.parameters(*test_base.base_names_and_params("test_quantized"))
-  def test_quantized(self, test_name, kwargs):
+  @override
+  def _test_quantized(self, dtype, a_tile_shape, b_tile_shape):
     with test_base.override_chex_args(atol=0.4, rtol=0.1):
-      getattr(super(), test_name)()
+      super()._test_quantized(dtype, a_tile_shape, b_tile_shape)
 
   @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
   def test_bench(self, spec):

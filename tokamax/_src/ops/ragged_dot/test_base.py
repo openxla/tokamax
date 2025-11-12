@@ -26,7 +26,6 @@ import jax.numpy as jnp
 import numpy as np
 from tokamax._src import numerics
 from tokamax._src import quantization
-from tokamax._src import test_utils
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import arg_specs
 
@@ -131,6 +130,9 @@ class RaggedDotTestBase(parameterized.TestCase):
       b_tile_shape=((1, 1, 16), (1, 1, 128), (1, 256, 1), (1, 16, 1)),
   )
   def test_quantized(self, dtype, a_tile_shape, b_tile_shape):
+    self._test_quantized(dtype, a_tile_shape, b_tile_shape)
+
+  def _test_quantized(self, dtype, a_tile_shape, b_tile_shape):
     dtype = jnp.dtype(dtype)
     num_groups, m, k, n = 8, 512, 256, 512
     a, b, group_sizes = self._create_inputs(
@@ -212,7 +214,3 @@ class RaggedDotTestBase(parameterized.TestCase):
     chex.assert_trees_all_close(
         actual[:count], expected[:count], atol=0.01, rtol=0.005
     )
-
-
-def base_names_and_params(test_name: str) -> list[tuple[str, str]]:
-  return test_utils.get_names_and_params(RaggedDotTestBase, test_name)
