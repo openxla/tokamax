@@ -1775,6 +1775,7 @@ def _splash_attention_bwd_dkv(
               q_layout=config.q_layout,
               k_layout=config.k_layout,
               v_layout=config.v_layout,
+              use_experimental_scheduler=config.use_experimental_scheduler,
           ),
       )
   }
