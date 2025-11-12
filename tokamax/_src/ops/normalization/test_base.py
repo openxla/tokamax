@@ -22,7 +22,6 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
-from tokamax._src import test_utils
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import arg_specs
 
@@ -86,6 +85,9 @@ class NormalizationTestBase(parameterized.TestCase):
       ),
   )
   def test_layer_norm_vmap(self, axis, vmap_in_axes):
+    self._test_layer_norm_vmap(axis, vmap_in_axes)
+
+  def _test_layer_norm_vmap(self, axis, vmap_in_axes):
     shape = (24, 32, 40)
     axis_sizes = []
     inner_shape = list(shape)
@@ -192,10 +194,6 @@ class NormalizationTestBase(parameterized.TestCase):
     ba.apply_defaults()
     ba.arguments.pop('return_residuals')
     self._run_test(*ba.args[1:], **ba.kwargs)
-
-
-def base_names_and_params(test_name: str) -> list[tuple[str, str]]:
-  return test_utils.get_names_and_params(NormalizationTestBase, test_name)
 
 
 # pylint: enable=missing-function-docstring

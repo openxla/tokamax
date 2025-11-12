@@ -17,12 +17,12 @@ import functools
 from unittest import mock
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import chex
 import jax
 from tokamax._src.ops.normalization import pallas_triton
 from tokamax._src.ops.normalization import pallas_triton_config
 from tokamax._src.ops.normalization import test_base
+from typing_extensions import override
 
 
 class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
@@ -31,8 +31,8 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
     super().__init__(*args, norm_fn=pallas_triton.PallasTritonNormalization())
 
   def setUp(self):
-    if jax.default_backend() == "tpu":
-      self.skipTest("Not supported on TPUs.")
+    if jax.default_backend() == 'tpu':
+      self.skipTest('Not supported on TPUs.')
     super().setUp()
 
   def test_layer_norm_with_pre_scale(self):
@@ -52,13 +52,8 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
     )
     chex.assert_trees_all_close(y_actual, y_expected, atol=1e-6)
 
-  @parameterized.parameters(
-      *test_base.base_names_and_params('test_layer_norm_vmap')
-  )
-  def test_layer_norm_vmap(self, test_name, kwargs):
-    kwargs = eval(f'dict{kwargs}')  # pylint: disable=eval-used
-    vmap_in_axes = kwargs['vmap_in_axes']
-
+  @override
+  def _test_layer_norm_vmap(self, axis, vmap_in_axes):
     x_shape = [24, 32, 40]
     vmap_axis_sizes = tuple(
         x_shape.pop(in_axes[0]) for in_axes in vmap_in_axes[::-1]
@@ -74,7 +69,7 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
     with mock.patch.object(
         pallas_triton_config, 'get_heuristics_config', my_heuristics_config
     ):
-      getattr(super(), test_name)()
+      super()._test_layer_norm_vmap(axis, vmap_in_axes)
 
     # We expect to see a shape for non-vmapped and each layer of vmap.
     seen_vmap_axis_sizes = seen_vmap_axis_sizes[-1 :: -(len(vmap_in_axes) + 1)]
