@@ -15,10 +15,8 @@
 """Tokamax Megablox TPU tests for core functionality."""
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
-from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
@@ -100,8 +98,8 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     with test_base.override_chex_args(atol=0.4, rtol=0.1):
       super()._test_quantized(dtype, a_tile_shape, b_tile_shape)
 
-  @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
-  def test_bench(self, spec):
+  @override
+  def _test_bench(self, spec):
     if "i8xi8" in self._testMethodName:
       kwargs = dict(atol=1.5, rtol=0.5)  # This is really bad!
     elif "i4" in self._testMethodName:
@@ -109,7 +107,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     else:
       kwargs = {}
     with test_base.override_chex_args(**kwargs):
-      getattr(super(), self._testMethodName)()
+      super()._test_bench(spec)
 
   def test_maxtext_config(self):
     # Test to ensure that we can get the correct config for a specific model.

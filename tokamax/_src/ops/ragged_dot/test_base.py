@@ -207,6 +207,9 @@ class RaggedDotTestBase(parameterized.TestCase):
 
   @parameterized.named_parameters(NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
+    self._test_bench(spec)
+
+  def _test_bench(self, spec):
     kwargs = numerics.random_initialize(spec)
     expected = ref(**kwargs)
     actual = self._dot_fn(**kwargs)

@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.ragged_dot import pallas_triton
 from tokamax._src.ops.ragged_dot import test_base
+from typing_extensions import override
 
 
 class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
@@ -65,8 +66,8 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
       with test_base.override_chex_args(rtol=0.01):
         self.test_quantized0()  # pytype: disable=attribute-error
 
-  @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
-  def test_bench(self, _):
+  @override
+  def _test_bench(self, spec):
     # TODO: Fix tolerance and enable tests.
     self.skipTest(
         "Accuracy for triton pallas is slightly less than mgpu. We need to"
