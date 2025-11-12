@@ -35,7 +35,7 @@ from typing_extensions import override
 
 Residuals = base.Residuals
 QArray = base.QArray
-GroupSizes = base.GroupSizes
+GroupSizes = base.RaggedDotGroupSizes
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)

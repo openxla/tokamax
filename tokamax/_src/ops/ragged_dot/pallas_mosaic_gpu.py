@@ -37,7 +37,7 @@ from typing_extensions import override
 
 Config = common.Config
 QArray = base.QArray
-GroupSizes = base.GroupSizes
+GroupSizes = base.RaggedDotGroupSizes
 
 
 # TODO: Natively support mk,ekn->mn.

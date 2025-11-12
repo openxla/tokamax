@@ -52,7 +52,7 @@ _STATIC = dataclasses.field(metadata=dict(static=True))
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
-class GroupSizes:
+class RaggedDotGroupSizes:
   """A group sizes array with representative values.
 
   `ragged_dot` performance is sensitive to the distribution of the group sizes,
@@ -61,6 +61,7 @@ class GroupSizes:
   distribution of group sizes. This allows `ragged_dot` to be benchmarked /
   autotuned with representative data.
   """
+
   value: jax.Array
   representative_value: tuple[int, ...] = _STATIC
 
@@ -82,7 +83,7 @@ class GroupSizes:
     return self.value
 
   def __eq__(self, other) -> bool:
-    return isinstance(other, GroupSizes) and (
+    return isinstance(other, RaggedDotGroupSizes) and (
         self.representative_value == other.representative_value
     )
 
@@ -113,6 +114,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 
   For use in MegaBlocks-style models: https://arxiv.org/abs/2211.15841.
   """
+
   _: dataclasses.KW_ONLY
   checkify_group_sizes: bool = False
 
@@ -122,7 +124,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       lhs: jax.Array | QuantizedArray | QArray,
       rhs: jax.Array | QuantizedArray | QArray,
       *,
-      group_sizes: jax.Array | GroupSizes | Sequence[int],
+      group_sizes: jax.Array | RaggedDotGroupSizes | Sequence[int],
       ragged_dot_dimension_numbers: (
           jax.lax.RaggedDotDimensionNumbers | None
       ) = None,
@@ -141,13 +143,15 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 
     if isinstance(group_sizes, (tuple, list)):
       group_sizes = tuple(group_sizes)
-      group_sizes = GroupSizes(jnp.array(group_sizes, jnp.int32), group_sizes)
+      group_sizes = RaggedDotGroupSizes(
+          jnp.array(group_sizes, jnp.int32), group_sizes
+      )
 
     # TODO: Create representative values for other ragged dot dim numbers.
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
-      if not isinstance(group_sizes, GroupSizes):
+      if not isinstance(group_sizes, RaggedDotGroupSizes):
         representative_sizes = (lhs.shape[0] // rhs.shape[0],) * rhs.shape[0]
-        group_sizes = GroupSizes(group_sizes, representative_sizes)
+        group_sizes = RaggedDotGroupSizes(group_sizes, representative_sizes)
 
       if self.checkify_group_sizes:
         gs = group_sizes.value
@@ -173,7 +177,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       lhs: jax.Array | QArray,
       rhs: jax.Array | QArray,
       *,
-      group_sizes: jax.Array | GroupSizes,
+      group_sizes: jax.Array | RaggedDotGroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
       precision: CanonicalPrecision,
       preferred_element_type: jnp.dtype | None,
@@ -184,7 +188,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 
     lhs, rhs = map(quantization.as_array, (lhs, rhs))
 
-    if isinstance(group_sizes, GroupSizes):
+    if isinstance(group_sizes, RaggedDotGroupSizes):
       group_sizes = jnp.array(group_sizes)
 
     # NOTE: `preferred_element_type` changes the accumulation type when using

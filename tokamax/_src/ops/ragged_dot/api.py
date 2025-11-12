@@ -24,7 +24,6 @@ from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-i
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 
-GroupSizes = base.GroupSizes
 QuantizedArray = quantization.QuantizedArray
 Implementation: TypeAlias = Literal["mosaic", "triton", "xla"]
 
@@ -65,7 +64,7 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
 def ragged_dot(
     lhs: Float[Array | QuantizedArray, "M K"],
     rhs: Float[Array | QuantizedArray, "G K N"],
-    group_sizes: Int[Array, "G"] | base.GroupSizes,
+    group_sizes: Int[Array, "G"] | base.RaggedDotGroupSizes,
     precision: jax.lax.PrecisionLike = None,
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
@@ -114,7 +113,7 @@ def ragged_dot(
 def ragged_dot_general(
     lhs: jax.Array | QuantizedArray,
     rhs: jax.Array | QuantizedArray,
-    group_sizes: Int[Array, "G"] | base.GroupSizes,
+    group_sizes: Int[Array, "G"] | base.RaggedDotGroupSizes,
     ragged_dot_dimension_numbers: (
         jax.lax.RaggedDotDimensionNumbers | None
     ) = None,
