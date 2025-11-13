@@ -16,13 +16,13 @@
 import dataclasses
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import pytest
 from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as fa
 from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
+from typing_extensions import override
 
 
 @pytest.mark.skip(reason="Too slow for OSS regression tests.")
@@ -125,12 +125,12 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       impl = dataclasses.replace(self._attention_fn, use_stable_softmax=False)
       self._run_test((2, 1024, 4, 64), impl=impl)
 
-  @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
-  def test_bench(self, spec):
+  @override
+  def _test_bench(self, spec):
     atol_grads = None if spec.get("bias") is None else 0.04
     try:
       with test_base.override_test_args(atol=0.02, atol_grads=atol_grads):
-        getattr(super(), self._testMethodName)()
+        super()._test_bench(spec)
     except ValueError as e:
       if "exceeds available shared memory" in str(e):
         self.skipTest(f"Test exceeds shared memory capacity: {e}")

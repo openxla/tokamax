@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import xla_chunked
+from typing_extensions import override
 import pytest
 
 
@@ -245,23 +246,16 @@ class XlaPagedAttentionTest(test_base.AttentionTestBase):
   def test_normalize_output(self):
     self.skipTest("Reference implementation doesn't support masks.")
 
-  @pytest.mark.skip(reason="Too slow for OSS regression tests.")
-  @parameterized.parameters(
-      *test_base.base_names_and_params("test_invalid_shapes")
-  )
-  def test_invalid_shapes(self, *_):
+  @override
+  def _test_invalid_shapes(self, **kwargs):
     self.skipTest("Flax impl doesn't support different batch sizes.")
 
-  @parameterized.parameters(
-      *test_base.base_names_and_params("test_quantized_int8")
-  )
-  def test_quantized_int8(self, *_):
+  @override
+  def _test_quantized_int8(self, tile_shape, quantize_q):
     self.skipTest("Unsupported.")
 
-  @parameterized.parameters(
-      *test_base.base_names_and_params("test_quantized_int4")
-  )
-  def test_quantized_int4(self, *_):
+  @override
+  def _test_quantized_int4(self, subchannel_size):
     self.skipTest("Unsupported.")
 
 

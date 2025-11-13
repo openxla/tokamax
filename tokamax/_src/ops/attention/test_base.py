@@ -30,7 +30,6 @@ import jax.numpy as jnp
 import numpy as np
 from tokamax._src import numerics
 from tokamax._src import quantization
-from tokamax._src import test_utils
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import xla_chunked
 from tokamax._src.ops.attention import arg_specs
@@ -380,6 +379,9 @@ class AttentionTestBase(parameterized.TestCase):
       ],
   )
   def test_mask(self, mask_shape):
+    self._test_mask(mask_shape)
+
+  def _test_mask(self, mask_shape):
     self._run_test(
         (2, 1024, 4, 64),
         mask_shape=mask_shape,
@@ -543,6 +545,9 @@ class AttentionTestBase(parameterized.TestCase):
       dict(k_start=576),
   )
   def test_mask_api(self, **kwargs):
+    self._test_mask_api(**kwargs)
+
+  def _test_mask_api(self, **kwargs):
     num_heads = 4
     offset_per_head = kwargs.pop("offset_per_head", None)
 
@@ -617,6 +622,9 @@ class AttentionTestBase(parameterized.TestCase):
       dict(vmap_in_axes=((0, None, None, None, 0), (None, 0, 0, 0, None))),
   )
   def test_vmap(self, vmap_in_axes):
+    self._test_vmap(vmap_in_axes)
+
+  def _test_vmap(self, vmap_in_axes):
     self.skipTest("Too slow for OSS")
     def vmap_impl(impl):
       def vmapped(q, k, v, *, bias, mask, **kwargs):
@@ -664,6 +672,9 @@ class AttentionTestBase(parameterized.TestCase):
       dict(q_shape=(4, 1024, 2, 64), mask_shape=(4, 2, 512, 1024)),  # mask
   )
   def test_invalid_shapes(self, **kwargs):
+    self._test_invalid_shapes(**kwargs)
+
+  def _test_invalid_shapes(self, **kwargs):
     self.skipTest("Too slow for OSS")
     self._run_test(**kwargs, expect_supported=False)
 
@@ -675,6 +686,9 @@ class AttentionTestBase(parameterized.TestCase):
       quantize_q=(True, False),
   )
   def test_quantized_int8(self, tile_shape, quantize_q):
+    self._test_quantized_int8(tile_shape, quantize_q)
+
+  def _test_quantized_int8(self, tile_shape, quantize_q):
     quantize = quantization.quantize_as(jnp.int8, tile_shape=tile_shape)
     quant_dequant = lambda x: quantize(x).recompose()
 
@@ -697,6 +711,9 @@ class AttentionTestBase(parameterized.TestCase):
   @pytest.mark.long
   @parameterized.parameters(-1, 64, 128, 256)
   def test_quantized_int4(self, subchannel_size):
+    self._test_quantized_int4(subchannel_size)
+
+  def _test_quantized_int4(self, subchannel_size):
     tile_shape = (1, 1, 1, subchannel_size)
     quantize = quantization.quantize_as(jnp.int4, tile_shape=tile_shape)
     quant_dequant = lambda x: quantize(x).recompose()
@@ -771,6 +788,9 @@ class AttentionTestBase(parameterized.TestCase):
   @pytest.mark.long
   @parameterized.named_parameters(NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
+    self._test_bench(spec)
+
+  def _test_bench(self, spec):
     self.skipTest("Awaiting Bug Fixes")
 
     spec = dict(spec)  # We need to take a copy to avoid modifying other tests.
@@ -1031,6 +1051,9 @@ class AttentionManualPartitioningTestBase(parameterized.TestCase):
 
   @parameterized.product(mask_shape=_BIAS_MASK_SHAPES)
   def test_self_attention_mask(self, mask_shape):
+    self._test_self_attention_mask(mask_shape)
+
+  def _test_self_attention_mask(self, mask_shape):
     try:
       partition_axis = self._BIAS_MASK_AXES[mask_shape.index(1)]
     except ValueError:
@@ -1135,16 +1158,5 @@ class AttentionManualPartitioningTestBase(parameterized.TestCase):
     )
 
   # TODO: Add partitioning test for non-broadcasted multi-query
-
-
-def base_names_and_params(test_name: str) -> list[tuple[str, str]]:
-  return test_utils.get_names_and_params(AttentionTestBase, test_name)
-
-
-def partitioning_names_and_params(test_name: str) -> list[tuple[str, str]]:
-  return test_utils.get_names_and_params(
-      AttentionManualPartitioningTestBase, test_name
-  )
-
 
 # pylint: enable=missing-function-docstring

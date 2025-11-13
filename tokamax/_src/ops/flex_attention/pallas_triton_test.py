@@ -14,11 +14,11 @@
 # ==============================================================================
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
 from tokamax._src.ops.flex_attention import pallas_triton
 from tokamax._src.ops.flex_attention import test_base
 from tokamax._src.ops.flex_attention import wrapper_test_base
+from typing_extensions import override
 import pytest
 
 
@@ -50,10 +50,8 @@ class WrappedPallasTritonFlexAttentionTest(
     super().setUp()
 
   @pytest.mark.skip(reason="Too slow for OSS regression tests.")
-  @parameterized.parameters(
-      *wrapper_test_base.base_names_and_params("test_vmap")
-  )
-  def test_vmap(self, *_):
+  @override
+  def _test_vmap(self, vmap_in_axes):
     self.skipTest("TODO: Fix `vmap` support.")
 
 

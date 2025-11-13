@@ -14,7 +14,6 @@
 # ==============================================================================
 """Test base for wrapped FlexAttention ops."""
 import jax
-from tokamax._src import test_utils
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.flex_attention import base
 from tokamax._src.ops.flex_attention import wrapper
@@ -31,8 +30,3 @@ class WrappedFlexAttentionTestBase(test_base.AttentionTestBase):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
     super().setUp()
-
-
-def base_names_and_params(test_name: str) -> list[tuple[str, str]]:
-  cls = WrappedFlexAttentionTestBase
-  return test_utils.get_names_and_params(cls, test_name)

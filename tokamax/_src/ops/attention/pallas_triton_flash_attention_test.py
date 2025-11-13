@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import dataclasses
 from typing import TypeAlias
 from unittest import mock
 import pytest
@@ -28,6 +27,7 @@ from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_triton_flash_attention as fa
 from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
+from typing_extensions import override
 
 
 class _F32PrecisionXlaAttentionVjp(base.DotProductAttentionVjp):

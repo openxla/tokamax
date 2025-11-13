@@ -15,11 +15,11 @@
 
 import pytest
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import test_base
+from typing_extensions import override
 
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
@@ -67,7 +67,7 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
   def __init__(self, *args):
     # TODO: Vjp has many restrictions. Work around and enable tests.
     super().__init__(*args, supports_vjp=False, implementation="cudnn")
-    
+
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
@@ -93,15 +93,13 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
   def test_bench_veo3_veo3(self):
     self.skipTest("Numerical issue in CuDNN for head_dim=256.")
 
-  @parameterized.parameters(*test_base.base_names_and_params("test_vmap"))
-  def test_vmap(self, test_name, kwargs):
+  @override
+  def _test_vmap(self, vmap_in_axes):
     self.skipTest("Too slow for OSS")
-    kwargs = eval(f"dict{kwargs}")  # pylint: disable=eval-used
-    vmap_in_axes = kwargs["vmap_in_axes"]
     for in_axes in vmap_in_axes:
       if any(x is None for x in in_axes[:3]):
         self.skipTest("Unsupported replication for qkv.")
-    getattr(super(), test_name)()
+    super()._test_vmap(vmap_in_axes)
 
   def test_impl_in_hlo(self):
     x = jnp.empty((2, 256, 4, 64), dtype=jnp.bfloat16)
