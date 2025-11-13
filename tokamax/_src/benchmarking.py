@@ -46,7 +46,7 @@ T = TypeVar('T')
 RetT: TypeAlias = T | list[jax.Array] | tuple[T, list[jax.Array]]
 
 TimingMethod: TypeAlias = Literal[
-    'wallclock', 'cuda_events', 'cupti', 'xprof', 'hermetic_xprof'
+    'wallclock', 'cupti', 'xprof', 'hermetic_xprof'
 ]
 
 
@@ -323,11 +323,6 @@ def wallclock_timer(f: Callable[[T], Any], args: T) -> Timer:
   return timer
 
 
-def cuda_events_timer(f: Callable[[T], Any], args: T) -> Timer:
-  timer = profiler.measure(f)
-  return lambda _: (timer(args)[1], {})
-
-
 def cupti_timer(f: Callable[[T], Any], args: T) -> Timer:
   timer = profiler.Cupti(finalize=False).measure(f)
   return lambda _: (timer(args)[1], {})
@@ -352,7 +347,6 @@ def hermetic_xprof_timer(f: Callable[[T], Any], args: T) -> Timer:
 
 _TIMERS: dict[str, Callable[[Callable[[T], Any], T], Timer]] = {
     'wallclock': wallclock_timer,
-    'cuda_events': cuda_events_timer,
     'cupti': cupti_timer,
     'xprof': xprof_timer,
     'hermetic_xprof': hermetic_xprof_timer,
@@ -398,9 +392,8 @@ def compile_benchmark(
       method: The timing method. 'wallclock' uses Python `time.perf_counter()`
         to measure blocked JAX function execution time. This works for any XLA
         backend, and does not add any device overhead, but does measure Python
-        overhead. 'cuda_events' uses CUDA synchronization events to measure the
-        device execution time. If `None`, will pick a sensible default for the
-        backend.
+        overhead. 'cupti' uses the CUPTI profiling API to measure the device
+        execution time. If `None`, will pick a sensible default for the backend.
 
     Returns:
       A `BenchmarkData` object.
@@ -417,26 +410,15 @@ def compile_benchmark(
     if method is None:
       method = _DEFAULT_TIMING_METHOD.get(platform, _FALLBACK_TIMING_METHOD)
 
-    if method == 'cuda_events':
+    if method == 'cupti':
       if platform != 'gpu':
-        raise ValueError('CUDA events are only supported on GPU.')
-      f_ = f  # CUDA events needs to `jit` the function.
-    elif method == 'cupti':
-      if platform != 'gpu':
-        raise ValueError('CUPTI profiler is only supported on GPU.')
-      f_ = f_compiled
-    elif method in ('hermmetic_xprof', 'xprof'):
+        raise ValueError('CUPTI profiling is only supported on GPU.')
+    elif method in ('hermetic_xprof', 'xprof'):
       if platform not in ('gpu', 'tpu'):
         raise ValueError('XProf profiling is only supported on GPU or TPU.')
-      f_ = f_compiled
-    else:
-      f_ = f_compiled
 
-    # start of timing code
-    timer = _TIMERS[method](f_, x)
+    timer = _TIMERS[method](f_compiled, x)
     times = [timer(False)[0] for _ in range(iterations - 1)]
-    # end of timing code
-
     dt, metadata = timer(True)  # Capture metadata on last iteration.
     return BenchmarkData(
         lower_time_ms=lowering_time * 10**3,

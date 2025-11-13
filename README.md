@@ -169,11 +169,9 @@ bench: tokamax.benchmarking.BenchmarkData = run(args)
 There are different measurement techniques: for example, on GPU, there is the
 [CUPTI profiler](https://docs.nvidia.com/cupti) that can be specified via
 `run(args, method='cupti')`. This instruments the kernel and adds some a small
-overhead. Using `run(args, method='cuda_events')` uses CUDA synchronization
-events to measure the device execution time. The default `run(args,
-method=None)` allows Tokamax to choose the method, and works for both TPU and
-GPU. Benchmark noise can be reduced by increasing the number of iterations
-`run(args, iterations=10)`.
+overhead. The default `run(args, method=None)` allows Tokamax to choose the
+method, and works for both TPU and GPU. Benchmark noise can be reduced by
+increasing the number of iterations `run(args, iterations=10)`.
 
 ## Disclaimer
 

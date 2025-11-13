@@ -144,7 +144,7 @@ class BenchmarkingTest(parameterized.TestCase):
 
   @parameterized.parameters(benchmarking._TIMERS.keys())
   def test_compile_benchmark(self, method):
-    if jax.default_backend() != 'gpu' and method in ('cuda_events', 'cupti'):
+    if jax.default_backend() != 'gpu' and method == 'cupti':
       self.skipTest('CUDA timers are only supported on GPU.')
 
     @jax.jit
