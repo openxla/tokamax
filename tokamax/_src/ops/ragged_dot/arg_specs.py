@@ -17,7 +17,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from scipy import special
 from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.ragged_dot import base
 
