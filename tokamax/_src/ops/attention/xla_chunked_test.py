@@ -182,10 +182,6 @@ class XlaPagedAttentionTest(test_base.AttentionTestBase):
         lambda x: jax.lax.collapse(x, 0, -3), (q, unpadded_k, unpadded_v)
     )
 
-    is_quant = lambda x: isinstance(x, xla_chunked.QuantizedArray)
-    if any(is_quant(x) for x in (q, unpadded_k, unpadded_v)):
-      self.skipTest("TODO: Support in-op dequantization.")
-
     impl_kwargs = kwargs.pop("impl_kwargs", {})
     if (
         impl_kwargs.get("is_causal", False)
