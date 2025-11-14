@@ -257,14 +257,11 @@ def standardize_function(
   ba.apply_defaults()
 
   is_leaf = lambda x: isinstance(x, numerics.ArrayInitializer)
-  args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs), is_leaf=is_leaf)
-  is_array = lambda x: isinstance(
-      x, (jax.Array, numerics.ArrayInitializer, jax.ShapeDtypeStruct)
-  )
-  arrays, other, merge = utils.split_merge(is_array, args_flat)
+  flatten_arrays = lambda x: utils.flatten_arrays(x, is_leaf=is_leaf)
+  arrays, recompose_args = flatten_arrays((ba.args, ba.kwargs))
 
   def forward(arrays: list[jax.Array]) -> T:
-    args, kwargs = args_tree.unflatten(merge(arrays, other))
+    args, kwargs = recompose_args(arrays)
     return f(*args, **kwargs)
 
   is_batched = lambda x: isinstance(x, batching.BatchedShapeDtype)

@@ -148,17 +148,18 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 
     bind = cast(Callable[_P, Any], self.bind)  # Work around pytype bug.
     ba = bind(*args, **kwargs)
-    args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
-    is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
-    arrays, other, merge = utils.split_merge(is_array, args_flat)
+    arrays, recompose_args = utils.flatten_arrays((ba.args, ba.kwargs))
+    # Hack to remove `Fusion` inputs until we handle them properly.
+    fusions, arrays, merge = utils.split_merge(callable, arrays)
+    recompose_args = lambda arrays, f=recompose_args: f(merge(fusions, arrays))
 
     @self._capture_batched_args
     def fwd(*arrays, batched_args, fwd_res=True):
-      args, kwargs = args_tree.unflatten(merge(arrays, other))
+      args, kwargs = recompose_args(arrays)
       kwargs["return_residuals"] = fwd_res or return_residuals
       ba = self.bind(*args, **kwargs)
       if batched_args is not None:
-        bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
+        bargs, bkwargs = recompose_args(batched_args.args)
         bkwargs["return_residuals"] = fwd_res or return_residuals
         arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
         ba = BoundArguments(self, arguments)
@@ -174,7 +175,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
         if fwd_res and self.vjp is None and batched_args is not None:
 
           def fwd_flat(*arrays):
-            args, kwargs = args_tree.unflatten(merge(arrays, other))
+            args, kwargs = recompose_args(arrays)
             kwargs["return_residuals"] = return_residuals
             return self._fwd(*args, config=config, **kwargs)
 
@@ -224,7 +225,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       def bwd(residuals, dout):  # pylint: disable=function-redefined
         arrays, out, residuals = residuals
         dout = dout[0] if return_residuals else dout
-        args, kwargs = args_tree.unflatten(merge(arrays, other))
+        args, kwargs = recompose_args(arrays)
         kwargs.pop("return_residuals")
         grads = self.vjp(residuals, out, dout, *args, **kwargs)  # pytype: disable=wrong-arg-count
 
@@ -235,6 +236,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 
         # Check that grads is tree with same structure as args.
         dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
+        is_array = utils.is_array_like
 
         for k, v in kwargs.items():
           if (dv := grads_ba.kwargs.get(k)) is None:
@@ -615,9 +617,8 @@ def _abstractify(pytree):
 
 
 def _as_batched(x):
-  if hasattr(x, "shape") and hasattr(x, "dtype"):
-    if not isinstance(x, batching.BatchedShapeDtype):
-      return batching.BatchedShapeDtype(x.shape, x.dtype, ())
+  if utils.is_array_like(x) and not isinstance(x, batching.BatchedShapeDtype):
+    return batching.BatchedShapeDtype(x.shape, x.dtype, ())
   return x
 
 
