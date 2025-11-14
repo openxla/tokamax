@@ -25,6 +25,7 @@ from tokamax._src.hlo_utils import DISABLE_JAX_EXPORT_CHECKS as DISABLE_JAX_EXPO
 from tokamax._src.ops.attention.api import dot_product_attention as dot_product_attention
 from tokamax._src.ops.attention.api import Implementation as DotProductAttentionImplementation
 from tokamax._src.ops.gated_linear_unit.api import gated_linear_unit as gated_linear_unit
+from tokamax._src.ops.linear_softmax_cross_entropy_loss.api import linear_softmax_cross_entropy_loss as linear_softmax_cross_entropy_loss
 from tokamax._src.ops.normalization.api import layer_norm as layer_norm
 from tokamax._src.ops.op import BoundArguments as BoundArguments
 from tokamax._src.ops.op import Op as Op
