@@ -27,12 +27,12 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel as non_quant_kernel
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_non_quant_kernel_blackwell as non_quant_kernel_blackwell
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel as quant_kernel
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_kernel_blackwell as quant_kernel_blackwell
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_async_store_kernel as quant_ws_async_store_kernel
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_quant_ws_kernel as quant_ws_kernel
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws as sm90_quant_ws
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws_async_store as sm90_quant_ws_async_store
 from typing_extensions import override
 
 Config = common.Config
@@ -91,18 +91,18 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
     if float(getattr(device, "compute_capability", "9.0")) >= 10.0:
       if isinstance(rhs, QArray):
-        fn = quant_kernel_blackwell.ragged_dot_gpu_quant_blackwell_kernel
+        fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
       else:
-        fn = non_quant_kernel_blackwell.ragged_dot_gpu_non_quant_blackwell_kernel  # pylint: disable=line-too-long
+        fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
     elif isinstance(rhs, QArray):
       if config.async_store:
-        fn = quant_ws_async_store_kernel.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
+        fn = sm90_quant_ws_async_store.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
       elif config.warp_specialized:
-        fn = quant_ws_kernel.ragged_dot_quantized_ws_kernel
+        fn = sm90_quant_ws.ragged_dot_quantized_ws_kernel
       else:
-        fn = quant_kernel.ragged_dot_quantized_kernel
+        fn = sm90_quant.ragged_dot_quantized_kernel
     else:
-      fn = non_quant_kernel.ragged_dot_non_quantized_kernel
+      fn = sm90.ragged_dot_non_quantized_kernel
 
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.array(group_sizes)
