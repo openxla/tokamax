@@ -158,7 +158,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       lhs: jax.Array | QArray,
       rhs: jax.Array | QArray,
       *,
-      group_sizes: jax.Array | base.RaggedDotGroupSizes,
+      group_sizes: jax.Array | base.GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
       precision: base.CanonicalPrecision,
       preferred_element_type: jax.typing.DTypeLike | None,
@@ -183,7 +183,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       x = quantization.quantize_as(self.qdtype, tile_shape=tile_shape)(x)
       return quantization.as_qarray(x)
 
-    if isinstance(group_sizes, base.RaggedDotGroupSizes):
+    if isinstance(group_sizes, base.GroupSizes):
       group_sizes = jnp.array(group_sizes)
 
     if preferred_element_type is None:
@@ -301,7 +301,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:
       group_sizes = ba.arguments["group_sizes"]
       grad = rhs
-      if isinstance(group_sizes, base.RaggedDotGroupSizes):
+      if isinstance(group_sizes, base.GroupSizes):
         group_sizes = jnp.array(group_sizes)
       (m, k), (_, n), g = lhs.shape, grad.shape, group_sizes.shape[0]
       lut_key = (m, k, n, g, is_quantized)

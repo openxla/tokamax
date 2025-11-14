@@ -63,7 +63,7 @@ def _make_spec(
     group_sizes = [m // num_groups] * num_groups
   else:
     assert len(group_sizes) == num_groups
-  group_sizes = base.RaggedDotGroupSizes(  # pytype: disable=wrong-arg-types
+  group_sizes = base.GroupSizes(  # pytype: disable=wrong-arg-types
       jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
       representative_value=tuple(group_sizes),
   )
@@ -84,7 +84,7 @@ ARG_SPECS = (
             'rhs': jax.ShapeDtypeStruct(
                 shape=(256, 7168, 2048), dtype=jnp.bfloat16
             ),
-            'group_sizes': base.RaggedDotGroupSizes(  # pytype: disable=wrong-arg-types
+            'group_sizes': base.GroupSizes(  # pytype: disable=wrong-arg-types
                 jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
                 representative_value=_generate_group_sizes(
                     target_m=262144, g=256

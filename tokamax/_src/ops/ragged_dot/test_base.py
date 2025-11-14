@@ -188,7 +188,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     num_groups, m, k, n = 8, 1024, 128, 256
     a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
     expected = ref(a, b, group_sizes=group_sizes)
-    group_sizes = base.RaggedDotGroupSizes(group_sizes, (1,) * num_groups)
+    group_sizes = base.GroupSizes(group_sizes, (1,) * num_groups)
     actual = self._dot_fn_f32(a, b, group_sizes=group_sizes)
     chex.assert_trees_all_close(actual, expected)
 
