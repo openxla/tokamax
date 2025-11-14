@@ -1,0 +1,81 @@
+# This registry defines the Tokamax attention benchmarks.
+
+benchmarks {
+  name: "tokamax_attention_gpu"
+  description: "Runs the Tokamax attention benchmark on H100."
+  owner: "tokamax-team"
+  update_frequency_policy: QUARTERLY
+  workload {
+    python_workload {
+      script_path: "tokamax/benchmarking/attention.py"
+      python_version: "3.11"
+    }
+  }
+
+  hardware_configs {
+    hardware_category: GPU_H100
+    topology { num_hosts: 1, num_devices_per_host: 1 }
+    workflow_type: [PRESUBMIT]
+    resource_spec {
+      os: LINUX
+    }
+    pip_optional_dependencies: "cuda"
+  }
+
+  metrics { 
+    name: "attention/default/forward" 
+    unit: "ms" 
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics { 
+    name: "attention/default/forward_and_vjp" 
+    unit: "ms" 
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics { 
+    name: "attention/triton/forward" 
+    unit: "ms" 
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics { 
+    name: "attention/triton/forward_and_vjp" 
+    unit: "ms" 
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics { 
+    name: "attention/mosaic/forward" 
+    unit: "ms" 
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics { 
+    name: "attention/mosaic/forward_and_vjp" 
+    unit: "ms" 
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics { 
+    name: "attention/cudnn/forward" 
+    unit: "ms" 
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics { 
+    name: "attention/cudnn/forward_and_vjp" 
+    unit: "ms" 
+    stats {
+      stat: MEDIAN
+    }
+  }
+}

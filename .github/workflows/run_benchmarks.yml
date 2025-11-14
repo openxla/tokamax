@@ -1,0 +1,33 @@
+name: Run Benchmarks
+
+on:
+  # Allow manual runs from the Actions tab for testing
+  workflow_dispatch:
+
+  # Run automatically on every push to your branch
+  push:
+    branches:
+      - benchmarking
+
+  # Run on pull requests that change the benchmark files
+  pull_request:
+    paths:
+      - 'tokamax/benchmarking/**'
+      - '.github/workflows/run_tokamax_benchmarks.yaml'
+
+permissions:
+  contents: read
+
+# Cancel any previous runs on the same branch when a new commit is pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  run_benchmarks:
+    name: Run Tokamax Attention Benchmark
+    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@main
+    with:
+      registry_file: "tokamax/benchmarking/benchmark_registry.pbtxt"
+      workflow_type: "PRESUBMIT"
+      ml_actions_ref: "main"
