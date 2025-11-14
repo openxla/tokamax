@@ -148,6 +148,11 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         num_stages=4,
         split_k=1,
         grid_block_n=1,
+        warp_specialized=True,
+        persistent=False,
+        async_store=True,
+        grid_minor_dim=common.MatmulDimension.M,
+        grid_tile_width=8,
     )
 
   @override
