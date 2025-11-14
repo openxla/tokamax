@@ -160,20 +160,18 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   def _get_sm90_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     # Adjusted block_k for float16/bfloat16
     lhs, rhs = ba.args[:2]
-    warp_specialized = [True]
-    if isinstance(rhs, quantization.QuantizedArray):
-      warp_specialized = [True, False]
-
-    out_dtype = ba.kwargs.get("preferred_element_type") or jnp.promote_types(
-        lhs.dtype, rhs.dtype
-    )
-    out_dtype_bits = jnp.finfo(out_dtype).bits
-    out_swizzle_elems = (128 * 8) // out_dtype_bits
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
-    if isinstance(rhs, quantization.QuantizedArray):
+    if isinstance(rhs, QArray):
       rhs_dtype_bits = jnp.iinfo(rhs.values.dtype).bits
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
+    out_dtype = ba.kwargs["preferred_element_type"]
+    if out_dtype is None:
+      out_dtype = jnp.promote_types(lhs.dtype, rhs.dtype)
+    out_dtype_bits = jnp.finfo(out_dtype).bits
+    out_swizzle_elems = (128 * 8) // out_dtype_bits
+
+    warp_specialized = [True, False] if isinstance(rhs, QArray) else [True]
 
     configs = set()
     # For prefill
