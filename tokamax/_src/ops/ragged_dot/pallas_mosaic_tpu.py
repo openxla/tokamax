@@ -60,7 +60,7 @@ def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
   gsc = jnp.concat([jnp.zeros((1,), gs.dtype), jnp.cumsum(gs)])
   s, e = gsc[:-1], gsc[1:]
   iota, inc = jnp.arange(m), jnp.arange(gs.size)
-  mask = ((iota[None, :] >= s[:, None]) & (iota[None, :] < e[:, None]))
+  mask = (iota[None, :] >= s[:, None]) & (iota[None, :] < e[:, None])
   return jnp.sum(inc[:, None] * mask, axis=0)
 
 
@@ -147,7 +147,9 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           config=self.config,
           qdtype=qdtype,
           interpret=self.interpret,
-      )(*args, **kw)
+      )(
+          *args, **kw
+      )
       object.__setattr__(
           self, "vjp", partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)
       )
@@ -282,8 +284,9 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       lut_key = (m, k, n, g, is_quantized)
       if lut_key in GMM_TILING_TUNED_LUT:
         gmm_tiling, input_buffer_count = GMM_TILING_TUNED_LUT[lut_key]
-        return Config(gmm_tiling=gmm_tiling,
-                      input_buffer_count=input_buffer_count)
+        return Config(
+            gmm_tiling=gmm_tiling, input_buffer_count=input_buffer_count
+        )
       return default_config
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:
       grad = lhs
@@ -307,8 +310,9 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       lut_key = (m, k, n, g, is_quantized)
       if lut_key in TGMM_TILING_TUNED_LUT:
         tgmm_tiling, input_buffer_count = TGMM_TILING_TUNED_LUT[lut_key]
-        return Config(tgmm_tiling=tgmm_tiling,
-                      input_buffer_count=input_buffer_count)
+        return Config(
+            tgmm_tiling=tgmm_tiling, input_buffer_count=input_buffer_count
+        )
       return default_config
     else:
       raise NotImplementedError(
@@ -319,11 +323,17 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     lhs, rhs = ba.args
     (_, k), (_, _, n) = lhs.shape, rhs.shape
+    k_ = ((k + 128 - 1) // 128) * 128
+    n_ = ((n + 128 - 1) // 128) * 128
     # Based on some empirical TPU tiling performance. Create a reasonable
     # tiling search space.
-    tile_m_range = range(128, 1024 + 128, 128)
-    tile_k_range = range(128, k + 128, 128)
-    tile_n_range = range(128, int(n / 2) + 128, 128)
+    tile_m_range = [64 * (2**i) for i in range(8)]
+    tile_k_range = set(
+        [128 * (2**i) for i in range(8)] + [k_ // (2**i) for i in range(6)]
+    )
+    tile_n_range = set(
+        [128 * (2**i) for i in range(8)] + [n_ // (2**i) for i in range(6)]
+    )
     return set(
         Config(gmm_tiling=(tile_m, tile_k, tile_n))
         for tile_m, tile_k, tile_n in itertools.product(
