@@ -19,6 +19,7 @@ from collections.abc import Callable
 from concurrent import futures
 from concurrent.futures import process
 import dataclasses
+import os
 import typing
 from typing import Any, ParamSpec, Self, TypeVar, cast
 
@@ -99,7 +100,7 @@ class Autotuner:
       futures.ThreadPoolExecutor
   )
   executor_fn: Callable[[], futures.Executor] = _SyncExecutor
-  timeout_seconds: float = 120.0
+  timeout_seconds: float = 600.0
 
   def autotune(
       self,
@@ -118,7 +119,9 @@ class Autotuner:
             "Cannot specify a `compile_executor_fn` when using a"
             " `ProcessPoolExecutor` executor."
         )
-      with self.compile_executor_fn() as compile_exec:
+      # pytype: disable=wrong-keyword-args
+      with self.compile_executor_fn(max_workers=os.cpu_count()) as compile_exec:
+        # pytype: enable=wrong-keyword-args
         compiled = {
             compile_exec.submit(_compile, fn_factory, cfg, args, kwargs): cfg
             for cfg in configs
@@ -133,11 +136,11 @@ class Autotuner:
                 initialized_args = numerics.random_initialize(args)
               executor_args[config] = (compiled_fn, initialized_args)
             except Exception:  # pylint: disable=broad-exception-caught
-              logging.exception("Config failed to compile: %s", config)
+              logging.vlog(2, "Config failed to compile: %s", config)
         except TimeoutError:
           slow_configs = [c for c in configs if c not in executor_args]
-          logging.exception(
-              "Configs timed out during compilation: %s", slow_configs
+          logging.vlog(
+              2, "Configs timed out during compilation: %s", slow_configs
           )
     else:
       for config in configs:
@@ -154,12 +157,13 @@ class Autotuner:
           try:
             data = future.result()
           except process.BrokenProcessPool:
-            logging.exception("Config broken: %s", config)
+            logging.vlog(2, "Config broken: %s", config)
           except Exception:  # pylint: disable=broad-exception-caught
-            logging.exception("Config failed: %s", config)
+            logging.vlog(2, "Config failed: %s", config)
           else:
             results[config] = data
-            logging.debug(
+            logging.vlog(
+                1,
                 "%s: lowering time (ms): %f, compile time (ms): %f, "
                 "execution times (ms): %s, median: %f",
                 config,
@@ -175,7 +179,8 @@ class Autotuner:
     results = AutotuningData(results)
     if results:
       config = results.fastest_config
-      logging.debug(
+      logging.vlog(
+          1,
           "best config is %s (median execution time: %f ms)",
           config,
           results[config].median_evaluation_time_ms,

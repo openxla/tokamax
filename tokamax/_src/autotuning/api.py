@@ -197,8 +197,8 @@ def get_bound_args(
     # The chosen config is serialized into the HLO - remove it here.
     object.__setattr__(bound_arg.op, "config", None)
     key = bound_arg.autotuning_cache_key
-    if (bound_arg.op, key) not in seen_keys:
-      seen_keys.add((bound_arg.op, key))
+    if (bound_arg.op.__class__.__name__, key) not in seen_keys:
+      seen_keys.add((bound_arg.op.__class__.__name__, key))
       unique_bound_args.append(bound_arg)
   return tuple(unique_bound_args)
 
