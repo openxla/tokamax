@@ -402,8 +402,12 @@ def ragged_kernel(
           functools.partial(loop_body, pl.cdiv(m, config.block_m))
       )
     else:
-      loop_body(0,
-        tuple(map(lax.axis_index, ("remainder_n", "m", "block_n",))))
+      loop_info = plgpu.NDLoopInfo(
+          index=tuple(map(lax.axis_index, ("remainder_n", "m", "block_n",))),
+          local_index=0,
+          num_local_steps=1,
+      )
+      loop_body(0, loop_info)
 
   if config.persistent:
     # TODO: Detect this number from device.
