@@ -35,7 +35,8 @@ _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = ("xla",)
 def triangle_multiplication(
     x: Float[Array, "N N C"],
     mask: Bool[Array, "N N"],
-    gate_projection_weights: Float[Array, "C 2 H 2"],
+    projection_in_weights: Float[Array, "C 2 H"],
+    gate_in_weights: Float[Array, "C 2 H"],
     projection_out_weights: Float[Array, "H D"],
     gate_out_weights: Float[Array, "C D"],
     layernorm_in_scale: Float[Array, "C"],
@@ -56,8 +57,8 @@ def triangle_multiplication(
   Args:
     x: The input array of shape `[N, N, C]`.
     mask: A boolean mask of shape `[N, N]`.
-    gate_projection_weights: Fused weights for gate and projection layers `[C,
-      2, H, 2]`.
+    projection_in_weights: Weights for projection layer `[C 2 H]`.
+    gate_in_weights: Weights for gate layer `[C 2 H]`.
     projection_out_weights: Weights for the output projection layer `[H, D]`.
     gate_out_weights: Weights for the output gate layer `[C, D]`.
     layernorm_in_scale: Scale for the input layer normalization `[C]`.
@@ -93,7 +94,8 @@ def triangle_multiplication(
   return impl(
       x=x,
       mask=mask,
-      gate_projection_weights=gate_projection_weights,
+      projection_in_weights=projection_in_weights,
+      gate_in_weights=gate_in_weights,
       projection_out_weights=projection_out_weights,
       gate_out_weights=gate_out_weights,
       layernorm_in_scale=layernorm_in_scale,

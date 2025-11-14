@@ -22,7 +22,6 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
-from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import base as norm_base
@@ -43,7 +42,8 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       self,
       x: Float[Array, "N N C"],
       mask: Bool[Array, "N N"],
-      gate_projection_weights: Float[Array, "C 2 H 2"],
+      projection_in_weights: Float[Array, "C 2 H"],
+      gate_in_weights: Float[Array, "C 2 H"],
       projection_out_weights: Float[Array, "H D"],
       gate_out_weights: Float[Array, "C D"],
       layernorm_in_scale: Float[Array, "C"],
@@ -60,7 +60,8 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     return super().bind(
         x=x,
         mask=mask,
-        gate_projection_weights=gate_projection_weights,
+        projection_in_weights=projection_in_weights,
+        gate_in_weights=gate_in_weights,
         projection_out_weights=projection_out_weights,
         gate_out_weights=gate_out_weights,
         layernorm_in_scale=layernorm_in_scale,
@@ -79,7 +80,8 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       self,
       x: Float[Array, "N N C"],
       mask: Bool[Array, "N N"],
-      gate_projection_weights: Float[Array, "C 2 H 2"],
+      projection_in_weights: Float[Array, "C 2 H"],
+      gate_in_weights: Float[Array, "C 2 H"],
       projection_out_weights: Float[Array, "H D"],
       gate_out_weights: Float[Array, "C D"],
       layernorm_in_scale: Float[Array, "C"],
@@ -101,8 +103,8 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     Args:
       x: The input array of shape `[N, N, C]`.
       mask: A boolean mask of shape `[N, N]`.
-      gate_projection_weights: Fused weights for gate and projection layers
-        `[C, 2, H, 2]`.
+      projection_in_weights: Weights for projection layer `[C 2 H]`.
+      gate_in_weights: Weights for gate layer `[C 2 H]`.
       projection_out_weights: Weights for the output projection layer `[H, D]`.
       gate_out_weights: Weights for the output gate layer `[C, D]`.
       layernorm_in_scale: Scale for the input layer normalization `[C]`.
@@ -120,12 +122,8 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       The result of triangle multiplication of shape `[N, N, D]`.
     """
     del config, return_residuals  # Unused.
-    mask = mask[..., None]
 
-    c_dim = x.shape[-1]
-    h_dim = gate_projection_weights.shape[2]
-
-    gate_projection_weights = gate_projection_weights.reshape(c_dim, 2, -1)
+    h_dim = layernorm_out_scale.shape[0]
 
     left_act = norm_base.Normalization()(
         x,
@@ -135,16 +133,25 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         axis=-1,
     )
 
+    gate_weights = jnp.concatenate(
+        [gate_in_weights[:, 0, :], gate_in_weights[:, 1, :]], axis=-1
+    )
+    projection_weights = jnp.concatenate(
+        [projection_in_weights[:, 0, :], projection_in_weights[:, 1, :]],
+        axis=-1,
+    )
     proj_act = glu_base.GatedLinearUnit()(
         left_act,
-        gate_projection_weights,
+        (gate_weights, projection_weights),
         activation=jax.nn.sigmoid,
         precision=precision,
     )
+    proj_act = proj_act.reshape(proj_act.shape[0], proj_act.shape[1], 2, h_dim)
+    proj_act = jnp.transpose(proj_act, (2, 3, 0, 1))  # 2 C N N
     proj_act = mask * proj_act
-
-    proj_act = shape_lib.einshape("ij(dc)->dcij", d=2, c=h_dim)(proj_act)
-    left_proj_act, right_proj_act = proj_act
+    left_proj_act, right_proj_act = jnp.split(proj_act, 2, axis=0)
+    left_proj_act = jnp.squeeze(left_proj_act, axis=0)
+    right_proj_act = jnp.squeeze(right_proj_act, axis=0)
 
     equation = "cik,cjk->ijc" if triangle_type == "outgoing" else "ckj,cki->ijc"
     act = jnp.einsum(

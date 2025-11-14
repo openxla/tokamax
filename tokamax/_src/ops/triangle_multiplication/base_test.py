@@ -25,7 +25,8 @@ def _get_params(n, c, h, d, dtype):
   params = dict(
       x=jax.ShapeDtypeStruct((n, n, c), dtype=dtype),
       mask=jax.ShapeDtypeStruct((n, n), dtype=jnp.bool),
-      gate_projection_weights=jax.ShapeDtypeStruct((c, 2, h, 2), dtype=dtype),
+      projection_in_weights=jax.ShapeDtypeStruct((c, 2, h), dtype=dtype),
+      gate_in_weights=jax.ShapeDtypeStruct((c, 2, h), dtype=dtype),
       projection_out_weights=jax.ShapeDtypeStruct((h, d), dtype=dtype),
       gate_out_weights=jax.ShapeDtypeStruct((c, d), dtype=dtype),
       layernorm_in_scale=jax.ShapeDtypeStruct((c,), dtype=dtype),
@@ -75,7 +76,8 @@ class TriangleMultiplicationTest(parameterized.TestCase):
       y = base.TriangleMultiplication()(
           x=x,
           mask=params['mask'],
-          gate_projection_weights=params['gate_projection_weights'],
+          projection_in_weights=params['projection_in_weights'],
+          gate_in_weights=params['gate_in_weights'],
           projection_out_weights=params['projection_out_weights'],
           gate_out_weights=params['gate_out_weights'],
           layernorm_in_scale=params['layernorm_in_scale'],

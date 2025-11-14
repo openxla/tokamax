@@ -31,7 +31,8 @@ def _get_params(n, c, h, d, dtype):
   params = dict(
       x=jax.ShapeDtypeStruct((n, n, c), dtype=dtype),
       mask=jax.ShapeDtypeStruct((n, n), dtype=jnp.bool),
-      gate_projection_weights=jax.ShapeDtypeStruct((c, 2, h, 2), dtype=dtype),
+      projection_in_weights=jax.ShapeDtypeStruct((c, 2, h), dtype=dtype),
+      gate_in_weights=jax.ShapeDtypeStruct((c, 2, h), dtype=dtype),
       projection_out_weights=jax.ShapeDtypeStruct((h, d), dtype=dtype),
       gate_out_weights=jax.ShapeDtypeStruct((c, d), dtype=dtype),
       layernorm_in_scale=jax.ShapeDtypeStruct((c,), dtype=dtype),
