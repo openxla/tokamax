@@ -95,4 +95,61 @@ ARG_SPECS = (
         name='deepseek-v3',
         tags=('long',),
     ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(327680, 2880), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 2880, 2880), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(  # pytype: disable=wrong-arg-types
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=_generate_group_sizes(
+                    target_m=327680, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss',
+        tags=('long',),
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(393216, 2048), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 2048, 768), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(  # pytype: disable=wrong-arg-types
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=_generate_group_sizes(
+                    target_m=393216, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss',
+        tags=('long',),
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(393216, 768), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 768, 2048), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(  # pytype: disable=wrong-arg-types
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=_generate_group_sizes(
+                    target_m=393216, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss',
+        tags=('long',),
+    ),
 ) + tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())
