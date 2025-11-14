@@ -42,7 +42,7 @@ GroupSizes = base.GroupSizes
 
 # TODO: Natively support mk,ekn->mn.
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
+class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   """Pallas-Mosaic-GPU ragged dot implementation.
 
   The kernel is optimized for physical layout `mk,enk->mn`.
@@ -67,7 +67,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
       precision: base.CanonicalPrecision,
       preferred_element_type: jnp.dtype | None,
       return_residuals: bool,
-      config: common.Config,
+      config: Config,
   ) -> tuple[jax.Array, None]:
     del return_residuals  # Unused.
 
@@ -87,38 +87,22 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
     if isinstance(rhs, QArray) and rhs.zero_point is not None:
       rhs = qwix.dequantize(rhs)
 
-    device_kind = backend.get_default_device().device_kind.lower()
-    is_hopper = "h100" in device_kind or "h200" in device_kind
-    is_blackwell = "b200" in device_kind
-    is_rhs_quantized = isinstance(rhs, QArray)
+    device = backend.get_default_device()
 
-    if is_rhs_quantized:
-      if is_hopper:
-        if config.async_store:
-          fn = quant_ws_async_store_kernel.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
-        elif config.warp_specialized:
-          fn = quant_ws_kernel.ragged_dot_quantized_ws_kernel
-        else:
-          fn = quant_kernel.ragged_dot_quantized_kernel
-      elif is_blackwell:
+    if float(getattr(device, "compute_capability", "9.0")) >= 10.0:
+      if isinstance(rhs, QArray):
         fn = quant_kernel_blackwell.ragged_dot_gpu_quant_blackwell_kernel
       else:
-        raise NotImplementedError(
-            "Quantized kernel is not supported on this"
-            f" platform({device_kind})."
-        )
-    else:
-      if is_hopper:
-        fn = non_quant_kernel.ragged_dot_non_quantized_kernel
-      elif is_blackwell:
-        fn = (
-            non_quant_kernel_blackwell.ragged_dot_gpu_non_quant_blackwell_kernel
-        )
+        fn = non_quant_kernel_blackwell.ragged_dot_gpu_non_quant_blackwell_kernel  # pylint: disable=line-too-long
+    elif isinstance(rhs, QArray):
+      if config.async_store:
+        fn = quant_ws_async_store_kernel.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
+      elif config.warp_specialized:
+        fn = quant_ws_kernel.ragged_dot_quantized_ws_kernel
       else:
-        raise NotImplementedError(
-            "Non-quantized kernel is not supported on this"
-            f" platform({device_kind})."
-        )
+        fn = quant_kernel.ragged_dot_quantized_kernel
+    else:
+      fn = non_quant_kernel.ragged_dot_non_quantized_kernel
 
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.array(group_sizes)
@@ -126,23 +110,16 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
     if preferred_element_type is None:
       preferred_element_type = jnp.promote_types(lhs.dtype, rhs.dtype)
 
-    out = fn(
-        lhs,
-        rhs,
-        group_sizes,
-        preferred_element_type,
-        config,
-    )
-    return out, None
+    return fn(lhs, rhs, group_sizes, preferred_element_type, config), None
 
   @override
-  def _get_heuristics_config(self, ba: op.BoundArguments) -> common.Config:
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     _, rhs = ba.args
-    quantized = isinstance(rhs, quantization.QuantizedArray)
-    device_kind = backend.get_default_device().device_kind.lower()
-    if "b200" in device_kind:
-      if quantized:
-        return common.Config(
+
+    device = backend.get_default_device()
+    if float(getattr(device, "compute_capability", "9.0")) >= 10.0:
+      if isinstance(rhs, QArray):
+        return Config(
             block_m=128,
             block_n=128,
             block_k=256,
@@ -151,7 +128,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
             grid_block_n=1,
         )
       else:
-        return common.Config(
+        return Config(
             block_m=64,
             block_n=128,
             block_k=256,
@@ -164,7 +141,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
             grid_minor_dim=common.MatmulDimension.M,
             grid_tile_width=4,
         )
-    return common.Config(
+    return Config(
         block_m=64,
         block_n=64,
         block_k=rhs.scale_tile_shape[1] if isinstance(rhs, QArray) else 128,
@@ -174,10 +151,13 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
     )
 
   @override
-  def _get_autotuning_configs(
-      self, ba: op.BoundArguments
-  ) -> set[common.Config]:
-    configs = set()
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    device = backend.get_default_device()
+    if float(getattr(device, "compute_capability", "9.0")) >= 10.0:
+      return self._get_sm100_autotuning_configs(ba)
+    return self._get_sm90_autotuning_configs(ba)
+
+  def _get_sm90_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     # Adjusted block_k for float16/bfloat16
     lhs, rhs = ba.args[:2]
     warp_specialized = [True]
@@ -195,112 +175,109 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[common.Config, None]):
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
 
-    device_kind = backend.get_default_device().device_kind.lower()
-    if "h100" in device_kind:
-      # For prefill
-      for persistent in [True, False]:
-        for async_store in [True, False]:
-          for ws in warp_specialized:
-            for block_k in [128, 256]:
-              if (block_k * rhs_dtype_bits) % (128 * 8) or (
-                  block_k * lhs_dtype_bits
-              ) % (128 * 8):
-                continue
-              for block_m in [128, 64]:
-                for num_stages in [4, 2, 1]:
-                  for grid_minor_dim in [
-                      common.MatmulDimension.M,
-                      common.MatmulDimension.N,
-                  ]:
-                    for grid_tile_width in [1, 2, 4, 8]:
-                      configs.add(
-                          common.Config(
-                              block_m=block_m,
-                              block_n=out_swizzle_elems,
-                              block_k=block_k,
-                              num_stages=num_stages,
-                              split_k=1,
-                              async_store=async_store,
-                              warp_specialized=ws,
-                              persistent=persistent,
-                              grid_block_n=grid_tile_width,
-                              grid_minor_dim=grid_minor_dim,
-                              grid_tile_width=grid_tile_width,
-                          )
-                      )
-      # For generate
-      for persistent in [True, False]:
-        for async_store in [True, False]:
-          for ws in warp_specialized:
-            for block_k in [128, 256]:
-              if (block_k * rhs_dtype_bits) % (128 * 8) or (
-                  block_k * lhs_dtype_bits
-              ) % (128 * 8):
-                continue
-              for block_m in [64, 32, 24, 16]:
-                for num_stages in [4]:
-                  for grid_minor_dim in [
-                      common.MatmulDimension.M,
-                      common.MatmulDimension.N,
-                  ]:
-                    for grid_tile_width in [1, 2, 4, 8]:
-                      configs.add(
-                          common.Config(
-                              block_m=block_m,
-                              block_n=out_swizzle_elems,
-                              block_k=block_k,
-                              num_stages=num_stages,
-                              split_k=1,
-                              async_store=async_store,
-                              warp_specialized=ws,
-                              persistent=persistent,
-                              grid_block_n=grid_tile_width,
-                              grid_minor_dim=grid_minor_dim,
-                              grid_tile_width=grid_tile_width,
-                          )
-                      )
-    elif "b200" in device_kind:
-      # Configs for prefill
-      block_m = 128
-      block_n = 128
-      for block_k in [128, 256]:
-        for num_stages in [2, 3]:
-          configs.add(
-              common.Config(
-                  block_m=block_m,
-                  block_n=block_n,
-                  block_k=block_k,
-                  num_stages=num_stages,
-                  split_k=1,
-                  grid_block_n=1,
-                  warp_specialized=True,
-                  persistent=False,
-                  collective=True,
-              )
-          )
+    configs = set()
+    # For prefill
+    for persistent in [True, False]:
+      for async_store in [True, False]:
+        for ws in warp_specialized:
+          for block_k in [128, 256]:
+            if (block_k * rhs_dtype_bits) % (128 * 8) or (
+                block_k * lhs_dtype_bits
+            ) % (128 * 8):
+              continue
+            for block_m in [128, 64]:
+              for num_stages in [4, 2, 1]:
+                for grid_minor_dim in [
+                    common.MatmulDimension.M,
+                    common.MatmulDimension.N,
+                ]:
+                  for grid_tile_width in [1, 2, 4, 8]:
+                    configs.add(
+                        Config(
+                            block_m=block_m,
+                            block_n=out_swizzle_elems,
+                            block_k=block_k,
+                            num_stages=num_stages,
+                            split_k=1,
+                            async_store=async_store,
+                            warp_specialized=ws,
+                            persistent=persistent,
+                            grid_block_n=grid_tile_width,
+                            grid_minor_dim=grid_minor_dim,
+                            grid_tile_width=grid_tile_width,
+                        )
+                    )
+    # For generate
+    for persistent in [True, False]:
+      for async_store in [True, False]:
+        for ws in warp_specialized:
+          for block_k in [128, 256]:
+            if (block_k * rhs_dtype_bits) % (128 * 8) or (
+                block_k * lhs_dtype_bits
+            ) % (128 * 8):
+              continue
+            for block_m in [64, 32, 24, 16]:
+              for num_stages in [4]:
+                for grid_minor_dim in [
+                    common.MatmulDimension.M,
+                    common.MatmulDimension.N,
+                ]:
+                  for grid_tile_width in [1, 2, 4, 8]:
+                    configs.add(
+                        Config(
+                            block_m=block_m,
+                            block_n=out_swizzle_elems,
+                            block_k=block_k,
+                            num_stages=num_stages,
+                            split_k=1,
+                            async_store=async_store,
+                            warp_specialized=ws,
+                            persistent=persistent,
+                            grid_block_n=grid_tile_width,
+                            grid_minor_dim=grid_minor_dim,
+                            grid_tile_width=grid_tile_width,
+                        )
+                    )
+    return configs
 
-      # Config for generate
-      for block_m in [8, 16, 32]:
-        for num_stages in [2, 3]:
-          for grid_block_n in [1, 4, 8]:
-            for persistent in [False, True]:
-              configs.add(
-                  common.Config(
-                      block_m=block_m,
-                      block_n=128,
-                      block_k=256,
-                      num_stages=num_stages,
-                      split_k=1,
-                      grid_block_n=grid_block_n,
-                      warp_specialized=True,
-                      persistent=persistent,
-                      collective=False,
-                  )
-              )
-    else:
-      raise ValueError(
-          f"Autotuning not supported for device kind: {device_kind}"
-      )
+  def _get_sm100_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    del ba  # Unused.
+    configs = set()
+    # Configs for prefill
+    for block_k in [128, 256]:
+      for num_stages in [2, 3]:
+        configs.add(
+            Config(
+                block_m=128,
+                block_n=128,
+                block_k=block_k,
+                num_stages=num_stages,
+                split_k=1,
+                grid_block_n=1,
+                warp_specialized=True,
+                persistent=False,
+                collective=True,
+            )
+        )
+
+    # Config for generate
+    for block_m in [8, 16, 32]:
+      for num_stages in [2, 3]:
+        for grid_block_n in [1, 4, 8]:
+          for persistent in [False, True]:
+            configs.add(
+                Config(
+                    block_m=block_m,
+                    block_n=128,
+                    block_k=256,
+                    num_stages=num_stages,
+                    split_k=1,
+                    grid_block_n=grid_block_n,
+                    warp_specialized=True,
+                    persistent=persistent,
+                    collective=False,
+                )
+            )
     return configs
 
   @override
