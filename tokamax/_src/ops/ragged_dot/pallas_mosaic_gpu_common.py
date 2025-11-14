@@ -23,6 +23,7 @@ import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend import backend
 import jax.numpy as jnp
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import memref
@@ -37,6 +38,7 @@ class MatmulDimension(enum.IntEnum):
 @pydantic.dataclasses.dataclass(frozen=True, slots=True)
 class Config:
   """Configuration for the ragged dot kernel."""
+
   block_m: pydantic.conint(multiple_of=8, gt=0)
   block_n: pydantic.PositiveInt
   block_k: pydantic.PositiveInt
@@ -59,7 +61,7 @@ class GroupInfo:
   """Information regarding the group being processed in a block."""
 
   group_id: jax.Array
-  block: jax.Array  | None
+  block: jax.Array | None
   block_start: jax.Array
   actual_start: jax.Array
   actual_end: jax.Array
@@ -94,7 +96,7 @@ class GroupInfo:
       block_end = final_block + 1
       tid_begin = start_block + cuts
       tid_end = block_end + cuts
-      cuts += (end % tile != 0)
+      cuts += end % tile != 0
       # How many blocks after is our block?
       this_is_group = (tid_begin <= tid) & (tid < tid_end)
       block = lax.select(this_is_group, tid - tid_begin + start_block, block)
@@ -236,7 +238,7 @@ def calculate_group_info_tasks(
   actual_size = jnp.maximum(0, actual_m_end - actual_m_start)
   non_empty_mask = actual_size > 0
   if noops_at_end:
-    noop_group_pos = 1024*1024
+    noop_group_pos = 1024 * 1024
     idx = jnp.argsort(noop_group_pos * (1 - (actual_size > 0)) + group_idx)
     return (
         group_idx[idx],
@@ -403,15 +405,14 @@ def ragged_kernel(
       )
     else:
       loop_info = plgpu.NDLoopInfo(
-          index=tuple(map(lax.axis_index, ("remainder_n", "m", "block_n",))),
+          index=tuple(map(lax.axis_index, ("remainder_n", "m", "block_n"))),
           local_index=0,
           num_local_steps=1,
       )
       loop_body(0, loop_info)
 
   if config.persistent:
-    # TODO: Detect this number from device.
-    grid = (132,)
+    grid = (backend.get_default_device().core_count,)
     grid_names = ("sm",)
   else:
     grid = inner_grid
