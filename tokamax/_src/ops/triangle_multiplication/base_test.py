@@ -59,6 +59,38 @@ class TriangleMultiplicationTest(parameterized.TestCase):
     self.assertEqual(out.shape, (n, n, d))
     self.assertEqual(out.dtype, dtype)
 
+  @parameterized.product(
+      triangle_type=['incoming', 'outgoing'],
+      dtype=[jnp.bfloat16],
+      precision=[jax.lax.Precision.HIGH],
+  )
+  def test_triangle_multiplication_grad(
+      self, triangle_type, dtype, precision
+  ):
+    n = 8
+    d = 64
+    params = _get_params(n=n, c=16, h=32, d=d, dtype=dtype)
+
+    def f(x):
+      y = base.TriangleMultiplication()(
+          x=x,
+          mask=params['mask'],
+          gate_projection_weights=params['gate_projection_weights'],
+          projection_out_weights=params['projection_out_weights'],
+          gate_out_weights=params['gate_out_weights'],
+          layernorm_in_scale=params['layernorm_in_scale'],
+          layernorm_in_offset=params['layernorm_in_offset'],
+          layernorm_out_scale=params['layernorm_out_scale'],
+          layernorm_out_offset=params['layernorm_out_offset'],
+          triangle_type=triangle_type,
+          precision=precision,
+      )
+      return jnp.sum(y)
+
+    grad_fn = jax.grad(f)
+    grads = grad_fn(params['x'])
+    self.assertFalse(jnp.isnan(grads).any())
+
 
 if __name__ == '__main__':
   absltest.main()

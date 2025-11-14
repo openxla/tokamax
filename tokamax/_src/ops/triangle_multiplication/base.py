@@ -57,8 +57,6 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Binds the arguments for the triangle multiplication function."""
-    if return_residuals:
-      raise NotImplementedError("`return_residuals=True` is not supported.")
     return super().bind(
         x=x,
         mask=mask,
