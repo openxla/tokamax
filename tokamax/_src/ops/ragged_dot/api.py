@@ -114,9 +114,7 @@ def ragged_dot_general(
     lhs: jax.Array | QuantizedArray,
     rhs: jax.Array | QuantizedArray,
     group_sizes: Int[Array, "G"] | base.GroupSizes,
-    ragged_dot_dimension_numbers: (
-        jax.lax.RaggedDotDimensionNumbers | None
-    ) = None,
+    ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
     precision: jax.lax.PrecisionLike = None,
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
@@ -163,6 +161,17 @@ def ragged_dot_general(
     implementation = (implementation,)
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
+
+  # check that reduction dimensions sizes match
+  reduction_dims = ragged_dot_dimension_numbers.dot_dimension_numbers[0]
+  for dim1, dim2 in zip(*reduction_dims, strict=True):
+    if lhs.shape[dim1] != rhs.shape[dim2]:
+      raise ValueError(
+          f"The reduction dimension {dim1} of lhs={jax.typeof(lhs)} equal to"
+          f" {lhs.shape[dim1]} does not match the reduction dimension {dim2} of"
+          f" rhs={jax.typeof(rhs)} equal to {rhs.shape[dim2]} for"
+          f" ragged_dot_dimension_numbers={ragged_dot_dimension_numbers}."
+      )
 
   errors = []
   for impl in implementation:
