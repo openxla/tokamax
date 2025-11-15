@@ -535,11 +535,9 @@ def flash_attention_kernel(
   if attn_logits_soft_cap is not None and config.use_base2_exp:
     attn_logits_soft_cap *= LOG2E
 
-  head_dim_v_repeats, rem = divmod(head_dim_v, NUM_LANES)
-  if rem != 0:
-    raise NotImplementedError(
-        f"{head_dim_v=} should be a multiple of {NUM_LANES}"
-    )
+  # If the head_dim_v is not a multiple of the number of lanes, it will be
+  # padded to that multiple with zeros.
+  head_dim_v_repeats = pl.cdiv(head_dim_v, NUM_LANES)
 
   grid_idx = pl.program_id(1)
   h = pl.program_id(0)
@@ -664,6 +662,7 @@ def flash_attention_kernel(
 
     if max_logit_estimate is None:
       alpha_o = pltpu.repeat(alpha, head_dim_v_repeats, axis=1)
+      alpha_o = alpha_o[..., :o_scratch_ref.shape[-1]]
       o_scratch_ref[...] = alpha_o * o_scratch_ref[...] + o_curr
     else:
       o_scratch_ref[...] = o_scratch_ref[...] + o_curr
@@ -687,6 +686,7 @@ def flash_attention_kernel(
     l = l_scratch_ref[...]
     if fuse_reciprocal:  # allows fusing reciprocal out of the kernel
       l_inv = pltpu.repeat(1.0 / l, head_dim_v_repeats, axis=1)
+      l_inv = l_inv[..., :o_scratch_ref.shape[-1]]
       o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
     else:
       o_ref[...] = o_scratch_ref[...].astype(o_ref.dtype)
