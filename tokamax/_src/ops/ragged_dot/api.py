@@ -21,9 +21,12 @@ import immutabledict
 import jax
 from jax.extend import backend
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import qwix
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 
+
+QArray = qwix.QArray
 QuantizedArray = quantization.QuantizedArray
 Implementation: TypeAlias = Literal["mosaic", "triton", "xla"]
 
@@ -62,8 +65,8 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
 
 
 def ragged_dot(
-    lhs: Float[Array | QuantizedArray, "M K"],
-    rhs: Float[Array | QuantizedArray, "G K N"],
+    lhs: Float[Array | QuantizedArray | QArray, "M K"],
+    rhs: Float[Array | QuantizedArray | QArray, "G K N"],
     group_sizes: Int[Array, "G"] | base.GroupSizes,
     precision: jax.lax.PrecisionLike = None,
     preferred_element_type: jax.typing.DTypeLike | None = None,
@@ -111,8 +114,8 @@ def ragged_dot(
 
 
 def ragged_dot_general(
-    lhs: jax.Array | QuantizedArray,
-    rhs: jax.Array | QuantizedArray,
+    lhs: jax.Array | QuantizedArray | QArray,
+    rhs: jax.Array | QuantizedArray | QArray,
     group_sizes: Int[Array, "G"] | base.GroupSizes,
     ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
     precision: jax.lax.PrecisionLike = None,
