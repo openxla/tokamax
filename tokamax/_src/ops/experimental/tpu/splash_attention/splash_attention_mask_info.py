@@ -185,6 +185,9 @@ def _get_mask_info(
     q_seq_start: int,
     q_seq_shard_size: int,
     blocked_q_seq_start: int,
+    kv_seq_start: int,
+    kv_seq_shard_size: int,
+    blocked_kv_seq_start: int,
     is_dkv: bool,
     return_dynamic_grid: bool,
 ):
@@ -202,9 +205,16 @@ def _get_mask_info(
       shard.
     blocked_q_seq_start: Start index along the Q sequence for the current shard
       (in number of grid blocks)
+    kv_seq_start: Start index along the KV sequence for the current shard (in
+      number of tokens).
+    kv_seq_shard_size: Number of tokens along the KV sequence for the current
+      shard.
+    blocked_kv_seq_start: Start index along the KV sequence for the current
+      shard (in number of grid blocks)
     is_dkv: True if we are processing the dKV mask
     return_dynamic_grid: If True, the grid is dynamic and the function returns
       only the active blocks. Otherwise, the kernel grid covers the entire mask.
+
   Returns:
     Slice of mask_next (if required) that correspond to the current mask slice.
   """
@@ -229,12 +239,19 @@ def _get_mask_info(
             q_seq_start + q_idx * q_block_size,
             q_seq_start + (q_idx + 1) * q_block_size,
         ),
-        slice(kv_idx * kv_block_size, (kv_idx + 1) * kv_block_size),
+        slice(
+            kv_seq_start + kv_idx * kv_block_size,
+            kv_seq_start + (kv_idx + 1) * kv_block_size,
+        ),
     )]
     if chunk.any():
       if not chunk.all():
         block_mask[idx] = 1
-        coord_global = (q_idx + blocked_q_seq_start, kv_idx)
+        # block coord globally in q and kv sequence
+        coord_global = (
+            q_idx + blocked_q_seq_start,
+            kv_idx + blocked_kv_seq_start,
+        )
         partial_blocks[idx] = coords_to_partial_mask_block_index[coord_global]
       else:
         block_mask[idx] = 2
@@ -399,6 +416,7 @@ def _process_mask(
     downcast_smem_data: bool = True,
     partial_mask_blocks_dtype: jnp.DTypeLike = np.int8,
     q_seq_shards: int = 1,
+    kv_seq_shards: int = 1,
     return_dynamic_grid: bool = True,
 ) -> tuple[MaskInfo, MaskCallable | None]:
   """Transform a dense mask into a sparse representation.
@@ -444,6 +462,14 @@ def _process_mask(
   q_blocks_per_shard, mod = divmod(q_seq_len_per_shard, q_block_size)
   if mod != 0:
     raise ValueError(f'{q_block_size=} should divide {q_seq_len_per_shard=}.')
+
+  kv_seq_len_per_shard, mod = divmod(kv_seq_len, kv_seq_shards)
+  if mod != 0:
+    raise ValueError(f'{kv_seq_shards=} should divide {kv_seq_len=}.')
+
+  kv_blocks_per_shard, mod = divmod(kv_seq_len_per_shard, kv_block_size)
+  if mod != 0:
+    raise ValueError(f'{kv_block_size=} should divide {kv_seq_len_per_shard=}.')
 
   # TODO: checking the validity of the masks is slow for large masks.
   # Disable it for now, reevaluate in the future.
@@ -503,26 +529,40 @@ def _process_mask(
     # current slice of the mask.
 
     q_seq_len_shard_size = q_blocks_per_shard * q_block_size
+    kv_seq_len_shard_size = kv_blocks_per_shard * kv_block_size
 
-    (
-        active_rows_slices,
-        active_cols_slices,
-        mask_next_slices,
-        block_mask_slices,
-        num_active_blocks,
-    ) = zip(*[
-        _get_mask_info(
+    active_rows_slices = []
+    active_cols_slices = []
+    mask_next_slices = []
+    block_mask_slices = []
+    num_active_blocks = []
+
+    for q_shard_idx in range(q_seq_shards):
+      for kv_shard_idx in range(kv_seq_shards):
+        (  # pytype: disable=bad-unpacking
+            active_rows_slice,
+            active_cols_slice,
+            mask_next_slice,
+            block_mask_slice,
+            num_active_block,
+        ) = _get_mask_info(
             mask=mask,
             block_shape=block_shape,
             coords_to_partial_mask_block_index=coords_to_partial_mask_block_index,
-            q_seq_start=shard_idx * q_seq_len_shard_size,
+            q_seq_start=q_shard_idx * q_seq_len_shard_size,
             q_seq_shard_size=q_seq_len_shard_size,
-            blocked_q_seq_start=shard_idx * q_blocks_per_shard,
+            blocked_q_seq_start=q_shard_idx * q_blocks_per_shard,
+            kv_seq_start=kv_shard_idx * kv_seq_len_shard_size,
+            kv_seq_shard_size=kv_seq_len_shard_size,
+            blocked_kv_seq_start=kv_shard_idx * kv_blocks_per_shard,
             is_dkv=is_dkv,
             return_dynamic_grid=return_dynamic_grid,
         )
-        for shard_idx in range(q_seq_shards)
-    ])
+        active_rows_slices.append(active_rows_slice)
+        active_cols_slices.append(active_cols_slice)
+        mask_next_slices.append(mask_next_slice)
+        block_mask_slices.append(block_mask_slice)
+        num_active_blocks.append(num_active_block)
 
     if return_dynamic_grid:
       # Pad each slice to the largest number of active blocks in any shard.
