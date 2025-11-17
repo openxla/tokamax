@@ -403,60 +403,85 @@ def gmm(
       preferred_element_type=preferred_element_type,
   )
 
-  def kernel(group_metadata, _, lhs_ref, rhs_ref, out_ref, acc_scratch):
-    grid_id = pl.program_id(1)
-    k_i = pl.program_id(2)
+  def _maybe_get_subslice(x, idx: int, subslice_count: int | None, axis: int):
+    """Returns a subslice of the given array along the given axis."""
+    if subslice_count == 1:  # we're not quantized or full-channel
+      return jax.tree.map(lambda x: x[...], x)
+    assert axis in (0, 1)
+
+    def getter(x):
+      size = x.shape[axis] // subslice_count
+      s, e = idx * size, (idx + 1) * size
+      return x[s:e, :] if axis == 0 else x[:, s:e]
+
+    return jax.tree.map(getter, x)
+
+  def kernel(group_metadata, _, lhs_ref, rhs_ref, out_ref, acc_scratch,
+             *, subchannel_iters: int):
+    grid_id, k_i = pl.program_id(1), pl.program_id(2)
 
     @pl.when(k_i == 0)
     def _zero_acc():
       acc_scratch[...] = jnp.zeros_like(acc_scratch)
 
     def accum(is_last_k_tile):
-      with jax.named_scope(f"accum-last_k_tile={is_last_k_tile}"):
-        lhs = jax.tree.map(lambda x: x[...], lhs_ref)
-        rhs = jax.tree.map(lambda x: x[...], rhs_ref)
+      with jax.named_scope(f"accum:{is_last_k_tile=}"):
+        scales_per_k_tile = subchannel_iters
+        sc_tile = tk // scales_per_k_tile
 
-        # optional dynamic quantization within the kernel
-        if lhs_qdtype is not None and not isinstance(lhs, QArray):
-          lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
-        if rhs_qdtype is not None and not isinstance(rhs, QArray):
-          rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
-
-        # unpack quantized arrays for dot operation
-        scales = []
-        if isinstance(lhs, QArray):
-          scales.append((lhs.scale, 1))
-          lhs = lhs.qvalue
-        if isinstance(rhs, QArray):
-          scales.append((rhs.scale.T if transpose_rhs else rhs.scale, 0))
-          rhs = rhs.qvalue
-
-        # mask values if the current tile extends beyond reduction axis size
-        if is_last_k_tile and (k_rem := k % tk) != 0:
-          iota = lambda x, d: lax.broadcasted_iota(jnp.int32, x.shape, d)
-          lhs = jnp.where(iota(lhs, 1) < k_rem, lhs, 0)
-          rhs = jnp.where(iota(rhs, 1 if transpose_rhs else 0) < k_rem, rhs, 0)
-
-        # perform the dot operation
-        is_int = lambda x: jnp.issubdtype(x.dtype, jnp.integer)
-        acc_dtype = jnp.int32 if is_int(lhs) and is_int(rhs) else jnp.float32
-        out = dot(lhs, rhs, acc_dtype)
-
-        # apply scales to the output if the inputs were quantized
-        for scale, axis in scales:
-          # broadcast on all axes in case non-reduction dims are quantized
-          del axis
-          out = _scale_out_by_scale(out, scale, None)
-
-        # accumulate and possibly store the output
-        acc_scratch[...] += out.astype(acc_scratch.dtype)
+        # compute the actual number of iterations for the last tile
+        iterations = scales_per_k_tile
         if is_last_k_tile:
-          mask = _get_store_mask(
-              grid_id=grid_id, group_metadata=group_metadata, tm=tm, tn=tn
+          iterations = pl.cdiv(k - tk * (tiles_k - 1), sc_tile)
+
+        for it in range(iterations):
+          # read the value of the input buffers
+          lhs = _maybe_get_subslice(lhs_ref, it, scales_per_k_tile, 1)
+          rhs_axis = 1 if transpose_rhs else 0
+          rhs = _maybe_get_subslice(rhs_ref, it, scales_per_k_tile, rhs_axis)
+
+          # optional dynamic quantization within the kernel
+          if lhs_qdtype is not None and not isinstance(lhs, QArray):
+            lhs = _quantize_as(lhs, lhs_qdtype, 1, lhs_static_scale)
+          if rhs_qdtype is not None and not isinstance(rhs, QArray):
+            rhs = _quantize_as(rhs, rhs_qdtype, rhs_axis, rhs_static_scale)
+
+          # unpack quantized arrays for dot operation
+          scales = []
+          if isinstance(lhs, QArray):
+            scales.append(lhs.scale)
+            lhs = lhs.qvalue
+          if isinstance(rhs, QArray):
+            scales.append(rhs.scale.T if transpose_rhs else rhs.scale)
+            rhs = rhs.qvalue
+
+          # mask values if the current tile extends beyond reduction axis size
+          is_last_subtile = (
+              is_last_k_tile and (tiles_k - 1) * tk + (it + 1) * sc_tile >= k
           )
-          acc = acc_scratch[...]
-          acc = jax.lax.select(mask, acc, out_ref[...].astype(acc.dtype))
-          out_ref[...] = acc.astype(out_dtype)
+          if is_last_subtile and (k_rem := ((k % tk) % sc_tile)) != 0:
+            iota = lambda x, d: lax.broadcasted_iota(jnp.int32, x.shape, d)
+            lhs = jnp.where(iota(lhs, 1) < k_rem, lhs, 0)
+            rhs = jnp.where(iota(rhs, rhs_axis) < k_rem, rhs, 0)
+
+          # perform the dot operation
+          is_int = lambda x: jnp.issubdtype(x.dtype, jnp.integer)
+          acc_dtype = jnp.int32 if is_int(lhs) and is_int(rhs) else jnp.float32
+          out = dot(lhs, rhs, acc_dtype)
+
+          # apply scales to the output if the inputs were quantized
+          for scale in scales:
+            out = _scale_out_by_scale(out, scale)
+
+          # accumulate and possibly store the output
+          acc_scratch[...] += out.astype(acc_scratch.dtype)
+          if is_last_subtile:
+            mask = _get_store_mask(
+                grid_id=grid_id, group_metadata=group_metadata, tm=tm, tn=tn
+            )
+            acc = acc_scratch[...]
+            acc = jax.lax.select(mask, acc, out_ref[...].astype(acc.dtype))
+            out_ref[...] = acc.astype(out_dtype)
 
     lax.cond(k_i == tiles_k - 1, lambda: accum(True), lambda: accum(False))
 
@@ -491,11 +516,16 @@ def gmm(
     rhs_block_spec = pl.BlockSpec((None, tk, tn), rhs_index_map)
   out_block_spec = pl.BlockSpec((tm, tn), out_index_map)
 
+  subchannel_iters = 1
   if isinstance(lhs, QArray):
+    lhs_eps = pl.cdiv(lhs.qvalue.shape[1], lhs.scale.shape[1])
+    subchannel_iters = max(subchannel_iters, tk // lhs_eps)
     lhs, lhs_block_spec = common.quant_block_spec(lhs, lhs_block_spec, 1)
   if isinstance(rhs, QArray):
-    rhs_axis = 2 if transpose_rhs else 1
-    rhs, rhs_block_spec = common.quant_block_spec(rhs, rhs_block_spec, rhs_axis)
+    axis = 2 if transpose_rhs else 1
+    rhs_eps = pl.cdiv(rhs.qvalue.shape[axis], rhs.scale.shape[axis])
+    subchannel_iters = max(subchannel_iters, tk // rhs_eps)
+    rhs, rhs_block_spec = common.quant_block_spec(rhs, rhs_block_spec, axis)
 
   lhs_bytes = jax.tree.reduce(lambda acc, x: acc + x.size * x.itemsize, lhs, 0)
   if isinstance(rhs, QArray):
@@ -518,7 +548,7 @@ def gmm(
       input_buffer_count=input_buffer_count,
   )
   call_gmm = common.custom_buffered_pallas_call(
-      kernel,
+      functools.partial(kernel, subchannel_iters=subchannel_iters),
       out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
@@ -655,7 +685,12 @@ def tgmm(
       x, y, precision=precision, preferred_element_type=preferred_element_type
   )
 
-  def kernel(group_metadata, _, lhs_ref, rhs_ref, out_ref, acc_scratch):
+  def kernel(group_metadata, _, lhs_ref, rhs_ref, out_ref, acc_scratch,
+             *, subchannel_iters: int):
+    if subchannel_iters != 1:
+      raise NotImplementedError(
+          "subchannel_iters != 1 not supported yet in tgmm."
+      )
     grid_id = pl.program_id(2)
     group_offsets, group_ids, _ = group_metadata
     group = group_ids[grid_id]
@@ -682,10 +717,10 @@ def tgmm(
       # unpack quantized arrays for dot operation
       scales = []
       if isinstance(lhs, QArray):
-        scales.append((lhs.scale.T, 1))
+        scales.append(lhs.scale.T)
         lhs = lhs.qvalue
       if isinstance(rhs, QArray):
-        scales.append((rhs.scale, 0))
+        scales.append(rhs.scale)
         rhs = rhs.qvalue
 
       kwargs = dict(grid_id=grid_id, group_metadata=group_metadata, tm=tm)
@@ -697,10 +732,8 @@ def tgmm(
       out = dot(lhs.T, rhs, acc_dtype)
 
       # apply scales to the output if the inputs were quantized
-      for scale, axis in scales:
-        # broadcast on all axes in case non-reduction dims are quantized
-        del axis
-        out = _scale_out_by_scale(out, scale, None)
+      for scale in scales:
+        out = _scale_out_by_scale(out, scale)
 
       acc_scratch[...] += out.astype(acc_scratch.dtype)
 
@@ -736,9 +769,14 @@ def tgmm(
   rhs_block_spec = pl.BlockSpec((tm, tn), rhs_index_map)
   out_block_spec = pl.BlockSpec((None, tk, tn), out_index_map)
 
+  subchannel_iters = 1
   if isinstance(lhs, QArray):
+    lhs_eps = pl.cdiv(lhs.qvalue.shape[0], lhs.scale.shape[0])
+    subchannel_iters = max(subchannel_iters, tk // lhs_eps)
     lhs, lhs_block_spec = common.quant_block_spec(lhs, lhs_block_spec, 0)
   if isinstance(rhs, QArray):
+    rhs_eps = pl.cdiv(rhs.qvalue.shape[0], rhs.scale.shape[0])
+    subchannel_iters = max(subchannel_iters, tk // rhs_eps)
     rhs, rhs_block_spec = common.quant_block_spec(rhs, rhs_block_spec, 0)
 
   lhs_bytes = jax.tree.reduce(lambda acc, x: acc + x.size * x.itemsize, lhs, 0)
@@ -757,7 +795,7 @@ def tgmm(
       input_buffer_count=input_buffer_count,
   )
   call_gmm = common.custom_buffered_pallas_call(
-      kernel,
+      functools.partial(kernel, subchannel_iters=subchannel_iters),
       out_shape=jax.ShapeDtypeStruct((num_actual_groups, k, n), out_dtype),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,

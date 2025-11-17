@@ -17,6 +17,7 @@
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu as common
 from tokamax._src import quantization
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
@@ -27,16 +28,18 @@ from typing_extensions import override
 QuantizedArray = quantization.QuantizedArray
 
 
-def _is_scale_tiling_along_reduction(
-    x: QuantizedArray, axis: int, min_tiling: int
-) -> bool:
-  all_equal = all(
-      s1 == s2
-      for i, (s1, s2) in enumerate(zip(x.values.shape, x.scales.shape))
-      if i != (axis % x.ndim)
-  )
-  scale_tiling = x.values.shape[axis] // x.scales.shape[axis]
-  return all_equal and scale_tiling >= min_tiling
+def _is_scale_tiling_supported(x: QuantizedArray, axis: int) -> bool:
+  min_addressable_sizes = (
+      [1] * x.ndim + [common._sublane_size(), common.LANES]
+  )[-x.ndim:]
+  cdiv = lambda x, y: (x + y - 1) // y
+  eps_list = [cdiv(x, y) for x, y in zip(x.values.shape, x.scales.shape)]
+  for ax, (mas, eps) in enumerate(zip(min_addressable_sizes, eps_list)):
+    if eps != 1 and eps % mas != 0:
+      return False
+    if ax != axis and not (eps == 1 or eps == x.values.shape[ax]):
+      return False
+  return True
 
 
 def _is_config_supported(
@@ -51,13 +54,9 @@ def _is_config_supported(
       or n < config.gmm_tiling[2]
   ):
     return False
-  if isinstance(lhs, QuantizedArray) and not _is_scale_tiling_along_reduction(
-      lhs, 1, config.gmm_tiling[1]
-  ):
+  if isinstance(lhs, QuantizedArray) and not _is_scale_tiling_supported(lhs, 1):
     return False
-  if isinstance(rhs, QuantizedArray) and not _is_scale_tiling_along_reduction(
-      rhs, 1, config.gmm_tiling[1]
-  ):
+  if isinstance(rhs, QuantizedArray) and not _is_scale_tiling_supported(rhs, 1):
     return False
   return True
 

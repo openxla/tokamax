@@ -89,76 +89,111 @@ def default_quant_dot_dtype() -> jnp.dtype:
     return jnp.int8
 
 
+@jax.tree_util.register_static
+@dataclasses.dataclass
+class ScalesTilingInfo:
+  true_scales_per_tile: int
+  scales_tile_size: int | None
+  ti_to_sti: Callable[[int], int]  # tile index to scale tile index
+
+  @property
+  def scales_inflation(self):
+    return (self.scales_tile_size or 1) // self.true_scales_per_tile
+
+
+def _get_scale_tile_info(
+    eps: int, tile_size: int | None, min_addressable_size: int
+) -> ScalesTilingInfo:
+  if tile_size is None:
+    if min_addressable_size != 1:
+      raise ValueError("We can only collapse a dimension when it is"
+                       " individually addressable. Pallas Mosaic TPU has the"
+                       " same restriction.")
+    return ScalesTilingInfo(
+        true_scales_per_tile=1,
+        scales_tile_size=None,
+        ti_to_sti=lambda tile_idx: tile_idx // eps,
+    )
+
+  assert eps % tile_size == 0 or tile_size % eps == 0
+  scales_per_tile = max(1, tile_size // eps)
+  if eps > tile_size:
+    tile_idx_to_scales_tile_idx = lambda tile_idx: tile_idx * tile_size // eps
+    scales_tile_size = 1
+  else:  # eps <= tile_size
+    tile_idx_to_scales_tile_idx = lambda tile_idx: tile_idx
+    scales_tile_size = tile_size // eps
+
+  if eps == 1:
+    assert scales_per_tile % min_addressable_size == 0
+    scales_tile_size = scales_per_tile
+  else:
+    scales_tile_size = scales_tile_size * min_addressable_size
+
+  return ScalesTilingInfo(
+      scales_per_tile, scales_tile_size, tile_idx_to_scales_tile_idx
+  )
+
+
 def quant_block_spec(
     x: QArray, x_spec: pl.BlockSpec, reduction_axis: int
 ) -> tuple[QArray, QArray]:
   """Broadcast scales so that they are addressable by Pallas via a BlockSpec."""
-  reduction_axis = reduction_axis % x.ndim
-  block_shape = list(x_spec.block_shape)
+  x_values, x_scales = x.qvalue, x.scale
 
-  # Check 1: the reduction axis x tiling includes only 1 scale per x tile.
-  elements_per_scale = pl.cdiv(
-      x.qvalue.shape[reduction_axis], x.scale.shape[reduction_axis]
-  )
-  reduction_tile = block_shape[reduction_axis]
-  if elements_per_scale % reduction_tile:  # tile too large or spans scales
+  eps_list = [pl.cdiv(xs, ss) for xs, ss in zip(x_values.shape, x_scales.shape)]
+  tile_sizes = x_spec.block_shape
+  min_addressable_sizes = ([1] * x.ndim + [_sublane_size(), LANES])[-x.ndim:]
+
+  # Limitation 1: Currently, we only support full-axis scales or 1 scale per
+  # each element for non-reduction axes, this is supported by the block-spec,
+  # but not by the kernel implementation.
+  for axis, eps in enumerate(eps_list):
+    if axis != reduction_axis and eps not in (1, x_values.shape[axis]):
+      raise NotImplementedError(
+          "Non-reduction axes must have an either 1 scale per each element or a"
+          " scalar full-axis scale, but"
+          f" {jax.tree.map(jax.typeof, x)=} for {reduction_axis=}."
+      )
+
+  # Limitation 2: The number of elements per single scale along the reduction
+  # axis must be greater than or equal to the min_addressable_size, because we
+  # don't want to pay the in-kernel cost of individually addressing the scales.
+  if eps_list[reduction_axis] < min_addressable_sizes[reduction_axis]:
     raise NotImplementedError(
-        f"{reduction_tile=} must be less than {elements_per_scale=} and"
-        f" must divide {elements_per_scale=} evenly. Failed for"
-        f" {jax.tree.map(jax.typeof, x)=} with {reduction_axis=}"
+        "The number of elements per single scale along the reduction axis must"
+        " be greater than or equal to the min_addressable_size."
     )
 
-  # How many x elements per each scale scalar.
-  els_per_scale = [
-      pl.cdiv(xs, ss) for xs, ss in zip(x.qvalue.shape, x.scale.shape)
+  for axis, (eps, mas) in enumerate(zip(eps_list, min_addressable_sizes)):
+    if eps != 1 and eps % mas != 0:
+      raise NotImplementedError(
+          "The number of elements per single scale must be divisible by the"
+          f" min_addressable_size in {axis=}. Got {eps=} and {mas=}."
+      )
+  scale_info_per_axis = [
+      _get_scale_tile_info(eps, tile_size, mas) for eps, tile_size, mas
+      in zip(eps_list, tile_sizes, min_addressable_sizes)
   ]
 
-  # Check 2: ensure that for subtiles, x tiles evenly divide elements per scale.
-  if any(
-      (1 if xb is None else xb) < eps and eps % (1 if xb is None else xb) != 0
-      for eps, xb in zip(els_per_scale, block_shape)
-  ):
-    raise NotImplementedError(
-        f"{els_per_scale=} must be divisible by {block_shape=} tiles for"
-        f" {jax.tree.map(jax.typeof, x)=}"
-    )
-
-  # How many steps to linger on the same scales tile before incrementing.
-  tile_steps = [
-      max(1, eps // (1 if xb is None else xb))
-      for xb, eps in zip(block_shape, els_per_scale)
-  ]
-
-  # Compute how large a scales tile should be.
-  scale_block_shape = [None if xb is None else max(xb // eps, 1)
-                       for xb, eps in zip(block_shape, els_per_scale)]
-
-  # Ensure that scale tiles are individually addressable, repeat if necessary.
-  min_sizes = [{x.ndim - 1: LANES, x.ndim - 2: _sublane_size()}.get(i, 1)
-               for i in range(x.ndim)]
-  scale = x.scale
-  for i, st in enumerate(scale_block_shape):
-    size = 1 if st is None else st
-    if size < min_sizes[i]:
-      if st is None:
-        raise NotImplementedError(f"{st=} must be >= 1 to tile it with None")
-      scale_block_shape[i] = min_sizes[i]
-      if min_sizes[i] % st != 0:
-        raise NotImplementedError(
-            f"{min_sizes[i]=} must be divisible by scale tile {st=} in"
-            f" {x.scale.shape=} for broadcasting to make addressable."
-        )
-      scale = jnp.repeat(scale, min_sizes[i] // st, axis=i)
-
-  # Construct the index map for the scales tiles and create the BlockSpec.
-  def idx_map(*args):
+  # construct the blockspec
+  def index_map(*args):
     idxs = list(x_spec.index_map(*args))
-    return tuple(i // tile_step for i, tile_step in zip(idxs, tile_steps))
+    return [scale_info_per_axis[i].ti_to_sti(idx) for i, idx in enumerate(idxs)]
 
-  scale_spec = pl.BlockSpec(scale_block_shape, idx_map)
-  spec = dataclasses.replace(x, qvalue=x_spec, scale=scale_spec)  # pytype: disable=wrong-arg-types
-  x = dataclasses.replace(x, scale=scale)
-  return x, spec
+  scales_block_shape = [info.scales_tile_size for info in scale_info_per_axis]
+  scales_blockspec = dataclasses.replace(
+      x_spec, block_shape=scales_block_shape, index_map=index_map
+  )
+
+  # repeat the scales to make them individually addressable
+  for ax, info in enumerate(scale_info_per_axis):
+    x_scales = jnp.repeat(x_scales, info.scales_inflation, axis=ax)
+
+  # return the results
+  x_new = dataclasses.replace(x, scale=x_scales)
+  x_spec_new = dataclasses.replace(x, qvalue=x_spec, scale=scales_blockspec)  # pytype: disable=wrong-arg-types
+  return x_new, x_spec_new
 
 
 def custom_buffered_pallas_call(
