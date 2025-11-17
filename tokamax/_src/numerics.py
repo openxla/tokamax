@@ -21,6 +21,7 @@ from typing import Any, TypeAlias
 import jax
 import jax.numpy as jnp
 import numpy as np
+import qwix
 from tokamax._src import quantization
 
 
@@ -188,7 +189,23 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
   def init_with_layout(x):
     if isinstance(x, ArrayInitializer):
       return jax.device_put(x(rng))
-    if isinstance(x, QuantizedArray):
+    if isinstance(x, qwix.QArray):
+      abstract_qvalue = isinstance(x.qvalue, jax.ShapeDtypeStruct)
+      abstract_scale = isinstance(x.scale, jax.ShapeDtypeStruct)
+
+      if abstract_qvalue and abstract_scale:
+        dtype = jnp.promote_types(x.dtype, jnp.float32)
+        values = rng.standard_normal(size=x.shape, dtype=dtype).astype(x.dtype)
+        tiled_axes = {i: d for i, d in enumerate(x.scale_tile_shape)}
+        return qwix.quantize(values, x.qvalue.dtype, tiled_axes=tiled_axes)
+      elif not abstract_qvalue and not abstract_scale:
+        return x
+      else:
+        raise ValueError(
+            '`QuantizedArray` values and scales must both be abstract or both'
+            ' concrete.'
+        )
+    elif isinstance(x, QuantizedArray):
       abstract_values = isinstance(x.values, jax.ShapeDtypeStruct)
       abstract_scales = isinstance(x.scales, jax.ShapeDtypeStruct)
 
@@ -223,5 +240,6 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     # TODO: Can we consolidate `device_put` into a single call?
     return jax.device_put(y, None if sharding is None else x.format)
 
-  is_leaf = lambda x: isinstance(x, (ArrayInitializer, QuantizedArray))
+  leaf_types = (ArrayInitializer, QuantizedArray, qwix.QArray)
+  is_leaf = lambda x: isinstance(x, leaf_types)
   return jax.tree.map(init_with_layout, x, is_leaf=is_leaf)

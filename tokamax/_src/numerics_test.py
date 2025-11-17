@@ -19,6 +19,7 @@ import jax
 from jax.experimental import layout
 import jax.numpy as jnp
 import numpy as np
+import qwix
 from tokamax._src import batching
 from tokamax._src import numerics
 from tokamax._src import quantization
@@ -132,6 +133,26 @@ class NumericsTest(parameterized.TestCase):
     expected = numerics.random_initialize(jax.ShapeDtypeStruct(shape, dtype))
     chex.assert_trees_all_close(actual, expected)
     self.assertEqual(actual.format, format_)
+
+  @parameterized.product(
+      qtype=(jnp.int8, jnp.int4),
+      scale=(
+          jax.ShapeDtypeStruct((1, 128), jnp.bfloat16),
+          jax.ShapeDtypeStruct((128, 1), jnp.bfloat16),
+          jax.ShapeDtypeStruct((32, 32), jnp.float32),
+      ),
+  )
+  def test_random_initialize_qarray(self, qtype, scale):
+    qvalue = jax.ShapeDtypeStruct((256, 256), qtype)
+    q = qwix.QArray(qvalue, scale)  # pytype: disable=wrong-arg-types
+    q = numerics.random_initialize(q)
+    self.assertEqual(q.qvalue.shape, qvalue.shape)
+    self.assertEqual(q.scale.shape, scale.shape)
+    self.assertEqual(q.qvalue.dtype, qtype)
+    self.assertEqual(q.scale.dtype, scale.dtype)
+    q_rms = jnp.sqrt(jnp.mean(qwix.dequantize(q) ** 2))
+    self.assertGreater(q_rms, 0.8)
+    self.assertLess(q_rms, 1.2)
 
   @parameterized.product(
       qdtype=(jnp.int8, jnp.int4),
