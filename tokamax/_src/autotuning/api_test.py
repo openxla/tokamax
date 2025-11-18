@@ -275,8 +275,6 @@ class AutotuningTest(parameterized.TestCase):
   def test_autotuning_result_context_retraced(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
-    if jax.version.__version_info__ < (0, 7, 2):
-      self.skipTest("Requires JAX >= 0.7.2.")
 
     op = _FakeOp()
     orig_fwd = op._fwd

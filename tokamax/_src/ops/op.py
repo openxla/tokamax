@@ -344,8 +344,7 @@ _AUTOTUNING_CACHE_OVERLAY = threading.local()
 def get_autotuning_cache_overlay_state() -> Any:
   if not hasattr(_AUTOTUNING_CACHE_OVERLAY, "stack"):
     _AUTOTUNING_CACHE_OVERLAY.stack = []
-    if jax.version.__version_info__ >= (0, 7, 2):
-      _AUTOTUNING_CACHE_OVERLAY.context = jax.make_user_context(())
+    _AUTOTUNING_CACHE_OVERLAY.context = jax.make_user_context(())
   return _AUTOTUNING_CACHE_OVERLAY
 
 
