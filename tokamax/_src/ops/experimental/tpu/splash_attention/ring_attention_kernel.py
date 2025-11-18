@@ -593,7 +593,7 @@ def make_ring_attention(
     save_residuals: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
     downcast_smem_data: bool = True,
-    partial_mask_blocks_dtype: jnp.DTypeLike = np.int8,
+    partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
     ring_axis: str,
     q_seq_shards: int = 1,
     kv_seq_shards: int = 1,

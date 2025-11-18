@@ -302,7 +302,7 @@ def _process_dynamic_mask(
     is_dkv: bool,
     *,
     downcast_smem_data: bool = True,
-    partial_mask_blocks_dtype: jnp.DTypeLike = np.int8,
+    partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
 ) -> MaskInfo:
   """Process a dynamic mask to compute it's local sparsity data.
 
@@ -414,7 +414,7 @@ def _process_mask(
     is_dkv: bool,
     *,
     downcast_smem_data: bool = True,
-    partial_mask_blocks_dtype: jnp.DTypeLike = np.int8,
+    partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
     q_seq_shards: int = 1,
     kv_seq_shards: int = 1,
     return_dynamic_grid: bool = True,

@@ -2038,7 +2038,7 @@ def _make_splash_attention(
     save_residuals: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
     downcast_smem_data: bool = True,
-    partial_mask_blocks_dtype: jnp.DTypeLike = np.int8,
+    partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
     q_seq_shards: int,
 ):
   if len(mask.shape) != 2:
@@ -2094,7 +2094,7 @@ def _process_mask_shard(
     *,
     config: SplashConfig,
     downcast_smem_data: bool,
-    partial_mask_blocks_dtype: jnp.DTypeLike,
+    partial_mask_blocks_dtype: jax.typing.DTypeLike,
 ) -> tuple[MaskInfo, MaskInfo | None]:
   process_mask_fn = functools.partial(
       mask_info_lib._process_dynamic_mask,
@@ -2124,7 +2124,7 @@ def _make_dynamic_splash_attention(
     save_residuals: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
     downcast_smem_data: bool = True,
-    partial_mask_blocks_dtype: jnp.DTypeLike = np.int8,
+    partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
 ):
   if (mesh is not None) != (mask_spec is not None):
     raise ValueError(
