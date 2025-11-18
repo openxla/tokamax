@@ -42,7 +42,7 @@ jobs:
     defaults:
       run:
         shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.12'
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15'
     timeout-minutes: 300
     steps:
       - name: Checkout Tokamax
@@ -70,7 +70,7 @@ jobs:
         shell: bash
     container:
     # Docker image will include CUDA and cuDNN for Tokamax.
-      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.12'
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15'
     timeout-minutes: 300
     steps:
       - name: Checkout Tokamax
@@ -98,7 +98,7 @@ jobs:
         shell: bash
     container:
     # Docker image will include CUDA and cuDNN for Tokamax.
-      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.12'
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15'
     timeout-minutes: 300
     steps:
       - name: Checkout Tokamax

@@ -32,7 +32,7 @@ jobs:
     defaults:
       run:
         shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.12'
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15'
     timeout-minutes: 600
     steps:
       - name: Checkout Tokamax
