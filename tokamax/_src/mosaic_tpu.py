@@ -102,7 +102,7 @@ class ScalesTilingInfo:
 
 
 def _get_scale_tile_info(
-    eps: int, tile_size: int | None, min_addressable_size: int
+    eps: int, tile_size: int | None, axis_size: int, min_addressable_size: int
 ) -> ScalesTilingInfo:
   if tile_size is None:
     if min_addressable_size != 1:
@@ -113,6 +113,12 @@ def _get_scale_tile_info(
         true_scales_per_tile=1,
         scales_tile_size=None,
         ti_to_sti=lambda tile_idx: tile_idx // eps,
+    )
+  if eps == axis_size:
+    return ScalesTilingInfo(
+        true_scales_per_tile=1,
+        scales_tile_size=min_addressable_size,
+        ti_to_sti=lambda tile_idx: 0,
     )
 
   assert eps % tile_size == 0 or tile_size % eps == 0
@@ -166,14 +172,14 @@ def quant_block_spec(
     )
 
   for axis, (eps, mas) in enumerate(zip(eps_list, min_addressable_sizes)):
-    if eps != 1 and eps % mas != 0:
+    if eps != 1 and (eps % mas != 0 and eps != x_values.shape[axis]):
       raise NotImplementedError(
           "The number of elements per single scale must be divisible by the"
           f" min_addressable_size in {axis=}. Got {eps=} and {mas=}."
       )
   scale_info_per_axis = [
-      _get_scale_tile_info(eps, tile_size, mas) for eps, tile_size, mas
-      in zip(eps_list, tile_sizes, min_addressable_sizes)
+      _get_scale_tile_info(eps, tile_size, s, mas) for eps, tile_size, s, mas
+      in zip(eps_list, tile_sizes, x_values.shape, min_addressable_sizes)
   ]
 
   # construct the blockspec
