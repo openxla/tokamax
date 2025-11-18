@@ -69,6 +69,7 @@ class AutotuningData(immutabledict.immutabledict[_Config, BenchmarkData]):
         ),
     )
 
+
 def _compile(fn_factory, config, args, kwargs, *, seed=None):
   fn = fn_factory(config)
   fn, x = benchmarking.standardize_function(fn, *args, kwargs=kwargs, seed=seed)

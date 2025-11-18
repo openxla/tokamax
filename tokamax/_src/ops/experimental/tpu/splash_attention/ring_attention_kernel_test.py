@@ -245,17 +245,12 @@ class RingAttentionTest(PallasBaseTest):
     @partial(
         shard_map,
         mesh=mesh,
-        in_specs=(
-            P(),
-            P(), # k
-            P(), # v
-            P()
-        ),
+        in_specs=(P(), P(), P(), P()),  # k  # v
         out_specs=(
-            P(), # out_original
-            P(), # dq
-            P(), # dk
-            P(), # dv
+            P(),  # out_original
+            P(),  # dq
+            P(),  # dk
+            P(),  # dv
         ),
         check_vma=False,
     )
@@ -270,6 +265,7 @@ class RingAttentionTest(PallasBaseTest):
       )
       out_original, dq, dk, dv = vmap_vjp_res(q, k, v, do)
       return out_original, dq, dk, dv
+
     # Run backward pass and assert close to reference backward pass
     o_original, dq, dk, dv = backward_fn(q, k, v, do.astype(jnp.bfloat16))
 

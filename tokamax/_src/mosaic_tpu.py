@@ -106,9 +106,11 @@ def _get_scale_tile_info(
 ) -> ScalesTilingInfo:
   if tile_size is None:
     if min_addressable_size != 1:
-      raise ValueError("We can only collapse a dimension when it is"
-                       " individually addressable. Pallas Mosaic TPU has the"
-                       " same restriction.")
+      raise ValueError(
+          "We can only collapse a dimension when it is"
+          " individually addressable. Pallas Mosaic TPU has the"
+          " same restriction."
+      )
     return ScalesTilingInfo(
         true_scales_per_tile=1,
         scales_tile_size=None,
@@ -149,7 +151,7 @@ def quant_block_spec(
 
   eps_list = [pl.cdiv(xs, ss) for xs, ss in zip(x_values.shape, x_scales.shape)]
   tile_sizes = x_spec.block_shape
-  min_addressable_sizes = ([1] * x.ndim + [_sublane_size(), LANES])[-x.ndim:]
+  min_addressable_sizes = ([1] * x.ndim + [_sublane_size(), LANES])[-x.ndim :]
 
   # Limitation 1: Currently, we only support full-axis scales or 1 scale per
   # each element for non-reduction axes, this is supported by the block-spec,
@@ -178,8 +180,10 @@ def quant_block_spec(
           f" min_addressable_size in {axis=}. Got {eps=} and {mas=}."
       )
   scale_info_per_axis = [
-      _get_scale_tile_info(eps, tile_size, s, mas) for eps, tile_size, s, mas
-      in zip(eps_list, tile_sizes, x_values.shape, min_addressable_sizes)
+      _get_scale_tile_info(eps, tile_size, s, mas)
+      for eps, tile_size, s, mas in zip(
+          eps_list, tile_sizes, x_values.shape, min_addressable_sizes
+      )
   ]
 
   # construct the blockspec
@@ -240,11 +244,13 @@ def custom_buffered_pallas_call(
 
     def pipeline(*args_refs):
       # unpack the dynamic grid elements from smem
-      grid = tuple(d[0] if d is not None else s
-                   for d, s in zip(args_refs[0], grid_static))
+      grid = tuple(
+          d[0] if d is not None else s
+          for d, s in zip(args_refs[0], grid_static)
+      )
 
       # unpack the smem prefetch values and bind them to the inspecs
-      smem_refs = args_refs[1:num_scalar_prefetch+1]
+      smem_refs = args_refs[1 : num_scalar_prefetch + 1]
       _bind_smem = functools.partial(_augment_blockspec, smem_refs=smem_refs)
       in_specs_ = jax.tree.map(_bind_smem, grid_spec.in_specs)
       if input_buffer_count is not None:
@@ -262,9 +268,9 @@ def custom_buffered_pallas_call(
 
       # unpack inputs/outputs and scratch refs
       input_output_refs = args_refs[
-          num_scalar_prefetch+1:num_scalar_prefetch + args_len + 1
+          num_scalar_prefetch + 1 : num_scalar_prefetch + args_len + 1
       ]
-      scratch_refs = args_refs[num_scalar_prefetch + args_len + 1:]
+      scratch_refs = args_refs[num_scalar_prefetch + args_len + 1 :]
 
       # bind smem and scratch to the pipeline body
       # specify dimension semantic from the scalar prefetch grid and emit
@@ -292,7 +298,7 @@ def custom_buffered_pallas_call(
         in_specs=smem_specs + in_specs,
         out_specs=out_specs,
         scratch_shapes=grid_spec.scratch_shapes,
-        **kw
+        **kw,
     )(grid_dynamic, *args)
 
   # pylint: enable=invalid-name

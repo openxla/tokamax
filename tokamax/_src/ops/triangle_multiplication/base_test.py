@@ -65,9 +65,7 @@ class TriangleMultiplicationTest(parameterized.TestCase):
       dtype=[jnp.bfloat16],
       precision=[jax.lax.Precision.HIGH],
   )
-  def test_triangle_multiplication_grad(
-      self, triangle_type, dtype, precision
-  ):
+  def test_triangle_multiplication_grad(self, triangle_type, dtype, precision):
     n = 8
     d = 64
     params = _get_params(n=n, c=16, h=32, d=d, dtype=dtype)

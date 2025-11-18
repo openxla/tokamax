@@ -260,13 +260,12 @@ def _get_store_mask(
 
 
 def _quantize_as(x, qdtype: jnp.dtype, axis: int, scale: float | None):
-  info_fn = (
-      jnp.iinfo if jnp.dtype(qdtype).name.startswith("int") else jnp.finfo
-  )
+  info_fn = jnp.iinfo if jnp.dtype(qdtype).name.startswith("int") else jnp.finfo
   max_val = min(info_fn(qdtype).max, -info_fn(qdtype).min)
   if scale is None:
-    scales = (jnp.max(jnp.abs(x), axis=axis, keepdims=True)
-              / jnp.array(max_val).astype(jnp.bfloat16))
+    scales = jnp.max(jnp.abs(x), axis=axis, keepdims=True) / jnp.array(
+        max_val
+    ).astype(jnp.bfloat16)
     inv_scales = jnp.broadcast_to(1.0 / scales, x.shape)
   else:  # compile-time (static) quantization scale
     scales, inv_scales = scale, 1.0 / scale
@@ -280,17 +279,20 @@ def _scale_out_by_scale(
     out *= scales
   else:
     if axis is None:  # scale all axes
-      if any(s1 % s2 != 0 for s1, s2 in zip(
-          out.shape, scales.shape, strict=True
-      )):
-        raise ValueError(f"{scales=} cannot be broadcast to {out=} because the"
-                         " scales shape cannot be broadcast.")
+      if any(
+          s1 % s2 != 0 for s1, s2 in zip(out.shape, scales.shape, strict=True)
+      ):
+        raise ValueError(
+            f"{scales=} cannot be broadcast to {out=} because the"
+            " scales shape cannot be broadcast."
+        )
       for ax, (s1, s2) in enumerate(zip(out.shape, scales.shape, strict=True)):
         scales = pltpu.repeat(scales, s1 // s2, ax)
       out *= scales
     else:
       out *= pltpu.repeat(scales, out.shape[axis] // scales.shape[axis], axis)
   return out
+
 
 _TilingFn = Callable[[int, int, int], tuple[int, int, int] | None]
 
@@ -416,8 +418,16 @@ def gmm(
 
     return jax.tree.map(getter, x)
 
-  def kernel(group_metadata, _, lhs_ref, rhs_ref, out_ref, acc_scratch,
-             *, subchannel_iters: int):
+  def kernel(
+      group_metadata,
+      _,
+      lhs_ref,
+      rhs_ref,
+      out_ref,
+      acc_scratch,
+      *,
+      subchannel_iters: int,
+  ):
     grid_id, k_i = pl.program_id(1), pl.program_id(2)
 
     @pl.when(k_i == 0)
@@ -685,8 +695,16 @@ def tgmm(
       x, y, precision=precision, preferred_element_type=preferred_element_type
   )
 
-  def kernel(group_metadata, _, lhs_ref, rhs_ref, out_ref, acc_scratch,
-             *, subchannel_iters: int):
+  def kernel(
+      group_metadata,
+      _,
+      lhs_ref,
+      rhs_ref,
+      out_ref,
+      acc_scratch,
+      *,
+      subchannel_iters: int,
+  ):
     if subchannel_iters != 1:
       raise NotImplementedError(
           "subchannel_iters != 1 not supported yet in tgmm."

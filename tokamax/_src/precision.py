@@ -198,8 +198,9 @@ def default_output_dtype_from_input_dtypes(*dtypes):
     # If no automatic promotion rules are available, start with bfloat16 and
     # pick the bitwidth-largest floating point dtype from inputs.
     def promote_dtypes(a_dtype, b_dtype):
-      if (jnp.dtype(b_dtype).itemsize > jnp.dtype(a_dtype).itemsize
-          and jnp.issubdtype(b_dtype, jnp.floating)):
+      if jnp.dtype(b_dtype).itemsize > jnp.dtype(
+          a_dtype
+      ).itemsize and jnp.issubdtype(b_dtype, jnp.floating):
         return jnp.dtype(b_dtype)
       else:
         return jnp.dtype(a_dtype)

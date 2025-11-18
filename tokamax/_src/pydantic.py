@@ -109,6 +109,7 @@ def annotate(ty: Any) -> Any:
     return Annotated[ty, Dataclass]
   return ty
 
+
 # pytype: enable=invalid-annotation
 
 

@@ -30,7 +30,6 @@ class RaggedDotTest(test_base.RaggedDotTestBase):
     super().setUp()
 
 
-
 class RaggedDotWithExplicitVjpTest(test_base.RaggedDotTestBase):
 
   def __init__(self, *args):
@@ -40,7 +39,6 @@ class RaggedDotWithExplicitVjpTest(test_base.RaggedDotTestBase):
     if jax.default_backend() == "tpu":
       self.skipTest("Disabled for now due to numeric issues.")
     super().setUp()
-
 
 
 if __name__ == "__main__":

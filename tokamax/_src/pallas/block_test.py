@@ -22,7 +22,9 @@ from jax.experimental import pallas as pl
 import jax.numpy as jnp
 from tokamax._src.pallas import block
 
-_SKIP_TPU_TEST_REASON = "Test broken on TPU due to blockspec shape TPU constraints."
+_SKIP_TPU_TEST_REASON = (
+    "Test broken on TPU due to blockspec shape TPU constraints."
+)
 
 
 class BlockTest(parameterized.TestCase):
@@ -57,6 +59,7 @@ class BlockTest(parameterized.TestCase):
   def test_block_ref_bounds_checked(self, block_shape, expect_checked, at=None):
     if jax.default_backend() == "tpu":
       self.skipTest(_SKIP_TPU_TEST_REASON)
+
     def kernel(x_ref, _):
       if at is not None:
         x_ref = x_ref.at[at]

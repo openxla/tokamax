@@ -41,10 +41,10 @@ def _create_arg_spec(seq_len: int, triangle_type: str) -> arg_spec.ArgSpec:
       project='alphafold',
   )
 
+
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = tuple(
     _create_arg_spec(n, t)
     for n, t in itertools.product(
-        (384, 640, 1024, 2048),
-        ('outgoing', 'incoming')
+        (384, 640, 1024, 2048), ('outgoing', 'incoming')
     )
 )

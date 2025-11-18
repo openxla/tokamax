@@ -81,6 +81,7 @@ def _normalization_vjp_kernel(
 @dataclasses.dataclass(frozen=True, slots=True)
 class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
   """Pallas-Triton normalization VJP."""
+
   config_cls: ClassVar[type[Config]] = Config
 
   @override

@@ -90,10 +90,14 @@ def quantize_as(
   """Returns a function that quantizes a JAX array as the given `dtype`."""
   dtype = jnp.dtype(dtype)
   # TODO: Support unsigned integers?
-  if not (jnp.issubdtype(dtype, jnp.signedinteger)
-          or jnp.issubdtype(dtype, jnp.floating)):
-    raise ValueError("`dtype` must be a signed integer or a floating point"
-                     f" type, but got {dtype}")
+  if not (
+      jnp.issubdtype(dtype, jnp.signedinteger)
+      or jnp.issubdtype(dtype, jnp.floating)
+  ):
+    raise ValueError(
+        "`dtype` must be a signed integer or a floating point"
+        f" type, but got {dtype}"
+    )
 
   info_fn = jnp.iinfo if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo
   info = info_fn(dtype)

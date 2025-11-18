@@ -32,13 +32,13 @@ def exact_div(a: int | tuple[int, str], b: int | tuple[int, str]) -> int:
 
 # Adapted from jax._src.util.split_merge in JAX v0.6.0.
 def split_merge(
-    predicate: Callable[[T], bool],
-    xs: Sequence[T]
+    predicate: Callable[[T], bool], xs: Sequence[T]
 ) -> tuple[list[T], list[T], Callable[[Sequence[T], Sequence[T]], list[T]]]:
   """Splits a sequence based on a predicate, and returns a merge function."""
   sides = list(map(predicate, xs))
   lhs = [x for x, s in zip(xs, sides) if s]
   rhs = [x for x, s in zip(xs, sides) if not s]
+
   def merge(new_lhs: Sequence[T], new_rhs: Sequence[T]) -> list[T]:
     out = []
     for s in sides:

@@ -193,6 +193,7 @@ class SplashAttentionShardingTest(PallasBaseTest):
       kernel_spec = kernel.manual_sharding_spec(
           jax.sharding.NamedSharding(mesh, mask_spec)
       )
+
     @partial(
         shard_map,
         mesh=mesh,

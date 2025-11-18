@@ -137,9 +137,11 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
               def _loop_body(ki, _):
                 slice_k = pl.ds(ki * block_k, block_k)
                 slot = lax.rem(ki, num_stages)
+
                 @pl.when((ki >= num_stages) | (carry > 0))
                 def _():
                   plgpu.barrier_wait(consumed_barrier.at[slot])
+
                 plgpu.copy_gmem_to_smem(
                     x_gmem.at[slice_m, slice_k],
                     x_smem.at[slot],
@@ -154,6 +156,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
                     partitioned_axis=0 if collective else None,
                     collective_axes="x" if collective else None,
                 )
+
               lax.fori_loop(0, num_k_iters, _loop_body, None)
 
             @pl.when((warp_id == _MMA_WARP) & (carry > 1))
@@ -176,12 +179,14 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
                       accumulate=(ki > 0),
                       collective_axis="x" if collective else None,
                   )
+
                 @pl.when(ki >= num_k_iters - 1)
                 def _():
                   plgpu.tcgen05_commit_arrive(
                       mma_done_barrier.at[acc_slot],
                       collective_axis="x" if collective else None,
                   )
+
               lax.fori_loop(0, num_k_iters, _loop_body, None)
 
         @pl.when(wg == _STORE_WG)

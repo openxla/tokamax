@@ -192,7 +192,7 @@ class NormalizationTestBase(parameterized.TestCase):
   def test_bench(self, kwargs):
     ba = inspect.signature(base.Normalization.__call__).bind(None, **kwargs)
     ba.apply_defaults()
-    ba.arguments.pop('return_residuals')
+    ba.arguments.pop("return_residuals")
     self._run_test(*ba.args[1:], **ba.kwargs)
 
 

@@ -488,7 +488,7 @@ class BoundArguments(Generic[_Config, _Key]):
       self, mode: benchmarking.BenchmarkMode = "forward"
   ) -> benchmarking.BenchmarkData:
     """Benchmarks the op with the bound arguments.
-    
+
     Args:
       mode: The benchmarking mode to use. Defaults to `forward`.
 

@@ -20,9 +20,11 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 import dataclasses
 from typing import Any
+
 import numpy as np
 
 # mypy: ignore-errors
+
 
 class Mask:
   """A base class for splash attention masks."""

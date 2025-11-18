@@ -31,7 +31,7 @@ QuantizedArray = quantization.QuantizedArray
 def _is_scale_tiling_supported(x: QuantizedArray, axis: int) -> bool:
   min_addressable_sizes = (
       [1] * x.ndim + [common._sublane_size(), common.LANES]
-  )[-x.ndim:]
+  )[-x.ndim :]
   cdiv = lambda x, y: (x + y - 1) // y
   eps_list = [cdiv(x, y) for x, y in zip(x.values.shape, x.scales.shape)]
   for ax, (mas, eps) in enumerate(zip(min_addressable_sizes, eps_list)):

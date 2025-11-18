@@ -90,6 +90,7 @@ class TokamaxTest(absltest.TestCase):
       self.assertIsInstance(autotune_res, tokamax.AutotuningResult)
       with autotune_res:
         out_autotuned = f_grad(x, scale)
+
         # TODO: Reduce tolerance once mgpu attention supports higher precision.
         def l2_rel(a, b):
           l2_diff = jnp.linalg.norm(a - b, axis=-1)

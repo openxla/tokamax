@@ -58,9 +58,8 @@ class MaskInfo(NamedTuple):
   This can be: np.int32, np.int16 or np.int8.
 
   Attributes:
-    mask_next: An integer[num_active_blocks] NumPy array where each
-      entry contains the next mask block index in `partial_mask_blocks` to
-      prefetch.
+    mask_next: An integer[num_active_blocks] NumPy array where each entry
+      contains the next mask block index in `partial_mask_blocks` to prefetch.
     active_rows: An integer[num_active_blocks] NumPy array where each entry
       contains the row index of the corresponding active block in the original
       mask.
@@ -70,8 +69,8 @@ class MaskInfo(NamedTuple):
     block_mask: An integer[num_active_blocks] NumPy array where each entry is
       either 1 or 2. 1 means the corresponding block is full and 2 means the
       corresponding block is partially masked.
-    num_active_blocks: An integer[] NumPy array whose
-      entries are the sizes of the corresponding blocks in the original mask.
+    num_active_blocks: An integer[] NumPy array whose entries are the sizes of
+      the corresponding blocks in the original mask.
     partial_mask_blocks: An int8[num_partial_blocks, block_q, block_kv] NumPy
       array that contains the blocks of the original mask that contained both
       zeros and ones. The entries in `mask_next` point to indices in the first
@@ -164,6 +163,7 @@ class _HashableNDArray:
   Attributes:
     array: The underlying numpy array.
   """
+
   array: np.ndarray
 
   def __init__(self, array: np.ndarray):
@@ -270,7 +270,7 @@ def _get_mask_info(
       # We extend the grid to visit these tiles to initialize them.
       empty_rows = np.all(block_mask == 0, axis=-1)
       first_col = np.arange(block_mask.shape[1]) == 0
-      active_mask |= (empty_rows[:, None] & first_col)
+      active_mask |= empty_rows[:, None] & first_col
 
     active_indices = np.argwhere(active_mask)
     active_rows = active_indices[:, 0].astype(np.int32)
@@ -325,7 +325,7 @@ def _process_dynamic_mask(
     compatible with the mask sizes.
   """
   # TODO: Fix dynamic mask processing with the new sparsity format.
-  raise NotImplementedError("Dynamic masks not supported.")
+  raise NotImplementedError('Dynamic masks not supported.')
 
   if len(mask.shape) != 2:
     raise ValueError(f'Expected a 2-dim mask, instead got: {mask.shape}.')
@@ -385,9 +385,7 @@ def _process_dynamic_mask(
 
   if downcast_smem_data:
     block_mask = block_mask.astype(np.int8)  # values are in the range [0, 1, 2]
-    mask_next = _downcast(
-        mask_next, q_blocks_count * kv_blocks_count
-    )
+    mask_next = _downcast(mask_next, q_blocks_count * kv_blocks_count)
 
   # Collapsing because the block ids are linearized.
   partial_mask_blocks = lax.collapse(partial_mask_blocks, 0, 2)

@@ -135,9 +135,7 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
   def test_kernel_forward_matches_reference(
       self, b_dim, h_dim, v_dim, reduction, config
   ):
-    x, labels, w = generate_random_data(
-        jax.random.key(42), b_dim, h_dim, v_dim
-    )
+    x, labels, w = generate_random_data(jax.random.key(42), b_dim, h_dim, v_dim)
 
     ref_loss, ref_lse = linear_softmax_cross_entropy_loss_fwd_reference(
         x, labels, w, reduction=reduction
@@ -242,9 +240,7 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
   def test_kernel_bwd_matches_reference(
       self, b_dim, h_dim, v_dim, reduction, config
   ):
-    x, labels, w = generate_random_data(
-        jax.random.key(42), b_dim, h_dim, v_dim
-    )
+    x, labels, w = generate_random_data(jax.random.key(42), b_dim, h_dim, v_dim)
     lse = jax.nn.logsumexp(x @ w, axis=-1)
 
     dout = 1.0
@@ -324,9 +320,7 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
       ),
   )
   def test_op_wrapper_fwd_bwd(self, b_dim, h_dim, v_dim, reduction, config):
-    x, labels, w = generate_random_data(
-        jax.random.key(42), b_dim, h_dim, v_dim
-    )
+    x, labels, w = generate_random_data(jax.random.key(42), b_dim, h_dim, v_dim)
 
     fn_pallas = PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(config=config)
     fn_reference = LinearSoftmaxCrossEntropyLoss(config=config)
@@ -363,9 +357,7 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
       ),
   )
   def test_validation_errors(self, b_dim, h_dim, v_dim, config):
-    x, labels, w = generate_random_data(
-        jax.random.key(42), b_dim, h_dim, v_dim
-    )
+    x, labels, w = generate_random_data(jax.random.key(42), b_dim, h_dim, v_dim)
     lse = jax.nn.logsumexp(x @ w, axis=-1)
 
     with self.assertRaises(ValueError):

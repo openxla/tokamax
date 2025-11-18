@@ -96,9 +96,7 @@ class FlashLceReferenceTest(parameterized.TestCase):
           reduction="mean",
       ),
   )
-  def test_reference_bwd_matches_jax_grad(
-      self, b_dim, h_dim, v_dim, reduction
-  ):
+  def test_reference_bwd_matches_jax_grad(self, b_dim, h_dim, v_dim, reduction):
     x, labels, w = test_utils.generate_random_data(
         jax.random.key(42), b_dim, h_dim, v_dim
     )

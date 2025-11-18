@@ -42,5 +42,6 @@ class PallasTritonGatedLinearUnitTest(test_base.GatedLinearUnitTestBase):
     autotuning_configs = glu_bound_args.autotuning_configs
     self.assertNotEmpty(autotuning_configs)
 
+
 if __name__ == "__main__":
   absltest.main()

@@ -38,6 +38,7 @@ def thread_unsafe_test_class():
 
 class SplashAttentionTestCase(parameterized.TestCase):
   """Base class for SplashAttention tests."""
+
   INTERPRET = False
 
   def setUp(self):

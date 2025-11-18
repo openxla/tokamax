@@ -96,7 +96,11 @@ def ragged_dot_quantized_kernel_body(
         grid=(k // block_k,),
         in_specs=(w_spec, x_spec, w_scales_spec),
         max_concurrent_steps=config.num_stages,
-    )(w_gmem.at[gi], x_gmem, w_scales_gmem.at[gi],)
+    )(
+        w_gmem.at[gi],
+        x_gmem,
+        w_scales_gmem.at[gi],
+    )
     return acc_ref[...]
 
   acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))

@@ -83,6 +83,7 @@ def _normalization_kernel(
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasTritonNormalization(base.Normalization[Config, Key]):
   """Pallas-Triton normalization op."""
+
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   # If `None`, `input_output_alias = not return_residuals`.

@@ -40,9 +40,8 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
     op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
 
     def fn(lhs, rhs, *, config=None, **kwargs):
-      expect_supported = (
-          (lhs.dtype == rhs.dtype == jnp.bfloat16)
-          and (lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0)
+      expect_supported = (lhs.dtype == rhs.dtype == jnp.bfloat16) and (
+          lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0
       )
 
       device_kind = jax.devices()[0].device_kind.lower()
