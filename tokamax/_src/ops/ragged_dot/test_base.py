@@ -47,10 +47,8 @@ _jax_ragged_dot_f32 = _dot_fn_f32(jax.lax.ragged_dot)
 
 def ref(lhs, rhs, group_sizes):
   """Reference implementation of ragged dot."""
-  if isinstance(lhs, quantization.QuantizedArray):
-    lhs = lhs.recompose()
-  if isinstance(rhs, quantization.QuantizedArray):
-    rhs = rhs.recompose()
+  lhs, rhs = map(quantization.as_array, (lhs, rhs))
+
   if lhs.dtype != rhs.dtype:
     input_dtype = jnp.result_type(lhs.dtype, rhs.dtype)
     lhs, rhs = lhs.astype(input_dtype), rhs.astype(input_dtype)

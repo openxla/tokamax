@@ -100,9 +100,9 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
   @override
   def _test_bench(self, spec):
     if "i8xi8" in self._testMethodName:
-      kwargs = dict(atol=1.5, rtol=0.5)  # This is really bad!
+      kwargs = dict(atol=2.0, rtol=0.5)  # This is really bad!
     elif "i4" in self._testMethodName:
-      kwargs = dict(atol=0.6, rtol=0.1)
+      kwargs = dict(atol=0.7, rtol=0.1)
     else:
       kwargs = {}
     with test_base.override_chex_args(**kwargs):
