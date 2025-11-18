@@ -23,6 +23,7 @@ import jax
 from jax import random
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.tpu.splash_attention import base
 from tokamax._src.ops.experimental.tpu.splash_attention import ring_attention_kernel
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
@@ -125,12 +126,12 @@ class RingAttentionTest(PallasBaseTest):
           jnp.int32, (seq_shard + seq_shard_pad,), 0
       )
       local_segment_tokens = (local_token_idx < seq_shard).astype(jnp.int32)
-      local_segment_ids = splash.SegmentIds(
+      local_segment_ids = base.SegmentIds(
           q=local_segment_tokens, kv=local_segment_tokens
       )
 
       global_kv_segment_tokens = jnp.tile(local_segment_tokens, q_seq_shards)
-      local_q_global_kv_segment_ids = splash.SegmentIds(
+      local_q_global_kv_segment_ids = base.SegmentIds(
           q=local_segment_tokens, kv=global_kv_segment_tokens
       )
 

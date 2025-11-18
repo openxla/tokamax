@@ -23,6 +23,7 @@ from jax import lax
 from jax import tree_util
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.tpu.splash_attention import base
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash_kernel
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
@@ -32,14 +33,14 @@ MaskInfo = mask_info_lib.MaskInfo
 partial = functools.partial
 
 RING_AXIS = "ring"
-SegmentIds = splash_kernel.SegmentIds
+SegmentIds = base.SegmentIds
 SplashConfig = splash_kernel.SplashConfig
-SplashResidualsType = splash_kernel.SplashResidualsType
-SplashCustomReturnType = splash_kernel.SplashCustomReturnType
+SplashResidualsType = base.SplashResidualsType
+SplashCustomReturnType = base.SplashCustomReturnType
 MaskFunctionType = splash_kernel.MaskFunctionType
 _splash_attention_forward = splash_kernel._splash_attention_forward  # pylint: disable=protected-access
 _splash_attention_bwd = splash_kernel._splash_attention_bwd  # pylint: disable=protected-access
-DEFAULT_MASK_VALUE = splash_kernel.DEFAULT_MASK_VALUE
+DEFAULT_MASK_VALUE = base.DEFAULT_MASK_VALUE
 
 
 def _ring_attention_forward(
