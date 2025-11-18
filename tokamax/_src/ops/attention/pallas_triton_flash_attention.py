@@ -617,24 +617,15 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       seq_k_axes = (None, -3, -3, -1, -1, -1, -1, -1, None, None)
       f = functools.partial(f, normalize_output=False, return_residuals=True)
       f = batching.vmap_split(f, in_axes=seq_k_axes, num_parts=split_k)
+      combine_partial_results = functools.partial(
+          base.combine_partial_results, normalize_output=normalize_output
+      )
+      f = lambda *args, f=f: combine_partial_results(*f(*args))
 
     for _ in q.shape[:-3]:  # Strip of the batch dimensions.
       f = batching.vmap_maybe_bcast(f, (0,) * len(args))
 
     out, residuals = f(*args)
-
-    # Re-normalize and reduce partial outputs.
-    if split_k > 1:
-      m, l = residuals
-      m_max = jnp.max(m, axis=-3, keepdims=True)
-      alpha = jnp.exp(m - m_max)
-      l_sum = jnp.sum(l * alpha, axis=-3)
-      alpha = alpha.mT[..., None]
-      # Avoid NaNs where `out` is infinity.
-      out = jnp.where(alpha == 0.0, 0.0, out * alpha)
-      out = jnp.sum(out.astype(jnp.float32), axis=-4)
-      out = (out / l_sum.mT[..., None]).astype(q.dtype)
-      residuals = (jnp.squeeze(m_max, -3), l_sum)
     return out, (residuals if return_residuals else None)
 
   @override

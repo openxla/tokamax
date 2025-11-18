@@ -687,6 +687,23 @@ def _softmax_jvp(normalize, primals, tangents):
   return (y, residual), (y_dot, jax.tree.map(jnp.zeros_like, residual))
 
 
+def combine_partial_results(
+    out: jax.Array, residuals: Residuals, normalize_output: bool
+) -> tuple[jax.Array, Residuals]:
+  """Combine partial attention results (reducing over leading axes)."""
+  m, l = residuals
+  m_max = jnp.max(m, axis=0)
+  alpha = jnp.exp(m - m_max)
+  l_sum = jnp.sum(l * alpha, axis=0)
+  alpha = alpha.mT[..., None]
+  # Avoid NaNs where `out` is infinity.
+  out = jnp.where(alpha == 0.0, 0.0, out * alpha)
+  out = jnp.sum(out, axis=0)
+  if normalize_output:
+    out = out / l_sum.mT[..., None]
+  return out, (m_max, l_sum)
+
+
 class DotProductAttentionGrads(TypedDict):
   q: Float[Array, "*B T H D"]
   k: Float[Array, "*b t h D"]
