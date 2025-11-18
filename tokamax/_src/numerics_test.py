@@ -155,7 +155,7 @@ class NumericsTest(parameterized.TestCase):
     self.assertLess(q_rms, 1.2)
 
   @parameterized.product(
-      qdtype=(jnp.int8, jnp.int4),
+      qdtype=(jnp.int8,),  # `int4` triggers an XLA:CPU bug.
       scales=(
           jax.ShapeDtypeStruct((1, 128), jnp.bfloat16),
           jax.ShapeDtypeStruct((128, 1), jnp.bfloat16),
