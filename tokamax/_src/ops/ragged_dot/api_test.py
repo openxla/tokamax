@@ -18,17 +18,13 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
+import qwix
 from tokamax._src import hlo_utils
 from tokamax._src import mosaic_gpu
-from tokamax._src import quantization
 from tokamax._src import triton
 from tokamax._src.ops.ragged_dot import api
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
-
-
-# TODO: Add test for QWIX quantization.
-QuantizedArray = quantization.QuantizedArray
 
 
 def _get_input_data(num_experts, m, k, n, dtype=jnp.bfloat16):
@@ -162,9 +158,9 @@ class RaggedDotMosaicTest(RaggedDotImplementationTest):
             (lhs.dtype == jnp.bfloat16)
             and (lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0)
             and (
-                not isinstance(rhs, QuantizedArray)
+                not isinstance(rhs, qwix.QArray)
                 or (
-                    (rhs.tile_shape == (1, 256, 1))
+                    (rhs.scale_tile_shape == (1, 256, 1))
                     and kwargs.get("preferred_element_type") is None
                 )
             )

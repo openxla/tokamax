@@ -22,6 +22,7 @@ import google_benchmark
 import jax
 from jax.experimental import layout
 import jax.numpy as jnp
+import qwix
 from tokamax._src import benchmarking
 from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import quantization
@@ -40,10 +41,7 @@ else:
 def _xla_only_group0(lhs, rhs, *, group_sizes):
   """XLA baseline that ignores group sizes and only uses group 0 weights."""
   del group_sizes
-  if isinstance(lhs, quantization.QuantizedArray):
-    lhs = lhs.recompose()
-  if isinstance(rhs, quantization.QuantizedArray):
-    rhs = rhs.recompose()
+  lhs, rhs = map(quantization.as_array, (lhs, rhs))
   return jnp.matmul(lhs, rhs[0])
 
 
@@ -51,10 +49,7 @@ def _xla_only_group0(lhs, rhs, *, group_sizes):
 def _xla_even_groups(lhs, rhs, *, group_sizes):
   """XLA baseline that ignores group sizes and splits evenly between groups."""
   del group_sizes
-  if isinstance(lhs, quantization.QuantizedArray):
-    lhs = lhs.recompose()
-  if isinstance(rhs, quantization.QuantizedArray):
-    rhs = rhs.recompose()
+  lhs, rhs = map(quantization.as_array, (lhs, rhs))
   num_groups = rhs.shape[0]
   lhs = lhs.reshape(num_groups, lhs.shape[0] // num_groups, -1)
   return jnp.matmul(lhs, rhs)
@@ -99,8 +94,8 @@ def _register_benchmarks():
     for impl_name in _BENCHMARK_IMPLS.value:
       if 'mosaic' in impl_name and (
           not mgpu_lib.has_mosaic_gpu_support()
-          or isinstance(spec['lhs'], quantization.QuantizedArray)
-          or not isinstance(spec['rhs'], quantization.QuantizedArray)
+          or isinstance(spec['lhs'], qwix.QArray)
+          or not isinstance(spec['rhs'], qwix.QArray)
       ):
         continue
       if impl_name == 'xla_only_group0' and name != 'compute_bound':

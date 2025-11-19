@@ -16,12 +16,10 @@
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
-from tokamax._src import quantization
+import qwix
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
 from tokamax._src.ops.ragged_dot import test_base
 
-
-QuantizedArray = quantization.QuantizedArray
 
 # A probably suboptimal global config that should work for most shapes. We use
 # this just to check that there exists a config that yields correct results.
@@ -56,16 +54,16 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
             persistent=True,
         )
         if (
-            not isinstance(rhs, QuantizedArray)
-            or (rhs.values.dtype != jnp.int4)
-            or (rhs.tile_shape[0] != 1)
-            or (rhs.tile_shape[1] < _CONFIG.block_k)
-            or (rhs.tile_shape[2] != 1)
+            not isinstance(rhs, qwix.QArray)
+            or (rhs.qtype != jnp.int4)
+            or (rhs.scale_tile_shape[0] != 1)
+            or (rhs.scale_tile_shape[1] < _CONFIG.block_k)
+            or (rhs.scale_tile_shape[2] != 1)
         ):
           expect_supported = False
-      elif isinstance(rhs, QuantizedArray):
+      elif isinstance(rhs, qwix.QArray):
         if (
-            rhs.tile_shape != (1, _CONFIG.block_k, 1)
+            rhs.scale_tile_shape != (1, _CONFIG.block_k, 1)
             or kwargs.get("preferred_element_type") is not None
         ):
           expect_supported = False

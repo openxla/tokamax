@@ -24,6 +24,7 @@ import jax
 from jax.experimental import checkify
 import jax.numpy as jnp
 import numpy as np
+import qwix
 from tokamax._src import numerics
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
@@ -138,12 +139,11 @@ class RaggedDotTestBase(parameterized.TestCase):
     )
 
     if a_tile_shape is not None:
-      a = quantization.quantize_as(
-          dtype, tile_shape=a_tile_shape, scale_dtype=a.dtype
-      )(a)
-    b = quantization.quantize_as(
-        dtype, tile_shape=b_tile_shape, scale_dtype=b.dtype
-    )(b)
+      a_tiled_axes = {i: d for i, d in enumerate(a_tile_shape)}
+      a = qwix.quantize(a, dtype, tiled_axes=a_tiled_axes)
+
+    b_tiled_axes = {i: d for i, d in enumerate(b_tile_shape)}
+    b = qwix.quantize(b, dtype, tiled_axes=b_tiled_axes)
 
     expected = ref(a, b, group_sizes)
     # TODO: preferred_element_type to f32 and tighten tolerances.

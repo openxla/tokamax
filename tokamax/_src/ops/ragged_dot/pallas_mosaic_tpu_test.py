@@ -17,34 +17,31 @@
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
+import qwix
 from tokamax._src import mosaic_tpu as common
-from tokamax._src import quantization
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
 
 
-QuantizedArray = quantization.QuantizedArray
-
-
-def _is_scale_tiling_supported(x: QuantizedArray, axis: int) -> bool:
+def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
   min_addressable_sizes = (
       [1] * x.ndim + [common._sublane_size(), common.LANES]
   )[-x.ndim :]
   cdiv = lambda x, y: (x + y - 1) // y
-  eps_list = [cdiv(x, y) for x, y in zip(x.values.shape, x.scales.shape)]
+  eps_list = [cdiv(x, y) for x, y in zip(x.qvalue.shape, x.scale.shape)]
   for ax, (mas, eps) in enumerate(zip(min_addressable_sizes, eps_list)):
     if eps != 1 and eps % mas != 0:
       return False
-    if ax != axis and not (eps == 1 or eps == x.values.shape[ax]):
+    if ax != axis and not (eps == 1 or eps == x.qvalue.shape[ax]):
       return False
   return True
 
 
 def _is_config_supported(
-    lhs: jax.Array | QuantizedArray,
-    rhs: jax.Array | QuantizedArray,
+    lhs: jax.Array | qwix.QArray,
+    rhs: jax.Array | qwix.QArray,
     config: pallas_mosaic_tpu.Config,
 ) -> bool:
   (m, k), (_, _, n) = lhs.shape, rhs.shape
@@ -54,9 +51,9 @@ def _is_config_supported(
       or n < config.gmm_tiling[2]
   ):
     return False
-  if isinstance(lhs, QuantizedArray) and not _is_scale_tiling_supported(lhs, 1):
+  if isinstance(lhs, qwix.QArray) and not _is_scale_tiling_supported(lhs, 1):
     return False
-  if isinstance(rhs, QuantizedArray) and not _is_scale_tiling_supported(rhs, 1):
+  if isinstance(rhs, qwix.QArray) and not _is_scale_tiling_supported(rhs, 1):
     return False
   return True
 

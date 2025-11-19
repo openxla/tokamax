@@ -20,11 +20,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
-from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
-
-
-QuantizedArray = quantization.QuantizedArray
 
 
 def ragged_dot_non_quantized_kernel_body(

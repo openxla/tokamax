@@ -35,7 +35,6 @@ _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 Residuals = types.NoneType
 QArray = qwix.QArray
-QuantizedArray = quantization.QuantizedArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
 _DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset
 
@@ -121,8 +120,8 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   @override
   def bind(
       self,
-      lhs: jax.Array | QuantizedArray | QArray,
-      rhs: jax.Array | QuantizedArray | QArray,
+      lhs: jax.Array | QArray,
+      rhs: jax.Array | QArray,
       *,
       group_sizes: jax.Array | GroupSizes | Sequence[int],
       ragged_dot_dimension_numbers: (
@@ -132,11 +131,6 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       preferred_element_type: jax.typing.DTypeLike | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
-    if isinstance(lhs, QuantizedArray):
-      lhs = quantization.as_qarray(lhs)
-    if isinstance(rhs, QuantizedArray):
-      rhs = quantization.as_qarray(rhs)
-
     if ragged_dot_dimension_numbers is None:
       # TODO: Support batch dims on LHS and/or RHS?
       ragged_dot_dimension_numbers = DEFAULT_RAGGED_DOT_DIM_NUMS
