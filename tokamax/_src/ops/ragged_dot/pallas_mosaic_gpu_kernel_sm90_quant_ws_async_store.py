@@ -78,6 +78,17 @@ def ragged_dot_quantized_ws_async_store_kernel(
       n % (config.block_n * 2) == 0
   ), "n must be divisible by config.block_n * 2"
 
+  if (
+      len(rhs.scale_tile_shape) != 3
+      or rhs.scale_tile_shape[0] != 1
+      or rhs.scale_tile_shape[2] != 1
+      or (rhs.scale_tile_shape[1] % config.block_k != 0)
+  ):
+    raise NotImplementedError(
+        "Scaling tile is not supported got:"
+        f" {rhs.scale_tile_shape=} (block_k={config.block_k})."
+    )
+
   out_elem_bits = jnp.finfo(out_dtype).bits
   swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
   out_swizzle_elems = (swizzle_out * 8) // out_elem_bits
@@ -303,12 +314,21 @@ def ragged_dot_quantized_ws_async_store_kernel(
     )
 
     w_elem_bits = jnp.iinfo(w.dtype).bits
-    w_swizzle = plgpu.find_swizzle(block_k * w_elem_bits)  # n,k
+    try:
+      w_swizzle = plgpu.find_swizzle(block_k * w_elem_bits)  # n,k
+    except ValueError as e:
+      raise NotImplementedError("No possible swizzle.") from e
     w_swizzle_elems = (w_swizzle * 8) // w_elem_bits
-    quantized_transforms = (
-        plgpu.TilingTransform((8, w_swizzle_elems)),
-        plgpu.SwizzleTransform(w_swizzle),
-    )
+    try:
+      quantized_transforms = (
+          plgpu.TilingTransform((8, w_swizzle_elems)),
+          plgpu.SwizzleTransform(w_swizzle),
+      )
+    except ValueError as e:
+      raise NotImplementedError(
+          f"{w_swizzle=} {w_swizzle_elems=} unsupported."
+      ) from e
+
     x_smem = plgpu.SMEM(
         (num_stages, block_m, block_k),
         dtype=x.dtype,

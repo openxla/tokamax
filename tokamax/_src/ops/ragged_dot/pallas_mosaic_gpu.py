@@ -144,9 +144,14 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         block_m=64,
         block_n=64,
         block_k=rhs.scale_tile_shape[1] if isinstance(rhs, QArray) else 128,
-        num_stages=4,
+        num_stages=2,
         split_k=1,
         grid_block_n=1,
+        warp_specialized=True,
+        persistent=False,
+        async_store=True,
+        grid_minor_dim=common.MatmulDimension.M,
+        grid_tile_width=1,
     )
 
   @override
