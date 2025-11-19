@@ -166,7 +166,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     lhs, rhs = ba.args[:2]
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
     if isinstance(rhs, QArray):
-      rhs_dtype_bits = jnp.iinfo(rhs.values.dtype).bits
+      rhs_dtype_bits = jnp.iinfo(rhs.qvalue.dtype).bits
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
     out_dtype = ba.kwargs["preferred_element_type"]
