@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import sys
 from typing import TypeAlias
 from unittest import mock
 import pytest
