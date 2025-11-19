@@ -354,12 +354,8 @@ def gmm(
   Returns:
     A 2d, jax.Array with shape [m, n].
   """
+  lhs, rhs = map(quantization.as_array_or_qarray_without_zero_point, (lhs, rhs))
   group_sizes = _validate_args(lhs, rhs, group_sizes)
-
-  if isinstance(lhs, QArray) and lhs.zero_point is not None:
-    lhs = qwix.dequantize(lhs)
-  if isinstance(rhs, QArray) and rhs.zero_point is not None:
-    rhs = qwix.dequantize(rhs)
 
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
@@ -647,12 +643,8 @@ def tgmm(
   Returns:
     A  3d, jax.Array with shape [num_groups, k, n].
   """
+  lhs, rhs = map(quantization.as_array_or_qarray_without_zero_point, (lhs, rhs))
   group_sizes = _validate_args(lhs, rhs, group_sizes, expected_rhs_dims=2)
-
-  if isinstance(lhs, QArray) and lhs.zero_point is not None:
-    lhs = qwix.dequantize(lhs)
-  if isinstance(rhs, QArray) and rhs.zero_point is not None:
-    rhs = qwix.dequantize(rhs)
 
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)

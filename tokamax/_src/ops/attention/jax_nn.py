@@ -30,7 +30,7 @@ from typing_extensions import override
 
 
 Mask = base.Mask
-QuantizedArray = quantization.QuantizedArray
+QArray = base.QArray
 PagingInfo = base.PagingInfo
 
 
@@ -44,9 +44,9 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
   @override
   def _fwd(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*B t h D"],
+      v: Float[Array | QArray, "*B t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       logits_dtype: jnp.dtype,
@@ -80,7 +80,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
 
-    q, k, v = map(base.as_array, (q, k, v))
+    q, k, v = map(quantization.as_array, (q, k, v))
 
     is_causal = False
     if q_indices is None and k_indices is None:

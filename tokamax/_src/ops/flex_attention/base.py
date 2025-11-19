@@ -20,6 +20,7 @@ from typing import Any, ClassVar, Literal, TypeVar, overload
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
+import qwix
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
@@ -28,6 +29,7 @@ from tokamax._src.ops import op
 from typing_extensions import override
 
 
+QArray = qwix.QArray
 QuantizedArray = quantization.QuantizedArray
 
 
@@ -51,9 +53,9 @@ class FlexAttention(
   @overload
   def __call__(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
+      k: Float[Array | QuantizedArray | QArray, "*B t h D"],
+      v: Float[Array | QuantizedArray | QArray, "*B t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -73,9 +75,9 @@ class FlexAttention(
   @overload
   def __call__(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
+      k: Float[Array | QuantizedArray | QArray, "*B t h D"],
+      v: Float[Array | QuantizedArray | QArray, "*B t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -95,9 +97,9 @@ class FlexAttention(
   @jaxtyping.jaxtyped
   def __call__(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
+      k: Float[Array | QuantizedArray | QArray, "*B t h D"],
+      v: Float[Array | QuantizedArray | QArray, "*B t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -188,9 +190,9 @@ class FlexAttention(
   @override
   def bind(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
+      k: Float[Array | QuantizedArray | QArray, "*B t h D"],
+      v: Float[Array | QuantizedArray | QArray, "*B t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -240,9 +242,9 @@ class FlexAttention(
   @override
   def _fwd(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*B t h D"],
+      v: Float[Array | QArray, "*B t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       score_mod: ScoreMod | None,
@@ -255,7 +257,7 @@ class FlexAttention(
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     del config  # Unused.
 
-    q, k, v = map(as_array, (q, k, v))
+    q, k, v = map(quantization.as_array, (q, k, v))
     if k.shape[-2] not in (1, q.shape[-2]):
       repeats = q.shape[-2] // k.shape[-2]
 
@@ -296,10 +298,6 @@ class FlexAttention(
         preferred_element_type=weights_v_dot_precision.accumulation_type,
     ).astype(q.dtype)
     return out, (softmax_residuals if return_residuals else None)
-
-
-def as_array(x: jax.Array | QuantizedArray) -> jax.Array:
-  return x.recompose() if isinstance(x, QuantizedArray) else x
 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))

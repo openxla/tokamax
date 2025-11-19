@@ -837,7 +837,7 @@ class AttentionTestBase(parameterized.TestCase):
 
     def ref_impl_(*args, **kwargs):
       q, k, v, *rest = args
-      q, k, v = map(base.as_array, (q, k, v))
+      q, k, v = map(quantization.as_array, (q, k, v))
       mask = kwargs.pop("mask", None)
       is_causal = kwargs.pop("is_causal", None)
 

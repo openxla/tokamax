@@ -25,6 +25,7 @@ from jax.experimental import shard_map
 import jax.numpy as jnp
 from jax.typing import DTypeLike  # pylint: disable=g-importing-member
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import qwix
 from tokamax._src import ad
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
@@ -38,6 +39,7 @@ class AUTO:  # Used as a sentinel value.
   pass
 
 
+QArray = qwix.QArray
 QuantizedArray = quantization.QuantizedArray
 
 
@@ -220,9 +222,9 @@ class DotProductAttention(
   @overload
   def __call__(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*b t h D"],
-      v: Float[Array | QuantizedArray, "*b t h d"],
+      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
+      k: Float[Array | QuantizedArray | QArray, "*b t h D"],
+      v: Float[Array | QuantizedArray | QArray, "*b t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -249,9 +251,9 @@ class DotProductAttention(
   @overload
   def __call__(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*b t h D"],
-      v: Float[Array | QuantizedArray, "*b t h d"],
+      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
+      k: Float[Array | QuantizedArray | QArray, "*b t h D"],
+      v: Float[Array | QuantizedArray | QArray, "*b t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -278,9 +280,9 @@ class DotProductAttention(
   @jaxtyping.jaxtyped
   def __call__(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*b t h D"],
-      v: Float[Array | QuantizedArray, "*b t h d"],
+      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
+      k: Float[Array | QuantizedArray | QArray, "*b t h D"],
+      v: Float[Array | QuantizedArray | QArray, "*b t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -482,9 +484,9 @@ class DotProductAttention(
   @override
   def bind(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*b t h D"],
-      v: Float[Array | QuantizedArray, "*b t h d"],
+      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
+      k: Float[Array | QuantizedArray | QArray, "*b t h D"],
+      v: Float[Array | QuantizedArray | QArray, "*b t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -515,6 +517,8 @@ class DotProductAttention(
 
     if paging_info is None and k.shape[:-3] != q.shape[:-3]:
       raise ValueError("`k` batch size must be the same as `q`.")
+
+    q, k, v = map(quantization.as_array_or_qarray, (q, k, v))
 
     if not isinstance(precision, tuple):
       precision = (precision, precision)
@@ -566,9 +570,9 @@ class DotProductAttention(
   @override
   def _fwd(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*b t h D"],
-      v: Float[Array | QuantizedArray, "*b t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*b t h D"],
+      v: Float[Array | QArray, "*b t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       logits_dtype: jnp.dtype,
@@ -587,7 +591,7 @@ class DotProductAttention(
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     del config  # Unused.
 
-    q, k, v = map(as_array, (q, k, v))
+    q, k, v = map(quantization.as_array, (q, k, v))
     if k.shape[-2] not in (1, q.shape[-2]):
       repeats = q.shape[-2] // k.shape[-2]
 
@@ -637,10 +641,6 @@ class DotProductAttention(
         preferred_element_type=weights_v_dot_precision.accumulation_type,
     ).astype(q.dtype)
     return out, (softmax_residuals if return_residuals else None)
-
-
-def as_array(x: jax.Array | QuantizedArray) -> jax.Array:
-  return x.recompose() if isinstance(x, QuantizedArray) else x
 
 
 def needs_stable_softmax(

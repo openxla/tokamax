@@ -42,7 +42,7 @@ from typing_extensions import override
 
 
 DotPrecisionLike = lax.Precision | lax.DotAlgorithmPreset
-QuantizedArray = quantization.QuantizedArray
+QArray = base.QArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
 _WGMMA = plgpu.Layout.WGMMA
@@ -558,9 +558,9 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   @override
   def _fwd(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*B t h D"],
+      v: Float[Array | QArray, "*B t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       logits_dtype: jnp.dtype,
@@ -592,7 +592,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       raise NotImplementedError("Paged attention not supported.")
 
     # TODO: Support in-kernel dequantization.
-    q, k, v = map(base.as_array, (q, k, v))
+    q, k, v = map(quantization.as_array, (q, k, v))
     out_dtype = q.dtype
 
     def cast(x, precision):

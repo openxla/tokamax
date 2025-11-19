@@ -37,7 +37,7 @@ from typing_extensions import override
 
 ScoreMod = base.ScoreMod
 MaskMod = base.MaskMod
-QuantizedArray = quantization.QuantizedArray
+QArray = base.QArray
 Residuals = base.Residuals
 
 
@@ -89,9 +89,10 @@ def _fwd_kernel(
   """Pallas-Triton FlexAttention forward kernel implementation."""
 
   def get_values_and_scales(x):
-    if isinstance(x, QuantizedArray):
+    if isinstance(x, QArray):
       # TODO: Allow scales dimensions to be non-broadcastable.
-      return x.values, x.scales
+      assert x.zero_point is None
+      return x.qvalue, x.scale
     return x, None
 
   q_ref, q_scales_ref = get_values_and_scales(q_ref)
@@ -266,9 +267,9 @@ def _tile_mask_mod(mask_mod, scores, block_q, block_k):
 
 @jaxtyping.jaxtyped
 def _fwd(
-    q: Float[Array | QuantizedArray, "*B T H D"],
-    k: Float[Array | QuantizedArray, "*B t h D"],
-    v: Float[Array | QuantizedArray, "*B t h d"],
+    q: Float[Array | QArray, "*B T H D"],
+    k: Float[Array | QArray, "*B t h D"],
+    v: Float[Array | QArray, "*B t h d"],
     *,
     score_mod: ScoreMod | None,
     mask_mod: MaskMod | None,
@@ -283,6 +284,7 @@ def _fwd(
     weights_v_dot_precision: jax.lax.DotAlgorithmPreset,
 ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
   """Forward pass of Pallas-Trtion FlexAttention."""
+  q, k, v = map(quantization.as_array_or_qarray_without_zero_point, (q, k, v))
 
   *batch, seq_len_q, num_heads_q, head_dim = q.shape
   *_, seq_len_k, num_heads_k, head_dim_out = v.shape
@@ -322,15 +324,15 @@ def _fwd(
 
   def input_spec(x, index_map, block_shape):
     spec_ = spec(index_map, block_shape)
-    if not isinstance(x, QuantizedArray):
+    if not isinstance(x, QArray):
       return spec_
 
     scales_block_shape = [
         None if b is None else min(s, b)
-        for s, b in zip(x.scales.shape[-3:], block_shape, strict=True)
+        for s, b in zip(x.scale.shape[-3:], block_shape, strict=True)
     ]
-    scales_spec = bcast_spec(x.scales, index_map, scales_block_shape)
-    return QuantizedArray(spec_, scales_spec)  # pytype: disable=wrong-arg-types
+    scales_spec = bcast_spec(x.scale, index_map, scales_block_shape)
+    return QArray(spec_, scales_spec, qtype=x.qtype)  # pytype: disable=wrong-arg-types
 
   scores_shape = (*batch, num_heads_q, seq_len_q, seq_len_k)
   scores = jax.ShapeDtypeStruct(scores_shape, jnp.float32)
@@ -413,8 +415,8 @@ def _fwd(
 
 def _can_have_block_d(*args):
   for arg in args:
-    if isinstance(arg, QuantizedArray) and any(
-        s not in (1, v) for v, s in zip(arg.values.shape, arg.scales.shape)
+    if isinstance(arg, QArray) and any(
+        s not in (1, v) for v, s in zip(arg.qvalue.shape, arg.scale.shape)
     ):
       return False  # TODO: Make block_d work with subchannel quant.
     if pl.next_power_of_2(arg.shape[-1]) != arg.shape[-1]:
@@ -446,9 +448,9 @@ class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
   @override
   def _fwd(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*B t h D"],
+      v: Float[Array | QArray, "*B t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       score_mod: ScoreMod | None,

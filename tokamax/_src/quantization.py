@@ -80,6 +80,23 @@ def as_array(x: jax.Array | QuantizedArray | QArray) -> jax.Array:
   return x if isinstance(x, jax.Array) else qwix.dequantize(as_qarray(x))
 
 
+def as_array_or_qarray(
+    x: jax.Array | QuantizedArray | QArray,
+) -> jax.Array | QArray:
+  """Converts value to a JAX array or Qwix QArray."""
+  return as_qarray(x) if isinstance(x, QuantizedArray) else x
+
+
+def as_array_or_qarray_without_zero_point(
+    x: jax.Array | QuantizedArray | QArray,
+) -> jax.Array | QArray:
+  """Converts value to a JAX array or Qwix QArray without zero point."""
+  y = as_array_or_qarray(x)
+  if isinstance(y, QArray) and y.zero_point is not None:
+    return qwix.dequantize(y)
+  return y
+
+
 def quantize_as(
     dtype: jax.typing.DTypeLike,
     *,

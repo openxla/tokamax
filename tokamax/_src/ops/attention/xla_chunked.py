@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -31,7 +32,7 @@ from typing_extensions import override
 
 
 Mask = base.Mask
-QuantizedArray = base.QuantizedArray
+QArray = base.QArray
 PagingInfo = base.PagingInfo
 
 
@@ -121,9 +122,9 @@ def _attend_chunk(
 
 @jaxtyping.jaxtyped
 def _attend_chunked(
-    q: Float[Array | QuantizedArray, "*B T H D"],
-    k: Float[Array | QuantizedArray, "*B t #H D"],
-    v: Float[Array | QuantizedArray, "*B t #H d"],
+    q: Float[Array, "*B T H D"],
+    k: Float[Array, "*B t #H D"],
+    v: Float[Array, "*B t #H d"],
     *,
     precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
     logits_dtype: jnp.dtype,
@@ -233,9 +234,9 @@ def _attend_chunked(
 
 @jaxtyping.jaxtyped
 def _attend_paged(
-    q: Float[Array | QuantizedArray, "*B T H D"],
-    k: Float[Array | QuantizedArray, "*b t #H D"],
-    v: Float[Array | QuantizedArray, "*b t #H d"],
+    q: Float[Array, "*B T H D"],
+    k: Float[Array, "*b t #H D"],
+    v: Float[Array, "*b t #H d"],
     *,
     precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
     logits_dtype: jnp.dtype,
@@ -317,9 +318,9 @@ class XlaChunkedDotProductAttention(
   @override
   def _fwd(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*b t h D"],
-      v: Float[Array | QuantizedArray, "*b t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*b t h D"],
+      v: Float[Array | QArray, "*b t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       logits_dtype: jnp.dtype,
@@ -339,7 +340,7 @@ class XlaChunkedDotProductAttention(
     if return_residuals:
       raise NotImplementedError("`return_residuals=True` not supported.")
 
-    q, k, v = map(base.as_array, (q, k, v))
+    q, k, v = map(quantization.as_array, (q, k, v))
     if k.shape[-2] not in (1, q.shape[-2]):
       repeats = q.shape[-2] // k.shape[-2]
 

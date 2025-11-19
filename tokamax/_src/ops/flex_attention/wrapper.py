@@ -20,6 +20,7 @@ from typing import Annotated
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import qwix
 from tokamax._src import jaxtyping
 from tokamax._src import pydantic
 from tokamax._src import quantization
@@ -31,6 +32,7 @@ from typing_extensions import override
 
 Mask = attn_base.Mask
 Residuals = attn_base.Residuals
+QArray = qwix.QArray
 QuantizedArray = quantization.QuantizedArray
 PagingInfo = attn_base.PagingInfo
 
@@ -45,9 +47,9 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
   @override
   def _fwd(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
+      k: Float[Array | QuantizedArray | QArray, "*B t h D"],
+      v: Float[Array | QuantizedArray | QArray, "*B t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       logits_dtype: jnp.dtype,

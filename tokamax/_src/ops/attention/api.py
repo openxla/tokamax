@@ -20,11 +20,13 @@ import immutabledict
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import qwix
 from tokamax._src import quantization
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import xla_chunked
 
+QArray = qwix.QArray
 QuantizedArray = quantization.QuantizedArray
 Implementation: TypeAlias = Literal[
     "mosaic", "triton", "cudnn", "xla", "xla_chunked"
@@ -67,9 +69,9 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
 
 
 def dot_product_attention(
-    query: Float[Array | QuantizedArray, "*B T N H"],
-    key: Float[Array | QuantizedArray, "*B S K H"],
-    value: Float[Array | QuantizedArray, "*B S K h"],
+    query: Float[Array | QuantizedArray | QArray, "*B T N H"],
+    key: Float[Array | QuantizedArray | QArray, "*B S K H"],
+    value: Float[Array | QuantizedArray | QArray, "*B S K h"],
     bias: Float[Array, "*#B #N #T #S"] | None = None,
     mask: Bool[Array, "*#B #N #T #S"] | None = None,
     *,

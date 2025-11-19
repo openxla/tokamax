@@ -37,7 +37,7 @@ from tokamax._src.pallas import block
 from typing_extensions import override
 
 Mask = base.Mask
-QuantizedArray = quantization.QuantizedArray
+QArray = base.QArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
 
@@ -128,9 +128,10 @@ def _fwd_kernel_impl(
   """Pallas MHA forward kernel implementation."""
 
   def get_values_and_scales(x):
-    if isinstance(x, QuantizedArray):
+    if isinstance(x, QArray):
+      assert x.zero_point is None
       # TODO: Allow scales dimensions to be non-broadcastable.
-      return x.values, x.scales
+      return x.qvalue, x.scale
     return x, None
 
   q_ref, q_scales_ref = get_values_and_scales(q_ref)
@@ -303,9 +304,9 @@ def _fwd_kernel_impl(
 
 @jaxtyping.jaxtyped
 def _fwd(
-    q: Float[Array | QuantizedArray, "T H D"],
-    k: Float[Array | QuantizedArray, "t h D"],
-    v: Float[Array | QuantizedArray, "t h d"],
+    q: Float[Array | QArray, "T H D"],
+    k: Float[Array | QArray, "t h D"],
+    v: Float[Array | QArray, "t h d"],
     bias: Float[Array, "#H #T #t"] | None,
     mask: Bool[Array, "#H #T #t"] | None,
     dropout_mask: Bool[Array, "#H #T #t"] | None,
@@ -328,6 +329,7 @@ def _fwd(
     weights_v_dot_precision: jax.lax.DotAlgorithmPreset,
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Forward pass of Pallas FlashAttention."""
+  q, k, v = map(quantization.as_array_or_qarray_without_zero_point, (q, k, v))
 
   seq_len_q, num_heads_q, head_dim = q.shape
   seq_len_k, num_heads_k, head_dim_out = v.shape
@@ -382,14 +384,16 @@ def _fwd(
     return pl.BlockSpec(tuple(block_shape), wrapped_index_map)
 
   def input_spec(x, index_map, block_shape):
-    if isinstance(x, QuantizedArray):
+    if isinstance(x, QArray):
+      assert x.zero_point is None
       scales_block_shape = [
           None if b is None else min(s, b)
-          for s, b in zip(x.scales.shape, block_shape)
+          for s, b in zip(x.scale.shape, block_shape)
       ]
-      return QuantizedArray(  # pytype: disable=wrong-arg-types
+      return QArray(  # pytype: disable=wrong-arg-types
           pl.BlockSpec(block_shape, index_map),
-          spec(x.scales, index_map, scales_block_shape),
+          spec(x.scale, index_map, scales_block_shape),
+          qtype=x.qvalue.dtype,
       )
     return pl.BlockSpec(block_shape, index_map)
 
@@ -505,8 +509,8 @@ def _decompose_mask(mask, q, k, q_indices, k_indices):
 
 def _can_have_block_d(*args):
   for arg in args:
-    if isinstance(arg, QuantizedArray) and any(
-        s not in (1, v) for v, s in zip(arg.values.shape, arg.scales.shape)
+    if isinstance(arg, QArray) and any(
+        s not in (1, v) for v, s in zip(arg.qvalue.shape, arg.scale.shape)
     ):
       return False  # TODO: Make block_d work with subchannel quant.
     if pl.next_power_of_2(arg.shape[-1]) != arg.shape[-1]:
@@ -543,9 +547,9 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
   @override
   def _fwd(
       self,
-      q: Float[Array | QuantizedArray, "*B T H D"],
-      k: Float[Array | QuantizedArray, "*B t h D"],
-      v: Float[Array | QuantizedArray, "*B t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*B t h D"],
+      v: Float[Array | QArray, "*B t h d"],
       *,
       precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
       logits_dtype: jnp.dtype,

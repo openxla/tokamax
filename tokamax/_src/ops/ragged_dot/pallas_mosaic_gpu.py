@@ -84,8 +84,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
     lhs = quantization.as_array(lhs)
     # None of the kernels support zero point yet.
-    if isinstance(rhs, QArray) and rhs.zero_point is not None:
-      rhs = qwix.dequantize(rhs)
+    rhs = quantization.as_array_or_qarray_without_zero_point(rhs)
 
     device = backend.get_default_device()
 
