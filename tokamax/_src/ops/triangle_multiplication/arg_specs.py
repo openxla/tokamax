@@ -29,7 +29,8 @@ def _create_arg_spec(seq_len: int, triangle_type: str) -> arg_spec.ArgSpec:
       dict(
           x=ShapeDtype((seq_len, seq_len, 64), jnp.bfloat16),
           mask=ShapeDtype((seq_len, seq_len), jnp.bool_),
-          gate_projection_weights=ShapeDtype((64, 2, 64, 2), jnp.bfloat16),
+          projection_in_weights=ShapeDtype((64, 2, 64), jnp.bfloat16),
+          gate_in_weights=ShapeDtype((64, 2, 64), jnp.bfloat16),
           projection_out_weights=ShapeDtype((64, 64), jnp.bfloat16),
           gate_out_weights=ShapeDtype((64, 64), jnp.bfloat16),
           layernorm_in_scale=ShapeDtype((64,), jnp.bfloat16),
