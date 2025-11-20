@@ -27,8 +27,9 @@ import numpy as np
 import qwix
 from tokamax._src import numerics
 from tokamax._src import quantization
-from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import arg_specs
+from tokamax._src.ops.ragged_dot import base
+ARG_SPECS = arg_specs.ARG_SPECS
 
 
 def _dot_fn_f32(dot_fn):
@@ -64,7 +65,7 @@ def override_chex_args(**kwargs):
 
 
 NAMED_ARG_SPECS = {
-    s.full_name: s.args for s in arg_specs.ARG_SPECS if "primary" in s.tags
+    s.full_name: s.args for s in ARG_SPECS if "primary" in s.tags
 }
 
 

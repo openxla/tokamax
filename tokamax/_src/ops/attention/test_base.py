@@ -31,9 +31,10 @@ import numpy as np
 import qwix
 from tokamax._src import numerics
 from tokamax._src import quantization
+from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import xla_chunked
-from tokamax._src.ops.attention import arg_specs
+ARG_SPECS = arg_specs.ARG_SPECS
 
 
 def _create_inputs(
@@ -206,7 +207,7 @@ def _ref_impl_tanh(
 
 
 NAMED_ARG_SPECS = {
-    s.full_name: s.args for s in arg_specs.ARG_SPECS if "primary" in s.tags
+    s.full_name: s.args for s in ARG_SPECS if "primary" in s.tags
 }
 
 

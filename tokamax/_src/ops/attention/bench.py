@@ -20,13 +20,14 @@ from absl import app
 from absl import flags
 import google_benchmark
 from tokamax._src import benchmarking
+from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as mgpu_attn
 from tokamax._src.ops.attention import pallas_triton_flash_attention as triton_attn
 from tokamax._src.ops.flex_attention import pallas_triton as triton_flex
 from tokamax._src.ops.flex_attention import wrapper
-from tokamax._src.ops.attention import arg_specs
+ARG_SPECS = arg_specs.ARG_SPECS
 
 
 _IMPLS = dict(
@@ -58,11 +59,11 @@ _register_benchmark = functools.partial(
 
 def _register_benchmarks():
   """Registers benchmarks."""
-  for arg_spec in arg_specs.ARG_SPECS:
+  for arg_spec in ARG_SPECS:
     for impl_name in _BENCHMARK_IMPLS_FWD.value:
       _register_benchmark(arg_spec.full_name, impl_name, arg_spec.args)
 
-  for arg_spec in arg_specs.ARG_SPECS:
+  for arg_spec in ARG_SPECS:
     name = arg_spec.full_name
     kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD_BWD.value:
