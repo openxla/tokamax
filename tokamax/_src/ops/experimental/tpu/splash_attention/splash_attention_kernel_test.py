@@ -184,8 +184,8 @@ def mask_strategy(draw: Draw, q_seq_len: int, kv_seq_len: int) -> Mask:
       causal_mask_strategy(q_seq_len, kv_seq_len),
       full_mask_strategy(q_seq_len, kv_seq_len),
       random_mask_strategy(q_seq_len, kv_seq_len),
-      # TODO Composing masks creates masks that produce minor numerical
-      # differences. We should investigate this in the future.
+      # TODO Composing masks creates masks that produce minor
+      # numerical differences. We should investigate this in the future.
       # compose_mask_strategy(q_seq_len, kv_seq_len),
   ]
 
@@ -216,7 +216,9 @@ def attention_strategy(draw: Draw) -> tuple[int, int, int, int, np.dtype]:
     # tests.
     dtype = np.dtype("float32")
   else:
-    dtype = draw(hps.sampled_from([np.dtype("float32"), np.dtype(jnp.bfloat16)]))
+    dtype = draw(
+        hps.sampled_from([np.dtype("float32"), np.dtype(jnp.bfloat16)])
+    )
   return q_seq_len, kv_seq_len, head_dim_qk, head_dim_v, dtype
 
 
@@ -388,9 +390,17 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_sinks=(False, True),
   )
   @hp.given(hps.data())
-  def test_splash_attention_fwd(self, is_mqa, is_segmented, is_dynamic_mask,
-                                use_base2_exp, use_max_logit_estimate,
-                                fuse_reciprocal, use_sinks, data):
+  def test_splash_attention_fwd(
+      self,
+      is_mqa,
+      is_segmented,
+      is_dynamic_mask,
+      use_base2_exp,
+      use_max_logit_estimate,
+      fuse_reciprocal,
+      use_sinks,
+      data,
+  ):
     seed = data.draw(seed_strategy())
     key = random.key(seed)
     k1, k2, k3, k_sinks = random.split(key, 4)
@@ -486,19 +496,22 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     max_logits_tol = dict(atol=1e-3, rtol=4e-3)
     if use_sinks:
       o_tol = dict(atol=1e-2, rtol=1e-1)
-      lse_tol['rtol'] = 6e-2
-    elif (use_base2_exp or use_max_logit_estimate is not None
-          or not fuse_reciprocal):
+      lse_tol["rtol"] = 6e-2
+    elif (
+        use_base2_exp
+        or use_max_logit_estimate is not None
+        or not fuse_reciprocal
+    ):
       o_tol = dict(atol=8e-3, rtol=3e-3)
     else:
       o_tol = dict(atol=4e-3, rtol=3e-3)
 
     self._assert_allclose(o, o_ref, **o_tol)
-    self._assert_allclose(stats["logsumexp"],
-                          stats_ref["logsumexp"], **lse_tol)
+    self._assert_allclose(stats["logsumexp"], stats_ref["logsumexp"], **lse_tol)
     if use_max_logit_estimate is None:
-      self._assert_allclose(stats["max_logits"],
-                            stats_ref["max_logits"], **max_logits_tol)
+      self._assert_allclose(
+          stats["max_logits"], stats_ref["max_logits"], **max_logits_tol
+      )
 
   @parameterized.product(
       is_mqa=(False, True),
@@ -603,8 +616,14 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     attn = make_mask_fn(mask)
 
-    o, attn_vjp = jax.vjp(partial(attn, max_logit_value=max_logit_value),
-                          q, k, v, segment_ids, sinks)
+    o, attn_vjp = jax.vjp(
+        partial(attn, max_logit_value=max_logit_value),
+        q,
+        k,
+        v,
+        segment_ids,
+        sinks,
+    )
     q32, k32, v32 = jax.tree.map(lambda x: x.astype(jnp.float32), (q, k, v))
     o_ref, stats_ref = splash.attention_reference(
         q32,
@@ -619,8 +638,11 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     if use_sinks:
       o_tol = dict(atol=1e-2, rtol=1e-1)
-    elif (use_base2_exp or use_max_logit_estimate is not None
-          or not fuse_reciprocal):
+    elif (
+        use_base2_exp
+        or use_max_logit_estimate is not None
+        or not fuse_reciprocal
+    ):
       o_tol = dict(atol=8e-3, rtol=1e-2)
     else:
       o_tol = dict(atol=4e-3, rtol=3e-3)
