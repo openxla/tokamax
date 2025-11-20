@@ -28,6 +28,7 @@ from flax import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+import qwix
 from tokamax._src import numerics
 from tokamax._src import quantization
 from tokamax._src.ops.attention import base
@@ -709,14 +710,14 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   @pytest.mark.long
-  @parameterized.parameters(-1, 64, 128, 256)
+  @parameterized.parameters(64, 128, 256)
   def test_quantized_int4(self, subchannel_size):
     self._test_quantized_int4(subchannel_size)
 
   def _test_quantized_int4(self, subchannel_size):
-    tile_shape = (1, 1, 1, subchannel_size)
-    quantize = quantization.quantize_as(jnp.int4, tile_shape=tile_shape)
-    quant_dequant = lambda x: quantize(x).recompose()
+    tiled_axes = {0: 1, 1: 1, 2: 1, 3: subchannel_size}
+    quantize = lambda x: qwix.quantize(x, jnp.int4, tiled_axes=tiled_axes)
+    quant_dequant = lambda x: qwix.dequantize(quantize(x))
 
     def impl(q, k, v, **kwargs):
       k, v = map(quantize, (k, v))
@@ -1138,11 +1139,13 @@ class AttentionManualPartitioningTestBase(parameterized.TestCase):
 
   @parameterized.product(
       partition_axis=_PARTITION_AXES,
-      tile_shape=((1, 1, 1, -1), (1, -1, 1, 1), (1, -1, -1, -1)),
+      channelwise_axes=((0, 1, 2), (0, 2, 3), (0,)),
       quantize_q=(True, False),
   )
-  def test_quantized_int8(self, partition_axis, tile_shape, quantize_q):
-    quantize = quantization.quantize_as(jnp.int8, tile_shape=tile_shape)
+  def test_quantized_int8(self, partition_axis, channelwise_axes, quantize_q):
+    quantize = functools.partial(
+        qwix.quantize, qtype=jnp.int8, channelwise_axes=channelwise_axes
+    )
 
     def impl(q, k, v, **kwargs):
       q = quantize(q) if quantize_q else q

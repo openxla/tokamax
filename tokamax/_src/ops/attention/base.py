@@ -431,10 +431,7 @@ class DotProductAttention(
       if mask.is_causal and q_indices is None:
         q_indices = jnp.arange(q.shape[-3])
 
-    def qkv_axes(x, axes):
-      if isinstance(x, QuantizedArray):
-        return QuantizedArray(axes, axes)  # pytype: disable=wrong-arg-types
-      return axes
+    qkv_axes = lambda x, axes: jax.tree.map(lambda _: axes, x)
 
     # TODO: Derive in_axes from the type annotations.
     in_axes = (
