@@ -1,0 +1,20 @@
+name: Run Benchmarks
+
+on:
+  # Allow manual runs from the Actions tab for testing
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 0 * * *"  # Runs at 00:00 UTC every day
+
+permissions:
+  contents: read
+
+jobs:
+  run_benchmarks:
+    name: Run Tokamax Attention Benchmark
+    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@b205d4122223ac8630478fd97e244d484f1873c7
+    with:
+      registry_file: "tokamax/benchmarking/benchmark_registry.pbtxt"
+      workflow_type: "SCHEDULED"
+      ml_actions_ref: "b205d4122223ac8630478fd97e244d484f1873c7"

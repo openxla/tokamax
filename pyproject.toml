@@ -31,6 +31,7 @@ dependencies = [
     "typing_extensions>=4.5.0",
     "typeguard==2.13.3",
     "xprof",
+    "immutabledict",
 ]
 [project.optional-dependencies]
 test = [
