@@ -21,8 +21,8 @@ requires-python = ">=3.11"
 dependencies = [
     "absl-py>=2.3.0",
     "einshape",
-    "jax>=0.8.0",
-    "jaxlib>=0.8.0",
+    "jax>=0.8.1",
+    "jaxlib>=0.8.1",
     "jaxtyping>=0.3",
     "pydantic>=2.11.0",
     "qwix>=0.1.2",

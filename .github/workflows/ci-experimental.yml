@@ -50,7 +50,6 @@ jobs:
           python3.12 -m uv pip --version
           python3.12 -m uv pip install -e .[cuda,tpu,test]
           python3.12 -m uv pip freeze
-          python3.12 -m uv pip install -U --pre jax jaxlib libtpu requests -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
       - name: Test Tokamax ops with unittest
         run: |
           pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/splash_attention_kernel_sharded_test.py" tokamax/_src/ops/experimental/tpu
