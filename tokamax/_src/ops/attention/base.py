@@ -18,7 +18,7 @@ import dataclasses
 import functools
 import math
 import types
-from typing import Any, Literal, NotRequired, Self, TypeVar, TypedDict, overload
+from typing import Any, Literal, NotRequired, TypeVar, TypedDict, overload
 import jax
 from jax import export
 from jax.experimental import shard_map
@@ -40,7 +40,6 @@ class AUTO:  # Used as a sentinel value.
 
 
 QArray = qwix.QArray
-QuantizedArray = quantization.QuantizedArray
 
 
 @jax.tree_util.register_dataclass
@@ -222,9 +221,9 @@ class DotProductAttention(
   @overload
   def __call__(
       self,
-      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
-      k: Float[Array | QuantizedArray | QArray, "*b t h D"],
-      v: Float[Array | QuantizedArray | QArray, "*b t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*b t h D"],
+      v: Float[Array | QArray, "*b t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -251,9 +250,9 @@ class DotProductAttention(
   @overload
   def __call__(
       self,
-      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
-      k: Float[Array | QuantizedArray | QArray, "*b t h D"],
-      v: Float[Array | QuantizedArray | QArray, "*b t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*b t h D"],
+      v: Float[Array | QArray, "*b t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -280,9 +279,9 @@ class DotProductAttention(
   @jaxtyping.jaxtyped
   def __call__(
       self,
-      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
-      k: Float[Array | QuantizedArray | QArray, "*b t h D"],
-      v: Float[Array | QuantizedArray | QArray, "*b t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*b t h D"],
+      v: Float[Array | QArray, "*b t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -481,9 +480,9 @@ class DotProductAttention(
   @override
   def bind(
       self,
-      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
-      k: Float[Array | QuantizedArray | QArray, "*b t h D"],
-      v: Float[Array | QuantizedArray | QArray, "*b t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*b t h D"],
+      v: Float[Array | QArray, "*b t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -514,8 +513,6 @@ class DotProductAttention(
 
     if paging_info is None and k.shape[:-3] != q.shape[:-3]:
       raise ValueError("`k` batch size must be the same as `q`.")
-
-    q, k, v = map(quantization.as_array_or_qarray, (q, k, v))
 
     if not isinstance(precision, tuple):
       precision = (precision, precision)
