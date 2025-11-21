@@ -328,17 +328,34 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     lhs, rhs = ba.args
-    (_, k), (_, _, n) = lhs.shape, rhs.shape
-    k_ = ((k + 128 - 1) // 128) * 128
+
+    dims = ba.arguments.get(
+        "ragged_dot_dimension_numbers", DEFAULT_RAGGED_DOT_DIM_NUMS
+    )
+    if dims == DEFAULT_RAGGED_DOT_DIM_NUMS:
+      (_, k), (_, _, n) = lhs.shape, rhs.shape
+    elif dims == DLHS_RAGGED_DOT_DIM_NUMS:
+      (_, n), (_, k, _) = lhs.shape, rhs.shape
+    elif dims == DRHS_RAGGED_DOT_DIM_NUMS:
+      (_, k), (_, n) = lhs.shape, rhs.shape
+    else:
+      raise NotImplementedError(UNSUPPORTED_DIMENSIONS_MSG.format(dims))
+
+    k_ = ((k + 128 - 1) // 128) * 128  # round up to nearest multiple of 128
     n_ = ((n + 128 - 1) // 128) * 128
+
     # Based on some empirical TPU tiling performance. Create a reasonable
     # tiling search space.
     tile_m_range = [64 * (2**i) for i in range(8)]
     tile_k_range = set(
-        [128 * (2**i) for i in range(8)] + [k_ // (2**i) for i in range(6)]
+        [128 * (2**i) for i in range(8)]  # upwards powers of 2
+        + [k_ // (2**i) for i in range(6)]  # downwards divisors of k_
+        + [k]  # full tile
     )
     tile_n_range = set(
-        [128 * (2**i) for i in range(8)] + [n_ // (2**i) for i in range(6)]
+        [128 * (2**i) for i in range(8)]  # upwards powers of 2
+        + [n_ // (2**i) for i in range(6)]  # downwards divisors of n_
+        + [n]  # full tile
     )
     return set(
         Config(gmm_tiling=(tile_m, tile_k, tile_n))
