@@ -863,7 +863,7 @@ class AttentionTestBase(parameterized.TestCase):
         and (self._supports_bias or bias is None)
     )
 
-    is_quantized = any(isinstance(x, base.QuantizedArray) for x in (q, k, v))
+    is_quantized = any(isinstance(x, qwix.QArray) for x in (q, k, v))
     test_vjp = (
         self._supports_vjp and not is_quantized and q.shape[-2] == k.shape[-2]
     )
