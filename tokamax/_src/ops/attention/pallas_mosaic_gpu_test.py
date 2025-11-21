@@ -19,7 +19,7 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import pytest
-from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as fa
+from tokamax._src.ops.attention import pallas_mosaic_gpu as fa
 from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
 from typing_extensions import override
