@@ -33,6 +33,17 @@ dependencies = [
     "xprof",
     "immutabledict",
 ]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"" = ["data/autotuning/*/*.json",]
+
 [project.optional-dependencies]
 test = [
     "chex>=0.1.91",
