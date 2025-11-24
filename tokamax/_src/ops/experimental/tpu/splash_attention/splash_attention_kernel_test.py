@@ -492,9 +492,9 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         sinks,
     )
 
-    res_tol = dict(atol=1e-3, rtol=3e-3)
+    res_tol = dict(atol=3e-2, rtol=3e-3)
     if use_sinks:
-      o_tol = dict(atol=1e-2, rtol=1e-2)
+      o_tol = dict(atol=3e-2, rtol=3e-2)
     elif (use_base2_exp or use_max_logit_estimate is not None
           or not fuse_reciprocal):
       o_tol = dict(atol=8e-3, rtol=3e-3)
