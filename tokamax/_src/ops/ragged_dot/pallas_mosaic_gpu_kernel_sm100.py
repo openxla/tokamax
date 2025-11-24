@@ -18,6 +18,7 @@ import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
@@ -68,7 +69,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   # num_stages must be less than or equal to the number of blocks
   num_stages = min(num_stages, k_w // block_k)
 
-  group_info = common.GroupInfo.create(
+  group_info = common.GroupInfo.create_aligned(
       group_sizes, block_m, pl.cdiv(m, block_m) + num_groups - 1
   )
   m_iters = pl.cdiv(m, block_m) + num_groups - 1
@@ -78,7 +79,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
     (
         x_gmem,
         w_gmem,
-        block_gmem,
+        _,
         group_id_gmem,
         start_within_block_gmem,
         actual_size_gmem,
@@ -98,9 +99,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
     num_k_iters = pl.cdiv(k, block_k)
     cluster_idx = lax.axis_index("x")
 
-    @plgpu.dynamic_scheduling_loop(
-        grid_names=("mn_linear",), thread_axis="wg", init_carry=0
-    )
+    @plgpu.nd_loop((m_iters * n_iters,), collective_axes=("sm",), init_carry=0)
     def mn_loop(loop_info: plgpu.NDLoopInfo, carry):
       (lin_idx,) = loop_info.index
       tid_m, ni = plgpu.planar_snake(
@@ -111,13 +110,12 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       )
 
       wg = jax.lax.axis_index("wg")
-      mi = block_gmem[tid_m]
       group_id = group_id_gmem[tid_m]
       start_within_block = start_within_block_gmem[tid_m]
       actual_size = actual_size_gmem[tid_m]
       block_start = block_start_gmem[tid_m]
       acc_slot = lax.rem(carry, jnp.int32(2))
-      slice_m = pl.ds(mi * block_m, block_m)
+      slice_m = pl.ds(block_start, block_m)
       slice_n = pl.ds(ni * block_n, block_n)
       slice_acc_m = pl.ds(acc_slot * block_m, block_m)
 
@@ -288,14 +286,15 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
         collective_axes="wg",
     )
 
+  num_sms = backend.get_default_device().core_count
   profile = False
   f = plgpu.kernel(
       kernel_entry,
       out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
       num_threads=2,
       thread_name="wg",
-      grid=(m_iters * n_iters,),
-      grid_names=("mn_linear",),
+      grid=(num_sms // 2,) if collective else (num_sms,),
+      grid_names=("sm",),
       cluster=(1 + collective,),
       cluster_names=("x",),
       compiler_params=plgpu.CompilerParams(
