@@ -8,7 +8,7 @@ benchmarks {
   update_frequency_policy: QUARTERLY
   workload {
     python_workload {
-      script_path: "tokamax/benchmarking/attention.py"
+      script_path: "tokamax/benchmarks/attention.py"
       python_version: "3.11"
     }
   }
