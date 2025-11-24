@@ -17,19 +17,19 @@
 
 import functools
 import math
-from absl.testing import absltest, parameterized
+
+from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from jax import random
-from jax import shard_map
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec
 import numpy as np
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_test_utils as test_utils
 
 
+PartitionSpec = jax.sharding.PartitionSpec
 P = jax.P
 partial = functools.partial
 
@@ -119,7 +119,7 @@ class SplashAttentionShardingTest(PallasBaseTest):
       )
 
     @partial(
-        shard_map,
+        jax.shard_map,
         mesh=mesh,
         in_specs=(
             kernel_spec,
@@ -195,7 +195,7 @@ class SplashAttentionShardingTest(PallasBaseTest):
       )
 
     @partial(
-        shard_map,
+        jax.shard_map,
         mesh=mesh,
         in_specs=(
             kernel_spec,

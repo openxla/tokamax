@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import annotations
-
 from collections.abc import Callable
 import dataclasses
 import functools
@@ -31,7 +29,6 @@ import numpy as np
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_test_utils as test_utils
-from tokamax._src.ops.experimental.tpu.splash_attention.splash_attention_mask_info import process_mask
 
 
 jax.config.parse_flags_with_absl()

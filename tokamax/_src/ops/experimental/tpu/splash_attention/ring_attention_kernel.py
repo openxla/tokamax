@@ -14,7 +14,6 @@
 # ==============================================================================
 
 """Implementation of Ring Attention."""
-from __future__ import annotations
 
 import functools
 from typing import Any
@@ -38,8 +37,8 @@ SplashConfig = splash_kernel.SplashConfig
 SplashResidualsType = splash_kernel.SplashResidualsType
 SplashCustomReturnType = splash_kernel.SplashCustomReturnType
 MaskFunctionType = splash_kernel.MaskFunctionType
-_splash_attention_forward = splash_kernel._splash_attention_forward
-_splash_attention_bwd = splash_kernel._splash_attention_bwd
+_splash_attention_forward = splash_kernel._splash_attention_forward  # pylint: disable=protected-access
+_splash_attention_bwd = splash_kernel._splash_attention_bwd  # pylint: disable=protected-access
 DEFAULT_MASK_VALUE = splash_kernel.DEFAULT_MASK_VALUE
 
 

@@ -14,20 +14,19 @@
 # ==============================================================================
 
 """Mini-mask creation library."""
-from __future__ import annotations
 
 import collections
 import functools
 from typing import Any, NamedTuple
 
 import jax
-import jax.lax as lax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 
 # mypy: ignore-errors
 
+lax = jax.lax
 MaskCallable = Any
 
 

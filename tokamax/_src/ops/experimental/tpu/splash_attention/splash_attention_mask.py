@@ -15,11 +15,9 @@
 
 """Mini-mask creation library."""
 
-from __future__ import annotations
-
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 import dataclasses
-from typing import Any
+from typing import Any, Self
 
 import numpy as np
 
@@ -42,14 +40,14 @@ class Mask:
         ' instead of bitwise operations on masks.'
     )
 
-  def __or__(self, other: Mask) -> Mask:
+  def __or__(self, other: Self) -> Self:
     if self.shape != other.shape:
       raise ValueError(
           f'Invalid shape for other: {other.shape}, expected: {self.shape}'
       )
     return LogicalOr(self, other)
 
-  def __and__(self, other: Mask) -> Mask:
+  def __and__(self, other: Self) -> Self:
     if self.shape != other.shape:
       raise ValueError(
           f'Invalid shape for other: {other.shape}, expected: {self.shape}'

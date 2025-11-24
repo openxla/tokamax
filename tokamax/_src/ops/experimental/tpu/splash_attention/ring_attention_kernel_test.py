@@ -16,19 +16,19 @@
 
 import functools
 import math
-from absl.testing import absltest, parameterized
+
+from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from jax import random
-from jax import shard_map
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P
 import numpy as np
+from tokamax._src.ops.experimental.tpu.splash_attention import ring_attention_kernel
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_test_utils as test_utils
-from tokamax._src.ops.experimental.tpu.splash_attention.ring_attention_kernel import make_ring_attention
 
-
+P = jax.sharding.PartitionSpec
 partial = functools.partial
 
 jax.config.parse_flags_with_absl()
@@ -171,7 +171,7 @@ class RingAttentionTest(PallasBaseTest):
 
     # Shardmap reference kernel for splash attention
     @partial(
-        shard_map,
+        jax.shard_map,
         mesh=mesh,
         in_specs=(q_spec, P(), P()),
         out_specs=q_spec,
@@ -183,7 +183,7 @@ class RingAttentionTest(PallasBaseTest):
       return o
 
     # Ring kernel for splash attention
-    ring_kernel = make_ring_attention(
+    ring_kernel = ring_attention_kernel.make_ring_attention(
         mask,
         is_mqa=is_mqa,
         ring_axis="ring",
@@ -192,7 +192,7 @@ class RingAttentionTest(PallasBaseTest):
     )
 
     @partial(
-        shard_map,
+        jax.shard_map,
         mesh=mesh,
         in_specs=(
             q_spec,
@@ -217,7 +217,7 @@ class RingAttentionTest(PallasBaseTest):
 
     # Ring attention backward pass wrapped in shardmap
     @partial(
-        shard_map,
+        jax.shard_map,
         mesh=mesh,
         in_specs=(
             q_spec,
@@ -243,7 +243,7 @@ class RingAttentionTest(PallasBaseTest):
     # Reference splash attention backward pass wrapped in shardmap
 
     @partial(
-        shard_map,
+        jax.shard_map,
         mesh=mesh,
         in_specs=(P(), P(), P(), P()),  # k  # v
         out_specs=(
