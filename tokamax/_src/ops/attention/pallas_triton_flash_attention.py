@@ -200,7 +200,7 @@ def _fwd_kernel_impl(
 
     if bias_ref is not None:
       bias_slice_k = slice_k if (bias_ref.shape[-1] > 1) else slice(None)
-      s += pl.load(bias_ref, (slice(None), bias_slice_k))
+      s += plgpu.load(bias_ref.at[:, bias_slice_k])
 
     if logits_soft_cap is not None:
       s = logits_soft_cap * jnp.tanh(s / logits_soft_cap)
@@ -223,7 +223,7 @@ def _fwd_kernel_impl(
         mask = mask & (1 << (jnp.arange(block_k) % 8))
       else:
         mask_slice_k = slice_k if (mask_ref.shape[-1] > 1) else slice(None)
-        mask = pl.load(mask_ref, (slice(None), mask_slice_k))
+        mask = plgpu.load(mask_ref.at[:, mask_slice_k])
       s = jnp.where(mask, s, mask_value)
 
     if q_start is not None:
@@ -257,7 +257,7 @@ def _fwd_kernel_impl(
       dropout_mask_slice_k = (
           slice_k if (dropout_mask_ref.shape[-1] > 1) else slice(None)
       )
-      dropout_mask = pl.load(dropout_mask_ref, (slice(None), dropout_mask_slice_k))
+      dropout_mask = plgpu.load(dropout_mask_ref.at[:, dropout_mask_slice_k])
       p *= dropout_mask.astype(p.dtype) / (1 - dropout_rate)
 
     for i in range(split_d_out):

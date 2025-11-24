@@ -85,11 +85,11 @@ def _ragged_dot_kernel(
         tile_k = a_ref.shape[1] // a_scales_ref.shape[1]
         if tile_k % block_k == 0:
           offs_k = pl.ds(start_k // tile_k, 1)
-          a_scales = pl.load(a_scales_ref, (span_m, offs_k))
+          a_scales = plgpu.load(a_scales_ref.at[span_m, offs_k])
         else:
           offs_m = (start_m + jnp.arange(block_m))[:, None]
           offs_k = ((start_k + jnp.arange(block_k)) // tile_k)[None, :]
-          a_scales = pl.load(a_scales_ref, (offs_m, offs_k))
+          a_scales = plgpu.load(a_scales_ref.at[offs_m, offs_k])
 
       b_scales = None
       if b_scales_ref is not None:
@@ -103,14 +103,14 @@ def _ragged_dot_kernel(
           offs_k = (start_k + jnp.arange(block_k)) // tile_k
         if tile_n % block_n == 0:
           offs_n = pl.ds(start_n // tile_n, 1)
-          b_scales = pl.load(b_scales_ref, (offs_k, offs_n))
+          b_scales = plgpu.load(b_scales_ref.at[offs_k, offs_n])
         elif tile_n == 1:
           offs_n = pl.ds(start_n, block_n)
-          b_scales = pl.load(b_scales_ref, (offs_k, offs_n))
+          b_scales = plgpu.load(b_scales_ref.at[offs_k, offs_n])
         else:
           offs_k = ((start_k + jnp.arange(block_k)) // tile_k)[:, None]
           offs_n = ((start_n + jnp.arange(block_n)) // tile_n)[None, :]
-          b_scales = pl.load(b_scales_ref, (offs_k, offs_n))
+          b_scales = plgpu.load(b_scales_ref.at[offs_k, offs_n])
 
       if (
           a_scales is not None
@@ -249,8 +249,8 @@ def _ragged_contracting_dim_dot_kernel(
     if mask_k:
       mask = (jnp.arange(block_k) < hi - start_k)[:, None]
       other = 0.0
-    a = pl.load(a_ref, span_k, mask=mask, other=other)
-    b = pl.load(b_ref, span_k, mask=mask, other=other)
+    a = plgpu.load(a_ref.at[span_k], mask=mask, other=other)
+    b = plgpu.load(b_ref.at[span_k], mask=mask, other=other)
     dtype = jnp.result_type(a, b)
     a = a.astype(dtype)
     b = b.astype(dtype)
