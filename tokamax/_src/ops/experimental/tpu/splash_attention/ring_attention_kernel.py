@@ -75,7 +75,7 @@ def _ring_attention_forward(
 
   splash_fwd_partial = partial(
       _splash_attention_forward,
-      fwd_mask_info=fwd_mask_info,
+      mask_info=fwd_mask_info,
       save_residuals=True,
       mask_value=mask_value,
       is_mqa=is_mqa,

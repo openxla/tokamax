@@ -373,37 +373,6 @@ class SplashConfig:
 
 to_i32 = lambda x: x.astype(jnp.int32)
 
-
-def _unravel(f, grid_width, transposed_grid=False):
-  """Creates a Pallas index_map for a 2D grid of blocks.
-
-  Wraps a function `f` to map a 1D grid index to 2D `(i, j)` block indices.
-  The mapping is dense if metadata is provided, otherwise it's a sparse
-  lookup.
-
-  Args:
-    f: Function to call with computed indices: `f(h, i, j, refs)`.
-    grid_width: The logical grid width for dense mapping.
-    transposed_grid: If True, swaps `i` and `j` indices before calling `f`.
-  """
-
-  def index_map(h, grid_idx, rows_ref, cols_ref, *refs):
-    if rows_ref is None:
-      assert cols_ref is None
-      i = grid_idx // grid_width
-      j = grid_idx % grid_width
-    else:
-      i = to_i32(rows_ref[grid_idx])
-      j = to_i32(cols_ref[grid_idx])
-
-    if transposed_grid:
-      i, j = j, i
-
-    return f(h, i, j, refs)
-
-  return index_map
-
-
 def _apply_mask_and_soft_cap(
     qk: jax.Array,
     mask_value: float,
@@ -717,7 +686,7 @@ def _div(dividend: int, divisor: int):
 
 
 def _splash_attention_forward(
-    fwd_mask_info: MaskInfo,
+    mask_info: MaskInfo,
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
@@ -735,9 +704,7 @@ def _splash_attention_forward(
   head_dim_v = v.shape[-1]
   bq, bkv = config.block_q, config.block_kv
   bkv_compute = config.block_kv_compute
-  bounds_start, bounds_end = mask_info_lib.find_bounds(
-      fwd_mask_info.active_rows
-  )
+  bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)
   fuse_reciprocal = config.fuse_reciprocal or not save_residuals
 
   if is_mqa:
@@ -779,6 +746,7 @@ def _splash_attention_forward(
   kv_seq_len = k.shape[-2]
   kv_steps = kv_seq_len // bkv
   q_heads_per_kv_head = num_q_heads // num_kv_heads
+  dynamic_grid = mask_info.active_rows is not None
 
   if segment_ids is not None:
     if segment_ids.q.shape != (q_seq_len,):
@@ -810,20 +778,28 @@ def _splash_attention_forward(
   k_layout = config.k_layout
   v_layout = config.v_layout
 
-  unravel = partial(_unravel, grid_width=kv_steps)
+  def unravel(f):
+    def index_map(h, grid_idx, rows_ref, cols_ref, *_):
+      if dynamic_grid:
+        i = to_i32(rows_ref[grid_idx])
+        j = to_i32(cols_ref[grid_idx])
+      else:
+        i = grid_idx // kv_steps
+        j = grid_idx % kv_steps
+      return f(h, i, j)
+
+    return index_map
 
   def create_kv_index_map(layout):
-    def index_map(h, i, j, *_):
+    def index_map(h, i, j):
       del i  # Unused.
       prefix = () if is_mqa else (_div(h, q_heads_per_kv_head),)
       return from_head_minor((*prefix, j, 0), layout)
 
     return index_map
 
-  q_index_map = unravel(
-      lambda h, i, j, *_: from_head_minor((h, i, 0), q_layout)
-  )
-  out_index_map = unravel(lambda h, i, j, *_: (h, i, 0))
+  q_index_map = unravel(lambda h, i, j: from_head_minor((h, i, 0), q_layout))
+  out_index_map = unravel(lambda h, i, j: (h, i, 0))
   k_index_map = unravel(create_kv_index_map(k_layout))
   v_index_map = unravel(create_kv_index_map(v_layout))
 
@@ -832,8 +808,8 @@ def _splash_attention_forward(
     next_m = to_i32(mask_next_ref[grid_idx])
     return next_m, 0, 0
 
-  q_segment_ids_index_map = unravel(lambda h, i, j, *_: (i, 0))
-  kv_segment_ids_index_map = unravel(lambda h, i, j, *_: (0, j))
+  q_segment_ids_index_map = unravel(lambda h, i, j: (i, 0))
+  kv_segment_ids_index_map = unravel(lambda h, i, j: (0, j))
 
   # Convert the logical shape from head-minor to sequence-minor.
   in_specs = [
@@ -885,19 +861,16 @@ def _splash_attention_forward(
   else:
     in_specs += [None]
 
-  if fwd_mask_info.partial_mask_blocks is not None:
+  if mask_info.partial_mask_blocks is not None:
     in_specs.append(pl.BlockSpec((None, bq, bkv), mask_index_map))
   else:
     in_specs.append(None)
 
-  assert (
-      fwd_mask_info.partial_mask_blocks is None
-      or fwd_mask_info.q_sequence is None
-  )
+  assert mask_info.partial_mask_blocks is None or mask_info.q_sequence is None
 
-  if fwd_mask_info.q_sequence is not None:
+  if mask_info.q_sequence is not None:
     q_sequence = jax.lax.broadcast_in_dim(
-        fwd_mask_info.q_sequence, (q_seq_len, NUM_LANES), (0,)
+        mask_info.q_sequence, (q_seq_len, NUM_LANES), (0,)
     )
     in_specs.append(pl.BlockSpec((bq, NUM_LANES), q_segment_ids_index_map))
   else:
@@ -1004,18 +977,16 @@ def _splash_attention_forward(
       v,
       q_segment_ids,
       kv_segment_ids,
-      fwd_mask_info.partial_mask_blocks,
+      mask_info.partial_mask_blocks,
   ]
   cost_estimate = config.fwd_cost_estimate or _fwd_cost_estimate(
       *vmem_inputs, out_shapes, fwd_mask_sparsity
   )
 
-  if fwd_mask_info.num_active_blocks is not None:
-    grid_size = fwd_mask_info.num_active_blocks[0]
+  if dynamic_grid:
+    grid = (num_q_heads, mask_info.num_active_blocks[0])
   else:
-    grid_size = kv_steps * (q_seq_len // bq)
-
-  grid = (num_q_heads, grid_size)
+    grid = (num_q_heads, kv_steps * (q_seq_len // bq))
 
   with jax.named_scope(kernel_name):
     all_out = pl.pallas_call(
@@ -1058,19 +1029,19 @@ def _splash_attention_forward(
         interpret=config.interpret,
         metadata=metadata,
     )(
-        fwd_mask_info.active_rows,
-        fwd_mask_info.active_cols,
-        fwd_mask_info.mask_next,
+        mask_info.active_rows,
+        mask_info.active_cols,
+        mask_info.mask_next,
         bounds_start,
         bounds_end,
-        fwd_mask_info.block_mask,
+        mask_info.block_mask,
         q if q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT,
         k if k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
         v if v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
         q_segment_ids,
         kv_segment_ids,
         sinks,
-        fwd_mask_info.partial_mask_blocks,
+        mask_info.partial_mask_blocks,
         q_sequence,
         max_logit_value,
     )
@@ -2084,7 +2055,7 @@ class SplashAttentionKernel:
 
 
 def _make_splash_attention(
-    mask: np.ndarray | jax.Array | mask_lib.Mask,
+    mask: np.ndarray | mask_lib.Mask,
     *,
     config: SplashConfig | None = None,
     is_mqa: bool,
@@ -2142,30 +2113,6 @@ def _make_splash_attention(
   )
 
 
-def _process_mask_shard(
-    mask: jax.Array,
-    *,
-    config: SplashConfig,
-    downcast_smem_data: bool,
-    partial_mask_blocks_dtype: jax.typing.DTypeLike,
-) -> tuple[MaskInfo, MaskInfo | None]:
-  process_mask_fn = functools.partial(
-      mask_info_lib._process_dynamic_mask,
-      downcast_smem_data=downcast_smem_data,
-      partial_mask_blocks_dtype=partial_mask_blocks_dtype,
-  )
-
-  fwd_mask_info = process_mask_fn(
-      mask, (config.block_q, config.block_kv), is_dkv=False
-  )
-
-  dkv_mask_info = None
-  if config.has_backward_blocks:
-    bq_dkv, bkv_dkv = config.block_q_dkv, config.block_kv_dkv
-    dkv_mask_info = process_mask_fn(mask, (bq_dkv, bkv_dkv), is_dkv=True)
-
-  return (fwd_mask_info, dkv_mask_info)
-
 
 def _make_dynamic_splash_attention(
     mask: jax.Array,
@@ -2193,55 +2140,68 @@ def _make_dynamic_splash_attention(
   if config is None:
     config = SplashConfig.get_default()
 
-  processing_fn = partial(
-      _process_mask_shard,
-      config=config,
-      downcast_smem_data=downcast_smem_data,
-      partial_mask_blocks_dtype=partial_mask_blocks_dtype,
-  )
+  # This is the only mode that supports the dynamic grid.
+  config = dataclasses.replace(config, dq_reduction_steps=3)
+
+  def process_mask_shard(mask):
+    process_mask_fn = functools.partial(
+        mask_info_lib._process_dynamic_mask,
+        downcast_smem_data=downcast_smem_data,
+        partial_mask_blocks_dtype=partial_mask_blocks_dtype,
+    )
+
+    fwd_mask_info = process_mask_fn(
+        mask, (config.block_q, config.block_kv), is_dkv=False
+    )
+
+    dkv_mask_info = None
+    if config.has_backward_blocks:
+      dkv_mask_info = process_mask_fn(
+          mask, (config.block_q_dkv, config.block_kv_dkv), is_dkv=True
+      )
+
+    return fwd_mask_info, dkv_mask_info
 
   kwargs = dict(
       config=config,
       is_mqa=is_mqa,
       save_residuals=save_residuals,
       mask_value=mask_value,
-      attn_logits_soft_cap=config.attn_logits_soft_cap,
-      residual_checkpoint_name=config.residual_checkpoint_name,
       mask_function=None,
       fwd_mask_sparsity=1.0,
-      interpret=config.interpret,
   )
 
   # If the input mask is replicated we don't need to call shard_map.
   if mask_spec is None:
-    fwd_mask_info, dkv_mask_info = processing_fn(mask)
+    fwd_mask_info, dkv_mask_info = process_mask_shard(mask)
     kernel = SplashAttentionKernel(fwd_mask_info, dkv_mask_info, **kwargs)
     return kernel
 
   mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
       mask_next=mask_spec,
-      active_rows=mask_spec,
-      active_cols=mask_spec,
-      num_active_blocks=mask_spec,
+      active_rows=None,
+      active_cols=None,
+      num_active_blocks=None,
       block_mask=mask_spec,
       partial_mask_blocks=mask_spec,
       q_sequence=None,
   )
-  has_dkv_mask_info = config.has_backward_blocks
-  in_specs = mask_spec
   out_specs = (
       mask_info_specs,
-      mask_info_specs if has_dkv_mask_info else None,
+      mask_info_specs if config.has_backward_blocks else None,
   )
 
-  fwd_mask_info, dkv_mask_info = jax.shard_map(
-      processing_fn,
+  @partial(
+      jax.shard_map,
       mesh=mesh,
-      in_specs=in_specs,
+      in_specs=mask_spec,
       out_specs=out_specs,
       check_vma=False,
-  )(mask)
+  )
+  def process_all_shards(mask):
+    return process_mask_shard(mask)
 
+  fwd_mask_info, dkv_mask_info = process_all_shards(mask)
   kernel = SplashAttentionKernel(fwd_mask_info, dkv_mask_info, **kwargs)
   kernel_spec = SplashAttentionKernel(*out_specs, **kwargs)
 
@@ -2251,13 +2211,9 @@ def _make_dynamic_splash_attention(
 make_splash_mha = partial(_make_splash_attention, is_mqa=False)
 make_splash_mqa = partial(_make_splash_attention, is_mqa=True)
 
-make_splash_mha_single_device = partial(
-    make_splash_mha, is_mqa=False, q_seq_shards=1
-)
+make_splash_mha_single_device = partial(make_splash_mha, q_seq_shards=1)
 
-make_splash_mqa_single_device = partial(
-    make_splash_mha, is_mqa=True, q_seq_shards=1
-)
+make_splash_mqa_single_device = partial(make_splash_mqa, q_seq_shards=1)
 
 make_dynamic_splash_mqa = partial(_make_dynamic_splash_attention, is_mqa=True)
 make_dynamic_splash_mha = partial(_make_dynamic_splash_attention, is_mqa=False)

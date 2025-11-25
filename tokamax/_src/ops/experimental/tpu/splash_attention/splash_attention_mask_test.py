@@ -1523,10 +1523,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
 
     self.assertIn("softmax", str(ctx.exception))
 
-  @parameterized.parameters((False,), (True,))
-  def test_dynamic_mask(self, is_dkv: bool):
-    # TODO: Re-enable once dynamic masks are fixed.
-    self.skipTest("Dynamic masks not supported.")
+  def test_dynamic_mask(self):
     q_seq_len, kv_seq_len = 8, 8
     block_shape = (2, 4)
 
@@ -1536,21 +1533,17 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         mask_info_lib.process_dynamic_mask,
         static_argnames=["block_shape", "is_dkv"],
     )
-    mask_info = process_dynamic_mask_fn(
-        mask, block_shape=block_shape, is_dkv=is_dkv
-    )
 
-    _expected_block_mask = np.array(
-        [
-            [1, 0],
-            [1, 0],
-            [2, 1],
-            [2, 1],
-        ],
-        dtype=np.int8,
-    )
+    args = (mask, block_shape)
+    mask_info = process_dynamic_mask_fn(*args)
+    mask_info_dkv = process_dynamic_mask_fn(*args, is_dkv=True)
 
-    _expected_partial_mask_blocks = np.array(
+    expected_mask_next = np.array([0, 2, 0, 5, 0, 7, 0, 0], dtype=np.int8)
+    expected_block_mask = np.array([1, 1, 2, 1, 2, 1, 0, 0], dtype=np.int8)
+    expected_active_rows = np.array([0, 1, 2, 2, 3, 3, 0, 0], dtype=np.int32)
+    expected_active_cols = np.array([0, 0, 0, 1, 0, 1, 0, 0], dtype=np.int32)
+    expected_num_active_blocks = np.array([6], dtype=np.int32)
+    expected_partial_mask_blocks = np.array(
         [
             [[1, 0, 0, 0], [1, 1, 0, 0]],
             [[0, 0, 0, 0], [0, 0, 0, 0]],
@@ -1564,29 +1557,33 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         dtype=np.int8,
     )
 
-    _expected_mask_next = np.array(
-        [
-            [0, 0],
-            [2, 0],
-            [0, 5],
-            [0, 7],
-        ],
-        dtype=np.int8,
+    expected_mask_info = mask_info_lib.MaskInfo(
+        expected_mask_next,
+        expected_active_rows,
+        expected_active_cols,
+        expected_block_mask,
+        expected_num_active_blocks,
+        expected_partial_mask_blocks,
+        None,
     )
 
-    if is_dkv:
-      _expected_partial_mask_blocks = _expected_partial_mask_blocks.swapaxes(
-          -1, -2
-      )
+    expected_mask_next_dkv = np.array([0, 2, 0, 0, 5, 7, 0, 0], dtype=np.int8)
+    expected_active_rows_dkv = np.array([0, 0, 0, 0, 1, 1, 0, 0], dtype=np.int32)
+    expected_active_cols_dkv = np.array([0, 1, 2, 3, 2, 3, 0, 0], dtype=np.int32)
+    expected_block_mask_dkv = np.array([1, 1, 2, 2, 1, 1, 0, 0], dtype=np.int8)
+    expected_num_active_blocks_dkv = np.array([6], dtype=np.int32)
 
-    self._assert_array_equal(mask_info.block_mask, _expected_block_mask)
-    self._assert_array_equal(
-        mask_info.partial_mask_blocks.reshape(
-            -1, *mask_info.partial_mask_blocks.shape[-2:]
-        ),
-        _expected_partial_mask_blocks,
+    expected_mask_info_dkv = mask_info_lib.MaskInfo(
+        expected_mask_next_dkv,
+        expected_active_rows_dkv,
+        expected_active_cols_dkv,
+        expected_block_mask_dkv,
+        expected_num_active_blocks_dkv,
+        expected_partial_mask_blocks.swapaxes(-1, -2),
+        None,
     )
-    self._assert_array_equal(mask_info.mask_next, _expected_mask_next)
+    self._assert_mask_info_match(mask_info, expected_mask_info)
+    self._assert_mask_info_match(mask_info_dkv, expected_mask_info_dkv)
 
 
 if __name__ == "__main__":

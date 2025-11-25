@@ -323,14 +323,8 @@ def _process_dynamic_mask(
     ValueError: if the input mask is invalid or the block sizes are not
     compatible with the mask sizes.
   """
-  # TODO: Fix dynamic mask processing with the new sparsity format.
-  raise NotImplementedError('Dynamic masks not supported.')
-
   if len(mask.shape) != 2:
     raise ValueError(f'Expected a 2-dim mask, instead got: {mask.shape}.')
-
-  if mask.dtype != jnp.bool:
-    raise ValueError(f'Expected a bool mask, instead got: {mask.dtype}.')
 
   q_seq_len, kv_seq_len = mask.shape
   q_block_size, kv_block_size = block_shape
@@ -343,7 +337,7 @@ def _process_dynamic_mask(
     raise ValueError(f'{kv_block_size=} should divide {kv_seq_len=}.')
 
   # Tile the last 2 dimensions of the mask into 2D tiles of size `block_shape`.
-  partial_mask_blocks = (
+  mask_blocks = (
       mask.reshape(
           q_blocks_count,
           q_block_size,
@@ -354,19 +348,41 @@ def _process_dynamic_mask(
       .astype(partial_mask_blocks_dtype)
   )
 
-  # The block mask is 2 for all blocks with all entries set to True and 1 for
-  # blocks with a mix of True and False entries.
-  is_full_mask = jnp.all(partial_mask_blocks, axis=(-1, -2))
-  is_empty_mask = jnp.logical_not(jnp.any(partial_mask_blocks, axis=(-1, -2)))
-  block_mask = (1 + is_full_mask - is_empty_mask).astype(jnp.int32)
+  any_mask = jnp.any(mask_blocks, axis=(-1, -2)).astype(np.int32)
+  all_mask = jnp.all(mask_blocks, axis=(-1, -2)).astype(np.int32)
+  block_mask = any_mask + all_mask
 
-  mask_next = jnp.arange(
-      q_blocks_count * kv_blocks_count, dtype=np.int32
-  ).reshape(q_blocks_count, kv_blocks_count)
+  block_ids = jnp.arange(block_mask.size, dtype=np.int32).reshape(
+      block_mask.shape
+  )
+  if is_dkv:
+    block_mask = block_mask.swapaxes(-1, -2)
+    block_ids = block_ids.swapaxes(-1, -2)
+    mask_blocks = mask_blocks.swapaxes(-1, -2)
+
+  active_mask = block_mask > 0
+  if is_dkv:
+    # If an entire row is masked then that kv output tile won't be visited.
+    # We extend the grid to visit these tiles to initialize them.
+    empty_rows = jnp.all(block_mask == 0, axis=-1)
+    first_col = jnp.arange(block_mask.shape[1]) == 0
+    active_mask |= (empty_rows[:, None] & first_col)
+
+  num_active_blocks = active_mask.flatten().sum(keepdims=True)
+  active_indices = jnp.argwhere(active_mask, size=active_mask.size)
+  active_rows = active_indices[:, 0].astype(np.int32)
+  active_cols = active_indices[:, 1].astype(np.int32)
+
+  block_mask = block_mask[active_rows, active_cols]
+  mask_next = block_ids[active_rows, active_cols]
   mask_next = jnp.where(block_mask == 1, mask_next, 0)
 
-  if is_dkv:
-    partial_mask_blocks = partial_mask_blocks.mT
+  # Mask out the blocks that aren't active.
+  mask = (jnp.arange(block_mask.size) < num_active_blocks).astype(np.int32)
+  block_mask = block_mask * mask
+
+  # Collapsing because the block ids are linearized.
+  mask_blocks = lax.collapse(mask_blocks, 0, 2)
 
   def _downcast(array: jax.Array, max_value: int) -> jax.Array:
     if array.size == 0:
@@ -386,16 +402,13 @@ def _process_dynamic_mask(
     block_mask = block_mask.astype(np.int8)  # values are in the range [0, 1, 2]
     mask_next = _downcast(mask_next, q_blocks_count * kv_blocks_count)
 
-  # Collapsing because the block ids are linearized.
-  partial_mask_blocks = lax.collapse(partial_mask_blocks, 0, 2)
-
   return MaskInfo(
       mask_next=mask_next,
-      active_rows=None,
-      active_cols=None,
-      block_mask=None,
-      num_active_blocks=None,
-      partial_mask_blocks=partial_mask_blocks,
+      active_rows=active_rows,
+      active_cols=active_cols,
+      block_mask=block_mask,
+      num_active_blocks=num_active_blocks,
+      partial_mask_blocks=mask_blocks,
       q_sequence=None,
   )
 

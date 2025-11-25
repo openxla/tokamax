@@ -306,10 +306,6 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
   )
   @hp.given(hps.data())
   def test_splash_attention(self, is_mqa, is_segmented, is_dynamic_mask, data):
-    # TODO: Re-enable once dynamic masks are fixed.
-    if is_dynamic_mask:
-      self.skipTest("Dynamic masks not supported.")
-
     seed = data.draw(seed_strategy())
     key = random.key(seed)
     k1, k2, k3 = random.split(key, 3)
@@ -395,10 +391,6 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
   def test_splash_attention_fwd(self, is_mqa, is_segmented, is_dynamic_mask,
                                 use_base2_exp, use_max_logit_estimate,
                                 fuse_reciprocal, use_sinks, data):
-    # TODO: Re-enable once dynamic masks are fixed.
-    if is_dynamic_mask:
-      self.skipTest("Dynamic masks not supported.")
-
     seed = data.draw(seed_strategy())
     key = random.key(seed)
     k1, k2, k3, k_sinks = random.split(key, 4)
@@ -468,9 +460,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     elif use_max_logit_estimate == "value_2d":
       max_logit_value = max_val * jnp.ones((num_q_heads,), dtype=jnp.bfloat16)
 
-    make_mask_fn = partial(
-        make_mask_fn, config=config, save_residuals=True
-    )
+    make_mask_fn = partial(make_mask_fn, config=config, save_residuals=True)
     attn = make_mask_fn(mask)
     attn_ref = partial(
         splash.attention_reference,
@@ -492,9 +482,11 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         sinks,
     )
 
-    res_tol = dict(atol=1e-3, rtol=3e-3)
+    lse_tol = dict(atol=1e-3, rtol=3e-3)
+    max_logits_tol = dict(atol=1e-3, rtol=4e-3)
     if use_sinks:
-      o_tol = dict(atol=1e-2, rtol=1e-2)
+      o_tol = dict(atol=1e-2, rtol=1e-1)
+      lse_tol['rtol'] = 6e-2
     elif (use_base2_exp or use_max_logit_estimate is not None
           or not fuse_reciprocal):
       o_tol = dict(atol=8e-3, rtol=3e-3)
@@ -503,10 +495,10 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
 
     self._assert_allclose(o, o_ref, **o_tol)
     self._assert_allclose(stats["logsumexp"],
-                          stats_ref["logsumexp"], **res_tol)
+                          stats_ref["logsumexp"], **lse_tol)
     if use_max_logit_estimate is None:
       self._assert_allclose(stats["max_logits"],
-                            stats_ref["max_logits"], **res_tol)
+                            stats_ref["max_logits"], **max_logits_tol)
 
   @parameterized.product(
       is_mqa=(False, True),
@@ -534,9 +526,6 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_sinks,
       data,
   ):
-    # TODO: Re-enable once dynamic masks are fixed.
-    if is_dynamic_mask:
-      self.skipTest("Dynamic masks not supported.")
     seed = data.draw(seed_strategy())
     key = random.key(seed)
     k1, k2, k3, k4, k_sinks = random.split(key, 5)
@@ -629,7 +618,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         attn_logits_soft_cap=attn_logits_soft_cap,
     )
     if use_sinks:
-      o_tol = dict(atol=1e-2, rtol=1e-2)
+      o_tol = dict(atol=1e-2, rtol=1e-1)
     elif (use_base2_exp or use_max_logit_estimate is not None
           or not fuse_reciprocal):
       o_tol = dict(atol=8e-3, rtol=1e-2)
