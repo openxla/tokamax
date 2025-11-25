@@ -30,7 +30,6 @@ from typing_extensions import override
 
 
 QArray = qwix.QArray
-QuantizedArray = quantization.QuantizedArray
 
 
 _Config = TypeVar("_Config")
@@ -53,9 +52,9 @@ class FlexAttention(
   @overload
   def __call__(
       self,
-      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
-      k: Float[Array | QuantizedArray | QArray, "*B t h D"],
-      v: Float[Array | QuantizedArray | QArray, "*B t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*B t h D"],
+      v: Float[Array | QArray, "*B t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -75,9 +74,9 @@ class FlexAttention(
   @overload
   def __call__(
       self,
-      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
-      k: Float[Array | QuantizedArray | QArray, "*B t h D"],
-      v: Float[Array | QuantizedArray | QArray, "*B t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*B t h D"],
+      v: Float[Array | QArray, "*B t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -97,9 +96,9 @@ class FlexAttention(
   @jaxtyping.jaxtyped
   def __call__(
       self,
-      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
-      k: Float[Array | QuantizedArray | QArray, "*B t h D"],
-      v: Float[Array | QuantizedArray | QArray, "*B t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*B t h D"],
+      v: Float[Array | QArray, "*B t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -190,9 +189,9 @@ class FlexAttention(
   @override
   def bind(
       self,
-      q: Float[Array | QuantizedArray | QArray, "*B T H D"],
-      k: Float[Array | QuantizedArray | QArray, "*B t h D"],
-      v: Float[Array | QuantizedArray | QArray, "*B t h d"],
+      q: Float[Array | QArray, "*B T H D"],
+      k: Float[Array | QArray, "*B t h D"],
+      v: Float[Array | QArray, "*B t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike

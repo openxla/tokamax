@@ -22,8 +22,8 @@ from absl.testing import parameterized
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
+import qwix
 from tokamax._src import precision as precision_utils
-from tokamax._src import quantization
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_triton_flash_attention as fa
 from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp as fa_vjp
@@ -62,7 +62,7 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
   def test_block_d(self):
     """Tests `block_d != None` with quantization and different head_dim_out."""
     assert isinstance(self._attention_fn, fa.PallasTritonFlashAttention)
-    quantize = quantization.quantize_as(jnp.int8, tile_shape=(1, 1, 1, -1))
+    quantize = lambda x: qwix.quantize(x, jnp.int8, channelwise_axes=(0, 1, 2))
     config = fa.Config(
         block_q=64,
         block_k=64,
@@ -77,7 +77,7 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
       return self._attention_fn.replace(config=config)(q, k, v, **kwargs)
 
     def ref_impl(q, k, v, **kwargs):
-      k, v = map(lambda x: quantize(x).recompose(), (k, v))
+      k, v = map(lambda x: qwix.dequantize(quantize(x)), (k, v))
       return nn.dot_product_attention(q, k, v, **kwargs)
 
     keys = jax.random.split(jax.random.PRNGKey(0), 3)
@@ -96,21 +96,18 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
   @parameterized.parameters(2, 3, 4)
   def test_split_k(self, split_k):
     self.skipTest("Too slow for OSS")
-    quantize = quantization.quantize_as(jnp.int8, tile_shape=(1, 1, 1, -1))
-    quant_dequant = lambda x: quantize(x).recompose()
+    quantize = lambda x: qwix.quantize(x, jnp.int8, channelwise_axes=(0, 1, 2))
     assert isinstance(self._attention_fn, fa.PallasTritonFlashAttention)
 
     def impl(q, k, v, **kwargs):
-      k = quantize(k)
-      v = quantize(v)
+      k, v = map(quantize, (k, v))
       config = fa.Config(
           block_q=64, block_k=64, num_warps=4, num_stages=2, split_k=split_k
       )
       return self._attention_fn.replace(config=config)(q, k, v, **kwargs)
 
     def ref_impl(q, k, v, **kwargs):
-      k = quant_dequant(k)
-      v = quant_dequant(v)
+      k, v = map(lambda x: qwix.dequantize(quantize(x)), (k, v))
       return nn.dot_product_attention(q, k, v, **kwargs)
 
     shape = (2, 1024, 4, 64)

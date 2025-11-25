@@ -682,17 +682,19 @@ class AttentionTestBase(parameterized.TestCase):
 
   @pytest.mark.long
   @parameterized.product(
-      tile_shape=(
-          (1, 1, 1, -1),
+      channelwise_axes=(
+          (0, 1, 2),
       ),
       quantize_q=(True, False),
   )
-  def test_quantized_int8(self, tile_shape, quantize_q):
-    self._test_quantized_int8(tile_shape, quantize_q)
+  def test_quantized_int8(self, channelwise_axes, quantize_q):
+    self._test_quantized_int8(channelwise_axes, quantize_q)
 
-  def _test_quantized_int8(self, tile_shape, quantize_q):
-    quantize = quantization.quantize_as(jnp.int8, tile_shape=tile_shape)
-    quant_dequant = lambda x: quantize(x).recompose()
+  def _test_quantized_int8(self, channelwise_axes, quantize_q):
+    quantize = functools.partial(
+        qwix.quantize, qtype=jnp.int8, channelwise_axes=channelwise_axes
+    )
+    quant_dequant = lambda x: qwix.dequantize(quantize(x))
 
     def impl(q, k, v, **kwargs):
       q = quantize(q) if quantize_q else q
