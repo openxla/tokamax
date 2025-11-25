@@ -17,14 +17,14 @@ toc:
   path: /tokamax
 - title: Developer Guide
   section:
-  - title: Basic Usage
-    path: /tokamax/basic_usage
   - title: Supported Ops and Hardware
     path: /tokamax/supported_ops
   - title: Autotuning
     path: /tokamax/autotuning
   - title: Benchmarking and Numerics
     path: /tokamax/benchmarking
+  - title: Contributing
+    path: /tokamax/contributing
 - title: Demo Notebook
   section:
   - title: Tokamax Demo
