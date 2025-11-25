@@ -99,6 +99,13 @@ class AutotuningResult:
       ...,
   ]
 
+  def __post_init__(self):
+    # Remove vjp from bound args so that it is not serialized.
+    data = tuple(
+        (ba.replace(op=ba.op.replace(vjp=None)), d) for ba, d in self.data
+    )
+    object.__setattr__(self, "data", data)
+
   def dump(self, fp):
     fp.write(self.dumps())
 
