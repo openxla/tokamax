@@ -17,6 +17,8 @@ toc:
   path: /tokamax
 - title: Developer Guide
   section:
+  - title: Basic Usage
+    path: /tokamax/basic_usage
   - title: Supported Ops and Hardware
     path: /tokamax/supported_ops
   - title: Autotuning
