@@ -630,7 +630,7 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       f = batching.vmap_maybe_bcast(f, (0,) * len(args))
 
     out, residuals = f(*args)
-    return out, (residuals if return_residuals else None)
+    return out.astype(q.dtype), (residuals if return_residuals else None)
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
