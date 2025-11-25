@@ -20,7 +20,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
-from tokamax._src import quantization
+from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
+import qwix
+from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
@@ -129,19 +131,19 @@ def body(
     )
 
 
+@jaxtyping.jaxtyped
 def ragged_dot_quantized_ws_kernel(
-    lhs: jax.Array,
-    rhs: quantization.QArray,
-    group_sizes: jax.Array,
+    lhs: Float[Array, "M K"],
+    rhs: Float[qwix.QArray, "G K N"],
+    group_sizes: Integer[Array, "G"],
     out_dtype,
     config: common.Config,
-) -> jax.Array:
+) -> Float[Array, "M N"]:
   """Returns the Pallas kernel for quantized ragged dot."""
   assert rhs.zero_point is None
 
-  m, k = lhs.shape
-  g, k2, n = rhs.shape
-  assert k == k2
+  m, _ = lhs.shape
+  g, _, n = rhs.shape
 
   if rhs.scale_tile_shape != (1, config.block_k, 1):
     raise NotImplementedError(

@@ -21,7 +21,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
-from tokamax._src import quantization
+from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
+import qwix
+from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 COMPUTE_WGS = 2
@@ -29,13 +31,14 @@ STORE_WG = COMPUTE_WGS
 MEMORY_WG = COMPUTE_WGS + 1
 
 
+@jaxtyping.jaxtyped
 def ragged_dot_quantized_ws_async_store_kernel(
-    lhs: jax.Array,
-    rhs: quantization.QArray,
-    group_sizes: jax.Array,
+    lhs: Float[Array, "M K"],
+    rhs: Float[qwix.QArray, "G K N"],
+    group_sizes: Integer[Array, "G"],
     out_dtype: jnp.dtype,
     config: common.Config,
-) -> jax.Array:
+) -> Float[Array, "M N"]:
   """Returns the Pallas kernel for quantized ragged dot.
 
   There are 4 Warp Group in this kernel:
@@ -60,7 +63,7 @@ def ragged_dot_quantized_ws_async_store_kernel(
   """
 
   _, k = lhs.shape
-  g, k2, _ = rhs.shape
+  g, _, _ = rhs.shape
   w, w_scales, x = (rhs.qvalue.mT, rhs.scale, lhs)
   (_, n, k_w), (m, k_x) = w.shape, x.shape
   group_info = common.GroupInfo.create_aligned(
@@ -68,7 +71,6 @@ def ragged_dot_quantized_ws_async_store_kernel(
   )
   block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
   tile_k = k_w // w_scales.shape[1]
-  assert k == k2
 
   if group_sizes.shape != (g,):
     raise ValueError(

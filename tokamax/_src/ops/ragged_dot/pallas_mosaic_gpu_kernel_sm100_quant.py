@@ -21,9 +21,11 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
+from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import memref
-from tokamax._src import quantization
+import qwix
+from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
@@ -52,13 +54,14 @@ def dequant(s_ref, w):
   return scaled_w(s_ref, w.astype(s_ref.dtype))
 
 
+@jaxtyping.jaxtyped
 def ragged_dot_gpu_quant_blackwell_kernel(
-    lhs: jax.Array,
-    rhs: quantization.QArray,
-    group_sizes: jax.Array,
+    lhs: Float[Array, "M K"],
+    rhs: Float[qwix.QArray, "G K N"],
+    group_sizes: Integer[Array, "G"],
     out_dtype,
     config: common.Config,
-) -> jax.Array:
+) -> Float[Array, "M N"]:
   """Pallas kernel for ragged dot with GPU quantization."""
   assert rhs.zero_point is None
 

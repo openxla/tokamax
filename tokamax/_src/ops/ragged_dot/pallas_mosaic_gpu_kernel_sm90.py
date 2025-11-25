@@ -20,6 +20,8 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
+from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
@@ -110,18 +112,18 @@ def ragged_dot_non_quantized_kernel_body(
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 
+@jaxtyping.jaxtyped
 def ragged_dot_non_quantized_kernel(
-    lhs: jax.Array,
-    rhs: jax.Array,
-    group_sizes: jax.Array,
+    lhs: Float[Array, "M K"],
+    rhs: Float[Array, "G K N"],
+    group_sizes: Integer[Array, "G"],
     out_dtype: jnp.dtype,
     config: common.Config,
-) -> jax.Array:
+) -> Float[Array, "M N"]:
   """Pallas kernel for ragged dot with non-quantized inputs."""
 
-  m, k = lhs.shape
-  g, k2, n = rhs.shape
-  assert k == k2
+  m, _ = lhs.shape
+  g, _, n = rhs.shape
 
   if lhs.dtype != rhs.dtype:
     raise ValueError(
