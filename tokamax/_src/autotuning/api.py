@@ -57,6 +57,7 @@ def _serialize_bound_args_autotuning_data(
     value: BoundArgsAutotuningData, info
 ) -> tuple[dict[str, Any], dict[str, Any]]:
   ba, data = value
+  ba = ba.replace(op=ba.op.replace(config=None, vjp=None))
   ba_data = _BOUND_ARGS_ADAPTER.dump_python(ba, info)
   del ba_data["op"]["config"]
   del ba_data["op"]["vjp"]
