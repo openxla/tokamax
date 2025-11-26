@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 """Pallas Mosaic TPU Megablox."""
-
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
 import itertools
@@ -174,7 +173,6 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       config: Config,
   ) -> tuple[jax.Array, None]:
     del return_residuals  # Unused.
-
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
 
@@ -333,11 +331,11 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         "ragged_dot_dimension_numbers", DEFAULT_RAGGED_DOT_DIM_NUMS
     )
     if dims == DEFAULT_RAGGED_DOT_DIM_NUMS:
-      (_, k), (_, _, n) = lhs.shape, rhs.shape
+      (m, k), (_, _, n) = lhs.shape, rhs.shape
     elif dims == DLHS_RAGGED_DOT_DIM_NUMS:
-      (_, n), (_, k, _) = lhs.shape, rhs.shape
+      (m, n), (_, k, _) = lhs.shape, rhs.shape
     elif dims == DRHS_RAGGED_DOT_DIM_NUMS:
-      (_, k), (_, n) = lhs.shape, rhs.shape
+      (m, k), (_, n) = lhs.shape, rhs.shape
     else:
       raise NotImplementedError(UNSUPPORTED_DIMENSIONS_MSG.format(dims))
 
@@ -346,14 +344,20 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
 
     # Based on some empirical TPU tiling performance. Create a reasonable
     # tiling search space.
-    tile_m_range = [64 * (2**i) for i in range(8)]
+    tile_m_range = [64 * (2**i) for i in range(8) if 64 * (2**i) <= m]
+
     tile_k_range = set(
-        [128 * (2**i) for i in range(8)]  # upwards powers of 2
+        [
+            128 * (2**i) for i in range(8) if 128 * (2**i) <= k_
+        ]  # upwards powers of 2
         + [k_ // (2**i) for i in range(6)]  # downwards divisors of k_
         + [k]  # full tile
     )
+
     tile_n_range = set(
-        [128 * (2**i) for i in range(8)]  # upwards powers of 2
+        [
+            128 * (2**i) for i in range(8) if 128 * (2**i) <= n_
+        ]  # upwards powers of 2
         + [n_ // (2**i) for i in range(6)]  # downwards divisors of n_
         + [n]  # full tile
     )
