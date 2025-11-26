@@ -31,6 +31,7 @@ from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
+from tokamax._src import utils
 from tokamax._src.ops import op
 from typing_extensions import override
 
@@ -679,6 +680,91 @@ def _softmax_jvp(normalize, primals, tangents):
     x_dot_max_mean = jnp.mean(x_dot, axis=-1, keepdims=True, where=(x == x_max))
     y_dot = y * (x_dot - x_dot_max_mean)
   return (y, residual), (y_dot, jax.tree.map(jnp.zeros_like, residual))
+
+
+def fold_q_sequence_heads(
+    q: Float[Array, "*B T H D"],
+    bias: Float[Array, "*#B #H #T #t"] | None,
+    mask: Mask,
+    dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
+    q_indices: Int[Array, "*#B #H T"] | None,
+    seq_len_k: int,
+    num_heads_k: int,
+) -> tuple[
+    Float[Array, "*B Tg h D"],
+    Float[Array, "*#B #h #Tg #t"] | None,
+    Mask,
+    Bool[Array, "*#B #h #Tg #t"] | None,
+    Int[Array, "*#B #h Tg"],
+]:
+  """Folds the q-heads into the q-sequence dimension."""
+  *_, seq_len_q, num_heads_q, _ = q.shape
+  num_q_heads_per_k_head = utils.exact_div(num_heads_q, num_heads_k)
+
+  q = shape_lib.einshape("...s(hg)d->...(sg)hd", h=num_heads_k)(q)
+
+  # NOTE: We must pass a `q_indices`, as we are modifying the effective indices
+  # in the q-sequence dimension for the purposes of the mask.
+  if q_indices is None:
+    q_indices = jnp.arange(seq_len_q)
+
+  dim_is_bcast = lambda x, i: True if x.ndim < -i else (x.shape[i] == 1)
+
+  def fold(x, has_k_seq=True):
+    if x is None:
+      return None
+
+    bcast_hg = dim_is_bcast(x, -2 - has_k_seq)
+    bcast_s = dim_is_bcast(x, -1 - has_k_seq)
+    if bcast_hg and bcast_s:
+      return x
+
+    x = jax.lax.broadcast_to_rank(x, 2 + has_k_seq)
+    t = "t" if has_k_seq else ""
+    eqn = f"...{["(hg)", "h"][bcast_hg]}{["s", "1"][bcast_s]}{t}->...h(sg){t}"
+    return shape_lib.einshape(eqn, s=seq_len_q, g=num_q_heads_per_k_head)(x)
+
+  bias, dropout_mask = map(fold, (bias, dropout_mask))
+
+  if mask is not None:
+    mask, k_start, k_end, is_causal = mask.take("k_start", "k_end", "is_causal")
+    q_start = q_end = None
+    # `q_{start,end}` don't have a q-sequence dimensions, so we cannot fold.
+    # If `q_{start,end}` is not broadcast along the heads dimension, we leave
+    # it in the mask so it will become part of the boolean mask below.
+    if mask.q_start is None or dim_is_bcast(mask.q_start, -2):
+      mask, q_start = mask.take("q_start")
+    if mask.q_end is None or dim_is_bcast(mask.q_end, -2):
+      mask, q_end = mask.take("q_end")
+
+    # We extracted the parts depending on `k_indices`, so we can pass anything.
+    mask = fold(mask.as_array(q_indices, seq_len_k))
+    mask = Mask(
+        mask,
+        q_start=q_start,
+        q_end=q_end,
+        k_start=fold(k_start, False),
+        k_end=fold(k_end, False),
+        is_causal=is_causal,
+    )
+
+  q_indices_shape = (*q_indices.shape[:-2], num_heads_q, seq_len_q)
+  q_indices = jnp.broadcast_to(q_indices, q_indices_shape)
+  q_indices = shape_lib.einshape("...(hg)s->...h(sg)", h=num_heads_k)(q_indices)
+  return q, bias, mask, dropout_mask, q_indices
+
+
+def unfold_q_sequence_heads(
+    out: Float[Array, "*B Tg h d"],
+    residuals: Residuals | None,
+    orig_seq_len_q: int,
+) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
+  """Unfolds the q-sequence heads from the q-sequence dimension."""
+  out = shape_lib.einshape("...(sg)hd->...s(hg)d", s=orig_seq_len_q)(out)
+  if residuals is None:
+    return out, None
+  reshape = shape_lib.einshape("...h(sg)->...(hg)s", s=orig_seq_len_q)
+  return out, tuple(map(reshape, residuals))
 
 
 def combine_partial_results(
