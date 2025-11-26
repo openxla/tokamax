@@ -148,6 +148,11 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 
     bind = cast(Callable[_P, Any], self.bind)  # Work around pytype bug.
     ba = bind(*args, **kwargs)
+
+    for device in infer_devices(ba) or {backend.get_default_device()}:
+      if not self.supported_on(device):
+        raise NotImplementedError(f"Not supported on {device.device_kind}.")
+
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
     is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
     arrays, other, merge = utils.split_merge(is_array, args_flat)
@@ -591,12 +596,21 @@ def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
 BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(BoundArguments)
 
 
-def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
-  """Infers the device kind from bound array arguments."""
-  device_kinds = set()
+def infer_devices(ba: BoundArguments) -> set[jax.Device]:
+  """Infers the devices from bound array arguments."""
+  devices = set()
   for x in jax.tree.leaves(dict(ba.arguments)):
     if isinstance(x, jax.Array):
-      device_kinds |= {d.device_kind for d in x.devices()}
+      try:
+        devices |= x.devices()
+      except jax.errors.ConcretizationTypeError:
+        pass
+  return devices
+
+
+def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
+  """Infers the device kind from bound array arguments."""
+  device_kinds = {d.device_kind for d in infer_devices(ba)}
   if not device_kinds:
     return None
   if len(device_kinds) == 1:

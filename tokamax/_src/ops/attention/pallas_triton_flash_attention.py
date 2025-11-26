@@ -566,8 +566,6 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       return_residuals: bool,
       config: Config,
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
-    if not triton_lib.has_triton_support():
-      raise NotImplementedError("Triton not supported on this platform.")
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
 

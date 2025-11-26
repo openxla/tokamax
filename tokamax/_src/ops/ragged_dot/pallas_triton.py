@@ -363,9 +363,6 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
   ) -> tuple[jax.Array, None]:
     del return_residuals  # Unused.
 
-    if not triton_lib.has_triton_support():
-      raise NotImplementedError("Triton not supported on this platform.")
-
     if preferred_element_type is None:
       out_dtype = jnp.promote_types(lhs.dtype, rhs.dtype)
     else:

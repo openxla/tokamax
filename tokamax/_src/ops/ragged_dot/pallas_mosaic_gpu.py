@@ -71,9 +71,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   ) -> tuple[jax.Array, None]:
     del return_residuals  # Unused.
 
-    if not mosaic_gpu_lib.has_mosaic_gpu_support():
-      raise NotImplementedError("Mosaic not supported on this platform.")
-
     if ragged_dot_dimension_numbers != base.DEFAULT_RAGGED_DOT_DIM_NUMS:
       raise NotImplementedError(
           "Only default `ragged_dot_dimension_numbers` supported."

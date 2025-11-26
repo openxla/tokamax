@@ -578,9 +578,6 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       config: Config,
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     """Performs attention, optionally returning softmax residuals."""
-    if not mosaic_gpu.has_mosaic_gpu_support():
-      raise NotImplementedError("Mosaic GPU not supported on this platform.")
-
     supported_dtypes = (jnp.float32, jnp.float16, jnp.bfloat16)
     if any(dt not in supported_dtypes for dt in [x.dtype for x in (q, k, v)]):
       raise NotImplementedError("Only f32, f16 and bf16 inputs are supported.")
