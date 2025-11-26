@@ -23,6 +23,7 @@ import jax
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
 import pydantic
+from tokamax._src import gpu_utils
 from tokamax._src import pydantic as pydantic_lib
 
 
@@ -78,10 +79,6 @@ def get_key(
   return key
 
 
-NUM_REGISTERS_PER_SM = 64 * 1024  # P100, V100, A100, H100
-CACHE_LINE_SIZE_BYTES = 128
-
-
 def get_heuristics_config(
     x: jax.Array,
     scale: jax.Array | None,
@@ -104,7 +101,9 @@ def get_heuristics_config(
   num_blocks = pl.cdiv(x.shape[0], block_m) * math.prod(vmap_axis_sizes)
   if x.ndim > 2:
     # Read full cache line at a time.
-    els_per_cache_line = CACHE_LINE_SIZE_BYTES // jnp.dtype(x.dtype).itemsize
+    els_per_cache_line = (
+        gpu_utils.CACHE_LINE_SIZE_BYTES // jnp.dtype(x.dtype).itemsize
+    )
     block_n = min(els_per_cache_line, pl.next_power_of_2(x.shape[2]))
     block_size *= block_n
     num_blocks *= pl.cdiv(x.shape[2], block_n)
@@ -113,7 +112,7 @@ def get_heuristics_config(
 
   # Pick a block size that fits into registers, and launch enough blocks to fill
   # the device.
-  max_block_size = NUM_REGISTERS_PER_SM // 4
+  max_block_size = gpu_utils.NUM_REGISTERS_PER_SM // 4
   min_num_blocks = 4 * jax.devices()[0].core_count
   while (block_m > 1) and (
       (block_size > max_block_size) or (num_blocks < min_num_blocks)

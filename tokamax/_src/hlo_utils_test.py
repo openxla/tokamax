@@ -26,8 +26,8 @@ from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
+from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
-from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import numerics
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu

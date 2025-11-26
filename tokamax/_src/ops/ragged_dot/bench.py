@@ -24,7 +24,7 @@ from jax.experimental import layout
 import jax.numpy as jnp
 import qwix
 from tokamax._src import benchmarking
-from tokamax._src import mosaic_gpu as mgpu_lib
+from tokamax._src import gpu_utils
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import arg_specs
 from tokamax._src.ops.ragged_dot import base
@@ -94,7 +94,7 @@ def _register_benchmarks():
     spec = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS.value:
       if 'mosaic' in impl_name and (
-          not mgpu_lib.has_mosaic_gpu_support()
+          not gpu_utils.has_mosaic_gpu_support()
           or isinstance(spec['lhs'], qwix.QArray)
           or not isinstance(spec['rhs'], qwix.QArray)
       ):

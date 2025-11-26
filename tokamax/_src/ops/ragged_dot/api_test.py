@@ -19,9 +19,8 @@ import chex
 import jax
 import jax.numpy as jnp
 import qwix
+from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
-from tokamax._src import mosaic_gpu
-from tokamax._src import triton
 from tokamax._src.ops.ragged_dot import api
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
@@ -40,14 +39,14 @@ class RaggedDotTest(parameterized.TestCase):
   @parameterized.parameters(*(None, "xla", "mosaic", "triton"))
   def test_basic_api(self, implementation):
 
-    if implementation == "triton" and not triton.has_triton_support():
+    if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
 
     # Current default backend if implementation is None is "mosaic".
     if implementation == "mosaic" or implementation is None:
       if (
           jax.default_backend() == "gpu"
-          and not mosaic_gpu.has_mosaic_gpu_support()
+          and not gpu_utils.has_mosaic_gpu_support()
       ):
         self.skipTest("Mosaic not supported on this platform.")
 

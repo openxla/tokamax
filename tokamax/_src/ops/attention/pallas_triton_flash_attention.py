@@ -26,10 +26,10 @@ from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-impo
 import numpy as np
 import pydantic
 from tokamax._src import batching
+from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import quantization
-from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp as vjp
@@ -680,4 +680,4 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return triton_lib.has_triton_support(device)
+    return gpu_utils.has_triton_support(device)

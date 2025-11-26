@@ -20,7 +20,7 @@ from typing import Any, Final, Literal, TypeAlias
 from absl import logging
 import immutabledict
 import jax
-from tokamax._src import triton
+from tokamax._src import gpu_utils
 from tokamax._src.ops.normalization import base
 
 
@@ -101,7 +101,7 @@ def layer_norm(
   fn = base.Normalization()
   for impl in implementation:
     if isinstance(impl, str):
-      if impl == 'triton' and not triton.has_triton_support():
+      if impl == 'triton' and not gpu_utils.has_triton_support():
         errors.append(
             NotImplementedError(
                 'Triton not supported on this platform. Please use XLA'

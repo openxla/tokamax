@@ -27,8 +27,8 @@ import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
+from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
-from tokamax._src import mosaic_gpu
 from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
@@ -680,7 +680,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return mosaic_gpu.has_mosaic_gpu_support(device)
+    return gpu_utils.has_mosaic_gpu_support(device)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:

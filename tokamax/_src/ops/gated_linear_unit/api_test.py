@@ -21,8 +21,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from tokamax import autotuning
-from tokamax._src import mosaic_gpu
-from tokamax._src import triton
+from tokamax._src import gpu_utils
 from tokamax._src.ops.gated_linear_unit import api
 from tokamax._src.ops.gated_linear_unit import test_base
 
@@ -45,10 +44,10 @@ class GatedLinearUnitTest(parameterized.TestCase):
       use_tuple_weights=[True, False],
   )
   def test_basic_api(self, implementation, use_tuple_weights):
-    if implementation == "triton" and not triton.has_triton_support():
+    if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
 
-    if not mosaic_gpu.has_mosaic_gpu_support() and implementation is not None:
+    if not gpu_utils.has_mosaic_gpu_support() and implementation is not None:
       if "mosaic" in implementation:
         self.skipTest("Mosaic not supported on this platform.")
 

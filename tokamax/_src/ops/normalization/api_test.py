@@ -22,8 +22,8 @@ import chex
 import jax
 from jax import export
 import jax.numpy as jnp
+from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
-from tokamax._src import triton
 from tokamax._src.ops.normalization import api
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
@@ -56,7 +56,7 @@ class LayerNormTest(parameterized.TestCase):
 
   @parameterized.parameters(*_IMPLEMENTATIONS)
   def test_basic_api(self, implementation):
-    if implementation == "triton" and not triton.has_triton_support():
+    if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
 
     x, scale, offset = _get_input_data(shape=(128, 32), dtype=jnp.bfloat16)
@@ -126,7 +126,7 @@ class LayerNormTritonTest(test_base.NormalizationTestBase):
   IMPL = "triton"
 
   def __init__(self, *args):
-    if not triton.has_triton_support():
+    if not gpu_utils.has_triton_support():
       norm_fn = functools.partial(api.layer_norm, implementation="xla")
       super().__init__(*args, norm_fn=norm_fn)
     else:

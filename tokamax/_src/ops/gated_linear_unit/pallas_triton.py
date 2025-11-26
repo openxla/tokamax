@@ -25,7 +25,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-importing-member,g-multiple-import
-from tokamax._src import triton as triton_lib
+from tokamax._src import gpu_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
@@ -220,7 +220,7 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return triton_lib.has_triton_support(device)
+    return gpu_utils.has_triton_support(device)
 
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     # Simple autotuning search space that can be improved upon.

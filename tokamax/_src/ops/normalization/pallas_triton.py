@@ -23,7 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
-from tokamax._src import triton as triton_lib
+from tokamax._src import gpu_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_config
@@ -35,7 +35,7 @@ from typing_extensions import override
 Config: TypeAlias = pallas_triton_config.Config
 Key: TypeAlias = pallas_triton_config.Key
 FusedInputArray = base.FusedInputArray
-_NUM_REGISTERS_PER_SM = pallas_triton_config.NUM_REGISTERS_PER_SM
+_NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
 
 
 def _normalization_kernel(
@@ -225,4 +225,4 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return triton_lib.has_triton_support(device)
+    return gpu_utils.has_triton_support(device)

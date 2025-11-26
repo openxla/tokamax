@@ -21,7 +21,7 @@ import jax
 from jax.extend import backend
 import jax.numpy as jnp
 import qwix
-from tokamax._src import mosaic_gpu as mosaic_gpu_lib
+from tokamax._src import gpu_utils
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
@@ -281,4 +281,4 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return mosaic_gpu_lib.has_mosaic_gpu_support(device)
+    return gpu_utils.has_mosaic_gpu_support(device)

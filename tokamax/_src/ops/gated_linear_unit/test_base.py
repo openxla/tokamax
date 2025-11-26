@@ -20,8 +20,7 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
-from tokamax._src import mosaic_gpu
-from tokamax._src import triton
+from tokamax._src import gpu_utils
 
 
 # pylint: disable=missing-function-docstring
@@ -46,13 +45,13 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
       keywords = self._glu_fn.keywords
 
       if keywords["implementation"] == "triton":
-        if not triton.has_triton_support():
+        if not gpu_utils.has_triton_support():
           self.skipTest("Triton not supported on this platform.")
 
       # Currently the MosaicGpuGatedLinearUnit only supports sigmoid and swish
       # activations and no batch dimensions.
       if keywords["implementation"] == "plain_mosaic":
-        if not mosaic_gpu.has_mosaic_gpu_support():
+        if not gpu_utils.has_mosaic_gpu_support():
           self.skipTest("Mosaic not supported on this platform.")
         if activation == "tanh":
           self.skipTest("Tanh not supported for MosaicGpuGatedLinearUnit")

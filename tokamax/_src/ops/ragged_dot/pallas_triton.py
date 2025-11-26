@@ -25,8 +25,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 import qwix
 from tokamax._src import batching
+from tokamax._src import gpu_utils
 from tokamax._src import quantization
-from tokamax._src import triton as triton_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.pallas import block
@@ -448,4 +448,4 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return triton_lib.has_triton_support(device)
+    return gpu_utils.has_triton_support(device)

@@ -21,7 +21,7 @@ from absl import logging
 import immutabledict
 import jax
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
-from tokamax._src import triton
+from tokamax._src import gpu_utils
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 
@@ -97,7 +97,7 @@ def gated_linear_unit(
   errors = []
   fn = base.GatedLinearUnit()
   for impl in implementation:
-    if impl == 'triton' and not triton.has_triton_support():
+    if impl == 'triton' and not gpu_utils.has_triton_support():
       continue
     if isinstance(impl, str):
       if impl not in IMPLEMENTATIONS:

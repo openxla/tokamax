@@ -22,10 +22,9 @@ from jax import export
 import jax.numpy as jnp
 from tokamax import autotuning
 from tokamax._src import batching
+from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
-from tokamax._src import mosaic_gpu
 from tokamax._src import shape as shape_lib
-from tokamax._src import triton as triton_lib
 from tokamax._src.ops.attention import api
 
 
@@ -290,7 +289,7 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
 
   def setUp(self):
     super().setUp()
-    if not mosaic_gpu.has_mosaic_gpu_support():
+    if not gpu_utils.has_mosaic_gpu_support():
       self.skipTest(
           'Skip test. Mosaic implementation is not supported on this platform.'
       )
@@ -301,7 +300,7 @@ class DotProductAttentionTritonTest(DotProductAttentionTest):
 
   def setUp(self):
     super().setUp()
-    if not triton_lib.has_triton_support():
+    if not gpu_utils.has_triton_support():
       self.skipTest('Triton not supported on this platform.')
 
 
