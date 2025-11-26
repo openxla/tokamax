@@ -198,9 +198,9 @@ def _fwd(
       def load_k_range(ref):
         if ref is None:
           return None
-        b_idx_ = 0 if ref.shape[0] == 1 else bi
-        h_idx_ = 0 if ref.shape[1] == 1 else hi
-        idx = (b_idx_, h_idx_, qs)
+        bi_ = 0 if ref.shape[0] == 1 else bi
+        hi_ = 0 if ref.shape[1] == 1 else hi
+        idx = (bi_, hi_, qs)
         return plgpu.load(ref, idx, layout=_WGMMA_ROW, optimized=False)
 
       k_start = load_k_range(k_start_gmem)
