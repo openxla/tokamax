@@ -136,7 +136,7 @@ def _attend_chunked(
     dropout_rate: float,
     paging_info: PagingInfo | None,
     q_indices: Int[Array, "*#B #H T"] | None,
-    k_indices: Int[Array, "*#B #H t"] | None,
+    k_indices: Int[Array, "*#B #h t"] | None,
     normalize_output: bool,
     chunk_size: tuple[int, int],
 ) -> tuple[Float[Array, "*B T H d"], None]:
@@ -248,7 +248,7 @@ def _attend_paged(
     dropout_rate: float,
     paging_info: PagingInfo | None,
     q_indices: Int[Array, "*#B #H T"] | None,
-    k_indices: Int[Array, "*#B #H t"] | None,
+    k_indices: Int[Array, "*#B #h t"] | None,
     normalize_output: bool,
     chunk_size: int,
 ) -> tuple[Float[Array, "*B T H d"], None]:
@@ -332,7 +332,7 @@ class XlaChunkedDotProductAttention(
       dropout_rate: float,
       paging_info: PagingInfo | None,
       q_indices: Int[Array, "*#B #H T"] | None,
-      k_indices: Int[Array, "*#B #H t"] | None,
+      k_indices: Int[Array, "*#B #h t"] | None,
       normalize_output: bool,
       return_residuals: bool,
       config: op.NullConfig,

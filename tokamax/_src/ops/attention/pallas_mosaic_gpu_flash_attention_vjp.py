@@ -840,7 +840,7 @@ class PallasMosaicGpuFlashAttentionVjp(
       dropout_rate: float,
       paging_info: PagingInfo | None,
       q_indices: Int[Array, "*#B #H T"] | None,
-      k_indices: Int[Array, "*#B #H t"] | None,
+      k_indices: Int[Array, "*#B #h t"] | None,
       normalize_output: bool,
       return_residuals: bool,
       config: Config,

@@ -86,19 +86,19 @@ class Mask:
   ```
   """
 
-  bool_mask: Bool[Array, "*#B #T #t"] | None = None
+  bool_mask: Bool[Array, "*#B #H #T #t"] | None = None
   _: dataclasses.KW_ONLY
-  q_start: Int[Array, "*#B #t"] | None = None
-  q_end: Int[Array, "*#B #t"] | None = None
-  k_start: Int[Array, "*#B #T"] | None = None
-  k_end: Int[Array, "*#B #T"] | None = None
+  q_start: Int[Array, "*#B #H #t"] | None = None
+  q_end: Int[Array, "*#B #H #t"] | None = None
+  k_start: Int[Array, "*#B #h #T"] | None = None
+  k_end: Int[Array, "*#B #h #T"] | None = None
   is_causal: bool = dataclasses.field(default=False, metadata=dict(static=True))
 
   def as_array(
       self,
-      q_len_or_indices: int | Int[Array, "*#B T"],
-      k_len_or_indices: int | Int[Array, "*#B t"],
-  ) -> Bool[Array, "*#B #T #t"] | None:
+      q_len_or_indices: int | Int[Array, "*#B #H T"],
+      k_len_or_indices: int | Int[Array, "*#B #h t"],
+  ) -> Bool[Array, "*#B #H #T #t"] | None:
     """Returns the mask as a boolean array."""
     if isinstance(q_len_or_indices, int) or export.is_symbolic_dim(
         q_len_or_indices
@@ -160,7 +160,7 @@ class Mask:
         or self.k_end is not None
     )
 
-  def __and__(self, other: "Bool[Array, '*#B #T #t'] | Mask") -> "Mask":
+  def __and__(self, other: "Bool[Array, '*#B #H #T #t'] | Mask") -> "Mask":
     """Returns the intersection of two masks."""
     if not isinstance(other, Mask):
       other = Mask(other)
@@ -241,7 +241,7 @@ class DotProductAttention(
       q_sharding: jax.sharding.NamedSharding | None = ...,
       k_sharding: jax.sharding.NamedSharding | None = ...,
       q_indices: Int[Array, "*#B #H T"] | None = ...,
-      k_indices: Int[Array, "*#b #H t"] | None = ...,
+      k_indices: Int[Array, "*#b #h t"] | None = ...,
       normalize_output: bool = ...,
       return_residuals: Literal[False] = ...,
   ) -> Float[Array, "*B T H d"]:
@@ -731,7 +731,7 @@ class DotProductAttentionVjp(
       dropout_rate: float,
       paging_info: PagingInfo | None,
       q_indices: Int[Array, "*#B #H T"] | None,
-      k_indices: Int[Array, "*#b #H t"] | None,
+      k_indices: Int[Array, "*#b #h t"] | None,
       normalize_output: bool,
       return_residuals: bool,
       config: _Config,
