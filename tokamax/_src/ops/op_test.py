@@ -88,6 +88,9 @@ class OpTest(parameterized.TestCase):
     y = jnp.ones((1, 2))
     self.assertEqual(_FakeOp().bind(x, y).args, (x, y))
 
+
+class BoundArgumentsTest(parameterized.TestCase):
+
   def test_get_config(self):
     cache = _FakeOp().get_autotuning_cache()
     cache.clear()
@@ -97,7 +100,7 @@ class OpTest(parameterized.TestCase):
     config = ba.get_config(
         autotune_configs=op_lib.AUTO, cache_autotuning_results=False
     )
-    self.assertIs(config, _AUTOTUNE_CONFIG)
+    self.assertIn(config, ba.autotuning_configs)
     self.assertEmpty(cache)
     tune_config = _FakeOpConfig(3)
     config = ba.get_config(
@@ -117,13 +120,22 @@ class OpTest(parameterized.TestCase):
     cache.clear()
     ba = _FakeOp().bind(jnp.zeros((1, 2)), jnp.ones((1, 2)))
     with config_lib.autotuning_cache_miss_fallback("autotune"):
-      self.assertIs(ba.default_config, _AUTOTUNE_CONFIG)
+      self.assertIn(ba.default_config, ba.autotuning_configs)
     cache.clear()
     with config_lib.autotuning_cache_miss_fallback("heuristics"):
       self.assertIs(ba.default_config, _HEURISTICS_CONFIG)
     with config_lib.autotuning_cache_miss_fallback("error"):
       with self.assertRaisesRegex(ValueError, "No config found"):
         _ = ba.default_config
+
+  def test_heuristics_config(self):
+    ba = _FakeOp().bind(jnp.zeros((1, 2)), jnp.ones((1, 2)))
+    self.assertIs(ba.heuristics_config, _HEURISTICS_CONFIG)
+
+  def test_autotuning_configs(self):
+    ba = _FakeOp().bind(jnp.zeros((1, 2)), jnp.ones((1, 2)))
+    expected = {_AUTOTUNE_CONFIG, _HEURISTICS_CONFIG}
+    self.assertEqual(ba.autotuning_configs, expected)
 
   def test_autotune(self):
     cache = _FakeOp().get_autotuning_cache()
@@ -147,9 +159,6 @@ class OpTest(parameterized.TestCase):
     y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=y_vmap_axes)
     results = _FakeOp().bind(x, y).autotune({config})
     self.assertIs(results.fastest_config, config)
-
-
-class BoundArgumentsTest(parameterized.TestCase):
 
   def test_equals(self):
     x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=(0, 1))

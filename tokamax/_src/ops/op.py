@@ -487,7 +487,7 @@ class BoundArguments(Generic[_Config, _Key]):
   @property
   def autotuning_configs(self) -> set[_Config]:
     """Returns the configs used for autotuning when `AUTO` is specified."""
-    return self.op._get_autotuning_configs(self)  # pylint: disable=protected-access
+    return {self.heuristics_config} | self.op._get_autotuning_configs(self)  # pylint: disable=protected-access
 
   def benchmark(
       self, mode: benchmarking.BenchmarkMode = "forward"
