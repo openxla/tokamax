@@ -191,14 +191,6 @@ class AutotuningTest(parameterized.TestCase):
       self.skipTest("Currently only supported on GPU.")
 
     f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
-    norm_bound_args, glu_bound_args = expected
-    norm_bound_args = norm_bound_args.replace(
-        op=norm_bound_args.op.replace(vjp=None)
-    )
-    glu_bound_args = glu_bound_args.replace(
-        op=glu_bound_args.op.replace(vjp=None)
-    )
-    expected = (norm_bound_args, glu_bound_args)
     result = api.autotune(f, *args, all_implementations=False)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
     self.assertEqual(tuple(x[0] for x in result.data), expected)
