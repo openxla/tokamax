@@ -20,7 +20,6 @@ from typing import ClassVar
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
-import qwix
 from tokamax._src import gpu_utils
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
