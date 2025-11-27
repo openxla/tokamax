@@ -600,7 +600,6 @@ class AttentionTestBase(parameterized.TestCase):
         atol=2e-6,
     )
 
-  # TODO: Add broadcasted dropout test
   def test_dropout(self):
     dropout_rng = jax.random.PRNGKey(42)
     dropout_mask = jax.random.bernoulli(dropout_rng, shape=(2, 4, 1024, 1024))
@@ -904,6 +903,8 @@ class AttentionManualPartitioningTestBase(parameterized.TestCase):
   # - Causal mask + seq_q sharding (self- and cross-)
   # - No batch/multiple batches
   # - Different sharding for q/kv heads
+  # - Non-broadcasted multi-query
+  # - Add test for vmap of vmap.
 
   _TEST_SHAPE = (16, 256, 16, 32)
   _ATTENTION_AXES = ("batch", "seq_q", "heads", "head_dim")
@@ -1097,7 +1098,6 @@ class AttentionManualPartitioningTestBase(parameterized.TestCase):
           ((0, 0, 0, 0, 0),),
           ((0, None, None, 0, 0),),
           ((0, 0, 0, None, None),),
-          # TODO: Add test for vmap of vmap.
       ),
       partition_axis=_PARTITION_AXES,
   )
@@ -1162,8 +1162,6 @@ class AttentionManualPartitioningTestBase(parameterized.TestCase):
         ref_impl=impl,
         test_vjp=False,
     )
-
-  # TODO: Add partitioning test for non-broadcasted multi-query
 
 
 # pylint: enable=missing-function-docstring

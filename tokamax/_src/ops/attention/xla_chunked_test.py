@@ -162,7 +162,6 @@ class XlaPagedAttentionTest(test_base.AttentionTestBase):
   def __init__(self, *args):
     super().__init__(
         *args,
-        # TODO: Support chunk_size != max_page_size
         attention_fn=xla_chunked.XlaChunkedDotProductAttention(chunk_size=128),
         supports_bias=False,
         supports_mask=False,

@@ -130,7 +130,6 @@ def _fwd_kernel_impl(
   def get_values_and_scales(x):
     if isinstance(x, QArray):
       assert x.zero_point is None
-      # TODO: Allow scales dimensions to be non-broadcastable.
       return x.qvalue, x.scale
     return x, None
 
@@ -145,6 +144,10 @@ def _fwd_kernel_impl(
 
   block_d_out = out_ref.shape[-1] if block_d_out is None else block_d_out
   split_d_out = out_ref.shape[-1] // block_d_out
+
+  # TODO: For split_d > 1, try to use a for loop around the whole
+  # kernel rather than having a list of tiles for acc and q. M and L will be
+  # computed only in the first iteration.
 
   # m_i and l_i (see FlashAttention paper) are updated during the k,v loop.
   if use_stable_softmax:
@@ -341,9 +344,6 @@ def _fwd(
   kernel = functools.partial(
       _fwd_kernel,
       block_k=config.block_k,
-      # TODO: Try to use a for loop around the whole kernel rather
-      # than having a list of tiles for acc and q. M and L will be computed only
-      # in the first iteration.
       block_d=config.block_d,
       block_d_out=config.block_d_out,
       sm_scale=logits_scale,
@@ -512,7 +512,7 @@ def _can_have_block_d(*args):
     if isinstance(arg, QArray) and any(
         s not in (1, v) for v, s in zip(arg.qvalue.shape, arg.scale.shape)
     ):
-      return False  # TODO: Make block_d work with subchannel quant.
+      return False  # TODO: Make block_d work with subchannel quant
     if pl.next_power_of_2(arg.shape[-1]) != arg.shape[-1]:
       return False  # TODO: Make block_d work with non-pow2 head_dims.
   return True

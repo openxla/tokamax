@@ -90,7 +90,6 @@ def _fwd_kernel(
 
   def get_values_and_scales(x):
     if isinstance(x, QArray):
-      # TODO: Allow scales dimensions to be non-broadcastable.
       assert x.zero_point is None
       return x.qvalue, x.scale
     return x, None
