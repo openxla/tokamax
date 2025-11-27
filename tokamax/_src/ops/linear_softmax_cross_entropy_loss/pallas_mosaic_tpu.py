@@ -642,6 +642,11 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     else:
       return Config(b_block_size=1024, h_block_size=512, v_block_size=1024)
 
+  # TODO: Implement an autotuning search space.
+  @override
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    return set()
+
   @override
   def supported_on(self, device: jax.Device) -> bool:
     return device.platform == "tpu" and mosaic_tpu.tpu_generation() >= 5
@@ -690,6 +695,11 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
     else:
       return Config(b_block_size=1024, h_block_size=512, v_block_size=1024)
+
+  # TODO: Implement an autotuning search space.
+  @override
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    return set()
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
