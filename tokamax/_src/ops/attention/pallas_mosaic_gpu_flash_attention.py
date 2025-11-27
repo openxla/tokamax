@@ -463,7 +463,7 @@ def _fwd(
         kv_barriers,
         # bias doesn't need a consumed barrier as it is implied by k consumed.
         None if no_async_bias else kv_barriers[0],
-        (None, None) if no_async_mask is None else kv_barriers,
+        (None, None) if no_async_mask else kv_barriers,
         schedule_barrier,
         collective_axes="wg",
     )
