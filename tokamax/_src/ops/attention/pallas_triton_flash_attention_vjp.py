@@ -574,7 +574,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    # TODO: Heuristics.
+    # TODO: Implement heuristics.
     return Config(
         block_m1=32,
         block_n1=64,
@@ -585,6 +585,11 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
         num_warps=4,
         num_stages=2,  # 5,
     )
+
+  # TODO: Implement an autotuning search space.
+  @override
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    return set()
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

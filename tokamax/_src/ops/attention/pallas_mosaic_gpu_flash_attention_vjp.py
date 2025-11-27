@@ -913,6 +913,11 @@ class PallasMosaicGpuFlashAttentionVjp(
         num_stages=2,
     )
 
+  # TODO: Implement an autotuning search space.
+  @override
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    return set()
+
   @override
   def supported_on(self, device: jax.Device) -> bool:
     return gpu_utils.has_mosaic_gpu_support(device)
