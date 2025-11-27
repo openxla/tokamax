@@ -195,23 +195,24 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     k_start = _broadcast_to_rank(k_start, q.ndim - 1)
     k_end = _broadcast_to_rank(k_end, q.ndim - 1)
 
-    args = (q, k, v, bias, mask, k_start, k_end)
+    split_k = config.split_k
 
-    if (split_k := config.split_k) > 1:
+    def pad_seq_k(x, axis):
+      if x is None or axis is None or x.shape[axis] == 1:
+        return x
+      block = split_k * config.block_kv
+      return shape_lib.pad_to_next_multiple_of(x, block, axis)
+
+    seq_k_axes = (None, -3, -3, -1, -1, None, None)
+    args = (q, k, v, bias, mask, k_start, k_end)
+    args = tuple(pad_seq_k(x, ax) for x, ax in zip(args, seq_k_axes))
+
+    if split_k > 1:
       if is_causal or k_start is not None or k_end is not None:
         raise ValueError(
             # TODO: Support causality and k_start/k_end with split_k > 1.
             "split_k > 1 only supported without causality and k_start/k_end."
         )
-
-      def pad_seq_k(x, axis):
-        if x is None or axis is None or x.shape[axis] == 1:
-          return x
-        block = split_k * config.block_kv
-        return shape_lib.pad_to_next_multiple_of(x, block, axis)
-
-      seq_k_axes = (None, -3, -3, -1, -1, None, None)
-      args = tuple(pad_seq_k(x, ax) for x, ax in zip(args, seq_k_axes))
       f = functools.partial(f, normalize_output=False, return_residuals=True)
       f = batching.vmap_split(f, in_axes=seq_k_axes, num_parts=split_k)
       combine_partial_results = functools.partial(
