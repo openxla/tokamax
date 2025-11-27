@@ -316,18 +316,13 @@ class AttentionTestBase(parameterized.TestCase):
 
   def test_grouped_query_attention(self):
 
-    def ref_impl(q, k, v, **kwargs):
+    def ref(q, k, v, **kwargs):
       repeats = q.shape[-2] // k.shape[-2]
       k = jnp.repeat(k, repeats, axis=-2)
       v = jnp.repeat(v, repeats, axis=-2)
       return nn.dot_product_attention(q, k, v, **kwargs)
 
-    self._run_test(
-        (2, 1024, 16, 64),
-        kv_shape=(2, 1024, 4, 64),
-        ref_impl=ref_impl,
-        test_vjp=False,  # TODO: Add vjp support.
-    )
+    self._run_test((2, 1024, 16, 64), kv_shape=(2, 1024, 4, 64), ref_impl=ref)
 
   def test_no_batch_dim(self):
     self._run_test((1024, 4, 64))
