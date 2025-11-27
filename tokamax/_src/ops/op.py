@@ -357,16 +357,15 @@ class AUTO:
   ...
 
 
-@dataclasses.dataclass(frozen=True, init=False, slots=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class BoundArguments(Generic[_Config, _Key]):
   """Bound arguments for an op's `__call__` method."""
 
   op: Op[..., Any, Any, _Config, _Key]  # pytype: disable=invalid-annotation
-  arguments: immutabledict.immutabledict[str, Any]
+  arguments: Mapping[str, Any]
 
-  def __init__(self, op: Op[..., Any, Any, _Config, _Key], arguments: Mapping[str, Any]):  # pytype: disable=invalid-annotation
-    object.__setattr__(self, "op", op)
-    immutable_args = immutabledict.immutabledict(arguments)
+  def __post_init__(self):
+    immutable_args = immutabledict.immutabledict(self.arguments)
     object.__setattr__(self, "arguments", immutable_args)
 
   @property
