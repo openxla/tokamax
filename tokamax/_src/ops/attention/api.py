@@ -81,6 +81,7 @@ def dot_product_attention(
     logits_soft_cap: float | None = None,
     precision: jax.lax.PrecisionLike = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
+    q_sharding: jax.sharding.NamedSharding | None = None,
 ) -> Float[Array, "*B T N h"]:  # pylint: disable=g-doc-args
   """Scaled dot product attention function.
 
@@ -107,9 +108,15 @@ def dot_product_attention(
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
       that doesn't raise a `NotImplementedError` is used.
+    q_sharding: NamedSharding for `q`. Sharding information for the other
+      tensors will be inferred by this.
 
   Returns:
     An array of the attention output.
+
+  Raises:
+    ExceptionGroup: If multiple implementations are provided and all of them
+      raise `NotImplementedError`.
   """
   if implementation is None:
     implementation = _DEFAULT_IMPLEMENTATION
@@ -159,6 +166,7 @@ def dot_product_attention(
           logits_scale=scale,
           precision=precision,
           logits_soft_cap=logits_soft_cap,
+          q_sharding=q_sharding,
       )
     except NotImplementedError as e:
       if len(implementation) == 1:
