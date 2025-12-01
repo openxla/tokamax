@@ -31,6 +31,7 @@ import numpy as np
 import qwix
 from tokamax._src import numerics
 from tokamax._src import quantization
+from tokamax._src import test_utils
 from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import xla_chunked
@@ -135,8 +136,9 @@ def _run_test(
   # Forwards inference.
   actual = jax.jit(impl)(q, k, v, bias)
   expected = jax.jit(ref_impl)(*ref_inputs)
-  rtol = max(atol / 10, 1e-6)
-  chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+  min_atol = atol if isinstance(atol, float) else min(atol.values())
+  rtol = max(min_atol / 10, 1e-6)
+  test_utils.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
   if test_deterministic:
     chex.assert_trees_all_equal(actual, jax.jit(impl)(q, k, v, bias))
