@@ -625,7 +625,7 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       f = lambda *args, f=f: combine_partial_results(*f(*args))
 
     for _ in q.shape[:-3]:  # Strip of the batch dimensions.
-      f = batching.vmap_maybe_bcast(f, (0,) * len(args))
+      f = batching.vmap_maybe_bcast(f, 0)
 
     out, residuals = f(*args)
     return out.astype(q.dtype), (residuals if return_residuals else None)
