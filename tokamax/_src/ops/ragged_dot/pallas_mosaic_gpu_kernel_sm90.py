@@ -25,7 +25,10 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
-def ragged_dot_non_quantized_kernel_body(
+_WGMMA = plgpu.Layout.WGMMA
+
+
+def ragged_dot_kernel_body(
     group_info,
     mi,
     ni,
@@ -113,7 +116,7 @@ def ragged_dot_non_quantized_kernel_body(
 
 
 @jaxtyping.jaxtyped
-def ragged_dot_non_quantized_kernel(
+def ragged_dot_kernel(
     lhs: Float[Array, "M K"],
     rhs: Float[Array, "G K N"],
     group_sizes: Integer[Array, "G"],
@@ -145,7 +148,7 @@ def ragged_dot_non_quantized_kernel(
     )
 
   body_fn = functools.partial(
-      ragged_dot_non_quantized_kernel_body,
+      ragged_dot_kernel_body,
       swizzle=swizzle,
       config=config,  # This config's block_k must work with swizzle
       out_dtype=out_dtype,
@@ -173,3 +176,124 @@ def ragged_dot_non_quantized_kernel(
       lhs,
       rhs,
   )
+
+
+def ragged_contracting_dim_dot_kernel_body(
+    group_sizes_gmem,
+    group_sizes_starts_gmem,
+    lhs_gmem,
+    rhs_gmem,
+    o_gmem,
+    *,
+    swizzle: int,
+    out_dtype: jnp.dtype,
+    config: common.Config,
+):
+  """Pallas kernel body for non-quantized ragged contracting dim dot."""
+  block_m = config.block_m
+  block_k = config.block_k
+  block_n = config.block_n
+
+  mi, ni, gi = map(jax.lax.axis_index, ("m", "n", "g"))
+  group_start = group_sizes_starts_gmem[gi]
+  group_end = group_start + group_sizes_gmem[gi]
+
+  lb = jax.lax.div(group_start.astype(jnp.int32), block_k)
+  ub = pl.cdiv(group_end.astype(jnp.int32), block_k)
+  transforms = (
+      plgpu.TilingTransform((8, swizzle // lhs_gmem.dtype.itemsize)),
+      plgpu.SwizzleTransform(swizzle),
+  )
+
+  def acc_scope(acc_ref):
+    def body(idxs, lhs_smem, rhs_smem):
+      (ki,) = idxs
+      k_start = (lb + ki) * block_k
+      kx = plgpu.broadcasted_iota(jnp.int32, lhs_smem.shape, 1, layout=_WGMMA)
+      mask = (kx >= (group_start - k_start)) & (kx < (group_end - k_start))
+
+      # TODO: Only mask out the 1st and last iteration.
+      plgpu.wgmma(acc_ref, lhs_smem[...] * mask, rhs_smem)
+      plgpu.wgmma_wait(1)
+
+    plgpu.emit_pipeline(
+        body,
+        grid=(ub - lb,),
+        in_specs=[
+            plgpu.BlockSpec(
+                (block_m, block_k),
+                lambda ki: (mi, lb + ki),
+                transforms=transforms,
+                delay_release=1,
+            ),
+            plgpu.BlockSpec(
+                (block_k, block_n),
+                lambda ki: (lb + ki, ni),
+                transforms=transforms,
+                delay_release=1,
+            ),
+        ],
+        max_concurrent_steps=config.num_stages,
+    )(lhs_gmem, rhs_gmem)
+    return acc_ref[...]
+
+  acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
+
+  @functools.partial(
+      pl.run_scoped,
+      o_smem=plgpu.SMEM((block_m, block_n), out_dtype, transforms=transforms),
+  )
+  def _store_scope(o_smem):
+    o_smem[...] = acc.astype(out_dtype)
+    plgpu.commit_smem()
+    slice_m = pl.ds(mi * block_m, block_m)
+    slice_n = pl.ds(ni * block_n, block_n)
+    out_gmem_slice = o_gmem.at[gi, slice_m, slice_n]
+    plgpu.copy_smem_to_gmem(o_smem, out_gmem_slice)
+    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+
+@jaxtyping.jaxtyped
+def ragged_contracting_dim_dot_kernel(
+    lhs: Float[Array, "K M"],
+    rhs: Float[Array, "K N"],
+    group_sizes: Integer[Array, "G"],
+    out_dtype: jnp.dtype,
+    config: common.Config,
+) -> Float[Array, "G M N"]:
+  """Pallas kernel for ragged contracting dim dot with non-quantized inputs."""
+
+  if lhs.dtype != rhs.dtype:
+    raise NotImplementedError(
+        f"lhs and rhs must have the same dtype. Got {lhs.dtype=} and"
+        f" {rhs.dtype=}"
+    )
+
+  if lhs.dtype not in (jnp.bfloat16, jnp.float16):
+    raise NotImplementedError(
+        f"Only bfloat16/float16 inputs are supported. Got {lhs.dtype=}"
+    )
+
+  elem_bits = jnp.finfo(lhs.dtype).bits
+  swizzle = plgpu.find_swizzle(elem_bits * config.block_k, "lhs")
+
+  _, m = lhs.shape
+  _, n = rhs.shape
+  g = group_sizes.shape[0]
+
+  body_fn = functools.partial(
+      ragged_contracting_dim_dot_kernel_body,
+      swizzle=swizzle,
+      config=config,
+      out_dtype=out_dtype,
+  )
+  kernel = plgpu.kernel(
+      body_fn,
+      out_shape=jax.ShapeDtypeStruct((g, m, n), out_dtype),
+      grid=(pl.cdiv(m, config.block_m), pl.cdiv(n, config.block_n), g),
+      grid_names=("m", "n", "g"),
+  )
+
+  group_sizes_starts = jnp.cumulative_sum(group_sizes, include_initial=True)
+  # TODO: Fuse transpose into kernel.
+  return kernel(group_sizes, group_sizes_starts[:-1], lhs.T, rhs)

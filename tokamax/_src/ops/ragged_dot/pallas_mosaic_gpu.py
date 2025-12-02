@@ -15,6 +15,7 @@
 """Ragged dot Pallas-Mosaic-GPU implementation."""
 
 import dataclasses
+import functools
 from typing import ClassVar
 
 import jax
@@ -53,8 +54,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
   def __post_init__(self):
     if self.vjp is None:
-      # TODO: Use kernel for vjp.
-      object.__setattr__(self, "vjp", base.vjp)
+      # Avoid infinite recursion.
+      f = lambda *a, **kw: PallasMosaicGpuRaggedDot()(*a, **kw)  # pylint: disable=unnecessary-lambda
+      vjp = functools.partial(base.vjp, dlhs_ragged_dot=f, drhs_ragged_dot=f)
+      object.__setattr__(self, "vjp", vjp)
 
   @override
   def _fwd(
@@ -71,13 +74,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   ) -> tuple[jax.Array, None]:
     del return_residuals  # Unused.
 
-    if ragged_dot_dimension_numbers != base.DEFAULT_RAGGED_DOT_DIM_NUMS:
-      raise NotImplementedError(
-          "Only default `ragged_dot_dimension_numbers` supported."
-      )
-
-    if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
-      raise NotImplementedError(f"{precision=} not supported.")
+    if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
+      rhs = rhs.mT  # TODO: Fuse transpose into kernel.
+      ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
     lhs = quantization.as_array(lhs)
     # None of the kernels support zero point yet.
@@ -86,19 +85,49 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     device = backend.get_default_device()
 
     if float(getattr(device, "compute_capability", "9.0")) >= 10.0:
+      if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+        raise NotImplementedError(f"{precision=} not supported.")
+
+      if ragged_dot_dimension_numbers != base.DEFAULT_RAGGED_DOT_DIM_NUMS:
+        raise NotImplementedError(
+            "Only default `ragged_dot_dimension_numbers` supported."
+        )
       if isinstance(rhs, QArray):
         fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
       else:
         fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
-    elif isinstance(rhs, QArray):
-      if config.async_store:
-        fn = sm90_quant_ws_async_store.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
-      elif config.warp_specialized:
-        fn = sm90_quant_ws.ragged_dot_quantized_ws_kernel
-      else:
-        fn = sm90_quant.ragged_dot_quantized_kernel
     else:
-      fn = sm90.ragged_dot_non_quantized_kernel
+      if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
+        if isinstance(rhs, QArray):
+          if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+            raise NotImplementedError(f"{precision=} not supported.")
+
+          if config.async_store:
+            fn = sm90_quant_ws_async_store.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
+          elif config.warp_specialized:
+            fn = sm90_quant_ws.ragged_dot_quantized_ws_kernel
+          else:
+            fn = sm90_quant.ragged_dot_quantized_kernel
+        else:
+          if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+            lhs = lhs.astype(jnp.bfloat16)
+            rhs = rhs.astype(jnp.bfloat16)
+          elif not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+            raise NotImplementedError(f"{precision=} not supported.")
+
+          fn = sm90.ragged_dot_kernel
+      elif ragged_dot_dimension_numbers == base.RAGGED_CONTRACTING_DOT_DIM_NUMS:
+        rhs = quantization.as_array(rhs)
+
+        if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+          lhs = lhs.astype(jnp.bfloat16)
+          rhs = rhs.astype(jnp.bfloat16)
+        elif not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+          raise NotImplementedError(f"{precision=} not supported.")
+
+        fn = sm90.ragged_contracting_dim_dot_kernel
+      else:
+        raise NotImplementedError("Unsupported ragged dot dimension numbers.")
 
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.array(group_sizes)

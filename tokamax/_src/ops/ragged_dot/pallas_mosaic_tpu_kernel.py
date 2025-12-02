@@ -389,17 +389,22 @@ def gmm(
   )
   group_offsets, group_ids, _ = group_metadata
 
-  if transpose_rhs:
-    dimension_numbers = (((1,), (1,)), ((), ()))
-  else:
-    dimension_numbers = (((1,), (0,)), ((), ()))
-  dot = lambda x, y, preferred_element_type: jax.lax.dot_general(
-      x,
-      y,
-      dimension_numbers=dimension_numbers,
-      precision=precision,
-      preferred_element_type=preferred_element_type,
-  )
+  def dot(x, y, preferred_element_type, *, precision=precision):
+    # TODO: Pallas-MTPU doesn't support `DotAlgorithmPreset`.
+    if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+      x = x.astype(jnp.bfloat16)
+      y = y.astype(jnp.bfloat16)
+      precision = (jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT)
+      preferred_element_type = jnp.float32
+
+    rhs_contracting_dim = 1 if transpose_rhs else 0
+    return jax.lax.dot_general(
+        x,
+        y,
+        dimension_numbers=(((1,), (rhs_contracting_dim,)), ((), ())),
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+    )
 
   def _maybe_get_subslice(x, idx: int, subslice_count: int | None, axis: int):
     """Returns a subslice of the given array along the given axis."""
@@ -683,9 +688,20 @@ def tgmm(
       visit_empty_groups=True,
   )
 
-  dot = lambda x, y, preferred_element_type: lax.dot(
-      x, y, precision=precision, preferred_element_type=preferred_element_type
-  )
+  def dot(x, y, preferred_element_type, *, precision=precision):
+    # TODO: Pallas-MTPU doesn't support `DotAlgorithmPreset`.
+    if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+      x = x.astype(jnp.bfloat16)
+      y = y.astype(jnp.bfloat16)
+      precision = (jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT)
+      preferred_element_type = jnp.float32
+
+    return jax.lax.dot(
+        x,
+        y,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+    )
 
   def kernel(
       group_metadata,

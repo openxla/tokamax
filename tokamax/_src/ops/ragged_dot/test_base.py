@@ -173,7 +173,11 @@ class RaggedDotTestBase(parameterized.TestCase):
     a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
     a_ref = a.astype(jnp.float32)
     b_ref = b.astype(jnp.float32)
-    f = functools.partial(self._dot_fn_f32, group_sizes=group_sizes)
+    f = functools.partial(
+        self._dot_fn_f32,
+        group_sizes=group_sizes,
+        precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+    )
     f_ref = functools.partial(ref, group_sizes=group_sizes)
     chex.assert_trees_all_close(f(a, b), f_ref(a_ref, b_ref), atol=1e-5)
 
@@ -181,7 +185,10 @@ class RaggedDotTestBase(parameterized.TestCase):
     expected, f_ref_vjp = jax.vjp(f_ref, a_ref, b_ref)
     chex.assert_trees_all_close(actual, expected, atol=1e-5)
 
-    dout = jax.nn.standardize(expected).astype(actual.dtype)
+    dout = jax.nn.standardize(expected)
+    # NOTE: The reference doesn't correctly support `BF16_BF16_F32`, so we
+    # explicitly downcast `dout` to bfloat16 to bottleneck the precision.
+    dout = dout.astype(jnp.bfloat16).astype(actual.dtype)
     expected = f_ref_vjp(dout.astype(expected.dtype))
     chex.assert_trees_all_close(f_vjp(dout), expected, atol=0.02, rtol=0.005)
 

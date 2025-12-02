@@ -264,13 +264,6 @@ def _ragged_contracting_dim_dot_kernel(
   out_ref.store(acc.astype(out_ref.dtype))
 
 
-_RAGGED_CONTRACTING_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
-    dot_dimension_numbers=(([0], [0]), ([], [])),
-    lhs_ragged_dimensions=[0],
-    rhs_group_dimensions=[],
-)
-
-
 def _ragged_contracting_dim_dot(
     lhs: jax.Array | QArray,
     rhs: jax.Array | QArray,
@@ -282,7 +275,7 @@ def _ragged_contracting_dim_dot(
     config: Config,
 ) -> jax.Array:
   """Pallas-Triton ragged dot for ragged contracting dimension."""
-  assert ragged_dot_dimension_numbers == _RAGGED_CONTRACTING_DOT_DIM_NUMS
+  assert ragged_dot_dimension_numbers == base.RAGGED_CONTRACTING_DOT_DIM_NUMS
 
   if config.split_k != 1:
     raise NotImplementedError(
@@ -327,13 +320,6 @@ def _ragged_contracting_dim_dot(
   return f(lhs, rhs, cum_rows[:-1], cum_rows[1:])
 
 
-_DLHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
-    dot_dimension_numbers=(([1], [2]), ([], [])),
-    lhs_ragged_dimensions=[0],
-    rhs_group_dimensions=[0],
-)
-
-
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
   """Pallas-Triton ragged dot implementation."""
@@ -371,8 +357,8 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
     else:
       out_dtype = preferred_element_type
 
-    if ragged_dot_dimension_numbers == _DLHS_RAGGED_DOT_DIM_NUMS:
-      rhs = jnp.swapaxes(rhs, -1, -2)  # TODO: Fuse transpose into kernel.
+    if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
+      rhs = rhs.mT  # TODO: Fuse transpose into kernel.
       ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
     if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
@@ -388,7 +374,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       )
       return out, None
 
-    if ragged_dot_dimension_numbers == _RAGGED_CONTRACTING_DOT_DIM_NUMS:
+    if ragged_dot_dimension_numbers == base.RAGGED_CONTRACTING_DOT_DIM_NUMS:
       out = _ragged_contracting_dim_dot(
           lhs,
           rhs,

@@ -45,6 +45,16 @@ DEFAULT_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
     lhs_ragged_dimensions=[0],
     rhs_group_dimensions=[0],
 )
+TRANS_RHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(([1], [2]), ([], [])),
+    lhs_ragged_dimensions=[0],
+    rhs_group_dimensions=[0],
+)
+RAGGED_CONTRACTING_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(([0], [0]), ([], [])),
+    lhs_ragged_dimensions=[0],
+    rhs_group_dimensions=[],
+)
 
 
 _STATIC = dataclasses.field(metadata=dict(static=True))
