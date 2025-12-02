@@ -717,8 +717,8 @@ def _bwd(
           (plgpu.Barrier(num_barriers=compute_wgs),) * 5,  # type: ignore
       ],
       compiler_params=plgpu.CompilerParams(approx_math=True),
-      grid=(num_q_heads, num_q_tiles, batch_size),
-      grid_names=("heads", "q_tiles", "batch"),
+      grid=(batch_size, num_q_heads, num_q_tiles),
+      grid_names=("batch", "heads", "q_tiles"),
       num_threads=compute_wgs + 1,
       thread_name="wg",
   )(q, k, v, dout, m, l, delta, bias, mask, k_start, k_end)
@@ -755,8 +755,8 @@ def _bwd(
           (plgpu.Barrier(num_barriers=compute_wgs),) * 2,  # type: ignore
       ],
       compiler_params=plgpu.CompilerParams(approx_math=True),
-      grid=(num_q_heads, num_kv_tiles, batch_size),
-      grid_names=("heads", "num_kv_tiles", "batch"),
+      grid=(batch_size, num_q_heads, num_kv_tiles),
+      grid_names=("batch", "heads", "num_kv_tiles"),
       num_threads=compute_wgs + 1,
       thread_name="wg",
   )(q, k, v, dout, m, l, delta, bias_, mask, k_start, k_end)
