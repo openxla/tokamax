@@ -35,6 +35,7 @@ _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 Residuals = types.NoneType
 QArray = qwix.QArray
+AsQArray = quantization.AsQArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
 _DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset
 
@@ -120,8 +121,8 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   @override
   def bind(
       self,
-      lhs: jax.Array | QArray,
-      rhs: jax.Array | QArray,
+      lhs: jax.Array | QArray | AsQArray,
+      rhs: jax.Array | QArray | AsQArray,
       *,
       group_sizes: jax.Array | GroupSizes | Sequence[int],
       ragged_dot_dimension_numbers: (
@@ -166,8 +167,8 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   @override
   def _fwd(
       self,
-      lhs: jax.Array | QArray,
-      rhs: jax.Array | QArray,
+      lhs: jax.Array | QArray | AsQArray,
+      rhs: jax.Array | QArray | AsQArray,
       *,
       group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
@@ -208,8 +209,8 @@ def vjp(
     residuals: Residuals,
     out: jax.Array,
     dout: jax.Array,
-    lhs: jax.Array,
-    rhs: jax.Array,
+    lhs: jax.Array | AsQArray,
+    rhs: jax.Array | AsQArray,
     *,
     group_sizes: jax.Array,
     ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,

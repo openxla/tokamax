@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Pydantic types and utilities."""
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import enum
 import functools
@@ -100,6 +100,13 @@ def annotate(ty: Any) -> Any:
     return tuple[tuple(map(annotate, typing.get_args(ty)))]
   if origin in (type, Callable):
     return pydantic.ImportString[ty]
+  if origin is Mapping:
+    # Allow `immutabledict` to be serialized as a `Mapping`.
+    return Annotated[
+        ty,
+        pydantic.AfterValidator(lambda d: immutabledict.immutabledict(d)),  # pylint: disable=unnecessary-lambda
+        pydantic.WrapSerializer(lambda d, handler: handler(dict(d))),
+    ]
   if origin is Sequence:
     return Annotated[ty, pydantic.AfterValidator(tuple)]
   if origin is fuser.Fusion:

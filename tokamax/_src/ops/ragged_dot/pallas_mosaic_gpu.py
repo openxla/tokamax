@@ -36,6 +36,7 @@ from typing_extensions import override
 
 Config = common.Config
 QArray = base.QArray
+AsQArray = base.AsQArray
 GroupSizes = base.GroupSizes
 
 
@@ -58,8 +59,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   @override
   def _fwd(
       self,
-      lhs: jax.Array | QArray,
-      rhs: jax.Array | QArray,
+      lhs: jax.Array | QArray | AsQArray,
+      rhs: jax.Array | QArray | AsQArray,
       *,
       group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,

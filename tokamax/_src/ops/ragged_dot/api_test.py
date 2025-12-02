@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import qwix
 from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
+from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import api
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
@@ -153,13 +154,15 @@ class RaggedDotMosaicTest(RaggedDotImplementationTest):
       dot_fn = self._dot_fn
 
       def fn(lhs, rhs, **kwargs):
+        rhs_ = jax.eval_shape(quantization.as_array_or_qarray, rhs)
+
         if (
             (lhs.dtype == jnp.bfloat16)
             and (lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0)
             and (
-                not isinstance(rhs, qwix.QArray)
+                not isinstance(rhs_, qwix.QArray)
                 or (
-                    (rhs.scale_tile_shape == (1, 256, 1))
+                    (rhs_.scale_tile_shape == (1, 256, 1))
                     and kwargs.get("preferred_element_type") is None
                 )
             )

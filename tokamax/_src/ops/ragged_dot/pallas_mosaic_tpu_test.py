@@ -19,10 +19,14 @@ import jax
 import jax.numpy as jnp
 import qwix
 from tokamax._src import mosaic_tpu as common
+from tokamax._src import quantization
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
+
+
+AsQArray = quantization.AsQArray
 
 
 def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
@@ -40,8 +44,8 @@ def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
 
 
 def _is_config_supported(
-    lhs: jax.Array | qwix.QArray,
-    rhs: jax.Array | qwix.QArray,
+    lhs: jax.Array | qwix.QArray | AsQArray,
+    rhs: jax.Array | qwix.QArray | AsQArray,
     config: pallas_mosaic_tpu.Config,
 ) -> bool:
   (m, k), (_, _, n) = lhs.shape, rhs.shape
@@ -51,9 +55,13 @@ def _is_config_supported(
       or n < config.gmm_tiling[2]
   ):
     return False
-  if isinstance(lhs, qwix.QArray) and not _is_scale_tiling_supported(lhs, 1):
+
+  lhs_ = jax.eval_shape(quantization.as_array_or_qarray, lhs)
+  rhs_ = jax.eval_shape(quantization.as_array_or_qarray, rhs)
+
+  if isinstance(lhs_, qwix.QArray) and not _is_scale_tiling_supported(lhs_, 1):
     return False
-  if isinstance(rhs, qwix.QArray) and not _is_scale_tiling_supported(rhs, 1):
+  if isinstance(rhs_, qwix.QArray) and not _is_scale_tiling_supported(rhs_, 1):
     return False
   return True
 
@@ -90,9 +98,9 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       super().test_vjp0()  # pytype: disable=attribute-error
 
   @override
-  def _test_quantized(self, dtype, a_tile_shape, b_tile_shape):
+  def _test_quantized(self, dtype, a_tile_shape, b_tile_shape, use_as_qarray):
     with test_base.override_chex_args(atol=0.4, rtol=0.1):
-      super()._test_quantized(dtype, a_tile_shape, b_tile_shape)
+      super()._test_quantized(dtype, a_tile_shape, b_tile_shape, use_as_qarray)
 
   @override
   def _test_bench(self, spec):

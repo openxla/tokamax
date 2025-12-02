@@ -35,6 +35,7 @@ from typing_extensions import override
 
 Residuals = base.Residuals
 QArray = base.QArray
+AsQArray = base.AsQArray
 GroupSizes = base.GroupSizes
 
 
@@ -351,8 +352,8 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
   @override
   def _fwd(
       self,
-      lhs: jax.Array | QArray,
-      rhs: jax.Array | QArray,
+      lhs: jax.Array | QArray | AsQArray,
+      rhs: jax.Array | QArray | AsQArray,
       *,
       group_sizes: jax.Array | GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
@@ -362,6 +363,8 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       config: Config,
   ) -> tuple[jax.Array, None]:
     del return_residuals  # Unused.
+
+    lhs, rhs = map(quantization.as_array_or_qarray, (lhs, rhs))
 
     if preferred_element_type is None:
       out_dtype = jnp.promote_types(lhs.dtype, rhs.dtype)

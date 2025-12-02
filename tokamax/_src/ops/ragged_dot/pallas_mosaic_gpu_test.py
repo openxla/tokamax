@@ -17,6 +17,7 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import qwix
+from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
 from tokamax._src.ops.ragged_dot import test_base
 
@@ -42,6 +43,8 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
           lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0
       )
 
+      rhs_ = jax.eval_shape(quantization.as_array_or_qarray, rhs)
+
       device_kind = jax.devices()[0].device_kind.lower()
       if "b200" in device_kind:
         config = pallas_mosaic_gpu.Config(
@@ -54,16 +57,16 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
             persistent=True,
         )
         if (
-            not isinstance(rhs, qwix.QArray)
-            or (rhs.qtype != jnp.int4)
-            or (rhs.scale_tile_shape[0] != 1)
-            or (rhs.scale_tile_shape[1] < _CONFIG.block_k)
-            or (rhs.scale_tile_shape[2] != 1)
+            not isinstance(rhs_, qwix.QArray)
+            or (rhs_.qtype != jnp.int4)
+            or (rhs_.scale_tile_shape[0] != 1)
+            or (rhs_.scale_tile_shape[1] < _CONFIG.block_k)
+            or (rhs_.scale_tile_shape[2] != 1)
         ):
           expect_supported = False
-      elif isinstance(rhs, qwix.QArray):
+      elif isinstance(rhs_, qwix.QArray):
         if (
-            rhs.scale_tile_shape != (1, _CONFIG.block_k, 1)
+            rhs_.scale_tile_shape != (1, _CONFIG.block_k, 1)
             or kwargs.get("preferred_element_type") is not None
         ):
           expect_supported = False

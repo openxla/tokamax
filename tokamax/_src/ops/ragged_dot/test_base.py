@@ -50,11 +50,9 @@ _jax_ragged_dot_f32 = _dot_fn_f32(jax.lax.ragged_dot)
 def ref(lhs, rhs, group_sizes):
   """Reference implementation of ragged dot."""
   lhs, rhs = map(quantization.as_array, (lhs, rhs))
-
   if lhs.dtype != rhs.dtype:
     input_dtype = jnp.result_type(lhs.dtype, rhs.dtype)
     lhs, rhs = lhs.astype(input_dtype), rhs.astype(input_dtype)
-
   return _jax_ragged_dot_f32(lhs, rhs, group_sizes=jnp.asarray(group_sizes))
 
 
@@ -128,23 +126,27 @@ class RaggedDotTestBase(parameterized.TestCase):
       dtype=("int8", "int4"),
       a_tile_shape=(None, (1, 128), (1, 16), (256, 1), (16, 1)),
       b_tile_shape=((1, 1, 16), (1, 1, 128), (1, 256, 1), (1, 16, 1)),
+      use_as_qarray=(True, False),
   )
-  def test_quantized(self, dtype, a_tile_shape, b_tile_shape):
-    self._test_quantized(dtype, a_tile_shape, b_tile_shape)
+  def test_quantized(self, dtype, a_tile_shape, b_tile_shape, use_as_qarray):
+    self._test_quantized(dtype, a_tile_shape, b_tile_shape, use_as_qarray)
 
-  def _test_quantized(self, dtype, a_tile_shape, b_tile_shape):
+  def _test_quantized(self, dtype, a_tile_shape, b_tile_shape, use_as_qarray):
     dtype = jnp.dtype(dtype)
     num_groups, m, k, n = 8, 512, 256, 512
     a, b, group_sizes = self._create_inputs(
         num_groups, m, k, n, jnp.bfloat16, random_groups=True
     )
 
-    if a_tile_shape is not None:
-      a_tiled_axes = {i: d for i, d in enumerate(a_tile_shape)}
-      a = qwix.quantize(a, dtype, tiled_axes=a_tiled_axes)
+    def quantize(x, tile_shape):
+      tiled_axes = {i: d for i, d in enumerate(tile_shape)}
+      if use_as_qarray:
+        return quantization.AsQArray(x, dtype, tiled_axes=tiled_axes)
+      return qwix.quantize(x, dtype, tiled_axes=tiled_axes)
 
-    b_tiled_axes = {i: d for i, d in enumerate(b_tile_shape)}
-    b = qwix.quantize(b, dtype, tiled_axes=b_tiled_axes)
+    if a_tile_shape is not None:
+      a = quantize(a, a_tile_shape)
+    b = quantize(b, b_tile_shape)
 
     expected = ref(a, b, group_sizes)
     # TODO: preferred_element_type to f32 and tighten tolerances.

@@ -43,6 +43,7 @@ TilingTuple = tuple[
 InputBufferCount = pydantic.conint(ge=1, le=3, multiple_of=1)
 
 QArray = base.QArray
+AsQArray = base.AsQArray
 Residuals = types.NoneType
 
 LUTKey = tuple[
@@ -162,8 +163,8 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   @override
   def _fwd(
       self,
-      lhs: jax.Array | QArray,
-      rhs: jax.Array | QArray,
+      lhs: jax.Array | QArray | AsQArray,
+      rhs: jax.Array | QArray | AsQArray,
       *,
       group_sizes: jax.Array | base.GroupSizes,
       ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
@@ -175,6 +176,8 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     del return_residuals  # Unused.
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
+
+    lhs, rhs = map(quantization.as_array_or_qarray, (lhs, rhs))
 
     if any(  # pallas mosaic TPU requires all non-expert dimensions to be >= 128
         size < 128 for size in tuple(lhs.shape[-2:]) + tuple(rhs.shape[-2:])
