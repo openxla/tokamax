@@ -721,7 +721,7 @@ def fold_q_sequence_heads(
 
     x = jax.lax.broadcast_to_rank(x, 2 + has_k_seq)
     t = "t" if has_k_seq else ""
-    eqn = f"...{["(hg)", "h"][bcast_hg]}{["s", "1"][bcast_s]}{t}->...h(sg){t}"
+    eqn = f"...{['(hg)', 'h'][bcast_hg]}{['s', '1'][bcast_s]}{t}->...h(sg){t}"
     return shape_lib.einshape(eqn, s=seq_len_q, g=num_q_heads_per_k_head)(x)
 
   bias, dropout_mask = map(fold, (bias, dropout_mask))
