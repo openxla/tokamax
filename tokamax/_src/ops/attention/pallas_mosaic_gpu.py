@@ -30,8 +30,8 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 import tokamax._src.ops.attention.pallas_mosaic_gpu_common as common
-import tokamax._src.ops.attention.pallas_mosaic_gpu_flash_attention_vjp as vjp
 import tokamax._src.ops.attention.pallas_mosaic_gpu_kernel_sm90 as sm90
+import tokamax._src.ops.attention.pallas_mosaic_gpu_vjp as vjp
 from typing_extensions import override
 
 Config = common.Config

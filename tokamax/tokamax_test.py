@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import tokamax
 from tokamax._src.autotuning import api as autotuning
 from tokamax._src.ops.attention import api as attention_api
-from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention_vjp
+from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp
 from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp
 from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton_vjp
@@ -80,7 +80,7 @@ class TokamaxTest(absltest.TestCase):
           attention_api.IMPLEMENTATIONS["mosaic"].__class__,
           norm_api.IMPLEMENTATIONS["triton"].__class__,
           pallas_triton_flash_attention_vjp.PallasTritonFlashAttentionVjp,
-          pallas_mosaic_gpu_flash_attention_vjp.PallasMosaicGpuFlashAttentionVjp,
+          pallas_mosaic_gpu_vjp.PallasMosaicGpuFlashAttentionVjp,
           pallas_triton_vjp.PallasTritonNormalizationVjp,
       ])
       self.assertContainsSubset(ops_expected, ops)
