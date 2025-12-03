@@ -27,6 +27,7 @@ import pydantic
 from tokamax._src import hlo_utils
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.autotuning import autotuner
+from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
@@ -105,6 +106,22 @@ class AutotuningResult:
 
   def dumps(self) -> str:
     return str(_AUTOTUNING_RESULT_ADAPTER.dump_json(self), "utf-8")
+
+  def dump_cache_str(self) -> str:
+    cache_str = ""
+    # Convert to a dictionary and serialize out the op.
+    device_autotuning_dict = {}
+    for ba, data in self.data:
+      device_autotuning_dict.setdefault(ba.op, {})[ba.arguments] = data
+
+    for op, cache in device_autotuning_dict.items():
+      adapter = cache_lib._get_cache_adapter(op)  # pylint: disable=protected-access
+      cache_str += (
+          str(adapter.dump_json(cache, indent=2, round_trip=True), "utf-8")
+          + "\n"
+      )
+
+    return cache_str
 
   @classmethod
   def load(cls, fp) -> Self:
