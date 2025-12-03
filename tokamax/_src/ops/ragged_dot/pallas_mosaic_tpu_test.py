@@ -16,6 +16,7 @@
 
 from absl.testing import absltest
 import jax
+import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 import qwix
 from tokamax._src import mosaic_tpu as common
@@ -31,7 +32,8 @@ AsQArray = quantization.AsQArray
 
 def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
   min_addressable_sizes = (
-      [1] * x.ndim + [common._sublane_size(), common.LANES]
+      [1] * x.ndim
+      + [common._adaptive_sublane_size(), pltpu.get_tpu_info().num_lanes]
   )[-x.ndim :]
   cdiv = lambda x, y: (x + y - 1) // y
   eps_list = [cdiv(x, y) for x, y in zip(x.qvalue.shape, x.scale.shape)]

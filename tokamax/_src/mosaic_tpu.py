@@ -16,12 +16,11 @@
 
 import dataclasses
 import functools
-from typing import Any, Callable, Final, Sequence
+from typing import Any, Callable, Sequence
 
 import jax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
-from jax.extend import backend
 import jax.numpy as jnp
 import qwix
 
@@ -29,29 +28,19 @@ import qwix
 QArray = qwix.QArray
 
 LANES = 128
-_sublane_size = functools.lru_cache(lambda: 16 if tpu_generation() >= 7 else 8)
+
+
+@functools.lru_cache
+def _adaptive_sublane_size() -> int:
+  """Returns the sublane size based on the generation.
+
+  The standard `pltpu.get_tpu_info().num_sublanes` is 8 for all generations, and
+  this returns 16 for TPU generation 7 and above.
+  """
+  return 16 if pltpu.get_tpu_info().generation >= 7 else 8
 
 
 # TODO: Add tests for this file.
-
-_SUPPORTED_TPU_GENERATIONS: Final[dict[str, int]] = {
-    "TPU v4": 4,
-    "TPU v5 lite": 5,
-    "TPU v5": 5,
-    "TPU v5e": 5,
-    "TPU v5p": 5,
-    "TPU v6 lite": 6,
-    "TPU7x": 7,
-}
-
-
-def tpu_generation() -> int:
-  """Generation number of the currently attached TPU."""
-  device_kind = backend.get_default_device().device_kind
-  try:
-    return _SUPPORTED_TPU_GENERATIONS[device_kind]
-  except KeyError as e:
-    raise ValueError(f"{device_kind} is not a supported TPU device") from e
 
 
 @jax.tree_util.register_static
@@ -116,7 +105,9 @@ def quant_block_spec(
 
   eps_list = [pl.cdiv(xs, ss) for xs, ss in zip(x_values.shape, x_scales.shape)]
   tile_sizes = x_spec.block_shape
-  min_addressable_sizes = ([1] * x.ndim + [_sublane_size(), LANES])[-x.ndim :]
+  min_addressable_sizes = (
+      [1] * x.ndim + [_adaptive_sublane_size(), pltpu.get_tpu_info().num_lanes]
+  )[-x.ndim :]
 
   # Limitation 1: Currently, we only support full-axis scales or 1 scale per
   # each element for non-reduction axes, this is supported by the block-spec,

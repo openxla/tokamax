@@ -20,10 +20,10 @@ import types
 from typing import ClassVar
 
 import jax
+import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 import pydantic
 import qwix
-from tokamax._src import mosaic_tpu
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
@@ -379,4 +379,4 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and mosaic_tpu.tpu_generation() >= 5
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5

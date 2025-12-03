@@ -26,7 +26,6 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Integer, Real, Scalar
 import pydantic
-from tokamax._src import mosaic_tpu
 from tokamax._src.ops import op
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
 from typing_extensions import override
@@ -637,7 +636,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     del ba
 
-    if mosaic_tpu.tpu_generation() >= 6:
+    if pltpu.get_tpu_info().generation >= 6:
       return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
     else:
       return Config(b_block_size=1024, h_block_size=512, v_block_size=1024)
@@ -649,7 +648,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and mosaic_tpu.tpu_generation() >= 5
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -691,7 +690,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     del ba
-    if mosaic_tpu.tpu_generation() >= 6:
+    if pltpu.get_tpu_info().generation >= 6:
       return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
     else:
       return Config(b_block_size=1024, h_block_size=512, v_block_size=1024)
@@ -703,4 +702,4 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and mosaic_tpu.tpu_generation() >= 5
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
