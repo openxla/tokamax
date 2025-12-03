@@ -40,7 +40,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       supports_tanh_clipping=True,
       supports_is_causal=True,
       supports_f32_inputs=True,
-      supports_vmap=False,
+      supports_vmap=True,
   ):
     if attention_fn is None:
       vjp = fa_vjp.PallasMosaicGpuFlashAttentionVjp(
