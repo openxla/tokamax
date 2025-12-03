@@ -54,41 +54,6 @@ def tpu_generation() -> int:
     raise ValueError(f"{device_kind} is not a supported TPU device") from e
 
 
-def has_mosaic_tpu_support() -> bool:
-  """Checks if Mosaic TPU is supported on the attached TPU."""
-  return "TPU" in jax.devices()[0].device_kind and tpu_generation() >= 4
-
-
-def supports_bfloat16_matmul() -> bool:
-  """Checks TPU generation to determine if bfloat16 matmul is supported."""
-  return "TPU" in jax.devices()[0].device_kind and tpu_generation() >= 4
-
-
-def assert_is_supported_dtype(dtype: jnp.dtype) -> None:
-  if dtype not in (jnp.bfloat16, jnp.float32):
-    raise ValueError(f"Expected bfloat16 or float32 array but got {dtype}.")
-
-
-def select_input_dtype(lhs: jnp.ndarray, rhs: jnp.ndarray) -> jnp.dtype:
-  """A type to which both input should be adapted to before dot product."""
-  # bf16xbf16 matmul is only supported since TPUv4 generation. In case of mixed
-  # input precision, we need to convert bf16 argument to fp32 beforehand.
-  if not has_mosaic_tpu_support():
-    raise ValueError("Mosaic TPU is not supported on this platform.")
-  if lhs.dtype == rhs.dtype == jnp.bfloat16:
-    return jnp.bfloat16
-  else:
-    return jnp.float32
-
-
-def default_quant_dot_dtype() -> jnp.dtype:
-  """Returns the default quantized dot dtype."""
-  if tpu_generation() >= 7:
-    return jnp.float8_e4m3fn
-  else:
-    return jnp.int8
-
-
 @jax.tree_util.register_static
 @dataclasses.dataclass
 class ScalesTilingInfo:
