@@ -14,52 +14,34 @@
 # ==============================================================================
 """Flash attention with Mosaic GPU."""
 
-import dataclasses
 import functools
 import math
-from typing import Any, ClassVar, TypeAlias
 
-import immutabledict
 import jax
 from jax import lax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
-import pydantic
-from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
-from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
-from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
-from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention_vjp as vjp
+import tokamax._src.ops.attention.pallas_mosaic_gpu_common as common
 from tokamax._src.pallas import block
-from typing_extensions import override
 
 
 # pylint: disable=cell-var-from-loop
 
-
-DotPrecisionLike = lax.Precision | lax.DotAlgorithmPreset
-QArray = base.QArray
+Config = common.Config
 Residuals = base.Residuals
-PagingInfo = base.PagingInfo
+
 _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 
 
-@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class Config:
-  # TODO: Relax constraints to multiple of 32.
-  block_q: pydantic.conint(multiple_of=64, gt=0) = 64
-  block_kv: pydantic.conint(multiple_of=64, gt=0) = 64
-  num_stages: pydantic.conint(gt=1) = 2
-
-
 @jaxtyping.jaxtyped
-def _fwd(
+def flash_attention_kernel(
     q: Float[Array, "*B T H D"],
     k: Float[Array, "*B t h D"],
     v: Float[Array, "*B t h d"],
@@ -503,203 +485,3 @@ def _fwd(
       for res in residuals
   )
   return out, (residuals if return_residuals else None)
-
-
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
-
-
-def _decompose_mask(mask, q, k, q_indices, k_indices):
-  """Decomposes `mask` into a mask array, `is_causal`, `k_start` and `k_end`."""
-  if mask is None:
-    return None, False, None, None
-
-  is_causal = False
-  k_start = None
-  k_end = None
-
-  if k_indices is None:
-    mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
-
-    # Fold `is_causal` into `k_end`. If `q_indices` is not `None`, then this is
-    # necessary for correctness. Otherwise, it is a performance optimization.
-    if is_causal and (q_indices is not None or k_end is not None):
-      if q_indices is None:
-        q_indices = jnp.arange(q.shape[-3])
-      k_end_ = q_indices + 1
-      k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
-      is_causal = False
-
-    if k_start is not None:
-      k_start = jax.lax.broadcast_to_rank(k_start, 2)
-    if k_end is not None:
-      k_end = jax.lax.broadcast_to_rank(k_end, 2)
-
-  q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
-  k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
-  mask = mask.as_array(q_len_or_indices, k_len_or_indices)
-  return mask, is_causal, k_start, k_end
-
-
-@dataclasses.dataclass(frozen=True)
-class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
-  """Flash attention with Mosaic GPU."""
-
-  config_cls: ClassVar[type[Config]] = Config
-  supports_symbolic_shapes: ClassVar[bool] = False
-  use_base2: bool = True
-  use_stable_softmax: bool | type[base.AUTO] = base.AUTO
-
-  def __post_init__(self):
-    if self.vjp is None:
-      vjp_ = vjp.PallasMosaicGpuFlashAttentionVjp(use_base2=self.use_base2)
-      object.__setattr__(self, "vjp", vjp_)
-
-  @jaxtyping.jaxtyped
-  @override
-  def _fwd(
-      self,
-      q: Float[Array | QArray, "*B T H D"],
-      k: Float[Array | QArray, "*B t h D"],
-      v: Float[Array | QArray, "*B t h d"],
-      *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
-      logits_dtype: jnp.dtype,
-      logits_scale: float,
-      bias: Float[Array, "*#B #H #T #t"] | None,
-      logits_soft_cap: float | None,
-      mask: base.Mask,
-      dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
-      dropout_rate: float,
-      paging_info: PagingInfo | None,
-      q_indices: Int[Array, "*#B #H T"] | None,
-      k_indices: Int[Array, "*#B #h t"] | None,
-      normalize_output: bool,
-      return_residuals: bool,
-      config: Config,
-  ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
-    """Performs attention, optionally returning softmax residuals."""
-    supported_dtypes = (jnp.float32, jnp.float16, jnp.bfloat16)
-    if any(dt not in supported_dtypes for dt in [x.dtype for x in (q, k, v)]):
-      raise NotImplementedError("Only f32, f16 and bf16 inputs are supported.")
-    if logits_dtype != jnp.float32:
-      raise NotImplementedError("`logits_dtype` must be float32.")
-    if dropout_mask is not None:
-      raise NotImplementedError("dropout is not supported.")
-    if paging_info is not None:
-      raise NotImplementedError("Paged attention not supported.")
-
-    # TODO: Support in-kernel dequantization.
-    q, k, v = map(quantization.as_array, (q, k, v))
-    out_dtype = q.dtype
-
-    def cast(x, precision):
-      msg = lambda dt: f"Only {dt} supported for {precision=}, got {x.dtype=}"
-      if precision == lax.DotAlgorithmPreset.DEFAULT:
-        if x.dtype not in (jnp.float16, jnp.bfloat16):
-          raise NotImplementedError(msg("f16 and bf16"))
-        return x
-      if x.dtype not in precision.supported_lhs_types:
-        raise NotImplementedError(msg(precision.supported_lhs_types))
-      if precision == lax.DotAlgorithmPreset.BF16_BF16_F32:
-        return x.astype(jnp.bfloat16)
-      if precision == lax.DotAlgorithmPreset.F16_F16_F32:
-        return x.astype(jnp.float16)
-      raise NotImplementedError(f"Unsupported {precision=}")
-
-    q_k_dot_precision, weights_v_dot_precision = precision
-    # TODO: Avoid silently downcasting types.
-    q = cast(q, q_k_dot_precision)
-    k = cast(k, q_k_dot_precision)
-    v = cast(v, weights_v_dot_precision)
-
-    mask, is_causal, k_start, k_end = _decompose_mask(
-        mask, q, k, q_indices, k_indices
-    )
-
-    use_stable_softmax = self.use_stable_softmax
-    if use_stable_softmax is base.AUTO:
-      use_stable_softmax = base.needs_stable_softmax(
-          logits_dtype, logits_soft_cap
-      )
-
-    return _fwd(
-        q,
-        k,
-        v,
-        bias=bias,
-        mask=mask,
-        k_start=k_start,
-        k_end=k_end,
-        is_causal=is_causal,
-        logits_soft_cap=logits_soft_cap,
-        logits_scale=logits_scale,
-        out_dtype=out_dtype,
-        normalize_output=normalize_output,
-        return_residuals=return_residuals,
-        use_base2=self.use_base2,
-        use_stable_softmax=use_stable_softmax,
-        config=config,
-    )
-
-  @override
-  def _get_heuristics_config(self, ba: op.BoundArguments):
-    q, k, v = ba.batched.args
-    seq_len_k, _, head_dim = k.shape[-3:]
-    head_dim_out = v.shape[-1]
-
-    mask = ba.batched.kwargs["mask"]
-    q_indices = ba.batched.kwargs["q_indices"]
-    k_indices = ba.batched.kwargs["k_indices"]
-    mask, *_ = jax.eval_shape(_decompose_mask, mask, q, k, q_indices, k_indices)
-    # 32-bit floats are downcast to 16-bit before the kernel call.
-    dtype_bits = jnp.finfo(jnp.bfloat16).bits
-
-    def shared_mem_usage_bytes(block_q, block_kv, num_stages):
-      bytes_per_stage = (
-          block_kv * head_dim * dtype_bits // 8
-          + block_kv * head_dim_out * dtype_bits // 8
-      )
-      if (bias := ba.kwargs["bias"]) is not None:
-        bytes_per_stage += (
-            2 * block_q * block_kv * jnp.finfo(bias.dtype).bits // 8
-        )
-      # FIXME: This is an overestimate for broadcast masks.
-      if mask is not None:
-        bytes_per_stage += 2 * block_q * block_kv
-      return (
-          2 * block_q * head_dim * dtype_bits // 8
-          + num_stages * bytes_per_stage
-          + 1000  # Add some extra for barriers.
-      )
-
-    if seq_len_k % 128 == 0 and shared_mem_usage_bytes(64, 128, 2) < 227 * 1024:
-      return Config(block_q=64, block_kv=128, num_stages=2)
-
-    # This is a pretty good option that works for most cases.
-    return Config(block_q=64, block_kv=64, num_stages=2)
-
-  @override
-  def supported_on(self, device: jax.Device) -> bool:
-    return gpu_utils.has_mosaic_gpu_support(device)
-
-  @override
-  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    q, k, _ = ba.args
-    block_qs = set([
-        min(x, pl.next_power_of_2(q.shape[-3] // 2))
-        for x in [64, 128, 256]
-        if q.shape[-3] % (x * 2) == 0  # 2 * block_q must divide seq_len_q.
-    ])
-    block_kvs = set([
-        min(x, pl.next_power_of_2(k.shape[-3]))
-        for x in [64, 128, 256]
-        if k.shape[-3] % x == 0  # block_kv must divide seq_len_kv.
-    ])
-    configs = set()
-    for block_q in block_qs:
-      for block_kv in block_kvs:
-        for num_stages in [2, 3, 4]:
-          configs.add(
-              Config(block_q=block_q, block_kv=block_kv, num_stages=num_stages)
-          )
-    return configs

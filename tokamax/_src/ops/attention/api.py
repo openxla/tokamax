@@ -53,7 +53,7 @@ except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.attention import pallas_mosaic_gpu_flash_attention as pl_mgpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_mosaic_gpu as pl_mgpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
   IMPLEMENTATIONS["mosaic"] = pl_mgpu.PallasMosaicGpuFlashAttention()
   _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
