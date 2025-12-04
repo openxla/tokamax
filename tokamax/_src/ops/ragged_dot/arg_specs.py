@@ -111,7 +111,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss',
+        name='gpt-oss-327680x2880',
         tags=('long',),
     ),
     arg_spec.ArgSpec(
@@ -130,7 +130,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss',
+        name='gpt-oss-393216x2048',
         tags=('long',),
     ),
     arg_spec.ArgSpec(
@@ -149,7 +149,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss',
+        name='gpt-oss-393216x768',
         tags=('long',),
     ),
 ) + tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())
