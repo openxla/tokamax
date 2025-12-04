@@ -90,31 +90,10 @@ def flash_attention_vjp_kernel(
   q_heads_per_kv_head = num_q_heads // num_kv_heads
 
   compute_wgs = config.compute_wgs
-  num_q_tiles, rem = divmod(q_seq_len, config.block_q_dq * compute_wgs)
-  if rem:
-    raise NotImplementedError(
-        f"{q_seq_len=} must be a multiple of {config.block_q_dq=} *"
-        f" {compute_wgs=}"
-    )
-
-  num_kv_tiles, rem = divmod(kv_seq_len, config.block_kv_dkv * compute_wgs)
-  if rem:
-    raise NotImplementedError(
-        f"{kv_seq_len=} must be a multiple of {config.block_kv_dkv=} *"
-        f" {compute_wgs=}"
-    )
-
-  num_q_tiles_in_dkv, rem = divmod(q_seq_len, config.block_q_dkv)
-  if rem:
-    raise NotImplementedError(
-        f"{q_seq_len=} must be a multiple of {config.block_q_dkv=}"
-    )
-
-  num_kv_tiles_in_dq, rem = divmod(kv_seq_len, config.block_kv_dq)
-  if rem:
-    raise NotImplementedError(
-        f"{kv_seq_len=} must be a multiple of {config.block_kv_dq=}"
-    )
+  num_q_tiles = pl.cdiv(q_seq_len, config.block_q_dq * compute_wgs)
+  num_kv_tiles = pl.cdiv(kv_seq_len, config.block_kv_dkv * compute_wgs)
+  num_q_tiles_in_dkv = pl.cdiv(q_seq_len, config.block_q_dkv)
+  num_kv_tiles_in_dq = pl.cdiv(kv_seq_len, config.block_kv_dq)
 
   if bias is not None:
     orig_bias_shape = bias.shape
@@ -203,6 +182,9 @@ def flash_attention_vjp_kernel(
     wg_idx = lax.axis_index("wg")
     kv_head = lax.div(q_head, jnp.array(q_heads_per_kv_head, q_head.dtype))
 
+    q_seq_base = q_idx * (compute_wgs * block_q) + wg_idx * block_q
+    qs = pl.ds(q_seq_base, block_q)
+
     q_smems, dout_smems, m_smems, l_smems, delta_smems = smem_buffers
     q_barriers, dout_barriers, m_barriers, l_barriers, delta_barriers = (
         buffer_barriers
@@ -222,8 +204,7 @@ def flash_attention_vjp_kernel(
       l_smem = l_smems.at[wg_idx]
       delta_smem = delta_smems.at[wg_idx]
 
-      q_seq_base = q_idx * (compute_wgs * block_q) + wg_idx * block_q
-      q_slice = (b_idx, pl.ds(q_seq_base, block_q), q_head)
+      q_slice = (b_idx, qs, q_head)
       res_slice = (b_idx, q_head, pl.ds(q_seq_base, block_q))
 
       plgpu.copy_gmem_to_smem(q_ref.at[q_slice], q_smem, q_barriers.at[wg_idx])
@@ -254,7 +235,6 @@ def flash_attention_vjp_kernel(
       def load_k_range(ref):
         if ref is None:
           return None
-        qs = pl.ds(q_seq_base, block_q)
         idx = (b_idx, 0 if (ref.shape[1] == 1) else q_head, qs)
         return plgpu.load(ref, idx, layout=_WGMMA_ROW, optimized=False)
 
@@ -284,11 +264,8 @@ def flash_attention_vjp_kernel(
     ):
       kv_step = index[0]
       kv_base = kv_step * block_kv
-      q_seq_base = q_idx * (compute_wgs * block_q) + wg_idx * block_q
       q_smem, dout_smem = q_smems.at[wg_idx], dout_smems.at[wg_idx]
       (dq_acc, m, l, delta, k_start, k_end) = carry
-
-      qs = pl.ds(q_seq_base, block_q)
       ks = pl.ds(kv_base, block_kv)
 
       def compute_s(acc_ref):
@@ -345,7 +322,8 @@ def flash_attention_vjp_kernel(
         s = jnp.where(mask, s, mask_value)
 
       broadcast = lambda x: lax.broadcast_in_dim(x, (block_q, block_kv), [0])
-      p = exp(s - broadcast(m)) / broadcast(l)
+      epsilon = jnp.finfo(jnp.float32).tiny  # Avoid division by zero.
+      p = exp(s - broadcast(m)) / broadcast(l + epsilon)
 
       def compute_dp(acc_ref):
         plgpu.wgmma(acc_ref, dout_smem, v_smem.T)
@@ -359,6 +337,12 @@ def flash_attention_vjp_kernel(
       ds = p * (dp - lax.broadcast_in_dim(delta, (block_q, block_kv), [0]))
       if logits_soft_cap is not None:
         ds *= 1 - jnp.pow(logits, 2)
+
+      # If we have an attention mask, it is possible that the entire row is
+      # masked out. In that case, the forwards pass will calculate `p`'s values
+      # as `1 / seq_len_k`. The corresponding `ds` values must be zeroed.
+      if mask is not None:
+        ds = jnp.where(mask, ds, 0.0)
 
       if ds_ref is not None:
         # TODO: Make this store non-blocking.
@@ -582,7 +566,8 @@ def flash_attention_vjp_kernel(
       if mask is not None:
         sT = jnp.where(mask, sT, mask_value)
 
-      pT = exp(sT - broadcast(m)) / broadcast(l)
+      epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
+      pT = exp(sT - broadcast(m)) / broadcast(l + epsilon)
 
       def _compute(refs):
         # Combining two WGMMA calls in one block to avoid the unnecessary
@@ -686,7 +671,11 @@ def flash_attention_vjp_kernel(
   if bias is None:
     ds_out_shape = None
   else:
-    ds_out_shape = (batch_size, num_q_heads, kv_seq_len, q_seq_len)
+    # NOTE: TMA stores to GMEM do not mask out-of-bounds writes, so we must pad
+    # the output to a multiple of the block size.
+    q_seq_len_ = num_q_tiles * compute_wgs * config.block_q_dq
+    kv_seq_len_ = num_kv_tiles_in_dq * config.block_kv_dq
+    ds_out_shape = (batch_size, num_q_heads, q_seq_len_, kv_seq_len_)
     if dbias_intermediate_dtype is None or (ds_out_shape == bias.shape):
       dbias_intermediate_dtype = bias.dtype
     ds_out_shape = jax.ShapeDtypeStruct(ds_out_shape, dbias_intermediate_dtype)
@@ -756,6 +745,7 @@ def flash_attention_vjp_kernel(
   if bias is None:
     dbias = None
   else:
+    ds = ds[..., :q_seq_len, :kv_seq_len]
     broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
     dbias = jnp.sum(ds, axis=broadcast_bias_axes)
     dbias = dbias.astype(bias.dtype).reshape(orig_bias_shape)
