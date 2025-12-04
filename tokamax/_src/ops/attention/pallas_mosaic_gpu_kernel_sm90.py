@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Flash attention with Mosaic GPU."""
+"""H100 Flash attention with Mosaic GPU."""
 
 import functools
 import math
