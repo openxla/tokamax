@@ -201,8 +201,8 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     def maybe_quantize(x, tile_shape):
       if isinstance(x, QArray) or self.qdtype is None:
         return x
-      x = quantization.quantize_as(self.qdtype, tile_shape=tile_shape)(x)
-      return quantization.as_qarray(x)
+      tiled_axes = {i: d for i, d in enumerate(tile_shape)}
+      return qwix.quantize(x, self.qdtype, tiled_axes=tiled_axes)
 
     if isinstance(group_sizes, base.GroupSizes):
       group_sizes = jnp.array(group_sizes)

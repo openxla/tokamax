@@ -22,11 +22,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import qwix
-from tokamax._src import quantization
 
 
 PyTree: TypeAlias = Any
-QuantizedArray = quantization.QuantizedArray
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -202,24 +200,7 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
         return x
       else:
         raise ValueError(
-            '`QuantizedArray` values and scales must both be abstract or both'
-            ' concrete.'
-        )
-    elif isinstance(x, QuantizedArray):
-      abstract_values = isinstance(x.values, jax.ShapeDtypeStruct)
-      abstract_scales = isinstance(x.scales, jax.ShapeDtypeStruct)
-
-      if abstract_values and abstract_scales:
-        dtype = jnp.promote_types(x.dtype, jnp.float32)
-        values = rng.standard_normal(size=x.shape, dtype=dtype).astype(x.dtype)
-        qdtype = x.values.dtype
-        return quantization.quantize_as(qdtype, tile_shape=x.tile_shape)(values)
-      elif not abstract_values and not abstract_scales:
-        return x
-      else:
-        raise ValueError(
-            '`QuantizedArray` values and scales must both be abstract or both'
-            ' concrete.'
+            '`QArray` values and scales must both be abstract or both concrete.'
         )
     if not isinstance(x, jax.ShapeDtypeStruct):
       return x
@@ -240,6 +221,5 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     # TODO: Can we consolidate `device_put` into a single call?
     return jax.device_put(y, None if sharding is None else x.format)
 
-  leaf_types = (ArrayInitializer, QuantizedArray, qwix.QArray)
-  is_leaf = lambda x: isinstance(x, leaf_types)
+  is_leaf = lambda x: isinstance(x, (ArrayInitializer, qwix.QArray))
   return jax.tree.map(init_with_layout, x, is_leaf=is_leaf)

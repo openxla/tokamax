@@ -22,7 +22,6 @@ import numpy as np
 import qwix
 from tokamax._src import batching
 from tokamax._src import numerics
-from tokamax._src import quantization
 
 
 if jax.__version_info__ >= (0, 6, 3):
@@ -151,26 +150,6 @@ class NumericsTest(parameterized.TestCase):
     self.assertEqual(q.qvalue.dtype, qtype)
     self.assertEqual(q.scale.dtype, scale.dtype)
     q_rms = jnp.sqrt(jnp.mean(qwix.dequantize(q) ** 2))
-    self.assertGreater(q_rms, 0.8)
-    self.assertLess(q_rms, 1.2)
-
-  @parameterized.product(
-      qdtype=(jnp.int8,),  # `int4` triggers an XLA:CPU bug.
-      scales=(
-          jax.ShapeDtypeStruct((1, 128), jnp.bfloat16),
-          jax.ShapeDtypeStruct((128, 1), jnp.bfloat16),
-          jax.ShapeDtypeStruct((32, 32), jnp.float32),
-      ),
-  )
-  def test_random_initialize_quantized_array(self, qdtype, scales):
-    values = jax.ShapeDtypeStruct((256, 256), qdtype)
-    q = quantization.QuantizedArray(values, scales)  # pytype: disable=wrong-arg-types
-    q = numerics.random_initialize(q)
-    self.assertEqual(q.values.shape, values.shape)
-    self.assertEqual(q.scales.shape, scales.shape)
-    self.assertEqual(q.values.dtype, qdtype)
-    self.assertEqual(q.scales.dtype, scales.dtype)
-    q_rms = jnp.sqrt(jnp.mean(q.recompose() ** 2))
     self.assertGreater(q_rms, 0.8)
     self.assertLess(q_rms, 1.2)
 

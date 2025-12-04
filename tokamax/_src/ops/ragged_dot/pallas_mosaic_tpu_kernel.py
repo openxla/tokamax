@@ -31,7 +31,7 @@ from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 
 CanonicalPrecision = precision_lib.CanonicalPrecision
-QArray = quantization.QArray
+QArray = qwix.QArray
 
 
 def _validate_args(
