@@ -84,14 +84,8 @@ def flash_attention_kernel(
   if mask is not None:
     mask = mask.astype(jnp.int8)
 
-  def bcast_k_range(x):
-    if x is None:
-      return None
-    x = jax.lax.broadcast_to_rank(x, 2)
-    # TODO: Avoid broadcast in q-sequence dim.
-    return jnp.broadcast_to(x, (*x.shape[:-1], q_seq_len))
-
-  k_start, k_end = map(bcast_k_range, (k_start, k_end))
+  as_2d = lambda x: None if x is None else jax.lax.broadcast_to_rank(x, 2)
+  k_start, k_end = map(as_2d, (k_start, k_end))
 
   def kernel(
       q_gmem,
@@ -136,8 +130,7 @@ def flash_attention_kernel(
         q_max = (qi + 1) * (2 * block_q)
         ub = lax.min(ub, pl.cdiv(q_max, block_kv))
 
-      def load_k_minmax(x):
-        return x[0 if x.shape[0] == 1 else hi, qi]
+      load_k_minmax = lambda x: _load_bcast(x, (hi, qi), layout=None)
 
       if k_start_minmax_gmems is None:
         k_start_max = None
@@ -231,18 +224,22 @@ def flash_attention_kernel(
         if mask is not None:
           s = jnp.where(mask, s, mask_value)
 
-        def apply_k_start():
-          k_start_ = lax.broadcast_in_dim(k_start, s.shape, [0])
-          return jnp.where(k_base + iota(1) >= k_start_, s, mask_value)
-
         if k_start is not None:
+
+          def apply_k_start(k_start=k_start):
+            if k_start.ndim > 0:
+              k_start = lax.broadcast_in_dim(k_start, s.shape, [0])
+            return jnp.where(k_base + iota(1) >= k_start, s, mask_value)
+
           s = lax.cond(k_base < k_start_max, apply_k_start, lambda: s)
 
-        def apply_k_end():
-          k_end_ = lax.broadcast_in_dim(k_end, s.shape, [0])
-          return jnp.where(k_base + iota(1) < k_end_, s, mask_value)
-
         if k_end is not None:
+
+          def apply_k_end(k_end=k_end):
+            if k_end.ndim > 0:
+              k_end = lax.broadcast_in_dim(k_end, s.shape, [0])
+            return jnp.where(k_base + iota(1) < k_end, s, mask_value)
+
           s = lax.cond(k_base + block_kv > k_end_min, apply_k_end, lambda: s)
 
         if mask_gmem is not None:
@@ -426,12 +423,16 @@ def flash_attention_kernel(
   # warpgroups share the same k/v blocks).
   if k_start is None:
     k_start_minmax = None
+  elif k_start.shape[-1] == 1:
+    k_start_minmax = (k_start, k_start)
   else:
     k_start_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_start)
     k_start_minmax = (jnp.min(k_start_, -1), jnp.max(k_start_, -1))
 
   if k_end is None:
     k_end_minmax = None
+  elif k_end.shape[-1] == 1:
+    k_end_minmax = (k_end, k_end)
   else:
     k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end)
     k_end_minmax = (jnp.min(k_end_, -1), jnp.max(k_end_, -1))

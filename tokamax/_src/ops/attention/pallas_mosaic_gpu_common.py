@@ -36,7 +36,7 @@ def load_bcast(
     *,
     layout: Any,
     optimized: bool = False,
-):
+) -> jax.Array:
   """Loads from a reference, with given index, broadcasting if needed."""
   new_idx = []
   shape = []
@@ -52,5 +52,7 @@ def load_bcast(
         bcast_dims.append(len(shape))
       shape.append(ix.size)
 
+  if not bcast_dims:
+    return ref[tuple(new_idx)]  # Return a scalar value.
   value = plgpu.load(ref, tuple(new_idx), layout=layout, optimized=optimized)
   return jax.lax.broadcast_in_dim(value, shape, bcast_dims)
