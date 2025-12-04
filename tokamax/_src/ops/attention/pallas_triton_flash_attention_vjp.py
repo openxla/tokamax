@@ -88,7 +88,7 @@ def _bwd_dkdv(
     q = q_ref.at[span_m].load()
     # Load m before computing qk to reduce pipeline stall.
     m = m_ref.at[span_m].load()
-    l = l_ref.at[span_m].load()
+    l = l_ref.at[span_m].load(other=float(jnp.finfo(jnp.float32).tiny))
     sT = pl.dot(k, q.T, precision=q_k_dot_precision).astype(logits_dtype)
 
     if bias_ref is not None:
