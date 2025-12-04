@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Common utilities for Mosaic GPU attention implementations."""
 
-"""Common Flash Attention Mosaic GPU utilities."""
+from typing import Any
 
+import jax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
 import pydantic
 
 
@@ -24,3 +28,29 @@ class Config:
   block_q: pydantic.conint(multiple_of=64, gt=0) = 64
   block_kv: pydantic.conint(multiple_of=64, gt=0) = 64
   num_stages: pydantic.conint(gt=1) = 2
+
+
+def load_bcast(
+    ref: Any,
+    idx: tuple[int | jax.Array | pl.Slice, ...],
+    *,
+    layout: Any,
+    optimized: bool = False,
+):
+  """Loads from a reference, with given index, broadcasting if needed."""
+  new_idx = []
+  shape = []
+  bcast_dims = []
+  # NOTE: We could add support for `idx` shorter than `ref.ndim`.
+  for d, ix in zip(ref.shape, idx, strict=True):
+    new_idx.append(0 if d == 1 else ix)
+
+    if isinstance(ix, pl.Slice):
+      if d == 1:
+        layout = layout.reduce(len(shape))
+      else:
+        bcast_dims.append(len(shape))
+      shape.append(ix.size)
+
+  value = plgpu.load(ref, tuple(new_idx), layout=layout, optimized=optimized)
+  return jax.lax.broadcast_in_dim(value, shape, bcast_dims)

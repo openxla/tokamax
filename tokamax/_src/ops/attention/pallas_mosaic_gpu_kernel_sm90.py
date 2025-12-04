@@ -26,7 +26,7 @@ from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-impo
 from tokamax._src import jaxtyping
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops.attention import base
-import tokamax._src.ops.attention.pallas_mosaic_gpu_common as common
+from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.pallas import block
 
 
@@ -38,6 +38,7 @@ Residuals = base.Residuals
 _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
+_load_bcast = common.load_bcast
 
 
 @jaxtyping.jaxtyped
@@ -177,16 +178,9 @@ def flash_attention_kernel(
       acc = jnp.zeros((block_q, head_dim_out), jnp.float32)
       acc = plgpu.layout_cast(acc, _WGMMA)
 
-      def load_k_range(ref):
-        if ref is None:
-          return None
-        bi_ = 0 if ref.shape[0] == 1 else bi
-        hi_ = 0 if ref.shape[1] == 1 else hi
-        idx = (bi_, hi_, qs)
-        return plgpu.load(ref, idx, layout=_WGMMA_ROW, optimized=False)
-
-      k_start = load_k_range(k_start_gmem)
-      k_end = load_k_range(k_end_gmem)
+      load_k_range = lambda r: _load_bcast(r, (bi, hi, qs), layout=_WGMMA_ROW)
+      k_start = None if k_start_gmem is None else load_k_range(k_start_gmem)
+      k_end = None if k_end_gmem is None else load_k_range(k_end_gmem)
       lb, ub, k_start_max, k_end_min = get_kv_ranges()
 
       plgpu.barrier_wait(q_barrier)
@@ -201,31 +195,20 @@ def flash_attention_kernel(
         acc, m_i, l_i = carry
         si = lax.rem(ki, max_stages)
         k_base = ki * block_kv
+        ks = pl.ds(k_base, block_kv)
 
         def iota(d):
           return plgpu.broadcasted_iota(jnp.int32, block_q_kv, d, layout=_WGMMA)
 
-        def load_bias_mask(gmem, smems, barriers):
-          if gmem is None:
-            return None
-          bi_ = 0 if gmem.shape[0] == 1 else bi
-          hi_ = 0 if gmem.shape[1] == 1 else hi
-          if gmem.shape[-2] == 1:
-            if gmem.shape[-1] == 1:
-              raise NotImplementedError("Broadcast on both sequences.")
-            idx = (bi_, hi_, 0, pl.ds(k_base, block_kv))
-            x = plgpu.load(gmem, idx, layout=_WGMMA_COL, optimized=False)
-            return lax.broadcast_in_dim(x, block_q_kv, [1])
-          if gmem.shape[-1] == 1:
-            idx = (bi_, hi_, qs, 0)
-            x = plgpu.load(gmem, idx, layout=_WGMMA_ROW, optimized=False)
-            return lax.broadcast_in_dim(x, block_q_kv, [0])
-          plgpu.barrier_wait(barriers.at[si])
-          return smems[si, block.ds(wg, block_q)]
-
         def compute_qk(acc_ref):
           plgpu.wgmma(acc_ref, q_smem, k_smems.at[si].T)
-          bias = load_bias_mask(bias_gmem, bias_smems, bias_barriers)
+          if bias_gmem is None:
+            bias = None
+          elif bias_smems is None:
+            bias = _load_bcast(bias_gmem, (bi, hi, qs, ks), layout=_WGMMA)
+          else:
+            plgpu.barrier_wait(bias_barriers.at[si])
+            bias = bias_smems[si, block.ds(wg, block_q)]
           plgpu.barrier_arrive(schedule_barrier)
           mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
           return acc_ref[...], bias, mask
@@ -269,9 +252,12 @@ def flash_attention_kernel(
         if k_end is not None:
           s = lax.cond(k_base + block_kv > k_end_min, apply_k_end, lambda: s)
 
-        mask = load_bias_mask(mask_gmem, mask_smems, mask_barriers)
-        if mask is not None:
-          if mask_consumed_barriers is not None:
+        if mask_gmem is not None:
+          if mask_smems is None:
+            mask = _load_bcast(mask_gmem, (bi, hi, qs, ks), layout=_WGMMA)
+          else:
+            plgpu.barrier_wait(mask_barriers.at[si])
+            mask = mask_smems[si, block.ds(wg, block_q)]
             plgpu.barrier_arrive(mask_consumed_barriers.at[si])
           s = jnp.where(mask, s, mask_value)
 
