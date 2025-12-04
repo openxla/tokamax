@@ -79,8 +79,8 @@ def flash_attention_kernel(
   head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
 
-  max_stages = min(config.num_stages, kv_seq_len // config.block_kv)
   block_q_kv = block_q, block_kv = config.block_q, config.block_kv
+  max_stages = min(config.num_stages, pl.cdiv(kv_seq_len, block_kv))
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
 
   if bias is not None:
@@ -136,7 +136,7 @@ def flash_attention_kernel(
 
     def get_kv_ranges():
       lb = 0
-      ub = kv_seq_len // block_kv
+      ub = pl.cdiv(kv_seq_len, block_kv)
 
       if is_causal:
         q_max = (qi + 1) * (2 * block_q)
@@ -310,9 +310,6 @@ def flash_attention_kernel(
         acc = pl.run_state(compute_pv)(plgpu.ACC.init(acc))
         plgpu.barrier_arrive(v_consumed_barriers.at[si])
         return acc, m_i, l_i
-
-      if kv_seq_len % block_kv:
-        raise ValueError(f"{kv_seq_len=} must be a multiple of {block_kv=}")
 
       if is_causal:
         causal_loop_body = functools.partial(loop_body, do_causal=True)

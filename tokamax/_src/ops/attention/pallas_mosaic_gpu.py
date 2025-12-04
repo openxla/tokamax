@@ -188,7 +188,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments):
     q, k, v = ba.batched.args
-    seq_len_k, _, head_dim = k.shape[-3:]
+    head_dim = k.shape[-1]
     head_dim_out = v.shape[-1]
 
     mask = ba.batched.kwargs["mask"]
@@ -216,7 +216,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
           + 1000  # Add some extra for barriers.
       )
 
-    if seq_len_k % 128 == 0 and shared_mem_usage_bytes(64, 128, 2) < 227 * 1024:
+    if shared_mem_usage_bytes(64, 128, 2) < 227 * 1024:
       return Config(block_q=64, block_kv=128, num_stages=2)
 
     # This is a pretty good option that works for most cases.
