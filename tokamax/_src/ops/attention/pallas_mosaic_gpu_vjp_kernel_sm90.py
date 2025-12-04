@@ -29,7 +29,7 @@ from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-impo
 from tokamax._src import jaxtyping
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops.attention import base
-from tokamax._src.ops.attention import pallas_mosaic_vjp_common as vjp_common
+from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_common as vjp_common
 
 Config = vjp_common.Config
 Residuals = base.Residuals
