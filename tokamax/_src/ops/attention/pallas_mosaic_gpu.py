@@ -15,6 +15,7 @@
 """Flash Attention Pallas-Mosaic-GPU implementation."""
 
 import dataclasses
+import functools
 from typing import Any, ClassVar, TypeAlias
 
 import immutabledict
@@ -24,6 +25,7 @@ from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
+from tokamax._src import batching
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
 from tokamax._src import quantization
@@ -40,6 +42,10 @@ Mask = base.Mask
 PagingInfo = base.PagingInfo
 QArray = base.QArray
 Residuals = base.Residuals
+
+
+def _broadcast_to_rank(x, rank):
+  return None if x is None else jax.lax.broadcast_to_rank(x, rank)
 
 
 def _decompose_mask(mask, q, k, q_indices, k_indices):
@@ -166,14 +172,8 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
           logits_dtype, logits_soft_cap
       )
 
-    return sm90.flash_attention_kernel(
-        q,
-        k,
-        v,
-        bias=bias,
-        mask=mask,
-        k_start=k_start,
-        k_end=k_end,
+    f = functools.partial(
+        sm90.flash_attention_kernel,
         is_causal=is_causal,
         logits_soft_cap=logits_soft_cap,
         logits_scale=logits_scale,
@@ -184,6 +184,16 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         use_stable_softmax=use_stable_softmax,
         config=config,
     )
+
+    bias = _broadcast_to_rank(bias, q.ndim)
+    mask = _broadcast_to_rank(mask, q.ndim)
+    k_start = _broadcast_to_rank(k_start, q.ndim - 1)
+    k_end = _broadcast_to_rank(k_end, q.ndim - 1)
+
+    for _ in q.shape[:-3]:  # Strip of the batch dimensions.
+      f = batching.vmap_maybe_bcast(f, 0)
+
+    return f(q, k, v, bias, mask, k_start, k_end)
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments):

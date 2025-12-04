@@ -43,14 +43,14 @@ _load_bcast = common.load_bcast
 
 @jaxtyping.jaxtyped
 def flash_attention_kernel(
-    q: Float[Array, "*B T H D"],
-    k: Float[Array, "*B t h D"],
-    v: Float[Array, "*B t h d"],
+    q: Float[Array, "T H D"],
+    k: Float[Array, "t h D"],
+    v: Float[Array, "t h d"],
+    bias: Float[Array, "#H #T #t"] | None,
+    mask: Bool[Array, "#H #T #t"] | None,
+    k_start: Int[Array, "#H #T"] | None,
+    k_end: Int[Array, "#H #T"] | None,
     *,
-    bias: Float[Array, "*#B #H #T #t"] | None,
-    mask: Bool[Array, "*#B #H #T #t"] | None,
-    k_start: Int[Array, "*#B #H #T"] | None,
-    k_end: Int[Array, "*#B #H #T"] | None,
     is_causal: bool,
     logits_soft_cap: float | None,
     logits_scale: float,
@@ -60,15 +60,12 @@ def flash_attention_kernel(
     use_base2: bool,
     use_stable_softmax: bool,
     config: Config,
-) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
+) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Flash attention with Mosaic GPU."""
 
   orig_q_shape = q.shape
-  as_4d = lambda x: jax.lax.collapse(jax.lax.broadcast_to_rank(x, 4), 0, -3)
-  q, k, v = map(as_4d, (q, k, v))
-
-  batch_size, q_seq_len, num_q_heads, _ = q.shape
-  _, kv_seq_len, num_kv_heads, head_dim_out = v.shape
+  q_seq_len, num_q_heads, _ = q.shape
+  kv_seq_len, num_kv_heads, head_dim_out = v.shape
   orig_head_dim_out = head_dim_out
 
   if num_q_heads % num_kv_heads:
@@ -84,16 +81,13 @@ def flash_attention_kernel(
   max_stages = min(config.num_stages, pl.cdiv(kv_seq_len, block_kv))
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
 
-  if bias is not None:
-    bias = as_4d(bias)
-
   if mask is not None:
-    mask = as_4d(mask).astype(jnp.int8)
+    mask = mask.astype(jnp.int8)
 
   def bcast_k_range(x):
     if x is None:
       return None
-    x = jax.lax.collapse(jax.lax.broadcast_to_rank(x, 3), 0, -2)
+    x = jax.lax.broadcast_to_rank(x, 2)
     # TODO: Avoid broadcast in q-sequence dim.
     return jnp.broadcast_to(x, (*x.shape[:-1], q_seq_len))
 
@@ -113,7 +107,6 @@ def flash_attention_kernel(
       *residual_gmems,
       scoped,
   ):
-    bi = lax.axis_index("batch")
     qi = lax.axis_index("q_tiles")
     hi = lax.axis_index("heads")
     wg = lax.axis_index("wg")
@@ -144,7 +137,7 @@ def flash_attention_kernel(
         ub = lax.min(ub, pl.cdiv(q_max, block_kv))
 
       def load_k_minmax(x):
-        return x[0 if x.shape[0] == 1 else bi, 0 if x.shape[1] == 1 else hi, qi]
+        return x[0 if x.shape[0] == 1 else hi, qi]
 
       if k_start_minmax_gmems is None:
         k_start_max = None
@@ -168,7 +161,7 @@ def flash_attention_kernel(
       plgpu.set_max_registers(232, action="increase")
       q_smem = q_smems.at[wg]
       q_barrier = q_barriers.at[wg]
-      plgpu.copy_gmem_to_smem(q_gmem.at[bi, qs, hi], q_smem, q_barrier)
+      plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_barrier)
 
       l_i = plgpu.layout_cast(jnp.zeros((block_q,), jnp.float32), _WGMMA_ROW)
       if use_stable_softmax:
@@ -178,7 +171,7 @@ def flash_attention_kernel(
       acc = jnp.zeros((block_q, head_dim_out), jnp.float32)
       acc = plgpu.layout_cast(acc, _WGMMA)
 
-      load_k_range = lambda r: _load_bcast(r, (bi, hi, qs), layout=_WGMMA_ROW)
+      load_k_range = lambda r: _load_bcast(r, (hi, qs), layout=_WGMMA_ROW)
       k_start = None if k_start_gmem is None else load_k_range(k_start_gmem)
       k_end = None if k_end_gmem is None else load_k_range(k_end_gmem)
       lb, ub, k_start_max, k_end_min = get_kv_ranges()
@@ -205,7 +198,7 @@ def flash_attention_kernel(
           if bias_gmem is None:
             bias = None
           elif bias_smems is None:
-            bias = _load_bcast(bias_gmem, (bi, hi, qs, ks), layout=_WGMMA)
+            bias = _load_bcast(bias_gmem, (hi, qs, ks), layout=_WGMMA)
           else:
             plgpu.barrier_wait(bias_barriers.at[si])
             bias = bias_smems[si, block.ds(wg, block_q)]
@@ -254,7 +247,7 @@ def flash_attention_kernel(
 
         if mask_gmem is not None:
           if mask_smems is None:
-            mask = _load_bcast(mask_gmem, (bi, hi, qs, ks), layout=_WGMMA)
+            mask = _load_bcast(mask_gmem, (hi, qs, ks), layout=_WGMMA)
           else:
             plgpu.barrier_wait(mask_barriers.at[si])
             mask = mask_smems[si, block.ds(wg, block_q)]
@@ -319,8 +312,8 @@ def flash_attention_kernel(
         l_smem[...] = l_i
         plgpu.commit_smem()
         m_gmem, l_gmem = residual_gmems
-        plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[bi, hi, qs])
-        plgpu.copy_smem_to_gmem(l_smem, l_gmem.at[bi, hi, qs])
+        plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[hi, qs])
+        plgpu.copy_smem_to_gmem(l_smem, l_gmem.at[hi, qs])
 
       l_i += float(jnp.finfo(jnp.float32).tiny)
 
@@ -331,7 +324,7 @@ def flash_attention_kernel(
       o_smem = o_smems.at[wg]
       o_smem[...] = acc.astype(o_smem.dtype)
       plgpu.commit_smem()
-      plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[bi, qs, hi])
+      plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     @pl.when(wg == 2)
@@ -343,16 +336,12 @@ def flash_attention_kernel(
       if bias_smems is None:
         bias_gmem_ = None
       else:
-        bias_bi = 0 if bias_gmem.shape[0] == 1 else bi
-        bias_hi = 0 if bias_gmem.shape[1] == 1 else hi
-        bias_gmem_ = bias_gmem.at[bias_bi, bias_hi, qs]
+        bias_gmem_ = bias_gmem.at[0 if bias_gmem.shape[0] == 1 else hi, qs]
 
       if mask_smems is None:
         mask_gmem_ = None
       else:
-        mask_bi = 0 if mask_gmem.shape[0] == 1 else bi
-        mask_hi = 0 if mask_gmem.shape[1] == 1 else hi
-        mask_gmem_ = mask_gmem.at[mask_bi, mask_hi, qs]
+        mask_gmem_ = mask_gmem.at[0 if mask_gmem.shape[0] == 1 else hi, qs]
 
       def cp(gmem, smems, barriers, si):
         plgpu.copy_gmem_to_smem(gmem, smems.at[si], barriers.at[si])
@@ -366,26 +355,26 @@ def flash_attention_kernel(
           ki = lb + i
           ks = block.ds(ki, block_kv)
           si = lax.rem(ki, max_stages)
-          cp(k_gmem.at[bi, ks, hi_kv], k_smems, k_barriers, si)
+          cp(k_gmem.at[ks, hi_kv], k_smems, k_barriers, si)
           if bias_gmem_ is not None:
             cp(bias_gmem_.at[:, ks], bias_smems, bias_barriers, si)
           if mask_gmem_ is not None:
             cp(mask_gmem_.at[:, ks], mask_smems, mask_barriers, si)
-          cp(v_gmem.at[bi, ks, hi_kv], v_smems, v_barriers, si)
+          cp(v_gmem.at[ks, hi_kv], v_smems, v_barriers, si)
 
       @pl.loop(lb, ub - max_stages)
       def _kv_loop(ki):
         si = lax.rem(ki, max_stages)
         ks = block.ds(ki + max_stages, block_kv)
         plgpu.barrier_wait(k_consumed_barriers.at[si])
-        cp(k_gmem.at[bi, ks, hi_kv], k_smems, k_barriers, si)
+        cp(k_gmem.at[ks, hi_kv], k_smems, k_barriers, si)
         if bias_gmem_ is not None:
           cp(bias_gmem_.at[:, ks], bias_smems, bias_barriers, si)
         if mask_gmem_ is not None:
           plgpu.barrier_wait(mask_consumed_barriers.at[si])
           cp(mask_gmem_.at[:, ks], mask_smems, mask_barriers, si)
         plgpu.barrier_wait(v_consumed_barriers.at[si])
-        cp(v_gmem.at[bi, ks, hi_kv], v_smems, v_barriers, si)
+        cp(v_gmem.at[ks, hi_kv], v_smems, v_barriers, si)
 
   def entry(*refs):
     compute_wgs = 2
@@ -449,14 +438,14 @@ def flash_attention_kernel(
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:
-    residuals_shape = (batch_size, num_q_heads, q_seq_len)
+    residuals_shape = (num_q_heads, q_seq_len)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
 
   out, *residuals = plgpu.kernel(
       entry,
       out_shape=out_shape,
-      grid=(batch_size, num_q_heads, num_q_tiles),
-      grid_names=("batch", "heads", "q_tiles"),
+      grid=(num_q_heads, num_q_tiles),
+      grid_names=("heads", "q_tiles"),
       num_threads=3,
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(approx_math=True),
