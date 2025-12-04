@@ -24,7 +24,6 @@ import jax.experimental.pallas as pl
 from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
-import pydantic
 from tokamax._src import batching
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
