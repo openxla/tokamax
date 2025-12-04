@@ -28,8 +28,8 @@ from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
+from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_common as vjp_common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm90 as sm90
-from tokamax._src.ops.attention import pallas_mosaic_vjp_common as vjp_common
 from typing_extensions import override
 
 Config = vjp_common.Config
