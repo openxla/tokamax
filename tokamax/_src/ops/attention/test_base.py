@@ -289,11 +289,17 @@ class AttentionTestBase(parameterized.TestCase):
     atol = {jnp.float32: 1e-6, jnp.bfloat16: 1e-2, jnp.float16: 5e-4}[dtype]
     self._run_test((2, 1024, 4, 64), dtype=dtype, atol=atol)
 
-  def test_cross_attention(self):
+  @parameterized.parameters(False, True)
+  def test_cross_attention(self, has_bias):
     self._run_test(
         q_shape=(2, 1024, 4, 64),
         kv_shape=(2, 1536, 4, 64),
-        expect_supported=self._supports_cross_attention,
+        bias_shape=(2, 4, 1024, 1536) if has_bias else None,
+        expect_supported=(
+            self._supports_cross_attention
+            and (self._supports_bias or not has_bias)
+        ),
+        atol=3e-6 if has_bias else 1e-6,
     )
 
   _PRODUCT_PARAMS = list(itertools.product((24, 128), (64, 112)))
