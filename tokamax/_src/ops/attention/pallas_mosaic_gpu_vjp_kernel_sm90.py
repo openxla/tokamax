@@ -110,9 +110,8 @@ def flash_attention_vjp_kernel(
       plgpu.SwizzleTransform(swizzle),
   )
   delta = jnp.einsum(
-      "bqhd,bqhd->bhq", out.astype(jnp.float32), dout.astype(jnp.float32)
+      "bqhd,bqhd->bhq", out, dout, preferred_element_type=jnp.float32
   )
-
   exp = jnp.exp2 if use_base2 else jnp.exp
 
   def bias_mask_info(x_ref, b_idx, q_head, name):
