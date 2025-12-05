@@ -96,7 +96,6 @@ class TritonKernelInfo(KernelInfoBase):
   num_warps: int
   grid: tuple[int, int, int]
   num_stages: int | None
-  cluster_dim: tuple[int, int, int]
   compute_capability: int | None
   metadata: bytes
 
@@ -153,7 +152,6 @@ def _get_pallas_kernel_info(
       grid=tuple(config[f'grid_{dim}'].value for dim in ('x', 'y', 'z')),
       hlo_module_name=module_name,
       compute_capability=None,
-      cluster_dim=(1, 1, 1),
       metadata=b'',
   )
 
