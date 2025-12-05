@@ -118,7 +118,10 @@ def flash_attention_kernel(
         schedule_barrier,
     ) = scoped
 
-    def perform_schedule_barrier():
+    at_wg = lambda x: x.at[wg]
+    q_smem, q_barrier, o_smem = map(at_wg, (q_smems, q_barriers, o_smems))
+
+    def schedule_barrier_arrive_and_wait():
       plgpu.barrier_arrive(schedule_barrier)
       plgpu.barrier_wait(schedule_barrier)
 
@@ -152,17 +155,12 @@ def flash_attention_kernel(
       qs = pl.ds(q_base, block_q)
 
       plgpu.set_max_registers(232, action="increase")
-      q_smem = q_smems.at[wg]
-      q_barrier = q_barriers.at[wg]
       plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_barrier)
 
+      m_init_value = -jnp.inf if use_stable_softmax else 0.0
       l_i = plgpu.layout_cast(jnp.zeros((block_q,), jnp.float32), _WGMMA_ROW)
-      if use_stable_softmax:
-        m_i = plgpu.layout_cast(jnp.full_like(l_i, -jnp.inf), _WGMMA_ROW)
-      else:
-        m_i = plgpu.layout_cast(jnp.full_like(l_i, 0.0), _WGMMA_ROW)
-      acc = jnp.zeros((block_q, head_dim_out), jnp.float32)
-      acc = plgpu.layout_cast(acc, _WGMMA)
+      m_i = plgpu.layout_cast(jnp.full_like(l_i, m_init_value), _WGMMA_ROW)
+      acc = plgpu.layout_cast(jnp.zeros_like(o_smem, jnp.float32), _WGMMA)
 
       load_k_range = lambda r: _load_bcast(r, (hi, qs), layout=_WGMMA_ROW)
       k_start = None if k_start_gmem is None else load_k_range(k_start_gmem)
@@ -175,7 +173,7 @@ def flash_attention_kernel(
       def _():
         plgpu.barrier_wait(k_barriers.at[lax.rem(lb, max_stages)])
 
-      pl.when(wg == 1)(perform_schedule_barrier)
+      pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
 
       def loop_body(ki, carry, *, do_causal=False):
         acc, m_i, l_i = carry
@@ -301,10 +299,10 @@ def flash_attention_kernel(
       else:
         acc, m_i, l_i = lax.fori_loop(lb, ub, loop_body, (acc, m_i, l_i))
 
-      pl.when(wg == 0)(perform_schedule_barrier)
+      pl.when(wg == 0)(schedule_barrier_arrive_and_wait)
 
       if return_residuals:
-        m_smem, l_smem = (smems.at[wg] for smems in residual_smems)
+        m_smem, l_smem = map(at_wg, residual_smems)
         m_smem[...] = (m_i * (1 / math.log2(math.e))) if use_base2 else m_i
         l_smem[...] = l_i
         plgpu.commit_smem()
@@ -318,7 +316,6 @@ def flash_attention_kernel(
         # TODO: Use `reciprocal`?
         acc *= lax.broadcast_in_dim(1 / l_i, acc.shape, [0])
 
-      o_smem = o_smems.at[wg]
       o_smem[...] = acc.astype(o_smem.dtype)
       plgpu.commit_smem()
       plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
