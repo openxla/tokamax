@@ -19,6 +19,7 @@ from typing import Any
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+import jax.numpy as jnp
 import pydantic
 
 
@@ -56,3 +57,8 @@ def load_bcast(
     return ref[tuple(new_idx)]  # Return a scalar value.
   value = plgpu.load(ref, tuple(new_idx), layout=layout, optimized=optimized)
   return jax.lax.broadcast_in_dim(value, shape, bcast_dims)
+
+
+def num_bits(dtype: jax.typing.DTypeLike) -> int:
+  fn = jnp.finfo if jnp.issubdtype(dtype, jnp.floating) else jnp.iinfo
+  return fn(dtype).bits
