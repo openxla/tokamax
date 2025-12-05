@@ -338,6 +338,13 @@ class AttentionTestBase(parameterized.TestCase):
   def test_multiple_batch_dims(self):
     self._run_test((2, 3, 4, 1024, 4, 64))
 
+  def test_non_power_of_two_q_seq_len(self):
+    self._run_test(
+        (2, 112, 4, 64),
+        kv_shape=(2, 1024, 4, 64),
+        expect_supported=self._supports_cross_attention,
+    )
+
   def test_non_power_of_two_head_dim(self):
     self._run_test((2, 1024, 4, 48))
 

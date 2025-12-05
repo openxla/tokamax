@@ -298,6 +298,9 @@ def _attend_paged(
       out = acc / denom.mT[..., None] if normalize_output else acc
       return -1, out.astype(q.dtype)
 
+    if seq_q % chunk_size != 0:
+      raise NotImplementedError(f"{seq_q=} must be a multiple of {chunk_size}.")
+
     q_batch = q_batch.reshape(seq_q // chunk_size, chunk_size, h, -1)
     _, out = jax.lax.scan(sq_loop_fn, init=0, xs=q_batch)
     return bidx + 1, out.reshape(seq_q, *out.shape[2:])

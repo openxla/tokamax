@@ -229,6 +229,9 @@ class XlaPagedAttentionTest(test_base.AttentionTestBase):
         lengths,
     )
 
+    if q.shape[-3] % 128 != 0:
+      kwargs["expect_supported"] = False
+
     super()._run_test_with_inputs(
         q,
         k_pages,
