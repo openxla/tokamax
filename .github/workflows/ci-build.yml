@@ -34,7 +34,7 @@ jobs:
                          'base_test.py',
                          'api_test.py',
                          'pallas_mosaic_gpu_test.py',
-                         'pallas_triton_flash_attention_test.py',
+                         'pallas_triton_test.py',
                          'jax_nn_test.py',
                          'xla_chunked_test.py',
                         ]

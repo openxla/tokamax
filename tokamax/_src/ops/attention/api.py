@@ -45,7 +45,7 @@ IMPLEMENTATIONS = dict(
 _DEFAULT_IMPLEMENTATION = ("xla",)
 
 try:
-  from tokamax._src.ops.attention import pallas_triton_flash_attention as pl_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_triton as pl_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
   IMPLEMENTATIONS["triton"] = pl_triton.PallasTritonFlashAttention()
   _DEFAULT_IMPLEMENTATION = ("triton",) + _DEFAULT_IMPLEMENTATION

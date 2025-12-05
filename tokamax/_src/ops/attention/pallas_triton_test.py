@@ -25,8 +25,8 @@ import jax.numpy as jnp
 import qwix
 from tokamax._src import precision as precision_utils
 from tokamax._src.ops.attention import base
-from tokamax._src.ops.attention import pallas_triton_flash_attention as fa
-from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp as fa_vjp
+from tokamax._src.ops.attention import pallas_triton as fa
+from tokamax._src.ops.attention import pallas_triton_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
 from typing_extensions import override
 

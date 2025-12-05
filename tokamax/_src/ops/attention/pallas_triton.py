@@ -32,7 +32,7 @@ from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
-from tokamax._src.ops.attention import pallas_triton_flash_attention_vjp as vjp
+from tokamax._src.ops.attention import pallas_triton_vjp as vjp
 from tokamax._src.pallas import block
 from typing_extensions import override
 

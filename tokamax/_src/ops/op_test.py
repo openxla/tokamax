@@ -26,7 +26,7 @@ from tokamax._src import config as config_lib
 from tokamax._src import utils
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import base as attn_base
-from tokamax._src.ops.attention import pallas_triton_flash_attention as pl_attn
+from tokamax._src.ops.attention import pallas_triton as pl_attn
 from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
