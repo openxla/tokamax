@@ -82,21 +82,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     # None of the kernels support zero point yet.
     rhs = quantization.as_array_or_qarray_without_zero_point(rhs)
 
-    device = backend.get_default_device()
-
-    if float(getattr(device, "compute_capability", "9.0")) >= 10.0:
-      if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
-        raise NotImplementedError(f"{precision=} not supported.")
-
-      if ragged_dot_dimension_numbers != base.DEFAULT_RAGGED_DOT_DIM_NUMS:
-        raise NotImplementedError(
-            "Only default `ragged_dot_dimension_numbers` supported."
-        )
-      if isinstance(rhs, QArray):
-        fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
-      else:
-        fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
-    else:
+    if gpu_utils.is_sm90():
       if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
         if isinstance(rhs, QArray):
           if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
@@ -128,6 +114,20 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         fn = sm90.ragged_contracting_dim_dot_kernel
       else:
         raise NotImplementedError("Unsupported ragged dot dimension numbers.")
+    elif gpu_utils.is_sm100():
+      if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+        raise NotImplementedError(f"{precision=} not supported.")
+
+      if ragged_dot_dimension_numbers != base.DEFAULT_RAGGED_DOT_DIM_NUMS:
+        raise NotImplementedError(
+            "Only default `ragged_dot_dimension_numbers` supported."
+        )
+      if isinstance(rhs, QArray):
+        fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
+      else:
+        fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
+    else:
+      raise NotImplementedError("Unsupported GPU architecture.")
 
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.array(group_sizes)
@@ -141,8 +141,21 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     _, rhs = ba.args
 
-    device = backend.get_default_device()
-    if float(getattr(device, "compute_capability", "9.0")) >= 10.0:
+    if gpu_utils.is_sm90():
+      return Config(
+          block_m=64,
+          block_n=64,
+          block_k=rhs.scale_tile_shape[1] if isinstance(rhs, QArray) else 128,
+          num_stages=2,
+          split_k=1,
+          grid_block_n=1,
+          warp_specialized=True,
+          persistent=False,
+          async_store=True,
+          grid_minor_dim=common.MatmulDimension.M,
+          grid_tile_width=1,
+      )
+    elif gpu_utils.is_sm100():
       if isinstance(rhs, QArray):
         return Config(
             block_m=128,
@@ -166,19 +179,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             grid_minor_dim=common.MatmulDimension.M,
             grid_tile_width=4,
         )
-    return Config(
-        block_m=64,
-        block_n=64,
-        block_k=rhs.scale_tile_shape[1] if isinstance(rhs, QArray) else 128,
-        num_stages=2,
-        split_k=1,
-        grid_block_n=1,
-        warp_specialized=True,
-        persistent=False,
-        async_store=True,
-        grid_minor_dim=common.MatmulDimension.M,
-        grid_tile_width=1,
-    )
+    else:
+      raise NotImplementedError("Unsupported GPU architecture.")
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
