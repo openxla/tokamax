@@ -115,3 +115,65 @@ benchmarks {
     }
   }
 }
+
+benchmarks {
+  name: "tokamax_triangle_multiplication_gpu"
+  description: "Runs the Tokamax triangle_multiplication benchmark on H100 and B200."
+  owner: "Tokamax Team"
+  update_frequency_policy: QUARTERLY
+  workload {
+    python_workload {
+      script_path: "tokamax/benchmarks/triangle_multiplication.py"
+      python_version: "3.11"
+    }
+  }
+
+  hardware_configs {
+    hardware_category: GPU_H100
+    topology { num_hosts: 1 num_devices_per_host: 1 }
+    workflow_type: [SCHEDULED]
+    resource_spec {
+      os: LINUX
+    }
+    pip_optional_dependencies: "cuda"
+  }
+
+  hardware_configs {
+    hardware_category: GPU_B200
+    topology { num_hosts: 1 num_devices_per_host: 1 }
+    workflow_type: [SCHEDULED]
+    resource_spec {
+      os: LINUX
+    }
+    pip_optional_dependencies: "cuda"
+  }
+
+  metrics {
+    name: "triangle_multiplication/default/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/default/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/xla/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+}
