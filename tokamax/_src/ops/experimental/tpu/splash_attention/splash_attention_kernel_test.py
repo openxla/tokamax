@@ -26,6 +26,7 @@ import jax
 from jax import random
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.tpu.splash_attention import base
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_test_utils as test_utils
@@ -49,7 +50,7 @@ Draw = TypeVar("Draw", bound=Callable[[hps.SearchStrategy[Any]], Any])
 
 
 @hps.composite
-def segment_ids_strategy(draw, seq_len: int) -> splash.SegmentIds:
+def segment_ids_strategy(draw, seq_len: int) -> base.SegmentIds:
   boundaries = hps.sets(hps.integers(1, seq_len - 1), min_size=1, max_size=4)
   bounds = sorted(draw(boundaries))
   ids_array = np.empty((seq_len,), dtype=np.int32)
@@ -58,7 +59,7 @@ def segment_ids_strategy(draw, seq_len: int) -> splash.SegmentIds:
     if end - start < 2:
       end = start + 2
     ids_array[start:end] = i
-  return splash.SegmentIds(ids_array, ids_array)
+  return base.SegmentIds(ids_array, ids_array)
 
 
 def seed_strategy() -> hps.SearchStrategy[int]:
@@ -216,7 +217,9 @@ def attention_strategy(draw: Draw) -> tuple[int, int, int, int, np.dtype]:
     # tests.
     dtype = np.dtype("float32")
   else:
-    dtype = draw(hps.sampled_from([np.dtype("float32"), np.dtype(jnp.bfloat16)]))
+    dtype = draw(
+        hps.sampled_from([np.dtype("float32"), np.dtype(jnp.bfloat16)])
+    )
   return q_seq_len, kv_seq_len, head_dim_qk, head_dim_v, dtype
 
 
@@ -352,7 +355,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         interpret=self.INTERPRET,
     )
 
-    attn_ref = partial(splash.attention_reference, is_mqa=is_mqa)
+    attn_ref = partial(base.splash_attention_reference, is_mqa=is_mqa)
     if is_mqa:
       if not is_dynamic_mask:
         make_mask_fn = splash.make_splash_mqa_single_device
@@ -388,9 +391,17 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_sinks=(False, True),
   )
   @hp.given(hps.data())
-  def test_splash_attention_fwd(self, is_mqa, is_segmented, is_dynamic_mask,
-                                use_base2_exp, use_max_logit_estimate,
-                                fuse_reciprocal, use_sinks, data):
+  def test_splash_attention_fwd(
+      self,
+      is_mqa,
+      is_segmented,
+      is_dynamic_mask,
+      use_base2_exp,
+      use_max_logit_estimate,
+      fuse_reciprocal,
+      use_sinks,
+      data,
+  ):
     seed = data.draw(seed_strategy())
     key = random.key(seed)
     k1, k2, k3, k_sinks = random.split(key, 4)
@@ -463,7 +474,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     make_mask_fn = partial(make_mask_fn, config=config, save_residuals=True)
     attn = make_mask_fn(mask)
     attn_ref = partial(
-        splash.attention_reference,
+        base.splash_attention_reference,
         is_mqa=is_mqa,
         save_residuals=True,
         attn_logits_soft_cap=attn_logits_soft_cap,
@@ -486,19 +497,22 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     max_logits_tol = dict(atol=1e-3, rtol=4e-3)
     if use_sinks:
       o_tol = dict(atol=1e-2, rtol=1e-1)
-      lse_tol['rtol'] = 6e-2
-    elif (use_base2_exp or use_max_logit_estimate is not None
-          or not fuse_reciprocal):
+      lse_tol["rtol"] = 6e-2
+    elif (
+        use_base2_exp
+        or use_max_logit_estimate is not None
+        or not fuse_reciprocal
+    ):
       o_tol = dict(atol=8e-3, rtol=3e-3)
     else:
       o_tol = dict(atol=4e-3, rtol=3e-3)
 
     self._assert_allclose(o, o_ref, **o_tol)
-    self._assert_allclose(stats["logsumexp"],
-                          stats_ref["logsumexp"], **lse_tol)
+    self._assert_allclose(stats["logsumexp"], stats_ref["logsumexp"], **lse_tol)
     if use_max_logit_estimate is None:
-      self._assert_allclose(stats["max_logits"],
-                            stats_ref["max_logits"], **max_logits_tol)
+      self._assert_allclose(
+          stats["max_logits"], stats_ref["max_logits"], **max_logits_tol
+      )
 
   @parameterized.product(
       is_mqa=(False, True),
@@ -603,10 +617,16 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     attn = make_mask_fn(mask)
 
-    o, attn_vjp = jax.vjp(partial(attn, max_logit_value=max_logit_value),
-                          q, k, v, segment_ids, sinks)
+    o, attn_vjp = jax.vjp(
+        partial(attn, max_logit_value=max_logit_value),
+        q,
+        k,
+        v,
+        segment_ids,
+        sinks,
+    )
     q32, k32, v32 = jax.tree.map(lambda x: x.astype(jnp.float32), (q, k, v))
-    o_ref, stats_ref = splash.attention_reference(
+    o_ref, stats_ref = base.splash_attention_reference(
         q32,
         k32,
         v32,
@@ -619,8 +639,11 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     if use_sinks:
       o_tol = dict(atol=1e-2, rtol=1e-1)
-    elif (use_base2_exp or use_max_logit_estimate is not None
-          or not fuse_reciprocal):
+    elif (
+        use_base2_exp
+        or use_max_logit_estimate is not None
+        or not fuse_reciprocal
+    ):
       o_tol = dict(atol=8e-3, rtol=1e-2)
     else:
       o_tol = dict(atol=4e-3, rtol=3e-3)
@@ -633,7 +656,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         mask, q, k, v, segment_ids, sinks, o, logsumexp, do
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
       attn_ref = partial(
-          splash._attention_reference_custom_bwd,
+          base.splash_attention_reference_bwd,
           backward_impl="flash",
           attn_logits_soft_cap=attn_logits_soft_cap,
       )

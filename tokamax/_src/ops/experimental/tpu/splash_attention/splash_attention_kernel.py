@@ -21,7 +21,7 @@ import enum
 import functools
 import json
 import math
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple
 
 import jax
 from jax import ad_checkpoint
@@ -31,13 +31,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.tpu.splash_attention import base
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
+
 
 P = jax.P
 MaskInfo = mask_info_lib.MaskInfo
 partial = functools.partial
-DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
 # We predefine some useful dimension numbers for dot_general
@@ -81,17 +82,19 @@ class SegmentIds(NamedTuple):
 
 
 # Return type of SplashAttention function that implements the custom vjp rule.
-SplashCustomReturnType = jax.Array | tuple[jax.Array, dict[str, jax.Array]]
+SplashCustomReturnType = (
+    jax.Array | tuple[jax.Array, dict[str, jax.Array]]
+)
 
 SplashResidualsType = tuple[
     jax.Array,  # q
     jax.Array,  # k
     jax.Array,  # v
-    Optional[SegmentIds],  # segment_ids
-    Optional[jax.Array],  # sinks
+    SegmentIds | None,  # segment_ids
+    jax.Array | None,  # sinks
     jax.Array,  # out
     jax.Array,  # logsumexp
-    Optional[MaskInfo],  # dkv_mask_info
+    MaskInfo | None,  # dkv_mask_info
 ]
 
 MaskFunctionType = Callable[..., jax.Array]
@@ -108,7 +111,6 @@ def get_kernel_name(
   attention_type = "mqa" if is_mqa else "mha"
   segments = "_segmented" if is_segmented else ""
   return f"splash_{attention_type}_{phase}{segments}{residuals}"
-
 
 # Reference attention implementations
 
@@ -164,7 +166,7 @@ def _attention_reference_custom_bwd(
     sinks,
     o,
     logsumexp,
-    mask_value: float = DEFAULT_MASK_VALUE,
+    mask_value: float = base.DEFAULT_MASK_VALUE,
     backward_impl: str = "vanilla",
     attn_logits_soft_cap: float | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, None, None, jax.Array | None]:
@@ -233,7 +235,7 @@ def attention_reference(
     sinks: jax.Array | None = None,
     *,
     is_mqa: bool,
-    mask_value: float = DEFAULT_MASK_VALUE,
+    mask_value: float = base.DEFAULT_MASK_VALUE,
     save_residuals: bool = False,
     attn_logits_soft_cap: float | None = None,
 ):
@@ -690,7 +692,7 @@ def _splash_attention_forward(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    segment_ids: SegmentIds | None,
+    segment_ids: base.SegmentIds | None,
     sinks: jax.Array | None,
     mask_value: float,
     is_mqa: bool,
@@ -699,7 +701,7 @@ def _splash_attention_forward(
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
-) -> SplashCustomReturnType:
+) -> base.SplashCustomReturnType:
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
   bq, bkv = config.block_q, config.block_kv
@@ -1087,7 +1089,7 @@ def _splash_attention_custom(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    segment_ids: SegmentIds | None,
+    segment_ids: base.SegmentIds | None,
     sinks: jax.Array | None,
     save_residuals: bool,
     mask_value: float,
@@ -1096,7 +1098,7 @@ def _splash_attention_custom(
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
-) -> SplashCustomReturnType:
+) -> base.SplashCustomReturnType:
   # The forward function does not use the dq and dkv MaskInfos, it just forwards
   # them to the backward function as residuals. This is a way to communicate
   # arbitrary Arrays to the backward function. Since the three MaskInfos are
@@ -1139,7 +1141,7 @@ def _splash_attention_fwd(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    segment_ids: SegmentIds | None,
+    segment_ids: base.SegmentIds | None,
     sinks: jax.Array | None,
     save_residuals: bool,
     mask_value: float,
@@ -1148,7 +1150,7 @@ def _splash_attention_fwd(
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
-) -> tuple[tuple[jax.Array], SplashResidualsType]:
+) -> tuple[tuple[jax.Array], base.SplashResidualsType]:
 
   # TODO: add some higher order AD check that isn't save_residuals based.
   # if save_residuals:
@@ -1870,7 +1872,7 @@ def _splash_attention_bwd(
     config: SplashConfig,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
-    res: SplashResidualsType,
+    res: base.SplashResidualsType,
     do: jax.Array,
 ) -> tuple[
     MaskInfo | None,  # fwd_mask_info
@@ -1878,7 +1880,7 @@ def _splash_attention_bwd(
     jax.Array,  # q
     jax.Array,  # k
     jax.Array,  # v
-    SegmentIds | None,  # segment_ids
+    base.SegmentIds | None,  # segment_ids
     jax.Array | None,  # segment_ids
     jax.Array | None,  # max_logit_estimate
 ]:
@@ -1953,7 +1955,7 @@ def _splash_attention(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    segment_ids: SegmentIds | None = None,
+    segment_ids: base.SegmentIds | None = None,
     sinks: jax.Array | None = None,
     *,
     is_mqa: bool,
@@ -1963,7 +1965,7 @@ def _splash_attention(
     max_logit_value: jax.Array | None = None,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
-) -> SplashCustomReturnType:
+) -> base.SplashCustomReturnType:
   return _splash_attention_custom(
       fwd_mask_info,
       dkv_mask_info,
@@ -1995,7 +1997,7 @@ class SplashAttentionKernel:
     self.fwd_mask_info = fwd_mask_info
     self.dkv_mask_info = dkv_mask_info
 
-  def __call__(self, *args, **kwargs) -> SplashCustomReturnType:
+  def __call__(self, *args, **kwargs) -> base.SplashCustomReturnType:
     return _splash_attention(
         self.fwd_mask_info,
         self.dkv_mask_info,
@@ -2060,7 +2062,7 @@ def _make_splash_attention(
     config: SplashConfig | None = None,
     is_mqa: bool,
     save_residuals: bool = False,
-    mask_value: float = DEFAULT_MASK_VALUE,
+    mask_value: float = base.DEFAULT_MASK_VALUE,
     downcast_smem_data: bool = True,
     partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
     q_seq_shards: int,
@@ -2122,7 +2124,7 @@ def _make_dynamic_splash_attention(
     config: SplashConfig | None = None,
     is_mqa: bool,
     save_residuals: bool = False,
-    mask_value: float = DEFAULT_MASK_VALUE,
+    mask_value: float = base.DEFAULT_MASK_VALUE,
     downcast_smem_data: bool = True,
     partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
 ):
