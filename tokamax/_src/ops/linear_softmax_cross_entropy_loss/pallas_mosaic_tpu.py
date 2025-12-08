@@ -598,6 +598,14 @@ class Config:
   v_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 2048
 
 
+def get_tpu_specific_default_config() -> Config:
+  """Returns the heuristic config for based on TPU version."""
+  if pltpu.get_tpu_info().generation >= 6:
+    return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
+  else:
+    return Config(b_block_size=1024, h_block_size=512, v_block_size=512)
+
+
 @dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     base.LinearSoftmaxCrossEntropyLoss
@@ -635,11 +643,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     del ba
-
-    if pltpu.get_tpu_info().generation >= 6:
-      return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
-    else:
-      return Config(b_block_size=1024, h_block_size=512, v_block_size=1024)
+    return get_tpu_specific_default_config()
 
   # TODO: Implement an autotuning search space.
   @override
@@ -690,10 +694,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     del ba
-    if pltpu.get_tpu_info().generation >= 6:
-      return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
-    else:
-      return Config(b_block_size=1024, h_block_size=512, v_block_size=1024)
+    return get_tpu_specific_default_config()
 
   # TODO: Implement an autotuning search space.
   @override

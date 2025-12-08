@@ -21,8 +21,8 @@ from tokamax._src.ops.linear_softmax_cross_entropy_loss.base import (
     LinearSoftmaxCrossEntropyLoss,
 )
 from tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu import (
-    Config,
     PallasMosaicTpuLinearSoftmaxCrossEntropyLoss,
+    get_tpu_specific_default_config,
     linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu,
     linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu,
 )
@@ -49,7 +49,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=512,
           v_dim=2048,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="fwd_medium_size_sum_reduction_test",
@@ -57,7 +56,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=4096,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="fwd_large_size_sum_reduction_test",
@@ -65,7 +63,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=4096,
           v_dim=16384,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="fwd_small_size_mean_reduction_test",
@@ -73,7 +70,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=512,
           v_dim=2048,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="fwd_medium_size_mean_reduction_test",
@@ -81,7 +77,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=4096,
           reduction="mean",
-          config=Config(),
       ),
       dict(
           testcase_name="fwd_large_size_mean_reduction_test",
@@ -89,7 +84,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=4096,
           v_dim=16384,
           reduction="mean",
-          config=Config(),
       ),
       dict(
           testcase_name="fwd_non_aligned_block_size_sum_reduction_test",
@@ -97,9 +91,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2560,
           reduction="sum",
-          config=Config(
-              v_block_size=1024,
-          ),
       ),
       dict(
           testcase_name="fwd_non_aligned_block_size_mean_reduction_test",
@@ -107,9 +98,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2560,
           reduction="mean",
-          config=Config(
-              v_block_size=1024,
-          ),
       ),
       dict(
           testcase_name="fwd_non_aligned_multiple_of_128_sum_reduction_test",
@@ -117,9 +105,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2664,
           reduction="sum",
-          config=Config(
-              v_block_size=1024,
-          ),
       ),
       dict(
           testcase_name="fwd_non_aligned_multiple_of_128_mean_reduction_test",
@@ -127,15 +112,13 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2664,
           reduction="mean",
-          config=Config(
-              v_block_size=1024,
-          ),
       ),
   )
   def test_kernel_forward_matches_reference(
-      self, b_dim, h_dim, v_dim, reduction, config
+      self, b_dim, h_dim, v_dim, reduction
   ):
     x, labels, w = generate_random_data(jax.random.key(42), b_dim, h_dim, v_dim)
+    config = get_tpu_specific_default_config()
 
     ref_loss, ref_lse = linear_softmax_cross_entropy_loss_fwd_reference(
         x, labels, w, reduction=reduction
@@ -162,7 +145,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=512,
           v_dim=2048,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="bwd_medium_size_sum_reduction_test",
@@ -170,7 +152,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=4096,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="bwd_large_size_sum_reduction_test",
@@ -178,7 +159,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=4096,
           v_dim=16384,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="bwd_small_size_mean_reduction_test",
@@ -186,7 +166,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=512,
           v_dim=2048,
           reduction="mean",
-          config=Config(),
       ),
       dict(
           testcase_name="bwd_medium_size_mean_reduction_test",
@@ -194,7 +173,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=4096,
           reduction="mean",
-          config=Config(),
       ),
       dict(
           testcase_name="bwd_large_size_mean_reduction_test",
@@ -202,7 +180,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=4096,
           v_dim=16384,
           reduction="mean",
-          config=Config(),
       ),
       dict(
           testcase_name="bwd_non_aligned_block_size_sum_reduction_test",
@@ -210,7 +187,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2560,
           reduction="sum",
-          config=Config(v_block_size=1024),
       ),
       dict(
           testcase_name="bwd_non_aligned_block_size_mean_reduction_test",
@@ -218,7 +194,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2560,
           reduction="mean",
-          config=Config(v_block_size=1024),
       ),
       dict(
           testcase_name="bwd_non_aligned_multiple_of_128_sum_reduction_test",
@@ -226,7 +201,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2664,
           reduction="sum",
-          config=Config(v_block_size=1024),
       ),
       dict(
           testcase_name="bwd_non_aligned_multiple_of_128_mean_reduction_test",
@@ -234,12 +208,10 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2664,
           reduction="mean",
-          config=Config(v_block_size=1024),
       ),
   )
-  def test_kernel_bwd_matches_reference(
-      self, b_dim, h_dim, v_dim, reduction, config
-  ):
+  def test_kernel_bwd_matches_reference(self, b_dim, h_dim, v_dim, reduction):
+    config = get_tpu_specific_default_config()
     x, labels, w = generate_random_data(jax.random.key(42), b_dim, h_dim, v_dim)
     lse = jax.nn.logsumexp(x @ w, axis=-1)
 
@@ -276,7 +248,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=512,
           v_dim=2048,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="op_wrapper_fwd_bwd_medium_size_sum_reduction_test",
@@ -284,7 +255,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=4096,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="op_wrapper_fwd_bwd_large_size_sum_reduction_test",
@@ -292,7 +262,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=4096,
           v_dim=16384,
           reduction="sum",
-          config=Config(),
       ),
       dict(
           testcase_name="op_wrapper_fwd_bwd_small_size_mean_reduction_test",
@@ -300,7 +269,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=512,
           v_dim=2048,
           reduction="mean",
-          config=Config(),
       ),
       dict(
           testcase_name="op_wrapper_fwd_bwd_medium_size_mean_reduction_test",
@@ -308,7 +276,6 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=4096,
           reduction="mean",
-          config=Config(),
       ),
       dict(
           testcase_name="op_wrapper_fwd_bwd_large_size_mean_reduction_test",
@@ -316,14 +283,13 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           h_dim=4096,
           v_dim=16384,
           reduction="mean",
-          config=Config(),
       ),
   )
-  def test_op_wrapper_fwd_bwd(self, b_dim, h_dim, v_dim, reduction, config):
+  def test_op_wrapper_fwd_bwd(self, b_dim, h_dim, v_dim, reduction):
     x, labels, w = generate_random_data(jax.random.key(42), b_dim, h_dim, v_dim)
 
-    fn_pallas = PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(config=config)
-    fn_reference = LinearSoftmaxCrossEntropyLoss(config=config)
+    fn_pallas = PallasMosaicTpuLinearSoftmaxCrossEntropyLoss()
+    fn_reference = LinearSoftmaxCrossEntropyLoss()
 
     kernel_loss, (kernel_grad_x, kernel_grad_w) = jax.value_and_grad(
         fn_pallas, argnums=(0, 2)
@@ -346,17 +312,16 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
           b_dim=1536,
           h_dim=512,
           v_dim=1024,
-          config=Config(b_block_size=1024),
       ),
       dict(
           testcase_name="h_dimension_not_multiple_of_h_block_size",
           b_dim=1024,
           h_dim=768,
           v_dim=1024,
-          config=Config(h_block_size=512),
       ),
   )
-  def test_validation_errors(self, b_dim, h_dim, v_dim, config):
+  def test_validation_errors(self, b_dim, h_dim, v_dim):
+    config = get_tpu_specific_default_config()
     x, labels, w = generate_random_data(jax.random.key(42), b_dim, h_dim, v_dim)
     lse = jax.nn.logsumexp(x @ w, axis=-1)
 
