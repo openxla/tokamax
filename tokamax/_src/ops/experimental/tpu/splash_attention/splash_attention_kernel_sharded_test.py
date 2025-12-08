@@ -24,6 +24,7 @@ import jax
 from jax import random
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.tpu.splash_attention import base
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_test_utils as test_utils
@@ -134,7 +135,7 @@ class SplashAttentionShardingTest(PallasBaseTest):
       return kernel(q, k, v)
 
     out = f(kernel, q, k, v)
-    out_ref = splash.attention_reference(q, k, v, mask, None, is_mqa=False)
+    out_ref = base.attention_reference(q, k, v, mask, None, is_mqa=False)
     self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
 
   @parameterized.product(
@@ -209,7 +210,7 @@ class SplashAttentionShardingTest(PallasBaseTest):
     def f(kernel, q, k, v):
       return kernel(q, k, v)
 
-    f_ref = partial(splash.attention_reference, is_mqa=False)
+    f_ref = partial(base.attention_reference, is_mqa=False)
 
     out, out_vjp = jax.vjp(f, kernel, q, k, v)
     out_ref, out_vjp_ref = jax.vjp(f_ref, q, k, v, mask, None)
