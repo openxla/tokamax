@@ -139,8 +139,8 @@ def flash_attention_vjp_kernel(
       plgpu.barrier_arrive(barrier)
     return smems[smem_idx]
 
-  def bias_mask_async_spec(x_ref, is_async, block_q, block_kv, idx, name):
-    if not is_async:
+  def bias_mask_async_spec(x_ref, block_q, block_kv, idx, name):
+    if x_ref is None:
       return None
     bytes_ = jnp.dtype(x_ref.dtype).itemsize
     swizzle = plgpu.find_swizzle(8 * bytes_ * block_kv, name)
@@ -188,12 +188,19 @@ def flash_attention_vjp_kernel(
         at_wg, buffer_barriers
     )
 
+    k_gmem = k_gmem.at[bi, :, hi_kv]
+    v_gmem = v_gmem.at[bi, :, hi_kv]
+
     bias_b_idx, bias_h_idx, bcast_bias_q, bcast_bias_k, async_bias = (
         bias_mask_info(bias_gmem, bi, hi, "bias")
     )
     mask_b_idx, mask_h_idx, bcast_mask_q, bcast_mask_k, async_mask = (
         bias_mask_info(mask_gmem, bi, hi, "mask")
     )
+    if bias_gmem is not None:
+      bias_gmem = bias_gmem.at[bias_b_idx, bias_h_idx]
+    if mask_gmem is not None:
+      mask_gmem = mask_gmem.at[mask_b_idx, mask_h_idx]
 
     def compute_thread(pipeline_callback):
       plgpu.copy_gmem_to_smem(q_gmem.at[bi, qs, hi], q_smem, q_barrier)
@@ -210,7 +217,7 @@ def flash_attention_vjp_kernel(
       l = plgpu.load(l_smem, (), layout=_WGMMA_ROW)
       if use_base2:
         m *= math.log2(math.e)
-      acc = plgpu.layout_cast(jnp.zeros(q_smem.shape, jnp.float32), _WGMMA)
+      acc = plgpu.layout_cast(jnp.zeros_like(q_smem, jnp.float32), _WGMMA)
 
       def load_k_range(ref):
         if ref is None:
@@ -240,7 +247,7 @@ def flash_attention_vjp_kernel(
         mask_consumed_barrier,
         carry,
     ):
-      ki = index[0]
+      (ki,) = index
       kv_base = ki * block_kv
       ks = pl.ds(kv_base, block_kv)
       acc, m, l, delta, k_start, k_end = carry
@@ -306,9 +313,7 @@ def flash_attention_vjp_kernel(
         plgpu.wgmma(acc_ref, dout_smem, v_smem.T)
         return acc_ref[...]
 
-      dp = pl.run_scoped(
-          compute_dp, plgpu.ACC((block_q, block_kv), jnp.float32)
-      )
+      dp = pl.run_scoped(compute_dp, plgpu.ACC(p.shape, jnp.float32))
       plgpu.barrier_arrive(v_consumed_barrier)
 
       ds = p * (dp - lax.broadcast_in_dim(delta, p.shape, [0]))
@@ -335,14 +340,20 @@ def flash_attention_vjp_kernel(
 
       return (acc, m, l, delta, k_start, k_end)
 
-    bias_in_spec = bias_mask_async_spec(
-        bias_gmem, async_bias, block_q, block_kv, qi, "bias"
-    )
-    mask_in_spec = bias_mask_async_spec(
-        mask_gmem, async_mask, block_q, block_kv, qi, "mask"
-    )
+    bias_gmem_ = bias_gmem if async_bias else None
+    mask_gmem_ = mask_gmem if async_mask else None
 
-    pipeline = plgpu.emit_pipeline_warp_specialized(
+    k_spec = plgpu.BlockSpec(
+        (block_kv, head_dim), lambda ki: (ki, 0), transforms=transforms(k.dtype)
+    )
+    v_block_shape = (block_kv, head_dim_out)
+    v_spec = plgpu.BlockSpec(
+        v_block_shape, lambda ki: (ki, 0), transforms=transforms(v.dtype)
+    )
+    bias_spec = bias_mask_async_spec(bias_gmem_, block_q, block_kv, qi, "bias")
+    mask_spec = bias_mask_async_spec(mask_gmem_, block_q, block_kv, qi, "mask")
+
+    plgpu.emit_pipeline_warp_specialized(
         kv_pipeline,
         grid=(num_kv_tiles_in_dq,),
         max_concurrent_steps=min(config.num_stages, num_kv_tiles_in_dq),
@@ -351,34 +362,8 @@ def flash_attention_vjp_kernel(
         wg_axis="wg",
         manual_consumed_barriers=True,
         compute_context=compute_thread,
-        in_specs=[
-            plgpu.BlockSpec(  # k
-                block_shape=(block_kv, head_dim),
-                index_map=lambda i: (i, 0),
-                transforms=transforms(k.dtype),
-            ),
-            plgpu.BlockSpec(  # v
-                block_shape=(block_kv, head_dim_out),
-                index_map=lambda i: (i, 0),
-                transforms=transforms(v.dtype),
-            ),
-            bias_in_spec,
-            mask_in_spec,
-        ],
-    )
-    k_gmem = k_gmem.at[bi, :, hi_kv, :]
-    v_gmem = v_gmem.at[bi, :, hi_kv, :]
-    if bias_gmem is not None:
-      bias_gmem = bias_gmem.at[bias_b_idx, bias_h_idx, :, :]
-    if mask_gmem is not None:
-      mask_gmem = mask_gmem.at[mask_b_idx, mask_h_idx, :, :]
-
-    pipeline(
-        k_gmem,
-        v_gmem,
-        bias_gmem if async_bias else None,
-        mask_gmem if async_mask else None,
-    )
+        in_specs=[k_spec, v_spec, bias_spec, mask_spec],
+    )(k_gmem, v_gmem, bias_gmem_, mask_gmem_)
 
   def kernel_dkv(
       q_gmem,
@@ -411,6 +396,12 @@ def flash_attention_vjp_kernel(
     k_smem, v_smem = map(lambda x: x.at[wg], smem_buffers)
     k_barrier, v_barrier = map(lambda x: x.at[wg], buffer_barriers)
 
+    q_gmem = q_gmem.at[bi, :, hi]
+    dout_gmem = dout_gmem.at[bi, :, hi]
+    m_gmem = m_gmem.at[bi, hi]
+    l_gmem = l_gmem.at[bi, hi]
+    delta_gmem = delta_gmem.at[bi, hi]
+
     bias_b_idx, bias_h_idx, bcast_bias_k, bcast_bias_q, async_bias = (
         bias_mask_info(bias_gmem, bi, hi, "bias")
     )
@@ -418,17 +409,17 @@ def flash_attention_vjp_kernel(
         bias_mask_info(mask_gmem, bi, hi, "mask")
     )
     if bias_gmem is not None:
-      bias_gmem = bias_gmem.at[bias_b_idx, bias_h_idx, :, :]
+      bias_gmem = bias_gmem.at[bias_b_idx, bias_h_idx]
     if mask_gmem is not None:
-      mask_gmem = mask_gmem.at[mask_b_idx, mask_h_idx, :, :]
+      mask_gmem = mask_gmem.at[mask_b_idx, mask_h_idx]
 
     def compute_thread(pipeline_callback):
       plgpu.copy_gmem_to_smem(k_gmem.at[bi, ks, hi_kv], k_smem, k_barrier)
       plgpu.copy_gmem_to_smem(v_gmem.at[bi, ks, hi_kv], v_smem, v_barrier)
       plgpu.barrier_wait(k_barrier)
       plgpu.barrier_wait(v_barrier)
-      dk_acc = plgpu.layout_cast(jnp.zeros(k_smem.shape, jnp.float32), _WGMMA)
-      dv_acc = plgpu.layout_cast(jnp.zeros(v_smem.shape, jnp.float32), _WGMMA)
+      dk_acc = plgpu.layout_cast(jnp.zeros_like(k_smem, jnp.float32), _WGMMA)
+      dv_acc = plgpu.layout_cast(jnp.zeros_like(v_smem, jnp.float32), _WGMMA)
       dk, dv = pipeline_callback((dk_acc, dv_acc))
       k_smem[...] = dk.astype(k.dtype)
       v_smem[...] = dv.astype(v.dtype)
@@ -463,7 +454,7 @@ def flash_attention_vjp_kernel(
         mask_consumed_barrier,
         carry,
     ):
-      qi = index[0]
+      (qi,) = index
       q_base = qi * block_q
       qs = pl.ds(q_base, block_q)
       dk_acc, dv_acc = carry
@@ -539,17 +530,15 @@ def flash_attention_vjp_kernel(
       epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
       pT = exp(sT - broadcast(m)) / broadcast(l + epsilon)
 
-      def _compute(refs):
+      def compute_dv_dpT(refs):
         # Combining two WGMMA calls in one block to avoid the unnecessary
         # synchronization from two `wgmma.wait_group` calls.
         dv_acc_ref, dpT_acc_ref = refs
         plgpu.wgmma(dv_acc_ref, pT.astype(dtype), dout_smem)
         plgpu.wgmma(dpT_acc_ref, v_smem, dout_smem.T)
 
-      zeros = plgpu.layout_cast(
-          jnp.full((block_kv, block_q), 0, dtype=jnp.float32), _WGMMA
-      )
-      dv_acc, dpT = pl.run_state(_compute)(
+      zeros = plgpu.layout_cast(jnp.zeros_like(pT, jnp.float32), _WGMMA)
+      dv_acc, dpT = pl.run_state(compute_dv_dpT)(
           (plgpu.ACC.init(dv_acc), plgpu.ACC.init(zeros))
       )
       plgpu.barrier_arrive(dout_consumed_barrier)
@@ -570,14 +559,21 @@ def flash_attention_vjp_kernel(
 
       return (dk_acc, dv_acc)
 
-    bias_in_spec = bias_mask_async_spec(
-        bias_gmem, async_bias, block_kv, block_q, ki, "bias"
-    )
-    mask_in_spec = bias_mask_async_spec(
-        mask_gmem, async_mask, block_kv, block_q, ki, "mask"
-    )
+    bias_gmem_ = bias_gmem if async_bias else None
+    mask_gmem_ = mask_gmem if async_mask else None
 
-    pipeline = plgpu.emit_pipeline_warp_specialized(
+    q_index_map = lambda qi: (qi, 0)
+    q_spec = plgpu.BlockSpec(
+        (block_q, head_dim), q_index_map, transforms=transforms(q.dtype)
+    )
+    dout_spec = plgpu.BlockSpec(
+        (block_q, head_dim_out), q_index_map, transforms=transforms(dout.dtype)
+    )
+    m_spec = l_spec = delta_spec = plgpu.BlockSpec((block_q,), lambda qi: (qi,))
+    bias_spec = bias_mask_async_spec(bias_gmem_, block_kv, block_q, ki, "bias")
+    mask_spec = bias_mask_async_spec(mask_gmem_, block_kv, block_q, ki, "mask")
+
+    plgpu.emit_pipeline_warp_specialized(
         q_pipeline,
         grid=(num_q_tiles_in_dkv,),
         max_concurrent_steps=min([config.num_stages, num_q_tiles_in_dkv]),
@@ -587,33 +583,15 @@ def flash_attention_vjp_kernel(
         manual_consumed_barriers=True,
         compute_context=compute_thread,
         in_specs=[
-            plgpu.BlockSpec(  # q
-                block_shape=(block_q, head_dim),
-                index_map=lambda i: (i, 0),
-                transforms=transforms(q.dtype),
-            ),
-            plgpu.BlockSpec(  # dout
-                block_shape=(block_q, head_dim_out),
-                index_map=lambda i: (i, 0),
-                transforms=transforms(dout.dtype),
-            ),
-            plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
-            plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
-            plgpu.BlockSpec(block_shape=(block_q,), index_map=lambda i: (i,)),
-            bias_in_spec,
-            mask_in_spec,
+            q_spec,
+            dout_spec,
+            m_spec,
+            l_spec,
+            delta_spec,
+            bias_spec,
+            mask_spec,
         ],
-    )
-
-    pipeline(
-        q_gmem.at[bi, :, hi, :],
-        dout_gmem.at[bi, :, hi, :],
-        m_gmem.at[bi, hi, :],
-        l_gmem.at[bi, hi, :],
-        delta_gmem.at[bi, hi, :],
-        bias_gmem if async_bias else None,
-        mask_gmem if async_mask else None,
-    )
+    )(q_gmem, dout_gmem, m_gmem, l_gmem, delta_gmem, bias_gmem_, mask_gmem_)
 
   q_scratch = plgpu.SMEM(
       (compute_wgs, config.block_q_dq, head_dim),
