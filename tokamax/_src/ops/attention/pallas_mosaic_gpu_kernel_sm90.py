@@ -63,7 +63,6 @@ def flash_attention_kernel(
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Flash attention with Mosaic GPU."""
 
-  orig_q_shape = q.shape
   q_seq_len, num_q_heads, _ = q.shape
   kv_seq_len, num_kv_heads, head_dim_out = v.shape
   orig_head_dim_out = head_dim_out
@@ -448,10 +447,5 @@ def flash_attention_kernel(
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(approx_math=True),
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
-
-  out = out.reshape(*orig_q_shape[:-1], out.shape[-1])[..., :orig_head_dim_out]
-  residuals = tuple(
-      res.reshape(*orig_q_shape[:-3], num_q_heads, q_seq_len)
-      for res in residuals
-  )
-  return out, (residuals if return_residuals else None)
+  out = out[..., :orig_head_dim_out]
+  return out, (tuple(residuals) if return_residuals else None)
