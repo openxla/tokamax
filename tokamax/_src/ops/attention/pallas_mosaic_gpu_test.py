@@ -19,6 +19,7 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import pytest
+from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu as fa
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
@@ -137,14 +138,15 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
   def test_autotune(self):
     # Test that all autotuning configs yield reasonable results.
-    assert isinstance(self._attention_fn, fa.PallasMosaicGpuFlashAttention)
+    assert isinstance(self._attention_fn, base.DotProductAttention)
     q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 64))
     bound_args = self._attention_fn.bind(q, k, v)
     configs = self._attention_fn._get_autotuning_configs(bound_args)
     self.assertNotEmpty(configs)
     for config in configs:
-      impl = fa.PallasMosaicGpuFlashAttention(config)
-      self._run_test_with_inputs(q, k, v, impl=impl)
+      with self.subTest(f"{config=}"):
+        impl = type(self._attention_fn)(config)
+        self._run_test_with_inputs(q, k, v, impl=impl)
 
 
 # TODO: Add manual partitioning test.
