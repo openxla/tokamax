@@ -39,23 +39,25 @@ Residuals = base.Residuals
 
 
 def _decompose_mask(mask, q, k, q_indices, k_indices):
-  """Decomposes `mask` into a mask array, `k_start` and `k_end`."""
+  """Decomposes `mask` into a mask array, `is_causal`, `k_start` and `k_end`."""
   if mask is None:
-    return None, None, None
+    return None, False, None, None
 
+  is_causal = False
   k_start = None
   k_end = None
 
   if k_indices is None:
     mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
 
-    # TODO: Support not folding `is_causal` into `k_end`.
-    # Fold `is_causal` into `k_end`.
-    if is_causal:
+    # Fold `is_causal` into `k_end`. If `q_indices` is not `None`, then this is
+    # necessary for correctness. Otherwise, it is a performance optimization.
+    if is_causal and (q_indices is not None or k_end is not None):
       if q_indices is None:
         q_indices = jnp.arange(q.shape[-3])
       k_end_ = q_indices + 1
       k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
+      is_causal = False
 
     if k_start is not None:
       k_start = jax.lax.broadcast_to_rank(k_start, 2)
@@ -65,7 +67,7 @@ def _decompose_mask(mask, q, k, q_indices, k_indices):
   q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
   k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
   mask = mask.as_array(q_len_or_indices, k_len_or_indices)
-  return mask, k_start, k_end
+  return mask, is_causal, k_start, k_end
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -132,7 +134,9 @@ class PallasMosaicGpuFlashAttentionVjp(
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
 
-    mask, k_start, k_end = _decompose_mask(mask, q, k, q_indices, k_indices)
+    mask, is_causal, k_start, k_end = _decompose_mask(
+        mask, q, k, q_indices, k_indices
+    )
 
     def cast(x, precision):
       msg = lambda dt: f"Only {dt} supported for {precision=}, got {x.dtype=}"
@@ -163,6 +167,7 @@ class PallasMosaicGpuFlashAttentionVjp(
         k_end=k_end,
         logits_scale=logits_scale,
         logits_soft_cap=logits_soft_cap,
+        is_causal=is_causal,
         use_base2=self.use_base2,
         dbias_intermediate_dtype=self.dbias_intermediate_dtype,
         config=config,
