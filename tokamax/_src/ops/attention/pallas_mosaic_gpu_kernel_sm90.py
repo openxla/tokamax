@@ -35,6 +35,7 @@ from tokamax._src.pallas import block
 Config = common.Config
 Residuals = base.Residuals
 
+_MIN_SWIZZLE = 32
 _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
@@ -65,16 +66,19 @@ def flash_attention_kernel(
 
   q_seq_len, num_q_heads, _ = q.shape
   kv_seq_len, num_kv_heads, head_dim_out = v.shape
-  orig_head_dim_out = head_dim_out
 
   if num_q_heads % num_kv_heads:
     raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
 
-  pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
-  q, k, v = map(pad_head_dim, (q, k, v))
+  # The contracting dimension for `wgmma` must be a multiple of the minimum
+  # swizzle size (in number of elements).
+  def pad_head_dim(x):
+    m = 8 * _MIN_SWIZZLE // common.num_bits(x.dtype)
+    return shape_lib.pad_to_next_multiple_of(x, m, -1)
+
+  q, k = map(pad_head_dim, (q, k))
   head_dim = q.shape[-1]
-  head_dim_out = v.shape[-1]
 
   block_q_kv = block_q, block_kv = config.block_q, config.block_kv
   max_stages = min(config.num_stages, pl.cdiv(kv_seq_len, block_kv))
@@ -454,5 +458,4 @@ def flash_attention_kernel(
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(approx_math=True),
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
-  out = out[..., :orig_head_dim_out]
   return out, (tuple(residuals) if return_residuals else None)
