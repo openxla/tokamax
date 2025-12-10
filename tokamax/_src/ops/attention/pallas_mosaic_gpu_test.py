@@ -16,6 +16,7 @@
 import dataclasses
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import pytest
@@ -116,8 +117,21 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     with test_base.override_test_args(atol=0.02):
       super().test_normalize_output()
 
-  def test_base2(self):
-    impl = fa.PallasMosaicGpuFlashAttention(use_base2=True)
+  @parameterized.product(
+      use_base2=[False, True], use_stable_softmax=[False, True]
+  )
+  def test_op_parameters(self, use_base2, use_stable_softmax):
+    self._test_op_parameters(use_base2, use_stable_softmax)
+
+  def _test_op_parameters(self, use_base2, use_stable_softmax):
+    op_cls = type(self._attention_fn)
+    assert hasattr(op_cls, "use_base2")
+    if hasattr(op_cls, "use_stable_softmax"):
+      impl = op_cls(use_base2=use_base2, use_stable_softmax=use_stable_softmax)
+    else:
+      if not use_stable_softmax:
+        self.skipTest("use_stable_softmax unsupported for this implementation.")
+      impl = op_cls(use_base2=use_base2)
     self._run_test((2, 1024, 4, 64), impl=impl)
 
   def test_unstable_softmax(self):
