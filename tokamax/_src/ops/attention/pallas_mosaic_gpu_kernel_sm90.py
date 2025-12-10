@@ -372,17 +372,14 @@ def flash_attention_kernel(
   def entry(*refs):
     compute_wgs = 2
 
-    def tiled_smem(shape, dtype):
-      elem_bytes = jnp.dtype(dtype).itemsize
-      swizzle_elems = min(shape[-1], 128 // elem_bytes)
-      tiling = plgpu.TilingTransform((8, swizzle_elems))
-      swizzle = plgpu.SwizzleTransform(swizzle_elems * elem_bytes)
-      return plgpu.SMEM(shape, dtype, transforms=(tiling, swizzle))
+    def tiled_smem(shape, dtype, what=""):
+      transforms = common.tile_swizzle_transforms(shape, dtype, what)
+      return plgpu.SMEM(shape, dtype, transforms=transforms)
 
-    q_scratch = tiled_smem((compute_wgs, block_q, head_dim), q.dtype)
-    k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype)
-    v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype)
-    o_scratch = tiled_smem((compute_wgs, block_q, head_dim_out), out_dtype)
+    q_scratch = tiled_smem((compute_wgs, block_q, head_dim), q.dtype, "q")
+    k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype, "k")
+    v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype, "v")
+    o_scratch = tiled_smem((compute_wgs, block_q, head_dim_out), out_dtype, "o")
     l_scratch = m_scratch = plgpu.SMEM((compute_wgs, block_q), jnp.float32)
 
     q_barriers = plgpu.Barrier(num_barriers=compute_wgs)
@@ -393,8 +390,19 @@ def flash_attention_kernel(
     schedule_barrier = plgpu.Barrier(num_arrivals=compute_wgs)
 
     bias_mask_smem_shape = (max_stages, compute_wgs * block_q, block_kv)
-    no_async_bias = bias is None or bias.shape[-2] == 1 or bias.shape[-1] == 1
-    no_async_mask = mask is None or mask.shape[-2] == 1 or mask.shape[-1] == 1
+    # bias doesn't need a consumed barrier as it is implied by k consumed.
+    if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
+      bias_scratch = tiled_smem(bias_mask_smem_shape, bias.dtype, "bias")
+      bias_barrier = kv_barriers[0]
+    else:
+      bias_scratch = bias_barrier = None
+
+    if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
+      mask_scratch = tiled_smem(bias_mask_smem_shape, jnp.int8, "mask")
+      mask_barriers = kv_barriers
+    else:
+      mask_scratch = None
+      mask_barriers = (None, None)
 
     pl.run_scoped(
         lambda *args: kernel(*refs, scoped=args),
@@ -404,13 +412,12 @@ def flash_attention_kernel(
         ),
         v_scratch,  # wg1 may still access v as wg0 writes to {o,l,m}_scratch.
         q_barriers,
-        None if no_async_bias else tiled_smem(bias_mask_smem_shape, bias.dtype),
-        None if no_async_mask else tiled_smem(bias_mask_smem_shape, jnp.int8),
+        bias_scratch,
+        mask_scratch,
         kv_barriers,
         kv_barriers,
-        # bias doesn't need a consumed barrier as it is implied by k consumed.
-        None if no_async_bias else kv_barriers[0],
-        (None, None) if no_async_mask else kv_barriers,
+        bias_barrier,
+        mask_barriers,
         schedule_barrier,
         collective_axes="wg",
     )

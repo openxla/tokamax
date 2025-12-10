@@ -62,3 +62,13 @@ def load_bcast(
 def num_bits(dtype: jax.typing.DTypeLike) -> int:
   fn = jnp.finfo if jnp.issubdtype(dtype, jnp.floating) else jnp.iinfo
   return fn(dtype).bits
+
+
+def tile_swizzle_transforms(
+    shape: tuple[int, ...], dtype: jax.typing.DTypeLike, what: str = ""
+) -> tuple[plgpu.TilingTransform, plgpu.SwizzleTransform]:
+  """Returns tiling and swizzling transforms."""
+  elem_bits = num_bits(dtype)
+  swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
+  tiling = (8, 8 * swizzle // elem_bits)
+  return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
