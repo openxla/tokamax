@@ -389,9 +389,9 @@ def _bwd(
   seq_len_k, num_heads_k, head_dim_out = v.shape
 
   m, l = residuals
-  # TODO: check whether this contributes significantly, and use
-  # kernel if it does.
-  delta = jnp.sum((out * dout).astype(jnp.float32), axis=-1).mT
+  delta = jnp.einsum(
+      "qhd,qhd->hq", out, dout, preferred_element_type=jnp.float32
+  )
 
   kernel = functools.partial(
       _bwd_kernel,
