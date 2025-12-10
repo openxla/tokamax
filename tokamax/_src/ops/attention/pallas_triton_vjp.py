@@ -369,7 +369,7 @@ def _bwd(
     is_causal: bool,
     dropout_rate: float,
     weights_v_dot_precision: jax.lax.DotAlgorithmPreset,
-    dbias_intermediate_dtype: jax.typing.DTypeLike | None,
+    ds_dtype: jax.typing.DTypeLike | None,
     config: Config,
 ) -> tuple[
     Float[Array, "T H D"],  # dq
@@ -453,9 +453,7 @@ def _bwd(
     ds_shape_dtype = None
   else:
     ds_shape = (num_heads_q, seq_len_q, seq_len_k)
-    if dbias_intermediate_dtype is None or (ds_shape == bias.shape):
-      dbias_intermediate_dtype = bias.dtype
-    ds_shape_dtype = jax.ShapeDtypeStruct(ds_shape, dbias_intermediate_dtype)
+    ds_shape_dtype = jax.ShapeDtypeStruct(ds_shape, ds_dtype)
   out_shapes = (
       q,
       jax.ShapeDtypeStruct(dk_shape, k.dtype),
@@ -537,6 +535,23 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
       mask = mask.as_array(q_len_or_indices, k_len_or_indices)
 
+    def broadcast_to_rank(x, rank):
+      return None if x is None else jax.lax.broadcast_to_rank(x, rank)
+
+    orig_bias_shape = None if bias is None else bias.shape
+    bias = broadcast_to_rank(bias, q.ndim)
+    mask = broadcast_to_rank(mask, q.ndim)
+    dropout_mask = broadcast_to_rank(dropout_mask, q.ndim)
+
+    if bias is None:
+      ds_dtype = None
+    elif self.dbias_intermediate_dtype is None:
+      ds_dtype = bias.dtype
+    elif bias.shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
+      ds_dtype = bias.dtype
+    else:
+      ds_dtype = self.dbias_intermediate_dtype
+
     q_k_dot_precision, weights_v_dot_precision = precision
     f = functools.partial(
         _bwd,
@@ -548,16 +563,9 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
         logits_soft_cap=logits_soft_cap,
         q_k_dot_precision=q_k_dot_precision,
         weights_v_dot_precision=weights_v_dot_precision,
-        dbias_intermediate_dtype=self.dbias_intermediate_dtype,
+        ds_dtype=ds_dtype,
     )
 
-    def broadcast_to_rank(x, rank):
-      return None if x is None else jax.lax.broadcast_to_rank(x, rank)
-
-    orig_bias_shape = bias.shape if bias is not None else None
-    bias = broadcast_to_rank(bias, q.ndim)
-    mask = broadcast_to_rank(mask, q.ndim)
-    dropout_mask = broadcast_to_rank(dropout_mask, q.ndim)
     args = (q, k, v, bias, mask, dropout_mask, residuals, out, dout)
 
     for _ in q.shape[:-3]:
