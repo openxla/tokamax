@@ -22,6 +22,7 @@ from typing import Any, Final, Sequence, TypeAlias
 from absl import logging
 import immutabledict
 import pydantic
+from tokamax._src import config as config_lib
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.autotuning import autotuner
 
@@ -80,7 +81,9 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
       path = tokamax_files.joinpath(base_dir, device_kind, f"{op_name}.json")
       try:
         json_data = path.read_text()
-      except FileNotFoundError:
+      except FileNotFoundError as e:
+        if config_lib.autotuning_cache_miss_fallback.value == "error":
+          raise FileNotFoundError(f"Autotuning cache file not found: {path}") from e
         logging.info("Autotuning cache file not found: %s", path)
         json_data = "{}"
       # Cache paths later in the list will override earlier ones.
