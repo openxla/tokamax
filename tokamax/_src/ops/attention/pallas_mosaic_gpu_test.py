@@ -157,6 +157,16 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         impl = type(self._attention_fn)(config)
         self._run_test_with_inputs(q, k, v, impl=impl)
 
+  def test_split_k(self):
+    assert hasattr(self._attention_fn, "config_cls")
+    if not hasattr(self._attention_fn.config_cls, "split_k"):
+      self.skipTest("split_k unsupported for this implementation.")
+    op_cls = type(self._attention_fn)
+    cfg_cls = op_cls.config_cls
+    cfg_dict = dict(block_q=128, block_kv=64, split_k=2, collective=False)
+    cfg_dict = {k: v for k, v in cfg_dict.items() if hasattr(cfg_cls, k)}
+    self._run_test((2, 1024, 4, 64), impl=op_cls(config=cfg_cls(**cfg_dict)))
+
 
 # TODO: Add manual partitioning test.
 

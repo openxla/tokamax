@@ -28,6 +28,7 @@ from tokamax._src import batching
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
 from tokamax._src import quantization
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
@@ -189,10 +190,34 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     k_start = _broadcast_to_rank(k_start, q.ndim - 1)
     k_end = _broadcast_to_rank(k_end, q.ndim - 1)
 
+    args = (q, k, v, bias, mask, k_start, k_end)
+
+    if (split_k := config.split_k) > 1:
+      if is_causal or k_start is not None or k_end is not None:
+        raise ValueError(
+            # TODO: Support causality and k_start/k_end with split_k > 1.
+            "split_k > 1 only supported without causality and k_start/k_end."
+        )
+
+      def pad_seq_k(x, axis):
+        if x is None or axis is None or x.shape[axis] == 1:
+          return x
+        block = split_k * config.block_kv
+        return shape_lib.pad_to_next_multiple_of(x, block, axis)
+
+      seq_k_axes = (None, -3, -3, -1, -1, None, None)
+      args = tuple(pad_seq_k(x, ax) for x, ax in zip(args, seq_k_axes))
+      f = functools.partial(f, normalize_output=False, return_residuals=True)
+      f = batching.vmap_split(f, in_axes=seq_k_axes, num_parts=split_k)
+      combine_partial_results = functools.partial(
+          base.combine_partial_results, normalize_output=normalize_output
+      )
+      f = lambda *args, f=f: combine_partial_results(*f(*args))
+
     for _ in q.shape[:-3]:  # Strip of the batch dimensions.
       f = batching.vmap_maybe_bcast(f, 0)
 
-    return f(q, k, v, bias, mask, k_start, k_end)
+    return f(*args)
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments):
