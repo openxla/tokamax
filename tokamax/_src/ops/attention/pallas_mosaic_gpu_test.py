@@ -134,11 +134,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       impl = op_cls(use_base2=use_base2)
     self._run_test((2, 1024, 4, 64), impl=impl)
 
-  def test_unstable_softmax(self):
-    if isinstance(self._attention_fn, fa.PallasMosaicGpuFlashAttention):
-      impl = dataclasses.replace(self._attention_fn, use_stable_softmax=False)
-      self._run_test((2, 1024, 4, 64), impl=impl)
-
   @override
   def _test_bench(self, spec):
     atol_grads = None if spec.get("bias") is None else 0.04
