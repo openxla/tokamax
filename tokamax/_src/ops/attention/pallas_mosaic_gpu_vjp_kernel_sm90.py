@@ -130,7 +130,7 @@ def flash_attention_vjp_kernel(
       dq_gmem,
       ds_gmem,
       smem_buffers,
-      buffer_barriers,
+      barriers,
       block_q: int,
       block_kv: int,
   ):
@@ -151,9 +151,7 @@ def flash_attention_vjp_kernel(
 
     at_wg = lambda x: x.at[wg]
     q_smem, dout_smem, m_smem, l_smem, delta_smem = map(at_wg, smem_buffers)
-    q_barrier, dout_barrier, m_barrier, l_barrier, delta_barrier = map(
-        at_wg, buffer_barriers
-    )
+    barrier = barriers.at[wg]
 
     k_gmem = k_gmem.at[bi, :, hi_kv]
     v_gmem = v_gmem.at[bi, :, hi_kv]
@@ -167,21 +165,11 @@ def flash_attention_vjp_kernel(
       mask_gmem = mask_gmem.at[bi_, hi_]
 
     def compute_thread(pipeline_callback):
-      plgpu.copy_gmem_to_smem(q_gmem.at[bi, qs, hi], q_smem, q_barrier)
-      plgpu.copy_gmem_to_smem(dout_gmem.at[bi, qs, hi], dout_smem, dout_barrier)
-      plgpu.copy_gmem_to_smem(
-          delta_gmem.at[bi, hi, qs], delta_smem, delta_barrier
-      )
-      plgpu.copy_gmem_to_smem(m_gmem.at[bi, hi, qs], m_smem, m_barrier)
-      plgpu.copy_gmem_to_smem(l_gmem.at[bi, hi, qs], l_smem, l_barrier)
-      _ = [plgpu.barrier_wait(buffer.at[wg]) for buffer in buffer_barriers]
-
-      delta = plgpu.load(delta_smem, (), layout=_WGMMA_ROW)
-      m = plgpu.load(m_smem, (), layout=_WGMMA_ROW)
-      l = plgpu.load(l_smem, (), layout=_WGMMA_ROW)
-      if use_base2:
-        m *= math.log2(math.e)
-      acc = plgpu.layout_cast(jnp.zeros_like(q_smem, jnp.float32), _WGMMA)
+      plgpu.copy_gmem_to_smem(q_gmem.at[bi, qs, hi], q_smem, barrier)
+      plgpu.copy_gmem_to_smem(dout_gmem.at[bi, qs, hi], dout_smem, barrier)
+      plgpu.copy_gmem_to_smem(delta_gmem.at[bi, hi, qs], delta_smem, barrier)
+      plgpu.copy_gmem_to_smem(m_gmem.at[bi, hi, qs], m_smem, barrier)
+      plgpu.copy_gmem_to_smem(l_gmem.at[bi, hi, qs], l_smem, barrier)
 
       def load_k_range(ref):
         if ref is None:
@@ -191,6 +179,15 @@ def flash_attention_vjp_kernel(
 
       k_start = load_k_range(k_start_gmem)
       k_end = load_k_range(k_end_gmem)
+      acc = plgpu.layout_cast(jnp.zeros_like(q_smem, jnp.float32), _WGMMA)
+
+      plgpu.barrier_wait(barrier)
+      delta = plgpu.load(delta_smem, (), layout=_WGMMA_ROW)
+      m = plgpu.load(m_smem, (), layout=_WGMMA_ROW)
+      l = plgpu.load(l_smem, (), layout=_WGMMA_ROW)
+      if use_base2:
+        m *= math.log2(math.e)
+
       dq, _, _, _, _, _ = pipeline_callback((acc, m, l, delta, k_start, k_end))
       q_smem[...] = dq.astype(dtype)
       plgpu.commit_smem()
@@ -360,7 +357,7 @@ def flash_attention_vjp_kernel(
       dk_gmem,
       dv_gmem,
       smem_buffers,
-      buffer_barriers,
+      barriers,
       block_q: int,
       block_kv: int,
   ):
@@ -378,7 +375,7 @@ def flash_attention_vjp_kernel(
     ub = num_q_tiles = pl.cdiv(q_seq_len, block_q)
 
     k_smem, v_smem = map(lambda x: x.at[wg], smem_buffers)
-    k_barrier, v_barrier = map(lambda x: x.at[wg], buffer_barriers)
+    barrier = barriers.at[wg]
 
     q_gmem = q_gmem.at[bi, :, hi]
     dout_gmem = dout_gmem.at[bi, :, hi]
@@ -396,12 +393,11 @@ def flash_attention_vjp_kernel(
       mask_gmem = mask_gmem.at[bi_, hi_]
 
     def compute_thread(pipeline_callback):
-      plgpu.copy_gmem_to_smem(k_gmem.at[bi, ks, hi_kv], k_smem, k_barrier)
-      plgpu.copy_gmem_to_smem(v_gmem.at[bi, ks, hi_kv], v_smem, v_barrier)
-      plgpu.barrier_wait(k_barrier)
-      plgpu.barrier_wait(v_barrier)
+      plgpu.copy_gmem_to_smem(k_gmem.at[bi, ks, hi_kv], k_smem, barrier)
+      plgpu.copy_gmem_to_smem(v_gmem.at[bi, ks, hi_kv], v_smem, barrier)
       dk_acc = plgpu.layout_cast(jnp.zeros_like(k_smem, jnp.float32), _WGMMA)
       dv_acc = plgpu.layout_cast(jnp.zeros_like(v_smem, jnp.float32), _WGMMA)
+      plgpu.barrier_wait(barrier)
       dk, dv = pipeline_callback((dk_acc, dv_acc))
       k_smem[...] = dk.astype(k.dtype)
       v_smem[...] = dv.astype(v.dtype)
@@ -611,7 +607,7 @@ def flash_attention_vjp_kernel(
       out_shape=(q, ds_out_shape),
       scratch_shapes=[
           (q_scratch, dout_scratch, m_scratch, l_scratch, delta_scratch),  # type: ignore
-          (plgpu.Barrier(num_barriers=compute_wgs),) * 5,  # type: ignore
+          plgpu.Barrier(num_barriers=compute_wgs, num_arrivals=5),  # type: ignore
       ],
       compiler_params=plgpu.CompilerParams(approx_math=True),
       grid=(batch_size, num_q_heads, pl.cdiv(q_seq_len, tile_q_dq)),
@@ -640,7 +636,7 @@ def flash_attention_vjp_kernel(
       ),
       scratch_shapes=[
           (k_scratch, v_scratch),  # type: ignore
-          (plgpu.Barrier(num_barriers=compute_wgs),) * 2,  # type: ignore
+          plgpu.Barrier(num_barriers=compute_wgs, num_arrivals=2),  # type: ignore
       ],
       compiler_params=plgpu.CompilerParams(approx_math=True),
       grid=(batch_size, num_q_heads, pl.cdiv(kv_seq_len, tile_kv_dkv)),
