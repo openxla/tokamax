@@ -19,6 +19,7 @@ from absl.testing import parameterized
 import chex
 import jax
 from jax import export
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax import autotuning
 from tokamax._src import batching
@@ -292,6 +293,12 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
     if not gpu_utils.has_mosaic_gpu_support():
       self.skipTest(
           'Skip test. Mosaic implementation is not supported on this platform.'
+      )
+    # Blackwell not supported.
+    compute_capability = float(backend.get_default_device().compute_capability)
+    if compute_capability < 9.0 or compute_capability >= 10.0:
+      raise NotImplementedError(
+        "Mosaic GPU backend only supported for sm90 GPUs for now."
       )
 
 
