@@ -64,12 +64,20 @@ def flash_attention_kernel(
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Flash attention with Mosaic GPU."""
 
-  q_seq_len, num_q_heads, _ = q.shape
-  kv_seq_len, num_kv_heads, head_dim_out = v.shape
+  _, num_q_heads, _ = q.shape
+  _, num_kv_heads, _ = v.shape
 
   if num_q_heads % num_kv_heads:
     raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
+
+  # The sequence dimensions must be a multiple of 8.
+  orig_q_seq_len, _, _ = q.shape
+  pad_seq_len = lambda x: shape_lib.pad_to_next_multiple_of(x, 8, 0)
+  q, k, v = map(pad_seq_len, (q, k, v))
+
+  q_seq_len, num_q_heads, _ = q.shape
+  kv_seq_len, _, head_dim_out = v.shape
 
   # The contracting dimension for `wgmma` must be a multiple of the minimum
   # swizzle size (in number of elements).
@@ -350,7 +358,7 @@ def flash_attention_kernel(
         @pl.when(i < (ub - lb))
         def _preload_kv_bias_mask():
           ki = lb + i
-          ks = block.ds(ki, block_kv)
+          ks = block.ds(jnp.asarray(ki, jnp.int32), block_kv)
           si = lax.rem(ki, max_stages)
           cp(k_gmem.at[ks, hi_kv], k_smems, k_barriers, si)
           if bias_gmem_ is not None:
@@ -458,4 +466,8 @@ def flash_attention_kernel(
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(approx_math=True),
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
-  return out, (tuple(residuals) if return_residuals else None)
+  if return_residuals:
+    residuals = tuple(r[:, :orig_q_seq_len] for r in residuals)
+  else:
+    residuals = None
+  return out[:orig_q_seq_len], residuals
