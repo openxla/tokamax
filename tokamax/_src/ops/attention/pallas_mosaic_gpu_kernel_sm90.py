@@ -130,7 +130,7 @@ def flash_attention_kernel(
     ) = scoped
 
     at_wg = lambda x: x.at[wg]
-    q_smem, q_barrier, o_smem = map(at_wg, (q_smems, q_barriers, o_smems))
+    q_smem, q_barrier, o_smem = map(at_wg, (q_smems_ttt, q_barriers, o_smems))
 
     def schedule_barrier_arrive_and_wait():
       plgpu.barrier_arrive(schedule_barrier)
