@@ -224,18 +224,20 @@ def flash_attention_vjp_kernel(
 
       def compute_s(acc_ref):
         plgpu.wgmma(acc_ref, q_smem, k_smem.T)
-        return acc_ref[...]
-
-      s = pl.run_scoped(compute_s, plgpu.ACC((block_q, block_kv), jnp.float32))
-      s *= logits_scale
-
-      if bias_gmem is not None:
-        if bias_smems is None:
+        if bias_gmem is None:
+          bias = None
+        elif bias_smems is None:
           bias = _load_bcast(bias_gmem, (qs, ks), layout=_WGMMA)
         else:
           bias = bias_smems[pl.ds(wg * block_q, block_q)]
           plgpu.barrier_arrive(bias_consumed_barrier)
+        return acc_ref[...], bias
 
+      acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
+      s, bias = pl.run_scoped(compute_s, acc_type)
+      s *= logits_scale
+
+      if bias is not None:
         s += bias
 
       if logits_soft_cap is not None:
@@ -442,27 +444,26 @@ def flash_attention_vjp_kernel(
 
       def compute_sT(acc_ref):
         plgpu.wgmma(acc_ref, k_smem, q_smem.T)
-        return acc_ref[...]
+        if bias_gmem is None:
+          biasT = None
+        elif bias_smems is None:
+          biasT = _load_bcast(bias_gmem, (ks, qs), layout=_WGMMA)
+        else:
+          biasT = bias_smems[pl.ds(wg * block_kv, block_kv)]
+          plgpu.barrier_arrive(bias_consumed_barrier)
+        return acc_ref[...], biasT
 
       m = plgpu.load(m_smem, (), layout=_WGMMA_COL)
       l = plgpu.load(l_smem, (), layout=_WGMMA_COL)
       plgpu.barrier_arrive(m_consumed_barrier)
       plgpu.barrier_arrive(l_consumed_barrier)
 
-      broadcast = lambda x: lax.broadcast_in_dim(x, (block_kv, block_q), [1])
-      sT = pl.run_scoped(
-          compute_sT, plgpu.ACC((block_kv, block_q), jnp.float32)
-      )
+      acc_type = plgpu.ACC((block_kv, block_q), jnp.float32)
+      sT, biasT = pl.run_scoped(compute_sT, acc_type)
       sT *= logits_scale
 
-      if bias_gmem is not None:
-        if bias_smems is None:
-          bias = _load_bcast(bias_gmem, (ks, qs), layout=_WGMMA)
-        else:
-          bias = bias_smems[pl.ds(wg * block_kv, block_kv)]
-          plgpu.barrier_arrive(bias_consumed_barrier)
-
-        sT += bias
+      if biasT is not None:
+        sT += biasT
 
       if logits_soft_cap is not None:
         logits = jnp.tanh(sT / logits_soft_cap)
@@ -505,6 +506,7 @@ def flash_attention_vjp_kernel(
 
         sT = jnp.where(mask, sT, mask_value)
 
+      broadcast = lambda x: lax.broadcast_in_dim(x, sT.shape, [1])
       epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
       pT = exp(sT - broadcast(m)) / broadcast(l + epsilon)
 
