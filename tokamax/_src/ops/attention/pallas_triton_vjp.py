@@ -565,13 +565,9 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
         weights_v_dot_precision=weights_v_dot_precision,
         ds_dtype=ds_dtype,
     )
+    f = base.vmap_batch_dims(f)
 
-    args = (q, k, v, bias, mask, dropout_mask, residuals, out, dout)
-
-    for _ in q.shape[:-3]:
-      f = batching.vmap_maybe_bcast(f, 0)
-
-    dq, dk, dv, ds = f(*args)
+    dq, dk, dv, ds = f(q, k, v, bias, mask, dropout_mask, residuals, out, dout)
     if bias is None:
       dbias = None
     else:

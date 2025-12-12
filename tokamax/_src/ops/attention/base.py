@@ -14,11 +14,12 @@
 # ==============================================================================
 """Base for attention ops."""
 
+from collections.abc import Callable
 import dataclasses
 import functools
 import math
 import types
-from typing import Any, Literal, NotRequired, TypeVar, TypedDict, overload
+from typing import Any, Literal, NotRequired, ParamSpec, TypeVar, TypedDict, cast, overload
 import jax
 from jax import export
 from jax.experimental import shard_map
@@ -27,6 +28,7 @@ from jax.typing import DTypeLike  # pylint: disable=g-importing-member
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
 from tokamax._src import ad
+from tokamax._src import batching
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
@@ -765,6 +767,22 @@ def unfold_q_sequence_heads(
     return out, None
   reshape = shape_lib.einshape("...h(sg)->...(hg)s", s=orig_seq_len_q)
   return out, tuple(map(reshape, residuals))
+
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+def vmap_batch_dims(f: Callable[_P, _T]) -> Callable[_P, _T]:
+  """Returns `f` vmapped over the batch dims of its first argument."""
+
+  def vmap(f, *args: _P.args, **kwargs: _P.kwargs):
+    assert not kwargs
+    for _ in cast(jax.Array, args[0]).shape[:-3]:
+      f = batching.vmap_maybe_bcast(f, 0)
+    return f(*args)
+
+  return functools.wraps(f)(functools.partial(vmap, f))
 
 
 def combine_partial_results(

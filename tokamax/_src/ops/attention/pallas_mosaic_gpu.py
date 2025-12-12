@@ -184,7 +184,6 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         use_stable_softmax=use_stable_softmax,
         config=config,
     )
-
     bias = _broadcast_to_rank(bias, q.ndim)
     mask = _broadcast_to_rank(mask, q.ndim)
     k_start = _broadcast_to_rank(k_start, q.ndim - 1)
@@ -214,10 +213,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       )
       f = lambda *args, f=f: combine_partial_results(*f(*args))
 
-    for _ in q.shape[:-3]:  # Strip of the batch dimensions.
-      f = batching.vmap_maybe_bcast(f, 0)
-
-    return f(*args)
+    return base.vmap_batch_dims(f)(*args)
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments):

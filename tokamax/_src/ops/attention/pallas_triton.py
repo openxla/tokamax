@@ -608,8 +608,6 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
     k_start = _broadcast_to_rank(k_start, q.ndim - 1)
     k_end = _broadcast_to_rank(k_end, q.ndim - 1)
 
-    args = (q, k, v, bias, mask, dropout_mask, q_start, q_end, k_start, k_end)
-
     if (split_k := config.split_k) > 1:
       # TODO: Handle `is_causal`.
       if is_causal:
@@ -624,10 +622,9 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       )
       f = lambda *args, f=f: combine_partial_results(*f(*args))
 
-    for _ in q.shape[:-3]:  # Strip of the batch dimensions.
-      f = batching.vmap_maybe_bcast(f, 0)
-
-    out, residuals = f(*args)
+    out, residuals = base.vmap_batch_dims(f)(
+        q, k, v, bias, mask, dropout_mask, q_start, q_end, k_start, k_end
+    )
     return out.astype(q.dtype), (residuals if return_residuals else None)
 
   @override
