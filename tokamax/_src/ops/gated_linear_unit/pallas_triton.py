@@ -218,30 +218,27 @@ class PallasTritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
         num_stages=4,
     )
 
-  @override
-  def supported_on(self, device: jax.Device) -> bool:
-    return gpu_utils.has_triton_support(device)
-
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     # Simple autotuning search space that can be improved upon.
     x, weights = ba.args  # TODO: Use batched args.
-    m = math.prod(x.shape[:-1])
-    n = weights.shape[2]
-    min_block_dim = 32
-    max_block_m = min(max(min_block_dim, pl.next_power_of_2(m)), 128)
-    max_block_n = min(max(min_block_dim, pl.next_power_of_2(n)), 256)
+    m_pow2 = pl.next_power_of_2(math.prod(x.shape[:-1]))
+    n_pow2 = pl.next_power_of_2(weights.shape[2])
     autotuning_configs = set()
-    for block_m in range(32, max_block_m, 32):
-      for block_n in range(32, max_block_n, 32):
-        for warps in [1, 2, 4, 8]:
-          for stages in range(1, 8):
+    for block_m in (32, *filter(lambda x: x <= m_pow2, (64, 128))):
+      for block_n in (32, *filter(lambda x: x <= n_pow2, (64, 128, 256))):
+        for num_warps in (4, 8):
+          for num_stages in range(1, 6):
             autotuning_configs.add(
                 Config(
                     block_m=block_m,
                     block_n=block_n,
                     block_k=32,
-                    num_warps=warps,
-                    num_stages=stages,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
                 )
             )
     return autotuning_configs
+
+  @override
+  def supported_on(self, device: jax.Device) -> bool:
+    return gpu_utils.has_triton_support(device)
