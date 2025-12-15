@@ -189,7 +189,7 @@ def flash_attention_vjp_kernel(
 
       plgpu.barrier_wait(barrier)
       dq, _, _, _, _, _ = pipeline_callback((acc, m, l, delta, k_start, k_end))
-      q_smem[...] = dq.astype(dtype)
+      q_smem[...] = (dq * logits_scale).astype(dtype)
       plgpu.commit_smem()
       plgpu.copy_smem_to_gmem(q_smem, dq_gmem.at[bi, qs, hi])
 
@@ -299,8 +299,6 @@ def flash_attention_vjp_kernel(
         # TODO: Make this store non-blocking.
         ds_gmem[bi, hi, qs, ks] = ds.astype(ds_gmem.dtype)
 
-      ds *= logits_scale
-
       def compute_dq(acc_ref):
         plgpu.wgmma(acc_ref, ds.astype(k_smem.dtype), k_smem)
 
@@ -403,7 +401,7 @@ def flash_attention_vjp_kernel(
       dv_acc = plgpu.layout_cast(jnp.zeros_like(v_smem, jnp.float32), _WGMMA)
       plgpu.barrier_wait(barrier)
       dk, dv = pipeline_callback((dk_acc, dv_acc))
-      k_smem[...] = dk.astype(k.dtype)
+      k_smem[...] = (dk * logits_scale).astype(k.dtype)
       v_smem[...] = dv.astype(v.dtype)
 
       plgpu.commit_smem()
@@ -529,7 +527,6 @@ def flash_attention_vjp_kernel(
       dsT = pT * (dpT - broadcast(delta))  # pytype: disable=wrong-arg-types  # jax-operator-types
       if logits_soft_cap is not None:
         dsT *= 1 - logits * logits
-      dsT *= logits_scale
 
       def compute_dk(acc_ref):
         plgpu.wgmma(acc_ref, dsT.astype(dtype), q_smem)
