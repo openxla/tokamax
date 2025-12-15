@@ -21,6 +21,7 @@ from typing import ClassVar
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
+from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
@@ -636,16 +637,20 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
     min_block, max_block = 16, 64
     block_q = min(max(pl.next_power_of_2(seq_len_q), min_block), max_block)
     block_k = min(max(pl.next_power_of_2(seq_len_k), min_block), max_block)
+    block_d = None
     num_warps, num_stages = 4, 2
 
-    head_dim_bytes = jnp.dtype(q.dtype).itemsize * head_dim
-    if head_dim_bytes >= 512:
-      num_stages = 1
+    devices = op.infer_devices(ba) or {backend.get_default_device()}
+    is_sm80 = any(map(gpu_utils.is_sm80, devices))
 
-    if _can_have_block_d(q, k, v):
-      block_d = pl.next_power_of_2(min(head_dim, 64**3 // (block_q * block_k)))
-    else:
-      block_d = None
+    if is_sm80:
+      head_dim_bytes = jnp.dtype(q.dtype).itemsize * head_dim
+      if head_dim_bytes >= 512:
+        num_stages = 1
+
+      if _can_have_block_d(q, k, v):
+        block_qk = block_q * block_k
+        block_d = pl.next_power_of_2(min(head_dim, 64**3 // block_qk))
 
     return Config(
         block_q=block_q,
