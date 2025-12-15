@@ -29,6 +29,7 @@ class Config:
   block_q: pydantic.conint(multiple_of=64, gt=0) = 64
   block_kv: pydantic.conint(multiple_of=64, gt=0) = 64
   num_stages: pydantic.conint(gt=1) = 2
+  fold_q_sequence_heads: bool = False
   split_k: pydantic.PositiveInt = 1
 
 

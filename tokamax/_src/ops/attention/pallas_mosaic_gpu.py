@@ -162,6 +162,12 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     k = cast(k, q_k_dot_precision)
     v = cast(v, weights_v_dot_precision)
 
+    orig_seq_len_q = q.shape[-3]
+    if config.fold_q_sequence_heads:
+      q, bias, mask, dropout_mask, q_indices = base.fold_q_sequence_heads(
+          q, bias, mask, dropout_mask, q_indices, k.shape[-3], k.shape[-2]
+      )
+
     mask, is_causal, k_start, k_end = _decompose_mask(
         mask, q, k, q_indices, k_indices
     )
@@ -213,7 +219,10 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       )
       f = lambda *args, f=f: combine_partial_results(*f(*args))
 
-    return base.vmap_batch_dims(f)(*args)
+    out, residuals = base.vmap_batch_dims(f)(*args)
+    if config.fold_q_sequence_heads:
+      return base.unfold_q_sequence_heads(out, residuals, orig_seq_len_q)
+    return out, residuals
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments):
