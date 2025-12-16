@@ -290,15 +290,9 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
 
   def setUp(self):
     super().setUp()
-    if not gpu_utils.has_mosaic_gpu_support():
+    if not gpu_utils.has_mosaic_gpu_support() or gpu_utils.is_sm100():
       self.skipTest(
           'Skip test. Mosaic implementation is not supported on this platform.'
-      )
-    # Blackwell not supported.
-    compute_capability = float(backend.get_default_device().compute_capability)
-    if compute_capability < 9.0 or compute_capability >= 10.0:
-      raise NotImplementedError(
-        "Mosaic GPU backend only supported for sm90 GPUs for now."
       )
 
 
