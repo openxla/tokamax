@@ -32,6 +32,7 @@ from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
+from tokamax._src.ops.attention import pallas_mosaic_gpu_kernel_sm100 as sm100
 from tokamax._src.ops.attention import pallas_mosaic_gpu_kernel_sm90 as sm90
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as vjp
 from typing_extensions import override
@@ -122,10 +123,9 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       raise NotImplementedError("Mosaic GPU not supported on this platform.")
 
     compute_capability = float(backend.get_default_device().compute_capability)
-
-    if compute_capability < 9.0 or compute_capability >= 10.0:
+    if compute_capability < 9.0 or compute_capability >= 11.0:
       raise NotImplementedError(
-          "Mosaic GPU backend only supported for sm90 GPUs for now."
+          "Mosaic GPU backend only supported for sm90 and sm100 GPUs for now."
       )
 
     supported_dtypes = (jnp.float32, jnp.float16, jnp.bfloat16)
@@ -173,13 +173,22 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     )
 
     use_stable_softmax = self.use_stable_softmax
-    if use_stable_softmax is base.AUTO:
-      use_stable_softmax = base.needs_stable_softmax(
-          logits_dtype, logits_soft_cap
-      )
+
+    if compute_capability >= 10.0:
+      kernel_module = sm100
+      out_dtype = q.dtype
+      if use_stable_softmax is base.AUTO:
+        # TODO: Support sm100 with unstable softmax.
+        use_stable_softmax = True
+    else:
+      kernel_module = sm90
+      if use_stable_softmax is base.AUTO:
+        use_stable_softmax = base.needs_stable_softmax(
+            logits_dtype, logits_soft_cap
+        )
 
     f = functools.partial(
-        sm90.flash_attention_kernel,
+        kernel_module.flash_attention_kernel,
         is_causal=is_causal,
         logits_soft_cap=logits_soft_cap,
         logits_scale=logits_scale,
@@ -224,8 +233,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       return base.unfold_q_sequence_heads(out, residuals, orig_seq_len_q)
     return out, residuals
 
-  @override
-  def _get_heuristics_config(self, ba: op.BoundArguments):
+  def _get_heuristics_config_sm90(self, ba: op.BoundArguments) -> Config:
     q, k, v = ba.batched.args
     head_dim = k.shape[-1]
     head_dim_out = v.shape[-1]
@@ -261,8 +269,28 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     # This is a pretty good option that works for most cases.
     return Config(block_q=64, block_kv=64, num_stages=2)
 
+  def _get_heuristics_config_sm100(self, ba: op.BoundArguments) -> Config:
+    q, _, v, *_ = ba.args
+    head_dim = max(q.shape[-1], v.shape[-1])
+    num_tma_splits = 2 if head_dim == 256 else 1
+    collective = True
+    num_stages = max(256 // head_dim, 1) * (1 + int(collective))
+    return Config(
+        block_q=256 if collective else 128,
+        block_kv=128,
+        block_d=128,
+        collective=collective,
+        num_stages=num_stages,
+        num_tma_splits=num_tma_splits,
+    )
+
   @override
-  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    if float(backend.get_default_device().compute_capability) >= 10.0:
+      return self._get_heuristics_config_sm100(ba)
+    return self._get_heuristics_config_sm90(ba)
+
+  def _get_autotuning_configs_sm90(self, ba: op.BoundArguments) -> set[Config]:
     q, k, _ = ba.args
     block_qs = set([
         min(x, pl.next_power_of_2(q.shape[-3] // 2))
@@ -282,6 +310,33 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
               Config(block_q=block_q, block_kv=block_kv, num_stages=num_stages)
           )
     return configs
+
+  def _get_autotuning_configs_sm100(self, ba: op.BoundArguments) -> set[Config]:
+    del ba
+    configs = set()
+    for block_kv in [64, 128]:
+      for num_stages in [1, 2, 3, 4]:
+        for num_tma_splits in [1, 2, 3, 4]:
+          # TODO: Investigate why split_k=2 doesn't work with block_kv=128.
+          for split_k in [1, 2] if block_kv == 64 else [1]:
+            for collective in [False, True] if split_k == 1 else [False]:
+              configs.add(
+                  Config(
+                      block_q=256 if collective else 128,
+                      block_kv=block_kv,
+                      num_stages=num_stages,
+                      num_tma_splits=num_tma_splits,
+                      collective=collective,
+                      split_k=split_k,
+                  )
+              )
+    return configs
+
+  @override
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    if float(backend.get_default_device().compute_capability) >= 10.0:
+      return self._get_autotuning_configs_sm100(ba)
+    return self._get_autotuning_configs_sm90(ba)
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

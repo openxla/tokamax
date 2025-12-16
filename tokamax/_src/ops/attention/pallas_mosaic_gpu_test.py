@@ -18,6 +18,7 @@ import dataclasses
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 import pytest
 from tokamax._src.ops.attention import base
@@ -27,44 +28,69 @@ from tokamax._src.ops.attention import test_base
 from typing_extensions import override
 
 
+class _UNSET:
+
+  def __init__(self, default_value):
+    self.value = default_value
+
+
 @pytest.mark.skip(reason="Too slow for OSS regression tests.")
 class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
+
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    super().setUp()
 
   def __init__(
       self,
       *args,
-      attention_fn=None,
-      supports_decode=False,
-      supports_bias=True,
-      supports_indices=True,
-      supports_vjp=True,
-      supports_mask=True,
-      supports_tanh_clipping=True,
-      supports_is_causal=True,
-      supports_f32_inputs=True,
-      supports_vmap=True,
+      attention_fn=_UNSET(None),
+      supports_decode=_UNSET(False),
+      supports_bias=_UNSET(True),
+      supports_indices=_UNSET(True),
+      supports_vjp=_UNSET(True),
+      supports_mask=_UNSET(True),
+      supports_tanh_clipping=_UNSET(True),
+      supports_is_causal=_UNSET(True),
+      supports_f32_inputs=_UNSET(True),
+      supports_vmap=_UNSET(True),
   ):
-    if attention_fn is None:
+    get_value = lambda x: x.value if isinstance(x, _UNSET) else x
+    dict_get_value = lambda **x: {k: get_value(v) for k, v in x.items()}
+
+    if (
+        hasattr(dev := backend.get_default_device(), "compute_capability")
+        and float(dev.compute_capability) >= 10.0
+    ):
+      supports_bias = False
+      supports_vjp = False
+      supports_f32_inputs = False  # TODO: Investigate Forge OOMs.
+
+    if get_value(attention_fn) is None:
       vjp = fa_vjp.PallasMosaicGpuFlashAttentionVjp(
           dbias_intermediate_dtype=jnp.float32
       )
       attention_fn = fa.PallasMosaicGpuFlashAttention(vjp=vjp)
+
     super().__init__(
         *args,
-        attention_fn=attention_fn,
-        supports_bias=supports_bias,
-        supports_vjp=supports_vjp,
-        supports_mask=supports_mask,
-        supports_tanh_clipping=supports_tanh_clipping,
-        supports_indices=supports_indices,
-        supports_dropout=False,
-        supports_cross_attention=True,
-        supports_precisions=False,
-        supports_vmap=supports_vmap,
-        supports_is_causal=supports_is_causal,
+        **dict_get_value(
+            attention_fn=attention_fn,
+            supports_bias=supports_bias,
+            supports_vjp=supports_vjp,
+            supports_mask=supports_mask,
+            supports_tanh_clipping=supports_tanh_clipping,
+            supports_indices=supports_indices,
+            supports_dropout=False,
+            supports_cross_attention=True,
+            supports_precisions=False,
+            supports_vmap=supports_vmap,
+            supports_is_causal=supports_is_causal,
+        ),
     )
-    self._supports_decode = supports_decode
-    self._supports_f32_inputs = supports_f32_inputs
+    self._supports_decode = get_value(supports_decode)
+    self._supports_f32_inputs = get_value(supports_f32_inputs)
 
   def _run_test_with_inputs(self, q, k, v, *, bias=None, **kwargs):
     # PallasMosaicGpuFlashAttention doesn't support high precisions and
@@ -132,7 +158,10 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       if not use_stable_softmax:
         self.skipTest("use_stable_softmax unsupported for this implementation.")
       impl = op_cls(use_base2=use_base2)
-    self._run_test((2, 1024, 4, 64), impl=impl)
+    sm90 = float(backend.get_default_device().compute_capability) < 10.0
+    self._run_test(
+        (2, 1024, 4, 64), impl=impl, expect_supported=sm90 or use_stable_softmax
+    )
 
   @override
   def _test_bench(self, spec):

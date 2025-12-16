@@ -25,12 +25,30 @@ import pydantic
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  # TODO: Relax constraints to multiple of 32.
+  """Configuration parameters for Pallas-Mosaic-GPU kernels.
+
+  Attributes:
+    block_q: Block size along Q sequence length.
+    block_kv: Block size along KV sequence length.
+    block_d: Block size along head_dim for updating accumulator.
+    num_stages: Number of tma stages for loading KV.
+    fold_q_sequence_heads: Whether to fold seq_q into num_q_heads.
+    split_k: Number of chunks to split seq_len_k into to improve parallelism.
+    num_tma_splits: Number of chunks to load each K/V - helpful to better hide
+      GMEM load latences as we can notify TMA warp after part of the mma, thus
+      giving more time to TMA loads.
+    collective: if True - 2 CTA MMA will be run with M=256, N=128
+  """
+  # TODO: Relax block size constraints to multiple of 32.
   block_q: pydantic.conint(multiple_of=64, gt=0) = 64
   block_kv: pydantic.conint(multiple_of=64, gt=0) = 64
-  num_stages: pydantic.conint(gt=1) = 2
-  fold_q_sequence_heads: bool = False
+  num_stages: pydantic.PositiveInt = 2
+  fold_q_sequence_heads: pydantic.StrictBool = False
   split_k: pydantic.PositiveInt = 1
+  # sm100 specific
+  block_d: pydantic.conint(multiple_of=8, gt=0) = 128
+  num_tma_splits: pydantic.PositiveInt = 2
+  collective: pydantic.StrictBool = True
 
 
 def load_bcast(
