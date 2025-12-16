@@ -22,6 +22,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
@@ -39,6 +40,7 @@ def ragged_dot_kernel_body(
     swizzle: int,
     out_dtype: jnp.dtype,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ):
   """Pallas kernel body for non-quantized ragged dot."""
 
@@ -80,6 +82,8 @@ def ragged_dot_kernel_body(
         in_specs=(lhs_spec, rhs_spec),
         max_concurrent_steps=config.num_stages,
     )(lhs_gmem, rhs_gmem.at[group_info.group_id])
+    if activation is not None:
+      return activation(acc_ref[...])
     return acc_ref[...]
 
   acc = pl.run_scoped(compute_acc, plgpu.ACC((block_m, block_n)))
@@ -122,6 +126,7 @@ def ragged_dot_kernel(
     group_sizes: Integer[Array, "G"],
     out_dtype: jnp.dtype,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "M N"]:
   """Pallas kernel for ragged dot with non-quantized inputs."""
 
@@ -152,6 +157,7 @@ def ragged_dot_kernel(
       swizzle=swizzle,
       config=config,  # This config's block_k must work with swizzle
       out_dtype=out_dtype,
+      activation=activation,
   )
 
   kernel = common.ragged_kernel(
@@ -188,6 +194,7 @@ def ragged_contracting_dim_dot_kernel_body(
     swizzle: int,
     out_dtype: jnp.dtype,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ):
   """Pallas kernel body for non-quantized ragged contracting dim dot."""
   block_m = config.block_m
@@ -235,6 +242,8 @@ def ragged_contracting_dim_dot_kernel_body(
         ],
         max_concurrent_steps=config.num_stages,
     )(lhs_gmem, rhs_gmem)
+    if activation is not None:
+      return activation(acc_ref[...])
     return acc_ref[...]
 
   acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
@@ -260,6 +269,7 @@ def ragged_contracting_dim_dot_kernel(
     group_sizes: Integer[Array, "G"],
     out_dtype: jnp.dtype,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "G M N"]:
   """Pallas kernel for ragged contracting dim dot with non-quantized inputs."""
 
@@ -286,6 +296,7 @@ def ragged_contracting_dim_dot_kernel(
       swizzle=swizzle,
       config=config,
       out_dtype=out_dtype,
+      activation=activation,
   )
   kernel = plgpu.kernel(
       body_fn,

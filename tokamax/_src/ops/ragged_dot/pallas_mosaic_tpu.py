@@ -17,7 +17,7 @@ import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
 import itertools
 import types
-from typing import ClassVar
+from typing import Callable, ClassVar
 
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -184,8 +184,8 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       preferred_element_type: jax.typing.DTypeLike | None,
       return_residuals: bool = False,
       config: Config,
-  ) -> tuple[jax.Array, None]:
-    del return_residuals  # Unused.
+      activation: base.ActivationFunction | None = None,
+  ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
 
@@ -227,6 +227,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           tiling=config.gmm_tiling,
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
+          activation=activation if not return_residuals else None,
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
       # here, handle fast-path special cases that arise in backwards gmm
@@ -253,6 +254,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           transpose_rhs=True,
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
+          activation=activation if not return_residuals else None,
       )
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
       lhs_trans = jax.tree.map(lambda x: x.mT, lhs)
@@ -280,12 +282,18 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           tiling=config.tgmm_tiling or config.gmm_tiling,
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
+          activation=activation if not return_residuals else None,
       )
     else:
       raise NotImplementedError(
           UNSUPPORTED_DIMENSIONS_MSG.format(ragged_dot_dimension_numbers)
       )
-    return out, None
+
+    residuals = out
+    if activation is not None and return_residuals:
+      out = activation(out)
+
+    return out, residuals if return_residuals else None
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:

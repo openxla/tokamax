@@ -15,7 +15,7 @@
 """Ragged dot Pallas-Mosaic-GPU implementation."""
 
 import dataclasses
-import functools
+from functools import partial  # pylint: disable=g-importing-member
 from typing import ClassVar
 
 import jax
@@ -55,8 +55,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   def __post_init__(self):
     if self.vjp is None:
       # Avoid infinite recursion.
-      f = lambda *a, **kw: PallasMosaicGpuRaggedDot()(*a, **kw)  # pylint: disable=unnecessary-lambda
-      vjp = functools.partial(base.vjp, dlhs_ragged_dot=f, drhs_ragged_dot=f)
+      fn = lambda *a, **kw: PallasMosaicGpuRaggedDot()(*a, **kw)  # pylint: disable=unnecessary-lambda
+      vjp = partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)
       object.__setattr__(self, "vjp", vjp)
 
   @override
@@ -71,8 +71,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       preferred_element_type: jnp.dtype | None,
       return_residuals: bool,
       config: Config,
-  ) -> tuple[jax.Array, None]:
-    del return_residuals  # Unused.
+      activation: base.ActivationFunction | None = None,
+  ) -> tuple[jax.Array, base.Residuals]:
+    # TODO: Support returning residuals from mosaic GPU kernel.
 
     if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
       rhs = rhs.mT  # TODO: Fuse transpose into kernel.
@@ -135,7 +136,19 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     if preferred_element_type is None:
       preferred_element_type = jnp.promote_types(lhs.dtype, rhs.dtype)
 
-    return fn(lhs, rhs, group_sizes, preferred_element_type, config), None
+    dot_out = fn(
+        lhs,
+        rhs,
+        group_sizes,
+        preferred_element_type,
+        config,
+        activation=activation if not return_residuals else None,
+    )
+    residuals = dot_out
+    if activation is not None and return_residuals:
+      dot_out = activation(dot_out)
+
+    return dot_out, residuals if return_residuals else None
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:

@@ -69,6 +69,7 @@ def ragged_dot(
     precision: jax.lax.PrecisionLike = None,
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
+    activation: base.ActivationFunction | None = None,
     *,
     implementation: (
         Implementation
@@ -91,6 +92,12 @@ def ragged_dot(
       argument for :func:`jax.lax.dot`.
     group_offset: Optional. (1,) shaped array that indicates the group in
       group_sizes to start computing from. If not specified, defaults to [0].
+    activation: Optional. Activation function to apply to the result. This
+      enables Tokamax to fuse the activation function into the
+      ragged_dot kernel. The activation function is applied in the dtype of the
+      accumulator before being cast to the output dtype. If `return_residuals`
+      is True, the activation function will not be fused into the kernel, and
+      instead applied after the kernel call.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -107,6 +114,7 @@ def ragged_dot(
       precision=precision,
       preferred_element_type=preferred_element_type,
       group_offset=group_offset,
+      activation=activation,
       implementation=implementation,
   )
 
@@ -119,6 +127,7 @@ def ragged_dot_general(
     precision: jax.lax.PrecisionLike = None,
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
+    activation: base.ActivationFunction | None = None,
     *,
     implementation: (
         Implementation
@@ -144,6 +153,8 @@ def ragged_dot_general(
       argument for :func:`jax.lax.dot`.
     group_offset: Optional. (1,) shaped array that indicates the group in
       group_sizes to start computing from. If not specified, defaults to [0].
+    activation: Optional. Activation function to apply to the result. If not
+      specified, no activation function is applied.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -196,6 +207,7 @@ def ragged_dot_general(
           ragged_dot_dimension_numbers=ragged_dot_dimension_numbers,
           precision=precision,
           preferred_element_type=preferred_element_type,
+          activation=activation,
       )
     except NotImplementedError as e:
       if len(implementation) == 1:

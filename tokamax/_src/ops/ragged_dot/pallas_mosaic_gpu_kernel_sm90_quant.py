@@ -13,15 +13,17 @@
 # limitations under the License.
 # ==============================================================================
 """Ragged dot Pallas-Mosaic-GPU Quantized Kernel."""
-import functools
 
-import jax
+import functools
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Float  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Integer  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
 from tokamax._src import jaxtyping
+from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
@@ -35,6 +37,7 @@ def ragged_dot_quantized_kernel_body(
     o_gmem,
     *,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ):
   """Pallas kernel for ragged dot with quantized RHS."""
   del mi
@@ -103,6 +106,8 @@ def ragged_dot_quantized_kernel_body(
         x_gmem,
         w_scales_gmem.at[gi],
     )
+    if activation is not None:
+      return activation(acc_ref[...])
     return acc_ref[...]
 
   acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
@@ -119,6 +124,7 @@ def ragged_dot_quantized_kernel(
     group_sizes: Integer[Array, "G"],
     out_dtype: jnp.dtype,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "M N"]:
   """Returns the Pallas kernel for quantized ragged dot."""
   assert rhs.zero_point is None
@@ -137,7 +143,11 @@ def ragged_dot_quantized_kernel(
         f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
     )
 
-  body = functools.partial(ragged_dot_quantized_kernel_body, config=config)
+  body = functools.partial(
+      ragged_dot_quantized_kernel_body,
+      activation=activation,
+      config=config,
+  )
   kernel = common.ragged_kernel(
       body, g=g, m=m, n=n, out_dtype=out_dtype, config=config
   )

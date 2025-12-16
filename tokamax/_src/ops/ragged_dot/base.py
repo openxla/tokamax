@@ -16,7 +16,6 @@
 
 from collections.abc import Callable, Sequence
 import dataclasses
-import types
 from typing import Any, TypeVar
 
 import jax
@@ -33,12 +32,12 @@ from typing_extensions import override
 
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
-Residuals = types.NoneType
+Residuals = jax.Array | None
 QArray = qwix.QArray
 AsQArray = quantization.AsQArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
 _DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset
-
+ActivationFunction = Callable[[jax.Array], jax.Array] | None
 
 DEFAULT_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
     dot_dimension_numbers=(([1], [1]), ([], [])),
@@ -141,6 +140,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       precision: jax.lax.PrecisionLike = None,
       preferred_element_type: jax.typing.DTypeLike | None = None,
       return_residuals: bool = False,
+      activation: ActivationFunction | None = None,
   ) -> op.BoundArguments:
     if ragged_dot_dimension_numbers is None:
       # TODO: Support batch dims on LHS and/or RHS?
@@ -172,6 +172,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         precision=precision_lib.canonicalize_precision(precision),
         preferred_element_type=preferred_element_type,
         return_residuals=return_residuals,
+        activation=activation,
     )
 
   @override
@@ -186,6 +187,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       preferred_element_type: jnp.dtype | None,
       return_residuals: bool,
       config: _Config,
+      activation: ActivationFunction | None = None,
   ) -> tuple[jax.Array, Residuals]:
     del config  # Unused.
 
@@ -204,7 +206,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       is_integer = jnp.issubdtype(out_dtype, jnp.integer)
       acc_dtype = jnp.int32 if is_integer else jnp.float32
       preferred_element_type = jnp.promote_types(out_dtype, acc_dtype)
-    out = jax.lax.ragged_dot_general(
+    dot_out = jax.lax.ragged_dot_general(
         lhs,
         rhs,
         group_sizes=group_sizes,
@@ -212,7 +214,12 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         precision=precision,
         preferred_element_type=preferred_element_type,
     ).astype(out_dtype)
-    return out, None
+
+    residuals = dot_out
+    if activation is not None:
+      dot_out = activation(dot_out)
+
+    return dot_out, residuals if return_residuals else None
 
 
 def vjp(
@@ -226,12 +233,16 @@ def vjp(
     ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
     precision: CanonicalPrecision,
     preferred_element_type: jnp.dtype | None,
+    activation: ActivationFunction | None = None,
     dlhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
 ) -> tuple[jax.Array, jax.Array]:
   """Ragged dot VJP."""
   del out, preferred_element_type  # Unused.
-  assert residuals is None
+
+  if activation is not None:
+    _, activation_grad_fn = jax.vjp(activation, residuals)
+    (dout,) = activation_grad_fn(dout)
 
   dot_dim_nums = ragged_dot_dimension_numbers.dot_dimension_numbers
   lhs_ragged = ragged_dot_dimension_numbers.lhs_ragged_dimensions

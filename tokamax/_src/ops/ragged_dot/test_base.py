@@ -47,13 +47,18 @@ def _dot_fn_f32(dot_fn):
 _jax_ragged_dot_f32 = _dot_fn_f32(jax.lax.ragged_dot)
 
 
-def ref(lhs, rhs, group_sizes):
+def ref(lhs, rhs, group_sizes, activation=None):
   """Reference implementation of ragged dot."""
   lhs, rhs = map(quantization.as_array, (lhs, rhs))
+
   if lhs.dtype != rhs.dtype:
     input_dtype = jnp.result_type(lhs.dtype, rhs.dtype)
     lhs, rhs = lhs.astype(input_dtype), rhs.astype(input_dtype)
-  return _jax_ragged_dot_f32(lhs, rhs, group_sizes=jnp.asarray(group_sizes))
+
+  result = _jax_ragged_dot_f32(lhs, rhs, group_sizes=jnp.asarray(group_sizes))
+  if activation is not None:
+    result = activation(result)
+  return result
 
 
 def override_chex_args(**kwargs):
@@ -65,6 +70,13 @@ def override_chex_args(**kwargs):
 NAMED_ARG_SPECS = {
     s.full_name: s.args for s in ARG_SPECS if "primary" in s.tags
 }
+
+
+# TODO: `jax.nn.relu` is annotated with `custom_jvp_call`
+# which isn't compatible with `_estimate_resources` in the mosaic lowering.
+# It would be nice in the future to support this, if possible.
+def relu(x):
+  return jnp.maximum(x, 0)
 
 
 # pylint: disable=missing-function-docstring
@@ -127,11 +139,28 @@ class RaggedDotTestBase(parameterized.TestCase):
       a_tile_shape=(None, (1, 128), (1, 16), (256, 1), (16, 1)),
       b_tile_shape=((1, 1, 16), (1, 1, 128), (1, 256, 1), (1, 16, 1)),
       use_as_qarray=(True, False),
+      activation=(None, relu),
   )
-  def test_quantized(self, dtype, a_tile_shape, b_tile_shape, use_as_qarray):
-    self._test_quantized(dtype, a_tile_shape, b_tile_shape, use_as_qarray)
+  def test_quantized(
+      self,
+      dtype,
+      a_tile_shape,
+      b_tile_shape,
+      use_as_qarray,
+      activation,
+  ):
+    self._test_quantized(
+        dtype, a_tile_shape, b_tile_shape, use_as_qarray, activation
+    )
 
-  def _test_quantized(self, dtype, a_tile_shape, b_tile_shape, use_as_qarray):
+  def _test_quantized(
+      self,
+      dtype,
+      a_tile_shape,
+      b_tile_shape,
+      use_as_qarray,
+      activation,
+  ):
     dtype = jnp.dtype(dtype)
     num_groups, m, k, n = 8, 512, 256, 512
     a, b, group_sizes = self._create_inputs(
@@ -148,9 +177,11 @@ class RaggedDotTestBase(parameterized.TestCase):
       a = quantize(a, a_tile_shape)
     b = quantize(b, b_tile_shape)
 
-    expected = ref(a, b, group_sizes)
+    expected = ref(a, b, group_sizes, activation)
     # TODO: preferred_element_type to f32 and tighten tolerances.
-    actual = self._dot_fn(a, b, group_sizes=group_sizes)
+    actual = self._dot_fn(
+        a, b, group_sizes=group_sizes, activation=activation
+    )
     count = sum(group_sizes)
     chex.assert_trees_all_close(
         actual[:count], expected[:count], atol=0.01, rtol=0.005
@@ -168,17 +199,26 @@ class RaggedDotTestBase(parameterized.TestCase):
     tol = dict(atol=0.01, rtol=0.005) if actual.dtype == jnp.bfloat16 else {}
     chex.assert_trees_all_close(actual, expected, **tol)
 
-  @parameterized.parameters((8, 1024, 128, 256), (8, 128, 64, 128))
-  def test_vjp(self, num_groups, m, k, n):
+  @parameterized.product(
+      num_groups=(8,),
+      m=(1024, 128),
+      k=(128, 64),
+      n=(256, 128),
+      activation=(None, relu),
+  )
+  def test_vjp(self, num_groups, m, k, n, activation=None):
     a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
     a_ref = a.astype(jnp.float32)
     b_ref = b.astype(jnp.float32)
     f = functools.partial(
         self._dot_fn_f32,
         group_sizes=group_sizes,
+        activation=activation,
         precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
     )
-    f_ref = functools.partial(ref, group_sizes=group_sizes)
+    f_ref = functools.partial(
+        ref, group_sizes=group_sizes, activation=activation
+    )
     chex.assert_trees_all_close(f(a, b), f_ref(a_ref, b_ref), atol=1e-5)
 
     actual, f_vjp = jax.vjp(f, a, b)

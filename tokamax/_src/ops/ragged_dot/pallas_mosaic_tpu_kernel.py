@@ -29,6 +29,8 @@ import qwix
 from tokamax._src import mosaic_tpu as common
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
+from tokamax._src.ops.ragged_dot import base
+
 
 CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
@@ -310,6 +312,7 @@ _TilingFn = Callable[[int, int, int], tuple[int, int, int] | None]
         "lhs_static_scale",
         "rhs_qdtype",
         "rhs_static_scale",
+        "activation",
     ],
 )
 def gmm(
@@ -328,6 +331,7 @@ def gmm(
     lhs_static_scale: float | None = None,
     rhs_qdtype: jnp.dtype | None = None,
     rhs_static_scale: float | None = None,
+    activation: base.ActivationFunction | None = None,
 ) -> jax.Array:
   """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
@@ -350,6 +354,8 @@ def gmm(
     rhs_qdtype: Quant dtype to quantize rhs to if rhs is not already quantized.
     rhs_static_scale: Compile-time scale when quantizing rhs instead of
       computing it from rhs values.
+    activation: Activation function to apply to the output of the dot
+      operation.
 
   Returns:
     A 2d, jax.Array with shape [m, n].
@@ -491,6 +497,8 @@ def gmm(
                 grid_id=grid_id, group_metadata=group_metadata, tm=tm, tn=tn
             )
             acc = acc_scratch[...]
+            if activation is not None:
+              acc = activation(acc)
             acc = jax.lax.select(mask, acc, out_ref[...].astype(acc.dtype))
             out_ref[...] = acc.astype(out_dtype)
 
@@ -603,6 +611,7 @@ def gmm(
         "lhs_static_scale",
         "rhs_qdtype",
         "rhs_static_scale",
+        "activation",
     ],
 )
 def tgmm(
@@ -621,6 +630,7 @@ def tgmm(
     lhs_static_scale: float | None = None,
     rhs_qdtype: jnp.dtype | None = None,
     rhs_static_scale: float | None = None,
+    activation: base.ActivationFunction | None = None,
 ) -> jax.Array:
   """Compute lhs[:, sizes[i-1]:sizes[i]] @ rhs[sizes[i-1]:sizes[i], :].
 
@@ -644,6 +654,8 @@ def tgmm(
     rhs_qdtype: Quant dtype to quantize rhs to if rhs is not already quantized.
     rhs_static_scale: Compile-time scale when quantizing rhs instead of
       computing it from rhs values.
+    activation: Activation function to apply to the output of the dot
+      operation.
 
   Returns:
     A  3d, jax.Array with shape [num_groups, k, n].
@@ -768,7 +780,10 @@ def tgmm(
 
     @pl.when(is_end_of_grid | (group != next_group))
     def _store_accum():
-      out_ref[...] = acc_scratch[...].astype(out_dtype)
+      acc = acc_scratch[...]
+      if activation is not None:
+        acc = activation(acc)
+      out_ref[...] = acc.astype(out_dtype)
 
   def lhs_index_map(n_i, k_i, grid_id, group_metadata, group_offset):
     del n_i, group_offset  # Unused.

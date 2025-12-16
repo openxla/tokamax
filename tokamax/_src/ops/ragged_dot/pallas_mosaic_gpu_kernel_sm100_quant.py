@@ -15,17 +15,21 @@
 """Ragged dot Pallas-Mosaic-GPU Quantized Kernel (Blackwell)."""
 
 import functools
+
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Float  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Integer  # pylint: disable=g-multiple-import,g-importing-member
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import memref
 import qwix
 from tokamax._src import jaxtyping
+from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
@@ -59,8 +63,9 @@ def ragged_dot_gpu_quant_blackwell_kernel(
     lhs: Float[Array, "M K"],
     rhs: Float[qwix.QArray, "G K N"],
     group_sizes: Integer[Array, "G"],
-    out_dtype,
+    out_dtype: jnp.dtype,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "M N"]:
   """Pallas kernel for ragged dot with GPU quantization."""
   assert rhs.zero_point is None
@@ -289,6 +294,11 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           plgpu.barrier_wait(mma_done_barrier)
           acc = plgpu.async_load_tmem(acc_tmem)
           plgpu.wait_load_tmem()
+          # Apply activation function to the output in dtype of output if
+          # provided.
+          acc = (
+              activation(acc) if activation is not None else acc
+          )
           out_smem.T[...] = plgpu.layout_cast(
               acc.astype(out_smem.dtype), plgpu.Layout.TCGEN05_TRANSPOSED
           )

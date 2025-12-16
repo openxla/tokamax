@@ -34,11 +34,19 @@ def _get_input_data(num_experts, m, k, n, dtype=jnp.bfloat16):
   group_sizes = jnp.array([m // num_experts] * num_experts, jnp.uint32)
   return (lhs, rhs, group_sizes)
 
+# TODO: `jax.nn.relu` is annotated with `custom_jvp_call`
+# which isn't compatible with `_estimate_resources` in the mosaic lowering.
+# It would be nice in the future to support this, if possible.
+def relu(x):
+  return jnp.maximum(x, 0)
 
 class RaggedDotTest(parameterized.TestCase):
 
-  @parameterized.parameters(*(None, "xla", "mosaic", "triton"))
-  def test_basic_api(self, implementation):
+  @parameterized.product(
+      implementation=[None, "xla", "mosaic", "triton"],
+      activation=[None, relu],
+  )
+  def test_basic_api(self, implementation, activation):
 
     if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
@@ -75,6 +83,7 @@ class RaggedDotTest(parameterized.TestCase):
           rhs,
           group_sizes,
           implementation=implementation,
+          activation=activation,
       )
       return jnp.sum(out)
 
@@ -82,6 +91,8 @@ class RaggedDotTest(parameterized.TestCase):
     @functools.partial(jax.value_and_grad, argnums=(0, 1))
     def f_gt(lhs, rhs):
       out = jax.lax.ragged_dot(lhs, rhs, group_sizes)
+      if activation is not None:
+        out = activation(out)
       return jnp.sum(out)
 
     (out, (lhs_grad, rhs_grad)) = f(lhs, rhs)

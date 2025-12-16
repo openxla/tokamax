@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Ragged dot Pallas-Mosaic-GPU Non-Quantized Kernel."""
+
 import functools
 
 import jax
@@ -20,9 +21,12 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Float  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Integer  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
 from tokamax._src import jaxtyping
+from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
@@ -37,6 +41,7 @@ def body(
     schedule_barrier,
     *,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ):
   """The main kernel function for ragged dot-product."""
   del mi
@@ -77,14 +82,18 @@ def body(
         lambda acc_ref: cb(acc_ref)[...], plgpu.ACC((block_n, block_m))
     )
 
-    def store_acc(o_smem):
+    def store_acc(acc, o_smem):
       assert block_n % 8 == 0
+      if activation is not None:
+        acc = activation(acc)
       common.store_acc_transposed(
           acc, o_gmem, 2 * ni + wg, m, group_info, o_smem.at[wg]
       )
 
     o_smem_type = plgpu.SMEM((2, block_m, block_n), o_gmem.dtype)
-    pl.run_scoped(store_acc, o_smem_type, collective_axes=("wg",))
+    pl.run_scoped(
+        functools.partial(store_acc, acc), o_smem_type, collective_axes=("wg",)
+    )
 
   try:
     swizzle_w_transform = plgpu.SwizzleTransform(swizzle_w)
@@ -136,8 +145,9 @@ def ragged_dot_quantized_ws_kernel(
     lhs: Float[Array, "M K"],
     rhs: Float[qwix.QArray, "G K N"],
     group_sizes: Integer[Array, "G"],
-    out_dtype,
+    out_dtype: jnp.dtype,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "M N"]:
   """Returns the Pallas kernel for quantized ragged dot."""
   assert rhs.zero_point is None
@@ -158,7 +168,9 @@ def ragged_dot_quantized_ws_kernel(
 
   def kernel_entry(*args):
     return pl.run_scoped(
-        functools.partial(body, *args, config=config),
+        functools.partial(
+            body, *args, activation=activation, config=config
+        ),
         plgpu.Barrier(num_arrivals=2),
         collective_axes="wg",
     )

@@ -100,9 +100,13 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       super().test_vjp0()  # pytype: disable=attribute-error
 
   @override
-  def _test_quantized(self, dtype, a_tile_shape, b_tile_shape, use_as_qarray):
+  def _test_quantized(
+      self, dtype, a_tile_shape, b_tile_shape, activation, use_as_qarray
+  ):
     with test_base.override_chex_args(atol=0.4, rtol=0.1):
-      super()._test_quantized(dtype, a_tile_shape, b_tile_shape, use_as_qarray)
+      super()._test_quantized(
+          dtype, a_tile_shape, b_tile_shape, activation, use_as_qarray
+      )
 
   @override
   def _test_bench(self, spec):

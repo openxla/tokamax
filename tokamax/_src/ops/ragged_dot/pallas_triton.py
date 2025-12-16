@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import math
-from typing import ClassVar
+from typing import Callable, ClassVar
 
 import jax
 from jax import numpy as jnp
@@ -62,6 +62,7 @@ def _ragged_dot_kernel(
     block_m,
     block_k,
     precision,
+    activation,
 ):
   """Pallas-Triton ragged dot kernel."""
   lo = lo_ref.load()
@@ -134,6 +135,8 @@ def _ragged_dot_kernel(
 
     acc = jax.lax.fori_loop(0, pl.cdiv(a_ref.shape[1], block_k), body, acc)
     mask = (start_m + jnp.arange(block_m)) < hi
+    if activation is not None:
+      acc = activation(acc)
     out_ref.at[span_m].store(acc.astype(out_ref.dtype), mask=mask[:, None])
 
 
@@ -147,13 +150,16 @@ def _ragged_dot(
     out_dtype: jnp.dtype,
     split_k_intermediate_dtype: jax.typing.DTypeLike | None,
     config: Config,
+    activation: base.ActivationFunction | None = None,
 ) -> jax.Array:
   """Pallas-Triton ragged dot."""
   assert ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
   if config.split_k != 1:
     if split_k_intermediate_dtype is None:
-      split_k_out_dtype = out_dtype
+      # if not provided, promote intermediate dtype to avoid precision loss
+      # when reducing.
+      split_k_out_dtype = jnp.result_type(out_dtype, jnp.float32)
     else:
       split_k_out_dtype = jnp.dtype(split_k_intermediate_dtype)
 
@@ -206,6 +212,7 @@ def _ragged_dot(
       block_m=block_m,
       block_k=block_k,
       precision=precision,
+      activation=activation,
   )
 
   return block.pallas_call(
@@ -237,6 +244,7 @@ def _ragged_contracting_dim_dot_kernel(
     block_m,
     block_k,
     precision,
+    activation,
 ):
   """Pallas-Triton ragged dot kernel for ragged contracting dimension."""
   lo = lo_ref.load()
@@ -261,6 +269,8 @@ def _ragged_contracting_dim_dot_kernel(
   acc = jnp.zeros((block_m, out_ref.shape[1]), dtype=jnp.float32)
   acc = jax.lax.fori_loop(0, num_iters - 1, body, acc)
   acc = body(num_iters - 1, acc, mask_k=True)  # Mask final iteration.
+  if activation is not None:
+    acc = activation(acc)
   out_ref.store(acc.astype(out_ref.dtype))
 
 
@@ -273,6 +283,7 @@ def _ragged_contracting_dim_dot(
     precision: base.CanonicalPrecision,
     out_dtype: jnp.dtype,
     config: Config,
+    activation: base.ActivationFunction | None = None,
 ) -> jax.Array:
   """Pallas-Triton ragged dot for ragged contracting dimension."""
   assert ragged_dot_dimension_numbers == base.RAGGED_CONTRACTING_DOT_DIM_NUMS
@@ -298,6 +309,7 @@ def _ragged_contracting_dim_dot(
         block_m=block_m,
         block_k=block_k,
         precision=precision,
+        activation=activation,
     )
 
     return block.pallas_call(
@@ -347,9 +359,8 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       preferred_element_type: jnp.dtype | None,
       return_residuals: bool,
       config: Config,
-  ) -> tuple[jax.Array, None]:
-    del return_residuals  # Unused.
-
+      activation: Callable[[jax.Array], jax.Array] | None = None,
+  ) -> tuple[jax.Array, base.Residuals]:
     lhs, rhs = map(quantization.as_array_or_qarray, (lhs, rhs))
 
     if preferred_element_type is None:
@@ -361,6 +372,24 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       rhs = rhs.mT  # TODO: Fuse transpose into kernel.
       ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
+    def handle_residuals(
+        dot_out: jax.Array,
+    ) -> tuple[jax.Array, base.Residuals]:
+      """Handles the residuals for the ragged dot operation.
+
+      Args:
+        dot_out: The result of the dot product.
+
+      Returns:
+        A tuple containing the (potentially activated) output and the residuals
+        if `return_residuals` is True, otherwise None.
+      """
+      residuals = dot_out
+      if activation is not None and return_residuals:
+        dot_out = activation(dot_out)
+
+      return dot_out, residuals if return_residuals else None
+
     if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
       out = _ragged_dot(
           lhs,
@@ -371,8 +400,9 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
           out_dtype=out_dtype,
           split_k_intermediate_dtype=self.split_k_intermediate_dtype,
           config=config,
+          activation=activation if not return_residuals else None,
       )
-      return out, None
+      return handle_residuals(out)
 
     if ragged_dot_dimension_numbers == base.RAGGED_CONTRACTING_DOT_DIM_NUMS:
       out = _ragged_contracting_dim_dot(
@@ -383,8 +413,9 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
           precision=precision,
           out_dtype=out_dtype,
           config=config,
+          activation=activation if not return_residuals else None,
       )
-      return out, None
+      return handle_residuals(out)
 
     raise NotImplementedError("Unsupported `ragged_dot_dimension_numbers`.")
 

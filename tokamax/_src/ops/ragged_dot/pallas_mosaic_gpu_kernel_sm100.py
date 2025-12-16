@@ -22,6 +22,7 @@ from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 _COMPUTE_WG = 0
@@ -35,8 +36,9 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
     lhs: Float[Array, "M K"],
     rhs: Float[Array, "G K N"],
     group_sizes: Integer[Array, "G"],
-    out_dtype,
+    out_dtype: jnp.dtype,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "M N"]:
   """Pallas kernel for ragged dot with GPU quantization."""
   block_m = config.block_m
@@ -198,6 +200,8 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
             acc_smem_t = plgpu.transpose_ref(acc_smem, (1, 0))
             acc = plgpu.async_load_tmem(acc_tmem.at[:, slice_acc_m])
             plgpu.wait_load_tmem()
+            if activation is not None:
+              acc = activation(acc)
             acc = acc.astype(acc_smem_t.dtype)
             acc_smem_t[...] = plgpu.layout_cast(
                 acc, plgpu.Layout.TCGEN05_TRANSPOSED

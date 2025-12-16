@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Ragged dot Pallas-Mosaic-GPU Quantized Kernel."""
+
 import functools
 
 import jax
@@ -21,10 +22,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Float  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Integer  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
 from tokamax._src import jaxtyping
+from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
+
 
 COMPUTE_WGS = 2
 STORE_WG = COMPUTE_WGS
@@ -38,6 +43,7 @@ def ragged_dot_quantized_ws_async_store_kernel(
     group_sizes: Integer[Array, "G"],
     out_dtype: jnp.dtype,
     config: common.Config,
+    activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "M N"]:
   """Returns the Pallas kernel for quantized ragged dot.
 
@@ -57,6 +63,8 @@ def ragged_dot_quantized_ws_async_store_kernel(
     group_sizes: The group sizes of the ragged dot. shape: (g)
     out_dtype: The output dtype of the ragged dot.
     config: The configuration of the ragged dot.
+    activation: Optional activation function to apply to the output of the
+      ragged dot.
 
   Returns:
     The output of the ragged dot. shape: (m, n)
@@ -249,7 +257,11 @@ def ragged_dot_quantized_ws_async_store_kernel(
             acc = plgpu.layout_cast(
                 acc.astype(out_gmem.dtype), plgpu.Layout.WGMMA_TRANSPOSED
             )
-            wg_o_smem.T[...] = acc
+            # Apply activation function to the output in dtype of output
+            # if provided.
+            wg_o_smem.T[...] = (
+                activation(acc) if activation is not None else acc
+            )
             plgpu.commit_smem()
             plgpu.barrier_arrive(store_smem_done_barrier)
 
