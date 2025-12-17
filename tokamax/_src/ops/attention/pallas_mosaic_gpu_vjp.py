@@ -38,6 +38,10 @@ PagingInfo = base.PagingInfo
 Residuals = base.Residuals
 
 
+def _broadcast_to_rank(x, rank):
+  return None if x is None else jax.lax.broadcast_to_rank(x, rank)
+
+
 def _decompose_mask(mask, q, k, q_indices, k_indices):
   """Decomposes `mask` into a mask array, `is_causal`, `k_start` and `k_end`."""
   if mask is None:
@@ -159,23 +163,40 @@ class PallasMosaicGpuFlashAttentionVjp(
     v = cast(v, weights_v_dot_precision)
     dout = cast(dout, weights_v_dot_precision)
 
+    orig_bias_shape = None if bias is None else bias.shape
+    bias = _broadcast_to_rank(bias, q.ndim)
+    mask = _broadcast_to_rank(mask, q.ndim)
+    k_start = _broadcast_to_rank(k_start, q.ndim - 1)
+    k_end = _broadcast_to_rank(k_end, q.ndim - 1)
+
+    if bias is None:
+      ds_dtype = None
+    elif self.dbias_intermediate_dtype is None:
+      ds_dtype = bias.dtype
+    elif bias.shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
+      ds_dtype = bias.dtype
+    else:
+      ds_dtype = self.dbias_intermediate_dtype
+
     f = functools.partial(
         sm90.flash_attention_vjp_kernel,
-        bias=bias,
-        mask=mask,
-        k_start=k_start,
-        k_end=k_end,
         logits_scale=logits_scale,
         logits_soft_cap=logits_soft_cap,
         is_causal=is_causal,
         use_base2=self.use_base2,
-        dbias_intermediate_dtype=self.dbias_intermediate_dtype,
+        ds_dtype=ds_dtype,
         config=config,
     )
 
-    args = (q, k, v, residuals, out, dout)
-
-    dq, dk, dv, dbias = f(*args)
+    dq, dk, dv, ds = base.vmap_batch_dims(f)(
+        q, k, v, residuals, out, dout, bias, mask, k_start, k_end
+    )
+    if bias is None:
+      dbias = None
+    else:
+      broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
+      dbias = jnp.sum(ds, axis=broadcast_bias_axes)
+      dbias = dbias.astype(bias.dtype).reshape(orig_bias_shape)
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
   @override
