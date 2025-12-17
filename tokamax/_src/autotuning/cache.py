@@ -17,7 +17,7 @@
 from importlib import resources
 import re
 from typing import Annotated
-from typing import Any, Final, TypeAlias
+from typing import Any, Final, Sequence, TypeAlias
 
 from absl import logging
 import immutabledict
@@ -64,7 +64,9 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
     self[device_kind] = (cache := self._load_cache(device_kind))
     return cache
 
-  def _load_cache(self, device_kind: DeviceKind) -> DeviceAutotuningCache:
+  def _load_cache(
+      self, device_kind: DeviceKind, cache_path: Sequence[str] = _CACHE_PATHS
+  ) -> DeviceAutotuningCache:
     """Loads autotuning cache from corresponding JSON files."""
 
     device_kind = device_kind.lower().replace(" ", "_")
@@ -73,7 +75,8 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
 
     tokamax_files = resources.files("tokamax")
     out = {}
-    for base_dir in _CACHE_PATHS:
+
+    for base_dir in cache_path:
       path = tokamax_files.joinpath(base_dir, device_kind, f"{op_name}.json")
       try:
         json_data = path.read_text()
