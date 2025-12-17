@@ -302,9 +302,8 @@ class AttentionTestBase(parameterized.TestCase):
         atol=3e-6 if has_bias else 1e-6,
     )
 
-  _PRODUCT_PARAMS = list(itertools.product((24, 128), (64, 112)))
   @pytest.mark.long
-  @pytest.mark.parametrize("input_dim,output_dim", _PRODUCT_PARAMS)
+  @parameterized.product(input_dim=(24, 128), output_dim=(64, 112))
   def test_different_output_head_dim(self, input_dim, output_dim):
     rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
     q = jax.random.normal(rng0, (2, 1024, 4, input_dim))
@@ -349,17 +348,6 @@ class AttentionTestBase(parameterized.TestCase):
     self._run_test((2, 1024, 4, 48))
 
   @pytest.mark.long
-  @pytest.mark.parametrize(
-      "bias_shape",
-      [
-          ((2, 4, 1024, 1024),),
-          ((2, 4, 1024, 1),),
-          ((2, 4, 1, 1024),),
-          ((2, 1, 1024, 1024),),
-          ((1, 4, 1024, 1024),),
-          ((4, 1024, 1024),),
-      ],
-  )
   @parameterized.parameters(
       ((2, 4, 1024, 1024),),
       ((2, 4, 1024, 1),),
@@ -377,18 +365,16 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   @pytest.mark.long
-  @pytest.mark.parametrize(
-      "mask_shape",
-      [
-          ((2, 4, 1024, 1024),),
-          ((2, 4, 1024, 1),),
-          ((2, 4, 1, 1024),),
-          ((2, 1, 1024, 1024),),
-          ((1, 4, 1024, 1024),),
-          ((2, 1, 1024, 1),),
-          ((1, 4, 1024, 1),),
-          ((2, 1, 1, 1024),),
-      ],
+  @parameterized.parameters(
+      ((2, 4, 1024, 1024),),
+      ((2, 4, 1024, 1),),
+      ((2, 4, 1, 1024),),
+      ((2, 1, 1024, 1024),),
+      ((1, 4, 1024, 1024),),
+      ((2, 1, 1024, 1),),
+      ((1, 4, 1024, 1),),
+      ((2, 1, 1, 1024),),
+      ((1, 4, 1, 1024),),
   )
   def test_mask(self, mask_shape):
     self._test_mask(mask_shape)
@@ -409,7 +395,7 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   @pytest.mark.long
-  @pytest.mark.parametrize("seq_len_k", [512, 539])
+  @parameterized.parameters(512, 539)
   def test_causal_mask_cross_attention(self, seq_len_k):
     mask = jnp.tri(1024, seq_len_k, dtype=bool)
     self._run_test(
