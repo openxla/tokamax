@@ -25,6 +25,12 @@ import numpy as np
 from tokamax._src import batching
 
 
+def _bsd(shape, dtype, vmap_axes):
+  shape = list(shape)
+  vmap_axes = tuple(None if a is None else (a, shape.pop(a)) for a in vmap_axes)
+  return batching.BatchedShapeDtype(tuple(shape), dtype, vmap_axes)
+
+
 class BatchingTest(parameterized.TestCase):
 
   @parameterized.parameters(
@@ -90,11 +96,10 @@ class BatchingTest(parameterized.TestCase):
 
     a0_axes, a1_axes = zip(*in_axes)
     expected_batched_args = (
-        batching.BatchedShapeDtype(a0.shape, a0.dtype, a0_axes),
-        batching.BatchedShapeDtype(a1.shape, a1.dtype, a1_axes),
+        _bsd(a0.shape, a0.dtype, a0_axes), _bsd(a1_shape, a1.dtype, a1_axes)
     )
     expected_batched_kwargs = dict(
-        kw=batching.BatchedShapeDtype(kw.shape, kw.dtype, (0,) * num_vmaps)
+        kw=_bsd(kw.shape, kw.dtype, (0,) * num_vmaps)
     )
     self.assertEqual(seen_batched_args[-1], expected_batched_args)
     self.assertEqual(seen_batched_kwargs[-1], expected_batched_kwargs)
@@ -112,7 +117,7 @@ class BatchingTest(parameterized.TestCase):
     x = jax.ShapeDtypeStruct((3, 4), jnp.float32)
     x_batched = batching.BatchedShapeDtype((3, 4), jnp.float32, vmap_axes=())
     x_batched_vmap = batching.BatchedShapeDtype(
-        (3, 4), jnp.float32, vmap_axes=(0,)
+        (4,), jnp.float32, vmap_axes=((0, 3),)
     )
 
     self.assertEqual(x_batched, x_batched)

@@ -14,7 +14,7 @@
 # ==============================================================================
 """Batching (a.k.a. `vmap`) utilities."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import dataclasses
 import functools
 import inspect
@@ -105,29 +105,33 @@ class BatchedShapeDtype(jax.ShapeDtypeStruct):
 
   __slots__ = ('vmap_axes',)
 
-  vmap_axes: tuple[int | None, ...]
+  # `(axis, axis_size)` pairs (or `None` when the value is broadcast).
+  vmap_axes: tuple[tuple[int, int] | None, ...]
 
-  def __init__(self, shape, dtype, vmap_axes: tuple[int | None, ...]):
+  def __init__(self, shape, dtype, vmap_axes: Sequence[tuple[int, int] | None]):
     super().__init__(shape, dtype)
-    self.vmap_axes = vmap_axes
+    self.vmap_axes = tuple(vmap_axes)
+
+  @property
+  def vmap_shape(self) -> tuple[int, ...]:
+    """Returns the shape of the array with the `vmap` axes added."""
+    shape = list(self.shape)
+    for axis_size in reversed(self.vmap_axes):
+      if axis_size is not None:
+        shape.insert(*axis_size)
+    return tuple(shape)
 
   @property
   def vmap_axis_sizes(self) -> tuple[int | None, ...]:
-    """Returns the vmap axis sizes of the given array."""
-    shape = list(self.shape)
-    return tuple(None if a is None else shape.pop(a) for a in self.vmap_axes)
-
-  @property
-  def inner_shape(self) -> tuple[int, ...]:
-    """Returns the shape of the array inside of the `vmap`ped context."""
-    shape = list(self.shape)
-    for axis in self.vmap_axes:
-      if axis is not None:
-        shape.pop(axis)
-    return tuple(shape)
+    return tuple(
+        None if axis_size is None else axis_size[1]
+        for axis_size in self.vmap_axes
+    )
 
   def __repr__(self):
     return f'{super().__repr__()[:-1]}, vmap_axes={self.vmap_axes})'
+
+  __str__ = __repr__
 
   def __eq__(self, other):
     if not isinstance(other, jax.ShapeDtypeStruct):
@@ -137,7 +141,8 @@ class BatchedShapeDtype(jax.ShapeDtypeStruct):
     return super().__eq__(other) and not self.vmap_axes
 
   def __hash__(self):
-    return hash((super().__hash__(), self.vmap_axes))
+    sds_hash = super().__hash__()
+    return hash((sds_hash, self.vmap_axes)) if self.vmap_axes else sds_hash
 
 
 def _unique_not_none_value(*args):
@@ -202,10 +207,10 @@ def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
       in_axes = [0 if b else None for b in in_batched]
       new_shapes = []
       for arg, axis, shape in _zip(args, in_axes, shapes):
-        exp_shape = (() if axis is None else (axis_size,)) + shape.shape
-        assert (arg.shape, arg.dtype) == (exp_shape, shape.dtype)
-        new_vmap_axes = (axis, *shape.vmap_axes)
-        new_shape = BatchedShapeDtype(arg.shape, arg.dtype, new_vmap_axes)
+        new_vmap_axis = None if axis is None else (axis, axis_size)
+        new_vmap_axes = (new_vmap_axis, *shape.vmap_axes)
+        new_shape = BatchedShapeDtype(shape.shape, shape.dtype, new_vmap_axes)
+        assert (arg.shape, arg.dtype) == (new_shape.vmap_shape, new_shape.dtype)
         new_shapes.append(new_shape)
 
       new_batched_args = Batched(fn_flat_sig.bind(*new_shapes))

@@ -15,8 +15,8 @@
 """Base class for ops."""
 
 import abc
+import collections
 from collections.abc import Callable, Mapping
-import copy
 import dataclasses
 import functools
 import inspect
@@ -370,7 +370,7 @@ class BoundArguments(Generic[_Config, _Key]):
 
   @property
   def _bound_args(self) -> inspect.BoundArguments:
-    arguments = jax.tree.map(_as_unbatched, dict(self.arguments))
+    arguments = collections.OrderedDict(self.arguments)
     return inspect.BoundArguments(self.signature, arguments)
 
   @property
@@ -618,10 +618,4 @@ def _as_batched(x):
   if hasattr(x, "shape") and hasattr(x, "dtype"):
     if not isinstance(x, batching.BatchedShapeDtype):
       return batching.BatchedShapeDtype(x.shape, x.dtype, ())
-  return x
-
-
-def _as_unbatched(x):
-  if isinstance(x, batching.BatchedShapeDtype):
-    return jax.ShapeDtypeStruct(x.inner_shape, x.dtype)
   return x

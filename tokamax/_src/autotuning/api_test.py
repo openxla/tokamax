@@ -72,17 +72,21 @@ def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
   scale = jax.ShapeDtypeStruct((d,), jnp.bfloat16)
   offset = jax.ShapeDtypeStruct((d,), jnp.bfloat16)
   weights = jax.ShapeDtypeStruct((d, 2, d), jnp.bfloat16)
+  args = (x, scale, offset, weights)
 
   if vmap:
     ax = (0, None, None, None)
     f = jax.vmap(f, in_axes=ax)
-    as_batched = lambda x, a: batching.BatchedShapeDtype(x.shape, x.dtype, (a,))
-    x, scale, offset, weights = map(as_batched, (x, scale, offset, weights), ax)
+    def as_batched(x, a):
+      shape = list(x.shape)
+      vmap_axis = None if a is None else (a, shape.pop(a))
+      return batching.BatchedShapeDtype(shape, x.dtype, (vmap_axis,))
+    x, scale, offset, weights = map(as_batched, args, ax)
   expected_bound_args = (
       norm.bind(x, scale, offset, epsilon=eps),  # pytype: disable=wrong-arg-types
       glu.bind(x, weights, activation=act),  # pytype: disable=wrong-arg-types
   )
-  return f, (x, scale, offset, weights), expected_bound_args
+  return f, args, expected_bound_args
 
 
 class AutotuningTest(parameterized.TestCase):

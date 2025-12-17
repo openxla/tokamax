@@ -37,7 +37,7 @@ class NumericsTest(parameterized.TestCase):
   def test_initializer_consistency(self):
     kwargs = {
         'u': 'test',
-        'x': batching.BatchedShapeDtype((3, 4), jnp.float32, vmap_axes=(0,)),
+        'x': batching.BatchedShapeDtype((4,), jnp.float32, vmap_axes=((0, 3),)),
         'y': 3.4,
         'z': jax.ShapeDtypeStruct((4,), jnp.bool_),
     }
@@ -160,9 +160,8 @@ class NumericsTest(parameterized.TestCase):
     self.assertEqual(jnp.max(x), 6)
 
   def test_seed(self):
-    shape = (16, 16)
-    a = batching.BatchedShapeDtype(shape, jnp.int4, vmap_axes=(0,))
-    b = jax.ShapeDtypeStruct(shape, jnp.int4)
+    a = batching.BatchedShapeDtype((16,), jnp.int4, vmap_axes=((0, 16),))
+    b = jax.ShapeDtypeStruct((16, 16), jnp.int4)
 
     a_random = numerics.random_initialize(a)
     b_random = numerics.random_initialize(b)

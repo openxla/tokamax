@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import qwix
+from tokamax._src import batching
 
 
 PyTree: TypeAlias = Any
@@ -167,6 +168,12 @@ def _int_initializer(rng, shape, dtype, minval=None, maxval=None):
   return rng.integers(minval, maxval, shape).astype(dtype)
 
 
+def _as_vmap_shape(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+  if isinstance(x, batching.BatchedShapeDtype):
+    return jax.ShapeDtypeStruct(x.vmap_shape, x.dtype)
+  return x
+
+
 def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
   """Randomly initialize all abstract arrays in a PyTree.
 
@@ -192,6 +199,7 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
       abstract_scale = isinstance(x.scale, jax.ShapeDtypeStruct)
 
       if abstract_qvalue and abstract_scale:
+        x = qwix.QArray(_as_vmap_shape(x.qvalue), _as_vmap_shape(x.scale))  # pytype: disable=wrong-arg-types
         dtype = jnp.promote_types(x.dtype, jnp.float32)
         values = rng.standard_normal(size=x.shape, dtype=dtype).astype(x.dtype)
         tiled_axes = {i: d for i, d in enumerate(x.scale_tile_shape)}
@@ -205,6 +213,7 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     if not isinstance(x, jax.ShapeDtypeStruct):
       return x
 
+    x = _as_vmap_shape(x)
     dtype = jnp.dtype(x.dtype)
 
     if 'float' in dtype.name:

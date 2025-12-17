@@ -35,6 +35,12 @@ from tokamax._src.ops.normalization import arg_specs as norm_arg_specs
 from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
 
 
+def _bsd(shape, dtype, vmap_axes):
+  shape = list(shape)
+  vmap_axes = tuple(None if a is None else (a, shape.pop(a)) for a in vmap_axes)
+  return batching.BatchedShapeDtype(tuple(shape), dtype, vmap_axes)
+
+
 def _eval_shape(spec):
   if not callable(spec):
     return spec
@@ -155,21 +161,21 @@ class BoundArgumentsTest(parameterized.TestCase):
   )
   def test_autotune_vmap(self, x_vmap_axes, y_vmap_axes):
     config = _FakeOpConfig(4)
-    x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=x_vmap_axes)
-    y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=y_vmap_axes)
+    x = _bsd((1, 3, 2), jnp.int8, vmap_axes=x_vmap_axes)
+    y = _bsd((1, 2), jnp.int8, vmap_axes=y_vmap_axes)
     results = _FakeOp().bind(x, y).autotune({config})
     self.assertIs(results.fastest_config, config)
 
   def test_equals(self):
-    x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=(0, 1))
-    y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=(0, 1))
-    y2 = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=(1, 0))
+    x = _bsd((1, 3, 2), jnp.int8, vmap_axes=(0, 1))
+    y = _bsd((1, 2, 3), jnp.int8, vmap_axes=(0, 1))
+    y2 = _bsd((1, 2, 3), jnp.int8, vmap_axes=(1, 0))
     self.assertEqual(_FakeOp().bind(x, y), _FakeOp().bind(x, y))
     self.assertNotEqual(_FakeOp().bind(x, y), _FakeOp().bind(x, y2))
 
   def test_hash(self):
-    x = batching.BatchedShapeDtype((1, 3, 2), jnp.int8, vmap_axes=(0, 1))
-    y = batching.BatchedShapeDtype((1, 2), jnp.int8, vmap_axes=(0, 1))
+    x = _bsd((1, 3, 2), jnp.int8, vmap_axes=(0, 1))
+    y = _bsd((1, 2, 3), jnp.int8, vmap_axes=(0, 1))
     self.assertEqual(hash(_FakeOp().bind(x, y)), hash(_FakeOp().bind(x, y)))
 
   @parameterized.named_parameters(

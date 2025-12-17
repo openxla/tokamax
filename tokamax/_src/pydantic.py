@@ -238,7 +238,8 @@ class ShapeDtype:
     del handler  # Unused.
     assert source in (jax.Array, jax.ShapeDtypeStruct)
     tuple_schema = lambda s: cs.tuple_schema([s], variadic_item_index=0)
-    vmap_axes_schema = tuple_schema(cs.nullable_schema(cs.int_schema()))
+    int_pair_schema = cs.tuple_schema([cs.int_schema(), cs.int_schema()])
+    vmap_axes_schema = tuple_schema(cs.nullable_schema(int_pair_schema))
     vmap_axes_serializer = pydantic_core.SchemaSerializer(vmap_axes_schema)
 
     def serialize(x, info) -> Any:

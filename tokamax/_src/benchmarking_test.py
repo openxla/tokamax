@@ -123,10 +123,12 @@ class BenchmarkingTest(parameterized.TestCase):
     def f_orig(x, y):
       return x + jnp.sin(y[0]) * y[1] ** 2
 
-    x = batching.BatchedShapeDtype((2, 3, 4), jnp.float32, vmap_axes=(0, 0))
+    x = batching.BatchedShapeDtype(
+        (4,), jnp.float32, vmap_axes=((0, 2), (0, 3))
+    )
     y = (
-        batching.BatchedShapeDtype((4, 2), jnp.float32, vmap_axes=(1, None)),
-        batching.BatchedShapeDtype((3, 4), jnp.float32, vmap_axes=(None, 0)),
+        batching.BatchedShapeDtype((4,), jnp.float32, vmap_axes=((1, 2), None)),
+        batching.BatchedShapeDtype((4,), jnp.float32, vmap_axes=(None, (0, 3))),
     )
     f, args = benchmarking.standardize_function(f_orig, x, y, seed=seed)
 

@@ -274,7 +274,10 @@ def standardize_function(
 
     batched = batching.Batched(arrays)
     if batched.vmap_axis_sizes:
-      array_vmap_axes = (x.vmap_axes for x in arrays)
+      array_vmap_axes = (
+          (None if axis is None else axis[0] for axis in x.vmap_axes)
+          for x in arrays
+      )
       for in_axes in reversed(list(zip(*array_vmap_axes, strict=True))):
         forward = jax.vmap(forward, in_axes=(list(in_axes),))
 
@@ -284,7 +287,7 @@ def standardize_function(
     # `BatchedShapeDtype` is converted to `jax.ShapeDtypeStruct`s.
     def convert_batched(x):
       if isinstance(x, batching.BatchedShapeDtype):
-        return jax.ShapeDtypeStruct(x.shape, x.dtype)
+        return jax.ShapeDtypeStruct(x.vmap_shape, x.dtype)
       return x
 
     arrays = [convert_batched(x) for x in arrays]

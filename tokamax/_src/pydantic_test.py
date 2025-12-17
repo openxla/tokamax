@@ -124,7 +124,7 @@ class PydanticTest(parameterized.TestCase):
   @parameterized.parameters(
       (jax.ShapeDtypeStruct((1, 2), jnp.float32)),
       (jax.ShapeDtypeStruct((3, 4), jnp.int4),),
-      (batching.BatchedShapeDtype((5, 6, 7), jnp.int8, vmap_axes=(0, 1)),),
+      (batching.BatchedShapeDtype((6,), jnp.int8, vmap_axes=((0, 5), (1, 7))),),
       (batching.BatchedShapeDtype((8, 9), jnp.int8, vmap_axes=(None,)),),
       (batching.BatchedShapeDtype((10, 11), jnp.int8, vmap_axes=()),),
   )
