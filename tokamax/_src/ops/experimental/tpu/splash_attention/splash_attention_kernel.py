@@ -488,6 +488,7 @@ def flash_attention_kernel(
     # Outputs
     o_ref,
     logsumexp_ref,
+    l_linear_ref,
     max_logits_ref,
     # Scratch
     m_scratch_ref,
@@ -662,6 +663,7 @@ def flash_attention_kernel(
   @pl.when(should_write)
   def end():
     l = l_scratch_ref[...]
+    m = m_scratch_ref[...]
     if fuse_reciprocal:  # allows fusing reciprocal out of the kernel
       l_inv = pltpu.repeat(1.0 / l, head_dim_v_repeats, axis=1)
       l_inv = l_inv[..., : o_scratch_ref.shape[-1]]
@@ -671,11 +673,14 @@ def flash_attention_kernel(
     if logsumexp_ref is not None:
       assert logsumexp_ref.shape == (bq, NUM_LANES)
       log = jnp.log2 if config.use_base2_exp else jnp.log
-      logsumexp = m_scratch_ref[...] + log(l)
+      logsumexp = m + log(l)
       logsumexp_ref[...] = logsumexp.astype(logsumexp_ref.dtype)
+    if l_linear_ref is not None:
+      assert l_linear_ref.shape == (bq, NUM_LANES)
+      l_linear_ref[...] = l.astype(l_linear_ref.dtype)
     if max_logits_ref is not None:
       assert max_logits_ref.shape == (bq, NUM_LANES)
-      max_logits_ref[...] = m_scratch_ref[...].astype(max_logits_ref.dtype)
+      max_logits_ref[...] = m.astype(max_logits_ref.dtype)
 
 
 def _div(dividend: int, divisor: int):
@@ -900,22 +905,32 @@ def _splash_attention_forward(
       pl.BlockSpec((None, bq, head_dim_v), out_index_map),
   ]
   if save_residuals:
+    logsumexp_index_map = unravel(lambda h, i, j, *_: (h, i, 0))
+
     out_shapes += [
         # logsumexp
-        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32),
+        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
+        if fuse_reciprocal
+        else None,
+        # l_linear
+        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
+        if not fuse_reciprocal
+        else None,
         # max_logits
         jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32),
     ]
-
-    logsumexp_and_max_logits_index_map = unravel(lambda h, i, j, *_: (h, i, 0))
-
     out_specs += [
-        pl.BlockSpec((None, bq, NUM_LANES), logsumexp_and_max_logits_index_map),
-        pl.BlockSpec((None, bq, NUM_LANES), logsumexp_and_max_logits_index_map),
+        pl.BlockSpec((None, bq, NUM_LANES), logsumexp_index_map)
+        if fuse_reciprocal
+        else None,
+        pl.BlockSpec((None, bq, NUM_LANES), logsumexp_index_map)
+        if not fuse_reciprocal
+        else None,
+        pl.BlockSpec((None, bq, NUM_LANES), logsumexp_index_map),
     ]
   else:
-    out_shapes += [None, None]
-    out_specs += [None, None]
+    out_shapes += [None, None, None]
+    out_specs += [None, None, None]
 
   kernel_name = get_kernel_name(
       is_mqa=is_mqa,
@@ -1045,15 +1060,26 @@ def _splash_attention_forward(
         q_sequence,
         max_logit_value,
     )
-  out, logsumexp, max_logits = all_out
-  if not fuse_reciprocal:
-    exp = jnp.exp2 if config.use_base2_exp else jnp.exp
-    l = exp(logsumexp[..., 0] - max_logits[..., 0])
-    out = (out / l[..., None]).astype(out.dtype)
+  out, logsumexp, l_linear, max_logits = all_out
 
   if save_residuals:
-    assert logsumexp is not None and max_logits is not None
-    logsumexp, max_logits = logsumexp[..., 0], max_logits[..., 0]
+    assert max_logits is not None
+    max_logits = max_logits[..., 0]
+
+    if fuse_reciprocal:
+      assert logsumexp is not None
+      logsumexp = logsumexp[..., 0]
+    else:
+      assert l_linear is not None
+      log = jnp.log2 if config.use_base2_exp else jnp.log
+
+      l = l_linear[..., 0]
+      logsumexp = max_logits + log(l)
+      out = (out / l[..., None]).astype(out.dtype)
+  else:
+    # If we're not saving residuals, then we can't fuse the reciprocal
+    # out of the kernel.
+    assert fuse_reciprocal
 
   if config.residual_checkpoint_name is not None:
     out = ad_checkpoint.checkpoint_name(
@@ -2111,7 +2137,6 @@ def _make_splash_attention(
       mask_function=mask_function_fwd,
       fwd_mask_sparsity=fwd_mask_sparsity,
   )
-
 
 
 def _make_dynamic_splash_attention(
