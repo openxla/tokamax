@@ -239,7 +239,7 @@ def custom_buffered_pallas_call(
       )(*input_output_refs)
 
     bs_smem = pl.BlockSpec(memory_space=pltpu.SMEM)
-    bs_hbm = pl.BlockSpec(memory_space=pltpu.ANY)
+    bs_hbm = pl.BlockSpec(memory_space=pl.ANY)
 
     smem_specs = (jax.tree.map(lambda _: bs_smem, grid_dynamic),)
     smem_specs += jax.tree.map(lambda _: bs_smem, smem_args)
