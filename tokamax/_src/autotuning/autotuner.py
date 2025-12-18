@@ -78,7 +78,7 @@ def _compile(fn_factory, config, args, kwargs, *, seed=None):
 
 def _benchmark(fn_factory, config, args, kwargs):
   runner, x = _compile(fn_factory, config, args, kwargs, seed=0)
-  return runner(x)
+  return runner(x, method='wallclock')
 
 
 class _SyncExecutor(futures.Executor):
@@ -135,7 +135,8 @@ class Autotuner:
               compiled_fn, args = future.result()
               if initialized_args is None:
                 initialized_args = numerics.random_initialize(args)
-              executor_args[config] = (compiled_fn, initialized_args)
+              wrapped_fn = lambda x: compiled_fn(x, method='wallclock')
+              executor_args[config] = (wrapped_fn, initialized_args)
             except Exception:  # pylint: disable=broad-exception-caught
               logging.vlog(2, "Config failed to compile: %s", config)
         except TimeoutError:
