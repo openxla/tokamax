@@ -68,9 +68,9 @@ def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
 class Config:
   """Pallas Mosaic TPU Ragged Dot config."""
 
-  gmm_tiling: TilingTuple = (128, 128, 128)
-  gmm_rhs_transpose_tiling: TilingTuple | None = None
-  tgmm_tiling: TilingTuple | None = None
+  tile_m: pydantic.PositiveInt = 128
+  tile_k: pydantic.PositiveInt = 128
+  tile_n: pydantic.PositiveInt = 128
   input_buffer_count: InputBufferCount = 2
 
 
@@ -174,7 +174,6 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     if self.vjp is None:
       # Avoid infinite recursion.
       fn = lambda *args, **kw: PallasMosaicTpuRaggedDot(  # pylint: disable=unnecessary-lambda
-          config=self.config,
           qdtype=qdtype,
           interpret=self.interpret,
       )(
@@ -225,7 +224,6 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
               lhs.dtype, rhs.dtype
           )
       )
-
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
       # STRATEGY 1: full-channel quantization along the reduction dimension
       lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
@@ -236,7 +234,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           group_sizes=group_sizes,
           precision=precision,
           out_dtype=preferred_element_type,
-          tiling=config.gmm_tiling,
+          tiling=(config.tile_m, config.tile_k, config.tile_n),
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
@@ -262,7 +260,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           group_sizes=group_sizes,
           precision=precision,
           out_dtype=preferred_element_type,
-          tiling=config.gmm_rhs_transpose_tiling or config.gmm_tiling,
+          tiling=(config.tile_m, config.tile_k, config.tile_n),
           transpose_rhs=True,
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
@@ -291,7 +289,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           group_sizes=group_sizes,
           precision=precision,
           out_dtype=preferred_element_type,
-          tiling=config.tgmm_tiling or config.gmm_tiling,
+          tiling=(config.tile_m, config.tile_k, config.tile_n),
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
@@ -322,9 +320,14 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       (m, k), (g, _, n) = lhs.shape, rhs.shape
       lut_key = (m, k, n, g, is_quantized)
       if lut_key in GMM_TILING_TUNED_LUT:
-        gmm_tiling, input_buffer_count = GMM_TILING_TUNED_LUT[lut_key]
+        (tile_m, tile_k, tile_n), input_buffer_count = GMM_TILING_TUNED_LUT[
+            lut_key
+        ]
         return Config(
-            gmm_tiling=gmm_tiling, input_buffer_count=input_buffer_count
+            input_buffer_count=input_buffer_count,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
         )
       return default_config
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:
@@ -332,12 +335,14 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       (m, n), (g, k, _) = grad.shape, rhs.shape  # lhs is out
       lut_key = (m, k, n, g, is_quantized)
       if lut_key in GMM_RHS_TRANSPOSE_TILING_TUNED_LUT:
-        gmm_rhs_transpose_tiling, input_buffer_count = (
+        (tile_m, tile_k, tile_n), input_buffer_count = (
             GMM_RHS_TRANSPOSE_TILING_TUNED_LUT[lut_key]
         )
         return Config(
-            gmm_rhs_transpose_tiling=gmm_rhs_transpose_tiling,
             input_buffer_count=input_buffer_count,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
         )
       return default_config
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:
@@ -348,9 +353,14 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       (m, k), (_, n), g = lhs.shape, grad.shape, group_sizes.shape[0]
       lut_key = (m, k, n, g, is_quantized)
       if lut_key in TGMM_TILING_TUNED_LUT:
-        tgmm_tiling, input_buffer_count = TGMM_TILING_TUNED_LUT[lut_key]
+        (tile_m, tile_k, tile_n), input_buffer_count = TGMM_TILING_TUNED_LUT[
+            lut_key
+        ]
         return Config(
-            tgmm_tiling=tgmm_tiling, input_buffer_count=input_buffer_count
+            input_buffer_count=input_buffer_count,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
         )
       return default_config
     else:
@@ -397,7 +407,11 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         + [n]  # full tile
     )
     return set(
-        Config(gmm_tiling=(tile_m, tile_k, tile_n))
+        Config(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        )
         for tile_m, tile_k, tile_n in itertools.product(
             tile_m_range, tile_k_range, tile_n_range
         )

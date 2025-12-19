@@ -51,11 +51,7 @@ def _is_config_supported(
     config: pallas_mosaic_tpu.Config,
 ) -> bool:
   (m, k), (_, _, n) = lhs.shape, rhs.shape
-  if (
-      m < config.gmm_tiling[0]
-      or k < config.gmm_tiling[1]
-      or n < config.gmm_tiling[2]
-  ):
+  if m < config.tile_m or k < config.tile_k or n < config.tile_n:
     return False
 
   lhs_ = jax.eval_shape(quantization.as_array_or_qarray, lhs)
@@ -135,7 +131,12 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
             },
         )
     )
-    self.assertEqual(maxtext_config.gmm_tiling, (256, 7168, 512))
+    tiling_tuple = (
+        maxtext_config.tile_m,
+        maxtext_config.tile_k,
+        maxtext_config.tile_n,
+    )
+    self.assertEqual(tiling_tuple, (256, 7168, 512))
 
   def test_autotuning_configs(self):
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
