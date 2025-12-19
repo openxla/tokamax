@@ -145,29 +145,18 @@ class BatchedShapeDtype(jax.ShapeDtypeStruct):
     return hash((sds_hash, self.vmap_axes)) if self.vmap_axes else sds_hash
 
 
+def get_vmap_axis_sizes(values) -> tuple[int, ...]:
+  values_flat = jax.tree.leaves(values)
+  arrays = tuple(a for a in values_flat if isinstance(a, BatchedShapeDtype))
+  if not arrays:
+    return ()
+  array_axis_sizes = (a.vmap_axis_sizes for a in arrays)
+  return tuple(map(_unique_not_none_value, *array_axis_sizes))
+
+
 def _unique_not_none_value(*args):
   (value,) = {arg for arg in args if arg is not None}
   return value
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class Batched(Generic[_T]):
-  """Wrapper for `vmap` axes on some values."""
-
-  values: _T
-
-  @property
-  def vmap_axis_sizes(self) -> tuple[int, ...]:
-    values = self.values
-    if isinstance(values, inspect.BoundArguments):
-      values = values.arguments
-    values_flat = jax.tree.leaves(values)
-    arrays = (a for a in values_flat if isinstance(a, BatchedShapeDtype))
-    array_axis_sizes = (a.vmap_axis_sizes for a in arrays)
-    return tuple(map(_unique_not_none_value, *array_axis_sizes))
-
-  def __getattr__(self, name: str) -> Any:
-    return getattr(self.values, name)
 
 
 def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -195,13 +184,12 @@ def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
       shapes = [s for s, a in _zip(bargs_flat, args_flat) if is_array(a)]
 
     fn_flat_sig = inspect.Signature.from_callable(lambda *arrays: None)
-    batched_args = Batched(fn_flat_sig.bind(*shapes))
+    batched_args = fn_flat_sig.bind(*shapes)
 
     def fn_flat(*arrays, batched_args=batched_args):
       args, kwargs = args_tree.unflatten(merge(arrays, other))
       bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
-      batched_args = Batched(bind(*bargs, **bkwargs))
-      return fn(*args, batched_args=batched_args, **kwargs)
+      return fn(*args, batched_args=bind(*bargs, **bkwargs), **kwargs)
 
     def vmap_rule(axis_size, in_batched, *args):
       in_axes = [0 if b else None for b in in_batched]
@@ -213,14 +201,12 @@ def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
         assert (arg.shape, arg.dtype) == (new_shape.vmap_shape, new_shape.dtype)
         new_shapes.append(new_shape)
 
-      new_batched_args = Batched(fn_flat_sig.bind(*new_shapes))
-
       @capture_batched_args
       def vmap_fn_flat(*arrays, batched_args):
         fn_flat_closed = functools.partial(fn_flat, batched_args=batched_args)
         return jax.vmap(fn_flat_closed, in_axes=in_axes)(*arrays)
 
-      out = vmap_fn_flat(*args, batched_args=new_batched_args)
+      out = vmap_fn_flat(*args, batched_args=fn_flat_sig.bind(*new_shapes))
       return out, jax.tree.map(lambda _: True, out)
 
     fn_vmap = jax.custom_batching.custom_vmap(fn_flat)

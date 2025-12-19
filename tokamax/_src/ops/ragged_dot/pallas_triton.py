@@ -435,7 +435,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
     lhs, rhs = ba.args
     m, k = lhs.shape
     n = rhs.shape[-1]
-    batch_size = math.prod(ba.batched.vmap_axis_sizes)
+    batch_size = math.prod(ba.vmap_axis_sizes)
     # This is unnecessary high to ensure good load balancing.
     min_num_blocks = 4 * jax.local_devices()[0].core_count
     clamp = lambda lo, x, hi: max(lo, min(x, hi))

@@ -188,7 +188,7 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     return pallas_triton_config.get_heuristics_config(
-        *ba.args, vmap_axis_sizes=ba.batched.vmap_axis_sizes, **ba.kwargs
+        *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
     )
 
   @override

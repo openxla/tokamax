@@ -272,8 +272,7 @@ def standardize_function(
     if not all(map(is_batched, arrays)):
       raise ValueError('Cannot mix batched and non-batched arguments.')
 
-    batched = batching.Batched(arrays)
-    if batched.vmap_axis_sizes:
+    if batching.get_vmap_axis_sizes(arrays):
       array_vmap_axes = (
           (None if axis is None else axis[0] for axis in x.vmap_axes)
           for x in arrays

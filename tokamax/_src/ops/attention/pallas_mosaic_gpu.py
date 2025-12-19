@@ -226,13 +226,13 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments):
-    q, k, v = ba.batched.args
+    q, k, v = ba.args
     head_dim = k.shape[-1]
     head_dim_out = v.shape[-1]
 
-    mask = ba.batched.kwargs["mask"]
-    q_indices = ba.batched.kwargs["q_indices"]
-    k_indices = ba.batched.kwargs["k_indices"]
+    mask = ba.kwargs["mask"]
+    q_indices = ba.kwargs["q_indices"]
+    k_indices = ba.kwargs["k_indices"]
     mask, *_ = jax.eval_shape(_decompose_mask, mask, q, k, q_indices, k_indices)
     # 32-bit floats are downcast to 16-bit before the kernel call.
     dtype_bits = jnp.finfo(jnp.bfloat16).bits

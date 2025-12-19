@@ -47,7 +47,8 @@ class BatchingTest(parameterized.TestCase):
 
     @batching.capture_batched_args
     def f(a0: jax.Array, a1: jax.Array, *, kw: jax.Array, batched_args):
-      ret = a0 * a1 * kw * math.prod(batched_args.vmap_axis_sizes)
+      vmap_axis_sizes = batching.get_vmap_axis_sizes(batched_args.arguments)
+      ret = a0 * a1 * kw * math.prod(vmap_axis_sizes)
       seen_inner_shapes.append((a0.shape, a1.shape, kw.shape))
       seen_batched_args.append(batched_args.args)
       seen_batched_kwargs.append(batched_args.kwargs)

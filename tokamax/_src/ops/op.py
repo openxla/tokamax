@@ -283,7 +283,6 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
 
   def _get_autotuning_cache_key(self, ba: "BoundArguments") -> _Key:
     """Returns a key for autotuning cache lookup."""
-    ba = batched if (batched := ba.batched).vmap_axis_sizes else ba
     pos_arg_names = tuple(
         name
         for name, param in ba.signature.parameters.items()
@@ -374,10 +373,8 @@ class BoundArguments(Generic[_Config, _Key]):
     return inspect.BoundArguments(self.signature, arguments)
 
   @property
-  def batched(self) -> batching.Batched[inspect.BoundArguments]:
-    arguments = jax.tree.map(_as_batched, dict(self.arguments))
-    ba = inspect.BoundArguments(self.signature, arguments)
-    return batching.Batched(ba)
+  def vmap_axis_sizes(self) -> tuple[int, ...]:
+    return batching.get_vmap_axis_sizes(dict(self.arguments))
 
   @property
   def default_config(self) -> _Config:
@@ -487,10 +484,8 @@ class BoundArguments(Generic[_Config, _Key]):
     Returns:
       A `BenchmarkData` object containing the benchmark results.
     """
-    ba = batched if (batched := self.batched).vmap_axis_sizes else self
-    kwargs = ba.kwargs
     f, x = benchmarking.standardize_function(
-        self.op, *ba.args, kwargs=kwargs, mode=mode
+        self.op, *self.args, kwargs=self.kwargs, mode=mode
     )
     return benchmarking.compile_benchmark(f, x)(x)
 
@@ -504,11 +499,9 @@ class BoundArguments(Generic[_Config, _Key]):
     if configs is AUTO:
       configs = self.autotuning_configs
 
-    ba = batched if (batched := self.batched).vmap_axis_sizes else self
-    args, kwargs = ba.args, ba.kwargs
     logging.debug("Autotuning %s(%s)", self.op, self.arguments)
-    op_with_config = lambda config: self.op.replace(config=config)
-    data = autotuner.autotune(op_with_config, configs, *args, **kwargs)
+    op_fn = lambda config: self.op.replace(config=config)
+    data = autotuner.autotune(op_fn, configs, *self.args, **self.kwargs)
     if cache_results:
       d = self.op.get_autotuning_cache()
       d[self.autotuning_cache_key] = data
@@ -517,13 +510,12 @@ class BoundArguments(Generic[_Config, _Key]):
   @property
   def vjp_arg_spec(self) -> dict[str, Any]:
     """Returns VJP arg specification for this op and arguments."""
-    ba = batched if (batched := self.batched).vmap_axis_sizes else self
-    kwargs = ba.kwargs | dict(return_residuals=True)
+    kwargs = self.kwargs | dict(return_residuals=True)
     f, x = benchmarking.standardize_function(
-        self.op, *ba.args, kwargs=kwargs, seed=None
+        self.op, *self.args, kwargs=kwargs, seed=None
     )
     out, residuals = jax.eval_shape(f, x)
-    vjp_arg_spec = dict(ba.arguments)
+    vjp_arg_spec = dict(self.arguments)
     vjp_arg_spec["residuals"] = residuals
     vjp_arg_spec["out"] = vjp_arg_spec["dout"] = out
     vjp_arg_spec["return_residuals"] = False
@@ -612,10 +604,3 @@ def _abstractify(pytree):
     return x
 
   return jax.tree.map(abstractify_leaf, pytree)
-
-
-def _as_batched(x):
-  if hasattr(x, "shape") and hasattr(x, "dtype"):
-    if not isinstance(x, batching.BatchedShapeDtype):
-      return batching.BatchedShapeDtype(x.shape, x.dtype, ())
-  return x
