@@ -117,7 +117,7 @@ def flash_attention_kernel(
     wg = lax.axis_index("wg")
 
     (
-        (q_smems, k_smems, o_smems, *residual_smems),
+        ((q_smems, k_smems), (o_smems, *residual_smems)),
         v_smems,
         q_barriers,
         bias_smems,
@@ -420,7 +420,7 @@ def flash_attention_kernel(
         lambda *args: kernel(*refs, scoped=args),
         plgpu.RefUnion(
             (q_scratch, k_scratch),
-            (o_scratch, ((l_scratch, m_scratch) if return_residuals else ())),
+            (o_scratch, *((l_scratch, m_scratch) if return_residuals else ())),
         ),
         v_scratch,  # wg1 may still access v as wg0 writes to {o,l,m}_scratch.
         q_barriers,
