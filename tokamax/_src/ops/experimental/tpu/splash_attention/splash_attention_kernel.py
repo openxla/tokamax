@@ -271,6 +271,62 @@ def attention_reference(
   return out
 
 
+@partial(
+    jax.jit, static_argnames=["is_mqa", "backward_impl", "attn_logits_soft_cap"]
+)
+def attention_reference_vjp(
+    do,
+    q,
+    k,
+    v,
+    mask,
+    segment_ids,
+    sinks,
+    o,
+    logsumexp,
+    *,
+    is_mqa: bool,
+    backward_impl: str = "vanilla",
+    attn_logits_soft_cap: float | None = None,
+):
+  """Wrapper for backward reference that handles GQA/MQA broadcasting and reduction."""
+  bwd = partial(
+      _attention_reference_custom_bwd,
+      backward_impl=backward_impl,
+      attn_logits_soft_cap=attn_logits_soft_cap,
+  )
+
+  num_q_heads = q.shape[0]
+  num_kv_heads = 1 if is_mqa else k.shape[0]
+
+  is_grouped = not is_mqa and num_kv_heads < num_q_heads
+  assert num_q_heads % num_kv_heads == 0
+  head_multiplier = num_q_heads // num_kv_heads
+  if is_mqa:
+    bwd = jax.vmap(bwd, in_axes=(0, 0, None, None, None, None, 0, 0, 0))
+  else:
+    bwd = jax.vmap(bwd, in_axes=(0, 0, 0, 0, None, None, 0, 0, 0))
+    # Interleave the KV heads to match the corresponding Q heads.
+    if is_grouped:
+      k = jnp.repeat(k, head_multiplier, axis=0)
+      v = jnp.repeat(v, head_multiplier, axis=0)
+
+  dq, dk, dv, _, _, dsinks = bwd(
+      do, q, k, v, mask, segment_ids, sinks, o, logsumexp
+  )
+
+  if is_mqa:
+    dk, dv = dk.sum(axis=0), dv.sum(axis=0)
+  elif is_grouped:
+    # Perform the sum reduction across the head_multiplier dimension only.
+    # So that the output still has KV heads.
+    dk = dk.reshape(num_kv_heads, head_multiplier, *dk.shape[1:])
+    dv = dv.reshape(num_kv_heads, head_multiplier, *dv.shape[1:])
+    dk, dv = dk.sum(axis=1), dv.sum(axis=1)
+
+  return dq, dk, dv, dsinks
+
+
 # Splash attention implementation
 
 
@@ -654,7 +710,7 @@ def flash_attention_kernel(
   def _():
     lax.fori_loop(0, num_iters, body, None, unroll=True)
 
-  @pl.when(~should_not_mask)
+  @pl.when(jnp.logical_not(should_not_mask))
   def _():
     lax.fori_loop(
         0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
@@ -1320,7 +1376,7 @@ def _flash_attention_dq_kernel(
   def _():
     body()
 
-  @pl.when(~should_not_mask)
+  @pl.when(jnp.logical_not(should_not_mask))
   def _():
     body(has_partial_mask=True)
 

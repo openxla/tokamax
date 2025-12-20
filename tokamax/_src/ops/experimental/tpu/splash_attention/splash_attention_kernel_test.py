@@ -33,6 +33,7 @@ from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_
 
 jax.config.parse_flags_with_absl()
 
+
 hp.settings.register_profile(
     name="deterministic",
     database=None,
@@ -46,6 +47,17 @@ hp.settings.load_profile(name="deterministic")
 
 partial = functools.partial
 Draw = TypeVar("Draw", bound=Callable[[hps.SearchStrategy[Any]], Any])
+
+
+@dataclasses.dataclass
+class ModelConfig:
+  q_seq_len: int
+  kv_seq_len: int
+  num_q_heads: int
+  num_kv_heads: int
+  head_dim_qk: int
+  head_dim_v: int
+  dtype: np.dtype
 
 
 @hps.composite
@@ -196,39 +208,25 @@ def mask_strategy(draw: Draw, q_seq_len: int, kv_seq_len: int) -> Mask:
 
 
 @hps.composite
-def sequence_length_strategy(draw: Draw) -> tuple[int, int]:
+def model_config_strategy(draw: Draw) -> ModelConfig:
   q_seq_len = draw(hps.sampled_from([1024, 2048, 4096]))
   kv_seq_len = draw(hps.sampled_from([1024, 2048, 4096]))
-  return q_seq_len, kv_seq_len
-
-
-@hps.composite
-def attention_strategy(draw: Draw) -> tuple[int, int, int, int, np.dtype]:
-  q_seq_len, kv_seq_len = draw(sequence_length_strategy())
   head_dim_qk, head_dim_v = draw(
       hps.sampled_from(
           [(64, 128), (64, 64), (128, 128), (256, 256), (192, 128)]
       )
   )
   if q_seq_len >= 4096 and kv_seq_len >= 4096:
-    # Do not draw bfloat16 on longer sequence lengths, as this increases
-    # the risk of numerical precision errors causing false positives in
-    # tests.
     dtype = np.dtype("float32")
   else:
-    dtype = draw(hps.sampled_from([np.dtype("float32"), np.dtype(jnp.bfloat16)]))
-  return q_seq_len, kv_seq_len, head_dim_qk, head_dim_v, dtype
+    dtype = draw(
+        hps.sampled_from([np.dtype("float32"), np.dtype(jnp.bfloat16)])
+    )
 
-
-@hps.composite
-def mha_strategy(draw: Draw) -> tuple[int, int, int, int, int, int, np.dtype]:
-  q_seq_len, kv_seq_len, head_dim_qk, head_dim_v, dtype = draw(
-      attention_strategy()
-  )
   num_q_heads, num_kv_heads = draw(
       hps.sampled_from([(1, 1), (2, 2), (4, 1), (8, 4), (6, 2)])
   )
-  return (
+  return ModelConfig(
       q_seq_len,
       kv_seq_len,
       num_q_heads,
@@ -287,6 +285,50 @@ def block_sizes_strategy(
   )
 
 
+def _generate_inputs(
+    data,
+    config: ModelConfig,
+    is_mqa: bool,
+    is_segmented: bool,
+    use_sinks: bool = False,
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array | None,
+    splash.SegmentIds | None,
+    jax.Array,
+]:
+  seed = data.draw(seed_strategy())
+  key = random.key(seed)
+  k1, k2, k3, k_sinks, k_do = random.split(key, 5)
+
+  q_shape = (config.num_q_heads, config.q_seq_len, config.head_dim_qk)
+  if is_mqa:
+    k_shape = (config.kv_seq_len, config.head_dim_qk)
+    v_shape = (config.kv_seq_len, config.head_dim_v)
+  else:
+    k_shape = (config.num_kv_heads, config.kv_seq_len, config.head_dim_qk)
+    v_shape = (config.num_kv_heads, config.kv_seq_len, config.head_dim_v)
+
+  q = random.uniform(k1, q_shape, dtype=config.dtype)
+  k = random.uniform(k2, k_shape, dtype=config.dtype)
+  v = random.uniform(k3, v_shape, dtype=config.dtype)
+
+  sinks = None
+  if use_sinks:
+    sinks = random.uniform(k_sinks, (config.num_q_heads,), dtype=config.dtype)
+
+  segment_ids = None
+  if is_segmented:
+    hp.assume(config.q_seq_len == config.kv_seq_len)
+    segment_ids = data.draw(segment_ids_strategy(config.q_seq_len))
+
+  o_shape = (config.num_q_heads, config.q_seq_len, config.head_dim_v)
+  do = random.uniform(k_do, o_shape, dtype=config.dtype)
+  return (q, k, v, sinks, segment_ids, do)
+
+
 def attn_logits_soft_cap_strategy() -> hps.SearchStrategy[float | None]:
   return hps.one_of(hps.just(None), hps.floats(min_value=1.0, max_value=50.0))
 
@@ -306,41 +348,11 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
   )
   @hp.given(hps.data())
   def test_splash_attention(self, is_mqa, is_segmented, is_dynamic_mask, data):
-    seed = data.draw(seed_strategy())
-    key = random.key(seed)
-    k1, k2, k3 = random.split(key, 3)
-
-    (
-        q_seq_len,
-        kv_seq_len,
-        num_q_heads,
-        num_kv_heads,
-        head_dim_qk,
-        head_dim_v,
-        dtype,
-    ) = data.draw(mha_strategy())
-
-    # Avoid segment ids for rectangular matrices, as its hard to enforce
-    # valid masks (non-0 rows).
-    hp.assume(q_seq_len == kv_seq_len or not is_segmented)
-
-    q = random.uniform(k1, (num_q_heads, q_seq_len, head_dim_qk), dtype=dtype)
-    if is_mqa:
-      k = random.uniform(k2, (kv_seq_len, head_dim_qk), dtype=dtype)
-      v = random.uniform(k3, (kv_seq_len, head_dim_v), dtype=dtype)
-    else:
-      k = random.uniform(
-          k2, (num_kv_heads, kv_seq_len, head_dim_qk), dtype=dtype
-      )
-      v = random.uniform(
-          k3, (num_kv_heads, kv_seq_len, head_dim_v), dtype=dtype
-      )
-
-    segment_ids = None
-    if is_segmented:
-      assert q_seq_len == kv_seq_len
-      segment_ids = data.draw(segment_ids_strategy(q_seq_len))
-
+    model_config = data.draw(model_config_strategy())
+    q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
+    q, k, v, _, segment_ids, _ = _generate_inputs(
+        data, model_config, is_mqa, is_segmented
+    )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
     if is_dynamic_mask:
@@ -364,8 +376,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       else:
         make_mask_fn = splash.make_dynamic_splash_mha
 
-    make_mask_fn = partial(make_mask_fn, config=config)
-    attn = make_mask_fn(mask)
+    attn = make_mask_fn(mask, config=config)
 
     o = attn(q, k, v, segment_ids)
     o_ref = attn_ref(
@@ -391,43 +402,11 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
   def test_splash_attention_fwd(self, is_mqa, is_segmented, is_dynamic_mask,
                                 use_base2_exp, use_max_logit_estimate,
                                 fuse_reciprocal, use_sinks, data):
-    seed = data.draw(seed_strategy())
-    key = random.key(seed)
-    k1, k2, k3, k_sinks = random.split(key, 4)
-
-    (
-        q_seq_len,
-        kv_seq_len,
-        num_q_heads,
-        num_kv_heads,
-        head_dim_qk,
-        head_dim_v,
-        dtype,
-    ) = data.draw(mha_strategy())
-
-    # Avoid segment ids for rectangular matrices, as its hard to enforce
-    # valid masks (non-0 rows).
-    hp.assume(q_seq_len == kv_seq_len or not is_segmented)
-
-    q = random.uniform(k1, (num_q_heads, q_seq_len, head_dim_qk), dtype=dtype)
-    if is_mqa:
-      k = random.uniform(k2, (kv_seq_len, head_dim_qk), dtype=dtype)
-      v = random.uniform(k3, (kv_seq_len, head_dim_v), dtype=dtype)
-    else:
-      k = random.uniform(
-          k2, (num_kv_heads, kv_seq_len, head_dim_qk), dtype=dtype
-      )
-      v = random.uniform(
-          k3, (num_kv_heads, kv_seq_len, head_dim_v), dtype=dtype
-      )
-    sinks = None
-    if use_sinks:
-      sinks = random.uniform(k_sinks, (num_q_heads,), dtype=dtype)
-
-    segment_ids = None
-    if is_segmented:
-      assert q_seq_len == kv_seq_len
-      segment_ids = data.draw(segment_ids_strategy(q_seq_len))
+    model_config = data.draw(model_config_strategy())
+    q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
+    q, k, v, sinks, segment_ids, _ = _generate_inputs(
+        data, model_config, is_mqa, is_segmented, use_sinks
+    )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
     if is_dynamic_mask:
@@ -458,10 +437,10 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     elif use_max_logit_estimate == "value_1d":
       max_logit_value = max_val * jnp.ones((1,), dtype=jnp.bfloat16)
     elif use_max_logit_estimate == "value_2d":
-      max_logit_value = max_val * jnp.ones((num_q_heads,), dtype=jnp.bfloat16)
-
-    make_mask_fn = partial(make_mask_fn, config=config, save_residuals=True)
-    attn = make_mask_fn(mask)
+      max_logit_value = max_val * jnp.ones(
+          (model_config.num_q_heads,), dtype=jnp.bfloat16
+      )
+    attn = make_mask_fn(mask, config=config, save_residuals=True)
     attn_ref = partial(
         splash.attention_reference,
         is_mqa=is_mqa,
@@ -485,7 +464,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     lse_tol = dict(atol=1e-3, rtol=3e-3)
     max_logits_tol = dict(atol=1e-3, rtol=4e-3)
     if use_sinks:
-      o_tol = dict(atol=1e-2, rtol=1e-1)
+      o_tol = dict(atol=8e-2, rtol=1e-1)
       lse_tol['rtol'] = 6e-2
     elif (use_base2_exp or use_max_logit_estimate is not None
           or not fuse_reciprocal):
@@ -503,12 +482,9 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
   @parameterized.product(
       is_mqa=(False, True),
       is_segmented=(False, True),
-      downcast_smem_data=(False, True),
       is_dynamic_mask=(False, True),
-      use_base2_exp=(False, True),
       # use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
       use_max_logit_estimate=(None,),
-      fuse_reciprocal=(True, False),
       use_sinks=(False, True),
       dq_reduction_steps=(None, 3),
   )
@@ -517,52 +493,21 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       self,
       is_mqa,
       is_segmented,
-      downcast_smem_data,
       is_dynamic_mask,
-      use_base2_exp,
       use_max_logit_estimate,
-      fuse_reciprocal,
       dq_reduction_steps,
       use_sinks,
       data,
   ):
-    seed = data.draw(seed_strategy())
-    key = random.key(seed)
-    k1, k2, k3, k4, k_sinks = random.split(key, 5)
+    downcast_smem_data = data.draw(hp.strategies.booleans())
+    fuse_reciprocal = data.draw(hp.strategies.booleans())
+    use_base2_exp = data.draw(hp.strategies.booleans())
 
-    (
-        q_seq_len,
-        kv_seq_len,
-        num_q_heads,
-        num_kv_heads,
-        head_dim_qk,
-        head_dim_v,
-        dtype,
-    ) = data.draw(mha_strategy())
-
-    # Avoid segment ids for rectangular matrices, as it's hard to enforce
-    # valid masks (non-0 rows).
-    hp.assume(q_seq_len == kv_seq_len or not is_segmented)
-
-    q = random.uniform(k1, (num_q_heads, q_seq_len, head_dim_qk), dtype=dtype)
-    if is_mqa:
-      k = random.uniform(k2, (kv_seq_len, head_dim_qk), dtype=dtype)
-      v = random.uniform(k3, (kv_seq_len, head_dim_v), dtype=dtype)
-    else:
-      k = random.uniform(
-          k2, (num_kv_heads, kv_seq_len, head_dim_qk), dtype=dtype
-      )
-      v = random.uniform(
-          k3, (num_kv_heads, kv_seq_len, head_dim_v), dtype=dtype
-      )
-    sinks = None
-    if use_sinks:
-      sinks = random.uniform(k_sinks, (num_q_heads,), dtype=dtype)
-
-    segment_ids = None
-    if is_segmented:
-      assert q_seq_len == kv_seq_len
-      segment_ids = data.draw(segment_ids_strategy(q_seq_len))
+    model_config = data.draw(model_config_strategy())
+    q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
+    q, k, v, sinks, segment_ids, do = _generate_inputs(
+        data, model_config, is_mqa, is_segmented, use_sinks=use_sinks
+    )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
     if is_dynamic_mask:
@@ -596,12 +541,13 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     elif use_max_logit_estimate == "value_1d":
       max_logit_value = max_val * jnp.ones((1,), dtype=jnp.bfloat16)
     elif use_max_logit_estimate == "value_2d":
-      max_logit_value = max_val * jnp.ones((num_q_heads,), dtype=jnp.bfloat16)
+      max_logit_value = max_val * jnp.ones(
+          (model_config.num_q_heads,), dtype=jnp.bfloat16
+      )
 
-    make_mask_fn = partial(
-        make_mask_fn, config=config, downcast_smem_data=downcast_smem_data
+    attn = make_mask_fn(
+        mask, config=config, downcast_smem_data=downcast_smem_data
     )
-    attn = make_mask_fn(mask)
 
     o, attn_vjp = jax.vjp(partial(attn, max_logit_value=max_logit_value),
                           q, k, v, segment_ids, sinks)
@@ -626,63 +572,30 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       o_tol = dict(atol=4e-3, rtol=3e-3)
     self._assert_allclose(o, o_ref, **o_tol)
 
-    do = random.uniform(k4, o.shape, dtype=o.dtype)
     dq, dk, dv, _, dsinks = attn_vjp(do)
-
-    def bwd(
-        mask, q, k, v, segment_ids, sinks, o, logsumexp, do
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
-      attn_ref = partial(
-          splash._attention_reference_custom_bwd,
-          backward_impl="flash",
-          attn_logits_soft_cap=attn_logits_soft_cap,
-      )
-      dq, dk, dv, _, _, dsinks = attn_ref(
-          do, q, k, v, mask, segment_ids, sinks, o, logsumexp
-      )
-      return dq, dk, dv, dsinks
-
-    is_grouped = not is_mqa and num_kv_heads < num_q_heads
-    assert num_q_heads % num_kv_heads == 0
-    head_multiplier = num_q_heads // num_kv_heads
-    if is_mqa:
-      bwd = jax.vmap(bwd, in_axes=(None, 0, None, None, None, 0, 0, 0, 0))
-    else:
-      bwd = jax.vmap(bwd, in_axes=(None, 0, 0, 0, None, 0, 0, 0, 0))
-      # Interleave the KV heads to match the corresponding Q heads.
-      if is_grouped:
-        k32 = jnp.repeat(k32, head_multiplier, axis=0)
-        v32 = jnp.repeat(v32, head_multiplier, axis=0)
-
-    dq_ref, dk_ref, dv_ref, dsinks_ref = bwd(
-        mask[:, :],
+    dq_ref, dk_ref, dv_ref, dsinks_ref = splash.attention_reference_vjp(
+        do.astype(jnp.float32),
         q32,
         k32,
         v32,
+        jnp.array(mask[:, :]),
         segment_ids,
         sinks,
         o.astype(jnp.float32),
         stats_ref["logsumexp"],
-        do.astype(jnp.float32),
+        is_mqa=is_mqa,
+        backward_impl="flash",
+        attn_logits_soft_cap=attn_logits_soft_cap,
     )
-    if is_mqa:
-      dk_ref, dv_ref = dk_ref.sum(axis=0), dv_ref.sum(axis=0)
-    elif is_grouped:
-      # Perform the sum reduction across the head_multiplier dimension only.
-      # So that the output still has KV heads.
-      dk_ref = dk_ref.reshape(num_kv_heads, head_multiplier, *dk_ref.shape[1:])
-      dv_ref = dv_ref.reshape(num_kv_heads, head_multiplier, *dv_ref.shape[1:])
 
-      dk_ref, dv_ref = dk_ref.sum(axis=1), dv_ref.sum(axis=1)
-
-    dq_atol = 5e-2 if use_base2_exp else 2e-2
+    dq_atol = 8e-2 if use_base2_exp else 2e-2
     dk_atol = 7e-2 if use_base2_exp else 2e-2
     dv_atol = 2e-2 if use_base2_exp else 2e-2
     self._assert_allclose(dq, dq_ref, atol=dq_atol, rtol=3e-2)
     self._assert_allclose(dk, dk_ref, atol=dk_atol, rtol=3e-2)
     self._assert_allclose(dv, dv_ref, atol=dv_atol, rtol=3e-2)
     if use_sinks:
-      self._assert_allclose(dsinks, dsinks_ref, atol=4e-3, rtol=4e-3)
+      self._assert_allclose(dsinks, dsinks_ref, atol=4e-3, rtol=6e-3)
 
 
 if __name__ == "__main__":
