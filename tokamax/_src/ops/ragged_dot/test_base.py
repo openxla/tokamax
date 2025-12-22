@@ -91,10 +91,19 @@ class RaggedDotTestBase(parameterized.TestCase):
   def _dot_fn_f32(self):
     return _dot_fn_f32(self._dot_fn)
 
-  def _create_inputs(self, num_groups, m, k, n, dtype, random_groups=False):
+  def _create_inputs(
+      self, num_groups, m, k, n, dtype, random_groups=False, std=0.1
+  ):
     rng = np.random.default_rng(sum(self._testMethodName.encode()))
-    a = jnp.array(rng.standard_normal((m, k), np.float32), dtype)
-    b = jnp.array(rng.standard_normal((num_groups, k, n), np.float32), dtype)
+    a = jnp.array(
+        rng.normal(loc=0.0, scale=std, size=(m, k)).astype(np.float32), dtype
+    )
+    b = jnp.array(
+        rng.normal(loc=0.0, scale=std, size=(num_groups, k, n)).astype(
+            np.float32
+        ),
+        dtype,
+    )
     if random_groups:
       group_sizes = rng.integers(0, m // num_groups, (num_groups,), np.int32)
       group_sizes = jnp.array(group_sizes)
@@ -102,12 +111,15 @@ class RaggedDotTestBase(parameterized.TestCase):
       group_sizes = jnp.array([m // num_groups] * num_groups, jnp.uint32)
     return a, b, group_sizes
 
-  @parameterized.parameters(jnp.bfloat16, jnp.float32)
-  def test_simple(self, dtype):
+  def _test_simple(self, dtype):
     num_groups, m, k, n = 8, 1024, 128, 256
     a, b, group_sizes = self._create_inputs(num_groups, m, k, n, dtype)
     actual = self._dot_fn_f32(a, b, group_sizes=group_sizes)
     chex.assert_trees_all_close(actual, ref(a, b, group_sizes))
+
+  @parameterized.parameters(jnp.bfloat16, jnp.float32)
+  def test_simple(self, dtype):
+    self._test_simple(dtype)
 
   def test_padded(self):
     num_groups, m, k, n = 8, 1024, 128, 256
@@ -139,7 +151,7 @@ class RaggedDotTestBase(parameterized.TestCase):
       a_tile_shape=(None, (1, 128), (1, 16), (256, 1), (16, 1)),
       b_tile_shape=((1, 1, 16), (1, 1, 128), (1, 256, 1), (1, 16, 1)),
       use_as_qarray=(True, False),
-      activation=(None, relu),
+      activation=(None, relu, jax.nn.tanh),
   )
   def test_quantized(
       self,
@@ -204,7 +216,7 @@ class RaggedDotTestBase(parameterized.TestCase):
       m=(1024, 128),
       k=(128, 64),
       n=(256, 128),
-      activation=(None, relu),
+      activation=(None, relu, jax.nn.tanh),
   )
   def test_vjp(self, num_groups, m, k, n, activation=None):
     a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)

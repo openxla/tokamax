@@ -294,7 +294,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           plgpu.barrier_wait(mma_done_barrier)
           acc = plgpu.async_load_tmem(acc_tmem)
           plgpu.wait_load_tmem()
-          # Apply activation function to the output in dtype of output if
+          # Apply activation function to the output in dtype of acc if
           # provided.
           acc = (
               activation(acc) if activation is not None else acc

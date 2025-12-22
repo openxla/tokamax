@@ -63,16 +63,13 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
     )
 
     with mock.patch.object(self, "_dot_fn", split_k_dot):
-      with test_base.override_chex_args(rtol=0.01):
-        self.test_quantized0()  # pytype: disable=attribute-error
+      self.test_quantized0()  # pytype: disable=attribute-error
 
+  @parameterized.parameters(jnp.bfloat16, jnp.float32)
   @override
-  def _test_bench(self, spec):
-    # TODO: Fix tolerance and enable tests.
-    self.skipTest(
-        "Accuracy for triton pallas is slightly less than mgpu. We need to"
-        " figure out how to fix it or to increase the tolerance."
-    )
+  def test_simple(self, dtype):
+    with test_base.override_chex_args(atol=1e-6):
+      self._test_simple(dtype)
 
 
 if __name__ == "__main__":

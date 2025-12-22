@@ -254,14 +254,14 @@ def ragged_dot_quantized_ws_async_store_kernel(
 
             wg_o_smem = o_smem.at[wg].reshape(block_m // 8, 1, 8, block_n)
             wg_o_smem = plgpu.untile_ref(wg_o_smem, (8, block_n))
+            # Apply activation function to the output in dtype of the acc
+            acc = (
+                activation(acc) if activation is not None else acc
+            )
             acc = plgpu.layout_cast(
                 acc.astype(out_gmem.dtype), plgpu.Layout.WGMMA_TRANSPOSED
             )
-            # Apply activation function to the output in dtype of output
-            # if provided.
-            wg_o_smem.T[...] = (
-                activation(acc) if activation is not None else acc
-            )
+            wg_o_smem.T[...] = acc
             plgpu.commit_smem()
             plgpu.barrier_arrive(store_smem_done_barrier)
 
