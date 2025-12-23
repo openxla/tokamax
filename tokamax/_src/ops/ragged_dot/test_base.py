@@ -271,7 +271,14 @@ class RaggedDotTestBase(parameterized.TestCase):
 
   def _test_bench(self, spec):
     kwargs = numerics.random_initialize(spec)
-    expected = ref(**kwargs)
+    # Skip the test if the reference implementation fails,
+    # e.g out-of-memory.
+    try:
+      expected = ref(**kwargs)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      if "RESOURCE_EXHAUSTED: Out of memory while trying to allocate" in str(e):
+        self.skipTest("Out of memory")
+      raise
     actual = self._dot_fn(**kwargs)
     count = sum(spec["group_sizes"].representative_value)
     chex.assert_trees_all_close(

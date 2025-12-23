@@ -173,7 +173,10 @@ class RaggedDotMosaicTest(RaggedDotImplementationTest):
             and (
                 not isinstance(rhs_, qwix.QArray)
                 or (
-                    (rhs_.scale_tile_shape == (1, 256, 1))
+                    (
+                        rhs_.scale_tile_shape == (1, 256, 1)
+                        or rhs_.scale_tile_shape == (1, 512, 1)
+                    )
                     and kwargs.get("preferred_element_type") is None
                 )
             )
