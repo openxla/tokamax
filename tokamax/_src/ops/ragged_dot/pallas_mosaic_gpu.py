@@ -175,7 +175,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     elif gpu_utils.is_sm100():
       if isinstance(rhs, QArray):
         return Config(
-            block_m=128,
+            block_m=64,
             block_n=128,
             block_k=256,
             num_stages=2,
@@ -292,39 +292,54 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     configs = set()
     # Configs for prefill
     for block_k in [128, 256]:
-      for num_stages in [2, 3]:
-        configs.add(
-            Config(
-                block_m=128,
-                block_n=128,
-                block_k=block_k,
-                num_stages=num_stages,
-                split_k=1,
-                grid_block_n=1,
-                warp_specialized=True,
-                persistent=False,
-                collective=True,
-            )
-        )
+      for num_stages in [2, 4]:
+        for grid_minor_dim in [
+            common.MatmulDimension.M,
+            common.MatmulDimension.N,
+        ]:
+          for grid_tile_width in [1, 2, 4, 8]:
+            for split_m in [1, 2]:
+              configs.add(
+                  Config(
+                      block_m=128,
+                      block_n=128,
+                      block_k=block_k,
+                      num_stages=num_stages,
+                      split_k=1,
+                      grid_block_n=1,
+                      warp_specialized=True,
+                      persistent=False,
+                      collective=True,
+                      grid_minor_dim=grid_minor_dim,
+                      grid_tile_width=grid_tile_width,
+                      split_m=split_m,
+                  )
+              )
 
     # Config for generate
-    for block_m in [8, 16, 32]:
-      for num_stages in [2, 3]:
-        for grid_block_n in [1, 4, 8]:
-          for persistent in [False, True]:
-            configs.add(
-                Config(
-                    block_m=block_m,
-                    block_n=128,
-                    block_k=256,
-                    num_stages=num_stages,
-                    split_k=1,
-                    grid_block_n=grid_block_n,
-                    warp_specialized=True,
-                    persistent=persistent,
-                    collective=False,
+    for block_m in [8, 16, 32, 64]:
+      for num_stages in [2, 4]:
+        for grid_minor_dim in [
+            common.MatmulDimension.M,
+            common.MatmulDimension.N,
+        ]:
+          for grid_tile_width in [1, 2, 4, 8]:
+            for split_m in [1, 2]:
+              for collective in [True, False]:
+                configs.add(
+                    Config(
+                        block_m=block_m,
+                        block_n=128,
+                        block_k=256,
+                        num_stages=num_stages,
+                        split_k=1,
+                        warp_specialized=True,
+                        collective=collective,
+                        split_m=split_m,
+                        grid_tile_width=grid_tile_width,
+                        grid_minor_dim=grid_minor_dim,
+                    )
                 )
-            )
     return configs
 
   @override

@@ -44,6 +44,7 @@ class Config:
   block_k: pydantic.PositiveInt
   num_stages: pydantic.PositiveInt
   split_k: pydantic.PositiveInt
+  split_m: pydantic.PositiveInt = 1
   grid_block_n: pydantic.PositiveInt = 1
   warp_specialized: bool = True
   persistent: bool = True
