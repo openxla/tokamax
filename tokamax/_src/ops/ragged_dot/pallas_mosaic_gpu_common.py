@@ -49,6 +49,7 @@ class Config:
   warp_specialized: bool = True
   persistent: bool = True
   async_store: bool = False
+  post_scale: bool = False
   # B200 collective MMA
   collective: bool = False
   # indicates the fastest changing dim.

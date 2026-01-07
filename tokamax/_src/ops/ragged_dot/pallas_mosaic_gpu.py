@@ -29,6 +29,7 @@ from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws as sm90_quant_ws
@@ -124,7 +125,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             "Only default `ragged_dot_dimension_numbers` supported."
         )
       if isinstance(rhs, QArray):
-        fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
+        if config.post_scale:
+          fn = sm100_quant_post_scale.ragged_dot_gpu_quant_post_scale_blackwell_kernel  # pylint: disable=line-too-long
+        else:
+          fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
       else:
         fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
     else:
@@ -326,20 +330,22 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           for grid_tile_width in [1, 2, 4, 8]:
             for split_m in [1, 2]:
               for collective in [True, False]:
-                configs.add(
-                    Config(
-                        block_m=block_m,
-                        block_n=128,
-                        block_k=256,
-                        num_stages=num_stages,
-                        split_k=1,
-                        warp_specialized=True,
-                        collective=collective,
-                        split_m=split_m,
-                        grid_tile_width=grid_tile_width,
-                        grid_minor_dim=grid_minor_dim,
-                    )
-                )
+                for post_scale in [True, False]:
+                  configs.add(
+                      Config(
+                          block_m=block_m,
+                          block_n=128,
+                          block_k=256,
+                          num_stages=num_stages,
+                          split_k=1,
+                          warp_specialized=True,
+                          collective=collective,
+                          split_m=split_m,
+                          grid_tile_width=grid_tile_width,
+                          grid_minor_dim=grid_minor_dim,
+                          post_scale=post_scale,
+                      )
+                  )
     return configs
 
   @override
