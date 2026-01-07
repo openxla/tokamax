@@ -26,6 +26,11 @@ from tokamax._src.ops.attention import pallas_mosaic_tpu as fa
 
 class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
 
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    super().setUp()
+
   @parameterized.product(
       dtype=[jnp.float32],
       is_mqa=[False, True],
