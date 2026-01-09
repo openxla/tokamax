@@ -765,8 +765,8 @@ def _splash_attention_forward(
   head_dim_v = v.shape[-1]
   bq, bkv = config.block_q, config.block_kv
   bkv_compute = config.block_kv_compute
-  bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)
   fuse_reciprocal = config.fuse_reciprocal or not save_residuals
+  bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)
 
   if is_mqa:
     expected_kv_rank = 2

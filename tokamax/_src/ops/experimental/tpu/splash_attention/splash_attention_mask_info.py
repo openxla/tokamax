@@ -107,7 +107,8 @@ def _downcast_to_small_type(array: np.ndarray) -> np.ndarray:
   if array.dtype != np.int32:
     raise ValueError(f'Expected int32 input, but got {array.dtype}.')
 
-  if not np.all(array >= 0):
+  if not np.all(array >= -1):
+    # Allow -1 for padding.
     raise ValueError('Expected non-negative array.')
 
   if array.size == 0:
@@ -163,13 +164,15 @@ class _HashableNDArray:
     array: The underlying numpy array.
   """
 
+  __slots__ = ('array', '_hash')
   array: np.ndarray
 
   def __init__(self, array: np.ndarray):
     self.array = array
+    self._hash = hash(array.tobytes())
 
   def __hash__(self):
-    return hash(self.array.tobytes())
+    return self._hash
 
   def __eq__(self, other: object) -> bool:
     if not isinstance(other, _HashableNDArray):
@@ -267,7 +270,7 @@ def _get_mask_info(
     active_indices = np.argwhere(active_mask)
     active_rows = active_indices[:, 0].astype(np.int32)
     active_cols = active_indices[:, 1].astype(np.int32)
-    block_mask = block_mask[block_mask > 0]
+    block_mask = block_mask[active_mask > 0]
     grid_size = active_rows.size
   else:
     active_indices = np.ndindex(block_mask.shape)
@@ -367,12 +370,16 @@ def _process_dynamic_mask(
     active_mask |= (empty_rows[:, None] & first_col)
 
   num_active_blocks = active_mask.flatten().sum(keepdims=True)
-  active_indices = jnp.argwhere(active_mask, size=active_mask.size)
+  active_indices = jnp.argwhere(
+      active_mask, size=active_mask.size, fill_value=-1
+  )
   active_rows = active_indices[:, 0].astype(np.int32)
   active_cols = active_indices[:, 1].astype(np.int32)
 
   block_mask = block_mask[active_rows, active_cols]
-  mask_next = block_ids[active_rows, active_cols]
+  mask_next = block_ids.at[active_rows, active_cols].get(
+      wrap_negative_indices=False
+  )
   mask_next = jnp.where(block_mask == 1, mask_next, 0)
 
   # Mask out the blocks that aren't active.
@@ -430,7 +437,7 @@ def _process_mask(
   """Transform a dense mask into a sparse representation.
 
   The number Q sequence shards are needed to create a MaskInfo
-  object that is partitionable (with shmap) along that dimension.
+  object that is partitionable (with shard_map) along that dimension.
   Args:
     mask: Dense mask to process.
     block_shape: Shape of the Pallas grid block.
@@ -442,7 +449,7 @@ def _process_mask(
 
   Returns:
     `MaskInfo`, a sparse representation of the dense mask.
-    `MaskCallable`: a callable that, given in input Q and KV indices, returns
+    `MaskCallable`: a callable that, given Q and KV indices, returns
       the value of the mask at those coordinates.
 
   Raises:
@@ -584,7 +591,9 @@ def _process_mask(
   if return_dynamic_grid:
     # Pad each slice to the largest number of active blocks in any shard.
     max_size = max(num_active_blocks)
-    pad_slice = lambda arr: np.pad(arr, (0, max_size - arr.shape[0]))
+    pad_slice = lambda arr: np.pad(
+          arr, (0, max_size - arr.shape[0]), mode='constant', constant_values=-1
+      )
     active_rows_slices = list(map(pad_slice, active_rows_slices))
     active_cols_slices = list(map(pad_slice, active_cols_slices))
     mask_next_slices = list(map(pad_slice, mask_next_slices))

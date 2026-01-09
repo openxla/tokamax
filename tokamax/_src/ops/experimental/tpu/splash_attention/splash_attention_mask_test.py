@@ -903,7 +903,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
       expected_causal_mask_next_dkv = np.array(
           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.int8
       )
-      # The grid is extended to visit ampty rows to initialize dk/dv.
+      # The grid is extended to visit empty rows to initialize dk/dv.
       expected_active_rows_dkv = np.array(
           [0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 4, 5, 6, 7], dtype=np.int8
       )
@@ -1393,12 +1393,11 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         mask, block_shape, q_seq_shards=2
     )
     self.assertIsNone(mask_function)
-    pad = [0, 0, 0]
 
     expected_mask_next = np.concatenate(
         [
             np.array([0, 1, 2, 0, 1, 2, 0, 1, 2, 0]),  # local wide mask
-            np.array([3, 2, 3, 2, 3, 2, 3] + pad),  # local narrow mask
+            np.array([3, 2, 3, 2, 3, 2, 3, -1, -1, -1]),  # local narrow mask
         ],
         axis=0,
         dtype=np.int8,
@@ -1406,7 +1405,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     expected_block_mask = np.concatenate(
         [
             np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1]),  # local wide block mask
-            np.array([1, 1, 1, 1, 1, 1, 1] + pad),  # local narrow block mask
+            np.array([1, 1, 1, 1, 1, 1, 1, -1, -1, -1]),  # local narrow block mask
         ],
         axis=0,
         dtype=np.int8,
@@ -1415,7 +1414,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     expected_active_rows = np.concatenate(
         [
             np.array([0, 0, 1, 1, 1, 2, 2, 2, 3, 3]),
-            np.array([0, 1, 1, 2, 2, 3, 3] + pad),
+            np.array([0, 1, 1, 2, 2, 3, 3, -1, -1, -1]),
         ],
         axis=0,
         dtype=np.int8,
@@ -1424,7 +1423,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     expected_active_cols = np.concatenate(
         [
             np.array([0, 1, 0, 1, 2, 1, 2, 3, 2, 3]),
-            np.array([0, 0, 1, 1, 2, 2, 3] + pad),
+            np.array([0, 0, 1, 1, 2, 2, 3, -1, -1, -1]),
         ],
         axis=0,
         dtype=np.int8,
@@ -1457,7 +1456,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     expected_local_mask_next_dkv = np.concatenate(
         [
             np.array([0, 2, 1, 0, 2, 1, 0, 2, 1, 0]),
-            np.array([3, 2, 3, 2, 3, 2, 3] + pad),
+            np.array([3, 2, 3, 2, 3, 2, 3, -1, -1, -1]),
         ],
         axis=0,
         dtype=np.int8,
@@ -1477,7 +1476,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
                 3,
                 3,
             ]),
-            np.array([0, 0, 1, 1, 2, 2, 3] + pad),
+            np.array([0, 0, 1, 1, 2, 2, 3, -1, -1, -1]),
         ],
         axis=0,
         dtype=np.int8,
@@ -1486,7 +1485,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     expected_active_cols_dkv = np.concatenate(
         [
             np.array([0, 1, 0, 1, 2, 1, 2, 3, 2, 3]),
-            np.array([0, 1, 1, 2, 2, 3, 3] + pad),
+            np.array([0, 1, 1, 2, 2, 3, 3, -1, -1, -1]),
         ],
         axis=0,
         dtype=np.int8,
@@ -1495,7 +1494,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     expected_block_mask_dkv = np.concatenate(
         [
             np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1]),
-            np.array([1, 1, 1, 1, 1, 1, 1] + pad),
+            np.array([1, 1, 1, 1, 1, 1, 1, -1, -1, -1]),
         ],
         axis=0,
         dtype=np.int8,
@@ -1588,8 +1587,8 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
 
     expected_mask_next = np.array([0, 2, 0, 5, 0, 7, 0, 0], dtype=np.int8)
     expected_block_mask = np.array([1, 1, 2, 1, 2, 1, 0, 0], dtype=np.int8)
-    expected_active_rows = np.array([0, 1, 2, 2, 3, 3, 0, 0], dtype=np.int32)
-    expected_active_cols = np.array([0, 0, 0, 1, 0, 1, 0, 0], dtype=np.int32)
+    expected_active_rows = np.array([0, 1, 2, 2, 3, 3, -1, -1], dtype=np.int32)
+    expected_active_cols = np.array([0, 0, 0, 1, 0, 1, -1, -1], dtype=np.int32)
     expected_num_active_blocks = np.array([6], dtype=np.int32)
     expected_partial_mask_blocks = np.array(
         [
@@ -1616,8 +1615,8 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     )
 
     expected_mask_next_dkv = np.array([0, 2, 0, 0, 5, 7, 0, 0], dtype=np.int8)
-    expected_active_rows_dkv = np.array([0, 0, 0, 0, 1, 1, 0, 0], dtype=np.int32)
-    expected_active_cols_dkv = np.array([0, 1, 2, 3, 2, 3, 0, 0], dtype=np.int32)
+    expected_active_rows_dkv = np.array([0, 0, 0, 0, 1, 1, -1, -1], dtype=np.int32)
+    expected_active_cols_dkv = np.array([0, 1, 2, 3, 2, 3, -1, -1], dtype=np.int32)
     expected_block_mask_dkv = np.array([1, 1, 2, 2, 1, 1, 0, 0], dtype=np.int8)
     expected_num_active_blocks_dkv = np.array([6], dtype=np.int32)
 
@@ -1633,6 +1632,20 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     self._assert_mask_info_match(mask_info, expected_mask_info)
     self._assert_mask_info_match(mask_info_dkv, expected_mask_info_dkv)
 
+  def test_find_bounds(self):
+    test_cases = [
+        ("standard", [0, 0, 1, 1, 2], [1, 0, 1, 0, 1], [0, 1, 0, 1, 1], 5),
+        ("homogeneous", [5, 5, 5, 5], [1, 0, 0, 0], [0, 0, 0, 1], 5),
+        ("alternating", [0, 1, 0, 1], [1, 1, 1, 1], [1, 1, 1, 1], 4),
+        ("wrap_around", [1, 0, 0, 1], [1, 1, 0, 1], [1, 0, 1, 1], 4),
+        ("padding", [0, 0, -1], [1, 0, 0], [0, 1, 0], 2),
+    ]
+
+    for name, arr, exp_start, exp_end, n in test_cases:
+      with self.subTest(name):
+        start, end = mask_info_lib.find_bounds(np.array(arr))
+        np.testing.assert_array_equal(start[:n], np.array(exp_start)[:n])
+        np.testing.assert_array_equal(end[:n], np.array(exp_end)[:n])
 
 if __name__ == "__main__":
   absltest.main()
