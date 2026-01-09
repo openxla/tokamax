@@ -90,6 +90,23 @@ def full_mask_strategy(
 
 
 @dataclasses.dataclass
+class SplitMask(Mask):
+  q_seq_len: int
+  kv_seq_len: int
+
+  def get_mask(self) -> mask_lib.Mask:
+    mask = np.ones((self.q_seq_len, self.kv_seq_len)).astype(np.bool_)
+    mask[:, mask.shape[1] // 2 :] = False
+    return mask_lib.NumpyMask(mask)
+
+
+def split_mask_strategy(
+    q_seq_len: int, kv_seq_len: int
+) -> hps.SearchStrategy[Mask]:
+  return hps.just(SplitMask(q_seq_len, kv_seq_len))
+
+
+@dataclasses.dataclass
 class FullMask(Mask):
   q_seq_len: int
   kv_seq_len: int
@@ -195,6 +212,7 @@ def mask_strategy(draw: Draw, q_seq_len: int, kv_seq_len: int) -> Mask:
   oneof = [
       causal_mask_strategy(q_seq_len, kv_seq_len),
       full_mask_strategy(q_seq_len, kv_seq_len),
+      split_mask_strategy(q_seq_len, kv_seq_len),
       random_mask_strategy(q_seq_len, kv_seq_len),
       # TODO Composing masks creates masks that produce minor numerical
       # differences. We should investigate this in the future.
@@ -235,6 +253,18 @@ def model_config_strategy(draw: Draw) -> ModelConfig:
       head_dim_v,
       dtype,
   )
+
+
+def check_mask_no_empty_rows(
+    mask: mask_lib.Mask, segment_ids: splash.SegmentIds | None
+):
+  effective_mask = np.array(mask[:, :])
+
+  if segment_ids is not None:
+    segment_mask = segment_ids.q[:, None] == segment_ids.kv[None, :]
+    effective_mask = effective_mask & segment_mask
+
+  hp.assume(np.all(np.any(effective_mask, axis=1)))
 
 
 @hps.composite
@@ -355,6 +385,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
+    check_mask_no_empty_rows(mask, segment_ids)
     if is_dynamic_mask:
       mask = jnp.array(mask[:, :])
     config = data.draw(block_sizes_strategy(q_seq_len, kv_seq_len))
@@ -409,6 +440,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
+    check_mask_no_empty_rows(mask, segment_ids)
     if is_dynamic_mask:
       mask = jnp.array(mask[:, :])
     config = data.draw(block_sizes_strategy(q_seq_len, kv_seq_len))
@@ -510,6 +542,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
+    check_mask_no_empty_rows(mask, segment_ids)
     if is_dynamic_mask:
       mask = jnp.array(mask[:, :])
     config = data.draw(

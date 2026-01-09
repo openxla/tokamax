@@ -790,6 +790,54 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     self._assert_mask_info_match(mask_info, expected_mask_info)
     self._assert_mask_info_match(mask_info_dkv, expected_mask_info)
 
+  def test_no_partial_mask_blocks(self):
+    sequence_lengths = (64, 64)
+    block_shape = (16, 16)
+
+    mask = np.ones(sequence_lengths).astype(np.bool_)
+    mask[:32, 32:] = False
+    mask = mask_lib.NumpyMask(mask)
+
+    mask_info, mask_info_dkv, mask_function = self._process_mask(
+        mask, block_shape
+    )
+    self.assertIsNone(mask_function)
+
+    expected_mask_info = mask_info_lib.MaskInfo(
+        mask_next=None,
+        active_rows=np.array(
+            [0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3], dtype=np.int8
+        ),
+        active_cols=np.array(
+            [0, 1, 0, 1, 0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int8
+        ),
+        block_mask=np.array(
+            [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2], dtype=np.int8
+        ),
+        num_active_blocks=np.array([12], dtype=np.int32),
+        partial_mask_blocks=None,
+        q_sequence=None,
+    )
+
+    expected_mask_info_dkv = mask_info_lib.MaskInfo(
+        mask_next=None,
+        active_rows=np.array(
+            [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3], dtype=np.int8
+        ),
+        active_cols=np.array(
+            [0, 1, 2, 3, 0, 1, 2, 3, 2, 3, 2, 3], dtype=np.int8
+        ),
+        block_mask=np.array(
+            [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2], dtype=np.int8
+        ),
+        num_active_blocks=np.array([12], dtype=np.int32),
+        partial_mask_blocks=None,
+        q_sequence=None,
+    )
+
+    self._assert_mask_info_match(mask_info, expected_mask_info)
+    self._assert_mask_info_match(mask_info_dkv, expected_mask_info_dkv)
+
   @parameterized.product(
       is_lazy_mask=[True, False], return_dynamic_grid=[True, False]
   )

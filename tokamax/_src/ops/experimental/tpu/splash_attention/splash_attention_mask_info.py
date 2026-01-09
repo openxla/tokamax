@@ -255,13 +255,6 @@ def _get_mask_info(
       else:
         block_mask[idx] = 2
 
-  # If the mask is completely zero'd out return freshly initialized outputs.
-  if not partial_blocks:
-    return []
-
-  mask_coords_iter = iter(list(partial_blocks.keys()))
-  first_m = coord_m = next(mask_coords_iter)
-
   if return_dynamic_grid:
     active_mask = block_mask > 0
     if is_dkv:
@@ -281,14 +274,19 @@ def _get_mask_info(
     active_rows = active_cols = grid_size = None
 
   mask_next = []
-  for idx in active_indices:
-    is_next_mask = tuple(idx) > tuple(coord_m)
-    if is_next_mask:
-      try:
-        coord_m = next(mask_coords_iter)  # type: ignore
-      except StopIteration:
-        coord_m = first_m
-    mask_next.append(partial_blocks[coord_m])
+  if partial_blocks:
+    mask_coords_iter = iter(list(partial_blocks.keys()))
+    first_m = coord_m = next(mask_coords_iter)
+
+    for idx in active_indices:
+      is_next_mask = tuple(idx) > tuple(coord_m)
+      if is_next_mask:
+        try:
+          coord_m = next(mask_coords_iter)  # type: ignore
+        except StopIteration:
+          coord_m = first_m
+      mask_next.append(partial_blocks[coord_m])
+
   mask_next = np.array(mask_next, dtype=np.int32)
   flat_block_mask = block_mask.flatten()
 
@@ -489,9 +487,6 @@ def _process_mask(
   )
   coords_to_partial_mask_block_index: dict[tuple[int, int], int] = {}
 
-  q_sequence = None
-  mask_function = None
-
   # The mask object either define q_sequence and mask_function or none of
   # them.
   assert hasattr(mask, 'q_sequence') == hasattr(mask, 'mask_function')
@@ -503,103 +498,118 @@ def _process_mask(
   if hasattr(mask, 'q_sequence') and hasattr(mask, 'mask_function'):
     q_sequence = mask.q_sequence
     mask_function = mask.mask_function
+  else:
+    q_sequence = mask_function = None
 
   # Identify the partial mask blocks and the value of the block mask for each
   # block.
   # Partial mask blocks are uniquified. When partitioning, all partial mask
   # blocks are replicated across shards.
 
+  full_mask = True
   for coords in np.ndindex((q_blocks_count, kv_blocks_count)):
     (q_idx, kv_idx) = coords
     chunk = mask[(
         slice(q_idx * q_block_size, (q_idx + 1) * q_block_size),
         slice(kv_idx * kv_block_size, (kv_idx + 1) * kv_block_size),
     )]
+    if (chunk == 0).any():
+      full_mask = False
+
     if chunk.any() and not chunk.all():
       partial_mask_block_id = partial_mask_block_ids[_HashableNDArray(chunk)]
       coords_to_partial_mask_block_index[coords] = partial_mask_block_id
 
-  if not partial_mask_block_ids:
-    num_active_blocks = None
-    block_mask = None
-    mask_next = None
-    partial_mask_blocks = None
-    active_rows = None
-    active_cols = None
-  else:
+  if full_mask:
+    return MaskInfo(
+        mask_next=None,
+        active_rows=None,
+        active_cols=None,
+        block_mask=None,
+        num_active_blocks=None,
+        partial_mask_blocks=None,
+        q_sequence=q_sequence,
+    ), None
+
+  if partial_mask_block_ids:
     partial_mask_blocks = [x.array for x in partial_mask_block_ids]
     partial_mask_blocks = np.stack(partial_mask_blocks, axis=0).astype(
         partial_mask_blocks_dtype
     )
     if is_dkv:
       partial_mask_blocks = np.swapaxes(partial_mask_blocks, -1, -2)
+  else:
+    partial_mask_blocks = None
 
-    # Work on a fraction of the mask at the time to compute the mask. This is
-    # needed to compute the correct data indices, which are relative to the
-    # current slice of the mask.
+  # Work on a fraction of the mask at the time to compute the mask. This is
+  # needed to compute the correct data indices, which are relative to the
+  # current slice of the mask.
 
-    q_seq_len_shard_size = q_blocks_per_shard * q_block_size
-    kv_seq_len_shard_size = kv_blocks_per_shard * kv_block_size
+  q_seq_len_shard_size = q_blocks_per_shard * q_block_size
+  kv_seq_len_shard_size = kv_blocks_per_shard * kv_block_size
 
-    active_rows_slices = []
-    active_cols_slices = []
-    mask_next_slices = []
-    block_mask_slices = []
-    num_active_blocks = []
+  active_rows_slices = []
+  active_cols_slices = []
+  mask_next_slices = []
+  block_mask_slices = []
+  num_active_blocks = []
 
-    for q_shard_idx in range(q_seq_shards):
-      for kv_shard_idx in range(kv_seq_shards):
-        (  # pytype: disable=bad-unpacking
-            active_rows_slice,
-            active_cols_slice,
-            mask_next_slice,
-            block_mask_slice,
-            num_active_block,
-        ) = _get_mask_info(
-            mask=mask,
-            block_shape=block_shape,
-            coords_to_partial_mask_block_index=coords_to_partial_mask_block_index,
-            q_seq_start=q_shard_idx * q_seq_len_shard_size,
-            q_seq_shard_size=q_seq_len_shard_size,
-            blocked_q_seq_start=q_shard_idx * q_blocks_per_shard,
-            kv_seq_start=kv_shard_idx * kv_seq_len_shard_size,
-            kv_seq_shard_size=kv_seq_len_shard_size,
-            blocked_kv_seq_start=kv_shard_idx * kv_blocks_per_shard,
-            is_dkv=is_dkv,
-            return_dynamic_grid=return_dynamic_grid,
-        )
-        active_rows_slices.append(active_rows_slice)
-        active_cols_slices.append(active_cols_slice)
-        mask_next_slices.append(mask_next_slice)
-        block_mask_slices.append(block_mask_slice)
-        num_active_blocks.append(num_active_block)
+  for q_shard_idx in range(q_seq_shards):
+    for kv_shard_idx in range(kv_seq_shards):
+      (  # pytype: disable=bad-unpacking
+          active_rows_slice,
+          active_cols_slice,
+          mask_next_slice,
+          block_mask_slice,
+          num_active_block,
+      ) = _get_mask_info(
+          mask=mask,
+          block_shape=block_shape,
+          coords_to_partial_mask_block_index=coords_to_partial_mask_block_index,
+          q_seq_start=q_shard_idx * q_seq_len_shard_size,
+          q_seq_shard_size=q_seq_len_shard_size,
+          blocked_q_seq_start=q_shard_idx * q_blocks_per_shard,
+          kv_seq_start=kv_shard_idx * kv_seq_len_shard_size,
+          kv_seq_shard_size=kv_seq_len_shard_size,
+          blocked_kv_seq_start=kv_shard_idx * kv_blocks_per_shard,
+          is_dkv=is_dkv,
+          return_dynamic_grid=return_dynamic_grid,
+      )
+      active_rows_slices.append(active_rows_slice)
+      active_cols_slices.append(active_cols_slice)
+      mask_next_slices.append(mask_next_slice)
+      block_mask_slices.append(block_mask_slice)
+      num_active_blocks.append(num_active_block)
 
-    if return_dynamic_grid:
-      # Pad each slice to the largest number of active blocks in any shard.
-      max_size = max(num_active_blocks)
-      pad_slice = lambda arr: np.pad(arr, (0, max_size - arr.shape[0]))
-      active_rows_slices = list(map(pad_slice, active_rows_slices))
-      active_cols_slices = list(map(pad_slice, active_cols_slices))
-      mask_next_slices = list(map(pad_slice, mask_next_slices))
-      block_mask_slices = list(map(pad_slice, block_mask_slices))
+  if return_dynamic_grid:
+    # Pad each slice to the largest number of active blocks in any shard.
+    max_size = max(num_active_blocks)
+    pad_slice = lambda arr: np.pad(arr, (0, max_size - arr.shape[0]))
+    active_rows_slices = list(map(pad_slice, active_rows_slices))
+    active_cols_slices = list(map(pad_slice, active_cols_slices))
+    mask_next_slices = list(map(pad_slice, mask_next_slices))
+    block_mask_slices = list(map(pad_slice, block_mask_slices))
 
-      # Concatenate the sequence shards.
-      active_rows = np.concatenate(active_rows_slices, axis=0)
-      active_cols = np.concatenate(active_cols_slices, axis=0)
-      num_active_blocks = np.array(num_active_blocks, dtype=np.int32)
-
-      if downcast_smem_data:
-        active_rows = _downcast_to_small_type(active_rows)
-        active_cols = _downcast_to_small_type(active_cols)
-    else:
-      active_rows = active_cols = num_active_blocks = None
-
-    mask_next = np.concatenate(mask_next_slices, axis=0)
-    block_mask = np.concatenate(block_mask_slices, axis=0)
+    # Concatenate the sequence shards.
+    active_rows = np.concatenate(active_rows_slices, axis=0)
+    active_cols = np.concatenate(active_cols_slices, axis=0)
+    num_active_blocks = np.array(num_active_blocks, dtype=np.int32)
 
     if downcast_smem_data:
-      mask_next = _downcast_to_small_type(mask_next)
-      block_mask = _downcast_to_small_type(block_mask)
+      active_rows = _downcast_to_small_type(active_rows)
+      active_cols = _downcast_to_small_type(active_cols)
+  else:
+    active_rows = active_cols = num_active_blocks = None
+
+  mask_next = np.concatenate(mask_next_slices, axis=0)
+  block_mask = np.concatenate(block_mask_slices, axis=0)
+
+  if downcast_smem_data:
+    mask_next = _downcast_to_small_type(mask_next)
+    block_mask = _downcast_to_small_type(block_mask)
+
+  if partial_mask_blocks is None:
+    mask_next = None
 
   assert (mask_function is not None) == (q_sequence is not None)
   # When the mask can be computed inside the kernel with a mask_function,
