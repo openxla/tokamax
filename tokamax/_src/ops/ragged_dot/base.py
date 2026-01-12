@@ -72,21 +72,25 @@ class GroupSizes:
   """
 
   value: jax.Array
-  representative_value: tuple[int, ...] = _STATIC
+  representative_value: Sequence[int] = _STATIC
 
   def __post_init__(self):
     (num_groups,) = self.value.shape
-    if len(self.representative_value) != num_groups:
+    representative_value = tuple(self.representative_value)
+
+    if len(representative_value) != num_groups:
       raise ValueError(
           "Representative value must have the same length as the group sizes."
       )
 
     if not isinstance(self.value, jax.Array):
-      value = np.asarray(self.representative_value, np.int32)
+      value = np.asarray(representative_value, np.int32)
       object.__setattr__(self, "value", value)
 
     if not np.issubdtype(self.value.dtype, np.integer):
       raise ValueError("Group sizes must be integers.")
+
+    object.__setattr__(self, "representative_value", representative_value)
 
   def __jax_array__(self):
     return self.value
