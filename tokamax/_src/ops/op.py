@@ -43,7 +43,7 @@ from tokamax._src.autotuning import cache as autotuning_cache
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
-_Residuals = TypeVar("_Residuals")
+_R = TypeVar("_R")
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 AutotuningData = autotuner_lib.AutotuningData
@@ -58,8 +58,51 @@ class NullConfig:
 _NULL_CONFIG: Final[NullConfig] = NullConfig()
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, slots=True)
+class _FlatTree:
+  values: list[jax.Array]
+  tree: jax.tree_util.PyTreeDef = dataclasses.field(metadata=dict(static=True))
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclasses.dataclass(frozen=True, slots=True)
+class Residuals(Generic[_T, _R]):
+  """Complete arguments and residual values passed to VJP."""
+
+  args: tuple[Any, ...]
+  kwargs: dict[str, Any]
+  out: _T
+  residuals: _R
+
+  def tree_flatten(self) -> tuple[Any, Any]:  # pylint: disable=missing-function-docstring
+    args_flat, args_tree = jax.tree.flatten((self.args, self.kwargs))
+    arrays = []
+    array_idxs = []
+    other = []
+    for i, arg in enumerate(args_flat):
+      if isinstance(arg, jax.Array):
+        array_idxs.append(i)
+        arrays.append(arg)
+      else:
+        other.append(arg)
+    aux = (args_tree, tuple(array_idxs), tuple(other))
+    return (arrays, self.out, self.residuals), aux
+
+  @classmethod
+  def tree_unflatten(cls, aux_data, children) -> Self:
+    args_tree, array_idxs, other = aux_data
+    arrays, out, residuals = children
+    arrays, other = map(lambda x: list(reversed(x)), (arrays, other))
+    args, kwargs = args_tree.unflatten((
+        arrays.pop() if i in array_idxs else other.pop()
+        for i in range(len(array_idxs) + len(other))
+    ))
+    return cls(args, kwargs, out, residuals)
+
+
 @dataclasses.dataclass(frozen=True)
-class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
+class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
   """Base class for operations.
 
   `Op`s are callable. The `__call__` method will perform the following steps:
@@ -111,7 +154,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
   # The VJP function must return a tuple of gradients for each positional
   # argument, or a dict `{"argname": gradient, ...}`. If a dict is returned, any
   # input array arguments not in the dict will have gradients set to zeros.
-  vjp: Callable[Concatenate[_Residuals, _T, _T, _P], Any] | None = None
+  vjp: Callable[Concatenate[_R, _T, _T, _P], Any] | None = None
 
   def __init_subclass__(cls, *args, **kwargs):
     super().__init_subclass__(*args, **kwargs)
@@ -133,12 +176,12 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
       *args: _P.args,
       return_residuals: Literal[True] = ...,
       **kwargs: _P.kwargs,
-  ) -> tuple[_T, _Residuals]:
+  ) -> tuple[_T, _R]:
     ...
 
   def __call__(
       self, *args: _P.args, return_residuals: bool = False, **kwargs: _P.kwargs
-  ) -> _T | tuple[_T, _Residuals]:
+  ) -> _T | tuple[_T, _R]:
     """Applies the operation with the given arguments."""
 
     if not self.supports_symbolic_shapes and shape.contains_symbolic_shape(
@@ -198,8 +241,10 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
           return ret, f_vjp
 
         out, residuals = self._fwd(*args, config=config, **kwargs)
+
       ret = (out, residuals) if return_residuals else out
-      return ret, (arrays, out, residuals)
+      full_residuals = Residuals(args, kwargs, out, residuals)
+      return ret, _FlatTree(*jax.tree.flatten(full_residuals))
 
     def f(*arrays):
       return fwd(*arrays, fwd_res=False)[0]
@@ -215,10 +260,13 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     else:
 
       def bwd(residuals, dout):  # pylint: disable=function-redefined
-        arrays, out, residuals = residuals
-        dout = dout[0] if return_residuals else dout
-        args, kwargs = args_tree.unflatten(merge(arrays, other))
+        residuals = residuals.tree.unflatten(residuals.values)
+        args = residuals.args
+        kwargs = residuals.kwargs
         kwargs.pop("return_residuals")
+        out = residuals.out
+        residuals = residuals.residuals
+        dout = dout[0] if return_residuals else dout
         grads = self.vjp(residuals, out, dout, *args, **kwargs)  # pytype: disable=wrong-arg-count
 
         if isinstance(grads, dict):
@@ -273,7 +321,7 @@ class Op(abc.ABC, Generic[_P, _T, _Residuals, _Config, _Key]):
     return cache[device_kind]
 
   @abc.abstractmethod
-  def _fwd(self, *args, **kwargs) -> tuple[_T, _Residuals | None]:
+  def _fwd(self, *args, **kwargs) -> tuple[_T, _R | None]:
     ...
 
   def _get_heuristics_config(self, ba: "BoundArguments") -> _Config:
