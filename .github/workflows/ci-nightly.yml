@@ -52,8 +52,8 @@ jobs:
 
   tokamax-nightly-ops-tests:
     strategy:
-        matrix:
-          runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
+      matrix:
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
