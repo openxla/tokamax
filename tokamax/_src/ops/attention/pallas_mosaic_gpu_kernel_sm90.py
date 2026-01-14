@@ -282,17 +282,18 @@ def flash_attention_kernel(
         plgpu.barrier_wait(v_barriers.at[si])
         plgpu.barrier_wait(schedule_barrier)
 
-        if not p_sum_before_barriers:
-          l_i += p.sum(axis=1)
-
-        def compute_pv(acc_ref):
+        def compute_pv(refs):
+          acc_ref, l_i_ref = refs
           plgpu.wgmma(acc_ref, p_, v_smems.at[si])
+
+          if not p_sum_before_barriers:
+            l_i_ref[...] += p.sum(axis=1)
 
           @pl.when(ki + 1 < ub)
           def _():
             plgpu.barrier_wait(k_barriers.at[lax.rem(ki + 1, max_stages)])
 
-        acc = pl.run_state(compute_pv)(plgpu.ACC.init(acc))
+        acc, l_i = pl.run_state(compute_pv)((plgpu.ACC.init(acc), l_i))
         plgpu.barrier_arrive(v_consumed_barriers.at[si])
         return acc, m_i, l_i
 
