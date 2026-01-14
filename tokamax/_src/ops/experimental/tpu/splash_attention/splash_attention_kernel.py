@@ -1023,7 +1023,7 @@ def _splash_attention_forward(
 
     matmul_flops = (
         2 * q_seq_len * kv_seq_len * head_dim_qk
-        + 2 * kv_seq_len * kv_seq_len * head_dim_v
+        + 2 * q_seq_len * kv_seq_len * head_dim_v
     )
 
     # This is an upper bound because `mask_sparsity` is actually the mean
