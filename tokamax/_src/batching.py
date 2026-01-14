@@ -15,10 +15,9 @@
 """Batching (a.k.a. `vmap`) utilities."""
 
 from collections.abc import Callable, Sequence
-import dataclasses
 import functools
 import inspect
-from typing import Any, Generic, ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
 import jax
 import jax.numpy as jnp
