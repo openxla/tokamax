@@ -216,8 +216,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
     if isinstance(rhs, QArray):
       rhs_dtype_bits = jnp.iinfo(rhs.qvalue.dtype).bits
+      scale_tile_shape = rhs.scale_tile_shape[1]
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
+      scale_tile_shape = 0
     out_dtype = ba.kwargs["preferred_element_type"]
     if out_dtype is None:
       out_dtype = jnp.promote_types(lhs.dtype, rhs.dtype)
@@ -227,17 +229,18 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     warp_specialized = [True, False] if isinstance(rhs, QArray) else [True]
 
     configs = set()
-    # For prefill
     for persistent in [True, False]:
-      for async_store in [True, False]:
-        for ws in warp_specialized:
-          for block_k in [128, 256]:
+      for ws in warp_specialized:
+        for async_store in [True, False]:
+          for block_k in [128, 256, 512]:
             if (block_k * rhs_dtype_bits) % (128 * 8) or (
                 block_k * lhs_dtype_bits
             ) % (128 * 8):
               continue
-            for block_m in [128, 64]:
-              for num_stages in [4, 2, 1]:
+            if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
+              continue
+            for block_m in [128, 64, 32, 16]:
+              for num_stages in [4, 2]:
                 for grid_minor_dim in [
                     common.MatmulDimension.M,
                     common.MatmulDimension.N,
@@ -249,41 +252,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                             block_n=out_swizzle_elems,
                             block_k=block_k,
                             num_stages=num_stages,
-                            split_k=1,
-                            async_store=async_store,
                             warp_specialized=ws,
                             persistent=persistent,
-                            grid_block_n=grid_tile_width,
-                            grid_minor_dim=grid_minor_dim,
-                            grid_tile_width=grid_tile_width,
-                        )
-                    )
-    # For generate
-    for persistent in [True, False]:
-      for async_store in [True, False]:
-        for ws in warp_specialized:
-          for block_k in [128, 256]:
-            if (block_k * rhs_dtype_bits) % (128 * 8) or (
-                block_k * lhs_dtype_bits
-            ) % (128 * 8):
-              continue
-            for block_m in [64, 32, 24, 16]:
-              for num_stages in [4]:
-                for grid_minor_dim in [
-                    common.MatmulDimension.M,
-                    common.MatmulDimension.N,
-                ]:
-                  for grid_tile_width in [1, 2, 4, 8]:
-                    configs.add(
-                        Config(
-                            block_m=block_m,
-                            block_n=out_swizzle_elems,
-                            block_k=block_k,
-                            num_stages=num_stages,
                             split_k=1,
                             async_store=async_store,
-                            warp_specialized=ws,
-                            persistent=persistent,
                             grid_block_n=grid_tile_width,
                             grid_minor_dim=grid_minor_dim,
                             grid_tile_width=grid_tile_width,
