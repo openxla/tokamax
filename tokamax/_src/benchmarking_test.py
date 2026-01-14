@@ -88,28 +88,28 @@ class BenchmarkingTest(parameterized.TestCase):
 
       golden_out = {
           'out': jnp.array(
-              [[8.146019, -4.8131247], [-5.683734, -6.8620615]],
+              [[12.999482, -8.095615], [-5.535231, -6.9900618]],
               dtype=jnp.float32,
           )
       }
       golden_vjp = [
           jnp.array(
-              [[8.146019, -4.8131247], [-5.683734, -6.8620615]],
+              [[12.999482, -8.095615], [-5.535231, -6.9900618]],
               dtype=jnp.float32,
           ),
           jnp.array(
-              [[10.445571, -0.01965224], [-1.7148038, -4.3324137]],
+              [[41.637928, -20.686935], [-0.17140004, -0.3397919]],
               dtype=jnp.float32,
           ),
           jnp.array(
-              [[2.5672877, 1.3520446], [-3.4060767, -0.22178978]],
+              [[-53.57182, -25.94791], [1.5480026, -4.553603]],
               dtype=jnp.float32,
           ),
       ]
       # Tests against goldens ensures that initialization is constant over
       # time. Tests both forward and backward consistency.
-      chex.assert_trees_all_close(out_fwd_vjp, golden_out, atol=1e-5)
-      chex.assert_trees_all_close(dargs_fwd_vjp[:3], golden_vjp, atol=1e-4)
+      chex.assert_trees_all_close(out_fwd_vjp, golden_out, rtol=1e-4)
+      chex.assert_trees_all_close(dargs_fwd_vjp[:3], golden_vjp, rtol=1e-4)
       chex.assert_trees_all_close(out_fwd_vjp, out_orig)
 
       f_vjp, args_vjp = benchmarking.standardize_function(
@@ -225,5 +225,4 @@ class BenchmarkingTest(parameterized.TestCase):
 
 
 if __name__ == '__main__':
-  jax.config.update('jax_threefry_partitionable', False)
   absltest.main()

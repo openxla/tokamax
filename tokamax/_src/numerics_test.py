@@ -29,8 +29,6 @@ if jax.__version_info__ >= (0, 6, 3):
 else:
   Layout = layout.DeviceLocalLayout  # type: ignore
 
-jax.config.update('jax_threefry_partitionable', False)
-
 
 class NumericsTest(parameterized.TestCase):
 
