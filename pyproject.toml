@@ -26,7 +26,6 @@ dependencies = [
     "jaxtyping>=0.3",
     "pydantic>=2.11.0",
     "qwix>=0.1.2",
-    "tensorflow",
     "tqdm",
     "typing_extensions>=4.5.0",
     "typeguard==2.13.3",
@@ -47,9 +46,10 @@ tokamax = ["data/autotuning/*/*.json"]
 [project.optional-dependencies]
 test = [
     "chex>=0.1.91",
+    "flatbuffers",
+    "flax",
     "pytest-xdist",
     "pytest",
-    "flax",
 ]
 
 bench = [

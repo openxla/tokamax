@@ -28,7 +28,6 @@ from tokamax._src import benchmarking
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
-from tokamax._src.ops.attention import api as attn_api
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
@@ -37,8 +36,6 @@ from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu as pl_ragged_dot_mosaic_tpu
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
-
-from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,23 +130,7 @@ class AutotuningTest(parameterized.TestCase):
     x_shape = (2, 64, 128) if vmap else (64, 128)
     f, args, expected = get_fn_and_args_and_expected_bound_args(x_shape, vmap)
     f_lowered = jax.jit(f).lower(*args)
-    actual = api.get_bound_args(f_lowered)
-    self.assertEqual(actual, expected)
-
-  def test_get_bound_args_from_hlo(self):
-    if jax.default_backend() == "tpu":
-      self.skipTest("Currently only supported on GPU.")
-
-    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
-    f_lowered = jax.jit(f).lower(*args)
-    hlo_modules = f_lowered.compile().runtime_executable().hlo_modules()
-    hlo_modules = [
-        hlo_pb2.HloModuleProto.FromString(hlo.as_serialized_hlo_module_proto())
-        for hlo in hlo_modules
-    ]
-    # Replicate the HLO modules multiple times to ensure that the bound args are
-    # unique.
-    self.assertEqual(api.get_bound_args(hlo_modules * 10), expected)
+    self.assertEqual(api.get_bound_args(f_lowered), expected)
 
   def test_get_bound_args_unique(self):
     if jax.default_backend() == "tpu":

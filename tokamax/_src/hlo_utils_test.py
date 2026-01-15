@@ -97,7 +97,8 @@ class DumpHloLibTest(parameterized.TestCase):
     )
     self.assertIsInstance(kernel_info, expected_class)
     self.assertEqual(
-        kernel_info.output, jax.ShapeDtypeStruct(shape=(8,), dtype=jnp.int32)
+        kernel_info.outputs,
+        (jax.ShapeDtypeStruct(shape=(8,), dtype=jnp.int32),),
     )
 
   def test_simple_pallas_triton(self):
@@ -130,7 +131,6 @@ class DumpHloLibTest(parameterized.TestCase):
     shape = jax.ShapeDtypeStruct(shape=(8,), dtype=dtype)
     self.assertEqual(kernel_1.inputs, (shape, shape))
     self.assertEqual(kernel_2.inputs, (shape,))
-
     self.assertEqual(kernel_2.grid, (8, 1, 1))
 
   def test_pallas_norm(self):
@@ -166,7 +166,7 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertEqual(vjp.kernel_name, 'pallas_layer_norm_vjp')
 
     self.assertLen(forward.inputs, 3)
-    self.assertLen(forward.output, 3)
+    self.assertLen(forward.outputs, 3)
 
     # `x` is canonicalized to a 3D shape.
     x_canonical_shape = (math.prod(x_shape[:-1]), x_shape[-1], 1)

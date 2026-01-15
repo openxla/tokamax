@@ -21,8 +21,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
-from jax._src.lib.mlir.dialects import arith
-from jax._src.lib.mlir.dialects import memref
+from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import memref
 import qwix
 from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_dot import base

@@ -39,16 +39,7 @@ from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 import tqdm
 
-from tensorflow.compiler.xla.service import hlo_pb2  # pylint: disable=g-direct-tensorflow-import
 
-
-HloComputation: TypeAlias = (
-    jax.stages.Lowered
-    | hlo_pb2.HloModuleProto
-    | Sequence[hlo_pb2.HloModuleProto]
-    | hlo_pb2.HloProto
-    | Sequence[hlo_pb2.HloProto]
-)
 BoundArgsAutotuningData: TypeAlias = tuple[
     op_lib.BoundArguments, autotuner.AutotuningData[Any]
 ]
@@ -185,7 +176,7 @@ _P = ParamSpec("_P")
 def get_bound_args(
     f: (
         Callable[_P, Any]
-        | HloComputation
+        | jax.stages.Lowered
     ),
     *args: _P.args,
     **kwargs: _P.kwargs,
@@ -193,7 +184,7 @@ def get_bound_args(
   """Returns a tuple of unique BoundArguments for all Tokamax ops in `f`.
 
   Args:
-    f: A callable, an HLO computation, or an XprofId.
+    f: A callable, or a lowered JAX function.
     *args: Positional arguments to `f` (only valid if `f` is callable).
     **kwargs: Keyword arguments to `f` (only valid if `f` is callable).
 
@@ -207,43 +198,19 @@ def get_bound_args(
   elif args or kwargs:
     raise ValueError("`args` / `kwargs` are only supported if `f` is callable.")
 
-  hlo_modules = _get_hlo_modules(f)
+  bound_args = hlo_utils.get_opspecs(f)
+
   # Filter out bound args so that only unique ones remain.
   seen_keys = set()
   unique_bound_args = []
-  for bound_arg in hlo_utils.get_opspecs(hlo_modules):
+  for bound_arg in bound_args:
     # The chosen config is serialized into the HLO - remove it here.
-    object.__setattr__(bound_arg.op, "config", None)
+    bound_arg = bound_arg.replace(op=bound_arg.op.replace(config=None))
     key = bound_arg.autotuning_cache_key
     if (bound_arg.op.__class__.__name__, key) not in seen_keys:
       seen_keys.add((bound_arg.op.__class__.__name__, key))
       unique_bound_args.append(bound_arg)
   return tuple(unique_bound_args)
-
-
-_convert_hlo_module = (
-    lambda x: x.hlo_module if isinstance(x, hlo_pb2.HloProto) else x
-)
-
-
-def _get_hlo_modules(
-    x: HloComputation,
-) -> tuple[hlo_pb2.HloModuleProto, ...]:
-  """Converts x to a tuple of HLO module protos."""
-
-  if isinstance(x, hlo_pb2.HloModuleProto):
-    return (x,)
-  elif isinstance(x, hlo_pb2.HloProto):
-    return (x.hlo_module,)
-  elif isinstance(x, (tuple, list)):
-    return tuple(_convert_hlo_module(hlo) for hlo in x)
-  elif isinstance(x, jax.stages.Lowered):
-    return tuple(
-        hlo_pb2.HloModuleProto.FromString(hlo.as_serialized_hlo_module_proto())
-        for hlo in x.compile().runtime_executable().hlo_modules()
-    )
-  else:
-    raise ValueError(f"Unsupported HLO computation type {type(x)}")
 
 
 _API_IMPLEMENTATIONS: Final[
@@ -282,7 +249,7 @@ def autotune(
     f: (
         Callable[..., Any]
         | Sequence[op_lib.BoundArguments]
-        | HloComputation
+        | jax.stages.Lowered
     ),
     *args,
     ignore_cache: bool = False,
@@ -292,7 +259,7 @@ def autotune(
   """Autotunes all captured ops in x.
 
   Args:
-    f: A callable, a list of bound arguments, or an HLO computation.
+    f: A callable, a list of bound arguments, or a lowered JAX function.
     *args: Positional arguments to `f` (only valid if `f` is callable). NOTE -
       To autotune a callable with keyword arguments, pass the results of
       `tokamax.get_bound_args(f, *args, **kwargs)` to `autotune`.

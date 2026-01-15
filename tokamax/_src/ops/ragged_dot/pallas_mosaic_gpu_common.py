@@ -25,8 +25,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
-from jax._src.lib.mlir.dialects import arith
-from jax._src.lib.mlir.dialects import memref
+from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import memref
 import pydantic
 
 
