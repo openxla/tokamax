@@ -240,7 +240,11 @@ def flash_attention_vjp_kernel(
         return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=_WGMMA)
 
       if is_causal:
-        s = jnp.where(q_base + iota(0) >= kv_base + iota(1), s, mask_value)
+
+        def apply_causal_mask():
+          return jnp.where(q_base + iota(0) >= kv_base + iota(1), s, mask_value)
+
+        s = lax.cond(kv_base + block_kv > q_base, apply_causal_mask, lambda: s)
 
       if k_start is not None:
         k_start_ = lax.broadcast_in_dim(k_start, s.shape, [0])
@@ -455,7 +459,13 @@ def flash_attention_vjp_kernel(
         return plgpu.broadcasted_iota(jnp.int32, sT.shape, d, layout=_WGMMA)
 
       if is_causal:
-        sT = jnp.where(kv_base + iota(0) <= q_base + iota(1), sT, mask_value)
+
+        def apply_causal_mask():
+          mask = kv_base + iota(0) <= q_base + iota(1)
+          return jnp.where(mask, sT, mask_value)
+
+        needs_causal_mask = kv_base + block_kv > q_base
+        sT = lax.cond(needs_causal_mask, apply_causal_mask, lambda: sT)
 
       def load_k_range(ref):
         idx = (0 if (ref.shape[0] == 1) else hi, qs)
