@@ -14,6 +14,7 @@
 # ==============================================================================
 
 
+import functools
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -27,8 +28,8 @@ from tokamax._src.ops.attention import pallas_mosaic_tpu as fa
 class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
 
   def setUp(self):
-    if jax.default_backend() != "tpu":
-      self.skipTest("Only supported on TPUs.")
+    if jax.default_backend() != 'tpu':
+      self.skipTest('Only supported on TPUs.')
     super().setUp()
 
   @parameterized.product(
@@ -58,45 +59,70 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
 
     is_causal = masking == 'causal'
     mask = (
-        jax.ShapeDtypeStruct(
-            (1, 1, q_seq_len, kv_seq_len), dtype=jnp.bool_
-        )
+        jax.ShapeDtypeStruct((1, 1, q_seq_len, kv_seq_len), dtype=jnp.bool_)
         if masking == 'bool'
         else None
     )
-    q, k, v, mask = numerics.random_initialize((q, k, v, mask))
+    do = jax.ShapeDtypeStruct(
+        (batch_size, q_seq_len, num_q_heads, head_dim), dtype=jnp.float32
+    )
+
+    q, k, v, mask, do = numerics.random_initialize((q, k, v, mask, do))
 
     @jax.jit
-    def f_base(query, key, value):
-      return fa_base.DotProductAttention()(
-          q=query,
-          k=key,
-          v=value,
-          mask=mask,
-          is_causal=is_causal,
-          logits_soft_cap=logits_soft_cap,
-          logits_scale=2.2,
+    def f_base(query, key, value, do):
+
+      primals, f_vjp = jax.vjp(
+          functools.partial(
+              fa_base.DotProductAttention(),
+              mask=mask,
+              is_causal=is_causal,
+              logits_soft_cap=logits_soft_cap,
+              logits_scale=2.2,
+          ),
+          query,
+          key,
+          value,
       )
+
+      return primals, f_vjp(do)
 
     @jax.jit
-    def f(query, key, value):
-      return fa.PallasMosaicTpuFlashAttention()(
-          q=query,
-          k=key,
-          v=value,
-          mask=mask,
-          is_causal=is_causal,
-          logits_soft_cap=logits_soft_cap,
-          logits_scale=2.2,
+    def f(query, key, value, do):
+
+      primals, f_vjp = jax.vjp(
+          functools.partial(
+              fa.PallasMosaicTpuFlashAttention(),
+              mask=mask,
+              is_causal=is_causal,
+              logits_soft_cap=logits_soft_cap,
+              logits_scale=2.2,
+          ),
+          query,
+          key,
+          value,
       )
 
-    out = f(query=q, key=k, value=v)
-    out_base = f_base(query=q, key=k, value=v)
+      return primals, f_vjp(do)
+
+    out_base, (dq_base, dk_base, dv_base) = f_base(q, k, v, do)
+    out, (dq, dk, dv) = f(q, k, v, do)
 
     atol = 0.035 if logits_soft_cap else 0.15
-    chex.assert_trees_all_close(
-        out.astype(jnp.float32), out_base.astype(jnp.float32), atol=atol
-    )
+    with self.subTest('output'):
+      chex.assert_trees_all_close(out, out_base, atol=atol)
+
+    atol = 0.15 if logits_soft_cap else 1.5
+    with self.subTest('dq'):
+      chex.assert_trees_all_close(dq, dq_base, atol=atol)
+
+    atol = 0.13 if logits_soft_cap else 1.2
+    with self.subTest('dk'):
+      chex.assert_trees_all_close(dk, dk_base, atol=atol)
+
+    atol = 0.03 if logits_soft_cap else 0.15
+    with self.subTest('dv'):
+      chex.assert_trees_all_close(dv, dv_base, atol=atol)
 
 
 if __name__ == '__main__':

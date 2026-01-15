@@ -52,6 +52,21 @@ class Config:
       )
 
 
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class ConfigVjp:
+  block_q_dkv: pydantic.conint(multiple_of=_NUM_LANES, gt=0) = 128
+  block_kv_dkv: pydantic.conint(multiple_of=_NUM_LANES, gt=0) = 128
+  block_kv_dkv_compute: pydantic.conint(multiple_of=_NUM_LANES, gt=0) = 128
+
+  def __post_init__(self):
+    if self.block_kv_dkv % self.block_kv_dkv_compute:
+      block_kv_dkv = self.block_kv_dkv
+      block_kv_dkv_compute = self.block_kv_dkv_compute
+      raise ValueError(
+          f"{block_kv_dkv=} must be a multiple of {block_kv_dkv_compute=}."
+      )
+
+
 @dataclasses.dataclass(frozen=True)
 class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
   """Flash attention with Mosaic TPU."""
@@ -145,6 +160,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         k_layout=splash.QKVLayout.HEAD_DIM_MINOR,
         v_layout=splash.QKVLayout.HEAD_DIM_MINOR,
         **dataclasses.asdict(config),
+        **dataclasses.asdict(ConfigVjp()),
     )
 
     # TODO: support multiple shards.
