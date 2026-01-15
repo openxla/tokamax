@@ -136,7 +136,8 @@ def lax_drhs_bwd(lhs, out, group_sizes, tile_m, tile_k, tile_n, **kw):
 
 def gmm_fwd(lhs, rhs, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
   config = pallas_mosaic_tpu.Config(
-      gmm_tiling=(tile_m, tile_k, tile_n), input_buffer_count=input_buffer_count
+      tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
+      input_buffer_count=input_buffer_count
   )
   return pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)(
       lhs,
@@ -148,7 +149,7 @@ def gmm_fwd(lhs, rhs, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
 
 def dlhs_bwd(out, rhs, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
   config = pallas_mosaic_tpu.Config(
-      gmm_rhs_transpose_tiling=(tile_m, tile_k, tile_n),
+      tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
       input_buffer_count=input_buffer_count,
   )
   return pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)(
@@ -161,7 +162,7 @@ def dlhs_bwd(out, rhs, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
 
 def drhs_bwd(lhs, out, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
   config = pallas_mosaic_tpu.Config(
-      tgmm_tiling=(tile_m, tile_k, tile_n),
+      tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
       input_buffer_count=input_buffer_count,
   )
   return pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)(
