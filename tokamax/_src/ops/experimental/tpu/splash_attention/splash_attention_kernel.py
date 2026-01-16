@@ -802,7 +802,7 @@ def _splash_attention_forward(
     total_flops = num_q_heads * matmul_flops * mask_sparsity
 
     # Count expensive exp() calls
-    transcendentals = num_q_heads * q_seq_len * kv_seq_len
+    transcendentals = num_q_heads * q_seq_len * kv_seq_len * mask_sparsity
 
     inputs_ = [q, k, v, q_segment_ids, kv_segment_ids, partial_mask_blocks]
     input_bytes = sum(map(_bytes, inputs_))
