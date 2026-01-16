@@ -226,7 +226,16 @@ def flash_attention_kernel(
         if use_base2:
           scale *= math.log2(math.e)
 
-        s *= scale
+        # If we are applying any mask, rescale `s` here. Otherwise, we defer it
+        # to the softmax computation below (allowing FMA to be used).
+        if (
+            mask is not None
+            or k_start is not None
+            or k_end is not None
+            or mask_gmem is not None
+        ):
+          s *= scale
+          scale = 1.0
 
         mask_value = float(jnp.finfo(jnp.float32).min)
 
@@ -262,14 +271,14 @@ def flash_attention_kernel(
 
         exp = jnp.exp2 if use_base2 else jnp.exp
         if use_stable_softmax:
-          m_ij = jnp.maximum(m_i, s.max(axis=1))
+          m_ij = jnp.maximum(m_i, s.max(axis=1) * scale)
           alpha = exp(m_i - m_ij)
           m_i = m_ij
-          p = exp(s - lax.broadcast_in_dim(m_ij, s.shape, [0]))
+          p = exp(s * scale - lax.broadcast_in_dim(m_ij, s.shape, [0]))
           acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
           l_i *= alpha
         else:
-          p = exp(s)
+          p = exp(s * scale)
         p_ = p.astype(v.dtype)
 
         # Can't fully explain why, but empirically the ordering here influences
