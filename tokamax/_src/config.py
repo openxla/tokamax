@@ -16,6 +16,7 @@
 
 import contextlib
 import dataclasses
+import sys
 import threading
 from typing import Generic, TypeVar
 
@@ -58,6 +59,8 @@ class _ConfigOption(Generic[_T]):
 
   @property
   def value(self) -> _T:
+    if not flags.FLAGS.is_parsed():
+      flags.FLAGS(sys.argv)
     return getattr(_STATE, self.flag.name, self.flag.value)
 
 
