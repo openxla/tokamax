@@ -83,6 +83,7 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
       except FileNotFoundError:
         logging.info("Autotuning cache file not found: %s", path)
         json_data = "{}"
+      json_data = "{}" if json_data is None else json_data
       # Cache paths later in the list will override earlier ones.
       data = _get_cache_adapter(self.op).validate_json(json_data)
       out |= {
