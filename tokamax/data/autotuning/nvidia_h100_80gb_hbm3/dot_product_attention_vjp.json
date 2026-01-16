@@ -1,0 +1,52 @@
+{
+  "{\"residuals\":[\"f32[32,32,4096]\",\"f32[32,32,4096]\"],\"out\":\"bf16[32,4096,32,128]\",\"dout\":\"bf16[32,4096,32,128]\",\"q\":\"bf16[32,4096,32,128]\",\"k\":\"bf16[32,4096,8,128]\",\"v\":\"bf16[32,4096,8,128]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.08838834764831843,\"bias\":null,\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":null,\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":true},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {},
+  "{\"residuals\":[\"f32[512,16,1024]\",\"f32[512,16,1024]\"],\"out\":\"bf16[512,1024,16,128]\",\"dout\":\"bf16[512,1024,16,128]\",\"q\":\"bf16[512,1024,16,192]\",\"k\":\"bf16[512,1024,16,192]\",\"v\":\"bf16[512,1024,16,128]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.07216878364870323,\"bias\":null,\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":null,\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":true},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {},
+  "{\"residuals\":[\"f32[384,4,384]\",\"f32[384,4,384]\"],\"out\":\"bf16[384,384,4,32]\",\"dout\":\"bf16[384,384,4,32]\",\"q\":\"bf16[384,384,4,32]\",\"k\":\"bf16[384,384,4,32]\",\"v\":\"bf16[384,384,4,32]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.17677669529663687,\"bias\":\"bf16[1,4,384,384]\",\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":\"bool[384,1,1,384]\",\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":false},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 2868.6749240150675,
+      "lower_time_ms": 59.1320589883253,
+      "evaluation_times_ms": [
+        4.633066,
+        4.635051,
+        4.637034,
+        4.639626,
+        4.633515
+      ],
+      "metadata": {
+        "peak_memory_mb": 2094.890655517578
+      }
+    }
+  },
+  "{\"residuals\":[\"f32[384,4,384]\",\"f32[384,4,384]\"],\"out\":\"bf16[384,384,4,64]\",\"dout\":\"bf16[384,384,4,64]\",\"q\":\"bf16[384,384,4,64]\",\"k\":\"bf16[384,384,4,64]\",\"v\":\"bf16[384,384,4,64]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.125,\"bias\":\"bf16[1,4,384,384]\",\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":\"bool[384,1,1,384]\",\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":false},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 2852.3300860542804,
+      "lower_time_ms": 59.305579983629286,
+      "evaluation_times_ms": [
+        5.058924,
+        5.0531,
+        5.05406,
+        5.04814,
+        5.057964
+      ],
+      "metadata": {
+        "peak_memory_mb": 2454.890655517578
+      }
+    }
+  },
+  "{\"residuals\":[\"f32[768,4,768]\",\"f32[768,4,768]\"],\"out\":\"bf16[768,768,4,64]\",\"dout\":\"bf16[768,768,4,64]\",\"q\":\"bf16[768,768,4,64]\",\"k\":\"bf16[768,768,4,64]\",\"v\":\"bf16[768,768,4,64]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.125,\"bias\":\"bf16[1,4,768,768]\",\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":\"bool[768,1,1,768]\",\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":false},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 2683.7926090229303,
+      "lower_time_ms": 60.87668502004817,
+      "evaluation_times_ms": [
+        33.130047,
+        33.137055,
+        33.14336,
+        33.135519,
+        33.134367
+      ],
+      "metadata": {
+        "peak_memory_mb": 16731.562530517578
+      }
+    }
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "{\"q\":\"bf16[32,4096,32,128]\",\"k\":\"bf16[32,4096,8,128]\",\"v\":\"bf16[32,4096,8,128]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.08838834764831843,\"bias\":null,\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":null,\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":true},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{\"block_q\":128,\"block_k\":128,\"num_stages\":3,\"num_warps\":8,\"block_d\":null,\"block_d_out\":null,\"split_k\":1,\"pack_mask\":false}": {
+      "compile_time_ms": 923.6114870291203,
+      "lower_time_ms": 13345.600534928963,
+      "evaluation_times_ms": [
+        11.643309,
+        11.623566,
+        11.617805,
+        11.733773,
+        11.797229
+      ],
+      "metadata": {
+        "peak_memory_mb": 2560.0
+      }
+    }
+  },
+  "{\"q\":\"bf16[512,1024,16,192]\",\"k\":\"bf16[512,1024,16,192]\",\"v\":\"bf16[512,1024,16,128]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.07216878364870323,\"bias\":null,\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":null,\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":true},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{\"block_q\":128,\"block_k\":64,\"num_stages\":3,\"num_warps\":8,\"block_d\":null,\"block_d_out\":null,\"split_k\":1,\"pack_mask\":false}": {
+      "compile_time_ms": 952.051175001543,
+      "lower_time_ms": 16926.795799983665,
+      "evaluation_times_ms": [
+        11.063168,
+        11.0584,
+        11.052352,
+        11.049792,
+        11.050496
+      ],
+      "metadata": {
+        "peak_memory_mb": 10240.0
+      }
+    }
+  },
+  "{\"q\":\"bf16[384,384,4,32]\",\"k\":\"bf16[384,384,4,32]\",\"v\":\"bf16[384,384,4,32]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.17677669529663687,\"bias\":\"bf16[1,4,384,384]\",\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":\"bool[384,1,1,384]\",\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":false},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{\"block_q\":64,\"block_k\":64,\"num_stages\":4,\"num_warps\":4,\"block_d\":null,\"block_d_out\":null,\"split_k\":1,\"pack_mask\":false}": {
+      "compile_time_ms": 260.58147998992354,
+      "lower_time_ms": 18287.864103040192,
+      "evaluation_times_ms": [
+        0.253216,
+        0.252447,
+        0.252384,
+        0.252799,
+        0.252223
+      ],
+      "metadata": {
+        "peak_memory_mb": 145.265625
+      }
+    }
+  },
+  "{\"q\":\"bf16[384,384,4,64]\",\"k\":\"bf16[384,384,4,64]\",\"v\":\"bf16[384,384,4,64]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.125,\"bias\":\"bf16[1,4,384,384]\",\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":\"bool[384,1,1,384]\",\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":false},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{\"block_q\":64,\"block_k\":64,\"num_stages\":3,\"num_warps\":4,\"block_d\":null,\"block_d_out\":null,\"split_k\":1,\"pack_mask\":false}": {
+      "compile_time_ms": 298.29059203621,
+      "lower_time_ms": 14076.758690993302,
+      "evaluation_times_ms": [
+        0.330082,
+        0.33213,
+        0.331393,
+        0.332001,
+        0.331169
+      ],
+      "metadata": {
+        "peak_memory_mb": 289.265625
+      }
+    }
+  },
+  "{\"q\":\"bf16[768,768,4,64]\",\"k\":\"bf16[768,768,4,64]\",\"v\":\"bf16[768,768,4,64]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.125,\"bias\":\"bf16[1,4,768,768]\",\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":\"bool[768,1,1,768]\",\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":false},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{\"block_q\":64,\"block_k\":64,\"num_stages\":3,\"num_warps\":4,\"block_d\":null,\"block_d_out\":null,\"split_k\":1,\"pack_mask\":false}": {
+      "compile_time_ms": 294.05768297147006,
+      "lower_time_ms": 15934.372730029281,
+      "evaluation_times_ms": [
+        2.286466,
+        2.283938,
+        2.278434,
+        2.27613,
+        2.275874
+      ],
+      "metadata": {
+        "peak_memory_mb": 1157.0625
+      }
+    }
+  }
+}

@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 from importlib import resources
 import os
+import re
 from typing import Final
 from absl import logging
 from absl.testing import absltest
@@ -46,24 +46,16 @@ class CacheTest(parameterized.TestCase):
 
     self.assertNotEmpty(c._load_cache(device_kind))
 
-  def test_caches_exist(self):
-    """Checks that the cache files exist for the given device kind."""
-    # TODO: Right now we only have H100 pallas triton normalization cache.
-    # Add more caches for other devices and operations.
-    tokamax_files = resources.files("tokamax")
-    path = tokamax_files.joinpath(
-        _CACHE_PATHS["external"],
-        "nvidia_h100_80gb_hbm3",
-        "pallas_triton_normalization.json",
-    )
-    self.assertTrue(path.is_file())
-
   def test_default_cache(self):
     device_kind = jax.devices()[0].device_kind
     flex_attention_cache = cache.AutotuningCache(
         attention_base.DotProductAttention()
     )._load_cache(device_kind)
-    self.assertEmpty(flex_attention_cache)
+    # TODO: Right now this only exists for H100. Add more devices.
+    if device_kind == "NVIDIA H100 80GB HBM3":
+      self.assertNotEmpty(flex_attention_cache)
+    else:
+      self.assertEmpty(flex_attention_cache)
 
 
 if __name__ == "__main__":

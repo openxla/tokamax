@@ -85,7 +85,13 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
         json_data = "{}"
       json_data = "{}" if json_data is None else json_data
       # Cache paths later in the list will override earlier ones.
-      data = _get_cache_adapter(self.op).validate_json(json_data)
+      try:
+        data = _get_cache_adapter(self.op).validate_json(json_data)
+      except Exception as e:
+        logging.exception(
+            "Failed to parse autotuning cache file: %s Error: %s", path, e
+        )
+        continue
       out |= {
           self.op.bind(**k).autotuning_cache_key: cache
           for k, cache in data.items()

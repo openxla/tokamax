@@ -1,0 +1,22 @@
+{
+  "{\"x\":\"bf16[384,384,64]\",\"scale\":\"f32[64]\",\"offset\":\"f32[64]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{\"block_m\":16,\"block_n\":null,\"num_warps\":2}": {
+      "compile_time_ms": 550.6197258364409,
+      "lower_time_ms": 605.5922829546034,
+      "evaluation_times_ms": [0.009088, 0.008672, 0.008736, 0.008896, 0.009152],
+      "metadata": {
+        "peak_memory_mb": 36.00048828125
+      }
+    }
+  },
+  "{\"x\":\"bf16[384,384,128]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{\"block_m\":8,\"block_n\":null,\"num_warps\":2}": {
+      "compile_time_ms": 153.32415397278965,
+      "lower_time_ms": 688.6551650241017,
+      "evaluation_times_ms": [0.025119, 0.026367, 0.024768, 0.024672, 0.024864],
+      "metadata": {
+        "peak_memory_mb": 72.0009765625
+      }
+    }
+  }
+}
