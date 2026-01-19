@@ -311,6 +311,21 @@ class AttentionTestBase(parameterized.TestCase):
     v = jax.random.normal(rng2, (2, 1024, 4, output_dim))
     self._run_test_with_inputs(q, k, v)
 
+  @parameterized.parameters((8, 256), (256, 8), (8, 8))
+  def test_small_sequences(self, seq_q, seq_kv):
+    self._test_small_sequences(seq_q, seq_kv)
+
+  def _test_small_sequences(self, seq_q, seq_kv):
+    rng = np.random.default_rng(0)
+    self._run_test_with_inputs(
+        # Avoid values around 0 as they cause issues when padding heavily.
+        jax.device_put(rng.uniform(low=1, high=2, size=(2, seq_q, 4, 64))),
+        jax.device_put(rng.uniform(low=1, high=2, size=(2, seq_kv, 4, 64))),
+        jax.device_put(rng.uniform(low=1, high=2, size=(2, seq_kv, 4, 64))),
+        atol_grads=6e-6,
+        expect_supported=(seq_q == seq_kv or self._supports_cross_attention),
+    )
+
   def test_multi_query_attention(self):
     def ref_impl(q, k, v, **kwargs):
       k = jnp.broadcast_to(k, (*k.shape[:-2], q.shape[-2], k.shape[-1]))

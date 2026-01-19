@@ -167,6 +167,11 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     cfg_dict = {k: v for k, v in cfg_dict.items() if hasattr(cfg_cls, k)}
     self._run_test((2, 1024, 4, 64), impl=op_cls(config=cfg_cls(**cfg_dict)))
 
+  @override
+  def _test_small_sequences(self, seq_q, seq_kv):
+    with test_base.override_test_args(atol=0.02, atol_grads=0.04):
+      super()._test_small_sequences(seq_q, seq_kv)
+
 
 # TODO: Add manual partitioning test.
 
