@@ -216,49 +216,45 @@ def flash_attention_kernel(
         scale = logits_scale
 
         if bias is not None:
-          s = s * scale + bias.astype(s.dtype)
-          scale = 1.0
+          s, scale = s * scale + bias.astype(s.dtype), 1.0
 
         if logits_soft_cap is not None:
-          s = jnp.tanh(s * (scale / logits_soft_cap))
-          scale = logits_soft_cap
+          s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
 
         if use_base2:
           scale *= math.log2(math.e)
 
-        # If we are applying any mask, rescale `s` here. Otherwise, we defer it
-        # to the softmax computation below (allowing FMA to be used).
-        if (
-            mask is not None
-            or k_start is not None
-            or k_end is not None
-            or mask_gmem is not None
-        ):
-          s *= scale
-          scale = 1.0
+        # Defer scaling to the softmax computation below, if possible (allowing
+        # FMA to be used).
 
         mask_value = float(jnp.finfo(jnp.float32).min)
 
         if mask is not None:
-          s = jnp.where(mask, s, mask_value)
+          s, scale = jnp.where(mask, s * scale, mask_value), 1.0
 
         if k_start is not None:
 
           def apply_k_start(k_start=k_start):
             if k_start.ndim > 0:
               k_start = lax.broadcast_in_dim(k_start, s.shape, [0])
-            return jnp.where(k_base + iota(1) >= k_start, s, mask_value)
+            s_ = s * scale
+            return jnp.where(k_base + iota(1) >= k_start, s_, mask_value), 1.0
 
-          s = lax.cond(k_base < k_start_max, apply_k_start, lambda: s)
+          s, scale = lax.cond(
+              k_base < k_start_max, apply_k_start, lambda: (s, scale)
+          )
 
         if k_end is not None:
 
           def apply_k_end(k_end=k_end):
             if k_end.ndim > 0:
               k_end = lax.broadcast_in_dim(k_end, s.shape, [0])
-            return jnp.where(k_base + iota(1) < k_end, s, mask_value)
+            s_ = s * scale
+            return jnp.where(k_base + iota(1) < k_end, s_, mask_value), 1.0
 
-          s = lax.cond(k_base + block_kv > k_end_min, apply_k_end, lambda: s)
+          s, scale = lax.cond(
+              k_base + block_kv > k_end_min, apply_k_end, lambda: (s, scale)
+          )
 
         if mask_gmem is not None:
           if mask_smems is None:
@@ -267,7 +263,7 @@ def flash_attention_kernel(
             plgpu.barrier_wait(mask_barriers.at[si])
             mask = mask_smems[si, block.ds(wg, block_q)]
             plgpu.barrier_arrive(mask_consumed_barriers.at[si])
-          s = jnp.where(mask, s, mask_value)
+          s, scale = jnp.where(mask, s * scale, mask_value), 1.0
 
         exp = jnp.exp2 if use_base2 else jnp.exp
         if use_stable_softmax:
