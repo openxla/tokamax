@@ -189,13 +189,8 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     ):
       raise NotImplementedError("This op does not support symbolic shapes.")
 
-    bind = cast(Callable[_P, Any], self.bind)  # Work around pytype bug.
-    ba = bind(*args, **kwargs)
-
-    for device in infer_devices(ba) or {backend.get_default_device()}:
-      if not self.supported_on(device):
-        raise NotImplementedError(f"Not supported on {device.device_kind}.")
-
+    # Bind arguments to canonicalize args-kwargs split.
+    ba = self.signature.bind_partial(*args, **kwargs)
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
     is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
     arrays, other, merge = utils.split_merge(is_array, args_flat)
@@ -204,18 +199,24 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     def fwd(*arrays, batched_args, fwd_res=True):
       args, kwargs = args_tree.unflatten(merge(arrays, other))
       kwargs["return_residuals"] = fwd_res or return_residuals
+
       ba = self.bind(*args, **kwargs)
-      if batched_args is not None:
+
+      for device in infer_devices(ba) or {backend.get_default_device()}:
+        if not self.supported_on(device):
+          raise NotImplementedError(f"Not supported on {device.device_kind}.")
+
+      if batched_args is None:
+        abstract_args = _abstractify(dict(ba.arguments))
+      else:
         bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
         bkwargs["return_residuals"] = fwd_res or return_residuals
-        arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
-        ba = BoundArguments(self, arguments)
+        abstract_args = self.bind(*bargs, **bkwargs).arguments
 
-      config = ba.default_config
-
+      config = BoundArguments(self, abstract_args).default_config
       # Serialize args into the HLO to allow for, e.g., offline autotuning.
       json_op = self.replace(config=config, vjp=None)
-      json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
+      json_ba = BoundArguments(json_op, abstract_args)
       json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
 
       with jax.named_scope(f"tokamax:{json_data}"):
@@ -224,7 +225,8 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
           def fwd_flat(*arrays):
             args, kwargs = args_tree.unflatten(merge(arrays, other))
             kwargs["return_residuals"] = return_residuals
-            return self._fwd(*args, config=config, **kwargs)
+            ba = self.bind(*args, **kwargs)
+            return self._fwd(*ba.args, config=config, **ba.kwargs)
 
           try:
             out, f_vjp, residuals = jax.vjp(fwd_flat, *arrays, has_aux=True)
@@ -240,10 +242,10 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
           ret = (out, residuals) if return_residuals else out
           return ret, f_vjp
 
-        out, residuals = self._fwd(*args, config=config, **kwargs)
+        out, residuals = self._fwd(*ba.args, config=config, **ba.kwargs)
 
       ret = (out, residuals) if return_residuals else out
-      full_residuals = Residuals(args, kwargs, out, residuals)
+      full_residuals = Residuals(ba.args, ba.kwargs, out, residuals)
       return ret, _FlatTree(*jax.tree.flatten(full_residuals))
 
     def f(*arrays):
@@ -270,9 +272,9 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
         grads = self.vjp(residuals, out, dout, *args, **kwargs)  # pytype: disable=wrong-arg-count
 
         if isinstance(grads, dict):
-          grads_ba = ba.signature.bind_partial(**grads)
+          grads_ba = self.signature.bind_partial(**grads)
         else:
-          grads_ba = ba.signature.bind_partial(*grads)
+          grads_ba = self.signature.bind_partial(*grads)
 
         # Check that grads is tree with same structure as args.
         dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
