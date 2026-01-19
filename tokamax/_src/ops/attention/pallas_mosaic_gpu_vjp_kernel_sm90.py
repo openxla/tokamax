@@ -167,14 +167,18 @@ def flash_attention_vjp_kernel(
 
       k_start = load_k_range(k_start_gmem)
       k_end = load_k_range(k_end_gmem)
-      acc = plgpu.layout_cast(jnp.zeros_like(q_smem, jnp.float32), _WGMMA)
 
       if use_base2:
         m *= math.log2(math.e)
 
       plgpu.barrier_wait(barrier)
-      dq, _, _, _, _, _ = pipeline_callback((acc, m, l, delta, k_start, k_end))
-      q_smem[...] = (dq * logits_scale).astype(dtype)
+
+      def compute_dq(dq_acc_ref):
+        _ = pipeline_callback((dq_acc_ref, m, l, delta, k_start, k_end))
+        return dq_acc_ref[...] * logits_scale
+
+      dq = pl.run_scoped(compute_dq, plgpu.ACC(q_smem.shape, jnp.float32))
+      q_smem[...] = dq.astype(dtype)
       plgpu.commit_smem()
       plgpu.copy_smem_to_gmem(q_smem, dq_gmem.at[qs, hi])
 
@@ -205,7 +209,7 @@ def flash_attention_vjp_kernel(
       ki = lb + i
       kv_base = ki * block_kv
       ks = pl.ds(kv_base, block_kv)
-      acc, m, l, delta, k_start, k_end = carry
+      dq_acc_ref, m, l, delta, k_start, k_end = carry
 
       def compute_s(acc_ref):
         plgpu.wgmma(acc_ref, q_smem, k_smem.T)
@@ -288,13 +292,10 @@ def flash_attention_vjp_kernel(
         # TODO: Make this store non-blocking.
         ds_gmem[hi, qs, ks] = ds.astype(ds_gmem.dtype)
 
-      def compute_dq(acc_ref):
-        plgpu.wgmma(acc_ref, ds.astype(k_smem.dtype), k_smem)
-
-      acc = pl.run_state(compute_dq)(plgpu.ACC.init(acc))
+      plgpu.wgmma(dq_acc_ref, ds.astype(k_smem.dtype), k_smem)
+      plgpu.wgmma_wait(0)
       plgpu.barrier_arrive(k_consumed_barrier)
-
-      return (acc, m, l, delta, k_start, k_end)
+      return dq_acc_ref, m, l, delta, k_start, k_end
 
     k_spec = tiled_spec(
         (block_kv, head_dim), k.dtype, lambda i: (lb + i, 0), "k"
