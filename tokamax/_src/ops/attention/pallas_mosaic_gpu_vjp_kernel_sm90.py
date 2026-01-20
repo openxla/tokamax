@@ -224,19 +224,22 @@ def flash_attention_vjp_kernel(
 
       acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
       s, bias = pl.run_scoped(compute_s, acc_type)
-      s *= logits_scale
+      scale = logits_scale
 
       if bias is not None:
-        s += bias
+        s = s * scale + bias.astype(s.dtype)
+        scale = 1.0
 
       if logits_soft_cap is not None:
-        logits = jnp.tanh(s / logits_soft_cap)
-        s = logits_soft_cap * logits
+        s = logits = jnp.tanh(s * (scale / logits_soft_cap))
+        scale = logits_soft_cap
 
       # NOTE: This rescaling must happen after bias and soft-cap but before the
       # attention masking (as the multiplication will cause `-inf`s).
       if use_base2:
-        s *= math.log2(math.e)
+        scale *= math.log2(math.e)
+
+      s *= scale
 
       mask_value = float(jnp.finfo(jnp.float32).min)
 
@@ -444,20 +447,23 @@ def flash_attention_vjp_kernel(
 
       acc_type = plgpu.ACC((block_kv, block_q), jnp.float32)
       sT, biasT = pl.run_scoped(compute_sT, acc_type)
-      sT *= logits_scale
+      scale = logits_scale
 
       if biasT is not None:
-        sT += biasT
+        sT = sT * scale + biasT.astype(sT.dtype)
+        scale = 1.0
 
       if logits_soft_cap is not None:
-        logits = jnp.tanh(sT / logits_soft_cap)
-        sT = logits_soft_cap * logits
+        sT = logits = jnp.tanh(sT * (scale / logits_soft_cap))
+        scale = logits_soft_cap
 
       # NOTE: This rescaling must happen after bias and soft-cap but before the
       # attention masking (as the multiplication will cause `-inf`s).
       if use_base2:
-        sT *= math.log2(math.e)
+        scale *= math.log2(math.e)
         m *= math.log2(math.e)
+
+      sT *= scale
 
       mask_value = float(jnp.finfo(jnp.float32).min)
 
