@@ -96,7 +96,6 @@ def get_kernel_name(
   return f"splash_{attention_type}_{phase}{segments}{residuals}"
 
 
-
 # Splash attention implementation
 
 
@@ -517,6 +516,19 @@ def _div(dividend: int, divisor: int):
   return lax.div(dividend, divisor)
 
 
+def _bytes(x: jax.Array | jax.ShapeDtypeStruct | None) -> int:
+  if x is None:
+    return 0
+
+  if jnp.issubdtype(x.dtype, jnp.floating):
+    info = jnp.finfo
+  elif jnp.issubdtype(x.dtype, jnp.integer):
+    info = jnp.iinfo
+  else:
+    raise ValueError(f"Unsupported dtype: {x.dtype}")
+  return math.ceil(math.prod(x.shape) * info(x.dtype).bits / 8)
+
+
 def _splash_attention_forward(
     mask_info: MaskInfo,
     q: jax.Array,
@@ -767,18 +779,6 @@ def _splash_attention_forward(
   )
   metadata = {"xprof_metadata": json.dumps(dataclasses.asdict(config))}
 
-  def _bytes(x: jax.Array | jax.ShapeDtypeStruct | None) -> int:
-    if x is None:
-      return 0
-
-    if jnp.issubdtype(x.dtype, jnp.floating):
-      info = jnp.finfo
-    elif jnp.issubdtype(x.dtype, jnp.integer):
-      info = jnp.iinfo
-    else:
-      raise ValueError(f"Unsupported dtype: {x.dtype}")
-    return math.ceil(math.prod(x.shape) * info(x.dtype).bits / 8)
-
   def _fwd_cost_estimate(
       q: jax.Array,
       k: jax.Array,
@@ -932,6 +932,7 @@ def _splash_attention_forward(
         "config",
         "mask_function",
         "fwd_mask_sparsity",
+        "dkv_mask_sparsity",
     ),
 )
 def _splash_attention_custom(
@@ -948,6 +949,7 @@ def _splash_attention_custom(
     config: SplashConfig,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
+    dkv_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   # The forward function does not use the dq and dkv MaskInfos, it just forwards
@@ -1000,6 +1002,7 @@ def _splash_attention_fwd(
     config: SplashConfig,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
+    dkv_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
 ) -> tuple[tuple[jax.Array], base.SplashResidualsType]:
 
@@ -1401,6 +1404,7 @@ def _splash_attention_bwd_dkv(
     mask_value: float,
     mask_function: MaskFunctionType | None,
     config: SplashConfig,
+    dkv_mask_sparsity: float,
 ):
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   kv_seq_len, head_dim_v = v.shape[-2:]
@@ -1684,6 +1688,82 @@ def _splash_attention_bwd_dkv(
       pltpu.VMEM((bkv, head_dim_v), jnp.float32),
   ]
 
+  def _bwd_cost_estimate(
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      q_segment_ids: jax.Array | None,
+      kv_segment_ids: jax.Array | None,
+      logsumexp: jax.Array,
+      do: jax.Array,
+      di: jax.Array,
+      partial_mask_blocks: jax.Array | None,
+      q_sequence: jax.Array | None,
+      out_shapes: list[jax.ShapeDtypeStruct],
+      mask_sparsity_factor: float,
+  ) -> pl.CostEstimate:
+    num_q_heads, q_seq_len, head_dim_qk = q.shape
+    kv_seq_len, head_dim_v = v.shape[-2:]
+
+    total_matmul_flops_per_head = (
+        2 * q_seq_len * kv_seq_len * head_dim_qk  # qk
+        + 2 * q_seq_len * kv_seq_len * head_dim_v  # dv
+        + 2 * q_seq_len * kv_seq_len * head_dim_v  # dp
+        + 2 * q_seq_len * kv_seq_len * head_dim_qk  # dq
+        + 2 * q_seq_len * kv_seq_len * head_dim_qk  # dk
+    )
+
+    estimated_flops = int(
+        total_matmul_flops_per_head * num_q_heads * mask_sparsity_factor
+    )
+
+    exp_flops = num_q_heads * q_seq_len * kv_seq_len * mask_sparsity_factor
+    if config.attn_logits_soft_cap is None:
+      tanh_flops = 0
+    else:
+      tanh_flops = (
+          2 * num_q_heads * q_seq_len * kv_seq_len * mask_sparsity_factor
+      )
+    estimated_transcendentals = int(exp_flops + tanh_flops)
+
+    inputs_ = [
+        q,
+        k,
+        v,
+        q_segment_ids,
+        kv_segment_ids,
+        logsumexp,
+        do,
+        di,
+        partial_mask_blocks,
+        q_sequence,
+    ]
+    input_bytes = sum(map(_bytes, inputs_))
+    output_bytes = sum(map(_bytes, out_shapes))
+
+    estimated_bytes = input_bytes + output_bytes
+
+    return pl.CostEstimate(
+        flops=estimated_flops,
+        transcendentals=estimated_transcendentals,
+        bytes_accessed=estimated_bytes,
+    )
+
+  cost_estimate = config.bwd_cost_estimate or _bwd_cost_estimate(
+      q,
+      k,
+      v,
+      q_segment_ids,
+      kv_segment_ids,
+      logsumexp,
+      do,
+      di,
+      mask_info.partial_mask_blocks,
+      q_sequence,
+      out_shapes,
+      dkv_mask_sparsity,
+  )
+
   with jax.named_scope(kernel_name):
     dq_unreduced, dk, dv = pl.pallas_call(
         kernel,
@@ -1705,7 +1785,7 @@ def _splash_attention_bwd_dkv(
             dimension_semantics=("arbitrary",) * len(grid)
         ),
         name=kernel_name,
-        cost_estimate=config.bwd_cost_estimate,
+        cost_estimate=cost_estimate,
         interpret=config.interpret,
         metadata=metadata,
     )(*args, dq, dk, dv)
@@ -1723,6 +1803,7 @@ def _splash_attention_bwd(
     config: SplashConfig,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
+    dkv_mask_sparsity: float,
     res: base.SplashResidualsType,
     do: jax.Array,
 ) -> tuple[
@@ -1763,6 +1844,7 @@ def _splash_attention_bwd(
       mask_value=mask_value,
       mask_function=mask_function,
       config=config,
+      dkv_mask_sparsity=dkv_mask_sparsity,
   )
   dsinks = None
   if sinks is not None:
@@ -1798,6 +1880,7 @@ _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
         "mask_value",
         "mask_function",
         "fwd_mask_sparsity",
+        "dkv_mask_sparsity",
     ],
 )
 def _splash_attention(
@@ -1816,6 +1899,7 @@ def _splash_attention(
     max_logit_value: jax.Array | None = None,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
+    dkv_mask_sparsity: float,
 ) -> base.SplashCustomReturnType:
   return _splash_attention_custom(
       fwd_mask_info,
@@ -1832,6 +1916,7 @@ def _splash_attention(
       max_logit_value=max_logit_value,
       mask_function=mask_function,
       fwd_mask_sparsity=fwd_mask_sparsity,
+      dkv_mask_sparsity=dkv_mask_sparsity,
   )
 
 
@@ -1950,9 +2035,13 @@ def _make_splash_attention(
         is_dkv=True,
         return_dynamic_grid=config.dq_reduction_steps == 3,
     )
+
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 
+    dkv_mask_sparsity = float(np.mean(dkv_mask_info.block_mask != 0))
     dkv_mask_info = tree_util.tree_map(jnp.array, dkv_mask_info)
+  else:
+    dkv_mask_sparsity = 1.0
 
   return SplashAttentionKernel(
       fwd_mask_info,
@@ -1963,6 +2052,7 @@ def _make_splash_attention(
       mask_value=mask_value,
       mask_function=mask_function_fwd,
       fwd_mask_sparsity=fwd_mask_sparsity,
+      dkv_mask_sparsity=dkv_mask_sparsity,
   )
 
 
@@ -2021,6 +2111,7 @@ def _make_dynamic_splash_attention(
       mask_value=mask_value,
       mask_function=None,
       fwd_mask_sparsity=1.0,
+      dkv_mask_sparsity=1.0,
   )
 
   # If the input mask is replicated we don't need to call shard_map.

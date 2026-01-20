@@ -150,6 +150,7 @@ def _ring_attention_backward(
     config: SplashConfig | None,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
+    dkv_mask_sparsity: float,
     ring_axis: str,
 ):
   """Backward pass for custom ring attention."""
@@ -197,6 +198,7 @@ def _ring_attention_backward(
         config=config,
         mask_function=mask_function,
         fwd_mask_sparsity=fwd_mask_sparsity,
+        dkv_mask_sparsity=dkv_mask_sparsity,
         res=residuals_for_chunk,
         do=do_main,
     )
@@ -238,8 +240,9 @@ def _ring_attention_bwd(
     config: SplashConfig | None,  # 3
     mask_function: MaskFunctionType | None,  # 4
     fwd_mask_sparsity: float,  # 5
-    save_residuals: bool,  # 6
-    ring_axis: str,  # 7
+    dkv_mask_sparsity: float,  # 6
+    save_residuals: bool,  # 7
+    ring_axis: str,  # 8
     # output from forward pass
     res: Any,
     do: jax.Array,
@@ -280,6 +283,7 @@ def _ring_attention_bwd(
       config=config,
       mask_function=mask_function,
       fwd_mask_sparsity=fwd_mask_sparsity,
+      dkv_mask_sparsity=dkv_mask_sparsity,  # Pass dkv_mask_sparsity
       ring_axis=ring_axis,
   )
   return (
@@ -307,8 +311,9 @@ def _ring_attention_fwd(
     config: SplashConfig | None,  # 3
     mask_function: MaskFunctionType | None,  # 4
     fwd_mask_sparsity: float,  # 5
-    save_residuals: bool,  # 6
-    ring_axis: str = RING_AXIS,  # 7
+    dkv_mask_sparsity: float,  # 6
+    save_residuals: bool,  # 7
+    ring_axis: str = RING_AXIS,  # 8
 ) -> tuple[
     jax.Array,
     SplashResidualsType,
@@ -375,6 +380,7 @@ def _ring_attention_fwd(
         "config",
         "mask_function",
         "fwd_mask_sparsity",
+        "dkv_mask_sparsity",
         "save_residuals",
         "ring_axis",
     ),
@@ -392,6 +398,7 @@ def _ring_attention_custom(
     config: SplashConfig | None,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
+    dkv_mask_sparsity: float,
     save_residuals: bool,
     ring_axis: str = RING_AXIS,
 ) -> SplashCustomReturnType:
@@ -457,6 +464,7 @@ def _has_axis(axis_name: str) -> bool:
         "mask_value",
         "mask_function",
         "fwd_mask_sparsity",
+        "dkv_mask_sparsity",
         "save_residuals",
         "ring_axis",
     ],
@@ -475,6 +483,7 @@ def _ring_attention(
     mask_value: float,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
+    dkv_mask_sparsity: float,
     save_residuals: bool = False,
     ring_axis: str = RING_AXIS,
 ) -> SplashCustomReturnType:
@@ -522,6 +531,7 @@ def _ring_attention(
       mask_value=mask_value,
       mask_function=mask_function,
       fwd_mask_sparsity=fwd_mask_sparsity,
+      dkv_mask_sparsity=dkv_mask_sparsity,
       save_residuals=save_residuals,
       ring_axis=ring_axis,
   )
@@ -644,6 +654,7 @@ def make_ring_attention(
   fwd_mask_info = tree_util.tree_map(jnp.array, fwd_mask_info)
 
   dkv_mask_info = None
+  dkv_mask_sparsity = 0.0
   if config.has_backward_blocks:
     bq_dkv, bkv_dkv = config.block_q_dkv, config.block_kv_dkv
     dkv_mask_info, mask_function_dkv = process_fn(
@@ -653,7 +664,7 @@ def make_ring_attention(
         return_dynamic_grid=config.dq_reduction_steps == 3,
     )
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
-
+    dkv_mask_sparsity = float(np.mean(dkv_mask_info.block_mask != 0))
     dkv_mask_info = tree_util.tree_map(jnp.array, dkv_mask_info)
 
   return RingSplashAttentionKernel(
@@ -666,4 +677,5 @@ def make_ring_attention(
       mask_value=mask_value,
       mask_function=mask_function_fwd,
       fwd_mask_sparsity=fwd_mask_sparsity,
+      dkv_mask_sparsity=dkv_mask_sparsity,
   )
