@@ -44,6 +44,18 @@ class DotProductAttentionTest(parameterized.TestCase):
   )
   def test_dot_product_attention(self, dtype, group_num, use_vmap):
 
+    if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
+      # TODO: Remove once grouped attention is supported on Mosaic
+      # TPU attention.
+      if group_num == 2:
+        self.skipTest(
+            'Group attention is not supported on Mosaic TPU attention.'
+        )
+      if dtype == jnp.float16:
+        self.skipTest(
+            'FP16 precision is not supported on Mosaic TPU attention.'
+        )
+
     B, S, T, N, H, G = 2, 128, 128, 4, 64, group_num
     q = jax.ShapeDtypeStruct((B, T, N, H), dtype)
     k = jax.ShapeDtypeStruct((B, S, N // G, H), dtype)
@@ -85,7 +97,12 @@ class DotProductAttentionTest(parameterized.TestCase):
     self.assertLen(args, 1)
 
     if self.IMPL is not None:
-      impl = api.IMPLEMENTATIONS[self.IMPL]
+      implementation = (
+          self.IMPL + f'_{jax.default_backend()}'
+          if self.IMPL == 'mosaic'
+          else self.IMPL
+      )
+      impl = api.IMPLEMENTATIONS[implementation]
       self.assertIsInstance(args[0].op, impl.__class__)
 
     array_type = (
@@ -146,12 +163,37 @@ class DotProductAttentionTest(parameterized.TestCase):
     # TODO: Fix test for 'xla_chunked' on TPU.
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
       self.skipTest(f'{self.IMPL} not supported on TPU')
+
     if isinstance(mask_mode, str):
       mask_mode = (mask_mode,)
+
+    if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
+      # TODO: Remove once bias is supported.
+      if 'bias' in mask_mode:
+        self.skipTest('Bias is not supported on Mosaic TPU attention.')
+      # TODO: Remove once padding is supported.
+      if 'padding' in mask_mode:
+        self.skipTest('Padding is not supported on Mosaic TPU attention.')
+      # TODO: Remove once sliding window is supported.
+      if 'sliding_window' in mask_mode:
+        self.skipTest(
+            'Sliding window is not supported on Mosaic TPU attention.'
+        )
 
     dtype = jnp.bfloat16
     cudnn_bias = self.IMPL == 'cudnn' and 'bias' in mask_mode
     B, S, T, N, H = (1 if cudnn_bias else 2), 256, 256, 4, 64
+    if 'custom' in mask_mode:
+      # TODO: Remove once causal + boolean custom mask is
+      # supported.
+      if 'causal' in mask_mode:
+        self.skipTest(
+            'Causal mask with custom mask is not supported on Mosaic TPU'
+            ' attention.'
+        )
+      if B != 1:
+        self.skipTest('Only unbatched boolean masks are supported.')
+
     q = jax.ShapeDtypeStruct((B, T, N, H), dtype)
     k = jax.ShapeDtypeStruct((B, S, N, H), dtype)
     v = jax.ShapeDtypeStruct((B, S, N, H), dtype)
@@ -229,6 +271,11 @@ class DotProductAttentionTest(parameterized.TestCase):
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
       self.skipTest(f'{self.IMPL} not supported on TPU')
 
+    if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
+      # TODO: Remove once a learnable bias is supported on Mosaic
+      # TPU attention.
+      self.skipTest('Bias is not supported on Mosaic TPU attention.')
+
     dtype = jnp.bfloat16
     B, S, N, H = batch_size, 128, 4, 64
     x = jax.ShapeDtypeStruct((B, S, N, H), dtype)
@@ -290,10 +337,20 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
 
   def setUp(self):
     super().setUp()
-    if not gpu_utils.has_mosaic_gpu_support() or gpu_utils.is_sm100():
-      self.skipTest(
-          'Skip test. Mosaic implementation is not supported on this platform.'
-      )
+    match jax.default_backend():
+      case 'gpu':
+        if not gpu_utils.has_mosaic_gpu_support() or gpu_utils.is_sm100():
+          self.skipTest(
+              'Skip test. Mosaic implementation is not supported on this'
+              ' platform.'
+          )
+      case 'tpu':
+        pass
+      case _:
+        self.skipTest(
+            'Skip test. Mosaic implementation is not supported on this'
+            ' platform.'
+        )
 
 
 class DotProductAttentionTritonTest(DotProductAttentionTest):

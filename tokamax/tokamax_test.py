@@ -76,7 +76,7 @@ class TokamaxTest(absltest.TestCase):
       ops = set(a.op.__class__ for a in arg_specs)
       ops_expected = set([
           attention_api.IMPLEMENTATIONS["triton"].__class__,
-          attention_api.IMPLEMENTATIONS["mosaic"].__class__,
+          attention_api.IMPLEMENTATIONS["mosaic_gpu"].__class__,
           norm_api.IMPLEMENTATIONS["triton"].__class__,
           pl_triton_attn_vjp.PallasTritonFlashAttentionVjp,
           pallas_mosaic_gpu_vjp.PallasMosaicGpuFlashAttentionVjp,

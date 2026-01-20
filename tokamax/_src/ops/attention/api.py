@@ -18,6 +18,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Final, Literal, TypeAlias
 import immutabledict
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
@@ -55,8 +56,20 @@ except ImportError:
 try:
   from tokamax._src.ops.attention import pallas_mosaic_gpu as pl_mgpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
-  IMPLEMENTATIONS["mosaic"] = pl_mgpu.PallasMosaicGpuFlashAttention()
+  IMPLEMENTATIONS["mosaic_gpu"] = pl_mgpu.PallasMosaicGpuFlashAttention()
   _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
+
+
+try:
+  from tokamax._src.ops.attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["mosaic_tpu"] = (
+      pallas_mosaic_tpu.PallasMosaicTpuFlashAttention()
+  )
+  if "mosaic" not in _DEFAULT_IMPLEMENTATION:
+    _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
 except ImportError:
   pass
 
@@ -152,6 +165,12 @@ def dot_product_attention(
   errors = []
   for impl in implementation:
     if isinstance(impl, str):
+      if impl == "mosaic":
+        impl = (
+            "mosaic_gpu"
+            if "NVIDIA" in backend.get_default_device().device_kind
+            else "mosaic_tpu"
+        )
       if impl not in IMPLEMENTATIONS:
         raise ValueError(f"Unknown implementation: {impl}")
       impl = IMPLEMENTATIONS[impl]
