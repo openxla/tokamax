@@ -15,6 +15,7 @@
 """Utilities for numerics."""
 
 import abc
+from concurrent import futures
 import dataclasses
 from typing import Any, TypeAlias
 
@@ -23,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import qwix
 from tokamax._src import batching
+from tokamax._src import utils
 
 
 PyTree: TypeAlias = Any
@@ -189,9 +191,8 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     A new PyTree with each abstract array replaced by a randomly initialized
     `jax.Array`.
   """
-  rng = np.random.default_rng(seed)
 
-  def init_with_layout(x):
+  def init_with_layout(rng, x):
     if isinstance(x, ArrayInitializer):
       return jax.device_put(x(rng))
     if isinstance(x, qwix.QArray):
@@ -210,8 +211,7 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
         raise ValueError(
             '`QArray` values and scales must both be abstract or both concrete.'
         )
-    if not isinstance(x, jax.ShapeDtypeStruct):
-      return x
+    assert isinstance(x, jax.ShapeDtypeStruct)
 
     x = _as_vmap_shape(x)
     dtype = jnp.dtype(x.dtype)
@@ -231,4 +231,21 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     return jax.device_put(y, None if sharding is None else x.format)
 
   is_leaf = lambda x: isinstance(x, (ArrayInitializer, qwix.QArray))
-  return jax.tree.map(init_with_layout, x, is_leaf=is_leaf)
+  x_flat, tree = jax.tree.flatten(x, is_leaf=is_leaf)
+
+  def is_abstract(x):
+    return isinstance(x, (jax.ShapeDtypeStruct, ArrayInitializer)) or (
+        isinstance(x, qwix.QArray)
+        and (
+            isinstance(x.qvalue, jax.ShapeDtypeStruct)
+            or isinstance(x.scale, jax.ShapeDtypeStruct)
+        )
+    )
+
+  abstract_arrays, other, merge = utils.split_merge(is_abstract, x_flat)
+  rngs = np.random.default_rng(seed).spawn(len(abstract_arrays))
+
+  with futures.ThreadPoolExecutor() as executor:
+    arrays = list(executor.map(init_with_layout, rngs, abstract_arrays))
+
+  return tree.unflatten(merge(arrays, other))

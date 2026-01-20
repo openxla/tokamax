@@ -101,18 +101,18 @@ class NumericsTest(parameterized.TestCase):
     )
 
     kwargs_expected = {
-        'bfloat16': np.float64(-2.4604949951171875),
-        'bool': np.float64(23.0),
-        'float16': np.float64(-1.642547607421875),
-        'float32': np.float64(8.68816682882607),
-        'int32': np.float64(50.0),
-        'int4': np.float64(-22.0),
-        'int64': np.float64(966.0),
-        'int8': np.float64(204.0),
-        'uint32': np.float64(3145.0),
-        'uint4': np.float64(380.0),
-        'uint64': np.float64(3317.0),
-        'uint8': np.float64(3216.0),
+        'bfloat16': np.float64(9.586051940917969),
+        'bool': np.float64(31.0),
+        'float16': np.float64(3.045166015625),
+        'float32': np.float64(3.760611795121804),
+        'int32': np.float64(-248.0),
+        'int4': np.float64(-27.0),
+        'int64': np.float64(-1027.0),
+        'int8': np.float64(-10.0),
+        'uint32': np.float64(2869.0),
+        'uint4': np.float64(408.0),
+        'uint64': np.float64(3117.0),
+        'uint8': np.float64(2976.0),
     }
 
     chex.assert_trees_all_close(kwargs, kwargs_expected)

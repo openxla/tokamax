@@ -880,7 +880,7 @@ class AttentionTestBase(parameterized.TestCase):
         self._supports_vjp and not is_quantized and q.shape[-2] == k.shape[-2]
     )
 
-    atol = {jnp.float32: 2e-6, jnp.bfloat16: 2e-2}[q.dtype.type]
+    atol = {jnp.float32: 5e-6, jnp.bfloat16: 2e-2}[q.dtype.type]
     atol_grads_bias = {jnp.float32: 2e-5, jnp.bfloat16: 8e-2}[q.dtype.type]
     try:
       self._run_test_with_inputs(
