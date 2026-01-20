@@ -31,6 +31,8 @@ from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
+from tokamax._src.ops.matmul import api as matmul_api
+from tokamax._src.ops.matmul import base as matmul_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import api as normalization_api
@@ -217,6 +219,7 @@ _API_IMPLEMENTATIONS: Final[
     Mapping[type[op_lib.Op], Mapping[str, Callable[..., Any]]]
 ] = immutabledict.immutabledict({
     normalization_base.Normalization: normalization_api.IMPLEMENTATIONS,
+    matmul_base.Matmul: matmul_api.IMPLEMENTATIONS,
     glu_base.GatedLinearUnit: glu_api.IMPLEMENTATIONS,
     ragged_dot_base.RaggedDot: ragged_dot_api.IMPLEMENTATIONS,
     attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,

@@ -62,6 +62,7 @@ bench = [
 cuda = [
     "jax[cuda12]>=0.8.0",
     "nvidia-cudnn-cu12>=9.0.0",
+    "nvidia-cutlass-dsl>=4.4.0",
 ]
 
 tpu = [
