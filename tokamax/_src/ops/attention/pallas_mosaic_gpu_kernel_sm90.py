@@ -195,8 +195,8 @@ def flash_attention_kernel(
         def iota(d):
           return plgpu.broadcasted_iota(jnp.int32, block_q_kv, d, layout=_WGMMA)
 
-        def compute_qk(acc_ref):
-          plgpu.wgmma(acc_ref, q_smem, k_smems.at[si].T)
+        def compute_qk(acc):
+          plgpu.wgmma(acc, q_smem, k_smems.at[si].T)
           if bias_gmem is None:
             bias = None
           elif bias_smems is None:
@@ -206,7 +206,7 @@ def flash_attention_kernel(
             bias = bias_smems[si, block.ds(wg, block_q)]
           plgpu.barrier_arrive(schedule_barrier)
           mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
-          return acc_ref[...], bias, mask
+          return acc[...], bias, mask
 
         acc_type = plgpu.ACC(block_q_kv, jnp.float32)
         s, bias, mask = pl.run_scoped(compute_qk, acc_type)
@@ -288,11 +288,11 @@ def flash_attention_kernel(
         plgpu.barrier_wait(schedule_barrier)
 
         def compute_pv(refs):
-          acc_ref, l_i_ref = refs
-          plgpu.wgmma(acc_ref, p_, v_smems.at[si])
+          acc, l_i = refs
+          plgpu.wgmma(acc, p_, v_smems.at[si])
 
           if not p_sum_before_barriers:
-            l_i_ref[...] += p.sum(axis=1)
+            l_i[...] += p.sum(axis=1)
 
           @pl.when(ki + 1 < ub)
           def _():

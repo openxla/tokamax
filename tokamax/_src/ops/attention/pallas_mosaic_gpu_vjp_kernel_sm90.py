@@ -173,9 +173,9 @@ def flash_attention_vjp_kernel(
 
       plgpu.barrier_wait(barrier)
 
-      def compute_dq(dq_acc_ref):
-        _ = pipeline_callback((dq_acc_ref, m, l, delta, k_start, k_end))
-        return dq_acc_ref[...] * logits_scale
+      def compute_dq(dq_acc):
+        _ = pipeline_callback((dq_acc, m, l, delta, k_start, k_end))
+        return dq_acc[...] * logits_scale
 
       dq = pl.run_scoped(compute_dq, plgpu.ACC(q_smem.shape, jnp.float32))
       q_smem[...] = dq.astype(dtype)
@@ -209,10 +209,10 @@ def flash_attention_vjp_kernel(
       ki = lb + i
       kv_base = ki * block_kv
       ks = pl.ds(kv_base, block_kv)
-      dq_acc_ref, m, l, delta, k_start, k_end = carry
+      dq_acc, m, l, delta, k_start, k_end = carry
 
-      def compute_s(acc_ref):
-        plgpu.wgmma(acc_ref, q_smem, k_smem.T)
+      def compute_s(acc):
+        plgpu.wgmma(acc, q_smem, k_smem.T)
         if bias_gmem is None:
           bias = None
         elif bias_smems is None:
@@ -220,7 +220,7 @@ def flash_attention_vjp_kernel(
         else:
           bias = bias_smems[pl.ds(wg * block_q, block_q)]
           plgpu.barrier_arrive(bias_consumed_barrier)
-        return acc_ref[...], bias
+        return acc[...], bias
 
       acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
       s, bias = pl.run_scoped(compute_s, acc_type)
@@ -274,9 +274,9 @@ def flash_attention_vjp_kernel(
       epsilon = jnp.finfo(jnp.float32).tiny  # Avoid division by zero.
       p = exp(s - broadcast(m)) / broadcast(l + epsilon)
 
-      def compute_dp(acc_ref):
-        plgpu.wgmma(acc_ref, dout_smem, v_smem.T)
-        return acc_ref[...]
+      def compute_dp(acc):
+        plgpu.wgmma(acc, dout_smem, v_smem.T)
+        return acc[...]
 
       dp = pl.run_scoped(compute_dp, plgpu.ACC(p.shape, jnp.float32))
       plgpu.barrier_arrive(v_consumed_barrier)
@@ -295,10 +295,10 @@ def flash_attention_vjp_kernel(
         # TODO: Make this store non-blocking.
         ds_gmem[hi, qs, ks] = ds.astype(ds_gmem.dtype)
 
-      plgpu.wgmma(dq_acc_ref, ds.astype(k_smem.dtype), k_smem)
+      plgpu.wgmma(dq_acc, ds.astype(k_smem.dtype), k_smem)
       plgpu.wgmma_wait(0)
       plgpu.barrier_arrive(k_consumed_barrier)
-      return dq_acc_ref, m, l, delta, k_start, k_end
+      return dq_acc, m, l, delta, k_start, k_end
 
     k_spec = tiled_spec(
         (block_kv, head_dim), k.dtype, lambda i: (lb + i, 0), "k"
@@ -387,9 +387,9 @@ def flash_attention_vjp_kernel(
       plgpu.copy_gmem_to_smem(v_gmem.at[ks, hi_kv], v_smem, barrier)
       plgpu.barrier_wait(barrier)
 
-      def compute_dk_dv(dk_acc_ref, dv_acc_ref):
-        _ = pipeline_callback((dk_acc_ref, dv_acc_ref))
-        return dk_acc_ref[...], dv_acc_ref[...]
+      def compute_dk_dv(dk_acc, dv_acc):
+        _ = pipeline_callback((dk_acc, dv_acc))
+        return dk_acc[...], dv_acc[...]
 
       dk_acc_type = plgpu.ACC(k_smem.shape, jnp.float32)
       dv_acc_type = plgpu.ACC(v_smem.shape, jnp.float32)
@@ -427,10 +427,10 @@ def flash_attention_vjp_kernel(
       qi = lb + i
       q_base = qi * block_q
       qs = pl.ds(q_base, block_q)
-      dk_acc_ref, dv_acc_ref = carry
+      dk_acc, dv_acc = carry
 
-      def compute_sT(acc_ref):
-        plgpu.wgmma(acc_ref, k_smem, q_smem.T)
+      def compute_sT(acc):
+        plgpu.wgmma(acc, k_smem, q_smem.T)
         if bias_gmem is None:
           biasT = None
         elif bias_smems is None:
@@ -438,7 +438,7 @@ def flash_attention_vjp_kernel(
         else:
           biasT = bias_smems[pl.ds(wg * block_kv, block_kv)]
           plgpu.barrier_arrive(bias_consumed_barrier)
-        return acc_ref[...], biasT
+        return acc[...], biasT
 
       m = plgpu.load(m_smem, (), layout=_WGMMA_COL)
       l = plgpu.load(l_smem, (), layout=_WGMMA_COL)
@@ -506,11 +506,11 @@ def flash_attention_vjp_kernel(
       epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
       pT = exp(sT - broadcast(m)) / broadcast(l + epsilon)
 
-      def compute_dpT(acc_ref):
-        plgpu.wgmma(acc_ref, v_smem, dout_smem.T)
-        plgpu.wgmma(dv_acc_ref, pT.astype(dtype), dout_smem)
+      def compute_dpT(acc):
+        plgpu.wgmma(acc, v_smem, dout_smem.T)
+        plgpu.wgmma(dv_acc, pT.astype(dtype), dout_smem)
         # TODO: Load this without waiting for the DV matmul to complete.
-        return acc_ref[...]
+        return acc[...]
 
       dpT = pl.run_scoped(compute_dpT, plgpu.ACC(pT.shape, jnp.float32))
       plgpu.barrier_arrive(dout_consumed_barrier)
@@ -522,10 +522,10 @@ def flash_attention_vjp_kernel(
       if logits_soft_cap is not None:
         dsT *= 1 - logits * logits
 
-      plgpu.wgmma(dk_acc_ref, dsT.astype(dtype), q_smem)
+      plgpu.wgmma(dk_acc, dsT.astype(dtype), q_smem)
       plgpu.wgmma_wait(0)
       plgpu.barrier_arrive(q_consumed_barrier)
-      return (dk_acc_ref, dv_acc_ref)
+      return (dk_acc, dv_acc)
 
     q_spec = tiled_spec(
         (block_q, head_dim), q.dtype, lambda i: (lb + i, 0), "q"
