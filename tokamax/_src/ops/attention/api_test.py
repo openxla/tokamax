@@ -19,7 +19,6 @@ from absl.testing import parameterized
 import chex
 import jax
 from jax import export
-from jax.extend import backend
 import jax.numpy as jnp
 from tokamax import autotuning
 from tokamax._src import batching

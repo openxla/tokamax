@@ -144,10 +144,10 @@ class DumpHloLibTest(parameterized.TestCase):
 
     f = functools.partial(pl_norm.PallasTritonNormalization(), axis=axis)
 
-    key1, key2, key3 = jax.random.split(jax.random.PRNGKey(0), num=3)
-    x = jax.random.normal(key=key1, shape=x_shape, dtype=dtype)
-    scale = jax.random.normal(key=key2, shape=param_shape, dtype=jnp.float32)
-    offset = jax.random.normal(key=key3, shape=param_shape, dtype=jnp.float32)
+    x = jax.ShapeDtypeStruct(shape=x_shape, dtype=dtype)
+    scale = jax.ShapeDtypeStruct(shape=param_shape, dtype=jnp.float32)
+    offset = jax.ShapeDtypeStruct(shape=param_shape, dtype=jnp.float32)
+    x, scale, offset = numerics.random_initialize((x, scale, offset))
 
     def layer_norm_loss(x, scale, offset):
       return jnp.sum(f(x, scale, offset))
@@ -189,13 +189,14 @@ class DumpHloLibTest(parameterized.TestCase):
 
     # Create a string of Tokamax ops in Jax, lower it to HLO, and extract the
     # kernel spec from the name of the kernel.
-    (key1, key2, key3, key4) = jax.random.split(jax.random.PRNGKey(0), 4)
     x_shape = (64, 128)
     param_shape = (x_shape[-1],)
-    x = jax.random.normal(key1, x_shape, jnp.bfloat16)
-    scale = jax.random.normal(key2, param_shape, jnp.bfloat16)
-    offset = jax.random.normal(key3, param_shape, jnp.bfloat16)
-    weights = jax.random.normal(key4, (128, 2, 128), jnp.bfloat16)
+    x, scale, offset, weights = numerics.random_initialize((
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct((128, 2, 128), jnp.bfloat16),
+    ))
 
     def norm_and_glu(x, scale, offset, weights):
       x = norm_op(x, scale, offset)

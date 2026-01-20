@@ -19,6 +19,7 @@ import chex
 import jax
 from jax import export
 import jax.numpy as jnp
+import numpy as np
 import tokamax
 from tokamax._src.autotuning import api as autotuning
 from tokamax._src.ops.attention import api as attention_api
@@ -49,12 +50,10 @@ class TokamaxTest(absltest.TestCase):
     batch_size = 32
     num_heads = 16
 
-    scale = jax.random.normal(jax.random.key(0), (channels,), dtype=jnp.float32)
-    x = jax.random.normal(
-        jax.random.key(1),
-        (batch_size, seq_len, num_heads, channels),
-        dtype=jnp.bfloat16,
-    )
+    rng0, rng1 = np.random.default_rng(0).spawn(2)
+    x_size = (batch_size, seq_len, num_heads, channels)
+    scale = jax.device_put(rng0.uniform(low=-1.0, size=(channels,)))
+    x = jax.device_put(rng1.uniform(low=-1.0, size=x_size)).astype(jnp.bfloat16)
 
     f_grad = jax.jit(jax.grad(loss))
     out = f_grad(x, scale)

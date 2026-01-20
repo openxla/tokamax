@@ -35,14 +35,11 @@ class BenchmarkingTest(parameterized.TestCase):
       else:
         return {'out': x + jnp.sin(y[0]) * y[1] ** 2 + z}
 
-    rng_keys = jax.random.split(jax.random.PRNGKey(0), 2)
     shape, dtype = ((2, 2), jnp.float32)
     square = False
-    y = (
-        jax.random.normal(rng_keys[0], shape, dtype=dtype),
-        jax.random.normal(rng_keys[1], shape, dtype=dtype),
-    )
+    y = (jax.ShapeDtypeStruct(shape, dtype),) * 2
     x = jax.ShapeDtypeStruct(shape, dtype)
+    x, y = numerics.random_initialize((x, y))
 
     initable = numerics.RangedArrayInitializer(shape, jnp.int32, -10, 10)
     kwargs = {'square': square, 'y': y, 'x': x, 'z': initable}
@@ -88,21 +85,21 @@ class BenchmarkingTest(parameterized.TestCase):
 
       golden_out = {
           'out': jnp.array(
-              [[8.017317, -2.7234104], [-10.071267, -5.160148]],
+              [[11.864799, -3.979468], [-10.16194, 5.627968]],
               dtype=jnp.float32,
           )
       }
       golden_vjp = [
           jnp.array(
-              [[8.017317, -2.7234104], [-10.071267, -5.160148]],
+              [[11.864799, -3.979468], [-10.16194, 5.627968]],
               dtype=jnp.float32,
           ),
           jnp.array(
-              [[25.679827, -6.9592013], [-0.31185973, -0.2508385]],
+              [[2.639511, 0.486031], [-1.788208, 0.031229]],
               dtype=jnp.float32,
           ),
           jnp.array(
-              [[-33.039948, -8.729023], [2.816567, -3.361525]],
+              [[19.885725, 5.087355], [-6.428973, 0.18801]],
               dtype=jnp.float32,
           ),
       ]

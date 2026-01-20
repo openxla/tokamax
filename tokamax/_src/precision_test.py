@@ -19,6 +19,7 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
+from tokamax._src import numerics
 from tokamax._src import precision
 
 
@@ -43,8 +44,9 @@ class PrecisionTest(parameterized.TestCase):
         a_dtype=dtype, b_dtype=dtype, precision=precision_old
     )
 
-    x = jax.random.normal(jax.random.PRNGKey(0), (32, 32), dtype=dtype)
-    y = jax.random.normal(jax.random.PRNGKey(1), (32, 32), dtype=dtype)
+    x = jax.ShapeDtypeStruct((32, 32), dtype=dtype)
+    y = jax.ShapeDtypeStruct((32, 32), dtype=dtype)
+    x, y = numerics.random_initialize((x, y))
 
     out_old = jax.jit(functools.partial(jnp.dot, precision=precision_old))(x, y)
     out_new = jax.jit(functools.partial(jnp.dot, precision=precision_new))(x, y)
@@ -77,8 +79,9 @@ class PrecisionTest(parameterized.TestCase):
     if jax.default_backend() == 'cpu':
       self.skipTest('New precision API broken on CPU.')
 
-    x = jax.random.normal(jax.random.PRNGKey(0), (32, 32), dtype=jnp.float32)
-    y = jax.random.normal(jax.random.PRNGKey(1), (32, 32), dtype=jnp.float32)
+    x = jax.ShapeDtypeStruct((32, 32), dtype=jnp.float32)
+    y = jax.ShapeDtypeStruct((32, 32), dtype=jnp.float32)
+    x, y = numerics.random_initialize((x, y))
 
     with jax.default_matmul_precision('BF16_BF16_F32_X3'):
       dot_gt = jax.jit(functools.partial(jnp.dot, precision=default_precision))

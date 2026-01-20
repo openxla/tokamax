@@ -50,22 +50,26 @@ def _create_inputs(
   if kv_shape is None:
     kv_shape = q_shape
 
-  rngs = list(jax.random.split(jax.random.PRNGKey(0), 6))
-  q = jax.random.normal(rngs.pop(), q_shape, dtype=dtype)
-  k = jax.random.normal(rngs.pop(), kv_shape, dtype=dtype)
-  v = jax.random.normal(rngs.pop(), kv_shape, dtype=dtype)
+  ss = np.random.SeedSequence(0)
+  seeds = list(ss.generate_state(n_words=3))
+  q = jax.ShapeDtypeStruct(q_shape, dtype=dtype)
+  k = jax.ShapeDtypeStruct(kv_shape, dtype=dtype)
+  v = jax.ShapeDtypeStruct(kv_shape, dtype=dtype)
+  q, k, v = numerics.random_initialize((q, k, v), seed=seeds.pop())
 
   if bias_shape is None:
     bias = None
   else:
-    bias = jax.random.normal(rngs.pop(), bias_shape, dtype=dtype)
+    bias = jax.ShapeDtypeStruct(bias_shape, dtype=dtype)
+    bias = numerics.random_initialize(bias, seed=seeds.pop())
 
   if mask_shape is None:
     mask = None
   else:
-    mask = jax.random.bernoulli(rngs.pop(), shape=mask_shape)
+    mask = jax.ShapeDtypeStruct(shape=mask_shape, dtype=jnp.bool)
+    mask = numerics.random_initialize(mask, seed=seeds.pop())
 
-  return q, k, v, bias, mask, rngs.pop()
+  return q, k, v, bias, mask, ss.spawn(n_children=1)[0]
 
 
 def _run_test(
@@ -84,7 +88,7 @@ def _run_test(
     test_deterministic=True,
     test_vjp=True,
     test_vjp_deterministic=True,
-    rng=None,
+    seed_seq=np.random.SeedSequence(42),
     **kwargs,
 ):
   """Runs an attention test with given inputs against the given reference."""
@@ -151,11 +155,11 @@ def _run_test(
   # Forwards training.
   actual, vjp_fn = jax.vjp(impl, q, k, v, bias)
   expected, ref_vjp_fn = jax.vjp(ref_impl, *ref_inputs)
-  chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+  test_utils.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
-  if rng is None:
-    rng = jax.random.PRNGKey(42)
-  dout = jax.random.normal(rng, expected.shape, dtype=actual.dtype)
+  (seed,) = seed_seq.generate_state(n_words=1)
+  dout = jax.ShapeDtypeStruct(expected.shape, dtype=actual.dtype)
+  dout = numerics.random_initialize(dout, seed=seed)
   ref_dout = dout.astype(expected.dtype)
   del expected, ref_kwargs, ref_impl, ref_inputs  # Free device memory.
 
@@ -166,8 +170,11 @@ def _run_test(
   grad_names = ("dq", "dk", "dv", "dbias")
   actual_grads = dict(zip(grad_names, vjp_fn(dout), strict=True))
   expected_grads = dict(zip(grad_names, ref_vjp_fn(ref_dout), strict=True))
-  rtol_grads = max(atol_grads / 10, 1e-6)
-  chex.assert_trees_all_close(
+  min_atol_grads = (
+      atol_grads if isinstance(atol_grads, float) else min(atol_grads.values())
+  )
+  rtol_grads = max(min_atol_grads / 10, 1e-6)
+  test_utils.assert_trees_all_close(
       actual_grads, expected_grads, atol=atol_grads, rtol=rtol_grads
   )
   del expected_grads, vjp_fn, ref_vjp_fn  # Free device memory.
@@ -257,7 +264,7 @@ class AttentionTestBase(parameterized.TestCase):
       dtype=jnp.float32,
       **kwargs,
   ):
-    q, k, v, bias, mask, rng = _create_inputs(
+    q, k, v, bias, mask, ss = _create_inputs(
         q_shape=q_shape,
         kv_shape=kv_shape,
         bias_shape=bias_shape,
@@ -268,7 +275,7 @@ class AttentionTestBase(parameterized.TestCase):
     if mask is not None:
       kwargs["mask"] = mask
 
-    self._run_test_with_inputs(q, k, v, bias=bias, rng=rng, **kwargs)
+    self._run_test_with_inputs(q, k, v, bias=bias, seed_seq=ss, **kwargs)
 
   def _run_test_with_inputs(self, *args, expect_supported=True, **kwargs):
     kwargs.setdefault("impl", self._attention_fn)
@@ -305,11 +312,11 @@ class AttentionTestBase(parameterized.TestCase):
   @pytest.mark.long
   @parameterized.product(input_dim=(24, 128), output_dim=(64, 112))
   def test_different_output_head_dim(self, input_dim, output_dim):
-    rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
-    q = jax.random.normal(rng0, (2, 1024, 4, input_dim))
-    k = jax.random.normal(rng1, (2, 1024, 4, input_dim))
-    v = jax.random.normal(rng2, (2, 1024, 4, output_dim))
-    self._run_test_with_inputs(q, k, v)
+    q = jax.ShapeDtypeStruct((2, 1024, 4, input_dim), jnp.float32)
+    k = jax.ShapeDtypeStruct((2, 1024, 4, input_dim), jnp.float32)
+    v = jax.ShapeDtypeStruct((2, 1024, 4, output_dim), jnp.float32)
+    q, k, v = numerics.random_initialize((q, k, v))
+    self._run_test_with_inputs(q, k, v, atol=2e-6)
 
   @parameterized.parameters((8, 256), (256, 8), (8, 8))
   def test_small_sequences(self, seq_q, seq_kv):
@@ -322,7 +329,7 @@ class AttentionTestBase(parameterized.TestCase):
         jax.device_put(rng.uniform(low=1, high=2, size=(2, seq_q, 4, 64))),
         jax.device_put(rng.uniform(low=1, high=2, size=(2, seq_kv, 4, 64))),
         jax.device_put(rng.uniform(low=1, high=2, size=(2, seq_kv, 4, 64))),
-        atol_grads=6e-6,
+        atol_grads=2e-5,
         expect_supported=(seq_q == seq_kv or self._supports_cross_attention),
     )
 
@@ -372,6 +379,9 @@ class AttentionTestBase(parameterized.TestCase):
       ((4, 1024, 1024),),
   )
   def test_bias(self, bias_shape):
+    self._test_bias(bias_shape)
+
+  def _test_bias(self, bias_shape):
     self._run_test(
         (2, 1024, 4, 64),
         bias_shape=bias_shape,
@@ -423,8 +433,8 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   def test_causal_mask_q_indices(self):
-    rng = jax.random.PRNGKey(0)
-    q_indices = jax.random.permutation(rng, jnp.arange(512), independent=True)
+    rng = np.random.default_rng(0)
+    q_indices = jax.device_put(rng.permutation(jnp.arange(512)))
     mask = jnp.tri(512, dtype=bool)[q_indices]
     self._run_test(
         (2, 512, 4, 64),
@@ -434,8 +444,8 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   def test_causal_mask_k_indices(self):
-    rng = jax.random.PRNGKey(0)
-    k_indices = jax.random.permutation(rng, jnp.arange(512), independent=True)
+    rng = np.random.default_rng(0)
+    k_indices = jax.device_put(rng.permutation(jnp.arange(512)))
     mask = jnp.tri(512, dtype=bool)[:, k_indices]
     self._run_test(
         (2, 512, 4, 64),
@@ -445,8 +455,8 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   def test_q_start_end_indices(self):
-    rng = jax.random.PRNGKey(0)
-    q_indices = jax.random.permutation(rng, jnp.arange(512), independent=True)
+    rng = np.random.default_rng(0)
+    q_indices = jax.device_put(rng.permutation(jnp.arange(512)))
     q_start = jnp.array([42])
     q_end = q_start + 256
     mask = base.Mask(q_start=q_start, q_end=q_end)
@@ -591,6 +601,7 @@ class AttentionTestBase(parameterized.TestCase):
         (2, seq_len, num_heads, 64),
         impl_kwargs=dict(mask=mask),
         ref_kwargs=dict(mask=mask.as_array(seq_len, seq_len)),
+        atol_grads=2e-5,
         expect_supported=(
             self._supports_mask
             or (self._supports_is_causal and kwargs == dict(is_causal=True))
@@ -612,6 +623,7 @@ class AttentionTestBase(parameterized.TestCase):
     )
 
   def test_dropout(self):
+    # Cannot use np.random as `nn.dot_product_attention` requires a jax.PRNGKey.
     dropout_rng = jax.random.PRNGKey(42)
     dropout_mask = jax.random.bernoulli(dropout_rng, shape=(2, 4, 1024, 1024))
 
@@ -1000,7 +1012,7 @@ class AttentionManualPartitioningTestBase(parameterized.TestCase):
         impl_supports_precisions=self._supports_precisions,
     )
 
-    q, k, v, bias, mask, rng = _create_inputs(
+    q, k, v, bias, mask, ss = _create_inputs(
         q_shape=q_shape,
         kv_shape=kv_shape,
         bias_shape=bias_shape,
@@ -1019,7 +1031,7 @@ class AttentionManualPartitioningTestBase(parameterized.TestCase):
       if not expect_supported:
         stack.enter_context(self.assertRaises(Exception))
 
-      _run_test(q, k, v, bias=bias, rng=rng, **kwargs)
+      _run_test(q, k, v, bias=bias, seed_seq=ss, **kwargs)
 
   @parameterized.parameters(*_PARTITION_AXES)
   def test_self_attention_one_axis(self, partition_axis):

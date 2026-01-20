@@ -31,5 +31,6 @@ def tokamax_testing_setup():
   os.environ['XLA_FLAGS'] = os.environ.get('XLA_FLAGS', '') + (
       ' --xla_gpu_deterministic_ops=True '
       ' --xla_gpu_exclude_nondeterministic_ops=True'
+      ' --xla_gpu_enable_triton_gemm=False'
   )
   yield

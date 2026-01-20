@@ -20,6 +20,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from tokamax._src import ad
+from tokamax._src import numerics
 
 
 class AutodiffTest(parameterized.TestCase):
@@ -27,9 +28,9 @@ class AutodiffTest(parameterized.TestCase):
   def test_vjp_taking_no_residuals(self):
     fn = lambda x: (x + x)
 
-    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
-    x = jax.random.normal(rng0, (3, 4, 5))
-    dout = jax.random.normal(rng1, x.shape)
+    x = jax.ShapeDtypeStruct((3, 4, 5), jnp.float32)
+    dout = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+    x, dout = numerics.random_initialize((x, dout))
 
     vjp_fn_ref = jax.vjp(fn, x)[1]
     vjp_fn = ad.get_vjp_taking_residuals(lambda x: (fn(x), ()), x)
@@ -37,9 +38,9 @@ class AutodiffTest(parameterized.TestCase):
 
   @parameterized.parameters(jax.nn.relu, jax.nn.sigmoid, jax.nn.swish)
   def test_vjp_taking_residuals_from_inputs(self, fn):
-    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
-    x = jax.random.normal(rng0, (3, 4, 5))
-    dout = jax.random.normal(rng1, x.shape)
+    x = jax.ShapeDtypeStruct((3, 4, 5), jnp.float32)
+    dout = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+    x, dout = numerics.random_initialize((x, dout))
 
     # This is not a sensible use-case for `get_vjp_taking_residuals`, but we
     # want to test it still produces a valid VJP function.
@@ -48,9 +49,9 @@ class AutodiffTest(parameterized.TestCase):
 
   @parameterized.parameters(jax.nn.sigmoid, lambda x: (x + x))
   def test_vjp_taking_residuals_from_outputs(self, fn):
-    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
-    x = jax.random.normal(rng0, (3, 4, 5))
-    dout = jax.random.normal(rng1, x.shape)
+    x = jax.ShapeDtypeStruct((3, 4, 5), jnp.float32)
+    dout = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+    x, dout = numerics.random_initialize((x, dout))
 
     y, vjp_fn_ref = jax.vjp(fn, x)
     vjp_fn = ad.get_vjp_taking_residuals(lambda x: (fn(x),) * 2, x)
@@ -68,9 +69,9 @@ class AutodiffTest(parameterized.TestCase):
       y = jax.nn.sigmoid(x)
       return y * y, y
 
-    rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
-    x = jax.random.normal(rng0, (3, 4, 5))
-    dout = jax.random.normal(rng1, x.shape)
+    x = jax.ShapeDtypeStruct((3, 4, 5), jnp.float32)
+    dout = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+    x, dout = numerics.random_initialize((x, dout))
 
     _, vjp_fn_ref, res = jax.vjp(fn_with_res, x, has_aux=True)
     vjp_fn = ad.get_vjp_taking_residuals(fn_with_res, x)
@@ -81,10 +82,10 @@ class AutodiffTest(parameterized.TestCase):
       z = jax.nn.sigmoid(x)
       return (y * y, y * z), (y, z)
 
-    rng0, rng1, rng2, rng3 = jax.random.split(jax.random.PRNGKey(0), 4)
-    x = jax.random.normal(rng0, (3, 4, 5))
-    y = jax.random.normal(rng1, x.shape)
-    dout = (jax.random.normal(rng2, x.shape), jax.random.normal(rng3, x.shape))
+    x = jax.ShapeDtypeStruct((3, 4, 5), jnp.float32)
+    y = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+    dout = (jax.ShapeDtypeStruct(x.shape, jnp.float32),) * 2
+    x, y, dout = numerics.random_initialize((x, y, dout))
 
     _, vjp_fn_ref, res = jax.vjp(fn_with_res, x, y, has_aux=True)
     vjp_fn = ad.get_vjp_taking_residuals(fn_with_res, x, y)
