@@ -289,10 +289,18 @@ def _scale_out_by_scale(
             " scales shape cannot be broadcast."
         )
       for ax, (s1, s2) in enumerate(zip(out.shape, scales.shape, strict=True)):
-        scales = pltpu.repeat(scales, s1 // s2, ax)
+        scales = jnp.tile(
+            scales, [s1 // s2 if i == ax else 1 for i in range(scales.ndim)]
+        )
       out *= scales
     else:
-      out *= pltpu.repeat(scales, out.shape[axis] // scales.shape[axis], axis)
+      out *= jnp.tile(
+          scales,
+          [
+              out.shape[axis] // scales.shape[axis] if i == axis else 1
+              for i in range(scales.ndim)
+          ],
+      )
   return out
 
 
