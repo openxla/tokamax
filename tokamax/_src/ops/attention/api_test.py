@@ -157,6 +157,7 @@ class DotProductAttentionTest(parameterized.TestCase):
           ('custom', 'padding'),
           ('bias', 'causal'),
           ('causal', 'sliding_window'),
+          ('causal', 'custom')
       ],
   )
   def testDotProductAttentionMask(self, mask_mode):
@@ -183,7 +184,7 @@ class DotProductAttentionTest(parameterized.TestCase):
     dtype = jnp.bfloat16
     cudnn_bias = self.IMPL == 'cudnn' and 'bias' in mask_mode
     B, S, T, N, H = (1 if cudnn_bias else 2), 256, 256, 4, 64
-    if 'custom' in mask_mode:
+    if 'custom' in mask_mode and jax.default_backend() == 'tpu':
       # TODO: Remove once causal + boolean custom mask is
       # supported.
       if 'causal' in mask_mode:

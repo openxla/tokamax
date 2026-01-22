@@ -167,11 +167,8 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     shard_count = 1
 
     mask_shape = (q_seq_len, kv_seq_len)
-    if mask.is_causal:
-      splash_mask = mask_lib.CausalMask(
-          shape=(q_seq_len, kv_seq_len), shard_count=shard_count
-      )
-    elif mask.bool_mask is not None:
+
+    if mask.bool_mask is not None:
       if mask.is_causal:
         raise NotImplementedError(
             "Causal attention with a boolean mask is not supported."
@@ -186,6 +183,10 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
       if mask_batch_size != 1:
         raise NotImplementedError("Only unbatched boolean masks are supported.")
       splash_mask = jnp.squeeze(splash_mask, axis=(0, 1))  # (seq_q, seq_kv)
+    elif mask.is_causal:
+      splash_mask = mask_lib.CausalMask(
+          shape=mask_shape, shard_count=shard_count
+      )
     else:
       splash_mask = mask_lib.FullMask(mask_shape)
 
