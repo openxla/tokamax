@@ -438,15 +438,15 @@ def flash_attention_vjp_kernel(
         else:
           biasT = bias_smems[pl.ds(wg * block_kv, block_kv)]
           plgpu.barrier_arrive(bias_consumed_barrier)
-        return acc[...], biasT
 
-      m = plgpu.load(m_smem, (), layout=_WGMMA_COL)
-      l = plgpu.load(l_smem, (), layout=_WGMMA_COL)
-      plgpu.barrier_arrive(m_consumed_barrier)
-      plgpu.barrier_arrive(l_consumed_barrier)
+        m = plgpu.load(m_smem, (), layout=_WGMMA_COL)
+        l = plgpu.load(l_smem, (), layout=_WGMMA_COL)
+        plgpu.barrier_arrive(m_consumed_barrier)
+        plgpu.barrier_arrive(l_consumed_barrier)
+        return acc[...], biasT, m, l
 
       acc_type = plgpu.ACC((block_kv, block_q), jnp.float32)
-      sT, biasT = pl.run_scoped(compute_sT, acc_type)
+      sT, biasT, m, l = pl.run_scoped(compute_sT, acc_type)
       scale = logits_scale
 
       if biasT is not None:
