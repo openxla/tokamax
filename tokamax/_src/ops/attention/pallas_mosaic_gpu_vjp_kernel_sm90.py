@@ -265,6 +265,10 @@ def flash_attention_vjp_kernel(
       if mask_gmem is not None:
         if mask_smems is None:
           mask = _load_bcast(mask_gmem, (qs, ks), layout=_WGMMA)
+        elif mask_smems.ndim == 1:
+          mask = plgpu.load(mask_smems, (), layout=_WGMMA_COL)
+          mask = lax.broadcast_in_dim(mask, s.shape, [1])
+          plgpu.barrier_arrive(mask_consumed_barrier)
         else:
           mask = mask_smems[pl.ds(wg * block_q, block_q)]
           plgpu.barrier_arrive(mask_consumed_barrier)
@@ -316,13 +320,17 @@ def flash_attention_vjp_kernel(
     else:
       bias_gmem_ = bias_spec = None
 
-    if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
-      mask_gmem_ = mask_gmem
-      mask_spec = tiled_spec(
-          (tile_q, block_kv), mask.dtype, lambda i: (qi, lb + i), "mask"
-      )
-    else:
-      mask_gmem_ = mask_spec = None
+    mask_gmem_ = mask_spec = None
+    if mask is not None and mask.shape[-1] != 1:
+      if mask.shape[-2] == 1:
+        if block_kv >= 128:  # Minimum transfer size is 128 bytes.
+          mask_gmem_ = mask_gmem
+          mask_spec = plgpu.BlockSpec((None, block_kv), lambda i: (0, lb + i))
+      else:
+        mask_gmem_ = mask_gmem
+        mask_spec = tiled_spec(
+            (tile_q, block_kv), mask.dtype, lambda i: (qi, lb + i), "mask"
+        )
 
     plgpu.emit_pipeline_warp_specialized(
         kv_pipeline,
@@ -386,10 +394,15 @@ def flash_attention_vjp_kernel(
     def compute_thread(pipeline_callback):
       plgpu.copy_gmem_to_smem(k_gmem.at[ks, hi_kv], k_smem, barrier)
       plgpu.copy_gmem_to_smem(v_gmem.at[ks, hi_kv], v_smem, barrier)
+      if mask_gmem is None or mask_gmem.shape[-1] != 1:
+        mask = None
+      else:  # The mask is loop invariant.
+        idx = (ks, 0)
+        mask = plgpu.load(mask_gmem, idx, layout=_WGMMA_ROW, optimized=False)
       plgpu.barrier_wait(barrier)
 
       def compute_dk_dv(dk_acc, dv_acc):
-        _ = pipeline_callback((dk_acc, dv_acc))
+        _ = pipeline_callback((dk_acc, dv_acc, mask))
         return dk_acc[...], dv_acc[...]
 
       dk_acc_type = plgpu.ACC(k_smem.shape, jnp.float32)
@@ -428,7 +441,7 @@ def flash_attention_vjp_kernel(
       qi = lb + i
       q_base = qi * block_q
       qs = pl.ds(q_base, block_q)
-      dk_acc, dv_acc = carry
+      dk_acc, dv_acc, loop_invariant_mask = carry
 
       def compute_sT(acc):
         plgpu.wgmma(acc, k_smem, q_smem.T)
@@ -496,7 +509,10 @@ def flash_attention_vjp_kernel(
 
       if mask_gmem is not None:
         if mask_smems is None:
-          mask = _load_bcast(mask_gmem, (ks, qs), layout=_WGMMA)
+          if loop_invariant_mask is None:
+            mask = _load_bcast(mask_gmem, (ks, qs), layout=_WGMMA)
+          else:
+            mask = lax.broadcast_in_dim(loop_invariant_mask, sT.shape, [0])
         else:
           mask = mask_smems[pl.ds(wg * block_kv, block_kv)]
           plgpu.barrier_arrive(mask_consumed_barrier)
@@ -526,7 +542,7 @@ def flash_attention_vjp_kernel(
       plgpu.wgmma(dk_acc, dsT.astype(dtype), q_smem)
       plgpu.wgmma_wait(0)
       plgpu.barrier_arrive(q_consumed_barrier)
-      return (dk_acc, dv_acc)
+      return dk_acc, dv_acc, loop_invariant_mask
 
     q_spec = tiled_spec(
         (block_q, head_dim), q.dtype, lambda i: (lb + i, 0), "q"
@@ -545,6 +561,7 @@ def flash_attention_vjp_kernel(
       )
     else:
       bias_gmem_ = bias_spec = None
+
     if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
       mask_gmem_ = mask_gmem
       mask_spec = tiled_spec(
