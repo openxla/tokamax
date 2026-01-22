@@ -195,14 +195,14 @@ def flash_attention_vjp_kernel(
     # pipeline as they are not dependent on kv_step.
     def kv_pipeline(
         index,
-        k_smem,
-        v_smem,
         bias_smems,
         mask_smems,
-        k_consumed_barrier,
-        v_consumed_barrier,
+        v_smem,
+        k_smem,
         bias_consumed_barrier,
         mask_consumed_barrier,
+        v_consumed_barrier,
+        k_consumed_barrier,
         carry,
     ):
       (i,) = index
@@ -219,7 +219,6 @@ def flash_attention_vjp_kernel(
           bias = _load_bcast(bias_gmem, (qs, ks), layout=_WGMMA)
         else:
           bias = bias_smems[pl.ds(wg * block_q, block_q)]
-          plgpu.barrier_arrive(bias_consumed_barrier)
         return acc[...], bias
 
       acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
@@ -228,6 +227,8 @@ def flash_attention_vjp_kernel(
 
       if bias is not None:
         s = s * scale + bias.astype(s.dtype)
+        if bias_smems is not None:
+          plgpu.barrier_arrive(bias_consumed_barrier)
         scale = 1.0
 
       if logits_soft_cap is not None:
@@ -332,8 +333,8 @@ def flash_attention_vjp_kernel(
         wg_axis="wg",
         manual_consumed_barriers=True,
         compute_context=compute_thread,
-        in_specs=[k_spec, v_spec, bias_spec, mask_spec],
-    )(k_gmem, v_gmem, bias_gmem_, mask_gmem_)
+        in_specs=[bias_spec, mask_spec, v_spec, k_spec],
+    )(bias_gmem_, mask_gmem_, v_gmem, k_gmem)
 
   def kernel_dkv(
       q_gmem,
@@ -407,20 +408,20 @@ def flash_attention_vjp_kernel(
     # pipeline as they are not dependent on q_step.
     def q_pipeline(
         index,
-        q_smem,
-        dout_smem,
+        bias_smems,
         m_smem,
         l_smem,
-        delta_smem,
-        bias_smems,
         mask_smems,
-        q_consumed_barrier,
-        dout_consumed_barrier,
+        dout_smem,
+        delta_smem,
+        q_smem,
+        bias_consumed_barrier,
         m_consumed_barrier,
         l_consumed_barrier,
-        delta_consumed_barrier,
-        bias_consumed_barrier,
         mask_consumed_barrier,
+        dout_consumed_barrier,
+        delta_consumed_barrier,
+        q_consumed_barrier,
         carry,
     ):
       (i,) = index
@@ -562,15 +563,15 @@ def flash_attention_vjp_kernel(
         manual_consumed_barriers=True,
         compute_context=compute_thread,
         in_specs=[
-            q_spec,
-            dout_spec,
+            bias_spec,
             m_spec,
             l_spec,
-            delta_spec,
-            bias_spec,
             mask_spec,
+            dout_spec,
+            delta_spec,
+            q_spec,
         ],
-    )(q_gmem, dout_gmem, m_gmem, l_gmem, delta_gmem, bias_gmem_, mask_gmem_)
+    )(bias_gmem_, m_gmem, l_gmem, mask_gmem_, dout_gmem, delta_gmem, q_gmem)
 
   def tiled_wgs_smem(shape, dtype, what=""):
     transforms = common.tile_swizzle_transforms(shape, dtype, what)
