@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
+# Copyright 2026 DeepMind Technologies Limited. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,11 +24,13 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
-import tensorflow as tf
+from tensorboardX import writer
+
 from tokamax._src import benchmarking
 from tokamax._src.ops.attention import api
 
 
+SummaryWriter = writer.SummaryWriter
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
     'tensorboard_output_env_var',
     'TENSORBOARD_OUTPUT_DIR',
@@ -82,13 +84,12 @@ class AttentionBenchmark(parameterized.TestCase):
 
     if tblog_dir:
       try:
-        writer = tf.summary.create_file_writer(tblog_dir)
-        with writer.as_default():
-          for i, value in enumerate(res.evaluation_times_ms):
-            tf.summary.scalar(metric_tag, value, step=i)
-        writer.flush()
-        writer.close()
-      except (IOError, tf.errors.OpError) as e:
+        tb_writer = SummaryWriter(log_dir=tblog_dir)
+        for i, value in enumerate(res.evaluation_times_ms):
+          tb_writer.add_scalar(metric_tag, value, global_step=i)
+
+        tb_writer.close()
+      except (OSError, IOError) as e:
         logging.exception('Error writing TensorBoard logs: %s', e)
     else:
       logging.info(

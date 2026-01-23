@@ -3,14 +3,13 @@
 
 benchmarks {
   name: "tokamax_attention_gpu"
-  description: "Runs the Tokamax attention benchmark on H100."
+  description: "Runs the Tokamax attention benchmark on H100 and B200."
   owner: "Tokamax Team"
   update_frequency_policy: QUARTERLY
   workload {
-    python_workload {
-      script_path: "tokamax/benchmarks/attention.py"
-      python_version: "3.11"
-    }
+    action: "./ml_actions/benchmarking/actions/workload_executors/python"
+    action_inputs { key: "script_path" value: "tokamax/benchmarks/attention.py" }
+    action_inputs { key: "python_version" value: "3.11" }
   }
 
   hardware_configs {
@@ -20,7 +19,7 @@ benchmarks {
     resource_spec {
       os: LINUX
     }
-    pip_optional_dependencies: "cuda"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
   hardware_configs {
@@ -30,8 +29,8 @@ benchmarks {
     resource_spec {
       os: LINUX
     }
-    pip_optional_dependencies: "cuda"
-    runtime_flags: "--skip_implementations=None,mosaic"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=None,mosaic" }
   }
 
   metrics {
@@ -122,10 +121,9 @@ benchmarks {
   owner: "Tokamax Team"
   update_frequency_policy: QUARTERLY
   workload {
-    python_workload {
-      script_path: "tokamax/benchmarks/triangle_multiplication.py"
-      python_version: "3.11"
-    }
+    action: "./ml_actions/benchmarking/actions/workload_executors/python"
+    action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_multiplication.py" }
+    action_inputs { key: "python_version" value: "3.11" }
   }
 
   hardware_configs {
@@ -135,7 +133,7 @@ benchmarks {
     resource_spec {
       os: LINUX
     }
-    pip_optional_dependencies: "cuda"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
   hardware_configs {
@@ -145,7 +143,7 @@ benchmarks {
     resource_spec {
       os: LINUX
     }
-    pip_optional_dependencies: "cuda"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
   metrics {
