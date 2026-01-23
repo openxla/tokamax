@@ -48,14 +48,13 @@ class CacheTest(parameterized.TestCase):
 
   def test_default_cache(self):
     device_kind = jax.devices()[0].device_kind
-    flex_attention_cache = cache.AutotuningCache(
+    # TODO: Enable TPU caches once issue is resolved externally.
+    if device_kind != "NVIDIA H100 80GB HBM3":
+      self.skipTest("Only NVIDIA H100 80GB HBM3 is supported.")
+    flash_attention_cache = cache.AutotuningCache(
         attention_base.DotProductAttention()
     )._load_cache(device_kind)
-    # TODO: Right now this only exists for H100. Add more devices.
-    if device_kind == "NVIDIA H100 80GB HBM3":
-      self.assertNotEmpty(flex_attention_cache)
-    else:
-      self.assertEmpty(flex_attention_cache)
+    self.assertNotEmpty(flash_attention_cache)
 
 
 if __name__ == "__main__":

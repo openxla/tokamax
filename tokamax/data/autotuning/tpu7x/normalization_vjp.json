@@ -1,0 +1,52 @@
+{
+  "{\"residuals\":[\"f32[384,384,1]\",\"f32[384,384,1]\"],\"out\":\"bf16[384,384,64]\",\"dout\":\"bf16[384,384,64]\",\"x\":\"bf16[384,384,64]\",\"scale\":\"f32[64]\",\"offset\":\"f32[64]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 524.9532910529524,
+      "lower_time_ms": 19.043080043047667,
+      "evaluation_times_ms": [
+        0.051,
+        0.051,
+        0.052,
+        0.051,
+        0.051
+      ],
+      "metadata": {
+        "peak_memory_mb": 112.50247192382812
+      }
+    }
+  },
+  "{\"residuals\":[\"f32[384,384,1]\",\"f32[384,384,1]\"],\"out\":\"bf16[384,384,128]\",\"dout\":\"bf16[384,384,128]\",\"x\":\"bf16[384,384,128]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 236.56953393947333,
+      "lower_time_ms": 19.924430991522968,
+      "evaluation_times_ms": [
+        0.194,
+        0.193,
+        0.194,
+        0.194,
+        0.194
+      ],
+      "metadata": {
+        "peak_memory_mb": 184.50247192382812
+      }
+    }
+  },
+  "{\"residuals\":[\"f32[768,768,1]\",\"f32[768,768,1]\"],\"out\":\"bf16[768,768,128]\",\"dout\":\"bf16[768,768,128]\",\"x\":\"bf16[768,768,128]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 448.71439901180565,
+      "lower_time_ms": 19.285037997178733,
+      "evaluation_times_ms": [
+        0.724,
+        0.724,
+        0.724,
+        0.724,
+        0.724
+      ],
+      "metadata": {
+        "peak_memory_mb": 594.0024719238281
+      }
+    }
+  },
+  "{\"residuals\":[\"f32[1,384,384]\",\"f32[1,384,384]\"],\"out\":\"bf16[128,384,384]\",\"dout\":\"bf16[128,384,384]\",\"x\":\"bf16[128,384,384]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":0,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {},
+  "{\"residuals\":[\"f32[1,768,768]\",\"f32[1,768,768]\"],\"out\":\"bf16[128,768,768]\",\"dout\":\"bf16[128,768,768]\",\"x\":\"bf16[128,768,768]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":0,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {}
+}

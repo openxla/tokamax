@@ -78,6 +78,7 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
 
     for base_dir in cache_path:
       path = tokamax_files.joinpath(base_dir, device_kind, f"{op_name}.json")
+      logging.info("Loading cache file: %s", path)
       try:
         json_data = path.read_text()
       except FileNotFoundError:

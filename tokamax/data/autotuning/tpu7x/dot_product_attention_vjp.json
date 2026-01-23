@@ -1,0 +1,67 @@
+{
+  "{\"residuals\":[\"f32[32,32,4096]\",\"f32[32,32,4096]\"],\"out\":\"bf16[32,4096,32,128]\",\"dout\":\"bf16[32,4096,32,128]\",\"q\":\"bf16[32,4096,32,128]\",\"k\":\"bf16[32,4096,8,128]\",\"v\":\"bf16[32,4096,8,128]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.08838834764831843,\"bias\":null,\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":null,\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":true},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {},
+  "{\"residuals\":[\"f32[512,16,1024]\",\"f32[512,16,1024]\"],\"out\":\"bf16[512,1024,16,128]\",\"dout\":\"bf16[512,1024,16,128]\",\"q\":\"bf16[512,1024,16,192]\",\"k\":\"bf16[512,1024,16,192]\",\"v\":\"bf16[512,1024,16,128]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.07216878364870323,\"bias\":null,\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":null,\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":true},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 2269.7324390755966,
+      "lower_time_ms": 61.91854097414762,
+      "evaluation_times_ms": [
+        142.682,
+        142.645,
+        142.661,
+        142.648,
+        142.664
+      ],
+      "metadata": {
+        "peak_memory_mb": 86177.00051879883
+      }
+    }
+  },
+  "{\"residuals\":[\"f32[384,4,384]\",\"f32[384,4,384]\"],\"out\":\"bf16[384,384,4,32]\",\"dout\":\"bf16[384,384,4,32]\",\"q\":\"bf16[384,384,4,32]\",\"k\":\"bf16[384,384,4,32]\",\"v\":\"bf16[384,384,4,32]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.17677669529663687,\"bias\":\"bf16[1,4,384,384]\",\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":\"bool[384,1,1,384]\",\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":false},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1219.0457340329885,
+      "lower_time_ms": 56.091933976858854,
+      "evaluation_times_ms": [
+        3.257,
+        3.248,
+        3.249,
+        3.257,
+        3.249
+      ],
+      "metadata": {
+        "peak_memory_mb": 2891.531280517578
+      }
+    }
+  },
+  "{\"residuals\":[\"f32[384,4,384]\",\"f32[384,4,384]\"],\"out\":\"bf16[384,384,4,64]\",\"dout\":\"bf16[384,384,4,64]\",\"q\":\"bf16[384,384,4,64]\",\"k\":\"bf16[384,384,4,64]\",\"v\":\"bf16[384,384,4,64]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.125,\"bias\":\"bf16[1,4,384,384]\",\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":\"bool[384,1,1,384]\",\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":false},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1160.7257809955627,
+      "lower_time_ms": 56.26443203072995,
+      "evaluation_times_ms": [
+        3.45,
+        3.444,
+        3.438,
+        3.446,
+        3.445
+      ],
+      "metadata": {
+        "peak_memory_mb": 3179.531280517578
+      }
+    }
+  },
+  "{\"residuals\":[\"f32[768,4,768]\",\"f32[768,4,768]\"],\"out\":\"bf16[768,768,4,64]\",\"dout\":\"bf16[768,768,4,64]\",\"q\":\"bf16[768,768,4,64]\",\"k\":\"bf16[768,768,4,64]\",\"v\":\"bf16[768,768,4,64]\",\"precision\":[\"BF16_BF16_F32\",\"BF16_BF16_F32\"],\"logits_dtype\":\"float32\",\"logits_scale\":0.125,\"bias\":\"bf16[1,4,768,768]\",\"logits_soft_cap\":null,\"mask\":{\"bool_mask\":\"bool[768,1,1,768]\",\"q_start\":null,\"q_end\":null,\"k_start\":null,\"k_end\":null,\"is_causal\":false},\"dropout_mask\":null,\"dropout_rate\":0.0,\"paging_info\":null,\"q_indices\":null,\"k_indices\":null,\"normalize_output\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1644.3225210532546,
+      "lower_time_ms": 55.079009965993464,
+      "evaluation_times_ms": [
+        28.49,
+        28.531,
+        28.505,
+        28.494,
+        28.489
+      ],
+      "metadata": {
+        "peak_memory_mb": 23095.125030517578
+      }
+    }
+  }
+}

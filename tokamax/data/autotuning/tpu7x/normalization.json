@@ -1,0 +1,82 @@
+{
+  "{\"x\":\"bf16[384,384,64]\",\"scale\":\"f32[64]\",\"offset\":\"f32[64]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 254.31152200326324,
+      "lower_time_ms": 14.595794025808573,
+      "evaluation_times_ms": [
+        0.033,
+        0.034,
+        0.034,
+        0.034,
+        0.034
+      ],
+      "metadata": {
+        "peak_memory_mb": 55.689453125
+      }
+    }
+  },
+  "{\"x\":\"bf16[384,384,128]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 164.08037499058992,
+      "lower_time_ms": 14.884180040098727,
+      "evaluation_times_ms": [
+        0.126,
+        0.126,
+        0.126,
+        0.126,
+        0.126
+      ],
+      "metadata": {
+        "peak_memory_mb": 109.689453125
+      }
+    }
+  },
+  "{\"x\":\"bf16[768,768,128]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 248.4148769872263,
+      "lower_time_ms": 14.472701004706323,
+      "evaluation_times_ms": [
+        0.488,
+        0.488,
+        0.489,
+        0.486,
+        0.488
+      ],
+      "metadata": {
+        "peak_memory_mb": 294.751953125
+      }
+    }
+  },
+  "{\"x\":\"bf16[128,384,384]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":0,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 270.7702210173011,
+      "lower_time_ms": 14.46496695280075,
+      "evaluation_times_ms": [
+        0.058,
+        0.058,
+        0.058,
+        0.058,
+        0.058
+      ],
+      "metadata": {
+        "peak_memory_mb": 109.689453125
+      }
+    }
+  },
+  "{\"x\":\"bf16[128,768,768]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":0,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 276.7564670648426,
+      "lower_time_ms": 15.183299081400037,
+      "evaluation_times_ms": [
+        0.286,
+        0.284,
+        0.285,
+        0.286,
+        0.284
+      ],
+      "metadata": {
+        "peak_memory_mb": 294.751953125
+      }
+    }
+  }
+}
