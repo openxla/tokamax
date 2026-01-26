@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Flash attention with Mosaic GPU."""
+"""H100 Flash attention with Mosaic GPU."""
 
 import functools
 import math
@@ -23,8 +23,10 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src import shape as shape_lib
+from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.pallas import block
@@ -32,7 +34,6 @@ from tokamax._src.pallas import block
 
 # pylint: disable=cell-var-from-loop
 
-Config = common.Config
 Residuals = base.Residuals
 
 _MIN_SWIZZLE = 32
@@ -40,6 +41,78 @@ _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 _load_bcast = common.load_bcast
+
+
+@pydantic.dataclasses.dataclass(
+    frozen=True, kw_only=True, slots=True, config=dict(extra="forbid")
+)  # pytype: disable=wrong-keyword-args
+class Config(common.ConfigBase):
+  """Configuration parameters for Pallas-Mosaic-GPU kernels on SM90 GPUs."""
+
+  pass
+
+
+def get_heuristics_config(ba: op.BoundArguments) -> Config:
+  """Returns a heuristic configuration for flash attention on SM90 GPUs."""
+  q, k, v = ba.args
+  head_dim = k.shape[-1]
+  head_dim_out = v.shape[-1]
+
+  mask = ba.kwargs["mask"]
+  q_indices = ba.kwargs["q_indices"]
+  k_indices = ba.kwargs["k_indices"]
+  mask, *_ = jax.eval_shape(
+      common.decompose_mask, mask, q, k, q_indices, k_indices
+  )
+  # 32-bit floats are downcast to 16-bit before the kernel call.
+  dtype_bits = jnp.finfo(jnp.bfloat16).bits
+
+  def shared_mem_usage_bytes(block_q, block_kv, num_stages):
+    bytes_per_stage = (
+        block_kv * head_dim * dtype_bits // 8
+        + block_kv * head_dim_out * dtype_bits // 8
+    )
+    if (bias := ba.kwargs["bias"]) is not None:
+      bytes_per_stage += (
+          2 * block_q * block_kv * jnp.finfo(bias.dtype).bits // 8
+      )
+    # FIXME: This is an overestimate for broadcast masks.
+    if mask is not None:
+      bytes_per_stage += 2 * block_q * block_kv
+    return (
+        2 * block_q * head_dim * dtype_bits // 8
+        + num_stages * bytes_per_stage
+        + 1000  # Add some extra for barriers.
+    )
+
+  if shared_mem_usage_bytes(64, 128, 2) < 227 * 1024:
+    return Config(block_q=64, block_kv=128, num_stages=2)
+
+  # This is a pretty good option that works for most cases.
+  return Config(block_q=64, block_kv=64, num_stages=2)
+
+
+def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
+  """Returns a set of configs for autotuning flash attention on SM90 GPUs."""
+  q, k, _ = ba.args
+  block_qs = set([
+      min(x, pl.next_power_of_2(q.shape[-3] // 2))
+      for x in [64, 128, 256]
+      if q.shape[-3] % (x * 2) == 0  # 2 * block_q must divide seq_len_q.
+  ])
+  block_kvs = set([
+      min(x, pl.next_power_of_2(k.shape[-3]))
+      for x in [64, 128, 256]
+      if k.shape[-3] % x == 0  # block_kv must divide seq_len_kv.
+  ])
+  configs = set()
+  for block_q in block_qs:
+    for block_kv in block_kvs:
+      for num_stages in [2, 3, 4]:
+        configs.add(
+            Config(block_q=block_q, block_kv=block_kv, num_stages=num_stages)
+        )
+  return configs
 
 
 @jaxtyping.jaxtyped

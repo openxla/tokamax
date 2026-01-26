@@ -23,14 +23,61 @@ import jax.numpy as jnp
 import pydantic
 
 
-@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class Config:
-  # TODO: Relax constraints to multiple of 32.
+@pydantic.dataclasses.dataclass(
+    frozen=True, kw_only=True, slots=True, config=dict(extra="forbid")
+)  # pytype: disable=wrong-keyword-args
+class ConfigBase:
+  """Common configuration parameters for Pallas-Mosaic-GPU kernels.
+
+  Attributes:
+    block_q: Block size along Q sequence length.
+    num_stages: Number of tma stages for loading KV.
+    fold_q_sequence_heads: Whether to fold seq_q into num_q_heads.
+    split_k: Number of chunks to split seq_len_k into to improve parallelism.
+  """
+
+  # TODO: Relax block size constraints to multiple of 32.
   block_q: pydantic.conint(multiple_of=64, gt=0) = 64
   block_kv: pydantic.conint(multiple_of=64, gt=0) = 64
-  num_stages: pydantic.conint(gt=1) = 2
-  fold_q_sequence_heads: bool = False
+  num_stages: pydantic.PositiveInt = 2
+  fold_q_sequence_heads: pydantic.StrictBool = False
   split_k: pydantic.PositiveInt = 1
+
+  def __post_init__(self):
+    if type(self) is ConfigBase:  # pylint: disable=unidiomatic-typecheck
+      raise ValueError("Cannot use ConfigBase directly. Use a subclass.")
+
+
+def decompose_mask(mask, q, k, q_indices, k_indices):
+  """Decomposes `mask` into a mask array, `is_causal`, `k_start` and `k_end`."""
+  if mask is None:
+    return None, False, None, None
+
+  is_causal = False
+  k_start = None
+  k_end = None
+
+  if k_indices is None:
+    mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
+
+    # Fold `is_causal` into `k_end`. If `q_indices` is not `None`, then this is
+    # necessary for correctness. Otherwise, it is a performance optimization.
+    if is_causal and (q_indices is not None or k_end is not None):
+      if q_indices is None:
+        q_indices = jnp.arange(q.shape[-3])
+      k_end_ = q_indices + 1
+      k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
+      is_causal = False
+
+    if k_start is not None:
+      k_start = jax.lax.broadcast_to_rank(k_start, 2)
+    if k_end is not None:
+      k_end = jax.lax.broadcast_to_rank(k_end, 2)
+
+  q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
+  k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
+  mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+  return mask, is_causal, k_start, k_end
 
 
 def load_bcast(
