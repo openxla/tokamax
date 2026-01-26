@@ -348,7 +348,11 @@ def flash_attention_kernel(
           alpha = exp(m_i - m_ij)
           m_i = m_ij
           p = exp(s * scale - lax.broadcast_in_dim(m_ij, s.shape, [0]))
-          acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
+          acc = jnp.where(
+              lax.broadcast_in_dim(alpha != 1.0, acc.shape, [0]),
+              acc * lax.broadcast_in_dim(alpha, acc.shape, [0]),
+              acc,
+          )
           l_i *= alpha
         else:
           p = exp(s * scale)
