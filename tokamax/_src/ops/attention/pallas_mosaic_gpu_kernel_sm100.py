@@ -22,7 +22,6 @@ import jax
 from jax import lax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
-from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
