@@ -30,6 +30,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_i8 as sm100_quant_i8
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws as sm90_quant_ws
@@ -80,8 +81,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       rhs = rhs.mT  # TODO: Fuse transpose into kernel.
       ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
-    lhs = quantization.as_array(lhs)
     # None of the kernels support zero point yet.
+    lhs = quantization.as_array_or_qarray_without_zero_point(lhs)
     rhs = quantization.as_array_or_qarray_without_zero_point(rhs)
 
     if gpu_utils.is_sm90():
@@ -125,7 +126,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             "Only default `ragged_dot_dimension_numbers` supported."
         )
       if isinstance(rhs, QArray):
-        if config.post_scale:
+        if config.use_native_int8_mma:
+          fn = sm100_quant_i8.ragged_dot_gpu_quant_i8_blackwell_kernel
+        elif config.post_scale:
           fn = sm100_quant_post_scale.ragged_dot_gpu_quant_post_scale_blackwell_kernel  # pylint: disable=line-too-long
         else:
           fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel

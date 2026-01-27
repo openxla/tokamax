@@ -50,6 +50,7 @@ class Config:
   persistent: bool = True
   async_store: bool = False
   post_scale: bool = False
+  use_native_int8_mma: bool = False
   # B200 collective MMA
   collective: bool = False
   # indicates the fastest changing dim.
