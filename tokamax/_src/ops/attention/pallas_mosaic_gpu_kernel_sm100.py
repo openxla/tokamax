@@ -683,13 +683,7 @@ def flash_attention_kernel(
   def entry(*refs):
 
     def tiled_smem(shape, dtype):
-      elem_bits = common.num_bits(dtype)
-      swizzle = plgpu.find_swizzle(elem_bits * shape[-1])
-
-      transforms = (
-          plgpu.TilingTransform((8, 8 * swizzle // elem_bits)),
-          plgpu.SwizzleTransform(swizzle),
-      )
+      transforms = common.tile_swizzle_transforms(shape, dtype)
       return plgpu.SMEM(shape, dtype, transforms=transforms)
 
     q_scratch = tiled_smem((block_q, head_dim), q.dtype)
