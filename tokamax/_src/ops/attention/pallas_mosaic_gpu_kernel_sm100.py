@@ -641,7 +641,7 @@ def flash_attention_kernel(
         plgpu.wait_load_tmem()
       with jax.named_scope("SMEM -> GMEM"):
         if normalize_output:
-          acc /= lax.broadcast_in_dim(l_i, (block_q, head_dim), [0])
+          acc *= lax.broadcast_in_dim(1.0 / l_i, acc.shape, [0])
         q_smem[...] = acc.astype(dtype)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(q_smem, out_ref.at[qs, hi])
