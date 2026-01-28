@@ -169,16 +169,6 @@ def flash_attention_kernel(
   pad_head_dim = lambda x: shape_lib.pad_dim_to(x, head_dim, -1)
   q, k, v = map(pad_head_dim, (q, k, v))
 
-  logits_map = lambda x: x
-
-  if logits_scale != 1.0:
-    logits_map = lambda x, logits_map=logits_map: logits_scale * logits_map(x)
-
-  if logits_soft_cap is not None:
-    logits_map = lambda x, logits_map=logits_map: logits_soft_cap * jnp.tanh(
-        logits_map(x) / logits_soft_cap
-    )
-
   if mask is None:
     apply_bool_mask = bcast_mask_q = bcast_mask_k = False
   else:
@@ -538,9 +528,9 @@ def flash_attention_kernel(
           )
         return mask
 
-      def maybe_apply_mask(qk, ki, *, do_causal):
+      def maybe_apply_mask(s, scale, ki, *, do_causal):
         if not (apply_bool_mask or use_k_ranges or do_causal):
-          return qk
+          return s, scale
         need_apply_mask = jnp.logical_or(
             do_causal or apply_bool_mask, need_apply_k_range_mask(ki)
         )
@@ -548,7 +538,9 @@ def flash_attention_kernel(
             compute_qk_mask(ki, do_causal), 0, _DEFAULT_MASK_VALUE
         )
         return lax.cond(
-            need_apply_mask, lambda: qk + compute_mask_fn(), lambda: qk
+            need_apply_mask,
+            lambda: (s * scale + compute_mask_fn(), 1.0),
+            lambda: (s, scale),
         )
 
       def kv_loop(ki, carry, *, do_causal=False):
@@ -558,16 +550,20 @@ def flash_attention_kernel(
         with jax.named_scope("Q@K"):
           plgpu.barrier_wait(qk_mma_barrier)
         with jax.named_scope("load_qk"):
-          qk = plgpu.async_load_tmem(acc_qk_tmem, layout=_TMEM)
+          s = plgpu.async_load_tmem(acc_qk_tmem, layout=_TMEM)
+          scale = logits_scale
           plgpu.wait_load_tmem()
           plgpu.barrier_arrive(qk_consumed_barrier)
+
+        if logits_soft_cap is not None:
+          s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
+
         with jax.named_scope("softmax"):
           exp = jnp.exp2 if use_base2 else jnp.exp
-          qk = logits_map(qk)
           if use_base2:
-            qk *= math.log2(math.e)
-          qk = maybe_apply_mask(qk, ki, do_causal=do_causal)
-          m_ij = jnp.maximum(qk.max(axis=1), m_i)
+            scale *= math.log2(math.e)
+          s, scale = maybe_apply_mask(s, scale, ki, do_causal=do_causal)
+          m_ij = jnp.maximum(m_i, s.max(axis=1) * scale)
           with jax.named_scope("exp(SFU)"):
             alpha = exp(m_i - m_ij)
 
@@ -578,7 +574,7 @@ def flash_attention_kernel(
 
           m_i = m_ij
           with jax.named_scope("exp(SFU)"):
-            p = exp(qk - lax.broadcast_in_dim(m_ij, (block_q, block_kv), [0]))
+            p = exp(s * scale - lax.broadcast_in_dim(m_ij, s.shape, [0]))
           l_i *= alpha
           l_i += p.sum(axis=1)
           p16 = p.astype(qk_tmem.dtype)
