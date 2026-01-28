@@ -18,6 +18,7 @@ import dataclasses
 import functools
 from typing import Any, ClassVar, Final, TypeAlias
 import immutabledict
+import itertools
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
@@ -44,6 +45,10 @@ class Config:
   block_q: pydantic.conint(multiple_of=_NUM_LANES, gt=0)
   block_kv: pydantic.conint(multiple_of=_NUM_LANES, gt=0)
   block_kv_compute: pydantic.conint(multiple_of=_NUM_LANES, gt=0)
+  q_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  k_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  v_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  use_experimental_scheduler: bool = False
 
   def __post_init__(self):
     if self.block_kv % self.block_kv_compute:
@@ -156,9 +161,6 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     config_splash = splash.SplashConfig(
         use_base2_exp=self.use_base2,
         attn_logits_soft_cap=logits_soft_cap,
-        q_layout=splash.QKVLayout.HEAD_DIM_MINOR,
-        k_layout=splash.QKVLayout.HEAD_DIM_MINOR,
-        v_layout=splash.QKVLayout.HEAD_DIM_MINOR,
         **dataclasses.asdict(config),
         **dataclasses.asdict(ConfigVjp()),
     )
@@ -216,12 +218,41 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments):
     # TODO: Select better parameters based on a heuristic.
-    return Config(block_q=128, block_kv=128, block_kv_compute=128)
+    return Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=splash.QKVLayout.HEAD_DIM_MINOR,
+        k_layout=splash.QKVLayout.HEAD_DIM_MINOR,
+        v_layout=splash.QKVLayout.HEAD_DIM_MINOR,
+        use_experimental_scheduler=False,
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    # TODO: Add support for autotuning.
-    return set()
+    q, k = ba.arguments['q'], ba.arguments['k']
+    q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
+    tiles = [128, 256, 512, 1024, 2048, 4096, 8192]
+    layouts = [splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR]
+    schedulers = [True, False]
+    config = set()
+    for bq, bkv, bkv_c, ql, kl, vl, sched in itertools.product(
+        tiles, tiles, tiles, layouts, layouts, layouts, schedulers
+    ):
+      if bkv % bkv_c != 0 or bq > q_seq_len or bkv > kv_seq_len:
+        continue
+      config.add(
+          Config(
+              block_q=bq,
+              block_kv=bkv,
+              block_kv_compute=bkv_c,
+              q_layout=ql,
+              k_layout=kl,
+              v_layout=vl,
+              use_experimental_scheduler=sched,
+          )
+      )
+    return config
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

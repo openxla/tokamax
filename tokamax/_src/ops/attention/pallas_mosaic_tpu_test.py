@@ -32,6 +32,56 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
       self.skipTest('Only supported on TPUs.')
     super().setUp()
 
+  def _test_attention(
+      self, q, k, v, do, mask, is_causal, logits_soft_cap, config=None
+  ):
+    kwargs = dict(
+        mask=mask,
+        is_causal=is_causal,
+        logits_soft_cap=logits_soft_cap,
+        logits_scale=0.1,
+    )
+    attention_impl = fa.PallasMosaicTpuFlashAttention(config=config)
+
+    @jax.jit
+    def f_base(query, key, value, do):
+      primals, f_vjp = jax.vjp(
+          functools.partial(fa_base.DotProductAttention(), **kwargs),
+          query,
+          key,
+          value,
+      )
+      return primals, f_vjp(do)
+
+    @jax.jit
+    def f(query, key, value, do):
+      primals, f_vjp = jax.vjp(
+          functools.partial(attention_impl, **kwargs),
+          query,
+          key,
+          value,
+      )
+      return primals, f_vjp(do)
+
+    out_base, (dq_base, dk_base, dv_base) = f_base(q, k, v, do)
+    out, (dq, dk, dv) = f(q, k, v, do)
+
+    atol = 0.035 if logits_soft_cap else 0.15
+    with self.subTest('output'):
+      chex.assert_trees_all_close(out, out_base, atol=atol)
+
+    atol = 0.15 if logits_soft_cap else 1.5
+    with self.subTest('dq'):
+      chex.assert_trees_all_close(dq, dq_base, atol=atol)
+
+    atol = 0.13 if logits_soft_cap else 1.2
+    with self.subTest('dk'):
+      chex.assert_trees_all_close(dk, dk_base, atol=atol)
+
+    atol = 0.03 if logits_soft_cap else 0.15
+    with self.subTest('dv'):
+      chex.assert_trees_all_close(dv, dv_base, atol=atol)
+
   @parameterized.product(
       dtype=[jnp.float32],
       is_mqa=[False, True],
@@ -39,7 +89,6 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
       logits_soft_cap=[None, 3.4],
   )
   def test_simple(self, dtype, is_mqa, masking, logits_soft_cap):
-
     head_dim = 32
     q_seq_len = 128
     kv_seq_len = 128
@@ -66,63 +115,45 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
     do = jax.ShapeDtypeStruct(
         (batch_size, q_seq_len, num_q_heads, head_dim), dtype=jnp.float32
     )
-
     q, k, v, mask, do = numerics.random_initialize((q, k, v, mask, do))
+    self._test_attention(q, k, v, do, mask, is_causal, logits_soft_cap)
 
-    @jax.jit
-    def f_base(query, key, value, do):
+  def test_autotune(self):
+    head_dim = 32
+    q_seq_len = 128
+    kv_seq_len = 128
+    num_q_heads = 4
+    num_kv_heads = 4
+    batch_size = 2
+    dtype = jnp.float32
 
-      primals, f_vjp = jax.vjp(
-          functools.partial(
-              fa_base.DotProductAttention(),
-              mask=mask,
-              is_causal=is_causal,
-              logits_soft_cap=logits_soft_cap,
-              logits_scale=0.1,
-          ),
-          query,
-          key,
-          value,
-      )
+    q_shape = (batch_size, q_seq_len, num_q_heads, head_dim)
+    k_shape = (batch_size, kv_seq_len, num_kv_heads, head_dim)
+    v_shape = (batch_size, kv_seq_len, num_kv_heads, head_dim)
 
-      return primals, f_vjp(do)
+    q = jax.ShapeDtypeStruct(q_shape, dtype)
+    k = jax.ShapeDtypeStruct(k_shape, dtype)
+    v = jax.ShapeDtypeStruct(v_shape, dtype)
+    do = jax.ShapeDtypeStruct(q_shape, dtype=jnp.float32)
+    q, k, v, do = numerics.random_initialize((q, k, v, do))
 
-    @jax.jit
-    def f(query, key, value, do):
+    attention_fn = fa.PallasMosaicTpuFlashAttention()
+    bound_args = attention_fn.bind(q, k, v)
+    configs = attention_fn._get_autotuning_configs(bound_args)
+    self.assertNotEmpty(configs)
 
-      primals, f_vjp = jax.vjp(
-          functools.partial(
-              fa.PallasMosaicTpuFlashAttention(),
-              mask=mask,
-              is_causal=is_causal,
-              logits_soft_cap=logits_soft_cap,
-              logits_scale=0.1,
-          ),
-          query,
-          key,
-          value,
-      )
-
-      return primals, f_vjp(do)
-
-    out_base, (dq_base, dk_base, dv_base) = f_base(q, k, v, do)
-    out, (dq, dk, dv) = f(q, k, v, do)
-
-    atol = 0.035 if logits_soft_cap else 0.15
-    with self.subTest('output'):
-      chex.assert_trees_all_close(out, out_base, atol=atol)
-
-    atol = 0.15 if logits_soft_cap else 1.5
-    with self.subTest('dq'):
-      chex.assert_trees_all_close(dq, dq_base, atol=atol)
-
-    atol = 0.13 if logits_soft_cap else 1.2
-    with self.subTest('dk'):
-      chex.assert_trees_all_close(dk, dk_base, atol=atol)
-
-    atol = 0.03 if logits_soft_cap else 0.15
-    with self.subTest('dv'):
-      chex.assert_trees_all_close(dv, dv_base, atol=atol)
+    for config in configs:
+      with self.subTest(f'{config=}'):
+        self._test_attention(
+            q,
+            k,
+            v,
+            do,
+            mask=None,
+            is_causal=False,
+            logits_soft_cap=None,
+            config=config,
+        )
 
 
 if __name__ == '__main__':
