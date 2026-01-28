@@ -91,21 +91,25 @@ def load_bcast(
   new_idx = []
   shape = []
   bcast_dims = []
+  ld_layout = layout
   # NOTE: We could add support for `idx` shorter than `ref.ndim`.
   for d, ix in zip(ref.shape, idx, strict=True):
     new_idx.append(0 if d == 1 else ix)
 
     if isinstance(ix, pl.Slice):
       if d == 1:
-        layout = layout.reduce(len(shape))
+        ld_layout = ld_layout.reduce(len(shape))
       else:
         bcast_dims.append(len(shape))
       shape.append(ix.size)
 
-  if not bcast_dims:
-    return ref[tuple(new_idx)]  # Return a scalar value.
-  value = plgpu.load(ref, tuple(new_idx), layout=layout, optimized=optimized)
-  return jax.lax.broadcast_in_dim(value, shape, bcast_dims)
+  new_idx = tuple(new_idx)
+  if bcast_dims:
+    value = plgpu.load(ref, new_idx, layout=ld_layout, optimized=optimized)
+  else:  # Scalar value.
+    value = ref[new_idx]
+  value = jax.lax.broadcast_in_dim(value, shape, bcast_dims)
+  return value if layout is None else plgpu.layout_cast(value, layout)
 
 
 def num_bits(dtype: jax.typing.DTypeLike) -> int:

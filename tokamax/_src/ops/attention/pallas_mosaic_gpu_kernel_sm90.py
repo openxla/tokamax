@@ -309,8 +309,7 @@ def flash_attention_kernel(
         if k_start is not None:
 
           def apply_k_start(k_start=k_start):
-            if k_start.ndim > 0:
-              k_start = lax.broadcast_in_dim(k_start, s.shape, [0])
+            k_start = lax.broadcast_in_dim(k_start, s.shape, [0])
             s_ = s * scale
             return jnp.where(k_base + iota(1) >= k_start, s_, mask_value), 1.0
 
@@ -321,8 +320,7 @@ def flash_attention_kernel(
         if k_end is not None:
 
           def apply_k_end(k_end=k_end):
-            if k_end.ndim > 0:
-              k_end = lax.broadcast_in_dim(k_end, s.shape, [0])
+            k_end = lax.broadcast_in_dim(k_end, s.shape, [0])
             s_ = s * scale
             return jnp.where(k_base + iota(1) < k_end, s_, mask_value), 1.0
 

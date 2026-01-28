@@ -54,6 +54,8 @@ _QK_MEMORY_WARP = 1
 _PV_MEMORY_WARP = 2
 _MASK_MEMORY_WARP = 3
 
+_load_bcast = common.load_bcast
+
 
 @pydantic.dataclasses.dataclass(
     frozen=True, kw_only=True, slots=True, config=dict(extra="forbid")
@@ -476,24 +478,9 @@ def flash_attention_kernel(
       )
       l_i = plgpu.layout_cast(jnp.zeros_like(m_i), _TMEM_ROW)
 
-      def load_k_range(k_range_ref) -> jax.Array | None:
-        if k_range_ref is None:
-          return None
-        shape = k_range_ref.shape
-        hi_ = 0 if shape[-2] == 1 else hi
-        singular_q = shape[-1] == 1
-
-        qs_ = 0 if singular_q else qs
-        layout = L.WG_SPLAT if singular_q else _TMEM_ROW
-        k_range = plgpu.load(
-            k_range_ref, (hi_, qs_), layout=layout, optimized=False
-        )
-        if singular_q:
-          k_range = lax.broadcast_in_dim(k_range, (block_q,), ())
-          k_range = plgpu.layout_cast(k_range, _TMEM_ROW)
-        return k_range
-
-      k_start, k_end = load_k_range(k_start_ref), load_k_range(k_end_ref)
+      load_k_range = lambda r: _load_bcast(r, (hi, qs), layout=_TMEM_ROW)
+      k_start = None if k_start_ref is None else load_k_range(k_start_ref)
+      k_end = None if k_end_ref is None else load_k_range(k_end_ref)
 
       def need_apply_k_range_mask(ki):
         need_apply = False
