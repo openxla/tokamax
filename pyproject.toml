@@ -29,7 +29,6 @@ dependencies = [
     "tqdm",
     "typing_extensions>=4.5.0",
     "typeguard==2.13.3",
-    "xprof",
     "immutabledict",
     "tensorboardx",
 ]
@@ -51,10 +50,12 @@ test = [
     "flax",
     "pytest-xdist",
     "pytest",
+    "xprof",
 ]
 
 bench = [
     "google-benchmark>=1.9.0",
+    "xprof",
 ]
 
 cuda = [
