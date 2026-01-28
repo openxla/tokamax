@@ -369,6 +369,9 @@ class AttentionTestBase(parameterized.TestCase):
   def test_non_power_of_two_head_dim(self):
     self._run_test((2, 1024, 4, 48))
 
+  def test_small_non_power_of_two_head_dim(self):
+    self._run_test((2, 1024, 4, 24))
+
   @pytest.mark.long
   @parameterized.parameters(
       ((2, 4, 1024, 1024),),

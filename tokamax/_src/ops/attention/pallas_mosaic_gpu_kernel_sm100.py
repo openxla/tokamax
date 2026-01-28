@@ -22,6 +22,7 @@ import jax
 from jax import lax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
+from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
@@ -77,17 +78,50 @@ class Config(common.ConfigBase):
 def get_heuristics_config(ba: op.BoundArguments) -> Config:
   """Returns a heuristic configuration for flash attention on SM100 GPUs."""
   q, _, v, *_ = ba.args
-  head_dim = max(q.shape[-1], v.shape[-1])
+  *batch_size, q_seq_len, q_heads, head_dim = q.shape
+  head_dim = pl.cdiv(max(head_dim, v.shape[-1]), 64) * 64
+  batch_size = math.prod(batch_size)
+  kv_seq_len = v.shape[-3]
   num_tma_splits = 2 if head_dim == 256 else 1
   collective = True
-  num_stages = max(256 // head_dim, 1) * (1 + int(collective))
+  cluster_size = 1 + int(collective)
+  num_stages = max(256 // head_dim, 1) * cluster_size
+  block_q = 256 if collective else 128
+  block_kv = 128
+  split_k = 1
+
+  mask = ba.kwargs.get("mask", None)
+  # We use 0.5 threshold here as a safe choice for automatic K-split usage.
+  # For other cases like 0.8 etc. we need a smarter heuristic or autotuning.
+  min_load_factor = 0.5
+  grid_size = batch_size * pl.cdiv(q_seq_len, block_q) * q_heads
+  num_ctas = backend.get_default_device().core_count // cluster_size
+  # We do not support k split yet for causal attn or with k ranges
+  not_masked = mask is None or not (
+      mask.is_causal or mask.k_start is not None or mask.k_end is not None
+  )
+  is_kv_seq_aligned = kv_seq_len % block_kv == 0
+  # TODO fix test failures for non aligned q seq
+  is_q_seq_aligned = q_seq_len % block_q == 0
+  if (
+      grid_size / num_ctas < min_load_factor
+      and is_kv_seq_aligned
+      and is_q_seq_aligned
+      and not_masked
+  ):
+    split_k = num_ctas // grid_size
+    split_k = min(kv_seq_len // block_kv, split_k)
+    while kv_seq_len % split_k != 0:
+      split_k -= 1
+
   return Config(
-      block_q=256 if collective else 128,
-      block_kv=128,
+      block_q=block_q,
+      block_kv=block_kv,
       block_d=128,
       collective=collective,
       num_stages=num_stages,
       num_tma_splits=num_tma_splits,
+      split_k=split_k,
   )
 
 

@@ -150,7 +150,7 @@ def flash_attention_kernel(
   q, k, v = map(pad_seq_len, (q, k, v))
 
   q_seq_len, num_q_heads, _ = q.shape
-  kv_seq_len, _, head_dim_out = v.shape
+  kv_seq_len, _, orig_head_dim_out = v.shape
 
   # The contracting dimension for `wgmma` must be a multiple of the minimum
   # swizzle size (in number of elements).
@@ -158,8 +158,9 @@ def flash_attention_kernel(
     m = 8 * _MIN_SWIZZLE // common.num_bits(x.dtype)
     return shape_lib.pad_to_next_multiple_of(x, m, -1)
 
-  q, k = map(pad_head_dim, (q, k))
+  q, k, v = map(pad_head_dim, (q, k, v))
   head_dim = q.shape[-1]
+  head_dim_out = v.shape[-1]
 
   block_q_kv = block_q, block_kv = config.block_q, config.block_kv
   max_stages = min(config.num_stages, pl.cdiv(kv_seq_len, block_kv))
@@ -562,4 +563,4 @@ def flash_attention_kernel(
     residuals = tuple(r[:, :orig_q_seq_len] for r in residuals)
   else:
     residuals = None
-  return out[:orig_q_seq_len], residuals
+  return out[:orig_q_seq_len, :, :orig_head_dim_out], residuals
