@@ -209,8 +209,9 @@ class DotProductAttentionTest(parameterized.TestCase):
       q_seqlen = jnp.array([T // 2, T // 4], dtype=jnp.int32)
       kv_seqlen = jnp.array([S // 4, S // 2], dtype=jnp.int32)
     if 'custom' in mask_mode:
-      # Use a generated causal mask as the custom mask.
-      custom_mask = jnp.tril(jnp.ones((T, S), dtype=jnp.bool_))
+      # Use a checkerboard mask as the custom mask to ensure it differs from
+      # a standard causal mask to test causal and custom together work.
+      custom_mask = (jnp.arange(T)[:, None] + jnp.arange(S)[None, :]) % 2 == 0
       mask = custom_mask[None, None, :, :]
     if 'bias' in mask_mode:
       bias = jax.ShapeDtypeStruct((1, N, T, S), dtype)

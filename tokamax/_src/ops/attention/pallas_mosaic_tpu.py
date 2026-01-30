@@ -171,11 +171,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     mask_shape = (q_seq_len, kv_seq_len)
 
     if mask.bool_mask is not None:
-      if mask.is_causal:
-        raise NotImplementedError(
-            "Causal attention with a boolean mask is not supported."
-        )
-      splash_mask = as_4d(mask.bool_mask)
+      splash_mask = as_4d(mask.as_array(q_seq_len, kv_seq_len))
       mask_batch_size, num_mask_heads, _, _ = splash_mask.shape
       # TODO: Support boolean masks differing across heads.
       if num_mask_heads != 1:
