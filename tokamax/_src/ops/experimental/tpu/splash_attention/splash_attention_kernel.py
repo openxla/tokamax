@@ -1946,30 +1946,26 @@ class SplashAttentionKernel:
     if self.fwd_mask_info.block_mask is not None:
       block_mask_shape = self.fwd_mask_info.block_mask.shape
       try:
-        shard_shape = sharding.shard_shape(block_mask_shape)
+        sharding.shard_shape(block_mask_shape)
       except ValueError as exc:
         raise ValueError(
             "The sharding must divide the mask blocks evenly between devices"
         ) from exc
-    # Only q sequence sharding is supported.
-    spec = sharding.spec
-    assert len(spec) == 1
+
+    if len(sharding.spec) != 1:
+      raise ValueError("Only q sequence sharding is supported.")
+
+    _resolve_spec = lambda x: sharding.spec if x is not None else None
     mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
-        mask_next=spec if self.fwd_mask_info.mask_next is not None else None,
-        active_rows=spec
-        if self.fwd_mask_info.active_rows is not None
-        else None,
-        active_cols=spec
-        if self.fwd_mask_info.active_cols is not None
-        else None,
-        num_active_blocks=spec
-        if self.fwd_mask_info.num_active_blocks is not None
-        else None,
-        block_mask=spec if self.fwd_mask_info.block_mask is not None else None,
+        mask_next=_resolve_spec(self.fwd_mask_info.mask_next),
+        active_rows=_resolve_spec(self.fwd_mask_info.active_rows),
+        active_cols=_resolve_spec(self.fwd_mask_info.active_cols),
+        num_active_blocks=_resolve_spec(self.fwd_mask_info.num_active_blocks),
+        block_mask=_resolve_spec(self.fwd_mask_info.block_mask),
         partial_mask_blocks=jax.sharding.PartitionSpec()  # replicated
         if self.fwd_mask_info.partial_mask_blocks is not None
         else None,
-        q_sequence=spec if self.fwd_mask_info.q_sequence is not None else None,
+        q_sequence=_resolve_spec(self.fwd_mask_info.q_sequence),
     )
     return SplashAttentionKernel(
         mask_info_specs,

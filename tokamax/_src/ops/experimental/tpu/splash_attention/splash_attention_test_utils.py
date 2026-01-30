@@ -48,6 +48,11 @@ class SplashAttentionTestCase(parameterized.TestCase):
     super().setUp()
 
   def _assert_array_equal(self, x, y, **kwargs):
+    if x is None or y is None:
+      self.assertIsNone(x)
+      self.assertIsNone(y)
+      return
+
     self.assertTrue(jnp.isfinite(x).all())
     self.assertTrue(jnp.isfinite(y).all())
 

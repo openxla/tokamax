@@ -698,61 +698,48 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     _check_presence(actual.active_rows, expected.active_rows)
     _check_presence(actual.active_cols, expected.active_cols)
 
-    if actual.num_active_blocks is not None:
-      self._assert_array_equal(
-          actual.num_active_blocks,
-          expected.num_active_blocks,
-          err_msg="num_active_blocks",
-          verbose=True,
-      )
-
-    if actual.block_mask is not None:
-      self._assert_array_equal(
-          actual.block_mask,
-          expected.block_mask,
-          err_msg="block_mask",
-          verbose=True,
-      )
-
-    if actual.active_rows is not None:
-      self._assert_array_equal(
-          actual.active_rows,
-          expected.active_rows,
-          err_msg="active_rows",
-          verbose=True,
-      )
-
-    if actual.active_cols is not None:
-      self._assert_array_equal(
-          actual.active_cols,
-          expected.active_cols,
-          err_msg="active_cols",
-          verbose=True,
-      )
-
-    if actual.mask_next is not None:
-      self._assert_array_equal(
-          actual.mask_next,
-          expected.mask_next,
-          err_msg="mask_next",
-          verbose=True,
-      )
-
-    if actual.partial_mask_blocks is not None:
-      self._assert_array_equal(
-          actual.partial_mask_blocks,
-          expected.partial_mask_blocks,
-          err_msg="partial_mask_blocks",
-          verbose=True,
-      )
-
-    if actual.q_sequence is not None:
-      self._assert_array_equal(
-          actual.q_sequence,
-          expected.q_sequence,
-          err_msg="q_sequence",
-          verbose=True,
-      )
+    self._assert_array_equal(
+        actual.num_active_blocks,
+        expected.num_active_blocks,
+        err_msg="num_active_blocks",
+        verbose=True,
+    )
+    self._assert_array_equal(
+        actual.block_mask,
+        expected.block_mask,
+        err_msg="block_mask",
+        verbose=True,
+    )
+    self._assert_array_equal(
+        actual.active_rows,
+        expected.active_rows,
+        err_msg="active_rows",
+        verbose=True,
+    )
+    self._assert_array_equal(
+        actual.active_cols,
+        expected.active_cols,
+        err_msg="active_cols",
+        verbose=True,
+    )
+    self._assert_array_equal(
+        actual.mask_next,
+        expected.mask_next,
+        err_msg="mask_next",
+        verbose=True,
+    )
+    self._assert_array_equal(
+        actual.partial_mask_blocks,
+        expected.partial_mask_blocks,
+        err_msg="partial_mask_blocks",
+        verbose=True,
+    )
+    self._assert_array_equal(
+        actual.q_sequence,
+        expected.q_sequence,
+        err_msg="q_sequence",
+        verbose=True,
+    )
 
   def _process_mask(self, *args, **kwargs):
     mask_info, mask_function = mask_info_lib.process_mask(*args, **kwargs)
@@ -931,7 +918,7 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
           ],
           dtype=np.int8,
       ).flatten()
-      expected_num_active_blocks_dkv = np.array([32], dtype=np.int32)
+      expected_num_active_blocks_dkv = None
 
     expected_mask_info_dkv = mask_info_lib.MaskInfo(
         expected_causal_mask_next_dkv if not is_lazy_mask else None,
@@ -1374,7 +1361,21 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     self._assert_mask_info_match(mask_info, expected_mask_info)
     self._assert_mask_info_match(mask_info_dkv, expected_mask_info_dkv)
 
-  def test_two_qseq_shards_local_wide_local_narrow_stacked(self):
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="q_seq_shards_2",
+          q_seq_shards=2,
+          kv_seq_shards=1,
+      ),
+      dict(
+          testcase_name="kv_seq_shards_2",
+          q_seq_shards=1,
+          kv_seq_shards=2,
+      ),
+  )
+  def test_two_shards_local_wide_local_narrow_stacked(
+      self, q_seq_shards, kv_seq_shards
+  ):
     sequence_lengths = (64, 64)
     block_shape = (16, 16)
     window_size = 8
@@ -1386,22 +1387,19 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         sequence_lengths, window_size=(window_size, 0), offset=0
     )
 
-    mask = np.concatenate((local_mask_wide, local_mask_narrow), axis=0)
+    concat_axis = 0 if q_seq_shards > 1 else 1
+    mask = np.concatenate((local_mask_wide, local_mask_narrow), axis=concat_axis)
+
     mask = mask_lib.NumpyMask(mask)
 
     mask_info, mask_info_dkv, mask_function = self._process_mask(
-        mask, block_shape, q_seq_shards=2
+        mask,
+        block_shape,
+        q_seq_shards=q_seq_shards,
+        kv_seq_shards=kv_seq_shards,
     )
     self.assertIsNone(mask_function)
 
-    expected_mask_next = np.concatenate(
-        [
-            np.array([0, 1, 2, 0, 1, 2, 0, 1, 2, 0]),  # local wide mask
-            np.array([3, 2, 3, 2, 3, 2, 3, -1, -1, -1]),  # local narrow mask
-        ],
-        axis=0,
-        dtype=np.int8,
-    )
     expected_block_mask = np.concatenate(
         [
             np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1]),  # local wide block mask
@@ -1431,17 +1429,48 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
 
     expected_num_active_blocks = np.array([10, 7], dtype=np.int32)
 
-    expected_partial_mask_blocks = np.stack([
-        # Wide
-        np.triu(
-            np.tri(*block_shape, window_size, dtype=np.int8),
-            -window_size,
-        ),
-        np.tri(*block_shape, -window_size, dtype=np.int8),
-        np.triu(np.ones(block_shape, dtype=np.int8), window_size),
-        # Narrow
-        np.triu(np.tri(*block_shape, 0, dtype=np.int8), -window_size),
-    ])
+    block_wide_1 = np.triu(
+        np.tri(*block_shape, window_size, dtype=np.int8), -window_size
+    )
+    block_wide_2 = np.tri(*block_shape, -window_size, dtype=np.int8)
+    block_wide_3 = np.triu(np.ones(block_shape, dtype=np.int8), window_size)
+    block_narrow = np.triu(np.tri(*block_shape, 0, dtype=np.int8), -window_size)
+
+    if q_seq_shards == 2:
+      expected_partial_mask_blocks = np.stack(
+          [block_wide_1, block_wide_2, block_wide_3, block_narrow]
+      ).astype(np.int8)
+
+      expected_mask_next = np.array(
+          [0, 1, 2, 0, 1, 2, 0, 1, 2, 0]  # local wide mask
+          + [3, 2, 3, 2, 3, 2, 3, -1, -1, -1],  # local narrow mask
+          dtype=np.int8,
+      )
+
+      expected_local_mask_next_dkv = np.array(
+          [0, 2, 1, 0, 2, 1, 0, 2, 1, 0] +
+          [3, 2, 3, 2, 3, 2, 3, -1, -1, -1],
+          dtype=np.int8,
+      )
+
+    else:
+      assert kv_seq_shards == 2
+      # The global mask is different so the partial mask blocks are processed
+      # in a different order.
+      expected_partial_mask_blocks = np.stack(
+          [block_wide_1, block_wide_2, block_narrow, block_wide_3],
+      ).astype(np.int8)
+
+      expected_mask_next = np.array(
+          [0, 1, 3, 0, 1, 3, 0, 1, 3, 0]  # local narrow mask
+          + [2, 3, 2, 3, 2, 3, 2, -1, -1, -1],  # local wide mask
+          dtype=np.int8,
+      )
+
+      expected_local_mask_next_dkv = np.array(
+          [0, 3, 1, 0, 3, 1, 0, 3, 1, 0] + [2, 3, 2, 3, 2, 3, 2, -1, -1, -1],
+          dtype=np.int8,
+      )
 
     expected_mask_info = mask_info_lib.MaskInfo(
         expected_mask_next,
@@ -1451,15 +1480,6 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_num_active_blocks,
         expected_partial_mask_blocks,
         None,
-    )
-
-    expected_local_mask_next_dkv = np.concatenate(
-        [
-            np.array([0, 2, 1, 0, 2, 1, 0, 2, 1, 0]),
-            np.array([3, 2, 3, 2, 3, 2, 3, -1, -1, -1]),
-        ],
-        axis=0,
-        dtype=np.int8,
     )
 
     expected_active_rows_dkv = np.concatenate(
@@ -1509,6 +1529,88 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         expected_partial_mask_blocks.mT,
         None,
     )
+
+    self._assert_mask_info_match(mask_info, expected_mask_info)
+    self._assert_mask_info_match(mask_info_dkv, expected_mask_info_dkv)
+
+  @parameterized.parameters(False, True)
+  def test_causal_two_q_shards_two_kv_shards(self, return_dynamic_grid):
+    q_seq_shards = kv_seq_shards = 2
+    sequence_lengths = (64, 64)
+    block_shape = (16, 16)
+
+    mask = mask_lib.make_causal_mask(sequence_lengths, 0)
+    mask = mask_lib.NumpyMask(mask)
+
+    args = (mask, block_shape)
+    kwargs = {
+        "q_seq_shards": q_seq_shards,
+        "kv_seq_shards": kv_seq_shards,
+    }
+    mask_info, _ = mask_info_lib.process_mask(*args, **kwargs)
+    mask_info_dkv, _ = mask_info_lib.process_mask_dkv(
+        *args,
+        **kwargs,
+        return_dynamic_grid=return_dynamic_grid,
+    )
+
+    partial_mask_blocks = np.tri(*(block_shape), dtype=np.int8)[None]
+    expected_mask_info = mask_info_lib.MaskInfo(
+        mask_next=np.array(
+            [0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, -1],
+            dtype=np.int8,
+        ),
+        active_rows=np.array(
+            [0, 1, 1, -1, -1, -1, -1, -1, 0, 0, 1, 1, 0, 1, 1, -1],
+            dtype=np.int8,
+        ),
+        active_cols=np.array(
+            [0, 0, 1, -1, -1, -1, -1, -1, 0, 1, 0, 1, 0, 0, 1, -1],
+            dtype=np.int8,
+        ),
+        block_mask=np.array(
+            [1, 2, 1, -1, -1, -1, -1, -1, 2, 2, 2, 2, 1, 2, 1, -1],
+            dtype=np.int8,
+        ),
+        num_active_blocks=np.array([3, 0, 4, 3], dtype=np.int32),
+        partial_mask_blocks=partial_mask_blocks,
+        q_sequence=None,
+    )
+    if return_dynamic_grid:
+      expected_mask_info_dkv = mask_info_lib.MaskInfo(
+          mask_next=np.array(
+              [0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, -1],
+              dtype=np.int8,
+          ),
+          active_rows=np.array(
+              [0, 0, 1, -1, 0, 1, -1, -1, 0, 0, 1, 1, 0, 0, 1, -1], dtype=np.int8
+          ),
+          active_cols=np.array(
+              [0, 1, 1, -1, 0, 0, -1, -1, 0, 1, 0, 1, 0, 1, 1, -1], dtype=np.int8
+          ),
+          block_mask=np.array(
+              [1, 2, 1, -1, 0, 0, -1, -1, 2, 2, 2, 2, 1, 2, 1, -1], dtype=np.int8
+          ),
+          num_active_blocks=np.array([3, 2, 4, 3], dtype=np.int32),
+          partial_mask_blocks=partial_mask_blocks.mT,
+          q_sequence=None,
+      )
+    else:
+
+      expected_mask_info_dkv = mask_info_lib.MaskInfo(
+          mask_next=np.array(
+              [0, 0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0],
+              dtype=np.int8,
+          ),
+          active_rows=None,
+          active_cols=None,
+          block_mask=np.array(
+              [1, 2, 0, 1, 0, 0, 0, 0, 2, 2, 2, 2, 1, 2, 0, 1], dtype=np.int8
+          ),
+          num_active_blocks=None,
+          partial_mask_blocks=partial_mask_blocks.mT,
+          q_sequence=None,
+      )
 
     self._assert_mask_info_match(mask_info, expected_mask_info)
     self._assert_mask_info_match(mask_info_dkv, expected_mask_info_dkv)

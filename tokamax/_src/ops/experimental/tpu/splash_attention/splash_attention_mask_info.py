@@ -220,11 +220,10 @@ def _get_mask_info(
   Returns:
     Slice of mask_next (if required) that correspond to the current mask slice.
   """
-  _, kv_seq_len = mask.shape
   q_block_size, kv_block_size = block_shape
 
   q_block_count, q_mod = divmod(q_seq_shard_size, q_block_size)
-  kv_block_count, kv_mod = divmod(kv_seq_len, kv_block_size)
+  kv_block_count, kv_mod = divmod(kv_seq_shard_size, kv_block_size)
 
   assert q_mod == 0
   assert kv_mod == 0
@@ -276,8 +275,8 @@ def _get_mask_info(
     active_indices = np.ndindex(block_mask.shape)
     active_rows = active_cols = grid_size = None
 
-  mask_next = []
   if partial_blocks:
+    mask_next = []
     mask_coords_iter = iter(list(partial_blocks.keys()))
     first_m = coord_m = next(mask_coords_iter)
 
@@ -289,6 +288,8 @@ def _get_mask_info(
         except StopIteration:
           coord_m = first_m
       mask_next.append(partial_blocks[coord_m])
+  else:
+    mask_next = np.full(block_mask.size, -1, dtype=np.int32)
 
   mask_next = np.array(mask_next, dtype=np.int32)
   flat_block_mask = block_mask.flatten()
