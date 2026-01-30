@@ -97,11 +97,25 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
 
   @override
   def _test_quantized(
-      self, dtype, a_tile_shape, b_tile_shape, activation, use_as_qarray
+      self,
+      a_dtype,
+      b_dtype,
+      a_tile_shape,
+      b_tile_shape,
+      use_as_qarray,
+      activation=None,
+      # (num_groups, m, k, n)
+      task=(8, 512, 256, 512),
   ):
     with test_base.override_chex_args(atol=0.4, rtol=0.1):
       super()._test_quantized(
-          dtype, a_tile_shape, b_tile_shape, activation, use_as_qarray
+          a_dtype,
+          b_dtype,
+          a_tile_shape,
+          b_tile_shape,
+          use_as_qarray,
+          activation,
+          task,
       )
 
   @override

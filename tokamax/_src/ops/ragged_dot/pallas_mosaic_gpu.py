@@ -28,6 +28,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm100_i8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
@@ -80,11 +81,17 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       rhs = rhs.mT  # TODO: Fuse transpose into kernel.
       ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
-    lhs = quantization.as_array(lhs)
     # None of the kernels support zero point yet.
+    lhs = quantization.as_array_or_qarray_without_zero_point(lhs)
     rhs = quantization.as_array_or_qarray_without_zero_point(rhs)
 
+    fn = None
+
     if gpu_utils.is_sm90():
+      # sm90 doesn't support lhs to be QArray.
+      if isinstance(lhs, QArray):
+        lhs = quantization.as_array(lhs)
+
       if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
         if isinstance(rhs, QArray):
           if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
@@ -125,10 +132,17 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             "Only default `ragged_dot_dimension_numbers` supported."
         )
       if isinstance(rhs, QArray):
-        if config.post_scale:
-          fn = sm100_quant_post_scale.ragged_dot_gpu_quant_post_scale_blackwell_kernel  # pylint: disable=line-too-long
-        else:
-          fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
+        if isinstance(lhs, QArray):
+          if lhs.qtype == jnp.int8:
+            fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
+          else:
+            # dequantize lhs to fallback to non-lhs-quantized kernel
+            lhs = quantization.as_array(lhs)
+        if isinstance(lhs, jax.Array):
+          if config.post_scale:
+            fn = sm100_quant_post_scale.ragged_dot_gpu_quant_post_scale_blackwell_kernel  # pylint: disable=line-too-long
+          else:
+            fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
       else:
         fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
     else:
@@ -139,6 +153,12 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
     if preferred_element_type is None:
       preferred_element_type = jnp.promote_types(lhs.dtype, rhs.dtype)
+
+    if fn is None:
+      raise NotImplementedError(
+          f"Unsupported config: {config=} {ragged_dot_dimension_numbers=}"
+          f" {lhs.dtype=} {rhs.dtype=} {preferred_element_type=} {precision=}"
+      )
 
     dot_out = fn(
         lhs,
@@ -156,13 +176,13 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    _, rhs = ba.args
+    lhs, rhs = ba.args
+    # avoid OOMs by having too large block_k
+    block_k = (
+        min(rhs.scale_tile_shape[1], 256) if isinstance(rhs, QArray) else 128
+    )
 
     if gpu_utils.is_sm90():
-      # avoid OOMs by having too large block_k
-      block_k = (
-          min(rhs.scale_tile_shape[1], 256) if isinstance(rhs, QArray) else 128
-      )
       return Config(
           block_m=64,
           block_n=64,
@@ -178,10 +198,20 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       )
     elif gpu_utils.is_sm100():
       if isinstance(rhs, QArray):
+        if isinstance(lhs, QArray):
+          if lhs.qtype == jnp.int8:
+            return Config(
+                block_m=16,
+                block_n=128,
+                block_k=block_k,
+                num_stages=2,
+                split_k=1,
+                grid_block_n=1,
+            )
         return Config(
             block_m=64,
             block_n=128,
-            block_k=256,
+            block_k=block_k,
             num_stages=2,
             split_k=1,
             grid_block_n=1,
