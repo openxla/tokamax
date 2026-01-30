@@ -14,8 +14,8 @@
 # ==============================================================================
 """Tests for ring attention."""
 
+import dataclasses
 import functools
-import math
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -35,167 +35,119 @@ partial = functools.partial
 jax.config.parse_flags_with_absl()
 
 
-class PallasBaseTest(test_utils.SplashAttentionTestCase):
-  INTERPRET = False
-
-  def setUp(self):
-    super().setUp()
-    if not test_utils.test_device_matches(["tpu"]):
-      self.skipTest("Test requires TPU.")
-
-    if len(jax.devices()) < 4:
-      self.skipTest("This test requires at least 4 devices.")
-
-
-class RingAttentionTest(PallasBaseTest):
+class RingAttentionTest(test_utils.SplashAttentionTestCase):
 
   def setUp(self):
     self.skipTest("no sharding on runners")
     if jax.default_backend() != "tpu":
       self.skipTest("Only supported on TPUs.")
+
+    if len(jax.devices()) < 4:
+      self.skipTest("This test requires at least 4 devices.")
+
     super().setUp()
 
   @parameterized.product(
-      topology=[(1, 4)],  # Ring attention requires >= 2 devices on ring axis
-      batch_size=[1, 2],
+      ring_size=[2],
       num_heads=[1],
       head_dim=[128, 256],
       dtype=[jnp.bfloat16],
       is_mqa=[False, True],
       padding_factor=[0, 1],
-      mask=[None, "FULL CAUSAL"],
-      fused_bwd=[True],
+      mask_type=["FULL", "CAUSAL"],
   )
-  def test_ring_attention_mha_fwd_bwd(
+  def test_ring_attention(
       self,
-      topology,
-      batch_size,
+      ring_size,
       num_heads,
       head_dim,
       dtype,
       is_mqa,
       padding_factor,
-      mask,
-      fused_bwd,
+      mask_type,
   ):
-    head_shards, q_seq_shards = topology
-    num_devices = math.prod(topology)
-    if head_shards > num_heads:
+    if len(jax.devices()) < ring_size:
       self.skipTest(
-          f"This test requires {num_heads} heads, but has only"
-          f" {head_shards} head shards available."
-      )
-    if mask == "FULL CAUSAL" and padding_factor > 0:
-      self.skipTest("Full causal mask not supported with padding yet.")
-
-    # Mesh Creation and Input Generation
-    devices = np.asarray(jax.devices()[:num_devices]).reshape(
-        head_shards, q_seq_shards
-    )
-    mesh = jax.sharding.Mesh(devices, ("heads", "ring"))
-    seq_shard = 256
-    seq_shard_pad = padding_factor * 128
-    seq_len = (seq_shard + seq_shard_pad) * q_seq_shards
-    if len(jax.devices()) < num_devices:
-      self.skipTest(
-          f"This test requires {num_devices} devices, but has only"
+          f"This test requires {ring_size} devices, but has only"
           f" {len(jax.devices())} devices available."
       )
+    if mask_type == "CAUSAL" and padding_factor > 0:
+      self.skipTest("Causal mask not supported with padding yet.")
+
+    # Mesh Creation and Input Generation
+    devices = np.asarray(jax.devices()[:ring_size]).reshape(1, ring_size)
+    mesh = jax.sharding.Mesh(devices, ("heads", "ring"))
+    seq_shard = 1024
+    seq_shard_pad = padding_factor * 128
+    seq_len = (seq_shard + seq_shard_pad) * ring_size
+
     k1, k2, k3, k4 = random.split(random.key(0), 4)
     q = random.uniform(
-        k1, (batch_size, num_heads, seq_len, head_dim), dtype=dtype
+        k1, (num_heads, seq_len, head_dim), dtype=dtype
     )
     if is_mqa:
-      k = random.uniform(k2, (batch_size, seq_len, head_dim), dtype=dtype)
-      v = random.uniform(k3, (batch_size, seq_len, head_dim), dtype=dtype)
+      k = random.uniform(k2, (seq_len, head_dim), dtype=dtype)
+      v = random.uniform(k3, (seq_len, head_dim), dtype=dtype)
     else:
       k = random.uniform(
-          k2, (batch_size, num_heads, seq_len, head_dim), dtype=dtype
+          k2, (num_heads, seq_len, head_dim), dtype=dtype
       )
       v = random.uniform(
-          k3, (batch_size, num_heads, seq_len, head_dim), dtype=dtype
+          k3, (num_heads, seq_len, head_dim), dtype=dtype
       )
     do = random.uniform(k4, q.shape, dtype=dtype)
-    mask = mask_lib.FullMask(_shape=(q.shape[2], k.shape[2]))
-    if mask == "FULL CAUSAL":
-      mask = mask_lib.make_causal_mask((q.shape[2], k.shape[2]))
+
+    if mask_type == "CAUSAL":
+      mask = mask_lib.make_causal_mask((seq_len, seq_len))
+    elif mask_type == "FULL":
+      mask = mask_lib.FullMask(_shape=(seq_len, seq_len))
+    else:
+      raise ValueError(f"Unsupported mask type: {mask_type}")
+
     local_segment_ids = None
-    local_q_global_kv_segment_ids = None
     if padding_factor > 0:
-      local_token_idx = jax.lax.broadcasted_iota(
-          jnp.int32, (seq_shard + seq_shard_pad,), 0
-      )
+      self.skipTest("Skipping because segment ids aren't supported.")
+
+      local_token_idx = jnp.arange(seq_shard + seq_shard_pad, dtype=jnp.int32)
       local_segment_tokens = (local_token_idx < seq_shard).astype(jnp.int32)
       local_segment_ids = base.SegmentIds(
           q=local_segment_tokens, kv=local_segment_tokens
       )
 
-      global_kv_segment_tokens = jnp.tile(local_segment_tokens, q_seq_shards)
-      local_q_global_kv_segment_ids = base.SegmentIds(
-          q=local_segment_tokens, kv=global_kv_segment_tokens
-      )
+      global_kv_segment_tokens = jnp.tile(local_segment_tokens, ring_size)
 
     # For ring attention, sequence dimension is sharded over 'ring' axis
-    q_spec = P(
-        None,  # batch
-        "heads" if head_shards > 1 else None,
-        "ring",
-        None,
-    )
-    # K and V must also be sharded along the 'ring' axis for ring attention
+    q_spec = P(None, "ring", None)
     if is_mqa:
-      kv_spec = P(
-          None,  # batch
-          "ring",
-          None,
-      )
+      kv_spec = P("ring", None)
     else:
       kv_spec = q_spec
 
-    # Splash Config and initialize splash kernel for reference kernel
-    splash_config = splash.SplashConfig(
-        block_q=128,
-        block_kv=128,
-        block_q_dkv=128,
-        block_kv_dkv=128,
-        block_kv_dkv_compute=128,
-        use_fused_bwd_kernel=fused_bwd,
+    splash_config = splash.SplashConfig.get_default()
+    splash_config = dataclasses.replace(
+        splash_config,
         use_base2_exp=False,
-        # fuse_reciprocal=False,
+        fuse_reciprocal=True,
         # TODO: Change fuse_reciprocal behavior for ring attention
         # so we do the reciprocal after ring
     )
-    make_splash = splash.make_splash_mqa if is_mqa else splash.make_splash_mha
-    seq_parallel_kernel = make_splash(
-        mask, config=splash_config, q_seq_shards=1
-    )
 
-    # Shardmap reference kernel for splash attention
-    @partial(
-        jax.shard_map,
-        mesh=mesh,
-        in_specs=(q_spec, P(), P()),
-        out_specs=q_spec,
-        check_vma=False,
-    )
-    def shardmap_fn_ref(q, k, v):
-      vmapped_kernel = jax.vmap(seq_parallel_kernel, in_axes=(0, 0, 0, None))
-      o = vmapped_kernel(q, k, v, local_q_global_kv_segment_ids)
-      return o
-
-    # Ring kernel for splash attention
     ring_kernel = ring_attention_kernel.make_ring_attention(
         mask,
         is_mqa=is_mqa,
         ring_axis="ring",
         config=splash_config,
         save_residuals=False,
+        q_seq_shards=ring_size,
+        kv_seq_shards=ring_size,
     )
+    kernel_spec = ring_kernel.manual_sharding_spec(ring_axis="ring")
 
     @partial(
         jax.shard_map,
         mesh=mesh,
         in_specs=(
+            kernel_spec,
             q_spec,
             kv_spec,
             kv_spec,
@@ -203,83 +155,29 @@ class RingAttentionTest(PallasBaseTest):
         out_specs=q_spec,
         check_vma=False,
     )
-    def shardmap_fn(q, k, v):
-      vmapped_kernel = jax.vmap(ring_kernel, in_axes=(0, 0, 0, None))
-      o = vmapped_kernel(q, k, v, local_segment_ids)
-      jax.block_until_ready(o)
-      return o
+    def ring_attn(ring_kernel, q, k, v):
+      out = ring_kernel(q, k, v, local_segment_ids)
+      return out
 
-    # Run forward pass and assert close to reference kernel
-    a = shardmap_fn(q, k, v)
-    jax.block_until_ready(a)
-    b = shardmap_fn_ref(q, k, v)
-    jax.block_until_ready(b)
-    self._assert_allclose(a, b, rtol=5e-3, atol=3e-3)
+    ring_attn_ref = partial(base.attention_reference, is_mqa=is_mqa)
 
-    # Ring attention backward pass wrapped in shardmap
-    @partial(
-        jax.shard_map,
-        mesh=mesh,
-        in_specs=(
-            q_spec,
-            kv_spec,
-            kv_spec,
-            q_spec,
-        ),
-        out_specs=(q_spec, q_spec, kv_spec, kv_spec),
-        check_vma=False,
-    )
-    def backward_fn(q, k, v, do):
-      def vmap_vjp(q, k, v, do):
-        out_original, out_vjp_original = jax.vjp(ring_kernel, q, k, v)
-        out_vjp_res = out_vjp_original(do)
-        return out_original, out_vjp_res[0], out_vjp_res[1], out_vjp_res[2]
+    with self.subTest("fwd"):
+      out = ring_attn(ring_kernel, q, k, v)
+      out_ref = ring_attn_ref(q, k, v, mask[:, :], None)
+      self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
 
-      vmap_vjp_res = jax.vmap(
-          vmap_vjp, in_axes=(0, 0, 0, 0), out_axes=(0, 0, 0, 0)
-      )
-      out_original, dq, dk, dv = vmap_vjp_res(q, k, v, do)
-      return out_original, dq, dk, dv
+    with self.subTest("bwd"):
+      out, out_vjp = jax.vjp(ring_attn, ring_kernel, q, k, v)
+      out_ref, out_vjp_ref = jax.vjp(ring_attn_ref, q, k, v, mask[:, :], None)
+      self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
 
-    # Reference splash attention backward pass wrapped in shardmap
+      _, dq, dk, dv = out_vjp(do)
+      dq_ref, dk_ref, dv_ref, _, _ = out_vjp_ref(do.astype(jnp.float32))
 
-    @partial(
-        jax.shard_map,
-        mesh=mesh,
-        in_specs=(P(), P(), P(), P()),  # k  # v
-        out_specs=(
-            P(),  # out_original
-            P(),  # dq
-            P(),  # dk
-            P(),  # dv
-        ),
-        check_vma=False,
-    )
-    def backward_fn_ref(q, k, v, do):
-      def vmap_vjp(q, k, v, do):
-        out_original, out_vjp_original = jax.vjp(seq_parallel_kernel, q, k, v)
-        out_vjp_res = out_vjp_original(do)
-        return out_original, out_vjp_res[0], out_vjp_res[1], out_vjp_res[2]
+      self._assert_allclose(dq, dq_ref, rtol=7e-2, atol=7e-2)
+      self._assert_allclose(dk, dk_ref, rtol=7e-2, atol=7e-2)
+      self._assert_allclose(dv, dv_ref, rtol=7e-2, atol=7e-2)
 
-      vmap_vjp_res = jax.vmap(
-          vmap_vjp, in_axes=(0, 0, 0, 0), out_axes=(0, 0, 0, 0)
-      )
-      out_original, dq, dk, dv = vmap_vjp_res(q, k, v, do)
-      return out_original, dq, dk, dv
-
-    # Run backward pass and assert close to reference backward pass
-    o_original, dq, dk, dv = backward_fn(q, k, v, do.astype(jnp.bfloat16))
-
-    o_splash, dq_splash_ref, dk_splash_ref, dv_splash_ref = backward_fn_ref(
-        q, k, v, do.astype(jnp.bfloat16)
-    )
-    jax.block_until_ready(dq_splash_ref)
-    jax.block_until_ready(dk_splash_ref)
-    jax.block_until_ready(dv_splash_ref)
-    self._assert_allclose(o_splash, o_original, rtol=7e-2, atol=7e-2)
-    self._assert_allclose(dq, dq_splash_ref, rtol=7e-2, atol=7e-2)
-    self._assert_allclose(dk, dk_splash_ref, rtol=7e-2, atol=7e-2)
-    self._assert_allclose(dv, dv_splash_ref, rtol=7e-2, atol=7e-2)
 
 
 if __name__ == "__main__":

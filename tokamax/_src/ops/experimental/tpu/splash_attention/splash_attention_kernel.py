@@ -825,9 +825,12 @@ def _splash_attention_forward(
   )
 
   if dynamic_grid:
-    grid = (num_q_heads, mask_info.num_active_blocks[0])
+    num_active_blocks = mask_info.num_active_blocks[0]
+    grid = (num_q_heads, num_active_blocks)
+    is_empty_attention_block = num_active_blocks == 0
   else:
     grid = (num_q_heads, kv_steps * (q_seq_len // bq))
+    is_empty_attention_block = False
 
   with jax.named_scope(kernel_name):
     all_out = pl.pallas_call(
@@ -888,13 +891,24 @@ def _splash_attention_forward(
     )
   out, logsumexp, l_linear, max_logits = all_out
 
+  # If there is no compute to do within an attention block, then we want to
+  # initialize the output and residuals to default values. Otherwise, we will
+  # read uninitialized memory. This is a common case in ring attention.
+  def init_if_empty(x: jax.Array, value: float) -> jax.Array:
+    if not dynamic_grid:
+      return x
+
+    return jnp.where(is_empty_attention_block, value, x)
+
+  out = init_if_empty(out, 0.0)
+
   if save_residuals:
     assert max_logits is not None
-    max_logits = max_logits[..., 0]
+    max_logits = init_if_empty(max_logits[..., 0], mask_value)
 
     if fuse_reciprocal:
       assert logsumexp is not None
-      logsumexp = logsumexp[..., 0]
+      logsumexp = init_if_empty(logsumexp[..., 0], mask_value)
     else:
       assert l_linear is not None
       log = jnp.log2 if config.use_base2_exp else jnp.log

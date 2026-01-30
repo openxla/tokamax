@@ -43,6 +43,30 @@ _splash_attention_bwd = splash_kernel._splash_attention_bwd  # pylint: disable=p
 DEFAULT_MASK_VALUE = base.DEFAULT_MASK_VALUE
 
 
+def _dynamic_slice_mask_info(
+    mask_info: MaskInfo, kv_shard_idx: jax.Array, ring_size: int
+) -> MaskInfo:
+  """Slices MaskInfo for the current ring step."""
+
+  def slice_if_exists(arr: jax.Array | None):
+    if arr is None:
+      return None
+
+    shard_len = int(arr.shape[-1]) // ring_size
+    start_idx = kv_shard_idx * shard_len
+    return lax.dynamic_slice_in_dim(arr, start_idx, shard_len, axis=-1)
+
+  return MaskInfo(
+      mask_next=slice_if_exists(mask_info.mask_next),
+      active_rows=slice_if_exists(mask_info.active_rows),
+      active_cols=slice_if_exists(mask_info.active_cols),
+      num_active_blocks=slice_if_exists(mask_info.num_active_blocks),
+      block_mask=slice_if_exists(mask_info.block_mask),
+      partial_mask_blocks=mask_info.partial_mask_blocks,  # partial mask blocks are global
+      q_sequence=mask_info.q_sequence,  # Q sequence stays stationary
+  )
+
+
 def _ring_attention_forward(
     fwd_mask_info: MaskInfo,
     q: jax.Array,
@@ -57,8 +81,20 @@ def _ring_attention_forward(
     sinks: jax.Array | None = None,
     ring_axis: str = RING_AXIS,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+  if segment_ids is not None:
+    raise NotImplementedError("Segment ids aren't supported yet.")
+
+  if q.shape[-1] != k.shape[-1]:
+    raise NotImplementedError(
+        "Queries and keys must have the same head dimension."
+    )
+
+  if sinks is not None:
+    raise NotImplementedError("Sinks aren't supportd yet.")
 
   ring_axis_size = lax.axis_size(ring_axis)
+  ring_axis_idx = lax.axis_index(ring_axis)
+
   shift = partial(
       lax.ppermute,
       axis_name=ring_axis,
@@ -76,7 +112,6 @@ def _ring_attention_forward(
 
   splash_fwd_partial = partial(
       _splash_attention_forward,
-      mask_info=fwd_mask_info,
       save_residuals=True,
       mask_value=mask_value,
       is_mqa=is_mqa,
@@ -88,20 +123,26 @@ def _ring_attention_forward(
   # Initial accumulator values
   o_shape = q.shape
   o_init = jnp.zeros(o_shape, dtype=jnp.float32)
-  l_init = jnp.zeros((q.shape[0], o_shape[1]), jnp.float32)
-  m_init = jnp.full_like(l_init, -jnp.inf, dtype=jnp.float32)
+  l_init = jnp.zeros((o_shape[0], o_shape[1]), jnp.float32)
+  m_init = jnp.full_like(l_init, mask_value, dtype=jnp.float32)
 
-  def body(
-      carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
-      _: int,
-  ) -> tuple[
-      tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array], None
-  ]:
+  def body(carry, i: int):
     m_prev, l_prev, o_prev, k_current, v_current = carry
+
+    current_kv_shard_idx = (ring_axis_idx - i) % ring_axis_size
+    local_fwd_mask_info = _dynamic_slice_mask_info(
+        fwd_mask_info, current_kv_shard_idx, ring_axis_size
+    )
+
     k_next = shift(k_current)
     v_next = shift(v_current)
     out_curr, stats = splash_fwd_partial(
-        q=q, k=k_current, v=v_current, segment_ids=segment_ids, sinks=sinks
+        local_fwd_mask_info,
+        q,
+        k_current,
+        v_current,
+        segment_ids=segment_ids,
+        sinks=sinks,
     )
     lse_curr = stats["logsumexp"]
     m_curr = stats["max_logits"]
@@ -132,7 +173,7 @@ def _ring_attention_forward(
   l_inv = jnp.where(
       l_final == 0.0, 0.0, 1.0 / l_final.astype(jnp.float32)
   ).astype(jnp.float32)
-  out: jax.Array = o_final * l_inv[..., None]
+  out = o_final * l_inv[..., None]
   out = out.astype(q.dtype)
   # Final logsumexp for residuals
   logsumexp = jnp.log(l_final) + m_final
@@ -157,7 +198,8 @@ def _ring_attention_backward(
   (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info) = res
   do_main = do.astype(jnp.float32)
   del do
-  ring_axis_size = lax.axis_size(axis_name=ring_axis)
+  ring_axis_size = lax.axis_size(ring_axis)
+  ring_axis_idx = lax.axis_index(ring_axis)
   # Ring size is 4
   # Device 3 => permute_idx 0, offset (3-0) % 4 = 3, permute_idx 1,
   # offset (3-1) % 4 = 2, etc.
@@ -177,21 +219,29 @@ def _ring_attention_backward(
   dv_accum = jnp.zeros_like(v, dtype=jnp.float32)
   dsinks = sinks
 
-  def body(carry, _: int):
-    dq_accum, dk_accum, dv_accum, k_cur, v_cur, _ = carry
-    k_next = shift(k_cur)
-    v_next = shift(v_cur)
+  def body(carry, i: int):
+    dq_accum, dk_accum, dv_accum, k_current, v_current, _ = carry
+    k_next = shift(k_current)
+    v_next = shift(v_current)
+
+    current_kv_shard_idx = (ring_axis_idx - i) % ring_axis_size
+    local_dkv_mask_info = _dynamic_slice_mask_info(
+        dkv_mask_info, current_kv_shard_idx, ring_axis_size
+    )
+
     residuals_for_chunk = (
         q,
-        k_cur,
-        v_cur,
+        k_current,
+        v_current,
         segment_ids,
         sinks,
         out,
         logsumexp,
-        dkv_mask_info,
+        local_dkv_mask_info,
     )
-    _, _, dq_i, dk_i, dv_i, _, dsinks, _ = _splash_attention_bwd(
+
+    attn_bwd = functools.partial(
+        _splash_attention_bwd,
         save_residuals=False,
         mask_value=mask_value,
         is_mqa=is_mqa,
@@ -200,18 +250,13 @@ def _ring_attention_backward(
         fwd_mask_sparsity=fwd_mask_sparsity,
         dkv_mask_sparsity=dkv_mask_sparsity,
         res=residuals_for_chunk,
-        do=do_main,
     )
-    dv_i = dv_i.astype(jnp.float32)
-    dk_i = dk_i.astype(jnp.float32)
-    dq_i = dq_i.astype(jnp.float32)
-    dv_accum = dv_accum + dv_i
-    dv_next = shift(dv_accum)
-    dk_accum = dk_accum + dk_i
-    dk_next = shift(dk_accum)
-    dq_accum += dq_i
-
-    # Permute k and v backwards for the next iteration.
+    _, _, dq_i, dk_i, dv_i, _, dsinks, _ = attn_bwd(
+        res=residuals_for_chunk, do=do_main
+    )
+    dv_next = shift(dv_accum + dv_i.astype(dv_accum.dtype))
+    dk_next = shift(dk_accum + dk_i.astype(dk_accum.dtype))
+    dq_accum = dq_accum + dq_i.astype(dq_accum.dtype)
 
     return (dq_accum, dk_next, dv_next, k_next, v_next, dsinks), None
 
@@ -574,6 +619,32 @@ class RingSplashAttentionKernel(splash_kernel.SplashAttentionKernel):
         ring_axis=self.ring_axis,
     )
 
+  def manual_sharding_spec(self, ring_axis: str):
+    """Ring attention expects MaskInfo to be sharded by `q_seq_shards`.
+
+    Each q shard will need all the k/v shard's MaskInfo eventually, so we don't
+    shard it, but instead dynamic_slice the chunk that we need at each
+    iteration.
+    """
+
+    spec = jax.sharding.PartitionSpec(ring_axis)
+    _resolve_spec = lambda x: spec if x is not None else None
+
+    mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
+        mask_next=_resolve_spec(self.fwd_mask_info.mask_next),
+        active_rows=_resolve_spec(self.fwd_mask_info.active_rows),
+        active_cols=_resolve_spec(self.fwd_mask_info.active_cols),
+        num_active_blocks=_resolve_spec(self.fwd_mask_info.num_active_blocks),
+        block_mask=_resolve_spec(self.fwd_mask_info.block_mask),
+        partial_mask_blocks=jax.sharding.PartitionSpec(),  # replicated
+        q_sequence=_resolve_spec(self.fwd_mask_info.q_sequence),
+    )
+    return RingSplashAttentionKernel(
+        mask_info_specs,
+        mask_info_specs if self.dkv_mask_info is not None else None,
+        **self.kwargs,
+    )
+
   def tree_flatten(self):
     children = (self.fwd_mask_info, self.dkv_mask_info)
     aux_data = self.kwargs.copy()
@@ -596,7 +667,7 @@ class RingSplashAttentionKernel(splash_kernel.SplashAttentionKernel):
 
 
 def make_ring_attention(
-    mask: np.ndarray | jax.Array | mask_lib.Mask,
+    mask: np.ndarray | mask_lib.Mask,
     *,
     config: SplashConfig | None = None,
     is_mqa: bool,
@@ -634,6 +705,11 @@ def make_ring_attention(
 
   if isinstance(mask, np.ndarray):
     mask = mask_lib.NumpyMask(mask)
+
+  if not isinstance(mask, (mask_lib.NumpyMask, mask_lib.FullMask)):
+    raise NotImplementedError(
+        f"Only NumpyMask and FullMask are supported, but got {type(mask)}."
+    )
 
   if config is None:
     config = SplashConfig.get_default()
