@@ -12,9 +12,9 @@ permissions:
 
 jobs:
   run_benchmarks:
-    name: Run Tokamax Attention Benchmark
-    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@f491ab7e3b51d97908f82a8a1cbc3961fc0be4df
+    name: Run Tokamax benchmarks
+    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@41d4df7f511683b977b4fa80cece1a06fabc061d
     with:
       registry_file: "tokamax/benchmarks/benchmark_registry.pbtxt"
       workflow_type: "SCHEDULED"
-      ml_actions_ref: "f491ab7e3b51d97908f82a8a1cbc3961fc0be4df"
+      ml_actions_ref: "41d4df7f511683b977b4fa80cece1a06fabc061d"

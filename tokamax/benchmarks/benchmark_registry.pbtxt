@@ -2,7 +2,7 @@
 # proto-message: BenchmarkSuite
 
 benchmarks {
-  name: "tokamax_attention_gpu"
+  name: "tokamax_attention"
   description: "Runs the Tokamax attention benchmark on H100 and B200."
   owner: "Tokamax Team"
   update_frequency_policy: QUARTERLY
@@ -12,101 +12,96 @@ benchmarks {
     action_inputs { key: "python_version" value: "3.11" }
   }
 
-  hardware_configs {
-    hardware_category: GPU_H100
-    topology { num_hosts: 1 num_devices_per_host: 1 }
+  environment_configs {
+    id: "GPU_H100"
+    runner_label: "linux-x86-a3-8g-h100-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
-    resource_spec {
-      os: LINUX
-    }
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
-  hardware_configs {
-    hardware_category: GPU_B200
-    topology { num_hosts: 1 num_devices_per_host: 1 }
+  environment_configs {
+    id: "GPU_B200"
+    runner_label: "linux-x86-a4-224-b200-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
-    resource_spec {
-      os: LINUX
-    }
     workload_action_inputs { key: "extras_hw" value: "cuda" }
     workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=None,mosaic" }
   }
 
   metrics {
-
     name: "attention/default/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-  metrics {
 
+  metrics {
     name: "attention/default/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-  metrics {
 
+  metrics {
     name: "attention/triton/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-  metrics {
 
+  metrics {
     name: "attention/triton/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-  metrics {
 
+  metrics {
     name: "attention/mosaic/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-  metrics {
 
+  metrics {
     name: "attention/mosaic/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-  metrics {
 
+  metrics {
     name: "attention/cudnn/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-  metrics {
 
+  metrics {
     name: "attention/cudnn/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-  metrics {
 
+  metrics {
     name: "attention/xla/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-  metrics {
 
+  metrics {
     name: "attention/xla/forward_and_vjp"
     unit: "ms"
     stats {
@@ -116,7 +111,7 @@ benchmarks {
 }
 
 benchmarks {
-  name: "tokamax_triangle_multiplication_gpu"
+  name: "tokamax_triangle_multiplication"
   description: "Runs the Tokamax triangle_multiplication benchmark on H100 and B200."
   owner: "Tokamax Team"
   update_frequency_policy: QUARTERLY
@@ -126,23 +121,19 @@ benchmarks {
     action_inputs { key: "python_version" value: "3.11" }
   }
 
-  hardware_configs {
-    hardware_category: GPU_H100
-    topology { num_hosts: 1 num_devices_per_host: 1 }
+  environment_configs {
+    id: "GPU_H100"
+    runner_label: "linux-x86-a3-8g-h100-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
-    resource_spec {
-      os: LINUX
-    }
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
-  hardware_configs {
-    hardware_category: GPU_B200
-    topology { num_hosts: 1 num_devices_per_host: 1 }
+  environment_configs {
+    id: "GPU_B200"
+    runner_label: "linux-x86-a4-224-b200-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
-    resource_spec {
-      os: LINUX
-    }
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
@@ -153,6 +144,7 @@ benchmarks {
       stat: MEDIAN
     }
   }
+
   metrics {
     name: "triangle_multiplication/default/forward_and_vjp"
     unit: "ms"
@@ -160,6 +152,7 @@ benchmarks {
       stat: MEDIAN
     }
   }
+
   metrics {
     name: "triangle_multiplication/xla/forward"
     unit: "ms"
@@ -167,6 +160,7 @@ benchmarks {
       stat: MEDIAN
     }
   }
+
   metrics {
     name: "triangle_multiplication/xla/forward_and_vjp"
     unit: "ms"
