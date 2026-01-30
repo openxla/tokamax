@@ -461,7 +461,6 @@ def flash_attention_kernel(
       v = v_ref[slice_k, :]
     else:
       v = v_ref[:, slice_k]
-    v = v.astype(float32)
     o_curr = lax.dot_general(s_curr, v, sv_dims)
 
     if max_logit_estimate is None:
