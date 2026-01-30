@@ -1576,7 +1576,7 @@ def _splash_attention_bwd_dkv(
     in_specs.append(None)
 
   dq_reduction_steps = config.dq_reduction_steps
-  if kv_steps <= 3 and dq_reduction_steps == 3:
+  if not dynamic_grid and kv_steps <= 3 and dq_reduction_steps == 3:
     dq_reduction_steps = None
 
   dq = dq_alias_spec = None
