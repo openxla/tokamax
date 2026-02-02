@@ -1,6 +1,9 @@
 name: Run Benchmarks
 
 on:
+  push:
+    branches:
+      - benchmarking
   # Allow manual runs from the Actions tab for testing
   workflow_dispatch:
 

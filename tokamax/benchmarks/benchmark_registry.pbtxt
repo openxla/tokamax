@@ -168,4 +168,20 @@ benchmarks {
       stat: MEDIAN
     }
   }
+
+  metrics {
+    name: "triangle_multiplication/cuequivariance/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "triangle_multiplication/cuequivariance/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
 }
