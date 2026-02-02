@@ -32,7 +32,6 @@ P = jax.P
 MaskInfo = mask_info_lib.MaskInfo
 partial = functools.partial
 
-RING_AXIS = "ring"
 SegmentIds = base.SegmentIds
 SplashConfig = splash_kernel.SplashConfig
 SplashResidualsType = base.SplashResidualsType
@@ -78,8 +77,9 @@ def _ring_attention_forward(
     config: SplashConfig | None,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
+    *,
     sinks: jax.Array | None = None,
-    ring_axis: str = RING_AXIS,
+    ring_axis: str,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
   if segment_ids is not None:
     raise NotImplementedError("Segment ids aren't supported yet.")
@@ -182,33 +182,26 @@ def _ring_attention_forward(
   return out, (lse, m_final)
 
 
-def _ring_attention_backward(
-    res: Any,
-    do: jax.Array,
-    *,
+def _ring_attention_bwd(
     mask_value: float,
     is_mqa: bool,
     config: SplashConfig | None,
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
     dkv_mask_sparsity: float,
+    save_residuals: bool,
     ring_axis: str,
+    # Residuals and gradients
+    res: Any,
+    do: jax.Array,
 ):
-  """Backward pass for custom ring attention."""
+  del save_residuals
   (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info) = res
-  do_main = do.astype(jnp.float32)
-  del do
+  do = do.astype(jnp.float32)
+
   ring_axis_size = lax.axis_size(ring_axis)
   ring_axis_idx = lax.axis_index(ring_axis)
-  # Ring size is 4
-  # Device 3 => permute_idx 0, offset (3-0) % 4 = 3, permute_idx 1,
-  # offset (3-1) % 4 = 2, etc.
-  # Device 2 => permute_idx 0, offset (2-0) % 4 = 2, permute_idx 1,
-  # offset (2-1) % 4 = 1, etc.
-  # Device 1 => permute_idx 0, offset (1-0) % 4 = 1, permute_idx 1,
-  # offset (1-1) % 4 = 0, etc.
-  # Device 0 => permute_idx 0, offset (0-0) % 4 = 0, permute_idx 1,
-  # offset (0-1) % 4 = 3, etc.
+
   shift = partial(
       lax.ppermute,
       axis_name=ring_axis,
@@ -249,10 +242,9 @@ def _ring_attention_backward(
         mask_function=mask_function,
         fwd_mask_sparsity=fwd_mask_sparsity,
         dkv_mask_sparsity=dkv_mask_sparsity,
-        res=residuals_for_chunk,
     )
     _, _, dq_i, dk_i, dv_i, _, dsinks, _ = attn_bwd(
-        res=residuals_for_chunk, do=do_main
+        res=residuals_for_chunk, do=do
     )
     dv_next = shift(dv_accum + dv_i.astype(dv_accum.dtype))
     dk_next = shift(dk_accum + dk_i.astype(dk_accum.dtype))
@@ -261,10 +253,10 @@ def _ring_attention_backward(
     return (dq_accum, dk_next, dv_next, k_next, v_next, dsinks), None
 
   initial_carry = (dq_accum, dk_accum, dv_accum, k, v, dsinks)
-  (dq_final, dk_final, dv_final, _, _, dsinks), _ = lax.scan(
+  (dq, dk, dv, _, _, dsinks), _ = lax.scan(
       body,
       initial_carry,
-      xs=jnp.arange(0, ring_axis_size),
+      xs=jnp.arange(ring_axis_size),
       length=ring_axis_size,
       unroll=True,
   )
@@ -272,71 +264,12 @@ def _ring_attention_backward(
   if sinks is not None:
     dsinks = jax.lax.psum(dsinks, axis_name=ring_axis)
 
-  dq_final = dq_final.astype(q.dtype)
-  dk_final = dk_final.astype(k.dtype)
-  dv_final = dv_final.astype(v.dtype)
-  return dq_final, dk_final, dv_final, dsinks
-
-
-def _ring_attention_bwd(
-    # non-diff args passed to the backward pass from the forward pass
-    mask_value: float,  # 1
-    is_mqa: bool,  # 2
-    config: SplashConfig | None,  # 3
-    mask_function: MaskFunctionType | None,  # 4
-    fwd_mask_sparsity: float,  # 5
-    dkv_mask_sparsity: float,  # 6
-    save_residuals: bool,  # 7
-    ring_axis: str,  # 8
-    # output from forward pass
-    res: Any,
-    do: jax.Array,
-):
-  """Custom VJP backward pass for ring attention.
-
-  This function is used by `jax.custom_vjp` to define the backward pass
-  of the ring attention computation. It takes the residuals from the forward
-  pass and the gradient of the output (`do`) and computes the gradients
-  with respect to the inputs (q, k, v, sinks).
-
-  Args:
-    mask_value: The value used for masked-out attention scores.
-    is_mqa: Whether Multi-Query Attention is used.
-    config: SplashAttention configuration.
-    mask_function: Optional function to apply additional masking.
-    fwd_mask_sparsity: Sparsity level of the forward mask.
-    save_residuals: Whether residuals were saved in the forward pass.
-    ring_axis: The name of the jax axis used for the ring.
-    res: Residuals returned by the forward pass (`_ring_attention_fwd`).
-    do: The gradient of the output of the forward pass.
-
-  Returns:
-    A tuple containing the gradients with respect to:
-      - fwd_mask_info (None)
-      - dkv_mask_info (None)
-      - q (dq)
-      - k (dk)
-      - v (dv)
-      - sinks (dsinks)
-      - segment_ids (None)
-  """
-  dq, dk, dv, dsinks = _ring_attention_backward(
-      res,
-      do,
-      mask_value=mask_value,
-      is_mqa=is_mqa,
-      config=config,
-      mask_function=mask_function,
-      fwd_mask_sparsity=fwd_mask_sparsity,
-      dkv_mask_sparsity=dkv_mask_sparsity,  # Pass dkv_mask_sparsity
-      ring_axis=ring_axis,
-  )
   return (
       None,  # fwd_mask_info
       None,  # dkv_mask_info
-      dq,
-      dk,
-      dv,
+      dq.astype(q.dtype),
+      dk.astype(k.dtype),
+      dv.astype(v.dtype),
       dsinks,
       None,
   )
@@ -358,11 +291,8 @@ def _ring_attention_fwd(
     fwd_mask_sparsity: float,  # 5
     dkv_mask_sparsity: float,  # 6
     save_residuals: bool,  # 7
-    ring_axis: str = RING_AXIS,  # 8
-) -> tuple[
-    jax.Array,
-    SplashResidualsType,
-]:
+    ring_axis: str,  # 8
+) -> tuple[jax.Array, SplashResidualsType]:
   """Forward pass for the custom VJP of ring attention.
 
   This function is used by `jax.custom_vjp` to define the forward pass
@@ -390,6 +320,10 @@ def _ring_attention_fwd(
       - The output of the ring attention computation.
       - Residuals needed for the backward pass (`SplashResidualsType`).
   """
+  del dkv_mask_sparsity
+  if save_residuals:
+    raise NotImplementedError("Higher-order AD not supported.")
+
   out, (logsumexp, max_logits) = _ring_attention_forward(
       fwd_mask_info,
       q,
@@ -404,17 +338,8 @@ def _ring_attention_fwd(
       fwd_mask_sparsity=fwd_mask_sparsity,
       ring_axis=ring_axis,
   )
-  residuals_for_bwd = (
-      q,
-      k,
-      v,
-      segment_ids,
-      sinks,
-      out,
-      logsumexp,
-      dkv_mask_info,
-  )
-  return out, residuals_for_bwd
+  residuals = (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info)
+  return out, residuals
 
 
 @partial(
@@ -445,7 +370,7 @@ def _ring_attention_custom(
     fwd_mask_sparsity: float,
     dkv_mask_sparsity: float,
     save_residuals: bool,
-    ring_axis: str = RING_AXIS,
+    ring_axis: str,
 ) -> SplashCustomReturnType:
   """Performs ring attention with a custom VJP.
 
@@ -471,7 +396,8 @@ def _ring_attention_custom(
   Returns:
     The output of the ring attention computation.
   """
-  out, (logsumexp, max_logits) = _ring_attention_forward(
+  del dkv_mask_info, dkv_mask_sparsity
+  out, _ = _ring_attention_forward(
       fwd_mask_info,
       q,
       k,
@@ -483,6 +409,7 @@ def _ring_attention_custom(
       config=config,
       mask_function=mask_function,
       fwd_mask_sparsity=fwd_mask_sparsity,
+      ring_axis=ring_axis,
   )
   return out
 
@@ -530,7 +457,7 @@ def _ring_attention(
     fwd_mask_sparsity: float,
     dkv_mask_sparsity: float,
     save_residuals: bool = False,
-    ring_axis: str = RING_AXIS,
+    ring_axis: str,
 ) -> SplashCustomReturnType:
   """Performs ring attention using SplashAttention kernels.
 
@@ -583,12 +510,13 @@ def _ring_attention(
 
 
 @jax.tree_util.register_pytree_node_class
-class RingSplashAttentionKernel(splash_kernel.SplashAttentionKernel):
-  """A SplashAttentionKernel implementation that uses Ring Attention.
+class RingSplashAttentionKernel:
+  """Implements Ring Attention using SplashAttention for sequence parallelism.
 
-  This kernel distributes the attention computation across devices using a ring
-  topology. It iterates through shards of keys and values, accumulating the
-  attention output.
+  This kernel computes global attention by keeping Keys and Values distributed
+  across the `ring_axis`. Instead of gathering full sequences, it rotates K/V 
+  shards between devices and accumulates results incrementally. This allows
+  processing sequence lengths that exceed single-device memory limits.
 
   Attributes:
     fwd_mask_info: Mask information for the forward pass.
@@ -602,12 +530,13 @@ class RingSplashAttentionKernel(splash_kernel.SplashAttentionKernel):
       self,
       fwd_mask_info: MaskInfo,
       dkv_mask_info: MaskInfo | None,
-      ring_axis="ring",
+      ring_axis: str,
       **kwargs,
   ):
+    self.fwd_mask_info = fwd_mask_info
+    self.dkv_mask_info = dkv_mask_info
     self.ring_axis = ring_axis
     self.kwargs = kwargs
-    super().__init__(fwd_mask_info, dkv_mask_info, **kwargs)
 
   def __call__(self, *args, **kwargs):
     return _ring_attention(
@@ -619,7 +548,7 @@ class RingSplashAttentionKernel(splash_kernel.SplashAttentionKernel):
         ring_axis=self.ring_axis,
     )
 
-  def manual_sharding_spec(self, ring_axis: str):
+  def manual_sharding_spec(self):
     """Ring attention expects MaskInfo to be sharded by `q_seq_shards`.
 
     Each q shard will need all the k/v shard's MaskInfo eventually, so we don't
@@ -627,7 +556,7 @@ class RingSplashAttentionKernel(splash_kernel.SplashAttentionKernel):
     iteration.
     """
 
-    spec = jax.sharding.PartitionSpec(ring_axis)
+    spec = jax.sharding.PartitionSpec(self.ring_axis)
     _resolve_spec = lambda x: spec if x is not None else None
 
     mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
@@ -642,6 +571,7 @@ class RingSplashAttentionKernel(splash_kernel.SplashAttentionKernel):
     return RingSplashAttentionKernel(
         mask_info_specs,
         mask_info_specs if self.dkv_mask_info is not None else None,
+        ring_axis=self.ring_axis,
         **self.kwargs,
     )
 

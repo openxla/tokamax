@@ -75,8 +75,9 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
       self.skipTest("Causal mask not supported with padding yet.")
 
     # Mesh Creation and Input Generation
+    ring_axis = "ring"
     devices = np.asarray(jax.devices()[:ring_size]).reshape(1, ring_size)
-    mesh = jax.sharding.Mesh(devices, ("heads", "ring"))
+    mesh = jax.sharding.Mesh(devices, ("heads", ring_axis))
     seq_shard = 1024
     seq_shard_pad = padding_factor * 128
     seq_len = (seq_shard + seq_shard_pad) * ring_size
@@ -117,9 +118,9 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
       global_kv_segment_tokens = jnp.tile(local_segment_tokens, ring_size)
 
     # For ring attention, sequence dimension is sharded over 'ring' axis
-    q_spec = P(None, "ring", None)
+    q_spec = P(None, ring_axis, None)
     if is_mqa:
-      kv_spec = P("ring", None)
+      kv_spec = P(ring_axis, None)
     else:
       kv_spec = q_spec
 
@@ -135,13 +136,13 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
     ring_kernel = ring_attention_kernel.make_ring_attention(
         mask,
         is_mqa=is_mqa,
-        ring_axis="ring",
+        ring_axis=ring_axis,
         config=splash_config,
         save_residuals=False,
         q_seq_shards=ring_size,
         kv_seq_shards=ring_size,
     )
-    kernel_spec = ring_kernel.manual_sharding_spec(ring_axis="ring")
+    kernel_spec = ring_kernel.manual_sharding_spec()
 
     @partial(
         jax.shard_map,
