@@ -25,7 +25,6 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tensorboardX import writer
-
 from tokamax._src import benchmarking
 from tokamax._src.ops.attention import api
 
@@ -60,6 +59,9 @@ class AttentionBenchmark(parameterized.TestCase):
   )
   def test_attention(self, implementation, benchmark_mode):
     """Test attention."""
+
+    if jax.default_backend() == 'tpu' and implementation in ('cudnn', 'triton'):
+      self.skipTest('Current test only runs on GPU.')
 
     if (implementation or 'None') in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(
