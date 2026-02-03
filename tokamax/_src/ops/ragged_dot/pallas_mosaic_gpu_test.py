@@ -50,7 +50,7 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
         config = pallas_mosaic_gpu.Config(
             block_m=128,
             block_n=128,
-            block_k=256,
+            block_k=128,
             num_stages=2,
             split_k=1,
             collective=True,
@@ -60,8 +60,9 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
             not isinstance(rhs_, qwix.QArray)
             or (rhs_.qtype != jnp.int4)
             or (rhs_.scale_tile_shape[0] != 1)
-            or (rhs_.scale_tile_shape[1] < _CONFIG.block_k)
+            or (rhs_.scale_tile_shape[1] < config.block_k)
             or (rhs_.scale_tile_shape[2] != 1)
+            or (rhs_.scale.shape[2] * rhs_.scale.dtype.itemsize <= 16)
         ):
           expect_supported = False
       elif isinstance(rhs_, qwix.QArray):

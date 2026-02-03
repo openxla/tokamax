@@ -91,6 +91,11 @@ def ragged_dot_gpu_quant_blackwell_kernel(
   (num_groups, n, k_w), (m, k_x) = w.shape, x.shape
   tile_k = k_w // w_scales.shape[1]
 
+  if tile_k < block_k:
+    raise NotImplementedError(
+        f"{tile_k=} must be greater than or equal to {block_k=}."
+    )
+
   if config.post_scale:
     raise ValueError("Post scale is not supported.")
 
@@ -104,13 +109,18 @@ def ragged_dot_gpu_quant_blackwell_kernel(
         f" {(num_groups,)} but got {group_sizes.shape}"
     )
   if (x.dtype, w.dtype) != (jnp.bfloat16, jnp.int4):
-    raise ValueError(
+    raise NotImplementedError(
         "Only mixed precision bfloat16 x int4 supported, got:"
         f" {x.dtype=} {w.dtype=}."
     )
 
+  if w_scales.shape[2] * jnp.dtype(w_scales.dtype).itemsize < 16:
+    raise NotImplementedError(
+        "Scales array doesn't have stride of at least 16 bytes."
+    )
+
   if block_m % split_m != 0:
-    raise ValueError(
+    raise NotImplementedError(
         f"Expected block_m ({block_m}) to be divisible by split_m ({split_m})"
     )
 
