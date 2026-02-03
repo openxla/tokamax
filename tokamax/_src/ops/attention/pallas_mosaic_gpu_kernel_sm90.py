@@ -442,19 +442,16 @@ def flash_attention_kernel(
 
       lb, ub, _, _ = get_kv_ranges()
 
-      for i in range(max_stages):
-
-        @pl.when(i < (ub - lb))
-        def _preload_kv_bias_mask():
-          ki = lb + i
-          ks = block.ds(jnp.asarray(ki, jnp.int32), block_kv)
-          si = lax.rem(ki, max_stages)
-          cp(k_gmem.at[ks, hi_kv], k_smems, k_barriers, si)
-          if bias_gmem_ is not None:
-            cp(bias_gmem_.at[:, ks], bias_smems, bias_barriers, si)
-          if mask_gmem_ is not None:
-            cp(mask_gmem_.at[..., ks], mask_smems, mask_barriers, si)
-          cp(v_gmem.at[ks, hi_kv], v_smems, v_barriers, si)
+      @pl.loop(lb, lax.min(lb + max_stages, ub))
+      def _preload_kv_bias_mask(ki):
+        si = lax.rem(ki, max_stages)
+        ks = block.ds(ki, block_kv)
+        cp(k_gmem.at[ks, hi_kv], k_smems, k_barriers, si)
+        if bias_gmem_ is not None:
+          cp(bias_gmem_.at[:, ks], bias_smems, bias_barriers, si)
+        if mask_gmem_ is not None:
+          cp(mask_gmem_.at[..., ks], mask_smems, mask_barriers, si)
+        cp(v_gmem.at[ks, hi_kv], v_smems, v_barriers, si)
 
       @pl.loop(lb, ub - max_stages)
       def _kv_loop(ki):
