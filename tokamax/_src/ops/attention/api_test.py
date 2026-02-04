@@ -180,14 +180,6 @@ class DotProductAttentionTest(parameterized.TestCase):
         self.skipTest(
             'Sliding window is not supported on Mosaic TPU attention.'
         )
-      if 'custom' in mask_mode:
-        # TODO: Remove once causal attention with a custom mask is
-        # supported.
-        if 'causal' in mask_mode:
-          self.skipTest(
-              'Causal attention with a custom mask is not supported on Mosaic'
-              ' TPU attention.'
-          )
 
     dtype = jnp.bfloat16
     cudnn_bias = self.IMPL == 'cudnn' and 'bias' in mask_mode
