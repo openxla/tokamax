@@ -43,9 +43,9 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
 
 dot_product_attention = api.dot_product_attention
 EXAMPLE = {
-    'query': jax.ShapeDtypeStruct((2, 8192, 16, 128), jnp.bfloat16),
-    'key': jax.ShapeDtypeStruct((2, 8192, 16, 128), jnp.bfloat16),
-    'value': jax.ShapeDtypeStruct((2, 8192, 16, 128), jnp.bfloat16),
+    'query': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
+    'key': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
+    'value': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
     'is_causal': True,
 }
 
