@@ -40,7 +40,7 @@ TilingTuple = tuple[
     pydantic.PositiveInt,  # tile_k
     pydantic.PositiveInt,  # tile_n
 ]
-InputBufferCount = pydantic.conint(ge=1, le=3, multiple_of=1)
+InputBufferCount = pydantic.PositiveInt
 
 QArray = base.QArray
 AsQArray = base.AsQArray
@@ -72,6 +72,7 @@ class Config:
   tile_k: pydantic.PositiveInt = 128
   tile_n: pydantic.PositiveInt = 128
   input_buffer_count: InputBufferCount = 2
+  combine_scopes: bool = False
 
 
 # A temporary lookup table for optimized configs.
@@ -299,6 +300,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
+          combine_scopes=config.combine_scopes,
       )
     else:
       raise NotImplementedError(
