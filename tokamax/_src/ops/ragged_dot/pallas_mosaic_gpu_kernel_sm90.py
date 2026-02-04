@@ -37,7 +37,6 @@ def ragged_dot_kernel_body(
     rhs_gmem,
     o_gmem,
     *,
-    swizzle: int,
     out_dtype: jnp.dtype,
     config: common.Config,
     activation: base.ActivationFunction | None = None,
@@ -46,34 +45,25 @@ def ragged_dot_kernel_body(
 
   del mi
   m, k = lhs_gmem.shape
-  out_elem_bits = jnp.finfo(out_dtype).bits
-  elem_bits = jnp.finfo(lhs_gmem.dtype).bits
-  swizzle_elems = swizzle * 8 // elem_bits
-  out_swizzle_elems = swizzle * 8 // out_elem_bits
-
   block_m, block_n = config.block_m, config.block_n
   block_k = min(k, config.block_k)
-  if block_k % swizzle_elems:
-    raise ValueError(
-        f"block_k {block_k} must be a multiple of swizzle_elems {swizzle_elems}"
-    )
 
   def compute_acc(acc_ref):
     mi = group_info.block
-    transforms = (
-        plgpu.TilingTransform((8, swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle),
-    )
     lhs_spec = plgpu.BlockSpec(
         (block_m, block_k),
         lambda ki: (mi, ki),
-        transforms=transforms,
+        transforms=common.tile_swizzle_transforms(
+            (block_m, block_k), lhs_gmem.dtype, "lhs"
+        ),
         delay_release=1,
     )
     rhs_spec = plgpu.BlockSpec(
         (block_k, block_n),
         lambda ki: (ki, ni),
-        transforms=transforms,
+        transforms=common.tile_swizzle_transforms(
+            (block_k, block_n), rhs_gmem.dtype, "rhs"
+        ),
         delay_release=1,
     )
     plgpu.emit_pipeline(
@@ -88,9 +78,11 @@ def ragged_dot_kernel_body(
 
   acc = pl.run_scoped(compute_acc, plgpu.ACC((block_m, block_n)))
 
+  out_elem_bits = common.num_bits(o_gmem.dtype)
+  out_swizzle = plgpu.find_swizzle(block_n * out_elem_bits, "out")
   transforms = (
-      plgpu.TilingTransform((1, out_swizzle_elems)),
-      plgpu.SwizzleTransform(swizzle),
+      plgpu.TilingTransform((1, 8 * out_swizzle // out_elem_bits)),
+      plgpu.SwizzleTransform(out_swizzle),
   )
   o_smem_type = plgpu.SMEM((block_m, block_n), out_dtype, transforms=transforms)
 
@@ -144,9 +136,6 @@ def ragged_dot_kernel(
         f"Only bfloat16/float16 inputs are supported. Got {lhs.dtype=}"
     )
 
-  elem_bits = jnp.finfo(lhs.dtype).bits
-  swizzle = plgpu.find_swizzle(elem_bits * config.block_k, "lhs")
-
   if group_sizes.shape != (g,):
     raise ValueError(
         f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
@@ -154,7 +143,6 @@ def ragged_dot_kernel(
 
   body_fn = functools.partial(
       ragged_dot_kernel_body,
-      swizzle=swizzle,
       config=config,  # This config's block_k must work with swizzle
       out_dtype=out_dtype,
       activation=activation,
@@ -191,7 +179,6 @@ def ragged_contracting_dim_dot_kernel_body(
     rhs_gmem,
     o_gmem,
     *,
-    swizzle: int,
     out_dtype: jnp.dtype,
     config: common.Config,
     activation: base.ActivationFunction | None = None,
@@ -207,10 +194,6 @@ def ragged_contracting_dim_dot_kernel_body(
 
   lb = jax.lax.div(group_start.astype(jnp.int32), block_k)
   ub = pl.cdiv(group_end.astype(jnp.int32), block_k)
-  transforms = (
-      plgpu.TilingTransform((8, swizzle // lhs_gmem.dtype.itemsize)),
-      plgpu.SwizzleTransform(swizzle),
-  )
 
   def acc_scope(acc_ref):
     def body(idxs, lhs_smem, rhs_smem):
@@ -230,13 +213,17 @@ def ragged_contracting_dim_dot_kernel_body(
             plgpu.BlockSpec(
                 (block_m, block_k),
                 lambda ki: (mi, lb + ki),
-                transforms=transforms,
+                transforms=common.tile_swizzle_transforms(
+                    (block_m, block_k), lhs_gmem.dtype, "lhs"
+                ),
                 delay_release=1,
             ),
             plgpu.BlockSpec(
                 (block_k, block_n),
                 lambda ki: (lb + ki, ni),
-                transforms=transforms,
+                transforms=common.tile_swizzle_transforms(
+                    (block_k, block_n), rhs_gmem.dtype, "rhs"
+                ),
                 delay_release=1,
             ),
         ],
@@ -247,6 +234,8 @@ def ragged_contracting_dim_dot_kernel_body(
     return acc_ref[...]
 
   acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
+
+  transforms = common.tile_swizzle_transforms((block_m, block_n), out_dtype)
 
   @functools.partial(
       pl.run_scoped,
@@ -284,16 +273,12 @@ def ragged_contracting_dim_dot_kernel(
         f"Only bfloat16/float16 inputs are supported. Got {lhs.dtype=}"
     )
 
-  elem_bits = jnp.finfo(lhs.dtype).bits
-  swizzle = plgpu.find_swizzle(elem_bits * config.block_k, "lhs")
-
   _, m = lhs.shape
   _, n = rhs.shape
   g = group_sizes.shape[0]
 
   body_fn = functools.partial(
       ragged_contracting_dim_dot_kernel_body,
-      swizzle=swizzle,
       config=config,
       out_dtype=out_dtype,
       activation=activation,

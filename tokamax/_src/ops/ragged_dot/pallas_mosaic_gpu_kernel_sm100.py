@@ -233,25 +233,14 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
       return carry + (actual_size > 0)
 
-  swizzle = plgpu.find_swizzle(block_k * jnp.dtype(x.dtype).itemsize * 8)
-
-  swizzle_elems = swizzle // jnp.dtype(x.dtype).itemsize
-  transforms = (
-      plgpu.TilingTransform((8, swizzle_elems)),
-      plgpu.SwizzleTransform(swizzle),
-  )
-
   def kernel_entry(*refs):
-    x_smem = plgpu.SMEM(
-        (num_stages, tile_m, block_k),
-        dtype=x.dtype,
-        transforms=transforms,
-    )
-    w_smem = plgpu.SMEM(
-        (num_stages, tile_n, block_k),
-        dtype=w.dtype,
-        transforms=transforms,
-    )
+
+    def tiled_smem(shape, dtype, what=""):
+      transforms = common.tile_swizzle_transforms(shape, dtype, what)
+      return plgpu.SMEM(shape, dtype, transforms=transforms)
+
+    x_smem = tiled_smem((num_stages, tile_m, block_k), x.dtype, "x")
+    w_smem = tiled_smem((num_stages, tile_n, block_k), w.dtype, "w")
     acc_tmem = plgpu.TMEM(
         (tile_n, block_m * 2), dtype=jnp.float32, collective=collective
     )
