@@ -30,6 +30,8 @@ _MMA_WARP = 0
 _TMA_WARP = 1
 _STORE_WG = 1
 
+_TCGEN05_TRANSPOSED = plgpu.Layout.TCGEN05_TRANSPOSED
+
 
 @jaxtyping.jaxtyped
 def ragged_dot_gpu_non_quant_blackwell_kernel(
@@ -197,17 +199,13 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
           plgpu.wait_smem_to_gmem(0, wait_read_only=True)
           plgpu.barrier_wait(mma_done_barrier.at[acc_slot])
           with jax.named_scope("tmem -> smem"):
-            acc_smem_t = plgpu.transpose_ref(acc_smem, (1, 0))
             acc = plgpu.async_load_tmem(acc_tmem.at[:, slice_acc_m])
             plgpu.wait_load_tmem()
             if activation is not None:
               acc = activation(acc)
-            acc = acc.astype(acc_smem_t.dtype)
-            acc_smem_t[...] = plgpu.layout_cast(
-                acc, plgpu.Layout.TCGEN05_TRANSPOSED
-            )
+            acc = acc.astype(acc_smem.dtype)
+            acc_smem.T[...] = plgpu.layout_cast(acc, _TCGEN05_TRANSPOSED)
             plgpu.commit_smem()
-            del acc_smem_t
 
           with jax.named_scope("smem -> gmem"):
             # Write out the largest power of two rows first,
