@@ -592,6 +592,8 @@ def _splash_attention_forward(
   dynamic_grid = mask_info.active_rows is not None
 
   if segment_ids is not None:
+    assert isinstance(segment_ids.q, jax.Array)  # for pytype
+    assert isinstance(segment_ids.kv, jax.Array)  # for pytype
     if segment_ids.q.shape != (q_seq_len,):
       raise ValueError(
           "Invalid shape for q segment_ids: "

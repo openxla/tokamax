@@ -53,7 +53,7 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
       head_dim=[128, 256],
       dtype=[jnp.bfloat16],
       is_mqa=[False, True],
-      padding_factor=[0, 1],
+      is_segmented=[False, True],
       mask_type=["FULL", "CAUSAL"],
   )
   def test_ring_attention(
@@ -63,7 +63,7 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
       head_dim,
       dtype,
       is_mqa,
-      padding_factor,
+      is_segmented,
       mask_type,
   ):
     if len(jax.devices()) < ring_size:
@@ -71,32 +71,29 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
           f"This test requires {ring_size} devices, but has only"
           f" {len(jax.devices())} devices available."
       )
-    if mask_type == "CAUSAL" and padding_factor > 0:
-      self.skipTest("Causal mask not supported with padding yet.")
 
     # Mesh Creation and Input Generation
     ring_axis = "ring"
     devices = np.asarray(jax.devices()[:ring_size]).reshape(1, ring_size)
     mesh = jax.sharding.Mesh(devices, ("heads", ring_axis))
-    seq_shard = 1024
-    seq_shard_pad = padding_factor * 128
-    seq_len = (seq_shard + seq_shard_pad) * ring_size
+    seq_len = 1024 * ring_size
 
     k1, k2, k3, k4 = random.split(random.key(0), 4)
-    q = random.uniform(
-        k1, (num_heads, seq_len, head_dim), dtype=dtype
-    )
+    scale = head_dim**-0.5
+    q = random.normal(k1, (num_heads, seq_len, head_dim), dtype=dtype) * scale
     if is_mqa:
-      k = random.uniform(k2, (seq_len, head_dim), dtype=dtype)
-      v = random.uniform(k3, (seq_len, head_dim), dtype=dtype)
+      k = random.normal(k2, (seq_len, head_dim), dtype=dtype) * scale
+      v = random.normal(k3, (seq_len, head_dim), dtype=dtype) * scale
     else:
-      k = random.uniform(
-          k2, (num_heads, seq_len, head_dim), dtype=dtype
+      k = (
+          random.normal(k2, (num_heads, seq_len, head_dim), dtype=dtype)
+          * scale
       )
-      v = random.uniform(
-          k3, (num_heads, seq_len, head_dim), dtype=dtype
+      v = (
+          random.normal(k3, (num_heads, seq_len, head_dim), dtype=dtype)
+          * scale
       )
-    do = random.uniform(k4, q.shape, dtype=dtype)
+    do = random.normal(k4, q.shape, dtype=dtype) * scale
 
     if mask_type == "CAUSAL":
       mask = mask_lib.make_causal_mask((seq_len, seq_len))
@@ -105,24 +102,16 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
     else:
       raise ValueError(f"Unsupported mask type: {mask_type}")
 
-    local_segment_ids = None
-    if padding_factor > 0:
-      self.skipTest("Skipping because segment ids aren't supported.")
-
-      local_token_idx = jnp.arange(seq_shard + seq_shard_pad, dtype=jnp.int32)
-      local_segment_tokens = (local_token_idx < seq_shard).astype(jnp.int32)
-      local_segment_ids = base.SegmentIds(
-          q=local_segment_tokens, kv=local_segment_tokens
-      )
-
-      global_kv_segment_tokens = jnp.tile(local_segment_tokens, ring_size)
+    if is_segmented:
+      segment_ids = test_utils.create_segment_ids(seq_len)
+      segment_ids_spec = base.SegmentIds(q=P(ring_axis), kv=P(ring_axis))
+    else:
+      segment_ids = segment_ids_spec = None
 
     # For ring attention, sequence dimension is sharded over 'ring' axis
     q_spec = P(None, ring_axis, None)
-    if is_mqa:
-      kv_spec = P(ring_axis, None)
-    else:
-      kv_spec = q_spec
+    kv_spec = P(ring_axis, None) if is_mqa else q_spec
+
 
     splash_config = splash.SplashConfig.get_default()
     splash_config = dataclasses.replace(
@@ -152,33 +141,35 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
             q_spec,
             kv_spec,
             kv_spec,
+            segment_ids_spec,
         ),
         out_specs=q_spec,
         check_vma=False,
     )
-    def ring_attn(ring_kernel, q, k, v):
-      out = ring_kernel(q, k, v, local_segment_ids)
+    def ring_attn(ring_kernel, q, k, v, segment_ids):
+      out = ring_kernel(q, k, v, segment_ids)
       return out
 
     ring_attn_ref = partial(base.attention_reference, is_mqa=is_mqa)
 
     with self.subTest("fwd"):
-      out = ring_attn(ring_kernel, q, k, v)
-      out_ref = ring_attn_ref(q, k, v, mask[:, :], None)
+      out = ring_attn(ring_kernel, q, k, v, segment_ids)
+      out_ref = ring_attn_ref(q, k, v, mask[:, :], segment_ids)
       self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
 
     with self.subTest("bwd"):
-      out, out_vjp = jax.vjp(ring_attn, ring_kernel, q, k, v)
-      out_ref, out_vjp_ref = jax.vjp(ring_attn_ref, q, k, v, mask[:, :], None)
+      out, out_vjp = jax.vjp(ring_attn, ring_kernel, q, k, v, segment_ids)
+      out_ref, out_vjp_ref = jax.vjp(
+          ring_attn_ref, q, k, v, mask[:, :], segment_ids
+      )
       self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
 
-      _, dq, dk, dv = out_vjp(do)
+      _, dq, dk, dv, _ = out_vjp(do)
       dq_ref, dk_ref, dv_ref, _, _ = out_vjp_ref(do.astype(jnp.float32))
 
-      self._assert_allclose(dq, dq_ref, rtol=7e-2, atol=7e-2)
-      self._assert_allclose(dk, dk_ref, rtol=7e-2, atol=7e-2)
-      self._assert_allclose(dv, dv_ref, rtol=7e-2, atol=7e-2)
-
+      self._assert_allclose(dq, dq_ref, rtol=1e-2, atol=1e-2)
+      self._assert_allclose(dk, dk_ref, rtol=1e-2, atol=1e-2)
+      self._assert_allclose(dv, dv_ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

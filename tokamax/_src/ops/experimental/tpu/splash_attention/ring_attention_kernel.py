@@ -39,7 +39,6 @@ SplashCustomReturnType = base.SplashCustomReturnType
 MaskFunctionType = splash_kernel.MaskFunctionType
 _splash_attention_forward = splash_kernel._splash_attention_forward  # pylint: disable=protected-access
 _splash_attention_bwd = splash_kernel._splash_attention_bwd  # pylint: disable=protected-access
-DEFAULT_MASK_VALUE = base.DEFAULT_MASK_VALUE
 
 
 def _dynamic_slice_mask_info(
@@ -81,8 +80,6 @@ def _ring_attention_forward(
     sinks: jax.Array | None = None,
     ring_axis: str,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
-  if segment_ids is not None:
-    raise NotImplementedError("Segment ids aren't supported yet.")
 
   if q.shape[-1] != k.shape[-1]:
     raise NotImplementedError(
@@ -127,42 +124,44 @@ def _ring_attention_forward(
   m_init = jnp.full_like(l_init, mask_value, dtype=jnp.float32)
 
   def body(carry, i: int):
-    m_prev, l_prev, o_prev, k_current, v_current = carry
+    m_prev, l_prev, o_prev, k_current, v_current, segment_ids_current = carry
 
     current_kv_shard_idx = (ring_axis_idx - i) % ring_axis_size
     local_fwd_mask_info = _dynamic_slice_mask_info(
         fwd_mask_info, current_kv_shard_idx, ring_axis_size
     )
-
     k_next = shift(k_current)
     v_next = shift(v_current)
+
+    if segment_ids is not None:
+      kv_segment_ids_next = shift(segment_ids_current.kv)
+      segment_ids_next = SegmentIds(segment_ids.q, kv_segment_ids_next)
+    else:
+      segment_ids_next = None
+
     out_curr, stats = splash_fwd_partial(
         local_fwd_mask_info,
         q,
         k_current,
         v_current,
-        segment_ids=segment_ids,
+        segment_ids=segment_ids_current,
         sinks=sinks,
     )
     lse_curr = stats["logsumexp"]
     m_curr = stats["max_logits"]
     l_curr = jnp.exp(lse_curr - m_curr)
-    m_curr = m_curr.astype(jnp.float32)
     o_curr = out_curr.astype(jnp.float32) * l_curr[..., None]
     m_next = jnp.maximum(m_prev, m_curr)
     alpha = jnp.exp(m_prev - m_next)
     beta = jnp.exp(m_curr - m_next)
-    alpha_bcast = lax.broadcast_in_dim(alpha, o_curr.shape, (0, 1))  # (b,1)
-    beta_bcast = lax.broadcast_in_dim(beta, o_curr.shape, (0, 1))  # (b,1)
     l_next = alpha * l_prev + beta * l_curr
-    o_next = alpha_bcast * o_prev + beta_bcast * o_curr
-    o_next = o_next.astype(jnp.float32)
-    return (m_next, l_next, o_next, k_next, v_next), None
+    o_next = alpha[..., None] * o_prev + beta[..., None] * o_curr
+    return (m_next, l_next, o_next, k_next, v_next, segment_ids_next), None
 
   # Use lax.scan to get the final carry AND the collected sequence of (k,v)
   # pairs
-  initial_carry = (m_init, l_init, o_init, k, v)
-  (m_final, l_final, o_final, _, _), _ = lax.scan(
+  initial_carry = (m_init, l_init, o_init, k, v, segment_ids)
+  (m_final, l_final, o_final, _, _, _), _ = lax.scan(
       body,
       initial_carry,
       xs=jnp.arange(0, ring_axis_size),
@@ -170,14 +169,12 @@ def _ring_attention_forward(
       unroll=True,
   )  # type: ignore[arg-type]
   # Final normalization
-  l_inv = jnp.where(
-      l_final == 0.0, 0.0, 1.0 / l_final.astype(jnp.float32)
-  ).astype(jnp.float32)
-  out = o_final * l_inv[..., None]
-  out = out.astype(q.dtype)
+  assert l_final.dtype == jnp.float32
+  l_inv = jnp.where(l_final == 0.0, 0.0, 1.0 / l_final)
+  out = (o_final * l_inv[..., None]).astype(q.dtype)
   # Final logsumexp for residuals
-  logsumexp = jnp.log(l_final) + m_final
-  lse = jnp.where(l_final == 0.0, DEFAULT_MASK_VALUE, logsumexp)
+  lse = jnp.log(l_final) + m_final
+  lse = jnp.where(l_final == 0.0, mask_value, lse)
 
   return out, (lse, m_final)
 
@@ -213,7 +210,15 @@ def _ring_attention_bwd(
   dsinks = sinks
 
   def body(carry, i: int):
-    dq_accum, dk_accum, dv_accum, k_current, v_current, _ = carry
+    (
+        dq_accum,
+        dk_accum,
+        dv_accum,
+        k_current,
+        v_current,
+        segment_ids_current,
+        _,
+    ) = carry
     k_next = shift(k_current)
     v_next = shift(v_current)
 
@@ -221,12 +226,17 @@ def _ring_attention_bwd(
     local_dkv_mask_info = _dynamic_slice_mask_info(
         dkv_mask_info, current_kv_shard_idx, ring_axis_size
     )
+    if segment_ids is not None:
+      kv_segment_ids_next = shift(segment_ids_current.kv)
+      segment_ids_next = SegmentIds(segment_ids.q, kv_segment_ids_next)
+    else:
+      segment_ids_next = None
 
     residuals_for_chunk = (
         q,
         k_current,
         v_current,
-        segment_ids,
+        segment_ids_current,
         sinks,
         out,
         logsumexp,
@@ -250,10 +260,18 @@ def _ring_attention_bwd(
     dk_next = shift(dk_accum + dk_i.astype(dk_accum.dtype))
     dq_accum = dq_accum + dq_i.astype(dq_accum.dtype)
 
-    return (dq_accum, dk_next, dv_next, k_next, v_next, dsinks), None
+    return (
+        dq_accum,
+        dk_next,
+        dv_next,
+        k_next,
+        v_next,
+        segment_ids_next,
+        dsinks,
+    ), None
 
-  initial_carry = (dq_accum, dk_accum, dv_accum, k, v, dsinks)
-  (dq, dk, dv, _, _, dsinks), _ = lax.scan(
+  initial_carry = (dq_accum, dk_accum, dv_accum, k, v, segment_ids, dsinks)
+  (dq, dk, dv, _, _, _, dsinks), _ = lax.scan(
       body,
       initial_carry,
       xs=jnp.arange(ring_axis_size),
@@ -602,7 +620,7 @@ def make_ring_attention(
     config: SplashConfig | None = None,
     is_mqa: bool,
     save_residuals: bool = False,
-    mask_value: float = DEFAULT_MASK_VALUE,
+    mask_value: float = base.DEFAULT_MASK_VALUE,
     downcast_smem_data: bool = True,
     partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
     ring_axis: str,
