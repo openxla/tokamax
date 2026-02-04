@@ -29,7 +29,6 @@ _COMPUTE_WG = 0
 _MMA_WARP = 0
 _TMA_WARP = 1
 _STORE_WG = 1
-_WGMMA_TRANSPOSED = plgpu.Layout.WGMMA_TRANSPOSED
 
 
 @jaxtyping.jaxtyped
@@ -203,8 +202,10 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
             plgpu.wait_load_tmem()
             if activation is not None:
               acc = activation(acc)
-            acc = acc.astype(acc_smem.dtype)
-            acc_smem_t[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
+            acc = acc.astype(acc_smem_t.dtype)
+            acc_smem_t[...] = plgpu.layout_cast(
+                acc, plgpu.Layout.TCGEN05_TRANSPOSED
+            )
             plgpu.commit_smem()
             del acc_smem_t
 
