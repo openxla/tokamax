@@ -182,11 +182,8 @@ def flash_attention_kernel(
     # TODO: Support other out_dtypes.
     raise NotImplementedError(f"{out_dtype=} != {q.dtype=} unsupported.")
 
-  q_seq_len, num_q_heads, head_dim = q.shape
+  orig_q_seq_len, num_q_heads, head_dim = q.shape
   dtype = q.dtype
-
-  if q_seq_len % 8 != 0:
-    raise NotImplementedError(f"{q_seq_len=} must be a multiple of 8")
 
   kv_seq_len, num_kv_heads, _ = k.shape
   orig_head_dim_out = v.shape[-1]
@@ -204,6 +201,9 @@ def flash_attention_kernel(
   head_dim = head_dim_out = pl.cdiv(max(head_dim, orig_head_dim_out), 64) * 64
   pad_head_dim = lambda x: shape_lib.pad_dim_to(x, head_dim, -1)
   q, k, v = map(pad_head_dim, (q, k, v))
+
+  q = shape_lib.pad_to_next_multiple_of(q, 8, -3)
+  q_seq_len = q.shape[-3]
 
   if mask is None:
     apply_bool_mask = bcast_mask_q = bcast_mask_k = False
@@ -851,5 +851,6 @@ def flash_attention_kernel(
       compiler_params=compiler_params,
   )(q, k, v, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
-  residuals = tuple(res[..., :q_seq_len] for res in residuals)
-  return (out[..., :orig_head_dim_out], residuals if residuals else None)
+  residuals = tuple(res[..., :orig_q_seq_len] for res in residuals)
+  out = out[..., :orig_q_seq_len, :, :orig_head_dim_out]
+  return (out, residuals if residuals else None)
