@@ -169,3 +169,80 @@ benchmarks {
     }
   }
 }
+
+benchmarks {
+  name: "tokamax_ragged_dot"
+  description: "Runs the Tokamax ragged_dot benchmark on H100 and B200."
+  owner: "Tokamax Team"
+  update_frequency_policy: QUARTERLY
+  workload {
+    action: "./ml_actions/benchmarking/actions/workload_executors/python"
+    action_inputs { key: "script_path" value: "tokamax/benchmarks/ragged_dot.py" }
+    action_inputs { key: "python_version" value: "3.11" }
+  }
+
+  environment_configs {
+    id: "GPU_H100"
+    runner_label: "linux-x86-a3-8g-h100-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
+    workflow_type: [SCHEDULED]
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
+  }
+
+  environment_configs {
+    id: "GPU_B200"
+    runner_label: "linux-x86-a4-224-b200-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
+    workflow_type: [SCHEDULED]
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
+  }
+
+  metrics {
+    name: "ragged_dot/default/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/default/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/triton/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/triton/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/mosaic/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/mosaic/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+}
+
