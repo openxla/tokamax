@@ -244,7 +244,7 @@ def _tile_score_mod(score_mod, scores, block_q, block_k):
   num_blocks_q = pl.cdiv(scores.shape[-2], block_q)
   num_blocks_k = pl.cdiv(scores.shape[-1], block_k)
   grid = (*scores.shape[:-2], num_blocks_q, num_blocks_k)
-  fn_spec_puller = fuser.pull_block_spec(fn, spec, grid_len=len(grid))
+  fn_spec_puller = fuser.pull_block_spec(fn, spec, grid=grid)
   fn, (value_specs, _), _ = fn_spec_puller(values, scores)
   return fn, values, value_specs
 

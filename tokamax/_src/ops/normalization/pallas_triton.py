@@ -148,7 +148,7 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
     x_fn, x_values, x_prefetch = fuser.get_fusion_values(x)
     if x_prefetch:
       raise NotImplementedError('Prefetch not supported.')
-    x_fn_spec_puller = fuser.pull_block_spec(x_fn, x_spec, grid_len=len(grid))
+    x_fn_spec_puller = fuser.pull_block_spec(x_fn, x_spec, grid=grid)
     x_fn, (x_value_specs,), _ = x_fn_spec_puller(x_values)
 
     kernel = functools.partial(
