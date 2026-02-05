@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Pallas Mosaic TPU Megablox."""
+
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
 import itertools
@@ -397,7 +398,11 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
 
     # Based on some empirical TPU tiling performance. Create a reasonable
     # tiling search space.
-    tile_m_range = [64 * (2**i) for i in range(8) if 64 * (2**i) <= m]
+    tile_m_range = [
+        64 * (2**i)
+        for i in range(8)
+        if 64 * (2**i) <= m and 64 * (2**i) <= 1024
+    ]
 
     tile_k_range = set(
         [
