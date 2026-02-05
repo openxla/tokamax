@@ -34,16 +34,16 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 
 
 DotPrecisionLike = lax.Precision | lax.DotAlgorithmPreset
-L: TypeAlias = plgpu.Layout
 PagingInfo = base.PagingInfo
 QArray = base.QArray
 Residuals = base.Residuals
 
 
-_TMEM = L.TCGEN05_TMEM_NATIVE
-_TMEM_COL = L.TCGEN05_TMEM_NATIVE.reduce(0)
-_TMEM_ROW = L.TCGEN05_TMEM_NATIVE.reduce(1)
-_TCGEN05_ROW = L.TCGEN05.reduce(1)
+_TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
+_TMEM_COL = _TMEM.reduce(0)
+_TMEM_ROW = _TMEM.reduce(1)
+_TCGEN05 = plgpu.Layout.TCGEN05
+_TCGEN05_ROW = _TCGEN05.reduce(1)
 _DEFAULT_MASK_VALUE = -1e30
 
 _MMA_WG = 0
@@ -623,13 +623,8 @@ def flash_attention_kernel(
       # in 2CTA we have non square blocks hence we may need to process
       # M//N steps with a mask, for M=256, N=128 this means 2 steps
       causal_blocks = int(is_causal) * (tile_q // block_kv)
+      m_i, l_i = lax.fori_loop(lb, ub - causal_blocks, kv_loop, (m_i, l_i))
 
-      m_i, l_i = lax.fori_loop(
-          lb,
-          ub - causal_blocks,
-          kv_loop,
-          (m_i, l_i),
-      )
       if is_causal:
         m_i, l_i = lax.fori_loop(
             ub - causal_blocks,
@@ -653,7 +648,7 @@ def flash_attention_kernel(
 
       # epilogue for writing GMEM
       with jax.named_scope("TMEM -> SMEM"):
-        acc = plgpu.async_load_tmem(acc_tmem, layout=L.TCGEN05)
+        acc = plgpu.async_load_tmem(acc_tmem, layout=_TCGEN05)
         plgpu.wait_load_tmem()
       with jax.named_scope("SMEM -> GMEM"):
         if normalize_output:
@@ -682,11 +677,9 @@ def flash_attention_kernel(
             @pl.loop(0, tma_chunk_size // block_d)
             def _scale_d(j):
               ds = pl.ds(i * tma_chunk_size + j * block_d, block_d)
-              acc_tmem_ref = acc_tmem.at[:, ds]
-              updated_acc = plgpu.async_load_tmem(
-                  acc_tmem_ref, layout=_TMEM
-              ) * lax.broadcast_in_dim(alpha, (block_q, block_d), [0])
-              plgpu.async_store_tmem(acc_tmem_ref, updated_acc)
+              acc = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
+              acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
+              plgpu.async_store_tmem(acc_tmem.at[:, ds], acc)
 
             plgpu.commit_tmem()
             plgpu.barrier_arrive(out_scaled_barrier.at[i])
