@@ -146,28 +146,20 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
     )
     fn = jax.jit(fn)
 
-    # Convert dynamic_args to the same order as expected by fn
+    # Convert dynamic_args to the same order as expected by fn.
     # Standardize function returns the args list it created.
-    # We should match the values in dynamic_args to the shapes in standardized_args_shapes.
-
-    def get_actual_args(template, data):
-      # Flatten template and data in a consistent way.
-      # However, standardized_args_shapes is already flat (list of ShapeDtypeStruct)
-      # We need to map dynamic_args to that list.
-      # Standardize function does:
-      # ba = inspect.signature(f).bind(*args, **({} if kwargs is None else kwargs))
-      # ba.apply_defaults()
-      # args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs), ...)
-      # arrays, other, merge = utils.split_merge(is_array, args_flat)
-      # return func, arrays
-
+    def get_actual_args():
       ba = inspect.signature(fn_partial).bind(**dynamic_args)
       ba.apply_defaults()
       args_flat, _ = jax.tree.flatten((ba.args, ba.kwargs))
-      arrays = [x for x in args_flat if isinstance(x, (jax.Array, jax.ShapeDtypeStruct))]
+      arrays = [
+          x
+          for x in args_flat
+          if isinstance(x, (jax.Array, jax.ShapeDtypeStruct))
+      ]
       return arrays
 
-    actual_args = get_actual_args(standardized_args_shapes, dynamic_args)
+    actual_args = get_actual_args()
 
     bench = benchmarking.compile_benchmark(fn, standardized_args_shapes)
     res = bench(actual_args)
@@ -180,20 +172,23 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
     if tblog_dir:
       try:
         tb_writer = SummaryWriter(log_dir=tblog_dir)
-        # Log median evaluation time as required by BAP using the tag from registry
         tb_writer.add_scalar(
             metric_tag,
             res.median_evaluation_time_ms,
             global_step=0,
         )
-
         # Also log individual evaluation times for more detail in TensorBoard
         for i, value in enumerate(res.evaluation_times_ms):
-          tb_writer.add_scalar(f"{metric_tag}/all_iterations", value, global_step=i)
+          tb_writer.add_scalar(
+              f'{metric_tag}/all_iterations', value, global_step=i
+          )
 
         tb_writer.close()
-      except (OSError, IOError) as e:
-        logging.exception('Error writing TensorBoard logs: %s', e)
+      except (OSError, IOError):
+        logging.warning(
+            'Failed to write to TensorBoard output directory: %s',
+            tblog_dir,
+        )
     else:
       logging.info(
           'n=%d, implementation=%s, benchmark_mode=%s, median benchmark time'
