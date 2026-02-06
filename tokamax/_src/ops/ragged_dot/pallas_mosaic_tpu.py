@@ -397,7 +397,9 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     n_ = ((n + 128 - 1) // 128) * 128
 
     # Based on some empirical TPU tiling performance. Create a reasonable
-    # tiling search space.
+    # tiling search space. We limit the search space max to 1024 to ensure
+    # reasonable compilation time. From our experiments, we found that there
+    # is no need on current TPU generations to search for larger tiles for m.
     tile_m_range = [
         64 * (2**i)
         for i in range(8)
