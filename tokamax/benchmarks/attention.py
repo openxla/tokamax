@@ -25,8 +25,8 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tensorboardX import writer
-from tokamax._src import benchmarking
-from tokamax._src.ops.attention import api
+import tokamax
+from tokamax import benchmarking
 
 
 SummaryWriter = writer.SummaryWriter
@@ -41,7 +41,6 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
     'A comma-separated list of implementations to skip.',
 )
 
-dot_product_attention = api.dot_product_attention
 EXAMPLE = {
     'query': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
     'key': jax.ShapeDtypeStruct((2, 8192, 8, 256), jnp.bfloat16),
@@ -71,7 +70,7 @@ class AttentionBenchmark(parameterized.TestCase):
 
     fn, args = benchmarking.standardize_function(
         functools.partial(
-            dot_product_attention,
+            tokamax.dot_product_attention,
             implementation=implementation,
             is_causal=True,
         ),
