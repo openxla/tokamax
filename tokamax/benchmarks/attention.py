@@ -59,8 +59,13 @@ class AttentionBenchmark(parameterized.TestCase):
   def test_attention(self, implementation, benchmark_mode):
     """Test attention."""
 
-    if jax.default_backend() == 'tpu' and implementation in ('cudnn', 'triton'):
-      self.skipTest('Current test only runs on GPU.')
+    # TODO: Re-enable once cuDNN bug is fixed.
+    if (
+        implementation == 'cudnn'
+        and benchmark_mode == 'forward_and_vjp'
+        and 'B200' in jax.devices()[0].device_kind
+    ):
+      self.skipTest('Skipping cudnn forward_and_vjp on B200.')
 
     if (implementation or 'None') in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(
@@ -98,6 +103,14 @@ class AttentionBenchmark(parameterized.TestCase):
           implementation,
           benchmark_mode,
           res.median_evaluation_time_ms,
+      )
+
+    # TODO: Add this to the proto once generic metadata is
+    # supported.
+    if implementation == 'cudnn':
+      logging.info(
+          'cudnn_version=%s',
+          jax._src.lib.cuda_versions.cudnn_get_version(),  # pylint: disable=protected-access # pytype: disable=attribute-error
       )
 
 
