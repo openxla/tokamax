@@ -63,7 +63,7 @@ def _make_spec(
     group_sizes = [m // num_groups] * num_groups
   else:
     assert len(group_sizes) == num_groups
-  group_sizes = base.GroupSizes(  # pytype: disable=wrong-arg-types
+  group_sizes = base.GroupSizes(
       jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
       representative_value=tuple(group_sizes),
   )
@@ -84,7 +84,7 @@ ARG_SPECS = (
             'rhs': jax.ShapeDtypeStruct(
                 shape=(256, 7168, 2048), dtype=jnp.bfloat16
             ),
-            'group_sizes': base.GroupSizes(  # pytype: disable=wrong-arg-types
+            'group_sizes': base.GroupSizes(
                 jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
                 representative_value=_generate_group_sizes(
                     target_m=262144, g=256
@@ -93,7 +93,6 @@ ARG_SPECS = (
         },
         project='maxtext',
         name='deepseek-v3',
-        tags=('long',),
     ),
     arg_spec.ArgSpec(
         args={
@@ -103,7 +102,7 @@ ARG_SPECS = (
             'rhs': jax.ShapeDtypeStruct(
                 shape=(128, 2880, 2880), dtype=jnp.bfloat16
             ),
-            'group_sizes': base.GroupSizes(  # pytype: disable=wrong-arg-types
+            'group_sizes': base.GroupSizes(
                 jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
                 representative_value=_generate_group_sizes(
                     target_m=327680, g=128
@@ -112,7 +111,6 @@ ARG_SPECS = (
         },
         project='maxtext',
         name='gpt-oss-327680x2880',
-        tags=('long',),
     ),
     arg_spec.ArgSpec(
         args={
@@ -122,7 +120,7 @@ ARG_SPECS = (
             'rhs': jax.ShapeDtypeStruct(
                 shape=(128, 2048, 768), dtype=jnp.bfloat16
             ),
-            'group_sizes': base.GroupSizes(  # pytype: disable=wrong-arg-types
+            'group_sizes': base.GroupSizes(
                 jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
                 representative_value=_generate_group_sizes(
                     target_m=393216, g=128
@@ -131,7 +129,6 @@ ARG_SPECS = (
         },
         project='maxtext',
         name='gpt-oss-393216x2048',
-        tags=('long',),
     ),
     arg_spec.ArgSpec(
         args={
@@ -141,7 +138,7 @@ ARG_SPECS = (
             'rhs': jax.ShapeDtypeStruct(
                 shape=(128, 768, 2048), dtype=jnp.bfloat16
             ),
-            'group_sizes': base.GroupSizes(  # pytype: disable=wrong-arg-types
+            'group_sizes': base.GroupSizes(
                 jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
                 representative_value=_generate_group_sizes(
                     target_m=393216, g=128
@@ -150,6 +147,5 @@ ARG_SPECS = (
         },
         project='maxtext',
         name='gpt-oss-393216x768',
-        tags=('long',),
     ),
 ) + tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())

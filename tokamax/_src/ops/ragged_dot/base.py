@@ -71,7 +71,7 @@ class GroupSizes:
   autotuned with representative data.
   """
 
-  value: jax.Array
+  value: jax.Array | jax.ShapeDtypeStruct
   representative_value: Sequence[int] = _STATIC
 
   def __post_init__(self):
