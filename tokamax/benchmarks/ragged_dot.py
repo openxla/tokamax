@@ -70,7 +70,7 @@ class RaggedDotBenchmark(parameterized.TestCase):
   )
   def test_ragged_dot(self, implementation, benchmark_mode):
     """Benchmarks the ragged dot operation."""
-    if implementation in _SKIP_IMPLEMENTATIONS.value:
+    if str(implementation) in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(f'Skipping implementation {implementation}')
 
     ragged_dot_fn = (

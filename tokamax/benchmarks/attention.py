@@ -67,6 +67,14 @@ class AttentionBenchmark(parameterized.TestCase):
     ):
       self.skipTest('Skipping cudnn forward_and_vjp on B200.')
 
+    # TODO: Re-enable once Mosaic GPU supports VJP on B200.
+    if (
+        implementation in ('mosaic', None)
+        and benchmark_mode == 'forward_and_vjp'
+        and 'B200' in jax.devices()[0].device_kind
+    ):
+      self.skipTest('Skipping Mosaic forward_and_vjp on B200.')
+
     if (implementation or 'None') in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(
           f"Skipping implementation '{implementation}' as per"
