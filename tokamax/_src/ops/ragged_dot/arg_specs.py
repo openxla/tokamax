@@ -36,7 +36,7 @@ SPEC_SHAPES = {
 }
 
 
-def _generate_group_sizes(target_m: int, g: int) -> tuple[int, ...]:
+def generate_group_sizes(target_m: int, g: int) -> tuple[int, ...]:
   """Generate group sizes for a given target m."""
   np.random.seed(0)
   repr_val = np.random.uniform(size=(g,))
@@ -86,7 +86,7 @@ ARG_SPECS = (
             ),
             'group_sizes': base.GroupSizes(
                 jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
-                representative_value=_generate_group_sizes(
+                representative_value=generate_group_sizes(
                     target_m=262144, g=256
                 ),
             ),
@@ -104,7 +104,7 @@ ARG_SPECS = (
             ),
             'group_sizes': base.GroupSizes(
                 jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
-                representative_value=_generate_group_sizes(
+                representative_value=generate_group_sizes(
                     target_m=327680, g=128
                 ),
             ),
@@ -122,7 +122,7 @@ ARG_SPECS = (
             ),
             'group_sizes': base.GroupSizes(
                 jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
-                representative_value=_generate_group_sizes(
+                representative_value=generate_group_sizes(
                     target_m=393216, g=128
                 ),
             ),
@@ -140,7 +140,7 @@ ARG_SPECS = (
             ),
             'group_sizes': base.GroupSizes(
                 jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
-                representative_value=_generate_group_sizes(
+                representative_value=generate_group_sizes(
                     target_m=393216, g=128
                 ),
             ),
