@@ -118,6 +118,22 @@ benchmarks {
       stat: MEDIAN
     }
   }
+
+  metrics {
+    name: "attention/xla_chunked/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/xla_chunked/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
 }
 
 benchmarks {

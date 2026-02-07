@@ -53,7 +53,7 @@ class AttentionBenchmark(parameterized.TestCase):
   """Benchmarks for different attention implementations."""
 
   @parameterized.product(
-      implementation=(None, 'triton', 'mosaic', 'cudnn'),
+      implementation=(None, 'triton', 'mosaic', 'cudnn', 'xla', 'xla_chunked'),
       benchmark_mode=('forward', 'forward_and_vjp'),
   )
   def test_attention(self, implementation, benchmark_mode):
