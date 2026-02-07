@@ -221,8 +221,8 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
-    # Disable 'xla' and 'jax_lax' as these OOM on GPU.
-    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla,jax_lax" }
+    # Disable 'xla' as this OOM on GPU.
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla" }
   }
 
   environment_configs {
@@ -231,9 +231,9 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
-    # Disable 'xla' and 'jax_lax' as these OOM on GPU.
+    # Disable 'xla' as this OOM on GPU.
     # TODO: enable 'mosaic' and None once the bug is fixed.
-    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla,jax_lax,None,mosaic" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla,None,mosaic" }
   }
 
   environment_configs {
@@ -303,22 +303,6 @@ benchmarks {
 
   metrics {
     name: "ragged_dot/xla/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "ragged_dot/jax_lax/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "ragged_dot/jax_lax/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN

@@ -59,13 +59,7 @@ class RaggedDotBenchmark(parameterized.TestCase):
   """Benchmarks for ragged dot."""
 
   @parameterized.product(
-      implementation=(
-          None,
-          'xla',
-          'triton',
-          'mosaic',
-          'jax_lax',
-      ),
+      implementation=(None, 'xla', 'triton', 'mosaic'),
       benchmark_mode=('forward', 'forward_and_vjp'),
   )
   def test_ragged_dot(self, implementation, benchmark_mode):
@@ -73,13 +67,9 @@ class RaggedDotBenchmark(parameterized.TestCase):
     if str(implementation) in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(f'Skipping implementation {implementation}')
 
-    ragged_dot_fn = (
-        functools.partial(  # pylint: disable=g-long-ternary
-            tokamax.ragged_dot,
-            implementation=implementation,
-        )
-        if implementation != 'jax_lax'
-        else jax.lax.ragged_dot
+    ragged_dot_fn = functools.partial(  # pylint: disable=g-long-ternary
+        tokamax.ragged_dot,
+        implementation=implementation,
     )
 
     fn, args = benchmarking.standardize_function(
