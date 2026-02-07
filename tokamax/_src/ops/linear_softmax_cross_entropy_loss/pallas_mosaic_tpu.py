@@ -15,11 +15,11 @@
 
 """Linear Cross-Entropy kernel implementation."""
 
-
 from dataclasses import dataclass
 from functools import partial, reduce
+import itertools
 import math
-from typing import Annotated, Literal
+from typing import Annotated, Literal, ClassVar
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -608,9 +608,11 @@ def get_tpu_specific_default_config() -> Config:
 
 @dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
-    base.LinearSoftmaxCrossEntropyLoss
+    base.LinearSoftmaxCrossEntropyLoss[Config]
 ):
   """Wrapper for the tokamax Op API for Pallas Mosaic TPU kernel."""
+
+  config_cls: ClassVar[type[Config]] = Config
 
   def __post_init__(self):
     object.__setattr__(
@@ -645,10 +647,37 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     del ba
     return get_tpu_specific_default_config()
 
-  # TODO: Implement an autotuning search space.
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    return set()
+    x = ba.arguments["x"]
+    w = ba.arguments["w"]
+
+    b_dim, h_dim = x.shape
+    v_dim = w.shape[1]
+
+    b_block_size_range = set(
+        [1024 + i * 128 for i in range(32) if b_dim % (1024 + i * 128) == 0]
+        + [1024 + i * 512 for i in range(8) if 1024 + i * 512 < b_dim]
+    )
+    h_block_size_range = set(
+        [128 + i * 128 for i in range(32) if h_dim % (128 + i * 128) == 0]
+        + [128 * 2**i for i in range(6) if 128 * 2**i < h_dim]
+    )
+    v_block_size_range = set(
+        [128 + i * 128 for i in range(32) if v_dim % (128 + i * 128) == 0]
+        + [128 * 2**i for i in range(6) if 128 * 2**i < v_dim]
+    )
+
+    return set(
+        Config(
+            b_block_size=b_block_size,
+            h_block_size=h_block_size,
+            v_block_size=v_block_size,
+        )
+        for b_block_size, h_block_size, v_block_size in itertools.product(
+            b_block_size_range, h_block_size_range, v_block_size_range
+        )
+    )
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -657,9 +686,11 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
 
 @dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
-    base.LinearSoftmaxCrossEntropyLossVjp
+    base.LinearSoftmaxCrossEntropyLossVjp[Config]
 ):
   """Pallas TPU implementation of Linear Softmax Cross-Entropy Loss VJP."""
+
+  config_cls: ClassVar[type[Config]] = Config
 
   def _fwd(
       self,
@@ -696,10 +727,37 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
     del ba
     return get_tpu_specific_default_config()
 
-  # TODO: Implement an autotuning search space.
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    return set()
+    x = ba.arguments["x"]
+    w = ba.arguments["w"]
+
+    b_dim, h_dim = x.shape
+    v_dim = w.shape[1]
+
+    b_block_size_range = set(
+        [1024 + i * 128 for i in range(32) if b_dim % (1024 + i * 128) == 0]
+        + [1024 + i * 512 for i in range(8) if 1024 + i * 512 < b_dim]
+    )
+    h_block_size_range = set(
+        [128 + i * 128 for i in range(32) if h_dim % (128 + i * 128) == 0]
+        + [128 * 2**i for i in range(6) if 128 * 2**i < h_dim]
+    )
+    v_block_size_range = set(
+        [128 + i * 128 for i in range(32) if v_dim % (128 + i * 128) == 0]
+        + [128 * 2**i for i in range(6) if 128 * 2**i < v_dim]
+    )
+
+    return set(
+        Config(
+            b_block_size=b_block_size,
+            h_block_size=h_block_size,
+            v_block_size=v_block_size,
+        )
+        for b_block_size, h_block_size, v_block_size in itertools.product(
+            b_block_size_range, h_block_size_range, v_block_size_range
+        )
+    )
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
