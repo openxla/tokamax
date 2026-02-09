@@ -147,7 +147,8 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
 
       # Numerical verification against Tokamax's XLA implementation.
       xla_out = jax.jit(
-          functools.partial(triangle_multiplication, implementation='xla')
+          functools.partial(triangle_multiplication, implementation='xla'),
+          static_argnames=['triangle_type']
       )(**all_inputs)
       cueq_out = jax.jit(fn_partial)(**dynamic_args)
       diff = numerics.array_diff_summary(xla_out, cueq_out)
