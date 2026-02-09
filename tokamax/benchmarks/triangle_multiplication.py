@@ -75,8 +75,12 @@ def map_to_cuequivariance_weights(tokamax_weights):
   h_dim = p_in.shape[-1]
 
   # Map Tokamax (C, 2, H) -> cuEq (2*H, C)
-  p_in_cueq = jnp.concatenate([p_in[:, 0, :], p_in[:, 1, :]], axis=-1)
-  g_in_cueq = jnp.concatenate([g_in[:, 0, :], g_in[:, 1, :]], axis=-1)
+  p_in_cueq = jnp.transpose(
+      jnp.concatenate([p_in[:, 0, :], p_in[:, 1, :]], axis=-1)
+  )
+  g_in_cueq = jnp.transpose(
+      jnp.concatenate([g_in[:, 0, :], g_in[:, 1, :]], axis=-1)
+  )
 
   return {
       'norm_in_weight': tokamax_weights['layernorm_in_scale'],
