@@ -15,7 +15,6 @@
 """Benchmarks for triangle_multiplication."""
 
 import functools
-import inspect
 import os
 
 from absl import flags
@@ -27,6 +26,7 @@ import jax.numpy as jnp
 from tensorboardX import writer
 
 from tokamax._src import benchmarking
+from tokamax._src import numerics
 from tokamax._src.ops.triangle_multiplication import api
 
 SummaryWriter = writer.SummaryWriter
@@ -46,51 +46,60 @@ dtype = jnp.bfloat16
 
 
 try:
-  from cuequivariance_jax import triangle_multiplicative_update as cueq_tmu  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
+  import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error
 except ImportError:
-  cueq_tmu = None
+  cuequivariance_jax = None
 
 
-def get_tokamax_weights(key, c, h, d):
-  """Generates random weights for Tokamax triangle_multiplication."""
-  keys = jax.random.split(key, 8)
+def get_example(n, c=128, h=32, d=128):
+  """Generates example inputs for triangle_multiplication."""
   return {
-      'projection_in_weights': jax.random.normal(
-          keys[0], (c, 2, h), dtype=dtype
-      ),
-      'gate_in_weights': jax.random.normal(keys[1], (c, 2, h), dtype=dtype),
-      'projection_out_weights': jax.random.normal(keys[2], (h, d), dtype=dtype),
-      'gate_out_weights': jax.random.normal(keys[3], (c, d), dtype=dtype),
-      'layernorm_in_scale': jax.random.normal(keys[4], (c,), dtype=dtype),
-      'layernorm_in_offset': jax.random.normal(keys[5], (c,), dtype=dtype),
-      'layernorm_out_scale': jax.random.normal(keys[6], (h,), dtype=dtype),
-      'layernorm_out_offset': jax.random.normal(keys[7], (h,), dtype=dtype),
+      'x': jax.ShapeDtypeStruct((n, n, c), dtype=dtype),
+      'mask': jax.ShapeDtypeStruct((n, n), dtype=jnp.bool_),
+      'projection_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype=dtype),
+      'gate_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype=dtype),
+      'projection_out_weights': jax.ShapeDtypeStruct((h, d), dtype=dtype),
+      'gate_out_weights': jax.ShapeDtypeStruct((c, d), dtype=dtype),
+      'layernorm_in_scale': jax.ShapeDtypeStruct((c,), dtype=dtype),
+      'layernorm_in_offset': jax.ShapeDtypeStruct((c,), dtype=dtype),
+      'layernorm_out_scale': jax.ShapeDtypeStruct((h,), dtype=dtype),
+      'layernorm_out_offset': jax.ShapeDtypeStruct((h,), dtype=dtype),
+      'triangle_type': 'incoming',
   }
 
 
-def get_cuequivariance_weights(key, c, d):
-  """Generates random weights for cuEquivariance triangle_multiplicative_update."""
-  # D_in = c, D_out = d
-  # The intermediate dimension in cuEquivariance's triangle part is also c.
-  keys = jax.random.split(key, 8)
+def map_to_cuequivariance_weights(tokamax_weights):
+  """Maps Tokamax weights to cuEquivariance weights."""
+  p_in = tokamax_weights['projection_in_weights']
+  g_in = tokamax_weights['gate_in_weights']
+  h_dim = p_in.shape[-1]
+
+  # Map Tokamax (C, 2, H) -> cuEq (2*H, C)
+  p_in_cueq = jnp.transpose(
+      jnp.concatenate([p_in[:, 0, :], p_in[:, 1, :]], axis=-1)
+  )
+  g_in_cueq = jnp.transpose(
+      jnp.concatenate([g_in[:, 0, :], g_in[:, 1, :]], axis=-1)
+  )
+
   return {
-      'norm_in_weight': jnp.ones(
-          c, dtype=dtype
-      ),  # Typically learned, but start with ones
-      'norm_in_bias': jnp.zeros(c, dtype=dtype),
-      'p_in_weight': jax.random.normal(keys[0], (2 * c, c), dtype=dtype),
-      'g_in_weight': jax.random.normal(keys[1], (2 * c, c), dtype=dtype),
-      'norm_out_weight': jnp.ones(
-          c, dtype=dtype
-      ),  # Acts on the 'c' dimension
-      'norm_out_bias': jnp.zeros(c, dtype=dtype),
-      'p_out_weight': jax.random.normal(keys[4], (d, c), dtype=dtype),
-      'g_out_weight': jax.random.normal(keys[5], (d, c), dtype=dtype),
-      # Biases for projections (optional in cueq, can be None)
-      'p_in_bias': jax.random.normal(keys[2], (2 * c,), dtype=dtype),
-      'g_in_bias': jax.random.normal(keys[3], (2 * c,), dtype=dtype),
-      'p_out_bias': jax.random.normal(keys[6], (d,), dtype=dtype),
-      'g_out_bias': jax.random.normal(keys[7], (d,), dtype=dtype),
+      'norm_in_weight': tokamax_weights['layernorm_in_scale'],
+      'norm_in_bias': tokamax_weights['layernorm_in_offset'],
+      'p_in_weight': p_in_cueq,
+      'g_in_weight': g_in_cueq,
+      'norm_out_weight': tokamax_weights['layernorm_out_scale'],
+      'norm_out_bias': tokamax_weights['layernorm_out_offset'],
+      'p_out_weight': jnp.transpose(tokamax_weights['projection_out_weights']),
+      'g_out_weight': jnp.transpose(tokamax_weights['gate_out_weights']),
+      # cuEq requires biases, providing zeros as Tokamax doesn't have them.
+      'p_in_bias': jnp.zeros(2 * h_dim, dtype=dtype),
+      'g_in_bias': jnp.zeros(2 * h_dim, dtype=dtype),
+      'p_out_bias': jnp.zeros(
+          tokamax_weights['projection_out_weights'].shape[-1], dtype=dtype
+      ),
+      'g_out_bias': jnp.zeros(
+          tokamax_weights['gate_out_weights'].shape[-1], dtype=dtype
+      ),
   }
 
 
@@ -98,7 +107,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
   """Benchmarks for different triangle_multiplication implementations."""
 
   @parameterized.product(
-      implementation=(None, 'xla', 'cuequivariance'),  # Added 'cuequivariance'
+      implementation=(None, 'xla', 'cuequivariance'),
       benchmark_mode=('forward', 'forward_and_vjp'),
       n=(384, 768),
   )
@@ -111,57 +120,55 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    if implementation == 'cuequivariance' and cueq_tmu is None:
+    if implementation == 'cuequivariance' and cuequivariance_jax is None:
       self.skipTest('cuequivariance is not installed.')
+    assert cuequivariance_jax is not None
 
-    c, h, d = 128, 32, 128  # c: Input, h: Tokamax Hidden, d: Output
-    key = jax.random.PRNGKey(0)
-    k1, k2, kw = jax.random.split(key, 3)
+    input_dim, hidden_dim, output_dim = 128, 32, 128
 
-    x = jax.random.normal(k1, (n, n, c), dtype=dtype)
-    mask = jax.random.randint(k2, (n, n), 0, 2).astype(jnp.bool_)
-    common_inputs = {'x': x, 'mask': mask}
+    # Initialize all inputs once using Tokamax schema.
+    example_schema = get_example(n, input_dim, hidden_dim, output_dim)
+    all_inputs = numerics.random_initialize(example_schema, seed=0)
 
     if implementation == 'cuequivariance':
-      weights = get_cuequivariance_weights(kw, c, d)
-      fn_partial = functools.partial(cueq_tmu, direction='incoming')
-      dynamic_args = common_inputs | weights
+      cueq = cuequivariance_jax
+      if cueq is None:
+        self.skipTest('cuequivariance is not installed.')
+        return
+
+      cueq_weights = map_to_cuequivariance_weights(all_inputs)
+      fn_partial = functools.partial(
+          cueq.triangle_multiplicative_update,
+          direction=all_inputs['triangle_type'],
+      )
+      dynamic_args = {
+          'x': all_inputs['x'],
+          'mask': all_inputs['mask'],
+      } | cueq_weights
+
+      # Numerical verification against Tokamax's XLA implementation.
+      xla_out = jax.jit(
+          functools.partial(triangle_multiplication, implementation='xla')
+      )(**all_inputs)
+      cueq_out = jax.jit(fn_partial)(**dynamic_args)
+      diff = numerics.array_diff_summary(xla_out, cueq_out)
+      # TODO(b/481381116): Log this to the proto.
+      logging.info('Numerical diff (xla vs cuequivariance): %s', diff)
     else:  # Tokamax implementations
-      weights = get_tokamax_weights(kw, c, h, d)
       fn_partial = functools.partial(
           triangle_multiplication,
           implementation=implementation,
-          triangle_type='incoming',
       )
-      dynamic_args = common_inputs | weights
+      dynamic_args = all_inputs
 
-    dynamic_args_shapes = jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), dynamic_args
-    )
-
-    fn, standardized_args_shapes = benchmarking.standardize_function(
+    fn, actual_args = benchmarking.standardize_function(
         fn_partial,
-        kwargs=dynamic_args_shapes,
-        mode=benchmark_mode,  # pytype: disable=wrong-arg-types
+        kwargs=dynamic_args,
+        mode=benchmark_mode,
+        seed=None,
     )
-    fn = jax.jit(fn)
 
-    # Convert dynamic_args to the same order as expected by fn.
-    # Standardize function returns the args list it created.
-    def get_actual_args():
-      ba = inspect.signature(fn_partial).bind(**dynamic_args)
-      ba.apply_defaults()
-      args_flat, _ = jax.tree.flatten((ba.args, ba.kwargs))
-      arrays = [
-          x
-          for x in args_flat
-          if isinstance(x, (jax.Array, jax.ShapeDtypeStruct))
-      ]
-      return arrays
-
-    actual_args = get_actual_args()
-
-    bench = benchmarking.compile_benchmark(fn, standardized_args_shapes)
+    bench = benchmarking.compile_benchmark(fn, actual_args)
     res = bench(actual_args)
 
     metric_tag = (
