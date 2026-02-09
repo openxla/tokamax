@@ -122,7 +122,6 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
 
     if implementation == 'cuequivariance' and cuequivariance_jax is None:
       self.skipTest('cuequivariance is not installed.')
-    assert cuequivariance_jax is not None
 
     input_dim, hidden_dim, output_dim = 128, 32, 128
 

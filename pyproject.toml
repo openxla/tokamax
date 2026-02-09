@@ -57,6 +57,7 @@ test = [
 bench = [
     "google-benchmark>=1.9.0",
     "xprof",
+    "cuequivariance_jax",
 ]
 
 cuda = [
