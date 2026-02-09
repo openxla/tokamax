@@ -59,6 +59,8 @@ class AttentionBenchmark(parameterized.TestCase):
   def test_attention(self, implementation, benchmark_mode):
     """Test attention."""
 
+    logging.info('device_kind=%s', jax.devices()[0].device_kind)
+
     # TODO: Re-enable once cuDNN bug is fixed.
     if (
         implementation == 'cudnn'
