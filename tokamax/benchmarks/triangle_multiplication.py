@@ -68,41 +68,6 @@ def get_example(n, c=128, h=32, d=128):
   }
 
 
-def map_to_cuequivariance_weights(tokamax_weights):
-  """Maps Tokamax weights to cuEquivariance weights."""
-  p_in = tokamax_weights['projection_in_weights']
-  g_in = tokamax_weights['gate_in_weights']
-  h_dim = p_in.shape[-1]
-
-  # Map Tokamax (C, 2, H) -> cuEq (2*H, C)
-  p_in_cueq = jnp.transpose(
-      jnp.concatenate([p_in[:, 0, :], p_in[:, 1, :]], axis=-1)
-  )
-  g_in_cueq = jnp.transpose(
-      jnp.concatenate([g_in[:, 0, :], g_in[:, 1, :]], axis=-1)
-  )
-
-  return {
-      'norm_in_weight': tokamax_weights['layernorm_in_scale'],
-      'norm_in_bias': tokamax_weights['layernorm_in_offset'],
-      'p_in_weight': p_in_cueq,
-      'g_in_weight': g_in_cueq,
-      'norm_out_weight': tokamax_weights['layernorm_out_scale'],
-      'norm_out_bias': tokamax_weights['layernorm_out_offset'],
-      'p_out_weight': jnp.transpose(tokamax_weights['projection_out_weights']),
-      'g_out_weight': jnp.transpose(tokamax_weights['gate_out_weights']),
-      # cuEq requires biases, providing zeros as Tokamax doesn't have them.
-      'p_in_bias': jnp.zeros(2 * h_dim, dtype=dtype),
-      'g_in_bias': jnp.zeros(2 * h_dim, dtype=dtype),
-      'p_out_bias': jnp.zeros(
-          tokamax_weights['projection_out_weights'].shape[-1], dtype=dtype
-      ),
-      'g_out_bias': jnp.zeros(
-          tokamax_weights['gate_out_weights'].shape[-1], dtype=dtype
-      ),
-  }
-
-
 class TriangleMultiplicationBenchmark(parameterized.TestCase):
   """Benchmarks for different triangle_multiplication implementations."""
 
@@ -120,12 +85,6 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    if implementation == 'cuequivariance':
-      self.skipTest(
-          'Skipping cuequivariance: Incompatible weight structures. '
-          'Tokamax uses hidden dim H, cuequivariance expects 2*C.'
-      )
-
     if implementation == 'cuequivariance' and cuequivariance_jax is None:
       self.skipTest('cuequivariance is not installed.')
 
@@ -141,25 +100,18 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
         self.skipTest('cuequivariance is not installed.')
         return
 
-      cueq_weights = map_to_cuequivariance_weights(all_inputs)
+      # Let cuequivariance initialize its own weights by not providing them.
+      # A key is needed for initialization.
+      key = jax.random.PRNGKey(42)
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
+          key=key,
       )
       dynamic_args = {
           'x': all_inputs['x'],
           'mask': all_inputs['mask'],
-      } | cueq_weights
-
-      # Numerical verification against Tokamax's XLA implementation.
-      xla_out = jax.jit(
-          functools.partial(triangle_multiplication, implementation='xla'),
-          static_argnames=['triangle_type']
-      )(**all_inputs)
-      cueq_out = jax.jit(fn_partial)(**dynamic_args)
-      diff = numerics.array_diff_summary(xla_out, cueq_out)
-      # TODO(b/481381116): Log this to the proto.
-      logging.info('Numerical diff (xla vs cuequivariance): %s', diff)
+      }
     else:  # Tokamax implementations
       fn_partial = functools.partial(
           triangle_multiplication,
