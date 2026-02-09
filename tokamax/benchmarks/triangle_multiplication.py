@@ -120,6 +120,12 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
+    if implementation == 'cuequivariance':
+      self.skipTest(
+          'Skipping cuequivariance: Incompatible weight structures. '
+          'Tokamax uses hidden dim H, cuequivariance expects 2*C.'
+      )
+
     if implementation == 'cuequivariance' and cuequivariance_jax is None:
       self.skipTest('cuequivariance is not installed.')
 
