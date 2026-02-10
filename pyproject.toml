@@ -58,6 +58,7 @@ bench = [
     "google-benchmark>=1.9.0",
     "xprof",
     "cuequivariance_jax",
+    "jax_triton",
 ]
 
 cuda = [
