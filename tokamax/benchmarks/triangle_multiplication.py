@@ -70,34 +70,34 @@ def get_example(n, c=128, h=32, d=128):
 def convert_tokamax_weights_to_cuequivariance(tokamax_weights, hidden_dim):
     """Converts Tokamax weights to cuEquivariance format."""
     h = hidden_dim
-    d = tokanax_weights['gate_out_weights'].shape[1]
+    d = tokamax_weights['gate_out_weights'].shape[1]
 
     cueq_weights = {}
-    cueq_weights['norm_in_weight'] = tokanax_weights['layernorm_in_scale']
-    cueq_weights['norm_in_bias'] = tokanax_weights['layernorm_in_offset']
+    cueq_weights['norm_in_weight'] = tokamax_weights['layernorm_in_scale']
+    cueq_weights['norm_in_bias'] = tokamax_weights['layernorm_in_offset']
 
     # projection_in_weights: (C, 2, H) -> (2H, C)
-    p_in = tokanax_weights['projection_in_weights']
+    p_in = tokamax_weights['projection_in_weights']
     cueq_weights['p_in_weight'] = jnp.concatenate([p_in[:, 0, :], p_in[:, 1, :]], axis=1).T
 
     # gate_in_weights: (C, 2, H) -> (2H, C)
-    g_in = tokanax_weights['gate_in_weights']
+    g_in = tokamax_weights['gate_in_weights']
     cueq_weights['g_in_weight'] = jnp.concatenate([g_in[:, 0, :], g_in[:, 1, :]], axis=1).T
 
-    cueq_weights['norm_out_weight'] = tokanax_weights['layernorm_out_scale']
-    cueq_weights['norm_out_bias'] = tokanax_weights['layernorm_out_offset']
+    cueq_weights['norm_out_weight'] = tokamax_weights['layernorm_out_scale']
+    cueq_weights['norm_out_bias'] = tokamax_weights['layernorm_out_offset']
 
     # projection_out_weights: (H, D) -> (D, H)
-    cueq_weights['p_out_weight'] = tokanax_weights['projection_out_weights'].T
+    cueq_weights['p_out_weight'] = tokamax_weights['projection_out_weights'].T
 
     # gate_out_weights: (C, D) -> (D, C)
-    cueq_weights['g_out_weight'] = tokanax_weights['gate_out_weights'].T
+    cueq_weights['g_out_weight'] = tokamax_weights['gate_out_weights'].T
 
     # Biases not present in Tokamax for these layers are set to zero
     cueq_weights['p_in_bias'] = jnp.zeros(2 * h, dtype=p_in.dtype)
     cueq_weights['g_in_bias'] = jnp.zeros(2 * h, dtype=g_in.dtype)
-    cueq_weights['p_out_bias'] = jnp.zeros(d, dtype=tokanax_weights['projection_out_weights'].dtype)
-    cueq_weights['g_out_bias'] = jnp.zeros(d, dtype=tokanax_weights['gate_out_weights'].dtype)
+    cueq_weights['p_out_bias'] = jnp.zeros(d, dtype=tokamax_weights['projection_out_weights'].dtype)
+    cueq_weights['g_out_bias'] = jnp.zeros(d, dtype=tokamax_weights['gate_out_weights'].dtype)
 
     return cueq_weights
 
