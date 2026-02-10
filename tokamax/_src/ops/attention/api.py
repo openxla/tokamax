@@ -32,7 +32,7 @@ Implementation: TypeAlias = Literal[
 ]
 
 # TODO: Investigate if `_XLA_CHUNK_SIZE` should be larger on TPU.
-_XLA_CHUNK_SIZE: Final[int] = 128
+_XLA_CHUNK_SIZE: Final[tuple[int, int]] = (512, 1024)
 
 IMPLEMENTATIONS = dict(
     cudnn=jax_nn.JaxNnDotProductAttention(implementation="cudnn"),
