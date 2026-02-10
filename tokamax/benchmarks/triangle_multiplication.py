@@ -117,23 +117,22 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       }
 
       # [FIX 2 & 3] Check correctness and Log Diff
-      if benchmark_mode == 'forward': # Simple check on forward pass
-        # 1. Run the Candidate (Cuequivariance)
-        out_cueq = fn_partial(**dynamic_args)
+      # 1. Run the Candidate (Cuequivariance)
+      out_cueq = fn_partial(**dynamic_args)
 
-        # 2. Run the Reference (Tokamax XLA)
-        out_xla = triangle_multiplication(
-            implementation='xla',
-            **all_inputs # XLA takes all arguments directly
-        )
+      # 2. Run the Reference (Tokamax XLA)
+      out_xla = triangle_multiplication(
+          implementation='xla',
+          **all_inputs # XLA takes all arguments directly
+      )
 
-        # 3. Compute Diff
-        # Ensure shapes match before comparing
-        diff = jnp.mean(jnp.abs(out_cueq - out_xla))
-        
-        # 4. Log to terminal + TODO
-        logging.info(f"Numeric Diff (Cuequivariance vs XLA): {diff}")
-        # TODO(b/481381116): Log this numeric diff to the benchmark proto.
+      # 3. Compute Diff
+      # Ensure shapes match before comparing
+      diff = jnp.mean(jnp.abs(out_cueq - out_xla))
+      
+      # 4. Log to terminal + TODO
+      logging.info(f"Numeric Diff (Cuequivariance vs XLA for n={n}): {diff}")
+      # TODO(b/481381116): Log this numeric diff to the benchmark proto.
 
     else:  # Tokamax implementations
       fn_partial = functools.partial(
