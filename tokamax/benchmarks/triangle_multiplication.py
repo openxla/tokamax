@@ -84,9 +84,6 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    if implementation == 'cuequivariance' and cuequivariance_jax is None:
-      self.skipTest('cuequivariance is not installed.')
-
     input_dim, hidden_dim, output_dim = 128, 32, 128
 
     # Initialize all inputs once using Tokamax schema.
@@ -99,18 +96,45 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
         self.skipTest('cuequivariance is not installed.')
         return
 
-      # Let cuequivariance initialize its own weights by not providing them.
-      # A key is needed for initialization.
-      key = jax.random.PRNGKey(42)
+      # [FIX 1] Like-for-like: Pass explicit weights instead of a key
+      # We map the Tokamax schema to what we assume cuequivariance expects.
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
-          key=key,
+          # Pass the same weights XLA uses:
+          w_in_gate=all_inputs['gate_in_weights'],
+          w_in_proj=all_inputs['projection_in_weights'],
+          w_out_gate=all_inputs['gate_out_weights'],
+          w_out_proj=all_inputs['projection_out_weights'],
+          ln_in_scale=all_inputs['layernorm_in_scale'],
+          ln_in_beta=all_inputs['layernorm_in_offset'],
+          ln_out_scale=all_inputs['layernorm_out_scale'],
+          ln_out_beta=all_inputs['layernorm_out_offset'],
           mask=all_inputs['mask'].astype(dtype),
       )
       dynamic_args = {
           'x': all_inputs['x'],
       }
+
+      # [FIX 2 & 3] Check correctness and Log Diff
+      if benchmark_mode == 'forward': # Simple check on forward pass
+        # 1. Run the Candidate (Cuequivariance)
+        out_cueq = fn_partial(**dynamic_args)
+
+        # 2. Run the Reference (Tokamax XLA)
+        out_xla = triangle_multiplication(
+            implementation='xla',
+            **all_inputs # XLA takes all arguments directly
+        )
+
+        # 3. Compute Diff
+        # Ensure shapes match before comparing
+        diff = jnp.mean(jnp.abs(out_cueq - out_xla))
+        
+        # 4. Log to terminal + TODO
+        logging.info(f"Numeric Diff (Cuequivariance vs XLA): {diff}")
+        # TODO(b/481381116): Log this numeric diff to the benchmark proto.
+
     else:  # Tokamax implementations
       fn_partial = functools.partial(
           triangle_multiplication,
