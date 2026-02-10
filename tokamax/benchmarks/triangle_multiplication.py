@@ -167,6 +167,21 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
                 print(f"  {pkg} version not found")
 
     print("--- END INSTALLED PACKAGES ---")
+    print("--- CUDA & JAX Detailed Debug ---")
+    print("Environment Variables:")
+    for var in ['PATH', 'LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES', 'XLA_FLAGS']:
+        print(f"  {var}={os.environ.get(var)}")
+
+    print("Which nvcc:")
+    subprocess.run(['which', 'nvcc'], check=False)
+    print("nvcc version:")
+    subprocess.run(['nvcc', '--version'], check=False)
+
+    print("Checking for libcuda.so:")
+    subprocess.run(['find', '/', '-name', 'libcuda.so*'], check=False)
+    print("Checking for libcudnn:")
+    subprocess.run(['find', '/', '-name', 'libcudnn.so*'], check=False)
+    print("--- END CUDA & JAX Detailed Debug ---")
     print("--- End Environment Diagnostics ---")
 
   @parameterized.product(
