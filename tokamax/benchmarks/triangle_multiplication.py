@@ -99,8 +99,8 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
           # Map Tokamax weights to cuequivariance argument names
-          g_in_weight=all_inputs['gate_in_weights'],
-          p_in_weight=all_inputs['projection_in_weights'],
+          g_in_weight=all_inputs['gate_in_weights'].reshape(input_dim, 2 * hidden_dim).T,
+          p_in_weight=all_inputs['projection_in_weights'].reshape(input_dim, 2 * hidden_dim).T,
           g_out_weight=all_inputs['gate_out_weights'],
           p_out_weight=all_inputs['projection_out_weights'],
           norm_in_weight=all_inputs['layernorm_in_scale'],
@@ -112,16 +112,6 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       dynamic_args = {
           'x': all_inputs['x'],
       }
-
-      out_cueq = fn_partial(**dynamic_args)
-      out_xla = triangle_multiplication(
-          implementation='xla',
-          **all_inputs # XLA takes all arguments directly
-      )
-
-      diff = jnp.mean(jnp.abs(out_cueq - out_xla))
-      # TODO(b/481381116): Log this numeric diff to the benchmark proto.
-      logging.info(f"Numeric Diff (Cuequivariance vs XLA for n={n}): {diff}")
 
     else:  # Tokamax implementations
       fn_partial = functools.partial(
