@@ -92,8 +92,8 @@ def convert_tokamax_weights_to_cuequivariance(tokamax_weights, input_dim, hidden
     cueq_weights['p_in_weight'] = pad_weights(tokamax_weights['projection_in_weights'])
     cueq_weights['g_in_weight'] = pad_weights(tokamax_weights['gate_in_weights'])
 
-    cueq_weights['norm_out_weight'] = all_inputs['layernorm_out_scale']
-    cueq_weights['norm_out_bias'] = all_inputs['layernorm_out_offset']
+    cueq_weights['norm_out_weight'] = tokamax_weights['layernorm_out_scale']
+    cueq_weights['norm_out_bias'] = tokamax_weights['layernorm_out_offset']
 
     # Tokamax projection_out_weights: (H, D)
     # cuEquivariance p_out_weight: (D, C)
