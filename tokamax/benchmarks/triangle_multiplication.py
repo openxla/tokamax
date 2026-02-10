@@ -24,13 +24,12 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tensorboardX import writer
+import tokamax
 
-from tokamax._src import benchmarking
 from tokamax._src import numerics
-from tokamax._src.ops.triangle_multiplication import api
 
 try:
-  import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error
+  import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
 except ImportError:
   cuequivariance_jax = None
 
@@ -46,25 +45,61 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
     'A comma-separated list of implementations to skip.',
 )
 
-triangle_multiplication = api.triangle_multiplication
-dtype = jnp.bfloat16
-
 
 def get_example(n, c=128, h=32, d=128):
   """Generates example inputs for triangle_multiplication."""
   return {
-      'x': jax.ShapeDtypeStruct((n, n, c), dtype=dtype),
+      'x': jax.ShapeDtypeStruct((n, n, c), dtype=jnp.bfloat16),
       'mask': jax.ShapeDtypeStruct((n, n), dtype=jnp.bool_),
-      'projection_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype=dtype),
-      'gate_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype=dtype),
-      'projection_out_weights': jax.ShapeDtypeStruct((h, d), dtype=dtype),
-      'gate_out_weights': jax.ShapeDtypeStruct((c, d), dtype=dtype),
-      'layernorm_in_scale': jax.ShapeDtypeStruct((c,), dtype=dtype),
-      'layernorm_in_offset': jax.ShapeDtypeStruct((c,), dtype=dtype),
-      'layernorm_out_scale': jax.ShapeDtypeStruct((h,), dtype=dtype),
-      'layernorm_out_offset': jax.ShapeDtypeStruct((h,), dtype=dtype),
+      'projection_in_weights': jax.ShapeDtypeStruct(
+          (c, 2, h), dtype=jnp.bfloat16
+      ),
+      'gate_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype=jnp.bfloat16),
+      'projection_out_weights': jax.ShapeDtypeStruct(
+          (h, d), dtype=jnp.bfloat16
+      ),
+      'gate_out_weights': jax.ShapeDtypeStruct((c, d), dtype=jnp.bfloat16),
+      'layernorm_in_scale': jax.ShapeDtypeStruct((c,), dtype=jnp.bfloat16),
+      'layernorm_in_offset': jax.ShapeDtypeStruct((c,), dtype=jnp.bfloat16),
+      'layernorm_out_scale': jax.ShapeDtypeStruct((h,), dtype=jnp.bfloat16),
+      'layernorm_out_offset': jax.ShapeDtypeStruct((h,), dtype=jnp.bfloat16),
       'triangle_type': 'incoming',
   }
+
+
+def convert_tokamax_weights_to_cuequivariance(tokamax_weights, hidden_dim):
+    """Converts Tokamax weights to cuEquivariance format."""
+    h = hidden_dim
+    d = tokanax_weights['gate_out_weights'].shape[1]
+
+    cueq_weights = {}
+    cueq_weights['norm_in_weight'] = tokanax_weights['layernorm_in_scale']
+    cueq_weights['norm_in_bias'] = tokanax_weights['layernorm_in_offset']
+
+    # projection_in_weights: (C, 2, H) -> (2H, C)
+    p_in = tokanax_weights['projection_in_weights']
+    cueq_weights['p_in_weight'] = jnp.concatenate([p_in[:, 0, :], p_in[:, 1, :]], axis=1).T
+
+    # gate_in_weights: (C, 2, H) -> (2H, C)
+    g_in = tokanax_weights['gate_in_weights']
+    cueq_weights['g_in_weight'] = jnp.concatenate([g_in[:, 0, :], g_in[:, 1, :]], axis=1).T
+
+    cueq_weights['norm_out_weight'] = tokanax_weights['layernorm_out_scale']
+    cueq_weights['norm_out_bias'] = tokanax_weights['layernorm_out_offset']
+
+    # projection_out_weights: (H, D) -> (D, H)
+    cueq_weights['p_out_weight'] = tokanax_weights['projection_out_weights'].T
+
+    # gate_out_weights: (C, D) -> (D, C)
+    cueq_weights['g_out_weight'] = tokanax_weights['gate_out_weights'].T
+
+    # Biases not present in Tokamax for these layers are set to zero
+    cueq_weights['p_in_bias'] = jnp.zeros(2 * h, dtype=p_in.dtype)
+    cueq_weights['g_in_bias'] = jnp.zeros(2 * h, dtype=g_in.dtype)
+    cueq_weights['p_out_bias'] = jnp.zeros(d, dtype=tokanax_weights['projection_out_weights'].dtype)
+    cueq_weights['g_out_bias'] = jnp.zeros(d, dtype=tokanax_weights['gate_out_weights'].dtype)
+
+    return cueq_weights
 
 
 class TriangleMultiplicationBenchmark(parameterized.TestCase):
@@ -93,49 +128,50 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
     if implementation == 'cuequivariance':
       cueq = cuequivariance_jax
       if cueq is None:
-        self.skipTest('cuequivariance is not installed.')
+        self.skipTest('cuEquivariance is not installed.')
 
-      # Let cuequivariance initialize its own weights by not providing them.
-      # A key is needed for initialization.
-      key = jax.random.PRNGKey(42)
+      cueq_weights = convert_tokamax_weights_to_cuequivariance(
+          all_inputs, hidden_dim
+      )
+
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
-          key=key,
-          mask=all_inputs['mask'].astype(dtype),
+          mask=all_inputs['mask'].astype(jnp.bfloat16),
+          **cueq_weights,
       )
       dynamic_args = {
           'x': all_inputs['x'],
       }
 
+      # Calculate the numeric difference vs XLA version of Tokamax.
       out_cueq = fn_partial(**dynamic_args)
-      out_xla = triangle_multiplication(
+      out_xla = tokamax.triangle_multiplication(
           implementation='xla',
-          **all_inputs # XLA takes all arguments directly
+          **all_inputs
       )
 
-      diff = jnp.mean(jnp.abs(out_cueq - out_xla))
-      # TODO(b/481381116): Log this numeric diff to the benchmark proto.
-      logging.info(f"Numeric Diff (Cuequivariance vs XLA for n={n}): {diff}")
+      diff = jnp.mean(jnp.abs(out_cueq.astype(jnp.float32) - out_xla.astype(jnp.float32)))
+      logging.info('Numeric Diff (cuEquivariance vs XLA for n=%d): %s', n, diff)
     else:  # Tokamax implementations
       fn_partial = functools.partial(
-          triangle_multiplication,
+          tokamax.triangle_multiplication,
           implementation=implementation,
       )
       dynamic_args = all_inputs
 
-    fn, actual_args = benchmarking.standardize_function(
+    fn, actual_args = tokamax.benchmarking.standardize_function(
         fn_partial,
         kwargs=dynamic_args,
         mode=benchmark_mode,
         seed=None,
     )
 
-    bench = benchmarking.compile_benchmark(fn, actual_args)
+    bench = tokamax.benchmarking.compile_benchmark(fn, actual_args)
     res = bench(actual_args)
 
     metric_tag = (
-        f"triangle_multiplication/{implementation or 'default'}/{benchmark_mode}"
+        f"triangle_multiplication/n={n}/{implementation or 'default'}/{benchmark_mode}"
     )
     tblog_dir = os.environ.get(_TENSORBOARD_OUTPUT_ENV_VAR.value)
 
