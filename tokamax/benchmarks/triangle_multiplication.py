@@ -123,6 +123,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
         kwargs=dynamic_args,
         mode=benchmark_mode,
         seed=None,
+        nondiff_argnames=('mask',),
     )
 
     bench = benchmarking.compile_benchmark(fn, actual_args)
