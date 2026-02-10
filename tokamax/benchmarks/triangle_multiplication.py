@@ -95,24 +95,18 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       if cueq is None:
         self.skipTest('cuequivariance is not installed.')
 
+      # Let cuequivariance initialize its own weights by not providing them.
+      # A key is needed for initialization.
+      key = jax.random.PRNGKey(42)
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
-          # Map Tokamax weights to cuequivariance argument names
-          g_in_weight=all_inputs['gate_in_weights'].reshape(input_dim, 2 * hidden_dim).T,
-          p_in_weight=all_inputs['projection_in_weights'].reshape(input_dim, 2 * hidden_dim).T,
-          g_out_weight=all_inputs['gate_out_weights'],
-          p_out_weight=all_inputs['projection_out_weights'],
-          norm_in_weight=all_inputs['layernorm_in_scale'],
-          norm_in_bias=all_inputs['layernorm_in_offset'],
-          norm_out_weight=all_inputs['layernorm_out_scale'],
-          norm_out_bias=all_inputs['layernorm_out_offset'],
+          key=key,
           mask=all_inputs['mask'].astype(dtype),
       )
       dynamic_args = {
           'x': all_inputs['x'],
       }
-
     else:  # Tokamax implementations
       fn_partial = functools.partial(
           triangle_multiplication,
