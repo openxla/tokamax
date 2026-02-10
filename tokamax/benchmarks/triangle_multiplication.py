@@ -16,6 +16,13 @@
 
 import functools
 import os
+import sys
+
+# Add CUDA library paths for dynamic loader
+if "LD_LIBRARY_PATH" in os.environ:
+  os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64:" + os.environ["LD_LIBRARY_PATH"]
+else:
+  os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64"
 
 from absl import flags
 from absl import logging
