@@ -14,15 +14,11 @@
 # ==============================================================================
 """Benchmarks for triangle_multiplication."""
 
+import ctypes
 import functools
 import os
+import subprocess
 import sys
-
-# Add CUDA library paths for dynamic loader
-if "LD_LIBRARY_PATH" in os.environ:
-  os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64:" + os.environ["LD_LIBRARY_PATH"]
-else:
-  os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64"
 
 from absl import flags
 from absl import logging
@@ -35,6 +31,27 @@ from tensorboardX import writer
 from tokamax._src import benchmarking
 from tokamax._src import numerics
 from tokamax._src.ops.triangle_multiplication import api
+
+# Pre-load libnvrtc.so.12 to resolve a dependency for libcue_ops.so
+try:
+  result = subprocess.run(
+      ["find", "/usr", "-name", "libnvrtc.so.12"],
+      capture_output=True,
+      text=True,
+      check=True,
+  )
+  libnvrtc_path = result.stdout.strip().splitlines()[0]
+  if libnvrtc_path:
+    ctypes.CDLL(libnvrtc_path, mode=ctypes.RTLD_GLOBAL)
+  else:
+    logging.warning("libnvrtc.so.12 not found, cuequivariance may fail.")
+except Exception as e:
+  logging.warning(f"Failed to pre-load libnvrtc.so.12: {e}")
+
+try:
+  import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error
+except ImportError:
+  cuequivariance_jax = None
 
 SummaryWriter = writer.SummaryWriter
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
@@ -50,12 +67,6 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
 
 triangle_multiplication = api.triangle_multiplication
 dtype = jnp.bfloat16
-
-
-try:
-  import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error
-except ImportError:
-  cuequivariance_jax = None
 
 
 def get_example(n, c=128, h=32, d=128):
