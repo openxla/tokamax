@@ -125,6 +125,50 @@ def convert_tokamax_weights_to_cuequivariance(tokamax_weights, input_dim, hidden
 class TriangleMultiplicationBenchmark(parameterized.TestCase):
   """Benchmarks for different triangle_multiplication implementations."""
 
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    import subprocess
+    import sys
+    import os
+    import platform
+    import pkg_resources
+
+    print("--- Environment Diagnostics ---")
+    print(f"Python version: {sys.version}")
+    print(f"Platform: {platform.platform()}")
+    try:
+      print("--- NVIDIA-SMI ---")
+      subprocess.run(["nvidia-smi"], check=True)
+    except FileNotFoundError:
+      print("nvidia-smi not found")
+    except subprocess.CalledProcessError as e:
+      print(f"nvidia-smi failed: {e}")
+    print("--- END NVIDIA-SMI ---")
+
+    try:
+      import jax
+      print(f"JAX version: {jax.__version__}")
+      print(f"JAX devices: {jax.devices()}")
+      import jax.lib
+      print(f"JAXLIB platform version: {jax.lib.xla_bridge.get_backend().platform_version}")
+      print(f"JAX config: {jax.config.values}")
+    except Exception as e:
+      print(f"JAX info error: {e}")
+
+    required_packages = ['jax', 'jaxlib', 'jax-triton', 'triton', 'cuequivariance-jax', 'cuequivariance', 'cuda-python', 'numpy', 'scipy']
+    print("--- INSTALLED PACKAGES ---")
+    installed_packages = {pkg.key for pkg in pkg_resources.working_set}
+    for pkg in sorted(installed_packages):
+      if any(p in pkg for p in required_packages):
+            try:
+                print(f"  {pkg}=={pkg_resources.get_distribution(pkg).version}")
+            except pkg_resources.DistributionNotFound:
+                print(f"  {pkg} version not found")
+
+    print("--- END INSTALLED PACKAGES ---")
+    print("--- End Environment Diagnostics ---")
+
   @parameterized.product(
       implementation=(None, 'xla', 'cuequivariance'),
       benchmark_mode=('forward', 'forward_and_vjp'),
