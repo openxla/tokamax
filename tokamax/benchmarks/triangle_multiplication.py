@@ -85,10 +85,12 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    if implementation == 'cuequivariance':
+    if implementation == 'cuequivariance' and cuequivariance_jax is None:
+      self.skipTest('cuequivariance is not installed.')
+
+    if implementation == 'cuequivariance' and benchmark_mode == 'forward_and_vjp':
       self.skipTest(
-          'Skipping cuequivariance tests due to missing cuequivariance_ops dependency '
-          'which likely requires source build (b/324629212).'
+          'Skipping cuequivariance in forward_and_vjp mode due to a type error in its backward pass (b/324629212)'
       )
 
     input_dim, hidden_dim, output_dim = 128, 32, 128
