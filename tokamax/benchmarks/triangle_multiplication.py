@@ -14,12 +14,8 @@
 # ==============================================================================
 """Benchmarks for triangle_multiplication."""
 
-import ctypes
-import ctypes.util
 import functools
 import os
-import subprocess
-import sys
 
 from absl import flags
 from absl import logging
@@ -32,19 +28,6 @@ from tensorboardX import writer
 from tokamax._src import benchmarking
 from tokamax._src import numerics
 from tokamax._src.ops.triangle_multiplication import api
-
-# Pre-load libnvrtc.so.12 to resolve a dependency for libcue_ops.so
-try:
-  libnvrtc_path = ctypes.util.find_library('nvrtc')
-  if libnvrtc_path is None:
-    libnvrtc_path = '/usr/local/cuda/lib64/libnvrtc.so.12'
-  
-  if os.path.exists(libnvrtc_path):
-    ctypes.CDLL(libnvrtc_path, mode=ctypes.RTLD_GLOBAL)
-  else:
-    logging.warning("libnvrtc.so.12 not found, cuequivariance may fail.")
-except Exception as e:
-  logging.warning(f"Failed to pre-load libnvrtc.so.12: {e}")
 
 try:
   import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error

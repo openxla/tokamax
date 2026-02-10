@@ -59,7 +59,7 @@ bench = [
     "xprof",
     "cuequivariance_jax",
     "jax_triton",
-    "cuequivariance-ops-jax-cu12",
+    "cuequivariance-ops-jax-cu13",
 ]
 
 cuda = [
