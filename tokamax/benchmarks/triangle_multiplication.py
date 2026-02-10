@@ -68,6 +68,55 @@ def get_example(n, c=128, h=32, d=128):
 
 
 
+def convert_tokamax_weights_to_cuequivariance(tokamax_weights, input_dim, hidden_dim, output_dim):
+    """Converts Tokamax weights to cuEquivariance format by padding."""
+    c, h, d = input_dim, hidden_dim, output_dim
+    dtype = tokamax_weights['x'].dtype
+
+    cueq_weights = {}
+    cueq_weights['norm_in_weight'] = tokamax_weights['layernorm_in_scale']
+    cueq_weights['norm_in_bias'] = tokamax_weights['layernorm_in_offset']
+
+    def pad_weights(weights):  # Shape (C, 2, H)
+        weights_concat = jnp.concatenate([weights[:, 0, :], weights[:, 1, :]], axis=1)  # (C, 2 * H)
+        padding_width = c - h
+        # Pad H to C for the second part of the 2*C dimension
+        padded = jnp.pad(
+            weights_concat,
+            ((0, 0), (0, 2 * padding_width)),
+            mode='constant',
+            constant_values=0.0,
+        )  # (C, 2 * C)
+        return padded.T  # (2 * C, C)
+
+    cueq_weights['p_in_weight'] = pad_weights(tokamax_weights['projection_in_weights'])
+    cueq_weights['g_in_weight'] = pad_weights(tokamax_weights['gate_in_weights'])
+
+    cueq_weights['norm_out_weight'] = all_inputs['layernorm_out_scale']
+    cueq_weights['norm_out_bias'] = all_inputs['layernorm_out_offset']
+
+    # Tokamax projection_out_weights: (H, D)
+    # cuEquivariance p_out_weight: (D, C)
+    proj_out = tokamax_weights['projection_out_weights']  # (H, D)
+    padding_width = c - h
+    proj_out_padded = jnp.pad(
+        proj_out, ((0, padding_width), (0, 0)), mode='constant', constant_values=0.0
+    )  # (C, D)
+    cueq_weights['p_out_weight'] = proj_out_padded.T  # (D, C)
+
+    # Tokamax gate_out_weights: (C, D)
+    # cuEquivariance g_out_weight: (D, C)
+    cueq_weights['g_out_weight'] = tokamax_weights['gate_out_weights'].T  # (D, C)
+
+    # Biases not present in Tokamax for these layers are set to zero
+    cueq_weights['p_in_bias'] = jnp.zeros(2 * c, dtype=dtype)
+    cueq_weights['g_in_bias'] = jnp.zeros(2 * c, dtype=dtype)
+    cueq_weights['p_out_bias'] = jnp.zeros(d, dtype=dtype)
+    cueq_weights['g_out_bias'] = jnp.zeros(d, dtype=dtype)
+
+    return cueq_weights
+
+
 class TriangleMultiplicationBenchmark(parameterized.TestCase):
   """Benchmarks for different triangle_multiplication implementations."""
 
@@ -97,32 +146,9 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       if cueq is None:
         self.skipTest('cuEquivariance is not installed.')
 
-      key = jax.random.PRNGKey(seed)
-      keys = jax.random.split(key, 10)
-
-      c, d = input_dim, output_dim
-      dtype = jnp.bfloat16
-
-      cueq_weights = {
-          "norm_in_weight": all_inputs['layernorm_in_scale'],
-          "norm_in_bias": all_inputs['layernorm_in_offset'],
-          "norm_out_weight": jax.random.normal(keys[0], (c,), dtype=dtype),  # This should be H (32)
-          "norm_out_bias": jax.random.normal(keys[1], (c,), dtype=dtype),   # This should be H (32)
-          "p_in_weight": jax.random.normal(keys[2], (2 * c, c), dtype=dtype),
-          "g_in_weight": jax.random.normal(keys[3], (2 * c, c), dtype=dtype),
-          "p_out_weight": jax.random.normal(keys[4], (d, c), dtype=dtype), # This should be (D, H)
-          "g_out_weight": jax.random.normal(keys[5], (d, c), dtype=dtype),
-          "p_in_bias": jax.random.normal(keys[6], (2 * c,), dtype=dtype),
-          "g_in_bias": jax.random.normal(keys[7], (2 * c,), dtype=dtype),
-          "p_out_bias": jax.random.normal(keys[8], (d,), dtype=dtype),
-          "g_out_bias": jax.random.normal(keys[9], (d,), dtype=dtype),
-      }
-      # Match layernorm out weights from tokamax
-      cueq_weights['norm_out_weight'] = all_inputs['layernorm_out_scale']
-      cueq_weights['norm_out_bias'] = all_inputs['layernorm_out_offset']
-      # Match cueq p_out_weight to (D, H)
-      cueq_weights['p_out_weight'] = jax.random.normal(keys[4], (d, hidden_dim), dtype=dtype)
-
+      cueq_weights = convert_tokamax_weights_to_cuequivariance(
+          all_inputs, input_dim, hidden_dim, output_dim
+      )
 
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
@@ -136,8 +162,6 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       }
 
       # Calculate the numeric difference vs XLA version of Tokamax.
-      # Note: This comparison is not truly like-for-like as the internal
-      # projections are different.
       out_cueq = fn_partial(**dynamic_args)
       out_xla = tokamax.triangle_multiplication(
           implementation='xla',
