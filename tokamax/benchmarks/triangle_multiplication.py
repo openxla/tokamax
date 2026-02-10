@@ -107,6 +107,16 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       dynamic_args = {
           'x': all_inputs['x'],
       }
+
+      out_cueq = fn_partial(**dynamic_args)
+      out_xla = triangle_multiplication(
+          implementation='xla',
+          **all_inputs # XLA takes all arguments directly
+      )
+
+      diff = jnp.mean(jnp.abs(out_cueq - out_xla))
+      # TODO(b/481381116): Log this numeric diff to the benchmark proto.
+      logging.info(f"Numeric Diff (Cuequivariance vs XLA for n={n}): {diff}")
     else:  # Tokamax implementations
       fn_partial = functools.partial(
           triangle_multiplication,
