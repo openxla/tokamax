@@ -94,45 +94,34 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       cueq = cuequivariance_jax
       if cueq is None:
         self.skipTest('cuequivariance is not installed.')
-        return
 
-      # [FIX 1] Like-for-like: Pass explicit weights instead of a key
-      # We map the Tokamax schema to what we assume cuequivariance expects.
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
-          # Pass the same weights XLA uses:
-          w_in_gate=all_inputs['gate_in_weights'],
-          w_in_proj=all_inputs['projection_in_weights'],
-          w_out_gate=all_inputs['gate_out_weights'],
-          w_out_proj=all_inputs['projection_out_weights'],
-          ln_in_scale=all_inputs['layernorm_in_scale'],
-          ln_in_beta=all_inputs['layernorm_in_offset'],
-          ln_out_scale=all_inputs['layernorm_out_scale'],
-          ln_out_beta=all_inputs['layernorm_out_offset'],
+          # Map Tokamax weights to cuequivariance argument names
+          g_in_weight=all_inputs['gate_in_weights'],
+          p_in_weight=all_inputs['projection_in_weights'],
+          g_out_weight=all_inputs['gate_out_weights'],
+          p_out_weight=all_inputs['projection_out_weights'],
+          norm_in_weight=all_inputs['layernorm_in_scale'],
+          norm_in_bias=all_inputs['layernorm_in_offset'],
+          norm_out_weight=all_inputs['layernorm_out_scale'],
+          norm_out_bias=all_inputs['layernorm_out_offset'],
           mask=all_inputs['mask'].astype(dtype),
       )
       dynamic_args = {
           'x': all_inputs['x'],
       }
 
-      # [FIX 2 & 3] Check correctness and Log Diff
-      # 1. Run the Candidate (Cuequivariance)
       out_cueq = fn_partial(**dynamic_args)
-
-      # 2. Run the Reference (Tokamax XLA)
       out_xla = triangle_multiplication(
           implementation='xla',
           **all_inputs # XLA takes all arguments directly
       )
 
-      # 3. Compute Diff
-      # Ensure shapes match before comparing
       diff = jnp.mean(jnp.abs(out_cueq - out_xla))
-      
-      # 4. Log to terminal + TODO
-      logging.info(f"Numeric Diff (Cuequivariance vs XLA for n={n}): {diff}")
       # TODO(b/481381116): Log this numeric diff to the benchmark proto.
+      logging.info(f"Numeric Diff (Cuequivariance vs XLA for n={n}): {diff}")
 
     else:  # Tokamax implementations
       fn_partial = functools.partial(
