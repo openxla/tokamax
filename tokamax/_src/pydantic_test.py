@@ -18,8 +18,10 @@ from typing import Annotated
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pydantic
 from tokamax._src import batching
 from tokamax._src import pydantic as pydantic_lib
@@ -133,6 +135,25 @@ class PydanticTest(parameterized.TestCase):
     adapter = pydantic.TypeAdapter(ty)
     self.assertEqual(shape, adapter.validate_python(adapter.dump_python(shape)))
     self.assertEqual(shape, adapter.validate_json(adapter.dump_json(shape)))
+
+  def test_concrete_array_roundtrip(self):
+    class NPArrSubclass(np.ndarray):
+
+      def __new__(cls, input_array):
+        return np.asarray(input_array).view(cls)
+
+    adpt = lambda t: pydantic.TypeAdapter(Annotated[t, pydantic_lib.ShapeDtype])
+    test_data = {
+        adpt(jax.Array): jnp.arange(12).reshape((3, 4)),
+        adpt(np.ndarray): np.arange(12).reshape((3, 4)),
+        adpt(NPArrSubclass): NPArrSubclass(np.arange(12).reshape((3, 4))),
+    }
+    for adapter, arr in test_data.items():
+      with self.subTest(adapter):
+        py_round = adapter.validate_python(adapter.dump_python(arr))
+        json_round = adapter.validate_json(adapter.dump_json(arr))
+        chex.assert_trees_all_equal(arr, py_round)
+        self.assertEqual(jax.ShapeDtypeStruct(arr.shape, arr.dtype), json_round)
 
   def test_abstract_dataclass_roundtrip(self):
     shape = jax.ShapeDtypeStruct((1, 2), dtype=jnp.float32)
