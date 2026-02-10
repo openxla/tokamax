@@ -15,6 +15,7 @@
 """Benchmarks for triangle_multiplication."""
 
 import ctypes
+import ctypes.util
 import functools
 import os
 import subprocess
@@ -34,14 +35,11 @@ from tokamax._src.ops.triangle_multiplication import api
 
 # Pre-load libnvrtc.so.12 to resolve a dependency for libcue_ops.so
 try:
-  result = subprocess.run(
-      ["find", "/usr", "-name", "libnvrtc.so.12"],
-      capture_output=True,
-      text=True,
-      check=True,
-  )
-  libnvrtc_path = result.stdout.strip().splitlines()[0]
-  if libnvrtc_path:
+  libnvrtc_path = ctypes.util.find_library('nvrtc')
+  if libnvrtc_path is None:
+    libnvrtc_path = '/usr/local/cuda/lib64/libnvrtc.so.12'
+  
+  if os.path.exists(libnvrtc_path):
     ctypes.CDLL(libnvrtc_path, mode=ctypes.RTLD_GLOBAL)
   else:
     logging.warning("libnvrtc.so.12 not found, cuequivariance may fail.")
