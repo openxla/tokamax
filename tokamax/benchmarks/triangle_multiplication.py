@@ -67,31 +67,42 @@ def get_example(n, c=128, h=32, d=128):
   }
 
 
-def convert_tokamax_weights_to_cuequivariance(tokamax_weights, hidden_dim):
+def convert_tokamax_weights_to_cuequivariance(tokamax_weights, input_dim, hidden_dim, output_dim):
     """Converts Tokamax weights to cuEquivariance format."""
-    h = hidden_dim
-    d = tokamax_weights['gate_out_weights'].shape[1]
+    c, h, d = input_dim, hidden_dim, output_dim
 
     cueq_weights = {}
     cueq_weights['norm_in_weight'] = tokamax_weights['layernorm_in_scale']
     cueq_weights['norm_in_bias'] = tokamax_weights['layernorm_in_offset']
 
-    # projection_in_weights: (C, 2, H) -> (2H, C)
-    p_in = tokamax_weights['projection_in_weights']
-    cueq_weights['p_in_weight'] = jnp.concatenate([p_in[:, 0, :], p_in[:, 1, :]], axis=1).T
+    # Tokamax projection_in_weights: (C, 2, H)
+    # cuEquivariance p_in_weight: (2 * C, C)
+    p_in = tokamax_weights['projection_in_weights']  # (C, 2, H)
+    # This seems to be the source of the error. The cuequivariance implementation expects the weights to be of shape (2 * D_in, D_in).
+    # In this case, D_in is the input dimension, which is C.
+    # The tokamax weights are of shape (C, 2, H).
+    # To make the shapes match, we need to reshape and transpose the tokamax weights.
+    # New interpretation: cuEquivariance expects (2 * H, C)
+    p_in_reshaped = jnp.concatenate([p_in[:, 0, :], p_in[:, 1, :]], axis=1)  # (C, 2 * H)
+    cueq_weights['p_in_weight'] = p_in_reshaped.T  # (2 * H, C)
 
-    # gate_in_weights: (C, 2, H) -> (2H, C)
-    g_in = tokamax_weights['gate_in_weights']
-    cueq_weights['g_in_weight'] = jnp.concatenate([g_in[:, 0, :], g_in[:, 1, :]], axis=1).T
+    # Tokamax gate_in_weights: (C, 2, H)
+    # cuEquivariance g_in_weight: (2 * C, C)
+    g_in = tokamax_weights['gate_in_weights']  # (C, 2, H)
+    # New interpretation: cuEquivariance expects (2 * H, C)
+    g_in_reshaped = jnp.concatenate([g_in[:, 0, :], g_in[:, 1, :]], axis=1)  # (C, 2 * H)
+    cueq_weights['g_in_weight'] = g_in_reshaped.T  # (2 * H, C)
 
     cueq_weights['norm_out_weight'] = tokamax_weights['layernorm_out_scale']
     cueq_weights['norm_out_bias'] = tokamax_weights['layernorm_out_offset']
 
-    # projection_out_weights: (H, D) -> (D, H)
-    cueq_weights['p_out_weight'] = tokamax_weights['projection_out_weights'].T
+    # Tokamax projection_out_weights: (H, D)
+    # cuEquivariance p_out_weight: (D, H)
+    cueq_weights['p_out_weight'] = tokamax_weights['projection_out_weights'].T  # (D, H)
 
-    # gate_out_weights: (C, D) -> (D, C)
-    cueq_weights['g_out_weight'] = tokamax_weights['gate_out_weights'].T
+    # Tokamax gate_out_weights: (C, D)
+    # cuEquivariance g_out_weight: (D, C)
+    cueq_weights['g_out_weight'] = tokamax_weights['gate_out_weights'].T  # (D, C)
 
     # Biases not present in Tokamax for these layers are set to zero
     cueq_weights['p_in_bias'] = jnp.zeros(2 * h, dtype=p_in.dtype)
@@ -131,7 +142,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
         self.skipTest('cuEquivariance is not installed.')
 
       cueq_weights = convert_tokamax_weights_to_cuequivariance(
-          all_inputs, hidden_dim
+          all_inputs, input_dim, hidden_dim, output_dim
       )
 
       fn_partial = functools.partial(
