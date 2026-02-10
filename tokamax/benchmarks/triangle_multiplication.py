@@ -175,6 +175,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
 
       # diff = jnp.mean(jnp.abs(out_cueq.astype(jnp.float32) - out_xla.astype(jnp.float32)))
       # logging.info('Numeric Diff (cuEquivariance vs XLA for n=%d): %s', n, diff)
+      return  # Skip benchmarking for cuequivariance due to internal error
     else:  # Tokamax implementations
       fn_partial = functools.partial(
           tokamax.triangle_multiplication,
