@@ -106,7 +106,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
           key=key,
-          mask=all_inputs['mask'],
+          mask=all_inputs['mask'].astype(dtype),
       )
       dynamic_args = {
           'x': all_inputs['x'],
