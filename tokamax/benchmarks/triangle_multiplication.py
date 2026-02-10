@@ -106,10 +106,10 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
           key=key,
+          mask=all_inputs['mask'],
       )
       dynamic_args = {
           'x': all_inputs['x'],
-          'mask': all_inputs['mask'],
       }
     else:  # Tokamax implementations
       fn_partial = functools.partial(
@@ -123,7 +123,6 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
         kwargs=dynamic_args,
         mode=benchmark_mode,
         seed=None,
-        nondiff_argnums=(1,),
     )
 
     bench = benchmarking.compile_benchmark(fn, actual_args)
