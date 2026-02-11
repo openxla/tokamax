@@ -148,4 +148,220 @@ ARG_SPECS = (
         project='maxtext',
         name='gpt-oss-393216x768',
     ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(524288, 4096), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 4096, 1536), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=524288, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-524288x4096',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(524288, 1536), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 1536, 4096), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=524288, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-524288x1536',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(262144, 4096), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 4096, 1536), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=262144, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-262144x4096',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(262144, 1536), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 1536, 4096), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=262144, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-262144x1536',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(131072, 7168), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 7168, 2048), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=131072, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-131072x7168',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(131072, 2048), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 2048, 768), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=131072, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-131072x2048',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(131072, 4096), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 4096, 1536), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=131072, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-131072x4096',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(131072, 1536), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(128, 1536, 4096), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((128,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=131072, g=128
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-131072x1536',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(131072, 7168), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(256, 7168, 2048), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=131072, g=256
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-131072x7168',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(65536, 7168), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(256, 7168, 2048), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=65536, g=256
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-65536x7168',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(131072, 7168), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(256, 7168, 512), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=131072, g=256
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-131072x7168',
+    ),
+    arg_spec.ArgSpec(
+        args={
+            'lhs': jax.ShapeDtypeStruct(
+                shape=(131072, 512), dtype=jnp.bfloat16
+            ),
+            'rhs': jax.ShapeDtypeStruct(
+                shape=(256, 512, 7168), dtype=jnp.bfloat16
+            ),
+            'group_sizes': base.GroupSizes(
+                jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
+                representative_value=generate_group_sizes(
+                    target_m=131072, g=256
+                ),
+            ),
+        },
+        project='maxtext',
+        name='gpt-oss-131072x512',
+    ),
 ) + tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())
