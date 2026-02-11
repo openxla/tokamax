@@ -19,7 +19,7 @@ dependencies = [
     "typeguard==2.13.3",
     "immutabledict",
     "tensorboardx",
-    "cuequivariance>=0.8.1", # Updated
+    "cuequivariance>=0.8.1",
 ]
 
 [build-system]
@@ -45,13 +45,14 @@ test = [
 bench = [
     "google-benchmark>=1.9.0",
     "xprof",
-    "cuequivariance-jax>=0.8.1", # Updated
-    "jax-triton>=0.3.0", # Pin to the latest available version
-    "triton>=3.0.0", # Updated
+    "cuequivariance-jax>=0.8.1",
+    "jax-triton>=0.3.0",
+    "triton>=3.0.0",
 ]
 
 cuda = [
-    "jax[cuda13_pip]>=0.4.31", # Ensures JAX is built with CUDA 13 support
+    "jax[cuda12]>=0.4.31",
+    "nvidia-cudnn-cu12>=9.0.0",
 ]
 
 tpu = [
