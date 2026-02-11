@@ -78,21 +78,28 @@ def get_example(n, c=64, h=64, d=64, seed=0) -> Any:
       k_ln_out_s,
       k_ln_out_o,
   ) = jax.random.split(key, 10)
+
+  # Scale weights by 0.1 to prevent activation blowup, matching your Colab
+  scale = 0.1
+
   return {
-      'x': jax.random.normal(k_x, (n, n, c), dtype=jnp.bfloat16),
-      'mask': jax.random.bernoulli(k_mask, shape=(n, n)),
+      'x': jax.random.normal(k_x, (n, n, c), dtype=jnp.bfloat16) * scale,
+
+      # FIX: Use an all-ones boolean mask instead of random bernoulli
+      'mask': jnp.ones((n, n), dtype=bool),
+
       'projection_in_weights': jax.random.normal(
           k_p_in, (c, 2, h), dtype=jnp.bfloat16
-      ),
+      ) * scale,
       'gate_in_weights': jax.random.normal(
           k_g_in, (c, 2, h), dtype=jnp.bfloat16
-      ),
+      ) * scale,
       'projection_out_weights': jax.random.normal(
           k_p_out, (h, d), dtype=jnp.bfloat16
-      ),
+      ) * scale,
       'gate_out_weights': jax.random.normal(
           k_g_out, (c, d), dtype=jnp.bfloat16
-      ),
+      ) * scale,
       'layernorm_in_scale': jax.random.normal(
           k_ln_in_s, (c,), dtype=jnp.bfloat16
       ),
