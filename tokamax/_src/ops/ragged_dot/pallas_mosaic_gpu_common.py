@@ -29,6 +29,16 @@ from jaxlib.mlir.dialects import arith
 from jaxlib.mlir.dialects import memref
 import pydantic
 
+SMEM_CAPACITY_MAP = {
+    "sm_120": (100 - 1) * 1024,
+    "sm_103": (228 - 1) * 1024,
+    "sm_100": (228 - 1) * 1024,
+    "sm_90": (228 - 1) * 1024,
+    "sm_80": (164 - 1) * 1024,
+    "sm_86": (100 - 1) * 1024,
+    "sm_89": (100 - 1) * 1024,
+}
+
 
 class MatmulDimension(enum.IntEnum):
   M = 0
@@ -435,6 +445,10 @@ def num_bits(dtype: jax.typing.DTypeLike) -> int:
   return fn(dtype).bits
 
 
+def num_bytes(dtype) -> float:
+  return num_bits(dtype) / 8
+
+
 def tile_swizzle_transforms(
     shape: tuple[int, ...], dtype: jax.typing.DTypeLike, what: str = ""
 ) -> tuple[plgpu.TilingTransform, plgpu.SwizzleTransform]:
@@ -443,3 +457,20 @@ def tile_swizzle_transforms(
   swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
   tiling = (8, 8 * swizzle // elem_bits)
   return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
+
+
+def get_smem_capacity() -> int:
+  """Returns the shared memory capacity of the device."""
+  device = backend.get_default_device()
+
+  if device.platform != "gpu":
+    raise NotImplementedError(
+        f"Unsupported device platform: {device}"
+    )
+  capacity = int(float(getattr(device, "compute_capability", 0)) * 10)
+  sm_version = f"sm_{capacity}"
+  if sm_version not in SMEM_CAPACITY_MAP:
+    raise NotImplementedError(
+        f"Unsupported device compute capability: {device} {sm_version}"
+    )
+  return SMEM_CAPACITY_MAP[sm_version]

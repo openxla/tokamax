@@ -28,6 +28,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_fp8_quant as sm100_fp8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm100_i8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
@@ -135,6 +136,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         if isinstance(lhs, QArray):
           if lhs.qtype == jnp.int8:
             fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
+          elif lhs.qtype == jnp.float8_e4m3fn:
+            fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
           else:
             # dequantize lhs to fallback to non-lhs-quantized kernel
             lhs = quantization.as_array(lhs)
@@ -200,6 +203,15 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       if isinstance(rhs, QArray):
         if isinstance(lhs, QArray):
           if lhs.qtype == jnp.int8:
+            return Config(
+                block_m=16,
+                block_n=128,
+                block_k=block_k,
+                num_stages=2,
+                split_k=1,
+                grid_block_n=1,
+            )
+          elif lhs.qtype == jnp.float8_e4m3fn:
             return Config(
                 block_m=16,
                 block_n=128,

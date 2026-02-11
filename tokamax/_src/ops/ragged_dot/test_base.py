@@ -14,6 +14,7 @@
 # ==============================================================================
 """Ragged dot test base."""
 
+import contextvars
 import dataclasses
 import functools
 from unittest import mock
@@ -77,6 +78,23 @@ NAMED_ARG_SPECS = {
 # It would be nice in the future to support this, if possible.
 def relu(x):
   return jnp.maximum(x, 0)
+
+
+test_config = contextvars.ContextVar("config", default=None)
+
+
+class ConfigManager:
+
+  def __init__(self, config):
+    self.prev_config = None
+    self.config = config
+
+  def __enter__(self):
+    self.prev_config = test_config.get()
+    test_config.set(self.config)
+
+  def __exit__(self, exc_type, exc_value, traceback):
+    test_config.set(self.prev_config)
 
 
 # pylint: disable=missing-function-docstring
