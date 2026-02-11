@@ -127,6 +127,7 @@ benchmarks {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_multiplication.py" }
     action_inputs { key: "python_version" value: "3.11" }
+    action_inputs { key: "extras" value: "bench" }
   }
 
   environment_configs {
