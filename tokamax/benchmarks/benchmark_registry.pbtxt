@@ -155,7 +155,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/default/forward"
+    name: "triangle_multiplication/n=384/default/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n=768/default/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -163,7 +170,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/default/forward_and_vjp"
+    name: "triangle_multiplication/n=384/default/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n=768/default/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -171,7 +185,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/xla/forward"
+    name: "triangle_multiplication/n=384/xla/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n=768/xla/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -179,21 +200,44 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/xla/forward_and_vjp"
+    name: "triangle_multiplication/n=384/xla/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
   metrics {
-    name: "triangle_multiplication/cuequivariance/forward"
+    name: "triangle_multiplication/n=768/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "triangle_multiplication/n=384/cuequivariance/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
   metrics {
-    name: "triangle_multiplication/cuequivariance/forward_and_vjp"
+    name: "triangle_multiplication/n=768/cuequivariance/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "triangle_multiplication/n=384/cuequivariance/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n=768/cuequivariance/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
