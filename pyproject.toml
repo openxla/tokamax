@@ -52,6 +52,8 @@ test = [
     "pytest-xdist",
     "pytest",
     "xprof",
+    "jax-triton>=0.3.0",
+    "triton>=3.0.0",
 ]
 
 bench = [
