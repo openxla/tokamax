@@ -270,6 +270,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
               f'{metric_tag}/all_iterations', value, global_step=i
           )
 
+        tb_writer.flush() # <--- ADD THIS LINE
         tb_writer.close()
         logging.info("TensorBoard log directory: %s", tblog_dir)
         print(f"DEBUG: TensorBoard log directory: {tblog_dir}")
