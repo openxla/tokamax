@@ -30,6 +30,7 @@ _MMA_WARP = 0
 _TMA_WARP = 1
 _STORE_WG = 1
 
+_TCGEN05 = plgpu.Layout.TCGEN05
 _TCGEN05_TRANSPOSED = plgpu.Layout.TCGEN05_TRANSPOSED
 
 
@@ -199,7 +200,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
           plgpu.wait_smem_to_gmem(0, wait_read_only=True)
           plgpu.barrier_wait(mma_done_barrier.at[acc_slot])
           with jax.named_scope("tmem -> smem"):
-            acc = plgpu.async_load_tmem(acc_tmem.at[:, slice_acc_m])
+            acc = plgpu.async_load_tmem(acc_tmem.at[:, slice_acc_m], layout=_TCGEN05)
             plgpu.wait_load_tmem()
             if activation is not None:
               acc = activation(acc)

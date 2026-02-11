@@ -47,23 +47,35 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
 
       device_kind = jax.devices()[0].device_kind.lower()
       if "b200" in device_kind:
-        config = pallas_mosaic_gpu.Config(
-            block_m=128,
-            block_n=128,
-            block_k=256,
-            num_stages=2,
-            split_k=1,
-            collective=True,
-            persistent=True,
-        )
-        if (
-            not isinstance(rhs_, qwix.QArray)
-            or (rhs_.qtype != jnp.int4)
-            or (rhs_.scale_tile_shape[0] != 1)
-            or (rhs_.scale_tile_shape[1] < _CONFIG.block_k)
-            or (rhs_.scale_tile_shape[2] != 1)
-        ):
-          expect_supported = False
+        if isinstance(rhs_, qwix.QArray):
+          config = pallas_mosaic_gpu.Config(
+              block_m=128,
+              block_n=128,
+              block_k=256,
+              num_stages=2,
+              split_k=1,
+              collective=True,
+              persistent=True,
+          )
+          if (
+              rhs_.qtype != jnp.int4
+              or rhs_.scale_tile_shape[0] != 1
+              or rhs_.scale_tile_shape[1] < config.block_k
+              or rhs_.scale_tile_shape[2] != 1
+              or rhs_.scale.shape[2] * rhs_.scale.dtype.itemsize <= 16
+          ):
+            expect_supported = False
+        else:
+          if kwargs.get("preferred_element_type") not in (None, jnp.bfloat16):
+            # MGPU throws a `ValueError` so we skip the test.
+            self.skipTest("f32 output not supported on B200.")
+          config = pallas_mosaic_gpu.Config(
+              block_m=128,
+              block_n=128,
+              block_k=128,
+              num_stages=2,
+              split_k=1,
+          )
       elif isinstance(rhs_, qwix.QArray):
         if (
             rhs_.scale_tile_shape != (1, _CONFIG.block_k, 1)
