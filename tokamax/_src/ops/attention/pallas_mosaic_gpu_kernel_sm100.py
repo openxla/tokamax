@@ -645,7 +645,6 @@ def flash_attention_kernel(
       # epilogue for writing GMEM
       with jax.named_scope("TMEM -> SMEM"):
         acc = plgpu.async_load_tmem(acc_tmem, layout=_TCGEN05)
-        plgpu.wait_load_tmem()
       with jax.named_scope("SMEM -> GMEM"):
         if normalize_output:
           acc *= lax.broadcast_in_dim(1.0 / l_i, acc.shape, [0])
