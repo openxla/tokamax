@@ -1,6 +1,18 @@
 [project]
 name = "tokamax"
-# ... other authors ...
+authors = [
+  {name = "Ani Udipi", email = "udipi@google.com"},
+  {name = "Chris Jones", email = "cjfj@google.com"},
+  {name = "Christos Perivolaropoulos", email = "cperivol@google.com"},
+  {name = "Giorgio Arena", email = "giorgioa@google.com"},
+  {name = "Gleb Pobudzey", email = "pobudzey@google.com"},
+  {name = "Robert Dyro", email = "rdyro@google.com"},
+  {name = "Sebastian Bodenstein", email = "sbodenstein@google.com"},
+  {name = "Selim Seferbekov", email = "selimsef@google.com"},
+  {name = "Stanley Tzeng", email = "stzeng@google.com"},
+  {name = "Niyati Chaudhary", email = "niyatic@google.com"},
+]
+
 description = "A Pallas Custom Kernel Library."
 readme = "README.md"
 version = "0.0.10"
@@ -9,8 +21,8 @@ requires-python = ">=3.11"
 dependencies = [
     "absl-py>=2.3.0",
     "einshape",
-    "jax>=0.4.31",
-    "jaxlib>=0.4.31",
+    "jax>=0.8.2",
+    "jaxlib>=0.8.2",
     "jaxtyping>=0.3",
     "pydantic>=2.11.0",
     "qwix>=0.1.2",
@@ -46,17 +58,15 @@ bench = [
     "google-benchmark>=1.9.0",
     "xprof",
     "cuequivariance-jax>=0.8.1",
-    "jax-triton>=0.3.0",
-    "triton>=3.0.0",
 ]
 
 cuda = [
-    "jax[cuda12]>=0.4.31",
+    "jax[cuda12]>=0.8.0",
     "nvidia-cudnn-cu12>=9.0.0",
 ]
 
 tpu = [
-    "jax[tpu]>=0.4.31",
+    "jax[tpu]>=0.8.0",
     "hypothesis",
 ]
 
