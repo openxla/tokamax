@@ -46,7 +46,7 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
 )
 
 
-def get_example(n, c=128, h=32, d=128, seed=0) -> Any:
+def get_example(n, c=64, h=64, d=64, seed=0) -> Any:
   """Generates example inputs for triangle_multiplication."""
   key = jax.random.PRNGKey(seed)
   (
@@ -92,71 +92,50 @@ def get_example(n, c=128, h=32, d=128, seed=0) -> Any:
   }
 
 
-def convert_tokamax_weights_to_cuequivariance(
-    tokamax_weights, input_dim, hidden_dim, output_dim
-):
-  """Converts Tokamax weights to cuEquivariance format by padding."""
-  c, h, d = input_dim, hidden_dim, output_dim
+def convert_tokamax_weights_to_cuequivariance(tokamax_weights):
+  """Converts Tokamax weights to cuEquivariance format."""
   dtype = tokamax_weights['x'].dtype
 
+  # Tokamax Input Proj: [C, 2, H] -> Needs [2*H, C] for CuEq
+  # Since C=H, we flatten (C, 2, H) -> (C, 2*H) then transpose -> (2*H, C)
+  def transform_in(w):
+    return w.reshape(w.shape[0], -1).T
+
+  # Tokamax Output Proj: [H, D] -> Needs [D, H] for CuEq
+  def transform_out(w):
+    return w.T
+
   cueq_weights = {}
-  cueq_weights['norm_in_weight'] = tokamax_weights['layernorm_in_scale']
-  cueq_weights['norm_in_bias'] = tokamax_weights['layernorm_in_offset']
 
-  def pad_weights(weights):  # Shape (C, 2, H)
-    weights_concat = jnp.concatenate(
-        [weights[:, 0, :], weights[:, 1, :]], axis=1
-    )  # (C, 2 * H)
-    padding_width = c - h
-    # Pad H to C for the second part of the 2*C dimension
-    padded = jnp.pad(
-        weights_concat,
-        ((0, 0), (0, 2 * padding_width)),
-        mode='constant',
-        constant_values=0.0,
-    )  # (C, 2 * C)
-    return padded.T  # (2 * C, C)
-
-  cueq_weights['p_in_weight'] = pad_weights(
+  # Input Layers
+  cueq_weights['p_in_weight'] = transform_in(
       tokamax_weights['projection_in_weights']
   )
-  cueq_weights['g_in_weight'] = pad_weights(tokamax_weights['gate_in_weights'])
+  cueq_weights['g_in_weight'] = transform_in(tokamax_weights['gate_in_weights'])
 
-  padding_width = c - h
-  cueq_weights['norm_out_weight'] = jnp.pad(
-      tokamax_weights['layernorm_out_scale'],
-      (0, padding_width),
-      mode='constant',
-      constant_values=0.0,
+  # Output Layers
+  cueq_weights['p_out_weight'] = transform_out(
+      tokamax_weights['projection_out_weights']
   )
-  cueq_weights['norm_out_bias'] = jnp.pad(
-      tokamax_weights['layernorm_out_offset'],
-      (0, padding_width),
-      mode='constant',
-      constant_values=0.0,
+  cueq_weights['g_out_weight'] = transform_out(
+      tokamax_weights['gate_out_weights']
   )
 
-  # Tokamax projection_out_weights: (H, D)
-  # cuEquivariance p_out_weight: (D, C)
-  proj_out = tokamax_weights['projection_out_weights']  # (H, D)
-  padding_width = c - h
-  proj_out_padded = jnp.pad(
-      proj_out,
-      ((0, padding_width), (0, 0)),
-      mode='constant',
-      constant_values=0.0,
-  )  # (C, D)
-  cueq_weights['p_out_weight'] = proj_out_padded.T  # (D, C)
+  # Norms (Direct mapping)
+  cueq_weights['norm_in_weight'] = tokamax_weights['layernorm_in_scale']
+  cueq_weights['norm_in_bias'] = tokamax_weights['layernorm_in_offset']
+  cueq_weights['norm_out_weight'] = tokamax_weights['layernorm_out_scale']
+  cueq_weights['norm_out_bias'] = tokamax_weights['layernorm_out_offset']
 
-  # Tokamax gate_out_weights: (C, D)
-  # cuEquivariance g_out_weight: (D, C)
-  cueq_weights['g_out_weight'] = tokamax_weights['gate_out_weights'].T  # (D, C)
+  # Tokamax doesn't use linear biases, CuEq does. We must explicitly zero them.
+  # We infer dimensions from the transposed weights we just created.
+  d_in = cueq_weights['p_in_weight'].shape[1]  # C
+  d_out = cueq_weights['p_out_weight'].shape[0]  # D
 
-  # Biases not present in Tokamax for these layers are set to zero
-  cueq_weights['p_in_bias'] = jnp.zeros(2 * c, dtype=dtype)
-  cueq_weights['g_in_bias'] = jnp.zeros(2 * c, dtype=dtype)
-  cueq_weights['p_out_bias'] = jnp.zeros(d, dtype=dtype)
-  cueq_weights['g_out_bias'] = jnp.zeros(d, dtype=dtype)
+  cueq_weights['p_in_bias'] = jnp.zeros(2 * d_in, dtype=dtype)
+  cueq_weights['g_in_bias'] = jnp.zeros(2 * d_in, dtype=dtype)
+  cueq_weights['p_out_bias'] = jnp.zeros(d_out, dtype=dtype)
+  cueq_weights['g_out_bias'] = jnp.zeros(d_out, dtype=dtype)
 
   return cueq_weights
 
@@ -178,7 +157,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    input_dim, hidden_dim, output_dim = 128, 32, 128
+    input_dim, hidden_dim, output_dim = 64, 64, 64
     seed = 0
 
     # Initialize all inputs once.
@@ -191,14 +170,12 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       if cueq is None:
         self.skipTest('cuEquivariance is not installed.')
 
-      cueq_weights = convert_tokamax_weights_to_cuequivariance(
-          all_inputs, input_dim, hidden_dim, output_dim
-      )
+      cueq_weights = convert_tokamax_weights_to_cuequivariance(all_inputs)
 
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
-          mask=all_inputs['mask'].astype(jnp.bfloat16),
+          mask=all_inputs['mask'].astype(all_inputs['x'].dtype),
           eps=1e-6,
           **cueq_weights,
       )
