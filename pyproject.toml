@@ -52,13 +52,14 @@ test = [
     "pytest-xdist",
     "pytest",
     "xprof",
-    "cuequivariance>=0.8.1",
 ]
 
 bench = [
     "google-benchmark>=1.9.0",
     "xprof",
     "cuequivariance-jax>=0.8.1",
+    "jax-triton>=0.3.0",
+    "triton>=3.0.0",
 ]
 
 cuda = [
