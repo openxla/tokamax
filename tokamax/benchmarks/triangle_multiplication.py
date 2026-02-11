@@ -16,8 +16,6 @@
 
 import functools
 import os
-import subprocess
-import sys
 from typing import Any
 
 from absl import flags
@@ -29,21 +27,6 @@ import jax.numpy as jnp
 from tensorboardX import writer
 import tokamax
 
-
-print(f"JAX Backend: {jax.default_backend()}")
-print(f"JAX Devices: {jax.devices()}")
-
-# detailed debug of what pip actually installed
-try:
-  subprocess.check_call([sys.executable, "-m", "pip", "list"])
-  subprocess.check_call([sys.executable, "-m", "pip", "show", "jax", "jaxlib"])
-except Exception:  # pylint: disable=broad-except
-  pass
-
-if jax.default_backend() != "gpu" and jax.default_backend() != "tpu":
-  logging.warning(
-      "Critical: GPU/TPU not found. JAX is running on %s", jax.default_backend()
-  )
 
 try:
   import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
@@ -63,7 +46,7 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
 )
 
 
-def get_example(n, c=64, h=64, d=64, seed=0) -> Any:
+def get_example(n, c=64, h=64, d=64, seed=0, dtype=jnp.float32) -> Any:
   """Generates example inputs for triangle_multiplication."""
   key = jax.random.PRNGKey(seed)
   (
@@ -79,38 +62,35 @@ def get_example(n, c=64, h=64, d=64, seed=0) -> Any:
       k_ln_out_o,
   ) = jax.random.split(key, 10)
 
-  # Scale weights by 0.1 to prevent activation blowup, matching your Colab
+  # Scale weights by 0.1 to prevent activation blowup.
   scale = 0.1
 
   return {
-      'x': jax.random.normal(k_x, (n, n, c), dtype=jnp.bfloat16) * scale,
-
-      # FIX: Use an all-ones boolean mask instead of random bernoulli
+      'x': jax.random.normal(k_x, (n, n, c), dtype=dtype) * scale,
       'mask': jnp.ones((n, n), dtype=bool),
-
       'projection_in_weights': jax.random.normal(
-          k_p_in, (c, 2, h), dtype=jnp.bfloat16
+          k_p_in, (c, 2, h), dtype=dtype
       ) * scale,
       'gate_in_weights': jax.random.normal(
-          k_g_in, (c, 2, h), dtype=jnp.bfloat16
+          k_g_in, (c, 2, h), dtype=dtype
       ) * scale,
       'projection_out_weights': jax.random.normal(
-          k_p_out, (h, d), dtype=jnp.bfloat16
+          k_p_out, (h, d), dtype=dtype
       ) * scale,
       'gate_out_weights': jax.random.normal(
-          k_g_out, (c, d), dtype=jnp.bfloat16
+          k_g_out, (c, d), dtype=dtype
       ) * scale,
       'layernorm_in_scale': jax.random.normal(
-          k_ln_in_s, (c,), dtype=jnp.bfloat16
+          k_ln_in_s, (c,), dtype=dtype
       ),
       'layernorm_in_offset': jax.random.normal(
-          k_ln_in_o, (c,), dtype=jnp.bfloat16
+          k_ln_in_o, (c,), dtype=dtype
       ),
       'layernorm_out_scale': jax.random.normal(
-          k_ln_out_s, (h,), dtype=jnp.bfloat16
+          k_ln_out_s, (h,), dtype=dtype
       ),
       'layernorm_out_offset': jax.random.normal(
-          k_ln_out_o, (h,), dtype=jnp.bfloat16
+          k_ln_out_o, (h,), dtype=dtype
       ),
       'triangle_type': 'incoming',
   }
@@ -120,12 +100,12 @@ def convert_tokamax_weights_to_cuequivariance(tokamax_weights):
   """Converts Tokamax weights to cuEquivariance format."""
   dtype = tokamax_weights['x'].dtype
 
-  # Tokamax Input Proj: [C, 2, H] -> Needs [2*H, C] for CuEq
+  # Tokamax Input Proj: [C, 2, H] -> [2*H, C] for cuEquivariance.
   # Since C=H, we flatten (C, 2, H) -> (C, 2*H) then transpose -> (2*H, C)
   def transform_in(w):
     return w.reshape(w.shape[0], -1).T
 
-  # Tokamax Output Proj: [H, D] -> Needs [D, H] for CuEq
+  # Tokamax Output Proj: [H, D] -> [D, H] for cuEquivariance.
   def transform_out(w):
     return w.T
 
@@ -151,8 +131,9 @@ def convert_tokamax_weights_to_cuequivariance(tokamax_weights):
   cueq_weights['norm_out_weight'] = tokamax_weights['layernorm_out_scale']
   cueq_weights['norm_out_bias'] = tokamax_weights['layernorm_out_offset']
 
-  # Tokamax doesn't use linear biases, CuEq does. We must explicitly zero them.
-  # We infer dimensions from the transposed weights we just created.
+  # Tokamax doesn't use linear biases, cuEquivariance does.
+  # They must be explicitly zeroed out.
+  # Infer dimensions from the transposed weights we just created.
   d_in = cueq_weights['p_in_weight'].shape[1]  # C
   d_out = cueq_weights['p_out_weight'].shape[0]  # D
 
@@ -185,19 +166,8 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
     seed = 0
 
     # Initialize all inputs once.
-    all_inputs: Any = get_example(
+    all_inputs = get_example(
         n, input_dim, hidden_dim, output_dim, seed=seed
-    )
-
-    # [Improvement 1]: Cast inputs to Float32 for correctness verification
-    # We use hasattr(x, 'dtype') to skip the 'triangle_type' string
-    all_inputs_f32 = jax.tree.map(
-        lambda x: (
-            x.astype(jnp.float32)
-            if hasattr(x, 'dtype') and x.dtype == jnp.bfloat16
-            else x
-        ),
-        all_inputs,
     )
 
     if implementation == 'cuequivariance':
@@ -205,7 +175,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       if cueq is None:
         self.skipTest('cuEquivariance is not installed.')
 
-      cueq_weights = convert_tokamax_weights_to_cuequivariance(all_inputs_f32)
+      cueq_weights = convert_tokamax_weights_to_cuequivariance(all_inputs)
 
       # [Improvement 2]: Force fallback=True because we are likely on CPU
       # or checking correctness. The optimized kernel is risky for exact matching.
@@ -213,20 +183,20 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
 
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
-          direction=all_inputs_f32['triangle_type'],
-          mask=all_inputs_f32['mask'].astype(jnp.float32),
+          direction=all_inputs['triangle_type'],
+          mask=all_inputs['mask'].astype(all_inputs['x'].dtype),
           eps=1e-6,
           fallback=use_fallback,
           **cueq_weights,
       )
       dynamic_args = {
-          'x': all_inputs_f32['x'],
+          'x': all_inputs['x'],
       }
 
       # Calculate the numeric difference vs default version of Tokamax.
       out_cueq = fn_partial(**dynamic_args)
       out_tokamax = tokamax.triangle_multiplication(
-          implementation=None, **all_inputs_f32
+          implementation=None, **all_inputs
       )
 
       diff = jnp.mean(jnp.abs(out_cueq - out_tokamax))
