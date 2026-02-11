@@ -271,6 +271,21 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           )
 
         tb_writer.close()
+        logging.info("TensorBoard log directory: %s", tblog_dir)
+        print(f"DEBUG: TensorBoard log directory: {tblog_dir}")
+        try:
+            contents = os.listdir(tblog_dir)
+            logging.info("Contents of TensorBoard log directory:")
+            print("DEBUG: Contents of TensorBoard log directory:")
+            if not contents:
+                logging.warning("TensorBoard log directory is EMPTY.")
+                print("DEBUG: TensorBoard log directory is EMPTY.")
+            for item in contents:
+                logging.info("  - %s", item)
+                print(f"  - {item}")
+        except Exception as e:
+            logging.error("Error listing TensorBoard directory contents: %s", e)
+            print(f"DEBUG: Error listing TensorBoard directory contents: {e}")
       except (OSError, IOError):
         logging.warning(
             'Failed to write to TensorBoard output directory: %s',
