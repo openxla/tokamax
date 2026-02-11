@@ -252,7 +252,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
     res = bench(actual_args)
 
     metric_tag = (
-        f"triangle_multiplication/n={n}/{implementation or 'default'}/{benchmark_mode}"
+        f"triangle_multiplication/{implementation or 'default'}/{benchmark_mode}"
     )
     tblog_dir = os.environ.get(_TENSORBOARD_OUTPUT_ENV_VAR.value)
 
