@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src import shape as shape_lib
+from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_common as vjp_common
@@ -39,6 +40,37 @@ _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_TRANSPOSED = plgpu.Layout.WGMMA_TRANSPOSED
 _load_bcast = common.load_bcast
+
+
+def get_heuristics_config(ba: op.BoundArguments) -> Config:
+  del ba
+  return Config(
+      block_q_dkv=64,
+      block_kv_dkv=64,
+      block_q_dq=64,
+      block_kv_dq=64,
+      num_stages=2,
+  )
+
+
+def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
+  del ba
+  configs = set()
+  for block_q in [64, 128]:
+    for block_kv in [64, 128]:
+      for num_stages in [1, 2, 3, 4]:
+        for compute_wgs in [1, 2, 3]:
+          configs.add(
+              Config(
+                  block_q_dkv=block_q,
+                  block_kv_dkv=block_kv,
+                  block_q_dq=block_q,
+                  block_kv_dq=block_kv,
+                  num_stages=num_stages,
+                  compute_wgs=compute_wgs,
+              )
+          )
+  return configs
 
 
 @jaxtyping.jaxtyped
@@ -184,6 +216,7 @@ def flash_attention_vjp_kernel(
       plgpu.copy_smem_to_gmem(q_smem, dq_gmem.at[qs, hi])
 
       if ds_gmem is not None:  # Zero `ds` for the kv tiles that are not used.
+
         @pl.loop(ub, num_kv_tiles)
         def zero_ds(ki):
           ks = pl.ds(ki * block_kv, block_kv)

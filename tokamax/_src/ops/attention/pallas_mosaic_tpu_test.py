@@ -118,7 +118,7 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
     q, k, v, mask, do = numerics.random_initialize((q, k, v, mask, do))
     self._test_attention(q, k, v, do, mask, is_causal, logits_soft_cap)
 
-  def test_autotune(self):
+  def test_autotune_configs(self):
     head_dim = 32
     q_seq_len = 128
     kv_seq_len = 128

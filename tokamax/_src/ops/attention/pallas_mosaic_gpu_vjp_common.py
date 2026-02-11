@@ -24,5 +24,5 @@ class Config:
   block_kv_dkv: pydantic.conint(multiple_of=64, gt=0)
   block_q_dq: pydantic.PositiveInt
   block_kv_dq: pydantic.PositiveInt
-  num_stages: pydantic.conint(gt=1) = 2
+  num_stages: pydantic.PositiveInt = 2
   compute_wgs: pydantic.PositiveInt = 2
