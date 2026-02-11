@@ -15,7 +15,7 @@
 from importlib import resources
 import os
 import re
-from typing import Final
+from typing import Any, Final
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -34,27 +34,19 @@ _CACHE_PATHS: Final[immutabledict.immutabledict[str, str]] = (
 
 class CacheTest(parameterized.TestCase):
 
-  def test_load_cache(self):
-    device_kind = jax.devices()[0].device_kind
-    if device_kind != "NVIDIA H100 80GB HBM3":
-      self.skipTest("Only NVIDIA H100 80GB HBM3 is supported.")
+  @parameterized.parameters(
+      ("NVIDIA H100 80GB HBM3", pallas_triton.PallasTritonNormalization),
+      ("TPU7x", attention_base.DotProductAttention),
+      ("not_a_real_device", pallas_triton.PallasTritonNormalization),
+  )
+  def test_load_cache(self, device: str, op_cls: Any):
+    c = cache.AutotuningCache(op_cls())
 
-    c = cache.AutotuningCache(pallas_triton.PallasTritonNormalization())
-
-    self.assertIsInstance(c._load_cache("not_a_real_device"), dict)
-    self.assertEmpty(c._load_cache("not_a_real_device"))
-
-    self.assertNotEmpty(c._load_cache(device_kind))
-
-  def test_default_cache(self):
-    device_kind = jax.devices()[0].device_kind
-    # TODO: Enable TPU caches once issue is resolved externally.
-    if device_kind != "NVIDIA H100 80GB HBM3":
-      self.skipTest("Only NVIDIA H100 80GB HBM3 is supported.")
-    flash_attention_cache = cache.AutotuningCache(
-        attention_base.DotProductAttention()
-    )._load_cache(device_kind)
-    self.assertNotEmpty(flash_attention_cache)
+    self.assertIsInstance(c._load_cache(device), dict)
+    if device == "not_a_real_device":
+      self.assertEmpty(c._load_cache(device))
+    else:
+      self.assertNotEmpty(c._load_cache(device))
 
 
 if __name__ == "__main__":
