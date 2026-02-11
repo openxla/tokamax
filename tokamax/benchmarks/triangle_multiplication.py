@@ -207,9 +207,8 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
 
       cueq_weights = convert_tokamax_weights_to_cuequivariance(all_inputs_f32)
 
-      # [Improvement 2]: Force fallback=True because we are likely on CPU
-      # or checking correctness. The optimized kernel is risky for exact matching.
-      use_fallback = True
+      # [Improvement 2]: Force fallback=False to use the optimized kernel.
+      use_fallback = False
 
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
