@@ -46,60 +46,25 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
 )
 
 
-def get_example(n, c=64, h=64, d=64, seed=0, dtype=jnp.float32) -> Any:
+def get_example(n, c=64, h=64, d=64, dtype=jnp.float32) -> Any:
   """Generates example inputs for triangle_multiplication."""
-  key = jax.random.PRNGKey(seed)
-  (
-      k_x,
-      k_mask,
-      k_p_in,
-      k_g_in,
-      k_p_out,
-      k_g_out,
-      k_ln_in_s,
-      k_ln_in_o,
-      k_ln_out_s,
-      k_ln_out_o,
-  ) = jax.random.split(key, 10)
-
-  # Scale weights by 0.1 to prevent activation blowup.
-  scale = 0.1
-
   return {
-      'x': jax.random.normal(k_x, (n, n, c), dtype=dtype) * scale,
-      'mask': jnp.ones((n, n), dtype=bool),
-      'projection_in_weights': jax.random.normal(
-          k_p_in, (c, 2, h), dtype=dtype
-      ) * scale,
-      'gate_in_weights': jax.random.normal(
-          k_g_in, (c, 2, h), dtype=dtype
-      ) * scale,
-      'projection_out_weights': jax.random.normal(
-          k_p_out, (h, d), dtype=dtype
-      ) * scale,
-      'gate_out_weights': jax.random.normal(
-          k_g_out, (c, d), dtype=dtype
-      ) * scale,
-      'layernorm_in_scale': jax.random.normal(
-          k_ln_in_s, (c,), dtype=dtype
-      ),
-      'layernorm_in_offset': jax.random.normal(
-          k_ln_in_o, (c,), dtype=dtype
-      ),
-      'layernorm_out_scale': jax.random.normal(
-          k_ln_out_s, (h,), dtype=dtype
-      ),
-      'layernorm_out_offset': jax.random.normal(
-          k_ln_out_o, (h,), dtype=dtype
-      ),
+      'x': jax.ShapeDtypeStruct((n, n, c), dtype),
+      'mask': jax.ShapeDtypeStruct((n, n), jnp.bool_),
+      'projection_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype),
+      'gate_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype),
+      'projection_out_weights': jax.ShapeDtypeStruct((h, d), dtype),
+      'gate_out_weights': jax.ShapeDtypeStruct((c, d), dtype),
+      'layernorm_in_scale': jax.ShapeDtypeStruct((c,), dtype),
+      'layernorm_in_offset': jax.ShapeDtypeStruct((c,), dtype),
+      'layernorm_out_scale': jax.ShapeDtypeStruct((h,), dtype),
+      'layernorm_out_offset': jax.ShapeDtypeStruct((h,), dtype),
       'triangle_type': 'incoming',
   }
 
 
 def convert_tokamax_weights_to_cuequivariance(tokamax_weights):
   """Converts Tokamax weights to cuEquivariance format."""
-  dtype = tokamax_weights['x'].dtype
-
   # Tokamax Input Proj: [C, 2, H] -> [2*H, C] for cuEquivariance.
   # Since C=H, we flatten (C, 2, H) -> (C, 2*H) then transpose -> (2*H, C)
   def transform_in(w):
@@ -133,14 +98,10 @@ def convert_tokamax_weights_to_cuequivariance(tokamax_weights):
 
   # Tokamax doesn't use linear biases, cuEquivariance does.
   # They must be explicitly zeroed out.
-  # Infer dimensions from the transposed weights we just created.
-  d_in = cueq_weights['p_in_weight'].shape[1]  # C
-  d_out = cueq_weights['p_out_weight'].shape[0]  # D
-
-  cueq_weights['p_in_bias'] = jnp.zeros(2 * d_in, dtype=dtype)
-  cueq_weights['g_in_bias'] = jnp.zeros(2 * d_in, dtype=dtype)
-  cueq_weights['p_out_bias'] = jnp.zeros(d_out, dtype=dtype)
-  cueq_weights['g_out_bias'] = jnp.zeros(d_out, dtype=dtype)
+  cueq_weights['p_in_bias'] = None
+  cueq_weights['g_in_bias'] = None
+  cueq_weights['p_out_bias'] = None
+  cueq_weights['g_out_bias'] = None
 
   return cueq_weights
 
@@ -162,14 +123,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    input_dim, hidden_dim, output_dim = 64, 64, 64
-    seed = 0
-
-    # Initialize all inputs once.
-    all_inputs = get_example(
-        n, input_dim, hidden_dim, output_dim, seed=seed
-    )
-
+    all_inputs = get_example(n)
     if implementation == 'cuequivariance':
       cueq = cuequivariance_jax
       if cueq is None:
@@ -177,16 +131,12 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
 
       cueq_weights = convert_tokamax_weights_to_cuequivariance(all_inputs)
 
-      # [Improvement 2]: Force fallback=True because we are likely on CPU
-      # or checking correctness. The optimized kernel is risky for exact matching.
-      use_fallback = True
-
       fn_partial = functools.partial(
           cueq.triangle_multiplicative_update,
           direction=all_inputs['triangle_type'],
           mask=all_inputs['mask'].astype(all_inputs['x'].dtype),
           eps=1e-6,
-          fallback=use_fallback,
+          fallback=True,  # Force fallback because we are checking correctness.
           **cueq_weights,
       )
       dynamic_args = {
