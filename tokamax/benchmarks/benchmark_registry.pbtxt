@@ -128,7 +128,6 @@ benchmarks {
     action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_multiplication.py" }
     action_inputs { key: "python_version" value: "3.11" }
     action_inputs { key: "extras" value: "bench" }
-    action_inputs { key: "setup_commands" value: "pip install --upgrade 'jax[cuda13_pip]'" }
   }
 
   environment_configs {
