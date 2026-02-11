@@ -430,8 +430,8 @@ def flash_attention_kernel(
             stage = lax.rem(ki - lb, num_stages)
             slot = lax.rem(ki - lb, 2)
             with jax.named_scope("wait_v"):
-              plgpu.barrier_wait(p_produced_barrier.at[slot])
               plgpu.barrier_wait(v_barrier.at[stage])
+              plgpu.barrier_wait(p_produced_barrier.at[slot])
 
             @pl.loop(0, num_tma_splits)
             def _(split_idx):
