@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 from tensorboardX import writer
 import tokamax
+from tokamax._src import numerics
 
 
 try:
@@ -50,7 +51,7 @@ def get_example(n, c=64, h=64, d=64, dtype=jnp.float32) -> Any:
   """Generates example inputs for triangle_multiplication."""
   return {
       'x': jax.ShapeDtypeStruct((n, n, c), dtype),
-      'mask': jax.ShapeDtypeStruct((n, n), jnp.bool_),
+      'mask': jnp.ones((n, n), dtype=bool),
       'projection_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype),
       'gate_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype),
       'projection_out_weights': jax.ShapeDtypeStruct((h, d), dtype),
@@ -123,7 +124,15 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    all_inputs = get_example(n)
+    abstract_inputs = get_example(n)
+    concrete_inputs = numerics.random_initialize(abstract_inputs, seed=0)
+    all_inputs = jax.tree.map(
+        lambda x: x * 0.1
+        if hasattr(x, 'dtype') and jnp.issubdtype(x.dtype, jnp.floating)
+        else x,
+        concrete_inputs
+    )
+
     if implementation == 'cuequivariance':
       cueq = cuequivariance_jax
       if cueq is None:
@@ -136,7 +145,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           direction=all_inputs['triangle_type'],
           mask=all_inputs['mask'].astype(all_inputs['x'].dtype),
           eps=1e-6,
-          fallback=False,  # Force fallback because we are checking correctness.
+          fallback=False,
           **cueq_weights,
       )
       dynamic_args = {
