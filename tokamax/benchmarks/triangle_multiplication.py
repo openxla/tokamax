@@ -16,6 +16,7 @@
 
 import functools
 import os
+from typing import Any
 
 from absl import flags
 from absl import logging
@@ -26,7 +27,6 @@ import jax.numpy as jnp
 from tensorboardX import writer
 import tokamax
 
-from tokamax._src import numerics
 
 try:
   import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
@@ -46,143 +46,123 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
 )
 
 
-def get_example(n, c=128, h=32, d=128):
+def get_example(n, c=128, h=32, d=128, seed=0) -> Any:
   """Generates example inputs for triangle_multiplication."""
+  key = jax.random.PRNGKey(seed)
+  (
+      k_x,
+      k_mask,
+      k_p_in,
+      k_g_in,
+      k_p_out,
+      k_g_out,
+      k_ln_in_s,
+      k_ln_in_o,
+      k_ln_out_s,
+      k_ln_out_o,
+  ) = jax.random.split(key, 10)
   return {
-      'x': jax.ShapeDtypeStruct((n, n, c), dtype=jnp.bfloat16),
-      'mask': jax.ShapeDtypeStruct((n, n), dtype=jnp.bool_),
-      'projection_in_weights': jax.ShapeDtypeStruct(
-          (c, 2, h), dtype=jnp.bfloat16
+      'x': jax.random.normal(k_x, (n, n, c), dtype=jnp.bfloat16),
+      'mask': jax.random.bernoulli(k_mask, shape=(n, n)),
+      'projection_in_weights': jax.random.normal(
+          k_p_in, (c, 2, h), dtype=jnp.bfloat16
       ),
-      'gate_in_weights': jax.ShapeDtypeStruct((c, 2, h), dtype=jnp.bfloat16),
-      'projection_out_weights': jax.ShapeDtypeStruct(
-          (h, d), dtype=jnp.bfloat16
+      'gate_in_weights': jax.random.normal(
+          k_g_in, (c, 2, h), dtype=jnp.bfloat16
       ),
-      'gate_out_weights': jax.ShapeDtypeStruct((c, d), dtype=jnp.bfloat16),
-      'layernorm_in_scale': jax.ShapeDtypeStruct((c,), dtype=jnp.bfloat16),
-      'layernorm_in_offset': jax.ShapeDtypeStruct((c,), dtype=jnp.bfloat16),
-      'layernorm_out_scale': jax.ShapeDtypeStruct((h,), dtype=jnp.bfloat16),
-      'layernorm_out_offset': jax.ShapeDtypeStruct((h,), dtype=jnp.bfloat16),
+      'projection_out_weights': jax.random.normal(
+          k_p_out, (h, d), dtype=jnp.bfloat16
+      ),
+      'gate_out_weights': jax.random.normal(
+          k_g_out, (c, d), dtype=jnp.bfloat16
+      ),
+      'layernorm_in_scale': jax.random.normal(
+          k_ln_in_s, (c,), dtype=jnp.bfloat16
+      ),
+      'layernorm_in_offset': jax.random.normal(
+          k_ln_in_o, (c,), dtype=jnp.bfloat16
+      ),
+      'layernorm_out_scale': jax.random.normal(
+          k_ln_out_s, (h,), dtype=jnp.bfloat16
+      ),
+      'layernorm_out_offset': jax.random.normal(
+          k_ln_out_o, (h,), dtype=jnp.bfloat16
+      ),
       'triangle_type': 'incoming',
   }
 
 
+def convert_tokamax_weights_to_cuequivariance(
+    tokamax_weights, input_dim, hidden_dim, output_dim
+):
+  """Converts Tokamax weights to cuEquivariance format by padding."""
+  c, h, d = input_dim, hidden_dim, output_dim
+  dtype = tokamax_weights['x'].dtype
 
-def convert_tokamax_weights_to_cuequivariance(tokamax_weights, input_dim, hidden_dim, output_dim):
-    """Converts Tokamax weights to cuEquivariance format by padding."""
-    c, h, d = input_dim, hidden_dim, output_dim
-    dtype = tokamax_weights['x'].dtype
+  cueq_weights = {}
+  cueq_weights['norm_in_weight'] = tokamax_weights['layernorm_in_scale']
+  cueq_weights['norm_in_bias'] = tokamax_weights['layernorm_in_offset']
 
-    cueq_weights = {}
-    cueq_weights['norm_in_weight'] = tokamax_weights['layernorm_in_scale']
-    cueq_weights['norm_in_bias'] = tokamax_weights['layernorm_in_offset']
-
-    def pad_weights(weights):  # Shape (C, 2, H)
-        weights_concat = jnp.concatenate([weights[:, 0, :], weights[:, 1, :]], axis=1)  # (C, 2 * H)
-        padding_width = c - h
-        # Pad H to C for the second part of the 2*C dimension
-        padded = jnp.pad(
-            weights_concat,
-            ((0, 0), (0, 2 * padding_width)),
-            mode='constant',
-            constant_values=0.0,
-        )  # (C, 2 * C)
-        return padded.T  # (2 * C, C)
-
-    cueq_weights['p_in_weight'] = pad_weights(tokamax_weights['projection_in_weights'])
-    cueq_weights['g_in_weight'] = pad_weights(tokamax_weights['gate_in_weights'])
-
+  def pad_weights(weights):  # Shape (C, 2, H)
+    weights_concat = jnp.concatenate(
+        [weights[:, 0, :], weights[:, 1, :]], axis=1
+    )  # (C, 2 * H)
     padding_width = c - h
-    cueq_weights['norm_out_weight'] = jnp.pad(
-        tokamax_weights['layernorm_out_scale'], (0, padding_width), mode='constant', constant_values=0.0
-    )
-    cueq_weights['norm_out_bias'] = jnp.pad(
-        tokamax_weights['layernorm_out_offset'], (0, padding_width), mode='constant', constant_values=0.0
-    )
+    # Pad H to C for the second part of the 2*C dimension
+    padded = jnp.pad(
+        weights_concat,
+        ((0, 0), (0, 2 * padding_width)),
+        mode='constant',
+        constant_values=0.0,
+    )  # (C, 2 * C)
+    return padded.T  # (2 * C, C)
 
-    # Tokamax projection_out_weights: (H, D)
-    # cuEquivariance p_out_weight: (D, C)
-    proj_out = tokamax_weights['projection_out_weights']  # (H, D)
-    padding_width = c - h
-    proj_out_padded = jnp.pad(
-        proj_out, ((0, padding_width), (0, 0)), mode='constant', constant_values=0.0
-    )  # (C, D)
-    cueq_weights['p_out_weight'] = proj_out_padded.T  # (D, C)
+  cueq_weights['p_in_weight'] = pad_weights(
+      tokamax_weights['projection_in_weights']
+  )
+  cueq_weights['g_in_weight'] = pad_weights(tokamax_weights['gate_in_weights'])
 
-    # Tokamax gate_out_weights: (C, D)
-    # cuEquivariance g_out_weight: (D, C)
-    cueq_weights['g_out_weight'] = tokamax_weights['gate_out_weights'].T  # (D, C)
+  padding_width = c - h
+  cueq_weights['norm_out_weight'] = jnp.pad(
+      tokamax_weights['layernorm_out_scale'],
+      (0, padding_width),
+      mode='constant',
+      constant_values=0.0,
+  )
+  cueq_weights['norm_out_bias'] = jnp.pad(
+      tokamax_weights['layernorm_out_offset'],
+      (0, padding_width),
+      mode='constant',
+      constant_values=0.0,
+  )
 
-    # Biases not present in Tokamax for these layers are set to zero
-    cueq_weights['p_in_bias'] = jnp.zeros(2 * c, dtype=dtype)
-    cueq_weights['g_in_bias'] = jnp.zeros(2 * c, dtype=dtype)
-    cueq_weights['p_out_bias'] = jnp.zeros(d, dtype=dtype)
-    cueq_weights['g_out_bias'] = jnp.zeros(d, dtype=dtype)
+  # Tokamax projection_out_weights: (H, D)
+  # cuEquivariance p_out_weight: (D, C)
+  proj_out = tokamax_weights['projection_out_weights']  # (H, D)
+  padding_width = c - h
+  proj_out_padded = jnp.pad(
+      proj_out,
+      ((0, padding_width), (0, 0)),
+      mode='constant',
+      constant_values=0.0,
+  )  # (C, D)
+  cueq_weights['p_out_weight'] = proj_out_padded.T  # (D, C)
 
-    return cueq_weights
+  # Tokamax gate_out_weights: (C, D)
+  # cuEquivariance g_out_weight: (D, C)
+  cueq_weights['g_out_weight'] = tokamax_weights['gate_out_weights'].T  # (D, C)
+
+  # Biases not present in Tokamax for these layers are set to zero
+  cueq_weights['p_in_bias'] = jnp.zeros(2 * c, dtype=dtype)
+  cueq_weights['g_in_bias'] = jnp.zeros(2 * c, dtype=dtype)
+  cueq_weights['p_out_bias'] = jnp.zeros(d, dtype=dtype)
+  cueq_weights['g_out_bias'] = jnp.zeros(d, dtype=dtype)
+
+  return cueq_weights
 
 
 class TriangleMultiplicationBenchmark(parameterized.TestCase):
   """Benchmarks for different triangle_multiplication implementations."""
-
-  @classmethod
-  def setUpClass(cls):
-    super().setUpClass()
-    import subprocess
-    import sys
-    import os
-    import platform
-    import pkg_resources
-
-    print("--- Environment Diagnostics ---")
-    print(f"Python version: {sys.version}")
-    print(f"Platform: {platform.platform()}")
-    try:
-      print("--- NVIDIA-SMI ---")
-      subprocess.run(["nvidia-smi"], check=True)
-    except FileNotFoundError:
-      print("nvidia-smi not found")
-    except subprocess.CalledProcessError as e:
-      print(f"nvidia-smi failed: {e}")
-    print("--- END NVIDIA-SMI ---")
-
-    try:
-      import jax
-      print(f"JAX version: {jax.__version__}")
-      print(f"JAX devices: {jax.devices()}")
-      import jax.lib
-      print(f"JAXLIB platform version: {jax.lib.xla_bridge.get_backend().platform_version}")
-      print(f"JAX config: {jax.config.values}")
-    except Exception as e:
-      print(f"JAX info error: {e}")
-
-    required_packages = ['jax', 'jaxlib', 'jax-triton', 'triton', 'cuequivariance-jax', 'cuequivariance', 'cuda-python', 'numpy', 'scipy']
-    print("--- INSTALLED PACKAGES ---")
-    installed_packages = {pkg.key for pkg in pkg_resources.working_set}
-    for pkg in sorted(installed_packages):
-      if any(p in pkg for p in required_packages):
-            try:
-                print(f"  {pkg}=={pkg_resources.get_distribution(pkg).version}")
-            except pkg_resources.DistributionNotFound:
-                print(f"  {pkg} version not found")
-
-    print("--- END INSTALLED PACKAGES ---")
-    print("--- CUDA & JAX Detailed Debug ---")
-    print("Environment Variables:")
-    for var in ['PATH', 'LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES', 'XLA_FLAGS']:
-        print(f"  {var}={os.environ.get(var)}")
-
-    print("Which nvcc:")
-    subprocess.run(['which', 'nvcc'], check=False)
-    print("nvcc version:")
-    subprocess.run(['nvcc', '--version'], check=False)
-
-    print("Checking for libcuda.so:")
-    subprocess.run(['find', '/', '-name', 'libcuda.so*'], check=False)
-    print("Checking for libcudnn:")
-    subprocess.run(['find', '/', '-name', 'libcudnn.so*'], check=False)
-    print("--- END CUDA & JAX Detailed Debug ---")
-    print("--- End Environment Diagnostics ---")
 
   @parameterized.product(
       implementation=(None, 'xla', 'cuequivariance'),
@@ -201,9 +181,10 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
     input_dim, hidden_dim, output_dim = 128, 32, 128
     seed = 0
 
-    # Initialize all inputs once using Tokamax schema.
-    example_schema = get_example(n, input_dim, hidden_dim, output_dim)
-    all_inputs = numerics.random_initialize(example_schema, seed=seed)
+    # Initialize all inputs once.
+    all_inputs: Any = get_example(
+        n, input_dim, hidden_dim, output_dim, seed=seed
+    )
 
     if implementation == 'cuequivariance':
       cueq = cuequivariance_jax
@@ -225,16 +206,21 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           'x': all_inputs['x'],
       }
 
-      # Calculate the numeric difference vs XLA version of Tokamax.
+      # Calculate the numeric difference vs default version of Tokamax.
       out_cueq = fn_partial(**dynamic_args)
-      out_xla = tokamax.triangle_multiplication(
-          implementation='xla',
-          **all_inputs
+      out_tokamax = tokamax.triangle_multiplication(
+          implementation=None, **all_inputs
       )
 
-      diff = jnp.mean(jnp.abs(out_cueq.astype(jnp.float32) - out_xla.astype(jnp.float32)))
-      logging.info('Numeric Diff (cuEquivariance vs XLA for n=%d): %s', n, diff)
-    else:  # Tokamax implementations
+      diff = jnp.mean(
+          jnp.abs(
+              out_cueq.astype(jnp.float32) - out_tokamax.astype(jnp.float32)
+          )
+      )
+      logging.info(
+          'Numeric Diff (cuEquivariance vs Tokamax for n=%d): %s', n, diff
+      )
+    else:  # Tokamax implementation.
       fn_partial = functools.partial(
           tokamax.triangle_multiplication,
           implementation=implementation,
@@ -270,23 +256,8 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
               f'{metric_tag}/all_iterations', value, global_step=i
           )
 
-        tb_writer.flush() # <--- ADD THIS LINE
+        tb_writer.flush()
         tb_writer.close()
-        logging.info("TensorBoard log directory: %s", tblog_dir)
-        print(f"DEBUG: TensorBoard log directory: {tblog_dir}")
-        try:
-            contents = os.listdir(tblog_dir)
-            logging.info("Contents of TensorBoard log directory:")
-            print("DEBUG: Contents of TensorBoard log directory:")
-            if not contents:
-                logging.warning("TensorBoard log directory is EMPTY.")
-                print("DEBUG: TensorBoard log directory is EMPTY.")
-            for item in contents:
-                logging.info("  - %s", item)
-                print(f"  - {item}")
-        except Exception as e:
-            logging.error("Error listing TensorBoard directory contents: %s", e)
-            print(f"DEBUG: Error listing TensorBoard directory contents: {e}")
       except (OSError, IOError):
         logging.warning(
             'Failed to write to TensorBoard output directory: %s',
