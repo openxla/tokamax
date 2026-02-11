@@ -170,6 +170,20 @@ class NumericsTest(parameterized.TestCase):
 
     self.assertFalse(jnp.array_equal(a_random, a_random_2))
 
+  @parameterized.parameters(
+      ((),),
+      ((0,),),
+      ((0, 5),),
+      ((1,),),
+      ((2, 3),),
+      ((10_000_000,),),
+  )
+  def test_shapes(self, shape):
+    x = jax.ShapeDtypeStruct(shape, jnp.float32)
+    x_init = numerics.random_initialize(x)
+    self.assertEqual(x_init.shape, shape)
+    self.assertEqual(x_init.dtype, jnp.float32)
+
 
 if __name__ == '__main__':
   absltest.main()

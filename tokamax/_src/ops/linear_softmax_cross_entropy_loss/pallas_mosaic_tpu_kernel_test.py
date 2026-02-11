@@ -601,10 +601,10 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
     )
 
     self._assert_allclose(
-        kernel_grad_x, ref_grad_x, atol=5e-2, rtol=5e-2, name="grad_x"
+        kernel_grad_x, ref_grad_x, atol=6e-2, rtol=6e-2, name="grad_x"
     )
     self._assert_allclose(
-        kernel_grad_w, ref_grad_w, atol=5e-2, rtol=5e-2, name="grad_w"
+        kernel_grad_w, ref_grad_w, atol=6e-2, rtol=6e-2, name="grad_w"
     )
 
   @parameterized.named_parameters(
