@@ -54,12 +54,13 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
 
 
 def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
+  # TODO: Expand vjp search space.
   del ba
   configs = set()
   for block_q in [64, 128]:
     for block_kv in [64, 128]:
-      for num_stages in [1, 2, 3, 4]:
-        for compute_wgs in [1, 2, 3]:
+      for num_stages in [2, 3]:
+        for compute_wgs in [1, 2]:
           configs.add(
               Config(
                   block_q_dkv=block_q,
