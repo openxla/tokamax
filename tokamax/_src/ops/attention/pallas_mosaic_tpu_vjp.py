@@ -128,7 +128,7 @@ class PallasMosaicTpuFlashAttentionVjp(
         attn_logits_soft_cap=logits_soft_cap,
         **dataclasses.asdict(config),
     )
-    splash_fn, splash_config = common.build_splash_kernel(
+    splash_fn = common.build_splash_kernel(
         mask=mask,
         splash_config=splash_config,
         q_seq_len=q_seq_len,
@@ -155,7 +155,7 @@ class PallasMosaicTpuFlashAttentionVjp(
         True,  # save_residuals
         splash_fn_kwargs["mask_value"],
         is_mqa,
-        splash_config,
+        splash_fn_kwargs["config"],
         splash_fn_kwargs["mask_function"],
         splash_fn_kwargs["fwd_mask_sparsity"],
         splash_fn_kwargs["dkv_mask_sparsity"],

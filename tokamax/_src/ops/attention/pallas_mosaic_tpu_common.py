@@ -69,8 +69,8 @@ def build_splash_kernel(
     kv_seq_len: int,
     is_mqa: bool,
     save_residuals: bool,
-) -> tuple[splash.SplashAttentionKernel, splash.SplashConfig]:
-  """Returns the SplashAttention kernel and config."""
+) -> splash.SplashAttentionKernel:
+  """Returns the SplashAttention kernel."""
 
   # TODO: support multiple shards.
   shard_count = 1
@@ -115,7 +115,7 @@ def build_splash_kernel(
       mask_value=float(jnp.finfo(jnp.float32).min),
       downcast_smem_data=False,
   )
-  return splash_fn, splash_config
+  return splash_fn
 
 
 

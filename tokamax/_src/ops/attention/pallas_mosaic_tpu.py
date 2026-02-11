@@ -132,7 +132,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         attn_logits_soft_cap=logits_soft_cap,
         **dataclasses.asdict(config),
     )
-    splash_fn, _ = common.build_splash_kernel(
+    splash_fn = common.build_splash_kernel(
         mask=mask,
         splash_config=splash_config,
         q_seq_len=q_seq_len,

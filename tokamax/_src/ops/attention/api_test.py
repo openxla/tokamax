@@ -255,11 +255,6 @@ class DotProductAttentionTest(parameterized.TestCase):
     dQ_ans, dK_ans, dV_ans, dbias_ans = sdpa_vjp_ans(dout)[:4]
 
     chex.assert_trees_all_close(out_ans, out_ref, atol=0.01, rtol=0.01)
-    # TODO: Renable this test once the bug is fixed.
-    if jax.default_backend() == 'tpu' and mask_mode == ('causal', 'custom'):
-      self.skipTest(
-          'Skip test. Mosaic TPU attention fails with custom + causal mask.'
-      )
     chex.assert_trees_all_close(dQ_ans, dQ_ref, rtol=0.02, atol=0.02)
     chex.assert_trees_all_close(dK_ans, dK_ref, rtol=0.02, atol=0.02)
     chex.assert_trees_all_close(dV_ans, dV_ref, rtol=0.01, atol=0.015)
