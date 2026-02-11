@@ -16,6 +16,8 @@
 
 import functools
 import os
+import subprocess
+import sys
 from typing import Any
 
 from absl import flags
@@ -27,6 +29,21 @@ import jax.numpy as jnp
 from tensorboardX import writer
 import tokamax
 
+
+print(f"JAX Backend: {jax.default_backend()}")
+print(f"JAX Devices: {jax.devices()}")
+
+# detailed debug of what pip actually installed
+try:
+  subprocess.check_call([sys.executable, "-m", "pip", "list"])
+  subprocess.check_call([sys.executable, "-m", "pip", "show", "jax", "jaxlib"])
+except Exception:  # pylint: disable=broad-except
+  pass
+
+if jax.default_backend() != "gpu" and jax.default_backend() != "tpu":
+  logging.warning(
+      "Critical: GPU/TPU not found. JAX is running on %s", jax.default_backend()
+  )
 
 try:
   import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
@@ -166,10 +183,13 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
     )
 
     # [Improvement 1]: Cast inputs to Float32 for correctness verification
-    # We can cast them back to bf16 if we specifically want to benchmark speed later,
-    # but for numeric diff, we need stability.
+    # We use hasattr(x, 'dtype') to skip the 'triangle_type' string
     all_inputs_f32 = jax.tree.map(
-        lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+        lambda x: (
+            x.astype(jnp.float32)
+            if hasattr(x, 'dtype') and x.dtype == jnp.bfloat16
+            else x
+        ),
         all_inputs,
     )
 

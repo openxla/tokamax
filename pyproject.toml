@@ -41,11 +41,10 @@ test = [
 ]
 
 bench = [
-    "tokamax[cuda]",
     "google-benchmark>=1.9.0",
     "xprof",
     "cuequivariance-jax>=0.8.1", # Updated
-    "jax-triton==0.3.0", # Pin to the latest available version
+    "jax-triton>=0.3.0", # Pin to the latest available version
     "triton>=3.0.0", # Updated
 ]
 
