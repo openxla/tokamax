@@ -136,6 +136,7 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
+    workload_action_inputs { key: "extras" value: "bench,cuda" }
   }
 
   environment_configs {
@@ -144,6 +145,7 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
+    workload_action_inputs { key: "extras" value: "bench,cuda" }
   }
 
   environment_configs {

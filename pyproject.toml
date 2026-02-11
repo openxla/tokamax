@@ -43,7 +43,6 @@ test = [
 ]
 
 bench = [
-    "tokamax[cuda]",
     "google-benchmark>=1.9.0",
     "xprof",
     "cuequivariance-jax>=0.8.1", # Updated
