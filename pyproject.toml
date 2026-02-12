@@ -58,16 +58,14 @@ bench = [
     "google-benchmark>=1.9.0",
     "xprof",
     "cuequivariance-jax>=0.8.1",
-    "jax-triton>=0.3.0",
-    "triton>=3.0.0",
 ]
 
 cuda = [
-    "jax[cuda13_pip]>=0.8.0",
+    "jax[cuda13]>=0.8.2",
 ]
 
 tpu = [
-    "jax[tpu]>=0.8.0",
+    "jax[tpu]>=0.8.2",
     "hypothesis",
 ]
 

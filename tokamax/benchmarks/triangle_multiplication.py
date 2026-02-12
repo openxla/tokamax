@@ -145,7 +145,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           direction=all_inputs['triangle_type'],
           mask=all_inputs['mask'].astype(all_inputs['x'].dtype),
           eps=1e-6,
-          fallback=False,
+          fallback=True,
           **cueq_weights,
       )
       dynamic_args = {
