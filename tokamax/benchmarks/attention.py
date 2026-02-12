@@ -103,6 +103,12 @@ class AttentionBenchmark(parameterized.TestCase):
     fn = jax.jit(fn)
     bench = benchmarking.compile_benchmark(fn, args)
     res = bench(args)
+
+    res_wallclock = bench(args, timing_method='wallclock')
+    logging.info(
+        'wallclock_median_time_ms: %s', res_wallclock.median_evaluation_time_ms
+    )
+
     metric_tag = f"attention/{implementation or 'default'}/{benchmark_mode}"
     tblog_dir = os.environ.get(_TENSORBOARD_OUTPUT_ENV_VAR.value)
 
