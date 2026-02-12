@@ -42,7 +42,6 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
 
     @functools.partial(
         pl.pallas_call,
-        backend="mosaic_gpu",
         out_shape=jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn),
         in_specs=(pl.BlockSpec(memory_space=plgpu.GMEM),),
         out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
@@ -84,7 +83,6 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
 
     @functools.partial(
         pl.pallas_call,
-        backend="mosaic_gpu",
         in_specs=(
             plgpu.BlockSpec(memory_space=plgpu.SMEM, transforms=f8_transforms),
             plgpu.BlockSpec(memory_space=plgpu.SMEM, transforms=i4_transforms),
