@@ -20,7 +20,6 @@ import chex
 import jax
 from jax.experimental import mesh_utils
 import jax.numpy as jnp
-
 from tokamax._src import gpu_utils
 from tokamax._src.ops.attention import api
 
@@ -33,7 +32,10 @@ class ApiShardingTest(parameterized.TestCase):
 
   @parameterized.parameters(*api.IMPLEMENTATIONS)
   def test_dot_product_attention_sharding(self, implementation):
-    if implementation == 'mosaic' and not gpu_utils.has_mosaic_gpu_support():
+    if (
+        implementation == 'mosaic_gpu'
+        and not gpu_utils.has_mosaic_gpu_support()
+    ):
       self.skipTest('Mosaic not supported on this platform.')
     if implementation == 'triton' and not gpu_utils.has_triton_support():
       self.skipTest('Triton not supported on this platform.')
