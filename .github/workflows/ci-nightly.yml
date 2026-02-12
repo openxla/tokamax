@@ -27,7 +27,7 @@ jobs:
   tokamax-nightly-attention-tests:
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu', 'linux-x86-a4-224-b200-1gpu']
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -53,7 +53,7 @@ jobs:
   tokamax-nightly-ops-tests:
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu', 'linux-x86-a4-224-b200-1gpu']
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -79,7 +79,7 @@ jobs:
   tokamax-nightly-tests:
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu', 'linux-x86-a4-224-b200-1gpu']
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
