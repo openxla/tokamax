@@ -16,6 +16,8 @@
 
 import functools
 import os
+import ctypes
+import importlib
 from typing import Any
 
 from absl import flags
@@ -28,6 +30,22 @@ from tensorboardX import writer
 import tokamax
 from tokamax._src import numerics
 
+# --- HOTFIX: Preload NVIDIA pip libraries for cuEquivariance ---
+# cuEquivariance expects system-level CUDA, but JAX installs them
+# via pip wheels. We load them into the global symbol table so
+# the dynamic linker can find them during the cuEq import.
+for pkg_name, lib_name in [
+    ('cuda_nvrtc', 'libnvrtc.so.12'),
+    ('cuda_runtime', 'libcudart.so.12'),
+    ('cublas', 'libcublas.so.12'),
+]:
+  try:
+    pkg = importlib.import_module(f"nvidia.{pkg_name}")
+    lib_path = os.path.join(os.path.dirname(pkg.__file__), 'lib', lib_name)
+    ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+  except Exception:  # pylint: disable=broad-except
+    pass
+# ---------------------------------------------------------------
 
 try:
   import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
