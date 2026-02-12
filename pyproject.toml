@@ -21,8 +21,8 @@ requires-python = ">=3.11"
 dependencies = [
     "absl-py>=2.3.0",
     "einshape",
-    "jax>=0.8.2",
-    "jaxlib>=0.8.2",
+    "jax>=0.6.0,<0.8.0",       # DOWNGRADE: Pin to 0.7.x (Goldilocks zone)
+    "jaxlib>=0.6.0,<0.8.0",    # DOWNGRADE: Pin to 0.7.x
     "jaxtyping>=0.3",
     "pydantic>=2.11.0",
     "qwix>=0.1.2",
@@ -61,11 +61,16 @@ bench = [
 ]
 
 cuda = [
-    "jax[cuda13]>=0.8.2",
+    "jax[cuda13]",                         # Use CUDA 13 wheels (Compatible with JAX 0.7.x)
+    "nvidia-cudnn-cu12>=9.0.0",
+    "jax-triton>=0.3.0",                   # Required for Triton kernel
+    "triton>=3.0.0",                       # Required for Triton kernel
+    "cuequivariance-ops-cu12>=0.8.1",      # The actual kernel ops
+    "cuequivariance-ops-jax-cu12>=0.8.1",  # The JAX bindings
 ]
 
 tpu = [
-    "jax[tpu]>=0.8.2",
+    "jax[tpu]",
     "hypothesis",
 ]
 

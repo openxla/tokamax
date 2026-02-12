@@ -16,6 +16,9 @@
 
 import functools
 import os
+import sys
+import glob
+import ctypes
 from typing import Any
 
 from absl import flags
@@ -28,6 +31,22 @@ from tensorboardX import writer
 import tokamax
 from tokamax._src import numerics
 
+# --- HOTFIX: Preload NVIDIA pip libraries for cuEquivariance ---
+# We are running JAX < 0.8 (CUDA 13 wheels) in a CUDA 13 container.
+# However, cuEquivariance ops are compiled for CUDA 12.
+# This hack forces the linker to find the CUDA 12 libraries in site-packages.
+for p in sys.path:
+  nvidia_dir = os.path.join(p, 'nvidia')
+  if os.path.exists(nvidia_dir):
+    for pkg_dir in ['cuda_nvrtc', 'cuda_runtime', 'cublas']:
+      lib_dir = os.path.join(nvidia_dir, pkg_dir, 'lib')
+      if os.path.exists(lib_dir):
+        for so_file in glob.glob(os.path.join(lib_dir, '*.so*')):
+          try:
+            ctypes.CDLL(so_file, mode=ctypes.RTLD_GLOBAL)
+          except Exception:
+            pass
+# ---------------------------------------------------------------
 
 try:
   import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
@@ -145,7 +164,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           direction=all_inputs['triangle_type'],
           mask=all_inputs['mask'].astype(all_inputs['x'].dtype),
           eps=1e-6,
-          fallback=True,
+          fallback=False,
           **cueq_weights,
       )
       dynamic_args = {
