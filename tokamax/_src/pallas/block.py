@@ -270,7 +270,6 @@ def pallas_call(
     in_specs: Any = pl.no_block_spec,
     out_specs: Any = pl.no_block_spec,
     filter_specs: bool = False,
-    backend="triton",
     **kwargs,
 ) -> Callable[..., Any]:
   """Invokes `pallas_call`, wrapping refs with a `BlockSpec` as `BlockRef`s."""
@@ -339,11 +338,7 @@ def pallas_call(
         scratch_shapes=grid_spec.scratch_shapes,
     )
     return pl.pallas_call(
-        wrapped_kernel,
-        out_shape,
-        grid_spec=grid_spec,
-        backend=backend,
-        **kwargs,
+        wrapped_kernel, out_shape, grid_spec=grid_spec, **kwargs
     )(*args)
 
   return helper
