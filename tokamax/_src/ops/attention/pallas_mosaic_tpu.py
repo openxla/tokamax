@@ -29,7 +29,6 @@ from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 from typing_extensions import override
 
 
@@ -48,7 +47,7 @@ class Config:
   k_layout: splash.QKVLayout
   v_layout: splash.QKVLayout
   use_experimental_scheduler: bool
-  use_base2_exp: bool
+  use_base2_exp: bool = True
 
   def __post_init__(self):
     if self.block_kv % self.block_kv_compute:
@@ -185,8 +184,8 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     q, k = ba.arguments['q'], ba.arguments['k']
     q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
-    kernel_default_config = splash.SplashConfig.get_default()
-    tiles = [128, 256, 512, 1024, 2048, 4096, 8192]
+    # TODO: Add 8192 once autotuning bugs are fixed.
+    tiles = [128, 256, 512, 1024, 2048, 4096]
     layouts = [splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR]
     schedulers = [True, False]
     config = set()
@@ -199,20 +198,18 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         layouts,
         schedulers,
     ):
-      if bkv % bkv_c != 0 or bq > q_seq_len or bkv > kv_seq_len:
-        continue
-      config.add(
-          Config(
-              block_q=bq,
-              block_kv=bkv,
-              block_kv_compute=bkv_c,
-              q_layout=ql,
-              k_layout=kl,
-              v_layout=vl,
-              use_experimental_scheduler=sched,
-              use_base2_exp=kernel_default_config.use_base2_exp,
-          )
-      )
+      if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
+        config.add(
+            Config(
+                block_q=bq,
+                block_kv=bkv,
+                block_kv_compute=bkv_c,
+                q_layout=ql,
+                k_layout=kl,
+                v_layout=vl,
+                use_experimental_scheduler=sched,
+            )
+        )
     return config
 
   @override

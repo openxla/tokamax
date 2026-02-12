@@ -16,6 +16,7 @@
 
 import dataclasses
 import functools
+import itertools
 from typing import Any, ClassVar, Final, TypeAlias
 
 import immutabledict
@@ -202,7 +203,25 @@ class PallasMosaicTpuFlashAttentionVjp(
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    return set()
+    q, k = ba.args[3], ba.args[4]
+    q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
+    # TODO: Add 256, 8192 once autotuning bugs are fixed.
+    tiles = [512, 1024, 2048, 4096]
+    configs = set()
+    for bq, bkv, bkv_c in itertools.product(
+        tiles,
+        tiles,
+        tiles,
+    ):
+      if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
+        configs.add(
+            Config(
+                block_q_dkv=bq,
+                block_kv_dkv=bkv,
+                block_kv_dkv_compute=bkv_c,
+            )
+        )
+    return configs
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

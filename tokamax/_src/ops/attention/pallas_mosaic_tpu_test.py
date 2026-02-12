@@ -15,6 +15,7 @@
 
 
 import functools
+import typing
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -23,6 +24,7 @@ import jax.numpy as jnp
 from tokamax._src import numerics
 from tokamax._src.ops.attention import base as fa_base
 from tokamax._src.ops.attention import pallas_mosaic_tpu as fa
+from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp as fa_vjp
 
 
 class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
@@ -33,7 +35,7 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
     super().setUp()
 
   def _test_attention(
-      self, q, k, v, do, mask, is_causal, logits_soft_cap, config=None
+      self, q, k, v, do, mask, is_causal, logits_soft_cap, config=None, vjp_config=None
   ):
     kwargs = dict(
         mask=mask,
@@ -41,7 +43,8 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
         logits_soft_cap=logits_soft_cap,
         logits_scale=0.1,
     )
-    attention_impl = fa.PallasMosaicTpuFlashAttention(config=config)
+    vjp = fa_vjp.PallasMosaicTpuFlashAttentionVjp(config=vjp_config)
+    attention_impl = fa.PallasMosaicTpuFlashAttention(config=config, vjp=vjp)
 
     @jax.jit
     def f_base(query, key, value, do):
@@ -153,6 +156,75 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
             is_causal=False,
             logits_soft_cap=None,
             config=config,
+        )
+
+  def test_autotune_vjp(self):
+    head_dim = 128
+    q_seq_len = 512
+    kv_seq_len = 512
+    num_q_heads = 4
+    num_kv_heads = 4
+    batch_size = 2
+    dtype = jnp.float32
+
+    q_shape = (batch_size, q_seq_len, num_q_heads, head_dim)
+    k_shape = (batch_size, kv_seq_len, num_kv_heads, head_dim)
+    v_shape = (batch_size, kv_seq_len, num_kv_heads, head_dim)
+
+    q = jax.ShapeDtypeStruct(q_shape, dtype)
+    k = jax.ShapeDtypeStruct(k_shape, dtype)
+    v = jax.ShapeDtypeStruct(v_shape, dtype)
+    do = jax.ShapeDtypeStruct(q_shape, dtype=jnp.float32)
+    q, k, v, do = numerics.random_initialize((q, k, v, do))
+
+    residuals = (
+        jnp.zeros((batch_size, num_q_heads, q_seq_len), dtype=jnp.float32),
+        jnp.zeros((batch_size, num_q_heads, q_seq_len), dtype=jnp.float32),
+    )
+    out = jnp.zeros(q_shape, dtype=jnp.float32)
+
+    attention_fn = fa.PallasMosaicTpuFlashAttention()
+    vjp_op = typing.cast(
+        fa_vjp.PallasMosaicTpuFlashAttentionVjp, attention_fn.vjp
+    )
+    bound_args = vjp_op.bind(
+        residuals,
+        out,
+        do,
+        q,
+        k,
+        v,
+        bias=None,
+        logits_scale=0.1,
+        mask=fa_base.Mask(),
+        precision=(
+            jax.lax.DotAlgorithmPreset.DEFAULT,
+            jax.lax.DotAlgorithmPreset.DEFAULT,
+        ),
+        logits_dtype=jnp.float32,
+        logits_soft_cap=None,
+        dropout_mask=None,
+        dropout_rate=0.0,
+        paging_info=None,
+        q_indices=None,
+        k_indices=None,
+        normalize_output=True,
+        return_residuals=False,
+    )
+    configs = vjp_op._get_autotuning_configs(bound_args)
+    self.assertNotEmpty(configs)
+
+    for config in configs:
+      with self.subTest(f'{config=}'):
+        self._test_attention(
+            q,
+            k,
+            v,
+            do,
+            mask=None,
+            is_causal=False,
+            logits_soft_cap=None,
+            vjp_config=config,
         )
 
 
