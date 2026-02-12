@@ -235,7 +235,7 @@ def flash_attention_kernel(
       return lb, ub, k_start_max, k_end_min
 
     @pl.when(wg < 2)
-    def _compute_wg():
+    def compute_wg():
       q_base = (2 * qi + wg) * block_q
       qs = pl.ds(q_base, block_q)
 
@@ -419,7 +419,7 @@ def flash_attention_kernel(
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     @pl.when(wg == 2)
-    def _memory_wg():
+    def memory_wg():
       plgpu.set_max_registers(40, action="decrease")
       hi_kv = lax.div(hi, q_heads_per_kv_head)
       qs = block.ds(qi, 2 * block_q)
@@ -443,7 +443,7 @@ def flash_attention_kernel(
       lb, ub, _, _ = get_kv_ranges()
 
       @pl.loop(lb, lax.min(lb + max_stages, ub))
-      def _preload_kv_bias_mask(ki):
+      def prologue(ki):
         si = lax.rem(ki, max_stages)
         ks = block.ds(ki, block_kv)
         cp(k_gmem.at[ks, hi_kv], k_smems, k_barriers, si)
@@ -454,7 +454,7 @@ def flash_attention_kernel(
         cp(v_gmem.at[ks, hi_kv], v_smems, v_barriers, si)
 
       @pl.loop(lb, ub - max_stages)
-      def _kv_loop(ki):
+      def kv_loop(ki):
         si = lax.rem(ki, max_stages)
         ks = block.ds(ki + max_stages, block_kv)
         plgpu.barrier_wait(k_consumed_barriers.at[si])
