@@ -184,17 +184,17 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
         @pl.when(wg == _EPILOGUE_WG)
         def epilogue_wg():
           si = lax.rem(carry, jnp.int32(2))
-          plgpu.wait_smem_to_gmem(0, wait_read_only=True)
           plgpu.barrier_wait(acc_barrier.at[si])
           with jax.named_scope("tmem -> smem"):
             acc = plgpu.async_load_tmem(
                 acc_tmem.at[:, pl.ds(si * block_m, block_m)], layout=_TCGEN05
             )
-            plgpu.wait_load_tmem()
             if activation is not None:
               acc = activation(acc)
             acc = acc.astype(acc_smem.dtype)
             acc_smem.T[...] = plgpu.layout_cast(acc, _TCGEN05_TRANSPOSED)
+            plgpu.wait_load_tmem()
+            plgpu.barrier_arrive(acc_consumed_barrier.at[si])
             plgpu.commit_smem()
 
           with jax.named_scope("smem -> gmem"):
@@ -212,12 +212,14 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
                     pl.ds(block_start + offset, size),
                     pl.ds(ni * block_n + cluster_idx * tile_n, tile_n),
                 ]
-                plgpu.copy_smem_to_gmem(out_smem_slice, o_gref_slice)
+                plgpu.copy_smem_to_gmem(
+                    out_smem_slice, o_gref_slice, commit_group=False
+                )
 
               offset += actual_size & size
               size //= 2
-            plgpu.wait_smem_to_gmem(0)
-            plgpu.barrier_arrive(acc_consumed_barrier.at[si])
+            plgpu.commit_smem_to_gmem_group()
+            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
       return carry + (actual_size > 0)
 
