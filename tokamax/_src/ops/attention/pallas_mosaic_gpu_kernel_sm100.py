@@ -70,8 +70,6 @@ class Config(common.ConfigBase):
     collective: if True - 2 CTA MMA will be run with M=256, N=128
   """
 
-  # TODO: Relax block size constraints to multiple of 32.
-  block_d: pydantic.conint(multiple_of=8, gt=0) = 128
   num_tma_splits: pydantic.PositiveInt = 2
   collective: pydantic.StrictBool = True
 
@@ -118,7 +116,6 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   return Config(
       block_q=block_q,
       block_kv=block_kv,
-      block_d=128,
       collective=collective,
       num_stages=num_stages,
       num_tma_splits=num_tma_splits,
@@ -651,11 +648,11 @@ def flash_attention_kernel(
           @pl.loop(0, num_tma_splits)
           def tma_loop(i):
             tma_chunk_size = head_dim_out // num_tma_splits
-            block_d = min(config.block_d, tma_chunk_size)
+            block_d = min(128, tma_chunk_size)
 
-            @pl.loop(0, tma_chunk_size // block_d)
+            @pl.loop(0, tma_chunk_size, step=block_d)
             def tmem_loop(j):
-              ds = pl.ds(i * tma_chunk_size + j * block_d, block_d)
+              ds = pl.ds(i * tma_chunk_size + j, block_d)
               acc = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
               acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
               plgpu.async_store_tmem(acc_tmem.at[:, ds], acc)
