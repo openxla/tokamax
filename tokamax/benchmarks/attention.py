@@ -104,7 +104,7 @@ class AttentionBenchmark(parameterized.TestCase):
     bench = benchmarking.compile_benchmark(fn, args)
     res = bench(args)
 
-    res_wallclock = bench(args, timing_method='wallclock')
+    res_wallclock = bench(args, method='wallclock')
     logging.info(
         'wallclock_median_time_ms: %s', res_wallclock.median_evaluation_time_ms
     )
