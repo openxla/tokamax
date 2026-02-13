@@ -69,14 +69,6 @@ class AttentionBenchmark(parameterized.TestCase):
     ):
       self.skipTest('Skipping cudnn forward_and_vjp on B200.')
 
-    # TODO: Re-enable once the bug is fixed.
-    if (
-        implementation == 'xla_chunked'
-        and benchmark_mode == 'forward_and_vjp'
-        and 'gpu' == jax.default_backend()
-    ):
-      self.skipTest('Skipping xla_chunked forward_and_vjp on GPU.')
-
     # TODO: Re-enable once Mosaic GPU supports VJP on B200.
     if (
         implementation in ('mosaic', None)
