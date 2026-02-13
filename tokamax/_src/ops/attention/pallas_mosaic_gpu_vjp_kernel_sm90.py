@@ -39,17 +39,83 @@ _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_TRANSPOSED = plgpu.Layout.WGMMA_TRANSPOSED
+_SMEM_SIZE_BYTES = 227 * 1024
+_F32_BYTES = 4
 _load_bcast = common.load_bcast
 
 
+def _estimate_dq_smem_bytes(ba, block_q, block_kv, num_stages):
+  """Estimates the dq kernel smem usage in bytes for a given configuration."""
+  _, _, _, q, k, v = ba.args
+  tile_q = 2 * block_q
+
+  # 32-bit floats are downcast to 16-bit before the kernel call.
+  dtype_bits = jnp.finfo(jnp.bfloat16).bits
+  block_d = pl.cdiv(q.shape[-1], 64) * 64
+  block_d_out = v.shape[-1]
+  bytes_per_stage = block_kv * (block_d + block_d_out) * dtype_bits // 8  # k,v
+  if (bias := ba.kwargs["bias"]) is not None:
+    if bias.shape[-2] != 1 and bias.shape[-1] != 1:
+      bytes_per_stage += tile_q * block_kv * jnp.finfo(bias.dtype).bits // 8
+
+  mask = ba.kwargs["mask"]
+  q_indices = ba.kwargs["q_indices"]
+  k_indices = ba.kwargs["k_indices"]
+  mask, *_ = jax.eval_shape(
+      common.decompose_mask, mask, q, k, q_indices, k_indices
+  )
+  if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
+    bytes_per_stage += tile_q * block_kv
+
+  return (
+      (tile_q * (block_d + block_d_out) * dtype_bits // 8)  # q, dout
+      + 3 * tile_q * _F32_BYTES  # m, l, delta
+      + num_stages * bytes_per_stage
+  )
+
+
+def _estimate_dkv_smem_bytes(ba, block_q, block_kv, num_stages):
+  """Estimates the dkv kernel smem usage in bytes for a given configuration."""
+  _, _, _, q, k, v = ba.args
+  tile_kv = 2 * block_kv
+
+  # 32-bit floats are downcast to 16-bit before the kernel call.
+  dtype_bits = jnp.finfo(jnp.bfloat16).bits
+  block_d = pl.cdiv(q.shape[-1], 64) * 64
+  block_d_out = v.shape[-1]
+  bytes_per_stage = block_q * (block_d + block_d_out) * dtype_bits // 8  # q, do
+  bytes_per_stage += 3 * block_q * _F32_BYTES  # m, l, delta
+  if (bias := ba.kwargs["bias"]) is not None:
+    if bias.shape[-2] != 1 and bias.shape[-1] != 1:
+      bytes_per_stage += block_q * tile_kv * jnp.finfo(bias.dtype).bits // 8
+
+  mask = ba.kwargs["mask"]
+  q_indices = ba.kwargs["q_indices"]
+  k_indices = ba.kwargs["k_indices"]
+  mask, *_ = jax.eval_shape(
+      common.decompose_mask, mask, q, k, q_indices, k_indices
+  )
+  if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
+    bytes_per_stage += block_q * tile_kv
+
+  return (
+      tile_kv * (block_d + block_d_out) * dtype_bits // 8
+  ) + num_stages * bytes_per_stage  # k, v
+
+
 def get_heuristics_config(ba: op.BoundArguments) -> Config:
-  del ba
+  num_stages = 2
+  if _estimate_dq_smem_bytes(ba, 64, 64, 2) > _SMEM_SIZE_BYTES:
+    num_stages = 1
+  if _estimate_dkv_smem_bytes(ba, 64, 64, 2) > _SMEM_SIZE_BYTES:
+    num_stages = 1
+
   return Config(
       block_q_dkv=64,
       block_kv_dkv=64,
       block_q_dq=64,
       block_kv_dq=64,
-      num_stages=2,
+      num_stages=num_stages,
   )
 
 
