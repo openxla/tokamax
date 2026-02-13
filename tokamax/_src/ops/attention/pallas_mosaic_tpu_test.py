@@ -87,16 +87,15 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
 
   @parameterized.product(
       dtype=[jnp.float32],
-      is_mqa=[False, True],
+      num_kv_heads=[1, 2, 4],
       masking=[None, 'causal', 'bool'],
       logits_soft_cap=[None, 3.4],
   )
-  def test_simple(self, dtype, is_mqa, masking, logits_soft_cap):
+  def test_simple(self, dtype, num_kv_heads, masking, logits_soft_cap):
     head_dim = 32
     q_seq_len = 128
     kv_seq_len = 128
     num_q_heads = 4
-    num_kv_heads = 1 if is_mqa else num_q_heads
     batch_size = 2
 
     q = jax.ShapeDtypeStruct(

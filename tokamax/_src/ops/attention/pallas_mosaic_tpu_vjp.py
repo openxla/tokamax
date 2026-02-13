@@ -119,11 +119,9 @@ class PallasMosaicTpuFlashAttentionVjp(
         lambda x: jnp.swapaxes(x, 1, 2), (q_4d, k_4d, v_4d, dout_4d, out_4d)
     )
 
-    is_mqa = num_q_heads != num_kv_heads
+    is_mqa = num_kv_heads == 1
     if num_q_heads % num_kv_heads:
       raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
-    if is_mqa and num_kv_heads != 1:
-      raise NotImplementedError("Grouped query attention is not implemented.")
     splash_config = dataclasses.replace(
         splash.SplashConfig.get_default(),
         attn_logits_soft_cap=logits_soft_cap,

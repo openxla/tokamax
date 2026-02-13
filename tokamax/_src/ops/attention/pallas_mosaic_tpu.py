@@ -121,11 +121,9 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     # the inputs, which introduces overhead.
     q, k, v = map(lambda x: jnp.swapaxes(x, 1, 2), (q, k, v))
 
-    is_mqa = num_q_heads != num_kv_heads
+    is_mqa = num_kv_heads == 1
     if num_q_heads % num_kv_heads:
       raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
-    if is_mqa and num_kv_heads != 1:
-      raise NotImplementedError("Grouped query attention is not implemented.")
     splash_config = dataclasses.replace(
         splash.SplashConfig.get_default(),
         attn_logits_soft_cap=logits_soft_cap,

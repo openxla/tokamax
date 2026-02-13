@@ -45,12 +45,6 @@ class DotProductAttentionTest(parameterized.TestCase):
   def test_dot_product_attention(self, dtype, group_num, use_vmap):
 
     if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
-      # TODO: Remove once grouped attention is supported on Mosaic
-      # TPU attention.
-      if group_num == 2:
-        self.skipTest(
-            'Group attention is not supported on Mosaic TPU attention.'
-        )
       if dtype == jnp.float16:
         self.skipTest(
             'FP16 precision is not supported on Mosaic TPU attention.'
