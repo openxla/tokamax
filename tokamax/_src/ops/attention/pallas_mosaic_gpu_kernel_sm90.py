@@ -52,11 +52,20 @@ class Config(common.ConfigBase):
   pass
 
 
-def get_heuristics_config(ba: op.BoundArguments) -> Config:
-  """Returns a heuristic configuration for flash attention on SM90 GPUs."""
+def _estimate_shared_mem_usage_bytes(ba, block_q, block_kv, num_stages):
+  """Estimates the shared memory usage in bytes for a given configuration."""
   q, k, v = ba.args
-  head_dim = k.shape[-1]
-  head_dim_out = v.shape[-1]
+  tile_q = 2 * block_q
+
+  # 32-bit floats are downcast to 16-bit before the kernel call.
+  dtype_bits = jnp.finfo(jnp.bfloat16).bits
+  m = 8 * _MIN_SWIZZLE // dtype_bits
+  block_d = pl.cdiv(q.shape[-1], m) * m
+  block_d_out = v.shape[-1]
+  bytes_per_stage = block_kv * block_d_out * dtype_bits // 8
+  if (bias := ba.kwargs["bias"]) is not None:
+    if bias.shape[-2] != 1 and bias.shape[-1] != 1:
+      bytes_per_stage += tile_q * block_kv * jnp.finfo(bias.dtype).bits // 8
 
   mask = ba.kwargs["mask"]
   q_indices = ba.kwargs["q_indices"]
@@ -64,28 +73,21 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   mask, *_ = jax.eval_shape(
       common.decompose_mask, mask, q, k, q_indices, k_indices
   )
-  # 32-bit floats are downcast to 16-bit before the kernel call.
-  dtype_bits = jnp.finfo(jnp.bfloat16).bits
+  if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
+    bytes_per_stage += tile_q * block_kv
 
-  def shared_mem_usage_bytes(block_q, block_kv, num_stages):
-    bytes_per_stage = (
-        block_kv * head_dim * dtype_bits // 8
-        + block_kv * head_dim_out * dtype_bits // 8
-    )
-    if (bias := ba.kwargs["bias"]) is not None:
-      bytes_per_stage += (
-          2 * block_q * block_kv * jnp.finfo(bias.dtype).bits // 8
-      )
-    # FIXME: This is an overestimate for broadcast masks.
-    if mask is not None:
-      bytes_per_stage += 2 * block_q * block_kv
-    return (
-        2 * block_q * head_dim * dtype_bits // 8
-        + num_stages * bytes_per_stage
-        + 1000  # Add some extra for barriers.
-    )
+  # `q`/`k` and the outputs are in a union.
+  q_k_elems = (tile_q + num_stages * block_kv) * block_d
+  out_elems = tile_q * block_d_out
+  return (
+      (max(q_k_elems, out_elems) * dtype_bits // 8)
+      + num_stages * bytes_per_stage
+      + 2200  # Add some extra for barriers, etc. (slight overestimate).
+  )
 
-  if shared_mem_usage_bytes(64, 128, 2) < 227 * 1024:
+
+def get_heuristics_config(ba: op.BoundArguments) -> Config:
+  if _estimate_shared_mem_usage_bytes(ba, 64, 128, 2) < 227 * 1024:
     return Config(block_q=64, block_kv=128, num_stages=2)
 
   # This is a pretty good option that works for most cases.
