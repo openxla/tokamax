@@ -83,22 +83,24 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   m_iters = pl.cdiv(m, block_m) + num_groups - 1
   n_iters = pl.cdiv(n, block_n)
 
-  def kernel(*refs, scoped):
-    (
-        x_gmem,
-        w_gmem,
-        _,
-        group_id_gmem,
-        start_within_block_gmem,
-        actual_size_gmem,
-        block_start_gmem,
-        out_gmem,
-    ) = refs
-    (
-        (x_smem, w_smem, acc_smem, acc_tmem),
-        (xw_barrier, xw_consumed_barrier, acc_barrier, acc_consumed_barrier),
-    ) = scoped
-
+  def kernel(
+      x_gmem,
+      w_gmem,
+      _,
+      group_id_gmem,
+      start_within_block_gmem,
+      actual_size_gmem,
+      block_start_gmem,
+      out_gmem,
+      x_smem,
+      w_smem,
+      acc_smem,
+      acc_tmem,
+      xw_barrier,
+      xw_consumed_barrier,
+      acc_barrier,
+      acc_consumed_barrier,
+  ):
     m, k = x_gmem.shape
     ub = pl.cdiv(k, block_k)
     cluster_idx = lax.axis_index("x")
@@ -223,55 +225,54 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
       return carry + (actual_size > 0)
 
-  def kernel_entry(*refs):
+  def tiled_smem(shape, dtype, what=""):
+    transforms = common.tile_swizzle_transforms(shape, dtype, what)
+    return plgpu.SMEM(shape, dtype, transforms=transforms)
 
-    def tiled_smem(shape, dtype, what=""):
-      transforms = common.tile_swizzle_transforms(shape, dtype, what)
-      return plgpu.SMEM(shape, dtype, transforms=transforms)
+  acc_smem = plgpu.SMEM(
+      (block_m, tile_n),
+      dtype=out_dtype,
+      # workaround for ValueError: Dynamic slice base index (which is a
+      # dynamic value) cannot be statically proven to be divisible by
+      # the tiling (8)
+      transforms=(
+          plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
+          plgpu.SwizzleTransform(128),
+      ),
+  )
 
-    x_smem = tiled_smem((num_stages, tile_m, block_k), x.dtype, "x")
-    w_smem = tiled_smem((num_stages, tile_n, block_k), w.dtype, "w")
-    acc_tmem = plgpu.TMEM(
-        (tile_n, block_m * 2), jnp.float32, collective=collective
+  if collective:
+    acc_consumed_barrier = plgpu.ClusterBarrier(
+        collective_axes=("x",),
+        num_barriers=2,
+        orders_tensor_core=True,
     )
-    acc_smem = plgpu.SMEM(
-        (block_m, tile_n),
-        dtype=out_dtype,
-        # workaround for ValueError: Dynamic slice base index (which is a
-        # dynamic value) cannot be statically proven to be divisible by
-        # the tiling (8)
-        transforms=(
-            plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
-            plgpu.SwizzleTransform(128),
-        ),
+  else:
+    acc_consumed_barrier = plgpu.Barrier(
+        num_barriers=2, orders_tensor_core=True
     )
-    xw_barrier = plgpu.Barrier(num_arrivals=2, num_barriers=num_stages)
-    xw_consumed_barrier = plgpu.Barrier(
-        num_barriers=num_stages, orders_tensor_core=True
-    )
-    acc_barrier = plgpu.Barrier(num_barriers=2, orders_tensor_core=True)
-    if collective:
-      acc_consumed_barrier = plgpu.ClusterBarrier(
-          collective_axes=("x",),
-          num_barriers=2,
-          orders_tensor_core=True,
-      )
-    else:
-      acc_consumed_barrier = plgpu.Barrier(
-          num_barriers=2, orders_tensor_core=True
-      )
-    pl.run_scoped(
-        lambda *args: kernel(*refs, scoped=args),
-        (x_smem, w_smem, acc_smem, acc_tmem),
-        (xw_barrier, xw_consumed_barrier, acc_barrier, acc_consumed_barrier),
-        collective_axes="wg",
-    )
+
+  scratch_shapes = dict(
+      x_smem=tiled_smem((num_stages, tile_m, block_k), x.dtype, "x"),
+      w_smem=tiled_smem((num_stages, tile_n, block_k), w.dtype, "w"),
+      acc_tmem=plgpu.TMEM(
+          (tile_n, block_m * 2), jnp.float32, collective=collective
+      ),
+      acc_smem=acc_smem,
+      xw_barrier=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),
+      xw_consumed_barrier=plgpu.Barrier(
+          num_barriers=num_stages, orders_tensor_core=True
+      ),
+      acc_barrier=plgpu.Barrier(num_barriers=2, orders_tensor_core=True),
+      acc_consumed_barrier=acc_consumed_barrier,
+  )
 
   num_sms = backend.get_default_device().core_count
   profile = False
   f = plgpu.kernel(
-      kernel_entry,
+      kernel,
       out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+      scratch_shapes=scratch_shapes,
       num_threads=2,
       thread_name="wg",
       grid=(num_sms // 2,) if collective else (num_sms,),
