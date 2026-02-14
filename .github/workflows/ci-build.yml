@@ -113,6 +113,8 @@ jobs:
           python3.12 -m uv pip install -e .[cuda,tpu,test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
+        env:
+          XPROF_GPU_CUPTI_COLLECTOR_MAX_CALLBACK_API_EVENTS: 100
+          XPROF_GPU_CUPTI_COLLECTOR_MAX_ACTIVITY_API_EVENTS: 100
         run: |
           pytest -s -m "not long" --ignore-glob="tokamax/_src/ops/*" tokamax
-
