@@ -184,14 +184,26 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def test_autotune_configs(self):
     # Test that all autotuning configs yield reasonable results.
     assert isinstance(self._attention_fn, base.DotProductAttention)
-    q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 64))
+    q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 128))
     bound_args = self._attention_fn.bind(q, k, v)
     configs = self._attention_fn._get_autotuning_configs(bound_args)
     self.assertNotEmpty(configs)
     for config in configs:
       with self.subTest(f"{config=}"):
         impl = type(self._attention_fn)(config)
-        self._run_test_with_inputs(q, k, v, impl=impl)
+        num_tma_splits = getattr(config, "num_tma_splits", 1)
+        if (
+            # Can't divide by 3 or chunk size too small for MMA.
+            num_tma_splits in (3, 4)
+            or (  # Too much smem.
+                config.num_stages > 2
+                and config.block_q == config.block_kv == 128
+            )
+        ):
+          with self.assertRaises(ValueError):
+            self._run_test_with_inputs(q, k, v, impl=impl)
+        else:
+          self._run_test_with_inputs(q, k, v, impl=impl)
 
   def test_vjp_autotune_configs(self):
     if not self._supports_vjp:
