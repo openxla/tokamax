@@ -68,7 +68,6 @@ def add_vectors_pallas_triton(x: jax.Array, y: jax.Array) -> jax.Array:
 class DumpHloLibTest(parameterized.TestCase):
 
   def test_pallas_gpu_tpu(self):
-    backend = 'triton' if jax.default_backend() == 'gpu' else None
     # Example taken from https://docs.jax.dev/en/latest/pallas/quickstart.html.
     def add_vectors_kernel(x_ref, y_ref, o_ref):
       x, y = x_ref[...], y_ref[...]
@@ -77,8 +76,11 @@ class DumpHloLibTest(parameterized.TestCase):
     @jax.jit
     def add_vectors(x: jax.Array, y: jax.Array) -> jax.Array:
       return pl.pallas_call(
-          add_vectors_kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-          backend=backend,
+          add_vectors_kernel,
+          out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          compiler_params=(
+              plgpu.CompilerParams() if jax.default_backend() == 'gpu' else None
+          ),
       )(x, y)
 
     x = jnp.arange(8)
