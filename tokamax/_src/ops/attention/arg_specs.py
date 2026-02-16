@@ -18,12 +18,76 @@ from typing import Final
 
 import jax
 import jax.numpy as jnp
+from tokamax._src import batching
 from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.attention import base
 
-
+BatchedShapeDtype = batching.BatchedShapeDtype
 ShapeDtype = jax.ShapeDtypeStruct
 Mask = base.Mask
+
+
+def _alphafold_oss_inference_spec(
+    batch_size: int, seq_len: int, head_dim: int, vmap: bool = False
+):
+  vmap_axes = ((0, 1),) if vmap else ()
+  vmap_axes_mask = (None,) if vmap else ()
+  num_heads = 4
+  x_shape = BatchedShapeDtype(
+      (batch_size, seq_len, num_heads, head_dim),
+      jnp.bfloat16,
+      vmap_axes=vmap_axes,
+  )
+  return arg_spec.ArgSpec(
+      args={
+          'q': x_shape,
+          'k': x_shape,
+          'v': x_shape,
+          'bias': BatchedShapeDtype(
+              (1, num_heads, seq_len, seq_len),
+              jnp.bfloat16,
+              vmap_axes=vmap_axes,
+          ),
+          'mask': Mask(
+              BatchedShapeDtype(
+                  (batch_size, 1, 1, seq_len), bool, vmap_axes=vmap_axes_mask
+              )
+          ),
+          'precision': (
+              jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+              jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+          ),
+      },
+      project='alphafold_3',
+      name=f'batch_size={batch_size}_seq_len={seq_len}_head_dim={head_dim}_vmap={vmap}',
+      tags=('forward_only',),
+  )
+
+
+# Shapes for https://github.com/google-deepmind/alphafold3.
+def _alphafold_oss_inference_specs() -> tuple[arg_spec.ArgSpec, ...]:
+  """Generates the AlphaFold OSS inference argument specifications."""
+  specs = []
+
+  seq_lens = {
+      32: tuple(range(512, 1536 + 1, 256)),
+      128: tuple(range(1792, 5120 + 1, 256)),
+  }
+  for batch_size, seq_lens in seq_lens.items():
+    for seq_len in seq_lens:
+      for head_dim in (16, 32):
+        for vmap in (True, False):
+          if head_dim == 16 and vmap:
+            continue
+          specs.append(
+              _alphafold_oss_inference_spec(
+                  batch_size=batch_size,
+                  seq_len=seq_len,
+                  head_dim=head_dim,
+                  vmap=vmap,
+              )
+          )
+  return tuple(specs)
 
 
 def _flash_attention_v3_specs() -> tuple[arg_spec.ArgSpec, ...]:
@@ -61,56 +125,60 @@ def _flash_attention_v3_specs() -> tuple[arg_spec.ArgSpec, ...]:
 
 
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
-    arg_spec.ArgSpec(
-        args={
-            'q': ShapeDtype((32, 4096, 32, 128), jnp.bfloat16),
-            'k': ShapeDtype((32, 4096, 8, 128), jnp.bfloat16),
-            'v': ShapeDtype((32, 4096, 8, 128), jnp.bfloat16),
-            'is_causal': True,
-        },
-        project='mixtral',
-        name='8x7b_bf16',
-        tags=('primary',),
-    ),
-    arg_spec.ArgSpec(
-        args={
-            'q': ShapeDtype((512, 1024, 16, 192), jnp.bfloat16),
-            'k': ShapeDtype((512, 1024, 16, 192), jnp.bfloat16),
-            'v': ShapeDtype((512, 1024, 16, 128), jnp.bfloat16),
-            'is_causal': True,
-        },
-        project='deepseek2',
-        name='16b_bf16',
-        tags=('primary',),
-    ),
-    arg_spec.ArgSpec(
-        args={
-            'q': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
-            'k': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
-            'v': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
-            'bias': ShapeDtype((1, 4, 384, 384), jnp.bfloat16),
-            'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
-        },
-        project='alphafold',
-    ),
-    arg_spec.ArgSpec(
-        args={
-            'q': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
-            'k': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
-            'v': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
-            'bias': ShapeDtype((1, 4, 384, 384), jnp.bfloat16),
-            'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
-        },
-        project='alphafold',
-    ),
-    arg_spec.ArgSpec(
-        args={
-            'q': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
-            'k': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
-            'v': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
-            'bias': ShapeDtype((1, 4, 768, 768), jnp.bfloat16),
-            'mask': Mask(ShapeDtype((768, 1, 1, 768), bool)),
-        },
-        project='alphafold',
-    ),
-) + _flash_attention_v3_specs()
+    (
+        arg_spec.ArgSpec(
+            args={
+                'q': ShapeDtype((32, 4096, 32, 128), jnp.bfloat16),
+                'k': ShapeDtype((32, 4096, 8, 128), jnp.bfloat16),
+                'v': ShapeDtype((32, 4096, 8, 128), jnp.bfloat16),
+                'is_causal': True,
+            },
+            project='mixtral',
+            name='8x7b_bf16',
+            tags=('primary',),
+        ),
+        arg_spec.ArgSpec(
+            args={
+                'q': ShapeDtype((512, 1024, 16, 192), jnp.bfloat16),
+                'k': ShapeDtype((512, 1024, 16, 192), jnp.bfloat16),
+                'v': ShapeDtype((512, 1024, 16, 128), jnp.bfloat16),
+                'is_causal': True,
+            },
+            project='deepseek2',
+            name='16b_bf16',
+            tags=('primary',),
+        ),
+        arg_spec.ArgSpec(
+            args={
+                'q': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
+                'k': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
+                'v': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
+                'bias': ShapeDtype((1, 4, 384, 384), jnp.bfloat16),
+                'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
+            },
+            project='alphafold',
+        ),
+        arg_spec.ArgSpec(
+            args={
+                'q': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
+                'k': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
+                'v': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
+                'bias': ShapeDtype((1, 4, 384, 384), jnp.bfloat16),
+                'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
+            },
+            project='alphafold',
+        ),
+        arg_spec.ArgSpec(
+            args={
+                'q': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
+                'k': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
+                'v': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
+                'bias': ShapeDtype((1, 4, 768, 768), jnp.bfloat16),
+                'mask': Mask(ShapeDtype((768, 1, 1, 768), bool)),
+            },
+            project='alphafold',
+        ),
+    )
+    + _flash_attention_v3_specs()
+    + _alphafold_oss_inference_specs()
+)
