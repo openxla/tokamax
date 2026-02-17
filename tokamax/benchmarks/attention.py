@@ -49,9 +49,9 @@ EXAMPLES = {
         'is_causal': True,
     },
     'alphafold': {
-        'q': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
-        'k': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
-        'v': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
+        'query': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
+        'key': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
+        'value': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
         'bias': jax.ShapeDtypeStruct((1, 4, 768, 768), jnp.bfloat16),
         'mask': jax.ShapeDtypeStruct((768, 1, 1, 768), bool),
     },
