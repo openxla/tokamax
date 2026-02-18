@@ -640,22 +640,26 @@ def flash_attention_kernel(
         slot = lax.rem(ki - lb, softmax_slots)
 
         plgpu.barrier_wait(pv_mma_barrier)
+        block_d = 32
+        ds = pl.ds(0, block_d)
+        acc = acc_next = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
         plgpu.barrier_wait(alpha_produced_barrier.at[slot])
         alpha = plgpu.load(alpha_smem, slot, layout=_TMEM_ROW)
 
         with jax.named_scope("scale_acc"):
 
-          @pl.loop(0, num_tma_splits)
-          def tma_loop(i):
-            tma_chunk_size = head_dim_out // num_tma_splits
-            block_d = min(128, tma_chunk_size)
+          for i in range(num_tma_splits):
+            for _ in range(0, head_dim_out // num_tma_splits, block_d):
+              ds_next = pl.ds(ds.start + block_d, block_d)
+              if ds_next.start < head_dim_out:
+                acc_next = plgpu.async_load_tmem(
+                    acc_tmem.at[:, ds_next], layout=_TMEM
+                )
 
-            @pl.loop(0, tma_chunk_size, step=block_d)
-            def tmem_loop(j):
-              ds = pl.ds(i * tma_chunk_size + j, block_d)
-              acc = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
               acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
               plgpu.async_store_tmem(acc_tmem.at[:, ds], acc)
+              ds = ds_next
+              acc = acc_next
 
             plgpu.commit_tmem()
             plgpu.barrier_arrive(out_scaled_barrier.at[i])
