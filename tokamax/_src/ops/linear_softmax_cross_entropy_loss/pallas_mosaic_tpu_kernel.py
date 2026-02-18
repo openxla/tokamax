@@ -270,6 +270,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
 
 
 def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
+    dout,
     x_ref,
     labels_ref,
     w_ref,
@@ -351,29 +352,31 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   ]
   w_grad_tile_slice = w_grad_tile_ref.at[:, pl.dslice(0, cur_v_block_size)]
 
-  def perform_x_grad_tile_reduction():
-    if reduction == "mean":
-      # Mean reduction happens on the last accumulation on V for
-      # numerical stability
-      @pl.when(
-          reduce(
-              jnp.logical_and, (stage_index == 1, v_index == num_v_blocks - 1)
-          )
-      )
-      def _():
+  def perform_x_grad_tile_scaling():
+    # Perform scaling to dout and b_dim (for mean reduction).
+    # Scaling happens on the last accumulation on V for
+    # numerical stability
+    @pl.when(
+        reduce(jnp.logical_and, (stage_index == 1, v_index == num_v_blocks - 1))
+    )
+    def _():
+      if reduction == "mean":
         x_grad_tile_ref[...] /= num_b_blocks * b_block_size
 
-  def perform_w_grad_tile_reduction():
-    if reduction == "mean":
-      # Mean reduction happens on the last accumulation on B for
-      # numerical stability
-      @pl.when(
-          reduce(
-              jnp.logical_and, (stage_index == 1, b_index == num_b_blocks - 1)
-          )
-      )
-      def _():
+      x_grad_tile_ref[...] *= dout[0]
+
+  def perform_w_grad_tile_scaling():
+    # Perform scaling to dout and b_dim (for mean reduction).
+    # Scaling happens on the last accumulation on B for
+    # numerical stability
+    @pl.when(
+        reduce(jnp.logical_and, (stage_index == 1, b_index == num_b_blocks - 1))
+    )
+    def _():
+      if reduction == "mean":
         w_grad_tile_ref[...] /= num_b_blocks * b_block_size
+
+      w_grad_tile_ref[...] *= dout[0]
 
   # Async copy ops are only defined here. It only starts after calling .start().
   x_write_future = pltpu.make_async_copy(
@@ -417,7 +420,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     x_grad_tile_ref[...] = jax.lax.dot_general(
         xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
     )
-    perform_x_grad_tile_reduction()
+    perform_x_grad_tile_scaling()
     x_write_future.start()
 
   # Init W gradient
@@ -426,7 +429,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     w_grad_tile_ref[...] = jax.lax.dot_general(
         x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
     )
-    perform_w_grad_tile_reduction()
+    perform_w_grad_tile_scaling()
     w_write_future.start()
 
   # Accumulate X grad on V dimension
@@ -437,7 +440,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     )
     x_read_future.wait()
     x_grad_tile_ref[...] += res
-    perform_x_grad_tile_reduction()
+    perform_x_grad_tile_scaling()
     x_write_future.start()
 
   # Accumulate W grad on B dimension
@@ -448,7 +451,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     )
     w_read_future.wait()
     w_grad_tile_ref[...] += res
-    perform_w_grad_tile_reduction()
+    perform_w_grad_tile_scaling()
     w_write_future.start()
 
   @pl.when(stage_index == 1)
@@ -521,6 +524,9 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
   num_h_blocks = math.ceil(h_dim / h_block_size)
   num_stages = 2
 
+  # Pallas only allow passing in vectors not scalars
+  dout_array = jnp.zeros(1).at[0].set(dout)
+
   # Backward
   x_grad, w_grad = pl.pallas_call(
       partial(
@@ -528,6 +534,9 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
           reduction=reduction,
       ),
       in_specs=[
+          pl.BlockSpec(  # dout
+              memory_space=pltpu.SMEM,
+          ),
           pl.BlockSpec(  # x
               (b_block_size, h_block_size),
               lambda i, j, s, k: (i, k),
@@ -571,7 +580,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
           pltpu.SemaphoreType.DMA,  # w_write_sem
       ),
       grid=(num_b_blocks, num_v_blocks, num_stages, num_h_blocks),
-  )(x, labels, w, lse)
+  )(dout_array, x, labels, w, lse)
 
   # There is no gradient for the labels
-  return (dout * x_grad, dout * w_grad)
+  return (x_grad, w_grad)

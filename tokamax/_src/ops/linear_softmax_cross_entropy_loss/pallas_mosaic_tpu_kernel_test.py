@@ -231,10 +231,12 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
     )
 
     self.assertTrue(
-        jnp.allclose(ref_grad_x, kernel_grad_x, atol=3e-2, rtol=3e-2)
+        jnp.allclose(ref_grad_x, kernel_grad_x, atol=3e-2, rtol=3e-2),
+        f"ref_grad_x: {ref_grad_x}, kernel_grad_x: {kernel_grad_x}",
     )
     self.assertTrue(
-        jnp.allclose(ref_grad_w, kernel_grad_w, atol=3e-2, rtol=3e-2)
+        jnp.allclose(ref_grad_w, kernel_grad_w, atol=3e-2, rtol=3e-2),
+        f"ref_grad_w: {ref_grad_w}, kernel_grad_w: {kernel_grad_w}",
     )
 
   @parameterized.named_parameters(
