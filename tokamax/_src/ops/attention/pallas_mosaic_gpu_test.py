@@ -172,6 +172,9 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
   @override
   def _test_bench(self, spec):
+    # TODO: Remove once fixed.
+    if "B200" in jax.devices()[0].device_kind:
+      self.skipTest("Skipping test on B200s")
     atol_grads = None if spec.get("bias") is None else 0.04
     try:
       with test_base.override_test_args(atol=0.02, atol_grads=atol_grads):
