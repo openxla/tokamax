@@ -406,8 +406,8 @@ def flash_attention_kernel(
         l_smem[...] = l_i
         plgpu.commit_smem()
         m_gmem, l_gmem = residual_gmems
-        plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[hi, qs])
-        plgpu.copy_smem_to_gmem(l_smem, l_gmem.at[hi, qs])
+        plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[hi, qs], commit_group=False)
+        plgpu.copy_smem_to_gmem(l_smem, l_gmem.at[hi, qs], commit_group=False)
 
       l_i += float(jnp.finfo(jnp.float32).tiny)
 
