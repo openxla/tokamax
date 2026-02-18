@@ -15,7 +15,6 @@
 
 """Benchmarks for attention."""
 
-import functools
 import os
 
 from absl import flags
@@ -101,13 +100,10 @@ class AttentionBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
+    example = EXAMPLES[args_spec_name] | {'implementation': implementation}
     fn, args = benchmarking.standardize_function(
-        functools.partial(
-            tokamax.dot_product_attention,
-            implementation=implementation,
-            is_causal=True,
-        ),
-        kwargs=EXAMPLES[args_spec_name],
+        tokamax.dot_product_attention,
+        kwargs=example,
         mode=benchmark_mode,  # pytype: disable=wrong-arg-types
     )
     fn = jax.jit(fn)
