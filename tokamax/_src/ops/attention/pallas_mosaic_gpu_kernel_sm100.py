@@ -57,6 +57,9 @@ _ALPHA_BARRIER_OFFSET = 8
 
 _load_bcast = common.load_bcast
 
+_MASK_PACK_DTYPE = jnp.int8
+_MASK_PACKED_BITS = common.num_bits(_MASK_PACK_DTYPE)
+
 
 @pydantic.dataclasses.dataclass(
     frozen=True, kw_only=True, slots=True, config=dict(extra="forbid")
@@ -208,18 +211,25 @@ def flash_attention_kernel(
   head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
 
+  min_mask_cols = 128 // _MASK_PACKED_BITS
   if mask is None:
-    apply_bool_mask = bcast_mask_q = bcast_mask_k = False
+    apply_bool_mask = use_2d_bool_mask = bcast_mask_q = False
   else:
     apply_bool_mask = True
     bcast_mask_q = mask.shape[-2] == 1
     bcast_mask_k = mask.shape[-1] == 1
-    mask = mask.astype(jnp.int8)
-
-  use_2d_bool_mask = apply_bool_mask and not (bcast_mask_k or bcast_mask_q)
+    use_2d_bool_mask = not (bcast_mask_q or bcast_mask_k)
+    if use_2d_bool_mask:
+      mask = jnp.packbits(mask, axis=-1, bitorder="little")
+      mask = mask.view(_MASK_PACK_DTYPE)
+      # align to 16 bytes
+      mask = shape_lib.pad_to_next_multiple_of(mask, m=min_mask_cols, axis=-1)
+    else:
+      mask = mask.astype(jnp.int8)
 
   tile_q, block_kv = config.block_q, config.block_kv
   num_q_tiles = pl.cdiv(q_seq_len, tile_q)
+  mask_block_kv = block_kv // _MASK_PACKED_BITS
   num_stages = config.num_stages
   num_tma_splits = config.num_tma_splits if head_dim >= 128 else 1
   collective = config.collective
@@ -371,11 +381,10 @@ def flash_attention_kernel(
 
           @pl.when(warp_id == _TMA_LOAD_MASK_WARP)
           def tma_load_mask_warp():
-
             @pl.loop(lb, ub)
             def kv_loop(ki):
               hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
-              ks = pl.ds(ki * block_kv, block_kv)
+              ks = pl.ds(ki * mask_block_kv, max(mask_block_kv, min_mask_cols))
               plgpu.copy_gmem_to_smem(
                   mask_gmem.at[hi_, qs, ks], mask_smem, mask_produced_barrier
               )
@@ -477,34 +486,42 @@ def flash_attention_kernel(
         iota = lambda d: plgpu.broadcasted_iota(
             jnp.int32, acc_shape, dimension=d, layout=_TMEM
         )
-        mask = plgpu.layout_cast(jnp.ones(acc_shape, dtype=jnp.bool_), _TMEM)
+        if use_2d_bool_mask:
+          plgpu.barrier_wait(mask_produced_barrier)
+          mask_smem_ref = mask_smem.at[:, pl.ds(0, mask_block_kv)]
+          mask = plgpu.load(
+              mask_smem_ref,
+              (),
+              layout=_TMEM(32 // _MASK_PACKED_BITS),
+              optimized=False,
+          )
+          mask = common.unpack_bool_bits_tmem_native(mask)
+          plgpu.commit_smem()
+          plgpu.barrier_arrive(mask_consumed_barrier)
+        else:
+          mask = plgpu.layout_cast(jnp.ones(acc_shape, dtype=jnp.bool_), _TMEM)
 
         if do_causal:
           mask &= (iota(0) + q_base) >= (iota(1) + ki * block_kv)
-        if apply_bool_mask:
-          if use_2d_bool_mask:
-            plgpu.barrier_wait(mask_produced_barrier)
-            mask &= plgpu.load(mask_smem, (), layout=_TMEM, optimized=False)
-            plgpu.barrier_arrive(mask_consumed_barrier)
+        if apply_bool_mask and not use_2d_bool_mask:
+          hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
+          if bcast_mask_q:
+            idx = (hi_, 0, pl.ds(ki * block_kv, block_kv))
+            layout = _TMEM_COL
           else:
-            hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
-            if bcast_mask_q:
-              idx = (hi_, 0, pl.ds(ki * block_kv, block_kv))
-              layout = _TMEM_COL
-            else:
-              idx = (hi_, qs, 0)
-              layout = _TMEM_ROW
+            idx = (hi_, qs, 0)
+            layout = _TMEM_ROW
 
-            mask_vector = plgpu.load(
-                mask_gmem, idx, layout=layout, optimized=False
-            )
-            bc_dim = 1 if bcast_mask_q else 0
-            # TODO: we need to handle Q masks differently
-            # broadcasting & using them the way it is done is extremely slow
-            mask &= plgpu.layout_cast(
-                lax.broadcast_in_dim(mask_vector, acc_shape, (bc_dim,)),
-                _TMEM,
-            )
+          mask_vector = plgpu.load(
+              mask_gmem, idx, layout=layout, optimized=False
+          )
+          bc_dim = 1 if bcast_mask_q else 0
+          # TODO: we need to handle Q masks differently
+          # broadcasting & using them the way it is done is extremely slow
+          mask &= plgpu.layout_cast(
+              lax.broadcast_in_dim(mask_vector, acc_shape, (bc_dim,)),
+              _TMEM,
+          )
 
         if use_k_ranges:
 
@@ -560,6 +577,7 @@ def flash_attention_kernel(
             scale *= math.log2(math.e)
           s, scale = maybe_apply_mask(s, scale, ki, do_causal=do_causal)
           m_ij = jnp.maximum(m_i, s.max(axis=1) * scale)
+
           with jax.named_scope("exp(SFU)"):
             alpha = exp(m_i - m_ij)
 
@@ -704,8 +722,9 @@ def flash_attention_kernel(
       li_scratch = plgpu.SMEM((block_q,), jnp.float32)
     else:
       li_scratch = None
-    mask_scratch = tiled_smem((block_q, block_kv), jnp.int8)
-
+    mask_scratch = plgpu.SMEM(
+        (block_q, max(mask_block_kv, min_mask_cols)), _MASK_PACK_DTYPE
+    )
     # TMA barriers
     k_barrier = v_barrier = plgpu.Barrier(
         num_barriers=num_stages, num_arrivals=num_tma_splits
