@@ -210,7 +210,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       profile_paths = list(
           pathlib.Path(self._profile_tempdir).glob('**/*.xplane.pb')
       )
-      assert len(profile_paths) == 1, 'Expected exactly one profile file.'
+      if len(profile_paths) != 1:
+        logging.warning(
+            'Expected exactly one profile file. Selecting the first one.'
+        )
       profile_path = profile_paths[0]
       self._profile = jax.profiler.ProfileData.from_serialized_xspace(
           profile_path.read_bytes()
