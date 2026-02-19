@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from jaxlib.mlir.dialects import arith
 from jaxlib.mlir.dialects import memref
 import pydantic
+from tokamax._src.ops.ragged_dot import base
 
 SMEM_CAPACITY_MAP = {
     "sm_120": (100 - 1) * 1024,
@@ -46,7 +47,7 @@ class MatmulDimension(enum.IntEnum):
 
 
 @pydantic.dataclasses.dataclass(frozen=True, slots=True)
-class Config:
+class Config(base.RaggedDotConfig):
   """Configuration for the ragged dot kernel."""
 
   block_m: pydantic.conint(multiple_of=8, gt=0)

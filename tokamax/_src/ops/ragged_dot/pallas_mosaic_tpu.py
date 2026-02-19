@@ -66,7 +66,7 @@ def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class Config:
+class Config(base.RaggedDotConfig):
   """Pallas Mosaic TPU Ragged Dot config."""
 
   tile_m: pydantic.PositiveInt = 128
