@@ -59,6 +59,11 @@ bench = [
     "xprof",
 ]
 
+cuda-bench = [
+    "google-benchmark>=1.9.0",
+    "xprof",
+]
+
 cuda = [
     "jax[cuda12]>=0.8.0",
     "nvidia-cudnn-cu12>=9.0.0",
