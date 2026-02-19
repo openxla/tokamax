@@ -44,6 +44,8 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
     activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "M N"]:
   """Pallas kernel for ragged dot with GPU quantization."""
+  common.check_bf16xbf16_or_f16xf16(lhs, rhs)
+
   block_m = config.block_m
   block_n = config.block_n
   block_k = config.block_k
@@ -63,11 +65,6 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
     raise ValueError(
         "Expected group_sizes to have shape"
         f" {(num_groups,)} but got {group_sizes.shape}"
-    )
-  if (x.dtype, w.dtype) != (jnp.bfloat16, jnp.bfloat16):
-    raise ValueError(
-        "Only the same precision bfloat16 x bfloat16 supported, got:"
-        f" {x.dtype=} {w.dtype=}."
     )
 
   # num_stages must be less than or equal to the number of blocks

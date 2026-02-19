@@ -451,13 +451,39 @@ def num_bytes(dtype) -> float:
 
 
 def tile_swizzle_transforms(
-    shape: tuple[int, ...], dtype: jax.typing.DTypeLike, what: str = ""
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike,
+    what: str = "",
+    *,
+    tiling_prefix: tuple[int, ...] = (8,),
 ) -> tuple[plgpu.TilingTransform, plgpu.SwizzleTransform]:
   """Returns tiling and swizzling transforms."""
   elem_bits = num_bits(dtype)
   swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
-  tiling = (8, 8 * swizzle // elem_bits)
+  tiling = (*tiling_prefix, 8 * swizzle // elem_bits)
   return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
+
+
+def tiled_swizzled_smem(
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike,
+    what: str = "",
+    *,
+    tiling_prefix: tuple[int, ...] = (8,),
+) -> pl.MemoryRef:
+  """Returns a memory reference to a tiled and swizzled shared memory array."""
+  transforms = tile_swizzle_transforms(
+      shape, dtype, what, tiling_prefix=tiling_prefix
+  )
+  return plgpu.SMEM(shape, dtype, transforms=transforms)
+
+
+def tiled_swizzled_block_spec(
+    shape, dtype, index_map, what="", **kwargs
+) -> plgpu.BlockSpec:
+  """Returns a block spec with tiling and swizzling transforms."""
+  transforms = tile_swizzle_transforms(shape, dtype, what)
+  return plgpu.BlockSpec(shape, index_map, transforms=transforms, **kwargs)
 
 
 def get_smem_capacity() -> int:
@@ -475,3 +501,15 @@ def get_smem_capacity() -> int:
         f"Unsupported device compute capability: {device} {sm_version}"
     )
   return SMEM_CAPACITY_MAP[sm_version]
+
+
+def check_bf16xbf16_or_f16xf16(lhs: jax.Array, rhs: jax.Array):
+  if lhs.dtype != rhs.dtype:
+    raise NotImplementedError(
+        f"lhs and rhs must have same dtype (got {lhs.dtype=}, {rhs.dtype=})."
+    )
+
+  if lhs.dtype not in (jnp.bfloat16, jnp.float16):
+    raise NotImplementedError(
+        f"Only bfloat16/float16 inputs are supported (got {lhs.dtype=})."
+    )

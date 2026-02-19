@@ -29,7 +29,7 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 _WGMMA = plgpu.Layout.WGMMA
 
 
-def ragged_dot_kernel_body(
+def _kernel_body(
     group_info,
     mi,
     ni,
@@ -37,7 +37,6 @@ def ragged_dot_kernel_body(
     rhs_gmem,
     o_gmem,
     *,
-    out_dtype: jnp.dtype,
     config: common.Config,
     activation: base.ActivationFunction | None = None,
 ):
@@ -45,50 +44,37 @@ def ragged_dot_kernel_body(
 
   del mi
   m, k = lhs_gmem.shape
-  block_m, block_n = config.block_m, config.block_n
+  block_m = config.block_m
+  block_n = config.block_n
   block_k = min(k, config.block_k)
 
-  def compute_acc(acc_ref):
+  def compute_acc(acc):
     mi = group_info.block
-    lhs_spec = plgpu.BlockSpec(
-        (block_m, block_k),
-        lambda ki: (mi, ki),
-        transforms=common.tile_swizzle_transforms(
-            (block_m, block_k), lhs_gmem.dtype, "lhs"
-        ),
-        delay_release=1,
+    spec = functools.partial(common.tiled_swizzled_block_spec, delay_release=1)
+    lhs_spec = spec(
+        (block_m, block_k), lhs_gmem.dtype, lambda ki: (mi, ki), "lhs"
     )
-    rhs_spec = plgpu.BlockSpec(
-        (block_k, block_n),
-        lambda ki: (ki, ni),
-        transforms=common.tile_swizzle_transforms(
-            (block_k, block_n), rhs_gmem.dtype, "rhs"
-        ),
-        delay_release=1,
+    rhs_spec = spec(
+        (block_k, block_n), rhs_gmem.dtype, lambda ki: (ki, ni), "rhs"
     )
     plgpu.emit_pipeline(
-        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc_ref, lhs_smem, rhs_smem),
+        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc, lhs_smem, rhs_smem),
         grid=(k // block_k,),
         in_specs=(lhs_spec, rhs_spec),
         max_concurrent_steps=config.num_stages,
     )(lhs_gmem, rhs_gmem.at[group_info.group_id])
-    if activation is not None:
-      return activation(acc_ref[...])
-    return acc_ref[...]
+    return acc[...]
 
   acc = pl.run_scoped(compute_acc, plgpu.ACC((block_m, block_n)))
 
-  out_elem_bits = common.num_bits(o_gmem.dtype)
-  out_swizzle = plgpu.find_swizzle(block_n * out_elem_bits, "out")
-  transforms = (
-      plgpu.TilingTransform((1, 8 * out_swizzle // out_elem_bits)),
-      plgpu.SwizzleTransform(out_swizzle),
+  o_smem_type = common.tiled_swizzled_smem(
+      (block_m, block_n), o_gmem.dtype, tiling_prefix=(1,), what="out"
   )
-  o_smem_type = plgpu.SMEM((block_m, block_n), out_dtype, transforms=transforms)
 
   @functools.partial(pl.run_scoped, o_smem=o_smem_type)
-  def _store_scope(o_smem):
-    o_smem[...] = acc.astype(out_dtype)
+  def epilogue(o_smem):
+    acc_ = acc if activation is None else activation(acc)
+    o_smem[...] = acc_.astype(o_smem.dtype)
     plgpu.commit_smem()
 
     smem_start = group_info.start_within_block
@@ -121,40 +107,14 @@ def ragged_dot_kernel(
     activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "M N"]:
   """Pallas kernel for ragged dot with non-quantized inputs."""
+  common.check_bf16xbf16_or_f16xf16(lhs, rhs)
 
   m, _ = lhs.shape
   g, _, n = rhs.shape
 
-  if lhs.dtype != rhs.dtype:
-    raise ValueError(
-        f"lhs and rhs must have the same dtype. Got {lhs.dtype=} and"
-        f" {rhs.dtype=}"
-    )
-
-  if lhs.dtype not in (jnp.bfloat16, jnp.float16):
-    raise NotImplementedError(
-        f"Only bfloat16/float16 inputs are supported. Got {lhs.dtype=}"
-    )
-
-  if group_sizes.shape != (g,):
-    raise ValueError(
-        f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
-    )
-
-  body_fn = functools.partial(
-      ragged_dot_kernel_body,
-      config=config,  # This config's block_k must work with swizzle
-      out_dtype=out_dtype,
-      activation=activation,
-  )
-
+  body = functools.partial(_kernel_body, config=config, activation=activation)
   kernel = common.ragged_kernel(
-      body_fn,
-      g=g,
-      m=m,
-      n=n,
-      out_dtype=out_dtype,
-      config=config,
+      body, g=g, m=m, n=n, out_dtype=out_dtype, config=config
   )
   group_info = common.GroupInfo.create(
       group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
@@ -172,14 +132,13 @@ def ragged_dot_kernel(
   )
 
 
-def ragged_contracting_dim_dot_kernel_body(
+def _ragged_contracting_dim_dot_kernel_body(
     group_sizes_gmem,
     group_sizes_starts_gmem,
     lhs_gmem,
     rhs_gmem,
     o_gmem,
     *,
-    out_dtype: jnp.dtype,
     config: common.Config,
     activation: base.ActivationFunction | None = None,
 ):
@@ -195,7 +154,7 @@ def ragged_contracting_dim_dot_kernel_body(
   lb = jax.lax.div(group_start.astype(jnp.int32), block_k)
   ub = pl.cdiv(group_end.astype(jnp.int32), block_k)
 
-  def acc_scope(acc_ref):
+  def acc_scope(acc):
     def body(idxs, lhs_smem, rhs_smem):
       (ki,) = idxs
       k_start = (lb + ki) * block_k
@@ -203,51 +162,39 @@ def ragged_contracting_dim_dot_kernel_body(
       mask = (kx >= (group_start - k_start)) & (kx < (group_end - k_start))
 
       # TODO: Only mask out the 1st and last iteration.
-      plgpu.wgmma(acc_ref, lhs_smem[...] * mask, rhs_smem)
+      plgpu.wgmma(acc, lhs_smem[...] * mask, rhs_smem)
       plgpu.wgmma_wait(1)
 
+    spec = functools.partial(common.tiled_swizzled_block_spec, delay_release=1)
+    lhs_spec = spec(
+        (block_m, block_k), lhs_gmem.dtype, lambda ki: (mi, lb + ki), "lhs"
+    )
+    rhs_spec = spec(
+        (block_k, block_n), rhs_gmem.dtype, lambda ki: (lb + ki, ni), "rhs"
+    )
     plgpu.emit_pipeline(
         body,
         grid=(ub - lb,),
-        in_specs=[
-            plgpu.BlockSpec(
-                (block_m, block_k),
-                lambda ki: (mi, lb + ki),
-                transforms=common.tile_swizzle_transforms(
-                    (block_m, block_k), lhs_gmem.dtype, "lhs"
-                ),
-                delay_release=1,
-            ),
-            plgpu.BlockSpec(
-                (block_k, block_n),
-                lambda ki: (lb + ki, ni),
-                transforms=common.tile_swizzle_transforms(
-                    (block_k, block_n), rhs_gmem.dtype, "rhs"
-                ),
-                delay_release=1,
-            ),
-        ],
+        in_specs=(lhs_spec, rhs_spec),
         max_concurrent_steps=config.num_stages,
     )(lhs_gmem, rhs_gmem)
-    if activation is not None:
-      return activation(acc_ref[...])
-    return acc_ref[...]
+    return acc[...]
 
   acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
 
-  transforms = common.tile_swizzle_transforms((block_m, block_n), out_dtype)
-
-  @functools.partial(
-      pl.run_scoped,
-      o_smem=plgpu.SMEM((block_m, block_n), out_dtype, transforms=transforms),
+  transforms = common.tile_swizzle_transforms((block_m, block_n), o_gmem.dtype)
+  o_smem_type = plgpu.SMEM(
+      (block_m, block_n), o_gmem.dtype, transforms=transforms
   )
-  def _store_scope(o_smem):
-    o_smem[...] = acc.astype(out_dtype)
+
+  @functools.partial(pl.run_scoped, o_smem=o_smem_type)
+  def epilogue(o_smem):
+    acc_ = acc if activation is None else activation(acc)
+    o_smem[...] = acc_.astype(o_smem.dtype)
     plgpu.commit_smem()
-    slice_m = pl.ds(mi * block_m, block_m)
-    slice_n = pl.ds(ni * block_n, block_n)
-    out_gmem_slice = o_gmem.at[gi, slice_m, slice_n]
-    plgpu.copy_smem_to_gmem(o_smem, out_gmem_slice)
+    ms = pl.ds(mi * block_m, block_m)
+    ns = pl.ds(ni * block_n, block_n)
+    plgpu.copy_smem_to_gmem(o_smem, o_gmem.at[gi, ms, ns])
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 
@@ -261,30 +208,19 @@ def ragged_contracting_dim_dot_kernel(
     activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "G M N"]:
   """Pallas kernel for ragged contracting dim dot with non-quantized inputs."""
-
-  if lhs.dtype != rhs.dtype:
-    raise NotImplementedError(
-        f"lhs and rhs must have the same dtype. Got {lhs.dtype=} and"
-        f" {rhs.dtype=}"
-    )
-
-  if lhs.dtype not in (jnp.bfloat16, jnp.float16):
-    raise NotImplementedError(
-        f"Only bfloat16/float16 inputs are supported. Got {lhs.dtype=}"
-    )
+  common.check_bf16xbf16_or_f16xf16(lhs, rhs)
 
   _, m = lhs.shape
   _, n = rhs.shape
-  g = group_sizes.shape[0]
+  (g,) = group_sizes.shape
 
-  body_fn = functools.partial(
-      ragged_contracting_dim_dot_kernel_body,
+  body = functools.partial(
+      _ragged_contracting_dim_dot_kernel_body,
       config=config,
-      out_dtype=out_dtype,
       activation=activation,
   )
   kernel = plgpu.kernel(
-      body_fn,
+      body,
       out_shape=jax.ShapeDtypeStruct((g, m, n), out_dtype),
       grid=(pl.cdiv(m, config.block_m), pl.cdiv(n, config.block_n), g),
       grid_names=("m", "n", "g"),
