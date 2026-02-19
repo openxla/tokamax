@@ -201,7 +201,7 @@ class PallasMosaicTpuFlashAttentionVjp(
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    q, k = ba.args[3], ba.args[4]
+    q, k = ba.arguments['q'], ba.arguments['k']
     q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
     # TODO: Add 256, 8192 once autotuning bugs are fixed.
     tiles = [512, 1024, 2048, 4096]
@@ -211,6 +211,14 @@ class PallasMosaicTpuFlashAttentionVjp(
         tiles,
         tiles,
     ):
+      # TODO: For sparse masks smaller block sizes could give
+      # better performance.
+      if q_seq_len >= 1024 and bq < 1024:
+        continue
+      if kv_seq_len >= 1024 and bkv < 1024:
+        continue
+      if bkv_c > 1024:
+        continue
       if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
         configs.add(
             Config(

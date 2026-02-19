@@ -196,6 +196,14 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         layouts,
         schedulers,
     ):
+      # TODO: For sparse masks smaller block sizes could give
+      # better performance.
+      if q_seq_len >= 1024 and bq < 1024:
+        continue
+      if kv_seq_len >= 1024 and bkv < 1024:
+        continue
+      if bkv_c > 1024:
+        continue
       if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
         config.add(
             Config(
