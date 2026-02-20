@@ -248,6 +248,7 @@ benchmarks {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_multiplication.py" }
     action_inputs { key: "python_version" value: "3.11" }
+    action_inputs { key: "extras" value: "bench" }
   }
 
   environment_configs {
@@ -283,7 +284,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/default/forward"
+    name: "triangle_multiplication/n_384/default/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/default/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -291,7 +299,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/default/forward_and_vjp"
+    name: "triangle_multiplication/n_384/default/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/default/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -299,7 +314,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/xla/forward"
+    name: "triangle_multiplication/n_384/xla/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/xla/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -307,7 +329,44 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/xla/forward_and_vjp"
+    name: "triangle_multiplication/n_384/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "triangle_multiplication/n_384/cuequivariance/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/cuequivariance/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "triangle_multiplication/n_384/cuequivariance/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/cuequivariance/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
