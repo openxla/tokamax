@@ -14,6 +14,7 @@
 # ==============================================================================
 import dataclasses
 import functools
+import itertools
 from types import UnionType
 from typing import Union, get_origin
 
@@ -22,6 +23,7 @@ from absl.testing import parameterized
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
+import tokamax._src.gpu_utils as gu
 import pytest
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu as fa
@@ -67,7 +69,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         and float(dev.compute_capability) >= 10.0
     ):
       supports_bias = False
-      supports_vjp = False
       supports_f32_inputs = False  # TODO: Investigate Forge OOMs.
 
     if get_value(attention_fn) is None:
@@ -93,7 +94,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         ),
     )
     self._supports_decode = get_value(supports_decode)
-    self._supports_f32_inputs = get_value(supports_f32_inputs)
+    self._supports_f32_inputs =  get_value(supports_f32_inputs)
 
   def _run_test_with_inputs(self, q, k, v, *, bias=None, **kwargs):
     # PallasMosaicGpuFlashAttention doesn't support high precisions and
@@ -121,9 +122,16 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045)
     kwargs["atol_grads"] = None if bias is None else 0.02
+    kwargs["test_vjp_deterministic"] = not gu.is_sm100()
 
     if not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
+
+    test_vjp = kwargs.get("test_vjp", self._supports_vjp)
+    # TODO: Head dim > 64 is unsupported at the moment on
+    # SM100 because smem and tmem is are both exceeded exceeded.
+    if gu.is_sm100() and q.shape[-1] > 64 and test_vjp:
+      kwargs["expect_supported"] = False
 
     super()._run_test_with_inputs(q, k, v, bias=bias, **kwargs)
 

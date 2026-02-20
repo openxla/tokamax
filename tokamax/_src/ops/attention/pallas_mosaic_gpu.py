@@ -104,7 +104,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     compute_capability = float(backend.get_default_device().compute_capability)
     if compute_capability < 9.0 or compute_capability >= 11.0:
       raise NotImplementedError(
-          "Mosaic GPU backend only supported for sm90 and sm100 GPUs for now."
+          "Mosaic GPU backend only supported for sm90+ GPUs for now."
       )
 
     supported_dtypes = (jnp.float32, jnp.float16, jnp.bfloat16)
@@ -142,7 +142,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     v = cast(v, weights_v_dot_precision)
 
     orig_seq_len_q = q.shape[-3]
-    if config.fold_q_sequence_heads:
+    if isinstance(config, common.ConfigBase) and config.fold_q_sequence_heads:
       q, bias, mask, dropout_mask, q_indices = base.fold_q_sequence_heads(
           q, bias, mask, dropout_mask, q_indices, k.shape[-3], k.shape[-2]
       )
@@ -218,12 +218,12 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     device = backend.get_default_device()
-    return _get_kernel_module(device).get_heuristics_config(ba)
+    return _get_kernel_module(device).get_heuristics_config(ba)  # pytype: disable=module-attr,attribute-error
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     device = backend.get_default_device()
-    return _get_kernel_module(device).get_autotuning_configs(ba)
+    return _get_kernel_module(device).get_autotuning_configs(ba)  # pytype: disable=module-attr,attribute-error
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
