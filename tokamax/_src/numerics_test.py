@@ -84,6 +84,7 @@ class NumericsTest(parameterized.TestCase):
         jnp.bfloat16,
         jnp.float16,
         jnp.float32,
+        jnp.float8_e4m3fn,
         jnp.int4,
         jnp.int8,
         jnp.int32,
@@ -105,14 +106,15 @@ class NumericsTest(parameterized.TestCase):
         'bool': np.float64(31.0),
         'float16': np.float64(3.045166015625),
         'float32': np.float64(3.760611795121804),
-        'int32': np.float64(-248.0),
-        'int4': np.float64(-27.0),
-        'int64': np.float64(-1027.0),
-        'int8': np.float64(-10.0),
-        'uint32': np.float64(2869.0),
-        'uint4': np.float64(408.0),
-        'uint64': np.float64(3117.0),
-        'uint8': np.float64(2976.0),
+        'float8_e4m3fn': np.float64(-3.7890625),
+        'int32': np.float64(-86.0),
+        'int4': np.float64(-87.0),
+        'int64': np.float64(-10.0),
+        'int8': np.float64(-637.0),
+        'uint32': np.float64(3459.0),
+        'uint4': np.float64(363.0),
+        'uint64': np.float64(2976.0),
+        'uint8': np.float64(3060.0),
     }
 
     chex.assert_trees_all_close(kwargs, kwargs_expected)
@@ -132,7 +134,7 @@ class NumericsTest(parameterized.TestCase):
     self.assertEqual(actual.format, format_)
 
   @parameterized.product(
-      qtype=(jnp.int8, jnp.int4),
+      qtype=(jnp.float8_e4m3fn, jnp.int8, jnp.int4),
       scale=(
           jax.ShapeDtypeStruct((1, 128), jnp.bfloat16),
           jax.ShapeDtypeStruct((128, 1), jnp.bfloat16),

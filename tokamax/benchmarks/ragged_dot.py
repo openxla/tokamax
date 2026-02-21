@@ -25,9 +25,9 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tensorboardX import writer
-from tokamax._src import benchmarking
-from tokamax._src.ops.ragged_dot import api
-
+import tokamax
+from tokamax import benchmarking
+from tokamax._src.ops.ragged_dot import arg_specs
 
 SummaryWriter = writer.SummaryWriter
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
@@ -41,35 +41,39 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
     'A comma-separated list of implementations to skip.',
 )
 
-ragged_dot = api.ragged_dot
-# Maxtext deepseek-v3 shapes.
+
+# MaxText DeepSeek-v3 shapes.
 EXAMPLE = {
     'lhs': jax.ShapeDtypeStruct((262144, 7168), jnp.bfloat16),
     'rhs': jax.ShapeDtypeStruct((256, 7168, 2048), jnp.bfloat16),
-    'group_sizes': jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
+    'group_sizes': tokamax.RaggedDotGroupSizes(
+        jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
+        representative_value=arg_specs.generate_group_sizes(
+            target_m=262144, g=256
+        ),
+    ),
 }
 
 
 class RaggedDotBenchmark(parameterized.TestCase):
+  """Benchmarks for ragged dot."""
 
   @parameterized.product(
-      implementation=(
-          None,
-          'triton',
-          'mosaic',
-      ),
+      implementation=(None, 'xla', 'triton', 'mosaic'),
       benchmark_mode=('forward', 'forward_and_vjp'),
   )
   def test_ragged_dot(self, implementation, benchmark_mode):
     """Benchmarks the ragged dot operation."""
-    if implementation in _SKIP_IMPLEMENTATIONS.value:
+    if str(implementation) in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(f'Skipping implementation {implementation}')
 
+    ragged_dot_fn = functools.partial(  # pylint: disable=g-long-ternary
+        tokamax.ragged_dot,
+        implementation=implementation,
+    )
+
     fn, args = benchmarking.standardize_function(
-        functools.partial(
-            ragged_dot,
-            implementation=implementation,
-        ),
+        ragged_dot_fn,
         kwargs=EXAMPLE,
         mode=benchmark_mode,  # pytype: disable=wrong-arg-types
     )

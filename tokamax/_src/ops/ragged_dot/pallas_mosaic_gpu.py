@@ -28,6 +28,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_fp8_quant as sm100_fp8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm100_i8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
@@ -135,6 +136,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         if isinstance(lhs, QArray):
           if lhs.qtype == jnp.int8:
             fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
+          elif lhs.qtype == jnp.float8_e4m3fn:
+            fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
           else:
             # dequantize lhs to fallback to non-lhs-quantized kernel
             lhs = quantization.as_array(lhs)
@@ -208,6 +211,15 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                 split_k=1,
                 grid_block_n=1,
             )
+          elif lhs.qtype == jnp.float8_e4m3fn:
+            return Config(
+                block_m=16,
+                block_n=128,
+                block_k=block_k,
+                num_stages=2,
+                split_k=1,
+                grid_block_n=1,
+            )
         return Config(
             block_m=64,
             block_n=128,
@@ -256,41 +268,43 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     out_dtype_bits = jnp.finfo(out_dtype).bits
     out_swizzle_elems = (128 * 8) // out_dtype_bits
 
-    warp_specialized = [True, False] if isinstance(rhs, QArray) else [True]
+    if isinstance(rhs, QArray):
+      ws_async_store_options = ((False, False), (True, False), (True, True))
+    else:
+      ws_async_store_options = ((False, False),)
 
     configs = set()
     for persistent in [True, False]:
-      for ws in warp_specialized:
-        for async_store in [True, False]:
-          for block_k in [128, 256, 512]:
-            if (block_k * rhs_dtype_bits) % (128 * 8) or (
-                block_k * lhs_dtype_bits
-            ) % (128 * 8):
-              continue
-            if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
-              continue
-            for block_m in [128, 64, 32, 16]:
-              for num_stages in [4, 2]:
-                for grid_minor_dim in [
-                    common.MatmulDimension.M,
-                    common.MatmulDimension.N,
-                ]:
-                  for grid_tile_width in [1, 2, 4, 8]:
-                    configs.add(
-                        Config(
-                            block_m=block_m,
-                            block_n=out_swizzle_elems,
-                            block_k=block_k,
-                            num_stages=num_stages,
-                            warp_specialized=ws,
-                            persistent=persistent,
-                            split_k=1,
-                            async_store=async_store,
-                            grid_block_n=grid_tile_width,
-                            grid_minor_dim=grid_minor_dim,
-                            grid_tile_width=grid_tile_width,
-                        )
-                    )
+      for warp_specialized, async_store in ws_async_store_options:
+        for block_k in [128, 256, 512]:
+          if (block_k * rhs_dtype_bits) % (128 * 8) or (
+              block_k * lhs_dtype_bits
+          ) % (128 * 8):
+            continue
+          if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
+            continue
+          for block_m in [128, 64, 32, 16]:
+            for num_stages in [4, 2]:
+              for grid_minor_dim in [
+                  common.MatmulDimension.M,
+                  common.MatmulDimension.N,
+              ]:
+                for grid_tile_width in [1, 2, 4, 8]:
+                  configs.add(
+                      Config(
+                          block_m=block_m,
+                          block_n=out_swizzle_elems,
+                          block_k=block_k,
+                          num_stages=num_stages,
+                          warp_specialized=warp_specialized,
+                          persistent=persistent,
+                          split_k=1,
+                          async_store=async_store,
+                          grid_block_n=grid_tile_width,
+                          grid_minor_dim=grid_minor_dim,
+                          grid_tile_width=grid_tile_width,
+                      )
+                  )
     return configs
 
   def _get_sm100_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:

@@ -14,12 +14,15 @@
 # ==============================================================================
 """Common utilities for Mosaic GPU attention implementations."""
 
+import functools
 from typing import Any
 
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import llvm
 import pydantic
 
 
@@ -125,3 +128,21 @@ def tile_swizzle_transforms(
   swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
   tiling = (8, 8 * swizzle // elem_bits)
   return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
+
+
+def _bar_operation(operation: str, barrier_id: jax.Array, num_threads: int):
+  @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
+  def bar_op(_, barrier_id):
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"),
+        [barrier_id.registers[()]],
+        f"bar.{operation} $0, {num_threads};",
+        "r",
+        has_side_effects=True,
+    )
+
+  bar_op(barrier_id)
+
+
+bar_arrive = functools.partial(_bar_operation, "arrive")
+bar_sync = functools.partial(_bar_operation, "sync")

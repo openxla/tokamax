@@ -24,9 +24,8 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tensorboardX import writer
-
-from tokamax._src import benchmarking
-from tokamax._src.ops.triangle_multiplication import api
+import tokamax
+from tokamax import benchmarking
 
 SummaryWriter = writer.SummaryWriter
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
@@ -40,11 +39,8 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
     'A comma-separated list of implementations to skip.',
 )
 
-triangle_multiplication = api.triangle_multiplication
-dtype = jnp.bfloat16
 
-
-def get_example(n, c=128, h=32, d=128):
+def _get_example(n, c=128, h=32, d=128, dtype=jnp.bfloat16):
   """Generates example inputs for triangle_multiplication."""
   return {
       'x': jax.ShapeDtypeStruct((n, n, c), dtype=dtype),
@@ -78,10 +74,10 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    example = get_example(n)
+    example = _get_example(n)
     fn, args = benchmarking.standardize_function(
         functools.partial(
-            triangle_multiplication,
+            tokamax.triangle_multiplication,
             implementation=implementation,
         ),
         kwargs=example,

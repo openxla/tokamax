@@ -15,8 +15,8 @@
 """Ragged dot API."""
 
 from collections.abc import Callable, Sequence
+import dataclasses
 from typing import Any, Final, Literal, TypeAlias
-
 import immutabledict
 import jax
 from jax.extend import backend
@@ -76,6 +76,7 @@ def ragged_dot(
         | Sequence[Implementation | Callable[..., jax.Array]]
         | None
     ) = None,
+    config: base.RaggedDotConfig | None = None,
 ) -> Float[Array, "M N"]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -102,6 +103,8 @@ def ragged_dot(
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
       that doesn't raise a `NotImplementedError` is used.
+    config: Optional. Configuration for the ragged dot kernel. If not specified,
+      it will rely on the autotuning.
 
   Returns:
     (m, n) shaped array with `preferred_element_type` element type.
@@ -116,6 +119,7 @@ def ragged_dot(
       group_offset=group_offset,
       activation=activation,
       implementation=implementation,
+      config=config,
   )
 
 
@@ -134,6 +138,7 @@ def ragged_dot_general(
         | Sequence[Implementation | Callable[..., jax.Array]]
         | None
     ) = None,
+    config: base.RaggedDotConfig | None = None,
 ) -> Float[Array, "..."]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -159,6 +164,8 @@ def ragged_dot_general(
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
       that doesn't raise a `NotImplementedError` is used.
+    config: Optional. Configuration for the ragged dot kernel. If not specified,
+      it will rely on the autotuning.
 
   Returns:
     An array with `preferred_element_type` element type.
@@ -198,6 +205,7 @@ def ragged_dot_general(
         raise ValueError(f"Unknown implementation: {impl}")
 
       impl = IMPLEMENTATIONS[impl]
+      impl = dataclasses.replace(impl, config=config)
 
     try:
       return impl(

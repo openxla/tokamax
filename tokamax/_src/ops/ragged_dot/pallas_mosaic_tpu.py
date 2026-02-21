@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Pallas Mosaic TPU Megablox."""
+
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
 import itertools
@@ -40,7 +41,7 @@ TilingTuple = tuple[
     pydantic.PositiveInt,  # tile_k
     pydantic.PositiveInt,  # tile_n
 ]
-InputBufferCount = pydantic.conint(ge=1, le=3, multiple_of=1)
+InputBufferCount = pydantic.PositiveInt
 
 QArray = base.QArray
 AsQArray = base.AsQArray
@@ -65,13 +66,14 @@ def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class Config:
+class Config(base.RaggedDotConfig):
   """Pallas Mosaic TPU Ragged Dot config."""
 
   tile_m: pydantic.PositiveInt = 128
   tile_k: pydantic.PositiveInt = 128
   tile_n: pydantic.PositiveInt = 128
   input_buffer_count: InputBufferCount = 2
+  combine_scopes: bool = False
 
 
 # A temporary lookup table for optimized configs.
@@ -98,6 +100,8 @@ GMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
     (262144, 512, 7168, 256, False): ((256, 512, 7168), 2),
     (262144, 7168, 1024, 256, False): ((512, 7168, 1024), 2),
     (262144, 1024, 7168, 256, False): ((256, 1024, 7168), 3),
+    (131072, 7168, 512, 256, False): ((128, 7168, 512), 3),
+    (131072, 512, 7168, 256, False): ((256, 512, 7168), 2),
 }
 GMM_RHS_TRANSPOSE_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
     (262144, 7168, 2048, 256, False): ((256, 2048, 1792), 2),
@@ -121,6 +125,8 @@ GMM_RHS_TRANSPOSE_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
     (262144, 512, 7168, 256, False): ((256, 7168, 512), 2),
     (262144, 7168, 1024, 256, False): ((512, 1024, 7168), 2),
     (262144, 1024, 7168, 256, False): ((256, 7168, 1024), 2),
+    (131072, 7168, 512, 256, False): ((256, 512, 7168), 2),
+    (131072, 512, 7168, 256, False): ((256, 7168, 512), 3),
 }
 TGMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
     (262144, 7168, 2048, 256, False): ((512, 1024, 2048), 3),
@@ -144,6 +150,8 @@ TGMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
     (262144, 512, 7168, 256, False): ((512, 512, 7168), 2),
     (262144, 7168, 1024, 256, False): ((256, 3584, 1024), 4),
     (262144, 1024, 7168, 256, False): ((512, 1024, 3584), 2),
+    (131072, 7168, 512, 256, False): ((256, 7168, 512), 3),
+    (131072, 512, 7168, 256, False): ((256, 256, 7168), 3),
 }
 
 # Ragged dot dimension numbers supported by the megablox kernel.
@@ -305,6 +313,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
+          combine_scopes=config.combine_scopes,
       )
     else:
       raise NotImplementedError(
@@ -400,8 +409,14 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     n_ = ((n + 128 - 1) // 128) * 128
 
     # Based on some empirical TPU tiling performance. Create a reasonable
-    # tiling search space.
-    tile_m_range = [64 * (2**i) for i in range(8) if 64 * (2**i) <= m]
+    # tiling search space. We limit the search space max to 1024 to ensure
+    # reasonable compilation time. From our experiments, we found that there
+    # is no need on current TPU generations to search for larger tiles for m.
+    tile_m_range = [
+        64 * (2**i)
+        for i in range(8)
+        if 64 * (2**i) <= m and 64 * (2**i) <= 1024
+    ]
 
     tile_k_range = set(
         [

@@ -28,7 +28,10 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 _COMPUTE_WG = 0
 _MMA_WARP = 0
 _TMA_WARP = 1
-_STORE_WG = 1
+_EPILOGUE_WG = 1
+
+_TCGEN05 = plgpu.Layout.TCGEN05
+_TCGEN05_TRANSPOSED = plgpu.Layout.TCGEN05_TRANSPOSED
 
 
 @jaxtyping.jaxtyped
@@ -41,17 +44,15 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
     activation: base.ActivationFunction | None = None,
 ) -> Float[Array, "M N"]:
   """Pallas kernel for ragged dot with GPU quantization."""
+  common.check_bf16xbf16_or_f16xf16(lhs, rhs)
+
   block_m = config.block_m
   block_n = config.block_n
   block_k = config.block_k
   num_stages = config.num_stages
   collective = config.collective
-  # `tile` is for each block
-  tile_m = block_m
-  tile_n = block_n
-  if collective:
-    block_m *= 2
-    block_n *= 2
+  cluster_block_m = (block_m * 2) if collective else block_m
+  cluster_block_n = (block_n * 2) if collective else block_n
 
   w, x = (rhs.mT, lhs)
 
@@ -65,53 +66,45 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
         "Expected group_sizes to have shape"
         f" {(num_groups,)} but got {group_sizes.shape}"
     )
-  if (x.dtype, w.dtype) != (jnp.bfloat16, jnp.bfloat16):
-    raise ValueError(
-        "Only the same precision bfloat16 x bfloat16 supported, got:"
-        f" {x.dtype=} {w.dtype=}."
-    )
 
   # num_stages must be less than or equal to the number of blocks
   num_stages = min(num_stages, k_w // block_k)
 
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, block_m, pl.cdiv(m, block_m) + num_groups - 1
+      group_sizes, cluster_block_m, pl.cdiv(m, cluster_block_m) + num_groups - 1
   )
-  m_iters = pl.cdiv(m, block_m) + num_groups - 1
-  n_iters = pl.cdiv(n, block_n)
+  m_iters = pl.cdiv(m, cluster_block_m) + num_groups - 1
+  n_iters = pl.cdiv(n, cluster_block_n)
 
-  def kernel(*refs, scoped):
-    (
-        x_gmem,
-        w_gmem,
-        _,
-        group_id_gmem,
-        start_within_block_gmem,
-        actual_size_gmem,
-        block_start_gmem,
-        out_gmem,
-    ) = refs
-    scratch_buffers, barriers = scoped
-    x_smem, w_smem, acc_smem, acc_tmem = scratch_buffers
-    (
-        xw_tma_barrier,
-        consumed_barrier,
-        mma_done_barrier,
-        store_done_barrier,
-    ) = barriers
-
+  def kernel(
+      x_gmem,
+      w_gmem,
+      _,
+      group_id_gmem,
+      start_within_block_gmem,
+      actual_size_gmem,
+      block_start_gmem,
+      out_gmem,
+      x_smem,
+      w_smem,
+      acc_smem,
+      acc_tmem,
+      xw_barrier,
+      xw_consumed_barrier,
+      acc_barrier,
+      acc_consumed_barrier,
+  ):
     m, k = x_gmem.shape
-    num_k_iters = pl.cdiv(k, block_k)
-    cluster_idx = lax.axis_index("x")
+    ub = pl.cdiv(k, block_k)
+    cluster_idx = lax.axis_index("cluster")
 
-    @plgpu.nd_loop((m_iters * n_iters,), collective_axes=("sm",), init_carry=0)
+    @plgpu.nd_loop(
+        (m_iters * n_iters,), collective_axes=("cluster_grid",), init_carry=0
+    )
     def mn_loop(loop_info: plgpu.NDLoopInfo, carry):
-      (lin_idx,) = loop_info.index
+      (idx,) = loop_info.index
       tid_m, ni = plgpu.planar_snake(
-          lin_idx,
-          (m_iters, n_iters),
-          config.grid_minor_dim,
-          config.grid_tile_width,
+          idx, (m_iters, n_iters), config.grid_minor_dim, config.grid_tile_width
       )
 
       wg = jax.lax.axis_index("wg")
@@ -119,191 +112,164 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       start_within_block = start_within_block_gmem[tid_m]
       actual_size = actual_size_gmem[tid_m]
       block_start = block_start_gmem[tid_m]
-      acc_slot = lax.rem(carry, jnp.int32(2))
-      slice_m = pl.ds(block_start, block_m)
-      slice_n = pl.ds(ni * block_n, block_n)
-      slice_acc_m = pl.ds(acc_slot * block_m, block_m)
-
-      is_lead_block = cluster_idx == 0
+      ms = pl.ds(block_start, cluster_block_m)
+      ns = pl.ds(ni * cluster_block_n, cluster_block_n)
 
       @pl.when(actual_size > 0)
-      def _body():
-
+      def compute():
         @pl.when(wg == _COMPUTE_WG)
-        def _():
+        def compute_wg():
           @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-          def _per_warp():
+          def compute_warps():
             warp_id = lax.axis_index("warp")
+            cluster_axis = "cluster" if collective else None
 
             @pl.when(warp_id == _TMA_WARP)
-            def _memory():
-              def _loop_body(ki, _):
-                slice_k = pl.ds(ki * block_k, block_k)
-                slot = lax.rem(ki, num_stages)
+            def tma_warp():
+              @pl.loop(0, ub)
+              def tma_loop(ki):
+                ks = pl.ds(ki * block_k, block_k)
+                si = lax.rem(ki, num_stages)
 
                 @pl.when((ki >= num_stages) | (carry > 0))
                 def _():
-                  plgpu.barrier_wait(consumed_barrier.at[slot])
+                  plgpu.barrier_wait(xw_consumed_barrier.at[si])
 
                 plgpu.copy_gmem_to_smem(
-                    x_gmem.at[slice_m, slice_k],
-                    x_smem.at[slot],
-                    xw_tma_barrier.at[slot],
+                    x_gmem.at[ms, ks],
+                    x_smem.at[si],
+                    xw_barrier.at[si],
                     partitioned_axis=0 if collective else None,
-                    collective_axes="x" if collective else None,
+                    collective_axes=cluster_axis,
                 )
                 plgpu.copy_gmem_to_smem(
-                    w_gmem.at[group_id, slice_n, slice_k],
-                    w_smem.at[slot],
-                    xw_tma_barrier.at[slot],
+                    w_gmem.at[group_id, ns, ks],
+                    w_smem.at[si],
+                    xw_barrier.at[si],
                     partitioned_axis=0 if collective else None,
-                    collective_axes="x" if collective else None,
+                    collective_axes=cluster_axis,
                 )
 
-              lax.fori_loop(0, num_k_iters, _loop_body, None)
+            @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
+            def mma_warp():
+              si_acc = lax.rem(carry, jnp.int32(2))
+              ms_acc = pl.ds(si_acc * cluster_block_m, cluster_block_m)
 
-            @pl.when((warp_id == _MMA_WARP) & (carry > 1))
-            def _wait_store():
-              with jax.named_scope("wait for store"):
-                plgpu.barrier_wait(store_done_barrier.at[acc_slot])
+              @pl.when(carry > 1)
+              def _():
+                with jax.named_scope("wait for store"):
+                  plgpu.barrier_wait(acc_consumed_barrier.at[si_acc])
 
-            @pl.when((warp_id == _MMA_WARP) & is_lead_block)
-            def _mma():
-              def _loop_body(ki, _):
-                slot = lax.rem(ki, num_stages)
+              @pl.loop(0, ub)
+              def mma_loop_body(ki):
+                si_tma = lax.rem(ki, num_stages)
                 with jax.named_scope("wait for xw"):
-                  plgpu.barrier_wait(xw_tma_barrier.at[slot])
+                  plgpu.barrier_wait(xw_barrier.at[si_tma])
                 with jax.named_scope("issuing mma"):
                   plgpu.tcgen05_mma(
-                      acc_tmem.at[:, slice_acc_m],
-                      w_smem.at[slot],
-                      x_smem.at[slot].T,
-                      consumed_barrier.at[slot],
+                      acc_tmem.at[:, ms_acc],
+                      w_smem.at[si_tma],
+                      x_smem.at[si_tma].T,
+                      xw_consumed_barrier.at[si_tma],
                       accumulate=(ki > 0),
-                      collective_axis="x" if collective else None,
+                      collective_axis=cluster_axis,
                   )
 
-                @pl.when(ki >= num_k_iters - 1)
-                def _():
-                  plgpu.tcgen05_commit_arrive(
-                      mma_done_barrier.at[acc_slot],
-                      collective_axis="x" if collective else None,
-                  )
+              plgpu.tcgen05_commit_arrive(
+                  acc_barrier.at[si_acc], collective_axis=cluster_axis
+              )
 
-              lax.fori_loop(0, num_k_iters, _loop_body, None)
-
-        @pl.when(wg == _STORE_WG)
-        def _():
-          plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-          plgpu.barrier_wait(mma_done_barrier.at[acc_slot])
+        @pl.when(wg == _EPILOGUE_WG)
+        def epilogue_wg():
+          si = lax.rem(carry, jnp.int32(2))
+          plgpu.barrier_wait(acc_barrier.at[si])
           with jax.named_scope("tmem -> smem"):
-            acc_smem_t = plgpu.transpose_ref(acc_smem, (1, 0))
-            acc = plgpu.async_load_tmem(acc_tmem.at[:, slice_acc_m])
-            plgpu.wait_load_tmem()
+            ms_acc = pl.ds(si * cluster_block_m, cluster_block_m)
+            acc = plgpu.async_load_tmem(acc_tmem.at[:, ms_acc], layout=_TCGEN05)
             if activation is not None:
               acc = activation(acc)
-            acc = acc.astype(acc_smem_t.dtype)
-            acc_smem_t[...] = plgpu.layout_cast(
-                acc, plgpu.Layout.TCGEN05_TRANSPOSED
-            )
+            acc = acc.astype(acc_smem.dtype)
+            acc_smem.T[...] = plgpu.layout_cast(acc, _TCGEN05_TRANSPOSED)
+            plgpu.wait_load_tmem()
+            plgpu.barrier_arrive(acc_consumed_barrier.at[si])
             plgpu.commit_smem()
-            del acc_smem_t
 
           with jax.named_scope("smem -> gmem"):
             # Write out the largest power of two rows first,
             # then the next largest, etc.
             # This allows us to coalesce writes as much as possible.
             offset = start_within_block
-            size = 1 << (min(block_m, m).bit_length() - 1)
+            size = 1 << (min(cluster_block_m, m).bit_length() - 1)
             while size > 0:
+              ns = pl.ds(ni * cluster_block_n + cluster_idx * block_n, block_n)
 
               @pl.when(actual_size & size != 0)
               def _():
+                ms = pl.ds(block_start + offset, size)
                 out_smem_slice = acc_smem.at[pl.ds(offset, size)]
-                o_gref_slice = out_gmem.at[
-                    pl.ds(block_start + offset, size),
-                    pl.ds(ni * block_n + cluster_idx * tile_n, tile_n),
-                ]
-                plgpu.copy_smem_to_gmem(out_smem_slice, o_gref_slice)
+                plgpu.copy_smem_to_gmem(
+                    out_smem_slice, out_gmem.at[ms, ns], commit_group=False
+                )
 
               offset += actual_size & size
               size //= 2
-            plgpu.wait_smem_to_gmem(0)
-            plgpu.barrier_arrive(store_done_barrier.at[acc_slot])
+            plgpu.commit_smem_to_gmem_group()
+            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
       return carry + (actual_size > 0)
 
-  swizzle = plgpu.find_swizzle(block_k * jnp.dtype(x.dtype).itemsize * 8)
+  def tiled_smem(shape, dtype, what=""):
+    transforms = common.tile_swizzle_transforms(shape, dtype, what)
+    return plgpu.SMEM(shape, dtype, transforms=transforms)
 
-  swizzle_elems = swizzle // jnp.dtype(x.dtype).itemsize
-  transforms = (
-      plgpu.TilingTransform((8, swizzle_elems)),
-      plgpu.SwizzleTransform(swizzle),
+  acc_smem = plgpu.SMEM(
+      (cluster_block_m, block_n),
+      dtype=out_dtype,
+      # workaround for ValueError: Dynamic slice base index (which is a
+      # dynamic value) cannot be statically proven to be divisible by
+      # the tiling (8)
+      transforms=(
+          plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
+          plgpu.SwizzleTransform(128),
+      ),
   )
 
-  def kernel_entry(*refs):
-    x_smem = plgpu.SMEM(
-        (num_stages, tile_m, block_k),
-        dtype=x.dtype,
-        transforms=transforms,
+  if collective:
+    acc_consumed_barrier = plgpu.ClusterBarrier(
+        collective_axes=("cluster",), num_barriers=2, orders_tensor_core=True
     )
-    w_smem = plgpu.SMEM(
-        (num_stages, tile_n, block_k),
-        dtype=w.dtype,
-        transforms=transforms,
+  else:
+    acc_consumed_barrier = plgpu.Barrier(
+        num_barriers=2, orders_tensor_core=True
     )
-    acc_tmem = plgpu.TMEM(
-        (tile_n, block_m * 2), dtype=jnp.float32, collective=collective
-    )
-    acc_smem = plgpu.SMEM(
-        (block_m, tile_n),
-        dtype=out_dtype,
-        # workaround for ValueError: Dynamic slice base index (which is a
-        # dynamic value) cannot be statically proven to be divisible by
-        # the tiling (8)
-        transforms=(
-            plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
-            plgpu.SwizzleTransform(128),
-        ),
-    )
-    xw_tma_barrier = plgpu.Barrier(num_arrivals=2, num_barriers=num_stages)
-    consumed_barrier = plgpu.Barrier(
-        num_barriers=num_stages, orders_tensor_core=True
-    )
-    mma_done_barrier = plgpu.Barrier(num_barriers=2, orders_tensor_core=True)
-    if collective:
-      store_done_barrier = plgpu.ClusterBarrier(
-          collective_axes=("x",),
-          num_barriers=2,
-          orders_tensor_core=True,
-      )
-    else:
-      store_done_barrier = plgpu.Barrier(
-          num_barriers=2, orders_tensor_core=True
-      )
-    pl.run_scoped(
-        lambda *args: kernel(*refs, scoped=args),
-        (x_smem, w_smem, acc_smem, acc_tmem),
-        (
-            xw_tma_barrier,
-            consumed_barrier,
-            mma_done_barrier,
-            store_done_barrier,
-        ),
-        collective_axes="wg",
-    )
+
+  scratch_shapes = dict(
+      x_smem=tiled_smem((num_stages, block_m, block_k), x.dtype, "x"),
+      w_smem=tiled_smem((num_stages, block_n, block_k), w.dtype, "w"),
+      acc_tmem=plgpu.TMEM(
+          (block_n, cluster_block_m * 2), jnp.float32, collective=collective
+      ),
+      acc_smem=acc_smem,
+      xw_barrier=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),
+      xw_consumed_barrier=plgpu.Barrier(
+          num_barriers=num_stages, orders_tensor_core=True
+      ),
+      acc_barrier=plgpu.Barrier(num_barriers=2, orders_tensor_core=True),
+      acc_consumed_barrier=acc_consumed_barrier,
+  )
 
   num_sms = backend.get_default_device().core_count
   profile = False
   f = plgpu.kernel(
-      kernel_entry,
+      kernel,
       out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+      scratch_shapes=scratch_shapes,
       num_threads=2,
       thread_name="wg",
       grid=(num_sms // 2,) if collective else (num_sms,),
-      grid_names=("sm",),
+      grid_names=("cluster_grid",),
       cluster=(1 + collective,),
-      cluster_names=("x",),
+      cluster_names=("cluster",),
       compiler_params=plgpu.CompilerParams(
           approx_math=True,
           unsafe_no_auto_barriers=True,

@@ -45,12 +45,6 @@ class DotProductAttentionTest(parameterized.TestCase):
   def test_dot_product_attention(self, dtype, group_num, use_vmap):
 
     if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
-      # TODO: Remove once grouped attention is supported on Mosaic
-      # TPU attention.
-      if group_num == 2:
-        self.skipTest(
-            'Group attention is not supported on Mosaic TPU attention.'
-        )
       if dtype == jnp.float16:
         self.skipTest(
             'FP16 precision is not supported on Mosaic TPU attention.'
@@ -255,9 +249,6 @@ class DotProductAttentionTest(parameterized.TestCase):
     dQ_ans, dK_ans, dV_ans, dbias_ans = sdpa_vjp_ans(dout)[:4]
 
     chex.assert_trees_all_close(out_ans, out_ref, atol=0.01, rtol=0.01)
-    # TODO: Fix the test for 'custom' mask mode on TPU.
-    if (jax.default_backend() == 'tpu'and 'custom' in mask_mode):
-      self.skipTest('Enable test after fixing the numerics.')
     chex.assert_trees_all_close(dQ_ans, dQ_ref, rtol=0.02, atol=0.02)
     chex.assert_trees_all_close(dK_ans, dK_ref, rtol=0.02, atol=0.02)
     chex.assert_trees_all_close(dV_ans, dV_ref, rtol=0.01, atol=0.015)

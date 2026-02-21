@@ -28,6 +28,17 @@ import jax.numpy as jnp
 from jaxlib.mlir.dialects import arith
 from jaxlib.mlir.dialects import memref
 import pydantic
+from tokamax._src.ops.ragged_dot import base
+
+SMEM_CAPACITY_MAP = {
+    "sm_120": (100 - 1) * 1024,
+    "sm_103": (228 - 1) * 1024,
+    "sm_100": (228 - 1) * 1024,
+    "sm_90": (228 - 1) * 1024,
+    "sm_80": (164 - 1) * 1024,
+    "sm_86": (100 - 1) * 1024,
+    "sm_89": (100 - 1) * 1024,
+}
 
 
 class MatmulDimension(enum.IntEnum):
@@ -36,7 +47,7 @@ class MatmulDimension(enum.IntEnum):
 
 
 @pydantic.dataclasses.dataclass(frozen=True, slots=True)
-class Config:
+class Config(base.RaggedDotConfig):
   """Configuration for the ragged dot kernel."""
 
   block_m: pydantic.conint(multiple_of=8, gt=0)
@@ -428,3 +439,77 @@ def ragged_kernel(
       thread_name=thread_axis,
       num_threads=thread_axis and (num_compute_threads + 1),
   )
+
+
+def num_bits(dtype: jax.typing.DTypeLike) -> int:
+  fn = jnp.finfo if jnp.issubdtype(dtype, jnp.floating) else jnp.iinfo
+  return fn(dtype).bits
+
+
+def num_bytes(dtype) -> float:
+  return num_bits(dtype) / 8
+
+
+def tile_swizzle_transforms(
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike,
+    what: str = "",
+    *,
+    tiling_prefix: tuple[int, ...] = (8,),
+) -> tuple[plgpu.TilingTransform, plgpu.SwizzleTransform]:
+  """Returns tiling and swizzling transforms."""
+  elem_bits = num_bits(dtype)
+  swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
+  tiling = (*tiling_prefix, 8 * swizzle // elem_bits)
+  return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
+
+
+def tiled_swizzled_smem(
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike,
+    what: str = "",
+    *,
+    tiling_prefix: tuple[int, ...] = (8,),
+) -> pl.MemoryRef:
+  """Returns a memory reference to a tiled and swizzled shared memory array."""
+  transforms = tile_swizzle_transforms(
+      shape, dtype, what, tiling_prefix=tiling_prefix
+  )
+  return plgpu.SMEM(shape, dtype, transforms=transforms)
+
+
+def tiled_swizzled_block_spec(
+    shape, dtype, index_map, what="", **kwargs
+) -> plgpu.BlockSpec:
+  """Returns a block spec with tiling and swizzling transforms."""
+  transforms = tile_swizzle_transforms(shape, dtype, what)
+  return plgpu.BlockSpec(shape, index_map, transforms=transforms, **kwargs)
+
+
+def get_smem_capacity() -> int:
+  """Returns the shared memory capacity of the device."""
+  device = backend.get_default_device()
+
+  if device.platform != "gpu":
+    raise NotImplementedError(
+        f"Unsupported device platform: {device}"
+    )
+  capacity = int(float(getattr(device, "compute_capability", 0)) * 10)
+  sm_version = f"sm_{capacity}"
+  if sm_version not in SMEM_CAPACITY_MAP:
+    raise NotImplementedError(
+        f"Unsupported device compute capability: {device} {sm_version}"
+    )
+  return SMEM_CAPACITY_MAP[sm_version]
+
+
+def check_bf16xbf16_or_f16xf16(lhs: jax.Array, rhs: jax.Array):
+  if lhs.dtype != rhs.dtype:
+    raise NotImplementedError(
+        f"lhs and rhs must have same dtype (got {lhs.dtype=}, {rhs.dtype=})."
+    )
+
+  if lhs.dtype not in (jnp.bfloat16, jnp.float16):
+    raise NotImplementedError(
+        f"Only bfloat16/float16 inputs are supported (got {lhs.dtype=})."
+    )

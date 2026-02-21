@@ -19,6 +19,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from tokamax._src.ops.experimental.tpu.splash_attention import base
+
 
 def test_device_matches(devices: list[str]) -> bool:
   """Returns True if the test device matches any of the given devices."""
@@ -73,3 +75,14 @@ class SplashAttentionTestCase(parameterized.TestCase):
     self.assertEqual(x.dtype, y.dtype)
     self.assertTupleEqual(x.shape, y.shape)
     np.testing.assert_allclose(x, y, **kwargs)
+
+
+def create_segment_ids(seq_len: int, num_breaks: int = 2) -> base.SegmentIds:
+  break_indices = np.random.choice(
+      range(1, seq_len), num_breaks, replace=False
+  )
+  idxs = np.zeros(seq_len, dtype=np.int32)
+  idxs[break_indices] = 1
+
+  idxs = np.cumsum(idxs, dtype=np.int32)
+  return base.SegmentIds(q=idxs, kv=idxs)

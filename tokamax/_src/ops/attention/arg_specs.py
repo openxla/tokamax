@@ -26,6 +26,40 @@ ShapeDtype = jax.ShapeDtypeStruct
 Mask = base.Mask
 
 
+def _flash_attention_v3_specs() -> tuple[arg_spec.ArgSpec, ...]:
+  """Generates the Flash Attention v3 benchmark specifications.
+
+  Taken from Section 4.1 of https://arxiv.org/abs/2407.08608.
+
+  Returns:
+    A tuple of Flash Attention v3 argument specifications.
+  """
+  num_tokens = 16384
+  hidden_dim = 2048
+  specs = []
+  for seq_len in (512, 1024, 2048, 4096, 8192, 16384):
+    for head_dim in (64, 128, 256):
+      for causal in (True, False):
+        for dtype in ('bfloat16', 'float16'):
+          batch_size = num_tokens // seq_len
+          num_heads = hidden_dim // head_dim
+          shape = ShapeDtype(
+              shape=(batch_size, seq_len, num_heads, head_dim), dtype=dtype
+          )
+          spec = arg_spec.ArgSpec(
+              args={
+                  'q': shape,
+                  'k': shape,
+                  'v': shape,
+                  'is_causal': causal,
+              },
+              project='flash_attention_v3',
+              name=f'seq_len={seq_len}_head_dim={head_dim}_causal={causal}_dtype={dtype}',
+          )
+          specs.append(spec)
+  return tuple(specs)
+
+
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     arg_spec.ArgSpec(
         args={
@@ -79,4 +113,4 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         },
         project='alphafold',
     ),
-)
+) + _flash_attention_v3_specs()

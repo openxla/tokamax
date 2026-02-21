@@ -54,6 +54,7 @@ test = [
 ]
 
 bench = [
+    "libtpu>=0.0.35",
     "google-benchmark>=1.9.0",
     "xprof",
 ]

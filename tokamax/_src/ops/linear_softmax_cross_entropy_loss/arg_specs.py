@@ -125,4 +125,36 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
             (jnp.bfloat16, jnp.float32),
         )
     )
+    + tuple(
+        _create_arg_spec(
+            batch_dim=batch_dim,
+            hidden_dim=2880,
+            output_dim=201088,
+            reduction=reduction,
+            x_dtype=x_dtype,
+            w_dtype=jnp.bfloat16,
+            project='gpt-oss-120b',
+        )
+        for batch_dim, reduction, x_dtype in itertools.product(
+            (1024, 2048, 4096, 8192, 16384, 32768),
+            ('mean', 'sum'),
+            (jnp.bfloat16, jnp.float32),
+        )
+    )
+    + tuple(
+        _create_arg_spec(
+            batch_dim=batch_dim,
+            hidden_dim=5120,
+            output_dim=151936,
+            reduction=reduction,
+            x_dtype=x_dtype,
+            w_dtype=jnp.bfloat16,
+            project='qwen3-32b',
+        )
+        for batch_dim, reduction, x_dtype in itertools.product(
+            (1024, 2048, 4096, 8192, 16384, 32768),
+            ('mean', 'sum'),
+            (jnp.bfloat16, jnp.float32),
+        )
+    )
 )

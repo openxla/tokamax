@@ -50,8 +50,8 @@ class SegmentIds(NamedTuple):
     kv: segment ids along the KV sequence
   """
 
-  q: jax.Array  # [q_seq_len]
-  kv: jax.Array  # [kv_seq_len]
+  q: jax.Array | jax.sharding.PartitionSpec  # [q_seq_len]
+  kv: jax.Array | jax.sharding.PartitionSpec  # [kv_seq_len]
 
 
 # Return type of SplashAttention function that implements the custom vjp rule.

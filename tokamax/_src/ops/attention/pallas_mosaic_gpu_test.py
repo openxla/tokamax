@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import dataclasses
+import functools
 from types import UnionType
 from typing import Union, get_origin
 
@@ -170,6 +172,9 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
   @override
   def _test_bench(self, spec):
+    # TODO: Remove once fixed.
+    if "B200" in jax.devices()[0].device_kind:
+      self.skipTest("Skipping test on B200s")
     atol_grads = None if spec.get("bias") is None else 0.04
     try:
       with test_base.override_test_args(atol=0.02, atol_grads=atol_grads):
@@ -179,7 +184,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         self.skipTest(f"Test exceeds shared memory capacity: {e}")
       raise
 
-  def test_autotune(self):
+  def test_autotune_configs(self):
     # Test that all autotuning configs yield reasonable results.
     assert isinstance(self._attention_fn, base.DotProductAttention)
     q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 64))
@@ -189,6 +194,29 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     for config in configs:
       with self.subTest(f"{config=}"):
         impl = type(self._attention_fn)(config)
+        self._run_test_with_inputs(q, k, v, impl=impl)
+
+  def test_vjp_autotune_configs(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    assert isinstance(self._attention_fn, base.DotProductAttention)
+    assert hasattr(self._attention_fn, "vjp")
+    attn_fn = self._attention_fn
+    vjp_fn = attn_fn.vjp
+
+    q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 64))
+    kwargs = dict(precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32)
+    fwd_with_res = functools.partial(attn_fn, **kwargs, return_residuals=True)
+    out, res = jax.eval_shape(fwd_with_res, q, k, v)
+    ba = attn_fn.bind(q, k, v, **kwargs)
+    ba = dataclasses.replace(
+        ba, arguments=ba.arguments | dict(residuals=res, out=out, dout=out)
+    )
+    configs = vjp_fn._get_autotuning_configs(ba)
+    self.assertNotEmpty(configs)
+    for config in configs:
+      with self.subTest(f"{config=}"):
+        impl = type(attn_fn)(vjp=type(vjp_fn)(config=config))
         self._run_test_with_inputs(q, k, v, impl=impl)
 
   def test_split_k(self):

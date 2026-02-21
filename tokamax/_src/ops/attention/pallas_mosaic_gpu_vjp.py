@@ -201,18 +201,11 @@ class PallasMosaicGpuFlashAttentionVjp(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return Config(
-        block_q_dkv=64,
-        block_kv_dkv=64,
-        block_q_dq=64,
-        block_kv_dq=64,
-        num_stages=2,
-    )
+    return sm90.get_heuristics_config(ba)
 
-  # TODO: Implement an autotuning search space.
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    return set()
+    return sm90.get_autotuning_configs(ba)
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

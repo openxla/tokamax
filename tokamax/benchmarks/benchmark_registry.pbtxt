@@ -26,11 +26,28 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
-    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=None,mosaic" }
+  }
+
+  environment_configs {
+    id: "TPUv6e"
+    runner_label: "linux-x86-ct6e-44-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workflow_type: [SCHEDULED]
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn" }
+  }
+
+  environment_configs {
+    id: "TPUv7"
+    runner_label: "linux-x86-tpu7x-56-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workflow_type: [SCHEDULED]
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn" }
   }
 
   metrics {
-    name: "attention/default/forward"
+    name: "attention/basic/default/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -38,7 +55,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/default/forward_and_vjp"
+    name: "attention/basic/default/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -46,7 +63,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/triton/forward"
+    name: "attention/basic/triton/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -54,7 +71,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/triton/forward_and_vjp"
+    name: "attention/basic/triton/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -62,7 +79,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/mosaic/forward"
+    name: "attention/basic/mosaic/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -70,7 +87,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/mosaic/forward_and_vjp"
+    name: "attention/basic/mosaic/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -78,7 +95,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/cudnn/forward"
+    name: "attention/basic/cudnn/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -86,7 +103,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/cudnn/forward_and_vjp"
+    name: "attention/basic/cudnn/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -94,7 +111,7 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/xla/forward"
+    name: "attention/basic/xla/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -102,7 +119,119 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/xla/forward_and_vjp"
+    name: "attention/basic/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/basic/xla_chunked/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/basic/xla_chunked/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/default/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/default/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/triton/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/triton/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/mosaic/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/mosaic/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/cudnn/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/cudnn/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/xla/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/xla_chunked/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/alphafold/xla_chunked/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -135,6 +264,22 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
+  }
+
+  environment_configs {
+    id: "TPUv6e"
+    runner_label: "linux-x86-ct6e-44-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workflow_type: [SCHEDULED]
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+  }
+
+  environment_configs {
+    id: "TPUv7"
+    runner_label: "linux-x86-tpu7x-56-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workflow_type: [SCHEDULED]
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
   }
 
   metrics {
@@ -187,6 +332,8 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
+    # Disable 'xla' as this OOM on GPU.
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla" }
   }
 
   environment_configs {
@@ -195,6 +342,27 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
+    # Disable 'xla' as this OOM on GPU.
+    # TODO: enable 'mosaic' and None once the bug is fixed.
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla,None,mosaic" }
+  }
+
+  environment_configs {
+    id: "TPUv6e"
+    runner_label: "linux-x86-ct6e-44-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workflow_type: [SCHEDULED]
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton" }
+  }
+
+  environment_configs {
+    id: "TPUv7"
+    runner_label: "linux-x86-tpu7x-56-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workflow_type: [SCHEDULED]
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton" }
   }
 
   metrics {
@@ -244,5 +412,22 @@ benchmarks {
       stat: MEDIAN
     }
   }
+
+  metrics {
+    name: "ragged_dot/xla/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
 }
 

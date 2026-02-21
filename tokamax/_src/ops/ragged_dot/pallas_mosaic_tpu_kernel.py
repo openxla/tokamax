@@ -620,6 +620,7 @@ def gmm(
         "rhs_qdtype",
         "rhs_static_scale",
         "activation",
+        "combine_scopes",
     ],
 )
 def tgmm(
@@ -639,6 +640,7 @@ def tgmm(
     rhs_qdtype: jnp.dtype | None = None,
     rhs_static_scale: float | None = None,
     activation: base.ActivationFunction | None = None,
+    combine_scopes: bool = False,
 ) -> jax.Array:
   """Compute lhs[:, sizes[i-1]:sizes[i]] @ rhs[sizes[i-1]:sizes[i], :].
 
@@ -741,14 +743,22 @@ def tgmm(
     group_offsets, group_ids, _ = group_metadata
     group = group_ids[grid_id]
     prev_group = group_ids[jnp.where(grid_id > 0, grid_id - 1, 0)]
+    is_prologue = (grid_id == 0) | (group != prev_group)
+    is_end_of_grid = grid_id == (pl.num_programs(2) - 1)
+    next_group = group_ids[jnp.where(is_end_of_grid, grid_id, grid_id + 1)]
+    is_epilogue = is_end_of_grid | (group != next_group)
+    group_size = group_offsets[group + 1] - group_offsets[group]
+    nonzero_gs = group_size > 0
 
-    @pl.when((grid_id == 0) | (group != prev_group))  # Group has changed.
     def _zero_acc():
       acc_scratch[...] = jnp.zeros_like(acc_scratch)
 
-    group_size = group_offsets[group + 1] - group_offsets[group]
+    def _store_accum():
+      acc = acc_scratch[...]
+      if activation is not None:
+        acc = activation(acc)
+      out_ref[...] = acc.astype(out_dtype)
 
-    @pl.when(group_size > 0)
     def _do():
       # load lhs and rhs
       lhs = jax.tree.map(lambda x: x[...], lhs_ref)
@@ -780,18 +790,58 @@ def tgmm(
       # apply scales to the output if the inputs were quantized
       for scale in scales:
         out = _scale_out_by_scale(out, scale)
-
       acc_scratch[...] += out.astype(acc_scratch.dtype)
 
-    is_end_of_grid = grid_id == (pl.num_programs(2) - 1)
-    next_group = group_ids[jnp.where(is_end_of_grid, grid_id, grid_id + 1)]
+    if combine_scopes:
+      # every conditional introduces an optimization barrier, so splitting this
+      # into 6 possible cases (with the sixth case being a no-op) allows the
+      # compiler to overlap the work within the bramches
+      @pl.when(nonzero_gs & ~is_prologue & ~is_epilogue)
+      def _case1():
+        with jax.named_scope("compute_only"):
+          _do()
 
-    @pl.when(is_end_of_grid | (group != next_group))
-    def _store_accum():
-      acc = acc_scratch[...]
-      if activation is not None:
-        acc = activation(acc)
-      out_ref[...] = acc.astype(out_dtype)
+      @pl.when(nonzero_gs & is_prologue & ~is_epilogue)
+      def _case2():
+        with jax.named_scope("zero_accum_and_compute"):
+          _zero_acc()
+          _do()
+
+      @pl.when(nonzero_gs & ~is_prologue & is_epilogue)
+      def _case3():
+        with jax.named_scope("compute_and_store_accum"):
+          _do()
+          _store_accum()
+
+      @pl.when(nonzero_gs & is_prologue & is_epilogue)
+      def _case4():
+        with jax.named_scope("do_all"):
+          _zero_acc()
+          _do()
+          _store_accum()
+
+      @pl.when(~nonzero_gs & is_epilogue)
+      def _case5():
+        with jax.named_scope("zero_output_for_empty_group"):
+          if activation is not None:
+            out_ref[...] = activation(jnp.zeros_like(out_ref))
+          else:
+            out_ref[...] = jnp.zeros_like(out_ref)
+    else:
+      @pl.when(is_prologue)
+      def _stage1():
+        with jax.named_scope("zero_accum"):
+          _zero_acc()
+
+      @pl.when(nonzero_gs)
+      def _stage2():
+        with jax.named_scope("compute"):
+          _do()
+
+      @pl.when(is_epilogue)
+      def _stage3():
+        with jax.named_scope("store_accum"):
+          _store_accum()
 
   def lhs_index_map(n_i, k_i, grid_id, group_metadata, group_offset):
     del n_i, group_offset  # Unused.

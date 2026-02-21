@@ -9,12 +9,13 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   run_benchmarks:
     name: Run Tokamax benchmarks
-    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@41d4df7f511683b977b4fa80cece1a06fabc061d
+    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@d338127d8da5d0f8cc5aee8e73c17808584388d3
     with:
       registry_file: "tokamax/benchmarks/benchmark_registry.pbtxt"
       workflow_type: "SCHEDULED"
-      ml_actions_ref: "41d4df7f511683b977b4fa80cece1a06fabc061d"
+      ml_actions_ref: "d338127d8da5d0f8cc5aee8e73c17808584388d3"

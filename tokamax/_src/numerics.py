@@ -201,8 +201,11 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
 
       if abstract_qvalue and abstract_scale:
         x = qwix.QArray(_as_vmap_shape(x.qvalue), _as_vmap_shape(x.scale))  # pytype: disable=wrong-arg-types
-        dtype = jnp.promote_types(x.dtype, jnp.float32)
-        values = rng.standard_normal(size=x.shape, dtype=dtype).astype(x.dtype)
+        try:
+          dtype_ = jnp.promote_types(x.dtype, jnp.float32)
+        except jax._src.dtypes.TypePromotionError:
+          dtype_ = jnp.float32
+        values = rng.standard_normal(size=x.shape, dtype=dtype_).astype(x.dtype)
         tiled_axes = {i: d for i, d in enumerate(x.scale_tile_shape)}
         return qwix.quantize(values, x.qvalue.dtype, tiled_axes=tiled_axes)
       elif not abstract_qvalue and not abstract_scale:
@@ -216,8 +219,11 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     x = _as_vmap_shape(x)
     dtype = jnp.dtype(x.dtype)
 
-    if 'float' in dtype.name:
-      dtype_ = jnp.promote_types(dtype, jnp.float32)
+    if jnp.issubdtype(dtype, jnp.floating):
+      try:
+        dtype_ = jnp.promote_types(dtype, jnp.float32)
+      except jax._src.dtypes.TypePromotionError:
+        dtype_ = jnp.float32
       y = rng.standard_normal(size=x.shape, dtype=dtype_).astype(dtype)
     elif dtype.name == 'bool':
       y = rng.binomial(n=1, p=0.5, size=x.shape).astype(dtype)

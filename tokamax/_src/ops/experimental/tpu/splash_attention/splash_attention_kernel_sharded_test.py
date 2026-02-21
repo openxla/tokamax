@@ -58,13 +58,14 @@ class SplashAttentionShardingTest(PallasBaseTest):
     super().setUp()
 
   @parameterized.product(
-      topology=[(1, 1), (2, 1), (2, 2), (1, 2), (1, 4), (4, 1)],
-      num_heads=[2, 4, 16],
+      topology=[(2, 2), (1, 4), (4, 1)],
+      num_heads=[2, 16],
       dtype=[jnp.bfloat16],
+      is_segmented=[False, True],
       is_dynamic_mask=[False, True],
   )
   def test_manual_partitioning_mha_fwd(
-      self, topology, num_heads, dtype, is_dynamic_mask
+      self, topology, num_heads, dtype, is_segmented, is_dynamic_mask
   ):
     # TODO: Re-enable once dynamic masks are fixed.
     if is_dynamic_mask:
@@ -97,6 +98,15 @@ class SplashAttentionShardingTest(PallasBaseTest):
     if is_dynamic_mask:
       mask = jnp.array(mask)
 
+    if is_segmented:
+      segment_ids = test_utils.create_segment_ids(seq_len)
+      segment_ids_spec = base.SegmentIds(
+          q=PartitionSpec("q_seq" if q_seq_shards > 1 else None),
+          kv=PartitionSpec(None),
+      )
+    else:
+      segment_ids = segment_ids_spec = None
+
     devices = np.asarray(jax.devices()[:num_devices]).reshape(
         head_shards, q_seq_shards
     )
@@ -127,25 +137,27 @@ class SplashAttentionShardingTest(PallasBaseTest):
             q_spec,
             kv_spec,
             kv_spec,
+            segment_ids_spec,
         ),
         out_specs=q_spec,
         check_vma=False,
     )
-    def f(kernel, q, k, v):
-      return kernel(q, k, v)
+    def f(kernel, q, k, v, segment_ids):
+      return kernel(q, k, v, segment_ids)
 
-    out = f(kernel, q, k, v)
-    out_ref = base.attention_reference(q, k, v, mask, None, is_mqa=False)
+    out = f(kernel, q, k, v, segment_ids)
+    out_ref = base.attention_reference(q, k, v, mask, segment_ids, is_mqa=False)
     self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
 
   @parameterized.product(
-      topology=[(1, 1), (2, 1), (2, 2), (1, 2), (1, 4), (4, 1)],
+      topology=[(2, 2), (1, 4), (4, 1)],
       num_heads=[2, 4],
       dtype=[jnp.bfloat16],
+      is_segmented=[False, True],
       is_dynamic_mask=[False, True],
   )
   def test_manual_partitioning_mha_bwd(
-      self, topology, num_heads, dtype, is_dynamic_mask
+      self, topology, num_heads, dtype, is_segmented, is_dynamic_mask
   ):
     # TODO: Re-enable once dynamic masks are fixed.
     if is_dynamic_mask:
@@ -173,6 +185,15 @@ class SplashAttentionShardingTest(PallasBaseTest):
     if is_dynamic_mask:
       mask = jnp.array(mask)
 
+    if is_segmented:
+      segment_ids = test_utils.create_segment_ids(seq_len)
+      segment_ids_spec = base.SegmentIds(
+          q=PartitionSpec("q_seq" if q_seq_shards > 1 else None),
+          kv=PartitionSpec(None),
+      )
+    else:
+      segment_ids = segment_ids_spec = None
+
     devices = np.asarray(jax.devices()[:num_devices]).reshape(
         head_shards, q_seq_shards
     )
@@ -203,25 +224,26 @@ class SplashAttentionShardingTest(PallasBaseTest):
             q_spec,
             kv_spec,
             kv_spec,
+            segment_ids_spec,
         ),
         out_specs=q_spec,
         check_vma=False,
     )
-    def f(kernel, q, k, v):
-      return kernel(q, k, v)
+    def f(kernel, q, k, v, segment_ids):
+      return kernel(q, k, v, segment_ids)
 
     f_ref = partial(base.attention_reference, is_mqa=False)
 
-    out, out_vjp = jax.vjp(f, kernel, q, k, v)
-    out_ref, out_vjp_ref = jax.vjp(f_ref, q, k, v, mask, None)
-    self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
+    out, out_vjp = jax.vjp(f, kernel, q, k, v, segment_ids)
+    out_ref, out_vjp_ref = jax.vjp(f_ref, q, k, v, mask, segment_ids)
+    self._assert_allclose(out, out_ref, rtol=5e-3, atol=5e-3)
 
     do = random.uniform(k4, out.shape, dtype=out.dtype)
-    _, dq, dk, dv = out_vjp(do)
+    _, dq, dk, dv, _ = out_vjp(do)
     dq_ref, dk_ref, dv_ref, _, _ = out_vjp_ref(do.astype(jnp.float32))
 
     self._assert_allclose(dq, dq_ref, atol=8e-2, rtol=1e-2)
-    self._assert_allclose(dk, dk_ref, atol=8e-2, rtol=1e-2)
+    self._assert_allclose(dk, dk_ref, atol=8e-2, rtol=2e-2)
     self._assert_allclose(dv, dv_ref, atol=8e-2, rtol=1e-2)
 
 

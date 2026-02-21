@@ -52,11 +52,20 @@ class Config(common.ConfigBase):
   pass
 
 
-def get_heuristics_config(ba: op.BoundArguments) -> Config:
-  """Returns a heuristic configuration for flash attention on SM90 GPUs."""
+def _estimate_shared_mem_usage_bytes(ba, block_q, block_kv, num_stages):
+  """Estimates the shared memory usage in bytes for a given configuration."""
   q, k, v = ba.args
-  head_dim = k.shape[-1]
-  head_dim_out = v.shape[-1]
+  tile_q = 2 * block_q
+
+  # 32-bit floats are downcast to 16-bit before the kernel call.
+  dtype_bits = jnp.finfo(jnp.bfloat16).bits
+  m = 8 * _MIN_SWIZZLE // dtype_bits
+  block_d = pl.cdiv(q.shape[-1], m) * m
+  block_d_out = v.shape[-1]
+  bytes_per_stage = block_kv * block_d_out * dtype_bits // 8
+  if (bias := ba.kwargs["bias"]) is not None:
+    if bias.shape[-2] != 1 and bias.shape[-1] != 1:
+      bytes_per_stage += tile_q * block_kv * jnp.finfo(bias.dtype).bits // 8
 
   mask = ba.kwargs["mask"]
   q_indices = ba.kwargs["q_indices"]
@@ -64,28 +73,21 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   mask, *_ = jax.eval_shape(
       common.decompose_mask, mask, q, k, q_indices, k_indices
   )
-  # 32-bit floats are downcast to 16-bit before the kernel call.
-  dtype_bits = jnp.finfo(jnp.bfloat16).bits
+  if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
+    bytes_per_stage += tile_q * block_kv
 
-  def shared_mem_usage_bytes(block_q, block_kv, num_stages):
-    bytes_per_stage = (
-        block_kv * head_dim * dtype_bits // 8
-        + block_kv * head_dim_out * dtype_bits // 8
-    )
-    if (bias := ba.kwargs["bias"]) is not None:
-      bytes_per_stage += (
-          2 * block_q * block_kv * jnp.finfo(bias.dtype).bits // 8
-      )
-    # FIXME: This is an overestimate for broadcast masks.
-    if mask is not None:
-      bytes_per_stage += 2 * block_q * block_kv
-    return (
-        2 * block_q * head_dim * dtype_bits // 8
-        + num_stages * bytes_per_stage
-        + 1000  # Add some extra for barriers.
-    )
+  # `q`/`k` and the outputs are in a union.
+  q_k_elems = (tile_q + num_stages * block_kv) * block_d
+  out_elems = tile_q * block_d_out
+  return (
+      (max(q_k_elems, out_elems) * dtype_bits // 8)
+      + num_stages * bytes_per_stage
+      + 2200  # Add some extra for barriers, etc. (slight overestimate).
+  )
 
-  if shared_mem_usage_bytes(64, 128, 2) < 227 * 1024:
+
+def get_heuristics_config(ba: op.BoundArguments) -> Config:
+  if _estimate_shared_mem_usage_bytes(ba, 64, 128, 2) < 227 * 1024:
     return Config(block_q=64, block_kv=128, num_stages=2)
 
   # This is a pretty good option that works for most cases.
@@ -200,15 +202,10 @@ def flash_attention_kernel(
         (v_barriers, v_consumed_barriers),
         bias_barriers,
         (mask_barriers, mask_consumed_barriers),
-        schedule_barrier,
     ) = scoped
 
     at_wg = lambda x: x.at[wg]
     q_smem, q_barrier, o_smem = map(at_wg, (q_smems, q_barriers, o_smems))
-
-    def schedule_barrier_arrive_and_wait():
-      plgpu.barrier_arrive(schedule_barrier)
-      plgpu.barrier_wait(schedule_barrier)
 
     def get_kv_ranges():
       lb = 0
@@ -235,7 +232,7 @@ def flash_attention_kernel(
       return lb, ub, k_start_max, k_end_min
 
     @pl.when(wg < 2)
-    def _compute_wg():
+    def compute_wg():
       q_base = (2 * qi + wg) * block_q
       qs = pl.ds(q_base, block_q)
 
@@ -258,6 +255,14 @@ def flash_attention_kernel(
       def _():
         plgpu.barrier_wait(k_barriers.at[lax.rem(lb, max_stages)])
 
+      # MGPU uses the lower barrier IDs, so use barriers 8 and 9 for scheduling.
+      schedule_barrier_arrive = functools.partial(
+          common.bar_arrive, barrier_id=9 - wg, num_threads=256
+      )
+      schedule_barrier_arrive_and_wait = functools.partial(
+          common.bar_sync, barrier_id=8 + wg, num_threads=256
+      )
+
       pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
 
       def loop_body(ki, carry, *, do_causal=False):
@@ -271,6 +276,7 @@ def flash_attention_kernel(
 
         def compute_qk(acc):
           plgpu.wgmma(acc, q_smem, k_smems.at[si].T)
+          schedule_barrier_arrive()
           if bias_gmem is None:
             bias = None
           elif bias_smems is None:
@@ -278,14 +284,12 @@ def flash_attention_kernel(
           else:
             plgpu.barrier_wait(bias_barriers.at[si])
             bias = bias_smems[si, block.ds(wg, block_q)]
-          plgpu.barrier_arrive(schedule_barrier)
           mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
           return acc[...], bias, mask
 
         acc_type = plgpu.ACC(block_q_kv, jnp.float32)
         s, bias, mask = pl.run_scoped(compute_qk, acc_type)
         plgpu.barrier_arrive(k_consumed_barriers.at[si])
-        plgpu.barrier_wait(schedule_barrier)
 
         scale = logits_scale
 
@@ -363,9 +367,8 @@ def flash_attention_kernel(
           l_i += p.sum(axis=1)
           acc, l_i, m_i, p_ = lax.optimization_barrier((acc, l_i, m_i, p_))
 
-        plgpu.barrier_arrive(schedule_barrier)
         plgpu.barrier_wait(v_barriers.at[si])
-        plgpu.barrier_wait(schedule_barrier)
+        schedule_barrier_arrive_and_wait()
 
         def compute_pv(refs):
           acc, l_i = refs
@@ -396,7 +399,7 @@ def flash_attention_kernel(
       else:
         acc, m_i, l_i = lax.fori_loop(lb, ub, loop_body, (acc, m_i, l_i))
 
-      pl.when(wg == 0)(schedule_barrier_arrive_and_wait)
+      pl.when(wg == 0)(schedule_barrier_arrive)
 
       if return_residuals:
         m_smem, l_smem = map(at_wg, residual_smems)
@@ -404,8 +407,8 @@ def flash_attention_kernel(
         l_smem[...] = l_i
         plgpu.commit_smem()
         m_gmem, l_gmem = residual_gmems
-        plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[hi, qs])
-        plgpu.copy_smem_to_gmem(l_smem, l_gmem.at[hi, qs])
+        plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[hi, qs], commit_group=False)
+        plgpu.copy_smem_to_gmem(l_smem, l_gmem.at[hi, qs], commit_group=False)
 
       l_i += float(jnp.finfo(jnp.float32).tiny)
 
@@ -419,7 +422,7 @@ def flash_attention_kernel(
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     @pl.when(wg == 2)
-    def _memory_wg():
+    def memory_wg():
       plgpu.set_max_registers(40, action="decrease")
       hi_kv = lax.div(hi, q_heads_per_kv_head)
       qs = block.ds(qi, 2 * block_q)
@@ -443,7 +446,7 @@ def flash_attention_kernel(
       lb, ub, _, _ = get_kv_ranges()
 
       @pl.loop(lb, lax.min(lb + max_stages, ub))
-      def _preload_kv_bias_mask(ki):
+      def prologue(ki):
         si = lax.rem(ki, max_stages)
         ks = block.ds(ki, block_kv)
         cp(k_gmem.at[ks, hi_kv], k_smems, k_barriers, si)
@@ -454,7 +457,7 @@ def flash_attention_kernel(
         cp(v_gmem.at[ks, hi_kv], v_smems, v_barriers, si)
 
       @pl.loop(lb, ub - max_stages)
-      def _kv_loop(ki):
+      def kv_loop(ki):
         si = lax.rem(ki, max_stages)
         ks = block.ds(ki + max_stages, block_kv)
         plgpu.barrier_wait(k_consumed_barriers.at[si])
@@ -485,7 +488,6 @@ def flash_attention_kernel(
         plgpu.Barrier(num_barriers=max_stages),
         plgpu.Barrier(num_barriers=max_stages, num_arrivals=compute_wgs),
     )
-    schedule_barrier = plgpu.Barrier(num_arrivals=compute_wgs)
 
     bias_mask_smem_shape = (max_stages, compute_wgs * block_q, block_kv)
     # bias doesn't need a consumed barrier as it is implied by k consumed.
@@ -518,7 +520,6 @@ def flash_attention_kernel(
         kv_barriers,
         bias_barrier,
         mask_barriers,
-        schedule_barrier,
         collective_axes="wg",
     )
 
