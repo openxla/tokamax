@@ -18,7 +18,7 @@
 
 import dataclasses
 import functools
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import jax
 from jax.extend import backend
@@ -28,7 +28,9 @@ from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
+from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_common as vjp_common
+from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm100 as sm100
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm90 as sm90
 from typing_extensions import override
 
@@ -42,45 +44,13 @@ def _broadcast_to_rank(x, rank):
   return None if x is None else jax.lax.broadcast_to_rank(x, rank)
 
 
-def _decompose_mask(mask, q, k, q_indices, k_indices):
-  """Decomposes `mask` into a mask array, `is_causal`, `k_start` and `k_end`."""
-  if mask is None:
-    return None, False, None, None
-
-  is_causal = False
-  k_start = None
-  k_end = None
-
-  if k_indices is None:
-    mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
-
-    # Fold `is_causal` into `k_end`. If `q_indices` is not `None`, then this is
-    # necessary for correctness. Otherwise, it is a performance optimization.
-    if is_causal and (q_indices is not None or k_end is not None):
-      if q_indices is None:
-        q_indices = jnp.arange(q.shape[-3])
-      k_end_ = q_indices + 1
-      k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
-      is_causal = False
-
-    if k_start is not None:
-      k_start = jax.lax.broadcast_to_rank(k_start, 2)
-    if k_end is not None:
-      k_end = jax.lax.broadcast_to_rank(k_end, 2)
-
-  q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
-  k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
-  mask = mask.as_array(q_len_or_indices, k_len_or_indices)
-  return mask, is_causal, k_start, k_end
-
-
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasMosaicGpuFlashAttentionVjp(
     base.DotProductAttentionVjp[Config, None]
 ):
   """Pallas-Triton FlashAttention VJP implementation."""
 
-  config_cls: ClassVar[type[Config]] = Config
+  config_cls: ClassVar[Any] = Config | sm100.Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = True
   dbias_intermediate_dtype: jax.typing.DTypeLike | None = None
@@ -109,7 +79,7 @@ class PallasMosaicGpuFlashAttentionVjp(
       k_indices: Int[Array, "*#B #h t"] | None,
       normalize_output: bool,
       return_residuals: bool,
-      config: Config,
+      config: Config | sm100.Config,
   ) -> tuple[base.DotProductAttentionGrads, None]:
     del dropout_rate
 
@@ -118,10 +88,16 @@ class PallasMosaicGpuFlashAttentionVjp(
 
     compute_capability = float(backend.get_default_device().compute_capability)
 
-    if compute_capability < 9.0 or compute_capability >= 10.0:
+    if compute_capability < 9.0 or compute_capability > 10.0:
       raise NotImplementedError(
-          "Mosaic GPU backend only supported for sm90 GPUs for now."
+          "Mosaic GPU backend only supported for sm90 and sm100 GPUs."
       )
+
+    if compute_capability >= 10.0 and not isinstance(config, sm100.Config):
+      raise NotImplementedError("SM100 config required for sm100 GPUs.")
+
+    if compute_capability < 10.0 and not isinstance(config, sm90.Config):
+      raise NotImplementedError("SM90 config required for sm90 GPUs.")
 
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
@@ -138,7 +114,7 @@ class PallasMosaicGpuFlashAttentionVjp(
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
 
-    mask, is_causal, k_start, k_end = _decompose_mask(
+    mask, is_causal, k_start, k_end = common.decompose_mask(
         mask, q, k, q_indices, k_indices
     )
 
@@ -169,6 +145,24 @@ class PallasMosaicGpuFlashAttentionVjp(
     k_start = _broadcast_to_rank(k_start, q.ndim - 1)
     k_end = _broadcast_to_rank(k_end, q.ndim - 1)
 
+    if isinstance(config, sm100.Config):
+      if compute_capability < 10.0:
+        raise ValueError("SM100 config provided but compute capability < 10.0")
+      # TMA requires 16-byte aligned strides. If the last dimension is
+      # 1 (e.g.  broadcasting), the stride of the second-to-last
+      # dimension is small (1 element), violating the requirement. We
+      # broadcast explicitly to fix this.  Note: mask is cast to int8
+      # in the kernel, which materializes the array and fixes the
+      # strides. bias is not cast, so we must materialize it here.
+      # TODO: Fuse the broadcast.
+      kv_seq_len = k.shape[-3]
+      if mask is not None and mask.shape[-1] == 1 and kv_seq_len > 1:
+        mask = jnp.broadcast_to(mask, mask.shape[:-1] + (kv_seq_len,))
+      if bias is not None and bias.shape[-1] == 1 and kv_seq_len > 1:
+        bias = jnp.broadcast_to(bias, bias.shape[:-1] + (kv_seq_len,)).astype(
+            bias.dtype
+        )
+
     if bias is None:
       ds_dtype = None
     elif self.dbias_intermediate_dtype is None:
@@ -178,33 +172,51 @@ class PallasMosaicGpuFlashAttentionVjp(
     else:
       ds_dtype = self.dbias_intermediate_dtype
 
-    f = functools.partial(
-        sm90.flash_attention_vjp_kernel,
+    kwargs = dict(
+        is_causal=is_causal,
         logits_scale=logits_scale,
         logits_soft_cap=logits_soft_cap,
-        is_causal=is_causal,
         use_base2=self.use_base2,
         ds_dtype=ds_dtype,
         config=config,
     )
 
-    dq, dk, dv, ds = base.vmap_batch_dims(f)(
-        q, k, v, residuals, out, dout, bias, mask, k_start, k_end
-    )
-    if bias is None:
-      dbias = None
+    if isinstance(config, sm100.Config):
+      kernel_fn = sm100.flash_attention_vjp_kernel
     else:
-      broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
-      dbias = jnp.sum(ds, axis=broadcast_bias_axes)
-      dbias = dbias.astype(bias.dtype).reshape(orig_bias_shape)
+      kernel_fn = sm90.flash_attention_vjp_kernel
+
+    f = functools.partial(kernel_fn, **kwargs)
+    if isinstance(config, sm90.Config):
+      f = base.vmap_batch_dims(f)
+
+    dq, dk, dv, ds = f(q, k, v, residuals, out, dout, bias, mask, k_start, k_end)
+
+    dbias = None
+    if isinstance(config, sm90.Config):
+      if bias is not None:
+        broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
+        dbias = jnp.sum(ds, axis=broadcast_bias_axes).astype(bias.dtype)
+        dbias = dbias.reshape(orig_bias_shape)
+    else:
+      dbias = ds
+
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
   @override
-  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+  def _get_heuristics_config(
+      self, ba: op.BoundArguments
+  ) -> sm90.Config | sm100.Config:
+    compute_capability = float(backend.get_default_device().compute_capability)
+    if compute_capability >= 10.0:
+      return sm100.get_heuristics_config(ba)
     return sm90.get_heuristics_config(ba)
 
   @override
-  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[sm90.Config | sm100.Config]:
+    compute_capability = float(backend.get_default_device().compute_capability)
+    if compute_capability >= 10.0:
+      return sm100.get_autotuning_configs(ba)
     return sm90.get_autotuning_configs(ba)
 
   @override

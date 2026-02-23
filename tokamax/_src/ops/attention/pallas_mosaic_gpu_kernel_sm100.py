@@ -74,6 +74,15 @@ class Config(common.ConfigBase):
   num_tma_splits: pydantic.PositiveInt = 2
   collective: pydantic.StrictBool = True
 
+  def __post_init__(self):
+    block_q_per_cta = self.block_q // 2 if self.collective else self.block_q
+    if block_q_per_cta < 128:
+      raise ValueError(
+          f"For SM100 attention forward, block_q per CTA must be at least 128 "
+          f"to support TMEM slicing. Got block_q={self.block_q} with "
+          f"collective={self.collective}."
+      )
+
 
 def get_heuristics_config(ba: op.BoundArguments) -> Config:
   """Returns a heuristic configuration for flash attention on SM100 GPUs."""
