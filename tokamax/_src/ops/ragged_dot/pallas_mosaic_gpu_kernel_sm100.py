@@ -49,32 +49,16 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   block_m = config.block_m
   block_n = config.block_n
   block_k = config.block_k
-  num_stages = config.num_stages
   collective = config.collective
   cluster_block_m = (block_m * 2) if collective else block_m
   cluster_block_n = (block_n * 2) if collective else block_n
 
-  w, x = (rhs.mT, lhs)
-
-  (num_groups, n, k_w), (m, k_x) = w.shape, x.shape
-  if k_w != k_x:
-    raise ValueError(
-        f"Contraction dim mismatch: weights.shape[1]={k_w}, x.shape[-1]={k_x}"
-    )
-  if group_sizes.shape != (num_groups,):
-    raise ValueError(
-        "Expected group_sizes to have shape"
-        f" {(num_groups,)} but got {group_sizes.shape}"
-    )
-
-  # num_stages must be less than or equal to the number of blocks
-  num_stages = min(num_stages, k_w // block_k)
-
-  group_info = common.GroupInfo.create_aligned(
-      group_sizes, cluster_block_m, pl.cdiv(m, cluster_block_m) + num_groups - 1
-  )
-  m_iters = pl.cdiv(m, cluster_block_m) + num_groups - 1
+  m, k = lhs.shape
+  g, _, n = rhs.shape
+  m_iters = pl.cdiv(m, cluster_block_m) + g - 1
   n_iters = pl.cdiv(n, cluster_block_n)
+  k_iters = pl.cdiv(k, block_k)
+  num_stages = min(config.num_stages, k_iters)
 
   def kernel(
       x_gmem,
@@ -94,8 +78,6 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       acc_barrier,
       acc_consumed_barrier,
   ):
-    m, k = x_gmem.shape
-    ub = pl.cdiv(k, block_k)
     cluster_idx = lax.axis_index("cluster")
 
     @plgpu.nd_loop(
@@ -126,7 +108,8 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
             @pl.when(warp_id == _TMA_WARP)
             def tma_warp():
-              @pl.loop(0, ub)
+
+              @pl.loop(0, k_iters)
               def tma_loop(ki):
                 ks = pl.ds(ki * block_k, block_k)
                 si = lax.rem(ki, num_stages)
@@ -160,7 +143,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
                 with jax.named_scope("wait for store"):
                   plgpu.barrier_wait(acc_consumed_barrier.at[si_acc])
 
-              @pl.loop(0, ub)
+              @pl.loop(0, k_iters)
               def mma_loop_body(ki):
                 si_tma = lax.rem(ki, num_stages)
                 with jax.named_scope("wait for xw"):
@@ -218,22 +201,6 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
       return carry + (actual_size > 0)
 
-  def tiled_smem(shape, dtype, what=""):
-    transforms = common.tile_swizzle_transforms(shape, dtype, what)
-    return plgpu.SMEM(shape, dtype, transforms=transforms)
-
-  acc_smem = plgpu.SMEM(
-      (cluster_block_m, block_n),
-      dtype=out_dtype,
-      # workaround for ValueError: Dynamic slice base index (which is a
-      # dynamic value) cannot be statically proven to be divisible by
-      # the tiling (8)
-      transforms=(
-          plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
-          plgpu.SwizzleTransform(128),
-      ),
-  )
-
   if collective:
     acc_consumed_barrier = plgpu.ClusterBarrier(
         collective_axes=("cluster",), num_barriers=2, orders_tensor_core=True
@@ -243,13 +210,16 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
         num_barriers=2, orders_tensor_core=True
     )
 
+  tiled_smem = common.tiled_swizzled_smem
   scratch_shapes = dict(
-      x_smem=tiled_smem((num_stages, block_m, block_k), x.dtype, "x"),
-      w_smem=tiled_smem((num_stages, block_n, block_k), w.dtype, "w"),
+      x_smem=tiled_smem((num_stages, block_m, block_k), lhs.dtype, "x"),
+      w_smem=tiled_smem((num_stages, block_n, block_k), rhs.dtype, "w"),
       acc_tmem=plgpu.TMEM(
           (block_n, cluster_block_m * 2), jnp.float32, collective=collective
       ),
-      acc_smem=acc_smem,
+      acc_smem=tiled_smem(
+          (cluster_block_m, block_n), out_dtype, "acc", tiling_prefix=(1,)
+      ),
       xw_barrier=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),
       xw_consumed_barrier=plgpu.Barrier(
           num_barriers=num_stages, orders_tensor_core=True
@@ -277,9 +247,12 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
           profile_dir="sponge" if profile else "",
       ),
   )
+  group_info = common.GroupInfo.create_aligned(
+      group_sizes, cluster_block_m, m_iters
+  )
   return f(
-      x,
-      w,
+      lhs,
+      rhs.mT,
       group_info.block,
       group_info.group_id,
       group_info.start_within_block,
