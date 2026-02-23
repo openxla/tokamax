@@ -60,7 +60,7 @@ def _flops(lhs, rhs, *, group_sizes) -> int:
   """Returns the floating-point operations."""
   del lhs  # Unused.
   _, k, n = rhs.shape
-  return 2 * sum(group_sizes.value) * k * n
+  return 2 * int(sum(group_sizes.value)) * k * n
 
 
 _IMPLS = dict(
