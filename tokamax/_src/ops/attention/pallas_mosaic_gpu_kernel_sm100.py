@@ -52,6 +52,7 @@ _MMA_WARP = 0
 _TMA_LOAD_QK_WARP = 1
 _TMA_LOAD_V_WARP = 2
 _TMA_LOAD_MASK_WARP = 3
+_ALPHA_BARRIER_OFFSET = 8
 
 _load_bcast = common.load_bcast
 
@@ -258,7 +259,6 @@ def flash_attention_kernel(
         v_consumed_barrier,
         p_produced_barrier,
         p_consumed_barrier,
-        alpha_produced_barrier,
         out_scaled_barrier,
     ) = buffer_barriers
 
@@ -562,7 +562,7 @@ def flash_attention_kernel(
           @pl.when(ki > lb)
           def write_alpha_to_smem():
             alpha_smem.at[si][...] = alpha
-            plgpu.barrier_arrive(alpha_produced_barrier.at[si])
+            common.bar_arrive(si + _ALPHA_BARRIER_OFFSET, num_threads=256)
 
           m_i = m_ij
           with jax.named_scope("exp(SFU)"):
@@ -643,7 +643,7 @@ def flash_attention_kernel(
         block_d = 32
         ds = pl.ds(0, block_d)
         acc = acc_next = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
-        plgpu.barrier_wait(alpha_produced_barrier.at[slot])
+        common.bar_sync(slot + _ALPHA_BARRIER_OFFSET, num_threads=256)
         alpha = plgpu.load(alpha_smem, slot, layout=_TMEM_ROW)
 
         with jax.named_scope("scale_acc"):
@@ -740,7 +740,6 @@ def flash_attention_kernel(
       out_scaled_barrier = plgpu.Barrier(num_barriers=num_tma_splits)
       qk_consumed_barrier = plgpu.Barrier()
 
-    alpha_produced_barrier = plgpu.Barrier(num_barriers=2)
     p_consumed_barrier = plgpu.Barrier(num_barriers=2, orders_tensor_core=True)
 
     pl.run_scoped(
@@ -771,7 +770,6 @@ def flash_attention_kernel(
             v_consumed_barrier,
             p_produced_barrier,
             p_consumed_barrier,
-            alpha_produced_barrier,
             out_scaled_barrier,
         ),
         collective_axes="wg",
