@@ -75,6 +75,7 @@ class AttentionBenchmark(parameterized.TestCase):
         implementation == 'cudnn'
         and benchmark_mode == 'forward_and_vjp'
         and 'B200' in jax.devices()[0].device_kind
+        and args_spec_name == 'basic'
     ):
       self.skipTest('Skipping cudnn forward_and_vjp on B200.')
 
