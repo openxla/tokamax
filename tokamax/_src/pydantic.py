@@ -231,6 +231,7 @@ class ShapeDtype:
       f32=np.float32,
       f64=np.float64,
       bf16=jnp.bfloat16,
+      f8_e4m3fn=jnp.float8_e4m3fn,
   )
 
   @classmethod
