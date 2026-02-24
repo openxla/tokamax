@@ -111,31 +111,35 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
   )
 
   # Padding if V dimension is not aligned to the V block size
-  @pl.when(v_index == num_v_blocks - 1)
-  def pad_non_aligned_v_block():
-    if v_dim % v_block_size != 0:
+  if v_dim % v_block_size != 0:
+
+    @pl.when(v_index == num_v_blocks - 1)
+    def pad_non_aligned_v_block():
       rem = v_dim % v_block_size
-      w_ref[:, rem:] = jnp.zeros(
-          (w_ref.shape[0], w_ref.shape[1] - rem), dtype=w_ref.dtype
+      iota_mask = jax.lax.broadcasted_iota(
+          dtype=jnp.int32, shape=w_ref.shape, dimension=1
       )
+      w_ref[...] = jnp.where(iota_mask < rem, w_ref[...], 0)
 
   @pl.when(reduce(jnp.logical_and, (b_index == 0, v_index == 0, h_index == 0)))
-  def _():
+  def init_loss():
     loss_ref[0] = 0.0
 
   @pl.when(jnp.logical_and(v_index == 0, h_index == 0))
-  def _():
+  def init_lse():
     lse_ref[...] = jnp.full_like(lse_ref, -jnp.inf)
     b_block_loss_ref[0] = 0.0
 
   @pl.when(h_index == 0)
-  def _():
-    xw_tiled[...] = jnp.zeros_like(xw_tiled)
+  def init_xw():
+    xw_tiled[...] = x_ref[...] @ w_ref[...]
 
-  xw_tiled[...] += x_ref[...] @ w_ref[...]
+  @pl.when(h_index != 0)
+  def accumulate_xw():
+    xw_tiled[...] += x_ref[...] @ w_ref[...]
 
   @pl.when(h_index == num_h_blocks - 1)
-  def _():
+  def accumulate_loss():
     # Convert labels to one-hot, due to chunking on v dimension, the indices
     # needs to be shifted down by the v starting index. Negative or out-of-bound
     # indices are OK since jax.nn.one_hot will set them to 0.
@@ -150,7 +154,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
   @pl.when(
       jnp.logical_and(v_index == num_v_blocks - 1, h_index == num_h_blocks - 1)
   )
-  def _():
+  def perform_loss_reduction():
     b_block_loss_ref[0] += jnp.sum(lse_ref[...])
     if reduction == "mean":
       # For mean reduction, use online averaging algorithm
@@ -315,13 +319,15 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   v_dim = w_grad_hbm_ref.shape[-1]
 
   # Padding if V dimension is not aligned to the V block size
-  @pl.when(v_index == num_v_blocks - 1)
-  def pad_non_aligned_v_block():
-    if v_dim % v_block_size != 0:
+  if v_dim % v_block_size != 0:
+
+    @pl.when(v_index == num_v_blocks - 1)
+    def pad_non_aligned_v_block():
       rem = v_dim % v_block_size
-      w_ref[:, rem:] = jnp.zeros(
-          (w_ref.shape[0], w_ref.shape[1] - rem), dtype=w_ref.dtype
+      iota_mask = jax.lax.broadcasted_iota(
+          dtype=jnp.int32, shape=w_ref.shape, dimension=1
       )
+      w_ref[...] = jnp.where(iota_mask < rem, w_ref[...], 0)
 
   # Initialize logits x@w
   @pl.when(jnp.logical_and(stage_index == 0, h_index == 0))
@@ -394,14 +400,15 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
   # Preload x_grad and w_grad async before computing softmax to
   # overlap computation
-  @pl.when(reduce(jnp.logical_and, (stage_index == 1, v_index != 0)))
-  def x_read():
-    x_read_future.start()
 
   # Preload w_grad
   @pl.when(reduce(jnp.logical_and, (stage_index == 1, b_index != 0)))
   def w_read():
     w_read_future.start()
+
+  @pl.when(reduce(jnp.logical_and, (stage_index == 1, v_index != 0)))
+  def x_read():
+    x_read_future.start()
 
   # Compute Softmax and store s = - labels + softmax(x@w) to xw_scratch_ref
   @pl.when(jnp.logical_and(stage_index == 1, h_index == 0))
@@ -414,15 +421,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         xw_scratch_ref[...] - lse_ref[...][:, None]
     )
 
-  # Init X gradient
-  @pl.when(reduce(jnp.logical_and, (stage_index == 1, v_index == 0)))
-  def init_x_grad():
-    x_grad_tile_ref[...] = jax.lax.dot_general(
-        xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
-    )
-    perform_x_grad_tile_scaling()
-    x_write_future.start()
-
   # Init W gradient
   @pl.when(reduce(jnp.logical_and, (stage_index == 1, b_index == 0)))
   def init_w_grad():
@@ -432,14 +430,12 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     perform_w_grad_tile_scaling()
     w_write_future.start()
 
-  # Accumulate X grad on V dimension
-  @pl.when(reduce(jnp.logical_and, (stage_index == 1, v_index != 0)))
-  def accumulate_x_grad():
-    res = jax.lax.dot_general(
+  # Init X gradient
+  @pl.when(reduce(jnp.logical_and, (stage_index == 1, v_index == 0)))
+  def init_x_grad():
+    x_grad_tile_ref[...] = jax.lax.dot_general(
         xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
     )
-    x_read_future.wait()
-    x_grad_tile_ref[...] += res
     perform_x_grad_tile_scaling()
     x_write_future.start()
 
@@ -454,10 +450,21 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     perform_w_grad_tile_scaling()
     w_write_future.start()
 
+  # Accumulate X grad on V dimension
+  @pl.when(reduce(jnp.logical_and, (stage_index == 1, v_index != 0)))
+  def accumulate_x_grad():
+    res = jax.lax.dot_general(
+        xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
+    )
+    x_read_future.wait()
+    x_grad_tile_ref[...] += res
+    perform_x_grad_tile_scaling()
+    x_write_future.start()
+
   @pl.when(stage_index == 1)
   def wait_async_writes():
-    x_write_future.wait()
     w_write_future.wait()
+    x_write_future.wait()
 
 
 @partial(
