@@ -337,12 +337,8 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
         if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
     )
     return immutabledict.immutabledict((
-        *zip(
-            pos_arg_names,
-            _abstractify(ba.args, convert_batched_args=True),
-            strict=True,
-        ),
-        *_abstractify(ba.kwargs, convert_batched_args=True).items(),
+        *zip(pos_arg_names, _abstractify(ba.args), strict=True),
+        *_abstractify(ba.kwargs).items(),
     ))
 
   def _get_autotuning_configs(self, ba: "BoundArguments") -> set[_Config]:
@@ -655,11 +651,9 @@ def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
   raise ValueError(f"Multiple device kinds found: {device_kinds}")
 
 
-def _abstractify(pytree, convert_batched_args: bool = False):
+def _abstractify(pytree):
   def abstractify_leaf(x):
     if isinstance(x, (jax.Array, np.ndarray)):
-      return jax.ShapeDtypeStruct(x.shape, x.dtype)
-    if convert_batched_args and isinstance(x, batching.BatchedShapeDtype) and not x.vmap_axes:
       return jax.ShapeDtypeStruct(x.shape, x.dtype)
     return x
 

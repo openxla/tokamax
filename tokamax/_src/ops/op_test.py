@@ -216,26 +216,6 @@ class BoundArgumentsTest(parameterized.TestCase):
         ba3 = adapter.validate_json(adapter.dump_json(ba))
         self.assertEqual(ba, ba3.replace(op=ba3.op.replace(vjp=None)))
 
-  # TODO: Add tests to ensure ops with BatchedShapeDtype args will
-  # hit the current cache key code path.
-  def test_abstractify(self):
-    x = batching.BatchedShapeDtype(
-        shape=(1, 2), dtype=jnp.float32, vmap_axes=()
-    )
-    y = batching.BatchedShapeDtype(
-        shape=(1, 2), dtype=jnp.float32, vmap_axes=((0, 1), (1, 2))
-    )
-    ba = _FakeOp().bind(x, y)
-    abstract_args = op_lib._abstractify(
-        dict(ba.arguments), convert_batched_args=True
-    )
-    self.assertIsInstance(abstract_args["x"], jax.ShapeDtypeStruct)
-    self.assertIsInstance(abstract_args["y"], batching.BatchedShapeDtype)
-    self.assertEqual(abstract_args["x"].shape, (1, 2))
-    self.assertEqual(abstract_args["x"].dtype, jnp.float32)
-    self.assertEqual(abstract_args["y"].shape, (1, 2))
-    self.assertEqual(abstract_args["y"].dtype, jnp.float32)
-
 
 if __name__ == "__main__":
   absltest.main()
