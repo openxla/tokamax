@@ -27,18 +27,10 @@ from tokamax._src import batching
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import utils
 from tokamax._src.ops import op as op_lib
-from tokamax._src.ops.attention import arg_specs as attn_arg_specs
 from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.attention import pallas_triton as pl_attn
-from tokamax._src.ops.normalization import arg_specs as norm_arg_specs
-from tokamax._src.ops.normalization import base as norm_base
-from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
-
-_ATTENTION_ARG_SPECS = attn_arg_specs.ARG_SPECS
-_NORMALIZATION_ARG_SPECS = norm_arg_specs.ARG_SPECS
-_RAGGED_DOT_ARG_SPECS = ragged_dot_arg_specs.ARG_SPECS
 
 
 def _eval_shape(spec):
@@ -197,25 +189,6 @@ class PydanticTest(parameterized.TestCase):
     op_roundtrip = adapter.validate_json(adapter.dump_json(op))
     object.__setattr__(op_roundtrip, "vjp", None)
     self.assertEqual(op, op_roundtrip)
-
-  @parameterized.named_parameters(
-      ("attention", attn_base.DotProductAttention, _ATTENTION_ARG_SPECS),
-      ("normalization", norm_base.Normalization, _NORMALIZATION_ARG_SPECS),
-      ("ragged_dot", ragged_dot_base.RaggedDot, _RAGGED_DOT_ARG_SPECS),
-  )
-  def test_arg_specs_roundtrip(self, op_cls, arg_specs):
-    spec = pydantic_lib.get_arg_spec_model("ArgSpec", op_cls().signature)
-    adapter = pydantic.TypeAdapter(spec)
-    for arg_spec in arg_specs:
-      spec = arg_spec.args
-      with self.subTest(arg_spec.full_name):
-        spec = op_lib._abstractify(_eval_shape(spec))
-        spec_roundtrip = adapter.validate_python(adapter.dump_python(spec))
-        self.assertEqual(spec, spec_roundtrip)
-        spec_roundtrip = adapter.validate_json(adapter.dump_json(spec))
-        if op_cls is ragged_dot_base.RaggedDot:
-          spec["group_sizes"] = spec["group_sizes"].representative_value
-        self.assertEqual(spec, spec_roundtrip)
 
 
 if __name__ == "__main__":

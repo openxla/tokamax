@@ -25,14 +25,18 @@ from tokamax._src import batching
 from tokamax._src import config as config_lib
 from tokamax._src import utils
 from tokamax._src.ops import op as op_lib
+from tokamax._src.ops.attention import arg_specs as attn_arg_specs
 from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.attention import pallas_triton as pl_attn
+from tokamax._src.ops.normalization import arg_specs as norm_arg_specs
 from tokamax._src.ops.normalization import base as norm_base
+from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
-from tokamax._src.ops.attention import arg_specs as attn_arg_specs
-from tokamax._src.ops.normalization import arg_specs as norm_arg_specs
-from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
+
+_ATTN_ARG_SPECS = attn_arg_specs.ARG_SPECS
+_NORM_ARG_SPECS = norm_arg_specs.ARG_SPECS
+_RAGGED_DOT_ARG_SPECS = ragged_dot_arg_specs.ARG_SPECS
 
 
 def _bsd(shape, dtype, vmap_axes):
@@ -179,32 +183,31 @@ class BoundArgumentsTest(parameterized.TestCase):
     self.assertEqual(hash(_FakeOp().bind(x, y)), hash(_FakeOp().bind(x, y)))
 
   @parameterized.named_parameters(
-      ("attention", attn_base.DotProductAttention(), attn_arg_specs),
-      ("pl_attn", pl_attn.PallasTritonFlashAttention(), attn_arg_specs),
+      ("attention", attn_base.DotProductAttention(), _ATTN_ARG_SPECS),
+      ("pl_attn", pl_attn.PallasTritonFlashAttention(), _ATTN_ARG_SPECS),
       (
           "pl_attn_stable_softmax",
           pl_attn.PallasTritonFlashAttention(use_stable_softmax=True),
-          attn_arg_specs,
+          _ATTN_ARG_SPECS,
       ),
-      ("normalization", norm_base.Normalization(), norm_arg_specs),
-      ("ragged_dot", ragged_dot_base.RaggedDot(), ragged_dot_arg_specs),
+      ("normalization", norm_base.Normalization(), _NORM_ARG_SPECS),
+      ("ragged_dot", ragged_dot_base.RaggedDot(), _RAGGED_DOT_ARG_SPECS),
       (
           "pl_ragged_dot",
           pl_ragged_dot.PallasTritonRaggedDot(),
-          ragged_dot_arg_specs,
+          _RAGGED_DOT_ARG_SPECS,
       ),
       (
           "pl_ragged_dot_split_k_intermediate_dtype",
           pl_ragged_dot.PallasTritonRaggedDot(
               split_k_intermediate_dtype=jnp.float32
           ),
-          ragged_dot_arg_specs,
+          _RAGGED_DOT_ARG_SPECS,
       ),
   )
   def test_roundtrip(self, op, arg_specs):
     op = op.replace(vjp=None)
     adapter = op_lib.BOUND_ARGS_ADAPTER
-    arg_specs = arg_specs.ARG_SPECS
     for arg_spec in arg_specs:
       spec = arg_spec.args
       with self.subTest(arg_spec.full_name):
