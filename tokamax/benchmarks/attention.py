@@ -78,14 +78,6 @@ class AttentionBenchmark(parameterized.TestCase):
     ):
       self.skipTest('Skipping cudnn forward_and_vjp on B200.')
 
-    # TODO: Re-enable once Mosaic GPU supports VJP on B200.
-    if (
-        implementation in ('mosaic', None)
-        and benchmark_mode == 'forward_and_vjp'
-        and 'B200' in jax.devices()[0].device_kind
-    ):
-      self.skipTest('Skipping Mosaic forward_and_vjp on B200.')
-
     if args_spec_name == 'alphafold':
       # TODO: Re-enable once Mosaic TPU supports learnable biases.
       if jax.default_backend() == 'tpu' and implementation == 'mosaic':
