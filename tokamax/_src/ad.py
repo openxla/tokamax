@@ -26,7 +26,7 @@ T = TypeVar("T")
 
 
 def get_vjp_taking_residuals(
-    fn: Callable[..., tuple[T, R]], *primals: ...
+    fn: Callable[..., tuple[T, R]], *primals
 ) -> Callable[[R, T], Any] | None:
   """Attempts to create a VJP function with respect to the requested residuals.
 
