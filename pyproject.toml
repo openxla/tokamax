@@ -21,8 +21,8 @@ requires-python = ">=3.11"
 dependencies = [
     "absl-py>=2.3.0",
     "einshape",
-    "jax>=0.8.2",
-    "jaxlib>=0.8.2",
+    "jax>=0.9.0",
+    "jaxlib>=0.9.0",
     "jaxtyping>=0.3",
     "pydantic>=2.11.0",
     "qwix>=0.1.2",
@@ -31,6 +31,7 @@ dependencies = [
     "typeguard==2.13.3",
     "immutabledict",
     "tensorboardx",
+    "cuequivariance>=0.8.1",
 ]
 
 [build-system]
@@ -57,15 +58,15 @@ bench = [
     "libtpu>=0.0.35",
     "google-benchmark>=1.9.0",
     "xprof",
+    "cuequivariance-jax>=0.8.1",
 ]
 
 cuda = [
-    "jax[cuda12]>=0.8.0",
-    "nvidia-cudnn-cu12>=9.0.0",
+    "jax[cuda13]>=0.9.0",
 ]
 
 tpu = [
-    "jax[tpu]>=0.8.0",
+    "jax[tpu]>=0.9.0",
     "hypothesis",
 ]
 

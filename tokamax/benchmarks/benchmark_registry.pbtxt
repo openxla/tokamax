@@ -244,6 +244,7 @@ benchmarks {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_multiplication.py" }
     action_inputs { key: "python_version" value: "3.11" }
+    action_inputs { key: "extras" value: "bench" }
   }
 
   environment_configs {
@@ -275,7 +276,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/default/forward"
+    name: "triangle_multiplication/n_384/default/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/default/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -283,7 +291,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/default/forward_and_vjp"
+    name: "triangle_multiplication/n_384/default/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/default/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -291,7 +306,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/xla/forward"
+    name: "triangle_multiplication/n_384/xla/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/xla/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -299,7 +321,44 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/xla/forward_and_vjp"
+    name: "triangle_multiplication/n_384/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "triangle_multiplication/n_384/cuequivariance/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/cuequivariance/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "triangle_multiplication/n_384/cuequivariance/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/cuequivariance/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -333,7 +392,6 @@ benchmarks {
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
     # Disable 'xla' as this OOM on GPU.
-    # TODO: enable 'mosaic' and None once the bug is fixed.
     workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla,None,mosaic" }
   }
 
@@ -417,4 +475,3 @@ benchmarks {
     }
   }
 }
-
