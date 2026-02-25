@@ -44,10 +44,19 @@ class Config:
   v_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 2048
 
 
-def get_tpu_specific_default_config() -> Config:
+def get_tpu_specific_default_config(b_dim: int, h_dim: int, v_dim: int) -> Config:
   """Returns the heuristic config for based on TPU version."""
-  if pltpu.get_tpu_info().generation >= 6:
+
+  if pltpu.get_tpu_info().generation >= 7:
     return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
+  elif pltpu.get_tpu_info().generation == 6:
+    # If H dimens is not 512 aligned, it needs additional mask / padding causing
+    # vmem spill over, which may OOM VMEM on tpu gen 6.
+    h_block_size_512_aligned = h_dim % 512 == 0
+    if h_block_size_512_aligned:
+      return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
+    else:
+      return Config(b_block_size=1024, h_block_size=512, v_block_size=1024)
   else:
     return Config(b_block_size=1024, h_block_size=512, v_block_size=512)
 
@@ -90,8 +99,13 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return get_tpu_specific_default_config()
+    x = ba.arguments["x"]
+    w = ba.arguments["w"]
+
+    b_dim, h_dim = x.shape
+    v_dim = w.shape[1]
+
+    return get_tpu_specific_default_config(b_dim, h_dim, v_dim)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
@@ -172,8 +186,13 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return get_tpu_specific_default_config()
+    x = ba.arguments["x"]
+    w = ba.arguments["w"]
+
+    b_dim, h_dim = x.shape
+    v_dim = w.shape[1]
+
+    return get_tpu_specific_default_config(b_dim, h_dim, v_dim)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:

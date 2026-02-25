@@ -54,18 +54,65 @@ def validate_inputs(
     raise ValueError(
         "The batch dimension of x must be a multiple of the B block size."
     )
-  if x.shape[1] % h_block_size != 0:
-    raise ValueError(
-        "The hidden dimension of x must be a multiple of the H block size."
-    )
   if labels.shape[0] % b_block_size != 0:
     raise ValueError(
         "The batch dimension of labels must be a multiple of the B block size."
     )
-  if w.shape[0] % h_block_size != 0:
-    raise ValueError(
-        "The hidden dimension of w must be a multiple of the H block size."
-    )
+
+  if w.shape[0] % 8 != 0:
+    raise ValueError("The hidden dimension of w must be a multiple of 8")
+
+
+def calculate_xw_tiled(
+    x_ref,
+    w_ref,
+    xw_tiled,
+    h_index,
+    v_index,
+    num_h_blocks,
+    num_v_blocks,
+    h_dim,
+    v_dim,
+):
+  """A kernel block for common logic between forward and backward kernel
+
+  to calculate xw_tiled += x@w
+  """
+  h_block_size, v_block_size = x_ref.shape[1], w_ref.shape[1]
+  # Padding if V dimension is not aligned to the V block size
+  if v_dim % v_block_size != 0:
+
+    @pl.when(v_index == num_v_blocks - 1)
+    def pad_non_aligned_v_block():
+      rem = v_dim % v_block_size
+      iota_mask = jax.lax.broadcasted_iota(
+          dtype=jnp.int32, shape=w_ref.shape, dimension=1
+      )
+      w_ref[...] = jnp.where(iota_mask < rem, w_ref[...], 0)
+
+  # Padding if H dimension is not aligned to the V block size
+  if h_dim % h_block_size != 0:
+
+    @pl.when(h_index == num_h_blocks - 1)
+    def pad_non_aligned_h_block():
+      rem = h_dim % h_block_size
+      x_iota_mask = jax.lax.broadcasted_iota(
+          dtype=jnp.int32, shape=x_ref.shape, dimension=1
+      )
+      x_ref[...] = jnp.where(x_iota_mask < rem, x_ref[...], 0)
+
+      w_iota_mask = jax.lax.broadcasted_iota(
+          dtype=jnp.int32, shape=w_ref.shape, dimension=0
+      )
+      w_ref[...] = jnp.where(w_iota_mask < rem, w_ref[...], 0)
+
+  @pl.when(h_index == 0)
+  def init_xw():
+    xw_tiled[...] = x_ref[...] @ w_ref[...]
+
+  @pl.when(h_index != 0)
+  def accumulate_xw():
+    xw_tiled[...] += x_ref[...] @ w_ref[...]
 
 
 def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
@@ -77,6 +124,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
     xw_tiled,
     b_block_loss_ref,
     reduction: Literal["sum", "mean"],
+    h_dim: int,
     v_dim: int,
 ):
   """Pallas kernel for the forward pass of Linear Softmax Cross-Entropy Loss.
@@ -104,22 +152,27 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
     reduction: The reduction method ("sum" or "mean") for the loss accumulation.
   """
   b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
-  b_block_size = x_ref.shape[0]
-  v_block_size = w_ref.shape[1]
+  b_block_size, h_block_size, v_block_size = (
+      x_ref.shape[0],
+      x_ref.shape[1],
+      w_ref.shape[1],
+  )
   num_b_blocks, num_v_blocks, num_h_blocks = (
       pl.num_programs(i) for i in range(3)
   )
 
-  # Padding if V dimension is not aligned to the V block size
-  if v_dim % v_block_size != 0:
-
-    @pl.when(v_index == num_v_blocks - 1)
-    def pad_non_aligned_v_block():
-      rem = v_dim % v_block_size
-      iota_mask = jax.lax.broadcasted_iota(
-          dtype=jnp.int32, shape=w_ref.shape, dimension=1
-      )
-      w_ref[...] = jnp.where(iota_mask < rem, w_ref[...], 0)
+  # xw_tiled += x_ref @ w_ref
+  calculate_xw_tiled(
+      x_ref,
+      w_ref,
+      xw_tiled,
+      h_index=h_index,
+      v_index=v_index,
+      num_h_blocks=num_h_blocks,
+      num_v_blocks=num_v_blocks,
+      h_dim=h_dim,
+      v_dim=v_dim,
+  )
 
   @pl.when(reduce(jnp.logical_and, (b_index == 0, v_index == 0, h_index == 0)))
   def init_loss():
@@ -129,14 +182,6 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
   def init_lse():
     lse_ref[...] = jnp.full_like(lse_ref, -jnp.inf)
     b_block_loss_ref[0] = 0.0
-
-  @pl.when(h_index == 0)
-  def init_xw():
-    xw_tiled[...] = x_ref[...] @ w_ref[...]
-
-  @pl.when(h_index != 0)
-  def accumulate_xw():
-    xw_tiled[...] += x_ref[...] @ w_ref[...]
 
   @pl.when(h_index == num_h_blocks - 1)
   def accumulate_loss():
@@ -232,6 +277,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
       partial(
           linear_softmax_cross_entropy_loss_forward_pallas_kernel,
           reduction=reduction,
+          h_dim=h_dim,
           v_dim=v_dim,
       ),
       in_specs=[
@@ -316,153 +362,173 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   )
   b_block_size, h_block_size = x_ref.shape
   v_block_size = w_ref.shape[1]
-  v_dim = w_grad_hbm_ref.shape[-1]
+  h_dim, v_dim = w_grad_hbm_ref.shape
 
-  # Padding if V dimension is not aligned to the V block size
-  if v_dim % v_block_size != 0:
-
-    @pl.when(v_index == num_v_blocks - 1)
-    def pad_non_aligned_v_block():
-      rem = v_dim % v_block_size
-      iota_mask = jax.lax.broadcasted_iota(
-          dtype=jnp.int32, shape=w_ref.shape, dimension=1
-      )
-      w_ref[...] = jnp.where(iota_mask < rem, w_ref[...], 0)
-
-  # Initialize logits x@w
-  @pl.when(jnp.logical_and(stage_index == 0, h_index == 0))
-  def init_logits():
-    xw_scratch_ref[...] = x_ref[...] @ w_ref[...]
-
-  # Accumulate logits x@w
-  @pl.when(jnp.logical_and(stage_index == 0, h_index != 0))
-  def accumulate_logits():
-    xw_scratch_ref[...] += x_ref[...] @ w_ref[...]
-
-  # Calculate the actual block size if v_dim is not a multiple of v_block_size
-  cur_v_block_size = jnp.minimum(v_dim - v_block_size * v_index, v_block_size)
-
-  # V Block size must be multiple of 128 to perform DMA (copy).
-  # Aligning the V block size to 128
-  cur_v_block_size = (jnp.ceil(cur_v_block_size / 128) * 128).astype(jnp.int32)
-  cur_v_block_size = pl.multiple_of(cur_v_block_size, 128)
-
-  # Slicing x_grad and x_grad HBM ref to prepare for tiled read / write
-  x_grad_slice = x_grad_hbm_ref.at[
-      pl.dslice(b_index * b_block_size, b_block_size),
-      pl.ds(h_index * h_block_size, h_block_size),
-  ]
-  w_grad_slice = w_grad_hbm_ref.at[
-      pl.ds(h_index * h_block_size, h_block_size),
-      pl.dslice(v_index * v_block_size, cur_v_block_size),
-  ]
-  w_grad_tile_slice = w_grad_tile_ref.at[:, pl.dslice(0, cur_v_block_size)]
-
-  def perform_x_grad_tile_scaling():
-    # Perform scaling to dout and b_dim (for mean reduction).
-    # Scaling happens on the last accumulation on V for
-    # numerical stability
-    @pl.when(
-        reduce(jnp.logical_and, (stage_index == 1, v_index == num_v_blocks - 1))
-    )
-    def _():
-      if reduction == "mean":
-        x_grad_tile_ref[...] /= num_b_blocks * b_block_size
-
-      x_grad_tile_ref[...] *= dout[0]
-
-  def perform_w_grad_tile_scaling():
-    # Perform scaling to dout and b_dim (for mean reduction).
-    # Scaling happens on the last accumulation on B for
-    # numerical stability
-    @pl.when(
-        reduce(jnp.logical_and, (stage_index == 1, b_index == num_b_blocks - 1))
-    )
-    def _():
-      if reduction == "mean":
-        w_grad_tile_ref[...] /= num_b_blocks * b_block_size
-
-      w_grad_tile_ref[...] *= dout[0]
-
-  # Async copy ops are only defined here. It only starts after calling .start().
-  x_write_future = pltpu.make_async_copy(
-      x_grad_tile_ref, x_grad_slice, sem=x_write_sem
-  )
-  w_write_future = pltpu.make_async_copy(
-      w_grad_tile_slice, w_grad_slice, sem=w_write_sem
-  )
-  x_read_future = pltpu.make_async_copy(
-      x_grad_slice, x_grad_tile_ref, sem=x_read_sem
-  )
-  w_read_future = pltpu.make_async_copy(
-      w_grad_slice, w_grad_tile_slice, sem=w_read_sem
-  )
-
-  # Preload x_grad and w_grad async before computing softmax to
-  # overlap computation
-
-  # Preload w_grad
-  @pl.when(reduce(jnp.logical_and, (stage_index == 1, b_index != 0)))
-  def w_read():
-    w_read_future.start()
-
-  @pl.when(reduce(jnp.logical_and, (stage_index == 1, v_index != 0)))
-  def x_read():
-    x_read_future.start()
-
-  # Compute Softmax and store s = - labels + softmax(x@w) to xw_scratch_ref
-  @pl.when(jnp.logical_and(stage_index == 1, h_index == 0))
-  def compute_s():
-    labels_adjusted = labels_ref[...] - v_index * v_block_size
-    labels_one_hot = jax.nn.one_hot(
-        labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
-    )
-    xw_scratch_ref[...] = -labels_one_hot + jnp.exp(
-        xw_scratch_ref[...] - lse_ref[...][:, None]
+  # Calculate and accumulate xw_scratch_ref += x_ref @ w_ref as first stage
+  @pl.when(stage_index == 0)
+  def calculate_xw():
+    calculate_xw_tiled(
+        x_ref,
+        w_ref,
+        xw_scratch_ref,
+        h_index=h_index,
+        v_index=v_index,
+        num_h_blocks=num_h_blocks,
+        num_v_blocks=num_v_blocks,
+        h_dim=h_dim,
+        v_dim=v_dim,
     )
 
-  # Init W gradient
-  @pl.when(reduce(jnp.logical_and, (stage_index == 1, b_index == 0)))
-  def init_w_grad():
-    w_grad_tile_ref[...] = jax.lax.dot_general(
-        x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
-    )
-    perform_w_grad_tile_scaling()
-    w_write_future.start()
-
-  # Init X gradient
-  @pl.when(reduce(jnp.logical_and, (stage_index == 1, v_index == 0)))
-  def init_x_grad():
-    x_grad_tile_ref[...] = jax.lax.dot_general(
-        xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
-    )
-    perform_x_grad_tile_scaling()
-    x_write_future.start()
-
-  # Accumulate W grad on B dimension
-  @pl.when(reduce(jnp.logical_and, (stage_index == 1, b_index != 0)))
-  def accumulate_w_grad():
-    res = jax.lax.dot_general(
-        x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
-    )
-    w_read_future.wait()
-    w_grad_tile_ref[...] += res
-    perform_w_grad_tile_scaling()
-    w_write_future.start()
-
-  # Accumulate X grad on V dimension
-  @pl.when(reduce(jnp.logical_and, (stage_index == 1, v_index != 0)))
-  def accumulate_x_grad():
-    res = jax.lax.dot_general(
-        xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
-    )
-    x_read_future.wait()
-    x_grad_tile_ref[...] += res
-    perform_x_grad_tile_scaling()
-    x_write_future.start()
-
+  # When xw_scratch_ref is fully accumulated, use it to calculate gradients
+  # as second stage
   @pl.when(stage_index == 1)
-  def wait_async_writes():
+  def calculate_grads():
+    # Calculate the actual block size if v_dim is not a multiple of v_block_size
+    cur_v_block_size = jnp.minimum(v_dim - v_block_size * v_index, v_block_size)
+
+    # V Block size must be multiple of 128 to perform DMA (copy).
+    # Aligning the V block size to 128
+    cur_v_block_size = pl.multiple_of(
+        (pl.cdiv(cur_v_block_size, 128) * 128).astype(jnp.int32), 128
+    )
+
+    # Calculate the actual block size if h_dim is not a multiple of h_block_size
+    cur_h_block_size = jnp.minimum(h_dim - h_block_size * h_index, h_block_size)
+
+    # H Block size must be multiple of 128 of major dimension, and 8 of minor
+    # dimension to perform DMA.
+    cur_h_block_128_aligned_size = pl.multiple_of(
+        (pl.cdiv(cur_h_block_size, 128) * 128).astype(jnp.int32), 128
+    )
+    cur_h_block_8_aligned_size = pl.multiple_of(
+        (pl.cdiv(cur_h_block_size, 8) * 8).astype(jnp.int32), 8
+    )
+
+    # Slicing x_grad and x_grad HBM ref to prepare for tiled read / write
+    x_grad_slice = x_grad_hbm_ref.at[
+        pl.ds(b_index * b_block_size, b_block_size),
+        pl.ds(h_index * h_block_size, cur_h_block_128_aligned_size),
+    ]
+    w_grad_slice = w_grad_hbm_ref.at[
+        pl.ds(h_index * h_block_size, cur_h_block_8_aligned_size),
+        pl.ds(v_index * v_block_size, cur_v_block_size),
+    ]
+
+    x_grad_tile_slice = x_grad_tile_ref.at[
+        pl.ds(0, b_block_size), pl.ds(0, cur_h_block_128_aligned_size)
+    ]
+    w_grad_tile_slice = w_grad_tile_ref.at[
+        pl.ds(0, cur_h_block_8_aligned_size), pl.ds(0, cur_v_block_size)
+    ]
+
+    def perform_x_grad_tile_scaling():
+      # Perform scaling to dout and b_dim (for mean reduction).
+      # Scaling happens on the last accumulation on V for
+      # numerical stability
+      @pl.when(
+          reduce(
+              jnp.logical_and, (stage_index == 1, v_index == num_v_blocks - 1)
+          )
+      )
+      def _():
+        if reduction == "mean":
+          x_grad_tile_ref[...] /= num_b_blocks * b_block_size
+
+        x_grad_tile_ref[...] *= dout[0]
+
+    def perform_w_grad_tile_scaling():
+      # Perform scaling to dout and b_dim (for mean reduction).
+      # Scaling happens on the last accumulation on B for
+      # numerical stability
+      @pl.when(
+          reduce(
+              jnp.logical_and, (stage_index == 1, b_index == num_b_blocks - 1)
+          )
+      )
+      def _():
+        if reduction == "mean":
+          w_grad_tile_ref[...] /= num_b_blocks * b_block_size
+
+        w_grad_tile_ref[...] *= dout[0]
+
+    # Async copy ops are only defined here. It only starts after calling .start().
+    x_write_future = pltpu.make_async_copy(
+        x_grad_tile_slice, x_grad_slice, sem=x_write_sem
+    )
+    w_write_future = pltpu.make_async_copy(
+        w_grad_tile_slice, w_grad_slice, sem=w_write_sem
+    )
+    x_read_future = pltpu.make_async_copy(
+        x_grad_slice, x_grad_tile_slice, sem=x_read_sem
+    )
+    w_read_future = pltpu.make_async_copy(
+        w_grad_slice, w_grad_tile_slice, sem=w_read_sem
+    )
+
+    # Preload x_grad and w_grad async before computing softmax to
+    # overlap computation
+
+    # Preload w_grad
+    @pl.when(b_index != 0)
+    def w_read():
+      w_read_future.start()
+
+    @pl.when(v_index != 0)
+    def x_read():
+      x_read_future.start()
+
+    # Compute Softmax and store s = - labels + softmax(x@w) to xw_scratch_ref
+    @pl.when(h_index == 0)
+    def compute_s():
+      labels_adjusted = labels_ref[...] - v_index * v_block_size
+      labels_one_hot = jax.nn.one_hot(
+          labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
+      )
+      xw_scratch_ref[...] = -labels_one_hot + jnp.exp(
+          xw_scratch_ref[...] - lse_ref[...][:, None]
+      )
+
+    # Init W gradient
+    @pl.when(b_index == 0)
+    def init_w_grad():
+      w_grad_tile_ref[...] = jax.lax.dot_general(
+          x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
+      )
+      perform_w_grad_tile_scaling()
+      w_write_future.start()
+
+    # Init X gradient
+    @pl.when(v_index == 0)
+    def init_x_grad():
+      x_grad_tile_ref[...] = jax.lax.dot_general(
+          xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
+      )
+      perform_x_grad_tile_scaling()
+      x_write_future.start()
+
+    # Accumulate W grad on B dimension
+    @pl.when(b_index != 0)
+    def accumulate_w_grad():
+      res = jax.lax.dot_general(
+          x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
+      )
+      w_read_future.wait()
+      w_grad_tile_ref[...] += res
+      perform_w_grad_tile_scaling()
+      w_write_future.start()
+
+    # Accumulate X grad on V dimension
+    @pl.when(v_index != 0)
+    def accumulate_x_grad():
+      res = jax.lax.dot_general(
+          xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
+      )
+      x_read_future.wait()
+      x_grad_tile_ref[...] += res
+      perform_x_grad_tile_scaling()
+      x_write_future.start()
+
+    # Lastly make sure to wait x_grad, w_grad write before next iteration
     w_write_future.wait()
     x_write_future.wait()
 
