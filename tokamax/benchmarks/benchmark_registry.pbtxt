@@ -3,7 +3,7 @@
 
 benchmarks {
   name: "tokamax_attention"
-  description: "Runs the Tokamax attention benchmark on H100 and B200."
+  description: "Runs the Tokamax attention benchmark."
   owner: "Tokamax Team"
   update_frequency_policy: QUARTERLY
   workload {
@@ -16,7 +16,6 @@ benchmarks {
     id: "GPU_H100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
@@ -24,7 +23,6 @@ benchmarks {
     id: "GPU_B200"
     runner_label: "linux-x86-a4-224-b200-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
@@ -32,7 +30,6 @@ benchmarks {
     id: "TPUv6e"
     runner_label: "linux-x86-ct6e-44-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "tpu" }
     workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn" }
   }
@@ -41,7 +38,6 @@ benchmarks {
     id: "TPUv7"
     runner_label: "linux-x86-tpu7x-56-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "tpu" }
     workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn" }
   }
@@ -241,7 +237,7 @@ benchmarks {
 
 benchmarks {
   name: "tokamax_triangle_multiplication"
-  description: "Runs the Tokamax triangle_multiplication benchmark on H100 and B200."
+  description: "Runs the Tokamax triangle_multiplication benchmark."
   owner: "Tokamax Team"
   update_frequency_policy: QUARTERLY
   workload {
@@ -254,7 +250,6 @@ benchmarks {
     id: "GPU_H100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
@@ -262,7 +257,6 @@ benchmarks {
     id: "GPU_B200"
     runner_label: "linux-x86-a4-224-b200-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
@@ -270,7 +264,6 @@ benchmarks {
     id: "TPUv6e"
     runner_label: "linux-x86-ct6e-44-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "tpu" }
   }
 
@@ -278,7 +271,6 @@ benchmarks {
     id: "TPUv7"
     runner_label: "linux-x86-tpu7x-56-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "tpu" }
   }
 
@@ -317,7 +309,7 @@ benchmarks {
 
 benchmarks {
   name: "tokamax_ragged_dot"
-  description: "Runs the Tokamax ragged_dot benchmark on H100 and B200."
+  description: "Runs the Tokamax ragged_dot benchmark."
   owner: "Tokamax Team"
   update_frequency_policy: QUARTERLY
   workload {
@@ -330,7 +322,6 @@ benchmarks {
     id: "GPU_H100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
     # Disable 'xla' as this OOM on GPU.
     workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla" }
@@ -340,7 +331,6 @@ benchmarks {
     id: "GPU_B200"
     runner_label: "linux-x86-a4-224-b200-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "cuda" }
     # Disable 'xla' as this OOM on GPU.
     # TODO: enable 'mosaic' and None once the bug is fixed.
@@ -351,7 +341,6 @@ benchmarks {
     id: "TPUv6e"
     runner_label: "linux-x86-ct6e-44-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "tpu" }
     workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton" }
   }
@@ -360,7 +349,6 @@ benchmarks {
     id: "TPUv7"
     runner_label: "linux-x86-tpu7x-56-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
-    workflow_type: [SCHEDULED]
     workload_action_inputs { key: "extras_hw" value: "tpu" }
     workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton" }
   }
@@ -428,6 +416,5 @@ benchmarks {
       stat: MEDIAN
     }
   }
-
 }
 
