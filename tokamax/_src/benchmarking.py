@@ -175,12 +175,12 @@ class XprofProfileSession(contextlib.AbstractContextManager):
             prefix='tokamax_xprof_profile_'
         )
         self._profile_tempdir = os.path.join(
-            os.environ.get(
-                'WORKLOAD_ARTIFACTS_DIR',
-                temp_xprof_dir.name,
-            ),
+            os.environ.get('WORKLOAD_ARTIFACTS_DIR', ''),
+            temp_xprof_dir.name,
             'jax_profiler_trace',
         )
+        if not pathlib.Path(self._profile_tempdir).exists():
+          pathlib.Path(self._profile_tempdir).mkdir(parents=True)
         jax.profiler.start_trace(self._profile_tempdir)
         logger.info(
             'JAX profiler trace file written to: %s', self._profile_tempdir
@@ -211,8 +211,8 @@ class XprofProfileSession(contextlib.AbstractContextManager):
           pathlib.Path(self._profile_tempdir).glob('**/*.xplane.pb')
       )
       if len(profile_paths) != 1:
-        logging.warning(
-            'Expected exactly one profile file. Selecting the first one.'
+        raise RuntimeError(
+            f'Expected exactly one profile file, but found {len(profile_paths)}'
         )
       profile_path = profile_paths[0]
       self._profile = jax.profiler.ProfileData.from_serialized_xspace(
