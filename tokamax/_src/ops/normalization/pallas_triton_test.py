@@ -89,13 +89,11 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
     g_ref = jax.value_and_grad(lambda *args: f(*args).sum())
     g_remat = jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
     g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
-    # TODO: Re-enable checks after bug is fixed.
-    _ = """
+
     hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
     self.assertEqual(hlo.count('name = "pallas_layer_norm"'), 1)
     self.assertEqual(hlo.count('name = "pallas_layer_norm_fwd_res"'), 1)
     self.assertEqual(hlo.count('name = "pallas_layer_norm_vjp"'), 1)
-    """
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
     chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
@@ -105,20 +103,8 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
 
     shape = (3, 128, 32)
     x = jax.random.normal(rngs.pop(), shape)
-    scale = jax.random.uniform(
-        rngs.pop(),
-        (
-            shape[0],
-            shape[-1],
-        ),
-    )
-    offset = jax.random.uniform(
-        rngs.pop(),
-        (
-            shape[0],
-            shape[-1],
-        ),
-    )
+    scale = jax.random.uniform(rngs.pop(), (shape[0], shape[-1]))
+    offset = jax.random.uniform(rngs.pop(), (shape[0], shape[-1]))
     epsilon = 1e-6
 
     def f(x, scale, offset):
@@ -129,15 +115,11 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
         jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
     )
     g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
-    # TODO: Re-enable checks after bug is fixed.
-    _ = """
+
     hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
-    self.assertEqual(
-        hlo.count('name = "pallas_layer_norm_batched"'), 1, msg=hlo
-    )
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_fwd_res_batched"'), 1)
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_vjp_batched"'), 1)
-    """
+    self.assertEqual(hlo.count('name = "pallas_layer_norm"'), 1, msg=hlo)
+    self.assertEqual(hlo.count('name = "pallas_layer_norm_fwd_res"'), 1)
+    self.assertEqual(hlo.count('name = "pallas_layer_norm_vjp"'), 1)
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
     chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
