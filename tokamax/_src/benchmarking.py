@@ -24,7 +24,7 @@ import os
 import pathlib
 import tempfile
 import time
-from typing import Any, Literal, TypeAlias, TypeVar
+from typing import Any, Literal, TypeAlias, TypeVar, Final
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,9 @@ RetT: TypeAlias = T | list[jax.Array] | tuple[T, list[jax.Array]]
 TimingMethod: TypeAlias = Literal[
     'wallclock', 'cupti', 'xprof', 'hermetic_xprof'
 ]
+
+
+WORKLOAD_ARTIFACTS_DIR_VARNAME: Final[str] = 'WORKLOAD_ARTIFACTS_DIR'  # for CI
 
 
 @jax.custom_vjp
@@ -130,7 +133,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     self._jax_profiler_mode = use_jax_profiler
     if xprof_session is None or profile_data is None:
       self._jax_profiler_mode = True
-    self._profile_tempdir: str | None = None
+    self._profile_tempdir: tempfile.TemporaryDirectory | None = None
     self._xprof_session_kwargs = xprof_session_kwargs
 
   @property
@@ -171,19 +174,13 @@ class XprofProfileSession(contextlib.AbstractContextManager):
   def __enter__(self):
     if self._jax_profiler_mode:
       try:
-        temp_xprof_dir = tempfile.TemporaryDirectory(
-            prefix='tokamax_xprof_profile_'
+        root_dir = os.environ.get(WORKLOAD_ARTIFACTS_DIR_VARNAME, None)
+        self._profile_tempdir = tempfile.TemporaryDirectory(
+            prefix='tokamax_xprof_profile_', dir=root_dir, delete=False
         )
-        self._profile_tempdir = os.path.join(
-            os.environ.get('WORKLOAD_ARTIFACTS_DIR', ''),
-            temp_xprof_dir.name,
-            'jax_profiler_trace',
-        )
-        if not pathlib.Path(self._profile_tempdir).exists():
-          pathlib.Path(self._profile_tempdir).mkdir(parents=True)
-        jax.profiler.start_trace(self._profile_tempdir)
+        jax.profiler.start_trace(self._profile_tempdir.name)
         logger.info(
-            'JAX profiler trace file written to: %s', self._profile_tempdir
+            'JAX profiler trace file written to: %s', self._profile_tempdir.name
         )
       except Exception as e:
         raise RuntimeError('Unable to start jax profiling session.') from e
@@ -208,7 +205,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       jax.profiler.stop_trace()
       assert self._profile_tempdir is not None, 'Profile tempdir should be set.'
       profile_paths = list(
-          pathlib.Path(self._profile_tempdir).glob('**/*.xplane.pb')
+          pathlib.Path(self._profile_tempdir.name).glob('**/*.xplane.pb')
       )
       if len(profile_paths) != 1:
         raise RuntimeError(
@@ -218,11 +215,8 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       self._profile = jax.profiler.ProfileData.from_serialized_xspace(
           profile_path.read_bytes()
       )
-      if 'WORKLOAD_ARTIFACTS_DIR' not in os.environ:
-        temp_xprof_dir = tempfile.TemporaryDirectory(
-            prefix='tokamax_xprof_profile_'
-        )
-        temp_xprof_dir.cleanup()
+      if WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ:
+        self._profile_tempdir.cleanup()
       logger.info('JAX profiler trace file written to: %s', profile_path)
       self._profile_tempdir = None
     else:
