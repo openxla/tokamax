@@ -310,7 +310,7 @@ def store_acc_transposed(
 
 
 def ragged_kernel(
-    body, *, g, m, n, out_dtype, config, thread_axis=None
+    body, *, g, m, n, out_dtype, config, thread_axis=None, **kwargs
 ) -> Callable[..., jax.Array]:
   """Returns a Pallas kernel for ragged matmul.
 
@@ -333,6 +333,7 @@ def ragged_kernel(
     config: The kernel config.
     thread_axis: The name of the thread axis to use for warp specialization. If
       None, warp specialization is not used.
+    **kwargs: Additional keyword arguments to pass to the Pallas kernel.
 
   Returns:
     A Pallas kernel for ragged matmul.
@@ -415,6 +416,7 @@ def ragged_kernel(
       grid_names=grid_names,
       thread_name=thread_axis,
       num_threads=thread_axis and (num_compute_threads + 1),
+      **kwargs,
   )
 
 

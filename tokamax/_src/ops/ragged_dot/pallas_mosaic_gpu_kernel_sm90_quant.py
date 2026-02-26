@@ -50,16 +50,13 @@ def ragged_dot_quantized_kernel_body(
   m, k = x_gmem.shape
 
   x_elem_bits = jnp.finfo(x_gmem.dtype).bits
-  w_elem_bits = jnp.iinfo(w_gmem.dtype).bits
-  swizzle_w = plgpu.find_swizzle(w_elem_bits * block_k, "lhs")
   swizzle_x = plgpu.find_swizzle(x_elem_bits * block_k, "rhs")
   x_swizzle_elems = (swizzle_x * 8) // x_elem_bits
-  w_swizzle_elems = (swizzle_w * 8) // w_elem_bits
 
-  def compute_acc(acc_ref):
+  def compute_acc(acc):
     def pipeline_body(_, w_smem, x_smem, w_scales_smem):
       w = w_smem[...]
-      w_scales = plgpu.load(w_scales_smem, (0,), layout=_WGMMA_ROW)
+      w_scales = plgpu.load(w_scales_smem, (), layout=_WGMMA_ROW)
       # Tiling along the reduction dimension. This overlaps to some extent
       # scaling/casting with wgmma.
       assert w.shape[1] % x_swizzle_elems == 0
@@ -73,33 +70,17 @@ def ragged_dot_quantized_kernel_body(
         ks = slice(j * x_swizzle_elems, (j + 1) * x_swizzle_elems)
         w_ = w[:, ks].astype(w_scales.dtype)
         w_ = w_ * jax.lax.broadcast_in_dim(w_scales, w_.shape, [0])
-        plgpu.wgmma(acc_ref, w_, x_smem.at[:, ks].T)
+        plgpu.wgmma(acc, w_, x_smem.at[:, ks].T)
         plgpu.wgmma_wait(1)
 
     mi = group_info.block
     gi = group_info.group_id
-    x_transforms = (
-        plgpu.TilingTransform((8, x_swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle_x),
-    )
-    w_transforms = (
-        plgpu.TilingTransform((8, w_swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle_w),
-    )
-    x_spec = plgpu.BlockSpec(
-        (block_m, block_k),
-        lambda ki: (mi, ki),
-        transforms=x_transforms,
-        delay_release=1,
-    )
-    w_spec = plgpu.BlockSpec(
-        (block_n, block_k),
-        lambda ki: (ni, ki),
-        transforms=w_transforms,
-        delay_release=1,
-    )
+
+    spec = functools.partial(common.tiled_swizzled_block_spec, delay_release=1)
+    x_spec = spec((block_m, block_k), x_gmem.dtype, lambda ki: (mi, ki), "x")
+    w_spec = spec((block_n, block_k), w_gmem.dtype, lambda ki: (ni, ki), "w")
     w_scales_spec = plgpu.BlockSpec(
-        (1, block_n),
+        (None, block_n),
         lambda ki: (ki // (k // w_scales_gmem.shape[1] // block_k), ni),
         delay_release=1,
     )
@@ -108,20 +89,16 @@ def ragged_dot_quantized_kernel_body(
         grid=(k // block_k,),
         in_specs=(w_spec, x_spec, w_scales_spec),
         max_concurrent_steps=config.num_stages,
-    )(
-        w_gmem.at[gi],
-        x_gmem,
-        w_scales_gmem.at[gi],
-    )
-    if activation is not None:
-      return activation(acc_ref[...])
-    return acc_ref[...]
+    )(w_gmem.at[gi], x_gmem, w_scales_gmem.at[gi])
+    return acc[...]
 
   acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
-  store = functools.partial(
-      common.store_acc_transposed, acc, o_gmem, ni, m, group_info
-  )
-  pl.run_scoped(store, plgpu.SMEM((block_m, block_n), o_gmem.dtype))
+  o_smem_type = plgpu.SMEM((block_m, block_n), o_gmem.dtype)
+
+  @functools.partial(pl.run_scoped, o_smem=o_smem_type)
+  def epilogue(o_smem):
+    acc_ = acc if activation is None else activation(acc)
+    common.store_acc_transposed(acc_, o_gmem, ni, m, group_info, o_smem)
 
 
 @jaxtyping.jaxtyped
@@ -149,15 +126,8 @@ def ragged_dot_quantized_kernel(
         f" {rhs.scale_tile_shape}."
     )
 
-  if group_sizes.shape != (g,):
-    raise ValueError(
-        f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
-    )
-
   body = functools.partial(
-      ragged_dot_quantized_kernel_body,
-      activation=activation,
-      config=config,
+      ragged_dot_quantized_kernel_body, activation=activation, config=config
   )
   kernel = common.ragged_kernel(
       body, g=g, m=m, n=n, out_dtype=out_dtype, config=config

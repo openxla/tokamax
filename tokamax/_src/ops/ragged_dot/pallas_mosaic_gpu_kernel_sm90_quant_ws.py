@@ -16,7 +16,6 @@
 
 import functools
 
-import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -41,6 +40,7 @@ def body(
     x_gmem,
     w_scales_gmem,
     o_gmem,
+    o_smem,
     schedule_barrier,
     *,
     config: common.Config,
@@ -51,101 +51,55 @@ def body(
   block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
 
   m, k = x_gmem.shape
-  x_elem_bits = jnp.dtype(x_gmem.dtype).itemsize * 8
-  w_elem_bits = jnp.iinfo(w_gmem.dtype).bits
-
-  # K is the contiguous dimension
-  try:
-    swizzle_w = plgpu.find_swizzle(w_elem_bits * block_k, "lhs")
-  except ValueError as e:
-    raise NotImplementedError("No possible swizzle.") from e
-  swizzle_x = plgpu.find_swizzle(x_elem_bits * block_k, "rhs")
-
-  x_swizzle_elems = (swizzle_x * 8) // x_elem_bits
-  w_swizzle_elems = (swizzle_w * 8) // w_elem_bits
-
   wg = lax.axis_index("wg")
   ns = pl.ds(wg * block_n, block_n)
 
-  def schedule():
+  def schedule_barrier_arrive_and_wait():
     plgpu.barrier_arrive(schedule_barrier)
     plgpu.barrier_wait(schedule_barrier)
 
-  def pipeline_body(_, w_smem, x_smem, w_scales_smem, acc_ref):
-    pl.when(wg == 0)(schedule)
+  def pipeline_body(_, w_smem, x_smem, w_scales_smem, acc):
+    pl.when(wg == 0)(schedule_barrier_arrive_and_wait)
     w = w_smem[ns].astype(w_scales_smem.dtype)
-    w_scales = plgpu.load(w_scales_smem, (0, ns), layout=_WGMMA_ROW)
-    w *= jax.lax.broadcast_in_dim(w_scales, w.shape, [0])
-    schedule()
-    plgpu.wgmma(acc_ref, w, x_smem.T)
-    pl.when(wg == 1)(schedule)
+    w_scales = plgpu.load(w_scales_smem, (ns,), layout=_WGMMA_ROW)
+    w *= lax.broadcast_in_dim(w_scales, w.shape, [0])
+    schedule_barrier_arrive_and_wait()
+    plgpu.wgmma(acc, w, x_smem.T)
+    pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
     plgpu.wgmma_wait(0)
-    return acc_ref
+    return acc
 
-  def pipeline_context(cb):
-    acc = pl.run_scoped(
-        lambda acc_ref: cb(acc_ref)[...], plgpu.ACC((block_n, block_m))
-    )
+  def pipeline_context(pipeline_callback):
+    compute_acc = lambda acc: pipeline_callback(acc)[...]
+    acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
 
-    def store_acc(acc, o_smem):
-      assert block_n % 8 == 0
-      if activation is not None:
-        acc = activation(acc)
-      common.store_acc_transposed(
-          acc, o_gmem, 2 * ni + wg, m, group_info, o_smem.at[wg]
-      )
+    if activation is not None:
+      acc = activation(acc)
 
-    o_smem_type = plgpu.SMEM((2, block_m, block_n), o_gmem.dtype)
-    pl.run_scoped(
-        functools.partial(store_acc, acc), o_smem_type, collective_axes=("wg",)
-    )
-
-  try:
-    swizzle_w_transform = plgpu.SwizzleTransform(swizzle_w)
-  except ValueError as e:
-    raise NotImplementedError(f"{swizzle_w=} unsupported.") from e
+    ni_ = 2 * ni + wg
+    common.store_acc_transposed(acc, o_gmem, ni_, m, group_info, o_smem.at[wg])
 
   mi = group_info.block
   gi = group_info.group_id
-  x_transforms = (
-      plgpu.TilingTransform((8, x_swizzle_elems)),
-      plgpu.SwizzleTransform(swizzle_x),
-  )
-  w_transforms = (
-      plgpu.TilingTransform((8, w_swizzle_elems)),
-      swizzle_w_transform,
-  )
-  x_spec = plgpu.BlockSpec(
-      (block_m, block_k), lambda ki: (mi, ki), transforms=x_transforms
-  )
-  w_spec = plgpu.BlockSpec(
-      (2 * block_n, block_k), lambda ki: (ni, ki), transforms=w_transforms
-  )
+
+  spec = common.tiled_swizzled_block_spec
+  x_spec = spec((block_m, block_k), x_gmem.dtype, lambda ki: (mi, ki), "x")
+  w_spec = spec((2 * block_n, block_k), w_gmem.dtype, lambda ki: (ni, ki), "w")
   w_scales_spec = plgpu.BlockSpec(
-      (1, 2 * block_n),
+      (None, 2 * block_n),
       lambda ki: (ki // (k // w_scales_gmem.shape[1] // block_k), ni),
   )
 
-  with jax.named_scope("pipeline"):
-    plgpu.emit_pipeline_warp_specialized(
-        pipeline_body,
-        num_compute_wgs=2,
-        wg_axis="wg",
-        memory_registers=168 if config.persistent else 40,
-        grid=(w_gmem.shape[2] // block_k,),
-        compute_context=pipeline_context,
-        in_specs=(w_spec, x_spec, w_scales_spec),
-        max_concurrent_steps=max(config.num_stages // 2, 2),
-    )(w_gmem.at[gi], x_gmem, w_scales_gmem.at[gi])
-
-  # The memory WG does not arrive at the run so we release it here.
-  # TODO: Change the run_scoped() API so this is not
-  # necessary.
-  @pl.when(wg == 2)
-  def _():
-    pl.run_scoped(
-        lambda _: None, plgpu.SMEM((), jnp.float32), collective_axes="wg"
-    )
+  plgpu.emit_pipeline_warp_specialized(
+      pipeline_body,
+      num_compute_wgs=2,
+      wg_axis="wg",
+      memory_registers=168 if config.persistent else 40,
+      grid=(k // block_k,),
+      compute_context=pipeline_context,
+      in_specs=(w_spec, x_spec, w_scales_spec),
+      max_concurrent_steps=max(config.num_stages // 2, 2),
+  )(w_gmem.at[gi], x_gmem, w_scales_gmem.at[gi])
 
 
 @jaxtyping.jaxtyped
@@ -173,30 +127,20 @@ def ragged_dot_quantized_ws_kernel(
         f" {rhs.scale_tile_shape}."
     )
 
-  if group_sizes.shape != (g,):
-    raise ValueError(
-        f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
-    )
-
-  def kernel_entry(*args):
-    return pl.run_scoped(
-        functools.partial(
-            body, *args, activation=activation, config=config
-        ),
-        plgpu.Barrier(num_arrivals=2),
-        collective_axes="wg",
-    )
-
   assert n % (config.block_n * 2) == 0
 
   kernel = common.ragged_kernel(
-      kernel_entry,
+      functools.partial(body, activation=activation, config=config),
       g=g,
       m=m,
       n=n,
       out_dtype=out_dtype,
       config=config,
       thread_axis="wg",
+      scratch_shapes=(
+          plgpu.SMEM((2, config.block_m, config.block_n), out_dtype),
+          plgpu.Barrier(num_arrivals=2),
+      ),
   )
   group_info = common.GroupInfo.create(
       group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
