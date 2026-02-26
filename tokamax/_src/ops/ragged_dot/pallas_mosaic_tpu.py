@@ -433,14 +433,16 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         + [n_ // (2**i) for i in range(6)]  # downwards divisors of n_
         + [n]  # full tile
     )
+    input_buffer_count_range = [2, 3, 4]
     return set(
         Config(
             tile_m=tile_m,
             tile_k=tile_k,
             tile_n=tile_n,
+            input_buffer_count=input_buffer_count,
         )
-        for tile_m, tile_k, tile_n in itertools.product(
-            tile_m_range, tile_k_range, tile_n_range
+        for tile_m, tile_k, tile_n, input_buffer_count in itertools.product(
+            tile_m_range, tile_k_range, tile_n_range, input_buffer_count_range
         )
     )
 
