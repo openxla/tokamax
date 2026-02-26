@@ -88,13 +88,11 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
       # Cache paths later in the list will override earlier ones.
       try:
         data = _get_cache_adapter(self.op).validate_json(json_data)
-      except Exception as e:
-        logging.exception(
-            "Failed to parse autotuning cache file: %s Error: %s", path, e
-        )
-        continue
-      out |= {
-          self.op.bind(**k).autotuning_cache_key: cache
-          for k, cache in data.items()
-      }
+      except Exception:  # pylint: disable=broad-except
+        logging.exception("Failed to parse autotuning cache file: %s", path)
+      else:
+        out |= {
+            self.op.bind(**k).autotuning_cache_key: cache
+            for k, cache in data.items()
+        }
     return out

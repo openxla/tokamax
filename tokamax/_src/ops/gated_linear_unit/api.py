@@ -107,7 +107,7 @@ def gated_linear_unit(
     try:
       return fn(x, weights, activation=activation, precision=precision)
     except NotImplementedError as e:
-      logging.error('Failed to run implementation: %s', e)
+      logging.exception('Failed to run implementation')
       errors.append(e)
 
   raise ExceptionGroup('all implementations failed', errors)

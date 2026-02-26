@@ -121,8 +121,8 @@ class AttentionBenchmark(parameterized.TestCase):
           tb_writer.add_scalar(metric_tag, value, global_step=i)
 
         tb_writer.close()
-      except (OSError, IOError) as e:
-        logging.exception('Error writing TensorBoard logs: %s', e)
+      except (OSError, IOError):
+        logging.exception('Error writing TensorBoard logs')
     else:
       logging.info(
           'implementation=%s, benchmark_mode=%s, benchmark time (ms): %s',

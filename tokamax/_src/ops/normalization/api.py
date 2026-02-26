@@ -124,7 +124,7 @@ def layer_norm(
           subtract_mean=subtract_mean,
       )
     except NotImplementedError as e:
-      logging.error('Failed to run implementation: %s', e)
+      logging.exception('Failed to run implementation')
       errors.append(e)
 
   raise ExceptionGroup('all implementations failed', errors)
