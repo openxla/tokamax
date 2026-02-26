@@ -41,6 +41,8 @@ class ApiShardingTest(parameterized.TestCase):
       self.skipTest('Triton not supported on this platform.')
     if implementation == 'cudnn' and jax.default_backend() != 'gpu':
       self.skipTest('cuDNN only supported on GPU')
+    if implementation == 'mosaic_tpu' and jax.default_backend() != 'tpu':
+      self.skipTest('Mosaic TPU only supported on TPU')
 
     if jax.device_count() < 2:
       self.skipTest('Requires at least 2 devices for sharding.')
