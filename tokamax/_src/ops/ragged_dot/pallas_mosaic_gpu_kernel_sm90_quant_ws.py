@@ -47,7 +47,7 @@ def body(
   del mi
   block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
 
-  m = x_gmem.shape[0]
+  m, k = x_gmem.shape
   x_elem_bits = jnp.dtype(x_gmem.dtype).itemsize * 8
   w_elem_bits = jnp.iinfo(w_gmem.dtype).bits
 
@@ -116,7 +116,10 @@ def body(
   w_spec = plgpu.BlockSpec(
       (2 * block_n, block_k), lambda ki: (ni, ki), transforms=w_transforms
   )
-  w_scales_spec = plgpu.BlockSpec((1, 2 * block_n), lambda ki: (ki, ni))
+  w_scales_spec = plgpu.BlockSpec(
+      (1, 2 * block_n),
+      lambda ki: (ki // (k // w_scales_gmem.shape[1] // block_k), ni),
+  )
 
   with jax.named_scope("pipeline"):
     plgpu.emit_pipeline_warp_specialized(
@@ -155,10 +158,14 @@ def ragged_dot_quantized_ws_kernel(
   m, _ = lhs.shape
   g, _, n = rhs.shape
 
-  if rhs.scale_tile_shape != (1, config.block_k, 1):
+  if (
+      rhs.scale_tile_shape[0] != 1
+      or rhs.scale_tile_shape[1] % config.block_k != 0
+      or rhs.scale_tile_shape[2] != 1
+  ):
     raise NotImplementedError(
-        "Only scaling tile supported is (1, block_k, 1) got:"
-        f" {rhs.scale_tile_shape} (block_k={config.block_k})."
+        "Only scaling tile supported is (1, N * block_k, 1) got:"
+        f" {rhs.scale_tile_shape}."
     )
 
   if group_sizes.shape != (g,):

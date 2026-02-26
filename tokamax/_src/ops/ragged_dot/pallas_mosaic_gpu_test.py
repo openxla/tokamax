@@ -78,7 +78,9 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
           )
       elif isinstance(rhs_, qwix.QArray):
         if (
-            rhs_.scale_tile_shape != (1, _CONFIG.block_k, 1)
+            rhs_.scale_tile_shape[0] != 1
+            or rhs_.scale_tile_shape[1] % _CONFIG.block_k != 0
+            or rhs_.scale_tile_shape[2] != 1
             or kwargs.get("preferred_element_type") is not None
         ):
           expect_supported = False

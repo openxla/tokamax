@@ -93,7 +93,7 @@ def ragged_dot_quantized_kernel_body(
     )
     w_scales_spec = plgpu.BlockSpec(
         (1, block_n),
-        lambda ki: (ki, ni),
+        lambda ki: (ki // (k // w_scales_gmem.shape[1] // block_k), ni),
         delay_release=1,
     )
     plgpu.emit_pipeline(
@@ -132,9 +132,13 @@ def ragged_dot_quantized_kernel(
   m, _ = lhs.shape
   g, _, n = rhs.shape
 
-  if rhs.scale_tile_shape != (1, config.block_k, 1):
+  if (
+      rhs.scale_tile_shape[0] != 1
+      or rhs.scale_tile_shape[1] % config.block_k != 0
+      or rhs.scale_tile_shape[2] != 1
+  ):
     raise NotImplementedError(
-        "Only scaling tile supported is (1, config.block_k, 1) got:"
+        "Only scaling tile supported is (1, N * block_k, 1) got:"
         f" {rhs.scale_tile_shape}."
     )
 
