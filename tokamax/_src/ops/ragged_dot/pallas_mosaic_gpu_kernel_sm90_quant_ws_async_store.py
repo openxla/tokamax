@@ -35,6 +35,8 @@ COMPUTE_WGS = 2
 STORE_WG = COMPUTE_WGS
 MEMORY_WG = COMPUTE_WGS + 1
 
+_WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
+
 
 @jaxtyping.jaxtyped
 def ragged_dot_quantized_ws_async_store_kernel(
@@ -216,10 +218,10 @@ def ragged_dot_quantized_ws_async_store_kernel(
             def _iter(ki, acc_ref):
               stage = jax.lax.rem(ki, num_stages)
               with jax.named_scope("dequant"):
-                w = common.dequant(
-                    w_scales_smem.at[stage, pl.ds(wg * block_n, block_n)],
-                    w_smem[stage, pl.ds(wg * block_n, block_n)],
-                )
+                idx = (stage, pl.ds(wg * block_n, block_n))
+                w = w_smem[idx].astype(w_scales_smem.dtype)
+                w_scales = plgpu.load(w_scales_smem, idx, layout=_WGMMA_ROW)
+                w *= jax.lax.broadcast_in_dim(w_scales, w.shape, [0])
               with jax.named_scope("wait X"):
                 plgpu.barrier_wait(x_tma_barrier.at[stage])
               with jax.named_scope("mma"):

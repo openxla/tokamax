@@ -15,6 +15,8 @@
 """Ragged dot Pallas-Mosaic-GPU Quantized Kernel."""
 
 import functools
+
+import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
@@ -25,6 +27,9 @@ import qwix
 from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
+
+
+_WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 
 
 def ragged_dot_quantized_kernel_body(
@@ -54,6 +59,7 @@ def ragged_dot_quantized_kernel_body(
   def compute_acc(acc_ref):
     def pipeline_body(_, w_smem, x_smem, w_scales_smem):
       w = w_smem[...]
+      w_scales = plgpu.load(w_scales_smem, (0,), layout=_WGMMA_ROW)
       # Tiling along the reduction dimension. This overlaps to some extent
       # scaling/casting with wgmma.
       assert w.shape[1] % x_swizzle_elems == 0
@@ -65,7 +71,8 @@ def ragged_dot_quantized_kernel_body(
 
       for j in range(steps):
         ks = slice(j * x_swizzle_elems, (j + 1) * x_swizzle_elems)
-        w_ = common.dequant(w_scales_smem.at[0], w[:, ks])
+        w_ = w[:, ks].astype(w_scales.dtype)
+        w_ = w_ * jax.lax.broadcast_in_dim(w_scales, w_.shape, [0])
         plgpu.wgmma(acc_ref, w_, x_smem.at[:, ks].T)
         plgpu.wgmma_wait(1)
 

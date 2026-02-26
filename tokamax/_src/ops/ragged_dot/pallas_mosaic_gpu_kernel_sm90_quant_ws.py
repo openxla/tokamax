@@ -30,6 +30,9 @@ from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
+_WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
+
+
 def body(
     group_info: common.GroupInfo,
     mi,
@@ -70,7 +73,9 @@ def body(
 
   def pipeline_body(_, w_smem, x_smem, w_scales_smem, acc_ref):
     pl.when(wg == 0)(schedule)
-    w = common.dequant(w_scales_smem.at[0, ns], w_smem[ns])
+    w = w_smem[ns].astype(w_scales_smem.dtype)
+    w_scales = plgpu.load(w_scales_smem, (0, ns), layout=_WGMMA_ROW)
+    w *= jax.lax.broadcast_in_dim(w_scales, w.shape, [0])
     schedule()
     plgpu.wgmma(acc_ref, w, x_smem.T)
     pl.when(wg == 1)(schedule)

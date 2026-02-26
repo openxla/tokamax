@@ -25,8 +25,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
-from jaxlib.mlir.dialects import arith
-from jaxlib.mlir.dialects import memref
 import pydantic
 from tokamax._src.ops.ragged_dot import base
 
@@ -195,27 +193,6 @@ class GroupInfo:
         offset_in_block,
         actual_size,
     )
-
-
-def dequant(s_ref, w):
-  """Dequantize the array `w` using a 1D ref `s_ref`."""
-
-  @plgpu.inline_mgpu(
-      arg_types=(plgpu.RefType(), plgpu.Layout.WGMMA),
-      return_type=plgpu.ShapeDtypeStruct(
-          w.shape,
-          s_ref.dtype,
-          plgpu.Layout.WGMMA,
-      ),
-  )
-  def scaled_w(_, s_smem, w):
-    def scale(w_val, idx):
-      assert s_smem.type.shape == [w.shape[0]]
-      return arith.mulf(memref.load(s_smem, (idx[0],)), w_val)
-
-    return w.foreach(scale, create_array=True)
-
-  return scaled_w(s_ref, w.astype(s_ref.dtype))
 
 
 def calculate_group_info_tasks(
