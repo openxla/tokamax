@@ -110,7 +110,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-327680x2880',
+        name='gpt-oss-327680x2880_128x2880x2880',
     ),
     arg_spec.ArgSpec(
         args={
@@ -128,7 +128,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-393216x2048',
+        name='gpt-oss-393216x2048_128x2048x768',
     ),
     arg_spec.ArgSpec(
         args={
@@ -146,7 +146,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-393216x768',
+        name='gpt-oss-393216x768_128x768x2048',
     ),
     arg_spec.ArgSpec(
         args={
@@ -164,7 +164,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-524288x4096',
+        name='gpt-oss-524288x4096_128x4096x1536',
     ),
     arg_spec.ArgSpec(
         args={
@@ -182,7 +182,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-524288x1536',
+        name='gpt-oss-524288x1536_128x1536x4096',
     ),
     arg_spec.ArgSpec(
         args={
@@ -200,7 +200,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-262144x4096',
+        name='gpt-oss-262144x4096_128x4096x1536',
     ),
     arg_spec.ArgSpec(
         args={
@@ -218,7 +218,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-262144x1536',
+        name='gpt-oss-262144x1536_128x1536x4096',
     ),
     arg_spec.ArgSpec(
         args={
@@ -236,7 +236,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-131072x7168',
+        name='gpt-oss-131072x7168_128x7168x2048',
     ),
     arg_spec.ArgSpec(
         args={
@@ -254,7 +254,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-131072x2048',
+        name='gpt-oss-131072x2048_128x2048x768',
     ),
     arg_spec.ArgSpec(
         args={
@@ -272,7 +272,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-131072x4096',
+        name='gpt-oss-131072x4096_128x4096x1536',
     ),
     arg_spec.ArgSpec(
         args={
@@ -290,7 +290,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-131072x1536',
+        name='gpt-oss-131072x1536_128x1536x4096',
     ),
     arg_spec.ArgSpec(
         args={
@@ -308,7 +308,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-131072x7168',
+        name='gpt-oss-131072x7168_256x7168x2048',
     ),
     arg_spec.ArgSpec(
         args={
@@ -326,7 +326,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-65536x7168',
+        name='gpt-oss-65536x7168_256x7168x2048',
     ),
     arg_spec.ArgSpec(
         args={
@@ -344,7 +344,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-131072x7168',
+        name='gpt-oss-131072x7168_256x7168x512',
     ),
     arg_spec.ArgSpec(
         args={
@@ -362,7 +362,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-131072x512',
+        name='gpt-oss-131072x512_256x512x7168',
     ),
     arg_spec.ArgSpec(
         args={
@@ -380,7 +380,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-262144x512',
+        name='gpt-oss-262144x512_256x512x7168',
     ),
     arg_spec.ArgSpec(
         args={
@@ -398,7 +398,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-262144x7168',
+        name='gpt-oss-262144x7168_256x7168x512',
     ),
     arg_spec.ArgSpec(
         args={
@@ -416,7 +416,7 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-262144x1024',
+        name='gpt-oss-262144x1024_256x1024x7168',
     ),
     arg_spec.ArgSpec(
         args={
@@ -434,6 +434,6 @@ ARG_SPECS = (
             ),
         },
         project='maxtext',
-        name='gpt-oss-262144x7168',
+        name='gpt-oss-262144x7168_256x7168x1024',
     ),
 ) + tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())
