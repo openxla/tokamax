@@ -19,6 +19,7 @@ from collections.abc import Callable
 from concurrent import futures
 from concurrent.futures import process
 import dataclasses
+import functools
 import os
 import typing
 from typing import Any, ParamSpec, Self, TypeVar, cast
@@ -114,6 +115,8 @@ class Autotuner:
     executor = self.executor_fn()
     executor_args = {}
     timeout = self.timeout_seconds
+    vlog_exc_info = functools.partial(logging.vlog, 2, exc_info=True)
+
     if self.compile_executor_fn is not None:
       if isinstance(executor, process.ProcessPoolExecutor):
         raise ValueError(
@@ -137,11 +140,11 @@ class Autotuner:
                 initialized_args = numerics.random_initialize(args)
               executor_args[config] = (compiled_fn, initialized_args)
             except Exception:  # pylint: disable=broad-exception-caught
-              logging.vlog(2, "Config failed to compile: %s", config)
+              vlog_exc_info("Config failed to compile: %s", config)
         except TimeoutError:
           slow_configs = [c for c in configs if c not in executor_args]
-          logging.vlog(
-              2, "Configs timed out during compilation: %s", slow_configs
+          vlog_exc_info(
+              "Configs timed out during compilation: %s", slow_configs
           )
     else:
       for config in configs:
@@ -158,9 +161,9 @@ class Autotuner:
           try:
             data = future.result()
           except process.BrokenProcessPool:
-            logging.vlog(2, "Config broken: %s", config)
+            vlog_exc_info("Config broken: %s", config)
           except Exception:  # pylint: disable=broad-exception-caught
-            logging.vlog(2, "Config failed: %s", config)
+            vlog_exc_info("Config failed: %s", config)
           else:
             results[config] = data
             logging.vlog(
