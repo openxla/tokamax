@@ -57,6 +57,13 @@ TimingMethod: TypeAlias = Literal[
 WORKLOAD_ARTIFACTS_DIR_VARNAME: Final[str] = 'WORKLOAD_ARTIFACTS_DIR'  # for CI
 
 
+def get_temp_dir(*args, **kwargs) -> tempfile.TemporaryDirectory[str]:
+  """A tempfile TemporaryDirectory with delete=False in all Python versions."""
+  if 'delete' in inspect.signature(tempfile.TemporaryDirectory).parameters:
+    kwargs = dict(kwargs, delete=False)  # in Python 3.12+
+  return tempfile.TemporaryDirectory(*args, **kwargs)
+
+
 @jax.custom_vjp
 def _optimization_barrier(x: T) -> T:
   return jax.lax.optimization_barrier(x)
@@ -133,7 +140,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     self._jax_profiler_mode = use_jax_profiler
     if xprof_session is None or profile_data is None:
       self._jax_profiler_mode = True
-    self._profile_tempdir: tempfile.TemporaryDirectory | None = None
+    self._profile_tempdir: tempfile.TemporaryDirectory[str] | None = None
     self._xprof_session_kwargs = xprof_session_kwargs
 
   @property
@@ -175,8 +182,8 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     if self._jax_profiler_mode:
       try:
         root_dir = os.environ.get(WORKLOAD_ARTIFACTS_DIR_VARNAME, None)
-        self._profile_tempdir = tempfile.TemporaryDirectory(
-            prefix='tokamax_xprof_profile_', dir=root_dir, delete=False
+        self._profile_tempdir = get_temp_dir(
+            prefix='tokamax_xprof_profile_', dir=root_dir
         )
         jax.profiler.start_trace(self._profile_tempdir.name)
         logger.info(
