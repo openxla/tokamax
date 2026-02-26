@@ -171,6 +171,11 @@ def flash_attention_vjp_kernel(
   q, k, v, out, dout = map(pad_head_dim, (q, k, v, out, dout))
   m, l = residuals
 
+  # TODO: Remove padding along q sequence length.
+  orig_q_seq_len = q.shape[-3]
+  pad_q_seq = lambda x, a: shape_lib.pad_to_next_multiple_of(x, 8, a)
+  q, m, l = map(pad_q_seq, (q, m, l), (-3, -1, -1))
+
   q_seq_len, num_q_heads, head_dim = q.shape
   kv_seq_len, num_kv_heads, head_dim_out = v.shape
   if (dtype := q.dtype) != k.dtype or dtype != v.dtype:
@@ -198,6 +203,7 @@ def flash_attention_vjp_kernel(
   delta = jnp.einsum(
       "qhd,qhd->hq", out, dout, preferred_element_type=jnp.float32
   )
+  delta = pad_q_seq(delta, -1)
   exp = jnp.exp2 if use_base2 else jnp.exp
 
   def tiled_spec(block_shape, dtype, index_map, what=""):
@@ -752,8 +758,8 @@ def flash_attention_vjp_kernel(
     dk = dk.reshape(*k.shape[:-1], q_heads_per_kv_head, -1).sum(axis=-2)
     dv = dv.reshape(*v.shape[:-1], q_heads_per_kv_head, -1).sum(axis=-2)
 
-  dq = dq[..., :orig_head_dim]
+  dq = dq[..., :orig_q_seq_len, :, :orig_head_dim]
   dk = dk[..., :orig_head_dim]
   dv = dv[..., :orig_head_dim_out]
-  ds = None if ds is None else ds[:, :q_seq_len, :kv_seq_len]
+  ds = None if ds is None else ds[:, :orig_q_seq_len, :kv_seq_len]
   return dq, dk, dv, ds

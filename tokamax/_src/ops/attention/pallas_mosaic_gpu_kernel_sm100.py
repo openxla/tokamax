@@ -188,7 +188,7 @@ def flash_attention_kernel(
     # TODO: Support other out_dtypes.
     raise NotImplementedError(f"{out_dtype=} != {q.dtype=} unsupported.")
 
-  orig_q_seq_len, num_q_heads, _ = q.shape
+  q_seq_len, num_q_heads, _ = q.shape
   dtype = q.dtype
 
   kv_seq_len, num_kv_heads, orig_head_dim_out = v.shape
@@ -204,8 +204,7 @@ def flash_attention_kernel(
 
   pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
   q, k, v = map(pad_head_dim, (q, k, v))
-  q = shape_lib.pad_to_next_multiple_of(q, 8, -3)
-  q_seq_len, _, head_dim = q.shape
+  head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
 
   if mask is None:
@@ -801,7 +800,7 @@ def flash_attention_kernel(
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), q.dtype)]
   if return_residuals:
-    residuals_shape = (num_q_heads, pl.cdiv(q_seq_len, tile_q) * tile_q)
+    residuals_shape = (num_q_heads, num_q_tiles * tile_q)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
 
   profile = False
@@ -823,6 +822,5 @@ def flash_attention_kernel(
       compiler_params=compiler_params,
   )(q, k, v, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
-  residuals = tuple(res[..., :orig_q_seq_len] for res in residuals)
-  out = out[..., :orig_q_seq_len, :, :orig_head_dim_out]
-  return (out, residuals if residuals else None)
+  residuals = tuple(res[..., :q_seq_len] for res in residuals)
+  return (out[..., :orig_head_dim_out], residuals if residuals else None)

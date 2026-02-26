@@ -147,9 +147,8 @@ def flash_attention_kernel(
   q_heads_per_kv_head = num_q_heads // num_kv_heads
 
   # The sequence dimensions must be a multiple of 8.
-  orig_q_seq_len, _, _ = q.shape
   pad_seq_len = lambda x: shape_lib.pad_to_next_multiple_of(x, 8, 0)
-  q, k, v = map(pad_seq_len, (q, k, v))
+  k, v = map(pad_seq_len, (k, v))
 
   q_seq_len, num_q_heads, _ = q.shape
   kv_seq_len, _, orig_head_dim_out = v.shape
@@ -543,7 +542,7 @@ def flash_attention_kernel(
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:
-    residuals_shape = (num_q_heads, q_seq_len)
+    residuals_shape = (num_q_heads, num_q_tiles * 2 * block_q)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
 
   out, *residuals = plgpu.kernel(
@@ -555,8 +554,6 @@ def flash_attention_kernel(
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(approx_math=True),
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
-  if return_residuals:
-    residuals = tuple(r[:, :orig_q_seq_len] for r in residuals)
-  else:
-    residuals = None
-  return out[:orig_q_seq_len, :, :orig_head_dim_out], residuals
+
+  residuals = tuple(res[..., :q_seq_len] for res in residuals)
+  return (out[..., :orig_head_dim_out], residuals if residuals else None)
