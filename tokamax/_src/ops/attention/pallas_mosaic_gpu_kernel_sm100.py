@@ -576,10 +576,12 @@ def flash_attention_kernel(
           l_i += p.sum(axis=1)
           p16 = p.astype(p_tmem.dtype)
 
-          @pl.when(is_last_step)
-          def write_l_to_smem():
-            li_smem[...] = l_i
-            common.bar_arrive(_L_BARRIER_ID, num_threads=256)
+          if normalize_output:
+
+            @pl.when(is_last_step)
+            def write_l_to_smem():
+              li_smem[...] = l_i
+              common.bar_arrive(_L_BARRIER_ID, num_threads=256)
 
           with jax.named_scope("write qk_tmem"):
             plgpu.async_store_tmem(
@@ -648,15 +650,17 @@ def flash_attention_kernel(
             plgpu.barrier_arrive(out_scaled_barrier.at[i])
 
       with jax.named_scope("epilogue"):
-        common.bar_sync(_L_BARRIER_ID, num_threads=256)
-        l_i = plgpu.load(li_smem, (), layout=_TCGEN05_ROW)
+        if normalize_output:
+          common.bar_sync(_L_BARRIER_ID, num_threads=256)
+          l_i = plgpu.load(li_smem, (), layout=_TCGEN05_ROW)
+          l_rcp = 1.0 / (l_i + float(jnp.finfo(jnp.float32).tiny))
+          l_rcp = lax.broadcast_in_dim(l_rcp, acc_tmem.shape, [0])
+        else:
+          l_rcp = 1.0
         plgpu.barrier_wait(pv_mma_barrier)
 
         acc = plgpu.async_load_tmem(acc_tmem, layout=_TCGEN05)
-        if normalize_output:
-          epsilon = float(jnp.finfo(jnp.float32).tiny)
-          acc *= lax.broadcast_in_dim(1.0 / (l_i + epsilon), acc.shape, [0])
-        o_smem[...] = acc.astype(dtype)
+        o_smem[...] = (acc * l_rcp).astype(dtype)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
@@ -700,7 +704,10 @@ def flash_attention_kernel(
         (block_q, block_kv), jnp.float32, collective=collective
     )
     alpha_scratch = plgpu.SMEM((softmax_slots, block_q), jnp.float32)
-    li_scratch = plgpu.SMEM((block_q,), jnp.float32)
+    if normalize_output:
+      li_scratch = plgpu.SMEM((block_q,), jnp.float32)
+    else:
+      li_scratch = None
     mask_scratch = tiled_smem((block_q, block_kv), jnp.int8)
 
     # TMA barriers
