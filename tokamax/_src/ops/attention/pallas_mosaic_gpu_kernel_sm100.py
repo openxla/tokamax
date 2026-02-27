@@ -65,14 +65,13 @@ class Config(common.ConfigBase):
   """Configuration parameters for Pallas-Mosaic-GPU kernels on SM100 GPUs.
 
   Attributes:
-    block_d: Block size along head_dim for updating accumulator.
     num_tma_splits: Number of chunks to load each K/V - helpful to better hide
       GMEM load latences as we can notify TMA warp after part of the mma, thus
       giving more time to TMA loads.
     collective: if True - 2 CTA MMA will be run with M=256, N=128
   """
 
-  num_tma_splits: pydantic.PositiveInt = 2
+  num_tma_splits: pydantic.PositiveInt = 1
   collective: pydantic.StrictBool = True
 
   def __post_init__(self):
@@ -92,7 +91,7 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   head_dim = pl.cdiv(max(head_dim, v.shape[-1]), 64) * 64
   batch_size = math.prod(batch_size)
   kv_seq_len = v.shape[-3]
-  num_tma_splits = 2 if head_dim == 256 else 1
+  num_tma_splits = 2 if head_dim >= 256 else 1
   collective = True
   cluster_size = 1 + int(collective)
   num_stages = max(256 // head_dim, 1) * cluster_size
@@ -221,7 +220,7 @@ def flash_attention_kernel(
   tile_q, block_kv = config.block_q, config.block_kv
   num_q_tiles = pl.cdiv(q_seq_len, tile_q)
   num_stages = config.num_stages
-  num_tma_splits = config.num_tma_splits if head_dim >= 128 else 1
+  num_tma_splits = config.num_tma_splits
   collective = config.collective
   block_q = tile_q // 2 if collective else tile_q
   collective_axis = "x" if collective else None

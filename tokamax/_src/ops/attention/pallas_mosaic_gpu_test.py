@@ -191,7 +191,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def test_autotune_configs(self):
     # Test that all autotuning configs yield reasonable results.
     assert isinstance(self._attention_fn, base.DotProductAttention)
-    q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 64))
+    q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 128))
     bound_args = self._attention_fn.bind(q, k, v)
     configs = self._attention_fn._get_autotuning_configs(bound_args)
     self.assertNotEmpty(configs)
