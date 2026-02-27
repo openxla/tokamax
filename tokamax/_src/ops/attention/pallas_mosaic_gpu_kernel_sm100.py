@@ -267,7 +267,6 @@ def flash_attention_kernel(
         pv_mma_barrier,
         v_consumed_barrier,
         p_produced_barrier,
-        p_consumed_barrier,
         out_scaled_barrier,
     ) = buffer_barriers
 
@@ -435,9 +434,6 @@ def flash_attention_kernel(
             plgpu.tcgen05_commit_arrive(
                 pv_mma_barrier, collective_axis=collective_axis
             )
-            plgpu.tcgen05_commit_arrive(
-                p_consumed_barrier.at[slot], collective_axis=collective_axis
-            )
 
           plgpu.barrier_wait(q_barrier)
           qk_mma(lb)
@@ -584,11 +580,6 @@ def flash_attention_kernel(
           def write_l_to_smem():
             li_smem[...] = l_i
             common.bar_arrive(_L_BARRIER_ID, num_threads=256)
-
-          @pl.when(ki > lb + 1)
-          def wait_for_p_consumed():
-            with jax.named_scope("wait p_consumed"):
-              plgpu.barrier_wait(p_consumed_barrier.at[si])
 
           with jax.named_scope("write qk_tmem"):
             plgpu.async_store_tmem(
@@ -744,8 +735,6 @@ def flash_attention_kernel(
       out_scaled_barrier = plgpu.Barrier(num_barriers=num_tma_splits)
       qk_consumed_barrier = plgpu.Barrier()
 
-    p_consumed_barrier = plgpu.Barrier(num_barriers=2, orders_tensor_core=True)
-
     pl.run_scoped(
         lambda *args: kernel(*refs, scoped=args),
         (
@@ -773,7 +762,6 @@ def flash_attention_kernel(
             pv_mma_barrier,
             v_consumed_barrier,
             p_produced_barrier,
-            p_consumed_barrier,
             out_scaled_barrier,
         ),
         collective_axes="wg",
