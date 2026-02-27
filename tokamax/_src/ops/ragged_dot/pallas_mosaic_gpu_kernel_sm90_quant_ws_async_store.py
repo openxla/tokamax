@@ -17,7 +17,6 @@
 import functools
 
 import jax
-from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
@@ -31,11 +30,12 @@ from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
-COMPUTE_WGS = 2
-STORE_WG = COMPUTE_WGS
-MEMORY_WG = COMPUTE_WGS + 1
+_COMPUTE_WGS = 2
+_EPILOGUE_WG = _COMPUTE_WGS
+_MEMORY_WG = _COMPUTE_WGS + 1
 
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
+_WGMMA_TRANSPOSED = plgpu.Layout.WGMMA_TRANSPOSED
 
 
 @jaxtyping.jaxtyped
@@ -72,203 +72,156 @@ def ragged_dot_quantized_ws_async_store_kernel(
     The output of the ragged dot. shape: (m, n)
   """
 
-  _, k = lhs.shape
-  g, _, _ = rhs.shape
+  m, k = lhs.shape
+  g, _, n = rhs.shape
   w, w_scales, x = (rhs.qvalue.mT, rhs.scale, lhs)
-  (_, n, k_w), (m, k_x) = w.shape, x.shape
+  block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
+
+  if n % (2 * block_n) != 0:
+    raise NotImplementedError(f"{n=} must be divisible by {2 * block_n=}")
+
+  w_scales_tile_g, w_scales_tile_k, w_scales_tile_n = rhs.scale_tile_shape
+  w_scales_tile_k_rem = w_scales_tile_k % block_k
+
+  if (w_scales_tile_g, w_scales_tile_k_rem, w_scales_tile_n) != (1, 0, 1):
+    raise NotImplementedError(
+        f"Scales tile is not supported got: {rhs.scale_tile_shape=} {block_k=}."
+    )
+
   group_info = common.GroupInfo.create_aligned(
       group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
   )
-  block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
-  tile_k = k_w // w_scales.shape[1]
+  num_stages = min(config.num_stages, k // block_k)
 
-  if group_sizes.shape != (g,):
-    raise ValueError(
-        f"Expected group_sizes to have shape {(g,)} but got {group_sizes.shape}"
-    )
-  assert (
-      n % (config.block_n * 2) == 0
-  ), "n must be divisible by config.block_n * 2"
-
-  if (
-      len(rhs.scale_tile_shape) != 3
-      or rhs.scale_tile_shape[0] != 1
-      or rhs.scale_tile_shape[2] != 1
-      or (rhs.scale_tile_shape[1] % config.block_k != 0)
+  def kernel(
+      x_gmem,
+      w_gmem,
+      w_scales_gmem,
+      _,
+      group_id_gmem,
+      start_within_block_gmem,
+      actual_size_gmem,
+      block_start_gmem,
+      out_gmem,
+      *,
+      x_smem,
+      w_smem,
+      w_scales_smem,
+      o_smem,
+      x_barrier,
+      w_barrier,
+      x_consumed_barrier,
+      w_consumed_barrier,
+      store_gmem_done_barrier,
+      store_smem_done_barrier,
   ):
-    raise NotImplementedError(
-        "Scaling tile is not supported got:"
-        f" {rhs.scale_tile_shape=} (block_k={config.block_k})."
-    )
-
-  out_elem_bits = jnp.finfo(out_dtype).bits
-  swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
-  out_swizzle_elems = (swizzle_out * 8) // out_elem_bits
-
-  if out_swizzle_elems != block_n:
-    raise ValueError(
-        f"Expected out_swizzle_elems ({out_swizzle_elems}) to equal"
-        f" block_n ({block_n})"
-    )
-  num_stages = min(config.num_stages, k_x // block_k)
-
-  def kernel(*refs, scoped):
-    (
-        x_gmem,
-        w_gmem,
-        w_scales_gmem,
-        _,
-        group_id_gmem,
-        start_within_block_gmem,
-        actual_size_gmem,
-        block_start_gmem,
-        out_gmem,
-    ) = refs
-    (scratch_buffers, barriers) = scoped
-    x_smem, w_smem, w_scales_smem, o_smem = scratch_buffers
-    (
-        x_tma_barrier,
-        w_tma_barrier,
-        x_consume_barrier,
-        w_consume_barrier,
-        store_gmem_done_barrier,
-        store_smem_done_barrier,
-    ) = barriers
-    num_k_iters = pl.cdiv(k, block_k)
+    k_iters = pl.cdiv(k, block_k)
 
     def mn_loop(m_offset, m_iters, n_iters, loop_info: plgpu.NDLoopInfo, carry):
       (lin_idx,) = loop_info.index
-      m_index, n_index = plgpu.planar_snake(
-          lin_idx,  # Linear index.
+      mi, ni = plgpu.planar_snake(
+          lin_idx,
           (m_iters, n_iters),
-          # The 2D iteration space.
           config.grid_minor_dim,
-          # 0 or 1, indicates the fastest changing dim.
           config.grid_tile_width,
-          # The width of tiles along the fastest changing dim.
       )
-      tid_m = m_index + m_offset
-      ni = n_index
+      tid_m = mi + m_offset
 
       with jax.named_scope("load group_info"):
-        group_id = group_id_gmem[tid_m]
+        gi = group_id_gmem[tid_m]
         start_within_block = start_within_block_gmem[tid_m]
         actual_size = actual_size_gmem[tid_m]
         block_start = block_start_gmem[tid_m]
+
       wg = jax.lax.axis_index("wg")
-
-      def do_tma_x(ki, slot):
-        plgpu.copy_gmem_to_smem(
-            x_gmem.at[
-                pl.ds(block_start, block_m),
-                pl.ds(ki * block_k, block_k),
-            ],
-            x_smem.at[slot],
-            x_tma_barrier.at[slot],
-        )
-
-      def do_tma_w(ki, slot):
-        plgpu.copy_gmem_to_smem(  # e,n,k
-            w_gmem.at[
-                group_id,
-                pl.ds(ni * block_n * COMPUTE_WGS, block_n * COMPUTE_WGS),
-                pl.ds(ki * block_k, block_k),
-            ],
-            w_smem.at[slot],
-            w_tma_barrier.at[slot],
-        )
-        plgpu.copy_gmem_to_smem(  # e,k//t,n
-            w_scales_gmem.at[
-                group_id,
-                jax.lax.div((ki * block_k), tile_k),
-                pl.ds(ni * block_n * COMPUTE_WGS, block_n * COMPUTE_WGS),
-            ],
-            w_scales_smem.at[slot],
-            w_tma_barrier.at[slot],
-        )
+      ms = pl.ds(block_start, block_m)
 
       @pl.when(actual_size > 0)
-      def _body():
-        @pl.when(wg == MEMORY_WG)
-        def _():
+      def body():
+        @pl.when(wg == _MEMORY_WG)
+        def memory_wg():
           plgpu.set_max_registers(80, action="decrease")
+          ns = pl.ds(ni * (_COMPUTE_WGS * block_n), _COMPUTE_WGS * block_n)
 
-          def _iter(ki, _):
-            stage = jax.lax.rem(ki, num_stages)
+          @pl.loop(0, k_iters)
+          def k_loop(ki):
+            ks = pl.ds(ki * block_k, block_k)
+            si = jax.lax.rem(ki, num_stages)
 
-            @pl.when(jnp.logical_or(ki >= num_stages, carry > 0))
-            def _():
-              plgpu.barrier_wait(w_consume_barrier.at[stage])
+            @pl.when((ki >= num_stages) | (carry > 0))
+            def wait_w_consumed():
+              plgpu.barrier_wait(w_consumed_barrier.at[si])
 
-            do_tma_w(ki, stage)
+            plgpu.copy_gmem_to_smem(  # e,n,k
+                w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
+            )
+            ki_ = jax.lax.div(ki, w_scales_tile_k // block_k)
+            plgpu.copy_gmem_to_smem(  # e,k//t,n
+                w_scales_gmem.at[gi, ki_, ns],
+                w_scales_smem.at[si],
+                w_barrier.at[si],
+            )
 
-            @pl.when(jnp.logical_or(ki >= num_stages, carry > 0))
-            def _():
-              plgpu.barrier_wait(x_consume_barrier.at[stage])
+            @pl.when((ki >= num_stages) | (carry > 0))
+            def wait_x_consumed():
+              plgpu.barrier_wait(x_consumed_barrier.at[si])
 
-            do_tma_x(ki, stage)
+            plgpu.copy_gmem_to_smem(
+                x_gmem.at[ms, ks], x_smem.at[si], x_barrier.at[si]
+            )
 
-          lax.fori_loop(0, num_k_iters, _iter, None)
-
-        @pl.when(wg < COMPUTE_WGS)
-        def _():
+        @pl.when(wg < _COMPUTE_WGS)
+        def compute_wg():
           plgpu.set_max_registers(176, action="increase")
 
-          def _func(acc_ref):
-            def _iter(ki, acc_ref):
-              stage = jax.lax.rem(ki, num_stages)
+          def compute_acc(acc):
+            with jax.named_scope("wait W"):
+              plgpu.barrier_wait(w_barrier.at[0])
+
+            @pl.loop(0, k_iters)
+            def k_loop(ki):
+              si = jax.lax.rem(ki, num_stages)
               with jax.named_scope("dequant"):
-                idx = (stage, pl.ds(wg * block_n, block_n))
+                idx = (si, pl.ds(wg * block_n, block_n))
                 w = w_smem[idx].astype(w_scales_smem.dtype)
                 w_scales = plgpu.load(w_scales_smem, idx, layout=_WGMMA_ROW)
                 w *= jax.lax.broadcast_in_dim(w_scales, w.shape, [0])
               with jax.named_scope("wait X"):
-                plgpu.barrier_wait(x_tma_barrier.at[stage])
+                plgpu.barrier_wait(x_barrier.at[si])
               with jax.named_scope("mma"):
-                plgpu.wgmma(acc_ref, w, x_smem.at[stage].T)
-              plgpu.barrier_arrive(w_consume_barrier.at[stage])
+                plgpu.wgmma(acc, w, x_smem.at[si].T)
+              plgpu.barrier_arrive(w_consumed_barrier.at[si])
 
-              @pl.when(ki + 1 < num_k_iters)
+              @pl.when(ki + 1 < k_iters)
               def _():
-                next_stage = jax.lax.rem(ki + 1, num_stages)
+                si_next = jax.lax.rem(ki + 1, num_stages)
                 with jax.named_scope("wait W"):
-                  plgpu.barrier_wait(w_tma_barrier.at[next_stage])
+                  plgpu.barrier_wait(w_barrier.at[si_next])
 
               with jax.named_scope("wait MMA"):
                 plgpu.wgmma_wait(0)
-              plgpu.barrier_arrive(x_consume_barrier.at[stage])
-              return acc_ref
+              plgpu.barrier_arrive(x_consumed_barrier.at[si])
 
-            with jax.named_scope("wait W"):
-              plgpu.barrier_wait(w_tma_barrier.at[0])
-            acc_ref = lax.fori_loop(0, num_k_iters, _iter, acc_ref)
-            return acc_ref
+            return acc[...]
 
-          acc = pl.run_scoped(
-              lambda acc_ref: _func(acc_ref)[...], plgpu.ACC((block_n, block_m))
-          )
-          # acc -> o_smem
+          acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
+
           with jax.named_scope("acc -> o_smem"):
 
             @pl.when(carry > 0)
             def _():
               plgpu.barrier_wait(store_gmem_done_barrier)
 
-            wg_o_smem = o_smem.at[wg].reshape(block_m // 8, 1, 8, block_n)
-            wg_o_smem = plgpu.untile_ref(wg_o_smem, (8, block_n))
-            # Apply activation function to the output in dtype of the acc
-            acc = (
-                activation(acc) if activation is not None else acc
-            )
-            acc = plgpu.layout_cast(
-                acc.astype(out_gmem.dtype), plgpu.Layout.WGMMA_TRANSPOSED
-            )
-            wg_o_smem.T[...] = acc
+            o_smem_ = o_smem.at[wg].reshape(block_m // 8, 1, 8, block_n)
+            o_smem_ = plgpu.untile_ref(o_smem_, (8, block_n))
+            acc = acc if activation is None else activation(acc)
+            acc = acc.astype(o_smem_.dtype)
+            o_smem_.T[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
             plgpu.commit_smem()
             plgpu.barrier_arrive(store_smem_done_barrier)
 
-        @pl.when(wg == STORE_WG)
-        def _():
+        @pl.when(wg == _EPILOGUE_WG)
+        def epilogue_wg():
           plgpu.set_max_registers(64, action="decrease")
           plgpu.barrier_wait(store_smem_done_barrier)
 
@@ -282,12 +235,10 @@ def ragged_dot_quantized_ws_async_store_kernel(
 
               @pl.when(actual_size & size != 0)
               def _():
-                for slot in range(COMPUTE_WGS):
-                  o_smem_ = o_smem.at[slot, pl.ds(offset, size)]
-                  o_gmem_ = out_gmem.at[
-                      pl.ds(block_start + offset, size),
-                      pl.ds((ni * COMPUTE_WGS + slot) * block_n, block_n),
-                  ]
+                for wg_ in range(_COMPUTE_WGS):
+                  ns = pl.ds((ni * _COMPUTE_WGS + wg_) * block_n, block_n)
+                  o_smem_ = o_smem.at[wg_, pl.ds(offset, size)]
+                  o_gmem_ = out_gmem.at[pl.ds(block_start + offset, size), ns]
                   plgpu.copy_smem_to_gmem(o_smem_, o_gmem_, commit_group=False)
 
               offset += actual_size & size
@@ -298,14 +249,13 @@ def ragged_dot_quantized_ws_async_store_kernel(
 
       return carry + (actual_size > 0)
 
-    n_iters = pl.cdiv(n, config.block_n * COMPUTE_WGS)
+    n_iters = pl.cdiv(n, _COMPUTE_WGS * block_n)
 
     if config.persistent:
-      # We stratify the grid: first emit a number of blocks that have
-      # definitely work to do. Then schedule blocks that may be
-      # noops. This way we lower the chances that noop bocks are
-      # scheduled to the same SM.
-      m0_iters = pl.cdiv(m, config.block_m)
+      # We stratify the grid: first emit a number of blocks that have definitely
+      # work to do. Then schedule blocks that may be no-ops. This way we lower
+      # the chances that no-op blocks are scheduled to the same SM.
+      m0_iters = pl.cdiv(m, block_m)
       carry = plgpu.nd_loop(
           (m0_iters * n_iters,), collective_axes="sm", init_carry=0
       )(functools.partial(mn_loop, 0, m0_iters, n_iters))
@@ -316,91 +266,57 @@ def ragged_dot_quantized_ws_async_store_kernel(
           functools.partial(mn_loop, m0_iters, m1_iters, n_iters),
       )
     else:
-      m_iters = pl.cdiv(m, config.block_m) + g - 1
+      m_iters = pl.cdiv(m, block_m) + g - 1
       plgpu.nd_loop((m_iters * n_iters,), collective_axes="sm", init_carry=0)(
           functools.partial(mn_loop, 0, m_iters, n_iters)
       )
 
-  def kernel_entry(*refs):
-    swizzle = plgpu.find_swizzle(block_k * jnp.dtype(x.dtype).itemsize * 8)
-    swizzle_elems = swizzle // jnp.dtype(x.dtype).itemsize
-    transforms = (
-        plgpu.TilingTransform((8, swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle),
-    )
+  out_elem_bits = jnp.finfo(out_dtype).bits
+  swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
+  out_swizzle_elems = (swizzle_out * 8) // out_elem_bits
+  if out_swizzle_elems != block_n:
+    raise NotImplementedError(f"{out_swizzle_elems=} must equal {block_n=}")
 
-    w_elem_bits = jnp.iinfo(w.dtype).bits
+  def tiled_smem(*args):
     try:
-      w_swizzle = plgpu.find_swizzle(block_k * w_elem_bits)  # n,k
+      return common.tiled_swizzled_smem(*args)
     except ValueError as e:
-      raise NotImplementedError("No possible swizzle.") from e
-    w_swizzle_elems = (w_swizzle * 8) // w_elem_bits
-    try:
-      quantized_transforms = (
-          plgpu.TilingTransform((8, w_swizzle_elems)),
-          plgpu.SwizzleTransform(w_swizzle),
-      )
-    except ValueError as e:
-      raise NotImplementedError(
-          f"{w_swizzle=} {w_swizzle_elems=} unsupported."
-      ) from e
+      raise NotImplementedError from e
 
-    x_smem = plgpu.SMEM(
-        (num_stages, block_m, block_k),
-        dtype=x.dtype,
-        transforms=transforms,
-    )
-    w_smem = plgpu.SMEM(
-        (num_stages, COMPUTE_WGS * block_n, block_k),
-        dtype=w.dtype,
-        transforms=quantized_transforms,
-    )
-    w_scales_smem = plgpu.SMEM(
-        (num_stages, COMPUTE_WGS * block_n), dtype=w_scales.dtype
-    )
-    o_smem = plgpu.SMEM(
-        (COMPUTE_WGS, block_m, block_n),
-        dtype=out_dtype,
-        transforms=(plgpu.SwizzleTransform(swizzle_out),),
-    )
-    x_tma_barrier = plgpu.Barrier(num_arrivals=1, num_barriers=num_stages)
-    # w and scale
-    w_tma_barrier = plgpu.Barrier(num_arrivals=2, num_barriers=num_stages)
-    w_consume_barrier = plgpu.Barrier(
-        num_arrivals=COMPUTE_WGS, num_barriers=num_stages
-    )
-    x_consume_barrier = plgpu.Barrier(
-        num_arrivals=COMPUTE_WGS, num_barriers=num_stages
-    )
-    store_gmem_done_barrier = plgpu.Barrier(num_barriers=COMPUTE_WGS)
-    store_smem_done_barrier = plgpu.Barrier(num_arrivals=COMPUTE_WGS)
-    pl.run_scoped(
-        lambda *args: kernel(*refs, scoped=args),
-        (
-            x_smem,
-            w_smem,
-            w_scales_smem,
-            o_smem,
-        ),
-        (
-            x_tma_barrier,
-            w_tma_barrier,
-            x_consume_barrier,
-            w_consume_barrier,
-            store_gmem_done_barrier,
-            store_smem_done_barrier,
-        ),
-        collective_axes="wg",
-    )
+  scratch_shapes = dict(
+      x_smem=tiled_smem((num_stages, block_m, block_k), x.dtype, "x"),
+      w_smem=tiled_smem(
+          (num_stages, _COMPUTE_WGS * block_n, block_k), w.dtype, "w"
+      ),
+      w_scales_smem=plgpu.SMEM(
+          (num_stages, _COMPUTE_WGS * block_n), w_scales.dtype
+      ),
+      o_smem=plgpu.SMEM(
+          (_COMPUTE_WGS, block_m, block_n),
+          dtype=out_dtype,
+          transforms=(plgpu.SwizzleTransform(swizzle_out),),
+      ),
+      x_barrier=plgpu.Barrier(num_arrivals=1, num_barriers=num_stages),
+      w_barrier=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),
+      x_consumed_barrier=plgpu.Barrier(
+          num_arrivals=_COMPUTE_WGS, num_barriers=num_stages
+      ),
+      w_consumed_barrier=plgpu.Barrier(
+          num_arrivals=_COMPUTE_WGS, num_barriers=num_stages
+      ),
+      store_gmem_done_barrier=plgpu.Barrier(num_barriers=_COMPUTE_WGS),
+      store_smem_done_barrier=plgpu.Barrier(num_arrivals=_COMPUTE_WGS),
+  )
 
   num_sms = backend.get_default_device().core_count
   profile = False
   if profile:
     num_sms = 1
   f = plgpu.kernel(
-      kernel_entry,
-      out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
-      num_threads=COMPUTE_WGS + 2,
+      kernel,
+      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+      scratch_shapes=scratch_shapes,
+      num_threads=_COMPUTE_WGS + 2,
       thread_name="wg",
       grid=(num_sms,),
       grid_names=("sm",),
