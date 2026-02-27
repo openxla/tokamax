@@ -20,10 +20,8 @@ from typing import Any, ClassVar, TypeAlias
 
 import immutabledict
 import jax
-from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
-import pydantic
 from tokamax._src import batching
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
@@ -52,12 +50,12 @@ def _broadcast_to_rank(x, rank):
   return None if x is None else jax.lax.broadcast_to_rank(x, rank)
 
 
-def _get_kernel_module(device: jax.Device):
-  if not gpu_utils.has_mosaic_gpu_support(device):
+def _get_kernel_module():
+  if not gpu_utils.has_mosaic_gpu_support():
     raise NotImplementedError("Mosaic GPU not supported on this platform.")
-  if (cc := float(device.compute_capability)) < 9.0 or cc >= 11.0:
+  if not (gpu_utils.is_sm90() or gpu_utils.is_sm100()):
     raise NotImplementedError("Only supported for sm90 and sm100 GPUs.")
-  return sm100 if cc >= 10.0 else sm90
+  return sm100 if gpu_utils.is_sm100() else sm90
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,8 +99,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     if not gpu_utils.has_mosaic_gpu_support():
       raise NotImplementedError("Mosaic GPU not supported on this platform.")
 
-    compute_capability = float(backend.get_default_device().compute_capability)
-    if compute_capability < 9.0 or compute_capability >= 11.0:
+    if not (gpu_utils.is_sm90() or gpu_utils.is_sm100()):
       raise NotImplementedError(
           "Mosaic GPU backend only supported for sm90+ GPUs for now."
       )
@@ -217,13 +214,11 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    device = backend.get_default_device()
-    return _get_kernel_module(device).get_heuristics_config(ba)  # pytype: disable=module-attr,attribute-error
+    return _get_kernel_module().get_heuristics_config(ba)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    device = backend.get_default_device()
-    return _get_kernel_module(device).get_autotuning_configs(ba)  # pytype: disable=module-attr,attribute-error
+    return _get_kernel_module().get_autotuning_configs(ba)
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

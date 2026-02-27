@@ -17,17 +17,16 @@ import functools
 import itertools
 from types import UnionType
 from typing import Union, get_origin
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
+from tokamax._src import gpu_utils
 import tokamax._src.gpu_utils as gu
 import pytest
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu as fa
-from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
 from typing_extensions import override
@@ -64,10 +63,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     get_value = lambda x: x.value if isinstance(x, _UNSET) else x
     dict_get_value = lambda **x: {k: get_value(v) for k, v in x.items()}
 
-    if (
-        hasattr(dev := backend.get_default_device(), "compute_capability")
-        and float(dev.compute_capability) >= 10.0
-    ):
+    if gpu_utils.is_sm100():
       supports_bias = False
       supports_f32_inputs = False  # TODO: Investigate Forge OOMs.
 
@@ -173,7 +169,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       if not use_stable_softmax:
         self.skipTest("use_stable_softmax unsupported for this implementation.")
       impl = op_cls(use_base2=use_base2)
-    sm90 = float(backend.get_default_device().compute_capability) < 10.0
+    sm90 = gpu_utils.is_sm90()
     self._run_test(
         (2, 1024, 4, 64), impl=impl, expect_supported=sm90 or use_stable_softmax
     )

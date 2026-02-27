@@ -19,7 +19,6 @@ from functools import partial  # pylint: disable=g-importing-member
 from typing import ClassVar
 
 import jax
-from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src import precision as precision_lib
@@ -247,8 +246,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    device = backend.get_default_device()
-    if float(getattr(device, "compute_capability", "9.0")) >= 10.0:
+    if gpu_utils.is_sm100():
       return self._get_sm100_autotuning_configs(ba)
     return self._get_sm90_autotuning_configs(ba)
 

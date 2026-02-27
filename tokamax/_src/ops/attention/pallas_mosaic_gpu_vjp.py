@@ -86,17 +86,15 @@ class PallasMosaicGpuFlashAttentionVjp(
     if not gpu_utils.has_mosaic_gpu_support():
       raise NotImplementedError("Mosaic GPU not supported on this platform.")
 
-    compute_capability = float(backend.get_default_device().compute_capability)
-
-    if compute_capability < 9.0 or compute_capability > 10.0:
+    if not (gpu_utils.is_sm90() or gpu_utils.is_sm100()):
       raise NotImplementedError(
           "Mosaic GPU backend only supported for sm90 and sm100 GPUs."
       )
 
-    if compute_capability >= 10.0 and not isinstance(config, sm100.Config):
+    if gpu_utils.is_sm100() and not isinstance(config, sm100.Config):
       raise NotImplementedError("SM100 config required for sm100 GPUs.")
 
-    if compute_capability < 10.0 and not isinstance(config, sm90.Config):
+    if gpu_utils.is_sm90() and not isinstance(config, sm90.Config):
       raise NotImplementedError("SM90 config required for sm90 GPUs.")
 
     if paging_info is not None:
@@ -146,8 +144,6 @@ class PallasMosaicGpuFlashAttentionVjp(
     k_end = _broadcast_to_rank(k_end, q.ndim - 1)
 
     if isinstance(config, sm100.Config):
-      if compute_capability < 10.0:
-        raise ValueError("SM100 config provided but compute capability < 10.0")
       # TMA requires 16-byte aligned strides. If the last dimension is
       # 1 (e.g.  broadcasting), the stride of the second-to-last
       # dimension is small (1 element), violating the requirement. We
@@ -190,7 +186,9 @@ class PallasMosaicGpuFlashAttentionVjp(
     if isinstance(config, sm90.Config):
       f = base.vmap_batch_dims(f)
 
-    dq, dk, dv, ds = f(q, k, v, residuals, out, dout, bias, mask, k_start, k_end)
+    dq, dk, dv, ds = f(
+        q, k, v, residuals, out, dout, bias, mask, k_start, k_end
+    )
 
     dbias = None
     if isinstance(config, sm90.Config):
@@ -207,15 +205,15 @@ class PallasMosaicGpuFlashAttentionVjp(
   def _get_heuristics_config(
       self, ba: op.BoundArguments
   ) -> sm90.Config | sm100.Config:
-    compute_capability = float(backend.get_default_device().compute_capability)
-    if compute_capability >= 10.0:
+    if gpu_utils.is_sm100():
       return sm100.get_heuristics_config(ba)
     return sm90.get_heuristics_config(ba)
 
   @override
-  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[sm90.Config | sm100.Config]:
-    compute_capability = float(backend.get_default_device().compute_capability)
-    if compute_capability >= 10.0:
+  def _get_autotuning_configs(
+      self, ba: op.BoundArguments
+  ) -> set[sm90.Config | sm100.Config]:
+    if gpu_utils.is_sm100():
       return sm100.get_autotuning_configs(ba)
     return sm90.get_autotuning_configs(ba)
 
