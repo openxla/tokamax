@@ -32,4 +32,7 @@ from tokamax._src.ops.op import Op as Op
 from tokamax._src.ops.ragged_dot.api import ragged_dot as ragged_dot
 from tokamax._src.ops.ragged_dot.base import GroupSizes as RaggedDotGroupSizes
 from tokamax._src.ops.triangle_multiplication.api import triangle_multiplication as triangle_multiplication
+from tokamax._src.version import TOKAMAX_VERSION as __version__
+from tokamax._src.version import TOKAMAX_VERSION_INFO as __version_info__
+
 # pylint: enable=g-importing-member,useless-import-alias
