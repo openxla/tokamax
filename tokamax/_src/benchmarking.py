@@ -14,6 +14,7 @@
 # ==============================================================================
 """Utilities for benchmarking."""
 
+from collections import defaultdict  # pylint: disable=g-importing-member
 from collections.abc import Callable, Mapping, Sequence
 import contextlib
 import dataclasses
@@ -22,6 +23,7 @@ import inspect
 import logging
 import os
 import pathlib
+import re
 import shutil
 import tempfile
 import time
@@ -114,6 +116,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
   Note: In case of multiple XLA Ops, the one with the most events is used.
   """
 
+  IGNORE_LINE_PATTERNS: set[str] = {
+      r'.*counter.*',  # on TPU the counters span more than the jit execution
+  }
+
   def __init__(
       self,
       hermetic: bool = True,
@@ -143,6 +149,8 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     self._jax_profiler_mode = use_jax_profiler
     if xprof_session is None or profile_data is None:
       self._jax_profiler_mode = True
+    self._profiler_wallclock_start_time: float | None = None
+    self._profiler_wallclock_time: float | None = None
     self._profile_tempdir: pathlib.Path | None = None
     self._xprof_session_kwargs = xprof_session_kwargs
 
@@ -153,21 +161,32 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     if profile is None:
       raise ValueError('XProfProfileSession has not been started.')
 
-    xla_xlines = []
+    xla_xlines = defaultdict(list)
     for xplane in profile.planes:
       if xplane.name.startswith('/device:'):
         for xline in xplane.lines:
-          # OSS select all lines
-          if self._jax_profiler_mode or 'XLA Ops' in xline.name:
-            xla_xlines.append(xline)
+          if self._jax_profiler_mode:
+            # OSS profiling: select all lines, except lines to ignore
+            if all(
+                re.match(p, xline.name) is None
+                for p in self.IGNORE_LINE_PATTERNS
+            ):
+              xla_xlines[xplane.name].append(xline)
+          else:
+            # xprof: select only the XLA Ops line
+            if 'XLA Ops' in xline.name:
+              xla_xlines[xplane.name].append(xline)
 
-    all_events = sum([list(x.events) for x in xla_xlines], [])
+    all_lines = sum(xla_xlines.values(), [])
+    all_events = sum([list(x.events) for x in all_lines], [])
+    xla_lines_repr = {k: [l.name for l in v] for k, v in xla_xlines.items()}
 
     if not xla_xlines or not all_events:  # len(all_events) == 0
       msg = (
           'No XLA device code executed in the context manager. Check that JAX'
           ' functions inside the context are blocked using'
-          ' `jax.block_until_ready`.'
+          ' `jax.block_until_ready`. '
+          f'Collected XLA lines include: {xla_lines_repr}.'
       )
       if jax.default_backend() == 'gpu':
         msg += ' Check also that build flag `--config=cuda` is used.'
@@ -176,6 +195,15 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     t_starts = [e.start_ns for e in all_events]
     t_ends = [e.start_ns + e.duration_ns for e in all_events]
     duration_ns = max(t_ends) - min(t_starts)
+    if (
+        self._profiler_wallclock_time is not None
+        and self._profiler_wallclock_time < duration_ns / 1e9
+    ):
+      raise RuntimeError(
+          f'Profiler wallclock time {self._profiler_wallclock_time:.4e} s is '
+          f'smaller than parsed profile time {duration_ns / 1e9:.4e} s. '
+          f'Collected XLA lines include: {xla_lines_repr}.'
+      )
 
     # timedelta will round to the nearest microsecond, which is the smallest
     # time resolution supported by this object.
@@ -188,10 +216,11 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         self._profile_tempdir = get_tempdir(
             prefix='tokamax_xprof_profile_', dir=root_dir
         )
+        # get profiling wallclock time right before the profiling starts
+        self._profiler_wallclock_start_time = time.perf_counter()
+        self._profiler_wallclock_time = None
         jax.profiler.start_trace(self._profile_tempdir)
-        logger.info(
-            'JAX profiler trace file written to: %s', self._profile_tempdir
-        )
+        logger.info('Writing JAX profiler trace to: %s', self._profile_tempdir)
       except Exception as e:
         raise RuntimeError('Unable to start jax profiling session.') from e
     else:
@@ -199,6 +228,9 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         raise ValueError('Xprof modules are missing, cannot use xprof profile.')
       self._xprof_session = xprof_session.XprofSession()
       try:
+        # get profiling wallclock time right before the profiling starts
+        self._profiler_wallclock_start_time = time.perf_counter()
+        self._profiler_wallclock_time = None
         self._xprof_session.start_session(
             enable_python_tracer=False,
             host_trace_level=2,
@@ -213,6 +245,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
 
     if self._jax_profiler_mode:
       jax.profiler.stop_trace()
+      # get profiling wallclock time right after the profiling ends
+      profiling_time = time.perf_counter() - self._profiler_wallclock_start_time
+      self._profiler_wallclock_start_time = None
+      self._profiler_wallclock_time = profiling_time
       assert self._profile_tempdir is not None, 'Profile tempdir should be set.'
       profile_paths = list(
           pathlib.Path(self._profile_tempdir).glob('**/*.xplane.pb')
@@ -241,6 +277,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       else:
         xspace, url = self._xprof_session.end_session_and_get_xspace_and_url()
         self.xprof_url = url
+      # get profiling wallclock time right after the profiling ends
+      profiling_time = time.perf_counter() - self._profiler_wallclock_start_time
+      self._profiler_wallclock_start_time = None
+      self._profiler_wallclock_time = profiling_time
 
       self._profile = profile_data.ProfileData.from_serialized_xspace(
           xspace.SerializeToString()
