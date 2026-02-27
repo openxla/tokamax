@@ -209,6 +209,7 @@ class AutotuningTest(parameterized.TestCase):
         lower_time_ms=0.0,
         evaluation_times_ms=(0.0,),
         metadata={},
+        peak_memory_mb=0.0,
     )
     config0, config1, config2, config3 = map(_FakeOpConfig, range(4))
     data0 = autotuner.AutotuningData({config0: bmark_data})
@@ -281,6 +282,7 @@ class AutotuningTest(parameterized.TestCase):
         lower_time_ms=0.0,
         evaluation_times_ms=(0.0,),
         metadata={},
+        peak_memory_mb=0.0,
     )
     config0 = _FakeOpConfig(0)
     config1 = _FakeOpConfig(1)

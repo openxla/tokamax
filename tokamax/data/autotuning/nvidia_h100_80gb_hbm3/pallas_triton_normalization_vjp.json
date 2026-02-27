@@ -10,9 +10,8 @@
         0.02848,
         0.02864
       ],
-      "metadata": {
-        "peak_memory_mb": 73.6884994506836
-      }
+      "metadata": {},
+      "peak_memory_mb": 73.6884994506836
     }
   },
   "{\"residuals\":[\"f32[384,384,1]\",\"f32[384,384,1]\"],\"out\":\"bf16[384,384,128]\",\"dout\":\"bf16[384,384,128]\",\"x\":\"bf16[384,384,128]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
@@ -26,9 +25,8 @@
         0.063424,
         0.064672
       ],
-      "metadata": {
-        "peak_memory_mb": 147.3769760131836
-      }
+      "metadata": {},
+      "peak_memory_mb": 147.3769760131836
     }
   },
   "{\"residuals\":[\"f32[768,768,1]\",\"f32[768,768,1]\"],\"out\":\"bf16[768,768,128]\",\"dout\":\"bf16[768,768,128]\",\"x\":\"bf16[768,768,128]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
@@ -42,9 +40,8 @@
         0.272577,
         0.27398500000000003
       ],
-      "metadata": {
-        "peak_memory_mb": 598.5644760131836
-      }
+      "metadata": {},
+      "peak_memory_mb": 598.5644760131836
     }
   },
   "{\"residuals\":[\"f32[1,384,384]\",\"f32[1,384,384]\"],\"out\":\"bf16[128,384,384]\",\"dout\":\"bf16[128,384,384]\",\"x\":\"bf16[128,384,384]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":0,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
@@ -58,9 +55,8 @@
         0.05632,
         0.055296
       ],
-      "metadata": {
-        "peak_memory_mb": 147.3769760131836
-      }
+      "metadata": {},
+      "peak_memory_mb": 147.3769760131836
     }
   },
   "{\"residuals\":[\"f32[1,768,768]\",\"f32[1,768,768]\"],\"out\":\"bf16[128,768,768]\",\"dout\":\"bf16[128,768,768]\",\"x\":\"bf16[128,768,768]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":0,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
@@ -74,9 +70,8 @@
         0.20976099999999998,
         0.209313
       ],
-      "metadata": {
-        "peak_memory_mb": 589.5019760131836
-      }
+      "metadata": {},
+      "peak_memory_mb": 589.5019760131836
     }
   }
 }

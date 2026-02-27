@@ -28,7 +28,6 @@ from tokamax._src import numerics
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops.attention import api
 
-
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
 
@@ -151,7 +150,7 @@ class DotProductAttentionTest(parameterized.TestCase):
           ('custom', 'padding'),
           ('bias', 'causal'),
           ('causal', 'sliding_window'),
-          ('causal', 'custom')
+          ('causal', 'custom'),
       ],
   )
   def testDotProductAttentionMask(self, mask_mode):
@@ -316,6 +315,51 @@ class DotProductAttentionTest(parameterized.TestCase):
     _, dbias_ref, _ = bwd_ref(x, bias, mask)
     _, dbias_ans, _ = bwd_ans(x, bias, mask)
     chex.assert_trees_all_close(dbias_ans, dbias_ref, rtol=0.25, atol=0.25)
+
+  @parameterized.parameters('fwd', 'fwd_bwd')
+  def test_memory_scaling(self, mode):
+    if self.IMPL in (None, 'cudnn'):
+      self.skipTest(
+          'Memory scaling guarantees not made for this implementation'
+      )
+    # TODO: Fwd+bwd pass for xla_chunked is O(N^2).
+    if self.IMPL == 'xla_chunked' and mode == 'fwd_bwd':
+      self.skipTest(
+          'Skip test. Memory scaling for fwd+bwd for xla_chunked is O(N^2).'
+      )
+    # TODO: Fwd+bwd pass for mosaic TPU is O(N^2).
+    if (
+        jax.default_backend() == 'tpu'
+        and self.IMPL == 'mosaic'
+        and mode == 'fwd_bwd'
+    ):
+      self.skipTest(
+          'Skip test. Memory scaling for fwd+bwd for mosaic TPU is O(N^2).'
+      )
+
+    seq_len = 1024
+    scale = 4
+    x = jnp.ones((1, seq_len, 16, 128), dtype=jnp.bfloat16)
+    x_scale = jnp.ones((1, seq_len * scale, 16, 128), dtype=jnp.bfloat16)
+
+    fwd_fn = lambda x: api.dot_product_attention(
+        x, x, x, implementation=self.IMPL
+    )
+    bwd_fn = lambda x: jax.vjp(fwd_fn, x)[1](x)
+    f = jax.jit(fwd_fn) if mode == 'fwd' else jax.jit(bwd_fn)
+
+    mem = f.lower(x).compile().memory_analysis().peak_memory_in_bytes
+    mem_scale = (
+        f.lower(x_scale).compile().memory_analysis().peak_memory_in_bytes
+    )
+    mem_increase = mem_scale / mem
+
+    if self.IMPL == 'xla':
+      self.assertBetween(
+          mem_increase, minv=(scale**2) * 0.5, maxv=(scale**2) * 1.5
+      )
+    else:
+      self.assertBetween(mem_increase, minv=(scale * 0.25), maxv=(scale * 1.5))
 
 
 # pylint: enable=invalid-name

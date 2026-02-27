@@ -27,9 +27,7 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Any, Literal, TypeAlias, TypeVar, Final
-
-logger = logging.getLogger(__name__)
+from typing import Any, Final, Literal, TypeAlias, TypeVar
 
 import jax
 from jax.experimental.mosaic.gpu import profiler
@@ -56,6 +54,7 @@ TimingMethod: TypeAlias = Literal[
     'wallclock', 'cupti', 'xprof', 'hermetic_xprof'
 ]
 
+logger = logging.getLogger(__name__)
 
 WORKLOAD_ARTIFACTS_DIR_VARNAME: Final[str] = 'WORKLOAD_ARTIFACTS_DIR'  # for CI
 
@@ -88,6 +87,8 @@ class BenchmarkData:
   lower_time_ms: float
   evaluation_times_ms: tuple[float, ...]
   metadata: dict[str, Any]
+  # TODO: Remove default value once all users have been migrated.
+  peak_memory_mb: float | None = None
 
   @property
   def median_evaluation_time_ms(self) -> float:
@@ -425,10 +426,6 @@ _DEFAULT_TIMING_METHOD = {'gpu': 'cupti', 'tpu': 'hermetic_xprof'}
 _FALLBACK_TIMING_METHOD = 'wallclock'
 
 
-def _get_metadata(lowered: jax.stages.Lowered) -> dict[str, Any]:
-  return {}  # Overridden internally.
-
-
 def compile_benchmark(
     f: Callable[[T], Any], x: T
 ) -> Callable[..., BenchmarkData]:
@@ -448,6 +445,8 @@ def compile_benchmark(
   start_time = time.perf_counter()
   f_compiled = lowered.compile()
   compile_time = time.perf_counter() - start_time
+
+  peak_mem_mb = f_compiled.memory_analysis().peak_memory_in_bytes / 10**6
 
   def runner(
       x: T, *, iterations: int = 5, method: TimingMethod | None = None
@@ -493,7 +492,8 @@ def compile_benchmark(
         lower_time_ms=lowering_time * 10**3,
         compile_time_ms=compile_time * 10**3,
         evaluation_times_ms=(*times, dt),
-        metadata=_get_metadata(lowered) | metadata,
+        peak_memory_mb=peak_mem_mb,
+        metadata=metadata,
     )
 
   return runner
