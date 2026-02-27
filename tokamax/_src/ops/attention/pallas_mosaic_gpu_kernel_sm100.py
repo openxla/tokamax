@@ -542,7 +542,6 @@ def flash_attention_kernel(
 
       def kv_loop(ki, carry, *, do_causal=False):
         m_i, l_i = carry
-        is_last_step = ki == ub - 1
         si = lax.rem(ki - lb, 2)
         with jax.named_scope("Q@K"):
           plgpu.barrier_wait(qk_mma_barrier)
@@ -576,13 +575,6 @@ def flash_attention_kernel(
           l_i += p.sum(axis=1)
           p16 = p.astype(p_tmem.dtype)
 
-          if normalize_output:
-
-            @pl.when(is_last_step)
-            def write_l_to_smem():
-              li_smem[...] = l_i
-              common.bar_arrive(_L_BARRIER_ID, num_threads=256)
-
           with jax.named_scope("write qk_tmem"):
             plgpu.async_store_tmem(
                 p_tmem.at[:, pl.ds(si * block_kv, block_kv)], p16
@@ -606,6 +598,10 @@ def flash_attention_kernel(
             functools.partial(kv_loop, do_causal=True),
             (m_i, l_i),
         )
+
+      if normalize_output:
+        li_smem[...] = l_i
+        common.bar_arrive(_L_BARRIER_ID, num_threads=256)
 
       if return_residuals:
         if use_base2:
