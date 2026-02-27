@@ -497,8 +497,8 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     lse_tol = dict(atol=1e-3, rtol=3e-3)
     max_logits_tol = dict(atol=1e-3, rtol=4e-3)
     if use_sinks:
-      o_tol = dict(atol=8e-2, rtol=1e-1)
-      lse_tol['rtol'] = 6e-2
+      o_tol = dict(atol=8e-3, rtol=5e-3)
+      lse_tol["rtol"] = 5e-3
     elif (use_base2_exp or use_max_logit_estimate is not None
           or not fuse_reciprocal):
       o_tol = dict(atol=8e-3, rtol=3e-3)
@@ -598,7 +598,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         attn_logits_soft_cap=attn_logits_soft_cap,
     )
     if use_sinks:
-      o_tol = dict(atol=1e-2, rtol=1e-1)
+      o_tol = dict(atol=1e-2, rtol=1e-2)
     elif (use_base2_exp or use_max_logit_estimate is not None
           or not fuse_reciprocal):
       o_tol = dict(atol=8e-3, rtol=1e-2)

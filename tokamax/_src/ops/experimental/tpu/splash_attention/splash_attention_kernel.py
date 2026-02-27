@@ -360,6 +360,9 @@ def flash_attention_kernel(
   if max_logit_value_ref is not None:  # already ensures max_logit_const is None
     max_logit_estimate = max_logit_value_ref[0, h]
 
+  if config.use_base2_exp and max_logit_estimate is not None:
+    max_logit_estimate *= LOG2E
+
   @pl.when(should_initialize)
   def init():
     o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
@@ -367,6 +370,8 @@ def flash_attention_kernel(
     sink = None
     if sinks_ref is not None:
       sink = sinks_ref[0, h].astype(m_scratch_ref.dtype)
+      if config.use_base2_exp:
+        sink *= LOG2E
 
     if sinks_ref is None and max_logit_estimate is None:
       m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
