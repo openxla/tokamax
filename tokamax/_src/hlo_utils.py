@@ -32,6 +32,7 @@ from tokamax._src.ops import op as op_lib
 
 _PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
 _MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
+_CUTE_DSL_KEY: Final[str] = 'CuteDSLRT_NvJaxCutlassCall'
 _MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
 _TRITON_KEY: Final[str] = 'triton_kernel_call'
 
@@ -90,6 +91,11 @@ class MosaicTpuKernelInfo(KernelInfoBase):
 @dataclasses.dataclass(frozen=True, slots=True)
 class MosaicGpuKernelInfo(KernelInfoBase):
   """Mosaic GPU kernel information."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CuteDslKernelInfo(KernelInfoBase):
+  """CuTe DSL kernel information."""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -221,6 +227,7 @@ _KERNEL_GETTER: Final[
     ]
 ] = immutabledict.immutabledict({
     _MOSAIC_GPU_KEY: _kernel_info_getter(MosaicGpuKernelInfo),
+    _CUTE_DSL_KEY: _kernel_info_getter(CuteDslKernelInfo),
     _MOSAIC_TPU_KEY: _kernel_info_getter(MosaicTpuKernelInfo),
     _PALLAS_TRITON_KEY: _get_pallas_kernel_info,
 })
