@@ -130,18 +130,32 @@ def tile_swizzle_transforms(
   return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
 
 
-def _bar_operation(operation: str, barrier_id: jax.Array, num_threads: int):
-  @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
-  def bar_op(_, barrier_id):
-    llvm.inline_asm(
-        ir.Type.parse("!llvm.void"),
-        [barrier_id.registers[()]],
-        f"bar.{operation} $0, {num_threads};",
-        "r",
-        has_side_effects=True,
-    )
+def _bar_operation(operation: str, barrier_id: int | jax.Array, num_threads: int):
+  if isinstance(barrier_id, int):
 
-  bar_op(barrier_id)
+    @plgpu.inline_mgpu()
+    def bar_op(_):
+      llvm.inline_asm(
+          ir.Type.parse("!llvm.void"),
+          [],
+          f"bar.{operation} {barrier_id}, {num_threads};",
+          "",
+          has_side_effects=True,
+      )
+
+    bar_op()
+  else:
+    @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
+    def bar_op(_, barrier_id):
+      llvm.inline_asm(
+          ir.Type.parse("!llvm.void"),
+          [barrier_id.registers[()]],
+          f"bar.{operation} $0, {num_threads};",
+          "r",
+          has_side_effects=True,
+      )
+
+    bar_op(barrier_id)
 
 
 bar_arrive = functools.partial(_bar_operation, "arrive")

@@ -52,6 +52,7 @@ _MMA_WARP = 0
 _TMA_LOAD_QK_WARP = 1
 _TMA_LOAD_V_WARP = 2
 _TMA_LOAD_MASK_WARP = 3
+_L_BARRIER_ID = 7
 _ALPHA_BARRIER_OFFSET = 8
 
 _load_bcast = common.load_bcast
@@ -582,6 +583,7 @@ def flash_attention_kernel(
           @pl.when(is_last_step)
           def write_l_to_smem():
             li_smem[...] = l_i
+            common.bar_arrive(_L_BARRIER_ID, num_threads=256)
 
           @pl.when(ki > lb + 1)
           def wait_for_p_consumed():
@@ -618,25 +620,7 @@ def flash_attention_kernel(
         for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
           gmem_ref.at[hi, qs].set(residual.astype(gmem_ref.dtype))
 
-      l_i = plgpu.load(li_smem, (), layout=_TCGEN05_ROW, optimized=True)
-      l_i += float(jnp.finfo(jnp.float32).tiny)
-
-      with jax.named_scope("wait mma"):
-        slot = lax.rem(ub - 1 - lb, softmax_slots)
-        plgpu.barrier_wait(p_consumed_barrier.at[slot])
-
-      # epilogue for writing GMEM
-      with jax.named_scope("TMEM -> SMEM"):
-        acc = plgpu.async_load_tmem(acc_tmem, layout=_TCGEN05)
-      with jax.named_scope("SMEM -> GMEM"):
-        if normalize_output:
-          acc *= lax.broadcast_in_dim(1.0 / l_i, acc.shape, [0])
-        o_smem[...] = acc.astype(dtype)
-        plgpu.commit_smem()
-        plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-    @pl.when((wg == _SCALE_WG) & (ub > lb))
+    @pl.when(wg == _SCALE_WG)
     def scale_wg():
       plgpu.set_max_registers(160, action="decrease")
 
@@ -672,7 +656,19 @@ def flash_attention_kernel(
             plgpu.commit_tmem()
             plgpu.barrier_arrive(out_scaled_barrier.at[i])
 
-      plgpu.barrier_wait(pv_mma_barrier)
+      with jax.named_scope("epilogue"):
+        common.bar_sync(_L_BARRIER_ID, num_threads=256)
+        l_i = plgpu.load(li_smem, (), layout=_TCGEN05_ROW)
+        plgpu.barrier_wait(pv_mma_barrier)
+
+        acc = plgpu.async_load_tmem(acc_tmem, layout=_TCGEN05)
+        if normalize_output:
+          epsilon = float(jnp.finfo(jnp.float32).tiny)
+          acc *= lax.broadcast_in_dim(1.0 / (l_i + epsilon), acc.shape, [0])
+        o_smem[...] = acc.astype(dtype)
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
   def entry(*refs):
 
