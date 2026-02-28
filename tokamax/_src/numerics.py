@@ -15,8 +15,10 @@
 """Utilities for numerics."""
 
 import abc
+import asyncio
 from concurrent import futures
 import dataclasses
+import functools
 from typing import Any, TypeAlias
 
 import jax
@@ -176,6 +178,103 @@ def _as_vmap_shape(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
   return x
 
 
+_RNG_CHUNK_SIZE = 4 * 1024**2
+
+
+async def _standard_normal(rng, size, dtype) -> np.ndarray:
+  """See `numpy.random.Generator.standard_normal`."""
+  try:
+    dtype_ = jnp.promote_types(dtype, jnp.float32)
+  except jax._src.dtypes.TypePromotionError:  # pylint: disable=protected-access
+    dtype_ = jnp.float32
+  out = np.empty(np.prod(size), dtype)
+  num_chunks = (out.size + _RNG_CHUNK_SIZE - 1) // _RNG_CHUNK_SIZE
+
+  def generate_chunk(rng, start, end):
+    if dtype_ == dtype:
+      rng.standard_normal(size=end - start, dtype=dtype, out=out[start:end])
+    else:
+      chunk = rng.standard_normal(size=end - start, dtype=dtype_)
+      out[start:end] = chunk.astype(dtype)
+
+  loop = asyncio.get_running_loop()
+  if num_chunks == 1:
+    await loop.run_in_executor(None, generate_chunk, rng, 0, out.size)
+  else:
+    futs = []
+    for i, rng in enumerate(rng.spawn(num_chunks)):
+      start = i * _RNG_CHUNK_SIZE
+      end = min(start + _RNG_CHUNK_SIZE, out.size)
+      futs.append(loop.run_in_executor(None, generate_chunk, rng, start, end))
+    await asyncio.gather(*futs)
+  return out.reshape(size)
+
+
+def _is_abstract(x):
+  return isinstance(x, (jax.ShapeDtypeStruct, ArrayInitializer)) or (
+      isinstance(x, qwix.QArray)
+      and (
+          isinstance(x.qvalue, jax.ShapeDtypeStruct)
+          or isinstance(x.scale, jax.ShapeDtypeStruct)
+      )
+  )
+
+
+async def _random_initialize_async(x: PyTree, seed: int = 0) -> PyTree:
+  """Randomly initialize all abstract arrays in a PyTree."""
+
+  async def init_with_layout(rng, x):
+    loop = asyncio.get_running_loop()
+    run_in_executor = functools.partial(loop.run_in_executor, None)
+
+    if isinstance(x, ArrayInitializer):
+      return jax.device_put(await run_in_executor(x, rng))
+    if isinstance(x, qwix.QArray):
+      abstract_qvalue = isinstance(x.qvalue, jax.ShapeDtypeStruct)
+      abstract_scale = isinstance(x.scale, jax.ShapeDtypeStruct)
+
+      if abstract_qvalue and abstract_scale:
+        x = qwix.QArray(_as_vmap_shape(x.qvalue), _as_vmap_shape(x.scale))  # pytype: disable=wrong-arg-types
+        values = await _standard_normal(rng, x.shape, x.dtype)
+        tiled_axes = {i: d for i, d in enumerate(x.scale_tile_shape)}
+        quantize = functools.partial(qwix.quantize, tiled_axes=tiled_axes)
+        return await run_in_executor(quantize, values, x.qvalue.dtype)
+      elif not abstract_qvalue and not abstract_scale:
+        return x
+      else:
+        raise ValueError(
+            '`QArray` values and scales must both be abstract or both concrete.'
+        )
+    assert isinstance(x, jax.ShapeDtypeStruct)
+
+    x = _as_vmap_shape(x)
+    dtype = jnp.dtype(x.dtype)
+
+    if jnp.issubdtype(dtype, jnp.floating):
+      y = await _standard_normal(rng, x.shape, x.dtype)
+    elif dtype.name == 'bool':
+      bernoulli = lambda: rng.binomial(n=1, p=0.5, size=x.shape).astype(dtype)
+      y = await run_in_executor(bernoulli)
+    elif 'int' in dtype.name:
+      y = await run_in_executor(_int_initializer, rng, x.shape, dtype)
+    else:
+      raise NotImplementedError(f'dtype {dtype.name} not supported.')
+
+    sharding = getattr(x, 'sharding', None)
+    # TODO: Can we consolidate `device_put` into a single call?
+    return jax.device_put(y, None if sharding is None else x.format)
+
+  is_leaf = lambda x: isinstance(x, (ArrayInitializer, qwix.QArray))
+  x_flat, tree = jax.tree.flatten(x, is_leaf=is_leaf)
+  abstract_arrays, other, merge = utils.split_merge(_is_abstract, x_flat)
+  rng = np.random.default_rng(seed)
+  tasks = []
+  async with asyncio.TaskGroup() as tg:
+    for rng, x in zip(rng.spawn(len(abstract_arrays)), abstract_arrays):
+      tasks.append(tg.create_task(init_with_layout(rng, x)))
+  return tree.unflatten(merge([t.result() for t in tasks], other))
+
+
 def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
   """Randomly initialize all abstract arrays in a PyTree.
 
@@ -191,67 +290,4 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     A new PyTree with each abstract array replaced by a randomly initialized
     `jax.Array`.
   """
-
-  def init_with_layout(rng, x):
-    if isinstance(x, ArrayInitializer):
-      return jax.device_put(x(rng))
-    if isinstance(x, qwix.QArray):
-      abstract_qvalue = isinstance(x.qvalue, jax.ShapeDtypeStruct)
-      abstract_scale = isinstance(x.scale, jax.ShapeDtypeStruct)
-
-      if abstract_qvalue and abstract_scale:
-        x = qwix.QArray(_as_vmap_shape(x.qvalue), _as_vmap_shape(x.scale))  # pytype: disable=wrong-arg-types
-        try:
-          dtype_ = jnp.promote_types(x.dtype, jnp.float32)
-        except jax._src.dtypes.TypePromotionError:
-          dtype_ = jnp.float32
-        values = rng.standard_normal(size=x.shape, dtype=dtype_).astype(x.dtype)
-        tiled_axes = {i: d for i, d in enumerate(x.scale_tile_shape)}
-        return qwix.quantize(values, x.qvalue.dtype, tiled_axes=tiled_axes)
-      elif not abstract_qvalue and not abstract_scale:
-        return x
-      else:
-        raise ValueError(
-            '`QArray` values and scales must both be abstract or both concrete.'
-        )
-    assert isinstance(x, jax.ShapeDtypeStruct)
-
-    x = _as_vmap_shape(x)
-    dtype = jnp.dtype(x.dtype)
-
-    if jnp.issubdtype(dtype, jnp.floating):
-      try:
-        dtype_ = jnp.promote_types(dtype, jnp.float32)
-      except jax._src.dtypes.TypePromotionError:
-        dtype_ = jnp.float32
-      y = rng.standard_normal(size=x.shape, dtype=dtype_).astype(dtype)
-    elif dtype.name == 'bool':
-      y = rng.binomial(n=1, p=0.5, size=x.shape).astype(dtype)
-    elif 'int' in dtype.name:
-      y = _int_initializer(rng, x.shape, dtype)
-    else:
-      raise NotImplementedError(f'dtype {dtype.name} not supported.')
-
-    sharding = getattr(x, 'sharding', None)
-    # TODO: Can we consolidate `device_put` into a single call?
-    return jax.device_put(y, None if sharding is None else x.format)
-
-  is_leaf = lambda x: isinstance(x, (ArrayInitializer, qwix.QArray))
-  x_flat, tree = jax.tree.flatten(x, is_leaf=is_leaf)
-
-  def is_abstract(x):
-    return isinstance(x, (jax.ShapeDtypeStruct, ArrayInitializer)) or (
-        isinstance(x, qwix.QArray)
-        and (
-            isinstance(x.qvalue, jax.ShapeDtypeStruct)
-            or isinstance(x.scale, jax.ShapeDtypeStruct)
-        )
-    )
-
-  abstract_arrays, other, merge = utils.split_merge(is_abstract, x_flat)
-  rngs = np.random.default_rng(seed).spawn(len(abstract_arrays))
-
-  with futures.ThreadPoolExecutor() as executor:
-    arrays = list(executor.map(init_with_layout, rngs, abstract_arrays))
-
-  return tree.unflatten(merge(arrays, other))
+  return asyncio.run(_random_initialize_async(x, seed))
