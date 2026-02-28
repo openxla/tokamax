@@ -81,7 +81,6 @@ class TritonKernelInfo(KernelInfoBase):
   metadata: bytes
 
 
-# TODO: Add fields for Mosaic TPU kernel information.
 @dataclasses.dataclass(frozen=True, slots=True)
 class MosaicTpuKernelInfo(KernelInfoBase):
   """Mosaic TPU kernel information."""
