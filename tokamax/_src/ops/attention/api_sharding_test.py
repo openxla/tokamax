@@ -30,8 +30,11 @@ PartitionSpec = jax.sharding.PartitionSpec
 
 class ApiShardingTest(parameterized.TestCase):
 
-  @parameterized.parameters(*api.IMPLEMENTATIONS)
-  def test_dot_product_attention_sharding(self, implementation):
+  @parameterized.product(
+      implementation=list(api.IMPLEMENTATIONS),
+      shard_axis=[0, 2],
+  )
+  def test_dot_product_attention_sharding(self, implementation, shard_axis):
     if (
         implementation == 'mosaic_gpu'
         and not gpu_utils.has_mosaic_gpu_support()
@@ -49,10 +52,12 @@ class ApiShardingTest(parameterized.TestCase):
 
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names='x')
-    sharding = NamedSharding(mesh, PartitionSpec('x'))
+    spec = [None, None, None, None]
+    spec[shard_axis] = 'x'
+    sharding = NamedSharding(mesh, PartitionSpec(*spec))
 
     dtype = jnp.bfloat16
-    b, s, t, n, h = jax.device_count(), 128, 128, 4, 64
+    b, s, t, n, h = jax.device_count(), 512, 512, jax.device_count() * 2, 64
     keys = jax.random.split(jax.random.PRNGKey(0), 3)
     q = jax.random.normal(keys[0], (b, t, n, h), dtype)
     k = jax.random.normal(keys[1], (b, s, n, h), dtype)
