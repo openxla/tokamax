@@ -306,60 +306,108 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     return configs
 
   def _get_sm100_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    del ba  # Unused.
-    configs = set()
-    # Configs for prefill
-    for block_k in [128, 256]:
-      for num_stages in [2, 4]:
-        for grid_minor_dim in [
-            common.MatmulDimension.M,
-            common.MatmulDimension.N,
-        ]:
-          for grid_tile_width in [1, 2, 4, 8]:
-            for split_m in [1, 2]:
-              configs.add(
-                  Config(
-                      block_m=128,
-                      block_n=128,
-                      block_k=block_k,
-                      num_stages=num_stages,
-                      split_k=1,
-                      grid_block_n=1,
-                      warp_specialized=True,
-                      persistent=False,
-                      collective=True,
-                      grid_minor_dim=grid_minor_dim,
-                      grid_tile_width=grid_tile_width,
-                      split_m=split_m,
-                  )
-              )
+    lhs, rhs = ba.args[:2]
+    lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
+    if isinstance(rhs, QArray):
+      rhs_dtype_bits = jnp.iinfo(rhs.qvalue.dtype).bits
+      scale_tile_shape = rhs.scale_tile_shape[1]
+    else:
+      rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
+      scale_tile_shape = 0
 
-    # Config for generate
-    for block_m in [8, 16, 32, 64]:
-      for num_stages in [2, 4]:
-        for grid_minor_dim in [
-            common.MatmulDimension.M,
-            common.MatmulDimension.N,
-        ]:
-          for grid_tile_width in [1, 2, 4, 8]:
-            for split_m in [1, 2]:
-              for collective in [True, False]:
-                for post_scale in [True, False]:
-                  configs.add(
-                      Config(
-                          block_m=block_m,
-                          block_n=128,
-                          block_k=256,
-                          num_stages=num_stages,
-                          split_k=1,
-                          warp_specialized=True,
-                          collective=collective,
-                          split_m=split_m,
-                          grid_tile_width=grid_tile_width,
-                          grid_minor_dim=grid_minor_dim,
-                          post_scale=post_scale,
+    block_k_choices = []
+    for block_k in [128, 256, 512]:
+      if (block_k * rhs_dtype_bits) % (128 * 8) or (
+          block_k * lhs_dtype_bits
+      ) % (128 * 8):
+        continue
+      if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
+        continue
+      block_k_choices.append(block_k)
+    grid_minor_dim_choices = [
+        common.MatmulDimension.M,
+        common.MatmulDimension.N,
+    ]
+    grid_tile_width_choices = [1, 2, 4, 8]
+
+    configs = set()
+
+    def _generate_configs(
+        configs,
+        block_m_choices: list[int],
+        block_k_choices: list[int],
+        num_stages_choices: list[int],
+        grid_minor_dim_choices: list[common.MatmulDimension],
+        grid_tile_width_choices: list[int],
+        split_m_choices: list[int],
+        collective_choices: list[bool],
+        post_scale_choices: list[bool],
+    ):
+      for block_m in block_m_choices:
+        for block_k in block_k_choices:
+          for num_stages in num_stages_choices:
+            for grid_minor_dim in grid_minor_dim_choices:
+              for grid_tile_width in grid_tile_width_choices:
+                for split_m in split_m_choices:
+                  for collective in collective_choices:
+                    for post_scale in post_scale_choices:
+                      configs.add(
+                          Config(
+                              block_m=block_m,
+                              block_n=128,
+                              block_k=block_k,
+                              num_stages=num_stages,
+                              split_k=1,
+                              grid_block_n=grid_tile_width,
+                              warp_specialized=True,
+                              persistent=False,
+                              collective=collective,
+                              post_scale=post_scale,
+                              grid_minor_dim=grid_minor_dim,
+                              grid_tile_width=grid_tile_width,
+                              split_m=split_m,
+                          )
                       )
-                  )
+      return configs
+
+    if isinstance(lhs, QArray):
+      if lhs.qtype in [jnp.int8, jnp.float8_e4m3fn]:
+        configs = _generate_configs(
+            configs,
+            block_m_choices=[8, 16, 32],
+            block_k_choices=[128, 256, 512],
+            num_stages_choices=[2, 4],
+            grid_minor_dim_choices=grid_minor_dim_choices,
+            grid_tile_width_choices=grid_tile_width_choices,
+            split_m_choices=[1],
+            collective_choices=[False],
+            post_scale_choices=[False],
+        )
+    else:
+      # Configs for prefill
+      configs = _generate_configs(
+          configs,
+          block_m_choices=[128],
+          block_k_choices=block_k_choices,
+          num_stages_choices=[2, 4],
+          grid_minor_dim_choices=grid_minor_dim_choices,
+          grid_tile_width_choices=grid_tile_width_choices,
+          split_m_choices=[1],
+          collective_choices=[True, False],
+          post_scale_choices=[False],
+      )
+      # Config for generate
+      configs = _generate_configs(
+          configs,
+          block_m_choices=[8, 16, 32, 64],
+          block_k_choices=block_k_choices,
+          num_stages_choices=[2, 4],
+          grid_minor_dim_choices=grid_minor_dim_choices,
+          grid_tile_width_choices=grid_tile_width_choices,
+          split_m_choices=[1],
+          collective_choices=[True, False],
+          post_scale_choices=[True, False],
+      )
     return configs
 
   @override
