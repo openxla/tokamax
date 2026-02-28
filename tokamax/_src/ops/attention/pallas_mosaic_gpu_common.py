@@ -19,10 +19,13 @@ from typing import Any
 
 import jax
 from jax.experimental import pallas as pl
+import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import llvm
+from jaxlib.mlir.dialects import vector
+import numpy as np
 import pydantic
 
 
@@ -160,3 +163,53 @@ def _bar_operation(operation: str, barrier_id: int | jax.Array, num_threads: int
 
 bar_arrive = functools.partial(_bar_operation, "arrive")
 bar_sync = functools.partial(_bar_operation, "sync")
+
+
+def unpack_bool_bits_tmem_native(a):
+  """Unpacks boolean bits from an int packed array in TMEM_NATIVE layout."""
+  packed_bits = num_bits(a.dtype)
+  if packed_bits not in {4, 8, 16}:
+    raise ValueError("Only 4, 8, 16 boolean packing is supported")
+  target_cols = a.shape[1] * packed_bits
+  @plgpu.inline_mgpu(
+      arg_types=(plgpu.Layout.TCGEN05_TMEM_NATIVE(32 // packed_bits),),
+      return_type=plgpu.ShapeDtypeStruct(
+          (128, target_cols),
+          jnp.bool,
+          plgpu.Layout.TCGEN05_TMEM_NATIVE,
+      ),
+  )
+  def unpack_booleans(_, fa: mgpu.FragmentedArray):
+    out_registers = np.empty(
+        mgpu.TMEM_NATIVE_LAYOUT.registers_shape((128, target_cols)),
+        dtype=object,
+    )
+    i1_type = ir.IntegerType.get_signless(1)
+    out_ty = ir.VectorType.get((2,), i1_type)
+    vec32_i1_type = ir.VectorType.get((32,), i1_type)
+    regs_per_32_bit = 16
+
+    for idx, reg_a in np.ndenumerate(fa.registers):
+      bools_32 = vector.bitcast(vec32_i1_type, reg_a)
+      col_idx = idx[1]
+      for i in range(regs_per_32_bit):
+        # TMEM_NATIVE boolean layout expects vec_len=2.
+        # we take our boolean vector and slice it into 16 consecutive pairs.
+        slice_vec = vector.extract_strided_slice(
+            out_ty,
+            bools_32,
+            offsets=[i * 2],
+            sizes=[2],
+            strides=[1]
+        )
+        out_idx = list(idx)
+        out_idx[1] = col_idx * 16 + i
+        out_registers[tuple(out_idx)] = slice_vec
+
+    return mgpu.FragmentedArray(
+        _registers=out_registers,
+        _layout=mgpu.TMEM_NATIVE_LAYOUT,
+        _is_signed=False,
+    )
+
+  return unpack_booleans(a)
