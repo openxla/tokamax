@@ -30,6 +30,7 @@ dependencies = [
     "typeguard==2.13.3",
     "immutabledict",
     "tensorboardx",
+    "cuequivariance>=0.8.1",
 ]
 
 dynamic = ["version"]
@@ -61,15 +62,16 @@ bench = [
     "libtpu>=0.0.35",
     "google-benchmark>=1.9.0",
     "xprof",
+    "cuequivariance-jax>=0.8.1",
+    "jax-triton>=0.3.1",
 ]
 
 cuda = [
-    "jax[cuda12]>=0.8.0",
-    "nvidia-cudnn-cu12>=9.0.0",
+    "jax[cuda13]>=0.9.2",
 ]
 
 tpu = [
-    "jax[tpu]>=0.8.0",
+    "jax[tpu]>=0.9.2",
     "hypothesis",
 ]
 
