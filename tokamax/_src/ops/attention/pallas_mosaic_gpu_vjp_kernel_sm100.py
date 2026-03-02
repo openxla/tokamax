@@ -95,17 +95,16 @@ def _kernel(body, out_shape, **kernel_kwargs):
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_kv: pydantic.conint(multiple_of=128, ge=128)
-  block_q: pydantic.conint(multiple_of=128, ge=128)
-  num_stages: pydantic.conint(gt=1) = 2
+  block_kv: pydantic.conint(multiple_of=64, ge=64)
+  block_q: pydantic.conint(multiple_of=64, ge=64)
+  num_stages: pydantic.PositiveInt = 2
   num_stages_dq: pydantic.PositiveInt = 1
 
   def __post_init__(self):
-    # SM100 VJP implementation currently relies on block_q and block_kv
-    # being at least 128 for indexing logic.
-    if self.block_q < 128 or self.block_kv < 128:
+    # TODO: Enable support for non-128 block sizes.
+    if (self.block_q, self.block_kv) != (128, 128):
       raise ValueError(
-          "For SM100 attention VJP, block_q and block_kv must be at least 128."
+          "For SM100 attention VJP, block_q and block_kv must be 128."
           f" Got block_q={self.block_q}, block_kv={self.block_kv}."
       )
 
@@ -116,8 +115,22 @@ def get_heuristics_config(ba) -> Config:
 
 
 def get_autotuning_configs(ba) -> set[Config]:
+  """Returns a set of configs for tuning flash attention VJP on SM100 GPUs."""
   del ba
-  return {Config(block_q=128, block_kv=128)}
+  configs = set()
+  for num_stages in [1, 2, 3]:
+    for num_stages_dq in [1, 2, 3, 4]:
+      if 2 * num_stages + num_stages_dq >= 8:
+        continue  # Exceeds memory limits.
+      configs.add(
+          Config(
+              block_q=128,
+              block_kv=128,
+              num_stages=num_stages,
+              num_stages_dq=num_stages_dq,
+          )
+      )
+  return configs
 
 
 def _ds(start, size):
@@ -210,6 +223,7 @@ def flash_attention_vjp_kernel(
     Float[Array, "*B t h d"],  # dv
     Float[Array, "*#B #H #T #t"] | None,  # ds
 ]:
+  """SM100 Pallas Mosaic GPU Flash Attention VJP."""
   # The key steps, computed block-wise over KV, are:
   #
   # Notations:
@@ -233,16 +247,6 @@ def flash_attention_vjp_kernel(
   # 7. Compute dK:
   #    dK' = dS.T @ Q
   #    dK  = dK' * scale
-
-  if config.block_q < 128:
-    raise NotImplementedError(
-        f"block_q {config.block_q=} must be larger than 128."
-    )
-
-  if config.block_kv < 128:
-    raise NotImplementedError(
-        f"block_kv {config.block_kv=} must be larger than 128."
-    )
 
   as_ndim = lambda x, ndim: jax.lax.collapse(
       jax.lax.broadcast_to_rank(x, ndim), 0, -ndim + 1
@@ -394,7 +398,7 @@ def flash_attention_vjp_kernel(
 
     @pl.when(wg_id == _LOAD_MMA_WG)
     def load_mma_wg():
-      # TODO: constrain the registers used with plgpu.set_max_registers.
+      # TODO: constrain the registers with plgpu.set_max_registers.
       for _ in range(_NUM_COMPUTE_WGS):
         plgpu.barrier_arrive(s_consumed_barrier)
 
@@ -566,7 +570,7 @@ def flash_attention_vjp_kernel(
             plgpu.barrier_wait(p_produced_barrier)
             plgpu.tcgen05_mma(
                 dv_tmem,
-                p_ds_smem.T,  # P is (block_q, block_kv) -> P.T is (block_kv, block_q)
+                p_ds_smem.T,  # P.T is (block_kv, block_q)
                 do_smem.at[stage],
                 accumulate=i > 0,  # P.T @ dO
             )
@@ -597,7 +601,7 @@ def flash_attention_vjp_kernel(
 
     @pl.when(wg_id >= _COMPUTE_WG_1)
     def compute_wg():
-      # TODO: constrain the registers used with plgpu.set_max_registers
+      # TODO: constrain the registers with plgpu.set_max_registers.
       kv_off = (block_kv // 2) * (wg_id - _COMPUTE_WG_1)
 
       def _compute_p(
@@ -806,7 +810,7 @@ def flash_attention_vjp_kernel(
 
     @pl.when(wg_id == _REDUCE_WG)
     def reduce_wg():
-      # TODO: constrain the registers used with plgpu.set_max_registers
+      # TODO: constrain the registers with plgpu.set_max_registers.
       b_idx = lax.axis_index("batch")
       h_idx = lax.axis_index("heads")
 
