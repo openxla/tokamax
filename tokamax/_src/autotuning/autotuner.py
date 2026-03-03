@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Tokamax autotuner."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -36,7 +37,9 @@ _P = ParamSpec("_P")
 BenchmarkData = benchmarking.BenchmarkData
 
 
-class AutotuningData(immutabledict.immutabledict[_Config, BenchmarkData]):
+class AutotuningData(
+    immutabledict.immutabledict[_Config, BenchmarkData | Exception]
+):
   """Results from autotuning."""
 
   # This is needed because pytype doesn't know that `__new__` returns a
@@ -46,14 +49,26 @@ class AutotuningData(immutabledict.immutabledict[_Config, BenchmarkData]):
 
   @property
   def fastest_config(self) -> _Config:
-    key_fn = lambda x: x[1].median_evaluation_time_ms
-    return min(self.items(), key=key_fn)[0]
+    valid_benchmarks = tuple(
+        it for it in self.items() if isinstance(it[1], BenchmarkData)
+    )
+    try:
+      key_fn = lambda x: x[1].median_evaluation_time_ms
+      return min(valid_benchmarks, key=key_fn)[0]
+    except ValueError as e:
+      if self:
+        raise ExceptionGroup("All configs failed", tuple(self.values())) from e
+      raise ValueError("Autotuning data is empty") from e
 
   def prune(self) -> Self:
     if not self:
       return self
-    config = self.fastest_config
-    return AutotuningData({config: self[config]})
+    try:
+      config = self.fastest_config
+      return_data = AutotuningData({config: self[config]})
+    except ExceptionGroup as e:
+      raise e
+    return return_data
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
@@ -117,6 +132,7 @@ class Autotuner:
     timeout = self.timeout_seconds
     vlog_exc_info = functools.partial(logging.vlog, 2, exc_info=True)
 
+    results = {}
     if self.compile_executor_fn is not None:
       if isinstance(executor, process.ProcessPoolExecutor):
         raise ValueError(
@@ -139,13 +155,16 @@ class Autotuner:
               if initialized_args is None:
                 initialized_args = numerics.random_initialize(args)
               executor_args[config] = (compiled_fn, initialized_args)
-            except Exception:  # pylint: disable=broad-exception-caught
+            except Exception as e:
               vlog_exc_info("Config failed to compile: %s", config)
-        except TimeoutError:
+              results[config] = e
+        except TimeoutError as e:
           slow_configs = [c for c in configs if c not in executor_args]
           vlog_exc_info(
               "Configs timed out during compilation: %s", slow_configs
           )
+          for config in slow_configs:
+            results[config] = e
     else:
       for config in configs:
         executor_args[config] = (_benchmark, fn_factory, config, args, kwargs)
@@ -154,18 +173,19 @@ class Autotuner:
       future_to_config = {
           executor.submit(*args): cfg for cfg, args in executor_args.items()
       }
-      results = {}
+
       try:
         for future in futures.as_completed(future_to_config, timeout=timeout):
           config = future_to_config[future]
           try:
             data = future.result()
-          except process.BrokenProcessPool:
+          except process.BrokenProcessPool as e:
             vlog_exc_info("Config broken: %s", config)
-          except Exception:  # pylint: disable=broad-exception-caught
+            results[config] = e
+          except Exception as e:  # pylint: disable=broad-exception-caught
             vlog_exc_info("Config failed: %s", config)
+            results[config] = e
           else:
-            results[config] = data
             logging.vlog(
                 1,
                 "%s: lowering time (ms): %f, compile time (ms): %f, "
@@ -176,12 +196,13 @@ class Autotuner:
                 data.evaluation_times_ms,
                 data.median_evaluation_time_ms,
             )
+            results[config] = data
       except TimeoutError:
         slow_configs = [c for c in configs if c not in results]
         logging.exception("Configs timed out: %s", slow_configs)
 
     results = AutotuningData(results)
-    if results:
+    try:
       config = results.fastest_config
       logging.vlog(
           1,
@@ -189,6 +210,7 @@ class Autotuner:
           config,
           results[config].median_evaluation_time_ms,
       )
-    else:
-      logging.error("all configs failed for %s", fn_factory)
+    except ExceptionGroup:
+      logging.exception("all configs failed for %s", fn_factory)
+
     return results

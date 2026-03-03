@@ -36,6 +36,7 @@ from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu as pl_ragged_dot_mosaic_tpu
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+from typing_extensions import override
 
 
 @dataclasses.dataclass(frozen=True)
@@ -74,10 +75,12 @@ def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
   if vmap:
     ax = (0, None, None, None)
     f = jax.vmap(f, in_axes=ax)
+
     def as_batched(x, a):
       shape = list(x.shape)
       vmap_axis = None if a is None else (a, shape.pop(a))
       return batching.BatchedShapeDtype(shape, x.dtype, (vmap_axis,))
+
     x, scale, offset, weights = map(as_batched, args, ax)
   expected_bound_args = (
       norm.bind(x, scale, offset, epsilon=eps),  # pytype: disable=wrong-arg-types
@@ -335,7 +338,32 @@ class AutotuningTest(parameterized.TestCase):
     self.assertNotEmpty(result.data)
     for _, data in result.data:
       for _, benchmark in data.items():
-        self.assertGreater(benchmark.median_evaluation_time_ms, 0.0)
+        if isinstance(benchmark, benchmarking.BenchmarkData):
+          self.assertGreater(benchmark.median_evaluation_time_ms, 0.0)
+        else:
+          self.assertIsInstance(benchmark, Exception)
+
+  def test_autotuning_error_message(self):
+    """Try to autotune a base op and make sure an error message is raised."""
+
+    class _FakeErrorOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
+
+      def _fwd(self, x, *, config, return_residuals):
+        raise ValueError("Fake error")
+
+      @override
+      def _get_autotuning_configs(
+          self, ba: op_lib.BoundArguments
+      ) -> set[_FakeOpConfig]:
+        del ba  # Unused.
+        return set([_FakeOpConfig(42), _FakeOpConfig(43)])
+
+    op = _FakeErrorOp()
+    ba = op.bind(jnp.zeros((1, 2)))
+    result = ba.autotune()
+    self.assertNotEmpty(result.items())
+    benchmark_data = list(result.values())[0]
+    self.assertIsInstance(benchmark_data, Exception)
 
 
 if __name__ == "__main__":
