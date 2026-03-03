@@ -112,9 +112,10 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
               @pl.loop(0, k_iters)
               def tma_loop(ki):
                 ks = pl.ds(ki * block_k, block_k)
-                si = lax.rem(ki, num_stages)
+                step = carry * k_iters + ki
+                si = lax.rem(step, num_stages)
 
-                @pl.when((ki >= num_stages) | (carry > 0))
+                @pl.when(step >= num_stages)
                 def _():
                   plgpu.barrier_wait(xw_consumed_barrier.at[si])
 
@@ -145,7 +146,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
               @pl.loop(0, k_iters)
               def mma_loop_body(ki):
-                si_tma = lax.rem(ki, num_stages)
+                si_tma = lax.rem(carry * k_iters + ki, num_stages)
                 with jax.named_scope("wait for xw"):
                   plgpu.barrier_wait(xw_barrier.at[si_tma])
                 with jax.named_scope("issuing mma"):
