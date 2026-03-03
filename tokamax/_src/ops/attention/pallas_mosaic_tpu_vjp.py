@@ -143,7 +143,10 @@ class PallasMosaicTpuFlashAttentionVjp(
       k_splash, v_splash = k_swap, v_swap
 
     # Always in natural base.
-    lse = residuals[1]
+    _, lse = residuals
+
+    dstats = dict(logsumexp=None, max_logits=None)
+
     # BWD kernel expects in corresponding base.
     if config.use_base2_exp:
       lse = lse * splash.LOG2E
@@ -170,11 +173,15 @@ class PallasMosaicTpuFlashAttentionVjp(
         lse,
         splash_fn.dkv_mask_info,
     )
-    res_in_axes = (0, 0, 0, None, None, 0, (0 if lse.ndim == 3 else None), None)
+    lse_in_axis = 0 if lse.ndim == 3 else None
+    res_in_axes = (0, 0, 0, None, None, 0, lse_in_axis, None)
+    cotangents = (dout_swap, dstats)
+    dstats_in_axes = jax.tree.map(lambda x: lse_in_axis, dstats)
+    cotangents_in_axes = (0, dstats_in_axes)
     # vmap over batch dimension
-    _, _, dq, dk, dv, _, _, _ = jax.vmap(bwd_fn, in_axes=(res_in_axes, 0))(
-        res, dout_swap
-    )
+    _, _, dq, dk, dv, _, _, _ = jax.vmap(
+        bwd_fn, in_axes=(res_in_axes, cotangents_in_axes)
+    )(res, cotangents)
 
     dq = jnp.swapaxes(dq, 1, 2) * logits_scale
     if is_mqa:

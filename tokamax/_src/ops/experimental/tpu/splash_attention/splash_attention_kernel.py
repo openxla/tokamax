@@ -1825,7 +1825,7 @@ def _splash_attention_bwd(
     fwd_mask_sparsity: float,
     dkv_mask_sparsity: float,
     res: base.SplashResidualsType,
-    do: jax.Array,
+    grads: jax.Array | tuple[jax.Array, dict[str, jax.Array]],
 ) -> tuple[
     MaskInfo | None,  # fwd_mask_info
     MaskInfo | None,  # dvk_mask_info
@@ -1836,6 +1836,13 @@ def _splash_attention_bwd(
     jax.Array | None,  # segment_ids
     jax.Array | None,  # max_logit_estimate
 ]:
+  # If `save_residuals` is True, `_splash_attention_fwd` returns `(out, stats)`,
+  # so we unpack the gradients, otherwise it returns `out` and `grads` is just
+  # `do`.
+  if save_residuals:
+    do, _ = grads
+  else:
+    do = grads
   del save_residuals, fwd_mask_sparsity
   if not config.has_backward_blocks:
     raise ValueError("Need to specify backward blocks.")

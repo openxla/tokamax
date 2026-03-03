@@ -520,6 +520,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_max_logit_estimate=(None,),
       use_sinks=(False, True),
       dq_reduction_steps=(None, 3),
+      save_residuals=(False, True),
   )
   @hp.given(hps.data())
   def test_splash_attention_bwd(
@@ -530,6 +531,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_max_logit_estimate,
       dq_reduction_steps,
       use_sinks,
+      save_residuals,
       data,
   ):
     downcast_smem_data = data.draw(hp.strategies.booleans())
@@ -580,11 +582,32 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       )
 
     attn = make_mask_fn(
-        mask, config=config, downcast_smem_data=downcast_smem_data
+        mask,
+        config=config,
+        downcast_smem_data=downcast_smem_data,
+        save_residuals=save_residuals,
     )
 
-    o, attn_vjp = jax.vjp(partial(attn, max_logit_value=max_logit_value),
-                          q, k, v, segment_ids, sinks)
+    if save_residuals:
+      (o, stats), attn_vjp = jax.vjp(
+          partial(attn, max_logit_value=max_logit_value),
+          q,
+          k,
+          v,
+          segment_ids,
+          sinks,
+      )
+      cotangents = (do, jax.tree.map(jnp.zeros_like, stats))
+    else:
+      o, attn_vjp = jax.vjp(
+          partial(attn, max_logit_value=max_logit_value),
+          q,
+          k,
+          v,
+          segment_ids,
+          sinks,
+      )
+      cotangents = do
     q32, k32, v32 = jax.tree.map(lambda x: x.astype(jnp.float32), (q, k, v))
     o_ref, stats_ref = base.attention_reference(
         q32,
@@ -606,7 +629,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       o_tol = dict(atol=4e-3, rtol=3e-3)
     self._assert_allclose(o, o_ref, **o_tol)
 
-    dq, dk, dv, _, dsinks = attn_vjp(do)
+    dq, dk, dv, _, dsinks = attn_vjp(cotangents)
     dq_ref, dk_ref, dv_ref, dsinks_ref = base.attention_reference_vjp(
         do.astype(jnp.float32),
         q32,
