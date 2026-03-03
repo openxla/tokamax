@@ -13,21 +13,21 @@ benchmarks {
   }
 
   environment_configs {
-    id: "GPU_H100"
+    id: "gpu-h100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
   environment_configs {
-    id: "GPU_B200"
+    id: "gpu-b200"
     runner_label: "linux-x86-a4-224-b200-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
   environment_configs {
-    id: "TPUv6e"
+    id: "tpu-v6e"
     runner_label: "linux-x86-ct6e-44-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
@@ -35,7 +35,7 @@ benchmarks {
   }
 
   environment_configs {
-    id: "TPUv7"
+    id: "tpu-v7"
     runner_label: "linux-x86-tpu7x-56-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
@@ -247,28 +247,28 @@ benchmarks {
   }
 
   environment_configs {
-    id: "GPU_H100"
+    id: "gpu-h100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
   environment_configs {
-    id: "GPU_B200"
+    id: "gpu-b200"
     runner_label: "linux-x86-a4-224-b200-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
   environment_configs {
-    id: "TPUv6e"
+    id: "tpu-v6e"
     runner_label: "linux-x86-ct6e-44-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
   }
 
   environment_configs {
-    id: "TPUv7"
+    id: "tpu-v7"
     runner_label: "linux-x86-tpu7x-56-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
@@ -319,7 +319,7 @@ benchmarks {
   }
 
   environment_configs {
-    id: "GPU_H100"
+    id: "gpu-h100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
@@ -328,7 +328,7 @@ benchmarks {
   }
 
   environment_configs {
-    id: "GPU_B200"
+    id: "gpu-b200"
     runner_label: "linux-x86-a4-224-b200-1gpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
@@ -338,7 +338,7 @@ benchmarks {
   }
 
   environment_configs {
-    id: "TPUv6e"
+    id: "tpu-v6e"
     runner_label: "linux-x86-ct6e-44-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
@@ -346,7 +346,7 @@ benchmarks {
   }
 
   environment_configs {
-    id: "TPUv7"
+    id: "tpu-v7"
     runner_label: "linux-x86-tpu7x-56-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
