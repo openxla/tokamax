@@ -617,8 +617,14 @@ def flash_attention_kernel(
 
         plgpu.barrier_wait(pv_mma_barrier)
         block_d = 32
-        ds = pl.ds(0, block_d)
+        wr_pos = rd_pos = 0
+        ds = pl.ds(rd_pos, block_d)
         acc = acc_next = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
+        rd_pos += block_d
+        if rd_pos < head_dim_out:
+          ds = pl.ds(rd_pos, block_d)
+          acc_next = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
+          rd_pos += block_d
         common.bar_sync(slot + _ALPHA_BARRIER_OFFSET, num_threads=256)
         alpha = plgpu.load(alpha_smem, slot, layout=_TMEM_ROW)
 
@@ -626,16 +632,17 @@ def flash_attention_kernel(
 
           for i in range(num_tma_splits):
             for _ in range(0, head_dim_out // num_tma_splits, block_d):
-              ds_next = pl.ds(ds.start + block_d, block_d)
-              if ds_next.start < head_dim_out:
-                acc_next = plgpu.async_load_tmem(
-                    acc_tmem.at[:, ds_next], layout=_TMEM
-                )
-
               acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
+              ds = pl.ds(wr_pos, block_d)
               plgpu.async_store_tmem(acc_tmem.at[:, ds], acc)
-              ds = ds_next
+              wr_pos += block_d
+
               acc = acc_next
+              if rd_pos < head_dim_out:
+                acc_next = plgpu.async_load_tmem(
+                    acc_tmem.at[:, pl.ds(rd_pos, block_d)], layout=_TMEM
+                )
+                rd_pos += block_d
 
             plgpu.commit_tmem()
             plgpu.barrier_arrive(out_scaled_barrier.at[i])
