@@ -174,6 +174,7 @@ def flash_attention_kernel(
     return_residuals: bool,
     use_base2: bool,
     use_stable_softmax: bool,
+    rescale_threshold: float,
     config: Config,
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """SM100 Pallas Mosaic GPU Flash Attention."""
@@ -183,6 +184,9 @@ def flash_attention_kernel(
 
   if not use_stable_softmax:
     raise NotImplementedError("Unstable softmax not supported on sm100.")
+
+  if rescale_threshold != 1.0:
+    raise NotImplementedError("Rescale threshold not supported on sm100.")
 
   if out_dtype != q.dtype:
     # TODO: Support other out_dtypes.

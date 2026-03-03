@@ -135,6 +135,7 @@ def flash_attention_kernel(
     return_residuals: bool,
     use_base2: bool,
     use_stable_softmax: bool,
+    rescale_threshold: float,
     config: Config,
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Flash attention with Mosaic GPU."""
@@ -232,6 +233,7 @@ def flash_attention_kernel(
 
     @pl.when(wg < 2)
     def compute_wg():
+      exp = jnp.exp2 if use_base2 else jnp.exp
       q_base = (2 * qi + wg) * block_q
       qs = pl.ds(q_base, block_q)
 
@@ -265,7 +267,7 @@ def flash_attention_kernel(
       pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
 
       def loop_body(ki, carry, *, do_causal=False):
-        acc, m_i, l_i = carry
+        acc, m_scale, m_i, l_i = carry
         si = lax.rem(ki, max_stages)
         k_base = ki * block_kv
         ks = pl.ds(k_base, block_kv)
@@ -344,18 +346,19 @@ def flash_attention_kernel(
             plgpu.barrier_arrive(mask_consumed_barrier.at[si])
           s, scale = jnp.where(mask, s * scale, mask_value), 1.0
 
-        exp = jnp.exp2 if use_base2 else jnp.exp
         if use_stable_softmax:
-          m_ij = jnp.maximum(m_i, s.max(axis=1) * scale)
-          alpha = exp(m_i - m_ij)
-          m_i = m_ij
-          p = exp(s * scale - lax.broadcast_in_dim(m_ij, s.shape, [0]))
+          m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
+          alpha = exp(m_scale - m_i)
+          threshold_is_1 = rescale_threshold == 1.0
+          needs_rescale = alpha < rescale_threshold
+          m_scale = jnp.where(needs_rescale | threshold_is_1, m_i, m_scale)
+          p = exp(s * scale - lax.broadcast_in_dim(m_scale, s.shape, [0]))
           acc = jnp.where(
-              lax.broadcast_in_dim(alpha != 1.0, acc.shape, [0]),
+              lax.broadcast_in_dim(needs_rescale, acc.shape, [0]),
               acc * lax.broadcast_in_dim(alpha, acc.shape, [0]),
               acc,
           )
-          l_i *= alpha
+          l_i = jnp.where(needs_rescale | threshold_is_1, l_i * alpha, l_i)
         else:
           p = exp(s * scale)
         p_ = p.astype(v.dtype)
@@ -364,7 +367,8 @@ def flash_attention_kernel(
         # the performance of the final kernel quite significantly.
         if p_sum_before_barriers := (head_dim <= 128):
           l_i += p.sum(axis=1)
-          acc, l_i, m_i, p_ = lax.optimization_barrier((acc, l_i, m_i, p_))
+          acc, p_ = lax.optimization_barrier((acc, p_))
+          l_i, m_i, m_scale = lax.optimization_barrier((l_i, m_i, m_scale))
 
         plgpu.barrier_wait(v_barrier.at[si])
         schedule_barrier_arrive_and_wait()
@@ -382,38 +386,41 @@ def flash_attention_kernel(
 
         acc, l_i = pl.run_state(compute_pv)((plgpu.ACC.init(acc), l_i))
         plgpu.barrier_arrive(v_consumed_barrier.at[si])
-        return acc, m_i, l_i
+        return acc, m_scale, m_i, l_i
+
+      carry = (acc, m_i, m_i, l_i)
 
       if is_causal:
         causal_loop_body = functools.partial(loop_body, do_causal=True)
         ub_no_causal = lax.min(ub, lax.div(q_base, block_kv))
-        carry = lax.fori_loop(lb, ub_no_causal, loop_body, (acc, m_i, l_i))
+        carry = lax.fori_loop(lb, ub_no_causal, loop_body, carry)
         # TODO: This cond should be redundant, but without it we
         # hit a weird compiler bug.
-        acc, m_i, l_i = lax.cond(
+        acc, m_scale, m_i, l_i = lax.cond(
             ub_no_causal < ub,
             lambda: lax.fori_loop(ub_no_causal, ub, causal_loop_body, carry),
             lambda: carry,
         )
       else:
-        acc, m_i, l_i = lax.fori_loop(lb, ub, loop_body, (acc, m_i, l_i))
+        acc, m_scale, m_i, l_i = lax.fori_loop(lb, ub, loop_body, carry)
 
       pl.when(wg == 0)(schedule_barrier_arrive)
 
       if return_residuals:
         m_smem, l_smem = map(at_wg, residual_smems)
         m_smem[...] = (m_i * (1 / math.log2(math.e))) if use_base2 else m_i
-        l_smem[...] = l_i
+        alpha = 1.0 if rescale_threshold == 1.0 else exp(m_scale - m_i)
+        l_smem[...] = l_i * alpha
         plgpu.commit_smem()
         m_gmem, l_gmem = residual_gmems
         plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[hi, qs], commit_group=False)
         plgpu.copy_smem_to_gmem(l_smem, l_gmem.at[hi, qs], commit_group=False)
 
-      l_i += float(jnp.finfo(jnp.float32).tiny)
-
       if normalize_output:
-        # TODO: Use `reciprocal`?
+        l_i += float(jnp.finfo(jnp.float32).tiny)
         acc *= lax.broadcast_in_dim(1 / l_i, acc.shape, [0])
+      elif rescale_threshold != 1.0:
+        acc *= lax.broadcast_in_dim(exp(m_scale - m_i), acc.shape, [0])
 
       o_smem[...] = acc.astype(o_smem.dtype)
       plgpu.commit_smem()

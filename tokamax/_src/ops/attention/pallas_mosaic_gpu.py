@@ -60,12 +60,29 @@ def _get_kernel_module():
 
 @dataclasses.dataclass(frozen=True)
 class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
-  """Flash attention with Mosaic GPU."""
+  """Flash attention with Mosaic GPU.
+
+  Attributes:
+    use_base2: If `True`, use base-2 exponential and logarithms.
+    use_stable_softmax: If `True`, use stable softmax, where the maximum value
+      will be subtracted from the logits before applying the softmax function,
+      improving numerical stability. If `AUTO` (the default), then stable
+      softmax will be `True` unless `logits_soft_cap` is not `None`, in which
+      case it will depend upon the value of `logits_soft_cap`.
+    rescale_threshold: The threshold for rescaling the accumulator when using
+      stable softmax. We have a rescaling factor, `alpha` where `alpha =
+      exp(prev_max - new_max)`. If `alpha < rescale_threshold`, we rescale the
+      accumulator. By default, it is `1`, which means rescaling happens every
+      time the maximum seen value changes. However, it can be set to a lower
+      value to perform rescaling less often, at the potential cost of numerical
+      stability. It is ignored when not using stable softmax.
+  """
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   use_base2: bool = True
   use_stable_softmax: bool | type[base.AUTO] = base.AUTO
+  rescale_threshold: float = 1.0
 
   def __post_init__(self):
     if self.vjp is None:
@@ -175,6 +192,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         return_residuals=return_residuals,
         use_base2=self.use_base2,
         use_stable_softmax=use_stable_softmax,
+        rescale_threshold=self.rescale_threshold,
         config=config,
     )
     bias = _broadcast_to_rank(bias, q.ndim)
