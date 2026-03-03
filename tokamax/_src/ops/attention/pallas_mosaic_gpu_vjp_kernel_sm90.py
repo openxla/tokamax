@@ -156,7 +156,6 @@ def flash_attention_vjp_kernel(
     logits_scale: float,
     logits_soft_cap: float | None,
     is_causal: bool,
-    use_base2: bool,
     ds_dtype: jax.typing.DTypeLike | None,
     config: Config,
 ) -> tuple[
@@ -204,7 +203,6 @@ def flash_attention_vjp_kernel(
       "qhd,qhd->hq", out, dout, preferred_element_type=jnp.float32
   )
   delta = pad_q_seq(delta, -1)
-  exp = jnp.exp2 if use_base2 else jnp.exp
 
   def tiled_spec(block_shape, dtype, index_map, what=""):
     transforms = common.tile_swizzle_transforms(block_shape, dtype, what)
@@ -273,9 +271,7 @@ def flash_attention_vjp_kernel(
 
       k_start = load_k_range(k_start_gmem)
       k_end = load_k_range(k_end_gmem)
-
-      if use_base2:
-        m *= math.log2(math.e)
+      m *= math.log2(math.e)
 
       plgpu.barrier_wait(barrier)
 
@@ -344,9 +340,7 @@ def flash_attention_vjp_kernel(
 
       # NOTE: This rescaling must happen after bias and soft-cap but before the
       # attention masking (as the multiplication will cause `-inf`s).
-      if use_base2:
-        scale *= math.log2(math.e)
-
+      scale *= math.log2(math.e)
       s *= scale
 
       mask_value = float(jnp.finfo(jnp.float32).min)
@@ -384,7 +378,7 @@ def flash_attention_vjp_kernel(
 
       broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
       epsilon = jnp.finfo(jnp.float32).tiny  # Avoid division by zero.
-      p = exp(s - broadcast(m)) / broadcast(l + epsilon)
+      p = jnp.exp2(s - broadcast(m)) / broadcast(l + epsilon)
 
       def compute_dp(acc):
         plgpu.wgmma(acc, dout_smem, v_smem.T)
@@ -581,10 +575,8 @@ def flash_attention_vjp_kernel(
 
       # NOTE: This rescaling must happen after bias and soft-cap but before the
       # attention masking (as the multiplication will cause `-inf`s).
-      if use_base2:
-        scale *= math.log2(math.e)
-        m *= math.log2(math.e)
-
+      scale *= math.log2(math.e)
+      m *= math.log2(math.e)
       sT *= scale
 
       mask_value = float(jnp.finfo(jnp.float32).min)
@@ -629,7 +621,7 @@ def flash_attention_vjp_kernel(
 
       broadcast = lambda x: lax.broadcast_in_dim(x, sT.shape, [1])
       epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
-      pT = exp(sT - broadcast(m)) / broadcast(l + epsilon)
+      pT = jnp.exp2(sT - broadcast(m)) / broadcast(l + epsilon)
 
       def compute_dpT(acc):
         plgpu.wgmma(acc, v_smem, dout_smem.T)

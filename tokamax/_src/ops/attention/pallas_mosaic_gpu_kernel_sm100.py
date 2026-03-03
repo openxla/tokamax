@@ -172,7 +172,6 @@ def flash_attention_kernel(
     out_dtype: jnp.dtype,
     normalize_output: bool,
     return_residuals: bool,
-    use_base2: bool,
     use_stable_softmax: bool,
     rescale_threshold: float,
     config: Config,
@@ -550,13 +549,11 @@ def flash_attention_kernel(
           s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
 
         with jax.named_scope("softmax"):
-          exp = jnp.exp2 if use_base2 else jnp.exp
-          if use_base2:
-            scale *= math.log2(math.e)
+          scale *= math.log2(math.e)
           s, scale = maybe_apply_mask(s, scale, ki, do_causal=do_causal)
           m_ij = jnp.maximum(m_i, s.max(axis=1) * scale)
           with jax.named_scope("exp(SFU)"):
-            alpha = exp(m_i - m_ij)
+            alpha = jnp.exp2(m_i - m_ij)
 
           @pl.when(ki > lb)
           def write_alpha_to_smem():
@@ -565,7 +562,7 @@ def flash_attention_kernel(
 
           m_i = m_ij
           with jax.named_scope("exp(SFU)"):
-            p = exp(s * scale - lax.broadcast_in_dim(m_ij, s.shape, [0]))
+            p = jnp.exp2(s * scale - lax.broadcast_in_dim(m_ij, s.shape, [0]))
           l_i *= alpha
           l_i += p.sum(axis=1)
           p16 = p.astype(p_tmem.dtype)
@@ -599,8 +596,7 @@ def flash_attention_kernel(
         common.bar_arrive(_L_BARRIER_ID, num_threads=256)
 
       if return_residuals:
-        if use_base2:
-          m_i *= 1 / math.log2(math.e)
+        m_i *= 1 / math.log2(math.e)
         for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
           gmem_ref.at[hi, qs].set(residual.astype(gmem_ref.dtype))
 

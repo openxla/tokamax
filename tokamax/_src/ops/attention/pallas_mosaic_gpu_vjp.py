@@ -52,7 +52,6 @@ class PallasMosaicGpuFlashAttentionVjp(
 
   config_cls: ClassVar[Any] = Config | sm100.Config
   supports_symbolic_shapes: ClassVar[bool] = False
-  use_base2: bool = True
   dbias_intermediate_dtype: jax.typing.DTypeLike | None = None
 
   @jaxtyping.jaxtyped
@@ -172,7 +171,6 @@ class PallasMosaicGpuFlashAttentionVjp(
         is_causal=is_causal,
         logits_scale=logits_scale,
         logits_soft_cap=logits_soft_cap,
-        use_base2=self.use_base2,
         ds_dtype=ds_dtype,
         config=config,
     )

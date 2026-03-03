@@ -80,13 +80,12 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
-  use_base2: bool = True
   use_stable_softmax: bool | type[base.AUTO] = base.AUTO
   rescale_threshold: float = 1.0
 
   def __post_init__(self):
     if self.vjp is None:
-      vjp_ = vjp.PallasMosaicGpuFlashAttentionVjp(use_base2=self.use_base2)
+      vjp_ = vjp.PallasMosaicGpuFlashAttentionVjp()
       object.__setattr__(self, "vjp", vjp_)
 
   @jaxtyping.jaxtyped
@@ -157,7 +156,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
     orig_seq_len_q = q.shape[-3]
     if isinstance(config, common.ConfigBase) and config.fold_q_sequence_heads:
-      q, bias, mask, dropout_mask, q_indices = base.fold_q_sequence_heads(
+      q, bias, mask, _, q_indices = base.fold_q_sequence_heads(
           q, bias, mask, dropout_mask, q_indices, k.shape[-3], k.shape[-2]
       )
 
@@ -190,7 +189,6 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         out_dtype=out_dtype,
         normalize_output=normalize_output,
         return_residuals=return_residuals,
-        use_base2=self.use_base2,
         use_stable_softmax=use_stable_softmax,
         rescale_threshold=self.rescale_threshold,
         config=config,

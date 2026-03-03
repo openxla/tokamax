@@ -133,7 +133,6 @@ def flash_attention_kernel(
     out_dtype: jnp.dtype,
     normalize_output: bool,
     return_residuals: bool,
-    use_base2: bool,
     use_stable_softmax: bool,
     rescale_threshold: float,
     config: Config,
@@ -233,7 +232,6 @@ def flash_attention_kernel(
 
     @pl.when(wg < 2)
     def compute_wg():
-      exp = jnp.exp2 if use_base2 else jnp.exp
       q_base = (2 * qi + wg) * block_q
       qs = pl.ds(q_base, block_q)
 
@@ -300,12 +298,9 @@ def flash_attention_kernel(
         if logits_soft_cap is not None:
           s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
 
-        if use_base2:
-          scale *= math.log2(math.e)
-
         # Defer scaling to the softmax computation below, if possible (allowing
         # FMA to be used).
-
+        scale *= math.log2(math.e)
         mask_value = float(jnp.finfo(jnp.float32).min)
 
         if mask is not None:
@@ -348,11 +343,11 @@ def flash_attention_kernel(
 
         if use_stable_softmax:
           m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
-          alpha = exp(m_scale - m_i)
+          alpha = jnp.exp2(m_scale - m_i)
           threshold_is_1 = rescale_threshold == 1.0
           needs_rescale = alpha < rescale_threshold
           m_scale = jnp.where(needs_rescale | threshold_is_1, m_i, m_scale)
-          p = exp(s * scale - lax.broadcast_in_dim(m_scale, s.shape, [0]))
+          p = jnp.exp2(s * scale - lax.broadcast_in_dim(m_scale, s.shape, [0]))
           acc = jnp.where(
               lax.broadcast_in_dim(needs_rescale, acc.shape, [0]),
               acc * lax.broadcast_in_dim(alpha, acc.shape, [0]),
@@ -360,7 +355,7 @@ def flash_attention_kernel(
           )
           l_i = jnp.where(needs_rescale | threshold_is_1, l_i * alpha, l_i)
         else:
-          p = exp(s * scale)
+          p = jnp.exp2(s * scale)
         p_ = p.astype(v.dtype)
 
         # Can't fully explain why, but empirically the ordering here influences
@@ -408,8 +403,8 @@ def flash_attention_kernel(
 
       if return_residuals:
         m_smem, l_smem = map(at_wg, residual_smems)
-        m_smem[...] = (m_i * (1 / math.log2(math.e))) if use_base2 else m_i
-        alpha = 1.0 if rescale_threshold == 1.0 else exp(m_scale - m_i)
+        m_smem[...] = m_i * (1 / math.log2(math.e))
+        alpha = 1.0 if rescale_threshold == 1.0 else jnp.exp2(m_scale - m_i)
         l_smem[...] = l_i * alpha
         plgpu.commit_smem()
         m_gmem, l_gmem = residual_gmems
@@ -420,7 +415,7 @@ def flash_attention_kernel(
         l_i += float(jnp.finfo(jnp.float32).tiny)
         acc *= lax.broadcast_in_dim(1 / l_i, acc.shape, [0])
       elif rescale_threshold != 1.0:
-        acc *= lax.broadcast_in_dim(exp(m_scale - m_i), acc.shape, [0])
+        acc *= lax.broadcast_in_dim(jnp.exp2(m_scale - m_i), acc.shape, [0])
 
       o_smem[...] = acc.astype(o_smem.dtype)
       plgpu.commit_smem()

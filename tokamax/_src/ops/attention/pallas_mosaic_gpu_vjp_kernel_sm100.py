@@ -213,7 +213,6 @@ def flash_attention_vjp_kernel(
     *,
     logits_scale: float,
     logits_soft_cap: float | None,
-    use_base2: bool,
     is_causal: bool,
     ds_dtype: jax.typing.DTypeLike | None,
     config: Config,
@@ -662,11 +661,7 @@ def flash_attention_vjp_kernel(
             mask = k_iota < k_end_val
             base_val = jnp.where(mask, base_val, mask_value)
 
-        if use_base2:
-          # Log2 change of base: exp2(x * log2(e))
-          p_val = jnp.exp2(base_val * math.log2(math.e))
-        else:
-          p_val = jnp.exp(base_val)
+        p_val = jnp.exp2(base_val * math.log2(math.e))
         return p_val, tanh_val
 
       for i in range(num_q_tiles):
