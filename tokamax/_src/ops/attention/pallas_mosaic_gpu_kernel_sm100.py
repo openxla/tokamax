@@ -226,48 +226,40 @@ def flash_attention_kernel(
   collective_axis = "x" if collective else None
   softmax_slots = 2
 
-  def kernel(*refs, scoped):
-    smem_buffers, buffer_barriers = scoped
-    (
-        (q_smem, o_smem),
-        k_smem,
-        v_smem,
-        p_tmem,
-        mask_smem,
-        alpha_smem,
-        li_smem,
-        acc_tmem,
-        qk_acc_tmem,
-    ) = smem_buffers
-    (
-        q_gmem,
-        k_gmem,
-        v_gmem,
-        mask_gmem,
-        k_start_gmem,
-        k_end_gmem,
-        k_start_minmax_gmems,
-        k_end_minmax_gmems,
-        out_gmem,
-        *residual_gmems,
-    ) = refs
-
-    (
-        q_barrier,
-        k_barrier,
-        v_barrier,
-        mask_produced_barrier,
-        mask_consumed_barrier,
-        # Q@K
-        qk_mma_barrier,
-        k_consumed_barrier,
-        qk_consumed_barrier,
-        # P@V
-        pv_mma_barrier,
-        v_consumed_barrier,
-        p_produced_barrier,
-        out_scaled_barrier,
-    ) = buffer_barriers
+  def kernel(
+      q_gmem,
+      k_gmem,
+      v_gmem,
+      mask_gmem,
+      k_start_gmem,
+      k_end_gmem,
+      k_start_minmax_gmems,
+      k_end_minmax_gmems,
+      out_gmem,
+      *residual_gmems,
+      qo_smem_union,
+      k_smem,
+      v_smem,
+      mask_smem,
+      alpha_smem,
+      li_smem,
+      qk_acc_tmem,
+      p_tmem,
+      acc_tmem,
+      q_barrier,
+      k_barrier,
+      v_barrier,
+      mask_produced_barrier,
+      mask_consumed_barrier,
+      qk_mma_barrier,
+      k_consumed_barrier,
+      qk_consumed_barrier,
+      pv_mma_barrier,
+      v_consumed_barrier,
+      p_produced_barrier,
+      out_scaled_barrier,
+  ):
+    (q_smem, o_smem) = qo_smem_union
 
     qi = lax.axis_index("q_tiles")
     hi = lax.axis_index("heads")
@@ -660,115 +652,6 @@ def flash_attention_kernel(
         plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-  def entry(*refs):
-
-    def tiled_smem(shape, dtype):
-      transforms = common.tile_swizzle_transforms(shape, dtype)
-      return plgpu.SMEM(shape, dtype, transforms=transforms)
-
-    q_scratch = tiled_smem((block_q, head_dim), q.dtype)
-    k_scratch = tiled_smem(
-        (
-            num_stages,
-            num_tma_splits,
-            block_kv // 2 if collective else block_kv,
-            head_dim // num_tma_splits,
-        ),
-        k.dtype,
-    )
-    v_scratch = tiled_smem(
-        (
-            num_stages,
-            num_tma_splits,
-            block_kv,
-            head_dim_out // num_tma_splits // (2 if collective else 1),
-        ),
-        k.dtype,
-    )
-    o_scratch = tiled_smem((block_q, head_dim_out), q.dtype)
-    p_scratch = plgpu.TMEM(
-        (block_q, block_kv * softmax_slots),
-        v.dtype,
-        packed=True,
-        collective=collective,
-    )
-    acc_scratch = plgpu.TMEM(
-        (block_q, head_dim_out), jnp.float32, collective=collective
-    )
-    qk_acc_scratch = plgpu.TMEM(
-        (block_q, block_kv), jnp.float32, collective=collective
-    )
-    alpha_scratch = plgpu.SMEM((softmax_slots, block_q), jnp.float32)
-    if normalize_output:
-      li_scratch = plgpu.SMEM((block_q,), jnp.float32)
-    else:
-      li_scratch = None
-    mask_scratch = tiled_smem((block_q, block_kv), jnp.int8)
-
-    # TMA barriers
-    k_barrier = v_barrier = plgpu.Barrier(
-        num_barriers=num_stages, num_arrivals=num_tma_splits
-    )
-    q_barrier = plgpu.Barrier()
-    mask_produced_barrier = plgpu.Barrier()
-    mask_consumed_barrier = plgpu.Barrier()
-    # Q@K
-    qk_mma_barrier = plgpu.Barrier(orders_tensor_core=True)
-    k_consumed_barrier = plgpu.Barrier(
-        num_barriers=num_stages * num_tma_splits, orders_tensor_core=True
-    )
-    # P@V
-    pv_mma_barrier = plgpu.Barrier(orders_tensor_core=True)
-    v_consumed_barrier = plgpu.Barrier(
-        num_barriers=num_stages * num_tma_splits, orders_tensor_core=True
-    )
-    if collective:
-      p_produced_barrier = plgpu.ClusterBarrier(
-          num_barriers=2, collective_axes=(collective_axis,)
-      )
-      out_scaled_barrier = plgpu.ClusterBarrier(
-          num_barriers=num_tma_splits, collective_axes=(collective_axis,)
-      )
-      qk_consumed_barrier = plgpu.ClusterBarrier(
-          collective_axes=(collective_axis,)
-      )
-    else:
-      p_produced_barrier = plgpu.Barrier(num_barriers=2)
-      out_scaled_barrier = plgpu.Barrier(num_barriers=num_tma_splits)
-      qk_consumed_barrier = plgpu.Barrier()
-
-    pl.run_scoped(
-        lambda *args: kernel(*refs, scoped=args),
-        (
-            plgpu.RefUnion(q_scratch, o_scratch),
-            k_scratch,
-            v_scratch,
-            p_scratch,
-            mask_scratch,
-            alpha_scratch,
-            li_scratch,
-            acc_scratch,
-            qk_acc_scratch,
-        ),
-        (
-            q_barrier,
-            k_barrier,
-            v_barrier,
-            mask_produced_barrier,
-            mask_consumed_barrier,
-            # Q@K
-            qk_mma_barrier,
-            k_consumed_barrier,
-            qk_consumed_barrier,
-            # P@V
-            pv_mma_barrier,
-            v_consumed_barrier,
-            p_produced_barrier,
-            out_scaled_barrier,
-        ),
-        collective_axes="wg",
-    )
-
   def pre_reduce_k_range_per_qtile(range_ref):
     if range_ref is None:
       return None
@@ -786,8 +669,76 @@ def flash_attention_kernel(
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), q.dtype)]
   if return_residuals:
-    residuals_shape = (num_q_heads, num_q_tiles * tile_q)
+    residuals_shape = (num_q_heads, pl.cdiv(q_seq_len, tile_q) * tile_q)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
+
+  def tiled_smem(shape, dtype):
+    transforms = common.tile_swizzle_transforms(shape, dtype)
+    return plgpu.SMEM(shape, dtype, transforms=transforms)
+
+  q_scratch = tiled_smem((block_q, head_dim), q.dtype)
+  k_scratch = tiled_smem(
+      (
+          num_stages,
+          num_tma_splits,
+          block_kv // 2 if collective else block_kv,
+          head_dim // num_tma_splits,
+      ),
+      k.dtype,
+  )
+  v_scratch = tiled_smem(
+      (
+          num_stages,
+          num_tma_splits,
+          block_kv,
+          head_dim_out // num_tma_splits // (2 if collective else 1),
+      ),
+      k.dtype,
+  )
+  o_scratch = tiled_smem((block_q, head_dim_out), q.dtype)
+  if normalize_output:
+    li_scratch = plgpu.SMEM((block_q,), jnp.float32)
+  else:
+    li_scratch = None
+
+  kv_barrier = plgpu.Barrier(
+      num_barriers=num_stages, num_arrivals=num_tma_splits
+  )
+  kv_consumed_barrier = plgpu.Barrier(
+      num_barriers=num_stages * num_tma_splits, orders_tensor_core=True
+  )
+
+  def tmem(shape, dtype=jnp.float32, **kwargs):
+    return plgpu.TMEM(shape, dtype, collective=collective, **kwargs)
+
+  def maybe_cluster_barrier(**kwargs):
+    if collective:
+      return plgpu.ClusterBarrier(collective_axes=(collective_axis,), **kwargs)
+    return plgpu.Barrier(**kwargs)
+
+  scratch_shapes = dict(
+      qo_smem_union=plgpu.RefUnion(q_scratch, o_scratch),
+      k_smem=k_scratch,
+      v_smem=v_scratch,
+      mask_smem=tiled_smem((block_q, block_kv), jnp.int8),
+      alpha_smem=plgpu.SMEM((softmax_slots, block_q), jnp.float32),
+      li_smem=li_scratch,
+      qk_acc_tmem=tmem((block_q, block_kv)),
+      p_tmem=tmem((block_q, block_kv * softmax_slots), v.dtype, packed=True),
+      acc_tmem=tmem((block_q, head_dim_out)),
+      q_barrier=plgpu.Barrier(),
+      k_barrier=kv_barrier,
+      v_barrier=kv_barrier,
+      mask_produced_barrier=plgpu.Barrier(),
+      mask_consumed_barrier=plgpu.Barrier(),
+      qk_mma_barrier=plgpu.Barrier(orders_tensor_core=True),
+      k_consumed_barrier=kv_consumed_barrier,
+      qk_consumed_barrier=maybe_cluster_barrier(),
+      pv_mma_barrier=plgpu.Barrier(orders_tensor_core=True),
+      v_consumed_barrier=kv_consumed_barrier,
+      p_produced_barrier=maybe_cluster_barrier(num_barriers=2),
+      out_scaled_barrier=maybe_cluster_barrier(num_barriers=num_tma_splits),
+  )
 
   profile = False
   compiler_params = plgpu.CompilerParams(
@@ -797,8 +748,9 @@ def flash_attention_kernel(
       profile_dir="sponge" if profile else "",
   )
   out, *residuals = plgpu.kernel(
-      entry,
+      kernel,
       out_shape=out_shape,
+      scratch_shapes=scratch_shapes,
       grid=(num_q_heads, num_q_tiles),
       grid_names=("heads", "q_tiles"),
       num_threads=3,
