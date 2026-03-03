@@ -556,7 +556,9 @@ def flash_attention_kernel(
       grid_names=("heads", "q_tiles"),
       num_threads=3,
       thread_name="wg",
-      compiler_params=plgpu.CompilerParams(approx_math=True),
+      compiler_params=plgpu.CompilerParams(
+          approx_math=True, unsafe_no_auto_barriers=True
+      ),
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
   residuals = tuple(res[..., :q_seq_len] for res in residuals)
