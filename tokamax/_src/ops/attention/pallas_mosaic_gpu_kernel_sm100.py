@@ -618,7 +618,7 @@ def flash_attention_kernel(
         for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
           gmem_ref.at[hi, qs].set(residual.astype(gmem_ref.dtype))
 
-    @pl.when(wg == _SCALE_WG)
+    @pl.when((wg == _SCALE_WG) & (ub > lb))
     def scale_wg():
       plgpu.set_max_registers(160, action="decrease")
 
