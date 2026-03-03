@@ -49,13 +49,11 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
       if "b200" in device_kind:
         if isinstance(rhs_, qwix.QArray):
           config = pallas_mosaic_gpu.Config(
-              block_m=128,
+              block_m=64,
               block_n=128,
-              block_k=256,
+              block_k=128,
               num_stages=2,
               split_k=1,
-              collective=True,
-              persistent=True,
           )
           if (
               rhs_.qtype != jnp.int4
