@@ -48,7 +48,6 @@ _load_bcast = common.load_bcast
 )  # pytype: disable=wrong-keyword-args
 class Config(common.ConfigBase):
   """Configuration parameters for Pallas-Mosaic-GPU kernels on SM90 GPUs."""
-
   pass
 
 
@@ -167,6 +166,13 @@ def flash_attention_kernel(
   max_stages = min(config.num_stages, pl.cdiv(kv_seq_len, block_kv))
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
 
+  epi_tile_q = 64
+  epi_tile_d = 1024 // common.num_bits(out_dtype)
+  assert block_q % epi_tile_q == 0
+  if head_dim_out % epi_tile_d != 0:
+    epi_tile_d = head_dim_out
+  num_epi_slots = min(2, (block_q // epi_tile_q) * (head_dim_out // epi_tile_d))
+
   if mask is not None:
     mask = mask.astype(jnp.int8)
 
@@ -183,7 +189,7 @@ def flash_attention_kernel(
       k_end_gmem,
       k_start_minmax_gmems,
       k_end_minmax_gmems,
-      out_gmem,
+      o_gmem,
       *residual_gmems,
       qko_smem_union,
       v_smem,
@@ -241,7 +247,8 @@ def flash_attention_kernel(
       m_init_value = -jnp.inf if use_stable_softmax else 0.0
       l_i = plgpu.layout_cast(jnp.zeros((block_q,), jnp.float32), _WGMMA_ROW)
       m_i = plgpu.layout_cast(jnp.full_like(l_i, m_init_value), _WGMMA_ROW)
-      acc = plgpu.layout_cast(jnp.zeros_like(o_smem, jnp.float32), _WGMMA)
+      acc = jnp.zeros((block_q, head_dim_out), jnp.float32)
+      acc = plgpu.layout_cast(acc, _WGMMA)
 
       load_k_range = lambda r: _load_bcast(r, (hi, qs), layout=_WGMMA_ROW)
       k_start = None if k_start_gmem is None else load_k_range(k_start_gmem)
@@ -419,9 +426,16 @@ def flash_attention_kernel(
       elif use_stable_softmax and rescale_threshold != 1.0:
         acc *= lax.broadcast_in_dim(jnp.exp2(m_scale - m_i), acc.shape, [0])
 
-      o_smem[...] = acc.astype(o_smem.dtype)
-      plgpu.commit_smem()
-      plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
+      o_gmem_ = o_gmem.at[qs, hi]
+      for qj in range(block_q // epi_tile_q):
+        for dj in range(head_dim_out // epi_tile_d):
+          si = lax.rem(qj * (head_dim_out // epi_tile_d) + dj, num_epi_slots)
+          epi_qs = slice(qj * epi_tile_q, (qj + 1) * epi_tile_q)
+          epi_ds = slice(dj * epi_tile_d, (dj + 1) * epi_tile_d)
+          plgpu.wait_smem_to_gmem(1, wait_read_only=True)
+          o_smem[si] = acc[epi_qs, epi_ds].astype(o_smem.dtype)
+          plgpu.commit_smem()
+          plgpu.copy_smem_to_gmem(o_smem.at[si], o_gmem_.at[epi_qs, epi_ds])
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     @pl.when(wg == 2)
@@ -504,7 +518,9 @@ def flash_attention_kernel(
   q_scratch = tiled_smem((compute_wgs, block_q, head_dim), q.dtype, "q")
   k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype, "k")
   v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype, "v")
-  o_scratch = tiled_smem((compute_wgs, block_q, head_dim_out), out_dtype, "o")
+  o_scratch = tiled_smem(
+      (compute_wgs, num_epi_slots, epi_tile_q, epi_tile_d), out_dtype, "o"
+  )
   l_scratch = m_scratch = plgpu.SMEM((compute_wgs, block_q), jnp.float32)
 
   kv_consumed_barrier = plgpu.Barrier(
