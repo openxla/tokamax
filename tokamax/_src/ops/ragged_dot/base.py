@@ -22,7 +22,6 @@ import jax
 from jax.experimental import checkify
 import jax.numpy as jnp
 import numpy as np
-import pydantic
 from pydantic_core import core_schema as cs
 import qwix
 from tokamax._src import precision as precision_lib
@@ -58,11 +57,6 @@ RAGGED_CONTRACTING_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
 
 
 _STATIC = dataclasses.field(metadata=dict(static=True))
-
-
-@pydantic.dataclasses.dataclass(frozen=True, slots=True)
-class RaggedDotConfig:
-  pass
 
 
 @jax.tree_util.register_dataclass
