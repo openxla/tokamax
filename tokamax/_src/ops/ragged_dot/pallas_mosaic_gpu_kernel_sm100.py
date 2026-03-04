@@ -18,7 +18,6 @@ import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
-from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
@@ -26,8 +25,8 @@ from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 _COMPUTE_WG = 0
-_MMA_WARP = 0
-_TMA_WARP = 1
+_MMA_WARP = 1#0
+_TMA_WARP = 0#1
 _EPILOGUE_WG = 1
 
 _TCGEN05 = plgpu.Layout.TCGEN05
@@ -80,9 +79,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   ):
     cluster_idx = lax.axis_index("cluster")
 
-    @plgpu.nd_loop(
-        (m_iters * n_iters,), collective_axes=("cluster_grid",), init_carry=0
-    )
+    @plgpu.dynamic_scheduling_loop(("mn",), thread_axis="wg", init_carry=0)
     def mn_loop(loop_info: plgpu.NDLoopInfo, carry):
       (idx,) = loop_info.index
       tid_m, ni = plgpu.planar_snake(
@@ -229,7 +226,6 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       acc_consumed_barrier=acc_consumed_barrier,
   )
 
-  num_sms = backend.get_default_device().core_count
   profile = False
   f = plgpu.kernel(
       kernel,
@@ -237,8 +233,8 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       scratch_shapes=scratch_shapes,
       num_threads=2,
       thread_name="wg",
-      grid=(num_sms // 2,) if collective else (num_sms,),
-      grid_names=("cluster_grid",),
+      grid=(m_iters * n_iters,),
+      grid_names=("mn",),
       cluster=(1 + collective,),
       cluster_names=("cluster",),
       compiler_params=plgpu.CompilerParams(
