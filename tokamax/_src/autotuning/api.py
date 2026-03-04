@@ -253,7 +253,7 @@ def autotune(
     ),
     *args,
     ignore_cache: bool = False,
-    all_implementations: bool = True,
+    all_implementations: bool = False,
     progress_bar: bool = True,
 ) -> AutotuningResult:
   """Autotunes all captured ops in x.
