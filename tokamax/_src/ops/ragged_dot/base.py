@@ -127,6 +127,34 @@ class GroupSizes:
     )
 
 
+def generate_group_sizes(
+    *, m: int, num_groups: int, p: Sequence[float] | None = None, seed: int = 0
+) -> tuple[int, ...]:
+  """Returns random group sizes.
+
+  `m` samples are drawn (with replacement) from the range `[0, num_groups - 1]`.
+  The returned tuple contains the number of times each group was chosen.
+
+  These values can be passed as the `representative_value` to `GroupSizes`,
+  allowing for more realistic benchmarking / autotuning (as the default, evenly
+  split, group sizes are often unrealisticly performant).
+
+  Args:
+    m: The number of rows to assign into groups.
+    num_groups: The number of groups.
+    p: The probabilities to use for each group. If `None`, the probabilities are
+      uniform. See `numpy.random.Generator.choice` for more details.
+    seed: The seed for the random number generator.
+
+  Returns:
+    A tuple of group sizes. The expected size of group `i` is `p[i] * m` (where
+    `p[i] = 1 / num_groups` if `p` is `None`).
+  """
+  rng = np.random.default_rng(seed)
+  group_ids = rng.choice(num_groups, (m,), p=p, replace=True)
+  return tuple(map(int, np.bincount(group_ids, minlength=num_groups)))
+
+
 @dataclasses.dataclass(frozen=True)
 class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   """Ragged dot base class.

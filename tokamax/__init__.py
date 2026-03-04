@@ -30,6 +30,7 @@ from tokamax._src.ops.normalization.api import layer_norm as layer_norm
 from tokamax._src.ops.op import BoundArguments as BoundArguments
 from tokamax._src.ops.op import Op as Op
 from tokamax._src.ops.ragged_dot.api import ragged_dot as ragged_dot
+from tokamax._src.ops.ragged_dot.base import generate_group_sizes as generate_ragged_dot_group_sizes
 from tokamax._src.ops.ragged_dot.base import GroupSizes as RaggedDotGroupSizes
 from tokamax._src.ops.triangle_multiplication.api import triangle_multiplication as triangle_multiplication
 # pylint: enable=g-importing-member,useless-import-alias
