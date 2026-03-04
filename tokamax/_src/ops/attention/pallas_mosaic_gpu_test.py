@@ -14,16 +14,16 @@
 # ==============================================================================
 import dataclasses
 import functools
-import itertools
-from types import UnionType
+from types import UnionType  # pylint: disable=g-importing-member
 from typing import Union, get_origin
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
-import tokamax._src.gpu_utils as gu
 import pytest
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu as fa
@@ -118,16 +118,23 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045)
     kwargs["atol_grads"] = None if bias is None else 0.02
-    kwargs["test_vjp_deterministic"] = not gu.is_sm100()
+    kwargs["test_vjp_deterministic"] = not gpu_utils.is_sm100()
 
     if not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
 
     test_vjp = kwargs.get("test_vjp", self._supports_vjp)
-    # TODO: Head dim > 64 is unsupported at the moment on
-    # SM100 because smem and tmem is are both exceeded exceeded.
-    if gu.is_sm100() and q.shape[-1] > 64 and test_vjp:
-      kwargs["expect_supported"] = False
+    if gpu_utils.is_sm100():
+      # TODO: Head dim > 64 is unsupported at the moment on
+      # SM100 because smem and tmem is are both exceeded exceeded.
+      if q.shape[-1] > 64 and test_vjp:
+        kwargs["expect_supported"] = False
+
+      impl = kwargs.get("impl", self._attention_fn)
+      if not getattr(impl, "use_stable_softmax", True):
+        kwargs["expect_supported"] = False
+      if getattr(impl, "rescale_threshold", 1.0) != 1.0:
+        kwargs["expect_supported"] = False
 
     super()._run_test_with_inputs(q, k, v, bias=bias, **kwargs)
 
@@ -154,20 +161,29 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     with test_base.override_test_args(atol=0.02):
       super().test_normalize_output()
 
-  @parameterized.parameters(False, True)
-  def test_op_parameters(self, use_stable_softmax):
-    self._test_op_parameters(use_stable_softmax)
+  @parameterized.product(
+      use_stable_softmax=(True, False), rescale_threshold=(1.0, 0.5)
+  )
+  def test_op_parameters(self, use_stable_softmax, rescale_threshold):
+    self._test_op_parameters(use_stable_softmax, rescale_threshold)
 
-  def _test_op_parameters(self, use_stable_softmax):
+  def _test_op_parameters(self, use_stable_softmax, rescale_threshold):
     op_cls = type(self._attention_fn)
+    kwargs = {}
     if hasattr(op_cls, "use_stable_softmax"):
-      impl = op_cls(use_stable_softmax=use_stable_softmax)
-    else:
-      self.skipTest("`use_stable_softmax` parameter not supported.")
-    sm90 = gpu_utils.is_sm90()
-    self._run_test(
-        (2, 1024, 4, 64), impl=impl, expect_supported=sm90 or use_stable_softmax
-    )
+      kwargs["use_stable_softmax"] = use_stable_softmax
+    elif not use_stable_softmax:
+      self.skipTest("`use_stable_softmax=False` unsupported.")
+
+    if hasattr(op_cls, "rescale_threshold"):
+      kwargs["rescale_threshold"] = rescale_threshold
+    elif rescale_threshold != 1.0:
+      self.skipTest("`rescale_threshold != 1.0` unsupported.")
+
+    with mock.patch.object(self, "_attention_fn", op_cls(**kwargs)):  # type: ignore
+      self.test_self_attention0()  # pytype: disable=attribute-error
+      if use_stable_softmax:
+        self.test_normalize_output()
 
   @override
   def _test_bench(self, spec):

@@ -404,8 +404,10 @@ def flash_attention_kernel(
       if return_residuals:
         m_smem, l_smem = map(at_wg, residual_smems)
         m_smem[...] = m_i * (1 / math.log2(math.e))
-        alpha = 1.0 if rescale_threshold == 1.0 else jnp.exp2(m_scale - m_i)
-        l_smem[...] = l_i * alpha
+        if use_stable_softmax and rescale_threshold != 1.0:
+          l_smem[...] = l_i * jnp.exp2(m_scale - m_i)
+        else:
+          l_smem[...] = l_i
         plgpu.commit_smem()
         m_gmem, l_gmem = residual_gmems
         plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[hi, qs], commit_group=False)
@@ -414,7 +416,7 @@ def flash_attention_kernel(
       if normalize_output:
         l_i += float(jnp.finfo(jnp.float32).tiny)
         acc *= lax.broadcast_in_dim(1 / l_i, acc.shape, [0])
-      elif rescale_threshold != 1.0:
+      elif use_stable_softmax and rescale_threshold != 1.0:
         acc *= lax.broadcast_in_dim(jnp.exp2(m_scale - m_i), acc.shape, [0])
 
       o_smem[...] = acc.astype(o_smem.dtype)
