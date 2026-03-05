@@ -272,8 +272,8 @@ def flash_attention_kernel(
       qk_consumed_barrier,
       pv_mma_barrier,
       v_consumed_barrier,
-      p_produced_barrier,
-      out_scaled_barrier,
+      p_barrier,
+      acc_barrier,
   ):
     (q_smem, o_smem) = qo_smem_union
 
@@ -394,6 +394,7 @@ def flash_attention_kernel(
             si = lax.rem(ki - lb, num_stages)
             with jax.named_scope("wait_k"):
               plgpu.barrier_wait(qk_consumed_barrier)
+              common.inline_ptx("tcgen05.fence::after_thread_sync;")
               plgpu.barrier_wait(k_barrier.at[si])
 
             @pl.loop(0, num_tma_splits)
@@ -419,14 +420,15 @@ def flash_attention_kernel(
             slot = lax.rem(ki - lb, 2)
             with jax.named_scope("wait_v"):
               plgpu.barrier_wait(v_barrier.at[si])
-              plgpu.barrier_wait(p_produced_barrier.at[slot])
+              plgpu.barrier_wait(p_barrier.at[slot])
 
             @pl.loop(0, num_tma_splits)
             def tma_loop(split_idx):
               barrier_slot = si * num_tma_splits + split_idx
               block_d = head_dim_out // num_tma_splits
               ds = pl.ds(split_idx * block_d, block_d)
-              plgpu.barrier_wait(out_scaled_barrier.at[split_idx])
+              plgpu.barrier_wait(acc_barrier.at[split_idx])
+              common.inline_ptx("tcgen05.fence::after_thread_sync;")
               with jax.named_scope("issuing P@V"):
                 plgpu.tcgen05_mma(
                     acc_tmem.at[:, ds],
@@ -562,7 +564,8 @@ def flash_attention_kernel(
         with jax.named_scope("load_qk"):
           s = plgpu.async_load_tmem(qk_acc_tmem, layout=_TMEM)
           scale = logits_scale
-          plgpu.wait_load_tmem()
+          common.inline_ptx("tcgen05.wait::ld.sync.aligned;")
+          common.inline_ptx("tcgen05.fence::before_thread_sync;")
           plgpu.barrier_arrive(qk_consumed_barrier)
 
         if logits_soft_cap is not None:
@@ -591,8 +594,9 @@ def flash_attention_kernel(
           with jax.named_scope("write qk_tmem"):
             ks = pl.ds(si * block_kv, block_kv)
             plgpu.async_store_tmem(p_tmem.at[:, ks], p.astype(p_tmem.dtype))
-            plgpu.commit_tmem()
-        plgpu.barrier_arrive(p_produced_barrier.at[si])
+            common.inline_ptx("tcgen05.wait::st.sync.aligned;")
+            common.inline_ptx("tcgen05.fence::before_thread_sync;")
+            plgpu.barrier_arrive(p_barrier.at[si])
         return m_scale, m_i, l_i
 
       # prologue
@@ -627,7 +631,7 @@ def flash_attention_kernel(
       @pl.when(ub > lb)
       def release_out_scaled_barriers():
         for i in range(num_tma_splits):
-          plgpu.barrier_arrive(out_scaled_barrier.at[i])
+          plgpu.barrier_arrive(acc_barrier.at[i])
 
       @pl.loop(lb + 1, ub)
       def kv_loop(ki):
@@ -683,14 +687,13 @@ def flash_attention_kernel(
                 )
                 rd_pos += block_d
 
-            plgpu.commit_tmem()
-            plgpu.barrier_arrive(out_scaled_barrier.at[i])
+            common.inline_ptx("tcgen05.wait::st.sync.aligned;")
+            common.inline_ptx("tcgen05.fence::before_thread_sync;")
+            plgpu.barrier_arrive(acc_barrier.at[i])
 
         def no_rescale():
           for i in range(num_tma_splits):
-            plgpu.barrier_arrive(out_scaled_barrier.at[i])
-          for _ in range(num_tma_splits):
-            common.warpgroup_barrier()  # To match barrier in `commit_tmem`.
+            plgpu.barrier_arrive(acc_barrier.at[i])
 
         with jax.named_scope("rescale_acc"):
           # If none of the threads in the warp need to rescale, then we can skip
@@ -812,8 +815,8 @@ def flash_attention_kernel(
       qk_consumed_barrier=maybe_cluster_barrier(),
       pv_mma_barrier=plgpu.Barrier(orders_tensor_core=True),
       v_consumed_barrier=kv_consumed_barrier,
-      p_produced_barrier=maybe_cluster_barrier(num_barriers=2),
-      out_scaled_barrier=maybe_cluster_barrier(num_barriers=num_tma_splits),
+      p_barrier=maybe_cluster_barrier(num_barriers=2),
+      acc_barrier=maybe_cluster_barrier(num_barriers=num_tma_splits),
   )
 
   profile = False
