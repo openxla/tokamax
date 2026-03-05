@@ -620,12 +620,14 @@ def flash_attention_kernel(
         for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
           gmem_ref.at[hi, qs].set(residual.astype(gmem_ref.dtype))
 
-    @pl.when((wg == _SCALE_WG) & (ub > lb))
+    @pl.when(wg == _SCALE_WG)
     def scale_wg():
       plgpu.set_max_registers(160, action="decrease")
 
-      for i in range(num_tma_splits):
-        plgpu.barrier_arrive(out_scaled_barrier.at[i])
+      @pl.when(ub > lb)
+      def release_out_scaled_barriers():
+        for i in range(num_tma_splits):
+          plgpu.barrier_arrive(out_scaled_barrier.at[i])
 
       @pl.loop(lb + 1, ub)
       def kv_loop(ki):
@@ -698,17 +700,28 @@ def flash_attention_kernel(
           lax.cond(rescale_warp, rescale_acc, no_rescale)
 
       with jax.named_scope("epilogue"):
-        if normalize_output:
-          common.bar_sync(_L_BARRIER_ID, num_threads=256)
-          l_i = plgpu.load(li_smem, (), layout=_TCGEN05_ROW)
-          l_rcp = 1.0 / (l_i + float(jnp.finfo(jnp.float32).tiny))
-          l_rcp = lax.broadcast_in_dim(l_rcp, acc_tmem.shape, [0])
-        else:
-          l_rcp = 1.0
-        plgpu.barrier_wait(pv_mma_barrier)
 
-        acc = plgpu.async_load_tmem(acc_tmem, layout=_TCGEN05)
-        o_smem[...] = (acc * l_rcp).astype(dtype)
+        def write_acc():
+          if normalize_output:
+            common.bar_sync(_L_BARRIER_ID, num_threads=256)
+            l_i = plgpu.load(li_smem, (), layout=_TCGEN05_ROW)
+            l_rcp = 1.0 / (l_i + float(jnp.finfo(jnp.float32).tiny))
+            l_rcp = lax.broadcast_in_dim(l_rcp, acc_tmem.shape, [0])
+          else:
+            l_rcp = 1.0
+          plgpu.barrier_wait(pv_mma_barrier)
+
+          acc = plgpu.async_load_tmem(acc_tmem, layout=_TCGEN05)
+          o_smem[...] = (acc * l_rcp).astype(o_smem.dtype)
+
+        def write_zeros():
+          if return_residuals:
+            m_gmem, l_gmem = residual_gmems
+            m_gmem[...] = jnp.full_like(m_gmem, -jnp.inf)
+            l_gmem[...] = jnp.zeros_like(l_gmem)
+          o_smem[...] = plgpu.layout_cast(jnp.zeros_like(o_smem), _TCGEN05)
+
+        lax.cond(ub > lb, write_acc, write_zeros)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
