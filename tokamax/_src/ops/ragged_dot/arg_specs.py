@@ -56,7 +56,7 @@ def _make_spec(
     rhs_dtype,
     group_sizes=None,
     project='',
-    tags=('primary',),
+    tags=(),
 ) -> arg_spec.ArgSpec:
   """Make an argument spec for a ragged dot operation."""
   lhs = jax.ShapeDtypeStruct((m, k), lhs_dtype)
@@ -85,7 +85,7 @@ def _make_maxtext_spec(name_prefix, num_groups, *, m, n, k) -> arg_spec.ArgSpec:
       rhs_dtype=jnp.bfloat16,
       group_sizes=group_sizes,
       project='maxtext',
-      tags=(),
+      tags=('primary',),
   )
 
 
