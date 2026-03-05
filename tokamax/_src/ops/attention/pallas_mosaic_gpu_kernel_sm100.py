@@ -19,11 +19,16 @@ import math
 
 import jax
 from jax import lax
+from jax.experimental.mosaic import gpu as mgpu
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import nvvm
+from jaxlib.mlir.dialects import vector
 import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src import shape as shape_lib
@@ -43,6 +48,7 @@ _TMEM_COL = _TMEM.reduce(0)
 _TMEM_ROW = _TMEM.reduce(1)
 _TCGEN05 = plgpu.Layout.TCGEN05
 _TCGEN05_ROW = _TCGEN05.reduce(1)
+_WG_SPLAT = plgpu.Layout.WG_SPLAT
 _DEFAULT_MASK_VALUE = -1e30
 
 _MMA_TMA_WG = 0
@@ -186,9 +192,6 @@ def flash_attention_kernel(
 
   if not use_stable_softmax:
     raise NotImplementedError("Unstable softmax not supported on sm100.")
-
-  if rescale_threshold != 1.0:
-    raise NotImplementedError("Rescale threshold not supported on sm100.")
 
   if out_dtype != q.dtype:
     # TODO: Support other out_dtypes.
@@ -552,7 +555,7 @@ def flash_attention_kernel(
         )
 
       def kv_loop(ki, carry, *, do_causal=False):
-        m_i, l_i = carry
+        m_scale, m_i, l_i = carry
         si = lax.rem(ki - lb, 2)
         with jax.named_scope("Q@K"):
           plgpu.barrier_wait(qk_mma_barrier)
@@ -568,30 +571,29 @@ def flash_attention_kernel(
         with jax.named_scope("softmax"):
           scale *= math.log2(math.e)
           s, scale = maybe_apply_mask(s, scale, ki, do_causal=do_causal)
-          m_ij = jnp.maximum(m_i, s.max(axis=1) * scale)
-
-          with jax.named_scope("exp(SFU)"):
-            alpha = jnp.exp2(m_i - m_ij)
+          m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
+          alpha = jnp.exp2(m_scale - m_i)
 
           @pl.when(ki > lb)
           def write_alpha_to_smem():
             alpha_smem.at[si][...] = alpha
             common.bar_arrive(si + _ALPHA_BARRIER_OFFSET, num_threads=256)
 
-          m_i = m_ij
-          with jax.named_scope("exp(SFU)"):
-            p = jnp.exp2(s * scale - lax.broadcast_in_dim(m_ij, s.shape, [0]))
-          l_i *= alpha
-          l_i += p.sum(axis=1)
-          p16 = p.astype(p_tmem.dtype)
+          needs_rescale = (
+              (rescale_threshold == 1.0)
+              | (alpha < rescale_threshold)
+              | ((not normalize_output) & (ki == ub - 1))
+          )
+          m_scale = jnp.where(needs_rescale, m_i, m_scale)
+          p = jnp.exp2(s * scale - lax.broadcast_in_dim(m_scale, s.shape, [0]))
+          l_i = jnp.where(needs_rescale, l_i * alpha, l_i) + p.sum(axis=1)
 
           with jax.named_scope("write qk_tmem"):
-            plgpu.async_store_tmem(
-                p_tmem.at[:, pl.ds(si * block_kv, block_kv)], p16
-            )
+            ks = pl.ds(si * block_kv, block_kv)
+            plgpu.async_store_tmem(p_tmem.at[:, ks], p.astype(p_tmem.dtype))
             plgpu.commit_tmem()
         plgpu.barrier_arrive(p_produced_barrier.at[si])
-        return m_i, l_i
+        return m_scale, m_i, l_i
 
       # prologue
       plgpu.barrier_arrive(qk_consumed_barrier)
@@ -599,21 +601,21 @@ def flash_attention_kernel(
       # in 2CTA we have non square blocks hence we may need to process
       # M//N steps with a mask, for M=256, N=128 this means 2 steps
       causal_blocks = int(is_causal) * (tile_q // block_kv)
-      m_i, l_i = lax.fori_loop(lb, ub - causal_blocks, kv_loop, (m_i, l_i))
+      carry = lax.fori_loop(lb, ub - causal_blocks, kv_loop, (m_i, m_i, l_i))
 
       if is_causal:
-        m_i, l_i = lax.fori_loop(
-            ub - causal_blocks,
-            ub,
-            functools.partial(kv_loop, do_causal=True),
-            (m_i, l_i),
-        )
+        causal_kv_loop = functools.partial(kv_loop, do_causal=True)
+        carry = lax.fori_loop(ub - causal_blocks, ub, causal_kv_loop, carry)
+
+      m_scale, m_i, l_i = carry
 
       if normalize_output:
         li_smem[...] = l_i
         common.bar_arrive(_L_BARRIER_ID, num_threads=256)
 
       if return_residuals:
+        if normalize_output and (rescale_threshold != 1.0):
+          l_i *= jnp.exp2(m_scale - m_i)
         m_i *= 1 / math.log2(math.e)
         for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
           gmem_ref.at[hi, qs].set(residual.astype(gmem_ref.dtype))
@@ -631,7 +633,7 @@ def flash_attention_kernel(
 
         plgpu.barrier_wait(pv_mma_barrier)
         block_d = 32
-        wr_pos = rd_pos = 0
+        rd_pos = 0
         ds = pl.ds(rd_pos, block_d)
         acc = acc_next = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
         rd_pos += block_d
@@ -641,12 +643,33 @@ def flash_attention_kernel(
           rd_pos += block_d
         common.bar_sync(slot + _ALPHA_BARRIER_OFFSET, num_threads=256)
         alpha = plgpu.load(alpha_smem, slot, layout=_TMEM_ROW)
+        needs_rescale = (
+            (rescale_threshold == 1.0)
+            | (alpha < rescale_threshold)
+            | ((not normalize_output) & (ki == ub - 1))
+        )
 
-        with jax.named_scope("scale_acc"):
+        per_warp_type = plgpu.ShapeDtypeStruct((), jnp.bool_, _WG_SPLAT)
 
+        @plgpu.inline_mgpu(arg_types=(_TMEM_ROW,), return_type=per_warp_type)
+        def warp_any(_, needs_rescale):
+          thread_val = functools.reduce(arith.ori, needs_rescale.registers.flat)
+          thread_val = vector.extract(thread_val, [], [0])
+          i1 = ir.IntegerType.get_signless(1)
+          i32 = ir.IntegerType.get_signless(32)
+          mask = arith.constant(i32, 0xFFFFFFFF)
+          warp_val = nvvm.vote_sync(i1, mask, thread_val, "any")
+          return mgpu.FragmentedArray.splat(warp_val, (), is_signed=False)
+
+        def rescale_acc(rd_pos=rd_pos, acc=acc, acc_next=acc_next):
+          wr_pos = 0
           for i in range(num_tma_splits):
             for _ in range(0, head_dim_out // num_tma_splits, block_d):
-              acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
+              acc = jnp.where(
+                  lax.broadcast_in_dim(needs_rescale, acc.shape, [0]),
+                  acc * lax.broadcast_in_dim(alpha, acc.shape, [0]),
+                  acc,
+              )
               ds = pl.ds(wr_pos, block_d)
               plgpu.async_store_tmem(acc_tmem.at[:, ds], acc)
               wr_pos += block_d
@@ -660,6 +683,19 @@ def flash_attention_kernel(
 
             plgpu.commit_tmem()
             plgpu.barrier_arrive(out_scaled_barrier.at[i])
+
+        def no_rescale():
+          for i in range(num_tma_splits):
+            plgpu.barrier_arrive(out_scaled_barrier.at[i])
+          for _ in range(num_tma_splits):
+            common.warpgroup_barrier()  # To match barrier in `commit_tmem`.
+
+        with jax.named_scope("rescale_acc"):
+          # If none of the threads in the warp need to rescale, then we can skip
+          # loading the accumulator from tmem entirely as the warps operate
+          # independently.
+          rescale_warp = (rescale_threshold == 1.0) or warp_any(needs_rescale)
+          lax.cond(rescale_warp, rescale_acc, no_rescale)
 
       with jax.named_scope("epilogue"):
         if normalize_output:

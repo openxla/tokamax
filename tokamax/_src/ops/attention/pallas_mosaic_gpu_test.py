@@ -133,8 +133,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       impl = kwargs.get("impl", self._attention_fn)
       if not getattr(impl, "use_stable_softmax", True):
         kwargs["expect_supported"] = False
-      if getattr(impl, "rescale_threshold", 1.0) != 1.0:
-        kwargs["expect_supported"] = False
 
     super()._run_test_with_inputs(q, k, v, bias=bias, **kwargs)
 

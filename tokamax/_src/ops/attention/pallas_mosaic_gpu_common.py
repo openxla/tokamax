@@ -133,6 +133,10 @@ def tile_swizzle_transforms(
   return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
 
 
+def warpgroup_barrier():
+  plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())()
+
+
 def _bar_operation(operation: str, barrier_id: int | jax.Array, num_threads: int):
   if isinstance(barrier_id, int):
 
@@ -159,7 +163,6 @@ def _bar_operation(operation: str, barrier_id: int | jax.Array, num_threads: int
       )
 
     bar_op(barrier_id)
-
 
 bar_arrive = functools.partial(_bar_operation, "arrive")
 bar_sync = functools.partial(_bar_operation, "sync")
