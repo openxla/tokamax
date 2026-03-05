@@ -165,18 +165,19 @@ execution time. This means the usual approach of timing
 for only measuring accelerator execution time:
 
 ```python
-
-f_std, args = tokamax.benchmarking.standardize_function(f, kwargs={'x': x, 'scale': scale})
-run = tokamax.benchmarking.compile_benchmark(f_std, args)
-bench: tokamax.benchmarking.BenchmarkData = run(args)
+f_std, args = tokamax.standardize_function(f, kwargs={'x': x, 'scale': scale})
+bench: tokamax.BenchmarkData = tokamax.benchmark(f_std, args)
 ```
 
 There are different measurement techniques: for example, on GPU, there is the
 [CUPTI profiler](https://docs.nvidia.com/cupti) that can be specified via
-`run(args, method='cupti')`. This instruments the kernel and adds some a small
-overhead. The default `run(args, method=None)` allows Tokamax to choose the
-method, and works for both TPU and GPU. Benchmark noise can be reduced by
-increasing the number of iterations `run(args, iterations=10)`.
+`tokamax.benchmark(f_std, args, method='cupti')`. This instruments the
+kernel and adds some a small overhead. The default `method=None` allows Tokamax
+to choose the method, and works for both TPU and GPU. Benchmark noise can be
+reduced by increasing the number of iterations:
+```python
+tokamax.benchmark(f_std, args, iterations=10)
+```
 
 ## Disclaimer
 

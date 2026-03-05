@@ -179,10 +179,12 @@ class BenchmarkingTest(parameterized.TestCase):
 
     kwargs = {'x': jnp.ones((512, 512))}
     f, x = benchmarking.standardize_function(f, kwargs=kwargs)
-    run = benchmarking.compile_benchmark(f, x)
-    bench = run(x, method='wallclock', iterations=1)
+    bench = benchmarking.benchmark(
+        f, x, method='wallclock', iterations=1
+    )
     time_sleep_ms = time_sleep_s * 1000
     self.assertGreaterEqual(bench.median_evaluation_time_ms, time_sleep_ms)
+    self.assertLen(bench.evaluation_times_ms, 1)
 
   def test_xprof_profile_session(self):
     def f(x):

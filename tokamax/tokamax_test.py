@@ -102,8 +102,8 @@ class TokamaxTest(absltest.TestCase):
         )
 
     with self.subTest("Benchmark"):
-      f_std, args = tokamax.benchmarking.standardize_function(f_grad, x, scale)
-      bench = tokamax.benchmarking.compile_benchmark(f_std, args)(args)
+      f_std, args = tokamax.standardize_function(f_grad, x, scale)
+      bench: tokamax.BenchmarkData = tokamax.benchmark(f_std, args)
       self.assertGreater(bench.median_evaluation_time_ms, 0.0)
 
 

@@ -21,6 +21,9 @@ from tokamax import config as config
 from tokamax._src.autotuning.api import autotune as autotune
 from tokamax._src.autotuning.api import AutotuningResult as AutotuningResult
 from tokamax._src.batching import BatchedShapeDtype as BatchedShapeDtype
+from tokamax._src.benchmarking import benchmark as benchmark
+from tokamax._src.benchmarking import BenchmarkData as BenchmarkData
+from tokamax._src.benchmarking import standardize_function as standardize_function
 from tokamax._src.hlo_utils import DISABLE_JAX_EXPORT_CHECKS as DISABLE_JAX_EXPORT_CHECKS
 from tokamax._src.ops.attention.api import dot_product_attention as dot_product_attention
 from tokamax._src.ops.attention.api import Implementation as DotProductAttentionImplementation
