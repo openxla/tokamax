@@ -15,10 +15,10 @@
 """Pallas Mosaic TPU Megablox."""
 
 import dataclasses
-from functools import partial  # pylint: disable=g-importing-member
+import functools
 import itertools
 import types
-from typing import Callable, ClassVar
+from typing import ClassVar
 
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -217,7 +217,9 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           *args, **kw
       )
       object.__setattr__(
-          self, "vjp", partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn)
+          self,
+          "vjp",
+          functools.partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn),
       )
 
   @override
