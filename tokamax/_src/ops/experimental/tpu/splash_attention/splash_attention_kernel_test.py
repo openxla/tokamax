@@ -322,17 +322,19 @@ def _generate_inputs(
     is_mqa: bool,
     is_segmented: bool,
     use_sinks: bool = False,
+    use_bias: bool = False,
 ) -> tuple[
     jax.Array,
     jax.Array,
     jax.Array,
+    jax.Array | None,
     jax.Array | None,
     splash.SegmentIds | None,
     jax.Array,
 ]:
   seed = data.draw(seed_strategy())
   key = random.key(seed)
-  k1, k2, k3, k_sinks, k_do = random.split(key, 5)
+  k1, k2, k3, k_sinks, k_bias, k_do = random.split(key, 6)
 
   q_shape = (config.num_q_heads, config.q_seq_len, config.head_dim_qk)
   if is_mqa:
@@ -350,6 +352,14 @@ def _generate_inputs(
   if use_sinks:
     sinks = random.uniform(k_sinks, (config.num_q_heads,), dtype=config.dtype)
 
+  bias = None
+  if use_bias:
+    bias = random.normal(
+        k_bias,
+        (config.num_q_heads, config.q_seq_len, config.kv_seq_len),
+        dtype=config.dtype,
+    )
+
   segment_ids = None
   if is_segmented:
     hp.assume(config.q_seq_len == config.kv_seq_len)
@@ -357,7 +367,7 @@ def _generate_inputs(
 
   o_shape = (config.num_q_heads, config.q_seq_len, config.head_dim_v)
   do = random.uniform(k_do, o_shape, dtype=config.dtype)
-  return (q, k, v, sinks, segment_ids, do)
+  return (q, k, v, sinks, bias, segment_ids, do)
 
 
 def attn_logits_soft_cap_strategy() -> hps.SearchStrategy[float | None]:
@@ -381,7 +391,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
   def test_splash_attention(self, is_mqa, is_segmented, is_dynamic_mask, data):
     model_config = data.draw(model_config_strategy())
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
-    q, k, v, _, segment_ids, _ = _generate_inputs(
+    q, k, v, _, _, segment_ids, _ = _generate_inputs(
         data, model_config, is_mqa, is_segmented
     )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
@@ -410,11 +420,12 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
 
     attn = make_mask_fn(mask, config=config)
 
-    o = attn(q, k, v, segment_ids)
+    o = attn(q, k, v, None, segment_ids)
     o_ref = attn_ref(
         q.astype(np.float32),
         k.astype(np.float32),
         v.astype(np.float32),
+        None,
         jnp.array(mask[:, :]),
         segment_ids,
         attn_logits_soft_cap=attn_logits_soft_cap,
@@ -429,15 +440,16 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
       fuse_reciprocal=(True, False),
       use_sinks=(False, True),
+      use_bias=(False, True),
   )
   @hp.given(hps.data())
   def test_splash_attention_fwd(self, is_mqa, is_segmented, is_dynamic_mask,
                                 use_base2_exp, use_max_logit_estimate,
-                                fuse_reciprocal, use_sinks, data):
+                                fuse_reciprocal, use_sinks, use_bias, data):
     model_config = data.draw(model_config_strategy())
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
-    q, k, v, sinks, segment_ids, _ = _generate_inputs(
-        data, model_config, is_mqa, is_segmented, use_sinks
+    q, k, v, sinks, bias, segment_ids, _ = _generate_inputs(
+        data, model_config, is_mqa, is_segmented, use_sinks, use_bias
     )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
@@ -482,13 +494,14 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
 
     o, stats = attn(
-        q, k, v, segment_ids, sinks, max_logit_value=max_logit_value
+        q, k, v, bias, segment_ids, sinks, max_logit_value=max_logit_value
     )
 
     o_ref, stats_ref = attn_ref(
         q.astype(jnp.float32),
         k.astype(jnp.float32),
         v.astype(jnp.float32),
+        bias.astype(jnp.float32) if bias is not None else None,
         jnp.array(mask[:, :]),
         segment_ids,
         sinks,
@@ -520,6 +533,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_max_logit_estimate=(None,),
       use_sinks=(False, True),
       dq_reduction_steps=(None, 3),
+      use_bias=(False, True),
       save_residuals=(False, True),
   )
   @hp.given(hps.data())
@@ -531,6 +545,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_max_logit_estimate,
       dq_reduction_steps,
       use_sinks,
+      use_bias,
       save_residuals,
       data,
   ):
@@ -540,8 +555,13 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
 
     model_config = data.draw(model_config_strategy())
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
-    q, k, v, sinks, segment_ids, do = _generate_inputs(
-        data, model_config, is_mqa, is_segmented, use_sinks=use_sinks
+    q, k, v, sinks, bias, segment_ids, do = _generate_inputs(
+        data,
+        model_config,
+        is_mqa,
+        is_segmented,
+        use_sinks=use_sinks,
+        use_bias=use_bias,
     )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
@@ -594,6 +614,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
           q,
           k,
           v,
+          bias,
           segment_ids,
           sinks,
       )
@@ -604,6 +625,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
           q,
           k,
           v,
+          bias,
           segment_ids,
           sinks,
       )
@@ -613,6 +635,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         q32,
         k32,
         v32,
+        bias.astype(jnp.float32) if bias is not None else None,
         jnp.array(mask[:, :]),
         segment_ids,
         sinks,
@@ -624,25 +647,33 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       o_tol = dict(atol=1e-2, rtol=1e-2)
     elif (use_base2_exp or use_max_logit_estimate is not None
           or not fuse_reciprocal):
-      o_tol = dict(atol=8e-3, rtol=1e-2)
+      if use_bias:
+        o_tol = dict(atol=9e-3, rtol=2e-2)
+      else:
+        o_tol = dict(atol=8e-3, rtol=1e-2)
+    elif use_bias:
+      o_tol = dict(atol=7e-3, rtol=7e-3)
     else:
       o_tol = dict(atol=4e-3, rtol=3e-3)
     self._assert_allclose(o, o_ref, **o_tol)
 
-    dq, dk, dv, _, dsinks = attn_vjp(cotangents)
-    dq_ref, dk_ref, dv_ref, dsinks_ref = base.attention_reference_vjp(
-        do.astype(jnp.float32),
-        q32,
-        k32,
-        v32,
-        jnp.array(mask[:, :]),
-        segment_ids,
-        sinks,
-        o.astype(jnp.float32),
-        stats_ref["logsumexp"],
-        is_mqa=is_mqa,
-        backward_impl="flash",
-        attn_logits_soft_cap=attn_logits_soft_cap,
+    dq, dk, dv, dbias, _, dsinks = attn_vjp(cotangents)
+    dq_ref, dk_ref, dv_ref, dbias_ref, dsinks_ref = (
+        base.attention_reference_vjp(
+            do.astype(jnp.float32),
+            q32,
+            k32,
+            v32,
+            bias.astype(jnp.float32) if bias is not None else None,
+            jnp.array(mask[:, :]),
+            segment_ids,
+            sinks,
+            o.astype(jnp.float32),
+            stats_ref["logsumexp"],
+            is_mqa=is_mqa,
+            backward_impl="flash",
+            attn_logits_soft_cap=attn_logits_soft_cap,
+        )
     )
 
     dq_atol = 8e-2 if use_base2_exp else 2e-2
@@ -651,6 +682,8 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     self._assert_allclose(dq, dq_ref, atol=dq_atol, rtol=3e-2)
     self._assert_allclose(dk, dk_ref, atol=dk_atol, rtol=3e-2)
     self._assert_allclose(dv, dv_ref, atol=dv_atol, rtol=3e-2)
+    if use_bias:
+      self._assert_allclose(dbias, dbias_ref, atol=dq_atol, rtol=3e-2)
     if use_sinks:
       self._assert_allclose(dsinks, dsinks_ref, atol=4e-3, rtol=6e-3)
 

@@ -63,6 +63,7 @@ SplashResidualsType = tuple[
     jax.Array,  # q
     jax.Array,  # k
     jax.Array,  # v
+    jax.Array | None,  # bias
     SegmentIds | None,  # segment_ids
     jax.Array | None,  # sinks
     jax.Array,  # out
@@ -75,6 +76,7 @@ def _attention_reference_impl(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
+    bias: jax.Array | None,
     mask: jax.Array,
     segment_ids: SegmentIds | None,
     sinks: jax.Array | None,
@@ -83,6 +85,9 @@ def _attention_reference_impl(
     attn_logits_soft_cap: float | None,
 ) -> SplashCustomReturnType:
   logits = jnp.einsum("sd,td->st", q.astype(jnp.float32), k.astype(jnp.float32))
+
+  if bias is not None:
+    logits = logits + bias.astype(jnp.float32)
 
   if segment_ids is not None:
     mask = jnp.logical_and(
@@ -117,6 +122,7 @@ def _attention_reference_custom_bwd(
     q,
     k,
     v,
+    bias,
     mask,
     segment_ids,
     sinks,
@@ -125,10 +131,15 @@ def _attention_reference_custom_bwd(
     mask_value: float = DEFAULT_MASK_VALUE,
     backward_impl: str = "vanilla",
     attn_logits_soft_cap: float | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, None, None, jax.Array | None]:
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array | None, None, jax.Array | None
+]:
   uncapped_logits = jnp.einsum(
       "qc,kc->qk", q, k, preferred_element_type=jnp.float32
   )
+
+  if bias is not None:
+    uncapped_logits = uncapped_logits + bias.astype(jnp.float32)
 
   if attn_logits_soft_cap is not None:
     logits = jnp.tanh(uncapped_logits / attn_logits_soft_cap)
@@ -163,6 +174,7 @@ def _attention_reference_custom_bwd(
     ds = g + g * d
   dk = jnp.einsum("sd,st->td", q.astype(jnp.float32), ds).astype(k.dtype)
   dq = jnp.einsum("st,td->sd", ds, k.astype(jnp.float32)).astype(q.dtype)
+  dbias = ds.astype(bias.dtype) if bias is not None else None
   dsinks = None
   if sinks is not None:
     sinks_exp = -jnp.exp(
@@ -170,7 +182,7 @@ def _attention_reference_custom_bwd(
         - logsumexp[..., None].astype(jnp.float32)
     )
     dsinks = jnp.sum(sinks_exp.astype(o.dtype) * o * do, axis=(-1, -2))
-  return dq, dk, dv, None, None, dsinks
+  return dq, dk, dv, dbias, None, dsinks
 
 
 @functools.partial(
@@ -186,7 +198,8 @@ def attention_reference(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    mask: jax.Array,
+    bias: jax.Array | None = None,
+    mask: jax.Array | None = None,
     segment_ids: SegmentIds | None = None,
     sinks: jax.Array | None = None,
     *,
@@ -204,7 +217,7 @@ def attention_reference(
   )
 
   if is_mqa:
-    func = jax.vmap(attn_impl, in_axes=(0, None, None, None, None, 0))
+    func = jax.vmap(attn_impl, in_axes=(0, None, None, 0, None, None, 0))
   else:
     # In grouped attention (1 < num_kv_heads && num_kv_heads < num_q_heads).
     # We interleave the KV heads across the Q heads.
@@ -223,9 +236,9 @@ def attention_reference(
       k = jnp.repeat(k, repeats=q_heads_per_kv, axis=0)
       v = jnp.repeat(v, repeats=q_heads_per_kv, axis=0)
 
-    func = jax.vmap(attn_impl, in_axes=(0, 0, 0, None, None, 0))
+    func = jax.vmap(attn_impl, in_axes=(0, 0, 0, 0, None, None, 0))
 
-  out = func(q, k, v, mask, segment_ids, sinks)
+  out = func(q, k, v, bias, mask, segment_ids, sinks)
   return out
 
 
@@ -237,6 +250,7 @@ def attention_reference_vjp(
     q,
     k,
     v,
+    bias,
     mask,
     segment_ids,
     sinks,
@@ -260,17 +274,21 @@ def attention_reference_vjp(
   is_grouped = not is_mqa and num_kv_heads < num_q_heads
   assert num_q_heads % num_kv_heads == 0
   head_multiplier = num_q_heads // num_kv_heads
+
+  bias_axis = 0 if bias is not None else None
   if is_mqa:
-    bwd = jax.vmap(bwd, in_axes=(0, 0, None, None, None, None, 0, 0, 0))
+    bwd = jax.vmap(
+        bwd, in_axes=(0, 0, None, None, bias_axis, None, None, 0, 0, 0)
+    )
   else:
-    bwd = jax.vmap(bwd, in_axes=(0, 0, 0, 0, None, None, 0, 0, 0))
+    bwd = jax.vmap(bwd, in_axes=(0, 0, 0, 0, bias_axis, None, None, 0, 0, 0))
     # Interleave the KV heads to match the corresponding Q heads.
     if is_grouped:
       k = jnp.repeat(k, head_multiplier, axis=0)
       v = jnp.repeat(v, head_multiplier, axis=0)
 
-  dq, dk, dv, _, _, dsinks = bwd(
-      do, q, k, v, mask, segment_ids, sinks, o, logsumexp
+  dq, dk, dv, dbias, _, dsinks = bwd(
+      do, q, k, v, bias, mask, segment_ids, sinks, o, logsumexp
   )
 
   if is_mqa:
@@ -282,4 +300,4 @@ def attention_reference_vjp(
     dv = dv.reshape(num_kv_heads, head_multiplier, *dv.shape[1:])
     dk, dv = dk.sum(axis=1), dv.sum(axis=1)
 
-  return dq, dk, dv, dsinks
+  return dq, dk, dv, dbias, dsinks
