@@ -167,20 +167,19 @@ class PallasMosaicTpuFlashAttentionVjp(
         q_swap,
         k_splash,
         v_splash,
-        None,  # bias
-        None,  # segment_ids
-        None,  # sinks
+        None,
+        None,
         out_swap,
         lse,
         splash_fn.dkv_mask_info,
     )
     lse_in_axis = 0 if lse.ndim == 3 else None
-    res_in_axes = (0, 0, 0, None, None, None, 0, lse_in_axis, None)
+    res_in_axes = (0, 0, 0, None, None, 0, lse_in_axis, None)
     cotangents = (dout_swap, dstats)
     dstats_in_axes = jax.tree.map(lambda x: lse_in_axis, dstats)
     cotangents_in_axes = (0, dstats_in_axes)
     # vmap over batch dimension
-    _, _, dq, dk, dv, _, _, _, _ = jax.vmap(
+    _, _, dq, dk, dv, _, _, _ = jax.vmap(
         bwd_fn, in_axes=(res_in_axes, cotangents_in_axes)
     )(res, cotangents)
 

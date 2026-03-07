@@ -112,6 +112,7 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
     q_spec = P(None, ring_axis, None)
     kv_spec = P(ring_axis, None) if is_mqa else q_spec
 
+
     splash_config = splash.SplashConfig.get_default()
     splash_config = dataclasses.replace(
         splash_config,
@@ -153,20 +154,18 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
 
     with self.subTest("fwd"):
       out = ring_attn(ring_kernel, q, k, v, segment_ids)
-      out_ref = ring_attn_ref(
-          q, k, v, bias=None, mask=mask[:, :], segment_ids=segment_ids
-      )
+      out_ref = ring_attn_ref(q, k, v, mask[:, :], segment_ids)
       self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
 
     with self.subTest("bwd"):
       out, out_vjp = jax.vjp(ring_attn, ring_kernel, q, k, v, segment_ids)
       out_ref, out_vjp_ref = jax.vjp(
-          ring_attn_ref, q, k, v, None, mask[:, :], segment_ids
+          ring_attn_ref, q, k, v, mask[:, :], segment_ids
       )
       self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
 
       _, dq, dk, dv, _ = out_vjp(do)
-      dq_ref, dk_ref, dv_ref, _, _, _ = out_vjp_ref(do.astype(jnp.float32))
+      dq_ref, dk_ref, dv_ref, _, _ = out_vjp_ref(do.astype(jnp.float32))
 
       self._assert_allclose(dq, dq_ref, rtol=1e-2, atol=1e-2)
       self._assert_allclose(dk, dk_ref, rtol=1e-2, atol=1e-2)

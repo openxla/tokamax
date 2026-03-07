@@ -143,12 +143,10 @@ class SplashAttentionShardingTest(PallasBaseTest):
         check_vma=False,
     )
     def f(kernel, q, k, v, segment_ids):
-      return kernel(q, k, v, bias=None, segment_ids=segment_ids)
+      return kernel(q, k, v, segment_ids)
 
     out = f(kernel, q, k, v, segment_ids)
-    out_ref = base.attention_reference(
-        q, k, v, None, mask, segment_ids, is_mqa=False
-    )
+    out_ref = base.attention_reference(q, k, v, mask, segment_ids, is_mqa=False)
     self._assert_allclose(out, out_ref, rtol=5e-3, atol=3e-3)
 
   @parameterized.product(
@@ -232,17 +230,17 @@ class SplashAttentionShardingTest(PallasBaseTest):
         check_vma=False,
     )
     def f(kernel, q, k, v, segment_ids):
-      return kernel(q, k, v, bias=None, segment_ids=segment_ids)
+      return kernel(q, k, v, segment_ids)
 
     f_ref = partial(base.attention_reference, is_mqa=False)
 
     out, out_vjp = jax.vjp(f, kernel, q, k, v, segment_ids)
-    out_ref, out_vjp_ref = jax.vjp(f_ref, q, k, v, None, mask, segment_ids)
+    out_ref, out_vjp_ref = jax.vjp(f_ref, q, k, v, mask, segment_ids)
     self._assert_allclose(out, out_ref, rtol=5e-3, atol=5e-3)
 
     do = random.uniform(k4, out.shape, dtype=out.dtype)
     _, dq, dk, dv, _ = out_vjp(do)
-    dq_ref, dk_ref, dv_ref, _, _, _ = out_vjp_ref(do.astype(jnp.float32))
+    dq_ref, dk_ref, dv_ref, _, _ = out_vjp_ref(do.astype(jnp.float32))
 
     self._assert_allclose(dq, dq_ref, atol=8e-2, rtol=1e-2)
     self._assert_allclose(dk, dk_ref, atol=8e-2, rtol=2e-2)
