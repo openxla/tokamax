@@ -553,7 +553,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     h_block_size: int = 512,
     v_block_size: int = 2048,
     reduction: Literal["sum", "mean"] = "sum",
-) -> tuple[Real[Array, "B H"], Real[Array, "B V"]]:
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """The pallas kernel implementation of the Linear Softmax Cross-Entropy Loss backward kernel.
 
   The backward pass is also chunking the x, labels and w in all B, H and V

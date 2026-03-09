@@ -55,7 +55,7 @@ def linear_softmax_cross_entropy_loss_bwd_reference(
     w: Real[Array, "H V"],
     *,
     reduction: Literal["sum", "mean"] = "sum",
-) -> tuple[Real[Array, "B H"], Real[Array, "B V"]]:
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """The reference Jax implementation of the linear softmax cross-entropy loss backward kernel."""
   labels_one_hot = jax.nn.one_hot(labels, num_classes=w.shape[1], dtype=x.dtype)
   s = -labels_one_hot + jnp.exp(x @ w - lse[:, None])
