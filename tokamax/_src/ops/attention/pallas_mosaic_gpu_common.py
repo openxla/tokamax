@@ -137,20 +137,23 @@ def warpgroup_barrier():
   plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())()
 
 
-def _bar_operation(operation: str, barrier_id: int | jax.Array, num_threads: int):
+def inline_ptx(asm: str):
+  """Inserts inline PTX assembly."""
+
+  @plgpu.inline_mgpu()
+  def ptx(_):
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"), [], asm, "", has_side_effects=True
+    )
+
+  ptx()
+
+
+def _bar_operation(
+    operation: str, barrier_id: int | jax.Array, num_threads: int
+):
   if isinstance(barrier_id, int):
-
-    @plgpu.inline_mgpu()
-    def bar_op(_):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [],
-          f"bar.{operation} {barrier_id}, {num_threads};",
-          "",
-          has_side_effects=True,
-      )
-
-    bar_op()
+    inline_ptx(f"bar.{operation} {barrier_id}, {num_threads};")
   else:
     @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
     def bar_op(_, barrier_id):
@@ -163,6 +166,7 @@ def _bar_operation(operation: str, barrier_id: int | jax.Array, num_threads: int
       )
 
     bar_op(barrier_id)
+
 
 bar_arrive = functools.partial(_bar_operation, "arrive")
 bar_sync = functools.partial(_bar_operation, "sync")
