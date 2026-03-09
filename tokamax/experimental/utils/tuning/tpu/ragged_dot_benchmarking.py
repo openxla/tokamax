@@ -17,6 +17,9 @@
 # pylint: disable=g-importing-member
 # pylint: disable=g-multiple-import
 
+from itertools import product as iproduct
+from functools import partial
+
 from absl import app
 from absl import flags
 import jax
@@ -86,17 +89,16 @@ def generate_gmm_inputs(
       return jnp.ones(shape, dtype=dtype) / (shape[-1] ** 0.5)
 
   lhs, rhs, dout = init_fn((m, k)), init_fn((g, k, n)), init_fn((m, n))
-  # scale some of the inputs to test scales are mapped properly in quantization
-  lhs = lhs.at[::3, : lhs.shape[1] // 2].set(lhs[::3, : lhs.shape[1] // 2] * 3)
-  rhs = rhs.at[:, :, : rhs.shape[2] // 2].set(
-      rhs[:, :, : rhs.shape[2] // 2] * 10
-  )
   return lhs, rhs, dout
 
 
 # ragged dot variants ##########################################################
-def lax_gmm_fwd(lhs, rhs, group_sizes, tile_m, tile_k, tile_n, **kw):
-  del kw
+jit_wrapper = partial(jax.jit, static_argnames=["tile_m", "tile_k", "tile_n", "input_buffer_count"])
+
+@jit_wrapper
+def lax_gmm_fwd(lhs, rhs, group_sizes, tile_m, tile_k, tile_n,
+                input_buffer_count):
+  del input_buffer_count
   dims = jax.lax.RaggedDotDimensionNumbers(
       (((1,), (1,)), ((), ())),  # (contracting, batch)
       (0,),  # (lhs ragged dims)
@@ -108,8 +110,10 @@ def lax_gmm_fwd(lhs, rhs, group_sizes, tile_m, tile_k, tile_n, **kw):
     return jax.lax.ragged_dot_general(lhs, rhs, group_sizes, dims)
 
 
-def lax_dlhs_bwd(out, rhs, group_sizes, tile_m, tile_k, tile_n, **kw):
-  del kw
+@jit_wrapper
+def lax_dlhs_bwd(out, rhs, group_sizes, tile_m, tile_k, tile_n,
+                 input_buffer_count):
+  del input_buffer_count
   dims = jax.lax.RaggedDotDimensionNumbers(
       (((1,), (1,)), ((), ())),  # (contracting, batch)
       (0,),  # (lhs ragged dims)
@@ -121,8 +125,10 @@ def lax_dlhs_bwd(out, rhs, group_sizes, tile_m, tile_k, tile_n, **kw):
     return jax.lax.ragged_dot_general(out, rhs.mT, group_sizes, dims)
 
 
-def lax_drhs_bwd(lhs, out, group_sizes, tile_m, tile_k, tile_n, **kw):
-  del kw
+@jit_wrapper
+def lax_drhs_bwd(lhs, out, group_sizes, tile_m, tile_k, tile_n,
+                 input_buffer_count):
+  del input_buffer_count
   dims = jax.lax.RaggedDotDimensionNumbers(
       (((0,), (0,)), ((), ())),  # (contracting, batch)
       (0,),  # (lhs ragged dims)
@@ -134,6 +140,7 @@ def lax_drhs_bwd(lhs, out, group_sizes, tile_m, tile_k, tile_n, **kw):
     return jax.lax.ragged_dot_general(lhs, out, group_sizes, dims)
 
 
+@jit_wrapper
 def gmm_fwd(lhs, rhs, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
   config = pallas_mosaic_tpu.Config(
       tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
@@ -147,6 +154,7 @@ def gmm_fwd(lhs, rhs, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
   )
 
 
+@jit_wrapper
 def dlhs_bwd(out, rhs, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
   config = pallas_mosaic_tpu.Config(
       tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
@@ -160,10 +168,12 @@ def dlhs_bwd(out, rhs, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
   )
 
 
+@jit_wrapper
 def drhs_bwd(lhs, out, group_sizes, tile_m, tile_k, tile_n, input_buffer_count):
   config = pallas_mosaic_tpu.Config(
       tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
       input_buffer_count=input_buffer_count,
+      combine_scopes=True,  # for tgmm we probably always want this
   )
   return pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)(
       lhs,
@@ -210,13 +220,31 @@ def run_benchmark(
   divs = set([k, k // 2, k // 4]) | set([n, n // 2, n // 4])
   divs = set(map(_ceil, divs))
   hyperparams = {
-      "tile_m": list(set(map(_ceil, [128, 256, 512, 1024, 2048, 4096]))),
+      "tile_m": list(set(map(_ceil, [128, 256, 512]))),
       "tile_k": list(set(map(_ceil, [256, 512, 1024, 2048])) | divs | set([k])),
       "tile_n": list(
           set(map(_ceil, [256, 512, 1024, 2048, n])) | divs | set([n])
       ),
-      "input_buffer_count": [2, 3],
+      "input_buffer_count": [2, 3, 4],
   }
+
+  hp_keys = sorted(hyperparams)
+  all_combos = list(iproduct(*(hyperparams[k] for k in hp_keys)))
+  np.random.RandomState(0).shuffle(all_combos)
+  selected = set(all_combos[:sample_num])
+  print(f"Sampling {len(selected) / len(all_combos):.2%} or {len(selected)} "
+        "hyperparameter combinations")
+
+  # tune_jax subsamples the cartesian product independently per call, but we
+  # want to share the same subsample across all tune calls. We pre-sample the
+  # space and wrap each function to reject non-selected combos via
+  # NotImplementedError, which tune_jax treats as a skip.
+  def _sampled(fn):
+    def wrapped(*args, **kw):
+      if tuple(kw[k] for k in hp_keys) not in selected:
+        raise NotImplementedError("Skipping sample")
+      return fn(*args, **kw)
+    return wrapped
 
   if qdtype is not None:
     qdtype = jnp.dtype(qdtype)
@@ -230,9 +258,8 @@ def run_benchmark(
   print(f"FWD PASS --- {(m, k, n)=} ----------------------------")
   if "fwd" in modes_to_tune:
     fn_fwd = tune_jax.tune(
-        gmm_fwd,
+        _sampled(gmm_fwd),
         hyperparams=hyperparams,
-        sample_num=sample_num,
         event_filter_regex="gmm",
     )
     _ = fn_fwd(lhs, rhs, gs)
@@ -247,9 +274,8 @@ def run_benchmark(
       print(tune_jax.tabulate(fn_fwd))
 
     lax_fn_fwd = tune_jax.tune(
-        lax_gmm_fwd,
+        _sampled(lax_gmm_fwd),
         hyperparams=hyperparams,
-        sample_num=sample_num,
         event_filter_regex="ragged",
     )
     _ = lax_fn_fwd(lhs, rhs, gs)
@@ -261,9 +287,8 @@ def run_benchmark(
   print("DLHS ----------------------------------------------------------------")
   if "dlhs" in modes_to_tune:
     dlhs_fn = tune_jax.tune(
-        dlhs_bwd,
+        _sampled(dlhs_bwd),
         hyperparams=hyperparams,
-        sample_num=sample_num,
         event_filter_regex="gmm",
     )
     _ = dlhs_fn(dout, rhs, gs)
@@ -278,9 +303,8 @@ def run_benchmark(
       print(tune_jax.tabulate(dlhs_fn))
 
     lax_dlhs_fn = tune_jax.tune(
-        lax_dlhs_bwd,
+        _sampled(lax_dlhs_bwd),
         hyperparams=hyperparams,
-        sample_num=sample_num,
         event_filter_regex="ragged",
     )
     _ = lax_dlhs_fn(dout, rhs, gs)
@@ -292,9 +316,8 @@ def run_benchmark(
   print("DRHS ----------------------------------------------------------------")
   if "drhs" in modes_to_tune:
     drhs_fn = tune_jax.tune(
-        drhs_bwd,
+        _sampled(drhs_bwd),
         hyperparams=hyperparams,
-        sample_num=sample_num,
         event_filter_regex="tgmm",
     )
     _ = drhs_fn(lhs, dout, gs)
@@ -309,9 +332,8 @@ def run_benchmark(
       print(tune_jax.tabulate(drhs_fn))
 
     lax_drhs_fn = tune_jax.tune(
-        lax_drhs_bwd,
+        _sampled(lax_drhs_bwd),
         hyperparams=hyperparams,
-        sample_num=sample_num,
         event_filter_regex="ragged",
     )
     _ = lax_drhs_fn(lhs, dout, gs)
@@ -322,7 +344,7 @@ def run_benchmark(
   # pytype: disable=name-error
   with jax.profiler.trace("/tmp/ragged_dot_benchmark"):
     if "fwd" in modes_to_tune:
-      for _ in range(2):
+      for _ in range(3):
         jax.block_until_ready(fn_fwd(lhs, rhs, gs))
       for _ in range(3):
         jax.block_until_ready(lax_fn_fwd(lhs, rhs, gs))
@@ -338,7 +360,7 @@ def run_benchmark(
         jax.block_until_ready(lax_drhs_fn(lhs, dout, gs))
   # pytype: enable=name-error
   print("######### XPROF URL HERE #########")
-  print("Run `xprof --logdir /tmp/ragged_dot_benchmark`")
+  print("Results at /tmp/ragged_dot_benchmark")
   print("######### XPROF URL HERE #########", flush=True)
 
   # pytype: disable=name-error
@@ -351,7 +373,6 @@ def run_benchmark(
     print(f"DLHS: {dlhs_fn.optimal_hyperparams=}")
   if "drhs" in modes_to_tune:
     print(f"DRHS: {drhs_fn.optimal_hyperparams=}")
-  print(f"Xprof url: {url}")
   print("------------------------------------------------------------")
   # pytype: enable=attribute-error
   # pytype: enable=name-error
