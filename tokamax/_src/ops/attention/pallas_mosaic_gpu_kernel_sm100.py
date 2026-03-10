@@ -15,6 +15,7 @@
 """B200 Flash attention with Mosaic GPU."""
 
 import functools
+import itertools
 import math
 
 import jax
@@ -242,6 +243,11 @@ def flash_attention_kernel(
   collective_axis = "x" if collective else None
   softmax_slots = 2
 
+  epi_tile_d = 1024 // common.num_bits(out_dtype)
+  if head_dim_out % epi_tile_d != 0:
+    epi_tile_d = head_dim_out
+  num_epi_slots = min(2, head_dim_out // epi_tile_d)
+
   def kernel(
       q_gmem,
       k_gmem,
@@ -251,7 +257,7 @@ def flash_attention_kernel(
       k_end_gmem,
       k_start_minmax_gmems,
       k_end_minmax_gmems,
-      out_gmem,
+      o_gmem,
       *residual_gmems,
       qo_smem_union,
       k_smem,
@@ -629,20 +635,24 @@ def flash_attention_kernel(
         for i in range(num_tma_splits):
           plgpu.barrier_arrive(out_scaled_barrier.at[i])
 
+      def two_in_flight(iterable):
+        for a, _ in itertools.pairwise(itertools.chain(iterable, [None])):  # pytype: disable=wrong-arg-types
+          yield a
+
       @pl.loop(lb + 1, ub)
       def kv_loop(ki):
         slot = lax.rem(ki - lb, softmax_slots)
 
         plgpu.barrier_wait(pv_mma_barrier)
-        block_d = 32
-        rd_pos = 0
-        ds = pl.ds(rd_pos, block_d)
-        acc = acc_next = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
-        rd_pos += block_d
-        if rd_pos < head_dim_out:
-          ds = pl.ds(rd_pos, block_d)
-          acc_next = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
-          rd_pos += block_d
+        tile_d = 32
+
+        def load_acc_tiles():
+          for d_base in range(0, head_dim_out, tile_d):
+            ds = pl.ds(d_base, tile_d)
+            yield ds, plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
+
+        acc_tiles = two_in_flight(load_acc_tiles())
+        ds, acc = next(acc_tiles)
         common.bar_sync(slot + _ALPHA_BARRIER_OFFSET, num_threads=256)
         alpha = plgpu.load(alpha_smem, slot, layout=_TMEM_ROW)
         needs_rescale = (
@@ -663,25 +673,19 @@ def flash_attention_kernel(
           warp_val = nvvm.vote_sync(i1, mask, thread_val, "any")
           return mgpu.FragmentedArray.splat(warp_val, (), is_signed=False)
 
-        def rescale_acc(rd_pos=rd_pos, acc=acc, acc_next=acc_next):
-          wr_pos = 0
+        def rescale_acc(ds=ds, acc=acc):
           for i in range(num_tma_splits):
-            for _ in range(0, head_dim_out // num_tma_splits, block_d):
+            for _ in range(0, head_dim_out // num_tma_splits, tile_d):
               acc = jnp.where(
                   lax.broadcast_in_dim(needs_rescale, acc.shape, [0]),
                   acc * lax.broadcast_in_dim(alpha, acc.shape, [0]),
                   acc,
               )
-              ds = pl.ds(wr_pos, block_d)
               plgpu.async_store_tmem(acc_tmem.at[:, ds], acc)
-              wr_pos += block_d
-
-              acc = acc_next
-              if rd_pos < head_dim_out:
-                acc_next = plgpu.async_load_tmem(
-                    acc_tmem.at[:, pl.ds(rd_pos, block_d)], layout=_TMEM
-                )
-                rd_pos += block_d
+              try:
+                ds, acc = next(acc_tiles)
+              except StopIteration:
+                break
 
             plgpu.commit_tmem()
             plgpu.barrier_arrive(out_scaled_barrier.at[i])
@@ -700,6 +704,8 @@ def flash_attention_kernel(
           lax.cond(rescale_warp, rescale_acc, no_rescale)
 
       with jax.named_scope("epilogue"):
+        num_d_tiles = head_dim_out // epi_tile_d
+        o_gmem_ = o_gmem.at[qs, hi]
 
         def write_acc():
           if normalize_output:
@@ -708,22 +714,42 @@ def flash_attention_kernel(
             l_rcp = 1.0 / (l_i + float(jnp.finfo(jnp.float32).tiny))
             l_rcp = lax.broadcast_in_dim(l_rcp, acc_tmem.shape, [0])
           else:
-            l_rcp = 1.0
+            l_rcp = lax.broadcast_in_dim(1.0, acc_tmem.shape, [])
           plgpu.barrier_wait(pv_mma_barrier)
 
-          acc = plgpu.async_load_tmem(acc_tmem, layout=_TCGEN05)
-          o_smem[...] = (acc * l_rcp).astype(o_smem.dtype)
+          def load_acc_tiles():
+            for di in range(num_d_tiles):
+              si = lax.rem(di, num_epi_slots)
+              ds = slice(di * epi_tile_d, (di + 1) * epi_tile_d)
+              acc = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TCGEN05)
+              yield ds, si, acc
+
+          acc_tiles = two_in_flight(load_acc_tiles())
+          for i, (ds, si, acc) in enumerate(acc_tiles):
+            acc = (acc * l_rcp[:, ds]).astype(o_smem.dtype)
+            if i >= num_epi_slots:
+              plgpu.wait_smem_to_gmem(num_epi_slots - 1, wait_read_only=True)
+            o_smem[si] = acc
+            plgpu.commit_smem()
+            plgpu.copy_smem_to_gmem(o_smem.at[si], o_gmem_.at[:, ds])
 
         def write_zeros():
           if return_residuals:
             m_gmem, l_gmem = residual_gmems
             m_gmem[...] = jnp.full_like(m_gmem, -jnp.inf)
             l_gmem[...] = jnp.zeros_like(l_gmem)
-          o_smem[...] = plgpu.layout_cast(jnp.zeros_like(o_smem), _TCGEN05)
+
+          o_smem[0] = plgpu.layout_cast(jnp.zeros_like(o_smem.at[0]), _TCGEN05)
+          plgpu.commit_smem()
+
+          for di in range(num_d_tiles):
+            ds = slice(di * epi_tile_d, (di + 1) * epi_tile_d)
+            plgpu.copy_smem_to_gmem(
+                o_smem.at[0], o_gmem_.at[:, ds], commit_group=False
+            )
+          plgpu.commit_smem_to_gmem_group()
 
         lax.cond(ub > lb, write_acc, write_zeros)
-        plgpu.commit_smem()
-        plgpu.copy_smem_to_gmem(o_smem, out_gmem.at[qs, hi])
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
   def pre_reduce_k_range_per_qtile(range_ref):
@@ -769,7 +795,7 @@ def flash_attention_kernel(
       ),
       k.dtype,
   )
-  o_scratch = tiled_smem((block_q, head_dim_out), q.dtype)
+  o_scratch = tiled_smem((num_epi_slots, block_q, epi_tile_d), out_dtype)
   if normalize_output:
     li_scratch = plgpu.SMEM((block_q,), jnp.float32)
   else:
