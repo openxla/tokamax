@@ -219,9 +219,8 @@ def flash_attention_kernel(
 
   min_mask_cols = 128 // _MASK_PACKED_BITS
   if mask is None:
-    apply_bool_mask = use_2d_bool_mask = bcast_mask_q = False
+    use_2d_bool_mask = bcast_mask_q = False
   else:
-    apply_bool_mask = True
     bcast_mask_q = mask.shape[-2] == 1
     bcast_mask_k = mask.shape[-1] == 1
     use_2d_bool_mask = not (bcast_mask_q or bcast_mask_k)
@@ -271,7 +270,7 @@ def flash_attention_kernel(
       q_barrier,
       k_barrier,
       v_barrier,
-      mask_produced_barrier,
+      mask_barrier,
       mask_consumed_barrier,
       qk_mma_barrier,
       k_consumed_barrier,
@@ -380,7 +379,7 @@ def flash_attention_kernel(
               v_gmem, v_smem, v_barrier, v_consumed_barrier, partitioned_axis=1
           )
 
-        if use_2d_bool_mask:
+        if mask_smem is not None:
 
           @pl.when(warp_id == _TMA_LOAD_MASK_WARP)
           def tma_load_mask_warp():
@@ -389,7 +388,7 @@ def flash_attention_kernel(
               hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
               ks = pl.ds(ki * mask_block_kv, max(mask_block_kv, min_mask_cols))
               plgpu.copy_gmem_to_smem(
-                  mask_gmem.at[hi_, qs, ks], mask_smem, mask_produced_barrier
+                  mask_gmem.at[hi_, qs, ks], mask_smem, mask_barrier
               )
               plgpu.barrier_wait(mask_consumed_barrier)
               common.fence_async_shared_cta()
@@ -471,94 +470,52 @@ def flash_attention_kernel(
       k_start = None if k_start_gmem is None else load_k_range(k_start_gmem)
       k_end = None if k_end_gmem is None else load_k_range(k_end_gmem)
 
-      def need_apply_k_range_mask(ki):
-        need_apply = False
-        if not use_k_ranges:
-          return need_apply
-        k_base = ki * block_kv
-        if k_end is not None:
-          need_apply = jnp.logical_or(need_apply, k_base + block_kv > k_end_min)
-        if k_start is not None:
-          need_apply = jnp.logical_or(need_apply, k_base < k_start_max)
-        return need_apply
+      def needs_k_range_mask(ki):
+        needs_apply = False
+        if k_end_min is not None:
+          needs_apply |= ki * block_kv + block_kv > k_end_min
+        if k_start_max is not None:
+          needs_apply |= ki * block_kv < k_start_max
+        return needs_apply
 
-      def compute_qk_mask(ki, do_causal):
+      def compute_mask(ki, do_causal):
+        k_base = ki * block_kv
         acc_shape = (block_q, block_kv)
-        if not (do_causal or apply_bool_mask or use_k_ranges):
-          # not mask needed
-          return None
         iota = lambda d: plgpu.broadcasted_iota(
             jnp.int32, acc_shape, dimension=d, layout=_TMEM
         )
-        if use_2d_bool_mask:
-          plgpu.barrier_wait(mask_produced_barrier)
-          mask_smem_ref = mask_smem.at[:, pl.ds(0, mask_block_kv)]
-          mask = plgpu.load(
-              mask_smem_ref,
-              (),
-              layout=_TMEM(32 // _MASK_PACKED_BITS),
-              optimized=False,
-          )
-          plgpu.barrier_arrive(mask_consumed_barrier)
-          mask = common.unpack_bool_bits_tmem_native(mask)
+
+        if do_causal:
+          mask = (q_base + iota(0)) >= (k_base + iota(1))
         else:
           mask = plgpu.layout_cast(jnp.ones(acc_shape, dtype=jnp.bool_), _TMEM)
 
-        if do_causal:
-          mask &= (iota(0) + q_base) >= (iota(1) + ki * block_kv)
-        if apply_bool_mask and not use_2d_bool_mask:
-          hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
-          if bcast_mask_q:
-            idx = (hi_, 0, pl.ds(ki * block_kv, block_kv))
-            layout = _TMEM_COL
+        if mask_gmem is not None:
+          if mask_smem is None:
+            ks = pl.ds(k_base, block_kv)
+            # TODO: we need to handle Q masks differently
+            # broadcasting & using them the way it is done is extremely slow
+            mask &= common.load_bcast(mask_gmem, (hi, qs, ks), layout=_TMEM)
           else:
-            idx = (hi_, qs, 0)
-            layout = _TMEM_ROW
+            plgpu.barrier_wait(mask_barrier)
+            idx = (slice(None), slice(0, mask_block_kv))
+            layout = _TMEM(32 // _MASK_PACKED_BITS)
+            mask_ = plgpu.load(mask_smem, idx, layout=layout, optimized=False)
+            plgpu.barrier_arrive(mask_consumed_barrier)
+            mask &= common.unpack_bool_bits_tmem_native(mask_)
 
-          mask_vector = plgpu.load(
-              mask_gmem, idx, layout=layout, optimized=False
-          )
-          bc_dim = 1 if bcast_mask_q else 0
-          # TODO: we need to handle Q masks differently
-          # broadcasting & using them the way it is done is extremely slow
-          mask &= plgpu.layout_cast(
-              lax.broadcast_in_dim(mask_vector, acc_shape, (bc_dim,)),
-              _TMEM,
-          )
+        def k_range_mask(mask):
+          bc_range = lambda x: lax.broadcast_in_dim(x, mask.shape, (0,))
+          if k_start_gmem is not None:
+            mask &= (k_base + iota(1)) >= bc_range(k_start)
+          if k_end_gmem is not None:
+            mask &= (k_base + iota(1)) < bc_range(k_end)
+          return mask
 
-        if use_k_ranges:
-
-          def _krange_mask(mask):
-            bc_range = lambda x: lax.broadcast_in_dim(x, acc_shape, (0,))
-            block_kv_iota = iota(1) + (ki * block_kv)
-
-            if k_start_gmem is not None:
-              mask &= bc_range(k_start) <= block_kv_iota
-            if k_end_gmem is not None:
-              mask &= bc_range(k_end) > block_kv_iota
-            return mask
-
-          mask = lax.cond(
-              need_apply_k_range_mask(ki),
-              lambda: _krange_mask(mask),
-              lambda: mask,
-          )
-        return mask
-
-      def maybe_apply_mask(s, scale, ki, *, do_causal):
-        if not (apply_bool_mask or use_k_ranges or do_causal):
-          return s, scale
-        need_apply_mask = jnp.logical_or(
-            do_causal or apply_bool_mask, need_apply_k_range_mask(ki)
+        mask = lax.cond(
+            needs_k_range_mask(ki), lambda: k_range_mask(mask), lambda: mask
         )
-        compute_mask_fn = lambda: jnp.where(
-            compute_qk_mask(ki, do_causal), 0, _DEFAULT_MASK_VALUE
-        )
-        return lax.cond(
-            need_apply_mask,
-            lambda: (s * scale + compute_mask_fn(), 1.0),
-            lambda: (s, scale),
-        )
+        return jnp.where(mask, 0, _DEFAULT_MASK_VALUE)
 
       def kv_loop(ki, carry, *, do_causal=False):
         m_scale, m_i, l_i = carry
@@ -576,7 +533,11 @@ def flash_attention_kernel(
 
         with jax.named_scope("softmax"):
           scale *= math.log2(math.e)
-          s, scale = maybe_apply_mask(s, scale, ki, do_causal=do_causal)
+          s, scale = lax.cond(
+              do_causal or mask_gmem is not None or needs_k_range_mask(ki),
+              lambda: (s * scale + compute_mask(ki, do_causal), 1.0),
+              lambda: (s, scale),
+          )
           m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
           alpha = jnp.exp2(m_scale - m_i)
 
@@ -808,6 +769,13 @@ def flash_attention_kernel(
       num_barriers=num_stages * num_tma_splits, orders_tensor_core=True
   )
 
+  if use_2d_bool_mask:
+    mask_scratch = plgpu.SMEM(
+        (block_q, max(mask_block_kv, min_mask_cols)), _MASK_PACK_DTYPE
+    )
+  else:
+    mask_scratch = None
+
   def tmem(shape, dtype=jnp.float32, **kwargs):
     return plgpu.TMEM(shape, dtype, collective=collective, **kwargs)
 
@@ -820,9 +788,7 @@ def flash_attention_kernel(
       qo_smem_union=plgpu.RefUnion(q_scratch, o_scratch),
       k_smem=k_scratch,
       v_smem=v_scratch,
-      mask_smem=plgpu.SMEM(
-          (block_q, max(mask_block_kv, min_mask_cols)), _MASK_PACK_DTYPE
-      ),
+      mask_smem=mask_scratch,
       alpha_smem=plgpu.SMEM((softmax_slots, block_q), jnp.float32),
       li_smem=li_scratch,
       qk_acc_tmem=tmem((block_q, block_kv)),
@@ -831,8 +797,8 @@ def flash_attention_kernel(
       q_barrier=plgpu.Barrier(),
       k_barrier=kv_barrier,
       v_barrier=kv_barrier,
-      mask_produced_barrier=plgpu.Barrier(),
-      mask_consumed_barrier=plgpu.Barrier(),
+      mask_barrier=None if mask_scratch is None else plgpu.Barrier(),
+      mask_consumed_barrier=None if mask_scratch is None else plgpu.Barrier(),
       qk_mma_barrier=plgpu.Barrier(orders_tensor_core=True),
       k_consumed_barrier=kv_consumed_barrier,
       qk_consumed_barrier=maybe_cluster_barrier(),
