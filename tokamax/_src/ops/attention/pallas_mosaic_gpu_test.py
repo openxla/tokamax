@@ -65,7 +65,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
     if gpu_utils.is_sm100():
       supports_bias = False
-      supports_f32_inputs = False  # TODO: Investigate Forge OOMs.
 
     if get_value(attention_fn) is None:
       vjp = fa_vjp.PallasMosaicGpuFlashAttentionVjp(
