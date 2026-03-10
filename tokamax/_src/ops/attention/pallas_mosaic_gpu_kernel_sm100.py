@@ -386,6 +386,7 @@ def flash_attention_kernel(
                   mask_gmem.at[hi_, qs, ks], mask_smem, mask_produced_barrier
               )
               plgpu.barrier_wait(mask_consumed_barrier)
+              common.fence_async_shared_cta()
 
         @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
         def mma_warp():
@@ -492,9 +493,8 @@ def flash_attention_kernel(
               layout=_TMEM(32 // _MASK_PACKED_BITS),
               optimized=False,
           )
-          mask = common.unpack_bool_bits_tmem_native(mask)
-          plgpu.commit_smem()
           plgpu.barrier_arrive(mask_consumed_barrier)
+          mask = common.unpack_bool_bits_tmem_native(mask)
         else:
           mask = plgpu.layout_cast(jnp.ones(acc_shape, dtype=jnp.bool_), _TMEM)
 

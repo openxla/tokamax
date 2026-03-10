@@ -24,6 +24,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import llvm
+from jaxlib.mlir.dialects import nvvm
 from jaxlib.mlir.dialects import vector
 import numpy as np
 import pydantic
@@ -135,6 +136,12 @@ def tile_swizzle_transforms(
 
 def warpgroup_barrier():
   plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())()
+
+
+@plgpu.inline_mgpu()
+def fence_async_shared_cta(_):
+  space = nvvm.SharedSpace.shared_cta
+  nvvm.fence_proxy(nvvm.ProxyKind.async_shared, space=space)
 
 
 def _bar_operation(operation: str, barrier_id: int | jax.Array, num_threads: int):
