@@ -89,7 +89,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         ),
     )
     self._supports_decode = get_value(supports_decode)
-    self._supports_f32_inputs =  get_value(supports_f32_inputs)
+    self._supports_f32_inputs = get_value(supports_f32_inputs)
 
   def _run_test_with_inputs(self, q, k, v, *, bias=None, **kwargs):
     # PallasMosaicGpuFlashAttention doesn't support high precisions and
@@ -113,7 +113,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
     # This backend casts to bfloat16 internally, so we recast inputs to bfloat16
     # and back to avoid precision loss with the reference implementation.
-    q, k, v, bias = map(recast, (q, k, v, bias))
+    q, k, v = map(recast, (q, k, v))
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045)
     kwargs["atol_grads"] = None if bias is None else 0.02
