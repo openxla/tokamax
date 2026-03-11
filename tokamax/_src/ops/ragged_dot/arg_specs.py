@@ -89,6 +89,14 @@ def _make_maxtext_spec(name_prefix, num_groups, *, m, n, k) -> arg_spec.ArgSpec:
 
 
 ARG_SPECS = (
+    _make_maxtext_spec('deepseek-v3', 256, m=131072, n=1024, k=7168),
+    _make_maxtext_spec('deepseek-v3', 256, m=131072, n=7168, k=1024),
+    _make_maxtext_spec('deepseek-v3', 256, m=131072, n=512, k=7168),
+    _make_maxtext_spec('deepseek-v3', 256, m=131072, n=7168, k=512),
+    _make_maxtext_spec('deepseek-v3', 256, m=262144, n=512, k=7168),
+    _make_maxtext_spec('deepseek-v3', 256, m=262144, n=7168, k=256),
+    _make_maxtext_spec('deepseek-v3', 256, m=262144, n=7168, k=1024),
+    _make_maxtext_spec('deepseek-v3', 256, m=262144, n=1024, k=7168),
     _make_maxtext_spec('deepseek-v3', 256, m=262144, n=2048, k=7168),
     _make_maxtext_spec('gpt-oss', 128, m=327680, n=2880, k=2880),
     _make_maxtext_spec('gpt-oss', 128, m=393216, n=768, k=2048),
