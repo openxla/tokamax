@@ -244,6 +244,7 @@ benchmarks {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_multiplication.py" }
     action_inputs { key: "python_version" value: "3.11" }
+    action_inputs { key: "extras" value: "bench" }
   }
 
   environment_configs {
@@ -275,7 +276,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/default/forward"
+    name: "triangle_multiplication/n_384/default/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/default/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -283,7 +291,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/default/forward_and_vjp"
+    name: "triangle_multiplication/n_384/default/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/default/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -291,7 +306,14 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/xla/forward"
+    name: "triangle_multiplication/n_384/xla/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/xla/forward"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -299,7 +321,154 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/xla/forward_and_vjp"
+    name: "triangle_multiplication/n_384/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/xla/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "triangle_multiplication/n_384/cuequivariance/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/cuequivariance/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "triangle_multiplication/n_384/cuequivariance/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    name: "triangle_multiplication/n_768/cuequivariance/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+}
+
+benchmarks {
+  name: "tokamax_ragged_dot"
+  description: "Runs the Tokamax ragged_dot benchmark."
+  owner: "Tokamax Team"
+  update_frequency_policy: QUARTERLY
+  workload {
+    action: "./ml_actions/benchmarking/actions/workload_executors/python"
+    action_inputs { key: "script_path" value: "tokamax/benchmarks/ragged_dot.py" }
+    action_inputs { key: "python_version" value: "3.11" }
+  }
+
+  environment_configs {
+    id: "GPU_H100"
+    runner_label: "linux-x86-a3-8g-h100-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
+    # Disable 'xla' as this OOM on GPU.
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla" }
+  }
+
+  environment_configs {
+    id: "GPU_B200"
+    runner_label: "linux-x86-a4-224-b200-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
+    # Disable 'xla' as this OOM on GPU.
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla,None,mosaic" }
+  }
+
+  environment_configs {
+    id: "TPUv6e"
+    runner_label: "linux-x86-ct6e-44-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton" }
+  }
+
+  environment_configs {
+    id: "TPUv7"
+    runner_label: "linux-x86-tpu7x-56-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton" }
+  }
+
+  metrics {
+    name: "ragged_dot/default/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/default/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/triton/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/triton/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/mosaic/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/mosaic/forward_and_vjp"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/xla/forward"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "ragged_dot/xla/forward_and_vjp"
     unit: "ms"
     stats {
       stat: MEDIAN
