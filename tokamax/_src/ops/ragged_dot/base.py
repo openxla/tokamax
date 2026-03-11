@@ -60,7 +60,7 @@ _STATIC = dataclasses.field(metadata=dict(static=True))
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True, slots=True, init=False)
 class GroupSizes:
   """A group sizes array with representative values.
 
@@ -69,54 +69,105 @@ class GroupSizes:
   will vary from one step to the next). Instead, we serialize a representative
   distribution of group sizes. This allows `ragged_dot` to be benchmarked /
   autotuned with representative data.
+
+  Attributes:
+    value: The group sizes array.
+    representative_value_or_total_size: Either a representative value (sequence
+      of group sizes), or the total size (sum of group sizes). If an integer,
+      the representative value is generated from the total size and the number
+      of groups using `generate_group_sizes` with uniform probabilities.
   """
 
-  value: jax.Array | jax.ShapeDtypeStruct
-  representative_value: Sequence[int] = _STATIC
+  value: jax.Array | np.ndarray
+  representative_value_or_total_size: Sequence[int] | int = _STATIC
 
-  def __post_init__(self):
-    (num_groups,) = self.value.shape
-    representative_value = tuple(self.representative_value)
-
-    if len(representative_value) != num_groups:
-      raise ValueError(
-          "Representative value must have the same length as the group sizes."
-      )
-
-    if not isinstance(self.value, jax.Array):
-      value = np.asarray(representative_value, np.int32)
-      object.__setattr__(self, "value", value)
-
-    if not np.issubdtype(self.value.dtype, np.integer):
+  def __init__(
+      self,
+      value: jax.Array | np.ndarray | jax.ShapeDtypeStruct,
+      representative_value_or_total_size: Sequence[int] | int,
+  ):
+    if not np.issubdtype(value.dtype, np.integer):
       raise ValueError("Group sizes must be integers.")
 
-    object.__setattr__(self, "representative_value", representative_value)
+    (num_groups,) = value.shape
+    repr_value_or_total_size = representative_value_or_total_size
 
-  def __jax_array__(self):
-    return self.value
+    if not isinstance(repr_value_or_total_size, int):
+      if len(repr_value_or_total_size) != num_groups:
+        raise ValueError(
+            "Representative value must have same length as the group sizes."
+        )
+      repr_value_or_total_size = tuple(repr_value_or_total_size)
+
+    if not isinstance(value, (jax.Array, np.ndarray)):
+      if isinstance(repr_value_or_total_size, int):
+        m = repr_value_or_total_size
+        representative_value = generate_group_sizes(m=m, num_groups=num_groups)
+      else:
+        representative_value = repr_value_or_total_size
+
+      value = np.asarray(representative_value, value.dtype)
+
+    object.__setattr__(self, "value", value)
+    object.__setattr__(
+        self, "representative_value_or_total_size", repr_value_or_total_size
+    )
+
+  @property
+  def representative_value(self) -> tuple[int, ...]:
+    """The representative value."""
+    if isinstance(self.representative_value_or_total_size, int):
+      assert isinstance(self.value, np.ndarray)
+      return tuple(map(int, self.value))
+    return self.representative_value_or_total_size  # pytype: disable=bad-return-type
+
+  def __jax_array__(self) -> jax.Array:
+    return jnp.asarray(self.value)
 
   def __eq__(self, other) -> bool:
-    return isinstance(other, GroupSizes) and (
-        self.representative_value == other.representative_value
+    return (
+        isinstance(other, GroupSizes)
+        and self.value.shape == other.value.shape
+        and self.representative_value_or_total_size
+        == other.representative_value_or_total_size
     )
 
   def __hash__(self) -> int:
-    return hash(self.representative_value)
+    return hash((self.value.shape, self.representative_value_or_total_size))
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
     del handler  # Unused.
     assert source is cls
-    serialize = lambda x: x.representative_value
-    validate = lambda x: cls(jax.ShapeDtypeStruct([len(x)], jnp.int32), x)  # pytype: disable=wrong-arg-types
+
+    def serialize(x: GroupSizes):
+      if isinstance(x.representative_value_or_total_size, int):
+        total_size = x.representative_value_or_total_size
+        return dict(num_groups=x.value.size, total_size=total_size)
+      return x.representative_value
+
+    validate_ints = lambda x: cls(jax.ShapeDtypeStruct([len(x)], jnp.int32), x)  # pytype: disable=wrong-arg-types
     from_ints_schema = cs.chain_schema([
         cs.tuple_schema([cs.int_schema()], variadic_item_index=0),
-        cs.no_info_plain_validator_function(validate),
+        cs.no_info_plain_validator_function(validate_ints),
     ])
+
+    def validate_dict(x: dict[str, int]) -> GroupSizes:
+      return cls(
+          jax.ShapeDtypeStruct([x["num_groups"]], jnp.int32), x["total_size"]
+      )
+
+    from_dict_schema = cs.chain_schema([
+        cs.dict_schema(cs.str_schema(), cs.int_schema()),
+        cs.no_info_plain_validator_function(validate_dict),
+    ])
+
     instance_schema = cs.is_instance_schema(cls)
     return cs.json_or_python_schema(
-        json_schema=from_ints_schema,
-        python_schema=cs.union_schema([instance_schema, from_ints_schema]),
+        json_schema=cs.union_schema([from_ints_schema, from_dict_schema]),
+        python_schema=cs.union_schema(
+            [instance_schema, from_ints_schema, from_dict_schema]
+        ),
         serialization=cs.plain_serializer_function_ser_schema(serialize),
     )
 
@@ -182,11 +233,9 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       group_sizes = tuple(group_sizes)
       group_sizes = GroupSizes(jnp.array(group_sizes, jnp.int32), group_sizes)
 
-    # TODO: Create representative values for other ragged dot dim numbers.
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
       if not isinstance(group_sizes, GroupSizes):
-        representative_sizes = (lhs.shape[0] // rhs.shape[0],) * rhs.shape[0]
-        group_sizes = GroupSizes(group_sizes, representative_sizes)
+        group_sizes = GroupSizes(group_sizes, lhs.shape[0])
 
       if self.checkify_group_sizes:
         gs = group_sizes.value
@@ -226,7 +275,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     lhs, rhs = map(quantization.as_array, (lhs, rhs))
 
     if isinstance(group_sizes, GroupSizes):
-      group_sizes = jnp.array(group_sizes)
+      group_sizes = group_sizes.value
 
     # NOTE: `preferred_element_type` changes the accumulation type when using
     # `jax.lax.Precision`. It would be easier to always convert the precision to

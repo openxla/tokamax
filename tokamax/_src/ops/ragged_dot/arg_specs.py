@@ -66,8 +66,7 @@ def _make_spec(
   else:
     assert len(group_sizes) == num_groups
   group_sizes = base.GroupSizes(
-      jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
-      representative_value=tuple(group_sizes),
+      jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), tuple(group_sizes)
   )
   args = dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
   return arg_spec.ArgSpec(name=name, args=args, project=project, tags=tags)
