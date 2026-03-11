@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
@@ -48,7 +49,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       k: Float[Array | QArray, "*B t h D"],
       v: Float[Array | QArray, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -81,6 +82,9 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       raise NotImplementedError("Paged attention not supported.")
 
     q, k, v = map(quantization.as_array, (q, k, v))
+    precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, precision[0]
+    )
 
     is_causal = False
     if q_indices is None and k_indices is None:
@@ -130,7 +134,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       if mask is not None:
         mask = jnp.broadcast_to(mask, (*mask.shape[:-2], seq_len_q, seq_len_k))
 
-    with jax.default_matmul_precision(str(precision[0])):
+    with jax.default_matmul_precision(str(precision)):
       out = jax.nn.dot_product_attention(
           q,
           k,
