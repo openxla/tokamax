@@ -194,10 +194,6 @@ def flash_attention_kernel(
   if not use_stable_softmax:
     raise NotImplementedError("Unstable softmax not supported on sm100.")
 
-  if out_dtype != q.dtype:
-    # TODO: Support other out_dtypes.
-    raise NotImplementedError(f"{out_dtype=} != {q.dtype=} unsupported.")
-
   q_seq_len, num_q_heads, _ = q.shape
   dtype = q.dtype
 
@@ -728,7 +724,7 @@ def flash_attention_kernel(
   k_start_minmax = pre_reduce_k_range_per_qtile(k_start)
   k_end_minmax = pre_reduce_k_range_per_qtile(k_end)
 
-  out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), q.dtype)]
+  out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:
     residuals_shape = (num_q_heads, pl.cdiv(q_seq_len, tile_q) * tile_q)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2

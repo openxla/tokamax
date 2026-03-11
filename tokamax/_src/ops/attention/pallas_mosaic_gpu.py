@@ -168,7 +168,6 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
     if isinstance(config, ConfigSM100):
       kernel_module = sm100
-      out_dtype = q.dtype
       if use_stable_softmax is base.AUTO:
         # TODO: Support sm100 with unstable softmax.
         use_stable_softmax = True
