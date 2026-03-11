@@ -21,6 +21,7 @@ from jax import export
 import jax.numpy as jnp
 import numpy as np
 import tokamax
+from tokamax._src import version
 from tokamax._src.autotuning import api as autotuning
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp
@@ -105,6 +106,10 @@ class TokamaxTest(absltest.TestCase):
       f_std, args = tokamax.standardize_function(f_grad, x, scale)
       bench: tokamax.BenchmarkData = tokamax.benchmark(f_std, args)
       self.assertGreater(bench.median_evaluation_time_ms, 0.0)
+
+  def test_version(self):
+    self.assertEqual(tokamax.__version__, version.TOKAMAX_VERSION)
+    self.assertEqual(tokamax.__version_info__, version.TOKAMAX_VERSION_INFO)
 
 
 if __name__ == "__main__":
