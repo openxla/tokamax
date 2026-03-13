@@ -16,11 +16,12 @@
 """Test utils for flash loss package."""
 
 import jax
+import jax.numpy as jnp
 from jaxtyping import Array, Integer, Key, Real
 
-
+# TODO: Get rid of this routine.
 def generate_random_data(
-    key: Key, b_dim: int, h_dim: int, v_dim: int
+    key: Key, b_dim: int, h_dim: int, v_dim: int, dtype: jnp.dtype = jnp.float32
 ) -> tuple[Real[Array, "B H"], Integer[Array, "B"], Real[Array, "H V"]]:
   """Generates random data for flash loss tests.
 
@@ -29,6 +30,7 @@ def generate_random_data(
       b_dim: The batch*sequence size.
       h_dim: The hidden size.
       v_dim: The vocabulary size.
+      dtype: The data type of the input data.
 
   Returns:
       A tuple of JAX arrays (x, labels, w) representing the input data.
@@ -37,7 +39,7 @@ def generate_random_data(
       w: A JAX array of shape (h_dim, v_dim) containing random normal data.
   """
   key1, key2, key3 = jax.random.split(key, 3)
-  x = jax.random.normal(key1, (b_dim, h_dim))
+  x = jax.random.normal(key1, (b_dim, h_dim), dtype=dtype)
   labels = jax.random.randint(key2, shape=(b_dim,), minval=0, maxval=v_dim)
-  w = jax.random.normal(key3, (h_dim, v_dim))
+  w = jax.random.normal(key3, (h_dim, v_dim), dtype=dtype)
   return x, labels, w

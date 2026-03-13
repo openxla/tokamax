@@ -37,10 +37,10 @@ def linear_softmax_cross_entropy_loss_fwd_reference(
   lse = jax.nn.logsumexp(logits, axis=-1)
 
   if reduction == "sum":
-    return jnp.sum(loss), lse
+    return jnp.sum(loss, dtype=jnp.float32), lse
   elif reduction == "mean":
     num_tokens = x.shape[0]
-    mean_loss = jnp.sum(loss) / num_tokens
+    mean_loss = jnp.sum(loss, dtype=jnp.float32) / num_tokens
     return mean_loss, lse
   else:
     raise ValueError(f"Unsupported reduction method: {reduction}")

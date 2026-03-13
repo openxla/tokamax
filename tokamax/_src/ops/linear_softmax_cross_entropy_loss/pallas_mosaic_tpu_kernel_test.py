@@ -17,6 +17,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+from tokamax._src import numerics
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu as pallas_mosaic_tpu
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel as kernel
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.reference as reference
@@ -129,12 +130,33 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           v_dim=2048,
           reduction="mean",
       ),
+      dict(
+          testcase_name="fwd_bfloat16_sum_reduction_test",
+          b_dim=4096,
+          h_dim=512,
+          v_dim=2048,
+          reduction="sum",
+          dtype=jnp.bfloat16,
+      ),
+      dict(
+          testcase_name="fwd_float16_mean_reduction_test",
+          b_dim=4096,
+          h_dim=512,
+          v_dim=2048,
+          reduction="mean",
+          dtype=jnp.float16,
+      ),
   )
   def test_kernel_forward_matches_reference(
-      self, b_dim, h_dim, v_dim, reduction
+      self, b_dim, h_dim, v_dim, reduction, dtype=jnp.float32
   ):
-    x, labels, w = test_utils.generate_random_data(
-        jax.random.key(42), b_dim, h_dim, v_dim
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), dtype)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), dtype)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
     )
     config = pallas_mosaic_tpu.get_tpu_specific_default_config(
         b_dim, h_dim, v_dim
@@ -157,8 +179,10 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
         )
     )
 
-    self.assertTrue(jnp.allclose(ref_loss, kernel_loss, atol=1e-4, rtol=1e-4))
-    self.assertTrue(jnp.allclose(ref_lse, kernel_lse, atol=1e-4, rtol=1e-4))
+    atol = 1e-4 if dtype == jnp.float32 else 5e-2
+    rtol = 1e-4 if dtype == jnp.float32 else 5e-2
+    self.assertTrue(jnp.allclose(ref_loss, kernel_loss, atol=atol, rtol=rtol))
+    self.assertTrue(jnp.allclose(ref_lse, kernel_lse, atol=atol, rtol=rtol))
 
   @parameterized.named_parameters(
       dict(
@@ -264,8 +288,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
     config = pallas_mosaic_tpu.get_tpu_specific_default_config(
         b_dim, h_dim, v_dim
     )
-    x, labels, w = test_utils.generate_random_data(
-        jax.random.key(42), b_dim, h_dim, v_dim
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), jnp.float32)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
     )
     lse = jax.nn.logsumexp(x @ w, axis=-1)
 
@@ -317,8 +346,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
     config = pallas_mosaic_tpu.get_tpu_specific_default_config(
         b_dim, h_dim, v_dim
     )
-    x, labels, w = test_utils.generate_random_data(
-        jax.random.key(42), b_dim, h_dim, v_dim
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), jnp.float32)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
     )
     lse = jax.nn.logsumexp(x @ w, axis=-1)
 

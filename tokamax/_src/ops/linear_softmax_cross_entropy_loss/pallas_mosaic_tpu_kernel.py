@@ -73,6 +73,7 @@ def calculate_xw_tiled(
     num_v_blocks,
     h_dim,
     v_dim,
+    preferred_element_type: jnp.dtype,
 ):
   """A kernel block for common logic between forward and backward kernel
 
@@ -108,11 +109,21 @@ def calculate_xw_tiled(
 
   @pl.when(h_index == 0)
   def init_xw():
-    xw_tiled[...] = x_ref[...] @ w_ref[...]
+    xw_tiled[...] = jax.lax.dot_general(
+        x_ref[...],
+        w_ref[...],
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=preferred_element_type,
+    )
 
   @pl.when(h_index != 0)
   def accumulate_xw():
-    xw_tiled[...] += x_ref[...] @ w_ref[...]
+    xw_tiled[...] += jax.lax.dot_general(
+        x_ref[...],
+        w_ref[...],
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=preferred_element_type,
+    )
 
 
 def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
@@ -126,6 +137,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
     reduction: Literal["sum", "mean"],
     h_dim: int,
     v_dim: int,
+    preferred_element_type: jnp.dtype,
 ):
   """Pallas kernel for the forward pass of Linear Softmax Cross-Entropy Loss.
 
@@ -172,6 +184,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       num_v_blocks=num_v_blocks,
       h_dim=h_dim,
       v_dim=v_dim,
+      preferred_element_type=preferred_element_type,
   )
 
   @pl.when(reduce(jnp.logical_and, (b_index == 0, v_index == 0, h_index == 0)))
@@ -219,6 +232,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         "h_block_size",
         "v_block_size",
         "reduction",
+        "preferred_element_type",
     ],
 )
 def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
@@ -230,6 +244,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
     h_block_size: int = 512,
     v_block_size: int = 2048,
     reduction: Literal["sum", "mean"] = "sum",
+    preferred_element_type: jnp.dtype = jnp.float32,
 ) -> tuple[Real[Scalar, ""], Real[Array, "B"]]:
   """The pallas kernel implementation of linear softmax cross-entropy loss.
 
@@ -264,6 +279,11 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
       v_block_size=v_block_size,
   )
 
+  if x.dtype == jnp.float16:
+    x = x.astype(preferred_element_type)
+  if w.dtype == jnp.float16:
+    w = w.astype(preferred_element_type)
+
   h_dim = x.shape[-1]
   v_dim = w.shape[1]
   b_dim = x.shape[0]
@@ -279,6 +299,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
           reduction=reduction,
           h_dim=h_dim,
           v_dim=v_dim,
+          preferred_element_type=preferred_element_type,
       ),
       in_specs=[
           pl.BlockSpec(
@@ -335,6 +356,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     x_write_sem,
     w_write_sem,
     reduction: Literal["sum", "mean"],
+    preferred_element_type: jnp.dtype,
 ):
   """Pallas kernel for the backward pass of Linear Softmax Cross-Entropy Loss.
 
@@ -377,6 +399,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         num_v_blocks=num_v_blocks,
         h_dim=h_dim,
         v_dim=v_dim,
+        preferred_element_type=preferred_element_type,
     )
 
   # When xw_scratch_ref is fully accumulated, use it to calculate gradients
@@ -540,6 +563,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         "h_block_size",
         "v_block_size",
         "reduction",
+        "preferred_element_type",
     ],
 )
 def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
@@ -553,6 +577,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     h_block_size: int = 512,
     v_block_size: int = 2048,
     reduction: Literal["sum", "mean"] = "sum",
+    preferred_element_type: jnp.dtype = jnp.float32,
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """The pallas kernel implementation of the Linear Softmax Cross-Entropy Loss backward kernel.
 
@@ -589,6 +614,11 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
       v_block_size=v_block_size,
   )
 
+  if x.dtype == jnp.float16:
+    x = x.astype(preferred_element_type)
+  if w.dtype == jnp.float16:
+    w = w.astype(preferred_element_type)
+
   v_dim = w.shape[1]
   b_dim = x.shape[0]
   h_dim = x.shape[-1]
@@ -605,6 +635,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
       partial(
           linear_softmax_cross_entropy_loss_backward_pallas_kernel,
           reduction=reduction,
+          preferred_element_type=preferred_element_type,
       ),
       in_specs=[
           pl.BlockSpec(  # dout
