@@ -227,7 +227,9 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
                     ],
                     x_smem.at[slot],
                     x_tma_barrier.at[slot],
-                    partitioned_axis=0 if collective else None,
+                    leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+                    if collective
+                    else None,
                     collective_axes="x" if collective else None,
                 )
 

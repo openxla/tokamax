@@ -322,7 +322,7 @@ def flash_attention_kernel(
       def per_warp():
         warp_id = lax.axis_index("warp")
 
-        def tma_load_kv(gmem, smem, barrier, partitioned_axis, ki, split_idx):
+        def tma_load_kv(gmem, smem, barrier, leader_tracked, ki, split_idx):
           kv_head = lax.div(hi, q_heads_per_kv_head)
           si = lax.rem(ki - lb, num_stages)
           block_d = gmem.shape[-1] // num_tma_splits
@@ -331,15 +331,15 @@ def flash_attention_kernel(
               gmem.at[pl.ds(ki * block_kv, block_kv), kv_head, ds],
               smem.at[si, split_idx],
               barrier=barrier.at[si],
-              partitioned_axis=partitioned_axis if collective else None,
+              leader_tracked=leader_tracked if collective else None,
               collective_axes="x" if collective else None,
           )
 
         def tma_load_kv_warp(
-            gmem, smem, barrier, consumed_barrier, partitioned_axis
+            gmem, smem, barrier, consumed_barrier, leader_tracked
         ):
           tma_load = functools.partial(
-              tma_load_kv, gmem, smem, barrier, partitioned_axis
+              tma_load_kv, gmem, smem, barrier, leader_tracked
           )
 
           @pl.loop(lb, lax.min(lb + num_stages, ub))
@@ -362,17 +362,27 @@ def flash_attention_kernel(
               q_gmem.at[pl.ds(q_base_cluster, tile_q), hi],
               q_smem,
               barrier=q_barrier,
-              partitioned_axis=0 if collective else None,
+              leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+              if collective
+              else None,
               collective_axes=(collective_axis,) if collective else None,
           )
           tma_load_kv_warp(
-              k_gmem, k_smem, k_barrier, k_consumed_barrier, partitioned_axis=0
+              k_gmem,
+              k_smem,
+              k_barrier,
+              k_consumed_barrier,
+              leader_tracked=plgpu.CopyPartition.PARTITIONED(0),
           )
 
         @pl.when(warp_id == _TMA_LOAD_V_WARP)
         def tma_load_v_warp():
           tma_load_kv_warp(
-              v_gmem, v_smem, v_barrier, v_consumed_barrier, partitioned_axis=1
+              v_gmem,
+              v_smem,
+              v_barrier,
+              v_consumed_barrier,
+              leader_tracked=plgpu.CopyPartition.PARTITIONED(1),
           )
 
         if mask_smem is not None:
