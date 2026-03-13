@@ -120,14 +120,18 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
                     x_gmem.at[ms, ks],
                     x_smem.at[si],
                     xw_barrier.at[si],
-                    partitioned_axis=0 if collective else None,
+                    leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+                    if collective
+                    else None,
                     collective_axes=cluster_axis,
                 )
                 plgpu.copy_gmem_to_smem(
                     w_gmem.at[group_id, ns, ks],
                     w_smem.at[si],
                     xw_barrier.at[si],
-                    partitioned_axis=0 if collective else None,
+                    leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+                    if collective
+                    else None,
                     collective_axes=cluster_axis,
                 )
 
