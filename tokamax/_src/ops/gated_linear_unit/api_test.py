@@ -46,8 +46,6 @@ class GatedLinearUnitTest(parameterized.TestCase):
   def test_basic_api(self, implementation, use_tuple_weights):
     if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
-    if implementation == "mosaic":
-      self.skipTest("TODO: Fix and re-enable.")
 
     if not gpu_utils.has_mosaic_gpu_support() and implementation is not None:
       if "mosaic" in implementation:
@@ -94,6 +92,7 @@ class GatedLinearUnitTest(parameterized.TestCase):
           # Ensure either a Triton or Mosaic kernel is used.
           self.assertTrue(
               isinstance(op, api.IMPLEMENTATIONS["triton"].__class__)
+              or isinstance(op, api.IMPLEMENTATIONS["mosaic"].__class__)
           )
       else:
         self.assertIsInstance(op, api.IMPLEMENTATIONS[implementation].__class__)

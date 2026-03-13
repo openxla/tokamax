@@ -25,11 +25,18 @@ from tokamax._src import gpu_utils
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 
-# TODO: Add Pallas-Mosaic-GPU implementation.
-Implementation: TypeAlias = Literal['triton', 'xla']
+Implementation: TypeAlias = Literal['mosaic', 'triton', 'xla']
 
 IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
 _DEFAULT_IMPLEMENTATION = ('xla',)
+
+try:
+  from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pallas_mgpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS['mosaic'] = pallas_mgpu.PallasMosaicGpuGatedLinearUnit()
+  _DEFAULT_IMPLEMENTATION = ('mosaic',) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
 
 try:
   from tokamax._src.ops.gated_linear_unit import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
@@ -38,7 +45,6 @@ try:
   _DEFAULT_IMPLEMENTATION = ('triton',) + _DEFAULT_IMPLEMENTATION
 except ImportError:
   pass
-
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(IMPLEMENTATIONS)

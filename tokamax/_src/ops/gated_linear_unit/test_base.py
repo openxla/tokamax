@@ -48,6 +48,10 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
         if not gpu_utils.has_triton_support():
           self.skipTest("Triton not supported on this platform.")
 
+      if keywords["implementation"] == "mosaic":
+        if not gpu_utils.has_mosaic_gpu_support():
+          self.skipTest("Mosaic not supported on this platform.")
+
       # Currently the MosaicGpuGatedLinearUnit only supports sigmoid and swish
       # activations and no batch dimensions.
       if keywords["implementation"] == "plain_mosaic":
