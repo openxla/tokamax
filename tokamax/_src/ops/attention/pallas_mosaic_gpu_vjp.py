@@ -26,6 +26,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
+from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
@@ -34,6 +35,7 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm100 as sm1
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm90 as sm90
 from typing_extensions import override
 
+CanonicalPrecision = base.CanonicalPrecision
 Config = vjp_common.Config
 Mask = base.Mask
 PagingInfo = base.PagingInfo
@@ -65,7 +67,7 @@ class PallasMosaicGpuFlashAttentionVjp(
       k: Float[Array, "*B t h D"],
       v: Float[Array, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[CanonicalPrecision, CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -130,6 +132,12 @@ class PallasMosaicGpuFlashAttentionVjp(
       raise NotImplementedError(f"Unsupported {precision=}")
 
     q_k_dot_precision, weights_v_dot_precision = precision
+    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, q_k_dot_precision
+    )
+    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+        v.dtype, v.dtype, weights_v_dot_precision
+    )
     # TODO: Avoid silently downcasting types.
     q = cast(q, q_k_dot_precision)
     k = cast(k, q_k_dot_precision)

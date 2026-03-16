@@ -24,14 +24,15 @@ from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
-from tokamax._src import batching
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
+from tokamax._src import precision as precision_lib
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.pallas import block
 from typing_extensions import override
+
 
 Mask = base.Mask
 Residuals = base.Residuals
@@ -502,7 +503,7 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       k: Float[Array, "*B t h D"],
       v: Float[Array, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -553,6 +554,12 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       ds_dtype = self.dbias_intermediate_dtype
 
     q_k_dot_precision, weights_v_dot_precision = precision
+    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, q_k_dot_precision
+    )
+    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+        v.dtype, v.dtype, weights_v_dot_precision
+    )
     f = functools.partial(
         _bwd,
         is_causal=is_causal,
