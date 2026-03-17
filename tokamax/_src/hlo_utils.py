@@ -176,7 +176,7 @@ def _get_common_kernel_info(
   source_file, source_line = _get_source_file_line(op.location)
 
   parent = op.parent
-  while parent.parent is not None:
+  while parent.parent is not None:  # pytype: disable=attribute-error
     parent = parent.parent
 
   # Capture input / output layouts?
@@ -252,14 +252,14 @@ def get_kernel_info(
     op = op.opview
 
     if isinstance(op, stablehlo.CustomCallOp):
-      if (getter := _KERNEL_GETTER.get(op.call_target_name.value)) is not None:
+      if (getter := _KERNEL_GETTER.get(op.call_target_name.value)) is not None:  # pytype: disable=attribute-error
         infos.append(getter(op, call_stack))
     elif isinstance(op, func.CallOp):
-      callee = symbol_table[op.callee.value]
+      callee = symbol_table[op.callee.value]  # pytype: disable=attribute-error
       call_stack = call_stack + (_get_op_name(op.location),)
       callee.operation.walk(functools.partial(handle_op, call_stack=call_stack))
     elif isinstance(op, func.FuncOp):
-      if op.name.value != 'main':
+      if op.name.value != 'main':  # pytype: disable=attribute-error
         return ir.WalkResult.SKIP
     elif (
         include_xla_kernels
