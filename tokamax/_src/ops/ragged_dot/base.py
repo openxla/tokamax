@@ -72,25 +72,24 @@ class GroupSizes:
 
   Attributes:
     value: The group sizes array.
-    representative_value_or_total_size: Either a representative value (sequence
-      of group sizes), or the total size (sum of group sizes). If an integer,
-      the representative value is generated from the total size and the number
-      of groups using `generate_group_sizes` with uniform probabilities.
+    repr_value_or_total_size: Either a representative value (sequence of group
+      sizes), or the total size (sum of group sizes). If an integer, the
+      representative value is generated from the total size and the number of
+      groups using `generate_group_sizes` with uniform probabilities.
   """
 
   value: jax.Array | np.ndarray
-  representative_value_or_total_size: Sequence[int] | int = _STATIC
+  repr_value_or_total_size: Sequence[int] | int = _STATIC
 
   def __init__(
       self,
       value: jax.Array | np.ndarray | jax.ShapeDtypeStruct,
-      representative_value_or_total_size: Sequence[int] | int,
+      repr_value_or_total_size: Sequence[int] | int,
   ):
     if not np.issubdtype(value.dtype, np.integer):
       raise ValueError("Group sizes must be integers.")
 
     (num_groups,) = value.shape
-    repr_value_or_total_size = representative_value_or_total_size
 
     if not isinstance(repr_value_or_total_size, int):
       if len(repr_value_or_total_size) != num_groups:
@@ -110,16 +109,16 @@ class GroupSizes:
 
     object.__setattr__(self, "value", value)
     object.__setattr__(
-        self, "representative_value_or_total_size", repr_value_or_total_size
+        self, "repr_value_or_total_size", repr_value_or_total_size
     )
 
   @property
   def representative_value(self) -> tuple[int, ...]:
     """The representative value."""
-    if isinstance(self.representative_value_or_total_size, int):
+    if isinstance(self.repr_value_or_total_size, int):
       assert isinstance(self.value, np.ndarray)
       return tuple(map(int, self.value))
-    return self.representative_value_or_total_size  # pytype: disable=bad-return-type
+    return self.repr_value_or_total_size  # pytype: disable=bad-return-type
 
   def __jax_array__(self) -> jax.Array:
     return jnp.asarray(self.value)
@@ -128,12 +127,11 @@ class GroupSizes:
     return (
         isinstance(other, GroupSizes)
         and self.value.shape == other.value.shape
-        and self.representative_value_or_total_size
-        == other.representative_value_or_total_size
+        and self.repr_value_or_total_size == other.repr_value_or_total_size
     )
 
   def __hash__(self) -> int:
-    return hash((self.value.shape, self.representative_value_or_total_size))
+    return hash((self.value.shape, self.repr_value_or_total_size))
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
@@ -141,8 +139,8 @@ class GroupSizes:
     assert source is cls
 
     def serialize(x: GroupSizes):
-      if isinstance(x.representative_value_or_total_size, int):
-        total_size = x.representative_value_or_total_size
+      if isinstance(x.repr_value_or_total_size, int):
+        total_size = x.repr_value_or_total_size
         return dict(num_groups=x.value.size, total_size=total_size)
       return x.representative_value
 

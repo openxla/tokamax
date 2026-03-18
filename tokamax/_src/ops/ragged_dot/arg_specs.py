@@ -16,9 +16,9 @@
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.ragged_dot import base
+
 
 SPEC_SHAPES = {
     'compute_bound': (
@@ -30,20 +30,10 @@ SPEC_SHAPES = {
         jnp.bfloat16,
         [4096] + [0] * 7,
     ),
-    'memory_bound': (8, 8, 4096, 4096, jnp.bfloat16, jnp.bfloat16),
+    'memory_bound': (8, 8, 4096, 4096, jnp.bfloat16, jnp.bfloat16, [1] * 8),
     # FIXME: Use correct dtypes.
     '8x7b': (8, 8192, 14336, 4096, jnp.bfloat16, jnp.bfloat16, None, 'mixtral'),
 }
-
-
-def generate_group_sizes(target_m: int, g: int) -> tuple[int, ...]:
-  """Generate group sizes for a given target m."""
-  np.random.seed(0)
-  repr_val = np.random.uniform(size=(g,))
-  repr_val = np.random.binomial(1, 0.9, (g,)) * repr_val
-  repr_val = np.int32((repr_val / np.sum(repr_val)) * target_m)
-  repr_val[0] += target_m - np.sum(repr_val)
-  return tuple(map(int, repr_val))
 
 
 def _make_spec(
@@ -62,18 +52,20 @@ def _make_spec(
   lhs = jax.ShapeDtypeStruct((m, k), lhs_dtype)
   rhs = jax.ShapeDtypeStruct((num_groups, k, n), rhs_dtype)
   if group_sizes is None:
-    group_sizes = [m // num_groups] * num_groups
+    group_sizes = base.GroupSizes(
+        jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), m
+    )
   else:
     assert len(group_sizes) == num_groups
-  group_sizes = base.GroupSizes(
-      jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), tuple(group_sizes)
-  )
+    group_sizes = base.GroupSizes(
+        jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), tuple(group_sizes)
+    )
+
   args = dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
   return arg_spec.ArgSpec(name=name, args=args, project=project, tags=tags)
 
 
 def _make_maxtext_spec(name_prefix, num_groups, *, m, n, k) -> arg_spec.ArgSpec:
-  group_sizes = generate_group_sizes(target_m=m, g=num_groups)
   return _make_spec(
       name=f'{name_prefix}-{m}x{k}_{num_groups}x{k}x{n}',
       num_groups=num_groups,
@@ -82,7 +74,6 @@ def _make_maxtext_spec(name_prefix, num_groups, *, m, n, k) -> arg_spec.ArgSpec:
       k=k,
       lhs_dtype=jnp.bfloat16,
       rhs_dtype=jnp.bfloat16,
-      group_sizes=group_sizes,
       project='maxtext',
       tags=(),
   )
