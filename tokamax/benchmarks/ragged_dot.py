@@ -27,7 +27,6 @@ import jax.numpy as jnp
 from tensorboardX import writer
 import tokamax
 from tokamax import benchmarking
-from tokamax._src.ops.ragged_dot import arg_specs
 
 SummaryWriter = writer.SummaryWriter
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
@@ -47,11 +46,7 @@ EXAMPLE = {
     'lhs': jax.ShapeDtypeStruct((262144, 7168), jnp.bfloat16),
     'rhs': jax.ShapeDtypeStruct((256, 7168, 2048), jnp.bfloat16),
     'group_sizes': tokamax.RaggedDotGroupSizes(
-        jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
-        representative_value=arg_specs.generate_group_sizes(
-            target_m=262144, g=256
-        ),
-    ),
+        jax.ShapeDtypeStruct((256,), dtype=jnp.int32), 262144),
 }
 
 
