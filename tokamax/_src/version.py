@@ -17,7 +17,7 @@
 
 from typing import Final
 
-TOKAMAX_VERSION: Final[str] = "0.0.11"
+TOKAMAX_VERSION: Final[str] = "0.0.12"
 
 
 def _version_as_tuple(version_str: str) -> tuple[int, int, int]:
