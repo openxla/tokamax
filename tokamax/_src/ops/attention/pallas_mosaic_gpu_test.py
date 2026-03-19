@@ -63,9 +63,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     get_value = lambda x: x.value if isinstance(x, _UNSET) else x
     dict_get_value = lambda **x: {k: get_value(v) for k, v in x.items()}
 
-    if gpu_utils.is_sm100():
-      supports_bias = False
-
     if get_value(attention_fn) is None:
       vjp = fa_vjp.PallasMosaicGpuFlashAttentionVjp(
           dbias_intermediate_dtype=jnp.float32
@@ -119,7 +116,9 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     kwargs["atol_grads"] = None if bias is None else 0.02
     kwargs["test_vjp_deterministic"] = not gpu_utils.is_sm100()
 
-    if not impl_kwargs.get("normalize_output", True):
+    if not impl_kwargs.get("normalize_output", True) or (
+        bias is not None and gpu_utils.is_sm100()
+    ):
       kwargs["test_vjp"] = False
 
     test_vjp = kwargs.get("test_vjp", self._supports_vjp)
