@@ -25,7 +25,6 @@ import jax
 import jax.numpy as jnp
 from tensorboardX import writer
 import tokamax
-from tokamax import benchmarking
 
 SummaryWriter = writer.SummaryWriter
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
@@ -75,7 +74,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
       )
 
     example = _get_example(n)
-    fn, args = benchmarking.standardize_function(
+    fn, args = tokamax.standardize_function(
         functools.partial(
             tokamax.triangle_multiplication,
             implementation=implementation,
@@ -84,8 +83,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
         mode=benchmark_mode,  # pytype: disable=wrong-arg-types
     )
     fn = jax.jit(fn)
-    bench = benchmarking.compile_benchmark(fn, args)
-    res = bench(args)
+    res = tokamax.benchmark(fn, args)
     metric_tag = (
         f"triangle_multiplication/{implementation or 'default'}/{benchmark_mode}"
     )

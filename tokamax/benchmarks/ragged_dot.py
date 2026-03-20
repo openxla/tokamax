@@ -26,7 +26,6 @@ import jax
 import jax.numpy as jnp
 from tensorboardX import writer
 import tokamax
-from tokamax import benchmarking
 
 SummaryWriter = writer.SummaryWriter
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
@@ -67,14 +66,13 @@ class RaggedDotBenchmark(parameterized.TestCase):
         implementation=implementation,
     )
 
-    fn, args = benchmarking.standardize_function(
+    fn, args = tokamax.standardize_function(
         ragged_dot_fn,
         kwargs=EXAMPLE,
         mode=benchmark_mode,  # pytype: disable=wrong-arg-types
     )
     fn = jax.jit(fn)
-    bench = benchmarking.compile_benchmark(fn, args)
-    res = bench(args)
+    res = tokamax.benchmark(fn, args)
     metric_tag = f"ragged_dot/{implementation or 'default'}/{benchmark_mode}"
     tblog_dir = os.environ.get(_TENSORBOARD_OUTPUT_ENV_VAR.value)
 

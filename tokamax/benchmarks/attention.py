@@ -25,7 +25,6 @@ import jax
 import jax.numpy as jnp
 from tensorboardX import writer
 import tokamax
-from tokamax import benchmarking
 
 
 SummaryWriter = writer.SummaryWriter
@@ -95,16 +94,15 @@ class AttentionBenchmark(parameterized.TestCase):
       )
 
     example = EXAMPLES[args_spec_name] | {'implementation': implementation}
-    fn, args = benchmarking.standardize_function(
+    fn, args = tokamax.standardize_function(
         tokamax.dot_product_attention,
         kwargs=example,
         mode=benchmark_mode,  # pytype: disable=wrong-arg-types
     )
     fn = jax.jit(fn)
-    bench = benchmarking.compile_benchmark(fn, args)
-    res = bench(args)
+    res = tokamax.benchmark(fn, args)
+    res_wallclock = tokamax.benchmark(fn, args, method='wallclock')
 
-    res_wallclock = bench(args, method='wallclock')
     logging.info(
         'wallclock_median_time_ms: %s', res_wallclock.median_evaluation_time_ms
     )
