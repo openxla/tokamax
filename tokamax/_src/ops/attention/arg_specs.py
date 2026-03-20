@@ -157,6 +157,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
                 'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
             },
             project='alphafold',
+            name='384x384x4x32',
         ),
         arg_spec.ArgSpec(
             args={
@@ -167,6 +168,8 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
                 'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
             },
             project='alphafold',
+            name='384x384x4x64',
+            tags=('mlcompass',),
         ),
         arg_spec.ArgSpec(
             args={
@@ -177,6 +180,8 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
                 'mask': Mask(ShapeDtype((768, 1, 1, 768), bool)),
             },
             project='alphafold',
+            name='768x768x4x64',
+            tags=('mlcompass',),
         ),
     )
     + _flash_attention_v3_specs()
