@@ -36,15 +36,13 @@ def write_tensorboard_logs(
   """
 
   tblog_dir = os.environ.get(tensorboard_output)
+  value = [value] if isinstance(value, float) else value
 
   if tblog_dir:
     try:
       tb_writer = SummaryWriter(log_dir=tblog_dir)
-      if isinstance(value, float):
-        tb_writer.add_scalar(metric_tag, value)
-      else:
-        for i, value in enumerate(value):
-          tb_writer.add_scalar(metric_tag, value, global_step=i)
+      for i, value in enumerate(value):
+        tb_writer.add_scalar(metric_tag, value, global_step=i)
 
       tb_writer.close()
     except (OSError, IOError):

@@ -139,6 +139,22 @@ benchmarks {
   }
 
   metrics {
+    name: "attention/basic/mosaic/forward_and_vjp/autotuning_time"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
+    name: "attention/basic/mosaic/forward_and_vjp/autotuned"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+
+  metrics {
     name: "attention/alphafold/default/forward"
     unit: "ms"
     stats {
@@ -234,15 +250,6 @@ benchmarks {
     }
   }
 
-  metrics {
-    name: "attention/alphafold/mosaic/forward_and_vjp/autotuning_time"
-    unit: "ms"
-  }
-
-  metrics {
-    name: "attention/alphafold/mosaic/forward_and_vjp/autotuned"
-    unit: "ms"
-  }
 }
 
 benchmarks {

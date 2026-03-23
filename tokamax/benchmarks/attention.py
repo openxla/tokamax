@@ -115,7 +115,11 @@ class AttentionBenchmark(parameterized.TestCase):
     )
 
     # Benchmark autotuning for Mosaic.
-    if implementation == 'mosaic' and benchmark_mode == 'forward_and_vjp':
+    if (
+        implementation == 'mosaic'
+        and benchmark_mode == 'forward_and_vjp'
+        and args_spec_name == 'basic'
+    ):
       t1 = time.time()
       autotune_res = tokamax.autotune(fn, args)
       time_autotune = time.time() - t1
