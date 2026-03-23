@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for pallas_triton_kernel.py (forward pass only)."""
+"""Tests for pallas_triton_kernel.py (forward and backward passes)."""
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -125,6 +125,138 @@ class PallasTritonLceFwdKernelTest(parameterized.TestCase):
     self.assertTrue(
         jnp.allclose(ref_lse, kernel_lse, atol=lse_atol, rtol=lse_rtol),
         msg=f"lse mismatch: max_diff={jnp.max(jnp.abs(ref_lse - kernel_lse)):.6f}",
+    )
+
+
+class PallasTritonLceBwdKernelTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "gpu":
+      self.skipTest("GPU-only test.")
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="small_sum",
+          b_dim=64,
+          h_dim=128,
+          v_dim=256,
+          reduction="sum",
+          b_block_size=32,
+          h_block_size=64,
+          v_block_size=128,
+      ),
+      dict(
+          testcase_name="small_mean",
+          b_dim=64,
+          h_dim=128,
+          v_dim=256,
+          reduction="mean",
+          b_block_size=32,
+          h_block_size=64,
+          v_block_size=128,
+      ),
+      dict(
+          testcase_name="medium_sum",
+          b_dim=128,
+          h_dim=256,
+          v_dim=512,
+          reduction="sum",
+          b_block_size=32,
+          h_block_size=64,
+          v_block_size=128,
+      ),
+      dict(
+          testcase_name="medium_mean",
+          b_dim=128,
+          h_dim=256,
+          v_dim=512,
+          reduction="mean",
+          b_block_size=32,
+          h_block_size=64,
+          v_block_size=128,
+      ),
+      dict(
+          testcase_name="bfloat16",
+          b_dim=64,
+          h_dim=128,
+          v_dim=256,
+          reduction="sum",
+          b_block_size=32,
+          h_block_size=64,
+          v_block_size=128,
+          dtype=jnp.bfloat16,
+      ),
+  )
+  def test_backward_matches_reference(
+      self,
+      b_dim,
+      h_dim,
+      v_dim,
+      reduction,
+      b_block_size,
+      h_block_size,
+      v_block_size,
+      dtype=jnp.float32,
+  ):
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(0), b_dim, h_dim, v_dim, dtype=dtype
+    )
+    dout = jnp.float32(1.0)
+
+    # Reference: use jax.grad on the reference forward.
+    # For bfloat16 inputs, our backward kernel computes in float32 internally
+    # (inputs are upcast), so compare against a float32-upcast reference.
+    x_ref = x.astype(jnp.float32) if dtype == jnp.bfloat16 else x
+    w_ref = w.astype(jnp.float32) if dtype == jnp.bfloat16 else w
+
+    def ref_fn(x, w):
+      loss, _ = reference.linear_softmax_cross_entropy_loss_fwd_reference(
+          x, labels, w, reduction=reduction
+      )
+      return loss
+
+    ref_x_grad, ref_w_grad = jax.grad(ref_fn, argnums=(0, 1))(x_ref, w_ref)
+
+    # Kernel: explicit backward call with lse residual from the forward.
+    _, lse = kernel.linear_softmax_cross_entropy_loss_fwd_pallas_triton(
+        x, labels, w,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+        reduction=reduction,
+    )
+    kernel_x_grad, kernel_w_grad = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_triton(
+        dout, lse, x, labels, w,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+        reduction=reduction,
+    )
+
+    # bfloat16: compare float32-upcast reference against float32 kernel outputs.
+    # The cuBLAS vs Triton tiled matmul can differ by ~2e-2 at medium dims
+    # (same cause as the forward lse tolerance).
+    atol = 2e-2
+    rtol = 2e-2
+
+    self.assertTrue(
+        jnp.allclose(
+            ref_x_grad.astype(jnp.float32),
+            kernel_x_grad,
+            atol=atol,
+            rtol=rtol,
+        ),
+        msg=f"x_grad mismatch: max_diff={jnp.max(jnp.abs(ref_x_grad.astype(jnp.float32) - kernel_x_grad)):.6f}",
+    )
+    self.assertTrue(
+        jnp.allclose(
+            ref_w_grad.astype(jnp.float32),
+            kernel_w_grad,
+            atol=atol,
+            rtol=rtol,
+        ),
+        msg=f"w_grad mismatch: max_diff={jnp.max(jnp.abs(ref_w_grad.astype(jnp.float32) - kernel_w_grad)):.6f}",
     )
 
 

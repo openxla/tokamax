@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pallas-Triton kernel for Linear Softmax Cross-Entropy Loss (forward pass)."""
+"""Pallas-Triton kernels for Linear Softmax Cross-Entropy Loss (fwd + bwd)."""
 
 from functools import partial
 from typing import Literal
@@ -224,3 +224,276 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_triton(
     loss = jnp.mean(per_token_loss)
 
   return loss.astype(jnp.float32), lse
+
+
+# ---------------------------------------------------------------------------
+# Backward kernels
+# ---------------------------------------------------------------------------
+
+
+def _lce_bwd_x_grad_kernel(
+    x_ref,
+    labels_ref,
+    lse_ref,
+    w_ref,
+    x_grad_ref,
+    *,
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+    num_h_blocks: int,
+    num_v_blocks: int,
+):
+  """Per-(b_block, h_block) tile: re-compute logits, compute s, accumulate x_grad.
+
+  x_grad[b, h] = sum_v s[b, v] * w[h, v]
+               = s[b, :] @ w[h_block, :].T   (contracted over V)
+
+  For each V chunk we re-compute xw[b, v_chunk] via an inner H loop, derive
+  s, then accumulate the contribution to x_grad.
+  """
+  h_prog = pl.program_id(1)
+  lse = lse_ref.load()  # (b_block,)
+  labels = labels_ref.load().astype(jnp.int32)  # (b_block,)
+
+  def v_body(v_idx, x_grad_acc):
+    # Re-compute xw tile for this V chunk.
+    def h_body(h_idx, xw_acc):
+      x_tile = x_ref.at[:, block.ds(h_idx, h_block_size)].load(
+          bounds_check=(False, True)
+      )
+      w_tile = w_ref.at[
+          block.ds(h_idx, h_block_size), block.ds(v_idx, v_block_size)
+      ].load()
+      return xw_acc + pl.dot(
+          x_tile.astype(jnp.float32), w_tile.astype(jnp.float32)
+      )
+
+    xw_tile = jax.lax.fori_loop(
+        0,
+        num_h_blocks,
+        h_body,
+        jnp.zeros((b_block_size, v_block_size), jnp.float32),
+    )
+
+    # s = softmax(xw) - one_hot(labels)
+    s = jnp.exp(xw_tile - lse[:, None]) - jax.nn.one_hot(
+        labels - v_idx * v_block_size,
+        num_classes=v_block_size,
+        dtype=jnp.float32,
+    )
+
+    # Contribution to x_grad: s @ w[h_prog, v].T
+    # w_h: (h_block, v_block), s: (b_block, v_block) -> result: (b_block, h_block)
+    w_h = w_ref.at[
+        block.ds(h_prog, h_block_size), block.ds(v_idx, v_block_size)
+    ].load().astype(jnp.float32)
+    return x_grad_acc + jax.lax.dot_general(
+        s, w_h, dimension_numbers=(((1,), (1,)), ((), ()))
+    )
+
+  x_grad_ref.store(
+      jax.lax.fori_loop(
+          0,
+          num_v_blocks,
+          v_body,
+          jnp.zeros((b_block_size, h_block_size), jnp.float32),
+      )
+  )
+
+
+def _lce_bwd_w_grad_kernel(
+    x_ref,
+    labels_ref,
+    lse_ref,
+    w_ref,
+    w_grad_ref,
+    *,
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+    num_b_blocks: int,
+    num_h_blocks: int,
+):
+  """Per-(h_block, v_block) tile: re-compute logits, compute s, accumulate w_grad.
+
+  w_grad[h, v] = sum_b x[b, h] * s[b, v]
+               = x[:, h_block].T @ s[:, v_block]   (contracted over B)
+
+  For each B chunk we re-compute xw[b_chunk, v_block] via an inner H loop,
+  derive s, then accumulate x[b, h_prog].T @ s into w_grad.
+  """
+  h_prog = pl.program_id(0)
+  v_prog = pl.program_id(1)
+
+  def b_body(b_idx, w_grad_acc):
+    # Re-compute xw tile for this (B chunk, V block).
+    def h_body(h_idx, xw_acc):
+      x_tile = x_ref.at[
+          block.ds(b_idx, b_block_size), block.ds(h_idx, h_block_size)
+      ].load()
+      w_tile = w_ref.at[block.ds(h_idx, h_block_size), :].load(
+          bounds_check=(True, False)
+      )
+      return xw_acc + pl.dot(
+          x_tile.astype(jnp.float32), w_tile.astype(jnp.float32)
+      )
+
+    xw_tile = jax.lax.fori_loop(
+        0,
+        num_h_blocks,
+        h_body,
+        jnp.zeros((b_block_size, v_block_size), jnp.float32),
+    )
+
+    lse_b = lse_ref.at[block.ds(b_idx, b_block_size)].load()  # (b_block,)
+    labels_b = labels_ref.at[block.ds(b_idx, b_block_size)].load().astype(
+        jnp.int32
+    )
+    s = jnp.exp(xw_tile - lse_b[:, None]) - jax.nn.one_hot(
+        labels_b - v_prog * v_block_size,
+        num_classes=v_block_size,
+        dtype=jnp.float32,
+    )
+
+    # Contribution to w_grad: x[b, h_prog].T @ s
+    # x_h: (b_block, h_block) -> contracted over B -> (h_block, v_block)
+    x_h = x_ref.at[
+        block.ds(b_idx, b_block_size), block.ds(h_prog, h_block_size)
+    ].load().astype(jnp.float32)
+    return w_grad_acc + jax.lax.dot_general(
+        x_h, s, dimension_numbers=(((0,), (0,)), ((), ()))
+    )
+
+  w_grad_ref.store(
+      jax.lax.fori_loop(
+          0,
+          num_b_blocks,
+          b_body,
+          jnp.zeros((h_block_size, v_block_size), jnp.float32),
+      )
+  )
+
+
+@partial(
+    jax.jit,
+    static_argnames=[
+        "b_block_size",
+        "h_block_size",
+        "v_block_size",
+        "reduction",
+        "num_warps",
+    ],
+)
+def linear_softmax_cross_entropy_loss_bwd_pallas_triton(
+    dout: Real[Scalar, ""],
+    lse: Real[Array, "B"],
+    x: Real[Array, "B H"],
+    labels: Integer[Array, "B"],
+    w: Real[Array, "H V"],
+    *,
+    b_block_size: int = 32,
+    h_block_size: int = 64,
+    v_block_size: int = 128,
+    reduction: Literal["sum", "mean"] = "sum",
+    num_warps: int = 4,
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
+  """Fused backward pass for linear softmax cross-entropy loss via Pallas/Triton.
+
+  Re-computes logit tiles on-the-fly (no HBM materialisation of the full
+  BxV logit matrix). Two kernel launches:
+    1. x_grad: grid (num_b_blocks, num_h_blocks), outer V loop, inner H loop.
+    2. w_grad: grid (num_h_blocks, num_v_blocks), outer B loop, inner H loop.
+
+  Args:
+    dout: Upstream gradient of the scalar loss.
+    lse: Per-token log-sum-exp from the forward pass, shape (B,).
+    x: Hidden states, shape (B, H).
+    labels: Integer token indices, shape (B,).
+    w: LM head weight matrix, shape (H, V).
+    b_block_size: Tile size over B. B must be divisible by b_block_size.
+    h_block_size: Tile size for the inner H accumulation loop.
+    v_block_size: Tile size over V. V must be divisible by v_block_size.
+    reduction: Must match the reduction used in the forward pass.
+    num_warps: Triton warp count.
+
+  Returns:
+    (x_grad, w_grad) in float32.
+  """
+  _validate_inputs(x, labels, w, b_block_size, h_block_size, v_block_size)
+
+  if x.dtype == jnp.float16:
+    x = x.astype(jnp.float32)
+  if w.dtype == jnp.float16:
+    w = w.astype(jnp.float32)
+
+  b_dim, h_dim = x.shape
+  v_dim = w.shape[1]
+  num_b_blocks = pl.cdiv(b_dim, b_block_size)
+  num_h_blocks = pl.cdiv(h_dim, h_block_size)
+  num_v_blocks = pl.cdiv(v_dim, v_block_size)
+  compiler_params = plgpu.CompilerParams(num_warps=num_warps)
+
+  # ---- x_grad kernel -------------------------------------------------------
+  # Grid: (num_b_blocks, num_h_blocks).
+  # w is passed without a V block spec so the kernel can iterate over all V
+  # chunks with dynamic indexing.
+  x_grad = block.pallas_call(
+      partial(
+          _lce_bwd_x_grad_kernel,
+          b_block_size=b_block_size,
+          h_block_size=h_block_size,
+          v_block_size=v_block_size,
+          num_h_blocks=num_h_blocks,
+          num_v_blocks=num_v_blocks,
+      ),
+      name="pallas_triton_lce_bwd_x_grad",
+      grid=(num_b_blocks, num_h_blocks),
+      out_shape=jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32),
+      in_specs=(
+          pl.BlockSpec((b_block_size, h_dim), lambda b, h: (b, 0)),  # x
+          pl.BlockSpec((b_block_size,), lambda b, h: (b,)),           # labels
+          pl.BlockSpec((b_block_size,), lambda b, h: (b,)),           # lse
+          pl.no_block_spec,                                            # w (full)
+      ),
+      out_specs=pl.BlockSpec((b_block_size, h_block_size), lambda b, h: (b, h)),
+      compiler_params=compiler_params,
+  )(x, labels, lse, w)
+
+  # ---- w_grad kernel -------------------------------------------------------
+  # Grid: (num_h_blocks, num_v_blocks).
+  # x, labels, lse are passed without block specs; the kernel accesses them
+  # with dynamic b-chunk indexing in the outer B loop.
+  w_grad = block.pallas_call(
+      partial(
+          _lce_bwd_w_grad_kernel,
+          b_block_size=b_block_size,
+          h_block_size=h_block_size,
+          v_block_size=v_block_size,
+          num_b_blocks=num_b_blocks,
+          num_h_blocks=num_h_blocks,
+      ),
+      name="pallas_triton_lce_bwd_w_grad",
+      grid=(num_h_blocks, num_v_blocks),
+      out_shape=jax.ShapeDtypeStruct((h_dim, v_dim), jnp.float32),
+      in_specs=(
+          pl.no_block_spec,                                            # x (full)
+          pl.no_block_spec,                                            # labels (full)
+          pl.no_block_spec,                                            # lse (full)
+          pl.BlockSpec((h_dim, v_block_size), lambda h, v: (0, v)),  # w
+      ),
+      out_specs=pl.BlockSpec(
+          (h_block_size, v_block_size), lambda h, v: (h, v)
+      ),
+      compiler_params=compiler_params,
+  )(x, labels, lse, w)
+
+  # Apply mean-reduction scaling and upstream gradient outside the kernel.
+  if reduction == "mean":
+    x_grad = x_grad / b_dim
+    w_grad = w_grad / b_dim
+
+  x_grad = x_grad * dout
+  w_grad = w_grad * dout
+
+  return x_grad.astype(jnp.float32), w_grad.astype(jnp.float32)
