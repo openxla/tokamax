@@ -15,7 +15,7 @@
 
 """Benchmarks for attention."""
 
-import os
+import time
 
 from absl import flags
 from absl import logging
@@ -23,11 +23,10 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
-from tensorboardX import writer
 import tokamax
+from tokamax.benchmarks import common
 
 
-SummaryWriter = writer.SummaryWriter
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
     'tensorboard_output_env_var',
     'TENSORBOARD_OUTPUT_DIR',
@@ -107,26 +106,41 @@ class AttentionBenchmark(parameterized.TestCase):
         'wallclock_median_time_ms: %s', res_wallclock.median_evaluation_time_ms
     )
 
-    metric_tag = (
-        f"attention/{args_spec_name}/{implementation or 'default'}/{benchmark_mode}"
+    common.write_tensorboard_logs(
+        tensorboard_output=_TENSORBOARD_OUTPUT_ENV_VAR.value,
+        value=res.evaluation_times_ms,
+        metric_tag=(
+            f"attention/{args_spec_name}/{implementation or 'default'}/{benchmark_mode}"
+        ),
     )
-    tblog_dir = os.environ.get(_TENSORBOARD_OUTPUT_ENV_VAR.value)
 
-    if tblog_dir:
-      try:
-        tb_writer = SummaryWriter(log_dir=tblog_dir)
-        for i, value in enumerate(res.evaluation_times_ms):
-          tb_writer.add_scalar(metric_tag, value, global_step=i)
+    # Benchmark autotuning for Mosaic.
+    if implementation == 'mosaic' and benchmark_mode == 'forward_and_vjp':
+      t1 = time.time()
+      autotune_res = tokamax.autotune(fn, args)
+      time_autotune = time.time() - t1
 
-        tb_writer.close()
-      except (OSError, IOError):
-        logging.exception('Error writing TensorBoard logs')
-    else:
-      logging.info(
-          'implementation=%s, benchmark_mode=%s, benchmark time (ms): %s',
-          implementation,
-          benchmark_mode,
-          res.median_evaluation_time_ms,
+      common.write_tensorboard_logs(
+          tensorboard_output=_TENSORBOARD_OUTPUT_ENV_VAR.value,
+          value=time_autotune,
+          metric_tag=(
+              f'attention/{args_spec_name}/mosaic/forward_and_vjp/autotuning_time'
+          ),
+      )
+
+      @jax.jit
+      def fn_autotuned(args):
+        with autotune_res:
+          return fn(args)
+
+      res_autotuned = tokamax.benchmark(fn_autotuned, args)
+
+      common.write_tensorboard_logs(
+          tensorboard_output=_TENSORBOARD_OUTPUT_ENV_VAR.value,
+          value=res_autotuned.evaluation_times_ms,
+          metric_tag=(
+              f'attention/{args_spec_name}/mosaic/forward_and_vjp/autotuned'
+          ),
       )
 
     # TODO: Add this to the proto once generic metadata is
