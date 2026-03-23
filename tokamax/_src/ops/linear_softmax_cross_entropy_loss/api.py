@@ -22,10 +22,21 @@ from jaxtyping import Array, Integer, Real, Scalar  # pylint: disable=g-multiple
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
 
 
-Implementation: TypeAlias = Literal["mosaic_tpu", "xla"]
+Implementation: TypeAlias = Literal["mosaic_tpu", "triton", "xla"]
 
 IMPLEMENTATIONS = dict(xla=base.LinearSoftmaxCrossEntropyLoss())
 _DEFAULT_IMPLEMENTATION = ("xla",)
+
+try:
+  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["triton"] = (
+      pallas_triton.PallasTritonLinearSoftmaxCrossEntropyLoss()
+  )
+
+  _DEFAULT_IMPLEMENTATION = ("triton",) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
 
 try:
   from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
@@ -91,21 +102,16 @@ def linear_softmax_cross_entropy_loss(
         "Customization of precision is currently not supported."
     )
 
-  if implementation is not None:
-    if implementation in IMPLEMENTATIONS:
-      loss = IMPLEMENTATIONS[implementation](
-          x,
-          labels,
-          weights,
-          reduction=reduction,
-      )
-      return loss
-    else:
-      raise ValueError(f"Unsupported implementation: {implementation}")
+  if implementation is None:
+    implementation = _DEFAULT_IMPLEMENTATION
 
-  # Find out the best impelmentation based on the hardware.
+  if not isinstance(implementation, (tuple, list)):
+    implementation = (implementation,)
+
   errors = []
-  for impl in IMPLEMENTATIONS:
+  for impl in implementation:
+    if impl not in IMPLEMENTATIONS:
+      raise ValueError(f"Unsupported implementation: {impl}")
     try:
       loss = IMPLEMENTATIONS[impl](
           x,
@@ -115,8 +121,6 @@ def linear_softmax_cross_entropy_loss(
       )
       return loss
     except NotImplementedError as e:
-      if len(implementation) == 1:
-        raise
       errors.append(e)
 
   raise ExceptionGroup("all implementations failed", errors)
