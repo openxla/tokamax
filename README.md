@@ -30,13 +30,10 @@ We currently support the following GPU kernels:
 
 And the following for both GPU and TPU:
 
+*   `tokamax.linear_softmax_cross_entropy_loss`
+    ([Memory Efficient Linear Cross Entropy Loss Kernel](https://arxiv.org/abs/2410.10989v2)).
 *   `tokamax.ragged_dot`
     ([Mixture of Experts](https://arxiv.org/abs/2211.15841)).
-
-And the following TPU kernels:
-
-*   `tokamax.linear_softmax_cross_entropy_loss`
-    ([Memory Efficient Linear Cross Entropy Loss Kernel](https://arxiv.org/abs/2410.10989v2))
 
 ## Installation
 
