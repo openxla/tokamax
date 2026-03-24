@@ -15,6 +15,7 @@
 """Tokamax Megablox TPU tests for core functionality."""
 
 from absl.testing import absltest
+import chex
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
@@ -140,6 +141,54 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     )
     autotuning_configs = ba.autotuning_configs
     self.assertGreaterEqual(len(autotuning_configs), 3 * 3 * 3)
+
+
+class FP8RaggedDotTest(absltest.TestCase):
+  """Tests for FP8 block-wise quantization in ragged dot."""
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    super().setUp()
+
+  def _run_fp8_forward(self, block_size, use_as_qarray):
+    num_groups, m, k, n = 8, 512, 256, 512
+    rng = jax.random.PRNGKey(42)
+    a = jax.random.normal(rng, (m, k), dtype=jnp.bfloat16) * 0.1
+    b = jax.random.normal(jax.random.split(rng)[0], (num_groups, k, n), dtype=jnp.bfloat16) * 0.1
+    group_sizes = jnp.array([m // num_groups] * num_groups, dtype=jnp.int32)
+
+    # Quantize inputs
+    a_tile = {0: 1, 1: block_size}
+    b_tile = {0: 1, 1: block_size, 2: 1}
+    if use_as_qarray:
+      a_q = quantization.AsQArray(a, jnp.float8_e4m3fn, tiled_axes=a_tile)
+      b_q = quantization.AsQArray(b, jnp.float8_e4m3fn, tiled_axes=b_tile)
+    else:
+      a_q = qwix.quantize(a, jnp.float8_e4m3fn, tiled_axes=a_tile)
+      b_q = qwix.quantize(b, jnp.float8_e4m3fn, tiled_axes=b_tile)
+
+    # Reference: dequantize and compute
+    ref_result = test_base.ref(a_q, b_q, group_sizes)
+
+    # Actual: use FP8 ragged dot
+    op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+    actual = op(a_q, b_q, group_sizes=group_sizes, preferred_element_type=jnp.float32)
+
+    count = sum(group_sizes)
+    chex.assert_trees_all_close(actual[:count], ref_result[:count], atol=0.5, rtol=0.1)
+
+  def test_fp8_forward_block128(self):
+    self._run_fp8_forward(128, use_as_qarray=False)
+
+  def test_fp8_forward_block256(self):
+    self._run_fp8_forward(256, use_as_qarray=False)
+
+  def test_fp8_forward_block128_as_qarray(self):
+    self._run_fp8_forward(128, use_as_qarray=True)
+
+  def test_fp8_forward_block256_as_qarray(self):
+    self._run_fp8_forward(256, use_as_qarray=True)
 
 
 if __name__ == "__main__":
