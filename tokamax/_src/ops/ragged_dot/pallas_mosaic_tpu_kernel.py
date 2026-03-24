@@ -748,10 +748,6 @@ def tgmm(
       *,
       subchannel_iters: int,
   ):
-    if subchannel_iters != 1:
-      raise NotImplementedError(
-          "subchannel_iters != 1 not supported yet in tgmm."
-      )
     grid_id = pl.program_id(2)
     group_offsets, group_ids, _ = group_metadata
     group = group_ids[grid_id]
@@ -773,37 +769,48 @@ def tgmm(
       out_ref[...] = acc.astype(out_dtype)
 
     def _do():
-      # load lhs and rhs
-      lhs = jax.tree.map(lambda x: x[...], lhs_ref)
-      rhs = jax.tree.map(lambda x: x[...], rhs_ref)
+      for it in range(subchannel_iters):
+        # Sub-slice lhs and rhs along M axis (axis=0)
+        lhs = _maybe_get_subslice(lhs_ref, it, subchannel_iters, axis=0)
+        rhs = _maybe_get_subslice(rhs_ref, it, subchannel_iters, axis=0)
 
-      # optional dynamic quantization within the kernel
-      if lhs_qdtype is not None and not isinstance(lhs, QArray):
-        lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
-      if rhs_qdtype is not None and not isinstance(rhs, QArray):
-        rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
+        # optional dynamic quantization within the kernel
+        if lhs_qdtype is not None and not isinstance(lhs, QArray):
+          lhs = _quantize_as(lhs, lhs_qdtype, axis=1, scale=lhs_static_scale)
+        if rhs_qdtype is not None and not isinstance(rhs, QArray):
+          rhs = _quantize_as(rhs, rhs_qdtype, axis=1, scale=rhs_static_scale)
 
-      # unpack quantized arrays for dot operation
-      scales = []
-      if isinstance(lhs, QArray):
-        scales.append(lhs.scale.T)
-        lhs = lhs.qvalue
-      if isinstance(rhs, QArray):
-        scales.append(rhs.scale)
-        rhs = rhs.qvalue
+        # unpack quantized arrays for dot operation
+        scales = []
+        if isinstance(lhs, QArray):
+          scales.append(lhs.scale.T)
+          lhs = lhs.qvalue
+        if isinstance(rhs, QArray):
+          scales.append(rhs.scale)
+          rhs = rhs.qvalue
 
-      kwargs = dict(grid_id=grid_id, group_metadata=group_metadata, tm=tm)
-      lhs = jnp.where(_get_store_mask(**kwargs, tn=tk), lhs, 0)
-      rhs = jnp.where(_get_store_mask(**kwargs, tn=tn), rhs, 0)
+        # mask: use sub-tile offset for correct group boundary masking
+        sc_tm = tm // subchannel_iters
+        m_offset = it * sc_tm
+        full_mask_lhs = _get_store_mask(
+            grid_id=grid_id, group_metadata=group_metadata, tm=tm, tn=tk
+        )
+        full_mask_rhs = _get_store_mask(
+            grid_id=grid_id, group_metadata=group_metadata, tm=tm, tn=tn
+        )
+        mask_lhs = full_mask_lhs[m_offset:m_offset + sc_tm, :]
+        mask_rhs = full_mask_rhs[m_offset:m_offset + sc_tm, :]
+        lhs = jnp.where(mask_lhs, lhs, 0)
+        rhs = jnp.where(mask_rhs, rhs, 0)
 
-      is_int = lambda x: jnp.issubdtype(x.dtype, jnp.integer)
-      acc_dtype = jnp.int32 if is_int(lhs) and is_int(rhs) else jnp.float32
-      out = dot(lhs.T, rhs, acc_dtype)
+        is_int = lambda x: jnp.issubdtype(x.dtype, jnp.integer)
+        acc_dtype = jnp.int32 if is_int(lhs) and is_int(rhs) else jnp.float32
+        out = dot(lhs.T, rhs, acc_dtype)
 
-      # apply scales to the output if the inputs were quantized
-      for scale in scales:
-        out = _scale_out_by_scale(out, scale)
-      acc_scratch[...] += out.astype(acc_scratch.dtype)
+        # apply scales to the output if the inputs were quantized
+        for scale in scales:
+          out = _scale_out_by_scale(out, scale)
+        acc_scratch[...] += out.astype(acc_scratch.dtype)
 
     if combine_scopes:
       # every conditional introduces an optimization barrier, so splitting this
