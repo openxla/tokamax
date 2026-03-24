@@ -109,16 +109,20 @@ def quant_block_spec(
       [1] * x.ndim + [_adaptive_sublane_size(), pltpu.get_tpu_info().num_lanes]
   )[-x.ndim :]
 
-  # Limitation 1: Currently, we only support full-axis scales or 1 scale per
-  # each element for non-reduction axes, this is supported by the block-spec,
-  # but not by the kernel implementation.
+  # Non-reduction axes: allow block-level scales as long as eps is compatible
+  # with the tile size (checked by _get_scale_tile_info via its assert).
+  # This enables DeepSeek-V3 style 128x128 block-wise FP8 on the weight's
+  # N axis while keeping the reduction axis (K) subchannel support unchanged.
   for axis, eps in enumerate(eps_list):
+    tile_size = tile_sizes[axis]
     if axis != reduction_axis and eps not in (1, x_values.shape[axis]):
-      raise NotImplementedError(
-          "Non-reduction axes must have an either 1 scale per each element or a"
-          " scalar full-axis scale, but"
-          f" {jax.tree.map(jax.typeof, x)=} for {reduction_axis=}."
-      )
+      if tile_size is not None and not (eps % tile_size == 0 or tile_size % eps == 0):
+        raise NotImplementedError(
+            "Non-reduction axis block-level scales require eps and tile_size"
+            " to be compatible (one must divide the other), but"
+            f" {eps=}, {tile_size=}, {axis=},"
+            f" {jax.tree.map(jax.typeof, x)=} for {reduction_axis=}."
+        )
 
   # Limitation 2: The number of elements per single scale along the reduction
   # axis must be greater than or equal to the min_addressable_size, because we
