@@ -64,6 +64,7 @@ class PallasMosaicGpuGatedLinearUnit(base.GatedLinearUnit[Config, None]):
       return_residuals: bool,
       config: Config,
   ) -> tuple[Float[Array, "*B M N"], Residuals | None]:
+    # TODO: Add support for unfused weights.
     weights = (
         jnp.stack(weights, axis=-2) if isinstance(weights, tuple) else weights
     )
