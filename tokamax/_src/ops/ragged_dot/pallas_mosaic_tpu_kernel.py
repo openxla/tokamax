@@ -408,7 +408,12 @@ def gmm(
 
   def dot(x, y, preferred_element_type, *, precision=precision):
     # TODO: Pallas-MTPU doesn't support `DotAlgorithmPreset`.
-    if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+    is_fp8 = lambda d: jnp.issubdtype(d, jnp.floating) and jnp.dtype(d).itemsize == 1
+    if is_fp8(x.dtype) or is_fp8(y.dtype):
+      # TPU v7x native FP8 dot — pass through directly.
+      precision = (jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT)
+      preferred_element_type = jnp.float32
+    elif precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
       x = x.astype(jnp.bfloat16)
       y = y.astype(jnp.bfloat16)
       precision = (jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT)
