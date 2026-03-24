@@ -236,6 +236,7 @@ def _lce_bwd_kernel(
     labels_ref,     # BlockRef, block spec (b_block,)
     lse_ref,        # BlockRef, block spec (b_block,)
     w_ref,          # BlockRef, block spec (h_dim, v_block)
+    dout_ref,       # scalar upstream gradient, no_block_spec
     _xg_init_ref,   # aliased to x_grad output -- provides zero-init; not read
     _wg_init_ref,   # aliased to w_grad output -- provides zero-init; not read
     x_grad_ref,     # output: full (b_dim, h_dim), aliased from _xg_init_ref
@@ -245,6 +246,7 @@ def _lce_bwd_kernel(
     h_block_size: int,
     v_block_size: int,
     num_h_blocks: int,
+    reduction_scale: float,
 ):
   """Per-(b_block, v_block) tile: fused recompute + gradient accumulation.
 
@@ -252,16 +254,13 @@ def _lce_bwd_kernel(
     1. Recomputes xw_tile via inner H fori_loop (pure reads, O(B*V*H) total).
     2. Computes s = exp(xw - lse) - one_hot(labels).
     3. Python-unrolled H loop: for each h_block, atomically accumulates
-         x_grad[b_block, h_block] += s @ w[h_block, v_block].T
-         w_grad[h_block, v_block] += x[b_block, h_block].T @ s
-       via plgpu.atomic_add. Each (b, v) program touches every H block once
-       -> O(B*V*H) for both gradients. Total backward: O(3*B*V*H) = 3x fwd.
+         x_grad[b_block, h_block] += scale * s @ w[h_block, v_block].T
+         w_grad[h_block, v_block] += scale * x[b_block, h_block].T @ s
+       where scale = dout * reduction_scale (fused, avoids separate launches).
 
   The _xg_init_ref / _wg_init_ref inputs are zero-filled arrays aliased to the
-  output buffers via input_output_aliases. This guarantees that the output
-  buffers start as zeros before any atomic_add accumulates into them (GPU
-  allocators reuse pool memory; without aliasing the buffers may contain stale
-  values from prior kernel launches).
+  output buffers via input_output_aliases, guaranteeing zero-initialised
+  accumulation buffers (GPU pool allocators reuse stale memory).
 
   plgpu.atomic_add is not usable inside jax.lax.fori_loop; the gradient
   accumulation loop is unrolled at Python/trace time (num_h_blocks is a static
@@ -274,6 +273,8 @@ def _lce_bwd_kernel(
 
   lse = lse_ref.load()                          # (b_block,)
   labels = labels_ref.load().astype(jnp.int32)  # (b_block,)
+  # Fuse dout scaling: scale = dout * reduction_scale (1/B for mean, 1 for sum).
+  scale = dout_ref.load().astype(jnp.float32) * jnp.float32(reduction_scale)
 
   # Step 1: recompute xw_tile via inner H fori_loop (reads only).
   def h_body_fwd(h_idx, xw_acc):
@@ -294,11 +295,13 @@ def _lce_bwd_kernel(
       jnp.zeros((b_block_size, v_block_size), jnp.float32),
   )
 
-  # Step 2: s = softmax(xw) - one_hot(labels).
-  s = jnp.exp(xw_tile - lse[:, None]) - jax.nn.one_hot(
-      labels - v_start,
-      num_classes=v_block_size,
-      dtype=jnp.float32,
+  # Step 2: s = softmax(xw) - one_hot(labels), scaled by dout * reduction_scale.
+  s = scale * (
+      jnp.exp(xw_tile - lse[:, None]) - jax.nn.one_hot(
+          labels - v_start,
+          num_classes=v_block_size,
+          dtype=jnp.float32,
+      )
   )
 
   # Step 3: atomically accumulate x_grad and w_grad.
@@ -395,6 +398,8 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_triton(
   num_h_blocks = pl.cdiv(h_dim, h_block_size)
   num_v_blocks = pl.cdiv(v_dim, v_block_size)
 
+  reduction_scale = 1.0 / b_dim if reduction == "mean" else 1.0
+
   # Zero-initialised buffers aliased to outputs so that atomic_add accumulates
   # from zero. GPU pool allocators reuse stale memory; input_output_aliases
   # ensures the output buffers start as zeros.
@@ -408,6 +413,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_triton(
           h_block_size=h_block_size,
           v_block_size=v_block_size,
           num_h_blocks=num_h_blocks,
+          reduction_scale=reduction_scale,
       ),
       name="pallas_triton_lce_bwd",
       grid=(num_b_blocks, num_v_blocks),
@@ -420,6 +426,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_triton(
           pl.BlockSpec((b_block_size,), lambda b, v: (b,)),           # labels
           pl.BlockSpec((b_block_size,), lambda b, v: (b,)),           # lse
           pl.BlockSpec((h_dim, v_block_size), lambda b, v: (0, v)),  # w
+          pl.no_block_spec,                                           # dout scalar
           pl.no_block_spec,                                           # x_grad_init (aliased -> output 0)
           pl.no_block_spec,                                           # w_grad_init (aliased -> output 1)
       ),
@@ -427,16 +434,8 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_triton(
           pl.no_block_spec,  # x_grad -- atomic-accumulated from zero
           pl.no_block_spec,  # w_grad -- atomic-accumulated from zero
       ),
-      input_output_aliases={4: 0, 5: 1},
+      input_output_aliases={5: 0, 6: 1},
       compiler_params=plgpu.CompilerParams(num_warps=num_warps),
-  )(x, labels, lse, w, x_grad_init, w_grad_init)
-
-  # Apply mean-reduction scaling and upstream gradient outside the kernel.
-  if reduction == "mean":
-    x_grad = x_grad / b_dim
-    w_grad = w_grad / b_dim
-
-  x_grad = x_grad * dout
-  w_grad = w_grad * dout
+  )(x, labels, lse, w, dout, x_grad_init, w_grad_init)
 
   return x_grad.astype(jnp.float32), w_grad.astype(jnp.float32)
