@@ -150,7 +150,7 @@ Add the following test method to the `PallasMosaicTpuRaggedDotTest` class, after
           (8, 512, 128, 512),   # K=128: single K-tile
           (8, 512, 256, 512),   # K=256: two K-tiles
           (8, 512, 1024, 512),  # K=1024: multiple K-tiles
-          (8, 512, 320, 512),   # K=320: K not divisible by 128
+          (8, 512, 384, 512),   # K=384: odd number of K-tiles (3)
       ),
   )
   def test_blockwise_fp8(self, use_as_qarray, task):
