@@ -207,6 +207,24 @@ class RaggedDotTestBase(parameterized.TestCase):
         dtype, dtype, a_tile_shape, b_tile_shape, use_as_qarray, activation
     )
 
+  @parameterized.product(
+      a_tile_shape=((1, 128), (1, 256)),
+      b_tile_shape=((1, 1, 128), (1, 1, 256)),
+      use_as_qarray=(True, False),
+      activation=(None, relu),
+  )
+  def test_quantized_fp8(
+      self,
+      a_tile_shape,
+      b_tile_shape,
+      use_as_qarray,
+      activation,
+  ):
+    self._test_quantized(
+        "float8_e4m3fn", "float8_e4m3fn",
+        a_tile_shape, b_tile_shape, use_as_qarray, activation,
+    )
+
   def _test_quantized(
       self,
       a_dtype,
