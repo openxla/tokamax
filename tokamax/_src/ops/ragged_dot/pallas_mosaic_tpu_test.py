@@ -40,8 +40,6 @@ def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
   for ax, (mas, eps) in enumerate(zip(min_addressable_sizes, eps_list)):
     if eps != 1 and eps % mas != 0:
       return False
-    if ax != axis and not (eps == 1 or eps == x.qvalue.shape[ax]):
-      return False
   return True
 
 
