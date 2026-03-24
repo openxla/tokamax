@@ -107,8 +107,10 @@ class PallasTritonLceOpTest(parameterized.TestCase):
         ref_op, argnums=(0, 2)
     )(x_ref, labels, w_ref, reduction=reduction)
 
-    # Tolerance is driven by cuBLAS vs Triton tiled matmul precision differences
-    # (same cause as the kernel-level tests).
+    # The conftest sets xla_gpu_enable_triton_gemm=False so the reference op
+    # uses cuBLAS for x@w while our kernel uses Triton tiled matmul; differences
+    # of ~1e-2 are observed for float32 gradients at medium dims (~4e-6 when
+    # both use Triton GEMM).
     atol = 2e-2
     rtol = 2e-2
 

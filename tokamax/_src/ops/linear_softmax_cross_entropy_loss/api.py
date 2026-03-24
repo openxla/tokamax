@@ -83,10 +83,10 @@ def linear_softmax_cross_entropy_loss(
     precision: The precision used for jax.lax.dot_general for the linear
       projection and gradient calculation.
     implementation: By default "None" will be used to pick the best available
-      backend. Can be set to "xla" or "mosaic_tpu" explicitly. The "mosaic_tpu"
-      implementation is memory efficient and has almost 0 additional buffer
-      overhead while the "xla" implementation needs to materialize the full
-      logits
+      backend. Can be set to "xla", "mosaic_tpu", or "triton" explicitly. The
+      "mosaic_tpu" and "triton" implementations are memory efficient and have
+      almost 0 additional buffer overhead while the "xla" implementation needs
+      to materialize the full logits
 
   Returns:
     The Cross-Entropy loss

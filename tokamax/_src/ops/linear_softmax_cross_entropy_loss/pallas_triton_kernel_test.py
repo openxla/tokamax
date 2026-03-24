@@ -112,9 +112,10 @@ class PallasTritonLceFwdKernelTest(parameterized.TestCase):
 
     loss_atol = 5e-2 if dtype == jnp.bfloat16 else 1e-4
     loss_rtol = 5e-2 if dtype == jnp.bfloat16 else 1e-4
-    # LSE tolerance is looser: the reference uses cuBLAS (xla_gpu_enable_triton_gemm=False
-    # in conftest) while the kernel uses Triton tiled accumulation, so per-token lse
-    # values can differ by ~O(1e-2) even for float32 at medium dimensions.
+    # LSE tolerance: the conftest sets xla_gpu_enable_triton_gemm=False so the
+    # reference x@w uses cuBLAS while the kernel uses Triton tiled matmul;
+    # per-token LSE differs by ~1.2e-2 for float32 at medium dims (~4e-6 when
+    # both use Triton GEMM).
     lse_atol = 5e-2 if dtype == jnp.bfloat16 else 2e-2
     lse_rtol = 5e-2 if dtype == jnp.bfloat16 else 2e-2
 
@@ -234,9 +235,10 @@ class PallasTritonLceBwdKernelTest(parameterized.TestCase):
         reduction=reduction,
     )
 
-    # bfloat16: compare float32-upcast reference against float32 kernel outputs.
-    # The cuBLAS vs Triton tiled matmul can differ by ~2e-2 at medium dims
-    # (same cause as the forward lse tolerance).
+    # The conftest sets xla_gpu_enable_triton_gemm=False so the reference
+    # uses cuBLAS for x@w while the kernel uses Triton tiled matmul; differences
+    # of ~1e-2 are observed for float32 gradients at medium dims (~2e-3 when
+    # both use Triton GEMM).
     atol = 2e-2
     rtol = 2e-2
 
