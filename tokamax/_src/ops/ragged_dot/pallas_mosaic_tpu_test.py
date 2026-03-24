@@ -41,6 +41,9 @@ def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
   for ax, (mas, eps) in enumerate(zip(min_addressable_sizes, eps_list)):
     if eps != 1 and eps % mas != 0:
       return False
+  # Reduction axis eps must be >= min_addressable_size (Limitation 2).
+  if eps_list[axis] < min_addressable_sizes[axis]:
+    return False
   return True
 
 
