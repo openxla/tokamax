@@ -319,8 +319,22 @@ def vjp(
   """Ragged dot VJP."""
   del out, preferred_element_type  # Unused.
 
+  # Handle FP8 forward-save residuals
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu  # avoid circular
+  rhs_for_dlhs = rhs
+  lhs_for_drhs = lhs
+  if isinstance(residuals, pallas_mosaic_tpu.FP8Residuals):
+    if residuals.rhs_for_dlhs is not None:
+      rhs_for_dlhs = residuals.rhs_for_dlhs
+    if residuals.lhs_for_drhs is not None:
+      lhs_for_drhs = residuals.lhs_for_drhs
+    # Extract activation residuals for activation VJP
+    activation_residuals = residuals.activation_residuals
+  else:
+    activation_residuals = residuals
+
   if activation is not None:
-    _, activation_grad_fn = jax.vjp(activation, residuals)
+    _, activation_grad_fn = jax.vjp(activation, activation_residuals)
     (dout,) = activation_grad_fn(dout)
 
   dot_dim_nums = ragged_dot_dimension_numbers.dot_dimension_numbers
@@ -342,7 +356,7 @@ def vjp(
   dout_ragged = [(len(dout_batch) + lhs_kept.index(d)) for d in lhs_ragged]
   dlhs = dlhs_ragged_dot(
       dout,
-      rhs,
+      rhs_for_dlhs,
       group_sizes=group_sizes,
       ragged_dot_dimension_numbers=jax.lax.RaggedDotDimensionNumbers(
           dot_dimension_numbers=dot_dim_nums,
@@ -355,7 +369,7 @@ def vjp(
 
   dot_dim_nums = ((lhs_kept, dout_lhs_kept), (lhs_batch, dout_batch))
   drhs = drhs_ragged_dot(
-      lhs,
+      lhs_for_drhs,
       dout,
       group_sizes=group_sizes,
       ragged_dot_dimension_numbers=jax.lax.RaggedDotDimensionNumbers(

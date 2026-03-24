@@ -45,7 +45,30 @@ InputBufferCount = pydantic.PositiveInt
 
 QArray = base.QArray
 AsQArray = base.AsQArray
-Residuals = types.NoneType
+
+def _is_fp8(dtype) -> bool:
+  """Returns True if dtype is an FP8 type (1-byte floating point)."""
+  dtype = jnp.dtype(dtype)
+  return jnp.issubdtype(dtype, jnp.floating) and dtype.itemsize == 1
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, slots=True)
+class FP8Residuals:
+  """Pre-quantized FP8 inputs saved during forward for backward use.
+
+  Attributes:
+    lhs_for_drhs: lhs columnwise-quantized as FP8, used for drhs (tgmm).
+    rhs_for_dlhs: rhs columnwise-quantized as FP8, used for dlhs.
+    activation_residuals: activation residuals (pre-activation output) for
+      use in the VJP when activation is not None.
+  """
+  lhs_for_drhs: QArray | None
+  rhs_for_dlhs: QArray | None
+  activation_residuals: jax.Array | None
+
+
+Residuals = FP8Residuals | types.NoneType
 
 
 def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
@@ -136,6 +159,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     # configurations.
 
     lhs, rhs = map(quantization.as_array_or_qarray, (lhs, rhs))
+    fp8_residuals = None
 
     if any(  # pallas mosaic TPU requires all non-expert dimensions to be >= 128
         size < 128 for size in tuple(lhs.shape[-2:]) + tuple(rhs.shape[-2:])
@@ -163,6 +187,31 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       # STRATEGY 1: full-channel quantization along the reduction dimension
       lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
       rhs = maybe_quantize(rhs, (1, rhs.shape[1], 1))
+
+      # Pre-quantize columnwise for backward if FP8 block-wise
+      if return_residuals and isinstance(lhs, QArray) and _is_fp8(lhs.qvalue.dtype):
+        lhs_raw = quantization.as_array(lhs)
+        rhs_raw = quantization.as_array(rhs)
+        # Infer block size from lhs scale shape
+        lhs_scale_k = lhs.scale.shape[1]
+        block_size = lhs.qvalue.shape[1] // max(1, lhs_scale_k)
+        fp8_dtype = lhs.qvalue.dtype
+        # For drhs (tgmm): lhs needs columnwise quantization
+        lhs_for_drhs = qwix.quantize(
+            lhs_raw, fp8_dtype,
+            tiled_axes={0: lhs_raw.shape[0], 1: block_size},
+        )
+        # For dlhs: rhs needs quantization along a different axis
+        rhs_for_dlhs = qwix.quantize(
+            rhs_raw, fp8_dtype,
+            tiled_axes={0: 1, 1: 1, 2: block_size},
+        )
+        fp8_residuals = FP8Residuals(
+            lhs_for_drhs=lhs_for_drhs,
+            rhs_for_dlhs=rhs_for_dlhs,
+            activation_residuals=None,  # filled later
+        )
+
       out = backend.gmm(
           lhs,
           rhs,
@@ -177,7 +226,10 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
       # here, handle fast-path special cases that arise in backwards gmm
       if isinstance(lhs, jax.Array) and isinstance(rhs, QArray):
-        if rhs.scale.shape[1] == 1:
+        if _is_fp8(rhs.qvalue.dtype):
+          # FP8 QArray from forward residuals — use directly
+          lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
+        elif rhs.scale.shape[1] == 1:
           # STRATEGY 1: full-channel quantization along the reduction dimension
           # here, apply rhs scales to lhs and compute with rhs quant values
           indices = _group_sizes_to_indices(group_sizes, m=lhs.shape[0])
@@ -205,7 +257,10 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       lhs_trans = jax.tree.map(lambda x: x.mT, lhs)
       # here, handle fast-path special cases that arise in backwards gmm
       if isinstance(lhs_trans, QArray) and isinstance(rhs, jax.Array):
-        if lhs_trans.scale.shape[0] == 1:
+        if _is_fp8(lhs_trans.qvalue.dtype):
+          # FP8 QArray from forward residuals — use directly
+          rhs = maybe_quantize(rhs, (rhs.shape[0], 1))
+        elif lhs_trans.scale.shape[0] == 1:
           # STRATEGY 1: full-channel quantization along the reduction dimension
           # here, apply lhs scales to rhs and compute with lhs quant values
           # lhs_trans = quant[k, m], scale[1, m] and rhs/dout = float[m, n]
@@ -235,11 +290,16 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           UNSUPPORTED_DIMENSIONS_MSG.format(ragged_dot_dimension_numbers)
       )
 
-    residuals = out
-    if activation is not None and return_residuals:
-      out = activation(out)
-
-    return out, residuals if return_residuals else None
+    if fp8_residuals is not None:
+      if activation is not None and return_residuals:
+        fp8_residuals = dataclasses.replace(fp8_residuals, activation_residuals=out)
+        out = activation(out)
+      return out, fp8_residuals
+    else:
+      residuals = out
+      if activation is not None and return_residuals:
+        out = activation(out)
+      return out, residuals if return_residuals else None
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
