@@ -116,7 +116,7 @@ def quant_block_spec(
   for axis, eps in enumerate(eps_list):
     tile_size = tile_sizes[axis]
     if axis != reduction_axis and eps not in (1, x_values.shape[axis]):
-      if tile_size is not None and not (eps % tile_size == 0 or tile_size % eps == 0):
+      if tile_size is not None and not (eps % tile_size == 0):
         raise NotImplementedError(
             "Non-reduction axis block-level scales require eps and tile_size"
             " to be compatible (one must divide the other), but"

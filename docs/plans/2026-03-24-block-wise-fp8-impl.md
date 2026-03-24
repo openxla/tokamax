@@ -48,7 +48,7 @@ With:
   for axis, eps in enumerate(eps_list):
     tile_size = tile_sizes[axis]
     if axis != reduction_axis and eps not in (1, x_values.shape[axis]):
-      if tile_size is not None and not (eps % tile_size == 0 or tile_size % eps == 0):
+      if tile_size is not None and not (eps % tile_size == 0):
         raise NotImplementedError(
             "Non-reduction axis block-level scales require eps and tile_size"
             " to be compatible (one must divide the other), but"
@@ -112,12 +112,18 @@ def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
   cdiv = lambda x, y: (x + y - 1) // y
   eps_list = [cdiv(x, y) for x, y in zip(x.qvalue.shape, x.scale.shape)]
   for ax, (mas, eps) in enumerate(zip(min_addressable_sizes, eps_list)):
-    if eps != 1 and eps % mas != 0:
+    if eps != 1 and (eps % mas != 0 and eps != x.qvalue.shape[ax]):
       return False
+  # Reduction axis eps must be >= min_addressable_size (Limitation 2).
+  if eps_list[axis] < min_addressable_sizes[axis]:
+    return False
   return True
 ```
 
-The only change: remove the non-reduction axis constraint (line 43-44). The `eps % mas` check on line 41 is sufficient — it ensures TPU addressability.
+Changes:
+1. Remove the non-reduction axis constraint (line 43-44).
+2. Align `eps % mas` check with production code by adding `eps != x.qvalue.shape[ax]` exemption.
+3. Add explicit Limitation 2 check for reduction axis eps >= min_addressable_size.
 
 **Step 3: Commit**
 
@@ -144,7 +150,7 @@ Add the following test method to the `PallasMosaicTpuRaggedDotTest` class, after
           (8, 512, 128, 512),   # K=128: single K-tile
           (8, 512, 256, 512),   # K=256: two K-tiles
           (8, 512, 1024, 512),  # K=1024: multiple K-tiles
-          (8, 512, 384, 512),   # K=384: K not divisible by 128
+          (8, 512, 320, 512),   # K=320: K not divisible by 128
       ),
   )
   def test_blockwise_fp8(self, use_as_qarray, task):

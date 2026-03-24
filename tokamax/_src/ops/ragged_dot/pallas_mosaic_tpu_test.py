@@ -39,7 +39,7 @@ def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
   cdiv = lambda x, y: (x + y - 1) // y
   eps_list = [cdiv(x, y) for x, y in zip(x.qvalue.shape, x.scale.shape)]
   for ax, (mas, eps) in enumerate(zip(min_addressable_sizes, eps_list)):
-    if eps != 1 and eps % mas != 0:
+    if eps != 1 and (eps % mas != 0 and eps != x.qvalue.shape[ax]):
       return False
   # Reduction axis eps must be >= min_addressable_size (Limitation 2).
   if eps_list[axis] < min_addressable_sizes[axis]:
@@ -126,7 +126,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
           (8, 512, 128, 512),   # K=128: single K-tile
           (8, 512, 256, 512),   # K=256: two K-tiles
           (8, 512, 1024, 512),  # K=1024: multiple K-tiles
-          (8, 512, 384, 512),   # K=384: K not divisible by 128
+          (8, 512, 320, 512),   # K=320: K not divisible by 128
       ),
   )
   def test_blockwise_fp8(self, use_as_qarray, task):

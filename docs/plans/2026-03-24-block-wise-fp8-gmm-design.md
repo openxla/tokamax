@@ -82,7 +82,7 @@ With tm=128, tk=128, tn=128:
 
 1. **`tokamax/_src/mosaic_tpu.py`** (~5 lines)
    - Relax Limitation 1 in `quant_block_spec()` (lines 112-121)
-   - Allow `eps` values where `eps % tile_size == 0 or tile_size % eps == 0`
+   - Allow `eps` values where `eps % tile_size == 0` (eps >= tile_size)
 
 2. **`tokamax/_src/ops/ragged_dot/pallas_mosaic_tpu_kernel.py`** (0 lines)
    - No kernel changes needed
