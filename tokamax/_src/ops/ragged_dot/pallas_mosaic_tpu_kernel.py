@@ -891,11 +891,11 @@ def tgmm(
   subchannel_iters = 1
   if isinstance(lhs, QArray):
     lhs_eps = pl.cdiv(lhs.qvalue.shape[0], lhs.scale.shape[0])
-    subchannel_iters = max(subchannel_iters, tk // lhs_eps)
+    subchannel_iters = max(subchannel_iters, tm // lhs_eps)
     lhs, lhs_block_spec = common.quant_block_spec(lhs, lhs_block_spec, 0)
   if isinstance(rhs, QArray):
     rhs_eps = pl.cdiv(rhs.qvalue.shape[0], rhs.scale.shape[0])
-    subchannel_iters = max(subchannel_iters, tk // rhs_eps)
+    subchannel_iters = max(subchannel_iters, tm // rhs_eps)
     rhs, rhs_block_spec = common.quant_block_spec(rhs, rhs_block_spec, 0)
 
   lhs_bytes = jax.tree.reduce(lambda acc, x: acc + x.size * x.itemsize, lhs, 0)

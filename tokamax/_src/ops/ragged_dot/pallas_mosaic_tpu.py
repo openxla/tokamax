@@ -196,10 +196,11 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         lhs_scale_k = lhs.scale.shape[1]
         block_size = lhs.qvalue.shape[1] // max(1, lhs_scale_k)
         fp8_dtype = lhs.qvalue.dtype
-        # For drhs (tgmm): lhs needs columnwise quantization
+        # For drhs (tgmm): lhs needs block-wise quantization along M axis
+        # (axis 0 is the reduction axis in tgmm: lhs.T @ dout)
         lhs_for_drhs = qwix.quantize(
             lhs_raw, fp8_dtype,
-            tiled_axes={0: lhs_raw.shape[0], 1: block_size},
+            tiled_axes={0: block_size, 1: lhs_raw.shape[1]},
         )
         # For dlhs: rhs needs quantization along a different axis
         rhs_for_dlhs = qwix.quantize(
