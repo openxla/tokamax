@@ -184,18 +184,18 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           )
       )
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
-      # STRATEGY 1: full-channel quantization along the reduction dimension
-      lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
-      rhs = maybe_quantize(rhs, (1, rhs.shape[1], 1))
-
-      # Pre-quantize columnwise for backward if FP8 block-wise
-      if return_residuals and isinstance(lhs, QArray) and _is_fp8(lhs.qvalue.dtype):
-        lhs_raw = quantization.as_array(lhs)
-        rhs_raw = quantization.as_array(rhs)
-        # Infer block size from lhs scale shape
-        lhs_scale_k = lhs.scale.shape[1]
-        block_size = lhs.qvalue.shape[1] // max(1, lhs_scale_k)
-        fp8_dtype = lhs.qvalue.dtype
+      # Pre-quantize columnwise for backward if FP8 block-wise.
+      # Done before rowwise quantization to avoid dequant->requant precision loss.
+      if return_residuals and self.qdtype is not None and _is_fp8(self.qdtype):
+        fp8_dtype = jnp.dtype(self.qdtype)
+        lhs_raw = quantization.as_array(lhs) if isinstance(lhs, QArray) else lhs
+        rhs_raw = quantization.as_array(rhs) if isinstance(rhs, QArray) else rhs
+        # Infer block size from the rowwise tiling of lhs: (1, K) means
+        # full-channel, so block_size = K. For block-wise, it's K / num_blocks.
+        block_size = lhs_raw.shape[1]  # default: full K
+        if isinstance(lhs, QArray):
+          lhs_scale_k = lhs.scale.shape[1]
+          block_size = lhs.qvalue.shape[1] // max(1, lhs_scale_k)
         # For drhs (tgmm): lhs needs block-wise quantization along M axis
         # (axis 0 is the reduction axis in tgmm: lhs.T @ dout)
         lhs_for_drhs = qwix.quantize(
@@ -212,6 +212,10 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
             rhs_for_dlhs=rhs_for_dlhs,
             activation_residuals=None,  # filled later
         )
+
+      # STRATEGY 1: full-channel quantization along the reduction dimension
+      lhs = maybe_quantize(lhs, (1, lhs.shape[1]))
+      rhs = maybe_quantize(rhs, (1, rhs.shape[1], 1))
 
       out = backend.gmm(
           lhs,
