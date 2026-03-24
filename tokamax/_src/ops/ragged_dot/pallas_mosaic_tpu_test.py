@@ -190,6 +190,43 @@ class FP8RaggedDotTest(absltest.TestCase):
   def test_fp8_forward_block256_as_qarray(self):
     self._run_fp8_forward(256, use_as_qarray=True)
 
+  def _run_fp8_vjp(self, block_size):
+    """Test FP8 block-wise forward + backward with forward-save optimization."""
+    num_groups, m, k, n = 4, 512, 256, 256
+    rng = jax.random.PRNGKey(42)
+    a = jax.random.normal(rng, (m, k), dtype=jnp.bfloat16) * 0.1
+    b = jax.random.normal(jax.random.split(rng)[0], (num_groups, k, n), dtype=jnp.bfloat16) * 0.1
+    group_sizes = jnp.array([m // num_groups] * num_groups, dtype=jnp.int32)
+
+    # FP8 quantized op
+    a_tile = {0: 1, 1: block_size}
+    b_tile = {0: 1, 1: block_size, 2: 1}
+    a_q = quantization.AsQArray(a, jnp.float8_e4m3fn, tiled_axes=a_tile)
+    b_q = quantization.AsQArray(b, jnp.float8_e4m3fn, tiled_axes=b_tile)
+
+    op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+    f = lambda a, b: op(a, b, group_sizes=group_sizes, preferred_element_type=jnp.float32)
+    f_ref = lambda a, b: test_base.ref(a, b, group_sizes)
+
+    # Forward
+    actual = f(a_q, b_q)
+    expected = f_ref(a, b)
+    count = sum(group_sizes)
+    chex.assert_trees_all_close(actual[:count], expected[:count], atol=1.0, rtol=0.2)
+
+    # Backward (sum to get scalar loss for grad)
+    actual_grads = jax.grad(lambda a, b: jnp.sum(f(a, b)), argnums=(0, 1))(a_q, b_q)
+    expected_grads = jax.grad(lambda a, b: jnp.sum(f_ref(a, b)), argnums=(0, 1))(a, b)
+
+    chex.assert_trees_all_close(actual_grads[0], expected_grads[0], atol=2.0, rtol=0.3)
+    chex.assert_trees_all_close(actual_grads[1], expected_grads[1], atol=2.0, rtol=0.3)
+
+  def test_fp8_vjp_block128(self):
+    self._run_fp8_vjp(128)
+
+  def test_fp8_vjp_block256(self):
+    self._run_fp8_vjp(256)
+
 
 if __name__ == "__main__":
   absltest.main()
