@@ -25,11 +25,27 @@ from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-importing-member,g-multiple-import
 from tokamax._src import jaxtyping
+from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_common as common
 
 
+def get_heuristics_config(ba: op.BoundArguments) -> common.Config:
+  del ba
+  return common.Config(
+      tile_m=128,
+      tile_n=64,
+      tile_k=64,
+      num_stages=4,
+  )
+
+
+def get_autotuning_configs(ba: op.BoundArguments) -> set[common.Config]:
+  del ba
+  return set()
+
+
 @jaxtyping.jaxtyped
-def gated_linear_unit_sm90(
+def gated_linear_unit(
     x: Float[Array, "*B M K"],
     weights: Float[Array, "K 2 N"],
     *,

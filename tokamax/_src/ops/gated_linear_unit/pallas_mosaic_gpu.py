@@ -27,12 +27,20 @@ from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_common as common
-from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_kernel_sm100
-from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_kernel_sm90
+from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_kernel_sm100 as sm100
+from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_kernel_sm90 as sm90
 from typing_extensions import override
 
 Residuals = base.Residuals
 Config = common.Config
+
+
+def _get_kernel_module():
+  if not gpu_utils.has_mosaic_gpu_support():
+    raise NotImplementedError("Mosaic GPU not supported on this platform.")
+  if not (gpu_utils.is_sm90() or gpu_utils.is_sm100()):
+    raise NotImplementedError("Only supported for sm90 and sm100 GPUs.")
+  return sm100 if gpu_utils.is_sm100() else sm90
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -75,22 +83,15 @@ class PallasMosaicGpuGatedLinearUnit(base.GatedLinearUnit[Config, None]):
     if not precision_lib.is_default(x.dtype, weights.dtype, precision):
       raise NotImplementedError(f"{precision=} is not supported.")
 
-    if gpu_utils.is_sm100():
-      glu_fn = pallas_mosaic_gpu_kernel_sm100.gated_linear_unit_sm100
-    elif gpu_utils.is_sm90():
-      glu_fn = pallas_mosaic_gpu_kernel_sm90.gated_linear_unit_sm90
-    else:
-      device_kind = backend.get_default_device().device_kind.lower()
-      raise NotImplementedError(f"Unsupported device kind: {device_kind}")
+    glu_fn = _get_kernel_module().gated_linear_unit
     fn = functools.partial(glu_fn, activation=activation, config=config)
     fn = self._with_vmap(fn, fallback_to_sequential=False)
     return fn(x, weights), None
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return Config(
-        tile_m=128,
-        tile_n=64,
-        tile_k=64,
-        num_stages=4,
-    )
+    return _get_kernel_module().get_heuristics_config(ba)
+
+  @override
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    return _get_kernel_module().get_autotuning_configs(ba)
