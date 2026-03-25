@@ -99,8 +99,10 @@ XLA, not inside the SM90 kernel). The autotuning config generator
 ## Performance
 
 Benchmarked on H100 (bfloat16 inputs, `mean` reduction). Triton is excluded
-below due to a JAX/Triton compiler segfault during autotuning compilation for
-vocab sizes >100k — a pre-existing upstream issue unrelated to this PR.
+below because the forward kernel segfaults during autotuning compilation for
+vocab sizes >100k — a pre-existing JAX/Triton LLVM thread-safety bug. The
+backward no longer uses a Triton kernel (chunked scan instead), so that
+contribution to the crashes is resolved, but the forward issue remains.
 
 ### Median wall-clock time (ms)
 
