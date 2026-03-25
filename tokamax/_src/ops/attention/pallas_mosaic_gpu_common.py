@@ -28,6 +28,7 @@ from jaxlib.mlir.dialects import nvvm
 from jaxlib.mlir.dialects import vector
 import numpy as np
 import pydantic
+from tokamax._src.ops.attention.base import Mask as _Mask
 
 
 @pydantic.dataclasses.dataclass(
@@ -59,6 +60,19 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
   """Decomposes `mask` into a mask array, `is_causal`, `k_start` and `k_end`."""
   if mask is None:
     return None, False, None, None
+
+  # After vmap batching, the Mask pytree may be incorrectly nested (a Mask
+  # appears as bool_mask instead of None). Normalize by flattening.
+  if isinstance(mask.bool_mask, _Mask):
+    inner = mask.bool_mask
+    mask = _Mask(
+        bool_mask=inner.bool_mask,
+        q_start=mask.q_start if mask.q_start is not None else inner.q_start,
+        q_end=mask.q_end if mask.q_end is not None else inner.q_end,
+        k_start=mask.k_start if mask.k_start is not None else inner.k_start,
+        k_end=mask.k_end if mask.k_end is not None else inner.k_end,
+        is_causal=mask.is_causal or inner.is_causal,
+    )
 
   is_causal = False
   k_start = None
