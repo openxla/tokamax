@@ -50,13 +50,29 @@ def get_heuristics_config(
 ) -> Config:
   """Returns a register-safe config based on the input shapes.
 
-  b_block=32 and v_block=128 are fixed: their product (4096) keeps the
-  (b_block, v_block) float32 accumulator at 32 registers per thread with
-  4 warps, well within the SM80/SM90 register budget. h_block scales with
-  H up to 128 to improve tensor-core utilisation without pressure risk.
+  Tile-size selection targets the register budget of SM80+ (65536 32-bit
+  registers per SM). With num_warps warps the per-thread accumulator cost
+  is b_block * v_block / (32 * num_warps) float32 registers.
+
+  When V is divisible by 256 we use larger tiles (b=64, v=256, warps=8):
+    accumulator: 64 * 256 / 256 = 64 regs — well within budget.
+  Otherwise we fall back to conservative tiles (b=32, v=128, warps=4):
+    accumulator: 32 * 128 / 128 = 32 regs.
+
+  h_block scales with H (64 or 128) to improve tensor-core utilisation.
   """
   _, h_dim = x.shape
+  v_dim = w.shape[1]
   h_block_size = 128 if h_dim % 128 == 0 else 64
+  if v_dim % 256 == 0:
+    # h_block capped at 64: with v_block=256 and warps=8 (256 threads), the
+    # w tile alone is h_block*256/256 regs; h=128 pushes total over ~200 regs.
+    return Config(
+        b_block_size=64,
+        h_block_size=64,
+        v_block_size=256,
+        num_warps=8,
+    )
   return Config(
       b_block_size=32,
       h_block_size=h_block_size,
