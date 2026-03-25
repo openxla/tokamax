@@ -652,9 +652,30 @@ def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
 
 
 def _abstractify(pytree):
+  from tokamax._src.ops.attention.base import Mask as _Mask
+
   def abstractify_leaf(x):
     if isinstance(x, (jax.Array, np.ndarray)):
       return jax.ShapeDtypeStruct(x.shape, x.dtype)
     return x
+
+  # Normalize nested Masks from vmap batching before abstractifying.
+  # After vmap, a Mask's bool_mask field may itself be a Mask (pytree
+  # reconstruction artifact). Flatten the nesting so serialization works.
+  def _normalize_mask(node):
+    if isinstance(node, _Mask) and isinstance(node.bool_mask, _Mask):
+      inner = node.bool_mask
+      node = _Mask(
+          bool_mask=inner.bool_mask,
+          q_start=node.q_start if node.q_start is not None else inner.q_start,
+          q_end=node.q_end if node.q_end is not None else inner.q_end,
+          k_start=node.k_start if node.k_start is not None else inner.k_start,
+          k_end=node.k_end if node.k_end is not None else inner.k_end,
+          is_causal=node.is_causal or inner.is_causal,
+      )
+    return node
+  pytree = jax.tree.map(
+      _normalize_mask, pytree, is_leaf=lambda x: isinstance(x, _Mask)
+  )
 
   return jax.tree.map(abstractify_leaf, pytree)
