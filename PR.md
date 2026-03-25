@@ -182,15 +182,15 @@ It is not a correctness defect.
 
 | File | Purpose |
 |---|---|
-| `pallas_triton_kernel.py` | Triton fwd + bwd kernel functions |
+| `pallas_triton_kernel.py` | Triton forward kernel |
 | `pallas_triton_config.py` | Config dataclass, autotuning search space |
-| `pallas_triton.py` | Op wrapper, VJP registration |
-| `pallas_triton_kernel_test.py` | Direct kernel tests (fwd + bwd, various block sizes) |
+| `pallas_triton.py` | Op wrapper, VJP (chunked-scan backward) |
+| `pallas_triton_kernel_test.py` | Direct forward kernel tests (various block sizes) |
 | `pallas_triton_test.py` | End-to-end Op value+grad tests |
-| `pallas_mosaic_gpu_kernel_sm90.py` | SM90 fwd + bwd kernel functions, `_kernel_zero_init` |
+| `pallas_mosaic_gpu_kernel_sm90.py` | SM90 forward kernel (WGMMA + TMA) |
 | `pallas_mosaic_gpu_common.py` | Config dataclass, autotuning search space |
-| `pallas_mosaic_gpu.py` | Op wrapper, VJP registration |
-| `pallas_mosaic_gpu_kernel_sm90_test.py` | Direct kernel tests (fwd + bwd, tile config sweep) |
+| `pallas_mosaic_gpu.py` | Op wrapper, VJP (chunked-scan backward) |
+| `pallas_mosaic_gpu_kernel_sm90_test.py` | Direct forward kernel tests (tile config sweep) |
 | `pallas_mosaic_gpu_test.py` | End-to-end Op value+grad tests |
 | `api.py` | Registers both backends, updates default selection |
 | `benchmarks/linear_softmax_cross_entropy_loss.py` | Benchmark harness |
