@@ -29,7 +29,6 @@ from typing_extensions import override
 
 
 Config = pallas_triton_config.Config
-Key = pallas_triton_config.Key
 
 def linear_softmax_cross_entropy_loss_bwd_chunked_scan(
     dout, lse, x, labels, w,
@@ -126,19 +125,9 @@ class PallasTritonLinearSoftmaxCrossEntropyLoss(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    x = ba.arguments["x"]
-    w = ba.arguments["w"]
-    return pallas_triton_config.get_heuristics_config(x, w)
-
-  @override
-  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    x = ba.arguments["x"]
-    w = ba.arguments["w"]
-    return pallas_triton_config.get_autotuning_configs(x, w)
-
-  @override
-  def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
-    return pallas_triton_config.get_key(**ba.arguments)
+    return pallas_triton_config.get_heuristics_config(
+        ba.arguments["x"], ba.arguments["w"]
+    )
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -183,23 +172,9 @@ class PallasTritonLinearSoftmaxCrossEntropyLossVjp(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    x = ba.arguments["x"]
-    w = ba.arguments["w"]
-    return pallas_triton_config.get_heuristics_config(x, w)
-
-  @override
-  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    x = ba.arguments["x"]
-    w = ba.arguments["w"]
-    return pallas_triton_config.get_autotuning_configs(x, w)
-
-  @override
-  def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
-    x = ba.arguments["x"]
-    labels = ba.arguments["labels"]
-    w = ba.arguments["w"]
-    reduction = ba.arguments["reduction"]
-    return pallas_triton_config.get_key(x, labels, w, reduction=reduction)
+    return pallas_triton_config.get_heuristics_config(
+        ba.arguments["x"], ba.arguments["w"]
+    )
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

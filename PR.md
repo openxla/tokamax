@@ -79,12 +79,9 @@ The last chunk is zero-padded so chunk_size (4096) divides cleanly for any
 vocab size (including irregular sizes like V=128256). Padded positions are
 masked by `valid = (col_idx < v_dim)` and contribute nothing.
 
-This avoids the `atomic_add` serialisation of the previous in-kernel backward
-design. Total FLOP count matches XLA; overhead is 32–38 sequential cuBLAS
+This avoids the `atomic_add` serialisation of a naïve in-kernel backward.
+Total FLOP count matches XLA; overhead is 32–38 sequential cuBLAS
 launches vs XLA's 2 full-width matmuls.
-
-The `_kernel_zero_init` helper (used only by the forward) remains in
-`pallas_mosaic_gpu_kernel_sm90.py` for any future in-kernel backward work.
 
 #### SMEM budget (forward only)
 
@@ -98,11 +95,10 @@ XLA, not inside the SM90 kernel). The autotuning config generator
 
 ## Performance
 
-Benchmarked on H100 (bfloat16 inputs, `mean` reduction). Triton is excluded
-below because the forward kernel segfaults during autotuning compilation for
-vocab sizes >100k — a pre-existing JAX/Triton LLVM thread-safety bug. The
-backward no longer uses a Triton kernel (chunked scan instead), so that
-contribution to the crashes is resolved, but the forward issue remains.
+Benchmarked on H100 (bfloat16 inputs, `mean` reduction). Triton numbers are
+not yet included — the benchmark was run before the autotuning configs were
+replaced with heuristics-based selection and the numbers need to be
+re-collected.
 
 ### Median wall-clock time (ms)
 

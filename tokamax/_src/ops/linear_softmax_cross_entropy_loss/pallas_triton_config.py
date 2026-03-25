@@ -14,12 +14,9 @@
 # ==============================================================================
 """Pallas-Triton linear softmax cross-entropy loss configuration."""
 
-from typing import Annotated, Any, TypeAlias
+from typing import Annotated
 
-import immutabledict
 import jax
-from jax.experimental import pallas as pl
-import jax.numpy as jnp
 import pydantic
 from tokamax._src import pydantic as pydantic_lib
 
@@ -47,83 +44,22 @@ class Config:
   num_warps: pydantic_lib.PowerOfTwo = 4
 
 
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
-
-
 def get_heuristics_config(
     x: jax.Array,
     w: jax.Array,
 ) -> Config:
-  """Returns a reasonable default config based on the input shapes."""
-  b_dim, h_dim = x.shape
-  v_dim = w.shape[1]
+  """Returns a register-safe config based on the input shapes.
 
-  # Pick the largest power-of-2 block sizes that divide the dimensions,
-  # capped at 1024 per the CLAUDE.md guideline.
-  def best_block(dim: int, default: int, cap: int = 1024) -> int:
-    size = default
-    while size * 2 <= cap and dim % (size * 2) == 0:
-      size *= 2
-    return size if dim % size == 0 else default
-
-  b_block_size = best_block(b_dim, 32)
-  h_block_size = best_block(h_dim, 64)
-  v_block_size = best_block(v_dim, 128)
-
+  b_block=32 and v_block=128 are fixed: their product (4096) keeps the
+  (b_block, v_block) float32 accumulator at 32 registers per thread with
+  4 warps, well within the SM80/SM90 register budget. h_block scales with
+  H up to 128 to improve tensor-core utilisation without pressure risk.
+  """
+  _, h_dim = x.shape
+  h_block_size = 128 if h_dim % 128 == 0 else 64
   return Config(
-      b_block_size=b_block_size,
+      b_block_size=32,
       h_block_size=h_block_size,
-      v_block_size=v_block_size,
+      v_block_size=128,
       num_warps=4,
-  )
-
-
-def get_autotuning_configs(x: jax.Array, w: jax.Array) -> set[Config]:
-  """Returns a bounded set of configs to try during autotuning."""
-  b_dim, h_dim = x.shape
-  v_dim = w.shape[1]
-
-  sizes = lambda dim: [
-      s for s in (16, 32, 64, 128, 256, 512, 1024) if dim % s == 0
-  ]
-
-  configs: set[Config] = set()
-  for b_block in sizes(b_dim):
-    for h_block in sizes(h_dim):
-      # Small h_block_size causes the backward kernel's Python-unrolled H loop
-      # to emit hundreds of iterations of Triton IR, which can OOM the LLVM
-      # compiler or trigger thread-safety crashes during parallel autotuning.
-      if h_block < 64:
-        continue
-      for v_block in sizes(v_dim):
-        # Large b_block * v_block tiles exceed register budget and produce
-        # oversized Triton IR that reliably segfaults the compiler.
-        if b_block * v_block > 65536:
-          continue
-        for num_warps in (4, 8):
-          configs.add(
-              Config(
-                  b_block_size=b_block,
-                  h_block_size=h_block,
-                  v_block_size=v_block,
-                  num_warps=num_warps,
-              )
-          )
-  return configs
-
-
-def get_key(
-    x: jax.Array,
-    labels: jax.Array,
-    w: jax.Array,
-    *,
-    reduction: str,
-    **_kwargs,
-) -> Key:
-  """Returns the autotuning cache lookup key for the given arguments."""
-  return immutabledict.immutabledict(
-      x=jax.ShapeDtypeStruct(x.shape, x.dtype),
-      labels=jax.ShapeDtypeStruct(labels.shape, labels.dtype),
-      w=jax.ShapeDtypeStruct(w.shape, w.dtype),
-      reduction=reduction,
   )
