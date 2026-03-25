@@ -22,7 +22,7 @@ from jaxtyping import Array, Integer, Real, Scalar  # pylint: disable=g-multiple
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
 
 
-Implementation: TypeAlias = Literal["mosaic_tpu", "triton", "xla"]
+Implementation: TypeAlias = Literal["mosaic_gpu", "mosaic_tpu", "triton", "xla"]
 
 IMPLEMENTATIONS = dict(xla=base.LinearSoftmaxCrossEntropyLoss())
 _DEFAULT_IMPLEMENTATION = ("xla",)
@@ -46,6 +46,17 @@ try:
   )
 
   _DEFAULT_IMPLEMENTATION = ("mosaic_tpu",) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_gpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["mosaic_gpu"] = (
+      pallas_mosaic_gpu.PallasMosaicGpuLinearSoftmaxCrossEntropyLoss()
+  )
+
+  _DEFAULT_IMPLEMENTATION = ("mosaic_gpu",) + _DEFAULT_IMPLEMENTATION
 except ImportError:
   pass
 
@@ -83,10 +94,11 @@ def linear_softmax_cross_entropy_loss(
     precision: The precision used for jax.lax.dot_general for the linear
       projection and gradient calculation.
     implementation: By default "None" will be used to pick the best available
-      backend. Can be set to "xla", "mosaic_tpu", or "triton" explicitly. The
-      "mosaic_tpu" and "triton" implementations are memory efficient and have
-      almost 0 additional buffer overhead while the "xla" implementation needs
-      to materialize the full logits
+      backend. Can be set to "xla", "mosaic_tpu", "triton", or "mosaic_gpu"
+      explicitly. The "mosaic_gpu", "mosaic_tpu", and "triton" implementations
+      are memory efficient and have almost 0 additional buffer overhead while
+      the "xla" implementation needs to materialize the full logits. On H100+,
+      "mosaic_gpu" is preferred (WGMMA + TMA); "triton" covers SM80 (Ampere)
 
   Returns:
     The Cross-Entropy loss
