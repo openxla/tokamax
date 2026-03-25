@@ -19,7 +19,7 @@
 from collections.abc import Callable
 import functools
 import json
-
+from typing import Final
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
@@ -34,6 +34,9 @@ from tokamax._src.ops.ragged_dot import base
 
 CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
+
+_KERNEL_NAME_GMM: Final[str] = "pallas_tpu_ragged_dot_gmm"
+_KERNEL_NAME_TGMM: Final[str] = "pallas_tpu_ragged_dot_tgmm"
 
 
 def _validate_args(
@@ -362,8 +365,7 @@ def gmm(
     rhs_qdtype: Quant dtype to quantize rhs to if rhs is not already quantized.
     rhs_static_scale: Compile-time scale when quantizing rhs instead of
       computing it from rhs values.
-    activation: Activation function to apply to the output of the dot
-      operation.
+    activation: Activation function to apply to the output of the dot operation.
 
   Returns:
     A 2d, jax.Array with shape [m, n].
@@ -565,7 +567,7 @@ def gmm(
   cost_estimate = pl.CostEstimate(
       flops=2 * m * k * n, bytes_accessed=bytes_accessed, transcendentals=0
   )
-  kernel_name = "gmm_megablox"
+  kernel_name = _KERNEL_NAME_GMM
   if transpose_rhs:
     kernel_name += "_transpose_rhs"
   metadata = dict(
@@ -664,8 +666,7 @@ def tgmm(
     rhs_qdtype: Quant dtype to quantize rhs to if rhs is not already quantized.
     rhs_static_scale: Compile-time scale when quantizing rhs instead of
       computing it from rhs values.
-    activation: Activation function to apply to the output of the dot
-      operation.
+    activation: Activation function to apply to the output of the dot operation.
 
   Returns:
     A  3d, jax.Array with shape [num_groups, k, n].
@@ -827,7 +828,9 @@ def tgmm(
             out_ref[...] = activation(jnp.zeros_like(out_ref))
           else:
             out_ref[...] = jnp.zeros_like(out_ref)
+
     else:
+
       @pl.when(is_prologue)
       def _stage1():
         with jax.named_scope("zero_accum"):
@@ -886,7 +889,7 @@ def tgmm(
       flops=2 * m * k * n, bytes_accessed=bytes_accessed, transcendentals=0
   )
 
-  kernel_name = "tgmm_megablox"
+  kernel_name = _KERNEL_NAME_TGMM
   metadata = dict(
       tiling=dict(tile_m=tm, tile_k=tk, tile_n=tn),
       prefer_element_type=jnp.dtype(out_dtype).name,

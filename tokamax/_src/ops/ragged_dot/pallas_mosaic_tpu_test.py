@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tokamax Megablox TPU tests for core functionality."""
+"""Tests for Pallas Mosaic TPU Ragged Dot."""
 
 from absl.testing import absltest
 import jax

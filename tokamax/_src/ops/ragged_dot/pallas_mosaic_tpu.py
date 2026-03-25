@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pallas Mosaic TPU Megablox."""
+"""Ragged dot Pallas-Mosaic-TPU implementation."""
 
 import dataclasses
 import functools
@@ -171,7 +171,6 @@ TGMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
     (131072, 512, 7168, 256, False): ((256, 256, 7168), 3),
 }
 
-# Ragged dot dimension numbers supported by the megablox kernel.
 DEFAULT_RAGGED_DOT_DIM_NUMS = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
 DLHS_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
