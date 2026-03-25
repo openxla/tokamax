@@ -80,7 +80,7 @@ class LinearSoftmaxCrossEntropyLossBenchmark(parameterized.TestCase):
   """Benchmarks for linear softmax cross-entropy loss."""
 
   @parameterized.product(
-      implementation=(None, 'xla', 'triton'),
+      implementation=(None, 'xla', 'triton', 'mosaic_gpu'),
       benchmark_mode=('forward', 'forward_and_vjp'),
       args_spec_name=tuple(EXAMPLES.keys()),
   )
@@ -91,8 +91,8 @@ class LinearSoftmaxCrossEntropyLossBenchmark(parameterized.TestCase):
     if str(implementation) in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(f'Skipping implementation {implementation}')
 
-    if implementation == 'triton' and jax.default_backend() != 'gpu':
-      self.skipTest('Triton implementation is GPU-only.')
+    if implementation in ('triton', 'mosaic_gpu') and jax.default_backend() != 'gpu':
+      self.skipTest(f'{implementation} implementation is GPU-only.')
 
     example = EXAMPLES[args_spec_name] | {'implementation': implementation}
     fn, args = tokamax.standardize_function(
