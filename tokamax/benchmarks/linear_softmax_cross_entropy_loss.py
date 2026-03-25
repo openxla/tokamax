@@ -40,37 +40,37 @@ EXAMPLES = {
     'qwen3-8b': {
         'x': jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16),
         'labels': jax.ShapeDtypeStruct((4096,), jnp.int32),
-        'w': jax.ShapeDtypeStruct((4096, 151936), jnp.bfloat16),
+        'weights':jax.ShapeDtypeStruct((4096, 151936), jnp.bfloat16),
         'reduction': 'mean',
     },
     'gemma3-4b': {
         'x': jax.ShapeDtypeStruct((4096, 2560), jnp.bfloat16),
         'labels': jax.ShapeDtypeStruct((4096,), jnp.int32),
-        'w': jax.ShapeDtypeStruct((2560, 262144), jnp.bfloat16),
+        'weights':jax.ShapeDtypeStruct((2560, 262144), jnp.bfloat16),
         'reduction': 'mean',
     },
     'gemma3-7b': {
         'x': jax.ShapeDtypeStruct((4096, 3840), jnp.bfloat16),
         'labels': jax.ShapeDtypeStruct((4096,), jnp.int32),
-        'w': jax.ShapeDtypeStruct((3840, 262144), jnp.bfloat16),
+        'weights':jax.ShapeDtypeStruct((3840, 262144), jnp.bfloat16),
         'reduction': 'mean',
     },
     'llama3.1-8b': {
         'x': jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16),
         'labels': jax.ShapeDtypeStruct((4096,), jnp.int32),
-        'w': jax.ShapeDtypeStruct((4096, 128256), jnp.bfloat16),
+        'weights':jax.ShapeDtypeStruct((4096, 128256), jnp.bfloat16),
         'reduction': 'mean',
     },
     'deepseek-v3-671b': {
         'x': jax.ShapeDtypeStruct((8192, 7168), jnp.bfloat16),
         'labels': jax.ShapeDtypeStruct((8192,), jnp.int32),
-        'w': jax.ShapeDtypeStruct((7168, 128256), jnp.bfloat16),
+        'weights':jax.ShapeDtypeStruct((7168, 128256), jnp.bfloat16),
         'reduction': 'mean',
     },
     'gpt-oss-120b': {
         'x': jax.ShapeDtypeStruct((4096, 2880), jnp.bfloat16),
         'labels': jax.ShapeDtypeStruct((4096,), jnp.int32),
-        'w': jax.ShapeDtypeStruct((2880, 201088), jnp.bfloat16),
+        'weights':jax.ShapeDtypeStruct((2880, 201088), jnp.bfloat16),
         'reduction': 'mean',
     },
 }
