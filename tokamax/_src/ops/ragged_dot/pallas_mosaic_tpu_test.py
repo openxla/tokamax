@@ -15,6 +15,7 @@
 """Tokamax Megablox TPU tests for core functionality."""
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
@@ -38,10 +39,11 @@ def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
   cdiv = lambda x, y: (x + y - 1) // y
   eps_list = [cdiv(x, y) for x, y in zip(x.qvalue.shape, x.scale.shape)]
   for ax, (mas, eps) in enumerate(zip(min_addressable_sizes, eps_list)):
-    if eps != 1 and eps % mas != 0:
+    if eps != 1 and (eps % mas != 0 and eps != x.qvalue.shape[ax]):
       return False
-    if ax != axis and not (eps == 1 or eps == x.qvalue.shape[ax]):
-      return False
+  # Reduction axis eps must be >= min_addressable_size (Limitation 2).
+  if eps_list[axis] < min_addressable_sizes[axis]:
+    return False
   return True
 
 
@@ -115,6 +117,28 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
           b_tile_shape,
           use_as_qarray,
           activation,
+          task,
+      )
+
+  @parameterized.product(
+      use_as_qarray=(True, False),
+      task=(
+          (8, 512, 128, 512),   # K=128: single K-tile
+          (8, 512, 256, 512),   # K=256: two K-tiles
+          (8, 512, 1024, 512),  # K=1024: multiple K-tiles
+          (8, 512, 384, 512),   # K=384: odd number of K-tiles (3)
+      ),
+  )
+  def test_blockwise_fp8(self, use_as_qarray, task):
+    """DeepSeek-V3 style: LHS 1x128 activation + RHS 128x128 weight."""
+    with test_base.override_chex_args(atol=0.4, rtol=0.1):
+      super()._test_quantized(
+          "float8_e4m3fn",
+          "float8_e4m3fn",
+          (1, 128),        # LHS: per-row, per-128-channel (1x128)
+          (1, 128, 128),   # RHS: 128x128 block
+          use_as_qarray,
+          None,             # no activation
           task,
       )
 
