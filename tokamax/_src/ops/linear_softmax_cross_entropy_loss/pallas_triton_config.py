@@ -90,7 +90,16 @@ def get_autotuning_configs(x: jax.Array, w: jax.Array) -> set[Config]:
   configs: set[Config] = set()
   for b_block in sizes(b_dim):
     for h_block in sizes(h_dim):
+      # Small h_block_size causes the backward kernel's Python-unrolled H loop
+      # to emit hundreds of iterations of Triton IR, which can OOM the LLVM
+      # compiler or trigger thread-safety crashes during parallel autotuning.
+      if h_block < 64:
+        continue
       for v_block in sizes(v_dim):
+        # Large b_block * v_block tiles exceed register budget and produce
+        # oversized Triton IR that reliably segfaults the compiler.
+        if b_block * v_block > 65536:
+          continue
         for num_warps in (4, 8):
           configs.add(
               Config(

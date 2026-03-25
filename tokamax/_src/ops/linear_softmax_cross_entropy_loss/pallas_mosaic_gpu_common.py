@@ -61,7 +61,7 @@ def get_autotuning_configs(x: jax.Array, w: jax.Array) -> set[Config]:
   b_dim, h_dim = x.shape
   v_dim = w.shape[1]
 
-  tile_ms = [t for t in (64, 128) if b_dim % (2 * t) == 0]
+  tile_ms = [t for t in (128,) if b_dim % (2 * t) == 0]
   tile_ns = [t for t in (64, 128, 256) if v_dim % t == 0]
   tile_ks = [t for t in (32, 64, 128) if h_dim % t == 0]
   num_stages_opts = [2, 4]
