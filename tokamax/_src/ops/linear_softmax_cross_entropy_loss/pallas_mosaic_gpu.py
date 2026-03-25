@@ -132,8 +132,8 @@ class PallasMosaicGpuLinearSoftmaxCrossEntropyLoss(
 ):
   """Pallas/Mosaic-GPU SM90 forward + backward for linear softmax CE loss.
 
-  Both forward and backward use WGMMA + TMA pipelining on H100 (SM90).
-  No Triton dependency.
+  Forward: SM90 WGMMA + TMA kernel (H100+).
+  Backward: chunked scan over V using cuBLAS GEMMs (no atomics, no WGMMA).
   """
 
   config_cls: ClassVar[type[Config]] = Config

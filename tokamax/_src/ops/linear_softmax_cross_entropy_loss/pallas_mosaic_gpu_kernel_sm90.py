@@ -21,16 +21,11 @@ compute the matmul x[b_tile,:] @ w[:,v_tile] and the epilogue reduces to
 per-token logsumexp. The correct-class logit is computed outside the kernel as
 a cheap O(B*H) XLA einsum (gather + dot).
 
-Algorithm (backward): also tiles (B, V) with inner H pipelines, fully on
-Mosaic GPU with no Triton dependency.
-  Phase 1 – recompute logit tile (same WGMMA pipeline as forward), compute
-            s_tile = scale * (softmax(logit) - one_hot) and stage to SMEM.
-  Phase 2 – two WGMMA ops per K-step over the same (x, w) tiles:
-            x_grad[b, k] += s_tile @ w[:, v_tile].T  (A=s_smem, B=w_smem.T)
-            w_grad[k, v] += x[b, :].T @ s_tile        (A=x_smem.T, B=s_smem)
-  Both phases reuse the same pipeline_allocs (same in_specs, num_stages_bwd=2).
-  Outputs are zero-initialised via _kernel_zero_init; atomic_add accumulates
-  contributions from different (b_cta, v) iterations on each SM.
+Algorithm (backward): implemented in pallas_mosaic_gpu.py as a jax.lax.scan
+over padded vocabulary chunks, issuing cuBLAS GEMMs per chunk (not WGMMA).
+The in-kernel backward (linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_gpu_sm90)
+exists and is tested, but is not wired into the Op — it was superseded by the
+chunked-scan approach which avoids atomic_add serialisation across CTAs.
 """
 
 import functools
