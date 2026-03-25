@@ -11,7 +11,7 @@ appears in HBM.
 - **Triton** (`pallas_triton_*`): forward + backward, targets SM80+ (Ampere and up). Float32 accumulation throughout.
 - **Mosaic GPU SM90** (`pallas_mosaic_gpu_*`): forward + backward, targets H100+ (SM90). WGMMA + TMA pipelining; two warp groups per CTA.
 
-The `api.py` default selection order is: `mosaic_gpu` → `mosaic_tpu` → `triton` → `xla`, with each backend skipped if unavailable.
+The `api.py` default selection order is: `mosaic_tpu` → `triton` → `xla`. `mosaic_gpu` is registered but **not** in the default chain — its backward is ~3× slower than XLA (see Performance below), so it should only be used via explicit `implementation='mosaic_gpu'` when the `(B, V)` logit matrix would OOM the device.
 
 Also adds a benchmark harness (`benchmarks/linear_softmax_cross_entropy_loss.py`) registered in `benchmark_registry.pbtxt` (H100, B200, TPU-v6e, TPU-v7 environments), and updates the README.
 

@@ -56,7 +56,11 @@ try:
       pallas_mosaic_gpu.PallasMosaicGpuLinearSoftmaxCrossEntropyLoss()
   )
 
-  _DEFAULT_IMPLEMENTATION = ("mosaic_gpu",) + _DEFAULT_IMPLEMENTATION
+  # mosaic_gpu is NOT added to _DEFAULT_IMPLEMENTATION. Its forward is at XLA
+  # parity but its backward is ~3× slower (chunked scan over V vs two full-width
+  # cuBLAS matmuls). The benefit is memory: the (B, V) logit matrix is never
+  # materialised. Use implementation='mosaic_gpu' explicitly when the logit
+  # matrix would OOM the device.
 except ImportError:
   pass
 
@@ -95,10 +99,14 @@ def linear_softmax_cross_entropy_loss(
       projection and gradient calculation.
     implementation: By default "None" will be used to pick the best available
       backend. Can be set to "xla", "mosaic_tpu", "triton", or "mosaic_gpu"
-      explicitly. The "mosaic_gpu", "mosaic_tpu", and "triton" implementations
-      are memory efficient and have almost 0 additional buffer overhead while
-      the "xla" implementation needs to materialize the full logits. On H100+,
-      "mosaic_gpu" is preferred (WGMMA + TMA); "triton" covers SM80 (Ampere)
+      explicitly. The default selection order is mosaic_tpu → triton → xla,
+      with each backend skipped if unavailable on the current device.
+      "mosaic_gpu" is available on H100+ (SM90) but is not in the default
+      chain: its forward is at XLA parity but its backward is ~3× slower due
+      to chunked-scan accumulation. Use implementation='mosaic_gpu' explicitly
+      when the (B, V) logit matrix would OOM the device — that is the intended
+      use case. "mosaic_tpu" and "triton" are memory-efficient and avoid
+      materialising the full logit matrix.
 
   Returns:
     The Cross-Entropy loss
