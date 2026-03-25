@@ -47,6 +47,15 @@ QArray = base.QArray
 AsQArray = base.AsQArray
 Residuals = types.NoneType
 
+LUTKey = tuple[
+    pydantic.PositiveInt,  # m
+    pydantic.PositiveInt,  # k
+    pydantic.PositiveInt,  # n
+    pydantic.PositiveInt,  # g
+    bool,  # is_quantized
+]
+LUTValue = tuple[TilingTuple, InputBufferCount]
+
 
 def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
   gsc = jnp.concat([jnp.zeros((1,), gs.dtype), jnp.cumsum(gs)])
@@ -66,6 +75,101 @@ class Config:
   input_buffer_count: InputBufferCount = 2
   combine_scopes: bool = False
 
+
+# A temporary lookup table for optimized configs.
+# TODO: formally add autotuning to the vjp.
+GMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
+    (262144, 7168, 2048, 256, False): ((256, 7168, 512), 2),
+    (262144, 7168, 2048, 256, True): ((128, 7168, 2048), 2),
+    (262144, 2048, 7168, 256, False): ((128, 2048, 3584), 2),
+    (262144, 2048, 7168, 256, True): ((256, 2048, 3584), 3),
+    (262144, 7168, 256, 256, False): ((1024, 128, 256), 3),
+    (262144, 256, 7168, 256, False): ((512, 1024, 2048), 4),
+    (327680, 2880, 2880, 128, False): ((512, 2944, 1536), 2),
+    (393216, 2048, 768, 128, False): ((512, 2048, 768), 2),
+    (393216, 768, 2048, 128, False): ((1024, 768, 2048), 2),
+    (524288, 4096, 1536, 128, False): ((256, 4096, 1536), 2),
+    (524288, 1536, 4096, 128, False): ((512, 1536, 1536), 2),
+    (524288, 7168, 2048, 16, False): ((1024, 1024, 1024), 2),
+    (524288, 7168, 2048, 16, True): ((1024, 1024, 1024), 2),
+    (524288, 2048, 7168, 16, False): ((256, 256, 7168), 3),
+    (524288, 2048, 7168, 16, True): ((256, 256, 7168), 3),
+    (262144, 4096, 1536, 128, False): ((256, 4096, 1536), 2),
+    (262144, 1536, 4096, 128, False): ((256, 1536, 4096), 2),
+    (131072, 7168, 2048, 256, False): ((128, 7168, 1024), 2),
+    (131072, 2048, 7168, 256, False): ((128, 2048, 3584), 2),
+    (131072, 4096, 1536, 128, False): ((256, 4096, 1536), 2),
+    (131072, 1536, 4096, 128, False): ((256, 1536, 4096), 2),
+    (131072, 7168, 2048, 256, False): ((512, 3584, 1024), 2),
+    (65536, 7168, 2048, 256, False): ((256, 3584, 1024), 2),
+    (262144, 7168, 512, 256, False): ((512, 7168, 512), 2),
+    (262144, 512, 7168, 256, False): ((256, 512, 7168), 2),
+    (262144, 7168, 1024, 256, False): ((512, 7168, 1024), 2),
+    (262144, 1024, 7168, 256, False): ((256, 1024, 7168), 3),
+    (131072, 7168, 512, 256, False): ((128, 7168, 512), 3),
+    (131072, 512, 7168, 256, False): ((256, 512, 7168), 2),
+}
+GMM_RHS_TRANSPOSE_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
+    (262144, 7168, 2048, 256, False): ((256, 2048, 1792), 2),
+    (262144, 7168, 2048, 256, True): ((256, 2048, 3584), 2),
+    (262144, 2048, 7168, 256, False): ((256, 7168, 512), 2),
+    (262144, 2048, 7168, 256, True): ((256, 7168, 1024), 2),
+    (262144, 7168, 256, 256, False): ((256, 512, 1792), 2),
+    (262144, 256, 7168, 256, False): ((512, 7168, 128), 4),
+    (327680, 2880, 2880, 128, False): ((512, 2944, 1536), 2),
+    (393216, 2048, 768, 128, False): ((1024, 768, 2048), 2),
+    (393216, 768, 2048, 128, False): ((512, 2048, 768), 2),
+    (524288, 4096, 1536, 128, False): ((1024, 1536, 1024), 2),
+    (524288, 1536, 4096, 128, False): ((1024, 1024, 1536), 2),
+    (524288, 7168, 2048, 16, False): ((512, 2048, 1792), 4),
+    (524288, 7168, 2048, 16, True): ((512, 2048, 1792), 4),
+    (524288, 2048, 7168, 16, False): ((512, 2048, 1792), 4),
+    (262144, 4096, 1536, 128, False): ((512, 1536, 1024), 2),
+    (262144, 1536, 4096, 128, False): ((1024, 1024, 1536), 2),
+    (131072, 7168, 2048, 256, False): ((256, 2048, 1792), 2),
+    (131072, 2048, 7168, 256, False): ((512, 7168, 512), 2),
+    (131072, 4096, 1536, 128, False): ((512, 1536, 1024), 2),
+    (131072, 1536, 4096, 128, False): ((512, 1024, 1536), 2),
+    (131072, 7168, 2048, 256, False): ((512, 2048, 1792), 2),
+    (65536, 7168, 2048, 256, False): ((512, 2048, 1024), 2),
+    (262144, 7168, 512, 256, False): ((256, 512, 7168), 2),
+    (262144, 512, 7168, 256, False): ((256, 7168, 512), 2),
+    (262144, 7168, 1024, 256, False): ((512, 1024, 7168), 2),
+    (262144, 1024, 7168, 256, False): ((256, 7168, 1024), 2),
+    (131072, 7168, 512, 256, False): ((256, 512, 7168), 2),
+    (131072, 512, 7168, 256, False): ((256, 7168, 512), 3),
+}
+TGMM_TILING_TUNED_LUT: dict[LUTKey, LUTValue] = {
+    (262144, 7168, 2048, 256, False): ((512, 1024, 2048), 3),
+    (262144, 7168, 2048, 256, True): ((512, 1024, 2048), 2),
+    (262144, 2048, 7168, 256, False): ((256, 2048, 1024), 3),
+    (262144, 2048, 7168, 256, True): ((512, 512, 3584), 2),
+    (262144, 7168, 256, 256, False): ((1024, 128, 1024), 3),
+    (262144, 256, 7168, 256, False): ((1024, 256, 1024), 3),
+    (327680, 2880, 2880, 128, False): ((512, 2944, 768), 2),
+    (393216, 2048, 768, 128, False): ((512, 2048, 768), 3),
+    (393216, 768, 2048, 128, False): ((512, 768, 2048), 3),
+    (524288, 4096, 1536, 128, False): ((512, 4096, 512), 2),
+    (524288, 1536, 4096, 128, False): ((512, 512, 4096), 2),
+    (524288, 7168, 2048, 16, False): ((256, 512, 3584), 4),
+    (524288, 7168, 2048, 16, True): ((256, 512, 3584), 4),
+    (524288, 2048, 7168, 16, False): ((256, 512, 3584), 4),
+    (524288, 2048, 7168, 16, True): ((256, 512, 3584), 4),
+    (262144, 4096, 1536, 128, False): ((512, 4096, 512), 2),
+    (262144, 1536, 4096, 128, False): ((512, 512, 4096), 2),
+    (131072, 7168, 2048, 256, False): ((256, 1024, 2048), 2),
+    (131072, 2048, 7168, 256, False): ((256, 2048, 1024), 2),
+    (131072, 4096, 1536, 128, False): ((512, 1024, 1536), 2),
+    (131072, 1536, 4096, 128, False): ((512, 512, 4096), 2),
+    (131072, 7168, 2048, 256, False): ((256, 1792, 1024), 3),
+    (65536, 7168, 2048, 256, False): ((256, 1024, 2048), 2),
+    (262144, 7168, 512, 256, False): ((256, 7168, 512), 3),
+    (262144, 512, 7168, 256, False): ((512, 512, 7168), 2),
+    (262144, 7168, 1024, 256, False): ((256, 3584, 1024), 4),
+    (262144, 1024, 7168, 256, False): ((512, 1024, 3584), 2),
+    (131072, 7168, 512, 256, False): ((256, 7168, 512), 3),
+    (131072, 512, 7168, 256, False): ((256, 256, 7168), 3),
+}
 
 # Ragged dot dimension numbers supported by the megablox kernel.
 DEFAULT_RAGGED_DOT_DIM_NUMS = base.DEFAULT_RAGGED_DOT_DIM_NUMS
@@ -243,7 +347,66 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return Config()
+    lhs, rhs = ba.arguments["lhs"], ba.arguments["rhs"]
+
+    # this is generally an incorrect assumption, but ok for a heuristic
+    is_quantized = isinstance(lhs, QArray) or isinstance(rhs, QArray)
+
+    ragged_dot_dimension_numbers = ba.arguments.get(
+        "ragged_dot_dimension_numbers", DEFAULT_RAGGED_DOT_DIM_NUMS
+    )
+    default_config = Config()
+    if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
+      (m, k), (g, _, n) = lhs.shape, rhs.shape
+      lut_key = (m, k, n, g, is_quantized)
+      if lut_key in GMM_TILING_TUNED_LUT:
+        (tile_m, tile_k, tile_n), input_buffer_count = GMM_TILING_TUNED_LUT[
+            lut_key
+        ]
+        return Config(
+            input_buffer_count=input_buffer_count,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        )
+      return default_config
+    elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:
+      grad = lhs
+      (m, n), (g, k, _) = grad.shape, rhs.shape  # lhs is out
+      lut_key = (m, k, n, g, is_quantized)
+      if lut_key in GMM_RHS_TRANSPOSE_TILING_TUNED_LUT:
+        (tile_m, tile_k, tile_n), input_buffer_count = (
+            GMM_RHS_TRANSPOSE_TILING_TUNED_LUT[lut_key]
+        )
+        return Config(
+            input_buffer_count=input_buffer_count,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        )
+      return default_config
+    elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:
+      group_sizes = ba.arguments["group_sizes"]
+      grad = rhs
+      if isinstance(group_sizes, base.GroupSizes):
+        group_sizes = jnp.array(group_sizes)
+      (m, k), (_, n), g = lhs.shape, grad.shape, group_sizes.shape[0]
+      lut_key = (m, k, n, g, is_quantized)
+      if lut_key in TGMM_TILING_TUNED_LUT:
+        (tile_m, tile_k, tile_n), input_buffer_count = TGMM_TILING_TUNED_LUT[
+            lut_key
+        ]
+        return Config(
+            input_buffer_count=input_buffer_count,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        )
+      return default_config
+    else:
+      raise NotImplementedError(
+          UNSUPPORTED_DIMENSIONS_MSG.format(ragged_dot_dimension_numbers)
+      )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
