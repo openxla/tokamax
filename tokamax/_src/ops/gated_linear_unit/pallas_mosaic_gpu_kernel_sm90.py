@@ -40,8 +40,38 @@ def get_heuristics_config(ba: op.BoundArguments) -> common.Config:
 
 
 def get_autotuning_configs(ba: op.BoundArguments) -> set[common.Config]:
+  """Returns the autotuning configs for the Pallas:MGPU GLU SM90 kernel."""
   del ba
-  return set()
+  configs = set()
+  tile_n = 64
+  epi_tile_m = 64
+  grid_minor_dim = common.MatmulDimension.N
+  for tile_m in (128, 256):
+    for tile_k in (64, 128, 256):
+      for num_stages in (1, 2, 4):
+        for epi_tile_n in (16, 32):
+          for grid_tile_width in (1, 2, 4, 8, 16):
+            for wg_dimension in (
+                common.MatmulDimension.M, common.MatmulDimension.N
+            ):
+              for cluster_size_m in (1, 2):
+                for cluster_size_n in (1, 2):
+                  configs.add(
+                      common.Config(
+                          tile_m=tile_m,
+                          tile_n=tile_n,
+                          tile_k=tile_k,
+                          num_stages=num_stages,
+                          epi_tile_n=epi_tile_n,
+                          epi_tile_m=epi_tile_m,
+                          grid_minor_dim=grid_minor_dim,
+                          grid_tile_width=grid_tile_width,
+                          wg_dimension=wg_dimension,
+                          cluster_size_m=cluster_size_m,
+                          cluster_size_n=cluster_size_n,
+                      )
+                  )
+  return configs
 
 
 @jaxtyping.jaxtyped
