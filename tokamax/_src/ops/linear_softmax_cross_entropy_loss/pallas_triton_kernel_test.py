@@ -83,6 +83,17 @@ class PallasTritonLceFwdKernelTest(parameterized.TestCase):
           v_block_size=128,
           dtype=jnp.bfloat16,
       ),
+      dict(
+          # V=300 is not divisible by v_block_size=128; last chunk is padded.
+          testcase_name="v_not_divisible_by_block",
+          b_dim=64,
+          h_dim=128,
+          v_dim=300,
+          reduction="mean",
+          b_block_size=32,
+          h_block_size=64,
+          v_block_size=128,
+      ),
   )
   def test_forward_matches_reference(
       self,
@@ -93,6 +104,7 @@ class PallasTritonLceFwdKernelTest(parameterized.TestCase):
       b_block_size,
       h_block_size,
       v_block_size,
+      num_warps=4,
       dtype=jnp.float32,
   ):
     x, labels, w = test_utils.generate_random_data(
@@ -107,6 +119,7 @@ class PallasTritonLceFwdKernelTest(parameterized.TestCase):
         b_block_size=b_block_size,
         h_block_size=h_block_size,
         v_block_size=v_block_size,
+        num_warps=num_warps,
         reduction=reduction,
     )
 

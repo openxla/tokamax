@@ -42,11 +42,6 @@ def _validate_inputs(
         f"Batch dimension B={b_dim} must be divisible by"
         f" b_block_size={b_block_size}."
     )
-  if v_dim % v_block_size != 0:
-    raise ValueError(
-        f"Vocab dimension V={v_dim} must be divisible by"
-        f" v_block_size={v_block_size}."
-    )
   if w.shape[0] != h_dim:
     raise ValueError(
         f"w hidden dim {w.shape[0]} must match x hidden dim {h_dim}."
@@ -73,6 +68,7 @@ def _lce_fwd_kernel(
     h_block_size: int,
     num_h_blocks: int,
     v_block_size: int,
+    v_dim: int,
 ):
   """Per-(b_block, v_block) tile: fused matmul + logsumexp + correct-logit.
 
@@ -83,8 +79,13 @@ def _lce_fwd_kernel(
 
   These are combined outside the kernel: lse = logsumexp(tile_lse, axis=-1) and
   correct_logit = sum(correct_logit, axis=-1), giving the final per-token loss.
+
+  w may be zero-padded to the next multiple of v_block_size. Padded columns are
+  masked to -inf before the logsumexp so they contribute nothing. correct_logit
+  uses the unmasked xw_tile; one_hot is 0 for padded columns (labels < v_dim).
   """
   v_idx = pl.program_id(1)
+  v_start = v_idx * v_block_size
 
   # Accumulate x[b_block, :] @ w[:, v_block] across H blocks in float32.
   def h_body(h_idx, acc):
@@ -105,15 +106,20 @@ def _lce_fwd_kernel(
       jnp.zeros((b_block_size, v_block_size), dtype=jnp.float32),
   )
 
+  # Mask zero-padded columns to -inf so they don't inflate the logsumexp.
+  # For non-padded chunks this is a no-op (all col_idx < v_dim).
+  col_idx = jnp.arange(v_block_size) + v_start  # (v_block_size,)
+  xw_masked = jnp.where(col_idx[None, :] < v_dim, xw_tile, -jnp.inf)
+
   # Per-token logsumexp over this V chunk. Combined across V outside the kernel
   # via logsumexp(tile_lse, axis=-1) to get the global per-token LSE.
-  tile_lse = jax.nn.logsumexp(xw_tile, axis=-1)  # (b_block_size,)
+  tile_lse = jax.nn.logsumexp(xw_masked, axis=-1)  # (b_block_size,)
   tile_lse_ref.store(tile_lse[:, None])
 
   # Correct-class logit for tokens whose label falls in this V chunk.
-  # jax.nn.one_hot returns 0 for labels outside [0, v_block_size), so tokens
-  # whose label is in a different V chunk contribute 0 here.
-  v_start = v_idx * v_block_size
+  # Uses unmasked xw_tile (not xw_masked) to avoid 0 * -inf = NaN.
+  # one_hot returns 0 for labels outside [0, v_block_size), so tokens
+  # whose label is in a different V chunk (or in the padded region) contribute 0.
   labels_local = labels_ref.load().astype(jnp.int32) - v_start
   one_hot = jax.nn.one_hot(
       labels_local, num_classes=v_block_size, dtype=jnp.float32
@@ -155,8 +161,9 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_triton(
     b_block_size: Tile size over the B (batch/token) dimension. B must be
       divisible by b_block_size.
     h_block_size: Tile size for the inner H accumulation loop.
-    v_block_size: Tile size over the V (vocab) dimension. V must be
-      divisible by v_block_size.
+    v_block_size: Tile size over the V (vocab) dimension. V is zero-padded
+      to the next multiple of v_block_size inside this function; V need not
+      be divisible by v_block_size.
     reduction: "sum" or "mean" over tokens.
     num_warps: Triton warp count (tunable).
 
@@ -177,6 +184,12 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_triton(
   num_b_blocks = pl.cdiv(b_dim, b_block_size)
   num_h_blocks = pl.cdiv(h_dim, h_block_size)
   num_v_blocks = pl.cdiv(v_dim, v_block_size)
+  v_padded = num_v_blocks * v_block_size
+
+  # Pad w so its V dimension is an exact multiple of v_block_size.
+  # Padded columns are zero; the kernel masks them to -inf before logsumexp.
+  if v_padded != v_dim:
+    w = jnp.pad(w, ((0, 0), (0, v_padded - v_dim)))
 
   kernel = partial(
       _lce_fwd_kernel,
@@ -184,6 +197,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_triton(
       h_block_size=h_block_size,
       num_h_blocks=num_h_blocks,
       v_block_size=v_block_size,
+      v_dim=v_dim,
   )
 
   # Outputs are (B, num_v_blocks): one value per token per V chunk.
@@ -199,7 +213,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_triton(
       in_specs=(
           pl.BlockSpec((b_block_size, h_dim), lambda b, v: (b, 0)),  # x
           pl.BlockSpec((b_block_size,), lambda b, v: (b,)),           # labels
-          pl.BlockSpec((h_dim, v_block_size), lambda b, v: (0, v)),  # w
+          pl.BlockSpec((h_dim, v_block_size), lambda b, v: (0, v)),  # w (padded)
       ),
       out_specs=(
           pl.BlockSpec((b_block_size, 1), lambda b, v: (b, v)),  # tile_lse

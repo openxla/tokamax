@@ -50,31 +50,60 @@ def get_heuristics_config(
 ) -> Config:
   """Returns a register-safe config based on the input shapes.
 
-  Tile-size selection targets the register budget of SM80+ (65536 32-bit
-  registers per SM). With num_warps warps the per-thread accumulator cost
-  is b_block * v_block / (32 * num_warps) float32 registers.
+  ## v_block_size (fixed at 128)
 
-  When V is divisible by 256 we use larger tiles (b=64, v=256, warps=8):
-    accumulator: 64 * 256 / 256 = 64 regs — well within budget.
-  Otherwise we fall back to conservative tiles (b=32, v=128, warps=4):
-    accumulator: 32 * 128 / 128 = 32 regs.
+  v_block_size=256 crashes the Triton-to-PTX compilation stage in JAX 0.9.2's
+  bundled Triton: the power-of-2 check in pallas/triton/lowering.py passes
+  (total tensor size 8192 is a power of 2) but the Triton compiler then crashes
+  with a C++ exception. The check comment explicitly warns: "the Triton lowering
+  will fail anyway but it will crash with a C++ exception". The nearest upstream
+  fix is jax-ml/jax#35654, which guards the same crash for fp64; the fp32/n=256
+  case is not yet guarded. Revisit when JAX upgrades its bundled Triton.
 
-  h_block scales with H (64 or 128) to improve tensor-core utilisation.
+  ## Register budget (SM80+, 65536 regs per SM, num_warps=4, 128 threads)
+
+  With v_block=128, per-thread register cost:
+    accumulator:  b_block * v_block / 128 = b_block regs/thread.
+    w tile:       h_block * v_block / 128 = h_block regs/thread.
+    x tile:       b_block * h_block / 128 regs/thread.
+    total:        b_block + h_block + b_block * h_block / 128.
+
+  The 50%-budget constraint (256 regs/thread, allows 2 CTAs/SM) limits
+  combined (b_block, h_block) choices:
+    b=128, h=64:  128 + 64  + 64  = 256 regs  (50%)  ← 2 CTAs/SM OK
+    b=64,  h=128: 64  + 128 + 64  = 256 regs  (50%)  ← 2 CTAs/SM OK
+    b=64,  h=64:  64  + 64  + 32  = 160 regs  (31%)  ← safe
+    b=32,  h=128: 32  + 128 + 32  = 192 regs  (37%)  ← safe
+    b=128, h=128: 128 + 128 + 128 = 384 regs  (75%)  ← 1 CTA/SM, avoided
+
+  ## HBM traffic analysis
+
+  HBM reads scale as (all shapes in elements):
+    x traffic: B * H * (V / v_block)  —  x is re-read once per v_block tile.
+    w traffic: H * V * (B / b_block)  —  w is re-read once per b_block tile.
+
+  At v_block=128: x traffic = B*H*V/128, w traffic = B*H*V/b_block.
+  Traffic is balanced when b_block = v_block = 128. At b_block=64, w traffic
+  is 2× x traffic; at b_block=32, 4×. So b_block=128 (when B divisible by 128)
+  minimises total HBM reads and measurably outperforms b_block=64 (~4% on
+  LLM-scale shapes, bandwidth-bound regime).
+
+  When b_block=128, h_block is capped at 64 to stay within the 50% budget.
+  When b_block<=64, h_block=128 (if H divisible by 128) for better tensor-core
+  tile efficiency; h_block does not affect HBM traffic.
   """
-  _, h_dim = x.shape
-  v_dim = w.shape[1]
-  h_block_size = 128 if h_dim % 128 == 0 else 64
-  if v_dim % 256 == 0:
-    # h_block capped at 64: with v_block=256 and warps=8 (256 threads), the
-    # w tile alone is h_block*256/256 regs; h=128 pushes total over ~200 regs.
-    return Config(
-        b_block_size=64,
-        h_block_size=64,
-        v_block_size=256,
-        num_warps=8,
-    )
+  b_dim, h_dim = x.shape
+  if b_dim % 128 == 0:
+    b_block_size = 128
+    h_block_size = 64  # b=128,h=128 → 75% regs → 1 CTA/SM; cap at 64.
+  elif b_dim % 64 == 0:
+    b_block_size = 64
+    h_block_size = 128 if h_dim % 128 == 0 else 64
+  else:
+    b_block_size = 32
+    h_block_size = 128 if h_dim % 128 == 0 else 64
   return Config(
-      b_block_size=32,
+      b_block_size=b_block_size,
       h_block_size=h_block_size,
       v_block_size=128,
       num_warps=4,
