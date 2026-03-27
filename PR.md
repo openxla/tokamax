@@ -2,7 +2,8 @@
 
 ## Summary
 
-Adds GPU backends for `linear_softmax_cross_entropy_loss`, which previously only ran on TPU. The motivation is memory, not speed.
+Adds GPU backends for `linear_softmax_cross_entropy_loss`, which previously only ran on TPU.
+Keeping with the motivation of reducing memory footprint through sacrificing speed.
 
 XLA's implementation materialises the full `(B, V)` logit matrix. At LLM scale this is large:
 
@@ -12,9 +13,11 @@ XLA's implementation materialises the full `(B, V)` logit matrix. At LLM scale t
 | gemma3-4b (B=4096, V=262144) | 4.3 GB |
 | deepseek-v3-671b (B=8192, V=128256) | 4.2 GB |
 
-During training, this allocation sits alongside activations, weights, and optimiser state. Both kernels here use the tiled algorithm from [Liger et al. (2024)](https://arxiv.org/abs/2410.10989v2), which tiles over `(b_tile, v_tile)` pairs and keeps logits only in registers; peak logit memory drops from O(B*V) to O(b_block*v_block), a few KB regardless of vocab size.
+During training, this allocation sits alongside activations, weights, and optimiser state.
+Both kernels here use the tiled algorithm from [Liger et al. (2024)](https://arxiv.org/abs/2410.10989v2), which tiles over `(b_tile, v_tile)` pairs and keeps logits only in registers; peak logit memory drops from `O(B*V)` to `O(b_block*v_block)`, a few KB regardless of vocab size.
 
-The trade-off is speed: XLA's single cuBLAS GEMM is compute-bound and hard to match with a tiled kernel. These kernels are slower (see Performance) and should be used when the logit matrix is the binding memory constraint, not as a general replacement for XLA.
+The trade-off is speed: XLA's single cuBLAS GEMM is compute-bound and hard to match with a tiled kernel.
+These kernels are slower (see Performance) and should be used when the logit matrix is the binding memory constraint, not as a general replacement for XLA.
 
 Also adds a benchmark harness registered in `benchmark_registry.pbtxt` (H100, B200, TPU-v6e, TPU-v7) and updates the README.
 
@@ -22,7 +25,8 @@ Also adds a benchmark harness registered in `benchmark_registry.pbtxt` (H100, B2
 SM80+ (Ampere and up). Selected automatically on GPU when Triton is available. Forward and backward; float32 accumulation throughout. ~2x XLA forward wall-clock time on LLM-scale shapes.
 
 ### Mosaic GPU SM90 (`pallas_mosaic_gpu_*`)
-H100+ (SM90). WGMMA + TMA pipelining; two warp groups per CTA. Not selected by default. Forward within ~5% of XLA; backward 4-8x slower (chunked cuBLAS scan over V). Use explicitly when the logit matrix would OOM and the backward cost is acceptable.
+H100+ (SM90). WGMMA + TMA pipelining; two warp groups per CTA. Not selected by default. Forward within ~5% of XLA; backward 4-8x slower (chunked cuBLAS scan over V).
+Use explicitly when the logit matrix would OOM and the backward cost is acceptable.
 
 ---
 
@@ -46,11 +50,13 @@ The backward recomputes logit tiles on-the-fly rather than storing them (recompu
 
 XLA allocates the full `(B, V)` logit tensor in HBM (float32 for numerical stability), then reads it again for the logsumexp and CE loss reduction. Both kernels here eliminate this:
 
-Forward: each `(b_block, v_block)` logit tile lives in registers for the duration of one kernel invocation. No HBM allocation for logits at any point. The outputs written to HBM are `(B, num_v_blocks)`, a per-token, per-v-chunk logsumexp and correct-logit contribution, O(B) not O(B*V).
+Forward: each `(b_block, v_block)` logit tile lives in registers for the duration of one kernel invocation.
+No HBM allocation for logits at any point.
+The outputs written to HBM are `(B, num_v_blocks)`, a per-token, per-v-chunk logsumexp and correct-logit contribution, `O(B)` rather than `O(B*V)`.
 
-Backward: logit tiles are recomputed from `x` and `w` on the fly, one chunk at a time, and discarded. The peak extra allocation during the backward is one logit chunk `(B, chunk_size)`, a few MB, not `(B, V)`.
+Backward: logit tiles are recomputed from `x` and `w` on the fly, one chunk at a time, and discarded. The peak extra allocation during the backward is one logit chunk `(B, chunk_size)`, which ends up being a few MB.
 
-The residual saved from forward to backward is the per-token log-sum-exp `lse`, shape `(B,)`, negligible.
+The residual saved from forward to backward is the per-token log-sum-exp `lse`, shape `(B,)`.
 
 For reference, the `(B, V)` logit tensor that these kernels avoid:
 
@@ -63,7 +69,8 @@ For reference, the `(B, V)` logit tensor that these kernels avoid:
 | deepseek-v3-671b (B=8192, V=128256) | 4.2 GB | 2.1 GB |
 | gpt-oss-120b (B=4096, V=201088) | 3.3 GB | 1.6 GB |
 
-XLA computes in float32 regardless of input dtype (bfloat16 inputs are upcast before the GEMM), so the relevant number is the float32 column. During benchmarking, XLA's forward for qwen3-8b hit `RESOURCE_EXHAUSTED` (48 MB allocation failure) at high memory pressure, where the tiled kernels succeeded.
+XLA computes in float32 regardless of input dtype (bfloat16 inputs are upcast before the GEMM), so the relevant number is the float32.
+During benchmarking, XLA's forward for qwen3-8b hit `RESOURCE_EXHAUSTED` (48 MB allocation failure) at high memory pressure, where the tiled kernels succeeded.
 
 ---
 
@@ -71,8 +78,7 @@ XLA computes in float32 regardless of input dtype (bfloat16 inputs are upcast be
 
 ### Triton backend
 
-Straightforward Pallas/Triton implementation.
-Matmul accumulates in **float32** throughout (Triton handles this natively with `jnp.float32` dot).
+Matmul accumulates in `float32` throughout (Triton handles this natively with `jnp.float32` dot).
 This gives good numerical accuracy; gradients match the XLA reference at `atol=2e-2`.
 
 The backward fuses the gradient scale (`dout / B` for mean, `dout` for sum) into the kernel rather than applying it post-hoc, saving one pass over the output tensors.
@@ -83,7 +89,8 @@ HBM traffic for the forward pass scales as:
 - `x` traffic: `B * H * V / v_block` (x is re-read once per v-chunk tile)
 - `w` traffic: `B * H * V / b_block` (w is re-read once per b-chunk tile)
 
-Traffic is balanced when `b_block = v_block`. At `v_block=128` (the maximum safe value), the heuristic targets `b_block=128` when `B` is divisible by 128, which equalises x/w HBM reads and measurably improves performance (~4% on LLM-scale shapes).
+Traffic is balanced when `b_block = v_block`.
+At `v_block=128` (the maximum safe value), the heuristic targets `b_block=128` when `B` is divisible by 128, which equalises x/w HBM reads and measurably improves performance (~4% on LLM-scale shapes).
 
 Register budget on SM80+ (65536 regs/SM, `num_warps=4`, 128 threads/CTA):
 
@@ -98,15 +105,15 @@ Register budget on SM80+ (65536 regs/SM, `num_warps=4`, 128 threads/CTA):
 With `b=128`, `h` is capped at 64 to stay within the 50% budget (2 CTAs/SM).
 With `b <= 64`, `h=128` is used when `H` is divisible by 128 for better tensor-core tile efficiency; `h_block` does not affect HBM traffic.
 
-#### v_block_size cap at 128
+#### `v_block_size` cap at 128
 
 `v_block_size=256` crashes the Triton-to-PTX compilation stage in JAX 0.9.2's bundled Triton with a C++ exception (segfault in `f.compile()`).
-JAX's `pallas/triton/lowering.py` itself documents this: the power-of-2 tensor-size check (line 288-301) applies only to load/store ops and explicitly notes that for other ops "the Triton lowering will fail anyway but it will crash with a C++ exception".
+JAX's `pallas/triton/lowering.py` documents this as the power-of-2 tensor-size check (line 288-301) applies only to load/store ops and explicitly notes that for other ops "the Triton lowering will fail anyway but it will crash with a C++ exception".
 With a (32, 256) accumulator tile, the load/store check passes (8192 = 2^13) but the Triton backend then crashes during instruction selection for `tl.dot`.
 
-No tracked upstream issue was found for this specific case (float32 `tl.dot` with N=256 on SM80 in JAX's bundled Triton).
+I didn't find an upstream issue this specific case (float32 `tl.dot` with N=256 on SM80 in JAX's bundled Triton).
 The closest related fix is [jax-ml/jax#35654](https://github.com/jax-ml/jax/pull/35654), which added an early guard for the same crash pattern in the fp64 MMA path; the fp32/n=256 case is not yet guarded.
-The heuristic caps `v_block_size` at 128 and should be revisited when JAX upgrades its bundled Triton.
+The heuristic caps `v_block_size` at 128 and could berevisited when JAX upgrades the bundled Triton.
 
 ### Mosaic GPU SM90 backend
 
@@ -126,7 +133,8 @@ The autotuning config generator (`get_autotuning_configs`) does not currently fi
 
 #### Backward
 
-The backward does **not** use the SM90 WGMMA kernel. Instead it uses a `jax.lax.scan` over padded vocabulary chunks, issuing one pair of cuBLAS GEMMs per chunk:
+The backward does not use the SM90 WGMMA kernel.
+Instead it uses a `jax.lax.scan` over padded vocabulary chunks, issuing one pair of cuBLAS GEMMs per chunk:
 
 ```
 for each chunk v_start..v_start+chunk_size:
@@ -139,7 +147,7 @@ for each chunk v_start..v_start+chunk_size:
 The last chunk is zero-padded so `chunk_size` (4096) divides cleanly for any vocab size (including irregular sizes like V=128256).
 Padded positions are masked by `valid = (col_idx < v_dim)` and contribute nothing.
 
-This avoids the `atomic_add` serialisation of a naive in-kernel backward.
+This avoids the `atomic_add` serialisation of a naive in-kernel backward that ended up adding far too much latency.
 Total FLOP count matches XLA; overhead is 32-38 sequential cuBLAS launches vs XLA's 2 full-width matmuls.
 
 ---
@@ -147,11 +155,11 @@ Total FLOP count matches XLA; overhead is 32-38 sequential cuBLAS launches vs XL
 ## Performance
 
 Benchmarked on H100 (bfloat16 inputs, `mean` reduction).
-Triton forward numbers below are from RTX 3090 (same heuristic, same pattern expected on H100); H100 Triton numbers TBD.
+Triton forward numbers below are from RTX 3090 (same heuristic, same pattern expected on H100, but I didn't didn't have access to the hardware for long enough); H100 Triton numbers TBD.
 
 ### Median wall-clock time (ms)
 
-H100 numbers (XLA and mosaic_gpu); RTX 3090 numbers (Triton, where available):
+H100 numbers (XLA and `mosaic_gpu`); RTX 3090 numbers (Triton, where available):
 
 | Shape | `XLA` fwd | `mosaic_gpu` fwd | `triton` fwd | `XLA` fwd+vjp | `mosaic_gpu` fwd+vjp |
 |---|---|---|---|---|---|
@@ -170,16 +178,17 @@ RTX 3090 Triton forward results (H100 benchmarks pending):
 | llama3.1-8b (B=4096, H=4096, V=128256) | 58.9 | 116.9 | 1.98x |
 | gpt-oss-120b (B=4096, H=2880, V=201088) | 66.7 | 130.3 | 1.95x |
 
-### Interpreting these numbers
+### Interpretation
 
 Forward: `mosaic_gpu` is within ~5% of XLA across all shapes.
 
-`triton` forward runs at ~2x XLA wall-clock time. This is expected and close to the theoretical minimum for this tiling approach: Triton re-reads `x` once per v-chunk and `w` once per b-chunk, accumulating `B*H*V/128` elements from each, while XLA's cuBLAS reads `x` and `w` once in a single compute-bound GEMM. The heuristic balances x/w HBM traffic (`b_block = v_block = 128` when B is divisible by 128). Closing the gap further would require `v_block > 128`, which is blocked by the JAX 0.9.2 Triton compiler limitation described above.
+`triton` forward runs at ~2x XLA wall-clock time. This is expected and close to the theoretical minimum for the tiling approach: Triton re-reads `x` once per v-chunk and `w` once per b-chunk, accumulating `B*H*V/128` elements from each, while XLA's cuBLAS reads `x` and `w` once in a single compute-bound GEMM. The heuristic balances x/w HBM traffic (`b_block = v_block = 128` when B is divisible by 128). Closing the gap further would require `v_block > 128`, which is blocked by the JAX 0.9.2 Triton compiler limitation described above.
 
 Backward: `mosaic_gpu` is 4-8x slower, scaling with `ceil(V / 4096)` (the number of sequential cuBLAS chunk iterations).
 Total FLOP count is identical to XLA; the overhead is that XLA issues two full-width matmuls while the chunked scan issues 32-64 sequential ones.
 
-For the shapes above on an H100 (80 GB), XLA fits comfortably. On devices with smaller HBM (A100 40 GB, RTX 3090 24 GB) or at higher batch sizes the logit tensor becomes the binding constraint; see Memory.
+For the shapes above on an H100 (80 GB), XLA fits comfortably.
+On devices with smaller HBM (A100 40 GB, RTX 3090 24 GB) or at higher batch sizes the logit tensor becomes the constraint; see Memory.
 
 ---
 
@@ -220,9 +229,9 @@ The initial results led me down a few rabbit holes, but I've confirmed it's the 
 
 ---
 
-## What this doesn't cover
+## Future work
 
-- Blackwell (SM100): `supported_on` permits SM100 for the Mosaic backend (same SM90 kernels), but it hasn't been tested.
-- Autotuning SMEM guard: configs that overflow the SMEM budget are generated but not filtered in `get_autotuning_configs`. A follow-up could add a `smem_bytes` check there. TODO: follow up.
-- tf32 WGMMA: would give better precision than bf16 for float32 inputs, but is not currently supported by the Mosaic GPU Pallas layer. TODO: follow up. 
+- Blackwell (SM100): `supported_on` permits SM100 for the Mosaic backend (same SM90 kernels), but I haven't tested it.
+- Autotuning SMEM guard: configs that overflow the SMEM budget are generated but not filtered in `get_autotuning_configs`. A follow-up could add a `smem_bytes` check there.
+- tf32 WGMMA: would give better precision than bf16 for float32 inputs, but is not currently supported by the Mosaic GPU Pallas layer.
 
