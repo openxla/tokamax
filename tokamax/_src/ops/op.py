@@ -514,11 +514,13 @@ class BoundArguments(Generic[_Config, _Key]):
     try:
       return self.op.get_autotuning_cache()[key]
     except KeyError:
+      json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
+
       logging.warning(
           "Autotuning cache miss for %s on %s with key %s",
           self.op,
           device_kind,
-          key,
+          str(json_key_bytes, "utf-8"),
       )
       return None
 
