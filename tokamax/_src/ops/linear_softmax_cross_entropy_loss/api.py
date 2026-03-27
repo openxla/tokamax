@@ -22,10 +22,21 @@ from jaxtyping import Array, Integer, Real, Scalar  # pylint: disable=g-multiple
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
 
 
-Implementation: TypeAlias = Literal["mosaic_tpu", "xla"]
+Implementation: TypeAlias = Literal["mosaic_gpu", "mosaic_tpu", "triton", "xla"]
 
 IMPLEMENTATIONS = dict(xla=base.LinearSoftmaxCrossEntropyLoss())
 _DEFAULT_IMPLEMENTATION = ("xla",)
+
+try:
+  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["triton"] = (
+      pallas_triton.PallasTritonLinearSoftmaxCrossEntropyLoss()
+  )
+
+  _DEFAULT_IMPLEMENTATION = ("triton",) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
 
 try:
   from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
@@ -35,6 +46,21 @@ try:
   )
 
   _DEFAULT_IMPLEMENTATION = ("mosaic_tpu",) + _DEFAULT_IMPLEMENTATION
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_gpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  IMPLEMENTATIONS["mosaic_gpu"] = (
+      pallas_mosaic_gpu.PallasMosaicGpuLinearSoftmaxCrossEntropyLoss()
+  )
+
+  # mosaic_gpu is NOT added to _DEFAULT_IMPLEMENTATION. Its forward is at XLA
+  # parity but its backward is ~3× slower (chunked scan over V vs two full-width
+  # cuBLAS matmuls). The benefit is memory: the (B, V) logit matrix is never
+  # materialised. Use implementation='mosaic_gpu' explicitly when the logit
+  # matrix would OOM the device.
 except ImportError:
   pass
 
@@ -72,10 +98,15 @@ def linear_softmax_cross_entropy_loss(
     precision: The precision used for jax.lax.dot_general for the linear
       projection and gradient calculation.
     implementation: By default "None" will be used to pick the best available
-      backend. Can be set to "xla" or "mosaic_tpu" explicitly. The "mosaic_tpu"
-      implementation is memory efficient and has almost 0 additional buffer
-      overhead while the "xla" implementation needs to materialize the full
-      logits
+      backend. Can be set to "xla", "mosaic_tpu", "triton", or "mosaic_gpu"
+      explicitly. The default selection order is mosaic_tpu → triton → xla,
+      with each backend skipped if unavailable on the current device.
+      "mosaic_gpu" is available on H100+ (SM90) but is not in the default
+      chain: its forward is at XLA parity but its backward is ~3× slower due
+      to chunked-scan accumulation. Use implementation='mosaic_gpu' explicitly
+      when the (B, V) logit matrix would OOM the device — that is the intended
+      use case. "mosaic_tpu" and "triton" are memory-efficient and avoid
+      materialising the full logit matrix.
 
   Returns:
     The Cross-Entropy loss
@@ -91,21 +122,16 @@ def linear_softmax_cross_entropy_loss(
         "Customization of precision is currently not supported."
     )
 
-  if implementation is not None:
-    if implementation in IMPLEMENTATIONS:
-      loss = IMPLEMENTATIONS[implementation](
-          x,
-          labels,
-          weights,
-          reduction=reduction,
-      )
-      return loss
-    else:
-      raise ValueError(f"Unsupported implementation: {implementation}")
+  if implementation is None:
+    implementation = _DEFAULT_IMPLEMENTATION
 
-  # Find out the best impelmentation based on the hardware.
+  if not isinstance(implementation, (tuple, list)):
+    implementation = (implementation,)
+
   errors = []
-  for impl in IMPLEMENTATIONS:
+  for impl in implementation:
+    if impl not in IMPLEMENTATIONS:
+      raise ValueError(f"Unsupported implementation: {impl}")
     try:
       loss = IMPLEMENTATIONS[impl](
           x,
@@ -115,8 +141,6 @@ def linear_softmax_cross_entropy_loss(
       )
       return loss
     except NotImplementedError as e:
-      if len(implementation) == 1:
-        raise
       errors.append(e)
 
   raise ExceptionGroup("all implementations failed", errors)

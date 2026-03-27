@@ -253,6 +253,131 @@ benchmarks {
 }
 
 benchmarks {
+  name: "tokamax_linear_softmax_cross_entropy_loss"
+  description: "Runs the Tokamax linear_softmax_cross_entropy_loss benchmark."
+  owner: "Tokamax Team"
+  update_frequency_policy: QUARTERLY
+  workload {
+    action: "./ml_actions/benchmarking/actions/workload_executors/python"
+    action_inputs { key: "script_path" value: "tokamax/benchmarks/linear_softmax_cross_entropy_loss.py" }
+    action_inputs { key: "python_version" value: "3.11" }
+  }
+
+  environment_configs {
+    id: "gpu-h100"
+    runner_label: "linux-x86-a3-8g-h100-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
+  }
+
+  environment_configs {
+    id: "gpu-b200"
+    runner_label: "linux-x86-a4-224-b200-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:943892a4ab8e9b58a9c7b4297f170d3f28fcb1d479e9835190d49dafdbd2992a"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
+  }
+
+  environment_configs {
+    id: "tpu-v6e"
+    runner_label: "linux-x86-ct6e-44-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,mosaic_gpu" }
+  }
+
+  environment_configs {
+    id: "tpu-v7"
+    runner_label: "linux-x86-tpu7x-56-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,mosaic_gpu" }
+  }
+
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/qwen3-8b/default/forward"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/qwen3-8b/default/forward_and_vjp"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/qwen3-8b/triton/forward"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/qwen3-8b/triton/forward_and_vjp"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/qwen3-8b/mosaic_gpu/forward"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/qwen3-8b/mosaic_gpu/forward_and_vjp"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/qwen3-8b/xla/forward"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/qwen3-8b/xla/forward_and_vjp"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/llama3.1-8b/default/forward"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/llama3.1-8b/default/forward_and_vjp"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/llama3.1-8b/triton/forward"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/llama3.1-8b/triton/forward_and_vjp"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/llama3.1-8b/mosaic_gpu/forward"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/llama3.1-8b/mosaic_gpu/forward_and_vjp"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/llama3.1-8b/xla/forward"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+  metrics {
+    name: "linear_softmax_cross_entropy_loss/llama3.1-8b/xla/forward_and_vjp"
+    unit: "ms"
+    stats { stat: MEDIAN }
+  }
+
+}
+
+benchmarks {
   name: "tokamax_triangle_multiplication"
   description: "Runs the Tokamax triangle_multiplication benchmark."
   owner: "Tokamax Team"
