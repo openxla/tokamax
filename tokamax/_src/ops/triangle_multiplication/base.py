@@ -133,13 +133,9 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         axis=-1,
     )
 
-    gate_weights = jnp.concatenate(
-        [gate_in_weights[:, 0, :], gate_in_weights[:, 1, :]], axis=-1
-    )
-    projection_weights = jnp.concatenate(
-        [projection_in_weights[:, 0, :], projection_in_weights[:, 1, :]],
-        axis=-1,
-    )
+    channel_dim = len(gate_in_weights)
+    gate_weights = jnp.reshape(gate_in_weights, (channel_dim, -1))  # (C, 2 * H)
+    projection_weights = jnp.reshape(projection_in_weights, (channel_dim, -1))
     proj_act = glu_base.GatedLinearUnit()(
         left_act,
         (gate_weights, projection_weights),

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tokamax Megablox TPU tests for core functionality."""
+"""Tests for Pallas Mosaic TPU Ragged Dot."""
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -152,6 +152,29 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       kwargs = {}
     with test_base.override_chex_args(**kwargs):
       super()._test_bench(spec)
+
+  def test_maxtext_config(self):
+    # Test to ensure that we can get the correct config for a specific model.
+    # For this test we are using jax.ShapeDtypeStruct instead of jax.Array
+    # because jax.Array would trigger OOM for our tests.
+    tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+    maxtext_config = tpu_ragged_dot._get_heuristics_config(
+        op_lib.BoundArguments(
+            op=tpu_ragged_dot,
+            arguments={
+                "lhs": jax.ShapeDtypeStruct((262144, 7168), dtype=jnp.bfloat16),
+                "rhs": jax.ShapeDtypeStruct(
+                    (256, 7168, 2048), dtype=jnp.bfloat16
+                ),
+            },
+        )
+    )
+    tiling_tuple = (
+        maxtext_config.tile_m,
+        maxtext_config.tile_k,
+        maxtext_config.tile_n,
+    )
+    self.assertEqual(tiling_tuple, (256, 7168, 512))
 
   def test_autotuning_configs(self):
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()

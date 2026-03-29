@@ -65,7 +65,7 @@ _F32_DOT_PRECISION_MAP: Final[dict[str, dict[Precision, str]]] = dict(
 
 
 CanonicalPrecision = (
-    tuple[Precision, Precision] | DotAlgorithm | DotAlgorithmPreset
+    tuple[Precision, Precision] | DotAlgorithmPreset | DotAlgorithm
 )
 
 

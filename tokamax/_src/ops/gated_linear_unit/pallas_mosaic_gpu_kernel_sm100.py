@@ -23,14 +23,30 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import, g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_common as common
 
 
 ACC_NUM_SLOTS = 2
 
 
+def get_heuristics_config(ba: op.BoundArguments) -> common.Config:
+  del ba
+  return common.Config(
+      tile_m=128,
+      tile_n=64,
+      tile_k=64,
+      num_stages=4,
+  )
+
+
+def get_autotuning_configs(ba: op.BoundArguments) -> set[common.Config]:
+  del ba
+  return set()
+
+
 @jaxtyping.jaxtyped
-def gated_linear_unit_sm100(
+def gated_linear_unit(
     x: Float[Array, "*B M K"],
     weights: Float[Array, "K 2 N"],
     *,
@@ -209,12 +225,8 @@ def gated_linear_unit_sm100(
         ]
         for ni in range(tile_n // epi_tile_n):
           ni_col_slice = pl.ds(ni * epi_tile_n, epi_tile_n)
-          val0 = plgpu.async_load_tmem(
-              acc_tmem_slice_0.at[:, ni_col_slice]
-          )
-          val1 = plgpu.async_load_tmem(
-              acc_tmem_slice_1.at[:, ni_col_slice]
-          )
+          val0 = plgpu.async_load_tmem(acc_tmem_slice_0.at[:, ni_col_slice])
+          val1 = plgpu.async_load_tmem(acc_tmem_slice_1.at[:, ni_col_slice])
           plgpu.wait_load_tmem()
           val0 = val0.astype(dtype).astype(jnp.float32)
           val1 = val1.astype(dtype).astype(jnp.float32)

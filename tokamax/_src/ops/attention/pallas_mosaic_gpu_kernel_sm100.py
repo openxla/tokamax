@@ -214,7 +214,7 @@ def flash_attention_kernel(
 
   min_mask_cols = 128 // _MASK_PACKED_BITS
   if mask is None:
-    use_2d_bool_mask = bcast_mask_q = False
+    use_2d_bool_mask = False
   else:
     bcast_mask_q = mask.shape[-2] == 1
     bcast_mask_k = mask.shape[-1] == 1
@@ -234,7 +234,7 @@ def flash_attention_kernel(
   num_tma_splits = config.num_tma_splits
   collective = config.collective
   block_q = tile_q // 2 if collective else tile_q
-  collective_axis = "x" if collective else None
+  collective_axis = "cluster" if collective else None
   softmax_slots = 2
 
   epi_tile_d = 1024 // common.num_bits(out_dtype)
@@ -284,13 +284,11 @@ def flash_attention_kernel(
     qi = lax.axis_index("q_tiles")
     hi = lax.axis_index("heads")
     wg = lax.axis_index("wg")
-    cluster_idx = lax.axis_index("x")
+    cluster_idx = lax.axis_index("cluster")
 
     q_base_cluster = qi * tile_q
     q_base = q_base_cluster + cluster_idx * block_q
     qs = pl.ds(q_base, block_q)
-
-    use_k_ranges = k_start_gmem is not None or k_end_gmem is not None
 
     lb = 0
     ub = kv_seq_len // block_kv
@@ -325,24 +323,28 @@ def flash_attention_kernel(
       def per_warp():
         warp_id = lax.axis_index("warp")
 
-        def tma_load_kv(gmem, smem, barrier, leader_tracked, ki, split_idx):
+        def tma_load_kv(gmem, smem, barrier, partition_axis, ki, split_idx):
           kv_head = lax.div(hi, q_heads_per_kv_head)
           si = lax.rem(ki - lb, num_stages)
           block_d = gmem.shape[-1] // num_tma_splits
           ds = pl.ds(split_idx * block_d, block_d)
+          if collective:
+            leader_tracked = plgpu.CopyPartition.PARTITIONED(partition_axis)
+          else:
+            leader_tracked = None
           plgpu.copy_gmem_to_smem(
               gmem.at[pl.ds(ki * block_kv, block_kv), kv_head, ds],
               smem.at[si, split_idx],
               barrier=barrier.at[si],
-              leader_tracked=leader_tracked if collective else None,
-              collective_axes="x" if collective else None,
+              collective_axes=collective_axis,
+              leader_tracked=leader_tracked,
           )
 
         def tma_load_kv_warp(
-            gmem, smem, barrier, consumed_barrier, leader_tracked
+            gmem, smem, barrier, consumed_barrier, partition_axis
         ):
           tma_load = functools.partial(
-              tma_load_kv, gmem, smem, barrier, leader_tracked
+              tma_load_kv, gmem, smem, barrier, partition_axis
           )
 
           @pl.loop(lb, lax.min(lb + num_stages, ub))
@@ -361,64 +363,41 @@ def flash_attention_kernel(
 
         @pl.when(warp_id == _TMA_LOAD_QK_WARP)
         def tma_load_qk_warp():
+          if collective:
+            leader_tracked = plgpu.CopyPartition.PARTITIONED(0)
+          else:
+            leader_tracked = None
           plgpu.copy_gmem_to_smem(
               q_gmem.at[pl.ds(q_base_cluster, tile_q), hi],
               q_smem,
               barrier=q_barrier,
-              leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
-              if collective
-              else None,
-              collective_axes=(collective_axis,) if collective else None,
+              collective_axes=collective_axis,
+              leader_tracked=leader_tracked,
           )
-          tma_load_kv_warp(
-              k_gmem,
-              k_smem,
-              k_barrier,
-              k_consumed_barrier,
-              leader_tracked=plgpu.CopyPartition.PARTITIONED(0),
-          )
+          tma_load_kv_warp(k_gmem, k_smem, k_barrier, k_consumed_barrier, 0)
 
         @pl.when(warp_id == _TMA_LOAD_V_WARP)
         def tma_load_v_warp():
-          tma_load_kv_warp(
-              v_gmem,
-              v_smem,
-              v_barrier,
-              v_consumed_barrier,
-              leader_tracked=plgpu.CopyPartition.PARTITIONED(1),
-          )
+          tma_load_kv_warp(v_gmem, v_smem, v_barrier, v_consumed_barrier, 1)
 
-        if mask_smem is not None or bias_smem is not None:
+        if bias_smem is not None or mask_smem is not None:
 
           @pl.when(warp_id == _TMA_LOAD_MASK_WARP)
-          def tma_load_mask_bias_warp():
+          def tma_load_bias_mask_warp():
             @pl.loop(lb, ub)
             def kv_loop(ki):
               if bias_smem is not None:
+                ks = pl.ds(ki * block_kv, block_kv)
                 hi_ = 0 if bias_gmem.shape[-3] == 1 else hi
-                if bias_gmem.shape[-1] == 1:
-                  plgpu.copy_gmem_to_smem(
-                      bias_gmem.at[hi_, qs, 0],
-                      bias_smem,
-                      barrier=bias_barrier,
-                  )
-                elif bias_gmem.shape[-2] == 1:
-                  ks = pl.ds(ki * block_kv, block_kv)
-                  plgpu.copy_gmem_to_smem(
-                      bias_gmem.at[hi_, 0, ks],
-                      bias_smem,
-                      barrier=bias_barrier,
-                  )
-                else:
-                  ks = pl.ds(ki * block_kv, block_kv)
-                  plgpu.copy_gmem_to_smem(
-                      bias_gmem.at[hi_, qs, ks],
-                      bias_smem,
-                      barrier=bias_barrier,
-                  )
+                qs_ = 0 if bias_gmem.shape[-2] == 1 else qs
+                ks_ = 0 if bias_gmem.shape[-1] == 1 else ks
+                plgpu.copy_gmem_to_smem(
+                    bias_gmem.at[hi_, qs_, ks_], bias_smem, bias_barrier
+                )
               if mask_smem is not None:
                 hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
-                ks = pl.ds(ki * mask_block_kv, max(mask_block_kv, min_mask_cols))
+                mask_block_size = max(mask_block_kv, min_mask_cols)
+                ks = pl.ds(ki * mask_block_kv, mask_block_size)
                 plgpu.copy_gmem_to_smem(
                     mask_gmem.at[hi_, qs, ks], mask_smem, mask_barrier
                 )
@@ -451,9 +430,7 @@ def flash_attention_kernel(
                     collective_axis=collective_axis,
                 )
 
-            plgpu.tcgen05_commit_arrive(
-                qk_mma_barrier, collective_axis=collective_axis
-            )
+            plgpu.tcgen05_commit_arrive(qk_mma_barrier, collective_axis)
 
           def pv_mma(ki):
             si = lax.rem(ki - lb, num_stages)
@@ -478,9 +455,7 @@ def flash_attention_kernel(
                     collective_axis=collective_axis,
                 )
 
-            plgpu.tcgen05_commit_arrive(
-                pv_mma_barrier, collective_axis=collective_axis
-            )
+            plgpu.tcgen05_commit_arrive(pv_mma_barrier, collective_axis)
 
           plgpu.barrier_wait(q_barrier)
           qk_mma(lb)
@@ -891,7 +866,7 @@ def flash_attention_kernel(
       num_threads=3,
       thread_name="wg",
       cluster=(1 + collective,),
-      cluster_names=("x",),
+      cluster_names=("cluster",),
       compiler_params=compiler_params,
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
