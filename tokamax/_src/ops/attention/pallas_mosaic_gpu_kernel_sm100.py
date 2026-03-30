@@ -197,8 +197,6 @@ def flash_attention_kernel(
   dtype = q.dtype
 
   kv_seq_len, num_kv_heads, orig_head_dim_out = v.shape
-  if kv_seq_len % config.block_kv:
-    raise ValueError(f"{kv_seq_len=} must be a multiple of {config.block_kv=}")
   if num_q_heads % num_kv_heads:
     raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
