@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 from importlib import resources
+import json
 import os
 import re
 from typing import Any, Final
@@ -47,6 +48,23 @@ class CacheTest(parameterized.TestCase):
       self.assertEmpty(c._load_cache(device))
     else:
       self.assertNotEmpty(c._load_cache(device))
+
+
+  def test_validate_json_cache_files(self):
+    """Checks that all cache files are valid JSON."""
+    tokamax_files = resources.files("tokamax")
+    for cache_path in _CACHE_PATHS.values():
+      base_dir_trav = tokamax_files.joinpath(cache_path)
+      if not base_dir_trav.is_dir():
+        continue
+      for device_dir_trav in base_dir_trav.iterdir():
+        if not device_dir_trav.is_dir():
+          continue
+        for file_trav in device_dir_trav.iterdir():
+          if file_trav.is_file() and file_trav.name.endswith(".json"):
+            with self.subTest(str(file_trav)):
+              content = file_trav.read_text()
+              json.loads(content)
 
 
 if __name__ == "__main__":
