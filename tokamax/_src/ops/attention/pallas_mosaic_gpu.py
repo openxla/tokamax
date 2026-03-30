@@ -171,18 +171,6 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       if use_stable_softmax is base.AUTO:
         # TODO: Support sm100 with unstable softmax.
         use_stable_softmax = True
-
-      # TMA requires 16-byte aligned strides. If the last dimension is
-      # 1 (e.g. broadcasting), the stride of the second-to-last
-      # dimension is small (1 element), violating the requirement. We
-      # broadcast explicitly to fix this.
-      kv_seq_len = k.shape[-3]
-      if mask is not None and mask.shape[-1] == 1 and kv_seq_len > 1:
-        mask = jnp.broadcast_to(mask, mask.shape[:-1] + (kv_seq_len,))
-      if bias is not None and bias.shape[-1] == 1 and kv_seq_len > 1:
-        bias = jnp.broadcast_to(bias, bias.shape[:-1] + (kv_seq_len,)).astype(
-            bias.dtype
-        )
     elif isinstance(config, ConfigSM90):
       kernel_module = sm90
       if use_stable_softmax is base.AUTO:

@@ -106,7 +106,7 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   cluster_size = 1 + int(collective)
   num_stages = max(256 // head_dim, 1) * cluster_size
   block_q = 256 if collective else 128
-  if ba.kwargs.get("bias", None) is not None:
+  if ba.kwargs.get("bias") is not None:
     num_stages = min(num_stages, 4)
   block_kv = 128
   split_k = 1
@@ -387,25 +387,22 @@ def flash_attention_kernel(
             @pl.loop(lb, ub)
             def kv_loop(ki):
               if bias_smem is not None:
-                ks = pl.ds(ki * block_kv, block_kv)
                 hi_ = 0 if bias_gmem.shape[-3] == 1 else hi
-                qs_ = 0 if bias_gmem.shape[-2] == 1 else qs
-                ks_ = 0 if bias_gmem.shape[-1] == 1 else ks
+                ks = pl.ds(ki * block_kv, block_kv)
+                plgpu.barrier_wait(bias_consumed_barrier)
+                common.fence_async_shared_cta()  # Ensure smem read is complete.
                 plgpu.copy_gmem_to_smem(
-                    bias_gmem.at[hi_, qs_, ks_], bias_smem, bias_barrier
+                    bias_gmem.at[hi_, qs, ks], bias_smem, bias_barrier
                 )
               if mask_smem is not None:
                 hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
                 mask_block_size = max(mask_block_kv, min_mask_cols)
                 ks = pl.ds(ki * mask_block_kv, mask_block_size)
+                plgpu.barrier_wait(mask_consumed_barrier)
+                common.fence_async_shared_cta()  # Ensure smem read is complete.
                 plgpu.copy_gmem_to_smem(
                     mask_gmem.at[hi_, qs, ks], mask_smem, mask_barrier
                 )
-              if bias_smem is not None:
-                plgpu.barrier_wait(bias_consumed_barrier)
-              if mask_smem is not None:
-                plgpu.barrier_wait(mask_consumed_barrier)
-              common.fence_async_shared_cta()
 
         @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
         def mma_warp():
@@ -535,29 +532,24 @@ def flash_attention_kernel(
         with jax.named_scope("load_qk"):
           s = plgpu.async_load_tmem(qk_acc_tmem, layout=_TMEM)
           scale = logits_scale
+
+          if bias_gmem is None:
+            bias = None
+          elif bias_smem is None:
+            hi_ = 0 if bias_gmem.shape[-3] == 1 else hi
+            ks = pl.ds(ki * block_kv, block_kv)
+            bias = common.load_bcast(bias_gmem, (hi_, qs, ks), layout=_TMEM)
+          else:
+            plgpu.barrier_wait(bias_barrier)
+            bias = plgpu.load(bias_smem, (), layout=_TMEM, optimized=False)
+            plgpu.barrier_arrive(bias_consumed_barrier)
+
           plgpu.wait_load_tmem()
           plgpu.barrier_arrive(qk_consumed_barrier)
 
-        if bias_gmem is not None:
-          with jax.named_scope("apply_bias"):
-            if bias_smem is not None:
-              plgpu.barrier_wait(bias_barrier)
-              if bias_gmem.shape[-1] == 1:
-                b_1d = plgpu.load(bias_smem, (), layout=_TMEM_ROW, optimized=False)
-                bias_val = lax.broadcast_in_dim(b_1d, (block_q, block_kv), [0])
-              elif bias_gmem.shape[-2] == 1:
-                b_1d = plgpu.load(bias_smem, (), layout=_TMEM_COL, optimized=False)
-                bias_val = lax.broadcast_in_dim(b_1d, (block_q, block_kv), [1])
-              else:
-                bias_val = plgpu.load(bias_smem, (), layout=_TMEM, optimized=False)
-              common.warpgroup_barrier()
-              plgpu.barrier_arrive(bias_consumed_barrier)
-            else:
-              ks = pl.ds(ki * block_kv, block_kv)
-              hi_ = 0 if bias_gmem.shape[-3] == 1 else hi
-              bias_val = common.load_bcast(bias_gmem, (hi_, qs, ks), layout=_TMEM)
-            s = s * scale + plgpu.layout_cast(bias_val.astype(s.dtype), _TMEM)
-            scale = 1.0
+        if bias is not None:
+          s = s * scale + bias.astype(s.dtype)
+          scale = 1.0
 
         if logits_soft_cap is not None:
           s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
@@ -595,6 +587,10 @@ def flash_attention_kernel(
 
       # prologue
       plgpu.barrier_arrive(qk_consumed_barrier)
+      if bias_consumed_barrier is not None:
+        plgpu.barrier_arrive(bias_consumed_barrier)
+      if mask_consumed_barrier is not None:
+        plgpu.barrier_arrive(mask_consumed_barrier)
 
       # in 2CTA we have non square blocks hence we may need to process
       # M//N steps with a mask, for M=256, N=128 this means 2 steps
@@ -792,12 +788,9 @@ def flash_attention_kernel(
     li_scratch = plgpu.SMEM((block_q,), jnp.float32)
   else:
     li_scratch = None
-  if bias is None or (bias.shape[-2] == 1 and bias.shape[-1] == 1):
+
+  if bias is None or bias.shape[-2] == 1 or bias.shape[-1] == 1:
     bias_scratch = None
-  elif bias.shape[-1] == 1:
-    bias_scratch = plgpu.SMEM((block_q,), bias.dtype)
-  elif bias.shape[-2] == 1:
-    bias_scratch = plgpu.SMEM((block_kv,), bias.dtype)
   else:
     bias_scratch = tiled_smem((block_q, block_kv), bias.dtype)
 
