@@ -36,7 +36,6 @@ from tokamax._src.pallas import block
 
 Residuals = base.Residuals
 
-_MIN_SWIZZLE = 32
 _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
@@ -58,7 +57,7 @@ def _estimate_shared_mem_usage_bytes(ba, block_q, block_kv, num_stages):
 
   # 32-bit floats are downcast to 16-bit before the kernel call.
   dtype_bits = jnp.finfo(jnp.bfloat16).bits
-  m = 8 * _MIN_SWIZZLE // dtype_bits
+  m = 8 * common.MIN_SWIZZLE // dtype_bits
   block_d = pl.cdiv(q.shape[-1], m) * m
   block_d_out = v.shape[-1]
   bytes_per_stage = block_kv * block_d_out * dtype_bits // 8
@@ -152,13 +151,7 @@ def flash_attention_kernel(
   q_seq_len, num_q_heads, _ = q.shape
   kv_seq_len, _, orig_head_dim_out = v.shape
 
-  # The contracting dimension for `wgmma` must be a multiple of the minimum
-  # swizzle size (in number of elements).
-  def pad_head_dim(x):
-    m = 8 * _MIN_SWIZZLE // common.num_bits(x.dtype)
-    return shape_lib.pad_to_next_multiple_of(x, m, -1)
-
-  q, k, v = map(pad_head_dim, (q, k, v))
+  q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
   head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
 

@@ -205,8 +205,10 @@ def flash_attention_kernel(
         f"Only f16 and bf16 are supported, got dtype: {dtype}"
     )
 
-  pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
-  q, k, v = map(pad_head_dim, (q, k, v))
+  q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
+  if config.collective:
+    m = 2 * 8 * common.MIN_SWIZZLE // common.num_bits(v.dtype)
+    v = shape_lib.pad_to_next_multiple_of(v, m, -1)  # Need >=32 bytes per CTA.
   head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
 
@@ -634,7 +636,7 @@ def flash_attention_kernel(
 
         def load_acc_tiles():
           for d_base in range(0, head_dim_out, tile_d):
-            ds = pl.ds(d_base, tile_d)
+            ds = pl.ds(d_base, min(tile_d, head_dim_out - d_base))
             yield ds, plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TMEM)
 
         acc_tiles = two_in_flight(load_acc_tiles())
