@@ -15,6 +15,8 @@
 """Tests for Pallas Mosaic GPU Gated Linear Unit."""
 
 from absl.testing import absltest
+import jax
+import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pl_glu
 from tokamax._src.ops.gated_linear_unit import test_base
@@ -29,6 +31,13 @@ class PallasMosaicGpuGatedLinearUnitTest(test_base.GatedLinearUnitTestBase):
     if not gpu_utils.has_mosaic_gpu_support():
       self.skipTest("Not supported on TPUs.")
     super().setUp()
+
+  def test_autotuning_configs(self):
+    # Test that the autotuning configs are valid.
+    x = jax.ShapeDtypeStruct(shape=(2, 256, 128), dtype=jnp.bfloat16)
+    w = jax.ShapeDtypeStruct(shape=(128, 2, 512), dtype=jnp.bfloat16)
+    for _ in self._glu_fn._get_autotuning_configs(self._glu_fn.bind(x, w)):
+      pass
 
 
 if __name__ == "__main__":

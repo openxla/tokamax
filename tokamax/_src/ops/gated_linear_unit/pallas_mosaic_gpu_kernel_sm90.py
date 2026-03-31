@@ -56,6 +56,8 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[common.Config]:
             ):
               for cluster_size_m in (1, 2):
                 for cluster_size_n in (1, 2):
+                  if cluster_size_m != 1 and cluster_size_n != 1:
+                    continue
                   configs.add(
                       common.Config(
                           tile_m=tile_m,
