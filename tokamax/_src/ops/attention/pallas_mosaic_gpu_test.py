@@ -32,12 +32,6 @@ from tokamax._src.ops.attention import test_base
 from typing_extensions import override
 
 
-class _UNSET:
-
-  def __init__(self, default_value):
-    self.value = default_value
-
-
 @pytest.mark.skip(reason="Too slow for OSS regression tests.")
 class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
@@ -49,21 +43,17 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def __init__(
       self,
       *args,
-      attention_fn=_UNSET(None),
-      supports_decode=_UNSET(False),
-      supports_bias=_UNSET(True),
-      supports_indices=_UNSET(True),
-      supports_vjp=_UNSET(True),
-      supports_mask=_UNSET(True),
-      supports_tanh_clipping=_UNSET(True),
-      supports_is_causal=_UNSET(True),
-      supports_f32_inputs=_UNSET(True),
-      supports_vmap=_UNSET(True),
+      attention_fn=None,
+      supports_bias=True,
+      supports_indices=True,
+      supports_vjp=True,
+      supports_mask=True,
+      supports_tanh_clipping=True,
+      supports_is_causal=True,
+      supports_f32_inputs=True,
+      supports_vmap=True,
   ):
-    get_value = lambda x: x.value if isinstance(x, _UNSET) else x
-    dict_get_value = lambda **x: {k: get_value(v) for k, v in x.items()}
-
-    if get_value(attention_fn) is None:
+    if attention_fn is None:
       vjp = fa_vjp.PallasMosaicGpuFlashAttentionVjp(
           dbias_intermediate_dtype=jnp.float32
       )
@@ -71,22 +61,19 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
     super().__init__(
         *args,
-        **dict_get_value(
-            attention_fn=attention_fn,
-            supports_bias=supports_bias,
-            supports_vjp=supports_vjp,
-            supports_mask=supports_mask,
-            supports_tanh_clipping=supports_tanh_clipping,
-            supports_indices=supports_indices,
-            supports_dropout=False,
-            supports_cross_attention=True,
-            supports_precisions=False,
-            supports_vmap=supports_vmap,
-            supports_is_causal=supports_is_causal,
-        ),
+        attention_fn=attention_fn,
+        supports_bias=supports_bias,
+        supports_vjp=supports_vjp,
+        supports_mask=supports_mask,
+        supports_tanh_clipping=supports_tanh_clipping,
+        supports_indices=supports_indices,
+        supports_dropout=False,
+        supports_cross_attention=True,
+        supports_precisions=False,
+        supports_vmap=supports_vmap,
+        supports_is_causal=supports_is_causal,
     )
-    self._supports_decode = get_value(supports_decode)
-    self._supports_f32_inputs = get_value(supports_f32_inputs)
+    self._supports_f32_inputs = supports_f32_inputs
 
   def _run_test_with_inputs(self, q, k, v, *, bias=None, **kwargs):
     # PallasMosaicGpuFlashAttention doesn't support high precisions and

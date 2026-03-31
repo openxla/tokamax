@@ -25,6 +25,7 @@ from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
+from tokamax._src import version
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
@@ -193,8 +194,11 @@ class AutotuningTest(parameterized.TestCase):
     # TODO: Test that we autotune against all implementations.
     self.assertContainsSubset(expected, tuple(x[0] for x in result.data))
 
+    res_json = result.dumps()
     res_round_trip = api.AutotuningResult.loads(result.dumps())
     self.assertEqual(result, res_round_trip)
+    self.assertIn("tokamax_version", res_json)
+    self.assertIn(version.TOKAMAX_VERSION, res_json)
 
     tempfile = self.create_tempfile("autotuning_results.json")
     with open(tempfile.full_path, "w") as f:

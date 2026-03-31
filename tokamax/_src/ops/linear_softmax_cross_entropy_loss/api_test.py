@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import itertools
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -22,46 +24,32 @@ from tokamax._src.ops.linear_softmax_cross_entropy_loss import api
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import test_utils
 
 
+def _api_fwd_bwd_matches_reference_test_cases():
+  sizes = [
+      ("small", 1024, 512, 2048),
+      ("medium", 4096, 1024, 4096),
+  ]
+  reductions = ["sum", "mean"]
+
+  for (size_name, b, h, v), reduction, impl in itertools.product(
+      sizes,
+      reductions,
+      list(api.IMPLEMENTATIONS.keys()) + [None],
+  ):
+    yield dict(
+        testcase_name=f"{size_name}_{reduction}_{impl}",
+        b_dim=b,
+        h_dim=h,
+        v_dim=v,
+        reduction=reduction,
+        test_impl=impl,
+        reference_impl="xla",
+    )
+
+
 class ApiTest(parameterized.TestCase):
 
-  @parameterized.named_parameters(
-      dict(
-          testcase_name="small_size_sum_reduction_test",
-          b_dim=1024,
-          h_dim=512,
-          v_dim=2048,
-          reduction="sum",
-          test_impl=None,
-          reference_impl="xla",
-      ),
-      dict(
-          testcase_name="medium_size_sum_reduction_test",
-          b_dim=4096,
-          h_dim=1024,
-          v_dim=4096,
-          reduction="sum",
-          test_impl=None,
-          reference_impl="xla",
-      ),
-      dict(
-          testcase_name="small_size_mean_reduction_test",
-          b_dim=1024,
-          h_dim=512,
-          v_dim=1024,
-          reduction="mean",
-          test_impl=None,
-          reference_impl="xla",
-      ),
-      dict(
-          testcase_name="medium_size_mean_reduction_test",
-          b_dim=4096,
-          h_dim=1024,
-          v_dim=4096,
-          reduction="mean",
-          test_impl=None,
-          reference_impl="xla",
-      ),
-  )
+  @parameterized.named_parameters(*_api_fwd_bwd_matches_reference_test_cases())
   def test_api_fwd_bwd_matches_reference(
       self,
       b_dim,

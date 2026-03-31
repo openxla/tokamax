@@ -26,6 +26,7 @@ from jax.extend import backend
 import pydantic
 from tokamax._src import hlo_utils
 from tokamax._src import pydantic as pydantic_lib
+from tokamax._src import version
 from tokamax._src.autotuning import autotuner
 from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
@@ -91,6 +92,10 @@ class AutotuningResult:
       ],
       ...,
   ]
+
+  # This is primarily used for serialization, so the importer can check which
+  # version of Tokamax was used to generate the serialized config.
+  tokamax_version: str = version.TOKAMAX_VERSION
 
   def dump(self, fp):
     fp.write(self.dumps())

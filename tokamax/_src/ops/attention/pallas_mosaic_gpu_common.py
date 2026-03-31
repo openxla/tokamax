@@ -28,6 +28,7 @@ from jaxlib.mlir.dialects import nvvm
 from jaxlib.mlir.dialects import vector
 import numpy as np
 import pydantic
+from tokamax._src import shape as shape_lib
 
 
 @pydantic.dataclasses.dataclass(
@@ -53,6 +54,16 @@ class ConfigBase:
   def __post_init__(self):
     if type(self) is ConfigBase:  # pylint: disable=unidiomatic-typecheck
       raise ValueError("Cannot use ConfigBase directly. Use a subclass.")
+
+
+MIN_SWIZZLE = 32
+
+
+# The contracting dimension for `wgmma` / `tcgen05.mma` must be a multiple of
+# the minimum swizzle size (in number of elements).
+def pad_head_dim_to_next_multiple_of_min_swizzle(x):
+  m = 8 * MIN_SWIZZLE // num_bits(x.dtype)
+  return shape_lib.pad_to_next_multiple_of(x, m, -1)
 
 
 def decompose_mask(mask, q, k, q_indices, k_indices):
