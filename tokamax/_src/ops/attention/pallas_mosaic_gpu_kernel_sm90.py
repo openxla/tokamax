@@ -281,8 +281,8 @@ def flash_attention_kernel(
           elif bias_smem is None:
             bias = _load_bcast(bias_gmem, (hi, qs, ks), layout=_WGMMA)
           else:
-            plgpu.barrier_wait(bias_barrier.at[si])
-            bias = bias_smem[si, block.ds(wg, block_q)]
+            plgpu.barrier_wait(bias_barrier.at[wg * max_stages + si])
+            bias = bias_smem[wg, si]
           mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
           return acc[...], bias, mask
 
@@ -436,11 +436,15 @@ def flash_attention_kernel(
       plgpu.set_max_registers(40, action="decrease")
       hi_kv = lax.div(hi, q_heads_per_kv_head)
       qs = block.ds(qi, 2 * block_q)
+      qs_wg0 = block.ds(2 * qi, block_q)
+      qs_wg1 = block.ds(2 * qi + 1, block_q)
 
       if bias_smem is None:
         bias_gmem_ = None
       else:
-        bias_gmem_ = bias_gmem.at[0 if bias_gmem.shape[0] == 1 else hi, qs]
+        bias_gmem_ = bias_gmem.at[0 if bias_gmem.shape[0] == 1 else hi]
+        bias_barrier_wg0 = bias_barrier
+        bias_barrier_wg1 = bias_barrier.at[max_stages:]
 
       if mask_smem is None:
         mask_gmem_ = None
@@ -461,7 +465,8 @@ def flash_attention_kernel(
         ks = block.ds(ki, block_kv)
         cp(k_gmem.at[ks, hi_kv], k_smem, k_barrier, si)
         if bias_gmem_ is not None:
-          cp(bias_gmem_.at[:, ks], bias_smem, bias_barrier, si)
+          cp(bias_gmem_.at[qs_wg0, ks], bias_smem.at[0], bias_barrier_wg0, si)
+          cp(bias_gmem_.at[qs_wg1, ks], bias_smem.at[1], bias_barrier_wg1, si)
         if mask_gmem_ is not None:
           cp(mask_gmem_.at[..., ks], mask_smem, mask_barrier, si)
         cp(v_gmem.at[ks, hi_kv], v_smem, v_barrier, si)
@@ -473,7 +478,8 @@ def flash_attention_kernel(
         plgpu.barrier_wait(k_consumed_barrier.at[si])
         cp(k_gmem.at[ks, hi_kv], k_smem, k_barrier, si)
         if bias_gmem_ is not None:
-          cp(bias_gmem_.at[:, ks], bias_smem, bias_barrier, si)
+          cp(bias_gmem_.at[qs_wg0, ks], bias_smem.at[0], bias_barrier_wg0, si)
+          cp(bias_gmem_.at[qs_wg1, ks], bias_smem.at[1], bias_barrier_wg1, si)
         if mask_gmem_ is not None:
           plgpu.barrier_wait(mask_consumed_barrier.at[si])
           cp(mask_gmem_.at[..., ks], mask_smem, mask_barrier, si)
@@ -520,11 +526,11 @@ def flash_attention_kernel(
       num_barriers=max_stages, num_arrivals=compute_wgs
   )
 
-  bias_mask_smem_shape = (max_stages, compute_wgs * block_q, block_kv)
   # bias doesn't need a consumed barrier as it is implied by k consumed.
   if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
-    bias_scratch = tiled_smem(bias_mask_smem_shape, bias.dtype, "bias")
-    bias_barrier = plgpu.Barrier(num_barriers=max_stages)
+    bias_scratch_shape = (compute_wgs, max_stages, block_q, block_kv)
+    bias_scratch = tiled_smem(bias_scratch_shape, bias.dtype, "bias")
+    bias_barrier = plgpu.Barrier(num_barriers=compute_wgs * max_stages)
   else:
     bias_scratch = bias_barrier = None
 
@@ -534,7 +540,8 @@ def flash_attention_kernel(
       if block_kv >= 128:  # Minimum transfer size is 128 bytes.
         mask_scratch = plgpu.SMEM((max_stages, block_kv), jnp.int8)
     else:
-      mask_scratch = tiled_smem(bias_mask_smem_shape, jnp.int8, "mask")
+      mask_scratch_shape = (max_stages, compute_wgs * block_q, block_kv)
+      mask_scratch = tiled_smem(mask_scratch_shape, jnp.int8, "mask")
 
     if mask_scratch is not None:
       mask_barrier = plgpu.Barrier(num_barriers=max_stages)
