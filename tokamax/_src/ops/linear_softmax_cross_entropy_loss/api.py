@@ -103,9 +103,11 @@ def linear_softmax_cross_entropy_loss(
     else:
       raise ValueError(f"Unsupported implementation: {implementation}")
 
-  # Find out the best impelmentation based on the hardware.
+  # Find out the best implementation based on the hardware.
   errors = []
-  for impl in IMPLEMENTATIONS:
+  for impl in _DEFAULT_IMPLEMENTATION:
+    if impl not in IMPLEMENTATIONS:
+      continue
     try:
       loss = IMPLEMENTATIONS[impl](
           x,
@@ -115,7 +117,7 @@ def linear_softmax_cross_entropy_loss(
       )
       return loss
     except NotImplementedError as e:
-      if len(implementation) == 1:
+      if len(_DEFAULT_IMPLEMENTATION) == 1:
         raise
       errors.append(e)
 

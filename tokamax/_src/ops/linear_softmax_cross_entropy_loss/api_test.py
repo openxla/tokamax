@@ -85,7 +85,6 @@ class ApiTest(parameterized.TestCase):
           h_dim=512,
           v_dim=2048,
           reduction="sum",
-          test_impl=None,
       ),
       dict(
           testcase_name="medium_sum_reduction_test",
@@ -93,7 +92,6 @@ class ApiTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=4096,
           reduction="sum",
-          test_impl=None,
       ),
   )
   def test_correct_implementation_used(
@@ -102,7 +100,6 @@ class ApiTest(parameterized.TestCase):
       h_dim,
       v_dim,
       reduction,
-      test_impl,
   ):
     x, labels, w = test_utils.generate_random_data(
         jax.random.key(42), b_dim, h_dim, v_dim
@@ -117,7 +114,7 @@ class ApiTest(parameterized.TestCase):
                 "reduction",
                 "implementation",
             ],
-        ).lower(x, labels, w, reduction=reduction, implementation=test_impl),
+        ).lower(x, labels, w, reduction=reduction),
         include_xla_kernels=False,
     )
 
@@ -127,7 +124,7 @@ class ApiTest(parameterized.TestCase):
         else None
     )
 
-    if test_impl == "mosaic_tpu":
+    if jax.default_backend() == "tpu":
       self.assertIsInstance(opspecs[0].op, mosaic_tpu_impl)
     else:
       # CPU / GPU are using XLA implementation
