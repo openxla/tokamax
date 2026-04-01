@@ -74,7 +74,7 @@ class PallasMosaicTpuFlashAttentionVjp(
       k: Float[Array, "*B t h D"],
       v: Float[Array, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,

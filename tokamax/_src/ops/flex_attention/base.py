@@ -29,6 +29,7 @@ from tokamax._src.ops import op
 from typing_extensions import override
 
 
+CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
 
 
@@ -216,19 +217,11 @@ class FlexAttention(
     if not isinstance(precision, tuple):
       precision = (precision, precision)
 
-    q_k_dot_precision, p_v_dot_precision = precision
-    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
-        q.dtype, k.dtype, q_k_dot_precision
-    )
-    p_v_dot_precision = precision_lib.to_dot_algorithm_preset(
-        v.dtype, v.dtype, p_v_dot_precision
-    )
-
     return super().bind(
         q,
         k,
         v,
-        precision=(q_k_dot_precision, p_v_dot_precision),
+        precision=tuple(map(precision_lib.canonicalize_precision, precision)),
         score_mod=score_mod,
         mask_mod=mask_mod,
         dropout_mask=dropout_mask,
@@ -245,7 +238,7 @@ class FlexAttention(
       k: Float[Array | QArray, "*B t h D"],
       v: Float[Array | QArray, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[CanonicalPrecision, CanonicalPrecision],
       score_mod: ScoreMod | None,
       mask_mod: MaskMod | None,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
@@ -265,6 +258,12 @@ class FlexAttention(
         v = jnp.repeat(v, repeats, axis=-2)
 
     q_k_dot_precision, weights_v_dot_precision = precision
+    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, q_k_dot_precision
+    )
+    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+        v.dtype, v.dtype, weights_v_dot_precision
+    )
 
     logits = jnp.einsum(
         "...qhd,...khd->...hqk",

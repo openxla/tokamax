@@ -17,7 +17,6 @@
 import dataclasses
 from typing import Annotated
 
-import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
@@ -49,7 +48,7 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
       k: Float[Array | QArray, "*B t h D"],
       v: Float[Array | QArray, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,

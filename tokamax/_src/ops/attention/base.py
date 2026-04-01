@@ -42,6 +42,7 @@ class AUTO:  # Used as a sentinel value.
   pass
 
 
+CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
 
 
@@ -520,20 +521,12 @@ class DotProductAttention(
     if not isinstance(precision, tuple):
       precision = (precision, precision)
 
-    q_k_dot_precision, p_v_dot_precision = precision
-
-    if not isinstance(q_k_dot_precision, jax.lax.DotAlgorithmPreset):
-      q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
-          q.dtype, k.dtype, q_k_dot_precision
-      )
-
-    if not isinstance(p_v_dot_precision, jax.lax.DotAlgorithmPreset):
-      p_v_dot_precision = precision_lib.to_dot_algorithm_preset(
-          v.dtype, v.dtype, p_v_dot_precision
-      )
+    precision = tuple(map(precision_lib.canonicalize_precision, precision))
 
     if logits_dtype is AUTO:
-      logits_dtype = q_k_dot_precision.accumulation_type
+      logits_dtype = precision_lib.to_dot_algorithm_preset(
+          q.dtype, k.dtype, precision[0]
+      ).accumulation_type
 
     if logits_scale is AUTO:
       logits_scale = 1 / math.sqrt(q.shape[-1])
@@ -548,7 +541,7 @@ class DotProductAttention(
         q,
         k,
         v,
-        precision=(q_k_dot_precision, p_v_dot_precision),
+        precision=precision,
         logits_dtype=jnp.dtype(logits_dtype),
         logits_scale=logits_scale,
         bias=bias,
@@ -571,7 +564,7 @@ class DotProductAttention(
       k: Float[Array | QArray, "*b t h D"],
       v: Float[Array | QArray, "*b t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[CanonicalPrecision, CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
@@ -597,6 +590,12 @@ class DotProductAttention(
         v = jnp.repeat(v, repeats, axis=-2)
 
     q_k_dot_precision, weights_v_dot_precision = precision
+    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, q_k_dot_precision
+    )
+    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+        v.dtype, v.dtype, weights_v_dot_precision
+    )
 
     logits = jnp.einsum(
         "...qhd,...khd->...hqk",
@@ -825,7 +824,7 @@ class DotProductAttentionVjp(
       k: Float[Array, "*b t h D"],
       v: Float[Array, "*b t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[CanonicalPrecision, CanonicalPrecision],
       logits_dtype: jnp.dtype,
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,

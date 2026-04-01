@@ -28,6 +28,7 @@ import numpy as np
 import pydantic
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
+from tokamax._src import precision as precision_lib
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
@@ -451,7 +452,7 @@ class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
       k: Float[Array | QArray, "*B t h D"],
       v: Float[Array | QArray, "*B t h d"],
       *,
-      precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+      precision: tuple[base.CanonicalPrecision, base.CanonicalPrecision],
       score_mod: ScoreMod | None,
       mask_mod: MaskMod | None,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
@@ -465,6 +466,12 @@ class PallasTritonFlexAttention(base.FlexAttention[Config, None]):
       raise ValueError("block_d[_out] unsupported for subchannel quantization.")
 
     q_k_dot_precision, weights_v_dot_precision = precision
+    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+        q.dtype, k.dtype, q_k_dot_precision
+    )
+    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+        v.dtype, v.dtype, weights_v_dot_precision
+    )
     return _fwd(
         q,
         k,
