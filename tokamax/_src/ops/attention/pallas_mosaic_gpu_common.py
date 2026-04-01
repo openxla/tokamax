@@ -28,7 +28,12 @@ from jaxlib.mlir.dialects import nvvm
 from jaxlib.mlir.dialects import vector
 import numpy as np
 import pydantic
+import qwix
+from tokamax._src import precision as precision_lib
 from tokamax._src import shape as shape_lib
+
+
+QArray = qwix.QArray
 
 
 @pydantic.dataclasses.dataclass(
@@ -96,6 +101,36 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
   k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
   mask = mask.as_array(q_len_or_indices, k_len_or_indices)
   return mask, is_causal, k_start, k_end
+
+
+def cast_qkv(
+    q: jax.Array | QArray,
+    k: jax.Array | QArray,
+    v: jax.Array | QArray,
+    precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+) -> tuple[jax.Array | QArray, jax.Array | QArray, jax.Array | QArray]:
+  """Casts Q, K, and V to the given precision."""
+
+  def cast(x, precision):
+    assert precision != jax.lax.DotAlgorithmPreset.DEFAULT
+    if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+      return x.astype(jnp.bfloat16)
+    if precision == jax.lax.DotAlgorithmPreset.F16_F16_F32:
+      return x.astype(jnp.float16)
+    raise NotImplementedError(f"Unsupported precision: {precision}")
+
+  q_k_dot_precision, p_v_dot_precision = precision
+  # Ensure precision is not `DotAlgorithmPreset.DEFAULT`.
+  q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
+      q.dtype, k.dtype, q_k_dot_precision
+  )
+  p_v_dot_precision = precision_lib.to_dot_algorithm_preset(
+      v.dtype, v.dtype, p_v_dot_precision
+  )
+  q = cast(q, q_k_dot_precision)
+  k = cast(k, q_k_dot_precision)
+  v = cast(v, p_v_dot_precision)
+  return q, k, v
 
 
 def load_bcast(

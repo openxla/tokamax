@@ -131,35 +131,10 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
 
+    out_dtype = q.dtype
     # TODO: Support in-kernel dequantization.
     q, k, v = map(quantization.as_array, (q, k, v))
-    out_dtype = q.dtype
-
-    def cast(x, precision):
-      msg = lambda dt: f"Only {dt} supported for {precision=}, got {x.dtype=}"
-      if precision == jax.lax.DotAlgorithmPreset.DEFAULT:
-        if x.dtype not in (jnp.float16, jnp.bfloat16):
-          raise NotImplementedError(msg("f16 and bf16"))
-        return x
-      if x.dtype not in precision.supported_lhs_types:
-        raise NotImplementedError(msg(precision.supported_lhs_types))
-      if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
-        return x.astype(jnp.bfloat16)
-      if precision == jax.lax.DotAlgorithmPreset.F16_F16_F32:
-        return x.astype(jnp.float16)
-      raise NotImplementedError(f"Unsupported {precision=}")
-
-    q_k_dot_precision, weights_v_dot_precision = precision
-    q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
-        q.dtype, k.dtype, q_k_dot_precision
-    )
-    weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
-        v.dtype, v.dtype, weights_v_dot_precision
-    )
-    # TODO: Avoid silently downcasting types.
-    q = cast(q, q_k_dot_precision)
-    k = cast(k, q_k_dot_precision)
-    v = cast(v, weights_v_dot_precision)
+    q, k, v = common.cast_qkv(q, k, v, precision)
 
     orig_seq_len_q = q.shape[-3]
     if isinstance(config, common.ConfigBase) and config.fold_q_sequence_heads:

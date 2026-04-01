@@ -50,7 +50,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       supports_mask=True,
       supports_tanh_clipping=True,
       supports_is_causal=True,
-      supports_f32_inputs=True,
       supports_vmap=True,
   ):
     if attention_fn is None:
@@ -72,32 +71,19 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         supports_precisions=False,
         supports_vmap=supports_vmap,
         supports_is_causal=supports_is_causal,
+        supports_logits_dtype=False,
     )
-    self._supports_f32_inputs = supports_f32_inputs
 
   def _run_test_with_inputs(self, q, k, v, *, bias=None, **kwargs):
-    # PallasMosaicGpuFlashAttention doesn't support high precisions and
-    # (logits_dtype != f32). Override the arguments instead of disabling
-    # basically most of the tests.
+    # PallasMosaicGpuFlashAttention doesn't support high precisions. Override
+    # the arguments instead of disabling most of the tests.
     impl_kwargs = kwargs.setdefault("impl_kwargs", {})
-    impl_kwargs["logits_dtype"] = jnp.float32
-    qk_prec, wv_prec = (jax.lax.DotAlgorithmPreset.DEFAULT,) * 2
-    if q.dtype == jnp.float32 or k.dtype == jnp.float32:
-      qk_prec = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-    if v.dtype == jnp.float32:
-      wv_prec = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-    impl_kwargs["precision"] = (qk_prec, wv_prec)
+    if any(x.dtype == jnp.float32 for x in (q, k, v)):
+      impl_kwargs["precision"] = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+      # Bottleneck precision for reference implementation to match kernel.
+      bf16_round_trip = lambda x: x.astype(jnp.bfloat16).astype(jnp.float32)
+      q, k, v = map(bf16_round_trip, (q, k, v))
 
-    def recast(x):
-      if isinstance(x, jax.Array) and x.dtype == jnp.float32:
-        x = x.astype(jnp.bfloat16)
-        if self._supports_f32_inputs:
-          x = x.astype(jnp.float32)
-      return x
-
-    # This backend casts to bfloat16 internally, so we recast inputs to bfloat16
-    # and back to avoid precision loss with the reference implementation.
-    q, k, v = map(recast, (q, k, v))
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045)
     kwargs["atol_grads"] = None if bias is None else 0.02
