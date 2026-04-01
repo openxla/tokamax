@@ -66,11 +66,10 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
     with mock.patch.object(self, "_dot_fn", split_k_dot):
       self.test_quantized0()  # pytype: disable=attribute-error
 
-  @parameterized.parameters(jnp.bfloat16, jnp.float32)
   @override
-  def test_simple(self, dtype):
+  def _test_simple(self, dtype):
     with test_base.override_chex_args(atol=1e-6):
-      self._test_simple(dtype)
+      super()._test_simple(dtype)
 
   @override
   def _test_bench(self, spec):
