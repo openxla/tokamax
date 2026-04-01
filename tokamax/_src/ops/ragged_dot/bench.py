@@ -22,20 +22,13 @@ import google_benchmark
 import jax
 from jax.experimental import layout
 import jax.numpy as jnp
-import qwix
 from tokamax._src import benchmarking
-from tokamax._src import gpu_utils
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import arg_specs
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu as pl_mgpu
 from tokamax._src.ops.ragged_dot import pallas_triton
 ARG_SPECS = arg_specs.ARG_SPECS
-
-if jax.__version_info__ >= (0, 6, 3):
-  DLL = layout.Layout
-else:
-  DLL = layout.DeviceLocalLayout  # type: ignore
 
 
 # This provides an upper-bound for performance for compute-bound workloads.
@@ -81,7 +74,7 @@ _register_benchmark = functools.partial(
 
 
 def _transpose_rhs(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
-  dev_layout = DLL((0, 2, 1), ())
+  dev_layout = layout.Layout((0, 2, 1), ())
   no_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
   dll_layout = layout.Format(dev_layout, no_sharding)
   return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=dll_layout)

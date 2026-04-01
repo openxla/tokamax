@@ -24,12 +24,6 @@ from tokamax._src import batching
 from tokamax._src import numerics
 
 
-if jax.__version_info__ >= (0, 6, 3):
-  Layout = layout.Layout
-else:
-  Layout = layout.DeviceLocalLayout  # type: ignore
-
-
 class NumericsTest(parameterized.TestCase):
 
   def test_initializer_consistency(self):
@@ -126,7 +120,7 @@ class NumericsTest(parameterized.TestCase):
 
     shape = (2, 3, 4)
     no_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
-    format_ = layout.Format(Layout((1, 2, 0), ()), no_sharding)
+    format_ = layout.Format(layout.Layout((1, 2, 0), ()), no_sharding)
     spec_with_layout = jax.ShapeDtypeStruct(shape, dtype, sharding=format_)
     actual = numerics.random_initialize(spec_with_layout)
     expected = numerics.random_initialize(jax.ShapeDtypeStruct(shape, dtype))
