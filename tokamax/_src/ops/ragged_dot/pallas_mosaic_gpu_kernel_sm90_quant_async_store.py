@@ -39,7 +39,7 @@ _WGMMA_TRANSPOSED = plgpu.Layout.WGMMA_TRANSPOSED
 
 
 @jaxtyping.jaxtyped
-def ragged_dot_quantized_ws_async_store_kernel(
+def ragged_dot_quantized_async_store_kernel(
     lhs: Float[Array, "M K"],
     rhs: Float[qwix.QArray, "G K N"],
     group_sizes: Integer[Array, "G"],

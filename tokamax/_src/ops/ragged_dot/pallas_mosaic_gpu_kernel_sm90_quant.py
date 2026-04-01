@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Ragged dot Pallas-Mosaic-GPU Quantized Kernel."""
+"""Ragged dot Pallas-Mosaic-GPU Non-Quantized Kernel."""
 
 import functools
 
-import jax
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
@@ -32,73 +32,74 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 
 
-def ragged_dot_quantized_kernel_body(
-    group_info,
+def body(
+    group_info: common.GroupInfo,
     mi,
     ni,
     w_gmem,
     x_gmem,
     w_scales_gmem,
     o_gmem,
+    o_smem,
+    schedule_barrier,
     *,
     config: common.Config,
     activation: base.ActivationFunction | None = None,
 ):
-  """Pallas kernel for ragged dot with quantized RHS."""
+  """The main kernel function for ragged dot-product."""
   del mi
   block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
+
   m, k = x_gmem.shape
+  wg = lax.axis_index("wg")
+  ns = pl.ds(wg * block_n, block_n)
 
-  x_elem_bits = jnp.finfo(x_gmem.dtype).bits
-  swizzle_x = plgpu.find_swizzle(x_elem_bits * block_k, "rhs")
-  x_swizzle_elems = (swizzle_x * 8) // x_elem_bits
+  def schedule_barrier_arrive_and_wait():
+    plgpu.barrier_arrive(schedule_barrier)
+    plgpu.barrier_wait(schedule_barrier)
 
-  def compute_acc(acc):
-    def pipeline_body(_, w_smem, x_smem, w_scales_smem):
-      w = w_smem[...]
-      w_scales = plgpu.load(w_scales_smem, (), layout=_WGMMA_ROW)
-      # Tiling along the reduction dimension. This overlaps to some extent
-      # scaling/casting with wgmma.
-      assert w.shape[1] % x_swizzle_elems == 0
-      steps = w.shape[1] // x_swizzle_elems
-      if steps == 1:
-        # The LHS registers are reused in each loop. Synchronizing here is
-        # the only way to make sure they are not overwritten.
-        plgpu.wgmma_wait(0)
+  def pipeline_body(_, w_smem, x_smem, w_scales_smem, acc):
+    pl.when(wg == 0)(schedule_barrier_arrive_and_wait)
+    w = w_smem[ns].astype(w_scales_smem.dtype)
+    w_scales = plgpu.load(w_scales_smem, (ns,), layout=_WGMMA_ROW)
+    w *= lax.broadcast_in_dim(w_scales, w.shape, [0])
+    schedule_barrier_arrive_and_wait()
+    plgpu.wgmma(acc, w, x_smem.T)
+    pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
+    plgpu.wgmma_wait(0)
+    return acc
 
-      for j in range(steps):
-        ks = slice(j * x_swizzle_elems, (j + 1) * x_swizzle_elems)
-        w_ = w[:, ks].astype(w_scales.dtype)
-        w_ = w_ * jax.lax.broadcast_in_dim(w_scales, w_.shape, [0])
-        plgpu.wgmma(acc, w_, x_smem.at[:, ks].T)
-        plgpu.wgmma_wait(1)
+  def pipeline_context(pipeline_callback):
+    compute_acc = lambda acc: pipeline_callback(acc)[...]
+    acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
 
-    mi = group_info.block
-    gi = group_info.group_id
+    if activation is not None:
+      acc = activation(acc)
 
-    spec = functools.partial(common.tiled_swizzled_block_spec, delay_release=1)
-    x_spec = spec((block_m, block_k), x_gmem.dtype, lambda ki: (mi, ki), "x")
-    w_spec = spec((block_n, block_k), w_gmem.dtype, lambda ki: (ni, ki), "w")
-    w_scales_spec = plgpu.BlockSpec(
-        (None, block_n),
-        lambda ki: (ki // (k // w_scales_gmem.shape[1] // block_k), ni),
-        delay_release=1,
-    )
-    plgpu.emit_pipeline(
-        pipeline_body,
-        grid=(k // block_k,),
-        in_specs=(w_spec, x_spec, w_scales_spec),
-        max_concurrent_steps=config.num_stages,
-    )(w_gmem.at[gi], x_gmem, w_scales_gmem.at[gi])
-    return acc[...]
+    ni_ = 2 * ni + wg
+    common.store_acc_transposed(acc, o_gmem, ni_, m, group_info, o_smem.at[wg])
 
-  acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
-  o_smem_type = plgpu.SMEM((block_m, block_n), o_gmem.dtype)
+  mi = group_info.block
+  gi = group_info.group_id
 
-  @functools.partial(pl.run_scoped, o_smem=o_smem_type)
-  def epilogue(o_smem):
-    acc_ = acc if activation is None else activation(acc)
-    common.store_acc_transposed(acc_, o_gmem, ni, m, group_info, o_smem)
+  spec = common.tiled_swizzled_block_spec
+  x_spec = spec((block_m, block_k), x_gmem.dtype, lambda ki: (mi, ki), "x")
+  w_spec = spec((2 * block_n, block_k), w_gmem.dtype, lambda ki: (ni, ki), "w")
+  w_scales_spec = plgpu.BlockSpec(
+      (None, 2 * block_n),
+      lambda ki: (ki // (k // w_scales_gmem.shape[1] // block_k), ni),
+  )
+
+  plgpu.emit_pipeline_warp_specialized(
+      pipeline_body,
+      num_compute_wgs=2,
+      wg_axis="wg",
+      memory_registers=168 if config.persistent else 40,
+      grid=(k // block_k,),
+      compute_context=pipeline_context,
+      in_specs=(w_spec, x_spec, w_scales_spec),
+      max_concurrent_steps=max(config.num_stages // 2, 2),
+  )(w_gmem.at[gi], x_gmem, w_scales_gmem.at[gi])
 
 
 @jaxtyping.jaxtyped
@@ -126,11 +127,20 @@ def ragged_dot_quantized_kernel(
         f" {rhs.scale_tile_shape}."
     )
 
-  body = functools.partial(
-      ragged_dot_quantized_kernel_body, activation=activation, config=config
-  )
+  assert n % (config.block_n * 2) == 0
+
   kernel = common.ragged_kernel(
-      body, g=g, m=m, n=n, out_dtype=out_dtype, config=config
+      functools.partial(body, activation=activation, config=config),
+      g=g,
+      m=m,
+      n=n,
+      out_dtype=out_dtype,
+      config=config,
+      thread_axis="wg",
+      scratch_shapes=(
+          plgpu.SMEM((2, config.block_m, config.block_n), out_dtype),
+          plgpu.Barrier(num_arrivals=2),
+      ),
   )
   group_info = common.GroupInfo.create(
       group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1

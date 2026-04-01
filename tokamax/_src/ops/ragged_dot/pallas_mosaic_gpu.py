@@ -33,8 +33,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws as sm90_quant_ws
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_ws_async_store as sm90_quant_ws_async_store
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_async_store as sm90_quant_async_store
 from typing_extensions import override
 
 Config = common.Config
@@ -98,11 +97,11 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             raise NotImplementedError(f"{precision=} not supported.")
 
           if config.async_store:
-            fn = sm90_quant_ws_async_store.ragged_dot_quantized_ws_async_store_kernel  # pylint: disable=line-too-long
+            fn = sm90_quant_async_store.ragged_dot_quantized_async_store_kernel  # pylint: disable=line-too-long
           elif config.warp_specialized:
-            fn = sm90_quant_ws.ragged_dot_quantized_ws_kernel
-          else:
             fn = sm90_quant.ragged_dot_quantized_kernel
+          else:
+            raise NotImplementedError("`warp_specialized=False` not supported.")
         else:
           if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
             lhs = lhs.astype(jnp.bfloat16)
@@ -266,14 +265,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     out_dtype_bits = jnp.finfo(out_dtype).bits
     out_swizzle_elems = (128 * 8) // out_dtype_bits
 
-    if isinstance(rhs, QArray):
-      ws_async_store_options = ((False, False), (True, False), (True, True))
-    else:
-      ws_async_store_options = ((False, False),)
-
     configs = set()
     for persistent in [True, False]:
-      for warp_specialized, async_store in ws_async_store_options:
+      for async_store in [True, False] if isinstance(rhs, QArray) else [False]:
         for block_k in [128, 256, 512]:
           if (block_k * rhs_dtype_bits) % (128 * 8) or (
               block_k * lhs_dtype_bits
@@ -294,7 +288,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                           block_n=out_swizzle_elems,
                           block_k=block_k,
                           num_stages=num_stages,
-                          warp_specialized=warp_specialized,
+                          warp_specialized=True,
                           persistent=persistent,
                           split_k=1,
                           async_store=async_store,
