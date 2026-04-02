@@ -22,12 +22,14 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
 _WGMMA = plgpu.Layout.WGMMA
-
+_tiled_swizzled_block_spec = mgpu_lib.tiled_swizzled_block_spec
+_tiled_swizzled_smem = mgpu_lib.tiled_swizzled_smem
 
 def _kernel_body(
     group_info,
@@ -50,7 +52,7 @@ def _kernel_body(
 
   def compute_acc(acc):
     mi = group_info.block
-    spec = functools.partial(common.tiled_swizzled_block_spec, delay_release=1)
+    spec = functools.partial(_tiled_swizzled_block_spec, delay_release=1)
     lhs_spec = spec(
         (block_m, block_k), lhs_gmem.dtype, lambda ki: (mi, ki), "lhs"
     )
@@ -67,7 +69,7 @@ def _kernel_body(
 
   acc = pl.run_scoped(compute_acc, plgpu.ACC((block_m, block_n)))
 
-  o_smem_type = common.tiled_swizzled_smem(
+  o_smem_type = _tiled_swizzled_smem(
       (block_m, block_n), o_gmem.dtype, tiling_prefix=(1,), what="out"
   )
 
@@ -165,7 +167,7 @@ def _ragged_contracting_dim_dot_kernel_body(
       plgpu.wgmma(acc, lhs_smem[...] * mask, rhs_smem)
       plgpu.wgmma_wait(1)
 
-    spec = functools.partial(common.tiled_swizzled_block_spec, delay_release=1)
+    spec = functools.partial(_tiled_swizzled_block_spec, delay_release=1)
     lhs_spec = spec(
         (block_m, block_k), lhs_gmem.dtype, lambda ki: (mi, lb + ki), "lhs"
     )
@@ -181,11 +183,7 @@ def _ragged_contracting_dim_dot_kernel_body(
     return acc[...]
 
   acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
-
-  transforms = common.tile_swizzle_transforms((block_m, block_n), o_gmem.dtype)
-  o_smem_type = plgpu.SMEM(
-      (block_m, block_n), o_gmem.dtype, transforms=transforms
-  )
+  o_smem_type = _tiled_swizzled_smem((block_m, block_n), o_gmem.dtype, "out")
 
   @functools.partial(pl.run_scoped, o_smem=o_smem_type)
   def epilogue(o_smem):

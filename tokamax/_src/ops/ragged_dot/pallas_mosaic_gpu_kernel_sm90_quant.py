@@ -25,6 +25,7 @@ from jaxtyping import Float  # pylint: disable=g-multiple-import,g-importing-mem
 from jaxtyping import Integer  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
@@ -82,7 +83,7 @@ def body(
   mi = group_info.block
   gi = group_info.group_id
 
-  spec = common.tiled_swizzled_block_spec
+  spec = mgpu_lib.tiled_swizzled_block_spec
   x_spec = spec((block_m, block_k), x_gmem.dtype, lambda ki: (mi, ki), "x")
   w_spec = spec((2 * block_n, block_k), w_gmem.dtype, lambda ki: (ni, ki), "w")
   w_scales_spec = plgpu.BlockSpec(

@@ -32,6 +32,7 @@ from jaxlib.mlir.dialects import nvvm
 from jaxlib.mlir.dialects import vector
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -65,7 +66,7 @@ _ALPHA_BARRIER_OFFSET = 8
 _load_bcast = common.load_bcast
 
 _MASK_PACK_DTYPE = jnp.int8
-_MASK_PACKED_BITS = common.num_bits(_MASK_PACK_DTYPE)
+_MASK_PACKED_BITS = mgpu_lib.num_bits(_MASK_PACK_DTYPE)
 
 
 @pydantic.dataclasses.dataclass(
@@ -207,7 +208,7 @@ def flash_attention_kernel(
 
   q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
   if config.collective:
-    m = 2 * 8 * common.MIN_SWIZZLE // common.num_bits(v.dtype)
+    m = 2 * 8 * common.MIN_SWIZZLE // mgpu_lib.num_bits(v.dtype)
     v = shape_lib.pad_to_next_multiple_of(v, m, -1)  # Need >=32 bytes per CTA.
   head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
@@ -237,7 +238,7 @@ def flash_attention_kernel(
   collective_axis = "cluster" if collective else None
   softmax_slots = 2
 
-  epi_tile_d = 1024 // common.num_bits(out_dtype)
+  epi_tile_d = 1024 // mgpu_lib.num_bits(out_dtype)
   if head_dim_out % epi_tile_d != 0:
     epi_tile_d = head_dim_out
   num_epi_slots = min(2, head_dim_out // epi_tile_d)
@@ -390,7 +391,7 @@ def flash_attention_kernel(
                 hi_ = 0 if bias_gmem.shape[-3] == 1 else hi
                 ks = pl.ds(ki * block_kv, block_kv)
                 plgpu.barrier_wait(bias_consumed_barrier)
-                common.fence_async_shared_cta()  # Ensure smem read is complete.
+                mgpu_lib.fence_async_shared_cta()  # Ensure smem read complete.
                 plgpu.copy_gmem_to_smem(
                     bias_gmem.at[hi_, qs, ks], bias_smem, bias_barrier
                 )
@@ -399,7 +400,7 @@ def flash_attention_kernel(
                 mask_block_size = max(mask_block_kv, min_mask_cols)
                 ks = pl.ds(ki * mask_block_kv, mask_block_size)
                 plgpu.barrier_wait(mask_consumed_barrier)
-                common.fence_async_shared_cta()  # Ensure smem read is complete.
+                mgpu_lib.fence_async_shared_cta()  # Ensure smem read complete.
                 plgpu.copy_gmem_to_smem(
                     mask_gmem.at[hi_, qs, ks], mask_smem, mask_barrier
                 )
@@ -567,7 +568,7 @@ def flash_attention_kernel(
           @pl.when(ki > lb)
           def write_alpha_to_smem():
             alpha_smem.at[si][...] = alpha
-            common.bar_arrive(si + _ALPHA_BARRIER_OFFSET, num_threads=256)
+            mgpu_lib.bar_arrive(si + _ALPHA_BARRIER_OFFSET, num_threads=256)
 
           needs_rescale = (
               (rescale_threshold == 1.0)
@@ -605,7 +606,7 @@ def flash_attention_kernel(
 
       if normalize_output:
         li_smem[...] = l_i
-        common.bar_arrive(_L_BARRIER_ID, num_threads=256)
+        mgpu_lib.bar_arrive(_L_BARRIER_ID, num_threads=256)
 
       if return_residuals:
         if normalize_output and (rescale_threshold != 1.0):
@@ -641,7 +642,7 @@ def flash_attention_kernel(
 
         acc_tiles = two_in_flight(load_acc_tiles())
         ds, acc = next(acc_tiles)
-        common.bar_sync(slot + _ALPHA_BARRIER_OFFSET, num_threads=256)
+        mgpu_lib.bar_sync(slot + _ALPHA_BARRIER_OFFSET, num_threads=256)
         alpha = plgpu.load(alpha_smem, slot, layout=_TMEM_ROW)
         needs_rescale = (
             (rescale_threshold == 1.0)
@@ -682,7 +683,7 @@ def flash_attention_kernel(
           for i in range(num_tma_splits):
             plgpu.barrier_arrive(out_scaled_barrier.at[i])
           for _ in range(num_tma_splits):
-            common.warpgroup_barrier()  # To match barrier in `commit_tmem`.
+            mgpu_lib.warpgroup_barrier()  # To match barrier in `commit_tmem`.
 
         with jax.named_scope("rescale_acc"):
           # If none of the threads in the warp need to rescale, then we can skip
@@ -697,7 +698,7 @@ def flash_attention_kernel(
 
         def write_acc():
           if normalize_output:
-            common.bar_sync(_L_BARRIER_ID, num_threads=256)
+            mgpu_lib.bar_sync(_L_BARRIER_ID, num_threads=256)
             l_i = plgpu.load(li_smem, (), layout=_TCGEN05_ROW)
             l_rcp = 1.0 / (l_i + float(jnp.finfo(jnp.float32).tiny))
             l_rcp = lax.broadcast_in_dim(l_rcp, acc_tmem.shape, [0])
@@ -760,30 +761,24 @@ def flash_attention_kernel(
     residuals_shape = (num_q_heads, pl.cdiv(q_seq_len, tile_q) * tile_q)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
 
-  def tiled_smem(shape, dtype):
-    transforms = common.tile_swizzle_transforms(shape, dtype)
-    return plgpu.SMEM(shape, dtype, transforms=transforms)
+  k_block_shape = (
+      num_stages,
+      num_tma_splits,
+      block_kv // 2 if collective else block_kv,
+      head_dim // num_tma_splits,
+  )
+  v_block_shape = (
+      num_stages,
+      num_tma_splits,
+      block_kv,
+      head_dim_out // num_tma_splits // (2 if collective else 1),
+  )
 
-  q_scratch = tiled_smem((block_q, head_dim), q.dtype)
-  k_scratch = tiled_smem(
-      (
-          num_stages,
-          num_tma_splits,
-          block_kv // 2 if collective else block_kv,
-          head_dim // num_tma_splits,
-      ),
-      k.dtype,
-  )
-  v_scratch = tiled_smem(
-      (
-          num_stages,
-          num_tma_splits,
-          block_kv,
-          head_dim_out // num_tma_splits // (2 if collective else 1),
-      ),
-      k.dtype,
-  )
-  o_scratch = tiled_smem((num_epi_slots, block_q, epi_tile_d), out_dtype)
+  tiled_smem = mgpu_lib.tiled_swizzled_smem
+  q_scratch = tiled_smem((block_q, head_dim), q.dtype, "q")
+  k_scratch = tiled_smem(k_block_shape, k.dtype, "k")
+  v_scratch = tiled_smem(v_block_shape, k.dtype, "v")
+  o_scratch = tiled_smem((num_epi_slots, block_q, epi_tile_d), out_dtype, "o")
   if normalize_output:
     li_scratch = plgpu.SMEM((block_q,), jnp.float32)
   else:
@@ -792,7 +787,7 @@ def flash_attention_kernel(
   if bias is None or bias.shape[-2] == 1 or bias.shape[-1] == 1:
     bias_scratch = None
   else:
-    bias_scratch = tiled_smem((block_q, block_kv), bias.dtype)
+    bias_scratch = tiled_smem((block_q, block_kv), bias.dtype, "bias")
 
   kv_barrier = plgpu.Barrier(
       num_barriers=num_stages, num_arrivals=num_tma_splits

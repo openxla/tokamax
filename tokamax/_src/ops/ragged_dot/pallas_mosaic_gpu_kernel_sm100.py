@@ -21,6 +21,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
@@ -212,7 +213,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
         num_barriers=2, orders_tensor_core=True
     )
 
-  tiled_smem = common.tiled_swizzled_smem
+  tiled_smem = mgpu_lib.tiled_swizzled_smem
   scratch_shapes = dict(
       x_smem=tiled_smem((num_stages, block_m, block_k), lhs.dtype, "x"),
       w_smem=tiled_smem((num_stages, block_n, block_k), rhs.dtype, "w"),

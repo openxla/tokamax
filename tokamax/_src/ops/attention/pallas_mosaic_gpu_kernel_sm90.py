@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -160,7 +161,7 @@ def flash_attention_kernel(
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
 
   epi_tile_q = 64
-  epi_tile_d = 1024 // common.num_bits(out_dtype)
+  epi_tile_d = 1024 // mgpu_lib.num_bits(out_dtype)
   assert block_q % epi_tile_q == 0
   if head_dim_out % epi_tile_d != 0:
     epi_tile_d = head_dim_out
@@ -256,10 +257,10 @@ def flash_attention_kernel(
 
       # MGPU uses the lower barrier IDs, so use barriers 8 and 9 for scheduling.
       schedule_barrier_arrive = functools.partial(
-          common.bar_arrive, barrier_id=9 - wg, num_threads=256
+          mgpu_lib.bar_arrive, barrier_id=9 - wg, num_threads=256
       )
       schedule_barrier_arrive_and_wait = functools.partial(
-          common.bar_sync, barrier_id=8 + wg, num_threads=256
+          mgpu_lib.bar_sync, barrier_id=8 + wg, num_threads=256
       )
 
       pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
@@ -509,11 +510,8 @@ def flash_attention_kernel(
     residuals_shape = (num_q_heads, num_q_tiles * 2 * block_q)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
 
-  def tiled_smem(shape, dtype, what=""):
-    transforms = common.tile_swizzle_transforms(shape, dtype, what)
-    return plgpu.SMEM(shape, dtype, transforms=transforms)
-
   compute_wgs = 2
+  tiled_smem = mgpu_lib.tiled_swizzled_smem
   q_scratch = tiled_smem((compute_wgs, block_q, head_dim), q.dtype, "q")
   k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype, "k")
   v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype, "v")

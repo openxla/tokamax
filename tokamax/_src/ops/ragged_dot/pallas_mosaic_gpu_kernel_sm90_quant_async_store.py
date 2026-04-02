@@ -26,6 +26,7 @@ from jaxtyping import Float  # pylint: disable=g-multiple-import,g-importing-mem
 from jaxtyping import Integer  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
@@ -279,7 +280,7 @@ def ragged_dot_quantized_async_store_kernel(
 
   def tiled_smem(*args):
     try:
-      return common.tiled_swizzled_smem(*args)
+      return mgpu_lib.tiled_swizzled_smem(*args)
     except ValueError as e:
       raise NotImplementedError from e
 

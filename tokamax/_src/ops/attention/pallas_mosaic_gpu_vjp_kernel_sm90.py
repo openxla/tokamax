@@ -26,6 +26,7 @@ import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -42,6 +43,7 @@ _WGMMA_TRANSPOSED = plgpu.Layout.WGMMA_TRANSPOSED
 _SMEM_SIZE_BYTES = 227 * 1024
 _F32_BYTES = 4
 _load_bcast = common.load_bcast
+_tiled_spec = mgpu_lib.tiled_swizzled_block_spec
 
 
 def _estimate_dq_smem_bytes(ba, block_q, block_kv, num_stages):
@@ -203,10 +205,6 @@ def flash_attention_vjp_kernel(
       "qhd,qhd->hq", out, dout, preferred_element_type=jnp.float32
   )
   delta = pad_q_seq(delta, -1)
-
-  def tiled_spec(block_shape, dtype, index_map, what=""):
-    transforms = common.tile_swizzle_transforms(block_shape, dtype, what)
-    return plgpu.BlockSpec(block_shape, index_map, transforms=transforms)
 
   def kernel_dq(
       q_gmem,
@@ -406,16 +404,16 @@ def flash_attention_vjp_kernel(
       plgpu.barrier_arrive(k_consumed_barrier)
       return dq_acc, m, l, delta, k_start, k_end
 
-    k_spec = tiled_spec(
+    k_spec = _tiled_spec(
         (block_kv, head_dim), k.dtype, lambda i: (lb + i, 0), "k"
     )
-    v_spec = tiled_spec(
+    v_spec = _tiled_spec(
         (block_kv, head_dim_out), v.dtype, lambda i: (lb + i, 0), "v"
     )
 
     if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
       bias_gmem_ = bias_gmem
-      bias_spec = tiled_spec(
+      bias_spec = _tiled_spec(
           (tile_q, block_kv), bias.dtype, lambda i: (qi, lb + i), "bias"
       )
     else:
@@ -429,7 +427,7 @@ def flash_attention_vjp_kernel(
           mask_spec = plgpu.BlockSpec((None, block_kv), lambda i: (0, lb + i))
       else:
         mask_gmem_ = mask_gmem
-        mask_spec = tiled_spec(
+        mask_spec = _tiled_spec(
             (tile_q, block_kv), mask.dtype, lambda i: (qi, lb + i), "mask"
         )
 
@@ -644,10 +642,10 @@ def flash_attention_vjp_kernel(
       plgpu.barrier_arrive(q_consumed_barrier)
       return dk_acc, dv_acc, loop_invariant_mask
 
-    q_spec = tiled_spec(
+    q_spec = _tiled_spec(
         (block_q, head_dim), q.dtype, lambda i: (lb + i, 0), "q"
     )
-    dout_spec = tiled_spec(
+    dout_spec = _tiled_spec(
         (block_q, head_dim_out), dout.dtype, lambda i: (lb + i, 0), "dout"
     )
     m_spec = l_spec = delta_spec = plgpu.BlockSpec(
@@ -656,7 +654,7 @@ def flash_attention_vjp_kernel(
 
     if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
       bias_gmem_ = bias_gmem
-      bias_spec = tiled_spec(
+      bias_spec = _tiled_spec(
           (block_q, tile_kv), bias.dtype, lambda i: (lb + i, ki), "bias"
       )
     else:
@@ -664,7 +662,7 @@ def flash_attention_vjp_kernel(
 
     if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
       mask_gmem_ = mask_gmem
-      mask_spec = tiled_spec(
+      mask_spec = _tiled_spec(
           (tile_kv, block_q), mask.dtype, lambda i: (ki, lb + i), "mask"
       )
     else:
@@ -691,8 +689,7 @@ def flash_attention_vjp_kernel(
     )(bias_gmem_, m_gmem, l_gmem, mask_gmem_, dout_gmem, delta_gmem, q_gmem)
 
   def tiled_wgs_smem(shape, dtype, what=""):
-    transforms = common.tile_swizzle_transforms(shape, dtype, what)
-    return plgpu.SMEM((compute_wgs, *shape), dtype, transforms=transforms)
+    return mgpu_lib.tiled_swizzled_smem((compute_wgs, *shape), dtype, what)
 
   tile_q_dq = compute_wgs * block_q_dq
   if bias is None:

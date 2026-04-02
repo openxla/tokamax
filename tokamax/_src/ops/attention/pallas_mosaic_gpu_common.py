@@ -14,7 +14,6 @@
 # ==============================================================================
 """Common utilities for Mosaic GPU attention implementations."""
 
-import functools
 from typing import Any
 
 import jax
@@ -23,12 +22,11 @@ import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxlib.mlir import ir
-from jaxlib.mlir.dialects import llvm
-from jaxlib.mlir.dialects import nvvm
 from jaxlib.mlir.dialects import vector
 import numpy as np
 import pydantic
 import qwix
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import precision as precision_lib
 from tokamax._src import shape as shape_lib
 
@@ -67,7 +65,7 @@ MIN_SWIZZLE = 32
 # The contracting dimension for `wgmma` / `tcgen05.mma` must be a multiple of
 # the minimum swizzle size (in number of elements).
 def pad_head_dim_to_next_multiple_of_min_swizzle(x):
-  m = 8 * MIN_SWIZZLE // num_bits(x.dtype)
+  m = 8 * MIN_SWIZZLE // mgpu_lib.num_bits(x.dtype)
   return shape_lib.pad_to_next_multiple_of(x, m, -1)
 
 
@@ -165,65 +163,9 @@ def load_bcast(
   return value if layout is None else plgpu.layout_cast(value, layout)
 
 
-def num_bits(dtype: jax.typing.DTypeLike) -> int:
-  fn = jnp.finfo if jnp.issubdtype(dtype, jnp.floating) else jnp.iinfo
-  return fn(dtype).bits
-
-
-def tile_swizzle_transforms(
-    shape: tuple[int, ...], dtype: jax.typing.DTypeLike, what: str = ""
-) -> tuple[plgpu.TilingTransform, plgpu.SwizzleTransform]:
-  """Returns tiling and swizzling transforms."""
-  elem_bits = num_bits(dtype)
-  swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
-  tiling = (8, 8 * swizzle // elem_bits)
-  return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
-
-
-def warpgroup_barrier():
-  plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())()
-
-
-@plgpu.inline_mgpu()
-def fence_async_shared_cta(_):
-  space = nvvm.SharedSpace.shared_cta
-  nvvm.fence_proxy(nvvm.ProxyKind.async_shared, space=space)
-
-
-def _bar_operation(operation: str, barrier_id: int | jax.Array, num_threads: int):
-  if isinstance(barrier_id, int):
-
-    @plgpu.inline_mgpu()
-    def bar_op(_):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [],
-          f"bar.{operation} {barrier_id}, {num_threads};",
-          "",
-          has_side_effects=True,
-      )
-
-    bar_op()
-  else:
-    @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
-    def bar_op(_, barrier_id):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [barrier_id.registers[()]],
-          f"bar.{operation} $0, {num_threads};",
-          "r",
-          has_side_effects=True,
-      )
-
-    bar_op(barrier_id)
-
-bar_arrive = functools.partial(_bar_operation, "arrive")
-bar_sync = functools.partial(_bar_operation, "sync")
-
-
 def unpack_bool_bits_tmem_native(a):
   """Unpacks boolean bits from an int packed array in TMEM_NATIVE layout."""
-  packed_bits = num_bits(a.dtype)
+  packed_bits = mgpu_lib.num_bits(a.dtype)
   if packed_bits not in {4, 8, 16}:
     raise ValueError("Only 4, 8, 16 boolean packing is supported")
   target_cols = a.shape[1] * packed_bits

@@ -27,7 +27,7 @@ from jaxlib.mlir.dialects import arith
 import numpy as np
 import qwix
 from tokamax._src import jaxtyping
-from tokamax._src import mosaic_gpu as mgpu_utils
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
@@ -113,17 +113,14 @@ def _compute_stages(
     out_dtype: jnp.dtype,
 ) -> tuple[int, int, int, int]:
   """Compute the number of stages for each type of data."""
-
-  tmem_max_cols = 512
-  tmem_cell_bitwidth = 32
   # 4096 bytes is reserved for barriers.
   smem_capacity = common.get_smem_capacity() - 4096
-  w_bf16_tmem_cols = _DEQ_WG * block_k // (
-      tmem_cell_bitwidth // common.num_bits(x_dtype)
-  )
-  acc_tmem_cols = (
-      _DEQ_WG * block_m // (tmem_cell_bitwidth // common.num_bits(acc_dtype))
-  )
+  tmem_max_cols = 512
+  tmem_bank_bits = 32
+  tmem_bank_x_elems = tmem_bank_bits // mgpu_lib.num_bits(x_dtype)
+  tmem_bank_acc_elems = tmem_bank_bits // mgpu_lib.num_bits(acc_dtype)
+  w_bf16_tmem_cols = _DEQ_WG * block_k // tmem_bank_x_elems
+  acc_tmem_cols = _DEQ_WG * block_m // tmem_bank_acc_elems
   acc_stages = 1
   deq_stages = (tmem_max_cols - acc_stages * acc_tmem_cols) // w_bf16_tmem_cols
   acc_stages += (
@@ -132,21 +129,15 @@ def _compute_stages(
   # acc_stages is at most 4 to avoid too much barriers in the kernel.
   acc_stages = min(acc_stages, 4)
 
-  out_smem_bytes = _DEQ_WG * block_m * block_n * common.num_bytes(out_dtype)
-  x_smem_bytes = block_m * block_k * common.num_bytes(x_dtype)
-  w_smem_bytes = _DEQ_WG * block_n * block_k * common.num_bytes(w_dtype)
-  ws_smem_bytes = _DEQ_WG * block_n * common.num_bytes(ws_dtype)
-  data_stages = (smem_capacity - out_smem_bytes) // (
-      x_smem_bytes + w_smem_bytes
-  )
-  scale_stages = (
-      smem_capacity
-      - out_smem_bytes
-      - data_stages * (x_smem_bytes + w_smem_bytes)
-  ) // ws_smem_bytes
+  out_smem_bytes = _DEQ_WG * block_m * block_n * jnp.dtype(out_dtype).itemsize
+  smem_capacity -= out_smem_bytes
+  x_smem_bytes = block_m * block_k * mgpu_lib.num_bits(x_dtype) // 8
+  w_smem_bytes = _DEQ_WG * block_n * block_k * mgpu_lib.num_bits(w_dtype) // 8
+  ws_smem_bytes = _DEQ_WG * block_n * mgpu_lib.num_bits(ws_dtype) // 8
+  xw_stages, smem_capacity = divmod(smem_capacity, x_smem_bytes + w_smem_bytes)
   # scale_stages is at most 4 to avoid too much barriers in the kernel.
-  scale_stages = min(scale_stages, 4)
-  return int(data_stages), int(scale_stages), int(deq_stages), int(acc_stages)
+  scale_stages = min(smem_capacity // ws_smem_bytes, 4)
+  return int(xw_stages), int(scale_stages), int(deq_stages), int(acc_stages)
 
 
 @jaxtyping.jaxtyped
@@ -517,7 +508,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
               )
 
             # dequant
-            w = mgpu_utils.int4_as_biased_f8e4m3fn(w, _TMEM(8))
+            w = mgpu_lib.int4_as_biased_f8e4m3fn(w, _TMEM(8))
             w = plgpu.layout_cast(w, _TMEM(4))
 
             # R -> T
