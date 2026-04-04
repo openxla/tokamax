@@ -152,6 +152,7 @@ def ragged_dot_quantized_async_store_kernel(
             @pl.when((ki >= num_stages) | (carry > 0))
             def wait_w_consumed():
               plgpu.barrier_wait(w_consumed_barrier.at[si])
+              mgpu_lib.fence_async_shared_cta()  # Ensure read is complete.
 
             plgpu.copy_gmem_to_smem(  # e,n,k
                 w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
@@ -186,12 +187,12 @@ def ragged_dot_quantized_async_store_kernel(
                 idx = (si, pl.ds(wg * block_n, block_n))
                 w = w_smem[idx].astype(w_scales_smem.dtype)
                 w_scales = plgpu.load(w_scales_smem, idx, layout=_WGMMA_ROW)
+                plgpu.barrier_arrive(w_consumed_barrier.at[si])
                 w *= jax.lax.broadcast_in_dim(w_scales, w.shape, [0])
               with jax.named_scope("wait X"):
                 plgpu.barrier_wait(x_barrier.at[si])
               with jax.named_scope("mma"):
                 plgpu.wgmma(acc, w, x_smem.at[si].T)
-              plgpu.barrier_arrive(w_consumed_barrier.at[si])
 
               @pl.when(ki + 1 < k_iters)
               def _():
