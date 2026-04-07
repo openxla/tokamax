@@ -20,11 +20,15 @@ from typing import Literal, TypeAlias
 import jax
 from jaxtyping import Array, Integer, Real, Scalar  # pylint: disable=g-multiple-import, g-importing-member
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import chunked_xla
 
 
-Implementation: TypeAlias = Literal["mosaic_tpu", "xla"]
+Implementation: TypeAlias = Literal["mosaic_tpu", "xla", "chunked_xla"]
 
-IMPLEMENTATIONS = dict(xla=base.LinearSoftmaxCrossEntropyLoss())
+IMPLEMENTATIONS = dict(
+    xla=base.LinearSoftmaxCrossEntropyLoss(),
+    chunked_xla=chunked_xla.ChunkedXlaLinearSoftmaxCrossEntropyLoss(),
+)
 _DEFAULT_IMPLEMENTATION = ("xla",)
 
 try:
@@ -72,10 +76,10 @@ def linear_softmax_cross_entropy_loss(
     precision: The precision used for jax.lax.dot_general for the linear
       projection and gradient calculation.
     implementation: By default "None" will be used to pick the best available
-      backend. Can be set to "xla" or "mosaic_tpu" explicitly. The "mosaic_tpu"
-      implementation is memory efficient and has almost 0 additional buffer
-      overhead while the "xla" implementation needs to materialize the full
-      logits
+      backend. Can be set to "mosaic_tpu", "xla" or "chunked_xla" explicitly.
+      The "mosaic_tpu" and "chunked_xla" implementations are memory efficient
+      and have almost 0 additional buffer overhead while the "xla"
+      implementation needs to materialize the full logits.
 
   Returns:
     The Cross-Entropy loss

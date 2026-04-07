@@ -27,6 +27,7 @@ from tokamax._src.ops.linear_softmax_cross_entropy_loss import test_utils
 def _api_fwd_bwd_matches_reference_test_cases():
   sizes = [
       ("small", 1024, 512, 2048),
+      ("small_unaligned", 1024, 520, 2049),
       ("medium", 4096, 1024, 4096),
   ]
   reductions = ["sum", "mean"]
