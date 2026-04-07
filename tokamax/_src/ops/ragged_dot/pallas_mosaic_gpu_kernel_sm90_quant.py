@@ -16,6 +16,7 @@
 
 import functools
 
+import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -80,11 +81,16 @@ def body(
     ni_ = 2 * ni + wg
     common.store_acc_transposed(acc, o_gmem, ni_, m, group_info, o_smem.at[wg])
 
-  mi = group_info.block
   gi = group_info.group_id
 
   spec = mgpu_lib.tiled_swizzled_block_spec
-  x_spec = spec((block_m, block_k), x_gmem.dtype, lambda ki: (mi, ki), "x")
+  if jax.__version_info__ >= (0, 10, 0):
+    x_index_map = lambda ki: (group_info.block_start, ki)
+    x_block_shape = (pl.Element(block_m), block_k)
+    x_spec = spec(x_block_shape, x_gmem.dtype, x_index_map, "x")
+  else:
+    mi = group_info.block
+    x_spec = spec((block_m, block_k), x_gmem.dtype, lambda ki: (mi, ki), "x")
   w_spec = spec((2 * block_n, block_k), w_gmem.dtype, lambda ki: (ni, ki), "w")
   w_scales_spec = plgpu.BlockSpec(
       (None, 2 * block_n),
@@ -143,9 +149,14 @@ def ragged_dot_quantized_kernel(
           plgpu.Barrier(num_arrivals=2),
       ),
   )
-  group_info = common.GroupInfo.create(
-      group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
-  )
+  if jax.__version_info__ >= (0, 10, 0):
+    group_info = common.GroupInfo.create_aligned(
+        group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
+    )
+  else:
+    group_info = common.GroupInfo.create(
+        group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
+    )
   return kernel(
       group_info.group_id,
       group_info.block,
