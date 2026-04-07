@@ -288,6 +288,11 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       )
 
 
+_ARRAY_TYPES = (
+    jax.Array, numerics.ArrayInitializer, jax.ShapeDtypeStruct, np.ndarray
+)
+
+
 def standardize_function(
     f: Callable[..., T],
     *args: PyTree,
@@ -326,9 +331,7 @@ def standardize_function(
 
   is_leaf = lambda x: isinstance(x, numerics.ArrayInitializer)
   args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs), is_leaf=is_leaf)
-  is_array = lambda x: isinstance(
-      x, (jax.Array, numerics.ArrayInitializer, jax.ShapeDtypeStruct)
-  )
+  is_array = lambda x: isinstance(x, _ARRAY_TYPES)
   arrays, other, merge = utils.split_merge(is_array, args_flat)
 
   def forward(arrays: list[jax.Array]) -> T:
