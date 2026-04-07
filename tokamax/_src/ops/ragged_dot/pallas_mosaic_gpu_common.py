@@ -71,66 +71,11 @@ class GroupInfo:
   """Information regarding the group being processed in a block."""
 
   group_id: jax.Array
-  block: jax.Array | None
   block_start: jax.Array
   actual_start: jax.Array
   actual_end: jax.Array
   start_within_block: jax.Array
   actual_size: jax.Array
-
-  @classmethod
-  def create(
-      cls, group_sizes: Sequence[jax.Array], tile: int, tid_size: int
-  ) -> "GroupInfo":
-    """Get the group info for the current block."""
-
-    tile = jnp.int32(tile)
-    # We usually only have very few groups, so we unroll the loop processing
-    # them. Normally we'd break out of the loop early, once we'd have found our
-    # boundary, but we can't do that when unrolling, so we rely on many selects
-    # to mask out the epilogue of the loop.
-    tid = jnp.arange(0, tid_size)
-    cuts = group_end = group_start = block = group = end = jnp.zeros_like(
-        tid, dtype=jnp.int32
-    )
-
-    for i, group_size in enumerate(group_sizes):
-      # Start/end are inclusive
-      start = end
-      end = start + group_size
-      final = end - 1
-      # How many times has a block been cut so far? This indicates how
-      # many more blocks are required along the dimension.
-      start_block = lax.div(start, tile)
-      final_block = lax.div(final, tile)
-      block_end = final_block + 1
-      tid_begin = start_block + cuts
-      tid_end = block_end + cuts
-      cuts += end % tile != 0
-      # How many blocks after is our block?
-      this_is_group = (tid_begin <= tid) & (tid < tid_end)
-      block = lax.select(this_is_group, tid - tid_begin + start_block, block)
-      group = lax.select(
-          this_is_group, jnp.full_like(tid, i, dtype=jnp.int32), group
-      )
-      group_start = lax.select(this_is_group, start, group_start)
-      group_end = lax.select(this_is_group, end, group_end)
-
-    block_start = block * tile
-    actual_start = jnp.maximum(group_start, block_start)
-    actual_end = jnp.minimum(group_end, block_start + tile)
-    start_within_block = actual_start - block_start
-    # The size can be negative if the tid is out of bounds, so we clamp it to 0.
-    actual_size = jnp.maximum(jnp.int32(0), actual_end - actual_start)
-    return cls(
-        group_id=group,
-        block=block,
-        block_start=block_start,
-        actual_start=actual_start,
-        actual_end=actual_end,
-        start_within_block=start_within_block,
-        actual_size=actual_size,
-    )
 
   @classmethod
   def create_aligned(
@@ -185,7 +130,6 @@ class GroupInfo:
     actual_end = global_m_start + offset_in_block + actual_size
     return cls(
         group_idx,
-        None,
         global_m_start,
         actual_start,
         actual_end,
@@ -347,7 +291,6 @@ def ragged_kernel(
 
   def kernel_body(
       group_id_gmem,
-      block_gmem,
       block_start_gmem,
       actual_start_gmem,
       actual_end_gmem,
@@ -367,7 +310,6 @@ def ragged_kernel(
       )
       group_info = GroupInfo(
           group_id=group_id_gmem[mi],
-          block=None if block_gmem is None else block_gmem[mi],
           block_start=block_start_gmem[mi],
           actual_start=actual_start_gmem[mi],
           actual_end=actual_end_gmem[mi],

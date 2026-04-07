@@ -89,7 +89,7 @@ def body(
     x_block_shape = (pl.Element(block_m), block_k)
     x_spec = spec(x_block_shape, x_gmem.dtype, x_index_map, "x")
   else:
-    mi = group_info.block
+    mi = group_info.block_start // block_m
     x_spec = spec((block_m, block_k), x_gmem.dtype, lambda ki: (mi, ki), "x")
   w_spec = spec((2 * block_n, block_k), w_gmem.dtype, lambda ki: (ni, ki), "w")
   w_scales_spec = plgpu.BlockSpec(
@@ -149,17 +149,12 @@ def ragged_dot_quantized_kernel(
           plgpu.Barrier(num_arrivals=2),
       ),
   )
-  if jax.__version_info__ >= (0, 10, 0):
-    group_info = common.GroupInfo.create_aligned(
-        group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
-    )
-  else:
-    group_info = common.GroupInfo.create(
-        group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
-    )
+  alignment = 8 if jax.__version_info__ >= (0, 10, 0) else config.block_m
+  group_info = common.GroupInfo.create_aligned(
+      group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1, alignment
+  )
   return kernel(
       group_info.group_id,
-      group_info.block,
       group_info.block_start,
       group_info.actual_start,
       group_info.actual_end,

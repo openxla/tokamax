@@ -63,7 +63,6 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   def kernel(
       x_gmem,
       w_gmem,
-      _,
       group_id_gmem,
       start_within_block_gmem,
       actual_size_gmem,
@@ -255,7 +254,6 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   return f(
       lhs,
       rhs.mT,
-      group_info.block,
       group_info.group_id,
       group_info.start_within_block,
       group_info.actual_size,

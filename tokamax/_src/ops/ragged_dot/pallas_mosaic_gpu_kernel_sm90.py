@@ -57,7 +57,7 @@ def _kernel_body(
       lhs_index_map = lambda ki: (group_info.block_start, ki)
     else:
       lhs_block_shape = (block_m, block_k)
-      lhs_index_map = lambda ki: (group_info.block, ki)
+      lhs_index_map = lambda ki: (group_info.block_start // block_m, ki)
     rhs_block_shape = (block_k, block_n)
     lhs_spec = spec(lhs_block_shape, lhs_gmem.dtype, lhs_index_map, "lhs")
     rhs_spec = spec(rhs_block_shape, rhs_gmem.dtype, lambda ki: (ki, ni), "rhs")
@@ -120,17 +120,12 @@ def ragged_dot_kernel(
   kernel = common.ragged_kernel(
       body, g=g, m=m, n=n, out_dtype=out_dtype, config=config
   )
-  if jax.__version_info__ >= (0, 10, 0):
-    group_info = common.GroupInfo.create_aligned(
-        group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
-    )
-  else:
-    group_info = common.GroupInfo.create(
-        group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
-    )
+  alignment = 8 if jax.__version_info__ >= (0, 10, 0) else config.block_m
+  group_info = common.GroupInfo.create_aligned(
+      group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1, alignment
+  )
   return kernel(
       group_info.group_id,
-      group_info.block,
       group_info.block_start,
       group_info.actual_start,
       group_info.actual_end,
