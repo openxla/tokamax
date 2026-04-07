@@ -38,6 +38,11 @@ jobs:
                          'jax_nn_test.py',
                          'xla_chunked_test.py',
                         ]
+        include:
+          - runner: 'linux-x86-a3-8g-h100-1gpu'
+            device: 'cuda'
+          - runner: 'linux-x86-ct6e-44-1tpu'
+            device: 'tpu'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -54,7 +59,7 @@ jobs:
         run: |
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[cuda,tpu,test]
+          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
@@ -64,6 +69,11 @@ jobs:
     strategy:
       matrix:
         runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
+        include:
+          - runner: 'linux-x86-a3-8g-h100-1gpu'
+            device: 'cuda'
+          - runner: 'linux-x86-ct6e-44-1tpu'
+            device: 'tpu'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -82,7 +92,7 @@ jobs:
         run: |
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[cuda,tpu,test]
+          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
@@ -92,6 +102,11 @@ jobs:
     strategy:
       matrix:
         runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
+        include:
+          - runner: 'linux-x86-a3-8g-h100-1gpu'
+            device: 'cuda'
+          - runner: 'linux-x86-ct6e-44-1tpu'
+            device: 'tpu'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -108,11 +123,13 @@ jobs:
 
       - name: Install dependencies
         run: |
+          echo "Installing dependencies on device ${{ matrix.device }}"
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[cuda,tpu,test]
+          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
+        # TODO: Disable benchmarking tests for presubmit until container is fixed
         run: |
-          pytest -s -m "not long" --ignore-glob="tokamax/_src/ops/*" tokamax
+          pytest -s -vv -m "not long" --ignore-glob="tokamax/_src/ops/*" --ignore-glob="tokamax/_src/benchmarking_test*" tokamax
 
