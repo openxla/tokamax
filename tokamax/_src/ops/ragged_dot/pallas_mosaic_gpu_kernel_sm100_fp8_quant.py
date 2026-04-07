@@ -39,10 +39,10 @@ _MAIN_WG = _DEQ_WG
 # Scale ACC and Store
 _STORE_WG = _MAIN_WG + 1
 # Warp in main WarpGroup
-_MMA_WARP = _MAIN_WG * 4
-_W_TMA_WARP = _MAIN_WG * 4 + 1
-_X_TMA_WARP = _MAIN_WG * 4 + 2
-_SCALE_TMA_WARP = _MAIN_WG * 4 + 3
+_MMA_WARP = 0
+_W_TMA_WARP = 1
+_X_TMA_WARP = 2
+_SCALE_TMA_WARP = 3
 _TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
 _TCGEN05 = plgpu.Layout.TCGEN05
 _TCGEN05_TRANSPOSED = plgpu.Layout.TCGEN05_TRANSPOSED
@@ -354,6 +354,10 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
           @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
           def _per_warp():
             warp_id = lax.axis_index("warp")
+
+            # Before jax 0.10, the warp ID is global, not within the warp group.
+            if jax.__version_info__ < (0, 10, 0):
+              warp_id = lax.rem(warp_id, 4)
 
             @pl.when(warp_id == _X_TMA_WARP)
             def x_tma_warp():
