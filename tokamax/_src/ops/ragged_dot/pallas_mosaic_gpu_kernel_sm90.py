@@ -51,14 +51,16 @@ def _kernel_body(
   block_k = min(k, config.block_k)
 
   def compute_acc(acc):
-    mi = group_info.block
     spec = functools.partial(_tiled_swizzled_block_spec, delay_release=1)
-    lhs_spec = spec(
-        (block_m, block_k), lhs_gmem.dtype, lambda ki: (mi, ki), "lhs"
-    )
-    rhs_spec = spec(
-        (block_k, block_n), rhs_gmem.dtype, lambda ki: (ki, ni), "rhs"
-    )
+    if jax.__version_info__ >= (0, 10, 0):
+      lhs_block_shape = (pl.Element(block_m), block_k)
+      lhs_index_map = lambda ki: (group_info.block_start, ki)
+    else:
+      lhs_block_shape = (block_m, block_k)
+      lhs_index_map = lambda ki: (group_info.block, ki)
+    rhs_block_shape = (block_k, block_n)
+    lhs_spec = spec(lhs_block_shape, lhs_gmem.dtype, lhs_index_map, "lhs")
+    rhs_spec = spec(rhs_block_shape, rhs_gmem.dtype, lambda ki: (ki, ni), "rhs")
     plgpu.emit_pipeline(
         lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc, lhs_smem, rhs_smem),
         grid=(k // block_k,),
@@ -118,9 +120,14 @@ def ragged_dot_kernel(
   kernel = common.ragged_kernel(
       body, g=g, m=m, n=n, out_dtype=out_dtype, config=config
   )
-  group_info = common.GroupInfo.create(
-      group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
-  )
+  if jax.__version_info__ >= (0, 10, 0):
+    group_info = common.GroupInfo.create_aligned(
+        group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
+    )
+  else:
+    group_info = common.GroupInfo.create(
+        group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
+    )
   return kernel(
       group_info.group_id,
       group_info.block,

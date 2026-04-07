@@ -367,7 +367,7 @@ def ragged_kernel(
       )
       group_info = GroupInfo(
           group_id=group_id_gmem[mi],
-          block=block_gmem[mi],
+          block=None if block_gmem is None else block_gmem[mi],
           block_start=block_start_gmem[mi],
           actual_start=actual_start_gmem[mi],
           actual_end=actual_end_gmem[mi],
