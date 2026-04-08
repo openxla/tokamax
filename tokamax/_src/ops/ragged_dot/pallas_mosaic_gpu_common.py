@@ -190,68 +190,6 @@ def calculate_group_info_tasks(
     )
 
 
-# TODO: Unify this with the non_quant store.
-def store_acc_transposed(
-    acc,
-    o_gmem,
-    ni: jax.Array,
-    m: int,
-    group_info: GroupInfo,
-    o_smem,
-):
-  """Stores the accumulator into the output gmem.
-
-  It does so by first storing the accumulator into a swizzled shared memory
-  array, then copying that to the output gmem. This is done to allow for
-  coalesced writes.
-
-  Args:
-    acc: The accumulator to store.
-    o_gmem: The output gmem.
-    ni: The current n index.
-    m: The total m dimension.
-    group_info: The group info for the current block.
-    o_smem: The shared memory reference.
-  """
-  block_n, block_m = acc.shape
-  out_elem_bits = jnp.finfo(o_gmem.dtype).bits
-  swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
-  out_swizzle_elems = (swizzle_out * 8) // out_elem_bits
-  o_smem_swizzled = plgpu.unswizzle_ref(o_smem, swizzle_out)
-
-  if out_swizzle_elems != block_n:
-    raise ValueError(
-        f"Expected out_swizzle_elems ({out_swizzle_elems}) to equal block_n"
-        f" ({block_n})"
-    )
-
-  o_smem = o_smem_swizzled.reshape(block_m // 8, 1, 8, block_n)
-  o_smem = plgpu.untile_ref(o_smem, (8, block_n))
-  o_smem.T[...] = plgpu.layout_cast(
-      acc.astype(o_gmem.dtype), plgpu.Layout.WGMMA_TRANSPOSED
-  )
-  plgpu.commit_smem()
-  # Write out the largest power of two rows first, then the next largest,
-  # etc. This allows us to coalesce writes as much as possible.
-  offset = group_info.start_within_block
-  size = 1 << (min(block_m, m).bit_length() - 1)
-  while size > 0:
-
-    @pl.when(group_info.actual_size & size != 0)
-    def _():
-      o_smem_ = o_smem_swizzled.at[pl.ds(offset, size)]
-      o_gmem_ = o_gmem.at[
-          pl.ds(group_info.block_start + offset, size),
-          pl.ds(ni * block_n, block_n),
-      ]
-      plgpu.copy_smem_to_gmem(o_smem_, o_gmem_, commit_group=False)
-
-    offset += group_info.actual_size & size
-    size //= 2
-  plgpu.commit_smem_to_gmem_group()
-  plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-
 def ragged_kernel(
     body, *, g, m, n, out_dtype, config, thread_axis=None, **kwargs
 ) -> Callable[..., jax.Array]:

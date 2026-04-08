@@ -32,7 +32,6 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_async_store as sm90_quant_async_store
 from typing_extensions import override
 
@@ -98,10 +97,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
           if config.async_store:
             fn = sm90_quant_async_store.ragged_dot_quantized_async_store_kernel  # pylint: disable=line-too-long
-          elif config.warp_specialized:
-            fn = sm90_quant.ragged_dot_quantized_kernel
           else:
-            raise NotImplementedError("`warp_specialized=False` not supported.")
+            raise NotImplementedError("`async_store=False` not supported.")
         else:
           if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
             lhs = lhs.astype(jnp.bfloat16)
@@ -267,36 +264,35 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
     configs = set()
     for persistent in [True, False]:
-      for async_store in [True, False] if isinstance(rhs, QArray) else [False]:
-        for block_k in [128, 256, 512]:
-          if (block_k * rhs_dtype_bits) % (128 * 8) or (
-              block_k * lhs_dtype_bits
-          ) % (128 * 8):
-            continue
-          if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
-            continue
-          for block_m in [128, 64, 32, 16]:
-            for num_stages in [4, 2]:
-              for grid_minor_dim in [
-                  common.MatmulDimension.M,
-                  common.MatmulDimension.N,
-              ]:
-                for grid_tile_width in [1, 2, 4, 8]:
-                  configs.add(
-                      Config(
-                          block_m=block_m,
-                          block_n=out_swizzle_elems,
-                          block_k=block_k,
-                          num_stages=num_stages,
-                          warp_specialized=True,
-                          persistent=persistent,
-                          split_k=1,
-                          async_store=async_store,
-                          grid_block_n=grid_tile_width,
-                          grid_minor_dim=grid_minor_dim,
-                          grid_tile_width=grid_tile_width,
-                      )
-                  )
+      for block_k in [128, 256, 512]:
+        if (block_k * rhs_dtype_bits) % (128 * 8) or (
+            block_k * lhs_dtype_bits
+        ) % (128 * 8):
+          continue
+        if scale_tile_shape != 0 and scale_tile_shape % block_k != 0:
+          continue
+        for block_m in [128, 64, 32, 16]:
+          for num_stages in [4, 2]:
+            for grid_minor_dim in [
+                common.MatmulDimension.M,
+                common.MatmulDimension.N,
+            ]:
+              for grid_tile_width in [1, 2, 4, 8]:
+                configs.add(
+                    Config(
+                        block_m=block_m,
+                        block_n=out_swizzle_elems,
+                        block_k=block_k,
+                        num_stages=num_stages,
+                        warp_specialized=True,
+                        persistent=persistent,
+                        split_k=1,
+                        async_store=isinstance(rhs, QArray),
+                        grid_block_n=grid_tile_width,
+                        grid_minor_dim=grid_minor_dim,
+                        grid_tile_width=grid_tile_width,
+                    )
+                )
     return configs
 
   def _get_sm100_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
