@@ -218,13 +218,13 @@ def ragged_dot_quantized_async_store_kernel(
             acc = acc if activation is None else activation(acc)
             acc = acc.astype(o_smem_.dtype)
             o_smem_.T[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
-            plgpu.commit_smem()
             plgpu.barrier_arrive(store_smem_done_barrier)
 
         @pl.when(wg == _EPILOGUE_WG)
         def epilogue_wg():
           plgpu.set_max_registers(64, action="decrease")
           plgpu.barrier_wait(store_smem_done_barrier)
+          mgpu_lib.fence_async_shared_cta()  # Ensure store is complete.
 
           with jax.named_scope("store"):
             # Write out the largest power of two rows first,
