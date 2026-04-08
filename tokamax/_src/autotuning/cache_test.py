@@ -17,11 +17,10 @@ import json
 import os
 import re
 from typing import Any, Final
-from absl import logging
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import immutabledict
-import jax
 from tokamax._src.autotuning import cache
 from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.normalization import pallas_triton
@@ -41,30 +40,23 @@ class CacheTest(parameterized.TestCase):
       ("not_a_real_device", pallas_triton.PallasTritonNormalization),
   )
   def test_load_cache(self, device: str, op_cls: Any):
-    c = cache.AutotuningCache(op_cls())
-
-    self.assertIsInstance(c._load_cache(device), dict)
+    device_cache = cache.AutotuningCache(op_cls())._load_cache(device)
+    self.assertIsInstance(device_cache, dict)
     if device == "not_a_real_device":
-      self.assertEmpty(c._load_cache(device))
+      self.assertEmpty(device_cache)
     else:
-      self.assertNotEmpty(c._load_cache(device))
-
+      self.assertNotEmpty(device_cache)
 
   def test_validate_json_cache_files(self):
     """Checks that all cache files are valid JSON."""
     tokamax_files = resources.files("tokamax")
     for cache_path in _CACHE_PATHS.values():
-      base_dir_trav = tokamax_files.joinpath(cache_path)
-      if not base_dir_trav.is_dir():
-        continue
-      for device_dir_trav in base_dir_trav.iterdir():
-        if not device_dir_trav.is_dir():
-          continue
-        for file_trav in device_dir_trav.iterdir():
-          if file_trav.is_file() and file_trav.name.endswith(".json"):
-            with self.subTest(str(file_trav)):
-              content = file_trav.read_text()
-              json.loads(content)
+      for device_dir in (tokamax_files / cache_path).iterdir():
+        for cache_file in device_dir.iterdir():
+          with self.subTest(str(cache_file)):
+            self.assertTrue(cache_file.is_file())
+            self.assertTrue(cache_file.name.endswith(".json"))
+            json.loads(cache_file.read_text())
 
 
 if __name__ == "__main__":
