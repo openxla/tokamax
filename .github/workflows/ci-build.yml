@@ -131,5 +131,5 @@ jobs:
       - name: Test Tokamax ops with unittest
         # TODO: Disable benchmarking tests for presubmit until container is fixed
         run: |
-          pytest -s -vv -m "not long" --ignore-glob="tokamax/_src/ops/*" --ignore-glob="tokamax/_src/benchmarking_test*" tokamax
+          pytest -s -vv -m "not long" --ignore-glob="tokamax/_src/ops/*" tokamax
 

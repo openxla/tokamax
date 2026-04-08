@@ -44,10 +44,9 @@ BenchmarkMode: TypeAlias = Literal[
 
 PyTree = Any
 
-# Timer functions return the time delta in ms and a dictionary of metadata.
-Timer: TypeAlias = Callable[[bool], tuple[float, dict[str, Any]]]
-
 T = TypeVar('T')
+# Timer functions return the time delta in ms and a dictionary of metadata.
+Timer: TypeAlias = Callable[[T], tuple[list[float], dict[str, Any]]]
 RetT: TypeAlias = T | list[jax.Array] | tuple[T, list[jax.Array]]
 
 TimingMethod: TypeAlias = Literal[
@@ -386,39 +385,52 @@ def standardize_function(
   return func, arrays
 
 
-def wallclock_timer(f: Callable[[T], Any], args: T) -> Timer:
-  def timer(_):
+def wallclock_timer(f: Callable[[T], Any], iterations: int) -> Timer[T]:
+
+  def timer(args):
     jax.block_until_ready(f(args))  # Warmup.
-    start_time = time.perf_counter()
-    jax.block_until_ready(f(args))
-    return (time.perf_counter() - start_time) * 10**3, {}
-
-  return timer
-
-
-def cupti_timer(f: Callable[[T], Any], args: T) -> Timer:
-  timer = profiler.Cupti(finalize=False).measure(f)
-  return lambda _: (timer(args)[1], {})
-
-
-def xprof_timer(f: Callable[[T], Any], args: T) -> Timer:
-  def timer(return_metadata):
-    jax.block_until_ready(f(args))  # Warmup.
-    with XprofProfileSession(hermetic=not return_metadata) as profile:
+    times = []
+    for _ in range(iterations):
+      start_time = time.perf_counter()
       jax.block_until_ready(f(args))
-
-    metadata = dict(xprof_url=profile.xprof_url) if return_metadata else {}
-    return profile.total_op_time / datetime.timedelta(milliseconds=1), metadata
+      times.append((time.perf_counter() - start_time) * 10**3)
+    return times, {}
 
   return timer
 
 
-def hermetic_xprof_timer(f: Callable[[T], Any], args: T) -> Timer:
-  timer = xprof_timer(f, args)
-  return lambda _: timer(False)
+def cupti_timer(f: Callable[[T], Any], iterations: int) -> Timer[T]:
+  timer = profiler.Cupti().measure(f, iterations=iterations)
+  return lambda args: (timer(args)[1], {})
 
 
-_TIMERS: dict[str, Callable[[Callable[[T], Any], T], Timer]] = {
+def xprof_timer(  # pylint: disable=missing-function-docstring
+    f: Callable[[T], Any], iterations: int, *, return_metadata: bool = True
+) -> Timer[T]:
+  def timer(args):
+    jax.block_until_ready(f(args))  # Warmup.
+
+    times = []
+    metadata = {}
+    for i in range(iterations):
+      hermetic = not (return_metadata and i == iterations - 1)
+      with XprofProfileSession(hermetic=hermetic) as profile:
+        jax.block_until_ready(f(args))
+      times.append(profile.total_op_time / datetime.timedelta(milliseconds=1))
+
+      if not hermetic:
+        metadata = dict(xprof_url=profile.xprof_url)
+
+    return times, metadata
+
+  return timer
+
+
+def hermetic_xprof_timer(f: Callable[[T], Any], iterations: int) -> Timer[T]:
+  return xprof_timer(f, iterations, return_metadata=False)
+
+
+_TIMERS: dict[str, Callable[[Callable[[T], Any], int], Timer[T]]] = {
     'wallclock': wallclock_timer,
     'cupti': cupti_timer,
     'xprof': xprof_timer,
@@ -488,13 +500,11 @@ def compile_benchmark(
       if platform not in ('gpu', 'tpu'):
         raise ValueError('XProf profiling is only supported on GPU or TPU.')
 
-    timer = _TIMERS[method](f_compiled, x)
-    times = [timer(False)[0] for _ in range(iterations - 1)]
-    dt, metadata = timer(True)  # Capture metadata on last iteration.
+    times, metadata = _TIMERS[method](f_compiled, iterations)(x)
     return BenchmarkData(
         lower_time_ms=lowering_time * 10**3,
         compile_time_ms=compile_time * 10**3,
-        evaluation_times_ms=(*times, dt),
+        evaluation_times_ms=tuple(times),
         peak_memory_mb=peak_mem_mb,
         metadata=metadata,
     )
