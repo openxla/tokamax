@@ -54,7 +54,6 @@ class Config:
   split_k: pydantic.PositiveInt
   split_m: pydantic.PositiveInt = 1
   grid_block_n: pydantic.PositiveInt = 1
-  warp_specialized: bool = True
   persistent: bool = True
   post_scale: bool = False
   # B200 collective MMA
