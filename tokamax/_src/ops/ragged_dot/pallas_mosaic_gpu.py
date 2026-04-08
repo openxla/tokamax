@@ -95,10 +95,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
             raise NotImplementedError(f"{precision=} not supported.")
 
-          if config.async_store:
-            fn = sm90_quant_async_store.ragged_dot_quantized_async_store_kernel  # pylint: disable=line-too-long
-          else:
-            raise NotImplementedError("`async_store=False` not supported.")
+          fn = sm90_quant_async_store.ragged_dot_quantized_async_store_kernel
         else:
           if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
             lhs = lhs.astype(jnp.bfloat16)
@@ -190,7 +187,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           grid_block_n=1,
           warp_specialized=True,
           persistent=False,
-          async_store=True,
           grid_minor_dim=common.MatmulDimension.M,
           grid_tile_width=1,
       )
@@ -287,7 +283,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                         warp_specialized=True,
                         persistent=persistent,
                         split_k=1,
-                        async_store=isinstance(rhs, QArray),
                         grid_block_n=grid_tile_width,
                         grid_minor_dim=grid_minor_dim,
                         grid_tile_width=grid_tile_width,

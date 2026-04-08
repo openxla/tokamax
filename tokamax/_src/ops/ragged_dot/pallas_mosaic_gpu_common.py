@@ -56,7 +56,6 @@ class Config:
   grid_block_n: pydantic.PositiveInt = 1
   warp_specialized: bool = True
   persistent: bool = True
-  async_store: bool = False
   post_scale: bool = False
   # B200 collective MMA
   collective: bool = False

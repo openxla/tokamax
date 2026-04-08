@@ -77,7 +77,6 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
               split_k=1,
           )
       elif isinstance(rhs_, qwix.QArray):
-        config = dataclasses.replace(_CONFIG, async_store=True)
         if (
             rhs_.scale_tile_shape[0] != 1
             or rhs_.scale_tile_shape[1] % _CONFIG.block_k != 0
