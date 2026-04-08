@@ -43,7 +43,6 @@ def body(
     w_scales_gmem,
     o_gmem,
     o_smem,
-    schedule_barrier,
     *,
     config: common.Config,
     activation: base.ActivationFunction | None = None,
@@ -56,24 +55,27 @@ def body(
   wg = lax.axis_index("wg")
   ns = pl.ds(wg * block_n, block_n)
 
-  def schedule_barrier_arrive_and_wait():
-    plgpu.barrier_arrive(schedule_barrier)
-    plgpu.barrier_wait(schedule_barrier)
+  bar_arrive = functools.partial(mgpu_lib.bar_arrive, num_threads=256)
+  bar_sync = functools.partial(mgpu_lib.bar_sync, num_threads=256)
+  # MGPU uses the lower barrier IDs, so use barriers 8 and 9 for scheduling.
+  wg_schedule_barrier_id = 8 + wg
+  other_wg_schedule_barrier_id = 9 - wg
 
   def pipeline_body(_, w_smem, x_smem, w_scales_smem, acc):
-    pl.when(wg == 0)(schedule_barrier_arrive_and_wait)
     w = w_smem[ns].astype(w_scales_smem.dtype)
     w_scales = plgpu.load(w_scales_smem, (ns,), layout=_WGMMA_ROW)
     w *= lax.broadcast_in_dim(w_scales, w.shape, [0])
-    schedule_barrier_arrive_and_wait()
+    bar_sync(wg_schedule_barrier_id)
     plgpu.wgmma(acc, w, x_smem.T)
-    pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
+    bar_arrive(other_wg_schedule_barrier_id)
     plgpu.wgmma_wait(0)
     return acc
 
   def pipeline_context(pipeline_callback):
     compute_acc = lambda acc: pipeline_callback(acc)[...]
+    pl.when(wg == 0)(lambda: bar_arrive(other_wg_schedule_barrier_id))
     acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
+    pl.when(wg == 1)(lambda: bar_arrive(wg_schedule_barrier_id))  # Reset.
 
     if activation is not None:
       acc = activation(acc)
@@ -146,7 +148,6 @@ def ragged_dot_quantized_kernel(
       thread_axis="wg",
       scratch_shapes=(
           plgpu.SMEM((2, config.block_m, config.block_n), out_dtype),
-          plgpu.Barrier(num_arrivals=2),
       ),
   )
   alignment = 8 if jax.__version_info__ >= (0, 10, 0) else config.block_m
