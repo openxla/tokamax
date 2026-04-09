@@ -32,8 +32,7 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
 _COMPUTE_WGS = 2
-_EPILOGUE_WG = _COMPUTE_WGS
-_MEMORY_WG = _COMPUTE_WGS + 1
+_TMA_WG = _COMPUTE_WGS
 
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_TRANSPOSED = plgpu.Layout.WGMMA_TRANSPOSED
@@ -94,6 +93,10 @@ def ragged_dot_quantized_kernel(
   )
   num_stages = min(config.num_stages, k // block_k)
 
+  # Before JAX 0.10, `barrier_arrive` and `commit_smem_to_gmem_group` are not
+  # supported in a single-warp context.
+  supports_warp_tma = jax.__version_info__ >= (0, 10, 0)
+
   def kernel(
       x_gmem,
       w_gmem,
@@ -138,42 +141,11 @@ def ragged_dot_quantized_kernel(
 
       @pl.when(actual_size > 0)
       def body():
-        @pl.when(wg == _MEMORY_WG)
-        def memory_wg():
-          plgpu.set_max_registers(80, action="decrease")
-          ns = pl.ds(ni * (_COMPUTE_WGS * block_n), _COMPUTE_WGS * block_n)
-
-          @pl.loop(0, k_iters)
-          def k_loop(ki):
-            ks = pl.ds(ki * block_k, block_k)
-            si = jax.lax.rem(ki, num_stages)
-
-            @pl.when((ki >= num_stages) | (carry > 0))
-            def wait_w_consumed():
-              plgpu.barrier_wait(w_consumed_barrier.at[si])
-              mgpu_lib.fence_async_shared_cta()  # Ensure read is complete.
-
-            plgpu.copy_gmem_to_smem(  # e,n,k
-                w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
-            )
-            ki_ = jax.lax.div(ki, w_scales_tile_k // block_k)
-            plgpu.copy_gmem_to_smem(  # e,k//t,n
-                w_scales_gmem.at[gi, ki_, ns],
-                w_scales_smem.at[si],
-                w_barrier.at[si],
-            )
-
-            @pl.when((ki >= num_stages) | (carry > 0))
-            def wait_x_consumed():
-              plgpu.barrier_wait(x_consumed_barrier.at[si])
-
-            plgpu.copy_gmem_to_smem(
-                x_gmem.at[ms, ks], x_smem.at[si], x_barrier.at[si]
-            )
 
         @pl.when(wg < _COMPUTE_WGS)
         def compute_wg():
-          plgpu.set_max_registers(176, action="increase")
+          max_registers = 216 if supports_warp_tma else 176
+          plgpu.set_max_registers(max_registers, action="increase")
 
           def compute_acc(acc):
             with jax.named_scope("wait W"):
@@ -220,9 +192,38 @@ def ragged_dot_quantized_kernel(
             o_smem_.T[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
             plgpu.barrier_arrive(store_smem_done_barrier)
 
-        @pl.when(wg == _EPILOGUE_WG)
-        def epilogue_wg():
-          plgpu.set_max_registers(64, action="decrease")
+        def issue_xw_tma():
+          ns = pl.ds(ni * (_COMPUTE_WGS * block_n), _COMPUTE_WGS * block_n)
+
+          @pl.loop(0, k_iters)
+          def k_loop(ki):
+            ks = pl.ds(ki * block_k, block_k)
+            si = jax.lax.rem(ki, num_stages)
+
+            @pl.when((ki >= num_stages) | (carry > 0))
+            def wait_w_consumed():
+              plgpu.barrier_wait(w_consumed_barrier.at[si])
+              mgpu_lib.fence_async_shared_cta()  # Ensure read is complete.
+
+            plgpu.copy_gmem_to_smem(  # e,n,k
+                w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
+            )
+            ki_ = jax.lax.div(ki, w_scales_tile_k // block_k)
+            plgpu.copy_gmem_to_smem(  # e,k//t,n
+                w_scales_gmem.at[gi, ki_, ns],
+                w_scales_smem.at[si],
+                w_barrier.at[si],
+            )
+
+            @pl.when((ki >= num_stages) | (carry > 0))
+            def wait_x_consumed():
+              plgpu.barrier_wait(x_consumed_barrier.at[si])
+
+            plgpu.copy_gmem_to_smem(
+                x_gmem.at[ms, ks], x_smem.at[si], x_barrier.at[si]
+            )
+
+        def issue_o_tma():
           plgpu.barrier_wait(store_smem_done_barrier)
           mgpu_lib.fence_async_shared_cta()  # Ensure store is complete.
 
@@ -238,15 +239,47 @@ def ragged_dot_quantized_kernel(
               def _():
                 for wg_ in range(_COMPUTE_WGS):
                   ns = pl.ds((ni * _COMPUTE_WGS + wg_) * block_n, block_n)
-                  o_smem_ = o_smem.at[wg_, pl.ds(offset, size)]
-                  o_gmem_ = out_gmem.at[pl.ds(block_start + offset, size), ns]
-                  plgpu.copy_smem_to_gmem(o_smem_, o_gmem_, commit_group=False)
+                  plgpu.copy_smem_to_gmem(
+                      o_smem.at[wg_, pl.ds(offset, size)],
+                      out_gmem.at[pl.ds(block_start + offset, size), ns],
+                      commit_group=False,
+                  )
 
               offset += actual_size & size
               size //= 2
             plgpu.commit_smem_to_gmem_group()
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
             plgpu.barrier_arrive(store_gmem_done_barrier)
+
+        if supports_warp_tma:
+
+          @pl.when(wg == _TMA_WG)
+          def tma_wg():
+            plgpu.set_max_registers(72, action="decrease")
+
+            @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
+            def tma_warps():
+              warp_id = jax.lax.axis_index("warp")
+
+              @pl.when(warp_id == 0)
+              def xw_tma_warp():
+                issue_xw_tma()
+
+              @pl.when(warp_id == 1)
+              def o_tma_warp():
+                issue_o_tma()
+
+        else:
+
+          @pl.when(wg == _TMA_WG)
+          def xw_tma_wg():
+            plgpu.set_max_registers(80, action="decrease")
+            issue_xw_tma()
+
+          @pl.when(wg == _TMA_WG + 1)
+          def o_tma_wg():
+            plgpu.set_max_registers(64, action="decrease")
+            issue_o_tma()
 
       return carry + (actual_size > 0)
 
@@ -317,7 +350,7 @@ def ragged_dot_quantized_kernel(
       kernel,
       out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
       scratch_shapes=scratch_shapes,
-      num_threads=_COMPUTE_WGS + 2,
+      num_threads=_COMPUTE_WGS + (1 if supports_warp_tma else 2),
       thread_name="wg",
       grid=(num_sms,),
       grid_names=("sm",),
