@@ -428,36 +428,6 @@ def ragged_dot_gpu_quant_blackwell_kernel(
 
       return carry + (actual_size > 0)
 
-    @pl.when(mn_loop > 0)
-    def _barrier_wait_epilogue():
-      @pl.when(wg == _MAIN_WG)
-      def _main_wg_epilogue():
-        @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-        def _per_warp():
-          warp_id = lax.axis_index("warp")
-
-          @pl.when(warp_id == _W_TMA_WARP)
-          def _w_tma_warp_epilogue():
-            @pl.loop(0, num_stages)
-            def _drain(i):
-              plgpu.barrier_wait(w_tma_consumed_barrier.at[i])
-
-          @pl.when(warp_id == _X_TMA_WARP)
-          def _x_tma_warp_epilogue():
-            @pl.loop(0, num_stages)
-            def _drain(i):
-              plgpu.barrier_wait(x_consumed_tcgen05_barrier.at[i])
-
-          @pl.when((warp_id == _MMA_WARP) & is_lead_block)
-          def _mma_warp_epilogue():
-            plgpu.barrier_wait(acc_consumed_barrier)
-
-      @pl.when(wg == _DEQ_WG)
-      def _deq_wg_epilogue():
-        @pl.loop(0, num_stages)
-        def _drain(i):
-          plgpu.barrier_wait(w_consumed_tcgen05_barrier.at[i])
-
   def kernel_entry(*refs):
     x_smem = plgpu.SMEM(
         (num_stages, tile_m, block_k),
@@ -504,10 +474,12 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           num_barriers=num_stages,
           collective_axes=("x",),
           orders_tensor_core=True,
+          leader_tracked=True
       )
       acc_consumed_barrier = plgpu.ClusterBarrier(
           collective_axes=("x",),
           orders_tensor_core=True,
+          leader_tracked=True
       )
     else:
       w_bf16_barrier = plgpu.Barrier(
