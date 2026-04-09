@@ -257,9 +257,8 @@ def ragged_dot_quantized_kernel(
           def tma_wg():
             plgpu.set_max_registers(72, action="decrease")
 
-            @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-            def tma_warps():
-              warp_id = jax.lax.axis_index("warp")
+            @plgpu.warp_map
+            def tma_warps(warp_id):
 
               @pl.when(warp_id == 0)
               def xw_tma_warp():
