@@ -32,7 +32,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant_async_store as sm90_quant_async_store
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
 from typing_extensions import override
 
 Config = common.Config
@@ -95,7 +95,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
             raise NotImplementedError(f"{precision=} not supported.")
 
-          fn = sm90_quant_async_store.ragged_dot_quantized_async_store_kernel
+          fn = sm90_quant.ragged_dot_quantized_kernel
         else:
           if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
             lhs = lhs.astype(jnp.bfloat16)
