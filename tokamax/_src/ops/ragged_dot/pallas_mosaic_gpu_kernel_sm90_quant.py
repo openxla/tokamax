@@ -113,10 +113,10 @@ def ragged_dot_quantized_kernel(
       o_smem,
       x_barrier,
       w_barrier,
+      o_barrier,
       x_consumed_barrier,
       w_consumed_barrier,
-      store_gmem_done_barrier,
-      store_smem_done_barrier,
+      o_consumed_barrier,
   ):
     k_iters = pl.cdiv(k, block_k)
 
@@ -180,20 +180,16 @@ def ragged_dot_quantized_kernel(
           acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
 
           with jax.named_scope("acc -> o_smem"):
-
-            @pl.when(carry > 0)
-            def _():
-              plgpu.barrier_wait(store_gmem_done_barrier)
-
+            pl.when(carry > 0)(lambda: plgpu.barrier_wait(o_consumed_barrier))
             o_smem_ = o_smem.at[wg].reshape(block_m // 8, 1, 8, block_n)
             o_smem_ = plgpu.untile_ref(o_smem_, (8, block_n))
             acc = acc if activation is None else activation(acc)
             acc = acc.astype(o_smem_.dtype)
             o_smem_.T[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
-            plgpu.barrier_arrive(store_smem_done_barrier)
+            plgpu.barrier_arrive(o_barrier)
 
         def issue_o_tma():
-          plgpu.barrier_wait(store_smem_done_barrier)
+          plgpu.barrier_wait(o_barrier)
           mgpu_lib.fence_async_shared_cta()  # Ensure store is complete.
 
           with jax.named_scope("store"):
@@ -218,7 +214,7 @@ def ragged_dot_quantized_kernel(
               size //= 2
             plgpu.commit_smem_to_gmem_group()
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-            plgpu.barrier_arrive(store_gmem_done_barrier)
+            plgpu.barrier_arrive(o_consumed_barrier)
 
         if supports_warp_tma:
 
@@ -363,16 +359,16 @@ def ragged_dot_quantized_kernel(
           dtype=out_dtype,
           transforms=(plgpu.SwizzleTransform(swizzle_out),),
       ),
-      x_barrier=plgpu.Barrier(num_arrivals=1, num_barriers=num_stages),
-      w_barrier=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),
+      x_barrier=plgpu.Barrier(num_barriers=num_stages),
+      w_barrier=plgpu.Barrier(num_barriers=num_stages, num_arrivals=2),
+      o_barrier=plgpu.Barrier(num_arrivals=_COMPUTE_WGS),
       x_consumed_barrier=plgpu.Barrier(
           num_arrivals=_COMPUTE_WGS, num_barriers=num_stages
       ),
       w_consumed_barrier=plgpu.Barrier(
           num_arrivals=_COMPUTE_WGS, num_barriers=num_stages
       ),
-      store_gmem_done_barrier=plgpu.Barrier(num_barriers=_COMPUTE_WGS),
-      store_smem_done_barrier=plgpu.Barrier(num_arrivals=_COMPUTE_WGS),
+      o_consumed_barrier=plgpu.Barrier(),
   )
 
   num_sms = backend.get_default_device().core_count
