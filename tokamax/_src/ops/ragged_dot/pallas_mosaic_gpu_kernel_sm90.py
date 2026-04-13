@@ -50,16 +50,10 @@ def ragged_dot_kernel(
 
   block_m = config.block_m
   block_n = config.block_n
-  block_k = min(k, config.block_k)
-  grid_block_n = config.grid_block_n
-  m_iters = pl.cdiv(m, block_m)
+  block_k = config.block_k
+  m_iters = pl.cdiv(m, block_m) + g - 1
+  n_iters = pl.cdiv(n, block_n)
   k_iters = pl.cdiv(k, block_k)
-
-  inner_grid = (
-      pl.cdiv(n, grid_block_n * block_n),
-      m_iters + g - 1,
-      grid_block_n,
-  )
 
   def kernel(
       lhs_gmem,
@@ -71,15 +65,18 @@ def ragged_dot_kernel(
       o_gmem,
   ):
 
-    def mn_loop(m_offset, loop_info: plgpu.NDLoopInfo):
-      remainder_ni, mi, block_ni = loop_info.index
+    def mn_loop_body(m_offset, m_iters, loop_info: plgpu.NDLoopInfo):
+      (mni,) = loop_info.index
+      mi, ni = plgpu.planar_snake(
+          mni, (m_iters, n_iters), config.grid_minor_dim, config.grid_tile_width
+      )
       mi += m_offset
-      ni = block_ni * pl.cdiv(n, block_n * grid_block_n) + remainder_ni
 
-      group_id = group_id_gmem[mi]
-      block_start = block_start_gmem[mi]
-      start_within_block = start_within_block_gmem[mi]
-      actual_size = actual_size_gmem[mi]
+      with jax.named_scope("load group_info"):
+        gi = group_id_gmem[mi]
+        start_within_block = start_within_block_gmem[mi]
+        actual_size = actual_size_gmem[mi]
+        block_start = block_start_gmem[mi]
 
       @pl.when(actual_size > 0)
       def body():
@@ -105,7 +102,7 @@ def ragged_dot_kernel(
               grid=(k_iters,),
               in_specs=(lhs_spec, rhs_spec),
               max_concurrent_steps=config.num_stages,
-          )(lhs_gmem, rhs_gmem.at[group_id])
+          )(lhs_gmem, rhs_gmem.at[gi])
           return acc[...]
 
         acc = pl.run_scoped(compute_acc, plgpu.ACC((block_m, block_n)))
@@ -140,38 +137,33 @@ def ragged_dot_kernel(
           plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     if config.persistent:
-      # We stratify the grid: first emit a number of blocks that have
-      # definitely work to do. Then schedule blocks that may be
-      # noops. This way we lower the chances that noop bocks are
-      # scheduled to the same SM.
-      inner_grid_l = list(inner_grid)
-      inner_grid_l[1] = m_iters
-      plgpu.nd_loop(tuple(inner_grid_l), collective_axes="sm")(
-          functools.partial(mn_loop, 0)
-      )
-      inner_grid_l[1] = g - 1
-      plgpu.nd_loop(tuple(inner_grid_l), collective_axes="sm")(
-          functools.partial(mn_loop, m_iters)
-      )
+      # We stratify the grid: first emit a number of blocks that have definitely
+      # work to do. Then schedule blocks that may be no-ops. This way we lower
+      # the chances that no-op blocks are scheduled to the same SM.
+      def run_mn_loop(m_offset, m_iters):
+        mn_iters = m_iters * n_iters
+        f = functools.partial(mn_loop_body, m_offset, m_iters)
+        plgpu.nd_loop((mn_iters,), collective_axes="sm")(f)
+
+      m0_iters = pl.cdiv(m, block_m)
+      run_mn_loop(0, m0_iters)
+      run_mn_loop(m0_iters, m_iters - m0_iters)
     else:
-      loop_info = plgpu.NDLoopInfo(
-          index=tuple(map(jax.lax.axis_index, ("remainder_n", "m", "block_n"))),
-          local_index=0,
-          num_local_steps=1,
-      )
-      mn_loop(0, loop_info)
+      mni = jax.lax.axis_index("mn")
+      loop_info = plgpu.NDLoopInfo((mni,), local_index=0, num_local_steps=1)
+      mn_loop_body(0, m_iters, loop_info)
 
   alignment = 8 if jax.__version_info__ >= (0, 10, 0) else config.block_m
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, block_m, m_iters + g - 1, alignment
+      group_sizes, block_m, m_iters, alignment
   )
 
   if config.persistent:
     grid = (backend.get_default_device().core_count,)
     grid_names = ("sm",)
   else:
-    grid = inner_grid
-    grid_names = ("remainder_n", "m", "block_n")
+    grid = (m_iters * n_iters,)
+    grid_names = ("mn",)
 
   return plgpu.kernel(
       kernel,
