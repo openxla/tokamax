@@ -19,6 +19,7 @@ import math
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
@@ -30,75 +31,6 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 _WGMMA = plgpu.Layout.WGMMA
 _tiled_swizzled_block_spec = mgpu_lib.tiled_swizzled_block_spec
 _tiled_swizzled_smem = mgpu_lib.tiled_swizzled_smem
-
-def _kernel_body(
-    group_info,
-    mi,
-    ni,
-    lhs_gmem,
-    rhs_gmem,
-    o_gmem,
-    *,
-    config: common.Config,
-    activation: base.ActivationFunction | None = None,
-):
-  """Pallas kernel body for non-quantized ragged dot."""
-
-  del mi
-  m, k = lhs_gmem.shape
-  block_m = config.block_m
-  block_n = config.block_n
-  block_k = min(k, config.block_k)
-
-  def compute_acc(acc):
-    spec = functools.partial(_tiled_swizzled_block_spec, delay_release=1)
-    if jax.__version_info__ >= (0, 10, 0):
-      lhs_block_shape = (pl.Element(block_m), block_k)
-      lhs_index_map = lambda ki: (group_info.block_start, ki)
-    else:
-      lhs_block_shape = (block_m, block_k)
-      lhs_index_map = lambda ki: (group_info.block_start // block_m, ki)
-    rhs_block_shape = (block_k, block_n)
-    lhs_spec = spec(lhs_block_shape, lhs_gmem.dtype, lhs_index_map, "lhs")
-    rhs_spec = spec(rhs_block_shape, rhs_gmem.dtype, lambda ki: (ki, ni), "rhs")
-    plgpu.emit_pipeline(
-        lambda _, lhs_smem, rhs_smem: plgpu.wgmma(acc, lhs_smem, rhs_smem),
-        grid=(k // block_k,),
-        in_specs=(lhs_spec, rhs_spec),
-        max_concurrent_steps=config.num_stages,
-    )(lhs_gmem, rhs_gmem.at[group_info.group_id])
-    return acc[...]
-
-  acc = pl.run_scoped(compute_acc, plgpu.ACC((block_m, block_n)))
-
-  o_smem_type = _tiled_swizzled_smem(
-      (block_m, block_n), o_gmem.dtype, tiling_prefix=(1,), what="out"
-  )
-
-  @functools.partial(pl.run_scoped, o_smem=o_smem_type)
-  def epilogue(o_smem):
-    acc_ = acc if activation is None else activation(acc)
-    o_smem[...] = acc_.astype(o_smem.dtype)
-    plgpu.commit_smem()
-
-    smem_start = group_info.start_within_block
-    remaining_rows = min(block_m, m)
-    while remaining_rows > 0:
-      const_rows_len = 1 << int(math.log2(remaining_rows))
-      remaining_rows //= 2
-
-      @pl.when(group_info.actual_size & const_rows_len != 0)
-      def _():
-        o_smem_slice = o_smem.at[pl.ds(smem_start, const_rows_len)]
-        o_gmem_slice = o_gmem.at[
-            pl.ds(group_info.block_start + smem_start, const_rows_len),
-            pl.ds(ni * block_n, block_n),
-        ]
-        plgpu.copy_smem_to_gmem(o_smem_slice, o_gmem_slice, commit_group=False)
-
-      smem_start += group_info.actual_size & const_rows_len
-    plgpu.commit_smem_to_gmem_group()
-    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 
 @jaxtyping.jaxtyped
@@ -113,26 +45,149 @@ def ragged_dot_kernel(
   """Pallas kernel for ragged dot with non-quantized inputs."""
   common.check_bf16xbf16_or_f16xf16(lhs, rhs)
 
-  m, _ = lhs.shape
+  m, k = lhs.shape
   g, _, n = rhs.shape
 
-  body = functools.partial(_kernel_body, config=config, activation=activation)
-  kernel = common.ragged_kernel(
-      body, g=g, m=m, n=n, out_dtype=out_dtype, config=config
+  block_m = config.block_m
+  block_n = config.block_n
+  block_k = min(k, config.block_k)
+  grid_block_n = config.grid_block_n
+  m_iters = pl.cdiv(m, block_m)
+  k_iters = pl.cdiv(k, block_k)
+
+  inner_grid = (
+      pl.cdiv(n, grid_block_n * block_n),
+      m_iters + g - 1,
+      grid_block_n,
   )
+
+  def kernel(
+      lhs_gmem,
+      rhs_gmem,
+      group_id_gmem,
+      start_within_block_gmem,
+      actual_size_gmem,
+      block_start_gmem,
+      o_gmem,
+  ):
+
+    def mn_loop(m_offset, loop_info: plgpu.NDLoopInfo):
+      remainder_ni, mi, block_ni = loop_info.index
+      mi += m_offset
+      ni = block_ni * pl.cdiv(n, block_n * grid_block_n) + remainder_ni
+
+      group_id = group_id_gmem[mi]
+      block_start = block_start_gmem[mi]
+      start_within_block = start_within_block_gmem[mi]
+      actual_size = actual_size_gmem[mi]
+
+      @pl.when(actual_size > 0)
+      def body():
+
+        def compute_acc(acc):
+          def pipeline_body(_, lhs_smem, rhs_smem):
+            plgpu.wgmma(acc, lhs_smem, rhs_smem)
+            plgpu.wgmma_wait(1)
+
+          spec = functools.partial(_tiled_swizzled_block_spec, delay_release=1)
+          if jax.__version_info__ >= (0, 10, 0):
+            lhs_block_shape = (pl.Element(block_m), block_k)
+            lhs_index_map = lambda ki: (block_start, ki)
+          else:
+            lhs_block_shape = (block_m, block_k)
+            lhs_index_map = lambda ki: (block_start // block_m, ki)
+          rhs_block_shape = (block_k, block_n)
+          rhs_index_map = lambda ki: (ki, ni)
+          lhs_spec = spec(lhs_block_shape, lhs_gmem.dtype, lhs_index_map, "lhs")
+          rhs_spec = spec(rhs_block_shape, rhs_gmem.dtype, rhs_index_map, "rhs")
+          plgpu.emit_pipeline(
+              pipeline_body,
+              grid=(k_iters,),
+              in_specs=(lhs_spec, rhs_spec),
+              max_concurrent_steps=config.num_stages,
+          )(lhs_gmem, rhs_gmem.at[group_id])
+          return acc[...]
+
+        acc = pl.run_scoped(compute_acc, plgpu.ACC((block_m, block_n)))
+
+        o_smem_type = _tiled_swizzled_smem(
+            (block_m, block_n), o_gmem.dtype, tiling_prefix=(1,), what="out"
+        )
+
+        @functools.partial(pl.run_scoped, o_smem=o_smem_type)
+        def epilogue(o_smem):
+          acc_ = acc if activation is None else activation(acc)
+          o_smem[...] = acc_.astype(o_smem.dtype)
+          plgpu.commit_smem()
+
+          smem_start = start_within_block
+          remaining_rows = min(block_m, m)
+          while remaining_rows > 0:
+            const_rows_len = 1 << int(math.log2(remaining_rows))
+            remaining_rows //= 2
+
+            @pl.when(actual_size & const_rows_len != 0)
+            def _():
+              o_smem_ = o_smem.at[pl.ds(smem_start, const_rows_len)]
+              o_gmem_ = o_gmem.at[
+                  pl.ds(block_start + smem_start, const_rows_len),
+                  pl.ds(ni * block_n, block_n),
+              ]
+              plgpu.copy_smem_to_gmem(o_smem_, o_gmem_, commit_group=False)
+
+            smem_start += actual_size & const_rows_len
+          plgpu.commit_smem_to_gmem_group()
+          plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+    if config.persistent:
+      # We stratify the grid: first emit a number of blocks that have
+      # definitely work to do. Then schedule blocks that may be
+      # noops. This way we lower the chances that noop bocks are
+      # scheduled to the same SM.
+      inner_grid_l = list(inner_grid)
+      inner_grid_l[1] = m_iters
+      plgpu.nd_loop(tuple(inner_grid_l), collective_axes="sm")(
+          functools.partial(mn_loop, 0)
+      )
+      inner_grid_l[1] = g - 1
+      plgpu.nd_loop(tuple(inner_grid_l), collective_axes="sm")(
+          functools.partial(mn_loop, m_iters)
+      )
+    else:
+      loop_info = plgpu.NDLoopInfo(
+          index=tuple(map(jax.lax.axis_index, ("remainder_n", "m", "block_n"))),
+          local_index=0,
+          num_local_steps=1,
+      )
+      mn_loop(0, loop_info)
+
   alignment = 8 if jax.__version_info__ >= (0, 10, 0) else config.block_m
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1, alignment
+      group_sizes, block_m, m_iters + g - 1, alignment
   )
-  return kernel(
-      group_info.group_id,
-      group_info.block_start,
-      group_info.actual_start,
-      group_info.actual_end,
-      group_info.start_within_block,
-      group_info.actual_size,
+
+  if config.persistent:
+    grid = (backend.get_default_device().core_count,)
+    grid_names = ("sm",)
+  else:
+    grid = inner_grid
+    grid_names = ("remainder_n", "m", "block_n")
+
+  return plgpu.kernel(
+      kernel,
+      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+      grid=grid,
+      grid_names=grid_names,
+      compiler_params=plgpu.CompilerParams(
+          approx_math=True, unsafe_no_auto_barriers=True
+      ),
+  )(
       lhs,
       rhs,
+      group_info.group_id,
+      group_info.start_within_block,
+      group_info.actual_size,
+      group_info.block_start,
   )
 
 

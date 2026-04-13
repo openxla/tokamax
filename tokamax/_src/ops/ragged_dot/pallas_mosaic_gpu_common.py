@@ -15,14 +15,13 @@
 
 """Common Pallas Mosaic GPU utilities."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 import dataclasses
 import enum
-import functools
+
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 import pydantic
@@ -186,115 +185,6 @@ def calculate_group_info_tasks(
         actual_size,
         non_empty_mask.sum(),
     )
-
-
-def ragged_kernel(
-    body, *, g, m, n, out_dtype, config, thread_axis=None, **kwargs
-) -> Callable[..., jax.Array]:
-  """Returns a Pallas kernel for ragged matmul.
-
-  This kernel computes a ragged matmul, where the LHS is a dense
-  matrix of shape (m, k) and the RHS is a ragged matrix of shape (g,
-  k, n), where g is the number of groups. The output is a dense matrix
-  of shape (m, n).
-
-  The kernel uses a persistent kernel if config.persistent is True,
-  otherwise it uses a non-persistent kernel.
-
-  Args:
-    body: The body of the kernel. This function will be called with the group
-      info, the current m index, the current n index, and the arguments to the
-      kernel.
-    g: The number of groups.
-    m: The m dimension of the LHS matrix.
-    n: The n dimension of the RHS matrix.
-    out_dtype: The dtype of the output matrix.
-    config: The kernel config.
-    thread_axis: The name of the thread axis to use for warp specialization. If
-      None, warp specialization is not used.
-    **kwargs: Additional keyword arguments to pass to the Pallas kernel.
-
-  Returns:
-    A Pallas kernel for ragged matmul.
-  """
-
-  num_compute_threads = 1 if thread_axis is None else 2
-  inner_grid = (
-      pl.cdiv(n, config.grid_block_n * config.block_n * num_compute_threads),
-      pl.cdiv(m, config.block_m) + g - 1,
-      config.grid_block_n,
-  )
-
-  def kernel_body(
-      group_id_gmem,
-      block_start_gmem,
-      actual_start_gmem,
-      actual_end_gmem,
-      start_within_block_gmem,
-      actual_size_gmem,
-      *args,
-  ):
-    def loop_body(m_offset, loop_info: plgpu.NDLoopInfo):
-      remainder_ni, mi, block_ni = loop_info.index
-      mi += m_offset
-      ni = (
-          block_ni
-          * pl.cdiv(
-              n, config.block_n * config.grid_block_n * num_compute_threads
-          )
-          + remainder_ni
-      )
-      group_info = GroupInfo(
-          group_id=group_id_gmem[mi],
-          block_start=block_start_gmem[mi],
-          actual_start=actual_start_gmem[mi],
-          actual_end=actual_end_gmem[mi],
-          start_within_block=start_within_block_gmem[mi],
-          actual_size=actual_size_gmem[mi],
-      )
-
-      @pl.when(group_info.actual_size > 0)
-      def _():
-        body(group_info, mi, ni, *args)
-
-    if config.persistent:
-      # We stratify the grid: first emit a number of blocks that have
-      # definitely work to do. Then schedule blocks that may be
-      # noops. This way we lower the chances that noop bocks are
-      # scheduled to the same SM.
-      inner_grid_l = list(inner_grid)
-      inner_grid_l[1] = pl.cdiv(m, config.block_m)
-      plgpu.nd_loop(tuple(inner_grid_l), collective_axes="sm")(
-          functools.partial(loop_body, 0)
-      )
-      inner_grid_l[1] = g - 1
-      plgpu.nd_loop(tuple(inner_grid_l), collective_axes="sm")(
-          functools.partial(loop_body, pl.cdiv(m, config.block_m))
-      )
-    else:
-      loop_info = plgpu.NDLoopInfo(
-          index=tuple(map(lax.axis_index, ("remainder_n", "m", "block_n"))),
-          local_index=0,
-          num_local_steps=1,
-      )
-      loop_body(0, loop_info)
-
-  if config.persistent:
-    grid = (backend.get_default_device().core_count,)
-    grid_names = ("sm",)
-  else:
-    grid = inner_grid
-    grid_names = ("remainder_n", "m", "block_n")
-
-  return plgpu.kernel(
-      kernel_body,
-      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
-      grid=grid,
-      grid_names=grid_names,
-      thread_name=thread_axis,
-      num_threads=thread_axis and (num_compute_threads + 1),
-      **kwargs,
-  )
 
 
 def get_smem_capacity() -> int:
