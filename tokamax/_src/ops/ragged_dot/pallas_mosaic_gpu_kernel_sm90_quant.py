@@ -34,8 +34,11 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 _COMPUTE_WGS = 2
 _TMA_WG = _COMPUTE_WGS
 
+_WGMMA = plgpu.Layout.WGMMA
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_TRANSPOSED = plgpu.Layout.WGMMA_TRANSPOSED
+_WGMMA_UPCAST_2X = plgpu.Layout.WGMMA_UPCAST_2X
+_WGMMA_UPCAST_4X = plgpu.Layout.WGMMA_UPCAST_4X
 
 
 @jaxtyping.jaxtyped
@@ -155,10 +158,19 @@ def ragged_dot_quantized_kernel(
             def k_loop(ki):
               si = jax.lax.rem(ki, num_stages)
               with jax.named_scope("dequant"):
+                w_scale_bits = mgpu_lib.num_bits(w_scales_smem.dtype)
+                match w_scale_bits // mgpu_lib.num_bits(w_smem.dtype):
+                  case 2:
+                    w_layout = _WGMMA_UPCAST_2X
+                  case 4:
+                    w_layout = _WGMMA_UPCAST_4X
+                  case _:
+                    w_layout = _WGMMA
                 idx = (si, pl.ds(wg * block_n, block_n))
-                w = w_smem[idx].astype(w_scales_smem.dtype)
+                w = plgpu.load(w_smem, idx, layout=w_layout)
                 w_scales = plgpu.load(w_scales_smem, idx, layout=_WGMMA_ROW)
                 plgpu.barrier_arrive(w_consumed_barrier.at[si])
+                w = plgpu.layout_cast(w, _WGMMA).astype(w_scales_smem.dtype)
                 w *= jax.lax.broadcast_in_dim(w_scales, w.shape, [0])
               with jax.named_scope("wait X"):
                 plgpu.barrier_wait(x_barrier.at[si])
