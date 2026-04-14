@@ -17,6 +17,7 @@
 import functools
 
 import jax
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
@@ -139,8 +140,9 @@ def ragged_dot_quantized_kernel(
         actual_size = actual_size_gmem[mi]
         block_start = block_start_gmem[mi]
 
-      wg = jax.lax.axis_index("wg")
+      wg = lax.axis_index("wg")
       ms = pl.ds(block_start, block_m)
+      ns = pl.ds(wg * block_n, block_n)
 
       @pl.when(actual_size > 0)
       def body():
@@ -154,11 +156,10 @@ def ragged_dot_quantized_kernel(
             with jax.named_scope("wait W"):
               plgpu.barrier_wait(w_barrier.at[0])
 
-            @pl.loop(0, k_iters)
-            def k_loop(ki):
-              si = jax.lax.rem(ki, num_stages)
+            def k_loop_body(ki, w_scales):
+              si = lax.rem(ki, num_stages)
               with jax.named_scope("dequant"):
-                w_scale_bits = mgpu_lib.num_bits(w_scales_smem.dtype)
+                w_scale_bits = mgpu_lib.num_bits(w_scales.dtype)
                 match w_scale_bits // mgpu_lib.num_bits(w_smem.dtype):
                   case 2:
                     w_layout = _WGMMA_UPCAST_2X
@@ -166,27 +167,30 @@ def ragged_dot_quantized_kernel(
                     w_layout = _WGMMA_UPCAST_4X
                   case _:
                     w_layout = _WGMMA
-                idx = (si, pl.ds(wg * block_n, block_n))
-                w = plgpu.load(w_smem, idx, layout=w_layout)
-                w_scales = plgpu.load(w_scales_smem, idx, layout=_WGMMA_ROW)
+                w = plgpu.load(w_smem, (si, ns), layout=w_layout)
                 plgpu.barrier_arrive(w_consumed_barrier.at[si])
-                w = plgpu.layout_cast(w, _WGMMA).astype(w_scales_smem.dtype)
-                w *= jax.lax.broadcast_in_dim(w_scales, w.shape, [0])
+                w = plgpu.layout_cast(w, _WGMMA).astype(w_scales.dtype)
+                w *= lax.broadcast_in_dim(w_scales, w.shape, [0])
               with jax.named_scope("wait X"):
                 plgpu.barrier_wait(x_barrier.at[si])
               with jax.named_scope("mma"):
                 plgpu.wgmma(acc, w, x_smem.at[si].T)
 
-              @pl.when(ki + 1 < k_iters)
-              def _():
-                si_next = jax.lax.rem(ki + 1, num_stages)
+              def load_scales():
+                si = lax.rem(ki + 1, num_stages)
                 with jax.named_scope("wait W"):
-                  plgpu.barrier_wait(w_barrier.at[si_next])
+                  plgpu.barrier_wait(w_barrier.at[si])
+                return plgpu.load(w_scales_smem, (si, ns), layout=_WGMMA_ROW)
+
+              carry = lax.cond(ki + 1 < k_iters, load_scales, lambda: w_scales)
 
               with jax.named_scope("wait MMA"):
                 plgpu.wgmma_wait(0)
               plgpu.barrier_arrive(x_consumed_barrier.at[si])
+              return carry
 
+            w_scales0 = plgpu.load(w_scales_smem, (0, ns), layout=_WGMMA_ROW)
+            lax.fori_loop(0, k_iters, k_loop_body, init_val=w_scales0)
             return acc[...]
 
           acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
@@ -244,7 +248,7 @@ def ragged_dot_quantized_kernel(
                 @pl.loop(0, k_iters)
                 def k_loop(ki):
                   ks = pl.ds(ki * block_k, block_k)
-                  si = jax.lax.rem(ki, num_stages)
+                  si = lax.rem(ki, num_stages)
 
                   @pl.when((ki >= num_stages) | (carry > 0))
                   def wait_w_consumed():
@@ -254,7 +258,7 @@ def ragged_dot_quantized_kernel(
                   plgpu.copy_gmem_to_smem(  # e,n,k
                       w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
                   )
-                  ki_ = jax.lax.div(ki, w_scales_tile_k // block_k)
+                  ki_ = lax.div(ki, w_scales_tile_k // block_k)
                   plgpu.copy_gmem_to_smem(  # e,k//t,n
                       w_scales_gmem.at[gi, ki_, ns],
                       w_scales_smem.at[si],
@@ -267,7 +271,7 @@ def ragged_dot_quantized_kernel(
                 @pl.loop(0, k_iters)
                 def k_loop(ki):
                   ks = pl.ds(ki * block_k, block_k)
-                  si = jax.lax.rem(ki, num_stages)
+                  si = lax.rem(ki, num_stages)
 
                   @pl.when((ki >= num_stages) | (carry > 0))
                   def wait_x_consumed():
@@ -292,7 +296,7 @@ def ragged_dot_quantized_kernel(
             @pl.loop(0, k_iters)
             def k_loop(ki):
               ks = pl.ds(ki * block_k, block_k)
-              si = jax.lax.rem(ki, num_stages)
+              si = lax.rem(ki, num_stages)
 
               @pl.when((ki >= num_stages) | (carry > 0))
               def wait_w_consumed():
@@ -302,7 +306,7 @@ def ragged_dot_quantized_kernel(
               plgpu.copy_gmem_to_smem(  # e,n,k
                   w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
               )
-              ki_ = jax.lax.div(ki, w_scales_tile_k // block_k)
+              ki_ = lax.div(ki, w_scales_tile_k // block_k)
               plgpu.copy_gmem_to_smem(  # e,k//t,n
                   w_scales_gmem.at[gi, ki_, ns],
                   w_scales_smem.at[si],
@@ -337,7 +341,7 @@ def ragged_dot_quantized_kernel(
       carry = run_mn_loop(0, m0_iters)
       _ = run_mn_loop(m0_iters, m_iters - m0_iters, carry)
     else:
-      mni = jax.lax.axis_index("mn")
+      mni = lax.axis_index("mn")
       loop_info = plgpu.NDLoopInfo((mni,), local_index=0, num_local_steps=1)
       mn_loop_body(0, m_iters, loop_info, carry=0)
 
