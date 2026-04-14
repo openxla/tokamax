@@ -184,7 +184,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           block_k=block_k,
           num_stages=2,
           split_k=1,
-          persistent=False,
+          persistent=isinstance(rhs, QArray),
           grid_minor_dim=common.MatmulDimension.M,
           grid_tile_width=1,
       )
