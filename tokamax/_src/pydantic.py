@@ -35,6 +35,11 @@ from pydantic_core import core_schema as cs
 from tokamax._src import batching
 from typing_extensions import TypedDict  # Required for Python <3.12.
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 def _int_power_of_two(n: int) -> int:
   if (n & (n - 1)) != 0:
@@ -112,8 +117,31 @@ def annotate(ty: Any) -> Any:
   if origin is fuser.Fusion:
     # TODO: Add support for serializing `Fusion`s.
     return Annotated[ty, pydantic.PlainSerializer(str, return_type=str)]
+  # TODO: Remove "ManualAxisType is not None" once JAX is upgraded.
+  if ManualAxisType is not None and origin is ManualAxisType:
+    def _parse_manual_axis_type(v: Any) -> Any:
+      if isinstance(v, ManualAxisType):
+        return v
+      if isinstance(v, dict):
+        v = {k: frozenset(val) for k, val in v.items()}
+        return ManualAxisType(**v)
+      return v
+
+    return Annotated[
+        ty,
+        pydantic.PlainSerializer(
+            lambda x: dict(
+                varying=list(x.varying),
+                unreduced=list(x.unreduced),
+                reduced=list(x.reduced),
+            ),
+            return_type=dict,
+        ),
+        pydantic.BeforeValidator(_parse_manual_axis_type),
+    ]
   if dataclasses.is_dataclass(origin):
     return Annotated[ty, Dataclass]
+
   return ty
 
 

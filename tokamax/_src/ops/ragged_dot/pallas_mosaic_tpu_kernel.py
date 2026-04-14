@@ -19,7 +19,7 @@
 from collections.abc import Callable
 import functools
 import json
-from typing import Final
+from typing import Any, Final
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
@@ -31,6 +31,11 @@ from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
@@ -324,6 +329,7 @@ _TilingFn = Callable[[int, int, int], tuple[int, int, int] | None]
         "rhs_qdtype",
         "rhs_static_scale",
         "activation",
+        "manual_axis_type",
     ],
 )
 def gmm(
@@ -337,6 +343,7 @@ def gmm(
     group_offset: jax.Array | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
+    manual_axis_type: ManualAxisType | None = None,
     # dynamic in kernel quantization support
     lhs_qdtype: jnp.dtype | None = None,
     lhs_static_scale: float | None = None,
@@ -359,6 +366,8 @@ def gmm(
     transpose_rhs: True if the rhs needs to be transposed.
     interpret: Whether or not to run the kernel in interpret mode, helpful for
       testing and debugging.
+    manual_axis_type: Manual axis type for the operation
+      https://docs.jax.dev/en/latest/notebooks/shard_map.html.
     lhs_qdtype: Quant dtype to quantize lhs to if lhs is not already quantized.
     lhs_static_scale: Compile-time scale when quantizing lhs instead of
       computing it from lhs values.
@@ -576,9 +585,15 @@ def gmm(
       transpose_rhs=transpose_rhs,
       input_buffer_count=input_buffer_count,
   )
+  # TODO: Remove "hasattr" check once JAX is upgraded.
+  out_shape_kwargs = (
+      {"manual_axis_type": manual_axis_type}
+      if hasattr(jax.ShapeDtypeStruct, "manual_axis_type")
+      else {}
+  )
   call_gmm = common.custom_buffered_pallas_call(
       functools.partial(kernel, subchannel_iters=subchannel_iters),
-      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype, **out_shape_kwargs),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
           in_specs=[lhs_block_spec, rhs_block_spec],
@@ -623,6 +638,7 @@ def gmm(
         "rhs_static_scale",
         "activation",
         "combine_scopes",
+        "manual_axis_type",
     ],
 )
 def tgmm(
@@ -636,6 +652,7 @@ def tgmm(
     group_offset: jax.Array | None = None,
     num_actual_groups: int | None = None,
     interpret: bool = False,
+    manual_axis_type: ManualAxisType | None = None,
     # dynamic in kernel quantization support
     lhs_qdtype: jnp.dtype | None = None,
     lhs_static_scale: float | None = None,
@@ -660,6 +677,7 @@ def tgmm(
       the groups that are local, starting from group_offset.
     interpret: Whether or not to run the kernel in interpret mode, helpful for
       testing and debugging.
+    manual_axis_type: Manual axis type for the operation.
     lhs_qdtype: Quant dtype to quantize lhs to if lhs is not already quantized.
     lhs_static_scale: Compile-time scale when quantizing lhs instead of
       computing it from lhs values.
@@ -896,9 +914,19 @@ def tgmm(
       num_actual_groups=num_actual_groups,
       input_buffer_count=input_buffer_count,
   )
+  # TODO: Remove "hasattr" check once JAX is upgraded.
+  out_shape_kwargs = (
+      {"manual_axis_type": manual_axis_type}
+      if hasattr(jax.ShapeDtypeStruct, "manual_axis_type")
+      else {}
+  )
   call_gmm = common.custom_buffered_pallas_call(
       functools.partial(kernel, subchannel_iters=subchannel_iters),
-      out_shape=jax.ShapeDtypeStruct((num_actual_groups, k, n), out_dtype),
+      out_shape=jax.ShapeDtypeStruct(
+          (num_actual_groups, k, n),
+          out_dtype,
+          **out_shape_kwargs,
+      ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
           in_specs=[lhs_block_spec, rhs_block_spec],

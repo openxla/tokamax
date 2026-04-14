@@ -56,6 +56,11 @@ try:
 except ImportError:
   pass
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(IMPLEMENTATIONS)
@@ -70,6 +75,7 @@ def ragged_dot(
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
     activation: base.ActivationFunction | None = None,
+    manual_axis_type: ManualAxisType | None = None,
     *,
     implementation: (
         Implementation
@@ -98,6 +104,7 @@ def ragged_dot(
       accumulator before being cast to the output dtype. If `return_residuals`
       is True, the activation function will not be fused into the kernel, and
       instead applied after the kernel call.
+    manual_axis_type: Optional. Manual axis type for the operation.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -115,6 +122,7 @@ def ragged_dot(
       preferred_element_type=preferred_element_type,
       group_offset=group_offset,
       activation=activation,
+      manual_axis_type=manual_axis_type,
       implementation=implementation,
   )
 
@@ -128,6 +136,7 @@ def ragged_dot_general(
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
     activation: base.ActivationFunction | None = None,
+    manual_axis_type: ManualAxisType | None = None,
     *,
     implementation: (
         Implementation
@@ -155,6 +164,7 @@ def ragged_dot_general(
       group_sizes to start computing from. If not specified, defaults to [0].
     activation: Optional. Activation function to apply to the result. If not
       specified, no activation function is applied.
+    manual_axis_type: Optional. Manual axis type for the operation.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -200,6 +210,12 @@ def ragged_dot_general(
       impl = IMPLEMENTATIONS[impl]
 
     try:
+      # We only pass manual_axis_type if it is explicitly set, since older
+      # implementations might not support this argument yet.
+      kwargs = {}
+      if manual_axis_type is not None:
+        kwargs["manual_axis_type"] = manual_axis_type
+
       return impl(
           lhs,
           rhs,
@@ -208,6 +224,7 @@ def ragged_dot_general(
           precision=precision,
           preferred_element_type=preferred_element_type,
           activation=activation,
+          **kwargs,
       )
     except NotImplementedError as e:
       if len(implementation) == 1:

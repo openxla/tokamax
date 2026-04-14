@@ -14,7 +14,11 @@
 # ==============================================================================
 """Tests for Pallas Mosaic TPU Ragged Dot."""
 
+import functools
+from typing import Any
 from absl.testing import absltest
+from jax import shard_map
+from jax.sharding import PartitionSpec as P
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
@@ -26,6 +30,11 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 AsQArray = quantization.AsQArray
 
@@ -94,6 +103,108 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
   def test_vjp0(self):
     with test_base.override_chex_args(atol=0.2, rtol=0.01):
       super().test_vjp0()  # pytype: disable=attribute-error
+
+  def test_shard_map_manual_axis_type_varying(self):
+    # TODO: Remove the skipTest once JAX is upgraded.
+    if ManualAxisType is Any:
+      self.skipTest("ManualAxisType is not supported.")
+    if jax.devices()[0].device_kind.startswith(
+        "TPU7x"
+    ):
+      self.skipTest("Skip the test on TPU v7.")
+    num_devices = jax.device_count()
+    mesh = jax.make_mesh((num_devices, 1), ("x", "y"))
+    # NB: Must not directly run jax.set_mesh in test method.
+    # jax.set_mesh(mesh) sets a global mesh for the entire process but never
+    # clears it. If this test runs before other tests, the global mesh remains
+    # active and causes other tests to fail, while if you only run that failing
+    # test, it passes.
+    with jax.set_mesh(mesh):
+      m, k, n = 256, 128, 128
+      num_groups = 1
+
+      lhs = jnp.ones((m, k))
+      lhs = jax.device_put(lhs, P("x",))
+      rhs = jnp.ones((num_groups, k, n))
+      rhs = jax.device_put(rhs, P(None, None, "y"))
+      group_sizes = jnp.array([m], jnp.uint32)
+
+      config = pallas_mosaic_tpu.Config(tile_m=128, tile_k=128, tile_n=128)
+      op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
+
+      @functools.partial(
+          shard_map,
+          mesh=mesh,
+          in_specs=(P("x", None), P(None, None, "y"), P(None)),
+          out_specs=P("x", "y"),
+          check_vma=True,
+      )
+      def f(lhs, rhs, sizes):
+        manual_axis_type = ManualAxisType(
+            varying={"x", "y"},
+        )
+        res = op(lhs, rhs, group_sizes=sizes, manual_axis_type=manual_axis_type)
+        self.assertEqual(jax.typeof(res).manual_axis_type, manual_axis_type)
+        return res
+
+      _, vjpfunc = jax.vjp(
+          f,
+          lhs,
+          rhs,
+          group_sizes,
+      )
+      cotangent = jax.random.normal(
+          jax.random.key(0), (m, n), dtype=jnp.float32
+      )
+      cotangent = jax.device_put(cotangent, P("x", "y"))
+      vjpfunc(cotangent)[0].block_until_ready()
+
+  def test_shard_map_manual_axis_type_unreduced(self):
+    # TODO: Remove the skipTest once JAX is upgraded.
+    if ManualAxisType is Any:
+      self.skipTest("ManualAxisType is not supported.")
+    num_devices = jax.device_count()
+    mesh = jax.make_mesh((num_devices, 1), ("x", "y"))
+    with jax.set_mesh(mesh):
+      m, k, n = 256, 256, 256
+      num_groups = 1
+
+      lhs = jnp.ones((m, k))
+      lhs = jax.device_put(lhs, P(None, "x"))
+      rhs = jnp.ones((num_groups, k, n))
+      rhs = jax.device_put(rhs, P(None, "x", None))
+      group_sizes = jnp.array([m], jnp.uint32)
+
+      config = pallas_mosaic_tpu.Config(tile_m=128, tile_k=128, tile_n=128)
+      op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
+
+      @jax.jit
+      @functools.partial(
+          shard_map,
+          mesh=mesh,
+          in_specs=(P(None, "x"), P(None, "x", None), P(None)),
+          out_specs=P(None, None, unreduced={"x"}),
+          check_vma=True,
+      )
+      def f(lhs, rhs, sizes):
+        manual_axis_type = ManualAxisType(
+            unreduced={"x"},
+        )
+        res = op(lhs, rhs, group_sizes=sizes, manual_axis_type=manual_axis_type)
+        self.assertEqual(jax.typeof(res).manual_axis_type, manual_axis_type)
+        return res
+
+      _, vjpfunc = jax.vjp(
+          f,
+          lhs,
+          rhs,
+          group_sizes,
+      )
+      cotangent = jax.random.normal(
+          jax.random.key(0), (m, n), dtype=jnp.float32
+      )
+      cotangent = jax.device_put(cotangent, P(None, None, reduced={"x"}))
+      vjpfunc(cotangent)[0].block_until_ready()
 
   @override
   def _test_quantized(

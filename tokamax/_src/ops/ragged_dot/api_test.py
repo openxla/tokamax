@@ -132,6 +132,21 @@ class RaggedDotTest(parameterized.TestCase):
                 or isinstance(opspecs[0].op, mosaic_impl)
             )
 
+  def test_manual_axis_type(self):
+    if jax.default_backend() == "tpu":
+      lhs, rhs, group_sizes = _get_input_data(
+          num_experts=8, m=256, k=128, n=128
+      )
+    else:
+      lhs, rhs, group_sizes = _get_input_data(num_experts=8, m=128, k=64, n=128)
+
+    api.ragged_dot(
+        lhs,
+        rhs,
+        group_sizes,
+        manual_axis_type=None,
+    )
+
 
 class RaggedDotImplementationTest(test_base.RaggedDotTestBase):
 

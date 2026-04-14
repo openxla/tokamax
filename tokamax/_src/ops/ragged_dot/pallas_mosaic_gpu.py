@@ -16,7 +16,7 @@
 
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -40,6 +40,11 @@ QArray = base.QArray
 AsQArray = base.AsQArray
 GroupSizes = base.GroupSizes
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 # TODO: Natively support mk,ekn->mn.
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -72,6 +77,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool,
       config: Config,
       activation: base.ActivationFunction | None = None,
+      manual_axis_type: ManualAxisType | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support returning residuals from mosaic GPU kernel.
 

@@ -18,7 +18,7 @@ import dataclasses
 import functools
 import itertools
 import types
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -32,6 +32,11 @@ from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
 from typing_extensions import override
 
+# TODO: Directly import ManualAxisType JAX is upgraded.
+try:
+  from jax.sharding import ManualAxisType
+except ImportError:
+  ManualAxisType = Any
 
 # Tiling on TPU technically needs to be a multiple of 128, but it's possible to
 # request a "full tile" of an array equal to the full axis size and that doesn't
@@ -234,6 +239,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool = False,
       config: Config,
       activation: base.ActivationFunction | None = None,
+      manual_axis_type: ManualAxisType | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
@@ -276,6 +282,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
+          manual_axis_type=manual_axis_type,
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
       # here, handle fast-path special cases that arise in backwards gmm
@@ -303,6 +310,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
+          manual_axis_type=manual_axis_type,
       )
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
       lhs_trans = jax.tree.map(lambda x: x.mT, lhs)
@@ -332,6 +340,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
           combine_scopes=config.combine_scopes,
+          manual_axis_type=manual_axis_type,
       )
     else:
       raise NotImplementedError(
