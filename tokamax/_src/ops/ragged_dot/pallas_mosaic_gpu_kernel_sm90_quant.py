@@ -83,6 +83,10 @@ def ragged_dot_quantized_kernel(
   if n % (2 * block_n) != 0:
     raise NotImplementedError(f"{n=} must be divisible by {2 * block_n=}")
 
+  m_iters = pl.cdiv(m, block_m) + g - 1
+  n_iters = pl.cdiv(n, _COMPUTE_WGS * block_n)
+  k_iters = pl.cdiv(k, block_k)
+
   w_scales_tile_g, w_scales_tile_k, w_scales_tile_n = rhs.scale_tile_shape
   w_scales_tile_k_rem = w_scales_tile_k % block_k
 
@@ -121,23 +125,19 @@ def ragged_dot_quantized_kernel(
       w_consumed_barrier,
       o_consumed_barrier,
   ):
-    k_iters = pl.cdiv(k, block_k)
 
-    def mn_loop(m_offset, m_iters, n_iters, loop_info: plgpu.NDLoopInfo, carry):
-      (lin_idx,) = loop_info.index
+    def mn_loop_body(m_offset, m_iters, loop_info: plgpu.NDLoopInfo, carry):
+      (mni,) = loop_info.index
       mi, ni = plgpu.planar_snake(
-          lin_idx,
-          (m_iters, n_iters),
-          config.grid_minor_dim,
-          config.grid_tile_width,
+          mni, (m_iters, n_iters), config.grid_minor_dim, config.grid_tile_width
       )
-      tid_m = mi + m_offset
+      mi += m_offset
 
       with jax.named_scope("load group_info"):
-        gi = group_id_gmem[tid_m]
-        start_within_block = start_within_block_gmem[tid_m]
-        actual_size = actual_size_gmem[tid_m]
-        block_start = block_start_gmem[tid_m]
+        gi = group_id_gmem[mi]
+        start_within_block = start_within_block_gmem[mi]
+        actual_size = actual_size_gmem[mi]
+        block_start = block_start_gmem[mi]
 
       wg = jax.lax.axis_index("wg")
       ms = pl.ds(block_start, block_m)
@@ -324,27 +324,22 @@ def ragged_dot_quantized_kernel(
 
       return carry + (actual_size > 0)
 
-    n_iters = pl.cdiv(n, _COMPUTE_WGS * block_n)
-
     if config.persistent:
       # We stratify the grid: first emit a number of blocks that have definitely
       # work to do. Then schedule blocks that may be no-ops. This way we lower
       # the chances that no-op blocks are scheduled to the same SM.
+      def run_mn_loop(m_offset, m_iters, carry=0):
+        return plgpu.nd_loop(
+            (m_iters * n_iters,), collective_axes="sm", init_carry=carry
+        )(functools.partial(mn_loop_body, m_offset, m_iters))
+
       m0_iters = pl.cdiv(m, block_m)
-      carry = plgpu.nd_loop(
-          (m0_iters * n_iters,), collective_axes="sm", init_carry=0
-      )(functools.partial(mn_loop, 0, m0_iters, n_iters))
-      m1_iters = g - 1
-      plgpu.nd_loop(
-          (m1_iters * n_iters,), collective_axes="sm", init_carry=carry
-      )(
-          functools.partial(mn_loop, m0_iters, m1_iters, n_iters),
-      )
+      carry = run_mn_loop(0, m0_iters)
+      _ = run_mn_loop(m0_iters, m_iters - m0_iters, carry)
     else:
-      m_iters = pl.cdiv(m, block_m) + g - 1
-      plgpu.nd_loop((m_iters * n_iters,), collective_axes="sm", init_carry=0)(
-          functools.partial(mn_loop, 0, m_iters, n_iters)
-      )
+      mni = jax.lax.axis_index("mn")
+      loop_info = plgpu.NDLoopInfo((mni,), local_index=0, num_local_steps=1)
+      mn_loop_body(0, m_iters, loop_info, carry=0)
 
   out_elem_bits = jnp.finfo(out_dtype).bits
   swizzle_out = plgpu.find_swizzle(out_elem_bits * block_n, "out")
@@ -383,18 +378,22 @@ def ragged_dot_quantized_kernel(
       o_consumed_barrier=plgpu.Barrier(),
   )
 
-  num_sms = backend.get_default_device().core_count
+  if config.persistent:
+    grid = (backend.get_default_device().core_count,)
+    grid_names = ("sm",)
+  else:
+    grid = (m_iters * n_iters,)
+    grid_names = ("mn",)
+
   profile = False
-  if profile:
-    num_sms = 1
   f = plgpu.kernel(
       kernel,
       out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
       scratch_shapes=scratch_shapes,
       num_threads=_COMPUTE_WGS + (1 if supports_warp_tma else 2),
       thread_name="wg",
-      grid=(num_sms,),
-      grid_names=("sm",),
+      grid=grid,
+      grid_names=grid_names,
       compiler_params=plgpu.CompilerParams(
           approx_math=True,
           unsafe_no_auto_barriers=True,
