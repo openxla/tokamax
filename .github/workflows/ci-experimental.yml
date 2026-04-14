@@ -36,7 +36,7 @@ jobs:
         shell: bash
     container:
     # Docker image will include CUDA and cuDNN for Tokamax.
-      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15'
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
     timeout-minutes: 300
     steps:
       - name: Checkout Tokamax
@@ -48,7 +48,7 @@ jobs:
         run: |
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[cuda,tpu,test]
+          python3.12 -m uv pip install -e .[tpu,test]
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
