@@ -1,6 +1,6 @@
 {
   "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
       "compile_time_ms": 772.8798359999018,
       "lower_time_ms": 251.32531400004154,
       "evaluation_times_ms": [
@@ -15,7 +15,7 @@
     }
   },
   "{\"lhs\":\"bf16[327680,2880]\",\"rhs\":\"bf16[128,2880,2880]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":327680},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
       "compile_time_ms": 780.8331869996437,
       "lower_time_ms": 433.54177299988805,
       "evaluation_times_ms": [
@@ -30,7 +30,7 @@
     }
   },
   "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
       "compile_time_ms": 150.0451250003607,
       "lower_time_ms": 320.833140999639,
       "evaluation_times_ms": [
@@ -45,7 +45,7 @@
     }
   },
   "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[128,768,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
       "compile_time_ms": 1347.051515000203,
       "lower_time_ms": 1518.1370599998445,
       "evaluation_times_ms": [
@@ -60,7 +60,7 @@
     }
   },
   "{\"lhs\":\"bf16[524288,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 806.4184790000581,
       "lower_time_ms": 533.5296869998274,
       "evaluation_times_ms": [
@@ -73,7 +73,7 @@
       "metadata": {},
       "peak_memory_mb": 8704.033187866211
     },
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 128.56283100001065,
       "lower_time_ms": 261.408026999959,
       "evaluation_times_ms": [
@@ -88,7 +88,7 @@
     }
   },
   "{\"lhs\":\"bf16[524288,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 124.0770629999588,
       "lower_time_ms": 269.6561800000836,
       "evaluation_times_ms": [
@@ -103,7 +103,7 @@
     }
   },
   "{\"lhs\":\"bf16[262144,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
       "compile_time_ms": 774.751212999945,
       "lower_time_ms": 261.74306799975966,
       "evaluation_times_ms": [
@@ -118,7 +118,7 @@
     }
   },
   "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 803.8728139999876,
       "lower_time_ms": 309.6112210000683,
       "evaluation_times_ms": [
@@ -133,7 +133,7 @@
     }
   },
   "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[128,7168,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
       "compile_time_ms": 116.20562999996764,
       "lower_time_ms": 286.33030900027734,
       "evaluation_times_ms": [
@@ -148,7 +148,7 @@
     }
   },
   "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
+    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
       "compile_time_ms": 137.86927699993612,
       "lower_time_ms": 248.2818230000703,
       "evaluation_times_ms": [
@@ -163,7 +163,7 @@
     }
   },
   "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 1289.3786780000482,
       "lower_time_ms": 1156.5762790000917,
       "evaluation_times_ms": [
@@ -178,7 +178,7 @@
     }
   },
   "{\"lhs\":\"bf16[131072,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 829.1015740001058,
       "lower_time_ms": 414.55697200012764,
       "evaluation_times_ms": [
@@ -193,7 +193,7 @@
     }
   },
   "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
       "compile_time_ms": 868.8712130001477,
       "lower_time_ms": 288.29789300016273,
       "evaluation_times_ms": [
@@ -208,7 +208,7 @@
     }
   },
   "{\"lhs\":\"bf16[65536,7168]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":65536},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":true,\"grid_minor_dim\":1,\"grid_tile_width\":8}": {
+    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":true,\"grid_minor_dim\":1,\"grid_tile_width\":8}": {
       "compile_time_ms": 153.85594700001093,
       "lower_time_ms": 225.20188500038785,
       "evaluation_times_ms": [
@@ -223,7 +223,7 @@
     }
   },
   "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":1,\"grid_tile_width\":8}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":1,\"grid_tile_width\":8}": {
       "compile_time_ms": 127.07883999974001,
       "lower_time_ms": 253.28761600030703,
       "evaluation_times_ms": [
@@ -238,7 +238,7 @@
     }
   },
   "{\"lhs\":\"bf16[131072,512]\",\"rhs\":\"bf16[256,512,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
+    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
       "compile_time_ms": 2022.4746180001603,
       "lower_time_ms": 2384.0452469999036,
       "evaluation_times_ms": [
@@ -253,7 +253,7 @@
     }
   },
   "{\"lhs\":\"bf16[4096,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[4096,0,0,0,0,0,0,0],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
+    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
       "compile_time_ms": 105.06452799995714,
       "lower_time_ms": 244.84716200004186,
       "evaluation_times_ms": [
@@ -268,7 +268,7 @@
     }
   },
   "{\"lhs\":\"bf16[8,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[1,1,1,1,1,1,1,1],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":8,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":false,\"grid_minor_dim\":1,\"grid_tile_width\":2}": {
+    "{\"block_m\":8,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":false,\"grid_minor_dim\":1,\"grid_tile_width\":2}": {
       "compile_time_ms": 23382.633226000053,
       "lower_time_ms": 162.82754500025476,
       "evaluation_times_ms": [
@@ -283,7 +283,7 @@
     }
   },
   "{\"lhs\":\"bf16[8192,4096]\",\"rhs\":\"bf16[8,4096,14336]\",\"group_sizes\":{\"num_groups\":8,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 19494.430602999728,
       "lower_time_ms": 263.0322589998286,
       "evaluation_times_ms": [
@@ -298,7 +298,7 @@
     }
   },
   "{\"lhs\":\"bf16[262144,2048]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
       "compile_time_ms": 810.2533220003352,
       "lower_time_ms": 458.49386899999445,
       "evaluation_times_ms": [
@@ -314,7 +314,7 @@
   },
   "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[262144,2048]\",\"group_sizes\":{\"num_groups\":262144,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[327680,2880]\",\"rhs\":\"bf16[128,2880,2880]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":327680},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
       "compile_time_ms": 716.2415199998122,
       "lower_time_ms": 235.96701500014206,
       "evaluation_times_ms": [
@@ -330,7 +330,7 @@
   },
   "{\"lhs\":\"bf16[327680,2880]\",\"rhs\":\"bf16[327680,2880]\",\"group_sizes\":{\"num_groups\":327680,\"total_size\":327680},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
       "compile_time_ms": 93.27277300008063,
       "lower_time_ms": 240.66696299996693,
       "evaluation_times_ms": [
@@ -346,7 +346,7 @@
   },
   "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[393216,768]\",\"group_sizes\":{\"num_groups\":393216,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[128,768,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
       "compile_time_ms": 1257.9973119999295,
       "lower_time_ms": 515.355956999997,
       "evaluation_times_ms": [
@@ -362,7 +362,7 @@
   },
   "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[393216,2048]\",\"group_sizes\":{\"num_groups\":393216,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[524288,1536]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 770.9908100000575,
       "lower_time_ms": 356.3605959998313,
       "evaluation_times_ms": [
@@ -378,7 +378,7 @@
   },
   "{\"lhs\":\"bf16[524288,4096]\",\"rhs\":\"bf16[524288,1536]\",\"group_sizes\":{\"num_groups\":524288,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[524288,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 958.7766130000546,
       "lower_time_ms": 262.452046999897,
       "evaluation_times_ms": [
@@ -394,7 +394,7 @@
   },
   "{\"lhs\":\"bf16[524288,1536]\",\"rhs\":\"bf16[524288,4096]\",\"group_sizes\":{\"num_groups\":524288,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 952.8693280000198,
       "lower_time_ms": 272.8659010000456,
       "evaluation_times_ms": [
@@ -410,7 +410,7 @@
   },
   "{\"lhs\":\"bf16[262144,4096]\",\"rhs\":\"bf16[262144,1536]\",\"group_sizes\":{\"num_groups\":262144,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[262144,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
       "compile_time_ms": 1269.1895159998694,
       "lower_time_ms": 263.506604999975,
       "evaluation_times_ms": [
@@ -426,7 +426,7 @@
   },
   "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[262144,4096]\",\"group_sizes\":{\"num_groups\":262144,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[128,7168,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
       "compile_time_ms": 667.4030429999789,
       "lower_time_ms": 242.5043819999928,
       "evaluation_times_ms": [
@@ -442,7 +442,7 @@
   },
   "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[131072,2048]\",\"group_sizes\":{\"num_groups\":131072,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[131072,768]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":8}": {
       "compile_time_ms": 1654.2927010000312,
       "lower_time_ms": 547.5398670000686,
       "evaluation_times_ms": [
@@ -458,7 +458,7 @@
   },
   "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[131072,768]\",\"group_sizes\":{\"num_groups\":131072,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[131072,1536]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 847.4344740000106,
       "lower_time_ms": 375.4757189999509,
       "evaluation_times_ms": [
@@ -474,7 +474,7 @@
   },
   "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[131072,1536]\",\"group_sizes\":{\"num_groups\":131072,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
+    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":4}": {
       "compile_time_ms": 121.27931899999567,
       "lower_time_ms": 290.94947900000534,
       "evaluation_times_ms": [
@@ -490,7 +490,7 @@
   },
   "{\"lhs\":\"bf16[131072,1536]\",\"rhs\":\"bf16[131072,4096]\",\"group_sizes\":{\"num_groups\":131072,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
+    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
       "compile_time_ms": 98.81244000007428,
       "lower_time_ms": 214.25276499985557,
       "evaluation_times_ms": [
@@ -505,7 +505,7 @@
     }
   },
   "{\"lhs\":\"bf16[65536,2048]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":65536},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
+    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":1}": {
       "compile_time_ms": 80.08812399998533,
       "lower_time_ms": 215.06549900004757,
       "evaluation_times_ms": [
@@ -521,7 +521,7 @@
   },
   "{\"lhs\":\"bf16[65536,7168]\",\"rhs\":\"bf16[65536,2048]\",\"group_sizes\":{\"num_groups\":65536,\"total_size\":65536},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[131072,512]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
+    "{\"block_m\":64,\"block_n\":128,\"block_k\":256,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":true,\"async_store\":false,\"post_scale\":true,\"collective\":true,\"grid_minor_dim\":0,\"grid_tile_width\":2}": {
       "compile_time_ms": 94.50771799993163,
       "lower_time_ms": 1576.8366050001532,
       "evaluation_times_ms": [
@@ -537,7 +537,7 @@
   },
   "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[131072,512]\",\"group_sizes\":{\"num_groups\":131072,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {},
   "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,512,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"grid_block_n\":1,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":1,\"grid_tile_width\":4}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":128,\"num_stages\":2,\"split_k\":1,\"split_m\":2,\"persistent\":false,\"async_store\":false,\"post_scale\":false,\"collective\":true,\"grid_minor_dim\":1,\"grid_tile_width\":4}": {
       "compile_time_ms": 860.126173000026,
       "lower_time_ms": 431.97963900001923,
       "evaluation_times_ms": [

@@ -34,7 +34,6 @@ _CONFIG = pallas_mosaic_gpu.Config(
     block_k=128,
     num_stages=2,
     split_k=1,
-    grid_block_n=1,
     persistent=True,
     collective=False,
     grid_minor_dim=pallas_mosaic_gpu.common.MatmulDimension.M,

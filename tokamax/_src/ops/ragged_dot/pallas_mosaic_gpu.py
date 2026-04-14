@@ -184,7 +184,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           block_k=block_k,
           num_stages=2,
           split_k=1,
-          grid_block_n=1,
           persistent=False,
           grid_minor_dim=common.MatmulDimension.M,
           grid_tile_width=1,
@@ -199,7 +198,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                 block_k=block_k,
                 num_stages=2,
                 split_k=1,
-                grid_block_n=1,
             )
           elif lhs.qtype == jnp.float8_e4m3fn:
             return Config(
@@ -208,7 +206,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                 block_k=block_k,
                 num_stages=2,
                 split_k=1,
-                grid_block_n=1,
             )
         return Config(
             block_m=64,
@@ -216,7 +213,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             block_k=block_k,
             num_stages=2,
             split_k=1,
-            grid_block_n=1,
         )
       else:
         return Config(
@@ -225,7 +221,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             block_k=256,
             num_stages=2,
             split_k=1,
-            grid_block_n=1,
             persistent=False,
             collective=True,
             grid_minor_dim=common.MatmulDimension.M,
@@ -280,7 +275,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                         num_stages=num_stages,
                         persistent=persistent,
                         split_k=1,
-                        grid_block_n=grid_tile_width,
                         grid_minor_dim=grid_minor_dim,
                         grid_tile_width=grid_tile_width,
                     )
@@ -340,7 +334,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                               block_k=block_k,
                               num_stages=num_stages,
                               split_k=1,
-                              grid_block_n=grid_tile_width,
                               persistent=False,
                               collective=collective,
                               post_scale=post_scale,
