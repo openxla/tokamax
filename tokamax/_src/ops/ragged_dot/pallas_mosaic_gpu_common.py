@@ -133,7 +133,9 @@ def calculate_group_info_tasks(
     align_block_size: int = 8,
 ):
   """Calculates task assignments for processing a ragged tensor with specified block alignment."""
-  group_sizes = jnp.asarray(group_sizes).astype(jnp.int32)
+  group_sizes = jnp.asarray(group_sizes)
+  group_sizes = lax.max(jnp.zeros_like(group_sizes), group_sizes)
+  group_sizes = group_sizes.astype(jnp.int32)
   group_starts = jnp.pad(jnp.cumsum(group_sizes)[:-1], (1, 0))
   group_ends = group_starts + group_sizes
   aligned_starts = lax.div(group_starts, align_block_size) * align_block_size
@@ -153,11 +155,11 @@ def calculate_group_info_tasks(
   cta_id = jnp.arange(max_tasks)
   inside_block_idx = cta_id - cta_group_block_start
   global_m_start = aligned_starts[group_idx] + block_m * inside_block_idx
-  actual_m_start = jnp.maximum(global_m_start, group_starts[group_idx])
+  actual_m_start = lax.max(global_m_start, group_starts[group_idx])
   global_m_end = global_m_start + block_m
-  actual_m_end = jnp.minimum(global_m_end, group_ends[group_idx])
+  actual_m_end = lax.min(global_m_end, group_ends[group_idx])
   offset_in_block = actual_m_start - global_m_start
-  actual_size = jnp.maximum(0, actual_m_end - actual_m_start)
+  actual_size = actual_m_end - actual_m_start
   return group_idx, global_m_start, offset_in_block, actual_size
 
 
