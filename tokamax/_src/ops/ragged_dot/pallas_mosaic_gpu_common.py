@@ -80,7 +80,6 @@ class GroupInfo:
       tile: int,
       tid_size: int,
       align_tile: int = 8,
-      noops_at_end: bool = True,
   ) -> "GroupInfo":
     """Creates a GroupInfo instance with block-aligned task assignments.
 
@@ -102,25 +101,18 @@ class GroupInfo:
         `pl.cdiv(m, block_m) + len(group_sizes) - 1`.
       align_tile: The alignment boundary for the start of each block. Block
         starts will be multiples of this value. Defaults to 8.
-      noops_at_end: If True, tasks that result in no actual work (actual_size ==
-        0) are moved to the end of the task list. Defaults to True.
 
     Returns:
       A GroupInfo instance containing the calculated information for each task.
       Note, that block array is always None.
     """
-    (
-        group_idx,
-        global_m_start,
-        offset_in_block,
-        actual_size,
-        _,
-    ) = calculate_group_info_tasks(
-        group_sizes,
-        max_tasks=tid_size,
-        block_m=tile,
-        align_block_size=align_tile,
-        noops_at_end=noops_at_end,
+    group_idx, global_m_start, offset_in_block, actual_size = (
+        calculate_group_info_tasks(
+            group_sizes,
+            max_tasks=tid_size,
+            block_m=tile,
+            align_block_size=align_tile,
+        )
     )
     actual_start = global_m_start + offset_in_block
     actual_end = global_m_start + offset_in_block + actual_size
@@ -139,14 +131,15 @@ def calculate_group_info_tasks(
     max_tasks: int,
     block_m: int,
     align_block_size: int = 8,
-    noops_at_end: bool = True,
 ):
   """Calculates task assignments for processing a ragged tensor with specified block alignment."""
   group_sizes = jnp.asarray(group_sizes).astype(jnp.int32)
   group_starts = jnp.pad(jnp.cumsum(group_sizes)[:-1], (1, 0))
   group_ends = group_starts + group_sizes
   aligned_starts = lax.div(group_starts, align_block_size) * align_block_size
-  blocks_per_group = pl.cdiv(group_ends - aligned_starts, block_m)
+  blocks_per_group = jnp.where(
+      group_sizes == 0, 0, pl.cdiv(group_ends - aligned_starts, block_m)
+  )
   group_range = jnp.arange(group_sizes.shape[0])
   group_idx = jnp.repeat(
       group_range,
@@ -165,25 +158,7 @@ def calculate_group_info_tasks(
   actual_m_end = jnp.minimum(global_m_end, group_ends[group_idx])
   offset_in_block = actual_m_start - global_m_start
   actual_size = jnp.maximum(0, actual_m_end - actual_m_start)
-  non_empty_mask = actual_size > 0
-  if noops_at_end:
-    noop_group_pos = 1024 * 1024
-    idx = jnp.argsort(noop_group_pos * (1 - (actual_size > 0)) + group_idx)
-    return (
-        group_idx[idx],
-        global_m_start[idx],
-        offset_in_block[idx],
-        actual_size[idx],
-        non_empty_mask.sum(),
-    )
-  else:
-    return (
-        group_idx,
-        global_m_start,
-        offset_in_block,
-        actual_size,
-        non_empty_mask.sum(),
-    )
+  return group_idx, global_m_start, offset_in_block, actual_size
 
 
 def get_smem_capacity() -> int:

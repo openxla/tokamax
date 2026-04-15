@@ -226,9 +226,7 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
 
   m_iters = pl.cdiv(m, block_m) + num_groups - 1
   n_iters = pl.cdiv(n, block_n * _DEQ_WG)
-  group_info = common.GroupInfo.create_aligned(
-      group_sizes, block_m, m_iters, noops_at_end=False
-  )
+  group_info = common.GroupInfo.create_aligned(group_sizes, block_m, m_iters)
 
   def kernel(*refs, scoped):
     (
