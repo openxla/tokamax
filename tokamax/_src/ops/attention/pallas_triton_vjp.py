@@ -600,7 +600,22 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   # TODO: Implement an autotuning search space.
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    return set()
+    configs = set()
+    for block_m in [16, 32, 64, 128, 256]:
+      for block_n in [16, 32, 64, 128, 256]:
+        for num_warps in [2, 4]:
+          for num_stages in [1, 2, 3, 4]:
+            configs.add(
+                Config(
+                    block_m1=block_m,
+                    block_m2=block_m,
+                    block_n1=block_n,
+                    block_n2=block_n,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                )
+            )
+    return configs
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
