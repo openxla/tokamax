@@ -14,7 +14,9 @@
 # ==============================================================================
 """Mosaic-GPU utils."""
 
+from collections.abc import Sequence
 import functools
+from typing import Callable, TypeVar
 
 import jax
 from jax.experimental import pallas as pl
@@ -112,6 +114,27 @@ def _bar_operation(
 
 bar_arrive = functools.partial(_bar_operation, "arrive")
 bar_sync = functools.partial(_bar_operation, "sync")
+
+
+_T = TypeVar("_T")
+
+
+def bucketed(
+    size: jax.Array, bucket_sizes: Sequence[int]
+) -> Callable[[Callable[[int], _T]], _T]:
+  """Executes the wrapped function with the smallest sufficient bucket size."""
+
+  def wrapper(f: Callable[[int], _T]) -> _T:
+    bucket_size, *remaining_bucket_sizes = bucket_sizes
+    if not remaining_bucket_sizes:
+      return f(bucket_size)
+    return jax.lax.cond(
+        size <= bucket_size,
+        lambda: f(bucket_size),
+        lambda: bucketed(size, remaining_bucket_sizes)(f),
+    )
+
+  return wrapper
 
 
 def int4_as_biased_f8e4m3fn(x, layout):
