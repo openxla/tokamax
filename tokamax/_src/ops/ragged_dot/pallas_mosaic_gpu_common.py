@@ -159,7 +159,7 @@ def calculate_group_info_tasks(
   global_m_end = global_m_start + block_m
   actual_m_end = lax.min(global_m_end, group_ends[group_idx])
   offset_in_block = actual_m_start - global_m_start
-  actual_size = actual_m_end - actual_m_start
+  actual_size = lax.max(0, actual_m_end - actual_m_start)
   return group_idx, global_m_start, offset_in_block, actual_size
 
 
