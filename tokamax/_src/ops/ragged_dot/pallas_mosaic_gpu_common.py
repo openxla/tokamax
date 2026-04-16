@@ -106,61 +106,39 @@ class GroupInfo:
       A GroupInfo instance containing the calculated information for each task.
       Note, that block array is always None.
     """
-    group_idx, global_m_start, offset_in_block, actual_size = (
-        calculate_group_info_tasks(
-            group_sizes,
-            max_tasks=tid_size,
-            block_m=tile,
-            align_block_size=align_tile,
-        )
+    group_sizes = jnp.asarray(group_sizes)
+    group_sizes = lax.max(jnp.zeros_like(group_sizes), group_sizes)
+    group_sizes = group_sizes.astype(jnp.int32)
+    group_starts = jnp.cumulative_sum(group_sizes, include_initial=True)
+    group_starts_aligned = lax.div(group_starts[:-1], align_tile) * align_tile
+    # We could use `group_starts[1:]`, but XLA fuses this better.
+    group_ends = group_starts[:-1] + group_sizes
+    group_num_blocks = jnp.where(
+        group_sizes == 0, 0, pl.cdiv(group_ends - group_starts_aligned, tile)
     )
-    actual_start = global_m_start + offset_in_block
-    actual_end = global_m_start + offset_in_block + actual_size
+    group_start_tasks = jnp.cumulative_sum(
+        group_num_blocks, include_initial=True
+    )
+    group_end_tasks = group_start_tasks[:-1] + group_num_blocks  # As above.
+    task_idx = jnp.arange(tid_size)
+    # `method="scan_unrolled"` should be better, particularly for larger numbers
+    # of groups, but XLA doesn't fuse it into a single fusion.
+    task_group_idx = jnp.searchsorted(
+        group_end_tasks[:-1], task_idx, "right", method="compare_all"
+    )
+    task_block_idx = task_idx - group_start_tasks[task_group_idx]
+    task_starts = group_starts_aligned[task_group_idx] + tile * task_block_idx
+    task_valid_starts = lax.max(task_starts, group_starts[task_group_idx])
+    task_valid_ends = lax.min(task_starts + tile, group_ends[task_group_idx])
+    task_valid_size = lax.max(0, task_valid_ends - task_valid_starts)
     return cls(
-        group_idx,
-        global_m_start,
-        actual_start,
-        actual_end,
-        offset_in_block,
-        actual_size,
+        task_group_idx,
+        task_starts,
+        task_valid_starts,
+        task_valid_ends,
+        task_valid_starts - task_starts,
+        task_valid_size,
     )
-
-
-def calculate_group_info_tasks(
-    group_sizes: Sequence[jax.Array],
-    max_tasks: int,
-    block_m: int,
-    align_block_size: int = 8,
-):
-  """Calculates task assignments for processing a ragged tensor with specified block alignment."""
-  group_sizes = jnp.asarray(group_sizes)
-  group_sizes = lax.max(jnp.zeros_like(group_sizes), group_sizes)
-  group_sizes = group_sizes.astype(jnp.int32)
-  group_starts = jnp.pad(jnp.cumsum(group_sizes)[:-1], (1, 0))
-  group_ends = group_starts + group_sizes
-  aligned_starts = lax.div(group_starts, align_block_size) * align_block_size
-  blocks_per_group = jnp.where(
-      group_sizes == 0, 0, pl.cdiv(group_ends - aligned_starts, block_m)
-  )
-  group_range = jnp.arange(group_sizes.shape[0])
-  group_idx = jnp.repeat(
-      group_range,
-      axis=0,
-      repeats=blocks_per_group,
-      total_repeat_length=max_tasks,
-  )
-
-  block_starts_per_group = jnp.pad(jnp.cumsum(blocks_per_group)[:-1], (1, 0))
-  cta_group_block_start = block_starts_per_group[group_idx]
-  cta_id = jnp.arange(max_tasks)
-  inside_block_idx = cta_id - cta_group_block_start
-  global_m_start = aligned_starts[group_idx] + block_m * inside_block_idx
-  actual_m_start = lax.max(global_m_start, group_starts[group_idx])
-  global_m_end = global_m_start + block_m
-  actual_m_end = lax.min(global_m_end, group_ends[group_idx])
-  offset_in_block = actual_m_start - global_m_start
-  actual_size = lax.max(0, actual_m_end - actual_m_start)
-  return group_idx, global_m_start, offset_in_block, actual_size
 
 
 def get_smem_capacity() -> int:
