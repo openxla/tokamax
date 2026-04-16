@@ -119,7 +119,7 @@ class NumericsTest(parameterized.TestCase):
       self.skipTest('Test broken on TPU')
 
     shape = (2, 3, 4)
-    no_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    no_sharding = jax.sharding.make_single_device_sharding(jax.devices()[0])
     format_ = layout.Format(layout.Layout((1, 2, 0), ()), no_sharding)
     spec_with_layout = jax.ShapeDtypeStruct(shape, dtype, sharding=format_)
     actual = numerics.random_initialize(spec_with_layout)

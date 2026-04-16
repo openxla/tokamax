@@ -75,7 +75,7 @@ _register_benchmark = functools.partial(
 
 def _transpose_rhs(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
   dev_layout = layout.Layout((0, 2, 1), ())
-  no_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+  no_sharding = jax.sharding.make_single_device_sharding(jax.devices()[0])
   dll_layout = layout.Format(dev_layout, no_sharding)
   return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=dll_layout)
 
