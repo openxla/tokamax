@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Utilities for extracting kernel information from HLO."""
+"""Utilities for extracting kernel information from StableHLO."""
+
 from collections.abc import Callable
 import dataclasses
 import functools
 from typing import Any, Final
-import zlib
 
 import immutabledict
 import jax
 from jax import export
-from jax.extend import mlir as jex_mlir
 from jax.interpreters import mlir
 import jax.numpy as jnp
 from jaxlib.mlir import ir

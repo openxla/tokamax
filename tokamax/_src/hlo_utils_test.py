@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 import functools
-import json
 import math
 from typing import cast
 
@@ -321,6 +320,8 @@ class DumpHloLibTest(parameterized.TestCase):
         and jax.default_backend() != 'gpu'
     ):
       self.skipTest('This test only runs on GPU.')
+    if implementation == 'mosaic' and not gpu_utils.has_mosaic_gpu_support():
+      self.skipTest('mosaic is not supported on this GPU version.')
 
     x = jnp.ones((32, 512, 16, 64), dtype=jnp.bfloat16)
     f = functools.partial(
