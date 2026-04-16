@@ -119,6 +119,7 @@ class GroupInfo:
     group_start_tasks = jnp.cumulative_sum(
         group_num_blocks, include_initial=True
     )
+    group_start_tasks = jax.lax.optimization_barrier(group_start_tasks)
     group_end_tasks = group_start_tasks[:-1] + group_num_blocks  # As above.
     task_idx = jnp.arange(tid_size)
     # `method="scan_unrolled"` should be better, particularly for larger numbers
