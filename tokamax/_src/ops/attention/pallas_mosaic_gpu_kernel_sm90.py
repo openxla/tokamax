@@ -98,7 +98,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   q, k, _ = ba.args
   block_qs = set([
       min(x, pl.next_power_of_2(q.shape[-3] // 2))
-      for x in [64, 128, 256]
+      for x in [64, 128]
       if q.shape[-3] % (x * 2) == 0  # 2 * block_q must divide seq_len_q.
   ])
   block_kvs = set([
