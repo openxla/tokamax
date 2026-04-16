@@ -656,10 +656,9 @@ def flash_attention_kernel(
         def warp_any(_, needs_rescale):
           thread_val = functools.reduce(arith.ori, needs_rescale.registers.flat)
           thread_val = vector.extract(thread_val, [], [0])
-          i1 = ir.IntegerType.get_signless(1)
           i32 = ir.IntegerType.get_signless(32)
           mask = arith.constant(i32, 0xFFFFFFFF)
-          warp_val = nvvm.vote_sync(i1, mask, thread_val, "any")
+          warp_val = nvvm.vote_sync(mask, thread_val, "any")
           return mgpu.FragmentedArray.splat(warp_val, (), is_signed=False)
 
         def rescale_acc(ds=ds, acc=acc):
