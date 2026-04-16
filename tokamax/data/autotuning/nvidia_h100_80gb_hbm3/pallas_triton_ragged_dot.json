@@ -1,733 +1,1053 @@
 {
-  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":2}": {
-      "compile_time_ms": 268.86103799998295,
-      "lower_time_ms": 1551.6401369999926,
-      "evaluation_times_ms": [
-        17.626377,
-        18.307562,
-        18.590198,
-        18.787409,
-        18.824779
-      ],
-      "metadata": {},
-      "peak_memory_mb": 11776.001953125
-    }
-  },
-  "{\"lhs\":\"bf16[327680,2880]\",\"rhs\":\"bf16[128,2880,2880]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":327680},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,7168,1024]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
     "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 249.02843599998903,
-      "lower_time_ms": 1396.094766999994,
+      "compile_time_ms": 366.5990249719471,
+      "lower_time_ms": 10230.60018895194,
       "evaluation_times_ms": [
-        13.03238,
-        13.127307,
-        13.854316,
-        13.955323,
-        14.045067
+        4.702522,
+        4.714425,
+        4.694202,
+        4.970297,
+        5.1000890000000005
       ],
       "metadata": {},
-      "peak_memory_mb": 5625.0009765625
-    },
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
-      "compile_time_ms": 239.6990839999944,
-      "lower_time_ms": 1283.4955739999998,
-      "evaluation_times_ms": [
-        13.567231,
-        13.847665,
-        13.839664,
-        14.505639,
-        14.475714
-      ],
-      "metadata": {},
-      "peak_memory_mb": 5625.0009765625
+      "peak_memory_mb": 5905.583104
     }
   },
-  "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,7168,1024]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
     "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 275.1871920000042,
-      "lower_time_ms": 1073.8617610000033,
+      "compile_time_ms": 333.5897499928251,
+      "lower_time_ms": 5848.601509002037,
       "evaluation_times_ms": [
-        3.413586,
-        3.411057,
-        3.410611,
-        3.41349,
-        3.410866
+        4.684322,
+        4.685346,
+        4.698595,
+        4.832227,
+        4.881155
       ],
       "metadata": {},
-      "peak_memory_mb": 2496.0009765625
+      "peak_memory_mb": 6174.018576
     }
   },
-  "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[128,768,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+  "{\"lhs\":\"bf16[131072,1024]\",\"rhs\":\"bf16[256,1024,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
     "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 1868.433103000001,
-      "lower_time_ms": 595.9201729999961,
+      "compile_time_ms": 334.71251802984625,
+      "lower_time_ms": 12388.093003071845,
       "evaluation_times_ms": [
-        6.683078,
-        6.685446,
-        6.68215,
-        6.681382,
-        6.683878
+        13.793678000000002,
+        13.790958,
+        13.794286,
+        13.811599,
+        13.809838
       ],
       "metadata": {},
-      "peak_memory_mb": 2496.0009765625
+      "peak_memory_mb": 5905.583104
     }
   },
-  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[262144,2048]\",\"group_sizes\":{\"num_groups\":262144,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+  "{\"lhs\":\"bf16[131072,1024]\",\"rhs\":\"bf16[256,1024,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
     "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 321.8666409999855,
-      "lower_time_ms": 1130.8663789999969,
+      "compile_time_ms": 363.09210304170847,
+      "lower_time_ms": 11298.682312946767,
       "evaluation_times_ms": [
-        14.011352,
-        14.068622,
-        14.459719,
-        15.897283,
-        15.857675
+        13.795319000000001,
+        13.814997,
+        13.809750000000001,
+        13.815062000000001,
+        13.796149
       ],
       "metadata": {},
-      "peak_memory_mb": 11776.001953125
-    }
-  },
-  "{\"lhs\":\"bf16[327680,2880]\",\"rhs\":\"bf16[128,2880,2880]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":327680},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 273.88758000000735,
-      "lower_time_ms": 1202.8901770000289,
-      "evaluation_times_ms": [
-        14.604266,
-        14.832315999999999,
-        15.072558,
-        15.708559,
-        15.468221999999999
-      ],
-      "metadata": {},
-      "peak_memory_mb": 7650.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[327680,2880]\",\"rhs\":\"bf16[327680,2880]\",\"group_sizes\":{\"num_groups\":327680,\"total_size\":327680},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
-      "compile_time_ms": 482.11693900000796,
-      "lower_time_ms": 1022.9627310000069,
-      "evaluation_times_ms": [
-        9.129171,
-        9.191143,
-        9.199398,
-        10.69531,
-        11.071496
-      ],
-      "metadata": {},
-      "peak_memory_mb": 5625.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 1809.4539739999789,
-      "lower_time_ms": 1762.1339190000072,
-      "evaluation_times_ms": [
-        6.925175,
-        6.919898,
-        6.927223,
-        6.918938000000001,
-        6.921976
-      ],
-      "metadata": {},
-      "peak_memory_mb": 2880.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[393216,768]\",\"group_sizes\":{\"num_groups\":393216,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
-      "compile_time_ms": 507.4286969999946,
-      "lower_time_ms": 1428.7265380000065,
-      "evaluation_times_ms": [
-        1.890921,
-        1.888393,
-        1.899531,
-        1.895274,
-        1.893961
-      ],
-      "metadata": {},
-      "peak_memory_mb": 2496.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[128,768,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 280.95185799998035,
-      "lower_time_ms": 1730.4666599999905,
-      "evaluation_times_ms": [
-        3.6880189999999997,
-        3.67381,
-        3.68354,
-        3.688725,
-        3.67637
-      ],
-      "metadata": {},
-      "peak_memory_mb": 2880.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[393216,2048]\",\"group_sizes\":{\"num_groups\":393216,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
-      "compile_time_ms": 495.96562299998936,
-      "lower_time_ms": 1905.7896109999888,
-      "evaluation_times_ms": [
-        1.866922,
-        1.863754,
-        1.866377,
-        1.868937,
-        1.867593
-      ],
-      "metadata": {},
-      "peak_memory_mb": 2496.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[524288,1536]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 263.8459359999956,
-      "lower_time_ms": 1219.855951999989,
-      "evaluation_times_ms": [
-        21.786714999999997,
-        21.776381,
-        21.757952,
-        21.866283000000003,
-        21.862444999999997
-      ],
-      "metadata": {},
-      "peak_memory_mb": 8704.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[524288,4096]\",\"rhs\":\"bf16[524288,1536]\",\"group_sizes\":{\"num_groups\":524288,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":256,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
-      "compile_time_ms": 389.7954029999937,
-      "lower_time_ms": 1445.7037769999772,
-      "evaluation_times_ms": [
-        10.358072,
-        10.385725,
-        10.401312,
-        10.960331,
-        11.820207
-      ],
-      "metadata": {},
-      "peak_memory_mb": 7168.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[524288,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
-      "compile_time_ms": 527.6893859999632,
-      "lower_time_ms": 1333.354087000032,
-      "evaluation_times_ms": [
-        17.640227,
-        17.773279,
-        17.681262,
-        17.911901,
-        18.194903
-      ],
-      "metadata": {},
-      "peak_memory_mb": 8704.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[524288,1536]\",\"rhs\":\"bf16[524288,4096]\",\"group_sizes\":{\"num_groups\":524288,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
-      "compile_time_ms": 458.09888300001944,
-      "lower_time_ms": 1185.4888870000195,
-      "evaluation_times_ms": [
-        9.431821,
-        9.733608,
-        9.807606,
-        10.745068,
-        10.721576
-      ],
-      "metadata": {},
-      "peak_memory_mb": 7168.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 257.05937899999753,
-      "lower_time_ms": 1505.0588019999936,
-      "evaluation_times_ms": [
-        11.461666,
-        11.441222999999999,
-        11.452452000000001,
-        11.453508000000001,
-        11.450661
-      ],
-      "metadata": {},
-      "peak_memory_mb": 5888.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[262144,4096]\",\"rhs\":\"bf16[262144,1536]\",\"group_sizes\":{\"num_groups\":262144,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
-      "compile_time_ms": 485.1000959999965,
-      "lower_time_ms": 1034.1665979999846,
-      "evaluation_times_ms": [
-        5.206661,
-        5.20858,
-        5.212228,
-        5.272824,
-        5.508429
-      ],
-      "metadata": {},
-      "peak_memory_mb": 4352.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[262144,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 274.70366700001136,
-      "lower_time_ms": 1187.161857999996,
-      "evaluation_times_ms": [
-        8.268457,
-        8.2929,
-        8.327134000000001,
-        8.47421,
-        8.480160999999999
-      ],
-      "metadata": {},
-      "peak_memory_mb": 5888.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[262144,4096]\",\"group_sizes\":{\"num_groups\":262144,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
-      "compile_time_ms": 484.0927560000239,
-      "lower_time_ms": 1259.2312069999991,
-      "evaluation_times_ms": [
-        5.127972,
-        5.129094,
-        5.146377,
-        5.152521,
-        5.718772
-      ],
-      "metadata": {},
-      "peak_memory_mb": 4352.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[128,7168,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":64,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
-      "compile_time_ms": 347.0497129999899,
-      "lower_time_ms": 483.65860500001645,
-      "evaluation_times_ms": [
-        13.918945999999998,
-        13.894589,
-        13.908865,
-        13.881563,
-        13.878394
-      ],
-      "metadata": {},
-      "peak_memory_mb": 9472.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[131072,2048]\",\"group_sizes\":{\"num_groups\":131072,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 317.0196869999984,
-      "lower_time_ms": 1413.8906690000113,
-      "evaluation_times_ms": [
-        7.864152,
-        7.846004,
-        7.939941,
-        8.706036,
-        8.8974
-      ],
-      "metadata": {},
-      "peak_memory_mb": 9472.001953125
-    }
-  },
-  "{\"lhs\":\"bf16[131072,768]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 1723.475124999993,
-      "lower_time_ms": 1334.6465309999899,
-      "evaluation_times_ms": [
-        2.5051669999999997,
-        2.503247,
-        2.511056,
-        2.503472,
-        2.5030550000000003
-      ],
-      "metadata": {},
-      "peak_memory_mb": 1472.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[131072,768]\",\"group_sizes\":{\"num_groups\":131072,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
-      "compile_time_ms": 303.60197900000685,
-      "lower_time_ms": 1695.9676100000252,
-      "evaluation_times_ms": [
-        0.747765,
-        0.749174,
-        0.751669,
-        0.75154,
-        0.749876
-      ],
-      "metadata": {},
-      "peak_memory_mb": 1088.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,1536]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 272.73136699994893,
-      "lower_time_ms": 1522.8755100000058,
-      "evaluation_times_ms": [
-        6.35637,
-        6.362896,
-        6.364495,
-        6.375373,
-        6.36955
-      ],
-      "metadata": {},
-      "peak_memory_mb": 4480.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[524288,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
-      "compile_time_ms": 308.6797119999858,
-      "lower_time_ms": 1806.5392719999807,
-      "evaluation_times_ms": [
-        16.946808,
-        16.692617,
-        16.797557,
-        16.797045,
-        16.859753
-      ],
-      "metadata": {},
-      "peak_memory_mb": 7168.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[524288,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 255.05175400002145,
-      "lower_time_ms": 1474.5194300000435,
-      "evaluation_times_ms": [
-        20.71291,
-        20.685939,
-        20.674263,
-        20.654363,
-        20.648316
-      ],
-      "metadata": {},
-      "peak_memory_mb": 7168.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[131072,1536]\",\"group_sizes\":{\"num_groups\":131072,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
-      "compile_time_ms": 554.7130239999944,
-      "lower_time_ms": 980.2080709999927,
-      "evaluation_times_ms": [
-        2.886733,
-        2.886188,
-        2.887436,
-        2.891534,
-        2.892398
-      ],
-      "metadata": {},
-      "peak_memory_mb": 2944.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 284.80720100000667,
-      "lower_time_ms": 1297.1006519999833,
-      "evaluation_times_ms": [
-        4.706422,
-        4.688211,
-        4.6759200000000005,
-        4.683474,
-        4.692628
-      ],
-      "metadata": {},
-      "peak_memory_mb": 4480.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,1536]\",\"rhs\":\"bf16[131072,4096]\",\"group_sizes\":{\"num_groups\":131072,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
-      "compile_time_ms": 378.6721650000118,
-      "lower_time_ms": 1037.4084249999953,
-      "evaluation_times_ms": [
-        2.910415,
-        2.911919,
-        2.9164,
-        2.922352,
-        2.919632
-      ],
-      "metadata": {},
-      "peak_memory_mb": 2944.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 312.384695999981,
-      "lower_time_ms": 1035.0072880000027,
-      "evaluation_times_ms": [
-        20.685368,
-        20.680633,
-        20.674231,
-        20.676567,
-        20.639504
-      ],
-      "metadata": {},
-      "peak_memory_mb": 16640.001953125
-    }
-  },
-  "{\"lhs\":\"bf16[65536,2048]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":65536},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 269.2719009999962,
-      "lower_time_ms": 1175.9576979999906,
-      "evaluation_times_ms": [
-        13.231169999999999,
-        13.223361999999998,
-        13.220897,
-        13.235908,
-        13.234211
-      ],
-      "metadata": {},
-      "peak_memory_mb": 15488.001953125
-    }
-  },
-  "{\"lhs\":\"bf16[65536,7168]\",\"rhs\":\"bf16[65536,2048]\",\"group_sizes\":{\"num_groups\":65536,\"total_size\":65536},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 336.9466240000065,
-      "lower_time_ms": 1420.4149659999814,
-      "evaluation_times_ms": [
-        5.204077,
-        5.196591,
-        5.205261,
-        5.204557,
-        5.195342
-      ],
-      "metadata": {},
-      "peak_memory_mb": 8320.001953125
-    }
-  },
-  "{\"lhs\":\"bf16[131072,512]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 1009.3072829999983,
-      "lower_time_ms": 1010.4309179999973,
-      "evaluation_times_ms": [
-        14.264503000000001,
-        14.269111,
-        14.267479,
-        14.27116,
-        14.26988
-      ],
-      "metadata": {},
-      "peak_memory_mb": 5504.001953125
-    }
-  },
-  "{\"lhs\":\"bf16[262144,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 275.79823499999634,
-      "lower_time_ms": 1352.7632460000234,
-      "evaluation_times_ms": [
-        7.178769,
-        7.193873,
-        7.413821,
-        7.721356,
-        7.850739
-      ],
-      "metadata": {},
-      "peak_memory_mb": 4352.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 251.33759300000236,
-      "lower_time_ms": 1226.0117510000014,
-      "evaluation_times_ms": [
-        10.479525,
-        10.45264,
-        10.396566,
-        10.379443,
-        10.340524
-      ],
-      "metadata": {},
-      "peak_memory_mb": 4352.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[128,7168,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":8,\"num_stages\":6}": {
-      "compile_time_ms": 284.7091459999831,
-      "lower_time_ms": 1026.674992000011,
-      "evaluation_times_ms": [
-        7.810857,
-        7.831118,
-        7.850001,
-        8.476171,
-        8.527252
-      ],
-      "metadata": {},
-      "peak_memory_mb": 5888.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 278.818541999982,
-      "lower_time_ms": 1304.1277469999955,
-      "evaluation_times_ms": [
-        1.141127,
-        1.146023,
-        1.144104,
-        1.147688,
-        1.144264
-      ],
-      "metadata": {},
-      "peak_memory_mb": 1088.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 248.49372299999573,
-      "lower_time_ms": 1480.8676759999742,
-      "evaluation_times_ms": [
-        3.591839,
-        3.595295,
-        3.609538,
-        3.637959,
-        3.641737
-      ],
-      "metadata": {},
-      "peak_memory_mb": 2944.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 257.2752009999988,
-      "lower_time_ms": 1071.5631749999943,
-      "evaluation_times_ms": [
-        5.279897,
-        5.275096,
-        5.269784,
-        5.272664,
-        5.274456
-      ],
-      "metadata": {},
-      "peak_memory_mb": 2944.0009765625
-    }
-  },
-  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 252.3725949999971,
-      "lower_time_ms": 1082.781223000012,
-      "evaluation_times_ms": [
-        8.957152,
-        9.035728,
-        9.176075,
-        9.555734,
-        9.624291
-      ],
-      "metadata": {},
-      "peak_memory_mb": 9472.001953125
-    }
-  },
-  "{\"lhs\":\"bf16[65536,7168]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":65536},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 253.22773700000312,
-      "lower_time_ms": 1164.0255339999896,
-      "evaluation_times_ms": [
-        4.949489,
-        4.927925,
-        4.935187,
-        5.075706,
-        5.081368
-      ],
-      "metadata": {},
-      "peak_memory_mb": 8320.001953125
+      "peak_memory_mb": 7784.631312
     }
   },
   "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
     "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 249.93220599998267,
-      "lower_time_ms": 1681.010786999991,
+      "compile_time_ms": 365.89337000623345,
+      "lower_time_ms": 14877.502126968466,
       "evaluation_times_ms": [
-        2.387324,
-        2.392733,
-        2.404928,
-        2.397342,
-        2.409537
+        2.484229,
+        2.482309,
+        2.485188,
+        2.480133,
+        2.478148
       ],
       "metadata": {},
-      "peak_memory_mb": 3712.001953125
+      "peak_memory_mb": 3892.317184
+    }
+  },
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 361.6543280004407,
+      "lower_time_ms": 8172.457052000027,
+      "evaluation_times_ms": [
+        2.4494700000000003,
+        2.4462699999999997,
+        2.4343339999999998,
+        2.439103,
+        2.460575
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4026.534928
     }
   },
   "{\"lhs\":\"bf16[131072,512]\",\"rhs\":\"bf16[256,512,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
     "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 1035.2236340000047,
-      "lower_time_ms": 773.8429999999994,
+      "compile_time_ms": 1096.2906509994355,
+      "lower_time_ms": 5937.5475169999845,
       "evaluation_times_ms": [
-        12.96573,
-        12.962337,
-        12.966658,
-        12.966081,
-        12.964449
+        13.200882,
+        13.204242,
+        13.204786,
+        13.204178,
+        13.206513999999999
       ],
       "metadata": {},
-      "peak_memory_mb": 3712.001953125
+      "peak_memory_mb": 3892.317184
+    }
+  },
+  "{\"lhs\":\"bf16[131072,512]\",\"rhs\":\"bf16[256,512,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 1082.6018130001103,
+      "lower_time_ms": 7646.038432999376,
+      "evaluation_times_ms": [
+        13.199759,
+        13.207632,
+        13.206064000000001,
+        13.204975000000001,
+        13.205647
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5771.365392
+    }
+  },
+  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 462.18698900065647,
+      "lower_time_ms": 5873.717094999847,
+      "evaluation_times_ms": [
+        4.513408,
+        4.515872,
+        4.514976,
+        4.641342,
+        4.645118
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5905.583104
+    }
+  },
+  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 359.290470000019,
+      "lower_time_ms": 7564.802852000071,
+      "evaluation_times_ms": [
+        4.540387,
+        4.6129739999999995,
+        4.705851,
+        4.709692,
+        4.854641
+      ],
+      "metadata": {},
+      "peak_memory_mb": 6174.018576
+    }
+  },
+  "{\"lhs\":\"bf16[262144,256]\",\"rhs\":\"bf16[256,256,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":256,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":2}": {
+      "compile_time_ms": 1225.7648370000425,
+      "lower_time_ms": 604.9258079997344,
+      "evaluation_times_ms": [
+        22.032771,
+        22.031363000000002,
+        22.029122,
+        22.037282,
+        22.035778
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4831.84128
+    }
+  },
+  "{\"lhs\":\"bf16[262144,256]\",\"rhs\":\"bf16[256,256,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":256,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":2}": {
+      "compile_time_ms": 1300.8663579998938,
+      "lower_time_ms": 492.8387390000353,
+      "evaluation_times_ms": [
+        22.059573,
+        22.065845000000003,
+        22.036693,
+        22.036053000000003,
+        22.041365000000003
+      ],
+      "metadata": {},
+      "peak_memory_mb": 8589.93768
+    }
+  },
+  "{\"lhs\":\"bf16[262144,1024]\",\"rhs\":\"bf16[256,1024,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 370.4875240000547,
+      "lower_time_ms": 1099.2234219997954,
+      "evaluation_times_ms": [
+        27.374151,
+        27.417351,
+        27.421895000000003,
+        27.223657,
+        27.221737
+      ],
+      "metadata": {},
+      "peak_memory_mb": 8053.066752
+    }
+  },
+  "{\"lhs\":\"bf16[262144,1024]\",\"rhs\":\"bf16[256,1024,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 367.33882599992285,
+      "lower_time_ms": 991.2096039997778,
+      "evaluation_times_ms": [
+        27.370852000000003,
+        27.372131,
+        27.386276000000002,
+        27.422211,
+        27.389699
+      ],
+      "metadata": {},
+      "peak_memory_mb": 11811.163152
+    }
+  },
+  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,7168,1024]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 354.3273710001813,
+      "lower_time_ms": 1152.5206619999153,
+      "evaluation_times_ms": [
+        8.819245,
+        8.962826,
+        8.988939,
+        9.342695,
+        9.696451999999999
+      ],
+      "metadata": {},
+      "peak_memory_mb": 8053.066752
+    }
+  },
+  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,7168,1024]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
+      "compile_time_ms": 368.69910699988395,
+      "lower_time_ms": 9255.977814999824,
+      "evaluation_times_ms": [
+        8.803944,
+        8.922089,
+        9.449644000000001,
+        9.778541,
+        9.701676999999998
+      ],
+      "metadata": {},
+      "peak_memory_mb": 8589.93768
     }
   },
   "{\"lhs\":\"bf16[4096,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[4096,0,0,0,0,0,0,0],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
-      "compile_time_ms": 413.073919999988,
-      "lower_time_ms": 1128.4077699999955,
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 422.53750999998374,
+      "lower_time_ms": 1690.953590999925,
       "evaluation_times_ms": [
-        0.20746,
-        0.20717100000000002,
-        0.20845100000000003,
-        0.20800300000000002,
-        0.208355
+        0.20716700000000002,
+        0.20799800000000002,
+        0.20735800000000001,
+        0.20783800000000002,
+        0.20739000000000002
       ],
       "metadata": {},
-      "peak_memory_mb": 320.00006103515625
+      "peak_memory_mb": 335.544416
+    }
+  },
+  "{\"lhs\":\"bf16[4096,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[4096,0,0,0,0,0,0,0],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 449.748720000116,
+      "lower_time_ms": 1437.2167100000297,
+      "evaluation_times_ms": [
+        0.208734,
+        0.210271,
+        0.208702,
+        0.209182,
+        0.208767
+      ],
+      "metadata": {},
+      "peak_memory_mb": 369.098832
     }
   },
   "{\"lhs\":\"bf16[8,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[1,1,1,1,1,1,1,1],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
     "{\"block_m\":8,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 101.3548720000017,
-      "lower_time_ms": 1484.0757050000093,
+      "compile_time_ms": 4291.341773999648,
+      "lower_time_ms": 1396.6320849999647,
       "evaluation_times_ms": [
-        0.088208,
-        0.087921,
-        0.08743899999999999,
-        0.087504,
-        0.08654300000000001
+        0.089375,
+        0.087104,
+        0.08819099999999999,
+        0.08819199999999999,
+        0.088703
       ],
       "metadata": {},
-      "peak_memory_mb": 256.12506103515625
+      "peak_memory_mb": 268.566624
+    }
+  },
+  "{\"lhs\":\"bf16[8,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[1,1,1,1,1,1,1,1],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":32,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 10794.270693999806,
+      "lower_time_ms": 54.58356100007222,
+      "evaluation_times_ms": [
+        0.08828799999999999,
+        0.088543,
+        0.087967,
+        0.08864,
+        0.088351
+      ],
+      "metadata": {},
+      "peak_memory_mb": 268.632144
     }
   },
   "{\"lhs\":\"bf16[8192,4096]\",\"rhs\":\"bf16[8,4096,14336]\",\"group_sizes\":{\"num_groups\":8,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
     "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
-      "compile_time_ms": 345.07894099999703,
-      "lower_time_ms": 1231.6370050000103,
+      "compile_time_ms": 460.36086399999476,
+      "lower_time_ms": 1463.906272999992,
       "evaluation_times_ms": [
-        1.42021,
-        1.422066,
-        1.4269290000000001,
-        1.420786,
-        1.42501
+        1.484248,
+        1.484953,
+        1.484953,
+        1.48876,
+        1.48588
       ],
       "metadata": {},
-      "peak_memory_mb": 1184.0000610351562
+      "peak_memory_mb": 1241.51408
     }
   },
-  "{\"lhs\":\"bf16[262144,2048]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
-    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":8,\"num_stages\":6}": {
-      "compile_time_ms": 60526.53730100002,
-      "lower_time_ms": 1052.5553870000408,
+  "{\"lhs\":\"bf16[8192,4096]\",\"rhs\":\"bf16[8,4096,14336]\",\"group_sizes\":{\"num_groups\":8,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 417.8365049883723,
+      "lower_time_ms": 10560.011880996171,
       "evaluation_times_ms": [
-        51.306553,
-        51.330387,
-        51.38084,
-        51.292315,
-        51.357901
+        1.507557,
+        1.506021,
+        1.50823,
+        1.506534,
+        1.507046
       ],
       "metadata": {},
-      "peak_memory_mb": 18944.001953125
-    },
+      "peak_memory_mb": 1476.395088
+    }
+  },
+  "{\"lhs\":\"bf16[131072,1024]\",\"rhs\":\"bf16[256,7168,1024]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
     "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
-      "compile_time_ms": 289.95196600001805,
-      "lower_time_ms": 1229.3966690000104,
+      "compile_time_ms": 508.63789999857545,
+      "lower_time_ms": 11037.374548002845,
       "evaluation_times_ms": [
-        35.557013,
-        35.432894,
-        35.43763,
-        35.441119,
-        35.444449
+        16.283701,
+        16.283862,
+        16.286678000000002,
+        16.307701,
+        16.302357
       ],
       "metadata": {},
-      "peak_memory_mb": 18944.001953125
+      "peak_memory_mb": 9663.679488
+    }
+  },
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[131072,1024]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 466.1678390111774,
+      "lower_time_ms": 9516.010637002182,
+      "evaluation_times_ms": [
+        3.8874120000000003,
+        3.893204,
+        3.899508,
+        3.949556,
+        3.957109
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5905.583104
+    }
+  },
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,1024,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 393.48179700027686,
+      "lower_time_ms": 11637.618377993931,
+      "evaluation_times_ms": [
+        7.198986,
+        7.229131,
+        7.217163,
+        7.217227,
+        7.202827
+      ],
+      "metadata": {},
+      "peak_memory_mb": 9663.679488
+    }
+  },
+  "{\"lhs\":\"bf16[131072,1024]\",\"rhs\":\"bf16[131072,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
+      "compile_time_ms": 445.35416799772065,
+      "lower_time_ms": 8726.689527989947,
+      "evaluation_times_ms": [
+        4.05919,
+        4.063606,
+        4.052919,
+        4.08511,
+        4.23567
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5905.583104
+    }
+  },
+  "{\"lhs\":\"bf16[131072,512]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 1090.6794450002053,
+      "lower_time_ms": 7609.742267000001,
+      "evaluation_times_ms": [
+        14.387497,
+        14.388842,
+        14.385962,
+        14.41201,
+        14.413097
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5771.365376
+    }
+  },
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[131072,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 457.20730699986234,
+      "lower_time_ms": 9016.485530999944,
+      "evaluation_times_ms": [
+        2.0141709999999997,
+        2.018107,
+        2.016507,
+        2.015611,
+        2.016059
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3892.317184
+    }
+  },
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,512,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 355.0192870000046,
+      "lower_time_ms": 6191.760632000012,
+      "evaluation_times_ms": [
+        3.7264860000000004,
+        3.724055,
+        3.7411740000000004,
+        3.715318,
+        3.723862
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5771.365376
+    }
+  },
+  "{\"lhs\":\"bf16[131072,512]\",\"rhs\":\"bf16[131072,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 455.5858089997855,
+      "lower_time_ms": 10337.3678450007,
+      "evaluation_times_ms": [
+        2.0574779999999997,
+        2.058086,
+        2.070151,
+        2.069031,
+        2.061991
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3892.317184
+    }
+  },
+  "{\"lhs\":\"bf16[262144,512]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 1062.0526929999983,
+      "lower_time_ms": 7278.344981999964,
+      "evaluation_times_ms": [
+        27.528797,
+        27.534749,
+        27.535487,
+        27.587179000000003,
+        27.588651000000002
+      ],
+      "metadata": {},
+      "peak_memory_mb": 7784.631296
+    }
+  },
+  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[262144,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 607.7001080000173,
+      "lower_time_ms": 5347.552042999951,
+      "evaluation_times_ms": [
+        3.486952,
+        3.4882969999999998,
+        3.485705,
+        3.489065,
+        3.4922
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5905.583104
+    }
+  },
+  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,256,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":2}": {
+      "compile_time_ms": 414.6776640000098,
+      "lower_time_ms": 7164.877373000081,
+      "evaluation_times_ms": [
+        3.181708,
+        3.1642680000000003,
+        3.1644919999999996,
+        3.169709,
+        3.165644
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5771.365376
+    }
+  },
+  "{\"lhs\":\"bf16[262144,256]\",\"rhs\":\"bf16[262144,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 438.8124380000136,
+      "lower_time_ms": 9170.125593999956,
+      "evaluation_times_ms": [
+        1.922258,
+        1.9198259999999998,
+        1.920596,
+        1.919986,
+        1.917395
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4831.84128
+    }
+  },
+  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,1024,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
+      "compile_time_ms": 355.7995639998808,
+      "lower_time_ms": 7212.141054000085,
+      "evaluation_times_ms": [
+        11.390296000000001,
+        11.401012999999999,
+        11.745001,
+        12.010768,
+        11.941533
+      ],
+      "metadata": {},
+      "peak_memory_mb": 11811.163136
+    }
+  },
+  "{\"lhs\":\"bf16[262144,1024]\",\"rhs\":\"bf16[262144,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
+      "compile_time_ms": 606.9667189999564,
+      "lower_time_ms": 7481.186380000054,
+      "evaluation_times_ms": [
+        6.818551,
+        7.002228,
+        6.9995080000000005,
+        7.003699,
+        7.427341
+      ],
+      "metadata": {},
+      "peak_memory_mb": 8053.066752
+    }
+  },
+  "{\"lhs\":\"bf16[327680,2880]\",\"rhs\":\"bf16[327680,2880]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":327680},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
+      "compile_time_ms": 587.5509440002133,
+      "lower_time_ms": 9058.914592000292,
+      "evaluation_times_ms": [
+        9.151617,
+        9.58419,
+        9.628574,
+        9.901404,
+        9.898363999999999
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5898.241536
+    }
+  },
+  "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 1870.5184359996565,
+      "lower_time_ms": 7863.420103999488,
+      "evaluation_times_ms": [
+        6.997092,
+        7.001636,
+        6.999524,
+        6.998851,
+        6.994852
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3019.900416
+    }
+  },
+  "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[393216,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 601.92995899979,
+      "lower_time_ms": 8148.347305000243,
+      "evaluation_times_ms": [
+        1.873583,
+        1.867887,
+        1.869839,
+        1.874127,
+        1.876815
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2617.247232
+    }
+  },
+  "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[128,768,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 365.8112359998995,
+      "lower_time_ms": 5119.065537000097,
+      "evaluation_times_ms": [
+        3.63536,
+        3.636512,
+        3.628864,
+        3.6272640000000003,
+        3.633024
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3019.900416
+    }
+  },
+  "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[393216,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 594.0019170002415,
+      "lower_time_ms": 7945.777061999252,
+      "evaluation_times_ms": [
+        1.862127,
+        1.863375,
+        1.864912,
+        1.860528,
+        1.865424
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2617.247232
+    }
+  },
+  "{\"lhs\":\"bf16[524288,7168]\",\"rhs\":\"bf16[524288,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":256,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":8,\"num_stages\":5}": {
+      "compile_time_ms": 461.45103000003473,
+      "lower_time_ms": 1283.7525180000284,
+      "evaluation_times_ms": [
+        27.186574,
+        28.342296,
+        28.254898,
+        27.952331,
+        28.385324
+      ],
+      "metadata": {},
+      "peak_memory_mb": 17179.872256
+    }
+  },
+  "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 352.162073000045,
+      "lower_time_ms": 994.4905500001369,
+      "evaluation_times_ms": [
+        11.441702,
+        11.440965,
+        11.454657999999998,
+        11.451236,
+        11.462652
+      ],
+      "metadata": {},
+      "peak_memory_mb": 6174.017024
+    }
+  },
+  "{\"lhs\":\"bf16[262144,4096]\",\"rhs\":\"bf16[262144,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
+      "compile_time_ms": 654.6713030002138,
+      "lower_time_ms": 1203.6972009998408,
+      "evaluation_times_ms": [
+        5.4278439999999994,
+        5.49179,
+        5.510152,
+        5.570996999999999,
+        5.582991
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4563.404288
+    }
+  },
+  "{\"lhs\":\"bf16[262144,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 354.29124000006595,
+      "lower_time_ms": 1217.9925819998516,
+      "evaluation_times_ms": [
+        7.902616,
+        7.8937230000000005,
+        8.173659,
+        8.256414,
+        8.220522
+      ],
+      "metadata": {},
+      "peak_memory_mb": 6174.017024
+    }
+  },
+  "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[262144,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
+      "compile_time_ms": 13216.563193999946,
+      "lower_time_ms": 56.60235300001659,
+      "evaluation_times_ms": [
+        5.160972,
+        5.092015999999999,
+        5.103022999999999,
+        5.219081999999999,
+        5.2388889999999995
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4563.404288
+    }
+  },
+  "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[131072,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 446.64522795937955,
+      "lower_time_ms": 15733.256341074593,
+      "evaluation_times_ms": [
+        2.852224,
+        2.852032,
+        2.852352,
+        2.851264,
+        2.982208
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3087.00928
+    }
+  },
+  "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 348.0521240271628,
+      "lower_time_ms": 11541.405449970625,
+      "evaluation_times_ms": [
+        4.610533,
+        4.613637,
+        4.693957,
+        4.683333,
+        4.685669
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4697.622016
+    }
+  },
+  "{\"lhs\":\"bf16[131072,1536]\",\"rhs\":\"bf16[131072,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 426.56700196675956,
+      "lower_time_ms": 10678.042248939164,
+      "evaluation_times_ms": [
+        2.909635,
+        2.907715,
+        2.910083,
+        2.9212830000000003,
+        2.916131
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3087.00928
+    }
+  },
+  "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {},
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[131072,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 440.8591939136386,
+      "lower_time_ms": 12311.034488957375,
+      "evaluation_times_ms": [
+        7.663754,
+        7.9350499999999995,
+        8.262922000000001,
+        8.739593999999999,
+        8.700778999999999
+      ],
+      "metadata": {},
+      "peak_memory_mb": 9932.114944
+    }
+  },
+  "{\"lhs\":\"bf16[65536,2048]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":65536},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 377.6513100001466,
+      "lower_time_ms": 6926.844222999989,
+      "evaluation_times_ms": [
+        13.292663,
+        13.285143,
+        13.291158000000001,
+        13.281879,
+        13.306358
+      ],
+      "metadata": {},
+      "peak_memory_mb": 16240.34816
+    }
+  },
+  "{\"lhs\":\"bf16[65536,7168]\",\"rhs\":\"bf16[65536,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":65536},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 440.2391940002417,
+      "lower_time_ms": 9538.113946000067,
+      "evaluation_times_ms": [
+        4.932404,
+        4.92242,
+        4.933717,
+        5.011284,
+        5.370483
+      ],
+      "metadata": {},
+      "peak_memory_mb": 8724.155392
+    }
+  },
+  "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 323.99739300035435,
+      "lower_time_ms": 5020.380944999943,
+      "evaluation_times_ms": [
+        3.374749,
+        3.3823,
+        3.378492,
+        3.385276,
+        3.381725
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2617.247232
+    }
+  },
+  "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 328.930992000096,
+      "lower_time_ms": 8065.007126000182,
+      "evaluation_times_ms": [
+        3.380862,
+        3.380573,
+        3.388477,
+        3.3930860000000003,
+        3.40147
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3221.227024
+    }
+  },
+  "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[128,768,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 1777.8533730001982,
+      "lower_time_ms": 7606.146693000028,
+      "evaluation_times_ms": [
+        6.754301,
+        6.750044,
+        6.754268,
+        6.755292,
+        6.756189
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2617.247232
+    }
+  },
+  "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[128,768,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 1789.0652589999263,
+      "lower_time_ms": 6179.661486999976,
+      "evaluation_times_ms": [
+        6.769918,
+        6.767262,
+        6.767773999999999,
+        6.768126,
+        6.767742
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4227.859984
+    }
+  },
+  "{\"lhs\":\"bf16[524288,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 348.2382530000905,
+      "lower_time_ms": 9618.797180000001,
+      "evaluation_times_ms": [
+        14.177726,
+        15.564958,
+        16.13443,
+        16.654654,
+        16.079775
+      ],
+      "metadata": {},
+      "peak_memory_mb": 7516.194304
+    }
+  },
+  "{\"lhs\":\"bf16[524288,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 398.8381330000266,
+      "lower_time_ms": 1207.7953329999218,
+      "evaluation_times_ms": [
+        14.6287,
+        15.847833000000001,
+        15.839929000000001,
+        16.240792,
+        16.409048000000002
+      ],
+      "metadata": {},
+      "peak_memory_mb": 9126.807056
+    }
+  },
+  "{\"lhs\":\"bf16[524288,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 432.2114840000495,
+      "lower_time_ms": 5823.74414100002,
+      "evaluation_times_ms": [
+        20.643987,
+        20.642771,
+        20.638513,
+        20.767827,
+        20.766979
+      ],
+      "metadata": {},
+      "peak_memory_mb": 7516.194304
+    }
+  },
+  "{\"lhs\":\"bf16[524288,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 338.50582399998075,
+      "lower_time_ms": 7976.695890999963,
+      "evaluation_times_ms": [
+        20.640711999999997,
+        20.654092000000002,
+        20.763181000000003,
+        20.736710000000002,
+        20.726531
+      ],
+      "metadata": {},
+      "peak_memory_mb": 11811.161616
+    }
+  },
+  "{\"lhs\":\"bf16[524288,7168]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":2}": {
+      "compile_time_ms": 407.8372339999987,
+      "lower_time_ms": 7274.1008879997935,
+      "evaluation_times_ms": [
+        36.664002,
+        37.226946999999996,
+        38.171427,
+        40.405308,
+        40.084047
+      ],
+      "metadata": {},
+      "peak_memory_mb": 17179.872256
+    }
+  },
+  "{\"lhs\":\"bf16[524288,7168]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":2}": {
+      "compile_time_ms": 370.20231099995726,
+      "lower_time_ms": 8751.531686000135,
+      "evaluation_times_ms": [
+        35.82555,
+        36.615604000000005,
+        36.973177,
+        37.213176,
+        36.455961
+      ],
+      "metadata": {},
+      "peak_memory_mb": 19327.35592
+    }
+  },
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[128,7168,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":64,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 428.52765299903695,
+      "lower_time_ms": 5423.600737000015,
+      "evaluation_times_ms": [
+        7.9246929999999995,
+        7.989909999999999,
+        8.176566000000001,
+        8.228534,
+        8.247638
+      ],
+      "metadata": {},
+      "peak_memory_mb": 6710.887952
+    }
+  },
+  "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 388.593491001302,
+      "lower_time_ms": 9827.388391999193,
+      "evaluation_times_ms": [
+        1.1504670000000001,
+        1.153059,
+        1.150884,
+        1.152068,
+        1.156963
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1140.852224
+    }
+  },
+  "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 337.27213199927064,
+      "lower_time_ms": 8386.069551001128,
+      "evaluation_times_ms": [
+        1.152388,
+        1.151875,
+        1.148772,
+        1.1508829999999999,
+        1.1564510000000001
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1342.178832
+    }
+  },
+  "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 377.59945300012987,
+      "lower_time_ms": 14484.971591999965,
+      "evaluation_times_ms": [
+        3.54998,
+        3.548828,
+        3.5684750000000003,
+        3.54998,
+        3.723866
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3087.00928
+    }
+  },
+  "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 376.91545500001666,
+      "lower_time_ms": 10074.343925000221,
+      "evaluation_times_ms": [
+        3.552699,
+        3.550588,
+        3.592251,
+        3.5941710000000002,
+        3.602011
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3489.66248
+    }
+  },
+  "{\"lhs\":\"bf16[131072,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 373.5958840698004,
+      "lower_time_ms": 13887.242227094248,
+      "evaluation_times_ms": [
+        5.2961339999999995,
+        5.304069999999999,
+        5.302822,
+        5.29447,
+        5.2987269999999995
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3087.00928
+    }
+  },
+  "{\"lhs\":\"bf16[131072,1536]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 347.48240001499653,
+      "lower_time_ms": 6620.728573994711,
+      "evaluation_times_ms": [
+        5.264176,
+        5.2683349999999995,
+        5.271503,
+        5.285263,
+        5.278351
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4160.75112
+    }
+  },
+  "{\"lhs\":\"bf16[131072,7168]\",\"rhs\":\"bf16[256,7168,2048]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":2}": {
+      "compile_time_ms": 498.66986204870045,
+      "lower_time_ms": 11318.178543122485,
+      "evaluation_times_ms": [
+        8.966218000000001,
+        9.187563,
+        9.582700999999998,
+        9.836879,
+        9.841645999999999
+      ],
+      "metadata": {},
+      "peak_memory_mb": 9932.114944
     }
   }
 }

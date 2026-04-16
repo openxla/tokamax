@@ -1,77 +1,77 @@
 {
   "{\"residuals\":[\"f32[384,384,1]\",\"f32[384,384,1]\"],\"out\":\"bf16[384,384,64]\",\"dout\":\"bf16[384,384,64]\",\"x\":\"bf16[384,384,64]\",\"scale\":\"f32[64]\",\"offset\":\"f32[64]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
-    "{\"block_m\":128,\"block_n\":null,\"num_warps\":4}": {
-      "compile_time_ms": 314.4126459956169,
-      "lower_time_ms": 2076.0096289450303,
+    "{\"block_m\":32,\"block_n\":null,\"num_warps\":2}": {
+      "compile_time_ms": 219.3552510580048,
+      "lower_time_ms": 1568.767281016335,
       "evaluation_times_ms": [
-        0.028832,
-        0.028415999999999997,
-        0.029056,
-        0.02848,
-        0.02864
+        0.025696,
+        0.025664,
+        0.025952,
+        0.025632,
+        0.025888
       ],
       "metadata": {},
-      "peak_memory_mb": 73.6884994506836
+      "peak_memory_mb": 79.053848
     }
   },
   "{\"residuals\":[\"f32[384,384,1]\",\"f32[384,384,1]\"],\"out\":\"bf16[384,384,128]\",\"dout\":\"bf16[384,384,128]\",\"x\":\"bf16[384,384,128]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
-    "{\"block_m\":64,\"block_n\":null,\"num_warps\":4}": {
-      "compile_time_ms": 318.15284700132906,
-      "lower_time_ms": 1425.3124709939584,
+    "{\"block_m\":32,\"block_n\":null,\"num_warps\":2}": {
+      "compile_time_ms": 307.52625000002354,
+      "lower_time_ms": 7591.836272999899,
       "evaluation_times_ms": [
-        0.064289,
-        0.063968,
-        0.065409,
-        0.063424,
-        0.064672
+        0.054061,
+        0.054861999999999994,
+        0.053678000000000003,
+        0.053742,
+        0.053165
       ],
       "metadata": {},
-      "peak_memory_mb": 147.3769760131836
+      "peak_memory_mb": 156.928024
     }
   },
   "{\"residuals\":[\"f32[768,768,1]\",\"f32[768,768,1]\"],\"out\":\"bf16[768,768,128]\",\"dout\":\"bf16[768,768,128]\",\"x\":\"bf16[768,768,128]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
-    "{\"block_m\":32,\"block_n\":null,\"num_warps\":2}": {
-      "compile_time_ms": 337.24982501007617,
-      "lower_time_ms": 1414.7553690127097,
+    "{\"block_m\":64,\"block_n\":null,\"num_warps\":4}": {
+      "compile_time_ms": 313.536474999637,
+      "lower_time_ms": 397.7484350002669,
       "evaluation_times_ms": [
-        0.272961,
-        0.275489,
-        0.27369699999999997,
-        0.272577,
-        0.27398500000000003
+        0.179039,
+        0.177663,
+        0.17827099999999999,
+        0.17795,
+        0.17833500000000002
       ],
       "metadata": {},
-      "peak_memory_mb": 598.5644760131836
+      "peak_memory_mb": 618.170392
     }
   },
   "{\"residuals\":[\"f32[1,384,384]\",\"f32[1,384,384]\"],\"out\":\"bf16[128,384,384]\",\"dout\":\"bf16[128,384,384]\",\"x\":\"bf16[128,384,384]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":0,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
     "{\"block_m\":1,\"block_n\":64,\"num_warps\":4}": {
-      "compile_time_ms": 280.127763049677,
-      "lower_time_ms": 812.3656200477853,
+      "compile_time_ms": 273.68243399905623,
+      "lower_time_ms": 8901.526566998655,
       "evaluation_times_ms": [
-        0.055616000000000006,
-        0.056704000000000004,
-        0.055712,
-        0.05632,
-        0.055296
+        0.053728000000000005,
+        0.05376,
+        0.053888,
+        0.053184999999999996,
+        0.054144
       ],
       "metadata": {},
-      "peak_memory_mb": 147.3769760131836
+      "peak_memory_mb": 154.53596
     }
   },
   "{\"residuals\":[\"f32[1,768,768]\",\"f32[1,768,768]\"],\"out\":\"bf16[128,768,768]\",\"dout\":\"bf16[128,768,768]\",\"x\":\"bf16[128,768,768]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":0,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":false}": {
     "{\"block_m\":1,\"block_n\":64,\"num_warps\":4}": {
-      "compile_time_ms": 287.6436520018615,
-      "lower_time_ms": 805.6229939684272,
+      "compile_time_ms": 276.5931070002807,
+      "lower_time_ms": 8653.72975299988,
       "evaluation_times_ms": [
-        0.210977,
-        0.210209,
-        0.21129699999999998,
-        0.20976099999999998,
-        0.209313
+        0.20144,
+        0.201536,
+        0.201888,
+        0.201023,
+        0.201152
       ],
       "metadata": {},
-      "peak_memory_mb": 589.5019760131836
+      "peak_memory_mb": 618.137624
     }
   }
 }
