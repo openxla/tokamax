@@ -108,7 +108,8 @@ def _get_op_name(loc: ir.Location) -> str:
   if isinstance(loc, ir.CallSiteLoc):
     return _get_op_name(loc.callee)
   if isinstance(loc, ir.FusedLoc):
-    return ';'.join(filter(bool, map(_get_op_name, loc.locations)))
+    locs = cast(list[ir.Location], loc.locations)
+    return ';'.join(filter(bool, map(_get_op_name, locs)))
   return ''
 
 
@@ -164,6 +165,7 @@ def _get_source_file_line(loc: ir.Location) -> tuple[str, int]:
     return _get_source_file_line(loc.callee)
   if isinstance(loc, ir.FusedLoc):
     for inner_loc in reversed(loc.locations):
+      assert isinstance(inner_loc, ir.Location)
       file, line = _get_source_file_line(inner_loc)
       if file:
         return file, line

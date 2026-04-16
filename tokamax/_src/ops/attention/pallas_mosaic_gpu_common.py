@@ -31,6 +31,7 @@ from tokamax._src import precision as precision_lib
 from tokamax._src import shape as shape_lib
 
 
+CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
 
 
@@ -105,7 +106,7 @@ def cast_qkv(
     q: jax.Array | QArray,
     k: jax.Array | QArray,
     v: jax.Array | QArray,
-    precision: tuple[jax.lax.DotAlgorithmPreset, jax.lax.DotAlgorithmPreset],
+    precision: tuple[CanonicalPrecision, CanonicalPrecision],
 ) -> tuple[jax.Array | QArray, jax.Array | QArray, jax.Array | QArray]:
   """Casts Q, K, and V to the given precision."""
 
@@ -118,7 +119,6 @@ def cast_qkv(
     raise NotImplementedError(f"Unsupported precision: {precision}")
 
   q_k_dot_precision, p_v_dot_precision = precision
-  # Ensure precision is not `DotAlgorithmPreset.DEFAULT`.
   q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
       q.dtype, k.dtype, q_k_dot_precision
   )

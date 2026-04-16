@@ -81,13 +81,13 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support returning residuals from mosaic GPU kernel.
 
-    if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
-      rhs = rhs.mT  # TODO: Fuse transpose into kernel.
-      ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
-
     # None of the kernels support zero point yet.
     lhs = quantization.as_array_or_qarray_without_zero_point(lhs)
     rhs = quantization.as_array_or_qarray_without_zero_point(rhs)
+
+    if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
+      rhs = rhs.mT  # TODO: Fuse transpose into kernel.
+      ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
     fn = None
 
@@ -162,8 +162,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       )
 
     dot_out = fn(
-        lhs,
-        rhs,
+        lhs,  # pyrefly: ignore[bad-argument-type]
+        rhs,  # pyrefly: ignore[bad-argument-type]
         group_sizes,
         preferred_element_type,
         config,
