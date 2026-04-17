@@ -90,7 +90,7 @@ def get_vjp_taking_residuals(
       # inputs from being shadowed.
       for i, var in enumerate(eqn.outvars):
         if var in residual_vars:
-          eqn.outvars[i] = jax.core.DropVar(var.aval)
+          eqn.outvars[i] = jex.core.DropVar(var.aval)
       eqns.append(eqn)  # `eqn` is still present in VJP function.
     else:
       banned_vars |= set(eqn.outvars) - set(residual_vars)
