@@ -277,9 +277,21 @@ def ragged_dot_quantized_kernel(
                   def wait_x_consumed():
                     plgpu.barrier_wait(x_consumed_barrier.at[si])
 
-                  plgpu.copy_gmem_to_smem(
-                      x_gmem.at[ms, ks], x_smem.at[si], x_barrier.at[si]
-                  )
+                  end = start_within_block + actual_size
+
+                  # Load the smallest power-of-two size that includes all of the
+                  # rows we need.
+                  def cp_rec(size):
+                    cp = lambda: plgpu.copy_gmem_to_smem(
+                        x_gmem.at[pl.ds(block_start, size), ks],
+                        x_smem.at[si, :size],
+                        x_barrier.at[si],
+                    )
+                    if size == block_m:
+                      return cp()
+                    return lax.cond(end <= size, cp, lambda: cp_rec(size * 2))
+
+                  cp_rec(8)
 
               @pl.when(warp_id == 2)
               def o_tma_warp():
