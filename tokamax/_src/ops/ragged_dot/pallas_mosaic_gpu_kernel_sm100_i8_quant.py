@@ -656,6 +656,7 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
       grid_names=("sm",),
       cluster=(1 + collective,),
       cluster_names=("x",),
+      kernel_name="ragged_dot_i8_quant_sm100",
       compiler_params=plgpu.CompilerParams(
           approx_math=True,
           unsafe_no_auto_barriers=True,

@@ -410,6 +410,7 @@ def ragged_dot_quantized_kernel(
       thread_name="wg",
       grid=grid,
       grid_names=grid_names,
+      kernel_name="ragged_dot_quant_sm90",
       compiler_params=plgpu.CompilerParams(
           approx_math=True,
           unsafe_no_auto_barriers=True,

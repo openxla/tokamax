@@ -575,6 +575,7 @@ def flash_attention_kernel(
       compiler_params=plgpu.CompilerParams(
           approx_math=True, unsafe_no_auto_barriers=True
       ),
+      kernel_name="flash_attention_sm90",
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
   residuals = tuple(res[..., :q_seq_len] for res in residuals)

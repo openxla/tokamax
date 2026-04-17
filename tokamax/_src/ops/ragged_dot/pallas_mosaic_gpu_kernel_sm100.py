@@ -241,6 +241,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       grid_names=("mn",),
       cluster=(1 + collective,),
       cluster_names=("cluster",),
+      kernel_name="ragged_dot_sm100",
       compiler_params=plgpu.CompilerParams(
           approx_math=True,
           unsafe_no_auto_barriers=True,

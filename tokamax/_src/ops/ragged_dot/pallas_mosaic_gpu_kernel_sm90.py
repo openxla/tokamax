@@ -170,6 +170,7 @@ def ragged_dot_kernel(
       out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
       grid=grid,
       grid_names=grid_names,
+      kernel_name="ragged_dot_sm90",
       compiler_params=plgpu.CompilerParams(
           approx_math=True, unsafe_no_auto_barriers=True
       ),
@@ -271,6 +272,7 @@ def ragged_contracting_dim_dot_kernel(
       out_shape=jax.ShapeDtypeStruct((g, m, n), out_dtype),
       grid=(pl.cdiv(m, config.block_m), pl.cdiv(n, config.block_n), g),
       grid_names=("m", "n", "g"),
+      kernel_name="ragged_contracting_dim_dot_sm90",
   )
 
   group_sizes_starts = jnp.cumulative_sum(group_sizes, include_initial=True)

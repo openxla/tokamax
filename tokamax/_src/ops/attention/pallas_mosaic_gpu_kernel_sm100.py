@@ -855,6 +855,7 @@ def flash_attention_kernel(
       cluster=(1 + collective,),
       cluster_names=("cluster",),
       compiler_params=compiler_params,
+      kernel_name="flash_attention_sm100",
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
   residuals = tuple(res[..., :q_seq_len] for res in residuals)
