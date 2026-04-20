@@ -50,6 +50,62 @@ def _chunked_xla_test_cases():
 class ChunkedXlaTest(parameterized.TestCase):
 
   @parameterized.named_parameters(*_chunked_xla_test_cases())
+  def test_fwd_matches_reference(
+      self,
+      reduction,
+      dtype,
+      preferred_element_type,
+      b_dim=256,
+      h_dim=1024,
+      v_dim=2048,
+      b_block_sz=128,
+      v_block_sz=256,
+  ):
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(42), b_dim, h_dim, v_dim, dtype=dtype
+    )
+
+    chunked_loss, chunked_lse = (
+        chunked_xla.linear_softmax_cross_entropy_loss_fwd_chunked_xla(
+            x,
+            labels,
+            w,
+            b_block_sz=b_block_sz,
+            v_block_sz=v_block_sz,
+            reduction=reduction,
+            preferred_element_type=preferred_element_type,
+        )
+    )
+
+    ref_loss, ref_lse = (
+        reference.linear_softmax_cross_entropy_loss_fwd_reference(
+            x, labels, w, reduction=reduction
+        )
+    )
+
+    is_mixed_precision = (
+        preferred_element_type is not None and dtype != preferred_element_type
+    )
+    is_gpu_f16_sum = (
+        jax.default_backend() == "gpu"
+        and reduction == "sum"
+        and dtype == jnp.float16
+    )
+
+    if is_mixed_precision or is_gpu_f16_sum:
+      atol = rtol = 0.15
+    else:
+      atol = rtol = 1e-3
+    self.assertTrue(
+        jnp.allclose(chunked_loss, ref_loss, atol=atol, rtol=rtol),
+        f"Loss mismatch: max diff {jnp.max(jnp.abs(chunked_loss - ref_loss))}",
+    )
+    self.assertTrue(
+        jnp.allclose(chunked_lse, ref_lse, atol=atol, rtol=rtol),
+        f"LSE mismatch: max diff {jnp.max(jnp.abs(chunked_lse - ref_lse))}",
+    )
+
+  @parameterized.named_parameters(*_chunked_xla_test_cases())
   def test_bwd_matches_reference(
       self,
       reduction,
