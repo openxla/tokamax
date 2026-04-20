@@ -15,6 +15,7 @@
 
 """Tests for chunked XLA implementation of linear softmax cross-entropy loss."""
 
+import itertools
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -24,40 +25,46 @@ from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import test_utils
 
 
+def _chunked_xla_test_cases():
+  reductions = ["sum", "mean"]
+  types = [
+      ("f16", jnp.float16, None),
+      ("f32", jnp.float32, None),
+      ("f16_f16", jnp.float16, jnp.float16),
+      ("f32_f32", jnp.float32, jnp.float32),
+      ("f16_f32", jnp.float16, jnp.float32),
+  ]
+
+  for reduction, (type_name, dtype, pref_type) in itertools.product(
+      reductions,
+      types,
+  ):
+    yield dict(
+        testcase_name=f"{reduction}_{type_name}",
+        reduction=reduction,
+        dtype=dtype,
+        preferred_element_type=pref_type,
+    )
+
+
 class ChunkedXlaTest(parameterized.TestCase):
 
-  @parameterized.named_parameters(
-      dict(
-          testcase_name="small",
-          b_dim=128,
-          h_dim=512,
-          v_dim=1024,
-          reduction="sum",
-          b_block_sz=64,
-          v_block_sz=128,
-      ),
-      dict(
-          testcase_name="medium",
-          b_dim=256,
-          h_dim=1024,
-          v_dim=2048,
-          reduction="mean",
-          b_block_sz=128,
-          v_block_sz=256,
-      ),
-  )
+  @parameterized.named_parameters(*_chunked_xla_test_cases())
   def test_bwd_matches_reference(
-      self, b_dim, h_dim, v_dim, reduction, b_block_sz, v_block_sz
+      self,
+      reduction,
+      dtype,
+      preferred_element_type,
+      b_dim=256,
+      h_dim=1024,
+      v_dim=2048,
+      b_block_sz=128,
+      v_block_sz=256,
   ):
     x, labels, w = test_utils.generate_random_data(
-        jax.random.key(42), b_dim, h_dim, v_dim
+        jax.random.key(42), b_dim, h_dim, v_dim, dtype=dtype
     )
-    # We need LSE from forward pass for the backward pass.
-    # We can use the reference forward pass to get it.
-    _, lse = reference.linear_softmax_cross_entropy_loss_fwd_reference(
-        x, labels, w, reduction=reduction
-    )
-
+    lse = jax.nn.logsumexp(x @ w, axis=-1)
     dout = jnp.array(1.0, dtype=x.dtype)
 
     # Run chunked XLA backward
@@ -71,6 +78,7 @@ class ChunkedXlaTest(parameterized.TestCase):
             b_block_sz=b_block_sz,
             v_block_sz=v_block_sz,
             reduction=reduction,
+            preferred_element_type=preferred_element_type,
         )
     )
 
@@ -79,8 +87,21 @@ class ChunkedXlaTest(parameterized.TestCase):
         dout, lse, x, labels, w, reduction=reduction
     )
 
-    atol = 3e-2
-    rtol = 3e-2
+    # Use looser tolerances for mixed precision or when accumulating float16
+    # sums on GPU.
+    is_mixed_precision = (
+        preferred_element_type is not None and dtype != preferred_element_type
+    )
+    is_gpu_f16_sum = (
+        jax.default_backend() == "gpu"
+        and reduction == "sum"
+        and dtype == jnp.float16
+    )
+
+    if is_mixed_precision or is_gpu_f16_sum:
+      atol = rtol = 0.15
+    else:
+      atol = rtol = 3e-3
     self.assertTrue(
         jnp.allclose(chunked_dx, ref_dx, atol=atol, rtol=rtol),
         f"dX mismatch: max diff {jnp.max(jnp.abs(chunked_dx - ref_dx))}",

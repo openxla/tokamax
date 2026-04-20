@@ -45,7 +45,12 @@ class Config:
 
 @functools.partial(
     jax.jit,
-    static_argnames=("b_block_sz", "v_block_sz", "reduction"),
+    static_argnames=(
+        "b_block_sz",
+        "v_block_sz",
+        "reduction",
+        "preferred_element_type",
+    ),
 )
 def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     dout: Real[Array, ""],
@@ -57,6 +62,7 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     b_block_sz: int = 1024,
     v_block_sz: int = 2048,
     reduction: Literal["sum", "mean"] = "sum",
+    preferred_element_type: jax.typing.DTypeLike | None = None,
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """The chunked XLA implementation of linear softmax cross-entropy loss backward pass.
 
@@ -72,10 +78,14 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     b_block_sz: The block size for the batch dimension.
     v_block_sz: The block size for the vocabulary dimension.
     reduction: The reduction method ("sum" or "mean").
+    preferred_element_type: The preferred element type for computation.
 
   Returns:
     A tuple (dx, dw).
   """
+  if preferred_element_type is not None:
+    preferred_element_type = jnp.dtype(preferred_element_type)
+
   b_dim, h_dim = x.shape
   _, v_dim = w.shape
   dtype = x.dtype
@@ -107,31 +117,33 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
       v_start = j * v_block_sz
 
       w_v = jax.lax.dynamic_slice(w_padded, (0, v_start), (h_dim, v_block_sz))
-      logits_bv = x_b @ w_v
+      logits_bv = jnp.dot(
+          x_b, w_v, preferred_element_type=preferred_element_type
+      )
 
       labels_one_hot_bv = jax.nn.one_hot(
           labels_b - v_start, v_block_sz, dtype=dtype
       )
       s_bv = jnp.exp(logits_bv - lse_b[:, None]) - labels_one_hot_bv
-      s_bv = s_bv.astype(dtype)
 
-      dx_b += s_bv @ w_v.T
-
-      dw_v = (
-          jax.lax.dynamic_slice(dw_acc, (0, v_start), (h_dim, v_block_sz))
-          + x_b.T @ s_bv
+      dx_b += jnp.dot(
+          s_bv, w_v.T, preferred_element_type=preferred_element_type
       )
+
+      dw_v = jax.lax.dynamic_slice(
+          dw_acc, (0, v_start), (h_dim, v_block_sz)
+      ) + jnp.dot(x_b.T, s_bv, preferred_element_type=preferred_element_type)
       dw_acc = jax.lax.dynamic_update_slice(dw_acc, dw_v, (0, v_start))
       return dx_b, dw_acc
 
-    dx_b_init = jnp.zeros((b_block_sz, h_dim), dtype=dtype)
+    dx_b_init = jnp.zeros((b_block_sz, h_dim), dtype=preferred_element_type)
     dx_b, dw = jax.lax.fori_loop(0, num_v_blocks, v_loop_body, (dx_b_init, dw))
 
     dx = jax.lax.dynamic_update_slice(dx, dx_b, (b_start, 0))
     return dx, dw
 
-  dx_init = jnp.zeros((b_dim_padded, h_dim), dtype=dtype)
-  dw_init = jnp.zeros((h_dim, v_dim_padded), dtype=dtype)
+  dx_init = jnp.zeros((b_dim_padded, h_dim), dtype=preferred_element_type)
+  dw_init = jnp.zeros((h_dim, v_dim_padded), dtype=preferred_element_type)
   dx, dw = jax.lax.fori_loop(0, num_b_blocks, b_loop_body, (dx_init, dw_init))
 
   dx = dx[:b_dim, :]
@@ -141,7 +153,7 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     dx /= b_dim
     dw /= b_dim
 
-  return dx * dout, dw * dout
+  return (dx * dout).astype(x.dtype), (dw * dout).astype(w.dtype)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
