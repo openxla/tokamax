@@ -56,7 +56,9 @@ TimingMethod: TypeAlias = Literal[
 
 logger = logging.getLogger(__name__)
 
-WORKLOAD_ARTIFACTS_DIR_VARNAME: Final[str] = 'WORKLOAD_ARTIFACTS_DIR'  # for CI
+# for CI
+WORKLOAD_ARTIFACTS_DIR_VARNAME: Final[str] = 'WORKLOAD_ARTIFACTS_DIR'
+RETAIN_ARTIFACTS_VARNAME: Final[str] = 'TOKAMAX_DUMP_XPROF'
 
 
 def get_tempdir(
@@ -154,6 +156,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     self._profiler_wallclock_time: float | None = None
     self._profile_tempdir: pathlib.Path | None = None
     self._xprof_session_kwargs = xprof_session_kwargs
+    self._retain_artifacts = False
 
   @property
   def total_op_time(self) -> datetime.timedelta:
@@ -211,6 +214,9 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     return datetime.timedelta(microseconds=duration_ns / 1000.0)
 
   def __enter__(self):
+    self._retain_artifacts = os.environ.get(
+        RETAIN_ARTIFACTS_VARNAME, 'false'
+    ).lower() in ['true', '1', 't', 'y', 'yes']
     if self._jax_profiler_mode:
       try:
         root_dir = os.environ.get(WORKLOAD_ARTIFACTS_DIR_VARNAME, None)
@@ -262,7 +268,8 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       self._profile = jax.profiler.ProfileData.from_serialized_xspace(
           profile_path.read_bytes()
       )
-      if WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ:
+      if (not self._retain_artifacts
+          or WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ):
         if self._profile_tempdir is not None and self._profile_tempdir.exists():
           shutil.rmtree(self._profile_tempdir)
       logger.info('JAX profiler trace file written to: %s', profile_path)
