@@ -33,12 +33,14 @@ _PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
 _MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
 _MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
 _TRITON_KEY: Final[str] = 'triton_kernel_call'
+_TRITON_FFI_KEY: Final[str] = 'triton_kernel_call_ffi'
 
 DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
     export.DisabledSafetyCheck.custom_call(_PALLAS_TRITON_KEY),
     export.DisabledSafetyCheck.custom_call(_MOSAIC_GPU_KEY),
     export.DisabledSafetyCheck.custom_call(_MOSAIC_TPU_KEY),
     export.DisabledSafetyCheck.custom_call(_TRITON_KEY),
+    export.DisabledSafetyCheck.custom_call(_TRITON_FFI_KEY),
 )
 
 _XLA_NOISE_OPCODES: Final[set[str]] = {
