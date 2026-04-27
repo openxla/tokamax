@@ -87,13 +87,9 @@ def ragged_dot_kernel(
             plgpu.wgmma_wait(1)
 
           spec = functools.partial(_tiled_swizzled_block_spec, delay_release=1)
-          if jax.__version_info__ >= (0, 10, 0):
-            lhs_block_shape = (pl.Element(block_m), block_k)
-            lhs_index_map = lambda ki: (block_start, ki)
-          else:
-            lhs_block_shape = (block_m, block_k)
-            lhs_index_map = lambda ki: (block_start // block_m, ki)
+          lhs_block_shape = (pl.Element(block_m), block_k)
           rhs_block_shape = (block_k, block_n)
+          lhs_index_map = lambda ki: (block_start, ki)
           rhs_index_map = lambda ki: (ki, ni)
           lhs_spec = spec(lhs_block_shape, lhs_gmem.dtype, lhs_index_map, "lhs")
           rhs_spec = spec(rhs_block_shape, rhs_gmem.dtype, rhs_index_map, "rhs")
@@ -153,10 +149,7 @@ def ragged_dot_kernel(
       loop_info = plgpu.NDLoopInfo((mni,), local_index=0, num_local_steps=1)
       mn_loop_body(0, m_iters, loop_info)
 
-  alignment = 8 if jax.__version_info__ >= (0, 10, 0) else config.block_m
-  group_info = common.GroupInfo.create_aligned(
-      group_sizes, block_m, m_iters, alignment
-  )
+  group_info = common.GroupInfo.create_aligned(group_sizes, block_m, m_iters)
 
   if config.persistent:
     grid = (backend.get_default_device().core_count,)

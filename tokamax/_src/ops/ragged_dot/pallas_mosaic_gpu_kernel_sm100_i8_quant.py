@@ -292,13 +292,8 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
         def _():
           plgpu.set_max_registers(104, action="decrease")
 
-          @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-          def _per_warp():
-            warp_id = lax.axis_index("warp")
-
-            # Before jax 0.10, the warp ID is global, not within the warp group.
-            if jax.__version_info__ < (0, 10, 0):
-              warp_id = lax.rem(warp_id, 4)
+          @plgpu.warp_map
+          def _per_warp(warp_id):
 
             @pl.when(warp_id == _W_TMA_WARP)
             def w_tma_warp():

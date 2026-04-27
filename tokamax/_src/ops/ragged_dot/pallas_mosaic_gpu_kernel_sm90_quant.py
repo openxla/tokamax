@@ -101,10 +101,6 @@ def ragged_dot_quantized_kernel(
   )
   num_stages = min(config.num_stages, k // block_k)
 
-  # Before JAX 0.10, `barrier_arrive` and `commit_smem_to_gmem_group` are not
-  # supported in a single-warp context.
-  supports_warp_tma = jax.__version_info__ >= (0, 10, 0)
-
   def kernel(
       x_gmem,
       w_gmem,
@@ -141,7 +137,6 @@ def ragged_dot_quantized_kernel(
         block_start = block_start_gmem[mi]
 
       wg = lax.axis_index("wg")
-      ms = pl.ds(block_start, block_m)
       ns = pl.ds(wg * block_n, block_n)
 
       @pl.when(actual_size > 0)
@@ -149,7 +144,7 @@ def ragged_dot_quantized_kernel(
 
         @pl.when(wg < _COMPUTE_WGS)
         def compute_wg():
-          max_registers = 216 if supports_warp_tma else 176
+          max_registers = 216
           plgpu.set_max_registers(max_registers, action="increase")
 
           def compute_acc(acc):
@@ -204,139 +199,93 @@ def ragged_dot_quantized_kernel(
             o_smem_.T[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
             plgpu.barrier_arrive(o_barrier)
 
-        def issue_o_tma():
-          plgpu.barrier_wait(o_barrier)
-          mgpu_lib.fence_async_shared_cta()  # Ensure store is complete.
+        @pl.when(wg == _TMA_WG)
+        def tma_wg():
+          plgpu.set_max_registers(72, action="decrease")
 
-          with jax.named_scope("store"):
-            # Write out the largest power of two rows first,
-            # then the next largest, etc. This allows us to coalesce
-            # writes as much as possible.
-            offset = start_within_block
-            size = 1 << (min(block_m, m).bit_length() - 1)
-            while size > 0:
+          @plgpu.warp_map
+          def tma_warps(warp_id):
 
-              @pl.when(actual_size & size != 0)
-              def _():
-                for wg_ in range(_COMPUTE_WGS):
-                  ns = pl.ds((ni * _COMPUTE_WGS + wg_) * block_n, block_n)
-                  plgpu.copy_smem_to_gmem(
-                      o_smem.at[wg_, pl.ds(offset, size)],
-                      out_gmem.at[pl.ds(block_start + offset, size), ns],
-                      commit_group=False,
+            @pl.when(warp_id == 0)
+            def w_tma_warp():
+              ns = pl.ds(ni * (_COMPUTE_WGS * block_n), _COMPUTE_WGS * block_n)
+
+              @pl.loop(0, k_iters)
+              def k_loop(ki):
+                ks = pl.ds(ki * block_k, block_k)
+                si = lax.rem(ki, num_stages)
+
+                @pl.when((ki >= num_stages) | (carry > 0))
+                def wait_w_consumed():
+                  plgpu.barrier_wait(w_consumed_barrier.at[si])
+                  mgpu_lib.fence_async_shared_cta()  # Ensure read complete.
+
+                plgpu.copy_gmem_to_smem(  # e,n,k
+                    w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
+                )
+                ki_ = lax.div(ki, w_scales_tile_k // block_k)
+                plgpu.copy_gmem_to_smem(  # e,k//t,n
+                    w_scales_gmem.at[gi, ki_, ns],
+                    w_scales_smem.at[si],
+                    w_barrier.at[si],
+                )
+
+            @pl.when(warp_id == 1)
+            def x_tma_warp():
+
+              @pl.loop(0, k_iters)
+              def k_loop(ki):
+                ks = pl.ds(ki * block_k, block_k)
+                si = lax.rem(ki, num_stages)
+
+                @pl.when((ki >= num_stages) | (carry > 0))
+                def wait_x_consumed():
+                  plgpu.barrier_wait(x_consumed_barrier.at[si])
+
+                end = start_within_block + actual_size
+
+                # Load the smallest power-of-two size that includes all of the
+                # rows we need.
+                def cp_rec(size):
+                  cp = lambda: plgpu.copy_gmem_to_smem(
+                      x_gmem.at[pl.ds(block_start, size), ks],
+                      x_smem.at[si, :size],
+                      x_barrier.at[si],
                   )
+                  if size == block_m:
+                    return cp()
+                  return lax.cond(end <= size, cp, lambda: cp_rec(size * 2))
 
-              offset += actual_size & size
-              size //= 2
-            plgpu.commit_smem_to_gmem_group()
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-            plgpu.barrier_arrive(o_consumed_barrier)
+                cp_rec(8)
 
-        if supports_warp_tma:
+            @pl.when(warp_id == 2)
+            def o_tma_warp():
+              plgpu.barrier_wait(o_barrier)
+              mgpu_lib.fence_async_shared_cta()  # Ensure store is complete.
 
-          @pl.when(wg == _TMA_WG)
-          def tma_wg():
-            plgpu.set_max_registers(72, action="decrease")
+              with jax.named_scope("store"):
+                # Write out the largest power of two rows first,
+                # then the next largest, etc. This allows us to coalesce
+                # writes as much as possible.
+                offset = start_within_block
+                size = 1 << (min(block_m, m).bit_length() - 1)
+                while size > 0:
 
-            @plgpu.warp_map
-            def tma_warps(warp_id):
+                  @pl.when(actual_size & size != 0)
+                  def _():
+                    for wg_ in range(_COMPUTE_WGS):
+                      ns = pl.ds((ni * _COMPUTE_WGS + wg_) * block_n, block_n)
+                      plgpu.copy_smem_to_gmem(
+                          o_smem.at[wg_, pl.ds(offset, size)],
+                          out_gmem.at[pl.ds(block_start + offset, size), ns],
+                          commit_group=False,
+                      )
 
-              @pl.when(warp_id == 0)
-              def w_tma_warp():
-                ns = pl.ds(ni * (_COMPUTE_WGS * block_n), _COMPUTE_WGS * block_n)
-
-                @pl.loop(0, k_iters)
-                def k_loop(ki):
-                  ks = pl.ds(ki * block_k, block_k)
-                  si = lax.rem(ki, num_stages)
-
-                  @pl.when((ki >= num_stages) | (carry > 0))
-                  def wait_w_consumed():
-                    plgpu.barrier_wait(w_consumed_barrier.at[si])
-                    mgpu_lib.fence_async_shared_cta()  # Ensure read complete.
-
-                  plgpu.copy_gmem_to_smem(  # e,n,k
-                      w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
-                  )
-                  ki_ = lax.div(ki, w_scales_tile_k // block_k)
-                  plgpu.copy_gmem_to_smem(  # e,k//t,n
-                      w_scales_gmem.at[gi, ki_, ns],
-                      w_scales_smem.at[si],
-                      w_barrier.at[si],
-                  )
-
-              @pl.when(warp_id == 1)
-              def x_tma_warp():
-
-                @pl.loop(0, k_iters)
-                def k_loop(ki):
-                  ks = pl.ds(ki * block_k, block_k)
-                  si = lax.rem(ki, num_stages)
-
-                  @pl.when((ki >= num_stages) | (carry > 0))
-                  def wait_x_consumed():
-                    plgpu.barrier_wait(x_consumed_barrier.at[si])
-
-                  end = start_within_block + actual_size
-
-                  # Load the smallest power-of-two size that includes all of the
-                  # rows we need.
-                  def cp_rec(size):
-                    cp = lambda: plgpu.copy_gmem_to_smem(
-                        x_gmem.at[pl.ds(block_start, size), ks],
-                        x_smem.at[si, :size],
-                        x_barrier.at[si],
-                    )
-                    if size == block_m:
-                      return cp()
-                    return lax.cond(end <= size, cp, lambda: cp_rec(size * 2))
-
-                  cp_rec(8)
-
-              @pl.when(warp_id == 2)
-              def o_tma_warp():
-                issue_o_tma()
-
-        else:
-
-          @pl.when(wg == _TMA_WG)
-          def xw_tma_wg():
-            plgpu.set_max_registers(80, action="decrease")
-
-            ns = pl.ds(ni * (_COMPUTE_WGS * block_n), _COMPUTE_WGS * block_n)
-
-            @pl.loop(0, k_iters)
-            def k_loop(ki):
-              ks = pl.ds(ki * block_k, block_k)
-              si = lax.rem(ki, num_stages)
-
-              @pl.when((ki >= num_stages) | (carry > 0))
-              def wait_w_consumed():
-                plgpu.barrier_wait(w_consumed_barrier.at[si])
-                mgpu_lib.fence_async_shared_cta()  # Ensure read is complete.
-
-              plgpu.copy_gmem_to_smem(  # e,n,k
-                  w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
-              )
-              ki_ = lax.div(ki, w_scales_tile_k // block_k)
-              plgpu.copy_gmem_to_smem(  # e,k//t,n
-                  w_scales_gmem.at[gi, ki_, ns],
-                  w_scales_smem.at[si],
-                  w_barrier.at[si],
-              )
-
-              @pl.when((ki >= num_stages) | (carry > 0))
-              def wait_x_consumed():
-                plgpu.barrier_wait(x_consumed_barrier.at[si])
-
-              plgpu.copy_gmem_to_smem(
-                  x_gmem.at[ms, ks], x_smem.at[si], x_barrier.at[si]
-              )
-
-          @pl.when(wg == _TMA_WG + 1)
-          def o_tma_wg():
-            plgpu.set_max_registers(64, action="decrease")
-            issue_o_tma()
+                  offset += actual_size & size
+                  size //= 2
+                plgpu.commit_smem_to_gmem_group()
+                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                plgpu.barrier_arrive(o_consumed_barrier)
 
       return carry + (actual_size > 0)
 
@@ -406,7 +355,7 @@ def ragged_dot_quantized_kernel(
       kernel,
       out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
       scratch_shapes=scratch_shapes,
-      num_threads=_COMPUTE_WGS + (1 if supports_warp_tma else 2),
+      num_threads=_COMPUTE_WGS + 1,
       thread_name="wg",
       grid=grid,
       grid_names=grid_names,
