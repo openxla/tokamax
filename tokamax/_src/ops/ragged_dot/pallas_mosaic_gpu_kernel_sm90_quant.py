@@ -100,6 +100,8 @@ def ragged_dot_quantized_kernel(
       group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
   )
   num_stages = min(config.num_stages, k // block_k)
+  # We bucket loads of `x` and compute into power-of-two sized blocks.
+  buckets = [2**i for i in range(3, block_m.bit_length())]
 
   # Before JAX 0.10, `barrier_arrive` and `commit_smem_to_gmem_group` are not
   # supported in a single-warp context.
@@ -141,7 +143,6 @@ def ragged_dot_quantized_kernel(
         block_start = block_start_gmem[mi]
 
       wg = lax.axis_index("wg")
-      ms = pl.ds(block_start, block_m)
       ns = pl.ds(wg * block_n, block_n)
 
       @pl.when(actual_size > 0)
@@ -174,7 +175,7 @@ def ragged_dot_quantized_kernel(
               with jax.named_scope("wait X"):
                 plgpu.barrier_wait(x_barrier.at[si])
               with jax.named_scope("mma"):
-                plgpu.wgmma(acc, w, x_smem.at[si].T)
+                plgpu.wgmma(acc, w, x_smem.at[si, : acc.shape[1]].T)
 
               def load_scales():
                 si = lax.rem(ki + 1, num_stages)
@@ -193,16 +194,19 @@ def ragged_dot_quantized_kernel(
             lax.fori_loop(0, k_iters, k_loop_body, init_val=w_scales0)
             return acc[...]
 
-          acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
+          @mgpu_lib.bucketed(start_within_block + actual_size, buckets)
+          def compute(block_m):
+            acc = pl.run_scoped(compute_acc, plgpu.ACC((block_n, block_m)))
 
-          with jax.named_scope("acc -> o_smem"):
-            pl.when(carry > 0)(lambda: plgpu.barrier_wait(o_consumed_barrier))
-            o_smem_ = o_smem.at[wg].reshape(block_m // 8, 1, 8, block_n)
-            o_smem_ = plgpu.untile_ref(o_smem_, (8, block_n))
-            acc = acc if activation is None else activation(acc)
-            acc = acc.astype(o_smem_.dtype)
-            o_smem_.T[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
-            plgpu.barrier_arrive(o_barrier)
+            with jax.named_scope("acc -> o_smem"):
+              pl.when(carry > 0)(lambda: plgpu.barrier_wait(o_consumed_barrier))
+              o_smem_ = o_smem.at[wg, :block_m]
+              o_smem_ = o_smem_.reshape(block_m // 8, 1, 8, block_n)
+              o_smem_ = plgpu.untile_ref(o_smem_, (8, block_n))
+              acc = acc if activation is None else activation(acc)
+              acc = acc.astype(o_smem_.dtype)
+              o_smem_.T[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
+              plgpu.barrier_arrive(o_barrier)
 
         def issue_o_tma():
           plgpu.barrier_wait(o_barrier)
@@ -277,21 +281,13 @@ def ragged_dot_quantized_kernel(
                   def wait_x_consumed():
                     plgpu.barrier_wait(x_consumed_barrier.at[si])
 
-                  end = start_within_block + actual_size
-
-                  # Load the smallest power-of-two size that includes all of the
-                  # rows we need.
-                  def cp_rec(size):
-                    cp = lambda: plgpu.copy_gmem_to_smem(
-                        x_gmem.at[pl.ds(block_start, size), ks],
-                        x_smem.at[si, :size],
+                  @mgpu_lib.bucketed(start_within_block + actual_size, buckets)
+                  def load_x(block_m):
+                    plgpu.copy_gmem_to_smem(
+                        x_gmem.at[pl.ds(block_start, block_m), ks],
+                        x_smem.at[si, :block_m],
                         x_barrier.at[si],
                     )
-                    if size == block_m:
-                      return cp()
-                    return lax.cond(end <= size, cp, lambda: cp_rec(size * 2))
-
-                  cp_rec(8)
 
               @pl.when(warp_id == 2)
               def o_tma_warp():
@@ -303,6 +299,7 @@ def ragged_dot_quantized_kernel(
           def xw_tma_wg():
             plgpu.set_max_registers(80, action="decrease")
 
+            ms = pl.ds(block_start, block_m)
             ns = pl.ds(ni * (_COMPUTE_WGS * block_n), _COMPUTE_WGS * block_n)
 
             @pl.loop(0, k_iters)
