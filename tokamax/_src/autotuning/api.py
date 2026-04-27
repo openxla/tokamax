@@ -40,7 +40,6 @@ from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 import tqdm
 
-
 BoundArgsAutotuningData: TypeAlias = tuple[
     op_lib.BoundArguments, autotuner.AutotuningData[Any]
 ]
@@ -268,17 +267,15 @@ def autotune(
     *args: Positional arguments to `f` (only valid if `f` is callable). NOTE -
       To autotune a callable with keyword arguments, pass the results of
       `tokamax.get_bound_args(f, *args, **kwargs)` to `autotune`.
-    ignore_cache: Whether to ignore the autotuningcache and re-autotune.
+    ignore_cache: . If `False` (default), only autotune ops that are not in the
+      autotuning cache. If `True` autotune all Tokamax ops found in `f`.
     all_implementations: Whether to autotune all implementations of the op that
       is tunable on the current device.
     progress_bar: Whether to show a progress bar (default: `True`).
 
   Returns:
-    An `AutotuningResult` of the autotuned ops.
+    An `AutotuningResult` object of the autotuned ops.
   """
-  # TODO: Implement `ignore_cache=True`.
-  if ignore_cache:
-    raise NotImplementedError("`ignore_cache=True` is not implemented.")
 
   if isinstance(f, (list, tuple)) and isinstance(f[0], op_lib.BoundArguments):
     if args:
@@ -286,6 +283,9 @@ def autotune(
     bound_args = tuple(f)
   else:
     bound_args = get_bound_args(f, *args)  # pytype: disable=paramspec-error
+
+  if not ignore_cache:
+    bound_args = [ba for ba in bound_args if ba.cached_autotuning_data is None]
 
   device_kinds = map(op_lib.infer_device_kind, bound_args)
   device_kinds = {k for k in device_kinds if k is not None}
@@ -318,7 +318,7 @@ def autotune(
 
   for bound_arg in bound_args:
     try:
-      data.append((bound_arg, bound_arg.autotune()))
+      data.append((bound_arg, bound_arg.autotune(cache_results=False)))
     except Exception:  # pylint: disable=broad-exception-caught
       logging.exception("Failed to autotune for op %s", bound_arg.op)
 

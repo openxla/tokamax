@@ -369,6 +369,22 @@ class AutotuningTest(parameterized.TestCase):
     benchmark_data = list(result.values())[0]
     self.assertIsInstance(benchmark_data, Exception)
 
+  @parameterized.parameters(True, False)
+  def test_autotuning_ignore_cache(self, ignore_cache):
+    f = jax.jit(lambda x: _FakeOp()(x, x))
+    x = jnp.zeros((3, 7))
+
+    res = api.autotune(f, x, ignore_cache=ignore_cache)
+    self.assertLen(res.data, 1)
+    # Test that this is not stateful (results are not cached between calls).
+    res = api.autotune(f, x, ignore_cache=ignore_cache)
+    self.assertLen(res.data, 1)
+
+    with res:
+      res_new = api.autotune(f, x, ignore_cache=ignore_cache)
+
+      expected_len = 1 if ignore_cache else 0
+      self.assertLen(res_new.data, expected_len)
 
 if __name__ == "__main__":
   absltest.main()
