@@ -106,6 +106,7 @@ class PydanticTest(parameterized.TestCase):
       (jax.typing.DTypeLike, jnp.float32),
       (jax.typing.DTypeLike, jnp.dtype("bfloat16")),
       (jax.typing.DTypeLike, float),
+      *((jax.typing.DTypeLike, ty) for ty in jax._src.dtypes._jax_types),
       (jax.lax.PrecisionLike, jax.lax.Precision.DEFAULT),
       (jax.lax.PrecisionLike, jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
       (jax.lax.PrecisionLike, "highest"),
@@ -120,9 +121,11 @@ class PydanticTest(parameterized.TestCase):
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
   @parameterized.parameters(
+      (jax.ShapeDtypeStruct((), jnp.int32)),
       (jax.ShapeDtypeStruct((1, 2), jnp.float32)),
       (jax.ShapeDtypeStruct((3, 4), jnp.int4),),
       (jax.ShapeDtypeStruct((5, 6), jnp.float8_e4m3fn),),
+      *((jax.ShapeDtypeStruct((7,), ty),) for ty in jax._src.dtypes._jax_types),
       (batching.BatchedShapeDtype((6,), jnp.int8, vmap_axes=((0, 5), (1, 7))),),
       (batching.BatchedShapeDtype((8, 9), jnp.int8, vmap_axes=(None,)),),
       (batching.BatchedShapeDtype((10, 11), jnp.int8, vmap_axes=()),),
@@ -132,6 +135,14 @@ class PydanticTest(parameterized.TestCase):
     adapter = pydantic.TypeAdapter(ty)
     self.assertEqual(shape, adapter.validate_python(adapter.dump_python(shape)))
     self.assertEqual(shape, adapter.validate_json(adapter.dump_json(shape)))
+
+  @parameterized.parameters(jax._src.dtypes._jax_types)
+  def test_shape_dtype_short_names(self, dtype):
+    ty = Annotated[jax.Array, pydantic_lib.ShapeDtype]
+    adapter = pydantic.TypeAdapter(ty)
+    shape = jax.ShapeDtypeStruct((), dtype)
+    str_short = jax.core.ShapedArray((), dtype).str_short(short_dtypes=True)
+    self.assertEqual(f'"{str_short}"', str(adapter.dump_json(shape), "utf-8"))
 
   def test_concrete_array_roundtrip(self):
     class NPArrSubclass(np.ndarray):

@@ -26,8 +26,8 @@ from typing import Annotated, Any, Generic, TypeAlias, TypeVar, Union
 import immutabledict
 import jax
 from jax.experimental.pallas import fuser
-import jax.numpy as jnp
 import jaxtyping
+import ml_dtypes
 import numpy as np
 import pydantic
 import pydantic_core
@@ -246,11 +246,16 @@ class ShapeDtype:
   PATTERN = re.compile(r'(.*?)(\[.*?\])(\{vmap_axes=(\[.*\])\})?')
   SHORT_DTYPE_NAMES_MAP = immutabledict.immutabledict(
       bool=bool,
-      i4=jnp.int4,
+      **(dict(i1=ml_dtypes.int1) if hasattr(ml_dtypes, 'int1') else {}),
+      i2=ml_dtypes.int2,
+      i4=ml_dtypes.int4,
       i8=np.int8,
       i16=np.int16,
       i32=np.int32,
       i64=np.int64,
+      **(dict(u1=ml_dtypes.uint1) if hasattr(ml_dtypes, 'uint1') else {}),
+      u2=ml_dtypes.uint2,
+      u4=ml_dtypes.uint4,
       u8=np.uint8,
       u16=np.uint16,
       u32=np.uint32,
@@ -258,9 +263,18 @@ class ShapeDtype:
       f16=np.float16,
       f32=np.float32,
       f64=np.float64,
-      bf16=jnp.bfloat16,
-      f8_e4m3fn=jnp.float8_e4m3fn,
-      f8_e5m2=jnp.float8_e5m2,
+      bf16=ml_dtypes.bfloat16,
+      f4_e2m1fn=ml_dtypes.float4_e2m1fn,
+      f8_e3m4=ml_dtypes.float8_e3m4,
+      f8_e4m3=ml_dtypes.float8_e4m3,
+      f8_e8m0fnu=ml_dtypes.float8_e8m0fnu,
+      f8_e4m3b11fnuz=ml_dtypes.float8_e4m3b11fnuz,
+      f8_e4m3fn=ml_dtypes.float8_e4m3fn,
+      f8_e4m3fnuz=ml_dtypes.float8_e4m3fnuz,
+      f8_e5m2=ml_dtypes.float8_e5m2,
+      f8_e5m2fnuz=ml_dtypes.float8_e5m2fnuz,
+      c64=np.complex64,
+      c128=np.complex128,
   )
 
   @classmethod
