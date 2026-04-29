@@ -134,15 +134,18 @@ class NumericsTest(parameterized.TestCase):
           jax.ShapeDtypeStruct((128, 1), jnp.bfloat16),
           jax.ShapeDtypeStruct((32, 32), jnp.float32),
       ),
+      explicit_qtype=(True, False),
   )
-  def test_random_initialize_qarray(self, qtype, scale):
+  def test_random_initialize_qarray(self, qtype, scale, explicit_qtype):
     qvalue = jax.ShapeDtypeStruct((256, 256), qtype)
-    q = qwix.QArray(qvalue, scale)  # pytype: disable=wrong-arg-types
+    kwargs = dict(qtype=qtype) if explicit_qtype else {}
+    q = qwix.QArray(qvalue, scale, **kwargs)  # pytype: disable=wrong-arg-types
     q = numerics.random_initialize(q)
     self.assertEqual(q.qvalue.shape, qvalue.shape)
     self.assertEqual(q.scale.shape, scale.shape)
     self.assertEqual(q.qvalue.dtype, qtype)
     self.assertEqual(q.scale.dtype, scale.dtype)
+    self.assertIs(q.qtype, qtype if explicit_qtype else jnp.dtype(qtype))
     q_rms = jnp.sqrt(jnp.mean(qwix.dequantize(q) ** 2))
     self.assertGreater(q_rms, 0.8)
     self.assertLess(q_rms, 1.2)
