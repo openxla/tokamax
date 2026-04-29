@@ -22,11 +22,9 @@ from typing import Any, Literal, TypeAlias
 # Tags are used to quickly identify different workloads for the same op.
 # forward_only models are models that only require forward passes - meaning no
 # vjp tuning is required.
-# mlcompass models are models that are tracked by mlcompass. These are all
-# internal models.
-# primary models are models that are considered the "primary" models for the
-# PA.
-Tag: TypeAlias = Literal['primary']
+# Primary arg specs support models that are considered important for key
+# users. These are used for nightly benchmarking.
+Tag: TypeAlias = Literal['primary', 'forward_only']
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
