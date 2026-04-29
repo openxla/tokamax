@@ -110,11 +110,15 @@ def cast_qkv(
   """Casts Q, K, and V to the given precision."""
 
   def cast(x, precision):
+    # Quantized arrays inherently define their precision (e.g., int8) and
+    # cannot contain infinities, so we bypass sanitization and downcasting.
+    if isinstance(x, QArray):
+      return x
     assert precision != jax.lax.DotAlgorithmPreset.DEFAULT
     if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
-      return x.astype(jnp.bfloat16)
+      return safe_downcast(x, jnp.bfloat16)
     if precision == jax.lax.DotAlgorithmPreset.F16_F16_F32:
-      return x.astype(jnp.float16)
+      return safe_downcast(x, jnp.float16)
     raise NotImplementedError(f"Unsupported precision: {precision}")
 
   q_k_dot_precision, p_v_dot_precision = precision
@@ -211,3 +215,13 @@ def unpack_bool_bits_tmem_native(a):
     )
 
   return unpack_booleans(a)
+
+
+def safe_downcast(
+    arr: jax.Array, target_dtype: jax.typing.DTypeLike
+) -> jax.Array:
+  """Clips the array to the target dtype's range before casting to prevent infinities."""
+  if arr.dtype == target_dtype:
+    return arr
+  finfo = jnp.finfo(target_dtype)
+  return jnp.clip(arr, finfo.min, finfo.max).astype(target_dtype)

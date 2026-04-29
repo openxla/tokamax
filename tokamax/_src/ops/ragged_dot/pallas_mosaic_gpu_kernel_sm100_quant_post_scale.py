@@ -190,7 +190,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
       def _body():
         @pl.when(wg == _MAIN_WG)
         def _():
-          @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
+          @pl.kernel(mesh=plgpu.WarpMesh(axis_name="warp"))
           def _per_warp():
             warp_id = lax.axis_index("warp")
 
@@ -283,6 +283,8 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
                 )
 
               lax.fori_loop(0, num_k_iters, do_mma, None)
+
+          _per_warp()
 
         @pl.when(wg == _DEQ_WG)
         def _():

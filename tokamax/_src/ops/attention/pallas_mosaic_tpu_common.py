@@ -14,8 +14,9 @@
 # ==============================================================================
 """Common utilities for Pallas Mosaic TPU attention."""
 
+from collections.abc import Callable
 import functools
-from typing import Final
+from typing import Any, Final
 
 import jax
 import jax.numpy as jnp
@@ -68,8 +69,8 @@ def build_splash_kernel(
     kv_seq_len: int,
     is_mqa: bool,
     save_residuals: bool,
-) -> splash.SplashAttentionKernel:
-  """Returns the SplashAttention kernel."""
+) -> tuple[Callable, Any]:
+  """Returns the SplashAttention kernel maker and splash mask."""
 
   # TODO: support multiple shards.
   shard_count = 1
@@ -83,14 +84,15 @@ def build_splash_kernel(
       raise NotImplementedError(
           "Only num_mask_heads=1 is supported with a boolean mask."
       )
-    # TODO: Support batched boolean masks.
-    if mask_batch_size != 1:
-      raise NotImplementedError("Only unbatched boolean masks are supported.")
-    splash_mask = jnp.squeeze(splash_mask, axis=(0, 1))  # (seq_q, seq_kv)
+    if mask_batch_size == 1:
+      splash_mask = jnp.squeeze(splash_mask, axis=(0, 1))  # (seq_q, seq_kv)
+    else:
+      splash_mask = jnp.squeeze(splash_mask, axis=1)  # (batch, seq_q, seq_kv)
   elif mask.is_causal:
     splash_mask = mask_lib.CausalMask(shape=mask_shape, shard_count=shard_count)
   else:
     splash_mask = mask_lib.FullMask(mask_shape)
+
   is_dynamic_mask = isinstance(splash_mask, jax.Array)
 
   if is_dynamic_mask:
@@ -104,11 +106,12 @@ def build_splash_kernel(
         splash.make_splash_mqa if is_mqa else splash.make_splash_mha
     )
     splash_maker = functools.partial(splash_maker, q_seq_shards=shard_count)
-  splash_fn = splash_maker(
-      mask=splash_mask,
+
+  splash_maker = functools.partial(
+      splash_maker,
       config=splash_config,
       save_residuals=save_residuals,
       mask_value=float(jnp.finfo(jnp.float32).min),
       downcast_smem_data=False,
   )
-  return splash_fn
+  return splash_maker, splash_mask

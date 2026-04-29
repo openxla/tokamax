@@ -134,6 +134,21 @@
       "peak_memory_mb": 306.709504
     }
   },
+  "{\"x\":\"bf16[2,2]\",\"scale\":null,\"offset\":null,\"axis\":-1,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":false,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 83.43212501495145,
+      "lower_time_ms": 16.382453992264345,
+      "evaluation_times_ms": [
+        0.023776,
+        0.023456,
+        0.024256,
+        0.023104,
+        0.023168
+      ],
+      "metadata": {},
+      "peak_memory_mb": 64.0
+    }
+  },
   "{\"x\":\"bf16[128,768,768]\",\"scale\":\"f32[128]\",\"offset\":\"f32[128]\",\"axis\":0,\"epsilon\":1e-6,\"scale_offset\":0.0,\"subtract_mean\":true,\"return_residuals\":true}": {
     "{}": {
       "compile_time_ms": 206.40609599649906,

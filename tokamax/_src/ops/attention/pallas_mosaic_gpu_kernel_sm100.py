@@ -146,26 +146,124 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   )
 
 
+def _estimate_smem_bytes(
+    config: Config,
+    head_dim: int,
+    head_dim_out: int,
+    q_dtype: jax.typing.DTypeLike,
+    k_dtype: jax.typing.DTypeLike,
+    v_dtype: jax.typing.DTypeLike,
+    out_dtype: jax.typing.DTypeLike,
+    bias: jax.ShapeDtypeStruct | jax.Array | None,
+    mask: jax.ShapeDtypeStruct | jax.Array | None,
+) -> int:
+  q_bytes = config.block_q * head_dim * jnp.dtype(q_dtype).itemsize
+  k_bytes = (
+      config.num_stages
+      * config.block_kv
+      * head_dim
+      * jnp.dtype(k_dtype).itemsize
+  )
+  v_bytes = (
+      config.num_stages
+      * config.block_kv
+      * head_dim_out
+      * jnp.dtype(v_dtype).itemsize
+  )
+  if config.collective:
+    k_bytes //= 2
+    v_bytes //= 2
+
+  out_dtype = jnp.dtype(out_dtype)
+  epi_tile_d = 1024 // mgpu_lib.num_bits(out_dtype)
+  if head_dim_out % epi_tile_d != 0:
+    epi_tile_d = head_dim_out
+  num_epi_slots = min(2, head_dim_out // epi_tile_d)
+  o_bytes = (
+      num_epi_slots
+      * config.block_q
+      * epi_tile_d
+      * jnp.dtype(out_dtype).itemsize
+  )
+
+  bias_bytes = 0
+  if bias is not None and not (bias.shape[-2] == 1 and bias.shape[-1] == 1):
+    bias_q = 1 if bias.shape[-2] == 1 else config.block_q
+    bias_kv = 1 if bias.shape[-1] == 1 else config.block_kv
+    bias_bytes = bias_q * bias_kv * jnp.dtype(bias.dtype).itemsize
+
+  mask_bytes = 0
+  if mask is not None and not (mask.shape[-2] == 1 or mask.shape[-1] == 1):
+    mask_block_kv = config.block_kv // _MASK_PACKED_BITS
+    min_mask_cols = 128 // _MASK_PACKED_BITS
+    mask_q = 1 if mask.shape[-2] == 1 else config.block_q
+    mask_bytes = mask_q * max(mask_block_kv, min_mask_cols)
+
+  overhead_bytes = 2048
+  return (
+      q_bytes
+      + k_bytes
+      + v_bytes
+      + o_bytes
+      + bias_bytes
+      + mask_bytes
+      + overhead_bytes
+  )
+
+
 def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   """Returns a set of configs for autotuning flash attention on SM100 GPUs."""
-  del ba
+  q, k, v, *_ = ba.args
+  bias = ba.kwargs.get("bias")
+  mask = ba.kwargs.get("mask")
+  q_indices = ba.kwargs.get("q_indices")
+  k_indices = ba.kwargs.get("k_indices")
+  out_dtype = ba.kwargs.get("out_dtype", q.dtype)
+
+  mask, *_ = jax.eval_shape(
+      common.decompose_mask, mask, q, k, q_indices, k_indices
+  )
+  # Before padding, check if the head_dim is compatible with splits.
+  # We assume head dims are padded to multiples of 64 inside the kernel.
+  head_dim = pl.cdiv(q.shape[-1], 64) * 64
+  head_dim_out = pl.cdiv(v.shape[-1], 64) * 64
+
   configs = set()
   for block_kv in [64, 128]:
     for num_stages in [1, 2, 3, 4]:
       for num_tma_splits in [1, 2, 3, 4]:
+        if (head_dim // num_tma_splits) % 64 != 0:
+          continue
+
         # TODO: Investigate why split_k=2 doesn't work with block_kv=128.
         for split_k in [1, 2] if block_kv == 64 else [1]:
           for collective in [False, True] if split_k == 1 else [False]:
-            configs.add(
-                Config(
-                    block_q=256 if collective else 128,
-                    block_kv=block_kv,
-                    num_stages=num_stages,
-                    num_tma_splits=num_tma_splits,
-                    collective=collective,
-                    split_k=split_k,
-                )
+            if (
+                head_dim_out // num_tma_splits // (2 if collective else 1)
+            ) % 64 != 0:
+              continue
+            config = Config(
+                block_q=256 if collective else 128,
+                block_kv=block_kv,
+                num_stages=num_stages,
+                num_tma_splits=num_tma_splits,
+                collective=collective,
+                split_k=split_k,
             )
+            smem_bytes = _estimate_smem_bytes(
+                config,
+                head_dim,
+                head_dim_out,
+                q.dtype,
+                k.dtype,
+                v.dtype,
+                out_dtype,
+                bias,
+                mask,
+            )
+            if smem_bytes > 227 * 1024:
+              continue
+            configs.add(config)
   return configs
 
 
@@ -320,7 +418,7 @@ def flash_attention_kernel(
     def mma_tma_wg():
       plgpu.set_max_registers(80, action="decrease")
 
-      @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
+      @pl.kernel(mesh=plgpu.WarpMesh(axis_name="warp"))
       def per_warp():
         warp_id = lax.axis_index("warp")
 
@@ -465,6 +563,8 @@ def flash_attention_kernel(
 
           pv_mma(ub - 1)
 
+      per_warp()
+
     @pl.when((wg == _SOFTMAX_WG) & (ub > lb))
     def softmax_wg():
       plgpu.set_max_registers(256, action="increase")
@@ -523,7 +623,7 @@ def flash_attention_kernel(
         mask = lax.cond(
             needs_k_range_mask(ki), lambda: k_range_mask(mask), lambda: mask
         )
-        return jnp.where(mask, 0, _DEFAULT_MASK_VALUE)
+        return mask
 
       def kv_loop(ki, carry, *, do_causal=False):
         m_scale, m_i, l_i = carry
@@ -559,7 +659,14 @@ def flash_attention_kernel(
           scale *= math.log2(math.e)
           s, scale = lax.cond(
               do_causal or mask_gmem is not None or needs_k_range_mask(ki),
-              lambda: (s * scale + compute_mask(ki, do_causal), 1.0),
+              lambda: (
+                  jnp.where(
+                      compute_mask(ki, do_causal),
+                      s * scale,
+                      _DEFAULT_MASK_VALUE,
+                  ),
+                  1.0,
+              ),
               lambda: (s, scale),
           )
           m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
@@ -633,7 +740,7 @@ def flash_attention_kernel(
         slot = lax.rem(ki - lb, softmax_slots)
 
         plgpu.barrier_wait(pv_mma_barrier)
-        tile_d = 32
+        tile_d = 64
 
         def load_acc_tiles():
           for d_base in range(0, head_dim_out, tile_d):
