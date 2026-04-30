@@ -292,6 +292,11 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
   num_h_blocks = math.ceil(h_dim / h_block_size)
   num_v_blocks = math.ceil(v_dim / v_block_size)
 
+  # Constrain the memory spaces for x and w to prevent OOB accesses that occur
+  # when the memory spaces is placed in VMEM.
+  x = pltpu.with_memory_space_constraint(x, memory_space=pltpu.HBM)
+  w = pltpu.with_memory_space_constraint(w, memory_space=pltpu.HBM)
+
   # Forward
   loss, lse = pl.pallas_call(
       partial(
@@ -629,6 +634,11 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
 
   # Pallas only allow passing in vectors not scalars
   dout_array = jnp.zeros(1).at[0].set(dout)
+
+  # Constrain the memory spaces for x and w to prevent OOB accesses that occur
+  # when the memory spaces is placed in VMEM.
+  x = pltpu.with_memory_space_constraint(x, memory_space=pltpu.HBM)
+  w = pltpu.with_memory_space_constraint(w, memory_space=pltpu.HBM)
 
   # Backward
   x_grad, w_grad = pl.pallas_call(
