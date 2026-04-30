@@ -216,6 +216,21 @@ class BenchmarkingTest(parameterized.TestCase):
       assert profile.total_op_time.total_seconds() > 0  # check is nonzero
       self.assertIsNone(profile.xprof_url)
 
+    with self.subTest('Include only all.'):
+      with benchmarking.XprofProfileSession(
+          hermetic=True, event_filter_regex='.*'
+      ) as profile:
+        jax.block_until_ready(f(x))
+      self.assertGreater(profile.total_op_time.total_seconds(), 0)
+
+    with self.subTest('Include only none.'):
+      with benchmarking.XprofProfileSession(
+          hermetic=True, event_filter_regex='non_existent_regex'
+      ) as profile:
+        jax.block_until_ready(f(x))
+      with self.assertRaises(ValueError):
+        _ = profile.total_op_time
+
   def test_xprof_profile_session_exception(self):
     with benchmarking.XprofProfileSession(hermetic=True) as profile:
       _ = 1 + 1

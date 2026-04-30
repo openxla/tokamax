@@ -92,9 +92,9 @@ def _compile(fn_factory, config, args, kwargs, *, seed=None):
   return benchmarking.compile_benchmark(fn, x), x
 
 
-def _benchmark(fn_factory, config, args, kwargs):
+def _benchmark(fn_factory, config, args, kwargs, event_filter_regex=None):
   runner, x = _compile(fn_factory, config, args, kwargs, seed=0)
-  return runner(x)
+  return runner(x, event_filter_regex=event_filter_regex)
 
 
 class _SyncExecutor(futures.Executor):
@@ -124,6 +124,7 @@ class Autotuner:
       fn_factory: Callable[[_Config], Callable[_P, Any]],
       configs: set[_Config],
       *args: _P.args,
+      event_filter_regex: str | None = None,
       **kwargs: _P.kwargs,
   ) -> AutotuningData[_Config]:
     """Autotunes over configs for the given arguments."""
@@ -154,7 +155,12 @@ class Autotuner:
               compiled_fn, args = future.result()
               if initialized_args is None:
                 initialized_args = numerics.random_initialize(args)
-              executor_args[config] = (compiled_fn, initialized_args)
+              executor_args[config] = (
+                  functools.partial(
+                      compiled_fn, event_filter_regex=event_filter_regex
+                  ),
+                  initialized_args,
+              )
             except Exception as e:
               vlog_exc_info("Config failed to compile: %s", config)
               results[config] = e
@@ -167,7 +173,14 @@ class Autotuner:
             results[config] = e
     else:
       for config in configs:
-        executor_args[config] = (_benchmark, fn_factory, config, args, kwargs)
+        executor_args[config] = (
+            _benchmark,
+            fn_factory,
+            config,
+            args,
+            kwargs,
+            event_filter_regex,
+        )
 
     with executor:
       future_to_config = {

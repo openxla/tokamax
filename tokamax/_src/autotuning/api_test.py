@@ -206,6 +206,56 @@ class AutotuningTest(parameterized.TestCase):
     with open(tempfile.full_path, "r") as f:
       self.assertEqual(result, api.AutotuningResult.load(f))
 
+  def test_autotune_with_event_filter_regex(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    result = api.autotune(
+        f, *args, all_implementations=False, event_filter_regex=".*"
+    )
+    self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+    self.assertEqual(tuple(x[0] for x in result.data), expected)
+
+  @parameterized.parameters(".*", "foo")
+  def test_autotune_with_event_filter_regex_tpu(self, regex):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Targets TPU only.")
+
+    def _get_ragged_dot_input_data(num_experts, m, k, n, dtype=jnp.bfloat16):
+      rng0, rng1 = jax.random.split(jax.random.PRNGKey(0))
+      lhs = jax.random.normal(rng0, (m, k), dtype=dtype)
+      rhs = jax.random.normal(rng1, (num_experts, k, n), dtype=dtype)
+      group_sizes = jnp.array([m // num_experts] * num_experts, jnp.uint32)
+      return (lhs, rhs, group_sizes)
+
+    @jax.jit
+    def f(lhs, rhs, group_sizes):
+      return ragged_dot_api.ragged_dot(
+          lhs,
+          rhs,
+          group_sizes,
+          implementation="mosaic",
+          preferred_element_type=jnp.bfloat16,
+      )
+
+    lhs, rhs, group_sizes = _get_ragged_dot_input_data(
+        num_experts=1, m=128, k=128, n=128
+    )
+    ragged_dot_lowered = f.lower(lhs, rhs, group_sizes=group_sizes)
+
+    result = api.autotune(
+        ragged_dot_lowered,
+        all_implementations=False,
+        event_filter_regex=regex,
+    )
+    self.assertNotEmpty(result.data)
+    for _, data in result.data:
+      for _, benchmark in data.items():
+        self.assertTrue(
+            isinstance(benchmark, Exception)
+            or isinstance(benchmark, benchmarking.BenchmarkData)
+        )
+
   def test_autotuning_result_context(self):
     op = _FakeOp()
     ba = op.bind(jnp.zeros((1, 2)), jnp.zeros((3,)))

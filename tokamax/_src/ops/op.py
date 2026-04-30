@@ -550,6 +550,7 @@ class BoundArguments(Generic[_Config, _Key]):
       configs: set[_Config] | type[AUTO] = AUTO,
       autotuner: autotuner_lib.Autotuner = autotuner_lib.Autotuner(),
       cache_results: bool = True,
+      event_filter_regex: str | None = None,
   ) -> AutotuningData[_Config]:
     """Autotunes the op with the bound arguments."""
     if configs is AUTO:
@@ -557,7 +558,13 @@ class BoundArguments(Generic[_Config, _Key]):
 
     logging.debug("Autotuning %s(%s)", self.op, self.arguments)
     op_fn = lambda config: self.op.replace(config=config)
-    data = autotuner.autotune(op_fn, configs, *self.args, **self.kwargs)
+    data = autotuner.autotune(
+        op_fn,
+        configs,
+        *self.args,
+        event_filter_regex=event_filter_regex,
+        **self.kwargs,
+    )
     if cache_results:
       d = self.op.get_autotuning_cache()
       d[self.autotuning_cache_key] = data
