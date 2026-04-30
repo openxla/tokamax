@@ -70,6 +70,9 @@ class AutotuningData(
       raise e
     return return_data
 
+  def prune_errors(self) -> dict[_Config, BenchmarkData]:
+    return {k: v for k, v in self.items() if isinstance(v, BenchmarkData)}  # pytype: disable=bad-return-type
+
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
     assert typing.get_origin(source) is cls

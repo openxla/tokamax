@@ -96,11 +96,19 @@ class AutotuningResult:
   # version of Tokamax was used to generate the serialized config.
   tokamax_version: str = version.TOKAMAX_VERSION
 
-  def dump(self, fp):
-    fp.write(self.dumps())
+  def dump(self, fp, *, prune_errors: bool = False):
+    fp.write(self.dumps(prune_errors=prune_errors))
 
-  def dumps(self) -> str:
-    return str(_AUTOTUNING_RESULT_ADAPTER.dump_json(self), "utf-8")
+  def dumps(self, *, prune_errors: bool = False) -> str:
+    if prune_errors:
+      data = tuple(
+          (ba, autotuner.AutotuningData(ba_data.prune_errors()))
+          for ba, ba_data in self.data
+      )
+      to_dump = dataclasses.replace(self, data=data)
+    else:
+      to_dump = self
+    return str(_AUTOTUNING_RESULT_ADAPTER.dump_json(to_dump), "utf-8")
 
   def dump_cache_str(self) -> str:
     cache_str = ""
