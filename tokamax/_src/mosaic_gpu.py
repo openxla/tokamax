@@ -197,7 +197,7 @@ def int4_as_biased_f8e4m3fn(x, layout):
     def upcast_i4_to_fp8_biased(reg: ir.Value):
 
       out_struct = llvm.inline_asm(
-          ir.Type.parse("!llvm.struct<(i32, i32)>"),
+          llvm.StructType.get_literal((i32, i32)),
           [reg],
           """
             {{
