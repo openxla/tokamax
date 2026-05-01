@@ -273,7 +273,9 @@ def _ragged_contracting_dim_dot_kernel(
   num_iters = pl.cdiv(jnp.int32(hi - lo), block_k)
   acc = jnp.zeros((block_m, out_ref.shape[1]), dtype=jnp.float32)
   acc = jax.lax.fori_loop(0, num_iters - 1, body, acc)
-  acc = body(num_iters - 1, acc, mask_k=True)  # Mask final iteration.
+  # Clamp the masked-tail index so empty groups (num_iters == 0) read at i=0
+  # with mask `arange(block_k) < hi - lo == 0` (all False) instead of i=-1.
+  acc = body(jnp.maximum(num_iters - 1, 0), acc, mask_k=True)
   if activation is not None:
     acc = activation(acc)
   out_ref.store(acc.astype(out_ref.dtype))

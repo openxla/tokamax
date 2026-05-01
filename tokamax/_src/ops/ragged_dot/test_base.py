@@ -188,6 +188,79 @@ class RaggedDotTestBase(parameterized.TestCase):
         count = sum(group_sizes_)
         chex.assert_trees_all_close(actual[:count], expected[:count])
 
+  @parameterized.parameters(
+      # (num_groups, group_sizes_pattern_int)
+      # Mix of empty and non-empty groups, all bits patterns covered by
+      # `test_zero_group_sizes` for forward; here we cover representative
+      # patterns for VJP to keep runtime bounded.
+      # (Bit order is MSB-first via `jnp.unpackbits`.)
+      (8, 0b10101010),  # alternating; empty at groups 1, 3, 5, 7
+      (8, 0b01010101),  # alternating; empty at groups 0, 2, 4, 6
+      (8, 0b11110000),  # empty tail (groups 4-7)
+      (8, 0b00001111),  # empty prefix (groups 0-3)
+      (8, 0b11111110),  # single empty group at the end (group 7)
+      (8, 0b01111111),  # single empty group at the start (group 0)
+      (8, 0b10000001),  # empty groups in the middle (1-6)
+  )
+  def test_vjp_zero_group_sizes(self, num_groups, pattern):
+    """VJP correctness when some groups are empty.
+
+    This exercises the `drhs` ragged-contracting path. For any group `g` with
+    `group_sizes[g] == 0`, `rhs.grad[g]` must be exactly zero (no tokens
+    contributed to it). We also check the full gradient against the reference.
+    """
+    m, k, n = 1024, 128, 256
+    a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
+    bits = jnp.unpackbits(jnp.uint8(pattern))
+    group_sizes = jnp.where(bits, group_sizes, 0)
+
+    a_ref = a.astype(jnp.float32)
+    b_ref = b.astype(jnp.float32)
+    f = functools.partial(
+        self._dot_fn_f32,
+        group_sizes=group_sizes,
+        precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+    )
+    f_ref = functools.partial(ref, group_sizes=group_sizes)
+
+    actual_fwd, f_vjp = jax.vjp(f, a, b)
+    expected_fwd, f_ref_vjp = jax.vjp(f_ref, a_ref, b_ref)
+    count = int(jnp.sum(group_sizes))
+    chex.assert_trees_all_close(
+        actual_fwd[:count], expected_fwd[:count], atol=1e-5
+    )
+
+    dout = jax.nn.standardize(expected_fwd)
+    dout = dout.astype(jnp.bfloat16).astype(actual_fwd.dtype)
+    # Zero out the dout for padded rows so they don't contribute spurious
+    # gradient mass through the lhs path.
+    row_idx = jnp.arange(dout.shape[0])
+    dout = jnp.where(row_idx[:, None] < count, dout, 0)
+
+    expected_grads = f_ref_vjp(dout.astype(expected_fwd.dtype))
+    actual_grads = f_vjp(dout)
+
+    da_actual, db_actual = actual_grads
+    da_expected, db_expected = expected_grads
+
+    # Only compare lhs gradient for the populated rows. Padded rows are
+    # implementation-defined.
+    chex.assert_trees_all_close(
+        da_actual[:count], da_expected[:count], atol=0.02, rtol=0.005
+    )
+    chex.assert_trees_all_close(
+        db_actual, db_expected, atol=0.02, rtol=0.005
+    )
+
+    # Hard invariant: empty groups must have exactly-zero rhs gradient.
+    empty_groups = np.flatnonzero(np.asarray(group_sizes) == 0)
+    for g in empty_groups:
+      with self.subTest(f"empty_group_{int(g)}"):
+        np.testing.assert_array_equal(
+            np.asarray(db_actual[int(g)]),
+            np.zeros_like(np.asarray(db_actual[int(g)])),
+        )
+
   @parameterized.product(
       dtype=("int8", "int4"),
       a_tile_shape=(None, (1, 128), (1, 16), (256, 1), (16, 1)),
