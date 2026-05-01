@@ -17,6 +17,7 @@
 from collections.abc import Callable, Mapping
 import dataclasses
 import inspect
+import json
 from typing import Annotated, Any, Final, ParamSpec, Self, Sequence, TypeAlias
 
 from absl import logging
@@ -223,6 +224,43 @@ def get_bound_args(
       seen_keys.add((bound_arg.op.__class__.__name__, key))
       unique_bound_args.append(bound_arg)
   return tuple(unique_bound_args)
+
+
+def dump_bound_args_to_json(bound_args: Sequence[op_lib.BoundArguments]) -> str:
+  """Dumps a sequence of BoundArguments to a JSON string."""
+  def _strip_vjp_and_config(
+      bound_arg: op_lib.BoundArguments,
+  ) -> op_lib.BoundArguments:
+    """Strips the VJP and config from the BoundArguments."""
+    return bound_arg.replace(op=bound_arg.op.replace(vjp=None, config=None))
+
+  json_list = [
+      op_lib.BOUND_ARGS_ADAPTER.dump_python(bound_arg, mode="json")
+      for bound_arg in map(_strip_vjp_and_config, bound_args)
+  ]
+  return json.dumps(json_list, indent=2)
+
+
+def bound_args_to_json(
+    f: (
+        Callable[_P, Any]
+        | jax.stages.Lowered
+    ),
+    filename: str,
+) -> None:
+  """Dumps a sequence of BoundArguments to a JSON file."""
+  bound_args = get_bound_args(f)
+  json_string = dump_bound_args_to_json(bound_args)
+  with open(filename, "w") as f:
+    f.write(json_string)
+
+
+def bound_args_from_json(filename: str) -> list[op_lib.BoundArguments]:
+  """Loads a sequence of BoundArguments from a JSON file."""
+  with open(filename, "r") as f:
+    json_data = f.read()
+  json_list = json.loads(json_data)
+  return [op_lib.BOUND_ARGS_ADAPTER.validate_python(item) for item in json_list]
 
 
 _API_IMPLEMENTATIONS: Final[

@@ -16,5 +16,7 @@
 
 # pylint: disable=g-multiple-import,useless-import-alias, g-importing-member, unused-import
 from tokamax._src.autotuning.api import (
+    bound_args_from_json as bound_args_from_json,
+    bound_args_to_json as bound_args_to_json,
     get_bound_args as get_bound_args,
 )

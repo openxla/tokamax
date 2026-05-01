@@ -256,7 +256,19 @@ class AutotuningTest(parameterized.TestCase):
             or isinstance(benchmark, benchmarking.BenchmarkData)
         )
 
+  def test_bound_args_to_from_json(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
+    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    f_lowered = jax.jit(f).lower(*args)
+    tempfile = self.create_tempfile("bound_args.json")
+    api.bound_args_to_json(f_lowered, tempfile.full_path)
+    loaded_bound_args = api.bound_args_from_json(tempfile.full_path)
+    self.assertEqual(loaded_bound_args, list(expected))
+
   def test_autotuning_result_context(self):
+
     op = _FakeOp()
     ba = op.bind(jnp.zeros((1, 2)), jnp.zeros((3,)))
     ba2 = op.bind(jnp.zeros((4, 5)), jnp.zeros((6,)))
