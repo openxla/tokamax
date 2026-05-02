@@ -100,14 +100,14 @@ class TokamaxXlaKernelInfo(KernelInfoBase):
 
 # Adapted from `GetNameFromLocImpl` in `mhlo_to_hlo/location_exporter.cc`.
 def _get_op_name(loc: ir.Location) -> str:
-  if loc.is_a_name():
+  if isinstance(loc, ir.NameLoc):
     name = loc.name_str.split('@', maxsplit=1)[0]
     if name.endswith(':'):
       name = _get_op_name(loc.child_loc)
     return name
-  if loc.is_a_callsite():
+  if isinstance(loc, ir.CallSiteLoc):
     return _get_op_name(loc.callee)
-  if loc.is_a_fused():
+  if isinstance(loc, ir.FusedLoc):
     return ';'.join(filter(bool, map(_get_op_name, loc.locations)))
   return ''
 
@@ -156,13 +156,13 @@ def _get_shape_dtype(ty: ir.Type) -> jax.ShapeDtypeStruct:
 
 def _get_source_file_line(loc: ir.Location) -> tuple[str, int]:
   """Returns the source file and line number of a location."""
-  if loc.is_a_file():
+  if isinstance(loc, ir.FileLineColLoc):
     return loc.filename, loc.start_line
-  if loc.is_a_name():
+  if isinstance(loc, ir.NameLoc):
     return _get_source_file_line(loc.child_loc)
-  if loc.is_a_callsite():
+  if isinstance(loc, ir.CallSiteLoc):
     return _get_source_file_line(loc.callee)
-  if loc.is_a_fused():
+  if isinstance(loc, ir.FusedLoc):
     for inner_loc in reversed(loc.locations):
       file, line = _get_source_file_line(inner_loc)
       if file:
