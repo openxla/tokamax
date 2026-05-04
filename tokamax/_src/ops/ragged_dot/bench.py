@@ -70,6 +70,7 @@ _register_benchmark = functools.partial(
     benchmarking.get_benchmark_registrar(_IMPLS),
     iterations=3,
     items_processed_fn=_flops,
+    raise_on_error=False,
 )
 
 
