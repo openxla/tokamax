@@ -277,16 +277,18 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     # reasonable compilation time. From our experiments, we found that there
     # is no need on current TPU generations to search for larger tiles for m.
     tile_m_range = [
-        64 * (2**i)
+        128 * (2**i)
         for i in range(8)
-        if 64 * (2**i) <= m and 64 * (2**i) <= 1024
+        if 128 * (2**i) <= m and 128 * (2**i) <= 1024
     ]
 
     tile_k_range = set(
         [
             128 * (2**i) for i in range(8) if 128 * (2**i) <= k_
         ]  # upwards powers of 2
-        + [k_ // (2**i) for i in range(6)]  # downwards divisors of k_
+        + [
+            k_ // (2**i) for i in range(6) if k_ // (2**i) >= 128
+        ]  # downwards divisors of k_
         + [k]  # full tile
     )
 
@@ -294,7 +296,9 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
         [
             128 * (2**i) for i in range(8) if 128 * (2**i) <= n_
         ]  # upwards powers of 2
-        + [n_ // (2**i) for i in range(6)]  # downwards divisors of n_
+        + [
+            n_ // (2**i) for i in range(6) if n_ // (2**i) >= 128
+        ]  # downwards divisors of n_
         + [n]  # full tile
     )
     input_buffer_count_range = [2, 3, 4]
