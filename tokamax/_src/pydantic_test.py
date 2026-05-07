@@ -21,6 +21,7 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pydantic
 from tokamax._src import batching
@@ -201,6 +202,11 @@ class PydanticTest(parameterized.TestCase):
     object.__setattr__(op_roundtrip, "vjp", None)
     self.assertEqual(op, op_roundtrip)
 
+  def test_ml_dtypes_serialization(self):
+    adapter = pydantic.TypeAdapter(pydantic_lib.NumpyDtype)
+    self.assertEqual(b'"bfloat16"', adapter.dump_json(ml_dtypes.bfloat16))
+    self.assertEqual("bfloat16", adapter.dump_python(ml_dtypes.bfloat16))
+    self.assertEqual(ml_dtypes.bfloat16, adapter.validate_json('"bfloat16"'))
 
 if __name__ == "__main__":
   absltest.main()

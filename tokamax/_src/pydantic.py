@@ -56,10 +56,17 @@ def _validate_np_dtype(x) -> np.dtype:
   return x if isinstance(x, np.dtype) else np.dtype(x)
 
 
+def _serialize_np_dtype(dtype) -> str:
+  try:
+    return dtype.name
+  except AttributeError:
+    return getattr(dtype, '__name__', str(dtype))
+
+
 NumpyDtype: TypeAlias = Annotated[
     np.dtype,
     pydantic.PlainValidator(_validate_np_dtype),
-    pydantic.PlainSerializer(lambda dtype: dtype.name),
+    pydantic.PlainSerializer(_serialize_np_dtype),
 ]
 
 
