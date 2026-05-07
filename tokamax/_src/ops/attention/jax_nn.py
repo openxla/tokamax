@@ -82,8 +82,8 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       raise NotImplementedError("Paged attention not supported.")
 
     q, k, v = map(quantization.as_array, (q, k, v))
-    precision = precision_lib.to_dot_algorithm_preset(
-        q.dtype, k.dtype, precision[0]
+    precision_str = str(
+        precision_lib.to_dot_algorithm_preset(q.dtype, k.dtype, precision[0])
     )
 
     is_causal = False
@@ -106,7 +106,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
 
     q_len_or_indices = q_indices if q_indices is not None else q.shape[-3]
     k_len_or_indices = k_indices if k_indices is not None else k.shape[-3]
-    mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+    mask = mask.as_array(q_len_or_indices, k_len_or_indices)  # pyrefly: ignore[bad-assignment]
 
     *batch, seq_len_q, num_heads, head_dim = q.shape
     *_, seq_len_k, _, head_dim_out = v.shape
@@ -132,9 +132,9 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       if bias is not None:
         bias = jnp.broadcast_to(bias, (*bias.shape[:-2], seq_len_q, seq_len_k))
       if mask is not None:
-        mask = jnp.broadcast_to(mask, (*mask.shape[:-2], seq_len_q, seq_len_k))
+        mask = jnp.broadcast_to(mask, (*mask.shape[:-2], seq_len_q, seq_len_k))  # pyrefly: ignore[bad-assignment]
 
-    with jax.default_matmul_precision(str(precision)):
+    with jax.default_matmul_precision(precision_str):
       out = jax.nn.dot_product_attention(
           q,
           k,

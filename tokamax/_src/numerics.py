@@ -117,14 +117,14 @@ def array_diff_summary(
 def array_numeric_summary(x: jax.Array) -> NumericSummary:
   """Produce a numerical summary of an array."""
   # Convert to numpy fp64 array to avoid issues with XLA:GPU numerics.
-  x = np.array(x).astype(np.float64)
+  x = np.array(x).astype(np.float64)  # pyrefly: ignore[bad-assignment]
   return NumericSummary(
-      has_inf=np.isinf(x).any(),
-      has_nan=np.isnan(x).any(),
-      min=np.nanmin(x),
-      max=np.nanmax(x),
-      mean=np.nanmean(x),
-      mean_abs=np.nanmean(np.abs(x)),
+      has_inf=bool(np.isinf(x).any()),
+      has_nan=bool(np.isnan(x).any()),
+      min=float(np.nanmin(x)),
+      max=float(np.nanmax(x)),
+      mean=float(np.nanmean(x)),
+      mean_abs=float(np.nanmean(np.abs(x))),
   )
 
 

@@ -57,7 +57,8 @@ class AutotuningData(
       return min(valid_benchmarks, key=key_fn)[0]
     except ValueError as e:
       if self:
-        raise ExceptionGroup("All configs failed", tuple(self.values())) from e
+        exceptions = cast(tuple[Exception, ...], tuple(self.values()))
+        raise ExceptionGroup("All configs failed", exceptions) from e
       raise ValueError("Autotuning data is empty") from e
 
   def prune(self) -> Self:
@@ -88,11 +89,14 @@ class AutotuningData(
         ),
     )
 
+  def __or__(self, other: Self) -> Self:
+    return AutotuningData(super().__or__(other))
+
 
 def _compile(fn_factory, config, args, kwargs, *, seed=None):
   fn = fn_factory(config)
   fn, x = benchmarking.standardize_function(fn, *args, kwargs=kwargs, seed=seed)
-  return benchmarking.compile_benchmark(fn, x), x
+  return benchmarking.compile_benchmark(fn, x), x  # pyrefly: ignore[bad-argument-type]
 
 
 def _benchmark(fn_factory, config, args, kwargs, event_filter_regex=None):
@@ -127,7 +131,7 @@ class Autotuner:
       fn_factory: Callable[[_Config], Callable[_P, Any]],
       configs: set[_Config],
       *args: _P.args,
-      event_filter_regex: str | None = None,
+      event_filter_regex: str | None = None,  # pyrefly: ignore[bad-function-definition]
       **kwargs: _P.kwargs,
   ) -> AutotuningData[_Config]:
     """Autotunes over configs for the given arguments."""
@@ -164,7 +168,7 @@ class Autotuner:
                   ),
                   initialized_args,
               )
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
               vlog_exc_info("Config failed to compile: %s", config)
               results[config] = e
         except TimeoutError as e:
@@ -224,7 +228,7 @@ class Autotuner:
           1,
           "best config is %s (median execution time: %f ms)",
           config,
-          results[config].median_evaluation_time_ms,
+          cast(BenchmarkData, results[config]).median_evaluation_time_ms,
       )
     except ExceptionGroup:
       logging.exception("all configs failed for %s", fn_factory)

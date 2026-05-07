@@ -27,7 +27,7 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Any, Final, Literal, TypeAlias, TypeVar
+from typing import Any, Final, Literal, TypeAlias, TypeVar, overload
 
 import jax
 from jax.experimental.mosaic.gpu import profiler
@@ -262,9 +262,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     if self._jax_profiler_mode:
       jax.profiler.stop_trace()
       # get profiling wallclock time right after the profiling ends
-      profiling_time = time.perf_counter() - self._profiler_wallclock_start_time
+      end_time = time.perf_counter()
+      assert (start_time := self._profiler_wallclock_start_time) is not None
       self._profiler_wallclock_start_time = None
-      self._profiler_wallclock_time = profiling_time
+      self._profiler_wallclock_time = end_time - start_time
       assert self._profile_tempdir is not None, 'Profile tempdir should be set.'
       profile_paths = list(
           pathlib.Path(self._profile_tempdir).glob('**/*.xplane.pb')
@@ -284,21 +285,18 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       logger.info('JAX profiler trace file written to: %s', profile_path)
       self._profile_tempdir = None
     else:
-      assert profile_data is not None and self._xprof_session is not None
-      if self._xprof_session is None:
-        raise AssertionError(
-            '__exit__ called without a prior call to __enter__'
-        )
+      assert self._xprof_session is not None
       if self._hermetic:
         xspace = self._xprof_session.end_session_and_get_xspace()
       else:
         xspace, url = self._xprof_session.end_session_and_get_xspace_and_url()
         self.xprof_url = url
       # get profiling wallclock time right after the profiling ends
-      profiling_time = time.perf_counter() - self._profiler_wallclock_start_time
+      end_time = time.perf_counter()
+      assert (start_time := self._profiler_wallclock_start_time) is not None
       self._profiler_wallclock_start_time = None
-      self._profiler_wallclock_time = profiling_time
-
+      self._profiler_wallclock_time = end_time - start_time
+      assert profile_data is not None
       self._profile = profile_data.ProfileData.from_serialized_xspace(
           xspace.SerializeToString()
       )
@@ -307,6 +305,30 @@ class XprofProfileSession(contextlib.AbstractContextManager):
 _ARRAY_TYPES = (
     jax.Array, numerics.ArrayInitializer, jax.ShapeDtypeStruct, np.ndarray
 )
+
+
+@overload
+def standardize_function(  # pyrefly: ignore[inconsistent-overload]
+    f: Callable[..., T],
+    *args: PyTree,
+    kwargs: Mapping[str, PyTree] | None = None,
+    mode: BenchmarkMode = ...,
+    seed: int = ...,
+) -> tuple[Callable[[list[jax.Array]], RetT], list[jax.Array]]:
+  ...
+
+
+@overload
+def standardize_function(
+    f: Callable[..., T],
+    *args: PyTree,
+    kwargs: Mapping[str, PyTree] | None = None,
+    mode: BenchmarkMode = ...,
+    seed: None,
+) -> tuple[
+    Callable[[list[jax.Array]], RetT], list[jax.Array | jax.ShapeDtypeStruct]
+]:
+  ...
 
 
 def standardize_function(
@@ -447,7 +469,10 @@ _TIMERS: dict[str, Callable[[Callable[[T], Any], T], Timer]] = {
     'hermetic_xprof': hermetic_xprof_timer,
 }
 
-_DEFAULT_TIMING_METHOD = {'gpu': 'cupti', 'tpu': 'hermetic_xprof'}
+_DEFAULT_TIMING_METHOD: Final[dict[str, TimingMethod]] = {
+    'gpu': 'cupti',
+    'tpu': 'hermetic_xprof',
+}
 _FALLBACK_TIMING_METHOD = 'wallclock'
 
 
@@ -471,7 +496,8 @@ def compile_benchmark(
   f_compiled = lowered.compile()
   compile_time = time.perf_counter() - start_time
 
-  peak_mem_mb = f_compiled.memory_analysis().peak_memory_in_bytes / 10**6
+  assert (memory_analysis := f_compiled.memory_analysis()) is not None
+  peak_mem_mb = memory_analysis.peak_memory_in_bytes / 10**6
 
   def runner(
       x: T,

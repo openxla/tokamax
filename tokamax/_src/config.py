@@ -47,15 +47,18 @@ class _ConfigOption(Generic[_T]):
 
   flag: flags.FlagHolder[_T]
 
-  def __call__(self, value: _T) -> contextlib.AbstractContextManager[None]:
+  def __call__(
+      self, value: _T | str
+  ) -> contextlib.AbstractContextManager[None]:
     name = self.flag.name
     flag = self.flag._flagvalues[name]
+
     try:
-      value = flag.parser.parse(value)
+      value_ = flag.parser.parse(value) if isinstance(value, str) else value
     except ValueError as e:
       raise ValueError(f"Invalid value for config `{name}`: {value}") from e
 
-    return _option_override_scope(name, value)
+    return _option_override_scope(name, value_)
 
   @property
   def value(self) -> _T:

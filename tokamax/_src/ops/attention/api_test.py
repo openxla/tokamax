@@ -348,11 +348,9 @@ class DotProductAttentionTest(parameterized.TestCase):
     bwd_fn = lambda x: jax.vjp(fwd_fn, x)[1](x)
     f = jax.jit(fwd_fn) if mode == 'fwd' else jax.jit(bwd_fn)
 
-    mem = f.lower(x).compile().memory_analysis().peak_memory_in_bytes
-    mem_scale = (
-        f.lower(x_scale).compile().memory_analysis().peak_memory_in_bytes
-    )
-    mem_increase = mem_scale / mem
+    assert (mem0 := f.lower(x).compile().memory_analysis()) is not None
+    assert (mem1 := f.lower(x_scale).compile().memory_analysis()) is not None
+    mem_increase = mem1.peak_memory_in_bytes / mem0.peak_memory_in_bytes
 
     if self.IMPL == 'xla':
       self.assertBetween(

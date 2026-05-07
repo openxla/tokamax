@@ -73,7 +73,7 @@ def canonicalize_precision(precision: PrecisionLike) -> CanonicalPrecision:
   """Canonicalizes a `PrecisionLike`."""
 
   if precision is None:
-    if (precision := jax.config.jax_default_matmul_precision) is None:
+    if (precision := jax.config.jax_default_matmul_precision) is None:  # pyrefly: ignore[missing-attribute]
       return Precision.DEFAULT, Precision.DEFAULT
   if isinstance(precision, str):
     if precision in DotAlgorithmPreset.__members__:
@@ -95,7 +95,7 @@ def canonicalize_precision(precision: PrecisionLike) -> CanonicalPrecision:
   if isinstance(precision, (list, tuple)) and len(precision) == 2:
     p0, p1 = precision
     if isinstance(p0, Precision) and isinstance(p1, Precision):
-      return precision
+      return p0, p1
     if isinstance(p0, str) and isinstance(p1, str):
       return Precision(p0), Precision(p1)
   raise ValueError(f"Invalid precision: {precision}")

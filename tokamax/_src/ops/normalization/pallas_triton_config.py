@@ -90,7 +90,7 @@ def get_heuristics_config(
     **_,
 ) -> Config:
   """Returns a config based on heuristics."""
-  x = jax.ShapeDtypeStruct(canonicalize_shape(x.shape, axis), x.dtype)
+  x = jax.ShapeDtypeStruct(canonicalize_shape(x.shape, axis), x.dtype)  # pyrefly: ignore[bad-assignment]
   # We get diminishing returns, and worse load-balancing, with `block_m > 32`.
   # `block_m == 1` appears best whenever not reducing in trailing axis.
   block_m = 32 if x.ndim == 2 else 1

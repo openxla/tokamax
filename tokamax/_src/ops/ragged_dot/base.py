@@ -233,7 +233,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       # TODO: Support batch dims on LHS and/or RHS?
       ragged_dot_dimension_numbers = DEFAULT_RAGGED_DOT_DIM_NUMS
 
-    if isinstance(group_sizes, (tuple, list)):
+    if isinstance(group_sizes, Sequence):
       group_sizes = tuple(group_sizes)
       group_sizes = GroupSizes(jnp.array(group_sizes, jnp.int32), group_sizes)
 
@@ -281,7 +281,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     lhs, rhs = map(quantization.as_array, (lhs, rhs))
 
     if isinstance(group_sizes, GroupSizes):
-      group_sizes = group_sizes.value
+      group_sizes = jnp.asarray(group_sizes.value)
 
     # NOTE: `preferred_element_type` changes the accumulation type when using
     # `jax.lax.Precision`. It would be easier to always convert the precision to

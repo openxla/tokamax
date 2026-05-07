@@ -17,7 +17,7 @@
 from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import immutabledict
 import jax
@@ -176,9 +176,9 @@ def _get_common_kernel_info(
   """Extracts common kernel information from a `stablehlo` op."""
   source_file, source_line = _get_source_file_line(op.location)
 
-  parent = op.parent
-  while parent.parent is not None:  # pytype: disable=attribute-error
-    parent = parent.parent
+  assert (parent := op.parent) is not None
+  while (grandparent := parent.parent) is not None:
+    parent = grandparent
 
   # Capture input / output layouts?
   return dict(
@@ -188,7 +188,7 @@ def _get_common_kernel_info(
       op_name=';'.join(filter(bool, call_stack + (_get_op_name(op.location),))),
       source_line=source_line,
       source_file=source_file,
-      hlo_module_name=parent.opview.sym_name.value,
+      hlo_module_name=parent.opview.sym_name.value,  # pytype: disable=attribute-error
   )
 
 
@@ -201,12 +201,17 @@ def _get_pallas_kernel_info(
   elif isinstance(config, ir.StringAttr):
     assert not ir.StringAttr(config).value
     config = op.attributes['mhlo.backend_config']
+  assert isinstance(config, ir.DictAttr)
+  int_ = lambda x: ir.IntegerAttr(x).value
+  grid_x = int_(config['grid_x'])
+  grid_y = int_(config['grid_y'])
+  grid_z = int_(config['grid_z'])
   return TritonKernelInfo(
       **_get_common_kernel_info(op, call_stack),
-      kernel_name=config['name'].value,
-      num_warps=config['num_warps'].value,
-      num_stages=config['num_stages'].value,
-      grid=tuple(config[f'grid_{dim}'].value for dim in ('x', 'y', 'z')),
+      kernel_name=ir.StringAttr(config['name']).value,
+      num_warps=int_(config['num_warps']),
+      num_stages=int_(config['num_stages']),
+      grid=(grid_x, grid_y, grid_z),
       compute_capability=None,
       metadata=b'',
   )
@@ -242,7 +247,8 @@ def get_kernel_info(
     A tuple of KernelInfoBase objects.
   """
   if isinstance(x, jax.stages.Lowered):
-    x = x.compiler_ir('stablehlo')
+    assert (module := x.compiler_ir('stablehlo')) is not None
+    x = cast(ir.Module, module)
 
   symbol_table = ir.SymbolTable(x.operation)
   infos = []
@@ -250,29 +256,29 @@ def get_kernel_info(
   def handle_op(
       op: ir.Operation, call_stack: tuple[str, ...] = ()
   ) -> ir.WalkResult:
-    op = op.opview
+    op_ = op.opview
 
-    if isinstance(op, stablehlo.CustomCallOp):
-      if (getter := _KERNEL_GETTER.get(op.call_target_name.value)) is not None:  # pytype: disable=attribute-error
-        infos.append(getter(op, call_stack))
-    elif isinstance(op, func.CallOp):
-      callee = symbol_table[op.callee.value]  # pytype: disable=attribute-error
-      call_stack = call_stack + (_get_op_name(op.location),)
+    if isinstance(op_, stablehlo.CustomCallOp):
+      if (getter := _KERNEL_GETTER.get(op_.call_target_name.value)) is not None:  # pytype: disable=attribute-error
+        infos.append(getter(op_, call_stack))
+    elif isinstance(op_, func.CallOp):
+      callee = symbol_table[op_.callee.value]  # pytype: disable=attribute-error
+      call_stack = call_stack + (_get_op_name(op_.location),)
       callee.operation.walk(functools.partial(handle_op, call_stack=call_stack))
-    elif isinstance(op, func.FuncOp):
-      if op.name.value != 'main':  # pytype: disable=attribute-error
+    elif isinstance(op_, func.FuncOp):
+      if op_.name.value != 'main':  # pytype: disable=attribute-error
         return ir.WalkResult.SKIP
     elif (
         include_xla_kernels
-        and isinstance(op.name, str)  # `FuncOp` returns `StringAttr`.
-        and op.name.startswith('stablehlo.')
-        and op.name[len('stablehlo.') :] not in _XLA_NOISE_OPCODES
+        and isinstance(op_.name, str)  # `FuncOp` returns `StringAttr`.
+        and op_.name.startswith('stablehlo.')
+        and op_.name[len('stablehlo.') :] not in _XLA_NOISE_OPCODES
         and (
             any(_TOKAMAX_NAME in name for name in call_stack)
-            or _TOKAMAX_NAME in _get_op_name(op.location)
+            or _TOKAMAX_NAME in _get_op_name(op_.location)
         )
     ):
-      infos.append(_get_tokamax_xla_kernel_info(op, call_stack))
+      infos.append(_get_tokamax_xla_kernel_info(op_, call_stack))
     return ir.WalkResult.ADVANCE
 
   x.operation.walk(handle_op, ir.WalkOrder.PRE_ORDER)

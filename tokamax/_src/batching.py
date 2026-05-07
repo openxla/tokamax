@@ -217,5 +217,5 @@ def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
   params['batched_args'] = params['batched_args'].replace(
       kind=inspect.Parameter.KEYWORD_ONLY, default=None
   )
-  wrapped.__signature__ = orig_sig.replace(parameters=tuple(params.values()))
+  wrapped.__signature__ = orig_sig.replace(parameters=tuple(params.values()))  # pyrefly: ignore[missing-attribute]
   return wrapped

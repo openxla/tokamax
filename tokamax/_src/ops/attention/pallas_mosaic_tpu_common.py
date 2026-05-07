@@ -14,9 +14,8 @@
 # ==============================================================================
 """Common utilities for Pallas Mosaic TPU attention."""
 
-import dataclasses
 import functools
-from typing import Any, Final
+from typing import Final
 
 import jax
 import jax.numpy as jnp
@@ -76,11 +75,8 @@ def build_splash_kernel(
   shard_count = 1
   mask_shape = (q_seq_len, kv_seq_len)
   if mask.bool_mask is not None:
-    splash_mask = jax.lax.collapse(
-        jax.lax.broadcast_to_rank(mask.as_array(q_seq_len, kv_seq_len), 4),
-        0,
-        -3,
-    )
+    assert (mask_ := mask.as_array(q_seq_len, kv_seq_len)) is not None
+    splash_mask = jax.lax.collapse(jax.lax.broadcast_to_rank(mask_, 4), 0, -3)
     mask_batch_size, num_mask_heads, _, _ = splash_mask.shape
     # TODO: Support boolean masks differing across heads.
     if num_mask_heads != 1:
@@ -116,6 +112,3 @@ def build_splash_kernel(
       downcast_smem_data=False,
   )
   return splash_fn
-
-
-

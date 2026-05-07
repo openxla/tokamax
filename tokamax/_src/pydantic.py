@@ -33,7 +33,7 @@ import pydantic
 import pydantic_core
 from pydantic_core import core_schema as cs
 from tokamax._src import batching
-from typing_extensions import TypedDict  # Required for Python <3.12.
+from typing_extensions import TypedDict, override  # Required for Python <3.12.
 
 # TODO: Directly import ManualAxisType JAX is upgraded.
 try:
@@ -151,19 +151,28 @@ def annotate(ty: Any) -> Any:
 _T = TypeVar('_T')
 
 
-class TypeAdapter(pydantic.TypeAdapter[_T], Generic[_T]):
+class TypeAdapter(Generic[_T]):
   """`TypeAdapter` where serialization info is be passed to `dump_python`.
 
   The `mode` and `round_trip` attributes from the `SerializationInfo` are
   forwarded to the `dump_python` method of the underlying `TypeAdapter`.
   """
 
+  def __init__(self, type: type[_T]):
+    self._impl = pydantic.TypeAdapter(type)
+
+  def dump_json(self, instance: _T, /, **kwargs) -> bytes:
+    return self._impl.dump_json(instance, **kwargs)
+
   def dump_python(
-      self, instance: Any, info: pydantic.SerializationInfo, **kwargs
+      self, instance: _T, /, info: pydantic.SerializationInfo, **kwargs
   ) -> Any:
     kwargs.setdefault('mode', info.mode)
     kwargs.setdefault('round_trip', info.round_trip)
-    return super().dump_python(instance, **kwargs)
+    return self._impl.dump_python(instance, **kwargs)
+
+  def validate_python(self, object: Any, /) -> _T:
+    return self._impl.validate_python(object)
 
 
 get_adapter = functools.lru_cache(TypeAdapter)
@@ -177,8 +186,8 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
   """
 
   @classmethod
-  def __class_getitem__(cls, item: _T) -> _T:
-    return Annotated[item, cls()]
+  def __class_getitem__(cls, item: type[_T]) -> type[_T]:
+    return Annotated[item, cls()]  # pyrefly: ignore[bad-return]
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
@@ -330,9 +339,7 @@ class ShapeDtype:
     )
 
 
-def get_arg_spec_model(
-    name: str, signature: inspect.Signature
-) -> type[dict[str, Any]]:
+def get_arg_spec_model(name: str, signature: inspect.Signature) -> type[Any]:
   """Returns a new `TypedDict` type for the given `inspect.Signature`."""
   fields = {}
   for param_name, p in signature.parameters.items():

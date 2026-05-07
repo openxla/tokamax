@@ -32,7 +32,8 @@ def _compute_capability(device: jax.Device | None = None) -> float | None:
   if device.platform != 'gpu':
     return None
 
-  return float(getattr(device, 'compute_capability', None))
+  cc = getattr(device, 'compute_capability', None)
+  return None if cc is None else float(cc)
 
 
 def _cc_between(

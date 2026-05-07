@@ -26,8 +26,6 @@ from tokamax._src.ops.triangle_multiplication import base
 Implementation: TypeAlias = Literal["xla"]
 
 IMPLEMENTATIONS = dict(xla=base.TriangleMultiplication())
-
-
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = ("xla",)
 
 
@@ -81,8 +79,7 @@ def triangle_multiplication(
   """
   if implementation is None:
     implementation = _DEFAULT_IMPLEMENTATIONS
-
-  if not isinstance(implementation, (tuple, list)):
+  elif isinstance(implementation, str):
     implementation = (implementation,)
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")

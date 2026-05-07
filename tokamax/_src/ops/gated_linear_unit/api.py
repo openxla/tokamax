@@ -27,28 +27,29 @@ from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights
 
 Implementation: TypeAlias = Literal['mosaic', 'triton', 'xla']
 
-IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
-_DEFAULT_IMPLEMENTATION = ('xla',)
+_IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
+_DEFAULT_IMPLEMENTATIONS = ('xla',)
 
 try:
   from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pallas_mgpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
-  IMPLEMENTATIONS['mosaic'] = pallas_mgpu.PallasMosaicGpuGatedLinearUnit()
-  _DEFAULT_IMPLEMENTATION = ('mosaic',) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS['mosaic'] = pallas_mgpu.PallasMosaicGpuGatedLinearUnit()
+  _DEFAULT_IMPLEMENTATIONS = ('mosaic',) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 try:
   from tokamax._src.ops.gated_linear_unit import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
-  IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
-  _DEFAULT_IMPLEMENTATION = ('triton',) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
+  _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(IMPLEMENTATIONS)
+    immutabledict.immutabledict(_IMPLEMENTATIONS)
 )
+del _IMPLEMENTATIONS
 
 
 def gated_linear_unit(
@@ -93,9 +94,8 @@ def gated_linear_unit(
   """
 
   if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATION
-
-  if not isinstance(implementation, (tuple, list)):
+    implementation = _DEFAULT_IMPLEMENTATIONS
+  elif isinstance(implementation, str):
     implementation = (implementation,)
   elif not implementation:
     raise ValueError('`implementation` must not be an empty sequence.')

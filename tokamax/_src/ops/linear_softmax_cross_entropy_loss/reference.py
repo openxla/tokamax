@@ -28,7 +28,7 @@ def linear_softmax_cross_entropy_loss_fwd_reference(
     w: Real[Array, "H V"],
     *,
     reduction: Literal["sum", "mean"] = "sum",
-) -> Real[Scalar, ""]:
+) -> tuple[Real[Scalar, ""], Real[Scalar, ""]]:
   """The reference Jax implementation of the linear softmax cross-entropy loss."""
   logits = x @ w
   log_probs = jax.nn.log_softmax(logits, axis=-1)

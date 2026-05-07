@@ -28,31 +28,31 @@ from tokamax._src.ops.ragged_dot import base
 QArray = qwix.QArray
 Implementation: TypeAlias = Literal["mosaic", "triton", "xla"]
 
-IMPLEMENTATIONS = dict(xla=base.RaggedDot())
-_DEFAULT_IMPLEMENTATION = ("xla",)
+_IMPLEMENTATIONS = dict(xla=base.RaggedDot())
+_DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
   from tokamax._src.ops.ragged_dot import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
-  IMPLEMENTATIONS["triton"] = pallas_triton.PallasTritonRaggedDot()
-  _DEFAULT_IMPLEMENTATION = ("triton",) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS["triton"] = pallas_triton.PallasTritonRaggedDot()
+  _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 try:
   from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
-  IMPLEMENTATIONS["mosaic_gpu"] = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
-  _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS["mosaic_gpu"] = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
+  _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
 try:
   from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
-  IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
-  if "mosaic" not in _DEFAULT_IMPLEMENTATION:
-    _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
+  _IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+  if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
+    _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
@@ -63,8 +63,9 @@ except ImportError:
   ManualAxisType = Any
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
-    immutabledict.immutabledict(IMPLEMENTATIONS)
+    immutabledict.immutabledict(_IMPLEMENTATIONS)
 )
+del _IMPLEMENTATIONS
 
 
 def ragged_dot(
@@ -177,9 +178,8 @@ def ragged_dot_general(
     raise NotImplementedError("`group_offset` is not yet supported.")
 
   if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATION
-
-  if not isinstance(implementation, (tuple, list)):
+    implementation = _DEFAULT_IMPLEMENTATIONS
+  elif isinstance(implementation, str):
     implementation = (implementation,)
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")

@@ -197,5 +197,5 @@ class GatedLinearUnitVjp(
       )
       return out, (x, weights, residuals)
 
-    vjp_fn = ad.get_vjp_taking_residuals(fn, x, weights)
+    assert (vjp_fn := ad.get_vjp_taking_residuals(fn, x, weights)) is not None
     return vjp_fn((x, weights, residuals), dout), None

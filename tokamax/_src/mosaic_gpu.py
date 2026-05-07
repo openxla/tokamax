@@ -15,6 +15,7 @@
 """Mosaic-GPU utils."""
 
 import functools
+from typing import cast
 
 import jax
 from jax.experimental import pallas as pl
@@ -196,21 +197,24 @@ def int4_as_biased_f8e4m3fn(x, layout):
 
     def upcast_i4_to_fp8_biased(reg: ir.Value):
 
-      out_struct = llvm.inline_asm(
-          llvm.StructType.get_literal((i32, i32)),
-          [reg],
-          """
-            {{
-            .reg .b32 biased, evens, odds, odds_raw;
-            xor.b32 biased, $2, 0x88888888;
-            and.b32 evens, biased, 0x0F0F0F0F;
-            shr.u32 odds_raw, biased, 4;
-            and.b32 odds, odds_raw, 0x0F0F0F0F;
-            prmt.b32 $0, evens, odds, 0x5140;
-            prmt.b32 $1, evens, odds, 0x7362;
-            }}
-            """,
-          "=r,=r,r",
+      out_struct = cast(
+          ir.Value,
+          llvm.inline_asm(
+              llvm.StructType.get_literal((i32, i32)),
+              [reg],
+              """
+              {{
+              .reg .b32 biased, evens, odds, odds_raw;
+              xor.b32 biased, $2, 0x88888888;
+              and.b32 evens, biased, 0x0F0F0F0F;
+              shr.u32 odds_raw, biased, 4;
+              and.b32 odds, odds_raw, 0x0F0F0F0F;
+              prmt.b32 $0, evens, odds, 0x5140;
+              prmt.b32 $1, evens, odds, 0x7362;
+              }}
+              """,
+              "=r,=r,r",
+          ),
       )
 
       lo_i32 = llvm.extractvalue(i32, out_struct, (0,))
