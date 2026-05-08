@@ -23,8 +23,10 @@ from typing import Any, Literal, TypeAlias
 # forward_only models are models that only require forward passes - meaning no
 # vjp tuning is required.
 # Primary arg specs support models that are considered important for key
-# users. These are used for nightly benchmarking.
-Tag: TypeAlias = Literal['primary', 'forward_only']
+# users. These are used for internal nightly benchmarking.
+# 'ci_tests' arg specs are used for tests that run as part of the CI flow.
+# 'primary' arg specs are a superset of 'ci_tests' arg specs.
+Tag: TypeAlias = Literal['primary', 'forward_only', 'ci_tests']
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

@@ -69,7 +69,7 @@ def override_chex_args(**kwargs):
 
 
 NAMED_ARG_SPECS = {
-    s.full_name: s.args for s in ARG_SPECS if "primary" in s.tags
+    s.full_name: s.args for s in ARG_SPECS if "ci_tests" in s.tags
 }
 
 

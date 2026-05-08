@@ -56,7 +56,7 @@ def _make_argspec(
       },
       project=project,
       name=name,
-      tags=('primary',),
+      tags=('primary', 'ci_tests'),
   )
 
 
