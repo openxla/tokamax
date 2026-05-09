@@ -116,7 +116,9 @@ class AutotuningResult:
     # Convert to a dictionary and serialize out the op.
     device_autotuning_dict = {}
     for ba, data in self.data:
-      device_autotuning_dict.setdefault(ba.op, {})[ba.arguments] = data
+      device_autotuning_dict.setdefault(ba.op, {})[
+          ba.arguments
+      ] = data.prune_errors()
 
     for op, cache in device_autotuning_dict.items():
       adapter = cache_lib._get_cache_adapter(op)  # pylint: disable=protected-access
