@@ -18,11 +18,13 @@ from collections.abc import Callable
 import dataclasses
 import functools
 from typing import Any, Final, cast
+import zlib
 
 import immutabledict
 import jax
 from jax import export
 from jax.interpreters import mlir
+from jax.jaxlib.gpu import triton_pb2
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import func
@@ -217,6 +219,29 @@ def _get_pallas_kernel_info(
   )
 
 
+def _get_triton_ffi_kernel_info(
+    op: stablehlo.CustomCallOp, call_stack: tuple[str, ...]
+) -> TritonKernelInfo:
+  """Get Triton FFI kernel info from a `stablehlo.CustomCallOp`."""
+  config = op.backend_config
+  if config is None or (isinstance(config, ir.StringAttr) and not config.value):
+    config = op.attributes['mhlo.backend_config']
+  assert isinstance(config, ir.DictAttr)
+  opaque = ir.StringAttr(config['opaque']).value_bytes
+  proto = triton_pb2.TritonAnyKernelCall.FromString(zlib.decompress(opaque))
+  kernel_call = proto.kernel_call
+  kernel = kernel_call.kernel
+  return TritonKernelInfo(
+      **_get_common_kernel_info(op, call_stack),
+      kernel_name=kernel.kernel_name,
+      compute_capability=kernel.compute_capability,
+      num_warps=kernel.num_warps,
+      num_stages=None,
+      grid=(kernel_call.grid_0, kernel_call.grid_1, kernel_call.grid_2),
+      metadata=proto.metadata,
+  )
+
+
 def _kernel_info_getter(cls):
   return lambda op, call_stack: cls(**_get_common_kernel_info(op, call_stack))
 
@@ -229,6 +254,7 @@ _KERNEL_GETTER: Final[
     _MOSAIC_GPU_KEY: _kernel_info_getter(MosaicGpuKernelInfo),
     _MOSAIC_TPU_KEY: _kernel_info_getter(MosaicTpuKernelInfo),
     _PALLAS_TRITON_KEY: _get_pallas_kernel_info,
+    _TRITON_FFI_KEY: _get_triton_ffi_kernel_info,
 })
 _get_tokamax_xla_kernel_info = _kernel_info_getter(TokamaxXlaKernelInfo)
 
