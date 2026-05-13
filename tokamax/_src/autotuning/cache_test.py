@@ -21,8 +21,12 @@ from typing import Any, Final
 from absl.testing import absltest
 from absl.testing import parameterized
 import immutabledict
+import jax
+import jax.numpy as jnp
+from tokamax._src import config as config_lib
 from tokamax._src.autotuning import cache
 from tokamax._src.ops.attention import base as attention_base
+from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.normalization import pallas_triton
 
 _CACHE_PATHS: Final[immutabledict.immutabledict[str, str]] = (
@@ -57,6 +61,28 @@ class CacheTest(parameterized.TestCase):
             self.assertTrue(cache_file.is_file())
             self.assertTrue(cache_file.name.endswith(".json"))
             json.loads(cache_file.read_text())
+
+  def test_ignore_cache(self):
+    with config_lib.ignore_autotuning_cache(True):
+      self.assertEmpty(
+          cache.AutotuningCache(
+              pallas_triton.PallasTritonNormalization()
+          )._load_cache("NVIDIA H100 80GB HBM3")
+      )
+    with config_lib.ignore_autotuning_cache(False):
+      self.assertNotEmpty(
+          cache.AutotuningCache(
+              pallas_triton.PallasTritonNormalization()
+          )._load_cache("NVIDIA H100 80GB HBM3")
+      )
+
+  def test_caches_exist(self):
+    """Checks that the cache files exist for some basic cache files."""
+    # Add more caches for other devices and operations.
+    tokamax_files = resources.files("tokamax")
+    for file_name in _KNOWN_EXTERNAL_CACHE_FILE_NAMES:
+      path = tokamax_files / _CACHE_PATHS["external"] / file_name
+      self.assertTrue(path.is_file())
 
 
 if __name__ == "__main__":

@@ -13,12 +13,14 @@
 # limitations under the License.
 # ==============================================================================
 
+import collections
 import functools
 from unittest import mock
 
 from absl.testing import absltest
 import chex
 import jax
+from tokamax._src import hlo_utils
 from tokamax._src.ops.normalization import pallas_triton
 from tokamax._src.ops.normalization import pallas_triton_config
 from tokamax._src.ops.normalization import test_base
@@ -90,10 +92,14 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
     g_remat = jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
     g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
 
-    hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
-    self.assertEqual(hlo.count('name = "pallas_layer_norm"'), 1)
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_fwd_res"'), 1)
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_vjp"'), 1)
+    kernel_names = collections.Counter(
+        k.kernel_name
+        for k in hlo_utils.get_kernel_info(g_remat_lowered)
+        if isinstance(k, hlo_utils.TritonKernelInfo)
+    )
+    self.assertEqual(kernel_names['pallas_layer_norm'], 1)
+    self.assertEqual(kernel_names['pallas_layer_norm_fwd_res'], 1)
+    self.assertEqual(kernel_names['pallas_layer_norm_vjp'], 1)
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
     chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
@@ -116,10 +122,14 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
     )
     g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
 
-    hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
-    self.assertEqual(hlo.count('name = "pallas_layer_norm"'), 1, msg=hlo)
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_fwd_res"'), 1)
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_vjp"'), 1)
+    kernel_names = collections.Counter(
+        k.kernel_name
+        for k in hlo_utils.get_kernel_info(g_remat_lowered)
+        if isinstance(k, hlo_utils.TritonKernelInfo)
+    )
+    self.assertEqual(kernel_names['pallas_layer_norm'], 1)
+    self.assertEqual(kernel_names['pallas_layer_norm_fwd_res'], 1)
+    self.assertEqual(kernel_names['pallas_layer_norm_vjp'], 1)
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
     chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
