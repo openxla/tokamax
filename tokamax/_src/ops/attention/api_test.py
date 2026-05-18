@@ -176,10 +176,7 @@ class DotProductAttentionTest(parameterized.TestCase):
 
     dtype = jnp.bfloat16
     cudnn_bias = self.IMPL == 'cudnn' and 'bias' in mask_mode
-    tpu_mosaic = self.IMPL == 'mosaic' and jax.default_backend() == 'tpu'
-    # TODO:Only unbatched boolean masks are supported on TPU
-    # Mosaic.
-    B, S, T, N, H = (1 if cudnn_bias or tpu_mosaic else 2), 256, 256, 4, 64
+    B, S, T, N, H = (1 if cudnn_bias else 2), 256, 256, 4, 64
 
     q = jax.ShapeDtypeStruct((B, T, N, H), dtype)
     k = jax.ShapeDtypeStruct((B, S, N, H), dtype)
@@ -197,7 +194,7 @@ class DotProductAttentionTest(parameterized.TestCase):
       # Use a checkerboard mask as the custom mask to ensure it differs from
       # a standard causal mask to test causal and custom together work.
       custom_mask = (jnp.arange(T)[:, None] + jnp.arange(S)[None, :]) % 2 == 0
-      mask = custom_mask[None, None, :, :]
+      mask = jnp.broadcast_to(custom_mask[None, None, :, :], (B, 1, T, S))
     if 'bias' in mask_mode:
       bias = jax.ShapeDtypeStruct((1, N, T, S), dtype)
     if 'sliding_window' in mask_mode:
