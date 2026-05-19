@@ -17,15 +17,16 @@
 import functools
 from typing import Any
 from absl.testing import absltest
-from jax import shard_map
-from jax.sharding import PartitionSpec as P
 import jax
+from jax import shard_map
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 import qwix
 from tokamax._src import mosaic_tpu as common
 from tokamax._src import quantization
 from tokamax._src.ops import op as op_lib
+from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
@@ -108,9 +109,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     # TODO: Remove the skipTest once JAX is upgraded.
     if ManualAxisType is Any:
       self.skipTest("ManualAxisType is not supported.")
-    if jax.devices()[0].device_kind.startswith(
-        "TPU7x"
-    ):
+    if jax.devices()[0].device_kind.startswith("TPU7x"):
       self.skipTest("Skip the test on TPU v7.")
     num_devices = jax.device_count()
     mesh = jax.make_mesh((num_devices, 1), ("x", "y"))
@@ -124,7 +123,12 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       num_groups = 1
 
       lhs = jnp.ones((m, k))
-      lhs = jax.device_put(lhs, P("x",))
+      lhs = jax.device_put(
+          lhs,
+          P(
+              "x",
+          ),
+      )
       rhs = jnp.ones((num_groups, k, n))
       rhs = jax.device_put(rhs, P(None, None, "y"))
       group_sizes = jnp.array([m], jnp.uint32)
@@ -251,6 +255,101 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     )
     autotuning_configs = ba.autotuning_configs
     self.assertGreaterEqual(len(autotuning_configs), 3 * 3 * 3)
+
+  def test_heuristics_config(self):
+    if not jax.devices()[0].device_kind.startswith("TPU7x"):
+      self.skipTest("This test is only supported on TPU v7.")
+    tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+    ba = op_lib.BoundArguments(
+        op=tpu_ragged_dot,
+        arguments={
+            "lhs": jax.ShapeDtypeStruct((262144, 7168), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((256, 7168, 2048), dtype=jnp.bfloat16),
+            "group_sizes": base.generate_group_sizes(m=262144, num_groups=256),
+        },
+    )
+    heuristics_config = ba.heuristics_config
+    self.assertIsInstance(heuristics_config, pallas_mosaic_tpu.Config)
+    self.assertEqual(heuristics_config.tile_m, 128)
+    self.assertEqual(heuristics_config.tile_k, 7168)
+    self.assertEqual(heuristics_config.tile_n, 512)
+    self.assertEqual(heuristics_config.input_buffer_count, 2)
+
+    # Ensure that the bound_args can execute correctly.
+    benchmark = ba.benchmark()
+    self.assertGreaterEqual(benchmark.median_evaluation_time_ms, 0)
+
+    # Try both DLHS and DRHS VJPs with heuristics config.
+    ba_vjp = op_lib.BoundArguments(
+        op=tpu_ragged_dot,
+        arguments={
+            "lhs": jax.ShapeDtypeStruct((262144, 2048), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((256, 7168, 2048), dtype=jnp.bfloat16),
+            "group_sizes": base.generate_group_sizes(m=262144, num_groups=256),
+            "ragged_dot_dimension_numbers": (
+                pallas_mosaic_tpu.DLHS_RAGGED_DOT_DIM_NUMS
+            ),
+        },
+    )
+
+    vjp_heuristics_config = ba_vjp.heuristics_config
+    self.assertIsInstance(vjp_heuristics_config, pallas_mosaic_tpu.Config)
+    self.assertEqual(vjp_heuristics_config.tile_m, 128)
+    self.assertEqual(vjp_heuristics_config.tile_k, 7168)
+    self.assertEqual(vjp_heuristics_config.tile_n, 512)
+    self.assertEqual(vjp_heuristics_config.input_buffer_count, 2)
+
+    benchmark_vjp = ba_vjp.benchmark()
+    self.assertGreaterEqual(benchmark_vjp.median_evaluation_time_ms, 0)
+
+    ba_vjp_drhs = op_lib.BoundArguments(
+        op=tpu_ragged_dot,
+        arguments={
+            "lhs": jax.ShapeDtypeStruct((131072, 7168), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((7168, 2048), dtype=jnp.bfloat16),
+            "group_sizes": base.generate_group_sizes(m=131072, num_groups=256),
+            "ragged_dot_dimension_numbers": (
+                pallas_mosaic_tpu.DRHS_RAGGED_DOT_DIM_NUMS
+            ),
+        },
+    )
+    vjp_heuristics_config_drhs = ba_vjp_drhs.heuristics_config
+    self.assertIsInstance(vjp_heuristics_config_drhs, pallas_mosaic_tpu.Config)
+    self.assertEqual(vjp_heuristics_config_drhs.tile_m, 128)
+    self.assertEqual(vjp_heuristics_config_drhs.tile_k, 7168)
+    self.assertEqual(vjp_heuristics_config_drhs.tile_n, 512)
+    self.assertEqual(vjp_heuristics_config_drhs.input_buffer_count, 2)
+
+    benchmark_vjp_drhs = ba_vjp_drhs.benchmark()
+    self.assertGreaterEqual(benchmark_vjp_drhs.median_evaluation_time_ms, 0)
+
+  def test_heuristics_monkey_patch(self):
+    """Tests that the heuristics config is monkey-patched correctly."""
+
+    def _monkey_patch_heuristics_config(bound_args) -> pallas_mosaic_tpu.Config:
+      del bound_args
+      return pallas_mosaic_tpu.Config(
+          tile_m=16,
+          tile_k=16,
+          tile_n=16,
+          input_buffer_count=1,
+          combine_scopes=True,
+      )
+
+    tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+
+    object.__setattr__(
+        tpu_ragged_dot,
+        "_get_heuristics_config",
+        _monkey_patch_heuristics_config,
+    )
+
+    config = tpu_ragged_dot._get_heuristics_config(None)  # pytype: disable=wrong-arg-types
+    self.assertEqual(config.tile_m, 16)
+    self.assertEqual(config.tile_k, 16)
+    self.assertEqual(config.tile_n, 16)
+    self.assertEqual(config.input_buffer_count, 1)
+    self.assertEqual(config.combine_scopes, True)
 
 
 if __name__ == "__main__":
