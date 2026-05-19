@@ -127,7 +127,7 @@ class PallasMosaicTpuFlashAttentionVjp(
         attn_logits_soft_cap=logits_soft_cap,
         **dataclasses.asdict(config),
     )
-    splash_fn = common.build_splash_kernel(
+    splash_maker, splash_mask = common.build_splash_kernel(
         mask=mask,
         splash_config=splash_config,
         q_seq_len=q_seq_len,
@@ -151,37 +151,34 @@ class PallasMosaicTpuFlashAttentionVjp(
     if config.use_base2_exp:
       lse = lse * splash.LOG2E
 
-    splash_fn_kwargs = splash_fn.kwargs
-    bwd_fn = functools.partial(
-        splash._splash_attention_bwd,  # pylint: disable=protected-access
-        True,  # save_residuals
-        splash_fn_kwargs["mask_value"],
-        is_mqa,
-        splash_fn_kwargs["config"],
-        splash_fn_kwargs["mask_function"],
-        splash_fn_kwargs["fwd_mask_sparsity"],
-        splash_fn_kwargs["dkv_mask_sparsity"],
-    )
-
-    res = (
-        q_swap,
-        k_splash,
-        v_splash,
-        None,
-        None,
-        out_swap,
-        lse,
-        splash_fn.dkv_mask_info,
-    )
+    res = (q_swap, k_splash, v_splash, None, None, out_swap, lse)
     lse_in_axis = 0 if lse.ndim == 3 else None
-    res_in_axes = (0, 0, 0, None, None, 0, lse_in_axis, None)
+    res_in_axes = (0, 0, 0, None, None, 0, lse_in_axis)
+
     cotangents = (dout_swap, dstats)
     dstats_in_axes = jax.tree.map(lambda x: lse_in_axis, dstats)
     cotangents_in_axes = (0, dstats_in_axes)
+
+    def bwd_fn(res, cotangents, splash_mask):
+      splash_fn = splash_maker(mask=splash_mask)
+      splash_fn_kwargs = splash_fn.kwargs
+      res = res + (splash_fn.dkv_mask_info,)
+      return splash._splash_attention_bwd(  # pylint: disable=protected-access
+          True,
+          splash_fn_kwargs["mask_value"],
+          is_mqa,
+          splash_fn_kwargs["config"],
+          splash_fn_kwargs["mask_function"],
+          splash_fn_kwargs["fwd_mask_sparsity"],
+          splash_fn_kwargs["dkv_mask_sparsity"],
+          res,
+          cotangents,
+      )
+    mask_in_axes = 0 if len(splash_mask.shape) == 3 else None
     # vmap over batch dimension
     _, _, dq, dk, dv, _, _, _ = jax.vmap(
-        bwd_fn, in_axes=(res_in_axes, cotangents_in_axes)
-    )(res, cotangents)
+        bwd_fn, in_axes=(res_in_axes, cotangents_in_axes, mask_in_axes)
+    )(res, cotangents, splash_mask)
 
     dq = jnp.swapaxes(dq, 1, 2) * logits_scale
     if is_mqa:
