@@ -129,7 +129,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         attn_logits_soft_cap=logits_soft_cap,
         **dataclasses.asdict(config),
     )
-    splash_fn = common.build_splash_kernel(
+    splash_maker, splash_mask = common.build_splash_kernel(
         mask=mask,
         splash_config=splash_config,
         q_seq_len=q_seq_len,
@@ -141,7 +141,13 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
       k = jnp.squeeze(k, axis=1)
       v = jnp.squeeze(v, axis=1)
 
-    splash_output = jax.vmap(splash_fn)(q, k, v)
+    def splash_fn(q, k, v, mask):
+      return splash_maker(mask=mask)(q, k, v)
+
+    mask_in_axes = 0 if len(splash_mask.shape) == 3 else None
+    splash_output = jax.vmap(splash_fn, in_axes=(0, 0, 0, mask_in_axes))(
+        q, k, v, splash_mask
+    )
 
     if return_residuals:
       out, stats = splash_output

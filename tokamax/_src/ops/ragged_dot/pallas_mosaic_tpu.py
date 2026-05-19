@@ -19,10 +19,10 @@ import functools
 import itertools
 import types
 from typing import Any, ClassVar
-
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
+import numpy as np
 import pydantic
 import qwix
 from tokamax._src import precision as precision_lib
@@ -249,9 +249,173 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
 
     return out, residuals if return_residuals else None
 
+  def _fit_within_tpu_vmem(
+      self,
+      input_tiles: list[tuple[int, int, Any]],
+      output_tile: tuple[int, int, Any],
+      input_buffer_count: int,
+      utilize_ratio: float = 0.8,
+  ) -> bool:
+    """Returns whether the given tiling fits within TPU VMEM."""
+    total_size = 0
+    for tile in input_tiles:
+      tile_size = np.prod(tile[:-1])
+      dtype = tile[-1]
+      # For Quantized types, we assume that the upper bound on the tile size is
+      # bfloat16. That is, the QArray tile size (qvalue + scale) should be less
+      # than or equal to the bfloat16 tile size.
+      num_bytes = max(jnp.dtype(dtype).itemsize, 2)
+      tile_size *= num_bytes
+      total_size += tile_size * input_buffer_count
+
+    # Now do the same for the output tile.
+    output_tile_size = np.prod(output_tile[:-1])
+    dtype = output_tile[-1]
+    # For Quantized types, we assume that the upper bound on the tile size is
+    # bfloat16. That is, the QArray tile size (qvalue + scale) should be less
+    # than or equal to the bfloat16 tile size.
+    num_bytes = max(jnp.dtype(dtype).itemsize, 2)
+    output_tile_size *= num_bytes
+    total_size += output_tile_size
+
+    # Get the TPU scoped VMEM size. Default to half of the VMEM capacity.
+    tpu_info = pltpu.get_tpu_info()
+    scoped_vmem_capacity = tpu_info.vmem_capacity_bytes / 2
+    if tpu_info.generation == 6:
+      scoped_vmem_capacity /= 2
+    elif tpu_info.generation == 5:
+      scoped_vmem_capacity /= 4
+    return total_size <= scoped_vmem_capacity * utilize_ratio
+
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return Config()
+    if self.qdtype is not None:
+      return Config()
+    # Currently the heuristics are only implemented for TPU7x.
+    if pltpu.get_tpu_info().generation < 7:
+      return Config()
+    lhs, rhs = ba.args
+
+    dims = ba.arguments.get(
+        "ragged_dot_dimension_numbers", DEFAULT_RAGGED_DOT_DIM_NUMS
+    )
+    input_buffer_count = 2
+
+    # Extract the dimensions of the input arrays. Here m, k, n, are the
+    # dimensions of the forward gmm. This is different from the tgmm case which
+    # we will handle in _tgmm_heuristics_config.
+    if dims == DEFAULT_RAGGED_DOT_DIM_NUMS:
+      (m, k), (_, _, n) = lhs.shape, rhs.shape
+    elif dims == DLHS_RAGGED_DOT_DIM_NUMS:
+      (m, n), (_, k, _) = lhs.shape, rhs.shape
+    elif dims == DRHS_RAGGED_DOT_DIM_NUMS:
+      (m, k), (_, n) = lhs.shape, rhs.shape
+      return self._tgmm_heuristics_config(ba, m, n, k, input_buffer_count)
+    else:
+      raise ValueError(UNSUPPORTED_DIMENSIONS_MSG.format(dims))
+
+    # Main heuristic: start with the largest possible tile size and "deflate" it
+    # until it fits within VMEM.
+
+    # Default m to 1024.
+    tile_m = min(m, 1024)
+    tile_n = n
+    tile_k = k
+    # Start with M, min size for m is 128
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
+            (tile_m, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_m > 128
+    ):
+      tile_m //= 2
+
+    # Now do the same for n.
+    tile_n = n
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
+            (tile_m, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_n > 128
+    ):
+      tile_n //= 2
+
+    # K is done last as we want as large k as possible.
+    tile_k = k if pltpu.get_tpu_info().generation > 5 else k // 2
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
+            (tile_m, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_k > 128
+    ):
+      tile_k //= 2
+
+    return Config(
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        input_buffer_count=input_buffer_count,
+    )
+
+  def _tgmm_heuristics_config(
+      self, ba: op.BoundArguments, m, n, k, input_buffer_count
+  ) -> Config:
+    """Heuristics config for tgmm."""
+    lhs, rhs = ba.args
+    # tgmm is lhs [m, k] @ rhs [m, n] so it is similar to gmm but transposed.
+    # the input buffer count is still 2.
+    # the tile sizes are now tile_k, tile_m, tile_n, even though we still use
+    # tile_m, tile_k, tile_n for convention.
+    # Default k to 1024.
+    tile_m = min(m, 1024)
+    tile_n = n
+    tile_k = k if pltpu.get_tpu_info().generation > 5 else k // 2
+    # # Start with M, min size for m is 128
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
+            (tile_m, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_m > 128
+    ):
+      tile_m //= 2
+
+    # # Now do the same for n.
+    tile_n = n
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
+            (tile_m, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_n > 128
+    ):
+      tile_n //= 2
+
+    # K is done last as we want as large k as possible.
+    while (
+        not self._fit_within_tpu_vmem(
+            [(tile_m, tile_k, lhs.dtype), (tile_k, tile_n, rhs.dtype)],
+            (tile_m, tile_n, lhs.dtype),
+            input_buffer_count,
+        )
+        and tile_k > 128
+    ):
+      tile_k //= 2
+    return Config(
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        input_buffer_count=2,
+        combine_scopes=False,
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
