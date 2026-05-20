@@ -99,6 +99,14 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
       self.skipTest("Not supported on TPUs.")
     super().setUp()
 
+  def test_autotune_configs_filtering(self):
+    op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
+    num_groups, m, k, n = 2, 256, 128, 128
+    a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
+    ba = op.bind(a, b, group_sizes=group_sizes)
+    configs = op._get_autotuning_configs(ba)
+    self.assertNotEmpty(configs)
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tokamax._src import gpu_utils
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
@@ -285,7 +286,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                         grid_tile_width=grid_tile_width,
                     )
                 )
-    return configs
+    return self._filter_configs_by_smem(configs, lhs, rhs, ba)
 
   def _get_sm100_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     lhs, rhs = ba.args[:2]
@@ -388,7 +389,35 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           collective_choices=[True, False],
           post_scale_choices=[True, False],
       )
-    return configs
+    return self._filter_configs_by_smem(configs, lhs, rhs, ba)
+
+  def _filter_configs_by_smem(
+      self,
+      configs: set[Config],
+      lhs: jax.Array | QArray,
+      rhs: jax.Array | QArray,
+      ba: op.BoundArguments,
+  ) -> set[Config]:
+    def to_abstract(val):
+      if isinstance(val, (jax.Array, np.ndarray)):
+        return jax.ShapeDtypeStruct(val.shape, val.dtype)
+      return val
+
+    abstract_lhs = jax.tree_util.tree_map(to_abstract, lhs)
+    abstract_rhs = jax.tree_util.tree_map(to_abstract, rhs)
+
+    filtered_configs = set()
+    for cfg in configs:
+
+      def run_fwd(lhs_arg, rhs_arg):
+        return self._fwd(lhs_arg, rhs_arg, config=cfg, **ba.kwargs)
+
+      try:
+        jax.jit(run_fwd).lower(abstract_lhs, abstract_rhs)
+        filtered_configs.add(cfg)
+      except Exception:  # pylint: disable=broad-except
+        pass
+    return filtered_configs
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
