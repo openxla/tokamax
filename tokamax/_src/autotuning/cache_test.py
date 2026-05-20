@@ -29,6 +29,13 @@ from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.normalization import pallas_triton
 
+_KNOWN_CACHE_FILE_NAMES: Final[tuple[str, ...]] = (
+    "nvidia_h100_80gb_hbm3/pallas_triton_normalization.json",
+    "nvidia_h100_80gb_hbm3/pallas_mosaic_gpu_flash_attention.json",
+    "nvidia_h100_80gb_hbm3/pallas_mosaic_gpu_ragged_dot.json",
+    "tpu7x/pallas_mosaic_tpu_ragged_dot.json",
+)
+
 _CACHE_PATHS: Final[immutabledict.immutabledict[str, str]] = (
     immutabledict.immutabledict({
         "external": "data/autotuning",
@@ -80,7 +87,7 @@ class CacheTest(parameterized.TestCase):
     """Checks that the cache files exist for some basic cache files."""
     # Add more caches for other devices and operations.
     tokamax_files = resources.files("tokamax")
-    for file_name in _KNOWN_EXTERNAL_CACHE_FILE_NAMES:
+    for file_name in _KNOWN_CACHE_FILE_NAMES:
       path = tokamax_files / _CACHE_PATHS["external"] / file_name
       self.assertTrue(path.is_file())
 
