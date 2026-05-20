@@ -477,6 +477,8 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
 
               lax.fori_loop(0, num_k_iters, do_mma, None)
 
+          _per_warp()
+
         @pl.when(wg < _DEQ_WG)
         def _():
           plgpu.set_max_registers(128, action="increase")

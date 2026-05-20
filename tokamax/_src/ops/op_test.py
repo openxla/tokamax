@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import config as config_lib
@@ -222,6 +223,29 @@ class BoundArgumentsTest(parameterized.TestCase):
         self.assertEqual(ba, ba2.replace(op=ba2.op.replace(vjp=None)))
         ba3 = adapter.validate_json(adapter.dump_json(ba))
         self.assertEqual(ba, ba3.replace(op=ba3.op.replace(vjp=None)))
+
+  def test_ignore_cache_overlay(self):
+    if "H100" not in backend.get_default_device().device_kind:
+      self.skipTest("Only test on H100 GPU.")
+    # Use a real op so that we have a real autotuning cache.
+    # Read in the autotuning cache and then with the overlay it should be None.
+    ba = norm_base.Normalization().bind(
+        x=jax.ShapeDtypeStruct((2, 2), jnp.bfloat16),
+        scale=None,
+        offset=None,
+        axis=-1,
+        epsilon=1e-6,
+        scale_offset=0.0,
+        subtract_mean=False,
+        return_residuals=False,
+    )
+    self.assertIsNotNone(ba.cached_autotuning_data)
+
+    with config_lib.ignore_autotuning_cache(True):
+      self.assertIsNone(ba.cached_autotuning_data)
+
+    with config_lib.ignore_autotuning_cache(False):
+      self.assertIsNotNone(ba.cached_autotuning_data)
 
 
 if __name__ == "__main__":

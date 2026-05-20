@@ -22,6 +22,7 @@ from typing import Any, Final, Sequence, TypeAlias
 from absl import logging
 import immutabledict
 import pydantic
+from tokamax._src import config as config_lib
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.autotuning import autotuner
 
@@ -75,6 +76,11 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
 
     tokamax_files = resources.files("tokamax")
     out = {}
+
+    ignore_cache = config_lib.ignore_autotuning_cache.value
+    if ignore_cache:
+      logging.info("Ignoring autotuning cache.")
+      return out
 
     for base_dir in cache_path:
       path = tokamax_files.joinpath(base_dir, device_kind, f"{op_name}.json")

@@ -98,7 +98,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       def compute():
         @pl.when(wg == _COMPUTE_WG)
         def compute_wg():
-          @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
+          @pl.kernel(mesh=plgpu.WarpMesh(axis_name="warp"))
           def compute_warps():
             warp_id = lax.axis_index("warp")
             cluster_axis = "cluster" if collective else None
@@ -163,6 +163,8 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
               plgpu.tcgen05_commit_arrive(
                   acc_barrier.at[si_acc], collective_axis=cluster_axis
               )
+
+          compute_warps()
 
         @pl.when(wg == _EPILOGUE_WG)
         def epilogue_wg():
