@@ -281,6 +281,8 @@ class ShapeDtype:
       f64=np.float64,
       bf16=ml_dtypes.bfloat16,
       f4_e2m1fn=ml_dtypes.float4_e2m1fn,
+      f6_e2m3fn=ml_dtypes.float6_e2m3fn,
+      f6_e3m2fn=ml_dtypes.float6_e3m2fn,
       f8_e3m4=ml_dtypes.float8_e3m4,
       f8_e4m3=ml_dtypes.float8_e4m3,
       f8_e8m0fnu=ml_dtypes.float8_e8m0fnu,
