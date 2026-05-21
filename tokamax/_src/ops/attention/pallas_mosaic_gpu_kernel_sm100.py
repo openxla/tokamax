@@ -621,7 +621,7 @@ def flash_attention_kernel(
         mask = lax.cond(
             needs_k_range_mask(ki), lambda: k_range_mask(mask), lambda: mask
         )
-        return mask
+        return jnp.where(mask, 0, _DEFAULT_MASK_VALUE)
 
       def kv_loop(ki, carry, *, do_causal=False):
         m_scale, m_i, l_i = carry
@@ -657,14 +657,7 @@ def flash_attention_kernel(
           scale *= math.log2(math.e)
           s, scale = lax.cond(
               do_causal or mask_gmem is not None or needs_k_range_mask(ki),
-              lambda: (
-                  jnp.where(
-                      compute_mask(ki, do_causal),
-                      s * scale,
-                      _DEFAULT_MASK_VALUE,
-                  ),
-                  1.0,
-              ),
+              lambda: (s * scale + compute_mask(ki, do_causal), 1.0),
               lambda: (s, scale),
           )
           m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
@@ -738,7 +731,7 @@ def flash_attention_kernel(
         slot = lax.rem(ki - lb, softmax_slots)
 
         plgpu.barrier_wait(pv_mma_barrier)
-        tile_d = 64
+        tile_d = 32
 
         def load_acc_tiles():
           for d_base in range(0, head_dim_out, tile_d):
