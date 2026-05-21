@@ -34,6 +34,12 @@ _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 class DotProductAttentionTest(parameterized.TestCase):
   IMPL = None
 
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() == 'gpu':
+      # TODO: Remove once Mosaic GPU support is fixed.
+      self.skipTest('Mosaic GPU support is broken.')
+
   # Tests derived from JAX `nn_test`.
   # pylint: disable=invalid-name
   @parameterized.product(
@@ -367,6 +373,8 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
     super().setUp()
     match jax.default_backend():
       case 'gpu':
+        # TODO: Remove once Mosaic GPU support is fixed.
+        self.skipTest('Mosaic GPU support is broken.')
         if not gpu_utils.has_mosaic_gpu_support() or gpu_utils.is_sm100():
           self.skipTest(
               'Skip test. Mosaic implementation is not supported on this'
