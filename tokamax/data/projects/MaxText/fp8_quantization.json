@@ -1,0 +1,320 @@
+[
+  {
+    "op": {
+      "__type": "tokamax._src.ops.ragged_dot.pallas_mosaic_tpu.PallasMosaicTpuRaggedDot",
+      "config": null,
+      "vjp": null,
+      "checkify_group_sizes": false,
+      "qdtype": null,
+      "interpret": false
+    },
+    "arguments": {
+      "lhs": {
+        "qvalue": "f8_e4m3fn[262144,7168]",
+        "scale": "bf16[1,1]",
+        "zero_point": null,
+        "qtype": "jax.numpy.float8_e4m3fn"
+      },
+      "rhs": {
+        "qvalue": "f8_e4m3fn[256,7168,2048]",
+        "scale": "bf16[1,1,1]",
+        "zero_point": null,
+        "qtype": "jax.numpy.float8_e4m3fn"
+      },
+      "group_sizes": {
+        "num_groups": 256,
+        "total_size": 262144
+      },
+      "ragged_dot_dimension_numbers": {
+        "dot_dimension_numbers": [
+          [
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ],
+          [
+            [],
+            []
+          ]
+        ],
+        "lhs_ragged_dimensions": [
+          0
+        ],
+        "rhs_group_dimensions": [
+          0
+        ]
+      },
+      "precision": [
+        "DEFAULT",
+        "DEFAULT"
+      ],
+      "preferred_element_type": "bfloat16",
+      "return_residuals": false,
+      "activation": null,
+      "manual_axis_type": null
+    }
+  },
+  {
+    "op": {
+      "__type": "tokamax._src.ops.ragged_dot.pallas_mosaic_tpu.PallasMosaicTpuRaggedDot",
+      "config": null,
+      "vjp": null,
+      "checkify_group_sizes": false,
+      "qdtype": null,
+      "interpret": false
+    },
+    "arguments": {
+      "lhs": {
+        "qvalue": "f8_e4m3fn[262144,2048]",
+        "scale": "bf16[1,1]",
+        "zero_point": null,
+        "qtype": "jax.numpy.float8_e4m3fn"
+      },
+      "rhs": {
+        "qvalue": "f8_e4m3fn[256,2048,7168]",
+        "scale": "bf16[1,1,1]",
+        "zero_point": null,
+        "qtype": "jax.numpy.float8_e4m3fn"
+      },
+      "group_sizes": {
+        "num_groups": 256,
+        "total_size": 262144
+      },
+      "ragged_dot_dimension_numbers": {
+        "dot_dimension_numbers": [
+          [
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ],
+          [
+            [],
+            []
+          ]
+        ],
+        "lhs_ragged_dimensions": [
+          0
+        ],
+        "rhs_group_dimensions": [
+          0
+        ]
+      },
+      "precision": [
+        "DEFAULT",
+        "DEFAULT"
+      ],
+      "preferred_element_type": "bfloat16",
+      "return_residuals": false,
+      "activation": null,
+      "manual_axis_type": null
+    }
+  },
+  {
+    "op": {
+      "__type": "tokamax._src.ops.ragged_dot.pallas_mosaic_tpu.PallasMosaicTpuRaggedDot",
+      "config": null,
+      "vjp": null,
+      "checkify_group_sizes": false,
+      "qdtype": null,
+      "interpret": false
+    },
+    "arguments": {
+      "lhs": {
+        "qvalue": "f8_e5m2[262144,7168]",
+        "scale": "bf16[262144,1]",
+        "zero_point": null,
+        "qtype": "jax.numpy.float8_e5m2"
+      },
+      "rhs": "f8_e4m3fn[256,7168,2048]",
+      "group_sizes": {
+        "num_groups": 256,
+        "total_size": 262144
+      },
+      "ragged_dot_dimension_numbers": {
+        "dot_dimension_numbers": [
+          [
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ],
+          [
+            [],
+            []
+          ]
+        ],
+        "lhs_ragged_dimensions": [
+          0
+        ],
+        "rhs_group_dimensions": [
+          0
+        ]
+      },
+      "precision": [
+        "DEFAULT",
+        "DEFAULT"
+      ],
+      "preferred_element_type": "bfloat16",
+      "return_residuals": false,
+      "activation": null,
+      "manual_axis_type": null
+    }
+  },
+  {
+    "op": {
+      "__type": "tokamax._src.ops.ragged_dot.pallas_mosaic_tpu.PallasMosaicTpuRaggedDot",
+      "config": null,
+      "vjp": null,
+      "checkify_group_sizes": false,
+      "qdtype": null,
+      "interpret": false
+    },
+    "arguments": {
+      "lhs": {
+        "qvalue": "f8_e5m2[262144,2048]",
+        "scale": "bf16[262144,1]",
+        "zero_point": null,
+        "qtype": "jax.numpy.float8_e5m2"
+      },
+      "rhs": "f8_e4m3fn[256,2048,7168]",
+      "group_sizes": {
+        "num_groups": 256,
+        "total_size": 262144
+      },
+      "ragged_dot_dimension_numbers": {
+        "dot_dimension_numbers": [
+          [
+            [
+              1
+            ],
+            [
+              1
+            ]
+          ],
+          [
+            [],
+            []
+          ]
+        ],
+        "lhs_ragged_dimensions": [
+          0
+        ],
+        "rhs_group_dimensions": [
+          0
+        ]
+      },
+      "precision": [
+        "DEFAULT",
+        "DEFAULT"
+      ],
+      "preferred_element_type": "bfloat16",
+      "return_residuals": false,
+      "activation": null,
+      "manual_axis_type": null
+    }
+  },
+  {
+    "op": {
+      "__type": "tokamax._src.ops.ragged_dot.pallas_mosaic_tpu.PallasMosaicTpuRaggedDot",
+      "config": null,
+      "vjp": null,
+      "checkify_group_sizes": false,
+      "qdtype": null,
+      "interpret": false
+    },
+    "arguments": {
+      "lhs": "f8_e4m3fn[262144,7168]",
+      "rhs": {
+        "qvalue": "f8_e5m2[262144,2048]",
+        "scale": "bf16[1,2048]",
+        "zero_point": null,
+        "qtype": "jax.numpy.float8_e5m2"
+      },
+      "group_sizes": "i32[256]",
+      "ragged_dot_dimension_numbers": {
+        "dot_dimension_numbers": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ],
+          [
+            [],
+            []
+          ]
+        ],
+        "lhs_ragged_dimensions": [
+          0
+        ],
+        "rhs_group_dimensions": []
+      },
+      "precision": [
+        "DEFAULT",
+        "DEFAULT"
+      ],
+      "preferred_element_type": "bfloat16",
+      "return_residuals": false,
+      "activation": null,
+      "manual_axis_type": null
+    }
+  },
+  {
+    "op": {
+      "__type": "tokamax._src.ops.ragged_dot.pallas_mosaic_tpu.PallasMosaicTpuRaggedDot",
+      "config": null,
+      "vjp": null,
+      "checkify_group_sizes": false,
+      "qdtype": null,
+      "interpret": false
+    },
+    "arguments": {
+      "lhs": "f8_e4m3fn[262144,2048]",
+      "rhs": {
+        "qvalue": "f8_e5m2[262144,7168]",
+        "scale": "bf16[1,7168]",
+        "zero_point": null,
+        "qtype": "jax.numpy.float8_e5m2"
+      },
+      "group_sizes": "i32[256]",
+      "ragged_dot_dimension_numbers": {
+        "dot_dimension_numbers": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ],
+          [
+            [],
+            []
+          ]
+        ],
+        "lhs_ragged_dimensions": [
+          0
+        ],
+        "rhs_group_dimensions": []
+      },
+      "precision": [
+        "DEFAULT",
+        "DEFAULT"
+      ],
+      "preferred_element_type": "bfloat16",
+      "return_residuals": false,
+      "activation": null,
+      "manual_axis_type": null
+    }
+  }
+]
