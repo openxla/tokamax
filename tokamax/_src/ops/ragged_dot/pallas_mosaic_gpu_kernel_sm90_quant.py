@@ -192,11 +192,9 @@ def ragged_dot_quantized_kernel(
 
           with jax.named_scope("acc -> o_smem"):
             pl.when(carry > 0)(lambda: plgpu.barrier_wait(o_consumed_barrier))
-            o_smem_ = o_smem.at[wg].reshape(block_m // 8, 1, 8, block_n)
-            o_smem_ = plgpu.untile_ref(o_smem_, (8, block_n))
             acc = acc if activation is None else activation(acc)
-            acc = acc.astype(o_smem_.dtype)
-            o_smem_.T[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
+            acc = acc.astype(o_smem.dtype)
+            o_smem.at[wg].T[...] = plgpu.layout_cast(acc, _WGMMA_TRANSPOSED)
             plgpu.barrier_arrive(o_barrier)
 
         @pl.when(wg == _TMA_WG)
