@@ -19,7 +19,6 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import lax
-from jax.experimental import pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 import numpy as np
@@ -41,11 +40,8 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
     shape = (128, 128)
 
     @functools.partial(
-        pl.pallas_call,
+        plgpu.kernel,
         out_shape=jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn),
-        in_specs=(pl.BlockSpec(memory_space=plgpu.GMEM),),
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        compiler_params=plgpu.CompilerParams(),
     )
     def kernel(x_ref, o_ref):
       layout = plgpu.Layout.WGMMA_UPCAST_4X
@@ -73,61 +69,61 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
 
     i4_transforms = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(32))
     f8_transforms = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(64))
-    o_transforms = (plgpu.TilingTransform((8, 32)), plgpu.SwizzleTransform(128))
-
-    scratch_shapes = [
-        plgpu.SMEM((n, k), fp8_dtype, transforms=f8_transforms),
-        plgpu.Barrier(orders_tensor_core=True),
-        plgpu.TMEM((m, n), jnp.float32),
-    ]
 
     @functools.partial(
-        pl.pallas_call,
-        in_specs=(
-            plgpu.BlockSpec(memory_space=plgpu.SMEM, transforms=f8_transforms),
-            plgpu.BlockSpec(memory_space=plgpu.SMEM, transforms=i4_transforms),
-        ),
+        plgpu.kernel,
         out_shape=jax.ShapeDtypeStruct((m, n), jnp.float32),
-        out_specs=plgpu.BlockSpec(transforms=o_transforms),
-        scratch_shapes=scratch_shapes,
-        compiler_params=plgpu.CompilerParams(),
+        scratch_shapes=dict(
+            b_up_smem=plgpu.SMEM((n, k), fp8_dtype, transforms=f8_transforms),
+            barrier_ref=plgpu.Barrier(orders_tensor_core=True),
+            acc_tmem=plgpu.TMEM((m, n), jnp.float32),
+        ),
     )
-    def kernel(
-        a_smem,
-        b_smem,
-        out_ref,
-        b_up_smem,
-        barrier_ref,
-        acc_tmem,
-    ):
-      b = plgpu.load(b_smem, (), layout=layout, optimized=False)
-
-      # Note, this approach for row sum calculation is slow due to upcasting
-      a_row_sum = plgpu.load(
-          a_smem,
-          (),
-          layout=plgpu.Layout.TCGEN05,
-          optimized=True,
-      ).astype(jnp.float32).sum(1)
-
-      b_up_smem[...] = common.int4_as_biased_f8e4m3fn(b, layout)
-      plgpu.commit_smem()
-
-      plgpu.tcgen05_mma(
-          acc_tmem,
-          a_smem,
-          plgpu.transpose_ref(b_up_smem, (1, 0)),
-          accumulate=False,
-          barrier=barrier_ref
+    def kernel(a_gmem, b_gmem, out_gmem, b_up_smem, barrier_ref, acc_tmem):
+      @functools.partial(
+          plgpu.emit_pipeline,
+          grid=(),
+          in_specs=[
+              plgpu.BlockSpec((m, k), lambda: (0, 0), transforms=f8_transforms),
+              plgpu.BlockSpec((n, k), lambda: (0, 0), transforms=i4_transforms),
+          ],
       )
+      def pipeline(_, a_smem, b_smem):
+        b = plgpu.load(b_smem, (), layout=layout, optimized=False)
 
-      plgpu.barrier_wait(barrier_ref)
-      # Following the scheme D = A@B with B as biased f8e4m3fn
-      # the accumulator should be descaled & debiased
-      # `S * D - Z * row_sum(A)` where S is scale=512 and Z is bias=8
-      acc = 512 * plgpu.async_load_tmem(acc_tmem, layout=plgpu.Layout.TCGEN05)
-      acc -= 8 * lax.broadcast_in_dim(a_row_sum, acc.shape, [0])
-      out_ref[...] = acc
+        # Note, this approach for row sum calculation is slow due to upcasting
+        a_row_sum = (
+            plgpu.load(
+                a_smem,
+                (),
+                layout=plgpu.Layout.TCGEN05,
+                optimized=True,
+            )
+            .astype(jnp.float32)
+            .sum(1)
+        )
+
+        b_up_smem[...] = common.int4_as_biased_f8e4m3fn(b, layout)
+        plgpu.commit_smem()
+
+        plgpu.tcgen05_mma(
+            acc_tmem,
+            a_smem,
+            plgpu.transpose_ref(b_up_smem, (1, 0)),
+            accumulate=False,
+            barrier=barrier_ref,
+        )
+
+        plgpu.barrier_wait(barrier_ref)
+        # Following the scheme D = A@B with B as biased f8e4m3fn
+        # the accumulator should be descaled & debiased
+        # `S * D - Z * row_sum(A)` where S is scale=512 and Z is bias=8
+        acc = 512 * plgpu.async_load_tmem(acc_tmem, layout=plgpu.Layout.TCGEN05)
+        acc -= 8 * lax.broadcast_in_dim(a_row_sum, acc.shape, [0])
+        out_gmem[...] = acc
+
+      pipeline(a_gmem, b_gmem)
+
     a = jax.random.uniform(jax.random.key(1), shape=(m, k), dtype=jnp.float32)
     a_f8 = a.astype(fp8_dtype)
     b = jax.random.randint(
