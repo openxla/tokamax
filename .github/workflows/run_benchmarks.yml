@@ -14,10 +14,10 @@ permissions:
 jobs:
   run_benchmarks:
     name: Run Tokamax benchmarks
-    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@34dfd0eeb034f93329ae87d953bc51940ce1c908
+    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@1a80c6f935a5f5a3d1fb0a40edcdea1758406efa
     with:
       registry_file: "tokamax/benchmarks/benchmark_registry.pbtxt"
-      ml_actions_ref: "34dfd0eeb034f93329ae87d953bc51940ce1c908"
+      ml_actions_ref: "1a80c6f935a5f5a3d1fb0a40edcdea1758406efa"
       publish_metrics: true
       pub_sub_gcp_project_id: "ml-oss-benchmarking-production"
       pub_sub_gcp_topic_id: "public-results-prod"

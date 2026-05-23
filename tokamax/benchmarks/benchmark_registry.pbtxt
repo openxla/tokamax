@@ -5,7 +5,6 @@ benchmarks {
   name: "tokamax_attention"
   description: "Runs the Tokamax attention benchmark."
   owner: "Tokamax Team"
-  update_frequency_policy: QUARTERLY
   workload {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/attention.py" }
@@ -43,220 +42,18 @@ benchmarks {
   }
 
   metrics {
-    name: "attention/basic/default/forward"
+    pattern: "attention/.*"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
-
-  metrics {
-    name: "attention/basic/default/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/triton/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/triton/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/mosaic/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/mosaic/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/cudnn/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/cudnn/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/xla/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/xla/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/xla_chunked/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/xla_chunked/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/mosaic/forward_and_vjp/autotuning_time"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/basic/mosaic/forward_and_vjp/autotuned"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/default/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/default/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/triton/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/triton/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/mosaic/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/mosaic/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/cudnn/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/cudnn/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/xla/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/xla/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/xla_chunked/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "attention/alphafold/xla_chunked/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
 }
 
 benchmarks {
   name: "tokamax_triangle_multiplication"
   description: "Runs the Tokamax triangle_multiplication benchmark."
   owner: "Tokamax Team"
-  update_frequency_policy: QUARTERLY
   workload {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_multiplication.py" }
@@ -293,89 +90,7 @@ benchmarks {
   }
 
   metrics {
-    name: "triangle_multiplication/n_384/default/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "triangle_multiplication/n_768/default/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "triangle_multiplication/n_384/default/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "triangle_multiplication/n_768/default/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "triangle_multiplication/n_384/xla/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "triangle_multiplication/n_768/xla/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "triangle_multiplication/n_384/xla/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "triangle_multiplication/n_768/xla/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "triangle_multiplication/n_384/cuequivariance/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "triangle_multiplication/n_768/cuequivariance/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "triangle_multiplication/n_384/cuequivariance/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "triangle_multiplication/n_768/cuequivariance/forward_and_vjp"
+    pattern: "triangle_multiplication/.*"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -387,7 +102,6 @@ benchmarks {
   name: "tokamax_ragged_dot"
   description: "Runs the Tokamax ragged_dot benchmark."
   owner: "Tokamax Team"
-  update_frequency_policy: QUARTERLY
   workload {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/ragged_dot.py" }
@@ -430,63 +144,7 @@ benchmarks {
   }
 
   metrics {
-    name: "ragged_dot/default/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "ragged_dot/default/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "ragged_dot/triton/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "ragged_dot/triton/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "ragged_dot/mosaic/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "ragged_dot/mosaic/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "ragged_dot/xla/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-
-  metrics {
-    name: "ragged_dot/xla/forward_and_vjp"
+    pattern: "ragged_dot/.*"
     unit: "ms"
     stats {
       stat: MEDIAN
@@ -498,7 +156,6 @@ benchmarks {
   name: "tokamax_linear_softmax_cross_entropy_loss"
   description: "Runs the Tokamax linear_softmax_cross_entropy_loss benchmark."
   owner: "Tokamax Team"
-  update_frequency_policy: QUARTERLY
   workload {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/linear_softmax_cross_entropy_loss.py" }
@@ -527,60 +184,10 @@ benchmarks {
   }
 
   metrics {
-    name: "linear_softmax_cross_entropy_loss/medium/default/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "linear_softmax_cross_entropy_loss/medium/default/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "linear_softmax_cross_entropy_loss/medium/xla/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "linear_softmax_cross_entropy_loss/medium/xla/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "linear_softmax_cross_entropy_loss/medium/mosaic_tpu/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "linear_softmax_cross_entropy_loss/medium/mosaic_tpu/forward_and_vjp"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "linear_softmax_cross_entropy_loss/medium/chunked_xla/forward"
-    unit: "ms"
-    stats {
-      stat: MEDIAN
-    }
-  }
-  metrics {
-    name: "linear_softmax_cross_entropy_loss/medium/chunked_xla/forward_and_vjp"
+    pattern: "linear_softmax_cross_entropy_loss/.*"
     unit: "ms"
     stats {
       stat: MEDIAN
     }
   }
 }
-
