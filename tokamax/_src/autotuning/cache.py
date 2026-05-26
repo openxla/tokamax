@@ -87,7 +87,9 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
       logging.info("Loading cache file: %s", path)
       try:
         json_data = path.read_text()
-      except FileNotFoundError:
+      except FileNotFoundError as e:
+        if config_lib.autotuning_cache_miss_fallback.value == "error":
+          raise FileNotFoundError(f"Autotuning cache file not found: {path}") from e
         logging.info("Autotuning cache file not found: %s", path)
         json_data = "{}"
       json_data = "{}" if json_data is None else json_data
