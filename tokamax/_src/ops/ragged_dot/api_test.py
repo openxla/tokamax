@@ -235,5 +235,64 @@ class RaggedDotXlaTest(RaggedDotImplementationTest):
     super().__init__(*args, implementation="xla")
 
 
+class RaggedDotGmmV2CompatibilityAPITest(parameterized.TestCase):
+  """Tests that the v2-specific kwargs surface on the `ragged_dot` API.
+
+  `rhs_scale`, `rhs_bias`, and `maybe_quantize_lhs` are consumed by the
+  mosaic_tpu_v2 implementation. Every other implementation must reject
+  them with a `NotImplementedError` whose message names the offending
+  kwarg, so the fallback chain in `api.ragged_dot_general` can route
+  around them.
+  """
+
+  def _get_small_inputs(self):
+    if jax.default_backend() == "tpu":
+      return _get_input_data(num_experts=2, m=256, k=128, n=128)
+    return _get_input_data(num_experts=2, m=128, k=64, n=128)
+
+  def _kwargs_for(self, kwarg, *, num_experts, n):
+    if kwarg == "rhs_scale":
+      return {"rhs_scale": jnp.ones((num_experts, 1, 1, n), jnp.bfloat16)}
+    if kwarg == "rhs_bias":
+      return {"rhs_bias": jnp.ones((num_experts, 1, n), jnp.bfloat16)}
+    if kwarg == "maybe_quantize_lhs":
+      return {"maybe_quantize_lhs": True}
+    raise ValueError(f"Unknown kwarg: {kwarg}")
+
+  def _assert_rejects(self, implementation, kwarg):
+    lhs, rhs, group_sizes = self._get_small_inputs()
+    kwargs = self._kwargs_for(kwarg, num_experts=rhs.shape[0], n=rhs.shape[-1])
+    with self.assertRaisesRegex(NotImplementedError, kwarg):
+      api.ragged_dot(
+          lhs, rhs, group_sizes, implementation=implementation, **kwargs
+      )
+
+  @parameterized.parameters("rhs_scale", "rhs_bias", "maybe_quantize_lhs")
+  def test_mosaic_xla_rejects_new_kwargs(self, kwarg):
+    self._assert_rejects("xla", kwarg)
+
+  @parameterized.parameters("rhs_scale", "rhs_bias", "maybe_quantize_lhs")
+  def test_mosaic_tpu_rejects_new_kwargs(self, kwarg):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Requires TPU backend.")
+    self._assert_rejects("mosaic_tpu", kwarg)
+
+  @parameterized.parameters("rhs_scale", "rhs_bias", "maybe_quantize_lhs")
+  def test_triton_rejects_new_kwargs(self, kwarg):
+    if "triton" not in api.IMPLEMENTATIONS:
+      self.skipTest("Triton implementation not registered.")
+    if not gpu_utils.has_triton_support():
+      self.skipTest("Triton not supported on this platform.")
+    self._assert_rejects("triton", kwarg)
+
+  @parameterized.parameters("rhs_scale", "rhs_bias", "maybe_quantize_lhs")
+  def test_mosaic_gpu_rejects_new_kwargs(self, kwarg):
+    if "mosaic_gpu" not in api.IMPLEMENTATIONS:
+      self.skipTest("mosaic_gpu implementation not registered.")
+    if not gpu_utils.has_mosaic_gpu_support():
+      self.skipTest("Mosaic GPU not supported on this platform.")
+    self._assert_rejects("mosaic_gpu", kwarg)
+
+
 if __name__ == "__main__":
   absltest.main()
