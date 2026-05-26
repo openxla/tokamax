@@ -366,7 +366,14 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       config: Config,
       activation: Callable[[jax.Array], jax.Array] | None = None,
       manual_axis_type: ManualAxisType | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
   ) -> tuple[jax.Array, base.Residuals]:
+    if rhs_scale is not None or rhs_bias is not None or maybe_quantize_lhs:
+      raise NotImplementedError("rhs_scale/rhs_bias/maybe_quantize_lhs not"
+                                "supported by Triton implementation.")
+
     lhs, rhs = map(quantization.as_array_or_qarray, (lhs, rhs))
 
     if preferred_element_type is None:

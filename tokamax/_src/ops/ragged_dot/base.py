@@ -228,6 +228,9 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       return_residuals: bool = False,
       activation: ActivationFunction | None = None,
       manual_axis_type: ManualAxisType | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
   ) -> op.BoundArguments:
     if ragged_dot_dimension_numbers is None:
       # TODO: Support batch dims on LHS and/or RHS?
@@ -259,6 +262,9 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         return_residuals=return_residuals,
         activation=activation,
         manual_axis_type=manual_axis_type,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        maybe_quantize_lhs=maybe_quantize_lhs,
     )
 
   @override
@@ -275,8 +281,15 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       config: _Config,
       activation: ActivationFunction | None = None,
       manual_axis_type: ManualAxisType | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
   ) -> tuple[jax.Array, Residuals]:
     del config  # Unused.
+    
+    if rhs_scale is not None or rhs_bias is not None or maybe_quantize_lhs:
+      raise NotImplementedError("rhs_scale/rhs_bias/maybe_quantize_lhs not"
+                                "supported by XLA implementation.")
 
     lhs, rhs = map(quantization.as_array, (lhs, rhs))
 

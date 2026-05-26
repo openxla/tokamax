@@ -77,6 +77,9 @@ def ragged_dot(
     group_offset: Array | None = None,
     activation: base.ActivationFunction | None = None,
     manual_axis_type: ManualAxisType | None = None,
+    rhs_scale: jax.Array | None = None,
+    rhs_bias: jax.Array | None = None,
+    maybe_quantize_lhs: bool = False,
     *,
     implementation: (
         Implementation
@@ -106,6 +109,10 @@ def ragged_dot(
       is True, the activation function will not be fused into the kernel, and
       instead applied after the kernel call.
     manual_axis_type: Optional. Manual axis type for the operation.
+    rhs_scale: GMM V2 feature only. The rhs scale.
+    rhs_bias: GMM V2 feature only. The rhs bias.
+    maybe_quantize_lhs: GMM v2 feature only. Quantize lhs if set to True and
+      rhs is quantized.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -124,6 +131,9 @@ def ragged_dot(
       group_offset=group_offset,
       activation=activation,
       manual_axis_type=manual_axis_type,
+      rhs_scale=rhs_scale,
+      rhs_bias=rhs_bias,
+      maybe_quantize_lhs=maybe_quantize_lhs,
       implementation=implementation,
   )
 
@@ -138,6 +148,9 @@ def ragged_dot_general(
     group_offset: Array | None = None,
     activation: base.ActivationFunction | None = None,
     manual_axis_type: ManualAxisType | None = None,
+    rhs_scale: jax.Array | None = None,
+    rhs_bias: jax.Array | None = None,
+    maybe_quantize_lhs: bool = False,
     *,
     implementation: (
         Implementation
@@ -166,6 +179,10 @@ def ragged_dot_general(
     activation: Optional. Activation function to apply to the result. If not
       specified, no activation function is applied.
     manual_axis_type: Optional. Manual axis type for the operation.
+    rhs_scale: GMM V2 feature only. The rhs scale.
+    rhs_bias: GMM V2 feature only. The rhs bias.
+    maybe_quantize_lhs: GMM v2 feature only. Quantize lhs if set to True and
+      rhs is quantized.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -224,6 +241,9 @@ def ragged_dot_general(
           precision=precision,
           preferred_element_type=preferred_element_type,
           activation=activation,
+          rhs_scale=rhs_scale,
+          rhs_bias=rhs_bias,
+          maybe_quantize_lhs=maybe_quantize_lhs,
           **kwargs,
       )
     except NotImplementedError as e:
