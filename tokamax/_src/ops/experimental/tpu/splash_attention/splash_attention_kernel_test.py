@@ -456,12 +456,23 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       else:
         make_mask_fn = splash.make_dynamic_splash_mha
 
+    q_heads_per_kv_head = model_config.num_q_heads // model_config.num_kv_heads
+    if (
+        sinks is None
+        and use_max_logit_estimate is None
+        and q_heads_per_kv_head % 2 == 0
+    ):
+      num_stacked_q_heads = 2
+    else:
+      num_stacked_q_heads = 1
+
     config = dataclasses.replace(
         config,
         fuse_reciprocal=fuse_reciprocal,
         attn_logits_soft_cap=attn_logits_soft_cap,
         use_base2_exp=use_base2_exp,
         interpret=self.INTERPRET,
+        num_stacked_q_heads=num_stacked_q_heads,
     )
 
     max_logit_value, max_val = None, 30.0
