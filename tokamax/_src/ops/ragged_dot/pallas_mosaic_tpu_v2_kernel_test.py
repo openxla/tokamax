@@ -184,6 +184,32 @@ def reference_tgmm(
   return jnp.stack(out)
 
 
+# Default per-dtype tolerances, mirroring
+# jax._src.public_test_util._default_tolerance. Extend this map if a new output
+# dtype is introduced into a default-tolerance assertion.
+_DTYPE_TOL = {
+    jnp.dtype(jnp.bfloat16): 1e-1,
+}
+
+
+def _lookup_tol(dtype):
+  key = jnp.dtype(dtype)
+  if key not in _DTYPE_TOL:
+    raise KeyError(
+        f"No default tolerance for dtype {key!r}. "
+        f"Add it to _DTYPE_TOL or pass explicit atol/rtol."
+    )
+  return _DTYPE_TOL[key]
+
+
+def assert_arrays_all_close(actual, desired, *, atol=None, rtol=None):
+  if atol is None:
+    atol = max(_lookup_tol(actual.dtype), _lookup_tol(desired.dtype))
+  if rtol is None:
+    rtol = max(_lookup_tol(actual.dtype), _lookup_tol(desired.dtype))
+  chex.assert_trees_all_close(actual, desired, atol=atol, rtol=rtol)
+
+
 class GmmTest(parameterized.TestCase):
 
   @parameterized.product(
@@ -226,7 +252,7 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset,
     )
 
-    chex.assert_trees_all_close(actual, expected)
+    assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
       batch_size=[128, 1024],
@@ -269,7 +295,7 @@ class GmmTest(parameterized.TestCase):
     # max_diff_idx = jnp.unravel_index(jnp.argmax(diff), diff.shape)
     # print(f"Output max diff: {jnp.max(diff)} at index {max_diff_idx}")
     # print(f"Output mean diff: {jnp.mean(jnp.abs(expected - actual))}")
-    chex.assert_trees_all_close(actual, expected)
+    assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
       batch_size=[128, 256],
@@ -302,7 +328,7 @@ class GmmTest(parameterized.TestCase):
         preferred_element_type=jnp.bfloat16,
     )
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
-    chex.assert_trees_all_close(actual, expected)
+    assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
       batch_size=[256, 1024],
@@ -347,7 +373,7 @@ class GmmTest(parameterized.TestCase):
         tile_info=tile_info,
     )
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
-    chex.assert_trees_all_close(actual, expected)
+    assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
       batch_size=[128],
@@ -393,7 +419,7 @@ class GmmTest(parameterized.TestCase):
         preferred_element_type=jnp.bfloat16,
     )
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
-    chex.assert_trees_all_close(actual, expected)
+    assert_arrays_all_close(actual, expected)
 
   def test_tgmm_explicitly_exercises_all_branches(self):
     # Group 0 (size 4*tile_m, 4 gm tiles): matmul_new_group, matmul, matmul,
@@ -425,7 +451,7 @@ class GmmTest(parameterized.TestCase):
         tile_info=tile_info,
     )
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
-    chex.assert_trees_all_close(actual, expected)
+    assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
       batch_size=[128],
@@ -777,7 +803,7 @@ class GmmTest(parameterized.TestCase):
     )
 
     self.assertEqual(actual.shape, (batch_size, out_size))
-    chex.assert_trees_all_close(actual, expected)
+    assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
       batch_size=[128],
@@ -894,7 +920,7 @@ class GmmTest(parameterized.TestCase):
     )
 
     self.assertEqual(actual.shape, (batch_size, out_size))
-    chex.assert_trees_all_close(actual, expected)
+    assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
       batch_size=[128],
