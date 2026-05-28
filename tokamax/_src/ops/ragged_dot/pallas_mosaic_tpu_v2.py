@@ -114,6 +114,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
       preferred_element_type: jax.typing.DTypeLike | None,
       return_residuals: bool = False,
       config: Config,
+      group_offset: jax.Array | None = None,
       activation: base.ActivationFunction | None = None,
       manual_axis_type: ManualAxisType | None = None,
       rhs_scale: jax.Array | None = None,

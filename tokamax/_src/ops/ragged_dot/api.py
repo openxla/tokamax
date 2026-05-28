@@ -191,10 +191,6 @@ def ragged_dot_general(
   Returns:
     An array with `preferred_element_type` element type.
   """
-  # TODO(xw32): move this check to all kernels except for gmm v2.
-  if group_offset is not None:
-    raise NotImplementedError("`group_offset` is not yet supported.")
-
   if implementation is None:
     implementation = _DEFAULT_IMPLEMENTATIONS
   elif isinstance(implementation, str):
@@ -241,6 +237,7 @@ def ragged_dot_general(
           ragged_dot_dimension_numbers=ragged_dot_dimension_numbers,
           precision=precision,
           preferred_element_type=preferred_element_type,
+          group_offset=group_offset,
           activation=activation,
           rhs_scale=rhs_scale,
           rhs_bias=rhs_bias,

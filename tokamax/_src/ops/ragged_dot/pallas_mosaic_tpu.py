@@ -134,6 +134,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       preferred_element_type: jax.typing.DTypeLike | None,
       return_residuals: bool = False,
       config: Config,
+      group_offset: jax.Array | None = None,
       activation: base.ActivationFunction | None = None,
       manual_axis_type: ManualAxisType | None = None,
       rhs_scale: jax.Array | None = None,
@@ -142,6 +143,11 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
+    if group_offset is not None:
+      raise NotImplementedError(
+          "`group_offset` is not supported by mosaic TPU implementation."
+      )
+
     if rhs_scale is not None or rhs_bias is not None or maybe_quantize_lhs:
       raise NotImplementedError("rhs_scale/rhs_bias/maybe_quantize_lhs not"
                                 "supported by mosaic TPU implementation.")

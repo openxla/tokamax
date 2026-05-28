@@ -226,6 +226,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       precision: jax.lax.PrecisionLike = None,
       preferred_element_type: jax.typing.DTypeLike | None = None,
       return_residuals: bool = False,
+      group_offset: jax.Array | None = None,
       activation: ActivationFunction | None = None,
       manual_axis_type: ManualAxisType | None = None,
       rhs_scale: jax.Array | None = None,
@@ -260,6 +261,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         precision=precision_lib.canonicalize_precision(precision),
         preferred_element_type=preferred_element_type,
         return_residuals=return_residuals,
+        group_offset=group_offset,
         activation=activation,
         manual_axis_type=manual_axis_type,
         rhs_scale=rhs_scale,
@@ -279,6 +281,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       preferred_element_type: jnp.dtype | None,
       return_residuals: bool,
       config: _Config,
+      group_offset: jax.Array | None = None,
       activation: ActivationFunction | None = None,
       manual_axis_type: ManualAxisType | None = None,
       rhs_scale: jax.Array | None = None,
@@ -286,7 +289,12 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       maybe_quantize_lhs: bool = False,
   ) -> tuple[jax.Array, Residuals]:
     del config  # Unused.
-    
+
+    if group_offset is not None:
+      raise NotImplementedError(
+          "`group_offset` is not supported by XLA implementation."
+      )
+
     if rhs_scale is not None or rhs_bias is not None or maybe_quantize_lhs:
       raise NotImplementedError("rhs_scale/rhs_bias/maybe_quantize_lhs not"
                                 "supported by XLA implementation.")
@@ -333,6 +341,7 @@ def vjp(
     ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
     precision: CanonicalPrecision,
     preferred_element_type: jnp.dtype | None,
+    group_offset: jax.Array | None = None,
     activation: ActivationFunction | None = None,
     dlhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
@@ -375,6 +384,7 @@ def vjp(
       ),
       precision=precision,
       preferred_element_type=lhs.dtype,
+      group_offset=group_offset,
       # TODO: Remove "hasattr" check once JAX is upgraded.
       manual_axis_type=(
           jax.typeof(lhs).manual_axis_type.to_ct_mat()
@@ -395,6 +405,7 @@ def vjp(
       ),
       precision=precision,
       preferred_element_type=rhs.dtype,
+      group_offset=group_offset,
       # TODO: Remove "hasattr" check once JAX is upgraded.
       manual_axis_type=(
           jax.typeof(rhs).manual_axis_type.to_ct_mat()
