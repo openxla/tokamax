@@ -14,7 +14,8 @@
 # ==============================================================================
 import functools
 import math
-from typing import cast
+import typing
+from typing import Literal
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -27,12 +28,27 @@ from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
+from tokamax._src import hlo_utils_common
 from tokamax._src import numerics
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+
+RepresentationTypes = Literal['lowered', 'mlir']
+
+REPRESENTATION_TYPES = tuple(typing.get_args(RepresentationTypes))
+
+
+def _computation_from_lowered(
+    x: jax.stages.Lowered, representation: RepresentationTypes
+) -> hlo_utils.HloComputation:
+  match representation:
+    case 'lowered':
+      return x
+    case 'mlir':
+      return hlo_utils_common.ir_module_from_lowered(x)
 
 
 def add_vectors_kernel(x_ref, y_ref, o_ref):
@@ -66,7 +82,8 @@ def add_vectors_pallas_triton(x: jax.Array, y: jax.Array) -> jax.Array:
 
 class DumpHloLibTest(parameterized.TestCase):
 
-  def test_pallas_gpu_tpu(self):
+  @parameterized.parameters(*REPRESENTATION_TYPES)
+  def test_pallas_gpu_tpu(self, representation):
     # Example taken from https://docs.jax.dev/en/latest/pallas/quickstart.html.
     def add_vectors_kernel(x_ref, y_ref, o_ref):
       x, y = x_ref[...], y_ref[...]
@@ -87,14 +104,18 @@ class DumpHloLibTest(parameterized.TestCase):
     out_ref = jnp.array([0, 2, 4, 6, 8, 10, 12, 14], dtype=jnp.int32)
     self.assertTrue(jnp.array_equal(out, out_ref))
 
+    computation = _computation_from_lowered(
+        add_vectors.lower(x, x), representation
+    )
+
     (kernel_info,) = hlo_utils.get_kernel_info(
-        add_vectors.lower(x, x), include_xla_kernels=False
+        computation, include_xla_kernels=False
     )
 
     expected_class = (
-        hlo_utils.TritonKernelInfo
+        hlo_utils_common.TritonKernelInfo
         if jax.default_backend() == 'gpu'
-        else hlo_utils.MosaicTpuKernelInfo
+        else hlo_utils_common.MosaicTpuKernelInfo
     )
     self.assertIsInstance(kernel_info, expected_class)
     self.assertEqual(
@@ -102,20 +123,25 @@ class DumpHloLibTest(parameterized.TestCase):
         (jax.ShapeDtypeStruct(shape=(8,), dtype=jnp.int32),),
     )
 
-  def test_simple_pallas_triton(self):
+  @parameterized.parameters(*REPRESENTATION_TYPES)
+  def test_simple_pallas_triton(self, representation):
 
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
     dtype = jnp.int32
     x = jnp.arange(8, dtype=dtype)
-    lowered = add_vectors_pallas_triton.lower(x=x, y=x)
-    kernel_info = hlo_utils.get_kernel_info(lowered, include_xla_kernels=False)
+    computation = _computation_from_lowered(
+        add_vectors_pallas_triton.lower(x=x, y=x), representation
+    )
+    kernel_info = hlo_utils.get_kernel_info(
+        computation, include_xla_kernels=False
+    )
     self.assertLen(kernel_info, 2)
     kernel_1, kernel_2 = kernel_info
 
-    self.assertIsInstance(kernel_1, hlo_utils.TritonKernelInfo)
-    self.assertIsInstance(kernel_2, hlo_utils.TritonKernelInfo)
+    self.assertIsInstance(kernel_1, hlo_utils_common.TritonKernelInfo)
+    self.assertIsInstance(kernel_2, hlo_utils_common.TritonKernelInfo)
 
     self.assertEqual(kernel_1.kernel_name, 'add_vectors_kernel_1')
     self.assertEqual(kernel_2.kernel_name, 'add_vector_two')
@@ -134,7 +160,8 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertEqual(kernel_2.inputs, (shape,))
     self.assertEqual(kernel_2.grid, (8, 1, 1))
 
-  def test_pallas_norm(self):
+  @parameterized.parameters(*REPRESENTATION_TYPES)
+  def test_pallas_norm(self, representation):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
@@ -154,14 +181,16 @@ class DumpHloLibTest(parameterized.TestCase):
       return jnp.sum(f(x, scale, offset))
 
     f_grad = jax.grad(layer_norm_loss, argnums=(0, 1, 2))
-    f_grad_lowered = jax.jit(f_grad).lower(x, scale, offset)
-
-    forward, vjp = hlo_utils.get_kernel_info(
-        f_grad_lowered, include_xla_kernels=False
+    computation = _computation_from_lowered(
+        jax.jit(f_grad).lower(x, scale, offset), representation
     )
 
-    self.assertIsInstance(forward, hlo_utils.TritonKernelInfo)
-    self.assertIsInstance(vjp, hlo_utils.TritonKernelInfo)
+    forward, vjp = hlo_utils.get_kernel_info(
+        computation, include_xla_kernels=False
+    )
+
+    self.assertIsInstance(forward, hlo_utils_common.TritonKernelInfo)
+    self.assertIsInstance(vjp, hlo_utils_common.TritonKernelInfo)
 
     self.assertEqual(forward.kernel_name, 'pallas_layer_norm_fwd_res')
     self.assertEqual(vjp.kernel_name, 'pallas_layer_norm_vjp')
@@ -180,7 +209,8 @@ class DumpHloLibTest(parameterized.TestCase):
 
     # TODO: add tests for axis once this is in the Pallas HLO.
 
-  def test_get_opspecs_from_lowered_jax(self):
+  @parameterized.parameters(*REPRESENTATION_TYPES)
+  def test_get_opspecs_from_lowered_jax(self, representation):
 
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
@@ -203,8 +233,10 @@ class DumpHloLibTest(parameterized.TestCase):
       x = norm_op(x, scale, offset)
       return jnp.sum(glu_op(x, weights, activation=jax.nn.swish))
 
-    f_lowered = jax.jit(norm_and_glu).lower(x, scale, offset, weights)
-    op_specs = hlo_utils.get_opspecs(f_lowered)
+    computation = _computation_from_lowered(
+        jax.jit(norm_and_glu).lower(x, scale, offset, weights), representation
+    )
+    op_specs = hlo_utils.get_opspecs(computation)
 
     norm_spec = norm_op.bind(  # pytype: disable=wrong-arg-types
         jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
@@ -225,8 +257,11 @@ class DumpHloLibTest(parameterized.TestCase):
 
     # Test VJP ops.
     norm_vjp = lambda x, scale, offset: jnp.sum(norm_op(x, scale, offset))
-    norm_lowered = jax.jit(jax.value_and_grad(norm_vjp)).lower(x, scale, offset)
-    op_specs = hlo_utils.get_opspecs(norm_lowered, include_xla_kernels=False)
+    computation = _computation_from_lowered(
+        jax.jit(jax.value_and_grad(norm_vjp)).lower(x, scale, offset),
+        representation,
+    )
+    op_specs = hlo_utils.get_opspecs(computation, include_xla_kernels=False)
 
     norm_spec = norm_op.bind(  # pytype: disable=wrong-arg-types
         jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
@@ -234,7 +269,9 @@ class DumpHloLibTest(parameterized.TestCase):
         jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
         return_residuals=True,
     )
-    norm_vjp_op = cast(pl_norm_vjp.PallasTritonNormalizationVjp, norm_op.vjp)
+    norm_vjp_op = typing.cast(
+        pl_norm_vjp.PallasTritonNormalizationVjp, norm_op.vjp
+    )
     norm_vjp_spec = norm_vjp_op.bind(**norm_spec.vjp_arg_spec)
     self.assertEqual(op_specs[0].op.config, norm_spec.default_config)
     self.assertEqual(op_specs[1].op.config, norm_vjp_spec.default_config)
@@ -246,11 +283,14 @@ class DumpHloLibTest(parameterized.TestCase):
     def sin_cos(x):
       return jnp.sin(x), jnp.cos(x)
 
-    sin_cos_lowered = jax.jit(sin_cos).lower(x)
-    op_specs = hlo_utils.get_opspecs(sin_cos_lowered)
+    computation = _computation_from_lowered(
+        jax.jit(sin_cos).lower(x), representation
+    )
+    op_specs = hlo_utils.get_opspecs(computation)
     self.assertEmpty(op_specs)
 
-  def test_normalization_spec_round_trip(self):
+  @parameterized.parameters(*REPRESENTATION_TYPES)
+  def test_normalization_spec_round_trip(self, representation):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
@@ -264,7 +304,8 @@ class DumpHloLibTest(parameterized.TestCase):
 
     fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
     fn_lowered = jax.jit(fn).lower(x)
-    (ba2,) = hlo_utils.get_opspecs(fn_lowered, include_xla_kernels=False)
+    computation = _computation_from_lowered(fn_lowered, representation)
+    (ba2,) = hlo_utils.get_opspecs(computation, include_xla_kernels=False)
     self.assertEqual(ba.default_config, ba2.op.config)
     object.__setattr__(ba2.op, 'config', None)
     self.assertEqual(ba, ba2)
@@ -274,7 +315,8 @@ class DumpHloLibTest(parameterized.TestCase):
     diff_summary = numerics.array_diff_summary(expected, jax.jit(fn2)(x2))
     self.assertGreater(diff_summary.percent_close * 100, 99.99)
 
-  def test_ragged_dot_spec_round_trip(self):
+  @parameterized.parameters(*REPRESENTATION_TYPES)
+  def test_ragged_dot_spec_round_trip(self, representation):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
@@ -287,7 +329,8 @@ class DumpHloLibTest(parameterized.TestCase):
 
     fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
     fn_lowered = jax.jit(fn).lower(x)
-    (ba2,) = hlo_utils.get_opspecs(fn_lowered, include_xla_kernels=False)
+    computation = _computation_from_lowered(fn_lowered, representation)
+    (ba2,) = hlo_utils.get_opspecs(computation, include_xla_kernels=False)
     fn2, x2 = benchmarking.standardize_function(ba2.op, kwargs=ba2.arguments)
 
     arguments = dict(ba.arguments)
@@ -308,10 +351,13 @@ class DumpHloLibTest(parameterized.TestCase):
     diff_summary = numerics.array_diff_summary(expected, jax.jit(fn2)(x2))
     self.assertGreater(diff_summary.percent_close * 100, 99.99)
 
-  @parameterized.parameters(
-      ['mosaic', 'triton', 'xla', 'xla_chunked', 'cudnn', None]
+  @parameterized.product(
+      implementation=['mosaic', 'triton', 'xla', 'xla_chunked', 'cudnn', None],
+      representation=REPRESENTATION_TYPES,
   )
-  def test_opspec_attention_all_implementations(self, implementation):
+  def test_opspec_attention_all_implementations(
+      self, implementation, representation
+  ):
     """Tests that attention opspecs are returned for all implementations."""
 
     # TODO: Remove skipping None once fixed.
@@ -328,7 +374,8 @@ class DumpHloLibTest(parameterized.TestCase):
         attention_api.dot_product_attention, implementation=implementation
     )
     f = jax.jit(f)
-    opspecs = hlo_utils.get_opspecs(f.lower(x, x, x))
+    computation = _computation_from_lowered(f.lower(x, x, x), representation)
+    opspecs = hlo_utils.get_opspecs(computation)
     self.assertNotEmpty(opspecs)
     opspec = opspecs[0]
     self.assertEqual(

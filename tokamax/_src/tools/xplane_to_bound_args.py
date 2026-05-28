@@ -32,7 +32,7 @@ Flags:
 import sys
 from absl import app
 from absl import flags
-from tokamax.google import hlo_utils
+from tokamax._src import hlo_utils
 from tensorflow.compiler.xla.service import hlo_pb2
 from tensorflow.tsl.profiler.protobuf import xplane_pb2
 

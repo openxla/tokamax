@@ -191,7 +191,7 @@ _P = ParamSpec("_P")
 def get_bound_args(
     f: (
         Callable[_P, Any]
-        | jax.stages.Lowered
+        | hlo_utils.HloComputation
     ),
     *args: _P.args,
     **kwargs: _P.kwargs,
@@ -230,6 +230,7 @@ def get_bound_args(
 
 def dump_bound_args_to_json(bound_args: Sequence[op_lib.BoundArguments]) -> str:
   """Dumps a sequence of BoundArguments to a JSON string."""
+
   def _strip_vjp_and_config(
       bound_arg: op_lib.BoundArguments,
   ) -> op_lib.BoundArguments:
