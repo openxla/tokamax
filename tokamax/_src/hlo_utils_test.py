@@ -360,11 +360,7 @@ class DumpHloLibTest(parameterized.TestCase):
   ):
     """Tests that attention opspecs are returned for all implementations."""
 
-    # TODO: Remove skipping None once fixed.
-    if (
-        implementation in ('mosaic', 'triton', 'cudnn', None)
-        and jax.default_backend() != 'gpu'
-    ):
+    if implementation in ('triton', 'cudnn') and jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
     if implementation == 'mosaic' and not gpu_utils.has_mosaic_gpu_support():
       self.skipTest('mosaic is not supported on this GPU version.')
