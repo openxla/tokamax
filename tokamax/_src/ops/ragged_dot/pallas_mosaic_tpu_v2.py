@@ -120,6 +120,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,
       maybe_quantize_lhs: bool = False,
+      zero_initialize: bool = True,
   ) -> tuple[jax.Array, base.Residuals]:
     if isinstance(lhs, (QArray, AsQArray)) or isinstance(rhs, (QArray, AsQArray)):
       raise NotImplementedError("v2 accepts only raw arrays; pass quantization via the rhs_scale/rhs_bias API kwargs instead.")

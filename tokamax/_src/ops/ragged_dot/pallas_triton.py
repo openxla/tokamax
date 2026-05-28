@@ -370,15 +370,23 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,
       maybe_quantize_lhs: bool = False,
+      zero_initialize: bool = True,
   ) -> tuple[jax.Array, base.Residuals]:
     if group_offset is not None:
       raise NotImplementedError(
           "`group_offset` is not supported by Triton implementation."
       )
 
-    if rhs_scale is not None or rhs_bias is not None or maybe_quantize_lhs:
-      raise NotImplementedError("rhs_scale/rhs_bias/maybe_quantize_lhs not"
-                                "supported by Triton implementation.")
+    if (
+        rhs_scale is not None
+        or rhs_bias is not None
+        or maybe_quantize_lhs
+        or not zero_initialize
+    ):
+      raise NotImplementedError(
+          "rhs_scale/rhs_bias/maybe_quantize_lhs/zero_initialize=False not"
+          " supported by Triton implementation."
+      )
 
     lhs, rhs = map(quantization.as_array_or_qarray, (lhs, rhs))
 

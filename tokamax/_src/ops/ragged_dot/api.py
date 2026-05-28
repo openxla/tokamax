@@ -80,6 +80,7 @@ def ragged_dot(
     rhs_scale: jax.Array | None = None,
     rhs_bias: jax.Array | None = None,
     maybe_quantize_lhs: bool = False,
+    zero_initialize: bool = True,
     *,
     implementation: (
         Implementation
@@ -113,6 +114,10 @@ def ragged_dot(
     rhs_bias: GMM V2 feature only. The rhs bias.
     maybe_quantize_lhs: GMM v2 feature only. Quantize lhs if set to True and
       rhs is quantized.
+    zero_initialize: GMM v2 feature only. Whether to initialize unvisited output
+      elements to zero. Defaults to True (standard behavior). Setting it to
+      False is a v2-only optimization; other implementations raise
+      `NotImplementedError`.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -134,6 +139,7 @@ def ragged_dot(
       rhs_scale=rhs_scale,
       rhs_bias=rhs_bias,
       maybe_quantize_lhs=maybe_quantize_lhs,
+      zero_initialize=zero_initialize,
       implementation=implementation,
   )
 
@@ -151,6 +157,7 @@ def ragged_dot_general(
     rhs_scale: jax.Array | None = None,
     rhs_bias: jax.Array | None = None,
     maybe_quantize_lhs: bool = False,
+    zero_initialize: bool = True,
     *,
     implementation: (
         Implementation
@@ -183,6 +190,10 @@ def ragged_dot_general(
     rhs_bias: GMM V2 feature only. The rhs bias.
     maybe_quantize_lhs: GMM v2 feature only. Quantize lhs if set to True and
       rhs is quantized.
+    zero_initialize: GMM v2 feature only. Whether to initialize unvisited output
+      elements to zero. Defaults to True (standard behavior). Setting it to
+      False is a v2-only optimization; other implementations raise
+      `NotImplementedError`.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -242,6 +253,7 @@ def ragged_dot_general(
           rhs_scale=rhs_scale,
           rhs_bias=rhs_bias,
           maybe_quantize_lhs=maybe_quantize_lhs,
+          zero_initialize=zero_initialize,
           **kwargs,
       )
     except NotImplementedError as e:
