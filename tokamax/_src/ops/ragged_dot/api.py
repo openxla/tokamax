@@ -81,6 +81,7 @@ def ragged_dot(
     rhs_bias: jax.Array | None = None,
     maybe_quantize_lhs: bool = False,
     zero_initialize: bool = True,
+    fuse_act: str | None = None,
     *,
     implementation: (
         Implementation
@@ -118,6 +119,13 @@ def ragged_dot(
       elements to zero. Defaults to True (standard behavior). Setting it to
       False is a v2-only optimization; other implementations raise
       `NotImplementedError`.
+    fuse_act: GMM v2 feature only. Name of a gated (GLU-style) activation to
+      fuse into the kernel: one of "silu", "gelu", or "swigluoai". The output's
+      `n` dimension is split into gate/up halves, the activation is applied to
+      the gate half, and the result is multiplied element-wise by the up half,
+      so the output `n` dimension is halved. This differs from `activation`,
+      which is an element-wise function applied to the full output. Other
+      implementations raise `NotImplementedError` if non-None.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -140,6 +148,7 @@ def ragged_dot(
       rhs_bias=rhs_bias,
       maybe_quantize_lhs=maybe_quantize_lhs,
       zero_initialize=zero_initialize,
+      fuse_act=fuse_act,
       implementation=implementation,
   )
 
@@ -158,6 +167,7 @@ def ragged_dot_general(
     rhs_bias: jax.Array | None = None,
     maybe_quantize_lhs: bool = False,
     zero_initialize: bool = True,
+    fuse_act: str | None = None,
     *,
     implementation: (
         Implementation
@@ -194,6 +204,13 @@ def ragged_dot_general(
       elements to zero. Defaults to True (standard behavior). Setting it to
       False is a v2-only optimization; other implementations raise
       `NotImplementedError`.
+    fuse_act: GMM v2 feature only. Name of a gated (GLU-style) activation to
+      fuse into the kernel: one of "silu", "gelu", or "swigluoai". The output's
+      `n` dimension is split into gate/up halves, the activation is applied to
+      the gate half, and the result is multiplied element-wise by the up half,
+      so the output `n` dimension is halved. This differs from `activation`,
+      which is an element-wise function applied to the full output. Other
+      implementations raise `NotImplementedError` if non-None.
     implementation: The implementation to use. By default, `None` is used, which
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
@@ -254,6 +271,7 @@ def ragged_dot_general(
           rhs_bias=rhs_bias,
           maybe_quantize_lhs=maybe_quantize_lhs,
           zero_initialize=zero_initialize,
+          fuse_act=fuse_act,
           **kwargs,
       )
     except NotImplementedError as e:

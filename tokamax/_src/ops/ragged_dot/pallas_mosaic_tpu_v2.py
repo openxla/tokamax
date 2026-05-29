@@ -121,6 +121,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
       rhs_bias: jax.Array | None = None,
       maybe_quantize_lhs: bool = False,
       zero_initialize: bool = True,
+      fuse_act: str | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
     if isinstance(lhs, (QArray, AsQArray)) or isinstance(rhs, (QArray, AsQArray)):
       raise NotImplementedError("v2 accepts only raw arrays; pass quantization via the rhs_scale/rhs_bias API kwargs instead.")
@@ -128,8 +129,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
       raise NotImplementedError("v2 does not support manual_axis_type yet.")
     if activation is not None:
       raise NotImplementedError("v2 does not support activation yet.")
-    
-    # xw32: What to do with the fuse_act in the gmm v2 kernel?
+
     tile_info = None
     vmem_limit_bytes = None
     acc_dtype = None

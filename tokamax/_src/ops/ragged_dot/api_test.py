@@ -263,6 +263,8 @@ class RaggedDotGmmV2CompatibilityAPITest(parameterized.TestCase):
       return {"zero_initialize": False}
     if kwarg == "group_offset":
       return {"group_offset": jnp.array([0], jnp.int32)}
+    if kwarg == "fuse_act":
+      return {"fuse_act": "silu"}
     raise ValueError(f"Unknown kwarg: {kwarg}")
 
   def _assert_rejects(self, implementation, kwarg):
@@ -275,14 +277,14 @@ class RaggedDotGmmV2CompatibilityAPITest(parameterized.TestCase):
 
   @parameterized.parameters(
       "rhs_scale", "rhs_bias", "maybe_quantize_lhs", "zero_initialize",
-      "group_offset"
+      "group_offset", "fuse_act"
   )
   def test_mosaic_xla_rejects_new_kwargs(self, kwarg):
     self._assert_rejects("xla", kwarg)
 
   @parameterized.parameters(
       "rhs_scale", "rhs_bias", "maybe_quantize_lhs", "zero_initialize",
-      "group_offset"
+      "group_offset", "fuse_act"
   )
   def test_mosaic_tpu_rejects_new_kwargs(self, kwarg):
     if jax.default_backend() != "tpu":
@@ -291,7 +293,7 @@ class RaggedDotGmmV2CompatibilityAPITest(parameterized.TestCase):
 
   @parameterized.parameters(
       "rhs_scale", "rhs_bias", "maybe_quantize_lhs", "zero_initialize",
-      "group_offset"
+      "group_offset", "fuse_act"
   )
   def test_triton_rejects_new_kwargs(self, kwarg):
     if "triton" not in api.IMPLEMENTATIONS:
@@ -302,7 +304,7 @@ class RaggedDotGmmV2CompatibilityAPITest(parameterized.TestCase):
 
   @parameterized.parameters(
       "rhs_scale", "rhs_bias", "maybe_quantize_lhs", "zero_initialize",
-      "group_offset"
+      "group_offset", "fuse_act"
   )
   def test_mosaic_gpu_rejects_new_kwargs(self, kwarg):
     if "mosaic_gpu" not in api.IMPLEMENTATIONS:

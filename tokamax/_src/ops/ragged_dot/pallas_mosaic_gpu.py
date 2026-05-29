@@ -83,6 +83,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       rhs_bias: jax.Array | None = None,
       maybe_quantize_lhs: bool = False,
       zero_initialize: bool = True,
+      fuse_act: str | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support returning residuals from mosaic GPU kernel.
 
@@ -96,10 +97,11 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         or rhs_bias is not None
         or maybe_quantize_lhs
         or not zero_initialize
+        or fuse_act is not None
     ):
       raise NotImplementedError(
-          "rhs_scale/rhs_bias/maybe_quantize_lhs/zero_initialize=False not"
-          " supported by mosaic GPU implementation."
+          "rhs_scale/rhs_bias/maybe_quantize_lhs/zero_initialize=False/fuse_act"
+          " not supported by mosaic GPU implementation."
       )
 
     if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
