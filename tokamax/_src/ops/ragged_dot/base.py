@@ -361,9 +361,30 @@ def vjp(
     drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     # `manual_axis_type` is not used, but is expected by vjp.
     manual_axis_type: ManualAxisType | None = None,
+    # The following are forward-only features (forwarded here by the op
+    # framework because they are part of `bind`). The backward path does not
+    # support quantized/biased/fused gradients, so they must be at defaults and
+    # are not propagated to the `dlhs`/`drhs` sub-calls.
+    rhs_scale: jax.Array | None = None,
+    rhs_bias: jax.Array | None = None,
+    maybe_quantize_lhs: bool = False,
+    zero_initialize: bool = True,
+    fuse_act: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Ragged dot VJP."""
   del out, preferred_element_type  # Unused.
+
+  if (
+      rhs_scale is not None
+      or rhs_bias is not None
+      or maybe_quantize_lhs
+      or not zero_initialize
+      or fuse_act is not None
+  ):
+    raise NotImplementedError(
+        "rhs_scale/rhs_bias/maybe_quantize_lhs/zero_initialize=False/fuse_act"
+        " are not supported on the ragged_dot backward path."
+    )
 
   if activation is not None:
     _, activation_grad_fn = jax.vjp(activation, residuals)

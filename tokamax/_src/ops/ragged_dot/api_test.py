@@ -245,6 +245,11 @@ class RaggedDotMosaicTpuV2Test(RaggedDotImplementationTest):
     dot_fn = self._dot_fn
 
     def fn(lhs, rhs, **kwargs):
+      # The mosaic_tpu_v2 wrapper has no element-wise `activation` (it fuses
+      # gated activations via `fuse_act` instead), so skip those subtests.
+      if kwargs.get("activation") is not None:
+        self.skipTest("v2 wrapper does not support `activation`.")
+
       # The mosaic_tpu_v2 wrapper accepts only raw arrays; `QArray`/`AsQArray`
       # inputs are rejected with `NotImplementedError`, so skip those subtests.
       lhs_ = jax.eval_shape(quantization.as_array_or_qarray, lhs)

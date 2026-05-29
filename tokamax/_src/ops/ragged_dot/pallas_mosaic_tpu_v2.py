@@ -72,6 +72,23 @@ UNSUPPORTED_DIMENSIONS_MSG = (
     f" {DLHS_RAGGED_DOT_DIM_NUMS}, {DRHS_RAGGED_DOT_DIM_NUMS}"
 )
 
+
+def _has_manual_axes(manual_axis_type) -> bool:
+  """Returns whether `manual_axis_type` names any manual axes.
+
+  The base VJP always forwards a `manual_axis_type` to its sub-calls, derived
+  from the input's type. For unsharded arrays this is a *trivial* value (all
+  axis sets empty), which is semantically equivalent to `None`. Only a value
+  that actually names axes implies shard_map, which v2 does not support yet.
+  """
+  if manual_axis_type is None:
+    return False
+  return bool(
+      getattr(manual_axis_type, "varying", None)
+      or getattr(manual_axis_type, "unreduced", None)
+      or getattr(manual_axis_type, "reduced", None)
+  )
+
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
   """Pallas-Mosaic-TPU ragged dot implementation v2.
@@ -146,8 +163,11 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
   ) -> tuple[jax.Array, base.Residuals]:
     if isinstance(lhs, (QArray, AsQArray)) or isinstance(rhs, (QArray, AsQArray)):
       raise NotImplementedError("v2 accepts only raw arrays; pass quantization via the rhs_scale/rhs_bias API kwargs instead.")
-    if manual_axis_type is not None:
-      raise NotImplementedError("v2 does not support manual_axis_type yet.")
+    if _has_manual_axes(manual_axis_type):
+      raise NotImplementedError(
+          "v2 does not support manual_axis_type yet. But got"
+          f" manual_axis_type={manual_axis_type}"
+      )
     if activation is not None:
       raise NotImplementedError("v2 does not support activation.")
 
@@ -189,7 +209,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           tile_info=gmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
-          preferred_element_type=preferred_element_type,
+          preferred_element_type=lhs.dtype,
           acc_dtype=acc_dtype,
           maybe_quantize_lhs=maybe_quantize_lhs,
           zero_initialize=zero_initialize,
@@ -206,6 +226,14 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             " is only available on the autodiff backward path."
         )
       num_actual_groups = self.num_actual_groups
+      # tgmm computes lhs^T @ rhs on the MXU and requires both operands to share
+      # a sublane tiling, i.e. the same dtype (it asserts
+      # size_lhs_sublane == size_rhs_sublane). On the backward path `rhs` is the
+      # incoming cotangent (often f32) while `lhs` is the original activation
+      # (e.g. bf16); cast the cotangent to `lhs.dtype` so the dtypes match. The
+      # kernel computes in this dtype on the MXU regardless, and the output then
+      # takes the original rhs gradient dtype rather than f32.
+      rhs = rhs.astype(lhs.dtype)
       out = tgmm_backend.tgmm_v2(
           lhs,  # [m, k]
           rhs,  # [m, n]
@@ -213,10 +241,10 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           num_actual_groups,
           group_offset,
           # TODO: consider letting users provide tiling for bwd.
-          tile_info=tgmm_backend.calculate_tiling,
+          tile_info=tgmm_backend.calculate_tgmm_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
-          preferred_element_type=preferred_element_type,
+          preferred_element_type=rhs.dtype,
           acc_dtype=acc_dtype,
       )
     else:
