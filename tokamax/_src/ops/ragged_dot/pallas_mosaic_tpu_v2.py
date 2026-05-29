@@ -153,6 +153,11 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
 
     if isinstance(group_sizes, base.GroupSizes):
       group_sizes = jnp.array(group_sizes)
+    # The v2 kernel's metadata code does `pl.cdiv(group_size, tile_m)` with an
+    # int32 `tile_m`, and `lax.div` rejects mixed signedness. Callers may pass
+    # `uint32` group sizes (e.g. `jax.lax.ragged_dot`'s default), so normalize
+    # to the int32 contract the kernel documents.
+    group_sizes = group_sizes.astype(jnp.int32)
 
     vmem_limit_bytes = None
     acc_dtype = None
@@ -222,6 +227,15 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     # xw32: under what condition is return_residuals True?
     residuals = out
     return out, residuals if return_residuals else None
+
+  @override
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    # The v2 kernel computes its own VMEM-aware tiling internally (see the
+    # `tile_info=...calculate_tiling` calls in `_fwd`), so there is nothing to
+    # search here. Return the default `Config`; its tile fields are not consumed
+    # by `_fwd` and exist only to satisfy the op-framework config contract.
+    del ba
+    return Config()
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

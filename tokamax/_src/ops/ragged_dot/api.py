@@ -56,6 +56,12 @@ try:
 except ImportError:
   pass
 
+try:
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  _IMPLEMENTATIONS["mosaic_tpu_v2"] = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+except ImportError:
+  pass
+
 # TODO: Directly import ManualAxisType JAX is upgraded.
 try:
   from jax.sharding import ManualAxisType

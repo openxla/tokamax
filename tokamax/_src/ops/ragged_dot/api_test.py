@@ -151,6 +151,7 @@ class RaggedDotTest(parameterized.TestCase):
 class RaggedDotImplementationTest(test_base.RaggedDotTestBase):
 
   def __init__(self, *args, implementation=None):
+    self._implementation = implementation
     dot_fn = functools.partial(api.ragged_dot, implementation=implementation)
     super().__init__(*args, dot_fn=dot_fn)
 
@@ -164,8 +165,9 @@ class RaggedDotImplementationTest(test_base.RaggedDotTestBase):
     # TODO: XLA:TPU is not respecting the new precision API.
     # As Tokamax converts jax.lax.Precision.HIGHEST to BF16_BF16_F32_X6 on TPU,
     # this causes numerical inconsistencies with the tests using
-    # jax.lax.Precision.HIGHEST.
-    if jax.default_backend() == "tpu":
+    # jax.lax.Precision.HIGHEST. Only the mosaic_tpu_v2 implementation is
+    # exercised on TPU for now; the others still hit this mismatch.
+    if jax.default_backend() == "tpu" and self._implementation != "mosaic_tpu_v2":
       self.skipTest("Test disabled on TPU.")
 
     super().setUp()
@@ -233,6 +235,45 @@ class RaggedDotXlaTest(RaggedDotImplementationTest):
 
   def __init__(self, *args):
     super().__init__(*args, implementation="xla")
+
+
+class RaggedDotMosaicTpuV2Test(RaggedDotImplementationTest):
+
+  def __init__(self, *args):
+    super().__init__(*args, implementation="mosaic_tpu_v2")
+
+    dot_fn = self._dot_fn
+
+    def fn(lhs, rhs, **kwargs):
+      # The mosaic_tpu_v2 wrapper accepts only raw arrays; `QArray`/`AsQArray`
+      # inputs are rejected with `NotImplementedError`, so skip those subtests.
+      lhs_ = jax.eval_shape(quantization.as_array_or_qarray, lhs)
+      rhs_ = jax.eval_shape(quantization.as_array_or_qarray, rhs)
+      if isinstance(lhs_, qwix.QArray) or isinstance(rhs_, qwix.QArray):
+        with self.assertRaises(NotImplementedError) as e:
+          _ = dot_fn(lhs, rhs, **kwargs)
+        self.skipTest(f"Test not supported: {e.msg}")
+
+      return dot_fn(lhs, rhs, **kwargs)
+
+    self._dot_fn = fn
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("mosaic_tpu_v2 is only supported on TPU.")
+    if "mosaic_tpu_v2" not in api.IMPLEMENTATIONS:
+      self.skipTest("mosaic_tpu_v2 implementation not registered.")
+    super().setUp()
+
+  @override
+  def _test_simple(self, dtype):
+    # The v2 kernel ignores `precision` and always computes on the bf16 MXU
+    # (see `gmm_v2`'s `del precision`). For f32 inputs `_dot_fn_f32` requests
+    # `Precision.HIGHEST`, so the reference computes in full f32 while the
+    # kernel returns a bf16-precision result; compare at bf16 tolerance.
+    tol = dict(atol=2e-2, rtol=2e-2) if jnp.dtype(dtype) == jnp.float32 else {}
+    with test_base.override_chex_args(**tol):
+      super()._test_simple(dtype)
 
 
 class RaggedDotGmmV2CompatibilityAPITest(parameterized.TestCase):
