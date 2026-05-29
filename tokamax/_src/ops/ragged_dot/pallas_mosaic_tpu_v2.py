@@ -15,7 +15,6 @@
 """Ragged dot Pallas-Mosaic-TPU implementation."""
 
 import dataclasses
-import functools
 import itertools
 import types
 from typing import Any, ClassVar
@@ -83,24 +82,46 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
   config_cls: ClassVar[type[Config]] = Config
   qdtype: jax.typing.DTypeLike | None = None
   interpret: bool = False
+  # Local weight group count for the drhs (tgmm) path. Under expert
+  # parallelism this differs from `group_sizes.shape[0]` (which is global).
+  # Set by the custom vjp (see `__post_init__`); `None` for the forward and
+  # for direct (non-autodiff) drhs calls.
+  num_actual_groups: int | None = None
 
   def __post_init__(self):
     qdtype: str | None = (
         self.qdtype if self.qdtype is None else jnp.dtype(self.qdtype).name
     )
     if self.vjp is None:
-      # Avoid infinite recursion.
-      fn = lambda *args, **kw: PallasMosaicTpuV2RaggedDot(  # pylint: disable=unnecessary-lambda
-          qdtype=qdtype,
-          interpret=self.interpret,
-      )(
-          *args, **kw
-      )
-      object.__setattr__(
-          self,
-          "vjp",
-          functools.partial(base.vjp, dlhs_ragged_dot=fn, drhs_ragged_dot=fn),
-      )
+      interpret = self.interpret
+
+      # Build a fresh sub-op for the backward sub-calls. `num_actual_groups`
+      # only matters for the drhs (tgmm) path; leave it `None` otherwise.
+      def make_fn(num_actual_groups=None):
+        return lambda *args, **kw: PallasMosaicTpuV2RaggedDot(  # pylint: disable=unnecessary-lambda
+            qdtype=qdtype,
+            interpret=interpret,
+            num_actual_groups=num_actual_groups,
+        )(*args, **kw)
+
+      def _vjp(residuals, out, dout, lhs, rhs, **kwargs):
+        # Under expert parallelism `group_sizes` is global, but the original
+        # local weights `rhs` (available here on the backward path) carry the
+        # actual local group count. Capture it and thread it into the tgmm
+        # sub-op, since the drhs `_fwd` only sees `lhs`/`dout`, not the weights.
+        num_actual_groups = rhs.shape[0]
+        return base.vjp(
+            residuals,
+            out,
+            dout,
+            lhs,
+            rhs,
+            dlhs_ragged_dot=make_fn(),
+            drhs_ragged_dot=make_fn(num_actual_groups=num_actual_groups),
+            **kwargs,
+        )
+
+      object.__setattr__(self, "vjp", _vjp)
 
   @override
   def _fwd(
@@ -128,7 +149,10 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     if manual_axis_type is not None:
       raise NotImplementedError("v2 does not support manual_axis_type yet.")
     if activation is not None:
-      raise NotImplementedError("v2 does not support activation yet.")
+      raise NotImplementedError("v2 does not support activation.")
+
+    if isinstance(group_sizes, base.GroupSizes):
+      group_sizes = jnp.array(group_sizes)
 
     tile_info = None
     vmem_limit_bytes = None
@@ -161,13 +185,23 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           tile_info=tile_info,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
-          preferred_element_type=lhs.dtype,
+          preferred_element_type=preferred_element_type,
           acc_dtype=acc_dtype,
           maybe_quantize_lhs=maybe_quantize_lhs,
           zero_initialize=zero_initialize,
           fuse_act=None,
       )
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
+      # Captured from the original local weights in the custom vjp. Under
+      # expert parallelism this is the local group count, which `group_sizes`
+      # (global) cannot provide. A direct (non-autodiff) drhs call has no
+      # weight context, so it is unsupported.
+      if self.num_actual_groups is None:
+        raise NotImplementedError(
+            "Direct drhs (tgmm) calls are not supported; `num_actual_groups`"
+            " is only available on the autodiff backward path."
+        )
+      num_actual_groups = self.num_actual_groups
       out = tgmm_backend.tgmm(
           lhs,  # [m, k]
           rhs,  # [m, n]
@@ -178,6 +212,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           tile_info=tile_info,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
+          preferred_element_type=preferred_element_type,
           acc_dtype=acc_dtype,
       )
     else:

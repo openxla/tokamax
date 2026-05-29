@@ -249,7 +249,6 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
 
     def f(*arrays):
       return fwd(*arrays, fwd_res=False)[0]
-    # TODO(xw32): need to set a breakpoint to study how this hard function works. 
     if self.vjp is None:
       if not self.supports_batched_args_capture:
         return f(*arrays)
