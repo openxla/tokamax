@@ -154,18 +154,17 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     if isinstance(group_sizes, base.GroupSizes):
       group_sizes = jnp.array(group_sizes)
 
-    tile_info = None
     vmem_limit_bytes = None
     acc_dtype = None
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
-      out = gmm_backend.gmm(
+      out = gmm_backend.gmm_v2(
           lhs,
           rhs,
           group_sizes,
           rhs_scale,
           rhs_bias,
           group_offset,
-          tile_info=tile_info,
+          tile_info=gmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
           preferred_element_type=preferred_element_type,
@@ -175,14 +174,14 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           fuse_act=fuse_act,
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
-      out = gmm_backend.gmm(
+      out = gmm_backend.gmm_v2(
           lhs,  # [m, n]
           rhs.swapaxes(1, 2),  # [num_groups, n, k]
           group_sizes,
           None,  # rhs_scale
           None,  # rhs_bias
           group_offset,
-          tile_info=tile_info,
+          tile_info=gmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
           preferred_element_type=preferred_element_type,
@@ -202,14 +201,14 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             " is only available on the autodiff backward path."
         )
       num_actual_groups = self.num_actual_groups
-      out = tgmm_backend.tgmm(
+      out = tgmm_backend.tgmm_v2(
           lhs,  # [m, k]
           rhs,  # [m, n]
           group_sizes,
           num_actual_groups,
           group_offset,
           # TODO: consider letting users provide tiling for bwd.
-          tile_info=tile_info,
+          tile_info=tgmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
           preferred_element_type=preferred_element_type,
