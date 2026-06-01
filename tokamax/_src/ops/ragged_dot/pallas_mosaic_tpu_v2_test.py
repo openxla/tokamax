@@ -19,31 +19,25 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
-import qwix
-from tokamax._src import quantization
-from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.ragged_dot import api
-from tokamax._src.ops.ragged_dot import base
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_kernel_test as kernel_test
 
 
 class PallasMosaicTpuV2ParameterPipingTest(parameterized.TestCase):
-  """Verifies each `ragged_dot` "mosaic_tpu_v2" API pipes the correct
-     parameters to the GMM v2 kernel.
+  """Verifies the "mosaic_tpu_v2" `ragged_dot` API pipes kwargs to the kernel.
 
-     Each test below mirrors one GMM case from `GmmTest` in
-     `pallas_mosaic_tpu_v2_kernel_test.py` (which compares the kernel against a
-     numpy-style reference). Here we instead route the *same* inputs through
-     `api.ragged_dot(..., implementation="mosaic_tpu_v2")` and a direct
-     `gmm_backend.gmm_v2(...)` call and assert they agree. Because both paths end
-     up in the same kernel with the same default tiling, any disagreement means
-     the API failed to thread a kwarg through to the kernel unchanged.
-     
-     The tests belongs to this file instead of the api_test.py. If we put the
-     tests to api_test.py then api_test.py needs to import the GMM v2 impl
-     which can be inconsistent with the status quo of api_test.py.
+  Each test below mirrors one GMM case from `GmmTest` in
+  `pallas_mosaic_tpu_v2_kernel_test.py` (which compares the kernel against a
+  numpy-style reference). Here we instead route the *same* inputs through
+  `api.ragged_dot(..., implementation="mosaic_tpu_v2")` and a direct
+  `gmm_backend.gmm_v2(...)` call and assert they agree. Because both paths end
+  up in the same kernel with the same default tiling, any disagreement means
+  the API failed to thread a kwarg through to the kernel unchanged.
+
+  These tests belong to this file instead of `api_test.py`. If we put them in
+  `api_test.py` then `api_test.py` would need to import the GMM v2 impl, which
+  would be inconsistent with the status quo of `api_test.py`.
   """
 
   def setUp(self):
@@ -232,6 +226,58 @@ class PallasMosaicTpuV2ParameterPipingTest(parameterized.TestCase):
         rhs,
         group_sizes,
         kwargs=dict(rhs_bias=rhs_bias, fuse_act="silu"),
+    )
+
+  def test_gmm_preferred_element_type_pipes(self):
+    """`preferred_element_type` must reach the kernel and set the output dtype.
+
+    With a non-default output dtype (f32), a wrapper that dropped the kwarg
+    would return bf16 (`lhs.dtype`); the explicit dtype checks below catch that
+    even though the values themselves would still be numerically close.
+    """
+    batch_size, in_size, out_size = 256, 256, 256
+    num_groups = 4
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups, in_size, out_size), jnp.bfloat16)
+    group_sizes = kernel_test.get_group_sizes(batch_size, num_groups)
+
+    via_api = api.ragged_dot(
+        lhs,
+        rhs,
+        group_sizes,
+        implementation="mosaic_tpu_v2",
+        preferred_element_type=jnp.float32,
+    )
+    via_kernel = gmm_backend.gmm_v2(
+        lhs, rhs, group_sizes=group_sizes, preferred_element_type=jnp.float32
+    )
+    self.assertEqual(via_api.dtype, jnp.float32)
+    self.assertEqual(via_kernel.dtype, jnp.float32)
+    chex.assert_trees_all_close(via_api, via_kernel, atol=2e-2, rtol=2e-2)
+
+  def test_gmm_precision_pipes(self):
+    """`precision` must thread through the API to the kernel without error.
+
+    The v2 kernel ignores `precision` (it exists only for API compatibility and
+    is `del`-eted inside `gmm_v2`), so this is an accepts-and-forwards check
+    rather than a numeric one: the API must accept a non-default precision and
+    still produce the same result as the direct kernel call.
+    """
+    batch_size, in_size, out_size = 256, 256, 256
+    num_groups = 4
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups, in_size, out_size), jnp.bfloat16)
+    group_sizes = kernel_test.get_group_sizes(batch_size, num_groups)
+
+    self._assert_gmm_api_matches_kernel(
+        lhs,
+        rhs,
+        group_sizes,
+        kwargs=dict(precision=jax.lax.Precision.HIGHEST),
     )
 
 
