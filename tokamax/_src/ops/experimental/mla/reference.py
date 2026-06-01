@@ -119,6 +119,7 @@ def update_kv_cache(
         "q_scale",
         "k_scale",
         "v_scale",
+        "s_dtype",
     ),
 )
 def mla_attention(
@@ -139,6 +140,7 @@ def mla_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    s_dtype: jnp.dtype = jnp.bfloat16,
 ):
   """Performs Multi-Head Latent Attention.
 
@@ -162,6 +164,7 @@ def mla_attention(
     q_scale: Optional scaling for queries.
     k_scale: Optional scaling for keys.
     v_scale: Optional scaling for values (applied to output).
+    s_dtype: Data type of the Logits.
 
   Returns:
     A tuple containing:
@@ -169,7 +172,6 @@ def mla_attention(
       - The updated KV cache.
   """
   q_kv_dtype = ql_nope.dtype
-  s_dtype = cache_kv.dtype
   if mask_value is None:
     mask_value = float(jnp.finfo(s_dtype).min)
   batch_size = kv_lens.shape[0]
@@ -276,8 +278,8 @@ def mla_attention(
       if soft_cap is not None:
         logits = jnp.tanh(logits / soft_cap) * soft_cap
       logits = jnp.where(mask[None, :, :], mask_value, logits)
-
-      probs = jax.nn.softmax(logits, axis=-1).astype(s_dtype)
+      logits = logits.astype(s_dtype)
+      probs = jax.nn.softmax(logits, axis=-1).astype(v_i.dtype)
 
       # out_i: [total_q_len, actual_num_q_heads, lkv_dim]
       out_i = jnp.einsum(

@@ -47,6 +47,7 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      s_dtype: jnp.dtype = jnp.bfloat16,
       debug_mode: bool = False,
       return_residuals: bool = False,
   ):
@@ -88,6 +89,7 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        s_dtype=s_dtype,
         debug_mode=debug_mode,
         return_residuals=return_residuals,
     )
@@ -112,6 +114,7 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      s_dtype: jnp.dtype = jnp.bfloat16,
       debug_mode: bool = False,
       return_residuals: bool = False,
       config: _Config | None = None,
@@ -135,6 +138,7 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            s_dtype=s_dtype,
         ),
         None,
     )
