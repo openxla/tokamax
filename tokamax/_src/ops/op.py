@@ -40,7 +40,6 @@ from tokamax._src import utils
 from tokamax._src.autotuning import autotuner as autotuner_lib
 from tokamax._src.autotuning import cache as autotuning_cache
 
-
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _T2 = TypeVar("_T2")
@@ -314,12 +313,29 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
       self, device_kind: DeviceKind | None = None
   ) -> dict[_Key, AutotuningData[_Config]]:
     self_no_vjp = self.replace(vjp=None)
-    if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
-      cache = autotuning_cache.AutotuningCache(self_no_vjp)
-      _AUTOTUNING_CACHE[self_no_vjp] = cache
+    final_cache = {}
     if device_kind is None:
       device_kind = backend.get_default_device().device_kind
-    return cache[device_kind]
+    if not config_lib.ignore_autotuning_cache.value:
+      if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
+        cache = autotuning_cache.AutotuningCache(
+            self_no_vjp, paths=[autotuning_cache.CACHE_PATH]
+        )
+        _AUTOTUNING_CACHE[self_no_vjp] = cache
+
+      final_cache = cache[device_kind]
+      logging.info(
+          "Loaded autotuning cache for %s: %s",
+          self_no_vjp,
+          final_cache,
+      )
+    else:
+      logging.warning(
+          "Ignoring autotuning cache for %s",
+          self_no_vjp,
+      )
+
+    return final_cache
 
   @abc.abstractmethod
   def _fwd(self, *args, **kwargs) -> tuple[_T, _R | None]:
@@ -381,6 +397,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
 _AUTOTUNING_CACHE: dict[
     Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]
 ] = {}
+
 _AUTOTUNING_CACHE_OVERLAY = threading.local()
 
 

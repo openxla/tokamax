@@ -97,7 +97,7 @@ ignore_autotuning_cache = _ConfigOption(
     flags.DEFINE_bool(
         "tokamax_ignore_autotuning_cache",
         False,
-        "If true, ignore the autotuning cache and always use the heuristics to"
-        " create a config.",
+        "If true, ignore the autotuning cache when looking for configs and"
+        " autotuning.",
     )
 )
