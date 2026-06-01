@@ -245,7 +245,9 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           UNSUPPORTED_DIMENSIONS_MSG.format(ragged_dot_dimension_numbers)
       )
     
-    # xw32: under what condition is return_residuals True?
+    # return_residuals is set when:
+    # No autodiff: JAX runs the primal rule f, which calls fwd(fwd_res=False) and sets return_residuals=False: https://github.com/openxla/tokamax/blob/3e40ec1e3a1f736441a85a05d6b7dbc0bf8e18df/tokamax/_src/ops/op.py#L291 and https://github.com/openxla/tokamax/blob/3e40ec1e3a1f736441a85a05d6b7dbc0bf8e18df/tokamax/_src/ops/op.py#L249-L250.
+    # Under autodiff: JAX runs the registered forward rule `fwd`` with its default fwd_res=True: https://github.com/openxla/tokamax/blob/3e40ec1e3a1f736441a85a05d6b7dbc0bf8e18df/tokamax/_src/ops/op.py#L292 
     residuals = out
     return out, residuals if return_residuals else None
 
