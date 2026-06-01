@@ -41,9 +41,9 @@ class PallasMosaicTpuV2ParameterPipingTest(parameterized.TestCase):
   """
 
   def setUp(self):
-    super().setUp()
     if jax.default_backend() != "tpu":
       self.skipTest("Only supported on TPUs.")
+    super().setUp()
 
   def _assert_gmm_api_matches_kernel(
       self, lhs, rhs, group_sizes, *, kwargs, atol=2e-2, rtol=2e-2

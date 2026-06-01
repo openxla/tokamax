@@ -212,6 +212,11 @@ def assert_arrays_all_close(actual, desired, *, atol=None, rtol=None):
 
 class GmmTest(parameterized.TestCase):
 
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    super().setUp()
+
   @parameterized.product(
       batch_size=[128, 512],
       in_size=[512, 1024],
