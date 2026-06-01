@@ -145,21 +145,18 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support more ragged_dot_dimension_numbers
     # configurations.
-    if group_offset is not None:
-      raise NotImplementedError(
-          "`group_offset` is not supported by mosaic TPU implementation."
-      )
-
     if (
-        rhs_scale is not None
+        group_offset is not None
+        or rhs_scale is not None
         or rhs_bias is not None
         or maybe_quantize_lhs
         or not zero_initialize
         or fuse_act is not None
     ):
       raise NotImplementedError(
-          "rhs_scale/rhs_bias/maybe_quantize_lhs/zero_initialize=False/fuse_act"
-          " not supported by mosaic TPU implementation."
+          "group_offset/rhs_scale/rhs_bias/maybe_quantize_lhs/"
+          "zero_initialize=False/fuse_act not supported by mosaic TPU"
+          " implementation."
       )
 
     lhs, rhs = map(quantization.as_array_or_qarray, (lhs, rhs))

@@ -296,21 +296,17 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
   ) -> tuple[jax.Array, Residuals]:
     del config  # Unused.
 
-    if group_offset is not None:
-      raise NotImplementedError(
-          "`group_offset` is not supported by XLA implementation."
-      )
-
     if (
-        rhs_scale is not None
+        group_offset is not None
+        or rhs_scale is not None
         or rhs_bias is not None
         or maybe_quantize_lhs
         or not zero_initialize
         or fuse_act is not None
     ):
       raise NotImplementedError(
-          "rhs_scale/rhs_bias/maybe_quantize_lhs/zero_initialize=False/fuse_act"
-          " not supported by XLA implementation."
+          "group_offset/rhs_scale/rhs_bias/maybe_quantize_lhs/"
+          "zero_initialize=False/fuse_act not supported by XLA implementation."
       )
 
     lhs, rhs = map(quantization.as_array, (lhs, rhs))
