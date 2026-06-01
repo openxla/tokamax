@@ -98,7 +98,6 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
 
   config_cls: ClassVar[type[Config]] = Config
   qdtype: jax.typing.DTypeLike | None = None
-  interpret: bool = False
   # Local weight group count for the drhs (tgmm) path. Under expert
   # parallelism this differs from `group_sizes.shape[0]` (which is global).
   # Set by the custom vjp (see `__post_init__`); `None` for the forward and
@@ -110,14 +109,12 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         self.qdtype if self.qdtype is None else jnp.dtype(self.qdtype).name
     )
     if self.vjp is None:
-      interpret = self.interpret
 
       # Build a fresh sub-op for the backward sub-calls. `num_actual_groups`
       # only matters for the drhs (tgmm) path; leave it `None` otherwise.
       def make_fn(num_actual_groups=None):
         return lambda *args, **kw: PallasMosaicTpuV2RaggedDot(  # pylint: disable=unnecessary-lambda
             qdtype=qdtype,
-            interpret=interpret,
             num_actual_groups=num_actual_groups,
         )(*args, **kw)
 
@@ -228,11 +225,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
       num_actual_groups = self.num_actual_groups
       # tgmm computes lhs^T @ rhs on the MXU and requires both operands to share
       # a sublane tiling, i.e. the same dtype (it asserts
-      # size_lhs_sublane == size_rhs_sublane). On the backward path `rhs` is the
-      # incoming cotangent (often f32) while `lhs` is the original activation
-      # (e.g. bf16); cast the cotangent to `lhs.dtype` so the dtypes match. The
-      # kernel computes in this dtype on the MXU regardless, and the output then
-      # takes the original rhs gradient dtype rather than f32.
+      # size_lhs_sublane == size_rhs_sublane).
       rhs = rhs.astype(lhs.dtype)
       out = tgmm_backend.tgmm_v2(
           lhs,  # [m, k]

@@ -85,7 +85,7 @@ class PallasMosaicTpuV2ParameterPipingTest(parameterized.TestCase):
     )
 
   def test_gmm_weight_quantized_pipes(self):
-    # Mirrors test_gmm_weight_quantized: int8 `rhs` + `rhs_scale` + `rhs_bias` +
+    # Mirrors test_gmm_weight_quantized: jnp.float8_e4m3fn `rhs` + `rhs_scale` + `rhs_bias` +
     # `group_offset`, with `maybe_quantize_lhs=False`.
     batch_size, in_size, out_size = 128, 512, 512
     num_groups, group_offset, block_size = 4, 1, 256
@@ -97,7 +97,7 @@ class PallasMosaicTpuV2ParameterPipingTest(parameterized.TestCase):
         key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
     )
     rhs_q, rhs_scale = kernel_test.quantize_tensor(
-        rhs, jnp.int8, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     rhs_bias = jax.random.normal(key, (num_local_groups, 1, out_size), jnp.bfloat16)
@@ -116,7 +116,7 @@ class PallasMosaicTpuV2ParameterPipingTest(parameterized.TestCase):
     )
 
   def test_gmm_activation_weight_quantized_pipes(self):
-    # Mirrors test_gmm_activation_weight_quantized: int8 `rhs` + `rhs_scale` with
+    # Mirrors test_gmm_activation_weight_quantized: jnp.float8_e4m3fn `rhs` + `rhs_scale` with
     # `maybe_quantize_lhs=True` (the lhs-quantization path).
     batch_size, in_size, out_size = 128, 512, 512
     num_groups, block_size = 4, 512
@@ -127,7 +127,7 @@ class PallasMosaicTpuV2ParameterPipingTest(parameterized.TestCase):
         key, (num_groups, in_size, out_size), jnp.bfloat16, -1, 1
     )
     rhs_q, rhs_scale = kernel_test.quantize_tensor(
-        rhs, jnp.int8, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     group_sizes = kernel_test.get_group_sizes(batch_size, num_groups)
@@ -156,7 +156,7 @@ class PallasMosaicTpuV2ParameterPipingTest(parameterized.TestCase):
     )
 
   def test_gmm_weight_quantized_padding_pipes(self):
-    # Mirrors test_gmm_weight_quantized_padding: int8 `rhs` + `rhs_scale` +
+    # Mirrors test_gmm_weight_quantized_padding: jnp.float8_e4m3fn `rhs` + `rhs_scale` +
     # `rhs_bias` with a non-tile-aligned `out_size`.
     batch_size, in_size, out_size = 128, 512, 500
     num_groups, block_size = 4, 512
@@ -165,7 +165,7 @@ class PallasMosaicTpuV2ParameterPipingTest(parameterized.TestCase):
     lhs = jax.random.normal(key, (batch_size, in_size), jnp.bfloat16)
     rhs = jax.random.normal(key, (num_groups, in_size, out_size), jnp.bfloat16)
     rhs_q, rhs_scale = kernel_test.quantize_tensor(
-        rhs, jnp.int8, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     rhs_bias = jax.random.normal(key, (num_groups, 1, out_size), jnp.bfloat16)
