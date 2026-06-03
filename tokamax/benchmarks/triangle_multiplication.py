@@ -28,10 +28,9 @@ from tensorboardX import writer
 import tokamax
 from tokamax._src import numerics
 
-
 try:
   import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
-except ImportError:
+except Exception:  # pylint: disable=broad-except
   cuequivariance_jax = None
 
 SummaryWriter = writer.SummaryWriter
@@ -66,6 +65,7 @@ def get_example(n, c=64, h=64, d=64, dtype=jnp.float32) -> Any:
 
 def convert_tokamax_weights_to_cuequivariance(tokamax_weights):
   """Converts Tokamax weights to cuEquivariance format."""
+
   # Tokamax Input Proj: [C, 2, H] -> [2*H, C] for cuEquivariance.
   # Since C=H, we flatten (C, 2, H) -> (C, 2*H) then transpose -> (2*H, C)
   def transform_in(w):
@@ -139,7 +139,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
           direction=all_inputs['triangle_type'],
           mask=all_inputs['mask'].astype(all_inputs['x'].dtype),
           eps=1e-6,
-          fallback=True,
+          fallback=False,
           **cueq_weights,
       )
       dynamic_args = {

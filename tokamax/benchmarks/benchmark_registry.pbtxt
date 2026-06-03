@@ -8,20 +8,20 @@ benchmarks {
   workload {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/attention.py" }
-    action_inputs { key: "python_version" value: "3.13" }
+    action_inputs { key: "python_version" value: "3.11" }
   }
 
   environment_configs {
     id: "gpu-h100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
-    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:94b11493f1637114e6ac08752c10c957f341abd2d293f24e2c0458b81c220411"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15@sha256:98d10696f84ab6b4dff4356c8c654c3f142f002e804a80d22817450ca9574a7d"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
   environment_configs {
     id: "gpu-b200"
     runner_label: "linux-x86-a4-224-b200-1gpu"
-    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:94b11493f1637114e6ac08752c10c957f341abd2d293f24e2c0458b81c220411"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15@sha256:98d10696f84ab6b4dff4356c8c654c3f142f002e804a80d22817450ca9574a7d"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
@@ -57,21 +57,21 @@ benchmarks {
   workload {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_multiplication.py" }
-    action_inputs { key: "python_version" value: "3.13" }
+    action_inputs { key: "python_version" value: "3.11" }
     action_inputs { key: "extras" value: "bench" }
   }
 
   environment_configs {
     id: "gpu-h100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
-    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:94b11493f1637114e6ac08752c10c957f341abd2d293f24e2c0458b81c220411"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15@sha256:98d10696f84ab6b4dff4356c8c654c3f142f002e804a80d22817450ca9574a7d"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
   environment_configs {
     id: "gpu-b200"
     runner_label: "linux-x86-a4-224-b200-1gpu"
-    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:94b11493f1637114e6ac08752c10c957f341abd2d293f24e2c0458b81c220411"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15@sha256:98d10696f84ab6b4dff4356c8c654c3f142f002e804a80d22817450ca9574a7d"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
@@ -105,13 +105,13 @@ benchmarks {
   workload {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/ragged_dot.py" }
-    action_inputs { key: "python_version" value: "3.13" }
+    action_inputs { key: "python_version" value: "3.11" }
   }
 
   environment_configs {
     id: "gpu-h100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
-    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:94b11493f1637114e6ac08752c10c957f341abd2d293f24e2c0458b81c220411"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15@sha256:98d10696f84ab6b4dff4356c8c654c3f142f002e804a80d22817450ca9574a7d"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
     # Disable 'xla' as this OOM on GPU.
     workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=xla" }
@@ -120,7 +120,7 @@ benchmarks {
   environment_configs {
     id: "gpu-b200"
     runner_label: "linux-x86-a4-224-b200-1gpu"
-    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:94b11493f1637114e6ac08752c10c957f341abd2d293f24e2c0458b81c220411"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15@sha256:98d10696f84ab6b4dff4356c8c654c3f142f002e804a80d22817450ca9574a7d"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
     # Disable 'xla' as this OOM on GPU.
     # TODO: enable 'mosaic' and None once the bug is fixed.
@@ -159,13 +159,13 @@ benchmarks {
   workload {
     action: "./ml_actions/benchmarking/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/linear_softmax_cross_entropy_loss.py" }
-    action_inputs { key: "python_version" value: "3.13" }
+    action_inputs { key: "python_version" value: "3.11" }
   }
 
   environment_configs {
     id: "gpu-h100"
     runner_label: "linux-x86-a3-8g-h100-1gpu"
-    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.0-cudnn9.15@sha256:94b11493f1637114e6ac08752c10c957f341abd2d293f24e2c0458b81c220411"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15@sha256:98d10696f84ab6b4dff4356c8c654c3f142f002e804a80d22817450ca9574a7d"
     workload_action_inputs { key: "extras_hw" value: "cuda" }
   }
 
