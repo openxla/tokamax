@@ -126,6 +126,93 @@ class BaselineMlaTest(parameterized.TestCase):
     np.testing.assert_allclose(out, out_ref, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(updated_kv, kv_ref, rtol=1e-5, atol=1e-5)
 
+  def test_shape_mismatch_validation(self):
+    baseline_op = base.MultiHeadLatentAttention()
+
+    # Create inputs with mismatched shapes for dimension 'actual_num_q_heads'
+    # ql_nope: [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
+    # q_pe: [max_num_tokens, actual_num_q_heads, actual_r_dim]
+    # We use different sizes for the second dimension (5 and 6).
+    ql_nope = jnp.zeros((10, 5, 128))
+    q_pe = jnp.zeros((10, 6, 64))  # Mismatch here: 6 != 5
+
+    new_kv_c = jnp.zeros((10, 128))
+    new_k_pe = jnp.zeros((10, 64))
+    cache_kv = jnp.zeros((2, 16, 4, 128))
+    kv_lens = jnp.zeros((2,), dtype=jnp.int32)
+    page_indices = jnp.zeros((2,), dtype=jnp.int32)
+    cu_q_lens = jnp.zeros((3,), dtype=jnp.int32)
+    distribution = jnp.zeros((3,), dtype=jnp.int32)
+
+    with self.assertRaises(Exception):
+      baseline_op.bind(
+          ql_nope=ql_nope,
+          q_pe=q_pe,
+          new_kv_c=new_kv_c,
+          new_k_pe=new_k_pe,
+          cache_kv=cache_kv,
+          kv_lens=kv_lens,
+          page_indices=page_indices,
+          cu_q_lens=cu_q_lens,
+          distribution=distribution,
+      )
+
+  def test_page_indices_divisibility_validation(self):
+    baseline_op = base.MultiHeadLatentAttention()
+
+    ql_nope = jnp.zeros((10, 8, 128))
+    q_pe = jnp.zeros((10, 8, 64))
+    new_kv_c = jnp.zeros((10, 128))
+    new_k_pe = jnp.zeros((10, 64))
+    cache_kv = jnp.zeros((2, 16, 4, 128))
+
+    # Mismatch: page_indices size 5 is not divisible by kv_lens size 2.
+    kv_lens = jnp.zeros((2,), dtype=jnp.int32)
+    page_indices = jnp.zeros((5,), dtype=jnp.int32)
+    cu_q_lens = jnp.zeros((3,), dtype=jnp.int32)
+    distribution = jnp.zeros((3,), dtype=jnp.int32)
+
+    with self.assertRaisesRegex(ValueError, "divisible by"):
+      baseline_op.bind(
+          ql_nope=ql_nope,
+          q_pe=q_pe,
+          new_kv_c=new_kv_c,
+          new_k_pe=new_k_pe,
+          cache_kv=cache_kv,
+          kv_lens=kv_lens,
+          page_indices=page_indices,
+          cu_q_lens=cu_q_lens,
+          distribution=distribution,
+      )
+
+  def test_cu_q_lens_shape_validation(self):
+    baseline_op = base.MultiHeadLatentAttention()
+
+    ql_nope = jnp.zeros((10, 8, 128))
+    q_pe = jnp.zeros((10, 8, 64))
+    new_kv_c = jnp.zeros((10, 128))
+    new_k_pe = jnp.zeros((10, 64))
+    cache_kv = jnp.zeros((2, 16, 4, 128))
+
+    # Mismatch: cu_q_lens shape (4,) is not (3,) for kv_lens shape (2,)
+    kv_lens = jnp.zeros((2,), dtype=jnp.int32)
+    page_indices = jnp.zeros((4,), dtype=jnp.int32)
+    cu_q_lens = jnp.zeros((4,), dtype=jnp.int32)
+    distribution = jnp.zeros((3,), dtype=jnp.int32)
+
+    with self.assertRaisesRegex(ValueError, "Expected cu_q_lens.shape"):
+      baseline_op.bind(
+          ql_nope=ql_nope,
+          q_pe=q_pe,
+          new_kv_c=new_kv_c,
+          new_k_pe=new_k_pe,
+          cache_kv=cache_kv,
+          kv_lens=kv_lens,
+          page_indices=page_indices,
+          cu_q_lens=cu_q_lens,
+          distribution=distribution,
+      )
+
 
 if __name__ == "__main__":
   absltest.main()
