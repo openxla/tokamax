@@ -55,6 +55,7 @@ test = [
     "pytest-xdist",
     "pytest",
     "xprof",
+    "hypothesis",
 ]
 
 bench = [
@@ -70,7 +71,6 @@ cuda = [
 
 tpu = [
     "jax[tpu]>=0.10.1",
-    "hypothesis",
 ]
 
 [tool.pytest.ini_options]
