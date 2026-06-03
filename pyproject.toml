@@ -30,7 +30,6 @@ dependencies = [
     "typeguard==2.13.3",
     "immutabledict",
     "tensorboardx",
-    "cuequivariance>=0.8.1",
 ]
 
 dynamic = ["version"]
