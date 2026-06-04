@@ -18,14 +18,10 @@ from typing import Any, TypeVar
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int
-import qwix
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.mla import reference
-from tokamax._src.ops.experimental.mla import utils
 from typing_extensions import override
-
-QArray = qwix.QArray
 
 _Config = TypeVar("_Config")
 
@@ -37,15 +33,15 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
   def bind(
       self,
       ql_nope: Float[
-          Array | QArray, "max_num_tokens actual_num_q_heads actual_lkv_dim"
+          Array, "max_num_tokens actual_num_q_heads actual_lkv_dim"
       ],
       q_pe: Float[
-          Array | QArray, "max_num_tokens actual_num_q_heads actual_r_dim"
+          Array, "max_num_tokens actual_num_q_heads actual_r_dim"
       ],
-      new_kv_c: Float[Array | QArray, "max_num_tokens actual_lkv_dim"],
-      new_k_pe: Float[Array | QArray, "max_num_tokens actual_r_dim"],
+      new_kv_c: Float[Array, "max_num_tokens actual_lkv_dim"],
+      new_k_pe: Float[Array, "max_num_tokens actual_r_dim"],
       cache_kv: Float[
-          Array | QArray,
+          Array,
           "total_num_pages page_size_per_kv_packing kv_packing lkv_dim",
       ],
       kv_lens: Int[Array, "max_num_seqs"],
@@ -101,15 +97,15 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
   def _fwd(
       self,
       ql_nope: Float[
-          Array | QArray, "max_num_tokens actual_num_q_heads actual_lkv_dim"
+          Array, "max_num_tokens actual_num_q_heads actual_lkv_dim"
       ],
       q_pe: Float[
-          Array | QArray, "max_num_tokens actual_num_q_heads actual_r_dim"
+          Array, "max_num_tokens actual_num_q_heads actual_r_dim"
       ],
-      new_kv_c: Float[Array | QArray, "max_num_tokens actual_lkv_dim"],
-      new_k_pe: Float[Array | QArray, "max_num_tokens actual_r_dim"],
+      new_kv_c: Float[Array, "max_num_tokens actual_lkv_dim"],
+      new_k_pe: Float[Array, "max_num_tokens actual_r_dim"],
       cache_kv: Float[
-          Array | QArray,
+          Array,
           "total_num_pages page_size_per_kv_packing kv_packing lkv_dim",
       ],
       kv_lens: Int[Array, "max_num_seqs"],
