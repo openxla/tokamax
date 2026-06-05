@@ -89,3 +89,18 @@ def assert_trees_all_close(
     return ""
 
   chex.assert_trees_all_equal_comparator(cmp_fn, err_msg_fn, *trees)
+
+
+def get_tpu_version() -> int:
+  """Returns the numeric version of the TPU, or -1 if not on TPU."""
+  kind = jax.devices()[0].device_kind
+  if "TPU" not in kind:
+    return -1
+  if kind.endswith(" lite"):
+    kind = kind[: -len(" lite")]
+  if kind.endswith("p") or kind.endswith("e"):
+    kind = kind[:-1]
+  if kind == "TPU7x":
+    return 7
+  assert kind[:-1] == "TPU v", kind
+  return int(kind[-1])
