@@ -264,7 +264,7 @@ class AutotuningTest(parameterized.TestCase):
     f_lowered = jax.jit(f).lower(*args)
     tempfile = self.create_tempfile("bound_args.json")
     api.bound_args_to_json(f_lowered, tempfile.full_path)
-    loaded_bound_args = api.bound_args_from_json(tempfile.full_path)
+    loaded_bound_args = api.bound_args_from_json_file(tempfile.full_path)
     self.assertEqual(loaded_bound_args, list(expected))
 
   def test_autotuning_result_context(self):

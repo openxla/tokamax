@@ -18,7 +18,6 @@
 import dataclasses
 from typing import Any, Literal, TypeAlias
 
-
 # Tags are used to quickly identify different workloads for the same op.
 # forward_only models are models that only require forward passes - meaning no
 # vjp tuning is required.
@@ -26,7 +25,7 @@ from typing import Any, Literal, TypeAlias
 # users. These are used for internal nightly benchmarking.
 # 'ci_tests' arg specs are used for tests that run as part of the CI flow.
 # 'primary' arg specs are a superset of 'ci_tests' arg specs.
-Tag: TypeAlias = Literal['primary', 'forward_only', 'ci_tests']
+Tag: TypeAlias = Literal['primary', 'forward_only', 'ci_tests', 'json']
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

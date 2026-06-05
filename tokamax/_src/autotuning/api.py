@@ -258,12 +258,16 @@ def bound_args_to_json(
     f.write(json_string)
 
 
-def bound_args_from_json(filename: str) -> list[op_lib.BoundArguments]:
+def bound_args_from_json(json_string: str) -> list[op_lib.BoundArguments]:
+  """Loads a sequence of BoundArguments from a JSON file."""
+  json_list = json.loads(json_string)
+  return [op_lib.BOUND_ARGS_ADAPTER.validate_python(item) for item in json_list]
+
+
+def bound_args_from_json_file(filename: str) -> list[op_lib.BoundArguments]:
   """Loads a sequence of BoundArguments from a JSON file."""
   with open(filename, "r") as f:
-    json_data = f.read()
-  json_list = json.loads(json_data)
-  return [op_lib.BOUND_ARGS_ADAPTER.validate_python(item) for item in json_list]
+    return bound_args_from_json(f.read())
 
 
 _API_IMPLEMENTATIONS: Final[
