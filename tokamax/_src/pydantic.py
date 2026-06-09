@@ -312,7 +312,14 @@ class ShapeDtype:
         return x
       s = jax.core.ShapedArray(x.shape, x.dtype).str_short(short_dtypes=True)
       if isinstance(x, batching.BatchedShapeDtype) and x.vmap_axes:
-        vmap_axes_str = str(vmap_axes_serializer.to_json(x.vmap_axes), 'utf-8')
+        try:
+          vmap_axes_str = str(
+              vmap_axes_serializer.to_json(x.vmap_axes), 'utf-8'
+          )
+        except pydantic_core.PydanticSerializationError:
+          # vmap_axes may contain symbolic dimensions (e.g. _DimExpr) that can't
+          # be serialized. Fall back to string representation.
+          vmap_axes_str = str(x.vmap_axes)
         return f'{s}{{vmap_axes={vmap_axes_str}}}'
       return s
 

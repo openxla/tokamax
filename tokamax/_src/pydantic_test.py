@@ -14,12 +14,13 @@
 # ==============================================================================
 from collections.abc import Callable
 import dataclasses
+import json
 from typing import Annotated
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
+from jax import export
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -32,6 +33,8 @@ from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.attention import pallas_triton as pl_attn
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+
+A_SYMBOLIC, B_SYMBOLIC = export.symbolic_shape("a, b")
 
 
 def _eval_shape(spec):
@@ -137,6 +140,29 @@ class PydanticTest(parameterized.TestCase):
     self.assertEqual(shape, adapter.validate_python(adapter.dump_python(shape)))
     self.assertEqual(shape, adapter.validate_json(adapter.dump_json(shape)))
 
+  # JAX supports shape polymorphism
+  # (https://docs.jax.dev/en/latest/export/shape_poly.html) that is commonly
+  # used to export shape-polymorphic StableHLO. This is not supported for
+  # Tokamax kernels at the moment, but should work if users wish to export XLA
+  # implementations. This just checks that serialization does not break with
+  # symbolic shapes, but without requiring deserialization to work.
+  @parameterized.parameters(
+      (jax.ShapeDtypeStruct((A_SYMBOLIC, 2, B_SYMBOLIC, 2), jnp.int8)),
+      (
+          batching.BatchedShapeDtype(
+              (A_SYMBOLIC, 2, B_SYMBOLIC),
+              jnp.int8,
+              vmap_axes=((0, 5), (B_SYMBOLIC, 7)),
+          ),
+      ),
+  )
+  def test_symbolic_shape_serialization(self, shape):
+    ty = Annotated[jax.Array, pydantic_lib.ShapeDtype]
+    adapter = pydantic.TypeAdapter(ty)
+    adapter.dump_python(shape)
+    json_bytes = adapter.dump_json(shape)
+    json.loads(json_bytes)
+
   @parameterized.parameters(jax._src.dtypes._jax_types)
   def test_shape_dtype_short_names(self, dtype):
     ty = Annotated[jax.Array, pydantic_lib.ShapeDtype]
@@ -207,6 +233,7 @@ class PydanticTest(parameterized.TestCase):
     self.assertEqual(b'"bfloat16"', adapter.dump_json(ml_dtypes.bfloat16))
     self.assertEqual("bfloat16", adapter.dump_python(ml_dtypes.bfloat16))
     self.assertEqual(ml_dtypes.bfloat16, adapter.validate_json('"bfloat16"'))
+
 
 if __name__ == "__main__":
   absltest.main()
