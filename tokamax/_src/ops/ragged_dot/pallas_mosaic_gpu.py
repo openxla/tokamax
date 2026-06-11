@@ -136,6 +136,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
           elif lhs.qtype == jnp.float8_e4m3fn:
             fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+            # make sure output is bfloat16 since we may want to store lhs.scale
+            # as float32 to avoid in-kernel conversion.
+            if preferred_element_type is None:
+              preferred_element_type = rhs.dtype
           else:
             # dequantize lhs to fallback to non-lhs-quantized kernel
             lhs = quantization.as_array(lhs)
@@ -175,6 +179,35 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
     return dot_out, residuals if return_residuals else None
 
+  # Because fp8 ragged dot kernel has special optimization to:
+  # 1. offload subchannel rowsum (used in debiasing) to preceding quant kernel;
+  # 2. pack rowsum to scale (to not break tokamax + qwix API);
+  # 3. pre-convert scale to f32 (since fp8 ragged dot is generally ALU bound).
+  # it will break autotuning cache lookup key because the special quant kernel
+  # is not exposed to Tokamax, which solely rely on qwix to perform quantization
+  # and dequantization. For example, autotuning will set the lookup key with
+  # "scale:bf16(4096,8)" but when fp8 ragged dot kernel is used with special
+  # quant kernel, the lookup key expects to be "scale:f32(4096,16)". This hack
+  # fixes the cache lookup.
+  @override
+  def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Any:
+    lhs = ba.arguments.get("lhs")
+    if isinstance(lhs, QArray) and lhs.qtype == jnp.float8_e4m3fn:
+      if lhs.scale.dtype == jnp.bfloat16:
+        new_scale = jax.ShapeDtypeStruct(
+            lhs.scale.shape[:-1] + (lhs.scale.shape[-1] * 2,), jnp.float32
+        )
+        new_lhs = QArray(
+            qvalue=lhs.qvalue,
+            scale=new_scale,
+            zero_point=lhs.zero_point,
+            qtype=lhs.qtype,
+        )
+        new_arguments = dict(ba.arguments)
+        new_arguments["lhs"] = new_lhs
+        ba = dataclasses.replace(ba, arguments=new_arguments)
+    return base.RaggedDot._get_autotuning_cache_key(self, ba)
+
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     lhs, rhs = ba.args
@@ -210,6 +243,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                 block_m=16,
                 block_n=128,
                 block_k=block_k,
+                collective=False,
                 num_stages=2,
                 split_k=1,
             )
@@ -356,11 +390,11 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             configs,
             block_m_choices=[8, 16, 32],
             block_k_choices=[128, 256, 512],
-            num_stages_choices=[2, 4],
+            num_stages_choices=[2],
             grid_minor_dim_choices=grid_minor_dim_choices,
             grid_tile_width_choices=grid_tile_width_choices,
             split_m_choices=[1],
-            collective_choices=[False],
+            collective_choices=[False, True],
             post_scale_choices=[False],
         )
     else:

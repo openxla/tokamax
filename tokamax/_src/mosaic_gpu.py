@@ -204,13 +204,13 @@ def int4_as_biased_f8e4m3fn(x, layout):
               [reg],
               """
               {{
-              .reg .b32 biased, evens, odds, odds_raw;
-              xor.b32 biased, $2, 0x88888888;
-              and.b32 evens, biased, 0x0F0F0F0F;
-              shr.u32 odds_raw, biased, 4;
-              and.b32 odds, odds_raw, 0x0F0F0F0F;
-              prmt.b32 $0, evens, odds, 0x5140;
-              prmt.b32 $1, evens, odds, 0x7362;
+              .reg .b32 odds_raw, c_mask;
+              mov.b32 c_mask, 0x0F0F0F0F;
+              shr.u32 odds_raw, $2, 4;
+              prmt.b32 $0, $2, odds_raw, 0x5140;
+              prmt.b32 $1, $2, odds_raw, 0x7362;
+              lop3.b32 $0, $0, 0x08080808, c_mask, 0x6c;
+              lop3.b32 $1, $1, 0x08080808, c_mask, 0x6c;
               }}
               """,
               "=r,=r,r",
