@@ -229,7 +229,7 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     if jnp.issubdtype(dtype, jnp.floating):
       try:
         dtype_ = jnp.promote_types(dtype, jnp.float32)
-      except jax._src.dtypes.TypePromotionError:
+      except jax.dtypes.TypePromotionError:
         dtype_ = jnp.float32
       y = rng.standard_normal(size=x.shape, dtype=dtype_).astype(dtype)
     elif dtype.name == 'bool':
