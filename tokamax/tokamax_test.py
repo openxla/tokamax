@@ -24,10 +24,14 @@ import tokamax
 from tokamax._src import version
 from tokamax._src.autotuning import api as autotuning
 from tokamax._src.ops.attention import api as attention_api
-from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp
-from tokamax._src.ops.attention import pallas_triton_vjp as pl_triton_attn_vjp
 from tokamax._src.ops.normalization import api as norm_api
-from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
+
+try:
+  from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_triton_vjp as pl_triton_attn_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+except ImportError:
+  pass
 
 try:
   from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
