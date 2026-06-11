@@ -27,6 +27,7 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_b
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
 
 
+
 jax.config.parse_flags_with_absl()
 
 
@@ -155,15 +156,22 @@ def reference_gmm(
   return jnp.concat(gmm_out, axis=0)
 
 
+# For TGMM quantized case, we want the reference to use the most accurate
+# computation of what the kernel is asked to compute
+# (f32 and highest precision) as opposed to the hardware-mirroring way
+# (reference also does native fp8 dot_general) which we measure noise against
+# noise.
 def reference_tgmm(
     lhs,  # [k, m]
     rhs,  # [m, n]
     group_sizes,  # [num_groups]
     # num_actual_groups comes from weights.shape[0]
     num_actual_groups,  # int32
+    rhs_scale: jax.Array | None = None,
     # group_offset is obtained from
     # jnp.arange(0, num_experts, num_experts_per_shard)
     group_offset=None,
+    out_dtype: jnp.dtype | None = None,
 ):  # [num_groups, k, n]
   # Compute lhs[:, sizes[i-1]:sizes[i]] @ rhs[sizes[i-1]:sizes[i], :]
   if group_offset is None:
@@ -173,6 +181,12 @@ def reference_tgmm(
     if jnp.isscalar(group_offset):
       group_offset = group_offset[None]
 
+  assert group_sizes.size >= int(group_offset[0]) + num_actual_groups, (
+      f"group_sizes.size ({group_sizes.size}) must be >= "
+      f"group_offset ({int(group_offset[0])}) + num_actual_groups "
+      f"({num_actual_groups})"
+  )
+
   start = 0
   out = []
   for global_group in range(group_sizes.size):
@@ -180,7 +194,20 @@ def reference_tgmm(
     group = global_group - group_offset[0]
     end = start + group_size
     if 0 <= group and group < num_actual_groups:
-      out.append(lhs[:, start:end] @ rhs[start:end, :])
+      if rhs_scale is None:
+        out.append(lhs[:, start:end] @ rhs[start:end, :])
+      else:
+        # rhs_scale.shape==(1, 1, N).
+        partial = jax.lax.dot_general(
+            lhs[:, start:end].astype(jnp.float32),
+            rhs[start:end, :].astype(jnp.float32),
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        partial *= rhs_scale[0]  # rhs_scale[0]: shape [1, N]
+        output_dtype = out_dtype if out_dtype is not None else lhs.dtype
+        out.append(partial.astype(output_dtype))
     start = end
   return jnp.stack(out)
 
@@ -288,6 +315,8 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
+    tgmm_backend.validate_tgmm_inputs(
+        group_sizes, num_local_groups, group_offset)
     actual = tgmm_backend.tgmm_v2(
         lhs,
         grad,
@@ -313,6 +342,16 @@ class GmmTest(parameterized.TestCase):
   def test_tgmm_implicit_padding(
       self, batch_size, in_size, out_size, num_groups, group_offset
   ):
+    # Test the case where there is implicit padding in the dim size_k (in_size)
+    # and size_n (out_size).
+    # Notice that tile_n and tile_k are aligned to the num_lanes in
+    # calculate_tgmm_tiling.
+    # The output shape is [num_groups, size_k, aligned_n] but there is implicit
+    # padding on the k-dim to a multiple of sublanes. So the kernel is able to
+    # write the full [i, aligned_tile_k, aligned_tile_n] to hbm with no problem
+    # at the last k block.
+    # Within the kernel, because k is not the contracting dim, so the padded k
+    # is also not a problem.
     num_local_groups = num_groups - group_offset
     key = jax.random.key(0)
     key1, key2 = jax.random.split(key, 2)
@@ -325,6 +364,8 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
+    tgmm_backend.validate_tgmm_inputs(
+        group_sizes, num_local_groups, group_offset)
     actual = tgmm_backend.tgmm_v2(
         lhs,
         grad,
@@ -369,6 +410,8 @@ class GmmTest(parameterized.TestCase):
     )
 
     tile_info = gmm_backend.TileSizes(tile_m=256, tile_k=tile_k, tile_n=tile_n)
+    tgmm_backend.validate_tgmm_inputs(
+        group_sizes, num_local_groups, group_offset)
     actual = tgmm_backend.tgmm_v2(
         lhs,
         grad,
@@ -416,6 +459,8 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
+    tgmm_backend.validate_tgmm_inputs(
+        group_sizes, num_local_groups, group_offset)
     actual = tgmm_backend.tgmm_v2(
         lhs,
         grad,
@@ -463,6 +508,95 @@ class GmmTest(parameterized.TestCase):
     )
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      batch_size=[128, 512],
+      in_size=[256, 512],
+      out_size=[256, 512],
+      num_groups=[16, 32],
+      group_offset=[0, 2],
+      dtype_pair=[
+          (jnp.float8_e4m3fn, jnp.float8_e5m2),       # production
+          (jnp.float8_e4m3fn, jnp.float8_e4m3fn),     # symmetric fp8
+      ],
+  )
+  def test_tgmm_with_rhs_scale(
+      self, batch_size, in_size, out_size, num_groups, group_offset, dtype_pair
+  ):
+    lhs_dtype, rhs_quant_dtype = dtype_pair
+    num_local_groups = num_groups - group_offset
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(
+        key1, (batch_size, in_size), dtype=jnp.bfloat16
+    ).astype(lhs_dtype)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.float32)
+
+    grad_q, grad_scale = quantize_tensor(
+        grad, rhs_quant_dtype, axis=0, block_size=batch_size,
+    )
+    grad_scale = jnp.expand_dims(grad_scale, axis=1)  # [1, 1, N]
+    assert grad_scale.shape == (1, 1, out_size)
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset_arr = jnp.array([group_offset], dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1), grad_q, group_sizes, num_local_groups,
+        rhs_scale=grad_scale,
+        group_offset=group_offset_arr,
+        out_dtype=jnp.bfloat16,
+    )
+    tgmm_backend.validate_tgmm_inputs(
+        group_sizes, num_local_groups, group_offset_arr)
+    actual = tgmm_backend.tgmm_v2(
+        lhs, grad_q, group_sizes, num_local_groups,
+        rhs_scale=grad_scale,
+        group_offset=group_offset_arr,
+        preferred_element_type=jnp.bfloat16,
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
+
+  def test_tgmm_with_rhs_scale_n_padding(self):
+    # Test the case where there is implicit padding in the dim size_n (out_size)
+    # Pins tile_n=128 with out_size=300 so the kernel runs 3 n-tiles over an
+    # aligned width of 384; the last tile (n_id=2) reads scale[..., 256:384]
+    # where columns 300..383 are pad.
+
+    batch_size, in_size, out_size = 128, 256, 300
+    num_groups = 4
+    rhs_quant_dtype = jnp.float8_e5m2
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(
+        key1, (batch_size, in_size), dtype=jnp.bfloat16
+    ).astype(jnp.float8_e4m3fn)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.float32)
+
+    grad_q, grad_scale = quantize_tensor(
+        grad, rhs_quant_dtype, axis=0, block_size=batch_size,
+    )
+    grad_scale = jnp.expand_dims(grad_scale, axis=1)  # [1, 1, N]
+    assert grad_scale.shape == (1, 1, out_size)
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    tile_info = gmm_backend.TileSizes(tile_m=128, tile_k=256, tile_n=128)
+
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1), grad_q, group_sizes, num_groups,
+        rhs_scale=grad_scale,
+        out_dtype=jnp.bfloat16,
+    )
+    tgmm_backend.validate_tgmm_inputs(group_sizes, num_groups)
+    actual = tgmm_backend.tgmm_v2(
+        lhs, grad_q, group_sizes, num_groups,
+        rhs_scale=grad_scale,
+        tile_info=tile_info,
+        preferred_element_type=jnp.bfloat16,
+    )
+    self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+    chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
   @parameterized.product(
       batch_size=[128],
