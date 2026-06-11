@@ -137,6 +137,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     q, k, v = common.cast_qkv(q, k, v, precision)
 
     orig_seq_len_q = q.shape[-3]
+    orig_seq_len_k = k.shape[-3]
     if isinstance(config, common.ConfigBase) and config.fold_q_sequence_heads:
       q, bias, mask, _, q_indices = base.fold_q_sequence_heads(
           q, bias, mask, dropout_mask, q_indices, k.shape[-3], k.shape[-2]
@@ -145,6 +146,12 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     mask, is_causal, k_start, k_end = common.decompose_mask(
         mask, q, k, q_indices, k_indices
     )
+
+    if orig_seq_len_k % (config.split_k * config.block_kv) != 0:
+      if k_end is None:
+        k_end = jnp.array(orig_seq_len_k, dtype=jnp.int32)
+      else:
+        k_end = jnp.minimum(k_end, orig_seq_len_k)
 
     use_stable_softmax = self.use_stable_softmax
 

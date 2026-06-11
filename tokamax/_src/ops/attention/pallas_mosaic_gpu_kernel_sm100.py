@@ -118,10 +118,9 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   min_load_factor = 0.5
   grid_size = batch_size * pl.cdiv(q_seq_len, block_q) * q_heads
   num_ctas = backend.get_default_device().core_count // cluster_size
-  # We do not support k split yet for causal attn or with k ranges
-  not_masked = mask is None or not (
-      mask.is_causal or mask.k_start is not None or mask.k_end is not None
-  )
+  # We do not support k split yet for any kind of masking (causal,
+  # k-ranges, or custom).
+  not_masked = mask is None
   is_kv_seq_aligned = kv_seq_len % block_kv == 0
   # TODO fix test failures for non aligned q seq
   is_q_seq_aligned = q_seq_len % block_q == 0

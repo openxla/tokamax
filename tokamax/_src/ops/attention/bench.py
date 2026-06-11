@@ -24,6 +24,8 @@ from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import pallas_mosaic_gpu as mgpu_attn
+from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as fa_vjp
+from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm100 as sm100_vjp
 from tokamax._src.ops.attention import pallas_triton as triton_attn
 from tokamax._src.ops.flex_attention import pallas_triton as triton_flex
 from tokamax._src.ops.flex_attention import wrapper
@@ -35,7 +37,7 @@ _IMPLS = dict(
     triton_flex=wrapper.WrappedFlexAttention(
         impl=triton_flex.PallasTritonFlexAttention()
     ),
-    mosaic=(mgpu_attn.PallasMosaicGpuFlashAttention()),
+    mosaic=mgpu_attn.PallasMosaicGpuFlashAttention(),
     cudnn=jax_nn.JaxNnDotProductAttention(implementation='cudnn'),
     xla=base.DotProductAttention(),
 )
@@ -47,7 +49,7 @@ _BENCHMARK_IMPLS_FWD = flags.DEFINE_list(
 )
 _BENCHMARK_IMPLS_FWD_BWD = flags.DEFINE_list(
     'benchmark_impls_fwd_bwd',
-    'triton,cudnn,xla',
+    'mosaic,triton,cudnn,xla',
     'List of implementations to benchmark forward and backward.',
 )
 _register_benchmark = functools.partial(

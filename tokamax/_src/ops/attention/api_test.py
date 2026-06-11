@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import functools
+import os
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -405,6 +406,14 @@ class DotProductAttentionCudnnTest(DotProductAttentionTest):
     super().setUp()
     if jax.default_backend() != 'gpu':
       self.skipTest(f'cuDNN only supported on GPU, not {jax.default_backend()}')
+    if gpu_utils.is_sm100():
+      # cuDNN deterministic algorithms are not supported on Blackwell below 9.18.0.
+      xla_flags = os.environ.get('XLA_FLAGS', '')
+      if '--xla_gpu_deterministic_ops' in xla_flags.split():
+        self.skipTest(
+            'Deterministic cuDNN SDPA not supported on Blackwell with current'
+            ' cuDNN version.'
+        )
 
   def test_impl_in_hlo(self):
     fn = functools.partial(api.dot_product_attention, implementation=self.IMPL)

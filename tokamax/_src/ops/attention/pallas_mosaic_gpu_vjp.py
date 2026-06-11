@@ -93,7 +93,7 @@ class PallasMosaicGpuFlashAttentionVjp(
       )
 
     if gpu_utils.is_sm100() and not isinstance(config, sm100.Config):
-      raise NotImplementedError("SM100 config required for sm100 GPUs.")
+      raise ValueError(f"Unexpected config: {config=}")
 
     if gpu_utils.is_sm90() and not isinstance(config, sm90.Config):
       raise NotImplementedError("SM90 config required for sm90 GPUs.")
@@ -126,9 +126,9 @@ class PallasMosaicGpuFlashAttentionVjp(
       if x.dtype not in precision.supported_lhs_types:
         raise NotImplementedError(msg(precision.supported_lhs_types))
       if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
-        return x.astype(jnp.bfloat16)
+        return common.safe_downcast(x, jnp.bfloat16)
       if precision == jax.lax.DotAlgorithmPreset.F16_F16_F32:
-        return x.astype(jnp.float16)
+        return common.safe_downcast(x, jnp.float16)
       raise NotImplementedError(f"Unsupported {precision=}")
 
     q_k_dot_precision, weights_v_dot_precision = precision
@@ -149,22 +149,6 @@ class PallasMosaicGpuFlashAttentionVjp(
     mask = _broadcast_to_rank(mask, q.ndim)
     k_start = _broadcast_to_rank(k_start, q.ndim - 1)
     k_end = _broadcast_to_rank(k_end, q.ndim - 1)
-
-    if isinstance(config, sm100.Config):
-      # TMA requires 16-byte aligned strides. If the last dimension is
-      # 1 (e.g.  broadcasting), the stride of the second-to-last
-      # dimension is small (1 element), violating the requirement. We
-      # broadcast explicitly to fix this.  Note: mask is cast to int8
-      # in the kernel, which materializes the array and fixes the
-      # strides. bias is not cast, so we must materialize it here.
-      # TODO: Fuse the broadcast.
-      kv_seq_len = k.shape[-3]
-      if mask is not None and mask.shape[-1] == 1 and kv_seq_len > 1:
-        mask = jnp.broadcast_to(mask, mask.shape[:-1] + (kv_seq_len,))
-      if bias is not None and bias.shape[-1] == 1 and kv_seq_len > 1:
-        bias = jnp.broadcast_to(bias, bias.shape[:-1] + (kv_seq_len,)).astype(
-            bias.dtype
-        )
 
     if bias is None:
       ds_dtype = None
@@ -189,7 +173,7 @@ class PallasMosaicGpuFlashAttentionVjp(
       kernel_fn = sm90.flash_attention_vjp_kernel
 
     f = functools.partial(kernel_fn, **kwargs)
-    if isinstance(config, sm90.Config):
+    if not isinstance(config, sm100.Config):
       f = base.vmap_batch_dims(f)
 
     dq, dk, dv, ds = f(
@@ -197,13 +181,10 @@ class PallasMosaicGpuFlashAttentionVjp(
     )
 
     dbias = None
-    if isinstance(config, sm90.Config):
-      if bias is not None:
-        broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
-        dbias = jnp.sum(ds, axis=broadcast_bias_axes).astype(bias.dtype)
-        dbias = dbias.reshape(orig_bias_shape)
-    else:
-      dbias = ds
+    if bias is not None:
+      broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
+      dbias = jnp.sum(ds, axis=broadcast_bias_axes).astype(bias.dtype)
+      dbias = dbias.reshape(orig_bias_shape)
 
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
