@@ -689,6 +689,10 @@ def _abstractify(pytree):
   def abstractify_leaf(x):
     if isinstance(x, (jax.Array, np.ndarray)):
       return jax.ShapeDtypeStruct(x.shape, x.dtype)
+    if isinstance(x, jax.ShapeDtypeStruct):
+      if isinstance(x, batching.BatchedShapeDtype):
+        return batching.BatchedShapeDtype(x.shape, x.dtype, x.vmap_axes)
+      return jax.ShapeDtypeStruct(x.shape, x.dtype)
     return x
 
   return jax.tree.map(abstractify_leaf, pytree)
