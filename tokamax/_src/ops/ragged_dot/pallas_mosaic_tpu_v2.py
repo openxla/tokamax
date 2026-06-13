@@ -1,0 +1,283 @@
+# Copyright 2026 DeepMind Technologies Limited. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Ragged dot Pallas-Mosaic-TPU implementation."""
+
+import dataclasses
+import types
+from typing import ClassVar
+
+import jax
+import jax.experimental.pallas.tpu as pltpu
+import jax.numpy as jnp
+from jax.sharding import ManualAxisType
+import pydantic
+from tokamax._src.ops import op
+from tokamax._src.ops.ragged_dot import base
+from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
+from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
+from typing_extensions import override
+
+
+QArray = base.QArray
+AsQArray = base.AsQArray
+Residuals = types.NoneType
+
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class Config:
+  """Pallas Mosaic TPU Ragged Dot config holding the kernel tuning parameters.
+
+  `tile_m`/`tile_k`/`tile_n` are the kernel tile sizes. Leave them `None` (the
+  default) to let the kernel choose a VMEM-aware tiling via its `calculate_*`
+  heuristic; set all three to force an explicit `TileSizes`.
+  """
+
+  tile_m: pydantic.PositiveInt | None = None
+  tile_k: pydantic.PositiveInt | None = None
+  tile_n: pydantic.PositiveInt | None = None
+
+DEFAULT_RAGGED_DOT_DIM_NUMS = base.DEFAULT_RAGGED_DOT_DIM_NUMS
+DLHS_RAGGED_DOT_DIM_NUMS = base.TRANS_RHS_RAGGED_DOT_DIM_NUMS
+DRHS_RAGGED_DOT_DIM_NUMS = base.RAGGED_CONTRACTING_DOT_DIM_NUMS
+
+UNSUPPORTED_DIMENSIONS_MSG = (
+    "Specified ragged_dot_dimension_numbers `{}` not supported. Supported"
+    f" dimensions include: {DEFAULT_RAGGED_DOT_DIM_NUMS},"
+    f" {DLHS_RAGGED_DOT_DIM_NUMS}, {DRHS_RAGGED_DOT_DIM_NUMS}"
+)
+
+
+def _has_manual_axes(manual_axis_type) -> bool:
+  """Returns whether `manual_axis_type` names any manual axes.
+
+  The base VJP always forwards a `manual_axis_type` to its sub-calls, derived
+  from the input's type. For unsharded arrays this is a *trivial* value (all
+  axis sets empty), which is semantically equivalent to `None`. Only a value
+  that actually names axes implies shard_map, which v2 does not support yet.
+  """
+  if manual_axis_type is None:
+    return False
+  return bool(
+      getattr(manual_axis_type, "varying", None)
+      or getattr(manual_axis_type, "unreduced", None)
+      or getattr(manual_axis_type, "reduced", None)
+  )
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
+  """Pallas-Mosaic-TPU ragged dot implementation v2.
+
+  TPU Implementation of the Megablocks Paper https://arxiv.org/abs/2211.15841.
+  GMM v2 kernel is functionally equivalent to v1, but offers improved
+  performance. For example, v2 uses dynamic dma to reduce redundant compute as
+  much as possible, offers heuristic based tile searching, and supports lots of
+  fusion options.
+  """
+
+  config_cls: ClassVar[type[Config]] = Config
+  qdtype: jax.typing.DTypeLike | None = None
+  # Local weight group count for the drhs (tgmm) path. Under expert
+  # parallelism this differs from `group_sizes.shape[0]` (which is global).
+  # Set by the custom vjp (see `__post_init__`); `None` for the forward and
+  # for direct (non-autodiff) drhs calls.
+  num_actual_groups: int | None = None
+
+  def __post_init__(self):
+    qdtype: str | None = (
+        self.qdtype if self.qdtype is None else jnp.dtype(self.qdtype).name
+    )
+    if self.vjp is None:
+
+      # Build a fresh sub-op for the backward sub-calls. `num_actual_groups`
+      # only matters for the drhs (tgmm) path; leave it `None` otherwise.
+      def make_fn(num_actual_groups=None):
+        return lambda *args, **kw: PallasMosaicTpuV2RaggedDot(  # pylint: disable=unnecessary-lambda
+            qdtype=qdtype,
+            num_actual_groups=num_actual_groups,
+        )(*args, **kw)
+
+      def _vjp(residuals, out, dout, lhs, rhs, **kwargs):
+        # Under expert parallelism `group_sizes` is global, but the original
+        # local weights `rhs` (available here on the backward path) carry the
+        # actual local group count. Capture it and thread it into the tgmm
+        # sub-op, since the drhs `_fwd` only sees `lhs`/`dout`, not the weights.
+        num_actual_groups = rhs.shape[0]
+        return base.vjp(
+            residuals,
+            out,
+            dout,
+            lhs,
+            rhs,
+            dlhs_ragged_dot=make_fn(),
+            drhs_ragged_dot=make_fn(num_actual_groups=num_actual_groups),
+            **kwargs,
+        )
+
+      object.__setattr__(self, "vjp", _vjp)
+
+  @override
+  def _fwd(
+      self,
+      lhs: jax.Array | QArray | AsQArray,
+      rhs: jax.Array | QArray | AsQArray,
+      *,
+      group_sizes: jax.Array | base.GroupSizes,
+      ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
+      precision: base.CanonicalPrecision,
+      preferred_element_type: jax.typing.DTypeLike | None,
+      return_residuals: bool = False,
+      config: Config,
+      group_offset: jax.Array | None = None,
+      activation: base.ActivationFunction | None = None,
+      manual_axis_type: ManualAxisType | None = None,
+      rhs_scale: jax.Array | None = None,
+      rhs_bias: jax.Array | None = None,
+      maybe_quantize_lhs: bool = False,
+      zero_initialize: bool = True,
+      fuse_gateup_activation: str | None = None,
+      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
+      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
+  ) -> tuple[jax.Array, base.Residuals]:
+    if isinstance(lhs, (QArray, AsQArray)) or isinstance(
+        rhs, (QArray, AsQArray)
+    ):
+      raise NotImplementedError(
+          "v2 accepts only raw arrays; pass quantization via the"
+          " rhs_scale/rhs_bias API kwargs instead."
+      )
+    if _has_manual_axes(manual_axis_type):
+      raise NotImplementedError(
+          "v2 does not support manual_axis_type yet. But got"
+          f" manual_axis_type={manual_axis_type}"
+      )
+    if activation is not None:
+      raise NotImplementedError("v2 does not support activation.")
+
+    if isinstance(group_sizes, base.GroupSizes):
+      group_sizes = jnp.array(group_sizes)
+    # The v2 kernel's metadata code does `pl.cdiv(group_size, tile_m)` with an
+    # int32 `tile_m`, and `lax.div` rejects mixed signedness. Callers may pass
+    # `uint32` group sizes (e.g. `jax.lax.ragged_dot`'s default), so normalize
+    # to the int32 contract the kernel documents.
+    group_sizes = group_sizes.astype(jnp.int32)
+
+    vmem_limit_bytes = None
+    acc_dtype = None
+    # An explicit `config` tiling overrides the kernel's VMEM-aware heuristic;
+    # `None` tiles (the default) fall back to the per-path `calculate_*`
+    # heuristic below.
+    explicit_tiles = (
+        None
+        if None in (config.tile_m, config.tile_k, config.tile_n)
+        else gmm_backend.TileSizes(
+            tile_m=config.tile_m, tile_k=config.tile_k, tile_n=config.tile_n
+        )
+    )
+    if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
+      out = gmm_backend.gmm_v2(
+          lhs,
+          rhs,
+          group_sizes,
+          rhs_scale,
+          rhs_bias,
+          group_offset,
+          tile_info=explicit_tiles
+          if explicit_tiles is not None
+          else gmm_backend.calculate_tiling,
+          vmem_limit_bytes=vmem_limit_bytes,
+          precision=precision,
+          preferred_element_type=preferred_element_type,
+          acc_dtype=acc_dtype,
+          maybe_quantize_lhs=maybe_quantize_lhs,
+          zero_initialize=zero_initialize,
+          fuse_act=fuse_gateup_activation,
+      )
+    elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
+      out = gmm_backend.gmm_v2(
+          lhs,  # [m, n]
+          rhs.swapaxes(1, 2),  # [num_groups, n, k]
+          group_sizes,
+          None,  # rhs_scale
+          None,  # rhs_bias
+          group_offset,
+          tile_info=explicit_tiles
+          if explicit_tiles is not None
+          else gmm_backend.calculate_tiling,
+          vmem_limit_bytes=vmem_limit_bytes,
+          precision=precision,
+          preferred_element_type=preferred_element_type
+          if preferred_element_type is not None
+          else lhs.dtype,
+          acc_dtype=acc_dtype,
+          maybe_quantize_lhs=maybe_quantize_lhs,
+          zero_initialize=zero_initialize,
+          fuse_act=None,
+      )
+    elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
+      # Captured from the original local weights in the custom vjp. Under
+      # expert parallelism this is the local group count, which `group_sizes`
+      # (global) cannot provide. A direct (non-autodiff) drhs call has no
+      # weight context, so it is unsupported.
+      if self.num_actual_groups is None:
+        raise NotImplementedError(
+            "Direct drhs (tgmm) calls are not supported; `num_actual_groups`"
+            " is only available on the autodiff backward path."
+        )
+      num_actual_groups = self.num_actual_groups
+      out = tgmm_backend.tgmm_v2(
+          lhs,  # [m, k]
+          rhs,  # [m, n]
+          group_sizes,
+          num_actual_groups,
+          rhs_scale=rhs_scale,
+          group_offset=group_offset,
+          tile_info=explicit_tiles
+          if explicit_tiles is not None
+          else tgmm_backend.calculate_tgmm_tiling,
+          vmem_limit_bytes=vmem_limit_bytes,
+          precision=precision,
+          preferred_element_type=preferred_element_type
+          if preferred_element_type is not None
+          else lhs.dtype,
+          acc_dtype=acc_dtype,
+      )
+    else:
+      raise NotImplementedError(
+          UNSUPPORTED_DIMENSIONS_MSG.format(ragged_dot_dimension_numbers)
+      )
+
+    # return_residuals is set when:
+    # No autodiff: JAX runs the primal rule f, which calls fwd(fwd_res=False)
+    # and sets return_residuals=False:
+    # https://github.com/openxla/tokamax/blob/3e40ec1e3a1f736441a85a05d6b7dbc0bf8e18df/tokamax/_src/ops/op.py#L291
+    # and
+    # https://github.com/openxla/tokamax/blob/3e40ec1e3a1f736441a85a05d6b7dbc0bf8e18df/tokamax/_src/ops/op.py#L249-L250.
+    # Under autodiff: JAX runs the registered forward rule `fwd`` with its
+    # default fwd_res=True:
+    # https://github.com/openxla/tokamax/blob/3e40ec1e3a1f736441a85a05d6b7dbc0bf8e18df/tokamax/_src/ops/op.py#L292
+    residuals = out
+    return out, residuals if return_residuals else None
+
+  @override
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    # The v2 kernel can compute its own VMEM-aware tiling internally, so there
+    # is nothing to search here. Return the default `Config` (all-`None` tiles),
+    # which makes `_fwd` fall back to the kernel's `calculate_*` heuristic. A
+    # caller that wants fixed tiles can pass an explicit `Config` to the op.
+    del ba
+    return Config()
+
+  @override
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 6
