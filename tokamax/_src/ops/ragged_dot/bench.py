@@ -81,6 +81,13 @@ def _transpose_rhs(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
   return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=dll_layout)
 
 
+def _is_ignorable_error(e: Exception) -> bool:
+  err_msg = str(e)
+  return (
+      'No config found' in err_msg or 'Unsupported GPU architecture' in err_msg
+  )
+
+
 def _register_benchmarks():
   """Registers benchmarks."""
   for arg_spec in ARG_SPECS:
@@ -91,12 +98,30 @@ def _register_benchmarks():
         continue
       if impl_name == 'xla_even_groups' and name != 'memory_bound':
         continue
-      _register_benchmark(name, impl_name, spec)
+      try:
+        _register_benchmark(name, impl_name, spec)
+      except (ValueError, NotImplementedError) as e:
+        if _is_ignorable_error(e):
+          print(
+              f'Skipping {impl_name} for {name} due to missing'
+              f' config/heuristics: {e}'
+          )
+        else:
+          raise
 
       # The MGPU implementation is optimized for transposed RHS.
       if 'mosaic' in impl_name:
         spec = spec | dict(rhs=jax.tree.map(_transpose_rhs, spec['rhs']))
-        _register_benchmark(name + '_transposed_rhs', impl_name, spec)
+        try:
+          _register_benchmark(name + '_transposed_rhs', impl_name, spec)
+        except (ValueError, NotImplementedError) as e:
+          if _is_ignorable_error(e):
+            print(
+                f'Skipping {impl_name}_transposed_rhs for {name} due to missing'
+                f' config/heuristics: {e}'
+            )
+          else:
+            raise
 
 
 if __name__ == '__main__':
