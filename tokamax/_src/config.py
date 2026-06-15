@@ -63,7 +63,12 @@ class _ConfigOption(Generic[_T]):
   @property
   def value(self) -> _T:
     if not flags.FLAGS.is_parsed():
-      flags.FLAGS(sys.argv)
+      # `known_only=True` parses the flags absl actually defines (so any
+      # `--tokamax_*` flags on the command line still take effect) and ignores
+      # the rest instead of raising `UnrecognizedFlagError`. Tokamax is a
+      # library, so `sys.argv` may carry flags owned by the host program
+      # (pytest's `-s`, vLLM's CLI args, etc.) that absl does not recognize.
+      flags.FLAGS(sys.argv, known_only=True)
     return getattr(_STATE, self.flag.name, self.flag.value)
 
 
