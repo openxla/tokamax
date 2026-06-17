@@ -21,6 +21,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import config as config_lib
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
@@ -152,4 +153,8 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return self.implementation != "cudnn" or device.platform == "gpu"
+    return (
+        self.implementation != "cudnn"
+        or device.platform == "gpu"
+        or config_lib.cross_compile.value
+    )
