@@ -326,30 +326,47 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
   def test_heuristics_monkey_patch(self):
     """Tests that the heuristics config is monkey-patched correctly."""
 
-    def _monkey_patch_heuristics_config(bound_args) -> pallas_mosaic_tpu.Config:
-      del bound_args
+    # A tile-size of 2 will never be chosen by the heuristics, as this is
+    # far too small to get reasonable performance. This makes it a good choice
+    # for testing whether the heuristics are being overridden.
+    tile_size = 2
+
+    original_heuristics_f = (
+        pallas_mosaic_tpu.PallasMosaicTpuRaggedDot._get_heuristics_config
+    )
+
+    def _monkey_patch_heuristics_config(
+        self, bound_args: op_lib.BoundArguments
+    ) -> pallas_mosaic_tpu.Config:
+      del bound_args, self
+
       return pallas_mosaic_tpu.Config(
-          tile_m=16,
-          tile_k=16,
-          tile_n=16,
+          tile_m=tile_size,
+          tile_k=tile_size,
+          tile_n=tile_size,
           input_buffer_count=1,
           combine_scopes=True,
       )
 
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
 
-    object.__setattr__(
-        tpu_ragged_dot,
-        "_get_heuristics_config",
-        _monkey_patch_heuristics_config,
+    # Patch the _get_heuristics_config method.
+    pallas_mosaic_tpu.PallasMosaicTpuRaggedDot._get_heuristics_config = (
+        _monkey_patch_heuristics_config
     )
 
     config = tpu_ragged_dot._get_heuristics_config(None)  # pytype: disable=wrong-arg-types
-    self.assertEqual(config.tile_m, 16)
-    self.assertEqual(config.tile_k, 16)
-    self.assertEqual(config.tile_n, 16)
+    self.assertEqual(config.tile_m, tile_size)
+    self.assertEqual(config.tile_k, tile_size)
+    self.assertEqual(config.tile_n, tile_size)
     self.assertEqual(config.input_buffer_count, 1)
     self.assertEqual(config.combine_scopes, True)
+
+    # Restore the original heuristics config method. Without this, other tests
+    # could use the incorrect heuristics config.
+    pallas_mosaic_tpu.PallasMosaicTpuRaggedDot._get_heuristics_config = (
+        original_heuristics_f
+    )
 
 
 if __name__ == "__main__":
