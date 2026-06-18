@@ -40,6 +40,12 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       self.skipTest("Not supported on TPUs.")
     super().setUp()
 
+  def tearDown(self):
+    # These tests trace the same attention functions in tokamax many times,
+    # causing the JAX caches to grow quite large (leading to slowness and OOMs).
+    jax.clear_caches()
+    super().tearDown()
+
   def __init__(
       self,
       *args,
