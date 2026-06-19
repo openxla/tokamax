@@ -303,6 +303,13 @@ def flash_attention_kernel(
         f"Only f16 and bf16 are supported, got dtype: {dtype}"
     )
 
+  if not config.collective and config.block_kv < 128:
+    raise NotImplementedError(
+        "TODO: this config has been found to cause intermited invalid"
+        " instruction errors. Possible cause is barrier state at the end of the"
+        " kernel."
+    )
+
   q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
   if config.collective:
     m = 2 * 8 * common.MIN_SWIZZLE // mgpu_lib.num_bits(v.dtype)
