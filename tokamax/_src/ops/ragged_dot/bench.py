@@ -18,6 +18,7 @@ import functools
 
 from absl import app
 from absl import flags
+from absl import logging
 import google_benchmark
 import jax
 from jax.experimental import layout
@@ -71,6 +72,7 @@ _register_benchmark = functools.partial(
     iterations=3,
     items_processed_fn=_flops,
     raise_on_error=False,
+    method='wallclock',
 )
 
 
@@ -83,6 +85,7 @@ def _transpose_rhs(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
 
 def _register_benchmarks():
   """Registers benchmarks."""
+  logging.info('BENCHMARK_IMPLS VALUE: %s', _BENCHMARK_IMPLS.value)
   for arg_spec in ARG_SPECS:
     name = arg_spec.full_name
     spec = arg_spec.args
@@ -91,12 +94,63 @@ def _register_benchmarks():
         continue
       if impl_name == 'xla_even_groups' and name != 'memory_bound':
         continue
-      _register_benchmark(name, impl_name, spec)
+      if impl_name == 'triton':
+        lhs = spec['lhs']
+        m = lhs.qvalue.shape[0] if hasattr(lhs, 'qvalue') else lhs.shape[0]
+        if m >= 524288:
+          logging.warning(
+              'Skipping Triton for %s due to large M (%d) B200 bug.', name, m
+          )
+          continue
+
+      if impl_name == 'mosaic':
+        lhs = spec['lhs']
+        m = lhs.qvalue.shape[0] if hasattr(lhs, 'qvalue') else lhs.shape[0]
+        if m >= 262144:
+          logging.warning(
+              'Skipping Mosaic for %s due to large M (%d) B200 hang bug.',
+              name,
+              m,
+          )
+          continue
+
+      try:
+        print(f'DEBUG: Calling _register_benchmark for {name} with {impl_name}')
+        _register_benchmark(name, impl_name, spec)
+        print(f'DEBUG: Successfully registered {name} for {impl_name}')
+      except ValueError as e:
+        print(f'DEBUG: Caught ValueError for {name} / {impl_name}: {e}')
+        if 'No config found for' in str(e):
+          logging.warning(
+              'Skipping %s for %s due to cache miss.', impl_name, name
+          )
+        else:
+          raise
+      except Exception as e:
+        print(
+            f'DEBUG: Caught UNEXPECTED exception for {name} / {impl_name}:'
+            f' {type(e)}: {e}'
+        )
+        raise
 
       # The MGPU implementation is optimized for transposed RHS.
       if 'mosaic' in impl_name:
-        spec = spec | dict(rhs=jax.tree.map(_transpose_rhs, spec['rhs']))
-        _register_benchmark(name + '_transposed_rhs', impl_name, spec)
+        transposed_spec = spec | dict(
+            rhs=jax.tree.map(_transpose_rhs, spec['rhs'])
+        )
+        try:
+          _register_benchmark(
+              name + '_transposed_rhs', impl_name, transposed_spec
+          )
+        except ValueError as e:
+          if 'No config found for' in str(e):
+            logging.warning(
+                'Skipping %s (transposed) for %s due to cache miss.',
+                impl_name,
+                name,
+            )
+          else:
+            raise
 
 
 if __name__ == '__main__':
