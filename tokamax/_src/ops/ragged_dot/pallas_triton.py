@@ -337,6 +337,10 @@ def _ragged_contracting_dim_dot(
   return f(lhs, rhs, cum_rows[:-1], cum_rows[1:])
 
 
+def _default_vjp_fn(*a, **kw):
+  return PallasTritonRaggedDot()(*a, **kw)
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
   """Pallas-Triton ragged dot implementation."""
@@ -348,8 +352,11 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
   def __post_init__(self):
     if self.vjp is None:
       # Avoid infinite recursion.
-      f = lambda *a, **kw: PallasTritonRaggedDot()(*a, **kw)  # pylint: disable=unnecessary-lambda
-      vjp = functools.partial(base.vjp, dlhs_ragged_dot=f, drhs_ragged_dot=f)
+      vjp = functools.partial(
+          base.vjp,
+          dlhs_ragged_dot=_default_vjp_fn,
+          drhs_ragged_dot=_default_vjp_fn,
+      )
       object.__setattr__(self, "vjp", vjp)
 
   @override
