@@ -33,6 +33,8 @@ from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
+from tokamax._src.ops.experimental.mla import api as mla_api
+from tokamax._src.ops.experimental.mla import base as mla_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import api as normalization_api
@@ -277,6 +279,7 @@ _API_IMPLEMENTATIONS: Final[
     glu_base.GatedLinearUnit: glu_api.IMPLEMENTATIONS,
     ragged_dot_base.RaggedDot: ragged_dot_api.IMPLEMENTATIONS,
     attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,
+    mla_base.MultiHeadLatentAttention: mla_api.IMPLEMENTATIONS,
 })
 
 

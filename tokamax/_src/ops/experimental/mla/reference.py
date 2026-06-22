@@ -290,7 +290,7 @@ def mla_attention(
       )
       if v_scale is not None:
         out_i *= v_scale
-      per_batch_outputs.append(out_i)
+      per_batch_outputs.append(out_i.astype(q_kv_dtype))
     return per_batch_outputs
 
   outputs = _run_per_batch(0, batch_size)
