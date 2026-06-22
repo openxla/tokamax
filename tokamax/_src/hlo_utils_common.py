@@ -22,7 +22,11 @@ from jaxlib.mlir import ir
 
 TOKAMAX_NAME: Final[str] = 'tokamax'
 
-PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
+PALLAS_TRITON_KEY: Final[str] = (
+    'triton_kernel_call_ffi'
+    if jax.__version_info__ > (0, 10, 2)
+    else '__gpu$xla.gpu.triton'
+)
 MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
 MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
 TRITON_KEY: Final[str] = 'triton_kernel_call'
@@ -61,13 +65,6 @@ class KernelInfoBase:
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class TritonKernelInfo(KernelInfoBase):
   """Triton kernel information."""
-
-  kernel_name: str
-  num_warps: int
-  grid: tuple[int, int, int]
-  num_stages: int | None
-  compute_capability: int | None
-  metadata: bytes
 
 
 # TODO: Add fields for Mosaic TPU kernel information.

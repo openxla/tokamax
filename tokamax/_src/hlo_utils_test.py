@@ -143,11 +143,6 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertIsInstance(kernel_1, hlo_utils_common.TritonKernelInfo)
     self.assertIsInstance(kernel_2, hlo_utils_common.TritonKernelInfo)
 
-    self.assertEqual(kernel_1.kernel_name, 'add_vectors_kernel_1')
-    self.assertEqual(kernel_2.kernel_name, 'add_vector_two')
-
-    self.assertEqual(kernel_1.num_warps, 2)
-    self.assertEqual(kernel_2.num_warps, 4)
 
     # TODO: Re-enable checks after bug is fixed.
     _ = """
@@ -158,7 +153,6 @@ class DumpHloLibTest(parameterized.TestCase):
     shape = jax.ShapeDtypeStruct(shape=(8,), dtype=dtype)
     self.assertEqual(kernel_1.inputs, (shape, shape))
     self.assertEqual(kernel_2.inputs, (shape,))
-    self.assertEqual(kernel_2.grid, (8, 1, 1))
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_pallas_norm(self, representation):
@@ -191,9 +185,6 @@ class DumpHloLibTest(parameterized.TestCase):
 
     self.assertIsInstance(forward, hlo_utils_common.TritonKernelInfo)
     self.assertIsInstance(vjp, hlo_utils_common.TritonKernelInfo)
-
-    self.assertEqual(forward.kernel_name, 'pallas_layer_norm_fwd_res')
-    self.assertEqual(vjp.kernel_name, 'pallas_layer_norm_vjp')
 
     self.assertLen(forward.inputs, 3)
     self.assertLen(forward.outputs, 3)

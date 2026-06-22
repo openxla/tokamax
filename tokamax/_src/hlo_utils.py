@@ -181,31 +181,6 @@ def _get_common_kernel_info(
   )
 
 
-def _get_pallas_kernel_info(
-    op: stablehlo.CustomCallOp, call_stack: tuple[str, ...]
-) -> TritonKernelInfo:
-  """Get Pallas kernel info from a `stablehlo.CustomCallOp`."""
-  if (config := op.backend_config) is None:
-    config = op.attributes['mhlo.backend_config']
-  elif isinstance(config, ir.StringAttr):
-    assert not ir.StringAttr(config).value
-    config = op.attributes['mhlo.backend_config']
-  assert isinstance(config, ir.DictAttr)
-  int_ = lambda x: ir.IntegerAttr(x).value
-  grid_x = int_(config['grid_x'])
-  grid_y = int_(config['grid_y'])
-  grid_z = int_(config['grid_z'])
-  return TritonKernelInfo(
-      **_get_common_kernel_info(op, call_stack),
-      kernel_name=ir.StringAttr(config['name']).value,
-      num_warps=int_(config['num_warps']),
-      num_stages=int_(config['num_stages']),
-      grid=(grid_x, grid_y, grid_z),
-      compute_capability=None,
-      metadata=b'',
-  )
-
-
 def _kernel_info_getter(cls):
   return lambda op, call_stack: cls(**_get_common_kernel_info(op, call_stack))
 
@@ -225,7 +200,9 @@ _KERNEL_GETTER: Final[
     hlo_utils_common.MOSAIC_TPU_KEY: _kernel_info_getter(
         hlo_utils_common.MosaicTpuKernelInfo
     ),
-    hlo_utils_common.PALLAS_TRITON_KEY: _get_pallas_kernel_info,
+    hlo_utils_common.PALLAS_TRITON_KEY: _kernel_info_getter(
+        hlo_utils_common.TritonKernelInfo
+    ),
 })
 _get_tokamax_xla_kernel_info = _kernel_info_getter(
     hlo_utils_common.TokamaxXlaKernelInfo
