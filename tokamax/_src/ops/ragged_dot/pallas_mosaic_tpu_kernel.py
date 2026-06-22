@@ -701,7 +701,7 @@ def tgmm(
   n = rhs.shape[1]
   # the general tgmm definition requires lhs @ rhs
   # but our memory pipeline loads (m, k), (m, n) and computes (m, k)^T @ (m, n)
-  lhs = jax.tree.map(lambda x: x.mT, lhs)
+  lhs = jax.tree.map(lambda x: x.mT, lhs)  # [k, m] -> [m, k]
 
   num_groups = group_sizes.shape[0]
   num_actual_groups = (

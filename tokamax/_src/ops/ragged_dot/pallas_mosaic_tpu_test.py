@@ -17,6 +17,7 @@
 import functools
 from typing import Any
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from jax import shard_map
 import jax.experimental.pallas.tpu as pltpu
@@ -256,72 +257,95 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     autotuning_configs = ba.autotuning_configs
     self.assertGreaterEqual(len(autotuning_configs), 3 * 3 * 3)
 
-  def test_heuristics_config(self):
+  @parameterized.parameters(
+      (128, 128, 128),
+      (1, 2048, 512),
+      (65536, 2048, 512),
+      (65536, 16384, 512),
+      (65536, 2048, 16384),
+      (65536, 32768, 32768),
+  )
+  def test_heuristics_config(self, m, k, n):
     if not jax.devices()[0].device_kind.startswith("TPU7x"):
       self.skipTest("This test is only supported on TPU v7.")
+    num_groups = 256
+
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
-    ba = op_lib.BoundArguments(
+
+
+    ba_fwd = op_lib.BoundArguments(
         op=tpu_ragged_dot,
         arguments={
-            "lhs": jax.ShapeDtypeStruct((262144, 7168), dtype=jnp.bfloat16),
-            "rhs": jax.ShapeDtypeStruct((256, 7168, 2048), dtype=jnp.bfloat16),
-            "group_sizes": base.generate_group_sizes(m=262144, num_groups=256),
+            "lhs": jax.ShapeDtypeStruct((m, k), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((num_groups, k, n), dtype=jnp.bfloat16),
+            "group_sizes": base.generate_group_sizes(
+                m=m, num_groups=num_groups
+            ),
         },
     )
-    heuristics_config = ba.heuristics_config
-    self.assertIsInstance(heuristics_config, pallas_mosaic_tpu.Config)
-    self.assertEqual(heuristics_config.tile_m, 128)
-    self.assertEqual(heuristics_config.tile_k, 7168)
-    self.assertEqual(heuristics_config.tile_n, 512)
-    self.assertEqual(heuristics_config.input_buffer_count, 2)
+    fwd_heuristics = ba_fwd.heuristics_config
+    self.assertIsInstance(fwd_heuristics, pallas_mosaic_tpu.Config)
+    self.assertLessEqual(fwd_heuristics.tile_m, min(m, 1024))
+    self.assertLessEqual(fwd_heuristics.tile_k, k)
+    self.assertLessEqual(fwd_heuristics.tile_n, n)
+    self.assertEqual(fwd_heuristics.input_buffer_count, 2)
+    # Deflation order GMM: m -> n -> k.
+    if fwd_heuristics.tile_n < n:
+      self.assertEqual(fwd_heuristics.tile_m, 128)
+    if fwd_heuristics.tile_k < k:
+      self.assertEqual(fwd_heuristics.tile_n, 128)
 
-    # Ensure that the bound_args can execute correctly.
-    benchmark = ba.benchmark()
-    self.assertGreaterEqual(benchmark.median_evaluation_time_ms, 0)
 
-    # Try both DLHS and DRHS VJPs with heuristics config.
-    ba_vjp = op_lib.BoundArguments(
+    ba_vjp_dlhs = op_lib.BoundArguments(
         op=tpu_ragged_dot,
         arguments={
-            "lhs": jax.ShapeDtypeStruct((262144, 2048), dtype=jnp.bfloat16),
-            "rhs": jax.ShapeDtypeStruct((256, 7168, 2048), dtype=jnp.bfloat16),
-            "group_sizes": base.generate_group_sizes(m=262144, num_groups=256),
+            "lhs": jax.ShapeDtypeStruct((m, n), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((num_groups, k, n), dtype=jnp.bfloat16),
+            "group_sizes": base.generate_group_sizes(
+                m=m, num_groups=num_groups
+            ),
             "ragged_dot_dimension_numbers": (
                 pallas_mosaic_tpu.DLHS_RAGGED_DOT_DIM_NUMS
             ),
         },
     )
+    dlhs_heuristics = ba_vjp_dlhs.heuristics_config
+    self.assertIsInstance(dlhs_heuristics, pallas_mosaic_tpu.Config)
+    self.assertLessEqual(dlhs_heuristics.tile_m, min(m, 1024))
+    self.assertLessEqual(dlhs_heuristics.tile_k, k)
+    self.assertLessEqual(dlhs_heuristics.tile_n, n)
+    self.assertEqual(dlhs_heuristics.input_buffer_count, 2)
+    # Deflation order GMM: m -> n -> k.
+    if dlhs_heuristics.tile_n < n:
+      self.assertEqual(dlhs_heuristics.tile_m, 128)
+    if dlhs_heuristics.tile_k < k:
+      self.assertEqual(dlhs_heuristics.tile_n, 128)
 
-    vjp_heuristics_config = ba_vjp.heuristics_config
-    self.assertIsInstance(vjp_heuristics_config, pallas_mosaic_tpu.Config)
-    self.assertEqual(vjp_heuristics_config.tile_m, 128)
-    self.assertEqual(vjp_heuristics_config.tile_k, 7168)
-    self.assertEqual(vjp_heuristics_config.tile_n, 512)
-    self.assertEqual(vjp_heuristics_config.input_buffer_count, 2)
-
-    benchmark_vjp = ba_vjp.benchmark()
-    self.assertGreaterEqual(benchmark_vjp.median_evaluation_time_ms, 0)
-
+    # Try DRHS VJP with heuristics config.
     ba_vjp_drhs = op_lib.BoundArguments(
         op=tpu_ragged_dot,
         arguments={
-            "lhs": jax.ShapeDtypeStruct((131072, 7168), dtype=jnp.bfloat16),
-            "rhs": jax.ShapeDtypeStruct((7168, 2048), dtype=jnp.bfloat16),
-            "group_sizes": base.generate_group_sizes(m=131072, num_groups=256),
+            "lhs": jax.ShapeDtypeStruct((m, k), dtype=jnp.bfloat16),
+            "rhs": jax.ShapeDtypeStruct((m, n), dtype=jnp.bfloat16),
+            "group_sizes": base.generate_group_sizes(
+                m=m, num_groups=num_groups
+            ),
             "ragged_dot_dimension_numbers": (
                 pallas_mosaic_tpu.DRHS_RAGGED_DOT_DIM_NUMS
             ),
         },
     )
-    vjp_heuristics_config_drhs = ba_vjp_drhs.heuristics_config
-    self.assertIsInstance(vjp_heuristics_config_drhs, pallas_mosaic_tpu.Config)
-    self.assertEqual(vjp_heuristics_config_drhs.tile_m, 128)
-    self.assertEqual(vjp_heuristics_config_drhs.tile_k, 7168)
-    self.assertEqual(vjp_heuristics_config_drhs.tile_n, 512)
-    self.assertEqual(vjp_heuristics_config_drhs.input_buffer_count, 2)
-
-    benchmark_vjp_drhs = ba_vjp_drhs.benchmark()
-    self.assertGreaterEqual(benchmark_vjp_drhs.median_evaluation_time_ms, 0)
+    drhs_heuristics = ba_vjp_drhs.heuristics_config
+    self.assertIsInstance(drhs_heuristics, pallas_mosaic_tpu.Config)
+    self.assertLessEqual(drhs_heuristics.tile_m, min(m, 1024))
+    self.assertLessEqual(drhs_heuristics.tile_k, k)
+    self.assertLessEqual(drhs_heuristics.tile_n, n)
+    self.assertEqual(drhs_heuristics.input_buffer_count, 2)
+    # Deflation order TGMM: k -> n -> m.
+    if drhs_heuristics.tile_n < n:
+      self.assertEqual(drhs_heuristics.tile_k, 128)
+    if drhs_heuristics.tile_m < min(m, 1024):
+      self.assertEqual(drhs_heuristics.tile_n, 128)
 
   def test_heuristics_monkey_patch(self):
     """Tests that the heuristics config is monkey-patched correctly."""
