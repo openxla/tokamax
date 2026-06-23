@@ -175,6 +175,15 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     self.assertNotEmpty(configs)
     for config in configs:
       with self.subTest(f"{config=}"):
+        if (
+            gpu_utils.is_sm100()
+            and not config.collective
+            and config.block_kv < 128
+        ):
+          self.skipTest(
+              "Skipping test for config that is known to cause issues"
+              " (b/517048781)."
+          )
         impl = type(self._attention_fn)(config)
         self._run_test_with_inputs(q, k, v, impl=impl)
 

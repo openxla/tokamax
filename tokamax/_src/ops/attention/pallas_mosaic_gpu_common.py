@@ -43,6 +43,7 @@ class ConfigBase:
 
   Attributes:
     block_q: Block size along Q sequence length.
+    block_kv: Block size along K/V sequence length.
     num_stages: Number of tma stages for loading KV.
     fold_q_sequence_heads: Whether to fold seq_q into num_q_heads.
     split_k: Number of chunks to split seq_len_k into to improve parallelism.

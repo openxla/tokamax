@@ -38,7 +38,6 @@ from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 
-
 DotPrecisionLike = lax.Precision | lax.DotAlgorithmPreset
 PagingInfo = base.PagingInfo
 QArray = base.QArray
@@ -89,7 +88,7 @@ class Config(common.ConfigBase):
     block_q_per_cta = self.block_q // 2 if self.collective else self.block_q
     if block_q_per_cta < 128:
       raise ValueError(
-          f"For SM100 attention forward, block_q per CTA must be at least 128 "
+          "For SM100 attention forward, block_q per CTA must be at least 128 "
           f"to support TMEM slicing. Got block_q={self.block_q} with "
           f"collective={self.collective}."
       )
@@ -303,6 +302,12 @@ def flash_attention_kernel(
         f"Only f16 and bf16 are supported, got dtype: {dtype}"
     )
 
+  if not config.collective and config.block_kv < 128:
+    raise NotImplementedError(  # TODO
+        "This config has been found to cause intermitted invalid instruction"
+        " errors. Possible cause is barrier state at the end of the kernel."
+    )
+
   q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
   if config.collective:
     m = 2 * 8 * common.MIN_SWIZZLE // mgpu_lib.num_bits(v.dtype)
@@ -377,7 +382,7 @@ def flash_attention_kernel(
       p_produced_barrier,
       out_scaled_barrier,
   ):
-    (q_smem, o_smem) = qo_smem_union
+    q_smem, o_smem = qo_smem_union
 
     qi = lax.axis_index("q_tiles")
     hi = lax.axis_index("heads")
