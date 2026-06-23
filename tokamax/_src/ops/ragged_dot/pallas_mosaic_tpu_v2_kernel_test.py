@@ -909,6 +909,89 @@ class GmmTest(parameterized.TestCase):
     chex.assert_trees_all_close(actual, expected, atol=1.1, rtol=1.1)
 
   @parameterized.product(
+      batch_size=[128],
+      # in_size x block_size cover single- vs multiple-RHS-quant-block-along-K
+      # (and >1 tile_k); group_offset covers group masking. out_size/num_groups
+      # are fixed since the fixed per-tensor LHS scale is independent of them and
+      # those axes are already swept by test_gmm_activation_weight_quantized.
+      in_size=[512, 1024],
+      # out_size=[512],
+      # num_groups=[16],
+      out_size=[512, 1024],
+      num_groups=[16, 32],
+      block_size=[512, 1024],
+      calibration=["fixed,-224,224"],
+      group_offset=[0, 2],
+  )
+  def test_gmm_lhs_fixed_fp8_quantized(
+      self,
+      batch_size,
+      in_size,
+      out_size,
+      num_groups,
+      block_size,
+      calibration,
+      group_offset,
+  ):
+    """LHS quantized with a fixed per-tensor fp8 scale (matches qpl.quantize)."""
+    if block_size > in_size:
+      self.skipTest("block_size must be <= in_size")
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+
+    lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    # Pin fp8 weights so rhs is dequantized after the matmul, which is the only
+    # path that enables lhs quantization.
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+    # The kernel quantizes LHS to fp8 internally (constant fixed scale,
+    # clip-before-cast), which perturbs every LHS value before the matmul. We
+    # apply the identical quantize->dequantize round-trip to the reference's LHS
+    # so both sides carry the same quantization error. Otherwise the comparison
+    # would measure fp8 quantization noise itself (large for fp8_e4m3fn) rather
+    # than whether the kernel computes the correct grouped matmul. Because the
+    # fixed scale is data-independent (not per-block absmax), the quantized
+    # values are identical regardless of how the kernel slices K, so this
+    # whole-tensor simulation is faithful; only accumulation order /
+    # intermediate-dtype differences remain, within the tolerance below.
+    bound = gmm_backend._parse_fixed_calibration(calibration)
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    scale = bound / fp8_max
+    lhs_q = jnp.clip(
+        lhs.astype(jnp.float32) / scale, -fp8_max, fp8_max
+    ).astype(jnp.float8_e4m3fn)
+    lhs_simulated = (lhs_q.astype(jnp.float32) * scale).astype(lhs.dtype)
+
+    expected = reference_gmm(
+        lhs_simulated,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+    )
+
+    actual = gmm_backend.gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        maybe_quantize_lhs=True,
+        lhs_calibration_method=calibration,
+    ).astype(lhs.dtype)
+
+    chex.assert_trees_all_close(actual, expected, atol=1.1, rtol=1.1)
+
+  @parameterized.product(
       batch_size=[128, 256],
       in_size=[255, 500],
       out_size=[255, 500],

@@ -170,6 +170,14 @@ class InputConfigs:
   dtype: jnp.dtype
   has_bias: bool = False
   has_scale: bool = False
+  # Symmetric absmax bound for fixed (data-independent) per-tensor quantization,
+  # e.g. 224.0 to match qwix's `calibration_method="fixed,-224,224"`. When None,
+  # quantization uses the default dynamic per-block absmax calibration.
+  fixed_quant_bound: float | None = None
+
+  @property
+  def use_fixed_quant(self) -> bool:
+    return self.fixed_quant_bound is not None
 
   @property
   def should_bitcast(self) -> bool:
@@ -431,6 +439,15 @@ def inner_kernel(
         dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
         preferred_element_type = jnp.int32
 
+      # Fixed (data-independent) per-tensor quantization. The scale is a Python
+      # constant folded by the compiler, so no per-row absmax reduction is
+      # emitted. Mirrors qwix's "fixed,-b,b": scale = bound / dtype_max with
+      # clip-before-cast into the fp8 range.
+      use_fixed = cfgs.lhs_cfgs.use_fixed_quant
+      if use_fixed:
+        fixed_scale = cfgs.lhs_cfgs.fixed_quant_bound / dtype_max
+        fixed_scale_inv = 1.0 / fixed_scale
+
       # Without n outer loop, result of quantized matmul becomes available only
       # at the last iteration of the loop. This means [tile_m, tile_n] value
       # needs to be stored until the last iteration. By adding n outer loop,
@@ -451,15 +468,23 @@ def inner_kernel(
           # Perform lhs quantization. Note that for every block_lhs,
           # same computation will be performed tiles_n//mxu_size times.
           # But we can let compiler perform CSE and avoid recomputation.
-          block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-          block_scale = block_abs_max / dtype_max
+          if use_fixed:
+            # Constant per-tensor scale: clip into the fp8 range before casting,
+            # matching qwix's quantize (clip(x / scale, fp8_min, fp8_max)).
+            block_lhs_q = jnp.clip(
+                block_lhs * fixed_scale_inv, -dtype_max, dtype_max
+            ).astype(lhs_q_dtype)
+            block_scale = None  # applied after matmul as a Python scalar.
+          else:
+            block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+            block_scale = block_abs_max / dtype_max
 
-          # If block_scale=0, it will cause division by zero and return either
-          # NaN or Inf. Since this can cause numeric issue when downcasting to
-          # quantized value, we convert them into 0.
-          block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-          # Convert lhs into quantized dtype.
-          block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+            # If block_scale=0, it will cause division by zero and return either
+            # NaN or Inf. Since this can cause numeric issue when downcasting to
+            # quantized value, we convert them into 0.
+            block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+            # Convert lhs into quantized dtype.
+            block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
 
           # Unlike unquantized path, compiler may not perform implicit type
           # conversion due to numeric concerns. As this can cause unsupported
@@ -473,7 +498,12 @@ def inner_kernel(
               preferred_element_type=preferred_element_type,
           ).astype(acc_ref.dtype)
 
-          block_acc *= block_scale.astype(acc_ref.dtype)
+          if use_fixed:
+            # fixed_scale is a weakly-typed Python float, so the accumulator
+            # keeps its dtype.
+            block_acc *= fixed_scale
+          else:
+            block_acc *= block_scale.astype(acc_ref.dtype)
 
           # Apply rhs subchannel scale per quant block.
           if cfgs.rhs_cfgs.should_dequantize_after_matmul:
@@ -1059,6 +1089,22 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
   )
 
 
+def _parse_fixed_calibration(method: str | None) -> float | None:
+  """Returns the symmetric absmax bound for a `"fixed,-b,b"` method, else None.
+
+  Mirrors qwix's `calibration_method="fixed,-224,224"`, which is a per-tensor,
+  data-independent calibration. Only symmetric ranges are supported.
+  """
+  if method is None or not method.startswith("fixed,"):
+    return None
+  _, lo, hi = method.split(",")
+  lo, hi = float(lo), float(hi)
+  assert abs(lo) == abs(hi), (
+      f"Only symmetric fixed calibration is supported, got {method!r}."
+  )
+  return abs(hi)
+
+
 def make_gmm_configs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -1074,6 +1120,7 @@ def make_gmm_configs(
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
     fuse_act: str | None = None,
+    lhs_calibration_method: str | None = None,
 ):
   """Fills the GMM config for the GMM kernel."""
 
@@ -1099,6 +1146,13 @@ def make_gmm_configs(
       has_scale=has_scale,
   )
 
+  fixed_bound = _parse_fixed_calibration(lhs_calibration_method)
+  # A fixed calibration only takes effect through the lhs quantization path,
+  # which requires maybe_quantize_lhs. Fail loudly rather than silently ignore.
+  assert fixed_bound is None or maybe_quantize_lhs, (
+      "lhs_calibration_method requires maybe_quantize_lhs=True."
+  )
+
   lhs_q_dtype = None
   if maybe_quantize_lhs and rhs_cfgs.should_dequantize_after_matmul:
     # Choose lhs quantization dtype based on TPU hardware support.
@@ -1116,6 +1170,16 @@ def make_gmm_configs(
       if not is_rhs_float:
         lhs_q_dtype = jnp.int8.dtype
 
+    # Fixed calibration (e.g. "fixed,-224,224") is fp8-specific: the bound and
+    # scale = bound / finfo(fp8).max only make sense for fp8_e4m3fn. Force fp8
+    # (overriding any int8 selection above) so the kernel mirrors qwix.
+    if fixed_bound is not None:
+      assert lhs_q_dtype is not None, (
+          "Fixed lhs calibration needs fp8 lhs quantization, but the hardware "
+          "does not support fp8 (fp8_ops_per_second == 0)."
+      )
+      lhs_q_dtype = jnp.float8_e4m3fn.dtype
+
   lhs_cfgs = InputConfigs(
       quant_dtype=lhs_q_dtype,
       # Input quantization involves reading all elements in a block to compute
@@ -1124,6 +1188,8 @@ def make_gmm_configs(
       # enough to minimize compute overhead of quantization.
       quant_block_size=512,
       dtype=lhs.dtype,
+      # Only meaningful when lhs is quantized; ignored otherwise.
+      fixed_quant_bound=fixed_bound if lhs_q_dtype is not None else None,
   )
 
   if out_dtype is None:
@@ -1176,6 +1242,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "maybe_quantize_lhs",
         "zero_initialize",
         "fuse_act",
+        "lhs_calibration_method",
     ]
 )
 def gmm_v2(
@@ -1194,6 +1261,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    lhs_calibration_method: str | None = None,
 ) -> jax.Array:
   """GMM kernel implemented with emit_pipeline.
 
@@ -1216,6 +1284,12 @@ def gmm_v2(
     maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
     zero_initialize: Whether to initialize unvisited output elements to zero.
     fuse_act: Activation function to fuse with GMM, None if no fusion.
+    lhs_calibration_method: Optional lhs quantization calibration. When None, lhs
+      uses the default dynamic per-block absmax calibration. When set to a qwix
+      style fixed string such as "fixed,-224,224", lhs is quantized with a
+      constant per-tensor scale (bound / finfo(fp8).max) and clipped before
+      casting to float8_e4m3fn, matching qpl.quantize used by MaxText. Only
+      takes effect when maybe_quantize_lhs is True and rhs is quantized.
 
   Returns:
     Output of shape [size_m, size_n].
@@ -1246,6 +1320,7 @@ def gmm_v2(
       maybe_quantize_lhs=maybe_quantize_lhs,
       zero_initialize=zero_initialize,
       fuse_act=fuse_act,
+      lhs_calibration_method=lhs_calibration_method,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles
