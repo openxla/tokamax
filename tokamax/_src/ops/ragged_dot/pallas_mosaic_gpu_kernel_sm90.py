@@ -54,6 +54,7 @@ def ragged_dot_kernel(
   m_iters = pl.cdiv(m, block_m) + g - 1
   n_iters = pl.cdiv(n, block_n)
   k_iters = pl.cdiv(k, block_k)
+  align_tile = 8
 
   def kernel(
       lhs_gmem,
@@ -77,6 +78,7 @@ def ragged_dot_kernel(
         start_within_block = start_within_block_gmem[mi]
         actual_size = actual_size_gmem[mi]
         block_start = block_start_gmem[mi]
+        block_start = pl.multiple_of(block_start, align_tile)
 
       @pl.when(actual_size > 0)
       def body():
@@ -149,7 +151,9 @@ def ragged_dot_kernel(
       loop_info = plgpu.NDLoopInfo((mni,), local_index=0, num_local_steps=1)
       mn_loop_body(0, m_iters, loop_info)
 
-  group_info = common.GroupInfo.create_aligned(group_sizes, block_m, m_iters)
+  group_info = common.GroupInfo.create_aligned(
+      group_sizes, block_m, m_iters, align_tile
+  )
 
   if config.persistent:
     grid = (backend.get_default_device().core_count,)

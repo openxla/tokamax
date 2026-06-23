@@ -131,8 +131,9 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
 
   m_iters = pl.cdiv(m, block_m) + num_groups - 1
   n_iters = pl.cdiv(n, block_n)
+  align_tile = 8
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, block_m, m_iters
+      group_sizes, block_m, m_iters, align_tile
   )
 
   def kernel(*refs, scoped):
@@ -183,6 +184,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
       start_within_block = start_within_block_gmem[tid_m]
       actual_size = actual_size_gmem[tid_m]
       block_start = block_start_gmem[tid_m]
+      block_start = pl.multiple_of(block_start, align_tile)
       slice_m = pl.ds(block_start, block_m)
       slice_n = pl.ds(ni * block_n + cluster_idx * tile_n, tile_n)
 

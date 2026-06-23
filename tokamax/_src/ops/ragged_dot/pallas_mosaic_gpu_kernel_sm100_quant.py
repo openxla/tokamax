@@ -147,8 +147,9 @@ def ragged_dot_gpu_quant_blackwell_kernel(
   # num_stages must be less than or equal to the number of blocks
   num_stages = min(num_stages, k_w // block_k)
 
+  align_tile = 8
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, block_m, pl.cdiv(m, block_m) + num_groups - 1
+      group_sizes, block_m, pl.cdiv(m, block_m) + num_groups - 1, align_tile
   )
   m_iters = pl.cdiv(m, block_m) + num_groups - 1
   n_iters = pl.cdiv(n, block_n)
@@ -202,6 +203,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
       start_within_block = start_within_block_gmem[tid_m]
       actual_size = actual_size_gmem[tid_m]
       block_start = block_start_gmem[tid_m]
+      block_start = pl.multiple_of(block_start, align_tile)
       slice_m = pl.ds(block_start, block_m)
       slice_n = pl.ds(ni * block_n + cluster_idx * tile_n, tile_n)
 

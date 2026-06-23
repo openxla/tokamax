@@ -96,8 +96,12 @@ def ragged_dot_quantized_kernel(
         f"Scales tile is not supported got: {rhs.scale_tile_shape=} {block_k=}."
     )
 
+  align_tile = 8
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, config.block_m, pl.cdiv(m, config.block_m) + g - 1
+      group_sizes,
+      config.block_m,
+      pl.cdiv(m, config.block_m) + g - 1,
+      align_tile,
   )
   num_stages = min(config.num_stages, k // block_k)
 
@@ -135,6 +139,7 @@ def ragged_dot_quantized_kernel(
         start_within_block = start_within_block_gmem[mi]
         actual_size = actual_size_gmem[mi]
         block_start = block_start_gmem[mi]
+        block_start = pl.multiple_of(block_start, align_tile)
 
       wg = lax.axis_index("wg")
       ns = pl.ds(wg * block_n, block_n)
