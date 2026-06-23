@@ -66,6 +66,11 @@ bench = [
     "triton"
 ]
 
+cuda-bench = [
+    "google-benchmark>=1.9.0",
+    "xprof",
+]
+
 cuda = [
     "jax[cuda13]>=0.10.1",
     "nvidia-cudnn-cu13>=9.23.0.39",
