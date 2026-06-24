@@ -303,7 +303,7 @@ def flash_attention_kernel(
     )
 
   if not config.collective and config.block_kv < 128:
-    raise NotImplementedError(  # TODO
+    raise NotImplementedError(  # TODO(b/517048781): Re-enable once barrier bug is resolved.
         "This config has been found to cause intermitted invalid instruction"
         " errors. Possible cause is barrier state at the end of the kernel."
     )
