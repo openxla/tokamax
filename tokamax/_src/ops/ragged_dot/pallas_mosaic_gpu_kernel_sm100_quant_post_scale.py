@@ -492,7 +492,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
     num_sms = 1 + collective
   f = plgpu.kernel(
       kernel_entry,
-      out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
+      out_type=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
       num_threads=3,
       thread_name="wg",
       grid=(num_sms // (1 + collective),),

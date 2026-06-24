@@ -840,7 +840,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
   num_sms = num_sms // 2 if profile else num_sms
   f = plgpu.kernel(
       kernel_entry,
-      out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
+      out_type=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
       num_threads=_DEQ_WG + 2,
       thread_name="wg",
       grid=(num_sms // 2,) if collective else (num_sms,),

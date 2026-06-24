@@ -434,7 +434,7 @@ def _kernel(body, out_shape, **kernel_kwargs):
 
       plgpu.kernel(
           _body,
-          out_shape=(),
+          out_type=(),
           **kernel_kwargs,
       ).fun(*kernel_args)
 

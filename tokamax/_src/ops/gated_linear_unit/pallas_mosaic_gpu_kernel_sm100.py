@@ -259,14 +259,14 @@ def gated_linear_unit(
   )
   kernel = plgpu.kernel(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), dtype),
+      out_type=jax.ShapeDtypeStruct((m, n), dtype),
       grid=(m_iters * n_iters,),
       grid_names=("mn_linear",),
       cluster=(cluster_size,),
       cluster_names=("cluster",),
       num_threads=2,
       thread_name="wg",
-      scratch_shapes=dict(
+      scratch_types=dict(
           a_smem=plgpu.SMEM(
               (max_concurrent_steps, tile_m, tile_k),
               dtype,

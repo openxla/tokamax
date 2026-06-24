@@ -287,13 +287,13 @@ def gated_linear_unit(
   cluster_size = config.cluster_size_m * config.cluster_size_n
   f = plgpu.kernel(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), dtype),
+      out_type=jax.ShapeDtypeStruct((m, n), dtype),
       grid=(num_sms // cluster_size,),
       grid_names=("cluster_grid",),
       cluster=(cluster_size,),
       cluster_names=("cluster",),
       num_threads=3,
       thread_name="wg",
-      scratch_shapes=scratch_shapes,
+      scratch_types=scratch_shapes,
   )
   return jnp.reshape(f(x, weights), (*orig_x_shape[:-1], n))
