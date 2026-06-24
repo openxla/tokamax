@@ -43,7 +43,8 @@ SPEC_SHAPES = {
         '',
         ('primary', 'ci_tests'),
     ),
-    # FIXME: Use correct dtypes.
+    # TODO: Verify dtypes match Mixtral 8x7B production config. Currently using
+    # bfloat16 as a reasonable default; may need int8/fp8 for quantized variants.
     '8x7b': (
         8,
         8192,
