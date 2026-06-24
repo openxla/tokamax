@@ -31,5 +31,9 @@ toc:
     path: /tokamax/tokamax_demo
 - title: Op-specific Documentation
   section:
-  - title: Splash Attention
+  - title: Dot Product Attention (Splash Attention)
     path: /tokamax/splash_attention
+  - title: Gated Linear Unit (GLU / SwiGLU)
+    path: /tokamax/gated_linear_unit
+  - title: Layer Normalization (LayerNorm / RMSNorm)
+    path: /tokamax/normalization
