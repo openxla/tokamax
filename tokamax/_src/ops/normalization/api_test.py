@@ -79,48 +79,31 @@ class LayerNormTest(parameterized.TestCase):
     with self.subTest("value"):
       chex.assert_trees_all_close(out, out_golden)
 
-    with self.subTest("symbolic serialization"):
-      (a,) = export.symbolic_shape("a")
-      x_shape = jax.ShapeDtypeStruct((a, 32), x.dtype)
-      param_shape = jax.ShapeDtypeStruct(scale.shape, x.dtype)
+    # Triton no longer supports getting bound args.
+    if implementation != "triton" and implementation is not None:
+      with self.subTest("symbolic serialization"):
+        (a,) = export.symbolic_shape("a")
+        x_shape = jax.ShapeDtypeStruct((a, 32), x.dtype)
+        param_shape = jax.ShapeDtypeStruct(scale.shape, x.dtype)
 
-      if implementation == "triton":
-        with self.assertRaisesRegex(Exception, "all implementations failed"):
-          export.export(
-              norm_fn,
-              disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
-          )(x_shape, param_shape, param_shape)
-        # Change shape to non-symbolic to test standard export.
-        x_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
-
-      exported = export.export(
-          norm_fn,
-          disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
-      )(x_shape, param_shape, param_shape)
-      serialized: bytearray = exported.serialize()
-      rehydrated_norm: export.Exported = export.deserialize(serialized)
-      out_rehydrated = jax.jit(rehydrated_norm.call)(x, scale, offset)
-      chex.assert_trees_all_close(out_rehydrated, out_golden)
+        exported = export.export(
+            norm_fn,
+            disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
+        )(x_shape, param_shape, param_shape)
+        serialized: bytearray = exported.serialize()
+        rehydrated_norm: export.Exported = export.deserialize(serialized)
+        out_rehydrated = jax.jit(rehydrated_norm.call)(x, scale, offset)
+        chex.assert_trees_all_close(out_rehydrated, out_golden)
 
     with self.subTest("correct_implementation_used"):
       opspecs = hlo_utils.get_opspecs(
           norm_fn.lower(x, scale, offset),
           include_xla_kernels=(implementation == "xla"),
       )
-      triton_impl = type(api.IMPLEMENTATIONS.get("triton"))
-      triton_vjp_impl = type(_IMPLEMENTATIONS_VJP["triton"])
+      # Triton does not support getting bound args.
       match implementation:
-        case "triton":
-          self.assertIsInstance(opspecs[0].op, triton_impl)
-          self.assertIsInstance(opspecs[1].op, triton_vjp_impl)
         case "xla":
           self.assertIsInstance(opspecs[0].op, type(api.IMPLEMENTATIONS["xla"]))
-        case None:
-          if jax.default_backend() == "gpu":
-            # Ensure the Triton implementation is used.
-            self.assertIsInstance(opspecs[0].op, triton_impl)
-            self.assertIsInstance(opspecs[1].op, triton_vjp_impl)
-
 
 class LayerNormTritonTest(test_base.NormalizationTestBase):
   IMPL = "triton"

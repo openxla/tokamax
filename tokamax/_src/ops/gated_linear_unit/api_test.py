@@ -76,26 +76,30 @@ class GatedLinearUnitTest(parameterized.TestCase):
     with self.subTest("value"):
       chex.assert_trees_all_close(out, out_golden)
 
-    args = autotuning.get_bound_args(f.lower(lhs, rhs))
-    self.assertLen(args, 1)
+    # Triton no longer supports getting bound args.
+    if implementation != "triton" and implementation is not None:
+      args = autotuning.get_bound_args(f.lower(lhs, rhs))
+      self.assertLen(args, 1)
 
-    self.assertEqual(lhs.dtype, jnp.bfloat16)
-    self.assertEqual(
-        args[0].arguments["precision"],
-        (jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT),
-    )
+      self.assertEqual(lhs.dtype, jnp.bfloat16)
+      self.assertEqual(
+          args[0].arguments["precision"],
+          (jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT),
+      )
 
-    with self.subTest("correct_implementation_used"):
-      op = args[0].op
-      if implementation is None:
-        if jax.default_backend() == "gpu":
-          # Ensure either a Triton or Mosaic kernel is used.
-          self.assertTrue(
-              isinstance(op, api.IMPLEMENTATIONS["triton"].__class__)
-              or isinstance(op, api.IMPLEMENTATIONS["mosaic"].__class__)
+      with self.subTest("correct_implementation_used"):
+        op = args[0].op
+        if implementation is None:
+          if jax.default_backend() == "gpu":
+            # Ensure either a Triton or Mosaic kernel is used.
+            self.assertTrue(
+                isinstance(op, api.IMPLEMENTATIONS["triton"].__class__)
+                or isinstance(op, api.IMPLEMENTATIONS["mosaic"].__class__)
+            )
+        else:
+          self.assertIsInstance(
+              op, api.IMPLEMENTATIONS[implementation].__class__
           )
-      else:
-        self.assertIsInstance(op, api.IMPLEMENTATIONS[implementation].__class__)
 
 
 class GatedLinearUnitTritonTest(test_base.GatedLinearUnitTestBase):

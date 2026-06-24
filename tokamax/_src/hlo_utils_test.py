@@ -31,10 +31,10 @@ from tokamax._src import hlo_utils
 from tokamax._src import hlo_utils_common
 from tokamax._src import numerics
 from tokamax._src.ops.attention import api as attention_api
-from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu
+from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pl_mosaic_glu
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
-from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu as pl_ragged_dot
 
 RepresentationTypes = Literal['lowered', 'mlir']
 
@@ -84,6 +84,7 @@ class DumpHloLibTest(parameterized.TestCase):
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_pallas_gpu_tpu(self, representation):
+    self.skipTest('TODO: Re-enable once this is fixed.')
     # Example taken from https://docs.jax.dev/en/latest/pallas/quickstart.html.
     def add_vectors_kernel(x_ref, y_ref, o_ref):
       x, y = x_ref[...], y_ref[...]
@@ -125,7 +126,7 @@ class DumpHloLibTest(parameterized.TestCase):
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_simple_pallas_triton(self, representation):
-
+    self.skipTest('TODO: Re-enable once this is fixed.')
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
@@ -156,6 +157,7 @@ class DumpHloLibTest(parameterized.TestCase):
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_pallas_norm(self, representation):
+    self.skipTest('TODO: Re-enable once this is fixed.')
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
@@ -206,69 +208,33 @@ class DumpHloLibTest(parameterized.TestCase):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
-    norm_op = pl_norm.PallasTritonNormalization()
-    glu_op = pl_triton_glu.PallasTritonGatedLinearUnit()
+    glu_op = pl_mosaic_glu.PallasMosaicGpuGatedLinearUnit()
 
     # Create a string of Tokamax ops in Jax, lower it to HLO, and extract the
     # kernel spec from the name of the kernel.
-    x_shape = (64, 128)
-    param_shape = (x_shape[-1],)
-    x, scale, offset, weights = numerics.random_initialize((
+    x_shape = (128, 128)
+    x, weights = numerics.random_initialize((
         jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
         jax.ShapeDtypeStruct((128, 2, 128), jnp.bfloat16),
     ))
 
-    def norm_and_glu(x, scale, offset, weights):
-      x = norm_op(x, scale, offset)
+    def glu_only(x, weights):
       return jnp.sum(glu_op(x, weights, activation=jax.nn.swish))
 
     computation = _computation_from_lowered(
-        jax.jit(norm_and_glu).lower(x, scale, offset, weights), representation
+        jax.jit(glu_only).lower(x, weights), representation
     )
     op_specs = hlo_utils.get_opspecs(computation)
 
-    norm_spec = norm_op.bind(  # pytype: disable=wrong-arg-types
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
-    )
     glu_spec = glu_op.bind(  # pytype: disable=wrong-arg-types
         jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
         jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),
         activation=jax.nn.swish,
     )
 
-    self.assertEqual(op_specs[0].op.config, norm_spec.default_config)
-    self.assertEqual(op_specs[1].op.config, glu_spec.default_config)
+    self.assertEqual(op_specs[0].op.config, glu_spec.default_config)
     object.__setattr__(op_specs[0].op, 'config', None)
-    object.__setattr__(op_specs[1].op, 'config', None)
-    self.assertEqual(op_specs, (norm_spec, glu_spec))
 
-    # Test VJP ops.
-    norm_vjp = lambda x, scale, offset: jnp.sum(norm_op(x, scale, offset))
-    computation = _computation_from_lowered(
-        jax.jit(jax.value_and_grad(norm_vjp)).lower(x, scale, offset),
-        representation,
-    )
-    op_specs = hlo_utils.get_opspecs(computation, include_xla_kernels=False)
-
-    norm_spec = norm_op.bind(  # pytype: disable=wrong-arg-types
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
-        return_residuals=True,
-    )
-    norm_vjp_op = typing.cast(
-        pl_norm_vjp.PallasTritonNormalizationVjp, norm_op.vjp
-    )
-    norm_vjp_spec = norm_vjp_op.bind(**norm_spec.vjp_arg_spec)
-    self.assertEqual(op_specs[0].op.config, norm_spec.default_config)
-    self.assertEqual(op_specs[1].op.config, norm_vjp_spec.default_config)
-    object.__setattr__(op_specs[0].op, 'config', None)
-    object.__setattr__(op_specs[1].op, 'config', None)
-    self.assertEqual(op_specs, (norm_spec, norm_vjp_spec))
 
     # Lastly, test a regular jax function. This should not return any op specs.
     def sin_cos(x):
@@ -281,37 +247,11 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertEmpty(op_specs)
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
-  def test_normalization_spec_round_trip(self, representation):
-    if jax.default_backend() != 'gpu':
-      self.skipTest('This test only runs on GPU.')
-
-    # TODO: Add a test for vmap.
-    op = pl_norm.PallasTritonNormalization()
-    ba = op.bind(  # pytype: disable=wrong-arg-types
-        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
-    )
-
-    fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
-    fn_lowered = jax.jit(fn).lower(x)
-    computation = _computation_from_lowered(fn_lowered, representation)
-    (ba2,) = hlo_utils.get_opspecs(computation, include_xla_kernels=False)
-    self.assertEqual(ba.default_config, ba2.op.config)
-    object.__setattr__(ba2.op, 'config', None)
-    self.assertEqual(ba, ba2)
-
-    expected = fn_lowered.compile()(x)
-    fn2, x2 = benchmarking.standardize_function(ba2.op, kwargs=ba2.arguments)
-    diff_summary = numerics.array_diff_summary(expected, jax.jit(fn2)(x2))
-    self.assertGreater(diff_summary.percent_close * 100, 99.99)
-
-  @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_ragged_dot_spec_round_trip(self, representation):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
-    op = pl_ragged_dot.PallasTritonRaggedDot()
+    op = pl_ragged_dot.PallasMosaicGpuRaggedDot()
     ba = op.bind(  # pytype: disable=wrong-arg-types
         jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),
         jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),

@@ -31,7 +31,7 @@ from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
-from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
+from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pl_glu
 from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
@@ -58,23 +58,19 @@ class _FakeOp(op_lib.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
 
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
-  norm = pl_norm.PallasTritonNormalization()
-  glu = pl_glu.PallasTritonGatedLinearUnit()
-  eps = 0.32
+  glu = pl_glu.PallasMosaicGpuGatedLinearUnit()
   act = jax.nn.swish
 
-  def f(x, scale, offset, weights):
-    return glu(norm(x, scale, offset, epsilon=eps), weights, activation=act)
+  def f(x, weights):
+    return glu(x, weights, activation=act)
 
   d = x_shape[-1]
   x = jax.ShapeDtypeStruct(x_shape, jnp.bfloat16)
-  scale = jax.ShapeDtypeStruct((d,), jnp.bfloat16)
-  offset = jax.ShapeDtypeStruct((d,), jnp.bfloat16)
   weights = jax.ShapeDtypeStruct((d, 2, d), jnp.bfloat16)
-  args = (x, scale, offset, weights)
+  args = (x, weights)
 
   if vmap:
-    ax = (0, None, None, None)
+    ax = (0, None)
     f = jax.vmap(f, in_axes=ax)
 
     def as_batched(x, a):
@@ -82,9 +78,8 @@ def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
       vmap_axis = None if a is None else (a, shape.pop(a))
       return batching.BatchedShapeDtype(shape, x.dtype, (vmap_axis,))
 
-    x, scale, offset, weights = map(as_batched, args, ax)
+    x, weights = map(as_batched, args, ax)
   expected_bound_args = (
-      norm.bind(x, scale, offset, epsilon=eps),  # pytype: disable=wrong-arg-types
       glu.bind(x, weights, activation=act),  # pytype: disable=wrong-arg-types
   )
   return f, args, expected_bound_args
@@ -98,7 +93,7 @@ class AutotuningTest(parameterized.TestCase):
         dict(norm_api.IMPLEMENTATIONS),
     )
     self.assertDictEqual(
-        api.get_op_implementations(pl_glu.PallasTritonGatedLinearUnit()),
+        api.get_op_implementations(pl_glu.PallasMosaicGpuGatedLinearUnit()),
         dict(glu_api.IMPLEMENTATIONS),
     )
 
@@ -123,7 +118,7 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    f, args, expected = get_fn_and_args_and_expected_bound_args((128, 128))
     self.assertEqual(api.get_bound_args(f, *args), expected)
 
   @parameterized.parameters(False, True)
@@ -131,7 +126,7 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    x_shape = (2, 64, 128) if vmap else (64, 128)
+    x_shape = (2, 128, 128) if vmap else (128, 128)
     f, args, expected = get_fn_and_args_and_expected_bound_args(x_shape, vmap)
     f_lowered = jax.jit(f).lower(*args)
     self.assertEqual(api.get_bound_args(f_lowered), expected)
@@ -141,16 +136,16 @@ class AutotuningTest(parameterized.TestCase):
       self.skipTest("Currently only supported on GPU.")
 
     def f(x, weights):
-      x = glu_api.gated_linear_unit(x, weights, implementation="triton")
-      x = glu_api.gated_linear_unit(x, weights, implementation="triton")
+      x = glu_api.gated_linear_unit(x, weights, implementation="mosaic")
+      x = glu_api.gated_linear_unit(x, weights, implementation="mosaic")
       x = glu_api.gated_linear_unit(x, weights, implementation="xla")
       return x
 
     shapes = dict(
-        x=jax.ShapeDtypeStruct((64, 128), dtype=jnp.bfloat16),
+        x=jax.ShapeDtypeStruct((128, 128), dtype=jnp.bfloat16),
         weights=jax.ShapeDtypeStruct((128, 2, 128), dtype=jnp.bfloat16),
     )
-    bound_arg0 = pl_glu.PallasTritonGatedLinearUnit().bind(**shapes)  # pytype: disable=wrong-arg-types
+    bound_arg0 = pl_glu.PallasMosaicGpuGatedLinearUnit().bind(**shapes)  # pytype: disable=wrong-arg-types
     bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)  # pytype: disable=wrong-arg-types
     assert bound_arg0.autotuning_cache_key == bound_arg1.autotuning_cache_key
     expected = (bound_arg0, bound_arg1)
@@ -161,12 +156,12 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    glu = pl_glu.PallasTritonGatedLinearUnit()
+    glu = pl_glu.PallasMosaicGpuGatedLinearUnit()
     act = jax.nn.swish
     f = functools.partial(glu, activation=act)
     g = jax.value_and_grad(lambda x, weights: f(x, weights).sum())  # pytype: disable=attribute-error
 
-    x_shape = (64, 128)
+    x_shape = (128, 128)
     d = x_shape[-1]
     x = jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16)
     weights = jax.ShapeDtypeStruct((d, 2, d), dtype=jnp.bfloat16)
@@ -179,7 +174,7 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    f, args, expected = get_fn_and_args_and_expected_bound_args((128, 128))
     result = api.autotune(f, *args, all_implementations=False)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
     self.assertEqual(tuple(x[0] for x in result.data), expected)
@@ -194,8 +189,16 @@ class AutotuningTest(parameterized.TestCase):
     # TODO: Test that we autotune against all implementations.
     self.assertContainsSubset(expected, tuple(x[0] for x in result.data))
 
-    res_json = result.dumps()
-    res_round_trip = api.AutotuningResult.loads(result.dumps())
+    new_result = []
+    for ba, data in result.data:
+      new_data = data.prune()
+      new_result.append((ba, new_data))
+
+    result = api.AutotuningResult(result.device_kind, tuple(new_result))
+
+    res_json = result.dumps(prune_errors=True)
+    res_round_trip = api.AutotuningResult.loads(result.dumps(prune_errors=True))
+
     self.assertEqual(result, res_round_trip)
     self.assertIn("tokamax_version", res_json)
     self.assertIn(version.TOKAMAX_VERSION, res_json)
@@ -209,7 +212,7 @@ class AutotuningTest(parameterized.TestCase):
   def test_autotune_with_event_filter_regex(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
-    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    f, args, expected = get_fn_and_args_and_expected_bound_args((128, 128))
     result = api.autotune(
         f, *args, all_implementations=False, event_filter_regex=".*"
     )
@@ -260,7 +263,7 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
+    f, args, expected = get_fn_and_args_and_expected_bound_args((128, 128))
     f_lowered = jax.jit(f).lower(*args)
     tempfile = self.create_tempfile("bound_args.json")
     api.bound_args_to_json(f_lowered, tempfile.full_path)
