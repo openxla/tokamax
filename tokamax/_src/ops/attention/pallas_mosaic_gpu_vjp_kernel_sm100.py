@@ -405,7 +405,7 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   return max(configs, key=_score)
 
 
-def _kernel(body, out_shape, **kernel_kwargs):
+def _kernel(body, out_type, **kernel_kwargs):
   """Interface for SM100 attention VJP kernel.
 
   Unwraps the custom_vmap() operator because tokamax handles vmap
@@ -421,8 +421,8 @@ def _kernel(body, out_shape, **kernel_kwargs):
 
   """
 
-  if singleton_out := not isinstance(out_shape, (tuple, list)):
-    out_shape = (out_shape,)
+  if singleton_out := not isinstance(out_type, (tuple, list)):
+    out_type = (out_type,)
 
   @jax.custom_batching.custom_vmap
   def wrapped(*kernel_args):
@@ -443,7 +443,7 @@ def _kernel(body, out_shape, **kernel_kwargs):
             lambda s: s
             if isinstance(s, jax.Array)
             else jax.lax.empty(s.shape, s.dtype),
-            out_shape,
+            out_type,
         )
     )
     return tuple(out)
@@ -1880,7 +1880,7 @@ def flash_attention_vjp_kernel(
 
     dq = _kernel(
         dq_body,
-        out_shape=dq_out_shape,
+        out_type=dq_out_shape,
         kernel_name="sm100_dq_kernel",
         grid=(
             q.shape[-4] if q.ndim == 4 else 1,
@@ -1891,7 +1891,7 @@ def flash_attention_vjp_kernel(
         num_threads=2,
         thread_name="wg",
         compiler_params=compiler_params,
-        scratch_shapes=dq_scratch_shapes,
+        scratch_types=dq_scratch_shapes,
     )(q, k, v, dout, m, l, delta, bias, k_start, k_end, mask)
     ds = None
   else:
@@ -1954,7 +1954,7 @@ def flash_attention_vjp_kernel(
 
     dq, ds = _kernel(
         dq_body_bias,
-        out_shape=dq_out_shape,
+        out_type=dq_out_shape,
         kernel_name="sm100_dq_kernel_bias",
         grid=(
             q.shape[-4] if q.ndim == 4 else 1,
@@ -1965,7 +1965,7 @@ def flash_attention_vjp_kernel(
         num_threads=2,
         thread_name="wg",
         compiler_params=compiler_params,
-        scratch_shapes=dq_scratch_shapes,
+        scratch_types=dq_scratch_shapes,
     )(q, k, v, dout, m, l, delta, bias, k_start, k_end, mask)
 
   dkv_shape = (
@@ -2047,7 +2047,7 @@ def flash_attention_vjp_kernel(
 
   dk, dv = _kernel(
       dkv_body,
-      out_shape=dkv_shape,
+      out_type=dkv_shape,
       kernel_name="sm100_dkv_kernel",
       grid=(
           q.shape[-4] if q.ndim == 4 else 1,
@@ -2058,7 +2058,7 @@ def flash_attention_vjp_kernel(
       num_threads=2,
       thread_name="wg",
       compiler_params=compiler_params,
-      scratch_shapes=dkv_scratch_shapes,
+      scratch_types=dkv_scratch_shapes,
   )(q, k, v, dout, m, l, delta, bias_dkv, k_start, k_end, mask_dkv)
 
   dq = dq[..., :orig_q_seq_len, :, :orig_head_dim]
