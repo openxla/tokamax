@@ -22,7 +22,7 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_kernel_test as kernel_test
+from tokamax._src.ops.ragged_dot.gmm_v2_kernel_tests import pallas_mosaic_tpu_v2_kernel_test as kernel_test
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
 
 
