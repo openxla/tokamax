@@ -118,6 +118,8 @@ class RaggedDotTest(parameterized.TestCase):
 
       triton_impl = type(api.IMPLEMENTATIONS.get("triton"))
       match implementation:
+        case "triton":
+          self.assertIsInstance(opspecs[0].op, triton_impl)
         case "xla":
           self.assertEmpty(opspecs)
         case "mosaic":
