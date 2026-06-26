@@ -30,7 +30,10 @@ from tokamax._src import hlo_utils_common
 from tokamax._src.ops import op as op_lib
 
 DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
-    export.DisabledSafetyCheck.custom_call(hlo_utils_common.PALLAS_TRITON_KEY),
+    *(
+        export.DisabledSafetyCheck.custom_call(key)
+        for key in hlo_utils_common.PALLAS_TRITON_KEYS
+    ),
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.MOSAIC_GPU_KEY),
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.MOSAIC_TPU_KEY),
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_KEY),
@@ -185,6 +188,19 @@ def _kernel_info_getter(cls):
   return lambda op, call_stack: cls(**_get_common_kernel_info(op, call_stack))
 
 
+_KERNEL_GETTER_DICT = {
+    hlo_utils_common.MOSAIC_GPU_KEY: _kernel_info_getter(
+        hlo_utils_common.MosaicGpuKernelInfo
+    ),
+    hlo_utils_common.MOSAIC_TPU_KEY: _kernel_info_getter(
+        hlo_utils_common.MosaicTpuKernelInfo
+    ),
+}
+for _key in hlo_utils_common.PALLAS_TRITON_KEYS:
+  _KERNEL_GETTER_DICT[_key] = _kernel_info_getter(
+      hlo_utils_common.TritonKernelInfo
+  )
+
 _KERNEL_GETTER: Final[
     immutabledict.immutabledict[
         str,
@@ -193,17 +209,7 @@ _KERNEL_GETTER: Final[
             KernelInfoBase,
         ],
     ]
-] = immutabledict.immutabledict({
-    hlo_utils_common.MOSAIC_GPU_KEY: _kernel_info_getter(
-        hlo_utils_common.MosaicGpuKernelInfo
-    ),
-    hlo_utils_common.MOSAIC_TPU_KEY: _kernel_info_getter(
-        hlo_utils_common.MosaicTpuKernelInfo
-    ),
-    hlo_utils_common.PALLAS_TRITON_KEY: _kernel_info_getter(
-        hlo_utils_common.TritonKernelInfo
-    ),
-})
+] = immutabledict.immutabledict(_KERNEL_GETTER_DICT)
 _get_tokamax_xla_kernel_info = _kernel_info_getter(
     hlo_utils_common.TokamaxXlaKernelInfo
 )
