@@ -90,7 +90,7 @@ def _bwd_dkdv(
     # Load m before computing qk to reduce pipeline stall.
     m = m_ref.at[span_m].load()
     l = l_ref.at[span_m].load(other=float(jnp.finfo(jnp.float32).tiny))
-    sT = pl.dot(k, q.T, precision=q_k_dot_precision).astype(logits_dtype)
+    sT = plgpu.dot(k, q.T, precision=q_k_dot_precision).astype(logits_dtype)
 
     if bias_ref is not None:
       nonlocal bias
@@ -114,9 +114,9 @@ def _bwd_dkdv(
 
     pT = jnp.exp(sT - m) / l
     do = do_ref.at[span_m].load()
-    dv += pl.dot(pT.astype(do.dtype), do, precision=weights_v_dot_precision)
+    dv += plgpu.dot(pT.astype(do.dtype), do, precision=weights_v_dot_precision)
     delta = delta_ref.at[span_m].load()
-    dpT = pl.dot(v, do.T, precision=weights_v_dot_precision) - delta
+    dpT = plgpu.dot(v, do.T, precision=weights_v_dot_precision) - delta
     dsT = pT * dpT
 
     # If we have an attention mask, it is possible that the entire row is
@@ -129,7 +129,7 @@ def _bwd_dkdv(
     if ds_ref is not None:
       ds_ref.at[span_m, span_n].store(dsT.T.astype(ds_ref.dtype))
 
-    dk += pl.dot(dsT.astype(q.dtype), q, precision=q_k_dot_precision)
+    dk += plgpu.dot(dsT.astype(q.dtype), q, precision=q_k_dot_precision)
     return dk, dv
 
   return jax.lax.fori_loop(lo, hi, body, (dk, dv))
@@ -180,7 +180,7 @@ def _bwd_dq(
     span_n = pl.ds(curr_n, block_n2)
     k = k_ref.at[span_n].load()
     v = v_ref.at[span_n].load()
-    s = pl.dot(q, k.T, precision=q_k_dot_precision).astype(logits_dtype)
+    s = plgpu.dot(q, k.T, precision=q_k_dot_precision).astype(logits_dtype)
 
     if bias_ref is not None:
       nonlocal bias
@@ -201,9 +201,9 @@ def _bwd_dq(
       offs_n = curr_n + jnp.arange(0, block_n2)
       p = jnp.where(offs_m[:, None] >= offs_n[None, :], p, 0.0)
 
-    dp = pl.dot(do, v.T, precision=weights_v_dot_precision) - delta
+    dp = plgpu.dot(do, v.T, precision=weights_v_dot_precision) - delta
     ds = p * dp
-    return dq + pl.dot(ds.astype(k.dtype), k, precision=q_k_dot_precision)
+    return dq + plgpu.dot(ds.astype(k.dtype), k, precision=q_k_dot_precision)
 
   return jax.lax.fori_loop(lo, hi, body, dq)
 

@@ -136,7 +136,9 @@ def _ragged_dot_kernel(
       dtype = jnp.result_type(a, b)
       a = a.astype(dtype)
       b = b.astype(dtype)
-      return acc + pl.dot(a, b, precision=dot_precision) * a_scales * b_scales
+      return (
+          acc + plgpu.dot(a, b, precision=dot_precision) * a_scales * b_scales
+      )
 
     acc = jax.lax.fori_loop(0, pl.cdiv(a_ref.shape[1], block_k), body, acc)
     mask = (start_m + jnp.arange(block_m)) < hi
@@ -268,7 +270,7 @@ def _ragged_contracting_dim_dot_kernel(
     dtype = jnp.result_type(a, b)
     a = a.astype(dtype)
     b = b.astype(dtype)
-    return acc + pl.dot(a.T, b, precision=precision)
+    return acc + plgpu.dot(a.T, b, precision=precision)
 
   num_iters = pl.cdiv(jnp.int32(hi - lo), block_k)
   acc = jnp.zeros((block_m, out_ref.shape[1]), dtype=jnp.float32)
