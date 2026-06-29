@@ -209,7 +209,7 @@ def make_tgmm_configs(
     # > 1 means the caller wants sub-channel (per-m-block) quantization.
     if rhs_scale.ndim == 3 and rhs_scale.shape[0] > 1:
       raise NotImplementedError(
-          "tgmm_v2 only supports per-N rhs_scale with shape (1, 1, size_n);"
+          "tgmm_v2 only supports per-N rhs_scale with shape (1, 1, size_n)"
           f" got {rhs_scale.shape}, which implies {rhs_scale.shape[0]}"
           " sub-channel quant blocks along the m (reduction) dimension."
           " Sub-channel quantization is not implemented."
