@@ -24,7 +24,10 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
+from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import gpu
+from jaxlib.mlir.dialects import memref as memref_dialect
 import numpy as np
 import qwix
 from tokamax._src import jaxtyping
@@ -199,6 +202,58 @@ def _compute_stages(
   return int(xw_stages), int(scale_stages), int(deq_stages), int(acc_stages)
 
 
+def _write_scales_to_gmem(
+    gmem_ref: pl.MemoryRef,
+    smem_ref: pl.MemoryRef,
+    copy_size: jax.Array,
+    offset: jax.Array,
+    scale_col: jax.Array,
+    block_start_m: jax.Array,
+    cluster_block_m: int,
+) -> None:
+  @plgpu.inline_mgpu(
+      arg_types=(
+          plgpu.RefType(),  # gmem_ref: out_scales (m, n_sub)
+          plgpu.RefType(),  # smem_ref: out_scales_smem [cluster_block_m]
+          plgpu.Layout.WG_SPLAT,  # copy_size = actual_size
+          plgpu.Layout.WG_SPLAT,  # offset = start_within_block
+          plgpu.Layout.WG_SPLAT,  # scale_col
+          plgpu.Layout.WG_SPLAT,  # block_start_m
+      ),
+  )
+  def _store(
+      ctx, gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m
+  ):
+    del ctx
+    index = ir.IndexType.get()
+    lane = arith.remui(
+        gpu.thread_id(gpu.Dimension.x), arith.constant(index, 128)
+    )
+    off_i = arith.index_cast(index, offset.registers.item())
+    lim_i = arith.addi(
+        off_i, arith.index_cast(index, copy_size.registers.item())
+    )
+    col_i = arith.index_cast(index, scale_col.registers.item())
+    bs_i = arith.index_cast(index, block_start_m.registers.item())
+    # Loop lanes over rows if cluster_block_m > 128.
+    for row_base in range(0, cluster_block_m, 128):
+      row = (
+          lane
+          if row_base == 0
+          else arith.addi(arith.constant(index, row_base), lane)
+      )
+      cond = arith.andi(
+          arith.cmpi(arith.CmpIPredicate.sge, row, off_i),
+          arith.cmpi(arith.CmpIPredicate.slt, row, lim_i),
+      )
+      with mgpu.utils.when(cond):
+        gmem_m = arith.addi(bs_i, row)
+        val = memref_dialect.load(smem_ref, [row])
+        memref_dialect.store(val, gmem_ref, [gmem_m, col_i])
+
+  return _store(gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m)
+
+
 @jaxtyping.jaxtyped
 def ragged_dot_gpu_fp8_quant_blackwell_kernel(
     lhs: Float[qwix.QArray, "M K"],
@@ -207,7 +262,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
     out_dtype,
     config: common.Config,
     activation: base.ActivationFunction | None = None,
-) -> Float[Array, "M N"]:
+) -> Float[Array, "M N"] | qwix.QArray:
   """Returns the Pallas kernel for fp8xint4 ragged dot.
 
   The kernel is using the trick of biased fp8 encoding to avoid explicit
@@ -295,6 +350,35 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         f"Only supported rhs to be int4, got: {rhs.dtype=}."
     )
 
+  # Optional fused output quantization (bf16 acc -> fp8 QArray). One CTA owns one
+  # `block_n` N-tile, so the output subchannel must equal `block_n`.
+  epilogue_quant_subchannel_size = config.epilogue_quant_subchannel_size
+  epilogue_quant_enabled = config.epilogue_quant_qtype is not None
+  # Quantize the same bf16 values the unfused path would; scale stored in bf16.
+  epilogue_quant_input_dtype = jnp.bfloat16
+  epilogue_quant_dtype = None
+  if epilogue_quant_enabled != (epilogue_quant_subchannel_size is not None):
+    raise NotImplementedError(
+        "epilogue_quant_qtype and epilogue_quant_subchannel_size must be set"
+        " together."
+    )
+  if epilogue_quant_enabled:
+    if epilogue_quant_subchannel_size != block_n:
+      raise NotImplementedError(
+          "Fused output quantization requires subchannel == block_n"
+          f" ({block_n}); got {epilogue_quant_subchannel_size=}. (Larger"
+          " subchannels need a collective/cross-CTA reduction.)"
+      )
+    epilogue_quant_dtype = jnp.dtype(config.epilogue_quant_qtype)
+    if epilogue_quant_dtype != jnp.float8_e4m3fn:
+      raise NotImplementedError(
+          f"Unsupported epilogue_quant_qtype={config.epilogue_quant_qtype!r}."
+      )
+    if n % epilogue_quant_subchannel_size != 0:
+      raise NotImplementedError(
+          f"n must be divisible by {epilogue_quant_subchannel_size=}, got {n=}."
+      )
+
   if tile_k % block_k != 0:
     raise NotImplementedError(
         f"tile_k must be multiple of block_k, got: {tile_k=} {block_k=}."
@@ -361,6 +445,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
 
   x, scales = lhs.qvalue, lhs.scale
   expected_d = k_x // tile_k
+
   if scales.shape[1] == 2 * expected_d:
     scales = scales.mT
     x_scales, x_sum = jnp.split(scales, 2, axis=0)
@@ -372,8 +457,17 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
 
   tile_xk = k_x // x_scales.shape[0]
 
-  if tile_xk != tile_k:
-    raise NotImplementedError(f"tile must be equal, got: {tile_xk=} {tile_k=}.")
+  # The activation subchannel may be finer than the weight subchannel, as long as
+  # it divides it and each block_k tile stays within one activation subchannel.
+  if tile_k % tile_xk != 0:
+    raise NotImplementedError(
+        "Activation subchannel (tile_xk) must divide weight subchannel"
+        f" (tile_k), got: {tile_xk=} {tile_k=}."
+    )
+  if tile_xk % block_k != 0:
+    raise NotImplementedError(
+        f"tile_xk must be a multiple of block_k, got: {tile_xk=} {block_k=}."
+    )
 
   m_iters = pl.cdiv(m, cluster_block_m) + num_groups - 1
   n_iters = pl.cdiv(n, cluster_block_n)
@@ -382,6 +476,9 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
       group_sizes, cluster_block_m, m_iters, align_tile
   )
   def kernel(*refs, scoped):
+    # Epilogue mode appends an out-scales output; it is the LAST ref/buffer.
+    refs = list(refs)
+    out_scales_gmem = refs.pop() if epilogue_quant_enabled else None
     (
         x_gmem,
         x_sum_gmem,
@@ -398,6 +495,8 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         scratch_buffers,
         barriers,
     ) = scoped
+    scratch_buffers = list(scratch_buffers)
+    out_scales_smem = scratch_buffers.pop() if epilogue_quant_enabled else None
     (
         x_smem,
         xs_smem,
@@ -518,7 +617,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
               def do_tma_xs(ki, slot):
                 plgpu.copy_gmem_to_smem(
                     x_scales_gmem.at[
-                        lax.div(block_k * ki, tile_k),
+                        lax.div(block_k * ki, tile_xk),
                         pl.ds(block_start, max(cluster_block_m, 64)),
                     ],
                     xs_smem.at[slot],
@@ -693,13 +792,55 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
             acc_carry = activation(acc_carry)
 
           with jax.named_scope("acc -> SMEM"):
-            out_smem.T[...] = plgpu.layout_cast(
-                acc_carry.astype(out_smem.dtype),
-                plgpu.Layout.TCGEN05_TRANSPOSED,
-            )
+            if not epilogue_quant_enabled:
+              out_smem.T[...] = plgpu.layout_cast(
+                  acc_carry.astype(out_smem.dtype),
+                  plgpu.Layout.TCGEN05_TRANSPOSED,
+              )
+            else:
+              assert out_scales_smem is not None
+              quant_t_dtype = jnp.float32
+              qmax = float(jnp.finfo(epilogue_quant_dtype).max)
+              acc_t = plgpu.layout_cast(
+                  acc_carry.astype(quant_t_dtype), _TCGEN05_TRANSPOSED
+              )
+              absmax = jnp.abs(acc_t).max(axis=0).astype(jnp.float32)  # [m]
+              out_scale = jnp.where(
+                  absmax == 0.0, jnp.array(1.0, absmax.dtype), absmax / qmax
+              )
+              # Round the scale to its storage dtype once and divide by exactly
+              # that value, so q * stored_scale round-trips.
+              out_scale_q = out_scale.astype(out_scales_smem.dtype)
+              inv = plgpu.layout_cast(
+                  lax.broadcast_in_dim(
+                      1.0 / out_scale_q.astype(jnp.float32),
+                      acc_carry.shape,
+                      [1],
+                  ),
+                  _TCGEN05_TRANSPOSED,
+              )
+              q = acc_t.astype(jnp.float32) * inv
+              q = jnp.clip(q, -qmax, qmax)
+              out_smem.T[...] = q.astype(epilogue_quant_dtype)
+              out_scales_smem[...] = out_scale_q
             plgpu.commit_smem()
 
           with jax.named_scope("SMEM -> GMEM"):
+            if epilogue_quant_enabled:
+              # Scatter scales before value TMA to overlap GMEM stores.
+              scale_col = lax.div(
+                  tid_n * cluster_block_n + cluster_idx * block_n,
+                  epilogue_quant_subchannel_size,
+              )
+              _write_scales_to_gmem(
+                  out_scales_gmem,
+                  out_scales_smem,
+                  actual_size,
+                  start_within_block,
+                  scale_col,
+                  block_start,
+                  cluster_block_m,
+              )
             # Write out the largest power of two rows first,
             # then the next largest, etc.
             # This allows us to coalesce writes as much as possible.
@@ -757,17 +898,26 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         (scale_stages, max(cluster_block_m, 64)),
         dtype=x_sum.dtype,
     )
+    out_smem_dtype = (
+        epilogue_quant_dtype if epilogue_quant_enabled else out_dtype
+    )
     out_smem = plgpu.SMEM(
         (cluster_block_m, block_n),
-        dtype=out_dtype,
+        dtype=out_smem_dtype,
         # workaround for ValueError: Dynamic slice base index (which is a
         # dynamic value) cannot be statically proven to be divisible by
         # the tiling (8)
         transforms=(
-            plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
+            plgpu.TilingTransform(
+                (1, 128 // jnp.dtype(out_smem_dtype).itemsize)
+            ),
             plgpu.SwizzleTransform(128),
         ),
     )
+    if epilogue_quant_enabled:
+      out_scales_smem = plgpu.SMEM(
+          (cluster_block_m,), dtype=epilogue_quant_input_dtype
+      )
     acc_tmem = plgpu.TMEM(
         (block_n, acc_stages * cluster_block_m),
         dtype=jnp.float32,
@@ -808,18 +958,21 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
           num_barriers=acc_stages, orders_tensor_core=True
       )
 
+    scratch = [
+        x_smem,
+        xs_smem,
+        x_sum_smem,
+        w_smem,
+        ws_smem,
+        w_tmem,
+        out_smem,
+        acc_tmem,
+    ]
+    if epilogue_quant_enabled:
+      scratch.append(out_scales_smem)  # LAST, matches the pop() in kernel()
     pl.run_scoped(
         lambda *args: kernel(*refs, scoped=args),
-        (
-            x_smem,
-            xs_smem,
-            x_sum_smem,
-            w_smem,
-            ws_smem,
-            w_tmem,
-            out_smem,
-            acc_tmem,
-        ),
+        tuple(scratch),
         (
             x_barrier,
             x_consumed_barrier,
@@ -838,9 +991,21 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
   profile = False
   num_sms = backend.get_default_device().core_count
   num_sms = num_sms // 2 if profile else num_sms
+  if epilogue_quant_enabled:
+    # Scales in (m, n_subchannels) order: the scatter is uncoalesced anyway, so
+    # m-major is free here and avoids a transpose-on-return.
+    out_type = (
+        jax.ShapeDtypeStruct((m, n), epilogue_quant_dtype),
+        jax.ShapeDtypeStruct(
+            (m, n // epilogue_quant_subchannel_size),
+            epilogue_quant_input_dtype,
+        ),
+    )
+  else:
+    out_type = jax.ShapeDtypeStruct((m, n), jnp.bfloat16)
   f = plgpu.kernel(
       kernel_entry,
-      out_type=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
+      out_type=out_type,
       num_threads=_DEQ_WG + 2,
       thread_name="wg",
       grid=(num_sms // 2,) if collective else (num_sms,),
@@ -855,7 +1020,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
           profile_dir="sponge" if profile else "",
       ),
   )
-  return f(
+  out = f(
       x,
       x_sum,
       x_scales,
@@ -866,3 +1031,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
       group_info.actual_size,
       group_info.block_start,
   )
+  if epilogue_quant_enabled:
+    qvalue, scales = out
+    return qwix.QArray(qvalue, scales, qtype=epilogue_quant_dtype)
+  return out
