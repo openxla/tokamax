@@ -72,7 +72,7 @@ class TriangleMultiplicationTest(parameterized.TestCase):
         api.triangle_multiplication(
             **params,
             triangle_type="incoming",
-            implementation="unsupported",
+            implementation="unsupported",  # pyrefly: ignore[bad-argument-type]
         )
 
 

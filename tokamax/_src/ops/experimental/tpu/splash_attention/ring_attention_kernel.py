@@ -55,11 +55,11 @@ def _dynamic_slice_mask_info(
     return lax.dynamic_slice_in_dim(arr, start_idx, shard_len, axis=-1)
 
   return MaskInfo(
-      mask_next=slice_if_exists(mask_info.mask_next),
-      active_rows=slice_if_exists(mask_info.active_rows),
-      active_cols=slice_if_exists(mask_info.active_cols),
-      num_active_blocks=slice_if_exists(mask_info.num_active_blocks),
-      block_mask=slice_if_exists(mask_info.block_mask),
+      mask_next=slice_if_exists(mask_info.mask_next),  # pyrefly: ignore[bad-argument-type]
+      active_rows=slice_if_exists(mask_info.active_rows),  # pyrefly: ignore[bad-argument-type]
+      active_cols=slice_if_exists(mask_info.active_cols),  # pyrefly: ignore[bad-argument-type]
+      num_active_blocks=slice_if_exists(mask_info.num_active_blocks),  # pyrefly: ignore[bad-argument-type]
+      block_mask=slice_if_exists(mask_info.block_mask),  # pyrefly: ignore[bad-argument-type]
       partial_mask_blocks=mask_info.partial_mask_blocks,  # partial mask blocks are global
       q_sequence=mask_info.q_sequence,  # Q sequence stays stationary
   )
@@ -578,13 +578,13 @@ class RingSplashAttentionKernel:
     _resolve_spec = lambda x: spec if x is not None else None
 
     mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
-        mask_next=_resolve_spec(self.fwd_mask_info.mask_next),
-        active_rows=_resolve_spec(self.fwd_mask_info.active_rows),
-        active_cols=_resolve_spec(self.fwd_mask_info.active_cols),
-        num_active_blocks=_resolve_spec(self.fwd_mask_info.num_active_blocks),
-        block_mask=_resolve_spec(self.fwd_mask_info.block_mask),
-        partial_mask_blocks=jax.sharding.PartitionSpec(),  # replicated
-        q_sequence=_resolve_spec(self.fwd_mask_info.q_sequence),
+        mask_next=_resolve_spec(self.fwd_mask_info.mask_next),  # pyrefly: ignore[bad-argument-type]
+        active_rows=_resolve_spec(self.fwd_mask_info.active_rows),  # pyrefly: ignore[bad-argument-type]
+        active_cols=_resolve_spec(self.fwd_mask_info.active_cols),  # pyrefly: ignore[bad-argument-type]
+        num_active_blocks=_resolve_spec(self.fwd_mask_info.num_active_blocks),  # pyrefly: ignore[bad-argument-type]
+        block_mask=_resolve_spec(self.fwd_mask_info.block_mask),  # pyrefly: ignore[bad-argument-type]
+        partial_mask_blocks=jax.sharding.PartitionSpec(),  # replicated  # pyrefly: ignore[bad-argument-type]
+        q_sequence=_resolve_spec(self.fwd_mask_info.q_sequence),  # pyrefly: ignore[bad-argument-type]
     )
     return RingSplashAttentionKernel(
         mask_info_specs,

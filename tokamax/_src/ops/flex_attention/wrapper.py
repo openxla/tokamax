@@ -84,7 +84,7 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
       mask = mask.as_array(q_indices, k_indices)
       return jnp.ones(shape, dtype=jnp.bool_) if mask is None else mask
 
-    out = self.impl(
+    out = self.impl(  # pyrefly: ignore[no-matching-overload]
         q,
         k,
         v,
