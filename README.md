@@ -33,6 +33,12 @@ And the following for both GPU and TPU:
 *   `tokamax.ragged_dot`
     ([Mixture of Experts](https://arxiv.org/abs/2211.15841)).
 
+The following portable XLA reference implementation is available on all
+platforms:
+
+*   `tokamax.kimi_delta_attention`
+    ([Kimi Delta Attention](https://arxiv.org/abs/2510.26692)).
+
 And the following TPU kernels:
 
 *   `tokamax.linear_softmax_cross_entropy_loss`
