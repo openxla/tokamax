@@ -21,7 +21,7 @@ from jaxtyping import Array, Integer, Key, Real
 
 # TODO: Get rid of this routine.
 def generate_random_data(
-    key: Key, b_dim: int, h_dim: int, v_dim: int, dtype: jnp.dtype = jnp.float32
+    key: Key, b_dim: int, h_dim: int, v_dim: int, dtype: jnp.dtype = jnp.float32  # pyrefly: ignore[invalid-annotation]
 ) -> tuple[Real[Array, "B H"], Integer[Array, "B"], Real[Array, "H V"]]:
   """Generates random data for flash loss tests.
 

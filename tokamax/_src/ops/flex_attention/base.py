@@ -273,7 +273,7 @@ class FlexAttention(
         preferred_element_type=q_k_dot_precision.accumulation_type,
     )
 
-    logits = score_mod(logits)
+    logits = score_mod(logits)  # pyrefly: ignore[not-callable]
 
     if mask_mod is not None:
       # This is not `-inf` as this can lead to `NaN`s when a full softmax row is

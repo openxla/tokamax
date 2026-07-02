@@ -137,7 +137,7 @@ class AutotuningResult:
 
   @classmethod
   def loads(cls, json_data: str) -> Self:
-    return _AUTOTUNING_RESULT_ADAPTER.validate_json(json_data)
+    return _AUTOTUNING_RESULT_ADAPTER.validate_json(json_data)  # pyrefly: ignore[bad-return]
 
   def __enter__(self):
     overlay = {}
@@ -254,9 +254,9 @@ def bound_args_to_json(
     filename: str,
 ) -> None:
   """Dumps a sequence of BoundArguments to a JSON file."""
-  bound_args = get_bound_args(f)
+  bound_args = get_bound_args(f)  # pyrefly: ignore[invalid-param-spec]
   json_string = dump_bound_args_to_json(bound_args)
-  with open(filename, "w") as f:
+  with open(filename, "w") as f:  # pyrefly: ignore[bad-argument-type]
     f.write(json_string)
 
 

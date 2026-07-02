@@ -69,7 +69,7 @@ class AutotuningData(
       return_data = AutotuningData({config: self[config]})
     except ExceptionGroup as e:
       raise e
-    return return_data
+    return return_data  # pyrefly: ignore[bad-return]
 
   def prune_errors(self) -> dict[_Config, BenchmarkData]:
     return {k: v for k, v in self.items() if isinstance(v, BenchmarkData)}  # pytype: disable=bad-return-type
@@ -90,7 +90,7 @@ class AutotuningData(
     )
 
   def __or__(self, other: Self) -> Self:
-    return AutotuningData(super().__or__(other))
+    return AutotuningData(super().__or__(other))  # pyrefly: ignore[bad-return]
 
 
 def _compile(fn_factory, config, args, kwargs, *, seed=None):

@@ -204,14 +204,14 @@ def gated_linear_unit(
                     b_smems[i].at[slot],
                     consumed_barriers[i].at[slot],
                     accumulate=(ki > 0),
-                    collective_axis=collective_axes,
+                    collective_axis=collective_axes,  # pyrefly: ignore[bad-argument-type]
                 )
 
               @pl.when(ki >= k_iters - 1)
               def _arrive():
                 plgpu.tcgen05_commit_arrive(
                     mma_done_barrier.at[acc_slot],
-                    collective_axis=collective_axes,
+                    collective_axis=collective_axes,  # pyrefly: ignore[bad-argument-type]
                 )
 
             lax.fori_loop(0, k_iters, _loop_body, None)
