@@ -75,7 +75,7 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
       debug_mode: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
-  ):
+  ) -> tuple[tuple[jax.Array, jax.Array], None]:
 
     assert config is not None, "Config must be specified."
 
@@ -110,7 +110,7 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
     )
 
   @override
-  def _get_heuristics_config(self, ba):
+  def _get_heuristics_config(self, ba) -> Config:
     return Config(
         num_kv_pages_per_block=16,
         num_queries_per_block=1,
@@ -120,7 +120,7 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
     )
 
   @override
-  def _get_autotuning_configs(self, ba):
+  def _get_autotuning_configs(self, ba) -> set[Config]:
     configs = set()
     for decode_batch_size, kv, q, vmem_size in itertools.product(
         [8],
@@ -140,5 +140,5 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
     return configs
 
   @override
-  def supported_on(self, device):
+  def supported_on(self, device) -> bool:
     return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5

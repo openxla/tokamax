@@ -59,7 +59,8 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
       s_dtype: jax.typing.DTypeLike = jnp.bfloat16,
       debug_mode: bool = False,
       return_residuals: bool = False,
-  ):
+  ) -> op.BoundArguments:
+
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     if num_page_indices % max_num_seqs != 0:
@@ -124,7 +125,7 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
       debug_mode: bool = False,
       return_residuals: bool = False,
       config: _Config | None = None,
-  ):
+  ) -> tuple[tuple[jax.Array, jax.Array], None]:
 
     return (
         reference.mla_attention(
