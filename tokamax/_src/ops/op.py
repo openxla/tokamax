@@ -165,7 +165,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
   def __call__(
       self,
       *args: _P.args,
-      return_residuals: Literal[False] = ...,
+      return_residuals: Literal[False] = ...,  # pyrefly: ignore[bad-function-definition]
       **kwargs: _P.kwargs,
   ) -> _T:
     ...
@@ -174,13 +174,13 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
   def __call__(
       self,
       *args: _P.args,
-      return_residuals: Literal[True],
+      return_residuals: Literal[True],  # pyrefly: ignore[bad-function-definition]
       **kwargs: _P.kwargs,
   ) -> tuple[_T, _R]:
     ...
 
   def __call__(
-      self, *args: _P.args, return_residuals: bool = False, **kwargs: _P.kwargs
+      self, *args: _P.args, return_residuals: bool = False, **kwargs: _P.kwargs  # pyrefly: ignore[bad-function-definition]
   ) -> _T | tuple[_T, _R]:
     """Applies the operation with the given arguments."""
 
@@ -293,7 +293,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     return f(*arrays)
 
   def bind(
-      self, *args: _P.args, return_residuals: bool = False, **kwargs: _P.kwargs
+      self, *args: _P.args, return_residuals: bool = False, **kwargs: _P.kwargs  # pyrefly: ignore[bad-function-definition]
   ) -> "BoundArguments":
     """Binds the op to the given arguments."""
     sig = self._fwd_signature
@@ -355,7 +355,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
         for name, param in ba.signature.parameters.items()
         if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
     )
-    return immutabledict.immutabledict((
+    return immutabledict.immutabledict((  # pyrefly: ignore[bad-return]
         *zip(pos_arg_names, _abstractify(ba.args), strict=True),
         *_abstractify(ba.kwargs).items(),
     ))
@@ -538,7 +538,7 @@ class BoundArguments(Generic[_Config, _Key]):
     try:
       return self.op.get_autotuning_cache()[key]
     except KeyError:
-      json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
+      json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))  # pyrefly: ignore[no-matching-overload]
 
       logging.warning(
           "Autotuning cache miss for %s on %s with key %s",
