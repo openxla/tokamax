@@ -29,13 +29,13 @@ from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu_kernel
 from typing_extensions import override
 
 
-@dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True)
 class Config:
-  num_kv_pages_per_block: pydantic.conint(multiple_of=2, gt=0)  # pyrefly: ignore[invalid-annotation]
-  num_queries_per_block: pydantic.conint(multiple_of=1, gt=0)  # pyrefly: ignore[invalid-annotation]
-  vmem_limit_bytes: pydantic.conint(multiple_of=16, gt=0)  # pyrefly: ignore[invalid-annotation]
-  chunk_prefill_size: pydantic.conint(multiple_of=256, ge=0)  # pyrefly: ignore[invalid-annotation]
-  decode_batch_size: pydantic.conint(multiple_of=1, gt=0)  # pyrefly: ignore[invalid-annotation]
+  num_kv_pages_per_block: pydantic.conint(multiple_of=2, gt=0)
+  num_queries_per_block: pydantic.conint(multiple_of=1, gt=0)
+  vmem_limit_bytes: pydantic.conint(multiple_of=16, gt=0)
+  chunk_prefill_size: pydantic.conint(multiple_of=256, ge=0)
+  decode_batch_size: pydantic.conint(multiple_of=1, gt=0)
 
 
 class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
