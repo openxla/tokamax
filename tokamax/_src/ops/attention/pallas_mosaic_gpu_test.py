@@ -101,7 +101,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
       # SM100 requires block_q=128 and block_kv=128 for the VJP dual kernel.
       # For head_dim=256, this pushes SMEM > 227KB, causing a ValueError.
-      if q.shape[-1] >= 256 and test_vjp:
+      if q.shape[-1] > 256 and test_vjp:
         kwargs["expect_supported"] = False
 
     super()._run_test_with_inputs(q, k, v, bias=bias, **kwargs)
