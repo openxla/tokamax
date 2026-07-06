@@ -40,6 +40,46 @@ QArray = base.QArray
 AsQArray = base.AsQArray
 GroupSizes = base.GroupSizes
 
+# Read quant metadata from a QArray, a lazy AsQArray, or a model-side
+# PreQuantizedInputFusionGPU uniformly. Heuristics run on abstract values, so an
+# AsQArray cannot be materialized to a QArray here.
+def _is_quantized_input(x) -> bool:
+  return (
+      isinstance(x, (QArray, AsQArray))
+      or x.__class__.__name__ == "PreQuantizedInputFusionGPU"
+  )
+
+
+def _input_qtype(x):
+  if isinstance(x, (QArray, AsQArray)):
+    return x.qtype
+  if x.__class__.__name__ == "PreQuantizedInputFusionGPU":
+    return x.buffer.dtype
+  if isinstance(x, jax.Array):
+    return x.dtype
+  return None
+
+
+def _input_quant_bits(x) -> int | None:
+  qtype = _input_qtype(x)
+  if qtype is None:
+    return None
+  try:
+    return jnp.iinfo(qtype).bits
+  except ValueError:
+    return jnp.finfo(qtype).bits
+
+
+def _input_subchannel(x) -> int | None:
+  if isinstance(x, QArray):
+    return x.scale_tile_shape[1]  # contraction-axis (index 1) tile
+  if isinstance(x, AsQArray):
+    return x.tiled_axes.get(1) if x.tiled_axes else None
+  if x.__class__.__name__ == "PreQuantizedInputFusionGPU":
+    return x.subchannel_size
+  return None
+
+
 # TODO: Directly import ManualAxisType JAX is upgraded.
 try:
   from jax.sharding import ManualAxisType
@@ -56,6 +96,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
+  enable_fused_epilogue_quant: bool = False
 
   def __post_init__(self):
     if self.vjp is None:
@@ -163,7 +204,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
             # make sure output is bfloat16 since we may want to store lhs.scale
             # as float32 to avoid in-kernel conversion.
-            if preferred_element_type is None:
+            if (
+                preferred_element_type is None
+                or preferred_element_type == jnp.float8_e4m3fn
+            ):
               preferred_element_type = rhs.dtype
           else:
             # dequantize lhs to fallback to non-lhs-quantized kernel
@@ -236,10 +280,18 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     lhs, rhs = ba.args
+    _is_fp8 = lambda x: _input_qtype(x) == jnp.float8_e4m3fn
+    _is_int8 = lambda x: _input_qtype(x) == jnp.int8
+
     # avoid OOMs by having too large block_k
-    block_k = (
-        min(rhs.scale_tile_shape[1], 256) if isinstance(rhs, QArray) else 128
-    )
+    rhs_subchannel = _input_subchannel(rhs)
+    block_k = min(rhs_subchannel, 256) if rhs_subchannel is not None else 128
+    if gpu_utils.is_sm100():
+      # Clamp to the activation subchannel so a finer lhs (e.g. fp8 output of a
+      # previous dot) keeps `tile_xk % block_k == 0`.
+      lhs_subchannel = _input_subchannel(lhs)
+      if lhs_subchannel is not None:
+        block_k = min(block_k, lhs_subchannel)
 
     if gpu_utils.is_sm90():
       return Config(
@@ -248,30 +300,37 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           block_k=block_k,
           num_stages=2,
           split_k=1,
-          persistent=isinstance(rhs, QArray),
+          persistent=_is_quantized_input(rhs),
           grid_minor_dim=common.MatmulDimension.M,
           grid_tile_width=1,
       )
     elif gpu_utils.is_sm100():
-      if isinstance(rhs, QArray):
-        if isinstance(lhs, QArray):
-          if lhs.qtype == jnp.int8:
-            return Config(
-                block_m=16,
-                block_n=128,
-                block_k=block_k,
-                num_stages=2,
-                split_k=1,
-            )
-          elif lhs.qtype == jnp.float8_e4m3fn:
-            return Config(
-                block_m=16,
-                block_n=128,
-                block_k=block_k,
-                collective=False,
-                num_stages=2,
-                split_k=1,
-            )
+      if _is_quantized_input(rhs):
+        if _is_int8(lhs):
+          return Config(
+              block_m=16,
+              block_n=128,
+              block_k=block_k,
+              num_stages=2,
+              split_k=1,
+          )
+        elif _is_fp8(lhs):
+          preferred_element_type = ba.arguments.get("preferred_element_type")
+          epilogue_quant_qtype = None
+          epilogue_quant_subchannel_size = None
+          if self.enable_fused_epilogue_quant and preferred_element_type == jnp.float8_e4m3fn:
+            epilogue_quant_qtype = jnp.float8_e4m3fn
+            epilogue_quant_subchannel_size = 128
+          return Config(
+              block_m=16,
+              block_n=128,
+              block_k=block_k,
+              collective=False,
+              num_stages=2,
+              split_k=1,
+              epilogue_quant_qtype=epilogue_quant_qtype,
+              epilogue_quant_subchannel_size=epilogue_quant_subchannel_size,
+          )
         return Config(
             block_m=64,
             block_n=128,
@@ -304,9 +363,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     # Adjusted block_k for float16/bfloat16
     lhs, rhs = ba.args[:2]
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
-    if isinstance(rhs, QArray):
-      rhs_dtype_bits = jnp.iinfo(rhs.qvalue.dtype).bits
-      scale_tile_shape = rhs.scale_tile_shape[1]
+    if _is_quantized_input(rhs):
+      rhs_dtype_bits = _input_quant_bits(rhs)
+      scale_tile_shape = _input_subchannel(rhs) or 0
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
       scale_tile_shape = 0
@@ -349,9 +408,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   def _get_sm100_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     lhs, rhs = ba.args[:2]
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
-    if isinstance(rhs, QArray):
-      rhs_dtype_bits = jnp.iinfo(rhs.qvalue.dtype).bits
-      scale_tile_shape = rhs.scale_tile_shape[1]
+    if _is_quantized_input(rhs):
+      rhs_dtype_bits = _input_quant_bits(rhs)
+      scale_tile_shape = _input_subchannel(rhs) or 0
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
       scale_tile_shape = 0
@@ -384,6 +443,14 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         collective_choices: list[bool],
         post_scale_choices: list[bool],
     ):
+      epilogue_quant_qtype = None
+      epilogue_quant_subchannel_size = None
+
+      preferred_element_type = ba.arguments.get("preferred_element_type")
+      if self.enable_fused_epilogue_quant and preferred_element_type == jnp.float8_e4m3fn:
+        epilogue_quant_qtype = jnp.float8_e4m3fn
+        epilogue_quant_subchannel_size = 128
+
       for block_m in block_m_choices:
         for block_k in block_k_choices:
           for num_stages in num_stages_choices:
@@ -405,12 +472,14 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
                               grid_minor_dim=grid_minor_dim,
                               grid_tile_width=grid_tile_width,
                               split_m=split_m,
+                              epilogue_quant_qtype=epilogue_quant_qtype,
+                              epilogue_quant_subchannel_size=epilogue_quant_subchannel_size,
                           )
                       )
       return configs
 
-    if isinstance(lhs, QArray):
-      if lhs.qtype in [jnp.int8, jnp.float8_e4m3fn]:
+    if _is_quantized_input(lhs):
+      if _input_qtype(lhs) in [jnp.int8, jnp.float8_e4m3fn]:
         configs = _generate_configs(
             configs,
             block_m_choices=[8, 16, 32],
