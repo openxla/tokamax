@@ -335,7 +335,7 @@ def flash_attention_kernel(
           else:
             plgpu.barrier_wait(mask_barrier.at[si])
             if mask_smem.ndim == 2:
-              mask = plgpu.load(mask_smem, si, layout=_WGMMA_COL)
+              mask = plgpu.load(mask_smem.at[si], layout=_WGMMA_COL)
               mask = lax.broadcast_in_dim(mask, s.shape, [1])
             else:
               mask = mask_smem[si, block.ds(wg, block_q)]

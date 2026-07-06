@@ -167,7 +167,7 @@ def ragged_dot_quantized_kernel(
                     w_layout = _WGMMA_UPCAST_4X
                   case _:
                     w_layout = _WGMMA
-                w = plgpu.load(w_smem, (si, ns), layout=w_layout)
+                w = plgpu.load(w_smem.at[si, ns], layout=w_layout)
                 plgpu.barrier_arrive(w_consumed_barrier.at[si])
                 w = plgpu.layout_cast(w, _WGMMA).astype(w_scales.dtype)
                 w *= lax.broadcast_in_dim(w_scales, w.shape, [0])
@@ -180,7 +180,7 @@ def ragged_dot_quantized_kernel(
                 si = lax.rem(ki + 1, num_stages)
                 with jax.named_scope("wait W"):
                   plgpu.barrier_wait(w_barrier.at[si])
-                return plgpu.load(w_scales_smem, (si, ns), layout=_WGMMA_ROW)
+                return plgpu.load(w_scales_smem.at[si, ns], layout=_WGMMA_ROW)
 
               carry = lax.cond(ki + 1 < k_iters, load_scales, lambda: w_scales)
 
@@ -189,7 +189,7 @@ def ragged_dot_quantized_kernel(
               plgpu.barrier_arrive(x_consumed_barrier.at[si])
               return carry
 
-            w_scales0 = plgpu.load(w_scales_smem, (0, ns), layout=_WGMMA_ROW)
+            w_scales0 = plgpu.load(w_scales_smem.at[0, ns], layout=_WGMMA_ROW)
             lax.fori_loop(0, k_iters, k_loop_body, init_val=w_scales0)
             return acc[...]
 

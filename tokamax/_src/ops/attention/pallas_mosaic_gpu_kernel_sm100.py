@@ -404,7 +404,7 @@ def flash_attention_kernel(
           lax.min(hi, k_range_ref.shape[-2] - 1),
           0 if k_range_ref.shape[-1] == 1 else qi,
       )
-      return plgpu.load(k_range_ref, idx=idx, layout=plgpu.Layout.WG_SPLAT)
+      return plgpu.load(k_range_ref.at[idx], layout=plgpu.Layout.WG_SPLAT)
 
     if k_start_minmax_gmems is None:
       k_start_max = None
@@ -610,7 +610,9 @@ def flash_attention_kernel(
             plgpu.barrier_wait(mask_barrier)
             idx = (slice(None), slice(0, mask_block_kv))
             layout = _TMEM(32 // _MASK_PACKED_BITS)
-            mask_ = plgpu.load(mask_smem, idx, layout=layout, optimized=False)
+            mask_ = plgpu.load(
+                mask_smem.at[idx], layout=layout, optimized=False
+            )
             plgpu.barrier_arrive(mask_consumed_barrier)
             mask &= common.unpack_bool_bits_tmem_native(mask_)
 
@@ -644,7 +646,7 @@ def flash_attention_kernel(
             bias = common.load_bcast(bias_gmem, (hi_, qs, ks), layout=_TMEM)
           else:
             plgpu.barrier_wait(bias_barrier)
-            bias = plgpu.load(bias_smem, (), layout=_TMEM, optimized=False)
+            bias = plgpu.load(bias_smem, layout=_TMEM, optimized=False)
             plgpu.barrier_arrive(bias_consumed_barrier)
 
           plgpu.wait_load_tmem()
@@ -745,7 +747,7 @@ def flash_attention_kernel(
         acc_tiles = two_in_flight(load_acc_tiles())
         ds, acc = next(acc_tiles)
         mgpu_lib.bar_sync(slot + _ALPHA_BARRIER_OFFSET, num_threads=256)
-        alpha = plgpu.load(alpha_smem, slot, layout=_TMEM_ROW)
+        alpha = plgpu.load(alpha_smem.at[slot], layout=_TMEM_ROW)
         needs_rescale = (
             (rescale_threshold == 1.0)
             | (alpha < rescale_threshold)
@@ -800,7 +802,7 @@ def flash_attention_kernel(
         def write_acc():
           if normalize_output:
             mgpu_lib.bar_sync(_L_BARRIER_ID, num_threads=256)
-            l_i = plgpu.load(li_smem, (), layout=_TCGEN05_ROW)
+            l_i = plgpu.load(li_smem, layout=_TCGEN05_ROW)
             l_rcp = 1.0 / (l_i + float(jnp.finfo(jnp.float32).tiny))
             l_rcp = lax.broadcast_in_dim(l_rcp, acc_tmem.shape, [0])
           else:
