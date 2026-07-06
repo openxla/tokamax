@@ -15,6 +15,8 @@
 
 """Benchmarks for attention."""
 
+import json
+import os
 import time
 
 from absl import flags
@@ -25,7 +27,6 @@ import jax
 import jax.numpy as jnp
 import tokamax
 from tokamax.benchmarks import common
-
 
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
     'tensorboard_output_env_var',
@@ -147,13 +148,16 @@ class AttentionBenchmark(parameterized.TestCase):
           ),
       )
 
-    # TODO: Add this to the proto once generic metadata is
-    # supported.
-    if implementation == 'cudnn':
-      logging.info(
-          'cudnn_version=%s',
-          jax._src.lib.cuda_versions.cudnn_get_version(),  # pylint: disable=protected-access # pytype: disable=attribute-error
-      )
+    metadata_dir = os.environ.get('WORKLOAD_METADATA_DIR')
+    if metadata_dir:
+      # Values must be strings as per the BenchmarkResult schema
+      metadata: dict[str, str] = {}
+      if implementation == 'cudnn':
+        cudnn_version = jax._src.lib.cuda_versions.cudnn_get_version()  # pylint: disable=protected-access
+        metadata['cudnn_version'] = str(cudnn_version)
+
+      with open(os.path.join(metadata_dir, 'workload_info.json'), 'w') as f:
+        json.dump(metadata, f)
 
 
 if __name__ == '__main__':
