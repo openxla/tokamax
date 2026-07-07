@@ -14,6 +14,7 @@
 # ==============================================================================
 """Configuration options."""
 
+# pylint: disable=unused-import
 from tokamax._src.config import (
     autotuning_cache_miss_fallback as autotuning_cache_miss_fallback,
     cross_compile as cross_compile,

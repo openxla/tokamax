@@ -15,7 +15,7 @@
 """Layer Normalization API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias, cast
+from typing import Any, Final, Literal, TypeAlias
 
 from absl import logging
 import immutabledict

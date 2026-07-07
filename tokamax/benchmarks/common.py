@@ -14,7 +14,6 @@
 # ==============================================================================
 
 import os
-from typing import Literal
 from typing import Sequence
 
 from absl import logging

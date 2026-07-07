@@ -33,7 +33,7 @@ import pydantic
 import pydantic_core
 from pydantic_core import core_schema as cs
 from tokamax._src import batching
-from typing_extensions import TypedDict, override  # Required for Python <3.12.
+from typing_extensions import TypedDict  # Required for Python <3.12.
 
 # TODO: Directly import ManualAxisType JAX is upgraded.
 try:

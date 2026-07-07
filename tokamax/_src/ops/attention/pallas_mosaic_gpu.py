@@ -25,7 +25,6 @@ from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-impo
 from tokamax._src import batching
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
-from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op

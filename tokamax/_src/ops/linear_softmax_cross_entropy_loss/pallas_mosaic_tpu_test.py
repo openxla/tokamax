@@ -22,7 +22,6 @@ from tokamax._src.ops.linear_softmax_cross_entropy_loss.base import (
 )
 from tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu import (
     PallasMosaicTpuLinearSoftmaxCrossEntropyLoss,
-    get_tpu_specific_default_config,
 )
 from tokamax._src.ops.linear_softmax_cross_entropy_loss.test_utils import (
     generate_random_data,
