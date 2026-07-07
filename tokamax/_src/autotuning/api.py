@@ -248,7 +248,7 @@ def dump_bound_args_to_json(bound_args: Sequence[op_lib.BoundArguments]) -> str:
 
 def bound_args_to_json(
     f: (
-        Callable[_P, Any]
+        Callable[[], Any]
         | jax.stages.Lowered
     ),
     filename: str,
@@ -256,8 +256,8 @@ def bound_args_to_json(
   """Dumps a sequence of BoundArguments to a JSON file."""
   bound_args = get_bound_args(f)  # pyrefly: ignore[invalid-param-spec]
   json_string = dump_bound_args_to_json(bound_args)
-  with open(filename, "w") as f:  # pyrefly: ignore[bad-argument-type]
-    f.write(json_string)
+  with open(filename, "w") as fd:
+    fd.write(json_string)
 
 
 def bound_args_from_json(json_string: str) -> list[op_lib.BoundArguments]:

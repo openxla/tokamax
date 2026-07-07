@@ -49,7 +49,7 @@ def _alphafold_oss_inference_spec(
               vmap_axes=vmap_axes,
           ),
           'mask': Mask(
-              BatchedShapeDtype(
+              BatchedShapeDtype(  # pyrefly: ignore[bad-argument-type]
                   (batch_size, 1, 1, seq_len), bool, vmap_axes=vmap_axes_mask
               )
           ),
@@ -154,7 +154,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
                 'k': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
                 'v': ShapeDtype((384, 384, 4, 32), jnp.bfloat16),
                 'bias': ShapeDtype((1, 4, 384, 384), jnp.bfloat16),
-                'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
+                'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),  # pyrefly: ignore[bad-argument-type]
             },
             project='alphafold',
             name='384x384x4x32',
@@ -165,7 +165,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
                 'k': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
                 'v': ShapeDtype((384, 384, 4, 64), jnp.bfloat16),
                 'bias': ShapeDtype((1, 4, 384, 384), jnp.bfloat16),
-                'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),
+                'mask': Mask(ShapeDtype((384, 1, 1, 384), bool)),  # pyrefly: ignore[bad-argument-type]
             },
             project='alphafold',
             name='384x384x4x64',
@@ -177,7 +177,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
                 'k': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
                 'v': ShapeDtype((768, 768, 4, 64), jnp.bfloat16),
                 'bias': ShapeDtype((1, 4, 768, 768), jnp.bfloat16),
-                'mask': Mask(ShapeDtype((768, 1, 1, 768), bool)),
+                'mask': Mask(ShapeDtype((768, 1, 1, 768), bool)),  # pyrefly: ignore[bad-argument-type]
             },
             project='alphafold',
             name='768x768x4x64',

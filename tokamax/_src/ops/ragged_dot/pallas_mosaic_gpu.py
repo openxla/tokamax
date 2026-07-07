@@ -16,7 +16,7 @@
 
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -60,10 +60,8 @@ def _input_qtype(x):
   return None
 
 
-def _input_quant_bits(x) -> int | None:
-  qtype = _input_qtype(x)
-  if qtype is None:
-    return None
+def _input_quant_bits(x) -> int:
+  assert (qtype := _input_qtype(x)) is not None
   try:
     return jnp.iinfo(qtype).bits
   except ValueError:
@@ -71,10 +69,11 @@ def _input_quant_bits(x) -> int | None:
 
 
 def _input_subchannel(x) -> int | None:
+  if isinstance(x, AsQArray):
+    x_flat, x_tree = jax.tree.flatten(x)
+    x = jax.eval_shape(lambda xs: x_tree.unflatten(xs).as_qarray(), x_flat)
   if isinstance(x, QArray):
     return x.scale_tile_shape[1]  # contraction-axis (index 1) tile
-  if isinstance(x, AsQArray):
-    return x.tiled_axes.get(1) if x.tiled_axes else None
   if x.__class__.__name__ == "PreQuantizedInputFusionGPU":
     return x.subchannel_size
   return None
@@ -82,7 +81,7 @@ def _input_subchannel(x) -> int | None:
 
 # TODO: Directly import ManualAxisType JAX is upgraded.
 try:
-  from jax.sharding import ManualAxisType
+  from jax.sharding import ManualAxisType  # pylint: disable=g-import-not-at-top,g-importing-member
 except ImportError:
   ManualAxisType = Any
 
@@ -147,13 +146,13 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           " or rhs_quantization_dtype."
       )
 
-    if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
-      rhs = rhs.mT  # TODO: Fuse transpose into kernel.
-      ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
-
     # None of the kernels support zero point yet.
     lhs = quantization.as_array_or_qarray_without_zero_point(lhs)
     rhs = quantization.as_array_or_qarray_without_zero_point(rhs)
+
+    if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
+      rhs = rhs.mT  # TODO: Fuse transpose into kernel.
+      ragged_dot_dimension_numbers = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 
     fn = None
 
@@ -235,13 +234,14 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       )
 
     dot_out = fn(
-        lhs,
-        rhs,
+        lhs,  # pyrefly: ignore[bad-argument-type]
+        rhs,  # pyrefly: ignore[bad-argument-type]
         group_sizes,
         preferred_element_type,
         config,
         activation=activation if not return_residuals else None,
     )
+    dot_out = cast(jax.Array, dot_out)  # FIXME
     residuals = dot_out
     if activation is not None and return_residuals:
       dot_out = activation(dot_out)
@@ -268,14 +268,14 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         )
         new_lhs = QArray(
             qvalue=lhs.qvalue,
-            scale=new_scale,
+            scale=new_scale,  # pyrefly: ignore[bad-argument-type]
             zero_point=lhs.zero_point,
             qtype=lhs.qtype,
         )
         new_arguments = dict(ba.arguments)
         new_arguments["lhs"] = new_lhs
         ba = dataclasses.replace(ba, arguments=new_arguments)
-    return base.RaggedDot._get_autotuning_cache_key(self, ba)
+    return base.RaggedDot._get_autotuning_cache_key(self, ba)  # pylint: disable=protected-access
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
