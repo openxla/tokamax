@@ -56,6 +56,25 @@ EXAMPLES = {
 }
 
 
+def setUpModule():  # pylint: disable=invalid-name
+  """Runs once before any tests in this module start."""
+  metadata_dir = os.environ.get('WORKLOAD_METADATA_DIR')
+  if not metadata_dir:
+    return
+
+  metadata: dict[str, str] = {}
+  if jax.default_backend() == 'gpu':
+    try:
+      cudnn_version = jax._src.lib.cuda_versions.cudnn_get_version()  # pylint: disable=protected-access
+      metadata['cudnn_version'] = str(cudnn_version)
+    except AttributeError:
+      pass
+
+  if metadata:
+    with open(os.path.join(metadata_dir, 'workload_info.json'), 'w') as f:
+      json.dump(metadata, f)
+
+
 class AttentionBenchmark(parameterized.TestCase):
   """Benchmarks for different attention implementations."""
 
@@ -147,17 +166,6 @@ class AttentionBenchmark(parameterized.TestCase):
               f'attention/{args_spec_name}/mosaic/forward_and_vjp/autotuned'
           ),
       )
-
-    metadata_dir = os.environ.get('WORKLOAD_METADATA_DIR')
-    if metadata_dir:
-      # Values must be strings as per the BenchmarkResult schema
-      metadata: dict[str, str] = {}
-      if implementation == 'cudnn':
-        cudnn_version = jax._src.lib.cuda_versions.cudnn_get_version()  # pylint: disable=protected-access
-        metadata['cudnn_version'] = str(cudnn_version)
-
-      with open(os.path.join(metadata_dir, 'workload_info.json'), 'w') as f:
-        json.dump(metadata, f)
 
 
 if __name__ == '__main__':
