@@ -17,6 +17,7 @@
 # pylint: disable=invalid-name
 
 import math
+from typing import Annotated
 
 import jax
 from jax import lax
@@ -56,7 +57,7 @@ class Config(vjp_common.Config):
   eltwise_stages: pydantic.PositiveInt = 1
   double_buffer: bool = False
   residual_stages: pydantic.PositiveInt = 2
-  chunk_size: pydantic.conint(multiple_of=32, ge=32) = 64
+  chunk_size: Annotated[int, pydantic.Field(multiple_of=32, ge=32)] = 64
   load_residuals_in_regs: bool = False
 
 

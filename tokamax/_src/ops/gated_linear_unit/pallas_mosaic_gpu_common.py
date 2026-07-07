@@ -15,6 +15,8 @@
 """Common definitions for Pallas-Mosaic-GPU Gated Linear Unit."""
 
 import enum
+from typing import Annotated
+
 import pydantic
 
 
@@ -47,8 +49,8 @@ class Config:
     cluster_size_n: The size of the cluster in the N dimension.
   """
 
-  tile_m: pydantic.conint(ge=64, multiple_of=64) = 128  # pyrefly: ignore[invalid-annotation]
-  tile_n: pydantic.conint(ge=64, multiple_of=64) = 128  # pyrefly: ignore[invalid-annotation]
+  tile_m: Annotated[int, pydantic.Field(ge=64, multiple_of=64)] = 128
+  tile_n: Annotated[int, pydantic.Field(ge=64, multiple_of=64)] = 128
   tile_k: pydantic.PositiveInt = 128
   num_stages: pydantic.PositiveInt = 4
   epi_tile_n: pydantic.PositiveInt | None = 64
@@ -56,8 +58,8 @@ class Config:
   grid_minor_dim: MatmulDimension = MatmulDimension.N
   grid_tile_width: pydantic.PositiveInt = 1
   wg_dimension: MatmulDimension = MatmulDimension.N
-  cluster_size_m: pydantic.conint(ge=1, le=2) = 1  # pyrefly: ignore[invalid-annotation]
-  cluster_size_n: pydantic.conint(ge=1, le=2) = 1  # pyrefly: ignore[invalid-annotation]
+  cluster_size_m: Annotated[int, pydantic.Field(ge=1, le=2)] = 1
+  cluster_size_n: Annotated[int, pydantic.Field(ge=1, le=2)] = 1
 
   def __post_init__(self):
     if self.cluster_size_m > 1 and self.cluster_size_n > 1:

@@ -18,7 +18,7 @@
 from collections.abc import Sequence
 import dataclasses
 import enum
-from typing import Any
+from typing import Annotated, Any
 
 import jax
 from jax import lax
@@ -47,7 +47,7 @@ class MatmulDimension(enum.IntEnum):
 class Config:
   """Configuration for the ragged dot kernel."""
 
-  block_m: pydantic.conint(multiple_of=8, gt=0)
+  block_m: Annotated[int, pydantic.Field(multiple_of=8, gt=0)]
   block_n: pydantic.PositiveInt
   block_k: pydantic.PositiveInt
   num_stages: pydantic.PositiveInt

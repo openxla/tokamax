@@ -14,7 +14,7 @@
 # ==============================================================================
 """Common utilities for Mosaic GPU attention implementations."""
 
-from typing import Any
+from typing import Annotated, Any
 
 import jax
 from jax.experimental import pallas as pl
@@ -51,8 +51,8 @@ class ConfigBase:
   """
 
   # TODO: Relax block size constraints to multiple of 32.
-  block_q: pydantic.conint(multiple_of=64, gt=0) = 64
-  block_kv: pydantic.conint(multiple_of=64, gt=0) = 64
+  block_q: Annotated[int, pydantic.Field(multiple_of=64, gt=0)] = 64
+  block_kv: Annotated[int, pydantic.Field(multiple_of=64, gt=0)] = 64
   num_stages: pydantic.PositiveInt = 2
   fold_q_sequence_heads: pydantic.StrictBool = False
   split_k: pydantic.PositiveInt = 1

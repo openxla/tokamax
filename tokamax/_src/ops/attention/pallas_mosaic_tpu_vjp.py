@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import itertools
-from typing import Any, ClassVar, Final, TypeAlias
+from typing import Annotated, Any, ClassVar, Final, TypeAlias
 
 import immutabledict
 import jax
@@ -40,9 +40,15 @@ Key: TypeAlias = immutabledict.immutabledict[str, Any]
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_q_dkv: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
-  block_kv_dkv: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
-  block_kv_dkv_compute: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
+  block_q_dkv: Annotated[
+      int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
+  ]
+  block_kv_dkv: Annotated[
+      int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
+  ]
+  block_kv_dkv_compute: Annotated[
+      int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
+  ]
   use_base2_exp: bool = True
 
   def __post_init__(self):

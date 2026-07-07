@@ -16,7 +16,7 @@
 
 import dataclasses
 import itertools
-from typing import Any, ClassVar, TypeAlias
+from typing import Annotated, Any, ClassVar, TypeAlias
 import immutabledict
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -40,9 +40,11 @@ Key: TypeAlias = immutabledict.immutabledict[str, Any]
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_q: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
-  block_kv: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
-  block_kv_compute: pydantic.conint(multiple_of=common.NUM_LANES, gt=0)
+  block_q: Annotated[int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)]
+  block_kv: Annotated[int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)]
+  block_kv_compute: Annotated[
+      int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
+  ]
   q_layout: splash.QKVLayout
   k_layout: splash.QKVLayout
   v_layout: splash.QKVLayout
