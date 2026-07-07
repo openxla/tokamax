@@ -14,7 +14,6 @@
 # ==============================================================================
 
 import dataclasses
-import types
 from typing import Any, ClassVar
 
 from absl.testing import absltest
@@ -78,7 +77,7 @@ _HEURISTICS_CONFIG = _FakeOpConfig(1)
 _AUTOTUNE_CONFIG = _FakeOpConfig(2)
 
 
-class _FakeOp(op_lib.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
+class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
   config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
 
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):

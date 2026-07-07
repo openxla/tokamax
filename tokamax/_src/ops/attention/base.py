@@ -18,7 +18,6 @@ from collections.abc import Callable, Hashable
 import dataclasses
 import functools
 import math
-import types
 from typing import Any, Literal, NotRequired, ParamSpec, TypeVar, TypedDict, cast, overload
 import jax
 from jax import export
@@ -812,7 +811,7 @@ class DotProductAttentionGrads(TypedDict):
 
 
 class DotProductAttentionVjp(
-    op.Op[Any, DotProductAttentionGrads, types.NoneType, _Config, _Key]
+    op.Op[Any, DotProductAttentionGrads, None, _Config, _Key]
 ):
   """Dot product attention VJP."""
 

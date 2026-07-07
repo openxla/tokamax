@@ -14,7 +14,6 @@
 # ==============================================================================
 import dataclasses
 import functools
-import types
 from typing import Any
 
 from absl.testing import absltest
@@ -48,7 +47,7 @@ class _FakeOpConfig:
 _HEURISTICS_CONFIG = _FakeOpConfig(42)
 
 
-class _FakeOp(op_lib.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
+class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
 
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
     return x + y, None

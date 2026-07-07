@@ -14,7 +14,6 @@
 # ==============================================================================
 """Triangle multiplication op."""
 
-import types
 from typing import Any, Literal, TypeAlias, TypeVar
 
 import jax
@@ -30,7 +29,7 @@ from typing_extensions import override
 
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
-Residuals: TypeAlias = types.NoneType
+Residuals: TypeAlias = None
 CanonicalPrecision = precision_lib.CanonicalPrecision
 
 
