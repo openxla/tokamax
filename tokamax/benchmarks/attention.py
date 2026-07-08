@@ -15,10 +15,10 @@
 
 """Benchmarks for attention."""
 
+import functools
 import json
 import os
 import time
-
 from absl import flags
 from absl import logging
 from absl.testing import absltest
@@ -26,7 +26,14 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import tokamax
+from tokamax._src import numerics
 from tokamax.benchmarks import common
+
+try:
+  import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
+except Exception:  # pylint: disable=broad-except
+  cuequivariance_jax = None
+
 
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
     'tensorboard_output_env_var',
@@ -52,8 +59,24 @@ EXAMPLES = {
         'value': jax.ShapeDtypeStruct((768, 768, 4, 64), jnp.bfloat16),
         'bias': jax.ShapeDtypeStruct((1, 4, 768, 768), jnp.bfloat16),
         'mask': jax.ShapeDtypeStruct((768, 1, 1, 768), bool),
+        'scale': 1.25,
     },
 }
+
+
+def _to_cuequivariance(args):
+  """Converts args to cuEquivariance format."""
+  transpose = lambda x: jnp.transpose(x, (0, 2, 1, 3))
+  out = {
+      'q': transpose(args['query']),
+      'k': transpose(args['key']),
+      'v': transpose(args['value']),
+      'bias': args['bias'],
+      'mask': args['mask'],
+  }
+  out = jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), out)
+  out['scale'] = args['scale']
+  return out
 
 
 def setUpModule():  # pylint: disable=invalid-name
@@ -70,6 +93,11 @@ def setUpModule():  # pylint: disable=invalid-name
     except AttributeError:
       pass
 
+    try:
+      metadata['cuequivariance_version'] = cuequivariance_jax.__version__
+    except AttributeError:
+      pass
+
   if metadata:
     with open(os.path.join(metadata_dir, 'workload_info.json'), 'w') as f:
       json.dump(metadata, f)
@@ -79,14 +107,26 @@ class AttentionBenchmark(parameterized.TestCase):
   """Benchmarks for different attention implementations."""
 
   @parameterized.product(
-      implementation=(None, 'triton', 'mosaic', 'cudnn', 'xla', 'xla_chunked'),
+      implementation=(
+          None,
+          'triton',
+          'mosaic',
+          'cudnn',
+          'xla',
+          'xla_chunked',
+          'cuequivariance',
+      ),
       benchmark_mode=('forward', 'forward_and_vjp'),
       args_spec_name=tuple(EXAMPLES.keys()),
   )
   def test_attention(self, implementation, benchmark_mode, args_spec_name):
     """Test attention."""
 
-    logging.info('device_kind=%s', jax.devices()[0].device_kind)
+    if str(implementation) in _SKIP_IMPLEMENTATIONS.value:
+      self.skipTest(
+          f"Skipping implementation '{implementation}' as per"
+          ' --skip_implementations flag.'
+      )
 
     # TODO: Re-enable once cuDNN bug is fixed.
     if (
@@ -102,15 +142,29 @@ class AttentionBenchmark(parameterized.TestCase):
       if jax.default_backend() == 'tpu' and implementation == 'mosaic':
         self.skipTest('Skipping AlphaFold on TPU.')
 
-    if str(implementation) in _SKIP_IMPLEMENTATIONS.value:
-      self.skipTest(
-          f"Skipping implementation '{implementation}' as per"
-          ' --skip_implementations flag.'
-      )
+    logging.info('device_kind=%s', jax.devices()[0].device_kind)
 
-    example = EXAMPLES[args_spec_name] | {'implementation': implementation}
+    example_ref = numerics.random_initialize(EXAMPLES[args_spec_name])
+    example = example_ref
+
+    fn = functools.partial(
+        tokamax.dot_product_attention, implementation=implementation
+    )
+
+    if implementation == 'cuequivariance':
+      if cuequivariance_jax is None:
+        self.skipTest('cuEquivariance is not installed.')
+
+      if args_spec_name == 'basic':
+        self.skipTest(
+            'Skipping cuequivariance for basic shape is not supported.'
+        )
+
+      example = _to_cuequivariance(example)
+      fn = cuequivariance_jax.triangle_attention
+
     fn, args = tokamax.standardize_function(
-        tokamax.dot_product_attention,
+        fn,
         kwargs=example,
         mode=benchmark_mode,  # pytype: disable=wrong-arg-types
     )
@@ -161,6 +215,34 @@ class AttentionBenchmark(parameterized.TestCase):
           metric_tag=(
               f'attention/{args_spec_name}/mosaic/forward_and_vjp/autotuned'
           ),
+      )
+
+    # Numerics test.
+    if benchmark_mode == 'forward':
+      fn_ref, args_ref = tokamax.standardize_function(
+          functools.partial(
+              tokamax.dot_product_attention, implementation='xla_chunked'
+          ),
+          kwargs=example_ref,
+          mode=benchmark_mode,  # pytype: disable=wrong-arg-types
+      )
+      out_ref = jax.jit(fn_ref)(args_ref)
+
+      out_actual = fn(args)
+      if implementation == 'cuequivariance':
+        # cuEquivariance returns (output, log-sum-exp, maximum value).
+        out_actual = out_actual[0].squeeze(axis=0)
+        out_actual = jnp.transpose(out_actual, (0, 2, 1, 3))
+
+      diff = numerics.array_diff_summary(
+          expected=out_ref,
+          actual=out_actual,
+      )
+      logging.info(
+          'max_absolute_diff: %s, max_absolute_diff_values: %s l2_diff: %s',
+          str(diff.max_absolute_diff),
+          str(diff.max_absolute_diff_values),
+          str(diff.l2_diff),
       )
 
 

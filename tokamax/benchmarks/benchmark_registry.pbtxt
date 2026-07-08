@@ -9,6 +9,7 @@ benchmarks {
     action: "./ml_actions/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/attention.py" }
     action_inputs { key: "python_version" value: "3.11" }
+    action_inputs { key: "extras" value: "bench" }
   }
 
   environment_configs {
@@ -30,7 +31,7 @@ benchmarks {
     runner_label: "linux-x86-ct6e-44-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
-    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn,cuequivariance" }
   }
 
   environment_configs {
@@ -38,7 +39,7 @@ benchmarks {
     runner_label: "linux-x86-tpu7x-56-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
-    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn,cuequivariance" }
   }
 
   metrics {
@@ -106,6 +107,7 @@ benchmarks {
     action: "./ml_actions/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/ragged_dot.py" }
     action_inputs { key: "python_version" value: "3.11" }
+    action_inputs { key: "extras" value: "bench" }
   }
 
   environment_configs {
@@ -160,6 +162,7 @@ benchmarks {
     action: "./ml_actions/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/linear_softmax_cross_entropy_loss.py" }
     action_inputs { key: "python_version" value: "3.11" }
+    action_inputs { key: "extras" value: "bench" }
   }
 
   environment_configs {
