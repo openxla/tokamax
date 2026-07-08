@@ -162,7 +162,10 @@ class SplashConfig:
   # (kv > q), filling mask_value instead of computing it. Those entries are
   # overwritten to mask_value by _apply_mask_and_soft_cap regardless, so the result
   # is bit-exact; the elementwise/softmax ops still run on the full assembled tile.
-  # PRECONDITION (enforced below): pure CausalMask + aligned SQUARE blocks.
+  # PRECONDITION (enforced below): pure CausalMask + aligned SQUARE blocks with a
+  # single compute tile per block (block_q == block_kv == block_kv_compute, and the
+  # backward trio), and sequence length a multiple of the block. Any other config
+  # raises (it does not silently corrupt); a non-causal mask raises too.
   qk_diag_skip: bool = False
   # Granularity of the diagonal skip: grid=2 -> quadrants (skip 1/4 of the diagonal
   # block, per-block waste 1/2 -> 1/4); grid=4 -> 4x4 (skip 6/16, waste -> 1/8).
