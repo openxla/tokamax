@@ -156,6 +156,19 @@ class SplashConfig:
   dq_reduction_steps: int | None = None
   # An experimental scheduler that sometimes produces better softmax overlap.
   use_experimental_scheduler: bool = False
+  # Skip the wasted causal-diagonal QK matmul. On a partial-mask (diagonal) block,
+  # split the QK matmul into a qk_diag_grid x qk_diag_grid sub-grid over (kv rows,
+  # q cols) and skip every sub-tile that lies entirely above the causal line
+  # (kv > q), filling mask_value instead of computing it. Those entries are
+  # overwritten to mask_value by _apply_mask_and_soft_cap regardless, so the result
+  # is bit-exact; the elementwise/softmax ops still run on the full assembled tile.
+  # PRECONDITION (enforced below): pure CausalMask + aligned SQUARE blocks.
+  qk_diag_skip: bool = False
+  # Granularity of the diagonal skip: grid=2 -> quadrants (skip 1/4 of the diagonal
+  # block, per-block waste 1/2 -> 1/4); grid=4 -> 4x4 (skip 6/16, waste -> 1/8).
+  # Larger grid skips more of the triangle but uses smaller (less MXU-efficient)
+  # matmuls; grid=4 is a good default at S=4096/block=2048. Must be a power of 2.
+  qk_diag_grid: int = 2
 
   def __post_init__(self):
     if self.block_kv_compute is None:
@@ -170,6 +183,30 @@ class SplashConfig:
       )
     if not self.use_fused_bwd_kernel:
       raise ValueError("Only the fused bwd kernel is supported.")
+
+    if self.qk_diag_skip:
+      # The skip fills mask_value for sub-tiles where kv > q, relying on the mask to
+      # mask EXACTLY those. That holds only for aligned SQUARE blocks (kv-band > q-band
+      # <=> fully above the causal line, single compute tile per block) — enforce it or
+      # the skip silently corrupts. Causality is checked in _make_splash_attention.
+      if not (self.block_q == self.block_kv == self.block_kv_compute):
+        raise ValueError(
+            "qk_diag_skip requires square forward blocks "
+            "(block_q == block_kv == block_kv_compute); got "
+            f"{self.block_q}/{self.block_kv}/{self.block_kv_compute}."
+        )
+      if self.has_backward_blocks and not (
+          self.block_q_dkv == self.block_kv_dkv == self.block_kv_dkv_compute
+      ):
+        raise ValueError(
+            "qk_diag_skip requires square backward blocks "
+            "(block_q_dkv == block_kv_dkv == block_kv_dkv_compute); got "
+            f"{self.block_q_dkv}/{self.block_kv_dkv}/{self.block_kv_dkv_compute}."
+        )
+      if self.qk_diag_grid < 2 or (self.qk_diag_grid & (self.qk_diag_grid - 1)):
+        raise ValueError(
+            f"qk_diag_grid must be a power of 2 >= 2; got {self.qk_diag_grid}."
+        )
 
   @property
   def has_backward_blocks(self) -> bool:
@@ -415,9 +452,38 @@ def flash_attention_kernel(
       k = k_ref[:, slice_k]
       qk_dims = NN_DIM_NUMBERS
 
-    qk_flat = lax.dot_general(
-        q_flat, k, qk_dims, preferred_element_type=float32
-    )
+    _g = config.qk_diag_grid
+    if (
+        config.qk_diag_skip
+        and has_partial_mask
+        and num_stacked_q_heads == 1
+        and config.k_layout == HEAD_DIM_MINOR
+        and bq % _g == 0
+        and bkv_compute % _g == 0
+    ):
+      # Diagonal skip (forward): qk tile is [q, kv]. On an aligned square diagonal
+      # block, sub-tile (q-band qi, kv-band kj) with kj > qi is fully above the causal
+      # boundary (kv > q) -> masked to mask_value anyway -> skip its matmul.
+      sq = bq // _g
+      sk = bkv_compute // _g
+      q_parts = [q_flat[i * sq:(i + 1) * sq, :] for i in range(_g)]
+      k_parts = [k[j * sk:(j + 1) * sk, :] for j in range(_g)]
+      rows = []
+      for qi in range(_g):  # q row-band
+        cols = []
+        for kj in range(_g):  # kv col-band
+          if kj > qi:  # fully masked -> skip matmul
+            cols.append(jnp.full((sq, sk), mask_value, dtype=float32))
+          else:
+            cols.append(lax.dot_general(
+                q_parts[qi], k_parts[kj], qk_dims, preferred_element_type=float32
+            ))
+        rows.append(jnp.concatenate(cols, axis=1))
+      qk_flat = jnp.concatenate(rows, axis=0)
+    else:
+      qk_flat = lax.dot_general(
+          q_flat, k, qk_dims, preferred_element_type=float32
+      )
     qk = qk_flat.reshape((num_stacked_q_heads, bq, bkv_compute))
 
     apply_mask_and_soft_cap = functools.partial(
@@ -1348,9 +1414,38 @@ def _flash_attention_dkv_kernel(
     qk_dims = (
         NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
-    qk_uncapped = lax.dot_general(
-        k, scaled_q, qk_dims, preferred_element_type=jnp.float32
-    )
+    _g = config.qk_diag_grid
+    if (
+        config.qk_diag_skip
+        and has_partial_mask
+        and bkv_compute % _g == 0
+        and bq % _g == 0
+    ):
+      # Diagonal skip (backward dkv): qk tile is [kv, q]. On an aligned square diagonal
+      # block, sub-tile (kv-band ki, q-band qj) with ki > qj is fully above the causal
+      # boundary (kv > q) -> overwritten to mask_value anyway -> skip its matmul; compute
+      # only ki <= qj sub-tiles; assemble the full tile for the single exp/ds/dv/dk.
+      sk = bkv_compute // _g
+      sq = bq // _g
+      k_parts = [k[i * sk:(i + 1) * sk, :] for i in range(_g)]
+      q_parts = [scaled_q[j * sq:(j + 1) * sq, :] for j in range(_g)]
+      _mm = lambda kk, qq: lax.dot_general(
+          kk, qq, qk_dims, preferred_element_type=jnp.float32
+      )
+      rows = []
+      for ki in range(_g):  # kv row-band
+        cols = []
+        for qj in range(_g):  # q col-band
+          if ki > qj:  # fully masked -> skip matmul
+            cols.append(jnp.full((sk, sq), mask_value, dtype=jnp.float32))
+          else:
+            cols.append(_mm(k_parts[ki], q_parts[qj]))
+        rows.append(jnp.concatenate(cols, axis=1))
+      qk_uncapped = jnp.concatenate(rows, axis=0)
+    else:
+      qk_uncapped = lax.dot_general(
+          k, scaled_q, qk_dims, preferred_element_type=jnp.float32
+      )
 
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
@@ -2086,6 +2181,17 @@ def _make_splash_attention(
 
   if config is None:
     config = SplashConfig.get_default()
+
+  if config.qk_diag_skip and not isinstance(mask, mask_lib.CausalMask):
+    # The skip assumes kv > q is ALWAYS masked — a pure-causal property. Any mask
+    # that admits a valid kv > q entry (bidirectional, local/sliding window, custom)
+    # would be silently corrupted, so fail loud. (Square-block preconditions are
+    # enforced in SplashConfig.__post_init__.)
+    raise ValueError(
+        "qk_diag_skip=True requires a pure CausalMask (the skip fills mask_value "
+        "for all kv > q sub-tiles, assuming the mask masks exactly those); got "
+        f"{type(mask).__name__}. Disable qk_diag_skip for non-causal masks."
+    )
 
   process_fn = partial(
       mask_info_lib.process_mask,
