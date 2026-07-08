@@ -16,6 +16,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import Any, Callable, Sequence
 
 import jax
@@ -28,6 +29,38 @@ import qwix
 QArray = qwix.QArray
 
 LANES = 128
+
+
+def pl_div(a: Any, b: Any) -> Any:
+  """Executes bitshift floor division for power-of-2 divisors on signed int32 coordinates."""
+  exponent = int(math.log2(b))
+  if b == int(math.pow(2, exponent)):
+    return a >> exponent
+  return a // b
+
+
+def pl_mod(a: Any, b: Any) -> Any:
+  """Executes bitmask remainder for power-of-2 divisors on signed int32 coordinates."""
+  exponent = int(math.log2(b))
+  if b == int(math.pow(2, exponent)):
+    return a & (b - 1)
+  return a % b
+
+
+def pl_cdiv(a: Any, b: Any) -> Any:
+  """Executes bitshift ceiling division for power-of-2 divisors on signed int32 coordinates."""
+  exponent = int(math.log2(b))
+  if b == int(math.pow(2, exponent)):
+    return (a + b - 1) >> exponent
+  return (a + b - 1) // b
+
+
+def pl_align_to(a: Any, b: Any) -> Any:
+  """Executes bitmask alignment for power-of-2 divisors on signed int32 coordinates."""
+  exponent = int(math.log2(b))
+  if b == int(math.pow(2, exponent)):
+    return (a + b - 1) & (-int(b))
+  return pl_cdiv(a, b) * b
 
 
 @functools.lru_cache
@@ -103,7 +136,7 @@ def quant_block_spec(
   """Broadcast scales so that they are addressable by Pallas via a BlockSpec."""
   x_values, x_scales = x.qvalue, x.scale
 
-  eps_list = [pl.cdiv(xs, ss) for xs, ss in zip(x_values.shape, x_scales.shape)]
+  eps_list = [pl_cdiv(xs, ss) for xs, ss in zip(x_values.shape, x_scales.shape)]
   tile_sizes = x_spec.block_shape
   min_addressable_sizes = (
       [1] * x.ndim + [_adaptive_sublane_size(), pltpu.get_tpu_info().num_lanes]
