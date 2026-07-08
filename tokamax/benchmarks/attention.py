@@ -101,10 +101,6 @@ class AttentionBenchmark(parameterized.TestCase):
       # TODO: Re-enable once Mosaic TPU supports learnable biases.
       if jax.default_backend() == 'tpu' and implementation == 'mosaic':
         self.skipTest('Skipping AlphaFold on TPU.')
-      # TODO: Re-enable once Mosaic GPU supports learnable biases
-      # on B200.
-      if 'B200' in jax.devices()[0].device_kind and implementation == 'mosaic':
-        self.skipTest('Skipping AlphaFold shape on B200.')
 
     if str(implementation) in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(
