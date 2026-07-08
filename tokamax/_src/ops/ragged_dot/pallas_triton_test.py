@@ -18,6 +18,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tokamax._src import gpu_utils
 from tokamax._src.ops.ragged_dot import pallas_triton
 from tokamax._src.ops.ragged_dot import test_base
@@ -65,6 +66,32 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
 
     with mock.patch.object(self, "_dot_fn", split_k_dot):
       self.test_quantized0()  # pytype: disable=attribute-error
+
+  def test_vjp_empty_groups(self):
+    lhs = jax.random.normal(
+        jax.random.key(0), (16, 64), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+    rhs = jax.random.normal(
+        jax.random.key(1), (4, 64, 32), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+    group_sizes = jnp.array([8, 0, 8, 0], jnp.int32)
+
+    def loss(lhs_arg, rhs_arg):
+      out = self._dot_fn_f32(
+          lhs_arg,
+          rhs_arg,
+          group_sizes=group_sizes,
+          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+      )
+      return jnp.sum(out.astype(jnp.float32))
+
+    _, (_, drhs) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(lhs, rhs)
+
+    self.assertFalse(np.asarray(~jnp.isfinite(drhs)).any())
+    np.testing.assert_array_equal(
+        np.asarray(drhs)[np.asarray(group_sizes) == 0],
+        np.zeros_like(np.asarray(drhs)[np.asarray(group_sizes) == 0]),
+    )
 
   @override
   def _test_simple(self, dtype):
