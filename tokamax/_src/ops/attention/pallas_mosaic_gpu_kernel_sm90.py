@@ -566,8 +566,8 @@ def flash_attention_kernel(
 
   out, *residuals = plgpu.kernel(
       kernel,
-      out_shape=out_shape,
-      scratch_shapes=scratch_shapes,
+      out_type=out_shape,
+      scratch_types=scratch_shapes,
       grid=(num_q_heads, num_q_tiles),
       grid_names=("heads", "q_tiles"),
       num_threads=3,

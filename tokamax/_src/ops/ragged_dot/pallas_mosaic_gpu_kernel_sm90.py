@@ -164,7 +164,7 @@ def ragged_dot_kernel(
 
   return plgpu.kernel(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
+      out_type=jax.ShapeDtypeStruct((m, n), out_dtype),
       grid=grid,
       grid_names=grid_names,
       kernel_name="ragged_dot_sm90",
@@ -266,7 +266,7 @@ def ragged_contracting_dim_dot_kernel(
   )
   kernel = plgpu.kernel(
       body,
-      out_shape=jax.ShapeDtypeStruct((g, m, n), out_dtype),
+      out_type=jax.ShapeDtypeStruct((g, m, n), out_dtype),
       grid=(pl.cdiv(m, config.block_m), pl.cdiv(n, config.block_n), g),
       grid_names=("m", "n", "g"),
       kernel_name="ragged_contracting_dim_dot_sm90",

@@ -119,18 +119,10 @@ def gated_linear_unit(
       plgpu.TilingTransform((8, swizzle_elems)),
       plgpu.SwizzleTransform(swizzle),
   )
-  if jax.__version_info__ < (0, 10, 1):
-    rhs_transforms = (
-        plgpu.TransposeTransform((0, 2, 1, 3)),  # type: ignore
-        plgpu.TilingTransform((8, swizzle_elems)),
-        plgpu.TransposeTransform((0, 2, 1, 3, 4, 5)),  # type: ignore
-        plgpu.SwizzleTransform(swizzle),
-    )
-  else:
-    rhs_transforms = (
-        plgpu.TilingTransform((8, 1, swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle),
-    )
+  rhs_transforms = (
+      plgpu.TilingTransform((8, 1, swizzle_elems)),
+      plgpu.SwizzleTransform(swizzle),
+  )
   cta_tile_m = tile_m * (1 + (config.wg_dimension == common.MatmulDimension.M))
   cta_tile_n = tile_n * (1 + (config.wg_dimension == common.MatmulDimension.N))
   cluster_tile_m = cta_tile_m * config.cluster_size_m
@@ -287,13 +279,13 @@ def gated_linear_unit(
   cluster_size = config.cluster_size_m * config.cluster_size_n
   f = plgpu.kernel(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), dtype),
+      out_type=jax.ShapeDtypeStruct((m, n), dtype),
       grid=(num_sms // cluster_size,),
       grid_names=("cluster_grid",),
       cluster=(cluster_size,),
       cluster_names=("cluster",),
       num_threads=3,
       thread_name="wg",
-      scratch_shapes=scratch_shapes,
+      scratch_types=scratch_shapes,
   )
   return jnp.reshape(f(x, weights), (*orig_x_shape[:-1], n))

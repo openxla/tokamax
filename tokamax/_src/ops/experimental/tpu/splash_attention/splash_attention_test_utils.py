@@ -85,4 +85,4 @@ def create_segment_ids(seq_len: int, num_breaks: int = 2) -> base.SegmentIds:
   idxs[break_indices] = 1
 
   idxs = np.cumsum(idxs, dtype=np.int32)
-  return base.SegmentIds(q=idxs, kv=idxs)
+  return base.SegmentIds(q=idxs, kv=idxs)  # pyrefly: ignore[bad-argument-type]

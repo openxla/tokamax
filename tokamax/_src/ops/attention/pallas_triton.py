@@ -198,9 +198,9 @@ def _fwd_kernel_impl(
       k, k_scales = _rescale(k, k_scales_ref, slice_k, slice_d, quantize_qk_dot)
 
       if quantize_qk_dot:
-        s += pl.dot(q[i], k.T).astype(jnp.float32) * (q_scales[i] * k_scales.T)  # pytype: disable=attribute-error
+        s += plgpu.dot(q[i], k.T).astype(jnp.float32) * (q_scales[i] * k_scales.T)  # pytype: disable=attribute-error
       else:
-        s += pl.dot(q[i].astype(k.dtype), k.T, precision=q_k_dot_precision)
+        s += plgpu.dot(q[i].astype(k.dtype), k.T, precision=q_k_dot_precision)
     s = s.astype(logits_dtype)
 
     if bias_ref is not None:
@@ -269,7 +269,9 @@ def _fwd_kernel_impl(
       slice_d = block.ds(i, block_d_out)
       v = v_ref.at[slice_k, slice_d].load(bounds_check=(True, False))
       v, _ = _rescale(v, v_scales_ref, slice_k, slice_d)
-      accs[i] += pl.dot(p.astype(v.dtype), v, precision=weights_v_dot_precision)
+      accs[i] += plgpu.dot(
+          p.astype(v.dtype), v, precision=weights_v_dot_precision
+      )
 
     return accs, m_i, l_i
 

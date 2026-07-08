@@ -235,8 +235,8 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   profile = False
   f = plgpu.kernel(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
-      scratch_shapes=scratch_shapes,
+      out_type=jax.ShapeDtypeStruct((m, n), out_dtype),
+      scratch_types=scratch_shapes,
       num_threads=2,
       thread_name="wg",
       grid=(m_iters * n_iters,),

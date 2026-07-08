@@ -14,7 +14,6 @@
 # ==============================================================================
 
 import dataclasses
-import types
 from typing import Any, ClassVar
 
 from absl.testing import absltest
@@ -59,9 +58,9 @@ def _eval_shape(spec):
 
   def f():
     out = spec()
-    out_flat, out_tree[0] = jax.tree.flatten(out)
+    out_flat, out_tree[0] = jax.tree.flatten(out)  # pyrefly: ignore[unsupported-operation]
     is_array = lambda x: isinstance(x, jax.Array)
-    arrays, other[0], merge[0] = utils.split_merge(is_array, out_flat)
+    arrays, other[0], merge[0] = utils.split_merge(is_array, out_flat)  # pyrefly: ignore[unsupported-operation]
     return arrays
 
   shapes = jax.eval_shape(f)
@@ -78,7 +77,7 @@ _HEURISTICS_CONFIG = _FakeOpConfig(1)
 _AUTOTUNE_CONFIG = _FakeOpConfig(2)
 
 
-class _FakeOp(op_lib.Op[Any, jax.Array, types.NoneType, _FakeOpConfig, Any]):
+class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
   config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
 
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
@@ -230,7 +229,7 @@ class BoundArgumentsTest(parameterized.TestCase):
     # Use a real op so that we have a real autotuning cache.
     # Read in the autotuning cache and then with the overlay it should be None.
     ba = norm_base.Normalization().bind(
-        x=jax.ShapeDtypeStruct((2, 2), jnp.bfloat16),
+        x=jax.ShapeDtypeStruct((2, 2), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
         scale=None,
         offset=None,
         axis=-1,

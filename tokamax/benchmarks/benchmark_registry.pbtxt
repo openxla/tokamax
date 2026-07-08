@@ -6,7 +6,7 @@ benchmarks {
   description: "Runs the Tokamax attention benchmark."
   owner: "Tokamax Team"
   workload {
-    action: "./ml_actions/benchmarking/actions/workload_executors/python"
+    action: "./ml_actions/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/attention.py" }
     action_inputs { key: "python_version" value: "3.11" }
   }
@@ -55,7 +55,7 @@ benchmarks {
   description: "Runs the Tokamax triangle_multiplication benchmark."
   owner: "Tokamax Team"
   workload {
-    action: "./ml_actions/benchmarking/actions/workload_executors/python"
+    action: "./ml_actions/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_multiplication.py" }
     action_inputs { key: "python_version" value: "3.11" }
     action_inputs { key: "extras" value: "bench" }
@@ -103,7 +103,7 @@ benchmarks {
   description: "Runs the Tokamax ragged_dot benchmark."
   owner: "Tokamax Team"
   workload {
-    action: "./ml_actions/benchmarking/actions/workload_executors/python"
+    action: "./ml_actions/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/ragged_dot.py" }
     action_inputs { key: "python_version" value: "3.11" }
   }
@@ -157,7 +157,7 @@ benchmarks {
   description: "Runs the Tokamax linear_softmax_cross_entropy_loss benchmark."
   owner: "Tokamax Team"
   workload {
-    action: "./ml_actions/benchmarking/actions/workload_executors/python"
+    action: "./ml_actions/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/linear_softmax_cross_entropy_loss.py" }
     action_inputs { key: "python_version" value: "3.11" }
   }

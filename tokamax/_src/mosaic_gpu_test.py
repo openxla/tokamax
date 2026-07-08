@@ -41,7 +41,7 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
 
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn),
+        out_type=jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn),
     )
     def kernel(x_ref, o_ref):
       layout = plgpu.Layout.WGMMA_UPCAST_4X
@@ -72,8 +72,8 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
 
     @functools.partial(
         plgpu.kernel,
-        out_shape=jax.ShapeDtypeStruct((m, n), jnp.float32),
-        scratch_shapes=dict(
+        out_type=jax.ShapeDtypeStruct((m, n), jnp.float32),
+        scratch_types=dict(
             b_up_smem=plgpu.SMEM((n, k), fp8_dtype, transforms=f8_transforms),
             barrier_ref=plgpu.Barrier(orders_tensor_core=True),
             acc_tmem=plgpu.TMEM((m, n), jnp.float32),

@@ -17,6 +17,7 @@
 # pylint: disable=invalid-name
 
 import math
+from typing import Annotated
 
 import jax
 from jax import lax
@@ -56,7 +57,7 @@ class Config(vjp_common.Config):
   eltwise_stages: pydantic.PositiveInt = 1
   double_buffer: bool = False
   residual_stages: pydantic.PositiveInt = 2
-  chunk_size: pydantic.conint(multiple_of=32, ge=32) = 64
+  chunk_size: Annotated[int, pydantic.Field(multiple_of=32, ge=32)] = 64
   load_residuals_in_regs: bool = False
 
 
@@ -324,65 +325,73 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   if bias is not None and ((bias.ndim >= 4 and bias.shape[-4] == 1) or (bias.ndim >= 3 and bias.shape[-3] == 1)):
     orig_ds_dtype = jnp.float32
 
-  for double_buffer in [False, True]:
-    for eltwise_stages in [1, 2]:
-      for residual_stages in [1, 2]:
-        for num_stages in [2, 3, 4]:
-          for load_residuals_in_regs in [False, True]:
-            for chunk_size in [32, 64]:
-              config = Config(
-                  block_kv_dkv=128,
-                  block_q_dkv=128,
-                  block_kv_dq=128,
-                  block_q_dq=128,
-                  double_buffer=double_buffer,
-                  eltwise_stages=eltwise_stages,
-                  residual_stages=residual_stages,
-                  num_stages=num_stages,
-                  load_residuals_in_regs=load_residuals_in_regs,
-                  chunk_size=chunk_size,
-              )
-              dq_shapes = _get_dq_scratch_shapes(
-                  config=config,
-                  head_dim=head_dim,
-                  head_dim_out=head_dim_out,
-                  chunk_size=config.chunk_size,
-                  q_dtype=q_dtype,
-                  dout_dtype=dout_dtype,
-                  k_dtype=k_dtype,
-                  v_dtype=v_dtype,
-                  ds_dtype=ds_dtype,
-                  bias_shape=bias.shape if bias is not None else None,
-                  bias_dtype=bias.dtype if bias is not None else None,
-                  mask_shape=mask.shape if mask is not None else None,
-                  mask_dtype=mask.dtype if mask is not None else None,
-                  orig_ds_dtype=orig_ds_dtype,
-              )
-              dkv_shapes = _get_dkv_scratch_shapes(
-                  config=config,
-                  head_dim=head_dim,
-                  head_dim_out=head_dim_out,
-                  chunk_size=config.chunk_size,
-                  q_dtype=q_dtype,
-                  dout_dtype=dout_dtype,
-                  k_dtype=k_dtype,
-                  v_dtype=v_dtype,
-                  ds_dtype=ds_dtype,
-                  bias_shape=bias.shape if bias is not None else None,
-                  bias_dtype=bias.dtype if bias is not None else None,
-                  mask_shape=mask.shape if mask is not None else None,
-                  mask_dtype=mask.dtype if mask is not None else None,
-              )
-              dq_smem = _estimate_smem_bytes(dq_shapes)
-              dkv_smem = _estimate_smem_bytes(dkv_shapes)
-              if dq_smem + dkv_smem < min_total_smem:
-                min_total_smem = dq_smem + dkv_smem
-                fallback_dq_smem = dq_smem
-                fallback_dkv_smem = dkv_smem
-              min_dq_smem = min(min_dq_smem, dq_smem)
-              min_dkv_smem = min(min_dkv_smem, dkv_smem)
-              if dq_smem <= _SMEM_SIZE_LIMIT and dkv_smem <= _SMEM_SIZE_LIMIT:
-                configs.add(config)
+  for q_kv_block_size in (128, 64):
+    for double_buffer in (False, True):
+      for eltwise_stages in (1, 2):
+        for residual_stages in (1, 2):
+          for num_stages in (2, 3, 4):
+            for load_residuals_in_regs in (False, True):
+              for chunk_size in (32, 64):
+                if q_kv_block_size < chunk_size:
+                  continue
+                config = Config(
+                    block_kv_dkv=q_kv_block_size,
+                    block_q_dkv=q_kv_block_size,
+                    block_kv_dq=q_kv_block_size,
+                    block_q_dq=q_kv_block_size,
+                    double_buffer=double_buffer,
+                    eltwise_stages=eltwise_stages,
+                    residual_stages=residual_stages,
+                    num_stages=num_stages,
+                    load_residuals_in_regs=load_residuals_in_regs,
+                    chunk_size=chunk_size,
+                )
+                dq_shapes = _get_dq_scratch_shapes(
+                    config=config,
+                    head_dim=head_dim,
+                    head_dim_out=head_dim_out,
+                    chunk_size=config.chunk_size,
+                    q_dtype=q_dtype,
+                    dout_dtype=dout_dtype,
+                    k_dtype=k_dtype,
+                    v_dtype=v_dtype,
+                    ds_dtype=ds_dtype,
+                    bias_shape=bias.shape if bias is not None else None,
+                    bias_dtype=bias.dtype if bias is not None else None,
+                    mask_shape=mask.shape if mask is not None else None,
+                    mask_dtype=mask.dtype if mask is not None else None,
+                    orig_ds_dtype=orig_ds_dtype,
+                )
+                dkv_shapes = _get_dkv_scratch_shapes(
+                    config=config,
+                    head_dim=head_dim,
+                    head_dim_out=head_dim_out,
+                    chunk_size=config.chunk_size,
+                    q_dtype=q_dtype,
+                    dout_dtype=dout_dtype,
+                    k_dtype=k_dtype,
+                    v_dtype=v_dtype,
+                    ds_dtype=ds_dtype,
+                    bias_shape=bias.shape if bias is not None else None,
+                    bias_dtype=bias.dtype if bias is not None else None,
+                    mask_shape=mask.shape if mask is not None else None,
+                    mask_dtype=mask.dtype if mask is not None else None,
+                )
+                dq_smem = _estimate_smem_bytes(dq_shapes)
+                dkv_smem = _estimate_smem_bytes(dkv_shapes)
+                if dq_smem + dkv_smem < min_total_smem:
+                  min_total_smem = dq_smem + dkv_smem
+                  fallback_dq_smem = dq_smem
+                  fallback_dkv_smem = dkv_smem
+                min_dq_smem = min(min_dq_smem, dq_smem)
+                min_dkv_smem = min(min_dkv_smem, dkv_smem)
+                if dq_smem <= _SMEM_SIZE_LIMIT and dkv_smem <= _SMEM_SIZE_LIMIT:
+                  configs.add(config)
+    # If we found a good config for q_kv_block_size 128 there is no point
+    # looking into 64 which is strictly worse for use of TC and
+    # SMEM/TMEM.
+    if configs:
+      break
   if not configs:
     raise ValueError(
         "Could not find any SM100 dual kernel configuration that fits in"
@@ -405,7 +414,7 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   return max(configs, key=_score)
 
 
-def _kernel(body, out_shape, **kernel_kwargs):
+def _kernel(body, out_type, **kernel_kwargs):
   """Interface for SM100 attention VJP kernel.
 
   Unwraps the custom_vmap() operator because tokamax handles vmap
@@ -421,8 +430,8 @@ def _kernel(body, out_shape, **kernel_kwargs):
 
   """
 
-  if singleton_out := not isinstance(out_shape, (tuple, list)):
-    out_shape = (out_shape,)
+  if singleton_out := not isinstance(out_type, (tuple, list)):
+    out_type = (out_type,)
 
   @jax.custom_batching.custom_vmap
   def wrapped(*kernel_args):
@@ -434,7 +443,7 @@ def _kernel(body, out_shape, **kernel_kwargs):
 
       plgpu.kernel(
           _body,
-          out_shape=(),
+          out_type=(),
           **kernel_kwargs,
       ).fun(*kernel_args)
 
@@ -443,7 +452,7 @@ def _kernel(body, out_shape, **kernel_kwargs):
             lambda s: s
             if isinstance(s, jax.Array)
             else jax.lax.empty(s.shape, s.dtype),
-            out_shape,
+            out_type,
         )
     )
     return tuple(out)
@@ -1880,7 +1889,7 @@ def flash_attention_vjp_kernel(
 
     dq = _kernel(
         dq_body,
-        out_shape=dq_out_shape,
+        out_type=dq_out_shape,
         kernel_name="sm100_dq_kernel",
         grid=(
             q.shape[-4] if q.ndim == 4 else 1,
@@ -1891,7 +1900,7 @@ def flash_attention_vjp_kernel(
         num_threads=2,
         thread_name="wg",
         compiler_params=compiler_params,
-        scratch_shapes=dq_scratch_shapes,
+        scratch_types=dq_scratch_shapes,
     )(q, k, v, dout, m, l, delta, bias, k_start, k_end, mask)
     ds = None
   else:
@@ -1954,7 +1963,7 @@ def flash_attention_vjp_kernel(
 
     dq, ds = _kernel(
         dq_body_bias,
-        out_shape=dq_out_shape,
+        out_type=dq_out_shape,
         kernel_name="sm100_dq_kernel_bias",
         grid=(
             q.shape[-4] if q.ndim == 4 else 1,
@@ -1965,7 +1974,7 @@ def flash_attention_vjp_kernel(
         num_threads=2,
         thread_name="wg",
         compiler_params=compiler_params,
-        scratch_shapes=dq_scratch_shapes,
+        scratch_types=dq_scratch_shapes,
     )(q, k, v, dout, m, l, delta, bias, k_start, k_end, mask)
 
   dkv_shape = (
@@ -2047,7 +2056,7 @@ def flash_attention_vjp_kernel(
 
   dk, dv = _kernel(
       dkv_body,
-      out_shape=dkv_shape,
+      out_type=dkv_shape,
       kernel_name="sm100_dkv_kernel",
       grid=(
           q.shape[-4] if q.ndim == 4 else 1,
@@ -2058,7 +2067,7 @@ def flash_attention_vjp_kernel(
       num_threads=2,
       thread_name="wg",
       compiler_params=compiler_params,
-      scratch_shapes=dkv_scratch_shapes,
+      scratch_types=dkv_scratch_shapes,
   )(q, k, v, dout, m, l, delta, bias_dkv, k_start, k_end, mask_dkv)
 
   dq = dq[..., :orig_q_seq_len, :, :orig_head_dim]

@@ -21,7 +21,6 @@ from tokamax._src import numerics
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu as pallas_mosaic_tpu
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel as kernel
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.reference as reference
-import tokamax._src.ops.linear_softmax_cross_entropy_loss.test_utils as test_utils
 
 
 class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):

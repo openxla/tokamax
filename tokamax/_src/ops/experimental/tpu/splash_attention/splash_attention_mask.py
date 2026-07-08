@@ -45,14 +45,14 @@ class Mask:
       raise ValueError(
           f'Invalid shape for other: {other.shape}, expected: {self.shape}'
       )
-    return LogicalOr(self, other)
+    return LogicalOr(self, other)  # pyrefly: ignore[bad-return]
 
   def __and__(self, other: Self) -> Self:
     if self.shape != other.shape:
       raise ValueError(
           f'Invalid shape for other: {other.shape}, expected: {self.shape}'
       )
-    return LogicalAnd(self, other)
+    return LogicalAnd(self, other)  # pyrefly: ignore[bad-return]
 
 
 def make_causal_mask(shape: tuple[int, int], offset: int = 0) -> np.ndarray:

@@ -15,13 +15,15 @@
 
 """Common Flash Attention Mosaic GPU VJP utilities."""
 
+from typing import Annotated
+
 import pydantic
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_q_dkv: pydantic.conint(multiple_of=64, gt=0)
-  block_kv_dkv: pydantic.conint(multiple_of=64, gt=0)
+  block_q_dkv: Annotated[int, pydantic.Field(multiple_of=64, gt=0)]
+  block_kv_dkv: Annotated[int, pydantic.Field(multiple_of=64, gt=0)]
   block_q_dq: pydantic.PositiveInt
   block_kv_dq: pydantic.PositiveInt
   num_stages: pydantic.PositiveInt = 2

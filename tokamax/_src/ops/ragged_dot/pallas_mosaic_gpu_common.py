@@ -18,6 +18,7 @@
 from collections.abc import Sequence
 import dataclasses
 import enum
+from typing import Annotated, Any
 
 import jax
 from jax import lax
@@ -46,7 +47,7 @@ class MatmulDimension(enum.IntEnum):
 class Config:
   """Configuration for the ragged dot kernel."""
 
-  block_m: pydantic.conint(multiple_of=8, gt=0)
+  block_m: Annotated[int, pydantic.Field(multiple_of=8, gt=0)]
   block_n: pydantic.PositiveInt
   block_k: pydantic.PositiveInt
   num_stages: pydantic.PositiveInt
@@ -60,6 +61,17 @@ class Config:
   grid_minor_dim: MatmulDimension = MatmulDimension.N
   # The width of tiles along the fastest changing dim.
   grid_tile_width: int = 1
+  # If set, the fp8xint4 SM100 kernel quantizes its bf16 epilogue output to fp8
+  # in-register and returns a QArray instead of a dense array. The scale tiling
+  # is (1, epilogue_quant_subchannel_size). Normalized to a dtype-name string so
+  # the config stays JSON-serializable for the autotuning cache.
+  epilogue_quant_qtype: Any | None = None
+  epilogue_quant_subchannel_size: int | None = None
+
+  @pydantic.field_validator("epilogue_quant_qtype")
+  @classmethod
+  def _normalize_qtype(cls, v):
+    return None if v is None else jnp.dtype(v).name
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

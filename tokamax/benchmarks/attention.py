@@ -15,6 +15,8 @@
 
 """Benchmarks for attention."""
 
+import json
+import os
 import time
 
 from absl import flags
@@ -25,7 +27,6 @@ import jax
 import jax.numpy as jnp
 import tokamax
 from tokamax.benchmarks import common
-
 
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
     'tensorboard_output_env_var',
@@ -55,6 +56,25 @@ EXAMPLES = {
 }
 
 
+def setUpModule():  # pylint: disable=invalid-name
+  """Runs once before any tests in this module start."""
+  metadata_dir = os.environ.get('WORKLOAD_METADATA_DIR')
+  if not metadata_dir:
+    return
+
+  metadata: dict[str, str] = {}
+  if jax.default_backend() == 'gpu':
+    try:
+      cudnn_version = jax._src.lib.cuda_versions.cudnn_get_version()  # pylint: disable=protected-access
+      metadata['cudnn_version'] = str(cudnn_version)
+    except AttributeError:
+      pass
+
+  if metadata:
+    with open(os.path.join(metadata_dir, 'workload_info.json'), 'w') as f:
+      json.dump(metadata, f)
+
+
 class AttentionBenchmark(parameterized.TestCase):
   """Benchmarks for different attention implementations."""
 
@@ -81,10 +101,6 @@ class AttentionBenchmark(parameterized.TestCase):
       # TODO: Re-enable once Mosaic TPU supports learnable biases.
       if jax.default_backend() == 'tpu' and implementation == 'mosaic':
         self.skipTest('Skipping AlphaFold on TPU.')
-      # TODO: Re-enable once Mosaic GPU supports learnable biases
-      # on B200.
-      if 'B200' in jax.devices()[0].device_kind and implementation == 'mosaic':
-        self.skipTest('Skipping AlphaFold shape on B200.')
 
     if str(implementation) in _SKIP_IMPLEMENTATIONS.value:
       self.skipTest(
@@ -145,14 +161,6 @@ class AttentionBenchmark(parameterized.TestCase):
           metric_tag=(
               f'attention/{args_spec_name}/mosaic/forward_and_vjp/autotuned'
           ),
-      )
-
-    # TODO: Add this to the proto once generic metadata is
-    # supported.
-    if implementation == 'cudnn':
-      logging.info(
-          'cudnn_version=%s',
-          jax._src.lib.cuda_versions.cudnn_get_version(),  # pylint: disable=protected-access # pytype: disable=attribute-error
       )
 
 

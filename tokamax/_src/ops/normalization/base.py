@@ -15,7 +15,6 @@
 """Normalization op."""
 
 from collections.abc import Callable
-import types
 from typing import Any, TypeAlias, TypeVar
 
 import jax
@@ -137,7 +136,7 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     return y.astype(x.dtype), (mean, rstddev) if return_residuals else None
 
 
-class NormalizationVjp(op.Op[Any, Any, types.NoneType, _Config, _Key]):
+class NormalizationVjp(op.Op[Any, Any, None, _Config, _Key]):
   """Normalization VJP."""
 
   @override

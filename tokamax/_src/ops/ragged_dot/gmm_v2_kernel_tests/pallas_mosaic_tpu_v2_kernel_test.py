@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 import collections
-import functools
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -25,7 +24,6 @@ import jax.numpy as jnp
 from tokamax._src import test_utils
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
-
 
 
 jax.config.parse_flags_with_absl()

@@ -704,8 +704,8 @@ def flash_attention_vjp_kernel(
   # TODO: Optionally fuse the dq and dkv kernels.
   dq, ds = plgpu.kernel(
       functools.partial(kernel_dq, block_q=block_q_dq, block_kv=block_kv_dq),
-      out_shape=(jax.ShapeDtypeStruct(q.shape, q.dtype), ds_out_shape),
-      scratch_shapes=[
+      out_type=(jax.ShapeDtypeStruct(q.shape, q.dtype), ds_out_shape),
+      scratch_types=[
           tiled_wgs_smem((block_q_dq, head_dim), q.dtype, "q"),
           tiled_wgs_smem((block_q_dq, head_dim_out), dout.dtype, "dout"),
           plgpu.Barrier(num_barriers=compute_wgs, num_arrivals=2),
@@ -730,8 +730,8 @@ def flash_attention_vjp_kernel(
   tile_kv_dkv = compute_wgs * block_kv_dkv
   dk, dv = plgpu.kernel(
       functools.partial(kernel_dkv, block_q=block_q_dkv, block_kv=block_kv_dkv),
-      out_shape=out_shape,
-      scratch_shapes=[
+      out_type=out_shape,
+      scratch_types=[
           tiled_wgs_smem((block_kv_dkv, head_dim), k.dtype, "k"),
           tiled_wgs_smem((block_kv_dkv, head_dim_out), v.dtype, "v"),
           plgpu.Barrier(num_barriers=compute_wgs, num_arrivals=2),

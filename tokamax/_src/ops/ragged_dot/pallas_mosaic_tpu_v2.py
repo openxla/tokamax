@@ -15,7 +15,6 @@
 """Ragged dot Pallas-Mosaic-TPU implementation."""
 
 import dataclasses
-import types
 from typing import ClassVar
 
 import jax
@@ -32,7 +31,7 @@ from typing_extensions import override
 
 QArray = base.QArray
 AsQArray = base.AsQArray
-Residuals = types.NoneType
+Residuals = None
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:

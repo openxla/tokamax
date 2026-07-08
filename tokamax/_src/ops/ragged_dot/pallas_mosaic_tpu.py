@@ -17,7 +17,6 @@
 import dataclasses
 import functools
 import itertools
-import types
 from typing import Any, ClassVar
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -50,7 +49,7 @@ InputBufferCount = pydantic.PositiveInt
 
 QArray = base.QArray
 AsQArray = base.AsQArray
-Residuals = types.NoneType
+Residuals = None
 
 
 def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:

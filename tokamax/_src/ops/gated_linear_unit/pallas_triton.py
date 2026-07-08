@@ -56,8 +56,8 @@ def _gated_linear_unit_kernel(
     x = x_ref.at[:, k_span].load(bounds_check=(False, True))
     w = weights_ref.at[k_span, 0].load(bounds_check=(True, False))
     v = weights_ref.at[k_span, 1].load(bounds_check=(True, False))
-    acc[0] += pl.dot(x, w.astype(x.dtype), precision=precision)
-    acc[1] += pl.dot(x, v.astype(x.dtype), precision=precision)
+    acc[0] += plgpu.dot(x, w.astype(x.dtype), precision=precision)
+    acc[1] += plgpu.dot(x, v.astype(x.dtype), precision=precision)
     return acc
 
   num_iters = pl.cdiv(x_ref.shape[-1], block_k)

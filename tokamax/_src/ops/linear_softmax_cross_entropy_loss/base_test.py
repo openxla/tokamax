@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from functools import partial
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax

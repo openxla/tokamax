@@ -3,6 +3,22 @@ name: Run Benchmarks
 on:
   # Allow manual runs from the Actions tab for testing
   workflow_dispatch:
+    inputs:
+      benchmark_filter:
+        description: "Regex to filter by benchmark name (e.g., 'attention.*')."
+        required: false
+        type: string
+        default: ""
+      environment_filter:
+        description: "Regex to filter by environment configuration ID (e.g., 'b200.*')."
+        required: false
+        type: string
+        default: ""
+      enable_xprof:
+        description: "Enable xprof trace collection."
+        required: false
+        type: boolean
+        default: false
 
   schedule:
     - cron: "0 0 * * *"  # Runs at 00:00 UTC every day
@@ -14,10 +30,14 @@ permissions:
 jobs:
   run_benchmarks:
     name: Run Tokamax benchmarks
-    uses: google-ml-infra/actions/.github/workflows/run-benchmarks.yaml@1a80c6f935a5f5a3d1fb0a40edcdea1758406efa
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@affd28b492f67c242afa8b119e590b25816b7b88
     with:
       registry_file: "tokamax/benchmarks/benchmark_registry.pbtxt"
-      ml_actions_ref: "1a80c6f935a5f5a3d1fb0a40edcdea1758406efa"
+      ml_actions_ref: "affd28b492f67c242afa8b119e590b25816b7b88"
       publish_metrics: true
       pub_sub_gcp_project_id: "ml-oss-benchmarking-production"
       pub_sub_gcp_topic_id: "public-results-prod"
+      benchmark_filter: ${{ inputs.benchmark_filter }}
+      environment_filter: ${{ inputs.environment_filter }}
+      custom_env_vars: |
+        ${{ inputs.enable_xprof == true && 'TOKAMAX_DUMP_XPROF=true' || '' }}

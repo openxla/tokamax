@@ -16,7 +16,7 @@
 
 import dataclasses
 import itertools
-from typing import ClassVar
+from typing import Annotated, ClassVar
 
 import jax
 from jax.experimental.pallas import tpu as pltpu
@@ -29,13 +29,13 @@ from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu_kernel
 from typing_extensions import override
 
 
-@dataclasses.dataclass(frozen=True)
+@pydantic.dataclasses.dataclass(frozen=True)
 class Config:
-  num_kv_pages_per_block: pydantic.conint(multiple_of=2, gt=0)
-  num_queries_per_block: pydantic.conint(multiple_of=1, gt=0)
-  vmem_limit_bytes: pydantic.conint(multiple_of=16, gt=0)
-  chunk_prefill_size: pydantic.conint(multiple_of=256, ge=0)
-  decode_batch_size: pydantic.conint(multiple_of=1, gt=0)
+  num_kv_pages_per_block: Annotated[int, pydantic.Field(multiple_of=2, gt=0)]
+  num_queries_per_block: Annotated[int, pydantic.Field(multiple_of=1, gt=0)]
+  vmem_limit_bytes: Annotated[int, pydantic.Field(multiple_of=16, gt=0)]
+  chunk_prefill_size: Annotated[int, pydantic.Field(multiple_of=256, ge=0)]
+  decode_batch_size: Annotated[int, pydantic.Field(multiple_of=1, gt=0)]
 
 
 class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
@@ -75,7 +75,7 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
       debug_mode: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
-  ):
+  ) -> tuple[tuple[jax.Array, jax.Array], None]:
 
     assert config is not None, "Config must be specified."
 
@@ -110,7 +110,7 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
     )
 
   @override
-  def _get_heuristics_config(self, ba):
+  def _get_heuristics_config(self, ba) -> Config:
     return Config(
         num_kv_pages_per_block=16,
         num_queries_per_block=1,
@@ -120,7 +120,7 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
     )
 
   @override
-  def _get_autotuning_configs(self, ba):
+  def _get_autotuning_configs(self, ba) -> set[Config]:
     configs = set()
     for decode_batch_size, kv, q, vmem_size in itertools.product(
         [8],
@@ -140,5 +140,5 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
     return configs
 
   @override
-  def supported_on(self, device):
+  def supported_on(self, device) -> bool:
     return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5

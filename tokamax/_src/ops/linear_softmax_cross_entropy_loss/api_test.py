@@ -126,7 +126,7 @@ class ApiTest(parameterized.TestCase):
     )
 
     if jax.default_backend() == "tpu":
-      self.assertIsInstance(opspecs[0].op, mosaic_tpu_impl)
+      self.assertIsInstance(opspecs[0].op, mosaic_tpu_impl)  # pyrefly: ignore[bad-argument-type]
     else:
       # CPU / GPU are using XLA implementation
       self.assertEmpty(opspecs)

@@ -204,14 +204,14 @@ def gated_linear_unit(
                     b_smems[i].at[slot],
                     consumed_barriers[i].at[slot],
                     accumulate=(ki > 0),
-                    collective_axis=collective_axes,
+                    collective_axis=collective_axes,  # pyrefly: ignore[bad-argument-type]
                 )
 
               @pl.when(ki >= k_iters - 1)
               def _arrive():
                 plgpu.tcgen05_commit_arrive(
                     mma_done_barrier.at[acc_slot],
-                    collective_axis=collective_axes,
+                    collective_axis=collective_axes,  # pyrefly: ignore[bad-argument-type]
                 )
 
             lax.fori_loop(0, k_iters, _loop_body, None)
@@ -259,14 +259,14 @@ def gated_linear_unit(
   )
   kernel = plgpu.kernel(
       kernel,
-      out_shape=jax.ShapeDtypeStruct((m, n), dtype),
+      out_type=jax.ShapeDtypeStruct((m, n), dtype),
       grid=(m_iters * n_iters,),
       grid_names=("mn_linear",),
       cluster=(cluster_size,),
       cluster_names=("cluster",),
       num_threads=2,
       thread_name="wg",
-      scratch_shapes=dict(
+      scratch_types=dict(
           a_smem=plgpu.SMEM(
               (max_concurrent_steps, tile_m, tile_k),
               dtype,
