@@ -31,11 +31,6 @@ from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 
-# TODO: Directly import ManualAxisType JAX is upgraded.
-try:
-  from jax.sharding import ManualAxisType
-except ImportError:
-  ManualAxisType = Any
 
 CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
@@ -343,7 +338,7 @@ def gmm(
     group_offset: jax.Array | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
-    manual_axis_type: ManualAxisType | None = None,
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
     # dynamic in kernel quantization support
     lhs_qdtype: jnp.dtype | None = None,
     lhs_static_scale: float | None = None,
@@ -585,15 +580,11 @@ def gmm(
       transpose_rhs=transpose_rhs,
       input_buffer_count=input_buffer_count,
   )
-  # TODO: Remove "hasattr" check once JAX is upgraded.
-  out_shape_kwargs = (
-      {"manual_axis_type": manual_axis_type}
-      if hasattr(jax.ShapeDtypeStruct, "manual_axis_type")
-      else {}
-  )
   call_gmm = common.custom_buffered_pallas_call(
       functools.partial(kernel, subchannel_iters=subchannel_iters),
-      out_shape=jax.ShapeDtypeStruct((m, n), out_dtype, **out_shape_kwargs),
+      out_shape=jax.ShapeDtypeStruct(
+          (m, n), out_dtype, manual_axis_type=manual_axis_type
+      ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,
           in_specs=[lhs_block_spec, rhs_block_spec],
@@ -652,7 +643,7 @@ def tgmm(
     group_offset: jax.Array | None = None,
     num_actual_groups: int | None = None,
     interpret: bool = False,
-    manual_axis_type: ManualAxisType | None = None,
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
     # dynamic in kernel quantization support
     lhs_qdtype: jnp.dtype | None = None,
     lhs_static_scale: float | None = None,
@@ -914,18 +905,12 @@ def tgmm(
       num_actual_groups=num_actual_groups,
       input_buffer_count=input_buffer_count,
   )
-  # TODO: Remove "hasattr" check once JAX is upgraded.
-  out_shape_kwargs = (
-      {"manual_axis_type": manual_axis_type}
-      if hasattr(jax.ShapeDtypeStruct, "manual_axis_type")
-      else {}
-  )
   call_gmm = common.custom_buffered_pallas_call(
       functools.partial(kernel, subchannel_iters=subchannel_iters),
       out_shape=jax.ShapeDtypeStruct(
           (num_actual_groups, k, n),
           out_dtype,
-          **out_shape_kwargs,
+          manual_axis_type=manual_axis_type,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=2,

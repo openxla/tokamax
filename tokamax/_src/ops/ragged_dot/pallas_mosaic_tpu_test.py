@@ -32,11 +32,6 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
 
-# TODO: Directly import ManualAxisType JAX is upgraded.
-try:
-  from jax.sharding import ManualAxisType
-except ImportError:
-  ManualAxisType = Any
 
 AsQArray = quantization.AsQArray
 
@@ -107,9 +102,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       super().test_vjp0()  # pytype: disable=attribute-error
 
   def test_shard_map_manual_axis_type_varying(self):
-    # TODO: Remove the skipTest once JAX is upgraded.
-    if ManualAxisType is Any:
-      self.skipTest("ManualAxisType is not supported.")
     if jax.devices()[0].device_kind.startswith("TPU7x"):
       self.skipTest("Skip the test on TPU v7.")
     num_devices = jax.device_count()
@@ -145,9 +137,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
           check_vma=True,
       )
       def f(lhs, rhs, sizes):
-        manual_axis_type = ManualAxisType(
-            varying={"x", "y"},
-        )
+        manual_axis_type = jax.sharding.ManualAxisType(varying={"x", "y"})
         res = op(lhs, rhs, group_sizes=sizes, manual_axis_type=manual_axis_type)
         self.assertEqual(jax.typeof(res).manual_axis_type, manual_axis_type)
         return res
@@ -167,9 +157,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
   def test_shard_map_manual_axis_type_unreduced(self):
     self.skipTest("Test is failing.")  # FIXME
 
-    # TODO: Remove the skipTest once JAX is upgraded.
-    if ManualAxisType is Any:
-      self.skipTest("ManualAxisType is not supported.")
     num_devices = jax.device_count()
     mesh = jax.make_mesh((num_devices, 1), ("x", "y"))
     with jax.set_mesh(mesh):
@@ -194,9 +181,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
           check_vma=True,
       )
       def f(lhs, rhs, sizes):
-        manual_axis_type = ManualAxisType(
-            unreduced={"x"},
-        )
+        manual_axis_type = jax.sharding.ManualAxisType(unreduced={"x"})
         res = op(lhs, rhs, group_sizes=sizes, manual_axis_type=manual_axis_type)
         self.assertEqual(jax.typeof(res).manual_axis_type, manual_axis_type)
         return res
