@@ -329,6 +329,7 @@ def flash_attention_vjp_kernel(
       if bias is not None:
         s = s * scale + bias.astype(s.dtype)
         if bias_smem is not None:
+          mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(bias_consumed_barrier)
         scale = 1.0
 
