@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
@@ -488,34 +489,6 @@ def _kernel(body, out_type, **kernel_kwargs):
     return out[0] if singleton_out else out
 
   return unwrap
-
-
-def _pad(x, axis, block, constant_values=0, broadcastable=False):
-  """Pads an array to a multiple of `block` along `axis`."""
-  if x is None:
-    return None
-  if axis is None:
-    return x
-
-  if isinstance(axis, int):
-    axis = (axis,)
-    block = (block,)
-
-  padding = [(0, 0)] * x.ndim
-  should_pad = False
-  for ax, blk in zip(axis, block):
-    if broadcastable and x.shape[ax] == 1:
-      continue
-    if x.shape[ax] % blk == 0:
-      continue
-    pad_len = blk - (x.shape[ax] % blk)
-    padding[ax] = (0, pad_len)
-    should_pad = True
-
-  if not should_pad:
-    return x
-
-  return jnp.pad(x, padding, constant_values=constant_values)
 
 
 def _smem_transforms(dtype, swizzle=128):
@@ -1703,6 +1676,12 @@ def _kernel_dkv(
       plgpu.barrier_wait(ds_consumed.at[i])
 
 
+def _pad_maybe_bcast(x, m, axis):
+  if x.shape[axis] == 1:
+    return x
+  return shape_lib.pad_to_next_multiple_of(x, m, axis)
+
+
 @jaxtyping.jaxtyped
 def flash_attention_vjp_kernel(
     q: Float[Array, "*B T H D"],
@@ -1770,11 +1749,11 @@ def flash_attention_vjp_kernel(
     orig_ds_dtype = jnp.float32
 
   # TODO: Remove explicit padding in favor of TMA out-of-bounds zero-filling and in-kernel -inf masking.
-  q = _pad(q, -3, block_q_dq)
-  out = _pad(out, -3, block_q_dq)
-  dout = _pad(dout, -3, block_q_dq)
-  k = _pad(k, -3, block_kv_dkv)
-  v = _pad(v, -3, block_kv_dkv)
+  q = shape_lib.pad_to_next_multiple_of(q, block_q_dq, -3)
+  out = shape_lib.pad_to_next_multiple_of(out, block_q_dq, -3)
+  dout = shape_lib.pad_to_next_multiple_of(dout, block_q_dq, -3)
+  k = shape_lib.pad_to_next_multiple_of(k, block_kv_dkv, -3)
+  v = shape_lib.pad_to_next_multiple_of(v, block_kv_dkv, -3)
 
   # TODO: Avoid broadcast.
   bcast = lambda x: jnp.broadcast_to(
@@ -1787,15 +1766,15 @@ def flash_attention_vjp_kernel(
     mask = mask.astype(jnp.int8)
 
   if mask is not None:
-    mask = _pad(mask, -2, block_q_dq, broadcastable=True)
-    mask = _pad(mask, -1, block_kv_dkv, broadcastable=True)
+    mask = _pad_maybe_bcast(mask, block_q_dq, -2)
+    mask = _pad_maybe_bcast(mask, block_kv_dkv, -1)
   if bias is not None:
-    bias = _pad(bias, -2, block_q_dq, broadcastable=True)
-    bias = _pad(bias, -1, block_kv_dkv, broadcastable=True)
+    bias = _pad_maybe_bcast(bias, block_q_dq, -2)
+    bias = _pad_maybe_bcast(bias, block_kv_dkv, -1)
   if k_start is not None:
-    k_start = _pad(k_start, -1, block_q_dq)
+    k_start = shape_lib.pad_to_next_multiple_of(k_start, block_q_dq, -1)
   if k_end is not None:
-    k_end = _pad(k_end, -1, block_q_dq)
+    k_end = shape_lib.pad_to_next_multiple_of(k_end, block_q_dq, -1)
 
   bias_4d_shape = bias.shape if bias is not None else None
   mask_4d_shape = mask.shape if mask is not None else None
@@ -1803,7 +1782,7 @@ def flash_attention_vjp_kernel(
   bias = _squeeze_trailing_1s(bias)
   mask = _squeeze_trailing_1s(mask)
 
-  pad_dim = lambda x: _pad(x, -1, 64)
+  pad_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
   q, k, v, out, dout = map(pad_dim, (q, k, v, out, dout))
 
   # ds_dtype must match `dtype` (compute precision) for TCGEN05 MMA
@@ -1811,13 +1790,13 @@ def flash_attention_vjp_kernel(
   head_dim, head_dim_out, ds_dtype = _get_input_metadata(q, v)
 
   m, l = residuals
-  m = _pad(m, -1, block_q_dq, constant_values=1e9)
-  l = _pad(l, -1, block_q_dq, constant_values=1)
+  m = shape_lib.pad_to_next_multiple_of(m, block_q_dq, -1, pad_value=1e9)
+  l = shape_lib.pad_to_next_multiple_of(l, block_q_dq, -1, pad_value=1)
 
   delta = jnp.einsum(
       "...qhd,...qhd->...hq", out.astype(jnp.float32), dout.astype(jnp.float32)
   )
-  delta = _pad(delta, -1, block_q_dq)
+  delta = shape_lib.pad_to_next_multiple_of(delta, block_q_dq, -1)
 
   compiler_params = plgpu.CompilerParams(
       approx_math=True,
