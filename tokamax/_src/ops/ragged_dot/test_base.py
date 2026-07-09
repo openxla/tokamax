@@ -67,11 +67,7 @@ def override_chex_args(**kwargs):
   assert_close = lambda *a, **kw: orig_assert_close(*a, **(kw | kwargs))
   return mock.patch.object(chex, "assert_trees_all_close", assert_close)
 
-
-NAMED_ARG_SPECS = {
-    s.full_name: s.args for s in ARG_SPECS if "ci_tests" in s.tags
-}
-
+NAMED_ARG_SPECS = {s.full_name: s for s in ARG_SPECS if "ci_tests" in s.tags}
 
 # TODO: `jax.nn.relu` is annotated with `custom_jvp_call`
 # which isn't compatible with `_estimate_resources` in the mosaic lowering.
@@ -319,7 +315,10 @@ class RaggedDotTestBase(parameterized.TestCase):
 
   @parameterized.named_parameters(NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
-    self._test_bench(spec)
+    if jax.devices()[0].device_kind in spec.excluded_platforms:
+      self.skipTest(f"Skip the test on {jax.devices()[0].device_kind}.")
+
+    self._test_bench(spec.args)
 
   def _test_bench(self, spec):
     kwargs = numerics.random_initialize(spec)
