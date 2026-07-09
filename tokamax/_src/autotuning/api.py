@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping
 import dataclasses
 import inspect
 import json
-from typing import Annotated, Any, Final, ParamSpec, Self, Sequence, TypeAlias
+from typing import Annotated, Any, Final, ParamSpec, Self, Sequence, TypeAlias, cast
 
 from absl import logging
 import immutabledict
@@ -137,7 +137,7 @@ class AutotuningResult:
 
   @classmethod
   def loads(cls, json_data: str) -> Self:
-    return _AUTOTUNING_RESULT_ADAPTER.validate_json(json_data)  # pyrefly: ignore[bad-return]
+    return cast(Self, _AUTOTUNING_RESULT_ADAPTER.validate_json(json_data))
 
   def __enter__(self):
     overlay = {}

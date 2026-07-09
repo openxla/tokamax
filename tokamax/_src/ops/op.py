@@ -345,7 +345,7 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
     """Returns a config based on heuristics."""
     del ba  # Unused.
     if type(self).config_cls is NullConfig:
-      return _NULL_CONFIG  # pyrefly: ignore[bad-return]
+      return cast(_Config, _NULL_CONFIG)
     raise NotImplementedError("`_get_heuristics_config` not implemented.")
 
   def _get_autotuning_cache_key(self, ba: "BoundArguments") -> _Key:
@@ -355,10 +355,11 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
         for name, param in ba.signature.parameters.items()
         if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
     )
-    return immutabledict.immutabledict((  # pyrefly: ignore[bad-return]
+    key = immutabledict.immutabledict((
         *zip(pos_arg_names, _abstractify(ba.args), strict=True),
         *_abstractify(ba.kwargs).items(),
     ))
+    return cast(_Key, key)
 
   def _get_autotuning_configs(self, ba: "BoundArguments") -> set[_Config]:
     """Returns configs to autotune."""
