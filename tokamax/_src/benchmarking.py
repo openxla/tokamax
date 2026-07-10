@@ -476,6 +476,12 @@ _DEFAULT_TIMING_METHOD: Final[dict[str, TimingMethod]] = {
 _FALLBACK_TIMING_METHOD = 'wallclock'
 
 
+def _is_concrete(x):
+  if isinstance(x, jax.core.Tracer):
+    return x.to_concrete_value() is not None
+  return x is not None
+
+
 def compile_benchmark(
     f: Callable[[T], Any], x: T
 ) -> Callable[..., BenchmarkData]:
@@ -528,7 +534,7 @@ def compile_benchmark(
     concrete_inputs = [
         z
         for z in jax.tree.leaves(x)
-        if isinstance(z, jax.Array) and jax.core.is_concrete(z)
+        if isinstance(z, jax.Array) and _is_concrete(z)
     ]
     if concrete_inputs:
       platform = list(concrete_inputs[0].devices())[0].platform
