@@ -52,7 +52,7 @@ class ApiShardingTest(parameterized.TestCase):
 
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices, axis_names='x')
-    spec = [None, None, None, None]
+    spec: list[str | None] = [None, None, None, None]
     spec[shard_axis] = 'x'
     sharding = NamedSharding(mesh, PartitionSpec(*spec))
 

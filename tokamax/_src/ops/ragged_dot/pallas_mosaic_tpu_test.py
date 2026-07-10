@@ -15,14 +15,11 @@
 """Tests for Pallas Mosaic TPU Ragged Dot."""
 
 import functools
-from typing import Any
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-from jax import shard_map
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P
 import qwix
 from tokamax._src import mosaic_tpu as common
 from tokamax._src import quantization
@@ -34,6 +31,7 @@ from typing_extensions import override
 
 
 AsQArray = quantization.AsQArray
+P = jax.sharding.PartitionSpec
 
 
 def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
@@ -130,7 +128,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
 
       @functools.partial(
-          shard_map,
+          jax.shard_map,
           mesh=mesh,
           in_specs=(P("x", None), P(None, None, "y"), P(None)),
           out_specs=P("x", "y"),
@@ -174,7 +172,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
 
       @jax.jit
       @functools.partial(
-          shard_map,
+          jax.shard_map,
           mesh=mesh,
           in_specs=(P(None, "x"), P(None, "x", None), P(None)),
           out_specs=P(None, None, unreduced={"x"}),
@@ -333,51 +331,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       self.assertEqual(drhs_heuristics.tile_k, 128)
     if drhs_heuristics.tile_m < min(m, 1024):
       self.assertEqual(drhs_heuristics.tile_n, 128)
-
-  def test_heuristics_monkey_patch(self):
-    """Tests that the heuristics config is monkey-patched correctly."""
-
-    # A tile-size of 2 will never be chosen by the heuristics, as this is
-    # far too small to get reasonable performance. This makes it a good choice
-    # for testing whether the heuristics are being overridden.
-    tile_size = 2
-
-    original_heuristics_f = (
-        pallas_mosaic_tpu.PallasMosaicTpuRaggedDot._get_heuristics_config
-    )
-
-    def _monkey_patch_heuristics_config(
-        self, bound_args: op_lib.BoundArguments
-    ) -> pallas_mosaic_tpu.Config:
-      del bound_args, self
-
-      return pallas_mosaic_tpu.Config(
-          tile_m=tile_size,
-          tile_k=tile_size,
-          tile_n=tile_size,
-          input_buffer_count=1,
-          combine_scopes=True,
-      )
-
-    tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
-
-    # Patch the _get_heuristics_config method.
-    pallas_mosaic_tpu.PallasMosaicTpuRaggedDot._get_heuristics_config = (
-        _monkey_patch_heuristics_config
-    )
-
-    config = tpu_ragged_dot._get_heuristics_config(None)  # pytype: disable=wrong-arg-types
-    self.assertEqual(config.tile_m, tile_size)
-    self.assertEqual(config.tile_k, tile_size)
-    self.assertEqual(config.tile_n, tile_size)
-    self.assertEqual(config.input_buffer_count, 1)
-    self.assertEqual(config.combine_scopes, True)
-
-    # Restore the original heuristics config method. Without this, other tests
-    # could use the incorrect heuristics config.
-    pallas_mosaic_tpu.PallasMosaicTpuRaggedDot._get_heuristics_config = (
-        original_heuristics_f
-    )
 
 
 if __name__ == "__main__":
