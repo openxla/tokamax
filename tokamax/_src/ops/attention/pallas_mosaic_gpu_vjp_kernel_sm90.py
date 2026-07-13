@@ -271,10 +271,13 @@ def flash_attention_vjp_kernel(
       k_end = load_k_range(k_end_gmem)
       m *= math.log2(math.e)
 
+      epsilon = jnp.finfo(jnp.float32).tiny  # Avoid division by zero.
+      l_rcp = 1.0 / (l + epsilon)
+
       plgpu.barrier_wait(barrier)
 
       def compute_dq(dq_acc):
-        _ = pipeline_callback((dq_acc, m, l, delta, k_start, k_end))
+        _ = pipeline_callback((dq_acc, m, l_rcp, delta, k_start, k_end))
         return dq_acc[...] * logits_scale
 
       dq = pl.run_scoped(compute_dq, plgpu.ACC(q_smem.shape, jnp.float32))
@@ -310,7 +313,7 @@ def flash_attention_vjp_kernel(
       ki = lb + i
       kv_base = ki * block_kv
       ks = pl.ds(kv_base, block_kv)
-      dq_acc, m, l, delta, k_start, k_end = carry
+      dq_acc, m, l_rcp, delta, k_start, k_end = carry
 
       def compute_s(acc):
         plgpu.wgmma(acc, q_smem, k_smem.T)
@@ -376,8 +379,7 @@ def flash_attention_vjp_kernel(
         s = jnp.where(mask, s, mask_value)
 
       broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
-      epsilon = jnp.finfo(jnp.float32).tiny  # Avoid division by zero.
-      p = jnp.exp2(s - broadcast(m)) / broadcast(l + epsilon)
+      p = jnp.exp2(s - broadcast(m)) * broadcast(l_rcp)
 
       def compute_dp(acc):
         plgpu.wgmma(acc, dout_smem, v_smem.T)
@@ -386,7 +388,7 @@ def flash_attention_vjp_kernel(
       dp = pl.run_scoped(compute_dp, plgpu.ACC(p.shape, jnp.float32))
       plgpu.barrier_arrive(v_consumed_barrier)
 
-      ds = p * (dp - lax.broadcast_in_dim(delta, p.shape, [0]))
+      ds = p * (dp - broadcast(delta))
       if logits_soft_cap is not None:
         ds *= 1 - logits * logits
 
@@ -403,7 +405,7 @@ def flash_attention_vjp_kernel(
       plgpu.wgmma(dq_acc, ds.astype(k_smem.dtype), k_smem)
       plgpu.wgmma_wait(0)
       plgpu.barrier_arrive(k_consumed_barrier)
-      return dq_acc, m, l, delta, k_start, k_end
+      return dq_acc, m, l_rcp, delta, k_start, k_end
 
     k_spec = _tiled_spec(
         (block_kv, head_dim), k.dtype, lambda i: (lb + i, 0), "k"
