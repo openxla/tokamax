@@ -49,6 +49,13 @@ benchmarks {
       stat: MEDIAN
     }
   }
+  metrics {
+    pattern: "attention_numerics/.*"
+    unit: "abs"
+    stats {
+      stat: LAST
+    }
+  }
 }
 
 benchmarks {

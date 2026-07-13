@@ -175,7 +175,9 @@ class AttentionBenchmark(parameterized.TestCase):
         ),
     )
 
-    # Benchmark autotuning for Mosaic.
+    # --------------------------------------------------------------------------
+    # Autotuning Benchmark
+    # --------------------------------------------------------------------------
     if (
         implementation == 'mosaic'
         and benchmark_mode == 'forward_and_vjp'
@@ -208,33 +210,48 @@ class AttentionBenchmark(parameterized.TestCase):
           ),
       )
 
-    # Numerics test.
-    if benchmark_mode == 'forward':
-      fn_ref, args_ref = tokamax.standardize_function(
-          functools.partial(
-              tokamax.dot_product_attention, implementation='xla_chunked'
-          ),
-          kwargs=example_ref,
-          mode=benchmark_mode,  # pytype: disable=wrong-arg-types
-      )
-      out_ref = jax.jit(fn_ref)(args_ref)
+    # --------------------------------------------------------------------------
+    # Numerics
+    # --------------------------------------------------------------------------
+    # Checking for for numerical equivalence with the xla_chunked implementation
+    # is a basic check that lik-for-like operaions are being benchmarked.
+    fn_ref, args_ref = tokamax.standardize_function(
+        functools.partial(
+            tokamax.dot_product_attention, implementation='xla_chunked'
+        ),
+        kwargs=example_ref,
+        mode=benchmark_mode,  # pytype: disable=wrong-arg-types
+    )
+    out_ref = jax.jit(fn_ref)(args_ref)
+    out_actual = fn(args)
 
-      out_actual = fn(args)
-      if implementation == 'cuequivariance':
-        # cuEquivariance returns (output, log-sum-exp, maximum value).
-        out_actual = out_actual[0].squeeze(axis=0)
-        out_actual = jnp.transpose(out_actual, (0, 2, 1, 3))
+    if benchmark_mode == 'forward_and_vjp':
+      out_ref, _ = out_ref
+      out_actual, _ = out_actual
 
-      diff = numerics.array_diff_summary(
-          expected=out_ref,
-          actual=out_actual,
-      )
-      logging.info(
-          'max_absolute_diff: %s, max_absolute_diff_values: %s l2_diff: %s',
-          str(diff.max_absolute_diff),
-          str(diff.max_absolute_diff_values),
-          str(diff.l2_diff),
-      )
+    if implementation == 'cuequivariance':
+      # cuEquivariance returns (output, log-sum-exp, maximum value).
+      out_actual = out_actual[0].squeeze(axis=0)
+      out_actual = jnp.transpose(out_actual, (0, 2, 1, 3))
+
+    diff = numerics.array_diff_summary(
+        expected=out_ref,
+        actual=out_actual,
+    )
+    common.write_tensorboard_logs(
+        tensorboard_output=_TENSORBOARD_OUTPUT_ENV_VAR.value,
+        value=diff.max_absolute_diff,
+        metric_tag=(
+            f"attention_numerics/{args_spec_name}/{implementation or 'default'}/{benchmark_mode}/max_absolute_diff"
+        ),
+    )
+    common.write_tensorboard_logs(
+        tensorboard_output=_TENSORBOARD_OUTPUT_ENV_VAR.value,
+        value=diff.l2_diff,
+        metric_tag=(
+            f"attention_numerics/{args_spec_name}/{implementation or 'default'}/{benchmark_mode}/l2_diff"
+        ),
+    )
 
 
 if __name__ == '__main__':
