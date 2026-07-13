@@ -128,15 +128,6 @@ class AttentionBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    # TODO: Re-enable once cuDNN bug is fixed.
-    if (
-        implementation == 'cudnn'
-        and benchmark_mode == 'forward_and_vjp'
-        and 'B200' in jax.devices()[0].device_kind
-        and args_spec_name == 'basic'
-    ):
-      self.skipTest('Skipping cudnn forward_and_vjp on B200.')
-
     if args_spec_name == 'alphafold':
       # TODO: Re-enable once Mosaic TPU supports learnable biases.
       if jax.default_backend() == 'tpu' and implementation == 'mosaic':
