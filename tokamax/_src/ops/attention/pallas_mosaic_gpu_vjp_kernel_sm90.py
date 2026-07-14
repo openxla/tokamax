@@ -526,16 +526,16 @@ def flash_attention_vjp_kernel(
         bias_smem,
         m_smem,
         l_smem,
+        delta_smem,
         mask_smem,
         dout_smem,
-        delta_smem,
         q_smem,
         bias_consumed_barrier,
         m_consumed_barrier,
         l_consumed_barrier,
+        delta_consumed_barrier,
         mask_consumed_barrier,
         dout_consumed_barrier,
-        delta_consumed_barrier,
         q_consumed_barrier,
         carry,
     ):
@@ -558,12 +558,14 @@ def flash_attention_vjp_kernel(
 
         m = plgpu.load(m_smem, (), layout=_WGMMA_COL)
         l = plgpu.load(l_smem, (), layout=_WGMMA_COL)
+        delta = plgpu.load(delta_smem, (), layout=_WGMMA_COL)
         plgpu.barrier_arrive(m_consumed_barrier)
         plgpu.barrier_arrive(l_consumed_barrier)
-        return acc[...], biasT, m, l
+        plgpu.barrier_arrive(delta_consumed_barrier)
+        return acc[...], biasT, m, l, delta
 
       acc_type = plgpu.ACC((block_kv, block_q), jnp.float32)
-      sT, biasT, m, l = pl.run_scoped(compute_sT, acc_type)
+      sT, biasT, m, l, delta = pl.run_scoped(compute_sT, acc_type)
       scale = logits_scale
 
       if biasT is not None:
@@ -627,20 +629,17 @@ def flash_attention_vjp_kernel(
       def compute_dpT(acc):
         plgpu.wgmma(acc, v_smem, dout_smem.T)
         plgpu.wgmma(dv_acc, pT.astype(dtype), dout_smem)
-        # TODO: Load this without waiting for the DV matmul to complete.
-        return acc[...]
+        # Load `dP.T` without waiting for the DV matmul to complete.
+        return plgpu.wgmma_accumulator_load(acc, wait_n=1)
 
       dpT = pl.run_scoped(compute_dpT, plgpu.ACC(pT.shape, jnp.float32))
-      plgpu.barrier_arrive(dout_consumed_barrier)
-
-      delta = plgpu.load(delta_smem, (), layout=_WGMMA_COL)
-      plgpu.barrier_arrive(delta_consumed_barrier)
-
       dsT = pT * (dpT - broadcast(delta))  # pytype: disable=wrong-arg-types  # jax-operator-types
       if logits_soft_cap is not None:
         dsT *= 1 - logits * logits
 
       plgpu.wgmma(dk_acc, dsT.astype(dtype), q_smem)
+      plgpu.wgmma_wait(1)
+      plgpu.barrier_arrive(dout_consumed_barrier)
       plgpu.wgmma_wait(0)
       plgpu.barrier_arrive(q_consumed_barrier)
       return dk_acc, dv_acc, loop_invariant_mask
@@ -684,12 +683,12 @@ def flash_attention_vjp_kernel(
             bias_spec,
             m_spec,
             l_spec,
+            delta_spec,
             mask_spec,
             dout_spec,
-            delta_spec,
             q_spec,
         ],
-    )(bias_gmem_, m_gmem, l_gmem, mask_gmem_, dout_gmem, delta_gmem, q_gmem)
+    )(bias_gmem_, m_gmem, l_gmem, delta_gmem, mask_gmem_, dout_gmem, q_gmem)
 
   def tiled_wgs_smem(shape, dtype, what=""):
     return mgpu_lib.tiled_swizzled_smem((compute_wgs, *shape), dtype, what)
