@@ -299,13 +299,13 @@ def flash_attention_vjp_kernel(
     # pipeline as they are not dependent on kv_step.
     def kv_pipeline(
         index,
+        v_smem,
         bias_smem,
         mask_smem,
-        v_smem,
         k_smem,
+        v_consumed_barrier,
         bias_consumed_barrier,
         mask_consumed_barrier,
-        v_consumed_barrier,
         k_consumed_barrier,
         carry,
     ):
@@ -315,18 +315,23 @@ def flash_attention_vjp_kernel(
       ks = pl.ds(kv_base, block_kv)
       dq_acc, m, l_rcp, delta, k_start, k_end = carry
 
-      def compute_s(acc):
-        plgpu.wgmma(acc, q_smem, k_smem.T)
+      def compute_dp_s(dp_acc, s_acc):
+        plgpu.wgmma(dp_acc, dout_smem, v_smem.T)
+        plgpu.wgmma(s_acc, q_smem, k_smem.T)
+
         if bias_gmem is None:
           bias = None
         elif bias_smem is None:
           bias = _load_bcast(bias_gmem, (qs, ks), layout=_WGMMA)
         else:
           bias = bias_smem[pl.ds(wg * block_q, block_q)]
-        return acc[...], bias
+
+        plgpu.wgmma_wait(1)
+        plgpu.barrier_arrive(v_consumed_barrier)
+        return dp_acc[...], s_acc[...], bias
 
       acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
-      s, bias = pl.run_scoped(compute_s, acc_type)
+      dp, s, bias = pl.run_scoped(compute_dp_s, acc_type, acc_type)
       scale = logits_scale
 
       if bias is not None:
@@ -368,27 +373,21 @@ def flash_attention_vjp_kernel(
       if mask_gmem is not None:
         if mask_smem is None:
           mask = _load_bcast(mask_gmem, (qs, ks), layout=_WGMMA)
-        elif mask_smem.ndim == 1:
-          mask = plgpu.load(mask_smem, (), layout=_WGMMA_COL)
-          mask = lax.broadcast_in_dim(mask, s.shape, [1])
-          plgpu.barrier_arrive(mask_consumed_barrier)
         else:
-          mask = mask_smem[pl.ds(wg * block_q, block_q)]
+          if mask_smem.ndim == 1:
+            mask = plgpu.load(mask_smem, (), layout=_WGMMA_COL)
+            mask = lax.broadcast_in_dim(mask, s.shape, [1])
+          else:
+            mask = mask_smem[pl.ds(wg * block_q, block_q)]
+          mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(mask_consumed_barrier)
 
         s = jnp.where(mask, s, mask_value)
 
       broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
       p = jnp.exp2(s - broadcast(m)) * broadcast(l_rcp)
-
-      def compute_dp(acc):
-        plgpu.wgmma(acc, dout_smem, v_smem.T)
-        return acc[...]
-
-      dp = pl.run_scoped(compute_dp, plgpu.ACC(p.shape, jnp.float32))
-      plgpu.barrier_arrive(v_consumed_barrier)
-
       ds = p * (dp - broadcast(delta))
+
       if logits_soft_cap is not None:
         ds *= 1 - logits * logits
 
@@ -443,8 +442,8 @@ def flash_attention_vjp_kernel(
         wg_axis="wg",
         manual_consumed_barriers=True,
         compute_context=compute_thread,
-        in_specs=[bias_spec, mask_spec, v_spec, k_spec],
-    )(bias_gmem_, mask_gmem_, v_gmem, k_gmem)
+        in_specs=[v_spec, bias_spec, mask_spec, k_spec],
+    )(v_gmem, bias_gmem_, mask_gmem_, k_gmem)
 
   def kernel_dkv(
       q_gmem,
