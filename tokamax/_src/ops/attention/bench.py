@@ -53,7 +53,7 @@ _BENCHMARK_IMPLS_FWD_BWD = flags.DEFINE_list(
     'List of implementations to benchmark forward and backward.',
 )
 _register_benchmark = functools.partial(
-    benchmarking.get_benchmark_registrar(_IMPLS),
+    benchmarking.get_benchmark_registrar(_IMPLS),  # pyrefly: ignore[bad-argument-type]
     iterations=3,
     raise_on_error=False,
 )

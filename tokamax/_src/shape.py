@@ -32,7 +32,9 @@ SymbolicDim: TypeAlias = type(export.symbolic_shape("_a")[0])  # pytype: disable
 einshape = lambda eq, **kw: functools.partial(einshape_jax.einshape, eq, **kw)
 
 
-def pad_dim_to(x: jax.Array, n: int, axis: int, pad_value: int = 0) -> jax.Array:
+def pad_dim_to(
+    x: jax.Array, n: int, axis: int, pad_value: Any = 0
+) -> jax.Array:
   """Pads `x` to size `n` along `axis`."""
   if (padding := n - x.shape[axis]) == 0:
     return x
@@ -44,7 +46,7 @@ def pad_dim_to(x: jax.Array, n: int, axis: int, pad_value: int = 0) -> jax.Array
 
 
 def pad_to_next_multiple_of(
-    x: jax.Array, m: int, axis: int = 0, pad_value: int = 0
+    x: jax.Array, m: int, axis: int = 0, pad_value: Any = 0
 ) -> jax.Array:
   """Pads `x` to the next multiple of `m` along `axis`."""
   return pad_dim_to(x, pl.cdiv(x.shape[axis], m) * m, axis, pad_value)

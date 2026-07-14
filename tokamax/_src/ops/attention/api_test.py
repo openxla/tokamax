@@ -242,7 +242,7 @@ class DotProductAttentionTest(parameterized.TestCase):
       )
       # The JAX implementation zeroes output rows in the padding region.
       if qs is not None:
-        mask = jnp.arange(0, T)[None, :] < q_seqlen[:, None]
+        mask = jnp.arange(0, T)[None, :] < qs[:, None]
         out *= mask[:, :, None, None]
       return out
 
@@ -419,8 +419,8 @@ class DotProductAttentionCudnnTest(DotProductAttentionTest):
     fn = functools.partial(api.dot_product_attention, implementation=self.IMPL)
     x = jax.ShapeDtypeStruct((2, 256, 4, 64), dtype=jnp.bfloat16)
     lowered = jax.jit(fn).lower(x, x, x)
-    hlo_text = lowered.compiler_ir(dialect='hlo').as_hlo_text()
-    self.assertIn(_CUDNN_CUSTOM_CALL_TARGET, hlo_text)
+    self.assertIsNotNone(hlo := lowered.compiler_ir('hlo'))
+    self.assertIn(_CUDNN_CUSTOM_CALL_TARGET, hlo.as_hlo_text())
 
 
 class DotProductAttentionXlaTest(DotProductAttentionTest):

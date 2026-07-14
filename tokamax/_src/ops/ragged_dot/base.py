@@ -29,11 +29,6 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from typing_extensions import override
 
-# TODO: Directly import ManualAxisType JAX is upgraded.
-try:
-  from jax.sharding import ManualAxisType
-except ImportError:
-  ManualAxisType = Any
 
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
@@ -244,7 +239,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       return_residuals: bool = False,
       group_offset: jax.Array | None = None,
       activation: ActivationFunction | None = None,
-      manual_axis_type: ManualAxisType | None = None,
+      manual_axis_type: jax.sharding.ManualAxisType | None = None,
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,
       maybe_quantize_lhs: bool = False,
@@ -307,7 +302,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       return_residuals: bool,
       config: _Config,
       activation: ActivationFunction | None = None,
-      manual_axis_type: ManualAxisType | None = None,
+      manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,
@@ -382,7 +377,7 @@ def vjp(
     dlhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     # `manual_axis_type` is not used, but is expected by vjp.
-    manual_axis_type: ManualAxisType | None = None,
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
     # The following are forward-only features (forwarded here by the op
     # framework because they are part of `bind`). The backward path does not
     # support quantized/biased/fused gradients, so they must be at defaults and
@@ -449,12 +444,7 @@ def vjp(
       ),
       precision=precision,
       preferred_element_type=lhs.dtype,
-      # TODO: Remove "hasattr" check once JAX is upgraded.
-      manual_axis_type=(
-          jax.typeof(lhs).manual_axis_type.to_ct_mat()
-          if hasattr(jax.typeof(lhs), "manual_axis_type")
-          else None
-      ),
+      manual_axis_type=jax.typeof(lhs).manual_axis_type.to_ct_mat(),
   )
 
   dot_dim_nums = ((lhs_kept, dout_lhs_kept), (lhs_batch, dout_batch))
@@ -469,11 +459,6 @@ def vjp(
       ),
       precision=precision,
       preferred_element_type=rhs.dtype,
-      # TODO: Remove "hasattr" check once JAX is upgraded.
-      manual_axis_type=(
-          jax.typeof(rhs).manual_axis_type.to_ct_mat()
-          if hasattr(jax.typeof(rhs), "manual_axis_type")
-          else None
-      ),
+      manual_axis_type=jax.typeof(rhs).manual_axis_type.to_ct_mat(),
   )
   return dlhs, drhs

@@ -229,14 +229,14 @@ class DumpHloLibTest(parameterized.TestCase):
     )
     op_specs = hlo_utils.get_opspecs(computation)
 
-    norm_spec = norm_op.bind(  # pytype: disable=wrong-arg-types
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+    norm_spec = norm_op.bind(
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
     )
-    glu_spec = glu_op.bind(  # pytype: disable=wrong-arg-types
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),
+    glu_spec = glu_op.bind(
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
         activation=jax.nn.swish,
     )
 
@@ -254,10 +254,10 @@ class DumpHloLibTest(parameterized.TestCase):
     )
     op_specs = hlo_utils.get_opspecs(computation, include_xla_kernels=False)
 
-    norm_spec = norm_op.bind(  # pytype: disable=wrong-arg-types
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+    norm_spec = norm_op.bind(
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
         return_residuals=True,
     )
     norm_vjp_op = typing.cast(
@@ -287,10 +287,10 @@ class DumpHloLibTest(parameterized.TestCase):
 
     # TODO: Add a test for vmap.
     op = pl_norm.PallasTritonNormalization()
-    ba = op.bind(  # pytype: disable=wrong-arg-types
-        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
+    ba = op.bind(
+        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
     )
 
     fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
@@ -312,9 +312,9 @@ class DumpHloLibTest(parameterized.TestCase):
       self.skipTest('This test only runs on GPU.')
 
     op = pl_ragged_dot.PallasTritonRaggedDot()
-    ba = op.bind(  # pytype: disable=wrong-arg-types
-        jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),
-        jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),
+    ba = op.bind(
+        jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
         group_sizes=[128] * 8,
     )
 

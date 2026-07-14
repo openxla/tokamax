@@ -37,12 +37,15 @@ class ArgSpec:
     project: The project the argument specification comes from.
     name: The name of the argument specification.
     tags: Tags for the argument specification.
+    excluded_platforms: Platforms to exclude from tuning for this argument
+      specification.
   """
 
   args: dict[str, Any]
   project: str = ''
   name: str = ''
   tags: tuple[Tag, ...] = ()
+  excluded_platforms: tuple[str, ...] = ()
 
   @property
   def full_name(self) -> str:

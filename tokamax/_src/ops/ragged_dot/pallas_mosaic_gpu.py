@@ -79,12 +79,6 @@ def _input_subchannel(x) -> int | None:
   return None
 
 
-# TODO: Directly import ManualAxisType JAX is upgraded.
-try:
-  from jax.sharding import ManualAxisType  # pylint: disable=g-import-not-at-top,g-importing-member
-except ImportError:
-  ManualAxisType = Any
-
 # TODO: Natively support mk,ekn->mn.
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
@@ -117,7 +111,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool,
       config: Config,
       activation: base.ActivationFunction | None = None,
-      manual_axis_type: ManualAxisType | None = None,
+      manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,

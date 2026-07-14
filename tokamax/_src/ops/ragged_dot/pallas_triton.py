@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import math
-from typing import Any, Callable, ClassVar
+from typing import Callable, ClassVar
 
 import jax
 from jax import numpy as jnp
@@ -32,11 +32,6 @@ from tokamax._src.ops.ragged_dot import base
 from tokamax._src.pallas import block
 from typing_extensions import override
 
-# TODO: Directly import ManualAxisType JAX is upgraded.
-try:
-  from jax.sharding import ManualAxisType
-except ImportError:
-  ManualAxisType = Any
 
 Residuals = base.Residuals
 QArray = base.QArray
@@ -367,7 +362,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool,
       config: Config,
       activation: Callable[[jax.Array], jax.Array] | None = None,
-      manual_axis_type: ManualAxisType | None = None,
+      manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,

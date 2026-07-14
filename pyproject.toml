@@ -61,14 +61,14 @@ test = [
 bench = [
     "google-benchmark>=1.9.0",
     "xprof",
-    "cuequivariance-jax>=0.10.0",
-    "cuequivariance-ops-jax-cu13>=0.10.0",
-    "triton"
 ]
 
 cuda = [
     "jax[cuda13]>=0.10.1",
     "nvidia-cudnn-cu13>=9.23.0.39",
+    "cuequivariance-jax>=0.10.0",
+    "cuequivariance-ops-jax-cu13>=0.10.0",
+    "triton"
 ]
 
 tpu = [

@@ -264,12 +264,20 @@ def ragged_contracting_dim_dot_kernel(
       config=config,
       activation=activation,
   )
+  if jax.__version_info__ >= (0, 11, 0):
+    lowering_semantics = plgpu.LoweringSemantics.Warpgroup
+  else:
+    lowering_semantics = plgpu.LoweringSemantics.Lane
+
   kernel = plgpu.kernel(
       body,
       out_type=jax.ShapeDtypeStruct((g, m, n), out_dtype),
       grid=(pl.cdiv(m, config.block_m), pl.cdiv(n, config.block_n), g),
       grid_names=("m", "n", "g"),
       kernel_name="ragged_contracting_dim_dot_sm90",
+      compiler_params=plgpu.CompilerParams(
+          lowering_semantics=lowering_semantics
+      )
   )
 
   group_sizes_starts = jnp.cumulative_sum(group_sizes, include_initial=True)

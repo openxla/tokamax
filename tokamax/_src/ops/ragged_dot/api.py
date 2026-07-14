@@ -56,11 +56,6 @@ try:
 except ImportError:
   pass
 
-# TODO: Directly import ManualAxisType JAX is upgraded.
-try:
-  from jax.sharding import ManualAxisType
-except ImportError:
-  ManualAxisType = Any
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(_IMPLEMENTATIONS)
@@ -76,7 +71,7 @@ def ragged_dot(
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
     activation: base.ActivationFunction | None = None,
-    manual_axis_type: ManualAxisType | None = None,
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
     *,
     implementation: (
         Implementation
@@ -137,7 +132,7 @@ def ragged_dot_general(
     preferred_element_type: jax.typing.DTypeLike | None = None,
     group_offset: Array | None = None,
     activation: base.ActivationFunction | None = None,
-    manual_axis_type: ManualAxisType | None = None,
+    manual_axis_type: jax.sharding.ManualAxisType | None = None,
     *,
     implementation: (
         Implementation

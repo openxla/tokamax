@@ -79,7 +79,7 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
 
     def impl(q, k, v, *, bias, **kwargs):
       cast = lambda x: None if x is None else x.astype(jnp.bfloat16)
-      return orig_impl(cast(q), cast(k), cast(v), bias=cast(bias), **kwargs)
+      return orig_impl(cast(q), cast(k), cast(v), bias=cast(bias), **kwargs)  # pyrefly: ignore[not-callable]
 
     kwargs["impl"] = impl
     kwargs["atol"] = 0.025 if "bias" in kwargs else 0.015
@@ -104,8 +104,8 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
   def test_impl_in_hlo(self):
     x = jnp.empty((2, 256, 4, 64), dtype=jnp.bfloat16)
     lowered = jax.jit(self._attention_fn).lower(x, x, x)
-    hlo_text = lowered.compiler_ir(dialect="hlo").as_hlo_text()
-    self.assertIn(_CUDNN_CUSTOM_CALL_TARGET, hlo_text)
+    self.assertIsNotNone(hlo := lowered.compiler_ir("hlo"))
+    self.assertIn(_CUDNN_CUSTOM_CALL_TARGET, hlo.as_hlo_text())
 
 
 if __name__ == "__main__":

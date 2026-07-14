@@ -24,7 +24,6 @@ from tokamax._src import gpu_utils
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
-from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.ragged_dot import (
     pallas_mosaic_gpu_kernel_sm100_fp8_quant as sm100_fp8_quant,
 )
@@ -229,7 +228,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
             actual[:count], expected[:count], atol=0.01, rtol=0.005
         )
 
-  def _dequant(self, qarray: qwix.QArray, subchannel: int) -> chex.Array:
+  def _dequant(self, qarray: qwix.QArray, subchannel: int) -> jax.Array:
     q = qarray.qvalue.astype(jnp.float32)
     s = jnp.repeat(qarray.scale.astype(jnp.float32), subchannel, axis=1)
     return q * s
@@ -278,6 +277,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     out2 = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
         a, b, jnp.asarray(group_sizes), jnp.bfloat16, config, activation
     )
+    self.assertIsInstance(out2, qwix.QArray)
     chex.assert_trees_all_equal(out.qvalue, out2.qvalue)
     chex.assert_trees_all_equal(out.scale, out2.scale)
 
@@ -401,6 +401,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
         a, b, group_sizes, jnp.bfloat16, config, None
     )
+    self.assertIsInstance(out, qwix.QArray)
     actual = self._dequant(out, sub)
     expected = test_base.ref(a, b, group_sizes, None)
     count = int(group_sizes.sum())
@@ -440,6 +441,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
         a, b, group_sizes, jnp.bfloat16, config, activation
     )
+    self.assertIsInstance(out, qwix.QArray)
     actual = self._dequant(out, 128)
     expected = test_base.ref(a, b, group_sizes, activation)
     count = int(group_sizes.sum())
@@ -539,6 +541,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
     # Baseline: dot1 -> bf16, explicit middle quant, then dot2.
     h_bf16 = kernel(a, w1, gs, jnp.bfloat16, cfg_plain, activation)
+    self.assertIsInstance(h_bf16, jax.Array)
     h_base = qwix.quantize(h_bf16, jnp.float8_e4m3fn, tiled_axes={0: 1, 1: sub})
     y_base = kernel(h_base, w2, gs, jnp.bfloat16, cfg_plain, None)
 

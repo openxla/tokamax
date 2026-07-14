@@ -87,7 +87,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045)
     kwargs["atol_grads"] = None if bias is None else 0.02
-    kwargs["test_vjp_deterministic"] = not gpu_utils.is_sm100()
 
     if not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
@@ -202,13 +201,13 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     out, res = jax.eval_shape(fwd_with_res, q, k, v)
     ba = attn_fn.bind(q, k, v, **kwargs)
     ba = dataclasses.replace(
-        ba, arguments=ba.arguments | dict(residuals=res, out=out, dout=out)
+        ba, arguments=dict(**ba.arguments, residuals=res, out=out, dout=out)
     )
-    configs = vjp_fn._get_autotuning_configs(ba)
+    configs = vjp_fn._get_autotuning_configs(ba)  # pyrefly: ignore[missing-attribute]
     self.assertNotEmpty(configs)
     for config in configs:
       with self.subTest(f"{config=}"):
-        impl = type(attn_fn)(vjp=type(vjp_fn)(config=config))
+        impl = type(attn_fn)(vjp=type(vjp_fn)(config=config))  # pyrefly: ignore[unexpected-keyword]
         self._run_test_with_inputs(q, k, v, impl=impl)
         jax.clear_caches()
 
@@ -219,7 +218,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     op_cls = type(self._attention_fn)
     cfg_cls = op_cls.config_cls
     if get_origin(cfg_cls) in {Union, UnionType}:
-      cfg_cls = fa._get_kernel_module(backend.get_default_device()).Config
+      cfg_cls = fa._get_kernel_module().Config
     cfg_dict = dict(block_q=128, block_kv=64, split_k=2, collective=False)
     cfg_dict = {k: v for k, v in cfg_dict.items() if hasattr(cfg_cls, k)}
     self._run_test((2, 1024, 4, 64), impl=op_cls(config=cfg_cls(**cfg_dict)))

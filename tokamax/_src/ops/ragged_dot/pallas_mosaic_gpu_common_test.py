@@ -28,7 +28,7 @@ class GroupInfoTest(parameterized.TestCase):
   def test_create_aligned(self, tid_size):
     group_sizes = jnp.array([17, 31, 24])
     actual = common.GroupInfo.create_aligned(
-        group_sizes=group_sizes, tile=32, tid_size=tid_size, align_tile=8
+        group_sizes=group_sizes, tile=32, tid_size=tid_size, align_tile=8  # pyrefly: ignore[bad-argument-type]
     )
     block_start_tail = [48 + 32 * (i + 1) for i in range(tid_size - 3)]
     expected = dict(
@@ -43,7 +43,7 @@ class GroupInfoTest(parameterized.TestCase):
 
   def test_create_aligned_empty_groups(self):
     actual = common.GroupInfo.create_aligned(
-        group_sizes=jnp.array([17, 0, 31]), tile=32, tid_size=5, align_tile=8
+        group_sizes=jnp.array([17, 0, 31]), tile=32, tid_size=5, align_tile=8  # pyrefly: ignore[bad-argument-type]
     )
     expected = dict(
         group_id=jnp.array([0, 2, 2, 2, 2]),
@@ -57,7 +57,7 @@ class GroupInfoTest(parameterized.TestCase):
 
   def test_create_aligned_multiple_blocks_per_group(self):
     actual = common.GroupInfo.create_aligned(
-        group_sizes=jnp.array([41, 32, 33]), tile=32, tid_size=6, align_tile=8
+        group_sizes=jnp.array([41, 32, 33]), tile=32, tid_size=6, align_tile=8  # pyrefly: ignore[bad-argument-type]
     )
     expected = dict(
         group_id=jnp.array([0, 0, 1, 1, 2, 2]),
@@ -71,7 +71,7 @@ class GroupInfoTest(parameterized.TestCase):
 
   def test_create_aligned_multiple_blocks_per_group_aligned(self):
     actual = common.GroupInfo.create_aligned(
-        group_sizes=jnp.array([40, 32, 33]), tile=32, tid_size=6, align_tile=8
+        group_sizes=jnp.array([40, 32, 33]), tile=32, tid_size=6, align_tile=8  # pyrefly: ignore[bad-argument-type]
     )
     expected = dict(
         group_id=jnp.array([0, 0, 1, 2, 2, 2]),

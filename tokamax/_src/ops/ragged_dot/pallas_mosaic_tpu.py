@@ -31,11 +31,6 @@ from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
 from typing_extensions import override
 
-# TODO: Directly import ManualAxisType JAX is upgraded.
-try:
-  from jax.sharding import ManualAxisType
-except ImportError:
-  ManualAxisType = Any
 
 # Tiling on TPU technically needs to be a multiple of 128, but it's possible to
 # request a "full tile" of an array equal to the full axis size and that doesn't
@@ -134,7 +129,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       return_residuals: bool = False,
       config: Config,
       activation: base.ActivationFunction | None = None,
-      manual_axis_type: ManualAxisType | None = None,
+      manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,

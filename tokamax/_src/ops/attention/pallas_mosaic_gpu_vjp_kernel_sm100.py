@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
@@ -75,27 +76,22 @@ def _get_dq_scratch_shapes(
     bias_dtype,
     mask_shape,
     mask_dtype,
-    orig_ds_dtype=None,
 ):
   ds_stages = 2 if config.double_buffer else 1
-  if orig_ds_dtype == jnp.float32:
-    ds_smem_ref = plgpu.RefUnion(
-        plgpu.SMEM(
-            (ds_stages, config.block_q_dq, chunk_size),
-            jnp.float32,
-            transforms=_smem_transforms(jnp.float32, swizzle=64),
-        ),
+  ds_smems = [
+      plgpu.SMEM(
+          (ds_stages, config.block_q_dq, chunk_size),
+          k_dtype,
+          transforms=_smem_transforms(k_dtype, swizzle=64),
+      )
+  ]
+  if bias_shape is not None:
+    ds_smems.append(
         plgpu.SMEM(
             (ds_stages, config.block_q_dq, chunk_size),
             ds_dtype,
             transforms=_smem_transforms(ds_dtype, swizzle=64),
-        ),
-    )
-  else:
-    ds_smem_ref = plgpu.SMEM(
-        (ds_stages, config.block_q_dq, chunk_size),
-        ds_dtype,
-        transforms=_smem_transforms(ds_dtype, swizzle=64),
+        )
     )
   shapes = dict(
       q_smem=plgpu.SMEM(
@@ -118,7 +114,7 @@ def _get_dq_scratch_shapes(
           v_dtype,
           transforms=_smem_transforms(v_dtype, swizzle=64),
       ),
-      ds_smem=ds_smem_ref,
+      ds_smem=plgpu.RefUnion(*ds_smems),
       s_tmem=plgpu.TMEM((config.block_q_dq, config.block_kv_dq), jnp.float32),
       dp_tmem=plgpu.TMEM((config.block_q_dq, config.block_kv_dq), jnp.float32),
       dq_tmem=plgpu.TMEM((config.block_q_dq, head_dim), jnp.float32),
@@ -180,7 +176,6 @@ def _get_dkv_scratch_shapes(
     dout_dtype,
     k_dtype,
     v_dtype,
-    ds_dtype,
     bias_shape,
     bias_dtype,
     mask_shape,
@@ -210,13 +205,13 @@ def _get_dkv_scratch_shapes(
       ),
       ds_smem=plgpu.SMEM(
           (ds_stages, config.block_kv_dkv, chunk_size),
-          ds_dtype,
-          transforms=_smem_transforms(ds_dtype, swizzle=64),
+          q_dtype,
+          transforms=_smem_transforms(q_dtype, swizzle=64),
       ),
       p_smem=plgpu.SMEM(
           (ds_stages, config.block_kv_dkv, chunk_size),
-          ds_dtype,
-          transforms=_smem_transforms(ds_dtype, swizzle=64),
+          dout_dtype,
+          transforms=_smem_transforms(dout_dtype, swizzle=64),
       ),
       s_tmem=plgpu.TMEM((config.block_kv_dkv, config.block_q_dkv), jnp.float32),
       dp_tmem=plgpu.TMEM(
@@ -307,8 +302,17 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
       common.decompose_mask, mask_obj, q, k, q_indices, k_indices
   )
 
-  head_dim, head_dim_out, ds_dtype = _get_input_metadata(q, v)
+  head_dim, head_dim_out = _get_input_metadata(q, v)
+  dbias_intermediate_dtype = getattr(ba.op, "dbias_intermediate_dtype", None)
 
+  if bias is None:
+    ds_dtype = None
+  elif dbias_intermediate_dtype is None:
+    ds_dtype = bias.dtype
+  elif bias.shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
+    ds_dtype = bias.dtype
+  else:
+    ds_dtype = dbias_intermediate_dtype
 
   configs = set()
   min_dq_smem = float("inf")
@@ -316,14 +320,10 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   min_total_smem = float("inf")
   fallback_dq_smem = 0
   fallback_dkv_smem = 0
-  orig_ds_dtype = bias.dtype if bias is not None else ds_dtype
   q_dtype = _downcast_if_needed(q.dtype, q_k_prec)
   k_dtype = _downcast_if_needed(k.dtype, q_k_prec)
   v_dtype = _downcast_if_needed(v.dtype, v_prec)
   dout_dtype = _downcast_if_needed(dout.dtype, v_prec)
-
-  if bias is not None and ((bias.ndim >= 4 and bias.shape[-4] == 1) or (bias.ndim >= 3 and bias.shape[-3] == 1)):
-    orig_ds_dtype = jnp.float32
 
   for q_kv_block_size in (128, 64):
     for double_buffer in (False, True):
@@ -360,7 +360,6 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                     bias_dtype=bias.dtype if bias is not None else None,
                     mask_shape=mask.shape if mask is not None else None,
                     mask_dtype=mask.dtype if mask is not None else None,
-                    orig_ds_dtype=orig_ds_dtype,
                 )
                 dkv_shapes = _get_dkv_scratch_shapes(
                     config=config,
@@ -371,7 +370,6 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                     dout_dtype=dout_dtype,
                     k_dtype=k_dtype,
                     v_dtype=v_dtype,
-                    ds_dtype=ds_dtype,
                     bias_shape=bias.shape if bias is not None else None,
                     bias_dtype=bias.dtype if bias is not None else None,
                     mask_shape=mask.shape if mask is not None else None,
@@ -490,34 +488,6 @@ def _kernel(body, out_type, **kernel_kwargs):
   return unwrap
 
 
-def _pad(x, axis, block, constant_values=0, broadcastable=False):
-  """Pads an array to a multiple of `block` along `axis`."""
-  if x is None:
-    return None
-  if axis is None:
-    return x
-
-  if isinstance(axis, int):
-    axis = (axis,)
-    block = (block,)
-
-  padding = [(0, 0)] * x.ndim
-  should_pad = False
-  for ax, blk in zip(axis, block):
-    if broadcastable and x.shape[ax] == 1:
-      continue
-    if x.shape[ax] % blk == 0:
-      continue
-    pad_len = blk - (x.shape[ax] % blk)
-    padding[ax] = (0, pad_len)
-    should_pad = True
-
-  if not should_pad:
-    return x
-
-  return jnp.pad(x, padding, constant_values=constant_values)
-
-
 def _smem_transforms(dtype, swizzle=128):
   return (
       plgpu.TilingTransform((8, swizzle // jnp.dtype(dtype).itemsize)),
@@ -562,14 +532,7 @@ def _get_input_metadata(q, v):
   """Normalizes and returns head dimensions and datatypes."""
   head_dim = pl.cdiv(q.shape[-1], 64) * 64
   head_dim_out = pl.cdiv(v.shape[-1], 64) * 64
-
-  dtype = jnp.dtype(q.dtype)
-  # We downcast float32 to float16 because 32-bit types will always exceed
-  # the shared memory capacity in the dual kernel.
-  if dtype == jnp.float32:
-    dtype = jnp.dtype(jnp.float16)
-
-  return head_dim, head_dim_out, dtype
+  return head_dim, head_dim_out
 
 
 def _estimate_smem_bytes(scratch_shapes: dict) -> int:
@@ -675,8 +638,6 @@ def _kernel_dq(
     is_causal,
     logits_scale,
     logits_soft_cap,
-    orig_ds_dtype=None,
-    reduce_ds: bool = False,
 ):
   """Computes dq."""
   ds_stages = 2 if config.double_buffer else 1
@@ -883,14 +844,9 @@ def _kernel_dq(
             c_start = chunk_idx * config.chunk_size
             chunk_slice = pl.ds(c_start, config.chunk_size)
 
-            if orig_ds_dtype == jnp.float32:
-              _, ds_smem_bf16 = ds_smem
-            else:
-              ds_smem_bf16 = ds_smem
-
             plgpu.tcgen05_mma(
                 dq_tmem,
-                ds_smem_bf16.at[ci],
+                ds_smem[0].at[ci],
                 k_smem.at[si, chunk_slice, :],
                 accumulate=(ki > lb) | (chunk_idx > 0),
             )
@@ -1116,82 +1072,39 @@ def _kernel_dq(
         if mask_ref is not None:
           ds_val = jnp.where(mask_val, ds_val, 0.0)
 
-        if orig_ds_dtype == jnp.float32 and ds_ref is not None:
-          ds_smem_f32, ds_smem_bf16 = ds_smem
-          ds_smem_f32.at[ci].set(ds_val)
+        if ds_ref is None:
+          [ds_smem_mma] = ds_smem
+          ds_smem_mma[ci] = ds_val.astype(ds_smem_mma.dtype)
+          plgpu.commit_smem()
+        else:
+          ds_smem_mma, ds_smem_tma = ds_smem
+          ds_smem_tma[ci] = ds_val.astype(ds_smem_tma.dtype)
           plgpu.commit_smem()
 
-          red_op = "add" if reduce_ds else None
           if ds_ref.ndim == 4:
-            b_m = 0 if ds_ref.shape[-4] == 1 else b
-            hi_m = 0 if ds_ref.shape[-3] == 1 else hi
             plgpu.copy_smem_to_gmem(
-                ds_smem_f32.at[ci],
+                ds_smem_tma.at[ci],
                 ds_ref.at[
-                    b_m,
-                    hi_m,
+                    b,
+                    hi,
                     qs,
                     pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size),
                 ],
-                reduction_op=red_op,
             )
           else:
-            hi_m = 0 if ds_ref.shape[-3] == 1 else hi
             plgpu.copy_smem_to_gmem(
-                ds_smem_f32.at[ci],
+                ds_smem_tma.at[ci],
                 ds_ref.at[
-                    hi_m,
+                    hi,
                     qs,
                     pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size),
                 ],
-                reduction_op=red_op,
             )
           plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-          ds_smem_bf16.at[ci].set(ds_val.astype(ds_smem_bf16.dtype))
-          plgpu.commit_smem()
-        else:
-          if orig_ds_dtype == jnp.float32:
-            _, ds_smem_bf16 = ds_smem
-          else:
-            ds_smem_bf16 = ds_smem
-          if ds_ref is not None:
-            ds_smem_bf16.at[ci].set(ds_val.astype(ds_smem_bf16.dtype))
+          if ds_smem_mma.dtype != ds_smem_tma.dtype:
+            ds_smem_mma[ci] = ds_val.astype(ds_smem_mma.dtype)
             plgpu.commit_smem()
-
-            red_op = "add" if reduce_ds else None
-            if ds_ref.ndim == 4:
-              b_m = 0 if ds_ref.shape[-4] == 1 else b
-              hi_m = 0 if ds_ref.shape[-3] == 1 else hi
-              plgpu.copy_smem_to_gmem(
-                  ds_smem_bf16.at[ci],
-                  ds_ref.at[
-                      b_m,
-                      hi_m,
-                      qs,
-                      pl.ds(
-                          ki * config.block_kv_dq + c_start, config.chunk_size
-                      ),
-                  ],
-                  reduction_op=red_op,
-              )
-            else:
-              hi_m = 0 if ds_ref.shape[-3] == 1 else hi
-              plgpu.copy_smem_to_gmem(
-                  ds_smem_bf16.at[ci],
-                  ds_ref.at[
-                      hi_m,
-                      qs,
-                      pl.ds(
-                          ki * config.block_kv_dq + c_start, config.chunk_size
-                      ),
-                  ],
-                  reduction_op=red_op,
-              )
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-          ds_smem_bf16.at[ci].set(ds_val.astype(ds_smem_bf16.dtype))
-          plgpu.commit_smem()
 
         plgpu.barrier_arrive(ds_produced.at[ci])
 
@@ -1703,6 +1616,12 @@ def _kernel_dkv(
       plgpu.barrier_wait(ds_consumed.at[i])
 
 
+def _pad_maybe_bcast(x, m, axis):
+  if x.shape[axis] == 1:
+    return x
+  return shape_lib.pad_to_next_multiple_of(x, m, axis)
+
+
 @jaxtyping.jaxtyped
 def flash_attention_vjp_kernel(
     q: Float[Array, "*B T H D"],
@@ -1736,7 +1655,6 @@ def flash_attention_vjp_kernel(
   chunk_size = config.chunk_size
 
   batch_shape = q.shape[:-3]
-  orig_bias_shape = bias.shape if bias is not None else None
 
   def _reshape_4d(arr, core_ndim):
     if arr is None:
@@ -1754,27 +1672,16 @@ def flash_attention_vjp_kernel(
   m, l = [_reshape_4d(x, 2) for x in residuals]
   residuals = (m, l)
   bias, mask = [_reshape_4d(x, 3) for x in (bias, mask)]
-  bias_4d_shape = bias.shape if bias is not None else None
   k_start, k_end = [_reshape_4d(x, 2) for x in (k_start, k_end)]
 
   assert q is not None  # To make pytype happy
-  orig_ds_dtype = (
-      ds_dtype
-      if ds_dtype is not None
-      else (bias.dtype if bias is not None else q.dtype)
-  )
-
-  # If there are many elements in the batch or head dimensions, we accumulate
-  # from multiple thread blocks, which requires float32 reduction for precision.
-  if bias is not None and (bias_4d_shape[-4] == 1 or bias_4d_shape[-3] == 1):
-    orig_ds_dtype = jnp.float32
 
   # TODO: Remove explicit padding in favor of TMA out-of-bounds zero-filling and in-kernel -inf masking.
-  q = _pad(q, -3, block_q_dq)
-  out = _pad(out, -3, block_q_dq)
-  dout = _pad(dout, -3, block_q_dq)
-  k = _pad(k, -3, block_kv_dkv)
-  v = _pad(v, -3, block_kv_dkv)
+  q = shape_lib.pad_to_next_multiple_of(q, block_q_dq, -3)
+  out = shape_lib.pad_to_next_multiple_of(out, block_q_dq, -3)
+  dout = shape_lib.pad_to_next_multiple_of(dout, block_q_dq, -3)
+  k = shape_lib.pad_to_next_multiple_of(k, block_kv_dkv, -3)
+  v = shape_lib.pad_to_next_multiple_of(v, block_kv_dkv, -3)
 
   # TODO: Avoid broadcast.
   bcast = lambda x: jnp.broadcast_to(
@@ -1787,15 +1694,15 @@ def flash_attention_vjp_kernel(
     mask = mask.astype(jnp.int8)
 
   if mask is not None:
-    mask = _pad(mask, -2, block_q_dq, broadcastable=True)
-    mask = _pad(mask, -1, block_kv_dkv, broadcastable=True)
+    mask = _pad_maybe_bcast(mask, block_q_dq, -2)
+    mask = _pad_maybe_bcast(mask, block_kv_dkv, -1)
   if bias is not None:
-    bias = _pad(bias, -2, block_q_dq, broadcastable=True)
-    bias = _pad(bias, -1, block_kv_dkv, broadcastable=True)
+    bias = _pad_maybe_bcast(bias, block_q_dq, -2)
+    bias = _pad_maybe_bcast(bias, block_kv_dkv, -1)
   if k_start is not None:
-    k_start = _pad(k_start, -1, block_q_dq)
+    k_start = shape_lib.pad_to_next_multiple_of(k_start, block_q_dq, -1)
   if k_end is not None:
-    k_end = _pad(k_end, -1, block_q_dq)
+    k_end = shape_lib.pad_to_next_multiple_of(k_end, block_q_dq, -1)
 
   bias_4d_shape = bias.shape if bias is not None else None
   mask_4d_shape = mask.shape if mask is not None else None
@@ -1803,21 +1710,18 @@ def flash_attention_vjp_kernel(
   bias = _squeeze_trailing_1s(bias)
   mask = _squeeze_trailing_1s(mask)
 
-  pad_dim = lambda x: _pad(x, -1, 64)
+  pad_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
   q, k, v, out, dout = map(pad_dim, (q, k, v, out, dout))
-
-  # ds_dtype must match `dtype` (compute precision) for TCGEN05 MMA
-  # compatibility.
-  head_dim, head_dim_out, ds_dtype = _get_input_metadata(q, v)
+  head_dim, head_dim_out = _get_input_metadata(q, v)
 
   m, l = residuals
-  m = _pad(m, -1, block_q_dq, constant_values=1e9)
-  l = _pad(l, -1, block_q_dq, constant_values=1)
+  m = shape_lib.pad_to_next_multiple_of(m, block_q_dq, -1, pad_value=1e9)
+  l = shape_lib.pad_to_next_multiple_of(l, block_q_dq, -1, pad_value=1)
 
   delta = jnp.einsum(
       "...qhd,...qhd->...hq", out.astype(jnp.float32), dout.astype(jnp.float32)
   )
-  delta = _pad(delta, -1, block_q_dq)
+  delta = shape_lib.pad_to_next_multiple_of(delta, block_q_dq, -1)
 
   compiler_params = plgpu.CompilerParams(
       approx_math=True,
@@ -1841,7 +1745,6 @@ def flash_attention_vjp_kernel(
       bias_dtype=bias.dtype if bias is not None else None,
       mask_shape=mask_4d_shape,
       mask_dtype=mask.dtype if mask is not None else None,
-      orig_ds_dtype=orig_ds_dtype,
   )
 
   if bias is None:
@@ -1883,8 +1786,6 @@ def flash_attention_vjp_kernel(
           is_causal=is_causal,
           logits_scale=logits_scale,
           logits_soft_cap=logits_soft_cap,
-          orig_ds_dtype=orig_ds_dtype,
-          reduce_ds=False,
       )
 
     dq = _kernel(
@@ -1906,19 +1807,9 @@ def flash_attention_vjp_kernel(
   else:
     q_seq_len_ = pl.cdiv(q.shape[-3], config.block_q_dq) * config.block_q_dq
     kv_seq_len_ = pl.cdiv(k.shape[-3], config.block_kv_dq) * config.block_kv_dq
-    full_ds_shape = (q.shape[-4], q.shape[-2], q_seq_len_, kv_seq_len_)
-
-    b_size = bias_4d_shape[-4] if bias_4d_shape[-4] == 1 else full_ds_shape[-4]
-    h_size = bias_4d_shape[-3] if bias_4d_shape[-3] == 1 else full_ds_shape[-3]
-    ds_out_shape = (b_size, h_size, full_ds_shape[2], full_ds_shape[3])
-
-    reduce_ds = ds_out_shape != full_ds_shape
-    ds_shape_or_array = (
-        jnp.zeros(ds_out_shape, orig_ds_dtype)
-        if reduce_ds
-        else jax.ShapeDtypeStruct(ds_out_shape, orig_ds_dtype)
-    )
-    dq_out_shape = (dq_shape, ds_shape_or_array)
+    ds_shape = (q.shape[-4], q.shape[-2], q_seq_len_, kv_seq_len_)
+    ds_shape = jax.ShapeDtypeStruct(ds_shape, ds_dtype)
+    dq_out_shape = (dq_shape, ds_shape)
 
     def dq_body_bias(
         q_ref,
@@ -1957,8 +1848,6 @@ def flash_attention_vjp_kernel(
           is_causal=is_causal,
           logits_scale=logits_scale,
           logits_soft_cap=logits_soft_cap,
-          orig_ds_dtype=orig_ds_dtype,
-          reduce_ds=reduce_ds,
       )
 
     dq, ds = _kernel(
@@ -1991,7 +1880,6 @@ def flash_attention_vjp_kernel(
       dout_dtype=dout.dtype,
       k_dtype=k.dtype,
       v_dtype=v.dtype,
-      ds_dtype=ds_dtype,
       bias_shape=bias_4d_shape,
       bias_dtype=bias.dtype if bias is not None else None,
       mask_shape=mask_4d_shape,
@@ -2073,27 +1961,10 @@ def flash_attention_vjp_kernel(
   dq = dq[..., :orig_q_seq_len, :, :orig_head_dim]
   dk = dk[..., :orig_kv_seq_len, :, :orig_head_dim]
   dv = dv[..., :orig_kv_seq_len, :, :orig_head_dim_out]
+  ds = None if ds is None else ds[..., :orig_q_seq_len, :orig_kv_seq_len]
 
   dq = dq.reshape(*batch_shape, *dq.shape[-3:])
   dk = dk.reshape(*batch_shape, *dk.shape[-3:])
   dv = dv.reshape(*batch_shape, *dv.shape[-3:])
-
-  if ds is not None:
-    ds = ds[..., :orig_q_seq_len, :orig_kv_seq_len]
-    if is_causal:
-      q_idx = jnp.arange(orig_q_seq_len)[:, None]
-      k_idx = jnp.arange(orig_kv_seq_len)[None, :]
-      ds = jnp.where(q_idx >= k_idx, ds, 0.0)
-
-    if orig_bias_shape is not None:
-      broadcast_axes = []
-      if bias_4d_shape[-2] == 1:
-        broadcast_axes.append(2)
-      if bias_4d_shape[-1] == 1:
-        broadcast_axes.append(3)
-      if broadcast_axes:
-        # Reduce sequence dimensions Python-side if they were
-        # broadcasted in the original bias.
-        ds = jnp.sum(ds, axis=tuple(broadcast_axes), keepdims=True)
-    ds = ds.reshape(orig_bias_shape).astype(orig_ds_dtype)
+  ds = None if ds is None else ds.reshape(*batch_shape, *ds.shape[-3:])
   return dq, dk, dv, ds
