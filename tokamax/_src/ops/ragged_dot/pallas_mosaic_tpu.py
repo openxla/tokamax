@@ -220,7 +220,9 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           group_sizes=group_sizes,
           precision=precision,
           out_dtype=preferred_element_type,
-          tiling=(config.tile_m, config.tile_k, config.tile_n),
+          # Treat config.tile_n as tk (backend contracting dim) and
+          # config.tile_k as tn (backend minor dim)
+          tiling=(config.tile_m, config.tile_n, config.tile_k),
           transpose_rhs=True,
           interpret=self.interpret,  # pytype: disable=attribute-error
           input_buffer_count=config.input_buffer_count,
