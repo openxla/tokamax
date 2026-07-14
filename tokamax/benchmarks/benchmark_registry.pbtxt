@@ -201,3 +201,29 @@ benchmarks {
     }
   }
 }
+
+benchmarks {
+  name: "tokamax_mla"
+  description: "Runs the Tokamax MLA benchmark."
+  owner: "Tokamax Team"
+  workload {
+    action: "./ml_actions/actions/workload_executors/python"
+    action_inputs { key: "script_path" value: "tokamax/benchmarks/mla.py" }
+    action_inputs { key: "python_version" value: "3.11" }
+  }
+
+  environment_configs {
+    id: "tpu-v7"
+    runner_label: "linux-x86-tpu7x-56-1tpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
+    workload_action_inputs { key: "extras_hw" value: "tpu" }
+  }
+
+  metrics {
+    pattern: "mla/.*"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+}
