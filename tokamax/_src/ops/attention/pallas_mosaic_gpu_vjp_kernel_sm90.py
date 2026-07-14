@@ -166,14 +166,13 @@ def flash_attention_vjp_kernel(
     Float[Array, "t h d"],  # dv
     Float[Array, "H T t"] | None,  # ds
 ]:
-  orig_head_dim = q.shape[-1]
+  orig_q_seq_len, _, orig_head_dim = q.shape
   orig_head_dim_out = v.shape[-1]
   pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
   q, k, v, out, dout = map(pad_head_dim, (q, k, v, out, dout))
   m, l = residuals
 
   # TODO: Remove padding along q sequence length.
-  orig_q_seq_len = q.shape[-3]
   pad_q_seq = lambda x, a: shape_lib.pad_to_next_multiple_of(x, 8, a)
   q, m, l = map(pad_q_seq, (q, m, l), (-3, -1, -1))
 
@@ -362,13 +361,13 @@ def flash_attention_vjp_kernel(
 
         s = lax.cond(kv_base + block_kv > q_base, apply_causal_mask, lambda: s)
 
+      broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
+
       if k_start is not None:
-        k_start_ = lax.broadcast_in_dim(k_start, s.shape, [0])
-        s = jnp.where(kv_base + iota(1) >= k_start_, s, mask_value)
+        s = jnp.where(kv_base + iota(1) >= broadcast(k_start), s, mask_value)
 
       if k_end is not None:
-        k_end_ = lax.broadcast_in_dim(k_end, s.shape, [0])
-        s = jnp.where(kv_base + iota(1) < k_end_, s, mask_value)
+        s = jnp.where(kv_base + iota(1) < broadcast(k_end), s, mask_value)
 
       if mask_gmem is not None:
         if mask_smem is None:
@@ -384,7 +383,6 @@ def flash_attention_vjp_kernel(
 
         s = jnp.where(mask, s, mask_value)
 
-      broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
       p = jnp.exp2(s - broadcast(m)) * broadcast(l_rcp)
       ds = p * (dp - broadcast(delta))
 
@@ -595,18 +593,18 @@ def flash_attention_vjp_kernel(
         needs_causal_mask = kv_base + block_kv > q_base
         sT = lax.cond(needs_causal_mask, apply_causal_mask, lambda: sT)
 
+      broadcast = lambda x: lax.broadcast_in_dim(x, sT.shape, [1])
+
       def load_k_range(ref):
         idx = (0 if (ref.shape[0] == 1) else hi, qs)
         return plgpu.load(ref, idx, layout=_WGMMA_COL, optimized=False)
 
       if k_start_gmem is not None:
-        k_start = load_k_range(k_start_gmem)
-        k_start = lax.broadcast_in_dim(k_start, sT.shape, [1])
+        k_start = broadcast(load_k_range(k_start_gmem))
         sT = jnp.where(kv_base + iota(0) >= k_start, sT, mask_value)
 
       if k_end_gmem is not None:
-        k_end = load_k_range(k_end_gmem)
-        k_end = lax.broadcast_in_dim(k_end, sT.shape, [1])
+        k_end = broadcast(load_k_range(k_end_gmem))
         sT = jnp.where(kv_base + iota(0) < k_end, sT, mask_value)
 
       if mask_gmem is not None:
@@ -621,7 +619,6 @@ def flash_attention_vjp_kernel(
 
         sT = jnp.where(maskT, sT, mask_value)
 
-      broadcast = lambda x: lax.broadcast_in_dim(x, sT.shape, [1])
       epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
       pT = jnp.exp2(sT - broadcast(m)) / broadcast(l + epsilon)
 
