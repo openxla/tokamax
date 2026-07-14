@@ -87,7 +87,6 @@ def _run_test(
     atol_grads=None,
     test_deterministic=True,
     test_vjp=True,
-    test_vjp_deterministic=True,
     seed_seq=np.random.SeedSequence(42),
     **kwargs,
 ):
@@ -179,11 +178,10 @@ def _run_test(
   )
   del expected_grads, vjp_fn, ref_vjp_fn  # Free device memory.
 
-  if test_vjp_deterministic:
-    actual2, vjp_fn = jax.vjp(impl, q, k, v, bias)
-    actual_grads2 = dict(zip(grad_names, vjp_fn(dout)))
-    chex.assert_trees_all_equal(actual, actual2)
-    chex.assert_trees_all_equal(actual_grads, actual_grads2)
+  actual2, vjp_fn = jax.vjp(impl, q, k, v, bias)
+  actual_grads2 = dict(zip(grad_names, vjp_fn(dout)))
+  chex.assert_trees_all_equal(actual, actual2)
+  chex.assert_trees_all_equal(actual_grads, actual_grads2)
 
 
 def override_test_args(**kwargs):

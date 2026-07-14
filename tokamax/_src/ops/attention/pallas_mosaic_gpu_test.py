@@ -87,7 +87,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045)
     kwargs["atol_grads"] = None if bias is None else 0.02
-    kwargs["test_vjp_deterministic"] = not gpu_utils.is_sm100()
 
     if not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
