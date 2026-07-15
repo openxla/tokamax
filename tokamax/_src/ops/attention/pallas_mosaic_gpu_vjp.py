@@ -172,10 +172,7 @@ class PallasMosaicGpuFlashAttentionVjp(
     else:
       kernel_fn = sm90.flash_attention_vjp_kernel
 
-    f = functools.partial(kernel_fn, **kwargs)
-    if not isinstance(config, sm100.Config):
-      f = base.vmap_batch_dims(f)
-
+    f = base.vmap_batch_dims(functools.partial(kernel_fn, **kwargs))
     dq, dk, dv, ds = f(
         q, k, v, residuals, out, dout, bias, mask, k_start, k_end
     )

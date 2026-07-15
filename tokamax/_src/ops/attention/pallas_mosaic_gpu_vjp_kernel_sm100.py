@@ -421,25 +421,21 @@ def _smem_transforms(dtype, swizzle=128):
 
 
 def _load_bcast_smem(
-    ref, smem, b, hi, elt_bi, s_shape, chunk_slice, is_dq, ref_4d_shape
+    ref, smem, hi, elt_bi, s_shape, chunk_slice, is_dq, ref_shape
 ):
   if smem is None:
-    b_m = 0 if ref_4d_shape[-4] == 1 else b
-    hi_m = 0 if ref_4d_shape[-3] == 1 else hi
-    if len(ref.shape) == 2:
-      val_0d = ref[b_m, hi_m]
-    else:
-      val_0d = ref[b_m, hi_m, 0, 0]
+    hi_m = 0 if ref_shape[-3] == 1 else hi
+    val_0d = ref[hi_m] if len(ref.shape) == 1 else ref[hi_m, 0, 0]
     val = lax.broadcast_in_dim(val_0d, s_shape, [])
   else:
-    if ref_4d_shape[-1] == 1:
+    if ref_shape[-1] == 1:
       if is_dq:
         val_1d = plgpu.load(smem.at[elt_bi], (), layout=_TMEM_ROW)
         val = lax.broadcast_in_dim(val_1d, s_shape, [0])
       else:
         val_1d = plgpu.load(smem.at[elt_bi, chunk_slice], (), layout=_TMEM_COL)
         val = lax.broadcast_in_dim(val_1d, s_shape, [1])
-    elif ref_4d_shape[-2] == 1:
+    elif ref_shape[-2] == 1:
       if is_dq:
         val_1d = plgpu.load(smem.at[elt_bi, chunk_slice], (), layout=_TMEM_COL)
         val = lax.broadcast_in_dim(val_1d, s_shape, [1])
@@ -529,8 +525,8 @@ def _kernel_dq(
     mask_ref,
     dq_ref,
     ds_ref=None,
-    bias_4d_shape=None,
-    mask_4d_shape=None,
+    bias_shape=None,
+    mask_shape=None,
     *,
     q_smem=None,
     do_smem=None,
@@ -569,7 +565,6 @@ def _kernel_dq(
   wg_id = lax.axis_index("wg")
   qi = lax.axis_index("q_tiles")
   hi = lax.axis_index("heads")
-  b = 0 if q_ref.ndim == 3 else lax.axis_index("batch")
 
   # We assume MHA or simple mapping here to respect boundaries.
   q_heads_per_kv_head = q_ref.shape[-2] // k_ref.shape[-2]
@@ -602,35 +597,21 @@ def _kernel_dq(
       def tma_q():
         qs = pl.ds(qi * config.block_q_dq, config.block_q_dq)
 
+        plgpu.copy_gmem_to_smem(q_ref.at[qs, hi], q_smem, barrier=q_do_produced)
         plgpu.copy_gmem_to_smem(
-            q_ref.at[b, qs, hi] if q_ref.ndim == 4 else q_ref.at[qs, hi],
-            q_smem,
-            barrier=q_do_produced,
-        )
-        plgpu.copy_gmem_to_smem(
-            dout_ref.at[b, qs, hi]
-            if dout_ref.ndim == 4
-            else dout_ref.at[qs, hi],
-            do_smem,
-            barrier=q_do_produced,
+            dout_ref.at[qs, hi], do_smem, barrier=q_do_produced
         )
         if not config.load_residuals_in_regs:
           plgpu.copy_gmem_to_smem(
-              m_ref.at[b, hi, qs] if m_ref.ndim == 3 else m_ref.at[hi, qs],
+              m_ref.at[hi, qs],
               m_smem,
               barrier=q_do_produced,
           )
           plgpu.copy_gmem_to_smem(
-              l_ref.at[b, hi, qs] if l_ref.ndim == 3 else l_ref.at[hi, qs],
-              l_smem,
-              barrier=q_do_produced,
+              l_ref.at[hi, qs], l_smem, barrier=q_do_produced
           )
           plgpu.copy_gmem_to_smem(
-              delta_ref.at[b, hi, qs]
-              if delta_ref.ndim == 3
-              else delta_ref.at[hi, qs],
-              delta_smem,
-              barrier=q_do_produced,
+              delta_ref.at[hi, qs], delta_smem, barrier=q_do_produced
           )
 
       @pl.when(warp_id == 1)
@@ -640,41 +621,24 @@ def _kernel_dq(
           si = lax.rem(ki - lb, config.num_stages)
           ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
           plgpu.copy_gmem_to_smem(
-              k_ref.at[b, ks, hi_kv]
-              if k_ref.ndim == 4
-              else k_ref.at[ks, hi_kv],
-              k_smem.at[si],
-              barrier=k_produced.at[si],
+              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=k_produced.at[si]
           )
           plgpu.copy_gmem_to_smem(
-              v_ref.at[b, ks, hi_kv]
-              if v_ref.ndim == 4
-              else v_ref.at[ks, hi_kv],
-              v_smem.at[si],
-              barrier=v_produced.at[si],
+              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=v_produced.at[si]
           )
 
         @pl.loop(lb + config.num_stages, ub)
         def kv_loop(ki):
           si = lax.rem(ki - lb, config.num_stages)
-          bi = lax.rem(ki - lb, config.eltwise_stages)
           ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
           # BLOCKING: Waiting for MMA to signal that previous tile in this slot is consumed.
           plgpu.barrier_wait(k_consumed.at[si])
           plgpu.copy_gmem_to_smem(
-              k_ref.at[b, ks, hi_kv]
-              if k_ref.ndim == 4
-              else k_ref.at[ks, hi_kv],
-              k_smem.at[si],
-              barrier=k_produced.at[si],
+              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=k_produced.at[si]
           )
           plgpu.barrier_wait(v_consumed.at[si])
           plgpu.copy_gmem_to_smem(
-              v_ref.at[b, ks, hi_kv]
-              if v_ref.ndim == 4
-              else v_ref.at[ks, hi_kv],
-              v_smem.at[si],
-              barrier=v_produced.at[si],
+              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=v_produced.at[si]
           )
 
         @pl.loop(lax.max(lb, ub - config.num_stages), ub)
@@ -693,17 +657,16 @@ def _kernel_dq(
             ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
             if bias_ref is not None:
               if bias_smem is not None:
-                b_m = 0 if bias_4d_shape[-4] == 1 else b
-                hi_m = 0 if bias_4d_shape[-3] == 1 else hi
-                if bias_4d_shape[-1] == 1:
-                  if bias_4d_shape[-2] == 1:
-                    bias_slice = bias_ref.at[b_m, hi_m]
+                hi_m = 0 if bias_shape[-3] == 1 else hi
+                if bias_shape[-1] == 1:
+                  if bias_shape[-2] == 1:
+                    bias_slice = bias_ref.at[hi_m]
                   else:
-                    bias_slice = bias_ref.at[b_m, hi_m, qs]
-                elif bias_4d_shape[-2] == 1:
-                  bias_slice = bias_ref.at[b_m, hi_m, 0, ks]
+                    bias_slice = bias_ref.at[hi_m, qs]
+                elif bias_shape[-2] == 1:
+                  bias_slice = bias_ref.at[hi_m, 0, ks]
                 else:
-                  bias_slice = bias_ref.at[b_m, hi_m, qs, ks]
+                  bias_slice = bias_ref.at[hi_m, qs, ks]
 
                 @pl.when(ki - lb >= config.eltwise_stages)
                 def wait_bias():
@@ -714,17 +677,16 @@ def _kernel_dq(
                 )
             if mask_ref is not None:
               if mask_smem is not None:
-                b_m = 0 if mask_4d_shape[-4] == 1 else b
-                hi_m = 0 if mask_4d_shape[-3] == 1 else hi
-                if mask_4d_shape[-1] == 1:
-                  if mask_4d_shape[-2] == 1:
-                    mask_slice = mask_ref.at[b_m, hi_m]
+                hi_m = 0 if mask_shape[-3] == 1 else hi
+                if mask_shape[-1] == 1:
+                  if mask_shape[-2] == 1:
+                    mask_slice = mask_ref.at[hi_m]
                   else:
-                    mask_slice = mask_ref.at[b_m, hi_m, qs]
-                elif mask_4d_shape[-2] == 1:
-                  mask_slice = mask_ref.at[b_m, hi_m, 0, ks]
+                    mask_slice = mask_ref.at[hi_m, qs]
+                elif mask_shape[-2] == 1:
+                  mask_slice = mask_ref.at[hi_m, 0, ks]
                 else:
-                  mask_slice = mask_ref.at[b_m, hi_m, qs, ks]
+                  mask_slice = mask_ref.at[hi_m, qs, ks]
 
                 @pl.when(ki - lb >= config.eltwise_stages)
                 def wait_mask():
@@ -790,10 +752,7 @@ def _kernel_dq(
     plgpu.wait_load_tmem()
     q_smem[...] = (dq_val * logits_scale).astype(q_smem.dtype)
     plgpu.commit_smem()
-    plgpu.copy_smem_to_gmem(
-        q_smem,
-        dq_ref.at[b, qs, hi] if dq_ref.ndim == 4 else dq_ref.at[qs, hi],
-    )
+    plgpu.copy_smem_to_gmem(q_smem, dq_ref.at[qs, hi])
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
   @pl.when((wg_id == 1) & (ub > lb))
@@ -809,35 +768,20 @@ def _kernel_dq(
     plgpu.barrier_arrive(dp_consumed)
 
     if k_start_ref is not None:
-      if k_start_ref.ndim == 3:
-        b_m = 0 if k_start_ref.shape[-3] == 1 else b
-        hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
-        k_start_slice = k_start_ref.at[b_m, hi_m, qs]
-      else:
-        hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
-        k_start_slice = k_start_ref.at[hi_m, qs]
+      hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
+      k_start_slice = k_start_ref.at[hi_m, qs]
       k_start_val = plgpu.load(
           k_start_slice, (), layout=_TMEM_ROW, optimized=False
       )
     if k_end_ref is not None:
-      if k_end_ref.ndim == 3:
-        b_m = 0 if k_end_ref.shape[-3] == 1 else b
-        hi_m = 0 if k_end_ref.shape[-2] == 1 else hi
-        k_end_slice = k_end_ref.at[b_m, hi_m, qs]
-      else:
-        hi_m = 0 if k_end_ref.shape[-2] == 1 else hi
-        k_end_slice = k_end_ref.at[hi_m, qs]
+      hi_m = 0 if k_end_ref.shape[-2] == 1 else hi
+      k_end_slice = k_end_ref.at[hi_m, qs]
       k_end_val = plgpu.load(k_end_slice, (), layout=_TMEM_ROW, optimized=False)
 
     if config.load_residuals_in_regs:
-      if m_ref.ndim == 3:
-        m_slice = m_ref.at[b, hi, qs]
-        l_slice = l_ref.at[b, hi, qs]
-        delta_slice = delta_ref.at[b, hi, qs]
-      else:
-        m_slice = m_ref.at[hi, qs]
-        l_slice = l_ref.at[hi, qs]
-        delta_slice = delta_ref.at[hi, qs]
+      m_slice = m_ref.at[hi, qs]
+      l_slice = l_ref.at[hi, qs]
+      delta_slice = delta_ref.at[hi, qs]
       m_val_full = plgpu.load(m_slice, (), layout=_TMEM_ROW, optimized=False)
       l_val_full = plgpu.load(l_slice, (), layout=_TMEM_ROW, optimized=False)
       delta_val_full = plgpu.load(
@@ -906,13 +850,12 @@ def _kernel_dq(
           bias_val = _load_bcast_smem(
               bias_ref,
               bias_smem,
-              b,
               hi,
               elt_bi,
               s_val.shape,
               chunk_slice,
               True,
-              bias_4d_shape,
+              bias_shape,
           )
           s_val += bias_val
 
@@ -968,13 +911,12 @@ def _kernel_dq(
           mask_val = _load_bcast_smem(
               mask_ref,
               mask_smem,
-              b,
               hi,
               elt_bi,
               s_val.shape,
               chunk_slice,
               True,
-              mask_4d_shape,
+              mask_shape,
           )
           mask_val = mask_val != 0
           base_val = jnp.where(
@@ -1005,26 +947,8 @@ def _kernel_dq(
           ds_smem_mma, ds_smem_tma = ds_smem
           ds_smem_tma[ci] = ds_val.astype(ds_smem_tma.dtype)
           plgpu.commit_smem()
-
-          if ds_ref.ndim == 4:
-            plgpu.copy_smem_to_gmem(
-                ds_smem_tma.at[ci],
-                ds_ref.at[
-                    b,
-                    hi,
-                    qs,
-                    pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size),
-                ],
-            )
-          else:
-            plgpu.copy_smem_to_gmem(
-                ds_smem_tma.at[ci],
-                ds_ref.at[
-                    hi,
-                    qs,
-                    pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size),
-                ],
-            )
+          ks = pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size)
+          plgpu.copy_smem_to_gmem(ds_smem_tma.at[ci], ds_ref.at[hi, qs, ks])
           plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
           if ds_smem_mma.dtype != ds_smem_tma.dtype:
@@ -1057,8 +981,8 @@ def _kernel_dkv(
     mask_ref,
     dk_ref,
     dv_ref,
-    bias_4d_shape=None,
-    mask_4d_shape=None,
+    bias_shape=None,
+    mask_shape=None,
     *,
     k_smem=None,
     v_smem=None,
@@ -1099,7 +1023,6 @@ def _kernel_dkv(
   wg_id = lax.axis_index("wg")
   ki = lax.axis_index("kv_tiles")
   hi_kv = lax.axis_index("heads")
-  b = 0 if k_ref.ndim == 3 else lax.axis_index("batch")
 
   num_q_heads = q_ref.shape[-2]
   q_heads_per_kv_head = num_q_heads // k_ref.shape[-2]
@@ -1111,7 +1034,6 @@ def _kernel_dkv(
   ub = q_ref.shape[-3] // config.block_q_dkv
   num_q_tiles = ub - lb
   safe_num_q_tiles = lax.max(num_q_tiles, 1)
-  num_chunks = config.block_q_dkv // config.chunk_size
   total_steps = q_heads_per_kv_head * num_q_tiles
 
   if residuals_smem is not None:
@@ -1132,14 +1054,10 @@ def _kernel_dkv(
       @pl.when(warp_id == 0)
       def tma_kv():
         plgpu.copy_gmem_to_smem(
-            k_ref.at[b, ks, hi_kv] if k_ref.ndim == 4 else k_ref.at[ks, hi_kv],
-            k_smem,
-            barrier=kv_produced,
+            k_ref.at[ks, hi_kv], k_smem, barrier=kv_produced
         )
         plgpu.copy_gmem_to_smem(
-            v_ref.at[b, ks, hi_kv] if v_ref.ndim == 4 else v_ref.at[ks, hi_kv],
-            v_smem,
-            barrier=kv_produced,
+            v_ref.at[ks, hi_kv], v_smem, barrier=kv_produced
         )
 
         @pl.loop(0, total_steps)
@@ -1155,19 +1073,13 @@ def _kernel_dkv(
             plgpu.barrier_wait(residual_consumed.at[li])
 
           plgpu.copy_gmem_to_smem(
-              m_ref.at[b, hi, qs] if m_ref.ndim == 3 else m_ref.at[hi, qs],
-              m_smem.at[li],
-              barrier=residual_produced.at[li],
+              m_ref.at[hi, qs], m_smem.at[li], barrier=residual_produced.at[li]
           )
           plgpu.copy_gmem_to_smem(
-              l_ref.at[b, hi, qs] if l_ref.ndim == 3 else l_ref.at[hi, qs],
-              l_smem.at[li],
-              barrier=residual_produced.at[li],
+              l_ref.at[hi, qs], l_smem.at[li], barrier=residual_produced.at[li]
           )
           plgpu.copy_gmem_to_smem(
-              delta_ref.at[b, hi, qs]
-              if delta_ref.ndim == 3
-              else delta_ref.at[hi, qs],
+              delta_ref.at[hi, qs],
               delta_smem.at[li],
               barrier=residual_produced.at[li],
           )
@@ -1192,16 +1104,10 @@ def _kernel_dkv(
             plgpu.barrier_wait(q_do_consumed.at[si])
 
           plgpu.copy_gmem_to_smem(
-              q_ref.at[b, qs, hi] if q_ref.ndim == 4 else q_ref.at[qs, hi],
-              q_smem.at[si],
-              barrier=q_do_produced.at[si],
+              q_ref.at[qs, hi], q_smem.at[si], barrier=q_do_produced.at[si]
           )
           plgpu.copy_gmem_to_smem(
-              dout_ref.at[b, qs, hi]
-              if dout_ref.ndim == 4
-              else dout_ref.at[qs, hi],
-              do_smem.at[si],
-              barrier=q_do_produced.at[si],
+              dout_ref.at[qs, hi], do_smem.at[si], barrier=q_do_produced.at[si]
           )
 
         @pl.loop(lax.max(0, total_steps - config.num_stages), total_steps)
@@ -1222,17 +1128,16 @@ def _kernel_dkv(
             qs = pl.ds(qi * config.block_q_dkv, config.block_q_dkv)
             if bias_ref is not None:
               if bias_smem is not None:
-                b_m = 0 if bias_4d_shape[-4] == 1 else b
-                hi_m = 0 if bias_4d_shape[-3] == 1 else hi
-                if bias_4d_shape[-1] == 1:
-                  if bias_4d_shape[-2] == 1:
-                    bias_slice = bias_ref.at[b_m, hi_m]
+                hi_m = 0 if bias_shape[-3] == 1 else hi
+                if bias_shape[-1] == 1:
+                  if bias_shape[-2] == 1:
+                    bias_slice = bias_ref.at[hi_m]
                   else:
-                    bias_slice = bias_ref.at[b_m, hi_m, qs]
-                elif bias_4d_shape[-2] == 1:
-                  bias_slice = bias_ref.at[b_m, hi_m, 0, ks]
+                    bias_slice = bias_ref.at[hi_m, qs]
+                elif bias_shape[-2] == 1:
+                  bias_slice = bias_ref.at[hi_m, 0, ks]
                 else:
-                  bias_slice = bias_ref.at[b_m, hi_m, ks, qs]
+                  bias_slice = bias_ref.at[hi_m, ks, qs]
 
                 @pl.when(step >= config.eltwise_stages)
                 def wait_bias():
@@ -1243,17 +1148,16 @@ def _kernel_dkv(
                 )
             if mask_ref is not None:
               if mask_smem is not None:
-                b_m = 0 if mask_4d_shape[-4] == 1 else b
-                hi_m = 0 if mask_4d_shape[-3] == 1 else hi
-                if mask_4d_shape[-1] == 1:
-                  if mask_4d_shape[-2] == 1:
-                    mask_slice = mask_ref.at[b_m, hi_m]
+                hi_m = 0 if mask_shape[-3] == 1 else hi
+                if mask_shape[-1] == 1:
+                  if mask_shape[-2] == 1:
+                    mask_slice = mask_ref.at[hi_m]
                   else:
-                    mask_slice = mask_ref.at[b_m, hi_m, qs]
-                elif mask_4d_shape[-2] == 1:
-                  mask_slice = mask_ref.at[b_m, hi_m, 0, ks]
+                    mask_slice = mask_ref.at[hi_m, qs]
+                elif mask_shape[-2] == 1:
+                  mask_slice = mask_ref.at[hi_m, 0, ks]
                 else:
-                  mask_slice = mask_ref.at[b_m, hi_m, ks, qs]
+                  mask_slice = mask_ref.at[hi_m, ks, qs]
 
                 @pl.when(step >= config.eltwise_stages)
                 def wait_mask():
@@ -1324,14 +1228,8 @@ def _kernel_dkv(
     k_smem[...] = (dk_val * logits_scale).astype(k_smem.dtype)
     v_smem[...] = dv_val.astype(v_smem.dtype)
     plgpu.commit_smem()
-    plgpu.copy_smem_to_gmem(
-        k_smem,
-        dk_ref.at[b, ks, hi_kv] if dk_ref.ndim == 4 else dk_ref.at[ks, hi_kv],
-    )
-    plgpu.copy_smem_to_gmem(
-        v_smem,
-        dv_ref.at[b, ks, hi_kv] if dv_ref.ndim == 4 else dv_ref.at[ks, hi_kv],
-    )
+    plgpu.copy_smem_to_gmem(k_smem, dk_ref.at[ks, hi_kv])
+    plgpu.copy_smem_to_gmem(v_smem, dv_ref.at[ks, hi_kv])
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
   @pl.when((wg_id == 1) & (total_steps > 0))
@@ -1362,8 +1260,6 @@ def _kernel_dkv(
       if mask_ref is not None:
         plgpu.barrier_wait(mask_produced.at[elt_bi])
 
-      qs = pl.ds(qi * config.block_q_dkv, config.block_q_dkv)
-
       num_chunks = config.block_q_dkv // config.chunk_size
 
       for chunk_idx in range(num_chunks):
@@ -1385,13 +1281,12 @@ def _kernel_dkv(
           bias_val = _load_bcast_smem(
               bias_ref,
               bias_smem,
-              b,
               hi,
               elt_bi,
               s_val.shape,
               chunk_slice,
               False,
-              bias_4d_shape,
+              bias_shape,
           )
           s_val += bias_val
 
@@ -1429,20 +1324,10 @@ def _kernel_dkv(
           )
 
         if k_start_ref is not None:
-          if k_start_ref.ndim == 3:
-            b_m = 0 if k_start_ref.shape[-3] == 1 else b
-            hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
-            k_start_slice = k_start_ref.at[
-                b_m,
-                hi_m,
-                pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size),
-            ]
-          else:
-            hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
-            k_start_slice = k_start_ref.at[
-                hi_m,
-                pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size),
-            ]
+          hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
+          k_start_slice = k_start_ref.at[
+              hi_m, pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
+          ]
           k_start_val = plgpu.load(
               k_start_slice, (), layout=_TMEM_COL, optimized=False
           )
@@ -1455,20 +1340,10 @@ def _kernel_dkv(
           )
 
         if k_end_ref is not None:
-          if k_end_ref.ndim == 3:
-            b_m = 0 if k_end_ref.shape[-3] == 1 else b
-            hi_m = 0 if k_end_ref.shape[-2] == 1 else hi
-            k_end_slice = k_end_ref.at[
-                b_m,
-                hi_m,
-                pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size),
-            ]
-          else:
-            hi_m = 0 if k_end_ref.shape[-2] == 1 else hi
-            k_end_slice = k_end_ref.at[
-                hi_m,
-                pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size),
-            ]
+          hi_m = 0 if k_end_ref.shape[-2] == 1 else hi
+          k_end_slice = k_end_ref.at[
+              hi_m, pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
+          ]
           k_end_val = plgpu.load(
               k_end_slice, (), layout=_TMEM_COL, optimized=False
           )
@@ -1485,13 +1360,12 @@ def _kernel_dkv(
           mask_val = _load_bcast_smem(
               mask_ref,
               mask_smem,
-              b,
               hi,
               elt_bi,
               s_val.shape,
               chunk_slice,
               False,
-              mask_4d_shape,
+              mask_shape,
           )
           mask_val = mask_val != 0
           base_val = jnp.where(
@@ -1549,16 +1423,16 @@ def _pad_maybe_bcast(x, m, axis):
 
 @jaxtyping.jaxtyped
 def flash_attention_vjp_kernel(
-    q: Float[Array, "*B T H D"],
-    k: Float[Array, "*B t h D"],
-    v: Float[Array, "*B t h d"],
+    q: Float[Array, "T H D"],
+    k: Float[Array, "t h D"],
+    v: Float[Array, "t h d"],
     residuals: base.Residuals,
-    out: Float[Array, "*B T H d"],
-    dout: Float[Array, "*B T H d"],
-    bias: Float[Array, "*#B #H #T #t"] | None,
-    mask: Bool[Array, "*#B #H #T #t"] | None,
-    k_start: Int[Array, "*#B #H #T"] | None,
-    k_end: Int[Array, "*#B #H #T"] | None,
+    out: Float[Array, "T H d"],
+    dout: Float[Array, "T H d"],
+    bias: Float[Array, "#H #T #t"] | None,
+    mask: Bool[Array, "#H #T #t"] | None,
+    k_start: Int[Array, "#H #T"] | None,
+    k_end: Int[Array, "#H #T"] | None,
     *,
     logits_scale: float,
     logits_soft_cap: float | None,
@@ -1566,25 +1440,18 @@ def flash_attention_vjp_kernel(
     ds_dtype: jax.typing.DTypeLike | None,
     config: Config,
 ) -> tuple[
-    Float[Array, "*B T H D"],  # dq
-    Float[Array, "*B t h D"],  # dk
-    Float[Array, "*B t h d"],  # dv
-    Float[Array, "*#B #H #T #t"] | None,  # ds
+    Float[Array, "T H D"],  # dq
+    Float[Array, "t h D"],  # dk
+    Float[Array, "t h d"],  # dv
+    Float[Array, "#H #T #t"] | None,  # ds
 ]:
   """SM100 Pallas Mosaic GPU Flash Attention VJP."""
-  *_, orig_q_seq_len, _, orig_head_dim = q.shape
-  *_, orig_kv_seq_len, _, orig_head_dim_out = v.shape
+  orig_q_seq_len, _, orig_head_dim = q.shape
+  orig_kv_seq_len, _, orig_head_dim_out = v.shape
 
   block_q_dq = config.block_q_dq
   block_kv_dkv = config.block_kv_dkv
   chunk_size = config.chunk_size
-
-  batch_shape = q.shape[:-3]
-
-  def _reshape_4d(arr, core_ndim):
-    if arr is None:
-      return None
-    return arr.reshape(-1, *arr.shape[-core_ndim:])
 
   def _squeeze_trailing_1s(arr):
     if arr is None:
@@ -1592,12 +1459,6 @@ def flash_attention_vjp_kernel(
     while len(arr.shape) > 1 and arr.shape[-1] == 1:
       arr = arr[..., 0]
     return arr
-
-  q, k, v, out, dout = [_reshape_4d(x, 3) for x in (q, k, v, out, dout)]
-  m, l = [_reshape_4d(x, 2) for x in residuals]
-  residuals = (m, l)
-  bias, mask = [_reshape_4d(x, 3) for x in (bias, mask)]
-  k_start, k_end = [_reshape_4d(x, 2) for x in (k_start, k_end)]
 
   assert q is not None  # To make pytype happy
 
@@ -1609,9 +1470,7 @@ def flash_attention_vjp_kernel(
   v = shape_lib.pad_to_next_multiple_of(v, block_kv_dkv, -3)
 
   # TODO: Avoid broadcast.
-  bcast = lambda x: jnp.broadcast_to(
-      x, (*x.shape[:-2], q.shape[-2], orig_q_seq_len)
-  )
+  bcast = lambda x: jnp.broadcast_to(x, (q.shape[-2], orig_q_seq_len))
   k_start = None if k_start is None else bcast(k_start)
   k_end = None if k_end is None else bcast(k_end)
   if mask is not None:
@@ -1629,8 +1488,8 @@ def flash_attention_vjp_kernel(
   if k_end is not None:
     k_end = shape_lib.pad_to_next_multiple_of(k_end, block_q_dq, -1)
 
-  bias_4d_shape = bias.shape if bias is not None else None
-  mask_4d_shape = mask.shape if mask is not None else None
+  bias_shape = bias.shape if bias is not None else None
+  mask_shape = mask.shape if mask is not None else None
 
   bias = _squeeze_trailing_1s(bias)
   mask = _squeeze_trailing_1s(mask)
@@ -1664,9 +1523,9 @@ def flash_attention_vjp_kernel(
       k_dtype=k.dtype,
       v_dtype=v.dtype,
       ds_dtype=ds_dtype,
-      bias_shape=bias_4d_shape,
+      bias_shape=bias_shape,
       bias_dtype=bias.dtype if bias is not None else None,
-      mask_shape=mask_4d_shape,
+      mask_shape=mask_shape,
       mask_dtype=mask.dtype if mask is not None else None,
   )
 
@@ -1675,13 +1534,13 @@ def flash_attention_vjp_kernel(
   else:
     q_seq_len_ = pl.cdiv(q.shape[-3], config.block_q_dq) * config.block_q_dq
     kv_seq_len_ = pl.cdiv(k.shape[-3], config.block_kv_dq) * config.block_kv_dq
-    ds_shape = (q.shape[-4], q.shape[-2], q_seq_len_, kv_seq_len_)
+    ds_shape = (q.shape[-2], q_seq_len_, kv_seq_len_)
     ds_shape = jax.ShapeDtypeStruct(ds_shape, ds_dtype)
 
   kernel_dq = functools.partial(
       _kernel_dq,
-      bias_4d_shape=bias_4d_shape,
-      mask_4d_shape=mask_4d_shape,
+      bias_shape=bias_shape,
+      mask_shape=mask_shape,
       config=config,
       is_causal=is_causal,
       logits_scale=logits_scale,
@@ -1692,12 +1551,8 @@ def flash_attention_vjp_kernel(
       kernel_dq,
       out_type=(jax.ShapeDtypeStruct(q.shape, q.dtype), ds_shape),
       kernel_name="sm100_dq_kernel",
-      grid=(
-          q.shape[-4] if q.ndim == 4 else 1,
-          q.shape[-2],
-          q.shape[-3] // block_q_dq,
-      ),
-      grid_names=("batch", "heads", "q_tiles"),
+      grid=(q.shape[-2], q.shape[-3] // block_q_dq),
+      grid_names=("heads", "q_tiles"),
       num_threads=2,
       thread_name="wg",
       compiler_params=compiler_params,
@@ -1718,9 +1573,9 @@ def flash_attention_vjp_kernel(
       dout_dtype=dout.dtype,
       k_dtype=k.dtype,
       v_dtype=v.dtype,
-      bias_shape=bias_4d_shape,
+      bias_shape=bias_shape,
       bias_dtype=bias.dtype if bias is not None else None,
-      mask_shape=mask_4d_shape,
+      mask_shape=mask_shape,
       mask_dtype=mask.dtype if mask is not None else None,
   )
 
@@ -1728,23 +1583,19 @@ def flash_attention_vjp_kernel(
   # strides for TMA.
   bias_dkv = (
       bias.mT
-      if (
-          bias is not None and bias_4d_shape[-1] != 1 and bias_4d_shape[-2] != 1
-      )
+      if (bias is not None and bias_shape[-1] != 1 and bias_shape[-2] != 1)
       else bias
   )
   mask_dkv = (
       mask.mT
-      if (
-          mask is not None and mask_4d_shape[-1] != 1 and mask_4d_shape[-2] != 1
-      )
+      if (mask is not None and mask_shape[-1] != 1 and mask_shape[-2] != 1)
       else mask
   )
 
   kernel_dkv = functools.partial(
       _kernel_dkv,
-      bias_4d_shape=bias_4d_shape,
-      mask_4d_shape=mask_4d_shape,
+      bias_shape=bias_shape,
+      mask_shape=mask_shape,
       config=config,
       is_causal=is_causal,
       logits_scale=logits_scale,
@@ -1755,25 +1606,16 @@ def flash_attention_vjp_kernel(
       kernel_dkv,
       out_type=dkv_shape,
       kernel_name="sm100_dkv_kernel",
-      grid=(
-          q.shape[-4] if q.ndim == 4 else 1,
-          k.shape[-2],
-          k.shape[-3] // block_kv_dkv,
-      ),
-      grid_names=("batch", "heads", "kv_tiles"),
+      grid=(k.shape[-2], k.shape[-3] // block_kv_dkv),
+      grid_names=("heads", "kv_tiles"),
       num_threads=2,
       thread_name="wg",
       compiler_params=compiler_params,
       scratch_types=dkv_scratch_shapes,
   )(q, k, v, dout, m, l, delta, bias_dkv, k_start, k_end, mask_dkv)
 
-  dq = dq[..., :orig_q_seq_len, :, :orig_head_dim]
-  dk = dk[..., :orig_kv_seq_len, :, :orig_head_dim]
-  dv = dv[..., :orig_kv_seq_len, :, :orig_head_dim_out]
-  ds = None if ds is None else ds[..., :orig_q_seq_len, :orig_kv_seq_len]
-
-  dq = dq.reshape(*batch_shape, *dq.shape[-3:])
-  dk = dk.reshape(*batch_shape, *dk.shape[-3:])
-  dv = dv.reshape(*batch_shape, *dv.shape[-3:])
-  ds = None if ds is None else ds.reshape(*batch_shape, *ds.shape[-3:])
+  dq = dq[:orig_q_seq_len, :, :orig_head_dim]
+  dk = dk[:orig_kv_seq_len, :, :orig_head_dim]
+  dv = dv[:orig_kv_seq_len, :, :orig_head_dim_out]
+  ds = None if ds is None else ds[:, :orig_q_seq_len, :orig_kv_seq_len]
   return dq, dk, dv, ds
