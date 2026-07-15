@@ -412,82 +412,6 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
   return max(configs, key=_score)
 
 
-def _kernel(body, out_type, **kernel_kwargs):
-  """Interface for SM100 attention VJP kernel.
-
-  Unwraps the custom_vmap() operator because tokamax handles vmap
-  already via the batched arguments.
-
-  Args:
-    body: The kernel body.
-    out_shape: The output shapes.
-    **kernel_kwargs: Additional kernel arguments.
-
-  Returns:
-    The kernel results.
-
-  """
-
-  if singleton_out := not isinstance(out_type, (tuple, list)):
-    out_type = (out_type,)
-
-  @jax.custom_batching.custom_vmap
-  def wrapped(*kernel_args):
-    @pl.run_state
-    def stateful(out_refs):
-      def _body(*args, **kwargs):
-        body(*args, *out_refs, **kwargs)
-      _body.__name__ = body.__name__
-
-      plgpu.kernel(
-          _body,
-          out_type=(),
-          **kernel_kwargs,
-      ).fun(*kernel_args)
-
-    out = stateful(
-        jax.tree.map(
-            lambda s: s
-            if isinstance(s, jax.Array)
-            else jax.lax.empty(s.shape, s.dtype),
-            out_type,
-        )
-    )
-    return tuple(out)
-
-  @wrapped.def_vmap
-  def _wrapped_vmap(axis_size, in_batched, *kernel_args):
-    # Handles broadcasting for inputs that are not batched across the
-    # mapped axis.
-    mapped_arrays = []
-    none_indices = []
-    for i, (batched, arg) in enumerate(zip(in_batched, kernel_args)):
-      if arg is None:
-        none_indices.append(i)
-      elif batched:
-        mapped_arrays.append(arg)
-      else:
-        arg_arr = jnp.asarray(arg)
-        mapped_arrays.append(
-            jnp.broadcast_to(arg_arr, (axis_size,) + arg_arr.shape)
-        )
-
-    def loop_body(arrays_tuple):
-      args_list = list(arrays_tuple)
-      for i in none_indices:
-        args_list.insert(i, None)
-      return wrapped(*args_list)
-
-    out = jax.lax.map(loop_body, tuple(mapped_arrays))
-    return out, tuple([True] * len(out))
-
-  def unwrap(*args):
-    out = wrapped(*args)
-    return out[0] if singleton_out else out
-
-  return unwrap
-
-
 def _smem_transforms(dtype, swizzle=128):
   return (
       plgpu.TilingTransform((8, swizzle // jnp.dtype(dtype).itemsize)),
@@ -1788,7 +1712,7 @@ def flash_attention_vjp_kernel(
           logits_soft_cap=logits_soft_cap,
       )
 
-    dq = _kernel(
+    dq = plgpu.kernel(
         dq_body,
         out_type=dq_out_shape,
         kernel_name="sm100_dq_kernel",
@@ -1850,7 +1774,7 @@ def flash_attention_vjp_kernel(
           logits_soft_cap=logits_soft_cap,
       )
 
-    dq, ds = _kernel(
+    dq, ds = plgpu.kernel(
         dq_body_bias,
         out_type=dq_out_shape,
         kernel_name="sm100_dq_kernel_bias",
@@ -1942,7 +1866,7 @@ def flash_attention_vjp_kernel(
         **scratches,
     )
 
-  dk, dv = _kernel(
+  dk, dv = plgpu.kernel(
       dkv_body,
       out_type=dkv_shape,
       kernel_name="sm100_dkv_kernel",
