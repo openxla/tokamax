@@ -16,6 +16,7 @@
 
 # pylint: disable=invalid-name
 
+import functools
 import math
 from typing import Annotated
 
@@ -1653,8 +1654,6 @@ def flash_attention_vjp_kernel(
       reduction_scratch_bytes=0,
   )
 
-  dq_shape = jax.ShapeDtypeStruct(q.shape, q.dtype)
-
   dq_scratch_shapes = _get_dq_scratch_shapes(
       config=config,
       head_dim=head_dim,
@@ -1672,123 +1671,38 @@ def flash_attention_vjp_kernel(
   )
 
   if bias is None:
-    dq_out_shape = dq_shape
-
-    def dq_body(
-        q_ref,
-        k_ref,
-        v_ref,
-        dout_ref,
-        m_ref,
-        l_ref,
-        delta_ref,
-        bias_ref,
-        k_start_ref,
-        k_end_ref,
-        mask_ref,
-        dq_ref,
-        **scratches,
-    ):
-      return _kernel_dq(
-          q_ref,
-          k_ref,
-          v_ref,
-          dout_ref,
-          m_ref,
-          l_ref,
-          delta_ref,
-          bias_ref,
-          k_start_ref,
-          k_end_ref,
-          mask_ref,
-          dq_ref,
-          bias_4d_shape=bias_4d_shape,
-          mask_4d_shape=mask_4d_shape,
-          ds_ref=None,
-          **scratches,
-          config=config,
-          is_causal=is_causal,
-          logits_scale=logits_scale,
-          logits_soft_cap=logits_soft_cap,
-      )
-
-    dq = plgpu.kernel(
-        dq_body,
-        out_type=dq_out_shape,
-        kernel_name="sm100_dq_kernel",
-        grid=(
-            q.shape[-4] if q.ndim == 4 else 1,
-            q.shape[-2],
-            q.shape[-3] // block_q_dq,
-        ),
-        grid_names=("batch", "heads", "q_tiles"),
-        num_threads=2,
-        thread_name="wg",
-        compiler_params=compiler_params,
-        scratch_types=dq_scratch_shapes,
-    )(q, k, v, dout, m, l, delta, bias, k_start, k_end, mask)
-    ds = None
+    ds_shape = None
   else:
     q_seq_len_ = pl.cdiv(q.shape[-3], config.block_q_dq) * config.block_q_dq
     kv_seq_len_ = pl.cdiv(k.shape[-3], config.block_kv_dq) * config.block_kv_dq
     ds_shape = (q.shape[-4], q.shape[-2], q_seq_len_, kv_seq_len_)
     ds_shape = jax.ShapeDtypeStruct(ds_shape, ds_dtype)
-    dq_out_shape = (dq_shape, ds_shape)
 
-    def dq_body_bias(
-        q_ref,
-        k_ref,
-        v_ref,
-        dout_ref,
-        m_ref,
-        l_ref,
-        delta_ref,
-        bias_ref,
-        k_start_ref,
-        k_end_ref,
-        mask_ref,
-        dq_ref,
-        ds_ref,
-        **scratches,
-    ):
-      return _kernel_dq(
-          q_ref,
-          k_ref,
-          v_ref,
-          dout_ref,
-          m_ref,
-          l_ref,
-          delta_ref,
-          bias_ref,
-          k_start_ref,
-          k_end_ref,
-          mask_ref,
-          dq_ref,
-          bias_4d_shape=bias_4d_shape,
-          mask_4d_shape=mask_4d_shape,
-          ds_ref=ds_ref,
-          **scratches,
-          config=config,
-          is_causal=is_causal,
-          logits_scale=logits_scale,
-          logits_soft_cap=logits_soft_cap,
-      )
+  kernel_dq = functools.partial(
+      _kernel_dq,
+      bias_4d_shape=bias_4d_shape,
+      mask_4d_shape=mask_4d_shape,
+      config=config,
+      is_causal=is_causal,
+      logits_scale=logits_scale,
+      logits_soft_cap=logits_soft_cap,
+  )
 
-    dq, ds = plgpu.kernel(
-        dq_body_bias,
-        out_type=dq_out_shape,
-        kernel_name="sm100_dq_kernel_bias",
-        grid=(
-            q.shape[-4] if q.ndim == 4 else 1,
-            q.shape[-2],
-            q.shape[-3] // block_q_dq,
-        ),
-        grid_names=("batch", "heads", "q_tiles"),
-        num_threads=2,
-        thread_name="wg",
-        compiler_params=compiler_params,
-        scratch_types=dq_scratch_shapes,
-    )(q, k, v, dout, m, l, delta, bias, k_start, k_end, mask)
+  dq, ds = plgpu.kernel(
+      kernel_dq,
+      out_type=(jax.ShapeDtypeStruct(q.shape, q.dtype), ds_shape),
+      kernel_name="sm100_dq_kernel",
+      grid=(
+          q.shape[-4] if q.ndim == 4 else 1,
+          q.shape[-2],
+          q.shape[-3] // block_q_dq,
+      ),
+      grid_names=("batch", "heads", "q_tiles"),
+      num_threads=2,
+      thread_name="wg",
+      compiler_params=compiler_params,
+      scratch_types=dq_scratch_shapes,
+  )(q, k, v, dout, m, l, delta, bias, k_start, k_end, mask)
 
   dkv_shape = (
       jax.ShapeDtypeStruct(k.shape, k.dtype),
@@ -1827,47 +1741,18 @@ def flash_attention_vjp_kernel(
       else mask
   )
 
-  def dkv_body(
-      q_ref,
-      k_ref,
-      v_ref,
-      dout_ref,
-      m_ref,
-      l_ref,
-      delta_ref,
-      bias_ref,
-      k_start_ref,
-      k_end_ref,
-      mask_ref,
-      dk_ref,
-      dv_ref,
-      **scratches,
-  ):
-    return _kernel_dkv(
-        q_ref,
-        k_ref,
-        v_ref,
-        dout_ref,
-        m_ref,
-        l_ref,
-        delta_ref,
-        bias_ref,
-        k_start_ref,
-        k_end_ref,
-        mask_ref,
-        dk_ref,
-        bias_4d_shape=bias_4d_shape,
-        mask_4d_shape=mask_4d_shape,
-        dv_ref=dv_ref,
-        config=config,
-        is_causal=is_causal,
-        logits_scale=logits_scale,
-        logits_soft_cap=logits_soft_cap,
-        **scratches,
-    )
+  kernel_dkv = functools.partial(
+      _kernel_dkv,
+      bias_4d_shape=bias_4d_shape,
+      mask_4d_shape=mask_4d_shape,
+      config=config,
+      is_causal=is_causal,
+      logits_scale=logits_scale,
+      logits_soft_cap=logits_soft_cap,
+  )
 
   dk, dv = plgpu.kernel(
-      dkv_body,
+      kernel_dkv,
       out_type=dkv_shape,
       kernel_name="sm100_dkv_kernel",
       grid=(
