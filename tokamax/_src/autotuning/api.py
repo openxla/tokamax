@@ -41,6 +41,8 @@ from tokamax._src.ops.normalization import api as normalization_api
 from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
+from tokamax._src.ops.ragged_scatter import api as ragged_scatter_api
+from tokamax._src.ops.ragged_scatter import base as ragged_scatter_base
 import tqdm
 
 BoundArgsAutotuningData: TypeAlias = tuple[
@@ -278,6 +280,7 @@ _API_IMPLEMENTATIONS: Final[
     normalization_base.Normalization: normalization_api.IMPLEMENTATIONS,
     glu_base.GatedLinearUnit: glu_api.IMPLEMENTATIONS,
     ragged_dot_base.RaggedDot: ragged_dot_api.IMPLEMENTATIONS,
+    ragged_scatter_base.RaggedScatter: ragged_scatter_api.IMPLEMENTATIONS,
     attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,
     mla_base.MultiHeadLatentAttention: mla_api.IMPLEMENTATIONS,
 })
