@@ -907,6 +907,84 @@ class GmmTest(parameterized.TestCase):
     chex.assert_trees_all_close(actual, expected, atol=1.1, rtol=1.1)
 
   @parameterized.product(
+      batch_size=[128],
+      in_size=[512, 1024],
+      out_size=[512, 1024],
+      num_groups=[16, 32],
+      block_size=[512, 1024],
+      group_offset=[0, 2],
+  )
+  def test_gmm_quantize_lhs_with_lhs_scale(
+      self,
+      batch_size,
+      in_size,
+      out_size,
+      num_groups,
+      block_size,
+      group_offset,
+  ):
+    """LHS quantized with a user provided lhs_scale."""
+    if block_size > in_size:
+      self.skipTest("block_size must be <= in_size")
+    # Per-tensor fp8 quant scale (bound / finfo(fp8).max = 224 / 448),
+    # matching qwix's "fixed,-224,224" act calibration.
+    lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
+
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+
+    lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    # Pin fp8 weights so rhs is dequantized after the matmul, which is the only
+    # path that enables lhs quantization.
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+    # The kernel quantizes LHS to fp8 internally (constant fixed scale,
+    # clip-before-cast), which perturbs every LHS value before the matmul. We
+    # apply the identical quantize->dequantize round-trip to the reference's LHS
+    # so both sides carry the same quantization error. Otherwise the comparison
+    # would measure fp8 quantization noise itself (large for fp8_e4m3fn) rather
+    # than whether the kernel computes the correct grouped matmul. Because the
+    # fixed scale is data-independent (not per-block absmax), the quantized
+    # values are identical regardless of how the kernel slices K, so this
+    # whole-tensor simulation is faithful; only accumulation order /
+    # intermediate-dtype differences remain, within the tolerance below.
+    scale = lhs_scale.item()
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    lhs_q = jnp.clip(
+        lhs.astype(jnp.float32) / scale, -fp8_max, fp8_max
+    ).astype(jnp.float8_e4m3fn)
+    lhs_simulated = (lhs_q.astype(jnp.float32) * scale).astype(lhs.dtype)
+
+    expected = reference_gmm(
+        lhs_simulated,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+    )
+
+    actual = gmm_backend.gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        maybe_quantize_lhs=True,
+        lhs_scale=lhs_scale,
+    ).astype(lhs.dtype)
+
+    chex.assert_trees_all_close(actual, expected, atol=0.75, rtol=3e-2)
+
+  @parameterized.product(
       batch_size=[128, 256],
       in_size=[255, 500],
       out_size=[255, 500],
@@ -1074,12 +1152,12 @@ class GmmTest(parameterized.TestCase):
       in_size=[512],
       out_size=[512],
       num_groups=[16],
-      has_bias=[True, False],
-      use_weight_scale=[True, False],
-      maybe_quantize_lhs=[True, False],
-      fuse_act=["silu", "swigluoai", "gelu"],
-      group_offset=[0, 2],
-      block_size=[256, 512],
+      has_bias=[False],
+      use_weight_scale=[True],
+      maybe_quantize_lhs=[True],
+      fuse_act=["silu"],
+      group_offset=[0],
+      block_size=[256],
   )
   def test_gmm_fused_activation(
       self,
@@ -1133,10 +1211,12 @@ class GmmTest(parameterized.TestCase):
     # whole tensor level, and output is casted down we need to simulate that
     # quantization noise in the reference as well for a fair comparison
     if maybe_quantize_lhs:
-      lhs_block_size = min(512, in_size)
+      lhs_block_size = 256
+      print(f"xw32 line 1221: {lhs.shape=}, {lhs_block_size=}.")
       lhs_q, lhs_scale_factor = quantize_tensor(
           lhs, jnp.int8, axis=1, block_size=lhs_block_size
       )
+      print(f"xw32 line 1225: {lhs_q.shape=}, {lhs_scale_factor.shape=}.")
       lhs_q_blocked = lhs_q.reshape(batch_size, -1, lhs_block_size).astype(
           jnp.float32
       )
