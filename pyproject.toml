@@ -44,6 +44,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.packages.find]
+include = ["tokamax*"]
+
 [tool.setuptools.package-data]
 tokamax = ["data/autotuning/*/*.json"]
 
