@@ -324,16 +324,9 @@ class Op(abc.ABC, Generic[_P, _T, _R, _Config, _Key]):
         _AUTOTUNING_CACHE[self_no_vjp] = cache
 
       final_cache = cache[device_kind]
-      logging.info(
-          "Loaded autotuning cache for %s: %s",
-          self_no_vjp,
-          final_cache,
-      )
+      logging.info("Loaded autotuning cache for %s", self_no_vjp)
     else:
-      logging.warning(
-          "Ignoring autotuning cache for %s",
-          self_no_vjp,
-      )
+      logging.warning("Ignoring autotuning cache for %s", self_no_vjp)
 
     return final_cache
 
