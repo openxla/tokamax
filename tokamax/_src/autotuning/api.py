@@ -35,6 +35,8 @@ from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.experimental.mla import api as mla_api
 from tokamax._src.ops.experimental.mla import base as mla_base
+from tokamax._src.ops.experimental.kda import api as kda_api
+from tokamax._src.ops.experimental.kda import base as kda_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import api as normalization_api
@@ -280,6 +282,7 @@ _API_IMPLEMENTATIONS: Final[
     ragged_dot_base.RaggedDot: ragged_dot_api.IMPLEMENTATIONS,
     attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,
     mla_base.MultiHeadLatentAttention: mla_api.IMPLEMENTATIONS,
+    kda_base.KimiDeltaAttention: kda_api.IMPLEMENTATIONS,
 })
 
 
