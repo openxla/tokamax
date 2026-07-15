@@ -310,7 +310,7 @@ class ChunkedXlaLinearSoftmaxCrossEntropyLoss(
         b_block_sz=config.b_block_size,
         v_block_sz=config.v_block_size,
     )
-    return loss, (lse,)
+    return loss.astype(jnp.float32), (lse,)
 
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     return Config()
