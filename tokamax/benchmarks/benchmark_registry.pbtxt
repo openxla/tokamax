@@ -53,7 +53,7 @@ benchmarks {
     pattern: "attention_numerics/.*"
     unit: "abs"
     stats {
-      stat: LAST
+      stat: MEDIAN
     }
   }
 }
