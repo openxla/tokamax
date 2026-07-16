@@ -143,30 +143,34 @@ def gated_linear_unit(
   def kernel(a_gmem, b_gmem, out_gmem, out_smem):
 
     def get_pipeline(pipeline_body, compute_context):
+      in_specs = [
+          plgpu.BlockSpec(
+              (cta_tile_m, tile_k),
+              lambda k: (0, k),
+              transforms=lhs_transforms,
+              memory_space=plgpu.SMEM,
+              collective_axes=("cluster",) if config.cluster_size_n > 1 else (),
+          ),
+      ]
+      for i in range(
+          2 if config.wg_dimension == common.MatmulDimension.N else 1
+      ):
+        in_specs.append(
+            plgpu.BlockSpec(
+                (tile_k, 2, tile_n),
+                lambda k, i=i: (k, 0, i),
+                transforms=rhs_transforms,
+                memory_space=plgpu.SMEM,
+                collective_axes=("cluster",)
+                if config.cluster_size_m > 1
+                else (),
+            )
+        )
       return plgpu.emit_pipeline_warp_specialized(
           pipeline_body,
           grid=(k_iters,),
           memory_registers=40,
-          in_specs=[
-              plgpu.BlockSpec(
-                  (cta_tile_m, tile_k),
-                  lambda k: (0, k),
-                  transforms=lhs_transforms,
-                  memory_space=plgpu.SMEM,
-                  collective_axes=("cluster",)
-                  if config.cluster_size_n > 1
-                  else (),
-              ),
-              plgpu.BlockSpec(
-                  (tile_k, 2, cta_tile_n),
-                  lambda k: (k, 0, 0),
-                  transforms=rhs_transforms,
-                  memory_space=plgpu.SMEM,
-                  collective_axes=("cluster",)
-                  if config.cluster_size_m > 1
-                  else (),
-              ),
-          ],
+          in_specs=in_specs,
           wg_axis="wg",
           num_compute_wgs=2,
           max_concurrent_steps=num_stages,
@@ -176,10 +180,15 @@ def gated_linear_unit(
     # Functions don't influence the allocations necessary to run the pipeline.
     ignore = lambda *_, **__: None
 
+    if config.wg_dimension == common.MatmulDimension.N:
+      alloc_shapes = [a_gmem, b_gmem, b_gmem]
+    else:
+      alloc_shapes = [a_gmem, b_gmem]
+
     @functools.partial(
         pl.run_scoped,
         pipeline_allocs=get_pipeline(ignore, ignore).get_allocations(
-            a_gmem, b_gmem
+            *alloc_shapes
         ),
         collective_axes="wg",
     )
@@ -242,18 +251,35 @@ def gated_linear_unit(
                     .at[epi_m_slice, epi_n_slice],
                 )
 
-        def mma_body(_, a_smem, b_smem, acc_ref):
-          reshaped_b = b_smem.at[:, :, wg_n_slice]
-          reshaped_b = reshaped_b.reshape(
-              reshaped_b.shape[0], math.prod(reshaped_b.shape[1:])
-          )
-          plgpu.wgmma(acc_ref, a_smem.at[wg_m_slice], reshaped_b)
+        def mma_body(_, *refs):
+          def collapse_minor_dims(ref):
+            return ref.reshape(ref.shape[0], math.prod(ref.shape[1:]))
+          if config.wg_dimension == common.MatmulDimension.N:
+            a_smem, b_smem0, b_smem1, acc_ref = refs
+            reshaped_b0 = collapse_minor_dims(b_smem0)
+            reshaped_b1 = collapse_minor_dims(b_smem1)
+
+            # TODO: We could use select_ref here, but we don't
+            # handle it yet in lowering. I.e.
+            # b_smem = pl.select_ref(wg_idx, b_smem0, b_smem1)
+            def zero():
+              plgpu.wgmma(acc_ref, a_smem, reshaped_b0)
+            def one():
+              plgpu.wgmma(acc_ref, a_smem, reshaped_b1)
+            jax.lax.cond(wg_idx == 0, zero, one)
+          else:
+            a_smem, b_smem, acc_ref = refs
+            reshaped_b = collapse_minor_dims(b_smem)
+            plgpu.wgmma(acc_ref, a_smem.at[wg_m_slice], reshaped_b)
           plgpu.wgmma_wait(0)
           return acc_ref
 
         get_pipeline(mma_body, compute_context)(
             a_gmem.at[cta_m_slice, :],
-            b_gmem.at[:, :, cta_n_slice],
+            *(
+                [b_gmem.at[:, :, cta_n_slice]]
+                * (1 + (config.wg_dimension == common.MatmulDimension.N))
+            ),
             allocations=pipeline_allocs,
         )
 
