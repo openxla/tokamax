@@ -35,7 +35,7 @@ def poison_tpu_memory():
     for i in range(s_scratch.shape[0]):
       s_scratch[i] = 0x7FC00000  # IEEE 754 NaN bit pattern
 
-  pl.pallas_call(
+  out = pl.pallas_call(
       poison_kernel,
       out_shape=jax.ShapeDtypeStruct((1,), jnp.float32),
       grid=(1,),
@@ -45,3 +45,4 @@ def poison_tpu_memory():
       ],
       compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
   )(jnp.zeros((1,), dtype=jnp.float32))
+  out.block_until_ready()

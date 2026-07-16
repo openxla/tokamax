@@ -21,7 +21,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.tpu.gdn.v3 import wrapper
-from tokamax._src.ops.experimental.tpu.gdn.v3.test_utils import poison_tpu_memory
+from tokamax._src.ops.experimental.utils.test_utils import poison_tpu_memory
 
 
 class GDNSecurityTest(parameterized.TestCase):
