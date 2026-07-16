@@ -298,12 +298,12 @@ def flash_attention_vjp_kernel(
     # pipeline as they are not dependent on kv_step.
     def kv_pipeline(
         index,
-        v_smem,
         bias_smem,
+        v_smem,
         mask_smem,
         k_smem,
-        v_consumed_barrier,
         bias_consumed_barrier,
+        v_consumed_barrier,
         mask_consumed_barrier,
         k_consumed_barrier,
         carry,
@@ -324,6 +324,8 @@ def flash_attention_vjp_kernel(
           bias = _load_bcast(bias_gmem, (qs, ks), layout=_WGMMA)
         else:
           bias = bias_smem[pl.ds(wg * block_q, block_q)]
+          mgpu_lib.fence_async_shared_cta()
+          plgpu.barrier_arrive(bias_consumed_barrier)
 
         plgpu.wgmma_wait(1)
         plgpu.barrier_arrive(v_consumed_barrier)
@@ -335,9 +337,6 @@ def flash_attention_vjp_kernel(
 
       if bias is not None:
         s = s * scale + bias.astype(s.dtype)
-        if bias_smem is not None:
-          mgpu_lib.fence_async_shared_cta()
-          plgpu.barrier_arrive(bias_consumed_barrier)
         scale = 1.0
 
       if logits_soft_cap is not None:
@@ -440,8 +439,8 @@ def flash_attention_vjp_kernel(
         wg_axis="wg",
         manual_consumed_barriers=True,
         compute_context=compute_thread,
-        in_specs=[v_spec, bias_spec, mask_spec, k_spec],
-    )(v_gmem, bias_gmem_, mask_gmem_, k_gmem)
+        in_specs=[bias_spec, v_spec, mask_spec, k_spec],
+    )(bias_gmem_, v_gmem, mask_gmem_, k_gmem)
 
   def kernel_dkv(
       q_gmem,
