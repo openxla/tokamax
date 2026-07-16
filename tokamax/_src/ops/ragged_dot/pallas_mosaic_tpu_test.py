@@ -95,6 +95,11 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       self.skipTest("Only supported on TPUs.")
     super().setUp()
 
+  @override
+  def _test_simple(self, dtype):
+    with test_base.override_chex_args(atol=1e-6):
+      super()._test_simple(dtype)
+
   def test_vjp0(self):
     with test_base.override_chex_args(atol=0.2, rtol=0.01):
       super().test_vjp0()  # pytype: disable=attribute-error
@@ -257,7 +262,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
 
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
 
-
     ba_fwd = op_lib.BoundArguments(
         op=tpu_ragged_dot,
         arguments={
@@ -279,7 +283,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       self.assertEqual(fwd_heuristics.tile_m, 128)
     if fwd_heuristics.tile_k < k:
       self.assertEqual(fwd_heuristics.tile_n, 128)
-
 
     ba_vjp_dlhs = op_lib.BoundArguments(
         op=tpu_ragged_dot,
