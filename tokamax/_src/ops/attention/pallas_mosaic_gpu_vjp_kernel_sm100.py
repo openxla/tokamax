@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -35,11 +36,11 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_common as vjp_common
 
 _SMEM_SIZE_LIMIT = 227 * 1024
-
-
 _TMEM = plgpu.Layout.TCGEN05
 _TMEM_COL = plgpu.Layout.TCGEN05.reduce(0)
 _TMEM_ROW = plgpu.Layout.TCGEN05.reduce(1)
+_load_bcast = common.load_bcast
+_tiled_smem = mgpu_lib.tiled_swizzled_smem
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -78,10 +79,13 @@ def _get_dq_scratch_shapes(
     mask_shape,
     mask_dtype,
 ):
+  block_q = config.block_q_dq
+  block_kv = config.block_kv_dq
+  eltwise_stages = config.eltwise_stages
   ds_stages = 2 if config.double_buffer else 1
   ds_smems = [
       plgpu.SMEM(
-          (ds_stages, config.block_q_dq, chunk_size),
+          (ds_stages, block_q, chunk_size),
           k_dtype,
           transforms=_smem_transforms(k_dtype, swizzle=64),
       )
@@ -89,36 +93,36 @@ def _get_dq_scratch_shapes(
   if bias_shape is not None:
     ds_smems.append(
         plgpu.SMEM(
-            (ds_stages, config.block_q_dq, chunk_size),
+            (ds_stages, block_q, chunk_size),
             ds_dtype,
             transforms=_smem_transforms(ds_dtype, swizzle=64),
         )
     )
   shapes = dict(
       q_smem=plgpu.SMEM(
-          (config.block_q_dq, head_dim),
+          (block_q, head_dim),
           q_dtype,
           transforms=_smem_transforms(q_dtype, swizzle=64),
       ),
       do_smem=plgpu.SMEM(
-          (config.block_q_dq, head_dim_out),
+          (block_q, head_dim_out),
           dout_dtype,
           transforms=_smem_transforms(dout_dtype, swizzle=64),
       ),
       k_smem=plgpu.SMEM(
-          (config.num_stages, config.block_kv_dq, head_dim),
+          (config.num_stages, block_kv, head_dim),
           k_dtype,
           transforms=_smem_transforms(k_dtype, swizzle=64),
       ),
       v_smem=plgpu.SMEM(
-          (config.num_stages, config.block_kv_dq, head_dim_out),
+          (config.num_stages, block_kv, head_dim_out),
           v_dtype,
           transforms=_smem_transforms(v_dtype, swizzle=64),
       ),
       ds_smem=plgpu.RefUnion(*ds_smems),
-      s_tmem=plgpu.TMEM((config.block_q_dq, config.block_kv_dq), jnp.float32),
-      dp_tmem=plgpu.TMEM((config.block_q_dq, config.block_kv_dq), jnp.float32),
-      dq_tmem=plgpu.TMEM((config.block_q_dq, head_dim), jnp.float32),
+      s_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
+      dp_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
+      dq_tmem=plgpu.TMEM((block_q, head_dim), jnp.float32),
       k_produced=plgpu.Barrier(num_barriers=config.num_stages),
       v_produced=plgpu.Barrier(num_barriers=config.num_stages),
       k_consumed=plgpu.Barrier(
@@ -141,19 +145,18 @@ def _get_dq_scratch_shapes(
     shapes["q_do_produced"] = plgpu.Barrier(num_arrivals=2)
   else:
     shapes["q_do_produced"] = plgpu.Barrier(num_arrivals=5)
-    shapes["residuals_smem"] = plgpu.SMEM((3, config.block_q_dq), jnp.float32)
+    shapes["residuals_smem"] = plgpu.SMEM((3, block_q), jnp.float32)
 
-  shapes.update(
-      _add_eltwise_scratch_shapes(
-          "bias",
-          bias_shape,
-          bias_dtype,
-          config,
-          config.block_q_dq,
-          config.block_kv_dq,
-          chunk_size * 2,
-      )
-  )
+  if bias_shape is not None and bias_shape[-2] != 1 and bias_shape[-1] != 1:
+    shape = (eltwise_stages, block_q, block_kv)
+    swizzle = min(
+        plgpu.find_swizzle(block_kv * mgpu_lib.num_bits(bias_dtype), "bias"),
+        chunk_size * 2,
+    )
+    shapes["bias_smem"] = _tiled_smem(shape, bias_dtype, swizzle=swizzle)
+    shapes["bias_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+    shapes["bias_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+
   shapes.update(
       _add_eltwise_scratch_shapes(
           "mask",
@@ -182,44 +185,45 @@ def _get_dkv_scratch_shapes(
     mask_shape,
     mask_dtype,
 ):
+  block_q = config.block_q_dkv
+  block_kv = config.block_kv_dkv
+  eltwise_stages = config.eltwise_stages
   ds_stages = 2 if config.double_buffer else 1
   shapes = dict(
       k_smem=plgpu.SMEM(
-          (config.block_kv_dkv, head_dim),
+          (block_kv, head_dim),
           k_dtype,
           transforms=_smem_transforms(k_dtype, swizzle=64),
       ),
       v_smem=plgpu.SMEM(
-          (config.block_kv_dkv, head_dim_out),
+          (block_kv, head_dim_out),
           v_dtype,
           transforms=_smem_transforms(v_dtype, swizzle=64),
       ),
       q_smem=plgpu.SMEM(
-          (config.num_stages, config.block_q_dkv, head_dim),
+          (config.num_stages, block_q, head_dim),
           q_dtype,
           transforms=_smem_transforms(q_dtype, swizzle=64),
       ),
       do_smem=plgpu.SMEM(
-          (config.num_stages, config.block_q_dkv, head_dim_out),
+          (config.num_stages, block_q, head_dim_out),
           dout_dtype,
           transforms=_smem_transforms(dout_dtype, swizzle=64),
       ),
       ds_smem=plgpu.SMEM(
-          (ds_stages, config.block_kv_dkv, chunk_size),
+          (ds_stages, block_kv, chunk_size),
           q_dtype,
           transforms=_smem_transforms(q_dtype, swizzle=64),
       ),
       p_smem=plgpu.SMEM(
-          (ds_stages, config.block_kv_dkv, chunk_size),
+          (ds_stages, block_kv, chunk_size),
           dout_dtype,
           transforms=_smem_transforms(dout_dtype, swizzle=64),
       ),
-      s_tmem=plgpu.TMEM((config.block_kv_dkv, config.block_q_dkv), jnp.float32),
-      dp_tmem=plgpu.TMEM(
-          (config.block_kv_dkv, config.block_q_dkv), jnp.float32
-      ),
-      dk_tmem=plgpu.TMEM((config.block_kv_dkv, head_dim), jnp.float32),
-      dv_tmem=plgpu.TMEM((config.block_kv_dkv, head_dim_out), jnp.float32),
+      s_tmem=plgpu.TMEM((block_kv, block_q), jnp.float32),
+      dp_tmem=plgpu.TMEM((block_kv, block_q), jnp.float32),
+      dk_tmem=plgpu.TMEM((block_kv, head_dim), jnp.float32),
+      dv_tmem=plgpu.TMEM((block_kv, head_dim_out), jnp.float32),
       kv_produced=plgpu.Barrier(num_arrivals=2),
       q_do_produced=plgpu.Barrier(
           num_barriers=config.num_stages, num_arrivals=2
@@ -239,24 +243,23 @@ def _get_dkv_scratch_shapes(
       ),
       kv_mma_finished=plgpu.Barrier(orders_tensor_core=True),
       residuals_smem=plgpu.SMEM(
-          (3, config.residual_stages, config.block_q_dkv), jnp.float32
+          (3, config.residual_stages, block_q), jnp.float32
       ),
       residual_produced=plgpu.Barrier(
           num_barriers=config.residual_stages, num_arrivals=3
       ),
       residual_consumed=plgpu.Barrier(num_barriers=config.residual_stages),
   )
-  shapes.update(
-      _add_eltwise_scratch_shapes(
-          "bias",
-          bias_shape,
-          bias_dtype,
-          config,
-          config.block_q_dkv,
-          config.block_kv_dkv,
-          chunk_size * 2,
-      )
-  )
+  if bias_shape is not None and bias_shape[-2] != 1 and bias_shape[-1] != 1:
+    shape = (eltwise_stages, block_kv, block_q)
+    swizzle = min(
+        plgpu.find_swizzle(block_q * mgpu_lib.num_bits(bias_dtype), "bias"),
+        chunk_size * 2,
+    )
+    shapes["bias_smem"] = _tiled_smem(shape, bias_dtype, swizzle=swizzle)
+    shapes["bias_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+    shapes["bias_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+
   shapes.update(
       _add_eltwise_scratch_shapes(
           "mask",
@@ -655,26 +658,18 @@ def _kernel_dq(
           def eltwise_loop(ki):
             bi = lax.rem(ki - lb, config.eltwise_stages)
             ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
-            if bias_ref is not None:
-              if bias_smem is not None:
-                hi_m = 0 if bias_shape[-3] == 1 else hi
-                if bias_shape[-1] == 1:
-                  if bias_shape[-2] == 1:
-                    bias_slice = bias_ref.at[hi_m]
-                  else:
-                    bias_slice = bias_ref.at[hi_m, qs]
-                elif bias_shape[-2] == 1:
-                  bias_slice = bias_ref.at[hi_m, 0, ks]
-                else:
-                  bias_slice = bias_ref.at[hi_m, qs, ks]
+            if bias_smem is not None:
 
-                @pl.when(ki - lb >= config.eltwise_stages)
-                def wait_bias():
-                  plgpu.barrier_wait(bias_consumed.at[bi])
+              @pl.when(ki - lb >= config.eltwise_stages)
+              def wait_bias():
+                plgpu.barrier_wait(bias_consumed.at[bi])
 
-                plgpu.copy_gmem_to_smem(
-                    bias_slice, bias_smem.at[bi], barrier=bias_produced.at[bi]
-                )
+              plgpu.copy_gmem_to_smem(
+                  bias_ref.at[0 if bias_shape[-3] == 1 else hi, qs, ks],
+                  bias_smem.at[bi],
+                  bias_produced.at[bi],
+              )
+
             if mask_ref is not None:
               if mask_smem is not None:
                 hi_m = 0 if mask_shape[-3] == 1 else hi
@@ -699,7 +694,7 @@ def _kernel_dq(
           @pl.loop(lax.max(lb, ub - config.eltwise_stages), ub)
           def eltwise_epilogue(ki):
             bi = lax.rem(ki - lb, config.eltwise_stages)
-            if bias_ref is not None:
+            if bias_smem is not None:
               plgpu.barrier_wait(bias_consumed.at[bi])
             if mask_ref is not None:
               plgpu.barrier_wait(mask_consumed.at[bi])
@@ -795,7 +790,7 @@ def _kernel_dq(
       elt_bi = lax.rem(ki - lb, config.eltwise_stages)
       plgpu.barrier_wait(s_produced)
       plgpu.barrier_wait(dp_produced)
-      if bias_ref is not None:
+      if bias_smem is not None:
         plgpu.barrier_wait(bias_produced.at[elt_bi])
       if mask_ref is not None:
         plgpu.barrier_wait(mask_produced.at[elt_bi])
@@ -847,16 +842,13 @@ def _kernel_dq(
 
         if bias_ref is not None:
           s_val *= logits_scale
-          bias_val = _load_bcast_smem(
-              bias_ref,
-              bias_smem,
-              hi,
-              elt_bi,
-              s_val.shape,
-              chunk_slice,
-              True,
-              bias_shape,
-          )
+          if bias_smem is None:
+            ks = pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size)
+            bias_val = _load_bcast(bias_ref, (hi, qs, ks), layout=_TMEM)
+          else:
+            bias_val = plgpu.load(
+                bias_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
+            )
           s_val += bias_val
 
         if logits_soft_cap is not None:
@@ -957,7 +949,7 @@ def _kernel_dq(
 
         plgpu.barrier_arrive(ds_produced.at[ci])
 
-      if bias_ref is not None:
+      if bias_smem is not None:
         plgpu.barrier_arrive(bias_consumed.at[elt_bi])
       if mask_ref is not None:
         plgpu.barrier_arrive(mask_consumed.at[elt_bi])
@@ -1126,26 +1118,19 @@ def _kernel_dkv(
             hi = hi_kv * q_heads_per_kv_head + qh
             bi = lax.rem(step, config.eltwise_stages)
             qs = pl.ds(qi * config.block_q_dkv, config.block_q_dkv)
-            if bias_ref is not None:
-              if bias_smem is not None:
-                hi_m = 0 if bias_shape[-3] == 1 else hi
-                if bias_shape[-1] == 1:
-                  if bias_shape[-2] == 1:
-                    bias_slice = bias_ref.at[hi_m]
-                  else:
-                    bias_slice = bias_ref.at[hi_m, qs]
-                elif bias_shape[-2] == 1:
-                  bias_slice = bias_ref.at[hi_m, 0, ks]
-                else:
-                  bias_slice = bias_ref.at[hi_m, ks, qs]
 
-                @pl.when(step >= config.eltwise_stages)
-                def wait_bias():
-                  plgpu.barrier_wait(bias_consumed.at[bi])
+            if bias_smem is not None:
 
-                plgpu.copy_gmem_to_smem(
-                    bias_slice, bias_smem.at[bi], barrier=bias_produced.at[bi]
-                )
+              @pl.when(step >= config.eltwise_stages)
+              def wait_bias():
+                plgpu.barrier_wait(bias_consumed.at[bi])
+
+              plgpu.copy_gmem_to_smem(
+                  bias_ref.at[0 if bias_shape[-3] == 1 else hi, ks, qs],
+                  bias_smem.at[bi],
+                  bias_produced.at[bi],
+              )
+
             if mask_ref is not None:
               if mask_smem is not None:
                 hi_m = 0 if mask_shape[-3] == 1 else hi
@@ -1170,7 +1155,7 @@ def _kernel_dkv(
           @pl.loop(lax.max(0, total_steps - config.eltwise_stages), total_steps)
           def eltwise_epilogue(step):
             bi = lax.rem(step, config.eltwise_stages)
-            if bias_ref is not None:
+            if bias_smem is not None:
               plgpu.barrier_wait(bias_consumed.at[bi])
             if mask_ref is not None:
               plgpu.barrier_wait(mask_consumed.at[bi])
@@ -1255,7 +1240,7 @@ def _kernel_dkv(
       plgpu.barrier_wait(residual_produced.at[li])
       plgpu.barrier_wait(s_produced)
       plgpu.barrier_wait(dp_produced)
-      if bias_ref is not None:
+      if bias_smem is not None:
         plgpu.barrier_wait(bias_produced.at[elt_bi])
       if mask_ref is not None:
         plgpu.barrier_wait(mask_produced.at[elt_bi])
@@ -1278,16 +1263,13 @@ def _kernel_dkv(
 
         if bias_ref is not None:
           s_val *= logits_scale
-          bias_val = _load_bcast_smem(
-              bias_ref,
-              bias_smem,
-              hi,
-              elt_bi,
-              s_val.shape,
-              chunk_slice,
-              False,
-              bias_shape,
-          )
+          if bias_smem is None:
+            qs = pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
+            bias_val = _load_bcast(bias_ref, (hi, ks, qs), layout=_TMEM)
+          else:
+            bias_val = plgpu.load(
+                bias_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
+            )
           s_val += bias_val
 
         if logits_soft_cap is not None:
@@ -1403,7 +1385,7 @@ def _kernel_dkv(
         plgpu.commit_smem()
         plgpu.barrier_arrive(ds_produced.at[ci])
 
-      if bias_ref is not None:
+      if bias_smem is not None:
         plgpu.barrier_arrive(bias_consumed.at[elt_bi])
       if mask_ref is not None:
         plgpu.barrier_arrive(mask_consumed.at[elt_bi])
@@ -1491,7 +1473,6 @@ def flash_attention_vjp_kernel(
   bias_shape = bias.shape if bias is not None else None
   mask_shape = mask.shape if mask is not None else None
 
-  bias = _squeeze_trailing_1s(bias)
   mask = _squeeze_trailing_1s(mask)
 
   pad_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
@@ -1579,13 +1560,9 @@ def flash_attention_vjp_kernel(
       mask_dtype=mask.dtype if mask is not None else None,
   )
 
+  bias_dkv = None if bias is None else bias.mT
   # Only transpose 2D arrays; transposing 1D arrays creates invalid
   # strides for TMA.
-  bias_dkv = (
-      bias.mT
-      if (bias is not None and bias_shape[-1] != 1 and bias_shape[-2] != 1)
-      else bias
-  )
   mask_dkv = (
       mask.mT
       if (mask is not None and mask_shape[-1] != 1 and mask_shape[-2] != 1)

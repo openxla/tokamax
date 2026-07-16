@@ -38,11 +38,13 @@ def tile_swizzle_transforms(
     dtype: jax.typing.DTypeLike,
     what: str = "",
     *,
+    swizzle: int | None = None,
     tiling_prefix: tuple[int, ...] = (8,),
 ) -> tuple[plgpu.TilingTransform, plgpu.SwizzleTransform]:
   """Returns tiling and swizzling transforms."""
   elem_bits = num_bits(dtype)
-  swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
+  if swizzle is None:
+    swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
   tiling = (*tiling_prefix, 8 * swizzle // elem_bits)
   return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
 
@@ -52,11 +54,12 @@ def tiled_swizzled_smem(
     dtype: jax.typing.DTypeLike,
     what: str = "",
     *,
+    swizzle: int | None = None,
     tiling_prefix: tuple[int, ...] = (8,),
 ) -> pl.MemoryRef:
   """Returns a memory reference to a tiled and swizzled shared memory array."""
   transforms = tile_swizzle_transforms(
-      shape, dtype, what, tiling_prefix=tiling_prefix
+      shape, dtype, what, swizzle=swizzle, tiling_prefix=tiling_prefix
   )
   return plgpu.SMEM(shape, dtype, transforms=transforms)
 
