@@ -581,7 +581,6 @@ def flash_attention_vjp_kernel(
       # attention masking (as the multiplication will cause `-inf`s).
       scale *= math.log2(math.e)
       m *= math.log2(math.e)
-      sT *= scale
 
       mask_value = float(jnp.finfo(jnp.float32).min)
 
@@ -592,10 +591,10 @@ def flash_attention_vjp_kernel(
 
         def apply_causal_mask():
           mask = kv_base + iota(0) <= q_base + iota(1)
-          return jnp.where(mask, sT, mask_value)
+          return jnp.where(mask, sT * scale, mask_value), 1.0
 
-        needs_causal_mask = kv_base + block_kv > q_base
-        sT = lax.cond(needs_causal_mask, apply_causal_mask, lambda: sT)
+        do_causal = kv_base + block_kv > q_base
+        sT, scale = lax.cond(do_causal, apply_causal_mask, lambda: (sT, scale))
 
       broadcast = lambda x: lax.broadcast_in_dim(x, sT.shape, [1])
 
@@ -605,11 +604,13 @@ def flash_attention_vjp_kernel(
 
       if k_start_gmem is not None:
         k_start = broadcast(load_k_range(k_start_gmem))
-        sT = jnp.where(kv_base + iota(0) >= k_start, sT, mask_value)
+        sT = jnp.where(kv_base + iota(0) >= k_start, sT * scale, mask_value)
+        scale = 1.0
 
       if k_end_gmem is not None:
         k_end = broadcast(load_k_range(k_end_gmem))
-        sT = jnp.where(kv_base + iota(0) < k_end, sT, mask_value)
+        sT = jnp.where(kv_base + iota(0) < k_end, sT * scale, mask_value)
+        scale = 1.0
 
       if mask_gmem is not None:
         if mask_smem is None:
@@ -621,10 +622,11 @@ def flash_attention_vjp_kernel(
           maskT = mask_smem[pl.ds(wg * block_kv, block_kv)]
           plgpu.barrier_arrive(mask_consumed_barrier)
 
-        sT = jnp.where(maskT, sT, mask_value)
+        sT = jnp.where(maskT, sT * scale, mask_value)
+        scale = 1.0
 
       epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
-      pT = jnp.exp2(sT - broadcast(m)) / broadcast(l + epsilon)
+      pT = jnp.exp2(sT * scale - broadcast(m)) / broadcast(l + epsilon)
 
       def compute_dpT(acc):
         plgpu.wgmma(acc, v_smem, dout_smem.T)
