@@ -119,10 +119,10 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       super().test_causal_mask_cross_attention0()  # pytype: disable=attribute-error
 
   def test_causal_mask_cross_attention1(self):
-    self.skipTest("TODO: Support k-sequence non-multiple of block_kv.")
+    self.skipTest("Cross-attention with k-sequence length not a multiple of block_kv is not yet supported (b/cross_attention_padding).")
 
   def test_padding_mask_with_nans(self):
-    self.skipTest("TODO: Fix.")
+    self.skipTest("Padding mask with NaN values triggers incorrect masking behavior in the SM100 kernel.")
 
   def test_normalize_output(self):
     with test_base.override_test_args(atol=0.02):
@@ -187,7 +187,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         self._run_test_with_inputs(q, k, v, impl=impl)
 
   def test_vjp_autotune_configs(self):
-    self.skipTest("TODO: Disable due to OOMs.")
+    self.skipTest("VJP autotuning configs disabled: autotuning over all configs exceeds GPU memory limits.")
     if not self._supports_vjp:
       self.skipTest("VJP unsupported for this implementation.")
     assert isinstance(self._attention_fn, base.DotProductAttention)
@@ -229,7 +229,9 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       super()._test_small_sequences(seq_q, seq_kv)
 
 
-# TODO: Add manual partitioning test.
+# TODO(b/manual_partitioning): Add a test for manual SPMD partitioning
+# (shard_map) with the Mosaic GPU attention kernel. This would verify that
+# the kernel correctly handles sharded Q/K/V inputs across devices.
 
 if __name__ == "__main__":
   absltest.main()
