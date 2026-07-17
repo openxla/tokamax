@@ -683,6 +683,13 @@ def _abstractify(pytree):
   def abstractify_leaf(x):
     if isinstance(x, (jax.Array, np.ndarray)):
       return jax.ShapeDtypeStruct(x.shape, x.dtype)
+    if isinstance(x, batching.BatchedShapeDtype):
+      # Strip layout/sharding but preserve BatchedShapeDtype type and vmap_axes.
+      return batching.BatchedShapeDtype(x.shape, x.dtype, x.vmap_axes)
+    if isinstance(x, jax.ShapeDtypeStruct):
+      # Strip layout and sharding information from ShapeDtypeStruct to ensure
+      # the generated cache key matches layout-free keys loaded from JSON.
+      return jax.ShapeDtypeStruct(x.shape, x.dtype)
     return x
 
   return jax.tree.map(abstractify_leaf, pytree)
