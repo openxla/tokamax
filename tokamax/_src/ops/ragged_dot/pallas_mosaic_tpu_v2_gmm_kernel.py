@@ -68,7 +68,7 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
     case "swigluoai":
       return swigluoai(acc_gate, acc_up)
     case _:
-      raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
+      raise NotImplementedError(f"Unsupported activation function: {fuse_act}.")
 
 
 def align_to(x, a):
