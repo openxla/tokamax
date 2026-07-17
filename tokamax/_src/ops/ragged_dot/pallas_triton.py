@@ -269,8 +269,17 @@ def _ragged_contracting_dim_dot_kernel(
 
   num_iters = pl.cdiv(jnp.int32(hi - lo), block_k)
   acc = jnp.zeros((block_m, out_ref.shape[1]), dtype=jnp.float32)
-  acc = jax.lax.fori_loop(0, num_iters - 1, body, acc)
-  acc = body(num_iters - 1, acc, mask_k=True)  # Mask final iteration.
+
+  def nonempty_group(_):
+    group_acc = jax.lax.fori_loop(0, num_iters - 1, body, acc)
+    return body(num_iters - 1, group_acc, mask_k=True)
+
+  acc = jax.lax.cond(
+      num_iters > 0,
+      nonempty_group,
+      lambda _: acc,
+      operand=None,
+  )
   if activation is not None:
     acc = activation(acc)
   out_ref.store(acc.astype(out_ref.dtype))
