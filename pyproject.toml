@@ -16,12 +16,12 @@ authors = [
 description = "A Pallas Custom Kernel Library."
 readme = "README.md"
 license = {file = "LICENSE"}
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "absl-py>=2.3.0",
     "einshape",
-    "jax>=0.10.2",
-    "jaxlib>=0.10.2",
+    "jax>=0.11.0",
+    "jaxlib>=0.11.0",
     "jaxtyping>=0.3",
     "pydantic>=2.11.0",
     "qwix>=0.1.2",
@@ -64,7 +64,7 @@ bench = [
 ]
 
 cuda = [
-    "jax[cuda13]>=0.10.1",
+    "jax[cuda13]>=0.11.0",
     "nvidia-cudnn-cu13>=9.23.0.39",
     "cuequivariance-jax>=0.10.0",
     "cuequivariance-ops-jax-cu13>=0.10.0",
@@ -72,7 +72,7 @@ cuda = [
 ]
 
 tpu = [
-    "jax[tpu]>=0.10.1",
+    "jax[tpu]>=0.11.0",
 ]
 
 [tool.pytest.ini_options]
