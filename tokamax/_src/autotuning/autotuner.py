@@ -27,6 +27,7 @@ from typing import Any, ParamSpec, Self, TypeVar, cast
 
 from absl import logging
 import immutabledict
+import jax
 from pydantic_core import core_schema as cs
 from tokamax._src import benchmarking
 from tokamax._src import numerics
@@ -100,8 +101,18 @@ def _compile(fn_factory, config, args, kwargs, *, seed=None):
 
 
 def _benchmark(fn_factory, config, args, kwargs, event_filter_regex=None):
-  runner, x = _compile(fn_factory, config, args, kwargs, seed=0)
-  return runner(x, event_filter_regex=event_filter_regex)
+  import gc
+
+  try:
+    runner, x = _compile(fn_factory, config, args, kwargs, seed=0)
+    return runner(x, event_filter_regex=event_filter_regex)
+  finally:
+    if "runner" in locals():
+      del runner
+    if "x" in locals():
+      del x
+    jax.clear_caches()
+    gc.collect()
 
 
 class _SyncExecutor(futures.Executor):
@@ -201,9 +212,11 @@ class Autotuner:
             data = future.result()
           except process.BrokenProcessPool as e:
             vlog_exc_info("Config broken: %s", config)
+            e.__traceback__ = None
             results[config] = e
           except Exception as e:  # pylint: disable=broad-exception-caught
             vlog_exc_info("Config failed: %s", config)
+            e.__traceback__ = None
             results[config] = e
           else:
             logging.vlog(
@@ -217,6 +230,8 @@ class Autotuner:
                 data.median_evaluation_time_ms,
             )
             results[config] = data
+
+          jax.clear_caches()
       except TimeoutError:
         slow_configs = [c for c in configs if c not in results]
         logging.exception("Configs timed out: %s", slow_configs)
