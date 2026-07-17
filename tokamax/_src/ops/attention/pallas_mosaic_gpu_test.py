@@ -40,6 +40,10 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       self.skipTest("Not supported on TPUs.")
     super().setUp()
 
+  def tearDown(self):
+    jax.clear_caches()
+    super().tearDown()
+
   def __init__(
       self,
       *args,
