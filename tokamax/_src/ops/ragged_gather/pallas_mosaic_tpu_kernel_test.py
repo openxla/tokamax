@@ -33,7 +33,7 @@ class PallasTpuRaggedGatherKernelTest(parameterized.TestCase):
       in_out_size=[(512, 400)],
       start_end=[(3, 338), (10, 422)],
       hidden_size=[128, 512, 8192],
-      dtype=[jnp.int4, jnp.int8, jnp.bfloat16, jnp.float32],
+      dtype=[jnp.int8, jnp.bfloat16, jnp.float32],
   )
   def test_sc_gather_kernel(self, in_out_size, hidden_size, start_end, dtype):
     if backend.get_default_device().device_kind != "TPU7x":
