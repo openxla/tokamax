@@ -89,8 +89,7 @@ class BenchmarkData:
   lower_time_ms: float
   evaluation_times_ms: tuple[float, ...]
   metadata: dict[str, Any]
-  # TODO: Remove default value once all users have been migrated.
-  peak_memory_mb: float | None = None
+  peak_memory_mb: float
 
   @property
   def median_evaluation_time_ms(self) -> float:
