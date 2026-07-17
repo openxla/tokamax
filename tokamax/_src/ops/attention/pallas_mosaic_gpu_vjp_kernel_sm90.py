@@ -346,8 +346,6 @@ def flash_attention_vjp_kernel(
       # NOTE: This rescaling must happen after bias and soft-cap but before the
       # attention masking (as the multiplication will cause `-inf`s).
       scale *= math.log2(math.e)
-      s *= scale
-
       mask_value = float(jnp.finfo(jnp.float32).min)
 
       def iota(d):
@@ -356,17 +354,23 @@ def flash_attention_vjp_kernel(
       if is_causal:
 
         def apply_causal_mask():
-          return jnp.where(q_base + iota(0) >= kv_base + iota(1), s, mask_value)
+          is_causal = q_base + iota(0) >= kv_base + iota(1)
+          return jnp.where(is_causal, s * scale, mask_value), 1.0
 
-        s = lax.cond(kv_base + block_kv > q_base, apply_causal_mask, lambda: s)
+        do_causal = kv_base + block_kv > q_base
+        s, scale = lax.cond(do_causal, apply_causal_mask, lambda: (s, scale))
 
       broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
 
       if k_start is not None:
+        s *= scale
         s = jnp.where(kv_base + iota(1) >= broadcast(k_start), s, mask_value)
+        scale = 1.0
 
       if k_end is not None:
+        s *= scale
         s = jnp.where(kv_base + iota(1) < broadcast(k_end), s, mask_value)
+        scale = 1.0
 
       if mask_gmem is not None:
         if mask_smem is None:
@@ -380,9 +384,10 @@ def flash_attention_vjp_kernel(
           mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(mask_consumed_barrier)
 
-        s = jnp.where(mask, s, mask_value)
+        s = jnp.where(mask, s * scale, mask_value)
+        scale = 1.0
 
-      p = jnp.exp2(s - broadcast(m)) * broadcast(l_rcp)
+      p = jnp.exp2(s * scale - broadcast(m)) * broadcast(l_rcp)
       ds = p * (dp - broadcast(delta))
 
       if logits_soft_cap is not None:
