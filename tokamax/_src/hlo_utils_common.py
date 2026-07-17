@@ -22,6 +22,10 @@ from jaxlib.mlir import ir
 
 TOKAMAX_NAME: Final[str] = 'tokamax'
 
+PALLAS_TRITON_KEYS: Final[tuple[str, ...]] = (
+    'triton_kernel_call_ffi',
+    '__gpu$xla.gpu.triton',
+)
 PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
 MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
 MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
