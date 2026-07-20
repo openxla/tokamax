@@ -69,6 +69,8 @@ def ragged_dot_gpu_quant_blackwell_kernel(
     out_dtype: jnp.dtype,
     config: common.Config,
     activation: base.ActivationFunction | None = None,
+    use_pdl_wait: bool = False,
+    use_pdl_launch: bool = False,
 ) -> Float[Array, "M N"]:
   """Pallas kernel for ragged dot with GPU quantization."""
   assert rhs.zero_point is None
@@ -250,6 +252,11 @@ def ragged_dot_gpu_quant_blackwell_kernel(
 
             @pl.when(warp_id == _X_TMA_WARP)
             def x_tma_warp():
+              @pl.when(carry == 0)
+              def _():
+                if use_pdl_wait:
+                  plgpu.griddepcontrol_wait()
+
               def do_tma_x(ki, slot):
                 plgpu.copy_gmem_to_smem(  # m,k
                     x_gmem.at[
@@ -355,6 +362,9 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           # TMEM -> SMEM
           with jax.named_scope("wait_mma"):
             plgpu.barrier_wait(mma_done_barrier)
+
+          if use_pdl_launch:
+            plgpu.griddepcontrol_launch_dependents()
           split_block_m = block_m // split_m
 
           def tmem_to_smem_loop_body(mi, _):
