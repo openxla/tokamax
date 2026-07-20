@@ -15,7 +15,7 @@
 """`DotProductAttention` wrapper for `FlexAttention`."""
 
 import dataclasses
-from typing import Annotated
+from typing import Annotated, override
 
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
@@ -25,7 +25,6 @@ from tokamax._src import pydantic
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.flex_attention import base
-from typing_extensions import override
 
 
 Mask = attn_base.Mask

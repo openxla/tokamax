@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import functools
+from typing import override
 from unittest import mock
 
 from absl.testing import absltest
@@ -22,7 +23,6 @@ import jax
 from tokamax._src.ops.normalization import pallas_triton
 from tokamax._src.ops.normalization import pallas_triton_config
 from tokamax._src.ops.normalization import test_base
-from typing_extensions import override
 
 
 class PallasTritonNormalizationTest(test_base.NormalizationTestBase):

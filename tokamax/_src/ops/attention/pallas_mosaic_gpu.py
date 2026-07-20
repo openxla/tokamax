@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import Any, ClassVar, TypeAlias
+from typing import Any, ClassVar, TypeAlias, override
 
 import immutabledict
 import jax
@@ -33,7 +33,7 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_kernel_sm100 as sm100
 from tokamax._src.ops.attention import pallas_mosaic_gpu_kernel_sm90 as sm90
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as vjp
-from typing_extensions import override
+
 
 # TODO: Make attention Config a pydantic discriminated union.
 ConfigSM90 = sm90.Config

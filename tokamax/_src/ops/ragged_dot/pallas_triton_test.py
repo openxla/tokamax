@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import override
 from unittest import mock
 
 from absl.testing import absltest
@@ -21,7 +22,6 @@ import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src.ops.ragged_dot import pallas_triton
 from tokamax._src.ops.ragged_dot import test_base
-from typing_extensions import override
 
 
 class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):

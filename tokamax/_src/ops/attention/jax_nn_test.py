@@ -14,12 +14,13 @@
 # ==============================================================================
 
 import pytest
+from typing import override
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import test_base
-from typing_extensions import override
+
 
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 

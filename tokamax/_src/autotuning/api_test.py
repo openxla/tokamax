@@ -14,7 +14,7 @@
 # ==============================================================================
 import dataclasses
 import functools
-from typing import Any
+from typing import Any, override
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -36,7 +36,6 @@ from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu as pl_ragged_dot_mosaic_tpu
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
-from typing_extensions import override
 
 
 @dataclasses.dataclass(frozen=True)

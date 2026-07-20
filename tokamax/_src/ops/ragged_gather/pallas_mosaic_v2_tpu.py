@@ -14,14 +14,14 @@
 # ==============================================================================
 """Pallas/Mosaic operator implementation v2 for Ragged Gather on TPU."""
 
-from typing import TypeVar
+from typing import TypeVar, override
 import jax
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_gather import base
 from tokamax._src.ops.ragged_gather import pallas_mosaic_v2_tpu_kernel
-from typing_extensions import override
+
 
 _Config = TypeVar("_Config")
 

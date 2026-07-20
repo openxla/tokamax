@@ -16,7 +16,8 @@
 
 from collections.abc import Callable
 import functools
-from typing import Any, ClassVar, Literal, TypeVar, overload
+from typing import Any, ClassVar, Literal, TypeVar, overload, override
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
@@ -26,7 +27,6 @@ from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
-from typing_extensions import override
 
 
 CanonicalPrecision = precision_lib.CanonicalPrecision

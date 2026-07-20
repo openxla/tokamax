@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import itertools
-from typing import Any, ClassVar
+from typing import Any, ClassVar, override
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
@@ -29,7 +29,6 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_kernel as backend
-from typing_extensions import override
 
 
 # Tiling on TPU technically needs to be a multiple of 128, but it's possible to

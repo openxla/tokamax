@@ -16,7 +16,7 @@
 
 from collections.abc import Callable, Sequence
 import dataclasses
-from typing import Any, TypeVar
+from typing import Any, TypeVar, override
 
 import jax
 from jax.experimental import checkify
@@ -27,7 +27,6 @@ import qwix
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
-from typing_extensions import override
 
 
 _Config = TypeVar("_Config")

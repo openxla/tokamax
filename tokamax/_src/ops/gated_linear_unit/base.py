@@ -15,7 +15,7 @@
 """Gated linear unit op."""
 
 from collections.abc import Callable
-from typing import Any, TypeAlias, TypeVar
+from typing import Any, TypeAlias, TypeVar, override
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +24,6 @@ from tokamax._src import ad
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
-from typing_extensions import override
 
 
 _T = TypeVar('_T')

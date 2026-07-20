@@ -16,7 +16,7 @@
 
 import dataclasses
 import math
-from typing import Literal
+from typing import Literal, override
 
 import jax
 import jax.numpy as jnp
@@ -28,7 +28,6 @@ from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
-from typing_extensions import override
 
 
 Mask = base.Mask

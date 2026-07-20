@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import dataclasses
+from typing import override
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -28,7 +29,6 @@ from tokamax._src.ops.ragged_dot import (
     pallas_mosaic_gpu_kernel_sm100_fp8_quant as sm100_fp8_quant,
 )
 from tokamax._src.ops.ragged_dot import test_base
-from typing_extensions import override
 
 
 def silu(x):
@@ -126,9 +126,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
   ):
     if subchannels < block_k:
       self.skipTest("subchannels < block_k")
-    config = dataclasses.replace(
-        _CONFIG, block_m=block_m, block_k=block_k
-    )
+    config = dataclasses.replace(_CONFIG, block_m=block_m, block_k=block_k)
     with test_base.ConfigManager(config):
       super()._test_quantized(
           "float8_e4m3fn",
@@ -563,7 +561,10 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     w_i4 = quantization.AsQArray(w, jnp.int4, tiled_axes={0: 1, 1: 128, 2: 1})
 
     # 1. Test enabled path (enable_fused_epilogue_quant=True)
-    op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(enable_fused_epilogue_quant=True)
+    op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(
+        enable_fused_epilogue_quant=True
+    )
+
     def epi_qtype(lhs, rhs, pet):
       ba = pallas_mosaic_gpu.op.BoundArguments(
           op, {"lhs": lhs, "rhs": rhs, "preferred_element_type": pet}
@@ -580,6 +581,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
     # 2. Test disabled path (enable_fused_epilogue_quant=False, default)
     op_disabled = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
+
     def epi_qtype_disabled(lhs, rhs, pet):
       ba = pallas_mosaic_gpu.op.BoundArguments(
           op_disabled, {"lhs": lhs, "rhs": rhs, "preferred_element_type": pet}

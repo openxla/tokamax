@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import ClassVar
+from typing import ClassVar, override
 
 import jax
 from jax.experimental import pallas as pl
@@ -31,7 +31,6 @@ from tokamax._src import pydantic as pydantic_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.pallas import block
-from typing_extensions import override
 
 
 Mask = base.Mask

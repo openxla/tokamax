@@ -20,6 +20,7 @@ gives more similar numerics to FlashAttention.
 
 import dataclasses
 import functools
+from typing import override
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
@@ -29,8 +30,6 @@ from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
-from typing_extensions import override
-
 
 Mask = base.Mask
 QArray = base.QArray

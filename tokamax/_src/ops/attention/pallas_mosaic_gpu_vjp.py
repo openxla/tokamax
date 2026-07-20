@@ -18,7 +18,7 @@
 
 import dataclasses
 import functools
-from typing import Any, ClassVar
+from typing import Any, ClassVar, override
 
 import jax
 from jax.extend import backend
@@ -33,7 +33,7 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_common as vjp_common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm100 as sm100
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm90 as sm90
-from typing_extensions import override
+
 
 CanonicalPrecision = base.CanonicalPrecision
 Config = vjp_common.Config

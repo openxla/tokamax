@@ -15,7 +15,7 @@
 import dataclasses
 import functools
 from types import UnionType  # pylint: disable=g-importing-member
-from typing import Union, get_origin
+from typing import Union, get_origin, override
 from unittest import mock
 
 from absl.testing import absltest
@@ -29,7 +29,6 @@ from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu as fa
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
-from typing_extensions import override
 
 
 @pytest.mark.skip(reason="Too slow for OSS regression tests.")

@@ -18,6 +18,7 @@ import dataclasses
 import functools
 import itertools
 from typing import Annotated, Any, ClassVar, Final, TypeAlias
+from typing import Any, ClassVar, Final, TypeAlias, override
 
 import immutabledict
 import jax
@@ -30,7 +31,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from typing_extensions import override
+
 
 QArray = base.QArray
 Residuals = base.Residuals

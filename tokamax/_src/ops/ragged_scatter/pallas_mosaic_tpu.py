@@ -14,6 +14,8 @@
 # ==============================================================================
 """Pallas/Mosaic operator implementation for Ragged Scatter on TPU."""
 
+from typing import override
+
 import jax
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Int, Shaped
@@ -21,7 +23,6 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops import op as tokamax_op
 from tokamax._src.ops.ragged_scatter import base
 from tokamax._src.ops.ragged_scatter import pallas_mosaic_tpu_kernel
-from typing_extensions import override
 
 _Config = pallas_mosaic_tpu_kernel.Config
 

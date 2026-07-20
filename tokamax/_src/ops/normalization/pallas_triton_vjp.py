@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import ClassVar, TypeAlias
+from typing import ClassVar, TypeAlias, override
 
 import jax
 from jax.experimental import pallas as pl
@@ -28,7 +28,6 @@ from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_config
 from tokamax._src.ops.normalization import pallas_triton_vjp_config
 from tokamax._src.pallas import block
-from typing_extensions import override
 
 
 _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM

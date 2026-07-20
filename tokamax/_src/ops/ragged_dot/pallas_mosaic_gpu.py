@@ -17,6 +17,7 @@
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
 from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, override
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +34,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
-from typing_extensions import override
+
 
 Config = common.Config
 QArray = base.QArray

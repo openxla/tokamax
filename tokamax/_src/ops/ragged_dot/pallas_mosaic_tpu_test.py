@@ -15,6 +15,8 @@
 """Tests for Pallas Mosaic TPU Ragged Dot."""
 
 import functools
+from typing import override
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -27,7 +29,6 @@ from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
-from typing_extensions import override
 
 
 AsQArray = quantization.AsQArray

@@ -15,13 +15,12 @@
 """Normalization op."""
 
 from collections.abc import Callable
-from typing import Any, TypeAlias, TypeVar
+from typing import Any, TypeAlias, TypeVar, override
 
 import jax
 from jax.experimental.pallas import fuser
 import jax.numpy as jnp
 from tokamax._src.ops import op
-from typing_extensions import override
 
 
 _Config = TypeVar("_Config")

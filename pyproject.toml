@@ -26,11 +26,11 @@ dependencies = [
     "pydantic>=2.11.0",
     "qwix>=0.1.2",
     "tqdm",
-    "typing_extensions>=4.5.0",
     "typeguard==2.13.3",
     "immutabledict",
     "tensorboardx",
 ]
+
 
 dynamic = ["version"]
 

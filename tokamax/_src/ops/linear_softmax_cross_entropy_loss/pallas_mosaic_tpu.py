@@ -17,7 +17,8 @@
 
 from dataclasses import dataclass
 import itertools
-from typing import Annotated, ClassVar, Literal
+from typing import Annotated, ClassVar, Literal, override
+
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
@@ -26,7 +27,6 @@ import pydantic
 from tokamax._src.ops import op
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel as kernel
-from typing_extensions import override
 
 
 @pydantic.dataclasses.dataclass(frozen=True)

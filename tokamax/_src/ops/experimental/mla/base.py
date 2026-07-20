@@ -14,14 +14,15 @@
 # ==============================================================================
 """MultiHeadLatentAttention operator definition."""
 
-from typing import Any, TypeVar
+from typing import Any, TypeVar, override
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.mla import reference
-from typing_extensions import override
+
 
 _Config = TypeVar("_Config")
 

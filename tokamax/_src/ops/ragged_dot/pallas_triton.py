@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import math
-from typing import Callable, ClassVar
+from typing import Callable, ClassVar, override
 
 import jax
 from jax import numpy as jnp
@@ -30,7 +30,6 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.pallas import block
-from typing_extensions import override
 
 
 Residuals = base.Residuals

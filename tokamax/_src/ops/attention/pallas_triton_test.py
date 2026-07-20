@@ -14,7 +14,7 @@
 # ==============================================================================
 
 import sys
-from typing import TypeAlias
+from typing import TypeAlias, override
 from unittest import mock
 import pytest
 from absl.testing import absltest
@@ -28,7 +28,6 @@ from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_triton as fa
 from tokamax._src.ops.attention import pallas_triton_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
-from typing_extensions import override
 
 
 class _F32PrecisionXlaAttentionVjp(base.DotProductAttentionVjp):

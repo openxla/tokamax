@@ -15,7 +15,7 @@
 """Ragged dot Pallas-Mosaic-TPU implementation."""
 
 import dataclasses
-from typing import ClassVar
+from typing import ClassVar, override
 
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -26,7 +26,6 @@ from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
-from typing_extensions import override
 
 
 QArray = base.QArray

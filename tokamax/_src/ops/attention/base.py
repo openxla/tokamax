@@ -18,7 +18,7 @@ from collections.abc import Callable, Hashable
 import dataclasses
 import functools
 import math
-from typing import Any, Literal, NotRequired, ParamSpec, TypeVar, TypedDict, cast, overload
+from typing import Any, Literal, NotRequired, ParamSpec, TypeVar, TypedDict, cast, overload, override
 import jax
 from jax import export
 from jax.experimental import shard_map
@@ -34,7 +34,6 @@ from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src import utils
 from tokamax._src.ops import op
-from typing_extensions import override
 
 
 class AUTO:  # Used as a sentinel value.

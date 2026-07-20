@@ -14,7 +14,7 @@
 # ==============================================================================
 """Triangle multiplication op."""
 
-from typing import Any, Literal, TypeAlias, TypeVar
+from typing import Any, Literal, TypeAlias, TypeVar, override
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +24,6 @@ from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import base as norm_base
-from typing_extensions import override
 
 
 _Config = TypeVar("_Config")

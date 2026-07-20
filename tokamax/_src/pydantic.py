@@ -21,7 +21,7 @@ import inspect
 import re
 import types
 import typing
-from typing import Annotated, Any, Generic, TypeAlias, TypeVar, Union
+from typing import Annotated, Any, Generic, TypeAlias, TypeVar, TypedDict, Union
 
 import immutabledict
 import jax
@@ -33,7 +33,6 @@ import pydantic
 import pydantic_core
 from pydantic_core import core_schema as cs
 from tokamax._src import batching
-from typing_extensions import TypedDict  # Required for Python <3.12.
 
 
 def _int_power_of_two(n: int) -> int:

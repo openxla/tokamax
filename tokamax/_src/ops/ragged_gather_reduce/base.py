@@ -14,13 +14,13 @@
 # ==============================================================================
 """Base class for Ragged Gather Reduce."""
 
-from typing import Any, TypeVar
+from typing import Any, TypeVar, override
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
-from typing_extensions import override
 
 _Config = TypeVar("_Config")
 
