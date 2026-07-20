@@ -294,12 +294,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
               plgpu.barrier_wait(w_tma_barrier.at[slot])
             # S -> T
             with jax.named_scope("S->R"):
-              w = plgpu.load(
-                  w_smem.at[slot],
-                  (),
-                  layout=_TMEM(8),
-                  optimized=False,
-              )
+              w = plgpu.load(w_smem.at[slot], layout=_TMEM(8), optimized=False)
             # dequant
             with jax.named_scope("upcast"):
               w_deq = w.astype(x_smem.dtype)
@@ -333,12 +328,11 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
           def _loop_body(ki, acc):
             slot = lax.rem(ki, num_stages)
             scale = plgpu.load(
-                w_scales_gmem,
-                (
+                w_scales_gmem.at[
                     group_id,
                     lax.div((ki * block_k), tile_k),
                     slice_n,
-                ),
+                ],
                 layout=_TCGEN05_ROW,
                 optimized=False,
             ).astype(acc.dtype)

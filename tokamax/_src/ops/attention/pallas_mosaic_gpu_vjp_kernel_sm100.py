@@ -433,22 +433,20 @@ def _load_bcast_smem(
   else:
     if ref_shape[-1] == 1:
       if is_dq:
-        val_1d = plgpu.load(smem.at[elt_bi], (), layout=_TMEM_ROW)
+        val_1d = plgpu.load(smem.at[elt_bi], layout=_TMEM_ROW)
         val = lax.broadcast_in_dim(val_1d, s_shape, [0])
       else:
-        val_1d = plgpu.load(smem.at[elt_bi, chunk_slice], (), layout=_TMEM_COL)
+        val_1d = plgpu.load(smem.at[elt_bi, chunk_slice], layout=_TMEM_COL)
         val = lax.broadcast_in_dim(val_1d, s_shape, [1])
     elif ref_shape[-2] == 1:
       if is_dq:
-        val_1d = plgpu.load(smem.at[elt_bi, chunk_slice], (), layout=_TMEM_COL)
+        val_1d = plgpu.load(smem.at[elt_bi, chunk_slice], layout=_TMEM_COL)
         val = lax.broadcast_in_dim(val_1d, s_shape, [1])
       else:
-        val_1d = plgpu.load(smem.at[elt_bi], (), layout=_TMEM_ROW)
+        val_1d = plgpu.load(smem.at[elt_bi], layout=_TMEM_ROW)
         val = lax.broadcast_in_dim(val_1d, s_shape, [0])
     else:
-      val = plgpu.load(
-          smem.at[elt_bi], (slice(None), chunk_slice), layout=_TMEM
-      )
+      val = plgpu.load(smem.at[elt_bi, :, chunk_slice], layout=_TMEM)
   return plgpu.layout_cast(val, _TMEM)
 
 
@@ -765,22 +763,20 @@ def _kernel_dq(
     if k_start_ref is not None:
       hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
       k_start_slice = k_start_ref.at[hi_m, qs]
-      k_start_val = plgpu.load(
-          k_start_slice, (), layout=_TMEM_ROW, optimized=False
-      )
+      k_start_val = plgpu.load(k_start_slice, layout=_TMEM_ROW, optimized=False)
     if k_end_ref is not None:
       hi_m = 0 if k_end_ref.shape[-2] == 1 else hi
       k_end_slice = k_end_ref.at[hi_m, qs]
-      k_end_val = plgpu.load(k_end_slice, (), layout=_TMEM_ROW, optimized=False)
+      k_end_val = plgpu.load(k_end_slice, layout=_TMEM_ROW, optimized=False)
 
     if config.load_residuals_in_regs:
       m_slice = m_ref.at[hi, qs]
       l_slice = l_ref.at[hi, qs]
       delta_slice = delta_ref.at[hi, qs]
-      m_val_full = plgpu.load(m_slice, (), layout=_TMEM_ROW, optimized=False)
-      l_val_full = plgpu.load(l_slice, (), layout=_TMEM_ROW, optimized=False)
+      m_val_full = plgpu.load(m_slice, layout=_TMEM_ROW, optimized=False)
+      l_val_full = plgpu.load(l_slice, layout=_TMEM_ROW, optimized=False)
       delta_val_full = plgpu.load(
-          delta_slice, (), layout=_TMEM_ROW, optimized=False
+          delta_slice, layout=_TMEM_ROW, optimized=False
       )
       m_val_full = m_val_full * math.log2(math.e)
 
@@ -796,9 +792,9 @@ def _kernel_dq(
         plgpu.barrier_wait(mask_produced.at[elt_bi])
 
       if not config.load_residuals_in_regs:
-        m_val = plgpu.load(m_smem, (), layout=_TMEM_ROW)
-        l_val = plgpu.load(l_smem, (), layout=_TMEM_ROW)
-        delta_val = plgpu.load(delta_smem, (), layout=_TMEM_ROW)
+        m_val = plgpu.load(m_smem, layout=_TMEM_ROW)
+        l_val = plgpu.load(l_smem, layout=_TMEM_ROW)
+        delta_val = plgpu.load(delta_smem, layout=_TMEM_ROW)
         m_val = m_val * math.log2(math.e)
       else:
         m_val = m_val_full
@@ -847,7 +843,7 @@ def _kernel_dq(
             bias_val = _load_bcast(bias_ref, (hi, qs, ks), layout=_TMEM)
           else:
             bias_val = plgpu.load(
-                bias_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
+                bias_smem.at[elt_bi, :, chunk_slice], layout=_TMEM
             )
           s_val += bias_val
 
@@ -1268,7 +1264,7 @@ def _kernel_dkv(
             bias_val = _load_bcast(bias_ref, (hi, ks, qs), layout=_TMEM)
           else:
             bias_val = plgpu.load(
-                bias_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
+                bias_smem.at[elt_bi, :, chunk_slice], layout=_TMEM
             )
           s_val += bias_val
 
@@ -1277,10 +1273,10 @@ def _kernel_dkv(
             s_val *= logits_scale
           s_val = jnp.tanh(s_val / logits_soft_cap) * logits_soft_cap
 
-        m_val = plgpu.load(m_smem.at[li, chunk_slice], (), layout=_TMEM_COL)
+        m_val = plgpu.load(m_smem.at[li, chunk_slice], layout=_TMEM_COL)
         m_val = lax.broadcast_in_dim(m_val, s_val.shape, [1])
         m_val = plgpu.layout_cast(m_val, _TMEM)
-        l_val = plgpu.load(l_smem.at[li, chunk_slice], (), layout=_TMEM_COL)
+        l_val = plgpu.load(l_smem.at[li, chunk_slice], layout=_TMEM_COL)
         l_val = lax.broadcast_in_dim(l_val, s_val.shape, [1])
         l_val = plgpu.layout_cast(l_val, _TMEM)
 
@@ -1311,7 +1307,7 @@ def _kernel_dkv(
               hi_m, pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
           ]
           k_start_val = plgpu.load(
-              k_start_slice, (), layout=_TMEM_COL, optimized=False
+              k_start_slice, layout=_TMEM_COL, optimized=False
           )
           k_start_val = lax.broadcast_in_dim(k_start_val, base_val.shape, [1])
           k_start_val = plgpu.layout_cast(k_start_val, _TMEM)
@@ -1326,9 +1322,7 @@ def _kernel_dkv(
           k_end_slice = k_end_ref.at[
               hi_m, pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
           ]
-          k_end_val = plgpu.load(
-              k_end_slice, (), layout=_TMEM_COL, optimized=False
-          )
+          k_end_val = plgpu.load(k_end_slice, layout=_TMEM_COL, optimized=False)
           k_end_val = lax.broadcast_in_dim(k_end_val, base_val.shape, [1])
           k_end_val = plgpu.layout_cast(k_end_val, _TMEM)
           base_val = jnp.where(
@@ -1357,9 +1351,7 @@ def _kernel_dkv(
         epsilon = float(jnp.finfo(jnp.float32).tiny)
         p_val = jnp.exp2(base_val) / (l_val + epsilon)
 
-        delta_val = plgpu.load(
-            delta_smem.at[li, chunk_slice], (), layout=_TMEM_COL
-        )
+        delta_val = plgpu.load(delta_smem.at[li, chunk_slice], layout=_TMEM_COL)
         delta_val = lax.broadcast_in_dim(delta_val, p_val.shape, [1])
         delta_val = plgpu.layout_cast(delta_val, _TMEM)
         ds_val = p_val * (dp_val - delta_val)

@@ -323,12 +323,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
               plgpu.barrier_wait(w_tma_barrier.at[slot])
             # S -> T
             with jax.named_scope("S->R"):
-              w = plgpu.load(
-                  w_smem.at[slot],
-                  (),
-                  layout=_TMEM(8),
-                  optimized=False,
-              )
+              w = plgpu.load(w_smem.at[slot], layout=_TMEM(8), optimized=False)
             with jax.named_scope("i4->bf16"):
               # dequant
               w = w.astype(w_scales_smem.dtype)

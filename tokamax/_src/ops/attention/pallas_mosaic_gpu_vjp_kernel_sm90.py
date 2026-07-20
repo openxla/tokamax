@@ -255,16 +255,16 @@ def flash_attention_vjp_kernel(
       plgpu.copy_gmem_to_smem(dout_gmem.at[qs, hi], dout_smem, barrier)
 
       delta = plgpu.load(
-          delta_gmem, (hi, qs), layout=_WGMMA_ROW, optimized=False
+          delta_gmem.at[hi, qs], layout=_WGMMA_ROW, optimized=False
       )
-      m = plgpu.load(m_gmem, (hi, qs), layout=_WGMMA_ROW, optimized=False)
-      l = plgpu.load(l_gmem, (hi, qs), layout=_WGMMA_ROW, optimized=False)
+      m = plgpu.load(m_gmem.at[hi, qs], layout=_WGMMA_ROW, optimized=False)
+      l = plgpu.load(l_gmem.at[hi, qs], layout=_WGMMA_ROW, optimized=False)
 
       def load_k_range(ref):
         if ref is None:
           return None
         idx = (0 if ref.shape[0] == 1 else hi, qs)
-        return plgpu.load(ref, idx, layout=_WGMMA_ROW, optimized=False)
+        return plgpu.load(ref.at[idx], layout=_WGMMA_ROW, optimized=False)
 
       k_start = load_k_range(k_start_gmem)
       k_end = load_k_range(k_end_gmem)
@@ -377,7 +377,7 @@ def flash_attention_vjp_kernel(
           mask = _load_bcast(mask_gmem, (qs, ks), layout=_WGMMA)
         else:
           if mask_smem.ndim == 1:
-            mask = plgpu.load(mask_smem, (), layout=_WGMMA_COL)
+            mask = plgpu.load(mask_smem, layout=_WGMMA_COL)
             mask = lax.broadcast_in_dim(mask, s.shape, [1])
           else:
             mask = mask_smem[pl.ds(wg * block_q, block_q)]
@@ -501,7 +501,7 @@ def flash_attention_vjp_kernel(
         mask = None
       else:  # The mask is loop invariant.
         idx = (ks, 0)
-        mask = plgpu.load(mask_gmem, idx, layout=_WGMMA_ROW, optimized=False)
+        mask = plgpu.load(mask_gmem.at[idx], layout=_WGMMA_ROW, optimized=False)
       plgpu.barrier_wait(barrier)
 
       def compute_dk_dv(dk_acc, dv_acc):
@@ -554,12 +554,12 @@ def flash_attention_vjp_kernel(
           biasT = _load_bcast(bias_gmem.T, (ks, qs), layout=_WGMMA)
         else:
           idx = pl.ds(wg * block_kv, block_kv)
-          biasT = plgpu.load(bias_smem.T, idx, layout=_WGMMA_TRANSPOSED)
+          biasT = plgpu.load(bias_smem.T.at[idx], layout=_WGMMA_TRANSPOSED)
           plgpu.barrier_arrive(bias_consumed_barrier)
 
-        m = plgpu.load(m_smem, (), layout=_WGMMA_COL)
-        l = plgpu.load(l_smem, (), layout=_WGMMA_COL)
-        delta = plgpu.load(delta_smem, (), layout=_WGMMA_COL)
+        m = plgpu.load(m_smem, layout=_WGMMA_COL)
+        l = plgpu.load(l_smem, layout=_WGMMA_COL)
+        delta = plgpu.load(delta_smem, layout=_WGMMA_COL)
         plgpu.barrier_arrive(m_consumed_barrier)
         plgpu.barrier_arrive(l_consumed_barrier)
         plgpu.barrier_arrive(delta_consumed_barrier)
@@ -600,7 +600,7 @@ def flash_attention_vjp_kernel(
 
       def load_k_range(ref):
         idx = (0 if (ref.shape[0] == 1) else hi, qs)
-        return plgpu.load(ref, idx, layout=_WGMMA_COL, optimized=False)
+        return plgpu.load(ref.at[idx], layout=_WGMMA_COL, optimized=False)
 
       if k_start_gmem is not None:
         k_start = broadcast(load_k_range(k_start_gmem))

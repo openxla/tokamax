@@ -162,7 +162,7 @@ def load_bcast(
 
   new_idx = tuple(new_idx)
   if bcast_dims:
-    value = plgpu.load(ref, new_idx, layout=ld_layout, optimized=optimized)
+    value = plgpu.load(ref.at[new_idx], layout=ld_layout, optimized=optimized)
   else:  # Scalar value.
     value = ref[new_idx]
   value = jax.lax.broadcast_in_dim(value, shape, bcast_dims)

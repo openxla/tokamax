@@ -45,7 +45,7 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
     )
     def kernel(x_ref, o_ref):
       layout = plgpu.Layout.WGMMA_UPCAST_4X
-      x = plgpu.load(x_ref, (), layout=layout, optimized=False)
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
       x = common.int4_as_biased_f8e4m3fn(x, layout)
       o_ref[...] = x
 
@@ -89,19 +89,11 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
           ],
       )
       def pipeline(_, a_smem, b_smem):
-        b = plgpu.load(b_smem, (), layout=layout, optimized=False)
+        b = plgpu.load(b_smem, layout=layout, optimized=False)
 
         # Note, this approach for row sum calculation is slow due to upcasting
-        a_row_sum = (
-            plgpu.load(
-                a_smem,
-                (),
-                layout=plgpu.Layout.TCGEN05,
-                optimized=True,
-            )
-            .astype(jnp.float32)
-            .sum(1)
-        )
+        a = plgpu.load(a_smem, layout=plgpu.Layout.TCGEN05)
+        a_row_sum = a.astype(jnp.float32).sum(1)
 
         b_up_smem[...] = common.int4_as_biased_f8e4m3fn(b, layout)
         plgpu.commit_smem()

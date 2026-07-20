@@ -705,7 +705,6 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
             with jax.named_scope("load_w_smem"):
               w = plgpu.load(
                   w_smem.at[data_slot, :, pl.ds(di * tile_d, tile_d)],
-                  (),
                   layout=_TMEM(8),
                   optimized=False,
               )
@@ -748,24 +747,16 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
           with jax.named_scope("wait_scales"):
             plgpu.barrier_wait(xws_barrier.at[scale_slot])
           with jax.named_scope("[scale]load"):
-            ws = plgpu.load(
-                ws_smem.at[scale_slot],
-                (),
-                layout=_TCGEN05_ROW,
-                optimized=True,
-            ).astype(acc_dtype)
+            ws = plgpu.load(ws_smem.at[scale_slot], layout=_TCGEN05_ROW)
+            ws = ws.astype(acc_dtype)
             x_scale = plgpu.load(
-                xs_smem,
-                (scale_slot, pl.ds(0, cluster_block_m)),
+                xs_smem.at[scale_slot, pl.ds(0, cluster_block_m)],
                 layout=_TCGEN05_COL,
-                optimized=True,
             ).astype(acc_dtype)
 
             x_sum = plgpu.load(
-                x_sum_smem,
-                (scale_slot, pl.ds(0, cluster_block_m)),
+                x_sum_smem.at[scale_slot, pl.ds(0, cluster_block_m)],
                 layout=_TCGEN05_COL,
-                optimized=True,
             ).astype(acc_dtype)
           mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(xws_consumed_barrier.at[scale_slot])
