@@ -447,15 +447,15 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
   expected_d = k_x // tile_k
 
   if scales.shape[1] == 2 * expected_d:
+    tile_xk = k_x // expected_d
     scales = scales.mT
     x_scales, x_sum = jnp.split(scales, 2, axis=0)
   else:
+    tile_xk = k_x // scales.shape[1]
     x_scales = scales.mT
     x_sum = (
-        x.astype(jnp.float32).reshape(m, -1, block_k).sum(-1).swapaxes(-1, -2)
+        x.astype(jnp.float32).reshape(m, -1, tile_xk).sum(-1).swapaxes(-1, -2)
     )
-
-  tile_xk = k_x // x_scales.shape[0]
 
   # The activation subchannel may be finer than the weight subchannel, as long as
   # it divides it and each block_k tile stays within one activation subchannel.
@@ -628,7 +628,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
               )
               plgpu.copy_gmem_to_smem(
                   x_sum_gmem.at[
-                      ki,
+                      lax.div(block_k * ki, tile_xk),
                       pl.ds(block_start, max(cluster_block_m, 64)),
                   ],
                   x_sum_smem.at[slot],
@@ -769,8 +769,14 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
           plgpu.barrier_arrive(acc_consumed_barrier.at[acc_slot])
 
           with jax.named_scope("rescale_acc"):
+            k_iters_per_subchannel = tile_xk // block_k
+            apply_bias = (ki % k_iters_per_subchannel) == 0
+            apply_bias_coef = lax.broadcast_in_dim(
+                apply_bias.astype(x_sum.dtype), x_sum.shape, ()
+            )
+            bias_val = -8 * x_sum * apply_bias_coef
             int_bias = plgpu.layout_cast(
-                lax.broadcast_in_dim(-8 * x_sum, acc.shape, [1]),
+                lax.broadcast_in_dim(bias_val, acc.shape, [1]),
                 _TCGEN05,
             )
             acc = acc * 512 + int_bias

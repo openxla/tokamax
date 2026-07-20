@@ -590,6 +590,140 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
     self.assertIsNone(epi_qtype_disabled(x_fp8, w_i4, jnp.float8_e4m3fn))
 
+  @parameterized.product(
+      use_as_qarray=(True, False),
+      task=(
+          (128, 32768, 3072, 4096),
+          (128, 16384, 3072, 4096),
+          (128, 32768, 4096, 3072),
+          (128, 16384, 4096, 3072),
+      ),
+  )
+  def test_heuristic_quality_eval_shapes_op(self, use_as_qarray, task):
+    a_dtype = jnp.dtype("float8_e4m3fn")
+    b_dtype = jnp.dtype("int4")
+    num_groups, m, k, n = task
+    a, b, group_sizes = self._create_inputs(
+        num_groups,
+        m,
+        k,
+        n,
+        jnp.bfloat16,
+        random_groups=True,
+        use_as_qarray=use_as_qarray,
+        quant_a_dtype=a_dtype,
+        a_tile_shape=(1, 512),
+        quant_b_dtype=b_dtype,
+        b_tile_shape=(1, 512, 1),
+    )
+    config = dataclasses.replace(
+        _CONFIG,
+        block_m=16,
+        block_n=128,
+        block_k=256,
+    )
+    with test_base.ConfigManager(config):
+      actual = self._dot_fn(a, b, group_sizes=group_sizes, activation=None)
+    expected = test_base.ref(a, b, group_sizes, None)
+    count = sum(group_sizes)
+    chex.assert_trees_all_close(
+        actual[:count], expected[:count], atol=0.015, rtol=0.01
+    )
+
+  @parameterized.product(
+      task=(
+          (128, 32768, 3072, 4096),
+          (128, 16384, 3072, 4096),
+          (128, 32768, 4096, 3072),
+          (128, 16384, 4096, 3072),
+      ),
+  )
+  def test_heuristic_quality_eval_shapes_kernel(self, task):
+    num_groups, m, k, n = task
+    sub = 512
+    a, b, group_sizes = self._create_inputs(
+        num_groups,
+        m,
+        k,
+        n,
+        jnp.bfloat16,
+        use_as_qarray=False,
+        quant_a_dtype=jnp.float8_e4m3fn,
+        a_tile_shape=(1, sub),
+        quant_b_dtype=jnp.int4,
+        b_tile_shape=(1, sub, 1),
+    )
+    config = dataclasses.replace(
+        _CONFIG,
+        block_m=16,
+        block_n=128,
+        block_k=256,
+        epilogue_quant_qtype=None,
+        epilogue_quant_subchannel_size=None,
+    )
+    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+        a, b, jnp.asarray(group_sizes), jnp.bfloat16, config, None
+    )
+    self.assertNotIsInstance(out, qwix.QArray)
+    expected = test_base.ref(a, b, group_sizes, None)
+    count = int(sum(group_sizes))
+    chex.assert_trees_all_close(
+        out[:count], expected[:count], atol=0.015, rtol=0.01
+    )
+
+  @parameterized.product(
+      task=(
+          (128, 32768, 3072, 4096),
+          (128, 16384, 3072, 4096),
+          (128, 32768, 4096, 3072),
+          (128, 16384, 4096, 3072),
+      ),
+      block_k=(256, 128),
+  )
+  def test_heuristic_quality_eval_shapes_bug_reproduction(self, task, block_k):
+    num_groups, m, k, n = task
+    sub = 512
+    a, b, group_sizes = self._create_inputs(
+        num_groups,
+        m,
+        k,
+        n,
+        jnp.bfloat16,
+        use_as_qarray=False,
+        quant_a_dtype=jnp.float8_e4m3fn,
+        a_tile_shape=(1, sub),
+        quant_b_dtype=jnp.int4,
+        b_tile_shape=(1, sub, 1),
+    )
+    expected = test_base.ref(a, b, group_sizes, None)
+
+    # Manually compute subchannel row-sum and concatenate to scales,
+    # simulating the scale hack / compute_subchannel_sum=True from
+    qvalue_f32 = a.qvalue.astype(jnp.float32)
+    rowsum = qvalue_f32.reshape(m, -1, sub).sum(-1)
+    a_scales = jnp.concatenate([a.scale.astype(jnp.float32), rowsum], axis=1)
+    a_fused = qwix.QArray(a.qvalue, a_scales, None, jnp.float8_e4m3fn)
+
+    config = dataclasses.replace(
+        _CONFIG,
+        block_m=16,
+        block_n=128,
+        block_k=block_k,
+        epilogue_quant_qtype=None,
+        epilogue_quant_subchannel_size=None,
+    )
+    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+        a_fused, b, jnp.asarray(group_sizes), jnp.bfloat16, config, None
+    )
+    self.assertNotIsInstance(out, qwix.QArray)
+    count = int(sum(group_sizes))
+
+    # Assert that this passes successfully now that the double-subtraction
+    # bug in the kernel is fixed.
+    chex.assert_trees_all_close(
+        out[:count], expected[:count], atol=0.015, rtol=0.01
+    )
+
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
