@@ -44,71 +44,7 @@ _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
 
 
 @triton.jit
-def _normalization_kernel_2d(
-    # --- pointer args: inputs then outputs ---
-    X, SCALE, OFFSET,
-    Y, MEAN, RSTD,
-    # --- scalar args ---
-    M_dim, A, epsilon, scale_offset,
-    # --- constexpr args ---
-    BLOCK_M: tl.constexpr,
-    BLOCK_A: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    HAS_OFFSET: tl.constexpr,
-    SUBTRACT_MEAN: tl.constexpr,
-    RETURN_MEAN: tl.constexpr,
-    RETURN_RSTD: tl.constexpr,
-):
-  """2D normalization forward kernel for the N=1 case (axis=-1).
-
-  1D grid over M. Each program handles a (BLOCK_M, BLOCK_A) tile, reducing
-  along axis 1 (A). Stats are 1D vectors of length M.
-  """
-  pid_m = tl.program_id(0)
-
-  x_blk = tl.make_block_ptr(
-      X, shape=(M_dim, A), strides=(A, 1),
-      offsets=(pid_m * BLOCK_M, 0),
-      block_shape=(BLOCK_M, BLOCK_A), order=(1, 0),
-  )
-  x = tl.load(x_blk, boundary_check=(0, 1), padding_option='zero').to(tl.float32)
-
-  a_offs = tl.arange(0, BLOCK_A)
-  a_mask = a_offs < A
-  m_off = pid_m * BLOCK_M
-  m_offs = m_off + tl.arange(0, BLOCK_M)
-  m_mask = m_offs < M_dim
-
-  if SUBTRACT_MEAN:
-    mean = tl.sum(x, axis=1) / A
-    if RETURN_MEAN:
-      tl.store(MEAN + m_offs, mean, mask=m_mask)
-    x = x - mean[:, None]
-    x = tl.where(a_mask[None, :], x, 0.0)
-
-  var = tl.sum(x * x, axis=1) / A
-  rstd = 1.0 / tl.sqrt(var + epsilon)
-  if RETURN_RSTD:
-    tl.store(RSTD + m_offs, rstd, mask=m_mask)
-  x = x * rstd[:, None]
-
-  if HAS_SCALE:
-    s = tl.load(SCALE + a_offs, mask=a_mask, other=0.0).to(tl.float32)
-    x = x * (s[None, :] + scale_offset)
-  if HAS_OFFSET:
-    o = tl.load(OFFSET + a_offs, mask=a_mask, other=0.0).to(tl.float32)
-    x = x + o[None, :]
-
-  y_blk = tl.make_block_ptr(
-      Y, shape=(M_dim, A), strides=(A, 1),
-      offsets=(pid_m * BLOCK_M, 0),
-      block_shape=(BLOCK_M, BLOCK_A), order=(1, 0),
-  )
-  tl.store(y_blk, x.to(Y.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.jit
-def _normalization_kernel_3d(
+def _normalization_kernel(
     # --- pointer args: inputs then outputs ---
     X, SCALE, OFFSET,
     Y, MEAN, RSTD,
@@ -124,134 +60,70 @@ def _normalization_kernel_3d(
     RETURN_MEAN: tl.constexpr,
     RETURN_RSTD: tl.constexpr,
 ):
-  """3D normalization forward kernel for the general case.
+  """Normalization forward kernel (layer norm / RMS norm).
 
-  Operates on a canonicalized (M, A, N) layout where A is the norm axis.
-  2D grid (pid_m, pid_n) tiles over M and N; each program reduces a full
-  (BLOCK_M, A, BLOCK_N) tile along A.
+  Input buffer is canonicalized (M, A, N) with A the norm axis, but the
+  in-register tile is laid out (M, N, A) so the reduced axis A is innermost.
+  This lets Triton lane-map the reduction efficiently even when N == 1 (the
+  axis=-1 case), matching Pallas without a separate 2D kernel.
   """
   pid_m = tl.program_id(0)
   pid_n = tl.program_id(1)
+  m_off = pid_m * BLOCK_M
+  n_off = pid_n * BLOCK_N
 
-  # Block pointers for the 3D x/y tile.
+  # (M, N, A) view: N contiguous (stride 1), A strided by N. order lists dims
+  # minor→major: N (stride 1), A (stride N), M (stride A*N).
   x_blk = tl.make_block_ptr(
-      X, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
-      offsets=(pid_m * BLOCK_M, 0, pid_n * BLOCK_N),
-      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
+      X, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
+      offsets=(m_off, n_off, 0),
+      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
   )
   x = tl.load(x_blk, boundary_check=(0, 1, 2), padding_option='zero').to(tl.float32)
 
   a_offs = tl.arange(0, BLOCK_A)
   a_mask = a_offs < A
 
-  # Stat offsets for block pointers.
-  stat_m_off = pid_m * BLOCK_M
-  stat_n_off = pid_n * BLOCK_N
-
   if SUBTRACT_MEAN:
-    mean = tl.sum(x, axis=1) / A
+    mean = tl.sum(x, axis=2) / A
     if RETURN_MEAN:
       mean_blk = tl.make_block_ptr(
           MEAN, shape=(M_dim, N_dim), strides=(N_dim, 1),
-          offsets=(stat_m_off, stat_n_off),
+          offsets=(m_off, n_off),
           block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
       )
       tl.store(mean_blk, mean, boundary_check=(0, 1))
-    x = x - tl.expand_dims(mean, 1)
+    x = x - mean[:, :, None]
     # Zero invalid values (when A is not a power of two).
-    x = tl.where(a_mask[None, :, None], x, 0.0)
+    x = tl.where(a_mask[None, None, :], x, 0.0)
 
-  var = tl.sum(x * x, axis=1) / A
+  var = tl.sum(x * x, axis=2) / A
   rstd = 1.0 / tl.sqrt(var + epsilon)
   if RETURN_RSTD:
     rstd_blk = tl.make_block_ptr(
         RSTD, shape=(M_dim, N_dim), strides=(N_dim, 1),
-        offsets=(stat_m_off, stat_n_off),
+        offsets=(m_off, n_off),
         block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
     )
     tl.store(rstd_blk, rstd, boundary_check=(0, 1))
-  x = x * tl.expand_dims(rstd, 1)
+  x = x * rstd[:, :, None]
 
   if HAS_SCALE:
     s = tl.load(SCALE + a_offs, mask=a_mask, other=0.0).to(tl.float32)
-    x = x * (s[None, :, None] + scale_offset)
+    x = x * (s[None, None, :] + scale_offset)
   if HAS_OFFSET:
     o = tl.load(OFFSET + a_offs, mask=a_mask, other=0.0).to(tl.float32)
-    x = x + o[None, :, None]
+    x = x + o[None, None, :]
 
   y_blk = tl.make_block_ptr(
-      Y, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
-      offsets=(pid_m * BLOCK_M, 0, pid_n * BLOCK_N),
-      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
+      Y, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
+      offsets=(m_off, n_off, 0),
+      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
   )
   tl.store(y_blk, x.to(Y.dtype.element_ty), boundary_check=(0, 1, 2))
 
 
 # ── VJP kernel ──────────────────────────────────────────────────────────────────
-
-
-@triton.jit
-def _normalization_vjp_kernel_2d(
-    # --- pointer args: inputs then outputs ---
-    DOUT, X, SCALE, MEAN, RSTD,
-    DX, DSCALE, DOFFSET,
-    # --- scalar args ---
-    M_dim, A, scale_offset,
-    # --- constexpr args ---
-    BLOCK_M: tl.constexpr,
-    BLOCK_A: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    HAS_OFFSET: tl.constexpr,
-    SUBTRACT_MEAN: tl.constexpr,
-):
-  """2D normalization VJP kernel for the N=1 case."""
-  pid_m = tl.program_id(0)
-  m_off = pid_m * BLOCK_M
-
-  a_offs = tl.arange(0, BLOCK_A)
-  a_mask = a_offs < A
-  m_offs = m_off + tl.arange(0, BLOCK_M)
-  m_mask = m_offs < M_dim
-
-  x_norm = tl.load(tl.make_block_ptr(
-      X, shape=(M_dim, A), strides=(A, 1),
-      offsets=(m_off, 0),
-      block_shape=(BLOCK_M, BLOCK_A), order=(1, 0),
-  ), boundary_check=(0, 1), padding_option='zero').to(tl.float32)
-  if SUBTRACT_MEAN:
-    mean = tl.load(MEAN + m_offs, mask=m_mask, other=0.0).to(tl.float32)
-    x_norm = x_norm - mean[:, None]
-  rstd = tl.load(RSTD + m_offs, mask=m_mask, other=0.0).to(tl.float32)
-  x_norm = x_norm * rstd[:, None]
-
-  dout = tl.load(tl.make_block_ptr(
-      DOUT, shape=(M_dim, A), strides=(A, 1),
-      offsets=(m_off, 0),
-      block_shape=(BLOCK_M, BLOCK_A), order=(1, 0),
-  ), boundary_check=(0, 1), padding_option='zero').to(tl.float32)
-
-  if HAS_OFFSET:
-    doffset = tl.sum(dout, axis=0)
-    tl.store(DOFFSET + pid_m * A + a_offs, doffset, mask=a_mask)
-
-  if HAS_SCALE:
-    dscale = tl.sum(dout * x_norm, axis=0)
-    tl.store(DSCALE + pid_m * A + a_offs, dscale, mask=a_mask)
-    s = tl.load(SCALE + a_offs, mask=a_mask, other=0.0).to(tl.float32)
-    dout = dout * (s[None, :] + scale_offset)
-
-  dx1 = -(tl.sum(dout * x_norm, axis=1) / A)
-  dx = dout + dx1[:, None] * x_norm
-  if SUBTRACT_MEAN:
-    dx2 = -(tl.sum(dout, axis=1) / A)
-    dx = dx + dx2[:, None]
-  dx = dx * rstd[:, None]
-
-  tl.store(tl.make_block_ptr(
-      DX, shape=(M_dim, A), strides=(A, 1),
-      offsets=(m_off, 0),
-      block_shape=(BLOCK_M, BLOCK_A), order=(1, 0),
-  ), dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -271,71 +143,72 @@ def _normalization_vjp_kernel(
 ):
   """Normalization VJP kernel.
 
+  In-register tile is laid out (M, N, A) with A innermost (see forward kernel).
   2D grid (pid_m, pid_n). Produces per-program partial sums for dscale and
   doffset (shape (grid_m * grid_n, A)), reduced outside the kernel.
   """
   pid_m = tl.program_id(0)
   pid_n = tl.program_id(1)
-  tile_m_off = pid_m * BLOCK_M
-  tile_n_off = pid_n * BLOCK_N
+  m_off = pid_m * BLOCK_M
+  n_off = pid_n * BLOCK_N
 
   a_offs = tl.arange(0, BLOCK_A)
   a_mask = a_offs < A
 
-  # Compute x_norm = (x - mean) * rstd.
+  # Compute x_norm = (x - mean) * rstd. Tile viewed as (M, N, A), A innermost.
   x_norm = tl.load(tl.make_block_ptr(
-      X, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
-      offsets=(tile_m_off, 0, tile_n_off),
-      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
+      X, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
+      offsets=(m_off, n_off, 0),
+      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
   ), boundary_check=(0, 1, 2), padding_option='zero').to(tl.float32)
   if SUBTRACT_MEAN:
     mean = tl.load(tl.make_block_ptr(
         MEAN, shape=(M_dim, N_dim), strides=(N_dim, 1),
-        offsets=(tile_m_off, tile_n_off),
+        offsets=(m_off, n_off),
         block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
     ), boundary_check=(0, 1), padding_option='zero').to(tl.float32)
-    x_norm = x_norm - tl.expand_dims(mean, 1)
+    x_norm = x_norm - mean[:, :, None]
   rstd = tl.load(tl.make_block_ptr(
       RSTD, shape=(M_dim, N_dim), strides=(N_dim, 1),
-      offsets=(tile_m_off, tile_n_off),
+      offsets=(m_off, n_off),
       block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
   ), boundary_check=(0, 1), padding_option='zero').to(tl.float32)
-  x_norm = x_norm * tl.expand_dims(rstd, 1)
+  x_norm = x_norm * rstd[:, :, None]
 
   # Load dout tile.
   dout = tl.load(tl.make_block_ptr(
-      DOUT, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
-      offsets=(tile_m_off, 0, tile_n_off),
-      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
+      DOUT, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
+      offsets=(m_off, n_off, 0),
+      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
   ), boundary_check=(0, 1, 2), padding_option='zero').to(tl.float32)
 
-  # Partial doffset/dscale: reduce (BM, BA, BN) → (BA,) via two sum axes.
+  # Partial doffset/dscale: reduce (BM, BN, BA) over M and N → (BA,).
   # Store as (linear_pid, A); host sums axis 0 to get (A,).
   linear_pid = pid_m * grid_n + pid_n
 
   if HAS_OFFSET:
-    doffset = tl.sum(tl.sum(dout, axis=2), axis=0)
+    doffset = tl.sum(tl.sum(dout, axis=1), axis=0)
     tl.store(DOFFSET + linear_pid * A + a_offs, doffset, mask=a_mask)
 
   if HAS_SCALE:
-    dscale = tl.sum(tl.sum(dout * x_norm, axis=2), axis=0)
+    dscale = tl.sum(tl.sum(dout * x_norm, axis=1), axis=0)
     tl.store(DSCALE + linear_pid * A + a_offs, dscale, mask=a_mask)
     s = tl.load(SCALE + a_offs, mask=a_mask, other=0.0).to(tl.float32)
-    dout = dout * (s[None, :, None] + scale_offset)
+    dout = dout * (s[None, None, :] + scale_offset)
 
   # dx = (dout - mean_a(dout·x_norm)·x_norm [- mean_a(dout)]) * rstd
-  # Reductions over axis 1 (the A dimension).
-  dx1 = tl.expand_dims(-(tl.sum(dout * x_norm, axis=1) / A), 1)
-  dx = dout + dx1 * x_norm
+  # Reductions over axis 2 (the A dimension).
+  dx1 = -(tl.sum(dout * x_norm, axis=2) / A)
+  dx = dout + dx1[:, :, None] * x_norm
   if SUBTRACT_MEAN:
-    dx2 = tl.expand_dims(-(tl.sum(dout, axis=1) / A), 1)
-    dx = dx + dx2
-  dx = dx * tl.expand_dims(rstd, 1)
+    dx2 = -(tl.sum(dout, axis=2) / A)
+    dx = dx + dx2[:, :, None]
+  dx = dx * rstd[:, :, None]
 
   tl.store(tl.make_block_ptr(
-      DX, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
-      offsets=(tile_m_off, 0, tile_n_off),
-      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
+      DX, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
+      offsets=(m_off, n_off, 0),
+      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
   ), dx.to(DX.dtype.element_ty), boundary_check=(0, 1, 2))
 
 
@@ -400,64 +273,35 @@ class JaxTritonNormalization(base.Normalization[Config, Key]):
     if input_output_alias:
       alias_kwargs['input_output_aliases'] = {0: 0}
 
-    if N == 1:
-      # 2D fast path: (M, A) layout, 1D grid, no N dimension overhead.
-      x = x.reshape(M, A)
-      out_shapes = [
-          jax.ShapeDtypeStruct((M, A), x.dtype),
-          jax.ShapeDtypeStruct((M,), jnp.float32),
-          jax.ShapeDtypeStruct((M,), jnp.float32),
-      ]
-      y, mean_flat, rstd_flat = jt.triton_call(
-          x, scale_arr, offset_arr,
-          kernel=_normalization_kernel_2d,
-          out_shape=out_shapes,
-          grid=(pl.cdiv(M, block_m),),
-          num_warps=config.num_warps,
-          **alias_kwargs,
-          M_dim=M,
-          A=A,
-          epsilon=epsilon,
-          scale_offset=scale_offset,
-          BLOCK_M=block_m,
-          BLOCK_A=block_a,
-          HAS_SCALE=scale is not None,
-          HAS_OFFSET=offset is not None,
-          SUBTRACT_MEAN=subtract_mean,
-          RETURN_MEAN=return_residuals and subtract_mean,
-          RETURN_RSTD=return_residuals,
-      )
-    else:
-      # 3D general path.
-      grid = (pl.cdiv(M, block_m), pl.cdiv(N, block_n))
-      out_shapes = [
-          jax.ShapeDtypeStruct(x_shape, x.dtype),
-          jax.ShapeDtypeStruct((num_rows,), jnp.float32),
-          jax.ShapeDtypeStruct((num_rows,), jnp.float32),
-      ]
-      y, mean_flat, rstd_flat = jt.triton_call(
-          x, scale_arr, offset_arr,
-          kernel=_normalization_kernel_3d,
-          out_shape=out_shapes,
-          grid=grid,
-          num_warps=config.num_warps,
-          **alias_kwargs,
-          M_dim=M,
-          A=A,
-          N_dim=N,
-          stride_m=A * N,
-          stride_a=N,
-          epsilon=epsilon,
-          scale_offset=scale_offset,
-          BLOCK_M=block_m,
-          BLOCK_A=block_a,
-          BLOCK_N=block_n,
-          HAS_SCALE=scale is not None,
-          HAS_OFFSET=offset is not None,
-          SUBTRACT_MEAN=subtract_mean,
-          RETURN_MEAN=return_residuals and subtract_mean,
-          RETURN_RSTD=return_residuals,
-      )
+    grid = (pl.cdiv(M, block_m), pl.cdiv(N, block_n))
+    out_shapes = [
+        jax.ShapeDtypeStruct(x_shape, x.dtype),
+        jax.ShapeDtypeStruct((num_rows,), jnp.float32),
+        jax.ShapeDtypeStruct((num_rows,), jnp.float32),
+    ]
+    y, mean_flat, rstd_flat = jt.triton_call(
+        x, scale_arr, offset_arr,
+        kernel=_normalization_kernel,
+        out_shape=out_shapes,
+        grid=grid,
+        num_warps=config.num_warps,
+        **alias_kwargs,
+        M_dim=M,
+        A=A,
+        N_dim=N,
+        stride_m=A * N,
+        stride_a=N,
+        epsilon=epsilon,
+        scale_offset=scale_offset,
+        BLOCK_M=block_m,
+        BLOCK_A=block_a,
+        BLOCK_N=block_n,
+        HAS_SCALE=scale is not None,
+        HAS_OFFSET=offset is not None,
+        SUBTRACT_MEAN=subtract_mean,
+        RETURN_MEAN=return_residuals and subtract_mean,
+        RETURN_RSTD=return_residuals,
+    )
 
     y = y.reshape(orig_x_shape)
 
@@ -563,67 +407,37 @@ class JaxTritonNormalizationVjp(base.NormalizationVjp[VjpConfig, VjpKey]):
     scale_arr = scale if scale is not None else dummy
 
     grid_m = pl.cdiv(M, block_m)
-
-    if N == 1:
-      # 2D fast path.
-      x = x.reshape(M, A)
-      dout = dout.reshape(M, A)
-      dparam_shape = jax.ShapeDtypeStruct((grid_m, A), jnp.float32)
-      dummy_shape = jax.ShapeDtypeStruct((1,), jnp.float32)
-      out_shapes = [
-          jax.ShapeDtypeStruct((M, A), x.dtype),
-          dparam_shape if scale is not None else dummy_shape,
-          dparam_shape if offset is not None else dummy_shape,
-      ]
-      dx, dscale_partial, doffset_partial = jt.triton_call(
-          dout, x, scale_arr, mean_flat, rstd_flat,
-          kernel=_normalization_vjp_kernel_2d,
-          out_shape=out_shapes,
-          grid=(grid_m,),
-          num_warps=config.num_warps,
-          input_output_aliases={1: 0},
-          M_dim=M,
-          A=A,
-          scale_offset=scale_offset,
-          BLOCK_M=block_m,
-          BLOCK_A=block_a,
-          HAS_SCALE=scale is not None,
-          HAS_OFFSET=offset is not None,
-          SUBTRACT_MEAN=subtract_mean,
-      )
-    else:
-      # 3D general path.
-      grid_n = pl.cdiv(N, block_n)
-      grid = (grid_m, grid_n)
-      num_programs = grid_m * grid_n
-      dparam_shape = jax.ShapeDtypeStruct((num_programs, A), jnp.float32)
-      dummy_shape = jax.ShapeDtypeStruct((1,), jnp.float32)
-      out_shapes = [
-          jax.ShapeDtypeStruct(x_shape, x.dtype),
-          dparam_shape if scale is not None else dummy_shape,
-          dparam_shape if offset is not None else dummy_shape,
-      ]
-      dx, dscale_partial, doffset_partial = jt.triton_call(
-          dout, x, scale_arr, mean_flat, rstd_flat,
-          kernel=_normalization_vjp_kernel,
-          out_shape=out_shapes,
-          grid=grid,
-          num_warps=config.num_warps,
-          input_output_aliases={1: 0},
-          M_dim=M,
-          A=A,
-          N_dim=N,
-          stride_m=A * N,
-          stride_a=N,
-          scale_offset=scale_offset,
-          grid_n=grid_n,
-          BLOCK_M=block_m,
-          BLOCK_A=block_a,
-          BLOCK_N=block_n,
-          HAS_SCALE=scale is not None,
-          HAS_OFFSET=offset is not None,
-          SUBTRACT_MEAN=subtract_mean,
-      )
+    grid_n = pl.cdiv(N, block_n)
+    grid = (grid_m, grid_n)
+    num_programs = grid_m * grid_n
+    dparam_shape = jax.ShapeDtypeStruct((num_programs, A), jnp.float32)
+    dummy_shape = jax.ShapeDtypeStruct((1,), jnp.float32)
+    out_shapes = [
+        jax.ShapeDtypeStruct(x_shape, x.dtype),
+        dparam_shape if scale is not None else dummy_shape,
+        dparam_shape if offset is not None else dummy_shape,
+    ]
+    dx, dscale_partial, doffset_partial = jt.triton_call(
+        dout, x, scale_arr, mean_flat, rstd_flat,
+        kernel=_normalization_vjp_kernel,
+        out_shape=out_shapes,
+        grid=grid,
+        num_warps=config.num_warps,
+        input_output_aliases={1: 0},
+        M_dim=M,
+        A=A,
+        N_dim=N,
+        stride_m=A * N,
+        stride_a=N,
+        scale_offset=scale_offset,
+        grid_n=grid_n,
+        BLOCK_M=block_m,
+        BLOCK_A=block_a,
+        BLOCK_N=block_n,
+        HAS_SCALE=scale is not None,
+        HAS_OFFSET=offset is not None,
+        SUBTRACT_MEAN=subtract_mean,
+    )
 
     dscale = None
     if scale is not None:
