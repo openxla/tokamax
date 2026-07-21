@@ -77,7 +77,6 @@ def _get_dq_scratch_shapes(
     bias_shape,
     bias_dtype,
     mask_shape,
-    mask_dtype,
 ):
   block_q = config.block_q_dq
   block_kv = config.block_kv_dq
@@ -157,17 +156,16 @@ def _get_dq_scratch_shapes(
     shapes["bias_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
     shapes["bias_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
 
-  shapes.update(
-      _add_eltwise_scratch_shapes(
-          "mask",
-          mask_shape,
-          mask_dtype,
-          config,
-          config.block_q_dq,
-          config.block_kv_dq,
-          chunk_size,
-      )
-  )
+  if mask_shape is not None and mask_shape[-1] != 1:
+    if mask_shape[-2] == 1:
+      shapes["mask_smem"] = plgpu.SMEM((eltwise_stages, block_kv), jnp.int8)
+    else:
+      shape = (eltwise_stages, block_q, block_kv)
+      swizzle = min(plgpu.find_swizzle(8 * block_kv, "mask"), chunk_size)
+      shapes["mask_smem"] = _tiled_smem(shape, jnp.int8, swizzle=swizzle)
+    shapes["mask_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+    shapes["mask_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+
   return shapes
 
 
@@ -183,7 +181,6 @@ def _get_dkv_scratch_shapes(
     bias_shape,
     bias_dtype,
     mask_shape,
-    mask_dtype,
 ):
   block_q = config.block_q_dkv
   block_kv = config.block_kv_dkv
@@ -260,17 +257,13 @@ def _get_dkv_scratch_shapes(
     shapes["bias_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
     shapes["bias_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
 
-  shapes.update(
-      _add_eltwise_scratch_shapes(
-          "mask",
-          mask_shape,
-          mask_dtype,
-          config,
-          config.block_q_dkv,
-          config.block_kv_dkv,
-          chunk_size,
-      )
-  )
+  if mask_shape is not None and mask_shape[-2] != 1 and mask_shape[-1] != 1:
+    shape = (eltwise_stages, block_kv, block_q)
+    swizzle = min(plgpu.find_swizzle(8 * block_q, "mask"), chunk_size)
+    shapes["mask_smem"] = _tiled_smem(shape, jnp.int8, swizzle=swizzle)
+    shapes["mask_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+    shapes["mask_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+
   return shapes
 
 
@@ -363,7 +356,6 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                     bias_shape=bias.shape if bias is not None else None,
                     bias_dtype=bias.dtype if bias is not None else None,
                     mask_shape=mask.shape if mask is not None else None,
-                    mask_dtype=mask.dtype if mask is not None else None,
                 )
                 dkv_shapes = _get_dkv_scratch_shapes(
                     config=config,
@@ -377,7 +369,6 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                     bias_shape=bias.shape if bias is not None else None,
                     bias_dtype=bias.dtype if bias is not None else None,
                     mask_shape=mask.shape if mask is not None else None,
-                    mask_dtype=mask.dtype if mask is not None else None,
                 )
                 dq_smem = _estimate_smem_bytes(dq_shapes)
                 dkv_smem = _estimate_smem_bytes(dkv_shapes)
@@ -423,33 +414,6 @@ def _smem_transforms(dtype, swizzle=128):
   )
 
 
-def _load_bcast_smem(
-    ref, smem, hi, elt_bi, s_shape, chunk_slice, is_dq, ref_shape
-):
-  if smem is None:
-    hi_m = 0 if ref_shape[-3] == 1 else hi
-    val_0d = ref[hi_m] if len(ref.shape) == 1 else ref[hi_m, 0, 0]
-    val = lax.broadcast_in_dim(val_0d, s_shape, [])
-  else:
-    if ref_shape[-1] == 1:
-      if is_dq:
-        val_1d = plgpu.load(smem.at[elt_bi], layout=_TMEM_ROW)
-        val = lax.broadcast_in_dim(val_1d, s_shape, [0])
-      else:
-        val_1d = plgpu.load(smem.at[elt_bi, chunk_slice], layout=_TMEM_COL)
-        val = lax.broadcast_in_dim(val_1d, s_shape, [1])
-    elif ref_shape[-2] == 1:
-      if is_dq:
-        val_1d = plgpu.load(smem.at[elt_bi, chunk_slice], layout=_TMEM_COL)
-        val = lax.broadcast_in_dim(val_1d, s_shape, [1])
-      else:
-        val_1d = plgpu.load(smem.at[elt_bi], layout=_TMEM_ROW)
-        val = lax.broadcast_in_dim(val_1d, s_shape, [0])
-    else:
-      val = plgpu.load(smem.at[elt_bi, :, chunk_slice], layout=_TMEM)
-  return plgpu.layout_cast(val, _TMEM)
-
-
 def _get_input_metadata(q, v):
   """Normalizes and returns head dimensions and datatypes."""
   head_dim = pl.cdiv(q.shape[-1], 64) * 64
@@ -484,32 +448,6 @@ def _estimate_smem_bytes(scratch_shapes: dict) -> int:
       total_bytes += num_barriers * 8
   # Add a 4096 byte compiler safety margin.
   return total_bytes + 4096 * 2
-
-
-def _add_eltwise_scratch_shapes(
-    name, shape, dtype, config, block_q, block_kv, swizzle_limit
-):
-  if shape is None:
-    return {}
-  smem_q = block_q if shape[-2] != 1 else 1
-  smem_kv = block_kv if shape[-1] != 1 else 1
-  if smem_q <= 1 and smem_kv <= 1:
-    return {}
-  smem_shape = (config.eltwise_stages,)
-  if smem_q > 1:
-    smem_shape += (smem_q,)
-  if smem_kv > 1:
-    smem_shape += (smem_kv,)
-  transforms = (
-      _smem_transforms(dtype, swizzle=min(128, swizzle_limit))
-      if (smem_q > 1 and smem_kv > 1)
-      else ()
-  )
-  return {
-      f"{name}_smem": plgpu.SMEM(smem_shape, dtype, transforms=transforms),
-      f"{name}_produced": plgpu.Barrier(num_barriers=config.eltwise_stages),
-      f"{name}_consumed": plgpu.Barrier(num_barriers=config.eltwise_stages),
-  }
 
 
 def _kernel_dq(
@@ -668,33 +606,26 @@ def _kernel_dq(
                   bias_produced.at[bi],
               )
 
-            if mask_ref is not None:
-              if mask_smem is not None:
-                hi_m = 0 if mask_shape[-3] == 1 else hi
-                if mask_shape[-1] == 1:
-                  if mask_shape[-2] == 1:
-                    mask_slice = mask_ref.at[hi_m]
-                  else:
-                    mask_slice = mask_ref.at[hi_m, qs]
-                elif mask_shape[-2] == 1:
-                  mask_slice = mask_ref.at[hi_m, 0, ks]
-                else:
-                  mask_slice = mask_ref.at[hi_m, qs, ks]
+            if mask_smem is not None:
 
-                @pl.when(ki - lb >= config.eltwise_stages)
-                def wait_mask():
-                  plgpu.barrier_wait(mask_consumed.at[bi])
+              @pl.when(ki - lb >= config.eltwise_stages)
+              def wait_mask():
+                plgpu.barrier_wait(mask_consumed.at[bi])
 
-                plgpu.copy_gmem_to_smem(
-                    mask_slice, mask_smem.at[bi], barrier=mask_produced.at[bi]
-                )
+              mask_hi = 0 if mask_shape[-3] == 1 else hi
+              mask_qs = 0 if mask_shape[-2] == 1 else qs
+              plgpu.copy_gmem_to_smem(
+                  mask_ref.at[mask_hi, mask_qs, ks],
+                  mask_smem.at[bi],
+                  mask_produced.at[bi],
+              )
 
           @pl.loop(lax.max(lb, ub - config.eltwise_stages), ub)
           def eltwise_epilogue(ki):
             bi = lax.rem(ki - lb, config.eltwise_stages)
             if bias_smem is not None:
               plgpu.barrier_wait(bias_consumed.at[bi])
-            if mask_ref is not None:
+            if mask_smem is not None:
               plgpu.barrier_wait(mask_consumed.at[bi])
 
       @pl.when(warp_id == 2)
@@ -788,7 +719,7 @@ def _kernel_dq(
       plgpu.barrier_wait(dp_produced)
       if bias_smem is not None:
         plgpu.barrier_wait(bias_produced.at[elt_bi])
-      if mask_ref is not None:
+      if mask_smem is not None:
         plgpu.barrier_wait(mask_produced.at[elt_bi])
 
       if not config.load_residuals_in_regs:
@@ -896,16 +827,18 @@ def _kernel_dq(
 
         mask_val = None
         if mask_ref is not None:
-          mask_val = _load_bcast_smem(
-              mask_ref,
-              mask_smem,
-              hi,
-              elt_bi,
-              s_val.shape,
-              chunk_slice,
-              True,
-              mask_shape,
-          )
+          if mask_smem is None:
+            ks = pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size)
+            mask_val = _load_bcast(mask_ref, (hi, qs, ks), layout=_TMEM)
+          elif mask_smem.ndim == 2:
+            mask_val = plgpu.load(
+                mask_smem, (elt_bi, chunk_slice), layout=_TMEM_COL
+            )
+            mask_val = lax.broadcast_in_dim(mask_val, base_val.shape, [1])
+          else:
+            mask_val = plgpu.load(
+                mask_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
+            )
           mask_val = mask_val != 0
           base_val = jnp.where(
               mask_val, base_val, float(jnp.finfo(jnp.float32).min)
@@ -947,7 +880,7 @@ def _kernel_dq(
 
       if bias_smem is not None:
         plgpu.barrier_arrive(bias_consumed.at[elt_bi])
-      if mask_ref is not None:
+      if mask_smem is not None:
         plgpu.barrier_arrive(mask_consumed.at[elt_bi])
 
     @pl.loop(0, ds_stages)
@@ -1127,33 +1060,26 @@ def _kernel_dkv(
                   bias_produced.at[bi],
               )
 
-            if mask_ref is not None:
-              if mask_smem is not None:
-                hi_m = 0 if mask_shape[-3] == 1 else hi
-                if mask_shape[-1] == 1:
-                  if mask_shape[-2] == 1:
-                    mask_slice = mask_ref.at[hi_m]
-                  else:
-                    mask_slice = mask_ref.at[hi_m, qs]
-                elif mask_shape[-2] == 1:
-                  mask_slice = mask_ref.at[hi_m, 0, ks]
-                else:
-                  mask_slice = mask_ref.at[hi_m, ks, qs]
+            if mask_smem is not None:
 
-                @pl.when(step >= config.eltwise_stages)
-                def wait_mask():
-                  plgpu.barrier_wait(mask_consumed.at[bi])
+              @pl.when(step >= config.eltwise_stages)
+              def wait_mask():
+                plgpu.barrier_wait(mask_consumed.at[bi])
 
-                plgpu.copy_gmem_to_smem(
-                    mask_slice, mask_smem.at[bi], barrier=mask_produced.at[bi]
-                )
+              mask_hi = 0 if mask_shape[-3] == 1 else hi
+              mask_qs = 0 if mask_shape[-1] == 1 else qs
+              plgpu.copy_gmem_to_smem(
+                  mask_ref.at[mask_hi, ks, mask_qs],
+                  mask_smem.at[bi],
+                  mask_produced.at[bi],
+              )
 
           @pl.loop(lax.max(0, total_steps - config.eltwise_stages), total_steps)
           def eltwise_epilogue(step):
             bi = lax.rem(step, config.eltwise_stages)
             if bias_smem is not None:
               plgpu.barrier_wait(bias_consumed.at[bi])
-            if mask_ref is not None:
+            if mask_smem is not None:
               plgpu.barrier_wait(mask_consumed.at[bi])
 
       @pl.when(warp_id == 2)
@@ -1224,6 +1150,13 @@ def _kernel_dkv(
     plgpu.barrier_arrive(s_consumed)
     plgpu.barrier_arrive(dp_consumed)
 
+    if mask_ref is None or mask_ref.shape[-3] != 1 or mask_ref.shape[-1] != 1:
+      loop_invariant_mask = None
+    else:  # The mask is loop invariant.
+      loop_invariant_mask = plgpu.load(
+          mask_ref.at[0, ks, 0], layout=_TMEM_ROW, optimized=False
+      )
+
     @pl.loop(0, total_steps)
     def sfu_loop(step):
       qh = lax.div(step, safe_num_q_tiles)
@@ -1238,7 +1171,7 @@ def _kernel_dkv(
       plgpu.barrier_wait(dp_produced)
       if bias_smem is not None:
         plgpu.barrier_wait(bias_produced.at[elt_bi])
-      if mask_ref is not None:
+      if mask_smem is not None:
         plgpu.barrier_wait(mask_produced.at[elt_bi])
 
       num_chunks = config.block_q_dkv // config.chunk_size
@@ -1333,16 +1266,18 @@ def _kernel_dkv(
 
         mask_val = None
         if mask_ref is not None:
-          mask_val = _load_bcast_smem(
-              mask_ref,
-              mask_smem,
-              hi,
-              elt_bi,
-              s_val.shape,
-              chunk_slice,
-              False,
-              mask_shape,
-          )
+          if mask_smem is None:
+            if loop_invariant_mask is None:
+              qs = pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
+              mask_val = _load_bcast(mask_ref, (hi, ks, qs), layout=_TMEM)
+            else:
+              mask_val = loop_invariant_mask
+              mask_val = lax.broadcast_in_dim(mask_val, base_val.shape, [0])
+          else:
+            mask_val = plgpu.load(
+                mask_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
+            )
+
           mask_val = mask_val != 0
           base_val = jnp.where(
               mask_val, base_val, float(jnp.finfo(jnp.float32).min)
@@ -1379,7 +1314,7 @@ def _kernel_dkv(
 
       if bias_smem is not None:
         plgpu.barrier_arrive(bias_consumed.at[elt_bi])
-      if mask_ref is not None:
+      if mask_smem is not None:
         plgpu.barrier_arrive(mask_consumed.at[elt_bi])
       plgpu.barrier_arrive(q_do_consumed.at[si])
       plgpu.barrier_arrive(residual_consumed.at[li])
@@ -1427,15 +1362,6 @@ def flash_attention_vjp_kernel(
   block_kv_dkv = config.block_kv_dkv
   chunk_size = config.chunk_size
 
-  def _squeeze_trailing_1s(arr):
-    if arr is None:
-      return None
-    while len(arr.shape) > 1 and arr.shape[-1] == 1:
-      arr = arr[..., 0]
-    return arr
-
-  assert q is not None  # To make pytype happy
-
   # TODO: Remove explicit padding in favor of TMA out-of-bounds zero-filling and in-kernel -inf masking.
   q = shape_lib.pad_to_next_multiple_of(q, block_q_dq, -3)
   out = shape_lib.pad_to_next_multiple_of(out, block_q_dq, -3)
@@ -1464,8 +1390,6 @@ def flash_attention_vjp_kernel(
 
   bias_shape = bias.shape if bias is not None else None
   mask_shape = mask.shape if mask is not None else None
-
-  mask = _squeeze_trailing_1s(mask)
 
   pad_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
   q, k, v, out, dout = map(pad_dim, (q, k, v, out, dout))
@@ -1499,7 +1423,6 @@ def flash_attention_vjp_kernel(
       bias_shape=bias_shape,
       bias_dtype=bias.dtype if bias is not None else None,
       mask_shape=mask_shape,
-      mask_dtype=mask.dtype if mask is not None else None,
   )
 
   if bias is None:
@@ -1549,17 +1472,10 @@ def flash_attention_vjp_kernel(
       bias_shape=bias_shape,
       bias_dtype=bias.dtype if bias is not None else None,
       mask_shape=mask_shape,
-      mask_dtype=mask.dtype if mask is not None else None,
   )
 
   bias_dkv = None if bias is None else bias.mT
-  # Only transpose 2D arrays; transposing 1D arrays creates invalid
-  # strides for TMA.
-  mask_dkv = (
-      mask.mT
-      if (mask is not None and mask_shape[-1] != 1 and mask_shape[-2] != 1)
-      else mask
-  )
+  mask_dkv = None if mask is None else mask.mT
 
   kernel_dkv = functools.partial(
       _kernel_dkv,
