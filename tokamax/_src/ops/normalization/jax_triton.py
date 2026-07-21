@@ -62,22 +62,20 @@ def _normalization_kernel(
 ):
   """Normalization forward kernel (layer norm / RMS norm).
 
-  Input buffer is canonicalized (M, A, N) with A the norm axis, but the
-  in-register tile is laid out (M, N, A) so the reduced axis A is innermost.
-  This lets Triton lane-map the reduction efficiently even when N == 1 (the
-  axis=-1 case), matching Pallas without a separate 2D kernel.
+  Operates on a canonicalized (M, A, N) layout where A is the (middle) norm
+  axis and N is contiguous. 2D grid (pid_m, pid_n) tiles over M and N; each
+  program reduces a full (BLOCK_M, A, BLOCK_N) tile along A.
   """
   pid_m = tl.program_id(0)
   pid_n = tl.program_id(1)
   m_off = pid_m * BLOCK_M
   n_off = pid_n * BLOCK_N
 
-  # (M, N, A) view: N contiguous (stride 1), A strided by N. order lists dims
-  # minor→major: N (stride 1), A (stride N), M (stride A*N).
+  # (M, A, N) tile: N contiguous (stride 1), A strided by N.
   x_blk = tl.make_block_ptr(
-      X, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
-      offsets=(m_off, n_off, 0),
-      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
+      X, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      offsets=(m_off, 0, n_off),
+      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   )
   x = tl.load(x_blk, boundary_check=(0, 1, 2), padding_option='zero').to(tl.float32)
 
@@ -85,7 +83,7 @@ def _normalization_kernel(
   a_mask = a_offs < A
 
   if SUBTRACT_MEAN:
-    mean = tl.sum(x, axis=2) / A
+    mean = tl.sum(x, axis=1) / A
     if RETURN_MEAN:
       mean_blk = tl.make_block_ptr(
           MEAN, shape=(M_dim, N_dim), strides=(N_dim, 1),
@@ -93,11 +91,11 @@ def _normalization_kernel(
           block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
       )
       tl.store(mean_blk, mean, boundary_check=(0, 1))
-    x = x - mean[:, :, None]
+    x = x - tl.expand_dims(mean, 1)
     # Zero invalid values (when A is not a power of two).
-    x = tl.where(a_mask[None, None, :], x, 0.0)
+    x = tl.where(a_mask[None, :, None], x, 0.0)
 
-  var = tl.sum(x * x, axis=2) / A
+  var = tl.sum(x * x, axis=1) / A
   rstd = 1.0 / tl.sqrt(var + epsilon)
   if RETURN_RSTD:
     rstd_blk = tl.make_block_ptr(
@@ -106,19 +104,19 @@ def _normalization_kernel(
         block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
     )
     tl.store(rstd_blk, rstd, boundary_check=(0, 1))
-  x = x * rstd[:, :, None]
+  x = x * tl.expand_dims(rstd, 1)
 
   if HAS_SCALE:
     s = tl.load(SCALE + a_offs, mask=a_mask, other=0.0).to(tl.float32)
-    x = x * (s[None, None, :] + scale_offset)
+    x = x * (s[None, :, None] + scale_offset)
   if HAS_OFFSET:
     o = tl.load(OFFSET + a_offs, mask=a_mask, other=0.0).to(tl.float32)
-    x = x + o[None, None, :]
+    x = x + o[None, :, None]
 
   y_blk = tl.make_block_ptr(
-      Y, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
-      offsets=(m_off, n_off, 0),
-      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
+      Y, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      offsets=(m_off, 0, n_off),
+      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   )
   tl.store(y_blk, x.to(Y.dtype.element_ty), boundary_check=(0, 1, 2))
 
@@ -143,9 +141,9 @@ def _normalization_vjp_kernel(
 ):
   """Normalization VJP kernel.
 
-  In-register tile is laid out (M, N, A) with A innermost (see forward kernel).
   2D grid (pid_m, pid_n). Produces per-program partial sums for dscale and
-  doffset (shape (grid_m * grid_n, A)), reduced outside the kernel.
+  doffset (shape (grid_m * grid_n, A)), reduced outside the kernel. Operates on
+  the canonical (M, A, N) layout, reducing along the middle axis A.
   """
   pid_m = tl.program_id(0)
   pid_n = tl.program_id(1)
@@ -155,11 +153,11 @@ def _normalization_vjp_kernel(
   a_offs = tl.arange(0, BLOCK_A)
   a_mask = a_offs < A
 
-  # Compute x_norm = (x - mean) * rstd. Tile viewed as (M, N, A), A innermost.
+  # Compute x_norm = (x - mean) * rstd. (M, A, N) tile, N contiguous.
   x_norm = tl.load(tl.make_block_ptr(
-      X, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
-      offsets=(m_off, n_off, 0),
-      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
+      X, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      offsets=(m_off, 0, n_off),
+      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   ), boundary_check=(0, 1, 2), padding_option='zero').to(tl.float32)
   if SUBTRACT_MEAN:
     mean = tl.load(tl.make_block_ptr(
@@ -167,48 +165,48 @@ def _normalization_vjp_kernel(
         offsets=(m_off, n_off),
         block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
     ), boundary_check=(0, 1), padding_option='zero').to(tl.float32)
-    x_norm = x_norm - mean[:, :, None]
+    x_norm = x_norm - tl.expand_dims(mean, 1)
   rstd = tl.load(tl.make_block_ptr(
       RSTD, shape=(M_dim, N_dim), strides=(N_dim, 1),
       offsets=(m_off, n_off),
       block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
   ), boundary_check=(0, 1), padding_option='zero').to(tl.float32)
-  x_norm = x_norm * rstd[:, :, None]
+  x_norm = x_norm * tl.expand_dims(rstd, 1)
 
   # Load dout tile.
   dout = tl.load(tl.make_block_ptr(
-      DOUT, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
-      offsets=(m_off, n_off, 0),
-      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
+      DOUT, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      offsets=(m_off, 0, n_off),
+      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   ), boundary_check=(0, 1, 2), padding_option='zero').to(tl.float32)
 
-  # Partial doffset/dscale: reduce (BM, BN, BA) over M and N → (BA,).
+  # Partial doffset/dscale: reduce (BM, BA, BN) over M and N → (BA,).
   # Store as (linear_pid, A); host sums axis 0 to get (A,).
   linear_pid = pid_m * grid_n + pid_n
 
   if HAS_OFFSET:
-    doffset = tl.sum(tl.sum(dout, axis=1), axis=0)
+    doffset = tl.sum(tl.sum(dout, axis=2), axis=0)
     tl.store(DOFFSET + linear_pid * A + a_offs, doffset, mask=a_mask)
 
   if HAS_SCALE:
-    dscale = tl.sum(tl.sum(dout * x_norm, axis=1), axis=0)
+    dscale = tl.sum(tl.sum(dout * x_norm, axis=2), axis=0)
     tl.store(DSCALE + linear_pid * A + a_offs, dscale, mask=a_mask)
     s = tl.load(SCALE + a_offs, mask=a_mask, other=0.0).to(tl.float32)
-    dout = dout * (s[None, None, :] + scale_offset)
+    dout = dout * (s[None, :, None] + scale_offset)
 
   # dx = (dout - mean_a(dout·x_norm)·x_norm [- mean_a(dout)]) * rstd
-  # Reductions over axis 2 (the A dimension).
-  dx1 = -(tl.sum(dout * x_norm, axis=2) / A)
-  dx = dout + dx1[:, :, None] * x_norm
+  # Reductions over axis 1 (the A dimension).
+  dx1 = tl.expand_dims(-(tl.sum(dout * x_norm, axis=1) / A), 1)
+  dx = dout + dx1 * x_norm
   if SUBTRACT_MEAN:
-    dx2 = -(tl.sum(dout, axis=2) / A)
-    dx = dx + dx2[:, :, None]
-  dx = dx * rstd[:, :, None]
+    dx2 = tl.expand_dims(-(tl.sum(dout, axis=1) / A), 1)
+    dx = dx + dx2
+  dx = dx * tl.expand_dims(rstd, 1)
 
   tl.store(tl.make_block_ptr(
-      DX, shape=(M_dim, N_dim, A), strides=(stride_m, 1, stride_a),
-      offsets=(m_off, n_off, 0),
-      block_shape=(BLOCK_M, BLOCK_N, BLOCK_A), order=(1, 2, 0),
+      DX, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      offsets=(m_off, 0, n_off),
+      block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   ), dx.to(DX.dtype.element_ty), boundary_check=(0, 1, 2))
 
 
