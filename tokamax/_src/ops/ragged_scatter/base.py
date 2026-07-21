@@ -18,9 +18,9 @@ from typing import Any, TypeVar
 
 import jax
 import jax.numpy as jnp
-import jaxtyping
 from jaxtyping import Array, Int, Shaped
 from tokamax._src.ops import op
+from tokamax._src import jaxtyping
 
 _Config = TypeVar("_Config")
 
