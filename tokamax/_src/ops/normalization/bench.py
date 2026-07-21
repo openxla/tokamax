@@ -63,4 +63,4 @@ def _register_benchmarks():
 
 if __name__ == '__main__':
   app.call_after_init(_register_benchmarks)
-  google_benchmark.main()
+  app.run(lambda _: google_benchmark.main())
