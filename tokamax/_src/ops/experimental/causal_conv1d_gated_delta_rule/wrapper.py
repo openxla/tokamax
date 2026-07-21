@@ -19,12 +19,12 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.gdn.v3 import compute_conv1d
-from tokamax._src.ops.experimental.tpu.gdn.v3 import compute_gdn
-from tokamax._src.ops.experimental.tpu.gdn.v3 import config
-from tokamax._src.ops.experimental.tpu.gdn.v3 import memory_ref
-from tokamax._src.ops.experimental.tpu.gdn.v3 import metadata
-from tokamax._src.ops.experimental.tpu.gdn.v3 import vmem_ldst
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import compute_conv1d
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import compute_gdn
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import config
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import memory_ref
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import metadata
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import vmem_ldst
 
 
 def inner_kernel(
@@ -43,7 +43,7 @@ def inner_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
-):
+) -> None:
   """Orchestrates computation of Conv1D and GDN for a single tile.
 
   This kernel acts as a facade adhering to strict separation of concerns. It
@@ -197,7 +197,7 @@ def outer_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
-):
+) -> None:
   """Setup memory allocations and emit pipeline for running inner_kernel."""
   del conv_state_out_ref, recurrent_state_out_ref
 

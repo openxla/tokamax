@@ -15,16 +15,15 @@
 """Security tests for GDN attention."""
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.gdn.v3 import wrapper
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import wrapper
 from tokamax._src.ops.experimental.utils.test_utils import poison_tpu_memory
 
 
-class GDNSecurityTest(parameterized.TestCase):
+class GDNSecurityTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()

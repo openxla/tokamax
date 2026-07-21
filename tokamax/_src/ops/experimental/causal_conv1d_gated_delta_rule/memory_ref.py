@@ -21,7 +21,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.gdn.v3 import config
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import config
 
 
 @jax.tree_util.register_dataclass
@@ -53,7 +53,7 @@ class SmemWrapper:
   data: Any
   shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
 
-  def _get_pos(self, indices):
+  def _get_pos(self, indices: tuple[Any, ...]) -> Any:
     strides = pl.strides_from_shape(self.shape)
     assert len(strides) == len(indices)
 
@@ -62,7 +62,7 @@ class SmemWrapper:
       pos += stride * idx
     return pos
 
-  def __getitem__(self, indices):
+  def __getitem__(self, indices: tuple[Any, ...]) -> Any:
     return self.data[self._get_pos(indices)]
 
 
@@ -90,7 +90,7 @@ class MetadataRef:
       p_id_is_last_tile: jax.Array,
       s_idx_has_initial_state: jax.Array,
       s_idx_to_state_indices: jax.Array,
-  ):
+  ) -> 'MetadataRef':
     # NOTE: First dim does not matter when it comes to calculating stride.
     shape = (1, cfgs.seq_tile_size)
     return cls(

@@ -15,7 +15,7 @@
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.gdn.v3 import config
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import config
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
@@ -34,7 +34,7 @@ def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
 
 
 # NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
-def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
+def invert_triangular_matrix(t: jax.Array, block_size: int = 16) -> jax.Array:
   """Compute invert matrix of a given triauglar matrix."""
 
   # NOTE: if chunk_size=1, compiler will perform DCE.
@@ -43,7 +43,7 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
   block_size = min(block_size, chunk)
   num_blocks = chunk // block_size
 
-  def local_forward_sub(t_mat, b_mat):
+  def local_forward_sub(t_mat: jax.Array, b_mat: jax.Array) -> jax.Array:
     x_list = []
     for i in range(block_size):
       b_i = b_mat[:, i, :]
