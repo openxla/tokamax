@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Optimized TPU Pallas/Mosaic kernel v2 for Ragged Gather Reduce."""
+"""TPU Pallas/Mosaic kernel for Ragged Gather Reduce."""
 
 import dataclasses
 import functools
@@ -469,7 +469,7 @@ def ragged_gather_reduce_pallas(
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
 ) -> jax.Array:
-  """Pallas Sparse Core kernel v2 for ragged gather reduce."""
+  """Pallas Sparse Core kernel for ragged gather reduce."""
   sc_info = pltpu.get_tpu_info().sparse_core
   if sc_info is None:
     return _fallback_implementation(
@@ -593,7 +593,7 @@ def ragged_gather_reduce_pallas(
       ),
       scratch_types=scratches,
       mesh=vector_mesh,
-      name="sc_ragged_gather_reduce_v2",
+      name="sc_ragged_gather_reduce",
   )(
       _Inputs(
           num_src_rows_per_row_partition=num_src_rows_per_row_partition,

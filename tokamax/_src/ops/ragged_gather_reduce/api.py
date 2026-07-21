@@ -21,18 +21,18 @@ import immutabledict
 import jax
 from tokamax._src.ops.ragged_gather_reduce import base
 
-Implementation: TypeAlias = Literal["xla", "mosaic", "mosaic_tpu", "mosaic_tpu_v2"]
+Implementation: TypeAlias = Literal["xla", "mosaic", "mosaic_tpu"]
 
 _IMPLEMENTATIONS = dict(xla=base.RaggedGatherReduce())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.ragged_gather_reduce import pallas_mosaic_v2_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_gather_reduce import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
-  _IMPLEMENTATIONS["mosaic_tpu_v2"] = (
-      pallas_mosaic_v2_tpu.PallasV2TpuRaggedGatherReduce()
+  _IMPLEMENTATIONS["mosaic_tpu"] = (
+      pallas_mosaic_tpu.PallasTpuRaggedGatherReduce()
   )
-  _DEFAULT_IMPLEMENTATIONS = ("mosaic_tpu_v2",) + _DEFAULT_IMPLEMENTATIONS
+  _DEFAULT_IMPLEMENTATIONS = ("mosaic_tpu",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
@@ -80,7 +80,7 @@ def ragged_gather_reduce(
   for impl in implementation:
     if isinstance(impl, str):
       if impl in ("mosaic", "mosaic_tpu"):
-        impl = "mosaic_tpu_v2"
+        impl = "mosaic_tpu"
       if impl not in IMPLEMENTATIONS:
         raise ValueError(
             f"Unknown implementation: {impl}. You may need to add a dependency"

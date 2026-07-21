@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for Pallas/Mosaic Ragged Gather Reduce operator v2 on TPU."""
+"""Tests for Pallas/Mosaic Ragged Gather Reduce operator on TPU."""
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -21,12 +21,12 @@ from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.ragged_gather_reduce import base
-from tokamax._src.ops.ragged_gather_reduce import pallas_mosaic_v2_tpu
+from tokamax._src.ops.ragged_gather_reduce import pallas_mosaic_tpu
 
 jax.config.parse_flags_with_absl()
 
 
-class PallasV2TpuRaggedGatherReduceTest(parameterized.TestCase):
+class PallasTpuRaggedGatherReduceTest(parameterized.TestCase):
 
   @parameterized.product(
       input_size=[512, 1024],
@@ -34,7 +34,7 @@ class PallasV2TpuRaggedGatherReduceTest(parameterized.TestCase):
       reduce_group_size=[4, 8],
       dtype=[jnp.bfloat16, jnp.float32],
   )
-  def test_sc_gather_reduce_v2(
+  def test_sc_gather_reduce(
       self, input_size, hidden_size, reduce_group_size, dtype
   ):
     if backend.get_default_device().platform != "tpu":
@@ -50,7 +50,7 @@ class PallasV2TpuRaggedGatherReduceTest(parameterized.TestCase):
     )
     valid_rows_mask = jnp.ones((input_size,), jnp.bool_)
 
-    op = pallas_mosaic_v2_tpu.PallasV2TpuRaggedGatherReduce()
+    op = pallas_mosaic_tpu.PallasTpuRaggedGatherReduce()
     actual = op(
         x,
         indices,
