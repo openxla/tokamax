@@ -80,55 +80,29 @@ def _get_dq_scratch_shapes(
 ):
   block_q = config.block_q_dq
   block_kv = config.block_kv_dq
+  num_stages = config.num_stages
   eltwise_stages = config.eltwise_stages
   ds_stages = 2 if config.double_buffer else 1
-  ds_smems = [
-      plgpu.SMEM(
-          (ds_stages, block_q, chunk_size),
-          k_dtype,
-          transforms=_smem_transforms(k_dtype, swizzle=64),
-      )
-  ]
+  ds_smems = [_tiled_smem((ds_stages, block_q, chunk_size), k_dtype)]
   if bias_shape is not None:
-    ds_smems.append(
-        plgpu.SMEM(
-            (ds_stages, block_q, chunk_size),
-            ds_dtype,
-            transforms=_smem_transforms(ds_dtype, swizzle=64),
-        )
-    )
+    ds_smems.append(_tiled_smem((ds_stages, block_q, chunk_size), ds_dtype))
+
   shapes = dict(
-      q_smem=plgpu.SMEM(
-          (block_q, head_dim),
-          q_dtype,
-          transforms=_smem_transforms(q_dtype, swizzle=64),
-      ),
-      do_smem=plgpu.SMEM(
-          (block_q, head_dim_out),
-          dout_dtype,
-          transforms=_smem_transforms(dout_dtype, swizzle=64),
-      ),
-      k_smem=plgpu.SMEM(
-          (config.num_stages, block_kv, head_dim),
-          k_dtype,
-          transforms=_smem_transforms(k_dtype, swizzle=64),
-      ),
-      v_smem=plgpu.SMEM(
-          (config.num_stages, block_kv, head_dim_out),
-          v_dtype,
-          transforms=_smem_transforms(v_dtype, swizzle=64),
-      ),
+      q_smem=_tiled_smem((block_q, head_dim), q_dtype),
+      do_smem=_tiled_smem((block_q, head_dim_out), dout_dtype),
+      k_smem=_tiled_smem((num_stages, block_kv, head_dim), k_dtype, swizzle=64),
+      v_smem=_tiled_smem((num_stages, block_kv, head_dim_out), v_dtype),
       ds_smem=plgpu.RefUnion(*ds_smems),
       s_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
       dp_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
       dq_tmem=plgpu.TMEM((block_q, head_dim), jnp.float32),
-      k_produced=plgpu.Barrier(num_barriers=config.num_stages),
-      v_produced=plgpu.Barrier(num_barriers=config.num_stages),
+      k_produced=plgpu.Barrier(num_barriers=num_stages),
+      v_produced=plgpu.Barrier(num_barriers=num_stages),
       k_consumed=plgpu.Barrier(
-          num_barriers=config.num_stages, orders_tensor_core=True
+          num_barriers=num_stages, orders_tensor_core=True
       ),
       v_consumed=plgpu.Barrier(
-          num_barriers=config.num_stages, orders_tensor_core=True
+          num_barriers=num_stages, orders_tensor_core=True
       ),
       s_produced=plgpu.Barrier(orders_tensor_core=True),
       s_consumed=plgpu.Barrier(),
@@ -153,8 +127,8 @@ def _get_dq_scratch_shapes(
         chunk_size * 2,
     )
     shapes["bias_smem"] = _tiled_smem(shape, bias_dtype, swizzle=swizzle)
-    shapes["bias_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
-    shapes["bias_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+    shapes["bias_produced"] = plgpu.Barrier(num_barriers=eltwise_stages)
+    shapes["bias_consumed"] = plgpu.Barrier(num_barriers=eltwise_stages)
 
   if mask_shape is not None and mask_shape[-1] != 1:
     if mask_shape[-2] == 1:
@@ -163,8 +137,8 @@ def _get_dq_scratch_shapes(
       shape = (eltwise_stages, block_q, block_kv)
       swizzle = min(plgpu.find_swizzle(8 * block_kv, "mask"), chunk_size)
       shapes["mask_smem"] = _tiled_smem(shape, jnp.int8, swizzle=swizzle)
-    shapes["mask_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
-    shapes["mask_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+    shapes["mask_produced"] = plgpu.Barrier(num_barriers=eltwise_stages)
+    shapes["mask_consumed"] = plgpu.Barrier(num_barriers=eltwise_stages)
 
   return shapes
 
@@ -184,51 +158,27 @@ def _get_dkv_scratch_shapes(
 ):
   block_q = config.block_q_dkv
   block_kv = config.block_kv_dkv
+  num_stages = config.num_stages
   eltwise_stages = config.eltwise_stages
   ds_stages = 2 if config.double_buffer else 1
+  residual_stages = config.residual_stages
   shapes = dict(
-      k_smem=plgpu.SMEM(
-          (block_kv, head_dim),
-          k_dtype,
-          transforms=_smem_transforms(k_dtype, swizzle=64),
+      k_smem=_tiled_smem((block_kv, head_dim), k_dtype),
+      v_smem=_tiled_smem((block_kv, head_dim_out), v_dtype),
+      q_smem=_tiled_smem((num_stages, block_q, head_dim), q_dtype, swizzle=64),
+      do_smem=_tiled_smem(
+          (num_stages, block_q, head_dim_out), dout_dtype, swizzle=64
       ),
-      v_smem=plgpu.SMEM(
-          (block_kv, head_dim_out),
-          v_dtype,
-          transforms=_smem_transforms(v_dtype, swizzle=64),
-      ),
-      q_smem=plgpu.SMEM(
-          (config.num_stages, block_q, head_dim),
-          q_dtype,
-          transforms=_smem_transforms(q_dtype, swizzle=64),
-      ),
-      do_smem=plgpu.SMEM(
-          (config.num_stages, block_q, head_dim_out),
-          dout_dtype,
-          transforms=_smem_transforms(dout_dtype, swizzle=64),
-      ),
-      ds_smem=plgpu.SMEM(
-          (ds_stages, block_kv, chunk_size),
-          q_dtype,
-          transforms=_smem_transforms(q_dtype, swizzle=64),
-      ),
-      p_smem=plgpu.SMEM(
-          (ds_stages, block_kv, chunk_size),
-          dout_dtype,
-          transforms=_smem_transforms(dout_dtype, swizzle=64),
-      ),
+      ds_smem=_tiled_smem((ds_stages, block_kv, chunk_size), q_dtype),
+      p_smem=_tiled_smem((ds_stages, block_kv, chunk_size), dout_dtype),
       s_tmem=plgpu.TMEM((block_kv, block_q), jnp.float32),
       dp_tmem=plgpu.TMEM((block_kv, block_q), jnp.float32),
       dk_tmem=plgpu.TMEM((block_kv, head_dim), jnp.float32),
       dv_tmem=plgpu.TMEM((block_kv, head_dim_out), jnp.float32),
       kv_produced=plgpu.Barrier(num_arrivals=2),
-      q_do_produced=plgpu.Barrier(
-          num_barriers=config.num_stages, num_arrivals=2
-      ),
+      q_do_produced=plgpu.Barrier(num_barriers=num_stages, num_arrivals=2),
       q_do_consumed=plgpu.Barrier(
-          num_barriers=config.num_stages,
-          num_arrivals=2,
-          orders_tensor_core=True,
+          num_barriers=num_stages, num_arrivals=2, orders_tensor_core=True
       ),
       s_produced=plgpu.Barrier(orders_tensor_core=True),
       s_consumed=plgpu.Barrier(),
@@ -239,13 +189,11 @@ def _get_dkv_scratch_shapes(
           num_barriers=ds_stages, orders_tensor_core=True
       ),
       kv_mma_finished=plgpu.Barrier(orders_tensor_core=True),
-      residuals_smem=plgpu.SMEM(
-          (3, config.residual_stages, block_q), jnp.float32
-      ),
+      residuals_smem=plgpu.SMEM((3, residual_stages, block_q), jnp.float32),
       residual_produced=plgpu.Barrier(
-          num_barriers=config.residual_stages, num_arrivals=3
+          num_barriers=residual_stages, num_arrivals=3
       ),
-      residual_consumed=plgpu.Barrier(num_barriers=config.residual_stages),
+      residual_consumed=plgpu.Barrier(num_barriers=residual_stages),
   )
   if bias_shape is not None and bias_shape[-2] != 1 and bias_shape[-1] != 1:
     shape = (eltwise_stages, block_kv, block_q)
@@ -254,15 +202,15 @@ def _get_dkv_scratch_shapes(
         chunk_size * 2,
     )
     shapes["bias_smem"] = _tiled_smem(shape, bias_dtype, swizzle=swizzle)
-    shapes["bias_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
-    shapes["bias_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+    shapes["bias_produced"] = plgpu.Barrier(num_barriers=eltwise_stages)
+    shapes["bias_consumed"] = plgpu.Barrier(num_barriers=eltwise_stages)
 
   if mask_shape is not None and mask_shape[-2] != 1 and mask_shape[-1] != 1:
     shape = (eltwise_stages, block_kv, block_q)
     swizzle = min(plgpu.find_swizzle(8 * block_q, "mask"), chunk_size)
     shapes["mask_smem"] = _tiled_smem(shape, jnp.int8, swizzle=swizzle)
-    shapes["mask_produced"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
-    shapes["mask_consumed"] = plgpu.Barrier(num_barriers=config.eltwise_stages)
+    shapes["mask_produced"] = plgpu.Barrier(num_barriers=eltwise_stages)
+    shapes["mask_consumed"] = plgpu.Barrier(num_barriers=eltwise_stages)
 
   return shapes
 
@@ -405,13 +353,6 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
     return (c.double_buffer, c.num_stages, c.eltwise_stages, c.residual_stages)
 
   return max(configs, key=_score)
-
-
-def _smem_transforms(dtype, swizzle=128):
-  return (
-      plgpu.TilingTransform((8, swizzle // jnp.dtype(dtype).itemsize)),
-      plgpu.SwizzleTransform(swizzle),
-  )
 
 
 def _get_input_metadata(q, v):
