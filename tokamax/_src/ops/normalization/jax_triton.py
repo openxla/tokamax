@@ -59,15 +59,24 @@ def _normalization_kernel(
     SUBTRACT_MEAN: tl.constexpr,
     RETURN_MEAN: tl.constexpr,
     RETURN_RSTD: tl.constexpr,
+    SINGLE_N: tl.constexpr,
 ):
   """Normalization forward kernel (layer norm / RMS norm).
 
   Operates on a canonicalized (M, A, N) layout where A is the (middle) norm
   axis and N is contiguous. 2D grid (pid_m, pid_n) tiles over M and N; each
   program reduces a full (BLOCK_M, A, BLOCK_N) tile along A.
+
+  When the N grid is degenerate (`SINGLE_N`, i.e. `cdiv(N, BLOCK_N) == 1`) the N
+  program id is folded to a compile-time 0. Otherwise `n_off = program_id(1) *
+  BLOCK_N` is a runtime value on the contiguous (stride-1) N axis of the block
+  pointer, which defeats Triton's alignment/divisibility proof and blocks
+  vectorization of the reduction axis (scalar, cross-warp layout). Folding it —
+  as Pallas/XLA do for size-1 grid dims — restores the vectorized intra-warp
+  layout.
   """
   pid_m = tl.program_id(0)
-  pid_n = tl.program_id(1)
+  pid_n = 0 if SINGLE_N else tl.program_id(1)
   m_off = pid_m * BLOCK_M
   n_off = pid_n * BLOCK_N
 
@@ -138,15 +147,18 @@ def _normalization_vjp_kernel(
     HAS_SCALE: tl.constexpr,
     HAS_OFFSET: tl.constexpr,
     SUBTRACT_MEAN: tl.constexpr,
+    SINGLE_N: tl.constexpr,
 ):
   """Normalization VJP kernel.
 
   2D grid (pid_m, pid_n). Produces per-program partial sums for dscale and
   doffset (shape (grid_m * grid_n, A)), reduced outside the kernel. Operates on
-  the canonical (M, A, N) layout, reducing along the middle axis A.
+  the canonical (M, A, N) layout, reducing along the middle axis A. `SINGLE_N`
+  folds a degenerate N grid id to 0 to keep loads vectorizable (see the forward
+  kernel docstring).
   """
   pid_m = tl.program_id(0)
-  pid_n = tl.program_id(1)
+  pid_n = 0 if SINGLE_N else tl.program_id(1)
   m_off = pid_m * BLOCK_M
   n_off = pid_n * BLOCK_N
 
@@ -272,6 +284,7 @@ class JaxTritonNormalization(base.Normalization[Config, Key]):
       alias_kwargs['input_output_aliases'] = {0: 0}
 
     grid = (pl.cdiv(M, block_m), pl.cdiv(N, block_n))
+    single_n = pl.cdiv(N, block_n) == 1
     out_shapes = [
         jax.ShapeDtypeStruct(x_shape, x.dtype),
         jax.ShapeDtypeStruct((num_rows,), jnp.float32),
@@ -299,6 +312,7 @@ class JaxTritonNormalization(base.Normalization[Config, Key]):
         SUBTRACT_MEAN=subtract_mean,
         RETURN_MEAN=return_residuals and subtract_mean,
         RETURN_RSTD=return_residuals,
+        SINGLE_N=single_n,
     )
 
     y = y.reshape(orig_x_shape)
@@ -435,6 +449,7 @@ class JaxTritonNormalizationVjp(base.NormalizationVjp[VjpConfig, VjpKey]):
         HAS_SCALE=scale is not None,
         HAS_OFFSET=offset is not None,
         SUBTRACT_MEAN=subtract_mean,
+        SINGLE_N=grid_n == 1,
     )
 
     dscale = None
