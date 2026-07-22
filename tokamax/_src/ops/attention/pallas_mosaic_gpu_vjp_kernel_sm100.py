@@ -74,9 +74,8 @@ def _get_dq_scratch_shapes(
     k_dtype,
     v_dtype,
     ds_dtype,
-    bias_shape,
-    bias_dtype,
-    mask_shape,
+    bias,
+    mask,
 ):
   block_q = config.block_q_dq
   block_kv = config.block_kv_dq
@@ -84,7 +83,7 @@ def _get_dq_scratch_shapes(
   eltwise_stages = config.eltwise_stages
   ds_stages = 2 if config.double_buffer else 1
   ds_smems = [_tiled_smem((ds_stages, block_q, chunk_size), k_dtype)]
-  if bias_shape is not None:
+  if bias is not None:
     ds_smems.append(_tiled_smem((ds_stages, block_q, chunk_size), ds_dtype))
 
   shapes = dict(
@@ -120,18 +119,18 @@ def _get_dq_scratch_shapes(
     shapes["q_do_produced"] = plgpu.Barrier(num_arrivals=5)
     shapes["residuals_smem"] = plgpu.SMEM((3, block_q), jnp.float32)
 
-  if bias_shape is not None and bias_shape[-2] != 1 and bias_shape[-1] != 1:
+  if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
     shape = (eltwise_stages, block_q, block_kv)
     swizzle = min(
-        plgpu.find_swizzle(block_kv * mgpu_lib.num_bits(bias_dtype), "bias"),
+        plgpu.find_swizzle(block_kv * mgpu_lib.num_bits(bias.dtype), "bias"),
         chunk_size * 2,
     )
-    shapes["bias_smem"] = _tiled_smem(shape, bias_dtype, swizzle=swizzle)
+    shapes["bias_smem"] = _tiled_smem(shape, bias.dtype, swizzle=swizzle)
     shapes["bias_produced"] = plgpu.Barrier(num_barriers=eltwise_stages)
     shapes["bias_consumed"] = plgpu.Barrier(num_barriers=eltwise_stages)
 
-  if mask_shape is not None and mask_shape[-1] != 1:
-    if mask_shape[-2] == 1:
+  if mask is not None and mask.shape[-1] != 1:
+    if mask.shape[-2] == 1:
       shapes["mask_smem"] = plgpu.SMEM((eltwise_stages, block_kv), jnp.int8)
     else:
       shape = (eltwise_stages, block_q, block_kv)
@@ -152,9 +151,8 @@ def _get_dkv_scratch_shapes(
     dout_dtype,
     k_dtype,
     v_dtype,
-    bias_shape,
-    bias_dtype,
-    mask_shape,
+    bias,
+    mask,
 ):
   block_q = config.block_q_dkv
   block_kv = config.block_kv_dkv
@@ -195,17 +193,17 @@ def _get_dkv_scratch_shapes(
       ),
       residual_consumed=plgpu.Barrier(num_barriers=residual_stages),
   )
-  if bias_shape is not None and bias_shape[-2] != 1 and bias_shape[-1] != 1:
+  if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
     shape = (eltwise_stages, block_kv, block_q)
     swizzle = min(
-        plgpu.find_swizzle(block_q * mgpu_lib.num_bits(bias_dtype), "bias"),
+        plgpu.find_swizzle(block_q * mgpu_lib.num_bits(bias.dtype), "bias"),
         chunk_size * 2,
     )
-    shapes["bias_smem"] = _tiled_smem(shape, bias_dtype, swizzle=swizzle)
+    shapes["bias_smem"] = _tiled_smem(shape, bias.dtype, swizzle=swizzle)
     shapes["bias_produced"] = plgpu.Barrier(num_barriers=eltwise_stages)
     shapes["bias_consumed"] = plgpu.Barrier(num_barriers=eltwise_stages)
 
-  if mask_shape is not None and mask_shape[-2] != 1 and mask_shape[-1] != 1:
+  if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
     shape = (eltwise_stages, block_kv, block_q)
     swizzle = min(plgpu.find_swizzle(8 * block_q, "mask"), chunk_size)
     shapes["mask_smem"] = _tiled_smem(shape, jnp.int8, swizzle=swizzle)
@@ -301,9 +299,8 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                     k_dtype=k_dtype,
                     v_dtype=v_dtype,
                     ds_dtype=ds_dtype,
-                    bias_shape=bias.shape if bias is not None else None,
-                    bias_dtype=bias.dtype if bias is not None else None,
-                    mask_shape=mask.shape if mask is not None else None,
+                    bias=bias,
+                    mask=mask,
                 )
                 dkv_shapes = _get_dkv_scratch_shapes(
                     config=config,
@@ -314,9 +311,8 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                     dout_dtype=dout_dtype,
                     k_dtype=k_dtype,
                     v_dtype=v_dtype,
-                    bias_shape=bias.shape if bias is not None else None,
-                    bias_dtype=bias.dtype if bias is not None else None,
-                    mask_shape=mask.shape if mask is not None else None,
+                    bias=bias,
+                    mask=mask,
                 )
                 dq_smem = _estimate_smem_bytes(dq_shapes)
                 dkv_smem = _estimate_smem_bytes(dkv_shapes)
@@ -404,19 +400,17 @@ def _kernel_dq(
     k_end_ref,
     mask_ref,
     dq_ref,
-    ds_ref=None,
-    bias_shape=None,
-    mask_shape=None,
+    ds_ref,
     *,
-    q_smem=None,
-    do_smem=None,
+    q_smem,
+    do_smem,
     residuals_smem=None,
-    k_smem=None,
-    v_smem=None,
-    ds_smem=None,
-    s_tmem=None,
-    dp_tmem=None,
-    dq_tmem=None,
+    k_smem,
+    v_smem,
+    ds_smem,
+    s_tmem,
+    dp_tmem,
+    dq_tmem,
     q_do_produced,
     k_produced,
     v_produced,
@@ -483,9 +477,7 @@ def _kernel_dq(
         )
         if not config.load_residuals_in_regs:
           plgpu.copy_gmem_to_smem(
-              m_ref.at[hi, qs],
-              m_smem,
-              barrier=q_do_produced,
+              m_ref.at[hi, qs], m_smem, barrier=q_do_produced
           )
           plgpu.copy_gmem_to_smem(
               l_ref.at[hi, qs], l_smem, barrier=q_do_produced
@@ -542,7 +534,7 @@ def _kernel_dq(
                 plgpu.barrier_wait(bias_consumed.at[bi])
 
               plgpu.copy_gmem_to_smem(
-                  bias_ref.at[0 if bias_shape[-3] == 1 else hi, qs, ks],
+                  bias_ref.at[0 if bias_ref.shape[-3] == 1 else hi, qs, ks],
                   bias_smem.at[bi],
                   bias_produced.at[bi],
               )
@@ -553,8 +545,8 @@ def _kernel_dq(
               def wait_mask():
                 plgpu.barrier_wait(mask_consumed.at[bi])
 
-              mask_hi = 0 if mask_shape[-3] == 1 else hi
-              mask_qs = 0 if mask_shape[-2] == 1 else qs
+              mask_hi = 0 if mask_ref.shape[-3] == 1 else hi
+              mask_qs = 0 if mask_ref.shape[-2] == 1 else qs
               plgpu.copy_gmem_to_smem(
                   mask_ref.at[mask_hi, mask_qs, ks],
                   mask_smem.at[bi],
@@ -843,20 +835,18 @@ def _kernel_dkv(
     mask_ref,
     dk_ref,
     dv_ref,
-    bias_shape=None,
-    mask_shape=None,
     *,
-    k_smem=None,
-    v_smem=None,
-    q_smem=None,
-    do_smem=None,
-    residuals_smem=None,
-    ds_smem=None,
-    p_smem=None,
-    s_tmem=None,
-    dp_tmem=None,
-    dk_tmem=None,
-    dv_tmem=None,
+    k_smem,
+    v_smem,
+    q_smem,
+    do_smem,
+    residuals_smem,
+    ds_smem,
+    p_smem,
+    s_tmem,
+    dp_tmem,
+    dk_tmem,
+    dv_tmem,
     kv_produced,
     q_do_produced,
     q_do_consumed,
@@ -996,7 +986,7 @@ def _kernel_dkv(
                 plgpu.barrier_wait(bias_consumed.at[bi])
 
               plgpu.copy_gmem_to_smem(
-                  bias_ref.at[0 if bias_shape[-3] == 1 else hi, ks, qs],
+                  bias_ref.at[0 if bias_ref.shape[-3] == 1 else hi, ks, qs],
                   bias_smem.at[bi],
                   bias_produced.at[bi],
               )
@@ -1007,8 +997,8 @@ def _kernel_dkv(
               def wait_mask():
                 plgpu.barrier_wait(mask_consumed.at[bi])
 
-              mask_hi = 0 if mask_shape[-3] == 1 else hi
-              mask_qs = 0 if mask_shape[-1] == 1 else qs
+              mask_hi = 0 if mask_ref.shape[-3] == 1 else hi
+              mask_qs = 0 if mask_ref.shape[-1] == 1 else qs
               plgpu.copy_gmem_to_smem(
                   mask_ref.at[mask_hi, ks, mask_qs],
                   mask_smem.at[bi],
@@ -1361,9 +1351,8 @@ def flash_attention_vjp_kernel(
       k_dtype=k.dtype,
       v_dtype=v.dtype,
       ds_dtype=ds_dtype,
-      bias_shape=bias_shape,
-      bias_dtype=bias.dtype if bias is not None else None,
-      mask_shape=mask_shape,
+      bias=bias,
+      mask=mask,
   )
 
   if bias is None:
@@ -1376,8 +1365,6 @@ def flash_attention_vjp_kernel(
 
   kernel_dq = functools.partial(
       _kernel_dq,
-      bias_shape=bias_shape,
-      mask_shape=mask_shape,
       config=config,
       is_causal=is_causal,
       logits_scale=logits_scale,
@@ -1410,9 +1397,8 @@ def flash_attention_vjp_kernel(
       dout_dtype=dout.dtype,
       k_dtype=k.dtype,
       v_dtype=v.dtype,
-      bias_shape=bias_shape,
-      bias_dtype=bias.dtype if bias is not None else None,
-      mask_shape=mask_shape,
+      bias=bias,
+      mask=mask,
   )
 
   bias_dkv = None if bias is None else bias.mT
@@ -1420,8 +1406,6 @@ def flash_attention_vjp_kernel(
 
   kernel_dkv = functools.partial(
       _kernel_dkv,
-      bias_shape=bias_shape,
-      mask_shape=mask_shape,
       config=config,
       is_causal=is_causal,
       logits_scale=logits_scale,
