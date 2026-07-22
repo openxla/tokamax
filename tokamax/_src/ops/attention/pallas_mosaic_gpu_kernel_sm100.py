@@ -460,8 +460,7 @@ def flash_attention_kernel(
 
             @pl.loop(0, num_tma_splits)
             def tma_loop(split_idx):
-              slot = si * num_tma_splits + split_idx
-              plgpu.barrier_wait(consumed_barrier.at[slot])
+              plgpu.barrier_wait(consumed_barrier.at[si, split_idx])
               tma_load(ki, split_idx)
 
         @pl.when(warp_id == _TMA_LOAD_QK_WARP)
@@ -525,7 +524,7 @@ def flash_attention_kernel(
                     qk_acc_tmem,
                     q_smem.at[:, ds],
                     k_smem.at[si, split_idx].T,
-                    k_consumed_barrier.at[si * num_tma_splits + split_idx],
+                    k_consumed_barrier.at[si, split_idx],
                     accumulate=split_idx > 0,
                     collective_axis=collective_axis,
                 )
@@ -541,7 +540,6 @@ def flash_attention_kernel(
 
             @pl.loop(0, num_tma_splits)
             def tma_loop(split_idx):
-              barrier_slot = si * num_tma_splits + split_idx
               block_d = head_dim_out // num_tma_splits
               ds = pl.ds(split_idx * block_d, block_d)
               plgpu.barrier_wait(out_scaled_barrier.at[split_idx])
@@ -550,7 +548,7 @@ def flash_attention_kernel(
                     acc_tmem.at[:, ds],
                     p_tmem.at[:, pl.ds(slot * block_kv, block_kv)],
                     v_smem.at[si, split_idx],
-                    v_consumed_barrier.at[barrier_slot],
+                    v_consumed_barrier.at[si, split_idx],
                     accumulate=(ki != lb),
                     collective_axis=collective_axis,
                 )
@@ -896,7 +894,7 @@ def flash_attention_kernel(
       num_barriers=num_stages, num_arrivals=num_tma_splits
   )
   kv_consumed_barrier = plgpu.Barrier(
-      num_barriers=num_stages * num_tma_splits, orders_tensor_core=True
+      num_barriers=(num_stages, num_tma_splits), orders_tensor_core=True
   )
 
   if use_2d_bool_mask:
