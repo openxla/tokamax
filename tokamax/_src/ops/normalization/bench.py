@@ -18,11 +18,15 @@ import functools
 from absl import app
 from absl import flags
 import google_benchmark
+from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import jax_triton as jt_norm
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import arg_specs
+
+# Batch size for the batched (`vmap`) benchmarks.
+_VMAP_BATCH = 8
 
 
 _IMPLS = dict(
@@ -42,20 +46,42 @@ _BENCHMARK_IMPLS_FWD_BWD = flags.DEFINE_list(
 )
 
 
+def _batched_args(args):
+  """Returns `args` with x batched over a new leading axis (`scale`/`offset`
+
+  shared). All array args become `batching.BatchedShapeDtype`, which the
+  benchmark harness turns into a `jax.vmap` over the op — exercising the
+  batching (fold-into-M) path.
+  """
+  def batched(sds, vmapped):
+    vmap_axes = ((0, _VMAP_BATCH),) if vmapped else (None,)
+    return batching.BatchedShapeDtype(sds.shape, sds.dtype, vmap_axes)
+
+  out = dict(args)
+  out['x'] = batched(args['x'], True)
+  for k in ('scale', 'offset'):
+    if args[k] is not None:
+      out[k] = batched(args[k], False)
+  return out
+
+
 def _register_benchmarks():
   """Registers benchmarks."""
   register_benchmark = functools.partial(
       benchmarking.register_benchmark, iterations=10
   )
 
-  for arg_spec in arg_specs.ARG_SPECS:
+  # Non-batched and batched (`vmap`) variants of each arg spec.
+  specs = [(s.full_name, s.args) for s in arg_specs.ARG_SPECS]
+  specs += [(f'{s.full_name}_vmap', _batched_args(s.args)) for s in
+            arg_specs.ARG_SPECS]
+
+  for name, kwargs in specs:
     for impl_name in _BENCHMARK_IMPLS_FWD.value:
       impl = _IMPLS[impl_name]
-      register_benchmark(arg_spec.full_name, impl_name, impl, arg_spec.args)
+      register_benchmark(name, impl_name, impl, kwargs)
 
-  for arg_spec in arg_specs.ARG_SPECS:
-    name = arg_spec.full_name
-    kwargs = arg_spec.args
+  for name, kwargs in specs:
     for impl_name in _BENCHMARK_IMPLS_FWD_BWD.value:
       impl = _IMPLS[impl_name]
       register_benchmark(name, impl_name, impl, kwargs, mode='forward_and_vjp')
