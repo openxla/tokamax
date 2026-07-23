@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pallas-Triton normalization op configuration."""
+"""Triton normalization op configuration."""
 
 from collections.abc import Sequence
 import math
