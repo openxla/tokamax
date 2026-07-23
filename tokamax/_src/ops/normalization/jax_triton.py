@@ -15,6 +15,7 @@
 """Native Triton normalization op via jax-triton."""
 
 import dataclasses
+import functools
 from typing import ClassVar, TypeAlias
 
 import jax
@@ -38,6 +39,38 @@ VjpKey: TypeAlias = triton_vjp_config.Key
 FusedInputArray = base.FusedInputArray
 Residuals = base.Residuals
 _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
+
+
+def _vmappable(launch):
+  """Adds a `jax.vmap` batching rule to a `jt.triton_call` `launch(*arrays)`.
+
+  `jt.triton_call` raises under `vmap` (the batching rule is inherently
+  per-kernel, so jax-triton refuses to guess). Normalization batching is just
+  extra rows, so we fold the batch axis with `lax.map`, whose body launches the
+  kernel per slice with no `vmap` tracer. Correct for batched `scale`/`offset`
+  and nested `vmap`. Outside `vmap` this calls `launch` directly (no overhead).
+  """
+  f = jax.custom_batching.custom_vmap(launch)
+
+  @f.def_vmap
+  def _rule(axis_size, in_batched, *arrays):
+    del axis_size
+    idx = [i for i, b in enumerate(in_batched) if b]
+    if not idx:  # Nothing batched (shouldn't happen under `vmap`).
+      return launch(*arrays), in_batched
+
+    def body(slices):
+      full = list(arrays)
+      for i, s in zip(idx, slices):
+        full[i] = s
+      # Call `f` (not `launch`): under nested `vmap` the inner batch axis is
+      # still live here, and must re-enter this rule (→ nested `lax.map`).
+      return f(*full)
+
+    out = jax.lax.map(body, tuple(arrays[i] for i in idx))
+    return out, jax.tree.map(lambda _: True, out)
+
+  return f
 
 
 # ── Forward kernel ─────────────────────────────────────────────────────────────
@@ -292,8 +325,8 @@ class JaxTritonNormalization(base.Normalization[Config, Key]):
         jax.ShapeDtypeStruct((num_rows,), jnp.float32),
         jax.ShapeDtypeStruct((num_rows,), jnp.float32),
     ]
-    y, mean_flat, rstd_flat = jt.triton_call(
-        x, scale_arr, offset_arr,
+    launch = _vmappable(functools.partial(
+        jt.triton_call,
         kernel=_normalization_kernel,
         out_shape=out_shapes,
         grid=grid,
@@ -315,7 +348,8 @@ class JaxTritonNormalization(base.Normalization[Config, Key]):
         RETURN_MEAN=return_residuals and subtract_mean,
         RETURN_RSTD=return_residuals,
         SINGLE_N=single_n,
-    )
+    ))
+    y, mean_flat, rstd_flat = launch(x, scale_arr, offset_arr)
 
     y = y.reshape(orig_x_shape)
 
@@ -431,8 +465,8 @@ class JaxTritonNormalizationVjp(base.NormalizationVjp[VjpConfig, VjpKey]):
         dparam_shape if scale is not None else dummy_shape,
         dparam_shape if offset is not None else dummy_shape,
     ]
-    dx, dscale_partial, doffset_partial = jt.triton_call(
-        dout, x, scale_arr, mean_flat, rstd_flat,
+    launch = _vmappable(functools.partial(
+        jt.triton_call,
         kernel=_normalization_vjp_kernel,
         out_shape=out_shapes,
         grid=grid,
@@ -452,7 +486,9 @@ class JaxTritonNormalizationVjp(base.NormalizationVjp[VjpConfig, VjpKey]):
         HAS_OFFSET=offset is not None,
         SUBTRACT_MEAN=subtract_mean,
         SINGLE_N=grid_n == 1,
-    )
+    ))
+    dx, dscale_partial, doffset_partial = launch(
+        dout, x, scale_arr, mean_flat, rstd_flat)
 
     dscale = None
     if scale is not None:

@@ -15,11 +15,14 @@
 """Tests for jax-triton normalization op."""
 
 import functools
+from typing import override
+from unittest import mock
 
 from absl.testing import absltest
 import chex
 import jax
 from tokamax._src.ops.normalization import jax_triton
+from tokamax._src.ops.normalization import triton_config
 from tokamax._src.ops.normalization import test_base
 
 
@@ -33,15 +36,6 @@ class JaxTritonNormalizationTest(test_base.NormalizationTestBase):
     if jax.default_backend() == 'tpu':
       self.skipTest('Not supported on TPUs.')
     super().setUp()
-
-  # `jax_triton.triton_call` has no `jax.vmap` batching rule (it raises by
-  # design; the rule is inherently per-kernel). Skipping the shared helper skips
-  # all parameterized `test_layer_norm_vmap*` cases until a
-  # `jax.custom_batching.custom_vmap` rule is added to `JaxTritonNormalization`
-  # (see `triton_call_vmap_plan.md`). TODO: re-enable (with the heuristics-mock
-  # override and `test_remat_with_vmap` from `pallas_triton_test.py`) then.
-  def _test_layer_norm_vmap(self, axis, vmap_in_axes):
-    self.skipTest('jax_triton normalization does not support `vmap` yet.')
 
   def test_layer_norm_with_pre_scale(self):
     rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
@@ -60,6 +54,30 @@ class JaxTritonNormalizationTest(test_base.NormalizationTestBase):
     )
     chex.assert_trees_all_close(y_actual, y_expected, atol=1e-6)
 
+  @override
+  def _test_layer_norm_vmap(self, axis, vmap_in_axes):
+    x_shape = [24, 32, 40]
+    vmap_axis_sizes = tuple(
+        x_shape.pop(in_axes[0]) for in_axes in vmap_in_axes[::-1]
+    )
+
+    seen_vmap_axis_sizes = []
+    get_heuristics_config = triton_config.get_heuristics_config
+
+    def my_heuristics_config(*args, **kwargs):
+      seen_vmap_axis_sizes.append(kwargs['vmap_axis_sizes'])
+      return get_heuristics_config(*args, **kwargs)
+
+    with mock.patch.object(
+        triton_config, 'get_heuristics_config', my_heuristics_config
+    ):
+      super()._test_layer_norm_vmap(axis, vmap_in_axes)
+
+    # We expect to see a shape for non-vmapped and each layer of vmap.
+    seen_vmap_axis_sizes = seen_vmap_axis_sizes[-1 :: -(len(vmap_in_axes) + 1)]
+    # We expect three calls from fwd, fwd res, and VJP.
+    self.assertEqual(seen_vmap_axis_sizes, [vmap_axis_sizes] * 3)
+
   def test_remat(self):
     rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
 
@@ -77,6 +95,30 @@ class JaxTritonNormalizationTest(test_base.NormalizationTestBase):
     # jax-triton lowers every kernel to the same `triton_kernel_call` target
     # (no per-kernel names like pallas), so we count the total instead of
     # per-name: remat gives fwd + recomputed fwd-res + vjp = 3.
+    hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
+    self.assertEqual(hlo.count('triton_kernel_call'), 3, msg=hlo)
+
+    g_out = g_remat_lowered.compile()(x, scale, offset)
+    chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
+
+  def test_remat_with_vmap(self):
+    rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
+
+    shape = (3, 128, 32)
+    x = jax.random.normal(rngs.pop(), shape)
+    scale = jax.random.uniform(rngs.pop(), (shape[0], shape[-1]))
+    offset = jax.random.uniform(rngs.pop(), (shape[0], shape[-1]))
+    epsilon = 1e-6
+
+    def f(x, scale, offset):
+      return self._norm_fn(x, scale, offset, epsilon=epsilon)
+
+    g_ref = jax.vmap(jax.value_and_grad(lambda *args: f(*args).sum()))
+    g_remat = jax.vmap(
+        jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
+    )
+    g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
+
     hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
     self.assertEqual(hlo.count('triton_kernel_call'), 3, msg=hlo)
 
