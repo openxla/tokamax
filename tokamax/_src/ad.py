@@ -15,17 +15,13 @@
 """Auto-differentiation utilities."""
 
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any
 
 import jax
 import jax.extend as jex
 
 
-R = TypeVar("R")
-T = TypeVar("T")
-
-
-def get_vjp_taking_residuals(
+def get_vjp_taking_residuals[T, R](
     fn: Callable[..., tuple[T, R]], *primals
 ) -> Callable[[R, T], Any] | None:
   """Attempts to create a VJP function with respect to the requested residuals.

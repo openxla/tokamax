@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import Any, ClassVar, TypeAlias, override
+from typing import Any, ClassVar, override
 
 import immutabledict
 import jax
@@ -38,8 +38,8 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as vjp
 # TODO: Make attention Config a pydantic discriminated union.
 ConfigSM90 = sm90.Config
 ConfigSM100 = sm100.Config
-Config = ConfigSM90 | ConfigSM100
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
+type Config = ConfigSM90 | ConfigSM100
+type Key = immutabledict.immutabledict[str, Any]
 Mask = base.Mask
 PagingInfo = base.PagingInfo
 QArray = base.QArray

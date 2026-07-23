@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import ClassVar, TypeAlias, override
+from typing import ClassVar, override
 
 import jax
 from jax.experimental import pallas as pl
@@ -31,8 +31,8 @@ from tokamax._src.ops.normalization import pallas_triton_vjp
 from tokamax._src.pallas import block
 
 
-Config: TypeAlias = pallas_triton_config.Config
-Key: TypeAlias = pallas_triton_config.Key
+Config = pallas_triton_config.Config
+Key = pallas_triton_config.Key
 FusedInputArray = base.FusedInputArray
 _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
 

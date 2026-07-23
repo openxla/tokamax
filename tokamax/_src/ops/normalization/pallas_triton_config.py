@@ -16,7 +16,7 @@
 
 from collections.abc import Sequence
 import math
-from typing import Any, TypeAlias
+from typing import Any
 
 import immutabledict
 import jax
@@ -34,7 +34,7 @@ class Config:
   num_warps: pydantic_lib.PowerOfTwo
 
 
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
+type Key = immutabledict.immutabledict[str, Any]
 
 
 def canonicalize_shape_3d(

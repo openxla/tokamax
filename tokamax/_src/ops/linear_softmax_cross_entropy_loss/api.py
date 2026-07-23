@@ -16,14 +16,14 @@
 """The Linear Softmax Cross-Entropy Loss Op API."""
 
 from collections.abc import Callable, Sequence
-from typing import Literal, TypeAlias
+from typing import Literal
 import jax
 from jaxtyping import Array, Integer, Real, Scalar  # pylint: disable=g-multiple-import, g-importing-member
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import chunked_xla
 
 
-Implementation: TypeAlias = Literal["mosaic_tpu", "xla", "chunked_xla"]
+type Implementation = Literal["mosaic_tpu", "xla", "chunked_xla"]
 
 IMPLEMENTATIONS = dict(
     xla=base.LinearSoftmaxCrossEntropyLoss(),

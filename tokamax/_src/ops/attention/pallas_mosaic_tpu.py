@@ -16,8 +16,8 @@
 
 import dataclasses
 import itertools
-from typing import Annotated, Any, ClassVar, TypeAlias
-from typing import Any, ClassVar, TypeAlias, override
+from typing import Annotated, Any, ClassVar, override
+
 import immutabledict
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -35,7 +35,7 @@ from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_
 QArray = base.QArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
+type Key = immutabledict.immutabledict[str, Any]
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)

@@ -16,7 +16,7 @@
 
 from collections.abc import Callable
 import functools
-from typing import Any, Final, Sequence, TypeAlias, cast
+from typing import Any, Final, Sequence, cast
 
 import immutabledict
 import jax
@@ -37,13 +37,13 @@ DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_FFI_KEY),
 )
 
-HloComputation: TypeAlias = (
+type HloComputation = (
     jax.stages.Lowered
     | ir.Module
 )
 
-TritonKernelInfo: TypeAlias = hlo_utils_common.TritonKernelInfo
-KernelInfoBase: TypeAlias = hlo_utils_common.KernelInfoBase
+TritonKernelInfo = hlo_utils_common.TritonKernelInfo
+KernelInfoBase = hlo_utils_common.KernelInfoBase
 
 
 def get_kernel_info(

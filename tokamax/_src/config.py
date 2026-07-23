@@ -18,14 +18,12 @@ import contextlib
 import dataclasses
 import sys
 import threading
-from typing import Generic, TypeVar
 
 from absl import flags
 
 
 _ABSENT = object()
 _STATE = threading.local()
-_T = TypeVar("_T")
 
 
 @contextlib.contextmanager
@@ -42,14 +40,12 @@ def _option_override_scope(name, value):
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _ConfigOption(Generic[_T]):
+class _ConfigOption[T]:
   """A configuration option."""
 
-  flag: flags.FlagHolder[_T]
+  flag: flags.FlagHolder[T]
 
-  def __call__(
-      self, value: _T | str
-  ) -> contextlib.AbstractContextManager[None]:
+  def __call__(self, value: T | str) -> contextlib.AbstractContextManager[None]:
     name = self.flag.name
     flag = self.flag._flagvalues[name]
 
@@ -61,7 +57,7 @@ class _ConfigOption(Generic[_T]):
     return _option_override_scope(name, value_)
 
   @property
-  def value(self) -> _T:
+  def value(self) -> T:
     if not flags.FLAGS.is_parsed():
       # `known_only=True` parses the flags absl actually defines (so any
       # `--tokamax_*` flags on the command line still take effect) and ignores

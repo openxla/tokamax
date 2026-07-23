@@ -16,7 +16,7 @@
 
 from collections.abc import Callable, Sequence
 import dataclasses
-from typing import Any, TypeVar, override
+from typing import Any, override
 
 import jax
 from jax.experimental import checkify
@@ -29,14 +29,13 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 
 
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
-Residuals = jax.Array | None
+# Type variables used below are defined in the generic class signature.
+type Residuals = jax.Array | None
 QArray = qwix.QArray
 AsQArray = quantization.AsQArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
-_DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset
-ActivationFunction = Callable[[jax.Array], jax.Array] | None
+type _DotAlgorithmLike = jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset
+type ActivationFunction = Callable[[jax.Array], jax.Array] | None
 
 DEFAULT_RAGGED_DOT_DIM_NUMS = jax.lax.RaggedDotDimensionNumbers(
     dot_dimension_numbers=(([1], [1]), ([], [])),
@@ -198,7 +197,7 @@ def generate_group_sizes(
 
 
 @dataclasses.dataclass(frozen=True)
-class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
+class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   """Ragged dot base class.
 
   For use in MegaBlocks-style models: https://arxiv.org/abs/2211.15841.
@@ -299,7 +298,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       precision: CanonicalPrecision,
       preferred_element_type: jnp.dtype | None,
       return_residuals: bool,
-      config: _Config,
+      config: C,
       activation: ActivationFunction | None = None,
       manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
@@ -341,7 +340,7 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     # `DotAlgorithmPreset` (https://github.com/jax-ml/jax/issues/32207).
     # TODO: Remove once the above is fixed.
     out_dtype = preferred_element_type or jnp.result_type(lhs, rhs)
-    if not isinstance(precision, _DotAlgorithmLike):
+    if not isinstance(precision, _DotAlgorithmLike.__value__):
       is_integer = jnp.issubdtype(out_dtype, jnp.integer)
       acc_dtype = jnp.int32 if is_integer else jnp.float32
       preferred_element_type = jnp.promote_types(out_dtype, acc_dtype)

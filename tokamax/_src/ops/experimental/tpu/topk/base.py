@@ -15,14 +15,13 @@
 """Base class for TopK operator."""
 
 import functools
-from typing import Any, TypeVar, override
+from typing import Any, override
+
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Int, Shaped
+from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
-
-_Config = TypeVar("_Config")
 
 
 @functools.partial(jax.jit, static_argnames=["k", "axis", "is_stable"])
@@ -56,7 +55,7 @@ def topk(
     return top_keys, top_values
 
 
-class TopK(op.Op[Any, tuple[jax.Array, jax.Array], None, _Config, Any]):
+class TopK[C](op.Op[Any, tuple[jax.Array, jax.Array], None, C, Any]):
   """Tokamax operator for TopK."""
 
   @jaxtyping.jaxtyped
@@ -107,7 +106,7 @@ class TopK(op.Op[Any, tuple[jax.Array, jax.Array], None, _Config, Any]):
       axis: int = -1,
       is_stable: bool = True,
       return_residuals: bool = False,
-      config: _Config | None = None,
+      config: C | None = None,
   ) -> tuple[tuple[jax.Array, jax.Array], None]:
     return (
         topk(operand, k, values, axis=axis, is_stable=is_stable),

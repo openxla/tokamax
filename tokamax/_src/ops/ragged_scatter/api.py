@@ -15,13 +15,13 @@
 """Public user-facing API for Ragged Scatter."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
 import immutabledict
 import jax
 from tokamax._src.ops.ragged_scatter import base
 
-Implementation: TypeAlias = Literal["xla", "mosaic", "mosaic_tpu"]
+type Implementation = Literal["xla", "mosaic", "mosaic_tpu"]
 
 _IMPLEMENTATIONS = dict(xla=base.RaggedScatter())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)

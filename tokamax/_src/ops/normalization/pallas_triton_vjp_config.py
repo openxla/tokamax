@@ -15,7 +15,6 @@
 """Pallas-Triton normalization VJP configuration."""
 
 import dataclasses
-from typing import TypeAlias
 
 import immutabledict
 import jax
@@ -32,7 +31,7 @@ class Config:
   num_warps: pydantic_lib.PowerOfTwo
 
 
-Key: TypeAlias = pallas_triton_config.Key
+Key = pallas_triton_config.Key
 
 
 def get_heuristics_config(

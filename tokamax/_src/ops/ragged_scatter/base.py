@@ -14,15 +14,13 @@
 # ==============================================================================
 """Baseline JAX implementation of Ragged Scatter."""
 
-from typing import Any, TypeVar
+from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Int, Shaped
-from tokamax._src.ops import op
+from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
-
-_Config = TypeVar("_Config")
+from tokamax._src.ops import op
 
 
 def ragged_scatter(
@@ -37,7 +35,7 @@ def ragged_scatter(
   return jnp.where(mask[:, None], out, 0)
 
 
-class RaggedScatter(op.Op[Any, jax.Array, None, _Config, Any]):
+class RaggedScatter[C](op.Op[Any, jax.Array, None, C, Any]):
   """Tokamax operator for Ragged Scatter."""
 
   @jaxtyping.jaxtyped
@@ -67,7 +65,7 @@ class RaggedScatter(op.Op[Any, jax.Array, None, _Config, Any]):
       end: Int[Array, "1"] | Int[Array, ""],
       *,
       return_residuals: bool = False,
-      config: _Config | None = None,
+      config: C | None = None,
   ) -> tuple[jax.Array, None]:
     del return_residuals, config
     return ragged_scatter(x, indices, start, end), None

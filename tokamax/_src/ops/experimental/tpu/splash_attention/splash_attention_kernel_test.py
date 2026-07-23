@@ -16,7 +16,7 @@
 from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, TypeVar
+from typing import Any
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -47,7 +47,7 @@ hp.settings.register_profile(
 hp.settings.load_profile(name="deterministic")
 
 partial = functools.partial
-Draw = TypeVar("Draw", bound=Callable[[hps.SearchStrategy[Any]], Any])
+type Draw = Callable[[hps.SearchStrategy[Any]], Any]
 
 
 @dataclasses.dataclass

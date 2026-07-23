@@ -14,14 +14,12 @@
 # ==============================================================================
 """Base class for Ragged Gather."""
 
-from typing import Any, TypeVar, override
+from typing import Any, override
+
 import jax
 from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
-
-
-_Config = TypeVar("_Config")
 
 
 def ragged_gather(
@@ -31,7 +29,7 @@ def ragged_gather(
   return x[indices]
 
 
-class RaggedGather(op.Op[Any, jax.Array, None, _Config, Any]):
+class RaggedGather[C](op.Op[Any, jax.Array, None, C, Any]):
   """Tokamax operator for Ragged Gather."""
 
   @jaxtyping.jaxtyped
@@ -63,7 +61,7 @@ class RaggedGather(op.Op[Any, jax.Array, None, _Config, Any]):
       end: Int[Array, "1"],
       *,
       return_residuals: bool = False,
-      config: _Config | None = None,
+      config: C | None = None,
   ) -> tuple[jax.Array, None]:
     return (
         ragged_gather(x, indices, start, end),

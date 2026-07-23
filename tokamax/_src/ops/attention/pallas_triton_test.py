@@ -14,7 +14,7 @@
 # ==============================================================================
 
 import sys
-from typing import TypeAlias, override
+from typing import override
 from unittest import mock
 import pytest
 from absl.testing import absltest
@@ -86,7 +86,7 @@ class PallasTritonFlashAttentionTest(test_base.AttentionTestBase):
 
   @parameterized.parameters(1, 2)
   def test_small_block_q(self, block_q: int):
-    Config: TypeAlias = fa.Config
+    Config = fa.Config
     config = Config(block_q=block_q, block_k=64, num_warps=4, num_stages=2)
     assert isinstance(self._attention_fn, fa.PallasTritonFlashAttention)
     impl = self._attention_fn.replace(config=config)

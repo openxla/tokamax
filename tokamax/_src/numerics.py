@@ -17,7 +17,7 @@
 import abc
 from concurrent import futures
 import dataclasses
-from typing import Any, TypeAlias
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -27,7 +27,7 @@ from tokamax._src import batching
 from tokamax._src import utils
 
 
-PyTree: TypeAlias = Any
+type PyTree = Any
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

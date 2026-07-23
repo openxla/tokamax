@@ -16,7 +16,7 @@
 
 from collections.abc import Callable
 import functools
-from typing import Any, ClassVar, Literal, TypeVar, overload, override
+from typing import Any, ClassVar, Literal, overload, override
 
 import jax
 import jax.numpy as jnp
@@ -33,8 +33,7 @@ CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
 
 
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
+# Type variables used below are defined in the generic class signature.
 # The attention residuals come from the softmax calculation:
 # `(maximum softmax input values, softmax denominator)`.
 Residuals = tuple[Float[Array, "*B H T"], Float[Array, "*B H T"]]
@@ -42,8 +41,8 @@ ScoreMod = Callable[[Float[Array, "*B H T t"]], Float[Array, "*B H T t"]]
 MaskMod = Callable[[tuple[int, ...]], Bool[Array, "*#B #H #T #t"]]
 
 
-class FlexAttention(
-    op.Op[Any, Float[Array, "*B T H d"], Residuals, _Config, _Key]
+class FlexAttention[C, K](
+    op.Op[Any, Float[Array, "*B T H d"], Residuals, C, K]
 ):
   """FlexAttention function."""
 
@@ -245,7 +244,7 @@ class FlexAttention(
       dropout_rate: float,
       normalize_output: bool,
       return_residuals: bool,
-      config: _Config,
+      config: C,
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     del config  # Unused.
 

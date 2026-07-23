@@ -14,8 +14,8 @@
 # ==============================================================================
 """Gated linear unit op."""
 
-from collections.abc import Callable
-from typing import Any, TypeAlias, TypeVar, override
+from collections.abc import Callable, Hashable
+from typing import Any, override
 
 import jax
 import jax.numpy as jnp
@@ -26,17 +26,13 @@ from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
 
 
-_T = TypeVar('_T')
-_Config = TypeVar('_Config')
-_Key = TypeVar('_Key')
-_FwdFn = Callable[[jax.Array, jax.Array], _T]
-FusedWeights: TypeAlias = Float[Array, 'K 2 N']
-UnfusedWeights: TypeAlias = tuple[Float[Array, 'K N'], Float[Array, 'K N']]
-Residuals: TypeAlias = Float[Array, '*B M 2 N']
+type FusedWeights = Float[Array, 'K 2 N']
+type UnfusedWeights = tuple[Float[Array, 'K N'], Float[Array, 'K N']]
+type Residuals = Float[Array, '*B M 2 N']
 CanonicalPrecision = precision_lib.CanonicalPrecision
 
 
-class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
+class GatedLinearUnit[C, K: Hashable](op.Op[Any, jax.Array, Residuals, C, K]):
   """Gated linear unit."""
 
   def __post_init__(self):
@@ -73,7 +69,7 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       activation: Callable[[jax.Array], jax.Array] | None,
       precision: CanonicalPrecision,
       return_residuals: bool,
-      config: _Config,
+      config: C,
   ) -> tuple[Float[Array, '*B M N'], Residuals | None]:
     """Applies a gated linear unit (https://arxiv.org/abs/1612.08083).
 
@@ -123,9 +119,12 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     out = (gate * projection).astype(x.dtype)
     return out, (y if return_residuals else None)
 
-  def _with_vmap(
-      self, fwd: _FwdFn, *, fallback_to_sequential: bool = True
-  ) -> _FwdFn:
+  def _with_vmap[T](
+      self,
+      fwd: Callable[[jax.Array, jax.Array], T],
+      *,
+      fallback_to_sequential: bool = True,
+  ) -> Callable[[jax.Array, jax.Array], T]:
     """Applies a vmap rule to a fwd function."""
     fwd_vmap = jax.custom_batching.custom_vmap(fwd)
 
@@ -148,18 +147,10 @@ class GatedLinearUnit(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     return fwd_vmap
 
 
-class GatedLinearUnitVjp(
-    op.Op[
-        Any,
-        tuple[
-            Float[Array, '*B M K'],
-            FusedWeights | UnfusedWeights,
-        ],
-        Any,
-        _Config,
-        _Key,
-    ]
-):
+type Grads = tuple[Float[Array, '*B M K'], FusedWeights | UnfusedWeights]
+
+
+class GatedLinearUnitVjp[C, K](op.Op[Any, Grads, Any, C, K]):
   """Gated linear unit VJP."""
 
   @override
@@ -174,14 +165,8 @@ class GatedLinearUnitVjp(
       activation: Callable[[jax.Array], jax.Array] | None,
       precision: CanonicalPrecision,
       return_residuals: bool,
-      config: _Config,
-  ) -> tuple[
-      tuple[
-          Float[Array, '*B M K'],
-          FusedWeights | UnfusedWeights,
-      ],
-      None,
-  ]:
+      config: C,
+  ) -> tuple[Grads, None]:
     """Gated linear unit VJP."""
     if return_residuals:
       raise NotImplementedError('`return_residuals=True` is not supported.')

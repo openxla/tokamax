@@ -15,7 +15,7 @@
 """Triangle Multiplication API."""
 
 from collections.abc import Sequence
-from typing import Final, Literal, TypeAlias
+from typing import Final, Literal
 
 import jax
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
@@ -23,7 +23,7 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops.triangle_multiplication import base
 
 
-Implementation: TypeAlias = Literal["xla", "triton", "mosaic"]
+type Implementation = Literal["xla", "triton", "mosaic"]
 
 IMPLEMENTATIONS = dict(xla=base.TriangleMultiplication())
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = ("xla",)

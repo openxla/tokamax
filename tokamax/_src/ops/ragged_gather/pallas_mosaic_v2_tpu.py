@@ -14,7 +14,8 @@
 # ==============================================================================
 """Pallas/Mosaic operator implementation v2 for Ragged Gather on TPU."""
 
-from typing import TypeVar, override
+from typing import override
+
 import jax
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
@@ -23,10 +24,7 @@ from tokamax._src.ops.ragged_gather import base
 from tokamax._src.ops.ragged_gather import pallas_mosaic_v2_tpu_kernel
 
 
-_Config = TypeVar("_Config")
-
-
-class PallasV2TpuRaggedGather(base.RaggedGather[_Config]):
+class PallasV2TpuRaggedGather[C](base.RaggedGather[C]):
   """Tokamax operator invoking the Pallas kernel V2 for Ragged Gather."""
 
   @override
@@ -39,7 +37,7 @@ class PallasV2TpuRaggedGather(base.RaggedGather[_Config]):
       end: Int[Array, "1"],
       *,
       return_residuals: bool = False,
-      config: _Config | None = None,
+      config: C | None = None,
   ) -> tuple[jax.Array, None]:
     return (
         pallas_mosaic_v2_tpu_kernel.ragged_gather_pallas(

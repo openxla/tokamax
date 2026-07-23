@@ -15,7 +15,7 @@
 """Triangle multiplication op."""
 
 from collections.abc import Sequence
-from typing import Any, Literal, TypeAlias, TypeVar, override
+from typing import Any, Literal, override
 
 import jax
 import jax.numpy as jnp
@@ -27,14 +27,12 @@ from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.normalization import api as norm_api
 
 
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
-Implementation: TypeAlias = Literal["xla", "triton"]
-Residuals: TypeAlias = None
+type Implementation = Literal["xla", "triton"]
+type Residuals = None
 CanonicalPrecision = precision_lib.CanonicalPrecision
 
 
-class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
+class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   """Triangle multiplicative update."""
 
   @override
@@ -96,7 +94,7 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       epsilon: float,
       return_residuals: bool,
       implementation: Implementation | Sequence[Implementation] | None,
-      config: _Config,
+      config: C,
   ) -> tuple[Float[Array, "N N D"], Residuals]:
     """Triangle multiplicative update.
 

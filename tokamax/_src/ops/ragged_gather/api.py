@@ -15,13 +15,13 @@
 """Ragged gather API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
 import immutabledict
 import jax
 from tokamax._src.ops.ragged_gather import base
 
-Implementation: TypeAlias = Literal["xla", "mosaic", "mosaic_tpu", "mosaic_tpu_v2"]
+type Implementation = Literal["xla", "mosaic", "mosaic_tpu", "mosaic_tpu_v2"]
 
 _IMPLEMENTATIONS = dict(xla=base.RaggedGather())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)

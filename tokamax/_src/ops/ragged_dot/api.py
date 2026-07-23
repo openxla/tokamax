@@ -15,7 +15,7 @@
 """Ragged dot API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
 import immutabledict
 import jax
@@ -26,7 +26,7 @@ from tokamax._src.ops.ragged_dot import base
 
 
 QArray = qwix.QArray
-Implementation: TypeAlias = Literal["mosaic", "triton", "xla"]
+type Implementation = Literal["mosaic", "triton", "xla"]
 
 _IMPLEMENTATIONS = dict(xla=base.RaggedDot())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)

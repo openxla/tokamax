@@ -14,20 +14,17 @@
 # ==============================================================================
 """MultiHeadLatentAttention operator definition."""
 
-from typing import Any, TypeVar, override
+from typing import Any, override
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.mla import reference
 
 
-_Config = TypeVar("_Config")
-
-
-class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
+class MultiHeadLatentAttention[C](op.Op[Any, Any, None, C, Any]):
   """Tokamax operator for Multi-Head Latent Attention."""
 
   @jaxtyping.jaxtyped
@@ -98,12 +95,8 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
   @jaxtyping.jaxtyped
   def _fwd(
       self,
-      ql_nope: Float[
-          Array, "max_num_tokens actual_num_q_heads actual_lkv_dim"
-      ],
-      q_pe: Float[
-          Array, "max_num_tokens actual_num_q_heads actual_r_dim"
-      ],
+      ql_nope: Float[Array, "max_num_tokens actual_num_q_heads actual_lkv_dim"],
+      q_pe: Float[Array, "max_num_tokens actual_num_q_heads actual_r_dim"],
       new_kv_c: Float[Array, "max_num_tokens actual_lkv_dim"],
       new_k_pe: Float[Array, "max_num_tokens actual_r_dim"],
       cache_kv: Float[
@@ -125,7 +118,7 @@ class MultiHeadLatentAttention(op.Op[Any, Any, None, _Config, Any]):
       s_dtype: jax.typing.DTypeLike = jnp.bfloat16,
       debug_mode: bool = False,
       return_residuals: bool = False,
-      config: _Config | None = None,
+      config: C | None = None,
   ) -> tuple[tuple[jax.Array, jax.Array], None]:
 
     return (

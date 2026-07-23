@@ -15,7 +15,7 @@
 """Layer Normalization API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
 from absl import logging
 import immutabledict
@@ -24,7 +24,7 @@ from tokamax._src import gpu_utils
 from tokamax._src.ops.normalization import base
 
 
-Implementation: TypeAlias = Literal['xla', 'triton']
+type Implementation = Literal['xla', 'triton']
 
 _IMPLEMENTATIONS = dict(xla=base.Normalization())
 _DEFAULT_IMPLEMENTATIONS = ('xla',)

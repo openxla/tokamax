@@ -16,9 +16,8 @@
 
 from importlib import resources
 import re
-import traceback
 from typing import Annotated
-from typing import Any, Final, Sequence, TypeAlias
+from typing import Any, Final, Sequence
 
 from absl import logging
 import immutabledict
@@ -29,7 +28,7 @@ from tokamax._src.autotuning import autotuner
 
 AutotuningData = autotuner.AutotuningData
 DeviceKind = str
-DeviceAutotuningCache: TypeAlias = dict[Any, AutotuningData[Any]]
+type DeviceAutotuningCache = dict[Any, AutotuningData[Any]]
 
 
 CACHE_PATH: Final[str] = "data/autotuning"

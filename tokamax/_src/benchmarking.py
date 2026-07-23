@@ -27,7 +27,7 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Any, Final, Literal, TypeAlias, TypeVar, overload
+from typing import Any, Final, Literal, overload
 
 import jax
 from jax.experimental.mosaic.gpu import profiler
@@ -38,21 +38,13 @@ from tokamax._src import utils
 
 xprof_session, profile_data = None, None  # stubs for internal benchmarking
 
-BenchmarkMode: TypeAlias = Literal[
-    'forward', 'forward_res', 'vjp', 'forward_and_vjp'
-]
-
-PyTree = Any
-
+type BenchmarkMode = Literal['forward', 'forward_res', 'vjp', 'forward_and_vjp']
 # Timer functions return the time delta in ms and a dictionary of metadata.
-Timer: TypeAlias = Callable[[bool], tuple[float, dict[str, Any]]]
+type Timer = Callable[[bool], tuple[float, dict[str, Any]]]
+type TimingMethod = Literal['wallclock', 'cupti', 'xprof', 'hermetic_xprof']
 
-T = TypeVar('T')
-RetT: TypeAlias = T | list[jax.Array] | tuple[T, list[jax.Array]]
-
-TimingMethod: TypeAlias = Literal[
-    'wallclock', 'cupti', 'xprof', 'hermetic_xprof'
-]
+type PyTree = Any
+type Ret[T] = T | list[jax.Array] | tuple[T, list[jax.Array]]
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +63,7 @@ def get_tempdir(
 
 
 @jax.custom_vjp
-def _optimization_barrier(x: T) -> T:
+def _optimization_barrier[T](x: T) -> T:
   return jax.lax.optimization_barrier(x)
 
 
@@ -308,37 +300,37 @@ _ARRAY_TYPES = (
 
 
 @overload
-def standardize_function(  # pyrefly: ignore[inconsistent-overload]
+def standardize_function[T](  # pyrefly: ignore[inconsistent-overload]
     f: Callable[..., T],
     *args: PyTree,
     kwargs: Mapping[str, PyTree] | None = None,
     mode: BenchmarkMode = ...,
     seed: int = ...,
-) -> tuple[Callable[[list[jax.Array]], RetT], list[jax.Array]]:
+) -> tuple[Callable[[list[jax.Array]], Ret[T]], list[jax.Array]]:
   ...
 
 
 @overload
-def standardize_function(
+def standardize_function[T](
     f: Callable[..., T],
     *args: PyTree,
     kwargs: Mapping[str, PyTree] | None = None,
     mode: BenchmarkMode = ...,
-    seed: None,
+    seed: None = None,
 ) -> tuple[
-    Callable[[list[jax.Array]], RetT], list[jax.Array | jax.ShapeDtypeStruct]
+    Callable[[list[jax.Array]], Ret[T]], list[jax.Array | jax.ShapeDtypeStruct]
 ]:
   ...
 
 
-def standardize_function(
+def standardize_function[T](
     f: Callable[..., T],
     *args: PyTree,
     kwargs: Mapping[str, PyTree] | None = None,
     mode: BenchmarkMode = 'forward',
     seed: int | None = 0,
 ) -> tuple[
-    Callable[[list[jax.Array]], RetT], list[jax.Array | jax.ShapeDtypeStruct]
+    Callable[[list[jax.Array]], Ret[T]], list[jax.Array | jax.ShapeDtypeStruct]
 ]:
   """Creates a standardized function for testing and benchmarking.
 
@@ -424,7 +416,7 @@ def standardize_function(
   return func, arrays
 
 
-def wallclock_timer(f: Callable[[T], Any], args: T) -> Timer:
+def wallclock_timer[T](f: Callable[[T], Any], args: T) -> Timer:
   def timer(_):
     jax.block_until_ready(f(args))  # Warmup.
     start_time = time.perf_counter()
@@ -434,12 +426,12 @@ def wallclock_timer(f: Callable[[T], Any], args: T) -> Timer:
   return timer
 
 
-def cupti_timer(f: Callable[[T], Any], args: T) -> Timer:
+def cupti_timer[T](f: Callable[[T], Any], args: T) -> Timer:
   timer = profiler.Cupti(finalize=False).measure(f)
   return lambda _: (timer(args)[1], {})
 
 
-def xprof_timer(
+def xprof_timer[T](
     f: Callable[[T], Any], args: T, event_filter_regex: str | None = None
 ) -> Timer:
   def timer(return_metadata):
@@ -455,14 +447,14 @@ def xprof_timer(
   return timer
 
 
-def hermetic_xprof_timer(
+def hermetic_xprof_timer[T](
     f: Callable[[T], Any], args: T, event_filter_regex: str | None = None
 ) -> Timer:
   timer = xprof_timer(f, args, event_filter_regex=event_filter_regex)
   return lambda _: timer(False)
 
 
-_TIMERS: dict[str, Callable[[Callable[[T], Any], T], Timer]] = {
+_TIMERS: dict[str, Callable[[Callable[[Any], Any], Any], Timer]] = {
     'wallclock': wallclock_timer,
     'cupti': cupti_timer,
     'xprof': xprof_timer,
@@ -482,7 +474,7 @@ def _is_concrete(x):
   return x is not None
 
 
-def compile_benchmark(
+def compile_benchmark[T](
     f: Callable[[T], Any], x: T
 ) -> Callable[..., BenchmarkData]:
   """Compiles a function and returns a function to benchmark it.
@@ -571,7 +563,7 @@ def compile_benchmark(
   return runner
 
 
-def benchmark(
+def benchmark[T](
     f: Callable[[T], Any],
     x: T,
     *,

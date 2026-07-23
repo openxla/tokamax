@@ -17,8 +17,9 @@
 from collections.abc import Callable
 import dataclasses
 import functools
-from typing import ClassVar, override
+from typing import Any, ClassVar, override
 
+import immutabledict
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-importing-member,g-multiple-import
@@ -33,6 +34,7 @@ from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_kernel_sm90 as 
 
 Residuals = base.Residuals
 Config = common.Config
+type Key = immutabledict.immutabledict[str, Any]
 
 
 def _get_kernel_module():
@@ -44,7 +46,7 @@ def _get_kernel_module():
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class PallasMosaicGpuGatedLinearUnit(base.GatedLinearUnit[Config, None]):
+class PallasMosaicGpuGatedLinearUnit(base.GatedLinearUnit[Config, Key]):
   """Pallas-Mosaic-GPU gated linear unit."""
 
   config_cls: ClassVar[type[Config]] = Config

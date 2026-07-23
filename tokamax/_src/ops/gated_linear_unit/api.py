@@ -15,7 +15,7 @@
 """Gated linear unit API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
 from absl import logging
 import immutabledict
@@ -25,7 +25,7 @@ from tokamax._src import gpu_utils
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 
-Implementation: TypeAlias = Literal['mosaic', 'triton', 'xla']
+type Implementation = Literal['mosaic', 'triton', 'xla']
 
 _IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
 _DEFAULT_IMPLEMENTATIONS = ('xla',)

@@ -16,7 +16,7 @@
 
 import functools
 import sys
-from typing import Any, TypeAlias
+from typing import Any
 from unittest import mock
 
 from einshape.src.jax import jax_ops as einshape_jax
@@ -26,8 +26,8 @@ from jax.experimental import pallas as pl
 import jax.numpy as jnp
 
 
-PyTree = Any
-SymbolicDim: TypeAlias = type(export.symbolic_shape("_a")[0])  # pytype: disable=invalid-annotation
+type PyTree = Any
+SymbolicDim = type(export.symbolic_shape("_a")[0])  # pytype: disable=invalid-annotation
 
 einshape = lambda eq, **kw: functools.partial(einshape_jax.einshape, eq, **kw)
 

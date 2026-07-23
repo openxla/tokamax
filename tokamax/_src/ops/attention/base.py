@@ -18,7 +18,8 @@ from collections.abc import Callable, Hashable
 import dataclasses
 import functools
 import math
-from typing import Any, Literal, NotRequired, ParamSpec, TypeVar, TypedDict, cast, overload, override
+from typing import Any, Literal, NotRequired, TypedDict, cast, overload, override
+
 import jax
 from jax import export
 from jax.experimental import shard_map
@@ -207,15 +208,13 @@ class PagingInfo:
   lengths: Int[Array, "*#b"]
 
 
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key", bound=Hashable)
 # The attention residuals come from the softmax calculation:
 # `(maximum softmax input values, softmax denominator)`.
-Residuals = tuple[Float[Array, "*B H T"], Float[Array, "*B H T"]]
+type Residuals = tuple[Float[Array, "*B H T"], Float[Array, "*B H T"]]
 
 
-class DotProductAttention(
-    op.Op[Any, Float[Array, "*B T H d"], Residuals, _Config, _Key]
+class DotProductAttention[C, K: Hashable](
+    op.Op[Any, Float[Array, "*B T H d"], Residuals, C, K]
 ):
   """Dot product attention function."""
 
@@ -579,7 +578,7 @@ class DotProductAttention(
       k_indices: Int[Array, "*#b #h t"] | None,
       normalize_output: bool,
       return_residuals: bool,
-      config: _Config,
+      config: C,
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     del config  # Unused.
 
@@ -769,14 +768,10 @@ def unfold_q_sequence_heads(
   return out, cast(Residuals, tuple(map(reshape, residuals)))
 
 
-_P = ParamSpec("_P")
-_T = TypeVar("_T")
-
-
-def vmap_batch_dims(f: Callable[_P, _T]) -> Callable[_P, _T]:
+def vmap_batch_dims[**P, T](f: Callable[P, T]) -> Callable[P, T]:  # pytype: disable=not-supported-yet
   """Returns `f` vmapped over the batch dims of its first argument."""
 
-  def vmap(f, *args: _P.args, **kwargs: _P.kwargs):
+  def vmap(f, *args: P.args, **kwargs: P.kwargs):
     assert not kwargs
     for _ in cast(jax.Array, args[0]).shape[:-3]:
       f = batching.vmap_maybe_bcast(f, 0)
@@ -809,8 +804,8 @@ class DotProductAttentionGrads(TypedDict):
   bias: NotRequired[Float[Array, "*#B #H #T #t"] | None]
 
 
-class DotProductAttentionVjp(
-    op.Op[Any, DotProductAttentionGrads, None, _Config, _Key]
+class DotProductAttentionVjp[C, K: Hashable](
+    op.Op[Any, DotProductAttentionGrads, None, C, K]
 ):
   """Dot product attention VJP."""
 
@@ -838,7 +833,7 @@ class DotProductAttentionVjp(
       k_indices: Int[Array, "*#b #h t"] | None,
       normalize_output: bool,
       return_residuals: bool,
-      config: _Config,
+      config: C,
   ) -> tuple[DotProductAttentionGrads, None]:
     """Computes attention VJP."""
     del config  # Unused.

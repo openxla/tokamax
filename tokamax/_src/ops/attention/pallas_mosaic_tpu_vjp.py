@@ -15,10 +15,8 @@
 """Flash attention with Mosaic TPU VJP."""
 
 import dataclasses
-import functools
 import itertools
-from typing import Annotated, Any, ClassVar, Final, TypeAlias
-from typing import Any, ClassVar, Final, TypeAlias, override
+from typing import Annotated, Any, ClassVar, override
 
 import immutabledict
 import jax
@@ -36,7 +34,7 @@ from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_
 QArray = base.QArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
+type Key = immutabledict.immutabledict[str, Any]
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)

@@ -14,15 +14,13 @@
 # ==============================================================================
 """Base class for Ragged Gather Reduce."""
 
-from typing import Any, TypeVar, override
+from typing import Any, override
 
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
-
-_Config = TypeVar("_Config")
 
 
 def ragged_gather_reduce(
@@ -39,7 +37,7 @@ def ragged_gather_reduce(
   return jnp.sum(out, axis=1).astype(x.dtype)
 
 
-class RaggedGatherReduce(op.Op[Any, jax.Array, None, _Config, Any]):
+class RaggedGatherReduce[C](op.Op[Any, jax.Array, None, C, Any]):
   """Tokamax operator for Ragged Gather Reduce."""
 
   @jaxtyping.jaxtyped
@@ -73,7 +71,7 @@ class RaggedGatherReduce(op.Op[Any, jax.Array, None, _Config, Any]):
       *,
       reduce_group_size: int,
       return_residuals: bool = False,
-      config: _Config | None = None,
+      config: C | None = None,
   ) -> tuple[jax.Array, None]:
     return (
         ragged_gather_reduce(

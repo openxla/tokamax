@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping
 import dataclasses
 import inspect
 import json
-from typing import Annotated, Any, Final, ParamSpec, Self, Sequence, TypeAlias, cast
+from typing import Annotated, Any, Final, Self, Sequence, cast
 
 from absl import logging
 import immutabledict
@@ -49,7 +49,7 @@ from tokamax._src.ops.ragged_scatter import api as ragged_scatter_api
 from tokamax._src.ops.ragged_scatter import base as ragged_scatter_base
 import tqdm
 
-BoundArgsAutotuningData: TypeAlias = tuple[
+type BoundArgsAutotuningData = tuple[
     op_lib.BoundArguments, autotuner.AutotuningData[Any]
 ]
 
@@ -193,17 +193,16 @@ class AutotuningResult:
 
 _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
 _BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_lib.BoundArguments)
-_P = ParamSpec("_P")
 
 
-def get_bound_args(
+def get_bound_args[**P](
     f: (
-        Callable[_P, Any]
+        Callable[P, Any]
         | hlo_utils.HloComputation
     ),
-    *args: _P.args,
-    **kwargs: _P.kwargs,
-) -> tuple[op_lib.BoundArguments, ...]:
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> tuple[op_lib.BoundArguments, ...]:  # pytype: disable=not-supported-yet
   """Returns a tuple of unique BoundArguments for all Tokamax ops in `f`.
 
   Args:
@@ -252,13 +251,13 @@ def dump_bound_args_to_json(bound_args: Sequence[op_lib.BoundArguments]) -> str:
   return json.dumps(json_list, indent=2)
 
 
-def bound_args_to_json(
+def bound_args_to_json[**P](
     f: (
         Callable[[], Any]
         | jax.stages.Lowered
     ),
     filename: str,
-) -> None:
+) -> None:  # pytype: disable=not-supported-yet
   """Dumps a sequence of BoundArguments to a JSON file."""
   bound_args = get_bound_args(f)  # pyrefly: ignore[invalid-param-spec]
   json_string = dump_bound_args_to_json(bound_args)
