@@ -26,15 +26,15 @@ import triton.language as tl
 from tokamax._src import gpu_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.normalization import base
-from tokamax._src.ops.normalization import pallas_triton_config
-from tokamax._src.ops.normalization import pallas_triton_vjp_config
+from tokamax._src.ops.normalization import triton_config
+from tokamax._src.ops.normalization import triton_vjp_config
 from typing_extensions import override
 
 
-Config: TypeAlias = pallas_triton_config.Config
-Key: TypeAlias = pallas_triton_config.Key
-VjpConfig: TypeAlias = pallas_triton_vjp_config.Config
-VjpKey: TypeAlias = pallas_triton_vjp_config.Key
+Config: TypeAlias = triton_config.Config
+Key: TypeAlias = triton_config.Key
+VjpConfig: TypeAlias = triton_vjp_config.Config
+VjpKey: TypeAlias = triton_vjp_config.Key
 FusedInputArray = base.FusedInputArray
 Residuals = base.Residuals
 _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
@@ -268,7 +268,7 @@ class JaxTritonNormalization(base.Normalization[Config, Key]):
       x = x()
 
     orig_x_shape = x.shape
-    x_shape = pallas_triton_config.canonicalize_shape_3d(orig_x_shape, axis)
+    x_shape = triton_config.canonicalize_shape_3d(orig_x_shape, axis)
     x = x.reshape(x_shape)
     M, A, N = x_shape
     num_rows = M * N
@@ -330,19 +330,19 @@ class JaxTritonNormalization(base.Normalization[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return pallas_triton_config.get_heuristics_config(
+    return triton_config.get_heuristics_config(
         *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
     )
 
   @override
   def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
-    return pallas_triton_config.get_key(*ba.args, **ba.kwargs)
+    return triton_config.get_key(*ba.args, **ba.kwargs)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     x = ba.args[0]
     axis = ba.kwargs['axis']
-    x_shape = pallas_triton_config.canonicalize_shape(x.shape, axis)
+    x_shape = triton_config.canonicalize_shape(x.shape, axis)
     configs = set()
     for num_warps in [1, 2, 4, 8, 16]:
       for block_m in [1, 2, 4, 8, 16, 32, 64]:
@@ -402,7 +402,7 @@ class JaxTritonNormalizationVjp(base.NormalizationVjp[VjpConfig, VjpKey]):
       raise ValueError('`mean` residual inconsistent with `subtract_mean`.')
 
     orig_x_shape = x.shape
-    x_shape = pallas_triton_config.canonicalize_shape_3d(x.shape, axis)
+    x_shape = triton_config.canonicalize_shape_3d(x.shape, axis)
     x = x.reshape(x_shape)
     dout = dout.reshape(x_shape)
     M, A, N = x_shape
@@ -466,18 +466,18 @@ class JaxTritonNormalizationVjp(base.NormalizationVjp[VjpConfig, VjpKey]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> VjpConfig:
-    return pallas_triton_vjp_config.get_heuristics_config(
+    return triton_vjp_config.get_heuristics_config(
         *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
     )
 
   @override
   def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> VjpKey:
-    return pallas_triton_vjp_config.get_key(*ba.args, **ba.kwargs)
+    return triton_vjp_config.get_key(*ba.args, **ba.kwargs)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[VjpConfig]:
     axis = ba.kwargs['axis']
-    dout_shape = pallas_triton_config.canonicalize_shape(ba.args[2].shape, axis)
+    dout_shape = triton_config.canonicalize_shape(ba.args[2].shape, axis)
     configs = set()
     for num_warps in [1, 2, 4, 8, 16]:
       for block_m in [1, 2, 4, 8, 16, 32, 64, 128]:

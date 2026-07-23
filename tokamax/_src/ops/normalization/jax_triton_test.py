@@ -22,7 +22,7 @@ from absl.testing import absltest
 import chex
 import jax
 from tokamax._src.ops.normalization import jax_triton
-from tokamax._src.ops.normalization import pallas_triton_config
+from tokamax._src.ops.normalization import triton_config
 from tokamax._src.ops.normalization import test_base
 
 
@@ -62,14 +62,14 @@ class JaxTritonNormalizationTest(test_base.NormalizationTestBase):
     )
 
     seen_vmap_axis_sizes = []
-    get_heuristics_config = pallas_triton_config.get_heuristics_config
+    get_heuristics_config = triton_config.get_heuristics_config
 
     def my_heuristics_config(*args, **kwargs):
       seen_vmap_axis_sizes.append(kwargs['vmap_axis_sizes'])
       return get_heuristics_config(*args, **kwargs)
 
     with mock.patch.object(
-        pallas_triton_config, 'get_heuristics_config', my_heuristics_config
+        triton_config, 'get_heuristics_config', my_heuristics_config
     ):
       super()._test_layer_norm_vmap(axis, vmap_in_axes)
 
