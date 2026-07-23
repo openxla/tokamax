@@ -15,7 +15,6 @@
 """Native Triton normalization op via jax-triton."""
 
 import dataclasses
-import functools
 from typing import ClassVar, TypeAlias
 
 import jax
@@ -42,32 +41,29 @@ _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
 
 
 def _vmappable(launch):
-  """Adds a `jax.vmap` batching rule to a `jt.triton_call` `launch(*arrays)`.
+  """Adds a `jax.vmap` batching rule that folds the batch into the row dim.
 
-  `jt.triton_call` raises under `vmap` (the batching rule is inherently
+  `jt.triton_call` raises under `vmap` (its batching rule is inherently
   per-kernel, so jax-triton refuses to guess). Normalization batching is just
-  extra rows, so we fold the batch axis with `lax.map`, whose body launches the
-  kernel per slice with no `vmap` tracer. Correct for batched `scale`/`offset`
-  and nested `vmap`. Outside `vmap` this calls `launch` directly (no overhead).
+  extra rows, so we merge each `vmap` axis into the leading batch dimension of
+  every argument and issue a single batch-aware launch.
   """
   f = jax.custom_batching.custom_vmap(launch)
 
   @f.def_vmap
   def _rule(axis_size, in_batched, *arrays):
-    del axis_size
-    idx = [i for i, b in enumerate(in_batched) if b]
-    if not idx:  # Nothing batched (shouldn't happen under `vmap`).
-      return launch(*arrays), in_batched
+    b = axis_size
 
-    def body(slices):
-      full = list(arrays)
-      for i, s in zip(idx, slices):
-        full[i] = s
-      # Call `f` (not `launch`): under nested `vmap` the inner batch axis is
-      # still live here, and must re-enter this rule (→ nested `lax.map`).
-      return f(*full)
+    def merge(a, batched):
+      # Give `a` a leading `b` axis (broadcast if unbatched here), then fold it
+      # into `a`'s existing leading batch dim.
+      if not batched:
+        a = jnp.broadcast_to(a[None], (b, *a.shape))
+      return a.reshape(b * a.shape[1], *a.shape[2:])
 
-    out = jax.lax.map(body, tuple(arrays[i] for i in idx))
+    out = f(*(merge(a, bat) for a, bat in zip(arrays, in_batched)))
+    # Split the folded batch back out for this `vmap` level.
+    out = jax.tree.map(lambda o: o.reshape(b, o.shape[0] // b, *o.shape[1:]), out)
     return out, jax.tree.map(lambda _: True, out)
 
   return f
@@ -94,6 +90,7 @@ def _normalization_kernel(
     RETURN_MEAN: tl.constexpr,
     RETURN_RSTD: tl.constexpr,
     SINGLE_N: tl.constexpr,
+    BATCHED: tl.constexpr,
 ):
   """Normalization forward kernel (layer norm / RMS norm).
 
@@ -108,15 +105,33 @@ def _normalization_kernel(
   vectorization of the reduction axis (scalar, cross-warp layout). Folding it —
   as Pallas/XLA do for size-1 grid dims — restores the vectorized intra-warp
   layout.
+
+  Under `vmap` (`BATCHED`), a batch of B independent normalizations is folded
+  into the grid: the M-grid tiles each batch element separately (grid axis 0 is
+  `B * cdiv(M, BLOCK_M)`), so a block never straddles a batch boundary and
+  `scale`/`offset` can be indexed per batch. `X`/`Y`/`MEAN`/`RSTD`/`SCALE`/
+  `OFFSET` are offset by the program's batch id. When not `BATCHED` this reduces
+  to the single-instance path (`batch == 0`, offsets fold away).
   """
-  pid_m = tl.program_id(0)
+  if BATCHED:
+    grid_m = (M_dim + BLOCK_M - 1) // BLOCK_M
+    pid0 = tl.program_id(0)
+    batch = pid0 // grid_m
+    pid_m = pid0 % grid_m
+    xb = batch * M_dim * stride_m  # X/Y batch stride (M * A * N).
+    sb = batch * M_dim * N_dim  # MEAN/RSTD batch stride (M * N).
+  else:
+    batch = 0
+    pid_m = tl.program_id(0)
+    xb = 0
+    sb = 0
   pid_n = 0 if SINGLE_N else tl.program_id(1)
   m_off = pid_m * BLOCK_M
   n_off = pid_n * BLOCK_N
 
   # (M, A, N) tile: N contiguous (stride 1), A strided by N.
   x_blk = tl.make_block_ptr(
-      X, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      X + xb, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
       offsets=(m_off, 0, n_off),
       block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   )
@@ -129,7 +144,7 @@ def _normalization_kernel(
     mean = tl.sum(x, axis=1) / A
     if RETURN_MEAN:
       mean_blk = tl.make_block_ptr(
-          MEAN, shape=(M_dim, N_dim), strides=(N_dim, 1),
+          MEAN + sb, shape=(M_dim, N_dim), strides=(N_dim, 1),
           offsets=(m_off, n_off),
           block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
       )
@@ -142,7 +157,7 @@ def _normalization_kernel(
   rstd = 1.0 / tl.sqrt(var + epsilon)
   if RETURN_RSTD:
     rstd_blk = tl.make_block_ptr(
-        RSTD, shape=(M_dim, N_dim), strides=(N_dim, 1),
+        RSTD + sb, shape=(M_dim, N_dim), strides=(N_dim, 1),
         offsets=(m_off, n_off),
         block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
     )
@@ -150,14 +165,14 @@ def _normalization_kernel(
   x = x * tl.expand_dims(rstd, 1)
 
   if HAS_SCALE:
-    s = tl.load(SCALE + a_offs, mask=a_mask, other=0.0).to(tl.float32)
+    s = tl.load(SCALE + batch * A + a_offs, mask=a_mask, other=0.0).to(tl.float32)
     x = x * (s[None, :, None] + scale_offset)
   if HAS_OFFSET:
-    o = tl.load(OFFSET + a_offs, mask=a_mask, other=0.0).to(tl.float32)
+    o = tl.load(OFFSET + batch * A + a_offs, mask=a_mask, other=0.0).to(tl.float32)
     x = x + o[None, :, None]
 
   y_blk = tl.make_block_ptr(
-      Y, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      Y + xb, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
       offsets=(m_off, 0, n_off),
       block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   )
@@ -183,6 +198,7 @@ def _normalization_vjp_kernel(
     HAS_OFFSET: tl.constexpr,
     SUBTRACT_MEAN: tl.constexpr,
     SINGLE_N: tl.constexpr,
+    BATCHED: tl.constexpr,
 ):
   """Normalization VJP kernel.
 
@@ -191,8 +207,27 @@ def _normalization_vjp_kernel(
   the canonical (M, A, N) layout, reducing along the middle axis A. `SINGLE_N`
   folds a degenerate N grid id to 0 to keep loads vectorizable (see the forward
   kernel docstring).
+
+  Under `vmap` (`BATCHED`), B independent normalizations are folded into the
+  M-grid (grid axis 0 is `B * cdiv(M, BLOCK_M)`); each program derives its batch
+  id, offsets its tensors accordingly, indexes `scale` per batch, and writes its
+  dscale/doffset partial into a per-batch slot (partials are (B, grid_m*grid_n,
+  A); the host sums over the programs axis per batch). When not `BATCHED` this
+  reduces to the single-instance path.
   """
-  pid_m = tl.program_id(0)
+  if BATCHED:
+    grid_m = (M_dim + BLOCK_M - 1) // BLOCK_M
+    pid0 = tl.program_id(0)
+    batch = pid0 // grid_m
+    pid_m = pid0 % grid_m
+    xb = batch * M_dim * stride_m  # DOUT/X/DX batch stride (M * A * N).
+    sb = batch * M_dim * N_dim  # MEAN/RSTD batch stride (M * N).
+  else:
+    grid_m = 0  # Unused when not batched.
+    batch = 0
+    pid_m = tl.program_id(0)
+    xb = 0
+    sb = 0
   pid_n = 0 if SINGLE_N else tl.program_id(1)
   m_off = pid_m * BLOCK_M
   n_off = pid_n * BLOCK_N
@@ -202,19 +237,19 @@ def _normalization_vjp_kernel(
 
   # Compute x_norm = (x - mean) * rstd. (M, A, N) tile, N contiguous.
   x_norm = tl.load(tl.make_block_ptr(
-      X, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      X + xb, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
       offsets=(m_off, 0, n_off),
       block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   ), boundary_check=(0, 1, 2), padding_option='zero').to(tl.float32)
   if SUBTRACT_MEAN:
     mean = tl.load(tl.make_block_ptr(
-        MEAN, shape=(M_dim, N_dim), strides=(N_dim, 1),
+        MEAN + sb, shape=(M_dim, N_dim), strides=(N_dim, 1),
         offsets=(m_off, n_off),
         block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
     ), boundary_check=(0, 1), padding_option='zero').to(tl.float32)
     x_norm = x_norm - tl.expand_dims(mean, 1)
   rstd = tl.load(tl.make_block_ptr(
-      RSTD, shape=(M_dim, N_dim), strides=(N_dim, 1),
+      RSTD + sb, shape=(M_dim, N_dim), strides=(N_dim, 1),
       offsets=(m_off, n_off),
       block_shape=(BLOCK_M, BLOCK_N), order=(1, 0),
   ), boundary_check=(0, 1), padding_option='zero').to(tl.float32)
@@ -222,14 +257,15 @@ def _normalization_vjp_kernel(
 
   # Load dout tile.
   dout = tl.load(tl.make_block_ptr(
-      DOUT, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      DOUT + xb, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
       offsets=(m_off, 0, n_off),
       block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   ), boundary_check=(0, 1, 2), padding_option='zero').to(tl.float32)
 
   # Partial doffset/dscale: reduce (BM, BA, BN) over M and N → (BA,).
-  # Store as (linear_pid, A); host sums axis 0 to get (A,).
-  linear_pid = pid_m * grid_n + pid_n
+  # Store as (batch * grid_m * grid_n + linear_pid, A); host sums the programs
+  # axis per batch to get (B, A).
+  linear_pid = (batch * grid_m + pid_m) * grid_n + pid_n
 
   if HAS_OFFSET:
     doffset = tl.sum(tl.sum(dout, axis=2), axis=0)
@@ -238,7 +274,7 @@ def _normalization_vjp_kernel(
   if HAS_SCALE:
     dscale = tl.sum(tl.sum(dout * x_norm, axis=2), axis=0)
     tl.store(DSCALE + linear_pid * A + a_offs, dscale, mask=a_mask)
-    s = tl.load(SCALE + a_offs, mask=a_mask, other=0.0).to(tl.float32)
+    s = tl.load(SCALE + batch * A + a_offs, mask=a_mask, other=0.0).to(tl.float32)
     dout = dout * (s[None, :, None] + scale_offset)
 
   # dx = (dout - mean_a(dout·x_norm)·x_norm [- mean_a(dout)]) * rstd
@@ -251,7 +287,7 @@ def _normalization_vjp_kernel(
   dx = dx * tl.expand_dims(rstd, 1)
 
   tl.store(tl.make_block_ptr(
-      DX, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
+      DX + xb, shape=(M_dim, A, N_dim), strides=(stride_m, stride_a, 1),
       offsets=(m_off, 0, n_off),
       block_shape=(BLOCK_M, BLOCK_A, BLOCK_N), order=(2, 1, 0),
   ), dx.to(DX.dtype.element_ty), boundary_check=(0, 1, 2))
@@ -318,38 +354,47 @@ class JaxTritonNormalization(base.Normalization[Config, Key]):
     if input_output_alias:
       alias_kwargs['input_output_aliases'] = {0: 0}
 
-    grid = (pl.cdiv(M, block_m), pl.cdiv(N, block_n))
-    single_n = pl.cdiv(N, block_n) == 1
-    out_shapes = [
-        jax.ShapeDtypeStruct(x_shape, x.dtype),
-        jax.ShapeDtypeStruct((num_rows,), jnp.float32),
-        jax.ShapeDtypeStruct((num_rows,), jnp.float32),
-    ]
-    launch = _vmappable(functools.partial(
-        jt.triton_call,
-        kernel=_normalization_kernel,
-        out_shape=out_shapes,
-        grid=grid,
-        num_warps=config.num_warps,
-        **alias_kwargs,
-        M_dim=M,
-        A=A,
-        N_dim=N,
-        stride_m=A * N,
-        stride_a=N,
-        epsilon=epsilon,
-        scale_offset=scale_offset,
-        BLOCK_M=block_m,
-        BLOCK_A=block_a,
-        BLOCK_N=block_n,
-        HAS_SCALE=scale is not None,
-        HAS_OFFSET=offset is not None,
-        SUBTRACT_MEAN=subtract_mean,
-        RETURN_MEAN=return_residuals and subtract_mean,
-        RETURN_RSTD=return_residuals,
-        SINGLE_N=single_n,
-    ))
-    y, mean_flat, rstd_flat = launch(x, scale_arr, offset_arr)
+    grid_m = pl.cdiv(M, block_m)
+    grid_n = pl.cdiv(N, block_n)
+    single_n = grid_n == 1
+
+    # `launch` takes a leading batch dim (folded from `vmap`); grid axis 0 tiles
+    # each batch element separately. See `_vmappable` and the kernel docstring.
+    def launch(x, scale_arr, offset_arr):
+      b = x.shape[0]
+      out_shapes = [
+          jax.ShapeDtypeStruct((b, M, A, N), x.dtype),
+          jax.ShapeDtypeStruct((b, num_rows), jnp.float32),
+          jax.ShapeDtypeStruct((b, num_rows), jnp.float32),
+      ]
+      return jt.triton_call(
+          x, scale_arr, offset_arr,
+          kernel=_normalization_kernel,
+          out_shape=out_shapes,
+          grid=(b * grid_m, grid_n),
+          num_warps=config.num_warps,
+          **alias_kwargs,
+          M_dim=M,
+          A=A,
+          N_dim=N,
+          stride_m=A * N,
+          stride_a=N,
+          epsilon=epsilon,
+          scale_offset=scale_offset,
+          BLOCK_M=block_m,
+          BLOCK_A=block_a,
+          BLOCK_N=block_n,
+          HAS_SCALE=scale is not None,
+          HAS_OFFSET=offset is not None,
+          SUBTRACT_MEAN=subtract_mean,
+          RETURN_MEAN=return_residuals and subtract_mean,
+          RETURN_RSTD=return_residuals,
+          SINGLE_N=single_n,
+          BATCHED=b > 1,
+      )
+
+    y, mean_flat, rstd_flat = _vmappable(launch)(
+        x[None], scale_arr[None], offset_arr[None])
 
     y = y.reshape(orig_x_shape)
 
@@ -456,47 +501,53 @@ class JaxTritonNormalizationVjp(base.NormalizationVjp[VjpConfig, VjpKey]):
 
     grid_m = pl.cdiv(M, block_m)
     grid_n = pl.cdiv(N, block_n)
-    grid = (grid_m, grid_n)
     num_programs = grid_m * grid_n
-    dparam_shape = jax.ShapeDtypeStruct((num_programs, A), jnp.float32)
-    dummy_shape = jax.ShapeDtypeStruct((1,), jnp.float32)
-    out_shapes = [
-        jax.ShapeDtypeStruct(x_shape, x.dtype),
-        dparam_shape if scale is not None else dummy_shape,
-        dparam_shape if offset is not None else dummy_shape,
-    ]
-    launch = _vmappable(functools.partial(
-        jt.triton_call,
-        kernel=_normalization_vjp_kernel,
-        out_shape=out_shapes,
-        grid=grid,
-        num_warps=config.num_warps,
-        input_output_aliases={1: 0},
-        M_dim=M,
-        A=A,
-        N_dim=N,
-        stride_m=A * N,
-        stride_a=N,
-        scale_offset=scale_offset,
-        grid_n=grid_n,
-        BLOCK_M=block_m,
-        BLOCK_A=block_a,
-        BLOCK_N=block_n,
-        HAS_SCALE=scale is not None,
-        HAS_OFFSET=offset is not None,
-        SUBTRACT_MEAN=subtract_mean,
-        SINGLE_N=grid_n == 1,
-    ))
-    dx, dscale_partial, doffset_partial = launch(
-        dout, x, scale_arr, mean_flat, rstd_flat)
+
+    # `launch` takes a leading batch dim (folded from `vmap`); dscale/doffset
+    # partials get a per-batch slot, summed over the programs axis below.
+    def launch(dout, x, scale_arr, mean_flat, rstd_flat):
+      b = dout.shape[0]
+      dparam_shape = jax.ShapeDtypeStruct((b, num_programs, A), jnp.float32)
+      dummy_shape = jax.ShapeDtypeStruct((b, 1), jnp.float32)
+      out_shapes = [
+          jax.ShapeDtypeStruct((b, M, A, N), x.dtype),
+          dparam_shape if scale is not None else dummy_shape,
+          dparam_shape if offset is not None else dummy_shape,
+      ]
+      return jt.triton_call(
+          dout, x, scale_arr, mean_flat, rstd_flat,
+          kernel=_normalization_vjp_kernel,
+          out_shape=out_shapes,
+          grid=(b * grid_m, grid_n),
+          num_warps=config.num_warps,
+          input_output_aliases={1: 0},
+          M_dim=M,
+          A=A,
+          N_dim=N,
+          stride_m=A * N,
+          stride_a=N,
+          scale_offset=scale_offset,
+          grid_n=grid_n,
+          BLOCK_M=block_m,
+          BLOCK_A=block_a,
+          BLOCK_N=block_n,
+          HAS_SCALE=scale is not None,
+          HAS_OFFSET=offset is not None,
+          SUBTRACT_MEAN=subtract_mean,
+          SINGLE_N=grid_n == 1,
+          BATCHED=b > 1,
+      )
+
+    dx, dscale_partial, doffset_partial = _vmappable(launch)(
+        dout[None], x[None], scale_arr[None], mean_flat[None], rstd_flat[None])
 
     dscale = None
     if scale is not None:
-      dscale = jnp.sum(dscale_partial, axis=0).astype(scale.dtype)
+      dscale = jnp.sum(dscale_partial.reshape(-1, A), axis=0).astype(scale.dtype)
 
     doffset = None
     if offset is not None:
-      doffset = jnp.sum(doffset_partial, axis=0).astype(offset.dtype)
+      doffset = jnp.sum(doffset_partial.reshape(-1, A), axis=0).astype(offset.dtype)
 
     return (dx.reshape(orig_x_shape), dscale, doffset), None
 
