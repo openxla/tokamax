@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
+# Copyright 2026 DeepMind Technologies Limited. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,8 +49,9 @@ def _normalization_kernel(
     X, SCALE, OFFSET,
     Y, MEAN, RSTD,
     # --- scalar args ---
-    M_dim, A, N_dim, stride_m, stride_a, epsilon, scale_offset,
+    M_dim, N_dim, stride_m, stride_a, epsilon, scale_offset,
     # --- constexpr args ---
+    A: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_A: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -139,8 +140,9 @@ def _normalization_vjp_kernel(
     DOUT, X, SCALE, MEAN, RSTD,
     DX, DSCALE, DOFFSET,
     # --- scalar args ---
-    M_dim, A, N_dim, stride_m, stride_a, scale_offset, grid_n,
+    M_dim, N_dim, stride_m, stride_a, scale_offset, grid_n,
     # --- constexpr args ---
+    A: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_A: tl.constexpr,
     BLOCK_N: tl.constexpr,
