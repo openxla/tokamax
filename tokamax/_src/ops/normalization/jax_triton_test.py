@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
+# Copyright 2026 DeepMind Technologies Limited. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Tests for jax-triton normalization op."""
 
 import functools
 from typing import override
@@ -20,15 +21,16 @@ from unittest import mock
 from absl.testing import absltest
 import chex
 import jax
-from tokamax._src.ops.normalization import pallas_triton
+from tokamax._src.ops.normalization import jax_triton
 from tokamax._src.ops.normalization import triton_config
 from tokamax._src.ops.normalization import test_base
 
 
-class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
+class JaxTritonNormalizationTest(test_base.NormalizationTestBase):
+  """Runs the standard normalization test suite against the jax-triton impl."""
 
   def __init__(self, *args):
-    super().__init__(*args, norm_fn=pallas_triton.PallasTritonNormalization())
+    super().__init__(*args, norm_fn=jax_triton.JaxTritonNormalization())
 
   def setUp(self):
     if jax.default_backend() == 'tpu':
@@ -90,10 +92,11 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
     g_remat = jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
     g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
 
+    # jax-triton lowers every kernel to the same `triton_kernel_call` target
+    # (no per-kernel names like pallas), so we count the total instead of
+    # per-name: remat gives fwd + recomputed fwd-res + vjp = 3.
     hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
-    self.assertEqual(hlo.count('name = "pallas_layer_norm"'), 1)
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_fwd_res"'), 1)
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_vjp"'), 1)
+    self.assertEqual(hlo.count('triton_kernel_call'), 3, msg=hlo)
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
     chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
@@ -117,9 +120,7 @@ class PallasTritonNormalizationTest(test_base.NormalizationTestBase):
     g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
 
     hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
-    self.assertEqual(hlo.count('name = "pallas_layer_norm"'), 1, msg=hlo)
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_fwd_res"'), 1)
-    self.assertEqual(hlo.count('name = "pallas_layer_norm_vjp"'), 1)
+    self.assertEqual(hlo.count('triton_kernel_call'), 3, msg=hlo)
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
     chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))

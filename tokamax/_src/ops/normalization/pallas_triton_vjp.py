@@ -25,16 +25,16 @@ import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.normalization import base
-from tokamax._src.ops.normalization import pallas_triton_config
-from tokamax._src.ops.normalization import pallas_triton_vjp_config
+from tokamax._src.ops.normalization import triton_config
+from tokamax._src.ops.normalization import triton_vjp_config
 from tokamax._src.pallas import block
 
 
 _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
 
 
-Config = pallas_triton_vjp_config.Config
-Key = pallas_triton_vjp_config.Key
+Config = triton_vjp_config.Config
+Key = triton_vjp_config.Key
 Residuals = base.Residuals
 
 
@@ -116,13 +116,13 @@ class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
 
     # Cananonicalize to 3D, where the second axis is the reduced axis.
     orig_x_shape = x.shape
-    x = x.reshape(pallas_triton_config.canonicalize_shape_3d(x.shape, axis))
+    x = x.reshape(triton_config.canonicalize_shape_3d(x.shape, axis))
     dout = dout.reshape(x.shape)
 
     if scale is not None:
       scale = scale[:, None]
 
-    stat_shape = pallas_triton_config.canonicalize_shape_3d(rstddev.shape, axis)
+    stat_shape = triton_config.canonicalize_shape_3d(rstddev.shape, axis)
     if mean is not None:
       mean = mean.reshape(stat_shape)
     rstddev = rstddev.reshape(stat_shape)
@@ -167,19 +167,19 @@ class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return pallas_triton_vjp_config.get_heuristics_config(
+    return triton_vjp_config.get_heuristics_config(
         *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
     )
 
   @override
   def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
     # TODO: Use batched args.
-    return pallas_triton_vjp_config.get_key(*ba.args, **ba.kwargs)
+    return triton_vjp_config.get_key(*ba.args, **ba.kwargs)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     axis = ba.kwargs['axis']
-    dout_shape = pallas_triton_config.canonicalize_shape(ba.args[1].shape, axis)
+    dout_shape = triton_config.canonicalize_shape(ba.args[1].shape, axis)
     configs = set()
     # `num_stages` has no effect, as there is no loop within kernel.
     for num_warps in [1, 2, 4, 8, 16]:
