@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
+# Copyright 2026 DeepMind Technologies Limited. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,13 +15,14 @@
 """Tests for jax-triton normalization op."""
 
 import functools
+from typing import override
+from unittest import mock
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import chex
 import jax
 from tokamax._src.ops.normalization import jax_triton
-from tokamax._src.ops.normalization import pallas_triton
+from tokamax._src.ops.normalization import pallas_triton_config
 from tokamax._src.ops.normalization import test_base
 
 
@@ -36,57 +37,93 @@ class JaxTritonNormalizationTest(test_base.NormalizationTestBase):
       self.skipTest('Not supported on TPUs.')
     super().setUp()
 
+  def test_layer_norm_with_pre_scale(self):
+    rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
 
-class JaxTritonVsPallasTritonTest(parameterized.TestCase):
-  """Cross-checks that jax-triton and pallas-triton produce the same results."""
-
-  def setUp(self):
-    if jax.default_backend() == 'tpu':
-      self.skipTest('Not supported on TPUs.')
-    super().setUp()
-    self._jt = jax_triton.JaxTritonNormalization(input_output_alias=False)
-    self._pt = pallas_triton.PallasTritonNormalization(input_output_alias=False)
-
-  @parameterized.parameters(
-      dict(shape=(128, 64), axis=-1, subtract_mean=True),
-      dict(shape=(128, 64), axis=-1, subtract_mean=False),
-      dict(shape=(8, 128, 32), axis=-1, subtract_mean=True),
-      dict(shape=(24, 32, 40), axis=1, subtract_mean=True),
-      dict(shape=(256, 42), axis=-1, subtract_mean=True),
-  )
-  def test_fwd_matches(self, shape, axis, subtract_mean):
-    rngs = list(jax.random.split(jax.random.PRNGKey(42), 3))
+    shape = (128, 32)
     x = jax.random.normal(rngs.pop(), shape)
-    scale = jax.random.uniform(rngs.pop(), (shape[axis],))
-    offset = jax.random.uniform(rngs.pop(), (shape[axis],))
+    scale = jax.random.uniform(rngs.pop(), (shape[-1],))
+    offset = jax.random.uniform(rngs.pop(), (shape[-1],))
+    pre_scale = jax.random.uniform(rngs.pop(), (shape[-1],))
+    epsilon = 1e-6
 
-    kwargs = dict(axis=axis, epsilon=1e-6, subtract_mean=subtract_mean)
-    y_pt = self._pt(x, scale, offset, **kwargs)
-    y_jt = self._jt(x, scale, offset, **kwargs)
-    chex.assert_trees_all_close(y_jt, y_pt, atol=1e-5)
+    y_expected = jax.nn.standardize(x * pre_scale, epsilon=epsilon) * scale
+    y_expected += offset
+    y_actual = self._norm_fn(
+        lambda: x * pre_scale, scale, offset, epsilon=epsilon
+    )
+    chex.assert_trees_all_close(y_actual, y_expected, atol=1e-6)
 
-  @parameterized.parameters(
-      dict(shape=(128, 64), axis=-1, subtract_mean=True),
-      dict(shape=(128, 64), axis=-1, subtract_mean=False),
-      dict(shape=(24, 32, 40), axis=1, subtract_mean=True),
-  )
-  def test_vjp_matches(self, shape, axis, subtract_mean):
-    rngs = list(jax.random.split(jax.random.PRNGKey(42), 4))
+  @override
+  def _test_layer_norm_vmap(self, axis, vmap_in_axes):
+    x_shape = [24, 32, 40]
+    vmap_axis_sizes = tuple(
+        x_shape.pop(in_axes[0]) for in_axes in vmap_in_axes[::-1]
+    )
+
+    seen_vmap_axis_sizes = []
+    get_heuristics_config = pallas_triton_config.get_heuristics_config
+
+    def my_heuristics_config(*args, **kwargs):
+      seen_vmap_axis_sizes.append(kwargs['vmap_axis_sizes'])
+      return get_heuristics_config(*args, **kwargs)
+
+    with mock.patch.object(
+        pallas_triton_config, 'get_heuristics_config', my_heuristics_config
+    ):
+      super()._test_layer_norm_vmap(axis, vmap_in_axes)
+
+    # We expect to see a shape for non-vmapped and each layer of vmap.
+    seen_vmap_axis_sizes = seen_vmap_axis_sizes[-1 :: -(len(vmap_in_axes) + 1)]
+    # We expect three calls from fwd, fwd res, and VJP.
+    self.assertEqual(seen_vmap_axis_sizes, [vmap_axis_sizes] * 3)
+
+  def test_remat(self):
+    rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
+
+    shape = (128, 32)
     x = jax.random.normal(rngs.pop(), shape)
-    scale = jax.random.uniform(rngs.pop(), (shape[axis],))
-    offset = jax.random.uniform(rngs.pop(), (shape[axis],))
-    dy = jax.random.normal(rngs.pop(), shape)
+    scale = jax.random.uniform(rngs.pop(), (shape[-1],))
+    offset = jax.random.uniform(rngs.pop(), (shape[-1],))
+    epsilon = 1e-6
 
-    kwargs = dict(axis=axis, epsilon=1e-6, subtract_mean=subtract_mean)
-    f_pt = functools.partial(self._pt, **kwargs)
-    f_jt = functools.partial(self._jt, **kwargs)
+    f = functools.partial(self._norm_fn, epsilon=epsilon)
+    g_ref = jax.value_and_grad(lambda *args: f(*args).sum())
+    g_remat = jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
+    g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
 
-    _, vjp_pt = jax.vjp(f_pt, x, scale, offset)
-    _, vjp_jt = jax.vjp(f_jt, x, scale, offset)
+    # jax-triton lowers every kernel to the same `triton_kernel_call` target
+    # (no per-kernel names like pallas), so we count the total instead of
+    # per-name: remat gives fwd + recomputed fwd-res + vjp = 3.
+    hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
+    self.assertEqual(hlo.count('triton_kernel_call'), 3, msg=hlo)
 
-    grads_pt = vjp_pt(dy)
-    grads_jt = vjp_jt(dy)
-    chex.assert_trees_all_close(grads_jt, grads_pt, atol=1e-4)
+    g_out = g_remat_lowered.compile()(x, scale, offset)
+    chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
+
+  def test_remat_with_vmap(self):
+    rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
+
+    shape = (3, 128, 32)
+    x = jax.random.normal(rngs.pop(), shape)
+    scale = jax.random.uniform(rngs.pop(), (shape[0], shape[-1]))
+    offset = jax.random.uniform(rngs.pop(), (shape[0], shape[-1]))
+    epsilon = 1e-6
+
+    def f(x, scale, offset):
+      return self._norm_fn(x, scale, offset, epsilon=epsilon)
+
+    g_ref = jax.vmap(jax.value_and_grad(lambda *args: f(*args).sum()))
+    g_remat = jax.vmap(
+        jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
+    )
+    g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
+
+    hlo = str(g_remat_lowered.compiler_ir('stablehlo'))
+    self.assertEqual(hlo.count('triton_kernel_call'), 3, msg=hlo)
+
+    g_out = g_remat_lowered.compile()(x, scale, offset)
+    chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
 
 
 if __name__ == '__main__':
