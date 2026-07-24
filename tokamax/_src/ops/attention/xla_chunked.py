@@ -151,7 +151,7 @@ def _attend_chunked(
 
   q_len_or_indices = seq_q if q_indices is None else q_indices
   k_len_or_indices = seq_k if k_indices is None else k_indices
-  mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+  mask_ = mask.as_array(q_len_or_indices, k_len_or_indices)
 
   def get_chunk(x, idx, size, axis):
     if x is None:
@@ -166,7 +166,7 @@ def _attend_chunked(
 
     q_chunk = get_q_chunk(q, -3)
     bias_chunk = get_q_chunk(bias, -2)
-    mask_chunk = get_q_chunk(mask, -2)
+    mask_chunk = get_q_chunk(mask_, -2)
     dropout_mask_chunk = get_q_chunk(dropout_mask, -2)
 
     intermediates_shape = (*b, h, q_chunk.shape[-3])
@@ -215,20 +215,22 @@ def _attend_chunked(
     out = acc / denom.mT[..., None] if normalize_output else acc
     return q_chunk_idx + q_chunk_size, out.astype(q.dtype)
 
-  q_chunk_idx, out = 0, None
-
   # Main q loop
   if seq_q >= q_chunk_size:
     loop_fn = functools.partial(q_loop_fn, q_chunk_size=q_chunk_size)
     length = seq_q // q_chunk_size
     q_chunk_idx, out = jax.lax.scan(loop_fn, init=0, length=length)
     out = shape_lib.einshape("q...thd->...(qt)hd")(out)
+  else:
+    q_chunk_idx = 0
+    out = None
 
   # Remainder q loop
   if (q_remainder := (seq_q % q_chunk_size)) != 0:
     _, rem_out = q_loop_fn(q_chunk_idx, None, q_chunk_size=q_remainder)
     out = rem_out if out is None else jnp.concatenate([out, rem_out], axis=-3)
 
+  assert out is not None
   return out, None
 
 
@@ -386,5 +388,5 @@ class XlaChunkedDotProductAttention(
         q_indices=q_indices,
         k_indices=k_indices,
         normalize_output=normalize_output,
-        chunk_size=chunk_size,
+        chunk_size=chunk_size,  # pyrefly: ignore[bad-argument-type]
     )

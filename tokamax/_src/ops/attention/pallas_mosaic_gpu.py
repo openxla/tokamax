@@ -78,7 +78,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       stability. It is ignored when not using stable softmax.
   """
 
-  config_cls: ClassVar[type[Config]] = Config
+  config_cls: ClassVar[type[Config]] = Config.__value__
   supports_symbolic_shapes: ClassVar[bool] = False
   use_stable_softmax: bool | type[base.AUTO] = base.AUTO
   rescale_threshold: float = 1.0

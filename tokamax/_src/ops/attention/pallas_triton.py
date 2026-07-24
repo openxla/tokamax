@@ -238,6 +238,7 @@ def _fwd_kernel_impl(
     if k_start is not None:
       s = jnp.where(k_start[:, None] <= span_k[None, :], s, mask_value)
     if use_k_end:
+      assert k_end is not None
       s = jnp.where(k_end[:, None] > span_k[None, :], s, mask_value)
     if is_causal:
       s = jnp.where(span_m[:, None] >= span_k[None, :], s, mask_value)
@@ -341,9 +342,11 @@ def _fwd(
   seq_len_q, num_heads_q, head_dim = q.shape
   seq_len_k, num_heads_k, head_dim_out = v.shape
 
-  pack_mask = config.pack_mask and mask is not None and mask.shape[-1] != 1
-  if pack_mask:
+  if config.pack_mask and mask is not None and mask.shape[-1] != 1:
     mask = jnp.packbits(mask, axis=-1, bitorder="little")
+    pack_mask = True
+  else:
+    pack_mask = False
 
   kernel = functools.partial(
       _fwd_kernel,
@@ -394,8 +397,8 @@ def _fwd(
           None if b is None else min(s, b)
           for s, b in zip(x.scale.shape, block_shape)
       ]
-      return QArray(  # pytype: disable=wrong-arg-types
-          pl.BlockSpec(block_shape, index_map),
+      return QArray(
+          pl.BlockSpec(block_shape, index_map),  # pyrefly: ignore[bad-argument-type]
           spec(x.scale, index_map, scales_block_shape),
           qtype=x.qvalue.dtype,
       )

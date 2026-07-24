@@ -17,6 +17,7 @@
 import functools
 import itertools
 import math
+from typing import cast
 
 import jax
 from jax import lax
@@ -67,10 +68,12 @@ _load_bcast = common.load_bcast
 _MASK_PACK_DTYPE = jnp.int8
 _MASK_PACKED_BITS = mgpu_lib.num_bits(_MASK_PACK_DTYPE)
 
+_FORBID_EXTRA = pydantic.ConfigDict(extra="forbid")
+
 
 @pydantic.dataclasses.dataclass(
-    frozen=True, kw_only=True, slots=True, config=dict(extra="forbid")
-)  # pytype: disable=wrong-keyword-args
+    frozen=True, kw_only=True, slots=True, config=_FORBID_EXTRA
+)
 class Config(common.ConfigBase):
   """Configuration parameters for Pallas-Mosaic-GPU kernels on SM100 GPUs.
 
@@ -255,7 +258,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                 q.dtype,
                 k.dtype,
                 v.dtype,
-                out_dtype,
+                out_dtype,  # pyrefly: ignore[bad-argument-type]
                 bias,
                 mask,
             )
@@ -335,9 +338,18 @@ def flash_attention_kernel(
   mask_block_kv = block_kv // _MASK_PACKED_BITS
   num_stages = config.num_stages
   num_tma_splits = config.num_tma_splits
-  collective = config.collective
-  block_q = tile_q // 2 if collective else tile_q
-  collective_axis = "cluster" if collective else None
+
+  if collective := config.collective:
+    block_q = tile_q // 2
+    collective_axis = "cluster"
+    maybe_cluster_barrier = functools.partial(  # pytype: disable=wrong-arg-types
+        plgpu.ClusterBarrier, collective_axes=(collective_axis,)
+    )
+  else:
+    block_q = tile_q
+    collective_axis = None
+    maybe_cluster_barrier = plgpu.Barrier
+
   softmax_slots = 2
 
   epi_tile_d = 1024 // mgpu_lib.num_bits(out_dtype)
@@ -391,7 +403,7 @@ def flash_attention_kernel(
 
     q_base_cluster = qi * tile_q
     q_base = q_base_cluster + cluster_idx * block_q
-    qs = pl.ds(q_base, block_q)
+    qs = cast(pl.Slice, pl.ds(q_base, block_q))
 
     lb = 0
     ub = kv_seq_len // block_kv
@@ -600,10 +612,10 @@ def flash_attention_kernel(
 
         if mask_gmem is not None:
           if mask_smem is None:
-            ks = pl.ds(k_base, block_kv)
+            ks = cast(pl.Slice, pl.ds(k_base, block_kv))
             # TODO: we need to handle Q masks differently
             # broadcasting & using them the way it is done is extremely slow
-            mask &= common.load_bcast(mask_gmem, (hi, qs, ks), layout=_TMEM)
+            mask &= _load_bcast(mask_gmem, (hi, qs, ks), layout=_TMEM)
           else:
             plgpu.barrier_wait(mask_barrier)
             idx = (slice(None), slice(0, mask_block_kv))
@@ -640,8 +652,8 @@ def flash_attention_kernel(
             bias = None
           elif bias_smem is None:
             hi_ = 0 if bias_gmem.shape[-3] == 1 else hi
-            ks = pl.ds(ki * block_kv, block_kv)
-            bias = common.load_bcast(bias_gmem, (hi_, qs, ks), layout=_TMEM)
+            ks = cast(pl.Slice, pl.ds(ki * block_kv, block_kv))
+            bias = _load_bcast(bias_gmem, (hi_, qs, ks), layout=_TMEM)
           else:
             plgpu.barrier_wait(bias_barrier)
             bias = plgpu.load(bias_smem, layout=_TMEM, optimized=False)
@@ -907,11 +919,6 @@ def flash_attention_kernel(
   def tmem(shape, dtype=jnp.float32, **kwargs):
     return plgpu.TMEM(shape, dtype, collective=collective, **kwargs)
 
-  def maybe_cluster_barrier(**kwargs):
-    if collective:
-      return plgpu.ClusterBarrier(collective_axes=(collective_axis,), **kwargs)
-    return plgpu.Barrier(**kwargs)
-
   scratch_shapes = dict(
       qo_smem_union=plgpu.RefUnion(q_scratch, o_scratch),
       k_smem=k_scratch,
@@ -949,7 +956,7 @@ def flash_attention_kernel(
   out, *residuals = plgpu.kernel(
       kernel,
       out_type=out_shape,
-      scratch_types=scratch_shapes,
+      scratch_types=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
       grid=(num_q_heads, num_q_tiles),
       grid_names=("heads", "q_tiles"),
       num_threads=3,

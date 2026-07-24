@@ -18,6 +18,7 @@
 
 import functools
 import math
+from typing import cast
 
 import jax
 from jax import lax
@@ -232,7 +233,7 @@ def flash_attention_vjp_kernel(
 
     tile_q = compute_wgs * block_q
     q_base = qi * tile_q + wg * block_q
-    qs = pl.ds(q_base, block_q)
+    qs = cast(pl.Slice, pl.ds(q_base, block_q))
 
     lb = 0
     ub = num_kv_tiles = pl.cdiv(kv_seq_len, block_kv_dq)
@@ -311,7 +312,7 @@ def flash_attention_vjp_kernel(
       (i,) = index
       ki = lb + i
       kv_base = ki * block_kv
-      ks = pl.ds(kv_base, block_kv)
+      ks = cast(pl.Slice, pl.ds(kv_base, block_kv))
       dq_acc, m, l_rcp, delta, k_start, k_end = carry
 
       def compute_dp_s(dp_acc, s_acc):
@@ -340,8 +341,9 @@ def flash_attention_vjp_kernel(
         scale = 1.0
 
       if logits_soft_cap is not None:
-        s = logits = jnp.tanh(s * (scale / logits_soft_cap))
+        s = jnp.tanh(s * (scale / logits_soft_cap))
         scale = logits_soft_cap
+      logits = s
 
       # NOTE: This rescaling must happen after bias and soft-cap but before the
       # attention masking (as the multiplication will cause `-inf`s).
@@ -372,7 +374,9 @@ def flash_attention_vjp_kernel(
         s = jnp.where(kv_base + iota(1) < broadcast(k_end), s, mask_value)
         scale = 1.0
 
-      if mask_gmem is not None:
+      if mask_gmem is None:
+        mask = None
+      else:
         if mask_smem is None:
           mask = _load_bcast(mask_gmem, (qs, ks), layout=_WGMMA)
         else:
@@ -396,7 +400,7 @@ def flash_attention_vjp_kernel(
       # If we have an attention mask, it is possible that the entire row is
       # masked out. In that case, the forwards pass will calculate `p`'s values
       # as `1 / seq_len_k`. The corresponding `ds` values must be zeroed.
-      if mask_gmem is not None:
+      if mask is not None:
         ds = jnp.where(mask, ds, 0.0)
 
       if ds_gmem is not None:
@@ -444,7 +448,7 @@ def flash_attention_vjp_kernel(
         wg_axis="wg",
         manual_consumed_barriers=True,
         compute_context=compute_thread,
-        in_specs=[bias_spec, v_spec, mask_spec, k_spec],
+        in_specs=[bias_spec, v_spec, mask_spec, k_spec],  # pyrefly: ignore[bad-argument-type]
     )(bias_gmem_, v_gmem, mask_gmem_, k_gmem)
 
   def kernel_dkv(
@@ -473,7 +477,7 @@ def flash_attention_vjp_kernel(
 
     tile_kv = compute_wgs * block_kv
     kv_base = ki * tile_kv + wg * block_kv
-    ks = pl.ds(kv_base, block_kv)
+    ks = cast(pl.Slice, pl.ds(kv_base, block_kv))
     lb = lax.div(ki * tile_kv, block_q) if is_causal else 0
     ub = num_q_tiles = pl.cdiv(q_seq_len, block_q)
 
@@ -532,7 +536,7 @@ def flash_attention_vjp_kernel(
       i, j = index
       qi = lb + i
       q_base = qi * block_q
-      qs = pl.ds(q_base, block_q)
+      qs = cast(pl.Slice, pl.ds(q_base, block_q))
       hi = q_heads_per_kv_head * j + hi_kv
       dk_acc, dv_acc, loop_invariant_mask = carry
 
@@ -565,8 +569,9 @@ def flash_attention_vjp_kernel(
         scale = 1.0
 
       if logits_soft_cap is not None:
-        sT = logits = jnp.tanh(sT * (scale / logits_soft_cap))
+        sT = jnp.tanh(sT * (scale / logits_soft_cap))
         scale = logits_soft_cap
+      logits = sT
 
       # NOTE: This rescaling must happen after bias and soft-cap but before the
       # attention masking (as the multiplication will cause `-inf`s).
@@ -626,7 +631,7 @@ def flash_attention_vjp_kernel(
         # Load `dP.T` without waiting for the DV matmul to complete.
         return plgpu.wgmma_accumulator_load(acc, wait_n=1)
 
-      dpT = pl.run_scoped(compute_dpT, plgpu.ACC(pT.shape, jnp.float32))
+      dpT = pl.run_scoped(compute_dpT, acc_type)
       dsT = pT * (dpT - broadcast(delta))  # pytype: disable=wrong-arg-types  # jax-operator-types
       if logits_soft_cap is not None:
         dsT *= 1 - logits * logits
@@ -685,7 +690,7 @@ def flash_attention_vjp_kernel(
         wg_axis="wg",
         manual_consumed_barriers=True,
         compute_context=compute_thread,
-        in_specs=[
+        in_specs=[  # pyrefly: ignore[bad-argument-type]
             bias_spec,
             m_spec,
             l_spec,

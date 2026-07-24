@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
@@ -109,6 +110,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         mask=mask,
     )
 
+    q = quantization.as_array(q)
     q *= logits_scale
 
     orig_q_shape = q.shape

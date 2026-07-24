@@ -417,6 +417,9 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
 
       return dot_out, residuals if return_residuals else None
 
+    if isinstance(group_sizes, GroupSizes):
+      group_sizes = jnp.array(group_sizes)
+
     if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
       out = _ragged_dot(
           lhs,

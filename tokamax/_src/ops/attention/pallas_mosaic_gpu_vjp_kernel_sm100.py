@@ -18,7 +18,7 @@
 
 import functools
 import math
-from typing import Annotated
+from typing import Annotated, cast
 
 import jax
 from jax import lax
@@ -445,7 +445,7 @@ def _kernel_dq(
   hi_kv = lax.div(hi, jnp.array(q_heads_per_kv_head, hi.dtype))
 
   q_base = qi * config.block_q_dq
-  qs = pl.ds(q_base, config.block_q_dq)
+  qs = cast(pl.Slice, pl.ds(q_base, config.block_q_dq))
 
   lb = 0
   ub = k_ref.shape[-3] // config.block_kv_dq
@@ -703,7 +703,10 @@ def _kernel_dq(
         if bias_ref is not None:
           s_val *= logits_scale
           if bias_smem is None:
-            ks = pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size)
+            ks = cast(
+                pl.Slice,
+                pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size),
+            )
             bias_val = _load_bcast(bias_ref, (hi, qs, ks), layout=_TMEM)
           else:
             bias_val = plgpu.load(

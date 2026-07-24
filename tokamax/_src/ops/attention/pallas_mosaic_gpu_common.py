@@ -34,11 +34,12 @@ from tokamax._src import shape as shape_lib
 
 CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
+_FORBID_EXTRA = pydantic.ConfigDict(extra="forbid")
 
 
 @pydantic.dataclasses.dataclass(
-    frozen=True, kw_only=True, slots=True, config=dict(extra="forbid")
-)  # pytype: disable=wrong-keyword-args
+    frozen=True, kw_only=True, slots=True, config=_FORBID_EXTRA
+)
 class ConfigBase:
   """Common configuration parameters for Pallas-Mosaic-GPU kernels.
 
@@ -104,12 +105,11 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
   return mask, is_causal, k_start, k_end
 
 
-def cast_qkv(
-    q: jax.Array | QArray,
-    k: jax.Array | QArray,
-    v: jax.Array | QArray,
-    precision: tuple[CanonicalPrecision, CanonicalPrecision],
-) -> tuple[jax.Array | QArray, jax.Array | QArray, jax.Array | QArray]:
+def cast_qkv[
+    Q: (jax.Array, QArray), K: (jax.Array, QArray), V: (jax.Array, QArray)
+](
+    q: Q, k: K, v: V, precision: tuple[CanonicalPrecision, CanonicalPrecision]
+) -> tuple[Q, K, V]:
   """Casts Q, K, and V to the given precision."""
 
   def cast(x, precision):

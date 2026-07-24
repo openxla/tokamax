@@ -15,7 +15,6 @@
 
 """Common Pallas Mosaic GPU utilities."""
 
-from collections.abc import Sequence
 import dataclasses
 import enum
 from typing import Annotated, Any
@@ -88,7 +87,7 @@ class GroupInfo:
   @classmethod
   def create_aligned(
       cls,
-      group_sizes: Sequence[jax.Array],
+      group_sizes: jax.Array,
       tile: int,
       tid_size: int,
       align_tile: int = 8,
@@ -106,8 +105,7 @@ class GroupInfo:
 
 
     Args:
-      group_sizes: A sequence of jax.Array, where each element is the size of a
-        group.
+      group_sizes: The sizes of each group.
       tile: The size of the processing tile (e.g., block_m).
       tid_size: Max number of tasks available - usually calculated as
         `pl.cdiv(m, block_m) + len(group_sizes) - 1`.
@@ -118,7 +116,6 @@ class GroupInfo:
       A GroupInfo instance containing the calculated information for each task.
       Note, that block array is always None.
     """
-    group_sizes = jnp.asarray(group_sizes)
     group_sizes = lax.max(jnp.zeros_like(group_sizes), group_sizes)
     group_sizes = group_sizes.astype(jnp.int32)
     group_starts = jnp.cumulative_sum(group_sizes, include_initial=True)

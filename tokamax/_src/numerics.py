@@ -206,7 +206,7 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
 
       if abstract_qvalue and abstract_scale:
         x = dataclasses.replace(
-            x, qvalue=_as_vmap_shape(x.qvalue), scale=_as_vmap_shape(x.scale)
+            x, qvalue=_as_vmap_shape(x.qvalue), scale=_as_vmap_shape(x.scale)  # pyrefly: ignore[bad-argument-type]
         )
         try:
           dtype_ = jnp.promote_types(x.dtype, jnp.float32)

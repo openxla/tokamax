@@ -527,20 +527,22 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       raise NotImplementedError("Paged attention not supported.")
 
     is_causal = False
-    if mask is not None:
+    if mask is None:
+      mask_ = None
+    else:
       if q_indices is None and k_indices is None:
         mask, is_causal = mask.take("is_causal")
 
       q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
       k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
-      mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+      mask_ = mask.as_array(q_len_or_indices, k_len_or_indices)
 
     def broadcast_to_rank(x, rank):
       return None if x is None else jax.lax.broadcast_to_rank(x, rank)
 
     orig_bias_shape = None if bias is None else bias.shape
     bias = broadcast_to_rank(bias, q.ndim)
-    mask = broadcast_to_rank(mask, q.ndim)
+    mask_ = broadcast_to_rank(mask_, q.ndim)
     dropout_mask = broadcast_to_rank(dropout_mask, q.ndim)
 
     if bias is None:
@@ -573,10 +575,11 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
     )
     f = base.vmap_batch_dims(f)
 
-    dq, dk, dv, ds = f(q, k, v, bias, mask, dropout_mask, residuals, out, dout)
+    dq, dk, dv, ds = f(q, k, v, bias, mask_, dropout_mask, residuals, out, dout)
     if bias is None:
       dbias = None
     else:
+      assert ds is not None
       broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
       dbias = jnp.sum(ds, axis=broadcast_bias_axes)
       dbias = dbias.astype(bias.dtype).reshape(orig_bias_shape)

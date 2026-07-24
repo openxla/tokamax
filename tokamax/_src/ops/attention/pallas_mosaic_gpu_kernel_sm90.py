@@ -16,6 +16,7 @@
 
 import functools
 import math
+from typing import cast
 
 import jax
 from jax import lax
@@ -41,10 +42,11 @@ _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 _load_bcast = common.load_bcast
+_FORBID_EXTRA = pydantic.ConfigDict(extra="forbid")
 
 
 @pydantic.dataclasses.dataclass(
-    frozen=True, kw_only=True, slots=True, config=dict(extra="forbid")
+    frozen=True, kw_only=True, slots=True, config=_FORBID_EXTRA
 )  # pytype: disable=wrong-keyword-args
 class Config(common.ConfigBase):
   """Configuration parameters for Pallas-Mosaic-GPU kernels on SM90 GPUs."""
@@ -233,7 +235,7 @@ def flash_attention_kernel(
     @pl.when(wg < 2)
     def compute_wg():
       q_base = (2 * qi + wg) * block_q
-      qs = pl.ds(q_base, block_q)
+      qs = cast(pl.Slice, pl.ds(q_base, block_q))
 
       plgpu.set_max_registers(232, action="increase")
       plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_barrier)
@@ -269,7 +271,7 @@ def flash_attention_kernel(
         acc, m_scale, m_i, l_i = carry
         si = lax.rem(ki, max_stages)
         k_base = ki * block_kv
-        ks = pl.ds(k_base, block_kv)
+        ks = cast(pl.Slice, pl.ds(k_base, block_kv))
 
         def iota(d):
           return plgpu.broadcasted_iota(jnp.int32, block_q_kv, d, layout=_WGMMA)
@@ -567,7 +569,7 @@ def flash_attention_kernel(
   out, *residuals = plgpu.kernel(
       kernel,
       out_type=out_shape,
-      scratch_types=scratch_shapes,
+      scratch_types=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
       grid=(num_q_heads, num_q_tiles),
       grid_names=("heads", "q_tiles"),
       num_threads=3,

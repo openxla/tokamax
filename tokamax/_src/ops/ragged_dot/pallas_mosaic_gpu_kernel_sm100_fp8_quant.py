@@ -158,13 +158,13 @@ def _compute_stages(
     block_n: int,
     cluster_size: int,
     block_k: int,
-    x_dtype: jnp.dtype,
-    w_dtype: jnp.dtype,
-    ws_dtype: jnp.dtype,
-    xs_dtype: jnp.dtype,
-    xsum_dtype: jnp.dtype,
-    acc_dtype: jnp.dtype,
-    out_dtype: jnp.dtype,
+    x_dtype: jax.typing.DTypeLike,
+    w_dtype: jax.typing.DTypeLike,
+    ws_dtype: jax.typing.DTypeLike,
+    xs_dtype: jax.typing.DTypeLike,
+    xsum_dtype: jax.typing.DTypeLike,
+    acc_dtype: jax.typing.DTypeLike,
+    out_dtype: jax.typing.DTypeLike,
     deq_wg: int,
 ) -> tuple[int, int, int, int]:
   """Compute the number of stages for each type of data."""
@@ -362,7 +362,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         "epilogue_quant_qtype and epilogue_quant_subchannel_size must be set"
         " together."
     )
-  if epilogue_quant_enabled:
+  if epilogue_quant_subchannel_size is not None:
     if epilogue_quant_subchannel_size != block_n:
       raise NotImplementedError(
           "Fused output quantization requires subchannel == block_n"
@@ -792,13 +792,12 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
           acc_carry = activation(acc_carry)
 
         with jax.named_scope("acc -> SMEM"):
-          if not epilogue_quant_enabled:
+          if out_scales_smem is None:
             out_smem.T[...] = plgpu.layout_cast(
                 acc_carry.astype(out_smem.dtype),
                 plgpu.Layout.TCGEN05_TRANSPOSED,
             )
           else:
-            assert out_scales_smem is not None
             quant_t_dtype = jnp.float32
             qmax = float(jnp.finfo(epilogue_quant_dtype).max)
             acc_t = plgpu.layout_cast(
@@ -826,7 +825,9 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
           plgpu.commit_smem()
 
         with jax.named_scope("SMEM -> GMEM"):
-          if epilogue_quant_enabled:
+          if epilogue_quant_subchannel_size is not None:
+            assert out_scales_gmem is not None
+            assert out_scales_smem is not None
             # Scatter scales before value TMA to overlap GMEM stores.
             scale_col = lax.div(
                 tid_n * cluster_block_n + cluster_idx * block_n,
@@ -896,9 +897,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         (scale_stages, max(cluster_block_m, 64)),
         dtype=x_sum.dtype,
     )
-    out_smem_dtype = (
-        epilogue_quant_dtype if epilogue_quant_enabled else out_dtype
-    )
+    out_smem_dtype = epilogue_quant_dtype or out_dtype
     out_smem = plgpu.SMEM(
         (cluster_block_m, block_n),
         dtype=out_smem_dtype,
@@ -912,10 +911,6 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
             plgpu.SwizzleTransform(128),
         ),
     )
-    if epilogue_quant_enabled:
-      out_scales_smem = plgpu.SMEM(
-          (cluster_block_m,), dtype=epilogue_quant_input_dtype
-      )
     acc_tmem = plgpu.TMEM(
         (block_n, acc_stages * cluster_block_m),
         dtype=jnp.float32,
@@ -967,7 +962,9 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         acc_tmem,
     ]
     if epilogue_quant_enabled:
-      scratch.append(out_scales_smem)  # LAST, matches the pop() in kernel()
+      # LAST, matches the pop() in kernel()
+      scratch.append(plgpu.SMEM((cluster_block_m,), epilogue_quant_input_dtype))
+
     pl.run_scoped(
         lambda *args: kernel(*refs, scoped=args),
         tuple(scratch),
@@ -990,6 +987,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
   num_sms = backend.get_default_device().core_count
   num_sms = num_sms // 2 if profile else num_sms
   if epilogue_quant_enabled:
+    assert epilogue_quant_subchannel_size is not None
     # Scales in (m, n_subchannels) order: the scatter is uncoalesced anyway, so
     # m-major is free here and avoids a transpose-on-return.
     out_type = (
@@ -1040,7 +1038,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
       group_info.block_start,
       (group_info.actual_size > 0).sum().astype(jnp.int32),
   )
-  if epilogue_quant_enabled:
+  if epilogue_quant_dtype is not None:
     qvalue, scales = out
     return qwix.QArray(qvalue, scales, qtype=epilogue_quant_dtype)
   return out

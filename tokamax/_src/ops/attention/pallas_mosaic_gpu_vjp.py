@@ -179,6 +179,7 @@ class PallasMosaicGpuFlashAttentionVjp(
 
     dbias = None
     if bias is not None:
+      assert ds is not None
       broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
       dbias = jnp.sum(ds, axis=broadcast_bias_axes).astype(bias.dtype)
       dbias = dbias.reshape(orig_bias_shape)
@@ -198,8 +199,8 @@ class PallasMosaicGpuFlashAttentionVjp(
       self, ba: op.BoundArguments
   ) -> set[sm90.Config | sm100.Config]:
     if gpu_utils.is_sm100():
-      return sm100.get_autotuning_configs(ba)
-    return sm90.get_autotuning_configs(ba)
+      return sm100.get_autotuning_configs(ba)  # pyrefly: ignore[bad-return]
+    return sm90.get_autotuning_configs(ba)  # pyrefly: ignore[bad-return]
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
