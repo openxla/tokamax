@@ -186,26 +186,6 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         final_state, ref_final_state, atol=0.01, rtol=0.01
     )
 
-  def test_kimi_delta_attention_gradients_match_reference(self):
-    q, k, v, g, beta, _ = _make_inputs(jnp.float32)
-
-    def loss(fn, q, k, v, g, beta):
-      output, _ = fn(q, k, v, g, beta)
-      return jnp.sum(output * output)
-
-    grad = jax.grad(
-        lambda q, k, v, g, beta: loss(
-            api.kimi_delta_attention, q, k, v, g, beta
-        ),
-        argnums=(0, 1, 2, 3, 4),
-    )(q, k, v, g, beta)
-    ref_grad = jax.grad(
-        lambda q, k, v, g, beta: loss(_reference_kda, q, k, v, g, beta),
-        argnums=(0, 1, 2, 3, 4),
-    )(q, k, v, g, beta)
-
-    chex.assert_trees_all_close(grad, ref_grad, atol=0.01, rtol=0.01)
-
   def test_varlen_gate_l2norm_matches_reference(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
     segment_ids = jnp.array(
@@ -260,7 +240,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
   def test_pallas_tpu_registered_and_default_falls_back_to_xla(self):
     q, k, v, g, beta, initial_state = _make_inputs(jnp.float32)
     self.assertIn("pallas_tpu", api.IMPLEMENTATIONS)
-    self.assertIsNotNone(api.IMPLEMENTATIONS["pallas_tpu"].vjp)
+    self.assertIsNone(api.IMPLEMENTATIONS["pallas_tpu"].vjp)
     self.assertEqual(api._DEFAULT_IMPLEMENTATIONS, ("pallas_tpu", "xla"))
 
     output, final_state = api.kimi_delta_attention(

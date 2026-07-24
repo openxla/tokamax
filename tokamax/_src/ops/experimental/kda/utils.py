@@ -52,14 +52,6 @@ def l2norm_fwd(x: jax.Array, eps: float = 1e-6):
   return (x_f * rstd[..., None]).astype(x.dtype), rstd.astype(jnp.float32)
 
 
-def l2norm_bwd(y: jax.Array, rstd: jax.Array, dy: jax.Array):
-  y_f = y.astype(jnp.float32)
-  dy_f = dy.astype(jnp.float32)
-  rstd_f = rstd.astype(jnp.float32)
-  dot_dy_y = jnp.sum(dy_f * y_f, axis=-1)
-  dx = dy_f * rstd_f[..., None] - dot_dy_y[..., None] * y_f * rstd_f[..., None]
-  return dx.astype(y.dtype)
-
 def derive_cp_context(
     *,
     segment_ids: jax.Array | None,

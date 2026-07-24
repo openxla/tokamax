@@ -188,7 +188,7 @@ Keeping these semantic stages makes correctness easier to explain. Fusing adjace
 | `chunk_gated_delta_rule_fwd_h_pre_process` | Construct the rank-local affine state summary consumed by the CP bridge | `_prepare_cp_initial_state` |
 | `_merge_initial_state` | Merge the applicable upstream rank summaries and recover the first local segment's initial state | `_prepare_cp_initial_state` |
 | `chunk_kda_fwd_h_o_varlen` | Unified fused Stage 3+4 for fixed-length and variable-length input | `o`, optional state residual, and final state |
-| `KdaResiduals` | Typed contract containing the prepared forward values consumed by the custom backward | `PallasTpuKimiDeltaAttentionVjp` |
+| `KdaResiduals` | Typed contract containing prepared forward values reserved for a differentiation consumer | `PallasTpuKimiDeltaAttention._fwd` |
 
 ### 3.5 Preprocessing Boundary and Single-Alignment Contract
 
@@ -806,7 +806,7 @@ Forward correctness is validated against implementations that do not use the Pal
 
 - `tokamax/_src/ops/experimental/kda/pallas_tpu_test.py` compares the Pallas TPU result with the XLA implementation using identical inputs. It compares both `output` and `final_state` when a final state is requested. For CP, the Pallas path is sharded across the context mesh and is compared with the unsharded XLA result for the same global input.
 - `tokamax/_src/ops/experimental/kda/api_test.py` compares the public KDA API with a direct token-recurrent reference implementation. This independently checks the chunked formulation against the recurrence in Section 9.1.2 rather than against another use of the same chunk equations.
-- The parameterized Pallas TPU backward tests run the same case matrix and compare `dq`, `dk`, `dv`, `dg`, `dbeta`, and optional `dh0` with XLA. Although backward implementation details are outside the scope of this document, these tests validate that the forward residual and recomputation contracts provide the values required by the custom VJP.
+- The parameterized Pallas TPU tests compare forward outputs and optional final states with the XLA reference across fixed-length, variable-length, fused-gate, L2-normalized, and context-parallel cases.
 
 ### 6.2 Existing Forward Coverage
 

@@ -92,8 +92,8 @@ def kimi_delta_attention(
       Padding is represented by 0.
     safe_gate: Match pallas-kernel gate validation.
     lower_bound: Optional sigmoid-gate lower bound.
-    disable_recompute: Pallas custom-VJP recompute policy. XLA reference
-      implementations accept it but the mathematical result is unchanged.
+    disable_recompute: Whether Pallas forward residuals retain the recurrent
+      state instead of relying on a later recomputation.
     cp_context: Optional context-parallel metadata. Construct it with
       `kda.CPContext(mesh, axis_name)`.
     chunk_size: Chunk size used by Pallas.
@@ -103,9 +103,9 @@ def kimi_delta_attention(
     implementation: The implementation to use. By default, the Pallas TPU
       implementation is attempted first when available, with XLA as a fallback.
       `"xla"` evaluates the recurrent reference implementation. `"pallas_tpu"`
-      uses the experimental Pallas TPU forward and custom VJP implementation
-      from pallas-kernel. A sequence tries implementations in order, falling
-      back when an implementation raises `NotImplementedError`.
+      uses the experimental Pallas TPU forward implementation from
+      pallas-kernel. A sequence tries implementations in order, falling back
+      when an implementation raises `NotImplementedError`.
 
   Returns:
     A pair `(output, final_state)`. The output has shape `[H, B, T, V]`.
