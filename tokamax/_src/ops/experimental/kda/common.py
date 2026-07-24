@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared helpers for the Pallas TPU KDA forward path."""
+"""KDA helpers shared by the Pallas TPU forward and backward paths."""
 
 from __future__ import annotations
 
@@ -52,8 +52,9 @@ def estimate_mini_batch(
 ) -> int:
   """Estimate the optimal mini-batch size to maximise VMEM utilisation.
 
-  Computes the largest MB that fits within the hardware VMEM budget, caps it,
-  and then adjusts downward so that ``total`` is evenly divisible by ``MB``.
+  This mirrors the backward auto-tune pattern used throughout the KDA kernels:
+  compute the largest MB that fits within the hardware VMEM budget, cap it,
+  and then adjust downward so that ``total`` is evenly divisible by ``MB``.
 
   Args:
       per_tile_bytes: Estimated VMEM footprint (bytes) for **one** tile/head.
@@ -555,7 +556,8 @@ def _chunk_gated_delta_rule_fwd_kernel(
 
   1. **Initialise state** (chunk 0 only): set scratch (the running hidden
      state ``h``) to zeros or to the provided initial state ``h0``.
-  2. **Snapshot**: optionally write the *pre-update* state into ``h_ref``.
+  2. **Snapshot**: write the *pre-update* state into ``h_ref`` so that the
+     intra-chunk backward pass can use it.
   3. **Delta correction**: ``v_new = u - w @ h`` — correct the raw value
      by subtracting the projection of the current state through ``w``.
   4. **Gated state update**: apply scalar gate ``g`` and/or per-dim gate
