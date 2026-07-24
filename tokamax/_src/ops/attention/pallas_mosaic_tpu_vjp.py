@@ -228,6 +228,10 @@ class PallasMosaicTpuFlashAttentionVjp(
         continue
       if bkv_c > 1024:
         continue
+      # Tile size >=4096 makes compile time > 15mins per config, which pushes
+      # single arg spec autotuning time to more than 1 hour.
+      if bq >= 4096 or bkv >= 4096:
+        continue
       if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
         configs.add(
             Config(
