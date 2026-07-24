@@ -193,7 +193,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     q, k = ba.arguments['q'], ba.arguments['k']
     q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
     # TODO: Add 8192 once autotuning bugs are fixed.
-    tiles = [128, 256, 512, 1024, 2048, 4096]
+    tiles = [256, 512, 1024, 2048, 4096]
     layouts = [splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR]
     schedulers = [True, False]
     config = set()
