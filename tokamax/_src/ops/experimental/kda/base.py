@@ -367,16 +367,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       )
       return states, output_h
 
-    if cp_enabled:
-      # Keep the native token-by-token recurrence, but rematerialize each
-      # head's large state intermediates during backward. Dot outputs are much
-      # smaller than the K x V states and are retained to limit recomputation.
-      step_head = jax.checkpoint(
-          step_head,
-          prevent_cse=False,
-          policy=jax.checkpoint_policies.dots_saveable,
-      )
-
     states, output_h = jax.lax.fori_loop(
         0, heads, step_head, (states, output_h)
     )

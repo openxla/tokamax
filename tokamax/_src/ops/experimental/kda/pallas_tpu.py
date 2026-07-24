@@ -22,21 +22,16 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
-from tokamax._src.ops import op
 from tokamax._src.ops.experimental.kda import base
 from tokamax._src.ops.experimental.kda.cp_utils import (
     CPContext,
     CPContextArg,
-)
-from tokamax._src.ops.experimental.kda.pallas_tpu_bwd import (
-    chunk_kda_bwd_custom,
 )
 from tokamax._src.ops.experimental.kda.pallas_tpu_fwd import (
     chunk_kda_fwd_custom,
 )
 from tokamax._src.ops.experimental.kda.pallas_tpu_types import (
     CpMetadata,
-    KdaResiduals,
 )
 from tokamax._src.ops.experimental.kda.utils import (
     _align_seqs,
@@ -156,8 +151,6 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
   def __post_init__(self):
     if self.chunk_size != 64:
       raise ValueError("`pallas_tpu` only supports chunk_size=64.")
-    if self.vjp is None:
-      object.__setattr__(self, "vjp", PallasTpuKimiDeltaAttentionVjp())
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -180,7 +173,7 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
       chunk_size: int,
       N_max: int | None,
   ) -> _PreparedKdaInputs:
-    """Canonicalizes inputs shared by the forward and backward kernels."""
+    """Canonicalizes inputs for the forward kernel."""
     cp_context, cu_seqlens = derive_cp_context(
         segment_ids=segment_ids,
         initial_state=initial_state,
@@ -416,102 +409,3 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
     if final_state is not None and final_state.ndim == 4:
       final_state = final_state[:, None]
     return (value, final_state), residuals
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class PallasTpuKimiDeltaAttentionVjp(
-    op.Op[Any, dict[str, Any], None, Any, Any]
-):
-  """Tokamax Op VJP wrapper for the Pallas TPU KDA backward path."""
-
-  def _fwd(
-      self,
-      residuals: KdaResiduals,
-      out: base.Output,
-      dout: base.Output,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      g: jax.Array,
-      beta: jax.Array,
-      *,
-      A_log: jax.Array | None,
-      dt_bias: jax.Array | None,
-      scale: float,
-      initial_state: jax.Array | None,
-      output_final_state: bool,
-      use_qk_l2norm_in_kernel: bool,
-      use_gate_in_kernel: bool,
-      segment_ids: jax.Array | None,
-      safe_gate: bool,
-      lower_bound: float | None,
-      disable_recompute: bool,
-      cp_context: CPContextArg,
-      chunk_size: int,
-      N_max: int | None,
-      return_residuals: bool,
-      config: Any,
-  ) -> tuple[dict[str, jax.Array], None]:
-    # Tokamax's VJP contract replays the original inputs here, but the backward
-    # kernel consumes the aligned and optionally L2-normalized copies retained
-    # in `residuals`. Reusing these arguments would skip that preprocessing.
-    del (
-        out,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        output_final_state,
-        return_residuals,
-        safe_gate,
-        config,
-    )
-
-    (
-        dq,
-        dk,
-        dv,
-        dg,
-        db,
-        dA,
-        dbias,
-        dh0,
-        dsegment_ids,
-    ) = chunk_kda_bwd_custom(
-        scale,
-        use_qk_l2norm_in_kernel,
-        use_gate_in_kernel,
-        lower_bound,
-        disable_recompute,
-        cp_context,
-        chunk_size,
-        N_max,
-        initial_state is not None,
-        residuals,
-        dout,
-    )
-
-    grads = {
-        "q": dq,
-        "k": dk,
-        "v": dv,
-        "g": dg,
-        "beta": db,
-    }
-    if A_log is not None:
-      grads["A_log"] = dA if dA is not None else jnp.zeros_like(A_log)
-    if dt_bias is not None:
-      grads["dt_bias"] = (
-          dbias if dbias is not None else jnp.zeros_like(dt_bias)
-      )
-    if initial_state is not None:
-      grads["initial_state"] = (
-          dh0 if dh0 is not None else jnp.zeros_like(initial_state)
-      )
-    if segment_ids is not None:
-      grads["segment_ids"] = (
-          dsegment_ids
-          if dsegment_ids is not None
-          else jnp.zeros_like(segment_ids)
-      )
-    return grads, None

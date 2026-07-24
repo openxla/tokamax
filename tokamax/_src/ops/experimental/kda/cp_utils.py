@@ -25,13 +25,9 @@ context can be constructed in JAX without a torch.distributed dependency.
 Algorithm: all-gather each rank's local state and transition matrix, then
 merge the contributions in sequence order.
 
-Each rank computes ``(S_ext, M)`` locally assuming ``S_in = 0`` (FWD) or
-``dS_out = 0`` (BWD), all-gathers both tensors, and then rebuilds its true
-boundary state ``S_in_r = sum_j (prod_{j' > j} M_{j'}) @ S_ext,j`` from
-upstream ranks (forward) or downstream ranks (backward).
-
-The forward and backward paths share the collectives and state-merge helpers
-defined here.
+Each rank computes ``(S_ext, M)`` locally assuming ``S_in = 0``, all-gathers
+both tensors, and then rebuilds its true boundary state
+``S_in_r = sum_j (prod_{j' > j} M_{j'}) @ S_ext,j`` from upstream ranks.
 
 **Entry form.** The framework (e.g. MaxText) shards ``segment_ids`` along
 T and feeds the rank-local slice into ``chunk_kda``; the caller passes a
@@ -83,8 +79,7 @@ class CPContext:
   ``__hash__`` and ``__eq__`` are based on identity + static fields only
   (``mesh`` id, ``axis_name``, ``cp_size``), so dataclass instances stay
   hashable even when chain fields are traced jnp.array values. This
-  matters because ``cp_context`` is a ``nondiff_argnum`` of
-  ``chunk_kda``'s ``jax.custom_vjp`` decoration.
+  keeps the context suitable for use as static operation metadata.
 
   Attributes:
     mesh: The JAX mesh containing the CP axis.
@@ -113,9 +108,8 @@ class CPContext:
 
   # Identity-based hash + eq so traced jnp.array fields (which are not
   # hashable) don't break dataclass auto-generated __hash__. This is safe
-  # for our use as a custom_vjp nondiff arg because each chunk_kda call
-  # site constructs its own CPContext — identity hashing keys the
-  # cache per call site, which is what we want.
+  # because each chunk_kda call site constructs its own CPContext — identity
+  # hashing keys the cache per call site, which is what we want.
   def __hash__(self) -> int:
     return hash((id(self.mesh), self.axis_name, self.cp_size))
 
@@ -407,32 +401,3 @@ def _merge_initial_state(
     return jnp.where(active, S_new, S_in_carry)
 
   return jax.lax.fori_loop(0, cp_size - 1, body, S_in)
-
-
-@jax.jit
-def _merge_dht(
-  dS_ext_all: jax.Array,
-  dM_all: jax.Array,
-  *,
-  rank: jax.Array,
-  post_num_ranks: jax.Array,
-  is_last_rank: jax.Array,
-) -> jax.Array:
-  """Merge downstream final-state gradients in furthest-to-nearest order.
-
-  Backward analogue of ``_merge_initial_state``. Accumulates in fp32.
-  """
-  cp_size = dS_ext_all.shape[0]
-  dS_ext_all = dS_ext_all.astype(jnp.float32)
-  dM_all = dM_all.astype(jnp.float32)
-  zero = jnp.zeros_like(dS_ext_all[0])
-
-  def body(i: int, carry: jax.Array) -> jax.Array:
-    idx = jnp.clip(rank + post_num_ranks - i, 0, cp_size - 1)
-    S_j = dS_ext_all[idx]
-    M_j = dM_all[idx]
-    merged = jnp.einsum("bhkj,bhjv->bhkv", M_j, carry) + S_j
-    active = (i < post_num_ranks) & ~is_last_rank
-    return jnp.where(active, merged, carry)
-
-  return jax.lax.fori_loop(0, cp_size, body, zero)
