@@ -22,6 +22,7 @@ from concurrent.futures import process
 import dataclasses
 import functools
 import os
+import time
 import typing
 from typing import Any, cast
 
@@ -92,14 +93,41 @@ class AutotuningData[K](
 
 
 def _compile(fn_factory, config, args, kwargs, *, seed=None):
+  t0 = time.time()
   fn = fn_factory(config)
   fn, x = benchmarking.standardize_function(fn, *args, kwargs=kwargs, seed=seed)
-  return benchmarking.compile_benchmark(fn, x), x  # pyrefly: ignore[bad-argument-type]
+  compiled_fn = benchmarking.compile_benchmark(fn, x)  # pyrefly: ignore[bad-argument-type]
+  compile_duration = time.time() - t0
+  if compile_duration > 900.0:
+    logging.warning(
+        "[SLOW COMPILE CONFIG DETECTED] Compilation for config %s took"
+        " %.2fs (>15 mins).",
+        config,
+        compile_duration,
+    )
+    print(
+        f"\n[BUGGY SLOW CONFIG REPORT] Config {config} took"
+        f" {compile_duration:.2f}s (>15m) to compile.\n"
+    )
+  elif compile_duration > 600.0:
+    logging.warning(
+        "[SLOW COMPILE CONFIG DETECTED] Compilation for config %s took"
+        " %.2fs (>10 mins).",
+        config,
+        compile_duration,
+    )
+    print(
+        f"\n[BUGGY SLOW CONFIG REPORT] Config {config} took"
+        f" {compile_duration:.2f}s (>10m) to compile.\n"
+    )
+  else:
+    logging.info("Config %s compiled in %.2fs", config, compile_duration)
+  return compiled_fn, x  # pyrefly: ignore[bad-argument-type]
 
 
-def _benchmark(fn_factory, config, args, kwargs, event_filter_regex=None):
+def _benchmark(fn_factory, config, args, kwargs):
   runner, x = _compile(fn_factory, config, args, kwargs, seed=0)
-  return runner(x, event_filter_regex=event_filter_regex)
+  return runner(x)
 
 
 class _SyncExecutor(futures.Executor):
@@ -118,24 +146,28 @@ class _SyncExecutor(futures.Executor):
 class Autotuner:
   """Autotuner for configurable JAX functions."""
 
-  compile_executor_fn: Callable[[], futures.Executor] | None = (
+  compile_executor_fn: Callable[..., futures.Executor] | None = (
       futures.ThreadPoolExecutor
   )
   executor_fn: Callable[[], futures.Executor] = _SyncExecutor
   timeout_seconds: float = 600.0
+  max_workers: int | None = None
 
   def autotune[C, **P](
       self,
       fn_factory: Callable[[C], Callable[P, Any]],
       configs: set[C],
       *args: P.args,
-      event_filter_regex: str | None = None,  # pyrefly: ignore[bad-function-definition]
+      timeout: float | None = None,  # pyrefly: ignore[bad-function-definition]
+      max_workers: int | None = None,
       **kwargs: P.kwargs,
   ) -> AutotuningData[C]:
     """Autotunes over configs for the given arguments."""
     executor = self.executor_fn()
     executor_args = {}
-    timeout = self.timeout_seconds
+    timeout = self.timeout_seconds if timeout is None else timeout
+    max_workers = self.max_workers if max_workers is None else max_workers
+    max_workers = os.cpu_count() if max_workers is None else max_workers
     vlog_exc_info = functools.partial(logging.vlog, 2, exc_info=True)
 
     results = {}
@@ -146,7 +178,7 @@ class Autotuner:
             " `ProcessPoolExecutor` executor."
         )
       # pytype: disable=wrong-keyword-args
-      with self.compile_executor_fn(max_workers=os.cpu_count()) as compile_exec:
+      with self.compile_executor_fn(max_workers=max_workers) as compile_exec:
         # pytype: enable=wrong-keyword-args
         compiled = {
             compile_exec.submit(_compile, fn_factory, cfg, args, kwargs): cfg
@@ -160,32 +192,29 @@ class Autotuner:
               compiled_fn, args = future.result()
               if initialized_args is None:
                 initialized_args = numerics.random_initialize(args)
-              executor_args[config] = (
-                  functools.partial(
-                      compiled_fn, event_filter_regex=event_filter_regex
-                  ),
-                  initialized_args,
-              )
+              executor_args[config] = (compiled_fn, initialized_args)
             except Exception as e:  # pylint: disable=broad-exception-caught
               vlog_exc_info("Config failed to compile: %s", config)
               results[config] = e
         except TimeoutError as e:
           slow_configs = [c for c in configs if c not in executor_args]
-          vlog_exc_info(
-              "Configs timed out during compilation: %s", slow_configs
+          logging.warning(
+              "[COMPILATION TIMEOUT] Configs timed out during compilation after"
+              " %.2fs: %s",
+              timeout,
+              slow_configs,
+          )
+          print(
+              "\n[BUGGY SLOW CONFIG REPORT] The following configs timed out"
+              f" during compilation (>{timeout:.2f}s):\n"
+              + "\n".join(f"  - {c}" for c in slow_configs)
+              + "\n"
           )
           for config in slow_configs:
             results[config] = e
     else:
       for config in configs:
-        executor_args[config] = (
-            _benchmark,
-            fn_factory,
-            config,
-            args,
-            kwargs,
-            event_filter_regex,
-        )
+        executor_args[config] = (_benchmark, fn_factory, config, args, kwargs)
 
     with executor:
       future_to_config = {

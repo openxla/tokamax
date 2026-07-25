@@ -163,6 +163,28 @@ class BoundArgumentsTest(parameterized.TestCase):
     self.assertIs(results.fastest_config, config)
     self.assertNotEmpty(cache)
 
+  def test_autotune_with_timeout(self):
+    config = _FakeOpConfig(3)
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    results = (
+        _FakeOp()
+        .bind(x, y)
+        .autotune({config}, cache_results=False, timeout=120.0)
+    )
+    self.assertIs(results.fastest_config, config)
+
+  def test_autotune_with_max_workers(self):
+    config = _FakeOpConfig(3)
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    results = (
+        _FakeOp()
+        .bind(x, y)
+        .autotune({config}, cache_results=False, max_workers=1)
+    )
+    self.assertIs(results.fastest_config, config)
+
   @parameterized.parameters(
       ((1,), (None,)), ((0, 0), (0, None)), ((1, 0), (None, 0))
   )
