@@ -401,6 +401,14 @@ class AUTO:
   ...
 
 
+@dataclasses.dataclass(frozen=True)
+class _OpReplaceFn:
+  op: Op
+
+  def __call__(self, config: Any) -> Op:
+    return self.op.replace(config=config)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class BoundArguments[C, K: Hashable]:
   """Bound arguments for an op's `__call__` method."""
@@ -570,7 +578,7 @@ class BoundArguments[C, K: Hashable]:
     configs = cast(set[C], configs)
 
     logging.debug("Autotuning %s(%s)", self.op, self.arguments)
-    op_fn = lambda config: self.op.replace(config=config)
+    op_fn = _OpReplaceFn(self.op)
     data = autotuner.autotune(
         op_fn,
         configs,
