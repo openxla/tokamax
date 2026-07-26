@@ -401,6 +401,14 @@ class AUTO:
   ...
 
 
+@dataclasses.dataclass(frozen=True)
+class _OpReplaceFn:
+  op: Op
+
+  def __call__(self, config: Any) -> Op:
+    return self.op.replace(config=config)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class BoundArguments[C, K: Hashable]:
   """Bound arguments for an op's `__call__` method."""
@@ -570,7 +578,7 @@ class BoundArguments[C, K: Hashable]:
     configs = cast(set[C], configs)
 
     logging.debug("Autotuning %s(%s)", self.op, self.arguments)
-    op_fn = lambda config: self.op.replace(config=config)
+    op_fn = _OpReplaceFn(self.op)
     data = autotuner.autotune(
         op_fn,
         configs,
@@ -676,6 +684,13 @@ def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
 def _abstractify(pytree):
   def abstractify_leaf(x):
     if isinstance(x, (jax.Array, np.ndarray)):
+      return jax.ShapeDtypeStruct(x.shape, x.dtype)
+    if isinstance(x, batching.BatchedShapeDtype):
+      # Strip layout/sharding but preserve BatchedShapeDtype type and vmap_axes.
+      return batching.BatchedShapeDtype(x.shape, x.dtype, x.vmap_axes)
+    if isinstance(x, jax.ShapeDtypeStruct):
+      # Strip layout and sharding information from ShapeDtypeStruct to ensure
+      # the generated cache key matches layout-free keys loaded from JSON.
       return jax.ShapeDtypeStruct(x.shape, x.dtype)
     return x
 
