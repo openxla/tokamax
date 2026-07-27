@@ -20,12 +20,14 @@ from absl import flags
 import google_benchmark
 from tokamax._src import benchmarking
 from tokamax._src.ops.normalization import base
+from tokamax._src.ops.normalization import mosaic as mosaic_norm
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import arg_specs
 
 
 _IMPLS = dict(
     pallas=pl_norm.PallasTritonNormalization(input_output_alias=False),
+    mosaic=mosaic_norm.PallasMosaicGpuNormalization(),
     xla=base.Normalization(),
 )
 _BENCHMARK_IMPLS_FWD = flags.DEFINE_list(

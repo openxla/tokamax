@@ -84,7 +84,7 @@ class LayerNormTest(parameterized.TestCase):
       x_shape = jax.ShapeDtypeStruct((a, 32), x.dtype)
       param_shape = jax.ShapeDtypeStruct(scale.shape, x.dtype)
 
-      if implementation == "triton":
+      if implementation in ("triton", "mosaic"):
         with self.assertRaisesRegex(Exception, "all implementations failed"):
           export.export(
               norm_fn,
