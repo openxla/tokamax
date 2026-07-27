@@ -17,7 +17,6 @@
 from collections.abc import Callable, Sequence
 from typing import Any, Final, Literal
 
-from absl import logging
 import immutabledict
 import jax
 from tokamax._src import gpu_utils
@@ -124,7 +123,6 @@ def layer_norm(
           subtract_mean=subtract_mean,
       )
     except NotImplementedError as e:
-      logging.exception('Failed to run implementation')
       errors.append(e)
 
   raise ExceptionGroup('all implementations failed', errors)
