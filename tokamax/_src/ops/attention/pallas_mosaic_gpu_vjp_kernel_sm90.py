@@ -47,7 +47,7 @@ _load_bcast = common.load_bcast
 _tiled_spec = mgpu_lib.tiled_swizzled_block_spec
 
 
-def _estimate_dq_smem_bytes(ba, block_q, block_kv, num_stages):
+def _estimate_dq_smem_bytes(ba, block_q, block_kv, num_stages, ds_dtype):
   """Estimates the dq kernel smem usage in bytes for a given configuration."""
   _, _, _, q, k, v = ba.args
   tile_q = 2 * block_q
@@ -57,7 +57,10 @@ def _estimate_dq_smem_bytes(ba, block_q, block_kv, num_stages):
   block_d = pl.cdiv(q.shape[-1], 64) * 64
   block_d_out = v.shape[-1]
   bytes_per_stage = block_kv * (block_d + block_d_out) * dtype_bits // 8  # k,v
-  if (bias := ba.kwargs["bias"]) is not None:
+  if (bias := ba.kwargs["bias"]) is None:
+    ds_bytes = 0
+  else:
+    ds_bytes = tile_q * block_kv * jnp.finfo(ds_dtype).bits // 8
     if bias.shape[-2] != 1 and bias.shape[-1] != 1:
       bytes_per_stage += tile_q * block_kv * jnp.finfo(bias.dtype).bits // 8
 
@@ -73,6 +76,7 @@ def _estimate_dq_smem_bytes(ba, block_q, block_kv, num_stages):
   return (
       (tile_q * (block_d + block_d_out) * dtype_bits // 8)  # q, dout
       + 3 * tile_q * _F32_BYTES  # m, l, delta
+      + ds_bytes
       + num_stages * bytes_per_stage
   )
 
@@ -107,8 +111,13 @@ def _estimate_dkv_smem_bytes(ba, block_q, block_kv, num_stages):
 
 
 def get_heuristics_config(ba: op.BoundArguments) -> Config:
+  _, _, _, q, k, _ = ba.args
+  bias = ba.kwargs["bias"]
+  dbias_intermediate_dtype = getattr(ba.op, "dbias_intermediate_dtype", None)
+  ds_dtype = vjp_common.get_ds_dtype(q, k, bias, dbias_intermediate_dtype)
+
   num_stages = 2
-  if _estimate_dq_smem_bytes(ba, 64, 64, 2) > _SMEM_SIZE_BYTES:
+  if _estimate_dq_smem_bytes(ba, 64, 64, 2, ds_dtype) > _SMEM_SIZE_BYTES:
     num_stages = 1
   if _estimate_dkv_smem_bytes(ba, 64, 64, 2) > _SMEM_SIZE_BYTES:
     num_stages = 1
@@ -222,6 +231,7 @@ def flash_attention_vjp_kernel(
       ds_gmem,
       q_smems,
       dout_smems,
+      ds_smems,
       barriers,
       block_q: int,
       block_kv: int,
@@ -249,6 +259,7 @@ def flash_attention_vjp_kernel(
 
     q_smem = q_smems.at[wg]
     dout_smem = dout_smems.at[wg]
+    ds_smem = None if ds_smems is None else ds_smems.at[wg]
     barrier = barriers.at[wg]
 
     def compute_thread(pipeline_callback):
@@ -404,8 +415,11 @@ def flash_attention_vjp_kernel(
         ds = jnp.where(mask, ds, 0.0)
 
       if ds_gmem is not None:
-        # TODO: Make this store non-blocking.
-        ds_gmem[hi, qs, ks] = ds.astype(ds_gmem.dtype)
+        assert ds_smem is not None
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        ds_smem[...] = ds.astype(ds_smem.dtype)
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(ds_smem, ds_gmem.at[hi, qs, ks])
 
       plgpu.wgmma(dq_acc, ds.astype(k_smem.dtype), k_smem)
       plgpu.wgmma_wait(0)
@@ -707,6 +721,7 @@ def flash_attention_vjp_kernel(
   tile_q_dq = compute_wgs * block_q_dq
   if bias is None:
     ds_out_shape = None
+    ds_scratch = None
   else:
     # NOTE: TMA stores to GMEM do not mask out-of-bounds writes, so we must pad
     # the output to a multiple of the block size.
@@ -714,6 +729,7 @@ def flash_attention_vjp_kernel(
     kv_seq_len_ = pl.cdiv(kv_seq_len, block_kv_dq) * block_kv_dq
     ds_out_shape = (num_q_heads, q_seq_len_, kv_seq_len_)
     ds_out_shape = jax.ShapeDtypeStruct(ds_out_shape, ds_dtype)
+    ds_scratch = tiled_wgs_smem((block_q_dq, block_kv_dq), ds_dtype, "ds")
   # TODO: Optionally fuse the dq and dkv kernels.
   dq, ds = plgpu.kernel(
       functools.partial(kernel_dq, block_q=block_q_dq, block_kv=block_kv_dq),
@@ -721,6 +737,7 @@ def flash_attention_vjp_kernel(
       scratch_types=[
           tiled_wgs_smem((block_q_dq, head_dim), q.dtype, "q"),
           tiled_wgs_smem((block_q_dq, head_dim_out), dout.dtype, "dout"),
+          ds_scratch,
           plgpu.Barrier(num_barriers=compute_wgs, num_arrivals=2),
       ],
       compiler_params=plgpu.CompilerParams(approx_math=True),

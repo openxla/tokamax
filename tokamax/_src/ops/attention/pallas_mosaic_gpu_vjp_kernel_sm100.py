@@ -247,15 +247,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
 
   head_dim, head_dim_out = _get_input_metadata(q, v)
   dbias_intermediate_dtype = getattr(ba.op, "dbias_intermediate_dtype", None)
-
-  if bias is None:
-    ds_dtype = None
-  elif dbias_intermediate_dtype is None:
-    ds_dtype = bias.dtype
-  elif bias.shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
-    ds_dtype = bias.dtype
-  else:
-    ds_dtype = dbias_intermediate_dtype
+  ds_dtype = vjp_common.get_ds_dtype(q, k, bias, dbias_intermediate_dtype)
 
   configs = set()
   min_dq_smem = float("inf")

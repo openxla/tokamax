@@ -150,20 +150,12 @@ class PallasMosaicGpuFlashAttentionVjp(
     k_start = _broadcast_to_rank(k_start, q.ndim - 1)
     k_end = _broadcast_to_rank(k_end, q.ndim - 1)
 
-    if bias is None:
-      ds_dtype = None
-    elif self.dbias_intermediate_dtype is None:
-      ds_dtype = bias.dtype
-    elif bias.shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
-      ds_dtype = bias.dtype
-    else:
-      ds_dtype = self.dbias_intermediate_dtype
-
+    dbias_intermediate_dtype = self.dbias_intermediate_dtype
     kwargs = dict(
         is_causal=is_causal,
         logits_scale=logits_scale,
         logits_soft_cap=logits_soft_cap,
-        ds_dtype=ds_dtype,
+        ds_dtype=vjp_common.get_ds_dtype(q, k, bias, dbias_intermediate_dtype),
         config=config,
     )
 
