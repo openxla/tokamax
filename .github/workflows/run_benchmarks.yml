@@ -14,6 +14,11 @@ on:
         required: false
         type: string
         default: ""
+      custom_metadata:
+        description: "JSON string of metadata to append to the benchmark result. Overwrites static metadata from the registry but is overwritten by dynamic metadata from the workload."
+        required: false
+        type: string
+        default: "{}"
       enable_xprof:
         description: "Enable xprof trace collection."
         required: false
@@ -39,5 +44,6 @@ jobs:
       pub_sub_gcp_topic_id: "public-results-prod"
       benchmark_filter: ${{ inputs.benchmark_filter }}
       environment_filter: ${{ inputs.environment_filter }}
+      custom_metadata: ${{ inputs.custom_metadata }}
       custom_env_vars: |
         ${{ inputs.enable_xprof == true && 'TOKAMAX_DUMP_XPROF=true' || '' }}
