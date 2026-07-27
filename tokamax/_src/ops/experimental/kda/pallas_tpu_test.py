@@ -53,6 +53,7 @@ def compare_tensor(
     max_ulp: int = 1,
     dtype: jax.typing.DTypeLike = jnp.bfloat16,
     compare_dtype: jax.typing.DTypeLike = np.float64,
+    max_rms_error_ratio: float | None = None,
 ) -> bool:
   """Compares two tensors and prints focused numerical diagnostics."""
   if expected is None and actual is None:
@@ -88,29 +89,47 @@ def compare_tensor(
   max_diff = np.max(diff)
   max_value = np.max(np.abs(expected_np))
   max_relative_diff = np.max(diff / (np.abs(expected_np) + 1e-12))
-  is_close = np.allclose(
-      actual_np,
-      expected_np,
-      atol=atol,
-      rtol=rtol,
-      equal_nan=True,
-  )
+  rms_error_ratio = None
+  if max_rms_error_ratio is not None:
+    rms_error = np.sqrt(np.mean(np.square(diff)))
+    reference_rms = np.sqrt(np.mean(np.square(expected_np)))
+    rms_error_ratio = rms_error / (reference_rms + 1e-8)
+    is_close = bool(max_diff <= 1e-6 or rms_error_ratio < max_rms_error_ratio)
+  else:
+    is_close = np.allclose(
+        actual_np,
+        expected_np,
+        atol=atol,
+        rtol=rtol,
+        equal_nan=True,
+    )
 
-  if not is_close:
-    ulp = compute_ulp(
-        np.maximum(np.abs(expected_np), np.abs(actual_np)), dtype
-    )
-    tolerance = np.maximum(
-        atol + rtol * np.abs(expected_np), max_ulp * ulp
-    )
-    is_close = bool(np.all(diff <= tolerance))
+    if not is_close:
+      ulp = compute_ulp(
+          np.maximum(np.abs(expected_np), np.abs(actual_np)), dtype
+      )
+      tolerance = np.maximum(
+          atol + rtol * np.abs(expected_np), max_ulp * ulp
+      )
+      is_close = bool(np.all(diff <= tolerance))
 
   print(f"[{name}] {'PASS' if is_close else 'FAIL'}")
   print(f"  Max Value        : {max_value:.6e}")
   print(f"  Max Abs Diff     : {max_diff:.6e}")
   print(f"  Max Rel Diff     : {max_relative_diff:.6e}")
+  if rms_error_ratio is not None:
+    print(f"  RMS Error Ratio  : {rms_error_ratio:.6e}")
+    print(f"  RMS Ratio Limit  : {max_rms_error_ratio:.6e}")
 
   if not is_close:
+    if max_rms_error_ratio is not None:
+      index = np.unravel_index(np.argmax(diff), diff.shape)
+      print(f"  Max Mismatch details at index {index}:")
+      print(f"    Left (expected) = {expected_np[index]}")
+      print(f"    Right (actual)  = {actual_np[index]}")
+      print(f"    Diff            = {diff[index]}")
+      return False
+
     error_ratio = diff / (tolerance + 1e-12)
     index = np.unravel_index(np.argmax(error_ratio), error_ratio.shape)
     print(f"  Max Mismatch details at index {index}:")
@@ -154,10 +173,15 @@ class TestConfig:
   lower_bound: float | None = None
   disable_recompute: bool = True
   forward_check: str = "reference"
+  backward_check: str = "reference"
   forward_atol: float = 0.05
   forward_rtol: float = 0.05
   state_atol: float | None = None
   state_rtol: float | None = None
+  backward_atol: float = 0.05
+  backward_rtol: float = 0.05
+  backward_rms_error_ratio: float | None = None
+  backward_gate_rms_error_ratio: float | None = None
   long: bool = False
 
   @property
@@ -197,6 +221,8 @@ class _Inputs:
   dt_bias: jax.Array
   initial_state: jax.Array | None
   segment_ids: jax.Array | None
+  dout: jax.Array
+  dfinal_state: jax.Array | None
 
 
 def make_test_config(
@@ -238,6 +264,10 @@ def _chunk_api_case(name: str, **cfg) -> TestConfig:
   dtype = cfg.pop("dtype", jnp.float32)
   has_h0 = cfg.pop("has_h0", True)
   is_bf16 = dtype == jnp.bfloat16
+  masked_gate = (
+      cfg.get("gate_mask_probability", 0.0) > 0
+      or cfg.get("gate_logit_normalizer", 1.0) != 1.0
+  )
   return make_test_config(
       f"chunk_api_{name}",
       dtype=dtype,
@@ -248,6 +278,8 @@ def _chunk_api_case(name: str, **cfg) -> TestConfig:
       disable_recompute=cfg.pop("disable_recompute", False),
       forward_atol=0.05 if is_bf16 else 5e-3,
       forward_rtol=0.05 if is_bf16 else 5e-3,
+      backward_atol=0.05 if is_bf16 else (2e-2 if masked_gate else 1e-2),
+      backward_rtol=0.05 if is_bf16 else (2e-2 if masked_gate else 1e-2),
       **cfg,
   )
 
@@ -263,6 +295,8 @@ def _chunk_fwd_case(name: str, **cfg) -> TestConfig:
       disable_recompute=False,
       forward_atol=0.05 if is_bf16 else 2e-4,
       forward_rtol=0.05 if is_bf16 else 2e-4,
+      backward_atol=0.05 if is_bf16 else 1e-3,
+      backward_rtol=0.05 if is_bf16 else 1e-3,
       **cfg,
   )
 
@@ -294,6 +328,8 @@ def _varlen_case(
   forward_rtol = kwargs.pop("forward_rtol", 0.05 if is_bf16 else 5e-4)
   state_atol = kwargs.pop("state_atol", 0.05 if is_bf16 else 2e-3)
   state_rtol = kwargs.pop("state_rtol", 0.05 if is_bf16 else 2e-3)
+  backward_atol = kwargs.pop("backward_atol", 0.05 if is_bf16 else 1e-2)
+  backward_rtol = kwargs.pop("backward_rtol", 0.05 if is_bf16 else 5e-3)
   long = kwargs.pop("long", T >= 8192)
   return make_test_config(
       name,
@@ -312,6 +348,8 @@ def _varlen_case(
       forward_rtol=forward_rtol,
       state_atol=state_atol,
       state_rtol=state_rtol,
+      backward_atol=backward_atol,
+      backward_rtol=backward_rtol,
       long=long,
       **kwargs,
   )
@@ -337,6 +375,8 @@ def _cp_case(
   is_bf16 = dtype == jnp.bfloat16
   forward_atol = kwargs.pop("forward_atol", 0.05 if is_bf16 else 5e-4)
   forward_rtol = kwargs.pop("forward_rtol", 0.05 if is_bf16 else 5e-4)
+  backward_atol = kwargs.pop("backward_atol", 0.05 if is_bf16 else 1e-3)
+  backward_rtol = kwargs.pop("backward_rtol", backward_atol)
   long = kwargs.pop("long", T >= 8192)
   safe_gate = kwargs.pop("safe_gate", False)
   return make_test_config(
@@ -354,6 +394,8 @@ def _cp_case(
       safe_gate=safe_gate,
       forward_atol=forward_atol,
       forward_rtol=forward_rtol,
+      backward_atol=backward_atol,
+      backward_rtol=backward_rtol,
       long=long,
       **kwargs,
   )
@@ -432,7 +474,7 @@ _CASES.extend([
 ])
 
 
-# Forward public-wrapper cases from test_varlen_e2e.py.
+# Forward and backward public-wrapper cases from test_varlen_e2e.py.
 _CASES.extend([
     _varlen_case("varlen_e2e_0", seq_lens=(64, 128)),
     _varlen_case("varlen_e2e_1", seq_lens=(128, 64, 192)),
@@ -471,52 +513,54 @@ _CASES.extend([
 # test's end-to-end call; the isolated intra-chunk tests are intentionally
 # omitted.
 _CASES.extend([
-    _varlen_case("prod_preactivated_0", seq_lens=(64, 128), input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_1", seq_lens=(128, 64, 192), input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_2", seq_lens=(30, 50), T=128, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_3", seq_lens=(45, 80, 20), T=256, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_4", seq_lens=(64, 128), input_profile="prod", use_initial_state=True, safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_5", seq_lens=(64, 128), T=256, N_pad=8, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_6", seq_lens=(64, 128), input_profile="prod", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("prod_preactivated_7", seq_lens=(45, 80, 20), T=256, input_profile="prod", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("prod_preactivated_8", seq_lens=(64, 128), input_profile="prod", dtype=jnp.bfloat16, use_initial_state=True, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("prod_preactivated_9", seq_lens=(450, 800, 200), T=8192, N_pad=64, input_profile="prod", dtype=jnp.bfloat16, use_initial_state=True, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("prod_preactivated_10", seq_lens=(64, 128), input_profile="low_gate", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_11", seq_lens=(64, 128), input_profile="low_gate", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("prod_preactivated_12", seq_lens=(45, 80, 20), T=256, input_profile="low_gate", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("prod_preactivated_13", seq_lens=(64, 128), input_profile="strong_gate", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_14", seq_lens=(64, 128), input_profile="strong_gate", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("prod_preactivated_15", seq_lens=(45, 80, 20), T=256, input_profile="strong_gate", dtype=jnp.bfloat16, use_initial_state=True, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
+    _varlen_case("prod_preactivated_0", seq_lens=(64, 128), input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_1", seq_lens=(128, 64, 192), input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_2", seq_lens=(30, 50), T=128, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_3", seq_lens=(45, 80, 20), T=256, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_4", seq_lens=(64, 128), input_profile="prod", use_initial_state=True, safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_5", seq_lens=(64, 128), T=256, N_pad=8, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_6", seq_lens=(64, 128), input_profile="prod", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("prod_preactivated_7", seq_lens=(45, 80, 20), T=256, input_profile="prod", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("prod_preactivated_8", seq_lens=(64, 128), input_profile="prod", dtype=jnp.bfloat16, use_initial_state=True, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("prod_preactivated_9", seq_lens=(450, 800, 200), T=8192, N_pad=64, input_profile="prod", dtype=jnp.bfloat16, use_initial_state=True, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("prod_preactivated_10", seq_lens=(64, 128), input_profile="low_gate", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_11", seq_lens=(64, 128), input_profile="low_gate", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("prod_preactivated_12", seq_lens=(45, 80, 20), T=256, input_profile="low_gate", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("prod_preactivated_13", seq_lens=(64, 128), input_profile="strong_gate", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_14", seq_lens=(64, 128), input_profile="strong_gate", dtype=jnp.bfloat16, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("prod_preactivated_15", seq_lens=(45, 80, 20), T=256, input_profile="strong_gate", dtype=jnp.bfloat16, use_initial_state=True, safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
 ])
 
 _CASES.extend([
-    _varlen_case("prod_preactivated_batch_0", batch_seq_lens=((64, 128), (128, 64)), input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_batch_1", batch_seq_lens=((64, 128), (128, 64)), use_initial_state=True, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_batch_2", batch_seq_lens=((64, 128), (64, 64, 64)), use_initial_state=True, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3),
-    _varlen_case("prod_preactivated_batch_3", batch_seq_lens=((64, 128), (128, 64)), dtype=jnp.bfloat16, use_initial_state=True, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
+    _varlen_case("prod_preactivated_batch_0", batch_seq_lens=((64, 128), (128, 64)), input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_batch_1", batch_seq_lens=((64, 128), (128, 64)), use_initial_state=True, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_batch_2", batch_seq_lens=((64, 128), (64, 64, 64)), use_initial_state=True, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=8e-4, forward_rtol=8e-4, state_atol=5e-3, state_rtol=5e-3, backward_atol=2e-2, backward_rtol=1e-2),
+    _varlen_case("prod_preactivated_batch_3", batch_seq_lens=((64, 128), (128, 64)), dtype=jnp.bfloat16, use_initial_state=True, input_profile="prod", safe_gate=True, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
 ])
 
 
 # Public chunk_kda fused-gate E2E cases from test_segment_e2e.py.
-# The unified E2E test compares forward outputs and final states against XLA.
+# The source uses per-sequence Pallas as its backward baseline. The unified E2E
+# test compares against XLA, whose bf16 fused-gate accumulation differs more
+# when the final-state cotangent is present.
 _CASES.extend([
-    _varlen_case("segment_fused_fwd_0", seq_lens=(64, 128), H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3),
-    _varlen_case("segment_fused_fwd_1", seq_lens=(128, 64, 192), H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3),
-    _varlen_case("segment_fused_fwd_2", seq_lens=(30, 50), T=128, H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3),
-    _varlen_case("segment_fused_fwd_3", seq_lens=(45, 80, 20), T=256, H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3),
-    _varlen_case("segment_fused_fwd_4", seq_lens=(64, 128), H=8, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3),
-    _varlen_case("segment_fused_fwd_5", seq_lens=(45, 80, 20, 1500, 300, 2000, 1200, 800, 1747, 500), T=8192, H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3),
-    _varlen_case("segment_fused_fwd_6", seq_lens=(64, 128), H=8, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("segment_fused_fwd_7", seq_lens=(128, 64, 192), H=8, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("segment_fused_fwd_8", seq_lens=(45, 80, 20), T=256, H=8, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
-    _varlen_case("segment_fused_fwd_9", seq_lens=(64, 128), H=8, dtype=jnp.bfloat16, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
+    _varlen_case("segment_fused_fwd_0", seq_lens=(64, 128), H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("segment_fused_fwd_1", seq_lens=(128, 64, 192), H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("segment_fused_fwd_2", seq_lens=(30, 50), T=128, H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("segment_fused_fwd_3", seq_lens=(45, 80, 20), T=256, H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("segment_fused_fwd_4", seq_lens=(64, 128), H=8, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("segment_fused_fwd_5", seq_lens=(45, 80, 20, 1500, 300, 2000, 1200, 800, 1747, 500), T=8192, H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("segment_fused_fwd_6", seq_lens=(64, 128), H=8, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.1, backward_rtol=0.1),
+    _varlen_case("segment_fused_fwd_7", seq_lens=(128, 64, 192), H=8, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.1, backward_rtol=0.1),
+    _varlen_case("segment_fused_fwd_8", seq_lens=(45, 80, 20), T=256, H=8, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.1, backward_rtol=0.1),
+    _varlen_case("segment_fused_fwd_9", seq_lens=(64, 128), H=8, dtype=jnp.bfloat16, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.1, backward_rtol=0.1),
 ])
 
 _CASES.extend([
-    _varlen_case("segment_fused_batch_0", batch_seq_lens=((64, 128), (128, 64)), H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3),
-    _varlen_case("segment_fused_batch_1", batch_seq_lens=((64, 128), (128, 64)), H=8, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3),
-    _varlen_case("segment_fused_batch_2", batch_seq_lens=((64, 128), (64, 64, 64)), H=8, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3),
-    _varlen_case("segment_fused_batch_3", batch_seq_lens=((64, 128), (128, 64)), H=8, dtype=jnp.bfloat16, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
+    _varlen_case("segment_fused_batch_0", batch_seq_lens=((64, 128), (128, 64)), H=8, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("segment_fused_batch_1", batch_seq_lens=((64, 128), (128, 64)), H=8, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("segment_fused_batch_2", batch_seq_lens=((64, 128), (64, 64, 64)), H=8, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, state_atol=8e-3, state_rtol=8e-3, backward_atol=0.05, backward_rtol=0.05),
+    _varlen_case("segment_fused_batch_3", batch_seq_lens=((64, 128), (128, 64)), H=8, dtype=jnp.bfloat16, use_initial_state=True, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.1, backward_rtol=0.1),
 ])
 
 _CASES.extend([
@@ -532,27 +576,35 @@ _CASES.extend([
 
 _CASES.extend([
     _cp_case("cp_prod_cp2_sparse_3_bf16", cp_size=2, T=16384, H=32, seq_lens=(5000, 6000, 5384), seed=42, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05),
-    _cp_case("cp_prod_cp2_medium_10_fp32", cp_size=2, T=16384, H=32, seq_lens=_lengths_from_boundaries((0, 700, 1800, 3500, 5200, 7000, 9000, 10500, 12500, 14000, 16384)), seed=42, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4),
+    _cp_case("cp_prod_cp2_medium_10_fp32", cp_size=2, T=16384, H=32, seq_lens=_lengths_from_boundaries((0, 700, 1800, 3500, 5200, 7000, 9000, 10500, 12500, 14000, 16384)), seed=42, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, backward_rms_error_ratio=8e-3, backward_gate_rms_error_ratio=2e-2),
     _cp_case("cp_prod_cp2_medium_10_bf16", cp_size=2, T=16384, H=32, seq_lens=_lengths_from_boundaries((0, 700, 1800, 3500, 5200, 7000, 9000, 10500, 12500, 14000, 16384)), seed=42, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05),
-    _cp_case("cp_prod_cp2_dense_25_fp32", cp_size=2, T=16384, H=32, seq_lens=_jittered_lengths(16384, 25, 11), seed=42, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4),
+    _cp_case("cp_prod_cp2_dense_25_fp32", cp_size=2, T=16384, H=32, seq_lens=_jittered_lengths(16384, 25, 11), seed=42, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, backward_rms_error_ratio=8e-3, backward_gate_rms_error_ratio=2e-2),
     _cp_case("cp_prod_cp2_dense_25_bf16", cp_size=2, T=16384, H=32, seq_lens=_jittered_lengths(16384, 25, 11), seed=42, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05),
-    _cp_case("cp_prod_cp2_max_45_fp32", cp_size=2, T=16384, H=32, seq_lens=_jittered_lengths(16384, 45, 12), seed=42, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4),
+    _cp_case("cp_prod_cp2_max_45_fp32", cp_size=2, T=16384, H=32, seq_lens=_jittered_lengths(16384, 45, 12), seed=42, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, backward_rms_error_ratio=8e-3, backward_gate_rms_error_ratio=2e-2),
     _cp_case("cp_prod_cp2_max_45_bf16", cp_size=2, T=16384, H=32, seq_lens=_jittered_lengths(16384, 45, 12), seed=42, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=False, safe_gate=False, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05),
 ])
 _CASES.extend([
-    _cp_case("cp_prod_cp4_sparse_4_fp32", cp_size=4, T=32768, H=32, seq_lens=(8000, 8000, 8000, 8768), seed=99, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4),
+    _cp_case("cp_prod_cp4_sparse_4_fp32", cp_size=4, T=32768, H=32, seq_lens=(8000, 8000, 8000, 8768), seed=99, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, backward_rms_error_ratio=8e-3, backward_gate_rms_error_ratio=2e-2),
     _cp_case("cp_prod_cp4_sparse_4_bf16", cp_size=4, T=32768, H=32, seq_lens=(8000, 8000, 8000, 8768), seed=99, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05),
-    _cp_case("cp_prod_cp4_medium_15_fp32", cp_size=4, T=32768, H=32, seq_lens=_lengths_from_boundaries((0, 1500, 5500, 10500, 15500, 20500, 26500, 30500, 32768)), seed=99, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4),
+    _cp_case("cp_prod_cp4_medium_15_fp32", cp_size=4, T=32768, H=32, seq_lens=_lengths_from_boundaries((0, 1500, 5500, 10500, 15500, 20500, 26500, 30500, 32768)), seed=99, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, backward_rms_error_ratio=8e-3, backward_gate_rms_error_ratio=2e-2),
     _cp_case("cp_prod_cp4_medium_15_bf16", cp_size=4, T=32768, H=32, seq_lens=_lengths_from_boundaries((0, 1500, 5500, 10500, 15500, 20500, 26500, 30500, 32768)), seed=99, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05),
-    _cp_case("cp_prod_cp4_dense_40_fp32", cp_size=4, T=32768, H=32, seq_lens=_jittered_lengths(32768, 40, 21), seed=99, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4),
+    _cp_case("cp_prod_cp4_dense_40_fp32", cp_size=4, T=32768, H=32, seq_lens=_jittered_lengths(32768, 40, 21), seed=99, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, backward_rms_error_ratio=8e-3, backward_gate_rms_error_ratio=2e-2),
     _cp_case("cp_prod_cp4_dense_40_bf16", cp_size=4, T=32768, H=32, seq_lens=_jittered_lengths(32768, 40, 21), seed=99, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05),
-    _cp_case("cp_prod_cp4_max_85_fp32", cp_size=4, T=32768, H=32, seq_lens=_jittered_lengths(32768, 85, 20), seed=99, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4),
+    _cp_case("cp_prod_cp4_max_85_fp32", cp_size=4, T=32768, H=32, seq_lens=_jittered_lengths(32768, 85, 20), seed=99, dtype=jnp.float32, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=8e-4, forward_rtol=8e-4, backward_rms_error_ratio=8e-3, backward_gate_rms_error_ratio=2e-2),
     _cp_case("cp_prod_cp4_max_85_bf16", cp_size=4, T=32768, H=32, seq_lens=_jittered_lengths(32768, 85, 20), seed=99, dtype=jnp.bfloat16, input_profile="prod", use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0, forward_atol=0.05, forward_rtol=0.05),
 ])
 
 
-# Batched context-parallel forward coverage.
+# The source backward suite uses all available devices. Tokamax keeps the
+# explicit CP4 mesh used by the source forward tests so collection is stable
+# on hosts exposing extra TPU devices.
 _CASES.extend([
+    _cp_case("cp_bwd_h2_single_fp32", cp_size=4, T=512, H=2),
+    _cp_case("cp_bwd_h16_single_mask03_fp32", cp_size=4, T=512, H=16, gate_mask_probability=0.3, backward_atol=2e-3),
+    _cp_case("cp_bwd_h2_split075_fp32", cp_size=4, T=512, H=2, seq_lens=(384, 128), backward_atol=2e-3),
+    _cp_case("cp_bwd_h16_split05_mask03_fp32", cp_size=4, T=512, H=16, seq_lens=(256, 256), gate_mask_probability=0.3, backward_atol=2e-3),
+    _cp_case("cp_bwd_h8_split0375_fp32", cp_size=4, T=512, H=8, seq_lens=(192, 320), backward_atol=5e-4),
+    _cp_case("cp_bwd_h16_t32768_bf16", cp_size=4, T=32768, H=16, dtype=jnp.bfloat16, gate_mask_probability=0.3),
     _cp_case("cp_fwd_cp2_b2_single_fp32", cp_size=2, T=8192, H=32, batch_seq_lens=((8192,), (8192,)), seed=50, dtype=jnp.float32),
     _cp_case("cp_fwd_cp2_b2_single_bf16", cp_size=2, T=8192, H=32, batch_seq_lens=((8192,), (8192,)), seed=50, dtype=jnp.bfloat16),
     _cp_case("cp_fwd_cp2_b2_different_fp32", cp_size=2, T=8192, H=32, batch_seq_lens=((8192,), (1024, 7168)), seed=51, dtype=jnp.float32),
@@ -561,14 +613,18 @@ _CASES.extend([
     _cp_case("cp_fwd_cp4_b2_multi_bf16", cp_size=4, T=8192, H=32, batch_seq_lens=(_lengths_from_boundaries((0, 392, 1024, 3241, 5120, 7777, 8192)), (2048, 2048, 2048, 2048)), seed=52, dtype=jnp.bfloat16),
     _cp_case("cp_fwd_cp2_b4_varlen_fp32", cp_size=2, T=8192, H=32, batch_seq_lens=((8192,), (3000, 5192), (1024, 3072, 4096), (512, 1536, 3072, 1880, 1192)), seed=53, dtype=jnp.float32),
     _cp_case("cp_fwd_cp2_b4_varlen_bf16", cp_size=2, T=8192, H=32, batch_seq_lens=((8192,), (3000, 5192), (1024, 3072, 4096), (512, 1536, 3072, 1880, 1192)), seed=53, dtype=jnp.bfloat16),
+    _cp_case("cp_bwd_b2_single_fp32", cp_size=4, T=512, H=2, batch_seq_lens=((512,), (512,))),
+    _cp_case("cp_bwd_b2_different_fp32", cp_size=4, T=512, H=2, batch_seq_lens=((512,), (384, 128)), backward_atol=2e-3),
+    _cp_case("cp_bwd_b2_splits_fp32", cp_size=4, T=512, H=8, batch_seq_lens=((256, 256), (192, 320))),
+    _cp_case("cp_bwd_b4_mixed_mask03_fp32", cp_size=4, T=512, H=2, batch_seq_lens=((512,), (256, 256), (384, 128), (512,)), gate_mask_probability=0.3, backward_atol=2e-3),
     make_test_config("tokamax_fixed_t8192", B=1, T=8192, H=16, D=128, dtype=jnp.bfloat16, input_profile="model", output_final_state=True, use_qk_l2norm_in_kernel=True, long=True),
-    _varlen_case("tokamax_varlen_fused", seq_lens=(45, 80, 20), T=256, use_initial_state=True, use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, lower_bound=-0.01, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05),
+    _varlen_case("tokamax_varlen_fused", seq_lens=(45, 80, 20), T=256, use_initial_state=True, use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, lower_bound=-0.01, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
     make_test_config("tokamax_fixed_unaligned_kv", B=1, T=64, H=1, K=129, V=127, dtype=jnp.bfloat16, input_profile="model"),
     _cp_case("tokamax_cp2_small", cp_size=2, T=128, H=2, dtype=jnp.float32),
     # Public varlen regressions from test_varlen_e2e.py.
-    make_test_config("varlen_shallow_tail", T=256, H=2, K=128, V=128, seq_lens=(30, 50), dtype=jnp.float32, input_profile="model"),
-    make_test_config("varlen_shallow_tail_large_head", T=256, H=2, K=256, V=256, seq_lens=(30, 50), dtype=jnp.float32, input_profile="model"),
-    make_test_config("varlen_single_seq_tail", T=256, H=2, K=128, V=128, seq_lens=(45,), dtype=jnp.float32, input_profile="model"),
+    make_test_config("varlen_shallow_tail", T=256, H=2, K=128, V=128, seq_lens=(30, 50), dtype=jnp.float32, input_profile="model", backward_check="finite"),
+    make_test_config("varlen_shallow_tail_large_head", T=256, H=2, K=256, V=256, seq_lens=(30, 50), dtype=jnp.float32, input_profile="model", backward_check="finite"),
+    make_test_config("varlen_single_seq_tail", T=256, H=2, K=128, V=128, seq_lens=(45,), dtype=jnp.float32, input_profile="model", backward_check="finite"),
     make_test_config("varlen_padding_tail", T=128, H=2, K=128, V=128, seq_lens=(30, 50), dtype=jnp.float32, input_profile="model", forward_check="padding_tail"),
     _varlen_case("varlen_empty_states_h0", seq_lens=(64, 128), T=256, N_pad=8, use_initial_state=True, forward_check="empty_states"),
     _varlen_case("varlen_empty_states_no_h0", seq_lens=(64, 128), T=256, N_pad=8, forward_check="empty_states"),
@@ -819,6 +875,25 @@ def _make_inputs(case: TestConfig) -> _Inputs:
         dtype=jnp.float32,
     ).astype(initial_dtype)
 
+  dout = jax.random.normal(
+      keys[8],
+      (case.heads, case.batch, case.seq_len, case.value_dim),
+      dtype=jnp.float32,
+  ).astype(case.dtype)
+  dfinal_state = None
+  if case.output_final_state:
+    dfinal_state = 0.1 * jax.random.normal(
+        keys[9],
+        (
+            case.batch,
+            state_count,
+            case.heads,
+            case.key_dim,
+            case.value_dim,
+        ),
+        dtype=jnp.float32,
+    )
+
   inputs = _Inputs(
       q=q,
       k=k,
@@ -829,6 +904,8 @@ def _make_inputs(case: TestConfig) -> _Inputs:
       dt_bias=dt_bias,
       initial_state=initial_state,
       segment_ids=segment_ids,
+      dout=dout,
+      dfinal_state=dfinal_state,
   )
   if case.forward_check == "padding_tail":
     inputs = dataclasses.replace(
@@ -943,11 +1020,131 @@ def _cp_forward(
   return output, None
 
 
+def _cp_backward(
+    implementation: api.Implementation | Sequence[api.Implementation] | None,
+    case: TestConfig,
+    inputs: _Inputs,
+) -> tuple[jax.Array, ...]:
+  mesh, cp_context = _cp_mesh(case)
+
+  def local_backward(q, k, v, g, beta, segment_ids, dout):
+    local_inputs = dataclasses.replace(
+        inputs,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        segment_ids=segment_ids,
+        dout=dout,
+    )
+
+    def local_forward(q, k, v, g, beta):
+      current_inputs = dataclasses.replace(
+          local_inputs, q=q, k=k, v=v, g=g, beta=beta
+      )
+      output, _ = _call_attention(
+          implementation, case, current_inputs, cp_context=cp_context
+      )
+      return output
+
+    _, pullback = jax.vjp(local_forward, q, k, v, g, beta)
+    return pullback(dout)
+
+  qkv_spec = P(None, None, "context", None)
+  beta_spec = P(None, None, "context")
+  with jaxtyping.disable_jaxtyping(), jax.set_mesh(mesh):
+    backward = jax.jit(
+        jax.shard_map(
+            local_backward,
+            mesh=mesh,
+            in_specs=(qkv_spec,) * 4
+            + (beta_spec, P(None, "context"), qkv_spec),
+            out_specs=(qkv_spec,) * 4 + (beta_spec,),
+            check_vma=False,
+        )
+    )
+    return backward(
+        inputs.q,
+        inputs.k,
+        inputs.v,
+        inputs.g,
+        inputs.beta,
+        inputs.segment_ids,
+        inputs.dout,
+    )
+
+
+def _direct_backward(
+    implementation: api.Implementation | Sequence[api.Implementation] | None,
+    case: TestConfig,
+    inputs: _Inputs,
+) -> tuple[jax.Array, ...]:
+  def loss_fn(q, k, v, g, beta, initial_state, A_log, dt_bias):
+    current_inputs = dataclasses.replace(
+        inputs,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+    output, final_state = _call_attention(
+        implementation, case, current_inputs
+    )
+    loss = jnp.sum(output.astype(jnp.float32) * inputs.dout)
+    if inputs.dfinal_state is not None:
+      if final_state is None:
+        raise ValueError("Expected a final state for the backward case.")
+      loss += jnp.sum(final_state * inputs.dfinal_state)
+    return loss
+
+  argnums = [0, 1, 2, 3, 4]
+  if case.use_initial_state:
+    argnums.append(5)
+  return jax.grad(loss_fn, argnums=tuple(argnums))(
+      inputs.q,
+      inputs.k,
+      inputs.v,
+      inputs.g,
+      inputs.beta,
+      inputs.initial_state,
+      inputs.A_log,
+      inputs.dt_bias,
+  )
+
+
 def _require_tpu(case: TestConfig) -> None:
   if jax.default_backend() != "tpu":
     pytest.skip("Pallas TPU KDA tests require a TPU backend.")
   if len(jax.devices()) < case.cp_size:
     pytest.skip(f"Case requires {case.cp_size} TPU devices.")
+
+
+def _valid_gradient_values(
+    name: str, gradient: jax.Array, case: TestConfig, inputs: _Inputs
+) -> jax.Array | np.ndarray:
+  """Selects the valid tokens/states used by the source varlen tests."""
+  if case.layouts is None:
+    return gradient
+  gradient_np = np.asarray(gradient)
+  if name == "dh0":
+    state_mask = np.zeros((case.batch, case.n_max or 1), dtype=np.bool_)
+    for batch_index, seq_lens in enumerate(case.layouts):
+      state_mask[batch_index, : len(seq_lens)] = True
+    mask = state_mask[:, :, None, None, None]
+  else:
+    assert inputs.segment_ids is not None
+    token_mask = np.asarray(inputs.segment_ids) > 0
+    mask = (
+        token_mask[None, :, :, None]
+        if gradient_np.ndim == 4
+        else token_mask[None, :, :]
+    )
+  return gradient_np[np.broadcast_to(mask, gradient_np.shape)]
 
 
 @pytest.mark.parametrize("case", _case_params())
@@ -1007,6 +1204,68 @@ def test_chunk_kda_forward(case: TestConfig):
       assert bool(
           jnp.all(jnp.isfinite(final_state[batch_index, :real_state_count]))
       )
+
+
+@pytest.mark.parametrize("case", _case_params())
+def test_chunk_kda_backward(case: TestConfig):
+  _require_tpu(case)
+  inputs = _make_inputs(case)
+
+  grads = (
+      _cp_backward("pallas_tpu", case, inputs)
+      if case.cp_size > 1
+      else _direct_backward(None, case, inputs)
+  )
+  grad_names = ("dq", "dk", "dv", "dg", "dbeta")
+  if case.use_initial_state:
+    grad_names += ("dh0",)
+
+  if case.backward_check == "finite":
+    output, _ = (
+        _cp_forward("pallas_tpu", case, inputs)
+        if case.cp_size > 1
+        else _call_attention("pallas_tpu", case, inputs)
+    )
+    jax.block_until_ready((grads, output))
+    for name, grad in zip(grad_names, grads, strict=True):
+      assert bool(jnp.all(jnp.isfinite(grad))), f"{name} contains NaN/Inf"
+    assert bool(jnp.all(jnp.isfinite(output))), "output contains NaN/Inf"
+    return
+  if case.backward_check != "reference":
+    raise ValueError(f"Unknown backward check: {case.backward_check}")
+
+  reference_grads = (
+      _cp_backward("xla", case, inputs)
+      if case.cp_size > 1
+      else _direct_backward("xla", case, inputs)
+  )
+  jax.block_until_ready((grads, reference_grads))
+
+  for name, actual, expected in zip(
+      grad_names, grads, reference_grads, strict=True
+  ):
+    actual = _valid_gradient_values(name, actual, case, inputs)
+    expected = _valid_gradient_values(name, expected, case, inputs)
+    # The source bf16 E2E tests compare gradients in float32. In particular,
+    # the custom VJP accumulates dh0 in float32 while XLA returns the tangent
+    # dtype of a bf16 initial state.
+    if case.dtype == jnp.bfloat16:
+      actual = actual.astype(np.float32)
+      expected = expected.astype(np.float32)
+    max_rms_error_ratio = (
+        case.backward_gate_rms_error_ratio
+        if name in ("dg", "dbeta")
+        else case.backward_rms_error_ratio
+    )
+    assert compare_tensor(
+        name,
+        expected,
+        actual,
+        atol=case.backward_atol,
+        rtol=case.backward_rtol,
+        dtype=actual.dtype,
+        max_rms_error_ratio=max_rms_error_ratio,
+    ), f"Gradient mismatch for {name}"
 
 
 if __name__ == "__main__":

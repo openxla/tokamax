@@ -1676,7 +1676,8 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   # h: pre-update state for all MB heads in this tile.
   b_h = scratch_ref[:]   # [MB, K, V]
 
-  # Spill the pre-update state when it is requested as a forward residual.
+  # Spill pre-update h (saved residual for bwd; tagged with
+  # checkpoint_name("kda_residuals") at the custom_vjp boundary).
   if STORE_H:
     h_out_ref[:, 0, 0] = b_h.astype(h_out_ref.dtype)  # [MB, K, V]
 
@@ -1692,7 +1693,7 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     preferred_element_type=jnp.float32,
   )  # [MB, BT, V]
 
-  # Optionally spill the updated values as a forward intermediate.
+  # Spill v_new (used by bwd Stage 0 when disable_recompute=True).
   if STORE_V_NEW:
     v_new_out_ref[:,0,:] = b_v_new.astype(v_new_out_ref.dtype)
 
@@ -1795,8 +1796,8 @@ def chunk_kda_fwd_h_o_varlen(
   """Fuses varlen state propagation with output projection.
 
   The recurrent state remains in VMEM. `store_h` and `store_v_new` spill
-  selected forward intermediates; `store_intermediates` is the legacy alias
-  that enables both.
+  only the intermediates needed by backward; `store_intermediates` is the
+  legacy alias that enables both.
   """
   # Back-compat shim: old single-flag callers map to both stores.
   if store_intermediates is not None:
@@ -1914,7 +1915,7 @@ def chunk_kda_fwd_h_o_varlen(
     )
     if output_final_state else None
   )
-  # Optional per-chunk pre-update state spill. Layout
+  # Per-chunk h spill (pre-update, used by bwd save-h fast path). Layout
   # [H, B, NT, K_PADSIZE, V_ALIGNED]
   h_out_spec = (
     pl.BlockSpec(
@@ -2177,14 +2178,14 @@ def chunk_kda_fwd_custom(
     output_final_state=output_final_state,
     scale=scale,
     chunk_size=BT,
-    store_h=save_for_backward,
+    store_h=disable_recompute,
     store_v_new=False,
   )
   if not _is_varlen and final_state is not None:
     final_state = final_state[:, 0]
 
   # ------------------------------------------------------------------
-  # Drop intermediates that are not part of the requested residual bundle.
+  # Drop intermediates that backward will recompute or never consume.
   # ------------------------------------------------------------------
   if not save_for_backward:
     w, u, qg, kg, v_new = None, None, None, None, None
@@ -2211,8 +2212,8 @@ def chunk_kda_fwd_custom(
 
   g_org = g if use_gate_in_kernel else None
 
-  # Keep prepared inputs because these copies may be varlen-aligned and
-  # L2-normalized, unlike the original public arguments.
+  # Keep the prepared inputs: the Op-level VJP also retains the original
+  # arguments, but these copies may be varlen-aligned and L2-normalized.
   residuals = KdaResiduals(
       q=q,
       k=k,
