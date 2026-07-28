@@ -83,8 +83,12 @@ def _calculate_bwd_vmem_bytes(
       + 2 * h_alloc * v_block_size * dtype_bytes
       # lse (log-sum-exp) buffer tile (B,) in float32 (double buffered for pallas_call input)
       + 2 * b_block_size * 4
-      # logits/softmax tile (B, V) in float32 accumulator (single scratch buffer)
-      + b_block_size * v_block_size * 4
+      # logits/softmax tile (B, V) in float32 accumulator:
+      # We account for 3 simultaneous (B, V) float32 buffers (3 * 4 = 12 bytes/elem):
+      #   1) xw_scratch_ref (explicit VMEM scratch buffer)
+      #   2) labels_one_hot (HLO stack temporary from jax.nn.one_hot in compute_s)
+      #   3) jnp.exp(...) (HLO stack temporary during softmax in compute_s)
+      + 3 * b_block_size * v_block_size * 4
       # x gradient tile accumulator (B, H) in float32 (single scratch buffer)
       + b_block_size * h_alloc * 4
       # w gradient tile accumulator (H, V) in float32 (single scratch buffer)
@@ -94,7 +98,7 @@ def _calculate_bwd_vmem_bytes(
 
 
 def _get_vmem_limit_bytes() -> int:
-  return int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+  return int(0.5 * pltpu.get_tpu_info().vmem_capacity_bytes)
 
 
 def _get_heuristic_config(
@@ -150,9 +154,14 @@ def _get_heuristic_config(
     fixed_bytes = (
         b_block_size * h_block_size * (2 * dtype_bytes + 4) + 16 * b_block_size
     )
-    per_v_bytes = h_block_size * (2 * dtype_bytes + 4) + b_block_size * (
-        4 + dtype_bytes
-    )
+    # per_v_bytes accounts for all VMEM costs per column of V:
+    #   - w tile (double-buffered in dtype) + w_grad_tile (float32) = h_block_size * (2 * dtype_bytes + 4)
+    #   - 3 simultaneous float32 (B, V) buffers on the VMEM stack during compute_s:
+    #       1) xw_scratch_ref (explicit VMEM scratch)
+    #       2) labels_one_hot (HLO stack temporary from jax.nn.one_hot)
+    #       3) jnp.exp(...) (HLO stack temporary during softmax)
+    #     Each float32 element is 4 bytes, so 3 * 4 = 12 bytes per element across b_block_size.
+    per_v_bytes = h_block_size * (2 * dtype_bytes + 4) + 12 * b_block_size
   else:
     fixed_bytes = (
         2 * b_block_size * h_block_size * dtype_bytes + 16 * b_block_size
@@ -330,18 +339,18 @@ def calculate_xw_tiled(
 
 
 def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
-    x_ref,
-    labels_ref,
-    w_ref,
-    loss_ref,
-    lse_ref,
-    xw_tiled,
-    b_block_loss_ref,
+    x,
+    labels,
+    w,
+    *,
     reduction: Literal["sum", "mean", "none"],
     h_dim: int,
     v_dim: int,
     preferred_element_type: jnp.dtype,
-):
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+) -> tuple[Real[Scalar, ""] | Real[Array, "B"], Real[Array, "B"]]:
   """Pallas kernel for the forward pass of Linear Softmax Cross-Entropy Loss.
 
   This kernel uses a block-wise algorithm on all B, H and V dimensions. The B
@@ -353,90 +362,195 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
   will need to re-compute x@w. Overall, this kernel will keep all the
   intermediate buffers in VMEM without logits HBM materialization.
 
-
   Args:
-    x_ref: BlockRef for the input activations `x` (b_block_size, h_block_size).
-    labels_ref: BlockRef for the labels (b_block_size, v_block_size).
-    w_ref: BlockRef for the weights `w` (h_block_size, v_block_size).
-    loss_ref: BlockRef for the scalar loss accumulator (1,).
-    lse_ref: BlockRef for the log-sum-exp accumulator per batch item
-      (b_block_size,). Used for backward pass
-    xw_tiled: Scratch BlockRef for accumulating `x @ w` results (b_block_size,
-      v_block_size).
-    b_block_loss_ref: Scratch BlockRef for accumulating loss per B block (1,).
-    reduction: The reduction method ("sum" or "mean") for the loss accumulation.
+    x: Input activations `x` (b_dim, h_dim).
+    labels: One-hot encoded labels (b_dim, v_dim).
+    w: LM Head projection weights `w` (h_dim, v_dim).
+    reduction: The reduction method ("sum", "mean" or "none") for the loss
+      accumulation.
+    h_dim: Hidden dimension size.
+    v_dim: Vocabulary dimension size.
+    preferred_element_type: Preferred element type for computation.
+    b_block_size: Block size for batch dimension.
+    h_block_size: Block size for hidden dimension.
+    v_block_size: Block size for vocabulary dimension.
+
+  Returns:
+    A tuple of (loss, lse).
   """
-  b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
-  b_block_size, h_block_size, v_block_size = (
-      x_ref.shape[0],
-      x_ref.shape[1],
-      w_ref.shape[1],
-  )
-  num_b_blocks, num_v_blocks, num_h_blocks = (
-      pl.num_programs(i) for i in range(3)
-  )
+  b_dim = x.shape[0]
+  num_b_blocks = math.ceil(b_dim / b_block_size)
+  num_h_blocks = math.ceil(h_dim / h_block_size)
+  num_v_blocks = math.ceil(v_dim / v_block_size)
 
-  # xw_tiled += x_ref @ w_ref
-  calculate_xw_tiled(
-      x_ref,
-      w_ref,
-      xw_tiled,
-      h_index=h_index,
-      v_index=v_index,
-      num_h_blocks=num_h_blocks,
-      num_v_blocks=num_v_blocks,
-      h_dim=h_dim,
-      v_dim=v_dim,
-      preferred_element_type=preferred_element_type,
-  )
-
-  @pl.when(reduce(jnp.logical_and, (b_index == 0, v_index == 0, h_index == 0)))
-  def init_loss():
-    if reduction in ("sum", "mean"):
-      loss_ref[0] = 0.0
-
-  @pl.when(jnp.logical_and(v_index == 0, h_index == 0))
-  def init_lse():
-    lse_ref[...] = jnp.full_like(lse_ref, -jnp.inf)
-    if reduction == "none":
-      loss_ref[...] = jnp.zeros_like(loss_ref)
-    else:
-      b_block_loss_ref[0] = 0.0
-
-  @pl.when(h_index == num_h_blocks - 1)
-  def accumulate_loss():
-    # Convert labels to one-hot, due to chunking on v dimension, the indices
-    # needs to be shifted down by the v starting index. Negative or out-of-bound
-    # indices are OK since jax.nn.one_hot will set them to 0.
-    labels_adjusted = labels_ref[...] - v_index * v_block_size
-    labels_one_hot = jax.nn.one_hot(
-        labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
+  if reduction in ("sum", "mean"):
+    out_type = [
+        jax.ShapeDtypeStruct(shape=(1,), dtype=jnp.float32),  # Loss
+        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
+    ]
+    loss_out_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+  else:
+    out_type = [
+        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # Loss
+        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
+    ]
+    loss_out_spec = pl.BlockSpec(
+        (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
     )
-    if reduction == "none":
-      loss_ref[...] -= jnp.sum(labels_one_hot * xw_tiled[...], axis=-1)
-    else:
-      b_block_loss_ref[0] -= jnp.sum(labels_one_hot * xw_tiled[...])
-    lse_block = jax.nn.logsumexp(xw_tiled[...], axis=-1)
-    lse_ref[...] = jnp.logaddexp(lse_ref[...], lse_block)
 
-  @pl.when(
-      jnp.logical_and(v_index == num_v_blocks - 1, h_index == num_h_blocks - 1)
+  @pl.kernel(
+      out_type=out_type,
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      scratch_types=(
+          pltpu.VMEM(
+              (b_block_size, v_block_size), dtype=jnp.float32
+          ),  # xw_tiled
+          pltpu.SMEM((1,), dtype=jnp.float32),  # b_block_loss
+      ),
+      compiler_params=pltpu.CompilerParams(
+          vmem_limit_bytes=_get_vmem_limit_bytes(),
+          disable_bounds_checks=True,
+      ),
+      name=f"lce_fwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}_reduction_{reduction}",
   )
-  def perform_loss_reduction():
-    if reduction == "mean":
-      b_block_loss_ref[0] += jnp.sum(lse_ref[...])
-      # For mean reduction, use online averaging algorithm
-      loss_ref[0] = (
-          loss_ref[0] * b_index / (b_index + 1)
-          + b_block_loss_ref[0] / (b_index + 1) / b_block_size
+  def fwd_kernel(
+      x_hbm_ref,
+      labels_hbm_ref,
+      w_hbm_ref,
+      loss_hbm_ref,
+      lse_hbm_ref,
+      xw_tiled_ref,
+      b_block_loss_ref,
+  ):
+    def fwd_pipeline(
+        x_ref,
+        labels_ref,
+        w_ref,
+        loss_ref,
+        lse_ref,
+        xw_tiled,
+        b_block_loss_ref,
+    ):
+      b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
+      num_b_blocks, num_v_blocks, num_h_blocks = (
+          pl.num_programs(i) for i in range(3)
       )
-    elif reduction == "sum":
-      b_block_loss_ref[0] += jnp.sum(lse_ref[...])
-      # Sum reduction
-      loss_ref[0] += b_block_loss_ref[0]
-    else:
-      # For reduction == "none", compute per-element loss
-      loss_ref[...] += lse_ref[...]
+
+      # xw_tiled += x_ref @ w_ref
+      calculate_xw_tiled(
+          x_ref,
+          w_ref,
+          xw_tiled,
+          h_index=h_index,
+          v_index=v_index,
+          num_h_blocks=num_h_blocks,
+          num_v_blocks=num_v_blocks,
+          h_dim=h_dim,
+          v_dim=v_dim,
+          preferred_element_type=preferred_element_type,
+      )
+
+      @pl.when(
+          reduce(jnp.logical_and, (b_index == 0, v_index == 0, h_index == 0))
+      )
+      def init_loss():
+        if reduction in ("sum", "mean"):
+          loss_ref[0] = 0.0
+
+      @pl.when(jnp.logical_and(v_index == 0, h_index == 0))
+      def init_lse():
+        lse_ref[...] = jnp.full_like(lse_ref, -jnp.inf)
+        if reduction == "none":
+          loss_ref[...] = jnp.zeros_like(loss_ref)
+        else:
+          b_block_loss_ref[0] = 0.0
+
+      @pl.when(h_index == num_h_blocks - 1)
+      def accumulate_loss():
+        # Convert labels to one-hot, due to chunking on v dimension, the indices
+        # needs to be shifted down by the v starting index. Negative or
+        # out-of-bound indices are OK since jax.nn.one_hot will set them to 0.
+        labels_adjusted = labels_ref[...] - v_index * v_block_size
+        labels_one_hot = jax.nn.one_hot(
+            labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
+        )
+        if reduction == "none":
+          loss_ref[...] -= jnp.sum(labels_one_hot * xw_tiled[...], axis=-1)
+        else:
+          b_block_loss_ref[0] -= jnp.sum(labels_one_hot * xw_tiled[...])
+        lse_block = jax.nn.logsumexp(xw_tiled[...], axis=-1)
+        lse_ref[...] = jnp.logaddexp(lse_ref[...], lse_block)
+
+      @pl.when(
+          jnp.logical_and(
+              v_index == num_v_blocks - 1, h_index == num_h_blocks - 1
+          )
+      )
+      def perform_loss_reduction():
+        if reduction == "mean":
+          b_block_loss_ref[0] += jnp.sum(lse_ref[...])
+          # For mean reduction, use online averaging algorithm
+          loss_ref[0] = (
+              loss_ref[0] * b_index / (b_index + 1)
+              + b_block_loss_ref[0] / (b_index + 1) / b_block_size
+          )
+        elif reduction == "sum":
+          b_block_loss_ref[0] += jnp.sum(lse_ref[...])
+          # Sum reduction
+          loss_ref[0] += b_block_loss_ref[0]
+        else:
+          # For reduction == "none", compute per-element loss
+          loss_ref[...] += lse_ref[...]
+
+    pltpu.emit_pipeline(
+        fwd_pipeline,
+        grid=(num_b_blocks, num_v_blocks, num_h_blocks),
+        in_specs=[
+            pl.BlockSpec(
+                (b_block_size, h_block_size),
+                lambda i, j, k: (i, k),
+                memory_space=pltpu.VMEM,
+            ),  # x
+            pl.BlockSpec(
+                (b_block_size,),
+                lambda i, j, k: (i,),
+                memory_space=pltpu.VMEM,
+            ),  # labels
+            pl.BlockSpec(
+                (h_block_size, v_block_size),
+                lambda i, j, k: (k, j),
+                memory_space=pltpu.VMEM,
+            ),  # w
+        ],
+        out_specs=[
+            loss_out_spec,  # loss
+            pl.BlockSpec(
+                (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
+            ),  # lse
+        ],
+        # TODO: enable parallel core_axis_name for the kernel.
+        # core_axis_name="core",
+        dimension_semantics=(
+            pltpu.ARBITRARY,
+            pltpu.ARBITRARY,
+            pltpu.ARBITRARY,
+        ),
+    )(
+        x_hbm_ref,
+        labels_hbm_ref,
+        w_hbm_ref,
+        loss_hbm_ref,
+        lse_hbm_ref,
+        scratches=(xw_tiled_ref, b_block_loss_ref),
+    )
+
+  loss, lse = fwd_kernel(  # pylint: disable=unpacking-non-sequence
+      x, labels, w
+  )
+  if reduction in ("sum", "mean"):
+    return loss[0], lse
+  else:
+    return loss, lse
 
 
 @partial(
@@ -459,7 +573,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
     v_block_size: int = 2048,
     reduction: Literal["sum", "mean", "none"] = "sum",
     preferred_element_type: jnp.dtype = jnp.float32,
-) -> tuple[Real[Scalar, ""], Real[Array, "B"]]:
+) -> tuple[Real[Scalar, ""] | Real[Array, "B"], Real[Array, "B"]]:
   """The pallas kernel implementation of linear softmax cross-entropy loss.
 
   This implementation is chunking the x, labels and w in all B, H and V
@@ -476,7 +590,8 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
     b_block_size: The batch block size.
     h_block_size: The hidden block size.
     v_block_size: The vocabulary block size.
-    reduction: The reduction method ("sum" or "mean") for the loss accumulation.
+    reduction: The reduction method ("sum", "mean" or "none") for the loss
+      accumulation.
 
   Returns:
     The loss in scalar and the log-sum-exp of the used for backward pass.
@@ -500,312 +615,377 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
 
   h_dim = x.shape[-1]
   v_dim = w.shape[1]
-  b_dim = x.shape[0]
-
-  num_b_blocks = math.ceil(b_dim / b_block_size)
-  num_h_blocks = math.ceil(h_dim / h_block_size)
-  num_v_blocks = math.ceil(v_dim / v_block_size)
 
   # Constrain the memory spaces for x and w to prevent OOB accesses that occur
   # when the memory spaces is placed in VMEM.
   x = pltpu.with_memory_space_constraint(x, memory_space=pltpu.HBM)
   w = pltpu.with_memory_space_constraint(w, memory_space=pltpu.HBM)
 
-  if reduction in ("sum", "mean"):
-    out_specs = [
-        pl.BlockSpec(memory_space=pltpu.SMEM),  # Loss
-        pl.BlockSpec(
-            (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
-        ),  # LSE
-    ]
-    out_shape = [
-        jax.ShapeDtypeStruct(shape=(1,), dtype=jnp.float32),  # Loss
-        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
-    ]
-  else:
-    out_specs = [
-        pl.BlockSpec(
-            (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
-        ),  # Loss
-        pl.BlockSpec(
-            (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
-        ),  # LSE
-    ]
-    out_shape = [
-        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # Loss
-        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
-    ]
-
   # Forward
-  loss, lse = pl.pallas_call(
-      partial(
-          linear_softmax_cross_entropy_loss_forward_pallas_kernel,
-          reduction=reduction,
-          h_dim=h_dim,
-          v_dim=v_dim,
-          preferred_element_type=preferred_element_type,
-      ),
-      in_specs=[
-          pl.BlockSpec(
-              (b_block_size, h_block_size),
-              lambda i, j, k: (i, k),
-              memory_space=pltpu.VMEM,
-          ),  # x
-          pl.BlockSpec(
-              (b_block_size,),
-              lambda i, j, k: (i,),
-              memory_space=pltpu.VMEM,
-          ),  # labels
-          pl.BlockSpec(
-              (h_block_size, v_block_size),
-              lambda i, j, k: (k, j),
-              memory_space=pltpu.VMEM,
-          ),  # w
-      ],
-      out_specs=out_specs,
-      out_shape=out_shape,
-      scratch_shapes=(
-          pltpu.VMEM(
-              (b_block_size, v_block_size), dtype=jnp.float32
-          ),  # xw_tiled
-          pltpu.SMEM((1,), dtype=jnp.float32),  # b_block_loss
-      ),
-      name=f"lce_fwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}_reduction_{reduction}",
-      compiler_params=pltpu.CompilerParams(
-          vmem_limit_bytes=_get_vmem_limit_bytes(),
-          disable_bounds_checks=True,
-      ),
-      grid=(num_b_blocks, num_v_blocks, num_h_blocks),
-  )(x, labels, w)
-
-  if reduction in ("sum", "mean"):
-    return loss[0], lse
-  else:
-    return loss, lse
+  loss, lse = linear_softmax_cross_entropy_loss_forward_pallas_kernel(
+      x,
+      labels,
+      w,
+      reduction=reduction,
+      h_dim=h_dim,
+      v_dim=v_dim,
+      preferred_element_type=preferred_element_type,
+      b_block_size=b_block_size,
+      h_block_size=h_block_size,
+      v_block_size=v_block_size,
+  )
+  return loss, lse
 
 
 def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     dout,
-    x_ref,
-    labels_ref,
-    w_ref,
-    lse_ref,
-    x_grad_hbm_ref,
-    w_grad_hbm_ref,
-    xw_scratch_ref,
-    x_grad_tile_ref,
-    w_grad_tile_ref,
-    x_read_sem,
-    w_read_sem,
-    x_write_sem,
-    w_write_sem,
+    x,
+    labels,
+    w,
+    lse,
+    *,
     reduction: Literal["sum", "mean", "none"],
     preferred_element_type: jnp.dtype,
-):
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """Pallas kernel for the backward pass of Linear Softmax Cross-Entropy Loss.
 
   Args:
-    x_ref: Input activations `x` (b_block_size, h_block_size).
-    labels_ref: One-hot encoded labels (b_block_size, v_block_size).
-    w_ref: LM Head projection weights `w` (h_block_size, v_block_size).
-    lse_ref: BlockRef for the log-sum-exp accumulator per batch item
-      (b_block_size,). Used for backward pass
-    x_grad_hbm_ref: The output gradient of x (b_dim, h_dim) on HBM
-    w_grad_hbm_ref: The output gradient of w (h_dim, v_dim)
-    xw_scratch_ref: Scratch BlockRef for accumulating logits results
-      (b_block_size, v_block_size).
-    x_grad_tile_ref: Scratch BlockRef for accumulating x gradient results
-      (b_block_size, h_block_size).
-    w_grad_tile_ref: Scratch BlockRef for accumulating w results (h_block_size,
-      v_block_size).
-    reduction: The reduction method ("sum" or "mean") for the gradient
+    dout: Gradient of the loss (1,) or (b_dim,) depending on reduction.
+    x: Input activations `x` (b_dim, h_dim).
+    labels: One-hot encoded labels (b_dim, v_dim).
+    w: LM Head projection weights `w` (h_dim, v_dim).
+    lse: Log-sum-exp accumulator per batch item (b_dim,).
+    reduction: The reduction method ("sum", "mean" or "none") for the gradient
       accumulation.
+    preferred_element_type: Preferred element type for computation.
+    b_block_size: Block size for batch dimension.
+    h_block_size: Block size for hidden dimension.
+    v_block_size: Block size for vocabulary dimension.
+
+  Returns:
+    A tuple of (x_grad, w_grad).
   """
+  b_dim = x.shape[0]
+  h_dim, v_dim = w.shape
+  num_b_blocks = math.ceil(b_dim / b_block_size)
+  num_h_blocks = math.ceil(h_dim / h_block_size)
+  num_v_blocks = math.ceil(v_dim / v_block_size)
+  num_stages = 2
 
-  b_index, v_index, stage_index, h_index = (pl.program_id(i) for i in range(4))
-  num_b_blocks, num_v_blocks, _, num_h_blocks = (
-      pl.num_programs(i) for i in range(4)
+  if reduction in ("sum", "mean"):
+    dout_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+  else:
+    dout_spec = pl.BlockSpec(
+        (b_block_size,), lambda i, j, s, k: (i,), memory_space=pltpu.VMEM
+    )
+
+  @pl.kernel(
+      out_type=[
+          jax.ShapeDtypeStruct(x.shape, dtype=jnp.float32),  # x_grad
+          jax.ShapeDtypeStruct(w.shape, dtype=jnp.float32),  # w_grad
+      ],
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      scratch_types=(
+          pltpu.VMEM(
+              (b_block_size, v_block_size), dtype=jnp.float32
+          ),  # xw_scratch
+          pltpu.VMEM(
+              (b_block_size, h_block_size), dtype=jnp.float32
+          ),  # x_grad_tile
+          pltpu.VMEM(
+              (h_block_size, v_block_size), dtype=jnp.float32
+          ),  # w_grad_tile
+          pltpu.SemaphoreType.DMA,  # x_read_sem
+          pltpu.SemaphoreType.DMA,  # w_read_sem
+          pltpu.SemaphoreType.DMA,  # x_write_sem
+          pltpu.SemaphoreType.DMA,  # w_write_sem
+      ),
+      compiler_params=pltpu.CompilerParams(
+          vmem_limit_bytes=_get_vmem_limit_bytes(),
+          disable_bounds_checks=True,
+      ),
+      name=f"lce_bwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}_reduction_{reduction}",
   )
-  b_block_size, h_block_size = x_ref.shape
-  v_block_size = w_ref.shape[1]
-  h_dim, v_dim = w_grad_hbm_ref.shape
-
-  # Calculate and accumulate xw_scratch_ref += x_ref @ w_ref as first stage
-  @pl.when(stage_index == 0)
-  def calculate_xw():
-    calculate_xw_tiled(
+  def bwd_kernel(
+      dout_hbm_ref,
+      x_hbm_ref,
+      labels_hbm_ref,
+      w_hbm_ref,
+      lse_hbm_ref,
+      x_grad_hbm_ref,
+      w_grad_hbm_ref,
+      xw_scratch_ref,
+      x_grad_tile_ref,
+      w_grad_tile_ref,
+      x_read_sem,
+      w_read_sem,
+      x_write_sem,
+      w_write_sem,
+  ):
+    def bwd_pipeline(
+        dout_ref,
         x_ref,
+        labels_ref,
         w_ref,
+        lse_ref,
+        x_grad_hbm_ref,
+        w_grad_hbm_ref,
         xw_scratch_ref,
-        h_index=h_index,
-        v_index=v_index,
-        num_h_blocks=num_h_blocks,
-        num_v_blocks=num_v_blocks,
-        h_dim=h_dim,
-        v_dim=v_dim,
-        preferred_element_type=preferred_element_type,
-    )
+        x_grad_tile_ref,
+        w_grad_tile_ref,
+        x_read_sem,
+        w_read_sem,
+        x_write_sem,
+        w_write_sem,
+    ):
+      b_index, v_index, stage_index, h_index = (
+          pl.program_id(i) for i in range(4)
+      )
 
-  # When xw_scratch_ref is fully accumulated, use it to calculate gradients
-  # as second stage
-  @pl.when(stage_index == 1)
-  def calculate_grads():
-    # Calculate the actual block size if v_dim is not a multiple of v_block_size
-    cur_v_block_size = jnp.minimum(v_dim - v_block_size * v_index, v_block_size)
+      # Calculate and accumulate xw_scratch_ref += x_ref @ w_ref as first stage
+      @pl.when(stage_index == 0)
+      def calculate_xw():
+        calculate_xw_tiled(
+            x_ref,
+            w_ref,
+            xw_scratch_ref,
+            h_index=h_index,
+            v_index=v_index,
+            num_h_blocks=num_h_blocks,
+            num_v_blocks=num_v_blocks,
+            h_dim=h_dim,
+            v_dim=v_dim,
+            preferred_element_type=preferred_element_type,
+        )
 
-    # V Block size must be multiple of 128 to perform DMA (copy).
-    # Aligning the V block size to 128
-    cur_v_block_size = pl.multiple_of(
-        (pl.cdiv(cur_v_block_size, 128) * 128).astype(jnp.int32), 128
-    )
+      # When xw_scratch_ref is fully accumulated, use it to calculate gradients
+      # as second stage
+      @pl.when(stage_index == 1)
+      def calculate_grads():
+        # Calculate actual block size if v_dim not a multiple of v_block_size
+        cur_v_block_size = jnp.minimum(
+            v_dim - v_block_size * v_index, v_block_size
+        )
 
-    # Calculate the actual block size if h_dim is not a multiple of h_block_size
-    cur_h_block_size = jnp.minimum(h_dim - h_block_size * h_index, h_block_size)
+        # V Block size must be multiple of 128 to perform DMA (copy).
+        # Aligning the V block size to 128
+        cur_v_block_size = pl.multiple_of(
+            (pl.cdiv(cur_v_block_size, 128) * 128).astype(jnp.int32), 128
+        )
 
-    # H Block size must be multiple of 128 of major dimension, and 8 of minor
-    # dimension to perform DMA.
-    cur_h_block_128_aligned_size = pl.multiple_of(
-        (pl.cdiv(cur_h_block_size, 128) * 128).astype(jnp.int32), 128
-    )
-    cur_h_block_8_aligned_size = pl.multiple_of(
-        (pl.cdiv(cur_h_block_size, 8) * 8).astype(jnp.int32), 8
-    )
+        # Calculate actual block size if h_dim not a multiple of h_block_size
+        cur_h_block_size = jnp.minimum(
+            h_dim - h_block_size * h_index, h_block_size
+        )
 
-    # Slicing x_grad and x_grad HBM ref to prepare for tiled read / write
-    x_grad_slice = x_grad_hbm_ref.at[
-        pl.ds(b_index * b_block_size, b_block_size),
-        pl.ds(h_index * h_block_size, cur_h_block_128_aligned_size),
-    ]
-    w_grad_slice = w_grad_hbm_ref.at[
-        pl.ds(h_index * h_block_size, cur_h_block_8_aligned_size),
-        pl.ds(v_index * v_block_size, cur_v_block_size),
-    ]
+        # H Block size must be multiple of 128 of major dimension, and 8 of
+        # minor dimension to perform DMA.
+        cur_h_block_128_aligned_size = pl.multiple_of(
+            (pl.cdiv(cur_h_block_size, 128) * 128).astype(jnp.int32), 128
+        )
+        cur_h_block_8_aligned_size = pl.multiple_of(
+            (pl.cdiv(cur_h_block_size, 8) * 8).astype(jnp.int32), 8
+        )
 
-    x_grad_tile_slice = x_grad_tile_ref.at[
-        pl.ds(0, b_block_size), pl.ds(0, cur_h_block_128_aligned_size)
-    ]
-    w_grad_tile_slice = w_grad_tile_ref.at[
-        pl.ds(0, cur_h_block_8_aligned_size), pl.ds(0, cur_v_block_size)
-    ]
+        # Slicing x_grad and x_grad HBM ref to prepare for tiled read / write
+        x_grad_slice = x_grad_hbm_ref.at[
+            pl.ds(b_index * b_block_size, b_block_size),
+            pl.ds(h_index * h_block_size, cur_h_block_128_aligned_size),
+        ]
+        w_grad_slice = w_grad_hbm_ref.at[
+            pl.ds(h_index * h_block_size, cur_h_block_8_aligned_size),
+            pl.ds(v_index * v_block_size, cur_v_block_size),
+        ]
 
-    def perform_x_grad_tile_scaling():
-      # Perform scaling to dout and b_dim (for mean reduction).
-      # Scaling happens on the last accumulation on V for
-      # numerical stability
-      @pl.when(
-          reduce(
-              jnp.logical_and, (stage_index == 1, v_index == num_v_blocks - 1)
+        x_grad_tile_slice = x_grad_tile_ref.at[
+            pl.ds(0, b_block_size), pl.ds(0, cur_h_block_128_aligned_size)
+        ]
+        w_grad_tile_slice = w_grad_tile_ref.at[
+            pl.ds(0, cur_h_block_8_aligned_size), pl.ds(0, cur_v_block_size)
+        ]
+
+        def perform_x_grad_tile_scaling():
+          # Perform scaling to dout and b_dim (for mean reduction).
+          # Scaling happens on the last accumulation on V for
+          # numerical stability
+          @pl.when(
+              reduce(
+                  jnp.logical_and,
+                  (stage_index == 1, v_index == num_v_blocks - 1),
+              )
           )
-      )
-      def _():
-        if reduction in ("sum", "mean"):
-          scale = (
-              dout[0] / (num_b_blocks * b_block_size)
-              if reduction == "mean"
-              else dout[0]
+          def _():
+            if reduction in ("sum", "mean"):
+              scale = (
+                  dout_ref[0] / (num_b_blocks * b_block_size)
+                  if reduction == "mean"
+                  else dout_ref[0]
+              )
+              x_grad_tile_ref[...] *= scale
+
+        def perform_w_grad_tile_scaling():
+          # Perform scaling to dout and b_dim (for mean reduction).
+          # Scaling happens on the last accumulation on B for
+          # numerical stability
+          @pl.when(
+              reduce(
+                  jnp.logical_and,
+                  (stage_index == 1, b_index == num_b_blocks - 1),
+              )
           )
-          x_grad_tile_ref[...] *= scale
+          def _():
+            if reduction in ("sum", "mean"):
+              scale = (
+                  dout_ref[0] / (num_b_blocks * b_block_size)
+                  if reduction == "mean"
+                  else dout_ref[0]
+              )
+              w_grad_tile_ref[...] *= scale
 
-    def perform_w_grad_tile_scaling():
-      # Perform scaling to dout and b_dim (for mean reduction).
-      # Scaling happens on the last accumulation on B for
-      # numerical stability
-      @pl.when(
-          reduce(
-              jnp.logical_and, (stage_index == 1, b_index == num_b_blocks - 1)
+        # Async copy ops defined here. Only starts after calling .start().
+        x_write_future = pltpu.make_async_copy(
+            x_grad_tile_slice, x_grad_slice, sem=x_write_sem
+        )
+        w_write_future = pltpu.make_async_copy(
+            w_grad_tile_slice, w_grad_slice, sem=w_write_sem
+        )
+        x_read_future = pltpu.make_async_copy(
+            x_grad_slice, x_grad_tile_slice, sem=x_read_sem
+        )
+        w_read_future = pltpu.make_async_copy(
+            w_grad_slice, w_grad_tile_slice, sem=w_read_sem
+        )
+
+        # Preload x_grad and w_grad async before computing softmax to
+        # overlap computation
+
+        # Preload w_grad
+        @pl.when(b_index != 0)
+        def w_read():
+          w_read_future.start()
+
+        @pl.when(v_index != 0)
+        def x_read():
+          x_read_future.start()
+
+        # Compute Softmax and store s = -labels + softmax(x@w) to xw_scratch_ref
+        @pl.when(h_index == 0)
+        def compute_s():
+          labels_adjusted = labels_ref[...] - v_index * v_block_size
+          labels_one_hot = jax.nn.one_hot(
+              labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
           )
-      )
-      def _():
-        if reduction in ("sum", "mean"):
-          scale = (
-              dout[0] / (num_b_blocks * b_block_size)
-              if reduction == "mean"
-              else dout[0]
+          xw_scratch_ref[...] = -labels_one_hot + jnp.exp(
+              xw_scratch_ref[...] - lse_ref[...][:, None]
           )
-          w_grad_tile_ref[...] *= scale
+          if reduction == "none":
+            xw_scratch_ref[...] *= dout_ref[...][:, None]
 
-    # Async copy ops are only defined here. It only starts after calling .start().
-    x_write_future = pltpu.make_async_copy(
-        x_grad_tile_slice, x_grad_slice, sem=x_write_sem
+        # Init W gradient
+        @pl.when(b_index == 0)
+        def init_w_grad():
+          w_grad_tile_ref[...] = jax.lax.dot_general(
+              x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
+          )
+          perform_w_grad_tile_scaling()
+          w_write_future.start()
+
+        # Init X gradient
+        @pl.when(v_index == 0)
+        def init_x_grad():
+          x_grad_tile_ref[...] = jax.lax.dot_general(
+              xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
+          )
+          perform_x_grad_tile_scaling()
+          x_write_future.start()
+
+        # Accumulate W grad on B dimension
+        @pl.when(b_index != 0)
+        def accumulate_w_grad():
+          res = jax.lax.dot_general(
+              x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
+          )
+          w_read_future.wait()
+          w_grad_tile_ref[...] += res
+          perform_w_grad_tile_scaling()
+          w_write_future.start()
+
+        # Accumulate X grad on V dimension
+        @pl.when(v_index != 0)
+        def accumulate_x_grad():
+          res = jax.lax.dot_general(
+              xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
+          )
+          x_read_future.wait()
+          x_grad_tile_ref[...] += res
+          perform_x_grad_tile_scaling()
+          x_write_future.start()
+
+        # Lastly make sure to wait x_grad, w_grad write before next iteration
+        w_write_future.wait()
+        x_write_future.wait()
+
+    pltpu.emit_pipeline(
+        bwd_pipeline,
+        grid=(num_b_blocks, num_v_blocks, num_stages, num_h_blocks),
+        in_specs=[
+            dout_spec,
+            pl.BlockSpec(  # x
+                (b_block_size, h_block_size),
+                lambda i, j, s, k: (i, k),
+                memory_space=pltpu.VMEM,
+            ),
+            pl.BlockSpec(  # labels
+                (b_block_size,),
+                lambda i, j, s, k: (i,),
+                memory_space=pltpu.VMEM,
+            ),
+            pl.BlockSpec(  # w
+                (h_block_size, v_block_size),
+                lambda i, j, s, k: (k, j),
+                memory_space=pltpu.VMEM,
+            ),
+            pl.BlockSpec(  # lse
+                (b_block_size,),
+                lambda i, j, s, k: (i,),
+                memory_space=pltpu.VMEM,
+            ),
+        ],
+        out_specs=[
+            pl.BlockSpec(memory_space=pltpu.HBM),  # x_grad
+            pl.BlockSpec(memory_space=pltpu.HBM),  # w_grad
+        ],
+        # TODO: enable parallel core_axis_name for the kernel.
+        # core_axis_name="core",
+        dimension_semantics=(
+            pltpu.ARBITRARY,
+            pltpu.ARBITRARY,
+            pltpu.ARBITRARY,
+            pltpu.ARBITRARY,
+        ),
+    )(
+        dout_hbm_ref,
+        x_hbm_ref,
+        labels_hbm_ref,
+        w_hbm_ref,
+        lse_hbm_ref,
+        x_grad_hbm_ref,
+        w_grad_hbm_ref,
+        scratches=(
+            xw_scratch_ref,
+            x_grad_tile_ref,
+            w_grad_tile_ref,
+            x_read_sem,
+            w_read_sem,
+            x_write_sem,
+            w_write_sem,
+        ),
     )
-    w_write_future = pltpu.make_async_copy(
-        w_grad_tile_slice, w_grad_slice, sem=w_write_sem
-    )
-    x_read_future = pltpu.make_async_copy(
-        x_grad_slice, x_grad_tile_slice, sem=x_read_sem
-    )
-    w_read_future = pltpu.make_async_copy(
-        w_grad_slice, w_grad_tile_slice, sem=w_read_sem
-    )
 
-    # Preload x_grad and w_grad async before computing softmax to
-    # overlap computation
-
-    # Preload w_grad
-    @pl.when(b_index != 0)
-    def w_read():
-      w_read_future.start()
-
-    @pl.when(v_index != 0)
-    def x_read():
-      x_read_future.start()
-
-    # Compute Softmax and store s = - labels + softmax(x@w) to xw_scratch_ref
-    @pl.when(h_index == 0)
-    def compute_s():
-      labels_adjusted = labels_ref[...] - v_index * v_block_size
-      labels_one_hot = jax.nn.one_hot(
-          labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
-      )
-      xw_scratch_ref[...] = -labels_one_hot + jnp.exp(
-          xw_scratch_ref[...] - lse_ref[...][:, None]
-      )
-      if reduction == "none":
-        xw_scratch_ref[...] *= dout[...][:, None]
-
-    # Init W gradient
-    @pl.when(b_index == 0)
-    def init_w_grad():
-      w_grad_tile_ref[...] = jax.lax.dot_general(
-          x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
-      )
-      perform_w_grad_tile_scaling()
-      w_write_future.start()
-
-    # Init X gradient
-    @pl.when(v_index == 0)
-    def init_x_grad():
-      x_grad_tile_ref[...] = jax.lax.dot_general(
-          xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
-      )
-      perform_x_grad_tile_scaling()
-      x_write_future.start()
-
-    # Accumulate W grad on B dimension
-    @pl.when(b_index != 0)
-    def accumulate_w_grad():
-      res = jax.lax.dot_general(
-          x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
-      )
-      w_read_future.wait()
-      w_grad_tile_ref[...] += res
-      perform_w_grad_tile_scaling()
-      w_write_future.start()
-
-    # Accumulate X grad on V dimension
-    @pl.when(v_index != 0)
-    def accumulate_x_grad():
-      res = jax.lax.dot_general(
-          xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
-      )
-      x_read_future.wait()
-      x_grad_tile_ref[...] += res
-      perform_x_grad_tile_scaling()
-      x_write_future.start()
-
-    # Lastly make sure to wait x_grad, w_grad write before next iteration
-    w_write_future.wait()
-    x_write_future.wait()
+  return bwd_kernel(dout, x, labels, w, lse)
 
 
 @partial(
@@ -819,7 +999,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     ],
 )
 def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
-    dout: Real[Array, ""],
+    dout: Real[Array, ""] | Real[Array, "B"],
     lse: Real[Array, "B"],
     x: Real[Array, "B H"],
     labels: Integer[Array, "B"],
@@ -841,7 +1021,8 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
 
   Args:
     dout: The output's gradient of the Linear Cross-Entropy kernel. Since the
-      output is loss, the gradient is usually 1.0.
+      output is loss, the gradient is usually 1.0 when reduction is "sum" or
+      "mean", or shape (B,) when reduction is "none".
     lse: The log-sum-exp of the from the forward pass residuals.
     x: The last layer output in the dimension of (B, H) where B is the batch
       dimension , and H is the hidden dimension.
@@ -852,7 +1033,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     h_block_size: The block size for the hidden dimension.
     v_block_size: The block size for the vocabulary dimension.
     reduction: The reduction method for the cross entropy loss. Can be set to
-      "sum" or "mean" explicitly.
+      "sum", "mean" or "none" explicitly.
 
   Returns:
     The tuple of gradient of the loss with respect to x and w.
@@ -871,23 +1052,11 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
   if w.dtype == jnp.float16:
     w = w.astype(preferred_element_type)
 
-  v_dim = w.shape[1]
-  b_dim = x.shape[0]
-  h_dim = x.shape[-1]
-  num_b_blocks = math.ceil(b_dim / b_block_size)
-  num_v_blocks = math.ceil(v_dim / v_block_size)
-  num_h_blocks = math.ceil(h_dim / h_block_size)
-  num_stages = 2
-
   # Prepare dout array and BlockSpec
   if reduction in ("sum", "mean"):
     dout_array = jnp.zeros(1).at[0].set(dout)
-    dout_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
   else:
     dout_array = dout
-    dout_spec = pl.BlockSpec(
-        (b_block_size,), lambda i, j, s, k: (i,), memory_space=pltpu.VMEM
-    )
 
   # Constrain the memory spaces for x and w to prevent OOB accesses that occur
   # when the memory spaces is placed in VMEM.
@@ -895,63 +1064,18 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
   w = pltpu.with_memory_space_constraint(w, memory_space=pltpu.HBM)
 
   # Backward
-  x_grad, w_grad = pl.pallas_call(
-      partial(
-          linear_softmax_cross_entropy_loss_backward_pallas_kernel,
-          reduction=reduction,
-          preferred_element_type=preferred_element_type,
-      ),
-      in_specs=[
-          dout_spec,  # dout
-          pl.BlockSpec(  # x
-              (b_block_size, h_block_size),
-              lambda i, j, s, k: (i, k),
-              memory_space=pltpu.VMEM,
-          ),
-          pl.BlockSpec(  # labels
-              (b_block_size,),
-              lambda i, j, s, k: (i),
-              memory_space=pltpu.VMEM,
-          ),
-          pl.BlockSpec(  # w
-              (h_block_size, v_block_size),
-              lambda i, j, s, k: (k, j),
-              memory_space=pltpu.VMEM,
-          ),
-          pl.BlockSpec(  # lse
-              (b_block_size,), lambda i, j, s, k: (i,), memory_space=pltpu.VMEM
-          ),
-      ],
-      out_specs=[
-          pl.BlockSpec(memory_space=pltpu.HBM),  # x_grad
-          pl.BlockSpec(memory_space=pltpu.HBM),  # w_grad
-      ],
-      out_shape=[
-          jax.ShapeDtypeStruct(x.shape, dtype=jnp.float32),  # x_grad
-          jax.ShapeDtypeStruct(w.shape, dtype=jnp.float32),  # w_grad
-      ],
-      scratch_shapes=(
-          pltpu.VMEM(
-              (b_block_size, v_block_size), dtype=jnp.float32
-          ),  # xw_scratch
-          pltpu.VMEM(
-              (b_block_size, h_block_size), dtype=jnp.float32
-          ),  # x_grad_tile
-          pltpu.VMEM(
-              (h_block_size, v_block_size), dtype=jnp.float32
-          ),  # w_grad_tile
-          pltpu.SemaphoreType.DMA,  # x_read_sem
-          pltpu.SemaphoreType.DMA,  # w_read_sem
-          pltpu.SemaphoreType.DMA,  # x_write_sem
-          pltpu.SemaphoreType.DMA,  # w_write_sem
-      ),
-      grid=(num_b_blocks, num_v_blocks, num_stages, num_h_blocks),
-      compiler_params=pltpu.CompilerParams(
-          vmem_limit_bytes=_get_vmem_limit_bytes(),
-          disable_bounds_checks=True,
-      ),
-      name=f"lce_bwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}_reduction_{reduction}",
-  )(dout_array, x, labels, w, lse)
+  x_grad, w_grad = linear_softmax_cross_entropy_loss_backward_pallas_kernel(  # pylint: disable=unpacking-non-sequence
+      dout_array,
+      x,
+      labels,
+      w,
+      lse,
+      reduction=reduction,
+      preferred_element_type=preferred_element_type,
+      b_block_size=b_block_size,
+      h_block_size=h_block_size,
+      v_block_size=v_block_size,
+  )
 
   # There is no gradient for the labels
   return (x_grad, w_grad)
