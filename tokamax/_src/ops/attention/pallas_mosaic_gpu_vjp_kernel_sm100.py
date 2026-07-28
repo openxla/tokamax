@@ -639,8 +639,6 @@ def _kernel_dq(
     def sfu_loop(ki):
       # BLOCKING: Waiting for MMA to signal that S matmul is complete in TMEM.
       elt_bi = lax.rem(ki - lb, config.eltwise_stages)
-      plgpu.barrier_wait(s_produced)
-      plgpu.barrier_wait(dp_produced)
 
       if not config.load_residuals_in_regs:
         m_val = plgpu.load(m_smem, layout=_TMEM_ROW)
@@ -680,12 +678,12 @@ def _kernel_dq(
         c_start = chunk_idx * config.chunk_size
         chunk_slice = pl.ds(c_start, config.chunk_size)
 
+        if chunk_idx == 0:
+          plgpu.barrier_wait(s_produced)
         s_val = plgpu.async_load_tmem(s_tmem.at[:, chunk_slice], layout=_TMEM)
-        dp_val = plgpu.async_load_tmem(dp_tmem.at[:, chunk_slice], layout=_TMEM)
-        plgpu.wait_load_tmem()
         if chunk_idx == num_chunks - 1:
+          plgpu.wait_load_tmem()
           plgpu.barrier_arrive(s_consumed)
-          plgpu.barrier_arrive(dp_consumed)
 
         if bias_ref is not None:
           s_val *= logits_scale
@@ -778,6 +776,14 @@ def _kernel_dq(
 
         epsilon = float(jnp.finfo(jnp.float32).tiny)
         p_val = jnp.exp2(base_val) / (l_val_bc + epsilon)
+
+        if chunk_idx == 0:
+          plgpu.barrier_wait(dp_produced)
+        dp_val = plgpu.async_load_tmem(dp_tmem.at[:, chunk_slice], layout=_TMEM)
+        if chunk_idx == num_chunks - 1:
+          plgpu.wait_load_tmem()
+          plgpu.barrier_arrive(dp_consumed)
+
         ds_val = p_val * (dp_val - delta_val_bc)
 
         if logits_soft_cap is not None:
@@ -1089,8 +1095,6 @@ def _kernel_dkv(
       hi = hi_kv * q_heads_per_kv_head + qh
       plgpu.barrier_wait(q_do_produced.at[si])
       plgpu.barrier_wait(residual_produced.at[li])
-      plgpu.barrier_wait(s_produced)
-      plgpu.barrier_wait(dp_produced)
 
       num_chunks = config.block_q_dkv // config.chunk_size
 
@@ -1101,12 +1105,12 @@ def _kernel_dkv(
         c_start = chunk_idx * config.chunk_size
         chunk_slice = pl.ds(c_start, config.chunk_size)
 
+        if chunk_idx == 0:
+          plgpu.barrier_wait(s_produced)
         s_val = plgpu.async_load_tmem(s_tmem.at[:, chunk_slice], layout=_TMEM)
-        dp_val = plgpu.async_load_tmem(dp_tmem.at[:, chunk_slice], layout=_TMEM)
-        plgpu.wait_load_tmem()
         if chunk_idx == num_chunks - 1:
+          plgpu.wait_load_tmem()
           plgpu.barrier_arrive(s_consumed)
-          plgpu.barrier_arrive(dp_consumed)
 
         if bias_ref is not None:
           s_val *= logits_scale
@@ -1215,6 +1219,14 @@ def _kernel_dkv(
         delta_val = plgpu.load(delta_smem.at[li, chunk_slice], layout=_TMEM_COL)
         delta_val = lax.broadcast_in_dim(delta_val, p_val.shape, [1])
         delta_val = plgpu.layout_cast(delta_val, _TMEM)
+
+        if chunk_idx == 0:
+          plgpu.barrier_wait(dp_produced)
+        dp_val = plgpu.async_load_tmem(dp_tmem.at[:, chunk_slice], layout=_TMEM)
+        if chunk_idx == num_chunks - 1:
+          plgpu.wait_load_tmem()
+          plgpu.barrier_arrive(dp_consumed)
+
         ds_val = p_val * (dp_val - delta_val)
 
         if logits_soft_cap is not None:
