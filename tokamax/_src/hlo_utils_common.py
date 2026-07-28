@@ -16,7 +16,7 @@
 """Common utilities for HLO utils."""
 
 import dataclasses
-from typing import Final, cast
+from typing import Any, Callable, Final, Iterable, cast
 import jax
 from jaxlib.mlir import ir
 
@@ -56,6 +56,8 @@ class KernelInfoBase:
   source_file: str
   source_line: int
   hlo_module_name: str
+  # TODO: Remove `None` once the migration is complete.
+  metadata_payload: str | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -111,3 +113,31 @@ def ir_module_from_lowered(
   """Returns an `ir.Module` from a lowered JAX function."""
   assert (module := lowered.compiler_ir('stablehlo')) is not None
   return cast(ir.Module, module)
+
+
+@dataclasses.dataclass(frozen=True)
+class Record:
+  emit_fn: Callable[[], KernelInfoBase]
+  is_noise: bool
+  payload: str | None
+
+
+def dedupe_wrapper_kernels(
+    records: Iterable[Record],
+) -> tuple[KernelInfoBase, ...]:
+  """Deduplicates wrapper operations based on their metadata payload.
+
+  Always returns non-noise ops. For noise ops, they are only returned if they
+  carry a unique payload that isn't already covered by a non-noise op and
+  hasn't been seen previously.
+  """
+  payloads = {r.payload for r in records if not r.is_noise and r.payload}
+  infos = []
+  for r in records:
+    if r.is_noise:
+      if not r.payload or r.payload in payloads:
+        continue
+      payloads.add(r.payload)
+    infos.append(r.emit_fn())
+  return tuple(infos)
+

@@ -23,6 +23,7 @@ import chex
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
+from jax.experimental.xla_metadata import set_xla_metadata
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
@@ -142,7 +143,6 @@ class DumpHloLibTest(parameterized.TestCase):
 
     self.assertIsInstance(kernel_1, hlo_utils_common.TritonKernelInfo)
     self.assertIsInstance(kernel_2, hlo_utils_common.TritonKernelInfo)
-
 
     # TODO: Re-enable checks after bug is fixed.
     _ = """
@@ -368,6 +368,141 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertEqual(
         batching.BatchedShapeDtype(shape=x.shape, dtype=x.dtype, vmap_axes=()),
         opspec.arguments['q'],
+    )
+
+
+class HloUtilsHelpersTest(parameterized.TestCase):
+
+  def _get_first_stablehlo_op(self, mlir_module, target_op='stablehlo'):
+    for func_op in mlir_module.body.operations:
+      if 'sym_name' in func_op.attributes and 'main' in str(
+          func_op.attributes['sym_name']
+      ):
+        for child in func_op.regions[0].blocks[0].operations:
+          if target_op in child.name:
+            return child
+    return None
+
+  def test_get_common_kernel_info_with_frontend_attributes(self):
+    @jax.jit
+    def my_func(x):
+      with set_xla_metadata(xla_metadata_payload='tokamax:my_mlir_payload'):
+        return x + 1
+
+    lowered = my_func.lower(jnp.array(1))
+    mlir_module = lowered.compiler_ir()
+    print('MLIR_OUTPUT_START\n', mlir_module, '\nMLIR_OUTPUT_END')
+
+    op = self._get_first_stablehlo_op(mlir_module, 'stablehlo.add')
+    self.assertIsNotNone(op)
+
+    info = hlo_utils._get_common_kernel_info(op, ())
+    self.assertEqual(info['metadata_payload'], 'tokamax:my_mlir_payload')
+
+  def test_get_common_kernel_info_no_payload(self):
+    @jax.jit
+    def my_func(x):
+      return x + 1
+
+    lowered = my_func.lower(jnp.array(1))
+    mlir_module = lowered.compiler_ir()
+
+    op = self._get_first_stablehlo_op(mlir_module, 'stablehlo.add')
+    self.assertIsNotNone(op)
+
+    info = hlo_utils._get_common_kernel_info(op, ())
+    self.assertIsNone(info.get('metadata_payload'))
+
+  def test_get_kernel_info_stablehlo_full_path(self):
+    @jax.jit
+    def my_func(x):
+      with set_xla_metadata(xla_metadata_payload='tokamax:my_mlir_payload'):
+        return x + 1
+
+    lowered = my_func.lower(jnp.array(1))
+    mlir_module = lowered.compiler_ir()
+
+    assert mlir_module is not None
+    infos = hlo_utils._get_kernel_info_stablehlo(
+        mlir_module, include_xla_kernels=True
+    )
+
+    # Find our payload among the extracted kernels
+    found_payload = False
+    for info in infos:
+      if info.metadata_payload == 'tokamax:my_mlir_payload':
+        found_payload = True
+        break
+
+    self.assertTrue(
+        found_payload,
+        'Full Tokamax MLIR walker failed to extract the injected payload.',
+    )
+
+  @parameterized.parameters(
+      ('add', False),
+      ('reshape', True),
+  )
+  def test_get_kernel_info_stablehlo_payload_propagation(self, op_type, is_noise):
+    @jax.jit
+    def my_func(x):
+      from jax._src.xla_metadata import set_xla_metadata
+      with set_xla_metadata(xla_metadata_payload='tokamax:my_mlir_payload'):
+        if op_type == 'add':
+          return x + 1
+        else:
+          return jnp.reshape(x, (2,))
+
+    lowered = my_func.lower(jnp.ones((2, 1)))
+    mlir_module = lowered.compiler_ir()
+    assert mlir_module is not None
+    infos = hlo_utils._get_kernel_info_stablehlo(
+        mlir_module, include_xla_kernels=True
+    )
+
+    found_payload = False
+    for info in infos:
+      if info.metadata_payload == 'tokamax:my_mlir_payload':
+        found_payload = True
+        break
+
+    self.assertTrue(
+        found_payload,
+        f'MLIR walker dropped payload for op_type={op_type} (is_noise={is_noise})',
+    )
+
+
+  def test_dedupe_wrapper_kernels(self):
+    def mock_info(name):
+      return hlo_utils_common.KernelInfoBase(
+          name=name,
+          inputs=(),
+          outputs=(),
+          op_name='',
+          source_file='',
+          source_line=0,
+          hlo_module_name='',
+      )
+
+    records = [  # shared PAYLOAD, DIFFERENT op_names (as in real HLO)
+        hlo_utils_common.Record(
+            lambda: mock_info('norm_kernel'), False, 'tokamax:NORM'
+        ),
+        hlo_utils_common.Record(
+            lambda: mock_info('reshape_in'), True, 'tokamax:NORM'
+        ),
+        hlo_utils_common.Record(
+            lambda: mock_info('reshape_out'), True, 'tokamax:NORM'
+        ),
+        hlo_utils_common.Record(
+            lambda: mock_info('cudnn_transpose'),
+            True,
+            'tokamax:CUDNN',
+        ),
+    ]
+    self.assertEqual(
+        [i.name for i in hlo_utils_common.dedupe_wrapper_kernels(records)],
+        ['norm_kernel', 'cudnn_transpose'],
     )
 
 
