@@ -391,8 +391,8 @@ def flash_attention_kernel(
       qk_consumed_barrier,
       pv_mma_barrier,
       v_consumed_barrier,
-      p_produced_barrier,
-      out_scaled_barrier,
+      p_barrier,
+      acc_barrier,
   ):
     q_smem, o_smem = qo_smem_union
 
@@ -548,13 +548,13 @@ def flash_attention_kernel(
             slot = lax.rem(ki - lb, 2)
             with jax.named_scope("wait_v"):
               plgpu.barrier_wait(v_barrier.at[si])
-              plgpu.barrier_wait(p_produced_barrier.at[slot])
+              plgpu.barrier_wait(p_barrier.at[slot])
 
             @pl.loop(0, num_tma_splits)
             def tma_loop(split_idx):
               block_d = head_dim_out // num_tma_splits
               ds = pl.ds(split_idx * block_d, block_d)
-              plgpu.barrier_wait(out_scaled_barrier.at[split_idx])
+              plgpu.barrier_wait(acc_barrier.at[split_idx])
               with jax.named_scope("issuing P@V"):
                 plgpu.tcgen05_mma(
                     acc_tmem.at[:, ds],
@@ -659,7 +659,7 @@ def flash_attention_kernel(
             bias = plgpu.load(bias_smem, layout=_TMEM, optimized=False)
             plgpu.barrier_arrive(bias_consumed_barrier)
 
-          plgpu.wait_load_tmem()
+          mgpu_lib.tcgen05_wait_ld()
           plgpu.barrier_arrive(qk_consumed_barrier)
 
         if bias is not None:
@@ -696,8 +696,11 @@ def flash_attention_kernel(
           with jax.named_scope("write qk_tmem"):
             ks = pl.ds(si * block_kv, block_kv)
             plgpu.async_store_tmem(p_tmem.at[:, ks], p.astype(p_tmem.dtype))
-            plgpu.commit_tmem()
-        plgpu.barrier_arrive(p_produced_barrier.at[si])
+            mgpu_lib.tcgen05_wait_st()
+            mgpu_lib.tcgen05_fence_before_thread_sync()
+            if collective:  # Not all threads arrive on the barrier.
+              mgpu_lib.warpgroup_barrier()
+            plgpu.barrier_arrive(p_barrier.at[si])
         return m_scale, m_i, l_i
 
       # prologue
@@ -736,7 +739,7 @@ def flash_attention_kernel(
       @pl.when(ub > lb)
       def release_out_scaled_barriers():
         for i in range(num_tma_splits):
-          plgpu.barrier_arrive(out_scaled_barrier.at[i])
+          plgpu.barrier_arrive(acc_barrier.at[i])
 
       def two_in_flight(iterable):
         for a, _ in itertools.pairwise(itertools.chain(iterable, [None])):  # pytype: disable=wrong-arg-types
@@ -789,14 +792,12 @@ def flash_attention_kernel(
               except StopIteration:
                 break
 
-            plgpu.commit_tmem()
-            plgpu.barrier_arrive(out_scaled_barrier.at[i])
+            mgpu_lib.tcgen05_wait_st()
+            plgpu.barrier_arrive(acc_barrier.at[i])
 
         def no_rescale():
           for i in range(num_tma_splits):
-            plgpu.barrier_arrive(out_scaled_barrier.at[i])
-          for _ in range(num_tma_splits):
-            mgpu_lib.warpgroup_barrier()  # To match barrier in `commit_tmem`.
+            plgpu.barrier_arrive(acc_barrier.at[i])
 
         with jax.named_scope("rescale_acc"):
           # If none of the threads in the warp need to rescale, then we can skip
@@ -939,11 +940,16 @@ def flash_attention_kernel(
       mask_consumed_barrier=None if mask_scratch is None else plgpu.Barrier(),
       qk_mma_barrier=plgpu.Barrier(orders_tensor_core=True),
       k_consumed_barrier=kv_consumed_barrier,
-      qk_consumed_barrier=maybe_cluster_barrier(),
+      qk_consumed_barrier=maybe_cluster_barrier(orders_tensor_core=True),
       pv_mma_barrier=plgpu.Barrier(orders_tensor_core=True),
       v_consumed_barrier=kv_consumed_barrier,
-      p_produced_barrier=maybe_cluster_barrier(num_barriers=2),
-      out_scaled_barrier=maybe_cluster_barrier(num_barriers=num_tma_splits),
+      # The `p_barrier` does order the tensor core, but we insert the correct
+      # PTX directive on arrive to avoid redundancy on the wait as `acc_barrier`
+      # wait already has it.
+      p_barrier=maybe_cluster_barrier(num_barriers=2),
+      acc_barrier=maybe_cluster_barrier(
+          num_barriers=num_tma_splits, orders_tensor_core=True
+      ),
   )
 
   profile = False
