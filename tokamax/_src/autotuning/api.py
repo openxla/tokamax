@@ -325,7 +325,6 @@ def autotune(
     ignore_cache: bool = False,
     all_implementations: bool = False,
     progress_bar: bool = True,
-    event_filter_regex: str | None = None,
 ) -> AutotuningResult:
   """Autotunes all captured ops in x.
 
@@ -339,9 +338,6 @@ def autotune(
     all_implementations: Whether to autotune all implementations of the op that
       is tunable on the current device.
     progress_bar: Whether to show a progress bar (default: `True`).
-    event_filter_regex: Reported timing sums all XLA operations in `f` by
-      default. This regex enables filtering by specific event names to report
-      timing for just a subset of events that match the pattern.
 
   Returns:
     An `AutotuningResult` object of the autotuned ops.
@@ -388,12 +384,7 @@ def autotune(
 
   for bound_arg in bound_args:
     try:
-      data.append((
-          bound_arg,
-          bound_arg.autotune(
-              event_filter_regex=event_filter_regex, cache_results=False
-          ),
-      ))
+      data.append((bound_arg, bound_arg.autotune(cache_results=False)))
     except Exception:  # pylint: disable=broad-exception-caught
       logging.exception("Failed to autotune for op %s", bound_arg.op)
 
