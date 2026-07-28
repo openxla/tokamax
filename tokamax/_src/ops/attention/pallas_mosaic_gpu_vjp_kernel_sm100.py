@@ -87,9 +87,11 @@ def _get_dq_scratch_shapes(
       k_smem=_tiled_smem((num_stages, block_kv, head_dim), k_dtype, swizzle=64),
       v_smem=_tiled_smem((num_stages, block_kv, head_dim_out), v_dtype),
       s_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
-      dp_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
+      dp_ds_tmems=plgpu.RefUnion(
+          plgpu.TMEM((block_q, block_kv), jnp.float32),
+          plgpu.TMEM((block_q, block_kv), k_dtype, packed=True),
+      ),
       dq_tmem=plgpu.TMEM((block_q, head_dim), jnp.float32),
-      ds_tmem=plgpu.TMEM((block_q, block_kv), k_dtype, packed=True),
       kv_produced=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),
       k_consumed=plgpu.Barrier(
           num_barriers=num_stages, orders_tensor_core=True
@@ -100,9 +102,7 @@ def _get_dq_scratch_shapes(
       s_produced=plgpu.Barrier(orders_tensor_core=True),
       s_consumed=plgpu.Barrier(),
       dp_produced=plgpu.Barrier(orders_tensor_core=True),
-      dp_consumed=plgpu.Barrier(),
       ds_produced=plgpu.Barrier(),
-      ds_consumed=plgpu.Barrier(orders_tensor_core=True),
       dq_mma_finished=plgpu.Barrier(orders_tensor_core=True),
   )
   if config.load_residuals_in_regs:
@@ -390,9 +390,8 @@ def _kernel_dq(
     k_smem,
     v_smem,
     s_tmem,
-    dp_tmem,
+    dp_ds_tmems,
     dq_tmem,
-    ds_tmem,
     q_do_produced,
     kv_produced,
     k_consumed,
@@ -400,9 +399,7 @@ def _kernel_dq(
     s_produced,
     s_consumed,
     dp_produced,
-    dp_consumed,
     ds_produced,
-    ds_consumed,
     dq_mma_finished,
     bias_smem=None,
     mask_smem=None,
@@ -439,6 +436,8 @@ def _kernel_dq(
     m_smem = residuals_smem.at[0]
     l_smem = residuals_smem.at[1]
     delta_smem = residuals_smem.at[2]
+
+  dp_tmem, ds_tmem = dp_ds_tmems
 
   @pl.when((wg_id == 0) & (ub > lb))
   def mma_tma_wg():
@@ -544,26 +543,38 @@ def _kernel_dq(
 
       @pl.when(warp_id == 2)
       def mma():
-        plgpu.barrier_wait(q_do_produced)
 
-        @pl.loop(lb, ub)
-        def mma_loop(ki):
+        def q_k_mma(ki, wait_s_consumed=True):
           si = lax.rem(ki - lb, config.num_stages)
           plgpu.barrier_wait(kv_produced.at[si])
-          plgpu.barrier_wait(s_consumed)
+          if wait_s_consumed:
+            plgpu.barrier_wait(s_consumed)
           plgpu.tcgen05_mma(s_tmem, q_smem, k_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(s_produced)
 
-          plgpu.barrier_wait(dp_consumed)
+        def do_v_mma(ki):
+          si = lax.rem(ki - lb, config.num_stages)
           plgpu.tcgen05_mma(dp_tmem, do_smem, v_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(dp_produced)
           plgpu.tcgen05_commit_arrive(v_consumed.at[si])
 
+        def ds_k_mma(ki):
+          si = lax.rem(ki - lb, config.num_stages)
           plgpu.barrier_wait(ds_produced)
           plgpu.tcgen05_mma(dq_tmem, ds_tmem, k_smem.at[si], accumulate=ki > lb)
-          plgpu.tcgen05_commit_arrive(ds_consumed)
           plgpu.tcgen05_commit_arrive(k_consumed.at[si])
 
+        plgpu.barrier_wait(q_do_produced)
+        q_k_mma(lb, wait_s_consumed=False)
+        do_v_mma(lb)
+
+        @pl.loop(lb, ub - 1)
+        def mma_loop(ki):
+          q_k_mma(ki + 1)
+          ds_k_mma(ki)
+          do_v_mma(ki + 1)
+
+        ds_k_mma(ub - 1)
         plgpu.tcgen05_commit_arrive(dq_mma_finished)
 
     plgpu.barrier_wait(dq_mma_finished)
@@ -577,9 +588,6 @@ def _kernel_dq(
   @pl.when((wg_id == 1) & (ub > lb))
   def sfu_wg():
     plgpu.barrier_wait(q_do_produced)
-    plgpu.barrier_arrive(s_consumed)
-    plgpu.barrier_arrive(dp_consumed)
-    plgpu.barrier_arrive(ds_consumed)
 
     if k_start_ref is not None:
       hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
@@ -717,9 +725,6 @@ def _kernel_dq(
 
       plgpu.barrier_wait(dp_produced)
       dp_val = plgpu.async_load_tmem(dp_tmem, layout=_TMEM)
-      plgpu.wait_load_tmem()
-      plgpu.barrier_arrive(dp_consumed)
-
       ds_val = p_val * (dp_val - delta_val_bc)
 
       if logits_soft_cap is not None:
@@ -741,7 +746,6 @@ def _kernel_dq(
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(ds_smem, ds_ref.at[hi, qs, ks])
 
-      plgpu.barrier_wait(ds_consumed)
       plgpu.async_store_tmem(ds_tmem, ds_val.astype(ds_tmem.dtype))
       plgpu.commit_tmem()
       plgpu.barrier_arrive(ds_produced)
