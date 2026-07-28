@@ -483,30 +483,30 @@ def _kernel_dq(
           si = lax.rem(ki - lb, config.num_stages)
           ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
           plgpu.copy_gmem_to_smem(
-              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
+              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
           )
           plgpu.copy_gmem_to_smem(
-              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
+              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
           )
 
         @pl.loop(lb + config.num_stages, ub)
         def kv_loop(ki):
           si = lax.rem(ki - lb, config.num_stages)
           ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
-          plgpu.barrier_wait(k_consumed.at[si])
-          plgpu.copy_gmem_to_smem(
-              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
-          )
           plgpu.barrier_wait(v_consumed.at[si])
           plgpu.copy_gmem_to_smem(
               v_ref.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
+          )
+          plgpu.barrier_wait(k_consumed.at[si])
+          plgpu.copy_gmem_to_smem(
+              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
           )
 
         @pl.loop(lax.max(lb, ub - config.num_stages), ub)
         def kv_epilogue(ki):
           si = lax.rem(ki - lb, config.num_stages)
-          plgpu.barrier_wait(k_consumed.at[si])
           plgpu.barrier_wait(v_consumed.at[si])
+          plgpu.barrier_wait(k_consumed.at[si])
 
       @pl.when(warp_id == 3)
       def tma_eltwise():
@@ -567,6 +567,7 @@ def _kernel_dq(
           plgpu.barrier_wait(dp_consumed)
           plgpu.tcgen05_mma(dp_tmem, do_smem, v_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(dp_produced)
+          plgpu.tcgen05_commit_arrive(v_consumed.at[si])
 
           num_chunks = config.block_kv_dq // config.chunk_size
           for chunk_idx in range(num_chunks):
@@ -585,7 +586,6 @@ def _kernel_dq(
             plgpu.tcgen05_commit_arrive(ds_consumed.at[ci])
 
           plgpu.tcgen05_commit_arrive(k_consumed.at[si])
-          plgpu.tcgen05_commit_arrive(v_consumed.at[si])
 
         plgpu.barrier_wait(s_consumed)
         plgpu.barrier_wait(dp_consumed)
