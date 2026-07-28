@@ -95,8 +95,7 @@ def _get_dq_scratch_shapes(
       s_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
       dp_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
       dq_tmem=plgpu.TMEM((block_q, head_dim), jnp.float32),
-      k_produced=plgpu.Barrier(num_barriers=num_stages),
-      v_produced=plgpu.Barrier(num_barriers=num_stages),
+      kv_produced=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),
       k_consumed=plgpu.Barrier(
           num_barriers=num_stages, orders_tensor_core=True
       ),
@@ -404,8 +403,7 @@ def _kernel_dq(
     dp_tmem,
     dq_tmem,
     q_do_produced,
-    k_produced,
-    v_produced,
+    kv_produced,
     k_consumed,
     v_consumed,
     s_produced,
@@ -485,24 +483,23 @@ def _kernel_dq(
           si = lax.rem(ki - lb, config.num_stages)
           ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
           plgpu.copy_gmem_to_smem(
-              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=k_produced.at[si]
+              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
           )
           plgpu.copy_gmem_to_smem(
-              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=v_produced.at[si]
+              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
           )
 
         @pl.loop(lb + config.num_stages, ub)
         def kv_loop(ki):
           si = lax.rem(ki - lb, config.num_stages)
           ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
-          # BLOCKING: Waiting for MMA to signal that previous tile in this slot is consumed.
           plgpu.barrier_wait(k_consumed.at[si])
           plgpu.copy_gmem_to_smem(
-              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=k_produced.at[si]
+              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
           )
           plgpu.barrier_wait(v_consumed.at[si])
           plgpu.copy_gmem_to_smem(
-              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=v_produced.at[si]
+              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
           )
 
         @pl.loop(lax.max(lb, ub - config.num_stages), ub)
@@ -562,11 +559,8 @@ def _kernel_dq(
         @pl.loop(lb, ub)
         def mma_loop(ki):
           si = lax.rem(ki - lb, config.num_stages)
-          # BLOCKING: Waiting for TMA to signal that tile data is produced in SMEM.
-          plgpu.barrier_wait(k_produced.at[si])
-          plgpu.barrier_wait(v_produced.at[si])
+          plgpu.barrier_wait(kv_produced.at[si])
           plgpu.barrier_wait(s_consumed)
-
           plgpu.tcgen05_mma(s_tmem, q_smem, k_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(s_produced)
 
@@ -1021,7 +1015,6 @@ def _kernel_dkv(
         def mma_loop(step):
           si = lax.rem(step, config.num_stages)
           plgpu.barrier_wait(q_do_produced.at[si])
-
           plgpu.barrier_wait(s_consumed)
           plgpu.tcgen05_mma(s_tmem, k_smem, q_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(s_produced)
@@ -1319,9 +1312,6 @@ def flash_attention_vjp_kernel(
     k_start = shape_lib.pad_to_next_multiple_of(k_start, block_q_dq, -1)
   if k_end is not None:
     k_end = shape_lib.pad_to_next_multiple_of(k_end, block_q_dq, -1)
-
-  bias_shape = bias.shape if bias is not None else None
-  mask_shape = mask.shape if mask is not None else None
 
   pad_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
   q, k, v, out, dout = map(pad_dim, (q, k, v, out, dout))
