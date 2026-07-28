@@ -675,9 +675,6 @@ def _kernel_dq(
 
       k_iota = iota(base_val.shape, 1) + ki * config.block_kv_dq
       q_iota = iota(base_val.shape, 0) + q_base
-      causal_mask = None
-      k_start_val_bc = None
-      k_end_val_bc = None
 
       if is_causal:
         causal_mask = k_iota <= q_iota
@@ -703,8 +700,9 @@ def _kernel_dq(
             float(jnp.finfo(jnp.float32).min),
         )
 
-      mask_val = None
-      if mask_ref is not None:
+      if mask_ref is None:
+        mask_val = None
+      else:
         if mask_smem is None:
           mask_val = _load_bcast(mask_ref, (hi, qs, ks), layout=_TMEM)
         else:
@@ -730,13 +728,10 @@ def _kernel_dq(
       if logits_soft_cap is not None:
         ds_val *= 1.0 - jnp.square(s_val / logits_soft_cap)
 
-      if is_causal:
-        ds_val = jnp.where(causal_mask, ds_val, 0.0)
-      if k_start_ref is not None:
-        ds_val = jnp.where(k_iota >= k_start_val_bc, ds_val, 0.0)
-      if k_end_ref is not None:
-        ds_val = jnp.where(k_iota < k_end_val_bc, ds_val, 0.0)
-      if mask_ref is not None:
+      # If we have an attention mask, it is possible that the entire row is
+      # masked out. In that case, the forwards pass will calculate `p`'s values
+      # as `1 / seq_len_k`. The corresponding `ds` values must be zeroed.
+      if mask_val is not None:
         ds_val = jnp.where(mask_val, ds_val, 0.0)
 
       if ds_ref is not None:
@@ -1085,9 +1080,6 @@ def _kernel_dkv(
 
         k_iota = iota(base_val.shape, 0) + kv_base
         q_iota = iota(base_val.shape, 1) + qi * config.block_q_dkv + c_start
-        causal_mask = None
-        k_start_val = None
-        k_end_val = None
 
         if is_causal:
           causal_mask = k_iota <= q_iota
@@ -1125,7 +1117,6 @@ def _kernel_dkv(
               float(jnp.finfo(jnp.float32).min),
           )
 
-        mask_val = None
         if mask_ref is not None:
           if mask_smem is None:
             if loop_invariant_mask is None:
@@ -1171,15 +1162,6 @@ def _kernel_dkv(
 
         if logits_soft_cap is not None:
           ds_val *= 1.0 - jnp.square(s_val / logits_soft_cap)
-
-        if is_causal:
-          ds_val = jnp.where(causal_mask, ds_val, 0.0)
-        if k_start_ref is not None:
-          ds_val = jnp.where(k_iota >= k_start_val, ds_val, 0.0)
-        if k_end_ref is not None:
-          ds_val = jnp.where(k_iota < k_end_val, ds_val, 0.0)
-        if mask_ref is not None:
-          ds_val = jnp.where(mask_val, ds_val, 0.0)
 
         plgpu.barrier_wait(ds_consumed.at[ci])
         ds_smem[ci] = ds_val.astype(ds_smem.dtype)
