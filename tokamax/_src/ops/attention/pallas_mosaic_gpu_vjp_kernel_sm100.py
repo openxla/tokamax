@@ -247,15 +247,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
 
   head_dim, head_dim_out = _get_input_metadata(q, v)
   dbias_intermediate_dtype = getattr(ba.op, "dbias_intermediate_dtype", None)
-
-  if bias is None:
-    ds_dtype = None
-  elif dbias_intermediate_dtype is None:
-    ds_dtype = bias.dtype
-  elif bias.shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
-    ds_dtype = bias.dtype
-  else:
-    ds_dtype = dbias_intermediate_dtype
+  ds_dtype = vjp_common.get_ds_dtype(q, k, bias, dbias_intermediate_dtype)
 
   configs = set()
   min_dq_smem = float("inf")
@@ -532,6 +524,7 @@ def _kernel_dq(
               @pl.when(ki - lb >= config.eltwise_stages)
               def wait_bias():
                 plgpu.barrier_wait(bias_consumed.at[bi])
+                mgpu_lib.fence_async_shared_cta()
 
               plgpu.copy_gmem_to_smem(
                   bias_ref.at[0 if bias_ref.shape[-3] == 1 else hi, qs, ks],
@@ -544,6 +537,7 @@ def _kernel_dq(
               @pl.when(ki - lb >= config.eltwise_stages)
               def wait_mask():
                 plgpu.barrier_wait(mask_consumed.at[bi])
+                mgpu_lib.fence_async_shared_cta()
 
               mask_hi = 0 if mask_ref.shape[-3] == 1 else hi
               mask_qs = 0 if mask_ref.shape[-2] == 1 else qs
@@ -617,10 +611,7 @@ def _kernel_dq(
     plgpu.set_max_registers(216, action="increase")
     plgpu.barrier_wait(q_do_produced)
 
-    @pl.loop(0, ds_stages)
-    def ds_prologue(i):
-      plgpu.barrier_arrive(ds_consumed.at[i])
-
+    pl.loop(0, ds_stages)(lambda i: plgpu.barrier_arrive(ds_consumed.at[i]))
     plgpu.barrier_arrive(s_consumed)
     plgpu.barrier_arrive(dp_consumed)
 
@@ -650,10 +641,6 @@ def _kernel_dq(
       elt_bi = lax.rem(ki - lb, config.eltwise_stages)
       plgpu.barrier_wait(s_produced)
       plgpu.barrier_wait(dp_produced)
-      if bias_smem is not None:
-        plgpu.barrier_wait(bias_produced.at[elt_bi])
-      if mask_smem is not None:
-        plgpu.barrier_wait(mask_produced.at[elt_bi])
 
       if not config.load_residuals_in_regs:
         m_val = plgpu.load(m_smem, layout=_TMEM_ROW)
@@ -709,9 +696,13 @@ def _kernel_dq(
             )
             bias_val = _load_bcast(bias_ref, (hi, qs, ks), layout=_TMEM)
           else:
+            if chunk_idx == 0:
+              plgpu.barrier_wait(bias_produced.at[elt_bi])
             bias_val = plgpu.load(
                 bias_smem.at[elt_bi, :, chunk_slice], layout=_TMEM
             )
+            if chunk_idx == num_chunks - 1:
+              plgpu.barrier_arrive(bias_consumed.at[elt_bi])
           s_val += bias_val
 
         if logits_soft_cap is not None:
@@ -766,15 +757,20 @@ def _kernel_dq(
           if mask_smem is None:
             ks = pl.ds(ki * config.block_kv_dq + c_start, config.chunk_size)
             mask_val = _load_bcast(mask_ref, (hi, qs, ks), layout=_TMEM)
-          elif mask_smem.ndim == 2:
-            mask_val = plgpu.load(
-                mask_smem, (elt_bi, chunk_slice), layout=_TMEM_COL
-            )
-            mask_val = lax.broadcast_in_dim(mask_val, base_val.shape, [1])
           else:
-            mask_val = plgpu.load(
-                mask_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
-            )
+            if chunk_idx == 0:
+              plgpu.barrier_wait(mask_produced.at[elt_bi])
+            if mask_smem.ndim == 2:
+              mask_val = plgpu.load(
+                  mask_smem, (elt_bi, chunk_slice), layout=_TMEM_COL
+              )
+              mask_val = lax.broadcast_in_dim(mask_val, base_val.shape, [1])
+            else:
+              mask_val = plgpu.load(
+                  mask_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
+              )
+            if chunk_idx == num_chunks - 1:
+              plgpu.barrier_arrive(mask_consumed.at[elt_bi])
           mask_val = mask_val != 0
           base_val = jnp.where(
               mask_val, base_val, float(jnp.finfo(jnp.float32).min)
@@ -814,14 +810,7 @@ def _kernel_dq(
 
         plgpu.barrier_arrive(ds_produced.at[ci])
 
-      if bias_smem is not None:
-        plgpu.barrier_arrive(bias_consumed.at[elt_bi])
-      if mask_smem is not None:
-        plgpu.barrier_arrive(mask_consumed.at[elt_bi])
-
-    @pl.loop(0, ds_stages)
-    def ds_cleanup(i):
-      plgpu.barrier_wait(ds_consumed.at[i])
+    pl.loop(0, ds_stages)(lambda i: plgpu.barrier_wait(ds_consumed.at[i]))
 
 
 def _kernel_dkv(
@@ -987,6 +976,7 @@ def _kernel_dkv(
               @pl.when(step >= config.eltwise_stages)
               def wait_bias():
                 plgpu.barrier_wait(bias_consumed.at[bi])
+                mgpu_lib.fence_async_shared_cta()
 
               plgpu.copy_gmem_to_smem(
                   bias_ref.at[0 if bias_ref.shape[-3] == 1 else hi, ks, qs],
@@ -999,6 +989,7 @@ def _kernel_dkv(
               @pl.when(step >= config.eltwise_stages)
               def wait_mask():
                 plgpu.barrier_wait(mask_consumed.at[bi])
+                mgpu_lib.fence_async_shared_cta()
 
               mask_hi = 0 if mask_ref.shape[-3] == 1 else hi
               mask_qs = 0 if mask_ref.shape[-1] == 1 else qs
@@ -1077,10 +1068,7 @@ def _kernel_dkv(
   def sfu_wg():
     plgpu.set_max_registers(216, action="increase")
 
-    @pl.loop(0, ds_stages)
-    def ds_prologue(i):
-      plgpu.barrier_arrive(ds_consumed.at[i])
-
+    pl.loop(0, ds_stages)(lambda i: plgpu.barrier_arrive(ds_consumed.at[i]))
     plgpu.barrier_arrive(s_consumed)
     plgpu.barrier_arrive(dp_consumed)
 
@@ -1103,10 +1091,6 @@ def _kernel_dkv(
       plgpu.barrier_wait(residual_produced.at[li])
       plgpu.barrier_wait(s_produced)
       plgpu.barrier_wait(dp_produced)
-      if bias_smem is not None:
-        plgpu.barrier_wait(bias_produced.at[elt_bi])
-      if mask_smem is not None:
-        plgpu.barrier_wait(mask_produced.at[elt_bi])
 
       num_chunks = config.block_q_dkv // config.chunk_size
 
@@ -1130,9 +1114,13 @@ def _kernel_dkv(
             qs = pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
             bias_val = _load_bcast(bias_ref, (hi, ks, qs), layout=_TMEM)
           else:
+            if chunk_idx == 0:
+              plgpu.barrier_wait(bias_produced.at[elt_bi])
             bias_val = plgpu.load(
                 bias_smem.at[elt_bi, :, chunk_slice], layout=_TMEM
             )
+            if chunk_idx == num_chunks - 1:
+              plgpu.barrier_arrive(bias_consumed.at[elt_bi])
           s_val += bias_val
 
         if logits_soft_cap is not None:
@@ -1208,9 +1196,13 @@ def _kernel_dkv(
               mask_val = loop_invariant_mask
               mask_val = lax.broadcast_in_dim(mask_val, base_val.shape, [0])
           else:
+            if chunk_idx == 0:
+              plgpu.barrier_wait(mask_produced.at[elt_bi])
             mask_val = plgpu.load(
                 mask_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
             )
+            if chunk_idx == num_chunks - 1:
+              plgpu.barrier_arrive(mask_consumed.at[elt_bi])
 
           mask_val = mask_val != 0
           base_val = jnp.where(
@@ -1246,16 +1238,10 @@ def _kernel_dkv(
         plgpu.commit_smem()
         plgpu.barrier_arrive(ds_produced.at[ci])
 
-      if bias_smem is not None:
-        plgpu.barrier_arrive(bias_consumed.at[elt_bi])
-      if mask_smem is not None:
-        plgpu.barrier_arrive(mask_consumed.at[elt_bi])
       plgpu.barrier_arrive(q_do_consumed.at[si])
       plgpu.barrier_arrive(residual_consumed.at[li])
 
-    @pl.loop(0, ds_stages)
-    def ds_cleanup(i):
-      plgpu.barrier_wait(ds_consumed.at[i])
+    pl.loop(0, ds_stages)(lambda i: plgpu.barrier_wait(ds_consumed.at[i]))
 
 
 def _pad_maybe_bcast(x, m, axis):

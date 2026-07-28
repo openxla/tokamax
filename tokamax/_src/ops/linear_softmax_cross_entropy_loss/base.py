@@ -44,7 +44,7 @@ class LinearSoftmaxCrossEntropyLoss[C](
       labels: Integer[Array, "B"],
       w: Real[Array, "H V"],
       *,
-      reduction: Literal["sum", "mean"] = "sum",
+      reduction: Literal["sum", "mean", "none"] = "sum",
       config: C,
       return_residuals: bool,
   ) -> tuple[jax.Array, Residuals]:
@@ -63,12 +63,12 @@ class LinearSoftmaxCrossEntropyLossVjp[C](op.Op[Any, Any, None, C, None]):
       self,
       residuals: Residuals,
       out: jax.Array,  # pylint: disable=unused-argument
-      dout: Real[Array, ""],
+      dout: Real[Array, "*"],
       x: Real[Array, "B H"],
       labels: Integer[Array, "B"],
       w: Real[Array, "H V"],
       *,
-      reduction: Literal["sum", "mean"] = "sum",
+      reduction: Literal["sum", "mean", "none"] = "sum",
       config: C,
       return_residuals: bool,
   ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:

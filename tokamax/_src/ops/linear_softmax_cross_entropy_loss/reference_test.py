@@ -43,14 +43,21 @@ class FlashLceReferenceTest(parameterized.TestCase):
           b_dim=1024,
           h_dim=512,
           v_dim=1024,
-          reduction="sum",
+          reduction="mean",
       ),
       dict(
           testcase_name="ref_fwd_medium_size_mean_reduction_test",
           b_dim=4096,
           h_dim=1024,
           v_dim=4096,
-          reduction="sum",
+          reduction="mean",
+      ),
+      dict(
+          testcase_name="ref_fwd_small_size_none_reduction_test",
+          b_dim=1024,
+          h_dim=512,
+          v_dim=1024,
+          reduction="none",
       ),
   )
   def test_reference_fwd_running_correctly(
@@ -95,20 +102,38 @@ class FlashLceReferenceTest(parameterized.TestCase):
           v_dim=4096,
           reduction="mean",
       ),
+      dict(
+          testcase_name="ref_bwd_small_size_none_reduction_test",
+          b_dim=1024,
+          h_dim=512,
+          v_dim=2048,
+          reduction="none",
+      ),
   )
   def test_reference_bwd_matches_jax_grad(self, b_dim, h_dim, v_dim, reduction):
     x, labels, w = test_utils.generate_random_data(
         jax.random.key(42), b_dim, h_dim, v_dim
     )
 
-    (jax_grad_x, jax_grad_w), _ = jax.grad(
-        reference.linear_softmax_cross_entropy_loss_fwd_reference,
-        argnums=(0, 2),
-        has_aux=True,
-    )(x, labels, w, reduction=reduction)
+    if reduction == "none":
+      dout = jax.random.normal(jax.random.key(123), (b_dim,))
+
+      def loss_fn(x_in, w_in):
+        loss, _ = reference.linear_softmax_cross_entropy_loss_fwd_reference(
+            x_in, labels, w_in, reduction="none"
+        )
+        return jnp.sum(dout * loss)
+
+      jax_grad_x, jax_grad_w = jax.grad(loss_fn, argnums=(0, 1))(x, w)
+    else:
+      dout = 1.0
+      (jax_grad_x, jax_grad_w), _ = jax.grad(
+          reference.linear_softmax_cross_entropy_loss_fwd_reference,
+          argnums=(0, 2),
+          has_aux=True,
+      )(x, labels, w, reduction=reduction)
 
     lse = jax.nn.logsumexp(x @ w, axis=-1)
-    dout = 1.0
     ref_grad_x, ref_grad_w = (
         reference.linear_softmax_cross_entropy_loss_bwd_reference(
             dout, lse, x, labels, w, reduction=reduction

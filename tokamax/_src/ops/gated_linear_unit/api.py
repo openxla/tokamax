@@ -17,7 +17,6 @@
 from collections.abc import Callable, Sequence
 from typing import Any, Final, Literal
 
-from absl import logging
 import immutabledict
 import jax
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
@@ -113,7 +112,6 @@ def gated_linear_unit(
     try:
       return fn(x, weights, activation=activation, precision=precision)
     except NotImplementedError as e:
-      logging.exception('Failed to run implementation')
       errors.append(e)
 
   raise ExceptionGroup('all implementations failed', errors)

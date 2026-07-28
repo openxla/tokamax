@@ -17,12 +17,215 @@
 
 from functools import partial, reduce
 import math
-from typing import Literal
+from typing import Annotated, Literal
+import pydantic
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Integer, Real, Scalar
+
+
+@pydantic.dataclasses.dataclass(frozen=True)
+class Config:
+  """The configuration specific for the Pallas Mosaic TPU kernel.
+
+  Attributes:
+    b_block_size: The block size for the batch dimension.
+    h_block_size: The block size for the hidden dimension.
+    v_block_size: The block size for the vocabulary dimension.
+  """
+
+  b_block_size: Annotated[int, pydantic.Field(ge=1024, multiple_of=128)] = 1024
+  h_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 512
+  v_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 2048
+
+
+def _calculate_fwd_vmem_bytes(
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+    dtype: jnp.dtype = jnp.float32,
+) -> int:
+  """Calculates VMEM memory usage in bytes for the forward kernel considering double buffering."""
+  dtype_bytes = jnp.dtype(dtype).itemsize
+  h_alloc = 1 << (h_block_size - 1).bit_length()
+  num_bytes = (
+      # x tile (B, H) in input dtype (double buffered for pallas_call input)
+      2 * b_block_size * h_alloc * dtype_bytes
+      # labels tile (B,) in int32/float32 (double buffered)
+      + 2 * b_block_size * 4
+      # w tile (H, V) in input dtype (double buffered for pallas_call input)
+      + 2 * h_alloc * v_block_size * dtype_bytes
+      # lse (log-sum-exp) buffer tile (B,) in float32 accumulator (double buffered for pallas_call output)
+      + 2 * b_block_size * 4
+      # logits/xw tile (B, V) in float32 accumulator (single scratch buffer)
+      + b_block_size * v_block_size * 4
+  )
+  return num_bytes
+
+
+def _calculate_bwd_vmem_bytes(
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+    dtype: jnp.dtype = jnp.float32,
+) -> int:
+  """Calculates VMEM memory usage in bytes for the backward kernel considering double buffering."""
+  dtype_bytes = jnp.dtype(dtype).itemsize
+  h_alloc = 1 << (h_block_size - 1).bit_length()
+  num_bytes = (
+      # x tile (B, H) in input dtype (double buffered for pallas_call input)
+      2 * b_block_size * h_alloc * dtype_bytes
+      # labels tile (B,) in int32/float32 (double buffered for pallas_call input)
+      + 2 * b_block_size * 4
+      # w tile (H, V) in input dtype (double buffered for pallas_call input)
+      + 2 * h_alloc * v_block_size * dtype_bytes
+      # lse (log-sum-exp) buffer tile (B,) in float32 (double buffered for pallas_call input)
+      + 2 * b_block_size * 4
+      # logits/softmax tile (B, V) in float32 accumulator (single scratch buffer)
+      + b_block_size * v_block_size * 4
+      # x gradient tile accumulator (B, H) in float32 (single scratch buffer)
+      + b_block_size * h_alloc * 4
+      # w gradient tile accumulator (H, V) in float32 (single scratch buffer)
+      + h_alloc * v_block_size * 4
+  )
+  return num_bytes
+
+
+def _get_vmem_limit_bytes() -> int:
+  return int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+
+
+def _get_heuristic_config(
+    b_dim: int,
+    h_dim: int,
+    v_dim: int,
+    *,
+    is_bwd: bool = False,
+    dtype: jnp.dtype = jnp.float32,
+    vmem_limit_bytes: int | None = None,
+) -> Config:
+  """Calculates heuristic config based on VMEM size, dtype, and dimension divisibility."""
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = _get_vmem_limit_bytes()
+
+  calc_vmem_fn = _calculate_bwd_vmem_bytes if is_bwd else _calculate_fwd_vmem_bytes
+  dtype_bytes = jnp.dtype(dtype).itemsize
+
+  # 1. Choose b_block_size: needs at least 1024, multiple of 128.
+  # Prefer b_block_size such that b_dim % b_block_size == 0.
+  b_candidates = [
+      b for b in range(1024, max(1025, b_dim + 1), 128) if b_dim % b == 0
+  ]
+  if b_candidates:
+    b_block_size = b_candidates[0]
+  else:
+    b_block_size = 1024
+
+  # 2. Choose h_block_size: at least 128, multiple of 128, close to h_dim_max.
+  # Prefer h_block_size such that h_dim % h_block_size == 0.
+  h_dim_max = (
+      pltpu.get_tpu_info().mxu_column_size
+      * pltpu.get_tpu_info().num_mxus
+      // pltpu.get_tpu_info().num_cores
+  )
+  h_candidates = [
+      h for h in range(128, max(129, h_dim + 1), 128) if h_dim % h == 0
+  ]
+  if h_candidates:
+    h_block_size = min(
+        h_candidates,
+        key=lambda x: (
+            0 if (x & (x - 1)) == 0 else 1,
+            abs(x - h_dim_max),
+        ),
+    )
+  else:
+    h_block_size = h_dim_max if h_dim >= h_dim_max else 128
+
+  # 3. Choose v_block_size: as large as possible to fit VMEM.
+  # Must be >= 128, multiple of 128. Divisible by v_dim if possible.
+  if is_bwd:
+    fixed_bytes = (
+        b_block_size * h_block_size * (2 * dtype_bytes + 4) + 16 * b_block_size
+    )
+    per_v_bytes = h_block_size * (2 * dtype_bytes + 4) + b_block_size * (
+        4 + dtype_bytes
+    )
+  else:
+    fixed_bytes = (
+        2 * b_block_size * h_block_size * dtype_bytes + 16 * b_block_size
+    )
+    per_v_bytes = 2 * h_block_size * dtype_bytes + b_block_size * (
+        4 + dtype_bytes
+    )
+
+  if vmem_limit_bytes > fixed_bytes:
+    max_v_vmem = (vmem_limit_bytes - fixed_bytes) // per_v_bytes
+  else:
+    max_v_vmem = 128
+
+  max_v = min(v_dim, max_v_vmem)
+  max_v_aligned = max(128, (max_v // 128) * 128)
+
+  # First try to find a divisor of v_dim that fits in VMEM
+  v_block_size = None
+  for v in range(max_v_aligned, 127, -128):
+    if v_dim % v == 0 and calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype) <= vmem_limit_bytes:
+      v_block_size = v
+      break
+
+  # If no divisor fits, pick the largest multiple of 128 that fits
+  if v_block_size is None:
+    for v in range(max_v_aligned, 127, -128):
+      if calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype) <= vmem_limit_bytes:
+        v_block_size = v
+        break
+    if v_block_size is None:
+      v_block_size = 128
+
+  return Config(
+      b_block_size=b_block_size,
+      h_block_size=h_block_size,
+      v_block_size=v_block_size,
+  )
+
+
+def get_heuristic_fwd_config(
+    b_dim: int,
+    h_dim: int,
+    v_dim: int,
+    dtype: jnp.dtype = jnp.float32,
+    vmem_limit_bytes: int | None = None,
+) -> Config:
+  """Returns the heuristic config for forward pass based on VMEM size and dtype."""
+  return _get_heuristic_config(
+      b_dim,
+      h_dim,
+      v_dim,
+      is_bwd=False,
+      dtype=dtype,
+      vmem_limit_bytes=vmem_limit_bytes,
+  )
+
+
+def get_heuristic_bwd_config(
+    b_dim: int,
+    h_dim: int,
+    v_dim: int,
+    dtype: jnp.dtype = jnp.float32,
+    vmem_limit_bytes: int | None = None,
+) -> Config:
+  """Returns the heuristic config for backward pass based on VMEM size and dtype."""
+  return _get_heuristic_config(
+      b_dim,
+      h_dim,
+      v_dim,
+      is_bwd=True,
+      dtype=dtype,
+      vmem_limit_bytes=vmem_limit_bytes,
+  )
 
 
 def validate_inputs(
@@ -134,7 +337,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
     lse_ref,
     xw_tiled,
     b_block_loss_ref,
-    reduction: Literal["sum", "mean"],
+    reduction: Literal["sum", "mean", "none"],
     h_dim: int,
     v_dim: int,
     preferred_element_type: jnp.dtype,
@@ -189,12 +392,16 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
 
   @pl.when(reduce(jnp.logical_and, (b_index == 0, v_index == 0, h_index == 0)))
   def init_loss():
-    loss_ref[0] = 0.0
+    if reduction in ("sum", "mean"):
+      loss_ref[0] = 0.0
 
   @pl.when(jnp.logical_and(v_index == 0, h_index == 0))
   def init_lse():
     lse_ref[...] = jnp.full_like(lse_ref, -jnp.inf)
-    b_block_loss_ref[0] = 0.0
+    if reduction == "none":
+      loss_ref[...] = jnp.zeros_like(loss_ref)
+    else:
+      b_block_loss_ref[0] = 0.0
 
   @pl.when(h_index == num_h_blocks - 1)
   def accumulate_loss():
@@ -205,7 +412,10 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
     labels_one_hot = jax.nn.one_hot(
         labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
     )
-    b_block_loss_ref[0] -= jnp.sum(labels_one_hot * xw_tiled[...])
+    if reduction == "none":
+      loss_ref[...] -= jnp.sum(labels_one_hot * xw_tiled[...], axis=-1)
+    else:
+      b_block_loss_ref[0] -= jnp.sum(labels_one_hot * xw_tiled[...])
     lse_block = jax.nn.logsumexp(xw_tiled[...], axis=-1)
     lse_ref[...] = jnp.logaddexp(lse_ref[...], lse_block)
 
@@ -213,16 +423,20 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       jnp.logical_and(v_index == num_v_blocks - 1, h_index == num_h_blocks - 1)
   )
   def perform_loss_reduction():
-    b_block_loss_ref[0] += jnp.sum(lse_ref[...])
     if reduction == "mean":
+      b_block_loss_ref[0] += jnp.sum(lse_ref[...])
       # For mean reduction, use online averaging algorithm
       loss_ref[0] = (
           loss_ref[0] * b_index / (b_index + 1)
           + b_block_loss_ref[0] / (b_index + 1) / b_block_size
       )
-    else:
+    elif reduction == "sum":
+      b_block_loss_ref[0] += jnp.sum(lse_ref[...])
       # Sum reduction
       loss_ref[0] += b_block_loss_ref[0]
+    else:
+      # For reduction == "none", compute per-element loss
+      loss_ref[...] += lse_ref[...]
 
 
 @partial(
@@ -243,7 +457,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
     b_block_size: int = 1024,
     h_block_size: int = 512,
     v_block_size: int = 2048,
-    reduction: Literal["sum", "mean"] = "sum",
+    reduction: Literal["sum", "mean", "none"] = "sum",
     preferred_element_type: jnp.dtype = jnp.float32,
 ) -> tuple[Real[Scalar, ""], Real[Array, "B"]]:
   """The pallas kernel implementation of linear softmax cross-entropy loss.
@@ -265,7 +479,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
     reduction: The reduction method ("sum" or "mean") for the loss accumulation.
 
   Returns:
-    The loss in scalar and thehe log-sum-exp of the used for backward pass.
+    The loss in scalar and the log-sum-exp of the used for backward pass.
 
   Raises:
     ValueError: If the invalid configuration is provided.
@@ -297,6 +511,31 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
   x = pltpu.with_memory_space_constraint(x, memory_space=pltpu.HBM)
   w = pltpu.with_memory_space_constraint(w, memory_space=pltpu.HBM)
 
+  if reduction in ("sum", "mean"):
+    out_specs = [
+        pl.BlockSpec(memory_space=pltpu.SMEM),  # Loss
+        pl.BlockSpec(
+            (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
+        ),  # LSE
+    ]
+    out_shape = [
+        jax.ShapeDtypeStruct(shape=(1,), dtype=jnp.float32),  # Loss
+        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
+    ]
+  else:
+    out_specs = [
+        pl.BlockSpec(
+            (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
+        ),  # Loss
+        pl.BlockSpec(
+            (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
+        ),  # LSE
+    ]
+    out_shape = [
+        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # Loss
+        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
+    ]
+
   # Forward
   loss, lse = pl.pallas_call(
       partial(
@@ -323,26 +562,26 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
               memory_space=pltpu.VMEM,
           ),  # w
       ],
-      out_specs=[
-          pl.BlockSpec(memory_space=pltpu.SMEM),  # loss
-          pl.BlockSpec(
-              (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
-          ),  # lse
-      ],
-      out_shape=[
-          jax.ShapeDtypeStruct(shape=(1,), dtype=jnp.float32),  # Loss
-          jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
-      ],
+      out_specs=out_specs,
+      out_shape=out_shape,
       scratch_shapes=(
           pltpu.VMEM(
               (b_block_size, v_block_size), dtype=jnp.float32
           ),  # xw_tiled
           pltpu.SMEM((1,), dtype=jnp.float32),  # b_block_loss
       ),
+      name=f"lce_fwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}_reduction_{reduction}",
+      compiler_params=pltpu.CompilerParams(
+          vmem_limit_bytes=_get_vmem_limit_bytes(),
+          disable_bounds_checks=True,
+      ),
       grid=(num_b_blocks, num_v_blocks, num_h_blocks),
   )(x, labels, w)
 
-  return loss[0], lse
+  if reduction in ("sum", "mean"):
+    return loss[0], lse
+  else:
+    return loss, lse
 
 
 def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
@@ -360,7 +599,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     w_read_sem,
     x_write_sem,
     w_write_sem,
-    reduction: Literal["sum", "mean"],
+    reduction: Literal["sum", "mean", "none"],
     preferred_element_type: jnp.dtype,
 ):
   """Pallas kernel for the backward pass of Linear Softmax Cross-Entropy Loss.
@@ -459,10 +698,13 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           )
       )
       def _():
-        if reduction == "mean":
-          x_grad_tile_ref[...] /= num_b_blocks * b_block_size
-
-        x_grad_tile_ref[...] *= dout[0]
+        if reduction in ("sum", "mean"):
+          scale = (
+              dout[0] / (num_b_blocks * b_block_size)
+              if reduction == "mean"
+              else dout[0]
+          )
+          x_grad_tile_ref[...] *= scale
 
     def perform_w_grad_tile_scaling():
       # Perform scaling to dout and b_dim (for mean reduction).
@@ -474,10 +716,13 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           )
       )
       def _():
-        if reduction == "mean":
-          w_grad_tile_ref[...] /= num_b_blocks * b_block_size
-
-        w_grad_tile_ref[...] *= dout[0]
+        if reduction in ("sum", "mean"):
+          scale = (
+              dout[0] / (num_b_blocks * b_block_size)
+              if reduction == "mean"
+              else dout[0]
+          )
+          w_grad_tile_ref[...] *= scale
 
     # Async copy ops are only defined here. It only starts after calling .start().
     x_write_future = pltpu.make_async_copy(
@@ -515,6 +760,8 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       xw_scratch_ref[...] = -labels_one_hot + jnp.exp(
           xw_scratch_ref[...] - lse_ref[...][:, None]
       )
+      if reduction == "none":
+        xw_scratch_ref[...] *= dout[...][:, None]
 
     # Init W gradient
     @pl.when(b_index == 0)
@@ -581,7 +828,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     b_block_size: int = 1024,
     h_block_size: int = 512,
     v_block_size: int = 2048,
-    reduction: Literal["sum", "mean"] = "sum",
+    reduction: Literal["sum", "mean", "none"] = "sum",
     preferred_element_type: jnp.dtype = jnp.float32,
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """The pallas kernel implementation of the Linear Softmax Cross-Entropy Loss backward kernel.
@@ -632,8 +879,15 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
   num_h_blocks = math.ceil(h_dim / h_block_size)
   num_stages = 2
 
-  # Pallas only allow passing in vectors not scalars
-  dout_array = jnp.zeros(1).at[0].set(dout)
+  # Prepare dout array and BlockSpec
+  if reduction in ("sum", "mean"):
+    dout_array = jnp.zeros(1).at[0].set(dout)
+    dout_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+  else:
+    dout_array = dout
+    dout_spec = pl.BlockSpec(
+        (b_block_size,), lambda i, j, s, k: (i,), memory_space=pltpu.VMEM
+    )
 
   # Constrain the memory spaces for x and w to prevent OOB accesses that occur
   # when the memory spaces is placed in VMEM.
@@ -648,9 +902,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
           preferred_element_type=preferred_element_type,
       ),
       in_specs=[
-          pl.BlockSpec(  # dout
-              memory_space=pltpu.SMEM,
-          ),
+          dout_spec,  # dout
           pl.BlockSpec(  # x
               (b_block_size, h_block_size),
               lambda i, j, s, k: (i, k),
@@ -694,6 +946,11 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
           pltpu.SemaphoreType.DMA,  # w_write_sem
       ),
       grid=(num_b_blocks, num_v_blocks, num_stages, num_h_blocks),
+      compiler_params=pltpu.CompilerParams(
+          vmem_limit_bytes=_get_vmem_limit_bytes(),
+          disable_bounds_checks=True,
+      ),
+      name=f"lce_bwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}_reduction_{reduction}",
   )(dout_array, x, labels, w, lse)
 
   # There is no gradient for the labels

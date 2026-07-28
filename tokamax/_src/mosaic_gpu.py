@@ -72,8 +72,22 @@ def tiled_swizzled_block_spec(
   return plgpu.BlockSpec(shape, index_map, transforms=transforms, **kwargs)
 
 
-def warpgroup_barrier():
-  plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())()
+warpgroup_barrier = plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())
+
+
+@plgpu.inline_mgpu()
+def tcgen05_wait_ld(_):
+  nvvm.tcgen05_wait(nvvm.Tcgen05WaitKind.LOAD)
+
+
+@plgpu.inline_mgpu()
+def tcgen05_wait_st(_):
+  nvvm.tcgen05_wait(nvvm.Tcgen05WaitKind.STORE)
+
+
+@plgpu.inline_mgpu()
+def tcgen05_fence_before_thread_sync(_):
+  nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)
 
 
 @plgpu.inline_mgpu()
