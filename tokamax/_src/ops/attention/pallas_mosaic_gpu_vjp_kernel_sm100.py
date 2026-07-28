@@ -491,12 +491,6 @@ def _kernel_dq(
               k_ref.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
           )
 
-        @pl.loop(lax.max(lb, ub - config.num_stages), ub)
-        def kv_epilogue(ki):
-          si = lax.rem(ki - lb, config.num_stages)
-          plgpu.barrier_wait(v_consumed.at[si])
-          plgpu.barrier_wait(k_consumed.at[si])
-
       @pl.when(warp_id == 3)
       def tma_eltwise():
         if bias_ref is not None or mask_ref is not None:
@@ -532,14 +526,6 @@ def _kernel_dq(
                   mask_smem.at[bi],
                   mask_produced.at[bi],
               )
-
-          @pl.loop(lax.max(lb, ub - config.eltwise_stages), ub)
-          def eltwise_epilogue(ki):
-            bi = lax.rem(ki - lb, config.eltwise_stages)
-            if bias_smem is not None:
-              plgpu.barrier_wait(bias_consumed.at[bi])
-            if mask_smem is not None:
-              plgpu.barrier_wait(mask_consumed.at[bi])
 
       @pl.when(warp_id == 2)
       def mma():
@@ -865,11 +851,6 @@ def _kernel_dkv(
               barrier=residual_produced.at[li],
           )
 
-        @pl.loop(lax.max(0, total_steps - config.residual_stages), total_steps)
-        def residual_epilogue(step):
-          li = lax.rem(step, config.residual_stages)
-          plgpu.barrier_wait(residual_consumed.at[li])
-
       @pl.when(warp_id == 1)
       def tma_q():
         @pl.loop(0, total_steps)
@@ -890,11 +871,6 @@ def _kernel_dkv(
           plgpu.copy_gmem_to_smem(
               dout_ref.at[qs, hi], do_smem.at[si], barrier=q_do_produced.at[si]
           )
-
-        @pl.loop(lax.max(0, total_steps - config.num_stages), total_steps)
-        def q_epilogue(step):
-          si = lax.rem(step, config.num_stages)
-          plgpu.barrier_wait(q_do_consumed.at[si])
 
       @pl.when(warp_id == 3)
       def tma_eltwise():
@@ -935,14 +911,6 @@ def _kernel_dkv(
                   mask_smem.at[bi],
                   mask_produced.at[bi],
               )
-
-          @pl.loop(lax.max(0, total_steps - config.eltwise_stages), total_steps)
-          def eltwise_epilogue(step):
-            bi = lax.rem(step, config.eltwise_stages)
-            if bias_smem is not None:
-              plgpu.barrier_wait(bias_consumed.at[bi])
-            if mask_smem is not None:
-              plgpu.barrier_wait(mask_consumed.at[bi])
 
       @pl.when(warp_id == 2)
       def mma():
@@ -1170,11 +1138,6 @@ def _kernel_dkv(
 
       plgpu.barrier_arrive(q_do_consumed.at[si])
       plgpu.barrier_arrive(residual_consumed.at[li])
-
-    @pl.loop(0, ds_stages)
-    def epilogue(i):
-      plgpu.barrier_wait(p_consumed.at[i])
-      plgpu.barrier_wait(ds_consumed.at[i])
 
 
 def _pad_maybe_bcast(x, m, axis):
