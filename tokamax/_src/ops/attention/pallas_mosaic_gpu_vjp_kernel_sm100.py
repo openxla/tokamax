@@ -453,7 +453,6 @@ def _kernel_dq(
 
   @pl.when((wg_id == 0) & (ub > lb))
   def mma_tma_wg():
-    plgpu.set_max_registers(112, action="decrease")
 
     @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
     def per_warp():
@@ -604,7 +603,6 @@ def _kernel_dq(
 
   @pl.when((wg_id == 1) & (ub > lb))
   def sfu_wg():
-    plgpu.set_max_registers(216, action="increase")
     plgpu.barrier_wait(q_do_produced)
 
     pl.loop(0, ds_stages)(lambda i: plgpu.barrier_arrive(ds_consumed.at[i]))
@@ -893,7 +891,6 @@ def _kernel_dkv(
 
   @pl.when((wg_id == 0) & (total_steps > 0))
   def mma_tma_wg():
-    plgpu.set_max_registers(96, action="decrease")
 
     @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
     def per_warp():
@@ -1071,8 +1068,6 @@ def _kernel_dkv(
 
   @pl.when((wg_id == 1) & (total_steps > 0))
   def sfu_wg():
-    plgpu.set_max_registers(216, action="increase")
-
     pl.loop(0, ds_stages)(lambda i: plgpu.barrier_arrive(p_consumed.at[i]))
     pl.loop(0, ds_stages)(lambda i: plgpu.barrier_arrive(ds_consumed.at[i]))
     plgpu.barrier_arrive(s_consumed)
