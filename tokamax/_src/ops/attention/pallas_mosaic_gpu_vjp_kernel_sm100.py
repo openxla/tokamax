@@ -271,10 +271,10 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                 if q_kv_block_size < chunk_size:
                   continue
                 config = Config(
-                    block_kv_dkv=q_kv_block_size,
+                    block_kv_dkv=128,
                     block_q_dkv=q_kv_block_size,
                     block_kv_dq=q_kv_block_size,
-                    block_q_dq=q_kv_block_size,
+                    block_q_dq=128,
                     double_buffer=double_buffer,
                     eltwise_stages=eltwise_stages,
                     residual_stages=residual_stages,
