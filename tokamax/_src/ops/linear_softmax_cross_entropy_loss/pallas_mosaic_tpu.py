@@ -53,7 +53,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       labels: Integer[Array, "B"],
       w: Real[Array, "H V"],
       *,
-      reduction: Literal["sum", "mean"] = "sum",
+      reduction: Literal["sum", "mean", "none"] = "sum",
       config: Config,
       return_residuals: bool,
   ) -> tuple[jax.Array, base.Residuals]:
@@ -144,7 +144,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       labels: Integer[Array, "B"],
       w: Real[Array, "H V"],
       *,
-      reduction: Literal["sum", "mean"] = "sum",
+      reduction: Literal["sum", "mean", "none"] = "sum",
       config: Config,
       return_residuals: bool,
   ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:

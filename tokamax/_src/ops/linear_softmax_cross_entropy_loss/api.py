@@ -18,7 +18,7 @@
 from collections.abc import Callable, Sequence
 from typing import Literal
 import jax
-from jaxtyping import Array, Integer, Real, Scalar  # pylint: disable=g-multiple-import, g-importing-member
+from jaxtyping import Array, Integer, Real  # pylint: disable=g-multiple-import, g-importing-member
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import chunked_xla
 
@@ -48,20 +48,20 @@ def linear_softmax_cross_entropy_loss(
     labels: Integer[Array, "B"],
     weights: Real[Array, "H V"],
     *,
-    reduction: Literal["sum", "mean"] = "sum",
+    reduction: Literal["sum", "mean", "none"] = "sum",
     precision: jax.lax.PrecisionLike = None,
     implementation: (
         Implementation
         | Sequence[Implementation | Callable[..., jax.Array]]
         | None
     ) = None,
-) -> Real[Scalar, ""]:
+) -> Real[Array, "*"]:
   """The linear softmax cross-entropy loss op.
 
   The Linear Softmax Cross-Entropy Loss Op is a tokamax Op that performs a
   linear projection and cross entropy loss calculation
   `loss = -reduction(labels * log(softmax(X@W)))`
-  where reduction is either sum or mean.
+  where reduction is sum, mean, or none.
   This op uses the regular (unsafe) Cross-Entropy loss function
   (Like `optax.softmax_cross_entropy()`) so the logits `X@W` cannot be `-inf`
 
@@ -72,7 +72,7 @@ def linear_softmax_cross_entropy_loss(
     weights: The linear projection weight matrix in the dimension of (H, V)
       where V is the dimension of the output logits aka vocabulary size.
     reduction: The reduction method for the cross entropy loss. Can be set to
-      "sum" or "mean" explicitly.
+      "sum", "mean", or "none" explicitly.
     precision: The precision used for jax.lax.dot_general for the linear
       projection and gradient calculation.
     implementation: By default "None" will be used to pick the best available
@@ -82,7 +82,8 @@ def linear_softmax_cross_entropy_loss(
       implementation needs to materialize the full logits.
 
   Returns:
-    The Cross-Entropy loss
+    The Cross-Entropy loss. If reduction is "none", returns loss of shape (B,).
+    Otherwise, returns a scalar loss.
 
   Raises:
     NotImplementedError: If the implementation is not supported.

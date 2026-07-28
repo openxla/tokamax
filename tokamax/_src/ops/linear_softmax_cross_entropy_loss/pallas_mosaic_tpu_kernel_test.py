@@ -74,6 +74,27 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           reduction="mean",
       ),
       dict(
+          testcase_name="fwd_small_size_none_reduction_test",
+          b_dim=1024,
+          h_dim=512,
+          v_dim=2048,
+          reduction="none",
+      ),
+      dict(
+          testcase_name="fwd_medium_size_none_reduction_test",
+          b_dim=4096,
+          h_dim=1024,
+          v_dim=4096,
+          reduction="none",
+      ),
+      dict(
+          testcase_name="fwd_large_size_none_reduction_test",
+          b_dim=16384,
+          h_dim=4096,
+          v_dim=16384,
+          reduction="none",
+      ),
+      dict(
           testcase_name="fwd_v_non_aligned_block_size_sum_reduction_test",
           b_dim=4096,
           h_dim=1024,
@@ -86,6 +107,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2560,
           reduction="mean",
+      ),
+      dict(
+          testcase_name="fwd_v_non_aligned_block_size_none_reduction_test",
+          b_dim=4096,
+          h_dim=1024,
+          v_dim=2560,
+          reduction="none",
       ),
       dict(
           testcase_name="fwd_v_non_aligned_multiple_of_128_sum_reduction_test",
@@ -102,6 +130,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           reduction="mean",
       ),
       dict(
+          testcase_name="fwd_v_non_aligned_multiple_of_128_none_reduction_test",
+          b_dim=4096,
+          h_dim=1024,
+          v_dim=2664,
+          reduction="none",
+      ),
+      dict(
           testcase_name="fwd_h_non_aligned_block_size_sum_reduction_test",
           b_dim=4096,
           h_dim=1152,
@@ -114,6 +149,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           h_dim=1152,
           v_dim=2048,
           reduction="mean",
+      ),
+      dict(
+          testcase_name="fwd_h_non_aligned_block_size_none_reduction_test",
+          b_dim=4096,
+          h_dim=1152,
+          v_dim=2048,
+          reduction="none",
       ),
       dict(
           testcase_name="fwd_h_non_aligned_multiple_of_128_sum_reduction_test",
@@ -130,6 +172,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           reduction="mean",
       ),
       dict(
+          testcase_name="fwd_h_non_aligned_multiple_of_128_none_reduction_test",
+          b_dim=4096,
+          h_dim=1288,
+          v_dim=2048,
+          reduction="none",
+      ),
+      dict(
           testcase_name="fwd_bfloat16_sum_reduction_test",
           b_dim=4096,
           h_dim=512,
@@ -143,6 +192,14 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           h_dim=512,
           v_dim=2048,
           reduction="mean",
+          dtype=jnp.float16,
+      ),
+      dict(
+          testcase_name="fwd_float16_none_reduction_test",
+          b_dim=4096,
+          h_dim=512,
+          v_dim=2048,
+          reduction="none",
           dtype=jnp.float16,
       ),
   )
@@ -524,5 +581,3 @@ class HeuristicConfigTest(parameterized.TestCase):
 
 if __name__ == "__main__":
   absltest.main()
-
-

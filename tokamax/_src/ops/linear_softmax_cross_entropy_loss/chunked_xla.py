@@ -57,12 +57,12 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
     labels: Integer[Array, "B"],
     w: Real[Array, "H V"],
     *,
-    reduction: Literal["sum", "mean"] = "sum",
+    reduction: Literal["sum", "mean", "none"] = "sum",
     b_block_sz: int = 1024,
     v_block_sz: int = 1024,
     unroll_factor: int | bool = False,
     preferred_element_type: jax.typing.DTypeLike | None = None,
-) -> tuple[Real[Array, ""], Real[Array, "B"]]:
+) -> tuple[Real[Array, "*"], Real[Array, "B"]]:
   """Chunked XLA implementation of linear softmax cross-entropy loss forward.
 
   This implementation processes the B and V dimensions in blocks to avoid
@@ -72,7 +72,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
     x: The input activations of shape (B, H).
     labels: The ground truth labels of shape (B,).
     w: The weight matrix of shape (H, V).
-    reduction: The reduction method ("sum" or "mean").
+    reduction: The reduction method ("sum", "mean", or "none").
     b_block_sz: The block size for the batch dimension.
     v_block_sz: The block size for the vocabulary dimension.
     unroll_factor: The unroll factor for the inner V loop.
@@ -102,7 +102,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
   num_v_blocks = v_dim_padded // v_block_sz
 
   def b_loop_body(i, carry):
-    lse_all, loss_sum = carry
+    lse_all, loss_acc = carry
     b_start = i * b_block_sz
 
     def v_loop_body(j, v_carry):
@@ -146,22 +146,33 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
     lse_b_masked = lse_b * mask_b
 
     lse_all = jax.lax.dynamic_update_slice(lse_all, lse_b, (b_start,))
-    loss_sum += jnp.sum(b_loss_sum_neg_logits) + jnp.sum(lse_b_masked)
-    return lse_all, loss_sum
+    if reduction == "none":
+      loss_b = b_loss_sum_neg_logits + lse_b_masked
+      loss_acc = jax.lax.dynamic_update_slice(loss_acc, loss_b, (b_start,))
+    else:
+      loss_acc += jnp.sum(b_loss_sum_neg_logits) + jnp.sum(lse_b_masked)
+    return lse_all, loss_acc
 
-  lse_all, loss_sum = jax.lax.fori_loop(
+  if reduction == "none":
+    init_loss = jnp.zeros(b_dim_padded, dtype=dtype)
+  else:
+    init_loss = jnp.array(0.0, dtype=dtype)
+
+  lse_all, loss_acc = jax.lax.fori_loop(
       0,
       num_b_blocks,
       b_loop_body,
-      (jnp.zeros(b_dim_padded, dtype=dtype), jnp.array(0.0, dtype=dtype)),
+      (jnp.zeros(b_dim_padded, dtype=dtype), init_loss),
   )
 
   lse_all = lse_all[:b_dim]
 
   if reduction == "mean":
-    loss_sum /= b_dim
+    loss_acc /= b_dim
+  elif reduction == "none":
+    loss_acc = loss_acc[:b_dim]
 
-  return loss_sum, lse_all
+  return loss_acc, lse_all
 
 
 @functools.partial(
@@ -174,7 +185,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
     ),
 )
 def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
-    dout: Real[Array, ""],
+    dout: Real[Array, "*"],
     lse: Real[Array, "B"],
     x: Real[Array, "B H"],
     labels: Integer[Array, "B"],
@@ -182,7 +193,7 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     *,
     b_block_sz: int = 1024,
     v_block_sz: int = 2048,
-    reduction: Literal["sum", "mean"] = "sum",
+    reduction: Literal["sum", "mean", "none"] = "sum",
     preferred_element_type: jax.typing.DTypeLike | None = None,
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """The chunked XLA implementation of linear softmax cross-entropy loss backward pass.
@@ -198,7 +209,7 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     w: The weight matrix of shape (H, V).
     b_block_sz: The block size for the batch dimension.
     v_block_sz: The block size for the vocabulary dimension.
-    reduction: The reduction method ("sum" or "mean").
+    reduction: The reduction method ("sum", "mean", or "none").
     preferred_element_type: The preferred element type for computation.
 
   Returns:
@@ -225,6 +236,11 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
   num_b_blocks = b_dim_padded // b_block_sz
   num_v_blocks = v_dim_padded // v_block_sz
 
+  if reduction == "none":
+    dout_padded = jnp.pad(dout, ((0, b_pad),))
+  else:
+    dout_padded = jnp.zeros((b_dim_padded,), dtype=x.dtype)
+
   def b_loop_body(i, b_carry):
     dx, dw = b_carry
     b_start = i * b_block_sz
@@ -232,6 +248,10 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     labels_b = jax.lax.dynamic_slice(labels_padded, (b_start,), (b_block_sz,))
 
     x_b = jax.lax.dynamic_slice(x_padded, (b_start, 0), (b_block_sz, h_dim))
+    if reduction == "none":
+      dout_b = jax.lax.dynamic_slice(dout_padded, (b_start,), (b_block_sz,))
+    else:
+      dout_b = jnp.zeros((b_block_sz,), dtype=dtype)
 
     def v_loop_body(j, v_carry):
       dx_b, dw_acc = v_carry
@@ -246,6 +266,8 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
           labels_b - v_start, v_block_sz, dtype=dtype
       )
       s_bv = jnp.exp(logits_bv - lse_b[:, None]) - labels_one_hot_bv
+      if reduction == "none":
+        s_bv = s_bv * dout_b[:, None]
 
       dx_b += jnp.dot(
           s_bv, w_v.T, preferred_element_type=preferred_element_type
@@ -274,7 +296,10 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     dx /= b_dim
     dw /= b_dim
 
-  return (dx * dout).astype(x.dtype), (dw * dout).astype(w.dtype)
+  if reduction == "none":
+    return dx.astype(x.dtype), dw.astype(w.dtype)
+  else:
+    return (dx * dout).astype(x.dtype), (dw * dout).astype(w.dtype)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -298,7 +323,7 @@ class ChunkedXlaLinearSoftmaxCrossEntropyLoss(
       labels: Integer[Array, "B"],
       w: Real[Array, "H V"],
       *,
-      reduction: Literal["sum", "mean"] = "sum",
+      reduction: Literal["sum", "mean", "none"] = "sum",
       config: Config,
       return_residuals: bool,
   ) -> tuple[jax.Array, base.Residuals]:
@@ -328,12 +353,12 @@ class ChunkedXlaLinearSoftmaxCrossEntropyLossVjp(
       self,
       residuals: base.Residuals,
       out: jax.Array,
-      dout: Real[Array, ""],
+      dout: Real[Array, "*"],
       x: Real[Array, "B H"],
       labels: Integer[Array, "B"],
       w: Real[Array, "H V"],
       *,
-      reduction: Literal["sum", "mean"] = "sum",
+      reduction: Literal["sum", "mean", "none"] = "sum",
       config: Config,
       return_residuals: bool,
   ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:
