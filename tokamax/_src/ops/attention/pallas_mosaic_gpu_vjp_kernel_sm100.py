@@ -179,6 +179,8 @@ def _get_dkv_scratch_shapes(
       ),
       s_produced=plgpu.Barrier(orders_tensor_core=True),
       s_consumed=plgpu.Barrier(),
+      p_produced=plgpu.Barrier(num_barriers=ds_stages, orders_tensor_core=True),
+      p_consumed=plgpu.Barrier(num_barriers=ds_stages, orders_tensor_core=True),
       dp_produced=plgpu.Barrier(orders_tensor_core=True),
       dp_consumed=plgpu.Barrier(),
       ds_produced=plgpu.Barrier(num_barriers=ds_stages),
@@ -573,10 +575,10 @@ def _kernel_dq(
           for chunk_idx in range(num_chunks):
             gci = (ki - lb) * num_chunks + chunk_idx
             ci = lax.rem(gci, ds_stages)
-            plgpu.barrier_wait(ds_produced.at[ci])
             c_start = chunk_idx * config.chunk_size
             chunk_slice = pl.ds(c_start, config.chunk_size)
 
+            plgpu.barrier_wait(ds_produced.at[ci])
             plgpu.tcgen05_mma(
                 dq_tmem,
                 ds_smem[0].at[ci],
@@ -846,6 +848,8 @@ def _kernel_dkv(
     residual_consumed,
     s_produced,
     s_consumed,
+    p_produced,
+    p_consumed,
     dp_produced,
     dp_consumed,
     ds_produced,
@@ -1027,20 +1031,22 @@ def _kernel_dkv(
           for chunk_idx in range(num_chunks):
             gci = step * num_chunks + chunk_idx
             ci = lax.rem(gci, ds_stages)
-            plgpu.barrier_wait(ds_produced.at[ci])
             c_start = chunk_idx * config.chunk_size
             chunk_slice = pl.ds(c_start, config.chunk_size)
             accumulate = (step > 0) | (chunk_idx > 0)
-            plgpu.tcgen05_mma(
-                dk_tmem,
-                ds_smem.at[ci],
-                q_smem.at[si, chunk_slice, :],
-                accumulate=accumulate,
-            )
+            plgpu.barrier_wait(p_produced.at[ci])
             plgpu.tcgen05_mma(
                 dv_tmem,
                 p_smem.at[ci],
                 do_smem.at[si, chunk_slice, :],
+                accumulate=accumulate,
+            )
+            plgpu.tcgen05_commit_arrive(p_consumed.at[ci])
+            plgpu.barrier_wait(ds_produced.at[ci])
+            plgpu.tcgen05_mma(
+                dk_tmem,
+                ds_smem.at[ci],
+                q_smem.at[si, chunk_slice, :],
                 accumulate=accumulate,
             )
             plgpu.tcgen05_commit_arrive(ds_consumed.at[ci])
@@ -1067,6 +1073,7 @@ def _kernel_dkv(
   def sfu_wg():
     plgpu.set_max_registers(216, action="increase")
 
+    pl.loop(0, ds_stages)(lambda i: plgpu.barrier_arrive(p_consumed.at[i]))
     pl.loop(0, ds_stages)(lambda i: plgpu.barrier_arrive(ds_consumed.at[i]))
     plgpu.barrier_arrive(s_consumed)
     plgpu.barrier_arrive(dp_consumed)
@@ -1094,7 +1101,6 @@ def _kernel_dkv(
       for chunk_idx in range(num_chunks):
         gci = step * num_chunks + chunk_idx
         ci = lax.rem(gci, ds_stages)
-        plgpu.barrier_wait(ds_consumed.at[ci])
         c_start = chunk_idx * config.chunk_size
         chunk_slice = pl.ds(c_start, config.chunk_size)
 
@@ -1209,6 +1215,11 @@ def _kernel_dkv(
         epsilon = float(jnp.finfo(jnp.float32).tiny)
         p_val = jnp.exp2(base_val) / (l_val + epsilon)
 
+        plgpu.barrier_wait(p_consumed.at[ci])
+        p_smem[ci] = p_val.astype(p_smem.dtype)
+        plgpu.commit_smem()
+        plgpu.barrier_arrive(p_produced.at[ci])
+
         delta_val = plgpu.load(delta_smem.at[li, chunk_slice], layout=_TMEM_COL)
         delta_val = lax.broadcast_in_dim(delta_val, p_val.shape, [1])
         delta_val = plgpu.layout_cast(delta_val, _TMEM)
@@ -1227,26 +1238,25 @@ def _kernel_dkv(
 
         if is_causal:
           ds_val = jnp.where(causal_mask, ds_val, 0.0)
-          p_val = jnp.where(causal_mask, p_val, 0.0)
         if k_start_ref is not None:
           ds_val = jnp.where(k_iota >= k_start_val, ds_val, 0.0)
-          p_val = jnp.where(k_iota >= k_start_val, p_val, 0.0)
         if k_end_ref is not None:
           ds_val = jnp.where(k_iota < k_end_val, ds_val, 0.0)
-          p_val = jnp.where(k_iota < k_end_val, p_val, 0.0)
         if mask_ref is not None:
           ds_val = jnp.where(mask_val, ds_val, 0.0)
-          p_val = jnp.where(mask_val, p_val, 0.0)
 
-        ds_smem.at[ci].set(ds_val.astype(ds_smem.dtype))
-        p_smem.at[ci].set(p_val.astype(p_smem.dtype))
+        plgpu.barrier_wait(ds_consumed.at[ci])
+        ds_smem[ci] = ds_val.astype(ds_smem.dtype)
         plgpu.commit_smem()
         plgpu.barrier_arrive(ds_produced.at[ci])
 
       plgpu.barrier_arrive(q_do_consumed.at[si])
       plgpu.barrier_arrive(residual_consumed.at[li])
 
-    pl.loop(0, ds_stages)(lambda i: plgpu.barrier_wait(ds_consumed.at[i]))
+    @pl.loop(0, ds_stages)
+    def epilogue(i):
+      plgpu.barrier_wait(p_consumed.at[i])
+      plgpu.barrier_wait(ds_consumed.at[i])
 
 
 def _pad_maybe_bcast(x, m, axis):
