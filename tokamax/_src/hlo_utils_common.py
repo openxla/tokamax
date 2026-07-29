@@ -16,16 +16,17 @@
 """Common utilities for HLO utils."""
 
 import dataclasses
-from typing import Any, Callable, Final, Iterable, cast
+from typing import Callable, Final, Iterable, cast
 import jax
 from jaxlib.mlir import ir
 
 TOKAMAX_NAME: Final[str] = 'tokamax'
 
-PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
 MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
 MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
-TRITON_KEY: Final[str] = 'triton_kernel_call'
+# These names are exposed in Triton Pallas and jax_triton, but we don't want
+# dependencies on these here. So the equivalence is tested against.
+PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
 TRITON_FFI_KEY: Final[str] = 'triton_kernel_call_ffi'
 
 
@@ -140,4 +141,3 @@ def dedupe_wrapper_kernels(
       payloads.add(r.payload)
     infos.append(r.emit_fn())
   return tuple(infos)
-
