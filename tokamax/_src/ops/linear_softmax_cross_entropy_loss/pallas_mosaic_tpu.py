@@ -15,24 +15,25 @@
 
 """Linear Cross-Entropy kernel implementation."""
 
-from dataclasses import dataclass
+import dataclasses
 import itertools
-from typing import Annotated, ClassVar, Literal, override
+from typing import ClassVar, Literal, override
 
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from jaxtyping import Array, Integer, Real
-import pydantic
+import jaxtyping as jt
 from tokamax._src.ops import op
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel as kernel
 
-
 Config = kernel.Config
+Array = jt.Array
+Integer = jt.Integer
+Real = jt.Real
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     base.LinearSoftmaxCrossEntropyLoss[Config]
 ):
@@ -127,7 +128,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
     base.LinearSoftmaxCrossEntropyLossVjp[Config]
 ):
