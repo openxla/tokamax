@@ -129,12 +129,13 @@ class Autotuner:
       fn_factory: Callable[[C], Callable[P, Any]],
       configs: set[C],
       *args: P.args,
+      timeout: float | None = None,  # pyrefly: ignore[bad-function-definition]
       **kwargs: P.kwargs,
   ) -> AutotuningData[C]:
     """Autotunes over configs for the given arguments."""
     executor = self.executor_fn()
     executor_args = {}
-    timeout = self.timeout_seconds
+    timeout = self.timeout_seconds if timeout is None else timeout
     vlog_exc_info = functools.partial(logging.vlog, 2, exc_info=True)
 
     results = {}

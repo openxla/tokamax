@@ -14,6 +14,7 @@
 # ==============================================================================
 import dataclasses
 import functools
+import time
 from typing import Any, override
 
 from absl.testing import absltest
@@ -86,6 +87,11 @@ def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
       glu.bind(x, weights, activation=act),  # pytype: disable=wrong-arg-types
   )
   return f, args, expected_bound_args
+
+
+def _slow_fn_factory(config):
+  time.sleep(0.5)
+  return lambda x: x
 
 
 class AutotuningTest(parameterized.TestCase):
@@ -203,6 +209,29 @@ class AutotuningTest(parameterized.TestCase):
       result.dump(f)
     with open(tempfile.full_path, "r") as f:
       self.assertEqual(result, api.AutotuningResult.load(f))
+
+  def test_autotune_with_timeout(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    ba = _FakeOp().bind(x, y)
+    result = api.autotune([ba], timeout=120.0)
+    self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+
+  def test_autotune_timeout_triggered(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Currently only supported on GPU.")
+
+    t = autotuner.Autotuner()
+    results = t.autotune(_slow_fn_factory, {1, 2}, timeout=0.01)
+    self.assertIn(1, results)
+    self.assertIn(2, results)
+    self.assertIsInstance(results[1], TimeoutError)
+    self.assertIsInstance(results[2], TimeoutError)
+    with self.assertRaises(ExceptionGroup):
+      _ = results.fastest_config
 
   def test_bound_args_to_from_json(self):
     if jax.default_backend() == "tpu":

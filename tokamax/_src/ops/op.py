@@ -562,6 +562,7 @@ class BoundArguments[C, K: Hashable]:
       configs: set[C] | type[AUTO] = AUTO,
       autotuner: autotuner_lib.Autotuner = autotuner_lib.Autotuner(),
       cache_results: bool = True,
+      timeout: float | None = None,
   ) -> AutotuningData[C]:
     """Autotunes the op with the bound arguments."""
     if configs is AUTO:
@@ -574,6 +575,7 @@ class BoundArguments[C, K: Hashable]:
         op_fn,
         configs,
         *self.args,
+        timeout=timeout,
         **self.kwargs,
     )
     if cache_results:
