@@ -53,15 +53,12 @@ class Config(vjp_common.Config):
     double_buffer: Whether to use double buffering for SMEM allocations.
     residual_stages: The number of stages for residual data (m, l, delta).
     chunk_size: The chunk size for processing along the sequence dimension.
-    load_residuals_in_regs: Whether to load residuals (m, l, delta) into
-      registers instead of SMEM in the dq kernel to save on SMEM.
   """
 
   eltwise_stages: pydantic.PositiveInt = 1
   double_buffer: bool = False
   residual_stages: pydantic.PositiveInt = 2
   chunk_size: Annotated[int, pydantic.Field(multiple_of=32, ge=32)] = 64
-  load_residuals_in_regs: bool = False
 
 
 def _get_dq_scratch_shapes(
@@ -92,6 +89,7 @@ def _get_dq_scratch_shapes(
           plgpu.TMEM((block_q, block_kv), k_dtype, packed=True),
       ),
       dq_tmem=plgpu.TMEM((block_q, head_dim), jnp.float32),
+      q_do_produced=plgpu.Barrier(num_arrivals=2),
       kv_produced=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),
       k_consumed=plgpu.Barrier(
           num_barriers=num_stages, orders_tensor_core=True
@@ -105,11 +103,6 @@ def _get_dq_scratch_shapes(
       ds_produced=plgpu.Barrier(),
       dq_mma_finished=plgpu.Barrier(orders_tensor_core=True),
   )
-  if config.load_residuals_in_regs:
-    shapes["q_do_produced"] = plgpu.Barrier(num_arrivals=2)
-  else:
-    shapes["q_do_produced"] = plgpu.Barrier(num_arrivals=5)
-    shapes["residuals_smem"] = plgpu.SMEM((3, block_q), jnp.float32)
 
   if bias is not None:
     shapes["ds_smem"] = _tiled_smem((block_q, block_kv), ds_dtype)
@@ -256,56 +249,54 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
       for eltwise_stages in (1, 2):
         for residual_stages in (1, 2):
           for num_stages in (2, 3, 4):
-            for load_residuals_in_regs in (False, True):
-              for chunk_size in (32, 64):
-                if q_kv_block_size < chunk_size:
-                  continue
-                config = Config(
-                    block_kv_dkv=128,
-                    block_q_dkv=q_kv_block_size,
-                    block_kv_dq=q_kv_block_size,
-                    block_q_dq=128,
-                    double_buffer=double_buffer,
-                    eltwise_stages=eltwise_stages,
-                    residual_stages=residual_stages,
-                    num_stages=num_stages,
-                    load_residuals_in_regs=load_residuals_in_regs,
-                    chunk_size=chunk_size,
-                )
-                dq_shapes = _get_dq_scratch_shapes(
-                    config=config,
-                    head_dim=head_dim,
-                    head_dim_out=head_dim_out,
-                    q_dtype=q_dtype,
-                    dout_dtype=dout_dtype,
-                    k_dtype=k_dtype,
-                    v_dtype=v_dtype,
-                    ds_dtype=ds_dtype,
-                    bias=bias,
-                    mask=mask,
-                )
-                dkv_shapes = _get_dkv_scratch_shapes(
-                    config=config,
-                    head_dim=head_dim,
-                    head_dim_out=head_dim_out,
-                    chunk_size=config.chunk_size,
-                    q_dtype=q_dtype,
-                    dout_dtype=dout_dtype,
-                    k_dtype=k_dtype,
-                    v_dtype=v_dtype,
-                    bias=bias,
-                    mask=mask,
-                )
-                dq_smem = _estimate_smem_bytes(dq_shapes)
-                dkv_smem = _estimate_smem_bytes(dkv_shapes)
-                if dq_smem + dkv_smem < min_total_smem:
-                  min_total_smem = dq_smem + dkv_smem
-                  fallback_dq_smem = dq_smem
-                  fallback_dkv_smem = dkv_smem
-                min_dq_smem = min(min_dq_smem, dq_smem)
-                min_dkv_smem = min(min_dkv_smem, dkv_smem)
-                if dq_smem <= _SMEM_SIZE_LIMIT and dkv_smem <= _SMEM_SIZE_LIMIT:
-                  configs.add(config)
+            for chunk_size in (32, 64):
+              if q_kv_block_size < chunk_size:
+                continue
+              config = Config(
+                  block_kv_dkv=128,
+                  block_q_dkv=q_kv_block_size,
+                  block_kv_dq=q_kv_block_size,
+                  block_q_dq=128,
+                  double_buffer=double_buffer,
+                  eltwise_stages=eltwise_stages,
+                  residual_stages=residual_stages,
+                  num_stages=num_stages,
+                  chunk_size=chunk_size,
+              )
+              dq_shapes = _get_dq_scratch_shapes(
+                  config=config,
+                  head_dim=head_dim,
+                  head_dim_out=head_dim_out,
+                  q_dtype=q_dtype,
+                  dout_dtype=dout_dtype,
+                  k_dtype=k_dtype,
+                  v_dtype=v_dtype,
+                  ds_dtype=ds_dtype,
+                  bias=bias,
+                  mask=mask,
+              )
+              dkv_shapes = _get_dkv_scratch_shapes(
+                  config=config,
+                  head_dim=head_dim,
+                  head_dim_out=head_dim_out,
+                  chunk_size=config.chunk_size,
+                  q_dtype=q_dtype,
+                  dout_dtype=dout_dtype,
+                  k_dtype=k_dtype,
+                  v_dtype=v_dtype,
+                  bias=bias,
+                  mask=mask,
+              )
+              dq_smem = _estimate_smem_bytes(dq_shapes)
+              dkv_smem = _estimate_smem_bytes(dkv_shapes)
+              if dq_smem + dkv_smem < min_total_smem:
+                min_total_smem = dq_smem + dkv_smem
+                fallback_dq_smem = dq_smem
+                fallback_dkv_smem = dkv_smem
+              min_dq_smem = min(min_dq_smem, dq_smem)
+              min_dkv_smem = min(min_dkv_smem, dkv_smem)
+              if dq_smem <= _SMEM_SIZE_LIMIT and dkv_smem <= _SMEM_SIZE_LIMIT:
+                configs.add(config)
     # If we found a good config for q_kv_block_size 128 there is no point
     # looking into 64 which is strictly worse for use of TC and
     # SMEM/TMEM.
@@ -386,7 +377,6 @@ def _kernel_dq(
     *,
     q_smem,
     do_smem,
-    residuals_smem=None,
     k_smem,
     v_smem,
     s_tmem,
@@ -435,13 +425,6 @@ def _kernel_dq(
   if is_causal:
     ub = lax.min(ub, pl.cdiv(q_base + block_q, block_kv))
 
-  if residuals_smem is not None:
-    # Pack m, l, and delta into the same buffer to avoid SMEM padding overhead.
-    # Note that they represent different residuals.
-    m_smem = residuals_smem.at[0]
-    l_smem = residuals_smem.at[1]
-    delta_smem = residuals_smem.at[2]
-
   dp_tmem, ds_tmem = dp_ds_tmems
 
   @pl.when((wg == 0) & (ub > lb))
@@ -455,13 +438,6 @@ def _kernel_dq(
       def tma_q_warp():
         plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_do_produced)
         plgpu.copy_gmem_to_smem(dout_gmem.at[qs, hi], do_smem, q_do_produced)
-
-        if not config.load_residuals_in_regs:
-          plgpu.copy_gmem_to_smem(m_gmem.at[hi, qs], m_smem, q_do_produced)
-          plgpu.copy_gmem_to_smem(l_gmem.at[hi, qs], l_smem, q_do_produced)
-          plgpu.copy_gmem_to_smem(
-              delta_gmem.at[hi, qs], delta_smem, q_do_produced
-          )
 
       @pl.when(warp_id == 1)
       def tma_kv_warp():
@@ -573,8 +549,6 @@ def _kernel_dq(
 
   @pl.when((wg == 1) & (ub > lb))
   def softmax_wg():
-    plgpu.barrier_wait(q_do_produced)
-
     if bias_gmem is None and mask_gmem is None:
       layout = plgpu.Layout.TCGEN05_TMEM_NATIVE
     else:
@@ -590,27 +564,18 @@ def _kernel_dq(
     k_start = load_k_range(k_start_gmem)
     k_end = load_k_range(k_end_gmem)
 
-    if config.load_residuals_in_regs:
-      m = plgpu.load(m_gmem.at[hi, qs], layout=row_layout, optimized=False)
-      l = plgpu.load(l_gmem.at[hi, qs], layout=row_layout, optimized=False)
-      delta = plgpu.load(
-          delta_gmem.at[hi, qs], layout=row_layout, optimized=False
-      )
-      m *= math.log2(math.e)
-    else:
-      m = l = delta = None
+    m = plgpu.load(m_gmem.at[hi, qs], layout=row_layout, optimized=False)
+    l = plgpu.load(l_gmem.at[hi, qs], layout=row_layout, optimized=False)
+    delta = plgpu.load(
+        delta_gmem.at[hi, qs], layout=row_layout, optimized=False
+    )
+    m *= math.log2(math.e)
 
     @pl.loop(lb, ub)
-    def kv_loop(ki, m=m, l=l, delta=delta):
+    def kv_loop(ki):
       si = lax.rem(ki - lb, eltwise_stages)
       kv_base = ki * block_kv
       ks = cast(pl.Slice, pl.ds(kv_base, block_kv))
-
-      if not config.load_residuals_in_regs:
-        m = plgpu.load(m_smem, layout=row_layout)
-        l = plgpu.load(l_smem, layout=row_layout)
-        delta = plgpu.load(delta_smem, layout=row_layout)
-        m *= math.log2(math.e)
 
       plgpu.barrier_wait(s_produced)
       s = plgpu.async_load_tmem(s_tmem, layout=layout)
