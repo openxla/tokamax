@@ -36,9 +36,9 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_common as vjp_common
 
 _SMEM_SIZE_LIMIT = 227 * 1024
-_TMEM = plgpu.Layout.TCGEN05
-_TMEM_COL = plgpu.Layout.TCGEN05.reduce(0)
-_TMEM_ROW = plgpu.Layout.TCGEN05.reduce(1)
+_TCGEN05 = plgpu.Layout.TCGEN05
+_TCGEN05_COL = plgpu.Layout.TCGEN05.reduce(0)
+_TCGEN05_ROW = plgpu.Layout.TCGEN05.reduce(1)
 _load_bcast = common.load_bcast
 _tiled_smem = mgpu_lib.tiled_swizzled_smem
 
@@ -370,19 +370,19 @@ def _estimate_smem_bytes(scratch_shapes: dict) -> int:
 
 
 def _kernel_dq(
-    q_ref,
-    k_ref,
-    v_ref,
-    dout_ref,
-    m_ref,
-    l_ref,
-    delta_ref,
-    bias_ref,
-    k_start_ref,
-    k_end_ref,
-    mask_ref,
-    dq_ref,
-    ds_ref,
+    q_gmem,
+    k_gmem,
+    v_gmem,
+    dout_gmem,
+    m_gmem,
+    l_gmem,
+    delta_gmem,
+    bias_gmem,
+    k_start_gmem,
+    k_end_gmem,
+    mask_gmem,
+    dq_gmem,
+    ds_gmem,
     *,
     q_smem,
     do_smem,
@@ -414,21 +414,26 @@ def _kernel_dq(
     logits_soft_cap,
 ):
   """Computes dq."""
-  wg_id = lax.axis_index("wg")
+  wg = lax.axis_index("wg")
   qi = lax.axis_index("q_tiles")
   hi = lax.axis_index("heads")
 
+  block_q = config.block_q_dq
+  block_kv = config.block_kv_dq
+  num_stages = config.num_stages
+  eltwise_stages = config.eltwise_stages
+
   # We assume MHA or simple mapping here to respect boundaries.
-  q_heads_per_kv_head = q_ref.shape[-2] // k_ref.shape[-2]
+  q_heads_per_kv_head = q_gmem.shape[-2] // k_gmem.shape[-2]
   hi_kv = lax.div(hi, jnp.array(q_heads_per_kv_head, hi.dtype))
 
-  q_base = qi * config.block_q_dq
-  qs = cast(pl.Slice, pl.ds(q_base, config.block_q_dq))
+  q_base = qi * block_q
+  qs = cast(pl.Slice, pl.ds(q_base, block_q))
 
   lb = 0
-  ub = k_ref.shape[-3] // config.block_kv_dq
+  ub = k_gmem.shape[-3] // block_kv
   if is_causal:
-    ub = lax.min(ub, pl.cdiv(q_base + config.block_q_dq, config.block_kv_dq))
+    ub = lax.min(ub, pl.cdiv(q_base + block_q, block_kv))
 
   if residuals_smem is not None:
     # Pack m, l, and delta into the same buffer to avoid SMEM padding overhead.
@@ -439,7 +444,7 @@ def _kernel_dq(
 
   dp_tmem, ds_tmem = dp_ds_tmems
 
-  @pl.when((wg_id == 0) & (ub > lb))
+  @pl.when((wg == 0) & (ub > lb))
   def mma_tma_wg():
 
     @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
@@ -447,91 +452,86 @@ def _kernel_dq(
       warp_id = lax.axis_index("warp")
 
       @pl.when(warp_id == 0)
-      def tma_q():
-        qs = pl.ds(qi * config.block_q_dq, config.block_q_dq)
+      def tma_q_warp():
+        plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_do_produced)
+        plgpu.copy_gmem_to_smem(dout_gmem.at[qs, hi], do_smem, q_do_produced)
 
-        plgpu.copy_gmem_to_smem(q_ref.at[qs, hi], q_smem, barrier=q_do_produced)
-        plgpu.copy_gmem_to_smem(
-            dout_ref.at[qs, hi], do_smem, barrier=q_do_produced
-        )
         if not config.load_residuals_in_regs:
+          plgpu.copy_gmem_to_smem(m_gmem.at[hi, qs], m_smem, q_do_produced)
+          plgpu.copy_gmem_to_smem(l_gmem.at[hi, qs], l_smem, q_do_produced)
           plgpu.copy_gmem_to_smem(
-              m_ref.at[hi, qs], m_smem, barrier=q_do_produced
-          )
-          plgpu.copy_gmem_to_smem(
-              l_ref.at[hi, qs], l_smem, barrier=q_do_produced
-          )
-          plgpu.copy_gmem_to_smem(
-              delta_ref.at[hi, qs], delta_smem, barrier=q_do_produced
+              delta_gmem.at[hi, qs], delta_smem, q_do_produced
           )
 
       @pl.when(warp_id == 1)
-      def tma_kv():
-        @pl.loop(lb, lax.min(lb + config.num_stages, ub))
+      def tma_kv_warp():
+        @pl.loop(lb, lax.min(lb + num_stages, ub))
         def prologue(ki):
-          si = lax.rem(ki - lb, config.num_stages)
-          ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
+          si = lax.rem(ki - lb, num_stages)
+          ks = pl.ds(ki * block_kv, block_kv)
           plgpu.copy_gmem_to_smem(
-              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
+              v_gmem.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
           )
           plgpu.copy_gmem_to_smem(
-              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
+              k_gmem.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
           )
 
-        @pl.loop(lb + config.num_stages, ub)
+        @pl.loop(lb + num_stages, ub)
         def kv_loop(ki):
-          si = lax.rem(ki - lb, config.num_stages)
-          ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
+          si = lax.rem(ki - lb, num_stages)
+          ks = pl.ds(ki * block_kv, block_kv)
           plgpu.barrier_wait(v_consumed.at[si])
           plgpu.copy_gmem_to_smem(
-              v_ref.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
+              v_gmem.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
           )
           plgpu.barrier_wait(k_consumed.at[si])
           plgpu.copy_gmem_to_smem(
-              k_ref.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
+              k_gmem.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
           )
 
-      @pl.when(warp_id == 3)
-      def tma_eltwise():
-        if bias_ref is not None or mask_ref is not None:
+      if bias_gmem is not None or mask_gmem is not None:
+
+        @pl.when(warp_id == 3)
+        def tma_eltwise_warp():
 
           @pl.loop(lb, ub)
-          def eltwise_loop(ki):
-            bi = lax.rem(ki - lb, config.eltwise_stages)
-            ks = pl.ds(ki * config.block_kv_dq, config.block_kv_dq)
+          def kv_loop(ki):
+            si = lax.rem(ki - lb, eltwise_stages)
+            ks = pl.ds(ki * block_kv, block_kv)
+
             if bias_smem is not None:
 
-              @pl.when(ki - lb >= config.eltwise_stages)
+              @pl.when(ki - lb >= eltwise_stages)
               def wait_bias():
-                plgpu.barrier_wait(bias_consumed.at[bi])
+                plgpu.barrier_wait(bias_consumed.at[si])
                 mgpu_lib.fence_async_shared_cta()
 
               plgpu.copy_gmem_to_smem(
-                  bias_ref.at[0 if bias_ref.shape[-3] == 1 else hi, qs, ks],
-                  bias_smem.at[bi],
-                  bias_produced.at[bi],
+                  bias_gmem.at[0 if bias_gmem.shape[-3] == 1 else hi, qs, ks],
+                  bias_smem.at[si],
+                  bias_produced.at[si],
               )
 
             if mask_smem is not None:
 
-              @pl.when(ki - lb >= config.eltwise_stages)
+              @pl.when(ki - lb >= eltwise_stages)
               def wait_mask():
-                plgpu.barrier_wait(mask_consumed.at[bi])
+                plgpu.barrier_wait(mask_consumed.at[si])
                 mgpu_lib.fence_async_shared_cta()
 
-              mask_hi = 0 if mask_ref.shape[-3] == 1 else hi
-              mask_qs = 0 if mask_ref.shape[-2] == 1 else qs
+              mask_hi = 0 if mask_gmem.shape[-3] == 1 else hi
+              mask_qs = 0 if mask_gmem.shape[-2] == 1 else qs
               plgpu.copy_gmem_to_smem(
-                  mask_ref.at[mask_hi, mask_qs, ks],
-                  mask_smem.at[bi],
-                  mask_produced.at[bi],
+                  mask_gmem.at[mask_hi, mask_qs, ks],
+                  mask_smem.at[si],
+                  mask_produced.at[si],
               )
 
       @pl.when(warp_id == 2)
-      def mma():
+      def mma_warp():
 
         def q_k_mma(ki, wait_s_consumed=True):
-          si = lax.rem(ki - lb, config.num_stages)
+          si = lax.rem(ki - lb, num_stages)
           plgpu.barrier_wait(kv_produced.at[si])
           if wait_s_consumed:
             plgpu.barrier_wait(s_consumed)
@@ -539,13 +539,13 @@ def _kernel_dq(
           plgpu.tcgen05_commit_arrive(s_produced)
 
         def do_v_mma(ki):
-          si = lax.rem(ki - lb, config.num_stages)
+          si = lax.rem(ki - lb, num_stages)
           plgpu.tcgen05_mma(dp_tmem, do_smem, v_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(dp_produced)
           plgpu.tcgen05_commit_arrive(v_consumed.at[si])
 
         def ds_k_mma(ki):
-          si = lax.rem(ki - lb, config.num_stages)
+          si = lax.rem(ki - lb, num_stages)
           plgpu.barrier_wait(ds_produced)
           plgpu.tcgen05_mma(dq_tmem, ds_tmem, k_smem.at[si], accumulate=ki > lb)
           plgpu.tcgen05_commit_arrive(k_consumed.at[si])
@@ -564,191 +564,160 @@ def _kernel_dq(
         plgpu.tcgen05_commit_arrive(dq_mma_finished)
 
     plgpu.barrier_wait(dq_mma_finished)
-    dq_val = plgpu.async_load_tmem(dq_tmem, layout=_TMEM)
+    dq = plgpu.async_load_tmem(dq_tmem, layout=_TCGEN05)
     plgpu.wait_load_tmem()
-    q_smem[...] = (dq_val * logits_scale).astype(q_smem.dtype)
+    q_smem[...] = (dq * logits_scale).astype(q_smem.dtype)
     plgpu.commit_smem()
-    plgpu.copy_smem_to_gmem(q_smem, dq_ref.at[qs, hi])
+    plgpu.copy_smem_to_gmem(q_smem, dq_gmem.at[qs, hi])
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-  @pl.when((wg_id == 1) & (ub > lb))
-  def sfu_wg():
+  @pl.when((wg == 1) & (ub > lb))
+  def softmax_wg():
     plgpu.barrier_wait(q_do_produced)
 
-    if k_start_ref is not None:
-      hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
-      k_start_slice = k_start_ref.at[hi_m, qs]
-      k_start_val = plgpu.load(k_start_slice, layout=_TMEM_ROW, optimized=False)
-    if k_end_ref is not None:
-      hi_m = 0 if k_end_ref.shape[-2] == 1 else hi
-      k_end_slice = k_end_ref.at[hi_m, qs]
-      k_end_val = plgpu.load(k_end_slice, layout=_TMEM_ROW, optimized=False)
+    def load_k_range(ref):
+      if ref is None:
+        return None
+      hi_ = 0 if ref.shape[0] == 1 else hi
+      return plgpu.load(ref.at[hi_, qs], layout=_TCGEN05_ROW, optimized=False)
+
+    k_start = load_k_range(k_start_gmem)
+    k_end = load_k_range(k_end_gmem)
 
     if config.load_residuals_in_regs:
-      m_slice = m_ref.at[hi, qs]
-      l_slice = l_ref.at[hi, qs]
-      delta_slice = delta_ref.at[hi, qs]
-      m_val_full = plgpu.load(m_slice, layout=_TMEM_ROW, optimized=False)
-      l_val_full = plgpu.load(l_slice, layout=_TMEM_ROW, optimized=False)
-      delta_val_full = plgpu.load(
-          delta_slice, layout=_TMEM_ROW, optimized=False
+      m = plgpu.load(m_gmem.at[hi, qs], layout=_TCGEN05_ROW, optimized=False)
+      l = plgpu.load(l_gmem.at[hi, qs], layout=_TCGEN05_ROW, optimized=False)
+      delta = plgpu.load(
+          delta_gmem.at[hi, qs], layout=_TCGEN05_ROW, optimized=False
       )
-      m_val_full = m_val_full * math.log2(math.e)
+      m *= math.log2(math.e)
+    else:
+      m = l = delta = None
 
     @pl.loop(lb, ub)
-    def sfu_loop(ki):
-      elt_bi = lax.rem(ki - lb, config.eltwise_stages)
-      ks = cast(pl.Slice, pl.ds(ki * config.block_kv_dq, config.block_kv_dq))
+    def kv_loop(ki, m=m, l=l, delta=delta):
+      si = lax.rem(ki - lb, eltwise_stages)
+      kv_base = ki * block_kv
+      ks = cast(pl.Slice, pl.ds(kv_base, block_kv))
 
       if not config.load_residuals_in_regs:
-        m_val = plgpu.load(m_smem, layout=_TMEM_ROW)
-        l_val = plgpu.load(l_smem, layout=_TMEM_ROW)
-        delta_val = plgpu.load(delta_smem, layout=_TMEM_ROW)
-        m_val = m_val * math.log2(math.e)
-      else:
-        m_val = m_val_full
-        l_val = l_val_full
-        delta_val = delta_val_full
-
-      m_val_bc = plgpu.layout_cast(
-          lax.broadcast_in_dim(
-              m_val, (config.block_q_dq, config.block_kv_dq), [0]
-          ),
-          _TMEM,
-      )
-      l_val_bc = plgpu.layout_cast(
-          lax.broadcast_in_dim(
-              l_val, (config.block_q_dq, config.block_kv_dq), [0]
-          ),
-          _TMEM,
-      )
-      delta_val_bc = plgpu.layout_cast(
-          lax.broadcast_in_dim(
-              delta_val, (config.block_q_dq, config.block_kv_dq), [0]
-          ),
-          _TMEM,
-      )
+        m = plgpu.load(m_smem, layout=_TCGEN05_ROW)
+        l = plgpu.load(l_smem, layout=_TCGEN05_ROW)
+        delta = plgpu.load(delta_smem, layout=_TCGEN05_ROW)
+        m *= math.log2(math.e)
 
       plgpu.barrier_wait(s_produced)
-      s_val = plgpu.async_load_tmem(s_tmem, layout=_TMEM)
+      s = plgpu.async_load_tmem(s_tmem, layout=_TCGEN05)
       plgpu.wait_load_tmem()
       plgpu.barrier_arrive(s_consumed)
+      scale = logits_scale
 
-      if bias_ref is not None:
-        s_val *= logits_scale
+      if bias_gmem is not None:
         if bias_smem is None:
-          bias_val = _load_bcast(bias_ref, (hi, qs, ks), layout=_TMEM)
+          bias = _load_bcast(bias_gmem, (hi, qs, ks), layout=_TCGEN05)
         else:
-          plgpu.barrier_wait(bias_produced.at[elt_bi])
-          bias_val = plgpu.load(bias_smem.at[elt_bi], layout=_TMEM)
-          plgpu.barrier_arrive(bias_consumed.at[elt_bi])
-        s_val += bias_val
+          plgpu.barrier_wait(bias_produced.at[si])
+          bias = plgpu.load(bias_smem.at[si], layout=_TCGEN05)
+          plgpu.barrier_arrive(bias_consumed.at[si])
+        s = s * scale + bias
+        scale = 1.0
 
       if logits_soft_cap is not None:
-        if bias_ref is None:
-          s_val *= logits_scale
-        s_val = jnp.tanh(s_val / logits_soft_cap) * logits_soft_cap
-        base_val = s_val * math.log2(math.e) - m_val_bc
-      else:
-        combined_scale = logits_scale * math.log2(math.e)
-        if bias_ref is None:
-          base_val = s_val * combined_scale - m_val_bc
-        else:
-          base_val = s_val * math.log2(math.e) - m_val_bc
+        s = jnp.tanh(s * (scale / logits_soft_cap))
+        scale = logits_soft_cap
+      logits = s
 
-      def iota(shape, d):
-        return plgpu.broadcasted_iota(jnp.int32, shape, d, layout=_TMEM)
+      # NOTE: This rescaling must happen after bias and soft-cap but before the
+      # attention masking (as the multiplication will cause `-inf`s).
+      scale *= math.log2(math.e)
+      mask_value = float(jnp.finfo(jnp.float32).min)
 
-      k_iota = iota(base_val.shape, 1) + ki * config.block_kv_dq
-      q_iota = iota(base_val.shape, 0) + q_base
+      def iota(d):
+        return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=_TCGEN05)
 
       if is_causal:
-        causal_mask = k_iota <= q_iota
-        base_val = jnp.where(
-            causal_mask, base_val, float(jnp.finfo(jnp.float32).min)
-        )
 
-      if k_start_ref is not None:
-        k_start_val_bc = lax.broadcast_in_dim(k_start_val, base_val.shape, [0])
-        k_start_val_bc = plgpu.layout_cast(k_start_val_bc, _TMEM)
-        base_val = jnp.where(
-            k_iota >= k_start_val_bc,
-            base_val,
-            float(jnp.finfo(jnp.float32).min),
-        )
+        def apply_causal_mask():
+          is_causal = q_base + iota(0) >= kv_base + iota(1)
+          return jnp.where(is_causal, s * scale, mask_value), 1.0
 
-      if k_end_ref is not None:
-        k_end_val_bc = lax.broadcast_in_dim(k_end_val, base_val.shape, [0])
-        k_end_val_bc = plgpu.layout_cast(k_end_val_bc, _TMEM)
-        base_val = jnp.where(
-            k_iota < k_end_val_bc,
-            base_val,
-            float(jnp.finfo(jnp.float32).min),
-        )
+        do_causal = kv_base + block_kv > q_base
+        s, scale = lax.cond(do_causal, apply_causal_mask, lambda: (s, scale))
 
-      if mask_ref is None:
-        mask_val = None
+      broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
+
+      if k_start is not None:
+        s *= scale
+        s = jnp.where(kv_base + iota(1) >= broadcast(k_start), s, mask_value)
+        scale = 1.0
+
+      if k_end is not None:
+        s *= scale
+        s = jnp.where(kv_base + iota(1) < broadcast(k_end), s, mask_value)
+        scale = 1.0
+
+      if mask_gmem is None:
+        mask = None
       else:
         if mask_smem is None:
-          mask_val = _load_bcast(mask_ref, (hi, qs, ks), layout=_TMEM)
+          mask = _load_bcast(mask_gmem, (hi, qs, ks), layout=_TCGEN05)
         else:
-          plgpu.barrier_wait(mask_produced.at[elt_bi])
+          plgpu.barrier_wait(mask_produced.at[si])
           if mask_smem.ndim == 2:
-            mask_val = plgpu.load(mask_smem.at[elt_bi], (), layout=_TMEM_COL)
-            mask_val = lax.broadcast_in_dim(mask_val, base_val.shape, [1])
+            mask = plgpu.load(mask_smem.at[si], layout=_TCGEN05_COL)
+            mask = lax.broadcast_in_dim(mask, s.shape, [1])
           else:
-            mask_val = plgpu.load(mask_smem.at[elt_bi], (), layout=_TMEM)
-          plgpu.barrier_arrive(mask_consumed.at[elt_bi])
-        mask_val = mask_val != 0
-        base_val = jnp.where(
-            mask_val, base_val, float(jnp.finfo(jnp.float32).min)
-        )
+            mask = plgpu.load(mask_smem.at[si], layout=_TCGEN05)
+          plgpu.barrier_arrive(mask_consumed.at[si])
+
+        s = jnp.where(mask, s * scale, mask_value)
+        scale = 1.0
 
       epsilon = float(jnp.finfo(jnp.float32).tiny)
-      p_val = jnp.exp2(base_val) / (l_val_bc + epsilon)
+      p = jnp.exp2(s * scale - broadcast(m)) / (broadcast(l) + epsilon)
 
       plgpu.barrier_wait(dp_produced)
-      dp_val = plgpu.async_load_tmem(dp_tmem, layout=_TMEM)
-      ds_val = p_val * (dp_val - delta_val_bc)
+      dp = plgpu.async_load_tmem(dp_tmem, layout=_TCGEN05)
+      ds = p * (dp - broadcast(delta))
 
       if logits_soft_cap is not None:
-        ds_val *= 1.0 - jnp.square(s_val / logits_soft_cap)
+        ds *= 1.0 - logits * logits
 
       # If we have an attention mask, it is possible that the entire row is
       # masked out. In that case, the forwards pass will calculate `p`'s values
       # as `1 / seq_len_k`. The corresponding `ds` values must be zeroed.
-      if mask_val is not None:
-        ds_val = jnp.where(mask_val, ds_val, 0.0)
+      if mask is not None:
+        ds = jnp.where(mask, ds, 0.0)
 
-      if ds_ref is not None:
+      if ds_gmem is not None:
         assert ds_smem is not None
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-        ds_smem[...] = ds_val.astype(ds_smem.dtype)
+        ds_smem[...] = ds.astype(ds_smem.dtype)
         plgpu.commit_smem()
-        plgpu.copy_smem_to_gmem(ds_smem, ds_ref.at[hi, qs, ks])
+        plgpu.copy_smem_to_gmem(ds_smem, ds_gmem.at[hi, qs, ks])
 
-      plgpu.async_store_tmem(ds_tmem, ds_val.astype(ds_tmem.dtype))
+      plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
       plgpu.commit_tmem()
       plgpu.barrier_arrive(ds_produced)
 
-    if ds_ref is not None:
+    if ds_gmem is not None:
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 
 def _kernel_dkv(
-    q_ref,
-    k_ref,
-    v_ref,
-    dout_ref,
-    m_ref,
-    l_ref,
-    delta_ref,
-    bias_ref,
-    k_start_ref,
-    k_end_ref,
-    mask_ref,
-    dk_ref,
-    dv_ref,
+    q_gmem,
+    k_gmem,
+    v_gmem,
+    dout_gmem,
+    m_gmem,
+    l_gmem,
+    delta_gmem,
+    bias_gmem,
+    k_start_gmem,
+    k_end_gmem,
+    mask_gmem,
+    dk_gmem,
+    dv_gmem,
     *,
     k_smem,
     v_smem,
@@ -787,19 +756,25 @@ def _kernel_dkv(
     logits_soft_cap,
 ):
   """Computes dkv."""
-  ds_stages = 2 if config.double_buffer else 1
-  wg_id = lax.axis_index("wg")
+  wg = lax.axis_index("wg")
   ki = lax.axis_index("kv_tiles")
   hi_kv = lax.axis_index("heads")
 
-  num_q_heads = q_ref.shape[-2]
-  q_heads_per_kv_head = num_q_heads // k_ref.shape[-2]
+  block_q = config.block_q_dkv
+  block_kv = config.block_kv_dkv
+  num_stages = config.num_stages
+  eltwise_stages = config.eltwise_stages
+  residual_stages = config.residual_stages
+  ds_stages = 2 if config.double_buffer else 1
 
-  kv_base = ki * config.block_kv_dkv
-  ks = pl.ds(kv_base, config.block_kv_dkv)
+  num_q_heads = q_gmem.shape[-2]
+  q_heads_per_kv_head = num_q_heads // k_gmem.shape[-2]
 
-  lb = lax.div(kv_base, config.block_q_dkv) if is_causal else 0
-  ub = q_ref.shape[-3] // config.block_q_dkv
+  kv_base = ki * block_kv
+  ks = pl.ds(kv_base, block_kv)
+
+  lb = lax.div(kv_base, block_q) if is_causal else 0
+  ub = q_gmem.shape[-3] // block_q
   num_q_tiles = ub - lb
   safe_num_q_tiles = lax.max(num_q_tiles, 1)
   total_steps = q_heads_per_kv_head * num_q_tiles
@@ -811,7 +786,7 @@ def _kernel_dkv(
     l_smem = residuals_smem.at[1]
     delta_smem = residuals_smem.at[2]
 
-  @pl.when((wg_id == 0) & (total_steps > 0))
+  @pl.when((wg == 0) & (total_steps > 0))
   def mma_tma_wg():
 
     @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
@@ -819,106 +794,100 @@ def _kernel_dkv(
       warp_id = lax.axis_index("warp")
 
       @pl.when(warp_id == 0)
-      def tma_kv():
-        plgpu.copy_gmem_to_smem(
-            k_ref.at[ks, hi_kv], k_smem, barrier=kv_produced
-        )
-        plgpu.copy_gmem_to_smem(
-            v_ref.at[ks, hi_kv], v_smem, barrier=kv_produced
-        )
+      def tma_kv_warp():
+        plgpu.copy_gmem_to_smem(k_gmem.at[ks, hi_kv], k_smem, kv_produced)
+        plgpu.copy_gmem_to_smem(v_gmem.at[ks, hi_kv], v_smem, kv_produced)
 
         @pl.loop(0, total_steps)
-        def residual_loop(step):
-          qh = lax.div(step, safe_num_q_tiles)
+        def q_loop(step):
+          si = lax.rem(step, residual_stages)
           qi = lb + lax.rem(step, safe_num_q_tiles)
-          hi = hi_kv * q_heads_per_kv_head + qh
-          li = lax.rem(step, config.residual_stages)
-          qs = pl.ds(qi * config.block_q_dkv, config.block_q_dkv)
+          qs = pl.ds(qi * block_q, block_q)
+          hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
 
-          @pl.when(step >= config.residual_stages)
+          @pl.when(step >= residual_stages)
           def wait_res():
-            plgpu.barrier_wait(residual_consumed.at[li])
+            plgpu.barrier_wait(residual_consumed.at[si])
 
           plgpu.copy_gmem_to_smem(
-              m_ref.at[hi, qs], m_smem.at[li], barrier=residual_produced.at[li]
+              m_gmem.at[hi, qs], m_smem.at[si], barrier=residual_produced.at[si]
           )
           plgpu.copy_gmem_to_smem(
-              l_ref.at[hi, qs], l_smem.at[li], barrier=residual_produced.at[li]
+              l_gmem.at[hi, qs], l_smem.at[si], barrier=residual_produced.at[si]
           )
           plgpu.copy_gmem_to_smem(
-              delta_ref.at[hi, qs],
-              delta_smem.at[li],
-              barrier=residual_produced.at[li],
+              delta_gmem.at[hi, qs],
+              delta_smem.at[si],
+              barrier=residual_produced.at[si],
           )
 
       @pl.when(warp_id == 1)
-      def tma_q():
+      def tma_q_warp():
         @pl.loop(0, total_steps)
         def q_loop(step):
-          qh = lax.div(step, safe_num_q_tiles)
+          si = lax.rem(step, num_stages)
           qi = lb + lax.rem(step, safe_num_q_tiles)
-          hi = hi_kv * q_heads_per_kv_head + qh
-          si = lax.rem(step, config.num_stages)
-          qs = pl.ds(qi * config.block_q_dkv, config.block_q_dkv)
+          qs = pl.ds(qi * block_q, block_q)
+          hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
 
-          @pl.when(step >= config.num_stages)
+          @pl.when(step >= num_stages)
           def wait_q():
             plgpu.barrier_wait(q_do_consumed.at[si])
 
           plgpu.copy_gmem_to_smem(
-              q_ref.at[qs, hi], q_smem.at[si], barrier=q_do_produced.at[si]
+              q_gmem.at[qs, hi], q_smem.at[si], barrier=q_do_produced.at[si]
           )
           plgpu.copy_gmem_to_smem(
-              dout_ref.at[qs, hi], do_smem.at[si], barrier=q_do_produced.at[si]
+              dout_gmem.at[qs, hi], do_smem.at[si], barrier=q_do_produced.at[si]
           )
 
-      @pl.when(warp_id == 3)
-      def tma_eltwise():
-        if bias_ref is not None or mask_ref is not None:
+      if bias_gmem is not None or mask_gmem is not None:
+
+        @pl.when(warp_id == 3)
+        def tma_eltwise_warp():
 
           @pl.loop(0, total_steps)
-          def eltwise_loop(step):
-            qh = lax.div(step, safe_num_q_tiles)
+          def q_loop(step):
+            si = lax.rem(step, eltwise_stages)
             qi = lb + lax.rem(step, safe_num_q_tiles)
-            hi = hi_kv * q_heads_per_kv_head + qh
-            bi = lax.rem(step, config.eltwise_stages)
-            qs = pl.ds(qi * config.block_q_dkv, config.block_q_dkv)
+            qs = pl.ds(qi * block_q, block_q)
+            hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
 
             if bias_smem is not None:
 
-              @pl.when(step >= config.eltwise_stages)
+              @pl.when(step >= eltwise_stages)
               def wait_bias():
-                plgpu.barrier_wait(bias_consumed.at[bi])
+                plgpu.barrier_wait(bias_consumed.at[si])
                 mgpu_lib.fence_async_shared_cta()
 
               plgpu.copy_gmem_to_smem(
-                  bias_ref.at[0 if bias_ref.shape[-3] == 1 else hi, ks, qs],
-                  bias_smem.at[bi],
-                  bias_produced.at[bi],
+                  bias_gmem.at[0 if bias_gmem.shape[-3] == 1 else hi, ks, qs],
+                  bias_smem.at[si],
+                  bias_produced.at[si],
               )
 
             if mask_smem is not None:
 
-              @pl.when(step >= config.eltwise_stages)
+              @pl.when(step >= eltwise_stages)
               def wait_mask():
-                plgpu.barrier_wait(mask_consumed.at[bi])
+                plgpu.barrier_wait(mask_consumed.at[si])
                 mgpu_lib.fence_async_shared_cta()
 
-              mask_hi = 0 if mask_ref.shape[-3] == 1 else hi
-              mask_qs = 0 if mask_ref.shape[-1] == 1 else qs
+              mask_hi = 0 if mask_gmem.shape[-3] == 1 else hi
+              mask_qs = 0 if mask_gmem.shape[-1] == 1 else qs
               plgpu.copy_gmem_to_smem(
-                  mask_ref.at[mask_hi, ks, mask_qs],
-                  mask_smem.at[bi],
-                  mask_produced.at[bi],
+                  mask_gmem.at[mask_hi, ks, mask_qs],
+                  mask_smem.at[si],
+                  mask_produced.at[si],
               )
 
       @pl.when(warp_id == 2)
-      def mma():
+      def mma_warp():
         plgpu.barrier_wait(kv_produced)
 
         @pl.loop(0, total_steps)
-        def mma_loop(step):
-          si = lax.rem(step, config.num_stages)
+        def q_loop(step):
+          si = lax.rem(step, num_stages)
           plgpu.barrier_wait(q_do_produced.at[si])
           plgpu.barrier_wait(s_consumed)
           plgpu.tcgen05_mma(s_tmem, k_smem, q_smem.at[si].T, accumulate=False)
@@ -928,7 +897,7 @@ def _kernel_dkv(
           plgpu.tcgen05_mma(dp_tmem, v_smem, do_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(dp_produced)
 
-          num_chunks = config.block_q_dkv // config.chunk_size
+          num_chunks = block_q // config.chunk_size
           for chunk_idx in range(num_chunks):
             gci = step * num_chunks + chunk_idx
             ci = lax.rem(gci, ds_stages)
@@ -960,184 +929,170 @@ def _kernel_dkv(
         plgpu.tcgen05_commit_arrive(kv_mma_finished)
 
     plgpu.barrier_wait(kv_mma_finished)
-    dk_val = plgpu.async_load_tmem(dk_tmem, layout=_TMEM)
-    dv_val = plgpu.async_load_tmem(dv_tmem, layout=_TMEM)
+    dk = plgpu.async_load_tmem(dk_tmem, layout=_TCGEN05)
+    dv = plgpu.async_load_tmem(dv_tmem, layout=_TCGEN05)
     plgpu.wait_load_tmem()
-    k_smem[...] = (dk_val * logits_scale).astype(k_smem.dtype)
-    v_smem[...] = dv_val.astype(v_smem.dtype)
+    k_smem[...] = (dk * logits_scale).astype(k_smem.dtype)
+    v_smem[...] = dv.astype(v_smem.dtype)
     plgpu.commit_smem()
-    plgpu.copy_smem_to_gmem(k_smem, dk_ref.at[ks, hi_kv])
-    plgpu.copy_smem_to_gmem(v_smem, dv_ref.at[ks, hi_kv])
+    plgpu.copy_smem_to_gmem(k_smem, dk_gmem.at[ks, hi_kv])
+    plgpu.copy_smem_to_gmem(v_smem, dv_gmem.at[ks, hi_kv])
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-  @pl.when((wg_id == 1) & (total_steps > 0))
-  def sfu_wg():
+  @pl.when((wg == 1) & (total_steps > 0))
+  def softmax_wg():
     pl.loop(0, ds_stages)(lambda i: plgpu.barrier_arrive(p_consumed.at[i]))
     pl.loop(0, ds_stages)(lambda i: plgpu.barrier_arrive(ds_consumed.at[i]))
     plgpu.barrier_arrive(s_consumed)
     plgpu.barrier_arrive(dp_consumed)
 
-    if mask_ref is None or mask_ref.shape[-3] != 1 or mask_ref.shape[-1] != 1:
+    if mask_gmem is None:
       loop_invariant_mask = None
-    else:  # The mask is loop invariant.
+    elif mask_gmem.shape[-3] != 1 or mask_gmem.shape[-1] != 1:
+      loop_invariant_mask = None
+    else:
       loop_invariant_mask = plgpu.load(
-          mask_ref.at[0, ks, 0], layout=_TMEM_ROW, optimized=False
+          mask_gmem.at[0, ks, 0], layout=_TCGEN05_ROW, optimized=False
       )
 
     @pl.loop(0, total_steps)
-    def sfu_loop(step):
-      qh = lax.div(step, safe_num_q_tiles)
+    def q_loop(step):
       qi = lb + lax.rem(step, safe_num_q_tiles)
-      si = lax.rem(step, config.num_stages)
-      elt_bi = lax.rem(step, config.eltwise_stages)
-      li = lax.rem(step, config.residual_stages)
-      hi = hi_kv * q_heads_per_kv_head + qh
+      si = lax.rem(step, num_stages)
+      si_elt = lax.rem(step, eltwise_stages)
+      si_res = lax.rem(step, residual_stages)
+      hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
       plgpu.barrier_wait(q_do_produced.at[si])
-      plgpu.barrier_wait(residual_produced.at[li])
+      plgpu.barrier_wait(residual_produced.at[si_res])
 
-      num_chunks = config.block_q_dkv // config.chunk_size
+      num_chunks = block_q // config.chunk_size
 
       for chunk_idx in range(num_chunks):
         gci = step * num_chunks + chunk_idx
         ci = lax.rem(gci, ds_stages)
         c_start = chunk_idx * config.chunk_size
         chunk_slice = pl.ds(c_start, config.chunk_size)
+        q_base = qi * block_q + c_start
+        qs = pl.ds(q_base, config.chunk_size)
 
         if chunk_idx == 0:
           plgpu.barrier_wait(s_produced)
-        s_val = plgpu.async_load_tmem(s_tmem.at[:, chunk_slice], layout=_TMEM)
+        s = plgpu.async_load_tmem(s_tmem.at[:, chunk_slice], layout=_TCGEN05)
         if chunk_idx == num_chunks - 1:
           plgpu.wait_load_tmem()
           plgpu.barrier_arrive(s_consumed)
 
-        if bias_ref is not None:
-          s_val *= logits_scale
+        scale = logits_scale
+
+        if bias_gmem is not None:
           if bias_smem is None:
-            qs = pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
-            bias_val = _load_bcast(bias_ref, (hi, ks, qs), layout=_TMEM)
+            bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)
           else:
             if chunk_idx == 0:
-              plgpu.barrier_wait(bias_produced.at[elt_bi])
-            bias_val = plgpu.load(
-                bias_smem.at[elt_bi, :, chunk_slice], layout=_TMEM
+              plgpu.barrier_wait(bias_produced.at[si_elt])
+            bias = plgpu.load(
+                bias_smem.at[si_elt, :, chunk_slice], layout=_TCGEN05
             )
             if chunk_idx == num_chunks - 1:
-              plgpu.barrier_arrive(bias_consumed.at[elt_bi])
-          s_val += bias_val
+              plgpu.barrier_arrive(bias_consumed.at[si_elt])
+
+          s = s * scale + bias
+          scale = 1.0
 
         if logits_soft_cap is not None:
-          if bias_ref is None:
-            s_val *= logits_scale
-          s_val = jnp.tanh(s_val / logits_soft_cap) * logits_soft_cap
+          s = jnp.tanh(s * (scale / logits_soft_cap))
+          scale = logits_soft_cap
+        logits = s
 
-        m_val = plgpu.load(m_smem.at[li, chunk_slice], layout=_TMEM_COL)
-        m_val = lax.broadcast_in_dim(m_val, s_val.shape, [1])
-        m_val = plgpu.layout_cast(m_val, _TMEM)
-        l_val = plgpu.load(l_smem.at[li, chunk_slice], layout=_TMEM_COL)
-        l_val = lax.broadcast_in_dim(l_val, s_val.shape, [1])
-        l_val = plgpu.layout_cast(l_val, _TMEM)
+        m = plgpu.load(m_smem.at[si_res, chunk_slice], layout=_TCGEN05_COL)
+        l = plgpu.load(l_smem.at[si_res, chunk_slice], layout=_TCGEN05_COL)
 
-        if logits_soft_cap is not None or bias_ref is not None:
-          base_val = s_val * math.log2(math.e) - m_val * math.log2(math.e)
-        else:
-          combined_scale = logits_scale * math.log2(math.e)
-          base_val = s_val * combined_scale - m_val * math.log2(math.e)
+        # NOTE: This rescaling must happen after bias and soft-cap but before
+        # the attention masking (as the multiplication will cause `-inf`s).
+        scale *= math.log2(math.e)
+        m *= math.log2(math.e)
 
-        def iota(shape, d):
-          return plgpu.broadcasted_iota(jnp.int32, shape, d, layout=_TMEM)
+        mask_value = float(jnp.finfo(jnp.float32).min)
 
-        k_iota = iota(base_val.shape, 0) + kv_base
-        q_iota = iota(base_val.shape, 1) + qi * config.block_q_dkv + c_start
+        def iota(d):
+          return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=_TCGEN05)
 
         if is_causal:
-          causal_mask = k_iota <= q_iota
-          base_val = jnp.where(
-              causal_mask, base_val, float(jnp.finfo(jnp.float32).min)
+
+          def apply_causal_mask():
+            mask = kv_base + iota(0) <= q_base + iota(1)
+            return jnp.where(mask, s * scale, mask_value), 1.0
+
+          do_causal = kv_base + block_kv > q_base
+          s, scale = lax.cond(do_causal, apply_causal_mask, lambda: (s, scale))
+
+        broadcast = lambda x, s=s: lax.broadcast_in_dim(x, s.shape, [1])
+
+        def load_k_range(ref):
+          hi_ = 0 if ref.shape[0] == 1 else hi
+          return plgpu.load(
+              ref.at[hi_, qs], layout=_TCGEN05_COL, optimized=False
           )
 
-        if k_start_ref is not None:
-          hi_m = 0 if k_start_ref.shape[-2] == 1 else hi
-          k_start_slice = k_start_ref.at[
-              hi_m, pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
-          ]
-          k_start_val = plgpu.load(
-              k_start_slice, layout=_TMEM_COL, optimized=False
-          )
-          k_start_val = lax.broadcast_in_dim(k_start_val, base_val.shape, [1])
-          k_start_val = plgpu.layout_cast(k_start_val, _TMEM)
-          base_val = jnp.where(
-              k_iota >= k_start_val,
-              base_val,
-              float(jnp.finfo(jnp.float32).min),
-          )
+        if k_start_gmem is not None:
+          k_start = broadcast(load_k_range(k_start_gmem))
+          s = jnp.where(kv_base + iota(0) >= k_start, s * scale, mask_value)
+          scale = 1.0
 
-        if k_end_ref is not None:
-          hi_m = 0 if k_end_ref.shape[-2] == 1 else hi
-          k_end_slice = k_end_ref.at[
-              hi_m, pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
-          ]
-          k_end_val = plgpu.load(k_end_slice, layout=_TMEM_COL, optimized=False)
-          k_end_val = lax.broadcast_in_dim(k_end_val, base_val.shape, [1])
-          k_end_val = plgpu.layout_cast(k_end_val, _TMEM)
-          base_val = jnp.where(
-              k_iota < k_end_val,
-              base_val,
-              float(jnp.finfo(jnp.float32).min),
-          )
+        if k_end_gmem is not None:
+          k_end = broadcast(load_k_range(k_end_gmem))
+          s = jnp.where(kv_base + iota(0) < k_end, s * scale, mask_value)
+          scale = 1.0
 
-        if mask_ref is not None:
+        if mask_gmem is not None:
           if mask_smem is None:
             if loop_invariant_mask is None:
-              qs = pl.ds(qi * config.block_q_dkv + c_start, config.chunk_size)
-              mask_val = _load_bcast(mask_ref, (hi, ks, qs), layout=_TMEM)
+              mask = _load_bcast(mask_gmem, (hi, ks, qs), layout=_TCGEN05)
             else:
-              mask_val = loop_invariant_mask
-              mask_val = lax.broadcast_in_dim(mask_val, base_val.shape, [0])
+              mask = lax.broadcast_in_dim(loop_invariant_mask, s.shape, [0])
           else:
             if chunk_idx == 0:
-              plgpu.barrier_wait(mask_produced.at[elt_bi])
-            mask_val = plgpu.load(
-                mask_smem.at[elt_bi, :, chunk_slice], (), layout=_TMEM
+              plgpu.barrier_wait(mask_produced.at[si_elt])
+            mask = plgpu.load(
+                mask_smem.at[si_elt, :, chunk_slice], layout=_TCGEN05
             )
             if chunk_idx == num_chunks - 1:
-              plgpu.barrier_arrive(mask_consumed.at[elt_bi])
+              plgpu.barrier_arrive(mask_consumed.at[si_elt])
 
-          mask_val = mask_val != 0
-          base_val = jnp.where(
-              mask_val, base_val, float(jnp.finfo(jnp.float32).min)
-          )
+          s = jnp.where(mask, s * scale, mask_value)
+          scale = 1.0
 
         epsilon = float(jnp.finfo(jnp.float32).tiny)
-        p_val = jnp.exp2(base_val) / (l_val + epsilon)
+        p = jnp.exp2(s * scale - broadcast(m)) / (broadcast(l) + epsilon)
 
         plgpu.barrier_wait(p_consumed.at[ci])
-        p_smem[ci] = p_val.astype(p_smem.dtype)
+        p_smem[ci] = p.astype(p_smem.dtype)
         plgpu.commit_smem()
         plgpu.barrier_arrive(p_produced.at[ci])
 
-        delta_val = plgpu.load(delta_smem.at[li, chunk_slice], layout=_TMEM_COL)
-        delta_val = lax.broadcast_in_dim(delta_val, p_val.shape, [1])
-        delta_val = plgpu.layout_cast(delta_val, _TMEM)
+        delta = plgpu.load(
+            delta_smem.at[si_res, chunk_slice], layout=_TCGEN05_COL
+        )
 
         if chunk_idx == 0:
           plgpu.barrier_wait(dp_produced)
-        dp_val = plgpu.async_load_tmem(dp_tmem.at[:, chunk_slice], layout=_TMEM)
+        dp = plgpu.async_load_tmem(dp_tmem.at[:, chunk_slice], layout=_TCGEN05)
         if chunk_idx == num_chunks - 1:
           plgpu.wait_load_tmem()
           plgpu.barrier_arrive(dp_consumed)
 
-        ds_val = p_val * (dp_val - delta_val)
+        ds = p * (dp - broadcast(delta))
 
         if logits_soft_cap is not None:
-          ds_val *= 1.0 - jnp.square(s_val / logits_soft_cap)
+          ds *= 1.0 - logits * logits
 
         plgpu.barrier_wait(ds_consumed.at[ci])
-        ds_smem[ci] = ds_val.astype(ds_smem.dtype)
+        ds_smem[ci] = ds.astype(ds_smem.dtype)
         plgpu.commit_smem()
         plgpu.barrier_arrive(ds_produced.at[ci])
 
       plgpu.barrier_arrive(q_do_consumed.at[si])
-      plgpu.barrier_arrive(residual_consumed.at[li])
+      plgpu.barrier_arrive(residual_consumed.at[si_res])
 
 
 def _pad_maybe_bcast(x, m, axis):
@@ -1175,6 +1130,7 @@ def flash_attention_vjp_kernel(
   orig_kv_seq_len, _, orig_head_dim_out = v.shape
 
   block_q_dq = config.block_q_dq
+  block_kv_dq = config.block_kv_dq
   block_kv_dkv = config.block_kv_dkv
   chunk_size = config.chunk_size
 
@@ -1239,8 +1195,8 @@ def flash_attention_vjp_kernel(
   if bias is None:
     ds_shape = None
   else:
-    q_seq_len_ = pl.cdiv(q.shape[-3], config.block_q_dq) * config.block_q_dq
-    kv_seq_len_ = pl.cdiv(k.shape[-3], config.block_kv_dq) * config.block_kv_dq
+    q_seq_len_ = pl.cdiv(q.shape[-3], block_q_dq) * block_q_dq
+    kv_seq_len_ = pl.cdiv(k.shape[-3], block_kv_dq) * block_kv_dq
     ds_shape = (q.shape[-2], q_seq_len_, kv_seq_len_)
     ds_shape = jax.ShapeDtypeStruct(ds_shape, ds_dtype)
 

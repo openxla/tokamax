@@ -404,7 +404,7 @@ def flash_attention_vjp_kernel(
       ds = p * (dp - broadcast(delta))
 
       if logits_soft_cap is not None:
-        ds *= 1 - logits * logits
+        ds *= 1.0 - logits * logits
 
       # If we have an attention mask, it is possible that the entire row is
       # masked out. In that case, the forwards pass will calculate `p`'s values
@@ -646,7 +646,7 @@ def flash_attention_vjp_kernel(
       dp = pl.run_scoped(compute_dp, acc_type)
       ds = p * (dp - broadcast(delta))  # pytype: disable=wrong-arg-types  # jax-operator-types
       if logits_soft_cap is not None:
-        ds *= 1 - logits * logits
+        ds *= 1.0 - logits * logits
 
       plgpu.wgmma(dk_acc, ds.astype(dtype), q_smem)
       plgpu.wgmma_wait(1)
