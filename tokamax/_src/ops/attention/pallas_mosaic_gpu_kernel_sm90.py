@@ -53,6 +53,17 @@ class Config(common.ConfigBase):
   pass
 
 
+def _get_epilogue_tile_shape(block_q, head_dim_out, out_dtype):
+  """Returns the epilogue tile size for a given configuration."""
+  epi_tile_q = 64
+  epi_tile_d = 1024 // mgpu_lib.num_bits(out_dtype)
+  assert block_q % epi_tile_q == 0
+  if head_dim_out % epi_tile_d != 0:
+    epi_tile_d = head_dim_out
+  num_epi_slots = min(2, (block_q // epi_tile_q) * (head_dim_out // epi_tile_d))
+  return epi_tile_q, epi_tile_d, num_epi_slots
+
+
 def _estimate_shared_mem_usage_bytes(ba, block_q, block_kv, num_stages):
   """Estimates the shared memory usage in bytes for a given configuration."""
   q, k, v = ba.args
@@ -77,9 +88,12 @@ def _estimate_shared_mem_usage_bytes(ba, block_q, block_kv, num_stages):
   if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
     bytes_per_stage += tile_q * block_kv
 
+  epi_tile_q, epi_tile_d, num_epi_slots = _get_epilogue_tile_shape(
+      block_q, block_d_out, q.dtype
+  )
   # `q`/`k` and the outputs are in a union.
   q_k_elems = (tile_q + num_stages * block_kv) * block_d
-  out_elems = tile_q * block_d_out
+  out_elems = 2 * num_epi_slots * epi_tile_q * epi_tile_d
   return (
       (max(q_k_elems, out_elems) * dtype_bits // 8)
       + num_stages * bytes_per_stage
@@ -161,13 +175,9 @@ def flash_attention_kernel(
   block_q_kv = block_q, block_kv = config.block_q, config.block_kv
   max_stages = min(config.num_stages, pl.cdiv(kv_seq_len, block_kv))
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
-
-  epi_tile_q = 64
-  epi_tile_d = 1024 // mgpu_lib.num_bits(out_dtype)
-  assert block_q % epi_tile_q == 0
-  if head_dim_out % epi_tile_d != 0:
-    epi_tile_d = head_dim_out
-  num_epi_slots = min(2, (block_q // epi_tile_q) * (head_dim_out // epi_tile_d))
+  epi_tile_q, epi_tile_d, num_epi_slots = _get_epilogue_tile_shape(
+      block_q, head_dim_out, out_dtype
+  )
 
   if mask is not None:
     mask = mask.astype(jnp.int8)
