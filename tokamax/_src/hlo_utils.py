@@ -31,8 +31,6 @@ from tokamax._src.ops import op as op_lib
 
 DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.PALLAS_TRITON_KEY),
-    export.DisabledSafetyCheck.custom_call(hlo_utils_common.MOSAIC_GPU_KEY),
-    export.DisabledSafetyCheck.custom_call(hlo_utils_common.MOSAIC_TPU_KEY),
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_FFI_KEY),
 )
 
