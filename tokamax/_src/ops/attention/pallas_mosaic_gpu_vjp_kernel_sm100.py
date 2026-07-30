@@ -81,7 +81,7 @@ def _get_dq_scratch_shapes(
   shapes = dict(
       q_smem=_tiled_smem((block_q, head_dim), q_dtype),
       do_smem=_tiled_smem((block_q, head_dim_out), dout_dtype),
-      k_smem=_tiled_smem((num_stages, block_kv, head_dim), k_dtype, swizzle=64),
+      k_smem=_tiled_smem((num_stages, block_kv, head_dim), k_dtype),
       v_smem=_tiled_smem((num_stages, block_kv, head_dim_out), v_dtype),
       s_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
       dp_ds_tmems=plgpu.RefUnion(
