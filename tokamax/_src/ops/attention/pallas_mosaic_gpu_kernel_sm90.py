@@ -428,7 +428,7 @@ def flash_attention_kernel(
           si = lax.rem(qj * (head_dim_out // epi_tile_d) + dj, num_epi_slots)
           epi_qs = slice(qj * epi_tile_q, (qj + 1) * epi_tile_q)
           epi_ds = slice(dj * epi_tile_d, (dj + 1) * epi_tile_d)
-          plgpu.wait_smem_to_gmem(1, wait_read_only=True)
+          plgpu.wait_smem_to_gmem(num_epi_slots - 1, wait_read_only=True)
           o_smem[si] = acc[epi_qs, epi_ds].astype(o_smem.dtype)
           plgpu.commit_smem()
           plgpu.copy_smem_to_gmem(o_smem.at[si], o_gmem_.at[epi_qs, epi_ds])
