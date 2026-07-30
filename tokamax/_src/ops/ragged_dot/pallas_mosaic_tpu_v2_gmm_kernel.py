@@ -837,6 +837,8 @@ def kernel_main(
     metadata_ref: MetadataRef,
     zero_ref: jax.Array | None,  # [tile_zero_m, num_lanes]
     semaphore_ref: jax.Array | None,  # [1]
+    lhs_group_sizes_smem_ref: jax.Array,
+    group_offset_smem_ref: jax.Array,
     *,
     cfgs: GmmConfigs,
 ):
@@ -866,6 +868,12 @@ def kernel_main(
     semaphore_ref: Semaphore for zero initialization DMAs.
     cfgs: GmmConfigs.
   """
+  # Copy metadata from HBM into fast SMEM so the TPU can evaluate tile offsets
+  # in multi-core mode.
+  pltpu.sync_copy(lhs_group_sizes_ref, lhs_group_sizes_smem_ref)
+  pltpu.sync_copy(group_offset_ref, group_offset_smem_ref)
+  lhs_group_sizes_ref = lhs_group_sizes_smem_ref
+  group_offset_ref = group_offset_smem_ref
 
   num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
   num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -906,12 +914,15 @@ def kernel_main(
         up=rhs_spec,
     )
 
-  # Execute the inner kernel.
+  # Partition output tiles across TCs in MegaCore mode over both parallel
+  # dimensions.
   pipeline_fn = pltpu.emit_pipeline(
       functools.partial(inner_kernel, cfgs=cfgs),
       grid=(num_n, num_gm, num_k),
       in_specs=(lhs_spec, rhs_spec),
       out_specs=out_spec,
+      core_axis_name="core",
+      dimension_semantics=(pltpu.PARALLEL, pltpu.PARALLEL, pltpu.ARBITRARY),
   )
 
   # Bounded slice requires second last dim to be aligned to the sublane size.
@@ -1371,21 +1382,16 @@ def gmm_v2(
   tiles = cfgs.tiles
 
   # Prepare block specs.
-  lhs_scale_spec = None
   if cfgs.lhs_cfgs.has_scale:
     assert lhs_scale is not None
     lhs_scale = lhs_scale.astype(jnp.float32)
-    lhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
   else:
     lhs_scale = None
 
-  rhs_scale_spec = rhs_bias_spec = None
   if rhs_scale is not None:
     rhs_scale = rhs_scale.astype(jnp.float32)
-    rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
   if rhs_bias is not None:
     rhs_bias = rhs_bias.astype(jnp.float32)
-    rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
 
   # Initialize scratch shapes.
   max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
@@ -1433,25 +1439,17 @@ def gmm_v2(
   lhs_in = LhsRef(value=lhs, scale=lhs_scale)
   rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
-  return pl.pallas_call(
+  scratch_shapes += [
+      pltpu.SMEM(group_sizes.shape, group_sizes.dtype),
+      pltpu.SMEM(group_offset.shape, group_offset.dtype),
+  ]
+
+  # Configure per-core execution over TensorCore mesh for MegaCore scaling.
+  return pl.kernel(
       functools.partial(kernel_main, cfgs=cfgs),
-      out_shape=out_init,
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=2,
-          in_specs=[
-              LhsRef(
-                  value=pl.BlockSpec(memory_space=pltpu.HBM),
-                  scale=lhs_scale_spec,
-              ),
-              WeightsRef(
-                  weight=pl.BlockSpec(memory_space=pltpu.HBM),
-                  scale=rhs_scale_spec,
-                  bias=rhs_bias_spec,
-              ),
-          ],
-          out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-          scratch_shapes=scratch_shapes,
-      ),
+      out_type=out_init,
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      scratch_types=scratch_shapes,
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=vmem_limit_bytes,
           disable_bounds_checks=True,

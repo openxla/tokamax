@@ -1,14 +1,6 @@
 name: CI-experimental
 
 on:
-  # Trigger the workflow on push or pull request,
-  # but only for the main branch
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
   # Event manually triggered (in the Github UI)
   workflow_dispatch:
 

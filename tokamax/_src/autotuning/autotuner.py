@@ -97,9 +97,9 @@ def _compile(fn_factory, config, args, kwargs, *, seed=None):
   return benchmarking.compile_benchmark(fn, x), x  # pyrefly: ignore[bad-argument-type]
 
 
-def _benchmark(fn_factory, config, args, kwargs, event_filter_regex=None):
+def _benchmark(fn_factory, config, args, kwargs):
   runner, x = _compile(fn_factory, config, args, kwargs, seed=0)
-  return runner(x, event_filter_regex=event_filter_regex)
+  return runner(x)
 
 
 class _SyncExecutor(futures.Executor):
@@ -129,13 +129,13 @@ class Autotuner:
       fn_factory: Callable[[C], Callable[P, Any]],
       configs: set[C],
       *args: P.args,
-      event_filter_regex: str | None = None,  # pyrefly: ignore[bad-function-definition]
+      timeout: float | None = None,  # pyrefly: ignore[bad-function-definition]
       **kwargs: P.kwargs,
   ) -> AutotuningData[C]:
     """Autotunes over configs for the given arguments."""
     executor = self.executor_fn()
     executor_args = {}
-    timeout = self.timeout_seconds
+    timeout = self.timeout_seconds if timeout is None else timeout
     vlog_exc_info = functools.partial(logging.vlog, 2, exc_info=True)
 
     results = {}
@@ -160,12 +160,7 @@ class Autotuner:
               compiled_fn, args = future.result()
               if initialized_args is None:
                 initialized_args = numerics.random_initialize(args)
-              executor_args[config] = (
-                  functools.partial(
-                      compiled_fn, event_filter_regex=event_filter_regex
-                  ),
-                  initialized_args,
-              )
+              executor_args[config] = (compiled_fn, initialized_args)
             except Exception as e:  # pylint: disable=broad-exception-caught
               vlog_exc_info("Config failed to compile: %s", config)
               results[config] = e
@@ -178,14 +173,7 @@ class Autotuner:
             results[config] = e
     else:
       for config in configs:
-        executor_args[config] = (
-            _benchmark,
-            fn_factory,
-            config,
-            args,
-            kwargs,
-            event_filter_regex,
-        )
+        executor_args[config] = (_benchmark, fn_factory, config, args, kwargs)
 
     with executor:
       future_to_config = {

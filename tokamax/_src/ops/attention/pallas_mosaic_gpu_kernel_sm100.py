@@ -618,10 +618,9 @@ def flash_attention_kernel(
             mask &= _load_bcast(mask_gmem, (hi, qs, ks), layout=_TMEM)
           else:
             plgpu.barrier_wait(mask_barrier)
-            idx = (slice(None), slice(0, mask_block_kv))
             layout = _TMEM(32 // _MASK_PACKED_BITS)
             mask_ = plgpu.load(
-                mask_smem.at[idx], layout=layout, optimized=False
+                mask_smem.at[:, :mask_block_kv], layout=layout, optimized=False
             )
             plgpu.barrier_arrive(mask_consumed_barrier)
             mask &= common.unpack_bool_bits_tmem_native(mask_)
@@ -681,7 +680,7 @@ def flash_attention_kernel(
 
           @pl.when(ki > lb)
           def write_alpha_to_smem():
-            alpha_smem.at[si][...] = alpha
+            alpha_smem[si] = alpha
             mgpu_lib.bar_arrive(si + _ALPHA_BARRIER_OFFSET, num_threads=256)
 
           needs_rescale = (

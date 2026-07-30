@@ -25,6 +25,7 @@ from tokamax._src import test_utils
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
 
+import pytest
 
 jax.config.parse_flags_with_absl()
 
@@ -242,7 +243,9 @@ class GmmTest(parameterized.TestCase):
     if jax.default_backend() != "tpu":
       self.skipTest("Only supported on TPUs.")
     super().setUp()
+    
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 512],
       in_size=[512, 1024],
@@ -285,6 +288,7 @@ class GmmTest(parameterized.TestCase):
 
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 1024],
       in_size=[512, 1024],
@@ -330,6 +334,7 @@ class GmmTest(parameterized.TestCase):
     # print(f"Output mean diff: {jnp.mean(jnp.abs(expected - actual))}")
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 256],
       in_size=[255, 500],
@@ -375,6 +380,7 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[256, 1024],
       in_size=[1024],
@@ -507,6 +513,7 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 512],
       in_size=[256, 512],
@@ -556,6 +563,7 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
+  @pytest.mark.long
   def test_tgmm_with_rhs_scale_n_padding(self):
     # Test the case where there is implicit padding in the dim size_n (out_size)
     # Pins tile_n=128 with out_size=300 so the kernel runs 3 n-tiles over an
@@ -596,6 +604,7 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_groups, in_size, out_size))
     chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512, 1024],

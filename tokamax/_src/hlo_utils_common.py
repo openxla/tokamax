@@ -16,16 +16,17 @@
 """Common utilities for HLO utils."""
 
 import dataclasses
-from typing import Final, cast
+from typing import Callable, Final, Iterable, cast
 import jax
 from jaxlib.mlir import ir
 
 TOKAMAX_NAME: Final[str] = 'tokamax'
 
-PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
 MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
 MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
-TRITON_KEY: Final[str] = 'triton_kernel_call'
+# These names are exposed in Triton Pallas and jax_triton, but we don't want
+# dependencies on these here. So the equivalence is tested against.
+PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
 TRITON_FFI_KEY: Final[str] = 'triton_kernel_call_ffi'
 
 
@@ -56,6 +57,8 @@ class KernelInfoBase:
   source_file: str
   source_line: int
   hlo_module_name: str
+  # TODO: Remove `None` once the migration is complete.
+  metadata_payload: str | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -111,3 +114,30 @@ def ir_module_from_lowered(
   """Returns an `ir.Module` from a lowered JAX function."""
   assert (module := lowered.compiler_ir('stablehlo')) is not None
   return cast(ir.Module, module)
+
+
+@dataclasses.dataclass(frozen=True)
+class Record:
+  emit_fn: Callable[[], KernelInfoBase]
+  is_noise: bool
+  payload: str | None
+
+
+def dedupe_wrapper_kernels(
+    records: Iterable[Record],
+) -> tuple[KernelInfoBase, ...]:
+  """Deduplicates wrapper operations based on their metadata payload.
+
+  Always returns non-noise ops. For noise ops, they are only returned if they
+  carry a unique payload that isn't already covered by a non-noise op and
+  hasn't been seen previously.
+  """
+  payloads = {r.payload for r in records if not r.is_noise and r.payload}
+  infos = []
+  for r in records:
+    if r.is_noise:
+      if not r.payload or r.payload in payloads:
+        continue
+      payloads.add(r.payload)
+    infos.append(r.emit_fn())
+  return tuple(infos)
