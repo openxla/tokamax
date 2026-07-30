@@ -98,9 +98,9 @@ def _get_dq_scratch_shapes(
           num_barriers=num_stages, orders_tensor_core=True
       ),
       s_produced=plgpu.Barrier(orders_tensor_core=True),
-      s_consumed=plgpu.Barrier(),
+      s_consumed=plgpu.Barrier(orders_tensor_core=True),
       dp_produced=plgpu.Barrier(orders_tensor_core=True),
-      ds_produced=plgpu.Barrier(),
+      ds_produced=plgpu.Barrier(orders_tensor_core=True),
       dq_mma_finished=plgpu.Barrier(orders_tensor_core=True),
   )
 
@@ -579,7 +579,7 @@ def _kernel_dq(
 
       plgpu.barrier_wait(s_produced)
       s = plgpu.async_load_tmem(s_tmem, layout=layout)
-      plgpu.wait_load_tmem()
+      mgpu_lib.tcgen05_wait_ld()
       plgpu.barrier_arrive(s_consumed)
       scale = logits_scale
 
@@ -668,7 +668,7 @@ def _kernel_dq(
         plgpu.copy_smem_to_gmem(ds_smem, ds_gmem.at[hi, qs, ks])
 
       plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
-      plgpu.commit_tmem()
+      mgpu_lib.tcgen05_wait_st()
       plgpu.barrier_arrive(ds_produced)
 
     if ds_gmem is not None:
