@@ -22,8 +22,8 @@ from absl.testing import parameterized
 import chex
 import jax
 from jax.experimental import pallas as pl
+from jax.experimental import xla_metadata
 from jax.experimental.pallas import triton as plgpu
-from jax.experimental.xla_metadata import set_xla_metadata
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
@@ -386,12 +386,13 @@ class HloUtilsHelpersTest(parameterized.TestCase):
   def test_get_common_kernel_info_with_frontend_attributes(self):
     @jax.jit
     def my_func(x):
-      with set_xla_metadata(xla_metadata_payload='tokamax:my_mlir_payload'):
+      with xla_metadata.set_xla_metadata(
+          xla_metadata_payload='tokamax:my_mlir_payload'
+      ):
         return x + 1
 
     lowered = my_func.lower(jnp.array(1))
     mlir_module = lowered.compiler_ir()
-    print('MLIR_OUTPUT_START\n', mlir_module, '\nMLIR_OUTPUT_END')
 
     op = self._get_first_stablehlo_op(mlir_module, 'stablehlo.add')
     self.assertIsNotNone(op)
@@ -416,7 +417,9 @@ class HloUtilsHelpersTest(parameterized.TestCase):
   def test_get_kernel_info_stablehlo_full_path(self):
     @jax.jit
     def my_func(x):
-      with set_xla_metadata(xla_metadata_payload='tokamax:my_mlir_payload'):
+      with xla_metadata.set_xla_metadata(
+          xla_metadata_payload='tokamax:my_mlir_payload'
+      ):
         return x + 1
 
     lowered = my_func.lower(jnp.array(1))
@@ -443,11 +446,14 @@ class HloUtilsHelpersTest(parameterized.TestCase):
       ('add', False),
       ('reshape', True),
   )
-  def test_get_kernel_info_stablehlo_payload_propagation(self, op_type, is_noise):
+  def test_get_kernel_info_stablehlo_payload_propagation(
+      self, op_type, is_noise
+  ):
     @jax.jit
     def my_func(x):
-      from jax._src.xla_metadata import set_xla_metadata
-      with set_xla_metadata(xla_metadata_payload='tokamax:my_mlir_payload'):
+      with xla_metadata.set_xla_metadata(
+          xla_metadata_payload='tokamax:my_mlir_payload'
+      ):
         if op_type == 'add':
           return x + 1
         else:
@@ -468,9 +474,9 @@ class HloUtilsHelpersTest(parameterized.TestCase):
 
     self.assertTrue(
         found_payload,
-        f'MLIR walker dropped payload for op_type={op_type} (is_noise={is_noise})',
+        f'MLIR walker dropped payload for op_type={op_type}'
+        f' (is_noise={is_noise})',
     )
-
 
   def test_dedupe_wrapper_kernels(self):
     def mock_info(name):
