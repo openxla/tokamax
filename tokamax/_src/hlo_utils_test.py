@@ -21,6 +21,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
+from jax import export
 from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import triton as plgpu
@@ -153,6 +154,24 @@ class DumpHloLibTest(parameterized.TestCase):
     shape = jax.ShapeDtypeStruct(shape=(8,), dtype=dtype)
     self.assertEqual(kernel_1.inputs, (shape, shape))
     self.assertEqual(kernel_2.inputs, (shape,))
+
+    # Note that Pallas Triton kernels are considered unstable for the purposes
+    # of JAX StableHLO export. Test that DISABLE_JAX_EXPORT_CHECKS works as
+    # expected.
+    with self.subTest('serialization'):
+      shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+      with self.assertRaises(ValueError):
+        export.export(add_vectors_pallas_triton)(shape, shape)
+
+      exported_fn = export.export(
+          add_vectors_pallas_triton,
+          disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
+      )(shape, shape)
+      serialized = exported_fn.serialize()
+      f_roundtrip = export.deserialize(serialized)
+      out_roundtrip = jax.jit(f_roundtrip.call)(x, x)
+      out = add_vectors_pallas_triton(x, x)
+      chex.assert_trees_all_equal(out, out_roundtrip)
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_pallas_norm(self, representation):
