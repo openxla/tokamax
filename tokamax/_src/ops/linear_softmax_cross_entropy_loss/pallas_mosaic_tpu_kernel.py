@@ -405,20 +405,13 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
   num_h_blocks = math.ceil(h_dim / h_block_size)
   num_v_blocks = math.ceil(v_dim / v_block_size)
 
-  if reduction in ("sum", "mean"):
-    out_type = [
-        jax.ShapeDtypeStruct(shape=(1,), dtype=jnp.float32),  # Loss
-        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
-    ]
-    loss_out_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
-  else:
-    out_type = [
-        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # Loss
-        jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
-    ]
-    loss_out_spec = pl.BlockSpec(
-        (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
-    )
+  out_type = [
+      jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # Loss
+      jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
+  ]
+  loss_out_spec = pl.BlockSpec(
+      (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
+  )
 
   @pl.kernel(
       out_type=out_type,
@@ -427,7 +420,6 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
           pltpu.VMEM(
               (b_block_size, v_block_size), dtype=jnp.float32
           ),  # xw_tiled
-          pltpu.SMEM((1,), dtype=jnp.float32),  # b_block_loss
       ),
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=_get_vmem_limit_bytes(),
@@ -435,7 +427,6 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       ),
       name=(
           f"lce_fwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}"
-          f"_reduction_{reduction}"
       ),
   )
   def fwd_kernel(
@@ -445,7 +436,6 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       loss_hbm_ref,
       lse_hbm_ref,
       xw_tiled_ref,
-      b_block_loss_ref,
   ):
     def fwd_pipeline(
         x_ref,
@@ -454,7 +444,6 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         loss_ref,
         lse_ref,
         xw_tiled,
-        b_block_loss_ref,
     ):
       b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
       unused_num_b_blocks, num_v_blocks, num_h_blocks = (
@@ -475,20 +464,10 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
           preferred_element_type=preferred_element_type,
       )
 
-      @pl.when(
-          reduce(jnp.logical_and, (b_index == 0, v_index == 0, h_index == 0))
-      )
-      def init_loss():
-        if reduction in ("sum", "mean"):
-          loss_ref[0] = 0.0
-
       @pl.when(jnp.logical_and(v_index == 0, h_index == 0))
       def init_lse():
         lse_ref[...] = jnp.full_like(lse_ref, -jnp.inf)
-        if reduction == "none":
-          loss_ref[...] = jnp.zeros_like(loss_ref)
-        else:
-          b_block_loss_ref[0] = 0.0
+        loss_ref[...] = jnp.zeros_like(loss_ref)
 
       @pl.when(h_index == num_h_blocks - 1)
       def accumulate_loss():
@@ -499,10 +478,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         labels_one_hot = jax.nn.one_hot(
             labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
         )
-        if reduction == "none":
-          loss_ref[...] -= jnp.sum(labels_one_hot * xw_tiled[...], axis=-1)
-        else:
-          b_block_loss_ref[0] -= jnp.sum(labels_one_hot * xw_tiled[...])
+        loss_ref[...] -= jnp.sum(labels_one_hot * xw_tiled[...], axis=-1)
         lse_block = jax.nn.logsumexp(xw_tiled[...], axis=-1)
         lse_ref[...] = jnp.logaddexp(lse_ref[...], lse_block)
 
@@ -512,20 +488,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
           )
       )
       def perform_loss_reduction():
-        if reduction == "mean":
-          b_block_loss_ref[0] += jnp.sum(lse_ref[...])
-          # For mean reduction, use online averaging algorithm
-          loss_ref[0] = (
-              loss_ref[0] * b_index / (b_index + 1)
-              + b_block_loss_ref[0] / (b_index + 1) / b_block_size
-          )
-        elif reduction == "sum":
-          b_block_loss_ref[0] += jnp.sum(lse_ref[...])
-          # Sum reduction
-          loss_ref[0] += b_block_loss_ref[0]
-        else:
-          # For reduction == "none", compute per-element loss
-          loss_ref[...] += lse_ref[...]
+        loss_ref[...] += lse_ref[...]
 
     pltpu.emit_pipeline(
         fwd_pipeline,
@@ -566,12 +529,14 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         w_hbm_ref,
         loss_hbm_ref,
         lse_hbm_ref,
-        scratches=(xw_tiled_ref, b_block_loss_ref),
+        scratches=(xw_tiled_ref,),
     )
 
   loss, lse = fwd_kernel(x, labels, w)  # pylint: disable=unpacking-non-sequence
-  if reduction in ("sum", "mean"):
-    return loss[0], lse
+  if reduction == "sum":
+    return jnp.sum(loss), lse
+  elif reduction == "mean":
+    return jnp.mean(loss), lse
   else:
     return loss, lse
 
@@ -667,7 +632,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     w,
     lse,
     *,
-    reduction: Literal["sum", "mean", "none"],
     preferred_element_type: jnp.dtype,
     b_block_size: int,
     h_block_size: int,
@@ -676,13 +640,11 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   """Pallas kernel for the backward pass of Linear Softmax Cross-Entropy Loss.
 
   Args:
-    dout: Gradient of the loss (1,) or (b_dim,) depending on reduction.
+    dout: Gradient of the loss (b_dim,).
     x: Input activations `x` (b_dim, h_dim).
     labels: One-hot encoded labels (b_dim, v_dim).
     w: LM Head projection weights `w` (h_dim, v_dim).
     lse: Log-sum-exp accumulator per batch item (b_dim,).
-    reduction: The reduction method ("sum", "mean" or "none") for the gradient
-      accumulation.
     preferred_element_type: Preferred element type for computation.
     b_block_size: Block size for batch dimension.
     h_block_size: Block size for hidden dimension.
@@ -698,12 +660,9 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   num_v_blocks = math.ceil(v_dim / v_block_size)
   num_stages = 2
 
-  if reduction in ("sum", "mean"):
-    dout_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
-  else:
-    dout_spec = pl.BlockSpec(
-        (b_block_size,), lambda i, j, s, k: (i,), memory_space=pltpu.VMEM
-    )
+  dout_spec = pl.BlockSpec(
+      (b_block_size,), lambda i, j, s, k: (i,), memory_space=pltpu.VMEM
+  )
 
   @pl.kernel(
       out_type=[
@@ -732,7 +691,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       ),
       name=(
           f"lce_bwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}"
-          f"_reduction_{reduction}"
       ),
   )
   def bwd_kernel(
@@ -833,44 +791,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             pl.ds(0, cur_h_block_8_aligned_size), pl.ds(0, cur_v_block_size)
         ]
 
-        def perform_x_grad_tile_scaling():
-          # Perform scaling to dout and b_dim (for mean reduction).
-          # Scaling happens on the last accumulation on V for
-          # numerical stability
-          @pl.when(
-              reduce(
-                  jnp.logical_and,
-                  (stage_index == 1, v_index == num_v_blocks - 1),
-              )
-          )
-          def _():
-            if reduction in ("sum", "mean"):
-              scale = (
-                  dout_ref[0] / (num_b_blocks * b_block_size)
-                  if reduction == "mean"
-                  else dout_ref[0]
-              )
-              x_grad_tile_ref[...] *= scale
-
-        def perform_w_grad_tile_scaling():
-          # Perform scaling to dout and b_dim (for mean reduction).
-          # Scaling happens on the last accumulation on B for
-          # numerical stability
-          @pl.when(
-              reduce(
-                  jnp.logical_and,
-                  (stage_index == 1, b_index == num_b_blocks - 1),
-              )
-          )
-          def _():
-            if reduction in ("sum", "mean"):
-              scale = (
-                  dout_ref[0] / (num_b_blocks * b_block_size)
-                  if reduction == "mean"
-                  else dout_ref[0]
-              )
-              w_grad_tile_ref[...] *= scale
-
         # Async copy ops defined here. Only starts after calling .start().
         x_write_future = pltpu.make_async_copy(
             x_grad_tile_slice, x_grad_slice, sem=x_write_sem
@@ -907,8 +827,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           xw_scratch_ref[...] = -labels_one_hot + jnp.exp(
               xw_scratch_ref[...] - lse_ref[...][:, None]
           )
-          if reduction == "none":
-            xw_scratch_ref[...] *= dout_ref[...][:, None]
+          xw_scratch_ref[...] *= dout_ref[...][:, None]
 
         # Init W gradient
         @pl.when(b_index == 0)
@@ -916,7 +835,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           w_grad_tile_ref[...] = jax.lax.dot_general(
               x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
           )
-          perform_w_grad_tile_scaling()
           w_write_future.start()
 
         # Init X gradient
@@ -925,7 +843,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           x_grad_tile_ref[...] = jax.lax.dot_general(
               xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
           )
-          perform_x_grad_tile_scaling()
           x_write_future.start()
 
         # Accumulate W grad on B dimension
@@ -936,7 +853,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           )
           w_read_future.wait()
           w_grad_tile_ref[...] += res
-          perform_w_grad_tile_scaling()
           w_write_future.start()
 
         # Accumulate X grad on V dimension
@@ -947,7 +863,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           )
           x_read_future.wait()
           x_grad_tile_ref[...] += res
-          perform_x_grad_tile_scaling()
           x_write_future.start()
 
         # Lastly make sure to wait x_grad, w_grad write before next iteration
@@ -1078,11 +993,16 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
   if w.dtype == jnp.float16:
     w = w.astype(preferred_element_type)
 
-  # Prepare dout array and BlockSpec
-  if reduction in ("sum", "mean"):
-    dout_array = jnp.zeros(1).at[0].set(dout)
+  # Prepare dout array of shape (B,) for all reduction modes.
+  b_dim = x.shape[0]
+  if reduction == "sum":
+    dout_scalar = jnp.squeeze(jnp.asarray(dout, dtype=preferred_element_type))
+    dout_array = jnp.broadcast_to(dout_scalar, (b_dim,))
+  elif reduction == "mean":
+    dout_scalar = jnp.squeeze(jnp.asarray(dout, dtype=preferred_element_type))
+    dout_array = jnp.broadcast_to(dout_scalar / b_dim, (b_dim,))
   else:
-    dout_array = dout
+    dout_array = jnp.asarray(dout, dtype=preferred_element_type)
 
   # Constrain the memory spaces for x and w to prevent OOB accesses that occur
   # when the memory spaces is placed in VMEM.
@@ -1097,7 +1017,6 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
       labels,
       w,
       lse,
-      reduction=reduction,
       preferred_element_type=preferred_element_type,
       b_block_size=b_block_size,
       h_block_size=h_block_size,
