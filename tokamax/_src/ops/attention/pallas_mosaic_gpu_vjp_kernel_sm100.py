@@ -133,10 +133,8 @@ def _get_dkv_scratch_shapes(
   shapes = dict(
       k_smem=_tiled_smem((block_kv, head_dim), k_dtype),
       v_smem=_tiled_smem((block_kv, head_dim_out), v_dtype),
-      q_smem=_tiled_smem((num_stages, block_q, head_dim), q_dtype, swizzle=64),
-      do_smem=_tiled_smem(
-          (num_stages, block_q, head_dim_out), dout_dtype, swizzle=64
-      ),
+      q_smem=_tiled_smem((num_stages, block_q, head_dim), q_dtype),
+      do_smem=_tiled_smem((num_stages, block_q, head_dim_out), dout_dtype),
       s_p_tmems=plgpu.RefUnion(
           plgpu.TMEM((block_kv, block_q), jnp.float32),
           plgpu.TMEM((block_kv, block_q), dout_dtype, packed=True),
