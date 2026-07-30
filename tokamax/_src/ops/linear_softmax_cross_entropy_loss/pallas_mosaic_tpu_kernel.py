@@ -94,6 +94,9 @@ def _calculate_bwd_vmem_bytes(
       # lse (log-sum-exp) buffer tile (B,) in float32 (double buffered for
       # pallas_call input)
       + 2 * b_block_size * 4
+      # dout (loss gradient) tile (B,) in float32 (double buffered for
+      # pallas_call input)
+      + 2 * b_block_size * 4
       # logits/softmax tile (B, V) in float32 accumulator:
       # We account for 3 simultaneous (B, V) float32 buffers (3 * 4 = 12
       # bytes/elem):
@@ -166,8 +169,11 @@ def _get_heuristic_config(
   # 3. Choose v_block_size: as large as possible to fit VMEM.
   # Must be >= 128, multiple of 128. Divisible by v_dim if possible.
   if is_bwd:
+    # fixed_bytes accounts for VMEM costs that do not scale with V:
+    #   - x tile + x_grad_tile = b_block_size * h_block_size * (2 * dtype_bytes + 4)
+    #   - labels (8 bytes) + lse (8 bytes) + dout (8 bytes) = 24 * b_block_size
     fixed_bytes = (
-        b_block_size * h_block_size * (2 * dtype_bytes + 4) + 16 * b_block_size
+        b_block_size * h_block_size * (2 * dtype_bytes + 4) + 24 * b_block_size
     )
     # per_v_bytes accounts for all VMEM costs per column of V:
     #   - w tile (double-buffered in dtype) + w_grad_tile (float32) =
@@ -445,7 +451,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         lse_ref,
         xw_tiled,
     ):
-      b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
+      unused_b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
       unused_num_b_blocks, num_v_blocks, num_h_blocks = (
           pl.num_programs(i) for i in range(3)
       )
@@ -516,10 +522,9 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
                 (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
             ),  # lse
         ],
-        # TODO: enable parallel core_axis_name for the kernel.
-        # core_axis_name="core",
+        core_axis_name="core",
         dimension_semantics=(
-            pltpu.ARBITRARY,
+            pltpu.PARALLEL,
             pltpu.ARBITRARY,
             pltpu.ARBITRARY,
         ),
@@ -660,14 +665,18 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   num_v_blocks = math.ceil(v_dim / v_block_size)
   num_stages = 2
 
-  dout_spec = pl.BlockSpec(
-      (b_block_size,), lambda i, j, s, k: (i,), memory_space=pltpu.VMEM
-  )
+  max_cores = pltpu.get_tpu_info().num_cores
+  num_cores = math.gcd(num_b_blocks, max_cores)
+  if num_cores == 0:
+    num_cores = 1
+  num_b_blocks_per_core = num_b_blocks // num_cores
 
   @pl.kernel(
       out_type=[
           jax.ShapeDtypeStruct(x.shape, dtype=jnp.float32),  # x_grad
-          jax.ShapeDtypeStruct(w.shape, dtype=jnp.float32),  # w_grad
+          jax.ShapeDtypeStruct(
+              (num_cores, w.shape[0], w.shape[1]), dtype=jnp.float32
+          ),  # w_grad
       ],
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
       scratch_types=(
@@ -691,6 +700,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       ),
       name=(
           f"lce_bwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}"
+          f"_cores_{num_cores}"
       ),
   )
   def bwd_kernel(
@@ -709,6 +719,8 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       x_write_sem,
       w_write_sem,
   ):
+    c_index = jax.lax.axis_index("core")
+
     def bwd_pipeline(
         dout_ref,
         x_ref,
@@ -728,6 +740,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       b_index, v_index, stage_index, h_index = (
           pl.program_id(i) for i in range(4)
       )
+      global_b_index = c_index * num_b_blocks_per_core + b_index
 
       # Calculate and accumulate xw_scratch_ref += x_ref @ w_ref as first stage
       @pl.when(stage_index == 0)
@@ -776,10 +789,11 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
         # Slicing x_grad and x_grad HBM ref to prepare for tiled read / write
         x_grad_slice = x_grad_hbm_ref.at[
-            pl.ds(b_index * b_block_size, b_block_size),
+            pl.ds(global_b_index * b_block_size, b_block_size),
             pl.ds(h_index * h_block_size, cur_h_block_128_aligned_size),
         ]
         w_grad_slice = w_grad_hbm_ref.at[
+            c_index,
             pl.ds(h_index * h_block_size, cur_h_block_8_aligned_size),
             pl.ds(v_index * v_block_size, cur_v_block_size),
         ]
@@ -871,17 +885,26 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
     pltpu.emit_pipeline(
         bwd_pipeline,
-        grid=(num_b_blocks, num_v_blocks, num_stages, num_h_blocks),
+        grid=(
+            num_b_blocks_per_core,
+            num_v_blocks,
+            num_stages,
+            num_h_blocks,
+        ),
         in_specs=[
-            dout_spec,
+            pl.BlockSpec(  # dout
+                (b_block_size,),
+                lambda i, j, s, k: (c_index * num_b_blocks_per_core + i,),
+                memory_space=pltpu.VMEM,
+            ),
             pl.BlockSpec(  # x
                 (b_block_size, h_block_size),
-                lambda i, j, s, k: (i, k),
+                lambda i, j, s, k: (c_index * num_b_blocks_per_core + i, k),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # labels
                 (b_block_size,),
-                lambda i, j, s, k: (i,),
+                lambda i, j, s, k: (c_index * num_b_blocks_per_core + i,),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # w
@@ -891,7 +914,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             ),
             pl.BlockSpec(  # lse
                 (b_block_size,),
-                lambda i, j, s, k: (i,),
+                lambda i, j, s, k: (c_index * num_b_blocks_per_core + i,),
                 memory_space=pltpu.VMEM,
             ),
         ],
@@ -899,14 +922,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             pl.BlockSpec(memory_space=pltpu.HBM),  # x_grad
             pl.BlockSpec(memory_space=pltpu.HBM),  # w_grad
         ],
-        # TODO: enable parallel core_axis_name for the kernel.
-        # core_axis_name="core",
-        dimension_semantics=(
-            pltpu.ARBITRARY,
-            pltpu.ARBITRARY,
-            pltpu.ARBITRARY,
-            pltpu.ARBITRARY,
-        ),
     )(
         dout_hbm_ref,
         x_hbm_ref,
@@ -926,7 +941,9 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         ),
     )
 
-  return bwd_kernel(dout, x, labels, w, lse)
+  x_grad, w_grad_blocks = bwd_kernel(dout, x, labels, w, lse)
+  w_grad = jnp.sum(w_grad_blocks, axis=0)
+  return x_grad, w_grad
 
 
 @partial(
