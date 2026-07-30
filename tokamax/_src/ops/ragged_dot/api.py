@@ -26,7 +26,7 @@ from tokamax._src.ops.ragged_dot import base
 
 
 QArray = qwix.QArray
-type Implementation = Literal["mosaic", "triton", "xla"]
+type Implementation = Literal["mosaic", "mosaic_tpu_v2", "triton", "xla"]
 
 _IMPLEMENTATIONS = dict(xla=base.RaggedDot())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
@@ -51,6 +51,17 @@ try:
   from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
   _IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+  if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
+    _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  _IMPLEMENTATIONS["mosaic_tpu_v2"] = (
+      pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+  )
   if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
     _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
