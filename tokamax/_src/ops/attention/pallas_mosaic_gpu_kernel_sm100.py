@@ -558,7 +558,7 @@ def flash_attention_kernel(
               with jax.named_scope("issuing P@V"):
                 plgpu.tcgen05_mma(
                     acc_tmem.at[:, ds],
-                    p_tmem.at[:, pl.ds(slot * block_kv, block_kv)],
+                    p_tmem.at[slot],
                     v_smem.at[si, split_idx],
                     v_consumed_barrier.at[si, split_idx],
                     accumulate=(ki != lb),
@@ -693,8 +693,7 @@ def flash_attention_kernel(
           l_i = jnp.where(needs_rescale, l_i * alpha, l_i) + p.sum(axis=1)
 
           with jax.named_scope("write qk_tmem"):
-            ks = pl.ds(si * block_kv, block_kv)
-            plgpu.async_store_tmem(p_tmem.at[:, ks], p.astype(p_tmem.dtype))
+            plgpu.async_store_tmem(p_tmem.at[si], p.astype(p_tmem.dtype))
             mgpu_lib.tcgen05_wait_st()
             mgpu_lib.tcgen05_fence_before_thread_sync()
             if collective:  # Not all threads arrive on the barrier.
@@ -927,7 +926,7 @@ def flash_attention_kernel(
       alpha_smem=plgpu.SMEM((softmax_slots, block_q), jnp.float32),
       li_smem=li_scratch,
       qk_acc_tmem=tmem((block_q, block_kv)),
-      p_tmem=tmem((block_q, block_kv * softmax_slots), v.dtype, packed=True),
+      p_tmem=tmem((softmax_slots, block_q, block_kv), v.dtype, packed=True),
       acc_tmem=tmem((block_q, head_dim_out)),
       bias_smem=bias_scratch,
       q_barrier=plgpu.Barrier(),
