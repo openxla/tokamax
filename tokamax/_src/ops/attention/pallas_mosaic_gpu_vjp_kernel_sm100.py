@@ -406,10 +406,13 @@ def _kernel_dq(
     def per_warp():
       warp_id = lax.axis_index("warp")
 
+      def cp(gmem, smem, barrier, si=()):
+        plgpu.copy_gmem_to_smem(gmem, smem.at[si], barrier.at[si])
+
       @pl.when(warp_id == 0)
       def tma_q_warp():
-        plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_do_produced)
-        plgpu.copy_gmem_to_smem(dout_gmem.at[qs, hi], do_smem, q_do_produced)
+        cp(q_gmem.at[qs, hi], q_smem, q_do_produced)
+        cp(dout_gmem.at[qs, hi], do_smem, q_do_produced)
 
       @pl.when(warp_id == 1)
       def tma_kv_warp():
@@ -417,25 +420,17 @@ def _kernel_dq(
         def prologue(ki):
           si = lax.rem(ki - lb, num_stages)
           ks = pl.ds(ki * block_kv, block_kv)
-          plgpu.copy_gmem_to_smem(
-              v_gmem.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
-          )
-          plgpu.copy_gmem_to_smem(
-              k_gmem.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
-          )
+          cp(v_gmem.at[ks, hi_kv], v_smem, kv_produced, si)
+          cp(k_gmem.at[ks, hi_kv], k_smem, kv_produced, si)
 
         @pl.loop(lb + num_stages, ub)
         def kv_loop(ki):
           si = lax.rem(ki - lb, num_stages)
           ks = pl.ds(ki * block_kv, block_kv)
           plgpu.barrier_wait(v_consumed.at[si])
-          plgpu.copy_gmem_to_smem(
-              v_gmem.at[ks, hi_kv], v_smem.at[si], barrier=kv_produced.at[si]
-          )
+          cp(v_gmem.at[ks, hi_kv], v_smem, kv_produced, si)
           plgpu.barrier_wait(k_consumed.at[si])
-          plgpu.copy_gmem_to_smem(
-              k_gmem.at[ks, hi_kv], k_smem.at[si], barrier=kv_produced.at[si]
-          )
+          cp(k_gmem.at[ks, hi_kv], k_smem, kv_produced, si)
 
       if bias_gmem is not None or mask_gmem is not None:
 
@@ -454,18 +449,14 @@ def _kernel_dq(
               plgpu.barrier_wait(bias_consumed)
               mgpu_lib.fence_async_shared_cta()
               bias_hi = 0 if bias_gmem.shape[-3] == 1 else hi
-              plgpu.copy_gmem_to_smem(
-                  bias_gmem.at[bias_hi, qs, ks], bias_smem, bias_produced
-              )
+              cp(bias_gmem.at[bias_hi, qs, ks], bias_smem, bias_produced)
 
             if mask_smem is not None:
               plgpu.barrier_wait(mask_consumed)
               mgpu_lib.fence_async_shared_cta()
               mask_hi = 0 if mask_gmem.shape[-3] == 1 else hi
               mask_qs = 0 if mask_gmem.shape[-2] == 1 else qs
-              plgpu.copy_gmem_to_smem(
-                  mask_gmem.at[mask_hi, mask_qs, ks], mask_smem, mask_produced
-              )
+              cp(mask_gmem.at[mask_hi, mask_qs, ks], mask_smem, mask_produced)
 
       @pl.when(warp_id == 2)
       def mma_warp():
@@ -724,10 +715,13 @@ def _kernel_dkv(
     def per_warp():
       warp_id = lax.axis_index("warp")
 
+      def cp(gmem, smem, barrier, si=()):
+        plgpu.copy_gmem_to_smem(gmem, smem.at[si], barrier.at[si])
+
       @pl.when(warp_id == 0)
       def tma_kv_warp():
-        plgpu.copy_gmem_to_smem(k_gmem.at[ks, hi_kv], k_smem, kv_produced)
-        plgpu.copy_gmem_to_smem(v_gmem.at[ks, hi_kv], v_smem, kv_produced)
+        cp(k_gmem.at[ks, hi_kv], k_smem, kv_produced)
+        cp(v_gmem.at[ks, hi_kv], v_smem, kv_produced)
 
         @pl.loop(0, total_steps)
         def q_loop(step):
@@ -741,17 +735,9 @@ def _kernel_dkv(
             plgpu.barrier_wait(residual_consumed.at[si])
             mgpu_lib.fence_async_shared_cta()
 
-          plgpu.copy_gmem_to_smem(
-              m_gmem.at[hi, qs], m_smem.at[si], barrier=residual_produced.at[si]
-          )
-          plgpu.copy_gmem_to_smem(
-              l_gmem.at[hi, qs], l_smem.at[si], barrier=residual_produced.at[si]
-          )
-          plgpu.copy_gmem_to_smem(
-              delta_gmem.at[hi, qs],
-              delta_smem.at[si],
-              barrier=residual_produced.at[si],
-          )
+          cp(m_gmem.at[hi, qs], m_smem, residual_produced, si)
+          cp(l_gmem.at[hi, qs], l_smem, residual_produced, si)
+          cp(delta_gmem.at[hi, qs], delta_smem, residual_produced, si)
 
       @pl.when(warp_id == 1)
       def tma_q_warp():
@@ -764,13 +750,9 @@ def _kernel_dkv(
           do_wait = step >= num_stages
 
           pl.when(do_wait)(lambda: plgpu.barrier_wait(do_consumed.at[si]))
-          plgpu.copy_gmem_to_smem(
-              dout_gmem.at[qs, hi], do_smem.at[si], barrier=q_do_produced.at[si]
-          )
+          cp(dout_gmem.at[qs, hi], do_smem, q_do_produced, si)
           pl.when(do_wait)(lambda: plgpu.barrier_wait(q_consumed.at[si]))
-          plgpu.copy_gmem_to_smem(
-              q_gmem.at[qs, hi], q_smem.at[si], barrier=q_do_produced.at[si]
-          )
+          cp(q_gmem.at[qs, hi], q_smem, q_do_produced, si)
 
       if bias_gmem is not None or mask_gmem is not None:
 
@@ -791,18 +773,14 @@ def _kernel_dkv(
               plgpu.barrier_wait(bias_consumed)
               mgpu_lib.fence_async_shared_cta()
               bias_hi = 0 if bias_gmem.shape[-3] == 1 else hi
-              plgpu.copy_gmem_to_smem(
-                  bias_gmem.at[bias_hi, ks, qs], bias_smem, bias_produced
-              )
+              cp(bias_gmem.at[bias_hi, ks, qs], bias_smem, bias_produced)
 
             if mask_smem is not None:
               plgpu.barrier_wait(mask_consumed)
               mgpu_lib.fence_async_shared_cta()
               mask_hi = 0 if mask_gmem.shape[-3] == 1 else hi
               mask_qs = 0 if mask_gmem.shape[-1] == 1 else qs
-              plgpu.copy_gmem_to_smem(
-                  mask_gmem.at[mask_hi, ks, mask_qs], mask_smem, mask_produced
-              )
+              cp(mask_gmem.at[mask_hi, ks, mask_qs], mask_smem, mask_produced)
 
       @pl.when(warp_id == 2)
       def mma_warp():

@@ -465,8 +465,8 @@ def flash_attention_kernel(
             0 if mask_gmem.shape[1] == 1 else qs,
         ]
 
-      def cp(gmem, smems, barrier, si):
-        plgpu.copy_gmem_to_smem(gmem, smems.at[si], barrier.at[si])
+      def cp(gmem, smem, barrier, si):
+        plgpu.copy_gmem_to_smem(gmem, smem.at[si], barrier.at[si])
 
       lb, ub, _, _ = get_kv_ranges()
 
