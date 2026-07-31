@@ -312,10 +312,10 @@ def flash_attention_vjp_kernel(
         v_smem,
         mask_smem,
         k_smem,
-        bias_consumed_barrier,
-        v_consumed_barrier,
-        mask_consumed_barrier,
-        k_consumed_barrier,
+        bias_consumed,
+        v_consumed,
+        mask_consumed,
+        k_consumed,
         carry,
     ):
       (i,) = index
@@ -335,10 +335,10 @@ def flash_attention_vjp_kernel(
         else:
           bias = bias_smem[pl.ds(wg * block_q, block_q)]
           mgpu_lib.fence_async_shared_cta()
-          plgpu.barrier_arrive(bias_consumed_barrier)
+          plgpu.barrier_arrive(bias_consumed)
 
         plgpu.wgmma_wait(1)
-        plgpu.barrier_arrive(v_consumed_barrier)
+        plgpu.barrier_arrive(v_consumed)
         return dp_acc[...], s_acc[...], bias
 
       acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
@@ -395,7 +395,7 @@ def flash_attention_vjp_kernel(
           else:
             mask = mask_smem[pl.ds(wg * block_q, block_q)]
           mgpu_lib.fence_async_shared_cta()
-          plgpu.barrier_arrive(mask_consumed_barrier)
+          plgpu.barrier_arrive(mask_consumed)
 
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0
@@ -421,7 +421,7 @@ def flash_attention_vjp_kernel(
 
       plgpu.wgmma(dq_acc, ds.astype(k_smem.dtype), k_smem)
       plgpu.wgmma_wait(0)
-      plgpu.barrier_arrive(k_consumed_barrier)
+      plgpu.barrier_arrive(k_consumed)
       return dq_acc, m, l_rcp, delta, k_start, k_end
 
     k_spec = _tiled_spec(
@@ -536,13 +536,13 @@ def flash_attention_vjp_kernel(
         mask_smem,
         dout_smem,
         q_smem,
-        bias_consumed_barrier,
-        m_consumed_barrier,
-        l_consumed_barrier,
-        delta_consumed_barrier,
-        mask_consumed_barrier,
-        dout_consumed_barrier,
-        q_consumed_barrier,
+        bias_consumed,
+        m_consumed,
+        l_consumed,
+        delta_consumed,
+        mask_consumed,
+        dout_consumed,
+        q_consumed,
         carry,
     ):
       i, j = index
@@ -562,14 +562,14 @@ def flash_attention_vjp_kernel(
         else:
           idx = pl.ds(wg * block_kv, block_kv)
           bias = plgpu.load(bias_smem.T.at[idx], layout=_WGMMA_TRANSPOSED)
-          plgpu.barrier_arrive(bias_consumed_barrier)
+          plgpu.barrier_arrive(bias_consumed)
 
         m = plgpu.load(m_smem, layout=_WGMMA_COL)
         l = plgpu.load(l_smem, layout=_WGMMA_COL)
         delta = plgpu.load(delta_smem, layout=_WGMMA_COL)
-        plgpu.barrier_arrive(m_consumed_barrier)
-        plgpu.barrier_arrive(l_consumed_barrier)
-        plgpu.barrier_arrive(delta_consumed_barrier)
+        plgpu.barrier_arrive(m_consumed)
+        plgpu.barrier_arrive(l_consumed)
+        plgpu.barrier_arrive(delta_consumed)
         return acc[...], bias, m, l, delta
 
       acc_type = plgpu.ACC((block_kv, block_q), jnp.float32)
@@ -629,7 +629,7 @@ def flash_attention_vjp_kernel(
             mask = lax.broadcast_in_dim(loop_invariant_mask, s.shape, [0])
         else:
           mask = mask_smem[pl.ds(wg * block_kv, block_kv)]
-          plgpu.barrier_arrive(mask_consumed_barrier)
+          plgpu.barrier_arrive(mask_consumed)
 
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0
@@ -650,9 +650,9 @@ def flash_attention_vjp_kernel(
 
       plgpu.wgmma(dk_acc, ds.astype(dtype), q_smem)
       plgpu.wgmma_wait(1)
-      plgpu.barrier_arrive(dout_consumed_barrier)
+      plgpu.barrier_arrive(dout_consumed)
       plgpu.wgmma_wait(0)
-      plgpu.barrier_arrive(q_consumed_barrier)
+      plgpu.barrier_arrive(q_consumed)
       return dk_acc, dv_acc, loop_invariant_mask
 
     def f(index_map):

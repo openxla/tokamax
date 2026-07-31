@@ -375,24 +375,24 @@ def flash_attention_kernel(
       mask_smem,
       alpha_smem,
       li_smem,
-      qk_acc_tmem,
+      s_tmem,
       p_tmem,
       acc_tmem,
       bias_smem,
-      q_barrier,
-      k_barrier,
-      v_barrier,
-      bias_barrier,
-      bias_consumed_barrier,
-      mask_barrier,
-      mask_consumed_barrier,
-      qk_mma_barrier,
-      k_consumed_barrier,
-      qk_consumed_barrier,
-      pv_mma_barrier,
-      v_consumed_barrier,
-      p_barrier,
-      acc_barrier,
+      q_produced,
+      k_produced,
+      k_consumed,
+      v_produced,
+      v_consumed,
+      bias_produced,
+      bias_consumed,
+      mask_produced,
+      mask_consumed,
+      s_produced,
+      s_consumed,
+      pv_mma_produced,
+      p_produced,
+      acc_produced,
   ):
     q_smem, o_smem = qo_smem_union
 
@@ -455,11 +455,9 @@ def flash_attention_kernel(
               leader_tracked=leader_tracked,
           )
 
-        def tma_load_kv_warp(
-            gmem, smem, barrier, consumed_barrier, partition_axis
-        ):
+        def tma_load_kv_warp(gmem, smem, produced, consumed, partition_axis):
           tma_load = functools.partial(
-              tma_load_kv, gmem, smem, barrier, partition_axis
+              tma_load_kv, gmem, smem, produced, partition_axis
           )
 
           @pl.loop(lb, lax.min(lb + num_stages, ub))
@@ -472,7 +470,7 @@ def flash_attention_kernel(
 
             @pl.loop(0, num_tma_splits)
             def tma_loop(split_idx):
-              plgpu.barrier_wait(consumed_barrier.at[si, split_idx])
+              plgpu.barrier_wait(consumed.at[si, split_idx])
               tma_load(ki, split_idx)
 
         @pl.when(warp_id == _TMA_LOAD_QK_WARP)
@@ -484,15 +482,15 @@ def flash_attention_kernel(
           plgpu.copy_gmem_to_smem(
               q_gmem.at[pl.ds(q_base_cluster, tile_q), hi],
               q_smem,
-              barrier=q_barrier,
+              barrier=q_produced,
               collective_axes=collective_axis,
               leader_tracked=leader_tracked,
           )
-          tma_load_kv_warp(k_gmem, k_smem, k_barrier, k_consumed_barrier, 0)
+          tma_load_kv_warp(k_gmem, k_smem, k_produced, k_consumed, 0)
 
         @pl.when(warp_id == _TMA_LOAD_V_WARP)
         def tma_load_v_warp():
-          tma_load_kv_warp(v_gmem, v_smem, v_barrier, v_consumed_barrier, 1)
+          tma_load_kv_warp(v_gmem, v_smem, v_produced, v_consumed, 1)
 
         if bias_smem is not None or mask_smem is not None:
 
@@ -503,19 +501,19 @@ def flash_attention_kernel(
               if bias_smem is not None:
                 hi_ = 0 if bias_gmem.shape[-3] == 1 else hi
                 ks = pl.ds(ki * block_kv, block_kv)
-                plgpu.barrier_wait(bias_consumed_barrier)
+                plgpu.barrier_wait(bias_consumed)
                 mgpu_lib.fence_async_shared_cta()  # Ensure smem read complete.
                 plgpu.copy_gmem_to_smem(
-                    bias_gmem.at[hi_, qs, ks], bias_smem, bias_barrier
+                    bias_gmem.at[hi_, qs, ks], bias_smem, bias_produced
                 )
               if mask_smem is not None:
                 hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
                 mask_block_size = max(mask_block_kv, min_mask_cols)
                 ks = pl.ds(ki * mask_block_kv, mask_block_size)
-                plgpu.barrier_wait(mask_consumed_barrier)
+                plgpu.barrier_wait(mask_consumed)
                 mgpu_lib.fence_async_shared_cta()  # Ensure smem read complete.
                 plgpu.copy_gmem_to_smem(
-                    mask_gmem.at[hi_, qs, ks], mask_smem, mask_barrier
+                    mask_gmem.at[hi_, qs, ks], mask_smem, mask_produced
                 )
 
         @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
@@ -524,8 +522,8 @@ def flash_attention_kernel(
           def qk_mma(ki):
             si = lax.rem(ki - lb, num_stages)
             with jax.named_scope("wait_k"):
-              plgpu.barrier_wait(qk_consumed_barrier)
-              plgpu.barrier_wait(k_barrier.at[si])
+              plgpu.barrier_wait(s_consumed)
+              plgpu.barrier_wait(k_produced.at[si])
 
             @pl.loop(0, num_tma_splits)
             def tma_loop(split_idx):
@@ -533,41 +531,41 @@ def flash_attention_kernel(
               ds = pl.ds(split_idx * block_d, block_d)
               with jax.named_scope("issuing Q@K.T"):
                 plgpu.tcgen05_mma(
-                    qk_acc_tmem,
+                    s_tmem,
                     q_smem.at[:, ds],
                     k_smem.at[si, split_idx].T,
-                    k_consumed_barrier.at[si, split_idx],
+                    k_consumed.at[si, split_idx],
                     accumulate=split_idx > 0,
                     collective_axis=collective_axis,
                 )
 
-            plgpu.tcgen05_commit_arrive(qk_mma_barrier, collective_axis)
+            plgpu.tcgen05_commit_arrive(s_produced, collective_axis)
 
           def pv_mma(ki):
             si = lax.rem(ki - lb, num_stages)
             slot = lax.rem(ki - lb, 2)
             with jax.named_scope("wait_v"):
-              plgpu.barrier_wait(v_barrier.at[si])
-              plgpu.barrier_wait(p_barrier.at[slot])
+              plgpu.barrier_wait(v_produced.at[si])
+              plgpu.barrier_wait(p_produced.at[slot])
 
             @pl.loop(0, num_tma_splits)
             def tma_loop(split_idx):
               block_d = head_dim_out // num_tma_splits
               ds = pl.ds(split_idx * block_d, block_d)
-              plgpu.barrier_wait(acc_barrier.at[split_idx])
+              plgpu.barrier_wait(acc_produced.at[split_idx])
               with jax.named_scope("issuing P@V"):
                 plgpu.tcgen05_mma(
                     acc_tmem.at[:, ds],
-                    p_tmem.at[:, pl.ds(slot * block_kv, block_kv)],
+                    p_tmem.at[slot],
                     v_smem.at[si, split_idx],
-                    v_consumed_barrier.at[si, split_idx],
+                    v_consumed.at[si, split_idx],
                     accumulate=(ki != lb),
                     collective_axis=collective_axis,
                 )
 
-            plgpu.tcgen05_commit_arrive(pv_mma_barrier, collective_axis)
+            plgpu.tcgen05_commit_arrive(pv_mma_produced, collective_axis)
 
-          plgpu.barrier_wait(q_barrier)
+          plgpu.barrier_wait(q_produced)
           qk_mma(lb)
 
           @pl.loop(lb, ub - 1)
@@ -617,12 +615,12 @@ def flash_attention_kernel(
             # broadcasting & using them the way it is done is extremely slow
             mask &= _load_bcast(mask_gmem, (hi, qs, ks), layout=_TMEM)
           else:
-            plgpu.barrier_wait(mask_barrier)
+            plgpu.barrier_wait(mask_produced)
             layout = _TMEM(32 // _MASK_PACKED_BITS)
             mask_ = plgpu.load(
                 mask_smem.at[:, :mask_block_kv], layout=layout, optimized=False
             )
-            plgpu.barrier_arrive(mask_consumed_barrier)
+            plgpu.barrier_arrive(mask_consumed)
             mask &= common.unpack_bool_bits_tmem_native(mask_)
 
         def k_range_mask(mask):
@@ -642,9 +640,9 @@ def flash_attention_kernel(
         m_scale, m_i, l_i = carry
         si = lax.rem(ki - lb, 2)
         with jax.named_scope("Q@K"):
-          plgpu.barrier_wait(qk_mma_barrier)
+          plgpu.barrier_wait(s_produced)
         with jax.named_scope("load_qk"):
-          s = plgpu.async_load_tmem(qk_acc_tmem, layout=_TMEM)
+          s = plgpu.async_load_tmem(s_tmem, layout=_TMEM)
           scale = logits_scale
 
           if bias_gmem is None:
@@ -654,12 +652,12 @@ def flash_attention_kernel(
             ks = cast(pl.Slice, pl.ds(ki * block_kv, block_kv))
             bias = _load_bcast(bias_gmem, (hi_, qs, ks), layout=_TMEM)
           else:
-            plgpu.barrier_wait(bias_barrier)
+            plgpu.barrier_wait(bias_produced)
             bias = plgpu.load(bias_smem, layout=_TMEM, optimized=False)
-            plgpu.barrier_arrive(bias_consumed_barrier)
+            plgpu.barrier_arrive(bias_consumed)
 
           mgpu_lib.tcgen05_wait_ld()
-          plgpu.barrier_arrive(qk_consumed_barrier)
+          plgpu.barrier_arrive(s_consumed)
 
         if bias is not None:
           s = s * scale + bias.astype(s.dtype)
@@ -693,21 +691,20 @@ def flash_attention_kernel(
           l_i = jnp.where(needs_rescale, l_i * alpha, l_i) + p.sum(axis=1)
 
           with jax.named_scope("write qk_tmem"):
-            ks = pl.ds(si * block_kv, block_kv)
-            plgpu.async_store_tmem(p_tmem.at[:, ks], p.astype(p_tmem.dtype))
+            plgpu.async_store_tmem(p_tmem.at[si], p.astype(p_tmem.dtype))
             mgpu_lib.tcgen05_wait_st()
             mgpu_lib.tcgen05_fence_before_thread_sync()
             if collective:  # Not all threads arrive on the barrier.
               mgpu_lib.warpgroup_barrier()
-            plgpu.barrier_arrive(p_barrier.at[si])
+            plgpu.barrier_arrive(p_produced.at[si])
         return m_scale, m_i, l_i
 
       # prologue
-      plgpu.barrier_arrive(qk_consumed_barrier)
-      if bias_consumed_barrier is not None:
-        plgpu.barrier_arrive(bias_consumed_barrier)
-      if mask_consumed_barrier is not None:
-        plgpu.barrier_arrive(mask_consumed_barrier)
+      plgpu.barrier_arrive(s_consumed)
+      if bias_consumed is not None:
+        plgpu.barrier_arrive(bias_consumed)
+      if mask_consumed is not None:
+        plgpu.barrier_arrive(mask_consumed)
 
       # in 2CTA we have non square blocks hence we may need to process
       # M//N steps with a mask, for M=256, N=128 this means 2 steps
@@ -738,7 +735,7 @@ def flash_attention_kernel(
       @pl.when(ub > lb)
       def release_out_scaled_barriers():
         for i in range(num_tma_splits):
-          plgpu.barrier_arrive(acc_barrier.at[i])
+          plgpu.barrier_arrive(acc_produced.at[i])
 
       def two_in_flight(iterable):
         for a, _ in itertools.pairwise(itertools.chain(iterable, [None])):  # pytype: disable=wrong-arg-types
@@ -748,7 +745,7 @@ def flash_attention_kernel(
       def kv_loop(ki):
         slot = lax.rem(ki - lb, softmax_slots)
 
-        plgpu.barrier_wait(pv_mma_barrier)
+        plgpu.barrier_wait(pv_mma_produced)
         tile_d = 32
 
         def load_acc_tiles():
@@ -792,11 +789,11 @@ def flash_attention_kernel(
                 break
 
             mgpu_lib.tcgen05_wait_st()
-            plgpu.barrier_arrive(acc_barrier.at[i])
+            plgpu.barrier_arrive(acc_produced.at[i])
 
         def no_rescale():
           for i in range(num_tma_splits):
-            plgpu.barrier_arrive(acc_barrier.at[i])
+            plgpu.barrier_arrive(acc_produced.at[i])
 
         with jax.named_scope("rescale_acc"):
           # If none of the threads in the warp need to rescale, then we can skip
@@ -817,7 +814,7 @@ def flash_attention_kernel(
             l_rcp = lax.broadcast_in_dim(l_rcp, acc_tmem.shape, [0])
           else:
             l_rcp = lax.broadcast_in_dim(1.0, acc_tmem.shape, [])
-          plgpu.barrier_wait(pv_mma_barrier)
+          plgpu.barrier_wait(pv_mma_produced)
 
           def load_acc_tiles():
             for di in range(num_d_tiles):
@@ -902,10 +899,10 @@ def flash_attention_kernel(
   else:
     bias_scratch = tiled_smem((block_q, block_kv), bias.dtype, "bias")
 
-  kv_barrier = plgpu.Barrier(
+  kv_produced = plgpu.Barrier(
       num_barriers=num_stages, num_arrivals=num_tma_splits
   )
-  kv_consumed_barrier = plgpu.Barrier(
+  kv_consumed = plgpu.Barrier(
       num_barriers=(num_stages, num_tma_splits), orders_tensor_core=True
   )
 
@@ -926,27 +923,27 @@ def flash_attention_kernel(
       mask_smem=mask_scratch,
       alpha_smem=plgpu.SMEM((softmax_slots, block_q), jnp.float32),
       li_smem=li_scratch,
-      qk_acc_tmem=tmem((block_q, block_kv)),
-      p_tmem=tmem((block_q, block_kv * softmax_slots), v.dtype, packed=True),
+      s_tmem=tmem((block_q, block_kv)),
+      p_tmem=tmem((softmax_slots, block_q, block_kv), v.dtype, packed=True),
       acc_tmem=tmem((block_q, head_dim_out)),
       bias_smem=bias_scratch,
-      q_barrier=plgpu.Barrier(),
-      k_barrier=kv_barrier,
-      v_barrier=kv_barrier,
-      bias_barrier=None if bias_scratch is None else plgpu.Barrier(),
-      bias_consumed_barrier=None if bias_scratch is None else plgpu.Barrier(),
-      mask_barrier=None if mask_scratch is None else plgpu.Barrier(),
-      mask_consumed_barrier=None if mask_scratch is None else plgpu.Barrier(),
-      qk_mma_barrier=plgpu.Barrier(orders_tensor_core=True),
-      k_consumed_barrier=kv_consumed_barrier,
-      qk_consumed_barrier=maybe_cluster_barrier(orders_tensor_core=True),
-      pv_mma_barrier=plgpu.Barrier(orders_tensor_core=True),
-      v_consumed_barrier=kv_consumed_barrier,
-      # The `p_barrier` does order the tensor core, but we insert the correct
-      # PTX directive on arrive to avoid redundancy on the wait as `acc_barrier`
+      q_produced=plgpu.Barrier(),
+      k_produced=kv_produced,
+      k_consumed=kv_consumed,
+      v_produced=kv_produced,
+      v_consumed=kv_consumed,
+      bias_produced=None if bias_scratch is None else plgpu.Barrier(),
+      bias_consumed=None if bias_scratch is None else plgpu.Barrier(),
+      mask_produced=None if mask_scratch is None else plgpu.Barrier(),
+      mask_consumed=None if mask_scratch is None else plgpu.Barrier(),
+      s_produced=plgpu.Barrier(orders_tensor_core=True),
+      s_consumed=maybe_cluster_barrier(orders_tensor_core=True),
+      pv_mma_produced=plgpu.Barrier(orders_tensor_core=True),
+      # The `p_produced` does order the tensor core, but we insert the correct
+      # PTX directive on arrive to avoid redundancy on wait as `acc_produced`
       # wait already has it.
-      p_barrier=maybe_cluster_barrier(num_barriers=2),
-      acc_barrier=maybe_cluster_barrier(
+      p_produced=maybe_cluster_barrier(num_barriers=2),
+      acc_produced=maybe_cluster_barrier(
           num_barriers=num_tma_splits, orders_tensor_core=True
       ),
   )

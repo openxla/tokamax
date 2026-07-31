@@ -81,7 +81,7 @@ def _get_dq_scratch_shapes(
   shapes = dict(
       q_smem=_tiled_smem((block_q, head_dim), q_dtype),
       do_smem=_tiled_smem((block_q, head_dim_out), dout_dtype),
-      k_smem=_tiled_smem((num_stages, block_kv, head_dim), k_dtype, swizzle=64),
+      k_smem=_tiled_smem((num_stages, block_kv, head_dim), k_dtype),
       v_smem=_tiled_smem((num_stages, block_kv, head_dim_out), v_dtype),
       s_tmem=plgpu.TMEM((block_q, block_kv), jnp.float32),
       dp_ds_tmems=plgpu.RefUnion(
@@ -98,9 +98,9 @@ def _get_dq_scratch_shapes(
           num_barriers=num_stages, orders_tensor_core=True
       ),
       s_produced=plgpu.Barrier(orders_tensor_core=True),
-      s_consumed=plgpu.Barrier(),
+      s_consumed=plgpu.Barrier(orders_tensor_core=True),
       dp_produced=plgpu.Barrier(orders_tensor_core=True),
-      ds_produced=plgpu.Barrier(),
+      ds_produced=plgpu.Barrier(orders_tensor_core=True),
       dq_mma_finished=plgpu.Barrier(orders_tensor_core=True),
   )
 
@@ -570,6 +570,7 @@ def _kernel_dq(
         delta_gmem.at[hi, qs], layout=row_layout, optimized=False
     )
     m *= math.log2(math.e)
+    l_rcp = 1.0 / (l + float(jnp.finfo(jnp.float32).tiny))
 
     @pl.loop(lb, ub)
     def kv_loop(ki):
@@ -579,7 +580,7 @@ def _kernel_dq(
 
       plgpu.barrier_wait(s_produced)
       s = plgpu.async_load_tmem(s_tmem, layout=layout)
-      plgpu.wait_load_tmem()
+      mgpu_lib.tcgen05_wait_ld()
       plgpu.barrier_arrive(s_consumed)
       scale = logits_scale
 
@@ -644,8 +645,7 @@ def _kernel_dq(
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0
 
-      epsilon = float(jnp.finfo(jnp.float32).tiny)
-      p = jnp.exp2(s * scale - broadcast(m)) / (broadcast(l) + epsilon)
+      p = jnp.exp2(s * scale - broadcast(m)) * broadcast(l_rcp)
 
       plgpu.barrier_wait(dp_produced)
       dp = plgpu.async_load_tmem(dp_tmem, layout=layout)
@@ -668,7 +668,7 @@ def _kernel_dq(
         plgpu.copy_smem_to_gmem(ds_smem, ds_gmem.at[hi, qs, ks])
 
       plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
-      plgpu.commit_tmem()
+      mgpu_lib.tcgen05_wait_st()
       plgpu.barrier_arrive(ds_produced)
 
     if ds_gmem is not None:

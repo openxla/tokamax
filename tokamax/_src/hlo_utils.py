@@ -171,7 +171,6 @@ def _get_payload(op: ir.OpView | ir.Operation) -> str | None:
   return None
 
 
-
 def _get_common_kernel_info(
     op: ir.OpView, call_stack: tuple[str, ...]
 ) -> dict[str, Any]:
