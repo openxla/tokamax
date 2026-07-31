@@ -570,6 +570,7 @@ def _kernel_dq(
         delta_gmem.at[hi, qs], layout=row_layout, optimized=False
     )
     m *= math.log2(math.e)
+    l_rcp = 1.0 / (l + float(jnp.finfo(jnp.float32).tiny))
 
     @pl.loop(lb, ub)
     def kv_loop(ki):
@@ -644,8 +645,7 @@ def _kernel_dq(
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0
 
-      epsilon = float(jnp.finfo(jnp.float32).tiny)
-      p = jnp.exp2(s * scale - broadcast(m)) / (broadcast(l) + epsilon)
+      p = jnp.exp2(s * scale - broadcast(m)) * broadcast(l_rcp)
 
       plgpu.barrier_wait(dp_produced)
       dp = plgpu.async_load_tmem(dp_tmem, layout=layout)
