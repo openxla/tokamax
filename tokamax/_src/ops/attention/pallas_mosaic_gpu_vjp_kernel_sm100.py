@@ -155,7 +155,10 @@ def _get_dkv_scratch_shapes(
       dv_tmem=plgpu.TMEM((block_kv, head_dim_out), jnp.float32),
       kv_produced=plgpu.Barrier(num_arrivals=2),
       q_do_produced=plgpu.Barrier(num_barriers=num_stages, num_arrivals=2),
-      q_do_consumed=plgpu.Barrier(
+      q_consumed=plgpu.Barrier(
+          num_barriers=num_stages, orders_tensor_core=True
+      ),
+      do_consumed=plgpu.Barrier(
           num_barriers=num_stages, orders_tensor_core=True
       ),
       s_produced=plgpu.Barrier(orders_tensor_core=True),
@@ -682,7 +685,8 @@ def _kernel_dkv(
     dv_tmem,
     kv_produced,
     q_do_produced,
-    q_do_consumed,
+    q_consumed,
+    do_consumed,
     residual_produced,
     residual_consumed,
     s_produced,
@@ -778,16 +782,15 @@ def _kernel_dkv(
           qi = lb + lax.rem(step, safe_num_q_tiles)
           qs = pl.ds(qi * block_q, block_q)
           hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
+          do_wait = step >= num_stages
 
-          @pl.when(step >= num_stages)
-          def wait_q():
-            plgpu.barrier_wait(q_do_consumed.at[si])
-
-          plgpu.copy_gmem_to_smem(
-              q_gmem.at[qs, hi], q_smem.at[si], barrier=q_do_produced.at[si]
-          )
+          pl.when(do_wait)(lambda: plgpu.barrier_wait(do_consumed.at[si]))
           plgpu.copy_gmem_to_smem(
               dout_gmem.at[qs, hi], do_smem.at[si], barrier=q_do_produced.at[si]
+          )
+          pl.when(do_wait)(lambda: plgpu.barrier_wait(q_consumed.at[si]))
+          plgpu.copy_gmem_to_smem(
+              q_gmem.at[qs, hi], q_smem.at[si], barrier=q_do_produced.at[si]
           )
 
       if bias_gmem is not None or mask_gmem is not None:
@@ -848,12 +851,13 @@ def _kernel_dkv(
           plgpu.tcgen05_mma(
               dv_tmem, p_tmem, do_smem.at[si], accumulate=(step > 0)
           )
+          plgpu.tcgen05_commit_arrive(do_consumed.at[si])
 
           plgpu.barrier_wait(ds_produced)
           plgpu.tcgen05_mma(
               dk_tmem, ds_tmem, q_smem.at[si], accumulate=(step > 0)
           )
-          plgpu.tcgen05_commit_arrive(q_do_consumed.at[si])
+          plgpu.tcgen05_commit_arrive(q_consumed.at[si])
 
         plgpu.tcgen05_commit_arrive(kv_mma_finished)
 
