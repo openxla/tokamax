@@ -580,8 +580,6 @@ def _kernel_dq(
 
       plgpu.barrier_wait(s_produced)
       s = plgpu.async_load_tmem(s_tmem, layout=layout)
-      mgpu_lib.tcgen05_wait_ld()
-      plgpu.barrier_arrive(s_consumed)
       scale = logits_scale
 
       if bias_gmem is not None:
@@ -591,8 +589,11 @@ def _kernel_dq(
           plgpu.barrier_wait(bias_produced.at[si])
           bias = plgpu.load(bias_smem.at[si], layout=layout)
           plgpu.barrier_arrive(bias_consumed.at[si])
-        s = s * scale + bias
+        s = s * scale + bias.astype(s.dtype)
         scale = 1.0
+
+      mgpu_lib.tcgen05_wait_ld()
+      plgpu.barrier_arrive(s_consumed)
 
       if logits_soft_cap is not None:
         s = jnp.tanh(s * (scale / logits_soft_cap))
@@ -946,29 +947,31 @@ def _kernel_dkv(
         q_base = qi * block_q + c_start
         qs = pl.ds(q_base, config.chunk_size)
 
+        if bias_gmem is None:
+          bias = None
+        elif bias_smem is None:
+          bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)
+        else:
+          if chunk_idx == 0:
+            plgpu.barrier_wait(bias_produced.at[si_elt])
+          bias = plgpu.load(
+              bias_smem.at[si_elt, :, chunk_slice], layout=_TCGEN05
+          )
+
         if chunk_idx == 0:
           plgpu.barrier_wait(s_produced)
         s = plgpu.async_load_tmem(s_tmem.at[:, chunk_slice], layout=_TCGEN05)
+        scale = logits_scale
+
+        if bias is not None:
+          if bias_smem is not None and chunk_idx == num_chunks - 1:
+            plgpu.barrier_arrive(bias_consumed.at[si_elt])
+          s = s * scale + bias.astype(s.dtype)
+          scale = 1.0
+
         if chunk_idx == num_chunks - 1:
           plgpu.wait_load_tmem()
           plgpu.barrier_arrive(s_consumed)
-
-        scale = logits_scale
-
-        if bias_gmem is not None:
-          if bias_smem is None:
-            bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)
-          else:
-            if chunk_idx == 0:
-              plgpu.barrier_wait(bias_produced.at[si_elt])
-            bias = plgpu.load(
-                bias_smem.at[si_elt, :, chunk_slice], layout=_TCGEN05
-            )
-            if chunk_idx == num_chunks - 1:
-              plgpu.barrier_arrive(bias_consumed.at[si_elt])
-
-          s = s * scale + bias
-          scale = 1.0
 
         if logits_soft_cap is not None:
           s = jnp.tanh(s * (scale / logits_soft_cap))
