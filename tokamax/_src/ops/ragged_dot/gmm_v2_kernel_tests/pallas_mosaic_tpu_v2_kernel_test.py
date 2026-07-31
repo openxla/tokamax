@@ -21,6 +21,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 from tokamax._src import test_utils
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
@@ -28,31 +29,6 @@ from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm
 import pytest
 
 jax.config.parse_flags_with_absl()
-
-
-def poison_tpu_memory():
-  """Fills TPU scratchpad memory with NaNs to simulate garbage state."""
-  tpu_info = pltpu.get_tpu_info()
-  # Security: Use a large but safe portion of VMEM/SMEM to avoid OOM.
-  vmem_size = (4 * 1024 * 1024) // 4  # 4MB
-  smem_size = (tpu_info.smem_capacity_bytes // 4) - 8192
-
-  def poison_kernel(in_ref, out_ref, v_scratch, s_scratch):
-    del in_ref, out_ref
-    v_scratch[...] = jnp.full_like(v_scratch, jnp.nan)
-    for i in range(s_scratch.shape[0]):
-      s_scratch[i] = 0x7FC00000  # IEEE 754 NaN bit pattern
-
-  pl.pallas_call(
-      poison_kernel,
-      out_shape=jax.ShapeDtypeStruct((1,), jnp.float32),
-      grid=(1,),
-      scratch_shapes=[
-          pltpu.VMEM((vmem_size // 128, 128), jnp.float32),
-          pltpu.SMEM((smem_size,), jnp.int32),
-      ],
-      compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
-  )(jnp.zeros((1,), dtype=jnp.float32))
 
 
 _GroupConfig = collections.namedtuple(
@@ -243,7 +219,6 @@ class GmmTest(parameterized.TestCase):
     if jax.default_backend() != "tpu":
       self.skipTest("Only supported on TPUs.")
     super().setUp()
-    
 
   @pytest.mark.long
   @parameterized.product(
@@ -718,7 +693,7 @@ class GmmTest(parameterized.TestCase):
     into the output.
     """
     # 1. Poison TPU memory with NaNs
-    poison_tpu_memory()
+    mosaic_tpu.poison_tpu_memory()
 
     # 2. Run GMM kernel
     batch_size = 128

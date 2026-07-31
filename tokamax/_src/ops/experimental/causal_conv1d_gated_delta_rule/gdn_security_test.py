@@ -19,8 +19,8 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import wrapper
-from tokamax._src.ops.experimental.utils.test_utils import poison_tpu_memory
 
 
 class GDNSecurityTest(absltest.TestCase):
@@ -36,7 +36,7 @@ class GDNSecurityTest(absltest.TestCase):
       self.skipTest("Failed to get TPU info.")
 
   def test_uninitialized_memory_robustness(self):
-    poison_tpu_memory()
+    mosaic_tpu.poison_tpu_memory()
     seq_lens = jnp.array([128], dtype=jnp.int32)
     mixed_qkv = jnp.zeros((128, 1536), dtype=jnp.float32)
     new_states, output = wrapper.fused_conv1d_gdn(
