@@ -58,7 +58,7 @@ jobs:
       - name: Test Tokamax ops with pytest
         run: |
           pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*" tokamax/_src/ops/attention
-
+  # TODO: Re-enable ragged dot on b200 once it is supported.
   tokamax-nightly-ops-tests:
     strategy:
       matrix:
@@ -66,12 +66,16 @@ jobs:
         include:
           - runner: 'linux-x86-a3-8g-h100-1gpu'
             device: 'cuda'
+            additional_ignore: ''
           - runner: 'linux-x86-ct6e-44-1tpu'
             device: 'tpu'
+            additional_ignore: ''
           - runner: 'linux-x86-tpu7x-56-1tpu'
             device: 'tpu'
+            additional_ignore: ''
           - runner: 'linux-x86-a4-224-b200-1gpu'
             device: 'cuda'
+            additional_ignore: '--ignore=tokamax/_src/ops/ragged_dot/'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -92,7 +96,7 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
         run: |
-          pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*"  --ignore=tokamax/_src/ops/attention/ tokamax/_src/ops
+          pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*"  --ignore=tokamax/_src/ops/attention/ ${{ matrix.additional_ignore }} tokamax/_src/ops
 
   tokamax-nightly-tests:
     strategy:
