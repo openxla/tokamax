@@ -116,8 +116,8 @@ def main_kernel(
     dtype_bits = jax.dtypes.itemsize_bits(dtype)
     packing = 32 // dtype_bits
 
-    in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
-    out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
+    in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)
+    out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)
 
     for col_vmem_start in range(0, col_size, num_lanes):
       col_hbm_start = col_tile_start + col_vmem_start
@@ -366,7 +366,7 @@ def ragged_scatter_pallas(
 ) -> jax.Array:
   """Scatter function using Pallas kernel."""
   if config is None:
-    config = create_config(x.shape, indices.size, x.dtype)  # pyrefly: ignore[bad-argument-type]
+    config = create_config(x.shape, indices.size, x.dtype)
 
   sc_info = pltpu.get_tpu_info().sparse_core
   assert sc_info is not None

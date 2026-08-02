@@ -30,9 +30,9 @@ from tokamax._src.ops.experimental.tpu.topk import pallas_mosaic_tpu_kernel
 class Config:
   """Autotuning and execution configuration for TopK Pallas TPU kernel."""
 
-  num_seq_windows: pydantic.conint(gt=0) = 1  # pyrefly: ignore[invalid-annotation]
-  digit_width: pydantic.conint(gt=0) = 4  # pyrefly: ignore[invalid-annotation]
-  num_digits: pydantic.conint(gt=0) = 8  # pyrefly: ignore[invalid-annotation]
+  num_seq_windows: pydantic.conint(gt=0) = 1
+  digit_width: pydantic.conint(gt=0) = 4
+  num_digits: pydantic.conint(gt=0) = 8
   poison_scratch: bool = False
   use_tc_tiling_on_sc: bool = False
   debug: bool = False
@@ -58,7 +58,7 @@ class PallasTpuTopK(base.TopK):
   ) -> tuple[tuple[jax.Array, jax.Array], None]:
     del axis, is_stable
     if config is None:
-      config = self._get_heuristics_config(None)  # pyrefly: ignore[bad-argument-type]
+      config = self._get_heuristics_config(None)
 
     res_keys, res_vals = pallas_mosaic_tpu_kernel.top_k(
         keys=operand,

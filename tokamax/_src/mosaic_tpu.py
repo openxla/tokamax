@@ -136,15 +136,15 @@ def quant_block_spec(
           f" min_addressable_size in {axis=}. Got {eps=} and {mas=}."
       )
   scale_info_per_axis = [
-      _get_scale_tile_info(eps, tile_size, s, mas)  # pyrefly: ignore[bad-argument-type]
+      _get_scale_tile_info(eps, tile_size, s, mas)
       for eps, tile_size, s, mas in zip(
-          eps_list, tile_sizes, x_values.shape, min_addressable_sizes  # pyrefly: ignore[bad-argument-type]
+          eps_list, tile_sizes, x_values.shape, min_addressable_sizes
       )
   ]
 
   # construct the blockspec
   def index_map(*args):
-    idxs = list(x_spec.index_map(*args))  # pyrefly: ignore[not-callable]
+    idxs = list(x_spec.index_map(*args))
     return [scale_info_per_axis[i].ti_to_sti(idx) for i, idx in enumerate(idxs)]
 
   scales_block_shape = [info.scales_tile_size for info in scale_info_per_axis]
@@ -232,10 +232,10 @@ def custom_buffered_pallas_call(
       # specify dimension semantic from the scalar prefetch grid and emit
       pltpu.emit_pipeline(
           lambda *args: kernel(*smem_refs, *args, *scratch_refs),
-          grid=grid,  # pyrefly: ignore[bad-argument-type]
+          grid=grid,
           in_specs=in_specs_,
           out_specs=out_specs_,
-          dimension_semantics=compiler_params.dimension_semantics,  # pyrefly: ignore[bad-argument-type]
+          dimension_semantics=compiler_params.dimension_semantics,
       )(*input_output_refs)
 
     bs_smem = pl.BlockSpec(memory_space=pltpu.SMEM)

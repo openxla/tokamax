@@ -520,7 +520,7 @@ class DotProductAttention[C, K: Hashable](
 
     precision = cast(
         tuple[CanonicalPrecision, CanonicalPrecision],
-        tuple(map(precision_lib.canonicalize_precision, precision)),  # pyrefly: ignore[bad-argument-type]
+        tuple(map(precision_lib.canonicalize_precision, precision)),
     )
 
     if logits_dtype is AUTO:

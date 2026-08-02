@@ -108,8 +108,8 @@ def main_kernel_v2(
 
   # SparseCore `.bitcast()` leverages hardware Row-Packing for 16-bit -> 32-bit conversion.
   # The logical row count halves, while physical column dimensions remain unchanged.
-  in_hbm_i32 = in_hbm_ref.bitcast(jnp.int32)  # pyrefly: ignore[missing-attribute]
-  out_hbm_i32 = out_hbm_ref.bitcast(jnp.int32)  # pyrefly: ignore[missing-attribute]
+  in_hbm_i32 = in_hbm_ref.bitcast(jnp.int32)
+  out_hbm_i32 = out_hbm_ref.bitcast(jnp.int32)
 
   num_phys_cols = col_size
 
