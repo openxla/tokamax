@@ -47,9 +47,9 @@ def _eval_shape(spec):
 
   def f():
     out = spec()
-    out_flat, out_tree[0] = jax.tree.flatten(out)
+    out_flat, out_tree[0] = jax.tree.flatten(out)  # pyrefly: ignore[unsupported-operation]
     is_array = lambda x: isinstance(x, jax.Array)
-    arrays, other[0], merge[0] = utils.split_merge(is_array, out_flat)
+    arrays, other[0], merge[0] = utils.split_merge(is_array, out_flat)  # pyrefly: ignore[unsupported-operation]
     return arrays
 
   shapes = jax.eval_shape(f)
@@ -152,7 +152,7 @@ class PydanticTest(parameterized.TestCase):
           batching.BatchedShapeDtype(
               (A_SYMBOLIC, 2, B_SYMBOLIC),
               jnp.int8,
-              vmap_axes=((0, 5), (B_SYMBOLIC, 7)),
+              vmap_axes=((0, 5), (B_SYMBOLIC, 7)),  # pyrefly: ignore[bad-argument-type]
           ),
       ),
   )
