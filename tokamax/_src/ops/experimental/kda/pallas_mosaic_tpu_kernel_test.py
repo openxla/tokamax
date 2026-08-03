@@ -19,6 +19,7 @@ from collections.abc import Sequence
 import dataclasses
 import math
 
+from absl import logging
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -55,36 +56,43 @@ def compare_tensor(
     dtype: jax.typing.DTypeLike = jnp.bfloat16,
     compare_dtype: jax.typing.DTypeLike = np.float64,
     max_rms_error_ratio: float | None = None,
+    log_diagnostics: bool = False,
 ) -> bool:
-  """Compares two tensors and prints focused numerical diagnostics."""
+  """Compares two tensors and optionally logs numerical diagnostics."""
   if expected is None and actual is None:
-    print(f"[{name}] Both are None. PASS.")
+    if log_diagnostics:
+      logging.info("[%s] Both are None. PASS.", name)
     return True
   if expected is None or actual is None:
-    print(f"[{name}] One is None. FAIL.")
+    logging.error("[%s] One is None. FAIL.", name)
     return False
 
   expected_dtype = np.dtype(expected.dtype).name
   actual_dtype = np.dtype(actual.dtype).name
   if expected_dtype != actual_dtype:
-    print(
-        f"[{name}] Dtype mismatch: Left {expected.dtype} vs "
-        f"Right {actual.dtype}. FAIL."
+    logging.error(
+        "[%s] Dtype mismatch: Left %s vs Right %s. FAIL.",
+        name,
+        expected.dtype,
+        actual.dtype,
     )
     return False
 
   expected_np = np.asarray(expected).astype(compare_dtype)
   actual_np = np.asarray(actual).astype(compare_dtype)
   if expected_np.shape != actual_np.shape:
-    print(
-        f"[{name}] Shape mismatch: Left {expected_np.shape} vs "
-        f"Right {actual_np.shape}. FAIL."
+    logging.error(
+        "[%s] Shape mismatch: Left %s vs Right %s. FAIL.",
+        name,
+        expected_np.shape,
+        actual_np.shape,
     )
     if expected_np.squeeze().shape != actual_np.squeeze().shape:
       return False
     expected_np = expected_np.squeeze()
     actual_np = actual_np.squeeze()
-    print(f"  Comparing squeezed shape: {expected_np.shape}")
+    if log_diagnostics:
+      logging.info("  Comparing squeezed shape: %s", expected_np.shape)
 
   diff = np.abs(expected_np - actual_np)
   max_diff = np.max(diff)
@@ -114,32 +122,34 @@ def compare_tensor(
       )
       is_close = bool(np.all(diff <= tolerance))
 
-  print(f"[{name}] {'PASS' if is_close else 'FAIL'}")
-  print(f"  Max Value        : {max_value:.6e}")
-  print(f"  Max Abs Diff     : {max_diff:.6e}")
-  print(f"  Max Rel Diff     : {max_relative_diff:.6e}")
-  if rms_error_ratio is not None:
-    print(f"  RMS Error Ratio  : {rms_error_ratio:.6e}")
-    print(f"  RMS Ratio Limit  : {max_rms_error_ratio:.6e}")
+  if log_diagnostics or not is_close:
+    log_result = logging.info if is_close else logging.error
+    log_result("[%s] %s", name, "PASS" if is_close else "FAIL")
+    log_result("  Max Value        : %.6e", max_value)
+    log_result("  Max Abs Diff     : %.6e", max_diff)
+    log_result("  Max Rel Diff     : %.6e", max_relative_diff)
+    if rms_error_ratio is not None:
+      log_result("  RMS Error Ratio  : %.6e", rms_error_ratio)
+      log_result("  RMS Ratio Limit  : %.6e", max_rms_error_ratio)
 
   if not is_close:
     if max_rms_error_ratio is not None:
       index = np.unravel_index(np.argmax(diff), diff.shape)
-      print(f"  Max Mismatch details at index {index}:")
-      print(f"    Left (expected) = {expected_np[index]}")
-      print(f"    Right (actual)  = {actual_np[index]}")
-      print(f"    Diff            = {diff[index]}")
+      logging.error("  Max Mismatch details at index %s:", index)
+      logging.error("    Left (expected) = %s", expected_np[index])
+      logging.error("    Right (actual)  = %s", actual_np[index])
+      logging.error("    Diff            = %s", diff[index])
       return False
 
     error_ratio = diff / (tolerance + 1e-12)
     index = np.unravel_index(np.argmax(error_ratio), error_ratio.shape)
-    print(f"  Max Mismatch details at index {index}:")
-    print(f"    Left (expected) = {expected_np[index]}")
-    print(f"    Right (actual)  = {actual_np[index]}")
-    print(f"    Diff            = {diff[index]}")
-    print(f"    Tolerance       = {tolerance[index]}")
-    print(f"    ULP diff        = {diff[index] / ulp[index]:.2f}")
-    print(f"    Ratio           = {error_ratio[index]}")
+    logging.error("  Max Mismatch details at index %s:", index)
+    logging.error("    Left (expected) = %s", expected_np[index])
+    logging.error("    Right (actual)  = %s", actual_np[index])
+    logging.error("    Diff            = %s", diff[index])
+    logging.error("    Tolerance       = %s", tolerance[index])
+    logging.error("    ULP diff        = %.2f", diff[index] / ulp[index])
+    logging.error("    Ratio           = %s", error_ratio[index])
 
   return is_close
 
