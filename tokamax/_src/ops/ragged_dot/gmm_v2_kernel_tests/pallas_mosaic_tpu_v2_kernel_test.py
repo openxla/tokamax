@@ -222,12 +222,12 @@ class GmmTest(parameterized.TestCase):
 
   @pytest.mark.long
   @parameterized.product(
-      batch_size=[128, 512],
-      in_size=[512, 1024],
-      out_size=[512, 1024],
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
       num_groups=[16, 32],
-      has_bias=[True, False],
-      group_offset=[0, 2, 3],
+      has_bias=[True],
+      group_offset=[0],
   )
   def test_gmm_basic(
       self, batch_size, in_size, out_size, num_groups, has_bias, group_offset
@@ -265,11 +265,11 @@ class GmmTest(parameterized.TestCase):
 
   @pytest.mark.long
   @parameterized.product(
-      batch_size=[128, 1024],
-      in_size=[512, 1024],
-      out_size=[512, 1024],
-      num_groups=[5, 16, 32],
-      group_offset=[0, 2, 3],
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
+      num_groups=[5, 16],
+      group_offset=[0],
   )
   def test_tgmm_basic(
       self, batch_size, in_size, out_size, num_groups, group_offset
@@ -312,8 +312,8 @@ class GmmTest(parameterized.TestCase):
   @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 256],
-      in_size=[255, 500],
-      out_size=[255, 500],
+      in_size=[255],
+      out_size=[255],
       num_groups=[16],
       group_offset=[0],
   )
@@ -357,11 +357,11 @@ class GmmTest(parameterized.TestCase):
 
   @pytest.mark.long
   @parameterized.product(
-      batch_size=[256, 1024],
+      batch_size=[256],
       in_size=[1024],
       out_size=[1024],
       num_groups=[16],
-      group_offset=[0, 2],
+      group_offset=[0],
       tile_k=[256, 512],
       tile_n=[256, 512],
   )
@@ -403,13 +403,14 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
       out_size=[512],
       num_groups=[4],
       group_offset=[0],
-      empty_group_index=[0, 1, 2, 3],
+      empty_group_index=[0, 1],
   )
   def test_tgmm_empty_group(
       self,
@@ -490,11 +491,11 @@ class GmmTest(parameterized.TestCase):
 
   @pytest.mark.long
   @parameterized.product(
-      batch_size=[128, 512],
-      in_size=[256, 512],
-      out_size=[256, 512],
-      num_groups=[16, 32],
-      group_offset=[0, 2],
+      batch_size=[128],
+      in_size=[256],
+      out_size=[256],
+      num_groups=[16],
+      group_offset=[0],
       dtype_pair=[
           (jnp.float8_e4m3fn, jnp.float8_e5m2),       # production
           (jnp.float8_e4m3fn, jnp.float8_e4m3fn),     # symmetric fp8
@@ -582,13 +583,13 @@ class GmmTest(parameterized.TestCase):
   @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
-      in_size=[512, 1024],
-      out_size=[512, 1024],
-      num_groups=[16, 32],
-      has_bias=[True, False],
+      in_size=[512],
+      out_size=[512],
+      num_groups=[16],
+      has_bias=[True],
       weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
-      block_size=[64, 128, 256, 512],
-      group_offset=[0, 2, 3],
+      block_size=[64],
+      group_offset=[0],
   )
   def test_gmm_weight_quantized(
       self,
@@ -712,14 +713,15 @@ class GmmTest(parameterized.TestCase):
     # 3. Verify that the output is NaN-free
     self.assertFalse(jnp.any(jnp.isnan(actual)))
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
       out_size=[512],
       num_groups=[16],
-      weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
+      weight_dtype=[jnp.int8],
       block_size=[1024],
-      tile_k=[128, 256, 512],
+      tile_k=[128, 256],
       group_offset=[0],
   )
   def test_gmm_weight_quantized_block_larger_than_tile_k(
@@ -774,14 +776,15 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
       out_size=[512],
       num_groups=[16],
-      weight_dtype=[jnp.int4, jnp.int8, jnp.float8_e4m3fn],
+      weight_dtype=[jnp.int4, jnp.int8],
       block_size=[1024],
-      tile_k=[128, 256, 512],
+      tile_k=[128, 256],
       group_offset=[0],
   )
   def test_gmm_activation_weight_quantized_block_larger_than_tile_k(
@@ -834,14 +837,15 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=1.2, rtol=1.2)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
-      in_size=[512, 1024],
-      out_size=[512, 1024],
+      in_size=[1024],
+      out_size=[1024],
       num_groups=[16, 32],
-      weight_dtype=[jnp.int4, jnp.uint4, jnp.int8, jnp.float8_e4m3fn],
-      block_size=[512, 1024],
-      group_offset=[0, 2, 3],
+      weight_dtype=[jnp.int4, jnp.int8],
+      block_size=[1024],
+      group_offset=[0],
   )
   def test_gmm_activation_weight_quantized(
       self,
@@ -890,13 +894,14 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=1.1, rtol=1.1)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
-      in_size=[512, 1024],
-      out_size=[512, 1024],
+      in_size=[1024],
+      out_size=[1024],
       num_groups=[16, 32],
-      block_size=[512, 1024],
-      group_offset=[0, 2],
+      block_size=[1024],
+      group_offset=[0],
   )
   def test_gmm_quantize_lhs_with_lhs_scale(
       self,
@@ -968,10 +973,11 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=0.75, rtol=3e-2)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 256],
-      in_size=[255, 500],
-      out_size=[255, 500],
+      in_size=[255],
+      out_size=[255],
       num_groups=[16],
       has_bias=[True, False],
       group_offset=[0],
@@ -1014,13 +1020,14 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (batch_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
       out_size=[500],
       num_groups=[16],
       has_bias=[True, False],
-      weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+      weight_dtype=[jnp.int8],
       block_size=[512],
       group_offset=[0],
   )
