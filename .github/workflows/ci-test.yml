@@ -36,7 +36,7 @@ jobs:
               --ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_test.py
               tokamax/_src/ops/ragged_dot/
               tokamax/_src/ops/ragged_gather/
-              tokamax/_src/ops/ragged_gather/reduce/
+              tokamax/_src/ops/ragged_gather_reduce/
           - shard_name: 'misc_small_ops'
             test_paths: >-
               tokamax/_src/ops/flex_attention/
