@@ -29,6 +29,12 @@ from tokamax._src import numerics
 from tokamax._src.ops.experimental.kda import api, CPContext  # pylint: disable=g-multiple-import
 
 
+def _l2_normalize(x: jax.Array) -> jax.Array:
+  x_f32 = x.astype(jnp.float32)
+  rstd = jax.lax.rsqrt(jnp.sum(jnp.square(x_f32), axis=-1) + 1e-6)
+  return (x_f32 * rstd[..., None]).astype(x.dtype)
+
+
 def _make_inputs(
     dtype,
     *,
@@ -105,6 +111,11 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
       )
       segment_ids = None
       max_num_segments = None
+
+    if not use_qk_l2norm_in_kernel:
+      q = _l2_normalize(q)
+      k = _l2_normalize(k)
+    initial_state = 0.1 * initial_state
 
     heads, _, _, key_dim = q.shape
     if use_gate_in_kernel:
