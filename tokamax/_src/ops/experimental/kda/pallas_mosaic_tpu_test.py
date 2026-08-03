@@ -13,28 +13,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for the Pallas/Mosaic TPU KDA adapter and input heuristics."""
+"""Tests for the Pallas/Mosaic TPU KDA adapter and public support checks."""
 
 import types
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.kda import api
 from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu
 from tokamax._src.ops.experimental.kda.cp_utils import CPContext
 
 
-def _check_inputs_support(q, v, **overrides):
-  kwargs = dict(
-      initial_state=None,
-      output_final_state=False,
-      segment_ids=None,
-      cp_context=None,
-      chunk_size=64,
-      N_max=None,
-  )
-  kwargs.update(overrides)
-  return pallas_mosaic_tpu.check_inputs_support(q, v, **kwargs)
+def _call_attention(implementation, q, v, **kwargs):
+  def call():
+    return api.kimi_delta_attention(
+        q,
+        jnp.ones_like(q),
+        v,
+        jnp.zeros_like(q),
+        jnp.ones(q.shape[:-1], dtype=q.dtype),
+        scale=1.0,
+        implementation=implementation,
+        **kwargs,
+    )
+
+  if implementation != "mosaic":
+    return call()
+  # Exercise Mosaic's public API validation on every test platform without
+  # tracing a kernel: every case below is rejected at the start of `_fwd`.
+  with mock.patch.object(
+      pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention,
+      "supported_on",
+      return_value=True,
+  ):
+    return call()
 
 
 class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
@@ -49,12 +63,16 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     self.assertEqual(vjp._get_heuristics_config(None), expected)
     self.assertEqual(vjp._get_autotuning_configs(None), {expected})
 
-  def test_rejects_large_key_dimension_before_kernel(self):
-    q = jnp.ones((1, 1, 64, 257), dtype=jnp.float32)
-    v = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
+  def test_large_key_dimension_is_mosaic_specific(self):
+    q = jnp.ones((1, 1, 1, 257), dtype=jnp.float32)
+    v = jnp.ones((1, 1, 1, 1), dtype=jnp.float32)
+
+    output, final_state = _call_attention("xla", q, v)
+    self.assertEqual(output.shape, v.shape)
+    self.assertIsNone(final_state)
 
     with self.assertRaisesRegex(NotImplementedError, "up to 256"):
-      _check_inputs_support(q, v)
+      _call_attention("mosaic", q, v)
 
   @parameterized.parameters((0, 1), (1, 0))
   def test_rejects_empty_kv_dimension_before_kernel(self, key_dim, value_dim):
@@ -62,7 +80,7 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     v = jnp.ones((1, 1, 64, value_dim), dtype=jnp.float32)
 
     with self.assertRaisesRegex(NotImplementedError, "positive key and value"):
-      _check_inputs_support(q, v)
+      _call_attention("mosaic", q, v)
 
   @parameterized.parameters((0, 1, 64), (1, 0, 64), (1, 1, 0))
   def test_rejects_empty_grid_dimension_before_kernel(
@@ -72,7 +90,7 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     v = jnp.ones((heads, batch, seq_len, 1), dtype=jnp.float32)
 
     with self.assertRaisesRegex(NotImplementedError, "positive head, batch"):
-      _check_inputs_support(q, v)
+      _call_attention("mosaic", q, v)
 
   def test_rejects_multiple_fixed_states_before_kernel(self):
     q = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
@@ -80,7 +98,7 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     initial_state = jnp.zeros((1, 2, 1, 1, 1), dtype=jnp.float32)
 
     with self.assertRaisesRegex(NotImplementedError, "exactly one"):
-      _check_inputs_support(q, v, initial_state=initial_state)
+      _call_attention("mosaic", q, v, initial_state=initial_state)
 
   @parameterized.parameters((64, 128), (128, 64))
   def test_rejects_unaligned_cp_dimensions_before_kernel(
@@ -92,7 +110,8 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     cp_context = CPContext(mesh=types.SimpleNamespace(shape={"context": 2}))
 
     with self.assertRaisesRegex(NotImplementedError, "multiples of 128"):
-      _check_inputs_support(
+      _call_attention(
+          "mosaic",
           q,
           v,
           segment_ids=segment_ids,
@@ -124,13 +143,13 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
             ),
         ),
         ("segment_ids", dict(N_max=1)),
-        ("N_max", dict(segment_ids=segment_ids)),
     )
 
     for error_fragment, overrides in cases:
       with self.subTest(error_fragment=error_fragment):
         with self.assertRaisesRegex(NotImplementedError, error_fragment):
-          _check_inputs_support(
+          _call_attention(
+              "mosaic",
               q,
               v,
               cp_context=cp_context,

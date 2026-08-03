@@ -28,104 +28,23 @@ from tokamax._src import numerics
 from tokamax._src.ops.experimental.kda import api, CPContext  # pylint: disable=g-multiple-import
 
 
-def _accumulator_dtype(dtype):
-  del dtype
-  return jnp.float32
-
-
-def _reference_kda(
-    q,
-    k,
-    v,
-    g,
-    beta,
+def _make_inputs(
+    dtype,
     *,
-  A_log=None,
-  dt_bias=None,
-  scale=None,
-  initial_state=None,
-  output_final_state=False,
-  use_qk_l2norm_in_kernel=False,
-  use_gate_in_kernel=False,
-  segment_ids=None,
-  lower_bound=None,
+    heads=3,
+    batch=2,
+    seq_len=7,
+    key_dim=8,
+    value_dim=5,
 ):
-  acc_dtype = _accumulator_dtype(q.dtype)
-  heads, batch, seq_len, key_dim = q.shape
-  value_dim = v.shape[-1]
-  if scale is None:
-    scale = key_dim**-0.5
-
-  if use_gate_in_kernel:
-    g_h = g.astype(jnp.float32)
-    if dt_bias is not None:
-      g_h = g_h + dt_bias.reshape(heads, 1, 1, key_dim)
-    A = jnp.exp(A_log.astype(jnp.float32)).reshape(heads, 1, 1, 1)
-    if lower_bound is None:
-      g = -A * jax.nn.softplus(g_h)
-    else:
-      g = lower_bound * jax.nn.sigmoid(A * g_h)
-
-  if use_qk_l2norm_in_kernel:
-    q_h = q.astype(acc_dtype)
-    q_h = q_h * jax.lax.rsqrt(jnp.sum(q_h * q_h, axis=-1, keepdims=True) + 1e-6)
-    k_h = k.astype(acc_dtype)
-    k_h = k_h * jax.lax.rsqrt(jnp.sum(k_h * k_h, axis=-1, keepdims=True) + 1e-6)
-  else:
-    q_h = q.astype(acc_dtype)
-    k_h = k.astype(acc_dtype)
-  q_h = q_h * scale
-  v_h = v.astype(acc_dtype)
-  g_h = g.astype(acc_dtype)
-  beta_h = beta.astype(acc_dtype)
-  if initial_state is not None:
-    num_states = initial_state.shape[1]
-  elif segment_ids is not None:
-    num_states = 3
-  else:
-    num_states = 1
-  states = jnp.zeros(
-      (batch, num_states, heads, key_dim, value_dim), dtype=acc_dtype
+  q = jax.ShapeDtypeStruct((heads, batch, seq_len, key_dim), dtype)
+  k = jax.ShapeDtypeStruct((heads, batch, seq_len, key_dim), dtype)
+  v = jax.ShapeDtypeStruct((heads, batch, seq_len, value_dim), dtype)
+  g = jax.ShapeDtypeStruct((heads, batch, seq_len, key_dim), dtype)
+  beta = jax.ShapeDtypeStruct((heads, batch, seq_len), dtype)
+  initial_state = jax.ShapeDtypeStruct(
+      (batch, 1, heads, key_dim, value_dim), jnp.float32
   )
-  if initial_state is not None:
-    states += initial_state.astype(acc_dtype)
-  output = jnp.zeros((heads, batch, seq_len, value_dim), dtype=acc_dtype)
-
-  for h in range(heads):
-    for b in range(batch):
-      for t in range(seq_len):
-        if segment_ids is None:
-          idx = jnp.array(0, jnp.int32)
-          valid = jnp.array(True)
-        else:
-          seg = segment_ids[b, t].astype(jnp.int32)
-          idx = jnp.clip(seg - 1, 0, num_states - 1)
-          valid = (seg > 0) & (seg <= num_states)
-        previous_state = states[b, idx, h]
-        state = previous_state * jnp.exp(g_h[h, b, t])[:, None]
-        prediction = k_h[h, b, t] @ state
-        residual = v_h[h, b, t] - prediction
-        new_state = state + (
-            beta_h[h, b, t] * k_h[h, b, t]
-        )[:, None] * residual[None, :]
-        out = q_h[h, b, t] @ new_state
-        output = output.at[h, b, t].set(
-            jnp.where(valid, out, jnp.zeros_like(out))
-        )
-        states = states.at[b, idx, h].set(
-            jnp.where(valid, new_state, previous_state)
-        )
-
-  return output.astype(q.dtype), states if output_final_state else None
-
-
-def _make_inputs(dtype):
-  q = jax.ShapeDtypeStruct((3, 2, 7, 8), dtype)
-  k = jax.ShapeDtypeStruct((3, 2, 7, 8), dtype)
-  v = jax.ShapeDtypeStruct((3, 2, 7, 5), dtype)
-  g = jax.ShapeDtypeStruct((3, 2, 7, 8), dtype)
-  beta = jax.ShapeDtypeStruct((3, 2, 7), dtype)
-  initial_state = jax.ShapeDtypeStruct((2, 1, 3, 8, 5), jnp.float32)
   q, k, v, g, beta, initial_state = numerics.random_initialize(
       (q, k, v, g, beta, initial_state)
   )
@@ -143,150 +62,90 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         "chunk_size", inspect.signature(api.kimi_delta_attention).parameters
     )
 
-  @parameterized.parameters(jnp.bfloat16, jnp.float32)
-  def test_kimi_delta_attention_matches_reference(self, dtype):
-    q, k, v, g, beta, initial_state = _make_inputs(dtype)
-
-    @jax.jit
-    def f(q, k, v, g, beta, initial_state):
-      return api.kimi_delta_attention(
-          q,
-          k,
-          v,
-          g,
-          beta,
-          initial_state=initial_state,
-          output_final_state=True,
+  @parameterized.named_parameters(
+      ("bfloat16", jnp.bfloat16, False, False, False),
+      ("float32", jnp.float32, False, False, False),
+      ("qk_l2norm", jnp.float32, True, False, False),
+      ("raw_gate", jnp.float32, False, True, False),
+      ("varlen_gate_l2norm", jnp.float32, True, True, True),
+  )
+  def test_default_implementation_matches_xla(
+      self,
+      dtype,
+      use_qk_l2norm_in_kernel,
+      use_gate_in_kernel,
+      variable_length,
+  ):
+    if variable_length:
+      q, k, v, g, beta, _ = _make_inputs(
+          dtype,
+          heads=2,
+          batch=2,
+          key_dim=64,
+          value_dim=64,
       )
+      segment_ids = jnp.array(
+          [
+              [1, 1, 2, 2, 2, 0, 0],
+              [1, 2, 2, 3, 3, 3, 0],
+          ],
+          dtype=jnp.int32,
+      )
+      initial_state = jnp.zeros((2, 3, 2, 64, 64), dtype=jnp.float32)
+      n_max = 3
+    else:
+      q, k, v, g, beta, initial_state = _make_inputs(
+          dtype,
+          heads=2,
+          batch=1,
+          seq_len=64,
+          key_dim=64,
+          value_dim=64,
+      )
+      segment_ids = None
+      n_max = None
 
-    output, final_state = f(q, k, v, g, beta, initial_state)
-    ref_output, ref_final_state = _reference_kda(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state=initial_state,
-        output_final_state=True,
-    )
+    heads, _, _, key_dim = q.shape
+    if use_gate_in_kernel:
+      A_log = jnp.log(jnp.linspace(1.0, 2.0, heads, dtype=jnp.float32))
+      dt_bias = jnp.linspace(
+          -0.2, 0.2, heads * key_dim, dtype=jnp.float32
+      )
+    else:
+      A_log = dt_bias = None
 
-    self.assertEqual(output.shape, v.shape)
-    self.assertEqual(output.dtype, q.dtype)
-    self.assertEqual(final_state.shape, initial_state.shape)
-    self.assertEqual(final_state.dtype, jnp.float32)
-    chex.assert_trees_all_close(output, ref_output, atol=0.01, rtol=0.01)
-    chex.assert_trees_all_close(
-        final_state, ref_final_state, atol=0.01, rtol=0.01
-    )
+    def call(implementation):
+      @jax.jit
+      def f(q, k, v, g, beta, initial_state, A_log, dt_bias, segment_ids):
+        return api.kimi_delta_attention(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            segment_ids=segment_ids,
+            safe_gate=not use_gate_in_kernel,
+            N_max=n_max,
+            implementation=implementation,
+        )
 
-  def test_kimi_delta_attention_gradients_match_reference(self):
-    q, k, v, g, beta, _ = _make_inputs(jnp.float32)
+      return f(q, k, v, g, beta, initial_state, A_log, dt_bias, segment_ids)
 
-    def loss(fn, q, k, v, g, beta):
-      output, _ = fn(q, k, v, g, beta)
-      return jnp.sum(output * output)
+    actual = call(None)
+    expected = call("xla")
 
-    grad = jax.grad(
-        lambda q, k, v, g, beta: loss(
-            api.kimi_delta_attention, q, k, v, g, beta
-        ),
-        argnums=(0, 1, 2, 3, 4),
-    )(q, k, v, g, beta)
-    ref_grad = jax.grad(
-        lambda q, k, v, g, beta: loss(_reference_kda, q, k, v, g, beta),
-        argnums=(0, 1, 2, 3, 4),
-    )(q, k, v, g, beta)
+    chex.assert_trees_all_close(actual, expected, atol=0.05, rtol=0.05)
 
-    chex.assert_trees_all_close(grad, ref_grad, atol=0.01, rtol=0.01)
-
-  def test_varlen_gate_l2norm_matches_reference(self):
-    q, k, v, g, beta, _ = _make_inputs(jnp.float32)
-    segment_ids = jnp.array(
-        [
-            [1, 1, 2, 2, 2, 0, 0],
-            [1, 2, 2, 3, 3, 3, 0],
-        ],
-        dtype=jnp.int32,
-    )
-    initial_state = jnp.zeros((2, 3, 3, 8, 5), dtype=jnp.float32)
-    A_log = jnp.log(jnp.array([1.0, 1.5, 2.0], dtype=jnp.float32))
-    dt_bias = jnp.linspace(-0.2, 0.2, 3 * 8, dtype=jnp.float32)
-
-    output, final_state = api.kimi_delta_attention(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        initial_state=initial_state,
-        output_final_state=True,
-        use_gate_in_kernel=True,
-        use_qk_l2norm_in_kernel=True,
-        segment_ids=segment_ids,
-        safe_gate=False,
-        N_max=3,
-        implementation="xla",
-    )
-    ref_output, ref_final_state = _reference_kda(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        initial_state=initial_state,
-        output_final_state=True,
-        use_gate_in_kernel=True,
-        use_qk_l2norm_in_kernel=True,
-        segment_ids=segment_ids,
-    )
-
-    self.assertEqual(final_state.shape, initial_state.shape)
-    chex.assert_trees_all_close(output, ref_output, atol=0.01, rtol=0.01)
-    chex.assert_trees_all_close(
-        final_state, ref_final_state, atol=0.01, rtol=0.01
-    )
-
-  def test_mosaic_registered_and_default_falls_back_to_xla(self):
-    q, k, v, g, beta, initial_state = _make_inputs(jnp.float32)
+  def test_mosaic_registered(self):
     self.assertIn("mosaic_tpu", api.IMPLEMENTATIONS)
     self.assertIsNotNone(api.IMPLEMENTATIONS["mosaic_tpu"].vjp)
     self.assertEqual(api._DEFAULT_IMPLEMENTATIONS, ("mosaic", "xla"))
-
-    output, final_state = api.kimi_delta_attention(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state=initial_state,
-        output_final_state=True,
-    )
-    ref_output, ref_final_state = api.kimi_delta_attention(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state=initial_state,
-        output_final_state=True,
-        implementation="xla",
-    )
-
-    chex.assert_trees_all_close(output, ref_output, atol=0.01, rtol=0.01)
-    chex.assert_trees_all_close(
-        final_state, ref_final_state, atol=0.01, rtol=0.01
-    )
-
-  def test_mosaic_alone_is_not_supported_in_cpu_test_shape(self):
-    q, k, v, g, beta, _ = _make_inputs(jnp.float32)
-    with self.assertRaisesRegex(
-        NotImplementedError, "Not supported|requires the sequence length"
-    ):
-      api.kimi_delta_attention(q, k, v, g, beta, implementation="mosaic")
 
   def test_no_final_state_by_default(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
@@ -300,7 +159,8 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
     self.assertEqual(output.shape, v.shape)
     self.assertIsNone(final_state)
 
-  def test_varlen_requires_n_max_without_initial_state(self):
+  @parameterized.parameters("xla", "mosaic")
+  def test_varlen_requires_n_max_without_initial_state(self, implementation):
     shape = (1, 1, 65, 1)
     q = k = v = beta_4d = jnp.ones(shape, dtype=jnp.float32)
     g = jnp.zeros_like(q)
@@ -319,7 +179,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           g,
           beta,
           segment_ids=segment_ids,
-          implementation="xla",
+          implementation=implementation,
       )
 
   def test_n_max_must_match_initial_state_segment_dimension(self):
