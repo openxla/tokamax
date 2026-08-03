@@ -22,6 +22,7 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
+import jaxtyping as jt
 import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src import numerics
@@ -247,11 +248,10 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
 
     self.assertEqual(output.shape, v.shape)
 
-  def test_invalid_shape(self):
+  def test_bind_uses_jaxtyping_validation(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
-    with self.assertRaisesRegex(ValueError, "`key` shape"):
-      with jaxtyping.disable_jaxtyping():
-        api.kimi_delta_attention(q, k[:, :, :-1], v, g, beta)
+    with self.assertRaises(jt.TypeCheckError):
+      api.IMPLEMENTATIONS["xla"].bind(q[:, :, 0], k, v, g, beta)
 
   def test_unsupported_implementation(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)

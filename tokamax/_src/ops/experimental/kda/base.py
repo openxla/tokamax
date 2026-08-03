@@ -35,11 +35,6 @@ Output: TypeAlias = tuple[jax.Array, jax.Array | None]
 Residuals: TypeAlias = Any
 
 
-def _check_array_rank(x: jax.Array, rank: int, name: str):
-  if x.ndim != rank:
-    raise ValueError(f"`{name}` must be rank {rank}, got shape {x.shape}.")
-
-
 def _validate_gate_args(
     *,
     use_gate_in_kernel: bool,
@@ -78,6 +73,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
 
   supports_symbolic_shapes = False
 
+  @jaxtyping.jaxtyped
   @override
   def bind(
       self,
@@ -102,8 +98,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       N_max: int | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
-    """Binds KDA arguments and validates the reference contract."""
-    _check_array_rank(query, 4, "query")
+    """Binds KDA arguments and validates semantic constraints."""
     heads, batch, seq_len, key_dim = query.shape
     value_dim = value.shape[-1]
 
