@@ -16,12 +16,13 @@
 """Experimental Pallas/Mosaic TPU implementation of Kimi Delta Attention."""
 
 import dataclasses
-from typing import Any
+from typing import Annotated, Any, ClassVar
 
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.kda import base
@@ -46,6 +47,13 @@ from tokamax._src.ops.experimental.kda.utils import (
     segment_ids_to_cu_seqlens,
 )
 from typing_extensions import override
+
+
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class Config:
+  """Autotuning and execution configuration for Mosaic TPU KDA."""
+
+  chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,20 +151,32 @@ def check_inputs_support(
 
 
 @dataclasses.dataclass(frozen=True)
-class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention):
+class PallasMosaicTpuKimiDeltaAttention(
+    base.KimiDeltaAttention[Config, Any]
+):
   """Pallas/Mosaic TPU KDA backend.
 
   This adapter preserves Tokamax's experimental head-first KDA contract:
   inputs are `[H, B, T, D]` and recurrent states are `[B, N, H, K, V]`.
   """
 
-  chunk_size: int = 64
+  config_cls: ClassVar[type[Config]] = Config
 
   def __post_init__(self):
-    if self.chunk_size != 64:
-      raise ValueError("`mosaic` only supports chunk_size=64.")
     if self.vjp is None:
       object.__setattr__(self, "vjp", PallasMosaicTpuKimiDeltaAttentionVjp())
+
+  @override
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    del ba
+    return Config(chunk_size=64)
+
+  @override
+  def _get_autotuning_configs(
+      self, ba: op.BoundArguments
+  ) -> set[Config]:
+    del ba
+    return {Config(chunk_size=64)}
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -348,12 +368,11 @@ class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention):
       lower_bound: float | None,
       disable_recompute: bool,
       cp_context: CPContextArg,
-      chunk_size: int,
       N_max: int | None,
       return_residuals: bool,
-      config: Any,
+      config: Config,
   ) -> tuple[base.Output, base.Residuals]:
-    del config
+    chunk_size = config.chunk_size
 
     # Reject unsupported calls before preprocessing or tracing a Pallas kernel,
     # so API dispatch can fall through to the next implementation.
@@ -418,9 +437,23 @@ class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention):
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuKimiDeltaAttentionVjp(
-    op.Op[Any, dict[str, Any], None, Any, Any]
+    op.Op[Any, dict[str, Any], None, Config, Any]
 ):
   """Tokamax Op VJP wrapper for the Pallas/Mosaic TPU KDA backward path."""
+
+  config_cls: ClassVar[type[Config]] = Config
+
+  @override
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    del ba
+    return Config(chunk_size=64)
+
+  @override
+  def _get_autotuning_configs(
+      self, ba: op.BoundArguments
+  ) -> set[Config]:
+    del ba
+    return {Config(chunk_size=64)}
 
   def _fwd(
       self,
@@ -445,10 +478,9 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       lower_bound: float | None,
       disable_recompute: bool,
       cp_context: CPContextArg,
-      chunk_size: int,
       N_max: int | None,
       return_residuals: bool,
-      config: Any,
+      config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
     # Tokamax's VJP contract replays the original inputs here, but the backward
     # kernel consumes the aligned and optionally L2-normalized copies retained
@@ -463,8 +495,8 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         output_final_state,
         return_residuals,
         safe_gate,
-        config,
     )
+    chunk_size = config.chunk_size
 
     (
         dq,

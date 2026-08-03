@@ -99,7 +99,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       lower_bound: float | None = None,
       disable_recompute: bool = True,
       cp_context: CPContext | None = None,
-      chunk_size: int = 64,
       N_max: int | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
@@ -153,8 +152,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       raise ValueError(
           f"`segment_ids` shape {segment_ids.shape} must be {(batch, seq_len)}."
       )
-    if chunk_size <= 0:
-      raise ValueError(f"`chunk_size` must be positive, got {chunk_size}.")
     if N_max is not None and N_max <= 0:
       raise ValueError(f"`N_max` must be positive, got {N_max}.")
     if segment_ids is not None and initial_state is None and N_max is None:
@@ -193,7 +190,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         lower_bound=lower_bound,
         disable_recompute=disable_recompute,
         cp_context=cp_context,
-        chunk_size=chunk_size,
         N_max=N_max,
         return_residuals=return_residuals,
     )
@@ -220,13 +216,12 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       lower_bound: float | None,
       disable_recompute: bool,
       cp_context: CPContextArg,
-      chunk_size: int,
       N_max: int | None,
       return_residuals: bool,
       config: _Config,
   ) -> tuple[Output, Residuals]:
     """Dispatches to the pure JAX KDA reference implementation."""
-    del config, return_residuals, safe_gate, disable_recompute, chunk_size
+    del config, return_residuals, safe_gate, disable_recompute
     output = reference.kimi_delta_attention(
         query,
         key,

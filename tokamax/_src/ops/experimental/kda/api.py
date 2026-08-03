@@ -62,7 +62,6 @@ def kimi_delta_attention(
     lower_bound: float | None = None,
     disable_recompute: bool = True,
     cp_context: CPContext | None = None,
-    chunk_size: int = 64,
     N_max: int | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> tuple[Float[Array, "H B T V"], Float[Array, "B N H K V"] | None]:
@@ -97,7 +96,6 @@ def kimi_delta_attention(
       implementations accept it but the mathematical result is unchanged.
     cp_context: Optional context-parallel metadata. Construct it with
       `kda.CPContext(mesh, axis_name)`.
-    chunk_size: Chunk size used by Pallas.
     N_max: Static upper bound for the number of varlen segments. Required when
       `segment_ids` is provided without `initial_state`; otherwise inferred
       from the initial state's segment dimension.
@@ -146,7 +144,6 @@ def kimi_delta_attention(
           lower_bound=lower_bound,
           disable_recompute=disable_recompute,
           cp_context=cp_context,
-          chunk_size=chunk_size,
           N_max=N_max,
       )
     except NotImplementedError as e:

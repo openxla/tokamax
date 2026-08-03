@@ -15,6 +15,8 @@
 # ==============================================================================
 """Tests for the KDA base contract and API dispatch."""
 
+import inspect
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -135,6 +137,11 @@ def _make_inputs(dtype):
 
 
 class KimiDeltaAttentionTest(parameterized.TestCase):
+
+  def test_chunk_size_is_not_public(self):
+    self.assertNotIn(
+        "chunk_size", inspect.signature(api.kimi_delta_attention).parameters
+    )
 
   @parameterized.parameters(jnp.bfloat16, jnp.float32)
   def test_kimi_delta_attention_matches_reference(self, dtype):

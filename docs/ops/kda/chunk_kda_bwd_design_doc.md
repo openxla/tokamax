@@ -148,7 +148,7 @@ Outputs:
 
 Static constraints:
 
-- the delivered Pallas adapter requires `BT=chunk_size=64`;
+- the delivered Mosaic config provides `BT=chunk_size=64`;
 - prepared `T` must be divisible by `BT`; variable-length inputs are aligned before residual construction;
 - the main path uses the log2 gate, i.e. `use_exp2=True`;
 - non-CP execution supports the backend's delivered `K<=256` contract, including non-128-aligned `K/V`; CP currently requires both `K` and `V` to be multiples of 128.

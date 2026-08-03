@@ -956,7 +956,6 @@ def _attention_kwargs(case: TestConfig, inputs: _Inputs) -> dict[str, object]:
       safe_gate=case.safe_gate,
       lower_bound=case.lower_bound,
       disable_recompute=case.disable_recompute,
-      chunk_size=64,
       N_max=case.n_max,
   )
 

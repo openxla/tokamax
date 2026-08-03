@@ -81,13 +81,14 @@ KDA output is not a softmax-weighted sum. It is the sum of a read from the state
 | Numerics | `use_qk_l2norm_in_kernel` | `False` | Requests q/k L2 normalization in `_preprocess_inputs` before Pallas execution |
 | State/output | `output_final_state` | `False` | Requests final recurrent states; CP execution does not support `True` |
 | Sequence | `segment_ids` | `None` | Optional 1-indexed varlen segment IDs shaped `[B,T]`; `0` denotes padding, and CP requires rank-local segment IDs |
-| Sequence | `chunk_size` | `64` | Chunk size used by the Pallas path; the delivered implementation supports only `64` |
 | Sequence | `N_max` | `None` | Static upper bound on varlen segment count; required when varlen input has no `initial_state`, and always required for CP |
 | CP | `cp_context` | `None` | Optional CP mesh and axis metadata; active CP additionally forbids external/final state and requires `K` and `V` to be multiples of 128 |
 | Residual policy | `disable_recompute` | `True` | Selects saved-state versus recompute behavior for the custom backward without changing the mathematical forward result |
 | Residual policy | `return_residuals` | `False` | Internal bind/backend control that returns `KdaResiduals` for the custom backward; it is not exposed as an additional public KDA result |
 
-`config` is injected by the Tokamax `Op` framework. The current Pallas TPU forward deletes it at entry and does not use it as part of the mathematical or kernel-selection contract.
+`config` is injected by the Tokamax `Op` framework. `chunk_size` is not part of
+the public KDA API; Mosaic forward and VJP read it from `Config`. The current
+heuristics and autotuning set provide only `Config(chunk_size=64)`.
 
 ### 2.2 Supported Functionality
 

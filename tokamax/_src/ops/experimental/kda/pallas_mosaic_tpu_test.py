@@ -39,6 +39,16 @@ def _check_inputs_support(q, v, **overrides):
 
 class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
 
+  def test_chunk_size_config(self):
+    attention = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention()
+    vjp = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttentionVjp()
+    expected = pallas_mosaic_tpu.Config(chunk_size=64)
+
+    self.assertEqual(attention._get_heuristics_config(None), expected)
+    self.assertEqual(attention._get_autotuning_configs(None), {expected})
+    self.assertEqual(vjp._get_heuristics_config(None), expected)
+    self.assertEqual(vjp._get_autotuning_configs(None), {expected})
+
   def test_rejects_large_key_dimension_before_kernel(self):
     q = jnp.ones((1, 1, 64, 257), dtype=jnp.float32)
     v = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
