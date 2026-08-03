@@ -180,7 +180,7 @@ def all_gather_into_tensor(
 def _derive_cp_metadata_from_segment_ids(
   segment_ids_local: jax.Array,
   axis_name: str,
-  n_max: int,
+  max_num_segments: int,
   chunk_size: int = 1,
 ) -> tuple[jax.Array, dict]:
   """Derive ``cu_local`` and chain metadata from **rank-local** segment_ids.
@@ -209,13 +209,14 @@ def _derive_cp_metadata_from_segment_ids(
     segment_ids_local: ``[T_local]`` or ``[1, T_local]`` int32. 1-indexed
       (``0 = padding``). Same id convention as ``segment_ids_to_seqlens``.
     axis_name: Mesh axis to gather across (the CP axis).
-    n_max: Static upper bound on per-rank segment count. Determines the
-      padded shape of the returned ``cu_local``.
+    max_num_segments: Static upper bound on per-rank segment count. Determines
+      the padded shape of the returned ``cu_local``.
     chunk_size: Passed through to ``segment_ids_to_seqlens`` (default 1).
 
   Returns:
     Tuple ``(cu_local, chain_meta)``:
-      - ``cu_local``: ``[n_max + 1]`` int32 (padded by repeating last value).
+      - ``cu_local``: ``[max_num_segments + 1]`` int32 (padded by repeating the
+        last value).
       - ``chain_meta``: dict with traced scalar entries
         ``{'pre_num_ranks', 'post_num_ranks', 'is_first_rank', 'is_last_rank'}``.
 
@@ -235,11 +236,13 @@ def _derive_cp_metadata_from_segment_ids(
     seg = segment_ids_local
   T_local = seg.shape[0]
 
-  # ── (1) cu_local: re-use the existing helper. It pads to n_max+1 by
-  # repeating the total valid length (matches the zero-length-tail
-  # convention pre-process / chunk_kda_fwd already handle).
+  # ── (1) cu_local: re-use the existing helper. It pads to
+  # max_num_segments+1 by repeating the total valid length (matches the
+  # zero-length-tail convention pre-process / chunk_kda_fwd already handle).
   from tokamax._src.ops.experimental.kda.utils import segment_ids_to_seqlens  # local import to avoid cycle
-  cu_local = segment_ids_to_seqlens(seg, max_segs=n_max, chunk_size=chunk_size)
+  cu_local = segment_ids_to_seqlens(
+      seg, max_segs=max_num_segments, chunk_size=chunk_size
+  )
 
   # ── (2) chain metadata via one small all_gather.
   # First/last *valid* (non-padding) segment id on this rank. argmax on a

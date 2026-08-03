@@ -83,7 +83,7 @@ def check_inputs_support(
     segment_ids: jax.Array | None,
     cp_context: CPContext | None,
     chunk_size: int,
-    N_max: int | None,
+    max_num_segments: int | None,
 ) -> None:
   """Checks whether the Pallas/Mosaic TPU backend supports static inputs."""
   if q.dtype not in (jnp.bfloat16, jnp.float32):
@@ -124,9 +124,9 @@ def check_inputs_support(
           "`mosaic` context-parallel execution requires rank-local "
           "`segment_ids`."
       )
-    if N_max is None:
+    if max_num_segments is None:
       raise NotImplementedError(
-          "`mosaic` context-parallel execution requires `N_max`."
+          "`mosaic` context-parallel execution requires `max_num_segments`."
       )
     if key_dim % 128 != 0 or value_dim % 128 != 0:
       raise NotImplementedError(
@@ -197,7 +197,7 @@ class PallasMosaicTpuKimiDeltaAttention(
       segment_ids: jax.Array | None,
       cp_context: CPContext | None,
       chunk_size: int,
-      N_max: int | None,
+      max_num_segments: int | None,
   ) -> _PreparedKdaInputs:
     """Canonicalizes inputs shared by the forward and backward kernels."""
     cp_context, cu_seqlens = derive_cp_context(
@@ -205,13 +205,13 @@ class PallasMosaicTpuKimiDeltaAttention(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cp_context=cp_context,
-        N_max=N_max,
+        max_num_segments=max_num_segments,
     )
     if cu_seqlens is None:
-      cu_seqlens, N_max = segment_ids_to_cu_seqlens(
+      cu_seqlens, max_num_segments = segment_ids_to_cu_seqlens(
           segment_ids,
           initial_state=initial_state,
-          N_max=N_max,
+          max_num_segments=max_num_segments,
       )
 
     aligned_cu_seqlens = None
@@ -289,15 +289,17 @@ class PallasMosaicTpuKimiDeltaAttention(
 
     aligned_segment_ids = None
     if aligned_cu_seqlens is not None and segment_ids is not None:
-      effective_n_max = (
-          N_max
-          if N_max is not None
+      effective_max_num_segments = (
+          max_num_segments
+          if max_num_segments is not None
           else aligned_cu_seqlens.shape[-1] - 1
       )
       aligned_segment_ids = jnp.stack(
           [
               align_segment_ids(
-                  segment_ids[batch_index], effective_n_max, chunk_size
+                  segment_ids[batch_index],
+                  effective_max_num_segments,
+                  chunk_size,
               )
               for batch_index in range(segment_ids.shape[0])
           ]
@@ -356,7 +358,7 @@ class PallasMosaicTpuKimiDeltaAttention(
       gate: Float[Array, "H B T K"],
       beta: Float[Array, "H B T"],
       *,
-      A_log: Float[Array, "H"] | None,
+      a_log: Float[Array, "H"] | None,
       dt_bias: Float[Array, "H*K"] | None,
       scale: float,
       initial_state: Float[Array, "B N H K V"] | None,
@@ -368,7 +370,7 @@ class PallasMosaicTpuKimiDeltaAttention(
       lower_bound: float | None,
       disable_recompute: bool,
       cp_context: CPContextArg,
-      N_max: int | None,
+      max_num_segments: int | None,
       return_residuals: bool,
       config: Config,
   ) -> tuple[base.Output, base.Residuals]:
@@ -384,7 +386,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         segment_ids=segment_ids,
         cp_context=cp_context,
         chunk_size=chunk_size,
-        N_max=N_max,
+        max_num_segments=max_num_segments,
     )
 
     prepared = self._preprocess_inputs(
@@ -400,7 +402,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         segment_ids=segment_ids,
         cp_context=cp_context,
         chunk_size=chunk_size,
-        N_max=N_max,
+        max_num_segments=max_num_segments,
     )
 
     output, residuals = chunk_kda_fwd_custom(
@@ -409,7 +411,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         prepared.v,
         prepared.g,
         prepared.beta,
-        A_log=A_log,
+        a_log=a_log,
         dt_bias=dt_bias,
         scale=scale,
         initial_state=prepared.initial_state,
@@ -466,7 +468,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       gate: jax.Array,
       beta: jax.Array,
       *,
-      A_log: jax.Array | None,
+      a_log: jax.Array | None,
       dt_bias: jax.Array | None,
       scale: float,
       initial_state: jax.Array | None,
@@ -478,7 +480,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       lower_bound: float | None,
       disable_recompute: bool,
       cp_context: CPContextArg,
-      N_max: int | None,
+      max_num_segments: int | None,
       return_residuals: bool,
       config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
@@ -516,7 +518,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         disable_recompute,
         cp_context,
         chunk_size,
-        N_max,
+        max_num_segments,
         initial_state is not None,
         residuals,
         dout,
@@ -529,8 +531,8 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         "gate": dg,
         "beta": db,
     }
-    if A_log is not None:
-      grads["A_log"] = dA if dA is not None else jnp.zeros_like(A_log)
+    if a_log is not None:
+      grads["a_log"] = dA if dA is not None else jnp.zeros_like(a_log)
     if dt_bias is not None:
       grads["dt_bias"] = (
           dbias if dbias is not None else jnp.zeros_like(dt_bias)

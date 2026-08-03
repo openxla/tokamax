@@ -387,7 +387,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
 @jaxtyping.jaxtyped
 def kda_gate_bwd(
   g: Float[Array, "H B T K"],
-  A_log: Float[Array, "H"],
+  a_log: Float[Array, "H"],
   *,
   dyg: Float[Array, "H B T K"],
   dt_bias: Float[Array, "H*K"] | None = None,
@@ -397,9 +397,9 @@ def kda_gate_bwd(
     Float[Array, "H"],
     Float[Array, "H*K"] | None,
 ]:
-  """Differentiates the KDA gate with respect to g, A_log, and dt_bias.
+  """Differentiates the KDA gate with respect to g, a_log, and dt_bias.
 
-  The standard path differentiates `-exp(A_log) * softplus(g + bias)`; the
+  The standard path differentiates `-exp(a_log) * softplus(g + bias)`; the
   lower-bound path differentiates the sigmoid form.
   """
   H, K = g.shape[0], g.shape[-1]
@@ -412,15 +412,15 @@ def kda_gate_bwd(
     g_f = g_f + dt_bias.reshape(H, 1, 1, K).astype(jnp.float32)
 
   if lower_bound is None:
-    # Forward: yg = -exp(A_log) * softplus(g + bias)
+    # Forward: yg = -exp(a_log) * softplus(g + bias)
     # softplus(x) = log(1 + exp(x)), d/dx softplus(x) = sigmoid(x)
-    b_A = -jnp.exp(A_log.astype(jnp.float32))  # [H]
+    b_A = -jnp.exp(a_log.astype(jnp.float32))  # [H]
     b_yg = b_A.reshape(H, 1, 1, 1) * jax.nn.softplus(g_f)  # [H, B, T, K]
     dg_f = b_A.reshape(H, 1, 1, 1) * (dyg_f * jax.nn.sigmoid(g_f))  # [H, B, T, K]
     dA_per_elem = dyg_f * b_yg  # [H, B, T, K]
   else:
-    # Forward: yg = lower_bound * sigmoid(exp(A_log) * g)
-    b_A = jnp.exp(A_log.astype(jnp.float32))  # [H]
+    # Forward: yg = lower_bound * sigmoid(exp(a_log) * g)
+    b_A = jnp.exp(a_log.astype(jnp.float32))  # [H]
     b_inner = b_A.reshape(H, 1, 1, 1) * g_f  # [H, B, T, K]
     b_sig = jax.nn.sigmoid(b_inner)
     b_dsig = b_sig * (1.0 - b_sig)
@@ -430,7 +430,7 @@ def kda_gate_bwd(
   # dA: reduce over all dims except H (axis 0) → [H]
   reduce_axes = (1, 2, 3)
   dA = jnp.sum(dA_per_elem, axis=reduce_axes)
-  dA = dA.astype(A_log.dtype)
+  dA = dA.astype(a_log.dtype)
 
   # Cast dg back to input dtype
   dg = dg_f.astype(g.dtype)
@@ -1068,7 +1068,14 @@ def _fused_dhu_wy_intra_cumsum_kernel(
 
 @partial(
   jax.jit,
-  static_argnames=["chunk_size", "use_exp2", "scale", "mini_batch", "return_dh0", "N_MAX"],
+  static_argnames=[
+      "chunk_size",
+      "use_exp2",
+      "scale",
+      "mini_batch",
+      "return_dh0",
+      "max_num_segments",
+  ],
 )
 @jaxtyping.jaxtyped
 def _fused_dhu_wy_intra_cumsum_pallas_jit(
@@ -1094,7 +1101,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   use_exp2: bool = True,
   mini_batch: int | None = None,
   return_dh0: bool = True,
-  N_MAX: int | None = None
+  max_num_segments: int | None = None,
 ) -> tuple[
   Float[Array, "H B T K"],
   Float[Array, "H B T K"],
@@ -1129,7 +1136,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   if dht is not None:
     N = dht.shape[1]  # dht is [B, N, H, K, V], N is dim 1
   elif is_varlen:
-    N = N_MAX
+    N = max_num_segments
   else:
     N = 1  # uniform: one sequence per batch element
   if dht is not None:
@@ -1467,7 +1474,7 @@ def chunk_kda_bwd_dAv_kernel(
     "disable_recompute",
     "cp_context",
     "chunk_size",
-    "N_max",
+    "max_num_segments",
     "has_initial_state",
   ],
 )
@@ -1480,7 +1487,7 @@ def chunk_kda_bwd_custom(
     disable_recompute: bool,
     cp_context: CPContext | None,
     chunk_size: int,
-    N_max: int | None,
+    max_num_segments: int | None,
     has_initial_state: bool,
     residuals: KdaResiduals,
     grad_outputs: tuple[
@@ -1511,7 +1518,7 @@ def chunk_kda_bwd_custom(
   Akk = residuals.akk
   initial_state = residuals.initial_state
   g_org = residuals.g_org
-  A_log = residuals.a_log
+  a_log = residuals.a_log
   dt_bias = residuals.dt_bias
   h = residuals.h
   g_dtype_marker = residuals.g_dtype_marker
@@ -1551,9 +1558,9 @@ def chunk_kda_bwd_custom(
         post_num_ranks=post_num_ranks,
     )
 
-  effective_n_max = N_max
+  effective_max_num_segments = max_num_segments
   if aligned_cu is not None:
-    effective_n_max = aligned_cu.shape[-1] - 1
+    effective_max_num_segments = aligned_cu.shape[-1] - 1
 
   original_cu_seqlens = cu_seqlens
   g = g_cumsum
@@ -1564,7 +1571,7 @@ def chunk_kda_bwd_custom(
       if segment_ids_aligned is not None
       else segment_ids
   )
-  N_max = effective_n_max
+  max_num_segments = effective_max_num_segments
 
   H, B, T, K = q.shape
   V = v.shape[-1]
@@ -1573,23 +1580,29 @@ def chunk_kda_bwd_custom(
   scale = K ** -0.5 if scale is None else scale
   if (cu_seqlens is None) and (segment_ids is not None):
     # per-batch cu_seqlens [B, N+1]
-    caller_N_max = N_max
-    if caller_N_max is not None:
-      N_max = caller_N_max
+    caller_max_num_segments = max_num_segments
+    if caller_max_num_segments is not None:
+      max_num_segments = caller_max_num_segments
     else:
       if initial_state is None:
         raise ValueError(
-            "`N_max` is required when `segment_ids` is provided without "
-            "`initial_state`."
+            "`max_num_segments` is required when `segment_ids` is provided "
+            "without `initial_state`."
         )
       # Varlen: (B, N, H, K, V)
-      N_max = initial_state.shape[1]
-    cu_seqlens = segment_ids_to_seqlens(segment_ids, max_segs=N_max)
+      max_num_segments = initial_state.shape[1]
+    cu_seqlens = segment_ids_to_seqlens(segment_ids, max_segs=max_num_segments)
 
-  # "N_max must be provided when segment_ids are used" — unless cu_seqlens
-  # was already derived upstream (e.g. bwd receives it from fwd residuals).
-  if segment_ids is not None and cu_seqlens is None and N_max is None:
-    raise ValueError("`N_max` is required when segment metadata is unavailable.")
+  # max_num_segments must be provided when segment_ids are used, unless
+  # cu_seqlens was already derived upstream (e.g. from forward residuals).
+  if (
+      segment_ids is not None
+      and cu_seqlens is None
+      and max_num_segments is None
+  ):
+    raise ValueError(
+        "`max_num_segments` is required when segment metadata is unavailable."
+    )
   if do.shape[2] != T:
     raise ValueError(f"aligned do has T={do.shape[2]}, expected {T}")
   if Aqk.shape[-1] != BT or Akk.shape[-1] != BT:
@@ -1611,11 +1624,11 @@ def chunk_kda_bwd_custom(
   if disable_recompute:
     # Path A: save-h fast path.
     if use_gate_in_kernel:
-      if A_log is None:
-        raise ValueError("A_log is required when use_gate_in_kernel=True")
+      if a_log is None:
+        raise ValueError("a_log is required when use_gate_in_kernel=True")
       g_cumsum = kda_gate_chunk_cumsum(
         g=g_org,
-        A_log=A_log,
+        a_log=a_log,
         chunk_size=BT,
         scale=RCP_LN2,
         dt_bias=dt_bias,
@@ -1642,11 +1655,11 @@ def chunk_kda_bwd_custom(
   else:
     # Path B: full recompute fallback.
     if use_gate_in_kernel:
-      if A_log is None:
-        raise ValueError("A_log is required when use_gate_in_kernel=True")
+      if a_log is None:
+        raise ValueError("a_log is required when use_gate_in_kernel=True")
       g_cumsum = kda_gate_chunk_cumsum(
         g=g_org,
-        A_log=A_log,
+        a_log=a_log,
         chunk_size=BT,
         scale=RCP_LN2,
         dt_bias=dt_bias,
@@ -1751,7 +1764,7 @@ def chunk_kda_bwd_custom(
     # dS_in: [B, H, K, V] — merged downstream gradient for each batch element.
     # M4 expects dht as [B, N, H, K, V] with per-batch segment indexing.
     # dS_in[b] goes to slot (last_seg_id_b - 1) in its own N dimension.
-    N = N_max
+    N = max_num_segments
     dht = jnp.zeros((B, N, H, K, V), dtype=jnp.float32)
     max_per_batch = jnp.max(segment_ids, axis=1)  # [B]
     for b in range(B):
@@ -1794,14 +1807,14 @@ def chunk_kda_bwd_custom(
     chunk_size=chunk_size,
     use_exp2=True,
     return_dh0=initial_state is not None,
-    N_MAX=N_max
+    max_num_segments=max_num_segments,
   )
 
   dA, dbias = None, None
   if use_gate_in_kernel:
     dg, dA, dbias = kda_gate_bwd(
       g=g_org,
-      A_log=A_log,
+      a_log=a_log,
       dt_bias=dt_bias,
       dyg=dg,
       lower_bound=lower_bound,

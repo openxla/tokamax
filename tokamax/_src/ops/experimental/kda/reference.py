@@ -34,17 +34,17 @@ def _l2_normalize(x: jax.Array, acc_dtype: jnp.dtype) -> jax.Array:
 def _activate_gate(
     g: jax.Array,
     *,
-    A_log: jax.Array | None,
+    a_log: jax.Array | None,
     dt_bias: jax.Array | None,
     lower_bound: float | None,
 ) -> jax.Array:
   heads, _, _, key_dim = g.shape
-  if A_log is None:
-    raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True`.")
+  if a_log is None:
+    raise ValueError("`a_log` must be provided when `use_gate_in_kernel=True`.")
   g_f = g.astype(jnp.float32)
   if dt_bias is not None:
     g_f = g_f + dt_bias.astype(jnp.float32).reshape(heads, 1, 1, key_dim)
-  A = jnp.exp(A_log.astype(jnp.float32)).reshape(heads, 1, 1, 1)
+  A = jnp.exp(a_log.astype(jnp.float32)).reshape(heads, 1, 1, 1)
   if lower_bound is None:
     return -A * jax.nn.softplus(g_f)
   return lower_bound * jax.nn.sigmoid(A * g_f)
@@ -54,16 +54,16 @@ def _state_count(
     *,
     segment_ids: jax.Array | None,
     initial_state: jax.Array | None,
-    N_max: int | None,
+    max_num_segments: int | None,
 ) -> int:
   if initial_state is not None:
     return initial_state.shape[1]
   if segment_ids is None:
     return 1
-  if N_max is not None:
-    return N_max
+  if max_num_segments is not None:
+    return max_num_segments
   raise ValueError(
-      "`N_max` is required when `segment_ids` is provided without "
+      "`max_num_segments` is required when `segment_ids` is provided without "
       "`initial_state`."
   )
 
@@ -75,7 +75,7 @@ def kimi_delta_attention(
     gate: jax.Array,
     beta: jax.Array,
     *,
-    A_log: jax.Array | None,
+    a_log: jax.Array | None,
     dt_bias: jax.Array | None,
     scale: float,
     initial_state: jax.Array | None,
@@ -85,7 +85,7 @@ def kimi_delta_attention(
     segment_ids: jax.Array | None,
     lower_bound: float | None,
     cp_context: CPContextArg,
-    N_max: int | None,
+    max_num_segments: int | None,
 ) -> tuple[jax.Array, jax.Array | None]:
   """Computes KDA with an explicit token-by-token JAX recurrence."""
   q, k, v, g = query, key, value, gate
@@ -97,7 +97,7 @@ def kimi_delta_attention(
 
   if use_gate_in_kernel:
     g = _activate_gate(
-        g, A_log=A_log, dt_bias=dt_bias, lower_bound=lower_bound
+        g, a_log=a_log, dt_bias=dt_bias, lower_bound=lower_bound
     )
   if use_qk_l2norm_in_kernel:
     q_h = _l2_normalize(q, acc_dtype)
@@ -136,7 +136,7 @@ def kimi_delta_attention(
   num_states = _state_count(
       segment_ids=segment_ids,
       initial_state=initial_state,
-      N_max=N_max,
+      max_num_segments=max_num_segments,
   )
 
   states = jnp.zeros(

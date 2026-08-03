@@ -50,7 +50,7 @@ def kimi_delta_attention(
     gate: Float[Array, "H B T K"],
     beta: Float[Array, "H B T"],
     *,
-    A_log: Float[Array, "H"] | None = None,
+    a_log: Float[Array, "H"] | None = None,
     dt_bias: Float[Array, "H*K"] | None = None,
     scale: float | None = None,
     initial_state: Float[Array, "B N H K V"] | None = None,
@@ -62,7 +62,7 @@ def kimi_delta_attention(
     lower_bound: float | None = None,
     disable_recompute: bool = True,
     cp_context: CPContext | None = None,
-    N_max: int | None = None,
+    max_num_segments: int | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> tuple[Float[Array, "H B T V"], Float[Array, "B N H K V"] | None]:
   """Kimi Delta Attention.
@@ -77,17 +77,18 @@ def kimi_delta_attention(
     value: Value tensor with shape `[H, B, T, V]`.
     gate: Per-channel gate tensor in log space, shape `[H, B, T, K]`.
     beta: Per-token delta-rule learning-rate tensor, shape `[H, B, T]`.
-    A_log: Gate parameter, shape `[H]`. Required when
+    a_log: Gate parameter, shape `[H]`. Required when
       `use_gate_in_kernel=True`.
     dt_bias: Optional gate bias, shape `[H * K]`.
     scale: Query scale. Defaults to `K ** -0.5`.
     initial_state: Optional initial recurrent state, shape `[B, N, H, K, V]`.
-      Its segment dimension `N` determines `N_max` when the latter is omitted.
+      Its segment dimension `N` determines `max_num_segments` when the latter
+      is omitted.
     output_final_state: Whether to return the final recurrent state.
     use_qk_l2norm_in_kernel: Whether to normalize query/key on the last
       dimension before running KDA.
     use_gate_in_kernel: Whether `gate` is raw input that should be activated
-      with `A_log` and `dt_bias`. When false, `gate` is already in log space.
+      with `a_log` and `dt_bias`. When false, `gate` is already in log space.
     segment_ids: Optional 1-indexed varlen segment IDs, shape `[B, T]`.
       Padding is represented by 0.
     safe_gate: Match pallas-kernel gate validation.
@@ -96,9 +97,9 @@ def kimi_delta_attention(
       implementations accept it but the mathematical result is unchanged.
     cp_context: Optional context-parallel metadata. Construct it with
       `kda.CPContext(mesh, axis_name)`.
-    N_max: Static upper bound for the number of varlen segments. Required when
-      `segment_ids` is provided without `initial_state`; otherwise inferred
-      from the initial state's segment dimension.
+    max_num_segments: Static upper bound for the number of varlen segments.
+      Required when `segment_ids` is provided without `initial_state`;
+      otherwise inferred from the initial state's segment dimension.
     implementation: The implementation to use. By default, the Mosaic TPU
       implementation is attempted first when available, with XLA as a fallback.
       `"xla"` evaluates the recurrent reference implementation. `"mosaic"`
@@ -132,7 +133,7 @@ def kimi_delta_attention(
           value=value,
           gate=gate,
           beta=beta,
-          A_log=A_log,
+          a_log=a_log,
           dt_bias=dt_bias,
           scale=scale,
           initial_state=initial_state,
@@ -144,7 +145,7 @@ def kimi_delta_attention(
           lower_bound=lower_bound,
           disable_recompute=disable_recompute,
           cp_context=cp_context,
-          N_max=N_max,
+          max_num_segments=max_num_segments,
       )
     except NotImplementedError as e:
       if len(implementation) == 1:

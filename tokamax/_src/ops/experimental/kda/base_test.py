@@ -93,7 +93,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           dtype=jnp.int32,
       )
       initial_state = jnp.zeros((2, 3, 2, 64, 64), dtype=jnp.float32)
-      n_max = 3
+      max_num_segments = 3
     else:
       q, k, v, g, beta, initial_state = _make_inputs(
           dtype,
@@ -104,27 +104,27 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           value_dim=64,
       )
       segment_ids = None
-      n_max = None
+      max_num_segments = None
 
     heads, _, _, key_dim = q.shape
     if use_gate_in_kernel:
-      A_log = jnp.log(jnp.linspace(1.0, 2.0, heads, dtype=jnp.float32))
+      a_log = jnp.log(jnp.linspace(1.0, 2.0, heads, dtype=jnp.float32))
       dt_bias = jnp.linspace(
           -0.2, 0.2, heads * key_dim, dtype=jnp.float32
       )
     else:
-      A_log = dt_bias = None
+      a_log = dt_bias = None
 
     def call(implementation):
       @jax.jit
-      def f(q, k, v, g, beta, initial_state, A_log, dt_bias, segment_ids):
+      def f(q, k, v, g, beta, initial_state, a_log, dt_bias, segment_ids):
         return api.kimi_delta_attention(
             q,
             k,
             v,
             g,
             beta,
-            A_log=A_log,
+            a_log=a_log,
             dt_bias=dt_bias,
             initial_state=initial_state,
             output_final_state=True,
@@ -132,11 +132,11 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
             use_gate_in_kernel=use_gate_in_kernel,
             segment_ids=segment_ids,
             safe_gate=not use_gate_in_kernel,
-            N_max=n_max,
+            max_num_segments=max_num_segments,
             implementation=implementation,
         )
 
-      return f(q, k, v, g, beta, initial_state, A_log, dt_bias, segment_ids)
+      return f(q, k, v, g, beta, initial_state, a_log, dt_bias, segment_ids)
 
     actual = call(None)
     expected = call("xla")
@@ -161,7 +161,9 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
     self.assertIsNone(final_state)
 
   @parameterized.parameters("xla", "mosaic")
-  def test_varlen_requires_n_max_without_initial_state(self, implementation):
+  def test_varlen_requires_max_num_segments_without_initial_state(
+      self, implementation
+  ):
     shape = (1, 1, 65, 1)
     q = k = v = beta_4d = jnp.ones(shape, dtype=jnp.float32)
     g = jnp.zeros_like(q)
@@ -172,7 +174,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         jnp.full((1, 25), 3, dtype=jnp.int32),
     ], axis=1)
 
-    with self.assertRaisesRegex(ValueError, "`N_max` is required"):
+    with self.assertRaisesRegex(ValueError, "`max_num_segments` is required"):
       api.kimi_delta_attention(
           q,
           k,
@@ -183,7 +185,9 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           implementation=implementation,
       )
 
-  def test_n_max_must_match_initial_state_segment_dimension(self):
+  def test_max_num_segments_must_match_initial_state_segment_dimension(
+      self,
+  ):
     q, k, v, g, beta, initial_state = _make_inputs(jnp.float32)
 
     with self.assertRaisesRegex(ValueError, "must match"):
@@ -194,7 +198,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           g,
           beta,
           initial_state=initial_state,
-          N_max=2,
+          max_num_segments=2,
           implementation="xla",
       )
 
@@ -212,7 +216,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         beta,
         segment_ids=segment_ids,
         output_final_state=True,
-        N_max=1,
+        max_num_segments=1,
         implementation="xla",
     )
     _, unpadded_final_state = api.kimi_delta_attention(
@@ -223,7 +227,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         beta[:, :, :1],
         segment_ids=segment_ids[:, :1],
         output_final_state=True,
-        N_max=1,
+        max_num_segments=1,
         implementation="xla",
     )
 

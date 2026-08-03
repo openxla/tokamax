@@ -75,7 +75,7 @@ def _pre_process_kernel(
       Computed in the launcher rather than reading ``chunk_to_seq[NT-1]``
       because ``prepare_chunk_indices``'s ``jnp.repeat(total_repeat_length=...)``
       pads trailing slots with the **last input value** (= the last
-      trailing-padding seg id when ``cu_seqlens`` has N_max padding),
+      trailing-padding seg id when ``cu_seqlens`` has max_num_segments padding),
       which would mis-identify the real last seg.
     - Only chunks of the LAST segment contribute to (S_ext, M); others
       no-op (BlockSpec DMA still happens but compute is skipped).
@@ -230,12 +230,12 @@ def _pre_process_pallas(
 
   # ── Real last seg idx (largest i where cu_seqlens[i+1] > cu_seqlens[i]) ──
   # MUST NOT derive from chunk_to_seq[NT-1] inside the kernel: when
-  # cu_seqlens is N_max-padded with trailing zero-length segments,
+  # cu_seqlens is max_num_segments-padded with trailing zero-length segments,
   # prepare_chunk_indices's `jnp.repeat(total_repeat_length=...)` pads
   # the trailing chunk_to_seq slots with the LAST input seg id (= the
   # trailing-padding seg id), which would point at a phantom segment.
   # Computing real_last_seg_idx here from cu_seqlens directly is robust
-  # to any N_max padding scheme.
+  # to any max_num_segments padding scheme.
   seg_lens = jnp.diff(cu_seqlens)  # [N]
   seg_indices = jnp.arange(seg_lens.shape[0], dtype=jnp.int32)
   real_last_seg_idx = jnp.maximum(
@@ -518,7 +518,7 @@ def _fused_gate_intra_kernel(
   g_ref,
   beta_ref,
   v_ref,
-  A_log_ref,
+  a_log_ref,
   dt_bias_ref,
   u_out_ref,
   w_out_ref,
@@ -550,7 +550,7 @@ def _fused_gate_intra_kernel(
   For float32 inputs, falls back to exact forward substitution.
 
   All refs have leading dims from BlockSpec: [1, MB, 1, BT, D].
-  A_log_ref: [1, MB, 1, 1, 1] — per-head scalar.
+  a_log_ref: [1, MB, 1, 1, 1] — per-head scalar.
   dt_bias_ref: [1, MB, 1, 1, K] — per-head bias vector.
 
   MB heads are processed simultaneously via batch-vectorized ops.
@@ -579,7 +579,7 @@ def _fused_gate_intra_kernel(
   if use_gate_in_kernel:
     dt_b = dt_bias_ref[:, 0, 0, 0]        # [MB, K]
     g_f32 = g_f32 + dt_b[:, None, :]       # [MB, BT, K]
-    A_val = A_log_ref[:, 0, 0, 0, 0]       # [MB]
+    A_val = a_log_ref[:, 0, 0, 0, 0]       # [MB]
     if lower_bound is None:
       g_f32 = -jnp.exp(A_val)[:, None, None] * jax.nn.softplus(g_f32)
     else:
@@ -799,7 +799,7 @@ def pallas_kda_fwd_intra_fused(
   safe_gate: bool = True,
   disable_recompute: bool = False,
   cumsum_scale: float = RCP_LN2,
-  A_log: Float[Array, "H"] | None = None,
+  a_log: Float[Array, "H"] | None = None,
   dt_bias: Float[Array, "H*K"] | None = None,
   use_gate_in_kernel: bool = False,
   lower_bound: float | None = None,
@@ -825,7 +825,7 @@ def pallas_kda_fwd_intra_fused(
   NC = T // BT
 
   if use_gate_in_kernel:
-    assert A_log is not None, "A_log required when use_gate_in_kernel=True"
+    assert a_log is not None, "a_log required when use_gate_in_kernel=True"
 
   if mini_batch is None:
     MB = _compute_intra_fused_mini_batch(H, BT, K, V, dtype=q.dtype)
@@ -841,13 +841,13 @@ def pallas_kda_fwd_intra_fused(
   v_r = v.reshape(H, B, NC, BT, V)
 
   if use_gate_in_kernel:
-    A_log_r = A_log.astype(jnp.float32).reshape(H, 1, 1, 1, 1)
+    a_log_r = a_log.astype(jnp.float32).reshape(H, 1, 1, 1, 1)
     if dt_bias is not None:
       dt_bias_r = dt_bias.astype(jnp.float32).reshape(H, 1, 1, 1, K)
     else:
       dt_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
   else:
-    A_log_r = jnp.zeros((H, 1, 1, 1, 1), dtype=jnp.float32)
+    a_log_r = jnp.zeros((H, 1, 1, 1, 1), dtype=jnp.float32)
     dt_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
 
   grid = (H // MB, B, NC)
@@ -911,7 +911,7 @@ def pallas_kda_fwd_intra_fused(
     compiler_params=pltpu.CompilerParams(
       dimension_semantics=("parallel", "parallel", "parallel"),
     ),
-  )(q_r, k_r, g_r, beta_r, v_r, A_log_r, dt_bias_r)
+  )(q_r, k_r, g_r, beta_r, v_r, a_log_r, dt_bias_r)
 
   # --- Reshape back to [H, B, T, D] (head-first) ---
   w_out = w_r.reshape(H, B, T, K)
@@ -941,7 +941,7 @@ def kda_fwd_intra_fused(
   safe_gate: bool = True,
   disable_recompute: bool = False,
   cumsum_scale: float = RCP_LN2,
-  A_log: jax.Array | None = None,
+  a_log: jax.Array | None = None,
   dt_bias: jax.Array | None = None,
   use_gate_in_kernel: bool = False,
   lower_bound: float | None = None,
@@ -964,7 +964,7 @@ def kda_fwd_intra_fused(
     scale=scale, chunk_size=chunk_size,
     safe_gate=safe_gate, disable_recompute=disable_recompute,
     cumsum_scale=cumsum_scale,
-    A_log=A_log, dt_bias=dt_bias,
+    a_log=a_log, dt_bias=dt_bias,
     use_gate_in_kernel=use_gate_in_kernel,
     lower_bound=lower_bound,
   )
@@ -1410,7 +1410,7 @@ def chunk_kda_fwd_custom(
     v: Float[Array, "H B T_ALIGNED V"],
     g: Float[Array, "H B T_ALIGNED K"],
     beta: Float[Array, "H B T_ALIGNED"],
-    A_log: Float[Array, "H"] | None = None,
+    a_log: Float[Array, "H"] | None = None,
     dt_bias: Float[Array, "H*K"] | None = None,
     scale: float | None = None,
     initial_state: (
@@ -1469,7 +1469,7 @@ def chunk_kda_fwd_custom(
     safe_gate=safe_gate,
     disable_recompute=save_for_backward,
     cumsum_scale=RCP_LN2,
-    A_log=A_log,
+    a_log=a_log,
     dt_bias=dt_bias,
     use_gate_in_kernel=use_gate_in_kernel,
     lower_bound=lower_bound,
@@ -1585,7 +1585,7 @@ def chunk_kda_fwd_custom(
       akk=Akk,
       initial_state=initial_state,
       g_org=g_org,
-      a_log=A_log,
+      a_log=a_log,
       dt_bias=dt_bias,
       h=h,
       g_dtype_marker=jnp.zeros((), dtype=g.dtype),

@@ -38,7 +38,7 @@ Residuals: TypeAlias = Any
 def _validate_gate_args(
     *,
     use_gate_in_kernel: bool,
-    A_log: jax.Array | None,
+    a_log: jax.Array | None,
     dt_bias: jax.Array | None,
     heads: int,
     key_dim: int,
@@ -47,10 +47,10 @@ def _validate_gate_args(
 ):
   if not use_gate_in_kernel:
     return
-  if A_log is None:
-    raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True`.")
-  if A_log.shape != (heads,):
-    raise ValueError(f"`A_log` shape {A_log.shape} must be {(heads,)}.")
+  if a_log is None:
+    raise ValueError("`a_log` must be provided when `use_gate_in_kernel=True`.")
+  if a_log.shape != (heads,):
+    raise ValueError(f"`a_log` shape {a_log.shape} must be {(heads,)}.")
   if dt_bias is not None and dt_bias.shape != (heads * key_dim,):
     raise ValueError(
         f"`dt_bias` shape {dt_bias.shape} must be {(heads * key_dim,)}."
@@ -83,7 +83,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       gate: Float[Array, "H B T K"],
       beta: Float[Array, "H B T"],
       *,
-      A_log: Float[Array, "H"] | None = None,
+      a_log: Float[Array, "H"] | None = None,
       dt_bias: Float[Array, "H*K"] | None = None,
       scale: float | None = None,
       initial_state: Float[Array, "B N H K V"] | None = None,
@@ -95,7 +95,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       lower_bound: float | None = None,
       disable_recompute: bool = True,
       cp_context: CPContext | None = None,
-      N_max: int | None = None,
+      max_num_segments: int | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Binds KDA arguments and validates semantic constraints."""
@@ -136,27 +136,35 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         raise ValueError(
             "`initial_state` must contain at least one recurrent state."
         )
-      if N_max is None:
-        N_max = state_count
-      elif N_max != state_count:
+      if max_num_segments is None:
+        max_num_segments = state_count
+      elif max_num_segments != state_count:
         raise ValueError(
-            "`N_max` must match the `initial_state` segment dimension; got "
-            f"N_max={N_max}, N={state_count}."
+            "`max_num_segments` must match the `initial_state` segment "
+            "dimension; got "
+            f"max_num_segments={max_num_segments}, "
+            f"num_segments={state_count}."
         )
     if segment_ids is not None and segment_ids.shape != (batch, seq_len):
       raise ValueError(
           f"`segment_ids` shape {segment_ids.shape} must be {(batch, seq_len)}."
       )
-    if N_max is not None and N_max <= 0:
-      raise ValueError(f"`N_max` must be positive, got {N_max}.")
-    if segment_ids is not None and initial_state is None and N_max is None:
+    if max_num_segments is not None and max_num_segments <= 0:
       raise ValueError(
-          "`N_max` is required when `segment_ids` is provided without "
-          "`initial_state`."
+          f"`max_num_segments` must be positive, got {max_num_segments}."
+      )
+    if (
+        segment_ids is not None
+        and initial_state is None
+        and max_num_segments is None
+    ):
+      raise ValueError(
+          "`max_num_segments` is required when `segment_ids` is provided "
+          "without `initial_state`."
       )
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,
-        A_log=A_log,
+        a_log=a_log,
         dt_bias=dt_bias,
         heads=heads,
         key_dim=key_dim,
@@ -173,7 +181,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         value=value,
         gate=gate,
         beta=beta,
-        A_log=A_log,
+        a_log=a_log,
         dt_bias=dt_bias,
         scale=scale,
         initial_state=initial_state,
@@ -185,7 +193,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         lower_bound=lower_bound,
         disable_recompute=disable_recompute,
         cp_context=cp_context,
-        N_max=N_max,
+        max_num_segments=max_num_segments,
         return_residuals=return_residuals,
     )
 
@@ -199,7 +207,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       gate: Float[Array, "H B T K"],
       beta: Float[Array, "H B T"],
       *,
-      A_log: Float[Array, "H"] | None,
+      a_log: Float[Array, "H"] | None,
       dt_bias: Float[Array, "H*K"] | None,
       scale: float,
       initial_state: Float[Array, "B N H K V"] | None,
@@ -211,7 +219,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       lower_bound: float | None,
       disable_recompute: bool,
       cp_context: CPContextArg,
-      N_max: int | None,
+      max_num_segments: int | None,
       return_residuals: bool,
       config: _Config,
   ) -> tuple[Output, Residuals]:
@@ -223,7 +231,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         value,
         gate,
         beta,
-        A_log=A_log,
+        a_log=a_log,
         dt_bias=dt_bias,
         scale=scale,
         initial_state=initial_state,
@@ -233,6 +241,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         segment_ids=segment_ids,
         lower_bound=lower_bound,
         cp_context=cp_context,
-        N_max=N_max,
+        max_num_segments=max_num_segments,
     )
     return output, None

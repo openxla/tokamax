@@ -154,7 +154,7 @@ class TestConfig:
   batch_size: int = 1
   seq_lens: tuple[int, ...] | None = None
   batch_seq_lens: tuple[tuple[int, ...], ...] | None = None
-  n_max_override: int | None = None
+  max_num_segments_override: int | None = None
   cp_size: int = 1
   key_dim: int = 128
   value_dim: int = 128
@@ -203,11 +203,11 @@ class TestConfig:
     return len(self.layouts) if self.layouts is not None else self.batch_size
 
   @property
-  def n_max(self) -> int | None:
+  def max_num_segments(self) -> int | None:
     if self.layouts is None:
       return None
-    real_n_max = max(len(seq_lens) for seq_lens in self.layouts)
-    return max(real_n_max, self.n_max_override or 0)
+    real_num_segments = max(len(seq_lens) for seq_lens in self.layouts)
+    return max(real_num_segments, self.max_num_segments_override or 0)
 
   @property
   def effective_scale(self) -> float:
@@ -221,7 +221,7 @@ class _Inputs:
   v: jax.Array
   g: jax.Array
   beta: jax.Array
-  A_log: jax.Array
+  a_log: jax.Array
   dt_bias: jax.Array
   initial_state: jax.Array | None
   segment_ids: jax.Array | None
@@ -350,7 +350,7 @@ def _varlen_case(
       V=V,
       seq_lens=seq_lens,
       batch_seq_lens=batch_seq_lens,
-      n_max_override=N_pad,
+      max_num_segments_override=N_pad,
       dtype=dtype,
       input_profile=input_profile,
       use_initial_state=use_initial_state,
@@ -397,7 +397,7 @@ def _cp_case(
       D=128,
       seq_lens=seq_lens,
       batch_seq_lens=batch_seq_lens,
-      n_max_override=max(len(layout) for layout in layouts),
+      max_num_segments_override=max(len(layout) for layout in layouts),
       cp_size=cp_size,
       dtype=dtype,
       input_profile=input_profile,
@@ -722,7 +722,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
       q = _l2_normalize(q)
       k = _l2_normalize(k)
     g_raw = jax.random.uniform(keys[3], qk_shape, dtype=jnp.float32)
-    A_log = jax.random.normal(
+    a_log = jax.random.normal(
         keys[5], (case.heads,), dtype=jnp.float32
     )
     dt_bias = jax.random.normal(
@@ -749,7 +749,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
     beta = 0.5 * jax.nn.sigmoid(
         jax.random.normal(keys[4], beta_shape, dtype=jnp.float32)
     )
-    A_log = jnp.zeros((case.heads,), dtype=jnp.float32)
+    a_log = jnp.zeros((case.heads,), dtype=jnp.float32)
     dt_bias = jnp.zeros(
         (case.heads * case.key_dim,), dtype=jnp.float32
     )
@@ -765,7 +765,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
     beta = jax.nn.sigmoid(
         jax.random.normal(keys[4], beta_shape, dtype=jnp.float32)
     )
-    A_log = jnp.zeros((case.heads,), dtype=jnp.float32)
+    a_log = jnp.zeros((case.heads,), dtype=jnp.float32)
     dt_bias = jnp.zeros(
         (case.heads * case.key_dim,), dtype=jnp.float32
     )
@@ -793,7 +793,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
     )
 
     if profile == "model":
-      A_log = jnp.log(
+      a_log = jnp.log(
           jax.random.uniform(
               keys[5], (case.heads,), minval=1.0, maxval=16.0
           )
@@ -809,7 +809,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
           jax.random.normal(keys[4], beta_shape, dtype=jnp.float32)
       )
     elif profile == "prod":
-      A_log = jax.random.uniform(
+      a_log = jax.random.uniform(
           keys[5], (case.heads,), minval=0.2, maxval=3.0
       )
       dt_bias = jax.random.uniform(
@@ -825,7 +825,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
           keys[4], beta_shape, minval=0.05, maxval=0.95
       )
     elif profile == "low_gate":
-      A_log = jnp.full((case.heads,), 2.5, dtype=jnp.float32)
+      a_log = jnp.full((case.heads,), 2.5, dtype=jnp.float32)
       dt_bias = jnp.full(
           (case.heads * case.key_dim,), -10.0, dtype=jnp.float32
       )
@@ -836,7 +836,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
           keys[4], beta_shape, minval=0.3, maxval=0.95
       )
     else:
-      A_log = jnp.full((case.heads,), 2.7, dtype=jnp.float32)
+      a_log = jnp.full((case.heads,), 2.7, dtype=jnp.float32)
       dt_bias = jnp.full(
           (case.heads * case.key_dim,), -2.0, dtype=jnp.float32
       )
@@ -853,7 +853,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
       gate_input = g_raw + dt_bias.reshape(
           case.heads, 1, 1, case.key_dim
       )
-      A = jnp.exp(A_log).reshape(case.heads, 1, 1, 1)
+      A = jnp.exp(a_log).reshape(case.heads, 1, 1, 1)
       if profile in ("prod", "low_gate", "strong_gate"):
         g = -5.0 * jax.nn.sigmoid(A * gate_input)
       else:
@@ -876,7 +876,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
   g = jnp.where(valid_4d, g, 0).astype(case.dtype)
   beta = jnp.where(valid_3d, beta, 0).astype(case.dtype)
 
-  state_count = case.n_max or 1
+  state_count = case.max_num_segments or 1
   initial_state = None
   if case.use_initial_state:
     initial_state = initial_scale * jax.random.normal(
@@ -916,7 +916,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
       v=v,
       g=g,
       beta=beta,
-      A_log=A_log,
+      a_log=a_log,
       dt_bias=dt_bias,
       initial_state=initial_state,
       segment_ids=segment_ids,
@@ -934,7 +934,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
     assert case.layouts is not None
     initial_state = inputs.initial_state
     for batch_index, seq_lens in enumerate(case.layouts):
-      for state_index in range(len(seq_lens), case.n_max or 0):
+      for state_index in range(len(seq_lens), case.max_num_segments or 0):
         initial_state = initial_state.at[batch_index, state_index].set(
             float(state_index + 1)
         )
@@ -946,7 +946,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
 
 def _attention_kwargs(case: TestConfig, inputs: _Inputs) -> dict[str, object]:
   return dict(
-      A_log=inputs.A_log if case.use_gate_in_kernel else None,
+      a_log=inputs.a_log if case.use_gate_in_kernel else None,
       dt_bias=inputs.dt_bias if case.use_gate_in_kernel else None,
       scale=case.effective_scale,
       initial_state=inputs.initial_state,
@@ -956,7 +956,7 @@ def _attention_kwargs(case: TestConfig, inputs: _Inputs) -> dict[str, object]:
       safe_gate=case.safe_gate,
       lower_bound=case.lower_bound,
       disable_recompute=case.disable_recompute,
-      N_max=case.n_max,
+      max_num_segments=case.max_num_segments,
   )
 
 
@@ -1095,7 +1095,7 @@ def _direct_backward(
     case: TestConfig,
     inputs: _Inputs,
 ) -> tuple[jax.Array, ...]:
-  def loss_fn(q, k, v, g, beta, initial_state, A_log, dt_bias):
+  def loss_fn(q, k, v, g, beta, initial_state, a_log, dt_bias):
     current_inputs = dataclasses.replace(
         inputs,
         q=q,
@@ -1104,7 +1104,7 @@ def _direct_backward(
         g=g,
         beta=beta,
         initial_state=initial_state,
-        A_log=A_log,
+        a_log=a_log,
         dt_bias=dt_bias,
     )
     output, final_state = _call_attention(
@@ -1127,7 +1127,7 @@ def _direct_backward(
       inputs.g,
       inputs.beta,
       inputs.initial_state,
-      inputs.A_log,
+      inputs.a_log,
       inputs.dt_bias,
   )
 
@@ -1147,7 +1147,9 @@ def _valid_gradient_values(
     return gradient
   gradient_np = np.asarray(gradient)
   if name == "dh0":
-    state_mask = np.zeros((case.batch, case.n_max or 1), dtype=np.bool_)
+    state_mask = np.zeros(
+        (case.batch, case.max_num_segments or 1), dtype=np.bool_
+    )
     for batch_index, seq_lens in enumerate(case.layouts):
       state_mask[batch_index, : len(seq_lens)] = True
     mask = state_mask[:, :, None, None, None]
@@ -1203,7 +1205,7 @@ def test_chunk_kda_forward(case: TestConfig):
     assert case.layouts is not None and final_state is not None
     for batch_index, seq_lens in enumerate(case.layouts):
       real_state_count = len(seq_lens)
-      for state_index in range(real_state_count, case.n_max or 0):
+      for state_index in range(real_state_count, case.max_num_segments or 0):
         expected = (
             inputs.initial_state[batch_index, state_index]
             if inputs.initial_state is not None

@@ -67,7 +67,7 @@ def derive_cp_context(
     initial_state: jax.Array | None,
     output_final_state: bool,
     cp_context: CPContext | None,
-    N_max: int | None,
+    max_num_segments: int | None,
 ) -> tuple[CPContext | None, jax.Array | None]:
   cu_seqlens = None
   if cp_context is None or not cp_context.is_cp_enabled:
@@ -80,15 +80,16 @@ def derive_cp_context(
   if segment_ids is None:
     raise ValueError("CP requires rank-local `segment_ids` with shape [B, T].")
 
-  if N_max is None:
-    raise ValueError("`N_max` is required when CP uses `segment_ids`.")
-  n_max = N_max
+  if max_num_segments is None:
+    raise ValueError(
+        "`max_num_segments` is required when CP uses `segment_ids`."
+    )
   cu_locals, chain_metas = [], []
   for b in range(segment_ids.shape[0]):
     cu_b, meta_b = _derive_cp_metadata_from_segment_ids(
         segment_ids[b],
         cp_context.axis_name,
-        n_max=n_max,
+        max_num_segments=max_num_segments,
     )
     cu_locals.append(cu_b)
     chain_metas.append(meta_b)
@@ -108,18 +109,21 @@ def segment_ids_to_cu_seqlens(
     segment_ids: jax.Array | None,
     *,
     initial_state: jax.Array | None,
-    N_max: int | None,
+    max_num_segments: int | None,
 ) -> tuple[jax.Array | None, int | None]:
   if segment_ids is None:
-    return None, N_max
-  if N_max is None:
+    return None, max_num_segments
+  if max_num_segments is None:
     if initial_state is None:
       raise ValueError(
-          "`N_max` is required when `segment_ids` is provided without "
-          "`initial_state`."
+          "`max_num_segments` is required when `segment_ids` is provided "
+          "without `initial_state`."
       )
-    N_max = initial_state.shape[1]
-  return segment_ids_to_seqlens(segment_ids, max_segs=N_max), N_max
+    max_num_segments = initial_state.shape[1]
+  return (
+      segment_ids_to_seqlens(segment_ids, max_segs=max_num_segments),
+      max_num_segments,
+  )
 
 
 def align_up(x, align: int):
@@ -306,7 +310,7 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
 
 def align_segment_ids(
     segment_ids: jax.Array,
-    N_max: int,
+    max_num_segments: int,
     chunk_size: int,
 ) -> jax.Array:
   """Align 1D segment IDs to chunk boundaries, matching `_align_seqs`."""
@@ -321,8 +325,16 @@ def align_segment_ids(
   seg_idx = jnp.cumsum(is_boundary.astype(jnp.int32)) - 1
   positions = jnp.arange(T, dtype=jnp.int32)
 
-  seg_starts = jnp.full(N_max, T, dtype=jnp.int32).at[seg_idx].min(positions)
-  seg_ends = jnp.zeros(N_max, dtype=jnp.int32).at[seg_idx].max(positions + 1)
+  seg_starts = (
+      jnp.full(max_num_segments, T, dtype=jnp.int32)
+      .at[seg_idx]
+      .min(positions)
+  )
+  seg_ends = (
+      jnp.zeros(max_num_segments, dtype=jnp.int32)
+      .at[seg_idx]
+      .max(positions + 1)
+  )
   seg_lens = jnp.maximum(seg_ends - seg_starts, 0)
   seg_labels = segment_ids[jnp.minimum(seg_starts, T - 1)]
 
@@ -333,7 +345,9 @@ def align_segment_ids(
       jnp.cumsum(aligned_lens)[:-1],
   ])
 
-  T_aligned = ((T + N_max * (chunk_size - 1) + chunk_size - 1) // chunk_size) * chunk_size
+  T_aligned = (
+      (T + max_num_segments * (chunk_size - 1) + chunk_size - 1) // chunk_size
+  ) * chunk_size
   out = jnp.zeros((T_aligned,), dtype=jnp.int32)
   apos = jnp.arange(T_aligned, dtype=jnp.int32)
 
@@ -343,7 +357,7 @@ def align_segment_ids(
     mask = is_real[i] & (apos >= start) & (apos < end)
     return jnp.where(mask, seg_labels[i], ids)
 
-  return jax.lax.fori_loop(0, N_max, body, out)
+  return jax.lax.fori_loop(0, max_num_segments, body, out)
 
 
 def segment_ids_to_seqlens(

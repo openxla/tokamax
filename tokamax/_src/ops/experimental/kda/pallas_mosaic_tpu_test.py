@@ -116,7 +116,7 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
           v,
           segment_ids=segment_ids,
           cp_context=cp_context,
-          N_max=1,
+          max_num_segments=1,
       )
 
   def test_rejects_cp_contract_gaps_before_kernel(self):
@@ -131,7 +131,7 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
             dict(
                 initial_state=initial_state,
                 segment_ids=segment_ids,
-                N_max=1,
+                max_num_segments=1,
             ),
         ),
         (
@@ -139,10 +139,10 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
             dict(
                 output_final_state=True,
                 segment_ids=segment_ids,
-                N_max=1,
+                max_num_segments=1,
             ),
         ),
-        ("segment_ids", dict(N_max=1)),
+        ("segment_ids", dict(max_num_segments=1)),
     )
 
     for error_fragment, overrides in cases:

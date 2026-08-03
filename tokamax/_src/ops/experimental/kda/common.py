@@ -929,7 +929,7 @@ def chunk_gated_delta_rule_fwd_h(
 @jaxtyping.jaxtyped
 def kda_gate_chunk_cumsum(
   g: Float[Array, "H B T K"],
-  A_log: Float[Array, "H"],
+  a_log: Float[Array, "H"],
   chunk_size: int,
   scale: float | None = None,
   dt_bias: Float[Array, "H*K"] | None = None,
@@ -943,7 +943,7 @@ def kda_gate_chunk_cumsum(
   if dt_bias is not None:
     g_f32 = g_f32 + dt_bias.astype(jnp.float32).reshape(H, 1, 1, K)
 
-  A = A_log.astype(jnp.float32)
+  A = a_log.astype(jnp.float32)
 
   if lower_bound is None:
     g_act = -jnp.exp(A).reshape(H, 1, 1, 1) * jax.nn.softplus(g_f32)

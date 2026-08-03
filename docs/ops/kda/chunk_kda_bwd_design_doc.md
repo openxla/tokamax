@@ -39,7 +39,7 @@ The Tokamax entry is `PallasMosaicTpuKimiDeltaAttentionVjp._fwd(...)`, which pas
 - `db`: gradient with respect to `beta`;
 - `dg`: gradient with respect to the public `gate` input. The fused kernel's reverse cumsum first produces the gradient of the per-token activated gate before cumsum; when `use_gate_in_kernel=True`, `kda_gate_bwd(...)` maps that gradient further back to the raw public gate;
 - `dh0`: gradient with respect to the initial state, returned only when the caller provides `initial_state`;
-- `dA, dbias`: gradients with respect to `A_log` and optional `dt_bias` when the gate activation is computed inside the kernel.
+- `dA, dbias`: gradients with respect to `a_log` and optional `dt_bias` when the gate activation is computed inside the kernel.
 
 `dht` is an optional input representing the gradient of the final state. It is nonzero only when the final state continues to be used by a downstream loss; when an ordinary attention layer only consumes the output `o`, `dht` can be `None` and is treated as zero.
 
@@ -62,7 +62,7 @@ Backward recompute:
 
 Optional recompute:
 
-- When `use_gate_in_kernel=True`, both backward preparation paths currently recompute the post-cumsum gate from `g_org`, `A_log`, and optional `dt_bias` via `kda_gate_chunk_cumsum`, including the saved-`h` path where the forward residual currently also contains `g_cumsum`.
+- When `use_gate_in_kernel=True`, both backward preparation paths currently recompute the post-cumsum gate from `g_org`, `a_log`, and optional `dt_bias` via `kda_gate_chunk_cumsum`, including the saved-`h` path where the forward residual currently also contains `g_cumsum`.
 - When `disable_recompute=False`, it does not take the fast path that saves `h`, but instead reruns the forward state recurrence to recover `h` and `v_new`.
 
 By naming convention, `disable_recompute=True` means "disable the full forward recurrence recompute, use the saved `h`." This is the current main path.
@@ -117,7 +117,7 @@ Inputs and forward-saved values:
 | public `gate`   | `[H, B, T, K]`                | per-token gate input before chunk-local cumsum       |
 | `g_cumsum`      | `[H, B, T, K]` / `None`       | internal post-cumsum gate in log2 space; recomputed when omitted |
 | `g_org`         | `[H, B, T, K]` / `None`       | retained raw gate when activation runs in the kernel |
-| `A_log`         | `[H]` / `None`                 | gate activation parameter                            |
+| `a_log`         | `[H]` / `None`                 | gate activation parameter                            |
 | `dt_bias`       | `[H*K]` / `None`               | optional gate activation bias                        |
 | `Aqk`           | `[H, B, T, BT]`               | forward-saved intra-chunk attention matrix           |
 | `Akk`           | `[H, B, T, BT]`               | forward-saved WY inverse matrix                      |
@@ -144,7 +144,7 @@ Outputs:
 | `dv`         | `[H, B, T, V]`             | value gradient                                          |
 | `db`         | `[H, B, T]`                | `beta` gradient                                         |
 | `dh0`        | `[B, N, H, K, V]` / `None` | initial-state gradient, matching the public input shape |
-| `dA, dbias`  | `[H]` / `[H*K]` / `None`   | `A_log` / `dt_bias` gradients                           |
+| `dA, dbias`  | `[H]` / `[H*K]` / `None`   | `a_log` / `dt_bias` gradients                           |
 
 Static constraints:
 
@@ -297,7 +297,7 @@ The CP backward direction goes from downstream rank to upstream rank, determined
 
 When `use_gate_in_kernel=True`, `chunk_kda_bwd_custom(...)` calls `kda_gate_bwd(...)` after the core backward.
 
-At this point the fusion kernel has already applied the chunk-local reverse cumsum, so its `dg` is the gradient with respect to the activated per-token gate before cumsum. `kda_gate_bwd(...)` then differentiates the activation and maps this gradient to the raw public `gate`, `A_log`, and optional `dt_bias`, returning `dg`, `dA`, and `dbias` respectively.
+At this point the fusion kernel has already applied the chunk-local reverse cumsum, so its `dg` is the gradient with respect to the activated per-token gate before cumsum. `kda_gate_bwd(...)` then differentiates the activation and maps this gradient to the raw public `gate`, `a_log`, and optional `dt_bias`, returning `dg`, `dA`, and `dbias` respectively.
 
 ---
 
