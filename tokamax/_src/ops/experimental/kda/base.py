@@ -102,23 +102,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
     heads, batch, seq_len, key_dim = query.shape
     value_dim = value.shape[-1]
 
-    if key.shape != query.shape:
-      raise ValueError(
-          f"`key` shape {key.shape} must match `query` shape {query.shape}."
-      )
-    if gate.shape != query.shape:
-      raise ValueError(
-          f"`gate` shape {gate.shape} must match `query` shape {query.shape}."
-      )
-    if value.shape != (heads, batch, seq_len, value_dim):
-      raise ValueError(
-          f"`value` shape {value.shape} must be "
-          f"{(heads, batch, seq_len, value_dim)}."
-      )
-    if beta.shape != (heads, batch, seq_len):
-      raise ValueError(
-          f"`beta` shape {beta.shape} must be {(heads, batch, seq_len)}."
-      )
     if initial_state is not None:
       expected_tail = (heads, key_dim, value_dim)
       if initial_state.ndim != 5 or initial_state.shape[0] != batch:

@@ -265,8 +265,20 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
 
   def test_bind_uses_jaxtyping_validation(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
+    implementation = api.IMPLEMENTATIONS["xla"]
+
     with self.assertRaises(jt.TypeCheckError):
-      api.IMPLEMENTATIONS["xla"].bind(q[:, :, 0], k, v, g, beta)
+      implementation.bind(q[:, :, 0], k, v, g, beta)
+
+    mismatched_inputs = (
+        ("key", (q, k[..., :-1], v, g, beta)),
+        ("value", (q, k, v[:, :-1], g, beta)),
+        ("gate", (q, k, v, g[:, :, :-1], beta)),
+        ("beta", (q, k, v, g, beta[..., :-1])),
+    )
+    for name, inputs in mismatched_inputs:
+      with self.subTest(name=name), self.assertRaises(jt.TypeCheckError):
+        implementation.bind(*inputs)
 
   def test_unsupported_implementation(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
