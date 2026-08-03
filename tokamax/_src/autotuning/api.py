@@ -15,6 +15,7 @@
 """Autotuning API."""
 
 from collections.abc import Callable, Mapping
+from concurrent import futures
 import dataclasses
 import inspect
 import json
@@ -68,7 +69,9 @@ def _serialize_bound_args_autotuning_data(
   return ba_data, data
 
 
-def _validate_bound_args_autotuning_data(value: Any) -> BoundArgsAutotuningData:
+def _validate_bound_args_autotuning_data(
+    value: Any,
+) -> BoundArgsAutotuningData:
   ba, data = value
   if isinstance(ba, op_lib.BoundArguments):
     assert isinstance(data, autotuner.AutotuningData)
@@ -326,6 +329,7 @@ def autotune(
     all_implementations: bool = False,
     progress_bar: bool = True,
     timeout: float | None = None,
+    max_workers: int | None = None,
 ) -> AutotuningResult:
   """Autotunes all captured ops in x.
 
@@ -340,6 +344,8 @@ def autotune(
       is tunable on the current device.
     progress_bar: Whether to show a progress bar (default: `True`).
     timeout: Time limit in seconds for autotuning.
+    max_workers: Maximum number of worker threads for parallel compilation
+      during autotuning.
 
   Returns:
     An `AutotuningResult` object of the autotuned ops.
@@ -384,11 +390,23 @@ def autotune(
         postfix={"Total microbenchmarks": sum(map(num_configs, bound_args))},
     )
 
+  custom_autotuner = autotuner.Autotuner()
+  if max_workers is not None:
+    custom_autotuner = autotuner.Autotuner(
+        compile_executor_fn=lambda: futures.ThreadPoolExecutor(
+            max_workers=max_workers
+        )
+    )
+
   for bound_arg in bound_args:
     try:
       data.append((
           bound_arg,
-          bound_arg.autotune(cache_results=False, timeout=timeout),
+          bound_arg.autotune(
+              cache_results=False,
+              timeout=timeout,
+              autotuner=custom_autotuner,
+          ),
       ))
     except Exception:  # pylint: disable=broad-exception-caught
       logging.exception("Failed to autotune for op %s", bound_arg.op)
