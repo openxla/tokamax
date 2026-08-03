@@ -243,11 +243,11 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         final_state, ref_final_state, atol=0.01, rtol=0.01
     )
 
-  def test_pallas_tpu_registered_and_default_falls_back_to_xla(self):
+  def test_mosaic_registered_and_default_falls_back_to_xla(self):
     q, k, v, g, beta, initial_state = _make_inputs(jnp.float32)
-    self.assertIn("pallas_tpu", api.IMPLEMENTATIONS)
-    self.assertIsNotNone(api.IMPLEMENTATIONS["pallas_tpu"].vjp)
-    self.assertEqual(api._DEFAULT_IMPLEMENTATIONS, ("pallas_tpu", "xla"))
+    self.assertIn("mosaic_tpu", api.IMPLEMENTATIONS)
+    self.assertIsNotNone(api.IMPLEMENTATIONS["mosaic_tpu"].vjp)
+    self.assertEqual(api._DEFAULT_IMPLEMENTATIONS, ("mosaic", "xla"))
 
     output, final_state = api.kimi_delta_attention(
         q,
@@ -274,16 +274,22 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         final_state, ref_final_state, atol=0.01, rtol=0.01
     )
 
-  def test_pallas_tpu_alone_is_not_supported_in_cpu_test_shape(self):
+  def test_mosaic_alone_is_not_supported_in_cpu_test_shape(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
     with self.assertRaisesRegex(
         NotImplementedError, "Not supported|requires the sequence length"
     ):
-      api.kimi_delta_attention(q, k, v, g, beta, implementation="pallas_tpu")
+      api.kimi_delta_attention(q, k, v, g, beta, implementation="mosaic")
 
   def test_no_final_state_by_default(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
-    output, final_state = api.kimi_delta_attention(q, k, v, g, beta)
+    output, final_state = api.kimi_delta_attention(
+        query=q,
+        key=k,
+        value=v,
+        gate=g,
+        beta=beta,
+    )
     self.assertEqual(output.shape, v.shape)
     self.assertIsNone(final_state)
 
@@ -376,7 +382,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
 
   def test_invalid_shape(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
-    with self.assertRaisesRegex(ValueError, "`k` shape"):
+    with self.assertRaisesRegex(ValueError, "`key` shape"):
       with jaxtyping.disable_jaxtyping():
         api.kimi_delta_attention(q, k[:, :, :-1], v, g, beta)
 

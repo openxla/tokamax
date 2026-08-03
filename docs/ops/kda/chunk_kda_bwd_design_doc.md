@@ -37,7 +37,7 @@ The Tokamax entry is `PallasMosaicTpuKimiDeltaAttentionVjp._fwd(...)`, which pas
 
 - `dq, dk, dv`: gradients with respect to query/key/value;
 - `db`: gradient with respect to `beta`;
-- `dg`: gradient with respect to the public gate input. The fused kernel's reverse cumsum first produces the gradient of the per-token activated gate before cumsum; when `use_gate_in_kernel=True`, `kda_gate_bwd(...)` maps that gradient further back to the raw public `g`;
+- `dg`: gradient with respect to the public `gate` input. The fused kernel's reverse cumsum first produces the gradient of the per-token activated gate before cumsum; when `use_gate_in_kernel=True`, `kda_gate_bwd(...)` maps that gradient further back to the raw public gate;
 - `dh0`: gradient with respect to the initial state, returned only when the caller provides `initial_state`;
 - `dA, dbias`: gradients with respect to `A_log` and optional `dt_bias` when the gate activation is computed inside the kernel.
 
@@ -111,10 +111,10 @@ Inputs and forward-saved values:
 
 | Variable        | Shape                         | Meaning                                              |
 | --------------- | ----------------------------- | ---------------------------------------------------- |
-| `q, k`          | `[H, B, T, K]`                | query / key                                          |
-| `v`             | `[H, B, T, V]`                | value                                                |
+| public `query, key` / residual `q, k` | `[H, B, T, K]` | query / key                              |
+| public `value` / residual `v` | `[H, B, T, V]`       | value                                                |
 | `beta`          | `[H, B, T]`                   | delta-rule write strength per token                  |
-| public `g`      | `[H, B, T, K]`                | per-token gate input before chunk-local cumsum       |
+| public `gate`   | `[H, B, T, K]`                | per-token gate input before chunk-local cumsum       |
 | `g_cumsum`      | `[H, B, T, K]` / `None`       | internal post-cumsum gate in log2 space; recomputed when omitted |
 | `g_org`         | `[H, B, T, K]` / `None`       | retained raw gate when activation runs in the kernel |
 | `A_log`         | `[H]` / `None`                 | gate activation parameter                            |
@@ -297,7 +297,7 @@ The CP backward direction goes from downstream rank to upstream rank, determined
 
 When `use_gate_in_kernel=True`, `chunk_kda_bwd_custom(...)` calls `kda_gate_bwd(...)` after the core backward.
 
-At this point the fusion kernel has already applied the chunk-local reverse cumsum, so its `dg` is the gradient with respect to the activated per-token gate before cumsum. `kda_gate_bwd(...)` then differentiates the activation and maps this gradient to the raw public `g`, `A_log`, and optional `dt_bias`, returning `dg`, `dA`, and `dbias` respectively.
+At this point the fusion kernel has already applied the chunk-local reverse cumsum, so its `dg` is the gradient with respect to the activated per-token gate before cumsum. `kda_gate_bwd(...)` then differentiates the activation and maps this gradient to the raw public `gate`, `A_log`, and optional `dt_bias`, returning `dg`, `dA`, and `dbias` respectively.
 
 ---
 

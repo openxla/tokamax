@@ -81,10 +81,10 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
   @override
   def bind(
       self,
-      q: Float[Array, "H B T K"],
-      k: Float[Array, "H B T K"],
-      v: Float[Array, "H B T V"],
-      g: Float[Array, "H B T K"],
+      query: Float[Array, "H B T K"],
+      key: Float[Array, "H B T K"],
+      value: Float[Array, "H B T V"],
+      gate: Float[Array, "H B T K"],
       beta: Float[Array, "H B T"],
       *,
       A_log: Float[Array, "H"] | None = None,
@@ -104,17 +104,22 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Binds KDA arguments and validates the reference contract."""
-    _check_array_rank(q, 4, "q")
-    heads, batch, seq_len, key_dim = q.shape
-    value_dim = v.shape[-1]
+    _check_array_rank(query, 4, "query")
+    heads, batch, seq_len, key_dim = query.shape
+    value_dim = value.shape[-1]
 
-    if k.shape != q.shape:
-      raise ValueError(f"`k` shape {k.shape} must match `q` shape {q.shape}.")
-    if g.shape != q.shape:
-      raise ValueError(f"`g` shape {g.shape} must match `q` shape {q.shape}.")
-    if v.shape != (heads, batch, seq_len, value_dim):
+    if key.shape != query.shape:
       raise ValueError(
-          f"`v` shape {v.shape} must be {(heads, batch, seq_len, value_dim)}."
+          f"`key` shape {key.shape} must match `query` shape {query.shape}."
+      )
+    if gate.shape != query.shape:
+      raise ValueError(
+          f"`gate` shape {gate.shape} must match `query` shape {query.shape}."
+      )
+    if value.shape != (heads, batch, seq_len, value_dim):
+      raise ValueError(
+          f"`value` shape {value.shape} must be "
+          f"{(heads, batch, seq_len, value_dim)}."
       )
     if beta.shape != (heads, batch, seq_len):
       raise ValueError(
@@ -171,10 +176,10 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       scale = key_dim**-0.5
 
     return super().bind(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
         beta=beta,
         A_log=A_log,
         dt_bias=dt_bias,
@@ -197,10 +202,10 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
   @override
   def _fwd(
       self,
-      q: Float[Array, "H B T K"],
-      k: Float[Array, "H B T K"],
-      v: Float[Array, "H B T V"],
-      g: Float[Array, "H B T K"],
+      query: Float[Array, "H B T K"],
+      key: Float[Array, "H B T K"],
+      value: Float[Array, "H B T V"],
+      gate: Float[Array, "H B T K"],
       beta: Float[Array, "H B T"],
       *,
       A_log: Float[Array, "H"] | None,
@@ -223,10 +228,10 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
     """Dispatches to the pure JAX KDA reference implementation."""
     del config, return_residuals, safe_gate, disable_recompute, chunk_size
     output = reference.kimi_delta_attention(
-        q,
-        k,
-        v,
-        g,
+        query,
+        key,
+        value,
+        gate,
         beta,
         A_log=A_log,
         dt_bias=dt_bias,

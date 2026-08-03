@@ -77,67 +77,67 @@ def check_inputs_support(
     chunk_size: int,
     N_max: int | None,
 ) -> None:
-  """Checks whether the Pallas TPU backend supports the static inputs."""
+  """Checks whether the Pallas/Mosaic TPU backend supports static inputs."""
   if q.dtype not in (jnp.bfloat16, jnp.float32):
     raise NotImplementedError(
-        "`pallas_tpu` currently supports bfloat16 and float32 inputs only."
+        "`mosaic` currently supports bfloat16 and float32 inputs only."
     )
   heads, batch, seq_len, key_dim = q.shape
   value_dim = v.shape[-1]
   if heads < 1 or batch < 1 or seq_len < 1:
     raise NotImplementedError(
-        "`pallas_tpu` requires positive head, batch, and sequence "
+        "`mosaic` requires positive head, batch, and sequence "
         f"dimensions; got H={heads}, B={batch}, T={seq_len}."
     )
   if key_dim < 1 or value_dim < 1:
     raise NotImplementedError(
-        "`pallas_tpu` requires positive key and value dimensions; got "
+        "`mosaic` requires positive key and value dimensions; got "
         f"K={key_dim}, V={value_dim}."
     )
   if key_dim > 256:
     raise NotImplementedError(
-        "`pallas_tpu` currently supports key dimensions up to 256; got "
+        "`mosaic` currently supports key dimensions up to 256; got "
         f"K={key_dim}."
     )
   cp_enabled = cp_context is not None and cp_context.is_cp_enabled
   if cp_enabled:
     if initial_state is not None:
       raise NotImplementedError(
-          "`pallas_tpu` context-parallel execution does not support "
+          "`mosaic` context-parallel execution does not support "
           "`initial_state`."
       )
     if output_final_state:
       raise NotImplementedError(
-          "`pallas_tpu` context-parallel execution does not support "
+          "`mosaic` context-parallel execution does not support "
           "`output_final_state=True`."
       )
     if segment_ids is None:
       raise NotImplementedError(
-          "`pallas_tpu` context-parallel execution requires rank-local "
+          "`mosaic` context-parallel execution requires rank-local "
           "`segment_ids`."
       )
     if N_max is None:
       raise NotImplementedError(
-          "`pallas_tpu` context-parallel execution requires `N_max`."
+          "`mosaic` context-parallel execution requires `N_max`."
       )
     if key_dim % 128 != 0 or value_dim % 128 != 0:
       raise NotImplementedError(
-          "`pallas_tpu` context-parallel execution requires key and value "
+          "`mosaic` context-parallel execution requires key and value "
           "dimensions to be multiples of 128; got "
           f"K={key_dim}, V={value_dim}."
       )
   if initial_state is not None and segment_ids is None:
     if initial_state.shape[1] != 1:
       raise NotImplementedError(
-          "`pallas_tpu` fixed-length execution requires exactly one "
+          "`mosaic` fixed-length execution requires exactly one "
           "recurrent state per batch item; got "
           f"N={initial_state.shape[1]}."
       )
   if chunk_size != 64:
-    raise NotImplementedError("`pallas_tpu` currently supports chunk_size=64.")
+    raise NotImplementedError("`mosaic` currently supports chunk_size=64.")
   if segment_ids is None and seq_len % chunk_size != 0:
     raise NotImplementedError(
-        "`pallas_tpu` requires the sequence length to be divisible by "
+        "`mosaic` requires the sequence length to be divisible by "
         f"`chunk_size`; got T={seq_len}, chunk_size={chunk_size}."
     )
 
@@ -154,7 +154,7 @@ class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention):
 
   def __post_init__(self):
     if self.chunk_size != 64:
-      raise ValueError("`pallas_tpu` only supports chunk_size=64.")
+      raise ValueError("`mosaic` only supports chunk_size=64.")
     if self.vjp is None:
       object.__setattr__(self, "vjp", PallasMosaicTpuKimiDeltaAttentionVjp())
 
@@ -330,10 +330,10 @@ class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention):
   @override
   def _fwd(
       self,
-      q: Float[Array, "H B T K"],
-      k: Float[Array, "H B T K"],
-      v: Float[Array, "H B T V"],
-      g: Float[Array, "H B T K"],
+      query: Float[Array, "H B T K"],
+      key: Float[Array, "H B T K"],
+      value: Float[Array, "H B T V"],
+      gate: Float[Array, "H B T K"],
       beta: Float[Array, "H B T"],
       *,
       A_log: Float[Array, "H"] | None,
@@ -358,8 +358,8 @@ class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention):
     # Reject unsupported calls before preprocessing or tracing a Pallas kernel,
     # so API dispatch can fall through to the next implementation.
     check_inputs_support(
-        q,
-        v,
+        query,
+        value,
         initial_state=initial_state,
         output_final_state=output_final_state,
         segment_ids=segment_ids,
@@ -369,10 +369,10 @@ class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention):
     )
 
     prepared = self._preprocess_inputs(
-        q,
-        k,
-        v,
-        g,
+        query,
+        key,
+        value,
+        gate,
         beta,
         initial_state=initial_state,
         output_final_state=output_final_state,
@@ -427,10 +427,10 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       residuals: KdaResiduals,
       out: base.Output,
       dout: base.Output,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      g: jax.Array,
+      query: jax.Array,
+      key: jax.Array,
+      value: jax.Array,
+      gate: jax.Array,
       beta: jax.Array,
       *,
       A_log: jax.Array | None,
@@ -455,10 +455,10 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     # in `residuals`. Reusing these arguments would skip that preprocessing.
     del (
         out,
-        q,
-        k,
-        v,
-        g,
+        query,
+        key,
+        value,
+        gate,
         beta,
         output_final_state,
         return_residuals,
@@ -491,10 +491,10 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     )
 
     grads = {
-        "q": dq,
-        "k": dk,
-        "v": dv,
-        "g": dg,
+        "query": dq,
+        "key": dk,
+        "value": dv,
+        "gate": dg,
         "beta": db,
     }
     if A_log is not None:

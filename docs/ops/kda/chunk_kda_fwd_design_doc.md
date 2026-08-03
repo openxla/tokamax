@@ -24,10 +24,10 @@ The primary tensor inputs and outputs are:
 | `N` | - | Number of logical segments represented in the recurrent-state axis; one for fixed-length input |
 | `K` | - | Query/key head dimension, denoted by `d_k` in the mathematical sections |
 | `V` | - | Value head dimension, denoted by `d_v` in the mathematical sections |
-| `q` | `[H, B, T, K]` | Query |
-| `k` | `[H, B, T, K]` | Key |
-| `v` | `[H, B, T, V]` | Value |
-| `g` | `[H, B, T, K]` | Raw gate or an already activated natural-log decay |
+| `query` | `[H, B, T, K]` | Query |
+| `key` | `[H, B, T, K]` | Key |
+| `value` | `[H, B, T, V]` | Value |
+| `gate` | `[H, B, T, K]` | Raw gate or an already activated natural-log decay |
 | `beta` | `[H, B, T]` | Per-token delta-rule write coefficient |
 | `initial_state` | `[B, N, H, K, V]`, or `None` | Optional initial `K x V` state for each sequence; fixed-length input requires `N=1`, and CP does not accept an external initial state |
 | `o` | `[H, B, T, V]` | Token output |
@@ -74,7 +74,7 @@ KDA output is not a softmax-weighted sum. It is the sum of a read from the state
 |---|---|---:|---|
 | Gate | `A_log` | `None` | Auxiliary tensor shaped `[H]`; required when `use_gate_in_kernel=True` and used to scale raw-gate activation |
 | Gate | `dt_bias` | `None` | Optional auxiliary tensor shaped `[H*K]`; added to the raw gate before activation |
-| Gate | `use_gate_in_kernel` | `False` | `False` means `g` already contains `ln(alpha)`; `True` means the backend activates raw `g` using `A_log`, optional `dt_bias`, and `lower_bound` |
+| Gate | `use_gate_in_kernel` | `False` | `False` means `gate` already contains `ln(alpha)`; `True` means the backend activates raw `gate` using `A_log`, optional `dt_bias`, and `lower_bound` |
 | Gate | `safe_gate` | `True` | Limits the exponent range within Stage 2 sub-blocks to prevent `exp2` overflow for large gate magnitudes |
 | Gate | `lower_bound` | `None` | `None` selects softplus raw-gate activation; a non-`None` value selects the sigmoid variant and must satisfy `-5 <= lower_bound < 0` |
 | Numerics | `scale` | `None` | The public contract canonicalizes `None` to `K^{-1/2}`; `_fwd` receives the resulting `float` query scale |
@@ -826,7 +826,7 @@ The API-level tests additionally cover:
 - variable-length input with `B=2`, padding, raw-gate activation, and in-kernel query/key L2 normalization;
 - preservation of final state across padded tokens and zero output at padding positions;
 - default omission of `final_state`;
-- implementation registration and ordered fallback from Pallas TPU to XLA;
+- implementation registration and ordered fallback from Mosaic TPU to XLA;
 - rejection before Pallas kernel launch for `K>256`, empty kernel-grid dimensions, an invalid fixed-length state dimension, unaligned CP `K/V`, and unsupported CP state or metadata combinations;
 - the requirement for `N_max` when variable-length input has no initial state, together with public shape and implementation-name validation.
 
@@ -1079,7 +1079,7 @@ $$
 \ell_t = a\,\operatorname{sigmoid}(\lambda_h x_t).
 $$
 
-When `use_gate_in_kernel=False`, input `g` directly represents `ell=ln(alpha)`. Production semantics require this value to be non-positive so that `alpha` lies in `(0,1]`.
+When `use_gate_in_kernel=False`, the public `gate` input directly represents `ell=ln(alpha)`. Production semantics require this value to be non-positive so that `alpha` lies in `(0,1]`.
 
 #### 9.1.4 Chunk Expansion and Compact WY Representation: Paper Eq. (2)-(5)
 

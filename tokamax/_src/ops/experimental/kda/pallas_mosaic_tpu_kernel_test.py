@@ -1135,7 +1135,7 @@ def _direct_backward(
 
 def _require_tpu(case: TestConfig) -> None:
   if jax.default_backend() != "tpu":
-    pytest.skip("Pallas TPU KDA tests require a TPU backend.")
+    pytest.skip("Pallas/Mosaic TPU KDA tests require a TPU backend.")
   if len(jax.devices()) < case.cp_size:
     pytest.skip(f"Case requires {case.cp_size} TPU devices.")
 
@@ -1169,10 +1169,10 @@ def test_chunk_kda_forward(case: TestConfig):
   inputs = _make_inputs(case)
 
   if case.cp_size > 1:
-    actual_result = _cp_forward("pallas_tpu", case, inputs)
+    actual_result = _cp_forward("mosaic", case, inputs)
     expected_result = _cp_forward("xla", case, inputs)
   else:
-    actual_result = _call_attention("pallas_tpu", case, inputs)
+    actual_result = _call_attention("mosaic", case, inputs)
     expected_result = _call_attention("xla", case, inputs)
   jax.block_until_ready((actual_result, expected_result))
 
@@ -1229,7 +1229,7 @@ def test_chunk_kda_backward(case: TestConfig):
   inputs = _make_inputs(case)
 
   grads = (
-      _cp_backward("pallas_tpu", case, inputs)
+      _cp_backward("mosaic", case, inputs)
       if case.cp_size > 1
       else _direct_backward(None, case, inputs)
   )
@@ -1239,9 +1239,9 @@ def test_chunk_kda_backward(case: TestConfig):
 
   if case.backward_check == "finite":
     output, _ = (
-        _cp_forward("pallas_tpu", case, inputs)
+        _cp_forward("mosaic", case, inputs)
         if case.cp_size > 1
-        else _call_attention("pallas_tpu", case, inputs)
+        else _call_attention("mosaic", case, inputs)
     )
     jax.block_until_ready((grads, output))
     for name, grad in zip(grad_names, grads, strict=True):

@@ -69,10 +69,10 @@ def _state_count(
 
 
 def kimi_delta_attention(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    gate: jax.Array,
     beta: jax.Array,
     *,
     A_log: jax.Array | None,
@@ -88,6 +88,7 @@ def kimi_delta_attention(
     N_max: int | None,
 ) -> tuple[jax.Array, jax.Array | None]:
   """Computes KDA with an explicit token-by-token JAX recurrence."""
+  q, k, v, g = query, key, value, gate
   heads, batch, seq_len, key_dim = q.shape
   value_dim = v.shape[-1]
   acc_dtype = _accumulator_dtype(q.dtype)

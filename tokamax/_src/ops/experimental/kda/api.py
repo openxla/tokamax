@@ -24,32 +24,30 @@ from tokamax._src.ops.experimental.kda import base
 from tokamax._src.ops.experimental.kda.cp_utils import CPContext
 
 
-Implementation: TypeAlias = Literal["xla", "pallas_tpu"]
+Implementation: TypeAlias = Literal["xla", "mosaic"]
 
 IMPLEMENTATIONS = dict(xla=base.KimiDeltaAttention())
 
 try:
   from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
-  IMPLEMENTATIONS["pallas_tpu"] = (
+  IMPLEMENTATIONS["mosaic_tpu"] = (
       pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention()
   )
 except ImportError:
   pass
 
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = (
-    ("pallas_tpu", "xla")
-    if "pallas_tpu" in IMPLEMENTATIONS
-    else ("xla",)
+    ("mosaic", "xla") if "mosaic_tpu" in IMPLEMENTATIONS else ("xla",)
 )
 
 
 @jaxtyping.jaxtyped
 def kimi_delta_attention(
-    q: Float[Array, "H B T K"],
-    k: Float[Array, "H B T K"],
-    v: Float[Array, "H B T V"],
-    g: Float[Array, "H B T K"],
+    query: Float[Array, "H B T K"],
+    key: Float[Array, "H B T K"],
+    value: Float[Array, "H B T V"],
+    gate: Float[Array, "H B T K"],
     beta: Float[Array, "H B T"],
     *,
     A_log: Float[Array, "H"] | None = None,
@@ -75,10 +73,10 @@ def kimi_delta_attention(
   contract for chunk-wise implementations.
 
   Args:
-    q: Query tensor with shape `[H, B, T, K]`.
-    k: Key tensor with shape `[H, B, T, K]`.
-    v: Value tensor with shape `[H, B, T, V]`.
-    g: Per-channel gate tensor in log space, shape `[H, B, T, K]`.
+    query: Query tensor with shape `[H, B, T, K]`.
+    key: Key tensor with shape `[H, B, T, K]`.
+    value: Value tensor with shape `[H, B, T, V]`.
+    gate: Per-channel gate tensor in log space, shape `[H, B, T, K]`.
     beta: Per-token delta-rule learning-rate tensor, shape `[H, B, T]`.
     A_log: Gate parameter, shape `[H]`. Required when
       `use_gate_in_kernel=True`.
@@ -87,10 +85,10 @@ def kimi_delta_attention(
     initial_state: Optional initial recurrent state, shape `[B, N, H, K, V]`.
       Its segment dimension `N` determines `N_max` when the latter is omitted.
     output_final_state: Whether to return the final recurrent state.
-    use_qk_l2norm_in_kernel: Whether to normalize q/k on the last dimension
-      before running KDA.
-    use_gate_in_kernel: Whether `g` is raw gate input that should be activated
-      with `A_log` and `dt_bias`. When false, `g` is already in log space.
+    use_qk_l2norm_in_kernel: Whether to normalize query/key on the last
+      dimension before running KDA.
+    use_gate_in_kernel: Whether `gate` is raw input that should be activated
+      with `A_log` and `dt_bias`. When false, `gate` is already in log space.
     segment_ids: Optional 1-indexed varlen segment IDs, shape `[B, T]`.
       Padding is represented by 0.
     safe_gate: Match pallas-kernel gate validation.
@@ -103,12 +101,12 @@ def kimi_delta_attention(
     N_max: Static upper bound for the number of varlen segments. Required when
       `segment_ids` is provided without `initial_state`; otherwise inferred
       from the initial state's segment dimension.
-    implementation: The implementation to use. By default, the Pallas TPU
+    implementation: The implementation to use. By default, the Mosaic TPU
       implementation is attempted first when available, with XLA as a fallback.
-      `"xla"` evaluates the recurrent reference implementation. `"pallas_tpu"`
-      uses the experimental Pallas TPU forward and custom VJP implementation
-      from pallas-kernel. A sequence tries implementations in order, falling
-      back when an implementation raises `NotImplementedError`.
+      `"xla"` evaluates the recurrent reference implementation. `"mosaic"`
+      uses the experimental Pallas/Mosaic TPU forward and custom VJP
+      implementation. A sequence tries implementations in order, falling back
+      when an implementation raises `NotImplementedError`.
 
   Returns:
     A pair `(output, final_state)`. The output has shape `[H, B, T, V]`.
@@ -124,15 +122,17 @@ def kimi_delta_attention(
 
   errors = []
   for impl in implementation:
+    if impl == "mosaic":
+      impl = "mosaic_tpu"
     if impl not in IMPLEMENTATIONS:
       raise ValueError(f"Unknown implementation: {impl}")
 
     try:
       return IMPLEMENTATIONS[impl](
-          q=q,
-          k=k,
-          v=v,
-          g=g,
+          query=query,
+          key=key,
+          value=value,
+          gate=gate,
           beta=beta,
           A_log=A_log,
           dt_bias=dt_bias,
