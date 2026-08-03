@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared data contracts for the Pallas TPU KDA implementation."""
+"""Shared data contracts for the Pallas/Mosaic TPU KDA implementation."""
 
 import dataclasses
 from typing import TypeAlias

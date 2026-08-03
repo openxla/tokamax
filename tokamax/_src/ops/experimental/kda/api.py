@@ -29,9 +29,11 @@ Implementation: TypeAlias = Literal["xla", "pallas_tpu"]
 IMPLEMENTATIONS = dict(xla=base.KimiDeltaAttention())
 
 try:
-  from tokamax._src.ops.experimental.kda import pallas_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
 
-  IMPLEMENTATIONS["pallas_tpu"] = pallas_tpu.PallasTpuKimiDeltaAttention()
+  IMPLEMENTATIONS["pallas_tpu"] = (
+      pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention()
+  )
 except ImportError:
   pass
 

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pallas TPU backward kernels for experimental KDA."""
+"""Pallas/Mosaic TPU backward kernels for experimental KDA."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ from tokamax._src.ops.experimental.kda.cp_utils import (
     _merge_dht,
     all_gather_into_tensor,
 )
-from tokamax._src.ops.experimental.kda.pallas_tpu_types import KdaResiduals
+from tokamax._src.ops.experimental.kda.pallas_mosaic_tpu_types import KdaResiduals
 from tokamax._src.ops.experimental.kda.utils import (
     _align_seqs,
     _unalign_output,

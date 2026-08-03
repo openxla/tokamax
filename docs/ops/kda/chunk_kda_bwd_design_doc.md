@@ -4,10 +4,12 @@ Reference: Kimi Linear tech report — https://github.com/MoonshotAI/Kimi-Linear
 
 Code:
 - `tokamax/_src/ops/experimental/kda/base.py` — public KDA argument and recurrent-state contract
-- `tokamax/_src/ops/experimental/kda/pallas_tpu.py` — Tokamax custom-VJP adapter
-- `tokamax/_src/ops/experimental/kda/pallas_tpu_types.py` — typed `KdaResiduals` contract
-- `tokamax/_src/ops/experimental/kda/pallas_tpu_fwd.py` — construction of forward residual matrices and saved states
-- `tokamax/_src/ops/experimental/kda/pallas_tpu_bwd.py` — backward orchestrator and Pallas kernels
+- `tokamax/_src/ops/experimental/kda/reference.py` — pure JAX recurrent reference implementation
+- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu.py` — Tokamax custom-VJP adapter
+- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_kernel.py` — public low-level kernel entry points
+- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_types.py` — typed `KdaResiduals` contract
+- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_fwd_kernel.py` — construction of forward residual matrices and saved states
+- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_bwd_kernel.py` — backward orchestrator and Pallas kernels
 - `tokamax/_src/ops/experimental/kda/common.py` — shared gate cumsum, state recurrence, and mini-batch helper
 - `tokamax/_src/ops/experimental/kda/cp_utils.py` — context-parallel gradient merge
 - `tokamax/_src/ops/experimental/kda/utils.py` — alignment, unalignment, and L2-normalization backward helpers
@@ -31,7 +33,7 @@ Intuitively, the output of a query comes from two paths:
 - inter path: reads information from the historical state `h` that already exists when entering this chunk;
 - intra path: reads information from the updated results of earlier tokens within this chunk.
 
-The Tokamax entry is `PallasTpuKimiDeltaAttentionVjp._fwd(...)`, which passes the typed forward residuals and output cotangents to `chunk_kda_bwd_custom(...)`. The orchestrator receives the output gradient `do` and optional final-state gradient `dht`, and produces:
+The Tokamax entry is `PallasMosaicTpuKimiDeltaAttentionVjp._fwd(...)`, which passes the typed forward residuals and output cotangents to `chunk_kda_bwd_custom(...)`. The orchestrator receives the output gradient `do` and optional final-state gradient `dht`, and produces:
 
 - `dq, dk, dv`: gradients with respect to query/key/value;
 - `db`: gradient with respect to `beta`;
@@ -101,7 +103,7 @@ The corresponding inter-chunk recurrence is:
 
 ### 1.3 API and Variable Reference
 
-Entry point: `tokamax/_src/ops/experimental/kda/pallas_tpu.py::PallasTpuKimiDeltaAttentionVjp._fwd(...)`, followed by `tokamax/_src/ops/experimental/kda/pallas_tpu_bwd.py::chunk_kda_bwd_custom(...)`.
+Entry point: `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu.py::PallasMosaicTpuKimiDeltaAttentionVjp._fwd(...)`, followed by `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_kernel.py::chunk_kda_bwd_custom(...)`.
 
 All main-path tensors use the head-first `[H, B, T, ...]` layout. The public KDA API and the Pallas backend already use this layout; there is no input transpose at the custom-VJP boundary. The backward consumes the aligned and optionally L2-normalized copies stored in `KdaResiduals`, rather than the replayed original tensors supplied by Tokamax's generic VJP contract.
 
@@ -160,7 +162,7 @@ The backward orchestrator can normalize an internal four-dimensional final-state
 The current Tokamax call chain is:
 
 ```text
-PallasTpuKimiDeltaAttentionVjp._fwd
+PallasMosaicTpuKimiDeltaAttentionVjp._fwd
 └─ chunk_kda_bwd_custom
    ├─ unpack KdaResiduals
    ├─ align do with the retained cu_seqlens/aligned_cu_seqlens

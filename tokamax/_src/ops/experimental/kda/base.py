@@ -18,10 +18,10 @@
 from typing import Any, TypeAlias, TypeVar
 
 import jax
-import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
+from tokamax._src.ops.experimental.kda import reference
 from tokamax._src.ops.experimental.kda.cp_utils import (
     CPContext,
     CPContextArg,
@@ -35,39 +35,9 @@ Output: TypeAlias = tuple[jax.Array, jax.Array | None]
 Residuals: TypeAlias = Any
 
 
-def _accumulator_dtype(dtype: jax.typing.DTypeLike) -> jnp.dtype:
-  dtype = jnp.dtype(dtype)
-  return jnp.float64 if dtype == jnp.float64 else jnp.float32
-
-
 def _check_array_rank(x: jax.Array, rank: int, name: str):
   if x.ndim != rank:
     raise ValueError(f"`{name}` must be rank {rank}, got shape {x.shape}.")
-
-
-def _l2_normalize(x: jax.Array, acc_dtype: jnp.dtype) -> jax.Array:
-  x_f = x.astype(acc_dtype)
-  rstd = jax.lax.rsqrt(jnp.sum(x_f * x_f, axis=-1) + 1e-6)
-  return x_f * rstd[..., None]
-
-
-def _activate_gate(
-    g: jax.Array,
-    *,
-    A_log: jax.Array | None,
-    dt_bias: jax.Array | None,
-    lower_bound: float | None,
-) -> jax.Array:
-  heads, _, _, key_dim = g.shape
-  if A_log is None:
-    raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True`.")
-  g_f = g.astype(jnp.float32)
-  if dt_bias is not None:
-    g_f = g_f + dt_bias.astype(jnp.float32).reshape(heads, 1, 1, key_dim)
-  A = jnp.exp(A_log.astype(jnp.float32)).reshape(heads, 1, 1, 1)
-  if lower_bound is None:
-    return -A * jax.nn.softplus(g_f)
-  return lower_bound * jax.nn.sigmoid(A * g_f)
 
 
 def _validate_gate_args(
@@ -97,24 +67,6 @@ def _validate_gate_args(
     )
   if lower_bound is not None and not (-5 <= lower_bound < 0):
     raise ValueError(f"`lower_bound` must be in [-5, 0), got {lower_bound}.")
-
-
-def _state_count(
-    *,
-    segment_ids: jax.Array | None,
-    initial_state: jax.Array | None,
-    N_max: int | None,
-) -> int:
-  if initial_state is not None:
-    return initial_state.shape[1]
-  if segment_ids is None:
-    return 1
-  if N_max is not None:
-    return N_max
-  raise ValueError(
-      "`N_max` is required when `segment_ids` is provided without "
-      "`initial_state`."
-  )
 
 
 class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
@@ -268,126 +220,24 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       return_residuals: bool,
       config: _Config,
   ) -> tuple[Output, Residuals]:
-    """Computes KDA with explicit Python loops."""
+    """Dispatches to the pure JAX KDA reference implementation."""
     del config, return_residuals, safe_gate, disable_recompute, chunk_size
-
-    heads, batch, seq_len, key_dim = q.shape
-    value_dim = v.shape[-1]
-    acc_dtype = _accumulator_dtype(q.dtype)
-    output_dtype = q.dtype
-    local_seq_len = seq_len
-
-    if use_gate_in_kernel:
-      g = _activate_gate(
-          g, A_log=A_log, dt_bias=dt_bias, lower_bound=lower_bound
-      )
-    if use_qk_l2norm_in_kernel:
-      q_h = _l2_normalize(q, acc_dtype)
-      k_h = _l2_normalize(k, acc_dtype)
-    else:
-      q_h = q.astype(acc_dtype)
-      k_h = k.astype(acc_dtype)
-
-    q_h = q_h * scale
-    v_h = v.astype(acc_dtype)
-    g_h = g.astype(acc_dtype)
-    beta_h = beta.astype(acc_dtype)
-    cp_enabled = cp_context is not None and getattr(
-        cp_context, "is_cp_enabled", False
-    )
-    if cp_enabled:
-      from tokamax._src.ops.experimental.kda.cp_utils import (  # pylint: disable=g-import-not-at-top
-          all_gather_into_tensor,
-      )
-
-      def gather_time_axis(x, axis: int):
-        x_all, _ = all_gather_into_tensor(x, cp_context.axis_name)
-        return jnp.concatenate(
-            [x_all[i] for i in range(x_all.shape[0])], axis=axis
-        )
-
-      q_h = gather_time_axis(q_h, 2)
-      k_h = gather_time_axis(k_h, 2)
-      v_h = gather_time_axis(v_h, 2)
-      g_h = gather_time_axis(g_h, 2)
-      beta_h = gather_time_axis(beta_h, 2)
-      if segment_ids is not None:
-        segment_ids = gather_time_axis(segment_ids, 1)
-      seq_len = q_h.shape[2]
-
-    num_states = _state_count(
-        segment_ids=segment_ids,
+    output = reference.kimi_delta_attention(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
         initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        segment_ids=segment_ids,
+        lower_bound=lower_bound,
+        cp_context=cp_context,
         N_max=N_max,
     )
-
-    states = jnp.zeros(
-        (batch, num_states, heads, key_dim, value_dim), dtype=acc_dtype
-    )
-    if initial_state is not None:
-      states = states + initial_state.astype(acc_dtype)
-
-    output_h = jnp.zeros((heads, batch, seq_len, value_dim), dtype=acc_dtype)
-
-    def step_token(h, b, t, carry):
-      states, output_h = carry
-      if segment_ids is None:
-        state_idx = jnp.array(0, dtype=jnp.int32)
-        valid = jnp.array(True)
-      else:
-        seg_id = segment_ids[b, t].astype(jnp.int32)
-        state_idx = jnp.clip(seg_id - 1, 0, num_states - 1)
-        valid = (seg_id > 0) & (seg_id <= num_states)
-
-      previous_state = states[b, state_idx, h]
-      state = previous_state * jnp.exp(g_h[h, b, t])[:, None]
-      prediction = k_h[h, b, t] @ state
-      residual = v_h[h, b, t] - prediction
-      new_state = state + (
-          beta_h[h, b, t] * k_h[h, b, t]
-      )[:, None] * residual[None, :]
-      out_t = q_h[h, b, t] @ new_state
-      output_h = output_h.at[h, b, t].set(
-          jnp.where(valid, out_t, jnp.zeros_like(out_t))
-      )
-      updated_state = jnp.where(valid, new_state, previous_state)
-      states = states.at[b, state_idx, h].set(updated_state)
-      return states, output_h
-
-    def step_head(h, carry):
-      states, output_h = carry
-
-      def body_b(b, b_carry):
-        def body_t(t, t_carry):
-          return step_token(h, b, t, t_carry)
-
-        return jax.lax.fori_loop(0, seq_len, body_t, b_carry)
-
-      states, output_h = jax.lax.fori_loop(
-          0, batch, body_b, (states, output_h)
-      )
-      return states, output_h
-
-    if cp_enabled:
-      # Keep the native token-by-token recurrence, but rematerialize each
-      # head's large state intermediates during backward. Dot outputs are much
-      # smaller than the K x V states and are retained to limit recomputation.
-      step_head = jax.checkpoint(
-          step_head,
-          prevent_cse=False,
-          policy=jax.checkpoint_policies.dots_saveable,
-      )
-
-    states, output_h = jax.lax.fori_loop(
-        0, heads, step_head, (states, output_h)
-    )
-
-    if cp_enabled:
-      rank = jax.lax.axis_index(cp_context.axis_name)
-      output_h = jax.lax.dynamic_slice_in_dim(
-          output_h, rank * local_seq_len, local_seq_len, axis=2
-      )
-
-    output = output_h.astype(output_dtype)
-    final_state = states if output_final_state else None
-    return (output, final_state), None
+    return output, None

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Numerical tests for the experimental Pallas TPU KDA implementation."""
+"""Numerical correctness tests for the Pallas/Mosaic TPU KDA kernels."""
 
 from collections.abc import Sequence
 import dataclasses

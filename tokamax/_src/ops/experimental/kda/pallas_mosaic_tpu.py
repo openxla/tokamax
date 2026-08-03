@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Experimental Pallas TPU implementation of Kimi Delta Attention."""
+"""Experimental Pallas/Mosaic TPU implementation of Kimi Delta Attention."""
 
 import dataclasses
 from typing import Any
@@ -29,13 +29,11 @@ from tokamax._src.ops.experimental.kda.cp_utils import (
     CPContext,
     CPContextArg,
 )
-from tokamax._src.ops.experimental.kda.pallas_tpu_bwd import (
+from tokamax._src.ops.experimental.kda.pallas_mosaic_tpu_kernel import (
     chunk_kda_bwd_custom,
-)
-from tokamax._src.ops.experimental.kda.pallas_tpu_fwd import (
     chunk_kda_fwd_custom,
 )
-from tokamax._src.ops.experimental.kda.pallas_tpu_types import (
+from tokamax._src.ops.experimental.kda.pallas_mosaic_tpu_types import (
     CpMetadata,
     KdaResiduals,
 )
@@ -145,8 +143,8 @@ def check_inputs_support(
 
 
 @dataclasses.dataclass(frozen=True)
-class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
-  """Pallas TPU KDA backend.
+class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention):
+  """Pallas/Mosaic TPU KDA backend.
 
   This adapter preserves Tokamax's experimental head-first KDA contract:
   inputs are `[H, B, T, D]` and recurrent states are `[B, N, H, K, V]`.
@@ -158,7 +156,7 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
     if self.chunk_size != 64:
       raise ValueError("`pallas_tpu` only supports chunk_size=64.")
     if self.vjp is None:
-      object.__setattr__(self, "vjp", PallasTpuKimiDeltaAttentionVjp())
+      object.__setattr__(self, "vjp", PallasMosaicTpuKimiDeltaAttentionVjp())
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -419,10 +417,10 @@ class PallasTpuKimiDeltaAttention(base.KimiDeltaAttention):
     return (value, final_state), residuals
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PallasTpuKimiDeltaAttentionVjp(
+class PallasMosaicTpuKimiDeltaAttentionVjp(
     op.Op[Any, dict[str, Any], None, Any, Any]
 ):
-  """Tokamax Op VJP wrapper for the Pallas TPU KDA backward path."""
+  """Tokamax Op VJP wrapper for the Pallas/Mosaic TPU KDA backward path."""
 
   def _fwd(
       self,

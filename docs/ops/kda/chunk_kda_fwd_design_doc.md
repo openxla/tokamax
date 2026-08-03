@@ -68,7 +68,7 @@ KDA output is not a softmax-weighted sum. It is the sum of a read from the state
 
 ### 2.1 Forward Control Parameters
 
-`KimiDeltaAttention.bind` supplies public defaults and validates the public contract before dispatch. `PallasTpuKimiDeltaAttention._fwd` therefore receives fully bound values. The table below records the public default together with the backend meaning of every semantically relevant auxiliary argument; the primary data tensors are not repeated.
+`KimiDeltaAttention.bind` supplies public defaults and validates the public contract before dispatch. `PallasMosaicTpuKimiDeltaAttention._fwd` therefore receives fully bound values. The table below records the public default together with the backend meaning of every semantically relevant auxiliary argument; the primary data tensors are not repeated.
 
 | Group | Parameter | Public default | Backend contract and effect |
 |---|---|---:|---|
@@ -117,7 +117,7 @@ KDA output is not a softmax-weighted sum. It is the sum of a read from the state
 ### 3.1 End-to-End Flow
 
 ```text
-PallasTpuKimiDeltaAttention._fwd
+PallasMosaicTpuKimiDeltaAttention._fwd
   |
   |-- Validate dtype, chunk size, and fixed-length divisibility
   |-- _preprocess_inputs
@@ -180,7 +180,7 @@ Keeping these semantic stages makes correctness easier to explain. Fusing adjace
 | Function | Primary responsibility | Downstream function |
 |---|---|---|
 | `KimiDeltaAttention.bind` | Validate the public contract and canonicalize `scale=None` to `K^{-1/2}` | TPU backend hook |
-| `PallasTpuKimiDeltaAttention._fwd` | Tokamax TPU backend dispatch and dtype/chunk validation | `_preprocess_inputs`, then `chunk_kda_fwd_custom` |
+| `PallasMosaicTpuKimiDeltaAttention._fwd` | Tokamax TPU backend dispatch and dtype/chunk validation | `_preprocess_inputs`, then `chunk_kda_fwd_custom` |
 | `_preprocess_inputs` | One-time CP/varlen metadata construction, alignment, raw-gate padding, optional q/k L2 normalization, and backward metadata preparation | `chunk_kda_fwd_custom` |
 | `chunk_kda_fwd_custom` | Unified forward orchestration, optional residual construction, output unalignment, and selection of Stage 1+2, CP, and Stage 3+4 | Stage functions below |
 | `kda_fwd_intra_fused` | Stage 1+2 dtype routing and fused execution | Fused bfloat16 path or float32 forward-substitution path |
@@ -188,7 +188,7 @@ Keeping these semantic stages makes correctness easier to explain. Fusing adjace
 | `chunk_gated_delta_rule_fwd_h_pre_process` | Construct the rank-local affine state summary consumed by the CP bridge | `_prepare_cp_initial_state` |
 | `_merge_initial_state` | Merge the applicable upstream rank summaries and recover the first local segment's initial state | `_prepare_cp_initial_state` |
 | `chunk_kda_fwd_h_o_varlen` | Unified fused Stage 3+4 for fixed-length and variable-length input | `o`, optional state residual, and final state |
-| `KdaResiduals` | Typed contract containing the prepared forward values consumed by the custom backward | `PallasTpuKimiDeltaAttentionVjp` |
+| `KdaResiduals` | Typed contract containing the prepared forward values consumed by the custom backward | `PallasMosaicTpuKimiDeltaAttentionVjp` |
 
 ### 3.5 Preprocessing Boundary and Single-Alignment Contract
 
@@ -804,8 +804,9 @@ Causality, segment boundaries, and padding are therefore fixed components of the
 
 Forward correctness is validated against implementations that do not use the Pallas TPU kernel decomposition:
 
-- `tokamax/_src/ops/experimental/kda/pallas_tpu_test.py` compares the Pallas TPU result with the XLA implementation using identical inputs. It compares both `output` and `final_state` when a final state is requested. For CP, the Pallas path is sharded across the context mesh and is compared with the unsharded XLA result for the same global input.
-- `tokamax/_src/ops/experimental/kda/api_test.py` compares the public KDA API with a direct token-recurrent reference implementation. This independently checks the chunked formulation against the recurrence in Section 9.1.2 rather than against another use of the same chunk equations.
+- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_kernel_test.py` compares the Pallas/Mosaic TPU result with the XLA implementation using identical inputs. It compares both `output` and `final_state` when a final state is requested. For CP, the Pallas path is sharded across the context mesh and is compared with the unsharded XLA result for the same global input.
+- `tokamax/_src/ops/experimental/kda/base_test.py` compares the public KDA API with a direct token-recurrent reference implementation. This independently checks the chunked formulation against the recurrence in Section 9.1.2 rather than against another use of the same chunk equations.
+- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_test.py` validates adapter-level input support and context-parallel contract checks before a kernel is traced.
 - The parameterized Pallas TPU backward tests run the same case matrix and compare `dq`, `dk`, `dv`, `dg`, `dbeta`, and optional `dh0` with XLA. Although backward implementation details are outside the scope of this document, these tests validate that the forward residual and recomputation contracts provide the values required by the custom VJP.
 
 ### 6.2 Existing Forward Coverage
@@ -839,7 +840,7 @@ A forward case is accepted only when every requested result passes the numerical
 
 ### 6.4 Execution Requirements and Current Gaps
 
-`pallas_tpu_test.py` requires a TPU default backend and skips a case when fewer than `cp_size` TPU devices are available. The `fixed_t8192` case is marked `long`. API and fallback tests can exercise the reference and dispatch contracts without a TPU, but they do not replace execution of the Pallas numerical cases.
+`pallas_mosaic_tpu_kernel_test.py` requires a TPU default backend and skips a case when fewer than `cp_size` TPU devices are available. The `fixed_t8192` case is marked `long`. API and fallback tests can exercise the reference and dispatch contracts without a TPU, but they do not replace execution of the Pallas numerical cases.
 
 The test sources establish the validation plan and existing coverage; they do not by themselves establish that an arbitrary current commit has passed. An upstream delivery result must record the tested source commit, JAX and libtpu versions, TPU generation and topology, exact test command, enabled test markers, and pass/fail result.
 
