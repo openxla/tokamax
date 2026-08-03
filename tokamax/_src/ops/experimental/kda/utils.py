@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import os
 
 import jax
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.kda.cp_utils import (
     CPContext,
@@ -437,106 +438,26 @@ def prepare_chunk_indices(
   return jnp.stack([seq_ids, block_ids], axis=1)
 
 
+_TPU_VMEM_USAGE_FRACTION = 0.9
+
+
 @dataclass(frozen=True)
-class TpuConfig:
-  generation: str
-  vmem_per_core_bytes: int
-  smem_per_core_bytes: int
-  tflops_bf16_2d: float
-  tflops_fp8_2d: float
-  tflops_fp32_2d: float
-  block_align_minor: int = 8
-  block_align_major: int = 128
-  hbm_bandwidth_gbps: float = 0.0
-  frequency_ghz: float = 0.0
-  tflops_fp32_1d: float = 0.0
-  description: str = ""
-  num_lanes: int = 128
-  num_sublanes: int = 8
-  mxu_column_size: int = 128
-  cmem_per_core_bytes: int = 0
-  hbm_per_core_bytes: int = 0
-  mem_bw_bytes_per_second: int = 0
-  tflops_int8_2d: float = 0.0
-  tflops_int4_2d: float = 0.0
+class _TpuLimits:
+  """Subset of JAX TPU hardware information used by KDA kernels."""
 
-  @property
-  def vmem_limit_bytes(self) -> int:
-    return int(self.vmem_per_core_bytes * 0.9)
-
-  @property
-  def vmem_hw_limit_bytes(self) -> int:
-    return int(self.vmem_per_core_bytes * 0.9)
+  vmem_limit_bytes: int
+  block_align_minor: int
+  block_align_major: int
 
 
-TPU_V6E = TpuConfig(
-    generation="v6e",
-    vmem_per_core_bytes=128 * 1024 * 1024,
-    smem_per_core_bytes=1024 * 1024,
-    tflops_fp8_2d=920.0,
-    tflops_bf16_2d=920.0,
-    tflops_fp32_2d=460.0,
-    hbm_bandwidth_gbps=1640.0,
-    frequency_ghz=1.75,
-    tflops_fp32_1d=7.168,
-    description="TPU v6e (Trillium)",
-    mxu_column_size=256,
-    hbm_per_core_bytes=34_400_000_000,
-    mem_bw_bytes_per_second=int(1.64e12),
-    tflops_int8_2d=1840.0,
-    tflops_int4_2d=3680.0,
-)
-
-TPU_V7 = TpuConfig(
-    generation="v7",
-    vmem_per_core_bytes=64 * 1024 * 1024,
-    smem_per_core_bytes=1024 * 1024,
-    tflops_fp8_2d=2300.0,
-    tflops_bf16_2d=1155.0,
-    tflops_fp32_2d=577.5,
-    hbm_bandwidth_gbps=3700.0,
-    frequency_ghz=2.2,
-    tflops_fp32_1d=9.0112,
-    description="TPU v7 (Ironwood) - 2 devices per chip, values are per-device",
-    mxu_column_size=256,
-    hbm_per_core_bytes=103_000_000_000,
-    mem_bw_bytes_per_second=int(3.70e12),
-)
-
-_PRESETS: dict[str, TpuConfig] = {
-    "v6e": TPU_V6E,
-    "v7": TPU_V7,
-}
-
-_DEVICE_KIND_MAP: list[tuple[str, str]] = [
-    ("v6 lite", "v6e"),
-    ("v7 lite", "v7"),
-    ("v7e", "v7"),
-    ("tpu7x", "v7"),
-    ("v6e", "v6e"),
-    ("v7", "v7"),
-    ("v6", "v6e"),
-]
-
-_current_config: TpuConfig | None = None
-
-
-def _detect_tpu_config() -> TpuConfig:
-  try:
-    devices = jax.devices()
-  except RuntimeError:
-    devices = []
-
-  for device in devices:
-    device_kind = device.device_kind.lower()
-    for needle, key in _DEVICE_KIND_MAP:
-      if needle in device_kind:
-        return _PRESETS[key]
-  return TPU_V6E
-
-
-def get_tpu_config() -> TpuConfig:
-  global _current_config
-  if _current_config is None:
-    _current_config = _detect_tpu_config()
-  return _current_config
+def get_tpu_limits() -> _TpuLimits:
+  """Returns KDA limits for the TPU selected by Mosaic dispatch."""
+  tpu_info = pltpu.get_tpu_info()
+  return _TpuLimits(
+      # Preserve headroom for compiler-managed VMEM allocations.
+      vmem_limit_bytes=int(
+          tpu_info.vmem_capacity_bytes * _TPU_VMEM_USAGE_FRACTION
+      ),
+      block_align_minor=int(tpu_info.num_sublanes),
+      block_align_major=int(tpu_info.num_lanes),
+  )

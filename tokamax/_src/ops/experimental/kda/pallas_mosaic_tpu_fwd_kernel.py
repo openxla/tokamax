@@ -41,7 +41,7 @@ from tokamax._src.ops.experimental.kda.utils import (
   align_up,
   exp2,
   get_interpret,
-  get_tpu_config,
+  get_tpu_limits,
   prepare_chunk_indices,
 )
 
@@ -1183,7 +1183,7 @@ def chunk_kda_fwd_h_o_varlen(
     )
   assert K <= 256, "current kernel does not support K > 256."
 
-  hw = get_tpu_config()
+  hw = get_tpu_limits()
   K_PADSIZE = int(align_up(K, hw.block_align_major))
   V_ALIGNED = int(align_up(V, hw.block_align_major))
 

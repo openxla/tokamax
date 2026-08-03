@@ -48,7 +48,7 @@ from tokamax._src.ops.experimental.kda.utils import (
     exp,
     exp2,
     get_interpret,
-    get_tpu_config,
+    get_tpu_limits,
     l2norm_bwd,
     segment_ids_to_seqlens,
 )
@@ -697,7 +697,7 @@ def fused_recompute_w_u_vnew_from_h_pallas(
   A_r = A.reshape(-1, BT, BT)
   h_r = h.reshape(total, K, V)
 
-  align_minor = get_tpu_config().block_align_minor
+  align_minor = get_tpu_limits().block_align_minor
   if mini_batch is None:
     elem_size = 2 if v.dtype == jnp.bfloat16 else 4
     in_bytes = (3 * BT * K + BT * V + BT + BT * BT + K * V) * elem_size  # beta: BT bytes (2D)
@@ -787,7 +787,7 @@ def fused_recompute_w_u_vnew_from_h_pallas(
     compiler_params=pltpu.CompilerParams(
       dimension_semantics=("parallel",),
       disable_bounds_checks=True,
-      vmem_limit_bytes=get_tpu_config().vmem_limit_bytes,
+      vmem_limit_bytes=get_tpu_limits().vmem_limit_bytes,
     ),
     interpret=get_interpret(),
   )(k_r, v_r, beta_r, A_r, q_r, g_r, h_r)
@@ -1149,7 +1149,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       K * V + 5 * BT * K + BT * V + BT + 2 * BT * BT + K * V
     ) * 4
     per_head = io_per_head + io_per_head * 3 // 2
-    hw = get_tpu_config()
+    hw = get_tpu_limits()
     vmem_budget = hw.vmem_limit_bytes
     MB = max(1, vmem_budget // per_head)
     MB = min(MB, H, 16)
@@ -1242,7 +1242,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     compiler_params=pltpu.CompilerParams(
       dimension_semantics=("parallel", "parallel", "arbitrary"),
       disable_bounds_checks=True,
-      vmem_limit_bytes=get_tpu_config().vmem_limit_bytes,
+      vmem_limit_bytes=get_tpu_limits().vmem_limit_bytes,
     ),
     interpret=get_interpret(),
   )(
@@ -1448,7 +1448,7 @@ def chunk_kda_bwd_dAv_kernel(
     compiler_params=pltpu.CompilerParams(
       dimension_semantics=("parallel",),
       disable_bounds_checks=True,
-      vmem_limit_bytes=get_tpu_config().vmem_limit_bytes,
+      vmem_limit_bytes=get_tpu_limits().vmem_limit_bytes,
     ),
     interpret=interpret,
   )(v_r, A_r, do_r)

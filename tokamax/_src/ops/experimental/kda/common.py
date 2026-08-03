@@ -33,7 +33,7 @@ from tokamax._src.ops.experimental.kda.utils import (
   exp,
   exp2,
   get_interpret,
-  get_tpu_config,
+  get_tpu_limits,
   pad_to_multiple,
 )
 RCP_LN2 = 1.0 / math.log(2)
@@ -62,16 +62,16 @@ def estimate_mini_batch(
       total: Number of tiles (or heads) to partition.
       max_mb: Upper bound on MB (default 16).
       vmem_budget: VMEM budget in bytes. ``None`` (default) queries
-          ``get_tpu_config().vmem_limit_bytes`` at call time.
+          ``get_tpu_limits().vmem_limit_bytes`` at call time.
       align_minor: TPU block_align_minor constraint. ``None`` (default)
-          queries ``get_tpu_config().block_align_minor``.  When provided,
+          queries ``get_tpu_limits().block_align_minor``.  When provided,
           the function prefers MB values that satisfy this alignment.
 
   Returns:
       Mini-batch size ``MB`` such that ``total % MB == 0`` (best-effort).
   """
   if vmem_budget is None or align_minor is None:
-    hw = get_tpu_config()
+    hw = get_tpu_limits()
     if vmem_budget is None:
       vmem_budget = hw.vmem_limit_bytes
     if align_minor is None:

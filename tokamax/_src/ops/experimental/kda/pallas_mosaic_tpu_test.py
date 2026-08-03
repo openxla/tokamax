@@ -23,6 +23,7 @@ from absl.testing import parameterized
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.kda import api
 from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu
+from tokamax._src.ops.experimental.kda import utils
 from tokamax._src.ops.experimental.kda.cp_utils import CPContext
 
 
@@ -52,6 +53,25 @@ def _call_attention(implementation, q, v, **kwargs):
 
 
 class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
+
+  def test_tpu_limits_use_pallas_hardware_info(self):
+    tpu_info = types.SimpleNamespace(
+        vmem_capacity_bytes=64 * 1024 * 1024,
+        num_sublanes=16,
+        num_lanes=128,
+    )
+
+    with mock.patch.object(
+        utils.pltpu, "get_tpu_info", return_value=tpu_info
+    ) as get_tpu_info:
+      limits = utils.get_tpu_limits()
+
+    get_tpu_info.assert_called_once_with()
+    self.assertEqual(
+        limits.vmem_limit_bytes, int(tpu_info.vmem_capacity_bytes * 0.9)
+    )
+    self.assertEqual(limits.block_align_minor, tpu_info.num_sublanes)
+    self.assertEqual(limits.block_align_major, tpu_info.num_lanes)
 
   def test_chunk_size_config(self):
     attention = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention()
