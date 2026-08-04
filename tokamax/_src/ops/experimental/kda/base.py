@@ -18,6 +18,8 @@
 from typing import Any, TypeAlias, TypeVar
 
 import jax
+from jax.experimental import checkify
+import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
@@ -33,6 +35,15 @@ _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 Output: TypeAlias = tuple[jax.Array, jax.Array | None]
 Residuals: TypeAlias = Any
+
+
+def _validate_beta(beta: jax.Array) -> None:
+  """Checks that the post-activation delta-rule rate is in [0, 1]."""
+  valid = jnp.all((beta >= 0) & (beta <= 1))
+  message = "`beta` must contain finite values in [0, 1]."
+  checkify.debug_check(valid, message)
+  if not isinstance(beta, jax.core.Tracer):
+    checkify.check(valid, message)
 
 
 def _validate_gate_args(
@@ -137,6 +148,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
           "`max_num_segments` is required when `segment_ids` is provided "
           "without `initial_state`."
       )
+    _validate_beta(beta)
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,
         a_log=a_log,

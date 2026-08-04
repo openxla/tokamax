@@ -76,7 +76,8 @@ def kimi_delta_attention(
     gate: Per-channel gate tensor with shape `[H, B, T, K]`. When
       `use_gate_in_kernel=True`, this is the raw delta-time input; otherwise,
       it is already the log-space decay.
-    beta: Per-token delta-rule learning-rate tensor, shape `[H, B, T]`.
+    beta: Post-activation per-token delta-rule learning-rate tensor with values
+      in `[0, 1]`, shape `[H, B, T]`.
     a_log: Per-head log decay-rate parameter, shape `[H]`. Required when
       `use_gate_in_kernel=True`.
     delta_time_bias: Optional per-head, per-key-channel bias added to the raw
