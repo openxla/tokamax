@@ -21,8 +21,7 @@ from tokamax._src.ops.experimental.kda.cp_utils import ContextParallelMetadataAr
 
 
 def _accumulator_dtype(dtype: jax.typing.DTypeLike) -> jnp.dtype:
-  dtype = jnp.dtype(dtype)
-  return jnp.float64 if dtype == jnp.float64 else jnp.float32
+  return jnp.promote_types(jnp.dtype(dtype), jnp.float32)
 
 
 def _l2_normalize(x: jax.Array, acc_dtype: jnp.dtype) -> jax.Array:

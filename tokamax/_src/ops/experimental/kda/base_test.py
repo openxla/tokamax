@@ -28,6 +28,7 @@ from tokamax._src import jaxtyping
 from tokamax._src import numerics
 from tokamax._src.ops.experimental.kda import api
 from tokamax._src.ops.experimental.kda import ContextParallelMetadata
+from tokamax._src.ops.experimental.kda import reference
 
 
 def _l2_normalize(x: jax.Array) -> jax.Array:
@@ -80,6 +81,15 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
       self.assertIn(name, parameters)
     for name in ("dt_bias", "use_qk_l2norm_in_kernel", "cp_context"):
       self.assertNotIn(name, parameters)
+
+  @parameterized.parameters(
+      (jnp.bfloat16, jnp.float32),
+      (jnp.float16, jnp.float32),
+      (jnp.float32, jnp.float32),
+      (jnp.float64, jnp.float64),
+  )
+  def test_accumulator_dtype_uses_float32_as_floor(self, dtype, expected):
+    self.assertEqual(reference._accumulator_dtype(dtype), jnp.dtype(expected))
 
   @parameterized.named_parameters(
       ("bfloat16", jnp.bfloat16, False, False, False),
