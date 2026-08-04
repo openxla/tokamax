@@ -168,7 +168,8 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     # Test that all autotuning configs yield reasonable results.
     assert isinstance(self._attention_fn, base.DotProductAttention)
     q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 128))
-    bound_args = self._attention_fn.bind(q, k, v)
+    precision = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    bound_args = self._attention_fn.bind(q, k, v, precision=precision)
     configs = self._attention_fn._get_autotuning_configs(bound_args)
     self.assertNotEmpty(configs)
     for config in configs:
