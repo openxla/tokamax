@@ -26,6 +26,41 @@ concurrency:
 
 # These jobs should build Tokamax and run the tests on Google Cloud resources.
 jobs: 
+  ragged-dot-v2:
+    strategy:
+      matrix:
+        runner: ['linux-x86-ct6e-44-1tpu']
+        pytest_command: [
+                         'pallas_mosaic_tpu_v2_kernel_perf_test.py',
+                         'pallas_mosaic_tpu_v2_kernel_test.py',
+                        ]
+        include:
+          - runner: 'linux-x86-a3-8g-h100-1gpu'
+            device: 'cuda'
+          - runner: 'linux-x86-ct6e-44-1tpu'
+            device: 'tpu'
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
+    timeout-minutes: 300
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          python3.12 -m uv pip install --upgrade pip
+          python3.12 -m uv pip --version
+          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
+          python3.12 -m uv pip freeze
+      - name: Test Tokamax ops with unittest
+        run: |
+          pytest -s -m "not long" --ignore-glob="*/test_base.py" tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/${{ matrix.pytest_command }}
+
   attention-tests:
     strategy:
       matrix:
@@ -34,6 +69,7 @@ jobs:
                          'base_test.py',
                          'api_test.py',
                          'pallas_mosaic_gpu_test.py',
+                         'pallas_mosaic_tpu_test.py',
                          'pallas_triton_test.py',
                          'jax_nn_test.py',
                          'xla_chunked_test.py',
@@ -96,7 +132,7 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
-          pytest -s -m "not long" --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ --ignore-glob="*/splash_attention" tokamax/_src/ops
+          pytest -s -m "not long" --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ --ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/ --ignore-glob="*/splash_attention" tokamax/_src/ops
 
   tokamax-presubmit:
     strategy:

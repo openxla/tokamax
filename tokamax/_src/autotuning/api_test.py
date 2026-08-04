@@ -233,6 +233,13 @@ class AutotuningTest(parameterized.TestCase):
     with self.assertRaises(ExceptionGroup):
       _ = results.fastest_config
 
+  def test_autotune_with_max_workers(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    ba = _FakeOp().bind(x, y)
+    result = api.autotune([ba], max_workers=1)
+    self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+
   def test_bound_args_to_from_json(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
