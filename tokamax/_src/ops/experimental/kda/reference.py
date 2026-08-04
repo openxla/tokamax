@@ -17,7 +17,7 @@
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.kda.cp_utils import CPContextArg
+from tokamax._src.ops.experimental.kda.cp_utils import ContextParallelMetadataArg
 
 
 def _accumulator_dtype(dtype: jax.typing.DTypeLike) -> jnp.dtype:
@@ -35,15 +35,15 @@ def _activate_gate(
     g: jax.Array,
     *,
     a_log: jax.Array | None,
-    dt_bias: jax.Array | None,
+    delta_time_bias: jax.Array | None,
     lower_bound: float | None,
 ) -> jax.Array:
   heads, _, _, key_dim = g.shape
   if a_log is None:
     raise ValueError("`a_log` must be provided when `use_gate_in_kernel=True`.")
   g_f = g.astype(jnp.float32)
-  if dt_bias is not None:
-    g_f = g_f + dt_bias.astype(jnp.float32).reshape(heads, 1, 1, key_dim)
+  if delta_time_bias is not None:
+    g_f = g_f + delta_time_bias.astype(jnp.float32).reshape(heads, 1, 1, key_dim)
   A = jnp.exp(a_log.astype(jnp.float32)).reshape(heads, 1, 1, 1)
   if lower_bound is None:
     return -A * jax.nn.softplus(g_f)
@@ -76,15 +76,15 @@ def kimi_delta_attention(
     beta: jax.Array,
     *,
     a_log: jax.Array | None,
-    dt_bias: jax.Array | None,
+    delta_time_bias: jax.Array | None,
     scale: float,
     initial_state: jax.Array | None,
     output_final_state: bool,
-    use_qk_l2norm_in_kernel: bool,
+    use_qk_l2norm: bool,
     use_gate_in_kernel: bool,
     segment_ids: jax.Array | None,
     lower_bound: float | None,
-    cp_context: CPContextArg,
+    context_parallel_metadata: ContextParallelMetadataArg,
     max_num_segments: int | None,
 ) -> tuple[jax.Array, jax.Array | None]:
   """Computes KDA with an explicit token-by-token JAX recurrence."""
@@ -97,9 +97,9 @@ def kimi_delta_attention(
 
   if use_gate_in_kernel:
     g = _activate_gate(
-        g, a_log=a_log, dt_bias=dt_bias, lower_bound=lower_bound
+        g, a_log=a_log, delta_time_bias=delta_time_bias, lower_bound=lower_bound
     )
-  if use_qk_l2norm_in_kernel:
+  if use_qk_l2norm:
     q_h = _l2_normalize(q, acc_dtype)
     k_h = _l2_normalize(k, acc_dtype)
   else:
@@ -110,8 +110,8 @@ def kimi_delta_attention(
   v_h = v.astype(acc_dtype)
   g_h = g.astype(acc_dtype)
   beta_h = beta.astype(acc_dtype)
-  cp_enabled = cp_context is not None and getattr(
-      cp_context, "is_cp_enabled", False
+  cp_enabled = context_parallel_metadata is not None and getattr(
+      context_parallel_metadata, "is_cp_enabled", False
   )
   if cp_enabled:
     from tokamax._src.ops.experimental.kda.cp_utils import (  # pylint: disable=g-import-not-at-top
@@ -119,7 +119,7 @@ def kimi_delta_attention(
     )
 
     def gather_time_axis(x, axis: int):
-      x_all, _ = all_gather_into_tensor(x, cp_context.axis_name)
+      x_all, _ = all_gather_into_tensor(x, context_parallel_metadata.axis_name)
       return jnp.concatenate(
           [x_all[i] for i in range(x_all.shape[0])], axis=axis
       )
@@ -201,7 +201,7 @@ def kimi_delta_attention(
   )
 
   if cp_enabled:
-    rank = jax.lax.axis_index(cp_context.axis_name)
+    rank = jax.lax.axis_index(context_parallel_metadata.axis_name)
     output_h = jax.lax.dynamic_slice_in_dim(
         output_h, rank * local_seq_len, local_seq_len, axis=2
     )

@@ -73,16 +73,16 @@ KDA output is not a softmax-weighted sum. It is the sum of a read from the state
 | Group | Parameter | Public default | Backend contract and effect |
 |---|---|---:|---|
 | Gate | `a_log` | `None` | Auxiliary tensor shaped `[H]`; required when `use_gate_in_kernel=True` and used to scale raw-gate activation |
-| Gate | `dt_bias` | `None` | Optional auxiliary tensor shaped `[H*K]`; added to the raw gate before activation |
-| Gate | `use_gate_in_kernel` | `False` | `False` means `gate` already contains `ln(alpha)`; `True` means the backend activates raw `gate` using `a_log`, optional `dt_bias`, and `lower_bound` |
+| Gate | `delta_time_bias` | `None` | Optional auxiliary tensor shaped `[H*K]`; added to the raw gate before activation |
+| Gate | `use_gate_in_kernel` | `False` | `False` means `gate` already contains `ln(alpha)`; `True` means the backend activates raw `gate` using `a_log`, optional `delta_time_bias`, and `lower_bound` |
 | Gate | `safe_gate` | `True` | Limits the exponent range within Stage 2 sub-blocks to prevent `exp2` overflow for large gate magnitudes |
 | Gate | `lower_bound` | `None` | `None` selects softplus raw-gate activation; a non-`None` value selects the sigmoid variant and must satisfy `-5 <= lower_bound < 0` |
 | Numerics | `scale` | `None` | The public contract canonicalizes `None` to `K^{-1/2}`; `_fwd` receives the resulting `float` query scale |
-| Numerics | `use_qk_l2norm_in_kernel` | `False` | Requests q/k L2 normalization in `_preprocess_inputs` before Pallas execution |
+| Numerics | `use_qk_l2norm` | `False` | Requests q/k L2 normalization in `_preprocess_inputs` before Pallas execution |
 | State/output | `output_final_state` | `False` | Requests final recurrent states; CP execution does not support `True` |
 | Sequence | `segment_ids` | `None` | Optional 1-indexed varlen segment IDs shaped `[B,T]`; `0` denotes padding, and CP requires rank-local segment IDs |
 | Sequence | `max_num_segments` | `None` | Static upper bound on varlen segment count; required when varlen input has no `initial_state`, and always required for CP |
-| CP | `cp_context` | `None` | Optional CP mesh and axis metadata; active CP additionally forbids external/final state and requires `K` and `V` to be multiples of 128 |
+| CP | `context_parallel_metadata` | `None` | Optional CP mesh and axis metadata; active CP additionally forbids external/final state and requires `K` and `V` to be multiples of 128 |
 | Residual policy | `disable_recompute` | `True` | Selects saved-state versus recompute behavior for the custom backward without changing the mathematical forward result |
 | Residual policy | `return_residuals` | `False` | Internal bind/backend control that returns `KdaResiduals` for the custom backward; it is not exposed as an additional public KDA result |
 
@@ -98,12 +98,12 @@ heuristics and autotuning set provide only `Config(chunk_size=64)`.
 | Variable-length forward | Supports `segment_ids` shaped `[B,T]` | The backend constructs `cu_seqlens`, aligns data, then calls `chunk_kda_fwd_h_o_varlen` |
 | Segments not aligned to 64 | Supported | Each segment is padded independently to a multiple of 64, then output is restored to the original length |
 | Variable length with `B>1` | Supported | Each batch element independently constructs boundaries, alignment, and chunk mapping |
-| Context Parallel forward | Supports rank-local `segment_ids` and a minimal `CPContext` | Rank-chain metadata is derived automatically; delivered CP form uses no external initial state and does not request final state |
+| Context Parallel forward | Supports rank-local `segment_ids` and a minimal `ContextParallelMetadata` | Rank-chain metadata is derived automatically; delivered CP form uses no external initial state and does not request final state |
 | CP with `B>1` | Supported | Each batch element independently merges upstream state summaries |
 | Causal semantics | Supported | `Aqk` is lower triangular and `L` is strictly lower triangular |
 | Segment boundaries | Supported | Chunks do not cross segments; Stages 3+4 reset state at boundaries |
 | Padding semantics | Supported | Data is zero padded; pre-activated gate padding is zero, while raw-gate padding is replaced with `-1e4` before fused activation |
-| Raw-gate activation | Supports softplus decay with `safe_gate=False`, or sigmoid decay with `-5 <= lower_bound < 0` | `_preprocess_inputs` prepares padding; `kda_fwd_intra_fused` requires `a_log`, with optional `dt_bias` |
+| Raw-gate activation | Supports softplus decay with `safe_gate=False`, or sigmoid decay with `-5 <= lower_bound < 0` | `_preprocess_inputs` prepares padding; `kda_fwd_intra_fused` requires `a_log`, with optional `delta_time_bias` |
 | Pre-activated gate | Supported | `g` represents `ln(alpha)` and is non-positive under production semantics |
 | Query/key L2 normalization | Supported | `_preprocess_inputs` normalizes the aligned q/k tensors before Pallas computation and retains `q_rstd/k_rstd` when residuals are requested |
 | Initial state | Tokamax backend contract `[B,N,H,K,V]`; fixed length uses `N=1` | Loaded at the first chunk of each sequence |
@@ -316,7 +316,7 @@ Inputs:
 | `g` | `[H, B, T_a, K]` | Raw gate or `ln(alpha)` |
 | `beta` | `[H, B, T_a]` | Write coefficient |
 | `a_log` | `[H]` or `None` | Raw-gate activation parameter |
-| `dt_bias` | `[H*K]` or `None` | Raw-gate bias |
+| `delta_time_bias` | `[H*K]` or `None` | Raw-gate bias |
 
 Outputs:
 
@@ -458,7 +458,7 @@ Under CP, one logical sequence can continue from an upstream rank onto the curre
 | `gk` (`g_cumsum` at the call site) | `[H, B, T_local_aligned, K]` |
 | `cu_seqlens` | `[B,N_local+1]` |
 | `chunk_indices` | `[B,N_T,2]` |
-| `cp_context` | CP axis name and rank-chain metadata |
+| `context_parallel_metadata` | CP axis name and rank-chain metadata |
 | `chunk_size` | Compile-time chunk size `C` |
 
 It returns one tensor:
@@ -788,7 +788,7 @@ Causality, segment boundaries, and padding are therefore fixed components of the
 ### 5.3 Required Runtime Invariants
 
 - Production gate semantics require `alpha in (0,1]`, so pre-activated `ln(alpha)` is non-positive.
-- With `use_gate_in_kernel=True`, `a_log` is required and must have shape `[H]`; an optional `dt_bias` must have shape `[H*K]`.
+- With `use_gate_in_kernel=True`, `a_log` is required and must have shape `[H]`; an optional `delta_time_bias` must have shape `[H*K]`.
 - Raw-gate softplus activation requires `lower_bound=None`. Under the public contract it is valid only with `safe_gate=False`, because `safe_gate=True` requires a finite lower bound.
 - A non-`None` `lower_bound` selects the sigmoid gate variant and must satisfy `-5 <= lower_bound < 0`.
 - The complete production path uses `chunk_size=64`.
@@ -1068,7 +1068,7 @@ $$
 \rho_c^{i\rightarrow r}=2^{G_c^r-G_c^i}.
 $$
 
-When `use_gate_in_kernel=True`, the input is a raw gate. Let `x_t = g_t^{raw} + dt_bias` and `lambda_h = exp(a_log_h)`. The implementation supports two parameterizations of `ell_t`:
+When `use_gate_in_kernel=True`, the input is a raw gate. Let `x_t = g_t^{raw} + delta_time_bias` and `lambda_h = exp(a_log_h)`. The implementation supports two parameterizations of `ell_t`:
 
 $$
 \ell_t = -\lambda_h\,\operatorname{softplus}(x_t),

@@ -26,7 +26,8 @@ import jaxtyping as jt
 import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src import numerics
-from tokamax._src.ops.experimental.kda import api, CPContext  # pylint: disable=g-multiple-import
+from tokamax._src.ops.experimental.kda import api
+from tokamax._src.ops.experimental.kda import ContextParallelMetadata
 
 
 def _l2_normalize(x: jax.Array) -> jax.Array:
@@ -69,6 +70,17 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         "chunk_size", inspect.signature(api.kimi_delta_attention).parameters
     )
 
+  def test_public_api_uses_descriptive_names(self):
+    parameters = inspect.signature(api.kimi_delta_attention).parameters
+    for name in (
+        "delta_time_bias",
+        "use_qk_l2norm",
+        "context_parallel_metadata",
+    ):
+      self.assertIn(name, parameters)
+    for name in ("dt_bias", "use_qk_l2norm_in_kernel", "cp_context"):
+      self.assertNotIn(name, parameters)
+
   @parameterized.named_parameters(
       ("bfloat16", jnp.bfloat16, False, False, False),
       ("float32", jnp.float32, False, False, False),
@@ -79,7 +91,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
   def test_default_implementation_matches_xla(
       self,
       dtype,
-      use_qk_l2norm_in_kernel,
+      use_qk_l2norm,
       use_gate_in_kernel,
       variable_length,
   ):
@@ -112,7 +124,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
       segment_ids = None
       max_num_segments = None
 
-    if not use_qk_l2norm_in_kernel:
+    if not use_qk_l2norm:
       q = _l2_normalize(q)
       k = _l2_normalize(k)
     initial_state = 0.1 * initial_state
@@ -120,15 +132,15 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
     heads, _, _, key_dim = q.shape
     if use_gate_in_kernel:
       a_log = jnp.log(jnp.linspace(1.0, 2.0, heads, dtype=jnp.float32))
-      dt_bias = jnp.linspace(
+      delta_time_bias = jnp.linspace(
           -0.2, 0.2, heads * key_dim, dtype=jnp.float32
       )
     else:
-      a_log = dt_bias = None
+      a_log = delta_time_bias = None
 
     def call(implementation):
       @jax.jit
-      def f(q, k, v, g, beta, initial_state, a_log, dt_bias, segment_ids):
+      def f(q, k, v, g, beta, initial_state, a_log, delta_time_bias, segment_ids):
         return api.kimi_delta_attention(
             q,
             k,
@@ -136,10 +148,10 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
             g,
             beta,
             a_log=a_log,
-            dt_bias=dt_bias,
+            delta_time_bias=delta_time_bias,
             initial_state=initial_state,
             output_final_state=True,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_qk_l2norm=use_qk_l2norm,
             use_gate_in_kernel=use_gate_in_kernel,
             segment_ids=segment_ids,
             safe_gate=not use_gate_in_kernel,
@@ -147,7 +159,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
             implementation=implementation,
         )
 
-      return f(q, k, v, g, beta, initial_state, a_log, dt_bias, segment_ids)
+      return f(q, k, v, g, beta, initial_state, a_log, delta_time_bias, segment_ids)
 
     actual = call(None)
     expected = call("xla")
@@ -247,7 +259,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         output[:, :, 1:], jnp.zeros_like(output[:, :, 1:])
     )
 
-  def test_cp_context_does_not_break_public_op_metadata(self):
+  def test_context_parallel_metadata_does_not_break_public_op_metadata(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("context",))
 
@@ -257,7 +269,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         v,
         g,
         beta,
-        cp_context=CPContext(mesh=mesh),
+        context_parallel_metadata=ContextParallelMetadata(mesh=mesh),
         implementation="xla",
     )
 

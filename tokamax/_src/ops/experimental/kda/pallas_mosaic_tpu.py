@@ -27,8 +27,8 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.kda import base
 from tokamax._src.ops.experimental.kda.cp_utils import (
-    CPContext,
-    CPContextArg,
+    ContextParallelMetadata,
+    ContextParallelMetadataArg,
 )
 from tokamax._src.ops.experimental.kda.pallas_mosaic_tpu_kernel import (
     chunk_kda_bwd_custom,
@@ -41,7 +41,7 @@ from tokamax._src.ops.experimental.kda.pallas_mosaic_tpu_types import (
 from tokamax._src.ops.experimental.kda.utils import (
     _align_seqs,
     align_segment_ids,
-    derive_cp_context,
+    derive_context_parallel_metadata,
     l2norm_fwd,
     prepare_chunk_indices,
     segment_ids_to_cu_seqlens,
@@ -64,7 +64,7 @@ class _PreparedKdaInputs:
   g: jax.Array
   beta: jax.Array
   initial_state: jax.Array | None
-  cp_context: CPContext | None
+  context_parallel_metadata: ContextParallelMetadata | None
   cu_seqlens: jax.Array | None
   aligned_cu_seqlens: jax.Array | None
   chunk_indices: jax.Array | None
@@ -81,7 +81,7 @@ def check_inputs_support(
     initial_state: jax.Array | None,
     output_final_state: bool,
     segment_ids: jax.Array | None,
-    cp_context: CPContext | None,
+    context_parallel_metadata: ContextParallelMetadata | None,
     chunk_size: int,
     max_num_segments: int | None,
 ) -> None:
@@ -107,7 +107,10 @@ def check_inputs_support(
         "`mosaic` currently supports key dimensions up to 256; got "
         f"K={key_dim}."
     )
-  cp_enabled = cp_context is not None and cp_context.is_cp_enabled
+  cp_enabled = (
+      context_parallel_metadata is not None
+      and context_parallel_metadata.is_cp_enabled
+  )
   if cp_enabled:
     if initial_state is not None:
       raise NotImplementedError(
@@ -192,19 +195,19 @@ class PallasMosaicTpuKimiDeltaAttention(
       *,
       initial_state: jax.Array | None,
       output_final_state: bool,
-      use_qk_l2norm_in_kernel: bool,
+      use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
       segment_ids: jax.Array | None,
-      cp_context: CPContext | None,
+      context_parallel_metadata: ContextParallelMetadata | None,
       chunk_size: int,
       max_num_segments: int | None,
   ) -> _PreparedKdaInputs:
     """Canonicalizes inputs shared by the forward and backward kernels."""
-    cp_context, cu_seqlens = derive_cp_context(
+    context_parallel_metadata, cu_seqlens = derive_context_parallel_metadata(
         segment_ids=segment_ids,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        cp_context=cp_context,
+        context_parallel_metadata=context_parallel_metadata,
         max_num_segments=max_num_segments,
     )
     if cu_seqlens is None:
@@ -305,7 +308,7 @@ class PallasMosaicTpuKimiDeltaAttention(
           ]
       )
 
-    if use_qk_l2norm_in_kernel:
+    if use_qk_l2norm:
       q_prepared, q_rstd = l2norm_fwd(q_aligned)
       k_prepared, k_rstd = l2norm_fwd(k_aligned)
     else:
@@ -313,22 +316,25 @@ class PallasMosaicTpuKimiDeltaAttention(
       q_rstd = k_rstd = None
 
     cp_metadata = None
-    if cp_context is not None and cp_context.is_cp_enabled:
+    if (
+        context_parallel_metadata is not None
+        and context_parallel_metadata.is_cp_enabled
+    ):
       if any(
           value is None
           for value in (
-              cp_context.is_first_rank,
-              cp_context.is_last_rank,
-              cp_context.pre_num_ranks,
-              cp_context.post_num_ranks,
+              context_parallel_metadata.is_first_rank,
+              context_parallel_metadata.is_last_rank,
+              context_parallel_metadata.pre_num_ranks,
+              context_parallel_metadata.post_num_ranks,
           )
       ):
         raise ValueError("Enabled CP context is missing derived rank metadata.")
       cp_metadata = (
-          cp_context.is_first_rank,
-          cp_context.is_last_rank,
-          cp_context.pre_num_ranks,
-          cp_context.post_num_ranks,
+          context_parallel_metadata.is_first_rank,
+          context_parallel_metadata.is_last_rank,
+          context_parallel_metadata.pre_num_ranks,
+          context_parallel_metadata.post_num_ranks,
       )
 
     return _PreparedKdaInputs(
@@ -338,7 +344,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         g=g_aligned,
         beta=beta_aligned,
         initial_state=initial_state_prepared,
-        cp_context=cp_context,
+        context_parallel_metadata=context_parallel_metadata,
         cu_seqlens=cu_seqlens,
         aligned_cu_seqlens=aligned_cu_seqlens,
         chunk_indices=chunk_indices,
@@ -359,17 +365,17 @@ class PallasMosaicTpuKimiDeltaAttention(
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None,
-      dt_bias: Float[Array, "H*K"] | None,
+      delta_time_bias: Float[Array, "H*K"] | None,
       scale: float,
       initial_state: Float[Array, "B N H K V"] | None,
       output_final_state: bool,
-      use_qk_l2norm_in_kernel: bool,
+      use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
       segment_ids: Int[Array, "B T"] | None,
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      cp_context: CPContextArg,
+      context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
       config: Config,
@@ -384,7 +390,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         initial_state=initial_state,
         output_final_state=output_final_state,
         segment_ids=segment_ids,
-        cp_context=cp_context,
+        context_parallel_metadata=context_parallel_metadata,
         chunk_size=chunk_size,
         max_num_segments=max_num_segments,
     )
@@ -397,10 +403,10 @@ class PallasMosaicTpuKimiDeltaAttention(
         beta,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_qk_l2norm=use_qk_l2norm,
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,
-        cp_context=cp_context,
+        context_parallel_metadata=context_parallel_metadata,
         chunk_size=chunk_size,
         max_num_segments=max_num_segments,
     )
@@ -412,7 +418,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         prepared.g,
         prepared.beta,
         a_log=a_log,
-        dt_bias=dt_bias,
+        delta_time_bias=delta_time_bias,
         scale=scale,
         initial_state=prepared.initial_state,
         output_final_state=output_final_state,
@@ -421,7 +427,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         safe_gate=safe_gate,
         lower_bound=lower_bound,
         disable_recompute=disable_recompute,
-        cp_context=prepared.cp_context,
+        context_parallel_metadata=prepared.context_parallel_metadata,
         chunk_size=chunk_size,
         return_residuals=return_residuals,
         cu_seqlens=prepared.cu_seqlens,
@@ -469,17 +475,17 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       beta: jax.Array,
       *,
       a_log: jax.Array | None,
-      dt_bias: jax.Array | None,
+      delta_time_bias: jax.Array | None,
       scale: float,
       initial_state: jax.Array | None,
       output_final_state: bool,
-      use_qk_l2norm_in_kernel: bool,
+      use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
       segment_ids: jax.Array | None,
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      cp_context: CPContextArg,
+      context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
       config: Config,
@@ -512,11 +518,11 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         dsegment_ids,
     ) = chunk_kda_bwd_custom(
         scale,
-        use_qk_l2norm_in_kernel,
+        use_qk_l2norm,
         use_gate_in_kernel,
         lower_bound,
         disable_recompute,
-        cp_context,
+        context_parallel_metadata,
         chunk_size,
         max_num_segments,
         initial_state is not None,
@@ -533,9 +539,9 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     }
     if a_log is not None:
       grads["a_log"] = dA if dA is not None else jnp.zeros_like(a_log)
-    if dt_bias is not None:
-      grads["dt_bias"] = (
-          dbias if dbias is not None else jnp.zeros_like(dt_bias)
+    if delta_time_bias is not None:
+      grads["delta_time_bias"] = (
+          dbias if dbias is not None else jnp.zeros_like(delta_time_bias)
       )
     if initial_state is not None:
       grads["initial_state"] = (

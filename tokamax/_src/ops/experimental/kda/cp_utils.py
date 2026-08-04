@@ -36,7 +36,7 @@ defined here.
 
 **Entry form.** The framework (e.g. MaxText) shards ``segment_ids`` along
 T and feeds the rank-local slice into ``chunk_kda``; the caller passes a
-MINIMAL ``CPContext(mesh, axis_name)``. chunk_kda derives
+MINIMAL ``ContextParallelMetadata(mesh, axis_name)``. chunk_kda derives
 ``cu_local`` + chain metadata (``pre_num_ranks`` / ``is_first_rank`` / ...)
 device-side via ``_derive_cp_metadata_from_segment_ids`` (one small
 ``all_gather`` over first/last segment ids) and fills them back into the
@@ -58,8 +58,8 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, eq=False)
-class CPContext:
-  """Per-rank context parallel state.
+class ContextParallelMetadata:
+  """Per-rank context-parallel metadata.
 
   Mirrors ``fla.ops.cp.context.FLACPContext`` field-for-field, with
   ``group: ProcessGroup`` replaced by ``mesh + axis_name``.
@@ -84,7 +84,7 @@ class CPContext:
   ``__hash__`` and ``__eq__`` are based on identity + static fields only
   (``mesh`` id, ``axis_name``, ``cp_size``), so dataclass instances stay
   hashable even when chain fields are traced jnp.array values. This
-  matters because ``cp_context`` is a ``nondiff_argnum`` of
+  matters because ``context_parallel_metadata`` is a ``nondiff_argnum`` of
   ``chunk_kda``'s ``jax.custom_vjp`` decoration.
 
   Attributes:
@@ -115,13 +115,13 @@ class CPContext:
   # Identity-based hash + eq so traced jnp.array fields (which are not
   # hashable) don't break dataclass auto-generated __hash__. This is safe
   # for our use as a custom_vjp nondiff arg because each chunk_kda call
-  # site constructs its own CPContext — identity hashing keys the
+  # site constructs its own ContextParallelMetadata — identity hashing keys the
   # cache per call site, which is what we want.
   def __hash__(self) -> int:
     return hash((id(self.mesh), self.axis_name, self.cp_size))
 
   def __eq__(self, other: Any) -> bool:
-    if not isinstance(other, CPContext):
+    if not isinstance(other, ContextParallelMetadata):
       return NotImplemented
     return self is other
 
@@ -136,15 +136,17 @@ class CPContext:
     return self.cp_size > 1
 
 
-def _exclude_cp_context_from_json(_: CPContext | None) -> None:
+def _exclude_context_parallel_metadata_from_json(
+    _: ContextParallelMetadata | None,
+) -> None:
   """Keeps the runtime mesh out of serialized Op metadata."""
   return None
 
 
-CPContextArg: TypeAlias = Annotated[
-    CPContext | None,
+ContextParallelMetadataArg: TypeAlias = Annotated[
+    ContextParallelMetadata | None,
     pydantic.PlainSerializer(
-        _exclude_cp_context_from_json,
+        _exclude_context_parallel_metadata_from_json,
         return_type=type(None),
         when_used="json",
     ),

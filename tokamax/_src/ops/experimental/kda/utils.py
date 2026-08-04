@@ -25,7 +25,7 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.kda.cp_utils import (
-    CPContext,
+    ContextParallelMetadata,
     _derive_cp_metadata_from_segment_ids,
 )
 
@@ -62,17 +62,17 @@ def l2norm_bwd(y: jax.Array, rstd: jax.Array, dy: jax.Array):
   dx = dy_f * rstd_f[..., None] - dot_dy_y[..., None] * y_f * rstd_f[..., None]
   return dx.astype(y.dtype)
 
-def derive_cp_context(
+def derive_context_parallel_metadata(
     *,
     segment_ids: jax.Array | None,
     initial_state: jax.Array | None,
     output_final_state: bool,
-    cp_context: CPContext | None,
+    context_parallel_metadata: ContextParallelMetadata | None,
     max_num_segments: int | None,
-) -> tuple[CPContext | None, jax.Array | None]:
+) -> tuple[ContextParallelMetadata | None, jax.Array | None]:
   cu_seqlens = None
-  if cp_context is None or not cp_context.is_cp_enabled:
-    return cp_context, cu_seqlens
+  if context_parallel_metadata is None or not context_parallel_metadata.is_cp_enabled:
+    return context_parallel_metadata, cu_seqlens
 
   if initial_state is not None:
     raise ValueError("`initial_state` is not supported when CP is enabled.")
@@ -89,21 +89,21 @@ def derive_cp_context(
   for b in range(segment_ids.shape[0]):
     cu_b, meta_b = _derive_cp_metadata_from_segment_ids(
         segment_ids[b],
-        cp_context.axis_name,
+        context_parallel_metadata.axis_name,
         max_num_segments=max_num_segments,
     )
     cu_locals.append(cu_b)
     chain_metas.append(meta_b)
   cu_seqlens = jnp.stack(cu_locals, axis=0)
   chain_meta = {k: jnp.stack([m[k] for m in chain_metas]) for k in chain_metas[0]}
-  cp_context = dataclasses.replace(
-      cp_context,
+  context_parallel_metadata = dataclasses.replace(
+      context_parallel_metadata,
       is_first_rank=chain_meta["is_first_rank"],
       is_last_rank=chain_meta["is_last_rank"],
       pre_num_ranks=chain_meta["pre_num_ranks"],
       post_num_ranks=chain_meta["post_num_ranks"],
   )
-  return cp_context, cu_seqlens
+  return context_parallel_metadata, cu_seqlens
 
 
 def segment_ids_to_cu_seqlens(

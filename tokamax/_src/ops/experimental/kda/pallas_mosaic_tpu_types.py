@@ -47,7 +47,7 @@ class KdaResiduals:
   )
   g_org: Float[Array, "H B T_ALIGNED K"] | None
   a_log: Float[Array, "H"] | None
-  dt_bias: Float[Array, "H*K"] | None
+  delta_time_bias: Float[Array, "H*K"] | None
   h: Float[Array, "H B NT K V"] | None
   g_dtype_marker: Float[Array, ""]
   q_rstd: Float[Array, "H B T_ALIGNED"] | None

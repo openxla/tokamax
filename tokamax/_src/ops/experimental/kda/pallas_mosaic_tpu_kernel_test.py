@@ -28,7 +28,7 @@ import numpy as np
 import pytest
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda import api
-from tokamax._src.ops.experimental.kda.cp_utils import CPContext
+from tokamax._src.ops.experimental.kda.cp_utils import ContextParallelMetadata
 
 
 def compute_ulp(
@@ -178,7 +178,7 @@ class TestConfig:
   gate_mask_probability: float = 0.0
   use_initial_state: bool = False
   output_final_state: bool = False
-  use_qk_l2norm_in_kernel: bool = False
+  use_qk_l2norm: bool = False
   use_gate_in_kernel: bool = False
   safe_gate: bool = True
   lower_bound: float | None = None
@@ -232,7 +232,7 @@ class _Inputs:
   g: jax.Array
   beta: jax.Array
   a_log: jax.Array
-  dt_bias: jax.Array
+  delta_time_bias: jax.Array
   initial_state: jax.Array | None
   segment_ids: jax.Array | None
   dout: jax.Array
@@ -451,7 +451,15 @@ _CASES = [
     _chunk_api_case("b1_t256_h2_d64_bf16", B=1, T=256, H=2, D=64, dtype=jnp.bfloat16),
     _chunk_api_case("b1_t128_h2_k128_v64_bf16", B=1, T=128, H=2, K=128, V=64, dtype=jnp.bfloat16),
     _chunk_api_case("normalizer8_mask03", B=1, T=256, H=2, D=64, gate_logit_normalizer=8.0, gate_mask_probability=0.3),
-    _chunk_api_case("l2norm_in_kernel", B=1, T=256, H=2, D=64, scale=0.125, use_qk_l2norm_in_kernel=True),
+    _chunk_api_case(
+        "l2norm_in_kernel",
+        B=1,
+        T=256,
+        H=2,
+        D=64,
+        scale=0.125,
+        use_qk_l2norm=True,
+    ),
     _chunk_api_case("b1_t8192_h16_d128_bf16", B=1, T=8192, H=16, D=128, scale=0.125, gate_mask_probability=0.3, dtype=jnp.bfloat16, long=True),
 ]
 
@@ -637,8 +645,34 @@ _CASES.extend([
     _cp_case("cp_bwd_b2_different_fp32", cp_size=4, T=512, H=2, batch_seq_lens=((512,), (384, 128)), backward_atol=2e-3),
     _cp_case("cp_bwd_b2_splits_fp32", cp_size=4, T=512, H=8, batch_seq_lens=((256, 256), (192, 320))),
     _cp_case("cp_bwd_b4_mixed_mask03_fp32", cp_size=4, T=512, H=2, batch_seq_lens=((512,), (256, 256), (384, 128), (512,)), gate_mask_probability=0.3, backward_atol=2e-3),
-    make_test_config("tokamax_fixed_t8192", B=1, T=8192, H=16, D=128, dtype=jnp.bfloat16, input_profile="model", output_final_state=True, use_qk_l2norm_in_kernel=True, long=True),
-    _varlen_case("tokamax_varlen_fused", seq_lens=(45, 80, 20), T=256, use_initial_state=True, use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, lower_bound=-0.01, disable_recompute=False, forward_atol=0.05, forward_rtol=0.05, state_atol=0.05, state_rtol=0.05, backward_atol=0.05, backward_rtol=0.05),
+    make_test_config(
+        "tokamax_fixed_t8192",
+        B=1,
+        T=8192,
+        H=16,
+        D=128,
+        dtype=jnp.bfloat16,
+        input_profile="model",
+        output_final_state=True,
+        use_qk_l2norm=True,
+        long=True,
+    ),
+    _varlen_case(
+        "tokamax_varlen_fused",
+        seq_lens=(45, 80, 20),
+        T=256,
+        use_initial_state=True,
+        use_qk_l2norm=True,
+        use_gate_in_kernel=True,
+        lower_bound=-0.01,
+        disable_recompute=False,
+        forward_atol=0.05,
+        forward_rtol=0.05,
+        state_atol=0.05,
+        state_rtol=0.05,
+        backward_atol=0.05,
+        backward_rtol=0.05,
+    ),
     make_test_config("tokamax_fixed_unaligned_kv", B=1, T=64, H=1, K=129, V=127, dtype=jnp.bfloat16, input_profile="model"),
     _cp_case("tokamax_cp2_small", cp_size=2, T=128, H=2, dtype=jnp.float32),
     # Public varlen regressions from test_varlen_e2e.py.
@@ -728,14 +762,14 @@ def _make_inputs(case: TestConfig) -> _Inputs:
     q = jax.random.uniform(keys[0], qk_shape, dtype=jnp.float32)
     k = jax.random.uniform(keys[1], qk_shape, dtype=jnp.float32)
     v = jax.random.uniform(keys[2], v_shape, dtype=jnp.float32)
-    if not case.use_qk_l2norm_in_kernel:
+    if not case.use_qk_l2norm:
       q = _l2_normalize(q)
       k = _l2_normalize(k)
     g_raw = jax.random.uniform(keys[3], qk_shape, dtype=jnp.float32)
     a_log = jax.random.normal(
         keys[5], (case.heads,), dtype=jnp.float32
     )
-    dt_bias = jax.random.normal(
+    delta_time_bias = jax.random.normal(
         keys[6], (case.heads * case.key_dim,), dtype=jnp.float32
     )
     if case.use_gate_in_kernel:
@@ -760,7 +794,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
         jax.random.normal(keys[4], beta_shape, dtype=jnp.float32)
     )
     a_log = jnp.zeros((case.heads,), dtype=jnp.float32)
-    dt_bias = jnp.zeros(
+    delta_time_bias = jnp.zeros(
         (case.heads * case.key_dim,), dtype=jnp.float32
     )
     initial_scale = 0.01
@@ -776,7 +810,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
         jax.random.normal(keys[4], beta_shape, dtype=jnp.float32)
     )
     a_log = jnp.zeros((case.heads,), dtype=jnp.float32)
-    dt_bias = jnp.zeros(
+    delta_time_bias = jnp.zeros(
         (case.heads * case.key_dim,), dtype=jnp.float32
     )
     initial_scale = 0.0
@@ -788,7 +822,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
     k = jax.nn.silu(
         jax.random.normal(keys[1], qk_shape, dtype=jnp.float32)
     )
-    if not case.use_qk_l2norm_in_kernel:
+    if not case.use_qk_l2norm:
       q = _l2_normalize(q.astype(case.dtype))
       k = _l2_normalize(k.astype(case.dtype))
 
@@ -813,7 +847,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
           * (jnp.log(jnp.array(0.1)) - jnp.log(jnp.array(0.001)))
           + jnp.log(jnp.array(0.001))
       ).clip(min=1e-4)
-      dt_bias = dt + jnp.log(-jnp.expm1(-dt))
+      delta_time_bias = dt + jnp.log(-jnp.expm1(-dt))
       g_raw = jax.random.normal(keys[3], qk_shape, dtype=jnp.float32)
       beta = jax.nn.sigmoid(
           jax.random.normal(keys[4], beta_shape, dtype=jnp.float32)
@@ -822,7 +856,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
       a_log = jax.random.uniform(
           keys[5], (case.heads,), minval=0.2, maxval=3.0
       )
-      dt_bias = jax.random.uniform(
+      delta_time_bias = jax.random.uniform(
           keys[6],
           (case.heads * case.key_dim,),
           minval=-8.0,
@@ -836,7 +870,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
       )
     elif profile == "low_gate":
       a_log = jnp.full((case.heads,), 2.5, dtype=jnp.float32)
-      dt_bias = jnp.full(
+      delta_time_bias = jnp.full(
           (case.heads * case.key_dim,), -10.0, dtype=jnp.float32
       )
       g_raw = jax.random.uniform(
@@ -847,7 +881,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
       )
     else:
       a_log = jnp.full((case.heads,), 2.7, dtype=jnp.float32)
-      dt_bias = jnp.full(
+      delta_time_bias = jnp.full(
           (case.heads * case.key_dim,), -2.0, dtype=jnp.float32
       )
       g_raw = jax.random.uniform(
@@ -860,7 +894,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
     if case.use_gate_in_kernel:
       g = g_raw
     else:
-      gate_input = g_raw + dt_bias.reshape(
+      gate_input = g_raw + delta_time_bias.reshape(
           case.heads, 1, 1, case.key_dim
       )
       A = jnp.exp(a_log).reshape(case.heads, 1, 1, 1)
@@ -927,7 +961,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
       g=g,
       beta=beta,
       a_log=a_log,
-      dt_bias=dt_bias,
+      delta_time_bias=delta_time_bias,
       initial_state=initial_state,
       segment_ids=segment_ids,
       dout=dout,
@@ -957,11 +991,11 @@ def _make_inputs(case: TestConfig) -> _Inputs:
 def _attention_kwargs(case: TestConfig, inputs: _Inputs) -> dict[str, object]:
   return dict(
       a_log=inputs.a_log if case.use_gate_in_kernel else None,
-      dt_bias=inputs.dt_bias if case.use_gate_in_kernel else None,
+      delta_time_bias=inputs.delta_time_bias if case.use_gate_in_kernel else None,
       scale=case.effective_scale,
       initial_state=inputs.initial_state,
       output_final_state=case.output_final_state,
-      use_qk_l2norm_in_kernel=case.use_qk_l2norm_in_kernel,
+      use_qk_l2norm=case.use_qk_l2norm,
       use_gate_in_kernel=case.use_gate_in_kernel,
       safe_gate=case.safe_gate,
       lower_bound=case.lower_bound,
@@ -975,7 +1009,7 @@ def _call_attention(
     case: TestConfig,
     inputs: _Inputs,
     *,
-    cp_context: CPContext | None = None,
+    context_parallel_metadata: ContextParallelMetadata | None = None,
 ):
   return api.kimi_delta_attention(
       inputs.q,
@@ -984,16 +1018,16 @@ def _call_attention(
       inputs.g,
       inputs.beta,
       segment_ids=inputs.segment_ids,
-      cp_context=cp_context,
+      context_parallel_metadata=context_parallel_metadata,
       implementation=implementation,
       **_attention_kwargs(case, inputs),
   )
 
 
-def _cp_mesh(case: TestConfig) -> tuple[Mesh, CPContext]:
+def _cp_mesh(case: TestConfig) -> tuple[Mesh, ContextParallelMetadata]:
   devices = jax.devices()[: case.cp_size]
   mesh = Mesh(np.asarray(devices), ("context",))
-  return mesh, CPContext(mesh=mesh, axis_name="context")
+  return mesh, ContextParallelMetadata(mesh=mesh, axis_name="context")
 
 
 def _cp_forward(
@@ -1001,7 +1035,7 @@ def _cp_forward(
     case: TestConfig,
     inputs: _Inputs,
 ) -> tuple[jax.Array, None]:
-  mesh, cp_context = _cp_mesh(case)
+  mesh, context_parallel_metadata = _cp_mesh(case)
 
   def local_forward(q, k, v, g, beta, segment_ids):
     local_inputs = dataclasses.replace(
@@ -1017,7 +1051,7 @@ def _cp_forward(
         implementation,
         case,
         local_inputs,
-        cp_context=cp_context,
+        context_parallel_metadata=context_parallel_metadata,
     )
     return output
 
@@ -1050,7 +1084,7 @@ def _cp_backward(
     case: TestConfig,
     inputs: _Inputs,
 ) -> tuple[jax.Array, ...]:
-  mesh, cp_context = _cp_mesh(case)
+  mesh, context_parallel_metadata = _cp_mesh(case)
 
   def local_backward(q, k, v, g, beta, segment_ids, dout):
     local_inputs = dataclasses.replace(
@@ -1069,7 +1103,10 @@ def _cp_backward(
           local_inputs, q=q, k=k, v=v, g=g, beta=beta
       )
       output, _ = _call_attention(
-          implementation, case, current_inputs, cp_context=cp_context
+          implementation,
+          case,
+          current_inputs,
+          context_parallel_metadata=context_parallel_metadata,
       )
       return output
 
@@ -1105,7 +1142,7 @@ def _direct_backward(
     case: TestConfig,
     inputs: _Inputs,
 ) -> tuple[jax.Array, ...]:
-  def loss_fn(q, k, v, g, beta, initial_state, a_log, dt_bias):
+  def loss_fn(q, k, v, g, beta, initial_state, a_log, delta_time_bias):
     current_inputs = dataclasses.replace(
         inputs,
         q=q,
@@ -1115,7 +1152,7 @@ def _direct_backward(
         beta=beta,
         initial_state=initial_state,
         a_log=a_log,
-        dt_bias=dt_bias,
+        delta_time_bias=delta_time_bias,
     )
     output, final_state = _call_attention(
         implementation, case, current_inputs
@@ -1138,7 +1175,7 @@ def _direct_backward(
       inputs.beta,
       inputs.initial_state,
       inputs.a_log,
-      inputs.dt_bias,
+      inputs.delta_time_bias,
   )
 
 

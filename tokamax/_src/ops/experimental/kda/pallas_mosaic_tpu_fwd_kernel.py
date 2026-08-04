@@ -31,7 +31,7 @@ from tokamax._src.ops.experimental.kda.common import (
   RCP_LN2
 )
 from tokamax._src.ops.experimental.kda.cp_utils import (
-  CPContext,
+  ContextParallelMetadata,
   _merge_initial_state,
   all_gather_into_tensor,
 )
@@ -357,7 +357,7 @@ def _prepare_cp_initial_state(
     gk: Float[Array, "H B T_LOCAL K"],
     cu_seqlens: Int[Array, "B N_CU"],
     chunk_indices: Int[Array, "B NT 2"],
-    cp_context: CPContext,
+    context_parallel_metadata: ContextParallelMetadata,
     chunk_size: int,
 ) -> jax.Array:
   """Builds the rank-local initial state for context parallel forward.
@@ -374,7 +374,7 @@ def _prepare_cp_initial_state(
     gk: Chunk-aligned cumulative gates in log2 space.
     cu_seqlens: Batched chunk-aligned rank-local sequence boundaries.
     chunk_indices: Batched chunk mapping derived from ``cu_seqlens``.
-    cp_context: CP axis and derived rank-chain metadata.
+    context_parallel_metadata: CP axis and derived rank-chain metadata.
     chunk_size: Kernel chunk size.
 
   Returns:
@@ -409,13 +409,13 @@ def _prepare_cp_initial_state(
       use_exp2=True,
   )
   S_ext_all, _ = all_gather_into_tensor(
-      S_ext_local, cp_context.axis_name
+      S_ext_local, context_parallel_metadata.axis_name
   )
-  M_all, _ = all_gather_into_tensor(M_local, cp_context.axis_name)
-  rank = jax.lax.axis_index(cp_context.axis_name)
+  M_all, _ = all_gather_into_tensor(M_local, context_parallel_metadata.axis_name)
+  rank = jax.lax.axis_index(context_parallel_metadata.axis_name)
 
-  pre_num = cp_context.pre_num_ranks
-  is_first = cp_context.is_first_rank
+  pre_num = context_parallel_metadata.pre_num_ranks
+  is_first = context_parallel_metadata.is_first_rank
   if B > 1 and hasattr(pre_num, "ndim") and pre_num.ndim > 0:
     s_in_list = []
     for batch_index in range(B):
@@ -519,7 +519,7 @@ def _fused_gate_intra_kernel(
   beta_ref,
   v_ref,
   a_log_ref,
-  dt_bias_ref,
+  delta_time_bias_ref,
   u_out_ref,
   w_out_ref,
   qg_out_ref,
@@ -551,7 +551,7 @@ def _fused_gate_intra_kernel(
 
   All refs have leading dims from BlockSpec: [1, MB, 1, BT, D].
   a_log_ref: [1, MB, 1, 1, 1] — per-head scalar.
-  dt_bias_ref: [1, MB, 1, 1, K] — per-head bias vector.
+  delta_time_bias_ref: [1, MB, 1, 1, K] — per-head bias vector.
 
   MB heads are processed simultaneously via batch-vectorized ops.
 
@@ -577,7 +577,7 @@ def _fused_gate_intra_kernel(
   g_f32 = g.astype(jnp.float32)
 
   if use_gate_in_kernel:
-    dt_b = dt_bias_ref[:, 0, 0, 0]        # [MB, K]
+    dt_b = delta_time_bias_ref[:, 0, 0, 0]        # [MB, K]
     g_f32 = g_f32 + dt_b[:, None, :]       # [MB, BT, K]
     A_val = a_log_ref[:, 0, 0, 0, 0]       # [MB]
     if lower_bound is None:
@@ -800,7 +800,7 @@ def pallas_kda_fwd_intra_fused(
   disable_recompute: bool = False,
   cumsum_scale: float = RCP_LN2,
   a_log: Float[Array, "H"] | None = None,
-  dt_bias: Float[Array, "H*K"] | None = None,
+  delta_time_bias: Float[Array, "H*K"] | None = None,
   use_gate_in_kernel: bool = False,
   lower_bound: float | None = None,
   mini_batch: int | None = None,
@@ -842,13 +842,13 @@ def pallas_kda_fwd_intra_fused(
 
   if use_gate_in_kernel:
     a_log_r = a_log.astype(jnp.float32).reshape(H, 1, 1, 1, 1)
-    if dt_bias is not None:
-      dt_bias_r = dt_bias.astype(jnp.float32).reshape(H, 1, 1, 1, K)
+    if delta_time_bias is not None:
+      delta_time_bias_r = delta_time_bias.astype(jnp.float32).reshape(H, 1, 1, 1, K)
     else:
-      dt_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
+      delta_time_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
   else:
     a_log_r = jnp.zeros((H, 1, 1, 1, 1), dtype=jnp.float32)
-    dt_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
+    delta_time_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
 
   grid = (H // MB, B, NC)
 
@@ -911,7 +911,7 @@ def pallas_kda_fwd_intra_fused(
     compiler_params=pltpu.CompilerParams(
       dimension_semantics=("parallel", "parallel", "parallel"),
     ),
-  )(q_r, k_r, g_r, beta_r, v_r, a_log_r, dt_bias_r)
+  )(q_r, k_r, g_r, beta_r, v_r, a_log_r, delta_time_bias_r)
 
   # --- Reshape back to [H, B, T, D] (head-first) ---
   w_out = w_r.reshape(H, B, T, K)
@@ -942,7 +942,7 @@ def kda_fwd_intra_fused(
   disable_recompute: bool = False,
   cumsum_scale: float = RCP_LN2,
   a_log: jax.Array | None = None,
-  dt_bias: jax.Array | None = None,
+  delta_time_bias: jax.Array | None = None,
   use_gate_in_kernel: bool = False,
   lower_bound: float | None = None,
 ):
@@ -964,7 +964,7 @@ def kda_fwd_intra_fused(
     scale=scale, chunk_size=chunk_size,
     safe_gate=safe_gate, disable_recompute=disable_recompute,
     cumsum_scale=cumsum_scale,
-    a_log=a_log, dt_bias=dt_bias,
+    a_log=a_log, delta_time_bias=delta_time_bias,
     use_gate_in_kernel=use_gate_in_kernel,
     lower_bound=lower_bound,
   )
@@ -1411,7 +1411,7 @@ def chunk_kda_fwd_custom(
     g: Float[Array, "H B T_ALIGNED K"],
     beta: Float[Array, "H B T_ALIGNED"],
     a_log: Float[Array, "H"] | None = None,
-    dt_bias: Float[Array, "H*K"] | None = None,
+    delta_time_bias: Float[Array, "H*K"] | None = None,
     scale: float | None = None,
     initial_state: (
         Float[Array, "B H K V"] | Float[Array, "B N H K V"] | None
@@ -1422,7 +1422,7 @@ def chunk_kda_fwd_custom(
     safe_gate: bool = True,
     lower_bound: float | None = None,
     disable_recompute: bool = True,
-    cp_context: CPContext | None = None,
+    context_parallel_metadata: ContextParallelMetadata | None = None,
     chunk_size: int = 64,
     return_residuals: bool = False,
     cu_seqlens: Int[Array, "B N_CU"] | None = None,
@@ -1450,7 +1450,10 @@ def chunk_kda_fwd_custom(
   V = v.shape[-1]
   BT = chunk_size
 
-  _cp_active = cp_context is not None and cp_context.is_cp_enabled
+  _cp_active = (
+      context_parallel_metadata is not None
+      and context_parallel_metadata.is_cp_enabled
+  )
 
   _is_varlen = cu_seqlens is not None
   # ------------------------------------------------------------------
@@ -1470,7 +1473,7 @@ def chunk_kda_fwd_custom(
     disable_recompute=save_for_backward,
     cumsum_scale=RCP_LN2,
     a_log=a_log,
-    dt_bias=dt_bias,
+    delta_time_bias=delta_time_bias,
     use_gate_in_kernel=use_gate_in_kernel,
     lower_bound=lower_bound,
   )
@@ -1483,7 +1486,7 @@ def chunk_kda_fwd_custom(
         gk=g_cumsum,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        cp_context=cp_context,
+        context_parallel_metadata=context_parallel_metadata,
         chunk_size=BT,
     )
 
@@ -1586,7 +1589,7 @@ def chunk_kda_fwd_custom(
       initial_state=initial_state,
       g_org=g_org,
       a_log=a_log,
-      dt_bias=dt_bias,
+      delta_time_bias=delta_time_bias,
       h=h,
       g_dtype_marker=jnp.zeros((), dtype=g.dtype),
       q_rstd=q_rstd,

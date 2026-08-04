@@ -15,7 +15,9 @@
 # ==============================================================================
 """Experimental Kimi Delta Attention ops."""
 
-from tokamax._src.ops.experimental.kda.cp_utils import CPContext as CPContext
+from tokamax._src.ops.experimental.kda.cp_utils import (
+    ContextParallelMetadata as ContextParallelMetadata,
+)
 
 
-__all__ = ("CPContext",)
+__all__ = ("ContextParallelMetadata",)

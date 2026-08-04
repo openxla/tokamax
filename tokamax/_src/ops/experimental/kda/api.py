@@ -21,7 +21,7 @@ from typing import Final, Literal, TypeAlias
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda import base
-from tokamax._src.ops.experimental.kda.cp_utils import CPContext
+from tokamax._src.ops.experimental.kda.cp_utils import ContextParallelMetadata
 
 
 Implementation: TypeAlias = Literal["xla", "mosaic"]
@@ -51,17 +51,17 @@ def kimi_delta_attention(
     beta: Float[Array, "H B T"],
     *,
     a_log: Float[Array, "H"] | None = None,
-    dt_bias: Float[Array, "H*K"] | None = None,
+    delta_time_bias: Float[Array, "H*K"] | None = None,
     scale: float | None = None,
     initial_state: Float[Array, "B N H K V"] | None = None,
     output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
+    use_qk_l2norm: bool = False,
     use_gate_in_kernel: bool = False,
     segment_ids: Int[Array, "B T"] | None = None,
     safe_gate: bool = True,
     lower_bound: float | None = None,
     disable_recompute: bool = True,
-    cp_context: CPContext | None = None,
+    context_parallel_metadata: ContextParallelMetadata | None = None,
     max_num_segments: int | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> tuple[Float[Array, "H B T V"], Float[Array, "B N H K V"] | None]:
@@ -75,28 +75,36 @@ def kimi_delta_attention(
     query: Query tensor with shape `[H, B, T, K]`.
     key: Key tensor with shape `[H, B, T, K]`.
     value: Value tensor with shape `[H, B, T, V]`.
-    gate: Per-channel gate tensor in log space, shape `[H, B, T, K]`.
+    gate: Per-channel gate tensor with shape `[H, B, T, K]`. When
+      `use_gate_in_kernel=True`, this is the raw delta-time input; otherwise,
+      it is already the log-space decay.
     beta: Per-token delta-rule learning-rate tensor, shape `[H, B, T]`.
-    a_log: Gate parameter, shape `[H]`. Required when
+    a_log: Per-head log decay-rate parameter, shape `[H]`. Required when
       `use_gate_in_kernel=True`.
-    dt_bias: Optional gate bias, shape `[H * K]`.
+    delta_time_bias: Optional per-head, per-key-channel bias added to the raw
+      gate before the delta-time activation, shape `[H * K]`. In the standard
+      activation path, KDA computes
+      `delta_time = softplus(gate + delta_time_bias)` and
+      `log_decay = -exp(a_log) * delta_time`. This argument is used only when
+      `use_gate_in_kernel=True`.
     scale: Query scale. Defaults to `K ** -0.5`.
     initial_state: Optional initial recurrent state, shape `[B, N, H, K, V]`.
       Its segment dimension `N` determines `max_num_segments` when the latter
       is omitted.
     output_final_state: Whether to return the final recurrent state.
-    use_qk_l2norm_in_kernel: Whether to normalize query/key on the last
-      dimension before running KDA.
+    use_qk_l2norm: Whether to normalize query/key on the last dimension before
+      running KDA.
     use_gate_in_kernel: Whether `gate` is raw input that should be activated
-      with `a_log` and `dt_bias`. When false, `gate` is already in log space.
+      with `a_log` and `delta_time_bias`. When false, `gate` is already in log
+      space.
     segment_ids: Optional 1-indexed varlen segment IDs, shape `[B, T]`.
       Padding is represented by 0.
     safe_gate: Match pallas-kernel gate validation.
     lower_bound: Optional sigmoid-gate lower bound.
     disable_recompute: Pallas custom-VJP recompute policy. XLA reference
       implementations accept it but the mathematical result is unchanged.
-    cp_context: Optional context-parallel metadata. Construct it with
-      `kda.CPContext(mesh, axis_name)`.
+    context_parallel_metadata: Optional context-parallel metadata. Construct
+      it with `kda.ContextParallelMetadata(mesh, axis_name)`.
     max_num_segments: Static upper bound for the number of varlen segments.
       Required when `segment_ids` is provided without `initial_state`;
       otherwise inferred from the initial state's segment dimension.
@@ -134,17 +142,17 @@ def kimi_delta_attention(
           gate=gate,
           beta=beta,
           a_log=a_log,
-          dt_bias=dt_bias,
+          delta_time_bias=delta_time_bias,
           scale=scale,
           initial_state=initial_state,
           output_final_state=output_final_state,
-          use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+          use_qk_l2norm=use_qk_l2norm,
           use_gate_in_kernel=use_gate_in_kernel,
           segment_ids=segment_ids,
           safe_gate=safe_gate,
           lower_bound=lower_bound,
           disable_recompute=disable_recompute,
-          cp_context=cp_context,
+          context_parallel_metadata=context_parallel_metadata,
           max_num_segments=max_num_segments,
       )
     except NotImplementedError as e:

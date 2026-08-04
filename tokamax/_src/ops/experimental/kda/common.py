@@ -932,7 +932,7 @@ def kda_gate_chunk_cumsum(
   a_log: Float[Array, "H"],
   chunk_size: int,
   scale: float | None = None,
-  dt_bias: Float[Array, "H*K"] | None = None,
+  delta_time_bias: Float[Array, "H*K"] | None = None,
   output_dtype: jax.typing.DTypeLike = jnp.float32,
   lower_bound: float | None = None,
 ) -> Float[Array, "H B T K"]:
@@ -940,8 +940,8 @@ def kda_gate_chunk_cumsum(
   H, B, T, K = g.shape
   g_f32 = g.astype(jnp.float32)
 
-  if dt_bias is not None:
-    g_f32 = g_f32 + dt_bias.astype(jnp.float32).reshape(H, 1, 1, K)
+  if delta_time_bias is not None:
+    g_f32 = g_f32 + delta_time_bias.astype(jnp.float32).reshape(H, 1, 1, K)
 
   A = a_log.astype(jnp.float32)
 

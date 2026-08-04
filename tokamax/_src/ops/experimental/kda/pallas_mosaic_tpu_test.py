@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from tokamax._src.ops.experimental.kda import api
 from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu
 from tokamax._src.ops.experimental.kda import utils
-from tokamax._src.ops.experimental.kda.cp_utils import CPContext
+from tokamax._src.ops.experimental.kda.cp_utils import ContextParallelMetadata
 
 
 def _call_attention(implementation, q, v, **kwargs):
@@ -127,7 +127,9 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     q = jnp.ones((1, 1, 64, key_dim), dtype=jnp.float32)
     v = jnp.ones((1, 1, 64, value_dim), dtype=jnp.float32)
     segment_ids = jnp.ones((1, 64), dtype=jnp.int32)
-    cp_context = CPContext(mesh=types.SimpleNamespace(shape={"context": 2}))
+    context_parallel_metadata = ContextParallelMetadata(
+        mesh=types.SimpleNamespace(shape={"context": 2})
+    )
 
     with self.assertRaisesRegex(NotImplementedError, "multiples of 128"):
       _call_attention(
@@ -135,7 +137,7 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
           q,
           v,
           segment_ids=segment_ids,
-          cp_context=cp_context,
+          context_parallel_metadata=context_parallel_metadata,
           max_num_segments=1,
       )
 
@@ -144,7 +146,9 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     v = jnp.ones((1, 1, 64, 128), dtype=jnp.float32)
     segment_ids = jnp.ones((1, 64), dtype=jnp.int32)
     initial_state = jnp.zeros((1, 1, 1, 128, 128), dtype=jnp.float32)
-    cp_context = CPContext(mesh=types.SimpleNamespace(shape={"context": 2}))
+    context_parallel_metadata = ContextParallelMetadata(
+        mesh=types.SimpleNamespace(shape={"context": 2})
+    )
     cases = (
         (
             "initial_state",
@@ -172,7 +176,7 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
               "mosaic",
               q,
               v,
-              cp_context=cp_context,
+              context_parallel_metadata=context_parallel_metadata,
               **overrides,
           )
 

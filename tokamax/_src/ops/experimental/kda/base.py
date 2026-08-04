@@ -23,8 +23,8 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.kda import reference
 from tokamax._src.ops.experimental.kda.cp_utils import (
-    CPContext,
-    CPContextArg,
+    ContextParallelMetadata,
+    ContextParallelMetadataArg,
 )
 from typing_extensions import override
 
@@ -39,7 +39,7 @@ def _validate_gate_args(
     *,
     use_gate_in_kernel: bool,
     a_log: jax.Array | None,
-    dt_bias: jax.Array | None,
+    delta_time_bias: jax.Array | None,
     heads: int,
     key_dim: int,
     safe_gate: bool,
@@ -51,9 +51,9 @@ def _validate_gate_args(
     raise ValueError("`a_log` must be provided when `use_gate_in_kernel=True`.")
   if a_log.shape != (heads,):
     raise ValueError(f"`a_log` shape {a_log.shape} must be {(heads,)}.")
-  if dt_bias is not None and dt_bias.shape != (heads * key_dim,):
+  if delta_time_bias is not None and delta_time_bias.shape != (heads * key_dim,):
     raise ValueError(
-        f"`dt_bias` shape {dt_bias.shape} must be {(heads * key_dim,)}."
+        f"`delta_time_bias` shape {delta_time_bias.shape} must be {(heads * key_dim,)}."
     )
   if safe_gate and lower_bound is None:
     raise ValueError(
@@ -84,17 +84,17 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None = None,
-      dt_bias: Float[Array, "H*K"] | None = None,
+      delta_time_bias: Float[Array, "H*K"] | None = None,
       scale: float | None = None,
       initial_state: Float[Array, "B N H K V"] | None = None,
       output_final_state: bool = False,
-      use_qk_l2norm_in_kernel: bool = False,
+      use_qk_l2norm: bool = False,
       use_gate_in_kernel: bool = False,
       segment_ids: Int[Array, "B T"] | None = None,
       safe_gate: bool = True,
       lower_bound: float | None = None,
       disable_recompute: bool = True,
-      cp_context: CPContext | None = None,
+      context_parallel_metadata: ContextParallelMetadata | None = None,
       max_num_segments: int | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
@@ -148,7 +148,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,
         a_log=a_log,
-        dt_bias=dt_bias,
+        delta_time_bias=delta_time_bias,
         heads=heads,
         key_dim=key_dim,
         safe_gate=safe_gate,
@@ -165,17 +165,17 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         gate=gate,
         beta=beta,
         a_log=a_log,
-        dt_bias=dt_bias,
+        delta_time_bias=delta_time_bias,
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_qk_l2norm=use_qk_l2norm,
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
         disable_recompute=disable_recompute,
-        cp_context=cp_context,
+        context_parallel_metadata=context_parallel_metadata,
         max_num_segments=max_num_segments,
         return_residuals=return_residuals,
     )
@@ -191,17 +191,17 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None,
-      dt_bias: Float[Array, "H*K"] | None,
+      delta_time_bias: Float[Array, "H*K"] | None,
       scale: float,
       initial_state: Float[Array, "B N H K V"] | None,
       output_final_state: bool,
-      use_qk_l2norm_in_kernel: bool,
+      use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
       segment_ids: Int[Array, "B T"] | None,
       safe_gate: bool,
       lower_bound: float | None,
       disable_recompute: bool,
-      cp_context: CPContextArg,
+      context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
       config: _Config,
@@ -215,15 +215,15 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         gate,
         beta,
         a_log=a_log,
-        dt_bias=dt_bias,
+        delta_time_bias=delta_time_bias,
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_qk_l2norm=use_qk_l2norm,
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,
         lower_bound=lower_bound,
-        cp_context=cp_context,
+        context_parallel_metadata=context_parallel_metadata,
         max_num_segments=max_num_segments,
     )
     return output, None

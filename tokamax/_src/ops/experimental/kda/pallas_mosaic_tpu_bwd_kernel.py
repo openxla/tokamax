@@ -35,7 +35,7 @@ from tokamax._src.ops.experimental.kda.common import (
     kda_gate_chunk_cumsum,
 )
 from tokamax._src.ops.experimental.kda.cp_utils import (
-    CPContext,
+    ContextParallelMetadata,
     _merge_dht,
     all_gather_into_tensor,
 )
@@ -390,14 +390,14 @@ def kda_gate_bwd(
   a_log: Float[Array, "H"],
   *,
   dyg: Float[Array, "H B T K"],
-  dt_bias: Float[Array, "H*K"] | None = None,
+  delta_time_bias: Float[Array, "H*K"] | None = None,
   lower_bound: float | None = None,
 ) -> tuple[
     Float[Array, "H B T K"],
     Float[Array, "H"],
     Float[Array, "H*K"] | None,
 ]:
-  """Differentiates the KDA gate with respect to g, a_log, and dt_bias.
+  """Differentiates the KDA gate with respect to g, a_log, and delta_time_bias.
 
   The standard path differentiates `-exp(a_log) * softplus(g + bias)`; the
   lower-bound path differentiates the sigmoid form.
@@ -408,8 +408,8 @@ def kda_gate_bwd(
   dyg_f = dyg.astype(jnp.float32)
 
   # Apply bias if present
-  if dt_bias is not None:
-    g_f = g_f + dt_bias.reshape(H, 1, 1, K).astype(jnp.float32)
+  if delta_time_bias is not None:
+    g_f = g_f + delta_time_bias.reshape(H, 1, 1, K).astype(jnp.float32)
 
   if lower_bound is None:
     # Forward: yg = -exp(a_log) * softplus(g + bias)
@@ -436,9 +436,9 @@ def kda_gate_bwd(
   dg = dg_f.astype(g.dtype)
 
   # dbias: sum dg over B, T (axes 1, 2) → [H, K] → [H*K]
-  if dt_bias is not None:
+  if delta_time_bias is not None:
     dbias = jnp.sum(dg_f, axis=(1, 2)).reshape(-1)  # [H*K]
-    dbias = dbias.astype(dt_bias.dtype)
+    dbias = dbias.astype(delta_time_bias.dtype)
   else:
     dbias = None
 
@@ -1468,11 +1468,11 @@ def chunk_kda_bwd_dAv_kernel(
   jax.jit,
   static_argnames=[
     "scale",
-    "use_qk_l2norm_in_kernel",
+    "use_qk_l2norm",
     "use_gate_in_kernel",
     "lower_bound",
     "disable_recompute",
-    "cp_context",
+    "context_parallel_metadata",
     "chunk_size",
     "max_num_segments",
     "has_initial_state",
@@ -1481,11 +1481,11 @@ def chunk_kda_bwd_dAv_kernel(
 @jaxtyping.jaxtyped
 def chunk_kda_bwd_custom(
     scale: float | None,
-    use_qk_l2norm_in_kernel: bool,
+    use_qk_l2norm: bool,
     use_gate_in_kernel: bool,
     lower_bound: float | None,
     disable_recompute: bool,
-    cp_context: CPContext | None,
+    context_parallel_metadata: ContextParallelMetadata | None,
     chunk_size: int,
     max_num_segments: int | None,
     has_initial_state: bool,
@@ -1519,7 +1519,7 @@ def chunk_kda_bwd_custom(
   initial_state = residuals.initial_state
   g_org = residuals.g_org
   a_log = residuals.a_log
-  dt_bias = residuals.dt_bias
+  delta_time_bias = residuals.delta_time_bias
   h = residuals.h
   g_dtype_marker = residuals.g_dtype_marker
   rstd_q = residuals.q_rstd
@@ -1544,14 +1544,17 @@ def chunk_kda_bwd_custom(
     )
     cu_seqlens_bwd = aligned_cu
 
-  if cp_context is not None and cp_context.is_cp_enabled:
+  if (
+      context_parallel_metadata is not None
+      and context_parallel_metadata.is_cp_enabled
+  ):
     if segment_ids is None:
       raise ValueError("backward CP requires rank-local `segment_ids`.")
     if cp_metadata is None:
       raise ValueError("backward CP requires metadata retained by forward.")
     is_first_rank, is_last_rank, pre_num_ranks, post_num_ranks = cp_metadata
-    cp_context = dataclasses.replace(
-        cp_context,
+    context_parallel_metadata = dataclasses.replace(
+        context_parallel_metadata,
         is_first_rank=is_first_rank,
         is_last_rank=is_last_rank,
         pre_num_ranks=pre_num_ranks,
@@ -1616,7 +1619,10 @@ def chunk_kda_bwd_custom(
       raise ValueError("g (post-cumsum, log2 space) must be provided")
   if T % BT != 0:
     raise ValueError(f"T={T} must be divisible by chunk_size={BT}")
-  _cp_active = cp_context is not None and cp_context.is_cp_enabled
+  _cp_active = (
+      context_parallel_metadata is not None
+      and context_parallel_metadata.is_cp_enabled
+  )
 
   # ============= assert input shapes and static properties =============
   # initial_state/dht: [B, H, K, V] (non-varlen) or [N, H, K, V] (varlen)
@@ -1631,7 +1637,7 @@ def chunk_kda_bwd_custom(
         a_log=a_log,
         chunk_size=BT,
         scale=RCP_LN2,
-        dt_bias=dt_bias,
+        delta_time_bias=delta_time_bias,
         lower_bound=lower_bound,
       )
       g = g_cumsum  # already [H,B,T,K]
@@ -1662,7 +1668,7 @@ def chunk_kda_bwd_custom(
         a_log=a_log,
         chunk_size=BT,
         scale=RCP_LN2,
-        dt_bias=dt_bias,
+        delta_time_bias=delta_time_bias,
         lower_bound=lower_bound,
       )
       g = g_cumsum  # already [H,B,T,K]
@@ -1711,9 +1717,9 @@ def chunk_kda_bwd_custom(
   if _cp_active:
     if segment_ids is None:
       raise ValueError("backward CP requires rank-local segment_ids")
-    if cp_context.post_num_ranks is None:
+    if context_parallel_metadata.post_num_ranks is None:
       raise ValueError("backward CP requires post_num_ranks")
-    if cp_context.is_last_rank is None:
+    if context_parallel_metadata.is_last_rank is None:
       raise ValueError("backward CP requires is_last_rank")
     # pre_process requires segment_ids length == aligned T (q.shape[2]).
     # Caller's segment_ids is un-aligned (length T_orig); pad with 0
@@ -1743,12 +1749,12 @@ def chunk_kda_bwd_custom(
     # Pack dS_ext [B,H,K,V] and dM [B,H,K,K] into one tensor along the last
     # axis so a single all_gather covers both, halving the CP collective cost.
     packed = jnp.concatenate([dS_ext, dM], axis=-1)  # [B, H, K, V+K]
-    packed_all, _ = all_gather_into_tensor(packed, cp_context.axis_name)
+    packed_all, _ = all_gather_into_tensor(packed, context_parallel_metadata.axis_name)
     dS_ext_all = packed_all[..., :V]                  # [cp, B, H, K, V]
     dM_all = packed_all[..., V:V + K]                 # [cp, B, H, K, K]
-    rank = jax.lax.axis_index(cp_context.axis_name)
-    post_num = cp_context.post_num_ranks
-    is_last = cp_context.is_last_rank
+    rank = jax.lax.axis_index(context_parallel_metadata.axis_name)
+    post_num = context_parallel_metadata.post_num_ranks
+    is_last = context_parallel_metadata.is_last_rank
     ds_list = []
     for b in range(B):
       ds_b = _merge_dht(
@@ -1815,7 +1821,7 @@ def chunk_kda_bwd_custom(
     dg, dA, dbias = kda_gate_bwd(
       g=g_org,
       a_log=a_log,
-      dt_bias=dt_bias,
+      delta_time_bias=delta_time_bias,
       dyg=dg,
       lower_bound=lower_bound,
     )
@@ -1827,7 +1833,7 @@ def chunk_kda_bwd_custom(
     dh0 = dh0[:, 0]
 
   cu_seqlens = original_cu_seqlens
-  if use_qk_l2norm_in_kernel:
+  if use_qk_l2norm:
     dq = l2norm_bwd(q, rstd_q, dq)
     dk = l2norm_bwd(k, rstd_k, dk)
 
