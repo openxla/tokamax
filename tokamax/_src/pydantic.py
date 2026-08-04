@@ -71,10 +71,20 @@ if not typing.TYPE_CHECKING:
   _ORIG_IMPORT_STRING_SERIALIZE = pydantic.ImportString._serialize  # pylint: disable=protected-access
 
   def _serialize(v: Any) -> str:
-    if hasattr(v, '_fun'):
-      v = v._fun
-    if hasattr(v, '__wrapped__'):
-      v = v.__wrapped__
+    """Serializes import strings, unwrapping decorated or jitted callables."""
+    seen = set()
+    while id(v) not in seen and (
+        hasattr(v, '_fun')
+        or hasattr(v, '__wrapped__')
+        or (isinstance(v, functools.partial) and hasattr(v, 'func'))
+    ):
+      seen.add(id(v))
+      if hasattr(v, '_fun'):
+        v = v._fun
+      elif hasattr(v, '__wrapped__'):
+        v = v.__wrapped__
+      elif isinstance(v, functools.partial) and hasattr(v, 'func'):
+        v = v.func
     if (data := _ORIG_IMPORT_STRING_SERIALIZE(v)) is not None:
       return data
     if (module := getattr(v, '__module__', None)) is not None:
