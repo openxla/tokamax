@@ -51,9 +51,28 @@ from typing_extensions import override
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  """Autotuning and execution configuration for Mosaic TPU KDA."""
+  """Autotuning and execution configuration for Mosaic TPU KDA.
+
+  `safe_gate=None` selects the exponent-stabilization strategy from the gate
+  activation mode. `rematerialize_for_backward=True` omits chunk hidden states
+  from forward residuals and manually rebuilds them in the custom backward.
+  """
 
   chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
+  safe_gate: bool | None = None
+  rematerialize_for_backward: bool = False
+
+
+def _resolve_safe_gate(
+    config: Config,
+    *,
+    use_gate_in_kernel: bool,
+    lower_bound: float | None,
+) -> bool:
+  """Selects the internal exponent-stabilization strategy."""
+  if config.safe_gate is not None:
+    return config.safe_gate
+  return not use_gate_in_kernel or lower_bound is not None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -372,15 +391,19 @@ class PallasMosaicTpuKimiDeltaAttention(
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
       segment_ids: Int[Array, "B T"] | None,
-      safe_gate: bool,
       lower_bound: float | None,
-      disable_recompute: bool,
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
       config: Config,
   ) -> tuple[base.Output, base.Residuals]:
     chunk_size = config.chunk_size
+    safe_gate = _resolve_safe_gate(
+        config,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+    )
+    save_intermediates_for_backward = not config.rematerialize_for_backward
 
     # Reject unsupported calls before preprocessing or tracing a Pallas kernel,
     # so API dispatch can fall through to the next implementation.
@@ -426,7 +449,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         segment_ids=segment_ids,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
-        disable_recompute=disable_recompute,
+        disable_recompute=save_intermediates_for_backward,
         context_parallel_metadata=prepared.context_parallel_metadata,
         chunk_size=chunk_size,
         return_residuals=return_residuals,
@@ -482,9 +505,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
       segment_ids: jax.Array | None,
-      safe_gate: bool,
       lower_bound: float | None,
-      disable_recompute: bool,
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
@@ -502,9 +523,12 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         beta,
         output_final_state,
         return_residuals,
-        safe_gate,
     )
     chunk_size = config.chunk_size
+    # The forward residual set records the selected policy: a retained hidden
+    # state means backward can use the saved-state path; otherwise it must
+    # rematerialize the forward state recurrence.
+    use_saved_state = residuals.h is not None
 
     (
         dq,
@@ -521,7 +545,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         use_qk_l2norm,
         use_gate_in_kernel,
         lower_bound,
-        disable_recompute,
+        use_saved_state,
         context_parallel_metadata,
         chunk_size,
         max_num_segments,

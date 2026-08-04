@@ -75,7 +75,6 @@ KDA output is not a softmax-weighted sum. It is the sum of a read from the state
 | Gate | `a_log` | `None` | Auxiliary tensor shaped `[H]`; required when `use_gate_in_kernel=True` and used to scale raw-gate activation |
 | Gate | `delta_time_bias` | `None` | Optional auxiliary tensor shaped `[H*K]`; added to the raw gate before activation |
 | Gate | `use_gate_in_kernel` | `False` | `False` means `gate` already contains `ln(alpha)`; `True` means the backend activates raw `gate` using `a_log`, optional `delta_time_bias`, and `lower_bound` |
-| Gate | `safe_gate` | `True` | Limits the exponent range within Stage 2 sub-blocks to prevent `exp2` overflow for large gate magnitudes |
 | Gate | `lower_bound` | `None` | `None` selects softplus raw-gate activation; a non-`None` value selects the sigmoid variant and must satisfy `-5 <= lower_bound < 0` |
 | Numerics | `scale` | `None` | The public contract canonicalizes `None` to `K^{-1/2}`; `_fwd` receives the resulting `float` query scale |
 | Numerics | `use_qk_l2norm` | `False` | Requests q/k L2 normalization in `_preprocess_inputs` before Pallas execution |
@@ -83,12 +82,16 @@ KDA output is not a softmax-weighted sum. It is the sum of a read from the state
 | Sequence | `segment_ids` | `None` | Optional 1-indexed varlen segment IDs shaped `[B,T]`; `0` denotes padding, and CP requires rank-local segment IDs |
 | Sequence | `max_num_segments` | `None` | Static upper bound on varlen segment count; required when varlen input has no `initial_state`, and always required for CP |
 | CP | `context_parallel_metadata` | `None` | Optional CP mesh and axis metadata; active CP additionally forbids external/final state and requires `K` and `V` to be multiples of 128 |
-| Residual policy | `disable_recompute` | `True` | Selects saved-state versus recompute behavior for the custom backward without changing the mathematical forward result |
 | Residual policy | `return_residuals` | `False` | Internal bind/backend control that returns `KdaResiduals` for the custom backward; it is not exposed as an additional public KDA result |
 
-`config` is injected by the Tokamax `Op` framework. `chunk_size` is not part of
-the public KDA API; Mosaic forward and VJP read it from `Config`. The current
-heuristics and autotuning set provide only `Config(chunk_size=64)`.
+`config` is injected by the Tokamax `Op` framework. Mosaic `Config` owns the
+backend-specific `chunk_size`, `safe_gate`, and `rematerialize_for_backward`
+controls; none is part of the public KDA API. By default, `safe_gate=None`
+selects midpoint exponent stabilization for pre-activated gates and bounded
+raw-gate activation, while the unbounded softplus path uses the original
+reference point. `rematerialize_for_backward=False` retains chunk hidden states
+for the custom backward; setting it to `True` trades additional backward
+computation for a smaller residual set.
 
 ### 2.2 Supported Functionality
 
@@ -103,14 +106,14 @@ heuristics and autotuning set provide only `Config(chunk_size=64)`.
 | Causal semantics | Supported | `Aqk` is lower triangular and `L` is strictly lower triangular |
 | Segment boundaries | Supported | Chunks do not cross segments; Stages 3+4 reset state at boundaries |
 | Padding semantics | Supported | Data is zero padded; pre-activated gate padding is zero, while raw-gate padding is replaced with `-1e4` before fused activation |
-| Raw-gate activation | Supports softplus decay with `safe_gate=False`, or sigmoid decay with `-5 <= lower_bound < 0` | `_preprocess_inputs` prepares padding; `kda_fwd_intra_fused` requires `a_log`, with optional `delta_time_bias` |
+| Raw-gate activation | Supports softplus decay, or sigmoid decay with `-5 <= lower_bound < 0` | `_preprocess_inputs` prepares padding; `kda_fwd_intra_fused` requires `a_log`, with optional `delta_time_bias`, and Mosaic selects the internal exponent-stabilization strategy |
 | Pre-activated gate | Supported | `g` represents `ln(alpha)` and is non-positive under production semantics |
 | Query/key L2 normalization | Supported | `_preprocess_inputs` normalizes the aligned q/k tensors before Pallas computation and retains `q_rstd/k_rstd` when residuals are requested |
 | Initial state | Tokamax backend contract `[B,N,H,K,V]`; fixed length uses `N=1` | Loaded at the first chunk of each sequence |
 | Final state | Tokamax backend contract `[B,N,H,K,V]`; supported for non-CP fixed-length and variable-length execution | Written at the final chunk of each sequence |
 | bfloat16 | Supported | Fused Stage 1+2 with float32 critical accumulators |
 | float32 | Supported | Separate gate cumsum and float32 lower-triangular forward substitution |
-| Recompute control | Supported | `return_residuals` and `disable_recompute` jointly select the typed residual set and save-state behavior |
+| Rematerialization control | Supported | `return_residuals` and `Config.rematerialize_for_backward` jointly select the typed residual set and save-state behavior |
 | Static segment bound | Supports `max_num_segments` | Fixes compile-time shapes for `cu_seqlens` and chunk mapping; a tight value reduces empty-segment overhead |
 
 ## 3. Architecture and Canonical Call Chain
@@ -349,7 +352,7 @@ $$
 2^{G_c^t-G_c^s}=2^{G_c^t-\mu}\,2^{\mu-G_c^s}.
 $$
 
-When `safe_gate=True`, the midpoint position of the sub-block is used as the reference, reducing the exponent range on either side. Outside the causal region, the implementation sets exponent differences to zero before evaluating `exp2`, then zeros the corresponding matrix-multiplication inputs. This prevents masked positions from first producing infinity and then forming a non-finite result when multiplied by zero.
+When the internal safe-gate strategy is enabled, the midpoint position of the sub-block is used as the reference, reducing the exponent range on either side. Outside the causal region, the implementation sets exponent differences to zero before evaluating `exp2`, then zeros the corresponding matrix-multiplication inputs. This prevents masked positions from first producing infinity and then forming a non-finite result when multiplied by zero.
 
 The query-key and key-key left operands for a sub-block are concatenated. One batched matrix multiplication then produces both the corresponding rows of `Aqk` and `L`, reusing gated-key loads and matrix-multiplication scheduling.
 
@@ -656,24 +659,27 @@ Both exponent terms are bounded below by `-126`, treating extremely small decays
 
 #### 4.3.4 Recompute and Caching
 
-Residual materialization depends on both `return_residuals` and `disable_recompute`. The forward defines:
+Residual materialization depends on both `return_residuals` and
+`Config.rematerialize_for_backward`. The forward defines:
 
 ```python
-save_for_backward = return_residuals and disable_recompute
+save_for_backward = (
+    return_residuals and not config.rematerialize_for_backward
+)
 ```
 
 The current behavior is:
 
-| `return_residuals` | `disable_recompute` | Forward materialization and returned residual behavior |
+| `return_residuals` | `rematerialize_for_backward` | Forward materialization and returned residual behavior |
 |---:|---:|---|
-| `False` | `False` | No `KdaResiduals`; `qg` and `h` are not stored; recomputable intermediates are dropped after output production. |
-| `False` | `True` | No `KdaResiduals`; Stage 1+2 does not request `qg`, but Stage 3+4 currently writes `h` because `store_h=disable_recompute`; `h` is then discarded before return. |
-| `True` | `False` | Returns `KdaResiduals` without `h`. For raw-gate activation, `g_org` is saved and `g_cumsum` is omitted for backward recomputation; for a pre-activated gate, `g_cumsum` is retained. |
-| `True` | `True` | Returns the save-state residual set including `h`, `g_cumsum`, `Aqk`, and `Akk`. Stage 1+2 also materializes `qg` internally, but `qg` is not a field of `KdaResiduals`. |
+| `False` | `False` | No `KdaResiduals`; Stage 1+2 does not request `qg`, but Stage 3+4 currently writes `h`; `h` is then discarded before return. |
+| `False` | `True` | No `KdaResiduals`; `qg` and `h` are not stored; recomputable intermediates are dropped after output production. |
+| `True` | `False` | Returns the saved-state residual set including `h`, `g_cumsum`, `Aqk`, and `Akk`. Stage 1+2 also materializes `qg` internally, but `qg` is not a field of `KdaResiduals`. |
+| `True` | `True` | Returns `KdaResiduals` without `h`. For raw-gate activation, `g_org` is saved and `g_cumsum` is omitted for backward rematerialization; for a pre-activated gate, `g_cumsum` is retained. |
 
 `KdaResiduals` retains the prepared, possibly aligned and L2-normalized `q/k`, along with `v`, `beta`, the selected gate representation, `Aqk/Akk`, optional `h`, initial-state data, and the alignment/CP metadata required by backward. `w`, `u`, `kg`, `qg`, and `V_new` are not part of the typed residual contract. `V_new` is never stored because the orchestrator fixes `store_v_new=False`.
 
-CP and non-CP execution use the same residual policy. Neither flag changes `o`, `final_state`, the CP affine-summary equations, or the initial state recovered for the current rank.
+CP and non-CP execution use the same residual policy. The policy does not change `o`, `final_state`, the CP affine-summary equations, or the initial state recovered for the current rank.
 
 In matrix terms, both policies evaluate the same forward map:
 
@@ -769,7 +775,7 @@ Neither communicated matrix has a token-length dimension, which is why the colle
 - Gate activation, cumulative gates, state, CP summaries, and critical matrix-multiplication accumulators use float32.
 - Bfloat16 is the production dtype for fused Stage 1+2. Float32 uses separate cumulative-gate computation and an algebraically exact lower-triangular forward-substitution formulation, subject to floating-point rounding.
 - All decays use `exp2` in log2 space, avoiding repeated conversion between natural and binary exponential representations.
-- The `safe_gate` reference point reduces exponent ranges in Stage 2 sub-blocks.
+- The internally selected safe-gate reference point reduces exponent ranges in Stage 2 sub-blocks.
 - Anti-causal entries are cleared before `exp2`, preventing overflow at positions that will be masked.
 - The unified Stage 3+4 path factors `2^G` around a reference point and applies a `-126` lower bound to very small exponents.
 - CP summaries and multi-rank merging remain in float32.
@@ -789,7 +795,7 @@ Causality, segment boundaries, and padding are therefore fixed components of the
 
 - Production gate semantics require `alpha in (0,1]`, so pre-activated `ln(alpha)` is non-positive.
 - With `use_gate_in_kernel=True`, `a_log` is required and must have shape `[H]`; an optional `delta_time_bias` must have shape `[H*K]`.
-- Raw-gate softplus activation requires `lower_bound=None`. Under the public contract it is valid only with `safe_gate=False`, because `safe_gate=True` requires a finite lower bound.
+- Raw-gate softplus activation requires `lower_bound=None`; Mosaic automatically selects the compatible exponent reference strategy.
 - A non-`None` `lower_bound` selects the sigmoid gate variant and must satisfy `-5 <= lower_bound < 0`.
 - The complete production path uses `chunk_size=64`.
 - Fixed-length `T` must be divisible by the chunk size; the call chain automatically aligns each segment for variable-length input.
@@ -817,7 +823,7 @@ The Pallas TPU numerical test contains the following forward cases:
 | Case | Dtype and shape | Forward behavior covered |
 |---|---|---|
 | `fixed_t8192` | bfloat16, `B=1`, `T=8192`, `H=16`, `K=V=128` | Fixed-length execution, in-kernel query/key L2 normalization, and final-state output; marked as a long test |
-| `varlen` | bfloat16, `B=1`, `T=256`, `H=2`, `K=V=128`, segment lengths `(45,80,20)` | Per-segment alignment and padding, initial/final state, raw-gate activation with `lower_bound=-0.01`, in-kernel query/key L2 normalization, and `disable_recompute=False` |
+| `varlen` | bfloat16, `B=1`, `T=256`, `H=2`, `K=V=128`, segment lengths `(45,80,20)` | Per-segment alignment and padding, initial/final state, raw-gate activation with `lower_bound=-0.01`, in-kernel query/key L2 normalization, and backward rematerialization |
 | `fixed_unaligned_kv` | bfloat16, `B=1`, `T=64`, `H=1`, `K=129`, `V=127` | Non-major-block-aligned key/value dimensions on the non-CP path |
 | `cp2` | float32, global `T=128`, `H=2`, `K=V=128`, `cp_size=2` | Two-rank CP execution with one rank-local chunk per device |
 
@@ -942,7 +948,7 @@ A replacement benchmark must record all of the following:
 
 - Source commit, JAX/libtpu versions, TPU generation/topology, and benchmark command.
 - Logical token length, aligned physical length, segment-length distribution, `max_num_segments`, and per-rank shapes.
-- `return_residuals`, `disable_recompute`, gate mode, L2-normalization mode, initial/final-state settings, and CP size.
+- `return_residuals`, `rematerialize_for_backward`, gate mode, L2-normalization mode, initial/final-state settings, and CP size.
 - Warmup count, measured sample count, synchronization method, and whether compilation, preprocessing, alignment, and output unalignment are included.
 - A paired single-rank and CP workload with identical logical inputs and identical physical alignment when reporting CP speedup.
 - Kernel-level runtime/HBM measurements separately from the end-to-end pipeline latency.

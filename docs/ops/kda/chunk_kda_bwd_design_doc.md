@@ -51,7 +51,7 @@ Forward residuals saved:
 
 - `Aqk`: the intra-chunk query-key attention matrix, shape `[H, B, T, BT]`;
 - `Akk`: the WY inverse matrix, i.e. `A_kk^{-1}`, shape `[H, B, T, BT]`;
-- `h`: the hidden state at the start of each chunk, shape `[H, B, NT, K, V]`; the forward stores it when `disable_recompute=True` and retains it in `KdaResiduals` when a custom backward is required.
+- `h`: the hidden state at the start of each chunk, shape `[H, B, NT, K, V]`; the forward retains it in `KdaResiduals` when `rematerialize_for_backward=False`.
 
 Backward recompute:
 
@@ -63,9 +63,10 @@ Backward recompute:
 Optional recompute:
 
 - When `use_gate_in_kernel=True`, both backward preparation paths currently recompute the post-cumsum gate from `g_org`, `a_log`, and optional `delta_time_bias` via `kda_gate_chunk_cumsum`, including the saved-`h` path where the forward residual currently also contains `g_cumsum`.
-- When `disable_recompute=False`, it does not take the fast path that saves `h`, but instead reruns the forward state recurrence to recover `h` and `v_new`.
+- When `rematerialize_for_backward=True`, the backward does not take the saved-`h` path, but instead reruns the forward state recurrence to recover `h` and `v_new`.
 
-By naming convention, `disable_recompute=True` means "disable the full forward recurrence recompute, use the saved `h`." This is the current main path.
+This is manual rematerialization within the Mosaic custom VJP, not a call to
+`jax.checkpoint` or `jax.remat`.
 
 ### 1.2 WY Representation and Gate Semantics
 
@@ -169,10 +170,10 @@ PallasMosaicTpuKimiDeltaAttentionVjp._fwd
    ├─ restore derived CP metadata retained by forward
    ├─ Stage 0: recover forward intermediate quantities
    │  ├─ if use_gate_in_kernel: kda_gate_chunk_cumsum(...)
-   │  ├─ fast path disable_recompute=True:
+   │  ├─ saved-state path rematerialize_for_backward=False:
    │  │  └─ fused_recompute_w_u_vnew_from_h_pallas(...)
    │  │     → w, qg, kg, v_new
-   │  └─ fallback path disable_recompute=False:
+   │  └─ low-memory path rematerialize_for_backward=True:
    │     ├─ _recompute_w_u_fwd(...)
    │     │  → w, u, qg, kg
    │     └─ chunk_gated_delta_rule_fwd_h(...)
@@ -212,7 +213,7 @@ dAv                     → dAqk, dv
 dhu/WY/intra/cumsum     → dq, dk, dv, db, dg, dh0
 ```
 
-The low-memory path selected by `disable_recompute=False` additionally calls `_recompute_w_u_fwd` and `chunk_gated_delta_rule_fwd_h` to rerun the forward state recurrence. Context-parallel preparation, gate backward, L2-normalization backward, and varlen unalignment are optional operations around the core kernels.
+The low-memory path selected by `rematerialize_for_backward=True` additionally calls `_recompute_w_u_fwd` and `chunk_gated_delta_rule_fwd_h` to rerun the forward state recurrence. Context-parallel preparation, gate backward, L2-normalization backward, and varlen unalignment are optional operations around the core kernels.
 
 ### 2.1 Recompute Fusion Kernel
 
@@ -477,7 +478,7 @@ The current `compute_intra_backward(...)` implementation explicitly casts `dg_ac
 
 Because the measurements above are historical, current-head validation should cover correctness and performance separately. At minimum, correctness revalidation should exercise:
 
-- the saved-`h` path (`disable_recompute=True`) and the full-recompute path (`disable_recompute=False`);
+- the saved-`h` path (`rematerialize_for_backward=False`) and the full-rematerialization path (`rematerialize_for_backward=True`);
 - fixed-length and variable-length inputs, including multiple segments and `B>1`;
 - a supplied `initial_state`, `output_final_state=True`, and a nonzero final-state cotangent;
 - precomputed gates and `use_gate_in_kernel=True`, with and without `delta_time_bias`;

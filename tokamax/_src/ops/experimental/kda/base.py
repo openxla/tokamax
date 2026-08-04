@@ -42,7 +42,6 @@ def _validate_gate_args(
     delta_time_bias: jax.Array | None,
     heads: int,
     key_dim: int,
-    safe_gate: bool,
     lower_bound: float | None,
 ):
   if not use_gate_in_kernel:
@@ -54,11 +53,6 @@ def _validate_gate_args(
   if delta_time_bias is not None and delta_time_bias.shape != (heads * key_dim,):
     raise ValueError(
         f"`delta_time_bias` shape {delta_time_bias.shape} must be {(heads * key_dim,)}."
-    )
-  if safe_gate and lower_bound is None:
-    raise ValueError(
-        "`lower_bound` must be specified when `safe_gate=True` and "
-        "`use_gate_in_kernel=True`."
     )
   if lower_bound is not None and not (-5 <= lower_bound < 0):
     raise ValueError(f"`lower_bound` must be in [-5, 0), got {lower_bound}.")
@@ -91,9 +85,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       use_qk_l2norm: bool = False,
       use_gate_in_kernel: bool = False,
       segment_ids: Int[Array, "B T"] | None = None,
-      safe_gate: bool = True,
       lower_bound: float | None = None,
-      disable_recompute: bool = True,
       context_parallel_metadata: ContextParallelMetadata | None = None,
       max_num_segments: int | None = None,
       return_residuals: bool = False,
@@ -151,7 +143,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         delta_time_bias=delta_time_bias,
         heads=heads,
         key_dim=key_dim,
-        safe_gate=safe_gate,
         lower_bound=lower_bound,
     )
 
@@ -172,9 +163,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         use_qk_l2norm=use_qk_l2norm,
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,
-        safe_gate=safe_gate,
         lower_bound=lower_bound,
-        disable_recompute=disable_recompute,
         context_parallel_metadata=context_parallel_metadata,
         max_num_segments=max_num_segments,
         return_residuals=return_residuals,
@@ -198,16 +187,14 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
       segment_ids: Int[Array, "B T"] | None,
-      safe_gate: bool,
       lower_bound: float | None,
-      disable_recompute: bool,
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
       config: _Config,
   ) -> tuple[Output, Residuals]:
     """Dispatches to the pure JAX KDA reference implementation."""
-    del config, return_residuals, safe_gate, disable_recompute
+    del config, return_residuals
     output = reference.kimi_delta_attention(
         query,
         key,

@@ -79,7 +79,13 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         "context_parallel_metadata",
     ):
       self.assertIn(name, parameters)
-    for name in ("dt_bias", "use_qk_l2norm_in_kernel", "cp_context"):
+    for name in (
+        "dt_bias",
+        "use_qk_l2norm_in_kernel",
+        "cp_context",
+        "safe_gate",
+        "disable_recompute",
+    ):
       self.assertNotIn(name, parameters)
 
   @parameterized.parameters(
@@ -164,7 +170,6 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
             use_qk_l2norm=use_qk_l2norm,
             use_gate_in_kernel=use_gate_in_kernel,
             segment_ids=segment_ids,
-            safe_gate=not use_gate_in_kernel,
             max_num_segments=max_num_segments,
             implementation=implementation,
         )

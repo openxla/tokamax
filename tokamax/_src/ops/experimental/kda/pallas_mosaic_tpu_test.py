@@ -73,7 +73,7 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     self.assertEqual(limits.block_align_minor, tpu_info.num_sublanes)
     self.assertEqual(limits.block_align_major, tpu_info.num_lanes)
 
-  def test_chunk_size_config(self):
+  def test_default_execution_config(self):
     attention = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention()
     vjp = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttentionVjp()
     expected = pallas_mosaic_tpu.Config(chunk_size=64)
@@ -82,6 +82,38 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     self.assertEqual(attention._get_autotuning_configs(None), {expected})
     self.assertEqual(vjp._get_heuristics_config(None), expected)
     self.assertEqual(vjp._get_autotuning_configs(None), {expected})
+    self.assertIsNone(expected.safe_gate)
+    self.assertFalse(expected.rematerialize_for_backward)
+
+  @parameterized.named_parameters(
+      ("preactivated_gate", False, None, True),
+      ("softplus_gate", True, None, False),
+      ("bounded_gate", True, -5.0, True),
+  )
+  def test_safe_gate_is_selected_internally(
+      self, use_gate_in_kernel, lower_bound, expected
+  ):
+    config = pallas_mosaic_tpu.Config()
+
+    self.assertEqual(
+        pallas_mosaic_tpu._resolve_safe_gate(
+            config,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+        ),
+        expected,
+    )
+
+  def test_safe_gate_config_override(self):
+    config = pallas_mosaic_tpu.Config(safe_gate=False)
+
+    self.assertFalse(
+        pallas_mosaic_tpu._resolve_safe_gate(
+            config,
+            use_gate_in_kernel=False,
+            lower_bound=None,
+        )
+    )
 
   def test_large_key_dimension_is_mosaic_specific(self):
     q = jnp.ones((1, 1, 1, 257), dtype=jnp.float32)

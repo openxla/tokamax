@@ -73,7 +73,6 @@ def _kimi_linear_48b_a3b_spec(
       "output_final_state": False,
       "use_qk_l2norm": True,
       "use_gate_in_kernel": True,
-      "safe_gate": True,
       "lower_bound": -5.0,
   }
   if num_segments is not None:

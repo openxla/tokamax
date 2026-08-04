@@ -58,9 +58,7 @@ def kimi_delta_attention(
     use_qk_l2norm: bool = False,
     use_gate_in_kernel: bool = False,
     segment_ids: Int[Array, "B T"] | None = None,
-    safe_gate: bool = True,
     lower_bound: float | None = None,
-    disable_recompute: bool = True,
     context_parallel_metadata: ContextParallelMetadata | None = None,
     max_num_segments: int | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
@@ -99,10 +97,7 @@ def kimi_delta_attention(
       space.
     segment_ids: Optional 1-indexed varlen segment IDs, shape `[B, T]`.
       Padding is represented by 0.
-    safe_gate: Match pallas-kernel gate validation.
     lower_bound: Optional sigmoid-gate lower bound.
-    disable_recompute: Pallas custom-VJP recompute policy. XLA reference
-      implementations accept it but the mathematical result is unchanged.
     context_parallel_metadata: Optional context-parallel metadata. Construct
       it with `kda.ContextParallelMetadata(mesh, axis_name)`.
     max_num_segments: Static upper bound for the number of varlen segments.
@@ -149,9 +144,7 @@ def kimi_delta_attention(
           use_qk_l2norm=use_qk_l2norm,
           use_gate_in_kernel=use_gate_in_kernel,
           segment_ids=segment_ids,
-          safe_gate=safe_gate,
           lower_bound=lower_bound,
-          disable_recompute=disable_recompute,
           context_parallel_metadata=context_parallel_metadata,
           max_num_segments=max_num_segments,
       )

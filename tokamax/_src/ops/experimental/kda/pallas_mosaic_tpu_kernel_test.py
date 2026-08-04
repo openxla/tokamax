@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda import api
+from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu
 from tokamax._src.ops.experimental.kda.cp_utils import ContextParallelMetadata
 
 
@@ -997,9 +998,7 @@ def _attention_kwargs(case: TestConfig, inputs: _Inputs) -> dict[str, object]:
       output_final_state=case.output_final_state,
       use_qk_l2norm=case.use_qk_l2norm,
       use_gate_in_kernel=case.use_gate_in_kernel,
-      safe_gate=case.safe_gate,
       lower_bound=case.lower_bound,
-      disable_recompute=case.disable_recompute,
       max_num_segments=case.max_num_segments,
   )
 
@@ -1011,6 +1010,24 @@ def _call_attention(
     *,
     context_parallel_metadata: ContextParallelMetadata | None = None,
 ):
+  attention_kwargs = _attention_kwargs(case, inputs)
+  if implementation == "mosaic":
+    attention = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention(
+        config=pallas_mosaic_tpu.Config(
+            safe_gate=case.safe_gate,
+            rematerialize_for_backward=not case.disable_recompute,
+        )
+    )
+    return attention(
+        inputs.q,
+        inputs.k,
+        inputs.v,
+        inputs.g,
+        inputs.beta,
+        segment_ids=inputs.segment_ids,
+        context_parallel_metadata=context_parallel_metadata,
+        **attention_kwargs,
+    )
   return api.kimi_delta_attention(
       inputs.q,
       inputs.k,
@@ -1020,7 +1037,7 @@ def _call_attention(
       segment_ids=inputs.segment_ids,
       context_parallel_metadata=context_parallel_metadata,
       implementation=implementation,
-      **_attention_kwargs(case, inputs),
+      **attention_kwargs,
   )
 
 
@@ -1279,7 +1296,7 @@ def test_chunk_kda_backward(case: TestConfig):
   grads = (
       _cp_backward("mosaic", case, inputs)
       if case.cp_size > 1
-      else _direct_backward(None, case, inputs)
+      else _direct_backward("mosaic", case, inputs)
   )
   grad_names = ("dq", "dk", "dv", "dg", "dbeta")
   if case.use_initial_state:
