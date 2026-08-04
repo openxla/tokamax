@@ -15,7 +15,8 @@
 """Mosaic-GPU utils."""
 
 import functools
-from typing import cast
+import math
+from typing import Any, cast
 
 import jax
 from jax.experimental import pallas as pl
@@ -254,3 +255,21 @@ def int4_as_biased_f8e4m3fn(x, layout):
     )
 
   return encode(x)
+
+
+def _get_smem_bytes(x: Any) -> int:
+  if isinstance(x, (plgpu.Barrier, plgpu.ClusterBarrier)):
+    return (n if isinstance(n := x.num_barriers, int) else math.prod(n)) * 8
+
+  if getattr(x, "memory_space", None) == plgpu.SMEM:
+    size_bytes = math.prod(x.shape) * num_bits(x.dtype) // 8
+    return pl.cdiv(size_bytes, 1024) * 1024
+
+  return 0
+
+
+def estimate_smem_bytes(scratch_types: Any) -> int:
+  """Estimates the total SMEM usage in bytes for the given scratch types."""
+  is_ref_union = lambda x: isinstance(x, plgpu.RefUnion)
+  scratch_types_flat = jax.tree.leaves(scratch_types, is_leaf=is_ref_union)
+  return sum(map(_get_smem_bytes, scratch_types_flat))

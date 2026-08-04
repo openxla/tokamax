@@ -18,7 +18,7 @@
 
 import functools
 import math
-from typing import cast
+from typing import Any, cast
 
 import jax
 from jax import lax
@@ -302,33 +302,8 @@ def _get_input_metadata(q, v):
   return head_dim, head_dim_out
 
 
-def _estimate_smem_bytes(scratch_shapes: dict) -> int:
-  """Estimates the total SMEM usage in bytes for a given scratch shapes dict."""
-  total_bytes = 0
-  for val in scratch_shapes.values():
-    if isinstance(val, plgpu.RefUnion):
-      max_size = 0
-      for ref in val.refs:
-        if (
-            hasattr(ref, "memory_space")
-            and getattr(ref.memory_space, "value", "") == "smem"
-        ):
-          size = math.prod(ref.shape) * jnp.dtype(ref.dtype).itemsize
-          max_size = max(max_size, size)
-      total_bytes += (max_size + 1023) // 1024 * 1024
-    elif (
-        hasattr(val, "memory_space")
-        and getattr(val.memory_space, "value", "") == "smem"
-    ):
-      size = math.prod(val.shape) * jnp.dtype(val.dtype).itemsize
-      total_bytes += (size + 1023) // 1024 * 1024
-    elif isinstance(val, (plgpu.Barrier, plgpu.ClusterBarrier)):
-      num_barriers = val.num_barriers
-      if isinstance(num_barriers, tuple):
-        num_barriers = math.prod(num_barriers)
-      total_bytes += num_barriers * 8
-  # Add a 4096 byte compiler safety margin.
-  return total_bytes + 4096 * 2
+def _estimate_smem_bytes(scratch_shapes: dict[str, Any]) -> int:
+  return mgpu_lib.estimate_smem_bytes(scratch_shapes) + 4096 * 2
 
 
 def _kernel_dq(
