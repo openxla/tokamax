@@ -90,6 +90,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
   # Set by the custom vjp (see `__post_init__`); `None` for the forward and
   # for direct (non-autodiff) drhs calls.
   num_actual_groups: int | None = None
+  dlhs_config: Config | None = None
+  drhs_config: Config | None = None
 
   def __post_init__(self):
     qdtype: str | None = (
@@ -106,7 +108,9 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             config=config,
         )(*args, **kw)
 
-      if self.config is not None:
+      if self.dlhs_config is not None:
+        dlhs_config = self.dlhs_config
+      elif self.config is not None:
         dlhs_config = Config(
             tile_m=self.config.tile_m,
             tile_k=self.config.tile_n,
@@ -114,7 +118,11 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         )
       else:
         dlhs_config = None
-      drhs_config = self.config
+
+      if self.drhs_config is not None:
+        drhs_config = self.drhs_config
+      else:
+        drhs_config = self.config
 
       def _vjp(residuals, out, dout, lhs, rhs, **kwargs):
         # Under expert parallelism `group_sizes` is global, but the original
