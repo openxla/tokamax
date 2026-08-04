@@ -613,16 +613,17 @@ def _kernel_dq(
       if mask is not None:
         ds = jnp.where(mask, ds, 0.0)
 
+      plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
+      if ds_gmem is not None:
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+      mgpu_lib.tcgen05_wait_st()
+      plgpu.barrier_arrive(ds_produced)
+
       if ds_gmem is not None:
         assert ds_smem is not None
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
         ds_smem[...] = ds.astype(ds_smem.dtype)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(ds_smem, ds_gmem.at[hi, qs, ks])
-
-      plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
-      mgpu_lib.tcgen05_wait_st()
-      plgpu.barrier_arrive(ds_produced)
 
     if ds_gmem is not None:
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
