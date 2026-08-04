@@ -15,22 +15,19 @@
 """Normalization op."""
 
 from collections.abc import Callable
-from typing import Any, TypeAlias, TypeVar
+from typing import Any, override
 
 import jax
 from jax.experimental.pallas import fuser
 import jax.numpy as jnp
 from tokamax._src.ops import op
-from typing_extensions import override
 
 
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
-FusedInputArray: TypeAlias = fuser.Fusion[[], jax.Array]  # pytype: disable=invalid-annotation
-Residuals: TypeAlias = tuple[jax.Array | None, jax.Array]  # mean, rstddev
+type FusedInputArray = fuser.Fusion[[], jax.Array]  # pytype: disable=invalid-annotation
+type Residuals = tuple[jax.Array | None, jax.Array]  # mean, rstddev
 
 
-class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
+class Normalization[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   """Normalization op."""
 
   @override
@@ -108,7 +105,7 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       scale_offset: float,
       subtract_mean: bool,
       return_residuals: bool,
-      config: _Config,
+      config: C,
   ) -> tuple[jax.Array, Residuals | None]:
     if callable(x):
       x = x()
@@ -136,7 +133,7 @@ class Normalization(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     return y.astype(x.dtype), (mean, rstddev) if return_residuals else None
 
 
-class NormalizationVjp(op.Op[Any, Any, None, _Config, _Key]):
+class NormalizationVjp[C, K](op.Op[Any, Any, None, C, K]):
   """Normalization VJP."""
 
   @override
@@ -154,7 +151,7 @@ class NormalizationVjp(op.Op[Any, Any, None, _Config, _Key]):
       scale_offset: float,
       subtract_mean: bool,
       return_residuals: bool,
-      config: _Config,
+      config: C,
   ) -> tuple[tuple[jax.Array, jax.Array | None, jax.Array | None], None]:
     """Computes normalization VJP `(dx, dscale, doffset)`."""
     del out, config  # Unused.

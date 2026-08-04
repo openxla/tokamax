@@ -15,6 +15,8 @@
 """Tests for Pallas Mosaic TPU Ragged Dot."""
 
 import functools
+from typing import override
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -27,7 +29,6 @@ from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu
 from tokamax._src.ops.ragged_dot import test_base
-from typing_extensions import override
 
 
 AsQArray = quantization.AsQArray
@@ -94,6 +95,11 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     if jax.default_backend() != "tpu":
       self.skipTest("Only supported on TPUs.")
     super().setUp()
+
+  @override
+  def _test_simple(self, dtype):
+    with test_base.override_chex_args(atol=1e-6):
+      super()._test_simple(dtype)
 
   def test_vjp0(self):
     with test_base.override_chex_args(atol=0.2, rtol=0.01):
@@ -257,7 +263,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
 
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
 
-
     ba_fwd = op_lib.BoundArguments(
         op=tpu_ragged_dot,
         arguments={
@@ -279,7 +284,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       self.assertEqual(fwd_heuristics.tile_m, 128)
     if fwd_heuristics.tile_k < k:
       self.assertEqual(fwd_heuristics.tile_n, 128)
-
 
     ba_vjp_dlhs = op_lib.BoundArguments(
         op=tpu_ragged_dot,

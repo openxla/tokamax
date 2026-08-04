@@ -18,7 +18,7 @@
 
 import dataclasses
 import functools
-from typing import Any, ClassVar
+from typing import Any, ClassVar, override
 
 import jax
 from jax.extend import backend
@@ -33,7 +33,7 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_common as vjp_common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm100 as sm100
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm90 as sm90
-from typing_extensions import override
+
 
 CanonicalPrecision = base.CanonicalPrecision
 Config = vjp_common.Config
@@ -150,20 +150,12 @@ class PallasMosaicGpuFlashAttentionVjp(
     k_start = _broadcast_to_rank(k_start, q.ndim - 1)
     k_end = _broadcast_to_rank(k_end, q.ndim - 1)
 
-    if bias is None:
-      ds_dtype = None
-    elif self.dbias_intermediate_dtype is None:
-      ds_dtype = bias.dtype
-    elif bias.shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
-      ds_dtype = bias.dtype
-    else:
-      ds_dtype = self.dbias_intermediate_dtype
-
+    dbias_intermediate_dtype = self.dbias_intermediate_dtype
     kwargs = dict(
         is_causal=is_causal,
         logits_scale=logits_scale,
         logits_soft_cap=logits_soft_cap,
-        ds_dtype=ds_dtype,
+        ds_dtype=vjp_common.get_ds_dtype(q, k, bias, dbias_intermediate_dtype),
         config=config,
     )
 
@@ -172,16 +164,14 @@ class PallasMosaicGpuFlashAttentionVjp(
     else:
       kernel_fn = sm90.flash_attention_vjp_kernel
 
-    f = functools.partial(kernel_fn, **kwargs)
-    if not isinstance(config, sm100.Config):
-      f = base.vmap_batch_dims(f)
-
+    f = base.vmap_batch_dims(functools.partial(kernel_fn, **kwargs))
     dq, dk, dv, ds = f(
         q, k, v, residuals, out, dout, bias, mask, k_start, k_end
     )
 
     dbias = None
     if bias is not None:
+      assert ds is not None
       broadcast_bias_axes = [i for i, d in enumerate(bias.shape) if d == 1]
       dbias = jnp.sum(ds, axis=broadcast_bias_axes).astype(bias.dtype)
       dbias = dbias.reshape(orig_bias_shape)
@@ -201,8 +191,8 @@ class PallasMosaicGpuFlashAttentionVjp(
       self, ba: op.BoundArguments
   ) -> set[sm90.Config | sm100.Config]:
     if gpu_utils.is_sm100():
-      return sm100.get_autotuning_configs(ba)
-    return sm90.get_autotuning_configs(ba)
+      return sm100.get_autotuning_configs(ba)  # pyrefly: ignore[bad-return]
+    return sm90.get_autotuning_configs(ba)  # pyrefly: ignore[bad-return]
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

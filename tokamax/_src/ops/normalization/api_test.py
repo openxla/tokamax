@@ -30,7 +30,7 @@ from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.normalization import test_base
 
 _IMPLEMENTATIONS: Final[tuple[str | None, ...]] = typing.get_args(
-    api.Implementation
+    api.Implementation.__value__
 ) + (None,)
 
 _IMPLEMENTATIONS_VJP: Mapping[str, Callable[..., jax.Array]] = dict(

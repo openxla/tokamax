@@ -15,7 +15,7 @@
 """Dot product attention API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 import immutabledict
 import jax
 from jax.extend import backend
@@ -27,9 +27,7 @@ from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import xla_chunked
 
 QArray = qwix.QArray
-Implementation: TypeAlias = Literal[
-    "mosaic", "triton", "cudnn", "xla", "xla_chunked"
-]
+type Implementation = Literal["mosaic", "triton", "cudnn", "xla", "xla_chunked"]
 
 # TODO: Investigate if `_XLA_CHUNK_SIZE` should be larger on TPU.
 _XLA_CHUNK_SIZE: Final[tuple[int, int]] = (512, 1024)

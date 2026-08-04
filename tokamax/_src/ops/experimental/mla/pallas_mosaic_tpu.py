@@ -17,6 +17,7 @@
 import dataclasses
 import itertools
 from typing import Annotated, ClassVar
+from typing import ClassVar, override
 
 import jax
 from jax.experimental.pallas import tpu as pltpu
@@ -26,7 +27,6 @@ import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.mla import base
 from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu_kernel
-from typing_extensions import override
 
 
 @pydantic.dataclasses.dataclass(frozen=True)

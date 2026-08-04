@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import ClassVar
+from typing import ClassVar, override
 
 import jax
 from jax.experimental import pallas as pl
@@ -34,7 +34,7 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.flex_attention import base
 from tokamax._src.pallas import block
-from typing_extensions import override
+
 
 ScoreMod = base.ScoreMod
 MaskMod = base.MaskMod

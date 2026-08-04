@@ -23,7 +23,7 @@ import dataclasses
 import functools
 import os
 import typing
-from typing import Any, ParamSpec, Self, TypeVar, cast
+from typing import Any, cast
 
 from absl import logging
 import immutabledict
@@ -32,13 +32,11 @@ from tokamax._src import benchmarking
 from tokamax._src import numerics
 
 
-_Config = TypeVar("_Config")
-_P = ParamSpec("_P")
 BenchmarkData = benchmarking.BenchmarkData
 
 
-class AutotuningData(
-    immutabledict.immutabledict[_Config, BenchmarkData | Exception]
+class AutotuningData[K](
+    immutabledict.immutabledict[K, BenchmarkData | Exception]
 ):
   """Results from autotuning."""
 
@@ -48,7 +46,7 @@ class AutotuningData(
     return cast(AutotuningData, super().__new__(cls, *args, **kwargs))
 
   @property
-  def fastest_config(self) -> _Config:
+  def fastest_config(self) -> K:
     valid_benchmarks = tuple(
         it for it in self.items() if isinstance(it[1], BenchmarkData)
     )
@@ -61,7 +59,7 @@ class AutotuningData(
         raise ExceptionGroup("All configs failed", exceptions) from e
       raise ValueError("Autotuning data is empty") from e
 
-  def prune(self) -> Self:
+  def prune(self) -> AutotuningData[K]:
     if not self:
       return self
     try:
@@ -71,7 +69,7 @@ class AutotuningData(
       raise e
     return return_data  # pyrefly: ignore[bad-return]
 
-  def prune_errors(self) -> dict[_Config, BenchmarkData]:
+  def prune_errors(self) -> dict[K, BenchmarkData]:
     return {k: v for k, v in self.items() if isinstance(v, BenchmarkData)}  # pytype: disable=bad-return-type
 
   @classmethod
@@ -89,7 +87,7 @@ class AutotuningData(
         ),
     )
 
-  def __or__(self, other: Self) -> Self:
+  def __or__(self, other: AutotuningData[K]) -> AutotuningData[K]:
     return AutotuningData(super().__or__(other))  # pyrefly: ignore[bad-return]
 
 
@@ -99,9 +97,9 @@ def _compile(fn_factory, config, args, kwargs, *, seed=None):
   return benchmarking.compile_benchmark(fn, x), x  # pyrefly: ignore[bad-argument-type]
 
 
-def _benchmark(fn_factory, config, args, kwargs, event_filter_regex=None):
+def _benchmark(fn_factory, config, args, kwargs):
   runner, x = _compile(fn_factory, config, args, kwargs, seed=0)
-  return runner(x, event_filter_regex=event_filter_regex)
+  return runner(x)
 
 
 class _SyncExecutor(futures.Executor):
@@ -126,18 +124,18 @@ class Autotuner:
   executor_fn: Callable[[], futures.Executor] = _SyncExecutor
   timeout_seconds: float = 600.0
 
-  def autotune(
+  def autotune[C, **P](
       self,
-      fn_factory: Callable[[_Config], Callable[_P, Any]],
-      configs: set[_Config],
-      *args: _P.args,
-      event_filter_regex: str | None = None,  # pyrefly: ignore[bad-function-definition]
-      **kwargs: _P.kwargs,
-  ) -> AutotuningData[_Config]:
+      fn_factory: Callable[[C], Callable[P, Any]],
+      configs: set[C],
+      *args: P.args,
+      timeout: float | None = None,  # pyrefly: ignore[bad-function-definition]
+      **kwargs: P.kwargs,
+  ) -> AutotuningData[C]:
     """Autotunes over configs for the given arguments."""
     executor = self.executor_fn()
     executor_args = {}
-    timeout = self.timeout_seconds
+    timeout = self.timeout_seconds if timeout is None else timeout
     vlog_exc_info = functools.partial(logging.vlog, 2, exc_info=True)
 
     results = {}
@@ -162,12 +160,7 @@ class Autotuner:
               compiled_fn, args = future.result()
               if initialized_args is None:
                 initialized_args = numerics.random_initialize(args)
-              executor_args[config] = (
-                  functools.partial(
-                      compiled_fn, event_filter_regex=event_filter_regex
-                  ),
-                  initialized_args,
-              )
+              executor_args[config] = (compiled_fn, initialized_args)
             except Exception as e:  # pylint: disable=broad-exception-caught
               vlog_exc_info("Config failed to compile: %s", config)
               results[config] = e
@@ -180,14 +173,7 @@ class Autotuner:
             results[config] = e
     else:
       for config in configs:
-        executor_args[config] = (
-            _benchmark,
-            fn_factory,
-            config,
-            args,
-            kwargs,
-            event_filter_regex,
-        )
+        executor_args[config] = (_benchmark, fn_factory, config, args, kwargs)
 
     with executor:
       future_to_config = {

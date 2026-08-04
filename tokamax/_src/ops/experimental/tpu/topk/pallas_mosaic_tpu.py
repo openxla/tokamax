@@ -14,8 +14,7 @@
 # ==============================================================================
 """Pallas/Mosaic kernel wrapper for TopK on TPU."""
 
-import dataclasses
-from typing import ClassVar
+from typing import ClassVar, override
 
 import jax
 import jax.numpy as jnp
@@ -25,7 +24,6 @@ import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.tpu.topk import base
 from tokamax._src.ops.experimental.tpu.topk import pallas_mosaic_tpu_kernel
-from typing_extensions import override
 
 
 @pydantic.dataclasses.dataclass(frozen=True)

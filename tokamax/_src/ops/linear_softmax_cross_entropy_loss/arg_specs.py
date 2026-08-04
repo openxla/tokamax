@@ -32,6 +32,7 @@ def _create_arg_spec(
     x_dtype: jax.typing.DTypeLike,
     w_dtype: jax.typing.DTypeLike,
     project: str = '',
+    tags: tuple[arg_spec.Tag, ...] = (),
 ) -> arg_spec.ArgSpec:
   return arg_spec.ArgSpec(
       dict(
@@ -41,6 +42,7 @@ def _create_arg_spec(
           reduction=reduction,
       ),
       project=project,
+      tags=tags,
   )
 
 
@@ -54,6 +56,13 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
             x_dtype=x_dtype,
             w_dtype=jnp.bfloat16,
             project='qwen3-8b',
+            tags=(
+                ('primary',)
+                if batch_dim == 1024
+                and reduction == 'mean'
+                and x_dtype == jnp.bfloat16
+                else ()
+            ),
         )
         for batch_dim, reduction, x_dtype in itertools.product(
             [1024, 2048, 4096, 16384, 32768, 131072],
@@ -102,6 +111,13 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
             x_dtype=x_dtype,
             w_dtype=jnp.bfloat16,
             project='llama3.1-8b',
+            tags=(
+                ('primary',)
+                if batch_dim == 1024
+                and reduction == 'mean'
+                and x_dtype == jnp.bfloat16
+                else ()
+            ),
         )
         for batch_dim, reduction, x_dtype in itertools.product(
             [1024, 2048, 4096, 16384, 32768, 131072],

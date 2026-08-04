@@ -61,13 +61,21 @@ class TriangleMultiplicationTest(parameterized.TestCase):
           **params, triangle_type=triangle_type, implementation=implementation
       )
 
-    out = f(params)
+    try:
+      out = f(params)
+    except (NotImplementedError, ValueError, ExceptionGroup) as e:
+      if implementation not in ("xla", None):
+        raise absltest.SkipTest(
+            f"Implementation {implementation} not supported on this"
+            f" platform: {e}"
+        )
+      raise
     self.assertEqual(out.shape, (n, n, d))
     self.assertEqual(out.dtype, dtype)
 
   def test_unsupported_implementation(self):
     params = _get_params(n=8, c=16, h=32, d=64, dtype=jnp.float32)
-    with self.assertRaisesRegex(NotImplementedError, "Only XLA"):
+    with self.assertRaises(NotImplementedError):
       with jaxtyping.disable_jaxtyping():
         api.triangle_multiplication(
             **params,

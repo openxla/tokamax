@@ -15,10 +15,11 @@
 """Autotuning API."""
 
 from collections.abc import Callable, Mapping
+from concurrent import futures
 import dataclasses
 import inspect
 import json
-from typing import Annotated, Any, Final, ParamSpec, Self, Sequence, TypeAlias, cast
+from typing import Annotated, Any, Final, Self, Sequence, cast
 
 from absl import logging
 import immutabledict
@@ -41,9 +42,15 @@ from tokamax._src.ops.normalization import api as normalization_api
 from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
+from tokamax._src.ops.ragged_gather import api as ragged_gather_api
+from tokamax._src.ops.ragged_gather import base as ragged_gather_base
+from tokamax._src.ops.ragged_gather_reduce import api as ragged_gather_reduce_api
+from tokamax._src.ops.ragged_gather_reduce import base as ragged_gather_reduce_base
+from tokamax._src.ops.ragged_scatter import api as ragged_scatter_api
+from tokamax._src.ops.ragged_scatter import base as ragged_scatter_base
 import tqdm
 
-BoundArgsAutotuningData: TypeAlias = tuple[
+type BoundArgsAutotuningData = tuple[
     op_lib.BoundArguments, autotuner.AutotuningData[Any]
 ]
 
@@ -62,7 +69,9 @@ def _serialize_bound_args_autotuning_data(
   return ba_data, data
 
 
-def _validate_bound_args_autotuning_data(value: Any) -> BoundArgsAutotuningData:
+def _validate_bound_args_autotuning_data(
+    value: Any,
+) -> BoundArgsAutotuningData:
   ba, data = value
   if isinstance(ba, op_lib.BoundArguments):
     assert isinstance(data, autotuner.AutotuningData)
@@ -187,17 +196,16 @@ class AutotuningResult:
 
 _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
 _BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_lib.BoundArguments)
-_P = ParamSpec("_P")
 
 
-def get_bound_args(
+def get_bound_args[**P](
     f: (
-        Callable[_P, Any]
+        Callable[P, Any]
         | hlo_utils.HloComputation
     ),
-    *args: _P.args,
-    **kwargs: _P.kwargs,
-) -> tuple[op_lib.BoundArguments, ...]:
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> tuple[op_lib.BoundArguments, ...]:  # pytype: disable=not-supported-yet
   """Returns a tuple of unique BoundArguments for all Tokamax ops in `f`.
 
   Args:
@@ -246,13 +254,13 @@ def dump_bound_args_to_json(bound_args: Sequence[op_lib.BoundArguments]) -> str:
   return json.dumps(json_list, indent=2)
 
 
-def bound_args_to_json(
+def bound_args_to_json[**P](
     f: (
         Callable[[], Any]
         | jax.stages.Lowered
     ),
     filename: str,
-) -> None:
+) -> None:  # pytype: disable=not-supported-yet
   """Dumps a sequence of BoundArguments to a JSON file."""
   bound_args = get_bound_args(f)  # pyrefly: ignore[invalid-param-spec]
   json_string = dump_bound_args_to_json(bound_args)
@@ -278,8 +286,13 @@ _API_IMPLEMENTATIONS: Final[
     normalization_base.Normalization: normalization_api.IMPLEMENTATIONS,
     glu_base.GatedLinearUnit: glu_api.IMPLEMENTATIONS,
     ragged_dot_base.RaggedDot: ragged_dot_api.IMPLEMENTATIONS,
+    ragged_scatter_base.RaggedScatter: ragged_scatter_api.IMPLEMENTATIONS,
     attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,
     mla_base.MultiHeadLatentAttention: mla_api.IMPLEMENTATIONS,
+    ragged_gather_base.RaggedGather: ragged_gather_api.IMPLEMENTATIONS,
+    ragged_gather_reduce_base.RaggedGatherReduce: (
+        ragged_gather_reduce_api.IMPLEMENTATIONS
+    ),
 })
 
 
@@ -315,7 +328,8 @@ def autotune(
     ignore_cache: bool = False,
     all_implementations: bool = False,
     progress_bar: bool = True,
-    event_filter_regex: str | None = None,
+    timeout: float | None = None,
+    max_workers: int | None = None,
 ) -> AutotuningResult:
   """Autotunes all captured ops in x.
 
@@ -329,9 +343,9 @@ def autotune(
     all_implementations: Whether to autotune all implementations of the op that
       is tunable on the current device.
     progress_bar: Whether to show a progress bar (default: `True`).
-    event_filter_regex: Reported timing sums all XLA operations in `f` by
-      default. This regex enables filtering by specific event names to report
-      timing for just a subset of events that match the pattern.
+    timeout: Time limit in seconds for autotuning.
+    max_workers: Maximum number of worker threads for parallel compilation
+      during autotuning.
 
   Returns:
     An `AutotuningResult` object of the autotuned ops.
@@ -376,12 +390,22 @@ def autotune(
         postfix={"Total microbenchmarks": sum(map(num_configs, bound_args))},
     )
 
+  custom_autotuner = autotuner.Autotuner()
+  if max_workers is not None:
+    custom_autotuner = autotuner.Autotuner(
+        compile_executor_fn=lambda: futures.ThreadPoolExecutor(
+            max_workers=max_workers
+        )
+    )
+
   for bound_arg in bound_args:
     try:
       data.append((
           bound_arg,
           bound_arg.autotune(
-              event_filter_regex=event_filter_regex, cache_results=False
+              cache_results=False,
+              timeout=timeout,
+              autotuner=custom_autotuner,
           ),
       ))
     except Exception:  # pylint: disable=broad-exception-caught

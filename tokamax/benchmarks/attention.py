@@ -30,8 +30,8 @@ from tokamax._src import numerics
 from tokamax.benchmarks import common
 
 try:
-  import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
-except Exception:  # pylint: disable=broad-except
+  import cuequivariance_jax  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+except ImportError:
   cuequivariance_jax = None
 
 
@@ -87,16 +87,11 @@ def setUpModule():  # pylint: disable=invalid-name
 
   metadata: dict[str, str] = {}
   if jax.default_backend() == 'gpu':
-    try:
-      cudnn_version = jax._src.lib.cuda_versions.cudnn_get_version()  # pylint: disable=protected-access
-      metadata['cudnn_version'] = str(cudnn_version)
-    except AttributeError:
-      pass
+    if (cuda_versions := jax._src.lib.cuda_versions) is not None:  # pylint: disable=protected-access
+      metadata['cudnn_version'] = str(cuda_versions.cudnn_get_version())
 
-    try:
+    if cuequivariance_jax is not None:
       metadata['cuequivariance_version'] = cuequivariance_jax.__version__
-    except AttributeError:
-      pass
 
   if metadata:
     with open(os.path.join(metadata_dir, 'workload_info.json'), 'w') as f:

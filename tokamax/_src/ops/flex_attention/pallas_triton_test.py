@@ -13,12 +13,13 @@
 # limitations under the License.
 # ==============================================================================
 
+from typing import override
 from absl.testing import absltest
 import jax
 from tokamax._src.ops.flex_attention import pallas_triton
 from tokamax._src.ops.flex_attention import test_base
 from tokamax._src.ops.flex_attention import wrapper_test_base
-from typing_extensions import override
+
 import pytest
 
 

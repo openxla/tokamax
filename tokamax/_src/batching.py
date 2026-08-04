@@ -17,15 +17,14 @@
 from collections.abc import Callable, Sequence
 import functools
 import inspect
-from typing import Any, TypeVar, TypeVarTuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src import utils
 
-_Ts = TypeVarTuple('_Ts')
-_T = TypeVar('_T')
+
 _zip = functools.partial(zip, strict=True)
 
 
@@ -37,13 +36,13 @@ def _broadcast_prefix(prefix_tree, full_tree):
   return result
 
 
-def vmap_maybe_bcast(
-    f: Callable[[*_Ts], _T], in_axes: Any
-) -> Callable[[*_Ts], _T]:
+def vmap_maybe_bcast[*Ts, R](
+    f: Callable[[*Ts], R], in_axes: Any
+) -> Callable[[*Ts], R]:
   """`vmap`s `f` over (possibly broadcast) axes of its arguments."""
 
   @functools.wraps(f)
-  def vmapped(*args: *tuple[*_Ts]) -> _T:  # pylint: disable=g-one-element-tuple
+  def vmapped(*args: *tuple[*Ts]) -> R:  # pylint: disable=g-one-element-tuple
     in_axes_flat = _broadcast_prefix(in_axes, args)
     args_flat, args_tree = jax.tree.flatten(args)
 
@@ -74,13 +73,13 @@ def _split_dim(x, axis, num_parts):
   return x.reshape(shape)
 
 
-def vmap_split(
-    f: Callable[[*_Ts], _T], in_axes: Any, *, num_parts: int
-) -> Callable[[*_Ts], _T]:
+def vmap_split[*Ts, R](
+    f: Callable[[*Ts], R], in_axes: Any, *, num_parts: int
+) -> Callable[[*Ts], R]:
   """`vmap`s `f` over (possibly broadcast) parts of axes of its arguments."""
 
   @functools.wraps(f)
-  def vmapped(*args: *tuple[*_Ts]) -> _T:  # pylint: disable=g-one-element-tuple
+  def vmapped(*args: *tuple[*Ts]) -> R:  # pylint: disable=g-one-element-tuple
     in_axes_flat = _broadcast_prefix(in_axes, args)
     args_flat, args_tree = jax.tree.flatten(args)
 

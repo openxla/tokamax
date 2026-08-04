@@ -18,7 +18,7 @@ from functools import partial
 from typing import Literal
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Integer, Real, Scalar
+from jaxtyping import Array, Integer, Real  # pylint: disable=g-multiple-import
 
 
 @partial(jax.jit, static_argnames=["reduction"])
@@ -27,44 +27,53 @@ def linear_softmax_cross_entropy_loss_fwd_reference(
     labels: Integer[Array, "B"],
     w: Real[Array, "H V"],
     *,
-    reduction: Literal["sum", "mean"] = "sum",
-) -> tuple[Real[Scalar, ""], Real[Scalar, ""]]:
+    reduction: Literal["sum", "mean", "none"] = "sum",
+) -> tuple[Real[Array, "*"], Real[Array, "B"]]:
   """The reference Jax implementation of the linear softmax cross-entropy loss."""
   logits = x @ w
   log_probs = jax.nn.log_softmax(logits, axis=-1)
   labels_one_hot = jax.nn.one_hot(labels, num_classes=w.shape[1], dtype=x.dtype)
   loss = -labels_one_hot * log_probs
   lse = jax.nn.logsumexp(logits, axis=-1)
+  loss_per_sample = jnp.sum(loss, axis=-1, dtype=jnp.float32)
 
   if reduction == "sum":
-    return jnp.sum(loss, dtype=jnp.float32), lse
+    return jnp.sum(loss_per_sample, dtype=jnp.float32), lse
   elif reduction == "mean":
-    num_tokens = x.shape[0]
-    mean_loss = jnp.sum(loss, dtype=jnp.float32) / num_tokens
-    return mean_loss, lse
+    return jnp.mean(loss_per_sample, dtype=jnp.float32), lse
+  elif reduction == "none":
+    return loss_per_sample, lse
   else:
     raise ValueError(f"Unsupported reduction method: {reduction}")
 
 
 @partial(jax.jit, static_argnames=["reduction"])
 def linear_softmax_cross_entropy_loss_bwd_reference(
-    dout: Real[Array, ""],
+    dout: Real[Array, "*"],
     lse: Real[Array, "B"],
     x: Real[Array, "B H"],
     labels: Integer[Array, "B"],
     w: Real[Array, "H V"],
     *,
-    reduction: Literal["sum", "mean"] = "sum",
+    reduction: Literal["sum", "mean", "none"] = "sum",
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """The reference Jax implementation of the linear softmax cross-entropy loss backward kernel."""
   labels_one_hot = jax.nn.one_hot(labels, num_classes=w.shape[1], dtype=x.dtype)
   s = -labels_one_hot + jnp.exp(x @ w - lse[:, None])
-  x_grad = s @ w.T
-  w_grad = x.T @ s
   num_tokens = x.shape[0]
 
-  if reduction == "mean":
-    x_grad /= num_tokens
-    w_grad /= num_tokens
+  if reduction == "none":
+    s_scaled = s * dout[:, None]
+    x_grad = s_scaled @ w.T
+    w_grad = x.T @ s_scaled
+  elif reduction == "mean":
+    scale = dout / num_tokens
+    x_grad = (s @ w.T) * scale
+    w_grad = (x.T @ s) * scale
+  elif reduction == "sum":
+    x_grad = (s @ w.T) * dout
+    w_grad = (x.T @ s) * dout
+  else:
+    raise ValueError(f"Unsupported reduction method: {reduction}")
 
-  return dout * x_grad, dout * w_grad
+  return x_grad, w_grad

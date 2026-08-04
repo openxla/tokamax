@@ -158,13 +158,13 @@ def _compute_stages(
     block_n: int,
     cluster_size: int,
     block_k: int,
-    x_dtype: jnp.dtype,
-    w_dtype: jnp.dtype,
-    ws_dtype: jnp.dtype,
-    xs_dtype: jnp.dtype,
-    xsum_dtype: jnp.dtype,
-    acc_dtype: jnp.dtype,
-    out_dtype: jnp.dtype,
+    x_dtype: jax.typing.DTypeLike,
+    w_dtype: jax.typing.DTypeLike,
+    ws_dtype: jax.typing.DTypeLike,
+    xs_dtype: jax.typing.DTypeLike,
+    xsum_dtype: jax.typing.DTypeLike,
+    acc_dtype: jax.typing.DTypeLike,
+    out_dtype: jax.typing.DTypeLike,
     deq_wg: int,
 ) -> tuple[int, int, int, int]:
   """Compute the number of stages for each type of data."""
@@ -362,7 +362,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         "epilogue_quant_qtype and epilogue_quant_subchannel_size must be set"
         " together."
     )
-  if epilogue_quant_enabled:
+  if epilogue_quant_subchannel_size is not None:
     if epilogue_quant_subchannel_size != block_n:
       raise NotImplementedError(
           "Fused output quantization requires subchannel == block_n"
@@ -447,15 +447,15 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
   expected_d = k_x // tile_k
 
   if scales.shape[1] == 2 * expected_d:
+    tile_xk = k_x // expected_d
     scales = scales.mT
     x_scales, x_sum = jnp.split(scales, 2, axis=0)
   else:
+    tile_xk = k_x // scales.shape[1]
     x_scales = scales.mT
     x_sum = (
-        x.astype(jnp.float32).reshape(m, -1, block_k).sum(-1).swapaxes(-1, -2)
+        x.astype(jnp.float32).reshape(m, -1, tile_xk).sum(-1).swapaxes(-1, -2)
     )
-
-  tile_xk = k_x // x_scales.shape[0]
 
   # The activation subchannel may be finer than the weight subchannel, as long as
   # it divides it and each block_k tile stays within one activation subchannel.
@@ -469,11 +469,13 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         f"tile_xk must be a multiple of block_k, got: {tile_xk=} {block_k=}."
     )
 
-  m_iters = pl.cdiv(m, cluster_block_m) + num_groups - 1
   n_iters = pl.cdiv(n, cluster_block_n)
   align_tile = 8
   group_info = common.GroupInfo.create_aligned(
-      group_sizes, cluster_block_m, m_iters, align_tile
+      group_sizes,
+      cluster_block_m,
+      pl.cdiv(m, cluster_block_m) + num_groups - 1,
+      align_tile,
   )
   def kernel(*refs, scoped):
     # Epilogue mode appends an out-scales output; it is the LAST ref/buffer.
@@ -489,6 +491,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         start_within_block_gmem,
         actual_size_gmem,
         block_start_gmem,
+        m_iters_gmem,
         out_gmem,
     ) = refs
     (
@@ -519,15 +522,17 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         acc_ready_barrier,
         acc_consumed_barrier,
     ) = barriers
-
+    m_iters = plgpu.load(m_iters_gmem, layout=plgpu.Layout.WG_SPLAT)
+    linear_grid = m_iters * n_iters
     m, k = x_gmem.shape
     num_k_iters = pl.cdiv(k, block_k)
     cluster_idx = lax.axis_index("x")
     is_lead_block = cluster_idx == 0
 
-    @plgpu.nd_loop((m_iters * n_iters,), collective_axes=("sm",), init_carry=0)
-    def mn_loop(loop_info: plgpu.NDLoopInfo, carry):
+    @plgpu.nd_loop((linear_grid,), collective_axes=("sm",))
+    def mn_loop(loop_info: plgpu.NDLoopInfo):
       (lin_idx,) = loop_info.index
+      local_index = loop_info.local_index
       tid_m, tid_n = plgpu.planar_snake(
           lin_idx,
           (m_iters, n_iters),
@@ -543,328 +548,322 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
       slice_n = pl.ds(tid_n * cluster_block_n + cluster_idx * block_n, block_n)
       wg = jax.lax.axis_index("wg")
 
-      @pl.when(actual_size > 0)
-      def _body():
-        @pl.when(wg == _MAIN_WG)
-        def _mma_tma_wg():
-          kernel_config.set_max_registers(kernel_config.main_wg_regs)
+      @pl.when(wg == _MAIN_WG)
+      def _mma_tma_wg():
+        kernel_config.set_max_registers(kernel_config.main_wg_regs)
 
-          @plgpu.warp_map
-          def _per_warp(warp_id):
-            if jax.__version_info__ < (0, 10, 0):
-              warp_id = lax.rem(warp_id, 4)
+        @plgpu.warp_map
+        def _per_warp(warp_id):
+          if jax.__version_info__ < (0, 10, 0):
+            warp_id = lax.rem(warp_id, 4)
 
-            @pl.when(warp_id == _X_TMA_WARP)
-            def x_tma_warp():
-              def do_tma_x(ki, slot):
-                plgpu.copy_gmem_to_smem(
-                    x_gmem.at[
-                        slice_m,
-                        pl.ds(ki * block_k, block_k),
-                    ],
-                    x_smem.at[slot],
-                    x_barrier.at[slot],
-                    leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
-                    if collective
-                    else None,
-                    collective_axes="x" if collective else None,
-                )
-
-              @pl.loop(0, num_k_iters)
-              def _x_tma_loop(ki):
-                global_ki = ki + carry * num_k_iters
-                slot = lax.rem(global_ki, data_stages)
-
-                @pl.when(global_ki >= data_stages)
-                def _wait_x_consumed():
-                  plgpu.barrier_wait(x_consumed_barrier.at[slot])
-
-                do_tma_x(ki, slot)
-
-            @pl.when(warp_id == _W_TMA_WARP)
-            def w_tma_warp():
-
-              @pl.loop(0, num_k_iters)
-              def loop_body(ki):
-                global_ki = ki + carry * num_k_iters
-                slot = lax.rem(global_ki, data_stages)
-
-                @pl.when(global_ki >= data_stages)
-                def _wait_w_consumed():
-                  plgpu.barrier_wait(w_consumed_barrier.at[slot])
-
-                # For 2CTA we still use a non-collective due to dequantization
-                plgpu.copy_gmem_to_smem(
-                    w_gmem.at[group_id, slice_n, pl.ds(ki * block_k, block_k)],
-                    w_smem.at[slot],
-                    w_barrier.at[slot],
-                )
-
-            @pl.when(warp_id == _SCALE_TMA_WARP)
-            def ws_tma_warp():
-
-              def do_tma_ws(ki, slot):
-                plgpu.copy_gmem_to_smem(
-                    w_scales_gmem.at[
-                        group_id,
-                        lax.div((ki * block_k), tile_k),
-                        slice_n,
-                    ],
-                    ws_smem.at[slot],
-                    xws_barrier.at[slot],
-                )
-
-              def do_tma_xs(ki, slot):
-                plgpu.copy_gmem_to_smem(
-                    x_scales_gmem.at[
-                        lax.div(block_k * ki, tile_xk),
-                        pl.ds(block_start, max(cluster_block_m, 64)),
-                    ],
-                    xs_smem.at[slot],
-                    xws_barrier.at[slot],
-                )
-                plgpu.copy_gmem_to_smem(
-                    x_sum_gmem.at[
-                        ki,
-                        pl.ds(block_start, max(cluster_block_m, 64)),
-                    ],
-                    x_sum_smem.at[slot],
-                    xws_barrier.at[slot],
-                )
-
-              @pl.loop(0, num_k_iters)
-              def _tma_ws_loop(ki):
-                global_ki = ki + carry * num_k_iters
-                slot = lax.rem(global_ki, scale_stages)
-
-                @pl.when(global_ki >= scale_stages)
-                def _():
-                  plgpu.barrier_wait(xws_consumed_barrier.at[slot])
-
-                do_tma_ws(ki, slot)
-                do_tma_xs(ki, slot)
-
-            @pl.when((warp_id == _MMA_WARP) & is_lead_block)
-            def mma_warp():
-
-              @pl.loop(0, num_k_iters)
-              def do_mma(ki):
-                global_ki = ki + carry * num_k_iters
-                x_slot = lax.rem(global_ki, data_stages)
-                w_slot = lax.rem(global_ki, deq_stages)
-                acc_slot = lax.rem(global_ki, acc_stages)
-
-                @pl.when(global_ki >= acc_stages)
-                def _():
-                  with jax.named_scope("wait_acc_consumed"):
-                    plgpu.barrier_wait(acc_consumed_barrier.at[acc_slot])
-
-                with jax.named_scope("wait_x_tma"):
-                  plgpu.barrier_wait(x_barrier.at[x_slot])
-                with jax.named_scope("wait_w_deq"):
-                  plgpu.barrier_wait(w_tmem_ready_barrier.at[w_slot])
-
-                acc_slice = pl.ds(acc_slot * cluster_block_m, cluster_block_m)
-
-                plgpu.tcgen05_mma(
-                    acc_tmem.at[:, acc_slice],
-                    w_tmem.at[:, pl.ds(w_slot * block_k, block_k)],
-                    x_smem.at[x_slot].T,
-                    w_tmem_consumed_barrier.at[w_slot],
-                    accumulate=False,
-                    collective_axis="x" if collective else None,
-                )
-                plgpu.tcgen05_commit_arrive(
-                    acc_ready_barrier.at[acc_slot],
-                    collective_axis="x" if collective else None,
-                )
-
-                plgpu.tcgen05_commit_arrive(
-                    x_consumed_barrier.at[x_slot],
-                    collective_axis="x" if collective else None,
-                )
-
-        @pl.when(wg < _DEQ_WG)
-        def _deq_wg():
-          kernel_config.set_max_registers(kernel_config.deq_wg_regs)
-
-          @pl.loop(wg, num_k_iters, step=_DEQ_WG)
-          def _dequantize(ki):
-            with jax.named_scope("indices"):
-              global_ki = ki + carry * num_k_iters
-              data_slot = lax.rem(global_ki, data_stages)
-              w_slot = lax.rem(global_ki, deq_stages)
-            with jax.named_scope("wait_w_tma"):
-              plgpu.barrier_wait(w_barrier.at[data_slot])
-
-            tile_d = min(256, block_k)
-            for di in range(block_k // tile_d):
-              with jax.named_scope("load_w_smem"):
-                w = plgpu.load(
-                    w_smem.at[data_slot, :, pl.ds(di * tile_d, tile_d)],
-                    (),
-                    layout=_TMEM(8),
-                    optimized=False,
-                )
-              if di == block_k // tile_d - 1:
-                mgpu_lib.fence_async_shared_cta()
-                plgpu.barrier_arrive(w_consumed_barrier.at[data_slot])
-
-              with jax.named_scope("dequant"):
-                w = mgpu_lib.int4_as_biased_f8e4m3fn(w, _TMEM(8))
-              w = plgpu.layout_cast(w, _TMEM(4))
-              if di == 0:
-
-                @pl.when((global_ki >= deq_stages))
-                def _():
-                  plgpu.barrier_wait(w_tmem_consumed_barrier.at[w_slot])
-
-              with jax.named_scope("store"):
-                plgpu.async_store_tmem(
-                    w_tmem.at[:, pl.ds(w_slot * block_k + di * tile_d, tile_d)],
-                    w,
-                )
-            plgpu.commit_tmem()
-            with jax.named_scope("arrive"):
-              plgpu.barrier_arrive(w_tmem_ready_barrier.at[w_slot])
-
-        @pl.when(wg == _STORE_WG)
-        def _store_wg():
-          kernel_config.set_max_registers(kernel_config.store_wg_regs)
-          acc_dtype = jnp.float32
-          acc_carry = plgpu.layout_cast(
-              jnp.zeros((block_n, cluster_block_m), dtype=acc_dtype),
-              _TCGEN05,
-          )
-
-          def _loop_body(ki, acc_carry):
-            global_ki = ki + carry * num_k_iters
-            scale_slot = lax.rem(global_ki, scale_stages)
-            acc_slot = lax.rem(global_ki, acc_stages)
-
-            with jax.named_scope("wait_scales"):
-              plgpu.barrier_wait(xws_barrier.at[scale_slot])
-            with jax.named_scope("[scale]load"):
-              ws = plgpu.load(
-                  ws_smem.at[scale_slot],
-                  (),
-                  layout=_TCGEN05_ROW,
-                  optimized=True,
-              ).astype(acc_dtype)
-              x_scale = plgpu.load(
-                  xs_smem,
-                  (scale_slot, pl.ds(0, cluster_block_m)),
-                  layout=_TCGEN05_COL,
-                  optimized=True,
-              ).astype(acc_dtype)
-
-              x_sum = plgpu.load(
-                  x_sum_smem,
-                  (scale_slot, pl.ds(0, cluster_block_m)),
-                  layout=_TCGEN05_COL,
-                  optimized=True,
-              ).astype(acc_dtype)
-            mgpu_lib.fence_async_shared_cta()
-            plgpu.barrier_arrive(xws_consumed_barrier.at[scale_slot])
-            with jax.named_scope("wait_acc_ready"):
-              plgpu.barrier_wait(acc_ready_barrier.at[acc_slot])
-            with jax.named_scope("load_acc"):
-              acc_slice = pl.ds(acc_slot * cluster_block_m, cluster_block_m)
-              acc = plgpu.async_load_tmem(acc_tmem.at[:, acc_slice])
-              plgpu.wait_load_tmem()
-            plgpu.barrier_arrive(acc_consumed_barrier.at[acc_slot])
-
-            with jax.named_scope("rescale_acc"):
-              int_bias = plgpu.layout_cast(
-                  lax.broadcast_in_dim(-8 * x_sum, acc.shape, [1]),
-                  _TCGEN05,
-              )
-              acc = acc * 512 + int_bias
-              return rescale_tcgen05_acc(
-                  acc_carry,
-                  acc,
-                  ws,
-                  x_scale,
+          @pl.when(warp_id == _X_TMA_WARP)
+          def x_tma_warp():
+            def do_tma_x(ki, slot):
+              plgpu.copy_gmem_to_smem(
+                  x_gmem.at[
+                      slice_m,
+                      pl.ds(ki * block_k, block_k),
+                  ],
+                  x_smem.at[slot],
+                  x_barrier.at[slot],
+                  leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+                  if collective
+                  else None,
+                  collective_axes="x" if collective else None,
               )
 
-          acc_carry = lax.fori_loop(0, num_k_iters, _loop_body, acc_carry)
-          if activation is not None:
-            acc_carry = activation(acc_carry)
+            @pl.loop(0, num_k_iters)
+            def _x_tma_loop(ki):
+              global_ki = ki + local_index * num_k_iters
+              slot = lax.rem(global_ki, data_stages)
 
-          with jax.named_scope("acc -> SMEM"):
-            if not epilogue_quant_enabled:
-              out_smem.T[...] = plgpu.layout_cast(
-                  acc_carry.astype(out_smem.dtype),
-                  plgpu.Layout.TCGEN05_TRANSPOSED,
-              )
-            else:
-              assert out_scales_smem is not None
-              quant_t_dtype = jnp.float32
-              qmax = float(jnp.finfo(epilogue_quant_dtype).max)
-              acc_t = plgpu.layout_cast(
-                  acc_carry.astype(quant_t_dtype), _TCGEN05_TRANSPOSED
-              )
-              absmax = jnp.abs(acc_t).max(axis=0).astype(jnp.float32)  # [m]
-              out_scale = jnp.where(
-                  absmax == 0.0, jnp.array(1.0, absmax.dtype), absmax / qmax
-              )
-              # Round the scale to its storage dtype once and divide by exactly
-              # that value, so q * stored_scale round-trips.
-              out_scale_q = out_scale.astype(out_scales_smem.dtype)
-              inv = plgpu.layout_cast(
-                  lax.broadcast_in_dim(
-                      1.0 / out_scale_q.astype(jnp.float32),
-                      acc_carry.shape,
-                      [1],
-                  ),
-                  _TCGEN05_TRANSPOSED,
-              )
-              q = acc_t.astype(jnp.float32) * inv
-              q = jnp.clip(q, -qmax, qmax)
-              out_smem.T[...] = q.astype(epilogue_quant_dtype)
-              out_scales_smem[...] = out_scale_q
-            plgpu.commit_smem()
+              @pl.when(global_ki >= data_stages)
+              def _wait_x_consumed():
+                plgpu.barrier_wait(x_consumed_barrier.at[slot])
 
-          with jax.named_scope("SMEM -> GMEM"):
-            if epilogue_quant_enabled:
-              # Scatter scales before value TMA to overlap GMEM stores.
-              scale_col = lax.div(
-                  tid_n * cluster_block_n + cluster_idx * block_n,
-                  epilogue_quant_subchannel_size,
-              )
-              _write_scales_to_gmem(
-                  out_scales_gmem,
-                  out_scales_smem,
-                  actual_size,
-                  start_within_block,
-                  scale_col,
-                  block_start,
-                  cluster_block_m,
-              )
-            # Write out the largest power of two rows first,
-            # then the next largest, etc.
-            # This allows us to coalesce writes as much as possible.
-            offset = start_within_block
-            size = 1 << (min(cluster_block_m, m).bit_length() - 1)
-            while size > 0:
+              do_tma_x(ki, slot)
 
-              @pl.when(actual_size & size != 0)
+          @pl.when(warp_id == _W_TMA_WARP)
+          def w_tma_warp():
+
+            @pl.loop(0, num_k_iters)
+            def loop_body(ki):
+              global_ki = ki + local_index * num_k_iters
+              slot = lax.rem(global_ki, data_stages)
+
+              @pl.when(global_ki >= data_stages)
+              def _wait_w_consumed():
+                plgpu.barrier_wait(w_consumed_barrier.at[slot])
+
+              # For 2CTA we still use a non-collective due to dequantization
+              plgpu.copy_gmem_to_smem(
+                  w_gmem.at[group_id, slice_n, pl.ds(ki * block_k, block_k)],
+                  w_smem.at[slot],
+                  w_barrier.at[slot],
+              )
+
+          @pl.when(warp_id == _SCALE_TMA_WARP)
+          def ws_tma_warp():
+
+            def do_tma_ws(ki, slot):
+              plgpu.copy_gmem_to_smem(
+                  w_scales_gmem.at[
+                      group_id,
+                      lax.div((ki * block_k), tile_k),
+                      slice_n,
+                  ],
+                  ws_smem.at[slot],
+                  xws_barrier.at[slot],
+              )
+
+            def do_tma_xs(ki, slot):
+              plgpu.copy_gmem_to_smem(
+                  x_scales_gmem.at[
+                      lax.div(block_k * ki, tile_xk),
+                      pl.ds(block_start, max(cluster_block_m, 64)),
+                  ],
+                  xs_smem.at[slot],
+                  xws_barrier.at[slot],
+              )
+              plgpu.copy_gmem_to_smem(
+                  x_sum_gmem.at[
+                      lax.div(block_k * ki, tile_xk),
+                      pl.ds(block_start, max(cluster_block_m, 64)),
+                  ],
+                  x_sum_smem.at[slot],
+                  xws_barrier.at[slot],
+              )
+
+            @pl.loop(0, num_k_iters)
+            def _tma_ws_loop(ki):
+              global_ki = ki + local_index * num_k_iters
+              slot = lax.rem(global_ki, scale_stages)
+
+              @pl.when(global_ki >= scale_stages)
               def _():
-                out_smem_slice = out_smem.at[pl.ds(offset, size)]
-                o_gref_slice = out_gmem.at[
-                    pl.ds(block_start + offset, size),
-                    slice_n,
-                ]
-                plgpu.copy_smem_to_gmem(
-                    out_smem_slice, o_gref_slice, commit_group=False
-                )
+                plgpu.barrier_wait(xws_consumed_barrier.at[slot])
 
-              offset += actual_size & size
-              size //= 2
-            plgpu.commit_smem_to_gmem_group()
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+              do_tma_ws(ki, slot)
+              do_tma_xs(ki, slot)
 
-      return carry + (actual_size > 0)
+          @pl.when((warp_id == _MMA_WARP) & is_lead_block)
+          def mma_warp():
+
+            @pl.loop(0, num_k_iters)
+            def do_mma(ki):
+              global_ki = ki + local_index * num_k_iters
+              x_slot = lax.rem(global_ki, data_stages)
+              w_slot = lax.rem(global_ki, deq_stages)
+              acc_slot = lax.rem(global_ki, acc_stages)
+
+              @pl.when(global_ki >= acc_stages)
+              def _():
+                with jax.named_scope("wait_acc_consumed"):
+                  plgpu.barrier_wait(acc_consumed_barrier.at[acc_slot])
+
+              with jax.named_scope("wait_x_tma"):
+                plgpu.barrier_wait(x_barrier.at[x_slot])
+              with jax.named_scope("wait_w_deq"):
+                plgpu.barrier_wait(w_tmem_ready_barrier.at[w_slot])
+
+              acc_slice = pl.ds(acc_slot * cluster_block_m, cluster_block_m)
+
+              plgpu.tcgen05_mma(
+                  acc_tmem.at[:, acc_slice],
+                  w_tmem.at[:, pl.ds(w_slot * block_k, block_k)],
+                  x_smem.at[x_slot].T,
+                  w_tmem_consumed_barrier.at[w_slot],
+                  accumulate=False,
+                  collective_axis="x" if collective else None,
+              )
+              plgpu.tcgen05_commit_arrive(
+                  acc_ready_barrier.at[acc_slot],
+                  collective_axis="x" if collective else None,
+              )
+
+              plgpu.tcgen05_commit_arrive(
+                  x_consumed_barrier.at[x_slot],
+                  collective_axis="x" if collective else None,
+              )
+
+      @pl.when(wg < _DEQ_WG)
+      def _deq_wg():
+        kernel_config.set_max_registers(kernel_config.deq_wg_regs)
+
+        @pl.loop(wg, num_k_iters, step=_DEQ_WG)
+        def _dequantize(ki):
+          with jax.named_scope("indices"):
+            global_ki = ki + local_index * num_k_iters
+            data_slot = lax.rem(global_ki, data_stages)
+            w_slot = lax.rem(global_ki, deq_stages)
+          with jax.named_scope("wait_w_tma"):
+            plgpu.barrier_wait(w_barrier.at[data_slot])
+
+          tile_d = min(256, block_k)
+          for di in range(block_k // tile_d):
+            with jax.named_scope("load_w_smem"):
+              w = plgpu.load(
+                  w_smem.at[data_slot, :, pl.ds(di * tile_d, tile_d)],
+                  layout=_TMEM(8),
+                  optimized=False,
+              )
+            if di == block_k // tile_d - 1:
+              mgpu_lib.fence_async_shared_cta()
+              plgpu.barrier_arrive(w_consumed_barrier.at[data_slot])
+
+            with jax.named_scope("dequant"):
+              w = mgpu_lib.int4_as_biased_f8e4m3fn(w, _TMEM(8))
+            w = plgpu.layout_cast(w, _TMEM(4))
+            if di == 0:
+
+              @pl.when((global_ki >= deq_stages))
+              def _():
+                plgpu.barrier_wait(w_tmem_consumed_barrier.at[w_slot])
+
+            with jax.named_scope("store"):
+              plgpu.async_store_tmem(
+                  w_tmem.at[:, pl.ds(w_slot * block_k + di * tile_d, tile_d)],
+                  w,
+              )
+          plgpu.commit_tmem()
+          with jax.named_scope("arrive"):
+            plgpu.barrier_arrive(w_tmem_ready_barrier.at[w_slot])
+
+      @pl.when(wg == _STORE_WG)
+      def _store_wg():
+        kernel_config.set_max_registers(kernel_config.store_wg_regs)
+        acc_dtype = jnp.float32
+        acc_carry = plgpu.layout_cast(
+            jnp.zeros((block_n, cluster_block_m), dtype=acc_dtype),
+            _TCGEN05,
+        )
+
+        def _loop_body(ki, acc_carry):
+          global_ki = ki + local_index * num_k_iters
+          scale_slot = lax.rem(global_ki, scale_stages)
+          acc_slot = lax.rem(global_ki, acc_stages)
+
+          with jax.named_scope("wait_scales"):
+            plgpu.barrier_wait(xws_barrier.at[scale_slot])
+          with jax.named_scope("[scale]load"):
+            ws = plgpu.load(ws_smem.at[scale_slot], layout=_TCGEN05_ROW)
+            ws = ws.astype(acc_dtype)
+            x_scale = plgpu.load(
+                xs_smem.at[scale_slot, pl.ds(0, cluster_block_m)],
+                layout=_TCGEN05_COL,
+            ).astype(acc_dtype)
+
+            x_sum = plgpu.load(
+                x_sum_smem.at[scale_slot, pl.ds(0, cluster_block_m)],
+                layout=_TCGEN05_COL,
+            ).astype(acc_dtype)
+          mgpu_lib.fence_async_shared_cta()
+          plgpu.barrier_arrive(xws_consumed_barrier.at[scale_slot])
+          with jax.named_scope("wait_acc_ready"):
+            plgpu.barrier_wait(acc_ready_barrier.at[acc_slot])
+          with jax.named_scope("load_acc"):
+            acc_slice = pl.ds(acc_slot * cluster_block_m, cluster_block_m)
+            acc = plgpu.async_load_tmem(acc_tmem.at[:, acc_slice])
+            plgpu.wait_load_tmem()
+          plgpu.barrier_arrive(acc_consumed_barrier.at[acc_slot])
+
+          with jax.named_scope("rescale_acc"):
+            k_iters_per_subchannel = tile_xk // block_k
+            apply_bias = (ki % k_iters_per_subchannel) == 0
+            apply_bias_coef = lax.broadcast_in_dim(
+                apply_bias.astype(x_sum.dtype), x_sum.shape, ()
+            )
+            bias_val = -8 * x_sum * apply_bias_coef
+            int_bias = plgpu.layout_cast(
+                lax.broadcast_in_dim(bias_val, acc.shape, [1]),
+                _TCGEN05,
+            )
+            acc = acc * 512 + int_bias
+            return rescale_tcgen05_acc(
+                acc_carry,
+                acc,
+                ws,
+                x_scale,
+            )
+
+        acc_carry = lax.fori_loop(0, num_k_iters, _loop_body, acc_carry)
+        if activation is not None:
+          acc_carry = activation(acc_carry)
+
+        with jax.named_scope("acc -> SMEM"):
+          if out_scales_smem is None:
+            out_smem.T[...] = plgpu.layout_cast(
+                acc_carry.astype(out_smem.dtype),
+                plgpu.Layout.TCGEN05_TRANSPOSED,
+            )
+          else:
+            quant_t_dtype = jnp.float32
+            qmax = float(jnp.finfo(epilogue_quant_dtype).max)
+            acc_t = plgpu.layout_cast(
+                acc_carry.astype(quant_t_dtype), _TCGEN05_TRANSPOSED
+            )
+            absmax = jnp.abs(acc_t).max(axis=0).astype(jnp.float32)  # [m]
+            out_scale = jnp.where(
+                absmax == 0.0, jnp.array(1.0, absmax.dtype), absmax / qmax
+            )
+            # Round the scale to its storage dtype once and divide by exactly
+            # that value, so q * stored_scale round-trips.
+            out_scale_q = out_scale.astype(out_scales_smem.dtype)
+            inv = plgpu.layout_cast(
+                lax.broadcast_in_dim(
+                    1.0 / out_scale_q.astype(jnp.float32),
+                    acc_carry.shape,
+                    [1],
+                ),
+                _TCGEN05_TRANSPOSED,
+            )
+            q = acc_t.astype(jnp.float32) * inv
+            q = jnp.clip(q, -qmax, qmax)
+            out_smem.T[...] = q.astype(epilogue_quant_dtype)
+            out_scales_smem[...] = out_scale_q
+          plgpu.commit_smem()
+
+        with jax.named_scope("SMEM -> GMEM"):
+          if epilogue_quant_subchannel_size is not None:
+            assert out_scales_gmem is not None
+            assert out_scales_smem is not None
+            # Scatter scales before value TMA to overlap GMEM stores.
+            scale_col = lax.div(
+                tid_n * cluster_block_n + cluster_idx * block_n,
+                epilogue_quant_subchannel_size,
+            )
+            _write_scales_to_gmem(
+                out_scales_gmem,
+                out_scales_smem,
+                actual_size,
+                start_within_block,
+                scale_col,
+                block_start,
+                cluster_block_m,
+            )
+          # Write out the largest power of two rows first,
+          # then the next largest, etc.
+          # This allows us to coalesce writes as much as possible.
+          offset = start_within_block
+          size = 1 << (min(cluster_block_m, m).bit_length() - 1)
+          while size > 0:
+
+            @pl.when(actual_size & size != 0)
+            def _():
+              out_smem_slice = out_smem.at[pl.ds(offset, size)]
+              o_gref_slice = out_gmem.at[
+                  pl.ds(block_start + offset, size),
+                  slice_n,
+              ]
+              plgpu.copy_smem_to_gmem(
+                  out_smem_slice, o_gref_slice, commit_group=False
+              )
+
+            offset += actual_size & size
+            size //= 2
+          plgpu.commit_smem_to_gmem_group()
+          plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
   def kernel_entry(*refs):
     x_smem = plgpu.SMEM(
@@ -898,9 +897,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         (scale_stages, max(cluster_block_m, 64)),
         dtype=x_sum.dtype,
     )
-    out_smem_dtype = (
-        epilogue_quant_dtype if epilogue_quant_enabled else out_dtype
-    )
+    out_smem_dtype = epilogue_quant_dtype or out_dtype
     out_smem = plgpu.SMEM(
         (cluster_block_m, block_n),
         dtype=out_smem_dtype,
@@ -914,10 +911,6 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
             plgpu.SwizzleTransform(128),
         ),
     )
-    if epilogue_quant_enabled:
-      out_scales_smem = plgpu.SMEM(
-          (cluster_block_m,), dtype=epilogue_quant_input_dtype
-      )
     acc_tmem = plgpu.TMEM(
         (block_n, acc_stages * cluster_block_m),
         dtype=jnp.float32,
@@ -969,7 +962,9 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         acc_tmem,
     ]
     if epilogue_quant_enabled:
-      scratch.append(out_scales_smem)  # LAST, matches the pop() in kernel()
+      # LAST, matches the pop() in kernel()
+      scratch.append(plgpu.SMEM((cluster_block_m,), epilogue_quant_input_dtype))
+
     pl.run_scoped(
         lambda *args: kernel(*refs, scoped=args),
         tuple(scratch),
@@ -992,6 +987,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
   num_sms = backend.get_default_device().core_count
   num_sms = num_sms // 2 if profile else num_sms
   if epilogue_quant_enabled:
+    assert epilogue_quant_subchannel_size is not None
     # Scales in (m, n_subchannels) order: the scatter is uncoalesced anyway, so
     # m-major is free here and avoids a transpose-on-return.
     out_type = (
@@ -1040,8 +1036,9 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
       group_info.start_within_block,
       group_info.actual_size,
       group_info.block_start,
+      (group_info.actual_size > 0).sum().astype(jnp.int32),
   )
-  if epilogue_quant_enabled:
+  if epilogue_quant_dtype is not None:
     qvalue, scales = out
     return qwix.QArray(qvalue, scales, qtype=epilogue_quant_dtype)
   return out

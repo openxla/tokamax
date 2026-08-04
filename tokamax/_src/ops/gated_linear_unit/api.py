@@ -15,9 +15,8 @@
 """Gated linear unit API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
-from absl import logging
 import immutabledict
 import jax
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
@@ -25,7 +24,7 @@ from tokamax._src import gpu_utils
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 
-Implementation: TypeAlias = Literal['mosaic', 'triton', 'xla']
+type Implementation = Literal['mosaic', 'triton', 'xla']
 
 _IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
 _DEFAULT_IMPLEMENTATIONS = ('xla',)
@@ -113,7 +112,6 @@ def gated_linear_unit(
     try:
       return fn(x, weights, activation=activation, precision=precision)
     except NotImplementedError as e:
-      logging.exception('Failed to run implementation')
       errors.append(e)
 
   raise ExceptionGroup('all implementations failed', errors)

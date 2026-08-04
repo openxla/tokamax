@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import math
-from typing import Callable, ClassVar
+from typing import Callable, ClassVar, override
 
 import jax
 from jax import numpy as jnp
@@ -30,7 +30,6 @@ from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.pallas import block
-from typing_extensions import override
 
 
 Residuals = base.Residuals
@@ -417,6 +416,9 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
         dot_out = activation(dot_out)
 
       return dot_out, residuals if return_residuals else None
+
+    if isinstance(group_sizes, GroupSizes):
+      group_sizes = jnp.array(group_sizes)
 
     if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
       out = _ragged_dot(

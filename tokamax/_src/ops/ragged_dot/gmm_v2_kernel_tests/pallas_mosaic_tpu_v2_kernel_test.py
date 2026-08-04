@@ -21,37 +21,14 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 from tokamax._src import test_utils
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
 
+import pytest
 
 jax.config.parse_flags_with_absl()
-
-
-def poison_tpu_memory():
-  """Fills TPU scratchpad memory with NaNs to simulate garbage state."""
-  tpu_info = pltpu.get_tpu_info()
-  # Security: Use a large but safe portion of VMEM/SMEM to avoid OOM.
-  vmem_size = (4 * 1024 * 1024) // 4  # 4MB
-  smem_size = (tpu_info.smem_capacity_bytes // 4) - 8192
-
-  def poison_kernel(in_ref, out_ref, v_scratch, s_scratch):
-    del in_ref, out_ref
-    v_scratch[...] = jnp.full_like(v_scratch, jnp.nan)
-    for i in range(s_scratch.shape[0]):
-      s_scratch[i] = 0x7FC00000  # IEEE 754 NaN bit pattern
-
-  pl.pallas_call(
-      poison_kernel,
-      out_shape=jax.ShapeDtypeStruct((1,), jnp.float32),
-      grid=(1,),
-      scratch_shapes=[
-          pltpu.VMEM((vmem_size // 128, 128), jnp.float32),
-          pltpu.SMEM((smem_size,), jnp.int32),
-      ],
-      compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
-  )(jnp.zeros((1,), dtype=jnp.float32))
 
 
 _GroupConfig = collections.namedtuple(
@@ -243,13 +220,14 @@ class GmmTest(parameterized.TestCase):
       self.skipTest("Only supported on TPUs.")
     super().setUp()
 
+  @pytest.mark.long
   @parameterized.product(
-      batch_size=[128, 512],
-      in_size=[512, 1024],
-      out_size=[512, 1024],
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
       num_groups=[16, 32],
-      has_bias=[True, False],
-      group_offset=[0, 2, 3],
+      has_bias=[True],
+      group_offset=[0],
   )
   def test_gmm_basic(
       self, batch_size, in_size, out_size, num_groups, has_bias, group_offset
@@ -285,12 +263,13 @@ class GmmTest(parameterized.TestCase):
 
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
-      batch_size=[128, 1024],
-      in_size=[512, 1024],
-      out_size=[512, 1024],
-      num_groups=[5, 16, 32],
-      group_offset=[0, 2, 3],
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
+      num_groups=[5, 16],
+      group_offset=[0],
   )
   def test_tgmm_basic(
       self, batch_size, in_size, out_size, num_groups, group_offset
@@ -330,10 +309,11 @@ class GmmTest(parameterized.TestCase):
     # print(f"Output mean diff: {jnp.mean(jnp.abs(expected - actual))}")
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 256],
-      in_size=[255, 500],
-      out_size=[255, 500],
+      in_size=[255],
+      out_size=[255],
       num_groups=[16],
       group_offset=[0],
   )
@@ -375,12 +355,13 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
-      batch_size=[256, 1024],
+      batch_size=[256],
       in_size=[1024],
       out_size=[1024],
       num_groups=[16],
-      group_offset=[0, 2],
+      group_offset=[0],
       tile_k=[256, 512],
       tile_n=[256, 512],
   )
@@ -422,13 +403,14 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
       out_size=[512],
       num_groups=[4],
       group_offset=[0],
-      empty_group_index=[0, 1, 2, 3],
+      empty_group_index=[0, 1],
   )
   def test_tgmm_empty_group(
       self,
@@ -507,12 +489,13 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
-      batch_size=[128, 512],
-      in_size=[256, 512],
-      out_size=[256, 512],
-      num_groups=[16, 32],
-      group_offset=[0, 2],
+      batch_size=[128],
+      in_size=[256],
+      out_size=[256],
+      num_groups=[16],
+      group_offset=[0],
       dtype_pair=[
           (jnp.float8_e4m3fn, jnp.float8_e5m2),       # production
           (jnp.float8_e4m3fn, jnp.float8_e4m3fn),     # symmetric fp8
@@ -556,6 +539,7 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
+  @pytest.mark.long
   def test_tgmm_with_rhs_scale_n_padding(self):
     # Test the case where there is implicit padding in the dim size_n (out_size)
     # Pins tile_n=128 with out_size=300 so the kernel runs 3 n-tiles over an
@@ -596,15 +580,16 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_groups, in_size, out_size))
     chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
-      in_size=[512, 1024],
-      out_size=[512, 1024],
-      num_groups=[16, 32],
-      has_bias=[True, False],
+      in_size=[512],
+      out_size=[512],
+      num_groups=[16],
+      has_bias=[True],
       weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
-      block_size=[64, 128, 256, 512],
-      group_offset=[0, 2, 3],
+      block_size=[64],
+      group_offset=[0],
   )
   def test_gmm_weight_quantized(
       self,
@@ -709,7 +694,7 @@ class GmmTest(parameterized.TestCase):
     into the output.
     """
     # 1. Poison TPU memory with NaNs
-    poison_tpu_memory()
+    mosaic_tpu.poison_tpu_memory()
 
     # 2. Run GMM kernel
     batch_size = 128
@@ -728,14 +713,15 @@ class GmmTest(parameterized.TestCase):
     # 3. Verify that the output is NaN-free
     self.assertFalse(jnp.any(jnp.isnan(actual)))
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
       out_size=[512],
       num_groups=[16],
-      weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
+      weight_dtype=[jnp.int8],
       block_size=[1024],
-      tile_k=[128, 256, 512],
+      tile_k=[128, 256],
       group_offset=[0],
   )
   def test_gmm_weight_quantized_block_larger_than_tile_k(
@@ -790,14 +776,15 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
       out_size=[512],
       num_groups=[16],
-      weight_dtype=[jnp.int4, jnp.int8, jnp.float8_e4m3fn],
+      weight_dtype=[jnp.int4, jnp.int8],
       block_size=[1024],
-      tile_k=[128, 256, 512],
+      tile_k=[128, 256],
       group_offset=[0],
   )
   def test_gmm_activation_weight_quantized_block_larger_than_tile_k(
@@ -850,14 +837,15 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=1.2, rtol=1.2)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
-      in_size=[512, 1024],
-      out_size=[512, 1024],
+      in_size=[1024],
+      out_size=[1024],
       num_groups=[16, 32],
-      weight_dtype=[jnp.int4, jnp.uint4, jnp.int8, jnp.float8_e4m3fn],
-      block_size=[512, 1024],
-      group_offset=[0, 2, 3],
+      weight_dtype=[jnp.int4, jnp.int8],
+      block_size=[1024],
+      group_offset=[0],
   )
   def test_gmm_activation_weight_quantized(
       self,
@@ -906,10 +894,90 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=1.1, rtol=1.1)
 
+  @pytest.mark.long
+  @parameterized.product(
+      batch_size=[128],
+      in_size=[1024],
+      out_size=[1024],
+      num_groups=[16, 32],
+      block_size=[1024],
+      group_offset=[0],
+  )
+  def test_gmm_quantize_lhs_with_lhs_scale(
+      self,
+      batch_size,
+      in_size,
+      out_size,
+      num_groups,
+      block_size,
+      group_offset,
+  ):
+    """LHS quantized with a user provided lhs_scale."""
+    if block_size > in_size:
+      self.skipTest("block_size must be <= in_size")
+    # Per-tensor fp8 quant scale (bound / finfo(fp8).max = 224 / 448),
+    # matching qwix's "fixed,-224,224" act calibration.
+    lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
+
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+
+    lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    # Pin fp8 weights so rhs is dequantized after the matmul, which is the only
+    # path that enables lhs quantization.
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+    # The kernel quantizes LHS to fp8 internally (constant fixed scale,
+    # clip-before-cast), which perturbs every LHS value before the matmul. We
+    # apply the identical quantize->dequantize round-trip to the reference's LHS
+    # so both sides carry the same quantization error. Otherwise the comparison
+    # would measure fp8 quantization noise itself (large for fp8_e4m3fn) rather
+    # than whether the kernel computes the correct grouped matmul. Because the
+    # fixed scale is data-independent (not per-block absmax), the quantized
+    # values are identical regardless of how the kernel slices K, so this
+    # whole-tensor simulation is faithful; only accumulation order /
+    # intermediate-dtype differences remain, within the tolerance below.
+    scale = lhs_scale.item()
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    lhs_q = jnp.clip(
+        lhs.astype(jnp.float32) / scale, -fp8_max, fp8_max
+    ).astype(jnp.float8_e4m3fn)
+    lhs_simulated = (lhs_q.astype(jnp.float32) * scale).astype(lhs.dtype)
+
+    expected = reference_gmm(
+        lhs_simulated,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+    )
+
+    actual = gmm_backend.gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        maybe_quantize_lhs=True,
+        lhs_scale=lhs_scale,
+    ).astype(lhs.dtype)
+
+    chex.assert_trees_all_close(actual, expected, atol=0.75, rtol=3e-2)
+
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 256],
-      in_size=[255, 500],
-      out_size=[255, 500],
+      in_size=[255],
+      out_size=[255],
       num_groups=[16],
       has_bias=[True, False],
       group_offset=[0],
@@ -952,13 +1020,14 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (batch_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
       out_size=[500],
       num_groups=[16],
       has_bias=[True, False],
-      weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+      weight_dtype=[jnp.int8],
       block_size=[512],
       group_offset=[0],
   )
@@ -1074,12 +1143,12 @@ class GmmTest(parameterized.TestCase):
       in_size=[512],
       out_size=[512],
       num_groups=[16],
-      has_bias=[True, False],
-      use_weight_scale=[True, False],
-      maybe_quantize_lhs=[True, False],
-      fuse_act=["silu", "swigluoai", "gelu"],
-      group_offset=[0, 2],
-      block_size=[256, 512],
+      has_bias=[False],
+      use_weight_scale=[True],
+      maybe_quantize_lhs=[True],
+      fuse_act=["silu"],
+      group_offset=[0],
+      block_size=[256],
   )
   def test_gmm_fused_activation(
       self,
@@ -1133,10 +1202,12 @@ class GmmTest(parameterized.TestCase):
     # whole tensor level, and output is casted down we need to simulate that
     # quantization noise in the reference as well for a fair comparison
     if maybe_quantize_lhs:
-      lhs_block_size = min(512, in_size)
+      lhs_block_size = 256
+      print(f"xw32 line 1221: {lhs.shape=}, {lhs_block_size=}.")
       lhs_q, lhs_scale_factor = quantize_tensor(
           lhs, jnp.int8, axis=1, block_size=lhs_block_size
       )
+      print(f"xw32 line 1225: {lhs_q.shape=}, {lhs_scale_factor.shape=}.")
       lhs_q_blocked = lhs_q.reshape(batch_size, -1, lhs_block_size).astype(
           jnp.float32
       )

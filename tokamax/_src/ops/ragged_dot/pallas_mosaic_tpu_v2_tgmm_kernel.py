@@ -548,6 +548,8 @@ def tgmm_kernel_main(
     metadata_ref: gmm_v2.MetadataRef,
     zero_ref: jax.Array,  # [tile_zero_k, num_lanes]
     semaphore_ref: jax.Array,  # [1]
+    lhs_group_sizes_smem_ref: jax.Array,
+    group_offset_smem_ref: jax.Array,
     *,
     cfgs,
 ):
@@ -566,6 +568,12 @@ def tgmm_kernel_main(
     semaphore_ref: DMA semaphore for the zeroing copies.
     cfgs: GmmConfigs object containing kernel configurations.
   """
+  # Copy metadata from HBM into fast SMEM so the TPU can evaluate tile offsets in multi-core mode.
+  pltpu.sync_copy(lhs_group_sizes_ref, lhs_group_sizes_smem_ref)
+  pltpu.sync_copy(group_offset_ref, group_offset_smem_ref)
+  lhs_group_sizes_ref = lhs_group_sizes_smem_ref
+  group_offset_ref = group_offset_smem_ref
+
   num_groups_to_zero = zero_out_start(
       lhs_group_sizes_ref,
       group_offset_ref,
@@ -584,11 +592,14 @@ def tgmm_kernel_main(
   )
 
   in_specs, out_specs = generate_tgmm_block_specs(metadata_ref, cfgs)
+  # Partition output tiles across TCs in MegaCore mode over both N and K dimensions.
   pipeline_fn = pltpu.emit_pipeline(
       functools.partial(tgmm_inner_kernel, cfgs=cfgs),
       grid=(num_n, num_k, num_gm),
       in_specs=in_specs,
       out_specs=out_specs,
+      core_axis_name="core",
+      dimension_semantics=(pltpu.PARALLEL, pltpu.PARALLEL, pltpu.ARBITRARY),
   )
   lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
   rhs_value = rhs_ref.value
@@ -743,30 +754,24 @@ def tgmm_v2(
       pltpu.VMEM((tile_zero_k, num_lanes), cfgs.out_dtype),
       pltpu.SemaphoreType.DMA((1,)),
   ]
-
   if rhs_scale is not None:
     rhs_scale = rhs_scale.astype(jnp.float32)
     pad_n = aligned_n - dims.size_n
     if pad_n > 0:
       rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, 0), (0, pad_n)))
   rhs = OperandRef(value=rhs, scale=rhs_scale)
-  hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-  in_specs = [
-      hbm_spec,  # lhs
-      # the tree.map build a
-      # OperandRef(value=hbm_spec, scale=None if scale is None else hbm_spec.
-      jax.tree.map(lambda _: hbm_spec, rhs),   # rhs
+
+  scratch_shapes += [
+      pltpu.SMEM(group_sizes.shape, group_sizes.dtype),
+      pltpu.SMEM(group_offset.shape, group_offset.dtype),
   ]
 
-  return pl.pallas_call(
+  # Configure per-core execution over TensorCore mesh for MegaCore scaling.
+  return pl.kernel(
       functools.partial(tgmm_kernel_main, cfgs=cfgs),
-      out_shape=out_init,
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=2,
-          in_specs=in_specs,
-          out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-          scratch_shapes=scratch_shapes,
-      ),
+      out_type=out_init,
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      scratch_types=scratch_shapes,
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=vmem_limit_bytes,
           disable_bounds_checks=True,
@@ -776,4 +781,4 @@ def tgmm_v2(
       # the metadata here is for profiling, debugging, and cost modeling.
       # It does not affect the kernel's computation.
       metadata=gmm_v2.get_metadata(cfgs),
-  )(group_sizes, group_offset, lhs, rhs)[:, :dims.size_k, :dims.size_n]
+  )(group_sizes, group_offset, lhs, rhs)[:, : dims.size_k, : dims.size_n]

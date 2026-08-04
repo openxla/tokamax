@@ -122,8 +122,8 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
 
   def test_autotune_configs(self):
     head_dim = 32
-    q_seq_len = 128
-    kv_seq_len = 128
+    q_seq_len = 256
+    kv_seq_len = 256
     num_q_heads = 4
     num_kv_heads = 4
     batch_size = 2

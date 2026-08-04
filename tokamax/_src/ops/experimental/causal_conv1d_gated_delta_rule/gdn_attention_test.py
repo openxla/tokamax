@@ -19,10 +19,10 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.gdn.v3 import wrapper
-from tokamax._src.ops.experimental.tpu.gdn.v3.reference import l2_normalize_ref
-from tokamax._src.ops.experimental.tpu.gdn.v3.reference import l2norm_chunked
-from tokamax._src.ops.experimental.tpu.gdn.v3.reference import run_jax_gdn_attention_local_ref
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import wrapper
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule.reference import l2_normalize_ref
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule.reference import l2norm_chunked
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule.reference import run_jax_gdn_attention_local_ref
 
 
 class GDNAttentionTest(parameterized.TestCase):

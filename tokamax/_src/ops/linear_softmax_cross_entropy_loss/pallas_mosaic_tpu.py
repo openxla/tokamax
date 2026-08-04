@@ -15,53 +15,25 @@
 
 """Linear Cross-Entropy kernel implementation."""
 
-from dataclasses import dataclass
+import dataclasses
 import itertools
-from typing import Annotated, ClassVar, Literal
+from typing import ClassVar, Literal, override
+
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from jaxtyping import Array, Integer, Real
-import pydantic
+import jaxtyping as jt
 from tokamax._src.ops import op
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel as kernel
-from typing_extensions import override
+
+Config = kernel.Config
+Array = jt.Array
+Integer = jt.Integer
+Real = jt.Real
 
 
-@pydantic.dataclasses.dataclass(frozen=True)
-class Config:
-  """The configuration specific for the Pallas Mosaic TPU kernel.
-
-  Attributes:
-    b_block_size: The block size for the batch dimension.
-    h_block_size: The block size for the hidden dimension.
-    v_block_size: The block size for the vocabulary dimension.
-  """
-
-  b_block_size: Annotated[int, pydantic.Field(ge=1024, multiple_of=128)] = 1024
-  h_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 512
-  v_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 2048
-
-
-def get_tpu_specific_default_config(b_dim: int, h_dim: int, v_dim: int) -> Config:
-  """Returns the heuristic config for based on TPU version."""
-
-  if pltpu.get_tpu_info().generation >= 7:
-    return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
-  elif pltpu.get_tpu_info().generation == 6:
-    # If H dimens is not 512 aligned, it needs additional mask / padding causing
-    # vmem spill over, which may OOM VMEM on tpu gen 6.
-    h_block_size_512_aligned = h_dim % 512 == 0
-    if h_block_size_512_aligned:
-      return Config(b_block_size=1024, h_block_size=512, v_block_size=2048)
-    else:
-      return Config(b_block_size=1024, h_block_size=512, v_block_size=1024)
-  else:
-    return Config(b_block_size=1024, h_block_size=512, v_block_size=512)
-
-
-@dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     base.LinearSoftmaxCrossEntropyLoss[Config]
 ):
@@ -82,7 +54,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       labels: Integer[Array, "B"],
       w: Real[Array, "H V"],
       *,
-      reduction: Literal["sum", "mean"] = "sum",
+      reduction: Literal["sum", "mean", "none"] = "sum",
       config: Config,
       return_residuals: bool,
   ) -> tuple[jax.Array, base.Residuals]:
@@ -105,7 +77,19 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     b_dim, h_dim = x.shape
     v_dim = w.shape[1]
 
-    return get_tpu_specific_default_config(b_dim, h_dim, v_dim)
+    return kernel.get_heuristic_fwd_config(b_dim, h_dim, v_dim, dtype=x.dtype)
+
+  @staticmethod
+  def get_heuristic_fwd_config(
+      b_dim: int,
+      h_dim: int,
+      v_dim: int,
+      dtype: jnp.dtype = jnp.float32,
+      vmem_limit_bytes: int | None = None,
+  ) -> Config:
+    return kernel.get_heuristic_fwd_config(
+        b_dim, h_dim, v_dim, dtype=dtype, vmem_limit_bytes=vmem_limit_bytes
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
@@ -144,7 +128,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
     base.LinearSoftmaxCrossEntropyLossVjp[Config]
 ):
@@ -161,7 +145,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       labels: Integer[Array, "B"],
       w: Real[Array, "H V"],
       *,
-      reduction: Literal["sum", "mean"] = "sum",
+      reduction: Literal["sum", "mean", "none"] = "sum",
       config: Config,
       return_residuals: bool,
   ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:
@@ -192,7 +176,19 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
     b_dim, h_dim = x.shape
     v_dim = w.shape[1]
 
-    return get_tpu_specific_default_config(b_dim, h_dim, v_dim)
+    return kernel.get_heuristic_bwd_config(b_dim, h_dim, v_dim, dtype=x.dtype)
+
+  @staticmethod
+  def get_heuristic_bwd_config(
+      b_dim: int,
+      h_dim: int,
+      v_dim: int,
+      dtype: jnp.dtype = jnp.float32,
+      vmem_limit_bytes: int | None = None,
+  ) -> Config:
+    return kernel.get_heuristic_bwd_config(
+        b_dim, h_dim, v_dim, dtype=dtype, vmem_limit_bytes=vmem_limit_bytes
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:

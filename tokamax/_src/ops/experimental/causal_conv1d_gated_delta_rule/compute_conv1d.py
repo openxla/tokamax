@@ -15,7 +15,7 @@
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.gdn.v3 import config
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import config
 
 
 def causal_conv1d(

@@ -15,17 +15,15 @@
 """TopK Op API."""
 
 from collections.abc import Callable, Sequence
-from typing import Literal, TypeAlias
+from typing import Literal
 import immutabledict
 import jax
-from jaxtyping import Array, Int, Shaped
+from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src.ops.experimental.tpu.topk import base
 
-Implementation: TypeAlias = Literal["mosaic_tpu", "xla"]
+type Implementation = Literal["mosaic_tpu", "xla"]
 
-_implementations = {
-    "xla": base.TopK(),
-}
+_implementations = dict(xla=base.TopK())
 _DEFAULT_IMPLEMENTATION = ("xla",)
 
 try:

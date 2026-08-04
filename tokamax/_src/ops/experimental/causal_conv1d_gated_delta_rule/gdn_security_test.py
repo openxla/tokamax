@@ -15,16 +15,15 @@
 """Security tests for GDN attention."""
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.gdn.v3 import wrapper
-from tokamax._src.ops.experimental.tpu.gdn.v3.test_utils import poison_tpu_memory
+from tokamax._src import mosaic_tpu
+from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import wrapper
 
 
-class GDNSecurityTest(parameterized.TestCase):
+class GDNSecurityTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -37,7 +36,7 @@ class GDNSecurityTest(parameterized.TestCase):
       self.skipTest("Failed to get TPU info.")
 
   def test_uninitialized_memory_robustness(self):
-    poison_tpu_memory()
+    mosaic_tpu.poison_tpu_memory()
     seq_lens = jnp.array([128], dtype=jnp.int32)
     mixed_qkv = jnp.zeros((128, 1536), dtype=jnp.float32)
     new_states, output = wrapper.fused_conv1d_gdn(

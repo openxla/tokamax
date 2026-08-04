@@ -19,7 +19,7 @@ import dataclasses
 import functools
 import itertools
 import threading
-from typing import Any, TypeAlias
+from typing import Any
 from unittest import mock
 
 import jax
@@ -31,7 +31,7 @@ import jax.numpy as jnp
 _zip = functools.partial(zip, strict=True)
 
 
-Indexer: TypeAlias = int | slice | pl.Slice | jax.Array
+type Indexer = int | slice | pl.Slice | jax.Array
 
 
 def dslice(idx: int | jax.Array, size: int) -> slice | pl.Slice:

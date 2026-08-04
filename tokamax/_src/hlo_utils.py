@@ -16,7 +16,7 @@
 
 from collections.abc import Callable
 import functools
-from typing import Any, Final, Sequence, TypeAlias, cast
+from typing import Any, Final, Sequence, cast
 
 import immutabledict
 import jax
@@ -31,19 +31,16 @@ from tokamax._src.ops import op as op_lib
 
 DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.PALLAS_TRITON_KEY),
-    export.DisabledSafetyCheck.custom_call(hlo_utils_common.MOSAIC_GPU_KEY),
-    export.DisabledSafetyCheck.custom_call(hlo_utils_common.MOSAIC_TPU_KEY),
-    export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_KEY),
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_FFI_KEY),
 )
 
-HloComputation: TypeAlias = (
+type HloComputation = (
     jax.stages.Lowered
     | ir.Module
 )
 
-TritonKernelInfo: TypeAlias = hlo_utils_common.TritonKernelInfo
-KernelInfoBase: TypeAlias = hlo_utils_common.KernelInfoBase
+TritonKernelInfo = hlo_utils_common.TritonKernelInfo
+KernelInfoBase = hlo_utils_common.KernelInfoBase
 
 
 def get_kernel_info(
@@ -78,7 +75,11 @@ def get_opspecs(
 
   op_specs = []
   for kernel in kernel_infos:
-    json_data = hlo_utils_common.get_json_from_name(kernel.op_name)
+    if kernel.metadata_payload is None:
+      op_name = kernel.op_name
+    else:
+      op_name = kernel.metadata_payload
+    json_data = hlo_utils_common.get_json_from_name(op_name)
     if json_data is None:
       continue
 
@@ -161,6 +162,15 @@ def _get_source_file_line(loc: ir.Location) -> tuple[str, int]:
   return '', -1
 
 
+def _get_payload(op: ir.OpView | ir.Operation) -> str | None:
+  """Returns the metadata payload if present, otherwise None."""
+  if (fe_attrs := op.attributes.get('mhlo.frontend_attributes')) is not None:
+    fe_dict = ir.DictAttr(fe_attrs)
+    if 'xla_metadata_payload' in fe_dict:
+      return ir.StringAttr(fe_dict['xla_metadata_payload']).value
+  return None
+
+
 def _get_common_kernel_info(
     op: ir.OpView, call_stack: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -180,6 +190,7 @@ def _get_common_kernel_info(
       source_line=source_line,
       source_file=source_file,
       hlo_module_name=parent.opview.sym_name.value,  # pytype: disable=attribute-error
+      metadata_payload=_get_payload(op),
   )
 
 
@@ -228,16 +239,16 @@ def _get_kernel_info_stablehlo(
     x = hlo_utils_common.ir_module_from_lowered(x)
 
   symbol_table = ir.SymbolTable(x.operation)
-  infos = []
+  records = []
 
   def handle_op(
       op: ir.Operation, call_stack: tuple[str, ...] = ()
   ) -> ir.WalkResult:
     op_ = op.opview
 
-    if isinstance(op_, stablehlo.CustomCallOp):
-      if (getter := _KERNEL_GETTER.get(op_.call_target_name.value)) is not None:  # pytype: disable=attribute-error
-        infos.append(getter(op_, call_stack))
+    if isinstance(op_, stablehlo.CustomCallOp) and (getter := _KERNEL_GETTER.get(op_.call_target_name.value)) is not None:  # pytype: disable=attribute-error
+      emit_fn = functools.partial(getter, op_, call_stack)
+      records.append(hlo_utils_common.Record(emit_fn, False, _get_payload(op_)))
     elif isinstance(op_, func.CallOp):
       callee = symbol_table[op_.callee.value]  # pytype: disable=attribute-error
       call_stack = call_stack + (_get_op_name(op_.location),)
@@ -249,15 +260,27 @@ def _get_kernel_info_stablehlo(
         include_xla_kernels
         and isinstance(op_.name, str)  # `FuncOp` returns `StringAttr`.
         and op_.name.startswith('stablehlo.')
-        and op_.name[len('stablehlo.') :]
-        not in hlo_utils_common.XLA_NOISE_OPCODES
-        and (
-            any(hlo_utils_common.TOKAMAX_NAME in name for name in call_stack)
-            or hlo_utils_common.TOKAMAX_NAME in _get_op_name(op_.location)
-        )
     ):
-      infos.append(_get_tokamax_xla_kernel_info(op_, call_stack))
+      is_noise = (
+          op_.name[len('stablehlo.') :] in hlo_utils_common.XLA_NOISE_OPCODES
+      )
+      payload = _get_payload(op_)
+      has_tokamax_payload = payload is not None and payload.startswith(
+          'tokamax:'
+      )
+
+      if has_tokamax_payload or (
+          not is_noise
+          and (
+              any(hlo_utils_common.TOKAMAX_NAME in name for name in call_stack)
+              or hlo_utils_common.TOKAMAX_NAME in _get_op_name(op_.location)
+          )
+      ):
+        emit_fn = functools.partial(
+            _get_tokamax_xla_kernel_info, op_, call_stack
+        )
+        records.append(hlo_utils_common.Record(emit_fn, is_noise, payload))
     return ir.WalkResult.ADVANCE
 
   x.operation.walk(handle_op, ir.WalkOrder.PRE_ORDER)
-  return tuple(infos)
+  return hlo_utils_common.dedupe_wrapper_kernels(records)

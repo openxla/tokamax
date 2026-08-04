@@ -17,6 +17,7 @@
 
 from typing import Annotated
 
+import jax
 import pydantic
 
 
@@ -28,3 +29,19 @@ class Config:
   block_kv_dq: pydantic.PositiveInt
   num_stages: pydantic.PositiveInt = 2
   compute_wgs: pydantic.PositiveInt = 2
+
+
+def get_ds_dtype(
+    q: jax.Array,
+    k: jax.Array,
+    bias: jax.Array | None,
+    dbias_intermediate_dtype: jax.typing.DTypeLike | None,
+) -> jax.typing.DTypeLike | None:
+  """Returns the dtype for ds output."""
+  if bias is None:
+    return None
+  if dbias_intermediate_dtype is None:
+    return bias.dtype
+  if bias.shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
+    return bias.dtype
+  return dbias_intermediate_dtype

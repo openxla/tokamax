@@ -426,7 +426,6 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
             with jax.named_scope("S->R"):
               w = plgpu.load(
                   w_smem.at[wg * num_stages + slot],
-                  (),
                   layout=_TMEM(8),
                   optimized=False,
               )
@@ -470,23 +469,21 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
             slot = lax.rem(global_ki, num_stages)
             with jax.named_scope("[scale]load"):
               x_scale = plgpu.load(
-                  x_scales_gmem,
-                  (
+                  x_scales_gmem.at[
                       lax.div((ki * block_k), tile_k),
                       slice_m,
-                  ),
+                  ],
                   layout=_TCGEN05_COL,
                   optimized=False,
               ).astype(acc_dtype)
 
             def load_ws_acc(ni):
               ws = plgpu.load(
-                  w_scales_gmem,
-                  (
+                  w_scales_gmem.at[
                       group_id,
                       lax.div((ki * block_k), tile_k),
                       slice_n(ni),
-                  ),
+                  ],
                   layout=_TCGEN05_ROW,
                   optimized=False,
               ).astype(acc_dtype)

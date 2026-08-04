@@ -273,7 +273,7 @@ def _quantize_as(x, qdtype: jnp.dtype, axis: int, scale: float | None):
     ).astype(jnp.bfloat16)
     inv_scales = jnp.broadcast_to(1.0 / scales, x.shape)
   else:  # compile-time (static) quantization scale
-    scales, inv_scales = scale, 1.0 / scale
+    scales, inv_scales = jnp.array(scale, jnp.bfloat16), 1.0 / scale
   return QArray(jnp.round(x * inv_scales).astype(qdtype), scales)
 
 

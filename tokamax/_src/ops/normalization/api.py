@@ -15,16 +15,15 @@
 """Layer Normalization API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias
+from typing import Any, Final, Literal
 
-from absl import logging
 import immutabledict
 import jax
 from tokamax._src import gpu_utils
 from tokamax._src.ops.normalization import base
 
 
-Implementation: TypeAlias = Literal['xla', 'triton']
+type Implementation = Literal['xla', 'triton']
 
 _IMPLEMENTATIONS = dict(xla=base.Normalization())
 _DEFAULT_IMPLEMENTATIONS = ('xla',)
@@ -124,7 +123,6 @@ def layer_norm(
           subtract_mean=subtract_mean,
       )
     except NotImplementedError as e:
-      logging.exception('Failed to run implementation')
       errors.append(e)
 
   raise ExceptionGroup('all implementations failed', errors)

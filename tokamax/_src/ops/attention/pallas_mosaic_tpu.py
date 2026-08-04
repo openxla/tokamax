@@ -16,7 +16,8 @@
 
 import dataclasses
 import itertools
-from typing import Annotated, Any, ClassVar, TypeAlias
+from typing import Annotated, Any, ClassVar, override
+
 import immutabledict
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -24,18 +25,18 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from typing_extensions import override
 
 
 QArray = base.QArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
+type Key = immutabledict.immutabledict[str, Any]
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -109,6 +110,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         mask=mask,
     )
 
+    q = quantization.as_array(q)
     q *= logits_scale
 
     orig_q_shape = q.shape
@@ -191,7 +193,7 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     q, k = ba.arguments['q'], ba.arguments['k']
     q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
     # TODO: Add 8192 once autotuning bugs are fixed.
-    tiles = [128, 256, 512, 1024, 2048, 4096]
+    tiles = [256, 512, 1024, 2048, 4096]
     layouts = [splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR]
     schedulers = [True, False]
     config = set()
@@ -211,6 +213,10 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
       if kv_seq_len >= 1024 and bkv < 1024:
         continue
       if bkv_c > 1024:
+        continue
+      # Tile size >=4096 makes compile time > 15mins per config, which pushes
+      # single arg spec autotuning time to more than 1 hour.
+      if bq >= 4096 or bkv >= 4096:
         continue
       if bkv % bkv_c == 0 and bq <= q_seq_len and bkv <= kv_seq_len:
         config.add(

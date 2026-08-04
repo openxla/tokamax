@@ -16,7 +16,7 @@
 import dataclasses
 import pytest
 import random
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
 from absl.testing import absltest
@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from tokamax._src import quantization
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import xla_chunked
-from typing_extensions import override
+
 import pytest
 
 

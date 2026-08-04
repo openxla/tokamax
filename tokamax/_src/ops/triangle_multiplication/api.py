@@ -15,7 +15,7 @@
 """Triangle Multiplication API."""
 
 from collections.abc import Sequence
-from typing import Final, Literal, TypeAlias
+from typing import Final, Literal
 
 import jax
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
@@ -23,7 +23,7 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops.triangle_multiplication import base
 
 
-Implementation: TypeAlias = Literal["xla"]
+type Implementation = Literal["xla", "triton", "mosaic"]
 
 IMPLEMENTATIONS = dict(xla=base.TriangleMultiplication())
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = ("xla",)
@@ -84,8 +84,14 @@ def triangle_multiplication(
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
 
-  if tuple(implementation) != ("xla",):
-    raise NotImplementedError("Only XLA implementation is supported.")
+  supported_implementations = ("xla", "triton", "mosaic")
+  for impl in implementation:
+    if impl not in supported_implementations:
+      raise NotImplementedError(
+          f"Implementation '{impl}' is not supported."
+      )
+    if impl == "mosaic" and impl not in IMPLEMENTATIONS:
+      raise ValueError(f"Unknown implementation: {impl}.")
 
   impl = IMPLEMENTATIONS["xla"]
   return impl(
@@ -102,4 +108,5 @@ def triangle_multiplication(
       triangle_type=triangle_type,
       precision=precision,
       epsilon=epsilon,
+      implementation=implementation,
   )

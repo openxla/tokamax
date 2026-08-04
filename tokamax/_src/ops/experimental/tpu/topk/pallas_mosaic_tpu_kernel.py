@@ -62,7 +62,7 @@ from collections.abc import Sequence
 import dataclasses
 import functools
 import math
-from typing import Any, Tuple, TypeAlias
+from typing import Any, Tuple
 
 from absl import logging
 import jax
@@ -77,7 +77,7 @@ import numpy as np
 
 
 # from jax._src import state as jax_state  # deps: ignore
-Ref: TypeAlias = Any  # jax_state.AbstractRef | jax_state.TransformedRef
+type Ref = Any  # jax_state.AbstractRef | jax_state.TransformedRef
 
 
 INVALID_VALUE = np.uint32(2**32 - 1).view(np.int32)

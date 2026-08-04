@@ -16,7 +16,7 @@
 
 import dataclasses
 import functools
-from typing import Any, ClassVar, TypeAlias
+from typing import Any, ClassVar, override
 
 import immutabledict
 import jax
@@ -33,13 +33,13 @@ from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_kernel_sm100 as sm100
 from tokamax._src.ops.attention import pallas_mosaic_gpu_kernel_sm90 as sm90
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as vjp
-from typing_extensions import override
+
 
 # TODO: Make attention Config a pydantic discriminated union.
 ConfigSM90 = sm90.Config
 ConfigSM100 = sm100.Config
-Config = ConfigSM90 | ConfigSM100
-Key: TypeAlias = immutabledict.immutabledict[str, Any]
+type Config = ConfigSM90 | ConfigSM100
+type Key = immutabledict.immutabledict[str, Any]
 Mask = base.Mask
 PagingInfo = base.PagingInfo
 QArray = base.QArray
@@ -78,7 +78,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       stability. It is ignored when not using stable softmax.
   """
 
-  config_cls: ClassVar[type[Config]] = Config
+  config_cls: ClassVar[type[Config]] = Config.__value__
   supports_symbolic_shapes: ClassVar[bool] = False
   use_stable_softmax: bool | type[base.AUTO] = base.AUTO
   rescale_threshold: float = 1.0

@@ -15,7 +15,8 @@
 """Mosaic-GPU utils."""
 
 import functools
-from typing import cast
+import math
+from typing import Any, cast
 
 import jax
 from jax.experimental import pallas as pl
@@ -38,11 +39,13 @@ def tile_swizzle_transforms(
     dtype: jax.typing.DTypeLike,
     what: str = "",
     *,
+    swizzle: int | None = None,
     tiling_prefix: tuple[int, ...] = (8,),
 ) -> tuple[plgpu.TilingTransform, plgpu.SwizzleTransform]:
   """Returns tiling and swizzling transforms."""
   elem_bits = num_bits(dtype)
-  swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
+  if swizzle is None:
+    swizzle = plgpu.find_swizzle(shape[-1] * elem_bits, what)
   tiling = (*tiling_prefix, 8 * swizzle // elem_bits)
   return plgpu.TilingTransform(tiling), plgpu.SwizzleTransform(swizzle)
 
@@ -52,11 +55,12 @@ def tiled_swizzled_smem(
     dtype: jax.typing.DTypeLike,
     what: str = "",
     *,
+    swizzle: int | None = None,
     tiling_prefix: tuple[int, ...] = (8,),
 ) -> pl.MemoryRef:
   """Returns a memory reference to a tiled and swizzled shared memory array."""
   transforms = tile_swizzle_transforms(
-      shape, dtype, what, tiling_prefix=tiling_prefix
+      shape, dtype, what, swizzle=swizzle, tiling_prefix=tiling_prefix
   )
   return plgpu.SMEM(shape, dtype, transforms=transforms)
 
@@ -69,8 +73,22 @@ def tiled_swizzled_block_spec(
   return plgpu.BlockSpec(shape, index_map, transforms=transforms, **kwargs)
 
 
-def warpgroup_barrier():
-  plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())()
+warpgroup_barrier = plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())
+
+
+@plgpu.inline_mgpu()
+def tcgen05_wait_ld(_):
+  nvvm.tcgen05_wait(nvvm.Tcgen05WaitKind.LOAD)
+
+
+@plgpu.inline_mgpu()
+def tcgen05_wait_st(_):
+  nvvm.tcgen05_wait(nvvm.Tcgen05WaitKind.STORE)
+
+
+@plgpu.inline_mgpu()
+def tcgen05_fence_before_thread_sync(_):
+  nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)
 
 
 @plgpu.inline_mgpu()
@@ -237,3 +255,21 @@ def int4_as_biased_f8e4m3fn(x, layout):
     )
 
   return encode(x)
+
+
+def _get_smem_bytes(x: Any) -> int:
+  if isinstance(x, (plgpu.Barrier, plgpu.ClusterBarrier)):
+    return (n if isinstance(n := x.num_barriers, int) else math.prod(n)) * 8
+
+  if getattr(x, "memory_space", None) == plgpu.SMEM:
+    size_bytes = math.prod(x.shape) * num_bits(x.dtype) // 8
+    return pl.cdiv(size_bytes, 1024) * 1024
+
+  return 0
+
+
+def estimate_smem_bytes(scratch_types: Any) -> int:
+  """Estimates the total SMEM usage in bytes for the given scratch types."""
+  is_ref_union = lambda x: isinstance(x, plgpu.RefUnion)
+  scratch_types_flat = jax.tree.leaves(scratch_types, is_leaf=is_ref_union)
+  return sum(map(_get_smem_bytes, scratch_types_flat))

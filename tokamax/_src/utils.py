@@ -14,10 +14,6 @@
 # ==============================================================================
 
 from collections.abc import Callable, Sequence
-from typing import TypeVar
-
-
-T = TypeVar('T')
 
 
 def exact_div(a: int | tuple[int, str], b: int | tuple[int, str]) -> int:
@@ -31,7 +27,7 @@ def exact_div(a: int | tuple[int, str], b: int | tuple[int, str]) -> int:
 
 
 # Adapted from jax._src.util.split_merge in JAX v0.6.0.
-def split_merge(
+def split_merge[T](
     predicate: Callable[[T], bool], xs: Sequence[T]
 ) -> tuple[list[T], list[T], Callable[[Sequence[T], Sequence[T]], list[T]]]:
   """Splits a sequence based on a predicate, and returns a merge function."""

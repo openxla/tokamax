@@ -17,7 +17,7 @@
 import abc
 from concurrent import futures
 import dataclasses
-from typing import Any, TypeAlias
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -27,7 +27,7 @@ from tokamax._src import batching
 from tokamax._src import utils
 
 
-PyTree: TypeAlias = Any
+type PyTree = Any
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -206,7 +206,7 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
 
       if abstract_qvalue and abstract_scale:
         x = dataclasses.replace(
-            x, qvalue=_as_vmap_shape(x.qvalue), scale=_as_vmap_shape(x.scale)
+            x, qvalue=_as_vmap_shape(x.qvalue), scale=_as_vmap_shape(x.scale)  # pyrefly: ignore[bad-argument-type]
         )
         try:
           dtype_ = jnp.promote_types(x.dtype, jnp.float32)

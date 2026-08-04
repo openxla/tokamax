@@ -14,7 +14,8 @@
 # ==============================================================================
 """Triangle multiplication op."""
 
-from typing import Any, Literal, TypeAlias, TypeVar
+from collections.abc import Sequence
+from typing import Any, Literal, override
 
 import jax
 import jax.numpy as jnp
@@ -22,18 +23,16 @@ from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
-from tokamax._src.ops.gated_linear_unit import base as glu_base
-from tokamax._src.ops.normalization import base as norm_base
-from typing_extensions import override
+from tokamax._src.ops.gated_linear_unit import api as glu_api
+from tokamax._src.ops.normalization import api as norm_api
 
 
-_Config = TypeVar("_Config")
-_Key = TypeVar("_Key")
-Residuals: TypeAlias = None
+type Implementation = Literal["xla", "triton"]
+type Residuals = None
 CanonicalPrecision = precision_lib.CanonicalPrecision
 
 
-class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
+class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   """Triangle multiplicative update."""
 
   @override
@@ -54,6 +53,7 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       precision: jax.lax.PrecisionLike = None,
       epsilon: float = 1e-6,
       return_residuals: bool = False,
+      implementation: Implementation | Sequence[Implementation] | None = None,
   ) -> op.BoundArguments:
     """Binds the arguments for the triangle multiplication function."""
     return super().bind(
@@ -71,6 +71,7 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         precision=precision_lib.canonicalize_precision(precision),
         epsilon=epsilon,
         return_residuals=return_residuals,
+        implementation=implementation,
     )
 
   @jaxtyping.jaxtyped
@@ -92,7 +93,8 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       precision: CanonicalPrecision,
       epsilon: float,
       return_residuals: bool,
-      config: _Config,
+      implementation: Implementation | Sequence[Implementation] | None,
+      config: C,
   ) -> tuple[Float[Array, "N N D"], Residuals]:
     """Triangle multiplicative update.
 
@@ -115,6 +117,7 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
       precision: Specifies the matrix multiplication precision.
       epsilon: Epsilon value added to the denominator to avoid division by zero.
       return_residuals: If True, returns residuals.
+      implementation: The implementation for the sub-operations.
       config: The op config.
 
     Returns:
@@ -124,22 +127,24 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
 
     h_dim = layernorm_out_scale.shape[0]
 
-    left_act = norm_base.Normalization()(
+    left_act = norm_api.layer_norm(
         x,
         scale=layernorm_in_scale,
         offset=layernorm_in_offset,
         epsilon=epsilon,
         axis=-1,
+        implementation=implementation,
     )
 
     channel_dim = len(gate_in_weights)
     gate_weights = jnp.reshape(gate_in_weights, (channel_dim, -1))  # (C, 2 * H)
     projection_weights = jnp.reshape(projection_in_weights, (channel_dim, -1))
-    proj_act = glu_base.GatedLinearUnit()(
+    proj_act = glu_api.gated_linear_unit(
         left_act,
         (gate_weights, projection_weights),
         activation=jax.nn.sigmoid,
         precision=precision,
+        implementation=implementation,
     )
     proj_act = proj_act.reshape(proj_act.shape[0], proj_act.shape[1], 2, h_dim)
     proj_act = jnp.transpose(proj_act, (2, 3, 0, 1))  # 2 C N N
@@ -153,12 +158,13 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
         equation, left_proj_act, right_proj_act, precision=precision
     )
 
-    act = norm_base.Normalization()(
+    act = norm_api.layer_norm(
         act,
         scale=layernorm_out_scale,
         offset=layernorm_out_offset,
         epsilon=epsilon,
         axis=-1,
+        implementation=implementation,
     )
 
     act = jnp.dot(act, projection_out_weights, precision=precision)
@@ -167,3 +173,4 @@ class TriangleMultiplication(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     act *= jax.nn.sigmoid(gate_values)
 
     return act, None
+

@@ -18,7 +18,7 @@ from collections.abc import Callable
 import dataclasses
 import functools
 import math
-from typing import ClassVar
+from typing import ClassVar, override
 
 import jax
 from jax.experimental import pallas as pl
@@ -31,7 +31,6 @@ from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 from tokamax._src.pallas import block
 from tokamax._src.pallas import grid
-from typing_extensions import override
 
 
 Residuals = base.Residuals

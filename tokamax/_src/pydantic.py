@@ -21,7 +21,7 @@ import inspect
 import re
 import types
 import typing
-from typing import Annotated, Any, Generic, TypeAlias, TypeVar, Union
+from typing import Annotated, Any, TypeAliasType, TypedDict, Union
 
 import immutabledict
 import jax
@@ -33,7 +33,6 @@ import pydantic
 import pydantic_core
 from pydantic_core import core_schema as cs
 from tokamax._src import batching
-from typing_extensions import TypedDict  # Required for Python <3.12.
 
 
 def _int_power_of_two(n: int) -> int:
@@ -42,7 +41,7 @@ def _int_power_of_two(n: int) -> int:
   return n
 
 
-PowerOfTwo: TypeAlias = Annotated[
+PowerOfTwo = Annotated[
     pydantic.PositiveInt, pydantic.AfterValidator(_int_power_of_two)
 ]
 
@@ -58,7 +57,7 @@ def _serialize_np_dtype(dtype) -> str:
     return getattr(dtype, '__name__', str(dtype))
 
 
-NumpyDtype: TypeAlias = Annotated[
+type NumpyDtype = Annotated[
     np.dtype,
     pydantic.PlainValidator(_validate_np_dtype),
     pydantic.PlainSerializer(_serialize_np_dtype),
@@ -72,7 +71,16 @@ if not typing.TYPE_CHECKING:
   _ORIG_IMPORT_STRING_SERIALIZE = pydantic.ImportString._serialize  # pylint: disable=protected-access
 
   def _serialize(v: Any) -> str:
-    return v if (data := _ORIG_IMPORT_STRING_SERIALIZE(v)) is None else data
+    if hasattr(v, '_fun'):
+      v = v._fun
+    if hasattr(v, '__wrapped__'):
+      v = v.__wrapped__
+    if (data := _ORIG_IMPORT_STRING_SERIALIZE(v)) is not None:
+      return data
+    if (module := getattr(v, '__module__', None)) is not None:
+      if name := getattr(v, '__qualname__', getattr(v, '__name__', None)):
+        return f'{module}.{name}'
+    return str(v)
 
   pydantic.ImportString._serialize = _serialize  # pylint: disable=protected-access
 
@@ -99,6 +107,10 @@ def annotate(ty: Any) -> Any:
   origin = typing.get_origin(ty) or ty
   if hasattr(origin, '__get_pydantic_core_schema__'):
     return ty
+  if isinstance(ty, TypeAliasType):
+    return TypeAliasType(
+        ty.__name__, annotate(ty.__value__), type_params=ty.__type_params__
+    )
   if origin is Annotated:
     return Annotated[annotate(ty.__origin__), *ty.__metadata__]
   if origin is Union or isinstance(ty, types.UnionType):
@@ -149,37 +161,34 @@ def annotate(ty: Any) -> Any:
 # pytype: enable=invalid-annotation
 
 
-_T = TypeVar('_T')
-
-
-class TypeAdapter(Generic[_T]):
+class TypeAdapter[T]:
   """`TypeAdapter` where serialization info is be passed to `dump_python`.
 
   The `mode` and `round_trip` attributes from the `SerializationInfo` are
   forwarded to the `dump_python` method of the underlying `TypeAdapter`.
   """
 
-  def __init__(self, type: type[_T]):
+  def __init__(self, type: type[T]):
     self._impl = pydantic.TypeAdapter(type)
 
-  def dump_json(self, instance: _T, /, **kwargs) -> bytes:
+  def dump_json(self, instance: T, /, **kwargs) -> bytes:
     return self._impl.dump_json(instance, **kwargs)
 
   def dump_python(
-      self, instance: _T, /, info: pydantic.SerializationInfo, **kwargs
+      self, instance: T, /, info: pydantic.SerializationInfo, **kwargs
   ) -> Any:
     kwargs.setdefault('mode', info.mode)
     kwargs.setdefault('round_trip', info.round_trip)
     return self._impl.dump_python(instance, **kwargs)
 
-  def validate_python(self, object: Any, /) -> _T:
+  def validate_python(self, object: Any, /) -> T:
     return self._impl.validate_python(object)
 
 
 get_adapter = functools.lru_cache(TypeAdapter)
 
 
-class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
+class AnyInstanceOf[T]:
   """Annotates a type, allowing serialization of any instance of the given type.
 
   The value is serialized with the type name, allowing it to be deserialized
@@ -187,7 +196,7 @@ class AnyInstanceOf(Generic[_T]):  # `Generic` makes pytype happy.
   """
 
   @classmethod
-  def __class_getitem__(cls, item: type[_T]) -> type[_T]:
+  def __class_getitem__(cls, item: type[T]) -> type[T]:
     return Annotated[item, cls()]  # pyrefly: ignore[bad-return]
 
   @classmethod

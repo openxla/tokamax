@@ -15,7 +15,7 @@
 """Ragged dot Pallas-Mosaic-TPU implementation."""
 
 import dataclasses
-from typing import ClassVar
+from typing import ClassVar, override
 
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -26,7 +26,6 @@ from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
-from typing_extensions import override
 
 
 QArray = base.QArray
@@ -100,11 +99,22 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
 
       # Build a fresh sub-op for the backward sub-calls. `num_actual_groups`
       # only matters for the drhs (tgmm) path; leave it `None` otherwise.
-      def make_fn(num_actual_groups=None):
+      def make_fn(num_actual_groups=None, config=None):
         return lambda *args, **kw: PallasMosaicTpuV2RaggedDot(  # pylint: disable=unnecessary-lambda
             qdtype=qdtype,
             num_actual_groups=num_actual_groups,
+            config=config,
         )(*args, **kw)
+
+      if self.config is not None:
+        dlhs_config = Config(
+            tile_m=self.config.tile_m,
+            tile_k=self.config.tile_n,
+            tile_n=self.config.tile_k,
+        )
+      else:
+        dlhs_config = None
+      drhs_config = self.config
 
       def _vjp(residuals, out, dout, lhs, rhs, **kwargs):
         # Under expert parallelism `group_sizes` is global, but the original
@@ -118,8 +128,10 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             dout,
             lhs,
             rhs,
-            dlhs_ragged_dot=make_fn(),
-            drhs_ragged_dot=make_fn(num_actual_groups=num_actual_groups),
+            dlhs_ragged_dot=make_fn(config=dlhs_config),
+            drhs_ragged_dot=make_fn(
+                num_actual_groups=num_actual_groups, config=drhs_config
+            ),
             **kwargs,
         )
 
