@@ -212,8 +212,6 @@ def flash_attention_kernel(
     wg = lax.axis_index("wg")
 
     ((q_smem, k_smem), (o_smem, *residual_smems)) = qko_smem_union
-    at_wg = lambda x: x.at[wg]
-    q_smem, q_produced, o_smem = map(at_wg, (q_smem, q_produced, o_smem))
 
     def get_kv_ranges():
       lb = 0
@@ -258,11 +256,10 @@ def flash_attention_kernel(
 
     @pl.when(wg < 2)
     def compute_wg():
+      plgpu.set_max_registers(232, action="increase")
+
       q_base = (2 * qi + wg) * block_q
       qs = cast(pl.Slice, pl.ds(q_base, block_q))
-
-      plgpu.set_max_registers(232, action="increase")
-      plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_produced)
 
       m_init_value = -jnp.inf if use_stable_softmax else 0.0
       l_i = plgpu.layout_cast(jnp.zeros((block_q,), jnp.float32), _WGMMA_ROW)
@@ -293,7 +290,7 @@ def flash_attention_kernel(
           return plgpu.broadcasted_iota(jnp.int32, block_q_kv, d, layout=_WGMMA)
 
         def compute_qk(acc):
-          plgpu.wgmma(acc, q_smem, k_smem.at[si].T)
+          plgpu.wgmma(acc, q_smem.at[block.ds(wg, block_q)], k_smem.at[si].T)
           schedule_barrier_arrive()
           if bias_gmem is None:
             bias = None
@@ -421,16 +418,20 @@ def flash_attention_kernel(
       pl.when(wg == 0)(schedule_barrier_arrive)
 
       if return_residuals:
-        m_smem, l_smem = map(at_wg, residual_smems)
-        m_smem[...] = m_i * (1 / math.log2(math.e))
+        m_smem, l_smem = residual_smems
+        m_smem[wg] = m_i * (1 / math.log2(math.e))
         if use_stable_softmax and rescale_threshold != 1.0:
-          l_smem[...] = l_i * jnp.exp2(m_scale - m_i)
+          l_smem[wg] = l_i * jnp.exp2(m_scale - m_i)
         else:
-          l_smem[...] = l_i
+          l_smem[wg] = l_i
         plgpu.commit_smem()
         m_gmem, l_gmem = residual_gmems
-        plgpu.copy_smem_to_gmem(m_smem, m_gmem.at[hi, qs], commit_group=False)
-        plgpu.copy_smem_to_gmem(l_smem, l_gmem.at[hi, qs], commit_group=False)
+        plgpu.copy_smem_to_gmem(
+            m_smem.at[wg], m_gmem.at[hi, qs], commit_group=False
+        )
+        plgpu.copy_smem_to_gmem(
+            l_smem.at[wg], l_gmem.at[hi, qs], commit_group=False
+        )
 
       if normalize_output:
         l_i += float(jnp.finfo(jnp.float32).tiny)
@@ -445,9 +446,9 @@ def flash_attention_kernel(
           epi_qs = slice(qj * epi_tile_q, (qj + 1) * epi_tile_q)
           epi_ds = slice(dj * epi_tile_d, (dj + 1) * epi_tile_d)
           plgpu.wait_smem_to_gmem(num_epi_slots - 1, wait_read_only=True)
-          o_smem[si] = acc[epi_qs, epi_ds].astype(o_smem.dtype)
+          o_smem[wg, si] = acc[epi_qs, epi_ds].astype(o_smem.dtype)
           plgpu.commit_smem()
-          plgpu.copy_smem_to_gmem(o_smem.at[si], o_gmem_.at[epi_qs, epi_ds])
+          plgpu.copy_smem_to_gmem(o_smem.at[wg, si], o_gmem_.at[epi_qs, epi_ds])
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     @pl.when(wg == 2)
@@ -473,6 +474,8 @@ def flash_attention_kernel(
 
       def cp(gmem, smem, barrier, si):
         plgpu.copy_gmem_to_smem(gmem, smem.at[si], barrier.at[si])
+
+      plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_produced)
 
       lb, ub, _, _ = get_kv_ranges()
 
@@ -530,7 +533,7 @@ def flash_attention_kernel(
 
   compute_wgs = 2
   tiled_smem = mgpu_lib.tiled_swizzled_smem
-  q_scratch = tiled_smem((compute_wgs, block_q, head_dim), q.dtype, "q")
+  q_scratch = tiled_smem((compute_wgs * block_q, head_dim), q.dtype, "q")
   k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype, "k")
   v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype, "v")
   o_scratch = tiled_smem(
@@ -567,7 +570,7 @@ def flash_attention_kernel(
       v_smem=v_scratch,
       bias_smem=bias_scratch,
       mask_smem=mask_scratch,
-      q_produced=plgpu.Barrier(num_barriers=compute_wgs),
+      q_produced=plgpu.Barrier(),
       k_produced=plgpu.Barrier(num_barriers=max_stages),
       v_produced=plgpu.Barrier(num_barriers=max_stages),
       bias_produced=bias_produced,
