@@ -179,12 +179,13 @@ class AttentionBenchmark(parameterized.TestCase):
         and args_spec_name == 'basic'
     ):
       t1 = time.time()
-      autotune_res = tokamax.autotune(fn, args)
+      autotune_res = tokamax.autotune(fn, args, ignore_cache=True)
       time_autotune = time.time() - t1
+      time_autotune_ms = time_autotune * 1000
 
       common.write_tensorboard_logs(
           tensorboard_output=_TENSORBOARD_OUTPUT_ENV_VAR.value,
-          value=time_autotune,
+          value=time_autotune_ms,
           metric_tag=(
               f'attention/{args_spec_name}/mosaic/forward_and_vjp/autotuning_time'
           ),
