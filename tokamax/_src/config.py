@@ -17,26 +17,12 @@
 import contextlib
 import dataclasses
 import sys
-import threading
+from typing import Any
 
 from absl import flags
+import jax
 
-
-_ABSENT = object()
-_STATE = threading.local()
-
-
-@contextlib.contextmanager
-def _option_override_scope(name, value):
-  prev_value = getattr(_STATE, name, _ABSENT)
-  try:
-    setattr(_STATE, name, value)
-    yield
-  finally:
-    if prev_value is _ABSENT:
-      delattr(_STATE, name)
-    else:
-      setattr(_STATE, name, prev_value)
+_DEFAULT = object()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -44,6 +30,11 @@ class _ConfigOption[T]:
   """A configuration option."""
 
   flag: flags.FlagHolder[T]
+  config: Any = None
+
+  def __post_init__(self):
+    if self.config is None:
+      object.__setattr__(self, "config", jax.make_user_context(_DEFAULT))
 
   def __call__(self, value: T | str) -> contextlib.AbstractContextManager[None]:
     name = self.flag.name
@@ -54,7 +45,7 @@ class _ConfigOption[T]:
     except ValueError as e:
       raise ValueError(f"Invalid value for config `{name}`: {value}") from e
 
-    return _option_override_scope(name, value_)
+    return self.config(value_)
 
   @property
   def value(self) -> T:
@@ -65,7 +56,7 @@ class _ConfigOption[T]:
       # library, so `sys.argv` may carry flags owned by the host program
       # (pytest's `-s`, vLLM's CLI args, etc.) that absl does not recognize.
       flags.FLAGS(sys.argv, known_only=True)
-    return getattr(_STATE, self.flag.name, self.flag.value)
+    return self.flag.value if (v := self.config.value) is _DEFAULT else v
 
 
 autotuning_cache_miss_fallback = _ConfigOption(
