@@ -150,7 +150,7 @@ class LocalAttentionMask(Mask):
     return mask | diagonal  # pyrefly: ignore[unsupported-operation]
 
 
-@hps.composite  # pyrefly: ignore[bad-argument-type]
+@hps.composite
 def local_attention_mask_strategy(draw: Draw, seq_len: int) -> Mask:
   left_window = draw(
       hps.one_of(hps.none(), hps.integers(min_value=0, max_value=seq_len))
@@ -180,7 +180,7 @@ class RandomMask(Mask):
     return mask_lib.NumpyMask(mask)
 
 
-@hps.composite  # pyrefly: ignore[bad-argument-type]
+@hps.composite
 def random_mask_strategy(draw: Draw, q_seq_len: int, kv_seq_len: int) -> Mask:
   rand = draw(hps.randoms())
   seed = rand.randint(0, 2**32 - 1)
@@ -198,7 +198,7 @@ class ComposeMask(Mask):
     return self.op(self.left.get_mask(), self.right.get_mask())
 
 
-@hps.composite  # pyrefly: ignore[bad-argument-type]
+@hps.composite
 def compose_mask_strategy(draw: Draw, q_seq_len: int, kv_seq_len: int) -> Mask:
   mask1 = draw(mask_strategy(q_seq_len, kv_seq_len))
   mask2 = draw(mask_strategy(q_seq_len, kv_seq_len))
@@ -208,7 +208,7 @@ def compose_mask_strategy(draw: Draw, q_seq_len: int, kv_seq_len: int) -> Mask:
   return ComposeMask(mask1, mask2, op)
 
 
-@hps.composite  # pyrefly: ignore[bad-argument-type]
+@hps.composite
 def mask_strategy(draw: Draw, q_seq_len: int, kv_seq_len: int) -> Mask:
   oneof = [
       causal_mask_strategy(q_seq_len, kv_seq_len),
@@ -226,7 +226,7 @@ def mask_strategy(draw: Draw, q_seq_len: int, kv_seq_len: int) -> Mask:
   return draw(hps.one_of(oneof))
 
 
-@hps.composite  # pyrefly: ignore[bad-argument-type]
+@hps.composite
 def model_config_strategy(draw: Draw) -> ModelConfig:
   q_seq_len = draw(hps.sampled_from([1024, 2048, 4096]))
   kv_seq_len = draw(hps.sampled_from([1024, 2048, 4096]))
@@ -268,7 +268,7 @@ def check_mask_no_empty_rows(
   hp.assume(np.all(np.any(effective_mask, axis=1)))
 
 
-@hps.composite  # pyrefly: ignore[bad-argument-type]
+@hps.composite
 def block_sizes_strategy(
     draw: Draw,
     q_seq_len: int,

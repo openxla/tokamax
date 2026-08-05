@@ -754,7 +754,7 @@ def flash_attention_kernel(
           plgpu.barrier_arrive(acc_produced.at[i])
 
       def two_in_flight(iterable):
-        for a, _ in itertools.pairwise(itertools.chain(iterable, [None])):  # pytype: disable=wrong-arg-types
+        for a, _ in itertools.pairwise(itertools.chain(iterable, [None])):
           yield a
 
       @pl.loop(lb + 1, ub)

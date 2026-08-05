@@ -577,7 +577,7 @@ class RingSplashAttentionKernel:
     spec = jax.sharding.PartitionSpec(self.ring_axis)
     _resolve_spec = lambda x: spec if x is not None else None
 
-    mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
+    mask_info_specs = MaskInfo(
         mask_next=_resolve_spec(self.fwd_mask_info.mask_next),  # pyrefly: ignore[bad-argument-type]
         active_rows=_resolve_spec(self.fwd_mask_info.active_rows),  # pyrefly: ignore[bad-argument-type]
         active_cols=_resolve_spec(self.fwd_mask_info.active_cols),  # pyrefly: ignore[bad-argument-type]

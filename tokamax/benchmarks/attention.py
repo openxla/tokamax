@@ -30,7 +30,7 @@ from tokamax._src import numerics
 from tokamax.benchmarks import common
 
 try:
-  import cuequivariance_jax  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  import cuequivariance_jax  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-import]
 except ImportError:
   cuequivariance_jax = None
 
@@ -152,7 +152,7 @@ class AttentionBenchmark(parameterized.TestCase):
     fn, args = tokamax.standardize_function(
         fn,
         kwargs=example,
-        mode=benchmark_mode,  # pytype: disable=wrong-arg-types
+        mode=benchmark_mode,
     )
     fn = jax.jit(fn)
     res = tokamax.benchmark(fn, args)
@@ -215,7 +215,7 @@ class AttentionBenchmark(parameterized.TestCase):
             tokamax.dot_product_attention, implementation='xla_chunked'
         ),
         kwargs=example_ref,
-        mode=benchmark_mode,  # pytype: disable=wrong-arg-types
+        mode=benchmark_mode,
     )
     out_ref = jax.jit(fn_ref)(args_ref)
     out_actual = fn(args)

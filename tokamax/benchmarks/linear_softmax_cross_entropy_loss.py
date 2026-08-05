@@ -76,7 +76,7 @@ class LinearSoftmaxCrossEntropyLossBenchmark(parameterized.TestCase):
     fn, args = tokamax.standardize_function(
         tokamax.linear_softmax_cross_entropy_loss,
         kwargs=example,
-        mode=benchmark_mode,  # pytype: disable=wrong-keyword-args
+        mode=benchmark_mode,
     )
     fn = jax.jit(fn)
     res = tokamax.benchmark(fn, args)

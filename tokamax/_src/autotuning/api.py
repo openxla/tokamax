@@ -161,7 +161,7 @@ class AutotuningResult:
     return self
 
   def __exit__(self, exc_type, exc_value, traceback):
-    self._context.__exit__(exc_type, exc_value, traceback)  # pytype: disable=attribute-error
+    self._context.__exit__(exc_type, exc_value, traceback)  # pyrefly: ignore[missing-attribute]
     object.__delattr__(self, "_context")
     op_lib.get_autotuning_cache_overlay_state().stack.pop()
 
@@ -205,7 +205,7 @@ def get_bound_args[**P](
     ),
     *args: P.args,
     **kwargs: P.kwargs,
-) -> tuple[op_lib.BoundArguments, ...]:  # pytype: disable=not-supported-yet
+) -> tuple[op_lib.BoundArguments, ...]:
   """Returns a tuple of unique BoundArguments for all Tokamax ops in `f`.
 
   Args:
@@ -260,9 +260,9 @@ def bound_args_to_json[**P](
         | jax.stages.Lowered
     ),
     filename: str,
-) -> None:  # pytype: disable=not-supported-yet
+) -> None:
   """Dumps a sequence of BoundArguments to a JSON file."""
-  bound_args = get_bound_args(f)  # pyrefly: ignore[invalid-param-spec]
+  bound_args = get_bound_args(f)
   json_string = dump_bound_args_to_json(bound_args)
   with open(filename, "w") as fd:
     fd.write(json_string)
@@ -314,7 +314,7 @@ def get_op_implementations(
   impls = dict(_API_IMPLEMENTATIONS.get(mro[mro.index(op_lib.Op) - 1], {}))
 
   if device is not None:
-    impls = {k: v for k, v in impls.items() if v.supported_on(device)}  # pytype: disable=attribute-error
+    impls = {k: v for k, v in impls.items() if v.supported_on(device)}  # pyrefly: ignore[missing-attribute]
   return impls
 
 
@@ -356,7 +356,7 @@ def autotune(
       raise ValueError("`args` are only supported if `f` is callable.")
     bound_args = tuple(f)
   else:
-    bound_args = get_bound_args(f, *args)  # pytype: disable=paramspec-error
+    bound_args = get_bound_args(f, *args)  # pyrefly: ignore[bad-argument-type]
 
   if not ignore_cache:
     bound_args = [ba for ba in bound_args if ba.cached_autotuning_data is None]

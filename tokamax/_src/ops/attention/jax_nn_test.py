@@ -44,13 +44,11 @@ class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
 
   def _run_test_with_inputs(self, *args, **kwargs):
     impl_kwargs = kwargs.get("impl_kwargs", {})
-    # pytype: disable=attribute-error
     if (
         (impl_kwargs.get("logits_dtype") not in (None, jnp.float32))
         or not impl_kwargs.get("normalize_output", True)
         or impl_kwargs.get("return_residuals", False)
     ):
-      # pytype: enable=attribute-error
       kwargs["expect_supported"] = False
     super()._run_test_with_inputs(*args, **kwargs)
 

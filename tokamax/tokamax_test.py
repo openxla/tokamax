@@ -27,14 +27,14 @@ from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.normalization import api as norm_api
 
 try:
-  from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
-  from tokamax._src.ops.attention import pallas_triton_vjp as pl_triton_attn_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
-  from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.attention import pallas_triton_vjp as pl_triton_attn_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 except ImportError:
   pass
 

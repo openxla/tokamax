@@ -85,7 +85,6 @@ if not typing.TYPE_CHECKING:
   pydantic.ImportString._serialize = _serialize  # pylint: disable=protected-access
 
 
-# pytype: disable=invalid-annotation
 def annotate(ty: Any) -> Any:
   """Annotates types with serializers and validators, as necessary."""
   # Move `str` to the end of the union.
@@ -114,9 +113,9 @@ def annotate(ty: Any) -> Any:
   if origin is Annotated:
     return Annotated[annotate(ty.__origin__), *ty.__metadata__]
   if origin is Union or isinstance(ty, types.UnionType):
-    return Union[tuple(map(annotate, typing.get_args(ty)))]
+    return Union[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[not-a-type]
   if origin is tuple:
-    return tuple[tuple(map(annotate, typing.get_args(ty)))]
+    return tuple[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[not-a-type]
   if origin in (type, Callable):
     return pydantic.ImportString[ty]
   if origin is Mapping:
@@ -137,7 +136,7 @@ def annotate(ty: Any) -> Any:
         return v
       if isinstance(v, dict):
         v = {k: frozenset(val) for k, val in v.items()}
-        return jax.sharding.ManualAxisType(**v)
+        return jax.sharding.ManualAxisType(**v)  # pyrefly: ignore[bad-argument-type]
       return v
 
     return Annotated[
@@ -156,9 +155,6 @@ def annotate(ty: Any) -> Any:
     return Annotated[ty, Dataclass]
 
   return ty
-
-
-# pytype: enable=invalid-annotation
 
 
 class TypeAdapter[T]:
@@ -367,6 +363,6 @@ def get_arg_spec_model(name: str, signature: inspect.Signature) -> type[Any]:
     else:
       annotation = annotate(p.annotation)
     fields[param_name] = annotation
-  ty = TypedDict(name, fields, total=False)  # pytype: disable=wrong-arg-types
+  ty = TypedDict(name, fields, total=False)  # pyrefly: ignore[invalid-argument]
   ty.__pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
   return ty

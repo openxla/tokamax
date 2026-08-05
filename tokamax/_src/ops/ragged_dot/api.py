@@ -32,7 +32,7 @@ _IMPLEMENTATIONS = dict(xla=base.RaggedDot())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.ragged_dot import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_dot import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["triton"] = pallas_triton.PallasTritonRaggedDot()
   _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS
@@ -40,7 +40,7 @@ except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["mosaic_gpu"] = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
   _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
@@ -48,7 +48,7 @@ except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
   if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
@@ -57,7 +57,7 @@ except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["mosaic_tpu_v2"] = (
       pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()

@@ -520,7 +520,7 @@ class DotProductAttention[C, K: Hashable](
 
     precision = cast(
         tuple[CanonicalPrecision, CanonicalPrecision],
-        tuple(map(precision_lib.canonicalize_precision, precision)),
+        tuple(map(precision_lib.canonicalize_precision, precision)),  # pyrefly: ignore[bad-argument-type]
     )
 
     if logits_dtype is AUTO:
@@ -768,7 +768,7 @@ def unfold_q_sequence_heads(
   return out, cast(Residuals, tuple(map(reshape, residuals)))
 
 
-def vmap_batch_dims[**P, T](f: Callable[P, T]) -> Callable[P, T]:  # pytype: disable=not-supported-yet
+def vmap_batch_dims[**P, T](f: Callable[P, T]) -> Callable[P, T]:
   """Returns `f` vmapped over the batch dims of its first argument."""
 
   def vmap(f, *args: P.args, **kwargs: P.kwargs):

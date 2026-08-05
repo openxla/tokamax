@@ -59,7 +59,7 @@ class GmmPerfTest(parameterized.TestCase):
     fn, args = tokamax.standardize_function(
         gmm_op,
         kwargs=benchmark_config,
-        mode="forward",  # pytype: disable=wrong-arg-types
+        mode="forward",
     )
     fn = jax.jit(fn)
     res = tokamax.benchmark(fn, args, method="hermetic_xprof")
@@ -99,7 +99,7 @@ class GmmPerfTest(parameterized.TestCase):
     fn, args = tokamax.standardize_function(
         drhs_op,
         kwargs=benchmark_config,
-        mode="forward",  # pytype: disable=wrong-arg-types
+        mode="forward",
     )
     fn = jax.jit(fn)
     res = tokamax.benchmark(fn, args, method="hermetic_xprof")

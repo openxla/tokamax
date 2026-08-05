@@ -116,7 +116,7 @@ class GroupSizes:
     if isinstance(self.repr_value_or_total_size, int):
       assert isinstance(self.value, np.ndarray)
       return tuple(map(int, self.value))
-    return self.repr_value_or_total_size  # pytype: disable=bad-return-type
+    return self.repr_value_or_total_size  # pyrefly: ignore[bad-return]
 
   def __jax_array__(self) -> jax.Array:
     return jnp.asarray(self.value)
@@ -142,7 +142,7 @@ class GroupSizes:
         return dict(num_groups=x.value.size, total_size=total_size)
       return x.representative_value
 
-    validate_ints = lambda x: cls(jax.ShapeDtypeStruct([len(x)], jnp.int32), x)  # pytype: disable=wrong-arg-types
+    validate_ints = lambda x: cls(jax.ShapeDtypeStruct([len(x)], jnp.int32), x)
     from_ints_schema = cs.chain_schema([
         cs.tuple_schema([cs.int_schema()], variadic_item_index=0),
         cs.no_info_plain_validator_function(validate_ints),

@@ -644,7 +644,7 @@ def flash_attention_vjp_kernel(
         return plgpu.wgmma_accumulator_load(acc, wait_n=1)
 
       dp = pl.run_scoped(compute_dp, acc_type)
-      ds = p * (dp - broadcast(delta))  # pytype: disable=wrong-arg-types  # jax-operator-types
+      ds = p * (dp - broadcast(delta))
       if logits_soft_cap is not None:
         ds *= 1.0 - logits * logits
 

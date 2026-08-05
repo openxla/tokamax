@@ -193,7 +193,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           precision=precision,
           out_dtype=preferred_element_type,
           tiling=(config.tile_m, config.tile_k, config.tile_n),
-          interpret=self.interpret,  # pytype: disable=attribute-error
+          interpret=self.interpret,
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
           manual_axis_type=manual_axis_type,
@@ -223,7 +223,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           # config.tile_k as tn (backend minor dim)
           tiling=(config.tile_m, config.tile_n, config.tile_k),
           transpose_rhs=True,
-          interpret=self.interpret,  # pytype: disable=attribute-error
+          interpret=self.interpret,
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
           manual_axis_type=manual_axis_type,
@@ -252,7 +252,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           precision=precision,
           out_dtype=preferred_element_type,
           tiling=(config.tile_m, config.tile_k, config.tile_n),
-          interpret=self.interpret,  # pytype: disable=attribute-error
+          interpret=self.interpret,
           input_buffer_count=config.input_buffer_count,
           activation=activation if not return_residuals else None,
           combine_scopes=config.combine_scopes,

@@ -115,7 +115,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     with test_base.override_test_args(
         atol={1.0: 0.008, 0.99: 0.006}, atol_grads={1.0: 0.02, 0.99: 0.012}
     ):
-      super().test_causal_mask_cross_attention0()  # pytype: disable=attribute-error
+      super().test_causal_mask_cross_attention0()  # pyrefly: ignore[missing-attribute]
 
   def test_causal_mask_cross_attention1(self):
     self.skipTest("TODO: Support k-sequence non-multiple of block_kv.")
@@ -147,7 +147,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       self.skipTest("`rescale_threshold != 1.0` unsupported.")
 
     with mock.patch.object(self, "_attention_fn", op_cls(**kwargs)):  # type: ignore
-      self.test_self_attention0()  # pytype: disable=attribute-error
+      self.test_self_attention0()  # pyrefly: ignore[missing-attribute]
       if use_stable_softmax:
         self.test_normalize_output()
 

@@ -27,7 +27,7 @@ _IMPLEMENTATIONS = dict(xla=base.RaggedGather())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.ragged_gather import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_gather import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasTpuRaggedGather()
   _DEFAULT_IMPLEMENTATIONS = ("mosaic_tpu",) + _DEFAULT_IMPLEMENTATIONS
@@ -35,7 +35,7 @@ except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.ragged_gather import pallas_mosaic_v2_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_gather import pallas_mosaic_v2_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["mosaic_tpu_v2"] = pallas_mosaic_v2_tpu.PallasV2TpuRaggedGather()
   if "mosaic_tpu_v2" not in _DEFAULT_IMPLEMENTATIONS:

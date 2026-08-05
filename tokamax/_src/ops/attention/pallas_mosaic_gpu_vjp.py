@@ -192,7 +192,7 @@ class PallasMosaicGpuFlashAttentionVjp(
   ) -> set[sm90.Config | sm100.Config]:
     if gpu_utils.is_sm100():
       return sm100.get_autotuning_configs(ba)  # pyrefly: ignore[bad-return]
-    return sm90.get_autotuning_configs(ba)  # pyrefly: ignore[bad-return]
+    return sm90.get_autotuning_configs(ba)
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

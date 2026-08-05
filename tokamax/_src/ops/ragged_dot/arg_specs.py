@@ -84,7 +84,7 @@ def _make_spec(
     )
 
   args = dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
-  return arg_spec.ArgSpec(name=name, args=args, project=project, tags=tags)  # pytype: disable=wrong-arg-types
+  return arg_spec.ArgSpec(name=name, args=args, project=project, tags=tags)
 
 
 def _make_maxtext_spec(

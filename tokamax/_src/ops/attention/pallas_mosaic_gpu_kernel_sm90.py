@@ -47,7 +47,7 @@ _FORBID_EXTRA = pydantic.ConfigDict(extra="forbid")
 
 @pydantic.dataclasses.dataclass(
     frozen=True, kw_only=True, slots=True, config=_FORBID_EXTRA
-)  # pytype: disable=wrong-keyword-args
+)
 class Config(common.ConfigBase):
   """Configuration parameters for Pallas-Mosaic-GPU kernels on SM90 GPUs."""
   pass

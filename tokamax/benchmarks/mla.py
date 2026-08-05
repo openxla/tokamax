@@ -97,7 +97,7 @@ def setUpModule():  # pylint: disable=invalid-name
     cuda_versions = getattr(jax._src.lib, 'cuda_versions', None)  # pylint: disable=protected-access
     if cuda_versions is not None:
       try:
-        cudnn_version = cuda_versions.cudnn_get_version()  # pytype: disable=attribute-error
+        cudnn_version = cuda_versions.cudnn_get_version()
       except AttributeError:
         pass
       else:
@@ -133,7 +133,7 @@ class MlaBenchmark(parameterized.TestCase):
     fn, args = tokamax.standardize_function(
         mla_op_wrapper,
         kwargs=example,
-        mode=benchmark_mode,  # pytype: disable=wrong-arg-types
+        mode=benchmark_mode,
     )
     fn = jax.jit(fn)
     res = tokamax.benchmark(fn, args)

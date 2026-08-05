@@ -139,7 +139,7 @@ class NumericsTest(parameterized.TestCase):
   def test_random_initialize_qarray(self, qtype, scale, explicit_qtype):
     qvalue = jax.ShapeDtypeStruct((256, 256), qtype)
     kwargs = dict(qtype=qtype) if explicit_qtype else {}
-    q = qwix.QArray(qvalue, scale, **kwargs)  # pytype: disable=wrong-arg-types
+    q = qwix.QArray(qvalue, scale, **kwargs)  # pyrefly: ignore[bad-argument-type]
     q = numerics.random_initialize(q)
     self.assertEqual(q.qvalue.shape, qvalue.shape)
     self.assertEqual(q.scale.shape, scale.shape)

@@ -27,7 +27,7 @@ import jax.numpy as jnp
 
 
 type PyTree = Any
-SymbolicDim = type(export.symbolic_shape("_a")[0])  # pytype: disable=invalid-annotation
+SymbolicDim = type(export.symbolic_shape("_a")[0])
 
 einshape = lambda eq, **kw: functools.partial(einshape_jax.einshape, eq, **kw)
 

@@ -29,7 +29,7 @@ import tokamax
 from tokamax._src import numerics
 
 try:
-  import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error # pytype: disable=import-error
+  import cuequivariance_jax  # pylint: disable=g-import-not-at-top,import-error  # pyrefly: ignore[missing-import]
 except Exception:  # pylint: disable=broad-except
   cuequivariance_jax = None
 
@@ -170,7 +170,7 @@ class TriangleMultiplicationBenchmark(parameterized.TestCase):
         seed=None,
     )
 
-    res = tokamax.benchmark(fn, actual_args)
+    res = tokamax.benchmark(fn, actual_args)  # pyrefly: ignore[bad-argument-type]
     metric_tag = (
         f"triangle_multiplication/n_{n}/{implementation or 'default'}/{benchmark_mode}"
     )

@@ -189,7 +189,7 @@ def _get_common_kernel_info(
       op_name=';'.join(filter(bool, call_stack + (_get_op_name(op.location),))),
       source_line=source_line,
       source_file=source_file,
-      hlo_module_name=parent.opview.sym_name.value,  # pytype: disable=attribute-error
+      hlo_module_name=parent.opview.sym_name.value,  # pyrefly: ignore[missing-attribute]
       metadata_payload=_get_payload(op),
   )
 
@@ -246,15 +246,19 @@ def _get_kernel_info_stablehlo(
   ) -> ir.WalkResult:
     op_ = op.opview
 
-    if isinstance(op_, stablehlo.CustomCallOp) and (getter := _KERNEL_GETTER.get(op_.call_target_name.value)) is not None:  # pytype: disable=attribute-error
+    if (
+        isinstance(op_, stablehlo.CustomCallOp)
+        and (getter := _KERNEL_GETTER.get(op_.call_target_name.value))
+        is not None
+    ):
       emit_fn = functools.partial(getter, op_, call_stack)
       records.append(hlo_utils_common.Record(emit_fn, False, _get_payload(op_)))
     elif isinstance(op_, func.CallOp):
-      callee = symbol_table[op_.callee.value]  # pytype: disable=attribute-error
+      callee = symbol_table[op_.callee.value]
       call_stack = call_stack + (_get_op_name(op_.location),)
       callee.operation.walk(functools.partial(handle_op, call_stack=call_stack))
     elif isinstance(op_, func.FuncOp):
-      if op_.name.value != 'main':  # pytype: disable=attribute-error
+      if op_.name.value != 'main':
         return ir.WalkResult.SKIP
     elif (
         include_xla_kernels

@@ -67,10 +67,10 @@ class AutotuningData[K](
       return_data = AutotuningData({config: self[config]})
     except ExceptionGroup as e:
       raise e
-    return return_data  # pyrefly: ignore[bad-return]
+    return return_data
 
   def prune_errors(self) -> dict[K, BenchmarkData]:
-    return {k: v for k, v in self.items() if isinstance(v, BenchmarkData)}  # pytype: disable=bad-return-type
+    return {k: v for k, v in self.items() if isinstance(v, BenchmarkData)}
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
@@ -88,7 +88,7 @@ class AutotuningData[K](
     )
 
   def __or__(self, other: AutotuningData[K]) -> AutotuningData[K]:
-    return AutotuningData(super().__or__(other))  # pyrefly: ignore[bad-return]
+    return AutotuningData(super().__or__(other))
 
 
 def _compile(fn_factory, config, args, kwargs, *, seed=None):
@@ -145,9 +145,7 @@ class Autotuner:
             "Cannot specify a `compile_executor_fn` when using a"
             " `ProcessPoolExecutor` executor."
         )
-      # pytype: disable=wrong-keyword-args
-      with self.compile_executor_fn(max_workers=os.cpu_count()) as compile_exec:
-        # pytype: enable=wrong-keyword-args
+      with self.compile_executor_fn(max_workers=os.cpu_count()) as compile_exec:  # pyrefly: ignore[unexpected-keyword]
         compiled = {
             compile_exec.submit(_compile, fn_factory, cfg, args, kwargs): cfg
             for cfg in configs

@@ -410,22 +410,22 @@ def _kernel_dq(
         @pl.when(warp_id == 3)
         def tma_eltwise_warp():
           if bias_smem is not None:
-            plgpu.barrier_arrive(bias_consumed)
+            plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
           if mask_smem is not None:
-            plgpu.barrier_arrive(mask_consumed)
+            plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
           @pl.loop(lb, ub)
           def kv_loop(ki):
             ks = pl.ds(ki * block_kv, block_kv)
 
             if bias_smem is not None:
-              plgpu.barrier_wait(bias_consumed)
+              plgpu.barrier_wait(bias_consumed)  # pyrefly: ignore[bad-argument-type]
               mgpu_lib.fence_async_shared_cta()
               bias_hi = 0 if bias_gmem.shape[-3] == 1 else hi
               cp(bias_gmem.at[bias_hi, qs, ks], bias_smem, bias_produced)
 
             if mask_smem is not None:
-              plgpu.barrier_wait(mask_consumed)
+              plgpu.barrier_wait(mask_consumed)  # pyrefly: ignore[bad-argument-type]
               mgpu_lib.fence_async_shared_cta()
               mask_hi = 0 if mask_gmem.shape[-3] == 1 else hi
               mask_qs = 0 if mask_gmem.shape[-2] == 1 else qs
@@ -513,9 +513,9 @@ def _kernel_dq(
         if bias_smem is None:
           bias = _load_bcast(bias_gmem, (hi, qs, ks), layout=layout)
         else:
-          plgpu.barrier_wait(bias_produced)
+          plgpu.barrier_wait(bias_produced)  # pyrefly: ignore[bad-argument-type]
           bias = plgpu.load(bias_smem, layout=layout)
-          plgpu.barrier_arrive(bias_consumed)
+          plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
         s = s * scale + bias.astype(s.dtype)
         scale = 1.0
 
@@ -562,13 +562,13 @@ def _kernel_dq(
         if mask_smem is None:
           mask = _load_bcast(mask_gmem, (hi, qs, ks), layout=layout)
         else:
-          plgpu.barrier_wait(mask_produced)
+          plgpu.barrier_wait(mask_produced)  # pyrefly: ignore[bad-argument-type]
           if mask_smem.ndim == 1:
             mask = plgpu.load(mask_smem, layout=_TCGEN05_COL)
             mask = lax.broadcast_in_dim(mask, s.shape, [1])
           else:
             mask = plgpu.load(mask_smem, layout=layout)
-          plgpu.barrier_arrive(mask_consumed)
+          plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0
@@ -733,9 +733,9 @@ def _kernel_dkv(
         @pl.when(warp_id == 3)
         def tma_eltwise_warp():
           if bias_smem is not None:
-            plgpu.barrier_arrive(bias_consumed)
+            plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
           if mask_smem is not None:
-            plgpu.barrier_arrive(mask_consumed)
+            plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
           @pl.loop(0, total_steps)
           def q_loop(step):
@@ -744,13 +744,13 @@ def _kernel_dkv(
             hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
 
             if bias_smem is not None:
-              plgpu.barrier_wait(bias_consumed)
+              plgpu.barrier_wait(bias_consumed)  # pyrefly: ignore[bad-argument-type]
               mgpu_lib.fence_async_shared_cta()
               bias_hi = 0 if bias_gmem.shape[-3] == 1 else hi
               cp(bias_gmem.at[bias_hi, ks, qs], bias_smem, bias_produced)
 
             if mask_smem is not None:
-              plgpu.barrier_wait(mask_consumed)
+              plgpu.barrier_wait(mask_consumed)  # pyrefly: ignore[bad-argument-type]
               mgpu_lib.fence_async_shared_cta()
               mask_hi = 0 if mask_gmem.shape[-3] == 1 else hi
               mask_qs = 0 if mask_gmem.shape[-1] == 1 else qs
@@ -817,9 +817,9 @@ def _kernel_dkv(
       if bias_gmem is None:
         bias = None
       elif bias_smem is None:
-        bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)
+        bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)  # pyrefly: ignore[bad-argument-type]
       else:
-        plgpu.barrier_wait(bias_produced)
+        plgpu.barrier_wait(bias_produced)  # pyrefly: ignore[bad-argument-type]
         bias = plgpu.load(bias_smem, layout=_TCGEN05)
 
       plgpu.barrier_wait(s_produced)
@@ -828,7 +828,7 @@ def _kernel_dkv(
 
       if bias is not None:
         if bias_smem is not None:
-          plgpu.barrier_arrive(bias_consumed)
+          plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
         s, scale = s * scale + bias.astype(s.dtype), 1.0
 
       if logits_soft_cap is not None:
@@ -876,13 +876,13 @@ def _kernel_dkv(
       if mask_gmem is not None:
         if mask_smem is None:
           if loop_invariant_mask is None:
-            mask = _load_bcast(mask_gmem, (hi, ks, qs), layout=_TCGEN05)
+            mask = _load_bcast(mask_gmem, (hi, ks, qs), layout=_TCGEN05)  # pyrefly: ignore[bad-argument-type]
           else:
             mask = lax.broadcast_in_dim(loop_invariant_mask, s.shape, [0])
         else:
-          plgpu.barrier_wait(mask_produced)
+          plgpu.barrier_wait(mask_produced)  # pyrefly: ignore[bad-argument-type]
           mask = plgpu.load(mask_smem, layout=_TCGEN05)
-          plgpu.barrier_arrive(mask_consumed)
+          plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0

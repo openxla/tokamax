@@ -136,15 +136,15 @@ def quant_block_spec(
           f" min_addressable_size in {axis=}. Got {eps=} and {mas=}."
       )
   scale_info_per_axis = [
-      _get_scale_tile_info(eps, tile_size, s, mas)
+      _get_scale_tile_info(eps, tile_size, s, mas)  # pyrefly: ignore[bad-argument-type]
       for eps, tile_size, s, mas in zip(
-          eps_list, tile_sizes, x_values.shape, min_addressable_sizes
+          eps_list, tile_sizes, x_values.shape, min_addressable_sizes  # pyrefly: ignore[bad-argument-type]
       )
   ]
 
   # construct the blockspec
   def index_map(*args):
-    idxs = list(x_spec.index_map(*args))
+    idxs = list(x_spec.index_map(*args))  # pyrefly: ignore[not-callable]
     return [scale_info_per_axis[i].ti_to_sti(idx) for i, idx in enumerate(idxs)]
 
   scales_block_shape = [info.scales_tile_size for info in scale_info_per_axis]
@@ -158,7 +158,7 @@ def quant_block_spec(
 
   # return the results
   x_new = dataclasses.replace(x, scale=x_scales)
-  x_spec_new = dataclasses.replace(x, qvalue=x_spec, scale=scales_blockspec)  # pytype: disable=wrong-arg-types
+  x_spec_new = dataclasses.replace(x, qvalue=x_spec, scale=scales_blockspec)  # pyrefly: ignore[bad-argument-type]
   return x_new, x_spec_new
 
 
@@ -232,10 +232,10 @@ def custom_buffered_pallas_call(
       # specify dimension semantic from the scalar prefetch grid and emit
       pltpu.emit_pipeline(
           lambda *args: kernel(*smem_refs, *args, *scratch_refs),
-          grid=grid,
+          grid=grid,  # pyrefly: ignore[bad-argument-type]
           in_specs=in_specs_,
           out_specs=out_specs_,
-          dimension_semantics=compiler_params.dimension_semantics,
+          dimension_semantics=compiler_params.dimension_semantics,  # pyrefly: ignore[bad-argument-type]
       )(*input_output_refs)
 
     bs_smem = pl.BlockSpec(memory_space=pltpu.SMEM)
@@ -287,4 +287,3 @@ def poison_tpu_memory():
       compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
   )(jnp.zeros((1,), dtype=jnp.float32))
   out.block_until_ready()
-

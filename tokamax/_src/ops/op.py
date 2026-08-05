@@ -141,14 +141,14 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
   supports_symbolic_shapes: ClassVar[bool] = True
   supports_batched_args_capture: ClassVar[bool] = True
 
-  config: C | None = None  # pytype: disable=name-error
+  config: C | None = None
   _: dataclasses.KW_ONLY
   # VJP function for the op. `vjp` will be passed the residuals and the output
   # of the op, the output gradients, then all arguments passed to the op.
   # The VJP function must return a tuple of gradients for each positional
   # argument, or a dict `{"argname": gradient, ...}`. If a dict is returned, any
   # input array arguments not in the dict will have gradients set to zeros.
-  vjp: Callable[Concatenate[R, T, T, P], Any] | None = None  # pytype: disable=name-error
+  vjp: Callable[Concatenate[R, T, T, P], Any] | None = None
 
   def __init_subclass__(cls, *args, **kwargs):
     super().__init_subclass__(*args, **kwargs)
@@ -261,7 +261,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         out = residuals.out
         residuals = residuals.residuals
         dout = dout[0] if return_residuals else dout
-        grads = self.vjp(residuals, out, dout, *args, **kwargs)  # pytype: disable=wrong-arg-count
+        grads = self.vjp(residuals, out, dout, *args, **kwargs)
 
         if isinstance(grads, dict):
           grads_ba = ba.signature.bind_partial(**grads)
@@ -353,7 +353,9 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     del ba  # Unused.
     return set()
 
-  def _capture_batched_args[_T2](self, fn: Callable[..., _T2]) -> Callable[..., _T2]:  # pytype: disable=not-supported-yet
+  def _capture_batched_args[_T2](
+      self, fn: Callable[..., _T2]
+  ) -> Callable[..., _T2]:
     if self.supports_batched_args_capture:
       return batching.capture_batched_args(fn)
     return lambda *args, **kwargs: fn(*args, batched_args=None, **kwargs)
@@ -405,7 +407,7 @@ class AUTO:
 class BoundArguments[C, K: Hashable]:
   """Bound arguments for an op's `__call__` method."""
 
-  op: Op[..., Any, Any, C, K]  # pytype: disable=invalid-annotation
+  op: Op[..., Any, Any, C, K]
   arguments: Mapping[str, Any]
 
   def __post_init__(self):
@@ -485,12 +487,12 @@ class BoundArguments[C, K: Hashable]:
 
     if check_autotuning_cache:
       if (data := self.cached_autotuning_data) is not None and data.items():
-        return data.fastest_config  # pytype: disable=unbound-type-param
+        return data.fastest_config
 
     if autotune_configs is not None:
       return self.autotune(
           autotune_configs, cache_results=cache_autotuning_results
-      ).fastest_config  # pytype: disable=unbound-type-param
+      ).fastest_config
 
     if allow_heuristics:
       return heuristics_config

@@ -198,7 +198,9 @@ def _fwd_kernel_impl(
       k, k_scales = _rescale(k, k_scales_ref, slice_k, slice_d, quantize_qk_dot)
 
       if quantize_qk_dot:
-        s += plgpu.dot(q[i], k.T).astype(jnp.float32) * (q_scales[i] * k_scales.T)  # pytype: disable=attribute-error
+        s += plgpu.dot(q[i], k.T).astype(jnp.float32) * (
+            q_scales[i] * k_scales.T
+        )
       else:
         s += plgpu.dot(q[i].astype(k.dtype), k.T, precision=q_k_dot_precision)
     s = s.astype(logits_dtype)

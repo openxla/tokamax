@@ -64,7 +64,7 @@ class XlaChunkedAttentionTest(test_base.AttentionTestBase):
 
   def test_normalize_output(self):
     with test_base.override_test_args(atol_grads=3e-5):
-      super().test_normalize_output()  # pytype: disable=attribute-error
+      super().test_normalize_output()
 
 
 def _split_into_pages(unpadded_k, unpadded_v, max_num_pages, max_page_size):

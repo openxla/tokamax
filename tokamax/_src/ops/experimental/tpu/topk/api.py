@@ -27,7 +27,7 @@ _implementations = dict(xla=base.TopK())
 _DEFAULT_IMPLEMENTATION = ("xla",)
 
 try:
-  from tokamax._src.ops.experimental.tpu.topk import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.experimental.tpu.topk import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _implementations["mosaic_tpu"] = pallas_mosaic_tpu.PallasTpuTopK()
   _DEFAULT_IMPLEMENTATION = ("mosaic_tpu",) + _DEFAULT_IMPLEMENTATION
