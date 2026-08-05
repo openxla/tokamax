@@ -155,9 +155,9 @@ class AutotuningResult:
       overlay.setdefault(ba.op, {}).setdefault(self.device_kind, {})[key] = data
     state = op_lib.get_autotuning_cache_overlay_state()
     state.stack.append(overlay)
-    context = state.context(state.context.value + (id(self),))
-    context.__enter__()
-    object.__setattr__(self, "_context", context)
+    config = op_lib.AUTOTUNING_CACHE_OVERLAY_JAX_CONFIG
+    object.__setattr__(self, "_context", config(config.value + (id(self),)))
+    self._context.__enter__()  # pyrefly: ignore[missing-attribute]
     return self
 
   def __exit__(self, exc_type, exc_value, traceback):

@@ -389,12 +389,12 @@ _AUTOTUNING_CACHE: dict[
 ] = {}
 
 _AUTOTUNING_CACHE_OVERLAY = threading.local()
+AUTOTUNING_CACHE_OVERLAY_JAX_CONFIG: Final[Any] = jax.make_user_context(())
 
 
 def get_autotuning_cache_overlay_state() -> Any:
   if not hasattr(_AUTOTUNING_CACHE_OVERLAY, "stack"):
     _AUTOTUNING_CACHE_OVERLAY.stack = []
-    _AUTOTUNING_CACHE_OVERLAY.context = jax.make_user_context(())
   return _AUTOTUNING_CACHE_OVERLAY
 
 
