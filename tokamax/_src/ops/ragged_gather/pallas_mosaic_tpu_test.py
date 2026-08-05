@@ -29,8 +29,8 @@ jax.config.parse_flags_with_absl()
 class PallasTpuRaggedGatherTest(parameterized.TestCase):
 
   @parameterized.product(
-      in_out_size=[(512, 400), (512, 1024)],
-      start_end=[(3, 338), (10, 422)],
+      in_out_size=[(512, 32), (512, 400), (512, 1024)],
+      start_end=[(3, 28), (3, 338), (10, 422)],
       hidden_size=[128, 512, 8192],
       dtype=[jnp.int8, jnp.bfloat16, jnp.float32],
   )
