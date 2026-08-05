@@ -21,7 +21,6 @@ import functools
 from typing import Any, ClassVar, override
 
 import jax
-from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import gpu_utils

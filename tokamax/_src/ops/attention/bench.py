@@ -24,8 +24,6 @@ from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import pallas_mosaic_gpu as mgpu_attn
-from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as fa_vjp
-from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm100 as sm100_vjp
 from tokamax._src.ops.attention import pallas_triton as triton_attn
 from tokamax._src.ops.flex_attention import pallas_triton as triton_flex
 from tokamax._src.ops.flex_attention import wrapper

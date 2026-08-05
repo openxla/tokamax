@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import dataclasses
-
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp

@@ -21,7 +21,6 @@ from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
 import pytest

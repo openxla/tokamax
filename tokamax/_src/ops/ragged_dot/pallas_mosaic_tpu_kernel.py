@@ -19,7 +19,7 @@
 from collections.abc import Callable
 import functools
 import json
-from typing import Any, Final
+from typing import Final
 import jax
 from jax import lax
 from jax.experimental import pallas as pl

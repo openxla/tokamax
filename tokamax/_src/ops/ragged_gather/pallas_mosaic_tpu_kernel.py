@@ -15,7 +15,6 @@
 """optimized TPU Pallas/Mosaic kernel for Ragged Gather."""
 
 import functools
-import math
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
