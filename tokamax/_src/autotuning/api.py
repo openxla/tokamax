@@ -329,7 +329,7 @@ def autotune(
     ignore_cache: bool = False,
     all_implementations: bool = False,
     progress_bar: bool = True,
-    timeout: float | None = None,
+    timeout: float | None = 600.0,
     max_workers: int | None = None,
 ) -> AutotuningResult:
   """Autotunes all captured ops in x.
@@ -344,7 +344,10 @@ def autotune(
     all_implementations: Whether to autotune all implementations of the op that
       is tunable on the current device.
     progress_bar: Whether to show a progress bar (default: `True`).
-    timeout: Time limit in seconds for autotuning.
+    timeout: The time limit (in seconds) for compiling a config in the
+      autotuning search space. If `None`, there is no time limit. This is useful
+      in the case where some pathological configs take a very long time to
+      compile.
     max_workers: Maximum number of worker threads for parallel compilation
       during autotuning.
 
