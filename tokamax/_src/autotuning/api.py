@@ -394,7 +394,7 @@ def autotune(
   custom_autotuner = autotuner.Autotuner()
   if max_workers is not None:
     custom_autotuner = autotuner.Autotuner(
-        compile_executor_fn=lambda: futures.ThreadPoolExecutor(
+        compile_executor_fn=lambda **kwargs: futures.ThreadPoolExecutor(
             max_workers=max_workers
         )
     )

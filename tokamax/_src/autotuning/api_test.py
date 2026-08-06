@@ -49,11 +49,17 @@ _HEURISTICS_CONFIG = _FakeOpConfig(42)
 
 class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
 
+  @property
+  def autotuning_configs(self) -> set[_FakeOpConfig]:
+    return {_HEURISTICS_CONFIG}
+
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
     return x + y, None
 
   def _get_heuristics_config(self, ba: op_lib.BoundArguments) -> _FakeOpConfig:
     return _HEURISTICS_CONFIG
+
+
 
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
@@ -240,6 +246,11 @@ class AutotuningTest(parameterized.TestCase):
     ba = _FakeOp().bind(x, y)
     result = api.autotune([ba], max_workers=1)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+    self.assertNotEmpty(result.data)
+    _, autotune_data = result.data[0]
+    self.assertIn(_HEURISTICS_CONFIG, autotune_data)
+
+
 
   def test_bound_args_to_from_json(self):
     if jax.default_backend() == "tpu":
