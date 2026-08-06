@@ -153,8 +153,8 @@ class AutotuningResult:
     for ba, data in self.data:
       key = ba.autotuning_cache_key
       overlay.setdefault(ba.op, {}).setdefault(self.device_kind, {})[key] = data
-    state = op_lib.get_autotuning_cache_overlay_state()
-    state.stack.append(overlay)
+    stack = op_lib.AUTOTUNING_CACHE_OVERLAY_STACK
+    object.__setattr__(self, "_token", stack.set(stack.get() + (overlay,)))
     config = op_lib.AUTOTUNING_CACHE_OVERLAY_JAX_CONFIG
     object.__setattr__(self, "_context", config(config.value + (id(self),)))
     self._context.__enter__()  # pyrefly: ignore[missing-attribute]
@@ -163,7 +163,8 @@ class AutotuningResult:
   def __exit__(self, exc_type, exc_value, traceback):
     self._context.__exit__(exc_type, exc_value, traceback)  # pyrefly: ignore[missing-attribute]
     object.__delattr__(self, "_context")
-    op_lib.get_autotuning_cache_overlay_state().stack.pop()
+    self._token.var.reset(self._token)  # pyrefly: ignore[missing-attribute]
+    object.__delattr__(self, "_token")
 
   def __or__(self, other: "AutotuningResult") -> "AutotuningResult":
     """Returns a new AutotuningResult that is the merge of `self` and `other`.

@@ -345,8 +345,6 @@ class AutotuningTest(parameterized.TestCase):
     result1 = api.AutotuningResult(device_kind, ((ba, data1),))
     f = jax.jit(op)
 
-    # Register context hook before first call, so first and last are identical.
-    _ = op_lib.get_autotuning_cache_overlay_state()
     _ = f(x, y)
     with result0:
       _ = f(x, y)

@@ -22,7 +22,6 @@ import contextvars
 import dataclasses
 import functools
 import inspect
-import threading
 from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final, overload
 
 from absl import logging
@@ -405,18 +404,14 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     return True
 
 
-_AUTOTUNING_CACHE: dict[
-    Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]
-] = {}
+type AutotuningCache = dict[DeviceKind, dict[Any, AutotuningData[Any]]]
 
-_AUTOTUNING_CACHE_OVERLAY = threading.local()
+_AUTOTUNING_CACHE: dict[Op, AutotuningCache] = {}  # pylint: disable=g-bare-generic
+
+AUTOTUNING_CACHE_OVERLAY_STACK: Final[
+    contextvars.ContextVar[tuple[dict[Op, AutotuningCache], ...]]  # pylint: disable=g-bare-generic
+] = contextvars.ContextVar("AUTOTUNING_CACHE_OVERLAY_STACK", default=())
 AUTOTUNING_CACHE_OVERLAY_JAX_CONFIG: Final[Any] = jax.make_user_context(())
-
-
-def get_autotuning_cache_overlay_state() -> Any:
-  if not hasattr(_AUTOTUNING_CACHE_OVERLAY, "stack"):
-    _AUTOTUNING_CACHE_OVERLAY.stack = []
-  return _AUTOTUNING_CACHE_OVERLAY
 
 
 @final
@@ -541,7 +536,7 @@ class BoundArguments[C, K: Hashable]:
       device_kind = backend.get_default_device().device_kind
     key = self.autotuning_cache_key
 
-    for overlay in reversed(get_autotuning_cache_overlay_state().stack):
+    for overlay in reversed(AUTOTUNING_CACHE_OVERLAY_STACK.get()):
       data = overlay.get(self.op, {}).get(device_kind, {}).get(key)
       if data is not None:
         return data
