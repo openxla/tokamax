@@ -31,8 +31,8 @@ jobs:
       matrix:
         runner: ['linux-x86-ct6e-44-1tpu']
         pytest_command: [
-                         'pallas_mosaic_tpu_v2_kernel_perf_test.py',
-                         'pallas_mosaic_tpu_v2_kernel_test.py',
+                         'gmm_v2_test.py',
+                         'gmm_v2_perf_test.py',
                         ]
         include:
           - runner: 'linux-x86-a3-8g-h100-1gpu'
@@ -43,6 +43,7 @@ jobs:
     defaults:
       run:
         shell: bash
+    # zizmor: ignore[unpinned-images] - {legacy image}
     container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
     timeout-minutes: 300
     steps:
@@ -59,7 +60,7 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with unittest
         run: |
-          pytest -s -m "not long" --ignore-glob="*/test_base.py" tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/${{ matrix.pytest_command }}
+          pytest -s -m "not long" --ignore-glob="*/test_base.py" tokamax/_src/ops/experimental/tpu/gmm_v2/${{ matrix.pytest_command }}
 
   attention-tests:
     strategy:
@@ -83,6 +84,7 @@ jobs:
     defaults:
       run:
         shell: bash
+    # zizmor: ignore[unpinned-images] - {legacy image}
     container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
     timeout-minutes: 300
     steps:
@@ -116,6 +118,7 @@ jobs:
         shell: bash
     container:
     # Docker image will include CUDA and cuDNN for Tokamax.
+      # zizmor: ignore[unpinned-images] - {legacy image}
       image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
     timeout-minutes: 300
     steps:
@@ -149,6 +152,7 @@ jobs:
         shell: bash
     container:
     # Docker image will include CUDA and cuDNN for Tokamax.
+      # zizmor: ignore[unpinned-images] - {legacy image}
       image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
     timeout-minutes: 300
     steps:

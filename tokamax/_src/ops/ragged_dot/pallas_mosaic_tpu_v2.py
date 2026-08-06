@@ -23,9 +23,9 @@ import jax.numpy as jnp
 from jax.sharding import ManualAxisType
 import pydantic
 from tokamax._src.ops import op
+from tokamax._src.ops.experimental.tpu.gmm_v2 import gmm_v2 as gmm_backend
+from tokamax._src.ops.experimental.tpu.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.ragged_dot import base
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
 
 
 QArray = base.QArray
@@ -44,6 +44,7 @@ class Config:
   tile_m: pydantic.PositiveInt | None = None
   tile_k: pydantic.PositiveInt | None = None
   tile_n: pydantic.PositiveInt | None = None
+  bucket_base: pydantic.PositiveInt | None = None
 
 DEFAULT_RAGGED_DOT_DIM_NUMS = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 DLHS_RAGGED_DOT_DIM_NUMS = base.TRANS_RHS_RAGGED_DOT_DIM_NUMS
@@ -115,6 +116,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             tile_m=self.config.tile_m,
             tile_k=self.config.tile_n,
             tile_n=self.config.tile_k,
+            bucket_base=self.config.bucket_base,
         )
       else:
         dlhs_config = None
@@ -198,9 +200,11 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     # heuristic below.
     explicit_tiles = (
         None
-        if None in (config.tile_m, config.tile_k, config.tile_n)
+        if None in (config.tile_m, config.tile_k, config.tile_n,
+                    config.bucket_base)
         else gmm_backend.TileSizes(
-            tile_m=config.tile_m, tile_k=config.tile_k, tile_n=config.tile_n  # pyrefly: ignore[bad-argument-type]
+            tile_m=config.tile_m, tile_k=config.tile_k, tile_n=config.tile_n,  # pyrefly: ignore[bad-argument-type]
+            bucket_base=config.bucket_base,  # pyrefly: ignore[bad-argument-type]
         )
     )
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd

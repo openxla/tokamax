@@ -59,17 +59,17 @@ jobs:
           - shard_name: 'attn_xla_chunked_test'
             test_paths: 'tokamax/_src/ops/attention/xla_chunked_test.py'
           - shard_name: 'gmm_v2_perf'
-            test_paths: 'tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_perf_test.py'
+            test_paths: 'tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_perf_test.py'
           - shard_name: 'gmm_v2_kernel'
-            test_paths: 'tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_test.py'
+            test_paths: 'tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_test.py'
           - shard_name: 'op_test'
             test_paths: 'tokamax/_src/ops/op_test.py'
           - shard_name: 'topk'
             test_paths: 'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py'
           - shard_name: 'ragged_dot_misc'
             test_paths: >-
-              --ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_perf_test.py
-              --ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_test.py
+              --ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_perf_test.py
+              --ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_test.py
               tokamax/_src/ops/ragged_dot/
               tokamax/_src/ops/triangle_multiplication/
               tokamax/_src/ops/ragged_gather/
@@ -97,6 +97,7 @@ jobs:
         shell: bash
     container:
     # Docker image will include CUDA and cuDNN for Tokamax.
+      # zizmor: ignore[unpinned-images] - {legacy image}
       image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
     timeout-minutes: 300
     steps:
