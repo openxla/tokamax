@@ -299,4 +299,4 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 6
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
