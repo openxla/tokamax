@@ -27,7 +27,7 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Any, Final, Literal, overload
+from typing import Any, Final, Literal, cast, overload
 
 import jax
 from jax.experimental.mosaic.gpu import profiler
@@ -44,7 +44,7 @@ type Timer = Callable[[bool], tuple[float, dict[str, Any]]]
 type TimingMethod = Literal['wallclock', 'cupti', 'xprof', 'hermetic_xprof']
 
 type PyTree = Any
-type Ret[T] = T | list[jax.Array] | tuple[T, list[jax.Array]]
+type Ret[T] = T | tuple[jax.Array, ...] | tuple[T, tuple[jax.Array, ...]]
 
 logger = logging.getLogger(__name__)
 
@@ -300,13 +300,13 @@ _ARRAY_TYPES = (
 
 
 @overload
-def standardize_function[T](  # pyrefly: ignore[inconsistent-overload]
+def standardize_function[T](
     f: Callable[..., T],
     *args: PyTree,
-    kwargs: Mapping[str, PyTree] | None = None,
+    kwargs: Mapping[str, PyTree] | None = ...,
     mode: BenchmarkMode = ...,
     seed: int = ...,
-) -> tuple[Callable[[list[jax.Array]], Ret[T]], list[jax.Array]]:
+) -> tuple[Callable[[Sequence[jax.Array]], Ret[T]], tuple[jax.Array, ...]]:
   ...
 
 
@@ -314,11 +314,12 @@ def standardize_function[T](  # pyrefly: ignore[inconsistent-overload]
 def standardize_function[T](
     f: Callable[..., T],
     *args: PyTree,
-    kwargs: Mapping[str, PyTree] | None = None,
+    kwargs: Mapping[str, PyTree] | None = ...,
     mode: BenchmarkMode = ...,
-    seed: None = None,
+    seed: None,
 ) -> tuple[
-    Callable[[list[jax.Array]], Ret[T]], list[jax.Array | jax.ShapeDtypeStruct]
+    Callable[[Sequence[jax.Array]], Ret[T]],
+    tuple[jax.Array | jax.ShapeDtypeStruct, ...],
 ]:
   ...
 
@@ -330,7 +331,8 @@ def standardize_function[T](
     mode: BenchmarkMode = 'forward',
     seed: int | None = 0,
 ) -> tuple[
-    Callable[[list[jax.Array]], Ret[T]], list[jax.Array | jax.ShapeDtypeStruct]
+    Callable[[Sequence[jax.Array]], Ret[T]],
+    tuple[jax.Array | jax.ShapeDtypeStruct, ...],
 ]:
   """Creates a standardized function for testing and benchmarking.
 
@@ -364,7 +366,7 @@ def standardize_function[T](
   is_array = lambda x: isinstance(x, _ARRAY_TYPES)
   arrays, other, merge = utils.split_merge(is_array, args_flat)
 
-  def forward(arrays: list[jax.Array]) -> T:
+  def forward(arrays: Sequence[jax.Array]) -> T:
     args, kwargs = args_tree.unflatten(merge(arrays, other))
     return f(*args, **kwargs)
 
@@ -379,7 +381,7 @@ def standardize_function[T](
           for x in arrays
       )
       for in_axes in reversed(list(zip(*array_vmap_axes, strict=True))):
-        forward = jax.vmap(forward, in_axes=(list(in_axes),))
+        forward = jax.vmap(forward, in_axes=(in_axes,))
 
   if seed is None:
     # `standardize_function` should be idempotent, but the vmaps added to
@@ -390,9 +392,9 @@ def standardize_function[T](
         return jax.ShapeDtypeStruct(x.vmap_shape, x.dtype)
       return x
 
-    arrays = [convert_batched(x) for x in arrays]
+    arrays = tuple(convert_batched(x) for x in arrays)
   else:
-    arrays = numerics.random_initialize(arrays, seed=seed)
+    arrays = tuple(numerics.random_initialize(arrays, seed=seed))
 
   if mode == 'forward':
     func = forward
@@ -400,7 +402,7 @@ def standardize_function[T](
     func = lambda arrays: jax.vjp(forward, arrays)[0]
   elif mode == 'forward_and_vjp':
 
-    def vjp_full(arrays: list[jax.Array]) -> tuple[T, list[jax.Array]]:
+    def vjp_full(arrays):
       fwd_opt_barrier = lambda x: _optimization_barrier(forward(x))
       out, f_vjp = jax.vjp(fwd_opt_barrier, arrays)
       return out, f_vjp(out)
@@ -413,7 +415,7 @@ def standardize_function[T](
   else:
     raise ValueError(f'Unsupported mode: {mode}')
 
-  return func, arrays
+  return cast(Callable[[Sequence[jax.Array]], Ret[T]], func), tuple(arrays)
 
 
 def wallclock_timer[T](f: Callable[[T], Any], args: T) -> Timer:

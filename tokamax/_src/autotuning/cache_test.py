@@ -16,7 +16,7 @@ from importlib import resources
 import json
 import os
 import re
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -70,7 +70,7 @@ class CacheTest(parameterized.TestCase):
             json.loads(cache_file.read_text())
 
   def test_ignore_cache(self):
-    with config_lib.ignore_autotuning_cache(True):
+      with config_lib.ignore_autotuning_cache(True):
       self.assertEmpty(
           cache.AutotuningCache(
               pallas_triton.PallasTritonNormalization()

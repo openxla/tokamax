@@ -15,7 +15,7 @@
 import dataclasses
 import functools
 from types import UnionType  # pylint: disable=g-importing-member
-from typing import Union, get_origin, override
+from typing import Union, cast, get_origin, override
 from unittest import mock
 
 from absl.testing import absltest
@@ -192,7 +192,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     assert isinstance(self._attention_fn, base.DotProductAttention)
     assert hasattr(self._attention_fn, "vjp")
     attn_fn = self._attention_fn
-    vjp_fn = attn_fn.vjp
+    vjp_fn = cast(fa_vjp.PallasMosaicGpuFlashAttentionVjp, attn_fn.vjp)
 
     q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 64))
     kwargs = dict(precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32)
@@ -202,11 +202,11 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     ba = dataclasses.replace(
         ba, arguments=dict(**ba.arguments, residuals=res, out=out, dout=out)
     )
-    configs = vjp_fn._get_autotuning_configs(ba)  # pyrefly: ignore[missing-attribute]
+    configs = vjp_fn._get_autotuning_configs(ba)
     self.assertNotEmpty(configs)
     for config in configs:
       with self.subTest(f"{config=}"):
-        impl = type(attn_fn)(vjp=type(vjp_fn)(config=config))  # pyrefly: ignore[unexpected-keyword]
+        impl = type(attn_fn)(vjp=type(vjp_fn)(config=config))
         self._run_test_with_inputs(q, k, v, impl=impl)
         jax.clear_caches()
 

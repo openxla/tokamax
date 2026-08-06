@@ -15,6 +15,7 @@
 """`DotProductAttention` wrapper for `FlexAttention`."""
 
 import dataclasses
+import functools
 from typing import Annotated, override
 
 import jax.numpy as jnp
@@ -83,7 +84,8 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
       mask = mask.as_array(q_indices, k_indices)
       return jnp.ones(shape, dtype=jnp.bool_) if mask is None else mask
 
-    out = self.impl(  # pyrefly: ignore[no-matching-overload]
+    fn = functools.partial(
+        self.impl,
         q,
         k,
         v,
@@ -93,6 +95,8 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
         dropout_mask=dropout_mask,
         dropout_rate=dropout_rate,
         normalize_output=normalize_output,
-        return_residuals=return_residuals,
     )
-    return out if return_residuals else (out, None)
+    if return_residuals:
+      out, residuals = fn(return_residuals=True)
+      return out, residuals
+    return fn(), None

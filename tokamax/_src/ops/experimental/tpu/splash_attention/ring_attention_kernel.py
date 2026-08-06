@@ -46,7 +46,7 @@ def _dynamic_slice_mask_info(
 ) -> MaskInfo:
   """Slices MaskInfo for the current ring step."""
 
-  def slice_if_exists(arr: jax.Array | None):
+  def slice_if_exists(arr: jax.Array | np.ndarray | None):
     if arr is None:
       return None
 
@@ -55,11 +55,11 @@ def _dynamic_slice_mask_info(
     return lax.dynamic_slice_in_dim(arr, start_idx, shard_len, axis=-1)
 
   return MaskInfo(
-      mask_next=slice_if_exists(mask_info.mask_next),  # pyrefly: ignore[bad-argument-type]
-      active_rows=slice_if_exists(mask_info.active_rows),  # pyrefly: ignore[bad-argument-type]
-      active_cols=slice_if_exists(mask_info.active_cols),  # pyrefly: ignore[bad-argument-type]
-      num_active_blocks=slice_if_exists(mask_info.num_active_blocks),  # pyrefly: ignore[bad-argument-type]
-      block_mask=slice_if_exists(mask_info.block_mask),  # pyrefly: ignore[bad-argument-type]
+      mask_next=slice_if_exists(mask_info.mask_next),
+      active_rows=slice_if_exists(mask_info.active_rows),
+      active_cols=slice_if_exists(mask_info.active_cols),
+      num_active_blocks=slice_if_exists(mask_info.num_active_blocks),
+      block_mask=slice_if_exists(mask_info.block_mask),
       partial_mask_blocks=mask_info.partial_mask_blocks,  # partial mask blocks are global
       q_sequence=mask_info.q_sequence,  # Q sequence stays stationary
   )

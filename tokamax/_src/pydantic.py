@@ -191,9 +191,8 @@ class AnyInstanceOf[T]:
   as the corresponding type.
   """
 
-  @classmethod
   def __class_getitem__(cls, item: type[T]) -> type[T]:
-    return Annotated[item, cls()]  # pyrefly: ignore[bad-return]
+    return typing.cast(type[T], Annotated[item, cls()])
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):

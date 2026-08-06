@@ -544,7 +544,8 @@ class BoundArguments[C, K: Hashable]:
     try:
       return self.op.get_autotuning_cache()[key]
     except KeyError:
-      json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))  # pyrefly: ignore[no-matching-overload]
+      key = cast(Mapping[str, Any], key)
+      json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
 
       logging.warning(
           "Autotuning cache miss for %s on %s with key %s",

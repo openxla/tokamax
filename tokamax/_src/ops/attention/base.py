@@ -21,7 +21,6 @@ import math
 from typing import Any, Literal, NotRequired, TypedDict, cast, overload, override
 
 import jax
-from jax import export
 from jax.experimental import shard_map
 import jax.numpy as jnp
 from jax.typing import DTypeLike  # pylint: disable=g-importing-member
@@ -103,19 +102,15 @@ class Mask:
       k_len_or_indices: int | Int[Array, "*#B #h t"],
   ) -> Bool[Array, "*#B #H #T #t"] | None:
     """Returns the mask as a boolean array."""
-    if isinstance(q_len_or_indices, int):
-      q_indices = jnp.arange(q_len_or_indices)
-    elif export.is_symbolic_dim(q_len_or_indices):  # pyrefly: ignore[bad-argument-type]
-      q_indices = jnp.arange(q_len_or_indices)
-    else:
+    if isinstance(q_len_or_indices, jax.Array):
       q_indices = q_len_or_indices
-
-    if isinstance(k_len_or_indices, int):
-      k_indices = jnp.arange(k_len_or_indices)
-    elif export.is_symbolic_dim(k_len_or_indices):  # pyrefly: ignore[bad-argument-type]
-      k_indices = jnp.arange(k_len_or_indices)
     else:
+      q_indices = jnp.arange(q_len_or_indices)
+
+    if isinstance(k_len_or_indices, jax.Array):
       k_indices = k_len_or_indices
+    else:
+      k_indices = jnp.arange(k_len_or_indices)
 
     q_indices = q_indices[..., None]
     k_indices = k_indices[..., None, :]
@@ -273,7 +268,7 @@ class DotProductAttention[C, K: Hashable](
       q_indices: Int[Array, "*#B #H T"] | None = ...,
       k_indices: Int[Array, "*#b #h t"] | None = ...,
       normalize_output: bool = ...,
-      return_residuals: Literal[True] = ...,
+      return_residuals: Literal[True],
   ) -> tuple[Float[Array, "*B T H d"], Residuals]:
     ...
 

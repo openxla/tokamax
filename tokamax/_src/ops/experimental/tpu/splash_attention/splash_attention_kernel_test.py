@@ -47,7 +47,7 @@ hp.settings.register_profile(
 hp.settings.load_profile(name="deterministic")
 
 partial = functools.partial
-type Draw = Callable[[hps.SearchStrategy[Any]], Any]
+type Draw = hps.DrawFn
 
 
 @dataclasses.dataclass
@@ -71,7 +71,7 @@ def segment_ids_strategy(draw, seq_len: int) -> base.SegmentIds:
     if end - start < 2:
       end = start + 2
     ids_array[start:end] = i
-  return base.SegmentIds(ids_array, ids_array)  # pyrefly: ignore[bad-argument-type]
+  return base.SegmentIds(jnp.asarray(ids_array), jnp.asarray(ids_array))
 
 
 def seed_strategy() -> hps.SearchStrategy[int]:
@@ -147,7 +147,7 @@ class LocalAttentionMask(Mask):
     # Make sure that no row is full of zeros as this is leads to undefined
     # softmax.
     diagonal = mask_lib.NumpyMask(np.identity(self.seq_len, dtype=np.bool_))
-    return mask | diagonal  # pyrefly: ignore[unsupported-operation]
+    return mask | diagonal
 
 
 @hps.composite

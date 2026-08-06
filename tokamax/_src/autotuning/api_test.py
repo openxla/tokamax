@@ -90,6 +90,7 @@ def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
 
 
 def _slow_fn_factory(config):
+  del config  # Unused.
   time.sleep(0.5)
   return lambda x: x
 

@@ -94,7 +94,7 @@ class AutotuningData[K](
 def _compile(fn_factory, config, args, kwargs, *, seed=None):
   fn = fn_factory(config)
   fn, x = benchmarking.standardize_function(fn, *args, kwargs=kwargs, seed=seed)
-  return benchmarking.compile_benchmark(fn, x), x  # pyrefly: ignore[bad-argument-type]
+  return benchmarking.compile_benchmark(fn, cast(Any, x)), x
 
 
 def _benchmark(fn_factory, config, args, kwargs):

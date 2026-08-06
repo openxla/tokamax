@@ -54,15 +54,15 @@ def _eval_shape(spec):
   if not callable(spec):
     return spec
 
-  other = [None]
-  merge = [None]
-  out_tree = [None]
+  other: list[Any] = [None]
+  merge: list[Any] = [None]
+  out_tree: list[Any] = [None]
 
   def f():
     out = spec()
-    out_flat, out_tree[0] = jax.tree.flatten(out)  # pyrefly: ignore[unsupported-operation]
+    out_flat, out_tree[0] = jax.tree.flatten(out)
     is_array = lambda x: isinstance(x, jax.Array)
-    arrays, other[0], merge[0] = utils.split_merge(is_array, out_flat)  # pyrefly: ignore[unsupported-operation]
+    arrays, other[0], merge[0] = utils.split_merge(is_array, out_flat)
     return arrays
 
   shapes = jax.eval_shape(f)

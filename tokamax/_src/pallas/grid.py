@@ -14,6 +14,8 @@
 # ==============================================================================
 """Pallas grid utilities."""
 
+from typing import cast
+
 import jax
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
@@ -52,14 +54,15 @@ def get_grid_pids(
   # Use `floor_divide` and `remainder` (instead of lax.div and lax.rem)
   # to handle dtypes: pid (int32) vs. num_blocks_n (int64) when `jax_enable_x64`
   # is set.
+  pid = cast(jax.Array, pid)
   if group_size_m == 1:
-    return jnp.floor_divide(pid, grid_n), jnp.remainder(pid, grid_n)  # pyrefly: ignore[bad-argument-type]
+    return jnp.floor_divide(pid, grid_n), jnp.remainder(pid, grid_n)
 
   num_progs_in_group = group_size_m * grid_n
-  group_start_m = jnp.floor_divide(pid, num_progs_in_group) * group_size_m  # pyrefly: ignore[bad-argument-type]
-  group_size_m = jnp.minimum(grid_m - group_start_m, group_size_m)  # pyrefly: ignore[bad-assignment]
-  pid_m = group_start_m + jnp.remainder(pid, group_size_m)  # pyrefly: ignore[bad-argument-type]
-  pid_n = jnp.floor_divide(jnp.remainder(pid, num_progs_in_group), group_size_m)  # pyrefly: ignore[bad-argument-type]
+  group_start_m = jnp.floor_divide(pid, num_progs_in_group) * group_size_m
+  group_size = jnp.minimum(grid_m - group_start_m, group_size_m)
+  pid_m = group_start_m + jnp.remainder(pid, group_size)
+  pid_n = jnp.floor_divide(jnp.remainder(pid, num_progs_in_group), group_size)
   return pid_m, pid_n
 
 
