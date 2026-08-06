@@ -14,7 +14,6 @@
 # ==============================================================================
 """Utilities for benchmarking."""
 
-from collections import defaultdict  # pylint: disable=g-importing-member
 from collections.abc import Callable, Mapping, Sequence
 import contextlib
 import dataclasses
@@ -23,7 +22,6 @@ import inspect
 import logging
 import os
 import pathlib
-import re
 import shutil
 import tempfile
 import time
@@ -37,6 +35,8 @@ from tokamax._src import numerics
 from tokamax._src import utils
 
 xprof_session, profile_data = None, None  # stubs for internal benchmarking
+
+from xprof.cli.tools import get_kernel_stats_tool
 
 type BenchmarkMode = Literal['forward', 'forward_res', 'vjp', 'forward_and_vjp']
 # Timer functions return the time delta in ms and a dictionary of metadata.
@@ -111,10 +111,6 @@ class XprofProfileSession(contextlib.AbstractContextManager):
   Note: In case of multiple XLA Ops, the one with the most events is used.
   """
 
-  IGNORE_LINE_PATTERNS: set[str] = {
-      r'.*counter.*',  # on TPU the counters span more than the jit execution
-  }
-
   def __init__(
       self,
       hermetic: bool = True,
@@ -152,67 +148,51 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     self._event_filter_regex = event_filter_regex
     self._xprof_session_kwargs = xprof_session_kwargs
     self._retain_artifacts = False
+    self._timing_summary: dict[str, Any] | None = None
 
   @property
   def total_op_time(self) -> datetime.timedelta:
-    """Returns the total device time of XLA operators."""
-    profile = self._profile
-    if profile is None:
-      raise ValueError('XProfProfileSession has not been started.')
+    """Returns the total active device time of XLA operators.
 
-    xla_xlines = defaultdict(list)
-    for xplane in profile.planes:
-      if xplane.name.startswith('/device:'):
-        for xline in xplane.lines:
-          if self._jax_profiler_mode:
-            # OSS profiling: select all lines, except lines to ignore
-            if all(
-                re.match(p, xline.name) is None
-                for p in self.IGNORE_LINE_PATTERNS
-            ):
-              xla_xlines[xplane.name].append(xline)
-          else:
-            # xprof: select only the XLA Ops line
-            if 'XLA Ops' in xline.name:
-              xla_xlines[xplane.name].append(xline)
+    This corresponds to the ground-truth device compute duration computed via
+    Disjoint Interval Union (a sweep-line algorithm that merges overlapping
+    hardware event intervals to measure exact active compute time without
+    double-counting; see the xprof CLI docs:
+    https://github.com/openxla/xprof/blob/master/plugin/xprof/cli/README.md#kernel-statistics--disjoint-interval-union)
+    over hardware event traces by
+    ``compute_kernel_stats(include_summary=True)``.
 
-    all_lines = sum(xla_xlines.values(), [])
-    all_events = sum([list(x.events) for x in all_lines], [])
+    The timing is pre-computed during ``__exit__`` and cached in
+    ``_timing_summary`` rather than evaluated on-demand, because the temporary
+    profile trace files are deleted upon context exit (``shutil.rmtree``),
+    making direct re-evaluation impossible after the session closes.
 
-    if self._event_filter_regex is not None:
-      all_events = [
-          e for e in all_events if re.search(self._event_filter_regex, e.name)
-      ]
-
-    xla_lines_repr = {k: [l.name for l in v] for k, v in xla_xlines.items()}
-
-    if not xla_xlines or not all_events:  # len(all_events) == 0
-      msg = (
+    Raises:
+      ValueError: If timing summary failed to compute or no XLA code executed.
+      RuntimeError: If profiler wallclock time is smaller than parsed profile
+        time.
+    """
+    if self._timing_summary is None:
+      raise ValueError(
+          'XprofProfileSession has not been started or failed to compute'
+          ' timing summary.'
+      )
+    total_us = self._timing_summary.get('total_device_duration_us', 0.0)
+    if total_us == 0:
+      raise ValueError(
           'No XLA device code executed in the context manager. Check that JAX'
           ' functions inside the context are blocked using'
-          ' `jax.block_until_ready`. '
-          f'Collected XLA lines include: {xla_lines_repr}.'
+          ' `jax.block_until_ready`.'
       )
-      if jax.default_backend() == 'gpu':
-        msg += ' Check also that build flag `--config=cuda` is used.'
-      raise ValueError(msg)
-
-    t_starts = [e.start_ns for e in all_events]
-    t_ends = [e.start_ns + e.duration_ns for e in all_events]
-    duration_ns = max(t_ends) - min(t_starts)
     if (
         self._profiler_wallclock_time is not None
-        and self._profiler_wallclock_time < duration_ns / 1e9
+        and self._profiler_wallclock_time < total_us / 1e6
     ):
       raise RuntimeError(
-          f'Profiler wallclock time {self._profiler_wallclock_time:.4e} s is '
-          f'smaller than parsed profile time {duration_ns / 1e9:.4e} s. '
-          f'Collected XLA lines include: {xla_lines_repr}.'
+          f'Profiler wallclock time {self._profiler_wallclock_time:.4e} s is'
+          f' smaller than parsed profile time {total_us / 1e6:.4e} s.'
       )
-
-    # timedelta will round to the nearest microsecond, which is the smallest
-    # time resolution supported by this object.
-    return datetime.timedelta(microseconds=duration_ns / 1000.0)
+    return datetime.timedelta(microseconds=total_us)
 
   def __enter__(self):
     self._retain_artifacts = os.environ.get(
@@ -292,6 +272,27 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       self._profile = profile_data.ProfileData.from_serialized_xspace(
           xspace.SerializeToString()
       )
+
+    self._compute_timing_summary()
+
+  def _compute_timing_summary(self) -> None:
+    """Pre-computes Disjoint Interval Union timings for this session."""
+    if self._profile is None:
+      return
+
+    trace_matchers = None if (re := self._event_filter_regex) is None else (re,)
+
+    try:
+      self._timing_summary = get_kernel_stats_tool.compute_kernel_stats(
+          self._profile,
+          output_format='dict',
+          include_summary=True,
+          trace_matchers=trace_matchers,
+      )
+    except Exception as e:
+      raise RuntimeError(
+          f'Could not compute timing summary via xprof_cli for {self._profile}.'
+      ) from e
 
 
 _ARRAY_TYPES = (
