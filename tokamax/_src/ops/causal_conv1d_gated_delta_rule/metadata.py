@@ -16,8 +16,8 @@
 import jax
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import config
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import memory_ref
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
 
 
 def compute_batched_seq_metadata(

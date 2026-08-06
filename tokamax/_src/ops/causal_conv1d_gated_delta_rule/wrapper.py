@@ -19,12 +19,12 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import compute_conv1d
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import compute_gdn
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import config
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import memory_ref
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import metadata
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import vmem_ldst
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import compute_conv1d
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import compute_gdn
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import metadata
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import vmem_ldst
 
 
 def inner_kernel(

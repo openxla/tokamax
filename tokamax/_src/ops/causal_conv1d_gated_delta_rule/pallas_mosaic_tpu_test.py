@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Tests for Pallas Mosaic TPU GDN attention."""
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -19,10 +20,10 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import wrapper
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule.reference import l2_normalize_ref
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule.reference import l2norm_chunked
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule.reference import run_jax_gdn_attention_local_ref
+from tokamax._src import mosaic_tpu
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import base
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import pallas_mosaic_tpu
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import reference
 
 
 class GDNAttentionTest(parameterized.TestCase):
@@ -155,13 +156,15 @@ class GDNAttentionTest(parameterized.TestCase):
         [conv_bias_q, conv_bias_k, conv_bias_v], axis=-1
     )
 
-    # Create wrapper that disables buffer donation.
+    op_pallas = pallas_mosaic_tpu.PallasMosaicTpuCausalConv1dGatedDeltaRule()
+    op_base = base.CausalConv1dGatedDeltaRule()
+
     run_jax_gdn_attention_local_jitted = jax.jit(
-        wrapper.fused_conv1d_gdn,
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
+        op_pallas,
+        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size", "config"],
     )
     run_jax_gdn_attention_local_ref_jitted = jax.jit(
-        run_jax_gdn_attention_local_ref,
+        op_base,
         static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size", "config"],
     )
 
@@ -200,7 +203,7 @@ class GDNAttentionTest(parameterized.TestCase):
         **common_kwargs
     )
 
-    # Run chunked
+    # Run chunked (pallas)
     new_states_chunked, output_chunked = run_jax_gdn_attention_local_jitted(
         **common_kwargs
     )
@@ -218,11 +221,7 @@ class GDNAttentionTest(parameterized.TestCase):
     """A new prefill landing on a slot whose previous tenant left
 
     non-zero state must produce the same output and final state as it
-    would on a fresh-zero slot. This exercises the production bug fixed
-    by the `has_initial_state` plumbing: vLLM's mamba pool reuses
-    freed slots without clearing them, and previously the TPU GDN
-    kernel consumed the stale state, silently corrupting the new
-    request's recurrent trajectory.
+    would on a fresh-zero slot.
     """
     kq_head_dim = 128
     v_head_dim = 128
@@ -254,8 +253,7 @@ class GDNAttentionTest(parameterized.TestCase):
     )
 
     # Build a "stale" pair where the slots that the two new requests
-    # land on are filled with arbitrary nonzero values (simulating a
-    # prior request that finished without the pool clearing the slot).
+    # land on are filled with arbitrary nonzero values.
     stale_conv = jax.random.normal(
         next(rngs), (num_blocks, kernel_size - 1, conv_dim)
     )
@@ -275,10 +273,10 @@ class GDNAttentionTest(parameterized.TestCase):
 
     mixed_qkv = jnp.concatenate([query, key, value], axis=-1)
 
-    # Create wrapper that disables buffer donation.
+    op_pallas = pallas_mosaic_tpu.PallasMosaicTpuCausalConv1dGatedDeltaRule()
     run_jitted = jax.jit(
-        wrapper.fused_conv1d_gdn,
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
+        op_pallas,
+        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size", "config"],
     )
 
     # Both requests are brand new — no prior context. seq_lens equals
@@ -311,9 +309,7 @@ class GDNAttentionTest(parameterized.TestCase):
         **common_kwargs,
     )
     # Stale-slot run: same inputs, but the slots already contain a
-    # prior request's state. With the fix, has_initial_state=False
-    # masks that out — outputs and the writeback at the active slots
-    # must match the fresh-zero run.
+    # prior request's state.
     (new_conv_stale, new_rec_stale), output_stale = run_jitted(
         conv_state=conv_state_stale,
         recurrent_state=recurrent_state_stale,
@@ -339,12 +335,7 @@ class GDNAttentionTest(parameterized.TestCase):
   def test_has_initial_state_preserves_continuation(self):
     """When ``has_initial_state[i]`` is True, the kernel must use the
 
-    slot's existing state as the prefill's initial state. This is the
-    chunked-prefill / prefix-cache continuation path: a prior step
-    wrote a recurrent/conv state to the slot, and the next prefill
-    chunk for the same request must continue from that state — not
-    from zero. Compares against running the equivalent single-shot
-    prefill on the concatenated token stream from a zero state.
+    slot's existing state as the prefill's initial state.
     """
     kq_head_dim = 128
     v_head_dim = 128
@@ -353,9 +344,6 @@ class GDNAttentionTest(parameterized.TestCase):
     kernel_size = 4
 
     # One request, prefill split into two halves of 32 tokens each.
-    # Step A: tokens [0, 32) starting from zero state.
-    # Step B: tokens [32, 64) starting from Step A's final state.
-    # Reference: tokens [0, 64) in a single shot from zero state.
     half = 32
     full = 64
     state_indices = jnp.array([1])
@@ -381,10 +369,10 @@ class GDNAttentionTest(parameterized.TestCase):
     conv_state_zero = jnp.zeros((num_blocks, kernel_size - 1, conv_dim))
     recurrent_state_zero = jnp.zeros((num_blocks, n_v, kq_head_dim, v_head_dim))
 
-    # Create wrapper that disables buffer donation.
+    op_pallas = pallas_mosaic_tpu.PallasMosaicTpuCausalConv1dGatedDeltaRule()
     run_jitted = jax.jit(
-        wrapper.fused_conv1d_gdn,
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
+        op_pallas,
+        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size", "config"],
     )
     common_static = dict(
         conv_weight=conv_weight,
@@ -399,8 +387,7 @@ class GDNAttentionTest(parameterized.TestCase):
         kernel_size=kernel_size,
     )
 
-    # Single-shot reference (all 64 tokens, zero state, has_initial=False
-    # encoded as seq_lens == query_lens == [full]).
+    # Single-shot reference
     (_, _), output_ref = run_jitted(
         qkv=mixed_qkv_full,
         b=b,
@@ -413,7 +400,7 @@ class GDNAttentionTest(parameterized.TestCase):
         **common_static,
     )
 
-    # Step A: first 32 tokens, zero state, has_initial=False.
+    # Step A: first 32 tokens
     (conv_after_a, rec_after_a), output_a = run_jitted(
         qkv=mixed_qkv_a,
         b=b[:half],
@@ -426,10 +413,8 @@ class GDNAttentionTest(parameterized.TestCase):
         **common_static,
     )
 
-    # Step B: next 32 tokens, slot now holds Step A's state.
-    # seq_lens=[full] with query_lens=[half] gives context_len=half>0,
-    # i.e., has_initial=True so the kernel continues from that state.
-    (_, _), output_b = wrapper.fused_conv1d_gdn(
+    # Step B: next 32 tokens
+    (_, _), output_b = op_pallas(
         qkv=mixed_qkv_b,
         b=b[half:],
         a=a[half:],
@@ -441,8 +426,6 @@ class GDNAttentionTest(parameterized.TestCase):
         **common_static,
     )
 
-    # Step A's output must match the first half of the single-shot
-    # reference; Step B (continuation) must match the second half.
     np.testing.assert_allclose(
         output_a, output_ref[:half], rtol=2e-2, atol=2e-2
     )
@@ -451,44 +434,26 @@ class GDNAttentionTest(parameterized.TestCase):
     )
 
   @parameterized.named_parameters(
-      dict(testcase_name="chunked", l2norm_fn=l2norm_chunked),
-      dict(testcase_name="ref", l2norm_fn=l2_normalize_ref),
+      dict(testcase_name="chunked", l2norm_fn=reference.l2norm_chunked),
+      dict(testcase_name="ref", l2norm_fn=reference.l2_normalize_ref),
   )
   def test_l2norm_fp32_internal_more_precise_than_bf16(self, l2norm_fn):
     """The l2norm helper must do its sum-of-squares in fp32 even when
 
-    the input is bf16. This is what GPU FLA's ``l2norm_fwd`` does.
-
-    Regression test for the full-GPQA-Diamond drop we observed when
-    the reduction was left in bf16: pick a bf16 input that is
-    nontrivial (non-unit-norm, large magnitude so sum-of-squares is
-    well above 1.0) and compare both the current implementation and
-    a deliberately-bf16-only reduction against an fp64 reference.
-    The fp32-internal implementation must be at least as close to
-    the fp64 ground truth — the bf16 reduction loses precision in
-    the sum-of-squares accumulation.
+    the input is bf16.
     """
     rng = jax.random.key(13)
-    # Vectors with components on the order of 5 — sum-of-squares is
-    # ~d*25, well above the bf16 ULP near that magnitude.
     x_f32 = jax.random.normal(rng, (32, 256)) * 5.0
     x_bf16 = x_f32.astype(jnp.bfloat16)
 
-    # fp64 ground truth on the bf16 quantized input. Whatever
-    # precision-loss the bf16 cast itself caused is shared with both
-    # implementations under test, so this isolates the reduction
-    # precision.
     x_fp64 = x_bf16.astype(jnp.float64)
     sq_sum_fp64 = (x_fp64 * x_fp64).sum(axis=-1, keepdims=True)
     ref = (x_fp64 / jnp.sqrt(sq_sum_fp64 + 1e-6)).astype(jnp.float32)
 
-    # The implementation under test (current code, fp32 internal).
-    if l2norm_fn is l2norm_chunked:
+    if l2norm_fn is reference.l2norm_chunked:
       test_out = l2norm_fn(x_bf16, dim=-1, eps=1e-6)
     else:
       test_out = l2norm_fn(x_bf16, eps=1e-6)
-    # A deliberately-bf16-only baseline that mimics the pre-fix
-    # behavior: rsqrt + reduction stay in bf16.
     bf16_only = x_bf16 * jax.lax.rsqrt(
         (x_bf16 * x_bf16).sum(axis=-1, keepdims=True)
         + jnp.array(1e-6, dtype=jnp.bfloat16)
@@ -497,10 +462,6 @@ class GDNAttentionTest(parameterized.TestCase):
     test_err = float(jnp.max(jnp.abs(test_out.astype(jnp.float32) - ref)))
     bf16_err = float(jnp.max(jnp.abs(bf16_only.astype(jnp.float32) - ref)))
 
-    # The current (fp32-internal) implementation is meaningfully
-    # closer to the fp64 reference than the bf16-only baseline. We
-    # assert a strict factor-of-2 improvement to catch silent
-    # regressions to bf16.
     self.assertLess(
         test_err,
         bf16_err / 2.0,
@@ -509,22 +470,123 @@ class GDNAttentionTest(parameterized.TestCase):
     )
 
   @parameterized.named_parameters(
-      dict(testcase_name="chunked", l2norm_fn=l2norm_chunked),
-      dict(testcase_name="ref", l2norm_fn=l2_normalize_ref),
+      dict(testcase_name="chunked", l2norm_fn=reference.l2norm_chunked),
+      dict(testcase_name="ref", l2norm_fn=reference.l2_normalize_ref),
   )
   def test_l2norm_returns_input_dtype(self, l2norm_fn):
     """The l2norm helpers compute in fp32 internally but must return
 
-    the input dtype unchanged so callers' downstream layout
-    assumptions (e.g. ``compute_dtype`` casts in
-    `pack_inputs_single_stream`) keep working.
+    the input dtype unchanged.
     """
     x = jax.random.normal(jax.random.key(17), (4, 128)).astype(jnp.bfloat16)
-    if l2norm_fn is l2norm_chunked:
+    if l2norm_fn is reference.l2norm_chunked:
       out = l2norm_fn(x, dim=-1)
     else:
       out = l2norm_fn(x)
     self.assertEqual(out.dtype, jnp.bfloat16)
+
+
+class GDNSecurityTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    try:
+      if not pltpu.get_tpu_info().generation >= 6:
+        self.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
+    except Exception:
+      self.skipTest("Failed to get TPU info.")
+
+  def test_uninitialized_memory_robustness(self):
+    mosaic_tpu.poison_tpu_memory()
+    seq_lens = jnp.array([128], dtype=jnp.int32)
+    mixed_qkv = jnp.zeros((128, 1536), dtype=jnp.float32)
+    op_pallas = pallas_mosaic_tpu.PallasMosaicTpuCausalConv1dGatedDeltaRule()
+    new_states, output = op_pallas(
+        qkv=mixed_qkv,
+        seq_lens=seq_lens,
+        b=jnp.zeros((128, 8), dtype=jnp.float32),
+        a=jnp.zeros((128, 8), dtype=jnp.float32),
+        conv_state=jnp.zeros((2, 3, 1536), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((2, 8, 128, 128), dtype=jnp.float32),
+        conv_weight=jnp.zeros((1536, 1, 4), dtype=jnp.float32),
+        conv_bias=jnp.zeros((1536,), dtype=jnp.float32),
+        a_log=jnp.zeros((8,), dtype=jnp.float32),
+        dt_bias=jnp.zeros((8,), dtype=jnp.float32),
+        query_start_loc=jnp.array([0, 128]),
+        state_indices=jnp.array([1]),
+        distribution=jnp.array([0, 3, 3], dtype=jnp.int32),
+        n_kq=2,
+        n_v=8,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+    )
+    for new_state in new_states:
+      self.assertFalse(jnp.any(jnp.isnan(new_state)))
+    self.assertFalse(jnp.any(jnp.isnan(output)))
+
+  def test_security_isolation(self):
+    # Configure two request sequences sharing the same local layer runner
+    seq_lens = jnp.array([128, 128], dtype=jnp.int32)
+    mixed_qkv = jnp.zeros((256, 1536), dtype=jnp.float32)
+    op_pallas = pallas_mosaic_tpu.PallasMosaicTpuCausalConv1dGatedDeltaRule()
+
+    # Baseline clean context evaluation
+    _, output_clean = op_pallas(
+        qkv=mixed_qkv,
+        seq_lens=seq_lens,
+        b=jnp.zeros((256, 8), dtype=jnp.float32),
+        a=jnp.zeros((256, 8), dtype=jnp.float32),
+        conv_state=jnp.zeros((3, 3, 1536), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((3, 8, 128, 128), dtype=jnp.float32),
+        conv_weight=jnp.zeros((1536, 1, 4), dtype=jnp.float32),
+        conv_bias=jnp.zeros((1536,), dtype=jnp.float32),
+        a_log=jnp.zeros((8,), dtype=jnp.float32),
+        dt_bias=jnp.zeros((8,), dtype=jnp.float32),
+        query_start_loc=jnp.array([0, 128, 256]),
+        state_indices=jnp.array([1, 2]),
+        distribution=jnp.array([0, 3, 3], dtype=jnp.int32),
+        n_kq=2,
+        n_v=8,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+    )
+
+    # Inject NaNs into the second request's allocated recurrent state buffer
+    recurrent_state_malicious = (
+        jnp.zeros((3, 8, 128, 128), dtype=jnp.float32).at[2].set(jnp.nan)
+    )
+    _, output_malicious = op_pallas(
+        qkv=mixed_qkv,
+        seq_lens=seq_lens,
+        b=jnp.zeros((256, 8), dtype=jnp.float32),
+        a=jnp.zeros((256, 8), dtype=jnp.float32),
+        conv_state=jnp.zeros((3, 3, 1536), dtype=jnp.float32),
+        recurrent_state=recurrent_state_malicious,
+        conv_weight=jnp.zeros((1536, 1, 4), dtype=jnp.float32),
+        conv_bias=jnp.zeros((1536,), dtype=jnp.float32),
+        a_log=jnp.zeros((8,), dtype=jnp.float32),
+        dt_bias=jnp.zeros((8,), dtype=jnp.float32),
+        query_start_loc=jnp.array([0, 128, 256]),
+        state_indices=jnp.array([1, 2]),
+        distribution=jnp.array([0, 3, 3], dtype=jnp.int32),
+        n_kq=2,
+        n_v=8,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+    )
+
+    # Assert strict sequence isolation for the first sequence
+    np.testing.assert_allclose(
+        np.array(output_malicious[:128]),
+        np.array(output_clean[:128]),
+        atol=0,
+        rtol=0,
+    )
 
 
 if __name__ == "__main__":
