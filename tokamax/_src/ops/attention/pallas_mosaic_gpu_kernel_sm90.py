@@ -14,9 +14,10 @@
 # ==============================================================================
 """H100 Flash attention with Mosaic GPU."""
 
+import dataclasses
 import functools
 import math
-from typing import cast
+from typing import Any, cast
 
 import jax
 from jax import lax
@@ -27,6 +28,7 @@ from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-impo
 import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu as mgpu_lib
+from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -42,7 +44,10 @@ _WGMMA = plgpu.Layout.WGMMA
 _WGMMA_ROW = plgpu.Layout.WGMMA.reduce(1)
 _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 _load_bcast = common.load_bcast
+_COMPUTE_WGS = 2
 _FORBID_EXTRA = pydantic.ConfigDict(extra="forbid")
+_SMEM_OVERHEAD = 2200
+_MAX_SMEM = 227 * 1024
 
 
 @pydantic.dataclasses.dataclass(
@@ -53,57 +58,101 @@ class Config(common.ConfigBase):
   pass
 
 
-def _get_epilogue_tile_shape(block_q, head_dim_out, out_dtype):
-  """Returns the epilogue tile size for a given configuration."""
+def _pad_qkv(q, k, v):
+  # The sequence dimensions must be a multiple of 8.
+  k, v = map(lambda x: shape_lib.pad_to_next_multiple_of(x, 8, 0), (k, v))
+  q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
+  return q, k, v
+
+
+def _get_scratch_types(
+    q, k, v, bias, mask, out_dtype, return_residuals, config
+) -> dict[str, Any]:
+  """Returns the scratch types for the kernel."""
+  q, k, v = jax.eval_shape(_pad_qkv, q, k, v)
+  head_dim = q.shape[-1]
+  head_dim_out = v.shape[-1]
+
+  block_q = config.block_q
+  block_kv = config.block_kv
+  num_stages = config.num_stages
+
   epi_tile_q = 64
   epi_tile_d = 1024 // mgpu_lib.num_bits(out_dtype)
   assert block_q % epi_tile_q == 0
   if head_dim_out % epi_tile_d != 0:
     epi_tile_d = head_dim_out
   num_epi_slots = min(2, (block_q // epi_tile_q) * (head_dim_out // epi_tile_d))
-  return epi_tile_q, epi_tile_d, num_epi_slots
+
+  tiled_smem = mgpu_lib.tiled_swizzled_smem
+  q_scratch = tiled_smem((_COMPUTE_WGS * block_q, head_dim), q.dtype, "q")
+  k_scratch = tiled_smem((num_stages, block_kv, head_dim), k.dtype, "k")
+  o_scratch = tiled_smem(
+      (_COMPUTE_WGS, num_epi_slots, epi_tile_q, epi_tile_d), out_dtype, "o"
+  )
+  l_scratch = m_scratch = plgpu.SMEM((_COMPUTE_WGS, block_q), jnp.float32)
+  k_bias_produced = plgpu.Barrier(num_barriers=num_stages)
+
+  scratch = dict(
+      # wg1 may still access v as wg0 writes to {o,l,m}_scratch.
+      qko_smem_union=plgpu.RefUnion(
+          (q_scratch, k_scratch),
+          (o_scratch, *((l_scratch, m_scratch) if return_residuals else ())),
+      ),
+      v_smem=tiled_smem((num_stages, block_kv, head_dim_out), v.dtype, "v"),
+      q_produced=plgpu.Barrier(),
+      v_produced=plgpu.Barrier(num_barriers=num_stages),
+  )
+
+  # bias doesn't need a consumed barrier as it is implied by k consumed.
+  if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
+    shape = (num_stages, _COMPUTE_WGS * block_q, block_kv)
+    scratch["bias_smem"] = tiled_smem(shape, bias.dtype, "bias")
+    k_bias_produced = dataclasses.replace(
+        k_bias_produced, num_arrivals=k_bias_produced.num_arrivals + 1
+    )
+
+  if mask is not None and mask.shape[-1] != 1:
+    if mask.shape[-2] == 1:
+      if block_kv >= 128:  # Minimum transfer size is 128 bytes.
+        scratch["mask_smem"] = plgpu.SMEM((num_stages, block_kv), jnp.int8)
+        k_bias_produced = dataclasses.replace(
+            k_bias_produced, num_arrivals=k_bias_produced.num_arrivals + 1
+        )
+    else:
+      shape = (num_stages, _COMPUTE_WGS * block_q, block_kv)
+      scratch["mask_smem"] = tiled_smem(shape, jnp.int8, "mask")
+      scratch["mask_produced"] = plgpu.Barrier(num_barriers=num_stages)
+
+  scratch["k_bias_produced"] = k_bias_produced
+  return scratch
 
 
-def _estimate_shared_mem_usage_bytes(ba, block_q, block_kv, num_stages):
+def _estimate_shared_mem_usage_bytes(ba, config) -> int:
   """Estimates the shared memory usage in bytes for a given configuration."""
   q, k, v = ba.args
-  tile_q = 2 * block_q
-
-  # 32-bit floats are downcast to 16-bit before the kernel call.
-  dtype_bits = jnp.finfo(jnp.bfloat16).bits
-  m = 8 * common.MIN_SWIZZLE // dtype_bits
-  block_d = pl.cdiv(q.shape[-1], m) * m
-  block_d_out = v.shape[-1]
-  bytes_per_stage = block_kv * block_d_out * dtype_bits // 8
-  if (bias := ba.kwargs["bias"]) is not None:
-    if bias.shape[-2] != 1 and bias.shape[-1] != 1:
-      bytes_per_stage += tile_q * block_kv * jnp.finfo(bias.dtype).bits // 8
-
+  q, k, v = map(lambda x: jax.eval_shape(quantization.as_array, x), (q, k, v))
+  precision = ba.kwargs["precision"]
+  cast_qkv = functools.partial(common.cast_qkv, precision=precision)
+  q, k, v = jax.eval_shape(cast_qkv, q, k, v)
+  bias = ba.kwargs["bias"]
   mask = ba.kwargs["mask"]
   q_indices = ba.kwargs["q_indices"]
   k_indices = ba.kwargs["k_indices"]
   mask, *_ = jax.eval_shape(
       common.decompose_mask, mask, q, k, q_indices, k_indices
   )
-  if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
-    bytes_per_stage += tile_q * block_kv
-
-  epi_tile_q, epi_tile_d, num_epi_slots = _get_epilogue_tile_shape(
-      block_q, block_d_out, q.dtype
+  return_residuals = ba.kwargs["return_residuals"]
+  scratch_types = _get_scratch_types(
+      q, k, v, bias, mask, q.dtype, return_residuals, config
   )
-  # `q`/`k` and the outputs are in a union.
-  q_k_elems = (tile_q + num_stages * block_kv) * block_d
-  out_elems = 2 * num_epi_slots * epi_tile_q * epi_tile_d
-  return (
-      (max(q_k_elems, out_elems) * dtype_bits // 8)
-      + num_stages * bytes_per_stage
-      + 2200  # Add some extra for barriers, etc. (slight overestimate).
-  )
+  return mgpu_lib.estimate_smem_bytes(scratch_types)
 
 
 def get_heuristics_config(ba: op.BoundArguments) -> Config:
-  if _estimate_shared_mem_usage_bytes(ba, 64, 128, 2) < 227 * 1024:
-    return Config(block_q=64, block_kv=128, num_stages=2)
+  config = Config(block_q=64, block_kv=128, num_stages=2)
+  if _estimate_shared_mem_usage_bytes(ba, config) + _SMEM_OVERHEAD < _MAX_SMEM:
+    return config
 
   # This is a pretty good option that works for most cases.
   return Config(block_q=64, block_kv=64, num_stages=2)
@@ -122,13 +171,18 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
       for x in [64, 128, 256]
       if k.shape[-3] % x == 0  # block_kv must divide seq_len_kv.
   ])
+
   configs = set()
   for block_q in block_qs:
     for block_kv in block_kvs:
       for num_stages in [2, 3, 4]:
-        configs.add(
-            Config(block_q=block_q, block_kv=block_kv, num_stages=num_stages)
+        if num_stages > pl.cdiv(k.shape[-3], block_kv):
+          continue
+        config = Config(
+            block_q=block_q, block_kv=block_kv, num_stages=num_stages
         )
+        if _estimate_shared_mem_usage_bytes(ba, config) <= _MAX_SMEM:
+          configs.add(config)
   return configs
 
 
@@ -155,29 +209,20 @@ def flash_attention_kernel(
   """Flash attention with Mosaic GPU."""
 
   _, num_q_heads, _ = q.shape
-  _, num_kv_heads, _ = v.shape
+  _, num_kv_heads, orig_head_dim_out = v.shape
 
   if num_q_heads % num_kv_heads:
     raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
 
-  # The sequence dimensions must be a multiple of 8.
-  pad_seq_len = lambda x: shape_lib.pad_to_next_multiple_of(x, 8, 0)
-  k, v = map(pad_seq_len, (k, v))
+  q, k, v = _pad_qkv(q, k, v)
+  q_seq_len, _, head_dim = q.shape
+  kv_seq_len, _, head_dim_out = v.shape
 
-  q_seq_len, num_q_heads, _ = q.shape
-  kv_seq_len, _, orig_head_dim_out = v.shape
-
-  q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
-  head_dim = q.shape[-1]
-  head_dim_out = v.shape[-1]
-
-  block_q_kv = block_q, block_kv = config.block_q, config.block_kv
-  max_stages = min(config.num_stages, pl.cdiv(kv_seq_len, block_kv))
+  block_q = config.block_q
+  block_kv = config.block_kv
+  num_stages = config.num_stages
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
-  epi_tile_q, epi_tile_d, num_epi_slots = _get_epilogue_tile_shape(
-      block_q, head_dim_out, out_dtype
-  )
 
   if mask is not None:
     mask = mask.astype(jnp.int8)
@@ -199,12 +244,12 @@ def flash_attention_kernel(
       *residual_gmems,
       qko_smem_union,
       v_smem,
-      bias_smem,
-      mask_smem,
+      bias_smem=None,
+      mask_smem=None,
       q_produced,
       k_bias_produced,
       v_produced,
-      mask_produced,
+      mask_produced=None,
   ):
     qi = lax.axis_index("q_tiles")
     hi = lax.axis_index("heads")
@@ -239,12 +284,12 @@ def flash_attention_kernel(
     # MGPU uses the lower barrier IDs.
     schedule_barrier = 4
     k_consumed_barrier = schedule_barrier + 2
-    v_consumed_barrier = k_consumed_barrier + max_stages
-    mask_consumed_barrier = v_consumed_barrier + max_stages
+    v_consumed_barrier = k_consumed_barrier + num_stages
+    mask_consumed_barrier = v_consumed_barrier + num_stages
     if mask_smem is None:
-      assert v_consumed_barrier + max_stages <= 16
+      assert v_consumed_barrier + num_stages <= 16
     else:
-      assert mask_consumed_barrier + max_stages <= 16
+      assert mask_consumed_barrier + num_stages <= 16
 
     schedule_barrier_arrive = functools.partial(
         mgpu_lib.bar_arrive, schedule_barrier + 1 - wg, num_threads=256
@@ -278,18 +323,20 @@ def flash_attention_kernel(
 
       @pl.when(ub > lb)
       def _():
-        plgpu.barrier_wait(k_bias_produced.at[lax.rem(lb, max_stages)])
+        plgpu.barrier_wait(k_bias_produced.at[lax.rem(lb, num_stages)])
 
       pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
 
       def loop_body(ki, carry, *, do_causal=False):
         acc, m_scale, m_i, l_i = carry
-        si = lax.rem(ki, max_stages)
+        si = lax.rem(ki, num_stages)
         k_base = ki * block_kv
         ks = cast(pl.Slice, pl.ds(k_base, block_kv))
 
         def iota(d):
-          return plgpu.broadcasted_iota(jnp.int32, block_q_kv, d, layout=_WGMMA)
+          return plgpu.broadcasted_iota(
+              jnp.int32, (block_q, block_kv), d, layout=_WGMMA
+          )
 
         def compute_qk(acc):
           plgpu.wgmma(acc, q_smem.at[block.ds(wg, block_q)], k_smem.at[si].T)
@@ -303,7 +350,7 @@ def flash_attention_kernel(
           mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
           return acc[...], bias, mask
 
-        acc_type = plgpu.ACC(block_q_kv, jnp.float32)
+        acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
         s, bias, mask = pl.run_scoped(compute_qk, acc_type)
         mgpu_lib.bar_arrive(k_consumed_barrier + si, num_threads=384)
 
@@ -395,7 +442,7 @@ def flash_attention_kernel(
 
           @pl.when(ki + 1 < ub)
           def _():
-            plgpu.barrier_wait(k_bias_produced.at[lax.rem(ki + 1, max_stages)])
+            plgpu.barrier_wait(k_bias_produced.at[lax.rem(ki + 1, num_stages)])
 
         acc, l_i = pl.run_state(compute_pv)((plgpu.ACC.init(acc), l_i))
         mgpu_lib.bar_arrive(v_consumed_barrier + si, num_threads=384)
@@ -441,6 +488,7 @@ def flash_attention_kernel(
       elif use_stable_softmax and rescale_threshold != 1.0:
         acc *= lax.broadcast_in_dim(jnp.exp2(m_scale - m_i), acc.shape, [0])
 
+      _, num_epi_slots, epi_tile_q, epi_tile_d = o_smem.shape
       o_gmem_ = o_gmem.at[qs, hi]
       for qj in range(block_q // epi_tile_q):
         for dj in range(head_dim_out // epi_tile_d):
@@ -479,27 +527,31 @@ def flash_attention_kernel(
 
       lb, ub, _, _ = get_kv_ranges()
 
-      @pl.loop(lb, lax.min(lb + max_stages, ub))
+      @pl.loop(lb, lax.min(lb + num_stages, ub))
       def prologue(ki):
-        si = lax.rem(ki, max_stages)
+        si = lax.rem(ki, num_stages)
         ks = block.ds(ki, block_kv)
         cp(k_gmem.at[ks, hi_kv], k_smem, k_bias_produced, si)
         if bias_gmem_ is not None:
+          assert bias_smem is not None
           cp(bias_gmem_.at[qs, ks], bias_smem, k_bias_produced, si)
         if mask_gmem_ is not None:
+          assert mask_smem is not None
           cp(mask_gmem_.at[..., ks], mask_smem, mask_produced, si)
         cp(v_gmem.at[ks, hi_kv], v_smem, v_produced, si)
 
-      @pl.loop(lb, ub - max_stages)
+      @pl.loop(lb, ub - num_stages)
       def kv_loop(ki):
-        si = lax.rem(ki, max_stages)
-        ks = block.ds(ki + max_stages, block_kv)
+        si = lax.rem(ki, num_stages)
+        ks = block.ds(ki + num_stages, block_kv)
         mgpu_lib.bar_sync(k_consumed_barrier + si, num_threads=384)
         cp(k_gmem.at[ks, hi_kv], k_smem, k_bias_produced, si)
         if bias_gmem_ is not None:
+          assert bias_smem is not None
           mgpu_lib.fence_async_shared_cta()
           cp(bias_gmem_.at[qs, ks], bias_smem, k_bias_produced, si)
         if mask_gmem_ is not None:
+          assert mask_smem is not None
           mgpu_lib.bar_sync(mask_consumed_barrier + si, num_threads=384)
           mgpu_lib.fence_async_shared_cta()
           cp(mask_gmem_.at[..., ks], mask_smem, mask_produced, si)
@@ -529,60 +581,17 @@ def flash_attention_kernel(
     residuals_shape = (num_q_heads, num_q_tiles * 2 * block_q)
     out_shape += [jax.ShapeDtypeStruct(residuals_shape, jnp.float32)] * 2
 
-  compute_wgs = 2
-  tiled_smem = mgpu_lib.tiled_swizzled_smem
-  q_scratch = tiled_smem((compute_wgs * block_q, head_dim), q.dtype, "q")
-  k_scratch = tiled_smem((max_stages, block_kv, head_dim), k.dtype, "k")
-  v_scratch = tiled_smem((max_stages, block_kv, head_dim_out), v.dtype, "v")
-  o_scratch = tiled_smem(
-      (compute_wgs, num_epi_slots, epi_tile_q, epi_tile_d), out_dtype, "o"
-  )
-  l_scratch = m_scratch = plgpu.SMEM((compute_wgs, block_q), jnp.float32)
-
-  k_bias_produced_arrivals = 1
-  # bias doesn't need a consumed barrier as it is implied by k consumed.
-  if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
-    bias_scratch_shape = (max_stages, compute_wgs * block_q, block_kv)
-    bias_scratch = tiled_smem(bias_scratch_shape, bias.dtype, "bias")
-    k_bias_produced_arrivals += 1
-  else:
-    bias_scratch = None
-
-  mask_scratch = mask_produced = None
-  if mask is not None and mask.shape[-1] != 1:
-    if mask.shape[-2] == 1:
-      if block_kv >= 128:  # Minimum transfer size is 128 bytes.
-        mask_scratch = plgpu.SMEM((max_stages, block_kv), jnp.int8)
-        k_bias_produced_arrivals += 1
-    else:
-      mask_scratch_shape = (max_stages, compute_wgs * block_q, block_kv)
-      mask_scratch = tiled_smem(mask_scratch_shape, jnp.int8, "mask")
-      mask_produced = plgpu.Barrier(num_barriers=max_stages)
-
-  scratch_shapes = dict(
-      # wg1 may still access v as wg0 writes to {o,l,m}_scratch.
-      qko_smem_union=plgpu.RefUnion(
-          (q_scratch, k_scratch),
-          (o_scratch, *((l_scratch, m_scratch) if return_residuals else ())),
-      ),
-      v_smem=v_scratch,
-      bias_smem=bias_scratch,
-      mask_smem=mask_scratch,
-      q_produced=plgpu.Barrier(),
-      k_bias_produced=plgpu.Barrier(
-          num_barriers=max_stages, num_arrivals=k_bias_produced_arrivals
-      ),
-      v_produced=plgpu.Barrier(num_barriers=max_stages),
-      mask_produced=mask_produced,
+  scratch_types = _get_scratch_types(
+      q, k, v, bias, mask, out_dtype, return_residuals, config
   )
 
   out, *residuals = plgpu.kernel(
       kernel,
       out_type=out_shape,
-      scratch_types=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
+      scratch_types=scratch_types,
       grid=(num_q_heads, num_q_tiles),
       grid_names=("heads", "q_tiles"),
-      num_threads=3,
+      num_threads=_COMPUTE_WGS + 1,
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(
           approx_math=True, unsafe_no_auto_barriers=True
