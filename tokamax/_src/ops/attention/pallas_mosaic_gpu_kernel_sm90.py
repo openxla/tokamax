@@ -253,6 +253,9 @@ def flash_attention_kernel(
         mgpu_lib.bar_sync, schedule_barrier + wg, num_threads=256
     )
 
+    if mask_produced is None:
+      mask_produced = k_bias_produced
+
     @pl.when(wg < 2)
     def compute_wg():
       plgpu.set_max_registers(232, action="increase")
@@ -346,7 +349,8 @@ def flash_attention_kernel(
           if mask_smem is None:
             mask = _load_bcast(mask_gmem, (hi, qs, ks), layout=_WGMMA)
           else:
-            plgpu.barrier_wait(mask_produced.at[si])
+            if mask_produced is not k_bias_produced:
+              plgpu.barrier_wait(mask_produced.at[si])
             if mask_smem.ndim == 2:
               mask = plgpu.load(mask_smem.at[si], layout=_WGMMA_COL)
               mask = lax.broadcast_in_dim(mask, s.shape, [1])
@@ -549,11 +553,10 @@ def flash_attention_kernel(
     if mask.shape[-2] == 1:
       if block_kv >= 128:  # Minimum transfer size is 128 bytes.
         mask_scratch = plgpu.SMEM((max_stages, block_kv), jnp.int8)
+        k_bias_produced_arrivals += 1
     else:
       mask_scratch_shape = (max_stages, compute_wgs * block_q, block_kv)
       mask_scratch = tiled_smem(mask_scratch_shape, jnp.int8, "mask")
-
-    if mask_scratch is not None:
       mask_produced = plgpu.Barrier(num_barriers=max_stages)
 
   scratch_shapes = dict(
