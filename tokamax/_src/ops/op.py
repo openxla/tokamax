@@ -17,6 +17,8 @@
 import abc
 import collections
 from collections.abc import Callable, Hashable, Mapping
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import inspect
@@ -26,6 +28,7 @@ from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final
 from absl import logging
 import immutabledict
 import jax
+from jax.experimental import xla_metadata
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
@@ -93,6 +96,24 @@ class Residuals[T, R]:
         for i in range(len(array_idxs) + len(other))
     ))
     return cls(args, kwargs, out, residuals)
+
+
+_ACTIVE_TOKAMAX_PAYLOAD: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tokamax_payload", default=""
+)
+
+
+@contextlib.contextmanager
+def _tokamax_metadata(json_data: str):
+  """Sets the Tokamax payload, stacking onto an enclosing one outermost-first."""
+  prev = _ACTIVE_TOKAMAX_PAYLOAD.get()
+  payload = f"{prev}/tokamax:{json_data}" if prev else f"tokamax:{json_data}"
+  reset = _ACTIVE_TOKAMAX_PAYLOAD.set(payload)
+  try:
+    with xla_metadata.set_xla_metadata(xla_metadata_payload=payload):
+      yield
+  finally:
+    _ACTIVE_TOKAMAX_PAYLOAD.reset(reset)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -212,7 +233,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
       json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
 
-      with jax.named_scope(f"tokamax:{json_data}"):
+      with _tokamax_metadata(json_data):
         if fwd_res and self.vjp is None and batched_args is not None:
 
           def fwd_flat(*arrays):

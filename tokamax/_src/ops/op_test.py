@@ -21,8 +21,10 @@ from absl.testing import parameterized
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
+import tokamax
 from tokamax._src import batching
 from tokamax._src import config as config_lib
+from tokamax._src import hlo_utils
 from tokamax._src import utils
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import arg_specs as attn_arg_specs
