@@ -31,7 +31,6 @@ from pydantic_core import core_schema as cs
 from tokamax._src import benchmarking
 from tokamax._src import numerics
 
-
 BenchmarkData = benchmarking.BenchmarkData
 
 
@@ -122,20 +121,18 @@ class Autotuner:
       futures.ThreadPoolExecutor
   )
   executor_fn: Callable[[], futures.Executor] = _SyncExecutor
-  timeout_seconds: float = 600.0
 
   def autotune[C, **P](
       self,
       fn_factory: Callable[[C], Callable[P, Any]],
       configs: set[C],
       *args: P.args,
-      timeout: float | None = None,  # pyrefly: ignore[bad-function-definition]
+      timeout: float | None = 600.0,  # pyrefly: ignore[bad-function-definition]
       **kwargs: P.kwargs,
   ) -> AutotuningData[C]:
     """Autotunes over configs for the given arguments."""
     executor = self.executor_fn()
     executor_args = {}
-    timeout = self.timeout_seconds if timeout is None else timeout
     vlog_exc_info = functools.partial(logging.vlog, 2, exc_info=True)
 
     results = {}
