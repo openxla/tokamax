@@ -4,6 +4,11 @@ on:
   # Allow manual runs from the Actions tab for testing
   workflow_dispatch:
     inputs:
+      ab_mode:
+        description: "Run A/B comparison (baseline vs experiment)."
+        required: false
+        type: boolean
+        default: false
       benchmark_filter:
         description: "Regex to filter by benchmark name (e.g., 'attention.*')."
         required: false
@@ -35,13 +40,14 @@ permissions:
 jobs:
   run_benchmarks:
     name: Run Tokamax benchmarks
-    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@355df6c9a7ff0065200c6284c5d86c9381b73d75
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@bd952b0063be0b4169f698947792d203ab5f5c42
     with:
       registry_file: "tokamax/benchmarks/benchmark_registry.pbtxt"
-      bap_ref: "355df6c9a7ff0065200c6284c5d86c9381b73d75"
+      bap_ref: "bd952b0063be0b4169f698947792d203ab5f5c42"
       publish_metrics: true
       pub_sub_gcp_project_id: "ml-oss-benchmarking-production"
       pub_sub_gcp_topic_id: "public-results-prod"
+      ab_mode: ${{ inputs.ab_mode }}
       benchmark_filter: ${{ inputs.benchmark_filter }}
       environment_filter: ${{ inputs.environment_filter }}
       custom_metadata: ${{ inputs.custom_metadata }}
