@@ -293,14 +293,6 @@ def validate_inputs(
   Raises:
     ValueError: If the inputs are invalid.
   """
-  if x.shape[0] % b_block_size != 0:
-    raise ValueError(
-        "The batch dimension of x must be a multiple of the B block size."
-    )
-  if labels.shape[0] % b_block_size != 0:
-    raise ValueError(
-        "The batch dimension of labels must be a multiple of the B block size."
-    )
 
   if w.shape[0] % 8 != 0:
     raise ValueError("The hidden dimension of w must be a multiple of 8")
@@ -310,16 +302,34 @@ def calculate_xw_tiled(
     x_ref,
     w_ref,
     xw_tiled,
+    b_index,
     h_index,
     v_index,
+    num_b_blocks,
     num_h_blocks,
     num_v_blocks,
+    b_dim,
     h_dim,
     v_dim,
     preferred_element_type: jnp.dtype,
 ):
   """Calculates xw_tiled += x@w for forward/backward kernel common logic."""
-  h_block_size, v_block_size = x_ref.shape[1], w_ref.shape[1]
+  b_block_size, h_block_size, v_block_size = (
+      x_ref.shape[0],
+      x_ref.shape[1],
+      w_ref.shape[1],
+  )
+  # Padding if B dimension is not aligned to the B block size
+  if b_dim % b_block_size != 0:
+
+    @pl.when(b_index == num_b_blocks - 1)
+    def pad_non_aligned_b_block():
+      rem = b_dim % b_block_size
+      x_iota_mask = jax.lax.broadcasted_iota(
+          dtype=jnp.int32, shape=(b_block_size, 1), dimension=0
+      )
+      x_ref[...] = jnp.where(x_iota_mask < rem, x_ref[...], 0)
+
   # Padding if V dimension is not aligned to the V block size
   if v_dim % v_block_size != 0:
 
@@ -327,7 +337,7 @@ def calculate_xw_tiled(
     def pad_non_aligned_v_block():
       rem = v_dim % v_block_size
       iota_mask = jax.lax.broadcasted_iota(
-          dtype=jnp.int32, shape=w_ref.shape, dimension=1
+          dtype=jnp.int32, shape=(1, v_block_size), dimension=1
       )
       w_ref[...] = jnp.where(iota_mask < rem, w_ref[...], 0)
 
@@ -338,12 +348,12 @@ def calculate_xw_tiled(
     def pad_non_aligned_h_block():
       rem = h_dim % h_block_size
       x_iota_mask = jax.lax.broadcasted_iota(
-          dtype=jnp.int32, shape=x_ref.shape, dimension=1
+          dtype=jnp.int32, shape=(1, h_block_size), dimension=1
       )
       x_ref[...] = jnp.where(x_iota_mask < rem, x_ref[...], 0)
 
       w_iota_mask = jax.lax.broadcasted_iota(
-          dtype=jnp.int32, shape=w_ref.shape, dimension=0
+          dtype=jnp.int32, shape=(h_block_size, 1), dimension=0
       )
       w_ref[...] = jnp.where(w_iota_mask < rem, w_ref[...], 0)
 
@@ -451,8 +461,8 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         lse_ref,
         xw_tiled,
     ):
-      unused_b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
-      unused_num_b_blocks, num_v_blocks, num_h_blocks = (
+      b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
+      num_b_blocks, num_v_blocks, num_h_blocks = (
           pl.num_programs(i) for i in range(3)
       )
 
@@ -461,10 +471,13 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
           x_ref,
           w_ref,
           xw_tiled,
+          b_index=b_index,
           h_index=h_index,
           v_index=v_index,
+          num_b_blocks=num_b_blocks,
           num_h_blocks=num_h_blocks,
           num_v_blocks=num_v_blocks,
+          b_dim=b_dim,
           h_dim=h_dim,
           v_dim=v_dim,
           preferred_element_type=preferred_element_type,
@@ -484,8 +497,28 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         labels_one_hot = jax.nn.one_hot(
             labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
         )
+        if b_dim % b_block_size != 0:
+          rem_b = b_dim % b_block_size
+          row_idx = jax.lax.broadcasted_iota(
+              jnp.int32, labels_one_hot.shape, dimension=0
+          )
+          labels_one_hot = jnp.where(
+              (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
+              0.0,
+              labels_one_hot,
+          )
         loss_ref[...] -= jnp.sum(labels_one_hot * xw_tiled[...], axis=-1)
         lse_block = jax.nn.logsumexp(xw_tiled[...], axis=-1)
+        if b_dim % b_block_size != 0:
+          rem_b = b_dim % b_block_size
+          row_idx = jax.lax.broadcasted_iota(
+              jnp.int32, lse_block.shape, dimension=0
+          )
+          lse_block = jnp.where(
+              (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
+              -jnp.inf,
+              lse_block,
+          )
         lse_ref[...] = jnp.logaddexp(lse_ref[...], lse_block)
 
       @pl.when(
@@ -749,10 +782,13 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             x_ref,
             w_ref,
             xw_scratch_ref,
+            b_index=global_b_index,
             h_index=h_index,
             v_index=v_index,
+            num_b_blocks=num_b_blocks,
             num_h_blocks=num_h_blocks,
             num_v_blocks=num_v_blocks,
+            b_dim=b_dim,
             h_dim=h_dim,
             v_dim=v_dim,
             preferred_element_type=preferred_element_type,
@@ -787,9 +823,24 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             (pl.cdiv(cur_h_block_size, 8) * 8).astype(jnp.int32), 8
         )
 
+        # Major dimension DMA requires 32-byte alignment (8 for fp32, 16 for
+        # bf16/fp16, 32 for int8).
+        major_align = 32 // x_ref.dtype.itemsize
+
+        # Calculate actual block size if b_dim not a multiple of b_block_size
+        cur_b_block_size = jnp.minimum(
+            b_dim - b_block_size * global_b_index, b_block_size
+        )
+        cur_b_block_aligned_size = pl.multiple_of(
+            (pl.cdiv(cur_b_block_size, major_align) * major_align).astype(
+                jnp.int32
+            ),
+            major_align,
+        )
+
         # Slicing x_grad and x_grad HBM ref to prepare for tiled read / write
         x_grad_slice = x_grad_hbm_ref.at[
-            pl.ds(global_b_index * b_block_size, b_block_size),
+            pl.ds(global_b_index * b_block_size, cur_b_block_aligned_size),
             pl.ds(h_index * h_block_size, cur_h_block_128_aligned_size),
         ]
         w_grad_slice = w_grad_hbm_ref.at[
@@ -799,7 +850,8 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         ]
 
         x_grad_tile_slice = x_grad_tile_ref.at[
-            pl.ds(0, b_block_size), pl.ds(0, cur_h_block_128_aligned_size)
+            pl.ds(0, cur_b_block_aligned_size),
+            pl.ds(0, cur_h_block_128_aligned_size),
         ]
         w_grad_tile_slice = w_grad_tile_ref.at[
             pl.ds(0, cur_h_block_8_aligned_size), pl.ds(0, cur_v_block_size)
@@ -838,16 +890,96 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           labels_one_hot = jax.nn.one_hot(
               labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
           )
-          xw_scratch_ref[...] = -labels_one_hot + jnp.exp(
-              xw_scratch_ref[...] - lse_ref[...][:, None]
-          )
-          xw_scratch_ref[...] *= dout_ref[...][:, None]
+          lse_val = lse_ref[...]
+          if b_dim % b_block_size != 0:
+            rem_b = b_dim % b_block_size
+            row_idx = jax.lax.broadcasted_iota(
+                jnp.int32, lse_val.shape, dimension=0
+            )
+            lse_val = jnp.where(
+                (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
+                0.0,
+                lse_val,
+            )
+          xw_scratch_ref[...] = (
+              -labels_one_hot + jnp.exp(xw_scratch_ref[...] - lse_val[:, None])
+          ) * dout_ref[...][:, None]
+          if b_dim % b_block_size != 0:
+            rem_b = b_dim % b_block_size
+            row_idx = jax.lax.broadcasted_iota(
+                jnp.int32, (b_block_size, 1), dimension=0
+            )
+            xw_scratch_ref[...] = jnp.where(
+                (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
+                0.0,
+                xw_scratch_ref[...],
+            )
+          if v_dim % v_block_size != 0:
+            rem_v = v_dim % v_block_size
+            col_idx = jax.lax.broadcasted_iota(
+                jnp.int32, (1, v_block_size), dimension=1
+            )
+            xw_scratch_ref[...] = jnp.where(
+                (v_index == num_v_blocks - 1) & (col_idx >= rem_v),
+                0.0,
+                xw_scratch_ref[...],
+            )
+
+        def get_clean_x():
+          """Zeros out out-of-bounds padding elements in x_ref in VMEM."""
+          x_val = x_ref[...]
+          if b_dim % b_block_size != 0:
+            rem_b = b_dim % b_block_size
+            row_idx = jax.lax.broadcasted_iota(
+                dtype=jnp.int32, shape=(b_block_size, 1), dimension=0
+            )
+            x_val = jnp.where(
+                (global_b_index == num_b_blocks - 1) & (row_idx >= rem_b),
+                0.0,
+                x_val,
+            )
+          if h_dim % h_block_size != 0:
+            rem_h = h_dim % h_block_size
+            col_idx = jax.lax.broadcasted_iota(
+                dtype=jnp.int32, shape=(1, h_block_size), dimension=1
+            )
+            x_val = jnp.where(
+                (h_index == num_h_blocks - 1) & (col_idx >= rem_h),
+                0.0,
+                x_val,
+            )
+          return x_val
+
+        def get_clean_w():
+          """Zeros out out-of-bounds padding elements in w_ref in VMEM."""
+          w_val = w_ref[...]
+          if h_dim % h_block_size != 0:
+            rem_h = h_dim % h_block_size
+            row_idx = jax.lax.broadcasted_iota(
+                dtype=jnp.int32, shape=(h_block_size, 1), dimension=0
+            )
+            w_val = jnp.where(
+                (h_index == num_h_blocks - 1) & (row_idx >= rem_h),
+                0.0,
+                w_val,
+            )
+          if v_dim % v_block_size != 0:
+            rem_v = v_dim % v_block_size
+            col_idx = jax.lax.broadcasted_iota(
+                dtype=jnp.int32, shape=(1, v_block_size), dimension=1
+            )
+            w_val = jnp.where(
+                (v_index == num_v_blocks - 1) & (col_idx >= rem_v),
+                0.0,
+                w_val,
+            )
+          return w_val
 
         # Init W gradient
         @pl.when(b_index == 0)
         def init_w_grad():
           w_grad_tile_ref[...] = jax.lax.dot_general(
-              x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
+              get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
           )
           w_write_future.start()
 
@@ -855,7 +987,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         @pl.when(v_index == 0)
         def init_x_grad():
           x_grad_tile_ref[...] = jax.lax.dot_general(
-              xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
+              xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
           )
           x_write_future.start()
 
@@ -863,7 +995,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         @pl.when(b_index != 0)
         def accumulate_w_grad():
           res = jax.lax.dot_general(
-              x_ref[...], xw_scratch_ref[...], (((0,), (0,)), ((), ()))
+              get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
           )
           w_read_future.wait()
           w_grad_tile_ref[...] += res
@@ -873,7 +1005,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         @pl.when(v_index != 0)
         def accumulate_x_grad():
           res = jax.lax.dot_general(
-              xw_scratch_ref[...], w_ref[...], (((1,), (1,)), ((), ()))
+              xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
           )
           x_read_future.wait()
           x_grad_tile_ref[...] += res
