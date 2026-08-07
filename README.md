@@ -32,11 +32,19 @@ And the following for both GPU and TPU:
 
 *   `tokamax.ragged_dot`
     ([Mixture of Experts](https://arxiv.org/abs/2211.15841)).
+*   `tokamax.ragged_dot_general`
+    (Generalized ragged dot with flexible contracting dimensions).
 
 And the following TPU kernels:
 
 *   `tokamax.linear_softmax_cross_entropy_loss`
     ([Memory Efficient Linear Cross Entropy Loss Kernel](https://arxiv.org/abs/2410.10989v2))
+
+And the following XLA kernels:
+
+*   `tokamax.triangle_multiplication`
+    ([AlphaFold](https://doi.org/10.1038/s41586-021-03819-2) Supplementary
+    Algorithm 11 and 12).
 
 ## Installation
 
