@@ -589,11 +589,15 @@ def tgmm_kernel_main(
   )
 
   in_specs, out_specs = generate_tgmm_block_specs(metadata_ref, cfgs)
+  # Partition output tiles across TCs in MegaCore mode over both N and K
+  # dimensions.
   pipeline_fn = pltpu.emit_pipeline(
       functools.partial(tgmm_inner_kernel, cfgs=cfgs),
       grid=(num_n, num_k, num_gm),
       in_specs=in_specs,
       out_specs=out_specs,
+      core_axis_name="core",
+      dimension_semantics=(pltpu.PARALLEL, pltpu.PARALLEL, pltpu.ARBITRARY),
   )
   lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
   rhs_value = rhs_ref.value
@@ -755,23 +759,15 @@ def tgmm_v2(
     if pad_n > 0:
       rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, 0), (0, pad_n)))
   rhs = OperandRef(value=rhs, scale=rhs_scale)
-  hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-  in_specs = [
-      hbm_spec,  # lhs
-      # the tree.map build a
-      # OperandRef(value=hbm_spec, scale=None if scale is None else hbm_spec.
-      jax.tree.map(lambda _: hbm_spec, rhs),   # rhs
-  ]
+  group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
+  group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
 
-  return pl.pallas_call(
+  # Configure per-core execution over TensorCore mesh for MegaCore scaling.
+  return pl.kernel(
       functools.partial(tgmm_kernel_main, cfgs=cfgs),
-      out_shape=out_init,
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=2,
-          in_specs=in_specs,
-          out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-          scratch_shapes=scratch_shapes,
-      ),
+      out_type=out_init,
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      scratch_types=scratch_shapes,
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=vmem_limit_bytes,
           disable_bounds_checks=True,
@@ -781,4 +777,4 @@ def tgmm_v2(
       # the metadata here is for profiling, debugging, and cost modeling.
       # It does not affect the kernel's computation.
       metadata=gmm_v2.get_metadata(cfgs),
-  )(group_sizes, group_offset, lhs, rhs)[:, :dims.size_k, : dims.size_n]
+  )(group_sizes, group_offset, lhs, rhs)[:, : dims.size_k, : dims.size_n]
