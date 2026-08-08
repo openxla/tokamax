@@ -21,16 +21,16 @@ import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
-from tokamax._src.ops.ragged_dot.gmm_v2_kernel_tests import pallas_mosaic_tpu_v2_kernel_test as kernel_test
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
+from tokamax._src.ops.experimental.tpu.gmm_v2 import gmm_v2 as gmm_backend
+from tokamax._src.ops.experimental.tpu.gmm_v2 import gmm_v2_test as kernel_test
+from tokamax._src.ops.experimental.tpu.gmm_v2 import tgmm_v2 as tgmm_backend
 
 
 class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
   """Verifies PallasMosaicTpuV2RaggedDot pipes kwargs correctly to the kernel.
 
   Each test below mirrors the kernel test cases in
-  `pallas_mosaic_tpu_v2_kernel_test.py`. Here we instead route the *same* inputs
+  `gmm_v2_test.py`. Here we instead route the *same* inputs
   through `PallasMosaicTpuV2RaggedDot` Op and compare with the direct kernel
   call. Because both paths end up in the same kernel with the same default
   tiling, any disagreement means the API failed to thread a kwarg through to
@@ -159,7 +159,7 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
         num_actual_groups=num_groups,
         preferred_element_type=jnp.bfloat16,
         tile_info=gmm_backend.TileSizes(
-            tile_m=tile_m, tile_k=tile_k, tile_n=tile_n
+            tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
         ),
     )
     chex.assert_trees_all_close(via_op, via_kernel, atol=2e-2, rtol=2e-2)
