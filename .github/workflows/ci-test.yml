@@ -1,7 +1,13 @@
 name: CI-Test-Sharding
 
-# Manual workflow to validate a sharded version of ci-build.yml
-on: 
+#  Full workflow to validate a sharded version of ci-build.yml
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 env:
@@ -16,27 +22,126 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.compute.outputs.shards }}
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Filter changed paths
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        id: filter
+        with:
+          filters: |
+            attention:
+              - 'tokamax/_src/ops/attention/**'
+            ragged_dot:
+              - 'tokamax/_src/ops/ragged_dot/**'
+            triangle_multiplication:
+              - 'tokamax/_src/ops/triangle_multiplication/**'
+            ragged_gather:
+              - 'tokamax/_src/ops/ragged_gather/**'
+            ragged_gather_reduce:
+              - 'tokamax/_src/ops/ragged_gather_reduce/**'
+            linear_softmax:
+              - 'tokamax/_src/ops/linear_softmax_cross_entropy_loss/**'
+            experimental:
+              - 'tokamax/_src/ops/experimental/**'
+            flex_attention:
+              - 'tokamax/_src/ops/flex_attention/**'
+            ragged_scatter:
+              - 'tokamax/_src/ops/ragged_scatter/**'
+            gated_linear_unit:
+              - 'tokamax/_src/ops/gated_linear_unit/**'
+            normalization:
+              - 'tokamax/_src/ops/normalization/**'
+            ops_core:
+              - 'tokamax/_src/ops/*.py'
+            shared_core:
+              - 'tokamax/_src/*.py'
+              - 'pyproject.toml'
+              - '.github/workflows/ci-test.yml'
+
+      - name: Compute affected shards
+        id: compute
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ATTENTION: ${{ steps.filter.outputs.attention }}
+          RAGGED_DOT: ${{ steps.filter.outputs.ragged_dot }}
+          TRIANGLE_MULTIPLICATION: ${{ steps.filter.outputs.triangle_multiplication }}
+          RAGGED_GATHER: ${{ steps.filter.outputs.ragged_gather }}
+          RAGGED_GATHER_REDUCE: ${{ steps.filter.outputs.ragged_gather_reduce }}
+          LINEAR_SOFTMAX: ${{ steps.filter.outputs.linear_softmax }}
+          EXPERIMENTAL: ${{ steps.filter.outputs.experimental }}
+          FLEX_ATTENTION: ${{ steps.filter.outputs.flex_attention }}
+          RAGGED_SCATTER: ${{ steps.filter.outputs.ragged_scatter }}
+          GATED_LINEAR_UNIT: ${{ steps.filter.outputs.gated_linear_unit }}
+          NORMALIZATION: ${{ steps.filter.outputs.normalization }}
+          OPS_CORE: ${{ steps.filter.outputs.ops_core }}
+          SHARED_CORE: ${{ steps.filter.outputs.shared_core }}
+        run: |
+          python3 - <<'PYEOF' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          all_shards = [
+              'attn_base_test', 'attn_api_test', 'attn_pallas_mosaic_gpu_test',
+              'attn_pallas_mosaic_tpu_test', 'attn_pallas_triton_test',
+              'attn_jax_nn_test', 'attn_xla_chunked_test',
+              'gmm_v2_perf', 'gmm_v2_kernel', 'op_test', 'topk',
+              'ragged_dot_misc', 'linear_softmax_and_experimental',
+              'misc_small_ops', 'tokamax_test', 'autotuning_api_test',
+              'tokamax_presubmit_misc', 'ops_catchall',
+          ]
+
+          always_on = {
+              'ops_catchall', 'tokamax_presubmit_misc',
+              'tokamax_test', 'autotuning_api_test',
+          }
+
+          filter_to_shards = {
+              'ATTENTION': [
+                  'attn_base_test', 'attn_api_test',
+                  'attn_pallas_mosaic_gpu_test', 'attn_pallas_mosaic_tpu_test',
+                  'attn_pallas_triton_test', 'attn_jax_nn_test',
+                  'attn_xla_chunked_test', 'op_test',
+              ],
+              'RAGGED_DOT': ['gmm_v2_perf', 'gmm_v2_kernel', 'ragged_dot_misc', 'op_test'],
+              'TRIANGLE_MULTIPLICATION': ['ragged_dot_misc'],
+              'RAGGED_GATHER': ['ragged_dot_misc'],
+              'RAGGED_GATHER_REDUCE': ['ragged_dot_misc'],
+              'LINEAR_SOFTMAX': ['linear_softmax_and_experimental'],
+              'EXPERIMENTAL': ['linear_softmax_and_experimental', 'topk'],
+              'FLEX_ATTENTION': ['misc_small_ops'],
+              'RAGGED_SCATTER': ['misc_small_ops'],
+              'GATED_LINEAR_UNIT': ['misc_small_ops', 'op_test'],
+              'NORMALIZATION': ['misc_small_ops', 'op_test'],
+              'OPS_CORE': ['op_test'],
+          }
+
+          if os.environ['EVENT_NAME'] == 'workflow_dispatch':
+              selected = set(all_shards)
+          elif os.environ.get('SHARED_CORE') == 'true':
+              selected = set(all_shards)
+          else:
+              selected = set(always_on)
+              for env_name, shards in filter_to_shards.items():
+                  if os.environ.get(env_name) == 'true':
+                      selected.update(shards)
+
+          print(f"shards={json.dumps(sorted(selected))}")
+          PYEOF
+
   ops-tests:
+    needs: detect-changes
     strategy:
       matrix:
         runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
-        shard_name: [
-          'attn_base_test',
-          'attn_api_test',
-          'attn_pallas_mosaic_gpu_test',
-          'attn_pallas_mosaic_tpu_test',
-          'attn_pallas_triton_test',
-          'attn_jax_nn_test',
-          'attn_xla_chunked_test',
-          'gmm_v2_perf',
-          'gmm_v2_kernel',
-          'op_test',
-          'topk',
-          'ragged_dot_misc',
-          'linear_softmax_and_experimental',
-          'misc_small_ops',
-          'tokamax_presubmit',
-        ]
+        shard_name: ${{ fromJson(needs.detect-changes.outputs.shards) }}
         include:
           - runner: 'linux-x86-a3-8g-h100-1gpu'
             device: 'cuda'
@@ -86,11 +191,38 @@ jobs:
               tokamax/_src/ops/ragged_scatter/
               tokamax/_src/ops/gated_linear_unit/
               tokamax/_src/ops/normalization/
-          - shard_name: 'tokamax_presubmit'
+          - shard_name: 'tokamax_test'
+            test_paths: 'tokamax/tokamax_test.py'
+          - shard_name: 'autotuning_api_test'
+            test_paths: 'tokamax/_src/autotuning/api_test.py'
+          - shard_name: 'tokamax_presubmit_misc'
             test_paths: >-
               --ignore-glob="tokamax/_src/ops/*"
               --ignore-glob="tokamax/_src/benchmarking_test*"
+              --ignore=tokamax/tokamax_test.py
+              --ignore=tokamax/_src/autotuning/api_test.py
               tokamax
+          - shard_name: 'ops_catchall'
+            test_paths: >-
+              --ignore=tokamax/_src/ops/attention/base_test.py
+              --ignore=tokamax/_src/ops/attention/api_test.py
+              --ignore=tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py
+              --ignore=tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py
+              --ignore=tokamax/_src/ops/attention/pallas_triton_test.py
+              --ignore=tokamax/_src/ops/attention/jax_nn_test.py
+              --ignore=tokamax/_src/ops/attention/xla_chunked_test.py
+              --ignore=tokamax/_src/ops/op_test.py
+              --ignore=tokamax/_src/ops/ragged_dot/
+              --ignore=tokamax/_src/ops/triangle_multiplication/
+              --ignore=tokamax/_src/ops/ragged_gather/
+              --ignore=tokamax/_src/ops/ragged_gather_reduce/
+              --ignore=tokamax/_src/ops/linear_softmax_cross_entropy_loss/
+              --ignore=tokamax/_src/ops/experimental/
+              --ignore=tokamax/_src/ops/flex_attention/
+              --ignore=tokamax/_src/ops/ragged_scatter/
+              --ignore=tokamax/_src/ops/gated_linear_unit/
+              --ignore=tokamax/_src/ops/normalization/
+              tokamax/_src/
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
