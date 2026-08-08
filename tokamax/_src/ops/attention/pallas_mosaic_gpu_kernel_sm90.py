@@ -319,6 +319,12 @@ def flash_attention_kernel(
       k_end = None if k_end_gmem is None else load_k_range(k_end_gmem)
       lb, ub, k_start_max, k_end_min = get_kv_ranges()
 
+      for si in range(num_stages):
+        mgpu_lib.bar_arrive(k_consumed_barrier + si, num_threads=384)
+        if mask_smem is not None:
+          mgpu_lib.bar_arrive(mask_consumed_barrier + si, num_threads=384)
+        mgpu_lib.bar_arrive(v_consumed_barrier + si, num_threads=384)
+
       plgpu.barrier_wait(q_produced)
 
       @pl.when(ub > lb)
@@ -527,23 +533,10 @@ def flash_attention_kernel(
 
       lb, ub, _, _ = get_kv_ranges()
 
-      @pl.loop(lb, lax.min(lb + num_stages, ub))
-      def prologue(ki):
-        si = lax.rem(ki, num_stages)
-        ks = block.ds(ki, block_kv)
-        cp(k_gmem.at[ks, hi_kv], k_smem, k_bias_produced, si)
-        if bias_gmem_ is not None:
-          assert bias_smem is not None
-          cp(bias_gmem_.at[qs, ks], bias_smem, k_bias_produced, si)
-        if mask_gmem_ is not None:
-          assert mask_smem is not None
-          cp(mask_gmem_.at[..., ks], mask_smem, mask_produced, si)
-        cp(v_gmem.at[ks, hi_kv], v_smem, v_produced, si)
-
-      @pl.loop(lb, ub - num_stages)
+      @pl.loop(lb, ub)
       def kv_loop(ki):
         si = lax.rem(ki, num_stages)
-        ks = block.ds(ki + num_stages, block_kv)
+        ks = block.ds(ki, block_kv)
         mgpu_lib.bar_sync(k_consumed_barrier + si, num_threads=384)
         cp(k_gmem.at[ks, hi_kv], k_smem, k_bias_produced, si)
         if bias_gmem_ is not None:
