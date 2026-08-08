@@ -14,6 +14,7 @@
 # ==============================================================================
 from collections.abc import Callable
 import dataclasses
+import functools
 import json
 from typing import Annotated
 from absl.testing import absltest
@@ -123,6 +124,27 @@ class PydanticTest(parameterized.TestCase):
     adapter = pydantic.TypeAdapter(pydantic_lib.annotate(typ), config=config)
     self.assertEqual(data, adapter.validate_python(adapter.dump_python(data)))
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+
+  def test_wrapped_callable_serialization(self):
+    config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+    adapter = pydantic.TypeAdapter(
+        pydantic_lib.annotate(Callable[[jax.Array], jax.Array]),
+        config=config,
+    )
+    expected_json = adapter.dump_json(jax.nn.swish)
+    jitted = jax.jit(jax.nn.swish)
+    double_jitted = jax.jit(jitted)
+
+    @functools.wraps(jax.nn.swish)
+    def wrapped(x):
+      return jax.nn.swish(x)
+
+    partial_fn = functools.partial(jax.nn.swish)
+    self.assertEqual(adapter.dump_json(jitted), expected_json)
+    self.assertEqual(adapter.dump_json(double_jitted), expected_json)
+    self.assertEqual(adapter.dump_json(wrapped), expected_json)
+    self.assertEqual(adapter.dump_json(partial_fn), expected_json)
+    self.assertEqual(adapter.validate_json(expected_json), jax.nn.swish)
 
   @parameterized.parameters(
       (jax.ShapeDtypeStruct((), jnp.int32)),
