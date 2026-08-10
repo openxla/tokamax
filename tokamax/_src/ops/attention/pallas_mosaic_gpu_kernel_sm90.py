@@ -161,20 +161,11 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
 def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   """Returns a set of configs for autotuning flash attention on SM90 GPUs."""
   q, k, _ = ba.args
-  block_qs = set([
-      min(x, pl.next_power_of_2(q.shape[-3] // 2))
-      for x in [64, 128]
-      if q.shape[-3] % (x * 2) == 0  # 2 * block_q must divide seq_len_q.
-  ])
-  block_kvs = set([
-      min(x, pl.next_power_of_2(k.shape[-3]))
-      for x in [64, 128, 256]
-      if k.shape[-3] % x == 0  # block_kv must divide seq_len_kv.
-  ])
+  block_kvs = [x for x in [128, 256] if x <= pl.next_power_of_2(k.shape[-3])]
 
   configs = set()
-  for block_q in block_qs:
-    for block_kv in block_kvs:
+  for block_q in [64, 128] if pl.next_power_of_2(q.shape[-3]) >= 256 else [64]:
+    for block_kv in [64] + block_kvs:
       for num_stages in [2, 3, 4]:
         if num_stages > pl.cdiv(k.shape[-3], block_kv):
           continue
