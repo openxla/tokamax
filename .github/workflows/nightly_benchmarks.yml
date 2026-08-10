@@ -1,0 +1,44 @@
+name: Nightly Benchmarks
+
+on:
+  # Required for MLCompass integration.
+  # Required inputs: benchmark_filter, environment_filter, custom_metadata.
+  workflow_dispatch:
+    inputs:
+      benchmark_filter:
+          description: "Regex to filter by benchmark name (e.g., 'attention.*')."
+          required: false
+          type: string
+          default: ""
+      environment_filter:
+        description: "Regex to filter by environment configuration ID (e.g., 'b200.*')."
+        required: false
+        type: string
+        default: ""
+      custom_metadata:
+        description: "JSON string of metadata to append to the benchmark result. Overwrites static metadata from the registry but is overwritten by dynamic metadata from the workload."
+        required: false
+        type: string
+        default: "{}"
+
+  schedule:
+    - cron: "0 0 * * *"  # Runs at 00:00 UTC every day
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  run_benchmarks:
+    name: Run Tokamax benchmarks
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@bd952b0063be0b4169f698947792d203ab5f5c42
+    with:
+      registry_file: "tokamax/benchmarks/benchmark_registry.pbtxt"
+      bap_ref: "bd952b0063be0b4169f698947792d203ab5f5c42"
+      publish_metrics: true
+      pub_sub_gcp_project_id: "ml-oss-benchmarking-production"
+      pub_sub_gcp_topic_id: "public-results-prod"
+      # Fallbacks required because workflow runs triggered by schedule lack the inputs context
+      benchmark_filter: ${{ inputs.benchmark_filter || '' }}
+      environment_filter: ${{ inputs.environment_filter || '' }}
+      custom_metadata: ${{ inputs.custom_metadata || '{}' }}
