@@ -25,7 +25,7 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      shards: ${{ steps.compute.outputs.shards }}
+      include: ${{ steps.compute.outputs.include }}
     steps:
       - name: Checkout Tokamax
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -88,17 +88,81 @@ jobs:
           import json
           import os
 
-          all_shards = [
-              'attn_base_test', 'attn_base_vjp_test', 'attn_api_test',
-              'attn_pallas_mosaic_gpu_test',
-              'attn_pallas_mosaic_tpu_test', 'attn_pallas_triton_test',
-              'attn_jax_nn_test', 'attn_xla_chunked_test',
-              'gmm_v2_perf', 'gmm_v2_kernel', 'op_test', 'topk',
-              'ragged_dot_sm100_fp8_quant', 'ragged_dot_sm100_i8_quant',
-              'ragged_dot_misc', 'linear_softmax_and_experimental',
-              'misc_small_ops', 'tokamax_test', 'autotuning_api_test',
-              'tokamax_catchall',
-          ]
+          SHARD_TEST_PATHS = {
+              'attn_base_test': (
+                  'tokamax/_src/ops/attention/base_test.py::MaskTest '
+                  'tokamax/_src/ops/attention/base_test.py::DotProductAttentionTest'
+              ),
+              'attn_base_vjp_test': (
+                  'tokamax/_src/ops/attention/base_test.py::DotProductAttentionWithExplicitVjpTest'
+              ),
+              'attn_api_test': 'tokamax/_src/ops/attention/api_test.py',
+              'attn_pallas_mosaic_gpu_test': 'tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py',
+              'attn_pallas_mosaic_tpu_test': 'tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py',
+              'attn_pallas_triton_test': 'tokamax/_src/ops/attention/pallas_triton_test.py',
+              'attn_jax_nn_test': 'tokamax/_src/ops/attention/jax_nn_test.py',
+              'attn_xla_chunked_test': 'tokamax/_src/ops/attention/xla_chunked_test.py',
+              'gmm_v2_perf': 'tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_perf_test.py',
+              'gmm_v2_kernel': 'tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_test.py',
+              'op_test': 'tokamax/_src/ops/op_test.py',
+              'topk': 'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py',
+              'ragged_dot_sm100_fp8_quant': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py',
+              'ragged_dot_sm100_i8_quant': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py',
+              'ragged_dot_misc': (
+                  '--ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_perf_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py '
+                  'tokamax/_src/ops/ragged_dot/ '
+                  'tokamax/_src/ops/triangle_multiplication/ '
+                  'tokamax/_src/ops/ragged_gather/ '
+                  'tokamax/_src/ops/ragged_gather_reduce/'
+              ),
+              'linear_softmax_and_experimental': (
+                  '--ignore=tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py '
+                  'tokamax/_src/ops/linear_softmax_cross_entropy_loss/ '
+                  'tokamax/_src/ops/experimental/'
+              ),
+              'misc_small_ops': (
+                  'tokamax/_src/ops/flex_attention/ '
+                  'tokamax/_src/ops/ragged_scatter/ '
+                  'tokamax/_src/ops/gated_linear_unit/ '
+                  'tokamax/_src/ops/normalization/'
+              ),
+              'tokamax_test': 'tokamax/tokamax_test.py',
+              'autotuning_api_test': 'tokamax/_src/autotuning/api_test.py',
+              'tokamax_catchall': (
+                  '--ignore=tokamax/_src/ops/attention/base_test.py '
+                  '--ignore=tokamax/_src/ops/attention/api_test.py '
+                  '--ignore=tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py '
+                  '--ignore=tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py '
+                  '--ignore=tokamax/_src/ops/attention/pallas_triton_test.py '
+                  '--ignore=tokamax/_src/ops/attention/jax_nn_test.py '
+                  '--ignore=tokamax/_src/ops/attention/xla_chunked_test.py '
+                  '--ignore=tokamax/_src/ops/op_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/ '
+                  '--ignore=tokamax/_src/ops/triangle_multiplication/ '
+                  '--ignore=tokamax/_src/ops/ragged_gather/ '
+                  '--ignore=tokamax/_src/ops/ragged_gather_reduce/ '
+                  '--ignore=tokamax/_src/ops/linear_softmax_cross_entropy_loss/ '
+                  '--ignore=tokamax/_src/ops/experimental/ '
+                  '--ignore=tokamax/_src/ops/flex_attention/ '
+                  '--ignore=tokamax/_src/ops/ragged_scatter/ '
+                  '--ignore=tokamax/_src/ops/gated_linear_unit/ '
+                  '--ignore=tokamax/_src/ops/normalization/ '
+                  '--ignore-glob="tokamax/_src/benchmarking_test*" '
+                  '--ignore=tokamax/_src/autotuning/api_test.py '
+                  'tokamax/_src'
+              ),
+          }
+
+          RUNNER_DEVICE = {
+              'linux-x86-a3-8g-h100-1gpu': 'cuda',
+              'linux-x86-ct6e-44-1tpu': 'tpu',
+              'linux-x86-tpu7x-56-1tpu': 'tpu',
+          }
+
+          all_shards = list(SHARD_TEST_PATHS)
 
           always_on = {
               'tokamax_catchall', 'tokamax_test', 'autotuning_api_test',
@@ -138,102 +202,25 @@ jobs:
                   if os.environ.get(env_name) == 'true':
                       selected.update(shards)
 
-          print(f"shards={json.dumps(sorted(selected))}")
+          combos = [
+              {
+                  'runner': runner,
+                  'device': device,
+                  'shard_name': shard,
+                  'test_paths': SHARD_TEST_PATHS[shard],
+              }
+              for runner, device in RUNNER_DEVICE.items()
+              for shard in sorted(selected)
+          ]
+
+          print(f"include={json.dumps(combos)}")
           PYEOF
 
   ops-tests:
     needs: detect-changes
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
-        shard_name: ${{ fromJson(needs.detect-changes.outputs.shards) }}
-        include:
-          - runner: 'linux-x86-a3-8g-h100-1gpu'
-            device: 'cuda'
-          - runner: 'linux-x86-ct6e-44-1tpu'
-            device: 'tpu'
-          - runner: 'linux-x86-tpu7x-56-1tpu'
-            device: 'tpu'
-          - shard_name: 'attn_base_test'
-            test_paths: >-
-              tokamax/_src/ops/attention/base_test.py::MaskTest
-              tokamax/_src/ops/attention/base_test.py::DotProductAttentionTest
-          - shard_name: 'attn_base_vjp_test'
-            test_paths: >-
-              tokamax/_src/ops/attention/base_test.py::DotProductAttentionWithExplicitVjpTest
-          - shard_name: 'attn_api_test'
-            test_paths: 'tokamax/_src/ops/attention/api_test.py'
-          - shard_name: 'attn_pallas_mosaic_gpu_test'
-            test_paths: 'tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py'
-          - shard_name: 'attn_pallas_mosaic_tpu_test'
-            test_paths: 'tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py'
-          - shard_name: 'attn_pallas_triton_test'
-            test_paths: 'tokamax/_src/ops/attention/pallas_triton_test.py'
-          - shard_name: 'attn_jax_nn_test'
-            test_paths: 'tokamax/_src/ops/attention/jax_nn_test.py'
-          - shard_name: 'attn_xla_chunked_test'
-            test_paths: 'tokamax/_src/ops/attention/xla_chunked_test.py'
-          - shard_name: 'gmm_v2_perf'
-            test_paths: 'tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_perf_test.py'
-          - shard_name: 'gmm_v2_kernel'
-            test_paths: 'tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_test.py'
-          - shard_name: 'op_test'
-            test_paths: 'tokamax/_src/ops/op_test.py'
-          - shard_name: 'topk'
-            test_paths: 'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py'
-          - shard_name: 'ragged_dot_sm100_fp8_quant'
-            test_paths: 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py'
-          - shard_name: 'ragged_dot_sm100_i8_quant'
-            test_paths: 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py'
-          - shard_name: 'ragged_dot_misc'
-            test_paths: >-
-              --ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_perf_test.py
-              --ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_test.py
-              --ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py
-              --ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py
-              tokamax/_src/ops/ragged_dot/
-              tokamax/_src/ops/triangle_multiplication/
-              tokamax/_src/ops/ragged_gather/
-              tokamax/_src/ops/ragged_gather_reduce/
-          - shard_name: 'linear_softmax_and_experimental'
-            test_paths: >-
-              --ignore=tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py
-              --ignore-glob="*/splash_attention"
-              tokamax/_src/ops/linear_softmax_cross_entropy_loss/
-              tokamax/_src/ops/experimental/
-          - shard_name: 'misc_small_ops'
-            test_paths: >-
-              tokamax/_src/ops/flex_attention/
-              tokamax/_src/ops/ragged_scatter/
-              tokamax/_src/ops/gated_linear_unit/
-              tokamax/_src/ops/normalization/
-          - shard_name: 'tokamax_test'
-            test_paths: 'tokamax/tokamax_test.py'
-          - shard_name: 'autotuning_api_test'
-            test_paths: 'tokamax/_src/autotuning/api_test.py'
-          - shard_name: 'tokamax_catchall'
-            test_paths: >-
-              --ignore=tokamax/_src/ops/attention/base_test.py
-              --ignore=tokamax/_src/ops/attention/api_test.py
-              --ignore=tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py
-              --ignore=tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py
-              --ignore=tokamax/_src/ops/attention/pallas_triton_test.py
-              --ignore=tokamax/_src/ops/attention/jax_nn_test.py
-              --ignore=tokamax/_src/ops/attention/xla_chunked_test.py
-              --ignore=tokamax/_src/ops/op_test.py
-              --ignore=tokamax/_src/ops/ragged_dot/
-              --ignore=tokamax/_src/ops/triangle_multiplication/
-              --ignore=tokamax/_src/ops/ragged_gather/
-              --ignore=tokamax/_src/ops/ragged_gather_reduce/
-              --ignore=tokamax/_src/ops/linear_softmax_cross_entropy_loss/
-              --ignore=tokamax/_src/ops/experimental/
-              --ignore=tokamax/_src/ops/flex_attention/
-              --ignore=tokamax/_src/ops/ragged_scatter/
-              --ignore=tokamax/_src/ops/gated_linear_unit/
-              --ignore=tokamax/_src/ops/normalization/
-              --ignore-glob="tokamax/_src/benchmarking_test*"
-              --ignore=tokamax/_src/autotuning/api_test.py
-              tokamax/_src
+        include: ${{ fromJson(needs.detect-changes.outputs.include) }}
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
