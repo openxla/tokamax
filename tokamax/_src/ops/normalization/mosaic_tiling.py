@@ -21,7 +21,7 @@ differ, so everything else lives here.
 
 from collections.abc import Callable
 import dataclasses
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 from jax.experimental import pallas as pl
@@ -38,8 +38,24 @@ LANE_SEMANTICS = plgpu.CompilerParams(
 
 
 def largest_divisor(n: int, cap: int) -> int:
-  """Returns the largest divisor of `n` that is at most `cap`."""
+  """Returns the largest divisor of `n` that is at most `cap`.
+
+  Always finds one, as 1 divides everything.
+  """
   return next(b for b in range(min(cap, n), 0, -1) if n % b == 0)
+
+
+def warp_aligned_block(rows: int, cap: int) -> int | None:
+  """Returns the largest divisor of `rows` at most `cap` and a multiple of 4.
+
+  The four warps of a block come from `M` whenever the reduced axis is the
+  contiguous one, so a block of rows that is not a multiple of 4 cannot be
+  lowered at all. Returns `None` when `rows` has no such divisor -- 2 rows
+  cannot fill four warps however the blocks are chosen.
+  """
+  return next(
+    (b for b in range(min(cap, rows) // 4 * 4, 0, -4) if rows % b == 0), None
+  )
 
 
 def _largest_pow2(cap: int, ok: Callable[[int], bool]) -> int | None:
@@ -86,6 +102,23 @@ def load(ref, layout) -> jax.Array:
   return plgpu.load(ref, layout=layout, optimized=False).astype(jnp.float32)
 
 
+class Indices(NamedTuple):
+  """How one program indexes the refs it was given.
+
+  Attributes:
+    x: Index into an `x`-shaped ref, giving this block's tile.
+    stat: Index into a `mean`/`rstddev`-shaped ref.
+    dparam: Index into a `dscale`/`doffset` partials ref.
+    pid_m: This block's position along `M`, already reassembled if the row grid
+      needed two axes.
+  """
+
+  x: Any
+  stat: Any
+  dparam: Any
+  pid_m: Any
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Plan:
   """How one canonical `(M, A, B)` normalization is spread over the device.
@@ -103,15 +136,12 @@ class Plan:
     stat_shape: Shape of the `mean`/`rstddev` refs.
     dparam_shape: Shape of the per-block `dscale`/`doffset` partials, one `A`-
       indexed row per block, to be summed over the leading two axes.
+    ndim: Rank of a tile in registers. Note this is not `len(x_shape)`: when `B`
+      is blocked, `M` is indexed by a scalar and so drops out of the tile.
     layout: Register layout of an `x` tile, or `None` for the 1D case, where the
       default strided layout is both usable and optimal.
-    reduce_axis: Axis of the tile holding `A`; `None` means every axis (the 1D
-      case), which reduces to a scalar.
-    stat_dims: `broadcast_in_dim` dims mapping a per-row statistic to a tile.
-    param_dims: `broadcast_in_dim` dims mapping an `A`-indexed param to a tile.
-    param_axes: Tile axes to reduce to get one value per `A` element -- the
-      complement of `reduce_axis`, and `None` in the 1D case, where a tile
-      already is one value per `A` element.
+    reduce_axis: Axis of the tile holding `A`. For a 1D tile that is its only
+      axis, so the reduction lands on a scalar.
     grid: The `plgpu.kernel` grid.
     grid_names: Names of `grid`'s axes. `'m'`/`'b'` index `M`/`B`; a leading
       `'mo'` appears only when `M` needs two grid axes (see `plan`).
@@ -124,56 +154,63 @@ class Plan:
   x_shape: tuple[int, ...]
   stat_shape: tuple[int, ...]
   dparam_shape: tuple[int, int, int]
+  ndim: int
   layout: Any | None
-  reduce_axis: int | None
-  stat_dims: tuple[int, ...]
-  param_dims: tuple[int, ...] | None
-  param_axes: tuple[int, ...] | None
+  reduce_axis: int
   grid: tuple[int, ...]
   grid_names: tuple[str, ...]
   split_m: int
 
   @property
+  def stat_axes(self) -> tuple[int, ...]:
+    """The tile axes other than `A`.
+
+    A per-row statistic is indexed by exactly these, and an `A`-indexed value is
+    reduced over exactly these, so one tuple serves both. For a 1D tile it is
+    empty: the statistic is a scalar and a tile already is one value per `A`.
+    """
+    return tuple(i for i in range(self.ndim) if i != self.reduce_axis)
+
+  @property
   def stat_layout(self):
     """Layout of a per-row statistic, laid out to match a tile."""
-    if self.layout is None:
-      return None
-    return self.layout.reduce((self.reduce_axis,))
+    return None if self.layout is None else self.layout.reduce((self.reduce_axis,))
 
   @property
   def param_layout(self):
     """Layout of an `A`-indexed param, laid out to match a tile."""
-    if self.layout is None:
-      return None
-    return self.layout.reduce(self.param_axes)
+    return None if self.layout is None else self.layout.reduce(self.stat_axes)
 
-  def indices(self):
-    """Returns `(x_idx, stat_idx, dparam_idx)` for the current program."""
+  def indices(self) -> 'Indices':
+    """Returns how the current program indexes each of the refs."""
     *pid_m_parts, pid_b = map(pl.program_id, range(len(self.grid)))
     pid_m = pid_m_parts[-1]
     if len(pid_m_parts) == 2:
       pid_m += pid_m_parts[0] * self.split_m
-    dparam_idx = (pid_m, pid_b)
+    dparam = (pid_m, pid_b)
     m_slice = pl.ds(pid_m * self.block_m, self.block_m)
     if len(self.x_shape) == 1:
-      return slice(None), 0, dparam_idx
+      return Indices(slice(None), 0, dparam, pid_m)
     if len(self.x_shape) == 2:
-      return m_slice, m_slice, dparam_idx
+      return Indices(m_slice, m_slice, dparam, pid_m)
     b_slice = pl.ds(pid_b * self.block_b, self.block_b)
-    return (pid_m, slice(None), b_slice), (pid_m, b_slice), dparam_idx
+    return Indices(
+      (pid_m, slice(None), b_slice), (pid_m, b_slice), dparam, pid_m
+    )
 
-  def bcast(self, a: jax.Array, shape, dims) -> jax.Array:
-    """Broadcasts a reduced value back over a tile of `shape`."""
+  def _spread(self, a: jax.Array, shape, dims) -> jax.Array:
     a = jax.lax.broadcast_in_dim(a, shape, dims)
     # A splat source needs no hint; the broadcast rule handles it.
     return a if self.layout is None else plgpu.layout_cast(a, self.layout)
 
+  def bcast(self, a: jax.Array, shape) -> jax.Array:
+    """Broadcasts a per-row statistic back over a tile of `shape`."""
+    return self._spread(a, shape, self.stat_axes)
+
   def read_param(self, ref, shape) -> jax.Array:
     """Reads a 1D param, laid out to match a tile of `shape` along `A`."""
-    p = load(ref, self.param_layout)
-    if self.layout is None:  # 1D tile: the param already matches it.
-      return p
-    return self.bcast(p, shape, self.param_dims)
+    # For a 1D tile this broadcast is the identity: the param already matches.
+    return self._spread(load(ref, self.param_layout), shape, (self.reduce_axis,))
 
   def mean_over_a(self, a: jax.Array) -> jax.Array:
     """Averages a tile over `A`, giving one value per row."""
@@ -181,7 +218,7 @@ class Plan:
 
   def sum_over_rows(self, a: jax.Array) -> jax.Array:
     """Sums a tile over all but `A`, giving one value per `A` element."""
-    return a if self.param_axes is None else jnp.sum(a, axis=self.param_axes)
+    return jnp.sum(a, axis=self.stat_axes)
 
 
 def plan(
@@ -190,6 +227,7 @@ def plan(
   *,
   block_m: int,
   block_b: int,
+  rows_per_element: int | None = None,
   max_regs: int = 256,
 ) -> Plan:
   """Plans a canonical `(M, A, B)` normalization.
@@ -197,9 +235,12 @@ def plan(
   Args:
     x_shape: The canonical `(M, A, B)` shape, `A` being the reduced axis.
     itemsize: Bytes per element of `x`.
-    block_m: Upper bound on `block_m`; the largest divisor of `M` at or below it
+    block_m: Upper bound on `block_m`; the largest usable divisor at or below it
       is used, as blocks must tile the array exactly.
     block_b: Upper bound on `block_b`, likewise.
+    rows_per_element: Rows belonging to a single `vmap` element, when `M` holds a
+      folded batch. Blocks are then kept from straddling a batch boundary, so
+      that per-block partials can still be separated per element.
     max_regs: Register budget per thread, in elements of a single block. The
       real footprint is a small multiple of this -- reductions run in `float32`
       and the kernels keep temporaries live -- so this is a knob to turn if a
@@ -209,6 +250,7 @@ def plan(
     The `Plan`.
   """
   num_m, num_a, num_b = x_shape
+  block_m_cap = block_m
   if num_m == 1 and num_b == 1:
     # Wholly degenerate: the tile is 1D, so reducing its only axis *is* an
     # all-axes reduction -- the one case the strided layout handles, and the
@@ -220,24 +262,30 @@ def plan(
       )
     block_m = block_b = 1
     tile_shape, stat_shape = (num_a,), (1,)
-    layout, reduce_axis, stat_dims, param_dims, param_axes = (
-      None, None, (), None, None
-    )
+    layout, ndim, reduce_axis = None, 1, 0
   elif num_b == 1:
     # `A` is contiguous *and* reduced, so the lanes land on it and the
-    # reduction is a lane shuffle.
-    block_m, block_b = largest_divisor(num_m, block_m), 1
+    # reduction is a lane shuffle. The four warps come from `M`, so the block
+    # has to be a multiple of 4 rows -- picking any old divisor below the cap
+    # and letting `coalesced_layout` reject it wastes most of the shape space.
+    rows = num_m if rows_per_element is None else rows_per_element
+    found = warp_aligned_block(rows, block_m_cap)
+    if found is None:
+      raise NotImplementedError(
+        f'No multiple of 4 at or below {min(block_m_cap, rows)} divides the'
+        f' {rows} rows, so the warps cannot be filled.'
+      )
+    block_m, block_b = found, 1
     tile_shape, stat_shape = (num_m, num_a), (num_m,)
-    layout = coalesced_layout(block_m, num_a, itemsize)
-    reduce_axis, stat_dims, param_dims, param_axes = 1, (0,), (1,), (0,)
+    layout, ndim, reduce_axis = coalesced_layout(block_m, num_a, itemsize), 2, 1
   else:
     # `B` is contiguous, so the warps land on `A` and the reduction takes the
     # scratch path. `M` goes entirely to the grid: it adds nothing to
     # coalescing and only inflates the register footprint.
     block_m, block_b = 1, largest_divisor(num_b, block_b)
     tile_shape, stat_shape = (num_m, num_a, num_b), (num_m, num_b)
-    layout = coalesced_layout(num_a, block_b, itemsize)
-    reduce_axis, stat_dims, param_dims, param_axes = 0, (1,), (0,), (1,)
+    # `M` is indexed by a scalar, so the tile is 2D even though the ref is 3D.
+    layout, ndim, reduce_axis = coalesced_layout(num_a, block_b, itemsize), 2, 0
 
   if (regs := block_m * num_a * block_b // 128) > max_regs:
     raise NotImplementedError(
@@ -267,108 +315,40 @@ def plan(
     x_shape=tile_shape,
     stat_shape=stat_shape,
     dparam_shape=(grid_m, grid_b, num_a),
+    ndim=ndim,
     layout=layout,
     reduce_axis=reduce_axis,
-    stat_dims=stat_dims,
-    param_dims=param_dims,
-    param_axes=param_axes,
     grid=grid,
     grid_names=grid_names,
     split_m=split_m,
   )
 
 
-def vmappable(launch):
-  """Folds a `vmap` axis into the leading axis of the canonical `(M, A, B)`.
+def with_usable_block_m(config):
+  """Raises a borrowed Triton config's `block_m` to something this kernel can use.
 
-  `batching.capture_batched_args` records the batch sizes for the heuristics
-  but still calls `jax.vmap` over `_fwd` (see `batching.py`), so without this
-  JAX batches the `plgpu.kernel` launch itself. `pallas_call` has a batching
-  rule that handles that well -- which is why `pallas_triton` needs nothing --
-  but `plgpu.kernel` does not, and it measured ~2.7x worse per element than a
-  single larger launch.
+  `pallas_triton_config.get_heuristics_config` halves `block_m` until the launch
+  has enough blocks to fill the device, which for anything but a very tall `M`
+  bottoms out at 1. Triton is happy with that; this kernel is not, because when
+  the reduced axis is contiguous the four warps of a block come from `M`, so a
+  `block_m` below 4 cannot be lowered and the op declines a shape it could
+  perfectly well have run at `block_m == 4`.
 
-  Rows of the canonical form are normalized independently, so a batch of them
-  is just more rows. Blocks may straddle a batch boundary, which is harmless
-  precisely because the rows are independent -- but only while `scale`/`offset`
-  are shared, which is the only case handled here.
-
-  This is for the forward only; the VJP uses `vmappable_serially`. Every output
-  here is indexed by row, so folding is just a reshape either way, whereas the
-  VJP's `dscale`/`doffset` are reduced *over* rows.
-
-  Args:
-    launch: Takes `x` in canonical form followed by the shared params, and
-      returns arrays whose leading axis indexes rows of `x`.
-
-  Returns:
-    `launch`, wrapped in a `custom_vmap` rule that folds rather than batches.
+  This is a floor, not a retuning: it says nothing about what `block_m` *should*
+  be, only what the layout can accept. `plan` still picks the largest usable
+  divisor at or below it, and the two degenerate cases override it entirely.
   """
-  f = jax.custom_batching.custom_vmap(launch)
-
-  @f.def_vmap
-  def _rule(axis_size, in_batched, x, *params):
-    x_batched, *params_batched = in_batched
-    if any(params_batched):
-      raise NotImplementedError(
-        'The Mosaic GPU kernel does not support batched `scale`/`offset`.'
-      )
-    if not x_batched:
-      out = f(x, *params)
-      return out, jax.tree.map(lambda _: False, out)
-    out = f(x.reshape(axis_size * x.shape[1], *x.shape[2:]), *params)
-    unmerge = lambda o: o.reshape(axis_size, o.shape[0] // axis_size, *o.shape[1:])
-    return jax.tree.map(unmerge, out), jax.tree.map(lambda _: True, out)
-
-  return f
+  return dataclasses.replace(config, block_m=max(4, config.block_m))
 
 
-def vmappable_serially(launch):
-  """Runs `launch` once per `vmap` element instead of once for the whole batch.
+def broadcast_unbatched(args, in_batched, axis_size):
+  """Gives every argument a leading batch axis, materializing the missing ones.
 
-  This is the VJP's counterpart to `vmappable`, and it exists because all three
-  cheaper options are wrong:
-
-  * Folding the batch into `M` sums `dscale`/`doffset` over it as well -- right
-    for `vjp(vmap(f))`, where the params are shared, and wrong for
-    `vmap(grad(f))`, which wants a gradient per batch element. The rule cannot
-    tell the two apart, and the wrong answer is silent: JAX broadcasts the summed
-    value, so every element receives the batch total.
-  * Leaving it to JAX's generic batching prepends a grid axis, which renumbers
-    the `pl.program_id`s that `Plan.indices` reads. Only the first row-block of
-    each element then gets written, and the rest of `dx` keeps whatever value the
-    incoming cotangent had.
-  * Sharing one param buffer across the batch is not available either: `scale`
-    arrives batched regardless of the caller's `in_axes`, because `op.Op` keeps
-    it in the `custom_vjp` residuals, which JAX batches wholesale.
-
-  So each element gets its own launch, via `jax.lax.map` -- one kernel in the
-  HLO however large the batch, rather than an unrolled one per element. Each
-  launch still covers `M // block_m` blocks, normally more than enough to fill
-  the device, so serializing a handful costs less than it sounds. Returning the
-  results per element is what makes both call patterns come out right: for a
-  shared param, transposing its broadcast sums the batch for us.
-
-  Args:
-    launch: Takes the arrays for one element and returns a tuple of arrays.
-
-  Returns:
-    `launch`, wrapped in a `custom_vmap` rule that maps rather than batches.
+  A `custom_vmap` rule gets its batched arguments with the mapped axis at the
+  front, but `vmap` leaves others alone -- the cotangent of a `sum` is a
+  broadcast scalar, for one -- and folding or mapping needs them all uniform.
   """
-  f = jax.custom_batching.custom_vmap(launch)
-
-  @f.def_vmap
-  def _rule(axis_size, in_batched, *args):
-    if not any(in_batched):
-      out = f(*args)
-      return out, jax.tree.map(lambda _: False, out)
-    # `lax.map` maps over every argument, and `vmap` leaves some unbatched -- the
-    # cotangent of a `sum` is a broadcast scalar, for one.
-    args = [
-      a if b else jnp.broadcast_to(a[jnp.newaxis], (axis_size, *a.shape))
-      for a, b in zip(args, in_batched)
-    ]
-    out = jax.lax.map(lambda args: launch(*args), tuple(args))
-    return out, jax.tree.map(lambda _: True, out)
-
-  return f
+  return [
+    a if b else jnp.broadcast_to(a[jnp.newaxis], (axis_size, *a.shape))
+    for a, b in zip(args, in_batched)
+  ]

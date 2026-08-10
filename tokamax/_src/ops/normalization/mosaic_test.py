@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import contextlib
 import functools
 from typing import override
 from unittest import mock
@@ -30,6 +31,20 @@ from tokamax._src.ops.normalization import pallas_triton_vjp_config as vjp_confi
 from tokamax._src.ops.normalization import test_base
 
 
+@contextlib.contextmanager
+def _skip_if_unsupported():
+    """Reports the kernel's by-design `NotImplementedError`s as skips.
+
+    A real bug still surfaces as a failure. This has to wrap the lowering call
+    as well as the op call: `jax.remat` re-traces its function while `lower`
+    runs, which is outside the dynamic extent of `norm_fn`.
+    """
+    try:
+        yield
+    except NotImplementedError as e:
+        raise absltest.SkipTest(f'Unsupported by the Mosaic kernel: {e}')
+
+
 class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
 
     def __init__(self, *args):
@@ -42,10 +57,8 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
         op = mosaic.PallasMosaicGpuNormalization()
 
         def norm_fn(*args, **kwargs):
-            try:
+            with _skip_if_unsupported():
                 return op(*args, **kwargs)
-            except NotImplementedError as e:
-                raise absltest.SkipTest(f'Unsupported by the Mosaic kernel: {e}')
 
         super().__init__(*args, norm_fn=norm_fn)
 
@@ -131,10 +144,8 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
                 f = jax.vmap(f, in_axes=(0, None, None))
             return f(x, scale, offset)
 
-        try:
+        with _skip_if_unsupported():
             actual = grads(lambda x, s, o: op(x, s, o, epsilon=epsilon))
-        except NotImplementedError as e:
-            raise absltest.SkipTest(f'Unsupported by the Mosaic kernel: {e}')
         dx, dscale, doffset = grads(ref)
         chex.assert_trees_all_close(actual[0], dx, atol=1e-5)
         # Each is a sum over 4096 rows, so a looser bound than `dx` needs.
@@ -155,7 +166,8 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
         g_remat = jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
         # `plgpu.kernel` takes no `name`, so unlike `pallas_triton_test` there is
         # nothing to count in the HLO; the numbers below are the real check.
-        g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
+        with _skip_if_unsupported():
+            g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
         g_out = g_remat_lowered.compile()(x, scale, offset)
         chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
 
@@ -175,7 +187,8 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
         g_remat = jax.vmap(
             jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
         )
-        g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
+        with _skip_if_unsupported():
+            g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
         g_out = g_remat_lowered.compile()(x, scale, offset)
         chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
 
@@ -193,6 +206,29 @@ class LargestDivisorTest(absltest.TestCase):
         ]:
             got = mosaic_tiling.largest_divisor(n, cap)
             self.assertEqual(got, expected, (n, cap))
+
+    def test_warp_aligned_block(self):
+        for rows, cap, expected in [
+            (256, 32, 32),
+            (12, 8, 4),  # 6 divides 12 and is under the cap, but is not a warp
+            (12, 32, 12),  # cap above rows
+            (4096, 4, 4),
+            (2, 32, None),  # 2 rows cannot fill four warps
+            (7, 32, None),  # odd
+        ]:
+            got = mosaic_tiling.warp_aligned_block(rows, cap)
+            self.assertEqual(got, expected, (rows, cap))
+
+    def test_with_usable_block_m_floors_at_four(self):
+        """The Triton heuristic bottoms out at 1, which cannot fill the warps."""
+        for block_m, expected in [(1, 4), (2, 4), (4, 4), (32, 32)]:
+            config = triton_config.Config(
+                block_m=block_m, block_n=None, num_warps=4
+            )
+            got = mosaic_tiling.with_usable_block_m(config)
+            self.assertEqual(got.block_m, expected)
+            # Everything else is left alone.
+            self.assertEqual((got.block_n, got.num_warps), (None, 4))
 
 
 class AmpereLoweringTest(parameterized.TestCase):
@@ -264,7 +300,8 @@ class AmpereLoweringTest(parameterized.TestCase):
 
         Folding the batch into `M` can only ever produce the summed form, so
         under `vmap` the VJP leaves batching to JAX -- see
-        `mosaic_tiling.vmappable`. Getting this wrong is not a crash: the fold
+        `mosaic.PallasMosaicGpuNormalization._rule`. Getting this wrong is not a
+        crash: the fold
         returns a summed gradient where a per-element one belongs, which JAX
         broadcasts, so every element silently gets the batch's total.
         """
@@ -292,6 +329,34 @@ class AmpereLoweringTest(parameterized.TestCase):
         self.assertEqual(shapes, expected)
 
 
+    def test_batched_params_lower(self):
+        """`vmap` may give each element its own `scale`/`offset`.
+
+        The kernel then reads the row's own element rather than a shared param,
+        which is why blocks must not straddle a batch boundary. Both directions
+        have to handle it: a forward that folds and a VJP that raised would push
+        the failure to grad time.
+        """
+        op = self._op(block_m=32, block_n=None)
+        x = jnp.zeros((3, 128, 32), jnp.float32)
+        params = jnp.zeros((3, 32), jnp.float32)
+        loss = lambda x, scale, offset: jnp.sum(op(x, scale, offset))
+        f = jax.vmap(jax.grad(loss, argnums=(0, 1, 2)))
+
+        with config_lib.cross_compile(True):
+            hlo = str(
+                jax.jit(f)
+                .trace(x, params, params)
+                .lower(lowering_platforms=('cuda',))
+                .as_text()
+            )
+            grads = jax.eval_shape(f, x, params, params)
+
+        self.assertEqual(hlo.count('custom_call @mosaic_gpu_v2'), 2, msg=hlo)
+        shapes = tuple(g.shape for g in jax.tree.leaves(grads))
+        self.assertEqual(shapes, ((3, 128, 32), (3, 32), (3, 32)))
+
+
 class PlanTest(absltest.TestCase):
     """`mosaic_tiling.plan` is pure Python, so it is testable without a GPU."""
 
@@ -303,11 +368,10 @@ class PlanTest(absltest.TestCase):
         self.assertEqual(p.stat_shape, (1,))
         self.assertEqual(p.dparam_shape, (1, 1, 128))
         self.assertEqual(p.grid, (1, 1))
-        # The strided layout is inferred, and reducing the only axis is an
-        # all-axes reduction.
+        # The strided layout is inferred, and the tile's only axis is `A`, so a
+        # statistic is a scalar and a param needs no reduction.
         self.assertIsNone(p.layout)
-        self.assertIsNone(p.reduce_axis)
-        self.assertIsNone(p.param_axes)
+        self.assertEqual((p.ndim, p.reduce_axis, p.stat_axes), (1, 0, ()))
 
     def test_degenerate_1d_needs_multiple_of_128(self):
         with self.assertRaises(NotImplementedError):
@@ -322,7 +386,7 @@ class PlanTest(absltest.TestCase):
         self.assertEqual(p.dparam_shape, (8, 1, 128))
         # `A` is the tile's fast axis, so it is reduced within a warp, and the
         # params are reduced over `M`, which crosses warps.
-        self.assertEqual((p.reduce_axis, p.param_axes), (1, (0,)))
+        self.assertEqual((p.reduce_axis, p.stat_axes), (1, (0,)))
 
     def test_reduced_axis_strided(self):
         p = mosaic_tiling.plan((4, 32, 256), self.F32, block_m=32, block_b=128)
@@ -332,7 +396,7 @@ class PlanTest(absltest.TestCase):
         self.assertEqual(p.stat_shape, (4, 256))
         self.assertEqual(p.grid, (4, 2))
         self.assertEqual(p.dparam_shape, (4, 2, 32))
-        self.assertEqual((p.reduce_axis, p.param_axes), (0, (1,)))
+        self.assertEqual((p.reduce_axis, p.stat_axes), (0, (1,)))
 
     def test_layouts_are_constructible(self):
         for x_shape in [(256, 128, 1), (4, 32, 256)]:
@@ -355,6 +419,27 @@ class PlanTest(absltest.TestCase):
         prime = 65599  # Over the cap, and its only divisor below it is 1.
         with self.assertRaises(NotImplementedError):
             mosaic_tiling.plan((4 * prime, 128, 1), self.F32, block_m=4, block_b=1)
+
+    def test_block_m_is_warp_aligned(self):
+        """A divisor under the cap is not enough; it has to fill four warps."""
+        # 6 is the largest divisor of 12 under the cap, but it is not four
+        # warps' worth, so 4 is taken instead.
+        p = mosaic_tiling.plan((12, 128, 1), self.F32, block_m=8, block_b=1)
+        self.assertEqual(p.block_m, 4)
+        self.assertEqual(p.grid, (3, 1))
+
+    def test_no_warp_aligned_block(self):
+        with self.assertRaisesRegex(NotImplementedError, 'multiple of 4'):
+            mosaic_tiling.plan((2, 128, 1), self.F32, block_m=32, block_b=1)
+
+    def test_rows_per_element_keeps_blocks_inside_one_element(self):
+        """A folded `vmap` batch: blocks must not straddle a batch boundary."""
+        p = mosaic_tiling.plan(
+            (24, 128, 1), self.F32, block_m=32, block_b=1, rows_per_element=12
+        )
+        self.assertEqual(p.block_m, 12)
+        self.assertEqual(12 % p.block_m, 0)  # Blocks divide one element's rows.
+        self.assertEqual(p.grid, (2, 1))
 
     def test_register_budget(self):
         with self.assertRaisesRegex(NotImplementedError, 'spill'):
