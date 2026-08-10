@@ -447,9 +447,8 @@ def flash_attention_kernel(
     def mma_tma_wg():
       plgpu.set_max_registers(80, action="decrease")
 
-      @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-      def per_warp():
-        warp_id = lax.axis_index("warp")
+      @plgpu.warp_map
+      def per_warp(warp_id):
 
         def tma_load_kv(gmem, smem, barrier, partition_axis, ki, split_idx):
           kv_head = lax.div(hi, q_heads_per_kv_head)

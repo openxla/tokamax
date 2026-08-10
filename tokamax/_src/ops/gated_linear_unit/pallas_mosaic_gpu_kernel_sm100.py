@@ -140,9 +140,8 @@ def gated_linear_unit(
 
       @pl.when(wg_idx == 0)
       def _compute_wg():
-        @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-        def _per_warp():
-          warp_id = lax.axis_index("warp")
+        @plgpu.warp_map
+        def _per_warp(warp_id):
           b_smems = (b0_smem, b1_smem)
           consumed_barriers = (consumed_barrier_0, consumed_barrier_1)
 

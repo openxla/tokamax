@@ -100,9 +100,8 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       def compute():
         @pl.when(wg == _COMPUTE_WG)
         def compute_wg():
-          @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-          def compute_warps():
-            warp_id = lax.axis_index("warp")
+          @plgpu.warp_map
+          def per_warp(warp_id):
             cluster_axis = "cluster" if collective else None
 
             @pl.when(warp_id == _TMA_WARP)

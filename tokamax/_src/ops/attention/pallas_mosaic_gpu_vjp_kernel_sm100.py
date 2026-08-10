@@ -375,10 +375,8 @@ def _kernel_dq(
   @pl.when((wg == 0) & (ub > lb))
   def mma_tma_wg():
 
-    @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-    def per_warp():
-      warp_id = lax.axis_index("warp")
-
+    @plgpu.warp_map
+    def per_warp(warp_id):
       def cp(gmem, smem, barrier, si=()):
         plgpu.copy_gmem_to_smem(gmem, smem.at[si], barrier.at[si])
 
@@ -685,9 +683,8 @@ def _kernel_dkv(
   @pl.when((wg == 0) & (total_steps > 0))
   def mma_tma_wg():
 
-    @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-    def per_warp():
-      warp_id = lax.axis_index("warp")
+    @plgpu.warp_map
+    def per_warp(warp_id):
 
       def cp(gmem, smem, barrier, si=()):
         plgpu.copy_gmem_to_smem(gmem, smem.at[si], barrier.at[si])
