@@ -60,7 +60,14 @@ def is_sm100(device: jax.Device | None = None) -> bool:
   return _cc_between(10.0, 11.0, device)
 
 
-def has_mosaic_gpu_support(device: jax.Device | None = None) -> bool:
+def has_mosaic_gpu_support(
+    device: jax.Device | None = None
+) -> bool:
+  """Returns True if Mosaic GPU is supported by the device.
+
+  Args:
+    device: The device to check, or the default device if `None`.
+  """
   if config_lib.cross_compile.value:
     return True
   if device is None:
