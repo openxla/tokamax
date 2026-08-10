@@ -89,28 +89,33 @@ jobs:
           import os
 
           all_shards = [
-              'attn_base_test', 'attn_api_test', 'attn_pallas_mosaic_gpu_test',
+              'attn_base_test', 'attn_base_vjp_test', 'attn_api_test',
+              'attn_pallas_mosaic_gpu_test',
               'attn_pallas_mosaic_tpu_test', 'attn_pallas_triton_test',
               'attn_jax_nn_test', 'attn_xla_chunked_test',
               'gmm_v2_perf', 'gmm_v2_kernel', 'op_test', 'topk',
+              'ragged_dot_sm100_fp8_quant', 'ragged_dot_sm100_i8_quant',
               'ragged_dot_misc', 'linear_softmax_and_experimental',
               'misc_small_ops', 'tokamax_test', 'autotuning_api_test',
-              'tokamax_presubmit_misc', 'ops_catchall',
+              'tokamax_catchall',
           ]
 
           always_on = {
-              'ops_catchall', 'tokamax_presubmit_misc',
-              'tokamax_test', 'autotuning_api_test',
+              'tokamax_catchall', 'tokamax_test', 'autotuning_api_test',
           }
 
           filter_to_shards = {
               'ATTENTION': [
-                  'attn_base_test', 'attn_api_test',
+                  'attn_base_test', 'attn_base_vjp_test', 'attn_api_test',
                   'attn_pallas_mosaic_gpu_test', 'attn_pallas_mosaic_tpu_test',
                   'attn_pallas_triton_test', 'attn_jax_nn_test',
                   'attn_xla_chunked_test', 'op_test',
               ],
-              'RAGGED_DOT': ['gmm_v2_perf', 'gmm_v2_kernel', 'ragged_dot_misc', 'op_test'],
+              'RAGGED_DOT': [
+                  'gmm_v2_perf', 'gmm_v2_kernel',
+                  'ragged_dot_sm100_fp8_quant', 'ragged_dot_sm100_i8_quant',
+                  'ragged_dot_misc', 'op_test',
+              ],
               'TRIANGLE_MULTIPLICATION': ['ragged_dot_misc'],
               'RAGGED_GATHER': ['ragged_dot_misc'],
               'RAGGED_GATHER_REDUCE': ['ragged_dot_misc'],
@@ -150,7 +155,12 @@ jobs:
           - runner: 'linux-x86-tpu7x-56-1tpu'
             device: 'tpu'
           - shard_name: 'attn_base_test'
-            test_paths: 'tokamax/_src/ops/attention/base_test.py'
+            test_paths: >-
+              tokamax/_src/ops/attention/base_test.py::MaskTest
+              tokamax/_src/ops/attention/base_test.py::DotProductAttentionTest
+          - shard_name: 'attn_base_vjp_test'
+            test_paths: >-
+              tokamax/_src/ops/attention/base_test.py::DotProductAttentionWithExplicitVjpTest
           - shard_name: 'attn_api_test'
             test_paths: 'tokamax/_src/ops/attention/api_test.py'
           - shard_name: 'attn_pallas_mosaic_gpu_test'
@@ -171,10 +181,16 @@ jobs:
             test_paths: 'tokamax/_src/ops/op_test.py'
           - shard_name: 'topk'
             test_paths: 'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py'
+          - shard_name: 'ragged_dot_sm100_fp8_quant'
+            test_paths: 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py'
+          - shard_name: 'ragged_dot_sm100_i8_quant'
+            test_paths: 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py'
           - shard_name: 'ragged_dot_misc'
             test_paths: >-
               --ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_perf_test.py
               --ignore=tokamax/_src/ops/ragged_dot/gmm_v2_kernel_tests/pallas_mosaic_tpu_v2_kernel_test.py
+              --ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py
+              --ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py
               tokamax/_src/ops/ragged_dot/
               tokamax/_src/ops/triangle_multiplication/
               tokamax/_src/ops/ragged_gather/
@@ -195,14 +211,7 @@ jobs:
             test_paths: 'tokamax/tokamax_test.py'
           - shard_name: 'autotuning_api_test'
             test_paths: 'tokamax/_src/autotuning/api_test.py'
-          - shard_name: 'tokamax_presubmit_misc'
-            test_paths: >-
-              --ignore-glob="tokamax/_src/ops/*"
-              --ignore-glob="tokamax/_src/benchmarking_test*"
-              --ignore=tokamax/tokamax_test.py
-              --ignore=tokamax/_src/autotuning/api_test.py
-              tokamax
-          - shard_name: 'ops_catchall'
+          - shard_name: 'tokamax_catchall'
             test_paths: >-
               --ignore=tokamax/_src/ops/attention/base_test.py
               --ignore=tokamax/_src/ops/attention/api_test.py
@@ -222,7 +231,9 @@ jobs:
               --ignore=tokamax/_src/ops/ragged_scatter/
               --ignore=tokamax/_src/ops/gated_linear_unit/
               --ignore=tokamax/_src/ops/normalization/
-              tokamax/_src/
+              --ignore-glob="tokamax/_src/benchmarking_test*"
+              --ignore=tokamax/_src/autotuning/api_test.py
+              tokamax/_src
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
