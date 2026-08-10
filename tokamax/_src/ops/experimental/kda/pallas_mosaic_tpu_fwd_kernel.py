@@ -508,6 +508,77 @@ def _solve_unit_lower_triangular_batched(A, b):
   return jnp.concatenate(blocks, axis=1)
 
 
+def _solve_unit_lower_triangular_neumann_batched(A, b):
+  """Solve (I + A) x = b with a blocked finite Neumann series.
+
+  The strictly lower triangular system is split into 8-token diagonal blocks.
+  Each diagonal block is inverted with a finite Neumann series, then the
+  block-off-diagonal system is inverted with Horner doubling.
+
+  Args:
+      A: (MB, N, N) strictly lower triangular matrix.
+      b: (MB, N, D) right-hand side matrix.
+
+  Returns:
+      A pair containing the solution with shape (MB, N, D) and the inverse of
+      (I + A) with shape (MB, N, N), both in float32.
+  """
+  N = A.shape[-1]
+  block_size = 8
+  num_blocks = N // block_size
+  inv_dtype = jnp.float32
+  identity = jnp.eye(N, dtype=inv_dtype)
+
+  # Batched dot: [MB, M, K] @ [MB, K, N] -> [MB, M, N].
+  def dot_batch(lhs, rhs):
+    return jax.lax.dot_general(
+        lhs,
+        rhs,
+        (((2,), (1,)), ((0,), (0,))),
+        preferred_element_type=jnp.float32,
+    )
+
+  A = A.astype(inv_dtype)
+  block_ids = jnp.arange(N, dtype=jnp.int32) // block_size
+  same_block = (block_ids[:, None] == block_ids[None, :]).astype(inv_dtype)
+  A_diag = A * same_block[None]
+  A_off_diag = A - A_diag
+
+  neg_A_diag = -A_diag
+  diag_inverse = identity[None] + neg_A_diag
+  power = neg_A_diag
+  num_diag_steps = {4: 1, 8: 2, 16: 3, 32: 4, 64: 5}[block_size]
+  for _ in range(num_diag_steps):
+    power = dot_batch(power, power)
+    diag_inverse = dot_batch(diag_inverse, identity[None] + power)
+
+  if num_blocks == 1:
+    return dot_batch(diag_inverse, b.astype(inv_dtype)), diag_inverse
+
+  # Fuse P @ [F | b] to share a matmul, where P is the block-diagonal
+  # inverse and F is the block-off-diagonal part of A.
+  off_diag_and_rhs = jnp.concatenate(
+      [A_off_diag, b.astype(inv_dtype)], axis=-1
+  )
+  merged = dot_batch(diag_inverse, off_diag_and_rhs)
+  transformed_off_diag = merged[:, :, :N]
+  transformed_rhs = merged[:, :, N:]
+
+  # (I + G)^-1 = sum(k=0..num_blocks-1) (-G)^k. The block-strictly-lower
+  # matrix G is nilpotent, so Horner doubling evaluates this finite series.
+  neg_transformed_off_diag = -transformed_off_diag
+  off_diag_inverse = identity[None] + neg_transformed_off_diag
+  power = neg_transformed_off_diag
+  log2_num_blocks = {2: 1, 4: 2, 8: 3, 16: 4, 32: 5}[num_blocks]
+  for _ in range(log2_num_blocks - 1):
+    power = dot_batch(power, power)
+    off_diag_inverse = off_diag_inverse + dot_batch(off_diag_inverse, power)
+
+  result = dot_batch(off_diag_inverse, transformed_rhs)
+  inverse = dot_batch(off_diag_inverse, diag_inverse)
+  return result, inverse
+
+
 # =============================================================================
 # Fused gate cumsum and intra-chunk solve
 # =============================================================================
@@ -671,75 +742,18 @@ def _fused_gate_intra_kernel(
   # --- Solve (I + L) x = rhs ---
   v_beta = v.astype(jnp.float32) * beta_f32          # [MB, BT, V]
   k_eg_beta = k_f32 * jnp.exp2(g_cumsum) * beta_f32  # [MB, BT, K]
-  I_bt = jnp.eye(BT, dtype=jnp.float32)               # [BT, BT]
-
-  # Batched dot helper: [MB, M, K] @ [MB, K, N] → [MB, M, N]
-  _dot_batch = lambda a, b: jax.lax.dot_general(
-    a, b, (((2,), (1,)), ((0,), (0,))),
-    preferred_element_type=jnp.float32,
-  )
+  rhs = jnp.concatenate([v_beta, k_eg_beta], axis=-1)  # [MB, BT, V+K]
 
   use_neumann = dtype != jnp.float32
 
   if use_neumann:
-    # --- Neumann series inversion ---
-    BC_inv = 8
-    NC_inv = BT // BC_inv
-    inv_dtype = jnp.float32
-
-    L_inv = L.astype(inv_dtype)  # [MB, BT, BT]
-
-    _idx = jnp.arange(BT, dtype=jnp.int32)
-    _block_id = _idx // BC_inv
-    _same_block = (_block_id[:, None] == _block_id[None, :]).astype(inv_dtype)
-    L_diag = L_inv * _same_block[None]  # [MB, BT, BT]
-    F = L_inv - L_diag                   # [MB, BT, BT]
-
-    neg_Ld = -L_diag
-    S = I_bt[None] + neg_Ld              # [MB, BT, BT]
-    Mk = neg_Ld
-    num_diag_steps = {4: 1, 8: 2, 16: 3, 32: 4, 64: 5}[BC_inv]
-    for _ in range(num_diag_steps):
-      Mk = _dot_batch(Mk, Mk)
-      S = _dot_batch(S, I_bt[None] + Mk)
-    P = S
-
-    rhs = jnp.concatenate([
-      v_beta.astype(inv_dtype),
-      k_eg_beta.astype(inv_dtype),
-    ], axis=-1)  # [MB, BT, V+K]
-
-    if NC_inv == 1:
-      # P already equals (I + L)^{-1} (no off-diagonal blocks).
-      result = _dot_batch(P, rhs)
-      A_inv = P
-    else:
-      # Fuse `P @ [F | rhs]` to share a matmul; split out G and P_rhs.
-      F_and_rhs = jnp.concatenate([F, rhs], axis=-1)  # [MB, BT, BT+V+K]
-      P_merged = _dot_batch(P, F_and_rhs)              # [MB, BT, BT+V+K]
-      G = P_merged[:, :, :BT]                          # [MB, BT, BT]
-      P_rhs = P_merged[:, :, BT:]                      # [MB, BT, V+K]
-
-      # Compute inv_I_G = (I + G)^{-1} = sum_{k=0}^{NC_inv-1} (-G)^k via
-      # Horner doubling. Build the matrix first (small (MB,BT,BT) matmuls),
-      # then apply once to P_rhs and once to P (small + medium matmuls).
-      # For NC_inv=8: 4 × (MB,BT,BT,BT) mm + 1 × (MB,BT,BT,V+K) mm + 1 × (MB,BT,BT,BT) mm
-      # vs sequential: 6 × (MB,BT,BT,BT) mm + 1 × (MB,BT,BT,V+K+BT) mm.
-      H_mat = -G
-      inv_I_G = I_bt[None] + H_mat                     # (I + H)
-      Hk = H_mat
-      log2_NC_inv = {2: 1, 4: 2, 8: 3, 16: 4, 32: 5}[NC_inv]
-      for step in range(log2_NC_inv - 1):
-        Hk = _dot_batch(Hk, Hk)                        # H^(2^(step+1))
-        inv_I_G = inv_I_G + _dot_batch(inv_I_G, Hk)    # inv_I_G @ (I + Hk)
-
-      result = _dot_batch(inv_I_G, P_rhs)              # [MB, BT, V+K]
-      A_inv = _dot_batch(inv_I_G, P)                   # [MB, BT, BT] = (I+L)^{-1}
+    result, A_inv = _solve_unit_lower_triangular_neumann_batched(L, rhs)
   else:
     # --- Exact forward substitution (fp32) ---
+    I_bt = jnp.eye(BT, dtype=jnp.float32)
     I_bt_batch = jnp.broadcast_to(I_bt, (MB, BT, BT))
     combined_b = jnp.concatenate(
-      [v_beta, k_eg_beta, I_bt_batch], axis=-1
+      [rhs, I_bt_batch], axis=-1
     )  # [MB, BT, V+K+BT]
     full_result = _solve_unit_lower_triangular_batched(L, combined_b)
     result = full_result[:, :, : V + K]

@@ -102,21 +102,9 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Binds KDA arguments and validates semantic constraints."""
-    heads, batch, seq_len, key_dim = query.shape
-    value_dim = value.shape[-1]
+    heads, _, _, key_dim = query.shape
 
     if initial_state is not None:
-      expected_tail = (heads, key_dim, value_dim)
-      if initial_state.ndim != 5 or initial_state.shape[0] != batch:
-        raise ValueError(
-            "`initial_state` must have shape [B, N, H, K, V]; got "
-            f"{initial_state.shape}."
-        )
-      if initial_state.shape[2:] != expected_tail:
-        raise ValueError(
-            "`initial_state` trailing dimensions must be "
-            f"{expected_tail}; got {initial_state.shape[2:]}."
-        )
       state_count = initial_state.shape[1]
       if state_count <= 0:
         raise ValueError(
@@ -131,10 +119,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
             f"max_num_segments={max_num_segments}, "
             f"num_segments={state_count}."
         )
-    if segment_ids is not None and segment_ids.shape != (batch, seq_len):
-      raise ValueError(
-          f"`segment_ids` shape {segment_ids.shape} must be {(batch, seq_len)}."
-      )
     if max_num_segments is not None and max_num_segments <= 0:
       raise ValueError(
           f"`max_num_segments` must be positive, got {max_num_segments}."

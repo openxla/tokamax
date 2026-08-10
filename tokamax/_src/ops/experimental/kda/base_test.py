@@ -291,7 +291,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
     self.assertEqual(output.shape, v.shape)
 
   def test_bind_uses_jaxtyping_validation(self):
-    q, k, v, g, beta, _ = _make_inputs(jnp.float32)
+    q, k, v, g, beta, initial_state = _make_inputs(jnp.float32)
     implementation = api.IMPLEMENTATIONS["xla"]
 
     with self.assertRaises(jt.TypeCheckError):
@@ -306,6 +306,31 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
     for name, inputs in mismatched_inputs:
       with self.subTest(name=name), self.assertRaises(jt.TypeCheckError):
         implementation.bind(*inputs)
+
+    with self.subTest(name="initial_state"), self.assertRaises(
+        jt.TypeCheckError
+    ):
+      implementation.bind(
+          q,
+          k,
+          v,
+          g,
+          beta,
+          initial_state=initial_state[:, :, :, :-1],
+      )
+
+    with self.subTest(name="segment_ids"), self.assertRaises(
+        jt.TypeCheckError
+    ):
+      implementation.bind(
+          q,
+          k,
+          v,
+          g,
+          beta,
+          segment_ids=jnp.ones((q.shape[1], q.shape[2] + 1), jnp.int32),
+          max_num_segments=1,
+      )
 
   def test_unsupported_implementation(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)
