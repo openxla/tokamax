@@ -88,13 +88,6 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
     def launch(dout, x, mean, rstddev, scale, axis_size):
       num_rows, num_a, num_b = x.shape
       rows_per_element = num_rows // axis_size
-      # The register budget is deliberately the forward's: the two then support
-      # exactly the same shapes, and a `NotImplementedError` raised here would
-      # surface at grad time, long after the forward committed to this kernel.
-      # The block does hold one array more live than the forward does, so this
-      # is the knob to lower if it starts spilling. `rows_per_element` keeps a
-      # block from straddling a batch boundary, which would mix two elements'
-      # `dscale` into one partial.
       p = mosaic_tiling.plan(
         (num_rows, num_a, num_b),
         dtype.itemsize,
@@ -111,36 +104,38 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
         scale_ref, mean_ref = take(has_scale), take(subtract_mean)
         rstddev_ref, dx_ref = next(it), next(it)
         dscale_ref, doffset_ref = take(has_scale), take(has_offset)
-        idx = p.indices()
-        x_idx, stat_idx, dparam_idx = idx.x, idx.stat, idx.dparam
+        x_idx, stat_idx, dparam_idx, pid_m = p.indices()
         # `scale` has a row per batch element, and this block lies inside one.
-        element = 0 if axis_size == 1 else idx.pid_m // blocks_per_element
+        element = 0 if axis_size == 1 else pid_m // blocks_per_element
 
-        load_stat = lambda ref: mosaic_tiling.load(ref.at[stat_idx], p.stat_layout)
+        # Reducing away `A` leaves the layout a per-row statistic has.
+        stat_layout = p.layout.reduce((p.reduce_axis,))
 
-        x_norm = mosaic_tiling.load(x_ref.at[x_idx], p.layout)
+        def load_stat(ref):
+          return plgpu.load(ref.at[stat_idx], layout=stat_layout,
+            optimized=False).astype(jnp.float32)
+
+        x_norm = plgpu.load(x_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
         bcast = lambda a: p.bcast(a, x_norm.shape)
         if mean_ref is not None:
           x_norm -= bcast(load_stat(mean_ref))
         rstddev = load_stat(rstddev_ref)
         x_norm *= bcast(rstddev)
 
-        dout = mosaic_tiling.load(dout_ref.at[x_idx], p.layout)
-        # These two reduce over every row, so a block can only ever hold a
-        # partial sum. Both read `dout` before `scale` is folded in.
+        dout = plgpu.load(dout_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
         if doffset_ref is not None:
-          doffset_ref[dparam_idx] = p.sum_over_rows(dout)
+          doffset_ref[dparam_idx] = jnp.sum(dout, axis=p.stat_axis)
         if dscale_ref is not None:
-          dscale_ref[dparam_idx] = p.sum_over_rows(dout * x_norm)
+          dscale_ref[dparam_idx] = jnp.sum(dout * x_norm, axis=p.stat_axis)
         if scale_ref is not None:
           dout *= p.read_param(scale_ref.at[element], dout.shape) + scale_offset
 
         # `dx = (dout - mean(dout * x_norm) * x_norm - mean(dout)) * rstddev`;
         # see `base.NormalizationVjp`. The last term is zero for RMS norm, whose
         # mean was never subtracted in the first place.
-        dx = dout - bcast(p.mean_over_a(dout * x_norm)) * x_norm
+        dx = dout - bcast(jnp.mean(dout * x_norm, axis=p.reduce_axis)) * x_norm
         if mean_ref is not None:
-          dx -= bcast(p.mean_over_a(dout))
+          dx -= bcast(jnp.mean(dout, axis=p.reduce_axis))
         dx_ref[x_idx] = (dx * bcast(rstddev)).astype(dtype)
 
       dparam = jax.ShapeDtypeStruct(p.dparam_shape, jnp.float32)

@@ -21,7 +21,7 @@ differ, so everything else lives here.
 
 from collections.abc import Callable
 import dataclasses
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax
 from jax.experimental import pallas as pl
@@ -38,20 +38,16 @@ LANE_SEMANTICS = plgpu.CompilerParams(
 
 
 def largest_divisor(n: int, cap: int) -> int:
-  """Returns the largest divisor of `n` that is at most `cap`.
-
-  Always finds one, as 1 divides everything.
-  """
+  "Returns the largest divisor of `n` that is at most `cap`"
   return next(b for b in range(min(cap, n), 0, -1) if n % b == 0)
 
 
 def warp_aligned_block(rows: int, cap: int) -> int | None:
   """Returns the largest divisor of `rows` at most `cap` and a multiple of 4.
 
-  `coalesced_layout` takes the four warps of a block from `M`, so it cannot be
-  built for a block of rows that is not a multiple of 4. Returns `None` when
-  `rows` has no such divisor -- 2 rows cannot supply four warps however the
-  blocks are chosen -- and the caller falls back to `warpgroup_row_layout`.
+  `make_layout` takes the four warps from `M` only when the block is a multiple
+  of 4 rows, which is the arrangement to prefer. Returns `None` when `rows` has
+  no such divisor.
   """
   return next(
     (b for b in range(min(cap, rows) // 4 * 4, 0, -4) if rows % b == 0), None
@@ -68,85 +64,41 @@ def _largest_pow2(cap: int, ok: Callable[[int], bool]) -> int | None:
   return v
 
 
-def coalesced_layout(block_slow: int, block_fast: int, itemsize: int):
+def make_layout(block_slow: int, block_fast: int, itemsize: int):
   """Register layout for a 2D `(slow, fast)` tile, `fast` being contiguous.
 
-  Lanes and the vector both come from `fast`, so a warp covers
-  `32 * vector` contiguous elements -- one unbroken memory transaction. The
-  warps come from `slow`. Whether the reduction ends up crossing warps (and so
-  needing SMEM scratch) depends on which axis is being reduced, and is
-  deliberately not what this optimises for.
+  Lanes and the vector always come from `fast`, so a warp covers `32 * vector`
+  contiguous elements -- one unbroken memory transaction. What varies is where
+  the four warps come from, and since a layout has to place all 128 threads of
+  the warpgroup, they have to come from somewhere:
 
-  Needs 4 rows of `slow` to feed the warps; `warpgroup_row_layout` covers the
-  tiles too short for that.
-  """
-  if block_slow % 4:
-    raise NotImplementedError(
-      f'Slow axis ({block_slow}) must be a multiple of 4 for the warps.'
-    )
-  max_vec = max(1, 16 // itemsize)  # 16-byte (128-bit) register vectors.
-  v = _largest_pow2(max_vec, lambda v: block_fast % (32 * v) == 0)
-  if v is None:
-    raise NotImplementedError(
-      f'Contiguous axis ({block_fast}) must be a multiple of 32 so the lanes'
-      ' cover it.'
-    )
-  return plgpu.Layout.TILED(
-    plgpu.Tiling(((4, 32 * v), (4, v))), (-2,), (-3,), -1
-  )
-
-
-def warpgroup_row_layout(block_fast: int, itemsize: int):
-  """Register layout for a 2D `(slow, fast)` tile whose `slow` extent is short.
-
-  A layout has to place all 128 threads of the warpgroup, so the factor of 4
-  that `coalesced_layout` takes from `slow` has to come from somewhere; with
-  fewer than 4 rows the only axis left is `fast`. One row is then spread over
-  the whole warpgroup -- lanes, the vector *and* the warps -- which stays
-  perfectly coalesced but makes a reduction along `fast` cross warps, so it
-  takes the SMEM scratch path that `coalesced_layout` avoids.
-
-  This is what Mosaic's inferred strided layout does for a 1D array, but stated
-  explicitly, so it applies to a 2D tile and picks its own vector width.
+  - `slow`, when it has 4 rows to give them. A row then lives inside a single
+    warp, so a reduction along `fast` is a lane shuffle.
+  - `fast` otherwise, spreading one row over the whole warpgroup. Still
+    perfectly coalesced, but a reduction along `fast` now crosses warps and
+    takes the SMEM scratch path.
   """
   max_vec = max(1, 16 // itemsize)  # 16-byte (128-bit) register vectors.
+  if block_slow % 4 == 0:
+    v = _largest_pow2(max_vec, lambda v: block_fast % (32 * v) == 0)
+    if v is None:
+      raise NotImplementedError(
+        f'Contiguous axis ({block_fast}) must be a multiple of 32 so the lanes'
+        ' cover it.'
+      )
+    return plgpu.Layout.TILED(
+      plgpu.Tiling(((4, 32 * v), (4, v))), (-2,), (-3,), -1
+    )
+
   v = _largest_pow2(max_vec, lambda v: block_fast % (128 * v) == 0)
   if v is None:
     raise NotImplementedError(
       f'Contiguous axis ({block_fast}) must be a multiple of 128 so the whole'
-      ' warpgroup covers it.'
+      f' warpgroup covers it, as {block_slow} rows cannot feed the warps.'
     )
-  # The first tile is 2D only to fix the rank; `Layout.reduce` needs a tiling
-  # that spans the tile, not just its contiguous axis.
   return plgpu.Layout.TILED(
     plgpu.Tiling(((1, 128 * v), (32 * v,), (v,))), (-3,), (-2,), -1
   )
-
-
-def load(ref, layout) -> jax.Array:
-  """Loads a whole `ref` into registers at `layout`, in `float32`.
-
-  Both kernels reduce in `float32` regardless of the input dtype, as Triton
-  does, so the cast belongs here rather than at every call site.
-  """
-  return plgpu.load(ref, layout=layout, optimized=False).astype(jnp.float32)
-
-
-class Indices(NamedTuple):
-  """How one program indexes the refs it was given.
-
-  Attributes:
-    x: Index into an `x`-shaped ref, giving this block's tile.
-    stat: Index into a `mean`/`rstddev`-shaped ref.
-    dparam: Index into a `dscale`/`doffset` partials ref.
-    pid_m: This block's position along `M`, already reassembled if the row grid
-      needed two axes.
-  """
-
-  x: Any
-  stat: Any
-  dparam: Any
-  pid_m: Any
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -161,7 +113,6 @@ class Plan:
   the other one being indexed by a scalar and so dropping out.
 
   Attributes:
-    num_a: Length of the reduced axis, i.e. the reduction denominator.
     block_m: Rows of `M` per block.
     block_b: Elements of `B` per block.
     x_shape: Shape the `x`-like refs are given, rank-reduced to the case so the
@@ -170,15 +121,13 @@ class Plan:
     dparam_shape: Shape of the per-block `dscale`/`doffset` partials, one `A`-
       indexed row per block, to be summed over the leading two axes.
     layout: Register layout of an `x` tile.
-    reduce_axis: Axis of the 2D tile holding `A`, so `1 - reduce_axis` is the
-      axis a statistic is indexed by.
+    reduce_axis: Axis of the 2D tile holding `A`.
     grid: The `plgpu.kernel` grid.
     grid_names: Names of `grid`'s axes. `'m'`/`'b'` index `M`/`B`; a leading
       `'mo'` appears only when `M` needs two grid axes (see `plan`).
     split_m: Stride of the `'mo'` axis, i.e. the size of the `'m'` axis.
   """
 
-  num_a: int
   block_m: int
   block_b: int
   x_shape: tuple[int, ...]
@@ -191,26 +140,18 @@ class Plan:
   split_m: int
 
   @property
-  def stat_axes(self) -> tuple[int, ...]:
-    """The tile axis other than `A`.
+  def stat_axis(self) -> int:
+    return 1 - self.reduce_axis
 
-    A per-row statistic is indexed by it, and an `A`-indexed value is reduced
-    over it, so one tuple serves both.
+  def indices(self):
+    """Returns how the current program indexes each of the refs.
+
+    In order:
+     - A `x`-shaped ref, giving this block's tile
+     - A `mean`/`rstddev`-shaped ref
+     - A `dscale`/`doffset` partials ref
+     - This block's position along `M`
     """
-    return (1 - self.reduce_axis,)
-
-  @property
-  def stat_layout(self):
-    """Layout of a per-row statistic, laid out to match a tile."""
-    return self.layout.reduce((self.reduce_axis,))
-
-  @property
-  def param_layout(self):
-    """Layout of an `A`-indexed param, laid out to match a tile."""
-    return self.layout.reduce(self.stat_axes)
-
-  def indices(self) -> 'Indices':
-    """Returns how the current program indexes each of the refs."""
     *pid_m_parts, pid_b = map(pl.program_id, range(len(self.grid)))
     pid_m = pid_m_parts[-1]
     if len(pid_m_parts) == 2:
@@ -218,11 +159,9 @@ class Plan:
     dparam = (pid_m, pid_b)
     m_slice = pl.ds(pid_m * self.block_m, self.block_m)
     if len(self.x_shape) == 2:
-      return Indices(m_slice, m_slice, dparam, pid_m)
+      return m_slice, m_slice, dparam, pid_m
     b_slice = pl.ds(pid_b * self.block_b, self.block_b)
-    return Indices(
-      (pid_m, slice(None), b_slice), (pid_m, b_slice), dparam, pid_m
-    )
+    return (pid_m, slice(None), b_slice), (pid_m, b_slice), dparam, pid_m
 
   def _spread(self, a: jax.Array, shape, dims) -> jax.Array:
     return plgpu.layout_cast(
@@ -231,19 +170,13 @@ class Plan:
 
   def bcast(self, a: jax.Array, shape) -> jax.Array:
     """Broadcasts a per-row statistic back over a tile of `shape`."""
-    return self._spread(a, shape, self.stat_axes)
+    return self._spread(a, shape, (self.stat_axis,))
 
   def read_param(self, ref, shape) -> jax.Array:
     """Reads a 1D param, laid out to match a tile of `shape` along `A`."""
-    return self._spread(load(ref, self.param_layout), shape, (self.reduce_axis,))
-
-  def mean_over_a(self, a: jax.Array) -> jax.Array:
-    """Averages a tile over `A`, giving one value per row."""
-    return jnp.sum(a, axis=self.reduce_axis) / self.num_a
-
-  def sum_over_rows(self, a: jax.Array) -> jax.Array:
-    """Sums a tile over all but `A`, giving one value per `A` element."""
-    return jnp.sum(a, axis=self.stat_axes)
+    layout = self.layout.reduce((self.stat_axis,))
+    p = plgpu.load(ref, layout=layout, optimized=False)
+    return self._spread(p.astype(jnp.float32), shape, (self.reduce_axis,))
 
 
 def plan(
@@ -270,9 +203,6 @@ def plan(
       real footprint is a small multiple of this -- reductions run in `float32`
       and the kernels keep temporaries live -- so this is a knob to turn if a
       kernel spills, not a hardware limit.
-
-  Returns:
-    The `Plan`.
   """
   num_m, num_a, num_b = x_shape
   block_m_cap = block_m
@@ -283,29 +213,23 @@ def plan(
     # warpgroup instead and pays a cross-warp reduction. Blocks must tile the
     # array exactly, hence the divisor search.
     rows = num_m if rows_per_element is None else rows_per_element
+    found = warp_aligned_block(rows, block_m_cap)
+    block_m = found if found is not None else largest_divisor(rows, block_m_cap)
     block_b = 1
-    if (found := warp_aligned_block(rows, block_m_cap)) is not None:
-      block_m = found
-      layout = coalesced_layout(block_m, num_a, itemsize)
-    else:
-      block_m = largest_divisor(rows, block_m_cap)
-      layout = warpgroup_row_layout(num_a, itemsize)
     tile_shape, stat_shape, reduce_axis = (num_m, num_a), (num_m,), 1
+    layout = make_layout(block_m, num_a, itemsize)
   else:
-    # `B` is contiguous, so the warps land on `A` and the reduction takes the
-    # scratch path. `M` goes entirely to the grid: it adds nothing to
-    # coalescing and only inflates the register footprint. `M` is then indexed
-    # by a scalar, so the tile is 2D even though the ref is 3D.
+    # `B` is contiguous, so `A` is the slow axis: it feeds the warps when it is
+    # long enough, and the reduction along it then takes the scratch path. `M`
+    # goes entirely to the grid -- it adds nothing to coalescing and only
+    # inflates the register footprint -- so it is indexed by a scalar and the
+    # tile is 2D even though the ref is 3D.
     block_m, block_b = 1, largest_divisor(num_b, block_b)
     tile_shape, stat_shape, reduce_axis = (num_m, num_a, num_b), (num_m, num_b), 0
-    layout = coalesced_layout(num_a, block_b, itemsize)
+    layout = make_layout(num_a, block_b, itemsize)
 
   if block_m * block_b == 1:
-    # A block whose statistic is a single element -- a 1D input, or one row per
-    # `vmap` element -- stores it through Mosaic's scalar path, which cannot
-    # write a tiled value to a GMEM ref, and a tiled layout is the only kind
-    # that can reduce along one axis. Nothing here is worth optimizing anyway:
-    # one row is one memory transaction.
+    # Mosaic's scalar path cannot yet write a tiled value to a GMEM ref.
     raise NotImplementedError(
       f'A block of ({block_m}, {num_a}, {block_b}) leaves a single-element'
       ' statistic, which cannot be stored.'
@@ -333,7 +257,6 @@ def plan(
     grid, grid_names = (grid_m // split_m, split_m, grid_b), ('mo', 'm', 'b')
 
   return Plan(
-    num_a=num_a,
     block_m=block_m,
     block_b=block_b,
     x_shape=tile_shape,
@@ -349,17 +272,9 @@ def plan(
 
 def with_usable_block_m(config):
   """Raises a borrowed Triton config's `block_m` to something this kernel can use.
-
-  `pallas_triton_config.get_heuristics_config` halves `block_m` until the launch
-  has enough blocks to fill the device, which for anything but a very tall `M`
-  bottoms out at 1. Triton is happy with that; this kernel would still run, but
-  when the reduced axis is contiguous a `block_m` below 4 leaves nothing to give
-  the warps, so `plan` falls back to `warpgroup_row_layout` and reduces across
-  warps through SMEM when a lane shuffle would have done.
-
-  This is a floor, not a retuning: it says nothing about what `block_m` *should*
-  be, only what the fast layout needs. `plan` still picks the largest usable
-  divisor at or below it, and the `B`-blocked case overrides it entirely.
+  A `block_m` below 4 leaves nothing to give the warps, so `make_layout` takes
+  them from the reduced axis instead and reduces across warps through SMEM when
+  a lane shuffle would have done.
   """
   return dataclasses.replace(config, block_m=max(4, config.block_m))
 

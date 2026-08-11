@@ -110,20 +110,19 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         x_ref, scale_ref, offset_ref = next(it), take(has_scale), take(has_offset)
         y_ref, mean_ref = next(it), take(return_mean)
         rstd_ref = take(return_residuals)
-        idx = p.indices()
-        x_idx, stat_idx = idx.x, idx.stat
+        x_idx, stat_idx, _, pid_m = p.indices()
         # Shared params have a leading axis of 1, so this folds to a constant.
-        element = idx.pid_m // blocks_per_element if params_batched else 0
+        element = pid_m // blocks_per_element if params_batched else 0
 
-        x = mosaic_tiling.load(x_ref.at[x_idx], p.layout)
+        x = plgpu.load(x_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
         bcast = lambda a: p.bcast(a, x.shape)
 
         if subtract_mean:
-          mean = p.mean_over_a(x)
+          mean = jnp.mean(x, axis=p.reduce_axis)
           x -= bcast(mean)
           if mean_ref is not None:
             mean_ref[stat_idx] = mean
-        rstddev = jax.lax.rsqrt(p.mean_over_a(jnp.square(x)) + epsilon)
+        rstddev = jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=p.reduce_axis) + epsilon)
         if rstd_ref is not None:
           rstd_ref[stat_idx] = rstddev
         x *= bcast(rstddev)
