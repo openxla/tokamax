@@ -46,7 +46,6 @@ _WGMMA_COL = plgpu.Layout.WGMMA.reduce(0)
 _load_bcast = common.load_bcast
 _COMPUTE_WGS = 2
 _FORBID_EXTRA = pydantic.ConfigDict(extra="forbid")
-_SMEM_OVERHEAD = 2200
 _MAX_SMEM = 227 * 1024
 
 
@@ -131,6 +130,7 @@ def _get_scratch_types(
 def _estimate_shared_mem_usage_bytes(ba, config) -> int:
   """Estimates the shared memory usage in bytes for a given configuration."""
   q, k, v = ba.args
+  out_dtype = q.dtype
   q, k, v = map(lambda x: jax.eval_shape(quantization.as_array, x), (q, k, v))
   precision = ba.kwargs["precision"]
   cast_qkv = functools.partial(common.cast_qkv, precision=precision)
@@ -144,14 +144,14 @@ def _estimate_shared_mem_usage_bytes(ba, config) -> int:
   )
   return_residuals = ba.kwargs["return_residuals"]
   scratch_types = _get_scratch_types(
-      q, k, v, bias, mask, q.dtype, return_residuals, config
+      q, k, v, bias, mask, out_dtype, return_residuals, config
   )
   return mgpu_lib.estimate_smem_bytes(scratch_types)
 
 
 def get_heuristics_config(ba: op.BoundArguments) -> Config:
   config = Config(block_q=64, block_kv=128, num_stages=2)
-  if _estimate_shared_mem_usage_bytes(ba, config) + _SMEM_OVERHEAD < _MAX_SMEM:
+  if _estimate_shared_mem_usage_bytes(ba, config) < _MAX_SMEM:
     return config
 
   # This is a pretty good option that works for most cases.
@@ -578,7 +578,9 @@ def flash_attention_kernel(
       num_threads=_COMPUTE_WGS + 1,
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(
-          approx_math=True, unsafe_no_auto_barriers=True
+          approx_math=True,
+          unsafe_no_auto_barriers=True,
+          reduction_scratch_bytes=0,
       ),
       kernel_name="flash_attention_sm90",
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
