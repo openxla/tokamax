@@ -34,6 +34,7 @@ from jaxlib.mlir.dialects import vector
 import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu as mgpu_lib
+from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -251,6 +252,8 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
 def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   """Returns a set of configs for autotuning flash attention on SM100 GPUs."""
   q, k, v, *_ = ba.args
+  out_dtype = q.dtype
+  q, k, v = map(lambda x: jax.eval_shape(quantization.as_array, x), (q, k, v))
   precision = ba.kwargs["precision"]
   cast_qkv = functools.partial(common.cast_qkv, precision=precision)
   q, k, v = jax.eval_shape(cast_qkv, q, k, v)
@@ -259,7 +262,6 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   mask = ba.kwargs.get("mask")
   q_indices = ba.kwargs.get("q_indices")
   k_indices = ba.kwargs.get("k_indices")
-  out_dtype = ba.kwargs.get("out_dtype", q.dtype)
   norm = ba.kwargs.get("normalize_output")
 
   mask, *_ = jax.eval_shape(
@@ -894,6 +896,7 @@ def flash_attention_kernel(
   compiler_params = plgpu.CompilerParams(
       approx_math=True,
       unsafe_no_auto_barriers=True,
+      reduction_scratch_bytes=0,
       profile_space=128 if profile else 0,
       profile_dir="sponge" if profile else "",
   )
