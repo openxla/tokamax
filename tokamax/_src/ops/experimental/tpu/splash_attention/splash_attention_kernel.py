@@ -262,7 +262,7 @@ def _apply_mask_and_soft_cap(
   if has_partial_mask:
     if mask_ref is not None:
       mask = mask_ref[:, k_slice] if k_in_lanes else mask_ref[k_slice, :]
-      masks.append(mask)
+      masks.append(mask.astype(jnp.bool_))
     elif mask_function is not None:
       # Compute the mask using the given q_sequence indices.
       # KV indices are computed on the fly. This works because we only support Q
@@ -325,6 +325,7 @@ def _apply_mask_and_soft_cap(
       return logits
 
   if masks:
+    masks = [m.astype(jnp.bool_) for m in masks]
     mask = functools.reduce(jnp.logical_and, masks)
     qk = cap_logits(qk)
     if mask.ndim == 2 and qk.ndim == 3:
