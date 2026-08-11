@@ -276,7 +276,8 @@ class AmpereLoweringTest(parameterized.TestCase):
             # One case per branch of `mosaic_tiling.plan`.
             dict(shape=(4096, 128), axis=-1, block_m=32, block_n=None),
             dict(shape=(8, 128, 256), axis=1, block_m=32, block_n=32),
-            dict(shape=(128,), axis=-1, block_m=1, block_n=None),
+            # 6 rows: no multiple of 4 divides them, so `A` supplies the warps.
+            dict(shape=(6, 256), axis=-1, block_m=32, block_n=None),
         ),
         use_params=(False, True),
         subtract_mean=(False, True),
@@ -362,20 +363,23 @@ class PlanTest(absltest.TestCase):
 
     F32 = 4
 
-    def test_degenerate_1d(self):
-        p = mosaic_tiling.plan((1, 128, 1), self.F32, block_m=32, block_b=1)
-        self.assertEqual(p.x_shape, (128,))
-        self.assertEqual(p.stat_shape, (1,))
-        self.assertEqual(p.dparam_shape, (1, 1, 128))
-        self.assertEqual(p.grid, (1, 1))
-        # The strided layout is inferred, and the tile's only axis is `A`, so a
-        # statistic is a scalar and a param needs no reduction.
-        self.assertIsNone(p.layout)
-        self.assertEqual((p.ndim, p.reduce_axis, p.stat_axes), (1, 0, ()))
+    def test_degenerate_1d_is_declined(self):
+        """A single row leaves a statistic Mosaic cannot store. See `plan`."""
+        with self.assertRaisesRegex(NotImplementedError, 'single-element'):
+            mosaic_tiling.plan((1, 128, 1), self.F32, block_m=32, block_b=1)
 
-    def test_degenerate_1d_needs_multiple_of_128(self):
-        with self.assertRaises(NotImplementedError):
-            mosaic_tiling.plan((1, 96, 1), self.F32, block_m=32, block_b=1)
+    def test_reduced_axis_needs_multiple_of_128_for_the_row_layout(self):
+        with self.assertRaisesRegex(NotImplementedError, 'multiple of 128'):
+            mosaic_tiling.plan((6, 96, 1), self.F32, block_m=32, block_b=1)
+
+    def test_short_m_uses_the_warpgroup_row_layout(self):
+        # 6 rows: no multiple of 4 divides them, so the fast path is out, but
+        # the shape is no longer rejected.
+        p = mosaic_tiling.plan((6, 256, 1), self.F32, block_m=32, block_b=1)
+        self.assertEqual((p.block_m, p.grid), (6, (1, 1)))
+        self.assertEqual(
+            p.layout, mosaic_tiling.warpgroup_row_layout(256, self.F32)
+        )
 
     def test_reduced_axis_contiguous(self):
         p = mosaic_tiling.plan((256, 128, 1), self.F32, block_m=32, block_b=1)
@@ -399,7 +403,7 @@ class PlanTest(absltest.TestCase):
         self.assertEqual((p.reduce_axis, p.stat_axes), (0, (1,)))
 
     def test_layouts_are_constructible(self):
-        for x_shape in [(256, 128, 1), (4, 32, 256)]:
+        for x_shape in [(256, 128, 1), (4, 32, 256), (6, 256, 1)]:
             p = mosaic_tiling.plan(x_shape, self.F32, block_m=32, block_b=128)
             # `to_mgpu` is where a bad tiling or partitioning would blow up.
             p.layout.to_mgpu()
@@ -428,9 +432,13 @@ class PlanTest(absltest.TestCase):
         self.assertEqual(p.block_m, 4)
         self.assertEqual(p.grid, (3, 1))
 
-    def test_no_warp_aligned_block(self):
-        with self.assertRaisesRegex(NotImplementedError, 'multiple of 4'):
-            mosaic_tiling.plan((2, 128, 1), self.F32, block_m=32, block_b=1)
+    def test_no_warp_aligned_block_falls_back(self):
+        """2 rows cannot fill four warps, so `A` supplies them instead."""
+        p = mosaic_tiling.plan((2, 128, 1), self.F32, block_m=32, block_b=1)
+        self.assertEqual((p.block_m, p.grid), (2, (1, 1)))
+        self.assertEqual(
+            p.layout, mosaic_tiling.warpgroup_row_layout(128, self.F32)
+        )
 
     def test_rows_per_element_keeps_blocks_inside_one_element(self):
         """A folded `vmap` batch: blocks must not straddle a batch boundary."""
