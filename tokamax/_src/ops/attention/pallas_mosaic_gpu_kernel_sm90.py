@@ -164,7 +164,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   block_kvs = [x for x in [128, 256] if x <= pl.next_power_of_2(k.shape[-3])]
 
   configs = set()
-  for block_q in [64, 128] if pl.next_power_of_2(q.shape[-3]) >= 256 else [64]:
+  for block_q in [64, 128] if pl.next_power_of_2(q.shape[-3]) > 128 else [64]:
     for block_kv in [64] + block_kvs:
       for num_stages in [2, 3, 4]:
         if num_stages > pl.cdiv(k.shape[-3], block_kv):
