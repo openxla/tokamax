@@ -35,7 +35,6 @@ from tokamax._src.ops.experimental.kda.pallas_mosaic_tpu_kernel import (
     chunk_kda_fwd_custom,
 )
 from tokamax._src.ops.experimental.kda.pallas_mosaic_tpu_types import (
-    CpMetadata,
     KdaResiduals,
 )
 from tokamax._src.ops.experimental.kda.utils import (
@@ -90,7 +89,6 @@ class _PreparedKdaInputs:
   aligned_segment_ids: jax.Array | None
   q_rstd: jax.Array | None
   k_rstd: jax.Array | None
-  cp_metadata: CpMetadata
 
 
 def check_inputs_support(
@@ -334,28 +332,6 @@ class PallasMosaicTpuKimiDeltaAttention(
       q_prepared, k_prepared = q_aligned, k_aligned
       q_rstd = k_rstd = None
 
-    cp_metadata = None
-    if (
-        context_parallel_metadata is not None
-        and context_parallel_metadata.is_cp_enabled
-    ):
-      if any(
-          value is None
-          for value in (
-              context_parallel_metadata.is_first_rank,
-              context_parallel_metadata.is_last_rank,
-              context_parallel_metadata.pre_num_ranks,
-              context_parallel_metadata.post_num_ranks,
-          )
-      ):
-        raise ValueError("Enabled CP context is missing derived rank metadata.")
-      cp_metadata = (
-          context_parallel_metadata.is_first_rank,
-          context_parallel_metadata.is_last_rank,
-          context_parallel_metadata.pre_num_ranks,
-          context_parallel_metadata.post_num_ranks,
-      )
-
     return _PreparedKdaInputs(
         q=q_prepared,
         k=k_prepared,
@@ -370,7 +346,6 @@ class PallasMosaicTpuKimiDeltaAttention(
         aligned_segment_ids=aligned_segment_ids,
         q_rstd=q_rstd,
         k_rstd=k_rstd,
-        cp_metadata=cp_metadata,
     )
 
   @jaxtyping.jaxtyped
@@ -459,7 +434,6 @@ class PallasMosaicTpuKimiDeltaAttention(
         aligned_segment_ids=prepared.aligned_segment_ids,
         q_rstd=prepared.q_rstd,
         k_rstd=prepared.k_rstd,
-        cp_metadata=prepared.cp_metadata,
     )
     value, final_state = output
     if final_state is not None and final_state.ndim == 4:

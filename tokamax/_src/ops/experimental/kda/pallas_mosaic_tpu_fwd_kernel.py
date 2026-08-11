@@ -1445,9 +1445,6 @@ def chunk_kda_fwd_custom(
     aligned_segment_ids: Int[Array, "B T_ALIGNED"] | None = None,
     q_rstd: Float[Array, "H B T_ALIGNED"] | None = None,
     k_rstd: Float[Array, "H B T_ALIGNED"] | None = None,
-    cp_metadata: (
-        tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None
-    ) = None,
 ) -> tuple[
     tuple[
         Float[Array, "H B T V"],
@@ -1468,6 +1465,17 @@ def chunk_kda_fwd_custom(
       context_parallel_metadata is not None
       and context_parallel_metadata.is_cp_enabled
   )
+  cp_metadata = None
+  if _cp_active:
+    assert context_parallel_metadata is not None
+    cp_metadata = (
+        context_parallel_metadata.is_first_rank,
+        context_parallel_metadata.is_last_rank,
+        context_parallel_metadata.pre_num_ranks,
+        context_parallel_metadata.post_num_ranks,
+    )
+    if any(value is None for value in cp_metadata):
+      raise ValueError("Enabled CP context is missing derived rank metadata.")
 
   _is_varlen = cu_seqlens is not None
   # ------------------------------------------------------------------
