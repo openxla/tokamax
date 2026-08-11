@@ -116,10 +116,7 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
         # `scale` has a row per batch element, and this block lies inside one.
         element = 0 if axis_size == 1 else idx.pid_m // blocks_per_element
 
-        def load_stat(ref):
-          if p.layout is None:  # 1D tile: the statistic is a scalar.
-            return ref[stat_idx].astype(jnp.float32)
-          return mosaic_tiling.load(ref.at[stat_idx], p.stat_layout)
+        load_stat = lambda ref: mosaic_tiling.load(ref.at[stat_idx], p.stat_layout)
 
         x_norm = mosaic_tiling.load(x_ref.at[x_idx], p.layout)
         bcast = lambda a: p.bcast(a, x_norm.shape)
@@ -233,14 +230,10 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
       mean = next(it) if subtract_mean else None
       rstddev = next(it)
 
-      try:
-        dx, *dparams = launch(dout, x, mean, rstddev, scale, axis_size)
-      except NotImplementedError:
-        # The folded rows do not tile -- a 1D input has one row per element, so
-        # there is nothing to give the warps. Fall back to a launch per element.
-        out = jax.lax.map(lambda a: launch_present(*a), tuple(args))
-        return out, jax.tree.map(lambda _: True, out)
-
+      # No per-element fallback: blocks are kept inside one element either way,
+      # so a launch per element plans exactly the same blocks as the fold and
+      # would decline the same shapes, only slower.
+      dx, *dparams = launch(dout, x, mean, rstddev, scale, axis_size)
       dx = dx.reshape(axis_size, dx.shape[0] // axis_size, *dx.shape[1:])
       return (dx, *dparams), (True,) * (1 + len(dparams))
 
