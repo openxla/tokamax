@@ -263,6 +263,7 @@ def make_tgmm_configs(
     tiles = tile_info
   else:
     tiles = tile_info(
+        # pyrefly: ignore[bad-argument-type]
         dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, out_dtype, acc_dtype,
         target_zero_ref_bytes,
     )
@@ -352,6 +353,7 @@ def tgmm_inner_kernel(
 
     if is_group_changing:
       if cfgs.rhs_cfgs.has_scale:
+        # pyrefly: ignore[unsupported-operation]
         scale_slice = tiled_rhs_scale_ref[0]
         acc *= scale_slice
       tiled_out_ref[...] = acc.astype(tiled_out_ref.dtype)
@@ -709,11 +711,13 @@ def tgmm_v2(
   cfgs = make_tgmm_configs(
       lhs,
       rhs,
+      # pyrefly: ignore[bad-argument-type]
       rhs_scale,
       group_sizes,
       num_actual_groups,
       tile_info=tile_info,
       vmem_limit_bytes=vmem_limit_bytes,
+      # pyrefly: ignore[bad-argument-type]
       out_dtype=preferred_element_type,
       acc_dtype=acc_dtype,
       target_zero_ref_bytes=target_zero_ref_bytes,
@@ -754,10 +758,12 @@ def tgmm_v2(
   ]
 
   if rhs_scale is not None:
+    # pyrefly: ignore[bad-assignment]
     rhs_scale = rhs_scale.astype(jnp.float32)
     pad_n = aligned_n - dims.size_n
     if pad_n > 0:
       rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, 0), (0, pad_n)))
+  # pyrefly: ignore[bad-assignment]
   rhs = OperandRef(value=rhs, scale=rhs_scale)
   group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
@@ -767,6 +773,7 @@ def tgmm_v2(
       functools.partial(tgmm_kernel_main, cfgs=cfgs),
       out_type=out_init,
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      # pyrefly: ignore[bad-argument-type]
       scratch_types=scratch_shapes,
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=vmem_limit_bytes,
@@ -776,5 +783,6 @@ def tgmm_v2(
       cost_estimate=get_cost_estimate(cfgs),
       # the metadata here is for profiling, debugging, and cost modeling.
       # It does not affect the kernel's computation.
+      # pyrefly: ignore[bad-argument-type]
       metadata=gmm_v2.get_metadata(cfgs),
   )(group_sizes, group_offset, lhs, rhs)[:, : dims.size_k, : dims.size_n]
