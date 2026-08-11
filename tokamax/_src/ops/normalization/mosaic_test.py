@@ -276,8 +276,10 @@ class AmpereLoweringTest(parameterized.TestCase):
             # One case per branch of `mosaic_tiling.plan`.
             dict(shape=(4096, 128), axis=-1, block_m=32, block_n=None),
             dict(shape=(8, 128, 256), axis=1, block_m=32, block_n=32),
-            # 6 rows: no multiple of 4 divides them, so `A` supplies the warps.
+            # Both cases where the slow axis cannot supply the warps, so the
+            # contiguous one does: 6 rows of `M`, and a reduced axis of 6.
             dict(shape=(6, 256), axis=-1, block_m=32, block_n=None),
+            dict(shape=(4, 6, 256), axis=1, block_m=32, block_n=128),
         ),
         use_params=(False, True),
         subtract_mean=(False, True),
@@ -378,7 +380,7 @@ class PlanTest(absltest.TestCase):
         p = mosaic_tiling.plan((6, 256, 1), self.F32, block_m=32, block_b=1)
         self.assertEqual((p.block_m, p.grid), (6, (1, 1)))
         self.assertEqual(
-            p.layout, mosaic_tiling.warpgroup_row_layout(256, self.F32)
+            p.layout, mosaic_tiling.make_layout(6, 256, self.F32)
         )
 
     def test_reduced_axis_contiguous(self):
@@ -390,7 +392,7 @@ class PlanTest(absltest.TestCase):
         self.assertEqual(p.dparam_shape, (8, 1, 128))
         # `A` is the tile's fast axis, so it is reduced within a warp, and the
         # params are reduced over `M`, which crosses warps.
-        self.assertEqual((p.reduce_axis, p.stat_axes), (1, (0,)))
+        self.assertEqual((p.reduce_axis, p.stat_axis), (1, 0))
 
     def test_reduced_axis_strided(self):
         p = mosaic_tiling.plan((4, 32, 256), self.F32, block_m=32, block_b=128)
@@ -400,15 +402,15 @@ class PlanTest(absltest.TestCase):
         self.assertEqual(p.stat_shape, (4, 256))
         self.assertEqual(p.grid, (4, 2))
         self.assertEqual(p.dparam_shape, (4, 2, 32))
-        self.assertEqual((p.reduce_axis, p.stat_axes), (0, (1,)))
+        self.assertEqual((p.reduce_axis, p.stat_axis), (0, 1))
 
     def test_layouts_are_constructible(self):
         for x_shape in [(256, 128, 1), (4, 32, 256), (6, 256, 1)]:
             p = mosaic_tiling.plan(x_shape, self.F32, block_m=32, block_b=128)
             # `to_mgpu` is where a bad tiling or partitioning would blow up.
             p.layout.to_mgpu()
-            p.stat_layout.to_mgpu()
-            p.param_layout.to_mgpu()
+            p.layout.reduce((p.reduce_axis,)).to_mgpu()  # A statistic.
+            p.layout.reduce((p.stat_axis,)).to_mgpu()  # An `A`-indexed param.
 
     def test_row_grid_splits_over_two_axes(self):
         grid_m = 1 << 17  # Over the 65535 cap on gridDim.y/.z.
@@ -437,7 +439,7 @@ class PlanTest(absltest.TestCase):
         p = mosaic_tiling.plan((2, 128, 1), self.F32, block_m=32, block_b=1)
         self.assertEqual((p.block_m, p.grid), (2, (1, 1)))
         self.assertEqual(
-            p.layout, mosaic_tiling.warpgroup_row_layout(128, self.F32)
+            p.layout, mosaic_tiling.make_layout(2, 128, self.F32)
         )
 
     def test_rows_per_element_keeps_blocks_inside_one_element(self):
