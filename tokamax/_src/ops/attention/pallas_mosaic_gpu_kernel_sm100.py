@@ -35,7 +35,6 @@ from jaxlib.mlir.dialects import vector
 import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu as mgpu_lib
-from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -112,8 +111,6 @@ def _get_scratch_types(
     q, k, v, bias, mask, out_dtype, config, *, normalize_output
 ) -> dict[str, Any]:
   """Returns the scratch types for the kernel."""
-  pad = functools.partial(_pad_to_swizzle, collective=config.collective)
-  q, k, v = jax.eval_shape(pad, q, k, v)
   head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
 
@@ -200,33 +197,39 @@ def _get_scratch_types(
   return scratch
 
 
-def get_heuristics_config(ba: op.BoundArguments) -> Config:
+def _eval_input_shapes(ba, *, collective, fold_q_sequence_heads, split_k):
+  q, k, v, bias, mask = common.eval_input_shapes(
+      ba, fold_q_sequence_heads=fold_q_sequence_heads, split_k=split_k
+  )
+  pad = functools.partial(_pad_to_swizzle, collective=collective)
+  return *jax.eval_shape(pad, q, k, v), bias, mask
+
+
+def get_heuristics_config(
+    ba: op.BoundArguments, fold_q_sequence_heads: bool
+) -> Config:
   """Returns a heuristic configuration for flash attention on SM100 GPUs."""
-  q, k, v, *_ = ba.args
-  out_dtype = q.dtype
-  q, k, v = map(lambda x: jax.eval_shape(quantization.as_array, x), (q, k, v))
-  precision = ba.kwargs["precision"]
-  cast_qkv = functools.partial(common.cast_qkv, precision=precision)
-  q, k, v = jax.eval_shape(cast_qkv, q, k, v)
-  bias = ba.kwargs.get("bias")
-  mask = ba.kwargs.get("mask")
-  q_indices = ba.kwargs.get("q_indices")
-  k_indices = ba.kwargs.get("k_indices")
+  out_dtype = ba.args[0].dtype
   norm = ba.kwargs.get("normalize_output")
-  mask, *_ = jax.eval_shape(
-      common.decompose_mask, mask, q, k, q_indices, k_indices
+  collective = False
+  split_k = 1
+
+  eval_in_shapes = functools.partial(
+      _eval_input_shapes,
+      ba,
+      collective=collective,
+      fold_q_sequence_heads=fold_q_sequence_heads,
   )
 
+  q, _, v, _, _ = eval_in_shapes(split_k=split_k)
   *batch_size, q_seq_len, q_heads, head_dim = q.shape
   head_dim = pl.cdiv(max(head_dim, v.shape[-1]), 64) * 64
   kv_seq_len = v.shape[-3]
   num_tma_splits = 2 if head_dim >= 256 else 1
-  collective = False
   cluster_size = 2 if collective else 1
   num_stages = max(256 // head_dim, 1) * cluster_size
   block_q = 128 * cluster_size
   block_kv = 128
-  split_k = 1
 
   # We use 0.5 threshold here as a safe choice for automatic K-split usage.
   # For other cases like 0.8 etc. we need a smarter heuristic or autotuning.
@@ -247,6 +250,7 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
     while kv_seq_len % split_k != 0:
       split_k -= 1
 
+  q, k, v, bias, mask = eval_in_shapes(split_k=split_k)
   config = Config(
       block_q=block_q,
       block_kv=block_kv,
@@ -254,6 +258,7 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
       num_stages=num_stages,
       num_tma_splits=num_tma_splits,
       split_k=split_k,
+      fold_q_sequence_heads=fold_q_sequence_heads,
   )
 
   while config.num_stages > 1:
@@ -269,41 +274,30 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
 
 def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   """Returns a set of configs for autotuning flash attention on SM100 GPUs."""
-  q, k, v, *_ = ba.args
-  out_dtype = q.dtype
-  q, k, v = map(lambda x: jax.eval_shape(quantization.as_array, x), (q, k, v))
-  precision = ba.kwargs["precision"]
-  cast_qkv = functools.partial(common.cast_qkv, precision=precision)
-  q, k, v = jax.eval_shape(cast_qkv, q, k, v)
-
-  bias = ba.kwargs.get("bias")
-  mask = ba.kwargs.get("mask")
-  q_indices = ba.kwargs.get("q_indices")
-  k_indices = ba.kwargs.get("k_indices")
+  out_dtype = ba.args[0].dtype
   norm = ba.kwargs.get("normalize_output")
-
-  mask, *_ = jax.eval_shape(
-      common.decompose_mask, mask, q, k, q_indices, k_indices
+  eval_in_shapes = functools.partial(
+      _eval_input_shapes, ba, fold_q_sequence_heads=False
   )
-  # Before padding, check if the head_dim is compatible with splits.
-  # We assume head dims are padded to multiples of 64 inside the kernel.
-  head_dim = pl.cdiv(q.shape[-1], 64) * 64
-  head_dim_out = pl.cdiv(v.shape[-1], 64) * 64
 
   configs = set()
   for block_kv in [64, 128]:
     for num_stages in [1, 2, 3, 4]:
       for num_tma_splits in [1, 2, 3, 4]:
-        if (head_dim // num_tma_splits) % 64 != 0:
-          continue
-
         # TODO: Investigate why split_k=2 doesn't work with block_kv=128.
         for split_k in [1, 2] if block_kv == 64 else [1]:
           for collective in [False, True] if split_k == 1 else [False]:
-            if (
-                head_dim_out // num_tma_splits // (2 if collective else 1)
-            ) % 64 != 0:
+            q, k, v, bias, mask = eval_in_shapes(
+                collective=collective, split_k=split_k
+            )
+
+            if (k.shape[-1] // num_tma_splits) % 64 != 0:
               continue
+
+            tile_d = v.shape[-1] // num_tma_splits // (2 if collective else 1)
+            if tile_d % 64 != 0:
+              continue
+
             config = Config(
                 block_q=256 if collective else 128,
                 block_kv=block_kv,

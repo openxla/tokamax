@@ -14,6 +14,7 @@
 # ==============================================================================
 """Common utilities for Mosaic GPU attention implementations."""
 
+import functools
 from typing import Annotated, Any
 
 import jax
@@ -29,7 +30,10 @@ import pydantic
 import qwix
 from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import precision as precision_lib
+from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
+from tokamax._src.ops import op as op_lib
+from tokamax._src.ops.attention import base
 
 
 CanonicalPrecision = precision_lib.CanonicalPrecision
@@ -135,6 +139,75 @@ def cast_qkv[
   k = cast(k, q_k_dot_precision)
   v = cast(v, p_v_dot_precision)
   return q, k, v
+
+
+def _broadcast_to_rank(x, rank):
+  return None if x is None else jax.lax.broadcast_to_rank(x, rank)
+
+
+def prepare_inputs(
+    q,
+    k,
+    v,
+    *,
+    bias,
+    mask,
+    q_indices,
+    k_indices,
+    precision,
+    fold_q_sequence_heads,
+):
+  """Prepares inputs for the standard attention kernel."""
+  # TODO: Support in-kernel dequantization.
+  q, k, v = map(quantization.as_array, (q, k, v))
+  q, k, v = cast_qkv(q, k, v, precision)
+
+  if fold_q_sequence_heads:
+    q, bias, mask, _, q_indices = base.fold_q_sequence_heads(
+        q, bias, mask, None, q_indices, k.shape[-3], k.shape[-2]
+    )
+
+  mask, is_causal, k_start, k_end = decompose_mask(
+      mask, q, k, q_indices, k_indices
+  )
+
+  bias = _broadcast_to_rank(bias, q.ndim)
+  mask = _broadcast_to_rank(mask, q.ndim)
+  k_start = _broadcast_to_rank(k_start, q.ndim - 1)
+  k_end = _broadcast_to_rank(k_end, q.ndim - 1)
+  return q, k, v, bias, mask, is_causal, k_start, k_end
+
+
+def eval_input_shapes(
+    ba: op_lib.BoundArguments, *, fold_q_sequence_heads: bool, split_k: int
+):
+  """Evaluates the shape of the inputs after `prepare_inputs`."""
+  q, k, v, bias, mask, _, _, _ = jax.eval_shape(
+      functools.partial(
+          prepare_inputs,
+          precision=ba.kwargs["precision"],
+          fold_q_sequence_heads=fold_q_sequence_heads,
+      ),
+      *ba.args,
+      bias=ba.kwargs["bias"],
+      mask=ba.kwargs["mask"],
+      q_indices=ba.kwargs["q_indices"],
+      k_indices=ba.kwargs["k_indices"],
+  )
+
+  if split_k > 1:
+    k_seq_len = pl.cdiv(k.shape[-3], split_k)
+    k_shape = (split_k, *k.shape[:-3], k_seq_len, *k.shape[-2:])
+    k = jax.ShapeDtypeStruct(k_shape, k.dtype)
+    v = jax.ShapeDtypeStruct(k_shape[:-1] + (v.shape[-1],), v.dtype)
+    if bias is not None:
+      bias_shape = (split_k, *bias.shape[:-1], k_seq_len)
+      bias = jax.ShapeDtypeStruct(bias_shape, bias.dtype)
+    if mask is not None:
+      mask_shape = (split_k, *mask.shape[:-1], k_seq_len)
+      mask = jax.ShapeDtypeStruct(mask_shape, mask.dtype)
+
+  return q, k, v, bias, mask
 
 
 def load_bcast(

@@ -28,7 +28,6 @@ from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-impo
 import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu as mgpu_lib
-from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -129,19 +128,12 @@ def _get_scratch_types(
 
 def _estimate_shared_mem_usage_bytes(ba, config) -> int:
   """Estimates the shared memory usage in bytes for a given configuration."""
-  q, k, v = ba.args
-  out_dtype = q.dtype
-  q, k, v = map(lambda x: jax.eval_shape(quantization.as_array, x), (q, k, v))
-  precision = ba.kwargs["precision"]
-  cast_qkv = functools.partial(common.cast_qkv, precision=precision)
-  q, k, v = jax.eval_shape(cast_qkv, q, k, v)
-  bias = ba.kwargs["bias"]
-  mask = ba.kwargs["mask"]
-  q_indices = ba.kwargs["q_indices"]
-  k_indices = ba.kwargs["k_indices"]
-  mask, *_ = jax.eval_shape(
-      common.decompose_mask, mask, q, k, q_indices, k_indices
+  q, k, v, bias, mask = common.eval_input_shapes(
+      ba,
+      fold_q_sequence_heads=config.fold_q_sequence_heads,
+      split_k=config.split_k,
   )
+  out_dtype = ba.args[0].dtype
   return_residuals = ba.kwargs["return_residuals"]
   scratch_types = _get_scratch_types(
       q, k, v, bias, mask, out_dtype, return_residuals, config
@@ -149,8 +141,16 @@ def _estimate_shared_mem_usage_bytes(ba, config) -> int:
   return mgpu_lib.estimate_smem_bytes(scratch_types)
 
 
-def get_heuristics_config(ba: op.BoundArguments) -> Config:
-  config = Config(block_q=64, block_kv=128, num_stages=2)
+def get_heuristics_config(
+    ba: op.BoundArguments, fold_q_sequence_heads: bool
+) -> Config:
+  """Returns a heuristic configuration for flash attention on SM90 GPUs."""
+  config = Config(
+      block_q=64,
+      block_kv=128,
+      num_stages=2,
+      fold_q_sequence_heads=fold_q_sequence_heads,
+  )
   if _estimate_shared_mem_usage_bytes(ba, config) < _MAX_SMEM:
     return config
 
