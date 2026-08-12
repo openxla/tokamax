@@ -29,7 +29,7 @@ dependencies = [
     "typeguard==2.13.3",
     "immutabledict",
     "tensorboardx",
-    "xprof",
+    "xprof>=2.23.1",
 ]
 
 
