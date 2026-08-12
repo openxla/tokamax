@@ -108,11 +108,15 @@ jobs:
               'topk': 'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py',
               'ragged_dot_sm100_fp8_quant': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py',
               'ragged_dot_sm100_i8_quant': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py',
+              'ragged_dot_pallas_mosaic_gpu': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py',
+              'ragged_dot_pallas_triton': 'tokamax/_src/ops/ragged_dot/pallas_triton_test.py',
               'ragged_dot_misc': (
                   '--ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_perf_test.py'
                   '--ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_test.py '
                   '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py '
                   '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_triton_test.py '
                   'tokamax/_src/ops/ragged_dot/ '
                   'tokamax/_src/ops/triangle_multiplication/ '
                   'tokamax/_src/ops/ragged_gather/ '
@@ -120,8 +124,17 @@ jobs:
               ),
               'linear_softmax_and_experimental': (
                   '--ignore=tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py '
+                  '--ignore=tokamax/_src/ops/experimental/tpu/splash_attention/ '
+                  '--ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/ '
                   'tokamax/_src/ops/linear_softmax_cross_entropy_loss/ '
                   'tokamax/_src/ops/experimental/'
+              ),
+              'splash_attention_kernel': (
+                  'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_test.py'
+              ),
+              'splash_attention_misc': (
+                  '--ignore=tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_test.py '
+                  'tokamax/_src/ops/experimental/tpu/splash_attention/'
               ),
               'misc_small_ops': (
                   'tokamax/_src/ops/flex_attention/ '
@@ -178,13 +191,17 @@ jobs:
               'RAGGED_DOT': [
                   'gmm_v2_perf', 'gmm_v2_kernel',
                   'ragged_dot_sm100_fp8_quant', 'ragged_dot_sm100_i8_quant',
+                  'ragged_dot_pallas_mosaic_gpu', 'ragged_dot_pallas_triton',
                   'ragged_dot_misc', 'op_test',
               ],
               'TRIANGLE_MULTIPLICATION': ['ragged_dot_misc'],
               'RAGGED_GATHER': ['ragged_dot_misc'],
               'RAGGED_GATHER_REDUCE': ['ragged_dot_misc'],
               'LINEAR_SOFTMAX': ['linear_softmax_and_experimental'],
-              'EXPERIMENTAL': ['linear_softmax_and_experimental', 'topk'],
+              'EXPERIMENTAL': [
+                  'linear_softmax_and_experimental', 'topk',
+                  'splash_attention_kernel', 'splash_attention_misc',
+              ],
               'FLEX_ATTENTION': ['misc_small_ops'],
               'RAGGED_SCATTER': ['misc_small_ops'],
               'GATED_LINEAR_UNIT': ['misc_small_ops', 'op_test'],
