@@ -14,6 +14,7 @@
 # ==============================================================================
 """B200 Flash attention with Mosaic GPU."""
 
+import dataclasses
 import functools
 import itertools
 import math
@@ -201,45 +202,52 @@ def _get_scratch_types(
 
 def get_heuristics_config(ba: op.BoundArguments) -> Config:
   """Returns a heuristic configuration for flash attention on SM100 GPUs."""
-  q, _, v, *_ = ba.args
+  q, k, v, *_ = ba.args
+  out_dtype = q.dtype
+  q, k, v = map(lambda x: jax.eval_shape(quantization.as_array, x), (q, k, v))
+  precision = ba.kwargs["precision"]
+  cast_qkv = functools.partial(common.cast_qkv, precision=precision)
+  q, k, v = jax.eval_shape(cast_qkv, q, k, v)
+  bias = ba.kwargs.get("bias")
+  mask = ba.kwargs.get("mask")
+  q_indices = ba.kwargs.get("q_indices")
+  k_indices = ba.kwargs.get("k_indices")
+  norm = ba.kwargs.get("normalize_output")
+  mask, *_ = jax.eval_shape(
+      common.decompose_mask, mask, q, k, q_indices, k_indices
+  )
+
   *batch_size, q_seq_len, q_heads, head_dim = q.shape
   head_dim = pl.cdiv(max(head_dim, v.shape[-1]), 64) * 64
-  batch_size = math.prod(batch_size)
   kv_seq_len = v.shape[-3]
   num_tma_splits = 2 if head_dim >= 256 else 1
-  collective = True
-  cluster_size = 1 + int(collective)
+  collective = False
+  cluster_size = 2 if collective else 1
   num_stages = max(256 // head_dim, 1) * cluster_size
-  block_q = 256 if collective else 128
-  if ba.kwargs.get("bias") is not None:
-    num_stages = min(num_stages, 4)
+  block_q = 128 * cluster_size
   block_kv = 128
   split_k = 1
 
-  mask = ba.kwargs.get("mask", None)
   # We use 0.5 threshold here as a safe choice for automatic K-split usage.
   # For other cases like 0.8 etc. we need a smarter heuristic or autotuning.
   min_load_factor = 0.5
-  grid_size = batch_size * pl.cdiv(q_seq_len, block_q) * q_heads
-  num_ctas = backend.get_default_device().core_count // cluster_size
-  # We do not support k split yet for any kind of masking (causal,
-  # k-ranges, or custom).
-  not_masked = mask is None
-  is_kv_seq_aligned = kv_seq_len % block_kv == 0
-  # TODO fix test failures for non aligned q seq
-  is_q_seq_aligned = q_seq_len % block_q == 0
+  grid_size = math.prod(batch_size) * pl.cdiv(q_seq_len, block_q) * q_heads
+  num_clusters = backend.get_default_device().core_count // cluster_size
   if (
-      grid_size / num_ctas < min_load_factor
-      and is_kv_seq_aligned
-      and is_q_seq_aligned
-      and not_masked
+      grid_size / num_clusters < min_load_factor
+      # We do not support k split yet for any kind of masking (causal,
+      # k-ranges, or custom).
+      # TODO fix test failures for non aligned q seq
+      and q_seq_len % block_q == 0
+      and kv_seq_len % block_kv == 0
+      and ba.kwargs.get("mask") is None
   ):
-    split_k = num_ctas // grid_size
+    split_k = num_clusters // grid_size
     split_k = min(kv_seq_len // block_kv, split_k)
     while kv_seq_len % split_k != 0:
       split_k -= 1
 
-  return Config(
+  config = Config(
       block_q=block_q,
       block_kv=block_kv,
       collective=collective,
@@ -247,6 +255,16 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
       num_tma_splits=num_tma_splits,
       split_k=split_k,
   )
+
+  while config.num_stages > 1:
+    scratch = _get_scratch_types(
+        q, k, v, bias, mask, out_dtype, config, normalize_output=norm
+    )
+    if mgpu_lib.estimate_smem_bytes(scratch) <= 227 * 1024:
+      break
+    config = dataclasses.replace(config, num_stages=config.num_stages - 1)
+
+  return config
 
 
 def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
