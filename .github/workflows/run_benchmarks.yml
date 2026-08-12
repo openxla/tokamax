@@ -56,5 +56,12 @@ jobs:
       benchmark_filter: ${{ inputs.benchmark_filter }}
       environment_filter: ${{ inputs.environment_filter }}
       custom_metadata: ${{ inputs.custom_metadata }}
+      ############################################################
+      # Temporary enable to populate looker studio test dashboards
+      ############################################################
+      publish_metrics: true
+      pub_sub_gcp_project_id: "ml-oss-benchmarking-production"
+      pub_sub_gcp_topic_id: "public-results-prod"
+      ############################################################
       custom_env_vars: |
         ${{ inputs.enable_xprof == true && 'TOKAMAX_DUMP_XPROF=true' || '' }}
