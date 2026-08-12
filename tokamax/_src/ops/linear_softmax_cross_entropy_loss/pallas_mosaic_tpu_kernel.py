@@ -58,20 +58,23 @@ def _calculate_fwd_vmem_bytes(
   """Calculates VMEM memory usage in bytes for the forward kernel."""
   dtype_bytes = jnp.dtype(dtype).itemsize
   h_alloc = 1 << (h_block_size - 1).bit_length()
-  num_bytes = (
+  return (
       # x tile (B, H) in input dtype (double buffered for pallas_call input)
       2 * b_block_size * h_alloc * dtype_bytes
-      # labels tile (B,) in int32/float32 (double buffered)
-      + 2 * b_block_size * 4
+      # labels (8 bytes), lse (8 bytes), and loss (8 bytes) tiles (all double
+      # buffered for pallas_call inputs/outputs, 24 bytes per batch elem total)
+      + 2 * 3 * 4 * b_block_size
       # w tile (H, V) in input dtype (double buffered for pallas_call input)
       + 2 * h_alloc * v_block_size * dtype_bytes
-      # lse (log-sum-exp) buffer tile (B,) in float32 accumulator (double
-      # buffered for pallas_call output)
-      + 2 * b_block_size * 4
-      # logits/xw tile (B, V) in float32 accumulator (single scratch buffer)
-      + b_block_size * v_block_size * 4
+      # logits/xw tile (B, V) in float32 accumulator:
+      # We account for 4 simultaneous (B, V) float32 buffers
+      # (4 * 4 = 16 bytes/elem):
+      #   1) xw_tiled (explicit scratch buffer)
+      #   2) labels_one_hot (HLO stack temporary in accumulate_loss)
+      #   3) diff = xw_tiled - max (HLO stack temporary in logsumexp)
+      #   4) exp(diff) (HLO stack temporary in logsumexp)
+      + 4 * b_block_size * v_block_size * 4
   )
-  return num_bytes
 
 
 def _calculate_bwd_vmem_bytes(
@@ -83,34 +86,28 @@ def _calculate_bwd_vmem_bytes(
   """Calculates VMEM memory usage in bytes for the backward kernel."""
   dtype_bytes = jnp.dtype(dtype).itemsize
   h_alloc = 1 << (h_block_size - 1).bit_length()
-  num_bytes = (
-      # x tile (B, H) in input dtype (double buffered for pallas_call input)
-      2 * b_block_size * h_alloc * dtype_bytes
-      # labels tile (B,) in int32/float32 (double buffered for pallas_call
-      # input)
-      + 2 * b_block_size * 4
-      # w tile (H, V) in input dtype (double buffered for pallas_call input)
-      + 2 * h_alloc * v_block_size * dtype_bytes
-      # lse (log-sum-exp) buffer tile (B,) in float32 (double buffered for
-      # pallas_call input)
-      + 2 * b_block_size * 4
-      # dout (loss gradient) tile (B,) in float32 (double buffered for
-      # pallas_call input)
-      + 2 * b_block_size * 4
+  return (
+      # x tile (B, H) in input dtype (double buff for pallas_call input: 2 * dt)
+      # + x_grad_tile accumulator (B, H) in float32 (single scratch buffer: 4B)
+      # + dot_general intermediate result in accumulate_x_grad (float32: 4B)
+      b_block_size * h_alloc * (2 * dtype_bytes + 8)
+      # labels (8 bytes), lse (8 bytes), and dout (8 bytes) tiles (all double
+      # buffered for pallas_call inputs, 24 bytes per batch elem total)
+      + 2 * 3 * 4 * b_block_size
+      # w tile (H, V) in input dtype (double buff for pallas_call input: 2 * dt)
+      # + w_grad_tile accumulator (H, V) in float32 (single scratch buffer: 4B)
+      # + dot_general intermediate result in accumulate_w_grad (float32: 4B)
+      + h_alloc * v_block_size * (2 * dtype_bytes + 8)
       # logits/softmax tile (B, V) in float32 accumulator:
-      # We account for 3 simultaneous (B, V) float32 buffers (3 * 4 = 12
-      # bytes/elem):
+      # We account for 4 simultaneous (B, V) float32 buffers
+      # (4 * 4 = 16 bytes/elem):
       #   1) xw_scratch_ref (explicit VMEM scratch buffer)
-      #   2) labels_one_hot (HLO stack temporary from jax.nn.one_hot in
-      #      compute_s)
-      #   3) jnp.exp(...) (HLO stack temporary during softmax in compute_s)
-      + 3 * b_block_size * v_block_size * 4
-      # x gradient tile accumulator (B, H) in float32 (single scratch buffer)
-      + b_block_size * h_alloc * 4
-      # w gradient tile accumulator (H, V) in float32 (single scratch buffer)
-      + h_alloc * v_block_size * 4
+      #   2) labels_one_hot (HLO stack temp from jax.nn.one_hot in compute_s)
+      #   3) diff = xw_scratch_ref - lse (HLO stack temporary during softmax in
+      #       compute_s)
+      #   4) jnp.exp(diff) (HLO stack temporary during softmax in compute_s)
+      + 4 * b_block_size * v_block_size * 4
   )
-  return num_bytes
 
 
 def _get_vmem_limit_bytes() -> int:
@@ -170,29 +167,38 @@ def _get_heuristic_config(
   # Must be >= 128, multiple of 128. Divisible by v_dim if possible.
   if is_bwd:
     # fixed_bytes accounts for VMEM costs that do not scale with V:
-    #   - x tile + x_grad_tile = b_block_size * h_block_size * (2 * dtype_bytes + 4)
+    #   - x tile (2 * dt) + x_grad_tile (4B) + dot_general res (4B) =
+    #          b_block_size * h_block_size * (2 * dtype_bytes + 8)
     #   - labels (8 bytes) + lse (8 bytes) + dout (8 bytes) = 24 * b_block_size
     fixed_bytes = (
-        b_block_size * h_block_size * (2 * dtype_bytes + 4) + 24 * b_block_size
+        b_block_size * h_block_size * (2 * dtype_bytes + 8) + 24 * b_block_size
     )
     # per_v_bytes accounts for all VMEM costs per column of V:
-    #   - w tile (double-buffered in dtype) + w_grad_tile (float32) =
-    #     h_block_size * (2 * dtype_bytes + 4)
-    #   - 3 simultaneous float32 (B, V) buffers on the VMEM stack during
-    #     compute_s:
+    #   - w tile (double-buffered in dtype: 2 * dt) + w_grad_tile (4B) +
+    #       dot_general res (4B) = h_block_size * (2 * dtype_bytes + 8)
+    #   - 4 simultaneous float32 (B, V) buffers on the VMEM stack during
+    #     compute_s: (4 * 4 = 16 bytes per element across b_block_size):
     #       1) xw_scratch_ref (explicit VMEM scratch)
     #       2) labels_one_hot (HLO stack temporary from jax.nn.one_hot)
-    #       3) jnp.exp(...) (HLO stack temporary during softmax)
-    #     Each float32 element is 4 bytes, so 3 * 4 = 12 bytes per element
-    #     across b_block_size.
-    per_v_bytes = h_block_size * (2 * dtype_bytes + 4) + 12 * b_block_size
+    #       3) diff = xw_scratch_ref - lse (HLO stack temporary during softmax)
+    #       4) jnp.exp(...) (HLO stack temporary during softmax)
+    per_v_bytes = h_block_size * (2 * dtype_bytes + 8) + 16 * b_block_size
   else:
+    # fixed_bytes accounts for VMEM costs that do not scale with V:
+    #   - x tile = 2 * b_block_size * h_block_size * dtype_bytes
+    #   - labels (8 bytes) + lse (8 bytes) + loss (8 bytes) = 24 * b_block_size
     fixed_bytes = (
-        2 * b_block_size * h_block_size * dtype_bytes + 16 * b_block_size
+        2 * b_block_size * h_block_size * dtype_bytes + 24 * b_block_size
     )
-    per_v_bytes = 2 * h_block_size * dtype_bytes + b_block_size * (
-        4 + dtype_bytes
-    )
+    # per_v_bytes accounts for all VMEM costs per column of V:
+    #   - w tile (double-buff in dtype: 2 * dt) = 2 * h_block_size * dtype_bytes
+    #   - 4 simultaneous float32 (B, V) buffers on the VMEM stack:
+    #     (4 * 4 = 16 bytes per element across b_block_size):
+    #       1) xw_tiled (explicit scratch buffer)
+    #       2) labels_one_hot (HLO stack temporary in accumulate_loss)
+    #       3) diff = xw_tiled - max (HLO stack temporary in logsumexp)
+    #       4) exp(diff) (HLO stack temporary in logsumexp)
+    per_v_bytes = 2 * h_block_size * dtype_bytes + 16 * b_block_size
 
   if vmem_limit_bytes > fixed_bytes:
     max_v_vmem = (vmem_limit_bytes - fixed_bytes) // per_v_bytes
@@ -1073,6 +1079,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         ),
     )
 
+  # pylint: disable-next=unpacking-non-sequence
   x_grad, w_grad_blocks = bwd_kernel(dout, x, labels, w, lse)
   w_grad = jnp.sum(w_grad_blocks, axis=0)
   return x_grad, w_grad

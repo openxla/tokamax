@@ -18,9 +18,9 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tokamax._src import numerics
-import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu as pallas_mosaic_tpu
-import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel as kernel
-import tokamax._src.ops.linear_softmax_cross_entropy_loss.reference as reference
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference
 
 
 class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
@@ -626,7 +626,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=32 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=2048
+              b_block_size=1024, h_block_size=512, v_block_size=1024
           ),
       ),
       dict(
@@ -636,7 +636,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=57 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=4096
+              b_block_size=1024, h_block_size=512, v_block_size=2048
           ),
       ),
   )
@@ -687,7 +687,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=16 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=512
+              b_block_size=1024, h_block_size=512, v_block_size=256
           ),
       ),
       dict(
@@ -697,7 +697,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=32 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=1024
+              b_block_size=1024, h_block_size=512, v_block_size=512
           ),
       ),
       dict(
