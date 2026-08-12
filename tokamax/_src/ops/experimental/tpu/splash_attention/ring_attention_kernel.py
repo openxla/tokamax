@@ -118,7 +118,7 @@ def _ring_attention_forward(
       max_logit_value=None,
   )
   # Initial accumulator values
-  o_shape = q.shape
+  o_shape = (*q.shape[:-1], v.shape[-1])
   o_init = jnp.zeros(o_shape, dtype=jnp.float32)
   l_init = jnp.zeros((o_shape[0], o_shape[1]), jnp.float32)
   m_init = jnp.full_like(l_init, mask_value, dtype=jnp.float32)
