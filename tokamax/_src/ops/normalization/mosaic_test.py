@@ -21,11 +21,12 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
+from jax.experimental.mosaic.gpu import core as mgpu_core
 import jax.numpy as jnp
 from tokamax._src import config as config_lib
 from tokamax._src.ops.normalization import mosaic
 from tokamax._src.ops.normalization import mosaic_tiling
-from tokamax._src.ops.normalization import mosaic_vjp
+from tokamax._src.ops.normalization import pallas_triton_vjp
 from tokamax._src.ops.normalization import pallas_triton_config as triton_config
 from tokamax._src.ops.normalization import pallas_triton_vjp_config as vjp_config
 from tokamax._src.ops.normalization import test_base
@@ -49,10 +50,10 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
 
     def __init__(self, *args):
         # The Mosaic kernel only supports a slice of the shape space (see
-        # `mosaic_tiling.plan`): the reduced axis must be a multiple of 32, and
-        # at most one non-reduced axis may be non-degenerate. Everything else
-        # raises `NotImplementedError` by design, so report those as skips
-        # rather than failures -- a real bug still surfaces as a failure.
+        # `mosaic_tiling.plan`): whichever axis the tile blocks needs a divisor
+        # that is a multiple of the tiling, and the tile has to fit SMEM.
+        # Everything else raises `NotImplementedError` by design, so report those
+        # as skips rather than failures -- a real bug still surfaces as a failure.
         op = mosaic.PallasMosaicGpuNormalization()
 
         def norm_fn(*args, **kwargs):
@@ -137,7 +138,7 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
         config = dict(block_m=32, block_n=None, num_warps=4)
         op = mosaic.PallasMosaicGpuNormalization(
             config=triton_config.Config(**config),
-            vjp=mosaic_vjp.PallasMosaicGpuNormalizationVjp(
+            vjp=pallas_triton_vjp.PallasTritonNormalizationVjp(
                 config=vjp_config.Config(**config)
             ),
         )
@@ -199,52 +200,44 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
         chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
 
 
-class BlockSizeTest(absltest.TestCase):
-    """`B` is blocked by a divisor; `M` is not (see `mosaic_tiling.Plan`)."""
+class DivisorsTest(absltest.TestCase):
+    """Blocks must tile `M` exactly: cp.async cannot predicate an OOB copy."""
 
-    def test_largest_divisor(self):
-        for n, cap, expected in [
-            (8, 8, 8),
-            (8, 16, 8),  # cap above n
-            (6, 8, 6),
-            (12, 8, 6),  # 8 does not divide 12
-            (7, 4, 1),  # prime
-        ]:
-            got = mosaic_tiling.largest_divisor(n, cap)
-            self.assertEqual(got, expected, (n, cap))
+    def test_divisors_descend_and_divide(self):
+        got = list(mosaic_tiling.divisors(96, 32, multiple_of=8))
+        self.assertEqual(got, [32, 24, 16, 8])
 
-    def test_warp_aligned_block(self):
-        for rows, cap, expected in [
-            (256, 32, 32),
-            (12, 8, 8),  # 8 does not divide 12; the last block slides back
-            (12, 32, 12),  # cap above rows
-            (4096, 4, 4),
-            (2, 32, 2),  # 2 rows cannot fill four warps: no rounding to do
-            (7, 32, 4),  # odd
-        ]:
-            got = mosaic_tiling.warp_aligned_block(rows, cap)
-            self.assertEqual(got, expected, (rows, cap))
+    def test_divisors_respects_the_cap_and_the_multiple(self):
+        self.assertEqual(list(mosaic_tiling.divisors(12, 8, multiple_of=8)), [])
+        self.assertEqual(list(mosaic_tiling.divisors(64, 128, multiple_of=8)),
+                         [64, 32, 16, 8])
 
-    def test_with_usable_block_m_floors_at_four(self):
-        """The Triton heuristic bottoms out at 1, which cannot fill the warps."""
-        for block_m, expected in [(1, 4), (2, 4), (4, 4), (32, 32)]:
-            config = triton_config.Config(
-                block_m=block_m, block_n=None, num_warps=4
-            )
-            got = mosaic_tiling.with_usable_block_m(config)
-            self.assertEqual(got.block_m, expected)
-            # Everything else is left alone.
-            self.assertEqual((got.block_n, got.num_warps), (None, 4))
+
+@contextlib.contextmanager
+def _target_ampere():
+    """Makes Mosaic lower for sm_80 rather than for the local device.
+
+    Mosaic takes the target from the default device's `compute_capability` and
+    falls back to `(9, 0)` when there is none (`mosaic_gpu/core.py:_infer_arch`).
+    On a machine with no GPU -- every machine that runs this test in CI --
+    `lowering_platforms=('cuda',)` alone would stamp the module as Hopper, and
+    the kernel would take the TMA path rather than the `cp.async` one it will
+    actually run on. Overriding the private `_infer_arch` is the only way in:
+    `AbstractDevice` has no `compute_capability` field.
+    """
+    with mock.patch.object(mgpu_core, '_infer_arch', lambda: (8, 0)):
+        yield
 
 
 class AmpereLoweringTest(parameterized.TestCase):
     """Lowers the kernels for Ampere, on whatever machine is running the test.
 
-    `--tokamax_cross_compile` drops the hardware checks and `lowering_platforms`
-    picks the target, so no GPU is needed: `.lower()` runs the whole Mosaic
-    pipeline -- layout inference, the SMEM scratch for a cross-warp reduction,
-    NVVM -- which is where a bad layout shows up. Only `.compile()`, i.e. PTX and
-    the register allocator, needs the real device.
+    `--tokamax_cross_compile` drops the hardware checks, `lowering_platforms`
+    picks the backend and `_target_ampere` picks the arch, so no GPU is needed:
+    `.lower()` runs the whole Mosaic pipeline -- layout inference, the SMEM
+    scratch for a cross-warp reduction, NVVM -- which is where a bad layout shows
+    up. Only `.compile()`, i.e. PTX and the register allocator, needs the real
+    device.
 
     Configs are explicit because the heuristics ask the local device for its core
     count, and because the block sizes are what select the case in
@@ -255,24 +248,24 @@ class AmpereLoweringTest(parameterized.TestCase):
         config = dict(block_m=block_m, block_n=block_n, num_warps=4)
         return mosaic.PallasMosaicGpuNormalization(
             config=triton_config.Config(**config),
-            vjp=mosaic_vjp.PallasMosaicGpuNormalizationVjp(
+            vjp=pallas_triton_vjp.PallasTritonNormalizationVjp(
                 config=vjp_config.Config(**config)
             ),
         )
 
     def _lower(self, shape, *, axis, block_m, block_n, use_params, subtract_mean):
+        """Lowers the forward kernel for sm_80.
+
+        Forward only: gradients go through the Triton VJP until the Mosaic one
+        is ported, and the Triton backend cannot lower without a real device.
+        """
         op = self._op(block_m=block_m, block_n=block_n)
         x = jnp.zeros(shape, jnp.float32)
         params = jnp.zeros((shape[axis],), jnp.float32) if use_params else None
-
-        def loss(x, scale, offset):
-            y = op(x, scale, offset, axis=axis, subtract_mean=subtract_mean)
-            return jnp.sum(y)
-
-        # Take the gradient so that the VJP kernel lowers too.
-        argnums = (0, 1, 2) if use_params else (0,)
-        f = jax.jit(jax.grad(loss, argnums=argnums))
-        with config_lib.cross_compile(True):
+        f = jax.jit(
+            lambda x, s, o: op(x, s, o, axis=axis, subtract_mean=subtract_mean)
+        )
+        with config_lib.cross_compile(True), _target_ampere():
             return f.trace(x, params, params).lower(
                 lowering_platforms=('cuda',)
             ).as_text()
@@ -281,92 +274,42 @@ class AmpereLoweringTest(parameterized.TestCase):
         (
             # One case per branch of `mosaic_tiling.plan`.
             dict(shape=(4096, 128), axis=-1, block_m=32, block_n=None),
+            # `block_m` shrinks to fit SMEM as the reduced axis grows.
+            dict(shape=(4096, 1024), axis=-1, block_m=32, block_n=None),
+            # Rows that the cap does not divide: a smaller divisor is taken.
+            dict(shape=(104, 128), axis=-1, block_m=32, block_n=None),
+            # Strided: the reduced axis is not the contiguous one, so the tile
+            # is `(A, block_b)` and the reduction runs down its slow axis.
             dict(shape=(8, 128, 256), axis=1, block_m=32, block_n=32),
-            # Rows that no block size divides: the last block slides back and
-            # the VJP has to mask the rows it repeats.
-            dict(shape=(100, 128), axis=-1, block_m=32, block_n=None),
-            # Both cases where the slow axis cannot supply the warps, so the
-            # contiguous one does: 6 rows of `M`, and a reduced axis of 6.
-            dict(shape=(6, 256), axis=-1, block_m=32, block_n=None),
-            dict(shape=(4, 6, 256), axis=1, block_m=32, block_n=128),
+            # `block_n` that the trailing axis does not divide.
+            dict(shape=(4, 32, 96), axis=1, block_m=32, block_n=64),
         ),
         use_params=(False, True),
         subtract_mean=(False, True),
     )
     def test_lowers(self, **kwargs):
         hlo = self._lower(**kwargs)
-        # The forward and the VJP, and nothing that fell back to XLA.
-        self.assertEqual(hlo.count('custom_call @mosaic_gpu_v2'), 2, msg=hlo)
-
-    @parameterized.named_parameters(
-        # `dscale` per batch element: `scale` is shared, but each element's
-        # gradient is asked for separately.
-        ('_vmap_of_grad', True, ((4, 4096, 128), (4, 128), (4, 128))),
-        # `dscale` summed over the batch: one gradient for the shared `scale`.
-        ('_grad_of_vmap', False, ((4, 4096, 128), (128,), (128,))),
-    )
-    def test_vmap_lowers_with_the_gradients_the_caller_asked_for(
-        self, grad_inside, expected
-    ):
-        """Both `vmap` orders, which disagree about the shape of `dscale`.
-
-        Folding the batch into `M` can only ever produce the summed form, so
-        under `vmap` the VJP leaves batching to JAX -- see
-        `mosaic.PallasMosaicGpuNormalization._rule`. Getting this wrong is not a
-        crash: the fold
-        returns a summed gradient where a per-element one belongs, which JAX
-        broadcasts, so every element silently gets the batch's total.
-        """
-        op = self._op(block_m=32, block_n=None)
-        x = jnp.zeros((4, 4096, 128), jnp.float32)
-        params = jnp.zeros((128,), jnp.float32)
-        loss = lambda x, scale, offset: jnp.sum(op(x, scale, offset))
-        if grad_inside:
-            f = jax.vmap(jax.grad(loss, argnums=(0, 1, 2)), in_axes=(0, None, None))
-        else:
-            batched = lambda x, s, o: jnp.sum(jax.vmap(lambda xi: op(xi, s, o))(x))
-            f = jax.grad(batched, argnums=(0, 1, 2))
-
-        with config_lib.cross_compile(True):
-            hlo = str(
-                jax.jit(f)
-                .trace(x, params, params)
-                .lower(lowering_platforms=('cuda',))
-                .as_text()
-            )
-            grads = jax.eval_shape(f, x, params, params)
-
-        self.assertEqual(hlo.count('custom_call @mosaic_gpu_v2'), 2, msg=hlo)
-        shapes = tuple(g.shape for g in jax.tree.leaves(grads))
-        self.assertEqual(shapes, expected)
-
+        # The forward kernel, and nothing that fell back to XLA.
+        self.assertEqual(hlo.count('custom_call @mosaic_gpu_v2'), 1, msg=hlo)
 
     def test_batched_params_lower(self):
-        """`vmap` may give each element its own `scale`/`offset`.
-
-        The kernel then reads the row's own element rather than a shared param,
-        which is why blocks must not straddle a batch boundary. Both directions
-        have to handle it: a forward that folds and a VJP that raised would push
-        the failure to grad time.
-        """
+        """`vmap` may give each element its own `scale`/`offset`."""
         op = self._op(block_m=32, block_n=None)
         x = jnp.zeros((3, 128, 32), jnp.float32)
         params = jnp.zeros((3, 32), jnp.float32)
-        loss = lambda x, scale, offset: jnp.sum(op(x, scale, offset))
-        f = jax.vmap(jax.grad(loss, argnums=(0, 1, 2)))
+        f = jax.vmap(lambda x, s, o: op(x, s, o))
 
-        with config_lib.cross_compile(True):
+        with config_lib.cross_compile(True), _target_ampere():
             hlo = str(
                 jax.jit(f)
                 .trace(x, params, params)
                 .lower(lowering_platforms=('cuda',))
                 .as_text()
             )
-            grads = jax.eval_shape(f, x, params, params)
+            out = jax.eval_shape(f, x, params, params)
 
-        self.assertEqual(hlo.count('custom_call @mosaic_gpu_v2'), 2, msg=hlo)
-        shapes = tuple(g.shape for g in jax.tree.leaves(grads))
-        self.assertEqual(shapes, ((3, 128, 32), (3, 32), (3, 32)))
+        self.assertEqual(hlo.count('custom_call @mosaic_gpu_v2'), 1, msg=hlo)
+        self.assertEqual(out.shape, (3, 128, 32))
 
 
 class PlanTest(absltest.TestCase):
@@ -374,108 +317,104 @@ class PlanTest(absltest.TestCase):
 
     F32 = 4
 
-    def test_degenerate_1d_is_declined(self):
-        """A single row leaves a statistic Mosaic cannot store. See `plan`."""
-        with self.assertRaisesRegex(NotImplementedError, 'single-element'):
-            mosaic_tiling.plan((1, 128, 1), self.F32, block_m=32, block_b=1)
+    def test_block_divides_the_rows(self):
+        p = mosaic_tiling.plan(4096, 128, self.F32, block_m=32)
+        self.assertEqual(p.block_m, 32)
+        self.assertEqual(4096 % p.block_m, 0)
+        self.assertEqual(p.steps, 128)
 
-    def test_reduced_axis_needs_multiple_of_32_for_the_warp_row_layout(self):
-        with self.assertRaisesRegex(NotImplementedError, 'multiple of 32'):
-            mosaic_tiling.plan((8, 48, 1), self.F32, block_m=32, block_b=1)
-
-    def test_reduced_axis_needs_multiple_of_128_for_the_row_layout(self):
-        # 2 rows cannot feed the warps, so the whole warpgroup covers a row.
-        with self.assertRaisesRegex(NotImplementedError, 'multiple of 128'):
-            mosaic_tiling.plan((2, 96, 1), self.F32, block_m=32, block_b=1)
-
-    def test_short_m_overlaps_rather_than_shrinking_the_block(self):
-        # 6 rows: no multiple of 4 divides them, but a block of 4 still fits
-        # twice if the second one slides back over the first.
-        p = mosaic_tiling.plan((6, 256, 1), self.F32, block_m=32, block_b=1)
-        self.assertEqual((p.block_m, p.grid, p.overlaps), (4, (2, 1), True))
-        self.assertEqual(
-            p.layout, mosaic_tiling.make_layout(4, 256, self.F32)
-        )
-
-    def test_reduced_axis_contiguous(self):
-        p = mosaic_tiling.plan((256, 128, 1), self.F32, block_m=32, block_b=1)
-        self.assertEqual((p.block_m, p.block_b), (32, 1))
-        self.assertEqual(p.x_shape, (256, 128))
-        self.assertEqual(p.stat_shape, (256,))
-        self.assertEqual((p.grid, p.overlaps), ((8, 1), False))
-        self.assertEqual(p.dparam_shape, (8, 1, 128))
-        # `A` is the tile's fast axis, so it is reduced within a warp, and the
-        # params are reduced over `M`, which crosses warps.
-        self.assertEqual((p.reduce_axis, p.stat_axis), (1, 0))
-
-    def test_reduced_axis_strided(self):
-        p = mosaic_tiling.plan((4, 32, 256), self.F32, block_m=32, block_b=128)
-        # `M` goes entirely to the grid.
-        self.assertEqual((p.block_m, p.block_b), (1, 128))
-        self.assertEqual(p.x_shape, (4, 32, 256))
-        self.assertEqual(p.stat_shape, (4, 256))
-        self.assertEqual(p.grid, (4, 2))
-        self.assertEqual(p.dparam_shape, (4, 2, 32))
-        self.assertEqual((p.reduce_axis, p.stat_axis), (0, 1))
-
-    def test_layouts_are_constructible(self):
-        for x_shape in [(256, 128, 1), (4, 32, 256), (6, 256, 1)]:
-            p = mosaic_tiling.plan(x_shape, self.F32, block_m=32, block_b=128)
-            # `to_mgpu` is where a bad tiling or partitioning would blow up.
-            p.layout.to_mgpu()
-            p.layout.reduce((p.reduce_axis,)).to_mgpu()  # A statistic.
-            p.layout.reduce((p.stat_axis,)).to_mgpu()  # An `A`-indexed param.
-
-    def test_row_grid_splits_over_two_axes(self):
-        grid_m = 1 << 17  # Over the 65535 cap on gridDim.y/.z.
-        p = mosaic_tiling.plan((4 * grid_m, 128, 1), self.F32, block_m=4, block_b=1)
-        self.assertEqual(p.grid_names, ('mo', 'm', 'b'))
-        outer, inner, _ = p.grid
-        self.assertLessEqual(max(outer, inner), 65535)
-        self.assertEqual(inner, p.split_m)
-        # The split need not be exact: a leftover block lands on the last one.
-        self.assertGreaterEqual(outer * inner, grid_m)
-        self.assertLess(outer * inner, grid_m + outer)
-
-    def test_row_grid_splits_when_it_does_not_factor(self):
-        """The old divisor-based split had no answer for a prime row grid."""
-        prime = 65599  # Over the cap, and its only divisor below it is 1.
-        p = mosaic_tiling.plan((4 * prime, 128, 1), self.F32, block_m=4, block_b=1)
-        outer, inner, _ = p.grid
-        self.assertLessEqual(max(outer, inner), 65535)
-        self.assertGreaterEqual(outer * inner, prime)
-        self.assertTrue(p.overlaps)
-
-    def test_split_grid_can_leave_a_spare_block_of_a_scalar_indexed_m(self):
-        """`M` on the grid, so a spare block repeats a whole row, not part of one.
-
-        `Plan.drop_duplicate_rows` has to zero all of it rather than masking a
-        tile axis that this case does not have.
-        """
-        p = mosaic_tiling.plan((70001, 32, 256), self.F32, block_m=32, block_b=128)
-        self.assertEqual((p.block_m, p.overlaps), (1, True))
-        outer, inner, _ = p.grid
-        self.assertEqual(outer * inner, 70002)
-
-    def test_block_m_is_warp_aligned(self):
-        """The block fills four warps; it need not divide the rows."""
-        p = mosaic_tiling.plan((12, 128, 1), self.F32, block_m=8, block_b=1)
+    def test_block_falls_to_a_divisor_under_the_cap(self):
+        # 32 does not divide 104; 8 is the largest multiple of 8 that does.
+        p = mosaic_tiling.plan(104, 128, self.F32, block_m=32)
         self.assertEqual(p.block_m, 8)
-        self.assertEqual((p.grid, p.overlaps), ((2, 1), True))
+        self.assertEqual(p.steps, 13)
 
-    def test_no_warp_aligned_block_falls_back(self):
-        """2 rows cannot fill four warps, so `A` supplies them instead."""
-        p = mosaic_tiling.plan((2, 128, 1), self.F32, block_m=32, block_b=1)
-        self.assertEqual((p.block_m, p.grid, p.overlaps), (2, (1, 1), False))
-        self.assertEqual(
-            p.layout, mosaic_tiling.make_layout(2, 128, self.F32)
-        )
+    def test_rows_must_be_a_multiple_of_the_tiling(self):
+        with self.assertRaisesRegex(NotImplementedError, 'multiple of 8'):
+            mosaic_tiling.plan(100, 128, self.F32, block_m=32)
 
-    def test_register_budget(self):
-        with self.assertRaisesRegex(NotImplementedError, 'spill'):
-            mosaic_tiling.plan(
-                (256, 1 << 16, 1), self.F32, block_m=32, block_b=1
-            )
+    def test_reduced_axis_must_be_a_multiple_of_32(self):
+        with self.assertRaisesRegex(NotImplementedError, 'multiple of 32'):
+            mosaic_tiling.plan(4096, 48, self.F32, block_m=32)
+
+    def test_block_shrinks_to_fit_smem(self):
+        """A long row is paid for in `block_m`, not declined outright."""
+        wide = mosaic_tiling.plan(4096, 2048, self.F32, block_m=32)
+        narrow = mosaic_tiling.plan(4096, 128, self.F32, block_m=32)
+        self.assertLess(wide.block_m, narrow.block_m)
+        self.assertLessEqual(wide.smem_bytes(), 227 * 1024)
+
+    def test_reduced_axis_can_be_too_wide_for_smem(self):
+        with self.assertRaisesRegex(NotImplementedError, 'SMEM'):
+            mosaic_tiling.plan(4096, 8192, self.F32, block_m=32)
+
+    def test_ctas_cover_every_step(self):
+        p = mosaic_tiling.plan(4096, 128, self.F32, block_m=32)
+        self.assertGreaterEqual(p.num_ctas * p.steps_per_cta, p.steps)
+        # A CTA handed fewer steps re-reads its last tile rather than going OOB.
+        self.assertLess((p.num_ctas - 1) * p.steps_per_cta, p.steps)
+
+    def test_strided_blocks_the_trailing_axis(self):
+        """`B > 1`: a tile holds one row of `M` and a block of `B`."""
+        p = mosaic_tiling.plan(24, 32, self.F32, block_m=32, num_b=256,
+                               block_b=32)
+        self.assertEqual((p.block_m, p.block_b), (1, 32))
+        self.assertEqual(p.tile_shape, (32, 32))
+        self.assertEqual(p.block_shape, (None, 32, 32))
+        self.assertEqual(p.steps, 24 * 8)
+        # The reduction runs down the tile's slow axis, which `A` spans.
+        self.assertEqual(p.reduce_axis, 0)
+
+    def test_strided_reduced_axis_must_be_a_multiple_of_8(self):
+        # `A` is the tiled axis here, so 8 divides it rather than 32.
+        mosaic_tiling.plan(24, 8, self.F32, block_m=32, num_b=256, block_b=32)
+        with self.assertRaisesRegex(NotImplementedError, 'multiple of 8'):
+            mosaic_tiling.plan(24, 36, self.F32, block_m=32, num_b=256,
+                               block_b=32)
+
+    def test_strided_trailing_axis_needs_a_usable_block(self):
+        with self.assertRaisesRegex(NotImplementedError, 'no divisor'):
+            mosaic_tiling.plan(24, 32, self.F32, block_m=32, num_b=48,
+                               block_b=32)
+
+    def test_every_tile_is_visited_exactly_once(self):
+        """The flat step index splits into a block of `M` and a block of `B`.
+
+        The whole array has to be covered, and -- because the statistics are
+        written per tile -- no tile may be visited twice, other than the clamped
+        repeats of the very last one.
+        """
+        for kwargs in (
+            dict(num_b=256, block_b=32),  # Strided.
+            dict(),  # Contiguous.
+            dict(num_b=96, block_b=64),  # Steps the CTAs do not divide evenly.
+        ):
+            with self.subTest(**kwargs):
+                p = mosaic_tiling.plan(24, 32, self.F32, block_m=32, **kwargs)
+                seen = []
+                for cta in range(p.num_ctas):
+                    with mock.patch.object(
+                        jax.lax, 'axis_index', lambda _, cta=cta: cta
+                    ):
+                        for step in range(p.steps_per_cta):
+                            i, j = p.tile_indices(step)
+                            seen.append((int(i), int(j)))
+                expected = [
+                    (i, j)
+                    for i in range(p.num_m // p.block_m)
+                    for j in range(p.steps_b)
+                ]
+                self.assertEqual(sorted(set(seen)), expected)
+                # Only the last tile may repeat, and only as the clamped tail.
+                repeats = len(seen) - len(set(seen))
+                self.assertEqual(
+                    seen[len(seen) - repeats:], [expected[-1]] * repeats
+                )
+
+    def test_a_single_block_needs_no_pipeline(self):
+        p = mosaic_tiling.plan(8, 128, self.F32, block_m=32)
+        self.assertEqual((p.block_m, p.steps, p.num_ctas), (8, 1, 1))
+        self.assertEqual(p.num_stages, 1)
 
 
 if __name__ == '__main__':
