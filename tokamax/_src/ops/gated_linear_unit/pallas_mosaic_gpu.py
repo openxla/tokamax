@@ -29,6 +29,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_kernel_sm100 as sm100
+from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_kernel_sm80 as sm80
 from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_kernel_sm90 as sm90
 
 
@@ -40,9 +41,13 @@ type Key = immutabledict.immutabledict[str, Any]
 def _get_kernel_module():
   if not gpu_utils.has_mosaic_gpu_support():
     raise NotImplementedError("Mosaic GPU not supported on this platform.")
-  if not (gpu_utils.is_sm90() or gpu_utils.is_sm100()):
-    raise NotImplementedError("Only supported for sm90 and sm100 GPUs.")
-  return sm100 if gpu_utils.is_sm100() else sm90
+  if gpu_utils.is_sm100():
+    return sm100
+  if gpu_utils.is_sm90():
+    return sm90
+  if gpu_utils.is_sm80():
+    return sm80
+  raise NotImplementedError("Only supported for sm80, sm90, and sm100 GPUs.")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -53,7 +58,11 @@ class PallasMosaicGpuGatedLinearUnit(base.GatedLinearUnit[Config, Key]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return gpu_utils.is_sm90(device) or gpu_utils.is_sm100(device)
+    return (
+        gpu_utils.is_sm80(device)
+        or gpu_utils.is_sm90(device)
+        or gpu_utils.is_sm100(device)
+    )
 
   @override
   def _fwd(
