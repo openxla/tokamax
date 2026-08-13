@@ -82,161 +82,93 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
     has_scale = scale is not None
     has_offset = offset is not None
 
-    # `x` may hold `axis_size` `vmap` elements folded into its leading axis, in
-    # which case `scale` has one row each and the param gradients come back one
-    # per element. See `_rule` below; `axis_size == 1` is the unbatched call.
-    def launch(dout, x, mean, rstddev, scale, axis_size):
-      num_rows, num_a, num_b = x.shape
-      rows_per_element = num_rows // axis_size
-      p = mosaic_tiling.plan(
-        (num_rows, num_a, num_b),
-        dtype.itemsize,
-        block_m=config.block_m,
-        block_b=config.block_n or 1,
-        rows_per_element=rows_per_element,
-      )
-      blocks_per_element = rows_per_element // p.block_m
-
-      def kernel(*refs):
-        it = iter(refs)  # Inputs then outputs, optional ones only if present.
-        take = lambda present: next(it) if present else None
-        dout_ref, x_ref = next(it), next(it)
-        scale_ref, mean_ref = take(has_scale), take(subtract_mean)
-        rstddev_ref, dx_ref = next(it), next(it)
-        dscale_ref, doffset_ref = take(has_scale), take(has_offset)
-        x_idx, stat_idx, dparam_idx, pid_m = p.indices()
-        # `scale` has a row per batch element, and this block lies inside one.
-        element = 0 if axis_size == 1 else pid_m // blocks_per_element
-
-        # Reducing away `A` leaves the layout a per-row statistic has.
-        stat_layout = p.layout.reduce((p.reduce_axis,))
-
-        def load_stat(ref):
-          return plgpu.load(ref.at[stat_idx], layout=stat_layout,
-            optimized=False).astype(jnp.float32)
-
-        x_norm = plgpu.load(x_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
-        bcast = lambda a: p.bcast(a, x_norm.shape)
-        if mean_ref is not None:
-          x_norm -= bcast(load_stat(mean_ref))
-        rstddev = load_stat(rstddev_ref)
-        x_norm *= bcast(rstddev)
-
-        dout = plgpu.load(dout_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
-        if doffset_ref is not None:
-          doffset_ref[dparam_idx] = jnp.sum(dout, axis=p.stat_axis)
-        if dscale_ref is not None:
-          dscale_ref[dparam_idx] = jnp.sum(dout * x_norm, axis=p.stat_axis)
-        if scale_ref is not None:
-          dout *= p.read_param(scale_ref.at[element], dout.shape) + scale_offset
-
-        # `dx = (dout - mean(dout * x_norm) * x_norm - mean(dout)) * rstddev`;
-        # see `base.NormalizationVjp`. The last term is zero for RMS norm, whose
-        # mean was never subtracted in the first place.
-        dx = dout - bcast(jnp.mean(dout * x_norm, axis=p.reduce_axis)) * x_norm
-        if mean_ref is not None:
-          dx -= bcast(jnp.mean(dout, axis=p.reduce_axis))
-        dx_ref[x_idx] = (dx * bcast(rstddev)).astype(dtype)
-
-      dparam = jax.ShapeDtypeStruct(p.dparam_shape, jnp.float32)
-      outs = plgpu.kernel(
-        kernel,
-        out_type=(
-          jax.ShapeDtypeStruct(p.x_shape, dtype),
-          *[dparam] * (has_scale + has_offset),
-        ),
-        grid=p.grid,
-        grid_names=p.grid_names,
-        compiler_params=mosaic_tiling.LANE_SEMANTICS,
-      )(
-        dout.reshape(p.x_shape),
-        x.reshape(p.x_shape),
-        *([scale] if has_scale else []),
-        *([mean.reshape(p.stat_shape)] if mean is not None else []),
-        rstddev.reshape(p.stat_shape),
-      )
-
-      # Finish the cross-block reduction here rather than in the kernel: XLA does
-      # it in one pass over an array that is `grid` big, not `x` big. Splitting
-      # the block axis first keeps each batch element's partials to itself, which
-      # is the whole reason blocks were kept from straddling a boundary.
-      def sum_partials(o):
-        o = o.reshape(axis_size, blocks_per_element, *o.shape[1:])
-        return jnp.sum(o, axis=(1, 2))
-
-      return (
-        outs[0].reshape(num_rows, num_a, num_b),
-        *(sum_partials(o) for o in outs[1:]),
-      )
-
     for name, stat in (('mean', mean), ('rstddev', rstddev)):
       if stat is not None and stat.dtype != jnp.float32:
         raise ValueError(f'`{name}` must be `float32`, got {stat.dtype}.')
 
-    def launch_one(dout, x, mean, rstddev, scale):
-      """One batch element: 1D `scale` in, 1D param gradients out."""
-      dx, *dparams = launch(
-        dout, x, mean, rstddev, None if scale is None else scale[jnp.newaxis], 1
-      )
-      return (dx, *(p[0] for p in dparams))
-
-    canonical = lambda a: a.reshape(num_m, num_a, num_b)
-    as_stat = lambda a: None if a is None else a.reshape(num_m, num_b)
-    # `scale` is last because it is the one argument not indexed by row.
-    args = (
-      canonical(dout), canonical(x), as_stat(mean), as_stat(rstddev), scale
+    p = mosaic_tiling.plan(
+      (num_m, num_a, num_b),
+      dtype.itemsize,
+      block_m=config.block_m,
+      block_b=config.block_n or 1,
     )
-    # `custom_vmap` reports one `in_batched` flag per positional argument, so the
-    # optional ones are dropped here and put back inside.
-    present = [a is not None for a in args]
 
-    def launch_present(*present_args):
-      it = iter(present_args)
-      return launch_one(*[next(it) if p else None for p in present])
+    def kernel(*refs):
+      it = iter(refs)  # Inputs then outputs, optional ones only if present.
+      take = lambda present: next(it) if present else None
+      dout_ref, x_ref = next(it), next(it)
+      scale_ref, mean_ref = take(has_scale), take(subtract_mean)
+      rstddev_ref, dx_ref = next(it), next(it)
+      dscale_ref, doffset_ref = take(has_scale), take(has_offset)
+      x_idx, stat_idx, dparam_idx, skip = p.indices()
 
-    f = jax.custom_batching.custom_vmap(launch_present)
+      # Reducing away `A` leaves the layout a per-row statistic has.
+      stat_layout = p.layout.reduce((p.reduce_axis,))
 
-    @f.def_vmap
-    def _rule(axis_size, in_batched, *args):
-      """Folds the batch into `M`, as the forward's own `_rule` does.
+      def load_stat(ref):
+        return plgpu.load(ref.at[stat_idx], layout=stat_layout,
+          optimized=False).astype(jnp.float32)
 
-      Two things stop this from being that function. `dscale`/`doffset` are
-      reduced over rows, so the fold would sum them over the batch as well --
-      right for `vjp(vmap(f))`, where the params are shared, wrong for
-      `vmap(grad(f))`, which wants one per element. And `scale` arrives batched
-      whatever the caller's `in_axes`, because `op.Op` keeps it in the
-      `custom_vjp` residuals, which JAX batches wholesale. So the launch keeps
-      each element's rows in its own blocks and hands back per-element gradients;
-      for a shared param, transposing its broadcast sums them again for free.
+      x_norm = plgpu.load(x_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
+      bcast = lambda a: p.bcast(a, x_norm.shape)
+      if mean_ref is not None:
+        x_norm -= bcast(load_stat(mean_ref))
+      rstddev = load_stat(rstddev_ref)
+      x_norm *= bcast(rstddev)
 
-      Leaving the batching to JAX is not an option: the generic rule prepends a
-      grid axis, renumbering the `pl.program_id`s that `Plan.indices` reads, and
-      only the first row-block of each element ends up written.
-      """
-      if not any(in_batched):
-        out = f(*args)
-        return out, jax.tree.map(lambda _: False, out)
+      dout = plgpu.load(dout_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
+      # These two are the only sums over rows, so they are the only place a row
+      # this block shares with its predecessor would be counted twice.
+      if doffset_ref is not None:
+        doffset_ref[dparam_idx] = jnp.sum(
+          p.drop_duplicate_rows(dout, skip), axis=p.stat_axis
+        )
+      if dscale_ref is not None:
+        dscale_ref[dparam_idx] = jnp.sum(
+          p.drop_duplicate_rows(dout * x_norm, skip), axis=p.stat_axis
+        )
+      if scale_ref is not None:
+        dout *= p.read_param(scale_ref, dout.shape) + scale_offset
 
-      args = mosaic_tiling.broadcast_unbatched(args, in_batched, axis_size)
-      rows, scale = (args[:-1], args[-1]) if has_scale else (args, None)
-      fold = lambda a: a.reshape(axis_size * a.shape[1], *a.shape[2:])
-      it = iter([fold(a) for a in rows])
-      dout, x = next(it), next(it)
-      mean = next(it) if subtract_mean else None
-      rstddev = next(it)
+      # `dx = (dout - mean(dout * x_norm) * x_norm - mean(dout)) * rstddev`;
+      # see `base.NormalizationVjp`. The last term is zero for RMS norm, whose
+      # mean was never subtracted in the first place.
+      dx = dout - bcast(jnp.mean(dout * x_norm, axis=p.reduce_axis)) * x_norm
+      if mean_ref is not None:
+        dx -= bcast(jnp.mean(dout, axis=p.reduce_axis))
+      dx_ref[x_idx] = (dx * bcast(rstddev)).astype(dtype)
 
-      # No per-element fallback: blocks are kept inside one element either way,
-      # so a launch per element plans exactly the same blocks as the fold and
-      # would decline the same shapes, only slower.
-      dx, *dparams = launch(dout, x, mean, rstddev, scale, axis_size)
-      dx = dx.reshape(axis_size, dx.shape[0] // axis_size, *dx.shape[1:])
-      return (dx, *dparams), (True,) * (1 + len(dparams))
+    dparam = jax.ShapeDtypeStruct(p.dparam_shape, jnp.float32)
+    as_stat = lambda a: a.reshape(p.stat_shape)
+    # As in the forward, the launch is the only thing `vmap` cannot batch on its
+    # own, and `plgpu.kernel`'s own rule handles it. The param gradients then
+    # come back one per batch element, which is what `vmap(grad(f))` asks for;
+    # for a shared param -- `grad(vmap(f))` -- transposing its broadcast sums
+    # them again for free.
+    outs = plgpu.kernel(
+      kernel,
+      out_type=(
+        jax.ShapeDtypeStruct(p.x_shape, dtype),
+        *[dparam] * (has_scale + has_offset),
+      ),
+      grid=p.grid,
+      grid_names=p.grid_names,
+      compiler_params=mosaic_tiling.LANE_SEMANTICS,
+    )(
+      dout.reshape(p.x_shape),
+      x.reshape(p.x_shape),
+      *([scale] if has_scale else []),
+      *([as_stat(mean)] if mean is not None else []),
+      as_stat(rstddev),
+    )
 
-    outs = list(f(*[a for a in args if a is not None]))
-
+    # Finish the cross-block reduction here rather than in the kernel: XLA does
+    # it in one pass over an array that is `grid` big, not `x` big.
+    outs = list(outs)
     dx = outs.pop(0).reshape(orig_x_shape)
-    dscale = outs.pop(0).astype(scale.dtype) if has_scale else None
-    doffset = outs.pop(0).astype(offset.dtype) if has_offset else None
+    sum_partials = lambda o: jnp.sum(o, axis=(0, 1))
+    dscale = sum_partials(outs.pop(0)).astype(scale.dtype) if has_scale else None
+    doffset = sum_partials(outs.pop(0)).astype(offset.dtype) if has_offset else None
     return (dx, dscale, doffset), None
 
   @override
