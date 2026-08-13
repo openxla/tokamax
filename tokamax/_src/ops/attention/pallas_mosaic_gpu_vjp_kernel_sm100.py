@@ -491,12 +491,11 @@ def _kernel_dq(
     k_end = load_k_range(k_end_gmem)
 
     m = plgpu.load(m_gmem.at[hi, qs], layout=row_layout, optimized=False)
-    l = plgpu.load(l_gmem.at[hi, qs], layout=row_layout, optimized=False)
+    l_rcp = plgpu.load(l_gmem.at[hi, qs], layout=row_layout, optimized=False)
     delta = plgpu.load(
         delta_gmem.at[hi, qs], layout=row_layout, optimized=False
     )
     m *= math.log2(math.e)
-    l_rcp = 1.0 / (l + float(jnp.finfo(jnp.float32).tiny))
 
     @pl.loop(lb, ub)
     def kv_loop(ki):
@@ -833,7 +832,7 @@ def _kernel_dkv(
       logits = s
 
       m = plgpu.load(m_smem.at[si_res], layout=_TCGEN05_COL)
-      l = plgpu.load(l_smem.at[si_res], layout=_TCGEN05_COL)
+      l_rcp = plgpu.load(l_smem.at[si_res], layout=_TCGEN05_COL)
 
       # NOTE: This rescaling must happen after bias and soft-cap but before
       # the attention masking (as the multiplication will cause `-inf`s).
@@ -884,8 +883,7 @@ def _kernel_dkv(
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0
 
-      epsilon = float(jnp.finfo(jnp.float32).tiny)
-      p = jnp.exp2(s * scale - broadcast(m)) / broadcast(l + epsilon)
+      p = jnp.exp2(s * scale - broadcast(m)) * broadcast(l_rcp)
 
       plgpu.async_store_tmem(p_tmem, p.astype(p_tmem.dtype))
       mgpu_lib.tcgen05_wait_st()
@@ -977,6 +975,7 @@ def flash_attention_vjp_kernel(
   m, l = residuals
   m = shape_lib.pad_to_next_multiple_of(m, block_q_dq, -1, pad_value=1e9)
   l = shape_lib.pad_to_next_multiple_of(l, block_q_dq, -1, pad_value=1)
+  l_rcp = jnp.reciprocal(l + jnp.finfo(jnp.float32).tiny)
 
   delta = jnp.einsum(
       "...qhd,...qhd->...hq", out.astype(jnp.float32), dout.astype(jnp.float32)
@@ -1028,7 +1027,7 @@ def flash_attention_vjp_kernel(
       thread_name="wg",
       compiler_params=compiler_params,
       scratch_types=dq_scratch_shapes,
-  )(q, k, v, dout, m, l, delta, bias, k_start, k_end, mask)
+  )(q, k, v, dout, m, l_rcp, delta, bias, k_start, k_end, mask)
 
   dkv_shape = (
       jax.ShapeDtypeStruct(k.shape, k.dtype),
@@ -1068,7 +1067,7 @@ def flash_attention_vjp_kernel(
       thread_name="wg",
       compiler_params=compiler_params,
       scratch_types=dkv_scratch_shapes,
-  )(q, k, v, dout, m, l, delta, bias_dkv, k_start, k_end, mask_dkv)
+  )(q, k, v, dout, m, l_rcp, delta, bias_dkv, k_start, k_end, mask_dkv)
 
   dq = dq[:orig_q_seq_len, :, :orig_head_dim]
   dk = dk[:orig_kv_seq_len, :, :orig_head_dim]
