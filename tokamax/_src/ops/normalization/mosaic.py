@@ -14,11 +14,14 @@
 # ==============================================================================
 """Pallas-Mosaic-GPU normalization op.
 
-Normalization is memory-bound, so the design serves coalesced GMEM access:
-blocking, layouts and the grid all live in `mosaic_tiling`, shared with the VJP.
+Normalization is memory-bound, so the design serves coalesced GMEM access: tiles
+arrive through `plgpu.emit_pipeline`, which stages them with `cp.async` on
+Ampere and gives the next tile somewhere to land while this one is reduced.
+Blocking and the pipeline live in `mosaic_tiling`.
 
-Lane semantics is required: Warpgroup layout inference cannot solve a program
-containing a partial reduction, so layouts are explicit.
+There are no layout annotations. Inference derives the register layout from the
+staged SMEM ref's transforms, including for the partial reduction -- see
+`mosaic_tiling` for the one thing that has to be true of `jax` for that to hold.
 """
 
 import dataclasses
@@ -31,8 +34,8 @@ from tokamax._src import gpu_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import mosaic_tiling
-from tokamax._src.ops.normalization import mosaic_vjp
 from tokamax._src.ops.normalization import pallas_triton_config as triton_config
+from tokamax._src.ops.normalization import pallas_triton_vjp
 
 # Reuse the Triton config only for its cache key
 Config = triton_config.Config
@@ -50,7 +53,12 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
   def __post_init__(self):
     if self.vjp is None:
-      object.__setattr__(self, 'vjp', mosaic_vjp.PallasMosaicGpuNormalizationVjp())
+      # The Mosaic VJP has not been ported to the pipelined form yet, so borrow
+      # the Triton one: it takes the same residuals and runs on the same
+      # hardware. Leaving this `None` would not fall back -- `op.Op` tries to
+      # differentiate `_fwd` itself, which a Pallas kernel does not support, and
+      # gradients would raise instead.
+      object.__setattr__(self, 'vjp', pallas_triton_vjp.PallasTritonNormalizationVjp())
 
   @override
   def _fwd(
@@ -85,57 +93,88 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     has_offset = offset is not None
 
     p = mosaic_tiling.plan(
-      (num_m, num_a, num_b),
+      num_m,
+      num_a,
       dtype.itemsize,
       block_m=config.block_m,
-      block_b=config.block_n or 1,
+      num_b=num_b,
+      block_b=config.block_n,
     )
 
     def kernel(*refs):
       it = iter(refs)  # Inputs then outputs, optional ones only if present.
       take = lambda present: next(it) if present else None
-      x_ref, scale_ref, offset_ref = next(it), take(has_scale), take(has_offset)
-      y_ref, mean_ref = next(it), take(return_mean)
-      rstd_ref = take(return_residuals)
-      x_idx, stat_idx, _, _ = p.indices()
+      x_gmem, scale_ref, offset_ref = next(it), take(has_scale), take(has_offset)
+      y_gmem, mean_gmem = next(it), take(return_mean)
+      rstd_gmem = take(return_residuals)
+      out_smem = next(it)
 
-      x = plgpu.load(x_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
-      bcast = lambda a: p.bcast(a, x.shape)
+      def param(ref, shape):
+        """Reads a 1D param straight from GMEM and spreads it along `A`."""
+        a = plgpu.load(ref, optimized=False).astype(jnp.float32)
+        return jax.lax.broadcast_in_dim(a, shape, (p.reduce_axis,))
 
-      if subtract_mean:
-        mean = jnp.mean(x, axis=p.reduce_axis)
-        x -= bcast(mean)
-        if mean_ref is not None:
-          mean_ref[stat_idx] = mean
-      rstddev = jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=p.reduce_axis) + epsilon)
-      if rstd_ref is not None:
-        rstd_ref[stat_idx] = rstddev
-      x *= bcast(rstddev)
-      # `y = x_norm * (scale + scale_offset) + offset`; see `base.Normalization`.
-      if scale_ref is not None:
-        x *= p.read_param(scale_ref, x.shape) + scale_offset
-      if offset_ref is not None:
-        x += p.read_param(offset_ref, x.shape)
-      y_ref[x_idx] = x.astype(dtype)
+      def compute(step, x_smem):
+        (step,) = step
+        stat_index = p.stat_index(step)
+        x = x_smem[...].astype(jnp.float32)
+        # The stats span whichever tile axis `A` does not.
+        bcast = lambda a: jax.lax.broadcast_in_dim(
+          a, x.shape, (1 - p.reduce_axis,)
+        )
 
-    stat = jax.ShapeDtypeStruct(p.stat_shape, jnp.float32)
-    # Under `vmap` this launch is the only thing needing a batching rule, and
-    # `plgpu.kernel` brings its own: it prepends a grid axis and slices every
-    # batched ref by it. `Plan.indices` reads the grid by name, so the extra
-    # axis passes it by, and everything around here is plain JAX that `vmap`
-    # batches itself. (`batching.capture_batched_args` records the batch sizes
-    # for the heuristics but still calls `jax.vmap` over `_fwd`; see
-    # `batching.py`.)
+        if subtract_mean:
+          mean = jnp.mean(x, axis=p.reduce_axis)
+          x -= bcast(mean)
+          if mean_gmem is not None:
+            mean_gmem[stat_index] = mean
+        rstddev = jax.lax.rsqrt(
+          jnp.mean(jnp.square(x), axis=p.reduce_axis) + epsilon
+        )
+        if rstd_gmem is not None:
+          rstd_gmem[stat_index] = rstddev
+        x *= bcast(rstddev)
+        # `y = x_norm * (scale + scale_offset) + offset`; see `base.Normalization`.
+        if scale_ref is not None:
+          x *= param(scale_ref, x.shape) + scale_offset
+        if offset_ref is not None:
+          x += param(offset_ref, x.shape)
+
+        # Outputs are not pipelined (`emit_pipeline` is input-only pre-Hopper),
+        # so store by hand. Going through swizzled SMEM relayouts the tile so
+        # that the store to GMEM coalesces; storing straight from the reduction
+        # layout would emit scattered writes.
+        out_smem[...] = x.astype(dtype)
+        y_gmem[p.out_index(step)] = plgpu.layout_cast(
+          out_smem[...], p.store_layout
+        )
+
+      plgpu.emit_pipeline(
+        compute,
+        grid=(p.steps_per_cta,),
+        in_specs=[p.in_spec()],
+        max_concurrent_steps=p.num_stages,
+      )(x_gmem)
+
+    x_shape = (num_m, num_a, num_b) if p.strided else (num_m, num_a)
+    stat_shape = x_shape[:1] + x_shape[2:]
+    stat = jax.ShapeDtypeStruct(stat_shape, jnp.float32)
     outs = plgpu.kernel(
       kernel,
       out_type=(
-        jax.ShapeDtypeStruct(p.x_shape, dtype),
+        jax.ShapeDtypeStruct(x_shape, dtype),
         *[stat] * (return_mean + return_residuals),
       ),
-      grid=p.grid,
-      grid_names=p.grid_names,
-      compiler_params=mosaic_tiling.LANE_SEMANTICS,
-    )(x.reshape(p.x_shape), *[a for a in (scale, offset) if a is not None])
+      scratch_types=[
+        plgpu.SMEM(p.tile_shape, dtype, transforms=p.transforms),
+      ],
+      grid=(p.num_ctas,),
+      grid_names=('cta',),
+      compiler_params=mosaic_tiling.WARPGROUP_SEMANTICS,
+    )(
+      x.reshape(x_shape),
+      *[a for a in (scale, offset) if a is not None],
+    )
 
     y = outs[0].reshape(orig_x_shape)
     if not return_residuals:
@@ -161,5 +200,5 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    # No TMA, WGMMA or async copies: plain GMEM loads and stores run on Ampere.
+    # `cp.async` staging and plain GMEM stores: no TMA or WGMMA needed.
     return gpu_utils.has_mosaic_gpu_support(device)

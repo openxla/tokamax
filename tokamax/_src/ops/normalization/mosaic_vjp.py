@@ -19,6 +19,9 @@ axis `A`, which the forward's layout already makes cheap; `dscale`/`doffset`
 reduce over every *other* axis, which no single block owns, so each block writes
 a partial sum and a small XLA reduction finishes the job -- as in
 `pallas_triton_vjp`.
+
+Warpgroup semantics, as in the forward: one annotated tile load, inference for
+everything after it.
 """
 
 import dataclasses
@@ -102,21 +105,14 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
       dscale_ref, doffset_ref = take(has_scale), take(has_offset)
       x_idx, stat_idx, dparam_idx, skip = p.indices()
 
-      # Reducing away `A` leaves the layout a per-row statistic has.
-      stat_layout = p.layout.reduce((p.reduce_axis,))
-
-      def load_stat(ref):
-        return plgpu.load(ref.at[stat_idx], layout=stat_layout,
-          optimized=False).astype(jnp.float32)
-
-      x_norm = plgpu.load(x_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
+      x_norm = p.load(x_ref, x_idx)
       bcast = lambda a: p.bcast(a, x_norm.shape)
       if mean_ref is not None:
-        x_norm -= bcast(load_stat(mean_ref))
-      rstddev = load_stat(rstddev_ref)
+        x_norm -= bcast(p.load_row(mean_ref, stat_idx))
+      rstddev = p.load_row(rstddev_ref, stat_idx)
       x_norm *= bcast(rstddev)
 
-      dout = plgpu.load(dout_ref.at[x_idx], layout=p.layout, optimized=False).astype(jnp.float32)
+      dout = p.load(dout_ref, x_idx)
       # These two are the only sums over rows, so they are the only place a row
       # this block shares with its predecessor would be counted twice.
       if doffset_ref is not None:
@@ -128,7 +124,7 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
           p.drop_duplicate_rows(dout * x_norm, skip), axis=p.stat_axis
         )
       if scale_ref is not None:
-        dout *= p.read_param(scale_ref, dout.shape) + scale_offset
+        dout *= p.bcast_param(p.load_row(scale_ref, ...), dout.shape) + scale_offset
 
       # `dx = (dout - mean(dout * x_norm) * x_norm - mean(dout)) * rstddev`;
       # see `base.NormalizationVjp`. The last term is zero for RMS norm, whose
@@ -153,7 +149,7 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
       ),
       grid=p.grid,
       grid_names=p.grid_names,
-      compiler_params=mosaic_tiling.LANE_SEMANTICS,
+      compiler_params=mosaic_tiling.WARPGROUP_SEMANTICS,
     )(
       dout.reshape(p.x_shape),
       x.reshape(p.x_shape),

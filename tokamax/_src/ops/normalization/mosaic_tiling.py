@@ -12,14 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Blocking, grid and register layouts shared by the Mosaic GPU norm kernels.
+"""Blocking and the input pipeline for the Mosaic GPU normalization kernels.
 
-The forward and the VJP walk the same canonical `(M, A, B)` form, want the same
-coalesced register layout, and hit the same grid limits. Only the kernel bodies
-differ, so everything else lives here.
+Tiles reach the kernel through `plgpu.emit_pipeline`, which stages them into
+SMEM with `cp.async` on Ampere. Two consequences shape everything here:
+
+  - The SMEM ref carries tiling and swizzling transforms, and layout inference
+    derives a register layout from them. Nothing states a layout by hand; that
+    needs `fa.short_tile_layout` to be among the candidates offered for an
+    optimized SMEM transfer, which is a local patch to `jax` at the time of
+    writing (see `jax-bug-mgpu-keepdims/`).
+  - `cp.async` cannot predicate an out-of-bounds access, so every copy has to be
+    provably in bounds. The tiling already forces the blocked axis to be a
+    multiple of 8 (resp. 32), so a block size that is both a multiple of that
+    and a divisor of the axis always exists -- and then the blocks tile the axis
+    exactly and the question of a partial block does not arise.
+  - The tiled `cp.async` copy is 2D only (`launch_context.py`, `Only 2D copies
+    implemented`), and the check runs on the rank *after* squeezing. So the
+    staged tile is always 2D: when the reduced axis is not the minor one, the
+    block is `(None, A, block_b)` and the degenerate leading axis is squeezed
+    away, which also keeps the GMEM slice contiguous.
+
+Outputs are not pipelined: `emit_pipeline` supports input-only pipelines
+pre-Hopper. The kernels store them by hand, relaying out through SMEM so that
+the store to GMEM coalesces -- as `pallas_mosaic_gpu_kernel_sm80` does.
 """
 
-from collections.abc import Callable
 import dataclasses
 from typing import Any
 
@@ -27,291 +45,273 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
+from tokamax._src import gpu_utils
 
 
-# CUDA allows 2**31-1 blocks in gridDim.x but only 65535 in .y and .z.
-_MAX_GRID_DIM = 65535
+# The tiled transform tiles the second minormost dimension by 8, so the tile's
+# slow axis -- and any block of it -- has to be a multiple of this.
+_TILING_ROWS = 8
 
-LANE_SEMANTICS = plgpu.CompilerParams(
-  lowering_semantics=plgpu.LoweringSemantics.Lane
+# The 32 lanes tile the tile's minor axis, so it has to be a multiple of this.
+_TILING_COLS = 32
+
+# Per-CTA SMEM, as reported by Mosaic when a kernel asks for too much. The
+# budget covers the pipeline's staging buffers *and* the store scratch.
+_SMEM_BUDGET = 227 * 1024
+
+# Tiles per CTA. Enough to give `cp.async` something to overlap with, without
+# making the grid so small that the device runs out of blocks to schedule.
+# ponytail: fixed depth, make it a `Config` field if autotuning wants it.
+_STEPS_PER_CTA = 4
+
+WARPGROUP_SEMANTICS = plgpu.CompilerParams(
+  lowering_semantics=plgpu.LoweringSemantics.Warpgroup
 )
 
 
-def _ceil_div(a: int, b: int) -> int:
+def ceil_div(a: int, b: int) -> int:
   return -(-a // b)
 
 
-def largest_divisor(n: int, cap: int) -> int:
-  "Returns the largest divisor of `n` that is at most `cap`"
-  return next(b for b in range(min(cap, n), 0, -1) if n % b == 0)
-
-
-def warp_aligned_block(rows: int, cap: int) -> int:
-  """Returns the largest multiple of 4 at most `min(cap, rows)`, else that.
-
-  `make_layout` takes the four warps from `M` only when the block is a multiple
-  of 4 rows, which is the arrangement to prefer. Blocks need not divide `rows`
-  -- the last one is slid back to fit, see `Plan.indices` -- so this is just a
-  rounding, except when there are not 4 rows to round to and the warps have to
-  come from the reduced axis instead.
-  """
-  return min(cap, rows) // 4 * 4 or min(cap, rows)
-
-
-def _largest_pow2(cap: int, ok: Callable[[int], bool]) -> int | None:
-  """Returns the largest power of two `<= cap` satisfying `ok`, or `None`."""
-  v = 1 << (cap.bit_length() - 1)
-  while not ok(v):
-    if v == 1:
-      return None
-    v //= 2
-  return v
-
-
-def make_layout(block_slow: int, block_fast: int, itemsize: int):
-  """Register layout for a 2D `(slow, fast)` tile, `fast` being contiguous.
-
-  Lanes and the vector always come from `fast`, so a warp covers `32 * vector`
-  contiguous elements -- one unbroken memory transaction. What varies is where
-  the four warps come from, and since a layout has to place all 128 threads of
-  the warpgroup, they have to come from somewhere:
-
-  - `slow`, when it has 4 rows to give them. A row then lives inside a single
-    warp, so a reduction along `fast` is a lane shuffle.
-  - `fast` otherwise, spreading one row over the whole warpgroup. Still
-    perfectly coalesced, but a reduction along `fast` now crosses warps and
-    takes the SMEM scratch path.
-  """
-  max_vec = max(1, 16 // itemsize)  # 16-byte (128-bit) register vectors.
-  if block_slow % 4 == 0:
-    v = _largest_pow2(max_vec, lambda v: block_fast % (32 * v) == 0)
-    if v is None:
-      raise NotImplementedError(
-        f'Contiguous axis ({block_fast}) must be a multiple of 32 so the lanes'
-        ' cover it.'
-      )
-    return plgpu.Layout.TILED(
-      plgpu.Tiling(((4, 32 * v), (4, v))), (-2,), (-3,), -1
-    )
-
-  v = _largest_pow2(max_vec, lambda v: block_fast % (128 * v) == 0)
-  if v is None:
-    raise NotImplementedError(
-      f'Contiguous axis ({block_fast}) must be a multiple of 128 so the whole'
-      f' warpgroup covers it, as {block_slow} rows cannot feed the warps.'
-    )
-  return plgpu.Layout.TILED(
-    plgpu.Tiling(((1, 128 * v), (32 * v,), (v,))), (-3,), (-2,), -1
-  )
+def divisors(n: int, cap: int, *, multiple_of: int = 1):
+  """Yields divisors of `n` at most `cap` and a multiple of `multiple_of`, descending."""
+  start = min(cap, n) // multiple_of * multiple_of
+  for b in range(start, 0, -multiple_of):
+    if n % b == 0:
+      yield b
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Plan:
   """How one canonical `(M, A, B)` normalization is spread over the device.
 
-  `A`, the reduced axis, is never blocked: a whole row lives in registers, so
-  the reduction needs no cross-block communication. `M` and `B` are blocked and
-  the rest of the extent goes to the grid.
+  `A`, the reduced axis, is never blocked: a whole row has to be resident for
+  the reduction, so it is what bounds the other block size through the SMEM
+  budget. Which axis *is* blocked depends on where `A` sits:
 
-  A tile in registers is always 2D: `A` and whichever of `M`/`B` is blocked,
-  the other one being indexed by a scalar and so dropping out.
+    - `B == 1`, the contiguous case. The tile is `(block_m, A)` and the
+      reduction runs along the tile's minor axis.
+    - `B > 1`, the strided case. `A` is no longer contiguous, so a tile can only
+      hold one row of `M`: the tile is `(A, block_b)` and the reduction runs
+      down its slow axis, crossing warps through the reduction scratch.
 
-  Blocks need not tile `M` exactly. Mosaic has no masked GMEM load or store, so
-  the last block instead slides back to end at the last row, overlapping its
-  predecessor. Rows are normalized independently, so the overlap is recomputed
-  to the same values and rewritten with them -- harmless for everything except a
-  sum over rows, which would count them twice; `drop_duplicate_rows` is how the
-  VJP's partials avoid that.
+  Either way the tiles are handed out to CTAs, and each CTA walks its own share
+  as a pipeline.
 
   Attributes:
     num_m: Rows of `M` in the whole array.
-    block_m: Rows of `M` per block.
-    block_b: Elements of `B` per block.
-    overlaps: Whether the blocks along `M` overrun `num_m`, so that the last one
-      slides back and repeats rows.
-    x_shape: Shape the `x`-like refs are given, rank-reduced to the case so the
-      kernel never indexes a rank away.
-    stat_shape: Shape of the `mean`/`rstddev` refs.
-    dparam_shape: Shape of the per-block `dscale`/`doffset` partials, one `A`-
-      indexed row per block, to be summed over the leading two axes.
-    layout: Register layout of an `x` tile.
-    reduce_axis: Axis of the 2D tile holding `A`.
-    grid: The `plgpu.kernel` grid.
-    grid_names: Names of `grid`'s axes. `'m'`/`'b'` index `M`/`B`; a leading
-      `'mo'` appears only when `M` needs two grid axes (see `plan`). They are
-      read by name, so a `vmap` prepending an axis of its own is harmless.
-    split_m: Stride of the `'mo'` axis, i.e. the size of the `'m'` axis.
+    num_a: The reduced axis, i.e. the width of a row.
+    num_b: The axis after the reduced one; 1 in the contiguous case.
+    block_m: Rows of `M` per tile. Divides `num_m`; forced to 1 when strided.
+    block_b: Columns of `B` per tile. Divides `num_b`; 1 when contiguous.
+    itemsize: Bytes per element of `x`.
+    swizzle: SMEM swizzle, chosen for the tile's minor axis.
+    steps: Tiles in total.
+    steps_per_cta: Tiles each CTA walks.
+    num_ctas: CTAs, i.e. the `plgpu.kernel` grid.
+    num_stages: Pipeline depth.
   """
 
   num_m: int
+  num_a: int
+  num_b: int
   block_m: int
   block_b: int
-  overlaps: bool
-  x_shape: tuple[int, ...]
-  stat_shape: tuple[int, ...]
-  dparam_shape: tuple[int, int, int]
-  layout: Any
-  reduce_axis: int
-  grid: tuple[int, ...]
-  grid_names: tuple[str, ...]
-  split_m: int
+  itemsize: int
+  swizzle: int
+  steps: int
+  steps_per_cta: int
+  num_ctas: int
+  num_stages: int
 
   @property
-  def stat_axis(self) -> int:
-    return 1 - self.reduce_axis
+  def strided(self) -> bool:
+    """Whether the reduced axis is not the contiguous one."""
+    return self.num_b > 1
 
-  def indices(self):
-    """Returns how the current program indexes each of the refs.
+  @property
+  def reduce_axis(self) -> int:
+    """The axis of the staged 2D tile that `A` spans, i.e. the reduced one."""
+    return 0 if self.strided else 1
 
-    In order:
-     - A `x`-shaped ref, giving this block's tile
-     - A `mean`/`rstddev`-shaped ref
-     - A `dscale`/`doffset` partials ref
-     - How many leading rows of the tile this block shares with its
-       predecessor, for `drop_duplicate_rows`; a constant `0` unless the blocks
-       overrun `M`.
+  @property
+  def tile_shape(self) -> tuple[int, int]:
+    """The staged tile, always 2D; see the module docstring."""
+    if self.strided:
+      return (self.num_a, self.block_b)
+    return (self.block_m, self.num_a)
+
+  @property
+  def block_shape(self) -> tuple[int | None, ...]:
+    """The `BlockSpec` block, with the squeezed axis that makes the copy 2D."""
+    if self.strided:
+      return (None, self.num_a, self.block_b)
+    return (self.block_m, self.num_a)
+
+  @property
+  def steps_b(self) -> int:
+    """Tiles needed to cover `B`."""
+    return self.num_b // self.block_b
+
+  @property
+  def transforms(self):
+    """Tiling and swizzling for the staged tile, and for the store scratch.
+
+    This is what gives layout inference a tiled layout to work from; without it
+    the register layout comes out strided and the reduction rejects it.
     """
-    pid_m = jax.lax.axis_index('m')
-    if 'mo' in self.grid_names:
-      pid_m += jax.lax.axis_index('mo') * self.split_m
-    pid_b = jax.lax.axis_index('b')
-    dparam = (pid_m, pid_b)
-
-    start_m, skip = pid_m * self.block_m, 0
-    if self.overlaps:
-      # Slide the overrunning block back to end at the last row. A block past
-      # the end entirely -- which the `'mo'` split can produce -- lands on the
-      # last one, so `skip` reaches `block_m` and it contributes nothing.
-      start_m = jnp.minimum(start_m, self.num_m - self.block_m)
-      skip = pid_m * self.block_m - start_m
-
-    if len(self.x_shape) == 2:
-      m_slice = pl.ds(start_m, self.block_m)
-      return m_slice, m_slice, dparam, skip
-    b_slice = pl.ds(pid_b * self.block_b, self.block_b)
-    return (start_m, slice(None), b_slice), (start_m, b_slice), dparam, skip
-
-  def drop_duplicate_rows(self, a: jax.Array, skip) -> jax.Array:
-    """Zeros the rows of a tile that its predecessor already accounted for.
-
-    Only for values about to be summed over `M`; anything else is idempotent
-    under the overlap and wants the real rows.
-    """
-    if not self.overlaps:
-      return a
-    if self.block_m == 1:
-      # `M` is indexed by a scalar and is not part of the tile, so a repeated
-      # block repeats all of it.
-      return jnp.where(skip == 0, a, 0.0)
-    # `M` is the tile's slow axis, so it is the one a per-row statistic keeps.
-    rows = jax.lax.broadcasted_iota(jnp.int32, a.shape, self.stat_axis)
-    return jnp.where(plgpu.layout_cast(rows, self.layout) >= skip, a, 0.0)
-
-  def _spread(self, a: jax.Array, shape, dims) -> jax.Array:
-    return plgpu.layout_cast(
-      jax.lax.broadcast_in_dim(a, shape, dims), self.layout
+    elem_bits = self.itemsize * 8
+    return (
+      plgpu.TilingTransform((_TILING_ROWS, 8 * self.swizzle // elem_bits)),
+      plgpu.SwizzleTransform(self.swizzle),
     )
 
-  def bcast(self, a: jax.Array, shape) -> jax.Array:
-    """Broadcasts a per-row statistic back over a tile of `shape`."""
-    return self._spread(a, shape, (self.stat_axis,))
+  @property
+  def store_layout(self):
+    """Register layout for the relayout that makes the GMEM store coalesce."""
+    return plgpu.Layout.SMEM_GMEM_COPY(
+      self.tile_shape, jnp.dtype(f'float{self.itemsize * 8}'), swizzle=self.swizzle
+    )
 
-  def read_param(self, ref, shape) -> jax.Array:
-    """Reads a 1D param, laid out to match a tile of `shape` along `A`."""
-    layout = self.layout.reduce((self.stat_axis,))
-    p = plgpu.load(ref, layout=layout, optimized=False)
-    return self._spread(p.astype(jnp.float32), shape, (self.reduce_axis,))
+  def block_index(self, step) -> jax.Array:
+    """Returns the tile this CTA reads on `step`, as a flat tile index.
+
+    The last CTA may be handed fewer than `steps_per_cta` tiles; rather than
+    read out of bounds -- which `cp.async` cannot predicate -- it re-reads the
+    last tile. Rows are normalized independently, so recomputing one is
+    idempotent: the same values are written back over themselves.
+    """
+    first = jax.lax.axis_index('cta') * self.steps_per_cta
+    return jnp.minimum(first + step, self.steps - 1)
+
+  def tile_indices(self, step) -> tuple[jax.Array, jax.Array]:
+    """Splits the flat tile index into a block of `M` and a block of `B`."""
+    flat = self.block_index(step)
+    return flat // self.steps_b, flat % self.steps_b
+
+  def in_spec(self) -> plgpu.BlockSpec:
+    def index_map(step):
+      i, j = self.tile_indices(step)
+      return (i, 0, j) if self.strided else (i, 0)
+
+    return plgpu.BlockSpec(
+      self.block_shape, index_map, transforms=self.transforms
+    )
+
+  def out_index(self, step) -> tuple[Any, ...]:
+    """Returns the slice of the `(M, A, B)` output that this `step` covers."""
+    i, j = self.tile_indices(step)
+    if self.strided:
+      return (i, slice(None), pl.ds(j * self.block_b, self.block_b))
+    return (pl.ds(i * self.block_m, self.block_m), slice(None))
+
+  def stat_index(self, step) -> tuple[Any, ...]:
+    """Returns the slice of the `(M, B)` statistics that this `step` covers."""
+    i, j = self.tile_indices(step)
+    if self.strided:
+      return (i, pl.ds(j * self.block_b, self.block_b))
+    return (pl.ds(i * self.block_m, self.block_m),)
+
+  def smem_bytes(self) -> int:
+    tile = self.tile_shape[0] * self.tile_shape[1] * self.itemsize
+    return tile * (self.num_stages + 1)  # Staging buffers, plus the store scratch.
 
 
 def plan(
-  x_shape: tuple[int, int, int],
+  num_m: int,
+  num_a: int,
   itemsize: int,
   *,
   block_m: int,
-  block_b: int,
-  max_regs: int = 256,
+  num_b: int = 1,
+  block_b: int | None = None,
 ) -> Plan:
   """Plans a canonical `(M, A, B)` normalization.
 
   Args:
-    x_shape: The canonical `(M, A, B)` shape, `A` being the reduced axis.
+    num_m: Rows to normalize, i.e. the product of the axes before the reduced
+      one.
+    num_a: The reduced axis.
     itemsize: Bytes per element of `x`.
-    block_m: Upper bound on `block_m`; the largest warp-aligned block at or
-      below it is used. It need not divide `M`; see `Plan`.
-    block_b: Upper bound on `block_b`; the largest divisor at or below it is
-      used, as `B` is the contiguous axis and a block sliding back off a
-      multiple of the load's vector width would misalign it.
-    max_regs: Register budget per thread, in elements of a single block. The
-      real footprint is a small multiple of this -- reductions run in `float32`
-      and the kernels keep temporaries live -- so this is a knob to turn if a
-      kernel spills, not a hardware limit.
+    block_m: Upper bound on the rows per tile. Ignored when `num_b > 1`, where a
+      tile can only hold one row.
+    num_b: The product of the axes after the reduced one.
+    block_b: Upper bound on the columns of `B` per tile. Only used when
+      `num_b > 1`; defaults to one cache line's worth.
+
+  Whichever axis is blocked, the largest divisor of it at or below the cap that
+  is also a multiple of the tiling is used; see the module docstring for why it
+  has to divide exactly.
   """
-  num_m, num_a, num_b = x_shape
-  if num_b == 1:
-    # `A` is contiguous *and* reduced, so the lanes land on it. Preferably the
-    # warps come from `M`, which keeps the reduction inside a warp -- but that
-    # needs 4 rows to give them, so a short `M` spreads one row over the whole
-    # warpgroup instead and pays a cross-warp reduction.
-    block_m = warp_aligned_block(num_m, block_m)
-    block_b = 1
-    tile_shape, stat_shape, reduce_axis = (num_m, num_a), (num_m,), 1
-    layout = make_layout(block_m, num_a, itemsize)
+  if num_b > 1:
+    # The tile is `(A, block_b)`, so `A` is what the 8-row tiling applies to and
+    # `block_b` is what the lanes tile.
+    if num_a % _TILING_ROWS:
+      raise NotImplementedError(
+        f'The reduced axis ({num_a}) must be a multiple of {_TILING_ROWS}, which'
+        ' is how the staged tile is tiled, when it is not the contiguous axis.'
+      )
+    if block_b is None:
+      block_b = gpu_utils.CACHE_LINE_SIZE_BYTES // itemsize
+    candidates = [
+      (1, b) for b in divisors(num_b, block_b, multiple_of=_TILING_COLS)
+    ]
   else:
-    # `B` is contiguous, so `A` is the slow axis: it feeds the warps when it is
-    # long enough, and the reduction along it then takes the scratch path. `M`
-    # goes entirely to the grid -- it adds nothing to coalescing and only
-    # inflates the register footprint -- so it is indexed by a scalar and the
-    # tile is 2D even though the ref is 3D.
-    block_m, block_b = 1, largest_divisor(num_b, block_b)
-    tile_shape, stat_shape, reduce_axis = (num_m, num_a, num_b), (num_m, num_b), 0
-    layout = make_layout(num_a, block_b, itemsize)
+    if num_m % _TILING_ROWS:
+      raise NotImplementedError(
+        f'Rows ({num_m}) must be a multiple of {_TILING_ROWS}, which is how the'
+        ' staged tile is tiled.'
+      )
+    if num_a % _TILING_COLS:
+      raise NotImplementedError(
+        f'The reduced axis ({num_a}) must be a multiple of {_TILING_COLS} so'
+        ' that the 32 lanes tile it.'
+      )
+    candidates = [
+      (m, 1) for m in divisors(num_m, block_m, multiple_of=_TILING_ROWS)
+    ]
 
-  if block_m * block_b == 1:
-    # Mosaic's scalar path cannot yet write a tiled value to a GMEM ref.
-    raise NotImplementedError(
-      f'A block of ({block_m}, {num_a}, {block_b}) leaves a single-element'
-      ' statistic, which cannot be stored.'
+  # A whole row has to be resident, so a long one is paid for in the other block
+  # size. Take the largest block that fits SMEM rather than declining outright.
+  smallest = None
+  for candidate_m, candidate_b in candidates:
+    steps = (num_m // candidate_m) * (num_b // candidate_b)
+    steps_per_cta = min(steps, _STEPS_PER_CTA)
+    minor = candidate_b if num_b > 1 else num_a
+    p = Plan(
+      num_m=num_m,
+      num_a=num_a,
+      num_b=num_b,
+      block_m=candidate_m,
+      block_b=candidate_b,
+      itemsize=itemsize,
+      swizzle=plgpu.find_swizzle(minor * itemsize * 8, 'normalization tile'),
+      steps=steps,
+      steps_per_cta=steps_per_cta,
+      num_ctas=ceil_div(steps, steps_per_cta),
+      num_stages=min(2, steps_per_cta),
     )
+    if p.smem_bytes() <= _SMEM_BUDGET:
+      return p
+    smallest = p
 
-  if (regs := block_m * num_a * block_b // 128) > max_regs:
+  if smallest is None:
     raise NotImplementedError(
-      f'Block ({block_m}, {num_a}, {block_b}) puts {regs} elements in each'
-      f' thread, over the budget of {max_regs}, so it will spill.'
+      f'The trailing axis ({num_b}) has no divisor that is a multiple of'
+      f' {_TILING_COLS} and at most {block_b}, so no tile of it can be staged.'
     )
-
-  # CUDA caps gridDim.y/.z at 65535 (only .x is 2**31-1) and Mosaic does not
-  # map the leading axis to .x, so too many rows aborts the launch with
-  # `cuLaunchKernelEx: invalid argument`. Splitting the row grid over two axes
-  # need not be exact either: a leftover block lands back on the last one and,
-  # like any other overlap, contributes nothing new.
-  grid_m, grid_b = _ceil_div(num_m, block_m), num_b // block_b
-  split_m, grid, grid_names = 1, (grid_m, grid_b), ('m', 'b')
-  if grid_m > _MAX_GRID_DIM:
-    outer = _ceil_div(grid_m, _MAX_GRID_DIM)
-    split_m = _ceil_div(grid_m, outer)
-    grid_m, grid = outer * split_m, (outer, split_m, grid_b)
-    grid_names = ('mo', 'm', 'b')
-
-  return Plan(
-    num_m=num_m,
-    overlaps=grid_m * block_m > num_m,
-    block_m=block_m,
-    block_b=block_b,
-    x_shape=tile_shape,
-    stat_shape=stat_shape,
-    dparam_shape=(grid_m, grid_b, num_a),
-    layout=layout,
-    reduce_axis=reduce_axis,
-    grid=grid,
-    grid_names=grid_names,
-    split_m=split_m,
+  rows, cols = smallest.tile_shape
+  raise NotImplementedError(
+    f'Even a tile of {rows}x{cols} over {smallest.num_stages} stages needs'
+    f' {smallest.smem_bytes()} bytes of SMEM, over the budget of'
+    f' {_SMEM_BUDGET}. The reduced axis cannot be blocked, so this bounds it.'
   )
 
 
 def with_usable_block_m(config):
   """Raises a borrowed Triton config's `block_m` to something this kernel can use.
-  A `block_m` below 4 leaves nothing to give the warps, so `make_layout` takes
-  them from the reduced axis instead and reduces across warps through SMEM when
-  a lane shuffle would have done.
+
+  A block has to be a multiple of 8 rows, so anything below that would leave
+  `largest_divisor` nothing to find.
   """
-  return dataclasses.replace(config, block_m=max(4, config.block_m))
+  return dataclasses.replace(config, block_m=max(_TILING_ROWS, config.block_m))
