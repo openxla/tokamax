@@ -325,49 +325,47 @@ def calculate_xw_tiled(
       x_ref.shape[1],
       w_ref.shape[1],
   )
-  # Padding if B dimension is not aligned to the B block size
+  x_val = x_ref[...]
   if b_dim % b_block_size != 0:
-
-    @pl.when(b_index == num_b_blocks - 1)
-    def pad_non_aligned_b_block():
-      rem = b_dim % b_block_size
-      x_iota_mask = jax.lax.broadcasted_iota(
-          dtype=jnp.int32, shape=(b_block_size, 1), dimension=0
-      )
-      x_ref[...] = jnp.where(x_iota_mask < rem, x_ref[...], 0)
-
-  # Padding if V dimension is not aligned to the V block size
-  if v_dim % v_block_size != 0:
-
-    @pl.when(v_index == num_v_blocks - 1)
-    def pad_non_aligned_v_block():
-      rem = v_dim % v_block_size
-      iota_mask = jax.lax.broadcasted_iota(
-          dtype=jnp.int32, shape=(1, v_block_size), dimension=1
-      )
-      w_ref[...] = jnp.where(iota_mask < rem, w_ref[...], 0)
-
-  # Padding if H dimension is not aligned to the V block size
+    rem_b = b_dim % b_block_size
+    row_idx = jax.lax.broadcasted_iota(
+        dtype=jnp.int32, shape=(b_block_size, 1), dimension=0
+    )
+    x_val = jnp.where(
+        (b_index == num_b_blocks - 1) & (row_idx >= rem_b), 0.0, x_val
+    )
   if h_dim % h_block_size != 0:
+    rem_h = h_dim % h_block_size
+    col_idx = jax.lax.broadcasted_iota(
+        dtype=jnp.int32, shape=(1, h_block_size), dimension=1
+    )
+    x_val = jnp.where(
+        (h_index == num_h_blocks - 1) & (col_idx >= rem_h), 0.0, x_val
+    )
 
-    @pl.when(h_index == num_h_blocks - 1)
-    def pad_non_aligned_h_block():
-      rem = h_dim % h_block_size
-      x_iota_mask = jax.lax.broadcasted_iota(
-          dtype=jnp.int32, shape=(1, h_block_size), dimension=1
-      )
-      x_ref[...] = jnp.where(x_iota_mask < rem, x_ref[...], 0)
-
-      w_iota_mask = jax.lax.broadcasted_iota(
-          dtype=jnp.int32, shape=(h_block_size, 1), dimension=0
-      )
-      w_ref[...] = jnp.where(w_iota_mask < rem, w_ref[...], 0)
+  w_val = w_ref[...]
+  if h_dim % h_block_size != 0:
+    rem_h = h_dim % h_block_size
+    row_idx = jax.lax.broadcasted_iota(
+        dtype=jnp.int32, shape=(h_block_size, 1), dimension=0
+    )
+    w_val = jnp.where(
+        (h_index == num_h_blocks - 1) & (row_idx >= rem_h), 0.0, w_val
+    )
+  if v_dim % v_block_size != 0:
+    rem_v = v_dim % v_block_size
+    col_idx = jax.lax.broadcasted_iota(
+        dtype=jnp.int32, shape=(1, v_block_size), dimension=1
+    )
+    w_val = jnp.where(
+        (v_index == num_v_blocks - 1) & (col_idx >= rem_v), 0.0, w_val
+    )
 
   @pl.when(h_index == 0)
   def init_xw():
     xw_tiled[...] = jax.lax.dot_general(
-        x_ref[...],
-        w_ref[...],
+        x_val,
+        w_val,
         dimension_numbers=(((1,), (0,)), ((), ())),
         preferred_element_type=preferred_element_type,
     )
@@ -375,8 +373,8 @@ def calculate_xw_tiled(
   @pl.when(h_index != 0)
   def accumulate_xw():
     xw_tiled[...] += jax.lax.dot_general(
-        x_ref[...],
-        w_ref[...],
+        x_val,
+        w_val,
         dimension_numbers=(((1,), (0,)), ((), ())),
         preferred_element_type=preferred_element_type,
     )
