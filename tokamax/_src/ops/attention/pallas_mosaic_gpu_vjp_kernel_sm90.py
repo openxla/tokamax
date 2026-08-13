@@ -204,6 +204,8 @@ def flash_attention_vjp_kernel(
   if mask is not None:
     mask = mask.astype(jnp.int8)
 
+  l_rcp = jnp.reciprocal(l + jnp.finfo(jnp.float32).tiny)
+
   # TODO: Avoid broadcast.
   bcast = lambda x: jnp.broadcast_to(x, (x.shape[-2], q_seq_len))
   k_start = None if k_start is None else bcast(k_start)
@@ -268,7 +270,7 @@ def flash_attention_vjp_kernel(
           delta_gmem.at[hi, qs], layout=_WGMMA_ROW, optimized=False
       )
       m = plgpu.load(m_gmem.at[hi, qs], layout=_WGMMA_ROW, optimized=False)
-      l = plgpu.load(l_gmem.at[hi, qs], layout=_WGMMA_ROW, optimized=False)
+      l_rcp = plgpu.load(l_gmem.at[hi, qs], layout=_WGMMA_ROW, optimized=False)
 
       def load_k_range(ref):
         if ref is None:
@@ -279,10 +281,6 @@ def flash_attention_vjp_kernel(
       k_start = load_k_range(k_start_gmem)
       k_end = load_k_range(k_end_gmem)
       m *= math.log2(math.e)
-
-      epsilon = jnp.finfo(jnp.float32).tiny  # Avoid division by zero.
-      l_rcp = 1.0 / (l + epsilon)
-
       plgpu.barrier_wait(barrier)
 
       def compute_dq(dq_acc):
@@ -565,15 +563,15 @@ def flash_attention_vjp_kernel(
           plgpu.barrier_arrive(bias_consumed)
 
         m = plgpu.load(m_smem, layout=_WGMMA_COL)
-        l = plgpu.load(l_smem, layout=_WGMMA_COL)
+        l_rcp = plgpu.load(l_smem, layout=_WGMMA_COL)
         delta = plgpu.load(delta_smem, layout=_WGMMA_COL)
         plgpu.barrier_arrive(m_consumed)
         plgpu.barrier_arrive(l_consumed)
         plgpu.barrier_arrive(delta_consumed)
-        return acc[...], bias, m, l, delta
+        return acc[...], bias, m, l_rcp, delta
 
       acc_type = plgpu.ACC((block_kv, block_q), jnp.float32)
-      s, bias, m, l, delta = pl.run_scoped(compute_s, acc_type)
+      s, bias, m, l_rcp, delta = pl.run_scoped(compute_s, acc_type)
       scale = logits_scale
 
       if bias is not None:
@@ -634,8 +632,7 @@ def flash_attention_vjp_kernel(
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0
 
-      epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
-      p = jnp.exp2(s * scale - broadcast(m)) / broadcast(l + epsilon)
+      p = jnp.exp2(s * scale - broadcast(m)) * broadcast(l_rcp)
 
       def compute_dp(acc):
         plgpu.wgmma(acc, v_smem, dout_smem.T)
@@ -743,7 +740,7 @@ def flash_attention_vjp_kernel(
       grid_names=("heads", "q_tiles"),
       num_threads=compute_wgs + 1,
       thread_name="wg",
-  )(q, k, v, dout, m, l, delta, bias, mask, k_start, k_end)
+  )(q, k, v, dout, m, l_rcp, delta, bias, mask, k_start, k_end)
 
   # TODO: Fuse transpose in the kernel.
   if mask is not None:
@@ -766,7 +763,7 @@ def flash_attention_vjp_kernel(
       grid_names=("heads", "kv_tiles"),
       num_threads=compute_wgs + 1,
       thread_name="wg",
-  )(q, k, v, dout, m, l, delta, bias, mask, k_start, k_end)
+  )(q, k, v, dout, m, l_rcp, delta, bias, mask, k_start, k_end)
 
   dq = dq[..., :orig_q_seq_len, :, :orig_head_dim]
   dk = dk[..., :orig_head_dim]
