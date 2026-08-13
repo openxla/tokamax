@@ -400,37 +400,24 @@ def flash_attention_kernel(
           if logits_soft_cap is not None:
             s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
 
-          # Defer scaling to the softmax computation below, if possible
-          # (allowing FMA to be used).
-          scale *= math.log2(math.e)
-          mask_value = float(jnp.finfo(jnp.float32).min)
-
           if mask is not None:
-            s, scale = jnp.where(mask, s * scale, mask_value), 1.0
+            s = jnp.where(mask, s, -jnp.inf)
 
-          broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
+          bcast = lambda x, tgt=s: lax.broadcast_in_dim(x, tgt.shape, [0])
 
           if k_start is not None:
 
-            def apply_k_start(k_start=k_start):
-              k_start = broadcast(k_start)
-              s_ = s * scale
-              return jnp.where(k_base + iota(1) >= k_start, s_, mask_value), 1.0
+            def apply_k_start():
+              return jnp.where(k_base + iota(1) >= bcast(k_start), s, -jnp.inf)
 
-            s, scale = lax.cond(
-                k_base < k_start_max, apply_k_start, lambda: (s, scale)
-            )
+            s = lax.cond(k_base < k_start_max, apply_k_start, lambda: s)
 
           if k_end is not None:
 
-            def apply_k_end(k_end=k_end):
-              k_end = broadcast(k_end)
-              s_ = s * scale
-              return jnp.where(k_base + iota(1) < k_end, s_, mask_value), 1.0
+            def apply_k_end():
+              return jnp.where(k_base + iota(1) < bcast(k_end), s, -jnp.inf)
 
-            s, scale = lax.cond(
-                k_base + block_kv > k_end_min, apply_k_end, lambda: (s, scale)
-            )
+            s = lax.cond(k_base + block_kv > k_end_min, apply_k_end, lambda: s)
 
           if mask_gmem is not None:
             if mask_smem is None:
@@ -444,19 +431,19 @@ def flash_attention_kernel(
               else:
                 mask = mask_smem[si, block.ds(wg, block_q)]
               mgpu_lib.bar_arrive(mask_consumed_barrier + si, num_threads=288)
-            s, scale = jnp.where(mask, s * scale, mask_value), 1.0
+            s = jnp.where(mask, s, -jnp.inf)
 
+          scale *= math.log2(math.e)
           if use_stable_softmax:
             m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
-            alpha = jnp.exp2(m_scale - m_i)
+            m_valid = (mask is None and not has_k_range) | (m_i != -jnp.inf)
+            alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
             threshold_is_1 = rescale_threshold == 1.0
             needs_rescale = alpha < rescale_threshold
             m_scale = jnp.where(needs_rescale | threshold_is_1, m_i, m_scale)
-            p = jnp.exp2(s * scale - broadcast(m_scale))
+            p = jnp.exp2(s * scale - bcast(jnp.where(m_valid, m_scale, 0.0)))
             acc = jnp.where(
-                lax.broadcast_in_dim(needs_rescale, acc.shape, [0]),
-                acc * lax.broadcast_in_dim(alpha, acc.shape, [0]),
-                acc,
+                bcast(needs_rescale, acc), acc * bcast(alpha, acc), acc
             )
             l_i = jnp.where(needs_rescale | threshold_is_1, l_i * alpha, l_i)
           else:
@@ -514,11 +501,14 @@ def flash_attention_kernel(
           else:
             schedule_barrier_arrive()
 
+        m_valid = (mask is None and not has_k_range) | (m_i != -jnp.inf)
+        alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
+
         if return_residuals:
           m_smem, l_smem = residual_smems
           m_smem[wg] = m_i * (1 / math.log2(math.e))
           if use_stable_softmax and rescale_threshold != 1.0:
-            l_smem[wg] = l_i * jnp.exp2(m_scale - m_i)
+            l_smem[wg] = l_i * alpha
           else:
             l_smem[wg] = l_i
           plgpu.commit_smem()
@@ -534,7 +524,7 @@ def flash_attention_kernel(
           l_i += float(jnp.finfo(jnp.float32).tiny)
           acc *= lax.broadcast_in_dim(1 / l_i, acc.shape, [0])
         elif use_stable_softmax and rescale_threshold != 1.0:
-          acc *= lax.broadcast_in_dim(jnp.exp2(m_scale - m_i), acc.shape, [0])
+          acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
 
         _, num_epi_slots, epi_tile_q, epi_tile_d = o_smem.shape
         o_gmem_ = o_gmem.at[qs, hi]
