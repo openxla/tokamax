@@ -299,6 +299,16 @@ def validate_inputs(
   Raises:
     ValueError: If the inputs are invalid.
   """
+  if labels.shape[0] != x.shape[0]:
+    raise ValueError(
+        f"Batch dimension mismatch: labels batch dimension ({labels.shape[0]})"
+        f" != x batch dimension ({x.shape[0]})."
+    )
+  if x.shape[-1] != w.shape[0]:
+    raise ValueError(
+        f"Hidden dimension mismatch: x hidden dimension ({x.shape[-1]}) !="
+        f" w hidden dimension ({w.shape[0]})."
+    )
 
   if w.shape[0] % 8 != 0:
     raise ValueError("The hidden dimension of w must be a multiple of 8")
@@ -862,30 +872,31 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         ]
 
         # Async copy ops defined here. Only starts after calling .start().
-        x_write_future = pltpu.make_async_copy(
+        x_grad_write_future = pltpu.make_async_copy(
             x_grad_tile_slice, x_grad_slice, sem=x_write_sem
         )
-        w_write_future = pltpu.make_async_copy(
+        w_grad_write_future = pltpu.make_async_copy(
             w_grad_tile_slice, w_grad_slice, sem=w_write_sem
         )
-        x_read_future = pltpu.make_async_copy(
+        x_grad_read_future = pltpu.make_async_copy(
             x_grad_slice, x_grad_tile_slice, sem=x_read_sem
         )
-        w_read_future = pltpu.make_async_copy(
+        w_grad_read_future = pltpu.make_async_copy(
             w_grad_slice, w_grad_tile_slice, sem=w_read_sem
         )
 
         # Preload x_grad and w_grad async before computing softmax to
-        # overlap computation
-
-        # Preload w_grad
+        # overlap computation. There's no accumulation on their first index
+        # so we skip the read for the first block. For these first blocks,
+        # we will initialize the gradient tiles using init_w_grad() and
+        # init_x_grad() defined below.
         @pl.when(b_index != 0)
         def w_read():
-          w_read_future.start()
+          w_grad_read_future.start()
 
         @pl.when(v_index != 0)
         def x_read():
-          x_read_future.start()
+          x_grad_read_future.start()
 
         # Compute Softmax and store s = -labels + softmax(x@w) to xw_scratch_ref
         @pl.when(h_index == 0)
@@ -985,7 +996,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           w_grad_tile_ref[...] = jax.lax.dot_general(
               get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
           )
-          w_write_future.start()
+          w_grad_write_future.start()
 
         # Init X gradient
         @pl.when(v_index == 0)
@@ -993,7 +1004,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           x_grad_tile_ref[...] = jax.lax.dot_general(
               xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
           )
-          x_write_future.start()
+          x_grad_write_future.start()
 
         # Accumulate W grad on B dimension
         @pl.when(b_index != 0)
@@ -1001,9 +1012,9 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           res = jax.lax.dot_general(
               get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
           )
-          w_read_future.wait()
+          w_grad_read_future.wait()
           w_grad_tile_ref[...] += res
-          w_write_future.start()
+          w_grad_write_future.start()
 
         # Accumulate X grad on V dimension
         @pl.when(v_index != 0)
@@ -1011,13 +1022,13 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           res = jax.lax.dot_general(
               xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
           )
-          x_read_future.wait()
+          x_grad_read_future.wait()
           x_grad_tile_ref[...] += res
-          x_write_future.start()
+          x_grad_write_future.start()
 
         # Lastly make sure to wait x_grad, w_grad write before next iteration
-        w_write_future.wait()
-        x_write_future.wait()
+        w_grad_write_future.wait()
+        x_grad_write_future.wait()
 
     pltpu.emit_pipeline(
         bwd_pipeline,
