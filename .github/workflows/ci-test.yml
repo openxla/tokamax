@@ -175,6 +175,13 @@ jobs:
               'linux-x86-tpu7x-56-1tpu': 'tpu',
           }
 
+          # Short display name only; runs-on still uses the full runner label above.
+          RUNNER_SHORT = {
+              'linux-x86-a3-8g-h100-1gpu': 'h100',
+              'linux-x86-ct6e-44-1tpu': 'tpu6e',
+              'linux-x86-tpu7x-56-1tpu': 'tpu7x',
+          }
+
           all_shards = list(SHARD_TEST_PATHS)
 
           always_on = {
@@ -184,7 +191,7 @@ jobs:
           filter_to_shards = {
               'ATTENTION': [
                   'attn_base_test', 'attn_base_vjp_test', 'attn_api_test',
-                  'attn_pallas_mosaic_gpu_test', 'attn_pallas_mosaic_tpu_test',
+                  'attn_pallas_mosaic_gpu_test', 'attn_pallas_mosaic_tpu_test', 
                   'attn_pallas_triton_test', 'attn_jax_nn_test',
                   'attn_xla_chunked_test', 'op_test',
               ],
@@ -222,6 +229,7 @@ jobs:
           combos = [
               {
                   'runner': runner,
+                  'runner_short': RUNNER_SHORT[runner],
                   'device': device,
                   'shard_name': shard,
                   'test_paths': SHARD_TEST_PATHS[shard],
@@ -234,6 +242,7 @@ jobs:
           PYEOF
 
   ops-tests:
+    name: ops-tests (${{ matrix.runner_short }}, ${{ matrix.shard_name }})
     needs: detect-changes
     strategy:
       matrix:
