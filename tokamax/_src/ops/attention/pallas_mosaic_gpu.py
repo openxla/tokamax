@@ -25,7 +25,6 @@ from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-impo
 from tokamax._src import batching
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
-from tokamax._src import quantization
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -44,10 +43,6 @@ Mask = base.Mask
 PagingInfo = base.PagingInfo
 QArray = base.QArray
 Residuals = base.Residuals
-
-
-def _broadcast_to_rank(x, rank):
-  return None if x is None else jax.lax.broadcast_to_rank(x, rank)
 
 
 def _get_kernel_module():
@@ -131,28 +126,28 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       raise NotImplementedError("Paged attention not supported.")
 
     out_dtype = q.dtype
-    # TODO: Support in-kernel dequantization.
-    q, k, v = map(quantization.as_array, (q, k, v))
-    q, k, v = common.cast_qkv(q, k, v, precision)
-
     orig_seq_len_q = q.shape[-3]
     orig_seq_len_k = k.shape[-3]
-    if isinstance(config, common.ConfigBase) and config.fold_q_sequence_heads:
-      q, bias, mask, _, q_indices = base.fold_q_sequence_heads(
-          q, bias, mask, dropout_mask, q_indices, k.shape[-3], k.shape[-2]
-      )
-
-    mask, is_causal, k_start, k_end = common.decompose_mask(
-        mask, q, k, q_indices, k_indices
+    q, k, v, bias, mask, is_causal, k_start, k_end = common.prepare_inputs(
+        q,
+        k,
+        v,
+        bias=bias,
+        mask=mask,
+        q_indices=q_indices,
+        k_indices=k_indices,
+        precision=precision,
+        fold_q_sequence_heads=config.fold_q_sequence_heads,
     )
 
     if orig_seq_len_k % (config.split_k * config.block_kv) != 0:
       if k_end is None:
-        k_end = jnp.array(orig_seq_len_k, dtype=jnp.int32)
+        k_end = jnp.full([1] * (q.ndim - 1), orig_seq_len_k, jnp.int32)
       else:
         k_end = jnp.minimum(k_end, orig_seq_len_k)
 
     use_stable_softmax = self.use_stable_softmax
+    split_k = config.split_k
 
     if isinstance(config, ConfigSM100):
       kernel_module = sm100
@@ -180,12 +175,6 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         rescale_threshold=self.rescale_threshold,
         config=config,
     )
-    bias = _broadcast_to_rank(bias, q.ndim)
-    mask = _broadcast_to_rank(mask, q.ndim)
-    k_start = _broadcast_to_rank(k_start, q.ndim - 1)
-    k_end = _broadcast_to_rank(k_end, q.ndim - 1)
-
-    split_k = config.split_k
 
     def pad_seq_k(x, axis):
       if x is None or axis is None or x.shape[axis] == 1:
@@ -217,7 +206,14 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return _get_kernel_module().get_heuristics_config(ba)
+    return self._get_heuristics_config_impl(ba, fold_q_sequence_heads=False)
+
+  def _get_heuristics_config_impl(
+      self, ba: op.BoundArguments, *, fold_q_sequence_heads: bool
+  ) -> Config:
+    return _get_kernel_module().get_heuristics_config(
+        ba, fold_q_sequence_heads=fold_q_sequence_heads
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:

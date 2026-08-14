@@ -27,7 +27,8 @@ jobs:
   tokamax-nightly-attention-tests:
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu', 'linux-x86-a4-224-b200-1gpu']
+      # TODO: Re-enable B200 once it is supported.
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
         include:
           - runner: 'linux-x86-a3-8g-h100-1gpu'
             device: 'cuda'
@@ -35,8 +36,6 @@ jobs:
             device: 'tpu'
           - runner: 'linux-x86-tpu7x-56-1tpu'
             device: 'tpu'
-          - runner: 'linux-x86-a4-224-b200-1gpu'
-            device: 'cuda'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -59,10 +58,11 @@ jobs:
         run: |
           pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*" tokamax/_src/ops/attention
   # TODO: Re-enable ragged dot on b200 once it is supported.
+  # TODO: Re-enable B200 once it is supported.
   tokamax-nightly-ops-tests:
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu', 'linux-x86-a4-224-b200-1gpu']
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
         include:
           - runner: 'linux-x86-a3-8g-h100-1gpu'
             device: 'cuda'
@@ -73,9 +73,6 @@ jobs:
           - runner: 'linux-x86-tpu7x-56-1tpu'
             device: 'tpu'
             additional_ignore: ''
-          - runner: 'linux-x86-a4-224-b200-1gpu'
-            device: 'cuda'
-            additional_ignore: '--ignore=tokamax/_src/ops/ragged_dot/'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -101,7 +98,8 @@ jobs:
   tokamax-nightly-tests:
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu', 'linux-x86-a4-224-b200-1gpu']
+        # TODO: Re-enable ragged dot on b200 once it is supported.
+        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu', 'linux-x86-tpu7x-56-1tpu']
         include:
           - runner: 'linux-x86-a3-8g-h100-1gpu'
             device: 'cuda'
@@ -109,8 +107,6 @@ jobs:
             device: 'tpu'
           - runner: 'linux-x86-tpu7x-56-1tpu'
             device: 'tpu'
-          - runner: 'linux-x86-a4-224-b200-1gpu'
-            device: 'cuda'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:

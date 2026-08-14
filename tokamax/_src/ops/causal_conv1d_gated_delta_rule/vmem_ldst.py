@@ -16,8 +16,8 @@
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import config
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import memory_ref
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
 
 
 def load_as_qkv_large(

@@ -1,4 +1,4 @@
-# Copyright 2026 DeepMind Technologies Limited. All Rights Reserved.
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,8 +23,8 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src import mosaic_tpu
 from tokamax._src import test_utils
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
+from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
+from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2
 
 import pytest
 
@@ -253,7 +253,7 @@ class GmmTest(parameterized.TestCase):
         lhs, rhs, group_sizes, rhs_bias=rhs_bias, group_offset=group_offset
     )
 
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs,
         group_sizes,
@@ -292,9 +292,9 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
-    tgmm_backend.validate_tgmm_inputs(
+    tgmm_v2.validate_tgmm_inputs(
         group_sizes, num_local_groups, group_offset)
-    actual = tgmm_backend.tgmm_v2(
+    actual = tgmm_v2.tgmm_v2(
         lhs,
         grad,
         group_sizes,
@@ -342,9 +342,9 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
-    tgmm_backend.validate_tgmm_inputs(
+    tgmm_v2.validate_tgmm_inputs(
         group_sizes, num_local_groups, group_offset)
-    actual = tgmm_backend.tgmm_v2(
+    actual = tgmm_v2.tgmm_v2(
         lhs,
         grad,
         group_sizes,
@@ -388,10 +388,13 @@ class GmmTest(parameterized.TestCase):
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
 
-    tile_info = gmm_backend.TileSizes(tile_m=256, tile_k=tile_k, tile_n=tile_n)
-    tgmm_backend.validate_tgmm_inputs(
+    tile_m = 256
+    tile_info = gmm_v2.TileSizes(
+        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
+    )
+    tgmm_v2.validate_tgmm_inputs(
         group_sizes, num_local_groups, group_offset)
-    actual = tgmm_backend.tgmm_v2(
+    actual = tgmm_v2.tgmm_v2(
         lhs,
         grad,
         group_sizes,
@@ -439,9 +442,9 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
-    tgmm_backend.validate_tgmm_inputs(
+    tgmm_v2.validate_tgmm_inputs(
         group_sizes, num_local_groups, group_offset)
-    actual = tgmm_backend.tgmm_v2(
+    actual = tgmm_v2.tgmm_v2(
         lhs,
         grad,
         group_sizes,
@@ -474,10 +477,10 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
-    tile_info = gmm_backend.TileSizes(
-        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n
+    tile_info = gmm_v2.TileSizes(
+        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
     )
-    actual = tgmm_backend.tgmm_v2(
+    actual = tgmm_v2.tgmm_v2(
         lhs,
         grad,
         group_sizes,
@@ -528,9 +531,9 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset_arr,
         out_dtype=jnp.bfloat16,
     )
-    tgmm_backend.validate_tgmm_inputs(
+    tgmm_v2.validate_tgmm_inputs(
         group_sizes, num_local_groups, group_offset_arr)
-    actual = tgmm_backend.tgmm_v2(
+    actual = tgmm_v2.tgmm_v2(
         lhs, grad_q, group_sizes, num_local_groups,
         rhs_scale=grad_scale,
         group_offset=group_offset_arr,
@@ -563,15 +566,18 @@ class GmmTest(parameterized.TestCase):
     assert grad_scale.shape == (1, 1, out_size)
 
     group_sizes = get_group_sizes(batch_size, num_groups)
-    tile_info = gmm_backend.TileSizes(tile_m=128, tile_k=256, tile_n=128)
+    tile_m = 128
+    tile_info = gmm_v2.TileSizes(
+        tile_m=tile_m, tile_k=256, tile_n=128, bucket_base=tile_m
+    )
 
     expected = reference_tgmm(
         lhs.swapaxes(0, 1), grad_q, group_sizes, num_groups,
         rhs_scale=grad_scale,
         out_dtype=jnp.bfloat16,
     )
-    tgmm_backend.validate_tgmm_inputs(group_sizes, num_groups)
-    actual = tgmm_backend.tgmm_v2(
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
+    actual = tgmm_v2.tgmm_v2(
         lhs, grad_q, group_sizes, num_groups,
         rhs_scale=grad_scale,
         tile_info=tile_info,
@@ -634,7 +640,7 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset,
     )
 
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs_q,
         group_sizes,
@@ -669,12 +675,12 @@ class GmmTest(parameterized.TestCase):
     group_sizes = jnp.array([4, 4, 4, batch_size - 12], dtype=jnp.int32)
 
     # 1. Run baseline
-    actual_clean = gmm_backend.gmm_v2(lhs, rhs, group_sizes)
+    actual_clean = gmm_v2.gmm_v2(lhs, rhs, group_sizes)
 
     # 2. Inject NaNs into all experts except the first one.
     # If isolation fails, the NaNs will leak into the first expert's output.
     rhs_malicious = rhs.at[1:].set(jnp.nan)
-    actual_malicious = gmm_backend.gmm_v2(lhs, rhs_malicious, group_sizes)
+    actual_malicious = gmm_v2.gmm_v2(lhs, rhs_malicious, group_sizes)
 
     # Verify that the first expert's output is identical and NaN-free.
     first_expert_size = group_sizes[0]
@@ -708,7 +714,7 @@ class GmmTest(parameterized.TestCase):
     )
     group_sizes = jnp.array([batch_size // 4] * 4, dtype=jnp.int32)
 
-    actual = gmm_backend.gmm_v2(lhs, rhs, group_sizes)
+    actual = gmm_v2.gmm_v2(lhs, rhs, group_sizes)
 
     # 3. Verify that the output is NaN-free
     self.assertFalse(jnp.any(jnp.isnan(actual)))
@@ -761,10 +767,10 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset,
     )
 
-    tile_info = gmm_backend.TileSizes(
-        tile_m=128, tile_k=tile_k, tile_n=out_size
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=tile_k, tile_n=out_size, bucket_base=128
     )
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs_q,
         group_sizes,
@@ -822,10 +828,10 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset,
     )
 
-    tile_info = gmm_backend.TileSizes(
-        tile_m=128, tile_k=tile_k, tile_n=out_size
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=tile_k, tile_n=out_size, bucket_base=128
     )
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs_q,
         group_sizes,
@@ -883,7 +889,7 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset,
     )
 
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs_q,
         group_sizes,
@@ -961,7 +967,7 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset,
     )
 
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs_q,
         group_sizes,
@@ -1009,7 +1015,7 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset,
     )
 
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs,
         group_sizes,
@@ -1072,7 +1078,7 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset,
     )
 
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs_q,
         group_sizes,
@@ -1127,7 +1133,7 @@ class GmmTest(parameterized.TestCase):
         group_offset=group_offset,
     )
 
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs,
         group_sizes,
@@ -1143,12 +1149,12 @@ class GmmTest(parameterized.TestCase):
       in_size=[512],
       out_size=[512],
       num_groups=[16],
-      has_bias=[False],
-      use_weight_scale=[True],
-      maybe_quantize_lhs=[True],
-      fuse_act=["silu"],
-      group_offset=[0],
-      block_size=[256],
+      has_bias=[True, False],
+      use_weight_scale=[True, False],
+      maybe_quantize_lhs=[True, False],
+      fuse_act=["silu", "swigluoai", "gelu"],
+      group_offset=[0, 2],
+      block_size=[256, 512],
   )
   def test_gmm_fused_activation(
       self,
@@ -1202,12 +1208,10 @@ class GmmTest(parameterized.TestCase):
     # whole tensor level, and output is casted down we need to simulate that
     # quantization noise in the reference as well for a fair comparison
     if maybe_quantize_lhs:
-      lhs_block_size = 256
-      print(f"xw32 line 1221: {lhs.shape=}, {lhs_block_size=}.")
+      lhs_block_size = min(512, in_size)
       lhs_q, lhs_scale_factor = quantize_tensor(
           lhs, jnp.int8, axis=1, block_size=lhs_block_size
       )
-      print(f"xw32 line 1225: {lhs_q.shape=}, {lhs_scale_factor.shape=}.")
       lhs_q_blocked = lhs_q.reshape(batch_size, -1, lhs_block_size).astype(
           jnp.float32
       )
@@ -1229,12 +1233,14 @@ class GmmTest(parameterized.TestCase):
     )
 
     # Slice the reference and apply the activation function
-    expected = gmm_backend.apply_act_fn(
-        raw_expected.astype(jnp.float32), fuse_act
-    ).astype(lhs.dtype)
+    if fuse_act is not None:
+      raw_gate, raw_up = jnp.split(raw_expected, 2, axis=-1)
+      raw_expected = gmm_v2.interleave_lane(raw_gate, raw_up)
+    expected = gmm_v2.apply_act_fn(
+        raw_expected.astype(jnp.float32), fuse_act).astype(lhs.dtype)
 
     # 4. Compute Actual Kernel Output
-    actual = gmm_backend.gmm_v2(
+    actual = gmm_v2.gmm_v2(
         lhs,
         rhs_q,
         group_sizes,

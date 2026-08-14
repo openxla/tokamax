@@ -48,7 +48,7 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
 
     with mock.patch.object(self, "_dot_fn", split_k_dot):
       with test_base.override_chex_args(atol=2e-5):
-        self.test_simple1()  # pytype: disable=attribute-error
+        self.test_simple1()  # pyrefly: ignore[missing-attribute]
 
   def test_split_k_quantized(self):
     config = pallas_triton.Config(
@@ -64,7 +64,7 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
     )
 
     with mock.patch.object(self, "_dot_fn", split_k_dot):
-      self.test_quantized0()  # pytype: disable=attribute-error
+      self.test_quantized0()  # pyrefly: ignore[missing-attribute]
 
   @override
   def _test_simple(self, dtype):

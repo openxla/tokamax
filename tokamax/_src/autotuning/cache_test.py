@@ -16,7 +16,7 @@ from importlib import resources
 import json
 import os
 import re
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from absl.testing import absltest
 from absl.testing import parameterized

@@ -17,15 +17,17 @@
 import abc
 import collections
 from collections.abc import Callable, Hashable, Mapping
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import inspect
-import threading
 from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final, overload
 
 from absl import logging
 import immutabledict
 import jax
+from jax.experimental import xla_metadata
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
@@ -95,6 +97,24 @@ class Residuals[T, R]:
     return cls(args, kwargs, out, residuals)
 
 
+_ACTIVE_TOKAMAX_PAYLOAD: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tokamax_payload", default=""
+)
+
+
+@contextlib.contextmanager
+def _tokamax_metadata(json_data: str):
+  """Sets the Tokamax payload, stacking onto an enclosing one outermost-first."""
+  prev = _ACTIVE_TOKAMAX_PAYLOAD.get()
+  payload = f"{prev}/tokamax:{json_data}" if prev else f"tokamax:{json_data}"
+  reset = _ACTIVE_TOKAMAX_PAYLOAD.set(payload)
+  try:
+    with xla_metadata.set_xla_metadata(xla_metadata_payload=payload):
+      yield
+  finally:
+    _ACTIVE_TOKAMAX_PAYLOAD.reset(reset)
+
+
 @dataclasses.dataclass(frozen=True)
 class Op[**P, T, R, C, K: Hashable](abc.ABC):
   """Base class for operations.
@@ -141,14 +161,14 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
   supports_symbolic_shapes: ClassVar[bool] = True
   supports_batched_args_capture: ClassVar[bool] = True
 
-  config: C | None = None  # pytype: disable=name-error
+  config: C | None = None
   _: dataclasses.KW_ONLY
   # VJP function for the op. `vjp` will be passed the residuals and the output
   # of the op, the output gradients, then all arguments passed to the op.
   # The VJP function must return a tuple of gradients for each positional
   # argument, or a dict `{"argname": gradient, ...}`. If a dict is returned, any
   # input array arguments not in the dict will have gradients set to zeros.
-  vjp: Callable[Concatenate[R, T, T, P], Any] | None = None  # pytype: disable=name-error
+  vjp: Callable[Concatenate[R, T, T, P], Any] | None = None
 
   def __init_subclass__(cls, *args, **kwargs):
     super().__init_subclass__(*args, **kwargs)
@@ -212,7 +232,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
       json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
 
-      with jax.named_scope(f"tokamax:{json_data}"):
+      with _tokamax_metadata(json_data):
         if fwd_res and self.vjp is None and batched_args is not None:
 
           def fwd_flat(*arrays):
@@ -261,7 +281,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         out = residuals.out
         residuals = residuals.residuals
         dout = dout[0] if return_residuals else dout
-        grads = self.vjp(residuals, out, dout, *args, **kwargs)  # pytype: disable=wrong-arg-count
+        grads = self.vjp(residuals, out, dout, *args, **kwargs)
 
         if isinstance(grads, dict):
           grads_ba = ba.signature.bind_partial(**grads)
@@ -353,7 +373,9 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     del ba  # Unused.
     return set()
 
-  def _capture_batched_args[_T2](self, fn: Callable[..., _T2]) -> Callable[..., _T2]:  # pytype: disable=not-supported-yet
+  def _capture_batched_args[_T2](
+      self, fn: Callable[..., _T2]
+  ) -> Callable[..., _T2]:
     if self.supports_batched_args_capture:
       return batching.capture_batched_args(fn)
     return lambda *args, **kwargs: fn(*args, batched_args=None, **kwargs)
@@ -382,18 +404,14 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     return True
 
 
-_AUTOTUNING_CACHE: dict[
-    Op, dict[DeviceKind, dict[Any, AutotuningData[Any]]]
-] = {}
+type AutotuningCache = dict[DeviceKind, dict[Any, AutotuningData[Any]]]
 
-_AUTOTUNING_CACHE_OVERLAY = threading.local()
+_AUTOTUNING_CACHE: dict[Op, AutotuningCache] = {}  # pylint: disable=g-bare-generic
 
-
-def get_autotuning_cache_overlay_state() -> Any:
-  if not hasattr(_AUTOTUNING_CACHE_OVERLAY, "stack"):
-    _AUTOTUNING_CACHE_OVERLAY.stack = []
-    _AUTOTUNING_CACHE_OVERLAY.context = jax.make_user_context(())
-  return _AUTOTUNING_CACHE_OVERLAY
+AUTOTUNING_CACHE_OVERLAY_STACK: Final[
+    contextvars.ContextVar[tuple[dict[Op, AutotuningCache], ...]]  # pylint: disable=g-bare-generic
+] = contextvars.ContextVar("AUTOTUNING_CACHE_OVERLAY_STACK", default=())
+AUTOTUNING_CACHE_OVERLAY_JAX_CONFIG: Final[Any] = jax.make_user_context(())
 
 
 @final
@@ -405,7 +423,7 @@ class AUTO:
 class BoundArguments[C, K: Hashable]:
   """Bound arguments for an op's `__call__` method."""
 
-  op: Op[..., Any, Any, C, K]  # pytype: disable=invalid-annotation
+  op: Op[..., Any, Any, C, K]
   arguments: Mapping[str, Any]
 
   def __post_init__(self):
@@ -485,12 +503,12 @@ class BoundArguments[C, K: Hashable]:
 
     if check_autotuning_cache:
       if (data := self.cached_autotuning_data) is not None and data.items():
-        return data.fastest_config  # pytype: disable=unbound-type-param
+        return data.fastest_config
 
     if autotune_configs is not None:
       return self.autotune(
           autotune_configs, cache_results=cache_autotuning_results
-      ).fastest_config  # pytype: disable=unbound-type-param
+      ).fastest_config
 
     if allow_heuristics:
       return heuristics_config
@@ -518,7 +536,7 @@ class BoundArguments[C, K: Hashable]:
       device_kind = backend.get_default_device().device_kind
     key = self.autotuning_cache_key
 
-    for overlay in reversed(get_autotuning_cache_overlay_state().stack):
+    for overlay in reversed(AUTOTUNING_CACHE_OVERLAY_STACK.get()):
       data = overlay.get(self.op, {}).get(device_kind, {}).get(key)
       if data is not None:
         return data
@@ -526,7 +544,8 @@ class BoundArguments[C, K: Hashable]:
     try:
       return self.op.get_autotuning_cache()[key]
     except KeyError:
-      json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))  # pyrefly: ignore[no-matching-overload]
+      key = cast(Mapping[str, Any], key)
+      json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
 
       logging.warning(
           "Autotuning cache miss for %s on %s with key %s",

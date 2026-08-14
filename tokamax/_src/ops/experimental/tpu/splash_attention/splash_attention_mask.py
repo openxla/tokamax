@@ -17,7 +17,7 @@
 
 from collections.abc import Callable
 import dataclasses
-from typing import Any, Self
+from typing import Any
 
 import numpy as np
 
@@ -40,19 +40,19 @@ class Mask:
         ' instead of bitwise operations on masks.'
     )
 
-  def __or__(self, other: Self) -> Self:
+  def __or__(self, other: 'Mask') -> 'Mask':
     if self.shape != other.shape:
       raise ValueError(
           f'Invalid shape for other: {other.shape}, expected: {self.shape}'
       )
-    return LogicalOr(self, other)  # pyrefly: ignore[bad-return]
+    return LogicalOr(self, other)
 
-  def __and__(self, other: Self) -> Self:
+  def __and__(self, other: 'Mask') -> 'Mask':
     if self.shape != other.shape:
       raise ValueError(
           f'Invalid shape for other: {other.shape}, expected: {self.shape}'
       )
-    return LogicalAnd(self, other)  # pyrefly: ignore[bad-return]
+    return LogicalAnd(self, other)
 
 
 def make_causal_mask(shape: tuple[int, int], offset: int = 0) -> np.ndarray:

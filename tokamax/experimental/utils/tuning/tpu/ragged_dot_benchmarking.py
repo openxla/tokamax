@@ -338,30 +338,26 @@ def run_benchmark(
     print(tune_jax.tabulate(lax_drhs_fn))
   # drhs #######################################################################
 
-  # pytype: disable=name-error
     with jax.profiler.trace("/tmp/ragged_dot_benchmark"):
     if "fwd" in modes_to_tune:
       for _ in range(3):
-        jax.block_until_ready(fn_fwd(lhs, rhs, gs))
+        jax.block_until_ready(fn_fwd(lhs, rhs, gs))  # pyrefly: ignore[unbound-name]
       for _ in range(3):
-        jax.block_until_ready(lax_fn_fwd(lhs, rhs, gs))
+        jax.block_until_ready(lax_fn_fwd(lhs, rhs, gs))  # pyrefly: ignore[unbound-name]
     if "dlhs" in modes_to_tune:
       for _ in range(3):
-        jax.block_until_ready(dlhs_fn(dout, rhs, gs))
+        jax.block_until_ready(dlhs_fn(dout, rhs, gs))  # pyrefly: ignore[unbound-name]
       for _ in range(3):
-        jax.block_until_ready(lax_dlhs_fn(dout, rhs, gs))
+        jax.block_until_ready(lax_dlhs_fn(dout, rhs, gs))  # pyrefly: ignore[unbound-name]
     if "drhs" in modes_to_tune:
       for _ in range(3):
-        jax.block_until_ready(drhs_fn(lhs, dout, gs))
+        jax.block_until_ready(drhs_fn(lhs, dout, gs))  # pyrefly: ignore[unbound-name]
       for _ in range(3):
-        jax.block_until_ready(lax_drhs_fn(lhs, dout, gs))
-  # pytype: enable=name-error
+        jax.block_until_ready(lax_drhs_fn(lhs, dout, gs))  # pyrefly: ignore[unbound-name]
   print("######### XPROF URL HERE #########")
   print("Results at /tmp/ragged_dot_benchmark")
   print("######### XPROF URL HERE #########", flush=True)
 
-  # pytype: disable=name-error
-  # pytype: disable=attribute-error
   print("-------------------------  Results -------------------------")
   print(f"For m={m}, k={k}, n={n}, g={g}")
   if "fwd" in modes_to_tune:
@@ -371,8 +367,6 @@ def run_benchmark(
   if "drhs" in modes_to_tune:
     print(f"DRHS: {drhs_fn.optimal_hyperparams=}")
   print("------------------------------------------------------------")
-  # pytype: enable=attribute-error
-  # pytype: enable=name-error
 
 
 def main(argv):

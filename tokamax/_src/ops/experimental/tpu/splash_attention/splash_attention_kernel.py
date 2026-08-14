@@ -262,7 +262,7 @@ def _apply_mask_and_soft_cap(
   if has_partial_mask:
     if mask_ref is not None:
       mask = mask_ref[:, k_slice] if k_in_lanes else mask_ref[k_slice, :]
-      masks.append(mask)
+      masks.append(mask.astype(jnp.bool_))
     elif mask_function is not None:
       # Compute the mask using the given q_sequence indices.
       # KV indices are computed on the fly. This works because we only support Q
@@ -291,7 +291,7 @@ def _apply_mask_and_soft_cap(
         q_sequence = jnp.broadcast_to(q_sequence, (k_slice.size, bq))
 
       assert q_sequence.shape == k_sequence.shape
-      computed_mask = mask_function(q_sequence, k_sequence)  # pytype: disable=wrong-arg-count
+      computed_mask = mask_function(q_sequence, k_sequence)
       if computed_mask.dtype != jnp.dtype(jnp.bool_):
         raise ValueError(
             "Mask function must return a boolean-valued array, but got:"
@@ -325,6 +325,7 @@ def _apply_mask_and_soft_cap(
       return logits
 
   if masks:
+    masks = [m.astype(jnp.bool_) for m in masks]
     mask = functools.reduce(jnp.logical_and, masks)
     qk = cap_logits(qk)
     if mask.ndim == 2 and qk.ndim == 3:
@@ -508,7 +509,7 @@ def flash_attention_kernel(
     qk = apply_mask_and_soft_cap()
 
     if max_logit_estimate is None:
-      m_curr = qk.max(axis=-1)[..., None]  # pytype: disable=attribute-error
+      m_curr = qk.max(axis=-1)[..., None]  # pyrefly: ignore[missing-attribute]
       assert m_curr.shape == (num_stacked_q_heads, bq, 1)
       m_next = jnp.maximum(m_prev, m_curr)
       assert m_next.shape == (num_stacked_q_heads, bq, NUM_LANES)
@@ -1104,7 +1105,7 @@ def _splash_attention_custom(
   # device.
   del dkv_mask_info
 
-  ret = _splash_attention_forward(  # pytype: disable=wrong-arg-types
+  ret = _splash_attention_forward(
       fwd_mask_info,
       q,
       k,
@@ -1151,7 +1152,7 @@ def _splash_attention_fwd(
   # if save_residuals:
   #   raise NotImplementedError("Higher-order AD not supported.")
 
-  out, stats = _splash_attention_forward(  # pytype: disable=wrong-arg-types
+  out, stats = _splash_attention_forward(
       fwd_mask_info,
       q,
       k,
@@ -2004,7 +2005,7 @@ def _splash_attention_bwd(
   q, k, v, segment_ids, sinks, o, logsumexp, dkv_mask_info = res
 
   # di: [num_heads, q_seq_len]
-  di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))  # pytype: disable=attribute-error
+  di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))  # pyrefly: ignore[missing-attribute]
   dq, dk, dv = _splash_attention_bwd_dkv(
       q,
       k,
@@ -2133,7 +2134,7 @@ class SplashAttentionKernel:
       raise ValueError("Only q sequence sharding is supported.")
 
     _resolve_spec = lambda x: sharding.spec if x is not None else None
-    mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
+    mask_info_specs = MaskInfo(
         mask_next=_resolve_spec(self.fwd_mask_info.mask_next),  # pyrefly: ignore[bad-argument-type]
         active_rows=_resolve_spec(self.fwd_mask_info.active_rows),  # pyrefly: ignore[bad-argument-type]
         active_cols=_resolve_spec(self.fwd_mask_info.active_cols),  # pyrefly: ignore[bad-argument-type]
@@ -2304,7 +2305,7 @@ def _make_dynamic_splash_attention(
     kernel = SplashAttentionKernel(fwd_mask_info, dkv_mask_info, **kwargs)
     return kernel
 
-  mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
+  mask_info_specs = MaskInfo(
       mask_next=mask_spec,  # pyrefly: ignore[bad-argument-type]
       active_rows=None,
       active_cols=None,

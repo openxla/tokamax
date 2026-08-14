@@ -69,7 +69,7 @@ class RaggedDotBenchmark(parameterized.TestCase):
     fn, args = tokamax.standardize_function(
         ragged_dot_fn,
         kwargs=EXAMPLE,
-        mode=benchmark_mode,  # pytype: disable=wrong-arg-types
+        mode=benchmark_mode,
     )
     fn = jax.jit(fn)
     res = tokamax.benchmark(fn, args)

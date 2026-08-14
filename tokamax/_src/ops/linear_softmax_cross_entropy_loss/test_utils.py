@@ -17,11 +17,16 @@
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Integer, Key, Real
+from jaxtyping import Array, Integer, Key, Real  # pylint: disable=g-multiple-import,g-importing-member
+
 
 # TODO: Get rid of this routine.
 def generate_random_data(
-    key: Key, b_dim: int, h_dim: int, v_dim: int, dtype: jnp.dtype = jnp.float32  # pyrefly: ignore[invalid-annotation]
+    key: Key,  # pyrefly: ignore[invalid-annotation]
+    b_dim: int,
+    h_dim: int,
+    v_dim: int,
+    dtype: jax.typing.DTypeLike = jnp.float32,
 ) -> tuple[Real[Array, "B H"], Integer[Array, "B"], Real[Array, "H V"]]:
   """Generates random data for flash loss tests.
 

@@ -23,9 +23,9 @@ import jax.numpy as jnp
 from jax.sharding import ManualAxisType
 import pydantic
 from tokamax._src.ops import op
+from tokamax._src.ops.experimental.gmm_v2 import gmm_v2 as gmm_backend
+from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.ragged_dot import base
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_backend
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
 
 
 QArray = base.QArray
@@ -44,6 +44,7 @@ class Config:
   tile_m: pydantic.PositiveInt | None = None
   tile_k: pydantic.PositiveInt | None = None
   tile_n: pydantic.PositiveInt | None = None
+  bucket_base: pydantic.PositiveInt | None = None
 
 DEFAULT_RAGGED_DOT_DIM_NUMS = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 DLHS_RAGGED_DOT_DIM_NUMS = base.TRANS_RHS_RAGGED_DOT_DIM_NUMS
@@ -90,6 +91,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
   # Set by the custom vjp (see `__post_init__`); `None` for the forward and
   # for direct (non-autodiff) drhs calls.
   num_actual_groups: int | None = None
+  dlhs_config: Config | None = None
+  drhs_config: Config | None = None
 
   def __post_init__(self):
     qdtype: str | None = (
@@ -106,15 +109,22 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             config=config,
         )(*args, **kw)
 
-      if self.config is not None:
+      if self.dlhs_config is not None:
+        dlhs_config = self.dlhs_config
+      elif self.config is not None:
         dlhs_config = Config(
             tile_m=self.config.tile_m,
             tile_k=self.config.tile_n,
             tile_n=self.config.tile_k,
+            bucket_base=self.config.bucket_base,
         )
       else:
         dlhs_config = None
-      drhs_config = self.config
+
+      if self.drhs_config is not None:
+        drhs_config = self.drhs_config
+      else:
+        drhs_config = self.config
 
       def _vjp(residuals, out, dout, lhs, rhs, **kwargs):
         # Under expert parallelism `group_sizes` is global, but the original
@@ -190,9 +200,11 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     # heuristic below.
     explicit_tiles = (
         None
-        if None in (config.tile_m, config.tile_k, config.tile_n)
+        if None in (config.tile_m, config.tile_k, config.tile_n,
+                    config.bucket_base)
         else gmm_backend.TileSizes(
-            tile_m=config.tile_m, tile_k=config.tile_k, tile_n=config.tile_n
+            tile_m=config.tile_m, tile_k=config.tile_k, tile_n=config.tile_n,  # pyrefly: ignore[bad-argument-type]
+            bucket_base=config.bucket_base,  # pyrefly: ignore[bad-argument-type]
         )
     )
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
@@ -207,8 +219,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           if explicit_tiles is not None
           else gmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
-          precision=precision,
-          preferred_element_type=preferred_element_type,
+          precision=precision,  # pyrefly: ignore[bad-argument-type]
+          preferred_element_type=preferred_element_type,  # pyrefly: ignore[bad-argument-type]
           acc_dtype=acc_dtype,
           maybe_quantize_lhs=maybe_quantize_lhs,
           zero_initialize=zero_initialize,
@@ -226,8 +238,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           if explicit_tiles is not None
           else gmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
-          precision=precision,
-          preferred_element_type=preferred_element_type
+          precision=precision,  # pyrefly: ignore[bad-argument-type]
+          preferred_element_type=preferred_element_type  # pyrefly: ignore[bad-argument-type]
           if preferred_element_type is not None
           else lhs.dtype,
           acc_dtype=acc_dtype,
@@ -257,8 +269,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           if explicit_tiles is not None
           else tgmm_backend.calculate_tgmm_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
-          precision=precision,
-          preferred_element_type=preferred_element_type
+          precision=precision,  # pyrefly: ignore[bad-argument-type]
+          preferred_element_type=preferred_element_type  # pyrefly: ignore[bad-argument-type]
           if preferred_element_type is not None
           else lhs.dtype,
           acc_dtype=acc_dtype,
@@ -291,4 +303,4 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 6
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5

@@ -30,7 +30,7 @@ from tokamax._src import numerics
 from tokamax.benchmarks import common
 
 try:
-  import cuequivariance_jax  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  import cuequivariance_jax  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-import]
 except ImportError:
   cuequivariance_jax = None
 
@@ -152,7 +152,7 @@ class AttentionBenchmark(parameterized.TestCase):
     fn, args = tokamax.standardize_function(
         fn,
         kwargs=example,
-        mode=benchmark_mode,  # pytype: disable=wrong-arg-types
+        mode=benchmark_mode,
     )
     fn = jax.jit(fn)
     res = tokamax.benchmark(fn, args)
@@ -179,12 +179,13 @@ class AttentionBenchmark(parameterized.TestCase):
         and args_spec_name == 'basic'
     ):
       t1 = time.time()
-      autotune_res = tokamax.autotune(fn, args)
+      autotune_res = tokamax.autotune(fn, args, ignore_cache=True)
       time_autotune = time.time() - t1
+      time_autotune_ms = time_autotune * 1000
 
       common.write_tensorboard_logs(
           tensorboard_output=_TENSORBOARD_OUTPUT_ENV_VAR.value,
-          value=time_autotune,
+          value=time_autotune_ms,
           metric_tag=(
               f'attention/{args_spec_name}/mosaic/forward_and_vjp/autotuning_time'
           ),
@@ -215,7 +216,7 @@ class AttentionBenchmark(parameterized.TestCase):
             tokamax.dot_product_attention, implementation='xla_chunked'
         ),
         kwargs=example_ref,
-        mode=benchmark_mode,  # pytype: disable=wrong-arg-types
+        mode=benchmark_mode,
     )
     out_ref = jax.jit(fn_ref)(args_ref)
     out_actual = fn(args)

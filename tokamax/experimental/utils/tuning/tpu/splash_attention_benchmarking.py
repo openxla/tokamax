@@ -34,7 +34,6 @@ import tune_jax
 
 QKVLayout = splash.QKVLayout
 
-# pytype: disable=attribute-error
 
 flags.DEFINE_integer("num_samples", int(1e30), "Tuning samples upper bound.")
 flags.DEFINE_integer("q_seq_len", 4096, "Number of q sequence length.")
@@ -235,10 +234,10 @@ def run_benchmark(
   print("Autotuning results:")
   print(tune_jax.tabulate(tuned_splash))
   print("Optimal hyperparameters:")
-  print(tuned_splash.optimal_hyperparams)  # pytype: disable=attribute-error
+  print(tuned_splash.optimal_hyperparams)
   print("-------------------------------------------------------------------\n")
 
-  return tuned_splash.optimal_hyperparams  # pytype: disable=attribute-error
+  return tuned_splash.optimal_hyperparams
 
 
 def _pallas_call_hlo_pattern(mode: str, mqa: bool) -> str:

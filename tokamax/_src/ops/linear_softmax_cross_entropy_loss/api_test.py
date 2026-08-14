@@ -119,14 +119,9 @@ class ApiTest(parameterized.TestCase):
         include_xla_kernels=False,
     )
 
-    mosaic_tpu_impl = (
-        type(api.IMPLEMENTATIONS.get("mosaic_tpu"))
-        if jax.default_backend() == "tpu"
-        else None
-    )
-
     if jax.default_backend() == "tpu":
-      self.assertIsInstance(opspecs[0].op, mosaic_tpu_impl)  # pyrefly: ignore[bad-argument-type]
+      mosaic_tpu_impl = type(api.IMPLEMENTATIONS.get("mosaic_tpu"))
+      self.assertIsInstance(opspecs[0].op, mosaic_tpu_impl)
     else:
       # CPU / GPU are using XLA implementation
       self.assertEmpty(opspecs)

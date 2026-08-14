@@ -46,7 +46,7 @@ def _dynamic_slice_mask_info(
 ) -> MaskInfo:
   """Slices MaskInfo for the current ring step."""
 
-  def slice_if_exists(arr: jax.Array | None):
+  def slice_if_exists(arr: jax.Array | np.ndarray | None):
     if arr is None:
       return None
 
@@ -55,11 +55,11 @@ def _dynamic_slice_mask_info(
     return lax.dynamic_slice_in_dim(arr, start_idx, shard_len, axis=-1)
 
   return MaskInfo(
-      mask_next=slice_if_exists(mask_info.mask_next),  # pyrefly: ignore[bad-argument-type]
-      active_rows=slice_if_exists(mask_info.active_rows),  # pyrefly: ignore[bad-argument-type]
-      active_cols=slice_if_exists(mask_info.active_cols),  # pyrefly: ignore[bad-argument-type]
-      num_active_blocks=slice_if_exists(mask_info.num_active_blocks),  # pyrefly: ignore[bad-argument-type]
-      block_mask=slice_if_exists(mask_info.block_mask),  # pyrefly: ignore[bad-argument-type]
+      mask_next=slice_if_exists(mask_info.mask_next),
+      active_rows=slice_if_exists(mask_info.active_rows),
+      active_cols=slice_if_exists(mask_info.active_cols),
+      num_active_blocks=slice_if_exists(mask_info.num_active_blocks),
+      block_mask=slice_if_exists(mask_info.block_mask),
       partial_mask_blocks=mask_info.partial_mask_blocks,  # partial mask blocks are global
       q_sequence=mask_info.q_sequence,  # Q sequence stays stationary
   )
@@ -118,7 +118,7 @@ def _ring_attention_forward(
       max_logit_value=None,
   )
   # Initial accumulator values
-  o_shape = q.shape
+  o_shape = (*q.shape[:-1], v.shape[-1])
   o_init = jnp.zeros(o_shape, dtype=jnp.float32)
   l_init = jnp.zeros((o_shape[0], o_shape[1]), jnp.float32)
   m_init = jnp.full_like(l_init, mask_value, dtype=jnp.float32)
@@ -577,7 +577,7 @@ class RingSplashAttentionKernel:
     spec = jax.sharding.PartitionSpec(self.ring_axis)
     _resolve_spec = lambda x: spec if x is not None else None
 
-    mask_info_specs = MaskInfo(  # pytype: disable=wrong-arg-types
+    mask_info_specs = MaskInfo(
         mask_next=_resolve_spec(self.fwd_mask_info.mask_next),  # pyrefly: ignore[bad-argument-type]
         active_rows=_resolve_spec(self.fwd_mask_info.active_rows),  # pyrefly: ignore[bad-argument-type]
         active_cols=_resolve_spec(self.fwd_mask_info.active_cols),  # pyrefly: ignore[bad-argument-type]

@@ -33,6 +33,7 @@ def _create_arg_spec(
     w_dtype: jax.typing.DTypeLike,
     project: str = '',
     tags: tuple[arg_spec.Tag, ...] = (),
+    excluded_platforms: tuple[str, ...] = (),
 ) -> arg_spec.ArgSpec:
   return arg_spec.ArgSpec(
       dict(
@@ -43,6 +44,7 @@ def _create_arg_spec(
       ),
       project=project,
       tags=tags,
+      excluded_platforms=excluded_platforms,
   )
 
 
@@ -63,6 +65,8 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
                 and x_dtype == jnp.bfloat16
                 else ()
             ),
+            # TODO: HBM page fault on TPU v5p.
+            excluded_platforms=('TPU v5p', 'TPU v5'),
         )
         for batch_dim, reduction, x_dtype in itertools.product(
             [1024, 2048, 4096, 16384, 32768, 131072],

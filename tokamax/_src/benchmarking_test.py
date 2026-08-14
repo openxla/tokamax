@@ -89,7 +89,7 @@ class BenchmarkingTest(parameterized.TestCase):
               dtype=jnp.float32,
           )
       }
-      golden_vjp = [
+      golden_vjp = (
           jnp.array(
               [[11.864799, -3.979468], [-10.16194, 5.627968]],
               dtype=jnp.float32,
@@ -102,7 +102,7 @@ class BenchmarkingTest(parameterized.TestCase):
               [[19.885725, 5.087355], [-6.428973, 0.18801]],
               dtype=jnp.float32,
           ),
-      ]
+      )
       # Tests against goldens ensures that initialization is constant over
       # time. Tests both forward and backward consistency.
       chex.assert_trees_all_close(out_fwd_vjp, golden_out, rtol=1e-4)

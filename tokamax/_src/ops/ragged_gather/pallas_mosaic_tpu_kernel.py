@@ -15,7 +15,6 @@
 """optimized TPU Pallas/Mosaic kernel for Ragged Gather."""
 
 import functools
-import math
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -113,8 +112,8 @@ def main_kernel(
     # but for other bitwidths, this is not possible. Therefore, we bitcast data
     # into 32-bits first to fetch packing number of rows per dma and later
     # perform bitwise unpacking / packing to obtain desired results.
-    in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)
-    out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)
+    in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
+    out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
 
     for col_vmem_start in range(0, col_size, num_lanes):
       col_hbm_start = pl.multiple_of(col_tile_start + col_vmem_start, num_lanes)

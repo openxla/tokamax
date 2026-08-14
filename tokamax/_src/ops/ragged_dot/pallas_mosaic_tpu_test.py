@@ -103,7 +103,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
 
   def test_vjp0(self):
     with test_base.override_chex_args(atol=0.2, rtol=0.01):
-      super().test_vjp0()  # pytype: disable=attribute-error
+      super().test_vjp0()  # pyrefly: ignore[missing-attribute]
 
   def test_shard_map_manual_axis_type_varying(self):
     if jax.devices()[0].device_kind.startswith("TPU7x"):

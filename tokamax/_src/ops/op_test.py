@@ -21,8 +21,10 @@ from absl.testing import parameterized
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
+import tokamax
 from tokamax._src import batching
 from tokamax._src import config as config_lib
+from tokamax._src import hlo_utils
 from tokamax._src import utils
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import arg_specs as attn_arg_specs
@@ -52,15 +54,15 @@ def _eval_shape(spec):
   if not callable(spec):
     return spec
 
-  other = [None]
-  merge = [None]
-  out_tree = [None]
+  other: list[Any] = [None]
+  merge: list[Any] = [None]
+  out_tree: list[Any] = [None]
 
   def f():
     out = spec()
-    out_flat, out_tree[0] = jax.tree.flatten(out)  # pyrefly: ignore[unsupported-operation]
+    out_flat, out_tree[0] = jax.tree.flatten(out)
     is_array = lambda x: isinstance(x, jax.Array)
-    arrays, other[0], merge[0] = utils.split_merge(is_array, out_flat)  # pyrefly: ignore[unsupported-operation]
+    arrays, other[0], merge[0] = utils.split_merge(is_array, out_flat)
     return arrays
 
   shapes = jax.eval_shape(f)

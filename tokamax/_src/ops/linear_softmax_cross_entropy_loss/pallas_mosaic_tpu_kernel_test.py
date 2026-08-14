@@ -18,9 +18,9 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tokamax._src import numerics
-import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu as pallas_mosaic_tpu
-import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel as kernel
-import tokamax._src.ops.linear_softmax_cross_entropy_loss.reference as reference
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference
 
 
 class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
@@ -179,6 +179,69 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           reduction="none",
       ),
       dict(
+          testcase_name="fwd_b_non_aligned_block_size_sum_reduction_test",
+          b_dim=4352,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="sum",
+      ),
+      dict(
+          testcase_name="fwd_b_non_aligned_block_size_mean_reduction_test",
+          b_dim=4352,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="mean",
+      ),
+      dict(
+          testcase_name="fwd_b_non_aligned_block_size_none_reduction_test",
+          b_dim=4352,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="none",
+      ),
+      dict(
+          testcase_name="fwd_b_non_aligned_multiple_of_128_sum_reduction_test",
+          b_dim=5133,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="sum",
+      ),
+      dict(
+          testcase_name="fwd_b_non_aligned_multiple_of_128_mean_reduction_test",
+          b_dim=5133,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="mean",
+      ),
+      dict(
+          testcase_name="fwd_b_non_aligned_multiple_of_128_none_reduction_test",
+          b_dim=5133,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="none",
+      ),
+      dict(
+          testcase_name="fwd_all_non_aligned_sum_reduction_test",
+          b_dim=5133,
+          h_dim=1288,
+          v_dim=2664,
+          reduction="sum",
+      ),
+      dict(
+          testcase_name="fwd_all_non_aligned_mean_reduction_test",
+          b_dim=5133,
+          h_dim=1288,
+          v_dim=2664,
+          reduction="mean",
+      ),
+      dict(
+          testcase_name="fwd_all_non_aligned_none_reduction_test",
+          b_dim=5133,
+          h_dim=1288,
+          v_dim=2664,
+          reduction="none",
+      ),
+      dict(
           testcase_name="fwd_bfloat16_sum_reduction_test",
           b_dim=4096,
           h_dim=512,
@@ -282,6 +345,27 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           reduction="mean",
       ),
       dict(
+          testcase_name="bwd_small_size_none_reduction_test",
+          b_dim=1024,
+          h_dim=512,
+          v_dim=2048,
+          reduction="none",
+      ),
+      dict(
+          testcase_name="bwd_medium_size_none_reduction_test",
+          b_dim=4096,
+          h_dim=1024,
+          v_dim=4096,
+          reduction="none",
+      ),
+      dict(
+          testcase_name="bwd_large_size_none_reduction_test",
+          b_dim=16384,
+          h_dim=4096,
+          v_dim=16384,
+          reduction="none",
+      ),
+      dict(
           testcase_name="bwd_v_non_aligned_block_size_sum_reduction_test",
           b_dim=4096,
           h_dim=1024,
@@ -294,6 +378,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           h_dim=1024,
           v_dim=2560,
           reduction="mean",
+      ),
+      dict(
+          testcase_name="bwd_v_non_aligned_block_size_none_reduction_test",
+          b_dim=4096,
+          h_dim=1024,
+          v_dim=2560,
+          reduction="none",
       ),
       dict(
           testcase_name="bwd_v_non_aligned_multiple_of_128_sum_reduction_test",
@@ -310,6 +401,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           reduction="mean",
       ),
       dict(
+          testcase_name="bwd_v_non_aligned_multiple_of_128_none_reduction_test",
+          b_dim=4096,
+          h_dim=1024,
+          v_dim=2664,
+          reduction="none",
+      ),
+      dict(
           testcase_name="bwd_h_non_aligned_block_size_sum_reduction_test",
           b_dim=4096,
           h_dim=1152,
@@ -322,6 +420,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           h_dim=1152,
           v_dim=2048,
           reduction="mean",
+      ),
+      dict(
+          testcase_name="bwd_h_non_aligned_block_size_none_reduction_test",
+          b_dim=4096,
+          h_dim=1152,
+          v_dim=2048,
+          reduction="none",
       ),
       dict(
           testcase_name="bwd_h_non_aligned_multiple_of_128_sum_reduction_test",
@@ -337,6 +442,76 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           v_dim=2048,
           reduction="mean",
       ),
+      dict(
+          testcase_name="bwd_h_non_aligned_multiple_of_128_none_reduction_test",
+          b_dim=4096,
+          h_dim=1288,
+          v_dim=2048,
+          reduction="none",
+      ),
+      dict(
+          testcase_name="bwd_b_non_aligned_block_size_sum_reduction_test",
+          b_dim=4352,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="sum",
+      ),
+      dict(
+          testcase_name="bwd_b_non_aligned_block_size_mean_reduction_test",
+          b_dim=4352,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="mean",
+      ),
+      dict(
+          testcase_name="bwd_b_non_aligned_block_size_none_reduction_test",
+          b_dim=4352,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="none",
+      ),
+      dict(
+          testcase_name="bwd_b_non_aligned_multiple_of_128_sum_reduction_test",
+          b_dim=5133,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="sum",
+      ),
+      dict(
+          testcase_name="bwd_b_non_aligned_multiple_of_128_mean_reduction_test",
+          b_dim=5133,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="mean",
+      ),
+      dict(
+          testcase_name="bwd_b_non_aligned_multiple_of_128_none_reduction_test",
+          b_dim=5133,
+          h_dim=1024,
+          v_dim=2048,
+          reduction="none",
+      ),
+      dict(
+          testcase_name="bwd_all_non_aligned_sum_reduction_test",
+          b_dim=5133,
+          h_dim=1288,
+          v_dim=2664,
+          reduction="sum",
+      ),
+      dict(
+          testcase_name="bwd_all_non_aligned_mean_reduction_test",
+          b_dim=5133,
+          h_dim=1288,
+          v_dim=2664,
+          reduction="mean",
+      ),
+      dict(
+          testcase_name="bwd_all_non_aligned_none_reduction_test",
+          b_dim=5133,
+          h_dim=1288,
+          v_dim=2664,
+          reduction="none",
+      ),
   )
   def test_kernel_bwd_matches_reference(self, b_dim, h_dim, v_dim, reduction):
     config = kernel.get_heuristic_bwd_config(b_dim, h_dim, v_dim)
@@ -350,7 +525,10 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
     )
     lse = jax.nn.logsumexp(x @ w, axis=-1)
 
-    dout = 1.0
+    dout_shape = (b_dim,) if reduction == "none" else ()
+    dout = numerics.random_initialize(
+        (jax.ShapeDtypeStruct(dout_shape, jnp.float32),), seed=42
+    )[0]
     kernel_grad_x, kernel_grad_w = (
         kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
             dout,
@@ -372,21 +550,15 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
     )
 
     self.assertTrue(
-        jnp.allclose(ref_grad_x, kernel_grad_x, atol=3e-2, rtol=3e-2),
+        jnp.allclose(ref_grad_x, kernel_grad_x, atol=5e-2, rtol=5e-2),
         f"ref_grad_x: {ref_grad_x}, kernel_grad_x: {kernel_grad_x}",
     )
     self.assertTrue(
-        jnp.allclose(ref_grad_w, kernel_grad_w, atol=3e-2, rtol=3e-2),
+        jnp.allclose(ref_grad_w, kernel_grad_w, atol=5e-2, rtol=5e-2),
         f"ref_grad_w: {ref_grad_w}, kernel_grad_w: {kernel_grad_w}",
     )
 
   @parameterized.named_parameters(
-      dict(
-          testcase_name="b_dimension_not_multiple_of_b_block_size",
-          b_dim=1500,
-          h_dim=512,
-          v_dim=1024,
-      ),  # B dimension is not a multiple b_block_size
       dict(
           testcase_name="h_dimension_not_multiple_of_8",
           b_dim=1024,
@@ -454,7 +626,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=32 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=2048
+              b_block_size=1024, h_block_size=512, v_block_size=1024
           ),
       ),
       dict(
@@ -464,7 +636,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=57 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=4096
+              b_block_size=1024, h_block_size=512, v_block_size=2048
           ),
       ),
   )
@@ -515,7 +687,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=16 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=512
+              b_block_size=1024, h_block_size=512, v_block_size=256
           ),
       ),
       dict(
@@ -525,7 +697,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=32 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=1024
+              b_block_size=1024, h_block_size=512, v_block_size=512
           ),
       ),
       dict(

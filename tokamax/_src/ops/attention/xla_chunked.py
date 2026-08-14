@@ -358,11 +358,6 @@ class XlaChunkedDotProductAttention(
     if is_paged and not single_chunk:
       raise ValueError("Paged attention does not support multiple chunk sizes.")
 
-    if not is_paged and single_chunk:
-      chunk_size = (self.chunk_size,) * 2
-    else:
-      chunk_size = self.chunk_size
-
     q_k_dot_precision, weights_v_dot_precision = precision
     q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
         q.dtype, k.dtype, q_k_dot_precision
@@ -371,7 +366,12 @@ class XlaChunkedDotProductAttention(
         v.dtype, v.dtype, weights_v_dot_precision
     )
 
-    attn_fn = _attend_paged if is_paged else _attend_chunked
+    if is_paged:
+      attn_fn = functools.partial(_attend_paged, chunk_size=self.chunk_size)
+    else:
+      chunk_size = (n, n) if isinstance(n := self.chunk_size, int) else n
+      attn_fn = functools.partial(_attend_chunked, chunk_size=chunk_size)
+
     return attn_fn(
         q,
         k,
@@ -388,5 +388,4 @@ class XlaChunkedDotProductAttention(
         q_indices=q_indices,
         k_indices=k_indices,
         normalize_output=normalize_output,
-        chunk_size=chunk_size,  # pyrefly: ignore[bad-argument-type]
     )

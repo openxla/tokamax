@@ -91,7 +91,7 @@ def gated_linear_unit(
 
   cluster_size = config.cluster_size_m * config.cluster_size_n
   collective = cluster_size > 1
-  collective_axes = ("cluster",) if collective else None
+  collective_axis = "cluster" if collective else None
   m_iters, n_iters, k_iters = m // tile_m, n // tile_n, k // tile_k
 
   def kernel(
@@ -140,9 +140,8 @@ def gated_linear_unit(
 
       @pl.when(wg_idx == 0)
       def _compute_wg():
-        @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-        def _per_warp():
-          warp_id = lax.axis_index("warp")
+        @plgpu.warp_map
+        def _per_warp(warp_id):
           b_smems = (b0_smem, b1_smem)
           consumed_barriers = (consumed_barrier_0, consumed_barrier_1)
 
@@ -169,7 +168,7 @@ def gated_linear_unit(
                     leader_tracked=plgpu.CopyPartition.PARTITIONED(1)
                     if config.cluster_size_m > 1
                     else None,
-                    collective_axes=collective_axes,
+                    collective_axes=collective_axis,
                 )
               plgpu.copy_gmem_to_smem(
                   a_gmem.at[slice_m, slice_k],
@@ -178,7 +177,7 @@ def gated_linear_unit(
                   leader_tracked=plgpu.CopyPartition.PARTITIONED(1)
                   if config.cluster_size_n > 1
                   else None,
-                  collective_axes="cluster" if collective else None,
+                  collective_axes=collective_axis,
               )
 
             lax.fori_loop(0, k_iters, _loop_body, None)
@@ -204,14 +203,14 @@ def gated_linear_unit(
                     b_smems[i].at[slot],
                     consumed_barriers[i].at[slot],
                     accumulate=(ki > 0),
-                    collective_axis=collective_axes,  # pyrefly: ignore[bad-argument-type]
+                    collective_axis=collective_axis,
                 )
 
               @pl.when(ki >= k_iters - 1)
               def _arrive():
                 plgpu.tcgen05_commit_arrive(
                     mma_done_barrier.at[acc_slot],
-                    collective_axis=collective_axes,  # pyrefly: ignore[bad-argument-type]
+                    collective_axis=collective_axis,
                 )
 
             lax.fori_loop(0, k_iters, _loop_body, None)

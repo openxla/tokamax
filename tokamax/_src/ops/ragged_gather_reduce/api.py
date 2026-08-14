@@ -27,7 +27,7 @@ _IMPLEMENTATIONS = dict(xla=base.RaggedGatherReduce())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.ragged_gather_reduce import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.ragged_gather_reduce import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["mosaic_tpu"] = (
       pallas_mosaic_tpu.PallasTpuRaggedGatherReduce()

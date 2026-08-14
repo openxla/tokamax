@@ -19,28 +19,28 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import compute_conv1d
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import compute_gdn
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import config
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import memory_ref
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import metadata
-from tokamax._src.ops.experimental.causal_conv1d_gated_delta_rule import vmem_ldst
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import compute_conv1d
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import compute_gdn
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import metadata
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import vmem_ldst
 
 
 def inner_kernel(
     # Inputs.
-    qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
-    b_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    a_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    conv_state_slot_ref: jax.Array,  # [seq, prev_kernel_size, 1, dim_size]
-    recurrent_slot_ref: jax.Array,  # [seq, num_v_heads, kq_head, v_head]
+    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
+    b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    conv_state_slot_ref: jax.Ref,  # [seq, prev_kernel_size, 1, dim_size]
+    recurrent_slot_ref: jax.Ref,  # [seq, num_v_heads, kq_head, v_head]
     # Outputs.
     out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
     # Scratches.
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
-    carry_conv_scratch_ref: jax.Array | None,
-    carry_recurrent_scratch_ref: jax.Array | None,
+    carry_conv_scratch_ref: jax.Ref | None,
+    carry_recurrent_scratch_ref: jax.Ref | None,
     *,
     cfg: config.GDNConfig,
 ) -> None:
@@ -75,10 +75,10 @@ def inner_kernel(
   real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
       metadata_ref=metadata_ref,
       p_id=p_id,
-      conv_state_slot_ref=conv_state_slot_ref,  # pyrefly: ignore[bad-argument-type]
-      recurrent_slot_ref=recurrent_slot_ref,  # pyrefly: ignore[bad-argument-type]
-      carry_conv_scratch_ref=carry_conv_scratch_ref,  # pyrefly: ignore[bad-argument-type]
-      carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,  # pyrefly: ignore[bad-argument-type]
+      conv_state_slot_ref=conv_state_slot_ref,
+      recurrent_slot_ref=recurrent_slot_ref,
+      carry_conv_scratch_ref=carry_conv_scratch_ref,
+      carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
       cfg=cfg,
   )
 
@@ -126,9 +126,9 @@ def inner_kernel(
     q_compact, k_compact, v_compact, b_compact, a_compact = (
         vmem_ldst.load_activation_as_compact(
             qkv_vreg=qkv_out_compact,
-            qkv_vmem_ref=qkv_slot_ref,  # pyrefly: ignore[bad-argument-type]
-            b_vmem_ref=b_slot_ref,  # pyrefly: ignore[bad-argument-type]
-            a_vmem_ref=a_slot_ref,  # pyrefly: ignore[bad-argument-type]
+            qkv_vmem_ref=qkv_slot_ref,
+            b_vmem_ref=b_slot_ref,
+            a_vmem_ref=a_slot_ref,
             cfgs=cfg,
         )
     )
@@ -150,9 +150,9 @@ def inner_kernel(
     q_large, k_large, v_large, b_large, a_large = (
         vmem_ldst.load_activation_as_large(
             qkv_vreg=qkv_out_compact,
-            qkv_vmem_ref=qkv_slot_ref,  # pyrefly: ignore[bad-argument-type]
-            b_vmem_ref=b_slot_ref,  # pyrefly: ignore[bad-argument-type]
-            a_vmem_ref=a_slot_ref,  # pyrefly: ignore[bad-argument-type]
+            qkv_vmem_ref=qkv_slot_ref,
+            b_vmem_ref=b_slot_ref,
+            a_vmem_ref=a_slot_ref,
             cfgs=cfg,
         )
     )

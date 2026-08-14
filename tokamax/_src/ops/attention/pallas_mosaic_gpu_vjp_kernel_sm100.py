@@ -18,7 +18,7 @@
 
 import functools
 import math
-from typing import cast
+from typing import Any, cast
 
 import jax
 from jax import lax
@@ -133,10 +133,8 @@ def _get_dkv_scratch_shapes(
   shapes = dict(
       k_smem=_tiled_smem((block_kv, head_dim), k_dtype),
       v_smem=_tiled_smem((block_kv, head_dim_out), v_dtype),
-      q_smem=_tiled_smem((num_stages, block_q, head_dim), q_dtype, swizzle=64),
-      do_smem=_tiled_smem(
-          (num_stages, block_q, head_dim_out), dout_dtype, swizzle=64
-      ),
+      q_smem=_tiled_smem((num_stages, block_q, head_dim), q_dtype),
+      do_smem=_tiled_smem((num_stages, block_q, head_dim_out), dout_dtype),
       s_p_tmems=plgpu.RefUnion(
           plgpu.TMEM((block_kv, block_q), jnp.float32),
           plgpu.TMEM((block_kv, block_q), dout_dtype, packed=True),
@@ -304,33 +302,8 @@ def _get_input_metadata(q, v):
   return head_dim, head_dim_out
 
 
-def _estimate_smem_bytes(scratch_shapes: dict) -> int:
-  """Estimates the total SMEM usage in bytes for a given scratch shapes dict."""
-  total_bytes = 0
-  for val in scratch_shapes.values():
-    if isinstance(val, plgpu.RefUnion):
-      max_size = 0
-      for ref in val.refs:
-        if (
-            hasattr(ref, "memory_space")
-            and getattr(ref.memory_space, "value", "") == "smem"
-        ):
-          size = math.prod(ref.shape) * jnp.dtype(ref.dtype).itemsize
-          max_size = max(max_size, size)
-      total_bytes += (max_size + 1023) // 1024 * 1024
-    elif (
-        hasattr(val, "memory_space")
-        and getattr(val.memory_space, "value", "") == "smem"
-    ):
-      size = math.prod(val.shape) * jnp.dtype(val.dtype).itemsize
-      total_bytes += (size + 1023) // 1024 * 1024
-    elif isinstance(val, (plgpu.Barrier, plgpu.ClusterBarrier)):
-      num_barriers = val.num_barriers
-      if isinstance(num_barriers, tuple):
-        num_barriers = math.prod(num_barriers)
-      total_bytes += num_barriers * 8
-  # Add a 4096 byte compiler safety margin.
-  return total_bytes + 4096 * 2
+def _estimate_smem_bytes(scratch_shapes: dict[str, Any]) -> int:
+  return mgpu_lib.estimate_smem_bytes(scratch_shapes) + 4096 * 2
 
 
 def _kernel_dq(
@@ -402,10 +375,8 @@ def _kernel_dq(
   @pl.when((wg == 0) & (ub > lb))
   def mma_tma_wg():
 
-    @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-    def per_warp():
-      warp_id = lax.axis_index("warp")
-
+    @plgpu.warp_map
+    def per_warp(warp_id):
       def cp(gmem, smem, barrier, si=()):
         plgpu.copy_gmem_to_smem(gmem, smem.at[si], barrier.at[si])
 
@@ -437,22 +408,22 @@ def _kernel_dq(
         @pl.when(warp_id == 3)
         def tma_eltwise_warp():
           if bias_smem is not None:
-            plgpu.barrier_arrive(bias_consumed)
+            plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
           if mask_smem is not None:
-            plgpu.barrier_arrive(mask_consumed)
+            plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
           @pl.loop(lb, ub)
           def kv_loop(ki):
             ks = pl.ds(ki * block_kv, block_kv)
 
             if bias_smem is not None:
-              plgpu.barrier_wait(bias_consumed)
+              plgpu.barrier_wait(bias_consumed)  # pyrefly: ignore[bad-argument-type]
               mgpu_lib.fence_async_shared_cta()
               bias_hi = 0 if bias_gmem.shape[-3] == 1 else hi
               cp(bias_gmem.at[bias_hi, qs, ks], bias_smem, bias_produced)
 
             if mask_smem is not None:
-              plgpu.barrier_wait(mask_consumed)
+              plgpu.barrier_wait(mask_consumed)  # pyrefly: ignore[bad-argument-type]
               mgpu_lib.fence_async_shared_cta()
               mask_hi = 0 if mask_gmem.shape[-3] == 1 else hi
               mask_qs = 0 if mask_gmem.shape[-2] == 1 else qs
@@ -520,12 +491,11 @@ def _kernel_dq(
     k_end = load_k_range(k_end_gmem)
 
     m = plgpu.load(m_gmem.at[hi, qs], layout=row_layout, optimized=False)
-    l = plgpu.load(l_gmem.at[hi, qs], layout=row_layout, optimized=False)
+    l_rcp = plgpu.load(l_gmem.at[hi, qs], layout=row_layout, optimized=False)
     delta = plgpu.load(
         delta_gmem.at[hi, qs], layout=row_layout, optimized=False
     )
     m *= math.log2(math.e)
-    l_rcp = 1.0 / (l + float(jnp.finfo(jnp.float32).tiny))
 
     @pl.loop(lb, ub)
     def kv_loop(ki):
@@ -540,9 +510,9 @@ def _kernel_dq(
         if bias_smem is None:
           bias = _load_bcast(bias_gmem, (hi, qs, ks), layout=layout)
         else:
-          plgpu.barrier_wait(bias_produced)
+          plgpu.barrier_wait(bias_produced)  # pyrefly: ignore[bad-argument-type]
           bias = plgpu.load(bias_smem, layout=layout)
-          plgpu.barrier_arrive(bias_consumed)
+          plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
         s = s * scale + bias.astype(s.dtype)
         scale = 1.0
 
@@ -589,13 +559,13 @@ def _kernel_dq(
         if mask_smem is None:
           mask = _load_bcast(mask_gmem, (hi, qs, ks), layout=layout)
         else:
-          plgpu.barrier_wait(mask_produced)
+          plgpu.barrier_wait(mask_produced)  # pyrefly: ignore[bad-argument-type]
           if mask_smem.ndim == 1:
             mask = plgpu.load(mask_smem, layout=_TCGEN05_COL)
             mask = lax.broadcast_in_dim(mask, s.shape, [1])
           else:
             mask = plgpu.load(mask_smem, layout=layout)
-          plgpu.barrier_arrive(mask_consumed)
+          plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0
@@ -615,16 +585,17 @@ def _kernel_dq(
       if mask is not None:
         ds = jnp.where(mask, ds, 0.0)
 
+      plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
+      if ds_gmem is not None:
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+      mgpu_lib.tcgen05_wait_st()
+      plgpu.barrier_arrive(ds_produced)
+
       if ds_gmem is not None:
         assert ds_smem is not None
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
         ds_smem[...] = ds.astype(ds_smem.dtype)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(ds_smem, ds_gmem.at[hi, qs, ks])
-
-      plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
-      mgpu_lib.tcgen05_wait_st()
-      plgpu.barrier_arrive(ds_produced)
 
     if ds_gmem is not None:
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
@@ -711,9 +682,8 @@ def _kernel_dkv(
   @pl.when((wg == 0) & (total_steps > 0))
   def mma_tma_wg():
 
-    @pl.core_map(plgpu.WarpMesh(axis_name="warp"))
-    def per_warp():
-      warp_id = lax.axis_index("warp")
+    @plgpu.warp_map
+    def per_warp(warp_id):
 
       def cp(gmem, smem, barrier, si=()):
         plgpu.copy_gmem_to_smem(gmem, smem.at[si], barrier.at[si])
@@ -759,9 +729,9 @@ def _kernel_dkv(
         @pl.when(warp_id == 3)
         def tma_eltwise_warp():
           if bias_smem is not None:
-            plgpu.barrier_arrive(bias_consumed)
+            plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
           if mask_smem is not None:
-            plgpu.barrier_arrive(mask_consumed)
+            plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
           @pl.loop(0, total_steps)
           def q_loop(step):
@@ -770,13 +740,13 @@ def _kernel_dkv(
             hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
 
             if bias_smem is not None:
-              plgpu.barrier_wait(bias_consumed)
+              plgpu.barrier_wait(bias_consumed)  # pyrefly: ignore[bad-argument-type]
               mgpu_lib.fence_async_shared_cta()
               bias_hi = 0 if bias_gmem.shape[-3] == 1 else hi
               cp(bias_gmem.at[bias_hi, ks, qs], bias_smem, bias_produced)
 
             if mask_smem is not None:
-              plgpu.barrier_wait(mask_consumed)
+              plgpu.barrier_wait(mask_consumed)  # pyrefly: ignore[bad-argument-type]
               mgpu_lib.fence_async_shared_cta()
               mask_hi = 0 if mask_gmem.shape[-3] == 1 else hi
               mask_qs = 0 if mask_gmem.shape[-1] == 1 else qs
@@ -843,9 +813,9 @@ def _kernel_dkv(
       if bias_gmem is None:
         bias = None
       elif bias_smem is None:
-        bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)
+        bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)  # pyrefly: ignore[bad-argument-type]
       else:
-        plgpu.barrier_wait(bias_produced)
+        plgpu.barrier_wait(bias_produced)  # pyrefly: ignore[bad-argument-type]
         bias = plgpu.load(bias_smem, layout=_TCGEN05)
 
       plgpu.barrier_wait(s_produced)
@@ -854,7 +824,7 @@ def _kernel_dkv(
 
       if bias is not None:
         if bias_smem is not None:
-          plgpu.barrier_arrive(bias_consumed)
+          plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
         s, scale = s * scale + bias.astype(s.dtype), 1.0
 
       if logits_soft_cap is not None:
@@ -862,7 +832,7 @@ def _kernel_dkv(
       logits = s
 
       m = plgpu.load(m_smem.at[si_res], layout=_TCGEN05_COL)
-      l = plgpu.load(l_smem.at[si_res], layout=_TCGEN05_COL)
+      l_rcp = plgpu.load(l_smem.at[si_res], layout=_TCGEN05_COL)
 
       # NOTE: This rescaling must happen after bias and soft-cap but before
       # the attention masking (as the multiplication will cause `-inf`s).
@@ -902,19 +872,18 @@ def _kernel_dkv(
       if mask_gmem is not None:
         if mask_smem is None:
           if loop_invariant_mask is None:
-            mask = _load_bcast(mask_gmem, (hi, ks, qs), layout=_TCGEN05)
+            mask = _load_bcast(mask_gmem, (hi, ks, qs), layout=_TCGEN05)  # pyrefly: ignore[bad-argument-type]
           else:
             mask = lax.broadcast_in_dim(loop_invariant_mask, s.shape, [0])
         else:
-          plgpu.barrier_wait(mask_produced)
+          plgpu.barrier_wait(mask_produced)  # pyrefly: ignore[bad-argument-type]
           mask = plgpu.load(mask_smem, layout=_TCGEN05)
-          plgpu.barrier_arrive(mask_consumed)
+          plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
         s = jnp.where(mask, s * scale, mask_value)
         scale = 1.0
 
-      epsilon = float(jnp.finfo(jnp.float32).tiny)
-      p = jnp.exp2(s * scale - broadcast(m)) / broadcast(l + epsilon)
+      p = jnp.exp2(s * scale - broadcast(m)) * broadcast(l_rcp)
 
       plgpu.async_store_tmem(p_tmem, p.astype(p_tmem.dtype))
       mgpu_lib.tcgen05_wait_st()
@@ -1006,6 +975,7 @@ def flash_attention_vjp_kernel(
   m, l = residuals
   m = shape_lib.pad_to_next_multiple_of(m, block_q_dq, -1, pad_value=1e9)
   l = shape_lib.pad_to_next_multiple_of(l, block_q_dq, -1, pad_value=1)
+  l_rcp = jnp.reciprocal(l + jnp.finfo(jnp.float32).tiny)
 
   delta = jnp.einsum(
       "...qhd,...qhd->...hq", out.astype(jnp.float32), dout.astype(jnp.float32)
@@ -1057,7 +1027,7 @@ def flash_attention_vjp_kernel(
       thread_name="wg",
       compiler_params=compiler_params,
       scratch_types=dq_scratch_shapes,
-  )(q, k, v, dout, m, l, delta, bias, k_start, k_end, mask)
+  )(q, k, v, dout, m, l_rcp, delta, bias, k_start, k_end, mask)
 
   dkv_shape = (
       jax.ShapeDtypeStruct(k.shape, k.dtype),
@@ -1097,7 +1067,7 @@ def flash_attention_vjp_kernel(
       thread_name="wg",
       compiler_params=compiler_params,
       scratch_types=dkv_scratch_shapes,
-  )(q, k, v, dout, m, l, delta, bias_dkv, k_start, k_end, mask_dkv)
+  )(q, k, v, dout, m, l_rcp, delta, bias_dkv, k_start, k_end, mask_dkv)
 
   dq = dq[:orig_q_seq_len, :, :orig_head_dim]
   dk = dk[:orig_kv_seq_len, :, :orig_head_dim]

@@ -44,7 +44,7 @@ _IMPLEMENTATIONS = dict(
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.attention import pallas_triton as pl_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_triton as pl_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["triton"] = pl_triton.PallasTritonFlashAttention()
   _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS
@@ -52,7 +52,7 @@ except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.attention import pallas_mosaic_gpu as pl_mgpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_mosaic_gpu as pl_mgpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["mosaic_gpu"] = pl_mgpu.PallasMosaicGpuFlashAttention()
   _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
@@ -61,7 +61,7 @@ except ImportError:
 
 
 try:
-  from tokamax._src.ops.attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["mosaic_tpu"] = (
       pallas_mosaic_tpu.PallasMosaicTpuFlashAttention()
@@ -142,7 +142,7 @@ def dot_product_attention(
   if key_value_seq_lengths is not None:
     key_value_seq_lengths = key_value_seq_lengths[:, None, None]
 
-  mask = base.Mask(  # pyrefly: ignore[bad-assignment]
+  mask_ = base.Mask(
       mask,
       is_causal=is_causal,
       q_end=query_seq_lengths,
@@ -154,8 +154,8 @@ def dot_product_attention(
 
   if local_window_size is not None:
     k_indices = jnp.arange(key.shape[-3])
-    before, after = local_window_size
-    mask &= base.Mask(k_start=k_indices - before, k_end=k_indices + (after + 1))  # pyrefly: ignore[unsupported-operation]
+    pre, post = local_window_size
+    mask_ &= base.Mask(k_start=k_indices - pre, k_end=k_indices + (post + 1))
 
   errors = []
   for impl in implementation:
@@ -176,7 +176,7 @@ def dot_product_attention(
           key,
           value,
           bias=bias,
-          mask=mask,
+          mask=mask_,
           logits_scale=base.AUTO if scale is None else scale,
           precision=precision,
           logits_soft_cap=logits_soft_cap,

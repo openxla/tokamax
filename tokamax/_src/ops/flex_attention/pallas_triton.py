@@ -147,7 +147,9 @@ def _fwd_kernel(
       k, k_scales = _rescale(k, k_scales_ref, slice_k, slice_d, quantize_qk_dot)
 
       if quantize_qk_dot:
-        s += plgpu.dot(q[j], k.T).astype(jnp.float32) * (q_scales[j] * k_scales.T)  # pytype: disable=attribute-error
+        s += plgpu.dot(q[j], k.T).astype(jnp.float32) * (
+            q_scales[j] * k_scales.T
+        )
       else:
         s += plgpu.dot(q[j].astype(k.dtype), k.T, precision=q_k_dot_precision)
 
@@ -334,7 +336,7 @@ def _fwd(
         for s, b in zip(x.scale.shape[-3:], block_shape, strict=True)
     ]
     scales_spec = bcast_spec(x.scale, index_map, scales_block_shape)
-    return QArray(spec_, scales_spec, qtype=x.qtype)  # pytype: disable=wrong-arg-types
+    return QArray(spec_, scales_spec, qtype=x.qtype)
 
   scores_shape = (*batch, num_heads_q, seq_len_q, seq_len_k)
   scores = jax.ShapeDtypeStruct(scores_shape, jnp.float32)

@@ -14,7 +14,9 @@
 # ==============================================================================
 """Benchmarks for attention implementations."""
 
+from collections.abc import Callable
 import functools
+from typing import Any, Final
 
 from absl import app
 from absl import flags
@@ -24,15 +26,13 @@ from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import pallas_mosaic_gpu as mgpu_attn
-from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as fa_vjp
-from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm100 as sm100_vjp
 from tokamax._src.ops.attention import pallas_triton as triton_attn
 from tokamax._src.ops.flex_attention import pallas_triton as triton_flex
 from tokamax._src.ops.flex_attention import wrapper
 ARG_SPECS = arg_specs.ARG_SPECS
 
 
-_IMPLS = dict(
+_IMPLS: Final[dict[str, Callable[..., Any]]] = dict(
     triton=triton_attn.PallasTritonFlashAttention(),
     triton_flex=wrapper.WrappedFlexAttention(
         impl=triton_flex.PallasTritonFlexAttention()
@@ -53,7 +53,7 @@ _BENCHMARK_IMPLS_FWD_BWD = flags.DEFINE_list(
     'List of implementations to benchmark forward and backward.',
 )
 _register_benchmark = functools.partial(
-    benchmarking.get_benchmark_registrar(_IMPLS),  # pyrefly: ignore[bad-argument-type]
+    benchmarking.get_benchmark_registrar(_IMPLS),
     iterations=3,
     raise_on_error=False,
 )

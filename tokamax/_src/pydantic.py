@@ -71,10 +71,19 @@ if not typing.TYPE_CHECKING:
   _ORIG_IMPORT_STRING_SERIALIZE = pydantic.ImportString._serialize  # pylint: disable=protected-access
 
   def _serialize(v: Any) -> str:
-    if hasattr(v, '_fun'):
-      v = v._fun
-    if hasattr(v, '__wrapped__'):
-      v = v.__wrapped__
+    while True:
+      if (fun := getattr(v, '_fun', None)) is not None:
+        v = fun
+      elif (wrapped := getattr(v, '__wrapped__', None)) is not None:
+        v = wrapped
+      elif not isinstance(v, type) and hasattr(v, '__getstate__'):
+        state = v.__getstate__()
+        if isinstance(state, dict) and (fun := state.get('fun')) is not None:
+          v = fun
+        else:
+          break
+      else:
+        break
     if (data := _ORIG_IMPORT_STRING_SERIALIZE(v)) is not None:
       return data
     if (module := getattr(v, '__module__', None)) is not None:
@@ -85,7 +94,6 @@ if not typing.TYPE_CHECKING:
   pydantic.ImportString._serialize = _serialize  # pylint: disable=protected-access
 
 
-# pytype: disable=invalid-annotation
 def annotate(ty: Any) -> Any:
   """Annotates types with serializers and validators, as necessary."""
   # Move `str` to the end of the union.
@@ -114,9 +122,9 @@ def annotate(ty: Any) -> Any:
   if origin is Annotated:
     return Annotated[annotate(ty.__origin__), *ty.__metadata__]
   if origin is Union or isinstance(ty, types.UnionType):
-    return Union[tuple(map(annotate, typing.get_args(ty)))]
+    return Union[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[not-a-type]
   if origin is tuple:
-    return tuple[tuple(map(annotate, typing.get_args(ty)))]
+    return tuple[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[not-a-type]
   if origin in (type, Callable):
     return pydantic.ImportString[ty]
   if origin is Mapping:
@@ -137,7 +145,7 @@ def annotate(ty: Any) -> Any:
         return v
       if isinstance(v, dict):
         v = {k: frozenset(val) for k, val in v.items()}
-        return jax.sharding.ManualAxisType(**v)
+        return jax.sharding.ManualAxisType(**v)  # pyrefly: ignore[bad-argument-type]
       return v
 
     return Annotated[
@@ -156,9 +164,6 @@ def annotate(ty: Any) -> Any:
     return Annotated[ty, Dataclass]
 
   return ty
-
-
-# pytype: enable=invalid-annotation
 
 
 class TypeAdapter[T]:
@@ -195,9 +200,8 @@ class AnyInstanceOf[T]:
   as the corresponding type.
   """
 
-  @classmethod
   def __class_getitem__(cls, item: type[T]) -> type[T]:
-    return Annotated[item, cls()]  # pyrefly: ignore[bad-return]
+    return typing.cast(type[T], Annotated[item, cls()])
 
   @classmethod
   def __get_pydantic_core_schema__(cls, source, handler):
@@ -367,6 +371,6 @@ def get_arg_spec_model(name: str, signature: inspect.Signature) -> type[Any]:
     else:
       annotation = annotate(p.annotation)
     fields[param_name] = annotation
-  ty = TypedDict(name, fields, total=False)  # pytype: disable=wrong-arg-types
+  ty = TypedDict(name, fields, total=False)  # pyrefly: ignore[invalid-argument]
   ty.__pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
   return ty

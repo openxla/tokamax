@@ -15,13 +15,12 @@
 import dataclasses
 import functools
 from types import UnionType  # pylint: disable=g-importing-member
-from typing import Union, get_origin, override
+from typing import Union, cast, get_origin, override
 from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
 import pytest
@@ -115,7 +114,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     with test_base.override_test_args(
         atol={1.0: 0.008, 0.99: 0.006}, atol_grads={1.0: 0.02, 0.99: 0.012}
     ):
-      super().test_causal_mask_cross_attention0()  # pytype: disable=attribute-error
+      super().test_causal_mask_cross_attention0()  # pyrefly: ignore[missing-attribute]
 
   def test_causal_mask_cross_attention1(self):
     self.skipTest("TODO: Support k-sequence non-multiple of block_kv.")
@@ -147,7 +146,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       self.skipTest("`rescale_threshold != 1.0` unsupported.")
 
     with mock.patch.object(self, "_attention_fn", op_cls(**kwargs)):  # type: ignore
-      self.test_self_attention0()  # pytype: disable=attribute-error
+      self.test_self_attention0()  # pyrefly: ignore[missing-attribute]
       if use_stable_softmax:
         self.test_normalize_output()
 
@@ -168,7 +167,8 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     # Test that all autotuning configs yield reasonable results.
     assert isinstance(self._attention_fn, base.DotProductAttention)
     q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 128))
-    bound_args = self._attention_fn.bind(q, k, v)
+    precision = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    bound_args = self._attention_fn.bind(q, k, v, precision=precision)
     configs = self._attention_fn._get_autotuning_configs(bound_args)
     self.assertNotEmpty(configs)
     for config in configs:
@@ -192,7 +192,7 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     assert isinstance(self._attention_fn, base.DotProductAttention)
     assert hasattr(self._attention_fn, "vjp")
     attn_fn = self._attention_fn
-    vjp_fn = attn_fn.vjp
+    vjp_fn = cast(fa_vjp.PallasMosaicGpuFlashAttentionVjp, attn_fn.vjp)
 
     q, k, v, *_ = test_base._create_inputs(q_shape=(2, 384, 4, 64))
     kwargs = dict(precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32)
@@ -202,11 +202,11 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     ba = dataclasses.replace(
         ba, arguments=dict(**ba.arguments, residuals=res, out=out, dout=out)
     )
-    configs = vjp_fn._get_autotuning_configs(ba)  # pyrefly: ignore[missing-attribute]
+    configs = vjp_fn._get_autotuning_configs(ba)
     self.assertNotEmpty(configs)
     for config in configs:
       with self.subTest(f"{config=}"):
-        impl = type(attn_fn)(vjp=type(vjp_fn)(config=config))  # pyrefly: ignore[unexpected-keyword]
+        impl = type(attn_fn)(vjp=type(vjp_fn)(config=config))
         self._run_test_with_inputs(q, k, v, impl=impl)
         jax.clear_caches()
 

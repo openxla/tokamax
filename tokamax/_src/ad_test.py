@@ -34,7 +34,7 @@ class AutodiffTest(parameterized.TestCase):
 
     vjp_fn_ref = jax.vjp(fn, x)[1]
     vjp_fn = ad.get_vjp_taking_residuals(lambda x: (fn(x), ()), x)
-    chex.assert_trees_all_equal(vjp_fn((), dout), vjp_fn_ref(dout))
+    chex.assert_trees_all_equal(vjp_fn((), dout), vjp_fn_ref(dout))  # pyrefly: ignore[not-callable]
 
   @parameterized.parameters(jax.nn.relu, jax.nn.sigmoid, jax.nn.swish)
   def test_vjp_taking_residuals_from_inputs(self, fn):
@@ -45,7 +45,7 @@ class AutodiffTest(parameterized.TestCase):
     # This is not a sensible use-case for `get_vjp_taking_residuals`, but we
     # want to test it still produces a valid VJP function.
     vjp_fn = ad.get_vjp_taking_residuals(lambda x: (fn(x), x), x)
-    chex.assert_trees_all_equal(vjp_fn(x, dout), jax.vjp(fn, x)[1](dout))
+    chex.assert_trees_all_equal(vjp_fn(x, dout), jax.vjp(fn, x)[1](dout))  # pyrefly: ignore[not-callable]
 
   @parameterized.parameters(jax.nn.sigmoid, lambda x: (x + x))
   def test_vjp_taking_residuals_from_outputs(self, fn):
@@ -55,7 +55,7 @@ class AutodiffTest(parameterized.TestCase):
 
     y, vjp_fn_ref = jax.vjp(fn, x)
     vjp_fn = ad.get_vjp_taking_residuals(lambda x: (fn(x),) * 2, x)
-    chex.assert_trees_all_equal(vjp_fn(y, dout), vjp_fn_ref(dout))
+    chex.assert_trees_all_equal(vjp_fn(y, dout), vjp_fn_ref(dout))  # pyrefly: ignore[not-callable]
 
   @parameterized.parameters(jax.nn.swish, lambda x: (x * x))
   def test_vjp_taking_residuals_from_invalid_outputs(self, fn):
@@ -75,7 +75,7 @@ class AutodiffTest(parameterized.TestCase):
 
     _, vjp_fn_ref, res = jax.vjp(fn_with_res, x, has_aux=True)
     vjp_fn = ad.get_vjp_taking_residuals(fn_with_res, x)
-    chex.assert_trees_all_equal(vjp_fn(res, dout), vjp_fn_ref(dout))
+    chex.assert_trees_all_equal(vjp_fn(res, dout), vjp_fn_ref(dout))  # pyrefly: ignore[not-callable]
 
   def test_vjp_taking_residuals_with_multiple_args_and_results(self):
     def fn_with_res(x, y):
@@ -89,7 +89,7 @@ class AutodiffTest(parameterized.TestCase):
 
     _, vjp_fn_ref, res = jax.vjp(fn_with_res, x, y, has_aux=True)
     vjp_fn = ad.get_vjp_taking_residuals(fn_with_res, x, y)
-    chex.assert_trees_all_equal(vjp_fn(res, dout), vjp_fn_ref(dout))
+    chex.assert_trees_all_equal(vjp_fn(res, dout), vjp_fn_ref(dout))  # pyrefly: ignore[not-callable]
 
 
 if __name__ == "__main__":

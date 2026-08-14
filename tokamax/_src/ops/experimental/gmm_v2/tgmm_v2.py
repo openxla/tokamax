@@ -1,4 +1,4 @@
-# Copyright 2026 DeepMind Technologies Limited. All Rights Reserved.
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""TGMM kernel"""
+# """TGMM kernel."""
 
 import dataclasses
 import functools
@@ -24,7 +24,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_gmm_kernel as gmm_v2
+from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -149,7 +150,9 @@ def calculate_tgmm_tiling(
     prev_tile_n = tile_n
 
   if tile_n >= tile_n_lower_bound and within_vmem_limit(tile_m, tile_k, tile_n):
-    return gmm_v2.TileSizes(tile_m=tile_m, tile_k=tile_k, tile_n=tile_n)
+    return gmm_v2.TileSizes(
+        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
+    )
 
   if tile_n < tile_n_lower_bound:
     num_n_tiles -= 1
@@ -178,7 +181,9 @@ def calculate_tgmm_tiling(
         f"Could not find valid tile sizes for tgmm. dims={dims},"
         f" tiles=({tile_m},{tile_k},{tile_n}), vmem={vmem_limit_bytes}"
     )
-  return gmm_v2.TileSizes(tile_m=tile_m, tile_k=tile_k, tile_n=tile_n)
+  return gmm_v2.TileSizes(
+      tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
+  )
 
 
 def make_tgmm_configs(
@@ -258,6 +263,7 @@ def make_tgmm_configs(
     tiles = tile_info
   else:
     tiles = tile_info(
+        # pyrefly: ignore[bad-argument-type]
         dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, out_dtype, acc_dtype,
         target_zero_ref_bytes,
     )
@@ -347,6 +353,7 @@ def tgmm_inner_kernel(
 
     if is_group_changing:
       if cfgs.rhs_cfgs.has_scale:
+        # pyrefly: ignore[unsupported-operation]
         scale_slice = tiled_rhs_scale_ref[0]
         acc *= scale_slice
       tiled_out_ref[...] = acc.astype(tiled_out_ref.dtype)
@@ -548,8 +555,6 @@ def tgmm_kernel_main(
     metadata_ref: gmm_v2.MetadataRef,
     zero_ref: jax.Array,  # [tile_zero_k, num_lanes]
     semaphore_ref: jax.Array,  # [1]
-    lhs_group_sizes_smem_ref: jax.Array,
-    group_offset_smem_ref: jax.Array,
     *,
     cfgs,
 ):
@@ -568,12 +573,6 @@ def tgmm_kernel_main(
     semaphore_ref: DMA semaphore for the zeroing copies.
     cfgs: GmmConfigs object containing kernel configurations.
   """
-  # Copy metadata from HBM into fast SMEM so the TPU can evaluate tile offsets in multi-core mode.
-  pltpu.sync_copy(lhs_group_sizes_ref, lhs_group_sizes_smem_ref)
-  pltpu.sync_copy(group_offset_ref, group_offset_smem_ref)
-  lhs_group_sizes_ref = lhs_group_sizes_smem_ref
-  group_offset_ref = group_offset_smem_ref
-
   num_groups_to_zero = zero_out_start(
       lhs_group_sizes_ref,
       group_offset_ref,
@@ -592,7 +591,8 @@ def tgmm_kernel_main(
   )
 
   in_specs, out_specs = generate_tgmm_block_specs(metadata_ref, cfgs)
-  # Partition output tiles across TCs in MegaCore mode over both N and K dimensions.
+  # Partition output tiles across TCs in MegaCore mode over both N and K
+  # dimensions.
   pipeline_fn = pltpu.emit_pipeline(
       functools.partial(tgmm_inner_kernel, cfgs=cfgs),
       grid=(num_n, num_k, num_gm),
@@ -711,11 +711,13 @@ def tgmm_v2(
   cfgs = make_tgmm_configs(
       lhs,
       rhs,
+      # pyrefly: ignore[bad-argument-type]
       rhs_scale,
       group_sizes,
       num_actual_groups,
       tile_info=tile_info,
       vmem_limit_bytes=vmem_limit_bytes,
+      # pyrefly: ignore[bad-argument-type]
       out_dtype=preferred_element_type,
       acc_dtype=acc_dtype,
       target_zero_ref_bytes=target_zero_ref_bytes,
@@ -754,23 +756,24 @@ def tgmm_v2(
       pltpu.VMEM((tile_zero_k, num_lanes), cfgs.out_dtype),
       pltpu.SemaphoreType.DMA((1,)),
   ]
+
   if rhs_scale is not None:
+    # pyrefly: ignore[bad-assignment]
     rhs_scale = rhs_scale.astype(jnp.float32)
     pad_n = aligned_n - dims.size_n
     if pad_n > 0:
       rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, 0), (0, pad_n)))
+  # pyrefly: ignore[bad-assignment]
   rhs = OperandRef(value=rhs, scale=rhs_scale)
-
-  scratch_shapes += [
-      pltpu.SMEM(group_sizes.shape, group_sizes.dtype),
-      pltpu.SMEM(group_offset.shape, group_offset.dtype),
-  ]
+  group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
+  group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
 
   # Configure per-core execution over TensorCore mesh for MegaCore scaling.
   return pl.kernel(
       functools.partial(tgmm_kernel_main, cfgs=cfgs),
       out_type=out_init,
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      # pyrefly: ignore[bad-argument-type]
       scratch_types=scratch_shapes,
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=vmem_limit_bytes,
@@ -780,5 +783,6 @@ def tgmm_v2(
       cost_estimate=get_cost_estimate(cfgs),
       # the metadata here is for profiling, debugging, and cost modeling.
       # It does not affect the kernel's computation.
+      # pyrefly: ignore[bad-argument-type]
       metadata=gmm_v2.get_metadata(cfgs),
   )(group_sizes, group_offset, lhs, rhs)[:, : dims.size_k, : dims.size_n]

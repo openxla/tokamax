@@ -19,9 +19,9 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import tokamax
+from tokamax._src.ops.experimental.gmm_v2 import gmm_v2_test as kernel_test
+from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2_tgmm_kernel as tgmm_backend
-from tokamax._src.ops.ragged_dot.gmm_v2_kernel_tests import pallas_mosaic_tpu_v2_kernel_test as kernel_test
 
 jax.config.parse_flags_with_absl()
 
@@ -59,7 +59,7 @@ class GmmPerfTest(parameterized.TestCase):
     fn, args = tokamax.standardize_function(
         gmm_op,
         kwargs=benchmark_config,
-        mode="forward",  # pytype: disable=wrong-arg-types
+        mode="forward",
     )
     fn = jax.jit(fn)
     res = tokamax.benchmark(fn, args, method="hermetic_xprof")
@@ -67,11 +67,7 @@ class GmmPerfTest(parameterized.TestCase):
 
     tpu_gen = pltpu.get_tpu_info().generation
     if tpu_gen == 7:
-      threshold = 4.1162  # 110% of measured median latency in ms
-      self.assertLessEqual(res.median_evaluation_time_ms, threshold)
-
-    elif tpu_gen == 6:
-      threshold = 13.2198  # 110% of measured median latency in ms
+      threshold = 3.40  # 110% of measured median latency in ms
       self.assertLessEqual(res.median_evaluation_time_ms, threshold)
     else:
       self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
@@ -99,7 +95,7 @@ class GmmPerfTest(parameterized.TestCase):
     fn, args = tokamax.standardize_function(
         drhs_op,
         kwargs=benchmark_config,
-        mode="forward",  # pytype: disable=wrong-arg-types
+        mode="forward",
     )
     fn = jax.jit(fn)
     res = tokamax.benchmark(fn, args, method="hermetic_xprof")
@@ -108,10 +104,6 @@ class GmmPerfTest(parameterized.TestCase):
     tpu_gen = pltpu.get_tpu_info().generation
     if tpu_gen == 7:
       threshold = 7.1995  # 110% of measured median latency in ms
-      self.assertLessEqual(res.median_evaluation_time_ms, threshold)
-
-    elif tpu_gen == 6:
-      threshold = 8.2753  # 110% of measured median latency in ms
       self.assertLessEqual(res.median_evaluation_time_ms, threshold)
     else:
       self.skipTest(f"Unsupported TPU generation: {tpu_gen}")

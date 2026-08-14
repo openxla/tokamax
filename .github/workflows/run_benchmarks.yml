@@ -1,9 +1,23 @@
 name: Run Benchmarks
 
 on:
-  # Allow manual runs from the Actions tab for testing
   workflow_dispatch:
     inputs:
+      ab_mode:
+        description: "Run A/B comparison (baseline vs experiment)."
+        required: false
+        type: boolean
+        default: false
+      baseline_ref:
+        description: "Git ref for the baseline in A/B mode. Defaults to PR base or main."
+        required: false
+        type: string
+        default: ""
+      experiment_ref:
+        description: "Git ref for the experiment in A/B mode. Defaults to current commit SHA."
+        required: false
+        type: string
+        default: ""
       benchmark_filter:
         description: "Regex to filter by benchmark name (e.g., 'attention.*')."
         required: false
@@ -25,9 +39,6 @@ on:
         type: boolean
         default: false
 
-  schedule:
-    - cron: "0 0 * * *"  # Runs at 00:00 UTC every day
-
 permissions:
   contents: read
   pull-requests: write
@@ -35,13 +46,13 @@ permissions:
 jobs:
   run_benchmarks:
     name: Run Tokamax benchmarks
-    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@355df6c9a7ff0065200c6284c5d86c9381b73d75
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@3caa61f05eb99b60ab6733b732184c532c2acbe4 # main
     with:
       registry_file: "tokamax/benchmarks/benchmark_registry.pbtxt"
-      bap_ref: "355df6c9a7ff0065200c6284c5d86c9381b73d75"
-      publish_metrics: true
-      pub_sub_gcp_project_id: "ml-oss-benchmarking-production"
-      pub_sub_gcp_topic_id: "public-results-prod"
+      bap_ref: "3caa61f05eb99b60ab6733b732184c532c2acbe4"
+      ab_mode: ${{ inputs.ab_mode }}
+      baseline_ref: ${{ inputs.baseline_ref }}
+      experiment_ref: ${{ inputs.experiment_ref }}
       benchmark_filter: ${{ inputs.benchmark_filter }}
       environment_filter: ${{ inputs.environment_filter }}
       custom_metadata: ${{ inputs.custom_metadata }}

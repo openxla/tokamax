@@ -23,7 +23,7 @@ IMPLEMENTATIONS: Final[dict[str, base.FlexAttention]] = dict(
 )
 
 try:
-  from tokamax._src.ops.flex_attention import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.flex_attention import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
 except ImportError:

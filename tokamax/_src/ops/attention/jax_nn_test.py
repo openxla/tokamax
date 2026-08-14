@@ -14,7 +14,8 @@
 # ==============================================================================
 
 import pytest
-from typing import override
+from collections.abc import Callable
+from typing import Any, cast, override
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
@@ -44,13 +45,11 @@ class JaxNnDotProductAttentionTest(test_base.AttentionTestBase):
 
   def _run_test_with_inputs(self, *args, **kwargs):
     impl_kwargs = kwargs.get("impl_kwargs", {})
-    # pytype: disable=attribute-error
     if (
         (impl_kwargs.get("logits_dtype") not in (None, jnp.float32))
         or not impl_kwargs.get("normalize_output", True)
         or impl_kwargs.get("return_residuals", False)
     ):
-      # pytype: enable=attribute-error
       kwargs["expect_supported"] = False
     super()._run_test_with_inputs(*args, **kwargs)
 
@@ -76,11 +75,11 @@ class JaxNnDotProductAttentionCudnnTest(JaxNnDotProductAttentionTest):
 
   def _run_test_with_inputs(self, *args, **kwargs):
     # CuDNN doesn't support f32 inputs.
-    orig_impl = kwargs.get("impl", self._attention_fn)
+    orig_impl = cast(Callable[..., Any], kwargs.get("impl", self._attention_fn))
 
     def impl(q, k, v, *, bias, **kwargs):
-      cast = lambda x: None if x is None else x.astype(jnp.bfloat16)
-      return orig_impl(cast(q), cast(k), cast(v), bias=cast(bias), **kwargs)  # pyrefly: ignore[not-callable]
+      cast_ = lambda x: None if x is None else x.astype(jnp.bfloat16)
+      return orig_impl(cast_(q), cast_(k), cast_(v), bias=cast_(bias), **kwargs)
 
     kwargs["impl"] = impl
     kwargs["atol"] = 0.025 if "bias" in kwargs else 0.015

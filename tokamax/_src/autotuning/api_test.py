@@ -49,11 +49,17 @@ _HEURISTICS_CONFIG = _FakeOpConfig(42)
 
 class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
 
+  @property
+  def autotuning_configs(self) -> set[_FakeOpConfig]:
+    return {_HEURISTICS_CONFIG}
+
   def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
     return x + y, None
 
   def _get_heuristics_config(self, ba: op_lib.BoundArguments) -> _FakeOpConfig:
     return _HEURISTICS_CONFIG
+
+
 
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
@@ -83,13 +89,14 @@ def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
 
     x, scale, offset, weights = map(as_batched, args, ax)
   expected_bound_args = (
-      norm.bind(x, scale, offset, epsilon=eps),  # pytype: disable=wrong-arg-types
-      glu.bind(x, weights, activation=act),  # pytype: disable=wrong-arg-types
+      norm.bind(x, scale, offset, epsilon=eps),  # pyrefly: ignore[bad-argument-type]
+      glu.bind(x, weights, activation=act),  # pyrefly: ignore[bad-argument-type]
   )
   return f, args, expected_bound_args
 
 
 def _slow_fn_factory(config):
+  del config  # Unused.
   time.sleep(0.5)
   return lambda x: x
 
@@ -154,8 +161,8 @@ class AutotuningTest(parameterized.TestCase):
         x=jax.ShapeDtypeStruct((64, 128), dtype=jnp.bfloat16),
         weights=jax.ShapeDtypeStruct((128, 2, 128), dtype=jnp.bfloat16),
     )
-    bound_arg0 = pl_glu.PallasTritonGatedLinearUnit().bind(**shapes)  # pytype: disable=wrong-arg-types
-    bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)  # pytype: disable=wrong-arg-types
+    bound_arg0 = pl_glu.PallasTritonGatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
+    bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
     assert bound_arg0.autotuning_cache_key == bound_arg1.autotuning_cache_key
     expected = (bound_arg0, bound_arg1)
     f_lowered = jax.jit(f).lower(**shapes)
@@ -168,15 +175,15 @@ class AutotuningTest(parameterized.TestCase):
     glu = pl_glu.PallasTritonGatedLinearUnit()
     act = jax.nn.swish
     f = functools.partial(glu, activation=act)
-    g = jax.value_and_grad(lambda x, weights: f(x, weights).sum())  # pytype: disable=attribute-error
+    g = jax.value_and_grad(lambda x, weights: f(x, weights).sum())
 
     x_shape = (64, 128)
     d = x_shape[-1]
     x = jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16)
     weights = jax.ShapeDtypeStruct((d, 2, d), dtype=jnp.bfloat16)
     actual = api.get_bound_args(jax.jit(g).lower(x, weights))
-    bound_arg = glu.bind(x, weights, activation=act, return_residuals=True)  # pytype: disable=wrong-arg-types
-    vjp_bound_arg = glu.vjp.bind(**bound_arg.vjp_arg_spec)  # pytype: disable=attribute-error
+    bound_arg = glu.bind(x, weights, activation=act, return_residuals=True)  # pyrefly: ignore[bad-argument-type]
+    vjp_bound_arg = glu.vjp.bind(**bound_arg.vjp_arg_spec)  # pyrefly: ignore[missing-attribute]
     self.assertCountEqual(actual, (bound_arg, vjp_bound_arg))
 
   def test_autotune(self):
@@ -239,6 +246,11 @@ class AutotuningTest(parameterized.TestCase):
     ba = _FakeOp().bind(x, y)
     result = api.autotune([ba], max_workers=1)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
+    self.assertNotEmpty(result.data)
+    _, autotune_data = result.data[0]
+    self.assertIn(_HEURISTICS_CONFIG, autotune_data)
+
+
 
   def test_bound_args_to_from_json(self):
     if jax.default_backend() == "tpu":
@@ -345,8 +357,6 @@ class AutotuningTest(parameterized.TestCase):
     result1 = api.AutotuningResult(device_kind, ((ba, data1),))
     f = jax.jit(op)
 
-    # Register context hook before first call, so first and last are identical.
-    _ = op_lib.get_autotuning_cache_overlay_state()
     _ = f(x, y)
     with result0:
       _ = f(x, y)

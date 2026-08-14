@@ -89,7 +89,7 @@ class FlexAttention[C, K](
       q_sharding: jax.sharding.NamedSharding | None = ...,
       k_sharding: jax.sharding.NamedSharding | None = ...,
       normalize_output: bool = ...,
-      return_residuals: Literal[True] = ...,
+      return_residuals: Literal[True],
   ) -> tuple[Float[Array, "*B T H d"], Residuals]:
     ...
 

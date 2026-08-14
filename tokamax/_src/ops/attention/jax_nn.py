@@ -106,7 +106,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
 
     q_len_or_indices = q_indices if q_indices is not None else q.shape[-3]
     k_len_or_indices = k_indices if k_indices is not None else k.shape[-3]
-    mask = mask.as_array(q_len_or_indices, k_len_or_indices)  # pyrefly: ignore[bad-assignment]
+    mask_ = mask.as_array(q_len_or_indices, k_len_or_indices)
 
     *batch, seq_len_q, num_heads, head_dim = q.shape
     *_, seq_len_k, _, head_dim_out = v.shape
@@ -123,7 +123,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
         x = jnp.broadcast_to(x, (*batch, *x.shape[len(batch) :]))
       return jax.lax.collapse(x, 0, len(batch))
 
-    q, k, v, bias, mask = map(flatten_batch, (q, k, v, bias, mask))
+    q, k, v, bias, mask_ = map(flatten_batch, (q, k, v, bias, mask_))
     q_seq_lengths = flatten_batch(q_seq_lengths, len(batch), True)
     kv_seq_lengths = flatten_batch(kv_seq_lengths, len(batch), True)
 
@@ -131,8 +131,9 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
     if self.implementation == "cudnn":
       if bias is not None:
         bias = jnp.broadcast_to(bias, (*bias.shape[:-2], seq_len_q, seq_len_k))
-      if mask is not None:
-        mask = jnp.broadcast_to(mask, (*mask.shape[:-2], seq_len_q, seq_len_k))  # pyrefly: ignore[bad-assignment]
+      if mask_ is not None:
+        shape = (*mask_.shape[:-2], seq_len_q, seq_len_k)
+        mask_ = jnp.broadcast_to(mask_, shape)
 
     with jax.default_matmul_precision(precision_str):
       out = jax.nn.dot_product_attention(
@@ -140,7 +141,7 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
           k,
           v,
           bias=bias,
-          mask=mask,
+          mask=mask_,
           is_causal=is_causal,
           scale=logits_scale,
           query_seq_lengths=q_seq_lengths,

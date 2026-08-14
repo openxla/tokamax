@@ -12,20 +12,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Multi-Head Latent Attention API."""
-
-from typing import Final
-from tokamax._src.ops.experimental.mla import base
-
-IMPLEMENTATIONS: Final[dict[str, base.MultiHeadLatentAttention]] = dict(
-    xla=base.MultiHeadLatentAttention(),
-)
-
-try:
-  from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
-
-  IMPLEMENTATIONS['mosaic_tpu'] = (
-      pallas_mosaic_tpu.PallasTpuMultiHeadLatentAttention()
-  )
-except ImportError:
-  pass

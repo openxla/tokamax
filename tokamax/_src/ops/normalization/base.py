@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from tokamax._src.ops import op
 
 
-type FusedInputArray = fuser.Fusion[[], jax.Array]  # pytype: disable=invalid-annotation
+type FusedInputArray = fuser.Fusion[[], jax.Array]
 type Residuals = tuple[jax.Array | None, jax.Array]  # mean, rstddev
 
 

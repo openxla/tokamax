@@ -28,8 +28,8 @@ jax.config.parse_flags_with_absl()
 class ApiTest(parameterized.TestCase):
 
   @parameterized.product(
-      in_out_size=[(512, 400), (512, 1024)],
-      start_end=[(3, 338), (10, 422)],
+      in_out_size=[(512, 400), (512, 1024), (512, 32)],
+      start_end=[(3, 338), (10, 422), (3, 28)],
       hidden_size=[128, 512],
       dtype=[jnp.bfloat16, jnp.float32],
       impl=["xla", "mosaic", "mosaic_tpu", "mosaic_tpu_v2"],

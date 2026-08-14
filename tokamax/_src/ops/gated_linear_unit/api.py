@@ -30,7 +30,7 @@ _IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
 _DEFAULT_IMPLEMENTATIONS = ('xla',)
 
 try:
-  from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pallas_mgpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pallas_mgpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS['mosaic'] = pallas_mgpu.PallasMosaicGpuGatedLinearUnit()
   _DEFAULT_IMPLEMENTATIONS = ('mosaic',) + _DEFAULT_IMPLEMENTATIONS
@@ -38,7 +38,7 @@ except ImportError:
   pass
 
 try:
-  from tokamax._src.ops.gated_linear_unit import pallas_triton  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.gated_linear_unit import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
   _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
