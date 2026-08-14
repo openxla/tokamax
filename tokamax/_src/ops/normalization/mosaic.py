@@ -85,21 +85,18 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
     dtype = x.dtype
     orig_x_shape = x.shape
-    # Canonicalize to 3D, where the second axis is the reduced axis.
-    num_m, num_a, num_b = triton_config.canonicalize_shape_3d(orig_x_shape, axis)
+    # `(M, A)`, or `(M, A, B)` when the reduced axis is not the minor one.
+    x_shape = triton_config.canonicalize_shape(orig_x_shape, axis)
 
     return_mean = return_residuals and subtract_mean
     has_scale = scale is not None
     has_offset = offset is not None
 
     p = mosaic_tiling.plan(
-      num_m,
-      num_a,
-      dtype.itemsize,
-      block_m=config.block_m,
-      num_b=num_b,
-      block_b=config.block_n,
+      x_shape, dtype.itemsize, block_m=config.block_m, block_b=config.block_n
     )
+
+    axis_a = mosaic_tiling.REDUCE_AXIS
 
     def kernel(*refs):
       it = iter(refs)  # Inputs then outputs, optional ones only if present.
@@ -112,25 +109,23 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       def param(ref, shape):
         """Reads a 1D param straight from GMEM and spreads it along `A`."""
         a = plgpu.load(ref, optimized=False).astype(jnp.float32)
-        return jax.lax.broadcast_in_dim(a, shape, (p.reduce_axis,))
+        return jax.lax.broadcast_in_dim(a, shape, (axis_a,))
 
       def compute(step, x_smem):
         (step,) = step
-        stat_index = p.stat_index(step)
+        index = p.out_index(step)
+        stat_index = mosaic_tiling.drop_reduced(index)
         x = x_smem[...].astype(jnp.float32)
-        # The stats span whichever tile axis `A` does not.
-        bcast = lambda a: jax.lax.broadcast_in_dim(
-          a, x.shape, (1 - p.reduce_axis,)
-        )
+        # The stats span every axis but the reduced one.
+        stat_dims = tuple(d for d in range(x.ndim) if d != axis_a)
+        bcast = lambda a: jax.lax.broadcast_in_dim(a, x.shape, stat_dims)
 
         if subtract_mean:
-          mean = jnp.mean(x, axis=p.reduce_axis)
+          mean = jnp.mean(x, axis=axis_a)
           x -= bcast(mean)
           if mean_gmem is not None:
             mean_gmem[stat_index] = mean
-        rstddev = jax.lax.rsqrt(
-          jnp.mean(jnp.square(x), axis=p.reduce_axis) + epsilon
-        )
+        rstddev = jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=axis_a) + epsilon)
         if rstd_gmem is not None:
           rstd_gmem[stat_index] = rstddev
         x *= bcast(rstddev)
@@ -145,20 +140,21 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         # that the store to GMEM coalesces; storing straight from the reduction
         # layout would emit scattered writes.
         out_smem[...] = x.astype(dtype)
-        y_gmem[p.out_index(step)] = plgpu.layout_cast(
-          out_smem[...], p.store_layout
+        y_gmem[index] = plgpu.layout_cast(
+          out_smem[...],
+          plgpu.Layout.SMEM_GMEM_COPY(p.block, dtype, swizzle=p.swizzle),
         )
 
       plgpu.emit_pipeline(
         compute,
         grid=(p.steps_per_cta,),
-        in_specs=[p.in_spec()],
+        in_specs=[
+          plgpu.BlockSpec(p.block, p.block_indices, transforms=p.transforms)
+        ],
         max_concurrent_steps=p.num_stages,
       )(x_gmem)
 
-    x_shape = (num_m, num_a, num_b) if p.strided else (num_m, num_a)
-    stat_shape = x_shape[:1] + x_shape[2:]
-    stat = jax.ShapeDtypeStruct(stat_shape, jnp.float32)
+    stat = jax.ShapeDtypeStruct(mosaic_tiling.drop_reduced(p.shape), jnp.float32)
     outs = plgpu.kernel(
       kernel,
       out_type=(
@@ -166,7 +162,7 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         *[stat] * (return_mean + return_residuals),
       ),
       scratch_types=[
-        plgpu.SMEM(p.tile_shape, dtype, transforms=p.transforms),
+        plgpu.SMEM(p.block, dtype, transforms=p.transforms),
       ],
       grid=(p.num_ctas,),
       grid_names=('cta',),
