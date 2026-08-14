@@ -102,8 +102,8 @@ jobs:
               'attn_pallas_triton_test': 'tokamax/_src/ops/attention/pallas_triton_test.py',
               'attn_jax_nn_test': 'tokamax/_src/ops/attention/jax_nn_test.py',
               'attn_xla_chunked_test': 'tokamax/_src/ops/attention/xla_chunked_test.py',
-              'gmm_v2_perf': 'tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_perf_test.py',
-              'gmm_v2_kernel': 'tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_test.py',
+              'gmm_v2_perf': 'tokamax/_src/ops/experimental/gmm_v2/gmm_v2_perf_test.py',
+              'gmm_v2_kernel': 'tokamax/_src/ops/experimental/gmm_v2/gmm_v2_test.py',
               'op_test': 'tokamax/_src/ops/op_test.py',
               'topk': 'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py',
               'ragged_dot_sm100_fp8_quant': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py',
@@ -111,8 +111,8 @@ jobs:
               'ragged_dot_pallas_mosaic_gpu': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py',
               'ragged_dot_pallas_triton': 'tokamax/_src/ops/ragged_dot/pallas_triton_test.py',
               'ragged_dot_misc': (
-                  '--ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_perf_test.py'
-                  '--ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/gmm_v2_test.py '
+                  '--ignore=tokamax/_src/ops/experimental/gmm_v2/gmm_v2_perf_test.py'
+                  '--ignore=tokamax/_src/ops/experimental/gmm_v2/gmm_v2_test.py '
                   '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py '
                   '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py '
                   '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py '
@@ -125,7 +125,7 @@ jobs:
               'linear_softmax_and_experimental': (
                   '--ignore=tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py '
                   '--ignore=tokamax/_src/ops/experimental/tpu/splash_attention/ '
-                  '--ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/ '
+                  '--ignore=tokamax/_src/ops/experimental/gmm_v2/ '
                   'tokamax/_src/ops/linear_softmax_cross_entropy_loss/ '
                   'tokamax/_src/ops/experimental/'
               ),

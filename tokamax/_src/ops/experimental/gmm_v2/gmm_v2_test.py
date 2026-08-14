@@ -23,8 +23,8 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src import mosaic_tpu
 from tokamax._src import test_utils
-from tokamax._src.ops.experimental.tpu.gmm_v2 import gmm_v2
-from tokamax._src.ops.experimental.tpu.gmm_v2 import tgmm_v2
+from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
+from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2
 
 import pytest
 

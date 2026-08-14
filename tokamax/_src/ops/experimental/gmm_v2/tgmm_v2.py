@@ -24,7 +24,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-from tokamax._src.ops.experimental.tpu.gmm_v2 import gmm_v2
+from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
 
 
 @jax.tree_util.register_dataclass

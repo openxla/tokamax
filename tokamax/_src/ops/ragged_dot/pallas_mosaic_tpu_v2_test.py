@@ -20,10 +20,10 @@ import chex
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.gmm_v2 import gmm_v2 as gmm_backend
+from tokamax._src.ops.experimental.gmm_v2 import gmm_v2_test as kernel_test
+from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
-from tokamax._src.ops.experimental.tpu.gmm_v2 import gmm_v2 as gmm_backend
-from tokamax._src.ops.experimental.tpu.gmm_v2 import gmm_v2_test as kernel_test
-from tokamax._src.ops.experimental.tpu.gmm_v2 import tgmm_v2 as tgmm_backend
 
 
 class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
