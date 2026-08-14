@@ -214,3 +214,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+MOSAIC_NORMALIZATION_PLAN.md
+tiling_axis_bug.md
+mgpu-rank3-transfer-probe/
+jax-bug-mgpu-keepdims/
+uv.lock
