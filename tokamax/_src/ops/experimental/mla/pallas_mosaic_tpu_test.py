@@ -14,6 +14,7 @@
 # ==============================================================================
 """Tests for MultiHeadLatentAttention Pallas/Mosaic kernel."""
 
+from tokamax._src.mosaic_tpu import pl_align_to, pl_cdiv
 import csv
 import os
 from absl import flags
@@ -77,7 +78,7 @@ class MultiHeadLatentAttentionTest(parameterized.TestCase):
     kv_dtype = jnp.bfloat16
     kv_len_val = 1024
     total_kv_tokens = batch_size * kv_len_val
-    num_pages = utils.cdiv(total_kv_tokens, page_size) + batch_size
+    num_pages = pl_cdiv(total_kv_tokens, page_size) + batch_size
     seq_lens = [(q_len, kv_len_val)] * batch_size
 
     key = jax.random.PRNGKey(0)

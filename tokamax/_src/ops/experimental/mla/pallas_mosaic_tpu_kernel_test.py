@@ -14,6 +14,7 @@
 # ==============================================================================
 """Tests for MultiHeadLatentAttention Pallas/Mosaic kernel correctness."""
 
+from tokamax._src.mosaic_tpu import pl_align_to, pl_cdiv
 from absl.testing import absltest
 from absl.testing import parameterized
 import hypothesis as hp
@@ -62,7 +63,7 @@ class MlaKernelTest(parameterized.TestCase):
 
     total_q_len = sum(s[0] for s in seq_lens_list)
     total_kv_tokens = sum(s[1] for s in seq_lens_list)
-    num_pages = utils.cdiv(total_kv_tokens, page_size) + len(seq_lens_list)
+    num_pages = pl_cdiv(total_kv_tokens, page_size) + len(seq_lens_list)
 
     inputs = utils.generate_mla_inputs(
         seq_lens_list,
@@ -109,11 +110,11 @@ class MlaKernelTest(parameterized.TestCase):
     self.assertEqual(updated_kv.shape, cache_kv.shape)
 
     packing = utils.get_dtype_packing(dtype)
-    padded_lkv_dim = utils.align_to(lkv_dim, 128)
-    padded_r_dim = utils.align_to(r_dim, 128)
+    padded_lkv_dim = pl_align_to(lkv_dim, 128)
+    padded_r_dim = pl_align_to(r_dim, 128)
     padded_kv_dim = padded_lkv_dim + padded_r_dim
-    page_count = sum(utils.cdiv(s[1], page_size) for s in seq_lens_list)
-    num_pages_arg = utils.cdiv(total_kv_tokens, page_size) + len(seq_lens_list)
+    page_count = sum(pl_cdiv(s[1], page_size) for s in seq_lens_list)
+    num_pages_arg = pl_cdiv(total_kv_tokens, page_size) + len(seq_lens_list)
     total_num_pages = max(num_pages_arg, page_count)
 
     self.assertEqual(updated_kv.shape[0], total_num_pages)
@@ -140,7 +141,7 @@ class MlaKernelTest(parameterized.TestCase):
     seq_lens.extend([(q_len, kv_len)] * batch_size)
 
     total_kv_tokens = sum(s[1] for s in seq_lens)
-    num_pages = utils.cdiv(total_kv_tokens, page_size) + len(seq_lens)
+    num_pages = pl_cdiv(total_kv_tokens, page_size) + len(seq_lens)
 
     inputs = utils.generate_mla_inputs(
         seq_lens,
