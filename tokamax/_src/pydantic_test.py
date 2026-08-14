@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 from collections.abc import Callable
+import copy
 import dataclasses
 import json
 from typing import Annotated
@@ -123,6 +124,18 @@ class PydanticTest(parameterized.TestCase):
     adapter = pydantic.TypeAdapter(pydantic_lib.annotate(typ), config=config)
     self.assertEqual(data, adapter.validate_python(adapter.dump_python(data)))
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+
+  def test_deepcopied_jax_callable_serialization(self):
+    adapter = pydantic.TypeAdapter(
+        pydantic_lib.annotate(Callable[[jax.Array], jax.Array]),
+        config=pydantic.ConfigDict(arbitrary_types_allowed=True),
+    )
+    copied_fn = copy.deepcopy(jax.nn.silu)
+    json_bytes = adapter.dump_json(copied_fn)
+    self.assertIsInstance(json_bytes, bytes)
+    deserialized_fn = adapter.validate_json(json_bytes)
+    x = jnp.array([0.5, -0.5, 1.0])
+    np.testing.assert_allclose(jax.nn.silu(x), deserialized_fn(x))
 
   @parameterized.parameters(
       (jax.ShapeDtypeStruct((), jnp.int32)),

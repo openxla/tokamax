@@ -71,10 +71,19 @@ if not typing.TYPE_CHECKING:
   _ORIG_IMPORT_STRING_SERIALIZE = pydantic.ImportString._serialize  # pylint: disable=protected-access
 
   def _serialize(v: Any) -> str:
-    if hasattr(v, '_fun'):
-      v = v._fun
-    if hasattr(v, '__wrapped__'):
-      v = v.__wrapped__
+    while True:
+      if (fun := getattr(v, '_fun', None)) is not None:
+        v = fun
+      elif (wrapped := getattr(v, '__wrapped__', None)) is not None:
+        v = wrapped
+      elif not isinstance(v, type) and hasattr(v, '__getstate__'):
+        state = v.__getstate__()
+        if isinstance(state, dict) and (fun := state.get('fun')) is not None:
+          v = fun
+        else:
+          break
+      else:
+        break
     if (data := _ORIG_IMPORT_STRING_SERIALIZE(v)) is not None:
       return data
     if (module := getattr(v, '__module__', None)) is not None:
