@@ -54,11 +54,9 @@ def _make_example(args_spec_name: str, implementation: str):
   example = numerics.random_initialize(example)
 
   # The public KDA API consumes post-activation beta values in [0, 1]. Keep
-  # parameter values deterministic and numerically stable without adding their
-  # initialization to the timed function.
+  # beta deterministic and numerically stable. The remaining KDA parameters
+  # retain the randomized representative-workload values.
   example["beta"] = jnp.full_like(example["beta"], 0.5)
-  example["a_log"] = jnp.zeros_like(example["a_log"])
-  example["delta_time_bias"] = jnp.zeros_like(example["delta_time_bias"])
   return example
 
 
@@ -90,9 +88,9 @@ class KdaBenchmark(parameterized.TestCase):
     )
     fn = jax.jit(fn)
 
-    result = tokamax.benchmark(fn, args, method="wallclock")
+    result = tokamax.benchmark(fn, args)
     logging.info(
-        "wallclock_median_time_ms=%s",
+        "median_time_ms=%s",
         result.median_evaluation_time_ms,
     )
 
