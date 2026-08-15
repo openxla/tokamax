@@ -283,6 +283,9 @@ class GmmConfigs:
   acc_dtype: jnp.dtype
   zero_init: bool
   fuse_act: str | None
+  # When True, rhs is physically [size_group, size_n, size_k] rather than the default
+  # [size_group, size_k, size_n] -- the same axes swapped, with zero data movement.
+  transpose_rhs: bool = False
 
   @property
   def num_quant_blocks_per_tile_k(self) -> int:
@@ -332,6 +335,10 @@ class IndexMaps:
       self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array
   ):
     group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+    # Swap the index positions to match the transposed layout. The n_id/k_id values are
+    # unchanged; only which physical axis they address differs.
+    if self.cfgs.transpose_rhs:
+      return (group_id, n_id, k_id)
     return (group_id, k_id, n_id)
 
   def rhs_bias_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
@@ -385,11 +392,20 @@ def generate_block_specs(
     )
   lhs_block_spec = LhsRef(value=lhs_value_spec, scale=lhs_scale_spec)
 
-  rhs_weight_spec = pl.BlockSpec(
-      (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
-      index_map.rhs_weight_index_map,
-      pipeline_mode=pl.Buffered(buffer_count=3),
-  )
+  # Emit a (None, tile_n, tile_k) block to match the transposed layout that
+  # rhs_weight_index_map addresses.
+  if cfgs.transpose_rhs:
+    rhs_weight_spec = pl.BlockSpec(
+        (None, cfgs.tiles.tile_n, cfgs.tiles.tile_k),
+        index_map.rhs_weight_index_map,
+        pipeline_mode=pl.Buffered(buffer_count=3),
+    )
+  else:
+    rhs_weight_spec = pl.BlockSpec(
+        (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
+        index_map.rhs_weight_index_map,
+        pipeline_mode=pl.Buffered(buffer_count=3),
+    )
   rhs_scale_block_spec = rhs_bias_block_spec = None
   if cfgs.rhs_cfgs.has_bias:
     rhs_bias_block_spec = pl.BlockSpec(
@@ -473,7 +489,12 @@ def inner_kernel(
     # This should only be taken in the case where we don't requantize
     # the scales and thus we need to dequantize inside VMEM to avoid small
     # contracting dimmensions
-    rhs_tile_n = tiled_rhs.shape[1]
+    # Under transpose_rhs tiled_rhs is [tile_n, tile_k]. validate_inputs has already rejected a
+    # sub-8-bit rhs with transpose_rhs, so the bitcast branch above cannot run here.
+    if cfgs.transpose_rhs:
+      rhs_tile_n = tiled_rhs.shape[0]
+    else:
+      rhs_tile_n = tiled_rhs.shape[1]
     rhs_qbs = cfgs.rhs_cfgs.quant_block_size
     if cfgs.rhs_cfgs.should_dequantize_before_matmul:
       tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
@@ -489,7 +510,11 @@ def inner_kernel(
 
     valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
     if is_last_k_step and valid_k != 0:
-      mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+      # K is tiled_rhs's axis 1 under transpose_rhs.
+      k_axis = 1 if cfgs.transpose_rhs else 0
+      mask_rhs = (
+          lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, k_axis) < valid_k
+      )
       tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
     # Step 2: Matmul.
@@ -504,11 +529,21 @@ def inner_kernel(
         for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):  # pyrefly: ignore[bad-argument-type]
           end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)  # pyrefly: ignore[unsupported-operation]
 
-          block_acc = jnp.matmul(
-              tiled_lhs[:, start_k:end_k],
-              tiled_rhs[start_k:end_k, start_n:end_n],
-              preferred_element_type=jnp.float32,
-          ).astype(acc_ref.dtype)
+          # dot_general with explicit dimension numbers expresses the same contraction (lhs's K
+          # against rhs's K) whichever physical axis of tiled_rhs holds K.
+          if cfgs.transpose_rhs:
+            block_acc = lax.dot_general(
+                tiled_lhs[:, start_k:end_k],
+                tiled_rhs[start_n:end_n, start_k:end_k],
+                dimension_numbers=(((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(acc_ref.dtype)
+          else:
+            block_acc = jnp.matmul(
+                tiled_lhs[:, start_k:end_k],
+                tiled_rhs[start_k:end_k, start_n:end_n],
+                preferred_element_type=jnp.float32,
+            ).astype(acc_ref.dtype)
 
           if cfgs.rhs_cfgs.should_dequantize_after_matmul:
             b_id = start_k // rhs_qbs  # pyrefly: ignore[unsupported-operation]
@@ -520,7 +555,15 @@ def inner_kernel(
           acc_n += block_acc
         acc_list.append(acc_n)
     else:
-      # Quantized matmul path.
+      # Quantized matmul path. Unreachable under transpose_rhs: lhs_q_dtype is non-None only when
+      # rhs_cfgs.has_scale, which validate_inputs already rejects alongside transpose_rhs. The
+      # assert is a tripwire -- this branch's slicing and rhs_scale indexing assume the
+      # un-transposed [tile_k, tile_n] layout and would need the dot_general treatment above.
+      assert not cfgs.transpose_rhs, (
+          "quantized-rhs matmul path + transpose_rhs is unimplemented -- "
+          "validate_inputs should have already rejected "
+          "rhs_scale is not None + transpose_rhs=True."
+      )
       lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
       q_block_size = cfgs.lhs_cfgs.quant_block_size
 
@@ -1114,16 +1157,66 @@ def validate_inputs(
     fuse_act: str | None = None,
     maybe_quantize_lhs: bool = True,
     lhs_scale: jax.Array | None = None,
+    transpose_rhs: bool = False,
 ) -> Dimensions:
-  """Validates the inputs for the GMM kernel."""
+  """Validates the inputs for the GMM kernel.
+
+  transpose_rhs: when True, `rhs`'s shape is
+  `(size_group, size_n, size_k)` instead of `(size_group, size_k, size_n)` --
+  i.e. the same two axes, physically swapped, with `n` resolved from
+  `rhs.shape[1]` instead of `rhs.shape[2]` (mirroring tokamax v1's own
+  `n = rhs.shape[1 if transpose_rhs else 2]` convention). Combining
+  `transpose_rhs=True` with `rhs_scale`, `rhs_bias`, `lhs_scale`, `fuse_act`,
+  or a sub-8-bit (bitcast-packed) rhs dtype is NOT implemented,
+  and raises `NotImplementedError` here rather than silently computing a wrong
+  answer.
+  """
 
   size_m = lhs.shape[0]
-  size_group, size_k, size_n = rhs.shape
+  if transpose_rhs:
+    size_group, size_n, size_k = rhs.shape
+  else:
+    size_group, size_k, size_n = rhs.shape
   size_lhs_group = group_sizes.shape[0]
 
   assert size_group <= size_lhs_group
   assert lhs.shape == (size_m, size_k)
-  assert rhs.shape == (size_group, size_k, size_n)
+  expected_rhs_shape = (
+      (size_group, size_n, size_k)
+      if transpose_rhs
+      else (size_group, size_k, size_n)
+  )
+  assert rhs.shape == expected_rhs_shape
+  if transpose_rhs:
+    if rhs_bias is not None:
+      raise NotImplementedError(
+          "transpose_rhs=True + rhs_bias is not implemented "
+          "(the bias index map assumes the un-transposed layout)."
+      )
+    if rhs_scale is not None:
+      raise NotImplementedError(
+          "transpose_rhs=True + rhs_scale (per-quant-block "
+          "dequant) is not implemented (the scale index map and the in-kernel "
+          "block slicing both assume the un-transposed layout)."
+      )
+    if lhs_scale is not None:
+      raise NotImplementedError(
+          "transpose_rhs=True + lhs_scale is not implemented "
+          "(lhs_scale requires the quantized matmul path, which assumes the "
+          "un-transposed layout)."
+      )
+    if fuse_act is not None:
+      raise NotImplementedError(
+          "transpose_rhs=True + fuse_act is not implemented "
+          "(fuse_act splits the N axis, which is a different physical rhs "
+          "axis when transposed)."
+      )
+    if jax.dtypes.itemsize_bits(rhs.dtype) < 8:
+      raise NotImplementedError(
+          "transpose_rhs=True + a sub-8-bit (bitcast-packed) rhs "
+          "dtype is not implemented (bitcast unpacking's axis assumption was "
+          "not re-derived for the transposed layout)."
+      )
   if rhs_bias is not None:
     assert rhs_bias.shape == (size_group, 1, size_n)
   if rhs_scale is not None:
@@ -1210,6 +1303,8 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
   return (
       f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
       f"-n_{dims.size_n}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
+      # Keep the flag in the scope name so a trace's op names identify the layout.
+      f"-transpose_rhs_{cfgs.transpose_rhs}"
   )
 
 
@@ -1229,6 +1324,7 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
     lhs_scale: jax.Array | None = None,
+    transpose_rhs: bool = False,
 ):
   """Fills the GMM config for the GMM kernel."""
 
@@ -1242,6 +1338,7 @@ def make_gmm_configs(
       fuse_act,
       maybe_quantize_lhs,
       lhs_scale,
+      transpose_rhs,
   )
 
   if rhs_scale is not None:
@@ -1324,6 +1421,7 @@ def make_gmm_configs(
       acc_dtype=jnp.dtype(acc_dtype),
       zero_init=zero_initialize,
       fuse_act=fuse_act,
+      transpose_rhs=transpose_rhs,
   )
 
 
@@ -1348,11 +1446,13 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "maybe_quantize_lhs",
         "zero_initialize",
         "fuse_act",
+        "transpose_rhs",
     ]
 )
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
-    rhs: jax.Array,  # [size_group, size_k, size_n]
+    rhs: jax.Array,  # [size_group, size_k, size_n], or
+    # [size_group, size_n, size_k] if transpose_rhs=True
     group_sizes: jax.Array,  # int32[size_lhs_group]
     rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, out_size]
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
@@ -1367,6 +1467,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    transpose_rhs: bool = False,
 ) -> jax.Array:
   """GMM kernel implemented with emit_pipeline.
 
@@ -1376,10 +1477,16 @@ def gmm_v2(
 
   Args:
     lhs: lhs with shape [size_m, size_k].
-    rhs: rhs with shape [size_group, size_k, size_n].
+    rhs: rhs with shape [size_group, size_k, size_n] (or
+      [size_group, size_n, size_k] if transpose_rhs=True -- the SAME two axes,
+      physically swapped, with zero data movement expected as long as no other
+      call site on the same tensor requests the un-transposed tiling).
     group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
     rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
-    rhs_bias: The rhs bias of shape [size_group, 1, out_size].
+      NOT supported together with transpose_rhs=True (raises
+      NotImplementedError).
+    rhs_bias: The rhs bias of shape [size_group, 1, out_size]. NOT supported
+      together with transpose_rhs=True (raises NotImplementedError).
     group_offset: Optional. The group offset of shape [1,].
     lhs_scale: Optional scale used to quantize the (unquantized) lhs
       inside the kernel and the result is multiplied back by `scale`. The shape
@@ -1394,7 +1501,17 @@ def gmm_v2(
     acc_dtype: Optional jnp.dtype for the accumulator.
     maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
     zero_initialize: Whether to initialize unvisited output elements to zero.
-    fuse_act: Activation function to fuse with GMM, None if no fusion.
+    fuse_act: Activation function to fuse with GMM, None if no fusion. NOT
+      supported together with transpose_rhs=True (raises NotImplementedError).
+    transpose_rhs: Default False, so every call site that does not set it is
+      behaviorally unchanged. If True,
+      `rhs` is consumed in its `[size_group, size_n, size_k]` physical layout
+      instead of `[size_group, size_k, size_n]` -- a BlockSpec index-map swap,
+      not a data movement. Lets a `dlhs` backward call reuse the forward
+      weight in its natural layout instead of paying a `.swapaxes(1, 2)` HBM
+      copy. Only implemented for `rhs_scale=None, rhs_bias=None,
+      lhs_scale=None, fuse_act=None` and a full-byte (>=8 bit) rhs dtype;
+      other combinations raise NotImplementedError.
 
   Returns:
     Output of shape [size_m, size_n].
@@ -1426,6 +1543,7 @@ def gmm_v2(
       zero_initialize=zero_initialize,
       fuse_act=fuse_act,
       lhs_scale=lhs_scale,
+      transpose_rhs=transpose_rhs,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles

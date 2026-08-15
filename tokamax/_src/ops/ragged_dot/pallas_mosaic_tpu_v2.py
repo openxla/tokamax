@@ -229,7 +229,11 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
       out = gmm_backend.gmm_v2(
           lhs,  # [m, n]
-          rhs.swapaxes(1, 2),  # [num_groups, n, k]
+          # DLHS_RAGGED_DOT_DIM_NUMS already declares "contract rhs dim 2 of [group, k, n]",
+          # which is exactly what transpose_rhs implements. Passing rhs.swapaxes(1, 2) instead
+          # made XLA materialize a second copy of the entire weight, because Pallas pins its
+          # operands' layout and cannot fuse a transpose into a kernel operand.
+          rhs,  # [num_groups, k, n], addressed in place
           group_sizes,
           None,  # rhs_scale
           None,  # rhs_bias
@@ -246,6 +250,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           maybe_quantize_lhs=maybe_quantize_lhs,
           zero_initialize=zero_initialize,
           fuse_act=None,
+          transpose_rhs=True,
       )
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
       # Captured from the original local weights in the custom vjp. Under
