@@ -978,13 +978,20 @@ def calculate_tiling(
   lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
   rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
 
-  # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
-  # safe to use for most scenarios. But if lower bitwidth is used, we need
-  # to tweak tile_m to account for using faster hardware unit.
-  # TODO: Account for different TPU hardware specs.
-  bf16_bf16_tile_m = 128
+  # tile_m targets the MXU's row granularity, read from the hardware rather than hardcoded. This
+  # discharges the "# TODO: Account for different TPU hardware specs." that sat here; tile_n_limit
+  # below already derives itself from mxu_column_size.
+  mxu_tile_m = pltpu.get_tpu_info().mxu_column_size
   rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
-  tile_m = bf16_bf16_tile_m // rhs_mod
+
+  # Floored at the value this function returned before, so no shape and no generation gets a
+  # smaller tile_m than before. Capped at twice the mean rows per group, because fill_metadata
+  # emits ceil(group_size / tile_m) tiles per group, so the last tile of every group is partially
+  # filled and the padding grows with tile_m. A tile_m sweep on v5p / v6e / v7x sets both bounds
+  # and rules out going higher -- see the commit message for the measurements.
+  legacy_tile_m = 128 // rhs_mod
+  mean_rows_per_group = dims.size_m // max(dims.size_group, 1)
+  tile_m = min(mxu_tile_m // rhs_mod, max(legacy_tile_m, 2 * mean_rows_per_group))
   if lhs_cfgs.should_quantize:
     tile_m *= 2
   tile_m = min(tile_m, dims.size_m)
