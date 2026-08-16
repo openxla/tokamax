@@ -662,6 +662,11 @@ def make_ring_attention(
   if config is None:
     config = SplashConfig.get_default()
 
+  if config.qk_diag_skip:
+    # The ring masks are arbitrary NumpyMasks, so the skip cannot assume that
+    # kv > q entries are masked.
+    raise ValueError("qk_diag_skip=True is not supported with ring attention.")
+
   process_fn = partial(
       mask_info_lib.process_mask,
       downcast_smem_data=downcast_smem_data,
