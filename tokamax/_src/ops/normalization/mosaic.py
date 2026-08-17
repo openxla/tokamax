@@ -106,10 +106,12 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       rstd_gmem = take(return_residuals)
       out_smem = next(it)
 
-      def param(ref, shape):
-        """Reads a 1D param straight from GMEM and spreads it along `A`."""
-        a = plgpu.load(ref, optimized=False).astype(jnp.float32)
-        return jax.lax.broadcast_in_dim(a, shape, (axis_a,))
+      # Read the 1D params straight from GMEM, once. Hoisted out of the pipeline
+      # loop below: a GMEM load is effectful, so nothing would lift it, and the
+      # params do not vary with the step. They ride the loop as registers.
+      load = lambda ref: plgpu.load(ref, optimized=False).astype(jnp.float32)
+      scale_a = None if scale_ref is None else load(scale_ref)
+      offset_a = None if offset_ref is None else load(offset_ref)
 
       def compute(step, x_smem):
         (step,) = step
@@ -130,10 +132,12 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
           rstd_gmem[stat_index] = rstddev
         x *= bcast(rstddev)
         # `y = x_norm * (scale + scale_offset) + offset`; see `base.Normalization`.
-        if scale_ref is not None:
-          x *= param(scale_ref, x.shape) + scale_offset
-        if offset_ref is not None:
-          x += param(offset_ref, x.shape)
+        # The params span only the reduced axis, so they spread along the rest.
+        bcast_a = lambda a: jax.lax.broadcast_in_dim(a, x.shape, (axis_a,))
+        if scale_a is not None:
+          x *= bcast_a(scale_a) + scale_offset
+        if offset_a is not None:
+          x += bcast_a(offset_a)
 
         # Outputs are not pipelined (`emit_pipeline` is input-only pre-Hopper),
         # so store by hand. Going through swizzled SMEM relayouts the tile so
