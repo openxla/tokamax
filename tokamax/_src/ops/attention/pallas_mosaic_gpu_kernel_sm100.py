@@ -52,7 +52,6 @@ _TMEM_ROW = _TMEM.reduce(1)
 _TCGEN05 = plgpu.Layout.TCGEN05
 _TCGEN05_ROW = _TCGEN05.reduce(1)
 _WG_SPLAT = plgpu.Layout.WG_SPLAT
-_DEFAULT_MASK_VALUE = -1e30
 
 _MMA_TMA_WG = 0
 _SOFTMAX_WG = 1
@@ -614,6 +613,7 @@ def flash_attention_kernel(
       load_k_range = lambda r: _load_bcast(r, (hi, qs), layout=_TMEM_ROW)
       k_start = None if k_start_gmem is None else load_k_range(k_start_gmem)
       k_end = None if k_end_gmem is None else load_k_range(k_end_gmem)
+      has_k_range = k_start is not None or k_end is not None
 
       def needs_k_range_mask(ki):
         needs_apply = False
@@ -659,10 +659,9 @@ def flash_attention_kernel(
             mask &= (k_base + iota(1)) < bc_range(k_end)
           return mask
 
-        mask = lax.cond(
+        return lax.cond(
             needs_k_range_mask(ki), lambda: k_range_mask(mask), lambda: mask
         )
-        return jnp.where(mask, 0, _DEFAULT_MASK_VALUE)
 
       def kv_loop(ki, carry, *, do_causal=False):
         m_scale, m_i, l_i = carry
@@ -696,14 +695,15 @@ def flash_attention_kernel(
           s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
 
         with jax.named_scope("softmax"):
-          scale *= math.log2(math.e)
-          s, scale = lax.cond(
+          s = lax.cond(
               do_causal or mask_gmem is not None or needs_k_range_mask(ki),
-              lambda: (s * scale + compute_mask(ki, do_causal), 1.0),
-              lambda: (s, scale),
+              lambda: jnp.where(compute_mask(ki, do_causal), s, -jnp.inf),
+              lambda: s,
           )
+          scale *= math.log2(math.e)
           m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
-          alpha = jnp.exp2(m_scale - m_i)
+          m_valid = (mask_gmem is None and not has_k_range) | (m_i != -jnp.inf)
+          alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
 
           @pl.when(ki > lb)
           def write_alpha_to_smem():
@@ -716,7 +716,8 @@ def flash_attention_kernel(
               | ((not normalize_output) & (ki == ub - 1))
           )
           m_scale = jnp.where(needs_rescale, m_i, m_scale)
-          p = jnp.exp2(s * scale - lax.broadcast_in_dim(m_scale, s.shape, [0]))
+          bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
+          p = jnp.exp2(s * scale - bcast(jnp.where(m_valid, m_scale, 0.0)))
           l_i = jnp.where(needs_rescale, l_i * alpha, l_i) + p.sum(axis=1)
 
           with jax.named_scope("write qk_tmem"):
@@ -752,7 +753,9 @@ def flash_attention_kernel(
 
       if return_residuals:
         if normalize_output and (rescale_threshold != 1.0):
-          l_i *= jnp.exp2(m_scale - m_i)
+          m_valid = (mask_gmem is None and not has_k_range) | (m_i != -jnp.inf)
+          alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
+          l_i *= alpha
         m_i *= 1 / math.log2(math.e)
         for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
           gmem_ref.at[hi, qs].set(residual.astype(gmem_ref.dtype))

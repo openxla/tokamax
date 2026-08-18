@@ -489,13 +489,15 @@ def _kernel_dq(
 
     k_start = load_k_range(k_start_gmem)
     k_end = load_k_range(k_end_gmem)
+    has_k_range = k_start is not None or k_end is not None
 
     m = plgpu.load(m_gmem.at[hi, qs], layout=row_layout, optimized=False)
     l_rcp = plgpu.load(l_gmem.at[hi, qs], layout=row_layout, optimized=False)
     delta = plgpu.load(
         delta_gmem.at[hi, qs], layout=row_layout, optimized=False
     )
-    m *= math.log2(math.e)
+    m_valid = (mask_gmem is None and not has_k_range) | (m != -jnp.inf)
+    m = jnp.where(m_valid, m * math.log2(math.e), 0.0)
 
     @pl.loop(lb, ub)
     def kv_loop(ki):
@@ -513,49 +515,33 @@ def _kernel_dq(
           plgpu.barrier_wait(bias_produced)  # pyrefly: ignore[bad-argument-type]
           bias = plgpu.load(bias_smem, layout=layout)
           plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
-        s = s * scale + bias.astype(s.dtype)
-        scale = 1.0
+        s, scale = s * scale + bias.astype(s.dtype), 1.0
 
       mgpu_lib.tcgen05_wait_ld()
       plgpu.barrier_arrive(s_consumed)
 
       if logits_soft_cap is not None:
-        s = jnp.tanh(s * (scale / logits_soft_cap))
-        scale = logits_soft_cap
+        s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
       logits = s
-
-      # NOTE: This rescaling must happen after bias and soft-cap but before the
-      # attention masking (as the multiplication will cause `-inf`s).
-      scale *= math.log2(math.e)
-      mask_value = float(jnp.finfo(jnp.float32).min)
 
       def iota(d):
         return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=layout)
 
+      def apply_causal_mask():
+        return jnp.where(q_base + iota(0) >= kv_base + iota(1), s, -jnp.inf)
+
       if is_causal:
+        s = lax.cond(kv_base + block_kv > q_base, apply_causal_mask, lambda: s)
 
-        def apply_causal_mask():
-          is_causal = q_base + iota(0) >= kv_base + iota(1)
-          return jnp.where(is_causal, s * scale, mask_value), 1.0
-
-        do_causal = kv_base + block_kv > q_base
-        s, scale = lax.cond(do_causal, apply_causal_mask, lambda: (s, scale))
-
-      broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
+      bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
 
       if k_start is not None:
-        s *= scale
-        s = jnp.where(kv_base + iota(1) >= broadcast(k_start), s, mask_value)
-        scale = 1.0
+        s = jnp.where(kv_base + iota(1) >= bcast(k_start), s, -jnp.inf)
 
       if k_end is not None:
-        s *= scale
-        s = jnp.where(kv_base + iota(1) < broadcast(k_end), s, mask_value)
-        scale = 1.0
+        s = jnp.where(kv_base + iota(1) < bcast(k_end), s, -jnp.inf)
 
-      if mask_gmem is None:
-        mask = None
-      else:
+      if mask_gmem is not None:
         if mask_smem is None:
           mask = _load_bcast(mask_gmem, (hi, qs, ks), layout=layout)
         else:
@@ -567,23 +553,16 @@ def _kernel_dq(
             mask = plgpu.load(mask_smem, layout=layout)
           plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
-        s = jnp.where(mask, s * scale, mask_value)
-        scale = 1.0
+        s = jnp.where(mask, s, -jnp.inf)
 
-      p = jnp.exp2(s * scale - broadcast(m)) * broadcast(l_rcp)
+      p = jnp.exp2(s * (scale * math.log2(math.e)) - bcast(m)) * bcast(l_rcp)
 
       plgpu.barrier_wait(dp_produced)
       dp = plgpu.async_load_tmem(dp_tmem, layout=layout)
-      ds = p * (dp - broadcast(delta))
+      ds = p * (dp - bcast(delta))
 
       if logits_soft_cap is not None:
         ds *= 1.0 - logits * logits
-
-      # If we have an attention mask, it is possible that the entire row is
-      # masked out. In that case, the forwards pass will calculate `p`'s values
-      # as `1 / seq_len_k`. The corresponding `ds` values must be zeroed.
-      if mask is not None:
-        ds = jnp.where(mask, ds, 0.0)
 
       plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
       if ds_gmem is not None:
@@ -834,40 +813,28 @@ def _kernel_dkv(
       m = plgpu.load(m_smem.at[si_res], layout=_TCGEN05_COL)
       l_rcp = plgpu.load(l_smem.at[si_res], layout=_TCGEN05_COL)
 
-      # NOTE: This rescaling must happen after bias and soft-cap but before
-      # the attention masking (as the multiplication will cause `-inf`s).
-      scale *= math.log2(math.e)
-      m *= math.log2(math.e)
-
-      mask_value = float(jnp.finfo(jnp.float32).min)
-
       def iota(d):
         return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=_TCGEN05)
 
+      def apply_causal_mask():
+        return jnp.where(kv_base + iota(0) <= q_base + iota(1), s, -jnp.inf)
+
       if is_causal:
+        s = lax.cond(kv_base + block_kv > q_base, apply_causal_mask, lambda: s)
 
-        def apply_causal_mask():
-          mask = kv_base + iota(0) <= q_base + iota(1)
-          return jnp.where(mask, s * scale, mask_value), 1.0
-
-        do_causal = kv_base + block_kv > q_base
-        s, scale = lax.cond(do_causal, apply_causal_mask, lambda: (s, scale))
-
-      broadcast = lambda x: lax.broadcast_in_dim(x, s.shape, [1])
+      bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [1])
 
       def load_k_range(ref):
         hi_ = 0 if ref.shape[0] == 1 else hi
         return plgpu.load(ref.at[hi_, qs], layout=_TCGEN05_COL, optimized=False)
 
       if k_start_gmem is not None:
-        k_start = broadcast(load_k_range(k_start_gmem))
-        s = jnp.where(kv_base + iota(0) >= k_start, s * scale, mask_value)
-        scale = 1.0
+        k_start = bcast(load_k_range(k_start_gmem))
+        s = jnp.where(kv_base + iota(0) >= k_start, s, -jnp.inf)
 
       if k_end_gmem is not None:
-        k_end = broadcast(load_k_range(k_end_gmem))
-        s = jnp.where(kv_base + iota(0) < k_end, s * scale, mask_value)
-        scale = 1.0
+        k_end = bcast(load_k_range(k_end_gmem))
+        s = jnp.where(kv_base + iota(0) < k_end, s, -jnp.inf)
 
       if mask_gmem is not None:
         if mask_smem is None:
@@ -880,10 +847,12 @@ def _kernel_dkv(
           mask = plgpu.load(mask_smem, layout=_TCGEN05)
           plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
-        s = jnp.where(mask, s * scale, mask_value)
-        scale = 1.0
+        s = jnp.where(mask, s, -jnp.inf)
 
-      p = jnp.exp2(s * scale - broadcast(m)) * broadcast(l_rcp)
+      has_k_range = k_start_gmem is not None or k_end_gmem is not None
+      m_valid = (mask_gmem is None and not has_k_range) | (m != -jnp.inf)
+      m = jnp.where(m_valid, m * math.log2(math.e), 0.0)
+      p = jnp.exp2(s * (scale * math.log2(math.e)) - bcast(m)) * bcast(l_rcp)
 
       plgpu.async_store_tmem(p_tmem, p.astype(p_tmem.dtype))
       mgpu_lib.tcgen05_wait_st()
@@ -894,7 +863,7 @@ def _kernel_dkv(
 
       plgpu.barrier_wait(dp_produced)
       dp = plgpu.async_load_tmem(dp_tmem, layout=_TCGEN05)
-      ds = p * (dp - broadcast(delta))
+      ds = p * (dp - bcast(delta))
 
       if logits_soft_cap is not None:
         ds *= 1.0 - logits * logits
