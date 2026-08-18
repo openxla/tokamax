@@ -161,7 +161,22 @@ def _get_heuristic_config(
         ),
     )
   else:
-    h_block_size = h_dim_max if h_dim >= h_dim_max else 128
+    if h_dim < h_dim_max:
+      h_candidates_non_div = [
+          h for h in range(128, h_dim_max + 1, 128) if h >= h_dim
+      ]
+      if h_candidates_non_div:
+        h_block_size = min(
+            h_candidates_non_div,
+            key=lambda x: (
+                0 if (x & (x - 1)) == 0 else 1,
+                x,
+            ),
+        )
+      else:
+        h_block_size = h_dim_max
+    else:
+      h_block_size = h_dim_max
 
   # 3. Choose v_block_size: as large as possible to fit VMEM.
   # Must be >= 128, multiple of 128. Divisible by v_dim if possible.
@@ -439,8 +454,13 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # Loss
       jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
   ]
+  get_b_ds_fwd = lambda i: pl.ds(
+      i * b_block_size, jnp.minimum(b_block_size, b_dim - i * b_block_size)
+  )
   loss_out_spec = pl.BlockSpec(
-      (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
+      (pl.BoundedSlice(b_block_size),),
+      lambda i, j, k: get_b_ds_fwd(i),
+      memory_space=pltpu.VMEM,
   )
 
   @pl.kernel(
@@ -522,6 +542,16 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
               labels_one_hot,
           )
         loss_ref[...] -= jnp.sum(labels_one_hot * xw_tiled[...], axis=-1)
+        if v_dim % v_block_size != 0:
+          rem_v = v_dim % v_block_size
+          col_idx = jax.lax.broadcasted_iota(
+              jnp.int32, xw_tiled.shape, dimension=1
+          )
+          xw_tiled[...] = jnp.where(
+              (v_index == num_v_blocks - 1) & (col_idx >= rem_v),
+              -jnp.inf, # forcing exp(-inf)=0, instead of 1
+              xw_tiled[...],
+          )
         lse_block = jax.nn.logsumexp(xw_tiled[...], axis=-1)
         if b_dim % b_block_size != 0:
           rem_b = b_dim % b_block_size
@@ -543,30 +573,42 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       def perform_loss_reduction():
         loss_ref[...] += lse_ref[...]
 
+    get_b_ds = lambda i: pl.ds(
+        i * b_block_size, jnp.minimum(b_block_size, b_dim - i * b_block_size)
+    )
+    get_h_ds = lambda k: pl.ds(
+        k * h_block_size, jnp.minimum(h_block_size, h_dim - k * h_block_size)
+    )
+    get_v_ds = lambda j: pl.ds(
+        j * v_block_size, jnp.minimum(v_block_size, v_dim - j * v_block_size)
+    )
+
     pltpu.emit_pipeline(
         fwd_pipeline,
         grid=(num_b_blocks, num_v_blocks, num_h_blocks),
         in_specs=[
             pl.BlockSpec(
-                (b_block_size, h_block_size),
-                lambda i, j, k: (i, k),
+                (pl.BoundedSlice(b_block_size), pl.BoundedSlice(h_block_size)),
+                lambda i, j, k: (get_b_ds(i), get_h_ds(k)),
                 memory_space=pltpu.VMEM,
             ),  # x
             pl.BlockSpec(
-                (b_block_size,),
-                lambda i, j, k: (i,),
+                (pl.BoundedSlice(b_block_size),),
+                lambda i, j, k: (get_b_ds(i),),
                 memory_space=pltpu.VMEM,
             ),  # labels
             pl.BlockSpec(
-                (h_block_size, v_block_size),
-                lambda i, j, k: (k, j),
+                (pl.BoundedSlice(h_block_size), pl.BoundedSlice(v_block_size)),
+                lambda i, j, k: (get_h_ds(k), get_v_ds(j)),
                 memory_space=pltpu.VMEM,
             ),  # w
         ],
         out_specs=[
             loss_out_spec,  # loss
             pl.BlockSpec(
-                (b_block_size,), lambda i, j, k: i, memory_space=pltpu.VMEM
+                (pl.BoundedSlice(b_block_size),),
+                lambda i, j, k: (get_b_ds(i),),
+                memory_space=pltpu.VMEM,
             ),  # lse
         ],
         core_axis_name="core",
@@ -718,11 +760,18 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     num_cores = 1
   num_b_blocks_per_core = num_b_blocks // num_cores
 
+  major_align = 32 // x.dtype.itemsize
+  padded_b_dim = math.ceil(b_dim / major_align) * major_align
+  padded_h_dim = math.ceil(h_dim / 128) * 128
+  padded_v_dim = math.ceil(v_dim / 128) * 128
+
   @pl.kernel(
       out_type=[
-          jax.ShapeDtypeStruct(x.shape, dtype=jnp.float32),  # x_grad
           jax.ShapeDtypeStruct(
-              (num_cores, w.shape[0], w.shape[1]), dtype=jnp.float32
+              (padded_b_dim, padded_h_dim), dtype=jnp.float32
+          ),  # x_grad
+          jax.ShapeDtypeStruct(
+              (num_cores, padded_h_dim, padded_v_dim), dtype=jnp.float32
           ),  # w_grad
       ],
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
@@ -913,7 +962,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             )
             lse_val = jnp.where(
                 (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
-                0.0,
+                jnp.inf,
                 lse_val,
             )
           xw_scratch_ref[...] = (
@@ -1030,6 +1079,20 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         w_grad_write_future.wait()
         x_grad_write_future.wait()
 
+    get_b_ds_bwd = lambda i: pl.ds(
+        (c_index * num_b_blocks_per_core + i) * b_block_size,
+        jnp.minimum(
+            b_block_size,
+            b_dim - (c_index * num_b_blocks_per_core + i) * b_block_size,
+        ),
+    )
+    get_h_ds = lambda k: pl.ds(
+        k * h_block_size, jnp.minimum(h_block_size, h_dim - k * h_block_size)
+    )
+    get_v_ds = lambda j: pl.ds(
+        j * v_block_size, jnp.minimum(v_block_size, v_dim - j * v_block_size)
+    )
+
     pltpu.emit_pipeline(
         bwd_pipeline,
         grid=(
@@ -1040,28 +1103,28 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         ),
         in_specs=[
             pl.BlockSpec(  # dout
-                (b_block_size,),
-                lambda i, j, s, k: (c_index * num_b_blocks_per_core + i,),
+                (pl.BoundedSlice(b_block_size),),
+                lambda i, j, s, k: (get_b_ds_bwd(i),),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # x
-                (b_block_size, h_block_size),
-                lambda i, j, s, k: (c_index * num_b_blocks_per_core + i, k),
+                (pl.BoundedSlice(b_block_size), pl.BoundedSlice(h_block_size)),
+                lambda i, j, s, k: (get_b_ds_bwd(i), get_h_ds(k)),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # labels
-                (b_block_size,),
-                lambda i, j, s, k: (c_index * num_b_blocks_per_core + i,),
+                (pl.BoundedSlice(b_block_size),),
+                lambda i, j, s, k: (get_b_ds_bwd(i),),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # w
-                (h_block_size, v_block_size),
-                lambda i, j, s, k: (k, j),
+                (pl.BoundedSlice(h_block_size), pl.BoundedSlice(v_block_size)),
+                lambda i, j, s, k: (get_h_ds(k), get_v_ds(j)),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # lse
-                (b_block_size,),
-                lambda i, j, s, k: (c_index * num_b_blocks_per_core + i,),
+                (pl.BoundedSlice(b_block_size),),
+                lambda i, j, s, k: (get_b_ds_bwd(i),),
                 memory_space=pltpu.VMEM,
             ),
         ],
@@ -1091,7 +1154,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   # pylint: disable-next=unpacking-non-sequence
   x_grad, w_grad_blocks = bwd_kernel(dout, x, labels, w, lse)
   w_grad = jnp.sum(w_grad_blocks, axis=0)
-  return x_grad, w_grad
+  return x_grad[:b_dim, :h_dim], w_grad[:h_dim, :v_dim]
 
 
 @partial(
