@@ -394,13 +394,14 @@ def autotune(
         postfix={"Total microbenchmarks": sum(map(num_configs, bound_args))},
     )
 
-  custom_autotuner = autotuner.Autotuner()
-  if max_workers is not None:
-    custom_autotuner = autotuner.Autotuner(
-        compile_executor_fn=lambda **kwargs: futures.ThreadPoolExecutor(
-            max_workers=max_workers
-        )
-    )
+  max_workers = (
+      autotuner.get_max_workers() if max_workers is None else max_workers
+  )
+  custom_autotuner = autotuner.Autotuner(
+      compile_executor_fn=lambda **kwargs: futures.ThreadPoolExecutor(
+          max_workers=max_workers
+      )
+  )
 
   for bound_arg in bound_args:
     try:
