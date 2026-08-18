@@ -16,6 +16,7 @@
 
 import math
 from typing import Callable
+
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -128,19 +129,19 @@ def gated_linear_unit(
     config: common.Config,
 ) -> Float[Array, "*B M N"]:
   """Gated Linear Unit implementation for SM80."""
+  if x.dtype != weights.dtype:
+    raise ValueError(
+        f"Matmul operands have incompatible dtypes {x.dtype} vs {weights.dtype}"
+    )
+
   orig_x_shape = x.shape
   x = jax.lax.collapse(x, 0, -1)
   m, k = x.shape
   _, _, n = weights.shape
   dtype = x.dtype
-  if x.dtype != weights.dtype:
-    raise ValueError(
-        f"Matmul LHS and RHS have incompatible dtypes {x.dtype} vs"
-        f" {weights.dtype}"
-    )
 
   tile_m, tile_n, tile_k = config.tile_m, config.tile_n, config.tile_k
-  num_stages = config.num_stages
+
   if m % tile_m != 0:
     raise ValueError(f"{m=} must be divisible by {tile_m=}")
   if n % tile_n != 0:
@@ -148,88 +149,62 @@ def gated_linear_unit(
   if k % tile_k != 0:
     raise ValueError(f"{k=} must be divisible by {tile_k=}")
 
-  m_iters = m // tile_m
-  n_iters = n // tile_n
-  k_iters = k // tile_k
-
-  w_gate = weights[:, 0, :]
-  w_proj = weights[:, 1, :]
-
-  num_sms = backend.get_default_device().core_count
-  out_swizzle = plgpu.find_swizzle(tile_n * mgpu_lib.num_bits(dtype), "out")
+  grid = (m // tile_m, n // tile_n)
 
   @plgpu.kernel(
       out_type=jax.ShapeDtypeStruct((m, n), dtype),
-      scratch_types=[
-          mgpu_lib.tiled_swizzled_smem(
-              (tile_m, tile_n), dtype, "out", swizzle=out_swizzle
-          ),
-      ],
-      grid=(num_sms * 4,),
+      scratch_types=(mgpu_lib.tiled_swizzled_smem((tile_m, tile_n), dtype),),
+      grid=(4 * backend.get_default_device().core_count,),
       grid_names=("block",),
       compiler_params=plgpu.CompilerParams(
           # TODO: Migrate to WG semantics once it supports cp_async.
           lowering_semantics=plgpu.LoweringSemantics.Lane,
       ),
   )
-  def kernel(a_gmem, wg_gmem, wp_gmem, out_gmem, out_smem):
+  def kernel(x_gmem, weights_gmem, out_gmem, out_smem):
 
-    @plgpu.nd_loop((m_iters * n_iters,), collective_axes="block")
-    def mn_loop(loop_info):
+    @plgpu.nd_loop((math.prod(grid),), collective_axes="block")
+    def mn_loop(loop_info: plgpu.NDLoopInfo):
+      (lin_idx,) = loop_info.index
       mi, ni = plgpu.planar_snake(
-          loop_info.index[0],
-          (m_iters, n_iters),
-          config.grid_minor_dim,
-          config.grid_tile_width,
+          lin_idx, grid, config.grid_minor_dim, config.grid_tile_width
       )
 
-      acc = plgpu.layout_cast(
-          jnp.zeros((tile_m, tile_n), jnp.float32),
-          plgpu.Layout.MMA_ACC(dtype),
-      )
-
-      def compute(_, a_smem, wg_smem, wp_smem, accs):
+      def compute(_, x_smem, wg_smem, wp_smem, accs):
         gates, proj = accs
         with jax.named_scope("load"):
-          a = plgpu.load(a_smem, layout=plgpu.Layout.MMA_LHS(dtype))
+          x = plgpu.load(x_smem, layout=plgpu.Layout.MMA_LHS(dtype))
           w = plgpu.load(wg_smem, layout=plgpu.Layout.MMA_RHS(dtype))
           v = plgpu.load(wp_smem, layout=plgpu.Layout.MMA_RHS(dtype))
         with jax.named_scope("mma"):
-          gates = plgpu.mma(gates, a, w)
-          proj = plgpu.mma(proj, a, v)
+          gates = plgpu.mma(gates, x, w)
+          proj = plgpu.mma(proj, x, v)
         return gates, proj
 
+      spec = mgpu_lib.tiled_swizzled_block_spec
+      x_spec = spec((tile_m, tile_k), dtype, lambda ki: (mi, ki), "x")
+      w_spec = spec((tile_k, tile_n), dtype, lambda ki: (ki, ni), "w")
+
+      acc = jnp.zeros(out_smem.shape, jnp.float32)
+      acc = plgpu.layout_cast(acc, plgpu.Layout.MMA_ACC(dtype))
       gates, proj = plgpu.emit_pipeline(
           compute,
-          grid=(k_iters,),
-          in_specs=[
-              mgpu_lib.tiled_swizzled_block_spec(
-                  (tile_m, tile_k), dtype, lambda ki: (mi, ki), "a"
-              ),
-              mgpu_lib.tiled_swizzled_block_spec(
-                  (tile_k, tile_n), dtype, lambda ki: (ki, ni), "wg"
-              ),
-              mgpu_lib.tiled_swizzled_block_spec(
-                  (tile_k, tile_n), dtype, lambda ki: (ki, ni), "wp"
-              ),
-          ],
-          max_concurrent_steps=num_stages,
+          grid=(k // tile_k,),
+          in_specs=(x_spec, w_spec, w_spec),
+          max_concurrent_steps=config.num_stages,
           init_carry=(acc, acc),
-      )(a_gmem, wg_gmem, wp_gmem)
+      )(x_gmem, weights_gmem.at[:, :n], weights_gmem.at[:, n:])
 
       with jax.named_scope("epilogue"):
-        out = proj * activation(gates)
         # Relayout through swizzled SMEM so the global store coalesces (MMA_ACC
         # layout emits scattered 4B stores). Ampere lacks TMA, so this is a
         # manual STS/LDS/STG path; the swizzle avoids STS bank conflicts.
         copy_layout = plgpu.Layout.SMEM_GMEM_COPY(
-            (tile_m, tile_n), dtype, swizzle=out_swizzle
+            out_smem.shape, dtype, swizzle=out_smem.transforms[0].swizzle
         )
-        m_slice = pl.ds(mi * tile_m, tile_m)
-        n_slice = pl.ds(ni * tile_n, tile_n)
-        out_smem[...] = out.astype(dtype)
-        out_gmem[m_slice, n_slice] = plgpu.layout_cast(
-            out_smem[...], copy_layout
-        )
+        ms = pl.ds(mi * tile_m, tile_m)
+        ns = pl.ds(ni * tile_n, tile_n)
+        out_smem[...] = (proj * activation(gates)).astype(dtype)
+        out_gmem[ms, ns] = plgpu.layout_cast(out_smem[...], copy_layout)
 
-  return jnp.reshape(kernel(x, w_gate, w_proj), (*orig_x_shape[:-1], n))
+  return kernel(x, weights.reshape(k, 2 * n)).reshape(*orig_x_shape[:-1], n)
