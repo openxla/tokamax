@@ -24,6 +24,7 @@ from tokamax._src.ops.causal_conv1d_gated_delta_rule import compute_gdn
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import metadata
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import tiling
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import vmem_ldst
 
 
@@ -298,9 +299,8 @@ def fused_conv1d_gdn(
     kernel_size: int,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
-    # TODO: Calculate tile size based on input dimensions.
-    decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    decode_tile_size: int | None = None,
+    mixed_tile_size: int | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
   """Perform conv1d and gdn in a single fused kernel.
 
@@ -346,9 +346,11 @@ def fused_conv1d_gdn(
     out: Fused output tensor.
   """
   # TODO: Support bf16
+  act_in_dtype = qkv.dtype
   act_out_dtype = qkv.dtype
   conv_out_dtype = conv_state.dtype
   recurrent_out_dtype = recurrent_state.dtype
+  assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
   qkv = qkv.astype(jnp.float32)
   b = b.astype(jnp.float32)
@@ -364,17 +366,33 @@ def fused_conv1d_gdn(
   assert query_start_loc.shape == (num_seqs + 1,)
   assert state_indices.shape == (num_seqs,)
   assert distribution.shape == (3,)
-  act_in_dtype = qkv.dtype
-  assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
   num_lanes = pltpu.get_tpu_info().num_lanes
   packing = 4 // act_in_dtype.itemsize
   padded_batch_size = pl.cdiv(batch_size, packing) * packing
-  decode_tile_size = min(decode_tile_size, batch_size)
-  mixed_tile_size = min(mixed_tile_size, batch_size)
-  aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+  conv_state_dim_size = conv_state.shape[-1]
+
+  decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+      batch_size=batch_size,
+      num_seqs=num_seqs,
+      padded_batch_size=padded_batch_size,
+      n_kq=n_kq,
+      n_v=n_v,
+      d_k=d_k,
+      d_v=d_v,
+      kernel_size=kernel_size,
+      conv_state_dim_size=conv_state_dim_size,
+      act_in_dtype=act_in_dtype,
+      act_out_dtype=act_out_dtype,
+      conv_state_dtype=conv_state.dtype,
+      recurrent_state_dtype=recurrent_state.dtype,
+      num_lanes=num_lanes,
+      decode_tile_size=decode_tile_size,
+      mixed_tile_size=mixed_tile_size,
+  )
 
   batch_padding_size = padded_batch_size - batch_size
+  aligned_num_v_heads = tiling.align_to(n_v, num_lanes)
   num_v_padding_size = aligned_num_v_heads - n_v
   qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
   b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
@@ -484,7 +502,7 @@ def fused_conv1d_gdn(
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
-            vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
+            vmem_limit_bytes=config.get_vmem_limit_bytes(),
         ),
         name=cfg.get_kernel_name(),
         metadata=cfg.get_metadata(),

@@ -41,8 +41,8 @@ hp.settings.register_profile(
     derandomize=True,
     deadline=None,
     max_examples=15,
-    print_blob=True,
-    verbosity=hp.Verbosity.verbose,
+    print_blob=False,
+    verbosity=hp.Verbosity.normal,
 )
 hp.settings.load_profile(name="deterministic")
 

@@ -79,6 +79,6 @@ class CausalConv1dGatedDeltaRule[C](
         d_k=d_k,
         d_v=d_v,
         kernel_size=kernel_size,
-        config=config,
+        config=config,  # pyrefly: ignore[bad-argument-type]
     )
     return output, None

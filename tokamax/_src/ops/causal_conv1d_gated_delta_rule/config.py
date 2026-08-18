@@ -23,6 +23,9 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
 
+DEFAULT_VMEM_LIMIT_FACTOR: float = 0.80
+
+
 class GDNMode(enum.StrEnum):
   BATCHED = enum.auto()
   PER_SEQ = enum.auto()
@@ -46,6 +49,14 @@ class Dtypes:
   compute: jnp.dtype
   recurrent_state: jnp.dtype
   conv_state: jnp.dtype
+
+
+def get_vmem_limit_bytes(
+    vmem_limit_factor: float = DEFAULT_VMEM_LIMIT_FACTOR,
+) -> int:
+  """Returns the maximum allowable VMEM capacity budget in bytes."""
+  tpu_info = pltpu.get_tpu_info()
+  return int(vmem_limit_factor * tpu_info.vmem_capacity_bytes)
 
 
 @jax.tree_util.register_dataclass
@@ -94,7 +105,10 @@ class GDNConfig:
     return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
   def get_kernel_name(self) -> str:
-    return f"fused_conv1d_gdn_{self.mode.value}"
+    return (
+        f"fused_conv1d_gdn_{self.mode.value}_b{self.seq_tile_size}"
+        f"_c{self.chunk_size}"
+    )
 
   def get_metadata(self) -> dict[str, str | int | float]:
     cfgs_dict = dataclasses.asdict(self)
@@ -111,10 +125,6 @@ class GDNConfig:
         (self.batch_size, self.num_v_heads, self.v_head_dim),
         self.dtypes.act_out,
     )
-
-  def get_vmem_limit_bytes(self) -> int:
-    tpu_info = pltpu.get_tpu_info()
-    return int(0.7 * tpu_info.vmem_capacity_bytes)
 
   def get_scratch_shape_dict(self) -> dict[str, Any]:
     conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)
