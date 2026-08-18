@@ -152,9 +152,6 @@ def gated_linear_unit(
   n_iters = n // tile_n
   k_iters = k // tile_k
 
-  w_gate = weights[:, 0, :]
-  w_proj = weights[:, 1, :]
-
   num_sms = backend.get_default_device().core_count
   out_swizzle = plgpu.find_swizzle(tile_n * mgpu_lib.num_bits(dtype), "out")
 
@@ -172,7 +169,7 @@ def gated_linear_unit(
           lowering_semantics=plgpu.LoweringSemantics.Lane,
       ),
   )
-  def kernel(a_gmem, wg_gmem, wp_gmem, out_gmem, out_smem):
+  def kernel(a_gmem, weights_gmem, out_gmem, out_smem):
 
     @plgpu.nd_loop((m_iters * n_iters,), collective_axes="block")
     def mn_loop(loop_info):
@@ -215,7 +212,7 @@ def gated_linear_unit(
           ],
           max_concurrent_steps=num_stages,
           init_carry=(acc, acc),
-      )(a_gmem, wg_gmem, wp_gmem)
+      )(a_gmem, weights_gmem.at[:, :n], weights_gmem.at[:, n:])
 
       with jax.named_scope("epilogue"):
         out = proj * activation(gates)
@@ -232,4 +229,5 @@ def gated_linear_unit(
             out_smem[...], copy_layout
         )
 
-  return jnp.reshape(kernel(x, w_gate, w_proj), (*orig_x_shape[:-1], n))
+  out = kernel(x, weights.reshape(k, 2 * n))
+  return jnp.reshape(out, (*orig_x_shape[:-1], n))
