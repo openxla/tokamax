@@ -560,9 +560,6 @@ def flash_attention_vjp_kernel(
         s, scale = jnp.tanh(s * (scale / logits_soft_cap)), logits_soft_cap
       logits = s
 
-      scale *= math.log2(math.e)
-      m *= math.log2(math.e)
-
       def iota(d):
         return plgpu.broadcasted_iota(jnp.int32, s.shape, d, layout=_WGMMA)
 
@@ -572,6 +569,8 @@ def flash_attention_vjp_kernel(
       if is_causal:
         s = lax.cond(kv_base + block_kv > q_base, apply_causal_mask, lambda: s)
 
+      scale *= math.log2(math.e)
+      m *= math.log2(math.e)
       bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [1])
       epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
       p = jnp.exp2(s * scale - bcast(m)) / bcast(l + epsilon)
