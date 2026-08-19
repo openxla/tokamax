@@ -186,6 +186,28 @@ def calculate_tgmm_tiling(
   )
 
 
+def validate_dynamic_quant(
+    lhs: jax.Array,  # [m, k]
+    rhs: jax.Array,  # [m, n]
+    rhs_scale: jax.Array,  # [1, 1, n] (per-N scale)
+    lhs_quant_dtype: jnp.dtype | None,
+    rhs_quant_dtype: jnp.dtype | None,
+):
+  """Validates the dynamic quantization."""
+  if lhs_quant_dtype is None and rhs_quant_dtype is None:
+    return
+  if (lhs_quant_dtype is None and rhs_quant_dtype is not None) or (lhs_quant_dtype is not None and rhs_quant_dtype is None):
+    raise ValueError(f"Quantizing one operand gains nothing — a mixed bf16xfp8 matmul runs at the bf16 rate.{lhs_quant_dtype=}, {rhs_quant_dtype=}")
+  assert lhs_quant_dtype and rhs_quant_dtype
+  assert lhs_quant_dtype != lhs.dtype, f"quant dtype must differ from the input dtype {lhs_quant_dtype=}, {lhs.dtype=}"
+  assert rhs_quant_dtype != rhs.dtype, f"quant dtype must differ from the input dtype {rhs_quant_dtype=}, {rhs.dtype=}"
+  assert rhs_scale is None, "Cannot set rhs_scale when both lhs_quant_dtype and rhs_quant_dtype are provided."
+  lhs_bits = jax.dtypes.itemsize_bits(lhs.dtype)
+  rhs_bits = jax.dtypes.itemsize_bits(rhs.dtype)
+  assert lhs_bits>=16 and rhs_bits>=16, f"Inputs must be ≥16-bit floating {lhs.dtype=}, {rhs.dtype=}"
+  assert pltpu.get_tpu_info().is_matmul_supported(lhs_quant_dtype, rhs_quant_dtype), f"matmul is not supported on this TPU {lhs_quant_dtype=}, {rhs_quant_dtype=}"
+
+
 def make_tgmm_configs(
     lhs: jax.Array,  # [m, k]
     rhs: jax.Array,  # [m, n]
