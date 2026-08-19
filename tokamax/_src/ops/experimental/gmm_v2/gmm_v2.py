@@ -520,7 +520,9 @@ def inner_kernel(
         end_n = min(rhs_tile_n, start_n + mxu_size)
         col_size = end_n - start_n
 
-        acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+        # Force fp32 accumulation to avoid precision loss across multi-K
+        # / M-bucket steps.
+        acc_n = jnp.zeros((bucket_m, col_size), dtype=jnp.float32)
         for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):  # pyrefly: ignore[bad-argument-type]
           end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)  # pyrefly: ignore[unsupported-operation]
 
@@ -529,13 +531,13 @@ def inner_kernel(
                 tiled_lhs[:, start_k:end_k],
                 tiled_rhs[start_n:end_n, start_k:end_k].T,
                 preferred_element_type=jnp.float32,
-            ).astype(acc_ref.dtype)
+            )
           else:
             block_acc = jnp.matmul(
                 tiled_lhs[:, start_k:end_k],
                 tiled_rhs[start_k:end_k, start_n:end_n],
                 preferred_element_type=jnp.float32,
-            ).astype(acc_ref.dtype)
+            )
 
           if cfgs.rhs_cfgs.should_dequantize_after_matmul:
             if cfgs.transpose_rhs:
@@ -547,10 +549,10 @@ def inner_kernel(
             rhs_scale_replicated = tiled_rhs_ref.get_scale(
                 replicate_size=bucket_m
             )[b_id, :, start_n : start_n + col_size]
-            block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+            block_acc *= rhs_scale_replicated.astype(jnp.float32)
 
           acc_n += block_acc
-        acc_list.append(acc_n)
+        acc_list.append(acc_n.astype(acc_ref.dtype))
     else:
       # Quantized matmul path.
       lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
@@ -623,13 +625,13 @@ def inner_kernel(
                 block_lhs_q,
                 block_rhs.T,
                 preferred_element_type=preferred_element_type,
-            ).astype(acc_ref.dtype)
+            )
           else:
             block_acc = jnp.matmul(
                 block_lhs_q,
                 block_rhs,
                 preferred_element_type=preferred_element_type,
-            ).astype(acc_ref.dtype)
+            )
 
           block_acc *= block_scale.astype(acc_ref.dtype)
 
@@ -647,14 +649,13 @@ def inner_kernel(
             block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
           acc_n += block_acc
-        acc_list.append(acc_n)
+        acc_list.append(acc_n.astype(acc_ref.dtype))
 
     acc = jnp.concatenate(acc_list, axis=1)
 
     # Step 3: Output post-processing.
     if not is_first_k_step:
-      acc = jnp.pad(acc, ((cfgs.tiles.tile_m - bucket_m, 0), (0, 0)))
-      acc += acc_ref[...]
+      acc += acc_ref[:bucket_m]
     acc_m = acc.shape[0]
 
     if is_last_k_step:
@@ -726,15 +727,11 @@ def inner_kernel(
     is_first_k_step = k_id == 0
     is_last_k_step = k_id == (num_k - 1)
 
-    if bucket_m == cfgs.tiles.tile_m:
-      lax.cond(
-          is_first_k_step,
-          lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
-          lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
-      )
-    else:
-      # partial m is only invoked at last matmul.
-      lax.cond(is_first_k_step, matmul_first_last, matmul_last)
+    lax.cond(
+        is_first_k_step,
+        lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
+        lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
+    )
 
   branches = []
   for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
