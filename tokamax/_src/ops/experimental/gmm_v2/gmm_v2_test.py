@@ -1265,6 +1265,122 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
+  @pytest.mark.long
+  @parameterized.product(
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
+      num_groups=[5, 16],
+      dtype_pair=[
+          (jnp.float8_e4m3fn, jnp.float8_e4m3fn),
+          (jnp.float8_e4m3fn, jnp.float8_e5m2),
+      ],
+  )
+  def test_tgmm_dynamic_quant_basic(
+      self, batch_size, in_size, out_size, num_groups, dtype_pair
+  ):
+    """Kernel quantizes bf16 lhs/dout per m-tile; compare against f32 tgmm."""
+    if test_utils.get_tpu_version() < 7:
+      self.skipTest("float8_e4m3fn matmul requires TPUv7+")
+    lhs_quant_dtype, rhs_quant_dtype = dtype_pair
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    # The reference is the most accurate computation of what the kernel is asked
+    # to compute -- f32, unquantized -- rather than a mirror of the kernel's own
+    # per-tile quantization. The tolerance below absorbs the fp8 error.
+    expected = reference_tgmm(
+        lhs.astype(jnp.float32).swapaxes(0, 1),
+        grad.astype(jnp.float32),
+        group_sizes,
+        num_groups,
+    )
+
+    # tile_m=128 with 8-25 rows per group keeps each group inside one m-tile,
+    # while tile_k/tile_n=256 force 2 k-tiles and 2 n-tiles.
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=256, bucket_base=128
+    )
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_groups,
+        tile_info=tile_info,
+        preferred_element_type=jnp.bfloat16,
+        lhs_quant_dtype=lhs_quant_dtype,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+    # atol comes from the tensor's overall scale, not per-element: each output is
+    # a sum of G signed products, so cancellation leaves many elements far below
+    # typical, where rtol*|b| ~ 0 and atol is the whole budget. Their absolute
+    # error is set by the summed terms rather than their own value -- fp8 gives
+    # each factor relative error d, so each product carries 2d and the sum
+    # carries ~2d*RMS(expected), a constant across elements. d ~ 3.6% RMS for
+    # float8_e4m3fn is where the 1e-1 comes from.
+    chex.assert_trees_all_close(
+        actual.astype(jnp.float32),
+        expected,
+        rtol=1e-1,
+        atol=1e-1 * float(jnp.sqrt(jnp.mean(jnp.square(expected)))),
+    )
+
+  @pytest.mark.long
+  def test_tgmm_dynamic_quant_all_branches(self):
+    """Per-tile quant across all four gm branches, including a multi-tile group.
+
+    Group 0 (size 4*tile_m, 4 gm tiles): matmul_new_group, matmul, matmul,
+    matmul_group_changing. Each tile carries its own scale, so this is the case
+    that detects a dequant applied after accumulation instead of before.
+    Group 1 (size 64, 1 gm tile): matmul_new_group_and_changing.
+    """
+    if test_utils.get_tpu_version() < 7:
+      self.skipTest("float8_e4m3fn matmul requires TPUv7+")
+
+    tile_m = tile_k = tile_n = 256
+    in_size = out_size = 256
+    num_local_groups = 2
+    g0, g1 = 4 * tile_m, 64
+    batch_size = g0 + g1
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = jnp.array([g0, g1], dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.astype(jnp.float32).swapaxes(0, 1),
+        grad.astype(jnp.float32),
+        group_sizes,
+        num_local_groups,
+    )
+
+    tile_info = gmm_v2.TileSizes(
+        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_local_groups,
+        tile_info=tile_info,
+        preferred_element_type=jnp.bfloat16,
+        lhs_quant_dtype=jnp.float8_e4m3fn,
+        rhs_quant_dtype=jnp.float8_e4m3fn,
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    chex.assert_trees_all_close(
+        actual.astype(jnp.float32),
+        expected,
+        rtol=1e-1,
+        atol=1e-1 * float(jnp.sqrt(jnp.mean(jnp.square(expected)))),
+    )
+
 
 if __name__ == "__main__":
   absltest.main()
