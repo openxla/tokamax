@@ -489,15 +489,13 @@ def _kernel_dq(
 
     k_start = load_k_range(k_start_gmem)
     k_end = load_k_range(k_end_gmem)
-    has_k_range = k_start is not None or k_end is not None
 
     m = plgpu.load(m_gmem.at[hi, qs], layout=row_layout, optimized=False)
     l_rcp = plgpu.load(l_gmem.at[hi, qs], layout=row_layout, optimized=False)
     delta = plgpu.load(
         delta_gmem.at[hi, qs], layout=row_layout, optimized=False
     )
-    m_valid = (mask_gmem is None and not has_k_range) | (m != -jnp.inf)
-    m = jnp.where(m_valid, m * math.log2(math.e), 0.0)
+    m *= math.log2(math.e)
 
     @pl.loop(lb, ub)
     def kv_loop(ki):
@@ -534,12 +532,13 @@ def _kernel_dq(
         s = lax.cond(kv_base + block_kv > q_base, apply_causal_mask, lambda: s)
 
       bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
+      p = jnp.exp2(s * (scale * math.log2(math.e)) - bcast(m)) * bcast(l_rcp)
 
       if k_start is not None:
-        s = jnp.where(kv_base + iota(1) >= bcast(k_start), s, -jnp.inf)
+        p = jnp.where(kv_base + iota(1) >= bcast(k_start), p, 0.0)
 
       if k_end is not None:
-        s = jnp.where(kv_base + iota(1) < bcast(k_end), s, -jnp.inf)
+        p = jnp.where(kv_base + iota(1) < bcast(k_end), p, 0.0)
 
       if mask_gmem is not None:
         if mask_smem is None:
@@ -553,9 +552,7 @@ def _kernel_dq(
             mask = plgpu.load(mask_smem, layout=layout)
           plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
-        s = jnp.where(mask, s, -jnp.inf)
-
-      p = jnp.exp2(s * (scale * math.log2(math.e)) - bcast(m)) * bcast(l_rcp)
+        p = jnp.where(mask, p, 0.0)
 
       plgpu.barrier_wait(dp_produced)
       dp = plgpu.async_load_tmem(dp_tmem, layout=layout)
@@ -823,6 +820,8 @@ def _kernel_dkv(
         s = lax.cond(kv_base + block_kv > q_base, apply_causal_mask, lambda: s)
 
       bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [1])
+      m *= math.log2(math.e)
+      p = jnp.exp2(s * (scale * math.log2(math.e)) - bcast(m)) * bcast(l_rcp)
 
       def load_k_range(ref):
         hi_ = 0 if ref.shape[0] == 1 else hi
@@ -830,11 +829,11 @@ def _kernel_dkv(
 
       if k_start_gmem is not None:
         k_start = bcast(load_k_range(k_start_gmem))
-        s = jnp.where(kv_base + iota(0) >= k_start, s, -jnp.inf)
+        p = jnp.where(kv_base + iota(0) >= k_start, p, 0.0)
 
       if k_end_gmem is not None:
         k_end = bcast(load_k_range(k_end_gmem))
-        s = jnp.where(kv_base + iota(0) < k_end, s, -jnp.inf)
+        p = jnp.where(kv_base + iota(0) < k_end, p, 0.0)
 
       if mask_gmem is not None:
         if mask_smem is None:
@@ -847,12 +846,7 @@ def _kernel_dkv(
           mask = plgpu.load(mask_smem, layout=_TCGEN05)
           plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
-        s = jnp.where(mask, s, -jnp.inf)
-
-      has_k_range = k_start_gmem is not None or k_end_gmem is not None
-      m_valid = (mask_gmem is None and not has_k_range) | (m != -jnp.inf)
-      m = jnp.where(m_valid, m * math.log2(math.e), 0.0)
-      p = jnp.exp2(s * (scale * math.log2(math.e)) - bcast(m)) * bcast(l_rcp)
+        p = jnp.where(mask, p, 0.0)
 
       plgpu.async_store_tmem(p_tmem, p.astype(p_tmem.dtype))
       mgpu_lib.tcgen05_wait_st()
