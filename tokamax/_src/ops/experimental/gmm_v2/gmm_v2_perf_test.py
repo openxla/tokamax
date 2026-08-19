@@ -33,7 +33,7 @@ class GmmPerfTest(parameterized.TestCase):
       self.skipTest("Only supported on TPUs.")
     super().setUp()
 
-  def test_gmm_perf_regression(self):
+  def test_gmm_perf_regression_maxtext(self):
     m, k, n, num_groups = 262144, 7168, 1024, 256
     block_size = 256
     k0, k1 = jax.random.split(jax.random.key(0), 2)
@@ -72,7 +72,7 @@ class GmmPerfTest(parameterized.TestCase):
     else:
       self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
 
-  def test_tgmm_perf_regression(self):
+  def test_tgmm_perf_regression_maxtext(self):
     m, k, n, num_groups = 262144, 7168, 1024, 256
     k0, k2 = jax.random.split(jax.random.key(0), 2)
 
@@ -145,7 +145,7 @@ class GmmPerfTest(parameterized.TestCase):
           threshold=0.1221,
       ),
   )
-  def test_gmm_perf_regression(self, m, k, n, fuse_act, threshold):
+  def test_gmm_perf_regression_ullm(self, m, k, n, fuse_act, threshold):
     num_groups = 512  # Global number of experts.
     num_local_groups = 64  # Experts per EP shard (512 / 8).
     group_offset = 256  # First expert of EP shard 4 (a middle shard).
