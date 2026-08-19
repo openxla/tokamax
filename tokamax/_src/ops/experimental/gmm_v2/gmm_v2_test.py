@@ -268,6 +268,46 @@ class GmmTest(parameterized.TestCase):
       batch_size=[128],
       in_size=[512],
       out_size=[512],
+      num_groups=[16],
+      group_offset=[0],
+  )
+  def test_gmm_transpose_rhs(
+      self, batch_size, in_size, out_size, num_groups, group_offset
+  ):
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+    k0, k1 = jax.random.split(key, 2)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    # When transpose_rhs=True, rhs shape is
+    # (num_local_groups, out_size, in_size)
+    rhs = jax.random.normal(
+        k1, (num_local_groups, out_size, in_size), dtype=jnp.bfloat16
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset_arr = jnp.array(group_offset, dtype=jnp.int32)
+
+    # Reference expects un-transposed RHS (num_local_groups, in_size, out_size)
+    rhs_ref = jnp.swapaxes(rhs, 1, 2)
+    expected = reference_gmm(
+        lhs, rhs_ref, group_sizes, group_offset=group_offset_arr
+    )
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        group_offset=group_offset_arr,
+        transpose_rhs=True,
+    )
+
+    assert_arrays_all_close(actual, expected)
+
+  @pytest.mark.long
+  @parameterized.product(
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
       num_groups=[5, 16],
       group_offset=[0],
   )

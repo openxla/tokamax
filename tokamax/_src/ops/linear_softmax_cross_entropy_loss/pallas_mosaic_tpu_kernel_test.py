@@ -30,6 +30,40 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
       self.skipTest("Only supported on TPUs.")
     super().setUp()
 
+  def _assert_allclose(self, actual, expected, atol=1e-4, rtol=1e-4, name=""):
+    """Asserts that two arrays are close, printing detailed diagnostic info on failure."""
+    abs_err = jnp.abs(actual - expected)
+    max_abs_err = float(jnp.max(abs_err))
+    max_rel_err = float(jnp.max(abs_err / (jnp.abs(expected) + 1e-7)))
+    mismatched = abs_err > (atol + rtol * jnp.abs(expected))
+    mismatch_count = int(jnp.sum(mismatched))
+    total_elements = actual.size
+
+    diag = ""
+    if mismatch_count > 0:
+      if actual.ndim == 0:
+        first_idx = ()
+      else:
+        first_idx = tuple(int(x[0]) for x in jnp.where(mismatched))
+      diag = (
+          f"\n[{name}] NUMERICAL MISMATCH:\n"
+          f"  Shape: {actual.shape}, Dtype: {actual.dtype}\n"
+          f"  Max Absolute Error: {max_abs_err:.6e}  (tolerance atol={atol})\n"
+          f"  Max Relative Error: {max_rel_err:.6e}  (tolerance rtol={rtol})\n"
+          f"  Mismatched Elements: {mismatch_count} / {total_elements} "
+          f"({100.0 * mismatch_count / total_elements:.2f}%)\n"
+          f"  First mismatch at index {first_idx}:\n"
+          f"    Actual (Kernel):   {actual[first_idx]}\n"
+          f"    Expected (Ref):    {expected[first_idx]}\n"
+          f"    Absolute Diff:     {abs_err[first_idx]}\n"
+      )
+
+    self.assertTrue(
+        mismatch_count == 0,
+        msg=diag
+        or f"[{name}] arrays are not close within atol={atol}, rtol={rtol}",
+    )
+
   @parameterized.named_parameters(
       dict(
           testcase_name="fwd_small_size_sum_reduction_test",
@@ -201,42 +235,42 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
       ),
       dict(
           testcase_name="fwd_b_non_aligned_multiple_of_128_sum_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1024,
           v_dim=2048,
           reduction="sum",
       ),
       dict(
           testcase_name="fwd_b_non_aligned_multiple_of_128_mean_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1024,
           v_dim=2048,
           reduction="mean",
       ),
       dict(
           testcase_name="fwd_b_non_aligned_multiple_of_128_none_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1024,
           v_dim=2048,
           reduction="none",
       ),
       dict(
           testcase_name="fwd_all_non_aligned_sum_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1288,
           v_dim=2664,
           reduction="sum",
       ),
       dict(
           testcase_name="fwd_all_non_aligned_mean_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1288,
           v_dim=2664,
           reduction="mean",
       ),
       dict(
           testcase_name="fwd_all_non_aligned_none_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1288,
           v_dim=2664,
           reduction="none",
@@ -298,8 +332,10 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
 
     atol = 1e-4 if dtype == jnp.float32 else 5e-2
     rtol = 1e-4 if dtype == jnp.float32 else 5e-2
-    self.assertTrue(jnp.allclose(ref_loss, kernel_loss, atol=atol, rtol=rtol))
-    self.assertTrue(jnp.allclose(ref_lse, kernel_lse, atol=atol, rtol=rtol))
+    self._assert_allclose(
+        kernel_loss, ref_loss, atol=atol, rtol=rtol, name="loss"
+    )
+    self._assert_allclose(kernel_lse, ref_lse, atol=atol, rtol=rtol, name="lse")
 
   @parameterized.named_parameters(
       dict(
@@ -472,42 +508,42 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
       ),
       dict(
           testcase_name="bwd_b_non_aligned_multiple_of_128_sum_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1024,
           v_dim=2048,
           reduction="sum",
       ),
       dict(
           testcase_name="bwd_b_non_aligned_multiple_of_128_mean_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1024,
           v_dim=2048,
           reduction="mean",
       ),
       dict(
           testcase_name="bwd_b_non_aligned_multiple_of_128_none_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1024,
           v_dim=2048,
           reduction="none",
       ),
       dict(
           testcase_name="bwd_all_non_aligned_sum_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1288,
           v_dim=2664,
           reduction="sum",
       ),
       dict(
           testcase_name="bwd_all_non_aligned_mean_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1288,
           v_dim=2664,
           reduction="mean",
       ),
       dict(
           testcase_name="bwd_all_non_aligned_none_reduction_test",
-          b_dim=5133,
+          b_dim=5136,
           h_dim=1288,
           v_dim=2664,
           reduction="none",
@@ -549,13 +585,11 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
         )
     )
 
-    self.assertTrue(
-        jnp.allclose(ref_grad_x, kernel_grad_x, atol=5e-2, rtol=5e-2),
-        f"ref_grad_x: {ref_grad_x}, kernel_grad_x: {kernel_grad_x}",
+    self._assert_allclose(
+        kernel_grad_x, ref_grad_x, atol=5e-2, rtol=5e-2, name="grad_x"
     )
-    self.assertTrue(
-        jnp.allclose(ref_grad_w, kernel_grad_w, atol=5e-2, rtol=5e-2),
-        f"ref_grad_w: {ref_grad_w}, kernel_grad_w: {kernel_grad_w}",
+    self._assert_allclose(
+        kernel_grad_w, ref_grad_w, atol=5e-2, rtol=5e-2, name="grad_w"
     )
 
   @parameterized.named_parameters(
