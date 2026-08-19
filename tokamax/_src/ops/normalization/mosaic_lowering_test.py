@@ -46,9 +46,10 @@ def _target_ampere():
   falls back to `(9, 0)` when there is none (`mosaic_gpu/core.py:_infer_arch`).
   On a machine with no GPU -- every machine that runs this test in CI --
   `lowering_platforms=('cuda',)` alone would stamp the module as Hopper, and the
-  kernel would take the TMA path rather than the `cp.async` one it will actually
-  run on. Overriding the private `_infer_arch` is the only way in:
-  `AbstractDevice` has no `compute_capability` field.
+  store would take the `stmatrix` path rather than the plain vector stores it
+  will actually run on (`fragmented_array.py`, `TxMatrixIneligible`). Overriding
+  the private `_infer_arch` is the only way in: `AbstractDevice` has no
+  `compute_capability` field.
   """
   with mock.patch.object(mgpu_core, '_infer_arch', lambda: (8, 0)):
     yield
@@ -97,13 +98,13 @@ class AmpereLoweringTest(parameterized.TestCase):
       (
           # One case per branch of `mosaic_tiling.plan`.
           dict(shape=(4096, 128), axis=-1, block_m=32, block_n=None),
-          # `block_m` shrinks to fit SMEM as the reduced axis grows.
+          # `block_m` shrinks to fit the register budget as the row grows.
           dict(shape=(4096, 1024), axis=-1, block_m=32, block_n=None),
-          # Rows that the cap does not divide: a smaller divisor is taken.
-          dict(shape=(104, 128), axis=-1, block_m=32, block_n=None),
+          # Rows that the block does not divide: the last tile slides back.
+          dict(shape=(100, 128), axis=-1, block_m=32, block_n=None),
           # A rank-3 tile: the reduced axis is not the minor one, so `B` is
-          # blocked and the reduction runs down the tile's middle axis. Needs
-          # the four `jax` fixes in `mgpu-rank3-transfer-probe/README.md`.
+          # blocked, the reduction runs down the tile's middle axis, and the
+          # slice this loads is strided.
           dict(shape=(8, 128, 256), axis=1, block_m=32, block_n=32),
           # `block_n` that the trailing axis does not divide.
           dict(shape=(4, 32, 96), axis=1, block_m=32, block_n=64),
@@ -137,7 +138,7 @@ class AmpereLoweringTest(parameterized.TestCase):
 
 
 class DivisorsTest(absltest.TestCase):
-  """Blocks must tile their axis exactly: cp.async cannot predicate an OOB copy."""
+  """Every axis but `M` must be tiled exactly: only `M`'s last tile can slide."""
 
   def test_divisors_descend_and_divide(self):
     got = list(mosaic_tiling.divisors(96, 32, multiple_of=8))
@@ -165,36 +166,37 @@ class PlanTest(absltest.TestCase):
     self.assertEqual(p.block, (32, 128))
     self.assertEqual(p.steps, 128)
 
-  def test_block_falls_to_a_divisor_under_the_cap(self):
-    # 32 does not divide 104; 8 is the largest multiple of 8 that does.
+  def test_the_cap_is_taken_whether_or_not_it_divides_the_rows(self):
+    # 32 does not divide 104, and no longer has to: the last tile slides back.
     p = self._plan((104, 128))
-    self.assertEqual(p.block, (8, 128))
-    self.assertEqual(p.steps, 13)
+    self.assertEqual(p.block, (32, 128))
+    self.assertEqual(p.steps, 4)
 
-  def test_rows_must_be_a_multiple_of_the_tiling(self):
-    with self.assertRaisesRegex(NotImplementedError, 'multiple of 8'):
-      self._plan((100, 128))
+  def test_the_last_row_block_slides_back(self):
+    p = self._plan((100, 128))
+    self.assertEqual((p.block, p.grid), ((32, 128), (4, 1)))
+    starts = [int(p.tile_starts(step)[0]) for step in range(p.steps)]
+    # The tail overlaps its predecessor rather than overhanging `M`.
+    self.assertEqual(starts, [0, 32, 64, 68])
+
+  def test_rows_must_feed_the_warps(self):
+    with self.assertRaisesRegex(NotImplementedError, 'at least 4'):
+      self._plan((3, 128))
 
   def test_reduced_axis_must_be_a_multiple_of_32(self):
     with self.assertRaisesRegex(NotImplementedError, 'multiple of 32'):
       self._plan((4096, 48))
 
-  def test_block_shrinks_to_fit_smem(self):
+  def test_block_shrinks_to_fit_the_registers(self):
     """A long row is paid for in `block_m`, not declined outright."""
     wide = self._plan((4096, 2048))
     narrow = self._plan((4096, 128))
     self.assertLess(wide.block[0], narrow.block[0])
-    self.assertLessEqual(wide.smem_bytes(), 227 * 1024)
+    self.assertLessEqual(wide.tile_regs(), 64)
 
-  def test_reduced_axis_can_be_too_wide_for_smem(self):
-    with self.assertRaisesRegex(NotImplementedError, 'SMEM'):
-      self._plan((4096, 8192))
-
-  def test_ctas_cover_every_step(self):
-    p = self._plan((4096, 128))
-    self.assertGreaterEqual(p.num_ctas * p.steps_per_cta, p.steps)
-    # A CTA handed fewer steps re-reads its last tile rather than going OOB.
-    self.assertLess((p.num_ctas - 1) * p.steps_per_cta, p.steps)
+  def test_reduced_axis_can_be_too_wide_for_the_registers(self):
+    with self.assertRaisesRegex(NotImplementedError, 'registers per thread'):
+      self._plan((4096, 4096))
 
   def test_the_reduced_axis_is_never_blocked(self):
     for shape in ((4096, 128), (24, 32, 256)):
@@ -208,50 +210,51 @@ class PlanTest(absltest.TestCase):
         )
 
   def test_trailing_axis_takes_the_lane_tiling(self):
-    """With a `B`, `B` is what the lanes tile and `A` takes the 8 rows."""
+    """With a `B`, `B` is what the lanes tile and `A` is what feeds the warps."""
     p = self._plan((24, 32, 256), block_m=8, block_b=32)
     self.assertEqual(p.block, (8, 32, 32))
     self.assertEqual(p.grid, (3, 1, 8))
-    # `A` needs only `% 8` here, rather than the `% 32` a minor axis needs.
-    self._plan((24, 8, 256), block_b=32)
-    with self.assertRaisesRegex(NotImplementedError, 'multiple of 8'):
-      self._plan((24, 36, 256), block_b=32)
+    # `A` needs only `% 4` here, rather than the `% 32` a minor axis needs.
+    self._plan((24, 4, 256), block_b=32)
+    with self.assertRaisesRegex(NotImplementedError, 'multiple of 4'):
+      self._plan((24, 34, 256), block_b=32)
 
   def test_trailing_axis_needs_a_usable_block(self):
     with self.assertRaisesRegex(NotImplementedError, 'no divisor'):
       self._plan((24, 32, 48), block_b=32)
 
   def test_every_tile_is_visited_exactly_once(self):
-    """The flat step index splits into one block index per axis.
+    """The flat tile index splits into one element offset per axis.
 
-    The whole array has to be covered, and -- because the statistics are written
-    per tile -- no tile may be visited twice, other than the clamped repeats of
-    the very last one.
+    One CTA takes one tile, so the whole array has to be covered and no tile may
+    be started twice -- the statistics are written per tile. A slid tile overlaps
+    its predecessor, which is harmless: it recomputes those rows to the same
+    values.
     """
     for shape, block_b in (
         ((24, 32, 256), 32),
         ((24, 32), None),
-        ((24, 32, 96), 32),  # Steps the CTAs do not divide evenly.
+        ((24, 32, 96), 32),
+        ((100, 32), None),  # Rows the block does not divide.
     ):
       with self.subTest(shape=shape):
         p = self._plan(shape, block_m=8, block_b=block_b)
-        seen = []
-        for cta in range(p.num_ctas):
-          with mock.patch.object(
-              jax.lax, 'axis_index', lambda _, cta=cta: cta
-          ):
-            for step in range(p.steps_per_cta):
-              seen.append(tuple(int(i) for i in p.block_indices(step)))
-        expected = sorted(itertools.product(*map(range, p.grid)))
-        self.assertEqual(sorted(set(seen)), expected)
-        # Only the last tile may repeat, and only as the clamped tail.
-        repeats = len(seen) - len(set(seen))
-        self.assertEqual(seen[len(seen) - repeats :], [expected[-1]] * repeats)
+        seen = [
+            tuple(int(i) for i in p.tile_starts(tile))
+            for tile in range(p.steps)
+        ]
+        expected = sorted(
+            itertools.product(*(
+                sorted({min(i * b, s - b) for i in range(n)})
+                for s, b, n in zip(p.shape, p.block, p.grid, strict=True)
+            ))
+        )
+        self.assertEqual(sorted(seen), expected)
+        self.assertLen(set(seen), p.steps)
 
-  def test_a_single_block_needs_no_pipeline(self):
+  def test_a_single_tile_is_a_single_cta(self):
     p = self._plan((8, 128))
-    self.assertEqual((p.block, p.steps, p.num_ctas), ((8, 128), 1, 1))
-    self.assertEqual(p.num_stages, 1)
+    self.assertEqual((p.block, p.steps), ((8, 128), 1))
 
 
 if __name__ == '__main__':
