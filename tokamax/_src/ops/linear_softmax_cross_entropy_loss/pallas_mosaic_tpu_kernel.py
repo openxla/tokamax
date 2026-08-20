@@ -99,14 +99,15 @@ def _calculate_bwd_vmem_bytes(
       # + dot_general intermediate result in accumulate_w_grad (float32: 4B)
       + h_alloc * v_block_size * (2 * dtype_bytes + 8)
       # logits/softmax tile (B, V) in float32 accumulator:
-      # We account for 4 simultaneous (B, V) float32 buffers
-      # (4 * 4 = 16 bytes/elem):
-      #   1) xw_scratch_ref (explicit VMEM scratch buffer)
-      #   2) labels_one_hot (HLO stack temp from jax.nn.one_hot in compute_s)
-      #   3) diff = xw_scratch_ref - lse (HLO stack temporary during softmax in
-      #       compute_s)
-      #   4) jnp.exp(diff) (HLO stack temporary during softmax in compute_s)
-      + 4 * b_block_size * v_block_size * 4
+      # In-place softmax and target subtraction in compute_s:
+      #   1) xw_scratch_ref (explicit VMEM scratch buffer: 4B)
+      #   2) diff = xw_scratch_ref - lse (HLO stack temporary: 4B)
+      #   3) jnp.exp(diff) * dout (HLO stack temporary: 4B)
+      # In-place target subtraction with broadcasted_iota/jnp.where uses zero
+      # extra (B, V) buffers
+      # Total 3 simultaneous (B, V) float32 buffers (12 bytes/elem across
+      # b_block_size)
+      + 3 * b_block_size * v_block_size * 4
   )
 
 
@@ -191,13 +192,12 @@ def _get_heuristic_config(
     # per_v_bytes accounts for all VMEM costs per column of V:
     #   - w tile (double-buffered in dtype: 2 * dt) + w_grad_tile (4B) +
     #       dot_general res (4B) = h_block_size * (2 * dtype_bytes + 8)
-    #   - 4 simultaneous float32 (B, V) buffers on the VMEM stack during
-    #     compute_s: (4 * 4 = 16 bytes per element across b_block_size):
+    #   - 3 simultaneous float32 (B, V) buffers on the VMEM stack during
+    #     compute_s: (3 * 4 = 12 bytes per element across b_block_size):
     #       1) xw_scratch_ref (explicit VMEM scratch)
-    #       2) labels_one_hot (HLO stack temporary from jax.nn.one_hot)
-    #       3) diff = xw_scratch_ref - lse (HLO stack temporary during softmax)
-    #       4) jnp.exp(...) (HLO stack temporary during softmax)
-    per_v_bytes = h_block_size * (2 * dtype_bytes + 8) + 16 * b_block_size
+    #       2) diff = xw_scratch_ref - lse (HLO stack temporary during softmax)
+    #       3) jnp.exp(...) * dout (HLO stack temporary during softmax)
+    per_v_bytes = h_block_size * (2 * dtype_bytes + 8) + 12 * b_block_size
   else:
     # fixed_bytes accounts for VMEM costs that do not scale with V:
     #   - x tile = 2 * b_block_size * h_block_size * dtype_bytes
@@ -314,11 +314,14 @@ def validate_inputs(
   Raises:
     ValueError: If the inputs are invalid.
   """
+  del b_block_size  # Currently unused.
+
   if labels.shape[0] != x.shape[0]:
     raise ValueError(
         f"Batch dimension mismatch: labels batch dimension ({labels.shape[0]})"
         f" != x batch dimension ({x.shape[0]})."
     )
+
   if x.shape[-1] != w.shape[0]:
     raise ValueError(
         f"Hidden dimension mismatch: x hidden dimension ({x.shape[-1]}) !="
@@ -329,6 +332,7 @@ def validate_inputs(
     raise ValueError("The hidden dimension of w must be a multiple of 8")
 
 
+@jax.named_scope("calculate_xw_tiled")
 def calculate_xw_tiled(
     x_ref,
     w_ref,
@@ -377,14 +381,11 @@ def calculate_xw_tiled(
     w_val = jnp.where(
         (h_index == num_h_blocks - 1) & (row_idx >= rem_h), 0.0, w_val
     )
-  if v_dim % v_block_size != 0:
-    rem_v = v_dim % v_block_size
+  if v_dim % v_block_size != 0 or num_v_blocks * v_block_size > v_dim:
     col_idx = jax.lax.broadcasted_iota(
         dtype=jnp.int32, shape=(1, v_block_size), dimension=1
     )
-    w_val = jnp.where(
-        (v_index == num_v_blocks - 1) & (col_idx >= rem_v), 0.0, w_val
-    )
+    w_val = jnp.where((v_index * v_block_size + col_idx) >= v_dim, 0.0, w_val)
 
   @pl.when(h_index == 0)
   def init_xw():
@@ -518,11 +519,13 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       )
 
       @pl.when(jnp.logical_and(v_index == 0, h_index == 0))
+      @jax.named_scope("init_lse")
       def init_lse():
         lse_ref[...] = jnp.full_like(lse_ref, -jnp.inf)
         loss_ref[...] = jnp.zeros_like(loss_ref)
 
       @pl.when(h_index == num_h_blocks - 1)
+      @jax.named_scope("accumulate_loss")
       def accumulate_loss():
         # Convert labels to one-hot, due to chunking on v dimension, the indices
         # needs to be shifted down by the v starting index. Negative or
@@ -726,6 +729,9 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     w,
     lse,
     *,
+    b_dim: int,
+    h_dim: int,
+    v_dim: int,
     preferred_element_type: jnp.dtype,
     b_block_size: int,
     h_block_size: int,
@@ -736,9 +742,12 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   Args:
     dout: Gradient of the loss (b_dim,).
     x: Input activations `x` (b_dim, h_dim).
-    labels: One-hot encoded labels (b_dim, v_dim).
+    labels: Ground truth labels (b_dim,).
     w: LM Head projection weights `w` (h_dim, v_dim).
     lse: Log-sum-exp accumulator per batch item (b_dim,).
+    b_dim: Batch dimension size.
+    h_dim: Hidden dimension size.
+    v_dim: Vocabulary dimension size.
     preferred_element_type: Preferred element type for computation.
     b_block_size: Block size for batch dimension.
     h_block_size: Block size for hidden dimension.
@@ -747,31 +756,29 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   Returns:
     A tuple of (x_grad, w_grad).
   """
-  b_dim = x.shape[0]
-  h_dim, v_dim = w.shape
   num_b_blocks = math.ceil(b_dim / b_block_size)
   num_h_blocks = math.ceil(h_dim / h_block_size)
   num_v_blocks = math.ceil(v_dim / v_block_size)
   num_stages = 2
 
   max_cores = pltpu.get_tpu_info().num_cores
-  num_cores = math.gcd(num_b_blocks, max_cores)
+  num_cores = math.gcd(num_v_blocks, max_cores)
   if num_cores == 0:
     num_cores = 1
-  num_b_blocks_per_core = num_b_blocks // num_cores
-
+  num_v_blocks_per_core = num_v_blocks // num_cores
   major_align = 32 // x.dtype.itemsize
-  padded_b_dim = math.ceil(b_dim / major_align) * major_align
-  padded_h_dim = math.ceil(h_dim / 128) * 128
-  padded_v_dim = math.ceil(v_dim / 128) * 128
+  b_dim_aligned = int(math.ceil(b_dim / major_align) * major_align)
+  h_dim_128_aligned = int(math.ceil(h_dim / 128) * 128)
+  h_dim_8_aligned = int(math.ceil(h_dim / 8) * 8)
+  v_dim_aligned = int(math.ceil(v_dim / 128) * 128)
 
   @pl.kernel(
       out_type=[
           jax.ShapeDtypeStruct(
-              (padded_b_dim, padded_h_dim), dtype=jnp.float32
+              (num_cores, b_dim_aligned, h_dim_128_aligned), dtype=jnp.float32
           ),  # x_grad
           jax.ShapeDtypeStruct(
-              (num_cores, padded_h_dim, padded_v_dim), dtype=jnp.float32
+              (h_dim_8_aligned, v_dim_aligned), dtype=jnp.float32
           ),  # w_grad
       ],
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
@@ -836,7 +843,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       b_index, v_index, stage_index, h_index = (
           pl.program_id(i) for i in range(4)
       )
-      global_b_index = c_index * num_b_blocks_per_core + b_index
+      global_v_index = c_index * num_v_blocks_per_core + v_index
 
       # Calculate and accumulate xw_scratch_ref += x_ref @ w_ref as first stage
       @pl.when(stage_index == 0)
@@ -845,9 +852,9 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             x_ref,
             w_ref,
             xw_scratch_ref,
-            b_index=global_b_index,
+            b_index=b_index,
             h_index=h_index,
-            v_index=v_index,
+            v_index=global_v_index,
             num_b_blocks=num_b_blocks,
             num_h_blocks=num_h_blocks,
             num_v_blocks=num_v_blocks,
@@ -860,10 +867,11 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       # When xw_scratch_ref is fully accumulated, use it to calculate gradients
       # as second stage
       @pl.when(stage_index == 1)
+      @jax.named_scope("calculate_grads")
       def calculate_grads():
         # Calculate actual block size if v_dim not a multiple of v_block_size
-        cur_v_block_size = jnp.minimum(
-            v_dim - v_block_size * v_index, v_block_size
+        cur_v_block_size = jnp.maximum(
+            0, jnp.minimum(v_dim - v_block_size * global_v_index, v_block_size)
         )
 
         # V Block size must be multiple of 128 to perform DMA (copy).
@@ -892,7 +900,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
         # Calculate actual block size if b_dim not a multiple of b_block_size
         cur_b_block_size = jnp.minimum(
-            b_dim - b_block_size * global_b_index, b_block_size
+            b_dim - b_block_size * b_index, b_block_size
         )
         cur_b_block_aligned_size = pl.multiple_of(
             (pl.cdiv(cur_b_block_size, major_align) * major_align).astype(
@@ -901,15 +909,15 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             major_align,
         )
 
-        # Slicing x_grad and x_grad HBM ref to prepare for tiled read / write
+        # Slicing x_grad and w_grad HBM ref to prepare for tiled read / write
         x_grad_slice = x_grad_hbm_ref.at[
-            pl.ds(global_b_index * b_block_size, cur_b_block_aligned_size),
+            c_index,
+            pl.ds(b_index * b_block_size, cur_b_block_aligned_size),
             pl.ds(h_index * h_block_size, cur_h_block_128_aligned_size),
         ]
         w_grad_slice = w_grad_hbm_ref.at[
-            c_index,
             pl.ds(h_index * h_block_size, cur_h_block_8_aligned_size),
-            pl.ds(v_index * v_block_size, cur_v_block_size),
+            pl.ds(global_v_index * v_block_size, cur_v_block_size),
         ]
 
         x_grad_tile_slice = x_grad_tile_ref.at[
@@ -934,26 +942,19 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             w_grad_slice, w_grad_tile_slice, sem=w_read_sem
         )
 
-        # Preload x_grad and w_grad async before computing softmax to
-        # overlap computation. There's no accumulation on their first index
-        # so we skip the read for the first block. For these first blocks,
-        # we will initialize the gradient tiles using init_w_grad() and
-        # init_x_grad() defined below.
+        # Preload w_grad async before computing softmax to overlap computation.
+        # There's no accumulation on their first index so we skip the read for
+        # the first block.
         @pl.when(b_index != 0)
+        @jax.named_scope("w_grad_read_start")
         def w_read():
           w_grad_read_future.start()
 
-        @pl.when(v_index != 0)
-        def x_read():
-          x_grad_read_future.start()
-
-        # Compute Softmax and store s = -labels + softmax(x@w) to xw_scratch_ref
+        # Compute Softmax and store s = -labels*dout + softmax(x@w)*dout to
+        # xw_scratch_ref
         @pl.when(h_index == 0)
+        @jax.named_scope("compute_s")
         def compute_s():
-          labels_adjusted = labels_ref[...] - v_index * v_block_size
-          labels_one_hot = jax.nn.one_hot(
-              labels_adjusted, num_classes=v_block_size, dtype=x_ref.dtype
-          )
           lse_val = lse_ref[...]
           if b_dim % b_block_size != 0:
             rem_b = b_dim % b_block_size
@@ -965,30 +966,44 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
                 jnp.inf,
                 lse_val,
             )
-          xw_scratch_ref[...] = (
-              -labels_one_hot + jnp.exp(xw_scratch_ref[...] - lse_val[:, None])
-          ) * dout_ref[...][:, None]
+
+          # 1. Broadcast dout once to avoid redundant vector staging registers
+          dout_val = dout_ref[...][:, None]
+
+          # 2. Compute probabilities: prob = exp(xw - lse)
+          prob = jnp.exp(xw_scratch_ref[...] - lse_val[:, None])
+
+          # 3. In-kernel target gradient subtraction: (prob - 1.0) * dout for
+          # targets
+          labels_adjusted = labels_ref[...] - global_v_index * v_block_size
+          col_idx = jax.lax.broadcasted_iota(
+              jnp.int32, (1, v_block_size), dimension=1
+          )
+          is_target = col_idx == labels_adjusted[:, None]
+          prob_sub = jnp.where(is_target, prob - 1.0, prob)
+          s_val = prob_sub * dout_val
+
+          # 4. Zero out padding elements only when dimensions are not aligned
           if b_dim % b_block_size != 0:
             rem_b = b_dim % b_block_size
             row_idx = jax.lax.broadcasted_iota(
                 jnp.int32, (b_block_size, 1), dimension=0
             )
-            xw_scratch_ref[...] = jnp.where(
+            s_val = jnp.where(
                 (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
                 0.0,
-                xw_scratch_ref[...],
+                s_val,
             )
-          if v_dim % v_block_size != 0:
-            rem_v = v_dim % v_block_size
-            col_idx = jax.lax.broadcasted_iota(
-                jnp.int32, (1, v_block_size), dimension=1
-            )
-            xw_scratch_ref[...] = jnp.where(
-                (v_index == num_v_blocks - 1) & (col_idx >= rem_v),
+          if v_dim % v_block_size != 0 or num_v_blocks * v_block_size > v_dim:
+            s_val = jnp.where(
+                (global_v_index * v_block_size + col_idx) >= v_dim,
                 0.0,
-                xw_scratch_ref[...],
+                s_val,
             )
 
+          xw_scratch_ref[...] = s_val
+
+        @jax.named_scope("get_clean_x")
         def get_clean_x():
           """Zeros out out-of-bounds padding elements in x_ref in VMEM."""
           x_val = x_ref[...]
@@ -998,7 +1013,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
                 dtype=jnp.int32, shape=(b_block_size, 1), dimension=0
             )
             x_val = jnp.where(
-                (global_b_index == num_b_blocks - 1) & (row_idx >= rem_b),
+                (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
                 0.0,
                 x_val,
             )
@@ -1014,6 +1029,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             )
           return x_val
 
+        @jax.named_scope("get_clean_w")
         def get_clean_w():
           """Zeros out out-of-bounds padding elements in w_ref in VMEM."""
           w_val = w_ref[...]
@@ -1027,20 +1043,26 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
                 0.0,
                 w_val,
             )
-          if v_dim % v_block_size != 0:
-            rem_v = v_dim % v_block_size
+          if v_dim % v_block_size != 0 or num_v_blocks * v_block_size > v_dim:
             col_idx = jax.lax.broadcasted_iota(
                 dtype=jnp.int32, shape=(1, v_block_size), dimension=1
             )
             w_val = jnp.where(
-                (v_index == num_v_blocks - 1) & (col_idx >= rem_v),
+                (global_v_index * v_block_size + col_idx) >= v_dim,
                 0.0,
                 w_val,
             )
           return w_val
 
+        # Preload x_grad async before computing softmax to overlap computation.
+        @pl.when(v_index != 0)
+        @jax.named_scope("x_grad_read_start")
+        def x_read():
+          x_grad_read_future.start()
+
         # Init W gradient
         @pl.when(b_index == 0)
+        @jax.named_scope("init_w_grad")
         def init_w_grad():
           w_grad_tile_ref[...] = jax.lax.dot_general(
               get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
@@ -1049,6 +1071,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
         # Init X gradient
         @pl.when(v_index == 0)
+        @jax.named_scope("init_x_grad")
         def init_x_grad():
           x_grad_tile_ref[...] = jax.lax.dot_general(
               xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
@@ -1057,6 +1080,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
         # Accumulate W grad on B dimension
         @pl.when(b_index != 0)
+        @jax.named_scope("accumulate_w_grad")
         def accumulate_w_grad():
           res = jax.lax.dot_general(
               get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
@@ -1067,6 +1091,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
         # Accumulate X grad on V dimension
         @pl.when(v_index != 0)
+        @jax.named_scope("accumulate_x_grad")
         def accumulate_x_grad():
           res = jax.lax.dot_general(
               xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
@@ -1076,55 +1101,44 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           x_grad_write_future.start()
 
         # Lastly make sure to wait x_grad, w_grad write before next iteration
-        w_grad_write_future.wait()
-        x_grad_write_future.wait()
+        with jax.named_scope("wait_w_grad"):
+          w_grad_write_future.wait()
 
-    get_b_ds_bwd = lambda i: pl.ds(
-        (c_index * num_b_blocks_per_core + i) * b_block_size,
-        jnp.minimum(
-            b_block_size,
-            b_dim - (c_index * num_b_blocks_per_core + i) * b_block_size,
-        ),
-    )
-    get_h_ds = lambda k: pl.ds(
-        k * h_block_size, jnp.minimum(h_block_size, h_dim - k * h_block_size)
-    )
-    get_v_ds = lambda j: pl.ds(
-        j * v_block_size, jnp.minimum(v_block_size, v_dim - j * v_block_size)
-    )
+        with jax.named_scope("wait_x_grad"):
+          x_grad_write_future.wait()
 
     pltpu.emit_pipeline(
         bwd_pipeline,
         grid=(
-            num_b_blocks_per_core,
-            num_v_blocks,
+            num_b_blocks,
+            num_v_blocks_per_core,
             num_stages,
             num_h_blocks,
         ),
         in_specs=[
             pl.BlockSpec(  # dout
-                (pl.BoundedSlice(b_block_size),),
-                lambda i, j, s, k: (get_b_ds_bwd(i),),
+                (b_block_size,),
+                lambda i, j, s, k: (i,),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # x
-                (pl.BoundedSlice(b_block_size), pl.BoundedSlice(h_block_size)),
-                lambda i, j, s, k: (get_b_ds_bwd(i), get_h_ds(k)),
+                (b_block_size, h_block_size),
+                lambda i, j, s, k: (i, k),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # labels
-                (pl.BoundedSlice(b_block_size),),
-                lambda i, j, s, k: (get_b_ds_bwd(i),),
+                (b_block_size,),
+                lambda i, j, s, k: (i,),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # w
-                (pl.BoundedSlice(h_block_size), pl.BoundedSlice(v_block_size)),
-                lambda i, j, s, k: (get_h_ds(k), get_v_ds(j)),
+                (h_block_size, v_block_size),
+                lambda i, j, s, k: (k, c_index * num_v_blocks_per_core + j),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # lse
-                (pl.BoundedSlice(b_block_size),),
-                lambda i, j, s, k: (get_b_ds_bwd(i),),
+                (b_block_size,),
+                lambda i, j, s, k: (i,),
                 memory_space=pltpu.VMEM,
             ),
         ],
@@ -1152,9 +1166,10 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     )
 
   # pylint: disable-next=unpacking-non-sequence
-  x_grad, w_grad_blocks = bwd_kernel(dout, x, labels, w, lse)
-  w_grad = jnp.sum(w_grad_blocks, axis=0)
-  return x_grad[:b_dim, :h_dim], w_grad[:h_dim, :v_dim]
+  x_grad_blocks, w_grad = bwd_kernel(dout, x, labels, w, lse)
+  x_grad = jnp.sum(x_grad_blocks, axis=0)[:b_dim, :h_dim]
+  w_grad = w_grad[:h_dim, :v_dim]
+  return x_grad, w_grad
 
 
 @partial(
@@ -1182,11 +1197,8 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """Pallas kernel implementation of Linear Softmax Cross-Entropy Loss backward.
 
-  The backward pass is also chunking the x, labels and w in all B, H and V
-  dimensions so it can fit in the TPU VMEM. To not materialize the logits, the
-  backward pass will re-compute the logits blockwise and cache in VMEM for the
-  gradient calculation. This leads to also almost 0 memory overhead in backward
-  pass.
+  Computes dense Softmax gradients and applies sparse target label subtraction
+  in-place inside Pallas Mosaic TPU kernel.
 
   Args:
     dout: The output's gradient of the Linear Cross-Entropy kernel. Since the
@@ -1194,7 +1206,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
       "mean", or shape (B,) when reduction is "none".
     lse: The log-sum-exp of the from the forward pass residuals.
     x: The last layer output in the dimension of (B, H) where B is the batch
-      dimension , and H is the hidden dimension.
+      dimension, and H is the hidden dimension.
     labels: The ground truth labels index in the dimension of (B,).
     w: The linear projection weight matrix in the dimension of (H, V) where V is
       the dimension of the output logits aka vocabulary size.
@@ -1203,6 +1215,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     v_block_size: The block size for the vocabulary dimension.
     reduction: The reduction method for the cross entropy loss. Can be set to
       "sum", "mean" or "none" explicitly.
+    preferred_element_type: Preferred element type for computation.
 
   Returns:
     The tuple of gradient of the loss with respect to x and w.
@@ -1232,6 +1245,9 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
   else:
     dout_array = jnp.asarray(dout, dtype=preferred_element_type)
 
+  h_dim = x.shape[-1]
+  v_dim = w.shape[1]
+
   # Constrain the memory spaces for x and w to prevent OOB accesses that occur
   # when the memory spaces is placed in VMEM.
   x = pltpu.with_memory_space_constraint(x, memory_space=pltpu.HBM)
@@ -1245,6 +1261,9 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
       labels,
       w,
       lse,
+      b_dim=b_dim,
+      h_dim=h_dim,
+      v_dim=v_dim,
       preferred_element_type=preferred_element_type,
       b_block_size=b_block_size,
       h_block_size=h_block_size,

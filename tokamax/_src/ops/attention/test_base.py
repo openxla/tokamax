@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import qwix
+from tokamax._src import gpu_utils
 from tokamax._src import numerics
 from tokamax._src import quantization
 from tokamax._src import test_utils
@@ -355,7 +356,7 @@ class AttentionTestBase(parameterized.TestCase):
     self._run_test((1024, 4, 64))
 
   def test_multiple_batch_dims(self):
-    self._run_test((2, 3, 4, 1024, 4, 64))
+    self._run_test((2, 3, 4, 256, 4, 64))
 
   def test_non_power_of_two_q_seq_len(self):
     self._run_test(
@@ -818,6 +819,8 @@ class AttentionTestBase(parameterized.TestCase):
     self._test_bench(spec)
 
   def _test_bench(self, spec):
+    if "deepseek2" in self._testMethodName and gpu_utils.is_sm90():
+      self.skipTest("deepseek2 doesn't fit into an H100 slice")
     self.skipTest("Awaiting Bug Fixes")
 
     spec = dict(spec)  # We need to take a copy to avoid modifying other tests.

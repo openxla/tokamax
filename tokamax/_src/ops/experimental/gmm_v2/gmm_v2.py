@@ -392,7 +392,7 @@ def generate_block_specs(
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_n, cfgs.tiles.tile_k),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=4),
+        pipeline_mode=pl.Buffered(buffer_count=3),
     )
   else:
     rhs_weight_spec = pl.BlockSpec(

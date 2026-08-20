@@ -731,7 +731,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=32 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=512
+              b_block_size=1024, h_block_size=512, v_block_size=1024
           ),
       ),
       dict(
