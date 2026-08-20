@@ -236,6 +236,8 @@ def make_tgmm_configs(
     out_dtype: jnp.dtype,
     acc_dtype: jnp.dtype | None,
     target_zero_ref_bytes: int,
+    lhs_quant_dtype: jnp.dtype | None,
+    rhs_quant_dtype: jnp.dtype | None,
 ):
   """Fills the GMM config for the TGMM kernel."""
   assert out_dtype, "out_dtype cannot be None"
@@ -282,15 +284,19 @@ def make_tgmm_configs(
   )
 
   rhs_quant_block_size_m = size_m
+  validate_dynamic_quant(lhs, rhs, rhs_scale, lhs_quant_dtype, rhs_quant_dtype)
   rhs_cfgs = gmm_v2.InputConfigs(
       quant_dtype=None,
-      quant_block_size=rhs_quant_block_size_m,
+      # On the dynamic quant path (rhs_q_dtype!=None), the quant_block is 
+      # scoped within a m_tile. On the external scale path, the quant
+      # block is the while m axis.
+      quant_block_size=None if rhs_q_dtype is not None else size_m,
       dtype=rhs.dtype,
       has_scale=(rhs_scale is not None),
   )
   lhs_cfgs = gmm_v2.InputConfigs(
-      quant_dtype=None,
-      quant_block_size=-1,
+      quant_dtype=lhs_quant_dtype,
+      quant_block_size=None if lhs_q_dtype is not None else -1,
       dtype=lhs.dtype,
   )
 
@@ -305,6 +311,12 @@ def make_tgmm_configs(
         dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, out_dtype, acc_dtype,
         target_zero_ref_bytes,
     )
+  if lhs_quant_dtype is not None and rhs_quant_dtype is not None:
+    lhs_cfgs = dataclasses.replace(lhs_cfgs, quant_block_size=tiles.tile_m)
+    rhs_cfgs = dataclasses.replace(rhs_cfgs, quant_block_size=tiles.tile_m)
+    assert lhs_cfgs.should_quantize
+    assert rhs_cfgs.should_quantize
+  assert not (rhs_cfgs.should_quantize and rhs_cfgs.has_scale), "Caller can choose to either quantize rhs dynamically or provide a prequantized rhs with a scale but not both."
 
   return gmm_v2.GmmConfigs(
       dims=dims,
