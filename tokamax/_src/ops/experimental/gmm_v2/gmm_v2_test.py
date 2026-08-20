@@ -1306,5 +1306,79 @@ class GmmTest(parameterized.TestCase):
     chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
 
+class GmmV2VmemStressTest(parameterized.TestCase):
+  """AOT compilation and VMEM stress tests for GMM v2.
+
+  Verifies that large model shapes and DLHS transpose_rhs configurations compile
+  ahead-of-time and fit within TPU VMEM capacity without triggering
+  RESOURCE_EXHAUSTED errors.
+  """
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    if pltpu.get_tpu_info().generation < 5:
+      self.skipTest("Only supported on TPU gen 5+.")
+    super().setUp()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="vmem_stress_transpose_rhs",
+          batch_size=65536,
+          num_groups=128,
+          in_size=3072,
+          out_size=2048,
+          transpose_rhs=True,
+          tile_info=gmm_v2.TileSizes(
+              tile_m=512, tile_k=3072, tile_n=2048, bucket_base=256
+          ),
+      ),
+      dict(
+          testcase_name="vmem_stress_normal_rhs",
+          batch_size=65536,
+          num_groups=128,
+          in_size=3072,
+          out_size=2048,
+          transpose_rhs=False,
+      ),
+      dict(
+          testcase_name="megablox_yt_moe_dlhs",
+          batch_size=65536,
+          num_groups=64,
+          in_size=1536,
+          out_size=1280,
+          transpose_rhs=True,
+      ),
+  )
+  def test_aot_compile_vmem_stress(
+      self,
+      batch_size,
+      num_groups,
+      in_size,
+      out_size,
+      transpose_rhs,
+      tile_info=gmm_v2.calculate_tiling,
+  ):
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    lhs_spec = jax.ShapeDtypeStruct((batch_size, in_size), jnp.bfloat16)
+    if transpose_rhs:
+      rhs_spec = jax.ShapeDtypeStruct(
+          (num_groups, out_size, in_size), jnp.bfloat16
+      )
+    else:
+      rhs_spec = jax.ShapeDtypeStruct(
+          (num_groups, in_size, out_size), jnp.bfloat16
+      )
+
+    def gmm_fn(lhs, rhs, sizes):
+      return gmm_v2.gmm_v2(
+          lhs, rhs, sizes, transpose_rhs=transpose_rhs, tile_info=tile_info
+      )
+
+    lowered = jax.jit(gmm_fn).lower(lhs_spec, rhs_spec, group_sizes)
+    compiled = lowered.compile()
+    self.assertIsNotNone(compiled)
+
+
 if __name__ == "__main__":
   absltest.main()
