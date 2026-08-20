@@ -159,6 +159,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
     # configurations.
 
     lhs, rhs = map(quantization.as_array_or_qarray, (lhs, rhs))
+    m = lhs.shape[0]
 
     if any(  # pallas mosaic TPU requires all non-expert dimensions to be >= 128
         size < 128 for size in tuple(lhs.shape[-2:]) + tuple(rhs.shape[-2:])
@@ -198,6 +199,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           activation=activation if not return_residuals else None,
           manual_axis_type=manual_axis_type,
       )
+      out = jnp.where(jnp.arange(m)[:, None] < jnp.sum(group_sizes), out, 0)
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
       # here, handle fast-path special cases that arise in backwards gmm
       if isinstance(lhs, jax.Array) and isinstance(rhs, QArray):
@@ -228,6 +230,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           activation=activation if not return_residuals else None,
           manual_axis_type=manual_axis_type,
       )
+      out = jnp.where(jnp.arange(m)[:, None] < jnp.sum(group_sizes), out, 0)
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
       lhs_trans = jax.tree.map(lambda x: x.mT, lhs)  # [m, k] -> [k, m]
       # here, handle fast-path special cases that arise in backwards gmm
