@@ -41,6 +41,14 @@ class RaggedDotWithExplicitVjpTest(test_base.RaggedDotTestBase):
       self.skipTest("Disabled for now due to numeric issues.")
     super().setUp()
 
+  def test_bench(self, spec):
+    if "128_m16384" in self._testMethodName:
+      if jax.default_backend() == "gpu":
+        self.skipTest(
+            f"{self._testMethodName} OOMs with explicit VJP reference on GPU."
+        )
+    super().test_bench(spec)
+
 
 class GenerateGroupSizesTest(parameterized.TestCase):
 

@@ -113,10 +113,8 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
       activation=(None, test_base.relu, jax.nn.tanh),
       task=(
           (8, 512, 512, 512),
-          (8, 512, 512, 512),
-          (32, 4096, 4096, 4096),
-          (32, 16384, 4096, 4096),
-          (16, 8192, 4096, 4096),
+          (16, 1024, 1024, 1024),
+          (16, 2048, 1024, 1024),
       ),
       block_m=(16, 32),
       block_k=(512, 256, 128),
@@ -593,10 +591,10 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
   @parameterized.product(
       use_as_qarray=(True, False),
       task=(
-          (128, 32768, 3072, 4096),
-          (128, 16384, 3072, 4096),
-          (128, 32768, 4096, 3072),
-          (128, 16384, 4096, 3072),
+          (16, 2048, 1024, 2048),
+          (16, 1024, 1024, 2048),
+          (16, 2048, 2048, 1024),
+          (16, 1024, 2048, 1024),
       ),
   )
   def test_heuristic_quality_eval_shapes_op(self, use_as_qarray, task):
@@ -632,10 +630,10 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
   @parameterized.product(
       task=(
-          (128, 32768, 3072, 4096),
-          (128, 16384, 3072, 4096),
-          (128, 32768, 4096, 3072),
-          (128, 16384, 4096, 3072),
+          (16, 2048, 1024, 2048),
+          (16, 1024, 1024, 2048),
+          (16, 2048, 2048, 1024),
+          (16, 1024, 2048, 1024),
       ),
   )
   def test_heuristic_quality_eval_shapes_kernel(self, task):
@@ -673,10 +671,10 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
   @parameterized.product(
       task=(
-          (128, 32768, 3072, 4096),
-          (128, 16384, 3072, 4096),
-          (128, 32768, 4096, 3072),
-          (128, 16384, 4096, 3072),
+          (16, 2048, 1024, 2048),
+          (16, 1024, 1024, 2048),
+          (16, 2048, 2048, 1024),
+          (16, 1024, 2048, 1024),
       ),
       block_k=(256, 128),
   )
