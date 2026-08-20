@@ -28,6 +28,7 @@ from tokamax._src.autotuning import cache
 from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.normalization import pallas_triton
+from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu as ragged_dot_pallas_mosaic_gpu
 
 _KNOWN_CACHE_FILE_NAMES: Final[tuple[str, ...]] = (
     "nvidia_h100_80gb_hbm3/pallas_triton_normalization.json",
@@ -57,6 +58,12 @@ class CacheTest(parameterized.TestCase):
       self.assertEmpty(device_cache)
     else:
       self.assertNotEmpty(device_cache)
+
+  @parameterized.parameters(
+      ("nvidia_b300_sxm6_ac", "nvidia_b300"),
+  )
+  def test_device_kind_alias(self, alias: str, canonical: str):
+    self.assertEqual(cache._DEVICE_KIND_ALIASES.get(alias), canonical)
 
   def test_validate_json_cache_files(self):
     """Checks that all cache files are valid JSON."""
