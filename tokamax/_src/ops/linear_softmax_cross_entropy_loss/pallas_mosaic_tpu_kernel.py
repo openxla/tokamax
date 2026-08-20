@@ -332,6 +332,7 @@ def validate_inputs(
     raise ValueError("The hidden dimension of w must be a multiple of 8")
 
 
+@jax.named_scope("calculate_xw_tiled")
 def calculate_xw_tiled(
     x_ref,
     w_ref,
@@ -518,11 +519,13 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       )
 
       @pl.when(jnp.logical_and(v_index == 0, h_index == 0))
+      @jax.named_scope("init_lse")
       def init_lse():
         lse_ref[...] = jnp.full_like(lse_ref, -jnp.inf)
         loss_ref[...] = jnp.zeros_like(loss_ref)
 
       @pl.when(h_index == num_h_blocks - 1)
+      @jax.named_scope("accumulate_loss")
       def accumulate_loss():
         # Convert labels to one-hot, due to chunking on v dimension, the indices
         # needs to be shifted down by the v starting index. Negative or
@@ -864,6 +867,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       # When xw_scratch_ref is fully accumulated, use it to calculate gradients
       # as second stage
       @pl.when(stage_index == 1)
+      @jax.named_scope("calculate_grads")
       def calculate_grads():
         # Calculate actual block size if v_dim not a multiple of v_block_size
         cur_v_block_size = jnp.maximum(
@@ -942,12 +946,14 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         # There's no accumulation on their first index so we skip the read for
         # the first block.
         @pl.when(b_index != 0)
+        @jax.named_scope("w_grad_read_start")
         def w_read():
           w_grad_read_future.start()
 
         # Compute Softmax and store s = -labels*dout + softmax(x@w)*dout to
         # xw_scratch_ref
         @pl.when(h_index == 0)
+        @jax.named_scope("compute_s")
         def compute_s():
           lse_val = lse_ref[...]
           if b_dim % b_block_size != 0:
@@ -997,6 +1003,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
           xw_scratch_ref[...] = s_val
 
+        @jax.named_scope("get_clean_x")
         def get_clean_x():
           """Zeros out out-of-bounds padding elements in x_ref in VMEM."""
           x_val = x_ref[...]
@@ -1022,6 +1029,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             )
           return x_val
 
+        @jax.named_scope("get_clean_w")
         def get_clean_w():
           """Zeros out out-of-bounds padding elements in w_ref in VMEM."""
           w_val = w_ref[...]
@@ -1048,11 +1056,13 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
         # Preload x_grad async before computing softmax to overlap computation.
         @pl.when(v_index != 0)
+        @jax.named_scope("x_grad_read_start")
         def x_read():
           x_grad_read_future.start()
 
         # Init W gradient
         @pl.when(b_index == 0)
+        @jax.named_scope("init_w_grad")
         def init_w_grad():
           w_grad_tile_ref[...] = jax.lax.dot_general(
               get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
@@ -1061,6 +1071,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
         # Init X gradient
         @pl.when(v_index == 0)
+        @jax.named_scope("init_x_grad")
         def init_x_grad():
           x_grad_tile_ref[...] = jax.lax.dot_general(
               xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
@@ -1069,6 +1080,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
         # Accumulate W grad on B dimension
         @pl.when(b_index != 0)
+        @jax.named_scope("accumulate_w_grad")
         def accumulate_w_grad():
           res = jax.lax.dot_general(
               get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
@@ -1079,6 +1091,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
         # Accumulate X grad on V dimension
         @pl.when(v_index != 0)
+        @jax.named_scope("accumulate_x_grad")
         def accumulate_x_grad():
           res = jax.lax.dot_general(
               xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
@@ -1088,8 +1101,11 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           x_grad_write_future.start()
 
         # Lastly make sure to wait x_grad, w_grad write before next iteration
-        w_grad_write_future.wait()
-        x_grad_write_future.wait()
+        with jax.named_scope("wait_w_grad"):
+          w_grad_write_future.wait()
+
+        with jax.named_scope("wait_x_grad"):
+          x_grad_write_future.wait()
 
     pltpu.emit_pipeline(
         bwd_pipeline,
