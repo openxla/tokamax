@@ -70,7 +70,7 @@ def has_mosaic_gpu_support(device: jax.Device | None = None) -> bool:
     return False
 
   # Only supported for Ampere and above. SM80 support is experimental.
-  return float(device.compute_capability) >= 8.0
+  return float(device.compute_capability) >= 9.0
 
 
 def has_triton_support(device: jax.Device | None = None) -> bool:
