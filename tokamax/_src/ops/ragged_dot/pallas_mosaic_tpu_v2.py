@@ -225,6 +225,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           maybe_quantize_lhs=maybe_quantize_lhs,
           zero_initialize=zero_initialize,
           fuse_act=fuse_gateup_activation,
+          lhs_quant_dtype=lhs_quantization_dtype,
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
       out = gmm_backend.gmm_v2(
@@ -247,6 +248,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           zero_initialize=zero_initialize,
           fuse_act=None,
           transpose_rhs=True,
+          lhs_quant_dtype=lhs_quantization_dtype,
       )
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
       # Captured from the original local weights in the custom vjp. Under
