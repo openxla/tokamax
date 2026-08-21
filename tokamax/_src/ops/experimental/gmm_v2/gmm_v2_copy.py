@@ -283,6 +283,7 @@ class GmmConfigs:
   acc_dtype: jnp.dtype
   zero_init: bool
   fuse_act: str | None
+  transpose_rhs: bool = False
 
   @property
   def num_quant_blocks_per_tile_k(self) -> int:
@@ -332,6 +333,8 @@ class IndexMaps:
       self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array
   ):
     group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+    if self.cfgs.transpose_rhs:
+      return (group_id, n_id, k_id)
     return (group_id, k_id, n_id)
 
   def rhs_bias_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
@@ -385,11 +388,18 @@ def generate_block_specs(
     )
   lhs_block_spec = LhsRef(value=lhs_value_spec, scale=lhs_scale_spec)
 
-  rhs_weight_spec = pl.BlockSpec(
-      (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
-      index_map.rhs_weight_index_map,
-      pipeline_mode=pl.Buffered(buffer_count=3),
-  )
+  if cfgs.transpose_rhs:
+    rhs_weight_spec = pl.BlockSpec(
+        (None, cfgs.tiles.tile_n, cfgs.tiles.tile_k),
+        index_map.rhs_weight_index_map,
+        pipeline_mode=pl.Buffered(buffer_count=3),
+    )
+  else:
+    rhs_weight_spec = pl.BlockSpec(
+        (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
+        index_map.rhs_weight_index_map,
+        pipeline_mode=pl.Buffered(buffer_count=3),
+    )
   rhs_scale_block_spec = rhs_bias_block_spec = None
   if cfgs.rhs_cfgs.has_bias:
     rhs_bias_block_spec = pl.BlockSpec(
@@ -473,9 +483,16 @@ def inner_kernel(
     # This should only be taken in the case where we don't requantize
     # the scales and thus we need to dequantize inside VMEM to avoid small
     # contracting dimmensions
-    rhs_tile_n = tiled_rhs.shape[1]
+    rhs_tile_n = (
+        tiled_rhs.shape[0] if cfgs.transpose_rhs else tiled_rhs.shape[1]
+    )
     rhs_qbs = cfgs.rhs_cfgs.quant_block_size
     if cfgs.rhs_cfgs.should_dequantize_before_matmul:
+      if cfgs.transpose_rhs:
+        raise NotImplementedError(
+            "should_dequantize_before_matmul is not supported with"
+            " transpose_rhs."
+        )
       tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
           cfgs.lhs_cfgs.dtype
       )
@@ -489,7 +506,10 @@ def inner_kernel(
 
     valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
     if is_last_k_step and valid_k != 0:
-      mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+      if cfgs.transpose_rhs:
+        mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 1) < valid_k
+      else:
+        mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
       tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
     # Step 2: Matmul.
@@ -504,13 +524,25 @@ def inner_kernel(
         for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):  # pyrefly: ignore[bad-argument-type]
           end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)  # pyrefly: ignore[unsupported-operation]
 
-          block_acc = jnp.matmul(
-              tiled_lhs[:, start_k:end_k],
-              tiled_rhs[start_k:end_k, start_n:end_n],
-              preferred_element_type=jnp.float32,
-          ).astype(acc_ref.dtype)
+          if cfgs.transpose_rhs:
+            block_acc = jnp.matmul(
+                tiled_lhs[:, start_k:end_k],
+                tiled_rhs[start_n:end_n, start_k:end_k].T,
+                preferred_element_type=jnp.float32,
+            ).astype(acc_ref.dtype)
+          else:
+            block_acc = jnp.matmul(
+                tiled_lhs[:, start_k:end_k],
+                tiled_rhs[start_k:end_k, start_n:end_n],
+                preferred_element_type=jnp.float32,
+            ).astype(acc_ref.dtype)
 
           if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+            if cfgs.transpose_rhs:
+              raise NotImplementedError(
+                  "should_dequantize_after_matmul is not supported with"
+                  " transpose_rhs."
+              )
             b_id = start_k // rhs_qbs  # pyrefly: ignore[unsupported-operation]
             rhs_scale_replicated = tiled_rhs_ref.get_scale(
                 replicate_size=bucket_m
@@ -554,7 +586,10 @@ def inner_kernel(
           end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)  # pyrefly: ignore[unsupported-operation]
 
           block_lhs = tiled_lhs[:, start_k:end_k]
-          block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+          if cfgs.transpose_rhs:
+            block_rhs = tiled_rhs[start_n:end_n, start_k:end_k]
+          else:
+            block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
           # Perform lhs quantization. Note that for every block_lhs,
           # same computation will be performed tiles_n//mxu_size times.
@@ -583,16 +618,28 @@ def inner_kernel(
           if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
             block_rhs = block_rhs.astype(lhs_q_dtype)
 
-          block_acc = jnp.matmul(
-              block_lhs_q,
-              block_rhs,
-              preferred_element_type=preferred_element_type,
-          ).astype(acc_ref.dtype)
+          if cfgs.transpose_rhs:
+            block_acc = jnp.matmul(
+                block_lhs_q,
+                block_rhs.T,
+                preferred_element_type=preferred_element_type,
+            ).astype(acc_ref.dtype)
+          else:
+            block_acc = jnp.matmul(
+                block_lhs_q,
+                block_rhs,
+                preferred_element_type=preferred_element_type,
+            ).astype(acc_ref.dtype)
 
           block_acc *= block_scale.astype(acc_ref.dtype)
 
           # Apply rhs subchannel scale per quant block.
           if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+            if cfgs.transpose_rhs:
+              raise NotImplementedError(
+                  "should_dequantize_after_matmul is not supported with"
+                  " transpose_rhs."
+              )
             b_id = start_k // rhs_qbs  # pyrefly: ignore[unsupported-operation]
             rhs_scale_replicated = tiled_rhs_ref.get_scale(
                 replicate_size=bucket_m
@@ -601,6 +648,7 @@ def inner_kernel(
 
           acc_n += block_acc
         acc_list.append(acc_n)
+
     acc = jnp.concatenate(acc_list, axis=1)
 
     # Step 3: Output post-processing.
@@ -1114,16 +1162,34 @@ def validate_inputs(
     fuse_act: str | None = None,
     maybe_quantize_lhs: bool = True,
     lhs_scale: jax.Array | None = None,
+    transpose_rhs: bool = False,
 ) -> Dimensions:
   """Validates the inputs for the GMM kernel."""
 
   size_m = lhs.shape[0]
-  size_group, size_k, size_n = rhs.shape
+  if transpose_rhs:
+    size_group, size_n, size_k = rhs.shape
+  else:
+    size_group, size_k, size_n = rhs.shape
   size_lhs_group = group_sizes.shape[0]
 
   assert size_group <= size_lhs_group
   assert lhs.shape == (size_m, size_k)
-  assert rhs.shape == (size_group, size_k, size_n)
+  if transpose_rhs:
+    if rhs_scale is not None:
+      raise NotImplementedError(
+          "transpose_rhs does not support quantized RHS (rhs_scale is not"
+          " None)."
+      )
+    if rhs_bias is not None:
+      raise NotImplementedError(
+          "transpose_rhs does not support RHS bias (rhs_bias is not None)."
+      )
+    if fuse_act is not None:
+      raise NotImplementedError("transpose_rhs does not support fuse_act.")
+    assert rhs.shape == (size_group, size_n, size_k)
+  else:
+    assert rhs.shape == (size_group, size_k, size_n)
   if rhs_bias is not None:
     assert rhs_bias.shape == (size_group, 1, size_n)
   if rhs_scale is not None:
@@ -1229,6 +1295,7 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
     lhs_scale: jax.Array | None = None,
+    transpose_rhs: bool = False,
 ):
   """Fills the GMM config for the GMM kernel."""
 
@@ -1242,6 +1309,7 @@ def make_gmm_configs(
       fuse_act,
       maybe_quantize_lhs,
       lhs_scale,
+      transpose_rhs=transpose_rhs,
   )
 
   if rhs_scale is not None:
@@ -1324,6 +1392,7 @@ def make_gmm_configs(
       acc_dtype=jnp.dtype(acc_dtype),
       zero_init=zero_initialize,
       fuse_act=fuse_act,
+      transpose_rhs=transpose_rhs,
   )
 
 
@@ -1348,11 +1417,12 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "maybe_quantize_lhs",
         "zero_initialize",
         "fuse_act",
+        "transpose_rhs",
     ]
 )
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
-    rhs: jax.Array,  # [size_group, size_k, size_n]
+    rhs: jax.Array,  # [size_group, size_k, size_n] (or [size_group, size_n, size_k] if transpose_rhs)
     group_sizes: jax.Array,  # int32[size_lhs_group]
     rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, out_size]
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
@@ -1367,6 +1437,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    transpose_rhs: bool = False,
 ) -> jax.Array:
   """GMM kernel implemented with emit_pipeline.
 
@@ -1376,17 +1447,17 @@ def gmm_v2(
 
   Args:
     lhs: lhs with shape [size_m, size_k].
-    rhs: rhs with shape [size_group, size_k, size_n].
+    rhs: rhs with shape [size_group, size_k, size_n] (or [size_group, size_n,
+      size_k] if transpose_rhs).
     group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
     rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
     rhs_bias: The rhs bias of shape [size_group, 1, out_size].
     group_offset: Optional. The group offset of shape [1,].
-    lhs_scale: Optional scale used to quantize the (unquantized) lhs
-      inside the kernel and the result is multiplied back by `scale`. The shape
-      encodes granularity; currently only per-tensor `[1, 1]` is supported. When
-      None, a quantized lhs uses the default dynamic per-block absmax
-      calibration. Only takes effect when maybe_quantize_lhs is True and rhs is
-      quantized.
+    lhs_scale: Optional scale used to quantize the (unquantized) lhs inside the
+      kernel and the result is multiplied back by `scale`. The shape encodes
+      granularity; currently only per-tensor `[1, 1]` is supported. When None, a
+      quantized lhs uses the default dynamic per-block absmax calibration. Only
+      takes effect when maybe_quantize_lhs is True and rhs is quantized.
     tile_info: The tile sizes or tile function to use.
     vmem_limit_bytes: Optional vmem limit in bytes.
     precision: Unused. Exists for compatibility reasons.
@@ -1395,6 +1466,7 @@ def gmm_v2(
     maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
     zero_initialize: Whether to initialize unvisited output elements to zero.
     fuse_act: Activation function to fuse with GMM, None if no fusion.
+    transpose_rhs: Whether to transpose rhs in-core without HBM transposition.
 
   Returns:
     Output of shape [size_m, size_n].
@@ -1426,6 +1498,7 @@ def gmm_v2(
       zero_initialize=zero_initialize,
       fuse_act=fuse_act,
       lhs_scale=lhs_scale,
+      transpose_rhs=transpose_rhs,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles
