@@ -2186,16 +2186,26 @@ def _make_splash_attention(
   if config is None:
     config = SplashConfig.get_default()
 
-  if config.qk_diag_skip and not isinstance(mask, mask_lib.CausalMask):
-    # The skip assumes kv > q is ALWAYS masked — a pure-causal property. Any mask
-    # that admits a valid kv > q entry (bidirectional, local/sliding window, custom)
-    # would be silently corrupted, so fail loud. (Square-block preconditions are
-    # enforced in SplashConfig.__post_init__.)
-    raise ValueError(
-        "qk_diag_skip=True requires a pure CausalMask (the skip fills mask_value "
-        "for all kv > q sub-tiles, assuming the mask masks exactly those); got "
-        f"{type(mask).__name__}. Disable qk_diag_skip for non-causal masks."
-    )
+  if config.qk_diag_skip:
+    if not isinstance(mask, mask_lib.CausalMask):
+      # The skip assumes kv > q is ALWAYS masked — a pure-causal property. Any mask
+      # that admits a valid kv > q entry (bidirectional, local/sliding window, custom)
+      # would be silently corrupted, so fail loud. (Square-block preconditions are
+      # enforced in SplashConfig.__post_init__.)
+      raise ValueError(
+          "qk_diag_skip=True requires a pure CausalMask (the skip fills mask_value "
+          "for all kv > q sub-tiles, assuming the mask masks exactly those); got "
+          f"{type(mask).__name__}. Disable qk_diag_skip for non-causal masks."
+      )
+    if mask.offset != 0 or not np.array_equal(
+        mask.q_sequence, np.arange(mask.shape[0], dtype=np.int32)
+    ):
+      # A shifted or permuted causal boundary no longer lies on the physical
+      # diagonal, so the skipped sub-tiles can contain valid entries.
+      raise ValueError(
+          "qk_diag_skip=True requires offset=0 and an unpermuted q_sequence; "
+          "disable it for shifted or permuted causal masks."
+      )
 
   process_fn = partial(
       mask_info_lib.process_mask,
@@ -2266,6 +2276,11 @@ def _make_dynamic_splash_attention(
 
   if config is None:
     config = SplashConfig.get_default()
+
+  if config.qk_diag_skip:
+    # A dynamic mask is an arbitrary array, so the skip cannot assume that
+    # kv > q entries are masked.
+    raise ValueError("qk_diag_skip=True is not supported with dynamic masks.")
 
   # This is the only mode that supports the dynamic grid.
   config = dataclasses.replace(config, dq_reduction_steps=3)

@@ -350,6 +350,42 @@ def _process_dynamic_mask(
   )
 
 
+def _causal_state_grid(
+    mask: mask_lib.CausalMask,
+    q_block_size: int,
+    kv_block_size: int,
+) -> np.ndarray:
+  """Compute the block states of a causal mask without materializing it.
+
+  A block is empty if its highest Q position is below its lowest KV position,
+  full if its lowest Q position is at or above its highest KV position, and
+  partial otherwise. This holds for any permutation of the Q sequence.
+
+  Args:
+    mask: Causal mask to process.
+    q_block_size: Q block size of the Pallas grid.
+    kv_block_size: KV block size of the Pallas grid.
+
+  Returns:
+    An i32[q_blocks, kv_blocks] grid of block states: 0 = Empty, 1 = Partial,
+    2 = Full.
+  """
+  q_seq_len, kv_seq_len = mask.shape
+  q_sequence = mask.q_sequence.reshape(q_seq_len // q_block_size, q_block_size)
+  q_block_min = q_sequence.min(axis=1) + mask.offset
+  q_block_max = q_sequence.max(axis=1) + mask.offset
+
+  kv_block_min = (
+      np.arange(kv_seq_len // kv_block_size, dtype=np.int32) * kv_block_size
+  )
+  kv_block_max = kv_block_min + kv_block_size - 1
+
+  state_grid = np.ones((len(q_block_min), len(kv_block_min)), dtype=np.int32)
+  state_grid[q_block_max[:, None] < kv_block_min[None, :]] = 0
+  state_grid[q_block_min[:, None] >= kv_block_max[None, :]] = 2
+  return state_grid
+
+
 # When used in a transformer network with multiple layers, the SplashAttention
 # kernel is created several times with the same mask. Cache MaskInfo to avoid
 # blowing up compile times. Ideally the size of the cache should be determined
@@ -441,31 +477,36 @@ def _process_mask(
   # blocks are replicated across shards.
 
   blocked_shape = (q_blocks_count, kv_blocks_count)
-  state_grid = np.zeros(blocked_shape, dtype=np.int32)
   partial_id_grid = np.full(blocked_shape, -1, dtype=np.int32)
 
   partial_blocks_map = collections.defaultdict(lambda: len(partial_blocks_map))
   unique_chunks = []
 
-  # Partition the dense mask into blocks and categorize them:
-  # 0 = Empty, 1 = Partial (mixed 0s and 1s), 2 = Full (all 1s).
-  # Partial blocks are deduplicated and stored in unique_chunks to save memory.
-  for coords in np.ndindex((q_blocks_count, kv_blocks_count)):
-    (q_idx, kv_idx) = coords
-    chunk = mask[(
-        slice(q_idx * q_block_size, (q_idx + 1) * q_block_size),
-        slice(kv_idx * kv_block_size, (kv_idx + 1) * kv_block_size),
-    )]
-    if chunk.any():
-      if chunk.all():
-        state_grid[q_idx, kv_idx] = 2
-      else:
-        state_grid[q_idx, kv_idx] = 1
-        chunk_id = partial_blocks_map[_HashableNDArray(chunk)]
-        partial_id_grid[q_idx, kv_idx] = chunk_id
+  if isinstance(mask, mask_lib.CausalMask):
+    # Causal block states follow from the Q positions alone, and the
+    # mask_function computes the partial blocks inside the kernel.
+    state_grid = _causal_state_grid(mask, q_block_size, kv_block_size)
+  else:
+    state_grid = np.zeros(blocked_shape, dtype=np.int32)
+    # Partition the dense mask into blocks and categorize them:
+    # 0 = Empty, 1 = Partial (mixed 0s and 1s), 2 = Full (all 1s).
+    # Partial blocks are deduplicated and stored in unique_chunks to save memory.
+    for coords in np.ndindex((q_blocks_count, kv_blocks_count)):
+      (q_idx, kv_idx) = coords
+      chunk = mask[(
+          slice(q_idx * q_block_size, (q_idx + 1) * q_block_size),
+          slice(kv_idx * kv_block_size, (kv_idx + 1) * kv_block_size),
+      )]
+      if chunk.any():
+        if chunk.all():
+          state_grid[q_idx, kv_idx] = 2
+        else:
+          state_grid[q_idx, kv_idx] = 1
+          chunk_id = partial_blocks_map[_HashableNDArray(chunk)]
+          partial_id_grid[q_idx, kv_idx] = chunk_id
 
-        if chunk_id == len(unique_chunks):
-          unique_chunks.append(chunk)
+          if chunk_id == len(unique_chunks):
+            unique_chunks.append(chunk)
 
   full_mask = (state_grid == 2).all()
   if full_mask:
