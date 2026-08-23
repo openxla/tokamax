@@ -165,7 +165,10 @@ def _run_test(
 
   # Backwards.
   if atol_grads is None:
-    atol_grads = max(2 * atol, 5e-6)
+    if isinstance(atol, dict):
+      atol_grads = {k: max(2 * v, 5e-6) for k, v in atol.items()}
+    else:
+      atol_grads = max(2 * atol, 5e-6)
 
   grad_names = ("dq", "dk", "dv", "dbias")
   actual_grads = dict(zip(grad_names, vjp_fn(dout), strict=True))

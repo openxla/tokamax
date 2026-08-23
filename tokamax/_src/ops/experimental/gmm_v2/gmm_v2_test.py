@@ -25,6 +25,7 @@ from tokamax._src import mosaic_tpu
 from tokamax._src import test_utils
 from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
 from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2
+from tokamax._src.ops.experimental.gmm_v2 import util
 
 import pytest
 
@@ -35,40 +36,9 @@ _GroupConfig = collections.namedtuple(
     "_GroupConfig", ["num_groups", "group_offset", "num_local_groups"]
 )
 
+get_group_sizes = util.get_group_sizes
+quantize_tensor = util.quantize_tensor
 
-def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
-  distribution = jax.random.uniform(
-      jax.random.key(0), (num_groups - 1,), dtype=jnp.float32
-  )
-  distribution = distribution / jnp.sum(distribution)
-  group_sizes = jnp.floor(distribution * batch_size).astype(jnp.int32)
-  return jnp.append(group_sizes, batch_size - jnp.sum(group_sizes))
-
-
-def quantize_tensor(
-    x: jax.Array, dtype: jnp.dtype, axis: int = -1, block_size: int = 256
-):
-  if jnp.issubdtype(dtype, jnp.integer):
-    dtype_info = jnp.iinfo(dtype)
-    max_val = int(dtype_info.max)
-    min_val = int(dtype_info.min)
-  else:
-    dtype_info = jnp.finfo(dtype)
-    max_val = float(dtype_info.max)
-    min_val = float(dtype_info.min)
-
-  orig_shape = x.shape
-  blocked_shape = orig_shape[:axis] + (-1, block_size) + orig_shape[axis + 1 :]
-  x_blocked = x.reshape(blocked_shape)
-
-  x_blocked_abs_max = jnp.max(jnp.abs(x_blocked), axis=axis + 1, keepdims=True)
-  scale = x_blocked_abs_max / max_val
-  x_blocked_q = jnp.clip(x_blocked / scale, min_val, max_val).astype(dtype)
-
-  x_q = x_blocked_q.reshape(orig_shape)
-  x_q = jnp.nan_to_num(x_q)
-  scale = scale.squeeze(axis=axis + 1).astype(jnp.float32)
-  return x_q, scale
 
 
 def reference_gmm(

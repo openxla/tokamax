@@ -19,8 +19,8 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import tokamax
-from tokamax._src.ops.experimental.gmm_v2 import gmm_v2_test as kernel_test
 from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
+from tokamax._src.ops.experimental.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
 
 jax.config.parse_flags_with_absl()
@@ -40,9 +40,9 @@ class GmmPerfTest(parameterized.TestCase):
 
     lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
     rhs = jax.random.normal(k1, (num_groups, k, n), jnp.bfloat16)
-    group_sizes = kernel_test.get_group_sizes(m, num_groups)
+    group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
-    rhs_q, rhs_scale = kernel_test.quantize_tensor(
+    rhs_q, rhs_scale = gmm_util.quantize_tensor(
         rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
@@ -78,7 +78,7 @@ class GmmPerfTest(parameterized.TestCase):
 
     lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
     grad = jax.random.normal(k2, (m, n), jnp.bfloat16)
-    group_sizes = kernel_test.get_group_sizes(m, num_groups)
+    group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
     tgmm_backend.validate_tgmm_inputs(group_sizes, num_groups)
 
@@ -161,7 +161,7 @@ class GmmPerfTest(parameterized.TestCase):
     # partially filled decode batch.
     group_sizes = jnp.full((num_groups,), m // num_groups, jnp.int32)
 
-    rhs_q, rhs_scale = kernel_test.quantize_tensor(
+    rhs_q, rhs_scale = gmm_util.quantize_tensor(
         rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)

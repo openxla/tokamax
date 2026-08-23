@@ -338,6 +338,9 @@ def flash_attention_kernel(
   if not use_stable_softmax:
     raise NotImplementedError("Unstable softmax not supported on sm100.")
 
+  orig_q_seq_len = q.shape[0]
+  q = shape_lib.pad_to_next_multiple_of(q, 8, 0)
+
   q_seq_len, num_q_heads, _ = q.shape
   dtype = q.dtype
 
@@ -929,5 +932,6 @@ def flash_attention_kernel(
       kernel_name="flash_attention_sm100",
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
-  residuals = tuple(res[..., :q_seq_len] for res in residuals)
+  out = out[:orig_q_seq_len, ...]
+  residuals = tuple(res[..., :orig_q_seq_len] for res in residuals)
   return (out[..., :orig_head_dim_out], residuals if residuals else None)

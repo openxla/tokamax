@@ -3,5 +3,4 @@ rules:
     ignore:
       - ci-build.yml
       - ci-nightly.yml
-      - ci-experimental.yml
       - ci-test.yml
