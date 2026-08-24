@@ -41,6 +41,11 @@ end flush with the axis (see `Plan.tile_starts`). Nothing here can read or write
 out of bounds: Mosaic has no masked GMEM load and no masked GMEM store, so every
 access has to be provably in bounds, and sliding is what makes that true without
 constraining `M`.
+
+The reduced axis borrows the same trick where the lanes tile it, since there a
+base tile of 32 elements has to divide it: it is read in several loads, the last
+sliding back, and the duplicated elements are dropped from the reduction in
+registers. See `Plan.a_tiles`.
 """
 
 import dataclasses
@@ -123,6 +128,9 @@ class _Mapping:
       spent on, so `plan` is what picks it.
     m_multiple: `M` is blocked in multiples of this: the rows the warps take, or
       1 when the warps come from elsewhere and `M` is untiled.
+    a_tile: How much of the reduced axis one load takes. The whole of it, unless
+      the lanes tile it and their base tile does not divide it; see
+      `Plan.a_tiles`.
     layout: The register layout of a tile, as loaded straight out of GMEM. Stated
       by hand because inference has no candidate this short; see the module
       docstring.
@@ -130,6 +138,7 @@ class _Mapping:
 
   tail: tuple[int, ...]
   m_multiple: int
+  a_tile: int
   layout: Any
 
 
@@ -147,12 +156,25 @@ def _lanes_on_reduced(shape, *, bitwidth, cap_n) -> _Mapping | str:
     return 'the reduced axis is not the minor one'
   if num_m < _WARP_ROWS:
     return f'rows ({num_m}) must be at least {_WARP_ROWS}, one per warp'
+  if num_a < _LANES:
+    return f'the reduced axis ({num_a}) must be at least {_LANES}, one per lane'
   if num_a % _LANES:
-    return f'the reduced axis ({num_a}) must be a multiple of {_LANES}'
-  vec = _vector_length(num_a, bitwidth)
+    # No base tile divides the axis, so it takes several loads with the last
+    # sliding back; see `Plan.a_tiles`. The vector is as wide as the *axis*
+    # allows, rather than as wide as a tile of it allows, because it is the slid
+    # offset -- a multiple of neither the tile nor the axis -- that has to stay
+    # aligned.
+    vec = _vector_length(num_a, bitwidth, lanes=1)
+    while _LANES * vec > num_a:
+      vec //= 2
+    a_tile = _LANES * vec
+  else:
+    vec = _vector_length(num_a, bitwidth)
+    a_tile = num_a
   return _Mapping(
     tail=(num_a,),
     m_multiple=_WARP_ROWS,
+    a_tile=a_tile,
     layout=_tiled(
       ((_WARP_ROWS, _LANES * vec), (_WARP_ROWS, vec)), warp_dim=-2, lane_dim=-3
     ),
@@ -189,6 +211,7 @@ def _lanes_on_minor(shape, *, bitwidth, cap_n) -> _Mapping | str:
   return _Mapping(
     tail=(num_a, block_n),
     m_multiple=_WARP_ROWS,
+    a_tile=num_a,
     layout=_tiled(
       ((_WARP_ROWS, num_a, _LANES * vec), (vec,)), warp_dim=-4, lane_dim=-2
     ),
@@ -222,6 +245,7 @@ def _warpgroup_on_minor(shape, *, bitwidth, cap_n) -> _Mapping | str:
   return _Mapping(
     tail=(num_a, block_n),
     m_multiple=1,
+    a_tile=num_a,
     layout=_tiled(
       ((1, num_a, _WARPGROUP * vec), (_LANES * vec,), (vec,)),
       warp_dim=-3,
@@ -245,8 +269,8 @@ def _minor_in_vector(shape, *, bitwidth, cap_n) -> _Mapping | str:
     return 'there is no axis minor to the reduced one'
   if num_m < _WARP_ROWS:
     return f'rows ({num_m}) must be at least {_WARP_ROWS}, one per warp'
-  if num_a % _LANES:
-    return f'the reduced axis ({num_a}) must be a multiple of {_LANES}'
+  if num_a < _LANES:
+    return f'the reduced axis ({num_a}) must be at least {_LANES}, one per lane'
   (num_n,) = rest
   base = (_WARP_ROWS, _LANES, num_n)
   vec = _vector_length(num_n, bitwidth, lanes=1)
@@ -257,7 +281,14 @@ def _minor_in_vector(shape, *, bitwidth, cap_n) -> _Mapping | str:
     layout = _tiled((base,), warp_dim=-3, lane_dim=-2)
   else:
     layout = _tiled((base, (vec,)), warp_dim=-4, lane_dim=-3)
-  return _Mapping(tail=(num_a, num_n), m_multiple=_WARP_ROWS, layout=layout)
+  # The vector comes from `N` here, so the lanes take a bare `_LANES` of the
+  # reduced axis and a ragged one is covered by several loads; see `Plan.a_tiles`.
+  return _Mapping(
+    tail=(num_a, num_n),
+    m_multiple=_WARP_ROWS,
+    a_tile=num_a if num_a % _LANES == 0 else _LANES,
+    layout=layout,
+  )
 
 
 # In preference order; `plan` takes the first that fits.
@@ -280,12 +311,15 @@ class Plan:
     block: One tile of `shape`. The reduced axis is not blocked, so
       `block[REDUCE_AXIS] == shape[REDUCE_AXIS]`. Every axis but `M` is tiled
       exactly; `M` need only be at least `block[0]` (see `tile_starts`).
-    layout: The register layout of a tile, from the thread mapping that chose the
-      block; see the module docstring.
+    a_tile: How much of the reduced axis one load takes; see `a_tiles`. The whole
+      of it, unless the lanes tile it and their base tile does not divide it.
+    layout: The register layout of one load, from the thread mapping that chose
+      the block; see the module docstring.
   """
 
   shape: tuple[int, ...]
   block: tuple[int, ...]
+  a_tile: int
   layout: Any
 
   @property
@@ -300,13 +334,42 @@ class Plan:
     """A `plgpu.kernel` grid name per axis, in the order of `shape`."""
     return ('m', 'a', 'n')[: len(self.shape)]
 
+  @property
+  def a_tiles(self) -> tuple[tuple[int, int], ...]:
+    """`(offset, duplicates)` per load along the reduced axis.
+
+    A base tile has to divide the block exactly, so when `a_tile` does not divide
+    the reduced axis the last load slides back to end flush with it -- the same
+    trick `M`'s last tile uses, and for the same reason: Mosaic has no masked GMEM
+    access, so every read has to be provably in bounds. `duplicates` is how many
+    of a load's leading elements its predecessor already covered. A reduction has
+    to drop them, or it would count them twice; a store may simply rewrite them,
+    as they take the same value.
+
+    Duplicated reads cost no bandwidth -- the previous load pulled those lines
+    into L1 a moment earlier -- but they do cost registers, which `tile_regs`
+    counts.
+    """
+    num_a = self.shape[REDUCE_AXIS]
+    offsets = [
+      min(i * self.a_tile, num_a - self.a_tile)
+      for i in range(ceil_div(num_a, self.a_tile))
+    ]
+    return tuple(
+      (offset, max(0, previous + self.a_tile - offset))
+      for previous, offset in zip([-self.a_tile, *offsets], offsets)
+    )
+
   def tile_regs(self) -> int:
     """Tile elements each thread holds, in `float32` registers.
 
-    The layout places a whole warpgroup and both tiled axes are multiples of
-    their share of it, so this divides exactly.
+    The whole reduced axis is resident, rounded up to whole `a_tile`s. The layout
+    places a whole warpgroup and every axis it tiles is a multiple of its share
+    of it, so this divides exactly.
     """
-    return math.prod(self.block) // _WARPGROUP
+    rows, _, *minor = self.block
+    resident = rows * len(self.a_tiles) * self.a_tile * math.prod(minor)
+    return resident // _WARPGROUP
 
   def tile_starts(self, indices) -> tuple[jax.Array, ...]:
     """Returns a tile's element offset per axis, given its block index per axis.
@@ -378,7 +441,10 @@ def plan(
     # than a search. One block's worth is always tried, even if `block_m` asks
     # for less than that.
     step = fit.m_multiple
-    row_regs = math.prod(fit.tail)
+    # The reduced axis is resident rounded up to whole loads of it; see
+    # `Plan.a_tiles`.
+    resident = ceil_div(fit.tail[0], fit.a_tile) * fit.a_tile
+    row_regs = resident * math.prod(fit.tail[1:])
     budget_rows = _MAX_TILE_REGS * _WARPGROUP // row_regs
     rows = min(max(step, min(block_m, num_m)), budget_rows) // step * step
     if rows == 0:
@@ -388,7 +454,12 @@ def plan(
         f' of {_MAX_TILE_REGS}'
       )
       continue
-    return Plan(shape=shape, block=(rows, *fit.tail), layout=fit.layout)
+    return Plan(
+      shape=shape,
+      block=(rows, *fit.tail),
+      a_tile=fit.a_tile,
+      layout=fit.layout,
+    )
 
   raise NotImplementedError(
     f'No thread mapping fits {shape}: ' + '; '.join(reasons) + '.'

@@ -116,6 +116,12 @@ class AmpereLoweringTest(parameterized.TestCase):
           # A trailing axis too short for the lanes to tile: they go back on the
           # reduced axis and `N` rides inside each lane.
           dict(shape=(24, 32, 3), axis=1, block_m=8, block_n=32),
+          # A reduced axis no base tile divides, so it takes two overlapping
+          # loads and the reduction masks the duplicates.
+          dict(shape=(4096, 48), axis=-1, block_m=32, block_n=None),
+          # The same, with the reduced axis not minor: there the lanes tile it
+          # bare, so the loads are 32 wide.
+          dict(shape=(24, 40, 3), axis=1, block_m=8, block_n=32),
       ),
       use_params=(False, True),
       subtract_mean=(False, True),
@@ -201,9 +207,32 @@ class PlanTest(absltest.TestCase):
     with self.assertRaisesRegex(NotImplementedError, 'multiple of 128'):
       self._plan((1, 32, 96), block_n=32)
 
-  def test_reduced_axis_must_be_a_multiple_of_32(self):
-    with self.assertRaisesRegex(NotImplementedError, 'multiple of 32'):
-      self._plan((4096, 48))
+  def test_reduced_axis_must_be_at_least_32(self):
+    """One element per lane is the least a load can take; it cannot slide below that."""
+    with self.assertRaisesRegex(NotImplementedError, 'at least 32'):
+      self._plan((4096, 16))
+
+  def test_an_aligned_reduced_axis_is_one_load(self):
+    """A base tile that divides the axis leaves nothing to slide."""
+    for num_a in (32, 96, 128, 1024):
+      with self.subTest(num_a=num_a):
+        p = self._plan((4096, num_a))
+        self.assertEqual(p.a_tile, num_a)
+        self.assertEqual(p.a_tiles, ((0, 0),))
+
+  def test_a_ragged_reduced_axis_is_read_in_overlapping_loads(self):
+    """The last load slides back, and says how much of it is a duplicate."""
+    p = self._plan((4096, 48))
+    self.assertEqual(p.a_tile, 32)  # 32 * 4-element vectors would overrun 48.
+    self.assertEqual(p.a_tiles, ((0, 0), (16, 16)))
+    # Only the tail is ragged, so the waste stays under one load, and the 16-byte
+    # vectors survive whenever the axis is a multiple of four elements.
+    p = self._plan((4096, 1000))
+    self.assertEqual(p.a_tile, 128)
+    self.assertEqual(p.a_tiles[:2], ((0, 0), (128, 0)))
+    self.assertEqual(p.a_tiles[-1], (1000 - 128, 128 - (1000 - 7 * 128)))
+    # The rounded-up extent is what costs registers, not the axis itself.
+    self.assertEqual(p.tile_regs(), p.block[0] * 1024 // 128)
 
   def test_block_shrinks_to_fit_the_registers(self):
     """A long row is paid for in `block_m`, not declined outright."""
@@ -265,6 +294,29 @@ class PlanTest(absltest.TestCase):
     """`M` too short for the warps and `N` too short to take them instead."""
     with self.assertRaisesRegex(NotImplementedError, 'No thread mapping fits'):
       self._plan((2, 32, 48), block_n=32)
+
+  def test_the_loads_cover_the_reduced_axis_exactly_once(self):
+    """What the reduction sums, once the duplicates are masked out.
+
+    The mask is what keeps a sum from double-counting the overlap, so the elements
+    each load owns have to partition the axis -- and every load has to stay in
+    bounds, since there is no masked GMEM read to fall back on.
+    """
+    for shape, block_n in (
+        ((4096, 48), None),  # Ragged, minor: two loads.
+        ((4096, 1000), None),  # Ragged, minor: eight loads.
+        ((4096, 128), None),  # Aligned: one load.
+        ((24, 40, 3), 32),  # Ragged, not minor: the lanes tile it bare.
+        ((24, 32, 256), 32),  # Not tiled by the lanes at all.
+    ):
+      with self.subTest(shape=shape):
+        p = self._plan(shape, block_m=8, block_n=block_n)
+        num_a = shape[mosaic_tiling.REDUCE_AXIS]
+        owned = []
+        for offset, duplicates in p.a_tiles:
+          self.assertLessEqual(offset + p.a_tile, num_a)  # In bounds.
+          owned.extend(range(offset + duplicates, offset + p.a_tile))
+        self.assertEqual(owned, list(range(num_a)))
 
   def test_every_tile_is_visited_exactly_once(self):
     """The grid index turns into one element offset per axis.
