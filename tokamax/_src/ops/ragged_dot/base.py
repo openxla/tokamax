@@ -16,7 +16,8 @@
 
 from collections.abc import Callable, Sequence
 import dataclasses
-from typing import Any, override
+import functools
+from typing import Any, cast, override
 
 import jax
 from jax.experimental import checkify
@@ -343,6 +344,37 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
 
     return dot_out, residuals if return_residuals else None
 
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    # TODO: Remove this once `ragged_dot_general` supports `group_offset`.
+    lhs, rhs = (jax.ShapeDtypeStruct(x.shape, x.dtype) for x in ba.args)
+    if isinstance(gs := ba.kwargs["group_sizes"], GroupSizes):
+      group_sizes = jax.ShapeDtypeStruct(gs.value.shape, gs.value.dtype)
+    else:
+      group_sizes = jax.ShapeDtypeStruct(gs.shape, gs.dtype)
+    if ba.kwargs["group_offset"] is not None:
+      (num_groups,) = group_sizes.shape
+      (group_axis,) = (
+          ba.kwargs["ragged_dot_dimension_numbers"].rhs_group_dimensions
+      )
+      shape = list(rhs.shape)
+      shape[group_axis] = num_groups
+      rhs = jax.ShapeDtypeStruct(shape, rhs.dtype)
+
+    kwargs = ba.kwargs | dict(group_sizes=group_sizes, group_offset=None)
+    config = cast(Any, self.config)
+    fwd = functools.partial(RaggedDot._fwd, self, config=config, **kwargs)
+    out = jax.eval_shape(fwd, lhs, rhs)
+    if (mat := ba.kwargs["manual_axis_type"]) is not None:
+      out = jax.tree.map(lambda x: x.update(manual_axis_type=mat), out)
+    return jax.tree.map(jax.typeof, out)
+
+
+def _get_manual_axis_type(x: Any) -> Any:
+  aval = getattr(x, "aval", x)
+  mat = getattr(aval, "manual_axis_type", None)
+  return None if mat is None else mat.to_ct_mat()
+
 
 def vjp(
     residuals: Residuals,
@@ -414,7 +446,7 @@ def vjp(
       ),
       precision=precision,
       preferred_element_type=lhs.dtype,
-      manual_axis_type=jax.typeof(lhs).manual_axis_type.to_ct_mat(),
+      manual_axis_type=_get_manual_axis_type(lhs),
   )
 
   dot_dim_nums = ((lhs_kept, dout_lhs_kept), (lhs_batch, dout_batch))
@@ -429,6 +461,6 @@ def vjp(
       ),
       precision=precision,
       preferred_element_type=rhs.dtype,
-      manual_axis_type=jax.typeof(rhs).manual_axis_type.to_ct_mat(),
+      manual_axis_type=_get_manual_axis_type(rhs),
   )
   return dlhs, drhs

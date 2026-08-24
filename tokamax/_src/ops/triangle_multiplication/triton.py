@@ -725,53 +725,9 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
     # There are no residuals; the VJP recomputes the forward pass.
     del return_residuals, implementation  # Unused.
 
-    if not gpu_utils.has_triton_support():
-      raise NotImplementedError("Triton is not supported on this platform.")
-
-    if not precision_lib.is_default(
-        x.dtype, projection_in_weights.dtype, precision
-    ):
-      raise NotImplementedError(f"{precision=} is not supported.")
-
-    if jnp.dtype(x.dtype) not in _SUPPORTED_DTYPES:
-      raise NotImplementedError(
-          "Triton triangle_multiplication only supports"
-          f" {_SUPPORTED_DTYPES}, got {x.dtype}."
-      )
-
-    for w in (
-        projection_in_weights,
-        gate_in_weights,
-        projection_out_weights,
-        gate_out_weights,
-        layernorm_in_scale,
-        layernorm_in_offset,
-        layernorm_out_scale,
-        layernorm_out_offset,
-    ):
-      if w.dtype != x.dtype:
-        raise NotImplementedError(
-            f"All weight and norm arrays must match x.dtype={x.dtype}, got"
-            f" {w.dtype}."
-        )
-
-    # Shapes are consistent (enforced by the `jaxtyping` annotations); only the
-    # kernel-specific constraints need to be checked here.
     n, _, c = x.shape
     h, d = projection_out_weights.shape
-    if not {c, h, d} <= _SUPPORTED_CHANNEL_DIMS:
-      raise NotImplementedError(
-          "Triton TriangleMultiplication requires C, H, D in"
-          f" {sorted(_SUPPORTED_CHANNEL_DIMS)}, got C={c}, H={h}, D={d}."
-      )
-    if n == 0:
-      raise NotImplementedError("Empty inputs are not supported.")
     m = n * n
-    if m * max(c, h, d) - 1 > _MAX_INT32:
-      raise NotImplementedError(
-          f"N={n} with max(C, H, D)={max(c, h, d)} would overflow the int32"
-          " offsets used by the Triton kernels."
-      )
 
     dot_dtype, input_precision = triton_utils.get_dot_dtype_and_precision(
         precision, x.dtype, x.dtype
@@ -835,6 +791,53 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
         **common_kwargs,
     )
     return out_flat.reshape(n, n, d), None
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments[Any, Any]) -> Any:
+    if not gpu_utils.has_triton_support():
+      raise NotImplementedError("Triton is not supported on this platform.")
+
+    x, _, *weights, _ = ba.args
+    projection_in_weights = ba.arguments["projection_in_weights"]
+    projection_out_weights = ba.arguments["projection_out_weights"]
+    precision = ba.kwargs["precision"]
+
+    if not precision_lib.is_default(
+        x.dtype, projection_in_weights.dtype, precision
+    ):
+      raise NotImplementedError(f"{precision=} is not supported.")
+
+    if jnp.dtype(x.dtype) not in _SUPPORTED_DTYPES:
+      raise NotImplementedError(
+          "Triton triangle_multiplication only supports"
+          f" {_SUPPORTED_DTYPES}, got {x.dtype}."
+      )
+
+    for w in weights:
+      if w.dtype != x.dtype:
+        raise NotImplementedError(
+            f"All weight and norm arrays must match x.dtype={x.dtype}, got"
+            f" {w.dtype}."
+        )
+
+    # Shapes are consistent (enforced by the `jaxtyping` annotations); only the
+    # kernel-specific constraints need to be checked here.
+    n, _, c = x.shape
+    h, d = projection_out_weights.shape
+    if not {c, h, d} <= _SUPPORTED_CHANNEL_DIMS:
+      raise NotImplementedError(
+          "Triton TriangleMultiplication requires C, H, D in"
+          f" {sorted(_SUPPORTED_CHANNEL_DIMS)}, got C={c}, H={h}, D={d}."
+      )
+    if n == 0:
+      raise NotImplementedError("Empty inputs are not supported.")
+    m = n * n
+    if m * max(c, h, d) - 1 > _MAX_INT32:
+      raise NotImplementedError(
+          f"N={n} with max(C, H, D)={max(c, h, d)} would overflow the int32"
+          " offsets used by the Triton kernels."
+      )
+    return super()._abstract_eval(ba)
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:

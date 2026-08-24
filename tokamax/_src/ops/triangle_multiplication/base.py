@@ -174,3 +174,10 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
 
     return act, None
 
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    x = ba.arguments["x"]
+    projection_out_weights = ba.arguments["projection_out_weights"]
+    out = jax.core.ShapedArray((*x.shape[:2], projection_out_weights.shape[1]), x.dtype)
+    return out, None
+

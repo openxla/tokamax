@@ -14,8 +14,7 @@
 # ==============================================================================
 
 import dataclasses
-from typing import Any
-from typing import Literal
+from typing import Any, Literal, override
 
 import jax
 import jax.numpy as jnp
@@ -54,6 +53,17 @@ class LinearSoftmaxCrossEntropyLoss[C](
 
     return loss, (lse,)
 
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    x, _, _ = ba.args
+    reduction = ba.kwargs["reduction"]
+    loss_shape = () if reduction in ("sum", "mean") else (x.shape[0],)
+    loss = jax.core.ShapedArray(loss_shape, jnp.float32)
+    if not ba.kwargs["return_residuals"]:
+      return loss, None
+    lse = jax.core.ShapedArray((x.shape[0],), jnp.float32)
+    return loss, (lse,)
+
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class LinearSoftmaxCrossEntropyLossVjp[C](op.Op[Any, Any, None, C, None]):
@@ -87,3 +97,8 @@ class LinearSoftmaxCrossEntropyLossVjp[C](op.Op[Any, Any, None, C, None]):
     )
     labels_grad = jnp.zeros_like(labels)
     return (x_grad, labels_grad, w_grad), None
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    _, _, _, x, labels, w = ba.args
+    return (x, labels, w), None

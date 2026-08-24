@@ -14,12 +14,9 @@
 # ==============================================================================
 """Batching utility tests."""
 
-import math
-
 from absl.testing import absltest
-from absl.testing import parameterized
-import chex
 import jax
+from jax.experimental import hijax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src import batching
@@ -31,88 +28,40 @@ def _bsd(shape, dtype, vmap_axes):
   return batching.BatchedShapeDtype(tuple(shape), dtype, vmap_axes)
 
 
-class BatchingTest(parameterized.TestCase):
+class _RecordVmapPrimitive(batching.ExpandWithVmapData):
+  """Test primitive that records the captured vmap stack upon expansion."""
 
-  @parameterized.parameters(
-      (((0, 0),),),
-      (((0, None),),),
-      (((0, 0), (0, 0)),),
-      (((0, 0), (None, 0)),),
-      (((None, 0), (None, 0)),),
-  )
-  def test_capture_batched_args(self, in_axes):
-    seen_inner_shapes = []
-    seen_batched_args = []
-    seen_batched_kwargs = []
+  def __init__(self, in_aval, recorder):
+    self.in_avals = (in_aval,)
+    self.out_aval = in_aval
+    self.params = {}
+    self._recorder = recorder
+    super().__init__()
 
-    @batching.capture_batched_args
-    def f(a0: jax.Array, a1: jax.Array, *, kw: jax.Array, batched_args):
-      vmap_axis_sizes = batching.get_vmap_axis_sizes(batched_args.arguments)
-      ret = a0 * a1 * kw * math.prod(vmap_axis_sizes)
-      seen_inner_shapes.append((a0.shape, a1.shape, kw.shape))
-      seen_batched_args.append(batched_args.args)
-      seen_batched_kwargs.append(batched_args.kwargs)
-      return ret
-
-    shape = [2, 3, 4]
-    a0_shape = shape[:]
-    a1_shape = shape[:]
-
-    for i, (a0_axis, a1_axis) in enumerate(in_axes[::-1]):
-      if a0_axis is None:
-        del a0_shape[len(in_axes) - i - 1]
-      if a1_axis is None:
-        del a1_shape[len(in_axes) - i - 1]
-      f = jax.vmap(f, in_axes=(a0_axis, a1_axis))
-
-    def _init_arr(shape, offs):
-      return jnp.arange(np.prod(shape)).reshape(shape) + offs
-
-    a0 = _init_arr(a0_shape, 0)
-    a1 = _init_arr(a1_shape, 42)
-    kw = _init_arr(shape, 100)
-
-    ref_a0 = a0.reshape([s if s in a0_shape else 1 for s in shape])
-    ref_a1 = a1.reshape([s if s in a1_shape else 1 for s in shape])
-    num_vmaps = len(in_axes) if in_axes is not None else 0
-
-    ref = ref_a0 * ref_a1 * kw * math.prod(shape[:num_vmaps])
-    chex.assert_trees_all_equal(ref, f(a0, a1, kw=kw))
-
-    expected_a0_inner_shape = a0_shape[:]
-    expected_a1_inner_shape = a1_shape[:]
-    expected_kw_inner_shape = shape[num_vmaps:]
-    for a0_axis, a1_axis in in_axes:
-      if a0_axis is not None:
-        del expected_a0_inner_shape[a0_axis]
-      if a1_axis is not None:
-        del expected_a1_inner_shape[a1_axis]
-
-    expected_shapes = (
-        tuple(expected_a0_inner_shape),
-        tuple(expected_a1_inner_shape),
-        tuple(expected_kw_inner_shape),
+  def expand_with_vmap_data(self, vmap_data, *args):
+    (x,) = args
+    self._recorder.append(
+        tuple(
+            (
+                axis_data.size,
+                axis_data.name if isinstance(axis_data.name, str) else None,
+                in_dims,
+            )
+            for axis_data, in_dims in vmap_data
+        )
     )
-    self.assertEqual(seen_inner_shapes, [expected_shapes] * (num_vmaps + 1))
+    return x * 2.0
 
-    a0_axes, a1_axes = zip(*in_axes)
-    expected_batched_args = (
-        _bsd(a0.shape, a0.dtype, a0_axes), _bsd(a1_shape, a1.dtype, a1_axes)
-    )
-    expected_batched_kwargs = dict(
-        kw=_bsd(kw.shape, kw.dtype, (0,) * num_vmaps)
-    )
-    self.assertEqual(seen_batched_args[-1], expected_batched_args)
-    self.assertEqual(seen_batched_kwargs[-1], expected_batched_kwargs)
+  def batch_dim_rule(self, axis_data, in_dims):
+    return in_dims[0]
 
-    seen_inner_shapes.clear()
-    seen_batched_args.clear()
-    seen_batched_kwargs.clear()
+  def jvp(self, primals, tangents):
+    return jax.jvp(self.expand, primals, tangents)
 
-    _ = jax.vjp(lambda a0, a1: f(a0, a1, kw=kw), a0, a1)
-    self.assertEqual(seen_inner_shapes, [expected_shapes] * (num_vmaps + 1))
-    self.assertEqual(seen_batched_args[-1], expected_batched_args)
-    self.assertEqual(seen_batched_kwargs[-1], expected_batched_kwargs)
+  vjp_fwd, vjp_bwd_retval = hijax.vjp_from_jvp
+
+
+class BatchingTest(absltest.TestCase):
 
   def test_batched_shape_dtype_equality(self):
     x = jax.ShapeDtypeStruct((3, 4), jnp.float32)
@@ -129,6 +78,72 @@ class BatchingTest(parameterized.TestCase):
     self.assertNotEqual(x_batched_vmap, x_batched)
     self.assertNotEqual(x, x_batched_vmap)
     self.assertNotEqual(x_batched_vmap, x)
+
+  def test_vmap_stack_no_vmap(self):
+    recorded = []
+    x = jnp.ones((4, 8), jnp.float32)
+    prim = _RecordVmapPrimitive(
+        jax.core.ShapedArray((8,), jnp.float32), recorded
+    )
+    np.testing.assert_allclose(prim(x), x * 2.0)
+    self.assertEqual(recorded, [()])
+
+  def test_vmap_stack_single_vmap(self):
+    recorded = []
+    x = jnp.ones((4, 8), jnp.float32)
+    prim = _RecordVmapPrimitive(
+        jax.core.ShapedArray((8,), jnp.float32), recorded
+    )
+    out = jax.vmap(prim, in_axes=0)(x)
+    np.testing.assert_allclose(out, x * 2.0)
+    self.assertEqual(recorded, [((4, None, (0,)),)])
+
+  def test_vmap_stack_nested_vmap(self):
+    recorded = []
+    x = jnp.ones((2, 3, 4), jnp.float32)
+    prim = _RecordVmapPrimitive(
+        jax.core.ShapedArray((4,), jnp.float32), recorded
+    )
+    out = jax.vmap(jax.vmap(prim, in_axes=0), in_axes=1)(x)
+    self.assertEqual(out.shape, (3, 2, 4))
+    np.testing.assert_allclose(out, jnp.transpose(x * 2.0, (1, 0, 2)))
+    self.assertEqual(recorded, [((3, None, (1,)), (2, None, (0,)))])
+
+  def test_vmap_stack_jvp(self):
+    recorded = []
+    x = jnp.ones((4, 8), jnp.float32)
+    x_dot = jnp.ones((4, 8), jnp.float32)
+    prim = _RecordVmapPrimitive(
+        jax.core.ShapedArray((8,), jnp.float32), recorded
+    )
+    primals_out, tangents_out = jax.jvp(
+        jax.vmap(prim, in_axes=0), (x,), (x_dot,)
+    )
+    np.testing.assert_allclose(primals_out, x * 2.0)
+    np.testing.assert_allclose(tangents_out, x_dot * 2.0)
+    self.assertEqual(recorded, [((4, None, (0,)),)])
+
+  def test_vmap_stack_vjp(self):
+    recorded = []
+    x = jnp.ones((4, 8), jnp.float32)
+    prim = _RecordVmapPrimitive(
+        jax.core.ShapedArray((8,), jnp.float32), recorded
+    )
+    primals_out, vjp_fn = jax.vjp(jax.vmap(prim, in_axes=0), x)
+    (grad,) = vjp_fn(jnp.ones((4, 8), jnp.float32))
+    np.testing.assert_allclose(primals_out, x * 2.0)
+    np.testing.assert_allclose(grad, jnp.full((4, 8), 2.0))
+    self.assertEqual(recorded, [((4, None, (0,)),), ((4, None, (0,)),)])
+
+  def test_vmap_stack_named_axes(self):
+    recorded = []
+    x = jnp.ones((4, 8), jnp.float32)
+    prim = _RecordVmapPrimitive(
+        jax.core.ShapedArray((8,), jnp.float32), recorded
+    )
+    out = jax.vmap(prim, in_axes=0, axis_name='i')(x)
+    np.testing.assert_allclose(out, x * 2.0)
+    self.assertEqual(recorded, [((4, 'i', (0,)),)])
 
 
 if __name__ == '__main__':
