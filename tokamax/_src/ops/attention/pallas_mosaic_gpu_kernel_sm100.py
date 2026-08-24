@@ -430,6 +430,9 @@ def flash_attention_kernel(
     wg = lax.axis_index("wg")
     cluster_idx = lax.axis_index("cluster")
 
+    if is_causal:
+      qi = num_q_tiles - 1 - qi
+
     q_base_cluster = qi * block_q
     q_base = q_base_cluster + cluster_idx * tile_q
     qs = cast(pl.Slice, pl.ds(q_base, tile_q))
