@@ -273,6 +273,8 @@ def flash_attention_kernel(
           *residual_gmems,
       ) = gmems
       hi, qi = loop_info.index
+      if is_causal:
+        qi = num_q_tiles - 1 - qi
       prev_iters = carry
 
       def get_kv_ranges():
