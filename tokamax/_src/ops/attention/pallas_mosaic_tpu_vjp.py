@@ -199,7 +199,7 @@ class PallasMosaicTpuFlashAttentionVjp(
     dq = dq.reshape(q.shape)
     dk = dk.reshape(k.shape)
     dv = dv.reshape(v.shape)
-    return base.DotProductAttentionGrads(q=dq, k=dk, v=dv), None
+    return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=None), None
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:

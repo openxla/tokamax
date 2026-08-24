@@ -152,6 +152,15 @@ class GatedLinearUnit[C, K: Hashable](op.Op[Any, jax.Array, Residuals, C, K]):
     fwd_vmap.def_vmap(vmap_rule)
     return fwd_vmap
 
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    x, weights = ba.args
+    n = weights[0].shape[1] if isinstance(weights, tuple) else weights.shape[2]
+    out = jax.core.ShapedArray((*x.shape[:-1], n), x.dtype)
+    if not ba.kwargs['return_residuals']:
+      return out, None
+    return out, jax.core.ShapedArray((*x.shape[:-1], 2, n), x.dtype)
+
 
 type Grads = tuple[Float[Array, '*B M K'], FusedWeights | UnfusedWeights]
 
@@ -189,3 +198,10 @@ class GatedLinearUnitVjp[C, K](op.Op[Any, Grads, Any, C, K]):
 
     assert (vjp_fn := ad.get_vjp_taking_residuals(fn, x, weights)) is not None
     return vjp_fn((x, weights, residuals), dout), None
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    if ba.kwargs['return_residuals']:
+      raise NotImplementedError('`return_residuals` not supported.')
+    _, _, _, x, weights = ba.args
+    return (x, weights), None

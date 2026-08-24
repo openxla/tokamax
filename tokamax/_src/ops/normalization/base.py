@@ -133,6 +133,19 @@ class Normalization[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
 
     return y.astype(x.dtype), (mean, rstddev) if return_residuals else None
 
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    x, _, _ = ba.args
+    if not ba.kwargs["return_residuals"]:
+      return x, None
+
+    axis = ba.kwargs["axis"]
+    axis = axis if axis >= 0 else (len(x.shape) + axis)
+    res_shape = tuple(1 if i == axis else s for i, s in enumerate(x.shape))
+    res_dtype = jnp.promote_types(x.dtype, jnp.float32)
+    res = jax.core.ShapedArray(res_shape, res_dtype)
+    return x, (res if ba.kwargs["subtract_mean"] else None, res)
+
 
 class NormalizationVjp[C, K](op.Op[Any, Any, None, C, K]):
   """Normalization VJP."""
@@ -194,3 +207,10 @@ class NormalizationVjp[C, K](op.Op[Any, Any, None, C, K]):
       dx -= jnp.mean(dout, axis=axis, keepdims=True)
     dx *= rstddev
     return (dx.astype(x.dtype), dscale, doffset), None
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    if ba.kwargs["return_residuals"]:
+      raise NotImplementedError("`return_residuals` not supported.")
+    _, _, _, x, scale, offset = ba.args
+    return (x, scale, offset), None

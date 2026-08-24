@@ -17,6 +17,7 @@
 from typing import Any, override
 
 import jax
+import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
@@ -84,3 +85,15 @@ class TopK[C](
         ),
         None,
     )
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    scores, k, _ = ba.args
+    out_shape = (scores.shape[0], k)
+    idx_aval = jax.core.ShapedArray(out_shape, jnp.int32)
+    if ba.kwargs["return_scores"]:
+      out_aval = (idx_aval, jax.core.ShapedArray(out_shape, jnp.int32))
+    else:
+      out_aval = idx_aval
+    return out_aval, None
+

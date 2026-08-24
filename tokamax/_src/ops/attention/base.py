@@ -18,7 +18,7 @@ from collections.abc import Callable, Hashable
 import dataclasses
 import functools
 import math
-from typing import Any, Literal, NotRequired, TypedDict, cast, overload, override
+from typing import Any, Literal, TypedDict, cast, overload, override
 
 import jax
 from jax.experimental import shard_map
@@ -749,6 +749,16 @@ class DotProductAttention[C, K: Hashable](
     ).astype(q.dtype)
     return out, (softmax_residuals if return_residuals else None)
 
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    q, _, v = ba.args
+    out = jax.core.ShapedArray((*q.shape[:-1], v.shape[-1]), q.dtype)
+    if not ba.kwargs["return_residuals"]:
+      return out, None
+    res_shape = (*q.shape[:-3], q.shape[-2], q.shape[-3])
+    res_dtype = jnp.promote_types(ba.kwargs["logits_dtype"], jnp.float32)
+    return out, (jax.core.ShapedArray(res_shape, res_dtype),) * 2
+
 
 def needs_stable_softmax(
     logits_dtype: DTypeLike, logits_soft_cap: float | None
@@ -914,7 +924,7 @@ class DotProductAttentionGrads(TypedDict):
   q: Float[Array, "*B T H D"]
   k: Float[Array, "*b t h D"]
   v: Float[Array, "*b t h d"]
-  bias: NotRequired[Float[Array, "*#B #H #T #t"] | None]
+  bias: Float[Array, "*#B #H #T #t"] | None
 
 
 class DotProductAttentionVjp[C, K: Hashable](
@@ -985,3 +995,10 @@ class DotProductAttentionVjp[C, K: Hashable](
     residuals_ = (q, k, v, bias, out, residuals)
     dq, dk, dv, dbias = vjp(residuals_, dout)
     return DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    if ba.kwargs["return_residuals"]:
+      raise NotImplementedError("`return_residuals` not supported.")
+    _, _, _, q, k, v = ba.args
+    return DotProductAttentionGrads(q=q, k=k, v=v, bias=ba.kwargs["bias"]), None

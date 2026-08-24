@@ -16,7 +16,7 @@
 
 from collections.abc import Callable
 import functools
-from typing import Any, ClassVar, Literal, overload, override
+from typing import Any, Literal, overload, override
 
 import jax
 import jax.numpy as jnp
@@ -46,8 +46,6 @@ class FlexAttention[C, K](
     op.Op[Any, Float[Array, "*B T H d"], Residuals, C, K]
 ):
   """FlexAttention function."""
-
-  supports_batched_args_capture: ClassVar[bool] = False
 
   # We override `__call__` in order to handle sharding at the top level.
   @overload
@@ -222,8 +220,8 @@ class FlexAttention[C, K](
         k,
         v,
         precision=tuple(map(precision_lib.canonicalize_precision, precision)),
-        score_mod=score_mod,
-        mask_mod=mask_mod,
+        score_mod=None if score_mod is None else op.convert_closure(score_mod),
+        mask_mod=None if mask_mod is None else op.convert_closure(mask_mod),
         dropout_mask=dropout_mask,
         dropout_rate=dropout_rate,
         normalize_output=normalize_output,
@@ -297,6 +295,17 @@ class FlexAttention[C, K](
         preferred_element_type=weights_v_dot_precision.accumulation_type,
     ).astype(q.dtype)
     return out, (softmax_residuals if return_residuals else None)
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    q, _, v = ba.args
+    out = jax.core.ShapedArray((*q.shape[:-1], v.shape[-1]), q.dtype)
+    if not ba.kwargs["return_residuals"]:
+      return out, None
+    res_shape = (*q.shape[:-3], q.shape[-2], q.shape[-3])
+    res_dtype = jnp.promote_types(q.dtype, jnp.float32)
+    return out, (jax.core.ShapedArray(res_shape, res_dtype),) * 2
+
 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
