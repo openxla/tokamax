@@ -33,7 +33,7 @@ from tokamax._src import hlo_utils
 from tokamax._src import hlo_utils_common
 from tokamax._src import numerics
 from tokamax._src.ops.attention import api as attention_api
-from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu
+from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pl_mgpu_glu
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
@@ -226,11 +226,11 @@ class DumpHloLibTest(parameterized.TestCase):
       self.skipTest('This test only runs on GPU.')
 
     norm_op = pl_norm.PallasTritonNormalization()
-    glu_op = pl_triton_glu.PallasTritonGatedLinearUnit()
+    glu_op = pl_mgpu_glu.PallasMosaicGpuGatedLinearUnit()
 
     # Create a string of Tokamax ops in Jax, lower it to HLO, and extract the
     # kernel spec from the name of the kernel.
-    x_shape = (64, 128)
+    x_shape = (128, 128)
     param_shape = (x_shape[-1],)
     x, scale, offset, weights = numerics.random_initialize((
         jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),

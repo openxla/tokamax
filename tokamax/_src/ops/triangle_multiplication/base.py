@@ -144,7 +144,11 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         (gate_weights, projection_weights),
         activation=jax.nn.sigmoid,
         precision=precision,
-        implementation=implementation,
+        implementation=implementation
+        if implementation == "xla"
+        # TODO: Do not drop the implementation once layer norm
+        # supports MGPU.
+        else None
     )
     proj_act = proj_act.reshape(proj_act.shape[0], proj_act.shape[1], 2, h_dim)
     proj_act = jnp.transpose(proj_act, (2, 3, 0, 1))  # 2 C N N
@@ -173,4 +177,3 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
     act *= jax.nn.sigmoid(gate_values)
 
     return act, None
-
