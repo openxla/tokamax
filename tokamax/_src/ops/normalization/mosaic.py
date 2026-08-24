@@ -20,8 +20,8 @@ back. No SMEM, no pipeline -- blocking and the layout live in `mosaic_tiling`.
 
 The one layout annotation is on the loaded tile, and everything downstream
 follows from it: it is what makes both the load and the store coalesce, and the
-reduction needs a tiled layout that inference will not offer. See
-`mosaic_tiling.short_tile_layout`.
+reduction needs a tiled layout that inference will not offer. Which layout that
+is depends on the shape; see `mosaic_tiling`'s thread mappings.
 """
 
 import dataclasses
@@ -81,7 +81,7 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
     dtype = x.dtype
     orig_x_shape = x.shape
-    # `(M, A)`, or `(M, A, B)` when the reduced axis is not the minor one.
+    # `(M, A)`, or `(M, A, N)` when the reduced axis is not the minor one.
     x_shape = triton_config.canonicalize_shape(orig_x_shape, axis)
 
     return_mean = return_residuals and subtract_mean
@@ -89,7 +89,7 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     has_offset = offset is not None
 
     p = mosaic_tiling.plan(
-      x_shape, dtype.itemsize, block_m=config.block_m, block_b=config.block_n
+      x_shape, dtype.itemsize, block_m=config.block_m, block_n=config.block_n
     )
 
     axis_a = mosaic_tiling.REDUCE_AXIS
@@ -141,8 +141,8 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         jax.ShapeDtypeStruct(x_shape, dtype),
         *[stat] * (return_mean + return_residuals),
       ),
-      grid=(p.steps,),
-      grid_names=('tile',),
+      grid=p.grid,
+      grid_names=p.grid_names,
       compiler_params=mosaic_tiling.WARPGROUP_SEMANTICS,
     )(
       x.reshape(x_shape),

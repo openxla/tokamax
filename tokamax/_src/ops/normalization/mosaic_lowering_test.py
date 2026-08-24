@@ -102,12 +102,20 @@ class AmpereLoweringTest(parameterized.TestCase):
           dict(shape=(4096, 1024), axis=-1, block_m=32, block_n=None),
           # Rows that the block does not divide: the last tile slides back.
           dict(shape=(100, 128), axis=-1, block_m=32, block_n=None),
-          # A rank-3 tile: the reduced axis is not the minor one, so `B` is
-          # blocked, the reduction runs down the tile's middle axis, and the
-          # slice this loads is strided.
-          dict(shape=(8, 128, 256), axis=1, block_m=32, block_n=32),
+          # A rank-3 tile: the reduced axis is not the minor one, so `N` is
+          # blocked, the reduction runs down the tile's middle axis in registers,
+          # and the slice this loads is strided. `A` is bounded here by the
+          # register budget; see
+          # `PlanTest.test_a_register_resident_reduced_axis_is_bounded`.
+          dict(shape=(8, 64, 256), axis=1, block_m=32, block_n=32),
           # `block_n` that the trailing axis does not divide.
           dict(shape=(4, 32, 96), axis=1, block_m=32, block_n=64),
+          # Reducing the major axis, so `M` is 1 and too short for the warps:
+          # they come from `N` instead and `M` is not blocked.
+          dict(shape=(32, 256), axis=0, block_m=32, block_n=32),
+          # A trailing axis too short for the lanes to tile: they go back on the
+          # reduced axis and `N` rides inside each lane.
+          dict(shape=(24, 32, 3), axis=1, block_m=8, block_n=32),
       ),
       use_params=(False, True),
       subtract_mean=(False, True),
@@ -156,32 +164,42 @@ class PlanTest(absltest.TestCase):
 
   F32 = 4
 
-  def _plan(self, shape, *, block_m=32, block_b=None):
+  def _plan(self, shape, *, block_m=32, block_n=None):
     return mosaic_tiling.plan(
-        shape, self.F32, block_m=block_m, block_b=block_b
+        shape, self.F32, block_m=block_m, block_n=block_n
     )
 
   def test_block_divides_the_rows(self):
     p = self._plan((4096, 128))
     self.assertEqual(p.block, (32, 128))
-    self.assertEqual(p.steps, 128)
+    self.assertEqual(p.grid, (128, 1))
 
   def test_the_cap_is_taken_whether_or_not_it_divides_the_rows(self):
     # 32 does not divide 104, and no longer has to: the last tile slides back.
     p = self._plan((104, 128))
     self.assertEqual(p.block, (32, 128))
-    self.assertEqual(p.steps, 4)
+    self.assertEqual(p.grid, (4, 1))
 
   def test_the_last_row_block_slides_back(self):
     p = self._plan((100, 128))
     self.assertEqual((p.block, p.grid), ((32, 128), (4, 1)))
-    starts = [int(p.tile_starts(step)[0]) for step in range(p.steps)]
+    starts = [int(p.tile_starts((i, 0))[0]) for i in range(p.grid[0])]
     # The tail overlaps its predecessor rather than overhanging `M`.
     self.assertEqual(starts, [0, 32, 64, 68])
 
   def test_rows_must_feed_the_warps(self):
     with self.assertRaisesRegex(NotImplementedError, 'at least 4'):
       self._plan((3, 128))
+
+  def test_short_rows_give_the_warps_to_the_trailing_axis(self):
+    """With an `N` to take them, `M` shorter than the warp rows is fine."""
+    p = self._plan((1, 32, 256), block_n=32)
+    # `M` is not blocked, and `N` is blocked by the whole warpgroup rather than
+    # by the 32 lanes -- which overrides the smaller `block_n` asked for.
+    self.assertEqual(p.block, (1, 32, 128))
+    self.assertEqual(p.grid, (1, 1, 2))
+    with self.assertRaisesRegex(NotImplementedError, 'multiple of 128'):
+      self._plan((1, 32, 96), block_n=32)
 
   def test_reduced_axis_must_be_a_multiple_of_32(self):
     with self.assertRaisesRegex(NotImplementedError, 'multiple of 32'):
@@ -201,7 +219,7 @@ class PlanTest(absltest.TestCase):
   def test_the_reduced_axis_is_never_blocked(self):
     for shape in ((4096, 128), (24, 32, 256)):
       with self.subTest(shape=shape):
-        p = self._plan(shape, block_b=32)
+        p = self._plan(shape, block_n=32)
         axis = mosaic_tiling.REDUCE_AXIS
         self.assertEqual(p.block[axis], shape[axis])
         self.assertEqual(p.grid[axis], 1)
@@ -210,39 +228,62 @@ class PlanTest(absltest.TestCase):
         )
 
   def test_trailing_axis_takes_the_lane_tiling(self):
-    """With a `B`, `B` is what the lanes tile and `A` is what feeds the warps."""
-    p = self._plan((24, 32, 256), block_m=8, block_b=32)
+    """With an `N`, `N` is what the lanes tile and `M` still feeds the warps."""
+    p = self._plan((24, 32, 256), block_m=8, block_n=32)
     self.assertEqual(p.block, (8, 32, 32))
     self.assertEqual(p.grid, (3, 1, 8))
-    # `A` needs only `% 4` here, rather than the `% 32` a minor axis needs.
-    self._plan((24, 4, 256), block_b=32)
-    with self.assertRaisesRegex(NotImplementedError, 'multiple of 4'):
-      self._plan((24, 34, 256), block_b=32)
+    # `A` is tiled by neither lanes nor warps here, so it is unconstrained: it
+    # lives in registers, one whole reduced row per thread.
+    for num_a in (4, 5, 34):
+      self.assertEqual(self._plan((24, num_a, 256), block_n=32).block[1], num_a)
 
-  def test_trailing_axis_needs_a_usable_block(self):
-    with self.assertRaisesRegex(NotImplementedError, 'no divisor'):
-      self._plan((24, 32, 48), block_b=32)
+  def test_a_register_resident_reduced_axis_is_bounded(self):
+    """`A` in registers costs `block_m * A * block_n / 128` per thread.
+
+    `block_m` cannot go under the four warp rows and `block_n` not under the 32
+    lanes, so with an `N` there is nothing left to shrink and a long `A` is
+    declined rather than blocked.
+    """
+    self.assertEqual(self._plan((8, 64, 256), block_n=32).tile_regs(), 64)
+    with self.assertRaisesRegex(NotImplementedError, 'registers per thread'):
+      self._plan((8, 128, 256), block_n=32)
+
+  def test_a_trailing_axis_the_lanes_cannot_tile_rides_in_them(self):
+    """A block of `N` has to divide it exactly, so 32 lanes need 32 elements.
+
+    Below that -- or at any `N` with no 32-multiple divisor -- the lanes go back
+    on the reduced axis and each lane takes the whole of `N`.
+    """
+    for num_n in (1, 3, 4, 48):
+      with self.subTest(num_n=num_n):
+        p = self._plan((24, 32, num_n), block_m=8, block_n=32)
+        # `N` is not blocked at all, so it has no grid axis of its own.
+        self.assertEqual(p.block[1:], (32, num_n))
+        self.assertEqual(p.grid[1:], (1, 1))
+
+  def test_nothing_fits_a_short_m_and_a_short_n(self):
+    """`M` too short for the warps and `N` too short to take them instead."""
+    with self.assertRaisesRegex(NotImplementedError, 'No thread mapping fits'):
+      self._plan((2, 32, 48), block_n=32)
 
   def test_every_tile_is_visited_exactly_once(self):
-    """The flat tile index splits into one element offset per axis.
+    """The grid index turns into one element offset per axis.
 
     One CTA takes one tile, so the whole array has to be covered and no tile may
     be started twice -- the statistics are written per tile. A slid tile overlaps
     its predecessor, which is harmless: it recomputes those rows to the same
     values.
     """
-    for shape, block_b in (
+    for shape, block_n in (
         ((24, 32, 256), 32),
         ((24, 32), None),
         ((24, 32, 96), 32),
         ((100, 32), None),  # Rows the block does not divide.
     ):
       with self.subTest(shape=shape):
-        p = self._plan(shape, block_m=8, block_b=block_b)
-        seen = [
-            tuple(int(i) for i in p.tile_starts(tile))
-            for tile in range(p.steps)
-        ]
+        p = self._plan(shape, block_m=8, block_n=block_n)
+        tiles = list(itertools.product(*map(range, p.grid)))
+        seen = [tuple(int(i) for i in p.tile_starts(t)) for t in tiles]
         expected = sorted(
             itertools.product(*(
                 sorted({min(i * b, s - b) for i in range(n)})
@@ -250,11 +291,11 @@ class PlanTest(absltest.TestCase):
             ))
         )
         self.assertEqual(sorted(seen), expected)
-        self.assertLen(set(seen), p.steps)
+        self.assertLen(set(seen), len(tiles))
 
   def test_a_single_tile_is_a_single_cta(self):
     p = self._plan((8, 128))
-    self.assertEqual((p.block, p.steps), ((8, 128), 1))
+    self.assertEqual((p.block, p.grid), ((8, 128), (1, 1)))
 
 
 if __name__ == '__main__':
