@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import override
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -40,6 +42,12 @@ class RaggedDotWithExplicitVjpTest(test_base.RaggedDotTestBase):
     if jax.default_backend() == "tpu":
       self.skipTest("Disabled for now due to numeric issues.")
     super().setUp()
+
+  @override
+  def _test_bench(self, spec):
+    if "128_m16384" in self._testMethodName and jax.default_backend() == "gpu":
+      self.skipTest("OOMs on MiG slice.")
+    super()._test_bench(spec)
 
 
 class GenerateGroupSizesTest(parameterized.TestCase):
