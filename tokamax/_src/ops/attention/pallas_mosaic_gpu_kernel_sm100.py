@@ -308,7 +308,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
             scratch = _get_scratch_types(
                 q, k, v, bias, mask, out_dtype, config, normalize_output=norm
             )
-            if (mgpu_lib.estimate_smem_bytes(scratch) + 1200) <= 227 * 1024:
+            if mgpu_lib.estimate_smem_bytes(scratch) <= 227 * 1024:
               configs.add(config)
   return configs
 
