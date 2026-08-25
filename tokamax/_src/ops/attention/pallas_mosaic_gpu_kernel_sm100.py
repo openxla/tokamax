@@ -151,13 +151,13 @@ def _get_scratch_types(
   def tmem(shape, dtype=jnp.float32, **kwargs):
     return plgpu.TMEM(shape, dtype, collective=collective, **kwargs)
 
+  q_scratch = tiled_smem((tile_q, head_dim), q.dtype, "q")
+  k_scratch = tiled_smem(k_block_shape, k.dtype, "k")
+  v_scratch = tiled_smem(v_block_shape, v.dtype, "v")
+  o_scratch = tiled_smem((num_epi_slots, tile_q, epi_tile_d), out_dtype, "o")
+
   scratch = dict(
-      qo_smem_union=plgpu.RefUnion(
-          tiled_smem((tile_q, head_dim), q.dtype, "q"),
-          tiled_smem((num_epi_slots, tile_q, epi_tile_d), out_dtype, "o"),
-      ),
-      k_smem=tiled_smem(k_block_shape, k.dtype, "k"),
-      v_smem=tiled_smem(v_block_shape, v.dtype, "v"),
+      qkvo_smems=plgpu.RefUnion((q_scratch, k_scratch, v_scratch), o_scratch),
       alpha_smem=plgpu.SMEM((softmax_slots, tile_q), jnp.float32),
       s_tmem=tmem((tile_q, block_kv)),
       p_tmem=tmem((softmax_slots, tile_q, block_kv), v.dtype, packed=True),
@@ -398,9 +398,7 @@ def flash_attention_kernel(
       k_end_minmax_gmems,
       o_gmem,
       *residual_gmems,
-      qo_smem_union,
-      k_smem,
-      v_smem,
+      qkvo_smems,
       mask_smem=None,
       alpha_smem,
       li_smem=None,
@@ -423,7 +421,7 @@ def flash_attention_kernel(
       p_produced,
       acc_produced,
   ):
-    q_smem, o_smem = qo_smem_union
+    (q_smem, k_smem, v_smem), o_smem = qkvo_smems
 
     qi = lax.axis_index("q_tiles")
     hi = lax.axis_index("heads")
