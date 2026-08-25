@@ -283,20 +283,19 @@ def make_tgmm_configs(
       size_lhs_sublane=size_lhs_sublane,
   )
 
-  rhs_quant_block_size_m = size_m
   validate_dynamic_quant(lhs, rhs, rhs_scale, lhs_quant_dtype, rhs_quant_dtype)
   rhs_cfgs = gmm_v2.InputConfigs(
-      quant_dtype=None,
-      # On the dynamic quant path (rhs_q_dtype!=None), the quant_block is 
+      quant_dtype=rhs_quant_dtype,
+      # On the dynamic quant path (rhs_quant_dtype!=None), the quant_block is
       # scoped within a m_tile. On the external scale path, the quant
-      # block is the while m axis.
-      quant_block_size=None if rhs_q_dtype is not None else size_m,
+      # block is the whole m axis.
+      quant_block_size=None if rhs_quant_dtype is not None else size_m,
       dtype=rhs.dtype,
       has_scale=(rhs_scale is not None),
   )
   lhs_cfgs = gmm_v2.InputConfigs(
       quant_dtype=lhs_quant_dtype,
-      quant_block_size=None if lhs_q_dtype is not None else -1,
+      quant_block_size=None if lhs_quant_dtype is not None else -1,
       dtype=lhs.dtype,
   )
 
