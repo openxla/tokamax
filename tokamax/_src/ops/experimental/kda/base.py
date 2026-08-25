@@ -131,7 +131,6 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
           "`max_num_segments` is required when `segment_ids` is provided "
           "without `initial_state`."
       )
-    _validate_beta(beta)
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,
         a_log=a_log,
@@ -190,6 +189,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
   ) -> tuple[Output, Residuals]:
     """Dispatches to the pure JAX KDA reference implementation."""
     del config, return_residuals
+    _validate_beta(beta)
     output = reference.kimi_delta_attention(
         query,
         key,
