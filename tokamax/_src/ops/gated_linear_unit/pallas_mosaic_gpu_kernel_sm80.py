@@ -142,12 +142,15 @@ def gated_linear_unit(
 
   tile_m, tile_n, tile_k = config.tile_m, config.tile_n, config.tile_k
 
+  # `NotImplementedError`, not `ValueError`: see the note on the equivalent
+  # guards in `pallas_mosaic_gpu_kernel_sm90.py`. This is the signal `api.py`
+  # catches to fall through to the next implementation.
   if m % tile_m != 0:
-    raise ValueError(f"{m=} must be divisible by {tile_m=}")
+    raise NotImplementedError(f"{m=} must be divisible by {tile_m=}")
   if n % tile_n != 0:
-    raise ValueError(f"{n=} must be divisible by {tile_n=}")
+    raise NotImplementedError(f"{n=} must be divisible by {tile_n=}")
   if k % tile_k != 0:
-    raise ValueError(f"{k=} must be divisible by {tile_k=}")
+    raise NotImplementedError(f"{k=} must be divisible by {tile_k=}")
 
   grid = (m // tile_m, n // tile_n)
 

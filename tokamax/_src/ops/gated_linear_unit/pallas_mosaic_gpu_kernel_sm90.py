@@ -127,12 +127,21 @@ def gated_linear_unit(
   cta_tile_n = tile_n * (1 + (config.wg_dimension == common.MatmulDimension.N))
   cluster_tile_m = cta_tile_m * config.cluster_size_m
   cluster_tile_n = cta_tile_n * config.cluster_size_n
+  # `NotImplementedError`, not `ValueError`: these say "this kernel cannot
+  # serve these shapes", which is the signal `gated_linear_unit` in `api.py`
+  # catches to fall through to the next implementation. Raising `ValueError`
+  # here escapes that loop, so a caller with awkward shapes gets a hard failure
+  # instead of the XLA fallback the default chain promises.
   if m % cluster_tile_m != 0:
-    raise ValueError(f"{m=} must be divisible by {tile_m} for the given config")
+    raise NotImplementedError(
+        f"{m=} must be divisible by {tile_m} for the given config"
+    )
   if n % cluster_tile_n != 0:
-    raise ValueError(f"{n=} must be divisible by {tile_n} for the given config")
+    raise NotImplementedError(
+        f"{n=} must be divisible by {tile_n} for the given config"
+    )
   if k % tile_k != 0:
-    raise ValueError(f"{k=} must be divisible by {tile_k=}")
+    raise NotImplementedError(f"{k=} must be divisible by {tile_k=}")
   m_iters = m // cluster_tile_m
   n_iters = n // cluster_tile_n
   k_iters = k // tile_k
