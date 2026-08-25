@@ -209,7 +209,7 @@ def get_heuristics_config(
 ) -> Config:
   """Returns a heuristic configuration for flash attention on SM100 GPUs."""
   out_dtype = ba.args[0].dtype
-  norm = ba.kwargs.get("normalize_output")
+  norm = ba.kwargs["normalize_output"]
   collective = False
   split_k = 1
 
@@ -237,12 +237,13 @@ def get_heuristics_config(
   num_clusters = backend.get_default_device().core_count // cluster_size
   if (
       grid_size / num_clusters < min_load_factor
-      # We do not support k split yet for any kind of masking (causal,
-      # k-ranges, or custom).
+      # We do not support k split yet for causal masking or k-ranges.
       # TODO fix test failures for non aligned q seq
       and q_seq_len % block_q == 0
       and kv_seq_len % block_kv == 0
-      and ba.kwargs.get("mask") is None
+      and not ba.kwargs["mask"].is_causal
+      and ba.kwargs["mask"].k_start is None
+      and ba.kwargs["mask"].k_end is None
   ):
     split_k = num_clusters // grid_size
     split_k = min(kv_seq_len // block_kv, split_k)
