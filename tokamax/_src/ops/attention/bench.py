@@ -27,16 +27,11 @@ from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import pallas_mosaic_gpu as mgpu_attn
 from tokamax._src.ops.attention import pallas_triton as triton_attn
-from tokamax._src.ops.flex_attention import pallas_triton as triton_flex
-from tokamax._src.ops.flex_attention import wrapper
 ARG_SPECS = arg_specs.ARG_SPECS
 
 
 _IMPLS: Final[dict[str, Callable[..., Any]]] = dict(
     triton=triton_attn.PallasTritonFlashAttention(),
-    triton_flex=wrapper.WrappedFlexAttention(
-        impl=triton_flex.PallasTritonFlexAttention()
-    ),
     mosaic=mgpu_attn.PallasMosaicGpuFlashAttention(),
     cudnn=jax_nn.JaxNnDotProductAttention(implementation='cudnn'),
     xla=base.DotProductAttention(),
