@@ -31,7 +31,7 @@ from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
-from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pl_glu
+from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
 from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
@@ -64,7 +64,7 @@ class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
   norm = pl_norm.PallasTritonNormalization()
-  glu = pl_glu.PallasMosaicGpuGatedLinearUnit()
+  glu = pl_glu.PallasTritonGatedLinearUnit()
   eps = 0.32
   act = jax.nn.swish
 
@@ -109,7 +109,7 @@ class AutotuningTest(parameterized.TestCase):
         dict(norm_api.IMPLEMENTATIONS),
     )
     self.assertDictEqual(
-        api.get_op_implementations(pl_glu.PallasMosaicGpuGatedLinearUnit()),
+        api.get_op_implementations(pl_glu.PallasTritonGatedLinearUnit()),
         dict(glu_api.IMPLEMENTATIONS),
     )
 
@@ -134,7 +134,7 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    f, args, expected = get_fn_and_args_and_expected_bound_args((128, 128))
+    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
     self.assertEqual(api.get_bound_args(f, *args), expected)
 
   @parameterized.parameters(False, True)
@@ -142,7 +142,7 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    x_shape = (2, 128, 128) if vmap else (128, 128)
+    x_shape = (2, 64, 128) if vmap else (64, 128)
     f, args, expected = get_fn_and_args_and_expected_bound_args(x_shape, vmap)
     f_lowered = jax.jit(f).lower(*args)
     self.assertEqual(api.get_bound_args(f_lowered), expected)
@@ -152,16 +152,16 @@ class AutotuningTest(parameterized.TestCase):
       self.skipTest("Currently only supported on GPU.")
 
     def f(x, weights):
-      x = glu_api.gated_linear_unit(x, weights, implementation="mosaic")
-      x = glu_api.gated_linear_unit(x, weights, implementation="mosaic")
+      x = glu_api.gated_linear_unit(x, weights, implementation="triton")
+      x = glu_api.gated_linear_unit(x, weights, implementation="triton")
       x = glu_api.gated_linear_unit(x, weights, implementation="xla")
       return x
 
     shapes = dict(
-        x=jax.ShapeDtypeStruct((128, 128), dtype=jnp.bfloat16),
+        x=jax.ShapeDtypeStruct((64, 128), dtype=jnp.bfloat16),
         weights=jax.ShapeDtypeStruct((128, 2, 128), dtype=jnp.bfloat16),
     )
-    bound_arg0 = pl_glu.PallasMosaicGpuGatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
+    bound_arg0 = pl_glu.PallasTritonGatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
     bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
     assert bound_arg0.autotuning_cache_key == bound_arg1.autotuning_cache_key
     expected = (bound_arg0, bound_arg1)
@@ -172,12 +172,12 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    glu = pl_glu.PallasMosaicGpuGatedLinearUnit()
+    glu = pl_glu.PallasTritonGatedLinearUnit()
     act = jax.nn.swish
     f = functools.partial(glu, activation=act)
     g = jax.value_and_grad(lambda x, weights: f(x, weights).sum())
 
-    x_shape = (128, 128)
+    x_shape = (64, 128)
     d = x_shape[-1]
     x = jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16)
     weights = jax.ShapeDtypeStruct((d, 2, d), dtype=jnp.bfloat16)
@@ -190,7 +190,7 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    f, args, expected = get_fn_and_args_and_expected_bound_args((128, 128))
+    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
     result = api.autotune(f, *args, all_implementations=False)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
     self.assertEqual(tuple(x[0] for x in result.data), expected)
@@ -205,16 +205,17 @@ class AutotuningTest(parameterized.TestCase):
     # TODO: Test that we autotune against all implementations.
     self.assertContainsSubset(expected, tuple(x[0] for x in result.data))
 
-    res_json = result.dumps(prune_errors=True)
-    res_round_trip = api.AutotuningResult.loads(res_json)
+    res_json = result.dumps()
+    res_round_trip = api.AutotuningResult.loads(result.dumps())
+    self.assertEqual(result, res_round_trip)
     self.assertIn("tokamax_version", res_json)
     self.assertIn(version.TOKAMAX_VERSION, res_json)
 
     tempfile = self.create_tempfile("autotuning_results.json")
     with open(tempfile.full_path, "w") as f:
-      result.dump(f, prune_errors=True)
+      result.dump(f)
     with open(tempfile.full_path, "r") as f:
-      self.assertEqual(res_round_trip, api.AutotuningResult.load(f))
+      self.assertEqual(result, api.AutotuningResult.load(f))
 
   def test_autotune_with_timeout(self):
     if jax.default_backend() == "tpu":
@@ -255,7 +256,7 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    f, args, expected = get_fn_and_args_and_expected_bound_args((128, 128))
+    f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
     f_lowered = jax.jit(f).lower(*args)
     tempfile = self.create_tempfile("bound_args.json")
     api.bound_args_to_json(f_lowered, tempfile.full_path)

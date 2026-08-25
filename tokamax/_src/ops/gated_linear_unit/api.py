@@ -20,10 +20,11 @@ from typing import Any, Final, Literal
 import immutabledict
 import jax
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import gpu_utils
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 
-type Implementation = Literal['mosaic', 'xla']
+type Implementation = Literal['mosaic', 'triton', 'xla']
 
 _IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
 _DEFAULT_IMPLEMENTATIONS = ('xla',)
@@ -33,6 +34,14 @@ try:
 
   _IMPLEMENTATIONS['mosaic'] = pallas_mgpu.PallasMosaicGpuGatedLinearUnit()
   _DEFAULT_IMPLEMENTATIONS = ('mosaic',) + _DEFAULT_IMPLEMENTATIONS
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.gated_linear_unit import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
+  _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
@@ -70,9 +79,9 @@ def gated_linear_unit(
       precision.
     implementation: if `None` (default), an implementation is automatically
       chosen and will work on any platform. 'xla' will use an XLA only
-      implementation and work on any platform, and 'mosaic' will use a fused
-      Mosaic GPU kernel. Only a subset of data types, shapes and GPUs are
-      supported by 'mosaic', with an exception thrown if the input falls outside
+      implementation and work on any platform, and 'triton' will use a fused
+      Triton GPU kernel. Only a subset of data types, shapes and GPUs are
+      supported by 'triton', with an exception thrown if the input falls outside
       of these supported cases.
 
   Raises:
@@ -93,6 +102,8 @@ def gated_linear_unit(
   errors = []
   fn = base.GatedLinearUnit()
   for impl in implementation:
+    if impl == 'triton' and not gpu_utils.has_triton_support():
+      continue
     if isinstance(impl, str):
       if impl not in IMPLEMENTATIONS:
         raise ValueError(f'Unknown implementation: {impl}')

@@ -44,6 +44,9 @@ class GatedLinearUnitTest(parameterized.TestCase):
       use_tuple_weights=[True, False],
   )
   def test_basic_api(self, implementation, use_tuple_weights):
+    if implementation == "triton" and not gpu_utils.has_triton_support():
+      self.skipTest("Triton not supported on this platform.")
+
     if not gpu_utils.has_mosaic_gpu_support() and implementation is not None:
       if "mosaic" in implementation:
         self.skipTest("Mosaic not supported on this platform.")
@@ -86,10 +89,20 @@ class GatedLinearUnitTest(parameterized.TestCase):
       op = args[0].op
       if implementation is None:
         if jax.default_backend() == "gpu":
-          # Ensure a Mosaic kernel is used.
-          self.assertIsInstance(op, api.IMPLEMENTATIONS["mosaic"].__class__)
+          # Ensure either a Triton or Mosaic kernel is used.
+          self.assertTrue(
+              isinstance(op, api.IMPLEMENTATIONS["triton"].__class__)
+              or isinstance(op, api.IMPLEMENTATIONS["mosaic"].__class__)
+          )
       else:
         self.assertIsInstance(op, api.IMPLEMENTATIONS[implementation].__class__)
+
+
+class GatedLinearUnitTritonTest(test_base.GatedLinearUnitTestBase):
+
+  def __init__(self, *args):
+    fn = functools.partial(api.gated_linear_unit, implementation="triton")
+    super().__init__(*args, glu_fn=fn)
 
 
 class GatedLinearUnitXlaTest(test_base.GatedLinearUnitTestBase):

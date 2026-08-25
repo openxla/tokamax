@@ -44,6 +44,10 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
     if isinstance(self._glu_fn, functools.partial):
       keywords = self._glu_fn.keywords
 
+      if keywords["implementation"] == "triton":
+        if not gpu_utils.has_triton_support():
+          self.skipTest("Triton not supported on this platform.")
+
       if keywords["implementation"] == "mosaic":
         if not gpu_utils.has_mosaic_gpu_support():
           self.skipTest("Mosaic not supported on this platform.")
