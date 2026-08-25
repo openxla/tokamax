@@ -86,7 +86,7 @@ def get_heuristics_config(ba: op.BoundArguments) -> common.Config:
       tile_m=tile_m,
       tile_n=tile_n,
       tile_k=tile_k,
-      num_stages=min(2, k // tile_k),
+      num_stages=min(4, k // tile_k),
       grid_minor_dim=common.MatmulDimension.M,
   )
 
