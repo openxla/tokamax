@@ -1,11 +1,7 @@
-name: CI
+name: CI-Build
 
 on:
-  # Trigger the workflow on push or pull request,
-  # but only for the main branch
-  push:
-    branches:
-      - main
+  # Trigger the workflow on pull request for the main branch.
   pull_request:
     branches:
       - main
@@ -16,6 +12,7 @@ on:
 env:
   JAX_ENABLE_X64: 0
   JAX_TRACEBACK_FILTERING: off
+  UV_HTTP_TIMEOUT: 300
 
 permissions:
   contents: read
@@ -25,124 +22,142 @@ concurrency:
   cancel-in-progress: true
 
 # These jobs should build Tokamax and run the tests on Google Cloud resources.
-jobs: 
-  ragged-dot-v2:
-    strategy:
-      matrix:
-        runner: ['linux-x86-ct6e-44-1tpu']
-        pytest_command: [
-                         'gmm_v2_test.py',
-                         'gmm_v2_perf_test.py',
-                        ]
-        include:
-          - runner: 'linux-x86-a3-8g-h100-1gpu'
-            device: 'cuda'
-          - runner: 'linux-x86-ct6e-44-1tpu'
-            device: 'tpu'
-    runs-on: ${{ matrix.runner }}
-    defaults:
-      run:
-        shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
-    timeout-minutes: 300
+jobs:
+  build-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.compute.outputs.include }}
     steps:
       - name: Checkout Tokamax
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false
-
-      - name: Install dependencies
+      - name: Compute affected shards
+        id: compute
         run: |
-          python3.12 -m uv pip install --upgrade pip
-          python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
-          python3.12 -m uv pip freeze
-      - name: Test Tokamax ops with unittest
-        run: |
-          pytest -s -m "not long" --ignore-glob="*/test_base.py" tokamax/_src/ops/experimental/gmm_v2/${{ matrix.pytest_command }}
+          # This script describes what tests are in a given shard. 
+          # All tests are automatically assigned a shard (oftentimes catchall).
+          # When specifying a test to a shard, ignore that test the shard by default.
+          # These shards are created first to distribute the load by timing, 
+          # then by test area.
+          python3 - <<'PYEOF' >> "$GITHUB_OUTPUT"
+          import json
 
-  attention-tests:
+          SHARD_TEST_PATHS = {
+              'attn_base_test': (
+                  'tokamax/_src/ops/attention/base_test.py::MaskTest '
+                  'tokamax/_src/ops/attention/base_test.py::DotProductAttentionTest'
+              ),
+              'attn_base_vjp_test': (
+                  'tokamax/_src/ops/attention/base_test.py::DotProductAttentionWithExplicitVjpTest'
+              ),
+              'attn_api_test': 'tokamax/_src/ops/attention/api_test.py',
+              'attn_pallas_mosaic_gpu_test': 'tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py',
+              'attn_pallas_mosaic_tpu_test': 'tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py',
+              'attn_pallas_triton_test': 'tokamax/_src/ops/attention/pallas_triton_test.py',
+              'attn_jax_nn_test': 'tokamax/_src/ops/attention/jax_nn_test.py',
+              'attn_xla_chunked_test': 'tokamax/_src/ops/attention/xla_chunked_test.py',
+              'gmm_v2_perf': 'tokamax/_src/ops/experimental/gmm_v2/gmm_v2_perf_test.py',
+              'gmm_v2_kernel': 'tokamax/_src/ops/experimental/gmm_v2/gmm_v2_test.py',
+              'op_test': 'tokamax/_src/ops/op_test.py',
+              'topk': 'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py',
+              'ragged_dot_sm100_fp8_quant': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py',
+              'ragged_dot_sm100_i8_quant': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py',
+              'ragged_dot_pallas_mosaic_gpu': 'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py',
+              'ragged_dot_pallas_triton': 'tokamax/_src/ops/ragged_dot/pallas_triton_test.py',
+              'ragged_dot_misc': (
+                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/pallas_triton_test.py '
+                  'tokamax/_src/ops/ragged_dot/ '
+                  'tokamax/_src/ops/triangle_multiplication/ '
+                  'tokamax/_src/ops/ragged_gather/ '
+                  'tokamax/_src/ops/ragged_gather_reduce/'
+              ),
+              'linear_softmax_and_experimental': (
+                  '--ignore=tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py '
+                  '--ignore=tokamax/_src/ops/experimental/tpu/splash_attention/ '
+                  '--ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/ '
+                  'tokamax/_src/ops/linear_softmax_cross_entropy_loss/ '
+                  'tokamax/_src/ops/experimental/'
+              ),
+              'splash_attention_kernel': (
+                  'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_test.py'
+              ),
+              'splash_attention_misc': (
+                  '--ignore=tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_test.py '
+                  'tokamax/_src/ops/experimental/tpu/splash_attention/'
+              ),
+              'misc_small_ops': (
+                  'tokamax/_src/ops/flex_attention/ '
+                  'tokamax/_src/ops/ragged_scatter/ '
+                  'tokamax/_src/ops/gated_linear_unit/ '
+                  'tokamax/_src/ops/normalization/'
+              ),
+              'tokamax_test': 'tokamax/tokamax_test.py',
+              'autotuning_api_test': 'tokamax/_src/autotuning/api_test.py',
+              'tokamax_catchall': (
+                  '--ignore=tokamax/_src/ops/attention/base_test.py '
+                  '--ignore=tokamax/_src/ops/attention/api_test.py '
+                  '--ignore=tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py '
+                  '--ignore=tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py '
+                  '--ignore=tokamax/_src/ops/attention/pallas_triton_test.py '
+                  '--ignore=tokamax/_src/ops/attention/jax_nn_test.py '
+                  '--ignore=tokamax/_src/ops/attention/xla_chunked_test.py '
+                  '--ignore=tokamax/_src/ops/op_test.py '
+                  '--ignore=tokamax/_src/ops/ragged_dot/ '
+                  '--ignore=tokamax/_src/ops/triangle_multiplication/ '
+                  '--ignore=tokamax/_src/ops/ragged_gather/ '
+                  '--ignore=tokamax/_src/ops/ragged_gather_reduce/ '
+                  '--ignore=tokamax/_src/ops/linear_softmax_cross_entropy_loss/ '
+                  '--ignore=tokamax/_src/ops/experimental/ '
+                  '--ignore=tokamax/_src/ops/flex_attention/ '
+                  '--ignore=tokamax/_src/ops/ragged_scatter/ '
+                  '--ignore=tokamax/_src/ops/gated_linear_unit/ '
+                  '--ignore=tokamax/_src/ops/normalization/ '
+                  '--ignore-glob="tokamax/_src/benchmarking_test*" '
+                  '--ignore=tokamax/_src/autotuning/api_test.py '
+                  'tokamax/_src'
+              ),
+          }
+
+          RUNNER_DEVICE = {
+              'linux-x86-a3-8g-h100-1gpu': 'cuda',
+              'linux-x86-ct6e-44-1tpu': 'tpu',
+              'linux-x86-tpu7x-56-1tpu': 'tpu',
+          }
+
+          # Short display name only; runs-on still uses the full runner label above.
+          RUNNER_SHORT = {
+              'linux-x86-a3-8g-h100-1gpu': 'h100',
+              'linux-x86-ct6e-44-1tpu': 'tpu6e',
+              'linux-x86-tpu7x-56-1tpu': 'tpu7x',
+          }
+
+          selected = set(SHARD_TEST_PATHS)
+
+          combos = [
+              {
+                  'runner': runner,
+                  'runner_short': RUNNER_SHORT[runner],
+                  'device': device,
+                  'shard_name': shard,
+                  'test_paths': SHARD_TEST_PATHS[shard],
+              }
+              for runner, device in RUNNER_DEVICE.items()
+              for shard in sorted(selected)
+          ]
+
+          print(f"include={json.dumps(combos)}")
+          PYEOF
+
+  ops-tests:
+    name: ops-tests (${{ matrix.runner_short }}, ${{ matrix.shard_name }})
+    needs: build-matrix
     strategy:
       matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
-        pytest_command: [
-                         'base_test.py',
-                         'api_test.py',
-                         'pallas_mosaic_gpu_test.py',
-                         'pallas_mosaic_tpu_test.py',
-                         'pallas_triton_test.py',
-                         'jax_nn_test.py',
-                         'xla_chunked_test.py',
-                        ]
-        include:
-          - runner: 'linux-x86-a3-8g-h100-1gpu'
-            device: 'cuda'
-          - runner: 'linux-x86-ct6e-44-1tpu'
-            device: 'tpu'
-    runs-on: ${{ matrix.runner }}
-    defaults:
-      run:
-        shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
-    timeout-minutes: 300
-    steps:
-      - name: Checkout Tokamax
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-        with:
-          persist-credentials: false
-
-      - name: Install dependencies
-        run: |
-          python3.12 -m uv pip install --upgrade pip
-          python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
-          python3.12 -m uv pip freeze
-      - name: Test Tokamax ops with unittest
-        run: |
-          pytest -s -m "not long" --ignore-glob="*/test_base.py" tokamax/_src/ops/attention/${{ matrix.pytest_command }}
-
-  tokamax-presubmit-ops-tests:
-    strategy:
-      matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
-        include:
-          - runner: 'linux-x86-a3-8g-h100-1gpu'
-            device: 'cuda'
-          - runner: 'linux-x86-ct6e-44-1tpu'
-            device: 'tpu'
-    runs-on: ${{ matrix.runner }}
-    defaults:
-      run:
-        shell: bash
-    container:
-    # Docker image will include CUDA and cuDNN for Tokamax.
-      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
-    timeout-minutes: 300
-    steps:
-      - name: Checkout Tokamax
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-        with:
-          persist-credentials: false
-
-      - name: Install dependencies
-        run: |
-          python3.12 -m uv pip install --upgrade pip
-          python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
-          python3.12 -m uv pip freeze
-      - name: Test Tokamax ops with unittest
-        run: |
-          pytest -s -m "not long" --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/attention/ --ignore=tokamax/_src/ops/experimental/gmm_v2/ --ignore-glob="*/splash_attention" tokamax/_src/ops
-
-  tokamax-presubmit:
-    strategy:
-      matrix:
-        runner: ['linux-x86-a3-8g-h100-1gpu', 'linux-x86-ct6e-44-1tpu']
-        include:
-          - runner: 'linux-x86-a3-8g-h100-1gpu'
-            device: 'cuda'
-          - runner: 'linux-x86-ct6e-44-1tpu'
-            device: 'tpu'
+        include: ${{ fromJson(needs.build-matrix.outputs.include) }}
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -167,5 +182,4 @@ jobs:
       - name: Test Tokamax ops with unittest
         # TODO: Disable benchmarking tests for presubmit until container is fixed
         run: |
-          pytest -s -vv -m "not long" --ignore-glob="tokamax/_src/ops/*" --ignore-glob="tokamax/_src/benchmarking_test*" tokamax
-
+          pytest -s -m "not long" --ignore-glob="*/test_base.py" ${{ matrix.test_paths }}
