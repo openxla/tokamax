@@ -366,6 +366,15 @@ def tgmm_inner_kernel(
   tiled_rhs_ref = tiled_rhs_ref.value.reshape(-1, tiled_rhs_ref.value.shape[-1])
   gm_id = pl.program_id(2)
 
+  should_quantize = cfgs.lhs_cfgs.should_quantize
+  if should_quantize:
+    assert cfgs.rhs_cfgs.should_quantize
+    assert not cfgs.rhs_cfgs.has_scale
+    lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
+    rhs_q_dtype = cfgs.rhs_cfgs.quant_dtype
+    lhs_dtype_max = float(jnp.finfo(lhs_q_dtype).max)
+    rhs_dtype_max = float(jnp.finfo(rhs_q_dtype).max)
+
   def _matmul(is_new_group: bool, is_group_changing: bool):
 
     # Mask out invalid rows in the LHS/RHS tiles.
@@ -390,12 +399,38 @@ def tgmm_inner_kernel(
     )
     rhs_masked = jnp.where(rhs_mask, tiled_rhs_ref[...], 0)
 
-    acc = jax.lax.dot_general(
-        lhs_masked,
-        rhs_masked,
-        (((0,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
+    if not should_quantize:
+      acc = jax.lax.dot_general(
+          lhs_masked,
+          rhs_masked,
+          (((0,), (0,)), ((), ())),
+          preferred_element_type=jnp.float32,
+      )
+    else:
+      lhs_t = lhs_masked.T  # [tile_k, tile_m]
+      lhs_scale = (
+          jnp.max(jnp.abs(lhs_t), axis=1, keepdims=True).astype(jnp.float32)
+          / lhs_dtype_max
+      )  # [tile_k, 1]
+      rhs_scale = (
+          jnp.max(jnp.abs(rhs_masked), axis=0, keepdims=True).astype(jnp.float32)
+          / rhs_dtype_max
+      )  # [1, tile_n]
+      lhs_scale_inv = jnp.where(lhs_scale == 0, 0, 1.0 / lhs_scale)
+      rhs_scale_inv = jnp.where(rhs_scale == 0, 0, 1.0 / rhs_scale)
+      lhs_q = (lhs_t * lhs_scale_inv.astype(lhs_t.dtype)).astype(lhs_q_dtype)
+      rhs_q = (
+          rhs_masked * rhs_scale_inv.astype(rhs_masked.dtype)
+      ).astype(rhs_q_dtype)
+
+      acc = jax.lax.dot_general(
+          lhs_q, rhs_q, (((1,), (0,)), ((), ())),
+          preferred_element_type=jnp.float32,
+      )
+      # The dequant should happen before the accumulation.
+      # unlike the external `rhs_scale` (constant along
+      # m, so it hoists to group change), these scales are per m-tile.
+      acc = acc * lhs_scale * rhs_scale
 
     if not is_new_group:
       acc += acc_ref[...]
@@ -407,7 +442,7 @@ def tgmm_inner_kernel(
         acc *= scale_slice
       tiled_out_ref[...] = acc.astype(tiled_out_ref.dtype)
     else:
-      acc_ref[...] = acc
+      acc_ref[...] = acc.astype(acc_ref.dtype)
 
   @jax.named_scope("matmul_new_group_and_changing")
   def matmul_new_group_and_changing():
