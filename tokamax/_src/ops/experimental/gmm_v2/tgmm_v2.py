@@ -236,8 +236,8 @@ def make_tgmm_configs(
     out_dtype: jnp.dtype,
     acc_dtype: jnp.dtype | None,
     target_zero_ref_bytes: int,
-    lhs_quant_dtype: jnp.dtype | None,
-    rhs_quant_dtype: jnp.dtype | None,
+    lhs_quant_dtype: jnp.dtype | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ):
   """Fills the GMM config for the TGMM kernel."""
   assert out_dtype, "out_dtype cannot be None"
@@ -702,6 +702,8 @@ def validate_tgmm_inputs(
         "precision",
         "preferred_element_type",
         "acc_dtype",
+        "lhs_quant_dtype",
+        "rhs_quant_dtype",
     ],
 )
 def tgmm_v2(
@@ -717,6 +719,8 @@ def tgmm_v2(
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
     acc_dtype: jnp.dtype | None = None,
+    lhs_quant_dtype: jnp.dtype | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ):
   """Computes a transposed grouped matrix multiplication.
 
@@ -737,6 +741,10 @@ def tgmm_v2(
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.
     acc_dtype: Optional jnp.dtype for the accumulator.
+    lhs_quant_dtype: Optional. When set (together with
+      `rhs_quant_dtype`), the kernel quantizes `lhs` on the fly with a scale
+      calibrated per Pallas m-tile. Mutually exclusive with `rhs_scale`.
+    rhs_quant_dtype: Optional. the target quantization dtype for rhs.
 
   Returns:
     The result of the transposed grouped matrix multiplication, with shape
@@ -770,6 +778,8 @@ def tgmm_v2(
       out_dtype=preferred_element_type,
       acc_dtype=acc_dtype,
       target_zero_ref_bytes=target_zero_ref_bytes,
+      lhs_quant_dtype=lhs_quant_dtype,
+      rhs_quant_dtype=rhs_quant_dtype,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles
