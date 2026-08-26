@@ -103,7 +103,8 @@ class AmpereLoweringTest(parameterized.TestCase):
           dict(shape=(4096, 128), axis=-1, block_m=32, block_n=None),
           # `block_m` shrinks to fit the register budget as the row grows.
           dict(shape=(4096, 1024), axis=-1, block_m=32, block_n=None),
-          # Rows that the block does not divide: the last tile slides back.
+          # Rows that the `block_m` bound does not divide: the block drops to a
+          # divisor of them, since every axis is tiled exactly.
           dict(shape=(100, 128), axis=-1, block_m=32, block_n=None),
           # A rank-3 tile: the reduced axis is not the minor one, so the lanes
           # split between the two and `N` is blocked. `A` is bounded here by the
@@ -124,12 +125,6 @@ class AmpereLoweringTest(parameterized.TestCase):
           # A trailing axis with no run for the lanes to tile: they all go back
           # on the reduced axis and `N` rides inside each lane.
           dict(shape=(24, 32, 3), axis=1, block_m=8, block_n=32),
-          # A reduced axis no base tile divides, so it takes two overlapping
-          # loads and the reduction masks the duplicates.
-          dict(shape=(4096, 48), axis=-1, block_m=32, block_n=None),
-          # The same, with the reduced axis not minor: there the lanes tile it
-          # bare, so the loads are 32 wide.
-          dict(shape=(24, 40, 3), axis=1, block_m=8, block_n=32),
       ),
       use_params=(False, True),
       subtract_mean=(False, True),
@@ -160,7 +155,7 @@ class AmpereLoweringTest(parameterized.TestCase):
 
 
 class DivisorsTest(absltest.TestCase):
-  """Every axis but `M` must be tiled exactly: only `M`'s last tile can slide."""
+  """Every axis is tiled exactly, so every block is a divisor of its axis."""
 
   def test_divisors_descend_and_divide(self):
     got = list(mosaic_tiling.divisors(96, 32, multiple_of=8))
@@ -188,18 +183,22 @@ class PlanTest(absltest.TestCase):
     self.assertEqual(p.block, (32, 128))
     self.assertEqual(p.grid, (128, 1))
 
-  def test_the_cap_is_taken_whether_or_not_it_divides_the_rows(self):
-    # 32 does not divide 104, and no longer has to: the last tile slides back.
-    p = self._plan((104, 128))
-    self.assertEqual(p.block, (32, 128))
-    self.assertEqual(p.grid, (4, 1))
+  def test_the_row_block_drops_to_a_divisor_of_the_rows(self):
+    """`block_m` is a bound, and the block the largest divisor under it.
 
-  def test_the_last_row_block_slides_back(self):
+    Every axis is tiled exactly, so a block that does not divide its axis is not
+    a block at all -- there is no masked GMEM store to write a partial tile with.
+    """
+    # 32 does not divide 104; 8 is the largest divisor of it the warps can take.
+    p = self._plan((104, 128))
+    self.assertEqual((p.block, p.grid), ((8, 128), (13, 1)))
     p = self._plan((100, 128))
-    self.assertEqual((p.block, p.grid), ((32, 128), (4, 1)))
-    starts = [int(p.tile_starts((i, 0))[0]) for i in range(p.grid[0])]
-    # The tail overlaps its predecessor rather than overhanging `M`.
-    self.assertEqual(starts, [0, 32, 64, 68])
+    self.assertEqual((p.block, p.grid), ((20, 128), (5, 1)))
+
+  def test_rows_with_no_divisor_the_warps_can_take_are_declined(self):
+    """The four warps take four rows, so a block of `M` is a multiple of four."""
+    with self.assertRaisesRegex(NotImplementedError, 'no divisor of the rows'):
+      self._plan((102, 128))
 
   def test_rows_must_feed_the_warps(self):
     """A short `M` with no `N` beside it has nowhere to put the four warps."""
@@ -256,32 +255,20 @@ class PlanTest(absltest.TestCase):
     self.assertEqual((p.block, p.tile_regs()), ((1, 512, 16), 64))
     self.assertEqual(p.grid, (1, 1, 256))
 
-  def test_reduced_axis_must_be_at_least_32(self):
-    """One element per lane is the least a load can take; it cannot slide below that."""
-    with self.assertRaisesRegex(NotImplementedError, 'at least 32'):
-      self._plan((4096, 16))
+  def test_the_vector_narrows_to_let_the_lanes_tile_the_reduced_axis(self):
+    """With no `N`, all 32 lanes tile `A`, so `32 * vec` has to divide it.
 
-  def test_an_aligned_reduced_axis_is_one_load(self):
-    """A base tile that divides the axis leaves nothing to slide."""
-    for num_a in (32, 96, 128, 1024):
+    The vector is what gives to make that true -- and where nothing does, the
+    shape is declined rather than read in overlapping loads: a tail costs a mask
+    on every reduction, and registers for elements the load already held.
+    """
+    self.assertEqual(self._plan((4096, 128)).layout.to_mgpu().vector_length, 4)
+    # 32 four-element vectors overrun 96, and 64 does not divide it either.
+    self.assertEqual(self._plan((4096, 96)).layout.to_mgpu().vector_length, 1)
+    for num_a in (16, 40, 48, 1000):
       with self.subTest(num_a=num_a):
-        p = self._plan((4096, num_a))
-        self.assertEqual(p.a_tile, num_a)
-        self.assertEqual(p.a_tiles, ((0, 0),))
-
-  def test_a_ragged_reduced_axis_is_read_in_overlapping_loads(self):
-    """The last load slides back, and says how much of it is a duplicate."""
-    p = self._plan((4096, 48))
-    self.assertEqual(p.a_tile, 32)  # 32 * 4-element vectors would overrun 48.
-    self.assertEqual(p.a_tiles, ((0, 0), (16, 16)))
-    # Only the tail is ragged, so the waste stays under one load, and the 16-byte
-    # vectors survive whenever the axis is a multiple of four elements.
-    p = self._plan((4096, 1000))
-    self.assertEqual(p.a_tile, 128)
-    self.assertEqual(p.a_tiles[:2], ((0, 0), (128, 0)))
-    self.assertEqual(p.a_tiles[-1], (1000 - 128, 128 - (1000 - 7 * 128)))
-    # The rounded-up extent is what costs registers, not the axis itself.
-    self.assertEqual(p.tile_regs(), p.block[0] * 1024 // 128)
+        with self.assertRaisesRegex(NotImplementedError, 'multiple of the 32'):
+          self._plan((4096, num_a))
 
   def test_block_shrinks_to_fit_the_registers(self):
     """A long row is paid for in `block_m`, not declined outright."""
@@ -310,10 +297,12 @@ class PlanTest(absltest.TestCase):
     p = self._plan((24, 32, 256), block_m=8, block_n=32)
     self.assertEqual(p.block, (8, 32, 32))
     self.assertEqual(p.grid, (3, 1, 8))
-    # The reduced axis is never blocked, whatever share of the lanes tiles it:
-    # an `a_lanes` that does not divide it is paid for in overlapping loads.
-    for num_a in (4, 5, 34):
+    # The reduced axis is never blocked, whatever share of the lanes tiles it --
+    # but a share that does not divide it is no mapping at all.
+    for num_a in (4, 8, 32):
       self.assertEqual(self._plan((24, num_a, 256), block_n=32).block[1], num_a)
+    with self.assertRaisesRegex(NotImplementedError, 'no split of the 128'):
+      self._plan((24, 34, 256), block_n=32)
 
   def test_the_lane_split_holds_a_whole_sector_per_lane_group(self):
     """The run the lanes read contiguously is what sets the register cost.
@@ -351,9 +340,8 @@ class PlanTest(absltest.TestCase):
           except NotImplementedError:
             continue  # Declined outright, which the caller falls back from.
           layout = p.layout.to_mgpu()  # Raises if the layout is not legal.
-          load = (*p.block[:1], p.a_tile, *p.block[2:])
-          held = math.prod(layout.registers_shape(load)) * layout.vector_length
-          self.assertEqual(held * len(p.a_tiles), p.tile_regs())
+          held = math.prod(layout.registers_shape(p.block))
+          self.assertEqual(held * layout.vector_length, p.tile_regs())
 
   def test_a_register_resident_reduced_axis_is_paid_for_in_both_blocks(self):
     """`A` in registers costs `block_m * A * block_n / 128` per thread.
@@ -413,36 +401,12 @@ class PlanTest(absltest.TestCase):
     self.assertEqual(p.block, (8, 32, 24))
     self.assertEqual(p.grid, (3, 1, 2))
 
-  def test_the_loads_cover_the_reduced_axis_exactly_once(self):
-    """What the reduction sums, once the duplicates are masked out.
-
-    The mask is what keeps a sum from double-counting the overlap, so the elements
-    each load owns have to partition the axis -- and every load has to stay in
-    bounds, since there is no masked GMEM read to fall back on.
-    """
-    for shape, block_n in (
-        ((4096, 48), None),  # Ragged, minor: two loads.
-        ((4096, 1000), None),  # Ragged, minor: eight loads.
-        ((4096, 128), None),  # Aligned: one load.
-        ((24, 40, 3), 32),  # Ragged, not minor: the lanes tile it bare.
-        ((24, 32, 256), 32),  # Not tiled by the lanes at all.
-    ):
-      with self.subTest(shape=shape):
-        p = self._plan(shape, block_m=8, block_n=block_n)
-        num_a = shape[mosaic_tiling.REDUCE_AXIS]
-        owned = []
-        for offset, duplicates in p.a_tiles:
-          self.assertLessEqual(offset + p.a_tile, num_a)  # In bounds.
-          owned.extend(range(offset + duplicates, offset + p.a_tile))
-        self.assertEqual(owned, list(range(num_a)))
-
   def test_every_tile_is_visited_exactly_once(self):
     """The grid index turns into one element offset per axis.
 
     One CTA takes one tile, so the whole array has to be covered and no tile may
-    be started twice -- the statistics are written per tile. A slid tile overlaps
-    its predecessor, which is harmless: it recomputes those rows to the same
-    values.
+    be started twice -- the statistics are written per tile. Every axis is tiled
+    exactly, so the tiles partition the array and none of them overhangs it.
     """
     for shape, block_n in (
         ((24, 32, 256), 32),
@@ -456,8 +420,7 @@ class PlanTest(absltest.TestCase):
         seen = [tuple(int(i) for i in p.tile_starts(t)) for t in tiles]
         expected = sorted(
             itertools.product(*(
-                sorted({min(i * b, s - b) for i in range(n)})
-                for s, b, n in zip(p.shape, p.block, p.grid, strict=True)
+                range(0, s, b) for s, b in zip(p.shape, p.block, strict=True)
             ))
         )
         self.assertEqual(sorted(seen), expected)
@@ -491,15 +454,19 @@ class PlanTest(absltest.TestCase):
     with nothing minor to take the rest of the warps, or too short a reduced axis
     to give the lanes one element each.
     """
-    shapes = ((128, 32), (1024, 32), (256, 42), (24, 32, 40), (768, 40),
-              (1, 24, 1280))  # The last: a reduced axis under one per lane, but
+    shapes = ((128, 32), (1024, 32), (24, 32, 40),
+              (1, 24, 1280))  # The last: fewer than one element per lane, but
     for shape in shapes:      # `a_lanes` is 8 here, so it is three each.
       with self.subTest(shape=shape):
         self.assertEqual(self._plan(shape, block_n=32).shape, shape)
     for shape, reason in (
         ((1, 64), 'no axis minor'),
         ((1, 40), 'no axis minor'),
-        ((1, 24, 7), 'at least 32'),
+        # The lanes tile the reduced axis exactly or not at all, and no share of
+        # 42 or 40 divides them; the Triton kernel takes these.
+        ((256, 42), 'multiple of the 32'),
+        ((768, 40), 'multiple of the 32'),
+        ((1, 24, 7), 'no split of the 128'),
     ):
       with self.subTest(shape=shape):
         with self.assertRaisesRegex(NotImplementedError, reason):

@@ -18,9 +18,10 @@ Normalization is memory-bound, so the design serves coalesced GMEM access: one
 CTA takes one tile straight from GMEM into registers, reduces it, and writes it
 back. No SMEM, no pipeline -- blocking and the layout live in `mosaic_tiling`.
 
-A tile takes one load, unless the reduced axis is ragged: no base tile divides it
-then, so it is read in overlapping loads whose duplicates the reduction masks out
-(`mosaic_tiling.Plan.a_tiles`).
+A tile is one load and one store. Every axis is tiled exactly -- the reduced axis
+by the lanes, the rest by the block -- so there is no tail to mask, and a shape
+that cannot be tiled exactly is declined for the caller to fall back on, Mosaic
+having no masked GMEM access to offer instead.
 
 The one layout annotation is on the loaded tile, and everything downstream
 follows from it: it is what makes both the load and the store coalesce, and the
@@ -32,7 +33,6 @@ import dataclasses
 from typing import ClassVar, override
 
 import jax
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
@@ -110,69 +110,40 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
       index = p.out_index()
       stat_index = mosaic_tiling.drop_reduced(index)
-      # One load per `(offset, duplicates)` along the reduced axis: one for the
-      # whole of it unless the lanes tile it and do not divide it, in which case
-      # the loads overlap. See `mosaic_tiling.Plan.a_tiles`.
-      loads = p.a_tiles
-      # One load's worth of the reduced axis, where the whole of it sits in the
-      # block and in the index: the shape of a load, and the slice it reads.
-      narrow = lambda xs, a: (*xs[:axis_a], a, *xs[axis_a + 1 :])
-      tile_shape = narrow(p.block, p.a_tile)
-      load_index = lambda at: narrow(index, pl.ds(at, p.a_tile))
+      # The tile is one load: every axis is tiled exactly, so the reduced axis
+      # comes whole and in one piece. See `mosaic_tiling`.
+      x = plgpu.load(x_gmem.at[index], layout=p.layout, optimized=False)
+      x = x.astype(jnp.float32)
 
-      def load_x(at):
-        x = plgpu.load(x_gmem.at[load_index(at)], layout=p.layout, optimized=False)
-        return x.astype(jnp.float32)
-
-      xs = [load_x(at) for at, _ in loads]
-
-      def reduce(vals):
-        """Sums `vals` over the reduced axis, dropping duplicated elements.
-
-        Overlapping loads see the same element twice, so all but the first copy
-        is masked out; `where` on an iota is a register op, and the mask is
-        entirely static.
-        """
-        parts = []
-        for val, (_, duplicates) in zip(vals, loads):
-          if duplicates:
-            a = jax.lax.broadcasted_iota(jnp.int32, tile_shape, axis_a)
-            val = jnp.where(a >= duplicates, val, 0.0)
-          parts.append(jnp.sum(val, axis=axis_a))
-        return sum(parts) / x_shape[axis_a]
-
+      reduce = lambda v: jnp.sum(v, axis=axis_a) / x_shape[axis_a]
       # The stats span every axis but the reduced one.
-      stat_dims = tuple(d for d in range(len(tile_shape)) if d != axis_a)
-      bcast = lambda a: jax.lax.broadcast_in_dim(a, tile_shape, stat_dims)
+      stat_dims = tuple(d for d in range(len(p.block)) if d != axis_a)
+      bcast = lambda a: jax.lax.broadcast_in_dim(a, p.block, stat_dims)
 
       if subtract_mean:
-        mean = reduce(xs)
-        xs = [x - bcast(mean) for x in xs]
+        mean = reduce(x)
+        x -= bcast(mean)
         if mean_gmem is not None:
           mean_gmem[stat_index] = mean
-      rstddev = jax.lax.rsqrt(reduce([x * x for x in xs]) + epsilon)
+      rstddev = jax.lax.rsqrt(reduce(x * x) + epsilon)
       if rstd_gmem is not None:
         rstd_gmem[stat_index] = rstddev
 
-      # The 1D params come straight from GMEM, each load taking its own slice.
-      # `optimized=False` because they are not in SMEM; inference picks their
-      # layout off the tile they multiply.
-      def param(ref, at):
-        sliced = plgpu.load(ref.at[pl.ds(at, p.a_tile)], optimized=False)
+      # The 1D params come straight from GMEM, whole, as the reduced axis is not
+      # blocked. `optimized=False` because they are not in SMEM; inference picks
+      # their layout off the tile they multiply.
+      def param(ref):
+        loaded = plgpu.load(ref, optimized=False).astype(jnp.float32)
         # The params span only the reduced axis, so they spread along the rest.
-        return jax.lax.broadcast_in_dim(
-          sliced.astype(jnp.float32), tile_shape, (axis_a,)
-        )
+        return jax.lax.broadcast_in_dim(loaded, p.block, (axis_a,))
 
-      for (at, _), x in zip(loads, xs):
-        x = x * bcast(rstddev)
-        # `y = x_norm * (scale + scale_offset) + offset`; see `base.Normalization`.
-        if scale_ref is not None:
-          x *= param(scale_ref, at) + scale_offset
-        if offset_ref is not None:
-          x += param(offset_ref, at)
-        # Overlapping loads store the same value twice, as `M`'s slide does.
-        y_gmem[load_index(at)] = x.astype(dtype)
+      x = x * bcast(rstddev)
+      # `y = x_norm * (scale + scale_offset) + offset`; see `base.Normalization`.
+      if scale_ref is not None:
+        x *= param(scale_ref) + scale_offset
+      if offset_ref is not None:
+        x += param(offset_ref)
+      y_gmem[index] = x.astype(dtype)
 
     stat = jax.ShapeDtypeStruct(mosaic_tiling.drop_reduced(p.shape), jnp.float32)
     outs = plgpu.kernel(
