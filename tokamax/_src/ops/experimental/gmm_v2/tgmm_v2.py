@@ -90,6 +90,8 @@ def calculate_tgmm_tiling(
     target_zero_ref_bytes: int,
 ) -> gmm_v2.TileSizes:
   """Calculate optimal tile sizes for TGMM kernel."""
+  # Everything DMA'd is multi-buffered; everything produced inside the kernel
+  # body is ×1.
   # In tgmm, we calculate lhs.T @ dout which doesn't require quantization.
   # Since we use it in MOE, the m can be dynamic and small. So we don't
   # want it to be too big. At the same time, because the mxu size is 256, the
@@ -129,6 +131,16 @@ def calculate_tgmm_tiling(
         # always <= this value.
         + target_zero_ref_bytes
     )
+    if lhs_cfgs.should_quantize:
+      budget += (
+          # fp8 operands fed to the MXU.
+          tile_m * tile_k * lhs_cfgs.quant_dtype
+          # fp8 operands fed to the MXU.
+          + tile_m * tile_n * rhs_cfgs.quant_dtype
+          # lhs_scale is [tile_k, 1] f32, lane-padded to [tile_k, num_lanes].
+          + tile_k * pltpu.get_tpu_info().num_lanes * 4  # s_l, [tile_k, 1] f32
+          # rhs_scale: [1, tile_n] is negligible
+      )
     return budget <= vmem_limit_bytes
 
   prev_tile_n = tile_n
