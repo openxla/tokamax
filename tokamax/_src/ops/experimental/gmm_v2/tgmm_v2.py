@@ -59,9 +59,14 @@ TileTgmmFn = Callable[
 def get_scope_name(cfgs: gmm_v2.GmmConfigs) -> str:
   dims = cfgs.dims
   tiles = cfgs.tiles
+  lhs_q = cfgs.lhs_cfgs.quant_dtype
+  rhs_q = cfgs.rhs_cfgs.quant_dtype
+  lhs_q = None if lhs_q is None else jnp.dtype(lhs_q).name
+  rhs_q = None if rhs_q is None else jnp.dtype(rhs_q).name
   return (
       f"tgmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
       f"-n_{dims.size_n}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
+      f"-lq_{lhs_q}-rq_{rhs_q}"
   )
 
 
@@ -132,14 +137,16 @@ def calculate_tgmm_tiling(
         + target_zero_ref_bytes
     )
     if lhs_cfgs.should_quantize:
+      lhs_q_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.quant_dtype) // 8
+      rhs_q_bytes = jax.dtypes.itemsize_bits(rhs_cfgs.quant_dtype) // 8
+      
       budget += (
           # fp8 operands fed to the MXU.
-          tile_m * tile_k * lhs_cfgs.quant_dtype
-          # fp8 operands fed to the MXU.
-          + tile_m * tile_n * rhs_cfgs.quant_dtype
-          # lhs_scale is [tile_k, 1] f32, lane-padded to [tile_k, num_lanes].
-          + tile_k * pltpu.get_tpu_info().num_lanes * 4  # s_l, [tile_k, 1] f32
-          # rhs_scale: [1, tile_n] is negligible
+          tile_m * tile_k * lhs_q_bytes
+          + tile_m * tile_n * rhs_q_bytes
+          # lhs_scale is [tile_k, 1] f32, lane-padded to [tile_k, num_lanes], so not negligible.
+          + tile_k * num_lanes * 4
+          # rhs_scale is [1, tile_n], negligible.
       )
     return budget <= vmem_limit_bytes
 
