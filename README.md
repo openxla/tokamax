@@ -1,6 +1,7 @@
 # Tokamax
 
-[![CI](https://github.com/openxla/tokamax/actions/workflows/ci-build.yml/badge.svg)](https://github.com/openxla/tokamax/actions/workflows/ci-build.yml)
+[![nightly](https://img.shields.io/github/actions/workflow/status/openxla/tokamax/ci-nightly.yml?label=nightly&logo=githubactions&logoColor=white)](https://github.com/openxla/tokamax/actions/workflows/ci-nightly.yml)
+[![pre-submit](https://img.shields.io/github/actions/workflow/status/openxla/tokamax/ci-build.yml?event=pull_request&label=pre-submit&logo=githubactions&logoColor=white)](https://github.com/openxla/tokamax/actions/workflows/ci-build.yml?query=event%3Apull_request)
 [![PyPI version](https://img.shields.io/pypi/v/tokamax)](https://pypi.org/project/tokamax/)
 ![Static Badge](https://img.shields.io/badge/Under_Development-red)
 
