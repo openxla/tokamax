@@ -96,6 +96,8 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     p = mosaic_tiling.plan(
       x_shape, dtype.itemsize, block_m=config.block_m, block_n=config.block_n
     )
+    # `plan` may drop a degenerate trailing axis, so it is what says the rank.
+    x_shape = p.shape
 
     axis_a = mosaic_tiling.REDUCE_AXIS
 
@@ -112,11 +114,14 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       # whole of it unless the lanes tile it and do not divide it, in which case
       # the loads overlap. See `mosaic_tiling.Plan.a_tiles`.
       loads = p.a_tiles
-      narrow = lambda i, at: (*i[:axis_a], pl.ds(at, p.a_tile), *i[axis_a + 1 :])
-      tile_shape = (*p.block[:axis_a], p.a_tile, *p.block[axis_a + 1 :])
+      # One load's worth of the reduced axis, where the whole of it sits in the
+      # block and in the index: the shape of a load, and the slice it reads.
+      narrow = lambda xs, a: (*xs[:axis_a], a, *xs[axis_a + 1 :])
+      tile_shape = narrow(p.block, p.a_tile)
+      load_index = lambda at: narrow(index, pl.ds(at, p.a_tile))
 
       def load_x(at):
-        x = plgpu.load(x_gmem.at[narrow(index, at)], layout=p.layout, optimized=False)
+        x = plgpu.load(x_gmem.at[load_index(at)], layout=p.layout, optimized=False)
         return x.astype(jnp.float32)
 
       xs = [load_x(at) for at, _ in loads]
@@ -128,14 +133,13 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         is masked out; `where` on an iota is a register op, and the mask is
         entirely static.
         """
-        total = None
+        parts = []
         for val, (_, duplicates) in zip(vals, loads):
           if duplicates:
             a = jax.lax.broadcasted_iota(jnp.int32, tile_shape, axis_a)
             val = jnp.where(a >= duplicates, val, 0.0)
-          part = jnp.sum(val, axis=axis_a)
-          total = part if total is None else total + part
-        return total / x_shape[axis_a]
+          parts.append(jnp.sum(val, axis=axis_a))
+        return sum(parts) / x_shape[axis_a]
 
       # The stats span every axis but the reduced one.
       stat_dims = tuple(d for d in range(len(tile_shape)) if d != axis_a)
@@ -168,7 +172,7 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         if offset_ref is not None:
           x += param(offset_ref, at)
         # Overlapping loads store the same value twice, as `M`'s slide does.
-        y_gmem[narrow(index, at)] = x.astype(dtype)
+        y_gmem[load_index(at)] = x.astype(dtype)
 
     stat = jax.ShapeDtypeStruct(mosaic_tiling.drop_reduced(p.shape), jnp.float32)
     outs = plgpu.kernel(
@@ -197,10 +201,11 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return mosaic_tiling.with_usable_block_m(
-      triton_config.get_heuristics_config(
-        *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
-      )
+    # Both block sizes are upper bounds; `plan` raises one below what the layout
+    # needs and lowers one the register budget cannot afford, so a config
+    # borrowed from the Triton kernel needs no fixing up here.
+    return triton_config.get_heuristics_config(
+      *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
     )
 
   @override

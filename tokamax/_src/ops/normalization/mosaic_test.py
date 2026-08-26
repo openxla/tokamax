@@ -36,6 +36,30 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
       self.skipTest('Mosaic GPU normalization not supported on this device.')
     super().setUp()
 
+  @override
+  def _run_test(self, *args, **kwargs):
+    """Skips the shapes this kernel has no thread mapping for.
+
+    The warpgroup's 128 threads have to be placed on axes that can feed them, and
+    some shapes in the shared battery cannot: `(1, 40)`, canonicalized, is a
+    single row with nothing minor to the reduced axis, so there is no axis to
+    spread the four warps over. Those are declined rather than lowered wrong, and
+    the caller falls back to another implementation, so there is nothing here to
+    check numerically.
+
+    Skipping on the error, rather than on a list of shapes, keeps this from
+    drifting out of step with `mosaic_tiling.plan`. It cannot hide a regression
+    that starts declining a shape that used to work:
+    `mosaic_lowering_test.test_the_shapes_the_op_is_tested_on_plan_or_decline_cleanly`
+    pins exactly which of these shapes plan and which do not, and needs no GPU.
+    """
+    try:
+      super()._run_test(*args, **kwargs)
+    except NotImplementedError as e:
+      if 'No thread mapping fits' not in str(e):
+        raise
+      self.skipTest(str(e))
+
   def test_layer_norm_with_pre_scale(self):
     rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
 
