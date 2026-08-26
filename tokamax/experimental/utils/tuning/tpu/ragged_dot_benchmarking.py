@@ -338,7 +338,7 @@ def run_benchmark(
     print(tune_jax.tabulate(lax_drhs_fn))
   # drhs #######################################################################
 
-    with jax.profiler.trace("/tmp/ragged_dot_benchmark"):
+  with jax.profiler.trace("/tmp/ragged_dot_benchmark"):
     if "fwd" in modes_to_tune:
       for _ in range(3):
         jax.block_until_ready(fn_fwd(lhs, rhs, gs))  # pyrefly: ignore[unbound-name]
