@@ -114,7 +114,11 @@ def gated_linear_unit(
     cluster_idx = lax.axis_index("cluster")
     is_lead_block = cluster_idx == 0
 
-    @plgpu.dynamic_scheduling_loop(grid_names=("mn_linear",), thread_axis="wg")
+    @plgpu.dynamic_scheduling_loop(
+        grid_names=("mn_linear",),
+        thread_axis="wg",
+        cluster_axes=("cluster",) if collective else (),
+    )
     def mn_loop(loop_info):
       (lin_idx,) = loop_info.index
       local_index = loop_info.local_index
