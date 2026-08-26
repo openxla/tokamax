@@ -859,7 +859,13 @@ class GmmTest(parameterized.TestCase):
       in_size=[1024],
       out_size=[1024],
       num_groups=[16, 32],
-      weight_dtype=[jnp.int4, jnp.int8],
+      weight_dtype=[jnp.int4, jnp.int8, jnp.float8_e4m3fn],
+      activation_dtype=[
+          None,
+          jnp.int8,
+          jnp.float8_e4m3fn,
+          jnp.float8_e5m2
+      ],
       block_size=[1024],
       group_offset=[0],
   )
@@ -870,6 +876,7 @@ class GmmTest(parameterized.TestCase):
       out_size,
       num_groups,
       weight_dtype,
+      activation_dtype,
       block_size,
       group_offset,
   ):
@@ -877,6 +884,17 @@ class GmmTest(parameterized.TestCase):
       self.skipTest("Expect TPUv7+")
     if block_size > in_size:
       self.skipTest("block_size must be <= in_size")
+    if activation_dtype is not None:
+      tpu_info = pltpu.get_tpu_info()
+      if not (
+          tpu_info.is_matmul_supported(activation_dtype, weight_dtype)
+      ) and not gmm_v2.is_manually_cast_matmul_dtype_combo(
+          activation_dtype, weight_dtype
+      ):
+        self.skipTest(
+            f"Combination {activation_dtype} and {weight_dtype} not supported"
+            " by the kernel."
+        )
     num_local_groups = num_groups - group_offset
     key = jax.random.key(0)
 
@@ -906,9 +924,16 @@ class GmmTest(parameterized.TestCase):
         rhs_scale=rhs_scale,
         group_offset=group_offset,
         maybe_quantize_lhs=True,
+        lhs_quant_dtype=activation_dtype,
     ).astype(lhs.dtype)
 
-    chex.assert_trees_all_close(actual, expected, atol=1.1, rtol=1.1)
+    # e5m2 introduces increased rounding error compared to e4m3
+    if activation_dtype == jnp.float8_e5m2:
+      atol, rtol = 2.25, 1.1
+    else:
+      atol, rtol = 1.1, 1.1
+
+    chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
   @pytest.mark.long
   @parameterized.product(

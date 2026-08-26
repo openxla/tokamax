@@ -1152,6 +1152,20 @@ def calculate_tiling(
   )
 
 
+def is_manually_cast_matmul_dtype_combo(
+    lhs_dtype: jax.typing.DTypeLike, rhs_dtype: jax.typing.DTypeLike
+) -> bool:
+  """Some dtype combos are not implicitly supported/promoted by JAX but we support them in the kernel through explicit casting."""
+  manual_cast_dtype_combo = {
+      # (lhs_dtype, rhs_dtype)
+      (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.int4)),
+      (jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.int4)),
+      (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.bfloat16)),
+      (jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.bfloat16)),
+  }
+  return (jnp.dtype(lhs_dtype), jnp.dtype(rhs_dtype)) in manual_cast_dtype_combo
+
+
 def validate_inputs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -1163,6 +1177,7 @@ def validate_inputs(
     maybe_quantize_lhs: bool = True,
     lhs_scale: jax.Array | None = None,
     transpose_rhs: bool = False,
+    lhs_quant_dtype: jnp.dtype | None = None,
 ) -> Dimensions:
   """Validates the inputs for the GMM kernel."""
 
@@ -1215,6 +1230,20 @@ def validate_inputs(
 
   assert group_offset.shape == (1,)
 
+  if lhs_quant_dtype is not None:
+    if not maybe_quantize_lhs:
+      raise ValueError(
+          "lhs_quant_dtype cannot be set when maybe_quantize_lhs is False."
+      )
+    tpu_info = pltpu.get_tpu_info()
+    if not tpu_info.is_matmul_supported(
+        lhs_quant_dtype, rhs.dtype
+    ) and not is_manually_cast_matmul_dtype_combo(lhs_quant_dtype, rhs.dtype):
+      raise ValueError(
+          f"lhs_quant_dtype ({lhs_quant_dtype}) and rhs dtype ({rhs.dtype}) "
+          "are not a supported combination."
+      )
+
   size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(lhs.dtype)
   size_lhs_sublane = min(size_lhs_sublane, size_m)
   if fuse_act is not None:
@@ -1249,7 +1278,7 @@ def get_cost_estimate(cfgs: GmmConfigs):
   # TODO: Add compute flops for quant, dequant, and bias.
   flops = 2 * dims.size_m * dims.size_k * dims.size_n
 
-  lhs_bytes = dims.size_m * dims.size_k * lhs_dtype.itemsize
+  lhs_bytes = dims.size_m * dims.size_k * jnp.dtype(lhs_dtype).itemsize
 
   rhs_size = dims.size_group * dims.size_k * dims.size_n
   rhs_bytes = rhs_size * rhs_bits // 8
@@ -1296,6 +1325,7 @@ def make_gmm_configs(
     fuse_act: str | None = None,
     lhs_scale: jax.Array | None = None,
     transpose_rhs: bool = False,
+    lhs_quant_dtype: jnp.dtype | None = None,
 ):
   """Fills the GMM config for the GMM kernel."""
 
@@ -1310,6 +1340,7 @@ def make_gmm_configs(
       maybe_quantize_lhs,
       lhs_scale,
       transpose_rhs=transpose_rhs,
+      lhs_quant_dtype=lhs_quant_dtype,
   )
 
   if rhs_scale is not None:
@@ -1332,20 +1363,26 @@ def make_gmm_configs(
 
   lhs_q_dtype = None
   if maybe_quantize_lhs and rhs_cfgs.should_dequantize_after_matmul:
-    # Choose lhs quantization dtype based on TPU hardware support.
-    is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)  # pyrefly: ignore[bad-argument-type]
-    tpu_info = pltpu.get_tpu_info()
-    # Check if there is hardware compute support for rhs dtype group.
-    if tpu_info.fp8_ops_per_second > 0:
-      # Special handling for 4-bit integer rhs as it can be converted to fp8
-      # without a numeric issues. Note that this is not the case for 4-bit
-      # floating rhs as conversion to int8 will cause numeric issues.
-      is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4  # pyrefly: ignore[bad-argument-type]
-      if is_rhs_float or is_rhs_4bits:
-        lhs_q_dtype = jnp.float8_e4m3fn.dtype
-    if tpu_info.int8_ops_per_second > 0:
-      if not is_rhs_float:
-        lhs_q_dtype = jnp.int8.dtype
+    if lhs_quant_dtype is not None:
+      lhs_q_dtype = lhs_quant_dtype
+    else:
+      # Choose lhs quantization dtype based on TPU hardware support
+      # only if lhs_quant_dtype is not provided.
+      assert rhs_quant_dtype is not None
+      is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)  # pyrefly: ignore[bad-argument-type]
+      tpu_info = pltpu.get_tpu_info()
+      # Check if there is hardware compute support for rhs dtype group.
+      if tpu_info.fp8_ops_per_second > 0:
+        # Special handling for 4-bit integer rhs as it can be converted to fp8
+        # without a numeric issues. Note that this is not the case for 4-bit
+        # floating rhs as conversion to int8 will cause numeric issues.
+        # see is_manually_cast_matmul_dtype_combo()
+        is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4  # pyrefly: ignore[bad-argument-type]
+        if is_rhs_float or is_rhs_4bits:
+          lhs_q_dtype = jnp.float8_e4m3fn.dtype
+      if tpu_info.int8_ops_per_second > 0:
+        if not is_rhs_float:
+          lhs_q_dtype = jnp.int8.dtype
 
   if lhs_scale is not None:
     assert lhs_q_dtype is not None, (
@@ -1415,6 +1452,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "preferred_element_type",
         "acc_dtype",
         "maybe_quantize_lhs",
+        "lhs_quant_dtype",
         "zero_initialize",
         "fuse_act",
         "transpose_rhs",
@@ -1435,6 +1473,7 @@ def gmm_v2(
     preferred_element_type: jnp.dtype | None = None,
     acc_dtype: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
+    lhs_quant_dtype: jnp.dtype | None = None,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     transpose_rhs: bool = False,
@@ -1458,6 +1497,7 @@ def gmm_v2(
       granularity; currently only per-tensor `[1, 1]` is supported. When None, a
       quantized lhs uses the default dynamic per-block absmax calibration. Only
       takes effect when maybe_quantize_lhs is True and rhs is quantized.
+    lhs_quant_dtype: Optional jnp.dtype to use for quantizing lhs
     tile_info: The tile sizes or tile function to use.
     vmem_limit_bytes: Optional vmem limit in bytes.
     precision: Unused. Exists for compatibility reasons.
@@ -1499,6 +1539,7 @@ def gmm_v2(
       fuse_act=fuse_act,
       lhs_scale=lhs_scale,
       transpose_rhs=transpose_rhs,
+      lhs_quant_dtype=lhs_quant_dtype,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles
