@@ -80,7 +80,12 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   ):
     cluster_idx = lax.axis_index("cluster")
 
-    @plgpu.dynamic_scheduling_loop(("mn",), thread_axis="wg", init_carry=0)
+    @plgpu.dynamic_scheduling_loop(
+        ("mn",),
+        thread_axis="wg",
+        cluster_axes=("cluster",) if collective else (),
+        init_carry=0,
+    )
     def mn_loop(loop_info: plgpu.NDLoopInfo, carry):
       (idx,) = loop_info.index
       tid_m, ni = plgpu.planar_snake(
