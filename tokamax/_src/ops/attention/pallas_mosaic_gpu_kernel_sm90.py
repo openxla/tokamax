@@ -595,6 +595,7 @@ def flash_attention_kernel(
 
             @pl.when((warp_id == 1) & (loop_info.local_index > 0))
             def tma_q_load_warp():
+              plgpu.async_prefetch(q_gmem.at[qs, hi])
               mgpu_lib.bar_sync(q_consumed_barrier, num_threads=160)
               plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_produced)
 
