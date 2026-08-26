@@ -352,73 +352,75 @@ def fused_conv1d_gdn(
   recurrent_out_dtype = recurrent_state.dtype
   assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
-  qkv = qkv.astype(jnp.float32)
-  b = b.astype(jnp.float32)
-  a = a.astype(jnp.float32)
-  conv_state = conv_state.astype(jnp.float32)
+  with jax.named_scope("fused_conv1d_gdn_input_preprocessing"):
+    qkv = qkv.astype(jnp.float32)
+    b = b.astype(jnp.float32)
+    a = a.astype(jnp.float32)
+    conv_state = conv_state.astype(jnp.float32)
 
-  # Step 1: Validate inputs.
-  num_seqs = state_indices.size
-  batch_size, dim = qkv.shape
-  assert conv_weight.shape == (dim, 1, kernel_size)
-  if conv_bias is not None:
-    assert conv_bias.shape == (dim,)
-  assert query_start_loc.shape == (num_seqs + 1,)
-  assert state_indices.shape == (num_seqs,)
-  assert distribution.shape == (3,)
+    # Step 1: Validate inputs.
+    num_seqs = state_indices.size
+    batch_size, dim = qkv.shape
+    assert conv_weight.shape == (dim, 1, kernel_size)
+    if conv_bias is not None:
+      assert conv_bias.shape == (dim,)
+    assert query_start_loc.shape == (num_seqs + 1,)
+    assert state_indices.shape == (num_seqs,)
+    assert distribution.shape == (3,)
 
-  num_lanes = pltpu.get_tpu_info().num_lanes
-  packing = 4 // act_in_dtype.itemsize
-  padded_batch_size = pl.cdiv(batch_size, packing) * packing
-  conv_state_dim_size = conv_state.shape[-1]
+    # Step 2: Compute tile sizes and pad/reshape activations.
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    packing = 4 // act_in_dtype.itemsize
+    padded_batch_size = pl.cdiv(batch_size, packing) * packing
+    conv_state_dim_size = conv_state.shape[-1]
 
-  decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
-      batch_size=batch_size,
-      num_seqs=num_seqs,
-      padded_batch_size=padded_batch_size,
-      n_kq=n_kq,
-      n_v=n_v,
-      d_k=d_k,
-      d_v=d_v,
-      kernel_size=kernel_size,
-      conv_state_dim_size=conv_state_dim_size,
-      act_in_dtype=act_in_dtype,
-      act_out_dtype=act_out_dtype,
-      conv_state_dtype=conv_state.dtype,
-      recurrent_state_dtype=recurrent_state.dtype,
-      num_lanes=num_lanes,
-      decode_tile_size=decode_tile_size,
-      mixed_tile_size=mixed_tile_size,
-  )
+    decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+        batch_size=batch_size,
+        num_seqs=num_seqs,
+        padded_batch_size=padded_batch_size,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        conv_state_dim_size=conv_state_dim_size,
+        act_in_dtype=act_in_dtype,
+        act_out_dtype=act_out_dtype,
+        conv_state_dtype=conv_state.dtype,
+        recurrent_state_dtype=recurrent_state.dtype,
+        num_lanes=num_lanes,
+        decode_tile_size=decode_tile_size,
+        mixed_tile_size=mixed_tile_size,
+    )
 
-  batch_padding_size = padded_batch_size - batch_size
-  aligned_num_v_heads = tiling.align_to(n_v, num_lanes)
-  num_v_padding_size = aligned_num_v_heads - n_v
-  qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
-  b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-  a = jnp.pad(a, ((0, batch_padding_size), (0, num_v_padding_size)))
+    batch_padding_size = padded_batch_size - batch_size
+    aligned_num_v_heads = tiling.align_to(n_v, num_lanes)
+    num_v_padding_size = aligned_num_v_heads - n_v
+    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+    a = jnp.pad(a, ((0, batch_padding_size), (0, num_v_padding_size)))
 
-  qkv = qkv.reshape(padded_batch_size, 1, -1)
-  b = b.reshape(padded_batch_size, 1, -1)
-  a = a.reshape(padded_batch_size, 1, -1)
+    qkv = qkv.reshape(padded_batch_size, 1, -1)
+    b = b.reshape(padded_batch_size, 1, -1)
+    a = a.reshape(padded_batch_size, 1, -1)
 
-  # Step 3: States and weights pre-processing.
-  # To eliminate runtime cost, this logic can be moved into model loading
-  conv_state_shape = conv_state.shape
-  conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
-  conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
-  conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
+    # Step 3: States and weights pre-processing.
+    # To eliminate runtime cost, this logic can be moved into model loading
+    conv_state_shape = conv_state.shape
+    conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
+    conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
-  # Step 4: Wrap inputs for the kernel.
-  conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)
-  gdn_weights = memory_ref.GDNWeightsRef(a_log=a_log, dt_bias=dt_bias)
-  weights = memory_ref.WeightRefs(conv=conv_weights, gdn=gdn_weights)
+    # Step 4: Wrap inputs for the kernel.
+    conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)
+    gdn_weights = memory_ref.GDNWeightsRef(a_log=a_log, dt_bias=dt_bias)
+    weights = memory_ref.WeightRefs(conv=conv_weights, gdn=gdn_weights)
 
-  # Step 5: Create specs.
-  smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
-  vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
-  hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-  weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
+    # Step 5: Create specs.
+    smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
   def call_kernel(
       in_conv_state: jax.Array,
@@ -517,11 +519,52 @@ def fused_conv1d_gdn(
         weights,
     )
 
-  out_act, out_conv_state, out_recurrent_state = call_kernel(
-      conv_state, recurrent_state, None, config.GDNMode.BATCHED
+  # Pre-allocate zero output buffer when zero_initialize_out is enabled.
+  out_act_init = (
+      jnp.zeros((padded_batch_size, n_v, d_v), dtype=act_out_dtype)
+      if zero_initialize_out
+      else None
   )
-  out_act, out_conv_state, out_recurrent_state = call_kernel(
-      out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ
+
+  def call_kernel_if_active(
+      in_conv_state: jax.Array,
+      in_recurrent_state: jax.Array,
+      in_act: jax.Array | None,
+      mode: config.GDNMode,
+      is_active: jax.Array,
+  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Conditionally launches Pallas kernel if the pass has active sequences."""
+    mode_name = (
+        "batched_decode" if mode == config.GDNMode.BATCHED else "per_seq_mixed"
+    )
+
+    def _execute():
+      with jax.named_scope(f"execute_{mode_name}"):
+        return call_kernel(in_conv_state, in_recurrent_state, in_act, mode)
+
+    def _skip():
+      act = in_act if in_act is not None else out_act_init
+      return act, in_conv_state, in_recurrent_state
+
+    return jax.lax.cond(is_active, _execute, _skip)
+
+  # Phase 1: Decode pass over sequences [0, distribution[0])
+  out_act, out_conv_state, out_recurrent_state = call_kernel_if_active(
+      conv_state,
+      recurrent_state,
+      None,
+      config.GDNMode.BATCHED,
+      distribution[0] > 0,
+  )
+
+  # Phase 2: Prefill/mixed pass over sequences
+  # [distribution[0], distribution[-1])
+  out_act, out_conv_state, out_recurrent_state = call_kernel_if_active(
+      out_conv_state,
+      out_recurrent_state,
+      out_act,
+      config.GDNMode.PER_SEQ,
+      distribution[-1] > distribution[0],
   )
 
   out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
