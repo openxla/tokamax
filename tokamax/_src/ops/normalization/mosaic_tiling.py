@@ -17,7 +17,7 @@
 Tiles go straight from GMEM into registers -- no SMEM, no pipeline.
 Given `x` canonicalized to `(M, A)` or `(M, A, N)`, there are 3 layout options:
 
-  - `_warps_on_m`. Warps on `M`, lanes split between `A` and `N`; `_lane_split` picks the split.
+  - `_warps_on_m`. Warps on `M`, lanes on `A` and `N`.
   - `_warps_on_mn_split`. Warps on `M` and part of `N`, lanes on `N`.
   - `_warps_on_mn`. Warps on `M` and `N`, lanes on `A`.
 
@@ -121,16 +121,6 @@ class _Mapping:
   layout: Any
 
 
-def _min_tile_regs(mapping: _Mapping, num_a: int) -> int:
-  """Registers per thread of the smallest tile the mapping admits.
-
-  Both blocks at their floor. `plan` can only ever grow them from here, so a
-  mapping over the budget at this size has nothing left to give.
-  """
-  cols = mapping.n_multiple or 1
-  return mapping.m_multiple * num_a * cols // _WARPGROUP
-
-
 def _lane_split(num_a: int, num_n: int, bitwidth: int) -> tuple[int, int, int]:
   """Splits the 32 lanes between the reduced axis and the minor one.
 
@@ -160,18 +150,19 @@ def _lane_split(num_a: int, num_n: int, bitwidth: int) -> tuple[int, int, int]:
   # A run cannot outrun the sector, nor the alignment `N` actually has: the run
   # has to divide `N` for a block of it to.
   run = min(_SECTOR_BITS // bitwidth, _pow2_part(num_n))
+  # `run` is a power of two at most `_LANES`, and `vec` halves down from one, so
+  # every `n_lanes` divides the warp and every split places exactly 32 lanes.
   splits = []
   vec = min(max_vec, run)
   while vec >= 1:
     n_lanes = run // vec
-    if _LANES % n_lanes == 0:
-      splits.append((_LANES // n_lanes, n_lanes, vec))
+    splits.append((_LANES // n_lanes, n_lanes, vec))
     vec //= 2
   # Widest vector first, so the first split that divides `A` is also the one with
-  # the fewest, widest loads. `run` is a power of two at most `_LANES`, so the
-  # narrowest vector always leaves a lane count that divides the warp and the
-  # list is never empty; falling back on it puts the fewest lanes on `A`, which is
-  # the likeliest to divide it, and the caller declines if even that does not.
+  # the fewest, widest loads. A wider vector puts more lanes on `A` and so asks
+  # more of it; the last split asks the least, and is never absent, so it is what
+  # a hard-to-divide `A` falls back on -- and the caller declines if even that
+  # does not divide it.
   return next((s for s in splits if num_a % s[0] == 0), splits[-1])
 
 def _warps_on_m(shape: tuple[int, ...], bitwidth: int) -> _Mapping | None:
@@ -376,9 +367,6 @@ class Plan:
   def grid_names(self) -> tuple[str, ...]:
     return ('m', 'a', 'n')[: len(self.shape)]
 
-  def tile_regs(self) -> int:
-    return math.prod(self.block) // _WARPGROUP
-
   def tile_starts(self, indices) -> tuple[Any, ...]:
     "Returns a tile's element offset per axis, given its block index per axis."
     return tuple(i * b for i, b in zip(indices, self.block, strict=True))
@@ -416,23 +404,15 @@ def _block(fit: _Mapping, shape, itemsize: int) -> tuple[int, ...] | None:
   if fit.n_multiple is None:
     tail = ()
   else:
-    # The floor wins over the cap: a block below what the base tile spans has no
-    # layout, so asking for one is asking for nothing.
-    cap_n = min(
-      gpu_utils.CACHE_LINE_SIZE_BYTES // itemsize,
-      budget // (fit.m_multiple * num_a),
+    block_n_ceil = max(
+      fit.n_multiple,
+      min(gpu_utils.CACHE_LINE_SIZE_BYTES // itemsize, budget // (fit.m_multiple * num_a))
     )
-    tail = (
-      next(
-        divisors(
-          shape[-1], max(cap_n, fit.n_multiple), multiple_of=fit.n_multiple
-        )
-      ),
-    )
+    tail = (next(divisors(shape[-1], block_n_ceil, multiple_of=fit.n_multiple)),)
 
   row_regs = num_a * math.prod(tail)
-  cap_m = min(shape[0], budget // row_regs)
-  rows = next(divisors(shape[0], cap_m, multiple_of=fit.m_multiple), None)
+  block_m_ceil = min(shape[0], budget // row_regs)
+  rows = next(divisors(shape[0], block_m_ceil, multiple_of=fit.m_multiple), None)
   return None if rows is None else (rows, num_a, *tail)
 
 
@@ -459,36 +439,26 @@ def _score(fit: _Mapping, block: tuple[int, ...], itemsize: int):
 def plan(shape: tuple[int, ...], itemsize: int) -> Plan:
   """Plans a normalization of a canonical `(M, A)` or `(M, A, N)` array.
 
-  The plan is a function of the shape and the dtype alone: what a tile can be is
-  settled by the layouts the shape admits and by the register budget, and there
-  is no bound left for a caller to pass. See `_block`.
-
   Args:
     shape: The canonical shape of `x`; see the module docstring.
     itemsize: Bytes per element of `x`.
 
   Every mapping the shape admits is blocked (`_mappings`, `_block`) and the tile
-  that reads best wins (`_score`). Nothing else is compared: a mapping is a place
-  to put 128 threads, they all put every one of them to work, and what is left to
-  tell them apart is the shape of the loads they make.
+  that reads best wins (`_score`).
 
   Raises:
-    NotImplementedError: if no mapping fits, saying what they wanted. This allows
-    us to fall back to another implementation.
+    NotImplementedError: if no mapping fits.
   """
   # Treat (M,A,1) as (M,A)
   if len(shape) == 3 and shape[2] == 1:
     shape = shape[:2]
   fits = _mappings(shape, bitwidth=itemsize * 8)
   viable = [
-    (fit, block)
-    for fit in fits
+    (fit, block) for fit in fits
     if (block := _block(fit, shape, itemsize)) is not None
   ]
   if not viable:
-    raise NotImplementedError(
-      f'No thread mapping fits {shape}'
-    )
+    raise NotImplementedError(f'No thread mapping fits {shape}')
 
   fit, block = max(viable, key=lambda fb: _score(*fb, itemsize))
   return Plan(shape=shape, block=block, layout=fit.layout)

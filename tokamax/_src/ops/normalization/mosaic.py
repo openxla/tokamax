@@ -96,6 +96,8 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     p = mosaic_tiling.plan(x_shape, dtype.itemsize)
     x_shape = p.shape # `plan` may drop a degenerate trailing axis
 
+    # TODO: see if named arguments work here.
+    # TODO: derive block sizes in the config.
     def kernel(*refs):
       it = iter(refs)  # Inputs then outputs, optional ones only if present.
       take = lambda present: next(it) if present else None
