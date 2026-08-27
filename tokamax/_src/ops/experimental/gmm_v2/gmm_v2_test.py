@@ -1276,9 +1276,10 @@ class GmmTest(parameterized.TestCase):
           (jnp.float8_e4m3fn, jnp.float8_e4m3fn),
           (jnp.float8_e4m3fn, jnp.float8_e5m2),
       ],
+      pin_tiles=[True, False],
   )
   def test_tgmm_dynamic_quant_basic(
-      self, batch_size, in_size, out_size, num_groups, dtype_pair
+      self, batch_size, in_size, out_size, num_groups, dtype_pair, pin_tiles
   ):
     """Kernel quantizes bf16 lhs/dout per m-tile; compare against f32 tgmm."""
     if test_utils.get_tpu_version() < 7:
@@ -1300,10 +1301,16 @@ class GmmTest(parameterized.TestCase):
         num_groups,
     )
 
-    # tile_m=128 with 8-25 rows per group keeps each group inside one m-tile,
-    # while tile_k/tile_n=256 force 2 k-tiles and 2 n-tiles.
-    tile_info = gmm_v2.TileSizes(
-        tile_m=128, tile_k=256, tile_n=256, bucket_base=128
+    # Pinned: tile_m=128 with 8-25 rows per group keeps each group inside one
+    # m-tile, while tile_k/tile_n=256 force 2 k-tiles and 2 n-tiles. Unpinned,
+    # calculate_tgmm_tiling returns (128, 512, 512) at this shape -- a single
+    # k/n tile -- so only the pinned arm covers scales being associated with the
+    # right k/n slice, and the unpinned arm is the smoke test that the tiler
+    # runs at all on the quant path.
+    tile_info = (
+        gmm_v2.TileSizes(tile_m=128, tile_k=256, tile_n=256, bucket_base=128)
+        if pin_tiles
+        else tgmm_v2.calculate_tgmm_tiling
     )
     tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
     actual = tgmm_v2.tgmm_v2(
@@ -1321,6 +1328,10 @@ class GmmTest(parameterized.TestCase):
     # for num_groups=5 (groups of 44, 45, ...), num_groups=16 (groups of ~8)
     # 16 groups means each output is smaler than the 5 groups.
     # So multiplying RMS makes the atol dimensionless.
+    # The 5e-1 coefficient is empirical: the per-element error is heavy-tailed
+    # (sigma/RMS 0.024, max/RMS 0.27), so this is a max over ~1e6 samples rather
+    # than a multiple of sigma. Worst measured need is 0.39, for a
+    # float8_e5m2 dout.
     chex.assert_trees_all_close(
         actual.astype(jnp.float32),
         expected,
@@ -1379,6 +1390,159 @@ class GmmTest(parameterized.TestCase):
         rtol=1e-1,
         atol=5e-1 * float(jnp.sqrt(jnp.mean(jnp.square(expected)))),
     )
+
+  @pytest.mark.long
+  def test_tgmm_dynamic_quant_ragged_groups(self):
+    """Empty and tiny groups, a non-zero group_offset, and all-zero columns.
+
+    The tiny groups start mid-tile, so local_offset != 0 and most tiles are
+    truncated on both ends. The zeroed lhs column / grad column are what make
+    the where(scale == 0, 0, 1/scale) guard load-bearing: that column's absmax
+    is 0, so an unguarded 1/scale gives inf and then 0*inf = NaN. Note an empty
+    *group* does not reach the guard -- the grid skips it and the output is
+    zeroed by DMA -- so verified by mutation: dropping the guard fails this
+    test and no other.
+    """
+    if test_utils.get_tpu_version() < 7:
+      self.skipTest("float8_e4m3fn matmul requires TPUv7+")
+
+    batch_size = in_size = out_size = 256
+    num_groups, offset = 8, 2
+    num_local_groups = num_groups - offset
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    # Sums to batch_size. Globals 3, 6, 7 are empty; at group_offset=2 they are
+    # local indices 1, 4, 5.
+    group_sizes = jnp.array([1, 7, 15, 0, 200, 33, 0, 0], dtype=jnp.int32)
+    empty_local = (1, 4, 5)
+    # Force a zero absmax on one k column and one n column.
+    lhs = lhs.at[:, 3].set(0)
+    grad = grad.at[:, 5].set(0)
+    group_offset = jnp.array(offset, dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.astype(jnp.float32).swapaxes(0, 1),
+        grad.astype(jnp.float32),
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+    )
+
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=256, bucket_base=128
+    )
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_local_groups, group_offset)
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+        tile_info=tile_info,
+        preferred_element_type=jnp.bfloat16,
+        lhs_quant_dtype=jnp.float8_e4m3fn,
+        rhs_quant_dtype=jnp.float8_e4m3fn,
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    for i in empty_local:
+      self.assertTrue(jnp.all(actual[i] == 0), f"group {i} is not zeroed")
+    self.assertFalse(jnp.any(jnp.isnan(actual)), "zero-scale guard let NaN out")
+    # Tolerance rationale: see test_tgmm_dynamic_quant_basic.
+    chex.assert_trees_all_close(
+        actual.astype(jnp.float32),
+        expected,
+        rtol=1e-1,
+        atol=5e-1 * float(jnp.sqrt(jnp.mean(jnp.square(expected)))),
+    )
+
+  @pytest.mark.long
+  def test_tgmm_dynamic_quant_padding(self):
+    """Unaligned size_k and size_n together.
+
+    in_size=255 leaves a pad column in the k-tile, so lhs_scale is computed over
+    it; out_size=300 aligns to 384 across 3 n-tiles, so rhs_scale covers columns
+    300..383 of the last one. k and n are independent output axes, so testing
+    both at once cannot mask a bug in either.
+    """
+    if test_utils.get_tpu_version() < 7:
+      self.skipTest("float8_e4m3fn matmul requires TPUv7+")
+
+    batch_size, in_size, out_size, num_groups = 128, 255, 300, 5
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_tgmm(
+        lhs.astype(jnp.float32).swapaxes(0, 1),
+        grad.astype(jnp.float32),
+        group_sizes,
+        num_groups,
+    )
+
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=128, bucket_base=128
+    )
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_groups,
+        tile_info=tile_info,
+        preferred_element_type=jnp.bfloat16,
+        lhs_quant_dtype=jnp.float8_e4m3fn,
+        rhs_quant_dtype=jnp.float8_e4m3fn,
+    )
+    self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+    # Tolerance rationale: see test_tgmm_dynamic_quant_basic.
+    chex.assert_trees_all_close(
+        actual.astype(jnp.float32),
+        expected,
+        rtol=1e-1,
+        atol=5e-1 * float(jnp.sqrt(jnp.mean(jnp.square(expected)))),
+    )
+
+  def test_tgmm_dynamic_quant_input_validation(self):
+    """The API contract from validate_dynamic_quant."""
+    lhs = jnp.zeros((128, 256), dtype=jnp.bfloat16)
+    rhs = jnp.zeros((128, 256), dtype=jnp.bfloat16)
+    rhs_scale = jnp.ones((1, 1, 256), dtype=jnp.float32)
+    e4 = jnp.float8_e4m3fn
+
+    with self.assertRaisesRegex(ValueError, "must be set together"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, None, e4, None)
+    with self.assertRaisesRegex(ValueError, "must be set together"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, None, None, e4)
+    with self.assertRaisesRegex(ValueError, "must differ from the input dtype"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, None, lhs.dtype, e4)
+    with self.assertRaisesRegex(ValueError, "must differ from the input dtype"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, None, e4, rhs.dtype)
+    with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, rhs_scale, e4, e4)
+    with self.assertRaisesRegex(ValueError, ">=16-bit"):
+      tgmm_v2.validate_dynamic_quant(
+          lhs.astype(jnp.float8_e5m2), rhs, None, e4, e4
+      )
+    with self.assertRaisesRegex(NotImplementedError, "integer input"):
+      tgmm_v2.validate_dynamic_quant(
+          lhs.astype(jnp.int32), rhs, None, e4, e4
+      )
+
+    # Wired into the public API, not merely reachable as a helper.
+    with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+      tgmm_v2.tgmm_v2(
+          lhs,
+          rhs,
+          jnp.array([128], dtype=jnp.int32),
+          1,
+          rhs_scale,
+          preferred_element_type=jnp.bfloat16,
+          lhs_quant_dtype=e4,
+          rhs_quant_dtype=e4,
+      )
 
 
 if __name__ == "__main__":
