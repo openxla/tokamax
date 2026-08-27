@@ -93,13 +93,8 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     has_scale = scale is not None
     has_offset = offset is not None
 
-    p = mosaic_tiling.plan(
-      x_shape, dtype.itemsize, block_m=config.block_m, block_n=config.block_n
-    )
-    # `plan` may drop a degenerate trailing axis, so it is what says the rank.
-    x_shape = p.shape
-
-    axis_a = mosaic_tiling.REDUCE_AXIS
+    p = mosaic_tiling.plan(x_shape, dtype.itemsize)
+    x_shape = p.shape # `plan` may drop a degenerate trailing axis
 
     def kernel(*refs):
       it = iter(refs)  # Inputs then outputs, optional ones only if present.
@@ -110,35 +105,27 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
       index = p.out_index()
       stat_index = mosaic_tiling.drop_reduced(index)
-      # The tile is one load: every axis is tiled exactly, so the reduced axis
-      # comes whole and in one piece. See `mosaic_tiling`.
-      x = plgpu.load(x_gmem.at[index], layout=p.layout, optimized=False)
-      x = x.astype(jnp.float32)
+      x = plgpu.load(x_gmem.at[index], layout=p.layout, optimized=False).astype(jnp.float32)
 
-      reduce = lambda v: jnp.sum(v, axis=axis_a) / x_shape[axis_a]
       # The stats span every axis but the reduced one.
-      stat_dims = tuple(d for d in range(len(p.block)) if d != axis_a)
+      stat_dims = tuple(d for d in range(len(p.block)) if d != 1)
       bcast = lambda a: jax.lax.broadcast_in_dim(a, p.block, stat_dims)
 
       if subtract_mean:
-        mean = reduce(x)
+        mean = jnp.mean(x, axis=1)
         x -= bcast(mean)
         if mean_gmem is not None:
           mean_gmem[stat_index] = mean
-      rstddev = jax.lax.rsqrt(reduce(x * x) + epsilon)
+      rstddev = jax.lax.rsqrt(jnp.mean(x * x, axis=1) + epsilon)
       if rstd_gmem is not None:
         rstd_gmem[stat_index] = rstddev
 
-      # The 1D params come straight from GMEM, whole, as the reduced axis is not
-      # blocked. `optimized=False` because they are not in SMEM; inference picks
-      # their layout off the tile they multiply.
       def param(ref):
         loaded = plgpu.load(ref, optimized=False).astype(jnp.float32)
         # The params span only the reduced axis, so they spread along the rest.
-        return jax.lax.broadcast_in_dim(loaded, p.block, (axis_a,))
+        return jax.lax.broadcast_in_dim(loaded, p.block, (1,))
 
       x = x * bcast(rstddev)
-      # `y = x_norm * (scale + scale_offset) + offset`; see `base.Normalization`.
       if scale_ref is not None:
         x *= param(scale_ref) + scale_offset
       if offset_ref is not None:
@@ -152,9 +139,10 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         jax.ShapeDtypeStruct(x_shape, dtype),
         *[stat] * (return_mean + return_residuals),
       ),
-      grid=p.grid,
-      grid_names=p.grid_names,
-      compiler_params=mosaic_tiling.WARPGROUP_SEMANTICS,
+      grid=p.grid(),
+      grid_names=p.grid_names(),
+      compiler_params=plgpu.CompilerParams(
+        lowering_semantics=plgpu.LoweringSemantics.Warpgroup)
     )(
       x.reshape(x_shape),
       *[a for a in (scale, offset) if a is not None],
@@ -172,9 +160,9 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    # Both block sizes are upper bounds; `plan` raises one below what the layout
-    # needs and lowers one the register budget cannot afford, so a config
-    # borrowed from the Triton kernel needs no fixing up here.
+    # The config is carried for its cache key and for the Triton VJP; the forward
+    # kernel takes no block sizes, `mosaic_tiling.plan` settling the tile from the
+    # shape and the register budget alone.
     return triton_config.get_heuristics_config(
       *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
     )
@@ -185,5 +173,4 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    # `cp.async` staging and plain GMEM stores: no TMA or WGMMA needed.
     return gpu_utils.has_mosaic_gpu_support(device)
