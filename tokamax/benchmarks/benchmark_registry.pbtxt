@@ -31,7 +31,7 @@ benchmarks {
     runner_label: "linux-x86-ct6e-44-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
-    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn,cuequivariance" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn" }
   }
 
   environment_configs {
@@ -39,7 +39,7 @@ benchmarks {
     runner_label: "linux-x86-tpu7x-56-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
-    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn,cuequivariance" }
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,cudnn" }
   }
 
   metrics {
@@ -51,6 +51,47 @@ benchmarks {
   }
   metrics {
     pattern: "attention_numerics/.*"
+    unit: "abs"
+    stats {
+      stat: MEDIAN
+    }
+  }
+}
+
+benchmarks {
+  name: "tokamax_triangle_attention"
+  description: "Runs the Tokamax triangle_attention benchmark."
+  owner: "Tokamax Team"
+  workload {
+    action: "./ml_actions/actions/workload_executors/python"
+    action_inputs { key: "script_path" value: "tokamax/benchmarks/triangle_attention.py" }
+    action_inputs { key: "python_version" value: "3.13" }
+    action_inputs { key: "extras" value: "bench" }
+  }
+
+  environment_configs {
+    id: "gpu-h100"
+    runner_label: "linux-x86-a3-8g-h100-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15@sha256:98d10696f84ab6b4dff4356c8c654c3f142f002e804a80d22817450ca9574a7d"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
+  }
+
+  environment_configs {
+    id: "gpu-b200"
+    runner_label: "linux-x86-a4-224-b200-1gpu"
+    container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15@sha256:98d10696f84ab6b4dff4356c8c654c3f142f002e804a80d22817450ca9574a7d"
+    workload_action_inputs { key: "extras_hw" value: "cuda" }
+  }
+
+  metrics {
+    pattern: "triangle_attention/.*"
+    unit: "ms"
+    stats {
+      stat: MEDIAN
+    }
+  }
+  metrics {
+    pattern: "triangle_attention_numerics/.*"
     unit: "abs"
     stats {
       stat: MEDIAN
