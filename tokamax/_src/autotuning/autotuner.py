@@ -22,6 +22,7 @@ from concurrent.futures import process
 import dataclasses
 import functools
 import os
+import sys
 import typing
 from typing import Any, cast
 
@@ -142,7 +143,7 @@ class Autotuner:
             "Cannot specify a `compile_executor_fn` when using a"
             " `ProcessPoolExecutor` executor."
         )
-      with self.compile_executor_fn(max_workers=os.cpu_count()) as compile_exec:  # pyrefly: ignore[unexpected-keyword]
+      with self.compile_executor_fn(max_workers=get_max_workers()) as compile_exec:  # pyrefly: ignore[unexpected-keyword]
         compiled = {
             compile_exec.submit(_compile, fn_factory, cfg, args, kwargs): cfg
             for cfg in configs
@@ -215,3 +216,16 @@ class Autotuner:
       logging.exception("all configs failed for %s", fn_factory)
 
     return results
+
+
+def get_max_workers() -> int:
+  """Returns the maximum number of workers for the autotuner."""
+  num_cpus = (
+      os.process_cpu_count() if sys.version_info >= (3, 13) else os.cpu_count()
+  )
+  if num_cpus is None:
+    num_cpus = 1
+    logging.info(
+        "Could not determine number of CPUs, defaulting to %d.", num_cpus
+    )
+  return num_cpus

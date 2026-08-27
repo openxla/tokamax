@@ -34,10 +34,10 @@ from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
-from tokamax._src.ops.experimental.mla import api as mla_api
-from tokamax._src.ops.experimental.mla import base as mla_base
 from tokamax._src.ops.experimental.kda import api as kda_api
 from tokamax._src.ops.experimental.kda import base as kda_base
+from tokamax._src.ops.experimental.mla import api as mla_api
+from tokamax._src.ops.experimental.mla import base as mla_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import api as normalization_api
@@ -397,13 +397,22 @@ def autotune(
         postfix={"Total microbenchmarks": sum(map(num_configs, bound_args))},
     )
 
-  custom_autotuner = autotuner.Autotuner()
-  if max_workers is not None:
-    custom_autotuner = autotuner.Autotuner(
-        compile_executor_fn=lambda **kwargs: futures.ThreadPoolExecutor(
-            max_workers=max_workers
-        )
-    )
+  max_workers = (
+      autotuner.get_max_workers() if max_workers is None else max_workers
+  )
+
+  logging.info(
+      "tokamax.autotune: machine has %d available CPU cores, and"
+      "will use max_workers=%d.",
+      autotuner.get_max_workers(),
+      max_workers,
+  )
+
+  custom_autotuner = autotuner.Autotuner(
+      compile_executor_fn=lambda **kwargs: futures.ThreadPoolExecutor(
+          max_workers=max_workers
+      )
+  )
 
   for bound_arg in bound_args:
     try:
