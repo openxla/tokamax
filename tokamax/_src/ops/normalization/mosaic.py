@@ -34,11 +34,13 @@ from typing import ClassVar, override
 
 import jax
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.experimental.mosaic.gpu import TiledLayout
+from jax.experimental import pallas as pl
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src.ops import op
+import numpy as np
 from tokamax._src.ops.normalization import base
-from tokamax._src.ops.normalization import mosaic_tiling
 from tokamax._src.ops.normalization import pallas_triton_config as triton_config
 from tokamax._src.ops.normalization import pallas_triton_vjp
 
@@ -47,6 +49,19 @@ Config = triton_config.Config
 Key = triton_config.Key
 FusedInputArray = base.FusedInputArray
 
+def _vector_length(block_n: int, A: int, bitwidth: int) -> int:
+  vec = (8 * 16) // bitwidth  # 16-byte vectors.
+  while True:
+    if (block_n % vec == 0 or
+      (vec % block_n == 0 and A % vec == 0 and (A // vec) % 32 == 0)):
+      return vec
+    vec //= 2
+
+def _sub_blocks(block_m, block_n):
+    for amt_m in [4,2,1]:
+      amt_n = 4 // amt_m
+      if block_m % amt_m == 0 and block_n % amt_n == 0:
+        return (amt_m, amt_n)
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
@@ -86,18 +101,17 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
     dtype = x.dtype
     orig_x_shape = x.shape
-    # `(M, A)`, or `(M, A, N)` when the reduced axis is not the minor one.
-    x_shape = triton_config.canonicalize_shape(orig_x_shape, axis)
+    x_shape = triton_config.canonicalize_shape_3d(orig_x_shape, axis)
 
     return_mean = return_residuals and subtract_mean
     has_scale = scale is not None
     has_offset = offset is not None
 
-    p = mosaic_tiling.plan(x_shape, dtype.itemsize)
-    x_shape = p.shape # `plan` may drop a degenerate trailing axis
+    A = x_shape[1]
+    block = (config.block_m, A, config.block_n or 1)
+    block_m, _, block_n = block
 
     # TODO: see if named arguments work here.
-    # TODO: derive block sizes in the config.
     def kernel(*refs):
       it = iter(refs)  # Inputs then outputs, optional ones only if present.
       take = lambda present: next(it) if present else None
@@ -105,13 +119,35 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       y_gmem, mean_gmem = next(it), take(return_mean)
       rstd_gmem = take(return_residuals)
 
-      index = p.out_index()
-      stat_index = mosaic_tiling.drop_reduced(index)
-      x = plgpu.load(x_gmem.at[index], layout=p.layout, optimized=False).astype(jnp.float32)
+      index = tuple(pl.ds(s * b, b) for (s, b) in
+        zip([jax.lax.axis_index(i) for i in "man"], block))
 
-      # The stats span every axis but the reduced one.
-      stat_dims = tuple(d for d in range(len(p.block)) if d != 1)
-      bcast = lambda a: jax.lax.broadcast_in_dim(a, p.block, stat_dims)
+      vec = _vector_length(block_n, A, dtype.itemsize * 8)
+      # Start with a block of size (block_m, A, block_n)
+      amt_m, amt_n = _sub_blocks(block_m, block_n)
+      tile_spec = [block, (block_m // amt_m, A // 32, block_n // amt_n)]
+      if vec >= block_n:
+        vector_dim = -2
+        tile_spec.append((vec, block_n),)
+      else:
+        vector_dim=-1
+        tile_spec.append((A // 32, vec),)
+      # print("GOT ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
+
+      # TODO: alphafold_alphafold_384res_128chan_axis0_forward
+      # and alphafold_alphafold_768res_128chan_axis0_forward are too slow!
+      l = TiledLayout(
+        plgpu.Tiling(tuple(tile_spec)),
+        warp_dims=(-8, -6),
+        lane_dims=(-7,),
+        vector_dim=vector_dim,
+        _check_canonical=False).canonicalize()
+      layout = plgpu.Layout.TILED(l.tiling, warp_dims=l.warp_dims,
+                           lane_dims=l.lane_dims, vector_dim=l.vector_dim)
+
+      stat_index = index[:1] + index[2:]
+      x = plgpu.load(x_gmem.at[index], layout=layout, optimized=False).astype(jnp.float32)
+      bcast = lambda a: jax.lax.broadcast_in_dim(a, block, (0, 2))
 
       if subtract_mean:
         mean = jnp.mean(x, axis=1)
@@ -125,7 +161,7 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       def param(ref):
         loaded = plgpu.load(ref, optimized=False).astype(jnp.float32)
         # The params span only the reduced axis, so they spread along the rest.
-        return jax.lax.broadcast_in_dim(loaded, p.block, (1,))
+        return jax.lax.broadcast_in_dim(loaded, block, (1,))
 
       x = x * bcast(rstddev)
       if scale_ref is not None:
@@ -134,15 +170,17 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         x += param(offset_ref)
       y_gmem[index] = x.astype(dtype)
 
-    stat = jax.ShapeDtypeStruct(mosaic_tiling.drop_reduced(p.shape), jnp.float32)
+    stat = jax.ShapeDtypeStruct(x_shape[:1] + x_shape[2:], jnp.float32)
+    for (s,b) in zip(x_shape, block):
+      assert s % b == 0
     outs = plgpu.kernel(
       kernel,
       out_type=(
         jax.ShapeDtypeStruct(x_shape, dtype),
         *[stat] * (return_mean + return_residuals),
       ),
-      grid=p.grid(),
-      grid_names=p.grid_names(),
+      grid=tuple(s//b for (s,b) in zip(x_shape, block)),
+      grid_names=('m', 'a', 'n'),
       compiler_params=plgpu.CompilerParams(
         lowering_semantics=plgpu.LoweringSemantics.Warpgroup)
     )(
@@ -162,9 +200,6 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    # The config is carried for its cache key and for the Triton VJP; the forward
-    # kernel takes no block sizes, `mosaic_tiling.plan` settling the tile from the
-    # shape and the register budget alone.
     return triton_config.get_heuristics_config(
       *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
     )
