@@ -17,7 +17,7 @@
 
 import functools
 import math
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Sequence
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -87,32 +87,33 @@ def _calculate_bwd_vmem_bytes(
   dtype_bytes = jnp.dtype(dtype).itemsize
   h_alloc = 1 << (h_block_size - 1).bit_length()
   return (
-      # x tile (B, H) in input dtype (double buff for pallas_call input: 2 * dt)
+      # (B, H) shapes:
+      # x tile (B, H) in input dtype (double buff for in_specs: 2 * dt)
       # + x_grad_tile accumulator (B, H) in float32 (single scratch buffer: 4B)
       # + dot_general intermediate result in accumulate_x_grad (float32: 4B)
       b_block_size * h_alloc * (2 * dtype_bytes + 8)
+      # (B) shapes
       # labels (8 bytes), lse (8 bytes), and dout (8 bytes) tiles (all double
-      # buffered for pallas_call inputs, 24 bytes per batch elem total)
+      # buffered for in_specs inputs, 24 bytes per batch elem total)
       + 2 * 3 * 4 * b_block_size
-      # w tile (H, V) in input dtype (double buff for pallas_call input: 2 * dt)
+      # (H, V) shapes:
+      # 2x w tiles (w_v & w_vm1 double buff for in_specs: 4 * dt)
       # + w_grad_tile accumulator (H, V) in float32 (single scratch buffer: 4B)
       # + dot_general intermediate result in accumulate_w_grad (float32: 4B)
-      + h_alloc * v_block_size * (2 * dtype_bytes + 8)
+      + h_alloc * v_block_size * (4 * dtype_bytes + 8)
+      # (B, V) shapes:
       # logits/softmax tile (B, V) in float32 accumulator:
-      # In-place softmax and target subtraction in compute_s:
-      #   1) xw_scratch_ref (explicit VMEM scratch buffer: 4B)
-      #   2) diff = xw_scratch_ref - lse (HLO stack temporary: 4B)
-      #   3) jnp.exp(diff) * dout (HLO stack temporary: 4B)
+      # Ping-pong xw_scratch_ref: 2 x (B, V) explicit float32 buffers (8B/elem)
+      # + 1 simultaneous float32 stack buffer during compute_s (4B/elem)
       # In-place target subtraction with broadcasted_iota/jnp.where uses zero
-      # extra (B, V) buffers
-      # Total 3 simultaneous (B, V) float32 buffers (12 bytes/elem across
-      # b_block_size)
+      # extra (B, V) buffers. Total 3 simultaneous (B, V) float32 buffers
+      # (12B/elem)
       + 3 * b_block_size * v_block_size * 4
   )
 
 
 def _get_vmem_limit_bytes() -> int:
-  return int(0.5 * pltpu.get_tpu_info().vmem_capacity_bytes)
+  return int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)
 
 
 def _get_heuristic_config(
@@ -190,14 +191,14 @@ def _get_heuristic_config(
         b_block_size * h_block_size * (2 * dtype_bytes + 8) + 24 * b_block_size
     )
     # per_v_bytes accounts for all VMEM costs per column of V:
-    #   - w tile (double-buffered in dtype: 2 * dt) + w_grad_tile (4B) +
-    #       dot_general res (4B) = h_block_size * (2 * dtype_bytes + 8)
-    #   - 3 simultaneous float32 (B, V) buffers on the VMEM stack during
-    #     compute_s: (3 * 4 = 12 bytes per element across b_block_size):
-    #       1) xw_scratch_ref (explicit VMEM scratch)
-    #       2) diff = xw_scratch_ref - lse (HLO stack temporary during softmax)
-    #       3) jnp.exp(...) * dout (HLO stack temporary during softmax)
-    per_v_bytes = h_block_size * (2 * dtype_bytes + 8) + 12 * b_block_size
+    #   - 2x w tiles (w_v & w_vm1 double-buffered in dtype: 4 * dt) +
+    #       w_grad_tile (4B) + dot_general res (4B) =
+    #       h_block_size * (4 * dtype_bytes + 8)
+    #   - 3 simultaneous float32 (B, V) buffers on the VMEM stack:
+    #       1-2) 2x xw_scratch_ref (explicit VMEM scratch ping-pong: 8B/elem)
+    #       3) diff/prob temporary on the stack during compute_s (4B/elem)
+    #       Total 3 * 4 = 12 bytes per element across b_block_size
+    per_v_bytes = h_block_size * (4 * dtype_bytes + 8) + 12 * b_block_size
   else:
     # fixed_bytes accounts for VMEM costs that do not scale with V:
     #   - x tile = 2 * b_block_size * h_block_size * dtype_bytes
@@ -223,18 +224,53 @@ def _get_heuristic_config(
   max_v = min(v_dim, max_v_vmem)
   max_v_aligned = max(128, (max_v // 128) * 128)
 
-  # First try to find a divisor of v_dim that fits in VMEM
+  try:
+    max_cores = pltpu.get_tpu_info().num_cores
+  except Exception:  # pylint: disable=broad-except
+    max_cores = 1
+
+  def is_mc_compatible(v: int) -> bool:
+    if max_cores <= 1:
+      return True
+    n_v_b = math.ceil(v_dim / v)
+    return n_v_b < max_cores or n_v_b % max_cores == 0
+
+  # 1. First try to find a divisor of v_dim that fits in VMEM and is multi-core
+  # compatible.
   v_block_size = None
   for v in range(max_v_aligned, 127, -128):
     if (
         v_dim % v == 0
+        and is_mc_compatible(v)
         and calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype)
         <= vmem_limit_bytes
     ):
       v_block_size = v
       break
 
-  # If no divisor fits, pick the largest multiple of 128 that fits
+  # 2. If no divisor fits, pick a multiple of 128 that is multi-core compatible
+  if v_block_size is None:
+    for v in range(max_v_aligned, 127, -128):
+      if (
+          is_mc_compatible(v)
+          and calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype)
+          <= vmem_limit_bytes
+      ):
+        v_block_size = v
+        break
+
+  # 3. Fallback: try divisor of v_dim that fits in VMEM
+  if v_block_size is None:
+    for v in range(max_v_aligned, 127, -128):
+      if (
+          v_dim % v == 0
+          and calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype)
+          <= vmem_limit_bytes
+      ):
+        v_block_size = v
+        break
+
+  # 4. Fallback: pick the largest multiple of 128 that fits
   if v_block_size is None:
     for v in range(max_v_aligned, 127, -128):
       if (
@@ -406,6 +442,183 @@ def calculate_xw_tiled(
     )
 
 
+def _bytes(tensor: jt.Array | jax.ShapeDtypeStruct) -> int:
+  """Computes total bytes of a tensor or ShapeDtypeStruct."""
+  return math.prod(tensor.shape) * jnp.dtype(tensor.dtype).itemsize
+
+
+def linear_softmax_cross_entropy_loss_fwd_cost_estimate(
+    x: Real[Array, "B H"] | jax.ShapeDtypeStruct,
+    labels: Integer[Array, "B"] | jax.ShapeDtypeStruct,
+    w: Real[Array, "H V"] | jax.ShapeDtypeStruct,
+    out_type: Sequence[jax.ShapeDtypeStruct] | None = None,
+) -> pl.CostEstimate:
+  """Calculates the theoretical hardware cost estimate for the forward pass kernel.
+
+  This provides an accurate model of computational (FLOPs), transcendental,
+  and memory bandwidth (bytes accessed) costs for profilers and runtime cost
+  models
+  (e.g., XProf / HLO CostAnalysis).
+
+  FLOPs Breakdown:
+    1. Logit Projection Matmul (X @ W):
+       - Input X: (B, H), Weight W: (H, V)
+       - Standard matmul FLOPs: 2 * B * H * V (1 multiply + 1 accumulate per
+       element).
+    2. Online LogSumExp Accumulation (jax.nn.logsumexp across V blocks):
+       - Maximum subtraction: B * V ops
+       - Exponentiation: B * V ops (tracked in transcendentals)
+       - Reduction sum: B * V ops
+       - Logarithm of sum: B ops (tracked in transcendentals)
+       - Running logaddexp combining blocks: 2 * B * V ops
+       - Total elementwise reduction FLOPs: 2 * B * V.
+    3. Sparse Target Loss Reduction:
+       - Target extraction / one-hot subtraction: B ops
+       - Total loss FLOPs: B.
+
+    Total FLOPs = 2 * B * H * V + 2 * B * V + B.
+
+  Transcendental Operations Breakdown:
+    - Exponentiation (exp) in logsumexp across vocabulary V: B * V ops.
+    - Logarithm (log) in logsumexp per batch element: B ops.
+    Total Transcendentals = B * V + B.
+
+  HBM Memory Traffic Breakdown:
+    - Inputs read from HBM:
+      - Activations x: B * H * sizeof(dtype_x)
+      - Labels: B * sizeof(dtype_labels)
+      - Weights w: H * V * sizeof(dtype_w)
+    - Outputs written to HBM:
+      - Loss: B * sizeof(float32) (4 bytes)
+      - LSE: B * sizeof(float32) (4 bytes)
+    Total Bytes Accessed = sum(input_bytes) + sum(output_bytes).
+
+  Args:
+    x: Input activation tensor or ShapeDtypeStruct with shape (B, H).
+    labels: Target label tensor or ShapeDtypeStruct with shape (B,).
+    w: Weight projection tensor or ShapeDtypeStruct with shape (H, V).
+    out_type: Optional sequence of output ShapeDtypeStructs for loss and LSE.
+
+  Returns:
+    A `pl.CostEstimate` object containing flops, transcendentals, and
+    bytes_accessed.
+  """
+  b_dim = x.shape[0]
+  h_dim = x.shape[1]
+  v_dim = w.shape[1]
+
+  matmul_flops = 2 * b_dim * h_dim * v_dim
+  reduction_flops = 2 * b_dim * v_dim + b_dim
+  total_flops = matmul_flops + reduction_flops
+
+  transcendentals = b_dim * v_dim + b_dim
+
+  inputs = [x, labels, w]
+  input_bytes = sum(_bytes(t) for t in inputs)
+  if out_type is not None:
+    output_bytes = sum(_bytes(t) for t in out_type)
+  else:
+    output_bytes = 2 * b_dim * 4
+
+  return pl.CostEstimate(
+      flops=int(total_flops),
+      transcendentals=int(transcendentals),
+      bytes_accessed=int(input_bytes + output_bytes),
+  )
+
+
+def linear_softmax_cross_entropy_loss_bwd_cost_estimate(
+    dout: Real[Array, ""] | Real[Array, "B"] | jax.ShapeDtypeStruct,
+    x: Real[Array, "B H"] | jax.ShapeDtypeStruct,
+    labels: Integer[Array, "B"] | jax.ShapeDtypeStruct,
+    w: Real[Array, "H V"] | jax.ShapeDtypeStruct,
+    lse: Real[Array, "B"] | jax.ShapeDtypeStruct,
+    out_type: Sequence[jax.ShapeDtypeStruct] | None = None,
+) -> pl.CostEstimate:
+  """Calculates the theoretical hardware cost estimate for the backward pass kernel.
+
+  This accounts for forward logit recomputation, dense softmax derivative
+  computation
+  with in-kernel target subtraction, and backward matrix multiplications for
+  activation
+  and weight gradients.
+
+  FLOPs Breakdown:
+    1. Forward Logit Recomputation (X @ W):
+       - Input X: (B, H), Weight W: (H, V)
+       - Matmul FLOPs: 2 * B * H * V.
+    2. Dense Softmax Probability & Target Subtraction (compute_s):
+       - Subtract LSE from logits: (XW - LSE): B * V ops
+       - Exponentiation: exp(XW - LSE): B * V ops (tracked in transcendentals)
+       - In-kernel target subtraction and gradient scaling:
+         S = (prob - 1.0) * dout for target, prob * dout for non-targets: 2 * B
+         * V ops.
+       - Total elementwise FLOPs: 3 * B * V.
+    3. Weight Gradient Matrix Multiplication (W_grad = X^T @ S):
+       - Transposed activations X^T: (H, B), Softmax derivatives S: (B, V)
+       - Output W_grad: (H, V)
+       - Matmul FLOPs: 2 * B * H * V.
+    4. Activation Gradient Matrix Multiplication (X_grad = S @ W^T):
+       - Softmax derivatives S: (B, V), Transposed weights W^T: (V, H)
+       - Output X_grad: (B, H)
+       - Matmul FLOPs: 2 * B * H * V.
+
+    Total FLOPs = 6 * B * H * V + 3 * B * V.
+
+  Transcendental Operations Breakdown:
+    - Exponentiation (exp) in softmax probabilities: B * V ops.
+    Total Transcendentals = B * V.
+
+  HBM Memory Traffic Breakdown:
+    - Inputs read from HBM:
+      - Upstream gradient dout: dout.size * sizeof(dtype_dout)
+      - Activations x: B * H * sizeof(dtype_x)
+      - Labels: B * sizeof(dtype_labels)
+      - Weights w: H * V * sizeof(dtype_w)
+      - Forward LSE: B * sizeof(dtype_lse)
+    - Outputs written to HBM:
+      - Activation gradients x_grad: (num_cores * B_aligned * H_aligned) or (B *
+      H) * 4 bytes
+      - Weight gradients w_grad: (H_aligned * V_aligned) * 4 bytes
+    Total Bytes Accessed = sum(input_bytes) + sum(output_bytes).
+
+  Args:
+    dout: Upstream gradient tensor or ShapeDtypeStruct.
+    x: Input activation tensor or ShapeDtypeStruct with shape (B, H).
+    labels: Target label tensor or ShapeDtypeStruct with shape (B,).
+    w: Weight projection tensor or ShapeDtypeStruct with shape (H, V).
+    lse: Forward log-sum-exp tensor or ShapeDtypeStruct with shape (B,).
+    out_type: Optional sequence of output ShapeDtypeStructs for x_grad and
+      w_grad.
+
+  Returns:
+    A `pl.CostEstimate` object containing flops, transcendentals, and
+    bytes_accessed.
+  """
+  b_dim = x.shape[0]
+  h_dim = x.shape[1]
+  v_dim = w.shape[1]
+
+  matmul_flops = 3 * (2 * b_dim * h_dim * v_dim)
+  softmax_flops = 3 * b_dim * v_dim
+  total_flops = matmul_flops + softmax_flops
+
+  transcendentals = b_dim * v_dim
+
+  inputs = [dout, x, labels, w, lse]
+  input_bytes = sum(_bytes(t) for t in inputs)
+  if out_type is not None:
+    output_bytes = sum(_bytes(t) for t in out_type)
+  else:
+    output_bytes = (b_dim * h_dim + h_dim * v_dim) * 4
+
+  return pl.CostEstimate(
+      flops=int(total_flops),
+      transcendentals=int(transcendentals),
+      bytes_accessed=int(input_bytes + output_bytes),
+  )
+
+
 def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
     x,
     labels,
@@ -455,13 +668,25 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # Loss
       jax.ShapeDtypeStruct(shape=(b_dim,), dtype=jnp.float32),  # LSE
   ]
-  get_b_ds_fwd = lambda i: pl.ds(
+  get_b_ds = lambda i: pl.ds(
       i * b_block_size, jnp.minimum(b_block_size, b_dim - i * b_block_size)
   )
   loss_out_spec = pl.BlockSpec(
       (pl.BoundedSlice(b_block_size),),
-      lambda i, j, k: get_b_ds_fwd(i),
+      lambda i, j, k: (get_b_ds(i),),
       memory_space=pltpu.VMEM,
+  )
+  lse_out_spec = pl.BlockSpec(
+      (pl.BoundedSlice(b_block_size),),
+      lambda i, j, k: (get_b_ds(i),),
+      memory_space=pltpu.VMEM,
+  )
+
+  cost_estimate = linear_softmax_cross_entropy_loss_fwd_cost_estimate(
+      x=x,
+      labels=labels,
+      w=w,
+      out_type=out_type,
   )
 
   @pl.kernel(
@@ -476,9 +701,8 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
           vmem_limit_bytes=_get_vmem_limit_bytes(),
           disable_bounds_checks=True,
       ),
-      name=(
-          f"lce_fwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}"
-      ),
+      cost_estimate=cost_estimate,
+      name=f"lce_fwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}",
   )
   def fwd_kernel(
       x_hbm_ref,
@@ -552,7 +776,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
           )
           xw_tiled[...] = jnp.where(
               (v_index == num_v_blocks - 1) & (col_idx >= rem_v),
-              -jnp.inf, # forcing exp(-inf)=0, instead of 1
+              -jnp.inf,  # forcing exp(-inf)=0, instead of 1
               xw_tiled[...],
           )
         lse_block = jax.nn.logsumexp(xw_tiled[...], axis=-1)
@@ -576,9 +800,6 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
       def perform_loss_reduction():
         loss_ref[...] += lse_ref[...]
 
-    get_b_ds = lambda i: pl.ds(
-        i * b_block_size, jnp.minimum(b_block_size, b_dim - i * b_block_size)
-    )
     get_h_ds = lambda k: pl.ds(
         k * h_block_size, jnp.minimum(h_block_size, h_dim - k * h_block_size)
     )
@@ -608,11 +829,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         ],
         out_specs=[
             loss_out_spec,  # loss
-            pl.BlockSpec(
-                (pl.BoundedSlice(b_block_size),),
-                lambda i, j, k: (get_b_ds(i),),
-                memory_space=pltpu.VMEM,
-            ),  # lse
+            lse_out_spec,  # lse
         ],
         core_axis_name="core",
         dimension_semantics=(
@@ -701,9 +918,10 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
   h_dim = x.shape[-1]
   v_dim = w.shape[1]
 
-  # Constrain the memory spaces for x and w to prevent OOB accesses that occur
-  # when the memory spaces is placed in VMEM.
+  # Constrain the memory spaces for x, labels, and w to prevent OOB accesses
+  # that occur when the memory spaces is placed in VMEM.
   x = pltpu.with_memory_space_constraint(x, memory_space=pltpu.HBM)
+  labels = pltpu.with_memory_space_constraint(labels, memory_space=pltpu.HBM)
   w = pltpu.with_memory_space_constraint(w, memory_space=pltpu.HBM)
 
   # Forward
@@ -759,32 +977,41 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   num_b_blocks = math.ceil(b_dim / b_block_size)
   num_h_blocks = math.ceil(h_dim / h_block_size)
   num_v_blocks = math.ceil(v_dim / v_block_size)
-  num_stages = 2
-
   max_cores = pltpu.get_tpu_info().num_cores
   num_cores = math.gcd(num_v_blocks, max_cores)
   if num_cores == 0:
     num_cores = 1
   num_v_blocks_per_core = num_v_blocks // num_cores
+  num_v_steps = num_v_blocks_per_core + 1
   major_align = 32 // x.dtype.itemsize
   b_dim_aligned = int(math.ceil(b_dim / major_align) * major_align)
   h_dim_128_aligned = int(math.ceil(h_dim / 128) * 128)
   h_dim_8_aligned = int(math.ceil(h_dim / 8) * 8)
   v_dim_aligned = int(math.ceil(v_dim / 128) * 128)
 
+  out_type = [
+      jax.ShapeDtypeStruct(
+          (num_cores, b_dim_aligned, h_dim_128_aligned), dtype=jnp.float32
+      ),  # x_grad
+      jax.ShapeDtypeStruct(
+          (h_dim_8_aligned, v_dim_aligned), dtype=jnp.float32
+      ),  # w_grad
+  ]
+  cost_estimate = linear_softmax_cross_entropy_loss_bwd_cost_estimate(
+      dout=dout,
+      x=x,
+      labels=labels,
+      w=w,
+      lse=lse,
+      out_type=out_type,
+  )
+
   @pl.kernel(
-      out_type=[
-          jax.ShapeDtypeStruct(
-              (num_cores, b_dim_aligned, h_dim_128_aligned), dtype=jnp.float32
-          ),  # x_grad
-          jax.ShapeDtypeStruct(
-              (h_dim_8_aligned, v_dim_aligned), dtype=jnp.float32
-          ),  # w_grad
-      ],
+      out_type=out_type,
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
       scratch_types=(
           pltpu.VMEM(
-              (b_block_size, v_block_size), dtype=jnp.float32
+              (2, b_block_size, v_block_size), dtype=jnp.float32
           ),  # xw_scratch
           pltpu.VMEM(
               (b_block_size, h_block_size), dtype=jnp.float32
@@ -801,6 +1028,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           vmem_limit_bytes=_get_vmem_limit_bytes(),
           disable_bounds_checks=True,
       ),
+      cost_estimate=cost_estimate,
       name=(
           f"lce_bwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}"
           f"_cores_{num_cores}"
@@ -828,7 +1056,8 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         dout_ref,
         x_ref,
         labels_ref,
-        w_ref,
+        w_v_ref,
+        w_vm1_ref,
         lse_ref,
         x_grad_hbm_ref,
         w_grad_hbm_ref,
@@ -840,21 +1069,24 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         x_write_sem,
         w_write_sem,
     ):
-      b_index, v_index, stage_index, h_index = (
-          pl.program_id(i) for i in range(4)
-      )
-      global_v_index = c_index * num_v_blocks_per_core + v_index
+      b_index, v_step, h_index = (pl.program_id(i) for i in range(3))
+      global_v = c_index * num_v_blocks_per_core + v_step
+      v_vm1 = jnp.maximum(0, v_step - 1)
+      global_v_vm1 = c_index * num_v_blocks_per_core + v_vm1
+      v_buf_idx = v_step % 2
+      vm1_buf_idx = (v_step - 1) % 2
 
-      # Calculate and accumulate xw_scratch_ref += x_ref @ w_ref as first stage
-      @pl.when(stage_index == 0)
-      def calculate_xw():
+      # 1. Forward logit accumulation for next tile (v_step)
+      # Was: @pl.when(v_step < num_v_blocks_per_core)
+      # Note: we let this run on the last V block even though it'll be garbage.
+      with jax.named_scope("calculate_xw"):
         calculate_xw_tiled(
             x_ref,
-            w_ref,
-            xw_scratch_ref,
+            w_v_ref,
+            xw_scratch_ref.at[v_buf_idx],
             b_index=b_index,
             h_index=h_index,
-            v_index=global_v_index,
+            v_index=global_v,
             num_b_blocks=num_b_blocks,
             num_h_blocks=num_h_blocks,
             num_v_blocks=num_v_blocks,
@@ -864,281 +1096,309 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             preferred_element_type=preferred_element_type,
         )
 
-      # When xw_scratch_ref is fully accumulated, use it to calculate gradients
-      # as second stage
-      @pl.when(stage_index == 1)
-      @jax.named_scope("calculate_grads")
-      def calculate_grads():
-        # Calculate actual block size if v_dim not a multiple of v_block_size
-        cur_v_block_size = jnp.maximum(
-            0, jnp.minimum(v_dim - v_block_size * global_v_index, v_block_size)
+      # 2. Compute Softmax and store s = -labels*dout + softmax(x@w)*dout to
+      # xw_scratch_ref[v_buf_idx] when forward accumulation finishes on H
+      @jax.named_scope("compute_s")
+      def compute_s():
+        lse_val = lse_ref[...]
+        if b_dim % b_block_size != 0:
+          rem_b = b_dim % b_block_size
+          row_idx = jax.lax.broadcasted_iota(
+              jnp.int32, lse_val.shape, dimension=0
+          )
+          lse_val = jnp.where(
+              (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
+              jnp.inf,
+              lse_val,
+          )
+
+        # 1. Broadcast dout once to avoid redundant vector staging registers
+        dout_val = dout_ref[...][:, None]
+
+        # 2. Compute probabilities: prob = exp(xw - lse)
+        prob = jnp.exp(xw_scratch_ref[v_buf_idx] - lse_val[:, None])
+
+        # 3. In-kernel target gradient subtraction: (prob - 1.0) * dout for
+        # targets
+        labels_adjusted = labels_ref[...] - global_v * v_block_size
+        col_idx = jax.lax.broadcasted_iota(
+            jnp.int32, (1, v_block_size), dimension=1
+        )
+        is_target = col_idx == labels_adjusted[:, None]
+        prob_sub = jnp.where(is_target, prob - 1.0, prob)
+        s_val = prob_sub * dout_val
+
+        # 4. Zero out padding elements only when dimensions are not aligned
+        if b_dim % b_block_size != 0:
+          rem_b = b_dim % b_block_size
+          row_idx = jax.lax.broadcasted_iota(
+              jnp.int32, (b_block_size, 1), dimension=0
+          )
+          s_val = jnp.where(
+              (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
+              0.0,
+              s_val,
+          )
+        if v_dim % v_block_size != 0 or num_v_blocks * v_block_size > v_dim:
+          s_val = jnp.where(
+              (global_v * v_block_size + col_idx) >= v_dim,
+              0.0,
+              s_val,
+          )
+
+        xw_scratch_ref[v_buf_idx] = s_val
+
+      # was: @pl.when((h_index == num_h_blocks - 1) &
+      #               (v_step < num_v_blocks_per_core))
+      # Note: we let this run on the last V block even though it'll be garbage.
+      if num_h_blocks == 1:
+        compute_s()
+      else:
+        jax.lax.cond(
+            (h_index == num_h_blocks - 1) & (v_step < num_v_blocks_per_core),
+            compute_s,
+            lambda: None,
         )
 
-        # V Block size must be multiple of 128 to perform DMA (copy).
-        # Aligning the V block size to 128
-        cur_v_block_size = pl.multiple_of(
-            (pl.cdiv(cur_v_block_size, 128) * 128).astype(jnp.int32), 128
-        )
+      # 3. Gradient calculation for current tile (v_step - 1)
+      # Calculate actual block size if v_dim not a multiple of v_block_size
+      cur_v_block_size = jnp.maximum(
+          0, jnp.minimum(v_dim - v_block_size * global_v_vm1, v_block_size)
+      )
 
-        # Calculate actual block size if h_dim not a multiple of h_block_size
-        cur_h_block_size = jnp.minimum(
-            h_dim - h_block_size * h_index, h_block_size
-        )
+      # V Block size must be multiple of 128 to perform DMA (copy).
+      cur_v_block_size = pl.multiple_of(
+          (pl.cdiv(cur_v_block_size, 128) * 128).astype(jnp.int32), 128
+      )
 
-        # H Block size must be multiple of 128 of major dimension, and 8 of
-        # minor dimension to perform DMA.
-        cur_h_block_128_aligned_size = pl.multiple_of(
-            (pl.cdiv(cur_h_block_size, 128) * 128).astype(jnp.int32), 128
-        )
-        cur_h_block_8_aligned_size = pl.multiple_of(
-            (pl.cdiv(cur_h_block_size, 8) * 8).astype(jnp.int32), 8
-        )
+      # Calculate actual block size if h_dim not a multiple of h_block_size
+      cur_h_block_size = jnp.minimum(
+          h_dim - h_block_size * h_index, h_block_size
+      )
 
-        # Major dimension DMA requires 32-byte alignment (8 for fp32, 16 for
-        # bf16/fp16, 32 for int8).
-        major_align = 32 // x_ref.dtype.itemsize
+      # H Block size must be multiple of 128 of major dimension, and 8 of
+      # minor dimension to perform DMA.
+      cur_h_block_128_aligned_size = pl.multiple_of(
+          (pl.cdiv(cur_h_block_size, 128) * 128).astype(jnp.int32), 128
+      )
+      cur_h_block_8_aligned_size = pl.multiple_of(
+          (pl.cdiv(cur_h_block_size, 8) * 8).astype(jnp.int32), 8
+      )
 
-        # Calculate actual block size if b_dim not a multiple of b_block_size
-        cur_b_block_size = jnp.minimum(
-            b_dim - b_block_size * b_index, b_block_size
-        )
-        cur_b_block_aligned_size = pl.multiple_of(
-            (pl.cdiv(cur_b_block_size, major_align) * major_align).astype(
-                jnp.int32
-            ),
-            major_align,
-        )
+      # Major dimension DMA requires 32-byte alignment (8 for fp32, 16 for
+      # bf16/fp16, 32 for int8).
+      major_align = 32 // x_ref.dtype.itemsize
 
-        # Slicing x_grad and w_grad HBM ref to prepare for tiled read / write
-        x_grad_slice = x_grad_hbm_ref.at[
-            c_index,
-            pl.ds(b_index * b_block_size, cur_b_block_aligned_size),
-            pl.ds(h_index * h_block_size, cur_h_block_128_aligned_size),
-        ]
-        w_grad_slice = w_grad_hbm_ref.at[
-            pl.ds(h_index * h_block_size, cur_h_block_8_aligned_size),
-            pl.ds(global_v_index * v_block_size, cur_v_block_size),
-        ]
+      # Calculate actual block size if b_dim not a multiple of b_block_size
+      cur_b_block_size = jnp.minimum(
+          b_dim - b_block_size * b_index, b_block_size
+      )
+      cur_b_block_aligned_size = pl.multiple_of(
+          (pl.cdiv(cur_b_block_size, major_align) * major_align).astype(
+              jnp.int32
+          ),
+          major_align,
+      )
 
-        x_grad_tile_slice = x_grad_tile_ref.at[
-            pl.ds(0, cur_b_block_aligned_size),
-            pl.ds(0, cur_h_block_128_aligned_size),
-        ]
-        w_grad_tile_slice = w_grad_tile_ref.at[
-            pl.ds(0, cur_h_block_8_aligned_size), pl.ds(0, cur_v_block_size)
-        ]
+      # Slicing x_grad and w_grad HBM ref to prepare for tiled read / write
+      x_grad_slice = x_grad_hbm_ref.at[
+          c_index,
+          pl.ds(b_index * b_block_size, cur_b_block_aligned_size),
+          pl.ds(h_index * h_block_size, cur_h_block_128_aligned_size),
+      ]
+      w_grad_slice = w_grad_hbm_ref.at[
+          pl.ds(h_index * h_block_size, cur_h_block_8_aligned_size),
+          pl.ds(global_v_vm1 * v_block_size, cur_v_block_size),
+      ]
 
-        # Async copy ops defined here. Only starts after calling .start().
-        x_grad_write_future = pltpu.make_async_copy(
-            x_grad_tile_slice, x_grad_slice, sem=x_write_sem
-        )
-        w_grad_write_future = pltpu.make_async_copy(
-            w_grad_tile_slice, w_grad_slice, sem=w_write_sem
-        )
-        x_grad_read_future = pltpu.make_async_copy(
-            x_grad_slice, x_grad_tile_slice, sem=x_read_sem
-        )
-        w_grad_read_future = pltpu.make_async_copy(
-            w_grad_slice, w_grad_tile_slice, sem=w_read_sem
-        )
+      x_grad_tile_slice = x_grad_tile_ref.at[
+          pl.ds(0, cur_b_block_aligned_size),
+          pl.ds(0, cur_h_block_128_aligned_size),
+      ]
+      w_grad_tile_slice = w_grad_tile_ref.at[
+          pl.ds(0, cur_h_block_8_aligned_size), pl.ds(0, cur_v_block_size)
+      ]
 
-        # Preload w_grad async before computing softmax to overlap computation.
-        # There's no accumulation on their first index so we skip the read for
-        # the first block.
-        @pl.when(b_index != 0)
-        @jax.named_scope("w_grad_read_start")
-        def w_read():
-          w_grad_read_future.start()
+      # Async copy ops defined here. Only starts after calling .start().
+      x_grad_write_future = pltpu.make_async_copy(
+          x_grad_tile_slice, x_grad_slice, sem=x_write_sem
+      )
+      w_grad_write_future = pltpu.make_async_copy(
+          w_grad_tile_slice, w_grad_slice, sem=w_write_sem
+      )
+      x_grad_read_future = pltpu.make_async_copy(
+          x_grad_slice, x_grad_tile_slice, sem=x_read_sem
+      )
+      w_grad_read_future = pltpu.make_async_copy(
+          w_grad_slice, w_grad_tile_slice, sem=w_read_sem
+      )
 
-        # Compute Softmax and store s = -labels*dout + softmax(x@w)*dout to
-        # xw_scratch_ref
-        @pl.when(h_index == 0)
-        @jax.named_scope("compute_s")
-        def compute_s():
-          lse_val = lse_ref[...]
-          if b_dim % b_block_size != 0:
-            rem_b = b_dim % b_block_size
-            row_idx = jax.lax.broadcasted_iota(
-                jnp.int32, lse_val.shape, dimension=0
-            )
-            lse_val = jnp.where(
-                (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
-                jnp.inf,
-                lse_val,
-            )
+      # Preload w_grad async before computing gradients.
+      # There's no accumulation on first batch block so we skip the read.
+      @pl.when((b_index != 0) & (v_step > 0))
+      @jax.named_scope("w_grad_read_start")
+      def w_read():
+        w_grad_read_future.start()
 
-          # 1. Broadcast dout once to avoid redundant vector staging registers
-          dout_val = dout_ref[...][:, None]
-
-          # 2. Compute probabilities: prob = exp(xw - lse)
-          prob = jnp.exp(xw_scratch_ref[...] - lse_val[:, None])
-
-          # 3. In-kernel target gradient subtraction: (prob - 1.0) * dout for
-          # targets
-          labels_adjusted = labels_ref[...] - global_v_index * v_block_size
+      @jax.named_scope("get_clean_x")
+      def get_clean_x():
+        """Zeros out out-of-bounds padding elements in x_ref in VMEM."""
+        x_val = x_ref[...]
+        if b_dim % b_block_size != 0:
+          rem_b = b_dim % b_block_size
+          row_idx = jax.lax.broadcasted_iota(
+              dtype=jnp.int32, shape=(b_block_size, 1), dimension=0
+          )
+          x_val = jnp.where(
+              (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
+              0.0,
+              x_val,
+          )
+        if h_dim % h_block_size != 0:
+          rem_h = h_dim % h_block_size
           col_idx = jax.lax.broadcasted_iota(
-              jnp.int32, (1, v_block_size), dimension=1
+              dtype=jnp.int32, shape=(1, h_block_size), dimension=1
           )
-          is_target = col_idx == labels_adjusted[:, None]
-          prob_sub = jnp.where(is_target, prob - 1.0, prob)
-          s_val = prob_sub * dout_val
-
-          # 4. Zero out padding elements only when dimensions are not aligned
-          if b_dim % b_block_size != 0:
-            rem_b = b_dim % b_block_size
-            row_idx = jax.lax.broadcasted_iota(
-                jnp.int32, (b_block_size, 1), dimension=0
-            )
-            s_val = jnp.where(
-                (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
-                0.0,
-                s_val,
-            )
-          if v_dim % v_block_size != 0 or num_v_blocks * v_block_size > v_dim:
-            s_val = jnp.where(
-                (global_v_index * v_block_size + col_idx) >= v_dim,
-                0.0,
-                s_val,
-            )
-
-          xw_scratch_ref[...] = s_val
-
-        @jax.named_scope("get_clean_x")
-        def get_clean_x():
-          """Zeros out out-of-bounds padding elements in x_ref in VMEM."""
-          x_val = x_ref[...]
-          if b_dim % b_block_size != 0:
-            rem_b = b_dim % b_block_size
-            row_idx = jax.lax.broadcasted_iota(
-                dtype=jnp.int32, shape=(b_block_size, 1), dimension=0
-            )
-            x_val = jnp.where(
-                (b_index == num_b_blocks - 1) & (row_idx >= rem_b),
-                0.0,
-                x_val,
-            )
-          if h_dim % h_block_size != 0:
-            rem_h = h_dim % h_block_size
-            col_idx = jax.lax.broadcasted_iota(
-                dtype=jnp.int32, shape=(1, h_block_size), dimension=1
-            )
-            x_val = jnp.where(
-                (h_index == num_h_blocks - 1) & (col_idx >= rem_h),
-                0.0,
-                x_val,
-            )
-          return x_val
-
-        @jax.named_scope("get_clean_w")
-        def get_clean_w():
-          """Zeros out out-of-bounds padding elements in w_ref in VMEM."""
-          w_val = w_ref[...]
-          if h_dim % h_block_size != 0:
-            rem_h = h_dim % h_block_size
-            row_idx = jax.lax.broadcasted_iota(
-                dtype=jnp.int32, shape=(h_block_size, 1), dimension=0
-            )
-            w_val = jnp.where(
-                (h_index == num_h_blocks - 1) & (row_idx >= rem_h),
-                0.0,
-                w_val,
-            )
-          if v_dim % v_block_size != 0 or num_v_blocks * v_block_size > v_dim:
-            col_idx = jax.lax.broadcasted_iota(
-                dtype=jnp.int32, shape=(1, v_block_size), dimension=1
-            )
-            w_val = jnp.where(
-                (global_v_index * v_block_size + col_idx) >= v_dim,
-                0.0,
-                w_val,
-            )
-          return w_val
-
-        # Preload x_grad async before computing softmax to overlap computation.
-        @pl.when(v_index != 0)
-        @jax.named_scope("x_grad_read_start")
-        def x_read():
-          x_grad_read_future.start()
-
-        # Init W gradient
-        @pl.when(b_index == 0)
-        @jax.named_scope("init_w_grad")
-        def init_w_grad():
-          w_grad_tile_ref[...] = jax.lax.dot_general(
-              get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
+          x_val = jnp.where(
+              (h_index == num_h_blocks - 1) & (col_idx >= rem_h),
+              0.0,
+              x_val,
           )
-          w_grad_write_future.start()
+        return x_val
 
-        # Init X gradient
-        @pl.when(v_index == 0)
-        @jax.named_scope("init_x_grad")
-        def init_x_grad():
-          x_grad_tile_ref[...] = jax.lax.dot_general(
-              xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
+      @jax.named_scope("get_clean_w_vm1")
+      def get_clean_w_vm1():
+        """Zeros out out-of-bounds padding elements in w_vm1_ref in VMEM."""
+        w_val = w_vm1_ref[...]
+        if h_dim % h_block_size != 0:
+          rem_h = h_dim % h_block_size
+          row_idx = jax.lax.broadcasted_iota(
+              dtype=jnp.int32, shape=(h_block_size, 1), dimension=0
           )
-          x_grad_write_future.start()
-
-        # Accumulate W grad on B dimension
-        @pl.when(b_index != 0)
-        @jax.named_scope("accumulate_w_grad")
-        def accumulate_w_grad():
-          res = jax.lax.dot_general(
-              get_clean_x(), xw_scratch_ref[...], (((0,), (0,)), ((), ()))
+          w_val = jnp.where(
+              (h_index == num_h_blocks - 1) & (row_idx >= rem_h),
+              0.0,
+              w_val,
           )
-          w_grad_read_future.wait()
-          w_grad_tile_ref[...] += res
-          w_grad_write_future.start()
-
-        # Accumulate X grad on V dimension
-        @pl.when(v_index != 0)
-        @jax.named_scope("accumulate_x_grad")
-        def accumulate_x_grad():
-          res = jax.lax.dot_general(
-              xw_scratch_ref[...], get_clean_w(), (((1,), (1,)), ((), ()))
+        if v_dim % v_block_size != 0 or num_v_blocks * v_block_size > v_dim:
+          col_idx = jax.lax.broadcasted_iota(
+              dtype=jnp.int32, shape=(1, v_block_size), dimension=1
           )
-          x_grad_read_future.wait()
-          x_grad_tile_ref[...] += res
-          x_grad_write_future.start()
+          w_val = jnp.where(
+              (global_v_vm1 * v_block_size + col_idx) >= v_dim,
+              0.0,
+              w_val,
+          )
+        return w_val
 
-        # Lastly make sure to wait x_grad, w_grad write before next iteration
-        with jax.named_scope("wait_w_grad"):
-          w_grad_write_future.wait()
+      # Preload x_grad async when accumulating across V (v_step > 1).
+      @pl.when(v_step > 1)
+      @jax.named_scope("x_grad_read_start")
+      def x_read():
+        x_grad_read_future.start()
 
-        with jax.named_scope("wait_x_grad"):
-          x_grad_write_future.wait()
+      # Init W gradient
+      @pl.when((v_step > 0) & (b_index == 0))
+      @jax.named_scope("init_w_grad")
+      def init_w_grad():
+        w_grad_tile_ref[...] = jax.lax.dot_general(
+            get_clean_x(),
+            xw_scratch_ref.at[vm1_buf_idx][...],
+            (((0,), (0,)), ((), ())),
+        )
+        w_grad_write_future.start()
+
+      # Init X gradient
+      @pl.when(v_step == 1)
+      @jax.named_scope("init_x_grad")
+      def init_x_grad():
+        x_grad_tile_ref[...] = jax.lax.dot_general(
+            xw_scratch_ref.at[vm1_buf_idx][...],
+            get_clean_w_vm1(),
+            (((1,), (1,)), ((), ())),
+        )
+        x_grad_write_future.start()
+
+      # Accumulate W grad on B dimension
+      @pl.when((v_step > 0) & (b_index != 0))
+      @jax.named_scope("accumulate_w_grad")
+      def accumulate_w_grad():
+        res = jax.lax.dot_general(
+            get_clean_x(),
+            xw_scratch_ref.at[vm1_buf_idx][...],
+            (((0,), (0,)), ((), ())),
+        )
+        w_grad_read_future.wait()
+        w_grad_tile_ref[...] += res
+        w_grad_write_future.start()
+
+      # Accumulate X grad on V dimension
+      @pl.when(v_step > 1)
+      @jax.named_scope("accumulate_x_grad")
+      def accumulate_x_grad():
+        res = jax.lax.dot_general(
+            xw_scratch_ref.at[vm1_buf_idx][...],
+            get_clean_w_vm1(),
+            (((1,), (1,)), ((), ())),
+        )
+        x_grad_read_future.wait()
+        x_grad_tile_ref[...] += res
+        x_grad_write_future.start()
+
+      # Lastly make sure to wait x_grad, w_grad write before next iteration
+      @pl.when(v_step > 0)
+      @jax.named_scope("wait_grads")
+      def wait_grads():
+        w_grad_write_future.wait()
+        x_grad_write_future.wait()
 
     pltpu.emit_pipeline(
         bwd_pipeline,
         grid=(
             num_b_blocks,
-            num_v_blocks_per_core,
-            num_stages,
+            num_v_steps,
             num_h_blocks,
         ),
         in_specs=[
             pl.BlockSpec(  # dout
                 (b_block_size,),
-                lambda i, j, s, k: (i,),
+                lambda i, j, k: (i,),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # x
                 (b_block_size, h_block_size),
-                lambda i, j, s, k: (i, k),
+                lambda i, j, k: (i, k),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # labels
                 (b_block_size,),
-                lambda i, j, s, k: (i,),
+                lambda i, j, k: (i,),
                 memory_space=pltpu.VMEM,
             ),
-            pl.BlockSpec(  # w
+            # Notes for w_v and w_vm1:
+            # - V is split across cores
+            # - We have one extra V block for additional pipelining in
+            #   the v dimension.
+            pl.BlockSpec(  # w_v
                 (h_block_size, v_block_size),
-                lambda i, j, s, k: (k, c_index * num_v_blocks_per_core + j),
+                lambda i, j, k: (
+                    k,
+                    c_index * num_v_blocks_per_core
+                    + jnp.minimum(j, num_v_blocks_per_core - 1),
+                ),
+                memory_space=pltpu.VMEM,
+            ),
+            pl.BlockSpec(  # w_vm1
+                (h_block_size, v_block_size),
+                lambda i, j, k: (
+                    k,
+                    c_index * num_v_blocks_per_core + jnp.maximum(0, j - 1),
+                ),
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # lse
                 (b_block_size,),
-                lambda i, j, s, k: (i,),
+                lambda i, j, k: (i,),
                 memory_space=pltpu.VMEM,
             ),
         ],
@@ -1150,6 +1410,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         dout_hbm_ref,
         x_hbm_ref,
         labels_hbm_ref,
+        w_hbm_ref,
         w_hbm_ref,
         lse_hbm_ref,
         x_grad_hbm_ref,

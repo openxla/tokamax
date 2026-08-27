@@ -58,8 +58,9 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           f"    Absolute Diff:     {abs_err[first_idx]}\n"
       )
 
-    self.assertTrue(
-        mismatch_count == 0,
+    self.assertEqual(
+        mismatch_count,
+        0,
         msg=diag
         or f"[{name}] arrays are not close within atol={atol}, rtol={rtol}",
     )
@@ -91,7 +92,7 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           b_dim=1024,
           h_dim=512,
           v_dim=2048,
-          reduction="sum",
+          reduction="mean",
       ),
       dict(
           testcase_name="fwd_medium_size_mean_reduction_test",
@@ -274,6 +275,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           h_dim=1288,
           v_dim=2664,
           reduction="none",
+      ),
+      dict(
+          testcase_name="fwd_all_non_aligned_large_sum_reduction_test",
+          b_dim=3600,
+          h_dim=1200,
+          v_dim=10000,
+          reduction="sum",
       ),
       dict(
           testcase_name="fwd_bfloat16_sum_reduction_test",
@@ -548,6 +556,13 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           v_dim=2664,
           reduction="none",
       ),
+      dict(
+          testcase_name="bwd_all_non_aligned_large_sum_reduction_test",
+          b_dim=3600,
+          h_dim=1200,
+          v_dim=10000,
+          reduction="sum",
+      ),
   )
   def test_kernel_bwd_matches_reference(self, b_dim, h_dim, v_dim, reduction):
     config = kernel.get_heuristic_bwd_config(b_dim, h_dim, v_dim)
@@ -731,7 +746,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=32 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=1024
+              b_block_size=1024, h_block_size=512, v_block_size=512
           ),
       ),
       dict(
@@ -783,6 +798,61 @@ class HeuristicConfigTest(parameterized.TestCase):
         dtype=dtype,
     )
     self.assertLessEqual(vmem_used, vmem_limit_bytes)
+
+
+class CostEstimateTest(parameterized.TestCase):
+
+  def test_fwd_cost_estimate(self):
+    b, h, v = 1024, 512, 2048
+    x = jax.ShapeDtypeStruct(shape=(b, h), dtype=jnp.bfloat16)
+    labels = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.int32)
+    w = jax.ShapeDtypeStruct(shape=(h, v), dtype=jnp.bfloat16)
+    out_type = [
+        jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.float32),
+        jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.float32),
+    ]
+
+    cost = kernel.linear_softmax_cross_entropy_loss_fwd_cost_estimate(
+        x=x, labels=labels, w=w, out_type=out_type
+    )
+
+    expected_matmul_flops = 2 * b * h * v
+    expected_reduction_flops = 2 * b * v + b
+    expected_flops = expected_matmul_flops + expected_reduction_flops
+    expected_transcendentals = b * v + b
+    expected_bytes = b * h * 2 + b * 4 + h * v * 2 + b * 4 + b * 4
+
+    self.assertEqual(cost.flops, expected_flops)
+    self.assertEqual(cost.transcendentals, expected_transcendentals)
+    self.assertEqual(cost.bytes_accessed, expected_bytes)
+
+  def test_bwd_cost_estimate(self):
+    b, h, v = 1024, 512, 2048
+    dout = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.float32)
+    x = jax.ShapeDtypeStruct(shape=(b, h), dtype=jnp.bfloat16)
+    labels = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.int32)
+    w = jax.ShapeDtypeStruct(shape=(h, v), dtype=jnp.bfloat16)
+    lse = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.float32)
+    out_type = [
+        jax.ShapeDtypeStruct(shape=(1, b, h), dtype=jnp.float32),
+        jax.ShapeDtypeStruct(shape=(h, v), dtype=jnp.float32),
+    ]
+
+    cost = kernel.linear_softmax_cross_entropy_loss_bwd_cost_estimate(
+        dout=dout, x=x, labels=labels, w=w, lse=lse, out_type=out_type
+    )
+
+    expected_matmul_flops = 3 * (2 * b * h * v)
+    expected_softmax_flops = 3 * b * v
+    expected_flops = expected_matmul_flops + expected_softmax_flops
+    expected_transcendentals = b * v
+    expected_bytes = (
+        b * 4 + b * h * 2 + b * 4 + h * v * 2 + b * 4 + b * h * 4 + h * v * 4
+    )
+
+    self.assertEqual(cost.flops, expected_flops)
+    self.assertEqual(cost.transcendentals, expected_transcendentals)
+    self.assertEqual(cost.bytes_accessed, expected_bytes)
 
 
 if __name__ == "__main__":
