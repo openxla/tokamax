@@ -222,6 +222,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         self._xprof_session.start_session(
             enable_python_tracer=False,
             host_trace_level=2,
+            perf_counters=False,
             **self._xprof_session_kwargs,
         )
       except Exception as e:
