@@ -26,6 +26,7 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import tokamax
+from tokamax._src import gpu_utils
 from tokamax._src import numerics
 from tokamax.benchmarks import common
 
@@ -98,6 +99,14 @@ class AttentionBenchmark(parameterized.TestCase):
     fn = functools.partial(
         tokamax.dot_product_attention, implementation=implementation
     )
+    # TODO: Mosaic GPU B200 VJP does not support head dim of 256.
+    if (
+        gpu_utils.is_sm100()
+        and args_spec_name == 'basic'
+        and implementation in ('mosaic', 'cudnn', None)
+        and benchmark_mode == 'forward_and_vjp'
+    ):
+      self.skipTest('Mosaic GPU VJP does not support head dim of 256.')
 
     fn, args = tokamax.standardize_function(
         fn,
