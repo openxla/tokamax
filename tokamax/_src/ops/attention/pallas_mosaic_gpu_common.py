@@ -279,15 +279,9 @@ def unpack_bool_bits_tmem_native(a):
       reg_v2_i32 = vector.broadcast(out_i32_ty, reg_i32_scalar)
 
       for i in range(16):
-        mask_low = 1 << (i * 2)
-        mask_high = 1 << (i * 2 + 1)
-        base_mask = vector.broadcast(out_i32_ty, mgpu.c(mask_low, i32_type))
-        bit_mask = vector.insert(
-            mgpu.c(mask_high, i32_type),
-            base_mask,
-            dynamic_position=[],
-            static_position=ir.DenseI64ArrayAttr.get([1]),
-        )
+        bit_masks = np.array([1 << (i * 2), 1 << (i * 2 + 1)], dtype=np.uint32)
+        bit_mask_attr = ir.DenseIntElementsAttr.get(bit_masks, type=out_i32_ty)
+        bit_mask = arith.constant(out_i32_ty, bit_mask_attr)
         and_res = arith.andi(reg_v2_i32, bit_mask)
         cmp_res = arith.cmpi(arith.CmpIPredicate.ne, and_res, zero_i32_vec)
         logical_col = col_idx * 16 + i
