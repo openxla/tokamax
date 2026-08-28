@@ -19,6 +19,9 @@ from typing import Final
 
 TOKAMAX_VERSION: Final[str] = "0.0.13"
 
+# Stamped at build time by the release workflow; empty in a source checkout.
+TOKAMAX_GIT_REVISION: Final[str] = ""
+
 
 def _version_as_tuple(version_str: str) -> tuple[int, int, int]:
   x, y, z = (int(i) for i in version_str.split(".") if i.isdigit())
