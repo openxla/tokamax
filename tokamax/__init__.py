@@ -37,6 +37,7 @@ from tokamax._src.ops.ragged_dot.api import ragged_dot_general as ragged_dot_gen
 from tokamax._src.ops.ragged_dot.base import generate_group_sizes as generate_ragged_dot_group_sizes
 from tokamax._src.ops.ragged_dot.base import GroupSizes as RaggedDotGroupSizes
 from tokamax._src.ops.triangle_multiplication.api import triangle_multiplication as triangle_multiplication
+from tokamax._src.version import TOKAMAX_GIT_REVISION as __git_revision__
 from tokamax._src.version import TOKAMAX_VERSION as __version__
 from tokamax._src.version import TOKAMAX_VERSION_INFO as __version_info__
 
