@@ -24,9 +24,6 @@ import jax
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
-from tensorboardX import writer
-import tokamax
-from tokamax._src.autotuning import api as autotuning
 from tokamax._src.ops.experimental.mla import base
 from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu
 from tokamax._src.ops.experimental.mla import utils

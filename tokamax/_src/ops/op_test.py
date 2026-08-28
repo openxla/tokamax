@@ -21,7 +21,6 @@ from absl.testing import parameterized
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
-import tokamax
 from tokamax._src import batching
 from tokamax._src import config as config_lib
 from tokamax._src import hlo_utils
@@ -34,9 +33,12 @@ from tokamax._src.ops.gated_linear_unit import arg_specs as glu_arg_specs
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import arg_specs as norm_arg_specs
 from tokamax._src.ops.normalization import base as norm_base
+from tokamax._src.ops.ragged_dot import api
 from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+
+ragged_dot = api.ragged_dot
 
 _ATTN_ARG_SPECS = attn_arg_specs.ARG_SPECS
 _GLU_ARG_SPECS = glu_arg_specs.ARG_SPECS

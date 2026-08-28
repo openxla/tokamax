@@ -18,7 +18,7 @@ from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-import tokamax
+from tokamax._src import benchmarking
 from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.experimental.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
@@ -56,13 +56,13 @@ class GmmPerfTest(parameterized.TestCase):
         maybe_quantize_lhs=True,
         preferred_element_type=jnp.bfloat16,
     )
-    fn, args = tokamax.standardize_function(
+    fn, args = benchmarking.standardize_function(
         gmm_op,
         kwargs=benchmark_config,
         mode="forward",
     )
     fn = jax.jit(fn)
-    res = tokamax.benchmark(fn, args, method="hermetic_xprof")
+    res = benchmarking.benchmark(fn, args, method="hermetic_xprof")
     logging.info("Benchmark time (ms): %s", res.median_evaluation_time_ms)
 
     tpu_gen = pltpu.get_tpu_info().generation
@@ -92,13 +92,13 @@ class GmmPerfTest(parameterized.TestCase):
         ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS,
         preferred_element_type=jnp.bfloat16,
     )
-    fn, args = tokamax.standardize_function(
+    fn, args = benchmarking.standardize_function(
         drhs_op,
         kwargs=benchmark_config,
         mode="forward",
     )
     fn = jax.jit(fn)
-    res = tokamax.benchmark(fn, args, method="hermetic_xprof")
+    res = benchmarking.benchmark(fn, args, method="hermetic_xprof")
     logging.info("Benchmark time (ms): %s", res.median_evaluation_time_ms)
 
     tpu_gen = pltpu.get_tpu_info().generation
@@ -179,13 +179,13 @@ class GmmPerfTest(parameterized.TestCase):
         fuse_gateup_activation=fuse_act,
         preferred_element_type=jnp.bfloat16,
     )
-    fn, args = tokamax.standardize_function(
+    fn, args = benchmarking.standardize_function(
         gmm_op,
         kwargs=benchmark_config,
         mode="forward",
     )
     fn = jax.jit(fn)
-    res = tokamax.benchmark(fn, args, method="hermetic_xprof")
+    res = benchmarking.benchmark(fn, args, method="hermetic_xprof")
     logging.info("Benchmark time (ms): %s", res.median_evaluation_time_ms)
 
     tpu_gen = pltpu.get_tpu_info().generation
