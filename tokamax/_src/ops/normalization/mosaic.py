@@ -52,12 +52,25 @@ FusedInputArray = base.FusedInputArray
 def _vector_length(block_n: int, A: int, bitwidth: int) -> int:
   vec = (8 * 16) // bitwidth  # 16-byte vectors.
   while True:
-    if (block_n % vec == 0 or
-      (vec % block_n == 0 and A % vec == 0 and (A // vec) % 32 == 0)):
+    if block_n % vec == 0 or (vec % block_n == 0 and A % vec == 0):
       return vec
     vec //= 2
 
-def _sub_blocks(block_m, block_n):
+def _vec_along_a(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
+  a = A // vec
+  if a >= 32:
+    return (M, a // 32, N)
+  else:
+    f = 32 // a
+    print("F ", f)
+    return (f, a, N)
+
+def _vec_along_n(vec, M, A, N):
+  a = 32 // (N // vec)
+  b = 32 // a
+  return (M, A // b, N // a)
+
+def _warp_blocks(block_m, block_n):
     for amt_m in [4,2,1]:
       amt_n = 4 // amt_m
       if block_m % amt_m == 0 and block_n % amt_n == 0:
@@ -122,24 +135,40 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       index = tuple(pl.ds(s * b, b) for (s, b) in
         zip([jax.lax.axis_index(i) for i in "man"], block))
 
+      print("\nITEMSIZE ", dtype.itemsize, dtype.itemsize * 8)
       vec = _vector_length(block_n, A, dtype.itemsize * 8)
+      tile_along_a = vec >= block_n
+      print("TILE ALONG A ", tile_along_a)
+      print("\nVEC ", vec)
       # Start with a block of size (block_m, A, block_n)
-      amt_m, amt_n = _sub_blocks(block_m, block_n)
-      tile_spec = [block, (block_m // amt_m, A // 32, block_n // amt_n)]
-      if vec >= block_n:
+      warp_m, warp_n = _warp_blocks(block_m, block_n)
+      print("AMT M ", warp_m)
+      print("AMT N ", warp_n)
+      tile_spec = [block, (block_m // warp_m, A, block_n // warp_n)]
+      print("SO FAR ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
+      if tile_along_a:
+        tile_spec.append(_vec_along_a(vec, *tile_spec[-1]))
+        print("GOT LANE BLOCKS ", tile_spec[-1])
         vector_dim = -2
+        print("TILING ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
         tile_spec.append((vec, block_n),)
+        print("--> ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
       else:
+        tile_spec.append(_vec_along_n(vec, *tile_spec[-1]))
+        print("GOT LANE BLOCKS ", tile_spec[-1])
+        print("TILING ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
         vector_dim=-1
         tile_spec.append((A // 32, vec),)
-      # print("GOT ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
+        print("--> ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
+      print("ORIG ", (block_m, A, block_n))
+      print("SPEC ", tile_spec)
 
       # TODO: alphafold_alphafold_384res_128chan_axis0_forward
       # and alphafold_alphafold_768res_128chan_axis0_forward are too slow!
       l = TiledLayout(
         plgpu.Tiling(tuple(tile_spec)),
-        warp_dims=(-8, -6),
-        lane_dims=(-7,),
+        warp_dims=(-11, -9),
+        lane_dims=(-8, -7,),
         vector_dim=vector_dim,
         _check_canonical=False).canonicalize()
       layout = plgpu.Layout.TILED(l.tiling, warp_dims=l.warp_dims,

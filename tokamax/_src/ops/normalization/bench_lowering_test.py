@@ -33,6 +33,8 @@ from tokamax._src import config as config_lib
 from tokamax._src.ops.normalization import arg_specs
 from tokamax._src.ops.normalization import mosaic
 
+def test_doit():
+  print("THE LEN ", mosaic._vector_length(1, 128, 16))
 
 class _AmpereDevice:
   """Just enough of a `jax.Device` for the support checks and heuristics."""

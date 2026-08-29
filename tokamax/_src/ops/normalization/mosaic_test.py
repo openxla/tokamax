@@ -12,132 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Numerics for the shapes this kernel exists for: the benchmark arg specs.
 
-import functools
-from typing import override
-from unittest import mock
+Same shapes as `bench_lowering_test`, which pins that they lower; this checks
+that what they lower to is right. The reference and the tolerances are borrowed
+from `test_base`, but not its shape battery -- those shapes are the shared
+cross-impl set, and this kernel is only aimed at the benchmark ones.
+"""
+
+import inspect
 
 from absl.testing import absltest
-import chex
+from absl.testing import parameterized
 import jax
+from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import mosaic
-from tokamax._src.ops.normalization import pallas_triton_config
 from tokamax._src.ops.normalization import test_base
 
 
-class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
+class PallasMosaicGpuNormalizationTest(parameterized.TestCase):
 
-  def __init__(self, *args):
-    super().__init__(*args, norm_fn=mosaic.PallasMosaicGpuNormalization())
+  _supports_vjp = True
+  # The reference impl, the vmap plumbing and the tolerances, without the shape
+  # battery the base class's own test methods would drag in.
+  _run_test = test_base.NormalizationTestBase._run_test
 
   def setUp(self):
-    op = mosaic.PallasMosaicGpuNormalization()
-    if not op.supported_on(jax.devices()[0]):
+    self._norm_fn = mosaic.PallasMosaicGpuNormalization()
+    if not self._norm_fn.supported_on(jax.devices()[0]):
       self.skipTest('Mosaic GPU normalization not supported on this device.')
     super().setUp()
 
-  @override
-  def _run_test(self, *args, **kwargs):
-    """Skips the shapes this kernel has no thread mapping for.
-
-    The warpgroup's 128 threads have to be placed on axes that can feed them, and
-    some shapes in the shared battery cannot: `(1, 40)`, canonicalized, is a
-    single row with nothing minor to the reduced axis, so there is no axis to
-    spread the four warps over. Those are declined rather than lowered wrong, and
-    the caller falls back to another implementation, so there is nothing here to
-    check numerically.
-
-    Skipping on the error, rather than on a list of shapes, keeps this from
-    drifting out of step with `mosaic_tiling.plan`. It cannot hide a regression
-    that starts declining a shape that used to work:
-    `mosaic_lowering_test.test_the_shapes_the_op_is_tested_on_plan_or_decline_cleanly`
-    pins exactly which of these shapes plan and which do not, and needs no GPU.
-    """
-    try:
-      super()._run_test(*args, **kwargs)
-    except NotImplementedError as e:
-      if 'No thread mapping fits' not in str(e):
-        raise
-      self.skipTest(str(e))
-
-  def test_layer_norm_with_pre_scale(self):
-    rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
-
-    shape = (128, 32)
-    x = jax.random.normal(rngs.pop(), shape)
-    scale = jax.random.uniform(rngs.pop(), (shape[-1],))
-    offset = jax.random.uniform(rngs.pop(), (shape[-1],))
-    pre_scale = jax.random.uniform(rngs.pop(), (shape[-1],))
-    epsilon = 1e-6
-
-    y_expected = jax.nn.standardize(x * pre_scale, epsilon=epsilon) * scale
-    y_expected += offset
-    y_actual = self._norm_fn(
-        lambda: x * pre_scale, scale, offset, epsilon=epsilon
-    )
-    chex.assert_trees_all_close(y_actual, y_expected, atol=1e-6)
-
-  @override
-  def _test_layer_norm_vmap(self, axis, vmap_in_axes):
-    x_shape = [24, 32, 40]
-    vmap_axis_sizes = tuple(
-        x_shape.pop(in_axes[0]) for in_axes in vmap_in_axes[::-1]
-    )
-
-    seen_vmap_axis_sizes = []
-    get_heuristics_config = pallas_triton_config.get_heuristics_config
-
-    def my_heuristics_config(*args, **kwargs):
-      seen_vmap_axis_sizes.append(kwargs['vmap_axis_sizes'])
-      return get_heuristics_config(*args, **kwargs)
-
-    with mock.patch.object(
-        pallas_triton_config, 'get_heuristics_config', my_heuristics_config
-    ):
-      super()._test_layer_norm_vmap(axis, vmap_in_axes)
-
-    # We expect to see a shape for non-vmapped and each layer of vmap.
-    seen_vmap_axis_sizes = seen_vmap_axis_sizes[-1 :: -(len(vmap_in_axes) + 1)]
-    # We expect three calls from fwd, fwd res, and VJP.
-    self.assertEqual(seen_vmap_axis_sizes, [vmap_axis_sizes] * 3)
-
-  def test_remat(self):
-    rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
-
-    shape = (128, 32)
-    x = jax.random.normal(rngs.pop(), shape)
-    scale = jax.random.uniform(rngs.pop(), (shape[-1],))
-    offset = jax.random.uniform(rngs.pop(), (shape[-1],))
-    epsilon = 1e-6
-
-    f = functools.partial(self._norm_fn, epsilon=epsilon)
-    g_ref = jax.value_and_grad(lambda *args: f(*args).sum())
-    g_remat = jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
-    g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
-
-    g_out = g_remat_lowered.compile()(x, scale, offset)
-    chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
-
-  def test_remat_with_vmap(self):
-    rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
-
-    shape = (3, 128, 32)
-    x = jax.random.normal(rngs.pop(), shape)
-    scale = jax.random.uniform(rngs.pop(), (shape[0], shape[-1]))
-    offset = jax.random.uniform(rngs.pop(), (shape[0], shape[-1]))
-    epsilon = 1e-6
-
-    def f(x, scale, offset):
-      return self._norm_fn(x, scale, offset, epsilon=epsilon)
-
-    g_ref = jax.vmap(jax.value_and_grad(lambda *args: f(*args).sum()))
-    g_remat = jax.vmap(
-        jax.value_and_grad(lambda *args: jax.remat(f)(*args).sum())
-    )
-    g_remat_lowered = jax.jit(g_remat).lower(x, scale, offset)
-
-    g_out = g_remat_lowered.compile()(x, scale, offset)
-    chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
+  @parameterized.named_parameters(test_base.NAMED_ARG_SPECS.items())
+  def test_bench(self, kwargs):
+    ba = inspect.signature(base.Normalization.__call__).bind(None, **kwargs)
+    ba.apply_defaults()
+    ba.arguments.pop('return_residuals')
+    self._run_test(*ba.args[1:], **ba.kwargs)
 
 
 if __name__ == '__main__':

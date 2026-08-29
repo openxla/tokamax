@@ -186,7 +186,7 @@ class NormalizationVjp[C, K](op.Op[Any, Any, None, C, K]):
       dscale = None
     else:
       dscale = jnp.sum(dout * x_norm, param_bcast_axes).astype(scale.dtype)
-      dout *= jnp.expand_dims(scale.astype(dtype) + scale_offset, param_bcast_axes)
+      dout *= scale.astype(dtype) + scale_offset
 
     dx = dout - jnp.mean(dout * x_norm, axis=axis, keepdims=True) * x_norm
     if mean is not None:
