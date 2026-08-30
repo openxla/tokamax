@@ -104,7 +104,7 @@ out = f_grad(x, scale)
 To get the best performance, autotune all Tokamax kernels in `f_grad`:
 
 ```python
-autotune_result: tokamax.AutotuningResult = tokamax.autotune(f, x, scale)
+autotune_result: tokamax.AutotuningResult = tokamax.autotune(f_grad, x, scale)
 ```
 
 `autotune_result` can be used as a context-manager, using the autotuned configs
@@ -166,7 +166,7 @@ execution time. This means the usual approach of timing
 for only measuring accelerator execution time:
 
 ```python
-f_std, args = tokamax.standardize_function(f, kwargs={'x': x, 'scale': scale})
+f_std, args = tokamax.standardize_function(f_grad, kwargs={'x': x, 'scale': scale})
 bench: tokamax.BenchmarkData = tokamax.benchmark(f_std, args)
 ```
 
