@@ -39,7 +39,6 @@ from jax.experimental import pallas as pl
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src.ops import op
-import numpy as np
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton_config as triton_config
 from tokamax._src.ops.normalization import pallas_triton_vjp
@@ -57,18 +56,19 @@ def _vector_length(block_n: int, A: int, bitwidth: int) -> int:
     vec //= 2
 
 def _vec_along_a(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
-  a = A // vec
+  # The 32 lanes go along the reduced axis, one vector each, and any lanes left
+  # over once it is exhausted spread along M.
+  a = A // vec  # Vectors along the reduced axis.
   if a >= 32:
-    return (M, a // 32, N)
-  else:
-    f = 32 // a
-    print("F ", f)
-    return (f, a, N)
+    return (M, A // 32, N)
+  return (M // (32 // a), vec, N)
 
-def _vec_along_n(vec, M, A, N):
-  a = 32 // (N // vec)
-  b = 32 // a
-  return (M, A // b, N // a)
+def _vec_along_n(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
+  for ln in (32, 16, 8, 4, 2, 1):
+    la = 32 // ln
+    if N % (ln * vec) == 0 and A % la == 0:
+      return (M, A // la, N // ln)
+  raise ValueError(f'Cannot spread 32 lanes over {A=}, {N=} with {vec=}.')
 
 def _warp_blocks(block_m, block_n):
     for amt_m in [4,2,1]:
@@ -135,40 +135,27 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       index = tuple(pl.ds(s * b, b) for (s, b) in
         zip([jax.lax.axis_index(i) for i in "man"], block))
 
-      print("\nITEMSIZE ", dtype.itemsize, dtype.itemsize * 8)
       vec = _vector_length(block_n, A, dtype.itemsize * 8)
-      tile_along_a = vec >= block_n
-      print("TILE ALONG A ", tile_along_a)
-      print("\nVEC ", vec)
       # Start with a block of size (block_m, A, block_n)
       warp_m, warp_n = _warp_blocks(block_m, block_n)
-      print("AMT M ", warp_m)
-      print("AMT N ", warp_n)
       tile_spec = [block, (block_m // warp_m, A, block_n // warp_n)]
-      print("SO FAR ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
-      if tile_along_a:
+      if vec >= block_n:
         tile_spec.append(_vec_along_a(vec, *tile_spec[-1]))
-        print("GOT LANE BLOCKS ", tile_spec[-1])
         vector_dim = -2
-        print("TILING ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
+        lane_dims = (-8, -7)  # The M and A tile counts.
         tile_spec.append((vec, block_n),)
-        print("--> ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
       else:
         tile_spec.append(_vec_along_n(vec, *tile_spec[-1]))
-        print("GOT LANE BLOCKS ", tile_spec[-1])
-        print("TILING ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
-        vector_dim=-1
-        tile_spec.append((A // 32, vec),)
-        print("--> ", plgpu.Tiling(tuple(tile_spec)).tile_shape((block_m, A, block_n)))
-      print("ORIG ", (block_m, A, block_n))
-      print("SPEC ", tile_spec)
+        vector_dim = -1
+        lane_dims = (-7, -6)  # The A and N tile counts.
+        tile_spec.append((tile_spec[-1][1], vec),)
 
       # TODO: alphafold_alphafold_384res_128chan_axis0_forward
       # and alphafold_alphafold_768res_128chan_axis0_forward are too slow!
       l = TiledLayout(
         plgpu.Tiling(tuple(tile_spec)),
         warp_dims=(-11, -9),
-        lane_dims=(-8, -7,),
+        lane_dims=lane_dims,
         vector_dim=vector_dim,
         _check_canonical=False).canonicalize()
       layout = plgpu.Layout.TILED(l.tiling, warp_dims=l.warp_dims,

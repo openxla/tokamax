@@ -33,8 +33,26 @@ from tokamax._src import config as config_lib
 from tokamax._src.ops.normalization import arg_specs
 from tokamax._src.ops.normalization import mosaic
 
-def test_doit():
-  print("THE LEN ", mosaic._vector_length(1, 128, 16))
+class VecAlongNTest(parameterized.TestCase):
+  """`_vec_along_n` must spend lanes on N before A, and tile exactly."""
+
+  @parameterized.parameters(
+      # (vec, M, A, N) -> (M, A // la, N // ln)
+      ((8, 1, 128, 16), (1, 8, 8)),  # alphafold_..._axis0: la=16, ln=2.
+      ((8, 1, 128, 256), (1, 128, 8)),  # N wide enough for all 32 lanes.
+      ((8, 4, 384, 16), (4, 24, 8)),
+  )
+  def test_lane_split(self, args, expected):
+    self.assertEqual(mosaic._vec_along_n(*args), expected)
+
+  @parameterized.parameters(
+      (8, 1, 128, 16), (8, 1, 128, 256), (8, 4, 384, 16), (8, 1, 32, 8)
+  )
+  def test_exactly_32_lanes(self, vec, m, a, n):
+    _, a3, n3 = mosaic._vec_along_n(vec, m, a, n)
+    # The lane dims are the A and N tile counts; they must be all 32 lanes.
+    self.assertEqual((a // a3) * (n // n3), 32)
+    self.assertEqual(n3 % vec, 0)  # The vector runs along N within the tile.
 
 class _AmpereDevice:
   """Just enough of a `jax.Device` for the support checks and heuristics."""
