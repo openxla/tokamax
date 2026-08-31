@@ -78,7 +78,7 @@ jobs:
               'linear_softmax_and_experimental': (
                   '--ignore=tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py '
                   '--ignore=tokamax/_src/ops/experimental/tpu/splash_attention/ '
-                  '--ignore=tokamax/_src/ops/experimental/tpu/gmm_v2/ '
+                  '--ignore=tokamax/_src/ops/experimental/gmm_v2/ '
                   'tokamax/_src/ops/linear_softmax_cross_entropy_loss/ '
                   'tokamax/_src/ops/experimental/'
               ),
