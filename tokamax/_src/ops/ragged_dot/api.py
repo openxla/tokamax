@@ -89,6 +89,7 @@ def ragged_dot(
         | Sequence[Implementation | Callable[..., jax.Array]]
         | None
     ) = None,
+    bypass_device_check: bool | None = None,
 ) -> Float[Array, "M N"]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -116,6 +117,8 @@ def ragged_dot(
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
       that doesn't raise a `NotImplementedError` is used.
+    bypass_device_check: Whether to bypass device validation. If None (default),
+      bypasses device check when an implementation is explicitly passed in.
 
   Returns:
     (m, n) shaped array with `preferred_element_type` element type.
@@ -131,6 +134,7 @@ def ragged_dot(
       activation=activation,
       manual_axis_type=manual_axis_type,
       implementation=implementation,
+      bypass_device_check=bypass_device_check,
   )
 
 
@@ -150,6 +154,7 @@ def ragged_dot_general(
         | Sequence[Implementation | Callable[..., jax.Array]]
         | None
     ) = None,
+    bypass_device_check: bool | None = None,
 ) -> Float[Array, "..."]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -176,12 +181,25 @@ def ragged_dot_general(
       will automatically select the best available backend, and is guaranteed to
       work on all platforms. If a sequence is passed, the first implementation
       that doesn't raise a `NotImplementedError` is used.
+    bypass_device_check: Whether to bypass device validation on the op. If None
+      (default), bypasses device check when an implementation is explicitly
+      passed in (manual implementation).
 
   Returns:
     An array with `preferred_element_type` element type.
   """
   if group_offset is not None:
     raise NotImplementedError("`group_offset` is not yet supported.")
+
+  if bypass_device_check is None:
+    # Auto-selection and fallback sequences enforce device checks;
+    # a single explicit implementation bypasses them for CPU export.
+    if implementation is None:
+      bypass_device_check = False
+    elif isinstance(implementation, (list, tuple)):
+      bypass_device_check = len(implementation) <= 1
+    else:
+      bypass_device_check = True
 
   if implementation is None:
     implementation = _DEFAULT_IMPLEMENTATIONS
@@ -221,6 +239,8 @@ def ragged_dot_general(
       kwargs = {}
       if manual_axis_type is not None:
         kwargs["manual_axis_type"] = manual_axis_type
+      if bypass_device_check and isinstance(impl, base.op.Op):
+        impl = impl.replace(bypass_device_check=True)
 
       return impl(
           lhs,

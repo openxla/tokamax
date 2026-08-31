@@ -158,6 +158,25 @@ of standard StableHLO. Tokamax makes two serialization guarantees:
     [compatibility guarantees as JAX](https://docs.jax.dev/en/latest/export/export.html#compatibility-guarantees-for-custom-calls):
     6 month backward compatibility.
 
+#### Cross-Compilation and CPU Export
+
+Tokamax kernels can be exported or cross-compiled on a CPU host:
+
+*   Explicit implementation selection (e.g. `implementation="mosaic_tpu_v2"`)
+    automatically bypasses host device validation.
+*   Alternatively, enable cross-compilation globally using
+    `tokamax.config.cross_compile(True)`:
+
+```python
+with tokamax.config.cross_compile(True):
+  f_exported = export.export(
+      f, disabled_checks=tokamax.DISABLE_JAX_EXPORT_CHECKS
+  )(
+      jax.ShapeDtypeStruct(x.shape, x.dtype),
+      ...,
+  )
+```
+
 ### Benchmarking
 
 JAX Python overhead is often much larger than the actual accelerator kernel

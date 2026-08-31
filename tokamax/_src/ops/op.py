@@ -163,6 +163,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
 
   config: C | None = None
   _: dataclasses.KW_ONLY
+  bypass_device_check: bool = False
   # VJP function for the op. `vjp` will be passed the residuals and the output
   # of the op, the output gradients, then all arguments passed to the op.
   # The VJP function must return a tuple of gradients for each positional
@@ -194,7 +195,10 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     ...
 
   def __call__(
-      self, *args: P.args, return_residuals: bool = False, **kwargs: P.kwargs  # pyrefly: ignore[bad-function-definition]
+      self,
+      *args: P.args,
+      return_residuals: bool = False,  # pyrefly: ignore[bad-function-definition]
+      **kwargs: P.kwargs,
   ) -> T | tuple[T, R]:
     """Applies the operation with the given arguments."""
 
@@ -206,9 +210,11 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     bind = cast(Callable[P, Any], self.bind)  # Work around pytype bug.
     ba = bind(*args, **kwargs)
 
-    for device in infer_devices(ba) or {backend.get_default_device()}:
-      if not self.supported_on(device):
-        raise NotImplementedError(f"Not supported on {device.device_kind}.")
+    bypass = self.bypass_device_check or config_lib.cross_compile.value
+    if not bypass:
+      for device in infer_devices(ba) or {backend.get_default_device()}:
+        if not self.supported_on(device):
+          raise NotImplementedError(f"Not supported on {device.device_kind}.")
 
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
     is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
