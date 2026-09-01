@@ -239,6 +239,7 @@ class InputConfigs:
   # (dtype == quant_dtype) the scale dequantizes it (rhs); when it arrives
   # unquantized (dtype != quant_dtype) the scale quantizes it online (lhs).
   has_scale: bool = False
+  is_transposed: bool = False
 
   @property
   def should_use_external_scale(self) -> bool:
@@ -1030,7 +1031,7 @@ def calculate_tiling(
   # safe to use for most scenarios. But if lower bitwidth is used, we need
   # to tweak tile_m to account for using faster hardware unit.
   # TODO: Account for different TPU hardware specs.
-  bf16_bf16_tile_m = 128
+  bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
   rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
   tile_m = bf16_bf16_tile_m // rhs_mod
   if lhs_cfgs.should_quantize:
@@ -1359,6 +1360,7 @@ def make_gmm_configs(
       dtype=rhs.dtype,
       has_bias=rhs_bias is not None,
       has_scale=has_scale,
+      is_transposed=transpose_rhs,
   )
 
   lhs_q_dtype = None

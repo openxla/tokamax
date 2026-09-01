@@ -200,11 +200,18 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     # heuristic below.
     explicit_tiles = (
         None
-        if None in (config.tile_m, config.tile_k, config.tile_n,
-                    config.bucket_base)
+        if (
+            config.tile_m is None
+            or config.tile_k is None
+            or config.tile_n is None
+        )
         else gmm_backend.TileSizes(
-            tile_m=config.tile_m, tile_k=config.tile_k, tile_n=config.tile_n,  # pyrefly: ignore[bad-argument-type]
-            bucket_base=config.bucket_base,  # pyrefly: ignore[bad-argument-type]
+            tile_m=config.tile_m,
+            tile_k=config.tile_k,
+            tile_n=config.tile_n,
+            bucket_base=config.bucket_base
+            if config.bucket_base is not None
+            else config.tile_m,
         )
     )
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
