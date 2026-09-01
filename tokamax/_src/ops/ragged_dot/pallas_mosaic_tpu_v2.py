@@ -165,6 +165,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,
       maybe_quantize_lhs: bool = False,
+      lhs_scale: jax.Array | None = None,
       zero_initialize: bool = True,
       fuse_gateup_activation: str | None = None,
       lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
@@ -222,6 +223,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           rhs_scale,
           rhs_bias,
           group_offset,
+          lhs_scale,
           tile_info=explicit_tiles
           if explicit_tiles is not None
           else gmm_backend.calculate_tiling,
@@ -242,6 +244,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           None,  # rhs_scale
           None,  # rhs_bias
           group_offset,
+          None,  # lhs_scale
           tile_info=explicit_tiles
           if explicit_tiles is not None
           else gmm_backend.calculate_tiling,

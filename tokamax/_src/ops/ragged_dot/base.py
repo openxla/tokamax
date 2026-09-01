@@ -206,6 +206,7 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
     rhs_scale: The rhs scale when rhs is quantized.
     rhs_bias: The rhs bias: ragged_dot(lhs, rhs) + rhs_bias.
     maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
+    lhs_scale: The lhs scale when maybe_quantize_lhs is True.
     zero_initialize: Whether to initialize unvisited output
       elements to zero. Defaults to True (standard behavior).
     fuse_gateup_activation: fuse_gateup_activation basically fuses these two
@@ -241,6 +242,7 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,
       maybe_quantize_lhs: bool = False,
+      lhs_scale: jax.Array | None = None,
       zero_initialize: bool = True,
       fuse_gateup_activation: str | None = None,
       lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
@@ -281,6 +283,7 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         rhs_scale=rhs_scale,
         rhs_bias=rhs_bias,
         maybe_quantize_lhs=maybe_quantize_lhs,
+        lhs_scale=lhs_scale,
         zero_initialize=zero_initialize,
         fuse_gateup_activation=fuse_gateup_activation,
         lhs_quantization_dtype=lhs_quantization_dtype,
@@ -305,6 +308,7 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,
       maybe_quantize_lhs: bool = False,
+      lhs_scale: jax.Array | None = None,
       zero_initialize: bool = True,
       fuse_gateup_activation: str | None = None,
       lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
@@ -317,6 +321,7 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         or rhs_scale is not None
         or rhs_bias is not None
         or maybe_quantize_lhs
+        or lhs_scale is not None
         or not zero_initialize
         or fuse_gateup_activation is not None
         or lhs_quantization_dtype is not None
@@ -324,9 +329,9 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
     ):
       raise NotImplementedError(
           "The base XLA implementation does not support group_offset,"
-          " rhs_scale, rhs_bias, maybe_quantize_lhs, zero_initialize,"
-          " fuse_gateup_activation, lhs_quantization_dtype, or"
-          " rhs_quantization_dtype."
+          " rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
+          " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
+          " or rhs_quantization_dtype."
       )
 
     lhs, rhs = map(quantization.as_array, (lhs, rhs))
@@ -384,6 +389,7 @@ def vjp(
     rhs_scale: jax.Array | None = None,
     rhs_bias: jax.Array | None = None,
     maybe_quantize_lhs: bool = False,
+    lhs_scale: jax.Array | None = None,
     zero_initialize: bool = True,
     fuse_gateup_activation: str | None = None,
     lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
@@ -397,13 +403,14 @@ def vjp(
       or rhs_scale is not None
       or rhs_bias is not None
       or maybe_quantize_lhs
+      or lhs_scale is not None
       or not zero_initialize
       or fuse_gateup_activation is not None
       or lhs_quantization_dtype is not None
       or rhs_quantization_dtype is not None
   ):
     raise NotImplementedError(
-        "group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs,"
+        "group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
         " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
         " rhs_quantization_dtype are not supported on the ragged_dot backward"
         " path for now."

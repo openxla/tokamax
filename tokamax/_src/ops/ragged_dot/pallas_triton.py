@@ -366,6 +366,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
       rhs_scale: jax.Array | None = None,
       rhs_bias: jax.Array | None = None,
       maybe_quantize_lhs: bool = False,
+      lhs_scale: jax.Array | None = None,
       zero_initialize: bool = True,
       fuse_gateup_activation: str | None = None,
       lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
@@ -376,6 +377,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
         or rhs_scale is not None
         or rhs_bias is not None
         or maybe_quantize_lhs
+        or lhs_scale is not None
         or not zero_initialize
         or fuse_gateup_activation is not None
         or lhs_quantization_dtype is not None
@@ -383,7 +385,7 @@ class PallasTritonRaggedDot(base.RaggedDot[Config, None]):
     ):
       raise NotImplementedError(
           "The Pallas-Triton implementation does not support"
-          " group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs,"
+          " group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
           " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
           " or rhs_quantization_dtype."
       )

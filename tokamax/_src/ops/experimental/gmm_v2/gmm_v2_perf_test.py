@@ -46,6 +46,7 @@ class GmmPerfTest(parameterized.TestCase):
         rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
@@ -54,6 +55,7 @@ class GmmPerfTest(parameterized.TestCase):
         group_sizes=group_sizes,
         rhs_scale=rhs_scale,
         maybe_quantize_lhs=True,
+        lhs_scale=lhs_scale,
         preferred_element_type=jnp.bfloat16,
     )
     fn, args = benchmarking.standardize_function(

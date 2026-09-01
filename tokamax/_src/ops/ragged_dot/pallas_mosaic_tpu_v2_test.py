@@ -273,6 +273,40 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
         kernel_kwargs=kwargs,
     )
 
+  def test_gmm_quantize_lhs_with_lhs_scale_pipes(self):
+    # Mirrors test_gmm_quantize_lhs_with_lhs_scale:
+    # jnp.float8_e4m3fn `rhs` + `rhs_scale` with
+    # `maybe_quantize_lhs=True` and a user-provided `lhs_scale`.
+    batch_size, in_size, out_size = 128, 512, 512
+    num_groups, group_offset, block_size = 4, 1, 512
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+
+    lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    rhs_q, rhs_scale = gmm_util.quantize_tensor(
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
+    group_sizes = gmm_util.get_group_sizes(batch_size, num_groups)
+
+    kwargs = dict(
+        rhs_scale=rhs_scale,
+        group_offset=jnp.array([group_offset], jnp.int32),
+        maybe_quantize_lhs=True,
+        lhs_scale=lhs_scale,
+    )
+    self._assert_gmm_api_matches_kernel(
+        lhs,
+        rhs_q,
+        group_sizes,
+        op_kwargs=kwargs,
+        kernel_kwargs=kwargs,
+    )
+
   def test_gmm_implicit_padding_pipes(self):
     # Mirrors test_gmm_implicit_padding: non-tile-aligned `in_size`/`out_size`
     # with `rhs_bias`.
