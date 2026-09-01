@@ -33,7 +33,6 @@ DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.PALLAS_TRITON_KEY),
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_FFI_KEY),
 )
-
 type HloComputation = (
     jax.stages.Lowered
     | ir.Module
@@ -86,6 +85,46 @@ def get_opspecs(
     op_specs.append(op_lib.BOUND_ARGS_ADAPTER.validate_json(json_data))
 
   return tuple(op_specs)
+
+
+def get_bound_args[**P](
+    f: (
+        Callable[P, Any]
+        | HloComputation
+    ),
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> tuple[op_lib.BoundArguments, ...]:
+  """Returns a tuple of unique BoundArguments for all Tokamax ops in `f`.
+
+  Args:
+    f: A callable, or a lowered JAX function.
+    *args: Positional arguments to `f` (only valid if `f` is callable).
+    **kwargs: Keyword arguments to `f` (only valid if `f` is callable).
+
+  Returns:
+    A tuple of unique BoundArguments for all Tokamax ops in `f`.
+  """
+  if callable(f):
+    if not isinstance(f, jax.stages.Wrapped):
+      f = jax.jit(f)
+    f = f.lower(*args, **kwargs)
+  elif args or kwargs:
+    raise ValueError('`args` / `kwargs` are only supported if `f` is callable.')
+
+  bound_args = get_opspecs(f)
+
+  # Filter out bound args so that only unique ones remain.
+  seen_keys = set()
+  unique_bound_args = []
+  for bound_arg in bound_args:
+    # The chosen config is serialized into the HLO - remove it here.
+    bound_arg = bound_arg.replace(op=bound_arg.op.replace(config=None))
+    key = bound_arg.autotuning_cache_key
+    if (bound_arg.op.__class__.__name__, key) not in seen_keys:
+      seen_keys.add((bound_arg.op.__class__.__name__, key))
+      unique_bound_args.append(bound_arg)
+  return tuple(unique_bound_args)
 
 
 # Adapted from `GetNameFromLocImpl` in `mhlo_to_hlo/location_exporter.cc`.

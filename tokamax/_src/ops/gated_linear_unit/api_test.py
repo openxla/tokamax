@@ -20,8 +20,8 @@ from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
-from tokamax import autotuning
 from tokamax._src import gpu_utils
+from tokamax._src import hlo_utils
 from tokamax._src.ops.gated_linear_unit import api
 from tokamax._src.ops.gated_linear_unit import test_base
 
@@ -76,7 +76,7 @@ class GatedLinearUnitTest(parameterized.TestCase):
     with self.subTest("value"):
       chex.assert_trees_all_close(out, out_golden)
 
-    args = autotuning.get_bound_args(f.lower(lhs, rhs))
+    args = hlo_utils.get_bound_args(f.lower(lhs, rhs))
     self.assertLen(args, 1)
 
     self.assertEqual(lhs.dtype, jnp.bfloat16)

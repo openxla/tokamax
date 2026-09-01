@@ -201,44 +201,10 @@ _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
 _BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_lib.BoundArguments)
 
 
-def get_bound_args[**P](
-    f: (
-        Callable[P, Any]
-        | hlo_utils.HloComputation
-    ),
-    *args: P.args,
-    **kwargs: P.kwargs,
-) -> tuple[op_lib.BoundArguments, ...]:
-  """Returns a tuple of unique BoundArguments for all Tokamax ops in `f`.
-
-  Args:
-    f: A callable, or a lowered JAX function.
-    *args: Positional arguments to `f` (only valid if `f` is callable).
-    **kwargs: Keyword arguments to `f` (only valid if `f` is callable).
-
-  Returns:
-    A tuple of unique BoundArguments for all Tokamax ops in `f`.
-  """
-  if callable(f):
-    if not isinstance(f, jax.stages.Wrapped):
-      f = jax.jit(f)
-    f = f.lower(*args, **kwargs)
-  elif args or kwargs:
-    raise ValueError("`args` / `kwargs` are only supported if `f` is callable.")
-
-  bound_args = hlo_utils.get_opspecs(f)
-
-  # Filter out bound args so that only unique ones remain.
-  seen_keys = set()
-  unique_bound_args = []
-  for bound_arg in bound_args:
-    # The chosen config is serialized into the HLO - remove it here.
-    bound_arg = bound_arg.replace(op=bound_arg.op.replace(config=None))
-    key = bound_arg.autotuning_cache_key
-    if (bound_arg.op.__class__.__name__, key) not in seen_keys:
-      seen_keys.add((bound_arg.op.__class__.__name__, key))
-      unique_bound_args.append(bound_arg)
-  return tuple(unique_bound_args)
+# Re-exported from `hlo_utils`, which is where it lives so that callers only
+# wanting to read ops back out of a lowered function need not import the op
+# modules that `_API_IMPLEMENTATIONS` below requires.
+get_bound_args = hlo_utils.get_bound_args
 
 
 def dump_bound_args_to_json(bound_args: Sequence[op_lib.BoundArguments]) -> str:
