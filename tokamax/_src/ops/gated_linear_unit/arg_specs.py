@@ -20,11 +20,8 @@ import jax
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src.autotuning import arg_spec
-from tokamax._src.ops.attention import base
 
 BatchedShapeDtype = batching.BatchedShapeDtype
-ShapeDtype = jax.ShapeDtypeStruct
-Mask = base.Mask
 
 
 def _alphafold_oss_inference_spec(
