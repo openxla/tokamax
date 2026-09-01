@@ -3,6 +3,13 @@ name: Publish to PyPI
 on:
   # Event manually triggered (in the Github UI)
   workflow_dispatch:
+  # Nightly wheels: publish automatically once the nightly tests pass.
+  # `types: [completed]` fires on any finish, so the job `if:` below filters
+  # down to successful runs of the default branch.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: ["CI-Nightly"]
+    types: [completed]
+    branches: [main]
 
 
 # This job will publish the package to PyPI. It will use the release
@@ -11,9 +18,18 @@ on:
 # and https://blog.pypi.org/posts/2023-04-20-introducing-trusted-publishers for more details.
 jobs:
   pypi-publish:
+    # On a manual run `github.event.workflow_run` does not exist, so the
+    # conclusion check alone would evaluate falsy and skip the job.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: release
+    # release-nightly environment and release environment use different
+    # approval gates.
+    environment:
+      name: ${{ (github.event_name == 'workflow_run' && 'release-nightly') || 'release' }}
     permissions:
       # IMPORTANT: this permission is mandatory for trusted publishing
       id-token: write
@@ -24,12 +40,24 @@ jobs:
     - name: Checkout Tokamax
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
+        # Pin to the commit CI-Nightly tested. Without this a workflow_run job
+        # checks out the default branch's current HEAD, which may have moved
+        # since that run started. Empty on manual dispatch, so it falls back.
+        ref: ${{ github.event.workflow_run.head_sha || github.ref }}
         persist-credentials: false
 
     - name: Install Python 3.12
       uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
       with:
         python-version: 3.12
+
+    # Stamp the version and git revision into the working tree before building.
+    # Never committed, so `main` keeps its stable version.
+    - name: Stamp version and revision
+      env:
+        NIGHTLY: ${{ github.event_name == 'workflow_run' }}
+        TESTED_SHA: ${{ github.event.workflow_run.head_sha }}  # empty on manual dispatch
+      run: python .github/scripts/stamp_version.py
 
     - name: Install dependencies
       run: |
@@ -45,4 +73,4 @@ jobs:
         python -m build
 
     - name: Publish package distributions to PyPI
-      uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc  # v1.12.4
+      uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
