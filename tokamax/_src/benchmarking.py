@@ -150,6 +150,17 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     self._retain_artifacts = False
     self._timing_summary: dict[str, Any] | None = None
 
+    options = jax.profiler.ProfileOptions()
+    options.python_tracer_level = 0
+    options.host_tracer_level = 0
+    options.enable_hlo_proto = False
+    if jax.default_backend() == 'tpu':
+      options.advanced_configuration = {
+          'tpu_trace_mode': 'TRACE_ONLY_XLA',
+          'tpu_perf_counters': True,
+      }
+    self._profiler_options = options
+
   @property
   def total_op_time(self) -> datetime.timedelta:
     """Returns the total active device time of XLA operators.
@@ -207,7 +218,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         # get profiling wallclock time right before the profiling starts
         self._profiler_wallclock_start_time = time.perf_counter()
         self._profiler_wallclock_time = None
-        jax.profiler.start_trace(self._profile_tempdir)
+
+        jax.profiler.start_trace(
+            self._profile_tempdir, profiler_options=self._profiler_options
+        )
         logger.info('Writing JAX profiler trace to: %s', self._profile_tempdir)
       except Exception as e:
         raise RuntimeError('Unable to start jax profiling session.') from e
@@ -221,7 +235,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         self._profiler_wallclock_time = None
         self._xprof_session.start_session(
             enable_python_tracer=False,
-            host_trace_level=2,
+            host_trace_level=0,
             perf_counters=False,
             **self._xprof_session_kwargs,
         )
@@ -251,8 +265,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       self._profile = jax.profiler.ProfileData.from_serialized_xspace(
           profile_path.read_bytes()
       )
-      if (not self._retain_artifacts
-          or WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ):
+      if (
+          not self._retain_artifacts
+          or WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ
+      ):
         if self._profile_tempdir is not None and self._profile_tempdir.exists():
           shutil.rmtree(self._profile_tempdir)
       logger.info('JAX profiler trace file written to: %s', profile_path)
@@ -297,7 +313,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
 
 
 _ARRAY_TYPES = (
-    jax.Array, numerics.ArrayInitializer, jax.ShapeDtypeStruct, np.ndarray
+    jax.Array,
+    numerics.ArrayInitializer,
+    jax.ShapeDtypeStruct,
+    np.ndarray,
 )
 
 
