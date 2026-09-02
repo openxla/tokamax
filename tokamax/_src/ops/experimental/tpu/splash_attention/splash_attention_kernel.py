@@ -156,6 +156,9 @@ class SplashConfig:
   dq_reduction_steps: int | None = None
   # An experimental scheduler that sometimes produces better softmax overlap.
   use_experimental_scheduler: bool = False
+  # If provided, scale FP32 QK logits inside the kernel. Keeping this optional
+  # preserves the legacy path, where callers pre-scale Q before invoking Splash.
+  softmax_scale: float | None = None
 
   def __post_init__(self):
     if self.block_kv_compute is None:
@@ -396,7 +399,7 @@ def flash_attention_kernel(
     assert l_prev.shape == (bq, NUM_LANES)
 
     q = q_ref[...] if config.q_layout == HEAD_DIM_MINOR else q_ref[...].T
-    if config.use_base2_exp:
+    if config.use_base2_exp and config.softmax_scale is None:
       q *= LOG2E
 
     qk_dims = (
@@ -407,6 +410,10 @@ def flash_attention_kernel(
     else:
       k = k_ref[:, slice_k]
     qk = lax.dot_general(q, k, qk_dims, preferred_element_type=float32)
+    if config.softmax_scale is not None:
+      qk *= jnp.float32(config.softmax_scale)
+      if config.use_base2_exp:
+        qk *= jnp.float32(LOG2E)
 
     assert qk.shape == (bq, bkv_compute)
     apply_mask_and_soft_cap = functools.partial(
@@ -1111,7 +1118,7 @@ def _flash_attention_dq_kernel(
 
   def body(has_partial_mask: bool = False):
     q = q_ref[...] if config.q_layout == HEAD_DIM_MINOR else q_ref[...].T
-    if config.use_base2_exp:
+    if config.use_base2_exp and config.softmax_scale is None:
       q *= LOG2E
     # We keep k and v possibly transposed, since they are RHS of dots.
     k = k_ref[...]
@@ -1124,6 +1131,10 @@ def _flash_attention_dq_kernel(
         NT_DIM_NUMBERS if config.k_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
     qk_uncapped = lax.dot_general(q, k, qk_dims, preferred_element_type=float32)
+    if config.softmax_scale is not None:
+      qk_uncapped *= jnp.float32(config.softmax_scale)
+      if config.use_base2_exp:
+        qk_uncapped *= jnp.float32(LOG2E)
 
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
@@ -1155,6 +1166,8 @@ def _flash_attention_dq_kernel(
       normalized = qk_uncapped / attn_logits_soft_cap
       d = jnp.tanh(normalized)
       ds = ds * (1 - d * d)
+    if config.softmax_scale is not None:
+      ds *= jnp.float32(config.softmax_scale)
 
     dq_dims = (
         NN_DIM_NUMBERS if config.k_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
@@ -1277,7 +1290,7 @@ def _flash_attention_dkv_kernel(
 
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
     q = q_ref[...]  # We keep q potentially transposed, since it's always RHS
-    if config.use_base2_exp:
+    if config.use_base2_exp and config.softmax_scale is None:
       scaled_q = q * LOG2E
     else:
       scaled_q = q
@@ -1299,6 +1312,10 @@ def _flash_attention_dkv_kernel(
     qk_uncapped = lax.dot_general(
         k, scaled_q, qk_dims, preferred_element_type=jnp.float32
     )
+    if config.softmax_scale is not None:
+      qk_uncapped *= jnp.float32(config.softmax_scale)
+      if config.use_base2_exp:
+        qk_uncapped *= jnp.float32(LOG2E)
 
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
@@ -1332,6 +1349,8 @@ def _flash_attention_dkv_kernel(
       normalized = qk_uncapped / attn_logits_soft_cap
       d = jnp.tanh(normalized)
       ds = ds * (1 - d * d)
+    if config.softmax_scale is not None:
+      ds *= jnp.float32(config.softmax_scale)
     dk_dims = (
         NN_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
     )
