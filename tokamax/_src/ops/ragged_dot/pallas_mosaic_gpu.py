@@ -16,8 +16,7 @@
 
 import dataclasses
 from functools import partial  # pylint: disable=g-importing-member
-from typing import Any, ClassVar, cast
-from typing import Any, ClassVar, override
+from typing import Any, cast, ClassVar, override
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +31,7 @@ import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_fp8_quant as s
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm100_i8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm80 as sm80
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
 
@@ -215,6 +215,23 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
       else:
         fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
+    elif gpu_utils.is_sm80():
+      lhs = quantization.as_array(lhs)
+      rhs = quantization.as_array(rhs)
+
+      if not precision_lib.is_default(lhs.dtype, rhs.dtype, precision):
+        if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+          lhs = lhs.astype(jnp.bfloat16)
+          rhs = rhs.astype(jnp.bfloat16)
+        else:
+          raise NotImplementedError(f"{precision=} not supported.")
+
+      if ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS:
+        fn = sm80.ragged_dot_kernel
+      else:
+        raise NotImplementedError(
+            "Only default `ragged_dot_dimension_numbers` supported on SM80."
+        )
     else:
       raise NotImplementedError("Unsupported GPU architecture.")
 
@@ -347,6 +364,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             grid_minor_dim=common.MatmulDimension.M,
             grid_tile_width=4,
         )
+    elif gpu_utils.is_sm80():
+      return sm80.get_heuristics_config(ba)
     else:
       raise NotImplementedError("Unsupported GPU architecture.")
 
@@ -354,6 +373,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     if gpu_utils.is_sm100():
       return self._get_sm100_autotuning_configs(ba)
+    if gpu_utils.is_sm80():
+      return sm80.get_autotuning_configs(ba)
     return self._get_sm90_autotuning_configs(ba)
 
   def _get_sm90_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:

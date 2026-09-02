@@ -74,6 +74,18 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
               num_stages=2,
               split_k=1,
           )
+      elif "a100" in device_kind:
+        has_custom_dims = "ragged_dot_dimension_numbers" in kwargs
+        if has_custom_dims:
+          expect_supported = False
+        else:
+          config = pallas_mosaic_gpu.Config(
+              block_m=64,
+              block_n=128,
+              block_k=64,
+              num_stages=2,
+              split_k=1,
+          )
       elif isinstance(rhs_, qwix.QArray):
         if (
             rhs_.scale_tile_shape[0] != 1
@@ -95,6 +107,11 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
+    device_kind = jax.devices()[0].device_kind.lower()
+    if "a100" in device_kind:
+      test_name = self._testMethodName
+      if "vjp" in test_name:
+        self.skipTest("No contracting dim kernel for A100 (drhs gradient).")
     super().setUp()
 
 
