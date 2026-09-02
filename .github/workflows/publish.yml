@@ -6,6 +6,9 @@ on:
   # Nightly wheels: publish automatically once the nightly tests pass.
   # `types: [completed]` fires on any finish, so the job `if:` below filters
   # down to successful runs of the default branch.
+  #
+  # The `zizmor: ignore` below is safe because of the
+  # `workflow_run.head_repository.full_name == github.repository` check below.
   workflow_run: # zizmor: ignore[dangerous-triggers]
     workflows: ["CI-Nightly"]
     types: [completed]
@@ -18,12 +21,15 @@ on:
 # and https://blog.pypi.org/posts/2023-04-20-introducing-trusted-publishers for more details.
 jobs:
   pypi-publish:
-    # On a manual run `github.event.workflow_run` does not exist, so the
-    # conclusion check alone would evaluate falsy and skip the job.
+    # On a manual run `github.event.workflow_run` does not exist.
+    # `workflow_run.head_repository.full_name == github.repository`
+    # ensures this job does not run on a CI-Nightly run whose head commit
+    # came from a fork.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main')
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # release-nightly environment and release environment use different
