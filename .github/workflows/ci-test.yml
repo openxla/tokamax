@@ -1,0 +1,196 @@
+name: CI-Test-Sharding
+
+#  Full workflow to validate a resharded version of ci-build.yml
+#
+#  This runs alongside `ci-build.yml`, not instead of it: both fire on every
+#  pull request, so a PR gets the current job set and this one, and the two can
+#  be compared on the same commit. That roughly doubles the accelerator load
+#  per PR, which is the price of the comparison and the reason this is
+#  temporary -- when the shard set is trusted, this file's contents replace
+#  ci-build.yml's and this file goes away. Nothing here is required in branch
+#  protection while that is true.
+#
+#  Every job here is prefixed `shard-`, and none of those names appear in
+#  ci-build.yml. GitHub names a check after its job, so two workflows sharing
+#  a job name put two identically-named checks on the same PR, and a required
+#  check by that name becomes ambiguous. The prefix also makes it readable at
+#  a glance which of the two workflows a red check came from. It says `shard-`
+#  rather than naming the mechanism, so that adding dependency-based selection
+#  later does not rename every check and invalidate branch protection.
+#
+#  Shards are declared in `.github/ci/shards.py`, which also builds the job
+#  matrix and checks that every test file is claimed by some shard.
+#
+#  Every shard runs on every PR here, as in ci-build.yml. Narrowing a run to
+#  the shards a change can affect is the next step and is deliberately not
+#  part of this one: this workflow exists to establish that the new shard set
+#  runs the same tests as the old one, and a run that skips shards cannot
+#  demonstrate that.
+#
+#  There is deliberately no `push` trigger: this workflow is being evaluated,
+#  and until it is trusted a merge should not spend a second full pass on the
+#  accelerators, nor be able to redden main.
+#
+#  Require `shard-all-tests-passed` in branch protection, not the shard jobs,
+#  whose names and number change whenever the SHARDS table is rebalanced.
+on:
+  # Trigger the workflow on pull request for the main branch.
+  pull_request:
+    branches:
+      - main
+  # Event manually triggered (in the Github UI)
+  workflow_dispatch:
+
+# Constants for the workflow that are shared across jobs.
+env:
+  JAX_ENABLE_X64: 0
+  JAX_TRACEBACK_FILTERING: off
+  UV_HTTP_TIMEOUT: 300
+
+permissions:
+  contents: read
+# We should cancel the previous run if it's still running and there is a new commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# These jobs should build Tokamax and run the tests on Google Cloud resources.
+jobs:
+  shard-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.compute.outputs.include }}
+      # The pytest flags that decide which tests are selected, as opposed to
+      # how they are reported. Emitted by the same module that builds the
+      # shard paths so the two cannot disagree about what the suite is.
+      pytest_flags: ${{ steps.compute.outputs.pytest_flags }}
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test the CI scripts
+        # `shards.py` decides what every other job runs, and no shard covers
+        # it -- the table only names test files under `tokamax/`, so a test in
+        # this directory would run nowhere. Ahead of the matrix rather than
+        # beside it: if these fail, the matrix built from the same module is
+        # not worth spending accelerators on. Stdlib unittest, no install.
+        run: python3 -m unittest discover -s .github/ci -p '*_test.py'
+
+      - name: Build test matrix
+        id: compute
+        # Fails the run if a shard's targets have been renamed away, if a file
+        # split by node ID grows a class no shard names, or if a shard's paths
+        # are not test files. Stdlib only, so no install needed.
+        #
+        # stdout is the job outputs and goes to $GITHUB_OUTPUT; stderr is the
+        # human summary and is kept for the step below. Split rather than
+        # piped so a non-zero exit still shows the error.
+        run: |
+          set -o pipefail
+          if ! python3 .github/ci/shards.py matrix \
+              > /tmp/outputs.txt 2> /tmp/summary.txt; then
+            cat /tmp/summary.txt
+            exit 1
+          fi
+          cat /tmp/outputs.txt >> "$GITHUB_OUTPUT"
+          cat /tmp/summary.txt
+
+      - name: Warn about unsharded test files
+        # A test file no shard names is swept into the `catch-all` shard, so it
+        # still runs; this is what makes that visible from the PR rather than
+        # only in this job's log. Not fatal, because the file running in the
+        # wrong job is better than a red build for someone who added a test.
+        if: steps.compute.outputs.catch_all != '[]'
+        # Through the environment rather than interpolated into the script:
+        # these are paths out of the pull request, so `${{ }}` here would be a
+        # shell injection.
+        env:
+          CATCH_ALL: ${{ steps.compute.outputs.catch_all }}
+        run: |
+          echo "::warning::Test files belong to no shard and ran in the" \
+               "catch-all job: ${CATCH_ALL}. Give each one a shard in" \
+               ".github/ci/shards.py; the catch-all job's --durations say" \
+               "which shard has room."
+
+      - name: Summarise shards
+        # Lists every shard and every test file it runs, in the run summary.
+        run: |
+          python3 .github/ci/shards.py list > /tmp/table.txt
+          cat /tmp/table.txt
+          {
+            echo '## Shard summary'
+            echo '```'
+            cat /tmp/summary.txt
+            echo '```'
+            echo '## Every shard and the tests it runs'
+            echo '```'
+            cat /tmp/table.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  shard-tests:
+    name: shard-tests (${{ matrix.runner_short }}, ${{ matrix.shard_name }})
+    needs: shard-matrix
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJson(needs.shard-matrix.outputs.include) }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    container:
+    # Docker image will include CUDA and cuDNN for Tokamax.
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          echo "Installing dependencies on device ${{ matrix.device }}"
+          python3.12 -m uv pip install --upgrade pip
+          python3.12 -m uv pip --version
+          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
+          python3.12 -m uv pip freeze
+
+      - name: Run shard
+         # TODO: Disable benchmarking tests for presubmit until container is fixed
+        run: |
+          # Which tests run is decided by `pytest_flags` plus this shard's
+          # paths, both from .github/ci/shards.py. `-s` and `--durations` are
+          # reporting only: --durations lists the slowest tests in each shard,
+          # which is what to rebalance the SHARDS table against.
+          pytest -s --durations=25 \
+            ${{ needs.shard-matrix.outputs.pytest_flags }} \
+            ${{ matrix.test_paths }}
+
+  shard-all-tests-passed:
+    # The idea here is that rather than checking for specific shard names to pass, we centralize
+    # the bookkeeping here, and then Copybara checks that this "result-aggregating" job passed.
+    name: shard-all-tests-passed
+    needs: [shard-matrix, shard-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        env:
+          MATRIX: ${{ needs.shard-matrix.result }}
+          TESTS: ${{ needs.shard-tests.result }}
+        run: |
+          echo "shard-matrix=${MATRIX} tests=${TESTS}"
+          # Only `success` counts. `cancelled` in particular is not a result,
+          # and treating it as one is how a cancelled run reports green.
+          if [[ "${MATRIX}" != "success" ]]; then
+            echo "::error::shard-matrix did not succeed"
+            exit 1
+          fi
+          if [[ "${TESTS}" != "success" ]]; then
+            echo "::error::tests reported ${TESTS}"
+            exit 1
+          fi
