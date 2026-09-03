@@ -144,9 +144,16 @@ class RaggedDotBenchmark(parameterized.TestCase):
     m, k, n, num_groups = 262144, 7168, 1024, 256
     k0, k2 = jax.random.split(jax.random.key(0), 2)
 
-    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
-    grad = jax.random.normal(k2, (m, n), jnp.bfloat16)
+    lhs = jax.random.normal(
+        k0, (m, k), dtype=jnp.bfloat16
+    ).astype(jnp.float8_e4m3fn)
+    grad = jax.random.normal(k2, (m, n), dtype=jnp.float32)
     group_sizes = gmm_util.get_group_sizes(m, num_groups)
+
+    grad_q, grad_scale = gmm_util.quantize_tensor(
+        grad, jnp.float8_e5m2, axis=0, block_size=m
+    )
+    grad_scale = jnp.expand_dims(grad_scale, axis=1)
 
     tgmm_backend.validate_tgmm_inputs(group_sizes, num_groups)
 
@@ -155,8 +162,9 @@ class RaggedDotBenchmark(parameterized.TestCase):
     )
     benchmark_config = dict(
         lhs=lhs,
-        rhs=grad,
+        rhs=grad_q,
         group_sizes=group_sizes,
+        rhs_scale=grad_scale,
         ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS,
         preferred_element_type=jnp.bfloat16,
     )
