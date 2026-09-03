@@ -49,6 +49,8 @@ env:
 
 permissions:
   contents: read
+  # For the jobs API, which `shard-all-tests-passed` reads to write a summary.
+  actions: read
 # We should cancel the previous run if it's still running and there is a new commit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -114,21 +116,10 @@ jobs:
                ".github/ci/shards.py; the catch-all job's --durations say" \
                "which shard has room."
 
-      - name: Summarise shards
-        # Lists every shard and every test file it runs, in the run summary.
-        run: |
-          python3 .github/ci/shards.py list > /tmp/table.txt
-          cat /tmp/table.txt
-          {
-            echo '## Shard summary'
-            echo '```'
-            cat /tmp/summary.txt
-            echo '```'
-            echo '## Every shard and the tests it runs'
-            echo '```'
-            cat /tmp/table.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: List the shards
+        # Log only, so that one can still see it, but not as an authoritative
+        # run summary including timing data - that is done after the job ends.
+        run: python3 .github/ci/shards.py list
 
   shard-tests:
     name: shard-tests (${{ matrix.runner_short }}, ${{ matrix.shard_name }})
@@ -178,6 +169,25 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Summarise results and timings
+        # Every shard's result and wall clock, in the run summary.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOBS: repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs
+        run: |
+          # `gh` holds the token and this stays testable without one. `--jq`
+          # emits one job per line. `filter=latest` is the jobs endpoint's
+          # default, named here because it is load-bearing: `all` would return
+          # a re-run's earlier attempts too, and a shard would be reported
+          # twice, once with whatever it did the first time.
+          gh api --paginate "${JOBS}?per_page=100&filter=latest" \
+            --jq '.jobs[]' > /tmp/jobs.jsonl
+          python3 .github/ci/summary.py < /tmp/jobs.jsonl >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Check results
         env:
           MATRIX: ${{ needs.shard-matrix.result }}

@@ -1019,8 +1019,8 @@ def shard_theme(name: str) -> tuple[int, str] | None:
   return None
 
 
-def shard_order(item: tuple[str, Spec]) -> tuple[int, bool, float, str]:
-  """Sorts shards by theme, then longest first, then name.
+def shard_order(item: tuple[str, Spec]) -> tuple[bool, float, int, str]:
+  """Sorts shards longest first, then by theme, then by name.
 
   Longest first because GitHub starts matrix jobs in matrix order as runners
   free up, so a long shard left until last sets the wall clock on its own.
@@ -1029,17 +1029,17 @@ def shard_order(item: tuple[str, Spec]) -> tuple[int, bool, float, str]:
     item: A `(shard name, spec)` pair, as from `dict.items`.
 
   Returns:
-    A sort key: theme in `THEMES` order with themeless shards last, then
-    measured shards before unmeasured ones, then descending `minutes`, then
+    A sort key: measured shards before unmeasured ones, then descending
+    `minutes`, then theme in `THEMES` order with themeless shards last, then
     the name.
   """
   name, spec = item
   theme = shard_theme(name)
   minutes = spec.get('minutes')
   return (
-      len(THEMES) if theme is None else theme[0],
       minutes is None,  # unmeasured last, since absent is not zero
       -(minutes or 0),
+      len(THEMES) if theme is None else theme[0],
       name,
   )
 
@@ -1130,27 +1130,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
   combos = build_matrix(shards)
   per_shard = collections.Counter(c['shard_name'] for c in combos)
-  measured = {n: s['minutes'] for n, s in shards.items() if 'minutes' in s}
   print(f'{len(shards)} shards, {len(combos)} jobs')
-  # Lead with how much runtime is actually known, because that is what a
-  # rebalance acts on and the file count says nothing about it. `longest known`
-  # is a lower bound on the suite, not an estimate of it: any shard without a
-  # number could be longer than all of these.
-  print(
-      f'  timings: {len(measured)}/{len(shards)} shards measured, longest'
-      f' known {max(measured.values(), default=0)}m'
-      f' ({max(measured, key=measured.get, default="none")})'
-  )
   # Longest first, shards without a number last. An absent `minutes` is an
   # unknown, so it sorts to the bottom rather than being read as a zero.
   order = sorted(shards.items(), key=shard_order)
-  theme_shown = None
   for name, spec in order:
-    if (theme := shard_theme(name)) and theme[1] != theme_shown:
-      theme_shown = theme[1]
-      print(f'  [{theme_shown}]')
-    minutes = f'{spec["minutes"]}m' if 'minutes' in spec else '?'
-    print(f'  {name:32s} {minutes:>4s}  x{per_shard[name]}')
+    print(f'  {name:32s} x{per_shard[name]}')
     for path in spec['paths']:
       print(f'      {path}')
 

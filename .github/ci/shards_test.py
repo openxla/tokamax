@@ -362,22 +362,32 @@ class ThemeTest(unittest.TestCase):
     self.assertNotIn('no theme', ' '.join(errors))  # filtered by `check`
     self.assertIn('no theme in THEMES: s1', joined)
 
-  def test_order_is_theme_then_longest_first(self) -> None:
+  def test_order_is_longest_first_across_themes(self) -> None:
     table = {
-        'core-utils': dict(paths=(), minutes=1),
+        'core-utils': dict(paths=(), minutes=2),
         'attention-slow': dict(paths=(), minutes=30),
         'attention-unmeasured': dict(paths=()),
-        'attention-fast': dict(paths=(), minutes=2),
+        'attention-fast': dict(paths=(), minutes=1),
     }
     self.assertEqual(
         [n for n, _ in sorted(table.items(), key=shards.shard_order)],
-        # Unmeasured sorts last within its theme: absent is not zero.
+        # Unmeasured sorts last overall: absent is not zero.
         [
             'attention-slow',
+            'core-utils',
             'attention-fast',
             'attention-unmeasured',
-            'core-utils',
         ],
+    )
+
+  def test_theme_breaks_ties_between_equal_length_shards(self) -> None:
+    table = {
+        'gmm-a': dict(paths=(), minutes=5),
+        'splash-b': dict(paths=(), minutes=5),
+    }
+    self.assertEqual(
+        [n for n, _ in sorted(table.items(), key=shards.shard_order)],
+        ['splash-b', 'gmm-a'],  # splash precedes gmm in THEMES
     )
 
   def test_every_real_shard_has_a_theme(self) -> None:
