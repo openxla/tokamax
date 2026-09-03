@@ -455,12 +455,17 @@ def cupti_timer[T](f: Callable[[T], Any], args: T) -> Timer:
 
 
 def xprof_timer[T](
-    f: Callable[[T], Any], args: T, event_filter_regex: str | None = None
+    f: Callable[[T], Any],
+    args: T,
+    event_filter_regex: str | None = None,
+    use_jax_profiler: bool = False,
 ) -> Timer:
   def timer(return_metadata):
     jax.block_until_ready(f(args))  # Warmup.
     with XprofProfileSession(
-        hermetic=not return_metadata, event_filter_regex=event_filter_regex
+        hermetic=not return_metadata,
+        event_filter_regex=event_filter_regex,
+        use_jax_profiler=use_jax_profiler,
     ) as profile:
       jax.block_until_ready(f(args))
 
@@ -473,7 +478,12 @@ def xprof_timer[T](
 def hermetic_xprof_timer[T](
     f: Callable[[T], Any], args: T, event_filter_regex: str | None = None
 ) -> Timer:
-  timer = xprof_timer(f, args, event_filter_regex=event_filter_regex)
+  timer = xprof_timer(
+      f,
+      args,
+      event_filter_regex=event_filter_regex,
+      use_jax_profiler=True,
+  )
   return lambda _: timer(False)
 
 
