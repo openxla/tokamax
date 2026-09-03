@@ -480,13 +480,13 @@ def inner_kernel(
     # Step 1: Input pre-processing.
     tiled_lhs = tiled_lhs_ref.get_value().reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
     tiled_rhs = tiled_rhs_ref.get_weight()
+    if cfgs.transpose_rhs:
+      tiled_rhs = jnp.transpose(tiled_rhs)
 
     # This should only be taken in the case where we don't requantize
     # the scales and thus we need to dequantize inside VMEM to avoid small
     # contracting dimmensions
-    rhs_tile_n = (
-        tiled_rhs.shape[0] if cfgs.transpose_rhs else tiled_rhs.shape[1]
-    )
+    rhs_tile_n = tiled_rhs.shape[1]
     rhs_qbs = cfgs.rhs_cfgs.quant_block_size
     if cfgs.rhs_cfgs.should_dequantize_before_matmul:
       if cfgs.transpose_rhs:
@@ -507,10 +507,7 @@ def inner_kernel(
 
     valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
     if is_last_k_step and valid_k != 0:
-      if cfgs.transpose_rhs:
-        mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 1) < valid_k
-      else:
-        mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+      mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
       tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
     # Step 2: Matmul.
@@ -525,18 +522,11 @@ def inner_kernel(
         for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):  # pyrefly: ignore[bad-argument-type]
           end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)  # pyrefly: ignore[unsupported-operation]
 
-          if cfgs.transpose_rhs:
-            block_acc = jnp.matmul(
-                tiled_lhs[:, start_k:end_k],
-                tiled_rhs[start_n:end_n, start_k:end_k].T,
-                preferred_element_type=jnp.float32,
-            ).astype(acc_ref.dtype)
-          else:
-            block_acc = jnp.matmul(
-                tiled_lhs[:, start_k:end_k],
-                tiled_rhs[start_k:end_k, start_n:end_n],
-                preferred_element_type=jnp.float32,
-            ).astype(acc_ref.dtype)
+          block_acc = jnp.matmul(
+              tiled_lhs[:, start_k:end_k],
+              tiled_rhs[start_k:end_k, start_n:end_n],
+              preferred_element_type=jnp.float32,
+          ).astype(acc_ref.dtype)
 
           if cfgs.rhs_cfgs.should_dequantize_after_matmul:
             if cfgs.transpose_rhs:
@@ -587,10 +577,7 @@ def inner_kernel(
           end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)  # pyrefly: ignore[unsupported-operation]
 
           block_lhs = tiled_lhs[:, start_k:end_k]
-          if cfgs.transpose_rhs:
-            block_rhs = tiled_rhs[start_n:end_n, start_k:end_k]
-          else:
-            block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+          block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
           # Perform lhs quantization. Note that for every block_lhs,
           # same computation will be performed tiles_n//mxu_size times.
@@ -619,18 +606,11 @@ def inner_kernel(
           if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
             block_rhs = block_rhs.astype(lhs_q_dtype)
 
-          if cfgs.transpose_rhs:
-            block_acc = jnp.matmul(
-                block_lhs_q,
-                block_rhs.T,
-                preferred_element_type=preferred_element_type,
-            ).astype(acc_ref.dtype)
-          else:
-            block_acc = jnp.matmul(
-                block_lhs_q,
-                block_rhs,
-                preferred_element_type=preferred_element_type,
-            ).astype(acc_ref.dtype)
+          block_acc = jnp.matmul(
+              block_lhs_q,
+              block_rhs,
+              preferred_element_type=preferred_element_type,
+          ).astype(acc_ref.dtype)
 
           block_acc *= block_scale.astype(acc_ref.dtype)
 
