@@ -167,7 +167,9 @@ class PallasMosaicTpuFlashAttentionVjp(
     def bwd_fn(res, cotangents, splash_mask):
       splash_fn = splash_maker(mask=splash_mask)
       splash_fn_kwargs = splash_fn.kwargs
-      res = res + (splash_fn.dkv_mask_info,)
+      # The trailing `None` is the dropout key: this op does not expose
+      # attention dropout, so the backward kernel regenerates no mask.
+      res = res + (splash_fn.dkv_mask_info, None)
       return splash._splash_attention_bwd(  # pylint: disable=protected-access
           True,
           splash_fn_kwargs["mask_value"],
@@ -181,7 +183,7 @@ class PallasMosaicTpuFlashAttentionVjp(
       )
     mask_in_axes = 0 if len(splash_mask.shape) == 3 else None
     # vmap over batch dimension
-    _, _, dq, dk, dv, _, _, _ = jax.vmap(
+    _, _, dq, dk, dv, _, _, _, _ = jax.vmap(
         bwd_fn, in_axes=(res_in_axes, cotangents_in_axes, mask_in_axes)
     )(res, cotangents, splash_mask)
 

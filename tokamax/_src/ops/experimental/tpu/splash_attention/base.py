@@ -65,6 +65,7 @@ type SplashResidualsType = tuple[
     jax.Array,  # out
     jax.Array,  # logsumexp
     MaskInfo | None,  # dkv_mask_info
+    jax.Array | None,  # prng_key
 ]
 
 
@@ -75,9 +76,11 @@ def _attention_reference_impl(
     mask: jax.Array,
     segment_ids: SegmentIds | None,
     sinks: jax.Array | None,
+    dropout_mask: jax.Array | None,
     mask_value: float,
     save_residuals: bool,
     attn_logits_soft_cap: float | None,
+    dropout_rate: float,
 ) -> SplashCustomReturnType:
   logits = jnp.einsum("sd,td->st", q.astype(jnp.float32), k.astype(jnp.float32))
 
@@ -101,6 +104,12 @@ def _attention_reference_impl(
   l = s.sum(axis=-1) + (0 if sinks is None else jnp.exp(sinks - m))
   p = s / l[..., None]
 
+  if dropout_mask is not None:
+    # Applied *after* normalization: the denominator is
+    # accumulated from the undropped weights, so the survivors are not
+    # renormalized over each other, only rescaled by 1 / (1 - rate).
+    p = jnp.where(dropout_mask, 0.0, p) / (1.0 - dropout_rate)
+
   o = jnp.einsum("st,td->sd", p, v.astype(jnp.float32))
 
   if save_residuals:
@@ -119,9 +128,11 @@ def _attention_reference_custom_bwd(
     sinks,
     o,
     logsumexp,
+    dropout_mask=None,
     mask_value: float = DEFAULT_MASK_VALUE,
     backward_impl: str = "vanilla",
     attn_logits_soft_cap: float | None = None,
+    dropout_rate: float = 0.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, None, None, jax.Array | None]:
   uncapped_logits = jnp.einsum(
       "qc,kc->qk", q, k, preferred_element_type=jnp.float32
@@ -141,8 +152,16 @@ def _attention_reference_custom_bwd(
 
   p = jnp.exp(logits - logsumexp[..., None])
   do = do.astype(jnp.float32)
-  dv = jnp.einsum("pt,pd->td", p, do).astype(v.dtype)
+  # `pr` is the dropped-and-rescaled weight, `p` the undropped one. dv and dp
+  # see the mask because the forward's numerator did; `ds` below deliberately
+  # keeps the undropped `p`, since `di` already equals rowsum(dp_dropped * p).
+  pr = p
+  if dropout_mask is not None:
+    pr = jnp.where(dropout_mask, 0.0, p) / (1.0 - dropout_rate)
+  dv = jnp.einsum("pt,pd->td", pr, do).astype(v.dtype)
   dp = jnp.einsum("pd,td->pt", do, v.astype(jnp.float32))
+  if dropout_mask is not None:
+    dp = jnp.where(dropout_mask, 0.0, dp) / (1.0 - dropout_rate)
 
   # These two ways of computing ds are mathematically equivalent. The first
   # involves reducing over the head_dim dimension and the second involves
@@ -177,6 +196,7 @@ def _attention_reference_custom_bwd(
         "save_residuals",
         "attn_logits_soft_cap",
         "is_mqa",
+        "dropout_rate",
     ],
 )
 def attention_reference(
@@ -186,22 +206,31 @@ def attention_reference(
     mask: jax.Array,
     segment_ids: SegmentIds | None = None,
     sinks: jax.Array | None = None,
+    dropout_mask: jax.Array | None = None,
     *,
     is_mqa: bool,
     mask_value: float = DEFAULT_MASK_VALUE,
     save_residuals: bool = False,
     attn_logits_soft_cap: float | None = None,
+    dropout_rate: float = 0.0,
 ):
-  """A JIT-compiled reference implementation of attention, handles MQA and MHA."""
+  """A JIT-compiled reference implementation of attention, handles MQA and MHA.
+
+  `dropout_mask` is a [num_q_heads, q_seq_len, kv_seq_len] bool array where True
+  means "dropped". It is taken as data rather than generated here so that the
+  reference stays independent of the kernel's block sizes: the kernel builds the
+  equivalent mask one tile at a time from a key and the tile coordinates.
+  """
   attn_impl = functools.partial(
       _attention_reference_impl,
       mask_value=mask_value,
       save_residuals=save_residuals,
       attn_logits_soft_cap=attn_logits_soft_cap,
+      dropout_rate=dropout_rate,
   )
 
   if is_mqa:
-    func = jax.vmap(attn_impl, in_axes=(0, None, None, None, None, 0))
+    func = jax.vmap(attn_impl, in_axes=(0, None, None, None, None, 0, 0))
   else:
     # In grouped attention (1 < num_kv_heads && num_kv_heads < num_q_heads).
     # We interleave the KV heads across the Q heads.
@@ -220,14 +249,20 @@ def attention_reference(
       k = jnp.repeat(k, repeats=q_heads_per_kv, axis=0)
       v = jnp.repeat(v, repeats=q_heads_per_kv, axis=0)
 
-    func = jax.vmap(attn_impl, in_axes=(0, 0, 0, None, None, 0))
+    func = jax.vmap(attn_impl, in_axes=(0, 0, 0, None, None, 0, 0))
 
-  out = func(q, k, v, mask, segment_ids, sinks)
+  out = func(q, k, v, mask, segment_ids, sinks, dropout_mask)
   return out
 
 
 @functools.partial(
-    jax.jit, static_argnames=["is_mqa", "backward_impl", "attn_logits_soft_cap"]
+    jax.jit,
+    static_argnames=[
+        "is_mqa",
+        "backward_impl",
+        "attn_logits_soft_cap",
+        "dropout_rate",
+    ],
 )
 def attention_reference_vjp(
     do,
@@ -239,16 +274,19 @@ def attention_reference_vjp(
     sinks,
     o,
     logsumexp,
+    dropout_mask=None,
     *,
     is_mqa: bool,
     backward_impl: str = "vanilla",
     attn_logits_soft_cap: float | None = None,
+    dropout_rate: float = 0.0,
 ):
   """Wrapper for backward reference that handles GQA/MQA broadcasting and reduction."""
   bwd = functools.partial(
       _attention_reference_custom_bwd,
       backward_impl=backward_impl,
       attn_logits_soft_cap=attn_logits_soft_cap,
+      dropout_rate=dropout_rate,
   )
 
   num_q_heads = q.shape[0]
@@ -258,16 +296,16 @@ def attention_reference_vjp(
   assert num_q_heads % num_kv_heads == 0
   head_multiplier = num_q_heads // num_kv_heads
   if is_mqa:
-    bwd = jax.vmap(bwd, in_axes=(0, 0, None, None, None, None, 0, 0, 0))
+    bwd = jax.vmap(bwd, in_axes=(0, 0, None, None, None, None, 0, 0, 0, 0))
   else:
-    bwd = jax.vmap(bwd, in_axes=(0, 0, 0, 0, None, None, 0, 0, 0))
+    bwd = jax.vmap(bwd, in_axes=(0, 0, 0, 0, None, None, 0, 0, 0, 0))
     # Interleave the KV heads to match the corresponding Q heads.
     if is_grouped:
       k = jnp.repeat(k, head_multiplier, axis=0)
       v = jnp.repeat(v, head_multiplier, axis=0)
 
   dq, dk, dv, _, _, dsinks = bwd(
-      do, q, k, v, mask, segment_ids, sinks, o, logsumexp
+      do, q, k, v, mask, segment_ids, sinks, o, logsumexp, dropout_mask
   )
 
   if is_mqa:
