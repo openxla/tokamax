@@ -32,6 +32,7 @@ from tokamax._src import version
 from tokamax._src.autotuning import autotuner
 from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
+from tokamax._src.ops import registry
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.experimental.kda import api as kda_api
@@ -249,20 +250,11 @@ def bound_args_from_json_file(filename: str) -> list[op_lib.BoundArguments]:
     return bound_args_from_json(f.read())
 
 
+
 _API_IMPLEMENTATIONS: Final[
     Mapping[type[op_lib.Op], Mapping[str, Callable[..., Any]]]
 ] = immutabledict.immutabledict({
-    normalization_base.Normalization: normalization_api.IMPLEMENTATIONS,
-    glu_base.GatedLinearUnit: glu_api.IMPLEMENTATIONS,
-    ragged_dot_base.RaggedDot: ragged_dot_api.IMPLEMENTATIONS,
-    ragged_scatter_base.RaggedScatter: ragged_scatter_api.IMPLEMENTATIONS,
-    attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,
-    mla_base.MultiHeadLatentAttention: mla_api.IMPLEMENTATIONS,
-    ragged_gather_base.RaggedGather: ragged_gather_api.IMPLEMENTATIONS,
-    ragged_gather_reduce_base.RaggedGatherReduce: (
-        ragged_gather_reduce_api.IMPLEMENTATIONS
-    ),
-    kda_base.KimiDeltaAttention: kda_api.IMPLEMENTATIONS,
+    op.base_class: op.implementations for op in registry.OPS
 })
 
 
