@@ -94,17 +94,31 @@ def generate_mla_inputs(
     cu_q_lens_list.append(cu_q_lens_list[-1] + q_len)
 
   max_kv_len = max(kv_lens_list) if kv_lens_list else 0
-  pages_per_seq = cdiv(max_kv_len, page_size)
+  max_q_len = max(q_lens) if q_lens else 0
+  pages_per_seq = cdiv(max_kv_len + max_q_len, page_size)
 
   page_indices_list = []
   page_count = 0
+  seq_pages = []
   for kv_len in kv_lens_list:
     num_seq_pages = cdiv(kv_len, page_size)
     indices = list(range(page_count, page_count + num_seq_pages))
-    page_indices_list.extend(indices + [-1] * (pages_per_seq - num_seq_pages))
+    seq_pages.append(indices)
     page_count += num_seq_pages
 
-  total_num_pages = max(num_pages, page_count)
+  total_num_pages = max(num_pages, len(seq_lens) * pages_per_seq)
+
+  extra_page_idx = page_count
+  for indices in seq_pages:
+    needed = pages_per_seq - len(indices)
+    extra_indices = []
+    for _ in range(needed):
+      if extra_page_idx < total_num_pages:
+        extra_indices.append(extra_page_idx)
+        extra_page_idx += 1
+      else:
+        extra_indices.append(-1)
+    page_indices_list.extend(indices + extra_indices)
 
   ql_nope = gen_random((total_q_len, num_heads, lkv_dim), q_dtype)
   q_pe = gen_random((total_q_len, num_heads, r_dim), q_dtype)
