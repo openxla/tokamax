@@ -739,6 +739,19 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     with self.assertRaisesRegex(ValueError, "CausalMask"):
       splash.make_splash_mha_single_device(local, config=config)
+    # Permuted q_sequence -> raises (the causal boundary leaves the diagonal).
+    permuted = mask_lib.CausalMask(shape=(seq_len, seq_len))
+    permuted.q_sequence = permuted.q_sequence[::-1].copy()
+    with self.assertRaisesRegex(ValueError, "unpermuted q_sequence"):
+      splash.make_splash_mha_single_device(permuted, config=config)
+    # Nonzero offset -> raises for the same reason.
+    shifted = mask_lib.CausalMask(shape=(seq_len, seq_len), offset=5)
+    with self.assertRaisesRegex(ValueError, "offset=0"):
+      splash.make_splash_mha_single_device(shifted, config=config)
+    # Dynamic mask -> raises (an arbitrary mask gives no causal guarantee).
+    dynamic = jnp.ones((seq_len, seq_len), dtype=jnp.bool_)
+    with self.assertRaisesRegex(ValueError, "dynamic masks"):
+      splash.make_dynamic_splash_mha(dynamic, config=config)
 
 
 def _rel_l2(x: jax.Array, y: jax.Array) -> float:

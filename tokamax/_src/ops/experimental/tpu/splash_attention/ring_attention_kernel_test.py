@@ -172,5 +172,22 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
       self._assert_allclose(dv, dv_ref, rtol=1e-2, atol=1e-2)
 
 
+class RingAttentionValidationTest(test_utils.SplashAttentionTestCase):
+
+  def test_qk_diag_skip_rejected(self):
+    block = 256
+    config = splash.SplashConfig(
+        block_q=block, block_kv=block, block_kv_compute=block,
+        block_q_dkv=block, block_kv_dkv=block, block_kv_dkv_compute=block,
+        use_fused_bwd_kernel=True, residual_checkpoint_name="context",
+        qk_diag_skip=True,
+    )
+    mask = mask_lib.NumpyMask(mask_lib.make_causal_mask((512, 512)))
+    with self.assertRaisesRegex(ValueError, "ring attention"):
+      ring_attention_kernel.make_ring_attention(
+          mask, is_mqa=False, ring_axis="ring", config=config
+      )
+
+
 if __name__ == "__main__":
   absltest.main()

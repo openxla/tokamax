@@ -1071,6 +1071,47 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
     self._assert_mask_info_match(mask_info, expected_mask_info)
     self._assert_mask_info_match(mask_info_dkv, expected_mask_info_dkv)
 
+  def test_causal_mask_with_permuted_q_sequence(self):
+    sequence_lengths = (64, 64)
+    block_shape = (16, 16)
+
+    causal_mask = mask_lib.CausalMask(sequence_lengths)
+    # Load balanced ordering: rank r of 2 holds chunks r and 3 - r of 4.
+    chunks = np.split(np.arange(sequence_lengths[0], dtype=np.int32), 4)
+    causal_mask.q_sequence = np.concatenate(
+        [chunks[0], chunks[3], chunks[1], chunks[2]]
+    )
+
+    mask_info, mask_info_dkv, mask_function = self._process_mask(
+        causal_mask, block_shape
+    )
+    self.assertIsNotNone(mask_function)
+
+    expected_num_active_blocks = np.array([10], dtype=np.int32)
+
+    expected_mask_info = mask_info_lib.MaskInfo(
+        None,
+        np.array([0, 1, 1, 1, 1, 2, 2, 3, 3, 3], dtype=np.int8),
+        np.array([0, 0, 1, 2, 3, 0, 1, 0, 1, 2], dtype=np.int8),
+        np.array([1, 2, 2, 2, 1, 2, 1, 2, 2, 1], dtype=np.int8),
+        expected_num_active_blocks,
+        None,
+        causal_mask.q_sequence,
+    )
+
+    expected_mask_info_dkv = mask_info_lib.MaskInfo(
+        None,
+        np.array([0, 0, 0, 0, 1, 1, 1, 2, 2, 3], dtype=np.int8),
+        np.array([0, 1, 2, 3, 1, 2, 3, 1, 3, 1], dtype=np.int8),
+        np.array([1, 2, 2, 2, 2, 1, 2, 2, 1, 1], dtype=np.int8),
+        expected_num_active_blocks,
+        None,
+        causal_mask.q_sequence,
+    )
+
+    self._assert_mask_info_match(mask_info, expected_mask_info)
+    self._assert_mask_info_match(mask_info_dkv, expected_mask_info_dkv)
+
   @parameterized.parameters((True,), (False,))
   def test_local_mask(self, is_lazy_mask: bool):
     sequence_lengths = (64, 64)
