@@ -98,12 +98,37 @@ class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
     return {_AUTOTUNE_CONFIG}
 
 
+class _DeviceRestrictedOp(_FakeOp):
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu"
+
+
 class OpTest(parameterized.TestCase):
 
   def test_bind(self):
     x = jnp.zeros((1, 2))
     y = jnp.ones((1, 2))
     self.assertEqual(_FakeOp().bind(x, y).args, (x, y))
+
+  def test_device_restriction_raises_on_unsupported_device(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    with self.assertRaisesRegex(NotImplementedError, "Not supported on cpu"):
+      _DeviceRestrictedOp()(x, y)
+
+  def test_bypass_device_check_bypasses_device_restriction(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    out = _DeviceRestrictedOp().replace(bypass_device_check=True)(x, y)
+    self.assertTrue(jnp.array_equal(out, x + y))
+
+  def test_cross_compile_config_bypasses_device_restriction(self):
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    with config_lib.cross_compile(True):
+      out = _DeviceRestrictedOp()(x, y)
+    self.assertTrue(jnp.array_equal(out, x + y))
 
 
 class BoundArgumentsTest(parameterized.TestCase):
