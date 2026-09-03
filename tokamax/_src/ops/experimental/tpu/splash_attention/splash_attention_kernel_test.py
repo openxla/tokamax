@@ -740,6 +740,80 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     with self.assertRaisesRegex(ValueError, "CausalMask"):
       splash.make_splash_mha_single_device(local, config=config)
 
+  @parameterized.named_parameters(
+      dict(testcase_name="grid2", qk_diag_grid=2, head_dim_qk=128),
+      dict(testcase_name="grid4", qk_diag_grid=4, head_dim_qk=192),
+  )
+  def test_sv_diag_skip_equivalence(self, qk_diag_grid, head_dim_qk):
+    """`sv_diag_skip` must be equivalent to the stock (`sv_diag_skip=False`) path."""
+    seq_len, num_heads, block = 512, 2, 256
+    k1, k2, k3 = random.split(random.key(0), 3)
+    q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    k = (random.normal(k2, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    v = (random.normal(k3, (num_heads, seq_len, 128)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def build(sv_diag_skip):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True,
+          residual_checkpoint_name="context",
+          sv_diag_skip=sv_diag_skip,
+          qk_diag_grid=qk_diag_grid,
+          interpret=self.INTERPRET,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+      return jax.jit(attn)
+
+    ref = jax.tree.leaves(build(False)(q, k, v))
+    opt = jax.tree.leaves(build(True)(q, k, v))
+    for r, o in zip(ref, opt):
+      self._assert_allclose(np.asarray(o), np.asarray(r), atol=3e-3, rtol=1e-2)
+
+  def test_sv_diag_skip_preconditions_raise(self):
+    """`sv_diag_skip` must fail loud (never silently corrupt) on unsupported configs."""
+    block = 256
+    square = dict(
+        block_q=block,
+        block_kv=block,
+        block_kv_compute=block,
+        block_q_dkv=block,
+        block_kv_dkv=block,
+        block_kv_dkv_compute=block,
+        use_fused_bwd_kernel=True,
+        residual_checkpoint_name="context",
+        interpret=self.INTERPRET,
+    )
+    # Non-square forward blocks -> raises in SplashConfig.__post_init__.
+    with self.assertRaisesRegex(ValueError, "square forward blocks"):
+      splash.SplashConfig(
+          **{**square, "block_kv": block // 2, "block_kv_compute": block // 2},
+          sv_diag_skip=True,
+      )
+    # Non-power-of-2 grid -> raises in __post_init__.
+    with self.assertRaisesRegex(ValueError, "power of 2"):
+      splash.SplashConfig(**square, sv_diag_skip=True, qk_diag_grid=3)
+    # Non-causal mask -> raises in make_splash_mha (the skip assumes kv > q
+    # is masked).
+    seq_len = 512
+    config = splash.SplashConfig(**square, sv_diag_skip=True)
+    local = mask_lib.LocalMask(
+        shape=(seq_len, seq_len), window_size=(128, 0), offset=0
+    )
+    with self.assertRaisesRegex(ValueError, "CausalMask"):
+      splash.make_splash_mha_single_device(local, config=config)
+
 
 def _rel_l2(x: jax.Array, y: jax.Array) -> float:
   """Relative L2 error ‖x - y‖ / ‖y‖."""

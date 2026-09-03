@@ -288,6 +288,10 @@ class SplashConfig:
   # Larger grid skips more of the triangle but uses smaller (less MXU-efficient)
   # matmuls; grid=4 is a good default at S=4096/block=2048. Must be a power of 2.
   qk_diag_grid: int = 2
+  # Skip the wasted causal-diagonal SV matmul. On a partial-mask (diagonal)
+  # block, split the SV matmul into a qk_diag_grid x qk_diag_grid sub-grid and
+  # skip sub-tiles strictly above the diagonal (kj > qi) during dot_general.
+  sv_diag_skip: bool = False
   # Attention dropout probability, applied to the softmax weights. The mask is
   # generated inside the kernel per (head, q block, kv block) tile from a
   # `prng_key` passed at call time, so it costs no HBM traffic and is never
@@ -397,6 +401,22 @@ class SplashConfig:
             "qk_diag_skip requires square backward blocks "
             "(block_q_dkv == block_kv_dkv == block_kv_dkv_compute); got "
             f"{self.block_q_dkv}/{self.block_kv_dkv}/{self.block_kv_dkv_compute}."
+        )
+      if self.qk_diag_grid < 2 or (self.qk_diag_grid & (self.qk_diag_grid - 1)):
+        raise ValueError(
+            f"qk_diag_grid must be a power of 2 >= 2; got {self.qk_diag_grid}."
+        )
+
+    if self.sv_diag_skip:
+      # The skip assumes the kv > q region is masked. That holds only for aligned
+      # SQUARE blocks (kv-band > q-band <=> fully above the causal line, single
+      # compute tile per block) — enforce it or the skip silently corrupts.
+      # Causality is checked in _make_splash_attention.
+      if not (self.block_q == self.block_kv == self.block_kv_compute):
+        raise ValueError(
+            "sv_diag_skip requires square forward blocks "
+            "(block_q == block_kv == block_kv_compute); got "
+            f"{self.block_q}/{self.block_kv}/{self.block_kv_compute}."
         )
       if self.qk_diag_grid < 2 or (self.qk_diag_grid & (self.qk_diag_grid - 1)):
         raise ValueError(
@@ -775,7 +795,33 @@ def flash_attention_kernel(
       v = v_ref[:, slice_k]
       sv_dims = NT_DIM_NUMBERS
 
-    o_curr_flat = lax.dot_general(s_curr_flat, v, sv_dims)
+    if (
+        config.sv_diag_skip
+        and has_partial_mask
+        and num_stacked_q_heads == 1
+        and config.v_layout == HEAD_DIM_MINOR
+        and bq % _g == 0
+        and bkv_compute % _g == 0
+    ):
+      sq = bq // _g
+      sk = bkv_compute // _g
+      s_parts = [
+          [
+              s_curr_flat[i * sq : (i + 1) * sq, j * sk : (j + 1) * sk]
+              for j in range(_g)
+          ]
+          for i in range(_g)
+      ]
+      v_parts = [v[j * sk : (j + 1) * sk, :] for j in range(_g)]
+      o_rows = []
+      for qi in range(_g):
+        o_row = lax.dot_general(s_parts[qi][0], v_parts[0], sv_dims)
+        for kj in range(1, qi + 1):
+          o_row = o_row + lax.dot_general(s_parts[qi][kj], v_parts[kj], sv_dims)
+        o_rows.append(o_row)
+      o_curr_flat = jnp.concatenate(o_rows, axis=0)
+    else:
+      o_curr_flat = lax.dot_general(s_curr_flat, v, sv_dims)
     o_curr = o_curr_flat.reshape((num_stacked_q_heads, bq, head_dim_v))
 
     if max_logit_estimate is None:
@@ -2478,15 +2524,18 @@ def _make_splash_attention(
   if config is None:
     config = SplashConfig.get_default()
 
-  if config.qk_diag_skip and not isinstance(mask, mask_lib.CausalMask):
+  if (config.qk_diag_skip or config.sv_diag_skip) and not isinstance(
+      mask, mask_lib.CausalMask
+  ):
     # The skip assumes kv > q is ALWAYS masked — a pure-causal property. Any mask
     # that admits a valid kv > q entry (bidirectional, local/sliding window, custom)
     # would be silently corrupted, so fail loud. (Square-block preconditions are
     # enforced in SplashConfig.__post_init__.)
+    param_name = "sv_diag_skip" if config.sv_diag_skip else "qk_diag_skip"
     raise ValueError(
-        "qk_diag_skip=True requires a pure CausalMask (the skip fills mask_value "
-        "for all kv > q sub-tiles, assuming the mask masks exactly those); got "
-        f"{type(mask).__name__}. Disable qk_diag_skip for non-causal masks."
+        f"{param_name}=True requires a pure CausalMask (the skip assumes the"
+        f" kv > q region is masked); got {type(mask).__name__}. Disable"
+        f" {param_name} for non-causal masks."
     )
 
   process_fn = partial(
