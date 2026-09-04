@@ -2,4 +2,4 @@ rules:
   unpinned-images:
     ignore:
       - ci-nightly.yml
-      - ci-test.yml
+      - ci-build.yml

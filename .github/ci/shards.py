@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Test shard definitions for `.github/workflows/ci-test.yml`.
+"""Test shard definitions for `.github/workflows/ci-build.yml`.
 
 The test suite is too slow to run as a single job, so it is split into shards
 that run in parallel, one GitHub Actions job per (shard, runner). `SHARDS`
