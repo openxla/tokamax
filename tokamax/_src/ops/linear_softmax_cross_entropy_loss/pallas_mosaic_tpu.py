@@ -91,6 +91,18 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
         b_dim, h_dim, v_dim, dtype=dtype, vmem_limit_bytes=vmem_limit_bytes
     )
 
+  @staticmethod
+  def get_heuristic_bwd_config(
+      b_dim: int,
+      h_dim: int,
+      v_dim: int,
+      dtype: jnp.dtype = jnp.float32,
+      vmem_limit_bytes: int | None = None,
+  ) -> Config:
+    return kernel.get_heuristic_bwd_config(
+        b_dim, h_dim, v_dim, dtype=dtype, vmem_limit_bytes=vmem_limit_bytes
+    )
+
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     x = ba.arguments["x"]
