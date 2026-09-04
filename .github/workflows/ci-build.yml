@@ -109,7 +109,6 @@ jobs:
           python3.12 -m uv pip freeze
 
       - name: Run shard
-         # TODO: Disable benchmarking tests for presubmit until container is fixed
         run: |
           # Which tests run is decided by `pytest_flags` plus this shard's
           # paths, both from .github/ci/shards.py. `-s` and `--durations` are

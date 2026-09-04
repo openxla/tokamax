@@ -129,8 +129,6 @@ THEMES = (
 
 # Test files intentionally run by no shard.
 EXCLUDED_TESTS = (
-    # Benchmarking needs a container fix before it can run in presubmit.
-    'tokamax/_src/benchmarking_test*',
 )
 
 
