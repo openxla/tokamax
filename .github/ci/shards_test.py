@@ -390,6 +390,26 @@ class ThemeTest(unittest.TestCase):
         ['splash-b', 'gmm-a'],  # splash precedes gmm in THEMES
     )
 
+  def test_catch_all_always_sorts_first(self) -> None:
+    table = {
+        'core-utils': dict(paths=(), minutes=2),
+        'attention-slow': dict(paths=(), minutes=30),
+        'catch-all': dict(paths=(), minutes=100),
+    }
+    self.assertEqual(
+        [n for n, _ in sorted(table.items(), key=shards.shard_order)],
+        ['catch-all', 'attention-slow', 'core-utils'],
+    )
+    # catch-all still sorts first even if another shard has more minutes
+    table_other = {
+        'attention-longest': dict(paths=(), minutes=200),
+        'catch-all': dict(paths=(), minutes=100),
+    }
+    self.assertEqual(
+        [n for n, _ in sorted(table_other.items(), key=shards.shard_order)],
+        ['catch-all', 'attention-longest'],
+    )
+
   def test_every_real_shard_has_a_theme(self) -> None:
     strays = [n for n in shards.SHARDS if shards.shard_theme(n) is None]
     self.assertEqual(strays, [])

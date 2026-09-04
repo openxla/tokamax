@@ -619,7 +619,7 @@ SHARDS: ShardMap = {
     # should be redistributed to other shards after some time.
     'catch-all': Spec(
         paths=None,
-        minutes=1,
+        minutes=100,
     ),
 }
 # pylint: enable=line-too-long
@@ -1019,24 +1019,27 @@ def shard_theme(name: str) -> tuple[int, str] | None:
   return None
 
 
-def shard_order(item: tuple[str, Spec]) -> tuple[bool, float, int, str]:
-  """Sorts shards longest first, then by theme, then by name.
+def shard_order(item: tuple[str, Spec]) -> tuple[bool, bool, float, int, str]:
+  """Sorts shards: catch-all first, then longest first, then by theme, then by name.
 
-  Longest first because GitHub starts matrix jobs in matrix order as runners
-  free up, so a long shard left until last sets the wall clock on its own.
+  The catch-all shard always runs first so newly added or unscheduled tests run
+  immediately. Other shards run longest first because GitHub starts matrix jobs
+  in matrix order as runners free up, so a long shard left until last sets the
+  wall clock on its own.
 
   Args:
     item: A `(shard name, spec)` pair, as from `dict.items`.
 
   Returns:
-    A sort key: measured shards before unmeasured ones, then descending
-    `minutes`, then theme in `THEMES` order with themeless shards last, then
-    the name.
+    A sort key: catch-all shard first, then measured shards before unmeasured
+    ones, then descending `minutes`, then theme in `THEMES` order with themeless
+    shards last, then the name.
   """
   name, spec = item
   theme = shard_theme(name)
   minutes = spec.get('minutes')
   return (
+      name != _CATCH_ALL_SHARD,
       minutes is None,  # unmeasured last, since absent is not zero
       -(minutes or 0),
       len(THEMES) if theme is None else theme[0],
