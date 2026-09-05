@@ -20,13 +20,10 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def cdiv(a, b):
-  assert b != 0
-  return (a + b - 1) // b
+from tokamax._src.mosaic_tpu import pl_cdiv
 
 
-def align_to(a, b):
-  return ((a + b - 1) // b) * b
+from tokamax._src.mosaic_tpu import pl_align_to
 
 
 def get_dtype_bitwidth(dtype):
@@ -82,8 +79,8 @@ def generate_mla_inputs(
   def gen_random(shape, dtype) -> jax.Array:
     return jnp.array(rng.random(size=shape, dtype=np.float32)).astype(dtype)
 
-  padded_r_dim = align_to(r_dim, 128)
-  padded_lkv_dim = align_to(lkv_dim, 128)
+  padded_r_dim = pl_align_to(r_dim, 128)
+  padded_lkv_dim = pl_align_to(lkv_dim, 128)
   padded_kv_dim = padded_lkv_dim + padded_r_dim
   packing = get_dtype_packing(kv_dtype)
   q_lens = [s[0] for s in seq_lens]
@@ -94,12 +91,12 @@ def generate_mla_inputs(
     cu_q_lens_list.append(cu_q_lens_list[-1] + q_len)
 
   max_kv_len = max(kv_lens_list) if kv_lens_list else 0
-  pages_per_seq = cdiv(max_kv_len, page_size)
+  pages_per_seq = pl_cdiv(max_kv_len, page_size)
 
   page_indices_list = []
   page_count = 0
   for kv_len in kv_lens_list:
-    num_seq_pages = cdiv(kv_len, page_size)
+    num_seq_pages = pl_cdiv(kv_len, page_size)
     indices = list(range(page_count, page_count + num_seq_pages))
     page_indices_list.extend(indices + [-1] * (pages_per_seq - num_seq_pages))
     page_count += num_seq_pages
@@ -144,20 +141,6 @@ def generate_mla_inputs(
       cu_q_lens,
       distribution,
   )
-
-
-def unsigned_cdiv(a, b):
-  exponent = int(math.log2(b))
-  if b == int(math.pow(2, exponent)):
-    return (a + b - 1) >> exponent
-  return (a + b - 1) // b
-
-
-def unsigned_align_to(a, b):
-  exponent = int(math.log2(b))
-  if b == int(math.pow(2, exponent)):
-    return (a + b - 1) & (-int(b))
-  return unsigned_cdiv(a, b) * b
 
 
 def static_validate_inputs(
@@ -219,8 +202,8 @@ def static_validate_inputs(
 
   actual_lkv_dim = ql_nope.shape[2]
   actual_r_dim = q_pe.shape[2]
-  lkv_dim = unsigned_align_to(actual_lkv_dim, 128)
-  r_dim = unsigned_align_to(actual_r_dim, 128)
+  lkv_dim = pl_align_to(actual_lkv_dim, 128)
+  r_dim = pl_align_to(actual_r_dim, 128)
 
   if not transpose_kv_cache:
     (
