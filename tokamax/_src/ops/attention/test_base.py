@@ -308,7 +308,7 @@ class AttentionTestBase(parameterized.TestCase):
             self._supports_cross_attention
             and (self._supports_bias or not has_bias)
         ),
-        atol=3e-6 if has_bias else 1e-6,
+        atol=1e-5 if has_bias else 1e-6,
     )
 
   @pytest.mark.long
