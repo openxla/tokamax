@@ -19,6 +19,7 @@ from typing import override
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import chex
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
@@ -201,6 +202,31 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       )
       cotangent = jax.device_put(cotangent, P(None, None, reduced={"x"}))
       vjpfunc(cotangent)[0].block_until_ready()
+
+  def test_all_zero_group_sizes_nan(self):
+    num_groups, m, k, n = 8, 1024, 128, 256
+    a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
+
+    # Run 1: normal run to dirty the memory
+    actual1 = self._dot_fn_f32(a, b, group_sizes=group_sizes)
+    actual1.block_until_ready()
+    self.assertTrue(jnp.any(actual1 != 0), "First run should be non-zero")
+
+    # Delete reference to allow reuse
+    del actual1
+    import gc
+
+    gc.collect()
+
+    # Run 2: all zero run
+    group_sizes_zero = jnp.zeros((num_groups,), jnp.int32)
+    actual2 = self._dot_fn_f32(a, b, group_sizes=group_sizes_zero)
+    actual2.block_until_ready()
+
+    # Check if there are any NaNs in the output
+    self.assertFalse(jnp.any(jnp.isnan(actual2)), "Output contains NaNs")
+    # Also check if it is all zeros
+    chex.assert_trees_all_close(actual2, jnp.zeros_like(actual2))
 
   @override
   def _test_quantized(
