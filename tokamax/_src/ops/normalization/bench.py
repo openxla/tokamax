@@ -20,12 +20,14 @@ from absl import flags
 import google_benchmark
 from tokamax._src import benchmarking
 from tokamax._src.ops.normalization import base
+from tokamax._src.ops.normalization import mosaic as mosaic_norm
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import arg_specs
 
 
 _IMPLS = dict(
     pallas=pl_norm.PallasTritonNormalization(input_output_alias=False),
+    mosaic=mosaic_norm.PallasMosaicGpuNormalization(input_output_alias=False),
     xla=base.Normalization(),
 )
 _BENCHMARK_IMPLS_FWD = flags.DEFINE_list(
@@ -59,6 +61,14 @@ def _register_benchmarks():
       register_benchmark(name, impl_name, impl, kwargs, mode='forward_and_vjp')
 
 
+def _main(argv):
+  # `google_benchmark.main` goes straight to the C++ library, so `app.run` never
+  # happens on its own -- and without it `call_after_init` never fires and no
+  # benchmark is ever registered. Registering under `app.run` also means the
+  # flags above are parsed by the time they are read.
+  _register_benchmarks()
+  google_benchmark.main(argv)
+
+
 if __name__ == '__main__':
-  app.call_after_init(_register_benchmarks)
-  google_benchmark.main()
+  app.run(_main)
