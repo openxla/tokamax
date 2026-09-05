@@ -136,9 +136,7 @@ class PallasTritonFlashAttentionWithPallasTritonVjpTest(
     if kwargs.get("test_vjp", True):
       # TODO: Add missing features to Pallas-Triton VJP.
       all_kwargs = kwargs | kwargs.get("impl_kwargs", {})
-      if (all_kwargs.get("dropout_mask") is not None) or (
-          all_kwargs.get("logits_soft_cap") is not None
-      ):
+      if all_kwargs.get("dropout_mask") is not None:
         expect_supported = False
     super()._run_test_with_inputs(
         *args, expect_supported=expect_supported, **kwargs
