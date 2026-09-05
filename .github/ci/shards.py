@@ -617,7 +617,7 @@ SHARDS: ShardMap = {
     # should be redistributed to other shards after some time.
     'catch-all': Spec(
         paths=None,
-        minutes=100,
+        minutes=1,
     ),
 }
 # pylint: enable=line-too-long
