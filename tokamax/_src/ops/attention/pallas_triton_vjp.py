@@ -587,16 +587,32 @@ class PallasTritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    # TODO: Implement heuristics.
+    # TODO: Tune these for performance. They are currently only sized to fit in
+    # shared memory, and do not take the sequence length or the device into
+    # account the way the forward heuristics do.
+    *_, q, _, v = ba.args
+    head_dim = max(q.shape[-1], v.shape[-1])
+    row_bytes = pl.next_power_of_2(head_dim) * jnp.dtype(q.dtype).itemsize
+
+    # Shared memory usage scales with `block * head_dim`, and head dims are
+    # padded to a power of two. The blocks below fit a 512-byte row (head dim
+    # 256 in bf16); shrink them beyond that, otherwise the kernel exceeds the
+    # shared memory limit. All four are dot dimensions, so none goes below 16;
+    # `block_m1` and `block_n2` are halved again for the causal diagonal, so
+    # they stop at 32 to keep those halves at 16.
+    #
+    # Shrinking the blocks is enough on its own, and `num_stages` stays at 2.
+    # Lowering it does not buy shared memory back in bf16: the compiler asks for
+    # more with one stage than with two (201088 vs 229376 bytes at head dim 512,
+    # blocks 32/64/64/32).
+    shrink = max(1, pl.next_power_of_2(-(-row_bytes // 512)))
     return Config(
         block_m1=32,
-        block_n1=64,
-        block_m2=64,
-        # block_n1=128,
-        # block_m2=128,
+        block_n1=max(16, 64 // shrink),
+        block_m2=max(16, 64 // shrink),
         block_n2=32,
         num_warps=4,
-        num_stages=2,  # 5,
+        num_stages=2,
     )
 
   # TODO: Implement an autotuning search space.
