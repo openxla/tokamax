@@ -57,6 +57,7 @@ def _bwd_dkdv(
     block_m1: int,
     is_causal: bool = False,
     logits_dtype: jnp.dtype,
+    logits_soft_cap: float | None = None,
     q_k_dot_precision: jax.lax.DotAlgorithmPreset,
     weights_v_dot_precision: jax.lax.DotAlgorithmPreset,
 ):
@@ -97,6 +98,15 @@ def _bwd_dkdv(
         bias = bias_ref.at[span_m, bias_span_n].load()
       sT += bias.T
 
+    # Soft-capping is applied after the bias add and before masking, as in the
+    # forward pass. The cap's gradient (`1 - tanh(u / c)^2`) is captured here,
+    # while the logits are still finite; after masking they are `mask_value`.
+    cap_gradT = None
+    if logits_soft_cap is not None:
+      tanhT = jnp.tanh(sT / logits_soft_cap)
+      sT = logits_soft_cap * tanhT
+      cap_gradT = 1.0 - tanhT * tanhT
+
     # See forward base class for explanation of why this is not `-inf`.
     mask_value = float(jnp.finfo(jnp.float32).min)
 
@@ -123,6 +133,10 @@ def _bwd_dkdv(
     # as `1 / seq_len_k`. The corresponding `ds` values must be zeroed.
     if mask_ref is not None:
       dsT = jnp.where(m == mask_value, 0.0, dsT)
+
+    # `dk` and `dbias` are both gradients wrt the pre-cap logits.
+    if cap_gradT is not None:
+      dsT *= cap_gradT
 
     # TODO: Would this be better in `_bwd_dq`? Benchmark it.
     if ds_ref is not None:
@@ -151,6 +165,7 @@ def _bwd_dq(
     block_n2: int,
     is_causal: bool = False,
     logits_dtype: jnp.dtype,
+    logits_soft_cap: float | None = None,
     q_k_dot_precision: jax.lax.DotAlgorithmPreset,
     weights_v_dot_precision: jax.lax.DotAlgorithmPreset,
 ):
@@ -187,6 +202,12 @@ def _bwd_dq(
         bias = bias_ref.at[bias_span_m, span_n].load()
       s += bias
 
+    cap_grad = None
+    if logits_soft_cap is not None:
+      tanh = jnp.tanh(s / logits_soft_cap)
+      s = logits_soft_cap * tanh
+      cap_grad = 1.0 - tanh * tanh
+
     p = jnp.exp(s - m) / l
 
     if mask_ref is not None:
@@ -202,6 +223,8 @@ def _bwd_dq(
 
     dp = plgpu.dot(do, v.T, precision=weights_v_dot_precision) - delta
     ds = p * dp
+    if cap_grad is not None:
+      ds *= cap_grad
     return dq + plgpu.dot(ds.astype(k.dtype), k, precision=q_k_dot_precision)
 
   return jax.lax.fori_loop(lo, hi, body, dq)
@@ -238,6 +261,7 @@ def _bwd_kernel(
     sm_scale: float,
     is_causal: bool,
     logits_dtype: jnp.dtype,
+    logits_soft_cap: float | None = None,
     q_k_dot_precision: jax.lax.DotAlgorithmPreset,
     weights_v_dot_precision: jax.lax.DotAlgorithmPreset,
 ):
@@ -270,6 +294,7 @@ def _bwd_kernel(
         ds_ref=ds_ref,
         block_m1=block_m1,
         logits_dtype=logits_dtype,
+        logits_soft_cap=logits_soft_cap,
         q_k_dot_precision=q_k_dot_precision,
         weights_v_dot_precision=weights_v_dot_precision,
     )
@@ -319,6 +344,7 @@ def _bwd_kernel(
         delta=delta,
         block_n2=block_n2,
         logits_dtype=logits_dtype,
+        logits_soft_cap=logits_soft_cap,
         q_k_dot_precision=q_k_dot_precision,
         weights_v_dot_precision=weights_v_dot_precision,
     )
@@ -382,8 +408,6 @@ def _bwd(
 
   if dropout_mask is not None:
     raise NotImplementedError("`dropout_mask` unsupported.")
-  if logits_soft_cap is not None:
-    raise NotImplementedError("`logits_soft_cap` unsupported.")
 
   seq_len_q, num_heads_q, head_dim = q.shape
   seq_len_k, num_heads_k, head_dim_out = v.shape
@@ -400,6 +424,7 @@ def _bwd(
       sm_scale=logits_scale,
       is_causal=is_causal,
       logits_dtype=logits_dtype,
+      logits_soft_cap=logits_soft_cap,
       q_k_dot_precision=q_k_dot_precision,
       weights_v_dot_precision=weights_v_dot_precision,
   )
