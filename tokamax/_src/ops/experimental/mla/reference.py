@@ -22,16 +22,10 @@ from jax import lax
 import jax.numpy as jnp
 
 
-def align_to(a, b):
-  return ((a + b - 1) // b) * b
+from tokamax._src.mosaic_tpu import pl_align_to
 
 
-def unsigned_cdiv(a, b):
-  exponent = int(math.log2(b))
-  if b == int(math.pow(2, exponent)):
-    # Use bit shift instead of division for efficiency.
-    return (a + b - 1) >> exponent
-  return (a + b - 1) // b
+from tokamax._src.mosaic_tpu import pl_cdiv
 
 
 @jax.jit(donate_argnames="cache_kv")
@@ -69,13 +63,13 @@ def update_kv_cache(
     The updated KV cache.
   """
   actual_r_dim = new_k_pe.shape[-1]
-  r_dim = align_to(actual_r_dim, 128)
+  r_dim = pl_align_to(actual_r_dim, 128)
   if actual_r_dim != r_dim:
     new_k_pe = jnp.pad(
         new_k_pe, ((0, 0), (0, r_dim - actual_r_dim)), constant_values=0
     )
   actual_lkv_dim = new_kv_c.shape[-1]
-  lkv_dim = align_to(actual_lkv_dim, 128)
+  lkv_dim = pl_align_to(actual_lkv_dim, 128)
   if actual_lkv_dim != lkv_dim:
     new_kv_c = jnp.pad(
         new_kv_c, ((0, 0), (0, lkv_dim - actual_lkv_dim)), constant_values=0
@@ -185,7 +179,7 @@ def mla_attention(
       batch_size,
   )
   actual_lkv_dim = ql_nope.shape[-1]
-  lkv_dim = align_to(actual_lkv_dim, 128)
+  lkv_dim = pl_align_to(actual_lkv_dim, 128)
   if lkv_dim != actual_lkv_dim:
     ql_nope = jnp.pad(
         ql_nope,
@@ -193,7 +187,7 @@ def mla_attention(
         constant_values=0,
     )
   actual_r_dim = q_pe.shape[-1]
-  r_dim = align_to(actual_r_dim, 128)
+  r_dim = pl_align_to(actual_r_dim, 128)
   if actual_r_dim != r_dim:
     q_pe = jnp.pad(
         q_pe, ((0, 0), (0, 0), (0, r_dim - actual_r_dim)), constant_values=0
