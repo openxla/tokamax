@@ -274,8 +274,10 @@ def _get_smem_bytes(x: Any) -> int:
 def estimate_smem_bytes(scratch_types: Any) -> int:
   """Estimates the total SMEM usage in bytes for the given scratch types."""
   is_ref_union = lambda x: isinstance(x, plgpu.RefUnion)
-  scratch_types_flat = jax.tree.leaves(scratch_types, is_leaf=is_ref_union)
-  return sum(map(_get_smem_bytes, scratch_types_flat))
+  flat = jax.tree.leaves(scratch_types, is_leaf=is_ref_union)
+  # TMEM allocation uses 4 bytes of SMEM to return the address.
+  uses_tmem = any(getattr(x, "memory_space", None) == plgpu.TMEM for x in flat)
+  return sum(map(_get_smem_bytes, flat)) + (4 if uses_tmem else 0)
 
 
 def static_scheduling_persistent_kernel(
