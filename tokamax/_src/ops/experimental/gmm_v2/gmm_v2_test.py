@@ -550,6 +550,7 @@ class GmmTest(parameterized.TestCase):
         preferred_element_type=jnp.bfloat16,
     )
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    # Tolerance rationale: see test_tgmm_dynamic_quant_basic.
     chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
   @pytest.mark.long
@@ -1299,6 +1300,251 @@ class GmmTest(parameterized.TestCase):
       atol, rtol = 5e-2, 5e-2  # Unquantized Path (bfloat16 precision diffs)
 
     chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+
+  @pytest.mark.long
+  @parameterized.product(
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
+      num_groups=[5, 16],
+      dtype_pair=[
+          (jnp.float8_e4m3fn, jnp.float8_e4m3fn),
+          (jnp.float8_e4m3fn, jnp.float8_e5m2),
+      ],
+      pin_tiles=[True, False],
+  )
+  def test_tgmm_dynamic_quant_basic(
+      self, batch_size, in_size, out_size, num_groups, dtype_pair, pin_tiles
+  ):
+    """Kernel quantizes bf16 lhs/dout per m-tile;"""
+    if test_utils.get_tpu_version() < 7:
+      self.skipTest("float8_e4m3fn matmul requires TPUv7+")
+    lhs_quant_dtype, rhs_quant_dtype = dtype_pair
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_tgmm(
+        lhs.astype(jnp.float32).swapaxes(0, 1),
+        grad.astype(jnp.float32),
+        group_sizes,
+        num_groups,
+    )
+
+    tile_info = (
+        gmm_v2.TileSizes(tile_m=128, tile_k=256, tile_n=256, bucket_base=128)
+        if pin_tiles
+        else tgmm_v2.calculate_tgmm_tiling
+    )
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_groups,
+        tile_info=tile_info,
+        preferred_element_type=jnp.bfloat16,
+        lhs_quant_dtype=lhs_quant_dtype,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+    # N.B. The reason why atol need to multiple by RMS is that
+    # for num_groups=5 (groups of 44, 45, ...), num_groups=16 (groups of ~8)
+    # 16 groups means each output is smaler than the 5 groups.
+    # So multiplying RMS makes the atol dimensionless.
+    chex.assert_trees_all_close(
+        actual.astype(jnp.float32),
+        expected,
+        rtol=1e-1,
+        atol=5e-1 * float(jnp.sqrt(jnp.mean(jnp.square(expected)))),
+    )
+
+  @pytest.mark.long
+  def test_tgmm_dynamic_quant_all_branches(self):
+    """Per-tile quant across all four gm branches, including a multi-tile group.
+
+    Group 0 (size 4*tile_m, 4 gm tiles): matmul_new_group, matmul, matmul,
+    matmul_group_changing. Each tile carries its own scale, so this is the case
+    that detects a dequant applied after accumulation instead of before.
+    Group 1 (size 64, 1 gm tile): matmul_new_group_and_changing.
+    """
+    if test_utils.get_tpu_version() < 7:
+      self.skipTest("float8_e4m3fn matmul requires TPUv7+")
+
+    tile_m = tile_k = tile_n = 256
+    in_size = out_size = 256
+    num_local_groups = 2
+    g0, g1 = 4 * tile_m, 64
+    batch_size = g0 + g1
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = jnp.array([g0, g1], dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.astype(jnp.float32).swapaxes(0, 1),
+        grad.astype(jnp.float32),
+        group_sizes,
+        num_local_groups,
+    )
+
+    tile_info = gmm_v2.TileSizes(
+        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_local_groups,
+        tile_info=tile_info,
+        preferred_element_type=jnp.bfloat16,
+        lhs_quant_dtype=jnp.float8_e4m3fn,
+        rhs_quant_dtype=jnp.float8_e4m3fn,
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    chex.assert_trees_all_close(
+        actual.astype(jnp.float32),
+        expected,
+        rtol=1e-1,
+        atol=5e-1 * float(jnp.sqrt(jnp.mean(jnp.square(expected)))),
+    )
+
+  @pytest.mark.long
+  def test_tgmm_dynamic_quant_ragged_groups(self):
+    """Empty and tiny groups, a non-zero group_offset, and all-zero columns.
+    """
+    if test_utils.get_tpu_version() < 7:
+      self.skipTest("float8_e4m3fn matmul requires TPUv7+")
+
+    batch_size = in_size = out_size = 256
+    num_groups, offset = 8, 2
+    num_local_groups = num_groups - offset
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = jnp.array([1, 7, 15, 0, 200, 33, 0, 0], dtype=jnp.int32)
+    empty_local = (1, 4, 5)
+    # Force a zero absmax on one k column and one n column.
+    lhs = lhs.at[:, 3].set(0)
+    grad = grad.at[:, 5].set(0)
+    group_offset = jnp.array(offset, dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.astype(jnp.float32).swapaxes(0, 1),
+        grad.astype(jnp.float32),
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+    )
+
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=256, bucket_base=128
+    )
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_local_groups, group_offset)
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+        tile_info=tile_info,
+        preferred_element_type=jnp.bfloat16,
+        lhs_quant_dtype=jnp.float8_e4m3fn,
+        rhs_quant_dtype=jnp.float8_e4m3fn,
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    for i in empty_local:
+      self.assertTrue(jnp.all(actual[i] == 0), f"group {i} is not zeroed")
+    self.assertFalse(jnp.any(jnp.isnan(actual)), "zero-scale guard let NaN out")
+    chex.assert_trees_all_close(
+        actual.astype(jnp.float32),
+        expected,
+        rtol=1e-1,
+        atol=5e-1 * float(jnp.sqrt(jnp.mean(jnp.square(expected)))),
+    )
+
+  @pytest.mark.long
+  def test_tgmm_dynamic_quant_padding(self):
+    if test_utils.get_tpu_version() < 7:
+      self.skipTest("float8_e4m3fn matmul requires TPUv7+")
+
+    batch_size, in_size, out_size, num_groups = 128, 255, 300, 5
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_tgmm(
+        lhs.astype(jnp.float32).swapaxes(0, 1),
+        grad.astype(jnp.float32),
+        group_sizes,
+        num_groups,
+    )
+
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=128, bucket_base=128
+    )
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_groups,
+        tile_info=tile_info,
+        preferred_element_type=jnp.bfloat16,
+        lhs_quant_dtype=jnp.float8_e4m3fn,
+        rhs_quant_dtype=jnp.float8_e4m3fn,
+    )
+    self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+    chex.assert_trees_all_close(
+        actual.astype(jnp.float32),
+        expected,
+        rtol=1e-1,
+        atol=5e-1 * float(jnp.sqrt(jnp.mean(jnp.square(expected)))),
+    )
+
+  def test_tgmm_dynamic_quant_input_validation(self):
+    """The API contract from validate_dynamic_quant."""
+    lhs = jnp.zeros((128, 256), dtype=jnp.bfloat16)
+    rhs = jnp.zeros((128, 256), dtype=jnp.bfloat16)
+    rhs_scale = jnp.ones((1, 1, 256), dtype=jnp.float32)
+    e4m3fn = jnp.float8_e4m3fn
+
+    with self.assertRaisesRegex(ValueError, "must be set together"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, None, e4m3fn, None)
+    with self.assertRaisesRegex(ValueError, "must be set together"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, None, None, e4m3fn)
+    with self.assertRaisesRegex(ValueError, "must differ from the input dtype"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, None, lhs.dtype, e4m3fn)
+    with self.assertRaisesRegex(ValueError, "must differ from the input dtype"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, None, e4m3fn, rhs.dtype)
+    with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+      tgmm_v2.validate_dynamic_quant(lhs, rhs, rhs_scale, e4m3fn, e4m3fn)
+    with self.assertRaisesRegex(ValueError, ">=16-bit"):
+      tgmm_v2.validate_dynamic_quant(
+          lhs.astype(jnp.float8_e5m2), rhs, None, e4m3fn, e4m3fn
+      )
+    with self.assertRaisesRegex(NotImplementedError, "integer input"):
+      tgmm_v2.validate_dynamic_quant(
+          lhs.astype(jnp.int32), rhs, None, e4m3fn, e4m3fn
+      )
+
+    # Wired into the public API, not merely reachable as a helper.
+    with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+      tgmm_v2.tgmm_v2(
+          lhs,
+          rhs,
+          jnp.array([128], dtype=jnp.int32),
+          1,
+          rhs_scale,
+          preferred_element_type=jnp.bfloat16,
+          lhs_quant_dtype=e4m3fn,
+          rhs_quant_dtype=e4m3fn,
+      )
 
 
 class GmmV2VmemStressTest(parameterized.TestCase):

@@ -59,9 +59,14 @@ TileTgmmFn = Callable[
 def get_scope_name(cfgs: gmm_v2.GmmConfigs) -> str:
   dims = cfgs.dims
   tiles = cfgs.tiles
+  lhs_q = cfgs.lhs_cfgs.quant_dtype
+  rhs_q = cfgs.rhs_cfgs.quant_dtype
+  lhs_q = None if lhs_q is None else jnp.dtype(lhs_q).name
+  rhs_q = None if rhs_q is None else jnp.dtype(rhs_q).name
   return (
       f"tgmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
       f"-n_{dims.size_n}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
+      f"-lq_{lhs_q}-rq_{rhs_q}"
   )
 
 
@@ -90,6 +95,8 @@ def calculate_tgmm_tiling(
     target_zero_ref_bytes: int,
 ) -> gmm_v2.TileSizes:
   """Calculate optimal tile sizes for TGMM kernel."""
+  # Everything DMA'd is multi-buffered; everything produced inside the kernel
+  # body is ×1.
   # In tgmm, we calculate lhs.T @ dout which doesn't require quantization.
   # Since we use it in MOE, the m can be dynamic and small. So we don't
   # want it to be too big. At the same time, because the mxu size is 256, the
@@ -129,6 +136,18 @@ def calculate_tgmm_tiling(
         # always <= this value.
         + target_zero_ref_bytes
     )
+    if lhs_cfgs.should_quantize:
+      lhs_q_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.quant_dtype) // 8
+      rhs_q_bytes = jax.dtypes.itemsize_bits(rhs_cfgs.quant_dtype) // 8
+      
+      budget += (
+          # fp8 operands fed to the MXU.
+          tile_m * tile_k * lhs_q_bytes
+          + tile_m * tile_n * rhs_q_bytes
+          # lhs_scale is [tile_k, 1] f32, lane-padded to [tile_k, num_lanes], so not negligible.
+          + tile_k * num_lanes * 4
+          # rhs_scale is [1, tile_n], negligible.
+      )
     return budget <= vmem_limit_bytes
 
   prev_tile_n = tile_n
@@ -186,6 +205,44 @@ def calculate_tgmm_tiling(
   )
 
 
+def validate_dynamic_quant(
+    lhs: jax.Array,  # [m, k]
+    rhs: jax.Array,  # [m, n]
+    rhs_scale: jax.Array | None,  # [1, 1, n] (per-N scale)
+    lhs_quant_dtype: jnp.dtype | None,
+    rhs_quant_dtype: jnp.dtype | None,
+):
+  """Validates the dynamic quantization."""
+  if lhs_quant_dtype is None and rhs_quant_dtype is None:
+    return
+  if (lhs_quant_dtype is None and rhs_quant_dtype is not None) or (lhs_quant_dtype is not None and rhs_quant_dtype is None):
+    raise ValueError(
+        "lhs_quant_dtype and rhs_quant_dtype must be set together; quantizing"
+        " only one operand gains nothing, as a mixed bf16 x fp8 matmul runs at"
+        f" the bf16 rate. Got {lhs_quant_dtype=}, {rhs_quant_dtype=}."
+    )
+  if lhs_quant_dtype == lhs.dtype:
+    raise ValueError(f"quant dtype must differ from the input dtype {lhs_quant_dtype=}, {lhs.dtype=}")
+  if rhs_quant_dtype == rhs.dtype:
+    raise ValueError(f"quant dtype must differ from the input dtype {rhs_quant_dtype=}, {rhs.dtype=}")
+  if rhs_scale is not None:
+    raise ValueError(
+        "rhs_scale and lhs_quant_dtype/rhs_quant_dtype are mutually exclusive."
+        " rhs_scale dequantizes an rhs that the caller already quantized with a"
+        " whole-tensor per-N scale, whereas lhs_quant_dtype/rhs_quant_dtype ask"
+        " the kernel to calibrate both operands per Pallas m-tile from"
+        " unquantized inputs."
+    )
+  lhs_bits = jax.dtypes.itemsize_bits(lhs.dtype)
+  rhs_bits = jax.dtypes.itemsize_bits(rhs.dtype)
+  if lhs_bits<16 or rhs_bits<16:
+    raise ValueError(f"Inputs must be >=16-bit floating {lhs.dtype=}, {rhs.dtype=}")
+  if not jnp.issubdtype(lhs.dtype, jnp.floating) or not jnp.issubdtype(rhs.dtype, jnp.floating):
+    raise NotImplementedError("Not yet supported for integer input for dynamic quantization.")
+  if not pltpu.get_tpu_info().is_matmul_supported(lhs_quant_dtype, rhs_quant_dtype):
+    raise ValueError(f"matmul is not supported on this TPU {lhs_quant_dtype=}, {rhs_quant_dtype=}")
+
+
 def make_tgmm_configs(
     lhs: jax.Array,  # [m, k]
     rhs: jax.Array,  # [m, n]
@@ -198,6 +255,8 @@ def make_tgmm_configs(
     out_dtype: jnp.dtype,
     acc_dtype: jnp.dtype | None,
     target_zero_ref_bytes: int,
+    lhs_quant_dtype: jnp.dtype | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ):
   """Fills the GMM config for the TGMM kernel."""
   assert out_dtype, "out_dtype cannot be None"
@@ -243,16 +302,19 @@ def make_tgmm_configs(
       size_lhs_sublane=size_lhs_sublane,
   )
 
-  rhs_quant_block_size_m = size_m
+  validate_dynamic_quant(lhs, rhs, rhs_scale, lhs_quant_dtype, rhs_quant_dtype)
   rhs_cfgs = gmm_v2.InputConfigs(
-      quant_dtype=None,
-      quant_block_size=rhs_quant_block_size_m,
+      quant_dtype=rhs_quant_dtype,
+      # On the dynamic quant path (rhs_quant_dtype!=None), the quant_block is
+      # scoped within a m_tile. On the external scale path, the quant
+      # block is the whole m axis.
+      quant_block_size=None if rhs_quant_dtype is not None else size_m,
       dtype=rhs.dtype,
       has_scale=(rhs_scale is not None),
   )
   lhs_cfgs = gmm_v2.InputConfigs(
-      quant_dtype=None,
-      quant_block_size=-1,
+      quant_dtype=lhs_quant_dtype,
+      quant_block_size=None if lhs_quant_dtype is not None else -1,
       dtype=lhs.dtype,
   )
 
@@ -267,6 +329,12 @@ def make_tgmm_configs(
         dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, out_dtype, acc_dtype,
         target_zero_ref_bytes,
     )
+  if lhs_quant_dtype is not None and rhs_quant_dtype is not None:
+    lhs_cfgs = dataclasses.replace(lhs_cfgs, quant_block_size=tiles.tile_m)
+    rhs_cfgs = dataclasses.replace(rhs_cfgs, quant_block_size=tiles.tile_m)
+    assert lhs_cfgs.should_quantize
+    assert rhs_cfgs.should_quantize
+  assert not (rhs_cfgs.should_quantize and rhs_cfgs.has_scale), "Caller can choose to either quantize rhs dynamically or provide a prequantized rhs with a scale but not both."
 
   return gmm_v2.GmmConfigs(
       dims=dims,
@@ -317,6 +385,15 @@ def tgmm_inner_kernel(
   tiled_rhs_ref = tiled_rhs_ref.value.reshape(-1, tiled_rhs_ref.value.shape[-1])
   gm_id = pl.program_id(2)
 
+  should_quantize = cfgs.lhs_cfgs.should_quantize
+  if should_quantize:
+    assert cfgs.rhs_cfgs.should_quantize
+    assert not cfgs.rhs_cfgs.has_scale
+    lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
+    rhs_q_dtype = cfgs.rhs_cfgs.quant_dtype
+    lhs_dtype_max = float(jnp.finfo(lhs_q_dtype).max)
+    rhs_dtype_max = float(jnp.finfo(rhs_q_dtype).max)
+
   def _matmul(is_new_group: bool, is_group_changing: bool):
 
     # Mask out invalid rows in the LHS/RHS tiles.
@@ -341,12 +418,38 @@ def tgmm_inner_kernel(
     )
     rhs_masked = jnp.where(rhs_mask, tiled_rhs_ref[...], 0)
 
-    acc = jax.lax.dot_general(
-        lhs_masked,
-        rhs_masked,
-        (((0,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
+    if not should_quantize:
+      acc = jax.lax.dot_general(
+          lhs_masked,
+          rhs_masked,
+          (((0,), (0,)), ((), ())),
+          preferred_element_type=jnp.float32,
+      )
+    else:
+      lhs_t = lhs_masked.T  # [tile_k, tile_m]
+      lhs_scale = (
+          jnp.max(jnp.abs(lhs_t), axis=1, keepdims=True).astype(jnp.float32)
+          / lhs_dtype_max
+      )  # [tile_k, 1]
+      rhs_scale = (
+          jnp.max(jnp.abs(rhs_masked), axis=0, keepdims=True).astype(jnp.float32)
+          / rhs_dtype_max
+      )  # [1, tile_n]
+      lhs_scale_inv = jnp.where(lhs_scale == 0, 0, 1.0 / lhs_scale)
+      rhs_scale_inv = jnp.where(rhs_scale == 0, 0, 1.0 / rhs_scale)
+      lhs_q = (lhs_t * lhs_scale_inv.astype(lhs_t.dtype)).astype(lhs_q_dtype)
+      rhs_q = (
+          rhs_masked * rhs_scale_inv.astype(rhs_masked.dtype)
+      ).astype(rhs_q_dtype)
+
+      acc = jax.lax.dot_general(
+          lhs_q, rhs_q, (((1,), (0,)), ((), ())),
+          preferred_element_type=jnp.float32,
+      )
+      # The dequant should happen before the accumulation.
+      # unlike the external `rhs_scale` (constant along
+      # m, so it hoists to group change), these scales are per m-tile.
+      acc = acc * lhs_scale * rhs_scale
 
     if not is_new_group:
       acc += acc_ref[...]
@@ -358,7 +461,7 @@ def tgmm_inner_kernel(
         acc *= scale_slice
       tiled_out_ref[...] = acc.astype(tiled_out_ref.dtype)
     else:
-      acc_ref[...] = acc
+      acc_ref[...] = acc.astype(acc_ref.dtype)
 
   @jax.named_scope("matmul_new_group_and_changing")
   def matmul_new_group_and_changing():
@@ -653,6 +756,8 @@ def validate_tgmm_inputs(
         "precision",
         "preferred_element_type",
         "acc_dtype",
+        "lhs_quant_dtype",
+        "rhs_quant_dtype",
     ],
 )
 def tgmm_v2(
@@ -668,6 +773,8 @@ def tgmm_v2(
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
     acc_dtype: jnp.dtype | None = None,
+    lhs_quant_dtype: jnp.dtype | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ):
   """Computes a transposed grouped matrix multiplication.
 
@@ -688,6 +795,10 @@ def tgmm_v2(
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.
     acc_dtype: Optional jnp.dtype for the accumulator.
+    lhs_quant_dtype: Optional. When set (together with
+      `rhs_quant_dtype`), the kernel quantizes `lhs` on the fly with a scale
+      calibrated per Pallas m-tile. Mutually exclusive with `rhs_scale`.
+    rhs_quant_dtype: Optional. the target quantization dtype for rhs.
 
   Returns:
     The result of the transposed grouped matrix multiplication, with shape
@@ -721,6 +832,8 @@ def tgmm_v2(
       out_dtype=preferred_element_type,
       acc_dtype=acc_dtype,
       target_zero_ref_bytes=target_zero_ref_bytes,
+      lhs_quant_dtype=lhs_quant_dtype,
+      rhs_quant_dtype=rhs_quant_dtype,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles
