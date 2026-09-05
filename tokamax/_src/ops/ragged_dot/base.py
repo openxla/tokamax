@@ -195,6 +195,51 @@ def generate_group_sizes(
   group_ids = rng.choice(num_groups, (m,), p=p, replace=True)
   return tuple(map(int, np.bincount(group_ids, minlength=num_groups)))
 
+_QUANTIZED_DTYPES = (
+    jnp.float8_e4m3fn,
+    jnp.float8_e5m2,
+    jnp.float8_e4m3fnuz,
+    jnp.float8_e5m2fnuz,
+    jnp.float4_e2m1fn,
+    jnp.int8,
+    jnp.int4,
+)
+
+
+def _is_quantized(x: jax.Array) -> bool:
+  return x.dtype in _QUANTIZED_DTYPES
+
+
+def _dequantize_inputs(
+    lhs: jax.Array | QArray | AsQArray,
+    rhs: jax.Array | QArray | AsQArray,
+    rhs_scale: jax.Array | None,
+    out_dtype: jnp.dtype,
+    ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
+) -> tuple[jax.Array, jax.Array]:
+  lhs, rhs = map(quantization.as_array, (lhs, rhs))
+  if rhs_scale is None:
+    return lhs, rhs
+
+  # rhs_scale is a gmm v2 feature.
+  if _is_quantized(rhs) and rhs_scale is not None:
+    if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
+      num_groups, k, n = rhs.shape
+      num_blocks = rhs_scale.shape[1]
+      block_size = k // num_blocks
+      rhs_reshaped = rhs.reshape(
+          (num_groups, num_blocks, block_size, n)
+      ).astype(jnp.float32)
+      rhs_dequant = (rhs_reshaped * rhs_scale.astype(jnp.float32)).reshape(
+          (num_groups, k, n)
+      )
+      rhs = rhs_dequant.astype(out_dtype)
+    elif ragged_dot_dimension_numbers == RAGGED_CONTRACTING_DOT_DIM_NUMS:
+      scale = rhs_scale.reshape(-1, rhs_scale.shape[-1]).astype(jnp.float32)
+      rhs = (rhs.astype(jnp.float32) * scale).astype(out_dtype)
+
+  return lhs, rhs
+
 
 @dataclasses.dataclass(frozen=True)
 class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
@@ -314,37 +359,26 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
       lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
       rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, Residuals]:
-    del config  # Unused.
+    del config, maybe_quantize_lhs, lhs_scale, zero_initialize
+    del lhs_quantization_dtype, rhs_quantization_dtype  # Unused.
 
-    if (
-        group_offset is not None
-        or rhs_scale is not None
-        or rhs_bias is not None
-        or maybe_quantize_lhs
-        or lhs_scale is not None
-        or not zero_initialize
-        or fuse_gateup_activation is not None
-        or lhs_quantization_dtype is not None
-        or rhs_quantization_dtype is not None
-    ):
+    # JAX/XLA does not implement group_offset.
+    if group_offset is not None:
       raise NotImplementedError(
-          "The base XLA implementation does not support group_offset,"
-          " rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
-          " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
-          " or rhs_quantization_dtype."
+          "The base XLA implementation does not support group_offset."
       )
-
-    lhs, rhs = map(quantization.as_array, (lhs, rhs))
 
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.asarray(group_sizes.value)
+
+    out_dtype = preferred_element_type or jnp.result_type(lhs, rhs)
+    lhs, rhs = _dequantize_inputs(lhs, rhs, rhs_scale, out_dtype, ragged_dot_dimension_numbers)
 
     # NOTE: `preferred_element_type` changes the accumulation type when using
     # `jax.lax.Precision`. It would be easier to always convert the precision to
     # `DotAlgorithmPreset`, but `ragged_dot_general` doesn't yet support
     # `DotAlgorithmPreset` (https://github.com/jax-ml/jax/issues/32207).
     # TODO: Remove once the above is fixed.
-    out_dtype = preferred_element_type or jnp.result_type(lhs, rhs)
     if not isinstance(precision, _DotAlgorithmLike.__value__):
       is_integer = jnp.issubdtype(out_dtype, jnp.integer)
       acc_dtype = jnp.int32 if is_integer else jnp.float32
@@ -357,6 +391,27 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         precision=precision,
         preferred_element_type=preferred_element_type,
     ).astype(out_dtype)
+
+    if rhs_bias is not None:
+      m = lhs.shape[0]
+      bias = rhs_bias[:, 0]
+      dot_out = dot_out + jnp.repeat(
+          bias, group_sizes, axis=0, total_repeat_length=m
+      )
+
+    if fuse_gateup_activation is not None:
+      gate, up = jnp.split(dot_out, 2, axis=-1)
+      match fuse_gateup_activation:
+        case "silu":
+          dot_out = jax.nn.silu(gate) * up
+        case "gelu":
+          dot_out = jax.nn.gelu(gate) * up
+        case "gelu_tanh":
+          dot_out = jax.nn.gelu(gate, approximate=True) * up
+        case _:
+          raise NotImplementedError(
+              f"Unsupported fused activation: {fuse_gateup_activation}"
+          )
 
     residuals = dot_out
     if activation is not None:
