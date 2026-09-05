@@ -26,7 +26,6 @@ dependencies = [
     "pydantic>=2.11.0",
     "qwix>=0.1.2",
     "tqdm",
-    "typeguard==2.13.3",
     "immutabledict",
     "tensorboardx",
     "xprof>=2.23.1",
