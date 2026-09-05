@@ -22,6 +22,12 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import pallas_batching_compat
+
+# These kernels pin scalars into SMEM with `with_memory_space_constraint`, which jax ships without a
+# batching rule, so registering one here is what lets a caller `vmap` them at all. See that module
+# for the second, deeper blocker (`mpmd_map`) that still applies.
+pallas_batching_compat.register()
 
 # Util.
 
