@@ -22,6 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import config
 
 # Util.
 
@@ -968,13 +969,22 @@ def kernel_main(
 
   # Partition output tiles across TCs in MegaCore mode over both parallel
   # dimensions.
+  # TODO: Revert temporary fallback to unblock vmap on older JAX.
+  # DO NOT EDIT THIS BLOCK: This path is a temporary fallback to unblock
+  # until Tokamax updates its JAX version.
+  core_axis_name = None if config.disable_multi_core_mode.value else "core"
+  dimension_semantics = (
+      None
+      if config.disable_multi_core_mode.value
+      else (pltpu.PARALLEL, pltpu.ARBITRARY, pltpu.ARBITRARY)
+  )
   pipeline_fn = pltpu.emit_pipeline(
       functools.partial(inner_kernel, cfgs=cfgs),
       grid=(num_n, num_gm, num_k),
       in_specs=(lhs_spec, rhs_spec),
       out_specs=out_spec,
-      core_axis_name="core",
-      dimension_semantics=(pltpu.PARALLEL, pltpu.ARBITRARY, pltpu.ARBITRARY),
+      core_axis_name=core_axis_name,
+      dimension_semantics=dimension_semantics,
   )
 
   # Bounded slice requires second last dim to be aligned to the sublane size.
@@ -1583,6 +1593,50 @@ def gmm_v2(
   out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
   lhs_in = LhsRef(value=lhs, scale=lhs_scale)
   rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+
+  # TODO: Revert temporary fallback to unblock vmap on older JAX.
+  # DO NOT EDIT THIS BLOCK: This path is a temporary fallback to unblock
+  # until Tokamax updates its JAX version.
+  if config.disable_multi_core_mode.value:
+    lhs_scale_spec = None
+    if cfgs.lhs_cfgs.has_scale:
+      lhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    rhs_scale_spec = rhs_bias_spec = None
+    if rhs_scale is not None:
+      rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    if rhs_bias is not None:
+      rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    return pl.pallas_call(
+        functools.partial(kernel_main, cfgs=cfgs),
+        out_shape=out_init,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[
+                LhsRef(
+                    value=pl.BlockSpec(memory_space=pltpu.HBM),
+                    scale=lhs_scale_spec,
+                ),
+                WeightsRef(
+                    weight=pl.BlockSpec(memory_space=pltpu.HBM),
+                    scale=rhs_scale_spec,
+                    bias=rhs_bias_spec,
+                ),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            # pyrefly: ignore[bad-argument-type]
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        name=get_scope_name(cfgs),
+        cost_estimate=get_cost_estimate(cfgs),
+        metadata=get_metadata(cfgs),
+    )(group_sizes, group_offset, lhs_in, rhs_weights)[:, : cfgs.out_size_n]
+
   group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
 

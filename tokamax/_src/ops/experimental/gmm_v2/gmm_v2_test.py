@@ -21,6 +21,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import config
 from tokamax._src import mosaic_tpu
 from tokamax._src import test_utils
 from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
@@ -38,7 +39,6 @@ _GroupConfig = collections.namedtuple(
 
 get_group_sizes = util.get_group_sizes
 quantize_tensor = util.quantize_tensor
-
 
 
 def reference_gmm(
@@ -1373,6 +1373,105 @@ class GmmV2VmemStressTest(parameterized.TestCase):
     lowered = jax.jit(gmm_fn).lower(lhs_spec, rhs_spec, group_sizes)
     compiled = lowered.compile()
     self.assertIsNotNone(compiled)
+
+
+class GmmV2VmapTest(parameterized.TestCase):
+  """Tests verifying jax.vmap compatibility for GMM and TGMM v2."""
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    if pltpu.get_tpu_info().generation < 5:
+      self.skipTest("Only supported on TPU gen 5+.")
+    super().setUp()
+
+  # TODO: Re-enable ("multi_core_mode", False) once JAX loop-based
+  # fallback for batched scalar prefetch lands in Pallas.
+  @parameterized.named_parameters(
+      ("single_core_fallback", True),
+  )
+  def test_gmm_vmap(self, disable_multi_core_mode: bool):
+    # Tests jax.vmap on gmm_v2 with batched LHS and group_sizes.
+    batch_size = 128
+    in_size = 256
+    out_size = 256
+    num_groups = 4
+    vmap_size = 2
+
+    key = jax.random.key(42)
+    k0, k1 = jax.random.split(key, 2)
+    lhs = jax.random.normal(
+        k0, (vmap_size, batch_size, in_size), dtype=jnp.bfloat16
+    )
+    rhs = jax.random.normal(
+        k1, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes_list = [
+        get_group_sizes(batch_size, num_groups) for _ in range(vmap_size)
+    ]
+    group_sizes = jnp.stack(group_sizes_list)
+
+    def gmm_fn(x, w, gs):
+      return gmm_v2.gmm_v2(x, w, gs)
+
+    with config.disable_multi_core_mode(disable_multi_core_mode):
+      vmapped_fn = jax.jit(jax.vmap(gmm_fn, in_axes=(0, None, 0)))
+      actual = vmapped_fn(lhs, rhs, group_sizes)
+
+    # Verify numerical equivalence with batched reference.
+    expected = jnp.stack([
+        reference_gmm(lhs[i], rhs, group_sizes_list[i])
+        for i in range(vmap_size)
+    ])
+    assert_arrays_all_close(actual, expected)
+
+  # TODO: Re-enable ("multi_core_mode", False) once JAX loop-based
+  # fallback for batched scalar prefetch lands in Pallas.
+  @parameterized.named_parameters(
+      ("single_core_fallback", True),
+  )
+  def test_tgmm_vmap(self, disable_multi_core_mode: bool):
+    # Tests jax.vmap on tgmm_v2 with batched LHS, RHS, and group_sizes.
+    batch_size = 128
+    in_size = 256
+    out_size = 256
+    num_groups = 4
+    vmap_size = 2
+
+    key = jax.random.key(42)
+    k0, k1 = jax.random.split(key, 2)
+    lhs = jax.random.normal(
+        k0, (vmap_size, batch_size, in_size), dtype=jnp.bfloat16
+    )
+    rhs = jax.random.normal(
+        k1, (vmap_size, batch_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes_list = [
+        get_group_sizes(batch_size, num_groups) for _ in range(vmap_size)
+    ]
+    group_sizes = jnp.stack(group_sizes_list)
+
+    def tgmm_fn(x, y, gs):
+      return tgmm_v2.tgmm_v2(
+          x,
+          y,
+          gs,
+          num_actual_groups=num_groups,
+          preferred_element_type=jnp.bfloat16,
+      )
+
+    with config.disable_multi_core_mode(disable_multi_core_mode):
+      vmapped_fn = jax.jit(jax.vmap(tgmm_fn, in_axes=(0, 0, 0)))
+      actual = vmapped_fn(lhs, rhs, group_sizes)
+
+    # Verify numerical equivalence with batched reference.
+    expected = jnp.stack([
+        reference_tgmm(
+            lhs[i].swapaxes(0, 1), rhs[i], group_sizes_list[i], num_groups
+        )
+        for i in range(vmap_size)
+    ])
+    assert_arrays_all_close(actual, expected)
 
 
 if __name__ == "__main__":
