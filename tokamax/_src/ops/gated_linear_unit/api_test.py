@@ -51,6 +51,9 @@ class GatedLinearUnitTest(parameterized.TestCase):
       if "mosaic" in implementation:
         self.skipTest("Mosaic not supported on this platform.")
 
+    if implementation == "cutedsl" and not gpu_utils.is_sm100():
+      self.skipTest("CuteDSL requires SM100+ GPU.")
+
     lhs, rhs = _get_input_data(m=128, k=64, n=128)
     activation = jax.nn.silu
 
