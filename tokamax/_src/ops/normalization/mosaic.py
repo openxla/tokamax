@@ -16,17 +16,7 @@
 
 Normalization is memory-bound, so the design serves coalesced GMEM access: one
 CTA takes one tile straight from GMEM into registers, reduces it, and writes it
-back. No SMEM, no pipeline -- blocking and the layout live in `mosaic_tiling`.
-
-A tile is one load and one store. Every axis is tiled exactly -- the reduced axis
-by the lanes, the rest by the block -- so there is no tail to mask, and a shape
-that cannot be tiled exactly is declined for the caller to fall back on, Mosaic
-having no masked GMEM access to offer instead.
-
-The one layout annotation is on the loaded tile, and everything downstream
-follows from it: it is what makes both the load and the store coalesce, and the
-reduction needs a tiled layout that inference will not offer. Which layout that
-is depends on the shape; see `mosaic_tiling`'s thread mappings.
+back. No SMEM, no pipeline.
 """
 
 import dataclasses
@@ -49,6 +39,15 @@ Key = triton_config.Key
 FusedInputArray = base.FusedInputArray
 
 def _vector_length(block_n: int, A: int, bitwidth: int) -> int:
+  """Picks the widest per-thread vector that stays contiguous in GMEM.
+
+  The kernel is memory-bound, so we want the widest load the hardware offers
+  (16 bytes = 128 bits per thread). A vector is only legal if its elements are
+  adjacent in memory: `x` is (M, A, N) with N innermost, so a vector either sits
+  inside one N row (`block_n % vec == 0`) or covers whole N rows and spills into
+  the A axis (`vec % block_n == 0`, with A divisible so the spill never crosses
+  a block boundary). Neither holds -> halve and retry, down to a scalar load.
+  """
   vec = (8 * 16) // bitwidth  # 16-byte vectors.
   while True:
     if block_n % vec == 0 or (vec % block_n == 0 and A % vec == 0):
@@ -56,14 +55,24 @@ def _vector_length(block_n: int, A: int, bitwidth: int) -> int:
     vec //= 2
 
 def _vec_along_a(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
-  # The 32 lanes go along the reduced axis, one vector each, and any lanes left
-  # over once it is exhausted spread along M.
+  """Tiles a warp's block when the vector spans whole N rows (vec >= block_n).
+  The 32 lanes go along the reduced axis, one vector each, and any lanes left
+  over once it is exhausted spread along M.
+  """
   a = A // vec  # Vectors along the reduced axis.
   if a >= 32:
     return (M, A // 32, N)
   return (M // (32 // a), vec, N)
 
 def _vec_along_n(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
+  """Tiles a warp's block when the vector fits inside an N row (vec < block_n).
+
+  The 32 lanes are split `ln` along N and `la = 32 // ln` along A. N first, since
+  lanes adjacent along N issue one coalesced transaction, whereas lanes along A
+  add reduction shuffles; we take the largest `ln` that divides evenly and only
+  fall back to A for the leftovers. Divisibility is required both ways because
+  the tiling has no support for partial tiles.
+  """
   for ln in (32, 16, 8, 4, 2, 1):
     la = 32 // ln
     if N % (ln * vec) == 0 and A % la == 0:
@@ -71,6 +80,8 @@ def _vec_along_n(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
   raise ValueError(f'Cannot spread 32 lanes over {A=}, {N=} with {vec=}.')
 
 def _warp_blocks(block_m, block_n):
+    """Splits the block over the warpgroup's 4 warps, along M and/or N.
+    """
     for amt_m in [4,2,1]:
       amt_n = 4 // amt_m
       if block_m % amt_m == 0 and block_n % amt_n == 0:
@@ -124,7 +135,40 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     block = (config.block_m, A, config.block_n or 1)
     block_m, _, block_n = block
 
-    # TODO: see if named arguments work here.
+    # Both branches below build a 14-dim tiled layout out of the (M, A, N)
+    # block. Each `plgpu.Tiling` entry replaces the trailing dims it covers with
+    # (how many tiles fit, tile shape), so the rank grows 3 -> 6 -> 9 -> 12 ->
+    # 14 as we tile by block, by warp, by lane, and finally by vector.
+    # `warp_dims`/`lane_dims`/`vector_dim` index that final rank from the end;
+    # the warp dims always multiply to 4 and the lane dims to 32.
+    #
+    # Shared by both branches (tile 0, the CTA block; tile 1, the warp block):
+    #   -14, -13, -12  block counts along M, A, N. All 1: the grid has already
+    #                  selected a single block, and A is never blocked.
+    #   -11, -10,  -9  warp counts along M, A, N. WARP dims are -11 and -9 --
+    #                  warps split M and/or N but never the reduced axis A, so
+    #                  -10 is always 1.
+    #
+    # vec >= block_n (`_vec_along_a`; the vector spans whole N rows):
+    #    -8,  -7,  -6  lane counts along M, A, N. LANE dims are -8 and -7 --
+    #                  lanes fill A first and spill into M; N is consumed
+    #                  entirely by the vector, so -6 is 1.
+    #    -5           M extent held by one lane.
+    #    -4,  -3      vectors along A per lane, and N chunks per lane (1).
+    #    -2           VECTOR dim: `vec` contiguous elements along A.
+    #    -1           the `block_n` elements of N each of those rows spans.
+    #
+    # vec < block_n (`_vec_along_n`; the vector sits inside one N row):
+    #    -8,  -7,  -6  lane counts along M, A, N. LANE dims are -7 and -6 --
+    #                  `la` lanes along A times `ln` lanes along N; lanes never
+    #                  split M here, so -8 is 1.
+    #    -5           M extent held by one lane (all of the warp's M).
+    #    -4,  -3      A chunks per lane and vectors along N per lane.
+    #    -2           the A extent one lane holds (A // la).
+    #    -1           VECTOR dim: `vec` contiguous elements along N.
+    #
+    # `canonicalize()` then collapses the size-1 dims, which is why the layout
+    # is read back off `l` rather than reusing the values passed in.
     def kernel(*refs):
       it = iter(refs)  # Inputs then outputs, optional ones only if present.
       take = lambda present: next(it) if present else None
@@ -136,7 +180,6 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         zip([jax.lax.axis_index(i) for i in "man"], block))
 
       vec = _vector_length(block_n, A, dtype.itemsize * 8)
-      # Start with a block of size (block_m, A, block_n)
       warp_m, warp_n = _warp_blocks(block_m, block_n)
       tile_spec = [block, (block_m // warp_m, A, block_n // warp_n)]
       if vec >= block_n:
@@ -150,8 +193,6 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
         lane_dims = (-7, -6)  # The A and N tile counts.
         tile_spec.append((tile_spec[-1][1], vec),)
 
-      # TODO: alphafold_alphafold_384res_128chan_axis0_forward
-      # and alphafold_alphafold_768res_128chan_axis0_forward are too slow!
       l = TiledLayout(
         plgpu.Tiling(tuple(tile_spec)),
         warp_dims=(-11, -9),
@@ -216,9 +257,16 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return triton_config.get_heuristics_config(
+    config = triton_config.get_heuristics_config(
       *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
     )
+    n = triton_config.canonicalize_shape_3d(
+      ba.args[0].shape, ba.kwargs['axis']
+    )[2]
+    if config.block_n is not None and n % 128 == 0:
+      # 128 divided by 4 warps allows for 32 lanes per warp.
+      config = dataclasses.replace(config, block_n=128)
+    return config
 
   @override
   def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
