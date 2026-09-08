@@ -45,6 +45,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+          # Full history, so that `origin/<base>` and the merge base with it
+          # both exist. 
+          fetch-depth: 0
 
       - name: Test the CI scripts
         # `shards.py` decides what every other job runs
@@ -78,6 +81,37 @@ jobs:
         # Log only, so that one can still see it, but not as an authoritative
         # run summary including timing data - that is done after the job ends.
         run: python3 .github/ci/shards.py list
+
+      - name: Report the shards this change would select
+        # A dry run of change-based selection. `deps.py` takes the import graph
+        # of the package and answers which test files a change can reach; 
+
+        # Landing it as a log first is the point so that we can
+        # validate dependency selection logic before running anything.
+        # step is `continue-on-error` for the same reason: it decides nothing,
+        # and `Build test matrix` above is what gates the run.
+        continue-on-error: true
+        env:
+          # The branch the pull request targets. Empty on `workflow_dispatch`,
+          # which has no base to diff against, and so has to mean everything.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if [[ -z "${BASE_REF}" ]]; then
+            echo "No base ref on ${GITHUB_EVENT_NAME}: every shard runs."
+            exit 0
+          fi
+          # Three dots: diff from the merge base, so commits landing on the
+          # base branch while this pull request is open are not read as part
+          # of it. `-z` because `--name-only` C-quotes unusual paths, and
+          # these are paths out of the pull request.
+          git diff --name-only -z "origin/${BASE_REF}...HEAD" > /tmp/changed
+          echo "Changed against origin/${BASE_REF}:"
+          tr '\0' '\n' < /tmp/changed | sed 's/^/  /'
+          if [[ ! -s /tmp/changed ]]; then
+            echo "Nothing changed; no shard would run."
+            exit 0
+          fi
+          xargs -0r -a /tmp/changed python3 .github/ci/deps.py
 
   shard-tests:
     name: shard-tests (${{ matrix.runner_short }}, ${{ matrix.shard_name }})
