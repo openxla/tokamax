@@ -23,6 +23,8 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.mla import reference
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
+
 
 class MultiHeadLatentAttention[C](op.Op[Any, Any, None, C, Any]):
   """Tokamax operator for Multi-Head Latent Attention."""
@@ -31,21 +33,23 @@ class MultiHeadLatentAttention[C](op.Op[Any, Any, None, C, Any]):
   def bind(
       self,
       ql_nope: Float[
-          Array, "max_num_tokens actual_num_q_heads actual_lkv_dim"
+          Array | AbstractArray,
+          "max_num_tokens actual_num_q_heads actual_lkv_dim"
       ],
       q_pe: Float[
-          Array, "max_num_tokens actual_num_q_heads actual_r_dim"
+          Array | AbstractArray,
+          "max_num_tokens actual_num_q_heads actual_r_dim"
       ],
-      new_kv_c: Float[Array, "max_num_tokens actual_lkv_dim"],
-      new_k_pe: Float[Array, "max_num_tokens actual_r_dim"],
+      new_kv_c: Float[Array | AbstractArray, "max_num_tokens actual_lkv_dim"],
+      new_k_pe: Float[Array | AbstractArray, "max_num_tokens actual_r_dim"],
       cache_kv: Float[
-          Array,
+          Array | AbstractArray,
           "total_num_pages page_size_per_kv_packing kv_packing lkv_dim",
       ],
-      kv_lens: Int[Array, "max_num_seqs"],
-      page_indices: Int[Array, "num_page_indices"],
-      cu_q_lens: Int[Array, "max_num_seqs_plus_1"],
-      distribution: Int[Array, "3"],
+      kv_lens: Int[Array | AbstractArray, "max_num_seqs"],
+      page_indices: Int[Array | AbstractArray, "num_page_indices"],
+      cu_q_lens: Int[Array | AbstractArray, "max_num_seqs_plus_1"],
+      distribution: Int[Array | AbstractArray, "3"],
       *,
       sm_scale: float = 1.0,
       sliding_window: int | None = None,

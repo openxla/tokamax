@@ -25,7 +25,7 @@ from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
 
-
+type AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 type FusedWeights = Float[Array, 'K 2 N']
 type UnfusedWeights = tuple[Float[Array, 'K N'], Float[Array, 'K N']]
 type Residuals = Float[Array, '*B M 2 N']
@@ -42,8 +42,14 @@ class GatedLinearUnit[C, K: Hashable](op.Op[Any, jax.Array, Residuals, C, K]):
   @override
   def bind(
       self,
-      x: Float[Array, '*B M K'],
-      weights: FusedWeights | UnfusedWeights,
+      x: Float[Array | AbstractArray, '*B M K'],
+      weights: (
+          Float[Array | AbstractArray, 'K 2 N']
+          | tuple[
+              Float[Array | AbstractArray, 'K N'],
+              Float[Array | AbstractArray, 'K N'],
+          ]
+      ),
       *,
       activation: Callable[[jax.Array], jax.Array] | None = None,
       precision: jax.lax.PrecisionLike = None,

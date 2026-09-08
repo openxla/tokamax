@@ -23,6 +23,8 @@ from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
+
 
 @functools.partial(jax.jit, static_argnames=["k", "axis", "is_stable"])
 def topk(
@@ -61,9 +63,9 @@ class TopK[C](op.Op[Any, tuple[jax.Array, jax.Array], None, C, Any]):
   @jaxtyping.jaxtyped
   def bind(
       self,
-      operand: Shaped[Array, "*batch N"],
+      operand: Shaped[Array | AbstractArray, "*batch N"],
       k: int,
-      values: Int[Array, "*batch N"] | None = None,
+      values: Int[Array | AbstractArray, "*batch N"] | None = None,
       *,
       axis: int = -1,
       is_stable: bool = True,

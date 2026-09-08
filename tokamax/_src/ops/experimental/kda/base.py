@@ -29,6 +29,7 @@ from tokamax._src.ops.experimental.kda.cp_utils import (
 )
 from typing_extensions import override
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
@@ -48,8 +49,8 @@ def _validate_beta(beta: jax.Array) -> None:
 def _validate_gate_args(
     *,
     use_gate_in_kernel: bool,
-    a_log: jax.Array | None,
-    delta_time_bias: jax.Array | None,
+    a_log: jax.Array | AbstractArray | None,
+    delta_time_bias: jax.Array | AbstractArray | None,
     heads: int,
     key_dim: int,
     lower_bound: float | None,
@@ -81,20 +82,22 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
   @override
   def bind(
       self,
-      query: Float[Array, "H B T K"],
-      key: Float[Array, "H B T K"],
-      value: Float[Array, "H B T V"],
-      gate: Float[Array, "H B T K"],
-      beta: Float[Array, "H B T"],
+      query: Float[Array | AbstractArray, "H B T K"],
+      key: Float[Array | AbstractArray, "H B T K"],
+      value: Float[Array | AbstractArray, "H B T V"],
+      gate: Float[Array | AbstractArray, "H B T K"],
+      beta: Float[Array | AbstractArray, "H B T"],
       *,
-      a_log: Float[Array, "H"] | None = None,
-      delta_time_bias: Float[Array, "H*K"] | None = None,
+      a_log: Float[Array | AbstractArray, "H"] | None = None,
+      delta_time_bias: Float[Array | AbstractArray, "H*K"] | None = None,
       scale: float | None = None,
-      initial_state: Float[Array, "B N H K V"] | None = None,
+      initial_state: (
+          Float[Array | AbstractArray, "B N H K V"] | None
+      ) = None,
       output_final_state: bool = False,
       use_qk_l2norm: bool = False,
       use_gate_in_kernel: bool = False,
-      segment_ids: Int[Array, "B T"] | None = None,
+      segment_ids: Int[Array | AbstractArray, "B T"] | None = None,
       lower_bound: float | None = None,
       context_parallel_metadata: ContextParallelMetadata | None = None,
       max_num_segments: int | None = None,
