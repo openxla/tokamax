@@ -57,7 +57,7 @@ _MMA_TMA_WG = 0
 _SOFTMAX_WG = 1
 _SCALE_WG = 2
 _MMA_WARP = 0
-_TMA_LOAD_QK_WARP = 1
+_TMA_LOAD_K_WARP = 1
 _TMA_LOAD_V_WARP = 2
 _TMA_LOAD_MASK_WARP = 3
 _L_PRODUCED = 4
@@ -485,67 +485,102 @@ def flash_attention_kernel(
       def mma_tma_wg():
         plgpu.set_max_registers(80, action="decrease")
 
+        qs_cluster = pl.ds(q_base_cluster, block_q)
+        q_leader_tracked = (
+            plgpu.CopyPartition.PARTITIONED(0) if collective else None
+        )
+
+        def tma_load_kv_warp(gmem, smem, produced, consumed, partition_axis):
+          kv_head = lax.div(hi, q_heads_per_kv_head)
+          block_d = gmem.shape[-1] // num_tma_splits
+          if collective:
+            leader_tracked = plgpu.CopyPartition.PARTITIONED(partition_axis)
+          else:
+            leader_tracked = None
+
+          @pl.when(loop_info.local_index == 0)
+          def prologue():
+            for si in range(num_stages):
+              for i in range(num_tma_splits):
+                plgpu.barrier_arrive(consumed.at[si, i])
+
+          @pl.loop(lb, ub)
+          def kv_loop(ki):
+            si = lax.rem(prev_iters + ki - lb, num_stages)
+            ks = pl.ds(ki * block_kv, block_kv)
+
+            for i in range(num_tma_splits):
+              ds = pl.ds(i * block_d, block_d)
+              plgpu.barrier_wait(consumed.at[si, i])
+              plgpu.copy_gmem_to_smem(
+                  gmem.at[ks, kv_head, ds],
+                  smem.at[si, i],
+                  barrier=produced.at[si],
+                  collective_axes=collective_axis,
+                  leader_tracked=leader_tracked,
+              )
+
+        def qk_mma(ki):
+          block_d = head_dim // num_tma_splits
+          si = lax.rem(prev_iters + ki - lb, num_stages)
+
+          with jax.named_scope("wait_k"):
+            plgpu.barrier_wait(s_consumed)
+            plgpu.barrier_wait(k_produced.at[si])
+            mgpu_lib.tcgen05_fence_after_thread_sync()
+
+          for i in range(num_tma_splits):
+            ds = pl.ds(i * block_d, block_d)
+            with jax.named_scope("issuing Q@K.T"):
+              plgpu.tcgen05_mma(
+                  s_tmem,
+                  q_smem.at[:, ds],
+                  k_smem.at[si, i].T,
+                  k_consumed.at[si, i],
+                  accumulate=i > 0,
+                  collective_axis=collective_axis,
+              )
+
+          plgpu.tcgen05_commit_arrive(s_produced, collective_axis)
+
+        def pv_mma(ki):
+          block_d = head_dim_out // num_tma_splits
+          v_si = lax.rem(prev_iters + ki - lb, num_stages)
+          p_si = lax.rem(prev_iters + ki - lb, 2)
+
+          with jax.named_scope("wait_v"):
+            plgpu.barrier_wait(v_produced.at[v_si])
+            plgpu.barrier_wait(p_produced.at[p_si])
+
+          for i in range(num_tma_splits):
+            ds = pl.ds(i * block_d, block_d)
+            plgpu.barrier_wait(acc_produced.at[i])
+            mgpu_lib.tcgen05_fence_after_thread_sync()
+            with jax.named_scope("issuing P@V"):
+              plgpu.tcgen05_mma(
+                  acc_tmem.at[:, ds],
+                  p_tmem.at[p_si],
+                  v_smem.at[v_si, i],
+                  v_consumed.at[v_si, i],
+                  accumulate=(ki != lb),
+                  collective_axis=collective_axis,
+              )
+
+          plgpu.tcgen05_commit_arrive(pv_mma_produced, collective_axis)
+
         @plgpu.warp_map
         def per_warp(warp_id):
 
-          def tma_load_kv_warp(gmem, smem, produced, consumed, partition_axis):
-            kv_head = lax.div(hi, q_heads_per_kv_head)
-            block_d = gmem.shape[-1] // num_tma_splits
-            if collective:
-              leader_tracked = plgpu.CopyPartition.PARTITIONED(partition_axis)
-            else:
-              leader_tracked = None
-
-            @pl.when(loop_info.local_index == 0)
-            def prologue():
-              for si in range(num_stages):
-                for i in range(num_tma_splits):
-                  plgpu.barrier_arrive(consumed.at[si, i])
-
-            @pl.loop(lb, ub)
-            def kv_loop(ki):
-              si = lax.rem(prev_iters + ki - lb, num_stages)
-              ks = pl.ds(ki * block_kv, block_kv)
-
-              for i in range(num_tma_splits):
-                ds = pl.ds(i * block_d, block_d)
-                plgpu.barrier_wait(consumed.at[si, i])
-                plgpu.copy_gmem_to_smem(
-                    gmem.at[ks, kv_head, ds],
-                    smem.at[si, i],
-                    barrier=produced.at[si],
-                    collective_axes=collective_axis,
-                    leader_tracked=leader_tracked,
-                )
-
-          @pl.when(warp_id == _TMA_LOAD_QK_WARP)
-          def tma_load_qk_warp():
-
-            if q_consumed is not None:
-
-              @pl.when(loop_info.local_index == 0)
-              def prologue():
-                plgpu.barrier_arrive(q_consumed)
-
-            @pl.when(ub > lb)
-            def load_q():
-              qs = pl.ds(q_base_cluster, block_q)
-              leader_tracked = (
-                  plgpu.CopyPartition.PARTITIONED(0) if collective else None
-              )
-              if q_consumed is not None:
-                plgpu.async_prefetch(
-                    q_gmem.at[qs, hi],
-                    collective_axes=collective_axis,
-                    leader_tracked=leader_tracked,
-                )
-                plgpu.barrier_wait(q_consumed)
+          @pl.when(warp_id == _TMA_LOAD_K_WARP)
+          def tma_load_k_warp():
+            if not config.persistent:
               plgpu.copy_gmem_to_smem(
-                  q_gmem.at[qs, hi],
+                  q_gmem.at[qs_cluster, hi],
                   q_smem,
                   barrier=q_produced,
                   collective_axes=collective_axis,
-                  leader_tracked=leader_tracked,
+                  leader_tracked=q_leader_tracked,
+                  predicate=jnp.asarray(ub > lb),
               )
 
             tma_load_kv_warp(k_gmem, k_smem, k_produced, k_consumed, 0)
@@ -579,59 +614,50 @@ def flash_attention_kernel(
                       mask_gmem.at[hi_, qs, ks], mask_smem, mask_produced
                   )
 
-          @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
-          def mma_warp():
+          if config.persistent:
 
-            def qk_mma(ki):
-              block_d = head_dim // num_tma_splits
-              si = lax.rem(prev_iters + ki - lb, num_stages)
+            @pl.when(warp_id == _MMA_WARP)
+            def tma_load_q_mma_warp():
+              assert q_consumed is not None
 
-              with jax.named_scope("wait_k"):
-                plgpu.barrier_wait(s_consumed)
-                plgpu.barrier_wait(k_produced.at[si])
-                mgpu_lib.tcgen05_fence_after_thread_sync()
+              @pl.when(loop_info.local_index == 0)
+              def prologue():
+                plgpu.barrier_arrive(q_consumed)
 
-              for i in range(num_tma_splits):
-                ds = pl.ds(i * block_d, block_d)
-                with jax.named_scope("issuing Q@K.T"):
-                  plgpu.tcgen05_mma(
-                      s_tmem,
-                      q_smem.at[:, ds],
-                      k_smem.at[si, i].T,
-                      k_consumed.at[si, i],
-                      accumulate=i > 0,
-                      collective_axis=collective_axis,
-                  )
+              plgpu.async_prefetch(
+                  q_gmem.at[qs_cluster, hi],
+                  collective_axes=collective_axis,
+                  leader_tracked=q_leader_tracked,
+              )
 
-              plgpu.tcgen05_commit_arrive(s_produced, collective_axis)
+              @pl.when(ub > lb)
+              def do_block():
+                plgpu.barrier_wait(q_consumed)
+                plgpu.copy_gmem_to_smem(
+                    q_gmem.at[qs_cluster, hi],
+                    q_smem,
+                    barrier=q_produced,
+                    collective_axes=collective_axis,
+                    leader_tracked=q_leader_tracked,
+                )
 
-            def pv_mma(ki):
-              block_d = head_dim_out // num_tma_splits
-              v_si = lax.rem(prev_iters + ki - lb, num_stages)
-              p_si = lax.rem(prev_iters + ki - lb, 2)
+                @pl.when(cluster_idx == 0)
+                def do_mma():
+                  plgpu.barrier_wait(q_produced)
+                  qk_mma(lb)
 
-              with jax.named_scope("wait_v"):
-                plgpu.barrier_wait(v_produced.at[v_si])
-                plgpu.barrier_wait(p_produced.at[p_si])
+                  @pl.loop(lb, ub - 1)
+                  def kv_loop(ki):
+                    qk_mma(ki + 1)
+                    pv_mma(ki)
 
-              for i in range(num_tma_splits):
-                ds = pl.ds(i * block_d, block_d)
-                plgpu.barrier_wait(acc_produced.at[i])
-                mgpu_lib.tcgen05_fence_after_thread_sync()
-                with jax.named_scope("issuing P@V"):
-                    plgpu.tcgen05_mma(
-                        acc_tmem.at[:, ds],
-                        p_tmem.at[p_si],
-                        v_smem.at[v_si, i],
-                        v_consumed.at[v_si, i],
-                        accumulate=(ki != lb),
-                        collective_axis=collective_axis,
-                    )
+                  plgpu.tcgen05_commit_arrive(q_consumed, collective_axis)
+                  pv_mma(ub - 1)
 
-              plgpu.tcgen05_commit_arrive(pv_mma_produced, collective_axis)
+          else:
 
-            @pl.when(ub > lb)
-            def compute():
+            @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0) & (ub > lb))
+            def mma_warp():
               plgpu.barrier_wait(q_produced)
               qk_mma(lb)
 
@@ -640,8 +666,6 @@ def flash_attention_kernel(
                 qk_mma(ki + 1)
                 pv_mma(ki)
 
-              if q_consumed is not None:
-                plgpu.tcgen05_commit_arrive(q_consumed, collective_axis)
               pv_mma(ub - 1)
 
       @pl.when(wg == _SOFTMAX_WG)
