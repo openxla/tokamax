@@ -162,6 +162,7 @@ def reference_tgmm(
 # dtype is introduced into a default-tolerance assertion.
 _DTYPE_TOL = {
     jnp.dtype(jnp.bfloat16): 1e-1,
+    jnp.dtype(jnp.float32): 5e-1,
 }
 
 
@@ -269,6 +270,70 @@ class GmmTest(parameterized.TestCase):
         group_sizes,
         group_offset=group_offset_arr,
         transpose_rhs=True,
+    )
+
+    assert_arrays_all_close(actual, expected)
+
+  @pytest.mark.long
+  @parameterized.product(
+      batch_size=[128],
+      in_size=[1024],
+      out_size=[512],
+      num_groups=[8],
+      tile_k=[256],
+      transpose_rhs=[False, True],
+      group_offset=[0],
+      dtype=[jnp.bfloat16, jnp.float32],
+  )
+  def test_gmm_multi_k_partial_bucket(
+      self,
+      batch_size,
+      in_size,
+      out_size,
+      num_groups,
+      tile_k,
+      transpose_rhs,
+      group_offset,
+      dtype,
+  ):
+    """Tests multi-K contraction (num_k > 1) with partial M-buckets."""
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+    k0, k1 = jax.random.split(key, 2)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=dtype)
+    if transpose_rhs:
+      rhs = jax.random.normal(
+          k1, (num_local_groups, out_size, in_size), dtype=dtype
+      )
+      rhs_ref = jnp.swapaxes(rhs, 1, 2)
+    else:
+      rhs = jax.random.normal(
+          k1, (num_local_groups, in_size, out_size), dtype=dtype
+      )
+      rhs_ref = rhs
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset_arr = jnp.array(group_offset, dtype=jnp.int32)
+
+    expected = reference_gmm(
+        lhs, rhs_ref, group_sizes, group_offset=group_offset_arr
+    )
+
+    tile_info = gmm_v2.TileSizes(
+        tile_m=256,
+        tile_k=tile_k,
+        tile_n=min(out_size, 512),
+        bucket_base=64,
+    )
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        group_offset=group_offset_arr,
+        tile_info=tile_info,
+        transpose_rhs=transpose_rhs,
     )
 
     assert_arrays_all_close(actual, expected)

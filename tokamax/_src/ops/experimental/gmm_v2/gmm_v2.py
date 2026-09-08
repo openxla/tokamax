@@ -635,8 +635,7 @@ def inner_kernel(
 
     # Step 3: Output post-processing.
     if not is_first_k_step:
-      acc = jnp.pad(acc, ((cfgs.tiles.tile_m - bucket_m, 0), (0, 0)))
-      acc += acc_ref[...]
+      acc += acc_ref[:bucket_m]
     acc_m = acc.shape[0]
 
     if is_last_k_step:
@@ -708,15 +707,11 @@ def inner_kernel(
     is_first_k_step = k_id == 0
     is_last_k_step = k_id == (num_k - 1)
 
-    if bucket_m == cfgs.tiles.tile_m:
-      lax.cond(
-          is_first_k_step,
-          lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
-          lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
-      )
-    else:
-      # partial m is only invoked at last matmul.
-      lax.cond(is_first_k_step, matmul_first_last, matmul_last)
+    lax.cond(
+        is_first_k_step,
+        lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
+        lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
+    )
 
   branches = []
   for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
