@@ -128,8 +128,7 @@ THEMES = (
 )
 
 # Test files intentionally run by no shard.
-EXCLUDED_TESTS = (
-)
+EXCLUDED_TESTS = ()
 
 
 class _RequiredSpec(TypedDict):
@@ -187,7 +186,9 @@ MatrixEntry = dict[str, str]
 #            model below.
 #   minutes  measured wall clock, worst case across the runners the shard is
 #            scheduled on. Set it only from a real run: omitting it means no
-#            number yet, which is not the same as fast.
+#            number yet, which is not the same as fast. The one exception is
+#            the catch-all shard, where it is a target rather than a
+#            measurement -- see its entry.
 #
 # There is no key for which runners a shard belongs on, and `Spec` has no
 # field for one: every shard runs on every runner in `RUNNERS`. Restricting a
@@ -542,6 +543,17 @@ SHARDS: ShardMap = {
         ),
         minutes=2,
     ),
+    'experimental-mla-v2-kernel': Spec(
+        paths=('tokamax/_src/ops/experimental/mla/v2/mla_kernel_v2_test.py',),
+        minutes=34,
+    ),
+    'experimental-mla-v2': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/mla/v2/mla_transpose_test.py',
+            'tokamax/_src/ops/experimental/mla/v2/test_mla_tuned_params.py',
+        ),
+        minutes=6,
+    ),
     # The kda tests that are not the kernel; see `experimental-kda-kernel`.
     'experimental-kda': Spec(
         paths=(
@@ -597,6 +609,7 @@ SHARDS: ShardMap = {
         paths=(
             'tokamax/_src/ad_test.py',
             'tokamax/_src/batching_test.py',
+            'tokamax/_src/benchmarking_test.py',
             'tokamax/_src/config_test.py',
             'tokamax/_src/gpu_utils_test.py',
             'tokamax/_src/hlo_utils_common_test.py',
@@ -609,7 +622,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/shape_test.py',
             'tokamax/_src/test_utils_test.py',
         ),
-        minutes=1,
+        minutes=2,
     ),
     # -- catch-all ---------------------------------------------------------
     # Temporary shard that ideally should be empty. It's filled in by
