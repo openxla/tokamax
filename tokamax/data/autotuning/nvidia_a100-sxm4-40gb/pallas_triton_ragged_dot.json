@@ -1,0 +1,228 @@
+{
+  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":64,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":5}": {
+      "compile_time_ms": 526.7448710510507,
+      "lower_time_ms": 2423.3755179448053,
+      "evaluation_times_ms": [
+        9.538294,
+        9.874005,
+        10.054867999999999,
+        10.051347999999999,
+        10.054101
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5905.583104
+    }
+  },
+  "{\"lhs\":\"bf16[262144,7168]\",\"rhs\":\"bf16[256,7168,512]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":64,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 517.3844159580767,
+      "lower_time_ms": 4066.98464602232,
+      "evaluation_times_ms": [
+        9.595318,
+        9.831669,
+        9.833909,
+        9.849974,
+        9.847509
+      ],
+      "metadata": {},
+      "peak_memory_mb": 6174.018576
+    }
+  },
+  "{\"lhs\":\"bf16[262144,256]\",\"rhs\":\"bf16[256,256,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
+      "compile_time_ms": 601.4529209351167,
+      "lower_time_ms": 2079.637447022833,
+      "evaluation_times_ms": [
+        52.609234,
+        52.612177,
+        52.608241,
+        52.610131,
+        52.607761
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4831.84128
+    }
+  },
+  "{\"lhs\":\"bf16[262144,256]\",\"rhs\":\"bf16[256,256,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[393216,768]\",\"rhs\":\"bf16[128,2048,768]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":128,\"block_n\":128,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
+      "compile_time_ms": 1836.0713500296697,
+      "lower_time_ms": 146.89954195637256,
+      "evaluation_times_ms": [
+        15.041504999999999,
+        15.042114,
+        15.046560999999999,
+        15.045058,
+        15.040512
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3019.900416
+    }
+  },
+  "{\"lhs\":\"bf16[393216,2048]\",\"rhs\":\"bf16[128,768,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":393216},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[524288,1536]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[262144,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":64,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":5}": {
+      "compile_time_ms": 1074.8465489596128,
+      "lower_time_ms": 7955.513158929534,
+      "evaluation_times_ms": [
+        17.527381,
+        17.774039,
+        18.035416,
+        18.133912,
+        18.443610999999997
+      ],
+      "metadata": {},
+      "peak_memory_mb": 6174.017024
+    }
+  },
+  "{\"lhs\":\"bf16[262144,1536]\",\"rhs\":\"bf16[262144,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":256,\"block_n\":64,\"block_k\":64,\"split_k\":1,\"num_warps\":4,\"num_stages\":3}": {
+      "compile_time_ms": 593.6213890090585,
+      "lower_time_ms": 3419.5443029748276,
+      "evaluation_times_ms": [
+        27.670669999999998,
+        27.669871,
+        27.821103,
+        27.606989,
+        27.622315999999998
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4563.404288
+    }
+  },
+  "{\"lhs\":\"bf16[131072,2048]\",\"rhs\":\"bf16[128,7168,2048]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[131072,4096]\",\"rhs\":\"bf16[128,1536,4096]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[524288,4096]\",\"rhs\":\"bf16[128,4096,1536]\",\"group_sizes\":{\"num_groups\":128,\"total_size\":524288},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[131072,512]\",\"rhs\":\"bf16[256,512,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":64,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 614.7568160085939,
+      "lower_time_ms": 2146.88381900487,
+      "evaluation_times_ms": [
+        27.597462999999998,
+        27.574552,
+        27.474903,
+        27.473014999999997,
+        27.469814999999997
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3892.317184
+    }
+  },
+  "{\"lhs\":\"bf16[131072,512]\",\"rhs\":\"bf16[256,512,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":64,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 1701.3158980116714,
+      "lower_time_ms": 2512.4037340137875,
+      "evaluation_times_ms": [
+        27.479498,
+        27.473898000000002,
+        27.475146,
+        27.475977999999998,
+        27.476457999999997
+      ],
+      "metadata": {},
+      "peak_memory_mb": 5771.365392
+    }
+  },
+  "{\"lhs\":\"bf16[262144,512]\",\"rhs\":\"bf16[256,512,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[262144,1024]\",\"rhs\":\"bf16[256,1024,7168]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":262144},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[4096,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[4096,0,0,0,0,0,0,0],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 506.31965801585466,
+      "lower_time_ms": 3373.4287680126727,
+      "evaluation_times_ms": [
+        0.5318369999999999,
+        0.531517,
+        0.532029,
+        0.5313249999999999,
+        0.532157
+      ],
+      "metadata": {},
+      "peak_memory_mb": 335.544416
+    }
+  },
+  "{\"lhs\":\"bf16[4096,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[4096,0,0,0,0,0,0,0],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":8,\"num_stages\":4}": {
+      "compile_time_ms": 504.59852200583555,
+      "lower_time_ms": 4151.035727001727,
+      "evaluation_times_ms": [
+        0.532094,
+        0.5324779999999999,
+        0.532318,
+        0.531742,
+        0.531934
+      ],
+      "metadata": {},
+      "peak_memory_mb": 369.098832
+    }
+  },
+  "{\"lhs\":\"bf16[8,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[1,1,1,1,1,1,1,1],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":8,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 175.1590939820744,
+      "lower_time_ms": 4916.923383978428,
+      "evaluation_times_ms": [
+        0.192576,
+        0.192639,
+        0.19375799999999999,
+        0.19139199999999998,
+        0.191839
+      ],
+      "metadata": {},
+      "peak_memory_mb": 268.566624
+    }
+  },
+  "{\"lhs\":\"bf16[8,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[1,1,1,1,1,1,1,1],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":8,\"block_n\":128,\"block_k\":32,\"split_k\":1,\"num_warps\":4,\"num_stages\":4}": {
+      "compile_time_ms": 146.5211560134776,
+      "lower_time_ms": 5180.150462983875,
+      "evaluation_times_ms": [
+        0.193311,
+        0.19340700000000002,
+        0.192768,
+        0.191808,
+        0.192479
+      ],
+      "metadata": {},
+      "peak_memory_mb": 268.632144
+    }
+  },
+  "{\"lhs\":\"bf16[8192,4096]\",\"rhs\":\"bf16[8,4096,14336]\",\"group_sizes\":{\"num_groups\":8,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
+      "compile_time_ms": 458.45438799005933,
+      "lower_time_ms": 4441.351018002024,
+      "evaluation_times_ms": [
+        3.779091,
+        3.7760190000000002,
+        3.7743230000000003,
+        3.770738,
+        3.783091
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1241.51408
+    }
+  },
+  "{\"lhs\":\"bf16[8192,4096]\",\"rhs\":\"bf16[8,4096,14336]\",\"group_sizes\":{\"num_groups\":8,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":null,\"return_residuals\":true,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {
+    "{\"block_m\":128,\"block_n\":256,\"block_k\":32,\"split_k\":1,\"num_warps\":8,\"num_stages\":3}": {
+      "compile_time_ms": 467.81549698789604,
+      "lower_time_ms": 2892.6850170246325,
+      "evaluation_times_ms": [
+        3.781462,
+        3.792341,
+        3.792213,
+        3.790165,
+        3.884598
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1476.395088
+    }
+  },
+  "{\"lhs\":\"bf16[8192,7168]\",\"rhs\":\"f8_e4m3fn[64,7168,1024]\",\"group_sizes\":{\"num_groups\":64,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":\"bf16[64,28,1,1024]\",\"rhs_bias\":null,\"maybe_quantize_lhs\":true,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[8192,7168]\",\"rhs\":\"f8_e4m3fn[64,7168,1024]\",\"group_sizes\":{\"num_groups\":64,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":true,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":\"bf16[64,28,1,1024]\",\"rhs_bias\":null,\"maybe_quantize_lhs\":true,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[81920,4096]\",\"rhs\":\"f8_e4m3fn[64,4096,2048]\",\"group_sizes\":[1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":\"bf16[64,1,1,2048]\",\"rhs_bias\":null,\"maybe_quantize_lhs\":true,\"lhs_scale\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":\"silu\",\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[81920,1024]\",\"rhs\":\"f8_e4m3fn[64,1024,4096]\",\"group_sizes\":[1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":\"bf16[64,1,1,4096]\",\"rhs_bias\":null,\"maybe_quantize_lhs\":true,\"lhs_scale\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[1280,4096]\",\"rhs\":\"f8_e4m3fn[64,4096,2048]\",\"group_sizes\":[20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":\"bf16[64,1,1,2048]\",\"rhs_bias\":null,\"maybe_quantize_lhs\":true,\"lhs_scale\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":\"silu\",\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[1280,1024]\",\"rhs\":\"f8_e4m3fn[64,1024,4096]\",\"group_sizes\":[20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":\"bf16[64,1,1,4096]\",\"rhs_bias\":null,\"maybe_quantize_lhs\":true,\"lhs_scale\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {},
+  "{\"lhs\":\"bf16[131072,1024]\",\"rhs\":\"bf16[256,7168,1024]\",\"group_sizes\":{\"num_groups\":256,\"total_size\":131072},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"rhs_scale\":null,\"rhs_bias\":null,\"maybe_quantize_lhs\":false,\"lhs_scale\":null,\"zero_initialize\":true,\"fuse_gateup_activation\":null,\"lhs_quantization_dtype\":null,\"rhs_quantization_dtype\":null}": {}
+}
