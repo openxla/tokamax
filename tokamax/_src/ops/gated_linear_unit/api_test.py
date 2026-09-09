@@ -58,7 +58,6 @@ class GatedLinearUnitTest(parameterized.TestCase):
         self.skipTest("CuteDSL requires nvidia-cudnn-frontend (cudnn).")
 
     lhs, rhs = _get_input_data(m=128, k=64, n=128)
-    activation = jax.nn.silu
 
     @jax.jit
     def f(x, weights):
@@ -94,11 +93,7 @@ class GatedLinearUnitTest(parameterized.TestCase):
       op = args[0].op
       if implementation is None:
         if jax.default_backend() == "gpu":
-          # Ensure either a Triton or Mosaic kernel is used.
-          self.assertTrue(
-              isinstance(op, api.IMPLEMENTATIONS["triton"].__class__)
-              or isinstance(op, api.IMPLEMENTATIONS["mosaic"].__class__)
-          )
+          self.assertIsInstance(op, api.IMPLEMENTATIONS["mosaic"].__class__)
       else:
         self.assertIsInstance(op, api.IMPLEMENTATIONS[implementation].__class__)
 
@@ -114,13 +109,6 @@ class GatedLinearUnitXlaTest(test_base.GatedLinearUnitTestBase):
 
   def __init__(self, *args):
     fn = functools.partial(api.gated_linear_unit, implementation="xla")
-    super().__init__(*args, glu_fn=fn)
-
-
-class GatedLinearUnitMosaicGpuTest(test_base.GatedLinearUnitTestBase):
-
-  def __init__(self, *args):
-    fn = functools.partial(api.gated_linear_unit, implementation="mosaic")
     super().__init__(*args, glu_fn=fn)
 
 
