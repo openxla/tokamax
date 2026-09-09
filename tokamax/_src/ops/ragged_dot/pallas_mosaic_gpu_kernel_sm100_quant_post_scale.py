@@ -25,6 +25,7 @@ from jaxlib.mlir.dialects import arith
 from jaxlib.mlir.dialects import memref
 import qwix
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
@@ -190,100 +191,100 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
 
       @pl.when(actual_size > 0)
       def _body():
-        @pl.when(wg == _MAIN_WG)
-        def _():
-          @plgpu.warp_map
-          def _per_warp(warp_id):
 
-            @pl.when(warp_id == _W_TMA_WARP)
-            def w_tma_warp():
-              def do_tma_w(ki, slot):
-                plgpu.copy_gmem_to_smem(  # e,n,k
-                    w_gmem.at[
-                        group_id,
-                        slice_n,
-                        pl.ds(ki * block_k, block_k),
-                    ],
-                    w_smem.at[slot],
-                    w_tma_barrier.at[slot],
-                )
+        @mgpu_lib.warp_map_when(wg == _MAIN_WG)
+        def _main_wg_warp(warp_id):
 
-              def _iter_w(ki, _):
-                slot = lax.rem(ki, num_stages)
+          @pl.when(warp_id == _W_TMA_WARP)
+          def w_tma_warp():
+            def do_tma_w(ki, slot):
+              plgpu.copy_gmem_to_smem(  # e,n,k
+                  w_gmem.at[
+                      group_id,
+                      slice_n,
+                      pl.ds(ki * block_k, block_k),
+                  ],
+                  w_smem.at[slot],
+                  w_tma_barrier.at[slot],
+              )
+
+            def _iter_w(ki, _):
+              slot = lax.rem(ki, num_stages)
+
+              @pl.when((ki >= num_stages) | (carry > 0))
+              def _():
+                plgpu.barrier_wait(w_tma_consumed_barrier.at[slot])
+
+              do_tma_w(ki, slot)
+
+            lax.fori_loop(0, num_k_iters, _iter_w, None)
+
+          @pl.when(warp_id == _X_TMA_WARP)
+          def x_tma_warp():
+            def do_tma_x(ki, slot):
+              plgpu.copy_gmem_to_smem(  # m,k
+                  x_gmem.at[
+                      slice_m,
+                      pl.ds(ki * block_k, block_k),
+                  ],
+                  x_smem.at[slot],
+                  x_tma_barrier.at[slot],
+                  leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+                  if collective
+                  else None,
+                  collective_axes="x" if collective else None,
+              )
+
+            def _iter_x(ki, _):
+              slot = lax.rem(ki, num_stages)
+
+              @pl.when((ki >= num_stages) | (carry > 0))
+              def _():
+                # Wait for the previous mma to complete.
+                plgpu.barrier_wait(x_consumed_tcgen05_barrier.at[slot])
+
+              do_tma_x(ki, slot)
+
+            lax.fori_loop(0, num_k_iters, _iter_x, None)
+
+          @pl.when((warp_id == _MMA_WARP) & is_lead_block)
+          def mma_warp():
+            def do_mma(ki, _):
+              slot = lax.rem(ki, num_stages)
+
+              with jax.named_scope("wait acc_consumed"):
 
                 @pl.when((ki >= num_stages) | (carry > 0))
                 def _():
-                  plgpu.barrier_wait(w_tma_consumed_barrier.at[slot])
+                  # wait for the previous mma to complete
+                  # to ensure the acc_tmem is consumed.
+                  plgpu.barrier_wait(acc_consumed_barrier.at[slot])
 
-                do_tma_w(ki, slot)
+              with jax.named_scope("wait_x_tma"):
+                plgpu.barrier_wait(x_tma_barrier.at[slot])
 
-              lax.fori_loop(0, num_k_iters, _iter_w, None)
+              with jax.named_scope("wait_wbf16"):
+                plgpu.barrier_wait(w_bf16_barrier.at[slot])
 
-            @pl.when(warp_id == _X_TMA_WARP)
-            def x_tma_warp():
-              def do_tma_x(ki, slot):
-                plgpu.copy_gmem_to_smem(  # m,k
-                    x_gmem.at[
-                        slice_m,
-                        pl.ds(ki * block_k, block_k),
-                    ],
-                    x_smem.at[slot],
-                    x_tma_barrier.at[slot],
-                    leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
-                    if collective
-                    else None,
-                    collective_axes="x" if collective else None,
-                )
-
-              def _iter_x(ki, _):
-                slot = lax.rem(ki, num_stages)
-
-                @pl.when((ki >= num_stages) | (carry > 0))
-                def _():
-                  # Wait for the previous mma to complete.
-                  plgpu.barrier_wait(x_consumed_tcgen05_barrier.at[slot])
-
-                do_tma_x(ki, slot)
-
-              lax.fori_loop(0, num_k_iters, _iter_x, None)
-
-            @pl.when((warp_id == _MMA_WARP) & is_lead_block)
-            def mma_warp():
-              def do_mma(ki, _):
-                slot = lax.rem(ki, num_stages)
-
-                with jax.named_scope("wait acc_consumed"):
-                  @pl.when((ki >= num_stages) | (carry > 0))
-                  def _():
-                    # wait for the previous mma to complete
-                    # to ensure the acc_tmem is consumed.
-                    plgpu.barrier_wait(acc_consumed_barrier.at[slot])
-
-                with jax.named_scope("wait_x_tma"):
-                  plgpu.barrier_wait(x_tma_barrier.at[slot])
-
-                with jax.named_scope("wait_wbf16"):
-                  plgpu.barrier_wait(w_bf16_barrier.at[slot])
-
-                with jax.named_scope("issuing mma"):
-                  plgpu.tcgen05_mma(
-                      acc_tmem.at[:, pl.ds(slot * block_m, block_m)],
-                      w_bf16_tmem.at[:, pl.ds(slot * block_k, block_k)],
-                      x_smem.at[slot].T,
-                      x_consumed_tcgen05_barrier.at[slot],
-                      accumulate=False,
-                      collective_axis="x" if collective else None,
-                  )
-                plgpu.tcgen05_commit_arrive(
-                    w_consumed_tcgen05_barrier.at[slot],
+              with jax.named_scope("issuing mma"):
+                plgpu.tcgen05_mma(
+                    acc_tmem.at[:, pl.ds(slot * block_m, block_m)],
+                    w_bf16_tmem.at[:, pl.ds(slot * block_k, block_k)],
+                    x_smem.at[slot].T,
+                    x_consumed_tcgen05_barrier.at[slot],
+                    accumulate=False,
                     collective_axis="x" if collective else None,
                 )
-                plgpu.tcgen05_commit_arrive(
-                    mma_barrier.at[slot],
-                    collective_axis="x" if collective else None,
-                )
+              plgpu.tcgen05_commit_arrive(
+                  w_consumed_tcgen05_barrier.at[slot],
+                  collective_axis="x" if collective else None,
+              )
+              plgpu.tcgen05_commit_arrive(
+                  mma_barrier.at[slot],
+                  collective_axis="x" if collective else None,
+              )
 
-              lax.fori_loop(0, num_k_iters, do_mma, None)
+            lax.fori_loop(0, num_k_iters, do_mma, None)
 
         @pl.when(wg == _DEQ_WG)
         def _():

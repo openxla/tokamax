@@ -76,6 +76,13 @@ def tiled_swizzled_block_spec(
   return plgpu.BlockSpec(shape, index_map, transforms=transforms, **kwargs)
 
 
+def warp_map_when(
+    pred: jax.Array | bool,
+) -> Callable[[Callable[[jax.Array], None]], None]:
+  """Runs a function with single warp semantics when the condition is true."""
+  return lambda body: pl.when(pred)(lambda: plgpu.warp_map(body))
+
+
 warpgroup_barrier = plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())
 
 
