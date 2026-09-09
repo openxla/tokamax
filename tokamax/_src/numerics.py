@@ -26,7 +26,6 @@ import qwix
 from tokamax._src import batching
 from tokamax._src import utils
 
-
 type PyTree = Any
 
 

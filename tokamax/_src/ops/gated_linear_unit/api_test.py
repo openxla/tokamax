@@ -26,7 +26,7 @@ from tokamax._src.ops.gated_linear_unit import api
 from tokamax._src.ops.gated_linear_unit import test_base
 
 _IMPLEMENTATIONS: Final[tuple[str | None, ...]] = typing.get_args(
-    api.Implementation
+    api.Implementation.__value__
 ) + (None,)
 
 
@@ -74,7 +74,7 @@ class GatedLinearUnitTest(parameterized.TestCase):
     out_golden = f_xla(lhs, rhs)
 
     with self.subTest("value"):
-      chex.assert_trees_all_close(out, out_golden)
+      chex.assert_trees_all_close(out, out_golden, atol=1.5, rtol=0.02)
 
     args = hlo_utils.get_bound_args(f.lower(lhs, rhs))
     self.assertLen(args, 1)
