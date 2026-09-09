@@ -158,9 +158,16 @@ class PallasTritonNormalization(base.Normalization[Config, Key]):
         subtract_mean=subtract_mean,
     )
 
-    name = 'pallas_layer_norm' if subtract_mean else 'pallas_rms_norm'
+    # Same scheme as the Mosaic kernels (`mosaic_norm_{fwd,bwd}_<dtype>_m<..>_
+    # n<..>[_mean]`), so the two impls line up side by side in a profiler and
+    # the block config is visible in the kernel name. `_res` is retained on top
+    # of it: without it, the residual and non-residual forwards -- different
+    # kernels -- would share a name in the report.
+    name = f'triton_norm_fwd_{x_shape_ty.dtype.name}_m{block_m}_n{block_n}'
+    if subtract_mean:
+      name += '_mean'
     if return_residuals:
-      name += '_fwd_res'
+      name += '_res'
 
     y, mean, rstddev = block.pallas_call(
         kernel,

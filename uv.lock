@@ -1711,6 +1711,16 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-cuda-nvdisasm"
+version = "13.3.73"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/92/be/e9de501cb71b10f7654381a485fa4ebf470ea25c3dce018cccaecf8a8f9a/nvidia_cuda_nvdisasm-13.3.73-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:dd4751884f9016b9b6dbf007abdeb5681d0a2edc731dd3d2fda9d6d878e88f73", size = 4744517, upload-time = "2026-06-29T16:48:33.527Z" },
+    { url = "https://files.pythonhosted.org/packages/86/3e/88460ebd737e559e8e9843db7a63f8ced9ec7be1882344438819dd13aebc/nvidia_cuda_nvdisasm-13.3.73-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:fa17084b07c0dca68a42892f771b4b1b40fbe9b91660209623e61cea611cae8c", size = 4782824, upload-time = "2026-06-29T16:49:05.109Z" },
+    { url = "https://files.pythonhosted.org/packages/32/63/00d687730b124f94345f83023363251310ccc08eeac269ec2eeff6b097f3/nvidia_cuda_nvdisasm-13.3.73-py3-none-win_amd64.whl", hash = "sha256:da2fab133c3d095d83f13587eb87149beabd199b34a3cc270d0aa99449a628c3", size = 5015368, upload-time = "2026-06-29T17:22:50.207Z" },
+]
+
+[[package]]
 name = "nvidia-cuda-nvrtc"
 version = "13.3.33"
 source = { registry = "https://pypi.org/simple" }
@@ -2591,6 +2601,7 @@ cuda = [
     { name = "cuequivariance-jax" },
     { name = "cuequivariance-ops-jax-cu13" },
     { name = "jax", extra = ["cuda13"] },
+    { name = "nvidia-cuda-nvdisasm" },
     { name = "nvidia-cudnn-cu13" },
     { name = "triton" },
 ]
@@ -2623,6 +2634,7 @@ requires-dist = [
     { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.11.0" },
     { name = "jaxlib", specifier = ">=0.11.0" },
     { name = "jaxtyping", specifier = ">=0.3" },
+    { name = "nvidia-cuda-nvdisasm", marker = "extra == 'cuda'" },
     { name = "nvidia-cudnn-cu13", marker = "extra == 'cuda'", specifier = ">=9.23.0.39" },
     { name = "pydantic", specifier = ">=2.11.0" },
     { name = "pytest", marker = "extra == 'test'" },
