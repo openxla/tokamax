@@ -638,6 +638,16 @@ def benchmark[T](
   return res
 
 
+# Mosaic re-reads `MOSAIC_GPU_DUMP_TO` on every compile, so each benchmark can
+# point it at its own subdirectory and keep its dumps separate. Captured at
+# import because `register_benchmark` overwrites the variable per benchmark.
+# `sponge` and `-` are special values to Mosaic (test outputs / stdout), so
+# they are left alone.
+_MOSAIC_DUMP_ROOT = os.environ.get('MOSAIC_GPU_DUMP_TO')
+if _MOSAIC_DUMP_ROOT in ('sponge', '-'):
+  _MOSAIC_DUMP_ROOT = None
+
+
 def register_benchmark(
     name: str,
     impl_name: str,
@@ -668,6 +678,13 @@ def register_benchmark(
     kwargs_ = kwargs() if callable(kwargs) else kwargs
     f, x = standardize_function(impl, kwargs=kwargs_, mode=mode)
     skip_fn = lambda e: state.skip_with_error(str(e).lstrip().splitlines()[0])
+
+    if _MOSAIC_DUMP_ROOT is not None:
+      # Must exist: Mosaic's dump writer opens files directly and silently
+      # falls back to stdout if the directory is missing.
+      dump_dir = os.path.join(_MOSAIC_DUMP_ROOT, bmark_name)
+      os.makedirs(dump_dir, exist_ok=True)
+      os.environ['MOSAIC_GPU_DUMP_TO'] = dump_dir
 
     try:
       benchmark_data = compile_benchmark(f, x)(x, **bmark_kwargs)

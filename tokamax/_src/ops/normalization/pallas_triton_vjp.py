@@ -147,7 +147,12 @@ class PallasTritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
 
     dx, dscale, doffset = block.pallas_call(
         kernel,
-        name='pallas_rms_norm_vjp' if mean is None else 'pallas_layer_norm_vjp',
+        # Matches the Mosaic VJP's naming, so the two are directly comparable
+        # in a profiler. See the forward kernel for the scheme.
+        name=(
+            f'triton_norm_bwd_{x.dtype.name}_m{block_m}_n{block_n}'
+            + ('' if mean is None else '_mean')
+        ),
         out_shape=out_shape,
         grid=grid,
         in_specs=(x_spec, x_spec, param_spec, stat_spec, stat_spec),

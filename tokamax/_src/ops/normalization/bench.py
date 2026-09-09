@@ -20,12 +20,14 @@ from absl import flags
 import google_benchmark
 from tokamax._src import benchmarking
 from tokamax._src.ops.normalization import base
+from tokamax._src.ops.normalization import mosaic as mosaic_norm
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import arg_specs
 
 
 _IMPLS = dict(
     pallas=pl_norm.PallasTritonNormalization(input_output_alias=False),
+    mosaic=mosaic_norm.PallasMosaicGpuNormalization(input_output_alias=False),
     xla=base.Normalization(),
 )
 _BENCHMARK_IMPLS_FWD = flags.DEFINE_list(
@@ -38,12 +40,31 @@ _BENCHMARK_IMPLS_FWD_BWD = flags.DEFINE_list(
     _BENCHMARK_IMPLS_FWD.default,
     'List of implementations to benchmark forward and backward.',
 )
+_ITERATIONS = flags.DEFINE_integer(
+    'iterations',
+    10,
+    'Timed iterations per benchmark. Lower it under a profiler: Nsight replays'
+    ' each launch many times (49 passes for `--set full`), saving and restoring'
+    ' device memory around every one.',
+)
+_TIMING_METHOD = flags.DEFINE_string(
+    'timing_method',
+    None,
+    "Timing method ('wallclock', 'cupti', 'xprof', 'hermetic_xprof'). Defaults"
+    ' to CUPTI on GPU. Pass `wallclock` when running under Nsight Compute or'
+    ' Nsight Systems: those subscribe to CUPTI, CUPTI permits only one'
+    ' subscriber, and the default timer would fail to initialize. Under a'
+    ' profiler these timings are noise anyway -- the profiler does the'
+    ' measuring.',
+)
 
 
 def _register_benchmarks():
   """Registers benchmarks."""
   register_benchmark = functools.partial(
-      benchmarking.register_benchmark, iterations=10
+      benchmarking.register_benchmark,
+      iterations=_ITERATIONS.value,
+      method=_TIMING_METHOD.value,
   )
 
   for arg_spec in arg_specs.ARG_SPECS:
@@ -51,14 +72,28 @@ def _register_benchmarks():
       impl = _IMPLS[impl_name]
       register_benchmark(arg_spec.full_name, impl_name, impl, arg_spec.args)
 
+  # `forward_and_vjp` minus `forward` is not a clean VJP time: the forward
+  # inside it computes residuals for the backward to consume, while the
+  # standalone `forward` above does not. `forward_res` is the like-for-like
+  # forward (it keeps the residuals), and `vjp` times the backward directly, so
+  # neither number has to be recovered by subtraction.
   for arg_spec in arg_specs.ARG_SPECS:
     name = arg_spec.full_name
     kwargs = arg_spec.args
     for impl_name in _BENCHMARK_IMPLS_FWD_BWD.value:
       impl = _IMPLS[impl_name]
-      register_benchmark(name, impl_name, impl, kwargs, mode='forward_and_vjp')
+      for mode in ('forward_res', 'vjp', 'forward_and_vjp'):
+        register_benchmark(name, impl_name, impl, kwargs, mode=mode)
+
+
+def _main(argv):
+  # `google_benchmark.main` goes straight to the C++ library, so `app.run` never
+  # happens on its own -- and without it `call_after_init` never fires and no
+  # benchmark is ever registered. Registering under `app.run` also means the
+  # flags above are parsed by the time they are read.
+  _register_benchmarks()
+  google_benchmark.main(argv)
 
 
 if __name__ == '__main__':
-  app.call_after_init(_register_benchmarks)
-  google_benchmark.main()
+  app.run(_main)
