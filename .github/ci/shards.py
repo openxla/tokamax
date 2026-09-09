@@ -1063,9 +1063,10 @@ def build_matrix(shards: ShardMap) -> list[MatrixEntry]:
 
   Every shard runs on every runner, so this is the full cross product.
 
-  The only place a shard's `paths` becomes a command line: the workflow
-  interpolates `test_paths` straight into a `run:` block, so `shlex.join`
-  quotes it here rather than trusting every path to be shell-safe.
+  The only place a shard's `paths` becomes a command line: the workflow reads
+  `test_paths` as one string and splits it back into arguments with `xargs`,
+  so `shlex.join` quotes it here rather than trusting every path to be free of
+  whitespace and quoting characters.
 
   Args:
     shards: Shard name to spec, as `resolve_shards` returns it.

@@ -49,10 +49,13 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
+        env:
+          # Inject device name via `env`.
+          DEVICE: ${{ matrix.device }}
         run: |
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
+          python3.12 -m uv pip install -e ".[${DEVICE},test]"
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
         run: |
@@ -86,14 +89,23 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
+        env:
+          # Inject device name via `env`.
+          DEVICE: ${{ matrix.device }}
         run: |
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
+          python3.12 -m uv pip install -e ".[${DEVICE},test]"
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
+        env:
+          # As above: read as data, not interpolated into the `run:` block.
+          ADDITIONAL_IGNORE: ${{ matrix.additional_ignore }}
         run: |
-          pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*"  --ignore=tokamax/_src/ops/attention/ ${{ matrix.additional_ignore }} tokamax/_src/ops
+          # `ADDITIONAL_IGNORE` is one string holding zero or more arguments,
+          # so it has to be word-split with `xargs` to reach pytest as separate arguments.
+          printf '%s tokamax/_src/ops' "${ADDITIONAL_IGNORE}" \
+            | xargs pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*" --ignore=tokamax/_src/ops/attention/
 
   tokamax-nightly-tests:
     strategy:
@@ -120,10 +132,13 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
+        env:
+          # Inject device name via `env`.
+          DEVICE: ${{ matrix.device }}
         run: |
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
+          python3.12 -m uv pip install -e ".[${DEVICE},test]"
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
         run: |

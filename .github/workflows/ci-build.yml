@@ -135,22 +135,29 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
+        env:
+          # Inject device name via `env`.
+          DEVICE: ${{ matrix.device }}
         run: |
-          echo "Installing dependencies on device ${{ matrix.device }}"
+          echo "Installing dependencies on device ${DEVICE}"
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
+          python3.12 -m uv pip install -e ".[${DEVICE},test]"
           python3.12 -m uv pip freeze
 
       - name: Run shard
+        env:
+          # Read through `env:` rather than as interpolated text.
+          PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
+          TEST_PATHS: ${{ matrix.test_paths }}
         run: |
           # Which tests run is decided by `pytest_flags` plus this shard's
           # paths, both from .github/ci/shards.py. `-s` and `--durations` are
           # reporting only: --durations lists the slowest tests in each shard,
           # which is what to rebalance the SHARDS table against.
-          pytest -s --durations=25 \
-            ${{ needs.shard-matrix.outputs.pytest_flags }} \
-            ${{ matrix.test_paths }}
+          # Use xargs to split the flags and paths into separate arguments.
+          printf '%s %s' "${PYTEST_FLAGS}" "${TEST_PATHS}" \
+            | xargs -r pytest -s --durations=25
 
   shard-all-tests-passed:
     # The idea here is that rather than checking for specific shard names to pass, we centralize
