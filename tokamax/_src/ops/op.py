@@ -548,7 +548,7 @@ class BoundArguments[C, K: Hashable]:
         return data
 
     try:
-      return self.op.get_autotuning_cache()[key]
+      return self.op.get_autotuning_cache(device_kind)[key]
     except KeyError:
       key = cast(Mapping[str, Any], key)
       json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
@@ -692,6 +692,10 @@ def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
   """Infers the device kind from bound array arguments."""
   device_kinds = {d.device_kind for d in infer_devices(ba)}
   if not device_kinds:
+    # Fall back to active abstract mesh during export or cross-compilation.
+    abstract_mesh = jax.sharding.get_abstract_mesh()
+    if abstract_mesh.abstract_device is not None:
+      return abstract_mesh.abstract_device.device_kind
     return None
   if len(device_kinds) == 1:
     return device_kinds.pop()

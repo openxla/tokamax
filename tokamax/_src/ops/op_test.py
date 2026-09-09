@@ -171,6 +171,31 @@ class BoundArgumentsTest(parameterized.TestCase):
       with self.assertRaisesRegex(ValueError, "No config found"):
         _ = ba.default_config
 
+  def test_cached_autotuning_data_cross_compile(self):
+    op = _FakeOp()
+    data = op_lib.AutotuningData({})
+    x = jnp.zeros((1, 2))
+    y = jnp.ones((1, 2))
+    ba = op.bind(x, y)
+    target_device = "mock_tpu"
+    op.get_autotuning_cache(target_device)[ba.autotuning_cache_key] = data
+
+    abstract_mesh = jax.sharding.AbstractMesh(
+        (),
+        (),
+        (),
+        abstract_device=jax.sharding.AbstractDevice(target_device, 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(abstract_mesh):
+
+      def traced_fn(x, y):
+        ba_traced = op.bind(x, y)
+        self.assertEqual(op_lib.infer_device_kind(ba_traced), target_device)
+        self.assertIs(ba_traced.cached_autotuning_data, data)
+        return x + y
+
+      jax.jit(traced_fn)(x, y)
+
   def test_heuristics_config(self):
     ba = _FakeOp().bind(jnp.zeros((1, 2)), jnp.ones((1, 2)))
     self.assertIs(ba.heuristics_config, _HEURISTICS_CONFIG)
