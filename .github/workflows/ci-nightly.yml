@@ -59,7 +59,7 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
         run: |
-          pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*" tokamax/_src/ops/attention
+          pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention
   # TODO: Re-enable ragged dot on b200 once it is supported.
   # TODO: Re-enable B200 once it is supported.
   tokamax-nightly-ops-tests:
@@ -142,4 +142,4 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
         run: |
-          pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*"  --ignore=tokamax/_src/ops/ tokamax
+          pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/ tokamax
