@@ -112,5 +112,12 @@ class GatedLinearUnitXlaTest(test_base.GatedLinearUnitTestBase):
     super().__init__(*args, glu_fn=fn)
 
 
+class GatedLinearUnitMosaicGpuTest(test_base.GatedLinearUnitTestBase):
+
+  def __init__(self, *args):
+    fn = functools.partial(api.gated_linear_unit, implementation="mosaic")
+    super().__init__(*args, glu_fn=fn)
+
+
 if __name__ == "__main__":
   absltest.main()
