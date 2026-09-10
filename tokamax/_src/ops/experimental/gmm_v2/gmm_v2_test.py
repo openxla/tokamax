@@ -191,7 +191,6 @@ class GmmTest(parameterized.TestCase):
       self.skipTest("Only supported on TPUs.")
     super().setUp()
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
@@ -200,6 +199,7 @@ class GmmTest(parameterized.TestCase):
       has_bias=[True],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_gmm_basic(
       self, batch_size, in_size, out_size, num_groups, has_bias, group_offset
   ):
@@ -234,7 +234,6 @@ class GmmTest(parameterized.TestCase):
 
     assert_arrays_all_close(actual, expected)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
@@ -242,6 +241,7 @@ class GmmTest(parameterized.TestCase):
       num_groups=[16],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_gmm_transpose_rhs(
       self, batch_size, in_size, out_size, num_groups, group_offset
   ):
@@ -274,7 +274,6 @@ class GmmTest(parameterized.TestCase):
 
     assert_arrays_all_close(actual, expected)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
@@ -285,6 +284,7 @@ class GmmTest(parameterized.TestCase):
       group_offset=[0],
       dtype=[jnp.bfloat16, jnp.float32],
   )
+  @pytest.mark.long
   def test_gmm_multi_k_partial_bucket(
       self,
       batch_size,
@@ -338,7 +338,6 @@ class GmmTest(parameterized.TestCase):
 
     assert_arrays_all_close(actual, expected)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
@@ -346,6 +345,7 @@ class GmmTest(parameterized.TestCase):
       num_groups=[5, 16],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_tgmm_basic(
       self, batch_size, in_size, out_size, num_groups, group_offset
   ):
@@ -384,7 +384,6 @@ class GmmTest(parameterized.TestCase):
     # print(f"Output mean diff: {jnp.mean(jnp.abs(expected - actual))}")
     assert_arrays_all_close(actual, expected)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 256],
       in_size=[255],
@@ -392,6 +391,7 @@ class GmmTest(parameterized.TestCase):
       num_groups=[16],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_tgmm_implicit_padding(
       self, batch_size, in_size, out_size, num_groups, group_offset
   ):
@@ -430,7 +430,6 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[256],
       in_size=[1024],
@@ -440,6 +439,7 @@ class GmmTest(parameterized.TestCase):
       tile_k=[256, 512],
       tile_n=[256, 512],
   )
+  @pytest.mark.long
   def test_tgmm_with_tile_info(
       self,
       batch_size,
@@ -481,7 +481,6 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
@@ -490,6 +489,7 @@ class GmmTest(parameterized.TestCase):
       group_offset=[0],
       empty_group_index=[0, 1],
   )
+  @pytest.mark.long
   def test_tgmm_empty_group(
       self,
       batch_size,
@@ -567,7 +567,6 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[256],
@@ -579,6 +578,7 @@ class GmmTest(parameterized.TestCase):
           (jnp.float8_e4m3fn, jnp.float8_e4m3fn),     # symmetric fp8
       ],
   )
+  @pytest.mark.long
   def test_tgmm_with_rhs_scale(
       self, batch_size, in_size, out_size, num_groups, group_offset, dtype_pair
   ):
@@ -661,7 +661,6 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_groups, in_size, out_size))
     chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
@@ -672,6 +671,7 @@ class GmmTest(parameterized.TestCase):
       block_size=[64],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_gmm_weight_quantized(
       self,
       batch_size,
@@ -794,7 +794,6 @@ class GmmTest(parameterized.TestCase):
     # 3. Verify that the output is NaN-free
     self.assertFalse(jnp.any(jnp.isnan(actual)))
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
@@ -805,6 +804,7 @@ class GmmTest(parameterized.TestCase):
       tile_k=[128, 256],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_gmm_weight_quantized_block_larger_than_tile_k(
       self,
       batch_size,
@@ -857,7 +857,6 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
@@ -868,6 +867,7 @@ class GmmTest(parameterized.TestCase):
       tile_k=[128, 256],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_gmm_activation_weight_quantized_block_larger_than_tile_k(
       self,
       batch_size,
@@ -918,7 +918,6 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=1.2, rtol=1.2)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
@@ -934,6 +933,7 @@ class GmmTest(parameterized.TestCase):
       block_size=[1024],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_gmm_activation_weight_quantized(
       self,
       batch_size,
@@ -1000,7 +1000,6 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
@@ -1009,6 +1008,7 @@ class GmmTest(parameterized.TestCase):
       block_size=[1024],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_gmm_quantize_lhs_with_lhs_scale(
       self,
       batch_size,
@@ -1079,7 +1079,6 @@ class GmmTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(actual, expected, atol=0.75, rtol=3e-2)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128, 256],
       in_size=[255],
@@ -1088,6 +1087,7 @@ class GmmTest(parameterized.TestCase):
       has_bias=[True, False],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_gmm_implicit_padding(
       self, batch_size, in_size, out_size, num_groups, has_bias, group_offset
   ):
@@ -1126,7 +1126,6 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (batch_size, out_size))
     assert_arrays_all_close(actual, expected)
 
-  @pytest.mark.long
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
@@ -1137,6 +1136,7 @@ class GmmTest(parameterized.TestCase):
       block_size=[512],
       group_offset=[0],
   )
+  @pytest.mark.long
   def test_gmm_weight_quantized_padding(
       self,
       batch_size,
