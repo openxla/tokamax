@@ -130,7 +130,7 @@ class LayerNormTritonTest(test_base.NormalizationTestBase):
       norm_fn = functools.partial(api.layer_norm, implementation="xla")
       super().__init__(*args, norm_fn=norm_fn)
     else:
-      norm_fn = functools.partial(api.layer_norm, implementation=self.IMPL)
+      norm_fn = functools.partial(api.layer_norm, implementation=self.IMPL)  # pyrefly: ignore[bad-argument-type]
       super().__init__(*args, norm_fn=norm_fn)
 
 
@@ -138,7 +138,7 @@ class LayerNormXlATest(test_base.NormalizationTestBase):
   IMPL = "xla"
 
   def __init__(self, *args):
-    norm_fn = functools.partial(api.layer_norm, implementation=self.IMPL)
+    norm_fn = functools.partial(api.layer_norm, implementation=self.IMPL)  # pyrefly: ignore[bad-argument-type]
     super().__init__(*args, norm_fn=norm_fn)
 
 

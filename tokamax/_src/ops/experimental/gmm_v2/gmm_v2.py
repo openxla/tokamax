@@ -1629,7 +1629,7 @@ def gmm_v2(
         ),
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
-        metadata=get_metadata(cfgs),
+        metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
     )(group_sizes, group_offset, lhs_in, rhs_weights)[:, : cfgs.out_size_n]
 
   group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)

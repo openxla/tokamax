@@ -245,7 +245,7 @@ class RaggedDotTest(parameterized.TestCase):
 
       # StableHLO export on CPU succeeds with custom call check disabled.
       exported = export.export(
-          dot_fn,
+          dot_fn,  # pyrefly: ignore[bad-argument-type]
           disabled_checks=[
               export.DisabledSafetyCheck.custom_call("tpu_custom_call")
           ],

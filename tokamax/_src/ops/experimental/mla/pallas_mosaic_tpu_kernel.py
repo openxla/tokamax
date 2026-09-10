@@ -2468,7 +2468,7 @@ def mla_ragged_paged_attention(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
-                static_q_len=static_q_len,
+                static_q_len=static_q_len,  # pyrefly: ignore[bad-argument-type]
                 bq_sz=bq_sz,
                 bkv_p=bkv_p,
                 batch_size=batch_size,
