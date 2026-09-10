@@ -104,8 +104,6 @@ def gated_linear_unit(
   errors = []
   fn = base.GatedLinearUnit()
   for impl in implementation:
-    if impl == 'triton' and not gpu_utils.has_triton_support():
-      continue
     if isinstance(impl, str):
       if impl not in IMPLEMENTATIONS:
         raise ValueError(f'Unknown implementation: {impl}')

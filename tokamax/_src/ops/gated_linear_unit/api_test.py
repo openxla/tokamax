@@ -52,20 +52,19 @@ class GatedLinearUnitTest(parameterized.TestCase):
         self.skipTest("Mosaic not supported on this platform.")
 
     lhs, rhs = _get_input_data(m=128, k=64, n=128)
+    activation = jax.nn.silu
 
     @jax.jit
     def f(x, weights):
-      out = api.gated_linear_unit(
-          x, weights, activation=jax.nn.sigmoid, implementation=implementation
+      return api.gated_linear_unit(
+          x, weights, activation=activation, implementation=implementation
       )
-      return jnp.sum(out)
 
     @jax.jit
     def f_xla(x, weights):
-      out = api.gated_linear_unit(
-          x, weights, activation=jax.nn.sigmoid, implementation="xla"
+      return api.gated_linear_unit(
+          x, weights, activation=activation, implementation="xla"
       )
-      return jnp.sum(out)
 
     if use_tuple_weights:
       rhs = jnp.unstack(rhs, axis=1)
@@ -74,7 +73,7 @@ class GatedLinearUnitTest(parameterized.TestCase):
     out_golden = f_xla(lhs, rhs)
 
     with self.subTest("value"):
-      chex.assert_trees_all_close(out, out_golden, atol=1.5, rtol=0.02)
+      chex.assert_trees_all_close(out, out_golden, atol=0.1, rtol=0.02)
 
     args = hlo_utils.get_bound_args(f.lower(lhs, rhs))
     self.assertLen(args, 1)
