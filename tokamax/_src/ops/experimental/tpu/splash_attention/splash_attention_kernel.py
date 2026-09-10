@@ -144,14 +144,12 @@ def _generate_blockwise_dropout_mask(
   sub_key = jax.random.fold_in(sub_key, head_idx)
   sub_key = jax.random.fold_in(sub_key, q_block_idx)
   sub_key = jax.random.fold_in(sub_key, kv_block_idx)
-  # TODO: Avoid float round-trip in bernoulli mask generation.
-  # jax.random.bernoulli builds float32 uniform then does f32 compare.
-  # We can use raw bits and compare with threshold directly:
-  # bits = jax.random.bits(sub_key, (q_block_size, kv_block_size), jnp.uint32)
-  # return bits < np.uint32(dropout_rate * 2**32)
-  return jax.random.bernoulli(
-      sub_key, dropout_rate, (q_block_size, kv_block_size)
-  )
+  # Raw bits + integer compare. `jax.random.bernoulli` builds a float32 uniform
+  # tile and compares in f32; that intermediate causes spilling when
+  # `block_q_dkv` is large.
+  threshold = np.uint32(dropout_rate * 2**32)
+  bits = jax.random.bits(sub_key, (q_block_size, kv_block_size), jnp.uint32)
+  return bits < threshold
 
 
 def _dropout_mask_tile(

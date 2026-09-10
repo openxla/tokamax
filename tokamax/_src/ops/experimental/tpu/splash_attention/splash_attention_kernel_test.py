@@ -916,13 +916,13 @@ def _restated_dropout_mask_kernel(
     dropout_rate: float,
 ):
   """Restates the derivation `_generate_blockwise_dropout_mask` implements."""
+  threshold = np.uint32(dropout_rate * 2**32)
   key_h = random.fold_in(prng_key_ref[...], pl.program_id(0))
   for i in range(out_ref.shape[0] // bq):
     key_q = random.fold_in(key_h, i)
     for j in range(out_ref.shape[1] // bkv):
-      out_ref[i * bq : (i + 1) * bq, j * bkv : (j + 1) * bkv] = (
-          random.bernoulli(random.fold_in(key_q, j), dropout_rate, (bq, bkv))
-      )
+      bits = random.bits(random.fold_in(key_q, j), (bq, bkv), jnp.uint32)
+      out_ref[i * bq : (i + 1) * bq, j * bkv : (j + 1) * bkv] = bits < threshold
 
 
 def _restated_dropout_mask(
