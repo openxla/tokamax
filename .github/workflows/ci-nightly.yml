@@ -105,7 +105,7 @@ jobs:
           # `ADDITIONAL_IGNORE` is one string holding zero or more arguments,
           # so it has to be word-split with `xargs` to reach pytest as separate arguments.
           printf '%s tokamax/_src/ops' "${ADDITIONAL_IGNORE}" \
-            | xargs pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/experimental/*" --ignore=tokamax/_src/ops/attention/
+            | xargs pytest -s --ignore-glob="*/test_base.py"  --ignore=tokamax/_src/ops/attention/
 
   tokamax-nightly-tests:
     strategy:
