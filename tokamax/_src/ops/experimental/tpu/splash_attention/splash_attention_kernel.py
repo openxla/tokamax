@@ -213,14 +213,24 @@ def _dropout_mask_tile(
 def _check_dropout_args(
     config: "SplashConfig",
     prng_key: jax.Array | None,
+    dropout_rate: float,
 ) -> jax.Array | None:
   """Validates the dropout arguments and converts the key for Pallas."""
-
-  if not config.dropout_rate:
+  if not 0.0 <= dropout_rate < 1.0:
+    raise ValueError(
+        f"dropout_rate must be in [0, 1), got {dropout_rate}."
+    )
+  if not dropout_rate:
     return None
+  if config.dropout_block_q is None or config.dropout_block_kv is None:
+    raise ValueError(
+        "dropout_block_q and dropout_block_kv must be set in SplashConfig if"
+        f" dropout_rate > 0; got {config.dropout_block_q=},"
+        f" {config.dropout_block_kv=}."
+    )
   if prng_key is None:
     raise ValueError(
-        "A prng_key is required when config.dropout_rate > 0; got None."
+        "A prng_key is required when dropout_rate > 0; got None."
     )
   # A key passed as a regular operand fails to lower ("AssertionError:
   # key<pl>"), so it travels through scalar prefetch as a Pallas key instead.
@@ -292,12 +302,6 @@ class SplashConfig:
   # block, split the SV matmul into a qk_diag_grid x qk_diag_grid sub-grid and
   # skip sub-tiles strictly above the diagonal (kj > qi) during dot_general.
   sv_diag_skip: bool = False
-  # Attention dropout probability, applied to the softmax weights. The mask is
-  # generated inside the kernel per (head, q block, kv block) tile from a
-  # `prng_key` passed at call time, so it costs no HBM traffic and is never
-  # saved for the backward pass. Requires a `prng_key`; 0.0 disables it and
-  # leaves the kernel bit-identical to the no-dropout version.
-  dropout_rate: float = 0.0
   # Granularity of the grid the dropout mask is drawn on. Keying the mask on
   # absolute canonical coordinates (instead of kernel tiles) allows fwd and
   # bwd to use different block sizes. Every tile size must be a multiple of the
@@ -317,10 +321,6 @@ class SplashConfig:
     return self.dropout_block_kv
 
   def __post_init__(self):
-    if not 0.0 <= self.dropout_rate < 1.0:
-      raise ValueError(
-          f"dropout_rate must be in [0, 1), got {self.dropout_rate}."
-      )
     if self.block_kv_compute is None:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
@@ -334,26 +334,17 @@ class SplashConfig:
     if not self.use_fused_bwd_kernel:
       raise ValueError("Only the fused bwd kernel is supported.")
 
-    if self.dropout_rate:
-      # The backward regenerates the mask rather than reloading it, so the two
-      # passes have to agree on which weights were dropped. They are keyed on a
-      # canonical grid of absolute coordinates instead of on their own tiles,
-      # which makes agreement independent of the tiling; all that is left to
-      # check is that each tile covers a whole number of canonical blocks.
-      if self.dropout_block_q is None or self.dropout_block_kv is None:
-        raise ValueError(
-            "dropout_block_q and dropout_block_kv must be set if dropout_rate"
-            " > 0."
-        )
+    if (self.dropout_block_q is None) != (self.dropout_block_kv is None):
+      raise ValueError(
+          "Either both or neither of dropout_block_q and dropout_block_kv must"
+          " be set."
+      )
+
+    if self.dropout_block_q is not None:
       if self.dropout_block_q <= 0:
         raise ValueError(
             f"dropout_block_q must be positive, got {self.dropout_block_q}."
         )
-      if self.dropout_block_kv <= 0:
-        raise ValueError(
-            f"dropout_block_kv must be positive, got {self.dropout_block_kv}."
-        )
-
       if self.block_q % self.dropout_block_q != 0:
         raise ValueError(
             f"block_q={self.block_q} must be a multiple of"
@@ -368,6 +359,11 @@ class SplashConfig:
             f" dropout_block_q={self.dropout_block_q}."
         )
 
+    if self.dropout_block_kv is not None:
+      if self.dropout_block_kv <= 0:
+        raise ValueError(
+            f"dropout_block_kv must be positive, got {self.dropout_block_kv}."
+        )
       assert self.block_kv_compute is not None
       if self.block_kv_compute % self.dropout_block_kv != 0:
         raise ValueError(
@@ -588,11 +584,11 @@ def flash_attention_kernel(
     mask_function: MaskFunctionType | None,
     fuse_reciprocal: bool,  # config.fuse_reciprocal or not save_residuals
     config: SplashConfig,
+    dropout_rate: float = 0.0,
 ):
   del mask_next_ref
   float32 = jnp.float32
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
-  dropout_rate = config.dropout_rate
   attn_logits_soft_cap = config.attn_logits_soft_cap
   if attn_logits_soft_cap is not None and config.use_base2_exp:
     attn_logits_soft_cap *= LOG2E
@@ -904,6 +900,7 @@ def _splash_attention_forward(
     fwd_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
     prng_key: jax.Array | None = None,
+    dropout_rate: float = 0.0,
 ) -> base.SplashCustomReturnType:
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
@@ -912,7 +909,7 @@ def _splash_attention_forward(
   fuse_reciprocal = config.fuse_reciprocal or not save_residuals
   bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]
   num_stacked_q_heads = config.num_stacked_q_heads
-  prng_key = _check_dropout_args(config, prng_key)
+  prng_key = _check_dropout_args(config, prng_key, dropout_rate)
 
   if num_stacked_q_heads > 1 and (
       sinks is not None or max_logit_value is not None
@@ -1244,6 +1241,7 @@ def _splash_attention_forward(
             fuse_reciprocal=fuse_reciprocal,
             config=config,
             mask_function=mask_function,
+            dropout_rate=dropout_rate,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=7,
@@ -1350,6 +1348,7 @@ def _splash_attention_forward(
         "mask_function",
         "fwd_mask_sparsity",
         "dkv_mask_sparsity",
+        "dropout_rate",
     ),
 )
 def _splash_attention_custom(
@@ -1367,6 +1366,7 @@ def _splash_attention_custom(
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
     dkv_mask_sparsity: float,
+    dropout_rate: float = 0.0,
     max_logit_value: jax.Array | None = None,
     prng_key: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
@@ -1396,6 +1396,7 @@ def _splash_attention_custom(
       fwd_mask_sparsity=fwd_mask_sparsity,
       max_logit_value=max_logit_value,
       prng_key=prng_key,
+      dropout_rate=dropout_rate,
   )
   if save_residuals:
     out, stats = ret
@@ -1422,6 +1423,7 @@ def _splash_attention_fwd(
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
     dkv_mask_sparsity: float,
+    dropout_rate: float = 0.0,
     max_logit_value: jax.Array | None = None,
     prng_key: jax.Array | None = None,
 ) -> tuple[tuple[jax.Array], base.SplashResidualsType]:
@@ -1445,6 +1447,7 @@ def _splash_attention_fwd(
       fwd_mask_sparsity=fwd_mask_sparsity,
       max_logit_value=max_logit_value,
       prng_key=prng_key,
+      dropout_rate=dropout_rate,
   )
   logsumexp = stats["logsumexp"]  # save in the config base for the bwd pass
   if config.use_base2_exp:  # for user, output values in natural base
@@ -1633,10 +1636,10 @@ def _flash_attention_dkv_kernel(
     mask_function: MaskFunctionType | None,
     q_heads_per_kv_head: int,
     config: SplashConfig,
+    dropout_rate: float = 0.0,
 ):
   del mask_next_ref
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
-  dropout_rate = config.dropout_rate
   attn_logits_soft_cap = config.attn_logits_soft_cap
   if attn_logits_soft_cap is not None and config.use_base2_exp:
     attn_logits_soft_cap *= LOG2E
@@ -1906,12 +1909,13 @@ def _splash_attention_bwd_dkv(
     mask_function: MaskFunctionType | None,
     config: SplashConfig,
     dkv_mask_sparsity: float,
+    dropout_rate: float = 0.0,
     prng_key: jax.Array | None = None,
 ):
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   kv_seq_len, head_dim_v = v.shape[-2:]
   num_kv_heads = 1 if is_mqa else k.shape[0]
-  prng_key = _check_dropout_args(config, prng_key)
+  prng_key = _check_dropout_args(config, prng_key, dropout_rate)
   dynamic_grid = mask_info.active_rows is not None
 
   bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]
@@ -2131,6 +2135,7 @@ def _splash_attention_bwd_dkv(
       bq=bq,
       bkv_compute=bkv_compute,
       config=config,
+      dropout_rate=dropout_rate,
       bkv=bkv,
       mask_function=mask_function,
       q_heads_per_kv_head=q_heads_per_kv_head,
@@ -2310,6 +2315,7 @@ def _splash_attention_bwd(
     dkv_mask_sparsity: float,
     res: base.SplashResidualsType,
     grads: jax.Array | tuple[jax.Array, dict[str, jax.Array]],
+    dropout_rate: float = 0.0,
 ) -> tuple[
     MaskInfo | None,  # fwd_mask_info
     MaskInfo | None,  # dvk_mask_info
@@ -2357,6 +2363,7 @@ def _splash_attention_bwd(
       mask_function=mask_function,
       config=config,
       dkv_mask_sparsity=dkv_mask_sparsity,
+      dropout_rate=dropout_rate,
       prng_key=prng_key,
   )
   dsinks = None
@@ -2395,6 +2402,7 @@ _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
         "mask_function",
         "fwd_mask_sparsity",
         "dkv_mask_sparsity",
+        "dropout_rate",
     ],
 )
 def _splash_attention(
@@ -2414,6 +2422,7 @@ def _splash_attention(
     mask_function: MaskFunctionType | None,
     fwd_mask_sparsity: float,
     dkv_mask_sparsity: float,
+    dropout_rate: float = 0.0,
     prng_key: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   return _splash_attention_custom(
@@ -2432,6 +2441,7 @@ def _splash_attention(
       mask_function=mask_function,
       fwd_mask_sparsity=fwd_mask_sparsity,
       dkv_mask_sparsity=dkv_mask_sparsity,
+      dropout_rate=dropout_rate,
       prng_key=prng_key,
   )
 
@@ -2514,7 +2524,11 @@ def _make_splash_attention(
     downcast_smem_data: bool = True,
     partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
     q_seq_shards: int,
+    dropout_rate: float = 0.0,
 ):
+  if not 0.0 <= dropout_rate < 1.0:
+    raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
+
   if len(mask.shape) != 2:
     raise ValueError(f"Unexpected mask shape: {mask.shape}")
 
@@ -2579,6 +2593,7 @@ def _make_splash_attention(
       mask_function=mask_function_fwd,
       fwd_mask_sparsity=fwd_mask_sparsity,
       dkv_mask_sparsity=dkv_mask_sparsity,
+      dropout_rate=dropout_rate,
   )
 
 
@@ -2593,7 +2608,10 @@ def _make_dynamic_splash_attention(
     mask_value: float = base.DEFAULT_MASK_VALUE,
     downcast_smem_data: bool = True,
     partial_mask_blocks_dtype: jax.typing.DTypeLike = np.int8,
+    dropout_rate: float = 0.0,
 ):
+  if not 0.0 <= dropout_rate < 1.0:
+    raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
   if (mesh is not None) != (mask_spec is not None):
     raise ValueError(
         "Either both or neither of mesh and mask_spec must be specified."
@@ -2638,6 +2656,7 @@ def _make_dynamic_splash_attention(
       mask_function=None,
       fwd_mask_sparsity=1.0,
       dkv_mask_sparsity=1.0,
+      dropout_rate=dropout_rate,
   )
 
   # If the input mask is replicated we don't need to call shard_map.
