@@ -66,8 +66,10 @@ class MaskInfo(NamedTuple):
       contains the column index of the corresponding active block in the
       original mask.
     block_mask: An integer[num_active_blocks] NumPy array where each entry is
-      either 1 or 2. 1 means the corresponding block is full and 2 means the
-      corresponding block is partially masked.
+      either 0, 1 or 2
+       - 0 means the corresponding block is fully masked,
+       - 1 means that the block is partially masked,
+       - 2 means the corresponding block is fully unmasked.
     num_active_blocks: An integer[] NumPy array whose entries are the sizes of
       the corresponding blocks in the original mask.
     partial_mask_blocks: An int8[num_partial_blocks, block_q, block_kv] NumPy
