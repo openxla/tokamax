@@ -64,7 +64,7 @@ class KdaBenchmark(parameterized.TestCase):
   """Performance benchmarks for the XLA and Mosaic KDA implementations."""
 
   @parameterized.product(
-      implementation=("xla", "mosaic"),
+      implementation=("xla", "xla_chunked", "mosaic"),
       benchmark_mode=("forward", "forward_and_vjp"),
       args_spec_name=tuple(EXAMPLES.keys()),
   )

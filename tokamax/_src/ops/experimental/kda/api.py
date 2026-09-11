@@ -20,12 +20,16 @@ from typing import Final, Literal, TypeAlias
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda import base
+from tokamax._src.ops.experimental.kda import xla_chunked
 from tokamax._src.ops.experimental.kda.cp_utils import ContextParallelMetadata
 
 
-Implementation: TypeAlias = Literal["xla", "mosaic"]
+Implementation: TypeAlias = Literal["xla", "xla_chunked", "mosaic"]
 
-IMPLEMENTATIONS = dict(xla=base.KimiDeltaAttention())
+IMPLEMENTATIONS = dict(
+    xla=base.KimiDeltaAttention(),
+    xla_chunked=xla_chunked.XlaChunkedKimiDeltaAttention(),
+)
 
 try:
   from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
@@ -107,8 +111,9 @@ def kimi_delta_attention(
       implementation is attempted first when available, with XLA as a fallback.
       `"xla"` evaluates the recurrent reference implementation. `"mosaic"`
       uses the experimental Pallas/Mosaic TPU forward and custom VJP
-      implementation. A sequence tries implementations in order, falling back
-      when an implementation raises `NotImplementedError`.
+      implementation. `"xla_chunked"` evaluates a pure-JAX chunked forward and
+      VJP lowered by XLA on the active backend. A sequence tries implementations
+      in order, falling back when an implementation raises `NotImplementedError`.
 
   Returns:
     A pair `(output, final_state)`. The output has shape `[H, B, T, V]`.
