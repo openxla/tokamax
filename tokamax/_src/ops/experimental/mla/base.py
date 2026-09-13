@@ -19,11 +19,12 @@ from typing import Any, override
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.mla import reference
 
-AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray | np.ndarray
 
 
 class MultiHeadLatentAttention[C](op.Op[Any, Any, None, C, Any]):
@@ -34,11 +35,11 @@ class MultiHeadLatentAttention[C](op.Op[Any, Any, None, C, Any]):
       self,
       ql_nope: Float[
           Array | AbstractArray,
-          "max_num_tokens actual_num_q_heads actual_lkv_dim"
+          "max_num_tokens actual_num_q_heads actual_lkv_dim",
       ],
       q_pe: Float[
           Array | AbstractArray,
-          "max_num_tokens actual_num_q_heads actual_r_dim"
+          "max_num_tokens actual_num_q_heads actual_r_dim",
       ],
       new_kv_c: Float[Array | AbstractArray, "max_num_tokens actual_lkv_dim"],
       new_k_pe: Float[Array | AbstractArray, "max_num_tokens actual_r_dim"],
