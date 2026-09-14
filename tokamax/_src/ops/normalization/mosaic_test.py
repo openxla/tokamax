@@ -34,11 +34,10 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
   """Runs `test_base`'s benchmark-shape tests, and only those."""
 
   def __init__(self, *args):
-    # No backward kernel yet, and Mosaic GPU Pallas calls have no AD rule.
     super().__init__(
         *args,
         norm_fn=mosaic.PallasMosaicGpuNormalization(),
-        supports_vjp=False,
+        supports_vjp=True,
     )
 
   def setUp(self):
