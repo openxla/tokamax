@@ -26,7 +26,7 @@ _IMPLEMENTATIONS: Final[tuple[str | None, ...]] = typing.get_args(
     api.Implementation.__value__
 ) + (None,)
 
-  
+
 def _get_params(n, c, h, d, dtype):
   params = dict(
       x=jax.ShapeDtypeStruct((n, n, c), dtype=dtype),
