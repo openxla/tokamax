@@ -45,8 +45,9 @@ class Config:
   block_n: pydantic_lib.PowerOfTwo | None
 
 
-# There is no autotuning cache for this op, so the key is only what `Op` builds
-# out of the arguments by default.
+# There is no autotuning cache for these ops, so the keys are only what `Op`
+# builds out of the arguments by default. The VJP takes the same block shape as
+# the forward, so it shares `Config` too.
 type Key = immutabledict.immutabledict[str, Any]
 FusedInputArray = base.FusedInputArray
 
@@ -91,17 +92,33 @@ def _vec_along_n(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
       return (M, A // la, N // ln)
   raise ValueError(f'Cannot spread 32 lanes over {A=}, {N=} with {vec=}.')
 
-def _warp_blocks(block_m, block_n):
-    """Splits the block over the warpgroup's 4 warps, along M and/or N.
+def _warp_blocks(block_m, block_n, a=1, split_a=False):
+    """Splits the block over the warpgroup's 4 warps. Returns (m, a, n) counts.
+
+    The forward only reduces A, so it splits M and/or N and keeps its reduction
+    in-warp (`split_a=False`, the default).
+
+    The VJP also reduces over M and N, for `dscale`/`doffset`. Splitting M or N
+    leaves those partials warp-replicated and all four warps store the same
+    values to the same addresses -- ~14x write amplification, about a third of
+    that kernel's DRAM writes. Since the dparam reduction covers everything
+    *except* A, putting the warps on A makes it partitioned for every shape.
     """
+    if split_a and a % 4 == 0:
+      return (1, 4, 1)
     for amt_m in [4,2,1]:
       amt_n = 4 // amt_m
       if block_m % amt_m == 0 and block_n % amt_n == 0:
-        return (amt_m, amt_n)
+        return (amt_m, 1, amt_n)
     raise ValueError(f'Cannot find warp distribution for block_m {block_m}, block_n {block_n}.')
 
-def _tiled_layout(block_m: int, a: int, block_n: int, bitwidth: int):
+def _tiled_layout(
+  block_m: int, a: int, block_n: int, bitwidth: int, split_a: bool = False
+):
   """Builds the register layout for one (block_m, a, block_n) block.
+
+  Shared by the forward and VJP kernels: both stream the same block shape
+  straight from GMEM and reduce along `a`, so they want the same tiling.
 
   The layout has 14 dims. Each `plgpu.Tiling` entry replaces the trailing dims
   it covers with (how many tiles fit, tile shape), so the rank grows
@@ -112,9 +129,11 @@ def _tiled_layout(block_m: int, a: int, block_n: int, bitwidth: int):
   Shared by both branches (tile 0, the CTA block; tile 1, the warp block):
     -14, -13, -12  block counts along M, A, N. All 1: the grid has already
                    selected a single block, and A is never blocked.
-    -11, -10,  -9  warp counts along M, A, N. WARP dims are -11 and -9 --
-                   warps split M and/or N but never the reduced axis A, so
-                   -10 is always 1.
+    -11, -10,  -9  warp counts along M, A, N, all three of which are WARP dims
+                   (their product is always 4, and `canonicalize()` drops
+                   whichever are 1). The forward splits M and/or N, leaving -10
+                   at 1; `split_a` puts all four warps on A instead. See
+                   `_warp_blocks` for why the choice matters.
 
   vec >= block_n (`_vec_along_a`; the vector spans whole N rows):
      -8,  -7,  -6  lane counts along M, A, N. LANE dims are -8 and -7 --
@@ -138,10 +157,10 @@ def _tiled_layout(block_m: int, a: int, block_n: int, bitwidth: int):
   read back off `l` rather than reusing the values passed in.
   """
   vec = _vector_length(block_n, a, bitwidth)
-  warp_m, warp_n = _warp_blocks(block_m, block_n)
+  warp_m, warp_a, warp_n = _warp_blocks(block_m, block_n, a, split_a)
   tile_spec = [
     (block_m, a, block_n),
-    (block_m // warp_m, a, block_n // warp_n),
+    (block_m // warp_m, a // warp_a, block_n // warp_n),
   ]
   if vec >= block_n:
     tile_spec.append(_vec_along_a(vec, *tile_spec[-1]))
@@ -156,7 +175,7 @@ def _tiled_layout(block_m: int, a: int, block_n: int, bitwidth: int):
 
   l = TiledLayout(
     plgpu.Tiling(tuple(tile_spec)),
-    warp_dims=(-11, -9),
+    warp_dims=(-11, -10, -9),
     lane_dims=lane_dims,
     vector_dim=vector_dim,
     _check_canonical=False).canonicalize()
@@ -204,6 +223,12 @@ def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
     num_blocks *= 2
   return Config(block_m=block_m, block_n=None)
 
+def _grid(x_shape, block) -> tuple[int, ...]:
+  """Returns the launch grid, rejecting blocks the launch cannot express."""
+  for (s, b) in zip(x_shape, block):
+    assert s % b == 0
+  return tuple(s // b for (s, b) in zip(x_shape, block))
+
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
   """Pallas-Mosaic-GPU normalization op."""
@@ -211,6 +236,10 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   input_output_alias: bool | None = None
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(self, 'vjp', PallasMosaicGpuNormalizationVjp())
 
   @override
   def _fwd(
@@ -283,16 +312,18 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       y_gmem[index] = x.astype(dtype)
 
     stat = jax.ShapeDtypeStruct(x_shape[:1] + x_shape[2:], jnp.float32)
-    for (s,b) in zip(x_shape, block):
-      assert s % b == 0
+    grid = _grid(x_shape, block)
     outs = plgpu.kernel(
       kernel,
       out_type=(
         *([] if alias else [jax.ShapeDtypeStruct(x_shape, dtype)]),
         *[stat] * (return_mean + return_residuals),
       ),
-      grid=tuple(s//b for (s,b) in zip(x_shape, block)),
-      grid_names=('m', 'a', 'n')
+      grid=grid,
+      grid_names=('m', 'a', 'n'),
+      kernel_name=f"mosaic_norm_fwd_{dtype.name}_m{block_m}_n{block_n}{'_mean' if subtract_mean else ''}",
+      compiler_params=plgpu.CompilerParams(
+        lowering_semantics=plgpu.LoweringSemantics.Warpgroup)
     )(
       x_operand,
       *[a for a in (scale, offset) if a is not None],
@@ -318,6 +349,179 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     return _heuristics_config(
       *ba.args, axis=ba.kwargs['axis'], vmap_axis_sizes=ba.vmap_axis_sizes
     )
+
+  @override
+  def supported_on(self, device: jax.Device) -> bool:
+    return gpu_utils.has_mosaic_gpu_support(device)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
+  """Pallas-Mosaic-GPU normalization VJP.
+
+  Same shape as the forward kernel: one CTA takes one (block_m, A, block_n)
+  tile of `x` and `dout` straight from GMEM into registers, reduces along A,
+  and writes `dx` back. `dscale`/`doffset` reduce over M and N as well, which
+  spans CTAs, so each CTA writes a partial and the final sum is left to XLA.
+  """
+
+  config_cls: ClassVar[type[Config]] = Config
+
+  @override
+  def _fwd(
+    self,
+    residuals: base.Residuals,
+    out: jax.Array,
+    dout: jax.Array,
+    x: jax.Array,
+    scale: jax.Array | None,
+    offset: jax.Array | None,
+    *,
+    axis: int,
+    epsilon: float,
+    scale_offset: float,
+    subtract_mean: bool,
+    return_residuals: bool,
+    config: Config,
+  ) -> tuple[tuple[jax.Array, jax.Array | None, jax.Array | None], None]:
+
+    del epsilon  # Unused: `rstddev` comes from the residuals, not recomputed.
+
+    if return_residuals:
+      raise NotImplementedError('`return_residuals` not supported.')
+
+    mean, rstddev = residuals
+    if (mean is not None) != subtract_mean:
+      raise ValueError('`mean` residual inconsistent with `subtract_mean`.')
+
+    dtype = x.dtype
+    orig_x_shape = x.shape
+    x_shape = canonicalize_shape_3d(orig_x_shape, axis)
+
+    stat_shape = (x_shape[0], x_shape[2])
+    if mean is not None:
+      mean = mean.reshape(stat_shape)
+    rstddev = rstddev.reshape(stat_shape)
+
+    has_scale = scale is not None
+    has_offset = offset is not None
+
+    A = x_shape[1]
+    block = (config.block_m, A, config.block_n or 1)
+    block_m, _, block_n = block
+    grid = _grid(x_shape, block)
+    grid_n = grid[2]
+
+    vec_bitwidth = 32
+    layout = _tiled_layout(block_m, A, block_n, vec_bitwidth, split_a=True)
+
+    # Reductions across singleton dimensions are not supported
+    reduced = tuple(ax for ax in (2, 0) if block[ax] > 1)
+    kept = tuple(ax for ax in range(3) if ax not in reduced)
+
+    def kernel(*refs):
+      it = iter(refs)  # Inputs then outputs, optional ones only if present.
+      take = lambda present: next(it) if present else None
+      dout_gmem, x_gmem, scale_ref = next(it), next(it), take(has_scale)
+      mean_gmem, rstd_gmem = take(subtract_mean), next(it)
+      dx_gmem = next(it)
+      dscale_gmem, doffset_gmem = take(has_scale), take(has_offset)
+
+      m, _, n = [jax.lax.axis_index(i) for i in 'man']
+      index = tuple(pl.ds(i * b, b) for (i, b) in zip((m, 0, n), block))
+      load = lambda ref: plgpu.load(
+        ref.at[index], layout=layout, optimized=False
+      ).astype(jnp.float32)
+      bcast = lambda a: jax.lax.broadcast_in_dim(a, block, (0, 2))
+
+      stat_index = index[:1] + index[2:]
+      stat = lambda ref: plgpu.load(
+        ref.at[stat_index], optimized=False
+      ).astype(jnp.float32)
+
+      rstddev = stat(rstd_gmem)
+      x_norm = load(x_gmem)
+      if mean_gmem is not None:
+        x_norm -= bcast(stat(mean_gmem))
+      x_norm *= bcast(rstddev)
+
+      dout = load(dout_gmem)
+
+      def reduce_mn(a): # Multi axis reduce on mosaic not yet implemented
+        for ax in reduced:
+          a = jnp.sum(a, axis=ax)  # N first, so M stays at axis 0.
+        return a
+
+      # Each CTA owns one (m, n) grid cell, hence one `A`-long run of the
+      # partials; any degenerate axis `reduce_mn` left on is indexed away.
+      dparam_index = tuple(
+        pl.ds((m * grid_n + n) * A, A) if ax == 1 else pl.ds(0, 1)
+        for ax in kept
+      )
+
+      if doffset_gmem is not None:
+        doffset_gmem[dparam_index] = reduce_mn(dout)
+      if dscale_gmem is not None:
+        dscale_gmem[dparam_index] = reduce_mn(dout * x_norm)
+        loaded = plgpu.load(scale_ref, optimized=False).astype(jnp.float32)
+        dout *= jax.lax.broadcast_in_dim(loaded, block, (1,)) + scale_offset
+
+      dx = dout - bcast(jnp.mean(dout * x_norm, axis=1)) * x_norm
+      if mean_gmem is not None:
+        dx -= bcast(jnp.mean(dout, axis=1))
+      dx_gmem[index] = (dx * bcast(rstddev)).astype(dtype)
+
+    # Shaped to match what `reduce_mn` leaves behind, with the A axis stacked
+    # one run per (m, n) grid cell.
+    dparam_shape = tuple(
+      grid[0] * grid_n * A if ax == 1 else 1 for ax in kept
+    )
+    dparam = jax.ShapeDtypeStruct(dparam_shape, jnp.float32)
+    dx, *dparams = plgpu.kernel(
+      kernel,
+      out_type=(
+        jax.ShapeDtypeStruct(x_shape, dtype),
+        *[dparam] * (has_scale + has_offset),
+      ),
+      grid=grid,
+      kernel_name=f"mosaic_norm_bwd_{dtype.name}_m{block_m}_n{block_n}{'_mean' if subtract_mean else ''}",
+      grid_names=('m', 'a', 'n'),
+      compiler_params=plgpu.CompilerParams(
+        lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+        # The dparam reductions run over M and N, which are the warp dims, so
+        # unlike the forward kernel's reduction over A they have to go via SMEM:
+        # one f32 slot per warp, lane and vector element.
+        reduction_scratch_bytes=(
+          4 * 32 * _vector_length(block_n, A, vec_bitwidth) * 4
+        ),
+      )
+    )(
+      dout.reshape(x_shape),
+      x.reshape(x_shape),
+      *[a for a in (scale, mean) if a is not None],
+      rstddev,
+    )
+
+    it = iter(dparams)
+
+    total = lambda a, dt: jnp.sum(a.reshape(-1, A), axis=0).astype(dt)
+    dscale = total(next(it), scale.dtype) if has_scale else None
+    doffset = total(next(it), offset.dtype) if has_offset else None
+    return (dx.reshape(orig_x_shape), dscale, doffset), None
+
+  @override
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    _, _, _, x, scale, offset = ba.args
+    axis = ba.kwargs['axis']
+    config = _heuristics_config(
+      x, scale, offset, axis=axis, vmap_axis_sizes=ba.vmap_axis_sizes
+    )
+    n = canonicalize_shape_3d(x.shape, axis)[2]
+    if config.block_n is not None and n % 32 == 0:
+      # The VJP holds more live values per element than the forward, so it takes
+      # a narrower N block.
+      config = dataclasses.replace(config, block_n=32)
+    return config
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
