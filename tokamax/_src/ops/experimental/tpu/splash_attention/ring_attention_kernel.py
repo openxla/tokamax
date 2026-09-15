@@ -112,7 +112,7 @@ def _ring_attention_forward(
       save_residuals=True,
       mask_value=mask_value,
       is_mqa=is_mqa,
-      config=config,
+      config=config,  # pyrefly: ignore[bad-argument-type]
       mask_function=mask_function,
       fwd_mask_sparsity=fwd_mask_sparsity,
       max_logit_value=None,
@@ -164,7 +164,7 @@ def _ring_attention_forward(
   (m_final, l_final, o_final, _, _, _), _ = lax.scan(
       body,
       initial_carry,
-      xs=jnp.arange(0, ring_axis_size),
+      xs=jnp.arange(0, ring_axis_size),  # pyrefly: ignore[bad-argument-type]
       length=ring_axis_size,
       unroll=True,
   )  # type: ignore[arg-type]
@@ -249,7 +249,7 @@ def _ring_attention_bwd(
         save_residuals=False,
         mask_value=mask_value,
         is_mqa=is_mqa,
-        config=config,
+        config=config,  # pyrefly: ignore[bad-argument-type]
         mask_function=mask_function,
         fwd_mask_sparsity=fwd_mask_sparsity,
         dkv_mask_sparsity=dkv_mask_sparsity,
@@ -275,7 +275,7 @@ def _ring_attention_bwd(
   (dq, dk, dv, _, _, _, dsinks), _ = lax.scan(
       body,
       initial_carry,
-      xs=jnp.arange(ring_axis_size),
+      xs=jnp.arange(ring_axis_size),  # pyrefly: ignore[bad-argument-type]
       length=ring_axis_size,
       unroll=True,
   )

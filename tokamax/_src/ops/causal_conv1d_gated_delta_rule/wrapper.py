@@ -506,7 +506,7 @@ def fused_conv1d_gdn(
             vmem_limit_bytes=config.get_vmem_limit_bytes(),
         ),
         name=cfg.get_kernel_name(),
-        metadata=cfg.get_metadata(),
+        metadata=cfg.get_metadata(),  # pyrefly: ignore[bad-argument-type]
     )(
         metadata_obj,
         qkv,
