@@ -69,6 +69,7 @@ cuda = [
     "cuequivariance-ops-jax-cu13>=0.10.0",
     "triton",
     "nvidia-cudnn-frontend>=1.28.0",
+    "jax-triton"
 ]
 
 tpu = [
