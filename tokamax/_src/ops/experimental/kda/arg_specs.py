@@ -15,12 +15,11 @@
 """Kimi Delta Attention argument specifications."""
 
 from typing import Final
-
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src import numerics
 from tokamax._src.autotuning import arg_spec
-
 
 ShapeDtype = jax.ShapeDtypeStruct
 
@@ -67,7 +66,9 @@ def _kimi_linear_48b_a3b_spec(
       "key": ShapeDtype(qkv_shape, dtype),
       "value": ShapeDtype(qkv_shape, dtype),
       "gate": ShapeDtype(qkv_shape, dtype),
-      "beta": ShapeDtype((num_heads, batch_size, seq_len), dtype),
+      "beta": numerics.RangedArrayInitializer(
+          shape=(num_heads, batch_size, seq_len), dtype=dtype, min=0.0, max=1.0
+      ),
       "a_log": ShapeDtype((num_heads,), jnp.float32),
       "delta_time_bias": ShapeDtype((num_heads * head_dim,), jnp.float32),
       "output_final_state": False,
