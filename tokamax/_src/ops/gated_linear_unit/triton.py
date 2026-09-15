@@ -32,7 +32,6 @@ from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights
 import triton
 import triton.language as tl
 
-
 Residuals = base.Residuals
 
 

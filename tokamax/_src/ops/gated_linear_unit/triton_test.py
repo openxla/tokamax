@@ -16,20 +16,34 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.gated_linear_unit import test_base
-from tokamax._src.ops.gated_linear_unit import triton as triton_glu
+
+try:
+  from tokamax._src.ops.gated_linear_unit import triton as triton_glu
+
+  _JAX_TRITON_AVAILABLE = True
+except ImportError:
+  triton_glu = None  # pyrefly: ignore[assignment]
+  _JAX_TRITON_AVAILABLE = False
 
 
+@absltest.skipIf(not _JAX_TRITON_AVAILABLE, "Requires jax_triton.")
 class TritonGatedLinearUnitTest(test_base.GatedLinearUnitTestBase):
 
   def __init__(self, *args):
-    super().__init__(*args, glu_fn=triton_glu.TritonGatedLinearUnit())
+    glu_fn = (
+        triton_glu.TritonGatedLinearUnit() if triton_glu is not None else None
+    )
+    super().__init__(*args, glu_fn=glu_fn)
 
   def setUp(self):
+    if not _JAX_TRITON_AVAILABLE:
+      self.skipTest("Requires jax_triton.")
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
     super().setUp()
 
   def test_autotuning_search_space(self):
+    assert triton_glu is not None
     m = 256
     n = 256
     k = 64
