@@ -51,6 +51,11 @@ import shlex
 import sys
 from typing import TypedDict
 
+# Sibling module, same directory, stdlib-only. This is the one direction the
+# dependency runs: `shards.py` decides what the shards are and is what the
+# workflow calls, `deps.py` answers which test files a change can reach.
+import deps
+
 # Runner label -> (device extra it installs and tests, short name used in the
 # job title). One table rather than two keyed by the same labels, so a runner
 # cannot be listed in one and missing from the other.
@@ -663,12 +668,14 @@ def all_test_files(root: str = 'tokamax') -> list[str]:
   Returns:
     Sorted repo-relative, slash-separated paths.
   """
-  return sorted(
-      os.path.join(dirpath, name).replace(os.sep, '/')
-      for dirpath, _, filenames in os.walk(root)
-      for name in filenames
-      if _is_test_filename(name) and '__pycache__' not in dirpath
-  )
+  found = []
+  for dirpath, _, filenames in os.walk(root):
+    if '__pycache__' in dirpath:
+      continue
+    for name in filenames:
+      if _is_test_filename(name):
+        found.append(os.path.join(dirpath, name).replace(os.sep, '/'))
+  return sorted(found)
 
 
 def split_node_id(path: str) -> tuple[str, str | None]:
@@ -905,8 +912,8 @@ def check_consistency(
     missing = sorted({f for f, _ in targets} - set(test_files))
     if missing:
       errors.append(
-          f'shard {name!r} names paths that are not test files: '
-          + ', '.join(missing)
+          f'shard {name!r} names paths that are not test files:'
+          f' {", ".join(missing)}'
       )
 
     files = collected_by(spec['paths'], test_files)
@@ -940,16 +947,16 @@ def check_consistency(
 
   uncovered = sorted(set(test_files) - set(claims) - excluded - ignored)
   if uncovered:
-    errors.append('test files no shard runs: ' + ', '.join(uncovered))
+    errors.append(f'test files no shard runs: {", ".join(uncovered)}')
 
   # A shard whose name matches no theme would sort into a nameless group at
   # the end of the job list, which is exactly the drift the themes exist to
   # prevent. Cheaper to reject the name than to notice the stray job later.
   if strays := sorted(n for n in shards if shard_theme(n) is None):
     errors.append(
-        'shards whose name starts with no theme in THEMES: '
-        + ', '.join(strays)
-        + ' -- rename to `<theme>-<what it runs>`, or add a theme'
+        'shards whose name starts with no theme in THEMES:'
+        f' {", ".join(strays)} -- rename to `<theme>-<what it runs>`, or add'
+        ' a theme'
     )
 
   # Job names are built from (runner_short, shard_name), and a required status
@@ -957,7 +964,7 @@ def check_consistency(
   # produce two jobs that cannot be told apart.
   short_counts = collections.Counter(short for _, short in RUNNERS.values())
   if dupes := sorted(s for s, n in short_counts.items() if n > 1):
-    errors.append('runner short names used twice: ' + ', '.join(dupes))
+    errors.append(f'runner short names used twice: {", ".join(dupes)}')
 
   # An exclusion for a file that no longer exists is dead config that reads as
   # a live decision.
@@ -987,7 +994,7 @@ def check_consistency(
       continue
     if dupes := sorted({s for s in selectors if selectors.count(s) > 1}):
       errors.append(
-          f'{file} is claimed more than once, in {where}: ' + ', '.join(dupes)
+          f'{file} is claimed more than once, in {where}: {", ".join(dupes)}'
       )
       continue
     if selectors == [None]:
@@ -1001,16 +1008,14 @@ def check_consistency(
     declared = set(class_reader(file))
     if orphans := sorted(declared - set(selectors)):
       errors.append(
-          f'{file} is split by node ID across {where}, but no shard names '
-          + ', '.join(orphans)
-          + ' -- add each to a shard, or, if it holds no tests, give it a'
-          ' leading underscore'
+          f'{file} is split by node ID across {where}, but no shard names'
+          f' {", ".join(orphans)} -- add each to a shard, or, if it holds no'
+          ' tests, give it a leading underscore'
       )
     if unknown := sorted(set(selectors) - declared):
       errors.append(
           f'{file} is split by node ID across {where}, which name classes it'
-          ' does not declare: '
-          + ', '.join(unknown)
+          f' does not declare: {", ".join(unknown)}'
       )
   return errors
 
@@ -1058,10 +1063,79 @@ def shard_order(item: tuple[str, Spec]) -> tuple[bool, bool, float, int, str]:
   )
 
 
-def build_matrix(shards: ShardMap) -> list[MatrixEntry]:
+def shards_for_tests(
+    shards: ShardMap, test_files: Collection[str], affected: Collection[str]
+) -> set[str]:
+  """Returns the shards that run at least one of `affected`.
+
+  The inverse of `collected_by`, and deliberately built from it rather than
+  from a second reading of `paths`: "what does this shard run" has one
+  definition, and selection has to agree with the command line the job will
+  actually execute or it will skip a shard that would have run the test.
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    test_files: The universe to select from, as from `all_test_files`.
+    affected: Test files a change can reach, as `deps.affected_tests` returns.
+
+  Returns:
+    The names of the shards that collect any affected file. A file split
+    across shards by node ID selects all of them: `collected_by` counts a node
+    ID as covering its file, and which class changed is finer than the graph
+    can see.
+  """
+  affected = set(affected)
+  return {
+      name
+      for name, spec in shards.items()
+      if spec['paths'] and collected_by(spec['paths'], test_files) & affected
+  }
+
+
+def unclaimed_tests(
+    shards: ShardMap, test_files: Collection[str], affected: Collection[str]
+) -> set[str]:
+  """Returns affected files that no shard would run.
+
+  A file here is one selection would silently drop. `check_consistency`
+  already rejects a table that leaves a collectable file unclaimed, so this is
+  expected to be empty; it is checked at selection time as well because the
+  cost of being wrong is a test that quietly stops running, which no other
+  check would notice.
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    test_files: The universe to select from, as from `all_test_files`.
+    affected: Test files a change can reach.
+
+  Returns:
+    Affected files claimed by no shard, ignoring the two kinds that are
+    unclaimed on purpose. `IGNORED_GLOBS` is what pytest never collects --
+    `deps` counts `test_base.py` as a test file because something imports it,
+    while the glob keeps it off every command line. `EXCLUDED_TESTS` is what
+    the table deliberately drops, and reading it as a coverage gap would
+    invert its meaning: excluding a test would start costing the full matrix
+    every time a change reached it, which is the opposite of leaving it out.
+  """
+  claimed = set()
+  for spec in shards.values():
+    if spec['paths']:
+      claimed |= collected_by(spec['paths'], test_files)
+  deliberate = IGNORED_GLOBS + EXCLUDED_TESTS
+  return {
+      f
+      for f in affected
+      if f not in claimed and not _matches_glob(f, deliberate)
+  }
+
+
+def build_matrix(
+    shards: ShardMap, only: Collection[str] | None = None
+) -> list[MatrixEntry]:
   """Builds `strategy.matrix.include`, one entry per (shard, runner) job.
 
-  Every shard runs on every runner, so this is the full cross product.
+  Every shard runs on every runner, so this is the full cross product unless
+  `only` narrows it.
 
   The only place a shard's `paths` becomes a command line: the workflow reads
   `test_paths` as one string and splits it back into arguments with `xargs`,
@@ -1070,29 +1144,189 @@ def build_matrix(shards: ShardMap) -> list[MatrixEntry]:
 
   Args:
     shards: Shard name to spec, as `resolve_shards` returns it.
+    only: If given, emit jobs for these shard names only. `None` means every
+      shard, which is not the same as an empty collection: empty is a change
+      that reaches no test and correctly runs nothing.
 
   Returns:
     A job per shard per runner, in `shard_order` within each runner.
   """
-  return [
-      {
+  ordered = sorted(shards.items(), key=shard_order)
+  jobs = []
+  for runner, (device, short) in RUNNERS.items():
+    for name, spec in ordered:
+      if only is not None and name not in only:
+        continue
+      # `check_consistency` rejects a shard with no paths, so this never emits
+      # a job with no arguments -- which pytest would read as "collect the
+      # whole repository".
+      if not spec['paths']:
+        continue
+      jobs.append({
           'runner': runner,
           'runner_short': short,
           'device': device,
           'shard_name': name,
           'test_paths': shlex.join(spec['paths']),
-      }
-      for runner, (device, short) in RUNNERS.items()
-      for name, spec in sorted(shards.items(), key=shard_order)
-      # `check_consistency` rejects a shard with no paths, so this never emits
-      # a job with no arguments -- which pytest would read as "collect the
-      # whole repository".
-      if spec['paths']
+      })
+  return jobs
+
+
+def read_changed(path: str) -> list[str]:
+  """Reads a NUL-separated path list.
+
+  Args:
+    path: File written by `git diff --name-only -z`.
+
+  Returns:
+    The paths, empty entries dropped. `-z` rather than newlines because
+    `--name-only` C-quotes paths holding unusual characters, and these come
+    out of a pull request.
+  """
+  with open(path, encoding='utf-8') as f:
+    return [p for p in f.read().split('\0') if p]
+
+
+def select(
+    shards: ShardMap, test_files: Collection[str], changed_from: str | None
+) -> tuple[set[str] | None, str]:
+  """Decides which shards a change has to run.
+
+  Fails open at every step that cannot answer confidently: no file to read,
+  a rule in `deps.full_run_reason`, or an affected test no shard claims. The
+  asymmetry is deliberate -- running too much costs runner minutes, running
+  too little reports a change green that was never tested.
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    test_files: The universe to select from, as from `all_test_files`.
+    changed_from: File of NUL-separated changed paths, or None for no
+      narrowing at all.
+
+  Returns:
+    `(names, reason)`. `names` is the shards to run, or None meaning every
+    shard; an empty set is a real answer, not a failure -- a change that
+    reaches no test runs nothing. `reason` is one line for the log.
+  """
+  if changed_from is None:
+    return None, 'no changed-file list: every shard runs'
+
+  changed = read_changed(changed_from)
+  if not changed:
+    return None, 'changed-file list is empty: every shard runs'
+
+  affected, why = deps.affected_tests(changed)
+  if affected is None:
+    return None, f'every shard runs: {why}'
+
+  # Defensive check: if any affected test is not covered by the shard map,
+  # fall back to running all shards.
+  if orphans := unclaimed_tests(shards, test_files, affected):
+    return None, (
+        f'every shard runs: {len(orphans)} affected test file(s) belong to no'
+        f' shard, first {sorted(orphans)[0]}'
+    )
+
+  names = shards_for_tests(shards, test_files, affected)
+  return names, (
+      f'{len(changed)} changed file(s) reach {len(affected)} test file(s)'
+      f' in {len(names)} of {len(shards)} shards'
+  )
+
+
+def explain(
+    shards: ShardMap, test_files: Collection[str], changed_from: str
+) -> list[str]:
+  """Reports which shards were selected for a change, and the tests reached.
+
+  Lists the changed files, the affected test files, and which shards collect
+  those tests. Tests are tagged as `edited` (directly modified) or `import`
+  (reached via dependency graph).
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    test_files: The universe to select from, as from `all_test_files`.
+    changed_from: File of NUL-separated changed paths.
+
+  Returns:
+    Lines for the log, in `shard_order` so they match the job list.
+  """
+  changed = read_changed(changed_from)
+  if not changed:
+    return ['changed-file list is empty: every shard runs']
+
+  affected, why = deps.affected_tests(changed)
+  if affected is None:
+    return [f'every shard runs: {why}']
+
+  # The change itself, before any graph, so the log says what was edited as
+  # well as what that dragged in. The `Decide which files changed` step logs
+  # the same list against the base ref it diffed; repeated here so this block
+  # is readable on its own.
+  edited = set(changed)
+  tests_edited = {f for f in edited if deps.is_test_file(f)}
+  affected = set(affected)
+  names = shards_for_tests(shards, test_files, affected)
+  noun = 'a test file' if len(tests_edited) == 1 else 'test files'
+  out = [f'{len(changed)} changed file(s), {len(tests_edited)} of them {noun}:']
+  out += [f'      {f}' for f in sorted(changed)]
+  out += [
+      '',
+      f'reaching {len(affected)} test file(s) in {len(names)} of'
+      f' {len(shards)} shards.',
+      '  `edited` was changed directly, `import` reaches one that was.',
+      '  the clock is measured wall time: what shards are sized on, not'
+      ' file count.',
+      '',
   ]
+  claimed = set()
+  for name, spec in sorted(shards.items(), key=shard_order):
+    if not spec['paths']:
+      continue
+    files = collected_by(spec['paths'], test_files)
+    claimed |= files
+    if not (reached := sorted(files & affected)):
+      continue
+    # Which classes of a file this shard runs, for the shards that split one
+    # by node ID. Empty for every other shard, which names whole files.
+    classes = collections.defaultdict(list)
+    for path in spec['paths']:
+      file, selector = split_node_id(path)
+      if selector:
+        classes[file].append(selector)
+    minutes = spec.get('minutes')
+    out.append(
+        f'  {name:32s} {f"{minutes}m" if minutes else "-":>4}'
+        f'  {len(reached)} of {len(files)} file(s) reached'
+    )
+    for file in reached:
+      tag = 'edited' if file in edited else 'import'
+      # The file is the unit the graph works in -- it cannot see classes, so a
+      # change anywhere in a split file reaches every shard that holds a piece
+      # of it. Naming the pieces says what this shard will actually run
+      # without claiming the change touched those classes in particular.
+      runs = f'  [runs ::{", ::".join(classes[file])}]' if classes[file] else ''
+      out.append(f'      {tag}  {file}{runs}')
+
+  # An affected file in no shard is either harmless or the whole story: the
+  # two `selects nothing` cases are unclaimed on purpose and correct, and any
+  # other is why `select` is about to fail open and run everything. The three
+  # branches here are the three `unclaimed_tests` decides between, and have to
+  # keep agreeing with it or this explains a decision that was not made.
+  if leftover := sorted(affected - claimed):
+    out.append('')
+    for file in leftover:
+      if _matches_glob(file, IGNORED_GLOBS):
+        out.append(f'      {file} -- never collected, selects nothing')
+      elif _matches_glob(file, EXCLUDED_TESTS):
+        out.append(f'      {file} -- in EXCLUDED_TESTS, selects nothing')
+      else:
+        out.append(f'      {file} -- NO SHARD, forces a full run')
+  return out
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-  """Runs the `matrix`, `check` or `list` command.
+  """Runs the `matrix`, `check`, `list` or `explain` command.
 
   Args:
     argv: Command-line arguments, `sys.argv[1:]` when None.
@@ -1104,7 +1338,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     SystemExit: If `check_consistency` finds a problem.
   """
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument('command', choices=('matrix', 'check', 'list'))
+  parser.add_argument(
+      'command', choices=('matrix', 'check', 'list', 'explain')
+  )
+  parser.add_argument(
+      '--changed-from',
+      metavar='FILE',
+      help='Path to file containing NUL-separated changed file paths (e.g. from'
+      ' `git diff --name-only -z`). Narrows the test matrix to affected shards.'
+      ' If omitted, all shards run.',
+  )
+  parser.add_argument(
+      '--dry-run',
+      action='store_true',
+      help='Calculate and log shard selection without filtering the matrix'
+      ' (emits all shards). Used to validate selection behavior before'
+      ' enforcing it.',
+  )
   args = parser.parse_args(argv)
 
   test_files = all_test_files()
@@ -1126,14 +1376,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     return 0
 
+  if args.command == 'explain':
+    if not args.changed_from:
+      parser.error('explain needs --changed-from')
+    print('\n'.join(explain(shards, test_files, args.changed_from)))
+    return 0
+
   if args.command == 'matrix':
-    combos = build_matrix(shards)
+    only, reason = select(shards, test_files, args.changed_from)
+    # Under `--dry-run` the selection is computed and reported but not acted
+    # on, so the matrix is every shard whatever `select` decided.
+    combos = build_matrix(shards, None if args.dry_run else only)
     flags = shlex.join(PYTEST_SELECT_FLAGS)
     # Diagnostics on stderr, so they land in the job log rather than in
     # $GITHUB_OUTPUT, which stdout is redirected to.
+    if args.dry_run and only is not None:
+      # `selection:` is the line the workflow lifts into the run summary, so
+      # the fact that it decided nothing has to be on that line and not
+      # somewhere further down the log.
+      reason = f'{reason} -- DRY RUN, not applied: every shard runs'
+    print(f'selection: {reason}', file=sys.stderr)
+    # What actually runs, always. The block below is what selection thought,
+    # which is the same thing unless this is a dry run.
     print(f'{len(shards)} shards, {len(combos)} jobs', file=sys.stderr)
+    if only is not None:
+      verb = 'would select' if args.dry_run else 'selected'
+      print(f'{verb} {len(only)} of {len(shards)} shards:', file=sys.stderr)
+      for name in sorted(only):
+        print(f'  {name}', file=sys.stderr)
     print(f'not run by design: {sorted(excluded)}', file=sys.stderr)
     print(f'pytest select flags: {flags}', file=sys.stderr)
+    # Only the values something reads. The reason goes to stderr above and
+    # reaches the run summary from there: as an output it would be one more
+    # `key=value` line, unescaped, in a file whose format a path containing a
+    # newline would break -- and `-z` exists precisely because such a path can
+    # come out of a pull request.
     print(f'include={json.dumps(combos)}')
     print(f'pytest_flags={flags}')
     # The catch-all is empty in the ordinary case, and the workflow turns a

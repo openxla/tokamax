@@ -111,6 +111,16 @@ class DepsTestCase(unittest.TestCase):
     self.files = deps.python_files()
     self.edges, self.unparsed = deps.import_graph(self.files)
 
+  def remove(self, path):
+    """Deletes a file from the fake package and rebuilds the graph.
+
+    The graph is rebuilt from what is left, which is the situation the CI job
+    is in: it checks out the merge result and never sees the old tree.
+    """
+    os.remove(path)
+    self.files = deps.python_files()
+    self.edges, self.unparsed = deps.import_graph(self.files)
+
   def affected(self, *changed):
     tests, reason = deps.affected_tests(
         list(changed), self.edges, self.unparsed, self.files
@@ -252,20 +262,95 @@ class FailOpenTest(DepsTestCase):
     tests, _ = self.affected('tokamax/_src/core.py', 'tokamax/data/tuning.json')
     self.assertIsNone(tests)
 
-  def test_deleted_file(self):
-    # The one case that looks answerable and is not. The graph is built from
-    # the tree as it is now, so a deleted file has no node and no dependents:
-    # without this rule it selects nothing, while every file that imported it
-    # is broken.
-    self.assert_full_run('tokamax/_src/deleted.py')
+  def test_deleted_package_init(self):
+    # The one deletion the referrer scan is not trusted with: `module_name`
+    # collapses an `__init__.py` to the package, so deleting it re-resolves
+    # every sibling, and what is left behind is a namespace package rather
+    # than an import error anyone would notice.
+    self.remove('tokamax/_src/ops/__init__.py')
+    self.assert_full_run('tokamax/_src/ops/__init__.py')
 
-  def test_renamed_file_is_a_delete_and_an_add(self):
-    # git reports a rename as both paths. The old one is gone, which is what
-    # forces the full run; the new one on its own would not.
-    tests, _ = self.affected(
+
+class DeletedFileTest(DepsTestCase):
+  """Deletions, which the graph built from the surviving tree cannot see.
+
+  A deleted file is not a node, and `import_graph` drops the edges that
+  pointed at it, so `dependents` finds nothing for it -- an answer identical
+  to the one a genuinely inert change gets. What is recovered instead is the
+  set of `import` statements that still spell its name; each file holding one
+  is broken exactly as if it had been edited.
+  """
+
+  def test_a_file_nothing_imports_selects_nothing(self):
+    # Empty and correct, not empty and lucky: `orphan.py` is named by no
+    # import in the tree, so removing it cannot break a test.
+    self.remove('tokamax/_src/orphan.py')
+    tests, reason = self.affected('tokamax/_src/orphan.py')
+    self.assertEqual(tests, set())
+    self.assertIsNone(reason)
+
+  def test_a_file_still_imported_selects_its_dependents(self):
+    # The case that actually goes red: `util.py` and `core_test.py` still say
+    # `from tokamax._src import core`, so both fail at collection. Reached
+    # through the surviving import statement, then up the graph as usual --
+    # `op_test.py` is three edges away and has to run.
+    self.remove('tokamax/_src/core.py')
+    tests, reason = self.affected('tokamax/_src/core.py')
+    self.assertIsNone(reason)
+    self.assertIn('tokamax/_src/core_test.py', tests)
+    self.assertIn('tokamax/_src/op_test.py', tests)
+
+  def test_a_deleted_chain_reaches_the_surviving_test(self):
+    # Two links of a chain deleted at once. Neither is a node any more, so the
+    # walk cannot be transitive -- it works because every link is itself in the
+    # changeset and gets its own turn, and the last one is named by a file that
+    # still exists.
+    self.remove('tokamax/_src/util.py')
+    self.remove('tokamax/_src/op.py')
+    tests, reason = self.affected('tokamax/_src/util.py', 'tokamax/_src/op.py')
+    self.assertIsNone(reason)
+    self.assertIn('tokamax/_src/op_test.py', tests)
+
+  def test_a_deleted_test_file_runs_nothing(self):
+    self.remove('tokamax/_src/core_test.py')
+    tests, reason = self.affected('tokamax/_src/core_test.py')
+    self.assertIsNone(reason)
+    self.assertNotIn('tokamax/_src/core_test.py', tests)
+
+  def test_a_completed_rename_does_not_force_a_full_run(self):
+    # The change this was built for. `git diff --no-renames` reports both
+    # paths, and previously the old one alone cost the whole matrix. `op.py` is
+    # named by exactly one file, so a finished rename -- new name in place, its
+    # one importer updated -- leaves the old name spelled nowhere, and the
+    # selection is as narrow as an ordinary edit of the same module.
+    self.remove('tokamax/_src/op.py')
+    self.add('tokamax/_src/op_renamed.py', 'from tokamax._src import util\n')
+    self.add('tokamax/_src/op_test.py', 'from tokamax._src import op_renamed\n')
+    tests, reason = self.affected(
+        'tokamax/_src/op.py',
+        'tokamax/_src/op_renamed.py',
+        'tokamax/_src/op_test.py',
+    )
+    self.assertIsNone(reason)
+    self.assertEqual(tests, {'tokamax/_src/op_test.py'})
+
+  def test_a_half_finished_rename_selects_the_importers_that_were_missed(self):
+    # The dangerous version of the same change, and the reason the scan reads
+    # raw import names rather than graph edges. `core.py` is named by three
+    # files and none of them were updated, so all three break at collection --
+    # including `triton.py`, which is reached only through an import inside an
+    # `if` and a second inside a function body, and is exactly the importer a
+    # human doing the rename would miss.
+    self.remove('tokamax/_src/core.py')
+    self.add('tokamax/_src/core_renamed.py', 'import jax\n')
+    tests, reason = self.affected(
         'tokamax/_src/core.py', 'tokamax/_src/core_renamed.py'
     )
-    self.assertIsNone(tests)
+    self.assertIsNone(reason)
+    self.assertIn('tokamax/_src/core_test.py', tests)
+    self.assertIn('tokamax/_src/op_test.py', tests)
+    self.assertIn('tokamax/_src/ops/backend_test.py', tests)
+    self.assertIn('tokamax/_src/ops/relative_test.py', tests)
 
 
 class NewFileTest(DepsTestCase):

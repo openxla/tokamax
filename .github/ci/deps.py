@@ -76,12 +76,14 @@ def python_files(root: str = PACKAGE_ROOT) -> list[str]:
     Sorted paths, `/`-separated on every platform. `__pycache__` is skipped:
     a stale `.pyc` beside a deleted source would otherwise become a node.
   """
-  return sorted(
-      os.path.join(dirpath, name).replace(os.sep, '/')
-      for dirpath, _, filenames in os.walk(root)
-      for name in filenames
-      if name.endswith('.py') and '__pycache__' not in dirpath
-  )
+  found = []
+  for dirpath, _, filenames in os.walk(root):
+    if '__pycache__' in dirpath:
+      continue
+    for name in filenames:
+      if name.endswith('.py'):
+        found.append(os.path.join(dirpath, name).replace(os.sep, '/'))
+  return sorted(found)
 
 
 def is_test_file(path: str) -> bool:
@@ -96,6 +98,11 @@ def is_test_file(path: str) -> bool:
   """
   name = os.path.basename(path)
   return name.endswith(TEST_FILE_SUFFIX) or name.startswith(TEST_FILE_PREFIX)
+
+
+def _is_package_init(path: str) -> bool:
+  """Whether `path` is a package `__init__.py`."""
+  return os.path.basename(path) == '__init__.py'
 
 
 def module_name(path: str) -> str:
@@ -189,6 +196,35 @@ def import_graph(
   return edges, unparsed
 
 
+def module_referrers(
+    files: Sequence[str] | None = None,
+) -> dict[str, set[str]]:
+  """Inverts `imported_modules`: module name -> the files that name it.
+
+  Unlike `import_graph`, this retains unresolved module names so that references
+  to deleted or renamed modules can still be tracked. Surviving files with raw
+  `import` statements matching the deleted module name are read by
+  `affected_tests` to find broken dependents.
+
+  Third-party and standard library module names are also included, as
+  callers query specific module names directly.
+
+  Args:
+    files: Files to parse. Defaults to every `.py` file in the package.
+
+  Returns:
+    Module name to the files whose imports mention it. A file that did not
+    parse contributes nothing, which costs no coverage: `full_run_reason`
+    turns any unparsed file into a full run before this is ever consulted.
+  """
+  files = python_files() if files is None else files
+  index = collections.defaultdict(set)
+  for path in files:
+    for module in imported_modules(path) or ():
+      index[module].add(path)
+  return index
+
+
 def _reachable(start: str, edges: ImportEdges) -> set[str]:
   """Every file `start` imports, transitively.
 
@@ -242,9 +278,10 @@ def full_run_reason(
   The exception is `INERT_SUFFIXES`, checked before anything else: those files
   cannot affect a test wherever they live (think documentation).
 
-  `known` is the file set the graph was built from. This handles the case of 
-  a file being deleted, which has no import edges and so would be ignored
-  otherwise.
+  `known` is the file set the graph was built from. Changed paths absent from
+  `known` represent deleted files. Most deletions do not force a full run
+  because `affected_tests` identifies their surviving referrers. However, a
+  deleted package `__init__.py` forces a full run.
 
   `unparsed` is not checked against `changed`: it is a property of the graph,
   and forces a full run if the collection is non-empty
@@ -254,8 +291,8 @@ def full_run_reason(
     unparsed: Files `ast` could not read, from `import_graph`. Any at all makes
       the whole graph untrustworthy.
     known: The file set the graph was built from. `None` switches the
-      deleted-file rule off, which is only safe when the caller already knows
-      every changed path still exists.
+      deleted-`__init__.py` rule off, which is only safe when the caller already
+      knows every changed path still exists.
 
   Returns:
     A human-readable reason to run every shard, or `None` if the changeset can
@@ -282,8 +319,11 @@ def full_run_reason(
       return f'{path} configures every test in the package'
     if not path.endswith('.py'):
       return f'{path} is package data, which no import edge covers'
-    if known is not None and path not in known:
-      return f'{path} was deleted or renamed, so its dependents are unknown'
+    # A deleted `__init__.py` forces a full run because removing package
+    # initialization alters how sibling modules resolve, potentially leaving
+    # implicit namespace packages with silently altered import semantics.
+    if known is not None and path not in known and _is_package_init(path):
+      return f'{path} was deleted, which re-resolves the whole package'
   return None
 
 
@@ -320,9 +360,23 @@ def affected_tests(
     return None, reason
 
   index = dependents(edges, files)
+  known = set(files)
   tests = set()
+  # Filter to `.py` files because non-Python files (such as documentation) may
+  # pass `full_run_reason`, but cannot be converted via `module_name`.
+  deleted = [p for p in changed if p not in known and p.endswith('.py')]
   for path in changed:
     tests |= index.get(path, set())
+
+  if deleted:
+    # A deleted file has no node in `edges`. Find surviving files that still
+    # import the deleted module, treat them as broken/changed, and include
+    # their transitive dependents. Unreferenced deleted files produce no
+    # additional test dependencies.
+    referrers = module_referrers(files)
+    for path in deleted:
+      for referrer in referrers.get(module_name(path), ()):
+        tests |= index.get(referrer, set())
   return tests, None
 
 
