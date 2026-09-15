@@ -23,7 +23,7 @@ from tokamax._src import gpu_utils
 from tokamax._src.ops.normalization import base
 
 
-type Implementation = Literal['xla', 'triton']
+type Implementation = Literal['xla', 'triton', 'mosaic']
 
 _IMPLEMENTATIONS = dict(xla=base.Normalization())
 _DEFAULT_IMPLEMENTATIONS = ('xla',)
@@ -33,6 +33,13 @@ try:
 
   _IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonNormalization()
   _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.normalization import mosaic  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
+  _IMPLEMENTATIONS['mosaic'] = mosaic.PallasMosaicGpuNormalization()
 except ImportError:
   pass
 
@@ -75,8 +82,10 @@ def layer_norm(
       assume mean is zero (i.e. RMS norm). Default is `True`.
     implementation: The implementation to use. If `None` (default), an
       implementation is automatically chosen that will work on all platforms.
-      'xla' will use an XLA only implementation and works on any platform, and
-      'triton' will use a Triton GPU kernel. A sequence of implementations can
+      'xla' will use an XLA only implementation and works on any platform,
+      'triton' will use a Triton GPU kernel, and 'mosaic' will use a
+      Pallas-Mosaic-GPU kernel. A sequence of implementations
+      can
       be passed, in which case all implementations will be attempted and the
       first successful result will be returned.
 
