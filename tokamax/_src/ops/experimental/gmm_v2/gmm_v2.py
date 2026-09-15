@@ -113,6 +113,22 @@ def align_to(x, a):
   return pl.cdiv(x, a) * a
 
 
+def get_packing_factor(
+    storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None
+) -> int:
+  if quant_dtype is None or quant_dtype == storage_dtype:
+    return 1
+  storage_bits = jax.dtypes.itemsize_bits(storage_dtype)
+  quant_bits = jax.dtypes.itemsize_bits(quant_dtype)
+  packing_factor, remainder = divmod(storage_bits, quant_bits)
+  if remainder != 0:
+    raise ValueError(
+        f"Storage dtype {storage_dtype} is not divisible by "
+        f"quant dtype {quant_dtype}"
+    )
+  return packing_factor
+
+
 # Define data classes.
 
 
@@ -241,6 +257,14 @@ class InputConfigs:
   # unquantized (dtype != quant_dtype) the scale quantizes it online (lhs).
   has_scale: bool = False
   is_transposed: bool = False
+
+  @property
+  def should_unpack(self) -> bool:
+    """True if rhs weights are sub-byte (e.g.
+
+    INT4) packed in INT32/UINT32 carriers.
+    """
+    return get_packing_factor(self.dtype, self.quant_dtype) > 1
 
   @property
   def should_use_external_scale(self) -> bool:
@@ -479,7 +503,9 @@ def inner_kernel(
     mxu_size = tpu_info.mxu_column_size
 
     # Step 1: Input pre-processing.
-    tiled_lhs = tiled_lhs_ref.get_value().reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
+    tiled_lhs = tiled_lhs_ref.get_value().reshape(-1, cfgs.tiles.tile_k)[
+        :bucket_m
+    ]
     tiled_rhs = tiled_rhs_ref.get_weight()
     if cfgs.transpose_rhs:
       tiled_rhs = jnp.transpose(tiled_rhs)
@@ -933,6 +959,10 @@ def kernel_main(
   num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
   num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
 
+  if cfgs.rhs_cfgs.should_unpack:
+    rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
+    rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
+
   # Fill metadata buffer and return number of group & m interations.
   num_gm = fill_metadata(
       lhs_group_sizes_ref,
@@ -1007,7 +1037,7 @@ def calculate_tiling(
   """Calculate optimal tile sizes for GMM kernel."""
 
   lhs_dtype = lhs_cfgs.dtype
-  rhs_dtype = rhs_cfgs.dtype
+  rhs_dtype = rhs_cfgs.quant_dtype or rhs_cfgs.dtype
 
   lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
   rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
@@ -1110,8 +1140,11 @@ def calculate_tiling(
       num_k_tiles += 1
       tile_k = align_to(dims.size_k, num_k_tiles * num_lanes) // num_k_tiles
 
-  if (rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None
-      and not _is_tile_k_quant_block_compatible(tile_k)):
+  if (
+      rhs_cfgs.has_scale
+      and rhs_cfgs.quant_block_size is not None
+      and not _is_tile_k_quant_block_compatible(tile_k)
+  ):
     tile_k = rhs_cfgs.quant_block_size
 
   if tile_n == 0 or tile_k == 0:
@@ -1164,6 +1197,7 @@ def validate_inputs(
     lhs_scale: jax.Array | None = None,
     transpose_rhs: bool = False,
     lhs_quant_dtype: jnp.dtype | None = None,
+    packing_factor: int = 1,
 ) -> Dimensions:
   """Validates the inputs for the GMM kernel."""
 
@@ -1172,6 +1206,7 @@ def validate_inputs(
     size_group, size_n, size_k = rhs.shape
   else:
     size_group, size_k, size_n = rhs.shape
+  size_k *= packing_factor
   size_lhs_group = group_sizes.shape[0]
 
   assert size_group <= size_lhs_group
@@ -1188,9 +1223,9 @@ def validate_inputs(
       )
     if fuse_act is not None:
       raise NotImplementedError("transpose_rhs does not support fuse_act.")
-    assert rhs.shape == (size_group, size_n, size_k)
+    assert rhs.shape == (size_group, size_n, size_k // packing_factor)
   else:
-    assert rhs.shape == (size_group, size_k, size_n)
+    assert rhs.shape == (size_group, size_k // packing_factor, size_n)
   if rhs_bias is not None:
     assert rhs_bias.shape == (size_group, 1, size_n)
   if rhs_scale is not None:
@@ -1202,9 +1237,7 @@ def validate_inputs(
     assert size_k % num_quant_blocks == 0
 
   if lhs_scale is not None:
-    assert maybe_quantize_lhs, (
-        "lhs_scale requires maybe_quantize_lhs=True."
-    )
+    assert maybe_quantize_lhs, "lhs_scale requires maybe_quantize_lhs=True."
     # Only per-tensor scales are supported for now. The current implementation
     # generalizes to per-channel [M, 1] and
     # sub-channel [M, num_k_blocks]; extend the validation and the block spec /
@@ -1255,7 +1288,7 @@ def get_cost_estimate(cfgs: GmmConfigs):
 
   dims = cfgs.dims
   lhs_dtype = cfgs.lhs_cfgs.quant_dtype or cfgs.lhs_cfgs.dtype
-  rhs_dtype = cfgs.rhs_cfgs.dtype
+  rhs_dtype = cfgs.rhs_cfgs.quant_dtype or cfgs.rhs_cfgs.dtype
 
   # We use bits for rhs since it could sub-byte dtype like int4.
   rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
@@ -1312,8 +1345,10 @@ def make_gmm_configs(
     lhs_scale: jax.Array | None = None,
     transpose_rhs: bool = False,
     lhs_quant_dtype: jnp.dtype | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ):
   """Fills the GMM config for the GMM kernel."""
+  packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
 
   dims = validate_inputs(
       lhs,
@@ -1327,16 +1362,16 @@ def make_gmm_configs(
       lhs_scale,
       transpose_rhs=transpose_rhs,
       lhs_quant_dtype=lhs_quant_dtype,
+      packing_factor=packing_factor,
   )
 
   if rhs_scale is not None:
     has_scale = True
-    rhs_quant_dtype = rhs.dtype
+    rhs_quant_dtype = rhs_quant_dtype or rhs.dtype
     num_blocks = rhs_scale.shape[1]
     block_size = dims.size_k // num_blocks
   else:
     has_scale = False
-    rhs_quant_dtype = None
     block_size = dims.size_k
 
   rhs_cfgs = InputConfigs(
@@ -1440,6 +1475,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "acc_dtype",
         "maybe_quantize_lhs",
         "lhs_quant_dtype",
+        "rhs_quant_dtype",
         "zero_initialize",
         "fuse_act",
         "transpose_rhs",
@@ -1461,6 +1497,7 @@ def gmm_v2(
     acc_dtype: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
     lhs_quant_dtype: jnp.dtype | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     transpose_rhs: bool = False,
@@ -1474,7 +1511,8 @@ def gmm_v2(
   Args:
     lhs: lhs with shape [size_m, size_k].
     rhs: rhs with shape [size_group, size_k, size_n] (or [size_group, size_n,
-      size_k] if transpose_rhs).
+      size_k] if transpose_rhs) if native else [size_group, size_k // 8, size_n]
+      if packed.
     group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
     rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
     rhs_bias: The rhs bias of shape [size_group, 1, out_size].
@@ -1485,6 +1523,7 @@ def gmm_v2(
       quantized lhs uses the default dynamic per-block absmax calibration. Only
       takes effect when maybe_quantize_lhs is True and rhs is quantized.
     lhs_quant_dtype: Optional jnp.dtype to use for quantizing lhs
+    rhs_quant_dtype: Optional jnp.dtype to use for quantizing rhs
     tile_info: The tile sizes or tile function to use.
     vmem_limit_bytes: Optional vmem limit in bytes.
     precision: Unused. Exists for compatibility reasons.
@@ -1527,6 +1566,7 @@ def gmm_v2(
       lhs_scale=lhs_scale,
       transpose_rhs=transpose_rhs,
       lhs_quant_dtype=lhs_quant_dtype,
+      rhs_quant_dtype=rhs_quant_dtype,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles

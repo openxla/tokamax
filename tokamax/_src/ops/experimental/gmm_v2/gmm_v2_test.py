@@ -171,7 +171,7 @@ def _lookup_tol(dtype):
   if key not in _DTYPE_TOL:
     raise KeyError(
         f"No default tolerance for dtype {key!r}. "
-        f"Add it to _DTYPE_TOL or pass explicit atol/rtol."
+        "Add it to _DTYPE_TOL or pass explicit atol/rtol."
     )
   return _DTYPE_TOL[key]
 
@@ -367,8 +367,7 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
-    tgmm_v2.validate_tgmm_inputs(
-        group_sizes, num_local_groups, group_offset)
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_local_groups, group_offset)
     actual = tgmm_v2.tgmm_v2(
         lhs,
         grad,
@@ -417,8 +416,7 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
-    tgmm_v2.validate_tgmm_inputs(
-        group_sizes, num_local_groups, group_offset)
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_local_groups, group_offset)
     actual = tgmm_v2.tgmm_v2(
         lhs,
         grad,
@@ -467,8 +465,7 @@ class GmmTest(parameterized.TestCase):
     tile_info = gmm_v2.TileSizes(
         tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
     )
-    tgmm_v2.validate_tgmm_inputs(
-        group_sizes, num_local_groups, group_offset)
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_local_groups, group_offset)
     actual = tgmm_v2.tgmm_v2(
         lhs,
         grad,
@@ -576,8 +573,7 @@ class GmmTest(parameterized.TestCase):
     expected = reference_tgmm(
         lhs_t, grad, group_sizes, num_local_groups, group_offset=group_offset
     )
-    tgmm_v2.validate_tgmm_inputs(
-        group_sizes, num_local_groups, group_offset)
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_local_groups, group_offset)
     actual = tgmm_v2.tgmm_v2(
         lhs,
         grad,
@@ -651,7 +647,10 @@ class GmmTest(parameterized.TestCase):
     grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.float32)
 
     grad_q, grad_scale = quantize_tensor(
-        grad, rhs_quant_dtype, axis=0, block_size=batch_size,
+        grad,
+        rhs_quant_dtype,
+        axis=0,
+        block_size=batch_size,
     )
     grad_scale = jnp.expand_dims(grad_scale, axis=1)  # [1, 1, N]
     assert grad_scale.shape == (1, 1, out_size)
@@ -660,15 +659,22 @@ class GmmTest(parameterized.TestCase):
     group_offset_arr = jnp.array([group_offset], dtype=jnp.int32)
 
     expected = reference_tgmm(
-        lhs.swapaxes(0, 1), grad_q, group_sizes, num_local_groups,
+        lhs.swapaxes(0, 1),
+        grad_q,
+        group_sizes,
+        num_local_groups,
         rhs_scale=grad_scale,
         group_offset=group_offset_arr,
         out_dtype=jnp.bfloat16,
     )
     tgmm_v2.validate_tgmm_inputs(
-        group_sizes, num_local_groups, group_offset_arr)
+        group_sizes, num_local_groups, group_offset_arr
+    )
     actual = tgmm_v2.tgmm_v2(
-        lhs, grad_q, group_sizes, num_local_groups,
+        lhs,
+        grad_q,
+        group_sizes,
+        num_local_groups,
         rhs_scale=grad_scale,
         group_offset=group_offset_arr,
         preferred_element_type=jnp.bfloat16,
@@ -694,7 +700,10 @@ class GmmTest(parameterized.TestCase):
     grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.float32)
 
     grad_q, grad_scale = quantize_tensor(
-        grad, rhs_quant_dtype, axis=0, block_size=batch_size,
+        grad,
+        rhs_quant_dtype,
+        axis=0,
+        block_size=batch_size,
     )
     grad_scale = jnp.expand_dims(grad_scale, axis=1)  # [1, 1, N]
     assert grad_scale.shape == (1, 1, out_size)
@@ -706,13 +715,19 @@ class GmmTest(parameterized.TestCase):
     )
 
     expected = reference_tgmm(
-        lhs.swapaxes(0, 1), grad_q, group_sizes, num_groups,
+        lhs.swapaxes(0, 1),
+        grad_q,
+        group_sizes,
+        num_groups,
         rhs_scale=grad_scale,
         out_dtype=jnp.bfloat16,
     )
     tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
     actual = tgmm_v2.tgmm_v2(
-        lhs, grad_q, group_sizes, num_groups,
+        lhs,
+        grad_q,
+        group_sizes,
+        num_groups,
         rhs_scale=grad_scale,
         tile_info=tile_info,
         preferred_element_type=jnp.bfloat16,
@@ -1113,9 +1128,9 @@ class GmmTest(parameterized.TestCase):
     # intermediate-dtype differences remain, within the tolerance below.
     scale = lhs_scale.item()
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    lhs_q = jnp.clip(
-        lhs.astype(jnp.float32) / scale, -fp8_max, fp8_max
-    ).astype(jnp.float8_e4m3fn)
+    lhs_q = jnp.clip(lhs.astype(jnp.float32) / scale, -fp8_max, fp8_max).astype(
+        jnp.float8_e4m3fn
+    )
     lhs_simulated = (lhs_q.astype(jnp.float32) * scale).astype(lhs.dtype)
 
     expected = reference_gmm(
@@ -1396,7 +1411,8 @@ class GmmTest(parameterized.TestCase):
       raw_gate, raw_up = jnp.split(raw_expected, 2, axis=-1)
       raw_expected = gmm_v2.interleave_lane(raw_gate, raw_up)
     expected = gmm_v2.apply_act_fn(
-        raw_expected.astype(jnp.float32), fuse_act).astype(lhs.dtype)
+        raw_expected.astype(jnp.float32), fuse_act
+    ).astype(lhs.dtype)
 
     # 4. Compute Actual Kernel Output
     actual = gmm_v2.gmm_v2(
@@ -1423,6 +1439,73 @@ class GmmTest(parameterized.TestCase):
       atol, rtol = 5e-2, 5e-2  # Unquantized Path (bfloat16 precision diffs)
 
     chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+
+  def test_gmm_v2_int4_packed_matches_reference(self):
+    batch_size = 128
+    logical_k = 512
+    storage_k = logical_k // 8
+    out_size = 256
+    num_groups = 4
+    block_size = 64
+    key = jax.random.key(0)
+
+    lhs = jax.random.uniform(key, (batch_size, logical_k), jnp.bfloat16, -1, 1)
+
+    weight_key, _ = jax.random.split(key)
+    rhs = jax.random.uniform(
+        weight_key,
+        (num_groups, logical_k, out_size),
+        minval=-1.0,
+        maxval=1.0,
+        dtype=jnp.bfloat16,
+    )
+    rhs_int4, rhs_scale = quantize_tensor(
+        rhs,
+        jnp.int4,
+        axis=1,
+        block_size=block_size,
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_gmm(
+        lhs,
+        rhs_int4,
+        group_sizes,
+        rhs_scale=rhs_scale,
+    )
+
+    # We simulate packing uint4 weights since checkpoints are stored as packed
+    # uint4 values
+    rhs_uint4 = (rhs_int4.astype(jnp.uint32) + 8) & 0x0F
+
+    packing_factor = gmm_v2.get_packing_factor(jnp.int32, jnp.int4)  # 8
+    rhs_reshaped = rhs_uint4.reshape(
+        num_groups, storage_k, packing_factor, out_size
+    )
+
+    # We pack 8 (packing factor) uint4 values into a single uint32
+    shifts = jnp.arange(packing_factor, dtype=jnp.int32) * 4
+    shifted = rhs_reshaped << shifts[None, None, :, None]
+    rhs_packed_uint32 = jnp.sum(shifted, axis=2).astype(jnp.int32)
+
+    # We use -2004318072 because this converts the packed uint4 back to int4.
+    # In decimal -2004318072 is 0x88888888 which when XOR-ed with the uint4
+    # values gives the corresponding packed int4 values.
+    INT4_SIGN_XOR = -2004318072
+    rhs_packed_int32_xor = (rhs_packed_uint32 ^ INT4_SIGN_XOR).astype(jnp.int32)
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs_packed_int32_xor,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_quant_dtype=jnp.int4,
+    )
+
+    assert actual.shape == (batch_size, out_size)
+    chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
 
 
 class GmmV2VmemStressTest(parameterized.TestCase):
