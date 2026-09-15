@@ -38,7 +38,8 @@ class DotProductAttentionTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     if jax.default_backend() == 'gpu':
-      # TODO: Remove once Mosaic GPU support is fixed.
+      # TODO(mosaic_gpu): Remove skip once Mosaic GPU attention forward pass
+      # is stabilized. Currently causes invalid instruction errors on SM100.
       self.skipTest('Mosaic GPU support is broken.')
 
   # Tests derived from JAX `nn_test`.
@@ -161,7 +162,8 @@ class DotProductAttentionTest(parameterized.TestCase):
       ],
   )
   def testDotProductAttentionMask(self, mask_mode):
-    # TODO: Fix test for 'xla_chunked' on TPU.
+    # TODO(xla_chunked_tpu): xla_chunked uses a different partitioning
+    # strategy that is not yet compatible with TPU's HBM layout.
     if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
       self.skipTest(f'{self.IMPL} not supported on TPU')
 
@@ -169,13 +171,16 @@ class DotProductAttentionTest(parameterized.TestCase):
       mask_mode = (mask_mode,)
 
     if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
-      # TODO: Remove once bias is supported.
+      # TODO(mosaic_tpu): Additive bias requires fusing an elementwise add
+      # into the SplashAttention kernel, which is not yet implemented.
       if 'bias' in mask_mode:
         self.skipTest('Bias is not supported on Mosaic TPU attention.')
-      # TODO: Remove once padding is supported.
+      # TODO(mosaic_tpu): Padding mask support requires variable-length
+      # sequence handling within the SplashAttention block structure.
       if 'padding' in mask_mode:
         self.skipTest('Padding is not supported on Mosaic TPU attention.')
-      # TODO: Remove once sliding window is supported.
+      # TODO(mosaic_tpu): Sliding window attention requires block-level
+      # mask generation that is not yet supported in the TPU kernel.
       if 'sliding_window' in mask_mode:
         self.skipTest(
             'Sliding window is not supported on Mosaic TPU attention.'
