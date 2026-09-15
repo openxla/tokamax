@@ -47,6 +47,7 @@ def reference_gmm(
     group_sizes: jax.Array,  # [num_groups]
     rhs_scale: jax.Array | None = None,
     rhs_bias: jax.Array | None = None,
+    partial_sum: jax.Array | None = None,  # [m, n]
     group_offset: jax.Array | None = None,  # int32[1]
 ):
   num_tokens = lhs.shape[0]
@@ -92,6 +93,8 @@ def reference_gmm(
         out += acc
       if rhs_bias is not None:
         out = out + rhs_bias[group]
+      if partial_sum is not None:
+        out = out + partial_sum[start:end]
     else:
       out = jnp.zeros((group_size, out_size), dtype=lhs.dtype)
 
@@ -233,6 +236,79 @@ class GmmTest(parameterized.TestCase):
     )
 
     assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
+      num_groups=[16],
+      has_bias=[True],
+      group_offset=[0],
+  )
+  @pytest.mark.long
+  def test_gmm_partial_sum(
+      self, batch_size, in_size, out_size, num_groups, has_bias, group_offset
+  ):
+    """Tests the fused residual add, including its interaction with bias."""
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+    k0, k1, k2, k3 = jax.random.split(key, 4)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_local_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    rhs_bias = None
+    if has_bias:
+      rhs_bias = jax.random.normal(
+          k2, (num_local_groups, 1, out_size), dtype=jnp.bfloat16
+      )
+    partial_sum = jax.random.normal(
+        k3, (batch_size, out_size), dtype=jnp.bfloat16
+    )
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+    expected = reference_gmm(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_bias=rhs_bias,
+        partial_sum=partial_sum,
+        group_offset=group_offset,
+    )
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_bias=rhs_bias,
+        partial_sum=partial_sum,
+        group_offset=group_offset,
+    )
+
+    assert_arrays_all_close(actual, expected)
+
+  def test_gmm_partial_sum_matches_unfused_add(self):
+    """A partial sum must be equivalent to adding it after an unfused GMM."""
+    batch_size, in_size, out_size, num_groups = 128, 512, 512, 16
+    key = jax.random.key(0)
+    k0, k1, k2 = jax.random.split(key, 3)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    partial_sum = jax.random.normal(
+        k2, (batch_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    fused = gmm_v2.gmm_v2(lhs, rhs, group_sizes, partial_sum=partial_sum)
+    unfused = gmm_v2.gmm_v2(lhs, rhs, group_sizes) + partial_sum
+
+    assert_arrays_all_close(fused, unfused)
 
   @parameterized.product(
       batch_size=[128],

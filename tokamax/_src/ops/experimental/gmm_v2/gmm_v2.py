@@ -286,6 +286,7 @@ class GmmConfigs:
   zero_init: bool
   fuse_act: str | None
   transpose_rhs: bool = False
+  has_partial_sum: bool = False
 
   @property
   def num_quant_blocks_per_tile_k(self) -> int:
@@ -300,7 +301,7 @@ class GmmConfigs:
 
 
 TileFn = Callable[
-    [Dimensions, InputConfigs, InputConfigs, int, str | None], TileSizes
+    [Dimensions, InputConfigs, InputConfigs, int, str | None, bool], TileSizes
 ]
 
 
@@ -367,10 +368,20 @@ class IndexMaps:
 
     return (pl.ds(row_start, row_size), 0, n_id)
 
+  def ps_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
+    m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
+    m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
+
+    row_start = m_start // self.cfgs.dims.size_lhs_sublane
+    row_end = pl.cdiv(m_end, self.cfgs.dims.size_lhs_sublane)
+    row_size = row_end - row_start
+
+    return (pl.ds(row_start, row_size), 0, n_id)
+
 
 def generate_block_specs(
     metadata_ref: MetadataRef, cfgs: GmmConfigs
-) -> Tuple[Tuple[LhsRef, WeightsRef], pl.BlockSpec]:
+) -> Tuple[Tuple[LhsRef, WeightsRef, pl.BlockSpec | None], pl.BlockSpec]:
   """Generates block specs for the given lhs, rhs, and out refs."""
 
   index_map = IndexMaps(metadata_ref, cfgs)
@@ -402,7 +413,7 @@ def generate_block_specs(
         index_map.rhs_weight_index_map,
         pipeline_mode=pl.Buffered(buffer_count=3),
     )
-  rhs_scale_block_spec = rhs_bias_block_spec = None
+  rhs_scale_block_spec = rhs_bias_block_spec = ps_block_spec = None
   if cfgs.rhs_cfgs.has_bias:
     rhs_bias_block_spec = pl.BlockSpec(
         (None, 1, cfgs.tiles.tile_n),
@@ -412,6 +423,12 @@ def generate_block_specs(
     rhs_scale_block_spec = pl.BlockSpec(
         (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
         index_map.rhs_scale_index_map,
+    )
+
+  if cfgs.has_partial_sum:
+    ps_block_spec = pl.BlockSpec(
+        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n),
+        index_map.ps_index_map,
     )
 
   rhs_block_spec = WeightsRef(
@@ -425,7 +442,7 @@ def generate_block_specs(
       index_map.out_index_map,
   )
 
-  return (lhs_block_spec, rhs_block_spec), out_block_spec
+  return (lhs_block_spec, rhs_block_spec, ps_block_spec), out_block_spec
 
 
 # Define kernels.
@@ -436,6 +453,9 @@ def inner_kernel(
     tiled_lhs_ref: LhsRef,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
     tiled_rhs_ref: RhsRef,  # [tile_k, tile_n]
+    # Partial Sum
+    tiled_ps_ref: jax.Array | None,
+    # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
     # Out
     tiled_out_ref: jax.Array,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
@@ -642,6 +662,18 @@ def inner_kernel(
       if cfgs.rhs_cfgs.has_bias:
         tiled_rhs_bias = tiled_rhs_ref.get_bias()
         acc += tiled_rhs_bias.astype(acc.dtype)
+      if cfgs.has_partial_sum:
+        # `has_partial_sum` and a non-None `tiled_ps_ref` are set together by
+        # `make_gmm_configs` / `generate_block_specs`; assert the invariant so
+        # the optional type narrows and any future divergence fails loudly.
+        assert tiled_ps_ref is not None, (
+            "cfgs.has_partial_sum is True but no partial-sum ref was passed"
+        )
+        # `acc` covers only `acc_m` rows (the current bucket), while the
+        # partial sum block spans the full `tile_m`. Slice it the same way the
+        # output ref is written below.
+        ps_tile = tiled_ps_ref.reshape(-1, cfgs.tiles.tile_n)[:acc_m]
+        acc += ps_tile.astype(acc.dtype)
 
       acc = apply_act_fn(acc, cfgs.fuse_act)
 
@@ -893,6 +925,7 @@ def kernel_main(
     # In
     lhs_ref: LhsRef,  # value: [size_m, size_k]
     rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
+    partial_sum_ref: jax.Array,  # [size_m, size_n]
     # Out
     out_ref: jax.Array,  # [size_m, size_n]
     # Scratch memory
@@ -922,6 +955,7 @@ def kernel_main(
     group_offset_ref: Reference to the group offset.
     lhs_ref: Reference to the lhs.
     rhs_ref: Reference to the rhs.
+    partial_sum_ref: Reference to the partial sum added to the matmul result.
     out_ref: Reference to the out.
     partial_out_ref: Reference to the partial output.
     acc_ref: Reference to the accumulator.
@@ -951,7 +985,9 @@ def kernel_main(
         dims=cfgs.dims,
     )
 
-  (lhs_spec, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs)
+  (lhs_spec, rhs_spec, ps_spec), out_spec = generate_block_specs(
+      metadata_ref, cfgs
+  )
 
   if cfgs.fuse_act is not None:
     rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n :], rhs_ref)
@@ -976,7 +1012,7 @@ def kernel_main(
   pipeline_fn = pltpu.emit_pipeline(
       functools.partial(inner_kernel, cfgs=cfgs),
       grid=(num_n, num_gm, num_k),
-      in_specs=(lhs_spec, rhs_spec),
+      in_specs=(lhs_spec, rhs_spec, ps_spec),
       out_specs=out_spec,
       core_axis_name=core_axis_name,
       dimension_semantics=dimension_semantics,
@@ -989,9 +1025,14 @@ def kernel_main(
       -1, cfgs.dims.size_lhs_sublane, lhs_ref.value.shape[-1]
   )
   lhs_in = LhsRef(value=lhs_value_in, scale=lhs_ref.scale)
+  ps_in = None
+  if cfgs.has_partial_sum:
+    ps_in = partial_sum_ref.reshape(
+        -1, cfgs.dims.size_lhs_sublane, partial_sum_ref.shape[-1]
+    )
   out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
   scratches = [partial_out_ref, acc_ref, metadata_ref]
-  pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+  pipeline_fn(lhs_in, rhs_ref, ps_in, out_in, scratches=scratches)
 
   if cfgs.zero_init:
     zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)  # pyrefly: ignore[bad-argument-type, unbound-name]
@@ -1003,6 +1044,7 @@ def calculate_tiling(
     rhs_cfgs: InputConfigs,
     vmem_limit_bytes: int,
     fuse_act: str | None = None,
+    has_partial_sum: bool = False,
 ) -> TileSizes:
   """Calculate optimal tile sizes for GMM kernel."""
 
@@ -1080,11 +1122,12 @@ def calculate_tiling(
     acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
     acc_vmem = tm * acc_cols * acc_dtype_bytes
 
-    # 4. Output tile (double-buffered)
+    # 4. Output tile (double-buffered) and partial sum tile (double-buffered)
     out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
     out_vmem = 2 * tm * tn * out_dtype_bytes
+    ps_vmem = 2 * tm * tn * out_dtype_bytes if has_partial_sum else 0
 
-    return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
+    return lhs_vmem + rhs_vmem + acc_vmem + out_vmem + ps_vmem
 
   # Multiple k tiles will introduce accumulation overhead. Thus, we first try
   # to fit the tensors into vmem by only adjusting tile_n.
@@ -1157,6 +1200,7 @@ def validate_inputs(
     rhs: jax.Array,
     rhs_scale: jax.Array | None,
     rhs_bias: jax.Array | None,
+    partial_sum: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
@@ -1193,6 +1237,10 @@ def validate_inputs(
     assert rhs.shape == (size_group, size_k, size_n)
   if rhs_bias is not None:
     assert rhs_bias.shape == (size_group, 1, size_n)
+  if partial_sum is not None:
+    assert partial_sum.shape[-1] == size_n
+    # lhs's m dimension can sometimes be padded to wi_tile_fwd_batch_seq.
+    assert partial_sum.shape[0] <= size_m
   if rhs_scale is not None:
     num_quant_blocks = rhs_scale.shape[1]
     assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n), (
@@ -1299,6 +1347,7 @@ def make_gmm_configs(
     rhs: jax.Array,
     rhs_scale: jax.Array | None,
     rhs_bias: jax.Array | None,
+    partial_sum: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
     *,
@@ -1320,6 +1369,7 @@ def make_gmm_configs(
       rhs,
       rhs_scale,
       rhs_bias,
+      partial_sum,
       group_sizes,
       group_offset,
       fuse_act,
@@ -1405,7 +1455,14 @@ def make_gmm_configs(
   if isinstance(tile_info, TileSizes):
     tiles = tile_info
   else:
-    tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)  # pyrefly: ignore[bad-argument-type]
+    tiles = tile_info(
+        dims,
+        lhs_cfgs,
+        rhs_cfgs,
+        vmem_limit_bytes,  # pyrefly: ignore[bad-argument-type]
+        fuse_act,
+        partial_sum is not None,
+    )
 
   return GmmConfigs(
       dims=dims,
@@ -1417,6 +1474,7 @@ def make_gmm_configs(
       zero_init=zero_initialize,
       fuse_act=fuse_act,
       transpose_rhs=transpose_rhs,
+      has_partial_sum=partial_sum is not None,
   )
 
 
@@ -1453,6 +1511,7 @@ def gmm_v2(
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
     group_offset: jax.Array | None = None,  # int32[1]
     lhs_scale: jax.Array | None = None,  # [1, 1] (per-tensor)
+    partial_sum: jax.Array | None = None,  # [size_m, size_n]
     *,
     tile_info: TileSizes | TileFn = calculate_tiling,
     vmem_limit_bytes: int | None = None,
@@ -1484,6 +1543,10 @@ def gmm_v2(
       granularity; currently only per-tensor `[1, 1]` is supported. When None, a
       quantized lhs uses the default dynamic per-block absmax calibration. Only
       takes effect when maybe_quantize_lhs is True and rhs is quantized.
+    partial_sum: Optional. Per-token partial sums of shape [size_m, size_n],
+      added to the matmul result inside the kernel before the fused activation.
+      This avoids a separate HBM round-trip for a residual add. The row count
+      may be smaller than size_m when the lhs has been padded.
     lhs_quant_dtype: Optional jnp.dtype to use for quantizing lhs
     tile_info: The tile sizes or tile function to use.
     vmem_limit_bytes: Optional vmem limit in bytes.
@@ -1515,6 +1578,7 @@ def gmm_v2(
       rhs,
       rhs_scale,
       rhs_bias,
+      partial_sum,
       group_sizes,
       group_offset,
       tile_info=tile_info,
@@ -1597,11 +1661,30 @@ def gmm_v2(
     if cfgs.lhs_cfgs.has_scale:
       lhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
 
-    rhs_scale_spec = rhs_bias_spec = None
+    rhs_scale_spec = rhs_bias_spec = partial_sum_spec = None
     if rhs_scale is not None:
       rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
       rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    if partial_sum is not None:
+      partial_sum_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    # Write the output over the partial sum buffer to save an HBM allocation.
+    # Only possible when the two are exactly the same shape and dtype, which is
+    # not guaranteed: `validate_inputs` allows a partial sum with fewer rows
+    # than `size_m`, and the output is lane-aligned while the partial sum is
+    # not.
+    input_output_aliases = {}
+    if partial_sum is not None and (
+        partial_sum.shape == (dims.size_m, aligned_n)
+        and partial_sum.dtype == cfgs.out_dtype
+    ):
+      # Nones are dropped by `tree_leaves`, so this is the flat operand index
+      # the partial sum will land on.
+      leaves = jax.tree_util.tree_leaves(
+          (group_sizes, group_offset, lhs_in, rhs_weights)
+      )
+      input_output_aliases = {len(leaves): 0}
 
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
@@ -1618,6 +1701,7 @@ def gmm_v2(
                     scale=rhs_scale_spec,
                     bias=rhs_bias_spec,
                 ),
+                partial_sum_spec,
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             # pyrefly: ignore[bad-argument-type]
@@ -1630,12 +1714,18 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
-    )(group_sizes, group_offset, lhs_in, rhs_weights)[:, : cfgs.out_size_n]
+        input_output_aliases=input_output_aliases,
+    )(group_sizes, group_offset, lhs_in, rhs_weights, partial_sum)[
+        :, : cfgs.out_size_n
+    ]
 
   group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
 
   # Configure per-core execution over TensorCore mesh for MegaCore scaling.
+  # NOTE: unlike `pl.pallas_call` above, `pl.kernel` does not expose
+  # `input_output_aliases`, so the partial sum cannot be aliased to the output
+  # on this path.
   return pl.kernel(
       functools.partial(kernel_main, cfgs=cfgs),
       out_type=out_init,
@@ -1648,4 +1738,6 @@ def gmm_v2(
       name=get_scope_name(cfgs),
       cost_estimate=get_cost_estimate(cfgs),
       metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
-  )(group_sizes, group_offset, lhs_in, rhs_weights)[:, : cfgs.out_size_n]
+  )(group_sizes, group_offset, lhs_in, rhs_weights, partial_sum)[
+      :, : cfgs.out_size_n
+  ]
