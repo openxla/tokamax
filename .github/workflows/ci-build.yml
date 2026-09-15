@@ -28,7 +28,7 @@ env:
   # reaches and logs it, but runs every shard regardless; `enforce` lets it
   # decide the matrix. This is the only line to change to turn it on, and the
   # only one to change back if it drops something it should not have.
-  SHARD_SELECTION: report
+  SHARD_SELECTION: enforce
 
 permissions:
   contents: read
