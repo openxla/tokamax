@@ -58,6 +58,9 @@ class LayerNormTest(parameterized.TestCase):
   def test_basic_api(self, implementation):
     if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
+    # The Mosaic GPU normalization kernel needs no Hopper-only feature.
+    if implementation == "mosaic" and not gpu_utils.has_mosaic_gpu_support():
+      self.skipTest("Mosaic GPU not supported on this platform.")
 
     x, scale, offset = _get_input_data(shape=(128, 32), dtype=jnp.bfloat16)
 
@@ -84,7 +87,7 @@ class LayerNormTest(parameterized.TestCase):
       x_shape = jax.ShapeDtypeStruct((a, 32), x.dtype)
       param_shape = jax.ShapeDtypeStruct(scale.shape, x.dtype)
 
-      if implementation == "triton":
+      if implementation in ("triton", "mosaic"):
         with self.assertRaisesRegex(Exception, "all implementations failed"):
           export.export(
               norm_fn,
