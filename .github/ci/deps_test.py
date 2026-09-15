@@ -161,11 +161,17 @@ class GraphTest(DepsTestCase):
     tests, _ = self.affected('tokamax/_src/ops/lazy.py')
     self.assertIn('tokamax/_src/ops/relative_test.py', tests)
 
-  def test_importing_a_submodule_depends_on_the_package_init(self):
-    # `from tokamax._src import core` executes `_src/__init__.py`, so editing
-    # the `__init__` has to select everything under it.
-    tests, _ = self.affected('tokamax/_src/__init__.py')
-    self.assertIn('tokamax/_src/core_test.py', tests)
+  def test_importing_a_submodule_records_an_edge_to_the_package_init(self):
+    # `from tokamax._src import core` executes `_src/__init__.py`, and the
+    # graph does record that edge -- the package imported *from* is named by
+    # the statement. Asserted against the graph rather than through
+    # `affected_tests`, which fails a changed `__init__.py` open before it gets
+    # this far; the edge still has to be there, because it is what the
+    # ancestors of *other* files' imports are missing.
+    index = deps.dependents(self.edges, self.files)
+    self.assertIn(
+        'tokamax/_src/core_test.py', index['tokamax/_src/__init__.py']
+    )
 
   def test_cycles_terminate(self):
     tests, _ = self.affected('tokamax/_src/cycle_a.py')
@@ -268,7 +274,38 @@ class FailOpenTest(DepsTestCase):
     # every sibling, and what is left behind is a namespace package rather
     # than an import error anyone would notice.
     self.remove('tokamax/_src/ops/__init__.py')
-    self.assert_full_run('tokamax/_src/ops/__init__.py')
+    tests, reason = self.affected('tokamax/_src/ops/__init__.py')
+    self.assertIsNone(tests)
+    self.assertIn('deleted', reason)
+
+  def test_edited_package_init(self):
+    # An edited `__init__.py` fails open for a different reason than a deleted
+    # one: nothing imports it by name, so its dependents are whatever happens
+    # to sit above the importer in the tree, which the graph does not record.
+    for path in (
+        'tokamax/__init__.py',
+        'tokamax/_src/__init__.py',
+        'tokamax/_src/ops/__init__.py',
+    ):
+      with self.subTest(path=path):
+        self.add(path, 'X = 1\n')
+        tests, reason = self.affected(path)
+        self.assertIsNone(tests, f'editing {path} should force a full run')
+        self.assertIn('__init__.py', reason)
+        self.assertNotIn('deleted', reason)
+
+  def test_an_init_forces_a_full_run_for_the_whole_changeset(self):
+    tests, reason = self.affected(
+        'tokamax/_src/core.py', 'tokamax/_src/ops/__init__.py'
+    )
+    self.assertIsNone(tests)
+    self.assertIn('__init__.py', reason)
+
+  def test_a_file_merely_named_init_elsewhere_is_not_special(self):
+    self.add('tokamax/_src/__init___helper.py', 'import jax\n')
+    tests, reason = self.affected('tokamax/_src/__init___helper.py')
+    self.assertEqual(tests, set())
+    self.assertIsNone(reason)
 
 
 class DeletedFileTest(DepsTestCase):
