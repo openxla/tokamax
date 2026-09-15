@@ -565,7 +565,7 @@ def _chunk_gated_delta_rule_fwd_kernel(
   gk_ref,  # [1, 1, BT, K_PADSIZE]
   h0_ref,  # [1, 1, K_PADSIZE, V_ALIGNED]
   # outputs
-  h_ref,  # [1, NT, 1, K_PADSIZE, V_ALIGNED]
+  h_ref,  # [1, 1, 1, K_PADSIZE, V_ALIGNED] -- this chunk's slice only
   v_new_ref,  # [1, 1, BT, V_ALIGNED]
   ht_ref,  # [1, 1, K_PADSIZE, V_ALIGNED]
   scratch_ref,  # [K_PADSIZE, V_ALIGNED]
@@ -603,7 +603,7 @@ def _chunk_gated_delta_rule_fwd_kernel(
     if h0_ref is not None:
       scratch_ref[...] = h0_ref[0, 0].astype(jnp.float32)
 
-  h_ref[0, 0, idx_nt] = scratch_ref[...].astype(h_ref.dtype)
+  h_ref[0, 0, 0] = scratch_ref[...].astype(h_ref.dtype)
 
   b_w = w_ref[0, 0]
   b_v = jnp.dot(
@@ -790,8 +790,9 @@ def _chunk_gated_delta_rule_fwd(
     else None
   )
 
+  # Slice one chunk per grid step to avoid allocating the full [NT, K, V] output in VMEM.
   h_blockspec_out = pl.BlockSpec(
-    [1, 1, NT, K_PADSIZE, V_ALIGNED], lambda b, h, nt: (h, b, 0, 0, 0)
+    [1, 1, 1, K_PADSIZE, V_ALIGNED], lambda b, h, nt: (h, b, nt, 0, 0)
   )
   v_new_blockspec_out = (
     pl.BlockSpec([1, 1, BT, V_ALIGNED], lambda b, h, nt: (h, b, nt, 0))
@@ -871,7 +872,8 @@ def chunk_gated_delta_rule_fwd_h(
   w: Float[Array, "H B T K"],
   u: Float[Array, "H B T V"],
   g: Float[Array, "H B T"] | None = None,
-  gk: Float[Array, "H B T K"] | None = None,
+  # GW, not K: a scalar gate arrives at width 1 and broadcasts from there.
+  gk: Float[Array, "H B T GW"] | None = None,
   initial_state: (
       Float[Array, "N_STATE H K V"]
       | Float[Array, "B N_STATE H K V"]

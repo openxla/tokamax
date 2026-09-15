@@ -46,7 +46,7 @@ def kimi_delta_attention(
     query: Float[Array, "H B T K"],
     key: Float[Array, "H B T K"],
     value: Float[Array, "H B T V"],
-    gate: Float[Array, "H B T K"],
+    gate: Float[Array, "H B T GW"],
     beta: Float[Array, "H B T"],
     *,
     a_log: Float[Array, "H"] | None = None,
@@ -56,6 +56,8 @@ def kimi_delta_attention(
     output_final_state: bool = False,
     use_qk_l2norm: bool = False,
     use_gate_in_kernel: bool = False,
+    per_channel_gate: bool = True,
+    chunk_size: int | None = None,
     segment_ids: Int[Array, "B T"] | None = None,
     lower_bound: float | None = None,
     context_parallel_metadata: ContextParallelMetadata | None = None,
@@ -90,6 +92,8 @@ def kimi_delta_attention(
       Its segment dimension `N` determines `max_num_segments` when the latter
       is omitted.
     output_final_state: Whether to return the final recurrent state.
+    per_channel_gate: Whether `gate` has an independent value per key channel
+      (True, shape `[..., K]`) or a scalar per head/token (False, shape `[..., 1]`).
     use_qk_l2norm: Whether to normalize query/key on the last dimension before
       running KDA.
     use_gate_in_kernel: Whether `gate` is raw input that should be activated
@@ -143,6 +147,8 @@ def kimi_delta_attention(
           output_final_state=output_final_state,
           use_qk_l2norm=use_qk_l2norm,
           use_gate_in_kernel=use_gate_in_kernel,
+          per_channel_gate=per_channel_gate,
+          chunk_size=chunk_size,
           segment_ids=segment_ids,
           lower_bound=lower_bound,
           context_parallel_metadata=context_parallel_metadata,

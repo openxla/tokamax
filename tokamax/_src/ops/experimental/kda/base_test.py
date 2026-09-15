@@ -65,10 +65,10 @@ def _make_inputs(
 
 class KimiDeltaAttentionTest(parameterized.TestCase):
 
-  def test_chunk_size_is_not_public(self):
-    self.assertNotIn(
-        "chunk_size", inspect.signature(api.kimi_delta_attention).parameters
-    )
+  def test_public_gdn_parameters(self):
+    parameters = inspect.signature(api.kimi_delta_attention).parameters
+    self.assertIn("per_channel_gate", parameters)
+    self.assertIn("chunk_size", parameters)
 
   def test_public_api_uses_descriptive_names(self):
     parameters = inspect.signature(api.kimi_delta_attention).parameters

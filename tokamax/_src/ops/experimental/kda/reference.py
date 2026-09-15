@@ -87,6 +87,9 @@ def kimi_delta_attention(
 ) -> tuple[jax.Array, jax.Array | None]:
   """Computes KDA with an explicit token-by-token JAX recurrence."""
   q, k, v, g = query, key, value, gate
+  # Broadcast scalar gates to key dimension width.
+  if g.shape[-1] != q.shape[-1]:
+    g = jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
   heads, batch, seq_len, key_dim = q.shape
   value_dim = v.shape[-1]
   acc_dtype = _accumulator_dtype(q.dtype)

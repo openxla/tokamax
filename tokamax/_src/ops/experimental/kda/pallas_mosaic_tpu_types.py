@@ -41,7 +41,7 @@ class KdaResiduals:
   k: Float[Array, "H B T_ALIGNED K"]
   v: Float[Array, "H B T_ALIGNED V"]
   beta: Float[Array, "H B T_ALIGNED"]
-  g_cumsum: Float[Array, "H B T_ALIGNED K"] | None
+  g_cumsum: Float[Array, "H B T_ALIGNED GW"] | None
   aqk: Float[Array, "H B T_ALIGNED BT"]
   akk: Float[Array, "H B T_ALIGNED BT"]
   initial_state: (

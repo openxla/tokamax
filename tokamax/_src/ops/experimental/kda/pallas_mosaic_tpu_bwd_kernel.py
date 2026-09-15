@@ -519,7 +519,8 @@ def _recompute_w_u_fwd(q, k, v, beta, A, gk, chunk_size):
   k_chunks = k.reshape(H * B * NT, BT, K)
   v_chunks = v.reshape(H * B * NT, BT, V)
   beta_chunks = beta.reshape(H * B * NT, BT, 1)
-  g_chunks = gk.reshape(H * B * NT, BT, K)
+  # Preserve gate width (K for per-channel, 1 for scalar) and broadcast in products below.
+  g_chunks = gk.reshape(H * B * NT, BT, gk.shape[-1])
   g_exp = jnp.exp2(g_chunks)
   precision = (
       None if q.dtype == jnp.bfloat16 else jax.lax.Precision.HIGHEST
@@ -806,10 +807,10 @@ def fused_recompute_w_u_vnew_from_h_pallas(
 # Shared L1 helpers for the fused backward kernel
 # ══════════════════════════════════════════════════════════════════════════
 
-@partial(jax.jit, static_argnames=["precision"])
+@partial(jax.jit, static_argnames=["precision", "per_channel_gate"])
 def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
                            dq_acc, dk_acc, db_acc, dg_acc,
-                           precision):
+                           precision, per_channel_gate=True):
   BT = bq.shape[1]
   idx = jnp.arange(BT, dtype=jnp.int32)
   causal_mask = idx[:, None] >= idx[None, :]
@@ -836,12 +837,28 @@ def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
   dAkk_diag = jnp.stack(
     [dAkk_full[:, i * BC:(i + 1) * BC, i * BC:(i + 1) * BC] for i in range(NC)])
 
-  g_max = jnp.max(g_b, axis=2, keepdims=True)
-  row_d = jnp.exp2(g_b - g_max)
-  col_d = jnp.exp2(g_max - g_b)
-  k_til = k_b * col_d
-  q_hat = q_b * row_d
-  k_hat = k_b * beta_b * row_d
+  dAkk_diag_beta = None
+  if per_channel_gate:
+    # Re-center around block max to prevent exp2 overflow across rows.
+    g_max = jnp.max(g_b, axis=2, keepdims=True)
+    row_d = jnp.exp2(g_b - g_max)
+    col_d = jnp.exp2(g_max - g_b)
+    k_til = k_b * col_d
+    q_hat = q_b * row_d
+    k_hat = k_b * beta_b * row_d
+  else:
+    # Scalar gate: fold causal pairwise decay exp2(g[r] - g[t]) directly into cotangents.
+    row_d = col_d = None
+    gs_b = g_b[:, :, :, 0]                                  # [NC, MB, BC]
+    _r = jax.lax.broadcasted_iota(jnp.int32, (BC, BC), dimension=0)
+    _c = jax.lax.broadcasted_iota(jnp.int32, (BC, BC), dimension=1)
+    _causal = (_r >= _c)[None, None]
+    _diff = gs_b[:, :, :, None] - gs_b[:, :, None, :]       # [NC, MB, BC, BC]
+    _decay = jnp.where(_causal, jnp.exp2(jnp.where(_causal, _diff, 0.0)), 0.0)
+    dAqk_diag = dAqk_diag * _decay
+    dAkk_diag = dAkk_diag * _decay
+    dAkk_diag_beta = dAkk_diag * beta_b
+    k_til, q_hat, k_hat = k_b, q_b, k_b
 
   K = bq.shape[2]
   MB = bq.shape[0]
@@ -851,20 +868,24 @@ def compute_intra_backward(bq, bk, bg, bb, dAqk, dAkk,
   def _f(x):
     return x.reshape(NM, x.shape[2], x.shape[3])
 
-  dq_all = (_f(row_d) * jax.lax.dot_general(
+  _sc_row = (lambda x: _f(row_d) * x) if per_channel_gate else (lambda x: x)
+  _sc_col = (lambda x: _f(col_d) * x) if per_channel_gate else (lambda x: x)
+  _dAkk_col = dAkk_diag if per_channel_gate else dAkk_diag_beta
+
+  dq_all = _sc_row(jax.lax.dot_general(
     _f(dAqk_diag), _f(k_til), _b1,
     preferred_element_type=jnp.float32, precision=precision,
   )).reshape(NC, MB, BC, K)
-  dk_row_pre_all = (_f(row_d) * jax.lax.dot_general(
+  dk_row_pre_all = _sc_row(jax.lax.dot_general(
     _f(dAkk_diag), _f(k_til), _b1,
     preferred_element_type=jnp.float32, precision=precision,
   )).reshape(NC, MB, BC, K)
-  dk_col_all = (_f(col_d) * (
+  dk_col_all = _sc_col(
     jax.lax.dot_general(_f(dAqk_diag), _f(q_hat), _b1t,
                         preferred_element_type=jnp.float32, precision=precision)
-    + jax.lax.dot_general(_f(dAkk_diag), _f(k_hat), _b1t,
+    + jax.lax.dot_general(_f(_dAkk_col), _f(k_hat), _b1t,
                           preferred_element_type=jnp.float32, precision=precision)
-  )).reshape(NC, MB, BC, K)
+  ).reshape(NC, MB, BC, K)
 
   row_pairs = [(ii, ij) for ii in range(NC) for ij in range(ii)]
   if row_pairs:
@@ -996,6 +1017,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   NT,
   scale,
   MB,
+  per_channel_gate=True,
 ):
   """Fuse Dhu, WY, intra backward, and reverse cumsum for one chunk tile."""
   head_group = pl.program_id(0)
@@ -1019,9 +1041,16 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   bqg = qg_ref[:, 0, 0].astype(jnp.float32)
   bkg = kg_ref[:, 0, 0]
   bw = w_ref[:, 0, 0].astype(jnp.float32)
-  bg = g_ref[:, 0, 0].astype(jnp.float32)
+  # Transpose scalar gate from [.., 1, BT] back to [MB, BT, 1] and broadcast to K in VMEM.
+  if g_ref.shape[-2] == 1:
+    bg = g_ref[:, 0, 0, 0].astype(jnp.float32)[..., None]
+  else:
+    bg = g_ref[:, 0, 0].astype(jnp.float32)
+  _gate_narrow = bg.shape[-1] != K
+  if _gate_narrow:
+    bg = jnp.broadcast_to(bg, bg.shape[:-1] + (K,))
   g_exp_last = jnp.exp2(bg[:, BT - 1, :])
-  bb = beta_ref[:, 0, 0, :, 0].astype(jnp.float32)
+  bb = beta_ref[:, 0, 0, 0].astype(jnp.float32)
   bA = A_ref[:, 0, 0].astype(jnp.float32)
   bh = h_ref[:, 0, 0].astype(jnp.float32)
   bdo = do_ref[:, 0, 0]
@@ -1050,15 +1079,21 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   # --- Intra backward + reverse cumsum ---
   dq_total, dk_total, db_total, dg_total = compute_intra_backward(
     bq, bk, bg, bb, bdAqk, dAkk_local, dq_acc, dk_acc, db_acc, dg_acc,
-    precision=precision,
+    precision=precision, per_channel_gate=per_channel_gate,
   )
   dg_reverse_cumsum = compute_reverse_cumsum_dg(dg_total)
 
   dq_ref[:, 0, 0] = dq_total.astype(dq_ref.dtype)
   dk_ref[:, 0, 0] = dk_total.astype(dk_ref.dtype)
   dv_ref[:, 0, 0] = (b_dvb * bb[:, :, None]).astype(dv_ref.dtype)
-  db_ref[:, 0, 0, :, 0] = db_total.astype(db_ref.dtype)
-  dg_ref[:, 0, 0] = dg_reverse_cumsum.astype(dg_ref.dtype)
+  db_ref[:, 0, 0, 0] = db_total.astype(db_ref.dtype)
+  # Sum per-channel gate gradients when using a scalar gate.
+  if _gate_narrow:
+    dg_reverse_cumsum = jnp.sum(dg_reverse_cumsum, axis=-1, keepdims=True)
+  if dg_ref.shape[-2] == 1:
+    dg_ref[:, 0, 0, 0] = dg_reverse_cumsum[..., 0].astype(dg_ref.dtype)
+  else:
+    dg_ref[:, 0, 0] = dg_reverse_cumsum.astype(dg_ref.dtype)
 
   @pl.when(is_first_chunk)
   def _():
@@ -1074,6 +1109,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
       "mini_batch",
       "return_dh0",
       "max_num_segments",
+      "per_channel_gate",
   ],
 )
 @jaxtyping.jaxtyped
@@ -1085,7 +1121,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   qg: Float[Array, "H B T K"],
   kg: Float[Array, "H B T K"],
   w: Float[Array, "H B T K"],
-  g: Float[Array, "H B T K"],
+  g: Float[Array, "H B T GW"],
   beta: Float[Array, "H B T"],
   A: Float[Array, "H B T BT"],
   h: Float[Array, "H B NT K V"],
@@ -1098,6 +1134,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   segment_ids: Int[Array, "B T"] | None = None,
   chunk_size: int = 64,
   use_exp2: bool = True,
+  per_channel_gate: bool = True,
   mini_batch: int | None = None,
   return_dh0: bool = True,
   max_num_segments: int | None = None,
@@ -1106,7 +1143,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   Float[Array, "H B T K"],
   Float[Array, "H B T V"],
   Float[Array, "H B T"],
-  Float[Array, "H B T K"],
+  Float[Array, "H B T GW"],
   Float[Array, "B N_OUT H K V"] | None,
 ]:
   """Fuses Dhu recurrence, WY backward, intra backward, and gate cumsum.
@@ -1150,6 +1187,13 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     per_head = io_per_head + io_per_head * 3 // 2
     hw = get_tpu_limits()
     vmem_budget = hw.vmem_limit_bytes
+    # Scale down VMEM budget for chunk sizes > 64 (override via KDA_BWD_VMEM_FRACTION).
+    import os as _os  # pylint: disable=g-import-not-at-top
+    _frac = float(_os.environ.get("KDA_BWD_VMEM_FRACTION", "0") or 0)
+    if _frac > 0:
+      vmem_budget = int(vmem_budget * _frac)
+    elif BT > 64:
+      vmem_budget = (vmem_budget * 64) // BT
     MB = max(1, vmem_budget // per_head)
     MB = min(MB, H, 16)
     while H % MB != 0 and MB > 1:
@@ -1167,8 +1211,12 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   qg_r = qg.reshape(H, B, NT, BT, K)
   kg_r = kg.reshape(H, B, NT, BT, K)
   w_r = w.reshape(H, B, NT, BT, K)
-  g_r = g.reshape(H, B, NT, BT, K)
-  beta_r = beta.reshape(H, B, NT, BT, 1)
+  GW = g.shape[-1]
+  scalar_gate = GW == 1
+  # Store width-1 axes as [.., 1, BT] to avoid 128-lane minor-axis padding in HBM.
+  g_r = (g.reshape(H, B, NT, 1, BT) if scalar_gate
+         else g.reshape(H, B, NT, BT, GW))
+  beta_r = beta.reshape(H, B, NT, 1, BT)
   A_r = A.reshape(H, B, NT, BT, BT)
   h_r = h  # already [H, B, NT, K, V]
   do_r = do.reshape(H, B, NT, BT, V)
@@ -1177,6 +1225,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
 
   def idx_chunk(head_group, batch, chunk, chunk_seg_ids_ref):
     return (head_group, batch, NT - 1 - chunk, 0, 0)
+
 
   def idx_state(head_group, batch, chunk, chunk_seg_ids_ref):
     chunk_id = NT - 1 - chunk
@@ -1187,8 +1236,12 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   dht_arr = dht_arr.transpose(2, 0, 1, 3, 4)
 
   qk_spec = pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk)
+  g_spec = (
+    pl.BlockSpec((MB, 1, 1, 1, BT), index_map=idx_chunk) if scalar_gate
+    else pl.BlockSpec((MB, 1, 1, BT, GW), index_map=idx_chunk)
+  )
   v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
-  b_spec = pl.BlockSpec((MB, 1, 1, BT, 1), index_map=idx_chunk)
+  b_spec = pl.BlockSpec((MB, 1, 1, 1, BT), index_map=idx_chunk)
   A_spec = pl.BlockSpec((MB, 1, 1, BT, BT), index_map=idx_chunk)
   h_spec = pl.BlockSpec((MB, 1, 1, K, V), index_map=idx_chunk)
   state_spec = pl.BlockSpec((MB, 1, 1, K, V), index_map=idx_state)
@@ -1196,6 +1249,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   kernel = partial(
     _fused_dhu_wy_intra_cumsum_kernel,
     scale=scale,
+    per_channel_gate=per_channel_gate,
     BT=BT,
     K=K,
     V=V,
@@ -1207,8 +1261,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, BT, V), jnp.float32),
-    jax.ShapeDtypeStruct((H, B, NT, BT, 1), jnp.float32),
-    jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
+    jax.ShapeDtypeStruct((H, B, NT, 1, BT), jnp.float32),
+    jax.ShapeDtypeStruct((H, B, NT, 1, BT), jnp.float32) if scalar_gate
+    else jax.ShapeDtypeStruct((H, B, NT, BT, GW), jnp.float32),
     jax.ShapeDtypeStruct((H, B, N, K, V), jnp.float32),
   ]
 
@@ -1226,7 +1281,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         qk_spec,
         qk_spec,
         qk_spec,
-        qk_spec,
+        g_spec,
         b_spec,
         A_spec,
         h_spec,
@@ -1235,7 +1290,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         A_spec,
         state_spec,
       ],
-      out_specs=[qk_spec, qk_spec, v_spec, b_spec, qk_spec, state_spec],
+      out_specs=[qk_spec, qk_spec, v_spec, b_spec, g_spec, state_spec],
       scratch_shapes=[dh_tmp],
     ),
     compiler_params=pltpu.CompilerParams(
@@ -1269,7 +1324,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     dk_r.reshape(H, B, T, K),
     dv_r.reshape(H, B, T, V),
     db_r.reshape(H, B, T),
-    dg_r.reshape(H, B, T, K),
+    dg_r.reshape(H, B, T, GW),
     dh0_out,
   )
 
@@ -1400,7 +1455,9 @@ def chunk_kda_bwd_dAv_kernel(
     in_bytes = (2 * BT * V + BT * BT) * elem_size
     out_bytes = (BT * BT * 4 + BT * V * 2)
     per_chunk = in_bytes + out_bytes
-    MB = estimate_mini_batch(per_chunk, total, max_mb=32)
+    # Pin MB=1 when BT > 64 so MB * BT stays within the 128-wide MXU limit.
+    max_mb = 1 if BT > 64 else 32
+    MB = estimate_mini_batch(per_chunk, total, max_mb=max_mb)
   else:
     MB = mini_batch
     assert total % MB == 0, f"total={total} must be divisible by mini_batch={MB}"
@@ -1475,6 +1532,7 @@ def chunk_kda_bwd_dAv_kernel(
     "chunk_size",
     "max_num_segments",
     "has_initial_state",
+    "per_channel_gate",
   ],
 )
 @jaxtyping.jaxtyped
@@ -1493,11 +1551,13 @@ def chunk_kda_bwd_custom(
         Float[Array, "H B T_ORIG V"],
         Float[Array, "B H K V"] | Float[Array, "B N H K V"] | None,
     ],
+    *,
+    per_channel_gate: bool = True,
 ) -> tuple[
     Float[Array, "H B T_ORIG K"],
     Float[Array, "H B T_ORIG K"],
     Float[Array, "H B T_ORIG V"],
-    Float[Array, "H B T_ORIG K"],
+    Float[Array, "H B T_ORIG GW"],
     Float[Array, "H B T_ORIG"],
     Float[Array, "H"] | None,
     Float[Array, "H*K"] | None,
@@ -1648,13 +1708,19 @@ def chunk_kda_bwd_custom(
       raise ValueError(f"saved h has NT={h.shape[2]}, expected {NT}")
 
     # M1 fusion: recompute w/qg/kg + v_new in one kernel (no u HBM round-trip).
+    # Broadcast scalar gate to key width K for the recompute helper.
+    assert g is not None
+    g_wide = (
+      g if g.shape[-1] == q.shape[-1]
+      else jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
+    )
     w, qg, kg, v_new = fused_recompute_w_u_vnew_from_h_pallas(
       q=q,
       k=k,
       v=v,
       beta=beta,
       A=Akk,
-      g=g,
+      g=g_wide,
       h=h,
       chunk_size=BT,
     )
@@ -1687,12 +1753,15 @@ def chunk_kda_bwd_custom(
     if kg is None:
       raise RuntimeError("KDA recompute did not produce gated keys.")
 
-    # chunk_gated_delta_rule_fwd_h expects [B,T,H,X]
+    # Pass scalar gates via `g` with plain keys `k`; pass per-channel gates via `gk` with gated keys `kg`.
+    assert g is not None
+    scalar_gate = g.shape[-1] == 1
     h, v_new, _ = chunk_gated_delta_rule_fwd_h(
-      k=kg,
+      k=k if scalar_gate else kg,
       w=w,
       u=u,
-      gk=g,
+      g=g[..., 0] if scalar_gate else None,
+      gk=None if scalar_gate else g,
       initial_state=initial_state,
       output_final_state=False,
       chunk_size=chunk_size,
@@ -1796,6 +1865,7 @@ def chunk_kda_bwd_custom(
     dht = dht[:, None, :, :, :]
   dht_m4 = dht
   dq, dk, dv, db, dg, dh0 = _fused_dhu_wy_intra_cumsum_pallas_jit(
+      per_channel_gate=per_channel_gate,
     q=q,
     k=k,
     v=v,
