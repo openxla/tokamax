@@ -115,15 +115,14 @@ def calculate_tgmm_tiling(
     lhs_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
     rhs_bytes = jax.dtypes.itemsize_bits(rhs_cfgs.dtype) // 8
     num_buffers = 2
-    # For lhs, we use (num_buffers+1). +1 is needed because we are doing
-    # lhs.T @ rhs, lhs cannot be fed directly into MXU and has to go through
-    # XLU's transpose. in order to reduce redundant XLU computation, instead
-    # of performing XLU's transpose every time lhs is pushed into XLU, it
-    # caches the transposed value into VMEM. this increases VMEM requirement.
+    # Account for double-buffered LHS/RHS, transposed caching, and the in-kernel
+    # lhs_masked/rhs_masked scratch arrays in tgmm_inner_kernel.
+    # For lhs: num_buffers (HBM load) + 1 (transposed cache) + 1 (lhs_masked).
+    # For rhs: num_buffers (HBM load) + 1 (rhs_masked).
     budget = (
         tile_k * tile_n * (acc_bytes + num_buffers * out_bytes)
-        + (num_buffers + 1) * (tile_m * tile_k * lhs_bytes)
-        + num_buffers * (tile_m * tile_n * rhs_bytes)
+        + (num_buffers + 2) * (tile_m * tile_k * lhs_bytes)
+        + (num_buffers + 1) * (tile_m * tile_n * rhs_bytes)
         # Reserve VMEM for zero_ref. Use the upper bound target_zero_ref_bytes
         # since the actual zero_ref size depends on out_dtype/size_k and is
         # always <= this value.
@@ -148,11 +147,6 @@ def calculate_tgmm_tiling(
     if tile_n < tile_n_lower_bound or tile_n >= prev_tile_n:
       break
     prev_tile_n = tile_n
-
-  if tile_n >= tile_n_lower_bound and within_vmem_limit(tile_m, tile_k, tile_n):
-    return gmm_v2.TileSizes(
-        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
-    )
 
   if tile_n < tile_n_lower_bound:
     num_n_tiles -= 1
@@ -181,8 +175,19 @@ def calculate_tgmm_tiling(
         f"Could not find valid tile sizes for tgmm. dims={dims},"
         f" tiles=({tile_m},{tile_k},{tile_n}), vmem={vmem_limit_bytes}"
     )
+
+  max_num_buckets = 4
+  bucket_base = tile_m
+  for _ in range(1, max_num_buckets):
+    new_tile_m = tile_m + bucket_base
+    if new_tile_m > dims.size_m:
+      break
+    if not within_vmem_limit(new_tile_m, tile_k, tile_n):
+      break
+    tile_m = new_tile_m
+
   return gmm_v2.TileSizes(
-      tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=tile_m
+      tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
   )
 
 
@@ -267,6 +272,10 @@ def make_tgmm_configs(
         dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, out_dtype, acc_dtype,
         target_zero_ref_bytes,
     )
+  assert tiles.tile_m % tiles.bucket_base == 0, (
+      f"tile_m ({tiles.tile_m}) must be divisible by bucket_base"
+      f" ({tiles.bucket_base})"
+  )
 
   return gmm_v2.GmmConfigs(
       dims=dims,
@@ -317,29 +326,33 @@ def tgmm_inner_kernel(
   tiled_rhs_ref = tiled_rhs_ref.value.reshape(-1, tiled_rhs_ref.value.shape[-1])
   gm_id = pl.program_id(2)
 
-  def _matmul(is_new_group: bool, is_group_changing: bool):
+  # Mask out invalid rows in the LHS/RHS tiles.
+  # The DMA loads tiles aligned to sublane boundaries, but the actual group
+  # data may not start/end on those boundaries.
+  m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+  m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+  m_offset = m_start - m_start % cfgs.dims.size_lhs_sublane
+  m_start_local = m_start - m_offset
+  m_end_local = m_end - m_offset
 
-    # Mask out invalid rows in the LHS/RHS tiles.
-    # The DMA loads tiles aligned to sublane boundaries, but the actual group
-    # data may not start/end on those boundaries.
-    m_start = metadata_ref.gm_id_to_m_offset[gm_id]
-    m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
-    m_offset = m_start - m_start % cfgs.dims.size_lhs_sublane
-    m_start_local = m_start - m_offset
-    m_end_local = m_end - m_offset
-    lhs_iota = lax.broadcasted_iota(jnp.int32, tiled_lhs_ref.shape, 0)
+  def _matmul(is_new_group: bool, is_group_changing: bool, bucket_m: int):
+    lhs_iota = lax.broadcasted_iota(
+        jnp.int32, (bucket_m, tiled_lhs_ref.shape[-1]), 0
+    )
     lhs_mask = jnp.logical_and(
         m_start_local <= lhs_iota, lhs_iota < m_end_local
     )
-    lhs_masked = jnp.where(lhs_mask, tiled_lhs_ref[...], 0)
+    lhs_masked = jnp.where(lhs_mask, tiled_lhs_ref[:bucket_m], 0)
     # If there are no NaNs, masking both lhs and rhs shouldn't be necessary.
     # But without masking both, we sometimes see the result contain NaNs so we
     # decide to mask both to be safe.
-    rhs_iota = lax.broadcasted_iota(jnp.int32, tiled_rhs_ref.shape, 0)
+    rhs_iota = lax.broadcasted_iota(
+        jnp.int32, (bucket_m, tiled_rhs_ref.shape[-1]), 0
+    )
     rhs_mask = jnp.logical_and(
         m_start_local <= rhs_iota, rhs_iota < m_end_local
     )
-    rhs_masked = jnp.where(rhs_mask, tiled_rhs_ref[...], 0)
+    rhs_masked = jnp.where(rhs_mask, tiled_rhs_ref[:bucket_m], 0)
 
     acc = jax.lax.dot_general(
         lhs_masked,
@@ -360,22 +373,6 @@ def tgmm_inner_kernel(
     else:
       acc_ref[...] = acc
 
-  @jax.named_scope("matmul_new_group_and_changing")
-  def matmul_new_group_and_changing():
-    _matmul(is_new_group=True, is_group_changing=True)
-
-  @jax.named_scope("matmul_new_group")
-  def matmul_new_group():
-    _matmul(is_new_group=True, is_group_changing=False)
-
-  @jax.named_scope("matmul")
-  def matmul():
-    _matmul(is_new_group=False, is_group_changing=False)
-
-  @jax.named_scope("matmul_group_changing")
-  def matmul_group_changing():
-    _matmul(is_new_group=False, is_group_changing=True)
-
   prev_gm_id = jnp.where(gm_id > 0, gm_id - 1, 0)
   is_first_gm = gm_id == 0
   group_id_changed = (
@@ -390,25 +387,55 @@ def tgmm_inner_kernel(
   cur_group_id = metadata_ref.gm_id_to_group_id[gm_id]
   group_is_changing = jnp.logical_or(is_last_gm, cur_group_id != next_group_id)
 
-  lax.cond(
-      new_group,
-      lambda: lax.cond(
-          group_is_changing,
-          # gm_id is the only one in its group =>
-          # group_size + local_offset ≤ tile_m.
-          matmul_new_group_and_changing,
-          # matmul_new_group: first gm_id of a multi-gm group =>
-          # group spans ≥ 2 gm_ids.
-          matmul_new_group,
-      ),
-      lambda: lax.cond(
-          group_is_changing,
-          # matmul_group_changing: last gm_id of a multi-gm group.
-          matmul_group_changing,
-          # matmul: middle gm_id => group spans ≥ 3 gm_ids =>
-          # group_size + local_offset > 2*tile_m.
-          matmul,
-      ),
+  def run_matmul_step(bucket_m: int):
+    @jax.named_scope(f"bm{bucket_m}_matmul_new_group_and_changing")
+    def matmul_new_group_and_changing():
+      _matmul(is_new_group=True, is_group_changing=True, bucket_m=bucket_m)
+
+    @jax.named_scope(f"bm{bucket_m}_matmul_new_group")
+    def matmul_new_group():
+      _matmul(is_new_group=True, is_group_changing=False, bucket_m=bucket_m)
+
+    @jax.named_scope(f"bm{bucket_m}_matmul")
+    def matmul():
+      _matmul(is_new_group=False, is_group_changing=False, bucket_m=bucket_m)
+
+    @jax.named_scope(f"bm{bucket_m}_matmul_group_changing")
+    def matmul_group_changing():
+      _matmul(is_new_group=False, is_group_changing=True, bucket_m=bucket_m)
+
+    lax.cond(
+        new_group,
+        lambda: lax.cond(
+            group_is_changing,
+            # gm_id is the only one in its group =>
+            # group_size + local_offset ≤ tile_m.
+            matmul_new_group_and_changing,
+            # matmul_new_group: first gm_id of a multi-gm group =>
+            # group spans ≥ 2 gm_ids.
+            matmul_new_group,
+        ),
+        lambda: lax.cond(
+            group_is_changing,
+            # matmul_group_changing: last gm_id of a multi-gm group.
+            matmul_group_changing,
+            # matmul: middle gm_id => group spans ≥ 3 gm_ids =>
+            # group_size + local_offset > 2*tile_m.
+            matmul,
+        ),
+    )
+
+  # Dispatch to dynamic M-buckets to skip zero-masked padding rows on boundary
+  # tiles. lax.switch clamps the index so full tiles select the last bucket.
+  bucket_base = cfgs.tiles.bucket_base
+  num_buckets = cfgs.tiles.tile_m // bucket_base
+  bucket_idx = jnp.maximum(0, (m_end_local - 1) // bucket_base)
+  lax.switch(
+      bucket_idx,
+      [
+          functools.partial(run_matmul_step, bucket_m=bucket_base * (i + 1))
+          for i in range(num_buckets)
+      ],
   )
 
 

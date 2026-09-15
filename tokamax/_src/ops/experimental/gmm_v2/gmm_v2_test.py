@@ -487,6 +487,65 @@ class GmmTest(parameterized.TestCase):
       out_size=[512],
       num_groups=[4],
       group_offset=[0],
+      tile_k=[256, 512],
+      tile_n=[256, 512],
+      bucket_base=[64, 256],
+  )
+  @pytest.mark.long
+  def test_tgmm_bucketing(
+      self,
+      batch_size,
+      in_size,
+      out_size,
+      num_groups,
+      group_offset,
+      tile_k,
+      tile_n,
+      bucket_base,
+  ):
+    """Verifies TGMM dynamic M-bucketing with num_buckets==1 and >1 across num_k=1,2 and num_n=1,2."""
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+    key1, key2 = jax.random.split(key, 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset_arr = jnp.array(group_offset, dtype=jnp.int32)
+
+    lhs_t = lhs.swapaxes(0, 1)
+    expected = reference_tgmm(
+        lhs_t,
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset_arr,
+    )
+
+    tile_m = 256
+    tile_info = gmm_v2.TileSizes(
+        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
+    )
+    tgmm_v2.validate_tgmm_inputs(
+        group_sizes, num_local_groups, group_offset_arr
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset_arr,
+        preferred_element_type=jnp.bfloat16,
+        tile_info=tile_info,
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
+      num_groups=[4],
+      group_offset=[0],
       empty_group_index=[0, 1],
   )
   @pytest.mark.long
