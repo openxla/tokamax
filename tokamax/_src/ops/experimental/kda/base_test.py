@@ -340,7 +340,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "Unknown implementation"):
       with jaxtyping.disable_jaxtyping():
         api.kimi_delta_attention(
-            q, k, v, g, beta, implementation="xla_chunked"
+            q, k, v, g, beta, implementation="unknown"
         )
 
 
