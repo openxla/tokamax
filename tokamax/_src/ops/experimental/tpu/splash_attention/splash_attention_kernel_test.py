@@ -852,6 +852,8 @@ def _get_dropout_mask(
     kv_seq_len: int,
     config: splash.SplashConfig,
     prng_key: jax.Array,
+    *,
+    dropout_rate: float,
     bq: int | None = None,
     bkv_compute: int | None = None,
 ) -> jax.Array:
@@ -886,7 +888,7 @@ def _get_dropout_mask(
             bkv_compute=bkv_compute,
             canonical_q=canonical_q,
             canonical_kv=canonical_kv,
-            dropout_rate=config.dropout_rate,
+            dropout_rate=dropout_rate,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -931,6 +933,8 @@ def _restated_dropout_mask(
     kv_seq_len: int,
     config: splash.SplashConfig,
     prng_key: jax.Array,
+    *,
+    dropout_rate: float,
 ) -> jax.Array:
   """Second statement of the dropout derivation, for `_get_dropout_mask`.
 
@@ -960,7 +964,7 @@ def _restated_dropout_mask(
           _restated_dropout_mask_kernel,
           bq=bq,
           bkv=bkv,
-          dropout_rate=config.dropout_rate,
+          dropout_rate=dropout_rate,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=1,
@@ -999,7 +1003,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
       self.skipTest("Only supported on TPUs.")
     super().setUp()
 
-  def _config(self, dropout_rate: float, **kwargs) -> splash.SplashConfig:
+  def _config(self, dropout_rate: float = 0.0, **kwargs) -> splash.SplashConfig:
     block = self.BLOCK
     if dropout_rate > 0:
       kwargs.setdefault("dropout_block_q", block)
@@ -1011,7 +1015,6 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
         block_q_dkv=block,
         block_kv_dkv=block,
         block_kv_dkv_compute=block,
-        dropout_rate=dropout_rate,
         use_base2_exp=False,
         interpret=self.INTERPRET,
         **kwargs,
@@ -1033,20 +1036,29 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     shape = (self.SEQ_LEN, self.SEQ_LEN)
     return mask_lib.CausalMask(shape) if is_causal else mask_lib.FullMask(shape)
 
-  def _attn(self, mask, config, is_mqa, is_dynamic_mask=False):
+  def _attn(
+      self,
+      mask,
+      config,
+      is_mqa,
+      is_dynamic_mask=False,
+      dropout_rate: float = 0.0,
+  ):
     if is_dynamic_mask:
       make_fn = (
           splash.make_dynamic_splash_mqa
           if is_mqa
           else splash.make_dynamic_splash_mha
       )
-      return make_fn(jnp.array(mask[:, :]), config=config)
+      return make_fn(
+          jnp.array(mask[:, :]), config=config, dropout_rate=dropout_rate
+      )
     make_fn = (
         splash.make_splash_mqa_single_device
         if is_mqa
         else splash.make_splash_mha_single_device
     )
-    return make_fn(mask, config=config)
+    return make_fn(mask, config=config, dropout_rate=dropout_rate)
 
   @parameterized.product(
       dropout_rate=(0.1, 0.5),
@@ -1058,7 +1070,9 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     q, k, v, _ = self._inputs(is_mqa)
     mask = self._mask(is_causal)
     config = self._config(dropout_rate)
-    attn = self._attn(mask, config, is_mqa, is_dynamic_mask)
+    attn = self._attn(
+        mask, config, is_mqa, is_dynamic_mask, dropout_rate=dropout_rate
+    )
     prng_key = random.key(1234)
 
     o = jax.jit(partial(attn, prng_key=prng_key))(q, k, v)
@@ -1069,6 +1083,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
             self.SEQ_LEN,
             self.SEQ_LEN,
             config,
+            dropout_rate=dropout_rate,
         )
     )(prng_key)
     o_ref = base.attention_reference(
@@ -1106,7 +1121,9 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     mask = self._mask(is_causal=True)
     dense_mask = jnp.array(mask[:, :])
     config = self._config(dropout_rate)
-    attn = self._attn(mask, config, is_mqa, is_dynamic_mask)
+    attn = self._attn(
+        mask, config, is_mqa, is_dynamic_mask, dropout_rate=dropout_rate
+    )
     prng_key = random.key(1234)
     dropout_mask = jax.jit(
         partial(
@@ -1115,6 +1132,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
             self.SEQ_LEN,
             self.SEQ_LEN,
             config,
+            dropout_rate=dropout_rate,
         )
     )(prng_key)
 
@@ -1154,13 +1172,15 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     """rate=0 must leave the kernel bit-identical, key or no key."""
     q, k, v, _ = self._inputs()
     mask = self._mask(is_causal=True)
-    attn = self._attn(mask, self._config(0.0), is_mqa=False)
+    attn = self._attn(mask, self._config(0.0), is_mqa=False, dropout_rate=0.0)
     o_no_key = jax.jit(attn)(q, k, v)
     o_with_key = jax.jit(partial(attn, prng_key=random.key(1234)))(q, k, v)
     self._assert_array_equal(o_no_key, o_with_key)
 
     # ... and it must differ from a run that actually drops.
-    dropout_attn = self._attn(mask, self._config(0.25), is_mqa=False)
+    dropout_attn = self._attn(
+        mask, self._config(0.25), is_mqa=False, dropout_rate=0.25
+    )
     o_dropout = jax.jit(partial(dropout_attn, prng_key=random.key(1234)))(
         q, k, v
     )
@@ -1169,7 +1189,9 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
   def test_dropout_is_deterministic_in_the_key(self):
     """Same key -> bit-identical; different key -> a different mask."""
     q, k, v, _ = self._inputs()
-    attn = self._attn(self._mask(is_causal=True), self._config(0.25), False)
+    attn = self._attn(
+        self._mask(is_causal=True), self._config(0.25), False, dropout_rate=0.25
+    )
     run = lambda key: jax.jit(partial(attn, prng_key=key))(q, k, v)
     self._assert_array_equal(run(random.key(1234)), run(random.key(1234)))
     self.assertGreater(
@@ -1188,7 +1210,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     q, k, v, do = self._inputs()
     mask = self._mask(is_causal=True)
     config = self._config(dropout_rate)
-    attn = self._attn(mask, config, is_mqa=False)
+    attn = self._attn(mask, config, is_mqa=False, dropout_rate=dropout_rate)
     prng_key = random.key(7)
     dropout_mask = jax.jit(
         partial(
@@ -1197,6 +1219,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
             self.SEQ_LEN,
             self.SEQ_LEN,
             config,
+            dropout_rate=dropout_rate,
         )
     )(prng_key)
 
@@ -1222,14 +1245,18 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
 
   def test_dropout_without_a_key_raises(self):
     q, k, v, _ = self._inputs()
-    attn = self._attn(self._mask(is_causal=True), self._config(0.25), False)
+    attn = self._attn(
+        self._mask(is_causal=True), self._config(0.25), False, dropout_rate=0.25
+    )
     with self.assertRaisesRegex(ValueError, "prng_key is required"):
       jax.jit(attn)(q, k, v)
 
   def test_invalid_dropout_rate_raises(self):
+    mask = self._mask(is_causal=True)
+    config = self._config(0.0)
     for rate in (-0.1, 1.0, 1.5):
       with self.assertRaisesRegex(ValueError, "dropout_rate must be in"):
-        self._config(rate)
+        self._attn(mask, config, False, dropout_rate=rate)
 
   def _mismatched_config(self, dropout_rate, fwd_mult, bwd_mult, **kwargs):
     block = self.BLOCK
@@ -1244,7 +1271,6 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
         block_q_dkv=bwd_mult * block,
         block_kv_dkv=bwd_mult * block,
         block_kv_dkv_compute=bwd_mult * block,
-        dropout_rate=dropout_rate,
         use_base2_exp=False,
         interpret=self.INTERPRET,
         **kwargs,
@@ -1266,11 +1292,14 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     block indices are then 0, so scaling them into canonical units is a no-op
     and that tiling cannot tell a correct scaling from a missing one.
     """
-    config = self._config(0.5)
+    dropout_rate = 0.5
+    config = self._config(dropout_rate)
     extent = 4 * self.SEQ_LEN
     args = (self.NUM_HEADS, extent, extent, config)
     key = random.key(3)
-    reference = jax.jit(partial(_get_dropout_mask, *args))(key)
+    reference = jax.jit(
+        partial(_get_dropout_mask, *args, dropout_rate=dropout_rate)
+    )(key)
     block = self.BLOCK
     for bq_mult, bkv_mult in ((2, 1), (1, 2), (2, 2), (4, 4)):
       with self.subTest(f"{bq_mult}x{bkv_mult}"):
@@ -1278,6 +1307,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
             partial(
                 _get_dropout_mask,
                 *args,
+                dropout_rate=dropout_rate,
                 bq=bq_mult * block,
                 bkv_compute=bkv_mult * block,
             )
@@ -1297,7 +1327,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     q, k, v, do = self._inputs()
     mask = self._mask(is_causal=True)
     config = self._mismatched_config(dropout_rate, fwd_mult, bwd_mult)
-    attn = self._attn(mask, config, is_mqa=False)
+    attn = self._attn(mask, config, is_mqa=False, dropout_rate=dropout_rate)
     prng_key = random.key(7)
     dropout_mask = jax.jit(
         partial(
@@ -1306,6 +1336,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
             self.SEQ_LEN,
             self.SEQ_LEN,
             config,
+            dropout_rate=dropout_rate,
         )
     )(prng_key)
 
@@ -1354,7 +1385,6 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
             block_q_dkv=bq_d,
             block_kv_dkv=bkv_d,
             block_kv_dkv_compute=bkv_dc,
-            dropout_rate=0.1,
             dropout_block_q=gq,
             dropout_block_kv=gkv,
         )
@@ -1372,7 +1402,6 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
           block_q_dkv=block + block // 2,
           block_kv_dkv=block,
           block_kv_dkv_compute=block,
-          dropout_rate=0.25,
           dropout_block_q=block,
           dropout_block_kv=block,
       )
@@ -1385,7 +1414,8 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
 
   def test_get_dropout_mask_is_blockwise_and_head_dependent(self):
     """Different (head, q block, kv block) tiles must get independent draws."""
-    config = self._config(0.5)
+    dropout_rate = 0.5
+    config = self._config(dropout_rate)
     mask = jax.jit(
         partial(
             _get_dropout_mask,
@@ -1393,6 +1423,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
             self.SEQ_LEN,
             self.SEQ_LEN,
             config,
+            dropout_rate=dropout_rate,
         )
     )(random.key(0))
     self.assertEqual(mask.shape, (self.NUM_HEADS, self.SEQ_LEN, self.SEQ_LEN))
@@ -1419,8 +1450,12 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
         config = self._config(rate)
         args = (self.NUM_HEADS, self.SEQ_LEN, self.SEQ_LEN, config)
         key = random.key(7)
-        actual = jax.jit(partial(_get_dropout_mask, *args))(key)
-        expected = jax.jit(partial(_restated_dropout_mask, *args))(key)
+        actual = jax.jit(
+            partial(_get_dropout_mask, *args, dropout_rate=rate)
+        )(key)
+        expected = jax.jit(
+            partial(_restated_dropout_mask, *args, dropout_rate=rate)
+        )(key)
         self._assert_array_equal(actual, expected)
 
   def test_reference_vjp_matches_autodiff_under_dropout(self):
@@ -1446,6 +1481,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
             self.SEQ_LEN,
             self.SEQ_LEN,
             self._config(dropout_rate),
+            dropout_rate=dropout_rate,
         )
     )(random.key(11))
 
