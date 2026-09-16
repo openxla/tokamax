@@ -56,10 +56,21 @@ def _resolve_safe_gate(
 def _check_supported(
     query: jax.Array,
     *,
+    use_gate_in_kernel: bool,
+    lower_bound: float | None,
+    safe_gate: bool,
     segment_ids: jax.Array | None,
     context_parallel_metadata: ContextParallelMetadataArg,
     chunk_size: int,
 ) -> None:
+  if not use_gate_in_kernel:
+    raise NotImplementedError(
+        "`xla_chunked` requires `use_gate_in_kernel=True`."
+    )
+  if lower_bound is None:
+    raise NotImplementedError("`xla_chunked` requires `lower_bound` to be set.")
+  if not safe_gate:
+    raise NotImplementedError("`xla_chunked` requires `safe_gate=True`.")
   if chunk_size != 64:
     raise NotImplementedError("`xla_chunked` currently supports chunk_size=64.")
   if segment_ids is None and query.shape[2] % chunk_size:
@@ -118,8 +129,16 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
       config: Config,
   ) -> tuple[base.Output, None]:
     del return_residuals
+    safe_gate = _resolve_safe_gate(
+        config,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+    )
     _check_supported(
         query,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        safe_gate=safe_gate,
         segment_ids=segment_ids,
         context_parallel_metadata=context_parallel_metadata,
         chunk_size=config.chunk_size,
@@ -142,11 +161,7 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
         lower_bound=lower_bound,
         max_num_segments=max_num_segments,
         chunk_size=config.chunk_size,
-        safe_gate=_resolve_safe_gate(
-            config,
-            use_gate_in_kernel=use_gate_in_kernel,
-            lower_bound=lower_bound,
-        ),
+        safe_gate=safe_gate,
     )
     return output, None
 
@@ -193,16 +208,19 @@ class XlaChunkedKimiDeltaAttentionVjp(op.Op[Any, dict[str, Any], None, Config, A
       config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
     del residuals, out, return_residuals
-    _check_supported(
-        query,
-        segment_ids=segment_ids,
-        context_parallel_metadata=context_parallel_metadata,
-        chunk_size=config.chunk_size,
-    )
     safe_gate = _resolve_safe_gate(
         config,
         use_gate_in_kernel=use_gate_in_kernel,
         lower_bound=lower_bound,
+    )
+    _check_supported(
+        query,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        safe_gate=safe_gate,
+        segment_ids=segment_ids,
+        context_parallel_metadata=context_parallel_metadata,
+        chunk_size=config.chunk_size,
     )
     dq, dk, dv, dg, db, da, dbias, dh0 = chunk_kda_bwd(
         query,

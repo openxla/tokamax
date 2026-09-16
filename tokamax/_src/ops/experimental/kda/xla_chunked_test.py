@@ -94,11 +94,46 @@ class XlaChunkedKimiDeltaAttentionTest(parameterized.TestCase):
     self.assertEqual(vjp._get_heuristics_config(None), expected)
     self.assertEqual(vjp._get_autotuning_configs(None), {expected})
 
-  @parameterized.parameters(False, True)
-  def test_fixed_forward_matches_recurrence(self, use_gate_in_kernel):
+  def test_fixed_forward_matches_recurrence(self):
     args = _make_inputs()
-    expected = _call("xla", *args, use_gate_in_kernel=use_gate_in_kernel)
-    actual = _call("xla_chunked", *args, use_gate_in_kernel=use_gate_in_kernel)
+    expected = _call("xla", *args, use_gate_in_kernel=True)
+    actual = _call("xla_chunked", *args, use_gate_in_kernel=True)
+
+    chex.assert_trees_all_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+  @parameterized.named_parameters(
+      (
+          "preactivated_gate",
+          False,
+          -5.0,
+          True,
+          "use_gate_in_kernel=True",
+      ),
+      ("missing_lower_bound", True, None, True, "lower_bound.*set"),
+      ("unsafe_gate", True, -5.0, False, "safe_gate=True"),
+  )
+  def test_rejects_unsupported_gate_config(
+      self, use_gate_in_kernel, lower_bound, safe_gate, expected_error
+  ):
+    query = jnp.zeros((1, 1, 64, 1), dtype=jnp.float32)
+
+    with self.assertRaisesRegex(NotImplementedError, expected_error):
+      xla_chunked._check_supported(  # pylint: disable=protected-access
+          query,
+          use_gate_in_kernel=use_gate_in_kernel,
+          lower_bound=lower_bound,
+          safe_gate=safe_gate,
+          segment_ids=None,
+          context_parallel_metadata=None,
+          chunk_size=64,
+      )
+
+  def test_unsupported_gate_config_falls_back_to_xla(self):
+    args = _make_inputs()
+    expected = _call("xla", *args, use_gate_in_kernel=False)
+    actual = _call(
+        ("xla_chunked", "xla"), *args, use_gate_in_kernel=False
+    )
 
     chex.assert_trees_all_close(actual, expected, atol=2e-4, rtol=2e-4)
 
