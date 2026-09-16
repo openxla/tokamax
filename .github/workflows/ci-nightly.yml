@@ -142,4 +142,4 @@ jobs:
           python3.12 -m uv pip freeze
       - name: Test Tokamax ops with pytest
         run: |
-          pytest -s --ignore-glob="*/test_base.py" --ignore=tokamax/_src/ops/ tokamax
+          pytest -s --ignore-glob="*/test_base.py" --ignore-glob="*/torch_tpu/*" --ignore=tokamax/_src/ops/ tokamax
