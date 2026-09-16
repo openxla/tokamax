@@ -1318,6 +1318,20 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (batch_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  @parameterized.parameters([None, 25.0])
+  def test_situ_and_mul(self, linear_beta):
+    gate = jnp.asarray([-3.0, 0.5, 7.0])
+    up = jnp.asarray([-30.0, 2.0, 40.0])
+    expected_gate = 4.0 * jnp.tanh(gate / 4.0) * jax.nn.sigmoid(gate)
+    expected_up = (
+        up if linear_beta is None else linear_beta * jnp.tanh(up / linear_beta)
+    )
+
+    chex.assert_trees_all_close(
+        gmm_v2.situ_and_mul(gate, up, 4.0, linear_beta),
+        expected_gate * expected_up,
+    )
+
   @parameterized.product(
       batch_size=[128],
       in_size=[512],
@@ -1326,7 +1340,7 @@ class GmmTest(parameterized.TestCase):
       has_bias=[True, False],
       use_weight_scale=[True, False],
       maybe_quantize_lhs=[True, False],
-      fuse_act=["silu", "swigluoai", "gelu"],
+      fuse_act=["silu", "swigluoai", "gelu", "situ:4.0:none", "situ:4.0:25.0"],
       group_offset=[0, 2],
       block_size=[256, 512],
   )

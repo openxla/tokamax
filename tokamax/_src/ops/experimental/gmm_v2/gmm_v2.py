@@ -49,6 +49,15 @@ def silu_and_mul_with_clamp(
   return jax.nn.silu(gate) * up
 
 
+def situ_and_mul(
+    gate: jax.Array, up: jax.Array, beta: float, linear_beta: float | None
+) -> jax.Array:
+  gate = beta * jnp.tanh(gate / beta) * jax.nn.sigmoid(gate)
+  if linear_beta is not None:
+    up = linear_beta * jnp.tanh(up / linear_beta)
+  return gate * up
+
+
 def interleave_lane(lhs: jax.Array, rhs: jax.Array) -> jax.Array:
   """Interleaves two arrays along lane dim at zero-cost."""
   assert lhs.shape == rhs.shape
@@ -105,6 +114,10 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
       return swigluoai(acc_gate, acc_up)
     case "silu_and_mul_with_clamp":
       return silu_and_mul_with_clamp(acc_gate, acc_up)
+    case str() if fuse_act.startswith("situ:"):
+      _, beta, linear_beta = fuse_act.split(":")
+      linear_beta = None if linear_beta == "none" else float(linear_beta)
+      return situ_and_mul(acc_gate, acc_up, float(beta), linear_beta)
     case _:
       raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
