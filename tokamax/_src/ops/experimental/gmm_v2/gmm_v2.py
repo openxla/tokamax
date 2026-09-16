@@ -126,6 +126,13 @@ def align_to(x, a):
   return pl.cdiv(x, a) * a
 
 
+def _get_lhs_sublane_size(dtype: jnp.dtype, size_m: int) -> int:
+  """Sublane block size the kernel processes lhs rows in."""
+  size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(dtype)
+  size_lhs_sublane = min(size_lhs_sublane, size_m)
+  return size_lhs_sublane
+
+
 def get_packing_factor(
     storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None
 ) -> int:
@@ -1276,8 +1283,7 @@ def validate_inputs(
           "are not a supported combination."
       )
 
-  size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(lhs.dtype)
-  size_lhs_sublane = min(size_lhs_sublane, size_m)
+  size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
   if fuse_act is not None:
     num_lanes = pltpu.get_tpu_info().num_lanes
     if size_n % (2 * num_lanes) != 0:
@@ -1553,6 +1559,15 @@ def gmm_v2(
 
   del precision
 
+  # The kernel reshapes lhs by its sublane block, so pad the rows up to it.
+  # The extra rows sit past every group, so they add no work, and they are
+  # sliced back off the output below.
+  size_m = lhs.shape[0]
+  size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+  padded_size_m = align_to(size_m, size_lhs_sublane)
+  if padded_size_m != size_m:
+    lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
   else:
@@ -1683,7 +1698,9 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
-    )(group_sizes, group_offset, lhs_in, rhs_weights)[:, : cfgs.out_size_n]
+    )(group_sizes, group_offset, lhs_in, rhs_weights)[
+        :size_m, : cfgs.out_size_n
+    ]
 
   group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
@@ -1701,4 +1718,4 @@ def gmm_v2(
       name=get_scope_name(cfgs),
       cost_estimate=get_cost_estimate(cfgs),
       metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
-  )(group_sizes, group_offset, lhs_in, rhs_weights)[:, : cfgs.out_size_n]
+  )(group_sizes, group_offset, lhs_in, rhs_weights)[:size_m, : cfgs.out_size_n]

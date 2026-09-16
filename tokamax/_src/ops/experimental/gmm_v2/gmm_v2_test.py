@@ -235,6 +235,30 @@ class GmmTest(parameterized.TestCase):
     assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
+      batch_size=[73, 117],
+      disable_multi_core_mode=[False, True],
+  )
+  def test_gmm_unaligned_m(self, batch_size, disable_multi_core_mode):
+    in_size = 512
+    out_size = 512
+    num_groups = 16
+
+    key = jax.random.key(0)
+    k0, k1 = jax.random.split(key, 2)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    expected = reference_gmm(lhs, rhs, group_sizes)
+
+    with config.disable_multi_core_mode(disable_multi_core_mode):
+      actual = gmm_v2.gmm_v2(lhs, rhs, group_sizes)
+
+    self.assertEqual(actual.shape, (batch_size, out_size))
+    assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
       batch_size=[128],
       in_size=[512],
       out_size=[512],
