@@ -43,7 +43,7 @@ class GmmPerfTest(parameterized.TestCase):
     group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
@@ -85,7 +85,7 @@ class GmmPerfTest(parameterized.TestCase):
     group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
     grad_q, grad_scale = gmm_util.quantize_tensor(
-        grad, jnp.float8_e5m2, axis=0, block_size=m
+        grad, jnp.float8_e5m2, axis=0, block_size=m  # pyrefly: ignore[bad-argument-type]
     )
     grad_scale = jnp.expand_dims(grad_scale, axis=1)
 
@@ -172,7 +172,7 @@ class GmmPerfTest(parameterized.TestCase):
     group_sizes = jnp.full((num_groups,), m // num_groups, jnp.int32)
 
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 

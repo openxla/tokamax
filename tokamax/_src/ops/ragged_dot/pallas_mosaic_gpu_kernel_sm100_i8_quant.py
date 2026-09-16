@@ -58,7 +58,7 @@ def rescale_i32_tcgen05_acc(running_acc, acc, row_scale, col_scale):
           _TCGEN05_ROW,
           _TCGEN05_COL,
       ),
-      return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.float32, _TCGEN05),
+      return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.float32, _TCGEN05),  # pyrefly: ignore[bad-argument-type]
   )
   def rescale(
       _,

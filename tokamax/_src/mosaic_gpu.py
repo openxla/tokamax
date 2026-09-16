@@ -216,7 +216,7 @@ def int4_as_biased_f8e4m3fn(x, layout):
 
   @plgpu.inline_mgpu(
       arg_types=(layout,),
-      return_type=plgpu.ShapeDtypeStruct(x.shape, jnp.float8_e4m3fn, layout),
+      return_type=plgpu.ShapeDtypeStruct(x.shape, jnp.float8_e4m3fn, layout),  # pyrefly: ignore[bad-argument-type]
   )
   def encode(_, fa: mgpu.FragmentedArray):
     [vector_len] = ir.VectorType(fa.registers.flat[0].type).shape

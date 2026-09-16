@@ -49,7 +49,7 @@ def _alphafold_oss_inference_spec(
           'precision': jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
       },
       project='alphafold_3',
-      name=f'batch_1={batch_1}_batch_2={batch_2}_n_in={n_in}_n_out={n_out}_vmap_size={vmap_size}_activation={activation.__name__}_dtype={dtype.__name__}',
+      name=f'batch_1={batch_1}_batch_2={batch_2}_n_in={n_in}_n_out={n_out}_vmap_size={vmap_size}_activation={activation.__name__}_dtype={dtype.__name__}',  # pyrefly: ignore[missing-attribute]
       tags=('forward_only',),
   )
 

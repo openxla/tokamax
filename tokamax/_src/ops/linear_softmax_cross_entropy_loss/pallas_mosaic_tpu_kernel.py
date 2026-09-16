@@ -53,7 +53,7 @@ def _calculate_fwd_vmem_bytes(
     b_block_size: int,
     h_block_size: int,
     v_block_size: int,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
 ) -> int:
   """Calculates VMEM memory usage in bytes for the forward kernel."""
   dtype_bytes = jnp.dtype(dtype).itemsize
@@ -81,7 +81,7 @@ def _calculate_bwd_vmem_bytes(
     b_block_size: int,
     h_block_size: int,
     v_block_size: int,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
 ) -> int:
   """Calculates VMEM memory usage in bytes for the backward kernel."""
   dtype_bytes = jnp.dtype(dtype).itemsize
@@ -122,7 +122,7 @@ def _get_heuristic_config(
     v_dim: int,
     *,
     is_bwd: bool = False,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     vmem_limit_bytes: int | None = None,
 ) -> Config:
   """Calculates heuristic config based on VMEM size, dtype, and divisibility."""
@@ -293,7 +293,7 @@ def get_heuristic_fwd_config(
     b_dim: int,
     h_dim: int,
     v_dim: int,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     vmem_limit_bytes: int | None = None,
 ) -> Config:
   """Returns heuristic config for forward pass based on VMEM size and dtype."""
@@ -311,7 +311,7 @@ def get_heuristic_bwd_config(
     b_dim: int,
     h_dim: int,
     v_dim: int,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     vmem_limit_bytes: int | None = None,
 ) -> Config:
   """Returns heuristic config for backward pass based on VMEM size and dtype."""
@@ -874,7 +874,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
     h_block_size: int = 512,
     v_block_size: int = 2048,
     reduction: Literal["sum", "mean", "none"] = "sum",
-    preferred_element_type: jnp.dtype = jnp.float32,
+    preferred_element_type: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[Real[Scalar, ""] | Real[Array, "B"], Real[Array, "B"]]:
   """The pallas kernel implementation of linear softmax cross-entropy loss.
 
@@ -1454,7 +1454,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     h_block_size: int = 512,
     v_block_size: int = 2048,
     reduction: Literal["sum", "mean", "none"] = "sum",
-    preferred_element_type: jnp.dtype = jnp.float32,
+    preferred_element_type: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """Pallas kernel implementation of Linear Softmax Cross-Entropy Loss backward.
 

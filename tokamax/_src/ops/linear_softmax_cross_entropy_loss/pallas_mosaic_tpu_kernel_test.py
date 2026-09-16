@@ -702,7 +702,7 @@ class HeuristicConfigTest(parameterized.TestCase):
         b_dim=b_dim,
         h_dim=h_dim,
         v_dim=v_dim,
-        dtype=dtype,
+        dtype=dtype,  # pyrefly: ignore[bad-argument-type]
         vmem_limit_bytes=vmem_limit_bytes,
     )
     self.assertEqual(config, expected_config)
@@ -711,7 +711,7 @@ class HeuristicConfigTest(parameterized.TestCase):
         b_dim=b_dim,
         h_dim=h_dim,
         v_dim=v_dim,
-        dtype=dtype,
+        dtype=dtype,  # pyrefly: ignore[bad-argument-type]
         vmem_limit_bytes=vmem_limit_bytes,
     )
     self.assertEqual(op_config, expected_config)
@@ -724,7 +724,7 @@ class HeuristicConfigTest(parameterized.TestCase):
         config.b_block_size,
         config.h_block_size,
         config.v_block_size,
-        dtype=dtype,
+        dtype=dtype,  # pyrefly: ignore[bad-argument-type]
     )
     self.assertLessEqual(vmem_used, vmem_limit_bytes)
 
@@ -773,7 +773,7 @@ class HeuristicConfigTest(parameterized.TestCase):
         b_dim=b_dim,
         h_dim=h_dim,
         v_dim=v_dim,
-        dtype=dtype,
+        dtype=dtype,  # pyrefly: ignore[bad-argument-type]
         vmem_limit_bytes=vmem_limit_bytes,
     )
     self.assertEqual(config, expected_config)
@@ -782,7 +782,7 @@ class HeuristicConfigTest(parameterized.TestCase):
         b_dim=b_dim,
         h_dim=h_dim,
         v_dim=v_dim,
-        dtype=dtype,
+        dtype=dtype,  # pyrefly: ignore[bad-argument-type]
         vmem_limit_bytes=vmem_limit_bytes,
     )
     self.assertEqual(op_config, expected_config)
@@ -795,7 +795,7 @@ class HeuristicConfigTest(parameterized.TestCase):
         config.b_block_size,
         config.h_block_size,
         config.v_block_size,
-        dtype=dtype,
+        dtype=dtype,  # pyrefly: ignore[bad-argument-type]
     )
     self.assertLessEqual(vmem_used, vmem_limit_bytes)
 

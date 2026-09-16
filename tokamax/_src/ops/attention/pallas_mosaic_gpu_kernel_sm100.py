@@ -877,7 +877,7 @@ def flash_attention_kernel(
               | ((not normalize_output) & (ki == ub - 1))
           )
 
-          per_warp_type = plgpu.ShapeDtypeStruct((), jnp.bool_, _WG_SPLAT)
+          per_warp_type = plgpu.ShapeDtypeStruct((), jnp.bool_, _WG_SPLAT)  # pyrefly: ignore[bad-argument-type]
 
           @plgpu.inline_mgpu(arg_types=(_TMEM_ROW,), return_type=per_warp_type)
           def warp_any(_, needs_rescale):

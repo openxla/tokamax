@@ -26,9 +26,9 @@ def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
 def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
   match jnp.dtype(dtype).itemsize:
     case 4:
-      return jnp.int32
+      return jnp.int32  # pyrefly: ignore[bad-return]
     case 2:
-      return jnp.int16
+      return jnp.int16  # pyrefly: ignore[bad-return]
     case _:
       raise ValueError(f"Unsupported dtype: {dtype}")
 

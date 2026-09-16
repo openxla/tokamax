@@ -140,7 +140,7 @@ def mla_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    s_dtype: jnp.dtype = jnp.bfloat16,
+    s_dtype: jnp.dtype = jnp.bfloat16,  # pyrefly: ignore[bad-function-definition]
 ):
   """Performs Multi-Head Latent Attention.
 
