@@ -99,6 +99,9 @@ PYTEST_SELECT_FLAGS = (
     # Collecting it finds nothing, but it still has to be named here or the
     # coverage checks below would report it as running in no shard.
     '--ignore-glob=*/test_utils.py',
+    # 'torch_tpu' needs to be skipped for now until Tokamax can pull from their
+    # github repo with correct permissions.
+    '--ignore-glob=*/torch_tpu/*',
 )
 
 # The `--ignore-glob` patterns above, which the coverage checks need too: a
