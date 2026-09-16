@@ -499,6 +499,7 @@ SHARDS: ShardMap = {
     'ops-causal-conv1d': Spec(
         paths=(
             'tokamax/_src/ops/causal_conv1d_gated_delta_rule/base_test.py',
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/gdn_attention_v3_test.py',
             'tokamax/_src/ops/causal_conv1d_gated_delta_rule/pallas_mosaic_tpu_test.py',
         ),
         minutes=5,

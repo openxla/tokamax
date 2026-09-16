@@ -15,13 +15,11 @@
 """Pallas Mosaic TPU kernel implementation for Causal Conv1D Gated Delta Rule."""
 
 import dataclasses
-from typing import Any, Optional, override
+from typing import Optional, override
 
 import jax
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops import op
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import base
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import wrapper
@@ -50,16 +48,19 @@ class PallasMosaicTpuCausalConv1dGatedDeltaRule(
       state_indices: jax.Array,
       distribution: jax.Array,
       seq_lens: jax.Array,
+      read_state_indices: Optional[jax.Array] = None,
+      read_offsets: Optional[jax.Array] = None,
       *,
       n_kq: int,
       n_v: int,
       d_k: int,
       d_v: int,
       kernel_size: int,
+      num_spec_tokens: int = 0,
       zero_initialize_out: bool = True,
       compute_precision: jnp.dtype = jnp.float32.dtype,
-      decode_tile_size: int = 4,
-      mixed_tile_size: int = 64,
+      decode_tile_size: int | None = None,
+      mixed_tile_size: int | None = None,
       # TODO: Calculate tile size based on input dimensions.
       config: GDNConfig | None = None,
       return_residuals: bool = False,
@@ -80,11 +81,14 @@ class PallasMosaicTpuCausalConv1dGatedDeltaRule(
             state_indices=state_indices,
             distribution=distribution,
             seq_lens=seq_lens,
+            read_state_indices=read_state_indices,
+            read_offsets=read_offsets,
             n_kq=n_kq,
             n_v=n_v,
             d_k=d_k,
             d_v=d_v,
             kernel_size=kernel_size,
+            num_spec_tokens=num_spec_tokens,
             zero_initialize_out=zero_initialize_out,
             compute_precision=compute_precision,
             decode_tile_size=decode_tile_size,
