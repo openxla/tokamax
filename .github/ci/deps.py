@@ -50,9 +50,16 @@ PACKAGE_ROOT: Final[str] = 'tokamax'
 #                  `resources.files("tokamax")` in `_src/autotuning/cache.py`.
 #                  It decides which kernel configuration a test actually runs,
 #                  so it is a behavioural input with no import edge at all.
+#   __init__.py    executed by every import that passes through the package,
+#                  but never named by one. `from a.b import c` records edges to
+#                  `a.b` and `a.b.c`, so the package being imported *from* is
+#                  covered -- but `a`, and every package above it, is not, even
+#                  though python runs all of their `__init__.py` files first.
+#                  The missing edges are always ancestors, and an ancestor is
+#                  always a package, so the gap is exactly this file name.
 #
-# Both are named by the rules in `full_run_reason` rather than listed here;
-# this comment is what they are.
+# All three are named by the rules in `full_run_reason` rather than listed
+# here; this comment is what they are.
 
 # `all_test_files` in shards.py matches pytest's `python_files`; the same
 # universe, kept in one place there and mirrored here rather than imported, so
@@ -280,8 +287,11 @@ def full_run_reason(
 
   `known` is the file set the graph was built from. Changed paths absent from
   `known` represent deleted files. Most deletions do not force a full run
-  because `affected_tests` identifies their surviving referrers. However, a
-  deleted package `__init__.py` forces a full run.
+  because `affected_tests` identifies their surviving referrers.
+
+  Any `__init__.py` forces a full run whether it was edited or deleted, since
+  no import statement names one and the graph therefore under-reports what it
+  reaches. `known` only distinguishes the two in the reason string.
 
   `unparsed` is not checked against `changed`: it is a property of the graph,
   and forces a full run if the collection is non-empty
@@ -290,9 +300,9 @@ def full_run_reason(
     changed: Repo-relative paths of the changed files.
     unparsed: Files `ast` could not read, from `import_graph`. Any at all makes
       the whole graph untrustworthy.
-    known: The file set the graph was built from. `None` switches the
-      deleted-`__init__.py` rule off, which is only safe when the caller already
-      knows every changed path still exists.
+    known: The file set the graph was built from. `None` reports a changed
+      `__init__.py` as edited rather than deleted, which is only safe when the
+      caller already knows every changed path still exists.
 
   Returns:
     A human-readable reason to run every shard, or `None` if the changeset can
@@ -319,11 +329,20 @@ def full_run_reason(
       return f'{path} configures every test in the package'
     if not path.endswith('.py'):
       return f'{path} is package data, which no import edge covers'
-    # A deleted `__init__.py` forces a full run because removing package
-    # initialization alters how sibling modules resolve, potentially leaving
-    # implicit namespace packages with silently altered import semantics.
-    if known is not None and path not in known and _is_package_init(path):
-      return f'{path} was deleted, which re-resolves the whole package'
+    # An `__init__.py` is depended on by tree position, never by name, so the
+    # graph cannot answer for it: see the comment on the fail-open rules above.
+    # Deletion is called out separately because it is a different failure --
+    # `module_name` collapses an `__init__.py` to the package itself, so
+    # removing it does not retire one module, it changes how every sibling
+    # resolves, and leaves a namespace package behind so the imports that named
+    # it may still work rather than failing loudly.
+    if _is_package_init(path):
+      if known is not None and path not in known:
+        return f'{path} was deleted, which re-resolves the whole package'
+      return (
+          f'{path} is a package __init__.py, which every import through the'
+          ' package executes but none names'
+      )
   return None
 
 
