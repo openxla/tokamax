@@ -485,6 +485,83 @@ class GDNAttentionTest(parameterized.TestCase):
       out = l2norm_fn(x)
     self.assertEqual(out.dtype, jnp.bfloat16)
 
+  def _decode_args(self, num_seqs=8):
+    """Returns args for a decode-only batch (one token per sequence)."""
+    n_kq, n_v, d_k, d_v, kernel_size = 2, 8, 128, 128, 4
+    num_blocks = num_seqs + 1
+    rngs = iter(jax.random.split(jax.random.key(0), 8))
+    normal = lambda shape: jax.random.normal(next(rngs), shape, jnp.bfloat16)
+    qkv_dim = 2 * n_kq * d_k + n_v * d_v
+    return dict(
+        qkv=normal((num_seqs, qkv_dim)),
+        b=normal((num_seqs, n_v)),
+        a=normal((num_seqs, n_v)),
+        conv_state=jnp.zeros(
+            (num_blocks, kernel_size - 1, qkv_dim), jnp.bfloat16
+        ),
+        recurrent_state=jnp.zeros((num_blocks, n_v, d_k, d_v), jnp.bfloat16),
+        conv_weight=normal((qkv_dim, 1, kernel_size)),
+        conv_bias=normal((qkv_dim,)),
+        a_log=jax.random.normal(next(rngs), (n_v,)),
+        dt_bias=normal((n_v,)),
+        query_start_loc=jnp.arange(num_seqs + 1, dtype=jnp.int32),
+        state_indices=jnp.arange(1, num_blocks, dtype=jnp.int32),
+        # Decode-only: all `num_seqs` sequences are in the decode partition, so
+        # `wrapper.fused_conv1d_gdn` never launches the prefill kernel.
+        distribution=jnp.array([num_seqs] * 3, dtype=jnp.int32),
+        seq_lens=jnp.ones(num_seqs, dtype=jnp.int32),
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+    )
+
+  def test_heuristics_config(self):
+    op = pallas_mosaic_tpu.PallasMosaicTpuCausalConv1dGatedDeltaRule()
+    ba = op.bind(**self._decode_args())
+    self.assertIs(op.config_cls, pallas_mosaic_tpu.Config)
+    # The heuristics config must be fully concrete, so that the tile sizes
+    # recorded in the autotuning cache are the ones the kernel actually runs.
+    config = ba.heuristics_config
+    self.assertIsNotNone(config.decode_tile_size)
+    self.assertIsNotNone(config.mixed_tile_size)
+
+  def test_autotuning_configs(self):
+    num_seqs = 8
+    op = pallas_mosaic_tpu.PallasMosaicTpuCausalConv1dGatedDeltaRule()
+    ba = op.bind(**self._decode_args(num_seqs))
+    configs = ba.autotuning_configs
+
+    self.assertIn(ba.heuristics_config, configs)
+    # The prefill pass does not run for a decode-only batch, so only
+    # `decode_tile_size` is searched, and only up to the batch size.
+    tiles = {c.decode_tile_size for c in configs} - {None}
+    self.assertGreater(len(tiles), 1)
+    self.assertTrue(all(t <= num_seqs for t in tiles))
+
+  def test_autotune(self):
+    args = self._decode_args()
+    op = pallas_mosaic_tpu.PallasMosaicTpuCausalConv1dGatedDeltaRule()
+    ba = op.bind(**args)
+    # `cache_results=False` keeps the test from mutating the process-wide
+    # autotuning cache.
+    data = ba.autotune(ba.autotuning_configs, cache_results=False)
+
+    # Every config in the search space must compile and run on device.
+    self.assertEmpty({k: v for k, v in data.items() if isinstance(v, Exception)})
+
+    static_argnames = ("n_kq", "n_v", "d_k", "d_v", "kernel_size")
+    states, out = jax.jit(op, static_argnames=static_argnames)(**args)
+    tuned_op = op.replace(config=data.fastest_config)
+    tuned_states, tuned_out = jax.jit(tuned_op, static_argnames=static_argnames)(
+        **args
+    )
+
+    np.testing.assert_allclose(tuned_out, out, rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(tuned_states[0], states[0], rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(tuned_states[1], states[1], rtol=2e-2, atol=2e-2)
+
 
 class GDNSecurityTest(absltest.TestCase):
 
