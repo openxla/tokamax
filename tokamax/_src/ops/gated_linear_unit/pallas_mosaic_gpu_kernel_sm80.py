@@ -203,6 +203,10 @@ def gated_linear_unit(
         ms = pl.ds(mi * tile_m, tile_m)
         ns = pl.ds(ni * tile_n, tile_n)
         out_smem[...] = (proj * activation(gates)).astype(dtype)
-        out_gmem[ms, ns] = plgpu.layout_cast(out_smem[...], copy_layout)
+        out = plgpu.layout_cast(out_smem[...], copy_layout)
+        if jax.__version_info__ >= (0, 11, 2):
+          plgpu.store(out_gmem.at[ms, ns], out, optimized=False)
+        else:
+          out_gmem[ms, ns] = out
 
   return kernel(x, weights.reshape(k, 2 * n)).reshape(*orig_x_shape[:-1], n)
