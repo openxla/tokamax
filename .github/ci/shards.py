@@ -47,8 +47,10 @@ from collections.abc import Callable, Collection, Iterable, Sequence
 import fnmatch
 import json
 import os
+import re
 import shlex
 import sys
+import tomllib
 from typing import TypedDict
 
 # Sibling module, same directory, stdlib-only. This is the one direction the
@@ -138,6 +140,16 @@ THEMES = (
 # Test files intentionally run by no shard.
 EXCLUDED_TESTS = ()
 
+# The JAX versions CI tests. `latest_jax()` is what every ordinary shard job
+# installs; every version in `older_jaxs()` gets a compat rerun
+# on each of `COMPAT_RUNNERS`, so that a downstream still on
+# the older release is not broken by a change that only works on the newer one.
+JAX_VERSIONS = ('0.11.1', '0.11.0')
+
+# TODO: Enable the backward compatibility test for GPU kernels by
+# adding 'linux-x86-a3-8g-h100-1gpu' to COMPAT_RUNNERS.
+COMPAT_RUNNERS = ('linux-x86-tpu7x-56-1tpu',)
+
 
 class _RequiredSpec(TypedDict):
   """The part of a shard spec every shard has."""
@@ -160,8 +172,8 @@ class Spec(_RequiredSpec, total=False):
 # Shard name -> spec, as `SHARDS` and as `resolve_shards` returns it.
 ShardMap = dict[str, Spec]
 
-# One `strategy.matrix.include` entry: a (shard, runner) job. Every value is a
-# string because that is what the workflow interpolates.
+# One `strategy.matrix.include` entry: a (shard, runner, JAX version) job.
+# Every value is a string because that is what the workflow interpolates.
 MatrixEntry = dict[str, str]
 
 # This script describes what tests are in a given shard.
@@ -646,6 +658,59 @@ SHARDS: ShardMap = {
 _CATCH_ALL_SHARD = 'catch-all'
 
 
+# A `jax` or `jaxlib` requirement with a `>=` floor, with or without extras:
+# `jax>=0.11.0`, `jaxlib>=0.11.0`, `jax[tpu]>=0.11.0`, `jax[cuda13]>=0.11.0`.
+# Anchored by `fullmatch`, so `jaxtyping>=0.3` and `cuequivariance-jax>=0.10.0`
+# are not JAX requirements and do not match.
+_JAX_REQUIREMENT_RE = re.compile(r'(jax|jaxlib)(\[[^\]]*\])?>=([0-9][^,;\s]*)')
+
+
+def jax_floor(pyproject: str = 'pyproject.toml') -> str:
+  """Returns the oldest JAX that `pyproject.toml` claims to support."""
+  with open(pyproject, 'rb') as f:
+    project = tomllib.load(f)['project']
+
+  requirements = list(project.get('dependencies', ()))
+  for extra in project.get('optional-dependencies', {}).values():
+    requirements.extend(extra)
+
+  floors = {
+      m[3]
+      for r in requirements
+      if (m := _JAX_REQUIREMENT_RE.fullmatch(r.strip()))
+  }
+  if not floors:
+    raise ValueError(f'{pyproject} declares no `jax>=` requirement')
+  if len(floors) > 1:
+    raise ValueError(
+        f'{pyproject} declares more than one JAX floor: '
+        + ', '.join(sorted(floors))
+    )
+  return floors.pop()
+
+def _version_key(version: str) -> tuple[int, ...]:
+  return tuple(int(part) for part in version.split('.'))
+
+def sorted_jax_versions() -> tuple[str, ...]:
+  """Returns `JAX_VERSIONS` in version order, newest first."""
+  return tuple(sorted(JAX_VERSIONS, key=_version_key, reverse=True))
+
+
+def latest_jax() -> str:
+  """Returns the newest version CI tests: what an ordinary shard job installs."""
+  return sorted_jax_versions()[0]
+
+
+def older_jaxs() -> tuple[str, ...]:
+  """Returns every version but the newest: one compat rerun each."""
+  return sorted_jax_versions()[1:]
+
+
+def oldest_jax() -> str:
+  """Returns the oldest version CI tests, which the `pyproject` floor equals."""
+  return sorted_jax_versions()[-1]
+
+
 def _is_test_filename(name: str) -> bool:
   """Returns whether pytest would collect a file with this base name.
 
@@ -864,6 +929,7 @@ def resolve_shards(
     del shards[_CATCH_ALL_SHARD]
   return shards, catch_all, excluded, ignored
 
+jax_version_re = re.compile(r'\d+(\.\d+)*')
 
 def check_consistency(
     shards: ShardMap,
@@ -871,6 +937,7 @@ def check_consistency(
     excluded: Collection[str],
     ignored: Collection[str],
     class_reader: Callable[[str], list[str]] = declared_test_classes,
+    pyproject: str | None = 'pyproject.toml',
 ) -> list[str]:
   """Returns the problems that would cause tests to run wrongly.
 
@@ -885,6 +952,8 @@ def check_consistency(
       production. A parameter only so a test can supply them directly;
       everything else here works off `test_files`, so the checks stay runnable
       against a tree that does not exist on disk.
+    pyproject: Path to pyproject.toml to verify JAX floor against, or None to
+      skip.
 
   Returns:
     One string per problem, empty if the table is sound.
@@ -1020,6 +1089,34 @@ def check_consistency(
           f'{file} is split by node ID across {where}, which name classes it'
           f' does not declare: {", ".join(unknown)}'
       )
+
+  for runner in COMPAT_RUNNERS:
+    if runner not in RUNNERS:
+      errors.append(f'COMPAT_RUNNERS {runner!r} is not in RUNNERS.')
+
+  if len(JAX_VERSIONS) != 2:
+    errors.append(
+        f'JAX_VERSIONS is {JAX_VERSIONS}: tokamax supports 2 latest JAX'
+        ' versions for backward compatibility.'
+    )
+  if sorted({v for v in JAX_VERSIONS if JAX_VERSIONS.count(v) > 1}):
+    errors.append(
+        f'Duplicated JAX version found in {JAX_VERSIONS}.'
+    )
+  if bad := sorted(v for v in JAX_VERSIONS if not jax_version_re.fullmatch(v)):
+    errors.append('Invalid JAX version found in JAX_VERSIONS: ' + ', '.join(bad))
+    return errors
+
+  if pyproject is not None:
+    try:
+      if (floor := jax_floor(pyproject)) != oldest_jax():
+        errors.append(
+            f'{pyproject} declares jax>={floor}, but the oldest version in'
+            f' JAX_VERSIONS is {oldest_jax()}: the JAX lower bound and the'
+            ' oldest JAX version the CI tests against have to be the same.'
+        )
+    except ValueError as exc:
+      errors.append(str(exc))
   return errors
 
 
@@ -1138,7 +1235,9 @@ def build_matrix(
   """Builds `strategy.matrix.include`, one entry per (shard, runner) job.
 
   Every shard runs on every runner, so this is the full cross product unless
-  `only` narrows it.
+  `only` narrows it. Every
+  shard then runs once more per version in `older_jaxs()`, on each of
+  `COMPAT_RUNNERS`, for the backward compatibility check.
 
   The only place a shard's `paths` becomes a command line: the workflow reads
   `test_paths` as one string and splits it back into arguments with `xargs`,
@@ -1152,7 +1251,8 @@ def build_matrix(
       that reaches no test and correctly runs nothing.
 
   Returns:
-    A job per shard per runner, in `shard_order` within each runner.
+    A job per shard per runner, in `shard_order` within each runner, then the
+    backward compatible jobs.
   """
   ordered = sorted(shards.items(), key=shard_order)
   jobs = []
@@ -1167,11 +1267,28 @@ def build_matrix(
         continue
       jobs.append({
           'runner': runner,
-          'runner_short': short,
+          'runner_short': f'{short}-jax{latest_jax()}',
           'device': device,
           'shard_name': name,
           'test_paths': shlex.join(spec['paths']),
+          'jax_pin': latest_jax(),
       })
+
+  for runner in COMPAT_RUNNERS:
+    for name, spec in ordered:
+      for version in older_jaxs():
+        if only is not None and name not in only:
+          continue
+        if not spec['paths']:
+          continue
+        jobs.append({
+            'runner': runner,
+            'runner_short': f'{RUNNERS[runner][1]}-jax{version}',
+            'device': RUNNERS[runner][0],
+            'shard_name': name,
+            'test_paths': shlex.join(spec['paths']),
+            'jax_pin': version,
+        })
   return jobs
 
 

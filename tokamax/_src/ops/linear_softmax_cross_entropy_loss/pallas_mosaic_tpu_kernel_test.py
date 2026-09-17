@@ -311,6 +311,9 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
   def test_kernel_forward_matches_reference(
       self, b_dim, h_dim, v_dim, reduction, dtype=jnp.float32
   ):
+    if jax.__version_info__ < (0, 11, 1):
+      self.skipTest("Test fails in JAX 0.11.0; fixed in JAX 0.11.1.")
+
     x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), dtype)
     labels_shape = numerics.RangedArrayInitializer(
         (b_dim,), jnp.int32, 0, v_dim

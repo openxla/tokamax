@@ -60,6 +60,9 @@ class ApiTest(parameterized.TestCase):
       test_impl,
       reference_impl,
   ):
+    if jax.__version_info__ < (0, 11, 1):
+      self.skipTest("Test fails in JAX 0.11.0; fixed in JAX 0.11.1.")
+
     if test_impl == "mosaic_tpu" and jax.default_backend() != "tpu":
       self.skipTest("Pallas Mosaic TPU is only supported on TPUs.")
 

@@ -25,6 +25,7 @@ Stdlib `unittest`, no third-party imports.
 
 from __future__ import annotations
 
+import collections
 from collections.abc import Collection, Iterable, Mapping
 import contextlib
 import io
@@ -86,6 +87,7 @@ def check(
     shard_map: Mapping[str, tuple[str, ...] | shards.Spec],
     files: Collection[str] = FILES,
     classes: Mapping[str, list[str]] | None = None,
+    pyproject: str | None = None,
 ) -> list[str]:
   """Runs `check_consistency` over a fake tree.
 
@@ -95,6 +97,7 @@ def check(
     files: The fake tree, defaulting to `FILES`.
     classes: File to its class names, standing in for the AST reader. Defaults
       to `CLASSES`.
+    pyproject: Path to pyproject.toml to verify JAX floor against, or None.
 
   Returns:
     The errors, minus the ones the fake tree provokes about itself.
@@ -116,6 +119,7 @@ def check(
           set(),
           ignored,
           class_reader=(classes or CLASSES).get,
+          pyproject=pyproject,
       )
   )
   # Errors about the fake tree rather than about the case under test: the
@@ -251,15 +255,23 @@ class ShardTableTest(unittest.TestCase):
     errors = check({'s1': dict(paths=FILES[:3], devices=('tpu',))})
     self.assertIn('has a `devices` key', ' '.join(errors))
 
+  def _jobs_on_latest_jax(
+      self, table: Mapping[str, shards.Spec]
+  ) -> list[shards.MatrixEntry]:
+    return [
+        c
+        for c in shards.build_matrix(table)
+        if c['jax_pin'] == shards.latest_jax()
+    ]
+
   def test_matrix_is_one_job_per_shard_and_runner(self) -> None:
     table = {'s1': dict(paths=FILES[:2]), 's2': dict(paths=FILES[2:3])}
-    combos = shards.build_matrix(table)
+    combos = self._jobs_on_latest_jax(table)
     self.assertEqual(len(combos), 2 * len(shards.RUNNERS))
     self.assertTrue(all(c['test_paths'] for c in combos))
 
   def test_matrix_covers_every_runner_once_per_shard(self) -> None:
-    table = {'s1': dict(paths=FILES[:2])}
-    combos = shards.build_matrix(table)
+    combos = self._jobs_on_latest_jax({'s1': dict(paths=FILES[:2])})
     self.assertCountEqual([c['runner'] for c in combos], list(shards.RUNNERS))
     # The device is the pip extra the job installs, and comes from `RUNNERS`.
     self.assertCountEqual(
@@ -416,6 +428,188 @@ class ThemeTest(unittest.TestCase):
   def test_every_real_shard_has_a_theme(self) -> None:
     strays = [n for n in shards.SHARDS if shards.shard_theme(n) is None]
     self.assertEqual(strays, [])
+
+
+class JaxFloorTest(unittest.TestCase):
+
+  def _jax_floor(self, body: str) -> str:
+    with tempfile.NamedTemporaryFile(
+        'w', suffix='.toml', delete=False, encoding='utf-8'
+    ) as f:
+      f.write(textwrap.dedent(body))
+      path = f.name
+    self.addCleanup(os.unlink, path)
+    return shards.jax_floor(path)
+
+  def test_disagreeing_floors_raise(self) -> None:
+    with self.assertRaisesRegex(ValueError, 'more than one JAX floor'):
+      self._jax_floor("""
+          [project]
+          dependencies = ["jax>=0.11.1"]
+          [project.optional-dependencies]
+          tpu = ["jax[tpu]>=0.11.0"]
+      """)
+
+  def test_no_jax_requirement_raises(self) -> None:
+    with self.assertRaisesRegex(ValueError, 'no .jax>=. requirement'):
+      self._jax_floor("""
+          [project]
+          dependencies = ["numpy>=2.1"]
+      """)
+
+  def test_floor_extracted_from_dependencies_and_extras(self) -> None:
+    floor = self._jax_floor("""
+        [project]
+        dependencies = [
+            "jax>=0.11.0",
+            "jaxlib>=0.11.0",
+            "jaxtyping>=0.3",
+        ]
+        [project.optional-dependencies]
+        tpu = ["jax[tpu]>=0.11.0"]
+        cuda = ["jax[cuda13]>=0.11.0"]
+    """)
+    self.assertEqual(floor, '0.11.0')
+
+  def test_unrelated_packages_with_jax_name_not_matched(self) -> None:
+    floor = self._jax_floor("""
+        [project]
+        dependencies = [
+            "jax>=0.11.0",
+            "cuequivariance-jax>=0.10.0",
+        ]
+    """)
+    self.assertEqual(floor, '0.11.0')
+
+
+class JaxVersionTest(unittest.TestCase):
+
+  def test_version_sorting_is_numerical(self) -> None:
+    versions = ('0.11.2', '0.11.10', '0.12.0', '0.11.0')
+    with mock.patch.object(shards, 'JAX_VERSIONS', versions):
+      self.assertEqual(
+          shards.sorted_jax_versions(),
+          ('0.12.0', '0.11.10', '0.11.2', '0.11.0'),
+      )
+      self.assertEqual(shards.latest_jax(), '0.12.0')
+      self.assertEqual(
+          shards.older_jaxs(), ('0.11.10', '0.11.2', '0.11.0')
+      )
+      self.assertEqual(shards.oldest_jax(), '0.11.0')
+
+
+class CompatMatrixTest(unittest.TestCase):
+
+  def matrix(self) -> list[shards.MatrixEntry]:
+    resolved, *_ = shards.resolve_shards()
+    return list(shards.build_matrix(resolved))
+
+  def test_every_version_runs_every_shard(self) -> None:
+    shards_by_pin = collections.defaultdict(set)
+    runners_by_pin = collections.defaultdict(set)
+    for entry in self.matrix():
+      shards_by_pin[entry['jax_pin']].add(entry['shard_name'])
+      runners_by_pin[entry['jax_pin']].add(entry['runner'])
+    self.assertCountEqual(shards_by_pin, shards.JAX_VERSIONS)
+    for version in shards.older_jaxs():
+      self.assertEqual(
+          shards_by_pin[version], shards_by_pin[shards.latest_jax()]
+      )
+      self.assertCountEqual(runners_by_pin[version], shards.COMPAT_RUNNERS)
+
+  def test_job_names_are_unique(self) -> None:
+    jobs = [(e['runner_short'], e['shard_name']) for e in self.matrix()]
+    duplicates = [
+        job for job, count in collections.Counter(jobs).items() if count > 1
+    ]
+    self.assertEqual(duplicates, [])
+
+  def test_every_job_preserves_runner_device(self) -> None:
+    for entry in self.matrix():
+      expected_device = shards.RUNNERS[entry['runner']][0]
+      self.assertEqual(entry['device'], expected_device)
+
+  def test_total_matrix_job_count(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    expected_per_shard = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
+        shards.COMPAT_RUNNERS
+    )
+    self.assertEqual(len(self.matrix()), len(resolved) * expected_per_shard)
+
+  def test_matrix_with_only_filters_all_versions(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    only = {'core-api'}
+    jobs = shards.build_matrix(resolved, only=only)
+    self.assertTrue(all(j['shard_name'] == 'core-api' for j in jobs))
+    expected = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
+        shards.COMPAT_RUNNERS
+    )
+    self.assertEqual(len(jobs), expected)
+
+
+class JaxConsistencyTest(unittest.TestCase):
+
+  def test_support_floor_mismatch_is_caught(self) -> None:
+    with tempfile.NamedTemporaryFile(
+        'w', suffix='.toml', delete=False, encoding='utf-8'
+    ) as f:
+      f.write(textwrap.dedent("""
+          [project]
+          dependencies = ["jax>=0.11.1"]
+      """))
+      path = f.name
+    self.addCleanup(os.unlink, path)
+
+    with mock.patch.object(shards, 'JAX_VERSIONS', ('0.11.1', '0.11.0')):
+      errors = check(
+          {'s1': ('pkg/api_test.py',)},
+          files=('pkg/api_test.py',),
+          pyproject=path,
+      )
+      self.assertTrue(
+          any(
+              'the JAX lower bound and the oldest JAX version the CI tests'
+              ' against have to be the same.' in e
+              for e in errors
+          )
+      )
+
+  def test_not_equal_to_two_jax_versions_is_caught(self) -> None:
+    with mock.patch.object(shards, 'JAX_VERSIONS', ('0.11.0',)):
+      errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
+      self.assertTrue(
+          any(
+              'tokamax supports 2 latest JAX versions for backward'
+              ' compatibility.' in e
+              for e in errors
+          )
+      )
+
+  def test_duplicated_jax_version_is_caught(self) -> None:
+    with mock.patch.object(
+        shards, 'JAX_VERSIONS', ('0.11.0', '0.11.0')
+    ):
+      errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
+      self.assertTrue(any('Duplicated JAX version found' in e for e in errors))
+
+  def test_invalid_jax_version_format_is_caught(self) -> None:
+    with mock.patch.object(
+        shards, 'JAX_VERSIONS', ('0.11.1', 'invalid-version')
+    ):
+      errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
+      self.assertTrue(
+          any('Invalid JAX version found in JAX_VERSIONS' in e for e in errors)
+      )
+
+  def test_unknown_compat_runner_is_caught(self) -> None:
+    with mock.patch.object(shards, 'COMPAT_RUNNERS', ('non-existent-runner',)):
+      errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
+      self.assertTrue(
+          any(
+              "COMPAT_RUNNERS 'non-existent-runner' is not in RUNNERS" in e
+              for e in errors
+          )
+      )
 
 
 class RealRepositoryTest(unittest.TestCase):
@@ -603,7 +797,11 @@ class SelectionTest(unittest.TestCase):
     picked = sorted(resolved)[:2]
     combos = shards.build_matrix(resolved, only=picked)
     self.assertEqual({c['shard_name'] for c in combos}, set(picked))
-    self.assertEqual(len(combos), len(picked) * len(shards.RUNNERS))
+    # For the latest JAX version, it runs len(shards.RUNNERS) times.
+    num_runs_per_shards = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
+        shards.COMPAT_RUNNERS
+    )
+    self.assertEqual(len(combos), len(picked) * num_runs_per_shards)
 
   def test_matrix_with_no_shards_is_empty_not_everything(self) -> None:
     resolved, *_ = shards.resolve_shards()
