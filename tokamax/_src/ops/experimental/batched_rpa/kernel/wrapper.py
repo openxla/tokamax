@@ -147,9 +147,10 @@ def get_kv_cache_shape(
     actual_head_dim,
     kv_dtype,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    chip_version: pltpu.ChipVersion = pltpu.ChipVersion.TPU_7X,
 ):
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    num_sublanes = pltpu.get_tpu_info().num_sublanes
+    chip_info = pltpu.get_tpu_info_for_chip(chip_version, 1)
+    num_lanes, num_sublanes = chip_info.num_lanes, chip_info.num_sublanes
     kv_packing = utils.get_dtype_packing(kv_dtype)
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         return (
@@ -309,7 +310,10 @@ def calculate_block_sizes(
                 "Cannot find batch size that fits within VMEM limit.")
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
-        max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
+        max_seq_len = max(
+            serve_cfgs.pages_per_seq * serve_cfgs.page_size, mxu_column_size
+        )
+        loop_ran = False
         while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
                < capped_vmem_limit_bytes and bkv_sz <= max_seq_len
                # and bkv_sz <= 8192
@@ -321,10 +325,12 @@ def calculate_block_sizes(
             # some kv tokens.
             bkv_sz += bkv_stride
             bq_sz += bq_stride
+            loop_ran = True
 
         # Rollback one step since the last attempted value triggered OOM.
-        bkv_sz -= bkv_stride
-        bq_sz -= bq_stride
+        if loop_ran:
+            bkv_sz -= bkv_stride
+            bq_sz -= bq_stride
 
         # Indicates OOM was triggered from the starting bkv size.
         if bkv_sz == 0:
@@ -506,6 +512,15 @@ def ragged_paged_attention(
         mask_value = jnp.finfo(out_dtype).min
     if vmem_limit_bytes is None:
         vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    orig_kv_cache_ndim = kv_cache.ndim
+    if kv_cache.ndim == 4:
+        if kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE:
+            kv_packing = utils.get_dtype_packing(kv_cache.dtype)
+            num_pages, page_sz, kv_heads_x2, h_dim = kv_cache.shape
+            kv_cache = kv_cache.reshape(
+                num_pages, page_sz, kv_heads_x2 // kv_packing, kv_packing, h_dim
+            )
+
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         page_size = kv_cache.shape[4]
@@ -550,12 +565,14 @@ def ragged_paged_attention(
         kv_layout=kv_layout,
         page_size=page_size,
     )
-    default_decode, default_prefill = calculate_block_sizes(
-        model_cfgs,
-        serve_cfgs,
-        vmem_limit_bytes,
-        decode_query_size=decode_query_size,
-    )
+    default_decode = default_prefill = None
+    if decode_block_sizes is None or prefill_block_sizes is None:
+        default_decode, default_prefill = calculate_block_sizes(
+            model_cfgs,
+            serve_cfgs,
+            vmem_limit_bytes,
+            decode_query_size=decode_query_size,
+        )
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None
     if return_lse:
@@ -664,6 +681,8 @@ def ragged_paged_attention(
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init)
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+        configs.RpaCase.PREFILL, o_hbm_alias_q_hbm, kv_cache, lse_hbm)
+    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm)
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
@@ -672,6 +691,13 @@ def ragged_paged_attention(
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+    if orig_kv_cache_ndim == 4 and kv_cache.ndim == 5:
+        kv_cache = kv_cache.reshape(
+            kv_cache.shape[0],
+            kv_cache.shape[1],
+            kv_cache.shape[2] * kv_cache.shape[3],
+            kv_cache.shape[4],
+        )
     if not return_lse:
         return o_hbm, kv_cache
     # Reshape LSE from [num_kv_heads, max_tokens * aligned_num_q_heads_per_kv_head, num_lanes] to

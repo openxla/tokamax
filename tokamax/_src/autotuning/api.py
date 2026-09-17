@@ -48,6 +48,8 @@ from tokamax._src.ops.ragged_gather import api as ragged_gather_api
 from tokamax._src.ops.ragged_gather import base as ragged_gather_base
 from tokamax._src.ops.ragged_gather_reduce import api as ragged_gather_reduce_api
 from tokamax._src.ops.ragged_gather_reduce import base as ragged_gather_reduce_base
+from tokamax._src.ops.experimental.batched_rpa import api as batched_rpa_api
+from tokamax._src.ops.experimental.batched_rpa import base as batched_rpa_base
 from tokamax._src.ops.ragged_scatter import api as ragged_scatter_api
 from tokamax._src.ops.ragged_scatter import base as ragged_scatter_base
 import tqdm
@@ -262,6 +264,7 @@ _API_IMPLEMENTATIONS: Final[
     ragged_gather_reduce_base.RaggedGatherReduce: (
         ragged_gather_reduce_api.IMPLEMENTATIONS
     ),
+    batched_rpa_base.BatchedRpa: batched_rpa_api.IMPLEMENTATIONS,
     kda_base.KimiDeltaAttention: kda_api.IMPLEMENTATIONS,
 })
 
