@@ -102,6 +102,30 @@ def get_triton_activation(
   )
 
 
+_JNP_TO_TL_DTYPES = {
+    jnp.bool_: tl.int1,
+    jnp.int8: tl.int8,
+    jnp.int16: tl.int16,
+    jnp.int32: tl.int32,
+    jnp.int64: tl.int64,
+    jnp.uint8: tl.uint8,
+    jnp.uint16: tl.uint16,
+    jnp.uint32: tl.uint32,
+    jnp.uint64: tl.uint64,
+    jnp.float8_e4m3fn: tl.float8e4nv,
+    jnp.float8_e5m2: tl.float8e5,
+    jnp.float16: tl.float16,
+    jnp.bfloat16: tl.bfloat16,
+    jnp.float32: tl.float32,
+    jnp.float64: tl.float64,
+}
+
+
+def jnp_to_tl_dtype(dtype: jax.typing.DTypeLike) -> tl.dtype:
+  """Returns the Triton dtype corresponding to a JAX dtype."""
+  return _JNP_TO_TL_DTYPES[jnp.dtype(dtype).type]
+
+
 def get_input_precision(
     precision: precision_lib.CanonicalPrecision, dtype: jnp.dtype
 ) -> str | None:
@@ -126,3 +150,21 @@ def get_input_precision(
             f'Unsupported precision for Triton kernel: {precision}'
         )
   return 'tf32'
+
+
+def get_dot_dtype_and_precision(
+    precision: precision_lib.CanonicalPrecision,
+    lhs_dtype: jax.typing.DTypeLike,
+    rhs_dtype: jax.typing.DTypeLike,
+) -> tuple[tl.dtype, str | None]:
+  """Returns the Triton dot operand dtype and `input_precision` string."""
+  if (
+      isinstance(precision, jax.lax.DotAlgorithmPreset)
+      and precision.supported_lhs_types is not None
+  ):
+    dot_jnp_dtype = jnp.dtype(precision.supported_lhs_types[0])
+  else:
+    dot_jnp_dtype = jnp.dtype(jnp.result_type(lhs_dtype, rhs_dtype))
+  input_precision = get_input_precision(precision, dot_jnp_dtype)
+  return jnp_to_tl_dtype(dot_jnp_dtype), input_precision
+

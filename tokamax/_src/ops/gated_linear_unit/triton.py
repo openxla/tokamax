@@ -55,6 +55,7 @@ def _gated_linear_unit_kernel(
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
+    dot_dtype: tl.constexpr,
     input_precision: tl.constexpr,
     activation: tl.constexpr,
     return_residuals: tl.constexpr,
@@ -85,8 +86,9 @@ def _gated_linear_unit_kernel(
     w = tl.load(w_ptrs, mask=k_mask[:, None], other=0.0)
     v = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0)
 
-    w = w.to(x.dtype)
-    v = v.to(x.dtype)
+    x = x.to(dot_dtype)
+    w = w.to(dot_dtype)
+    v = v.to(dot_dtype)
 
     gates = tl.dot(x, w, acc=gates, input_precision=input_precision)
     proj = tl.dot(x, v, acc=proj, input_precision=input_precision)
@@ -177,7 +179,9 @@ class TritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
     )
 
     triton_act = triton_utils.get_triton_activation(activation)
-    input_precision = triton_utils.get_input_precision(precision, x.dtype)
+    dot_dtype, input_precision = triton_utils.get_dot_dtype_and_precision(
+        precision, x.dtype, weights.dtype
+    )
 
     def fn(x, weights):
       out_shape = x.shape[:-1] + (weights.shape[-1],)
@@ -237,6 +241,7 @@ class TritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
           block_m=block_m,
           block_n=block_n,
           block_k=block_k,
+          dot_dtype=dot_dtype,
           input_precision=input_precision,
           activation=triton_act,
           return_residuals=return_residuals,
