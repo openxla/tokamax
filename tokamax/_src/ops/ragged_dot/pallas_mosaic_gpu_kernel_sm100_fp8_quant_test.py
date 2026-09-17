@@ -110,7 +110,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
   @parameterized.product(
       subchannels=(512, 256, 128),
       use_as_qarray=(True, False),
-      activation=(None, test_base.relu, jax.nn.tanh),
+      activation=(None, jax.nn.relu, jax.nn.tanh),
       task=(
           (8, 512, 512, 512),
           (16, 1024, 1024, 1024),
@@ -230,7 +230,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     return q * s
 
   @parameterized.product(
-      block_k=(128,), activation=(None, test_base.relu, silu)
+      block_k=(128,), activation=(None, jax.nn.relu, silu)
   )
   def test_epilogue_quant(self, block_k, activation):
     # New arch: ONE accumulator of block_n N-cols per CTA -> the fused output
@@ -277,7 +277,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     chex.assert_trees_all_equal(out.qvalue, out2.qvalue)
     chex.assert_trees_all_equal(out.scale, out2.scale)
 
-  @parameterized.product(block_k=(128,), activation=(None, test_base.relu))
+  @parameterized.product(block_k=(128,), activation=(None, jax.nn.relu))
   def test_relaxed_activation_subchannel(self, block_k, activation):
     # Activation subchannel (128) finer than weight subchannel (512); dense out.
     # NOTE: uses a 4x ratio (weight 512 / act 128). A 2x ratio (tile_k ==
@@ -310,7 +310,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
   @parameterized.product(
       block_k=(128,),
-      activation=(None, test_base.relu),
+      activation=(None, jax.nn.relu),
       block_m=(16, 64),
       group_sizes_pat=(
           # cumsum starts not multiples of align_tile(8) -> a tile straddles two
@@ -405,7 +405,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         actual[:count], expected[:count], atol=0.06, rtol=0.1
     )
 
-  @parameterized.product(activation=(None, test_base.relu, silu))
+  @parameterized.product(activation=(None, jax.nn.relu, silu))
   def test_epilogue_quant_prod_config(self, activation):
     # The production autotuned config for this fused kernel: block_m=32,
     # block_k=256 (with weight subchannel 512, so block_k <= subchannel: 2
@@ -445,7 +445,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         actual[:count], expected[:count], atol=0.06, rtol=0.1
     )
 
-  @parameterized.product(activation=(None, test_base.relu))
+  @parameterized.product(activation=(None, jax.nn.relu))
   def test_epilogue_quant_target_config(self, activation):
     # Verify target benchmark config correctness.
     num_groups, m, k, n = 8, 512, 1024, 512
@@ -484,7 +484,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         actual[:count], expected[:count], atol=0.06, rtol=0.1
     )
 
-  @parameterized.product(activation=(None, test_base.relu, silu))
+  @parameterized.product(activation=(None, jax.nn.relu, silu))
   def test_chained_two_ragged_dots(self, activation):
     # quant -> dot -> quant -> dot, fused vs unfused. Both run the
     # kernel; the fused chain folds the middle quant into dot1 (fp8 QArray out),

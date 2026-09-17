@@ -69,12 +69,6 @@ def override_chex_args(**kwargs):
 
 NAMED_ARG_SPECS = {s.full_name: s for s in ARG_SPECS if "ci_tests" in s.tags}
 
-# TODO: `jax.nn.relu` is annotated with `custom_jvp_call`
-# which isn't compatible with `_estimate_resources` in the mosaic lowering.
-# It would be nice in the future to support this, if possible.
-def relu(x):
-  return jnp.maximum(x, 0)
-
 
 test_config = contextvars.ContextVar("config", default=None)
 
@@ -189,7 +183,7 @@ class RaggedDotTestBase(parameterized.TestCase):
       a_tile_shape=(None, (1, 128), (1, 16), (256, 1), (16, 1)),
       b_tile_shape=((1, 1, 16), (1, 1, 128), (1, 256, 1), (1, 16, 1)),
       use_as_qarray=(True, False),
-      activation=(None, relu, jax.nn.tanh),
+      activation=(None, jax.nn.relu, jax.nn.tanh),
   )
   def test_quantized(
       self,
@@ -261,7 +255,7 @@ class RaggedDotTestBase(parameterized.TestCase):
       m=(1024, 128),
       k=(128, 64),
       n=(256, 128),
-      activation=(None, relu, jax.nn.tanh),
+      activation=(None, jax.nn.relu, jax.nn.tanh),
   )
   def test_vjp(self, num_groups, m, k, n, activation=None):
     return self._test_vjp(num_groups, m, k, n, activation)
