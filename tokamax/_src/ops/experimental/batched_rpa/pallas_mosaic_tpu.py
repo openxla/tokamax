@@ -70,41 +70,54 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       cu_q_lens: jax.Array,
       distribution: jax.Array,
       *,
-      use_causal_mask: bool = True,
       sm_scale: float = 1.0,
       sliding_window: int | None = None,
       soft_cap: float | None = None,
       mask_value: float | None = None,
-      out_dtype: Any = None,
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
-      decode_query_size: int = 1,
+      chunk_prefill_size: int | None = None,
+      decode_block_sizes: base.BlockSizes | None = None,
+      prefill_block_sizes: base.BlockSizes | None = None,
+      vmem_limit_bytes: int | None = None,
+      debug_mode: bool = False,
+      out_dtype: Any = None,
+      use_causal_mask: bool = True,
       skip_kv_update: bool = True,
-      kv_layout: str | Any | None = None,
+      kv_layout: base.KVLayout | str = base.KVLayout.HEAD_ALONG_SUBLANE,
+      decode_query_size: int = 1,
       cp_group_size: int | None = None,
       cp_rank: jax.Array | None = None,
-      attention_scope: str | Any = "FULL",
+      attention_scope: base.AttentionScope | str = base.AttentionScope.FULL,
       return_lse: bool = False,
-      decode_block_sizes: Any | None = None,
-      prefill_block_sizes: Any | None = None,
       return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None]:
     del return_residuals
     assert config is not None, "Config must be supplied."
 
-    if isinstance(attention_scope, str):
-      effective_attention_scope = rpa_configs.AttentionScope[attention_scope]
-    else:
+    if isinstance(attention_scope, base.AttentionScope):
       effective_attention_scope = attention_scope
-
-    if isinstance(kv_layout, str):
-      effective_kv_layout = rpa_configs.KVLayout[kv_layout]
-    elif isinstance(kv_layout, rpa_configs.KVLayout):
-      effective_kv_layout = kv_layout
+    elif isinstance(attention_scope, str):
+      try:
+        effective_attention_scope = base.AttentionScope[attention_scope]
+      except KeyError:
+        effective_attention_scope = base.AttentionScope(attention_scope)
     else:
-      effective_kv_layout = rpa_configs.KVLayout[config.kv_layout]
+      effective_attention_scope = base.AttentionScope.FULL
+
+    if isinstance(kv_layout, base.KVLayout):
+      effective_kv_layout = kv_layout
+    elif isinstance(kv_layout, str):
+      try:
+        effective_kv_layout = base.KVLayout[kv_layout]
+      except KeyError:
+        effective_kv_layout = base.KVLayout(kv_layout)
+    elif kv_layout is None:
+      effective_kv_layout = base.KVLayout[config.kv_layout]
+    else:
+      effective_kv_layout = base.KVLayout(kv_layout)
 
     if decode_block_sizes is None:
       decode_block_sizes = rpa_configs.BlockSizes(
@@ -136,13 +149,16 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
+        mask_value=mask_value,
         out_dtype=out_dtype,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
-        mask_value=mask_value,
+        chunk_prefill_size=chunk_prefill_size,
         decode_block_sizes=decode_block_sizes,
         prefill_block_sizes=prefill_block_sizes,
+        vmem_limit_bytes=vmem_limit_bytes,
+        debug_mode=debug_mode,
         skip_kv_update=skip_kv_update,
         kv_layout=effective_kv_layout,
         decode_query_size=decode_query_size,

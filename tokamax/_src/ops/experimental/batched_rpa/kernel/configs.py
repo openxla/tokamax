@@ -22,64 +22,11 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from tokamax._src.ops.experimental.batched_rpa.kernel import utils
-
-
-@dataclasses.dataclass(frozen=True)
-class BlockSizes:
-    """Tuning parameters for the RPA kernel."""
-
-    bq_sz: int
-    bq_c_sz: int
-    bkv_sz: int
-    batch_size: int
-    n_buffer: int
-
-
-@dataclasses.dataclass(frozen=True)
-class ModelConfigs:
-    """Model config that will always stay constant."""
-
-    num_q_heads: int
-    num_kv_heads: int
-    head_dim: int
-    mask_value: float
-    sm_scale: float = 1.0
-    soft_cap: float | None = None
-    sliding_window: int | None = None
-
-    @property
-    def num_q_heads_per_kv_head(self) -> int:
-        return self.num_q_heads // self.num_kv_heads
-
-
-class AttentionScope(enum.StrEnum):
-    """Which KV positions to attend to.
-  FULL:            attend all positions (default).
-  CACHE_ONLY:      attend only cached tokens, skip new tokens.
-  NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens.
-  """
-    FULL = enum.auto()
-    CACHE_ONLY = enum.auto()
-    NEW_TOKENS_ONLY = enum.auto()
-
-
-class KVLayout(enum.StrEnum):
-    """Represents the different layouts for KV cache.
-
-    - HEAD_ALONG_SUBLANE: Number of heads on sublane, head_dim on lane.
-    - SEQ_ALONG_LANE: Sequence is packed along the lane, head_dim on sublane.
-    """
-
-    HEAD_ALONG_SUBLANE = enum.auto()
-    SEQ_ALONG_LANE = enum.auto()
-
-    @property
-    def symbol(self):
-        match self:
-            case KVLayout.HEAD_ALONG_SUBLANE:
-                return "nhs"
-            case KVLayout.SEQ_ALONG_LANE:
-                return "snh"
+from tokamax._src.ops.experimental.batched_rpa.types import AttentionScope
+from tokamax._src.ops.experimental.batched_rpa.types import BlockSizes
+from tokamax._src.ops.experimental.batched_rpa.types import KVLayout
+from tokamax._src.ops.experimental.batched_rpa.types import ModelConfigs
+from tokamax._src.ops.experimental.batched_rpa.types import RpaCase
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,41 +74,6 @@ class ServingConfigs:
     @property
     def packing_kv(self) -> int:
         return utils.get_dtype_packing(self.dtype_kv)
-
-
-class RpaCase(enum.StrEnum):
-    """Represents the different cases for Ragged Paged Attention.
-
-    - DECODE: Sequences are in decode-only mode (q_len = 1).
-    - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
-    - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
-    """
-
-    DECODE = enum.auto()
-    PREFILL = enum.auto()
-    MIXED = enum.auto()
-
-    @property
-    def symbol(self):
-        match self:
-            case RpaCase.DECODE:
-                return "d"
-            case RpaCase.PREFILL:
-                return "p"
-            case RpaCase.MIXED:
-                return "m"
-
-    def get_range(
-        self, distribution: jax.Array
-    ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
-        assert distribution.shape == (3, )
-        match self:
-            case RpaCase.DECODE:
-                return 0, distribution[0]
-            case RpaCase.PREFILL:
-                return distribution[0], distribution[1]
-            case RpaCase.MIXED:
-                return distribution[1], distribution[2]
 
 
 @dataclasses.dataclass(frozen=True, eq=True)

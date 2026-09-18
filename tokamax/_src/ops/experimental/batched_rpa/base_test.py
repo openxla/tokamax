@@ -144,39 +144,43 @@ class BatchedRpaBaseTest(parameterized.TestCase):
 
     from tokamax._src.ops.experimental.batched_rpa import api
 
-    out, new_cache, lse = api.batched_ragged_paged_attention(
-        queries=queries,
-        keys=keys,
-        values=values,
-        kv_cache=kv_cache,
-        kv_lens=kv_lens,
-        page_indices=page_indices,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        v_scale=1.0,
-        decode_query_size=2,
-        skip_kv_update=True,
-        return_lse=True,
-        implementation="reference",
+    out, new_cache, lse = (  # pyrefly: ignore[bad-unpacking]
+        api.batched_ragged_paged_attention(
+            queries=queries,
+            keys=keys,
+            values=values,
+            kv_cache=kv_cache,
+            kv_lens=kv_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            v_scale=1.0,
+            decode_query_size=2,
+            skip_kv_update=True,
+            return_lse=True,
+            implementation="reference",
+        )
     )
     self.assertEqual(out.shape, queries.shape)
     self.assertEqual(new_cache.shape, kv_cache.shape)
     self.assertEqual(lse.shape, (total_q_tokens, num_q_heads))
 
-    out_std, new_cache_std = api.batched_ragged_paged_attention(
-        queries=queries,
-        keys=keys,
-        values=values,
-        kv_cache=kv_cache,
-        kv_lens=kv_lens,
-        page_indices=page_indices,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        v_scale=1.0,
-        decode_query_size=2,
-        skip_kv_update=True,
-        return_lse=False,
-        implementation="reference",
+    out_std, new_cache_std = (  # pyrefly: ignore[bad-unpacking]
+        api.batched_ragged_paged_attention(
+            queries=queries,
+            keys=keys,
+            values=values,
+            kv_cache=kv_cache,
+            kv_lens=kv_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            v_scale=1.0,
+            decode_query_size=2,
+            skip_kv_update=True,
+            return_lse=False,
+            implementation="reference",
+        )
     )
     self.assertEqual(out_std.shape, queries.shape)
     self.assertEqual(new_cache_std.shape, kv_cache.shape)
