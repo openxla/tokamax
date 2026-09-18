@@ -30,7 +30,7 @@ AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 
 
 @dataclasses.dataclass(frozen=True)
-class BatchedRpa(op.Op[Any, tuple[jax.Array, jax.Array], None, _Config, Any]):
+class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
   """Batched Ragged Paged Attention (bRPA) base operator.
 
   Supports batched multi-head and grouped-query attention for mixed prefill and
@@ -45,7 +45,7 @@ class BatchedRpa(op.Op[Any, tuple[jax.Array, jax.Array], None, _Config, Any]):
       queries: Float[Array | AbstractArray, "total_q_tokens num_q_heads head_dim"],
       keys: Float[Array | AbstractArray, "total_q_tokens num_kv_heads head_dim"],
       values: Float[Array | AbstractArray, "total_q_tokens num_kv_heads head_dim"],
-      kv_cache: Shaped[Array | AbstractArray, "total_pages page_size num_kv_heads_x2 head_dim_aligned"],
+      kv_cache: Shaped[Array | AbstractArray, "..."],
       kv_lens: Int[Array | AbstractArray, "max_num_seqs"],
       page_indices: Int[Array | AbstractArray, "total_page_indices"],
       cu_q_lens: Int[Array | AbstractArray, "max_num_seqs_plus_one"],
@@ -60,6 +60,15 @@ class BatchedRpa(op.Op[Any, tuple[jax.Array, jax.Array], None, _Config, Any]):
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      decode_query_size: int = 1,
+      skip_kv_update: bool = True,
+      kv_layout: str | Any | None = None,
+      cp_group_size: int | None = None,
+      cp_rank: jax.Array | None = None,
+      attention_scope: str | Any = "FULL",
+      return_lse: bool = False,
+      decode_block_sizes: Any | None = None,
+      prefill_block_sizes: Any | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Validates structural dimensions and binds input arguments."""
@@ -90,6 +99,15 @@ class BatchedRpa(op.Op[Any, tuple[jax.Array, jax.Array], None, _Config, Any]):
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        decode_query_size=decode_query_size,
+        skip_kv_update=skip_kv_update,
+        kv_layout=kv_layout,
+        cp_group_size=cp_group_size,
+        cp_rank=cp_rank,
+        attention_scope=attention_scope,
+        return_lse=return_lse,
+        decode_block_sizes=decode_block_sizes,
+        prefill_block_sizes=prefill_block_sizes,
         return_residuals=return_residuals,
     )
 
@@ -115,29 +133,46 @@ class BatchedRpa(op.Op[Any, tuple[jax.Array, jax.Array], None, _Config, Any]):
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      decode_query_size: int = 1,
+      skip_kv_update: bool = True,
+      kv_layout: str | Any | None = None,
+      cp_group_size: int | None = None,
+      cp_rank: jax.Array | None = None,
+      attention_scope: str | Any = "FULL",
+      return_lse: bool = False,
+      decode_block_sizes: Any | None = None,
+      prefill_block_sizes: Any | None = None,
       return_residuals: bool = False,
       config: _Config | None = None,
-  ) -> tuple[tuple[jax.Array, jax.Array], None]:
+  ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None]:
     """Invokes standard reference implementation."""
-    del config, return_residuals  # Base class always executes pure JAX reference.
-    del mask_value, v_scale  # Reference impl does not use these.
-    return (
-        reference.batched_ragged_paged_attention_reference(
-            queries=queries,
-            keys=keys,
-            values=values,
-            kv_cache=kv_cache,
-            kv_lens=kv_lens,
-            page_indices=page_indices,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            use_causal_mask=use_causal_mask,
-            sm_scale=sm_scale,
-            sliding_window=sliding_window,
-            soft_cap=soft_cap,
-            out_dtype=out_dtype,
-            q_scale=q_scale,
-            k_scale=k_scale,
-        ),
-        None,
+    del config, return_residuals
+    ref_res = reference.batched_ragged_paged_attention_reference(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        use_causal_mask=use_causal_mask,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        mask_value=mask_value,
+        out_dtype=out_dtype,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        decode_query_size=decode_query_size,
+        skip_kv_update=skip_kv_update,
+        kv_layout=kv_layout,
+        cp_group_size=cp_group_size,
+        cp_rank=cp_rank,
+        attention_scope=attention_scope,
+        return_lse=return_lse,
     )
+    if return_lse:
+      return (ref_res[0], ref_res[1], ref_res[2]), None
+    return (ref_res[0], ref_res[1]), None

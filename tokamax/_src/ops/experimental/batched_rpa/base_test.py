@@ -119,6 +119,68 @@ class BatchedRpaBaseTest(parameterized.TestCase):
     self.assertEqual(out.shape, queries.shape)
     self.assertEqual(new_cache.shape, kv_cache.shape)
 
+  def test_high_level_api_with_extended_kwargs(self):
+    total_q_tokens = 4
+    max_num_seqs = 2
+    page_size = 8
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 64
+    total_pages = 8
+    head_dim_aligned = 128
+
+    k1, k2, k3 = jax.random.split(jax.random.key(2), 3)
+    queries = jax.random.normal(k1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16)
+    keys = jax.random.normal(k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    values = jax.random.normal(k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    kv_cache = jnp.zeros(
+        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        dtype=jnp.bfloat16,
+    )
+    kv_lens = jnp.array([8, 8], dtype=jnp.int32)
+    page_indices = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 2, 4], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+
+    from tokamax._src.ops.experimental.batched_rpa import api
+
+    out, new_cache, lse = api.batched_ragged_paged_attention(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        v_scale=1.0,
+        decode_query_size=2,
+        skip_kv_update=True,
+        return_lse=True,
+        implementation="reference",
+    )
+    self.assertEqual(out.shape, queries.shape)
+    self.assertEqual(new_cache.shape, kv_cache.shape)
+    self.assertEqual(lse.shape, (total_q_tokens, num_q_heads))
+
+    out_std, new_cache_std = api.batched_ragged_paged_attention(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        v_scale=1.0,
+        decode_query_size=2,
+        skip_kv_update=True,
+        return_lse=False,
+        implementation="reference",
+    )
+    self.assertEqual(out_std.shape, queries.shape)
+    self.assertEqual(new_cache_std.shape, kv_cache.shape)
+
 
 if __name__ == "__main__":
   absltest.main()

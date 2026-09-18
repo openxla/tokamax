@@ -51,9 +51,17 @@ def _merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
         "use_causal_mask",
         "sliding_window",
         "soft_cap",
+        "mask_value",
         "out_dtype",
         "q_scale",
         "k_scale",
+        "v_scale",
+        "decode_query_size",
+        "skip_kv_update",
+        "kv_layout",
+        "cp_group_size",
+        "attention_scope",
+        "return_lse",
     ),
 )
 def batched_ragged_paged_attention_reference(
@@ -70,10 +78,20 @@ def batched_ragged_paged_attention_reference(
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
+    mask_value: float | None = None,
     out_dtype: Any = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
-) -> tuple[jax.Array, jax.Array]:
+    v_scale: float | None = None,
+    decode_query_size: int = 1,
+    skip_kv_update: bool = True,
+    kv_layout: Any = None,
+    cp_group_size: int | None = None,
+    cp_rank: jax.Array | None = None,
+    attention_scope: Any = None,
+    return_lse: bool = False,
+    **unused_kwargs: Any,
+) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
   """Reference multi-head / grouped-query ragged paged attention in pure JAX.
 
   Args:
@@ -162,9 +180,11 @@ def batched_ragged_paged_attention_reference(
   scaled_queries = queries / q_scale if q_scale is not None else queries
   if k_scale is not None:
     all_k = all_k / k_scale
+  if v_scale is not None:
+    all_v = all_v / v_scale
 
   # Step 3: Compute attention per query token.
-  def compute_single_token(t: jax.Array) -> jax.Array:
+  def compute_single_token(t: jax.Array) -> tuple[jax.Array, jax.Array]:
     s = seq_idx[t]
     q_t = scaled_queries[t]
     k_s = all_k[s]
@@ -185,13 +205,19 @@ def batched_ragged_paged_attention_reference(
       mask = mask & (k_positions > token_kv_pos[t] - sliding_window)
 
     scores = jnp.where(mask[None, :], scores, -1e30)
+    lse = jax.nn.logsumexp(scores, axis=-1).astype(jnp.float32)
     weights = jax.nn.softmax(scores, axis=-1).astype(out_dtype)
 
-    return jnp.einsum(
+    token_out = jnp.einsum(
         "hk,khd->hd", weights, v_s, preferred_element_type=jnp.float32
     ).astype(out_dtype)
+    return token_out, lse
 
-  outputs = jax.vmap(compute_single_token)(token_indices)
-  outputs = jnp.where(valid_token[:, None, None], outputs, jnp.zeros_like(outputs))
+  token_outputs, token_lses = jax.vmap(compute_single_token)(token_indices)
+  outputs = jnp.where(valid_token[:, None, None], token_outputs, jnp.zeros_like(token_outputs))
+
+  if return_lse:
+    lse = jnp.where(valid_token[:, None], token_lses, jnp.full_like(token_lses, -jnp.inf))
+    return outputs, updated_kv_cache, lse
 
   return outputs, updated_kv_cache

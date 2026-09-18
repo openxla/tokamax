@@ -79,29 +79,49 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      decode_query_size: int = 1,
+      skip_kv_update: bool = True,
+      kv_layout: str | Any | None = None,
+      cp_group_size: int | None = None,
+      cp_rank: jax.Array | None = None,
+      attention_scope: str | Any = "FULL",
+      return_lse: bool = False,
+      decode_block_sizes: Any | None = None,
+      prefill_block_sizes: Any | None = None,
       return_residuals: bool = False,
       config: Config | None = None,
-  ) -> tuple[tuple[jax.Array, jax.Array], None]:
+  ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None]:
     del return_residuals
     assert config is not None, "Config must be supplied."
 
-    kv_layout = rpa_configs.KVLayout[config.kv_layout]
+    if isinstance(attention_scope, str):
+      effective_attention_scope = rpa_configs.AttentionScope[attention_scope]
+    else:
+      effective_attention_scope = attention_scope
 
-    # Decode fast-paths require bq_sz=1 and bq_c_sz=1.
-    decode_block_sizes = rpa_configs.BlockSizes(
-        bq_sz=1,
-        bq_c_sz=1,
-        bkv_sz=config.bkv_sz,
-        batch_size=config.decode_batch_size,
-        n_buffer=config.n_buffer,
-    )
-    prefill_block_sizes = rpa_configs.BlockSizes(
-        bq_sz=config.prefill_bq_sz,
-        bq_c_sz=config.prefill_bq_c_sz,
-        bkv_sz=config.bkv_sz,
-        batch_size=config.prefill_batch_size,
-        n_buffer=config.n_buffer,
-    )
+    if isinstance(kv_layout, str):
+      effective_kv_layout = rpa_configs.KVLayout[kv_layout]
+    elif isinstance(kv_layout, rpa_configs.KVLayout):
+      effective_kv_layout = kv_layout
+    else:
+      effective_kv_layout = rpa_configs.KVLayout[config.kv_layout]
+
+    if decode_block_sizes is None:
+      decode_block_sizes = rpa_configs.BlockSizes(
+          bq_sz=decode_query_size,
+          bq_c_sz=1,
+          bkv_sz=config.bkv_sz,
+          batch_size=config.decode_batch_size,
+          n_buffer=config.n_buffer,
+      )
+    if prefill_block_sizes is None:
+      prefill_block_sizes = rpa_configs.BlockSizes(
+          bq_sz=config.prefill_bq_sz,
+          bq_c_sz=config.prefill_bq_c_sz,
+          bkv_sz=config.bkv_sz,
+          batch_size=config.prefill_batch_size,
+          n_buffer=config.n_buffer,
+      )
 
     result = rpa_wrapper.ragged_paged_attention(
         queries=queries,
@@ -123,9 +143,17 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
         mask_value=mask_value,
         decode_block_sizes=decode_block_sizes,
         prefill_block_sizes=prefill_block_sizes,
-        kv_layout=kv_layout,
+        skip_kv_update=skip_kv_update,
+        kv_layout=effective_kv_layout,
+        decode_query_size=decode_query_size,
+        cp_group_size=cp_group_size,
+        cp_rank=cp_rank,
+        attention_scope=effective_attention_scope,
+        return_lse=return_lse,
     )
 
+    if return_lse:
+      return (result[0], result[1], result[2]), None
     return (result[0], result[1]), None
 
   @override
