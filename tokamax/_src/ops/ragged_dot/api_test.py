@@ -38,13 +38,6 @@ def _get_input_data(num_experts, m, k, n, dtype=jnp.bfloat16):
   return (lhs, rhs, group_sizes)
 
 
-# TODO: `jax.nn.relu` is annotated with `custom_jvp_call`
-# which isn't compatible with `_estimate_resources` in the mosaic lowering.
-# It would be nice in the future to support this, if possible.
-def relu(x):
-  return jnp.maximum(x, 0)
-
-
 class _MockDeviceRestrictedOp(base.RaggedDot):
 
   def __call__(self, *args, **kwargs):
@@ -58,7 +51,7 @@ class RaggedDotTest(parameterized.TestCase):
 
   @parameterized.product(
       implementation=[None, "xla", "mosaic", "triton"],
-      activation=[None, relu],
+      activation=[None, jax.nn.relu],
   )
   def test_basic_api(self, implementation, activation):
 

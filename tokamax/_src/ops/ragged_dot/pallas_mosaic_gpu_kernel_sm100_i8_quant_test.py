@@ -105,7 +105,7 @@ class PallasMosaicGpuKernelSm100I8QuantTest(test_base.RaggedDotTestBase):
           (1, 256, 1),
       ),
       use_as_qarray=(True, False),
-      activation=(None, test_base.relu, jax.nn.tanh),
+      activation=(None, jax.nn.relu, jax.nn.tanh),
       task=((8, 512, 512, 512), (8, 512, 512, 512)),
   )
   def test_wi4_ai8_quantized(self, tile_shape, use_as_qarray, activation, task):
