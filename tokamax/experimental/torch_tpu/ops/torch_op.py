@@ -71,6 +71,9 @@ _Config = TypeVar("_Config")
   - derive_backward_shapes: Derives the backward shapes for the backward pass
     residuals and outputs. Only needed if the Torch Op is a backward op; this
     will be used to look up the autotuning configs for the backward pass op.
+    The shapes derived here should be a dictionary of the backward pass
+    parameter names that are not in the forward pass. The derivation for these
+    shapes should be based on the shapes given in the forward pass inputs.
     
   
   Finally, in the module, make the forward TorchOp class a singleton instance.
