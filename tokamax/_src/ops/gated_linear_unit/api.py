@@ -30,9 +30,9 @@ _DEFAULT_IMPLEMENTATIONS = ('xla',)
 
 
 try:
-  from tokamax._src.ops.gated_linear_unit import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.gated_linear_unit import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  _IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonGatedLinearUnit()
+  _IMPLEMENTATIONS['triton'] = triton.TritonGatedLinearUnit()
   _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass

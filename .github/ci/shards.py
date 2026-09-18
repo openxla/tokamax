@@ -523,7 +523,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/gated_linear_unit/api_test.py',
             'tokamax/_src/ops/gated_linear_unit/base_test.py',
             'tokamax/_src/ops/gated_linear_unit/pallas_mosaic_gpu_test.py',
-            'tokamax/_src/ops/gated_linear_unit/pallas_triton_test.py',
+            'tokamax/_src/ops/gated_linear_unit/triton_test.py',
         ),
         minutes=1,
     ),

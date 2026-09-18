@@ -33,10 +33,14 @@ from tokamax._src import hlo_utils
 from tokamax._src import hlo_utils_common
 from tokamax._src import numerics
 from tokamax._src.ops.attention import api as attention_api
-from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_triton_glu
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+
+try:
+  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  triton_glu = None  # pyrefly: ignore[assignment]
 
 RepresentationTypes = Literal['lowered', 'mlir']
 
@@ -221,12 +225,13 @@ class DumpHloLibTest(parameterized.TestCase):
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_get_opspecs_from_lowered_jax(self, representation):
-
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
+    assert triton_glu is not None
+
     norm_op = pl_norm.PallasTritonNormalization()
-    glu_op = pl_triton_glu.PallasTritonGatedLinearUnit()
+    glu_op = triton_glu.TritonGatedLinearUnit()
 
     # Create a string of Tokamax ops in Jax, lower it to HLO, and extract the
     # kernel spec from the name of the kernel.

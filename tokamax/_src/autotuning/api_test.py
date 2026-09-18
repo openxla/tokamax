@@ -31,12 +31,16 @@ from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
-from tokamax._src.ops.gated_linear_unit import pallas_triton as pl_glu
 from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu as pl_ragged_dot_mosaic_tpu
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+
+try:
+  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  triton_glu = None  # pyrefly: ignore[assignment]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,8 +67,9 @@ class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
 
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
+  assert triton_glu is not None
   norm = pl_norm.PallasTritonNormalization()
-  glu = pl_glu.PallasTritonGatedLinearUnit()
+  glu = triton_glu.TritonGatedLinearUnit()
   eps = 0.32
   act = jax.nn.swish
 
@@ -109,9 +114,15 @@ class AutotuningTest(parameterized.TestCase):
         dict(norm_api.IMPLEMENTATIONS),
     )
     self.assertDictEqual(
-        api.get_op_implementations(pl_glu.PallasTritonGatedLinearUnit()),
+        api.get_op_implementations(glu_base.GatedLinearUnit()),
         dict(glu_api.IMPLEMENTATIONS),
     )
+    if jax.default_backend() != "tpu":
+      assert triton_glu is not None
+      self.assertDictEqual(
+          api.get_op_implementations(triton_glu.TritonGatedLinearUnit()),
+          dict(glu_api.IMPLEMENTATIONS),
+      )
 
     with self.subTest("current_device_only"):
       if jax.default_backend() == "tpu":
@@ -151,6 +162,8 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
+    assert triton_glu is not None
+
     def f(x, weights):
       x = glu_api.gated_linear_unit(x, weights, implementation="triton")
       x = glu_api.gated_linear_unit(x, weights, implementation="triton")
@@ -161,7 +174,7 @@ class AutotuningTest(parameterized.TestCase):
         x=jax.ShapeDtypeStruct((64, 128), dtype=jnp.bfloat16),
         weights=jax.ShapeDtypeStruct((128, 2, 128), dtype=jnp.bfloat16),
     )
-    bound_arg0 = pl_glu.PallasTritonGatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
+    bound_arg0 = triton_glu.TritonGatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
     bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
     assert bound_arg0.autotuning_cache_key == bound_arg1.autotuning_cache_key
     expected = (bound_arg0, bound_arg1)
@@ -172,7 +185,9 @@ class AutotuningTest(parameterized.TestCase):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
 
-    glu = pl_glu.PallasTritonGatedLinearUnit()
+    assert triton_glu is not None
+
+    glu = triton_glu.TritonGatedLinearUnit()
     act = jax.nn.swish
     f = functools.partial(glu, activation=act)
     g = jax.value_and_grad(lambda x, weights: f(x, weights).sum())
