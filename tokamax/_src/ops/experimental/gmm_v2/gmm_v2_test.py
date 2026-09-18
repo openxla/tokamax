@@ -689,7 +689,7 @@ class GmmTest(parameterized.TestCase):
         num_local_groups,
         rhs_scale=grad_scale,
         group_offset=group_offset_arr,
-        out_dtype=jnp.bfloat16,
+        out_dtype=jnp.bfloat16,  # pyrefly: ignore[bad-argument-type]
     )
     tgmm_v2.validate_tgmm_inputs(
         group_sizes, num_local_groups, group_offset_arr
@@ -725,7 +725,7 @@ class GmmTest(parameterized.TestCase):
 
     grad_q, grad_scale = quantize_tensor(
         grad,
-        rhs_quant_dtype,
+        rhs_quant_dtype,  # pyrefly: ignore[bad-argument-type]
         axis=0,
         block_size=batch_size,
     )
@@ -744,7 +744,7 @@ class GmmTest(parameterized.TestCase):
         group_sizes,
         num_groups,
         rhs_scale=grad_scale,
-        out_dtype=jnp.bfloat16,
+        out_dtype=jnp.bfloat16,  # pyrefly: ignore[bad-argument-type]
     )
     tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
     actual = tgmm_v2.tgmm_v2(
@@ -1133,7 +1133,7 @@ class GmmTest(parameterized.TestCase):
     # Pin fp8 weights so rhs is dequantized after the matmul, which is the only
     # path that enables lhs quantization.
     rhs_q, rhs_scale = quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
@@ -1401,7 +1401,7 @@ class GmmTest(parameterized.TestCase):
     rhs_scale = None
     if use_weight_scale:
       rhs_q, rhs_scale = quantize_tensor(
-          rhs, jnp.int8, axis=1, block_size=block_size
+          rhs, jnp.int8, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
       )
       rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
@@ -1422,7 +1422,7 @@ class GmmTest(parameterized.TestCase):
     if maybe_quantize_lhs:
       lhs_block_size = min(512, in_size)
       lhs_q, lhs_scale_factor = quantize_tensor(
-          lhs, jnp.int8, axis=1, block_size=lhs_block_size
+          lhs, jnp.int8, axis=1, block_size=lhs_block_size  # pyrefly: ignore[bad-argument-type]
       )
       lhs_q_blocked = lhs_q.reshape(batch_size, -1, lhs_block_size).astype(
           jnp.float32
@@ -1499,7 +1499,7 @@ class GmmTest(parameterized.TestCase):
     )
     rhs_int4, rhs_scale = quantize_tensor(
         rhs,
-        jnp.int4,
+        jnp.int4,  # pyrefly: ignore[bad-argument-type]
         axis=1,
         block_size=block_size,
     )
@@ -1518,7 +1518,7 @@ class GmmTest(parameterized.TestCase):
     # uint4 values
     rhs_uint4 = (rhs_int4.astype(jnp.uint32) + 8) & 0x0F
 
-    packing_factor = gmm_v2.get_packing_factor(jnp.int32, jnp.int4)  # 8
+    packing_factor = gmm_v2.get_packing_factor(jnp.int32, jnp.int4)  # 8  # pyrefly: ignore[bad-argument-type]
     rhs_reshaped = rhs_uint4.reshape(
         num_groups, storage_k, packing_factor, out_size
     )
