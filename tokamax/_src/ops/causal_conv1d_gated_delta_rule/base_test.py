@@ -159,7 +159,14 @@ class GDNAttentionTest(parameterized.TestCase):
     # Create wrapper that disables buffer donation.
     run_jax_gdn_attention_local_jitted = jax.jit(
         wrapper.fused_conv1d_gdn,
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
+        static_argnames=[
+            "n_kq",
+            "n_v",
+            "d_k",
+            "d_v",
+            "kernel_size",
+            "num_spec_tokens",
+        ],
     )
     run_jax_gdn_attention_base_op_jitted = jax.jit(
         base.CausalConv1dGatedDeltaRule(),
@@ -274,7 +281,14 @@ class GDNAttentionTest(parameterized.TestCase):
     # Create wrapper that disables buffer donation.
     run_jitted = jax.jit(
         wrapper.fused_conv1d_gdn,
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
+        static_argnames=[
+            "n_kq",
+            "n_v",
+            "d_k",
+            "d_v",
+            "kernel_size",
+            "num_spec_tokens",
+        ],
     )
 
     # Both requests are brand new — no prior context. seq_lens equals
@@ -372,7 +386,14 @@ class GDNAttentionTest(parameterized.TestCase):
     # Create wrapper that disables buffer donation.
     run_jitted = jax.jit(
         wrapper.fused_conv1d_gdn,
-        static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
+        static_argnames=[
+            "n_kq",
+            "n_v",
+            "d_k",
+            "d_v",
+            "kernel_size",
+            "num_spec_tokens",
+        ],
     )
     common_static = dict(
         conv_weight=conv_weight,
