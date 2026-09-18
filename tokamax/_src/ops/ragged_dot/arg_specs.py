@@ -256,7 +256,7 @@ ARG_SPECS = (
         k=4096,
         n=2 * 1024,
         fuse_act='silu',
-        weight_dtype=jnp.float8_e4m3fn,
+        weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
         block_size=4096,
     ),
     _make_ullm_gmm_v2_spec(
@@ -265,7 +265,7 @@ ARG_SPECS = (
         k=1024,
         n=4096,
         fuse_act=None,
-        weight_dtype=jnp.float8_e4m3fn,
+        weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
         block_size=1024,
     ),
     _make_ullm_gmm_v2_spec(
@@ -274,7 +274,7 @@ ARG_SPECS = (
         k=4096,
         n=2 * 1024,
         fuse_act='silu',
-        weight_dtype=jnp.float8_e4m3fn,
+        weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
         block_size=4096,
     ),
     _make_ullm_gmm_v2_spec(
@@ -283,7 +283,7 @@ ARG_SPECS = (
         k=1024,
         n=4096,
         fuse_act=None,
-        weight_dtype=jnp.float8_e4m3fn,
+        weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
         block_size=1024,
     ),
     _make_ullm_gmm_v2_spec(
@@ -292,7 +292,7 @@ ARG_SPECS = (
         k=4096,
         n=2 * 1024,
         fuse_act='silu',
-        weight_dtype=jnp.float4_e2m1fn,
+        weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
         block_size=64,
     ),
     _make_ullm_gmm_v2_spec(
@@ -301,7 +301,7 @@ ARG_SPECS = (
         k=1024,
         n=4096,
         fuse_act=None,
-        weight_dtype=jnp.float4_e2m1fn,
+        weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
         block_size=64,
     ),
     _make_ullm_gmm_v2_spec(
@@ -310,7 +310,7 @@ ARG_SPECS = (
         k=4096,
         n=2 * 1024,
         fuse_act='silu',
-        weight_dtype=jnp.float4_e2m1fn,
+        weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
         block_size=64,
     ),
     _make_ullm_gmm_v2_spec(
@@ -319,7 +319,7 @@ ARG_SPECS = (
         k=1024,
         n=4096,
         fuse_act=None,
-        weight_dtype=jnp.float4_e2m1fn,
+        weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
         block_size=64,
     ),
 )

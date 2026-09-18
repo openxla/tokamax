@@ -87,9 +87,9 @@ class ConfigsTest(parameterized.TestCase):
         page_size=16,
         total_q_tokens=8,
         num_page_indices=128,
-        dtype_q=dtype,
-        dtype_kv=dtype,
-        dtype_out=jnp.bfloat16,
+        dtype_q=dtype,  # pyrefly: ignore[bad-argument-type]
+        dtype_kv=dtype,  # pyrefly: ignore[bad-argument-type]
+        dtype_out=jnp.bfloat16,  # pyrefly: ignore[bad-argument-type]
     )
     vmem_limit = 64 * 1024 * 1024
     with mock.patch.object(
