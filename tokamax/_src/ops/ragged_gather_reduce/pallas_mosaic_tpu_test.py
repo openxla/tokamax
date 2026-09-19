@@ -37,8 +37,9 @@ class PallasTpuRaggedGatherReduceTest(parameterized.TestCase):
   def test_sc_gather_reduce(
       self, input_size, hidden_size, reduce_group_size, dtype
   ):
-    if backend.get_default_device().platform != "tpu":
-      self.skipTest("Only tested on TPU.")
+    op = pallas_mosaic_tpu.PallasTpuRaggedGatherReduce()
+    if not op.supported_on(backend.get_default_device()):
+      self.skipTest("PallasTpuRaggedGatherReduce not supported on this device.")
 
     key = jax.random.key(0)
     x = jax.random.normal(key, (input_size, hidden_size), jnp.float32).astype(
@@ -50,7 +51,6 @@ class PallasTpuRaggedGatherReduceTest(parameterized.TestCase):
     )
     valid_rows_mask = jnp.ones((input_size,), jnp.bool_)
 
-    op = pallas_mosaic_tpu.PallasTpuRaggedGatherReduce()
     actual = op(
         x,
         indices,
