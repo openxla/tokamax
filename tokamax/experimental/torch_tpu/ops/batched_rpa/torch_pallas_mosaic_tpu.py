@@ -20,6 +20,7 @@ from typing import Any, Literal, cast, override
 
 from absl import logging
 import jax
+from tokamax._src.ops.experimental.batched_rpa import types as jax_types
 import tokamax._src.ops.experimental.batched_rpa.pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
@@ -48,6 +49,7 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
       page_indices: jax.Array,
       cu_q_lens: jax.Array,
       distribution: jax.Array,
+      cp_rank: jax.Array | None = None,
       *,
       use_causal_mask: bool = True,
       sm_scale: float = 1.0,
@@ -58,6 +60,13 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      chunk_prefill_size: int | None = None,
+      vmem_limit_bytes: int | None = None,
+      debug_mode: bool = False,
+      skip_kv_update: bool = True,
+      decode_query_size: int = 1,
+      cp_group_size: int | None = None,
+      return_lse: bool = False,
       return_residuals: bool = False,
   ) -> tuple[jax.Array, jax.Array]:
     assert (
@@ -81,6 +90,15 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        decode_query_size=decode_query_size,
+        skip_kv_update=skip_kv_update,
+        kv_layout=self.kv_layout,
+        cp_group_size=cp_group_size,
+        cp_rank=cp_rank,
+        attention_scope=self.attention_scope,
+        return_lse=return_lse,
+        decode_block_sizes=self.decode_block_sizes,
+        prefill_block_sizes=self.prefill_block_sizes,
         return_residuals=return_residuals,
         config=self.configs[0],
     )
@@ -96,6 +114,7 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
       page_indices: torch.Tensor,
       cu_q_lens: torch.Tensor,
       distribution: torch.Tensor,
+      cp_rank: torch.Tensor | None = None,
       *,
       use_causal_mask: bool = True,
       sm_scale: float = 1.0,
@@ -105,6 +124,22 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      chunk_prefill_size: int | None = None,
+      decode_block_sizes: jax_types.BlockSizes | None = None,
+      prefill_block_sizes: jax_types.BlockSizes | None = None,
+      vmem_limit_bytes: int | None = None,
+      debug_mode: bool = False,
+      out_dtype: Any = None,
+      skip_kv_update: bool = True,
+      kv_layout: (
+          jax_types.KVLayout | str
+      ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,
+      decode_query_size: int = 1,
+      cp_group_size: int | None = None,
+      attention_scope: (
+          jax_types.AttentionScope | str
+      ) = jax_types.AttentionScope.FULL,
+      return_lse: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -125,6 +160,16 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
           cu_q_lens,
           distribution,
       )
+    else:
+      self.configs = (config, None)
+
+    # Store the inputs that cannot go through jax_op.
+    self.out_dtype = out_dtype
+    self.decode_block_sizes = decode_block_sizes
+    self.prefill_block_sizes = prefill_block_sizes
+    self.kv_layout = kv_layout
+    self.attention_scope = attention_scope
+
     return self._torch_tokamax_op(
         queries,
         keys,
@@ -134,6 +179,7 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
         page_indices,
         cu_q_lens,
         distribution,
+        cp_rank,
         use_causal_mask=use_causal_mask,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
@@ -142,6 +188,13 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        chunk_prefill_size=chunk_prefill_size,
+        vmem_limit_bytes=vmem_limit_bytes,
+        debug_mode=debug_mode,
+        skip_kv_update=skip_kv_update,
+        decode_query_size=decode_query_size,
+        cp_group_size=cp_group_size,
+        return_lse=return_lse,
         return_residuals=return_residuals,
     )
 
