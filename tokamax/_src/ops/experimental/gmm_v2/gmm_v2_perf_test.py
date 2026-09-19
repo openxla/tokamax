@@ -34,6 +34,9 @@ class GmmPerfTest(parameterized.TestCase):
     super().setUp()
 
   def test_gmm_perf_regression_maxtext(self):
+    tpu_gen = pltpu.get_tpu_info().generation
+    if tpu_gen < 7:
+      self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
     m, k, n, num_groups = 262144, 7168, 1024, 256
     block_size = 256
     k0, k1 = jax.random.split(jax.random.key(0), 2)
@@ -43,7 +46,7 @@ class GmmPerfTest(parameterized.TestCase):
     group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
@@ -67,14 +70,13 @@ class GmmPerfTest(parameterized.TestCase):
     res = benchmarking.benchmark(fn, args, method="hermetic_xprof")
     logging.info("Benchmark time (ms): %s", res.median_evaluation_time_ms)
 
-    tpu_gen = pltpu.get_tpu_info().generation
-    if tpu_gen == 7:
-      threshold = 3.40  # 110% of measured median latency in ms
-      self.assertLessEqual(res.median_evaluation_time_ms, threshold)
-    else:
-      self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
+    threshold = 3.40  # 110% of measured median latency in ms
+    self.assertLessEqual(res.median_evaluation_time_ms, threshold)
 
   def test_tgmm_perf_regression_maxtext(self):
+    tpu_gen = pltpu.get_tpu_info().generation
+    if tpu_gen < 7:
+      self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
     m, k, n, num_groups = 262144, 7168, 1024, 256
     k0, k2 = jax.random.split(jax.random.key(0), 2)
 
@@ -85,7 +87,7 @@ class GmmPerfTest(parameterized.TestCase):
     group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
     grad_q, grad_scale = gmm_util.quantize_tensor(
-        grad, jnp.float8_e5m2, axis=0, block_size=m
+        grad, jnp.float8_e5m2, axis=0, block_size=m  # pyrefly: ignore[bad-argument-type]
     )
     grad_scale = jnp.expand_dims(grad_scale, axis=1)
 
@@ -111,57 +113,103 @@ class GmmPerfTest(parameterized.TestCase):
     res = benchmarking.benchmark(fn, args, method="hermetic_xprof")
     logging.info("Benchmark time (ms): %s", res.median_evaluation_time_ms)
 
-    tpu_gen = pltpu.get_tpu_info().generation
-    if tpu_gen == 7:
-      threshold = 5.27  # 110% of measured median latency in ms
-      self.assertLessEqual(res.median_evaluation_time_ms, threshold)
-    else:
-      self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
+    threshold = 5.27  # 110% of measured median latency in ms
+    self.assertLessEqual(res.median_evaluation_time_ms, threshold)
 
   # The ULLM MoE layer runs two gmm calls per token batch: the fused gate + up
   # projection, followed by the down projection. Both are covered here at a
   # prefill and at a decode batch size.
   @parameterized.named_parameters(
       dict(
-          testcase_name="ullm_prefill_gate_up",
+          testcase_name="ullm_fp8_prefill_gate_up",
           m=81920,  # 8192 tokens * topk 10.
           k=4096,  # hidden_size.
           n=2 * 1024,  # gate and up, each moe_intermediate_size wide.
           fuse_act="silu",
           threshold=0.2453,  # 110% of measured median latency in ms
+          weight_dtype=jnp.float8_e4m3fn,
+          block_size=4096,
       ),
       dict(
-          testcase_name="ullm_prefill_down",
+          testcase_name="ullm_fp8_prefill_down",
           m=81920,
           k=1024,  # moe_intermediate_size.
           n=4096,  # hidden_size.
           fuse_act=None,
           threshold=0.1617,
+          weight_dtype=jnp.float8_e4m3fn,
+          block_size=1024,
       ),
       dict(
-          testcase_name="ullm_decode_gate_up",
+          testcase_name="ullm_fp8_decode_gate_up",
           m=1280,  # 128 tokens * topk 10.
           k=4096,
           n=2 * 1024,
           fuse_act="silu",
           threshold=0.1936,
+          weight_dtype=jnp.float8_e4m3fn,
+          block_size=4096,
       ),
       dict(
-          testcase_name="ullm_decode_down",
+          testcase_name="ullm_fp8_decode_down",
           m=1280,
           k=1024,
           n=4096,
           fuse_act=None,
           threshold=0.1221,
+          weight_dtype=jnp.float8_e4m3fn,
+          block_size=1024,
+      ),
+      dict(
+          testcase_name="ullm_fp4_prefill_gate_up",
+          m=81920,
+          k=4096,
+          n=2 * 1024,
+          fuse_act="silu",
+          threshold=0.2805,  # 110% of measured median latency in ms
+          weight_dtype=jnp.float4_e2m1fn,
+          block_size=64,
+      ),
+      dict(
+          testcase_name="ullm_fp4_prefill_down",
+          m=81920,
+          k=1024,
+          n=4096,
+          fuse_act=None,
+          threshold=0.1672,
+          weight_dtype=jnp.float4_e2m1fn,
+          block_size=64,
+      ),
+      dict(
+          testcase_name="ullm_fp4_decode_gate_up",
+          m=1280,
+          k=4096,
+          n=2 * 1024,
+          fuse_act="silu",
+          threshold=0.2442,
+          weight_dtype=jnp.float4_e2m1fn,
+          block_size=64,
+      ),
+      dict(
+          testcase_name="ullm_fp4_decode_down",
+          m=1280,
+          k=1024,
+          n=4096,
+          fuse_act=None,
+          threshold=0.1397,
+          weight_dtype=jnp.float4_e2m1fn,
+          block_size=64,
       ),
   )
-  def test_gmm_perf_regression_ullm(self, m, k, n, fuse_act, threshold):
+  def test_gmm_perf_regression_ullm(
+      self, m, k, n, fuse_act, threshold, weight_dtype, block_size
+  ):
+    tpu_gen = pltpu.get_tpu_info().generation
+    if tpu_gen < 7:
+      self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
     num_groups = 512  # Global number of experts.
     num_local_groups = 64  # Experts per EP shard (512 / 8).
     group_offset = 256  # First expert of EP shard 4 (a middle shard).
-    # The weights reach the kernel with a single per-output-channel scale
-    # covering the whole k axis, i.e. `rhs_scale` is [64, 1, 1, n].
-    block_size = k
     k0, k1 = jax.random.split(jax.random.key(0), 2)
 
     lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
@@ -172,7 +220,7 @@ class GmmPerfTest(parameterized.TestCase):
     group_sizes = jnp.full((num_groups,), m // num_groups, jnp.int32)
 
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, weight_dtype, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
@@ -197,12 +245,7 @@ class GmmPerfTest(parameterized.TestCase):
     fn = jax.jit(fn)
     res = benchmarking.benchmark(fn, args, method="hermetic_xprof")
     logging.info("Benchmark time (ms): %s", res.median_evaluation_time_ms)
-
-    tpu_gen = pltpu.get_tpu_info().generation
-    if tpu_gen == 7:
-      self.assertLessEqual(res.median_evaluation_time_ms, threshold)
-    else:
-      self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
+    self.assertLessEqual(res.median_evaluation_time_ms, threshold)
 
 
 if __name__ == "__main__":

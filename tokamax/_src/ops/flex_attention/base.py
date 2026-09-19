@@ -29,6 +29,7 @@ from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
 
@@ -189,9 +190,9 @@ class FlexAttention[C, K](
   @override
   def bind(
       self,
-      q: Float[Array | QArray, "*B T H D"],
-      k: Float[Array | QArray, "*B t h D"],
-      v: Float[Array | QArray, "*B t h d"],
+      q: Float[Array | QArray | AbstractArray, "*B T H D"],
+      k: Float[Array | QArray | AbstractArray, "*B t h D"],
+      v: Float[Array | QArray | AbstractArray, "*B t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -199,7 +200,7 @@ class FlexAttention[C, K](
       ) = None,
       score_mod: ScoreMod | None = None,
       mask_mod: MaskMod | None = None,
-      dropout_mask: Bool[Array, "*#B #H #T #t"] | None = None,
+      dropout_mask: Bool[Array | AbstractArray, "*#B #H #T #t"] | None = None,
       dropout_rate: float = 0.0,
       q_sharding: jax.sharding.NamedSharding | None = None,
       k_sharding: jax.sharding.NamedSharding | None = None,

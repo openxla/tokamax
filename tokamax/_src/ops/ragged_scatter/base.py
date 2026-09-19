@@ -22,6 +22,8 @@ from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
+
 
 def ragged_scatter(
     x: jax.Array,
@@ -41,10 +43,14 @@ class RaggedScatter[C](op.Op[Any, jax.Array, None, C, Any]):
   @jaxtyping.jaxtyped
   def bind(
       self,
-      x: Shaped[Array, "num_rows hidden_size"],
-      indices: Int[Array, "output_size"],
-      start: Int[Array, "1"] | Int[Array, ""],
-      end: Int[Array, "1"] | Int[Array, ""],
+      x: Shaped[Array | AbstractArray, "num_rows hidden_size"],
+      indices: Int[Array | AbstractArray, "output_size"],
+      start: (
+          Int[Array | AbstractArray, "1"] | Int[Array | AbstractArray, ""]
+      ),
+      end: (
+          Int[Array | AbstractArray, "1"] | Int[Array | AbstractArray, ""]
+      ),
       *,
       return_residuals: bool = False,
   ) -> op.BoundArguments:

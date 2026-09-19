@@ -26,7 +26,7 @@ from tokamax._src import gpu_utils
 from tokamax._src import mosaic_gpu as common
 
 
-class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
+class PallasMosaicGpuUtilsTest(parameterized.TestCase):
 
   def setUp(self):
     if jax.default_backend() == "tpu":
@@ -47,7 +47,10 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
       layout = plgpu.Layout.WGMMA_UPCAST_4X
       x = plgpu.load(x_ref, layout=layout, optimized=False)
       x = common.int4_as_biased_f8e4m3fn(x, layout)
-      o_ref[...] = x
+      if jax.__version_info__ >= (0, 11, 2):
+        plgpu.store(o_ref, x, optimized=False)
+      else:
+        o_ref[...] = x
 
     x = jnp.arange(-8, 8, dtype=jnp.int8)
     x = jnp.tile(x, shape[0] * shape[1] // 16).astype(jnp.int4)
@@ -112,7 +115,10 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
         # `S * D - Z * row_sum(A)` where S is scale=512 and Z is bias=8
         acc = 512 * plgpu.async_load_tmem(acc_tmem, layout=plgpu.Layout.TCGEN05)
         acc -= 8 * lax.broadcast_in_dim(a_row_sum, acc.shape, [0])
-        out_gmem[...] = acc
+        if jax.__version_info__ >= (0, 11, 2):
+          plgpu.store(out_gmem, acc, optimized=False)
+        else:
+          out_gmem[...] = acc
 
       pipeline(a_gmem, b_gmem)
 
@@ -124,6 +130,29 @@ class PallasMosaicGpuConversionUtilsTest(parameterized.TestCase):
     actual = kernel(a_f8, b)
     ref = a_f8.astype(jnp.float32) @ b.astype(jnp.float32).T
     np.testing.assert_array_equal(actual, ref)
+
+  def test_warp_map_when(self):
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((8,), jnp.int32),
+        num_threads=2,
+        thread_name="wg",
+    )
+    def kernel(x_ref, out_ref):
+      wg_idx = lax.axis_index("wg")
+
+      @common.warp_map_when(wg_idx == 0)
+      def _(warp_id):
+        out_ref[warp_id] = x_ref[warp_id] + 10
+
+      @common.warp_map_when(wg_idx == 1)
+      def _(warp_id):
+        out_ref[4 + warp_id] = x_ref[4 + warp_id] + 20
+
+    x = jnp.arange(8, dtype=jnp.int32)
+    actual = kernel(x)
+    expected = jnp.array([10, 11, 12, 13, 24, 25, 26, 27], dtype=jnp.int32)
+    np.testing.assert_array_equal(actual, expected)
 
 
 if __name__ == "__main__":

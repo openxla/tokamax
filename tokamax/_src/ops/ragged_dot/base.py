@@ -31,6 +31,7 @@ from tokamax._src.ops import op
 
 # Type variables used below are defined in the generic class signature.
 type Residuals = jax.Array | None
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 QArray = qwix.QArray
 AsQArray = quantization.AsQArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
@@ -271,23 +272,23 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   @override
   def bind(
       self,
-      lhs: jax.Array | QArray | AsQArray,
-      rhs: jax.Array | QArray | AsQArray,
+      lhs: jax.Array | QArray | AsQArray | AbstractArray,
+      rhs: jax.Array | QArray | AsQArray | AbstractArray,
       *,
-      group_sizes: jax.Array | GroupSizes | Sequence[int],
+      group_sizes: jax.Array | GroupSizes | Sequence[int] | AbstractArray,
       ragged_dot_dimension_numbers: (
           jax.lax.RaggedDotDimensionNumbers | None
       ) = None,
       precision: jax.lax.PrecisionLike = None,
       preferred_element_type: jax.typing.DTypeLike | None = None,
       return_residuals: bool = False,
-      group_offset: jax.Array | None = None,
+      group_offset: jax.Array | AbstractArray | None = None,
       activation: ActivationFunction | None = None,
       manual_axis_type: jax.sharding.ManualAxisType | None = None,
-      rhs_scale: jax.Array | None = None,
-      rhs_bias: jax.Array | None = None,
+      rhs_scale: jax.Array | AbstractArray | None = None,
+      rhs_bias: jax.Array | AbstractArray | None = None,
       maybe_quantize_lhs: bool = False,
-      lhs_scale: jax.Array | None = None,
+      lhs_scale: jax.Array | AbstractArray | None = None,
       zero_initialize: bool = True,
       fuse_gateup_activation: str | None = None,
       lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
@@ -304,7 +305,7 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
 
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:
       if not isinstance(group_sizes, GroupSizes):
-        group_sizes = GroupSizes(group_sizes, lhs.shape[0])
+        group_sizes = GroupSizes(group_sizes, lhs.shape[0])  # pyrefly: ignore[bad-argument-type]
 
       if self.checkify_group_sizes:
         gs = group_sizes.value

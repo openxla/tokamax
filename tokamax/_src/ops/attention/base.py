@@ -40,6 +40,7 @@ class AUTO:  # Used as a sentinel value.
   pass
 
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
 
@@ -476,9 +477,9 @@ class DotProductAttention[C, K: Hashable](
   @override
   def bind(
       self,
-      q: Float[Array | QArray, "*B T H D"],
-      k: Float[Array | QArray, "*b t h D"],
-      v: Float[Array | QArray, "*b t h d"],
+      q: Float[Array | QArray | AbstractArray, "*B T H D"],
+      k: Float[Array | QArray | AbstractArray, "*b t h D"],
+      v: Float[Array | QArray | AbstractArray, "*b t h d"],
       *,
       precision: (
           jax.lax.PrecisionLike
@@ -486,17 +487,17 @@ class DotProductAttention[C, K: Hashable](
       ) = jax.lax.Precision.DEFAULT,
       logits_dtype: DTypeLike | type[AUTO] = AUTO,
       logits_scale: float | type[AUTO] = AUTO,
-      bias: Float[Array, "*#B #H #T #t"] | None = None,
+      bias: Float[Array | AbstractArray, "*#B #H #T #t"] | None = None,
       logits_soft_cap: float | None = None,
-      mask: Bool[Array, "*#B #H #T #t"] | Mask | None = None,
+      mask: Bool[Array | AbstractArray, "*#B #H #T #t"] | Mask | None = None,
       is_causal: bool = False,
-      dropout_mask: Bool[Array, "*#B #H #T #t"] | None = None,
+      dropout_mask: Bool[Array | AbstractArray, "*#B #H #T #t"] | None = None,
       dropout_rate: float = 0.0,
       paging_info: PagingInfo | None = None,
       q_sharding: jax.sharding.NamedSharding | None = None,
       k_sharding: jax.sharding.NamedSharding | None = None,
-      q_indices: Int[Array, "*#B #H T"] | None = None,
-      k_indices: Int[Array, "*#b #h t"] | None = None,
+      q_indices: Int[Array | AbstractArray, "*#B #H T"] | None = None,
+      k_indices: Int[Array | AbstractArray, "*#b #h t"] | None = None,
       normalize_output: bool = True,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
@@ -528,7 +529,7 @@ class DotProductAttention[C, K: Hashable](
       logits_scale = 1 / math.sqrt(q.shape[-1])
 
     if not isinstance(mask, Mask):
-      mask = Mask(mask)
+      mask = Mask(mask)  # pyrefly: ignore[bad-argument-type]
 
     if is_causal:
       mask &= CAUSAL_MASK

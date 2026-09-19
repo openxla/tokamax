@@ -105,7 +105,9 @@ def annotate(ty: Any) -> Any:
   if isinstance(ty, type):
     if issubclass(ty, jaxtyping.AbstractArray):
       ty = ty.array_type
-    if issubclass(ty, (jax.Array, np.ndarray)):
+    if issubclass(
+        ty, (jax.Array, np.ndarray, jax.ShapeDtypeStruct, jax.core.ShapedArray)
+    ):
       return Annotated[ty, ShapeDtype]
     if issubclass(ty, enum.Enum):
       return Annotated[ty, EnumByName]

@@ -634,22 +634,14 @@ def flash_attention_kernel(
   if config.persistent:
     maybe_persistent_kernel = mgpu_lib.static_scheduling_persistent_kernel
   else:
-    grid_names = ("heads", "q_tiles")
-
-    def maybe_persistent_kernel(body, **kwargs):
-      def wrapped_body(*args, **kwargs):
-        idx = tuple(map(lax.axis_index, grid_names))
-        loop_info = plgpu.NDLoopInfo(idx, local_index=0, num_local_steps=1)
-        grid_loop = lambda init_carry: lambda f: f(args, loop_info, init_carry)
-        return body(grid_loop, **kwargs)
-
-      return plgpu.kernel(wrapped_body, grid_names=grid_names, **kwargs)
+    maybe_persistent_kernel = mgpu_lib.not_persistent_grid_loop_kernel
 
   out, *residuals = maybe_persistent_kernel(
       kernel,
       out_type=out_shape,
       scratch_types=scratch_types,
       grid=(num_q_heads, num_q_tiles),
+      grid_names=("heads", "q_tiles"),
       num_threads=_COMPUTE_WGS + 1,
       thread_name="wg",
       compiler_params=plgpu.CompilerParams(

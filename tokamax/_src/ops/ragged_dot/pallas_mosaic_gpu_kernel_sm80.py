@@ -48,7 +48,8 @@ def get_heuristics_config(ba: op.BoundArguments) -> common.Config:
 
 
 def get_autotuning_configs(ba: op.BoundArguments) -> set[common.Config]:
-  lhs, rhs, _ = ba.args
+  """Returns autotuning configs for SM80."""
+  lhs, rhs = ba.args
   _, k = lhs.shape
   n = rhs.shape[-1]
 

@@ -367,7 +367,7 @@ class XlaChunkedDotProductAttention(
     )
 
     if is_paged:
-      attn_fn = functools.partial(_attend_paged, chunk_size=self.chunk_size)
+      attn_fn = functools.partial(_attend_paged, chunk_size=self.chunk_size)  # pyrefly: ignore[bad-argument-type]
     else:
       chunk_size = (n, n) if isinstance(n := self.chunk_size, int) else n
       attn_fn = functools.partial(_attend_chunked, chunk_size=chunk_size)

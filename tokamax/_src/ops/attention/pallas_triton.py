@@ -604,7 +604,7 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
         is_causal=is_causal,
         config=config,
         use_base2=self.use_base2,
-        use_stable_softmax=use_stable_softmax,
+        use_stable_softmax=use_stable_softmax,  # pyrefly: ignore[bad-argument-type]
         return_residuals=return_residuals,
         dropout_rate=dropout_rate,
         logits_dtype=logits_dtype,
@@ -635,10 +635,10 @@ class PallasTritonFlashAttention(base.DotProductAttention[Config, None]):
       combine_partial_results = functools.partial(
           base.combine_partial_results, normalize_output=normalize_output
       )
-      f = lambda *args, f=f: combine_partial_results(*f(*args))
+      f = lambda *args, f=f: combine_partial_results(*f(*args))  # pyrefly: ignore[bad-argument-type]
 
     out, residuals = base.vmap_batch_dims(f)(
-        q, k, v, bias, mask, dropout_mask, q_start, q_end, k_start, k_end
+        q, k, v, bias, mask, dropout_mask, q_start, q_end, k_start, k_end  # pyrefly: ignore[bad-argument-type]
     )
     return out.astype(q.dtype), (residuals if return_residuals else None)
 

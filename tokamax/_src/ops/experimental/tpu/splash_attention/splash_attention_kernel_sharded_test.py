@@ -121,10 +121,10 @@ class SplashAttentionShardingTest(PallasBaseTest):
 
     if is_dynamic_mask:
       kernel, kernel_spec = splash.make_dynamic_splash_mha(
-          mask, mesh=mesh, mask_spec=mask_spec
+          mask, mesh=mesh, mask_spec=mask_spec  # pyrefly: ignore[bad-argument-type]
       )
     else:
-      kernel = splash.make_splash_mha(mask, q_seq_shards=q_seq_shards)
+      kernel = splash.make_splash_mha(mask, q_seq_shards=q_seq_shards)  # pyrefly: ignore[bad-argument-type]
       kernel_spec = kernel.manual_sharding_spec(
           jax.sharding.NamedSharding(mesh, mask_spec)
       )
@@ -208,10 +208,10 @@ class SplashAttentionShardingTest(PallasBaseTest):
 
     if is_dynamic_mask:
       kernel, kernel_spec = splash.make_dynamic_splash_mha(
-          mask, mesh=mesh, mask_spec=mask_spec
+          mask, mesh=mesh, mask_spec=mask_spec  # pyrefly: ignore[bad-argument-type]
       )
     else:
-      kernel = splash.make_splash_mha(mask, q_seq_shards=q_seq_shards)
+      kernel = splash.make_splash_mha(mask, q_seq_shards=q_seq_shards)  # pyrefly: ignore[bad-argument-type]
       kernel_spec = kernel.manual_sharding_spec(
           jax.sharding.NamedSharding(mesh, mask_spec)
       )

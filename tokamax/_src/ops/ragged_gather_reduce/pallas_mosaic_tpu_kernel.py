@@ -589,7 +589,6 @@ def ragged_gather_reduce_pallas(
       compiler_params=pltpu.CompilerParams(
           use_tc_tiling_on_sc=True,
           disable_bounds_checks=True,
-          needs_layout_passes=False,
       ),
       scratch_types=scratches,
       mesh=vector_mesh,

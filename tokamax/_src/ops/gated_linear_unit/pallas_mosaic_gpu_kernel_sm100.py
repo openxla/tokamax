@@ -23,6 +23,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import, g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_common as common
 
@@ -142,82 +143,80 @@ def gated_linear_unit(
       # Accumulator for X @ W1
       acc_tmem_slice_1 = acc1_tmem.at[:, pl.ds(acc_slot * tile_n, tile_n)]
 
-      @pl.when(wg_idx == 0)
-      def _compute_wg():
-        @plgpu.warp_map
-        def _per_warp(warp_id):
-          b_smems = (b0_smem, b1_smem)
-          consumed_barriers = (consumed_barrier_0, consumed_barrier_1)
+      @mgpu_lib.warp_map_when(wg_idx == 0)
+      def _compute_wg_warp(warp_id):
+        b_smems = (b0_smem, b1_smem)
+        consumed_barriers = (consumed_barrier_0, consumed_barrier_1)
 
-          @pl.when(warp_id == 0)
-          def _tma_warp():
-            def _loop_body(ki, _):
-              slice_k = pl.ds(ki * tile_k, tile_k)
-              slice_n = pl.ds(block_n_index * tile_n, tile_n)
-              slot = lax.rem(ki, max_concurrent_steps)
+        @pl.when(warp_id == 0)
+        def _tma_warp():
+          def _loop_body(ki, _):
+            slice_k = pl.ds(ki * tile_k, tile_k)
+            slice_n = pl.ds(block_n_index * tile_n, tile_n)
+            slot = lax.rem(ki, max_concurrent_steps)
 
-              def _wait_barrier(barrier):
-                @pl.when(
-                    jnp.logical_or(ki >= max_concurrent_steps, local_index > 0)
-                )
-                def _():
-                  plgpu.barrier_wait(barrier.at[slot])
+            def _wait_barrier(barrier):
+              @pl.when(
+                  jnp.logical_or(ki >= max_concurrent_steps, local_index > 0)
+              )
+              def _():
+                plgpu.barrier_wait(barrier.at[slot])
 
-              for i in range(2):
-                _wait_barrier(consumed_barriers[i])
-                plgpu.copy_gmem_to_smem(
-                    b_gmem.at[slice_k, i, slice_n],
-                    b_smems[i].at[slot],
-                    ab_tma_barrier.at[slot],
-                    leader_tracked=plgpu.CopyPartition.PARTITIONED(1)
-                    if config.cluster_size_m > 1
-                    else None,
-                    collective_axes=collective_axis,
-                )
+            for i in range(2):
+              _wait_barrier(consumed_barriers[i])
               plgpu.copy_gmem_to_smem(
-                  a_gmem.at[slice_m, slice_k],
-                  a_smem.at[slot],
+                  b_gmem.at[slice_k, i, slice_n],
+                  b_smems[i].at[slot],
                   ab_tma_barrier.at[slot],
                   leader_tracked=plgpu.CopyPartition.PARTITIONED(1)
-                  if config.cluster_size_n > 1
+                  if config.cluster_size_m > 1
                   else None,
                   collective_axes=collective_axis,
               )
+            plgpu.copy_gmem_to_smem(
+                a_gmem.at[slice_m, slice_k],
+                a_smem.at[slot],
+                ab_tma_barrier.at[slot],
+                leader_tracked=plgpu.CopyPartition.PARTITIONED(1)
+                if config.cluster_size_n > 1
+                else None,
+                collective_axes=collective_axis,
+            )
 
-            lax.fori_loop(0, k_iters, _loop_body, None)
+          lax.fori_loop(0, k_iters, _loop_body, None)
 
-          @pl.when(jnp.logical_and(warp_id == 1, local_index > 1))
-          def _wait_store():
-            plgpu.barrier_wait(store_done_barrier.at[acc_slot])
+        @pl.when(jnp.logical_and(warp_id == 1, local_index > 1))
+        def _wait_store():
+          plgpu.barrier_wait(store_done_barrier.at[acc_slot])
 
-          @pl.when(jnp.logical_and(warp_id == 1, is_lead_block))
-          def _mma_warp():
-            def _loop_body(ki, _):
-              slot = lax.rem(ki, max_concurrent_steps)
-              plgpu.barrier_wait(ab_tma_barrier.at[slot])
-              # TODO: When tcgen05 supports reshapes with
-              # transposes like wgmma we can avoid the dual
-              # accumulators.
-              #
-              acc_tmem_slices = (acc_tmem_slice_0, acc_tmem_slice_1)
-              for i in range(2):
-                plgpu.tcgen05_mma(
-                    acc_tmem_slices[i],
-                    a_smem.at[slot],
-                    b_smems[i].at[slot],
-                    consumed_barriers[i].at[slot],
-                    accumulate=(ki > 0),
-                    collective_axis=collective_axis,
-                )
+        @pl.when(jnp.logical_and(warp_id == 1, is_lead_block))
+        def _mma_warp():
+          def _loop_body(ki, _):
+            slot = lax.rem(ki, max_concurrent_steps)
+            plgpu.barrier_wait(ab_tma_barrier.at[slot])
+            # TODO: When tcgen05 supports reshapes with
+            # transposes like wgmma we can avoid the dual
+            # accumulators.
+            #
+            acc_tmem_slices = (acc_tmem_slice_0, acc_tmem_slice_1)
+            for i in range(2):
+              plgpu.tcgen05_mma(
+                  acc_tmem_slices[i],
+                  a_smem.at[slot],
+                  b_smems[i].at[slot],
+                  consumed_barriers[i].at[slot],
+                  accumulate=(ki > 0),
+                  collective_axis=collective_axis,
+              )
 
-              @pl.when(ki >= k_iters - 1)
-              def _arrive():
-                plgpu.tcgen05_commit_arrive(
-                    mma_done_barrier.at[acc_slot],
-                    collective_axis=collective_axis,
-                )
+            @pl.when(ki >= k_iters - 1)
+            def _arrive():
+              plgpu.tcgen05_commit_arrive(
+                  mma_done_barrier.at[acc_slot],
+                  collective_axis=collective_axis,
+              )
 
-            lax.fori_loop(0, k_iters, _loop_body, None)
+          lax.fori_loop(0, k_iters, _loop_body, None)
 
       @pl.when(wg_idx == 1)
       def _store_wg():

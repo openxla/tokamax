@@ -255,7 +255,7 @@ def unpack_bool_bits_tmem_native(a):
       arg_types=(plgpu.Layout.TCGEN05_TMEM_NATIVE(32 // packed_bits),),
       return_type=plgpu.ShapeDtypeStruct(
           (128, target_cols),
-          jnp.bool_,
+          jnp.bool_,  # pyrefly: ignore[bad-argument-type]
           out_layout,
       ),
   )

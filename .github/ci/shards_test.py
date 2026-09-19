@@ -25,7 +25,10 @@ Stdlib `unittest`, no third-party imports.
 
 from __future__ import annotations
 
+import collections
 from collections.abc import Collection, Iterable, Mapping
+import contextlib
+import io
 import os
 import tempfile
 import textwrap
@@ -33,6 +36,7 @@ from typing import NoReturn
 import unittest
 from unittest import mock
 
+import deps
 import shards
 
 # Two private names, aliased once rather than reached for at each use: the
@@ -83,6 +87,7 @@ def check(
     shard_map: Mapping[str, tuple[str, ...] | shards.Spec],
     files: Collection[str] = FILES,
     classes: Mapping[str, list[str]] | None = None,
+    pyproject: str | None = None,
 ) -> list[str]:
   """Runs `check_consistency` over a fake tree.
 
@@ -92,6 +97,7 @@ def check(
     files: The fake tree, defaulting to `FILES`.
     classes: File to its class names, standing in for the AST reader. Defaults
       to `CLASSES`.
+    pyproject: Path to pyproject.toml to verify JAX floor against, or None.
 
   Returns:
     The errors, minus the ones the fake tree provokes about itself.
@@ -113,6 +119,7 @@ def check(
           set(),
           ignored,
           class_reader=(classes or CLASSES).get,
+          pyproject=pyproject,
       )
   )
   # Errors about the fake tree rather than about the case under test: the
@@ -248,15 +255,23 @@ class ShardTableTest(unittest.TestCase):
     errors = check({'s1': dict(paths=FILES[:3], devices=('tpu',))})
     self.assertIn('has a `devices` key', ' '.join(errors))
 
+  def _jobs_on_latest_jax(
+      self, table: Mapping[str, shards.Spec]
+  ) -> list[shards.MatrixEntry]:
+    return [
+        c
+        for c in shards.build_matrix(table)
+        if c['jax_pin'] == shards.latest_jax()
+    ]
+
   def test_matrix_is_one_job_per_shard_and_runner(self) -> None:
     table = {'s1': dict(paths=FILES[:2]), 's2': dict(paths=FILES[2:3])}
-    combos = shards.build_matrix(table)
+    combos = self._jobs_on_latest_jax(table)
     self.assertEqual(len(combos), 2 * len(shards.RUNNERS))
     self.assertTrue(all(c['test_paths'] for c in combos))
 
   def test_matrix_covers_every_runner_once_per_shard(self) -> None:
-    table = {'s1': dict(paths=FILES[:2])}
-    combos = shards.build_matrix(table)
+    combos = self._jobs_on_latest_jax({'s1': dict(paths=FILES[:2])})
     self.assertCountEqual([c['runner'] for c in combos], list(shards.RUNNERS))
     # The device is the pip extra the job installs, and comes from `RUNNERS`.
     self.assertCountEqual(
@@ -415,6 +430,188 @@ class ThemeTest(unittest.TestCase):
     self.assertEqual(strays, [])
 
 
+class JaxFloorTest(unittest.TestCase):
+
+  def _jax_floor(self, body: str) -> str:
+    with tempfile.NamedTemporaryFile(
+        'w', suffix='.toml', delete=False, encoding='utf-8'
+    ) as f:
+      f.write(textwrap.dedent(body))
+      path = f.name
+    self.addCleanup(os.unlink, path)
+    return shards.jax_floor(path)
+
+  def test_disagreeing_floors_raise(self) -> None:
+    with self.assertRaisesRegex(ValueError, 'more than one JAX floor'):
+      self._jax_floor("""
+          [project]
+          dependencies = ["jax>=0.11.1"]
+          [project.optional-dependencies]
+          tpu = ["jax[tpu]>=0.11.0"]
+      """)
+
+  def test_no_jax_requirement_raises(self) -> None:
+    with self.assertRaisesRegex(ValueError, 'no .jax>=. requirement'):
+      self._jax_floor("""
+          [project]
+          dependencies = ["numpy>=2.1"]
+      """)
+
+  def test_floor_extracted_from_dependencies_and_extras(self) -> None:
+    floor = self._jax_floor("""
+        [project]
+        dependencies = [
+            "jax>=0.11.0",
+            "jaxlib>=0.11.0",
+            "jaxtyping>=0.3",
+        ]
+        [project.optional-dependencies]
+        tpu = ["jax[tpu]>=0.11.0"]
+        cuda = ["jax[cuda13]>=0.11.0"]
+    """)
+    self.assertEqual(floor, '0.11.0')
+
+  def test_unrelated_packages_with_jax_name_not_matched(self) -> None:
+    floor = self._jax_floor("""
+        [project]
+        dependencies = [
+            "jax>=0.11.0",
+            "cuequivariance-jax>=0.10.0",
+        ]
+    """)
+    self.assertEqual(floor, '0.11.0')
+
+
+class JaxVersionTest(unittest.TestCase):
+
+  def test_version_sorting_is_numerical(self) -> None:
+    versions = ('0.11.2', '0.11.10', '0.12.0', '0.11.0')
+    with mock.patch.object(shards, 'JAX_VERSIONS', versions):
+      self.assertEqual(
+          shards.sorted_jax_versions(),
+          ('0.12.0', '0.11.10', '0.11.2', '0.11.0'),
+      )
+      self.assertEqual(shards.latest_jax(), '0.12.0')
+      self.assertEqual(
+          shards.older_jaxs(), ('0.11.10', '0.11.2', '0.11.0')
+      )
+      self.assertEqual(shards.oldest_jax(), '0.11.0')
+
+
+class CompatMatrixTest(unittest.TestCase):
+
+  def matrix(self) -> list[shards.MatrixEntry]:
+    resolved, *_ = shards.resolve_shards()
+    return list(shards.build_matrix(resolved))
+
+  def test_every_version_runs_every_shard(self) -> None:
+    shards_by_pin = collections.defaultdict(set)
+    runners_by_pin = collections.defaultdict(set)
+    for entry in self.matrix():
+      shards_by_pin[entry['jax_pin']].add(entry['shard_name'])
+      runners_by_pin[entry['jax_pin']].add(entry['runner'])
+    self.assertCountEqual(shards_by_pin, shards.JAX_VERSIONS)
+    for version in shards.older_jaxs():
+      self.assertEqual(
+          shards_by_pin[version], shards_by_pin[shards.latest_jax()]
+      )
+      self.assertCountEqual(runners_by_pin[version], shards.COMPAT_RUNNERS)
+
+  def test_job_names_are_unique(self) -> None:
+    jobs = [(e['runner_short'], e['shard_name']) for e in self.matrix()]
+    duplicates = [
+        job for job, count in collections.Counter(jobs).items() if count > 1
+    ]
+    self.assertEqual(duplicates, [])
+
+  def test_every_job_preserves_runner_device(self) -> None:
+    for entry in self.matrix():
+      expected_device = shards.RUNNERS[entry['runner']][0]
+      self.assertEqual(entry['device'], expected_device)
+
+  def test_total_matrix_job_count(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    expected_per_shard = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
+        shards.COMPAT_RUNNERS
+    )
+    self.assertEqual(len(self.matrix()), len(resolved) * expected_per_shard)
+
+  def test_matrix_with_only_filters_all_versions(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    only = {'core-api'}
+    jobs = shards.build_matrix(resolved, only=only)
+    self.assertTrue(all(j['shard_name'] == 'core-api' for j in jobs))
+    expected = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
+        shards.COMPAT_RUNNERS
+    )
+    self.assertEqual(len(jobs), expected)
+
+
+class JaxConsistencyTest(unittest.TestCase):
+
+  def test_support_floor_mismatch_is_caught(self) -> None:
+    with tempfile.NamedTemporaryFile(
+        'w', suffix='.toml', delete=False, encoding='utf-8'
+    ) as f:
+      f.write(textwrap.dedent("""
+          [project]
+          dependencies = ["jax>=0.11.1"]
+      """))
+      path = f.name
+    self.addCleanup(os.unlink, path)
+
+    with mock.patch.object(shards, 'JAX_VERSIONS', ('0.11.1', '0.11.0')):
+      errors = check(
+          {'s1': ('pkg/api_test.py',)},
+          files=('pkg/api_test.py',),
+          pyproject=path,
+      )
+      self.assertTrue(
+          any(
+              'the JAX lower bound and the oldest JAX version the CI tests'
+              ' against have to be the same.' in e
+              for e in errors
+          )
+      )
+
+  def test_not_equal_to_two_jax_versions_is_caught(self) -> None:
+    with mock.patch.object(shards, 'JAX_VERSIONS', ('0.11.0',)):
+      errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
+      self.assertTrue(
+          any(
+              'tokamax supports 2 latest JAX versions for backward'
+              ' compatibility.' in e
+              for e in errors
+          )
+      )
+
+  def test_duplicated_jax_version_is_caught(self) -> None:
+    with mock.patch.object(
+        shards, 'JAX_VERSIONS', ('0.11.0', '0.11.0')
+    ):
+      errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
+      self.assertTrue(any('Duplicated JAX version found' in e for e in errors))
+
+  def test_invalid_jax_version_format_is_caught(self) -> None:
+    with mock.patch.object(
+        shards, 'JAX_VERSIONS', ('0.11.1', 'invalid-version')
+    ):
+      errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
+      self.assertTrue(
+          any('Invalid JAX version found in JAX_VERSIONS' in e for e in errors)
+      )
+
+  def test_unknown_compat_runner_is_caught(self) -> None:
+    with mock.patch.object(shards, 'COMPAT_RUNNERS', ('non-existent-runner',)):
+      errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
+      self.assertTrue(
+          any(
+              "COMPAT_RUNNERS 'non-existent-runner' is not in RUNNERS" in e
+              for e in errors
+          )
+      )
+
+
 class RealRepositoryTest(unittest.TestCase):
   """The table as it actually is, which is what CI runs."""
 
@@ -441,6 +638,341 @@ class RealRepositoryTest(unittest.TestCase):
     resolved, *_ = shards.resolve_shards()
     for combo in shards.build_matrix(resolved):
       self.assertTrue(combo['test_paths'], combo)
+
+
+class SelectionTest(unittest.TestCase):
+  """Narrowing the matrix to the shards a change can reach.
+
+  The asymmetry under test throughout: a shard wrongly run costs runner
+  minutes, a shard wrongly skipped reports a change green that was never
+  tested. Every uncertain path here has to fail open.
+  """
+
+  def _changed(self, *paths: str) -> str:
+    """Writes a NUL-separated change list and returns its path."""
+    handle, name = tempfile.mkstemp()
+    with os.fdopen(handle, 'w') as f:
+      f.write(''.join(f'{p}\0' for p in paths))
+    self.addCleanup(os.unlink, name)
+    return name
+
+  def test_no_list_runs_everything(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    only, reason = shards.select(resolved, shards.all_test_files(), None)
+    self.assertIsNone(only)
+    self.assertIn('every shard runs', reason)
+
+  def test_empty_list_runs_everything(self) -> None:
+    # Distinct from "reaches no test": an empty diff is a diff that failed to
+    # produce anything, and guessing that it means "nothing to run" is how a
+    # broken `git diff` would silently skip the whole suite.
+    resolved, *_ = shards.resolve_shards()
+    only, reason = shards.select(
+        resolved, shards.all_test_files(), self._changed()
+    )
+    self.assertIsNone(only)
+    self.assertIn('empty', reason)
+
+  def test_a_change_no_shard_owns_runs_everything(self) -> None:
+    # Two files that reach no shard, for unrelated reasons: `conftest.py` is
+    # inside the package and changes what every test collects, and
+    # `pyproject.toml` is outside it, so `deps` cannot trace it to a test at
+    # all. Neither may be read as "nothing to run".
+    resolved, *_ = shards.resolve_shards()
+    files = shards.all_test_files()
+    for path in ('tokamax/conftest.py', 'pyproject.toml'):
+      with self.subTest(path=path):
+        only, _ = shards.select(resolved, files, self._changed(path))
+        self.assertIsNone(only)
+
+  def test_documentation_selects_nothing(self) -> None:
+    # An empty set is a real answer, not a failure: `None` means "run
+    # everything" and these two must never be confused.
+    resolved, *_ = shards.resolve_shards()
+    only, _ = shards.select(
+        resolved, shards.all_test_files(), self._changed('README.md')
+    )
+    self.assertEqual(only, set())
+
+  def test_a_test_file_selects_its_own_shard(self) -> None:
+    files = shards.all_test_files()
+    resolved, *_ = shards.resolve_shards(files)
+    target = 'tokamax/_src/ops/attention/base_test.py'
+    self.assertIn(target, files)
+    only, _ = shards.select(resolved, files, self._changed(target))
+    self.assertTrue(only)
+    for name in only:
+      self.assertIn(name, resolved)
+    # Whichever shards those are, they are the ones that collect the file.
+    owning = {
+        n
+        for n, s in resolved.items()
+        if target in shards.collected_by(s['paths'], files)
+    }
+    self.assertEqual(only & owning, owning)
+
+  def test_selection_covers_every_affected_file(self) -> None:
+    # The property that matters: nothing affected is left unrun. Checked
+    # against a high fan-in module, so the selected set is large but not all.
+    files = shards.all_test_files()
+    resolved, *_ = shards.resolve_shards(files)
+    affected, reason = deps.affected_tests(['tokamax/_src/config.py'])
+    self.assertIsNone(reason)
+    only = shards.shards_for_tests(resolved, files, affected)
+    ran = set()
+    for name in only:
+      ran |= shards.collected_by(resolved[name]['paths'], files)
+    # Minus the files pytest never collects: `deps` counts `test_base.py` as
+    # affected because a real test imports it, and that real test is in `ran`.
+    self.assertEqual(
+        affected - ran - matches(affected, shards.IGNORED_GLOBS), set()
+    )
+
+  def test_an_unclaimed_affected_file_forces_a_full_run(self) -> None:
+    # `check_consistency` should make this unreachable. If the two ever
+    # disagree, the safe reading is to run everything, not to drop the file.
+    files = shards.all_test_files()
+    resolved, *_ = shards.resolve_shards(files)
+    stripped = {n: dict(s) for n, s in resolved.items()}
+    victim = 'tokamax/_src/ops/attention/base_test.py'
+    for spec in stripped.values():
+      spec['paths'] = tuple(
+          p for p in spec['paths'] if shards.split_node_id(p)[0] != victim
+      )
+    only, reason = shards.select(stripped, files, self._changed(victim))
+    self.assertIsNone(only)
+    self.assertIn('no shard', reason)
+
+  def test_ignored_files_do_not_force_a_full_run(self) -> None:
+    # `test_base.py` is a test file to `deps` (something imports it) and not
+    # one to pytest (`IGNORED_GLOBS`). Treating that as an unclaimed file
+    # would make every change to a base class a full run.
+    files = shards.all_test_files()
+    resolved, *_ = shards.resolve_shards(files)
+    self.assertEqual(
+        shards.unclaimed_tests(
+            resolved, files, {'tokamax/_src/ops/attention/test_base.py'}
+        ),
+        set(),
+    )
+
+  def _without(self, resolved: shards.ShardMap, victim: str) -> shards.ShardMap:
+    """The shard table with `victim` taken out of every shard's paths.
+
+    Excluding a test means removing it from its shard as well as listing it:
+    `check_consistency` subtracts `excluded` from the files a shard has to
+    cover, so the two go together and neither half alone is the real state.
+    """
+    stripped = {}
+    for name, spec in resolved.items():
+      stripped[name] = dict(spec)
+      stripped[name]['paths'] = tuple(
+          p for p in spec['paths'] if shards.split_node_id(p)[0] != victim
+      )
+    return stripped
+
+  def test_excluded_files_do_not_force_a_full_run(self) -> None:
+    files = shards.all_test_files()
+    victim = files[0]
+    stripped = self._without(shards.resolve_shards(files)[0], victim)
+    self.assertEqual(
+        shards.unclaimed_tests(stripped, files, {victim}), {victim}
+    )
+    with mock.patch.object(shards, 'EXCLUDED_TESTS', (victim,)):
+      self.assertEqual(shards.resolve_shards(files)[2], {victim})
+      self.assertEqual(shards.unclaimed_tests(stripped, files, {victim}), set())
+
+  def test_an_excluded_file_is_labelled_in_the_explanation(self) -> None:
+    files = shards.all_test_files()
+    victim = files[0]
+    changed = self._changed(victim)
+    stripped = self._without(shards.resolve_shards(files)[0], victim)
+    with mock.patch.object(shards, 'EXCLUDED_TESTS', (victim,)):
+      out = '\n'.join(shards.explain(stripped, files, changed))
+    self.assertIn('in EXCLUDED_TESTS, selects nothing', out)
+    self.assertNotIn('NO SHARD', out)
+
+  def test_matrix_narrows_to_the_named_shards(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    picked = sorted(resolved)[:2]
+    combos = shards.build_matrix(resolved, only=picked)
+    self.assertEqual({c['shard_name'] for c in combos}, set(picked))
+    # For the latest JAX version, it runs len(shards.RUNNERS) times.
+    num_runs_per_shards = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
+        shards.COMPAT_RUNNERS
+    )
+    self.assertEqual(len(combos), len(picked) * num_runs_per_shards)
+
+  def test_matrix_with_no_shards_is_empty_not_everything(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    self.assertEqual(shards.build_matrix(resolved, only=set()), [])
+    self.assertNotEqual(shards.build_matrix(resolved, only=None), [])
+
+  def test_reading_a_change_list_drops_the_trailing_empty(self) -> None:
+    self.assertEqual(
+        shards.read_changed(self._changed('a.py', 'b.py')), ['a.py', 'b.py']
+    )
+
+
+class ExplainTest(unittest.TestCase):
+  """The log that says why each selected shard was selected.
+
+  Names shards by their formatted column rather than by substring: several
+  shard names are prefixes of others -- `attention-base` of
+  `attention-base-vjp` -- so a substring check would pass on the wrong row.
+  """
+
+  def _changed(self, *paths: str) -> str:
+    handle, name = tempfile.mkstemp()
+    with os.fdopen(handle, 'w') as f:
+      f.write(''.join(f'{p}\0' for p in paths))
+    self.addCleanup(os.unlink, name)
+    return name
+
+  def test_a_node_id_split_file_says_what_each_shard_runs(self) -> None:
+    files = shards.all_test_files()
+    resolved, *_ = shards.resolve_shards(files)
+    target = 'tokamax/_src/ops/attention/base_test.py'
+    body = '\n'.join(shards.explain(resolved, files, self._changed(target)))
+
+    split = [ln for ln in body.splitlines() if '[runs ::' in ln]
+    self.assertEqual(len(split), 2, body)
+    # Disjoint class lists, which is the invariant `check_consistency`
+    # enforces on a split file and the reason running both is not duplication.
+    self.assertTrue(
+        any('::DotProductAttentionWithExplicitVjpTest' in l for l in split)
+    )
+    self.assertTrue(any('::MaskTest' in l for l in split))
+    # A shard that names whole files must not grow the annotation.
+    for line in body.splitlines():
+      if 'tokamax_test.py' in line:
+        self.assertNotIn('[runs ::', line)
+
+  def test_the_shard_clock_is_reported_next_to_the_file_count(self) -> None:
+    files = shards.all_test_files()
+    resolved, *_ = shards.resolve_shards(files)
+    target = 'tokamax/_src/ops/attention/base_test.py'
+    body = '\n'.join(shards.explain(resolved, files, self._changed(target)))
+    minutes = resolved['attention-base-vjp']['minutes']
+    header = f'  {"attention-base-vjp":32s} {f"{minutes}m":>4}'
+    self.assertIn(header, body)
+
+  def test_names_every_selected_shard_and_no_other(self) -> None:
+    files = shards.all_test_files()
+    resolved, *_ = shards.resolve_shards(files)
+    target = 'tokamax/_src/ops/attention/base_test.py'
+    body = '\n'.join(shards.explain(resolved, files, self._changed(target)))
+
+    affected, _ = deps.affected_tests([target])
+    picked = shards.shards_for_tests(resolved, files, affected)
+    self.assertTrue(picked)
+    self.assertNotEqual(picked, set(resolved))
+    for name in picked:
+      self.assertIn(f'  {name:32s} ', body)
+    for name in set(resolved) - picked:
+      self.assertNotIn(f'  {name:32s} ', body)
+    self.assertIn(f'      {target}', body)
+
+  def test_separates_the_edited_tests_from_the_fallout(self) -> None:
+    source = 'tokamax/_src/ops/attention/base.py'
+    test = 'tokamax/_src/ops/attention/base_test.py'
+    files = shards.all_test_files()
+    resolved, *_ = shards.resolve_shards(files)
+    changed = self._changed(source, test)
+    body = '\n'.join(shards.explain(resolved, files, changed))
+
+    self.assertIn(f'      edited  {test}', body)
+    self.assertNotIn(f'      import  {test}', body)
+    # The source is listed as changed, but is not itself a test file, so it
+    # is never tagged in the per-shard block.
+    self.assertIn(f'      {source}', body)
+    self.assertIn('2 changed file(s), 1 of them a test file:', body)
+    # Something has to have come in through the graph, or the tags are not
+    # telling the two cases apart at all.
+    self.assertIn('      import  ', body)
+
+  def test_a_never_collected_file_is_labelled_not_orphaned(self) -> None:
+    files = shards.all_test_files()
+    resolved, *_ = shards.resolve_shards(files)
+    body = '\n'.join(
+        shards.explain(
+            resolved,
+            files,
+            self._changed('tokamax/_src/ops/attention/test_base.py'),
+        )
+    )
+    self.assertIn('never collected, selects nothing', body)
+    self.assertNotIn('NO SHARD', body)
+
+  def test_an_empty_change_list_says_every_shard_runs(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    self.assertEqual(
+        shards.explain(resolved, shards.all_test_files(), self._changed()),
+        ['changed-file list is empty: every shard runs'],
+    )
+
+
+class DryRunTest(unittest.TestCase):
+  """`--dry-run`, which is how selection is landed without it deciding.
+
+  The mode exists so the selection can be read against real pull requests
+  before it gates one. What it must guarantee is therefore narrow and exact:
+  the report is the one selection would really have produced, and the matrix
+  is untouched.
+  """
+
+  def _matrix(self, *argv: str) -> tuple[dict[str, str], str]:
+    """Runs `matrix` and returns its `key=value` outputs and its stderr."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+      shards.main(['matrix', *argv])
+    outputs = dict(
+        line.split('=', 1)
+        for line in out.getvalue().splitlines()
+        if '=' in line
+    )
+    return outputs, err.getvalue()
+
+  def _changed(self, *paths: str) -> str:
+    handle, name = tempfile.mkstemp()
+    with os.fdopen(handle, 'w') as f:
+      f.write(''.join(f'{p}\0' for p in paths))
+    self.addCleanup(os.unlink, name)
+    return name
+
+  def test_dry_run_reports_the_selection_and_still_runs_everything(
+      self,
+  ) -> None:
+    changed = self._changed('tokamax/_src/ops/attention/base_test.py')
+    live, _ = self._matrix('--changed-from', changed)
+    dry, log = self._matrix('--changed-from', changed, '--dry-run')
+    full, _ = self._matrix()
+
+    # Worth asserting that the selection is real before asserting that the
+    # dry run ignores it: if `select` returned everything, the interesting
+    # half of this test would pass for the wrong reason.
+    self.assertNotEqual(live['include'], full['include'])
+    self.assertEqual(dry['include'], full['include'])
+    # The reason reaches the run summary through this line only.
+    self.assertIn('DRY RUN', log.partition('\n')[0])
+    self.assertIn('would select', log)
+
+  def test_dry_run_without_a_change_list_changes_nothing(self) -> None:
+    dry, log = self._matrix('--dry-run')
+    full, _ = self._matrix()
+    self.assertEqual(dry['include'], full['include'])
+    # Nothing was narrowed, so there is no dry run to announce.
+    self.assertNotIn('DRY RUN', log)
+
+  def test_dry_run_leaves_the_other_outputs_alone(self) -> None:
+    changed = self._changed('README.md')
+    dry, _ = self._matrix('--changed-from', changed, '--dry-run')
+    full, _ = self._matrix()
+    self.assertEqual(dry['pytest_flags'], full['pytest_flags'])
+    self.assertEqual(dry['catch_all'], full['catch_all'])
+    # A documentation-only change selects nothing, and `include` being `[]`
+    # is what skips `shard-tests`. A dry run must not trip that path.
+    self.assertNotEqual(dry['include'], '[]')
 
 
 if __name__ == '__main__':

@@ -2327,7 +2327,7 @@ def mla_ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
     decode_batch_size: int = 1,
     mixed_q_split: int = 1,
-    s_dtype: jnp.dtype = jnp.bfloat16,
+    s_dtype: jnp.dtype = jnp.bfloat16,  # pyrefly: ignore[bad-function-definition]
     transpose_kv_cache: bool = False,
     two_step_flash_attention: bool = True,
     p_same_dtype_as_v: bool = True,

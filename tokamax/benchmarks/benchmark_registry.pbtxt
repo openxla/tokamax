@@ -182,7 +182,8 @@ benchmarks {
     runner_label: "linux-x86-ct6e-44-1tpu"
     container_image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:43c523372c4b7f7ce649a1ff204b908727bd338353303c0444af34cb305e5832"
     workload_action_inputs { key: "extras_hw" value: "tpu" }
-    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton" }
+    # Disable 'xla' as this OOM on v6e.
+    workload_action_inputs { key: "runtime_flags_hw" value: "--skip_implementations=triton,xla" }
   }
 
   environment_configs {

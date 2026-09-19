@@ -3,7 +3,11 @@ name: CI-Build
 #  Shards are declared in `.github/ci/shards.py`, which also builds the job
 #  matrix and checks that every test file is claimed by some shard.
 #
-#  Every shard runs on every pull request.
+#  Which shards a pull request's changed files can reach is computed from the
+#  import graph in `.github/ci/deps.py` and reported in the run summary.
+#  Whether that decides anything is `SHARD_SELECTION` below: while it is
+#  `report` the selection is logged and every shard runs anyway. Anything
+#  that cannot be analysed runs everything, as does a `workflow_dispatch`.
 #
 #  Require `shard-all-tests-passed` in branch protection, not the shard jobs,
 #  whose names and number change whenever the SHARDS table is rebalanced.
@@ -12,7 +16,7 @@ on:
   pull_request:
     branches:
       - main
-  # Event manually triggered (in the Github UI)
+  # Event manually triggered (in the Github UI). This also forces all shards to run, so can be helpful for debugging.
   workflow_dispatch:
 
 # Constants for the workflow that are shared across jobs.
@@ -20,6 +24,11 @@ env:
   JAX_ENABLE_X64: 0
   JAX_TRACEBACK_FILTERING: off
   UV_HTTP_TIMEOUT: 300
+  # Change-based test selection. `report` computes which shards a change
+  # reaches and logs it, but runs every shard regardless; `enforce` lets it
+  # decide the matrix. This is the only line to change to turn it on, and the
+  # only one to change back if it drops something it should not have.
+  SHARD_SELECTION: enforce
 
 permissions:
   contents: read
@@ -45,21 +54,73 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+          # Full history, so that `origin/<base>` and the merge base with it
+          # both exist. 
+          fetch-depth: 0
 
       - name: Test the CI scripts
         # `shards.py` decides what every other job runs
         run: python3 -m unittest discover -s .github/ci -p '*_test.py'
+
+      - name: Decide which files changed
+        # Writes /tmp/changed, which narrows the matrix below. Every path that
+        # cannot produce a trustworthy list leaves the file absent, and an
+        # absent file means every shard runs: too many jobs costs runner
+        # minutes, too few reports a change green that was never tested.
+        env:
+          # The branch the pull request targets. Empty on `workflow_dispatch`,
+          # which has no base to diff against, and so has to mean everything.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if [[ -z "${BASE_REF}" ]]; then
+            echo "No base ref on ${GITHUB_EVENT_NAME}: every shard runs."
+            exit 0
+          fi
+          # Diff against the base branch merge base to isolate PR changes.
+          # Use `--no-renames` so old paths in renamed files are reported
+          # directly, allowing dependency tracking of the previous module name.
+          # On any git failure, fall back to running all shards.
+          if ! git diff --no-renames --name-only -z \
+              "origin/${BASE_REF}...HEAD" > /tmp/changed.tmp; then
+            echo "::warning::Could not diff against origin/${BASE_REF};" \
+                 "every shard runs."
+            rm -f /tmp/changed.tmp
+            exit 0
+          fi
+          mv /tmp/changed.tmp /tmp/changed
+          echo "Changed against origin/${BASE_REF}:"
+          tr '\0' '\n' < /tmp/changed | sed 's/^/  /'
+
       - name: Build test matrix
         id: compute
         run: |
           set -o pipefail
-          if ! python3 .github/ci/shards.py matrix \
+          # `--changed-from` narrows the matrix to the shards those files can
+          # reach, via the import graph in `.github/ci/deps.py`. The step
+          # above writes the file only when there is something to diff
+          # against; with no file the flag is omitted and every shard runs.
+          narrow=()
+          if [[ -f /tmp/changed ]]; then
+            narrow=(--changed-from /tmp/changed)
+            # Anything but `enforce` reports the selection and runs every
+            # shard, so a typo here fails towards running too much.
+            if [[ "${SHARD_SELECTION}" != "enforce" ]]; then
+              narrow+=(--dry-run)
+            fi
+          fi
+          if ! python3 .github/ci/shards.py matrix "${narrow[@]}" \
               > /tmp/outputs.txt 2> /tmp/summary.txt; then
             cat /tmp/summary.txt
             exit 1
           fi
           cat /tmp/outputs.txt >> "$GITHUB_OUTPUT"
           cat /tmp/summary.txt
+          # Add to run summary.
+          {
+            echo '## Shard selection'
+            echo
+            sed -n 's/^selection: //p' /tmp/summary.txt
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Warn about unsharded test files
         # Fails the run if a shard's targets have been renamed away, if a file
@@ -79,9 +140,26 @@ jobs:
         # run summary including timing data - that is done after the job ends.
         run: python3 .github/ci/shards.py list
 
+      - name: Explain the selection
+        # Each shard the change reaches, and which of that shard's test files
+        # it reached. Log only: the decision was made in `Build test matrix`
+        # above, and this is the detail behind it for anyone asking why a
+        # shard did or did not run. Gated on the same `-f` test that step
+        # uses, rather than on a step output saying the same thing twice.
+        continue-on-error: true
+        run: |
+          if [[ -f /tmp/changed ]]; then
+            python3 .github/ci/shards.py explain --changed-from /tmp/changed
+          fi
+
   shard-tests:
     name: shard-tests (${{ matrix.runner_short }}, ${{ matrix.shard_name }})
     needs: shard-matrix
+    # A change that reaches no test -- documentation, a benchmark script --
+    # selects no shard, and a matrix with an empty `include` is not a job with
+    # nothing to do, it is a configuration error. `Check results` knows this
+    # skip is legitimate and passes the run.
+    if: needs.shard-matrix.outputs.include != '[]'
     strategy:
       fail-fast: true
       matrix:
@@ -101,22 +179,36 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
+        env:
+          DEVICE: ${{ matrix.device }}
+          JAX_PIN: ${{ matrix.jax_pin }}
         run: |
-          echo "Installing dependencies on device ${{ matrix.device }}"
+          echo "Installing dependencies on device ${DEVICE}, jax ${JAX_PIN}"
+          # No need to put `jax[tpu]` or `jaxlib` in the constraint file.
+          # `jax==` bounds `jax[tpu]` too, and jax's own metadata pins jaxlib
+          # (unconditionally), libtpu and the CUDA plugin from there.
+          printf 'jax==%s\n' "${JAX_PIN}" > /tmp/jax-pin.txt
           python3.12 -m uv pip install --upgrade pip
           python3.12 -m uv pip --version
-          python3.12 -m uv pip install -e .[${{ matrix.device }},test]
+          python3.12 -m uv pip install --constraint /tmp/jax-pin.txt -e ".[${DEVICE},test]"
           python3.12 -m uv pip freeze
+          got=$(python3.12 -c 'import jax; print(jax.__version__)')
+          [[ "${got}" == "${JAX_PIN}" ]] || {
+            echo "::error::asked for jax ${JAX_PIN}, got ${got}"; exit 1; }
 
       - name: Run shard
+        env:
+          # Read through `env:` rather than as interpolated text.
+          PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
+          TEST_PATHS: ${{ matrix.test_paths }}
         run: |
           # Which tests run is decided by `pytest_flags` plus this shard's
           # paths, both from .github/ci/shards.py. `-s` and `--durations` are
           # reporting only: --durations lists the slowest tests in each shard,
           # which is what to rebalance the SHARDS table against.
-          pytest -s --durations=25 \
-            ${{ needs.shard-matrix.outputs.pytest_flags }} \
-            ${{ matrix.test_paths }}
+          # Use xargs to split the flags and paths into separate arguments.
+          printf '%s %s' "${PYTEST_FLAGS}" "${TEST_PATHS}" \
+            | xargs -r pytest -s --durations=25
 
   shard-all-tests-passed:
     # The idea here is that rather than checking for specific shard names to pass, we centralize
@@ -149,6 +241,7 @@ jobs:
         env:
           MATRIX: ${{ needs.shard-matrix.result }}
           TESTS: ${{ needs.shard-tests.result }}
+          INCLUDE: ${{ needs.shard-matrix.outputs.include }}
         run: |
           echo "shard-matrix=${MATRIX} tests=${TESTS}"
           # Only `success` counts. `cancelled` in particular is not a result,
@@ -156,6 +249,12 @@ jobs:
           if [[ "${MATRIX}" != "success" ]]; then
             echo "::error::shard-matrix did not succeed"
             exit 1
+          fi
+          # `skipped` is expected when the change only touches non-test files
+          # (e.g. documentation or non-code files) and no shards are selected.
+          if [[ "${TESTS}" == "skipped" && "${INCLUDE}" == "[]" ]]; then
+            echo "This change reaches no test; no shard was selected."
+            exit 0
           fi
           if [[ "${TESTS}" != "success" ]]; then
             echo "::error::tests reported ${TESTS}"

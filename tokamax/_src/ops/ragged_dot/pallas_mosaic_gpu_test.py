@@ -114,6 +114,18 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
         self.skipTest("No contracting dim kernel for A100 (drhs gradient).")
     super().setUp()
 
+  def test_get_autotuning_configs(self):
+    op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
+    lhs = jax.ShapeDtypeStruct((128, 512), dtype=jnp.bfloat16)
+    rhs = jax.ShapeDtypeStruct((4, 512, 512), dtype=jnp.bfloat16)
+    group_sizes = (32, 32, 32, 32)
+    ba = op.bind(lhs, rhs, group_sizes=group_sizes)
+
+    configs = op._get_autotuning_configs(ba)
+    self.assertIsNotNone(configs)
+    self.assertNotEmpty(configs)
+
+
 
 if __name__ == "__main__":
   absltest.main()

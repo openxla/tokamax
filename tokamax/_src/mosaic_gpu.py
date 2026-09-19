@@ -14,7 +14,7 @@
 # ==============================================================================
 """Mosaic-GPU utils."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 import dataclasses
 import functools
 import math
@@ -76,6 +76,13 @@ def tiled_swizzled_block_spec(
   return plgpu.BlockSpec(shape, index_map, transforms=transforms, **kwargs)
 
 
+def warp_map_when(
+    pred: jax.Array | bool,
+) -> Callable[[Callable[[jax.Array], None]], None]:
+  """Runs a function with single warp semantics when the condition is true."""
+  return lambda body: pl.when(pred)(lambda: plgpu.warp_map(body))
+
+
 warpgroup_barrier = plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())
 
 
@@ -92,6 +99,11 @@ def tcgen05_wait_st(_):
 @plgpu.inline_mgpu()
 def tcgen05_fence_before_thread_sync(_):
   nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)
+
+
+@plgpu.inline_mgpu()
+def tcgen05_fence_after_thread_sync(_):
+  nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
 
 
 @plgpu.inline_mgpu()
@@ -204,7 +216,7 @@ def int4_as_biased_f8e4m3fn(x, layout):
 
   @plgpu.inline_mgpu(
       arg_types=(layout,),
-      return_type=plgpu.ShapeDtypeStruct(x.shape, jnp.float8_e4m3fn, layout),
+      return_type=plgpu.ShapeDtypeStruct(x.shape, jnp.float8_e4m3fn, layout),  # pyrefly: ignore[bad-argument-type]
   )
   def encode(_, fa: mgpu.FragmentedArray):
     [vector_len] = ir.VectorType(fa.registers.flat[0].type).shape
@@ -271,13 +283,101 @@ def _get_smem_bytes(x: Any) -> int:
   return 0
 
 
-def estimate_smem_bytes(scratch_types: Any) -> int:
+def estimate_smem_bytes(
+    scratch_types: Any, uses_dynamic_scheduling_loop: bool = False
+) -> int:
   """Estimates the total SMEM usage in bytes for the given scratch types."""
+  if uses_dynamic_scheduling_loop:
+    scratch_types = (
+        scratch_types,
+        plgpu.TryClusterCancelResult(2),
+        plgpu.Barrier(num_barriers=2),  # try cancel barrier
+        plgpu.Barrier(num_barriers=2),  # cancel used barrier
+    )
+
   is_ref_union = lambda x: isinstance(x, plgpu.RefUnion)
   flat = jax.tree.leaves(scratch_types, is_leaf=is_ref_union)
   # TMEM allocation uses 4 bytes of SMEM to return the address.
   uses_tmem = any(getattr(x, "memory_space", None) == plgpu.TMEM for x in flat)
   return sum(map(_get_smem_bytes, flat)) + (4 if uses_tmem else 0)
+
+
+def _batched_persistent_body(body, in_batched, out_batched):
+
+  def batched_body(batched_grid_loop, **scratch_ref_kwargs):
+
+    def grid_loop[T](init_carry: T = None) -> Callable[[Callable[..., T]], T]:
+
+      def decorator(body: Callable[..., T]) -> T:
+
+        def wrapper(refs, batched_loop_info: plgpu.NDLoopInfo, carry: T) -> T:
+          batch_idx, *idx = batched_loop_info.index
+          slice_ref = lambda r, b: (r.at[batch_idx] if b else r)
+          if isinstance(out_batched, (tuple, list)):
+            batched = (*in_batched, *out_batched)
+          else:
+            batched = (*in_batched, out_batched)
+          refs = jax.tree.map(slice_ref, refs, batched)
+          loop_info = dataclasses.replace(batched_loop_info, index=tuple(idx))
+          return body(refs, loop_info, carry)
+
+        return batched_grid_loop(init_carry=init_carry)(wrapper)
+
+      return decorator
+
+    return body(grid_loop, **scratch_ref_kwargs)
+
+  return batched_body
+
+
+def _persistent_kernel(
+    recurse_fn: Callable[..., Any],
+    loop_fn: Callable[..., Any],
+    body: Callable[..., None],
+    out_type: Any = (),
+    *,
+    grid: tuple[int, ...] = (),
+    grid_names: tuple[str, ...] = (),
+    launch_grid: tuple[int, ...] = (),
+    launch_grid_names: tuple[str, ...] = (),
+    **kwargs: Any,
+) -> Callable[..., Any]:
+
+  @jax.custom_batching.custom_vmap
+  def wrapper(*args):
+
+    def wrapped_body(*refs, **scratch_ref_kwargs):
+
+      def grid_loop[T](init_carry: T = None) -> Callable[[Callable[..., T]], T]:
+        return lambda body: loop_fn(init_carry=init_carry)(
+            functools.partial(body, refs)
+        )
+
+      return body(grid_loop, **scratch_ref_kwargs)
+
+    return plgpu.kernel(
+        wrapped_body,
+        out_type=out_type,
+        grid=launch_grid,
+        grid_names=launch_grid_names,
+        **kwargs,
+    )(*args)
+
+  @wrapper.def_vmap
+  def vmap_rule(axis_size, in_batched, *args):
+    out_batched = jax.tree.map(lambda _: True, out_type)
+    batched_body = _batched_persistent_body(body, in_batched, out_batched)
+    add_batch_dim = lambda x: x.update(shape=(axis_size, *x.shape))
+    out = recurse_fn(
+        batched_body,
+        out_type=jax.tree.map(add_batch_dim, out_type),
+        grid=(axis_size, *grid),
+        grid_names=(f"$$__batch_{len(grid_names)}__$$", *grid_names),
+        **kwargs,
+    )(*args)
+    return out, out_batched
+
+  return wrapper
 
 
 def static_scheduling_persistent_kernel(
@@ -288,67 +388,65 @@ def static_scheduling_persistent_kernel(
     cluster: tuple[int, ...] = (),
     **kwargs: Any,
 ) -> Callable[..., Any]:
-  """Entry point for defining a persistent Mosaic GPU kernel."""
+  """Entry point for defining a static scheduling persistent Mosaic GPU kernel."""
+  cluster_size = math.prod(cluster)
+  launch_grid_name = "$$__sm__$$" if cluster_size == 1 else "$$__cluster__$$"
 
-  launch_grid = (backend.get_default_device().core_count // math.prod(cluster),)
-  launch_grid_name = "$$__sm__$$"
+  return _persistent_kernel(
+      static_scheduling_persistent_kernel,
+      functools.partial(plgpu.nd_loop, grid, collective_axes=launch_grid_name),
+      body,
+      out_type,
+      grid=grid,
+      launch_grid=(backend.get_default_device().core_count // cluster_size,),
+      launch_grid_names=(launch_grid_name,),
+      cluster=cluster,
+      **kwargs,
+  )
 
-  @jax.custom_batching.custom_vmap
-  def wrapper(*args):
 
-    def wrapped_body(*refs, **scratch_ref_kwargs):
+def dynamic_scheduling_persistent_kernel(
+    body: Callable[..., None],
+    out_type: Any = (),
+    *,
+    grid: tuple[int, ...] = (),
+    grid_names: tuple[str, ...] = (),
+    cluster: tuple[int, ...] = (),
+    cluster_names: tuple[str, ...] = (),
+    thread_name: str | None = None,
+    **kwargs: Any,
+) -> Callable[..., Any]:
+  """Entry point for defining a dynamic scheduling persistent Mosaic GPU kernel."""
+  return _persistent_kernel(
+      dynamic_scheduling_persistent_kernel,
+      functools.partial(
+          plgpu.dynamic_scheduling_loop,
+          grid_names=grid_names,
+          thread_axis=thread_name,
+          cluster_axes=cluster_names,
+      ),
+      body,
+      out_type,
+      grid=grid,
+      grid_names=grid_names,
+      launch_grid=grid,
+      launch_grid_names=grid_names,
+      cluster=cluster,
+      cluster_names=cluster_names,
+      thread_name=thread_name,
+      **kwargs,
+  )
 
-      def grid_loop[T](init_carry: T = None) -> Callable[[Callable[..., T]], T]:
-        return lambda body: plgpu.nd_loop(
-            grid, collective_axes=launch_grid_name, init_carry=init_carry
-        )(functools.partial(body, refs))
 
-      return body(grid_loop, **scratch_ref_kwargs)
+def not_persistent_grid_loop_kernel(
+    body: Callable[..., None], *, grid_names: tuple[str, ...] = (), **kwargs
+):
+  """A standard kernel that can swapped in for the persistent kernels."""
 
-    return plgpu.kernel(
-        wrapped_body,
-        out_type=out_type,
-        grid=launch_grid,
-        grid_names=(launch_grid_name,),
-        cluster=cluster,
-        **kwargs,
-    )(*args)
+  def wrapped_body(*args, **kwargs):
+    idx = tuple(map(jax.lax.axis_index, grid_names))
+    loop_info = plgpu.NDLoopInfo(idx, local_index=0, num_local_steps=1)
+    grid_loop = lambda init_carry: lambda f: f(args, loop_info, init_carry)
+    return body(grid_loop, **kwargs)
 
-  @wrapper.def_vmap
-  def vmap_rule(axis_size, in_batched, *args):
-    out_batched = jax.tree.map(lambda _: True, out_type)
-
-    def batched_body(batched_grid_loop, **scratch_ref_kwargs):
-
-      def grid_loop[T](init_carry: T = None) -> Callable[[Callable[..., T]], T]:
-
-        def decorator(body: Callable[..., T]) -> T:
-
-          def wrapper(refs, batched_loop_info: plgpu.NDLoopInfo, carry: T) -> T:
-            batch_idx, *idx = batched_loop_info.index
-            slice_ref = lambda r, b: (r.at[batch_idx] if b else r)
-            if isinstance(out_batched, (tuple, list)):
-              batched = (*in_batched, *out_batched)
-            else:
-              batched = (*in_batched, out_batched)
-            refs = jax.tree.map(slice_ref, refs, batched)
-            loop_info = dataclasses.replace(batched_loop_info, index=tuple(idx))
-            return body(refs, loop_info, carry)
-
-          return batched_grid_loop(init_carry=init_carry)(wrapper)
-
-        return decorator
-
-      return body(grid_loop, **scratch_ref_kwargs)
-
-    add_batch_dim = lambda x: x.update(shape=(axis_size, *x.shape))
-    out = static_scheduling_persistent_kernel(
-        batched_body,
-        out_type=jax.tree.map(add_batch_dim, out_type),
-        grid=(axis_size,) + grid,
-        cluster=cluster,
-        **kwargs,
-    )(*args)
-    return out, out_batched
-
-  return wrapper
+  return plgpu.kernel(wrapped_body, grid_names=grid_names, **kwargs)
