@@ -513,6 +513,7 @@ SHARDS: ShardMap = {
     ),
     'ops-ragged-scatter': Spec(
         paths=(
+            'tokamax/_src/ops/ragged_scatter/api_test.py',
             'tokamax/_src/ops/ragged_scatter/base_test.py',
             'tokamax/_src/ops/ragged_scatter/pallas_mosaic_tpu_test.py',
         ),
@@ -529,6 +530,7 @@ SHARDS: ShardMap = {
     ),
     'ops-ragged-gather-reduce': Spec(
         paths=(
+            'tokamax/_src/ops/ragged_gather_reduce/api_test.py',
             'tokamax/_src/ops/ragged_gather_reduce/base_test.py',
             'tokamax/_src/ops/ragged_gather_reduce/pallas_mosaic_tpu_test.py',
         ),

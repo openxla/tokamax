@@ -35,8 +35,9 @@ class PallasTpuRaggedScatterTest(parameterized.TestCase):
       dtype=[jnp.bfloat16, jnp.float32],
   )
   def test_sc_scatter(self, out_size, hidden_size, start_end, dtype):
-    if backend.get_default_device().platform != "tpu":
-      self.skipTest("Only tested on TPU.")
+    op = pallas_mosaic_tpu.PallasTpuRaggedScatter()
+    if not op.supported_on(backend.get_default_device()):
+      self.skipTest("PallasTpuRaggedScatter not supported on this device.")
 
     start, end = start_end
     start = min(start, out_size)
@@ -50,7 +51,6 @@ class PallasTpuRaggedScatterTest(parameterized.TestCase):
     start_arr = jnp.array([start], jnp.int32)
     end_arr = jnp.array([end], jnp.int32)
 
-    op = pallas_mosaic_tpu.PallasTpuRaggedScatter()
     actual = op(x, indices, start_arr, end_arr)
 
     base_op = base.RaggedScatter()
