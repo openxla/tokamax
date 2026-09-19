@@ -25,16 +25,9 @@ from jax.experimental import pallas as pl
 from jax.extend import backend
 import jax.numpy as jnp
 import pydantic
+from tokamax._src import gpu_utils
 
-SMEM_CAPACITY_MAP = {
-    "sm_120": (100 - 1) * 1024,
-    "sm_103": (228 - 1) * 1024,
-    "sm_100": (228 - 1) * 1024,
-    "sm_90": (228 - 1) * 1024,
-    "sm_80": (164 - 1) * 1024,
-    "sm_86": (100 - 1) * 1024,
-    "sm_89": (100 - 1) * 1024,
-}
+SMEM_CAPACITY_MAP = gpu_utils.SMEM_CAPACITY_BYTES
 
 
 class MatmulDimension(enum.IntEnum):
@@ -159,13 +152,12 @@ def get_smem_capacity() -> int:
     raise NotImplementedError(
         f"Unsupported device platform: {device}"
     )
-  capacity = int(float(getattr(device, "compute_capability", 0)) * 10)
-  sm_version = f"sm_{capacity}"
-  if sm_version not in SMEM_CAPACITY_MAP:
+  if (capacity := gpu_utils.smem_capacity(device)) is None:
     raise NotImplementedError(
-        f"Unsupported device compute capability: {device} {sm_version}"
+        "Unsupported device compute capability:"
+        f" {device} {getattr(device, 'compute_capability', None)}"
     )
-  return SMEM_CAPACITY_MAP[sm_version]
+  return capacity
 
 
 def check_bf16xbf16_or_f16xf16(lhs: jax.Array, rhs: jax.Array):
