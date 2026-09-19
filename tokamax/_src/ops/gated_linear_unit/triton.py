@@ -144,6 +144,35 @@ def _get_best_block_size(m: int, n: int) -> tuple[int, int, int]:
   return block_m, block_n, block_k
 
 
+def _smem_bytes(config: Config, itemsize: int) -> int:
+  """Returns the shared memory needed by the kernel, in bytes."""
+  # Measured against the Triton 3.8 compiler (float32, sm_89 and sm_120).
+  return (
+      itemsize
+      * config.block_k
+      * max(1, config.num_stages - 1)
+      * (config.block_m + 2 * config.block_n)
+  )
+
+
+def _shrink_to_fit_smem(config: Config, itemsize: int) -> Config:
+  """Shrinks the tile until it fits in the device's shared memory."""
+  if (limit := gpu_utils.smem_capacity()) is None:
+    return config
+  while _smem_bytes(config, itemsize) > limit:
+    if config.block_m > 32:
+      config = dataclasses.replace(config, block_m=config.block_m // 2)
+    elif config.block_n > 32:
+      config = dataclasses.replace(config, block_n=config.block_n // 2)
+    elif config.num_stages > 2:
+      config = dataclasses.replace(config, num_stages=config.num_stages - 1)
+    else:
+      raise NotImplementedError(
+          f'No tile fits in {limit} bytes of shared memory.'
+      )
+  return config
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class TritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
   """Triton gated linear unit."""
@@ -266,13 +295,14 @@ class TritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
       block_m, block_n, block_k = _get_best_block_size(m, n)
     else:
       block_n, block_m, block_k = _get_best_block_size(n, m)
-    return Config(
+    config = Config(
         block_m=block_m,
         block_n=block_n // 2,  # We have two blocks for RHS, so halve `block_n`.
         block_k=block_k,
         num_warps=4,
         num_stages=4,
     )
+    return _shrink_to_fit_smem(config, jnp.dtype(x.dtype).itemsize)
 
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     # Simple autotuning search space that can be improved upon.
@@ -294,6 +324,11 @@ class TritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
                     num_stages=num_stages,
                 )
             )
+    if (limit := gpu_utils.smem_capacity()) is not None:
+      itemsize = jnp.dtype(x.dtype).itemsize
+      autotuning_configs = {
+          c for c in autotuning_configs if _smem_bytes(c, itemsize) <= limit
+      }
     return autotuning_configs
 
   @override
