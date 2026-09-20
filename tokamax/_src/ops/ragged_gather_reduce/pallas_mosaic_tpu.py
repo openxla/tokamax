@@ -49,4 +49,10 @@ class PallasTpuRaggedGatherReduce[C](base.RaggedGatherReduce[C]):
 
   @override
   def supported_on(self, device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+    if device.platform != "tpu":
+      return False
+    tpu_info = pltpu.get_tpu_info()
+    return (
+        tpu_info.generation >= 5
+        and getattr(tpu_info, "sparse_core", None) is not None
+    )
