@@ -110,7 +110,7 @@ def _min_block_m(A: int, bitwidth: int) -> int:
 
   With only M and A to tile, the block has to hold enough for 128 threads to
   divide it. `_tiled_layout` is the authority on that, so we ask it rather than
-  re-deriving the rule.
+  re-deriving the rule, and leave `_launch` to pad shapes with fewer rows.
   """
   for block_m in (1, 2, 4, 8, 16, 32, 64, 128):
     try:
@@ -143,11 +143,10 @@ def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
   # fits in registers and enough blocks are launched to fill the device, but
   # never below what the tiling needs: M is carrying the warps and whatever
   # lanes A could not take.
+  # A shape with fewer rows than the floor gets the floor anyway, and `_grid`
+  # declines it. Raising here would pre-empt the `vmap` rule in `_fwd`, which
+  # is the one that can still find the rows, in the batch axes.
   min_block_m = _min_block_m(a, jnp.dtype(x.dtype).itemsize * 8)
-  if min_block_m > m:
-    raise NotImplementedError(
-        f'Tiling {a} elements needs {min_block_m} rows; the shape has {m}.'
-    )
   block_m = min_block_m if (scale is None and offset is None) else max(
       min_block_m, min(32, prev_power_of_2(m))
   )
@@ -164,10 +163,16 @@ def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
   return Config(block_m=block_m, block_n=None)
 
 def _grid(x_shape, block) -> tuple[int, ...]:
-  """Returns the launch grid, rejecting blocks the launch cannot express."""
+  """Returns the launch grid, declining blocks the launch cannot express.
+
+  A block wider than its axis is a shape this kernel has no tiling for, not a
+  bug in the caller, so it declines and lets another impl take it.
+  """
   for (s, b) in zip(x_shape, block):
     if s < b:
-      raise ValueError(f'Block {b} is larger than the axis it tiles ({s}).')
+      raise NotImplementedError(
+        f'Block {b} is larger than the axis it tiles ({s}).'
+      )
   return tuple(pl.cdiv(s, b) for (s, b) in zip(x_shape, block))
 
 def _block_index(x_shape, block, idx, squeeze):
@@ -209,8 +214,73 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     return_residuals: bool,
     config: Config,
   ) -> tuple[jax.Array, base.Residuals | None]:
+    """Launches the kernel, folding `vmap`'s axes into M where they can be.
+
+    Left to itself, `vmap` gives each batch element its own grid slot, so the
+    block is left tiling the inner rows alone -- fewer than the layout needs,
+    for an A the lanes cannot cover on their own (see `_min_block_m`). But the
+    batch axis lands left of the reduced one, where `canonicalize_shape_3d`
+    folds it into M, and the block then draws rows from it like any other.
+
+    Only `x` folds. A batched `scale`/`offset` varies along the rows one block
+    spans and the kernel has a single param vector per launch, so those keep
+    `vmap`'s own rule.
+    """
     if callable(x):
       x = x()
+
+    rest = dict(
+      epsilon=epsilon,
+      scale_offset=scale_offset,
+      subtract_mean=subtract_mean,
+      return_residuals=return_residuals,
+    )
+
+    def with_vmap(axis, config):
+      def launch(x, scale, offset):
+        return self._launch(x, scale, offset, axis=axis, config=config, **rest)
+
+      fwd = jax.custom_batching.custom_vmap(launch)
+
+      def vmap_rule(axis_size, in_batched, x, scale, offset):
+        del axis_size
+        x_batched, *params_batched = in_batched
+        if x_batched and not any(jax.tree.leaves(params_batched)):
+          # The batch arrives at axis 0, so the reduced axis has shifted right.
+          # The config goes back to `None` to be re-derived: the one we were
+          # handed describes the shape as it was before the fold. Recursing
+          # through `with_vmap` leaves the new call batchable in turn, which is
+          # what lets a second `vmap` fold its axis in as well.
+          new_axis = axis + 1 if axis >= 0 else axis
+          out = with_vmap(new_axis, None)(x, scale, offset)
+        else:
+          in_axes = [0 if b else None for b in in_batched]
+          out = jax.vmap(launch, in_axes=in_axes)(x, scale, offset)
+        return out, jax.tree.map(lambda _: True, out)
+
+      fwd.def_vmap(vmap_rule)
+      return fwd
+
+    return with_vmap(axis, config)(x, scale, offset)
+
+  def _launch(
+    self,
+    x: jax.Array,
+    scale: jax.Array | None,
+    offset: jax.Array | None,
+    *,
+    axis: int,
+    epsilon: float,
+    scale_offset: float,
+    subtract_mean: bool,
+    return_residuals: bool,
+    config: Config | None,
+  ) -> tuple[jax.Array, base.Residuals | None]:
+    """One kernel launch. `config` is `None` when it has to be re-derived."""
+    if config is None:
+      config = _heuristics_config(
+        x, scale, offset, axis=axis, vmap_axis_sizes=()
+      )
 
     dtype = x.dtype
     orig_x_shape = x.shape
@@ -222,6 +292,7 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
     A = x_shape[1]
     block = (config.block_m, A, config.block_n or 1)
+    block_m, _, block_n = block
 
     # Either M or N is blocked, never both; the other is indexed with a scalar
     # so the tile is 2D with the contiguous axis last.
@@ -233,14 +304,28 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     layout = _tiled_layout(tile[0], tile[1], dtype.itemsize * 8,
                             reduce_axis=red)
 
+    # `_block_index` shifts a trailing partial block back to end at the array's
+    # edge, which needs a whole block to shift within. Too few rows for even one
+    # -- a shape below `_min_block_m`, which `vmap` hands over all the time --
+    # and the rows are padded up to a block.
+    rows = x_shape[0]
+    pad_m = max(0, block_m - rows)
+    x = x.reshape(x_shape)
+    if pad_m:
+      x = jnp.pad(x, ((0, pad_m), (0, 0), (0, 0)))
+      x_shape = (block_m,) + x_shape[1:]
+
     # A trailing partial block re-reads rows a neighbouring CTA writes, so
-    # writing `y` over `x` would race; fall back to a separate output.
-    alias = bool(self.input_output_alias) and all(
-      s % b == 0 for (s, b) in zip(x_shape, block)
+    # writing `y` over `x` would race; fall back to a separate output. Padding
+    # makes `x` a fresh buffer, so there is nothing left worth aliasing either.
+    alias = (
+      bool(self.input_output_alias)
+      and not pad_m
+      and all(s % b == 0 for (s, b) in zip(x_shape, block))
     )
     # A ref is written in place, so the kernel writes `y` over `x` and XLA gets
     # to drop the copy `new_ref` starts with whenever `x` is dead afterwards.
-    x_operand = jax.new_ref(x.reshape(x_shape)) if alias else x.reshape(x_shape)
+    x_operand = jax.new_ref(x) if alias else x
 
     def kernel(*refs):
       it = iter(refs)  # Inputs then outputs, optional ones only if present.
@@ -299,14 +384,15 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     else:
       y, *stats = outs
 
-    y = y.reshape(orig_x_shape)
+    unpad = lambda a: a[:rows] if pad_m else a
+    y = unpad(y).reshape(orig_x_shape)
     if not return_residuals:
       return y, None
 
     stat_shape = list(orig_x_shape)
     stat_shape[axis] = 1
-    mean = stats[0].reshape(stat_shape) if return_mean else None
-    rstddev = stats[-1].reshape(stat_shape)
+    mean = unpad(stats[0]).reshape(stat_shape) if return_mean else None
+    rstddev = unpad(stats[-1]).reshape(stat_shape)
     return y, (mean, rstddev)
 
   @override
