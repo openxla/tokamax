@@ -892,6 +892,50 @@ class GmmTest(parameterized.TestCase):
     # 3. Verify that the output is NaN-free
     self.assertFalse(jnp.any(jnp.isnan(actual)))
 
+  @parameterized.parameters(64, 129, 160)
+  def test_gmm_unaligned_k_to_tpu_num_lanes_with_nans(self, k: int):
+    """The last k tile requires proper masking when `% num_lanes !=0` especially with NaNs."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    self.assertNotEqual(k % num_lanes, 0)
+
+    batch_size = 128
+    out_size = 512
+    num_groups = 4
+    key = jax.random.key(10)
+    k0, k1, k2 = jax.random.split(key, 3)
+
+    # Mark half of the tokens as paddings to stress-test GMM
+    is_padding = jax.random.bernoulli(k2, p=0.5, shape=(batch_size, 1))
+
+    aligned_k = pl.cdiv(k, num_lanes) * num_lanes
+    # On the k-dimension, we allocate `num_lanes`-aligned array so that we can
+    # fill `[k:aligned_k]` as `jnp.nan`s and TPU will load those `[k:aligned_k]`
+    # nans into VMEM.
+    lhs_padded = jax.random.normal(
+        k0, (batch_size, aligned_k), dtype=jnp.bfloat16
+    )
+    lhs_padded = jnp.where(is_padding, jnp.nan, lhs_padded)
+    lhs_padded = lhs_padded.at[:, k:].set(jnp.nan)
+
+    lhs = lhs_padded[:, :k]
+
+    rhs = jax.random.normal(
+        k1, (num_groups, k, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = jnp.array(
+        [batch_size // num_groups] * num_groups, dtype=jnp.int32
+    )
+
+    # Re-masking because we only care about the output values on non-paddings
+    # across different implementations.
+    expected = reference_gmm(lhs, rhs, group_sizes)
+    expected = jnp.where(is_padding, jnp.nan, expected)
+
+    actual = gmm_v2.gmm_v2(lhs, rhs, group_sizes)
+    actual = jnp.where(is_padding, jnp.nan, actual)
+
+    assert_arrays_all_close(actual, expected)
+
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
@@ -1119,6 +1163,9 @@ class GmmTest(parameterized.TestCase):
     """LHS quantized with a user provided lhs_scale."""
     if block_size > in_size:
       self.skipTest("block_size must be <= in_size")
+    if pltpu.get_tpu_info().generation <= 5:
+      self.skipTest("FP8 is only supported after TPU generation 6")
+
     # Per-tensor fp8 quant scale (bound / finfo(fp8).max = 224 / 448),
     # matching qwix's "fixed,-224,224" act calibration.
     lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
