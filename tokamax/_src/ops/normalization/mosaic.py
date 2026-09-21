@@ -51,8 +51,8 @@ class Config:
 type Key = immutabledict.immutabledict[str, Any]
 FusedInputArray = base.FusedInputArray
 
-def _vector_length(block_n: int, A: int, bitwidth: int) -> int:
-  """Picks the widest per-thread vector that stays contiguous in GMEM.
+def _vector_lengths(block_n: int, A: int, bitwidth: int):
+  """The legal per-thread vector lengths, widest first.
 
   The kernel is memory-bound, so we want the widest load the hardware offers
   (16 bytes = 128 bits per thread). A vector is only legal if its elements are
@@ -62,24 +62,62 @@ def _vector_length(block_n: int, A: int, bitwidth: int) -> int:
   a block boundary). Neither holds -> halve and retry, down to a scalar load.
   """
   vec = (8 * 16) // bitwidth  # 16-byte vectors.
-  while True:
+  while vec >= 1:
     if block_n % vec == 0 or (vec % block_n == 0 and A % vec == 0):
-      return vec
+      yield vec
     vec //= 2
 
-def _lanes_along_a(vec: int, A: int) -> int:
+def _vector_length(block_n: int, A: int, bitwidth: int) -> int:
+  """The widest legal vector, ignoring what it costs in rows."""
+  return next(iter(_vector_lengths(block_n, A, bitwidth)))
+
+def _lanes_along_a(vec: int, A: int) -> int | None:
   """How many of the 32 lanes go along A; the rest spread along M.
 
   A lane holds `A // la` elements of the reduced axis, which the vector then has
   to tile, so `la` must divide A and leave a multiple of `vec` behind. A is not
   always obliging -- A=40 with a 4-element vector admits la=2 at most, and A=42
   only la=1 -- and every lane A cannot take is a lane M has to, which is what
-  makes `block_m` the heuristic's problem. See `_min_block_m`.
+  makes `block_m` the heuristic's problem. See `_min_block_m`. `None` when no
+  split works, which is a narrower vector's cue.
   """
   for la in (32, 16, 8, 4, 2, 1):
     if A % la == 0 and (A // la) % vec == 0:
       return la
-  raise ValueError(f'Cannot spread lanes over {A=} with {vec=}.')
+  return None
+
+def _lanes_along_n(vec: int, A: int, N: int) -> int | None:
+  """How many of the 32 lanes go along N; the rest go along A.
+
+  N first, since lanes adjacent along N issue one coalesced transaction, whereas
+  lanes along A add reduction shuffles; we take the largest `ln` that divides
+  evenly and only fall back to A for the leftovers. Divisibility is required
+  both ways because the tiling has no support for partial tiles. `None` when no
+  split works, which is a narrower vector's cue.
+  """
+  for ln in (32, 16, 8, 4, 2, 1):
+    if N % (ln * vec) == 0 and A % (32 // ln) == 0:
+      return ln
+  return None
+
+def _vector_for(block_n: int, bitwidth: int, M: int, A: int, N: int) -> int:
+  """The widest legal vector whose lane split tiles one warp's block.
+
+  Width is not free. The wider the vector, the fewer lanes are left for the axis
+  it runs along, and the leftovers have to divide what remains: the warp's rows
+  when the vector spans whole N rows, its N when it sits inside one. Narrowing
+  is what lets an awkward block tile at all -- A=40 with 8 rows to a warp, A=24
+  with N=8 -- and it costs a narrower load, nothing else. The search runs widest
+  first and crosses from one branch to the other as `vec` falls below `block_n`.
+  """
+  for vec in _vector_lengths(block_n, A, bitwidth):
+    if vec >= block_n:
+      la = _lanes_along_a(vec, A)
+      if la is not None and M % (32 // la) == 0:
+        return vec
+    elif _lanes_along_n(vec, A, N) is not None:
+      return vec
+  raise ValueError(f'Cannot tile {M=}, {A=}, {N=} with any vector.')
 
 def _vec_along_a(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
   """Tiles a warp's block when the vector spans whole N rows (vec >= block_n).
@@ -87,25 +125,19 @@ def _vec_along_a(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
   left over once it is exhausted spread along M.
   """
   la = _lanes_along_a(vec, A)
-  lm = 32 // la
-  if M % lm:
-    raise ValueError(f'Cannot spread {lm} lanes over {M=} rows per warp.')
-  return (M // lm, A // la, N)
+  if la is None or M % (32 // la):
+    raise ValueError(f'Cannot spread 32 lanes over {M=}, {A=} with {vec=}.')
+  return (M // (32 // la), A // la, N)
 
 def _vec_along_n(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
   """Tiles a warp's block when the vector fits inside an N row (vec < block_n).
-
-  The 32 lanes are split `ln` along N and `la = 32 // ln` along A. N first, since
-  lanes adjacent along N issue one coalesced transaction, whereas lanes along A
-  add reduction shuffles; we take the largest `ln` that divides evenly and only
-  fall back to A for the leftovers. Divisibility is required both ways because
-  the tiling has no support for partial tiles.
+  The 32 lanes go along N, as many as it can take, and the ones left over spread
+  along the reduced axis.
   """
-  for ln in (32, 16, 8, 4, 2, 1):
-    la = 32 // ln
-    if N % (ln * vec) == 0 and A % la == 0:
-      return (M, A // la, N // ln)
-  raise ValueError(f'Cannot spread 32 lanes over {A=}, {N=} with {vec=}.')
+  ln = _lanes_along_n(vec, A, N)
+  if ln is None:
+    raise ValueError(f'Cannot spread 32 lanes over {A=}, {N=} with {vec=}.')
+  return (M, A // (32 // ln), N // ln)
 
 def _warp_blocks(block_m, block_n, a=1, split_a=False):
     """Splits the block over the warpgroup's 4 warps. Returns (m, a, n) counts.
@@ -115,9 +147,7 @@ def _warp_blocks(block_m, block_n, a=1, split_a=False):
 
     The VJP also reduces over M and N, for `dscale`/`doffset`. Splitting M or N
     leaves those partials warp-replicated and all four warps store the same
-    values to the same addresses -- ~14x write amplification, about a third of
-    that kernel's DRAM writes. Since the dparam reduction covers everything
-    *except* A, putting the warps on A makes it partitioned for every shape.
+    values to the same addresses.
     """
     if split_a and a % 4 == 0:
       return (1, 4, 1)
@@ -171,12 +201,12 @@ def _tiled_layout(
   `canonicalize()` then collapses the size-1 dims, which is why the layout is
   read back off `l` rather than reusing the values passed in.
   """
-  vec = _vector_length(block_n, a, bitwidth)
   warp_m, warp_a, warp_n = _warp_blocks(block_m, block_n, a, split_a)
   tile_spec = [
     (block_m, a, block_n),
     (block_m // warp_m, a // warp_a, block_n // warp_n),
   ]
+  vec = _vector_for(block_n, bitwidth, *tile_spec[-1])
   if vec >= block_n:
     tile_spec.append(_vec_along_a(vec, *tile_spec[-1]))
     vector_dim = -2
@@ -202,16 +232,29 @@ def canonicalize_shape_3d(
 ) -> tuple[int, int, int]:
   return (math.prod(shape[:axis]), shape[axis], math.prod(shape[axis:][1:]))
 
-def _min_block_m(A: int, bitwidth: int) -> int:
+def _min_block_m(A: int, bitwidth: int, rows: int) -> int:
   """The fewest rows a block can have, with no N to block.
 
   All four warps go along M (`_warp_blocks` has nowhere else to put them), and
   so do the `32 // la` lanes A had no room for, so the block needs one row per
-  warp per leftover lane before the layout can tile it at all. A=64 asks for 8
-  rows, A=40 for 64, A=42 for 128.
+  warp per leftover lane before the layout can tile it at all. At the widest
+  vector that is 8 rows for A=64, 64 for A=40, 128 for A=42.
+
+  A narrower vector leaves A room for more lanes and so asks for fewer rows,
+  which is the trade to make when `rows` cannot cover the widest one: A=40 wants
+  64 rows at 16-byte loads and 32 at 8-byte. We take the widest vector the rows
+  can afford, and fall back to the widest one outright when none fits, leaving
+  `_launch` to pad.
   """
-  la = _lanes_along_a(_vector_length(1, A, bitwidth), A)
-  return 4 * (32 // la)
+  floors = []
+  for vec in _vector_lengths(1, A, bitwidth):
+    la = _lanes_along_a(vec, A)
+    if la is None:
+      continue
+    floors.append(4 * (32 // la))
+    if floors[-1] <= rows:
+      return floors[-1]
+  return floors[0]
 
 def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
   """Picks the block shape.
@@ -240,11 +283,10 @@ def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
   # fits in registers and enough blocks are launched to fill the device, but
   # never below what the tiling needs: M is carrying the warps and whatever
   # lanes A could not take.
-  min_block_m = _min_block_m(a, jnp.dtype(x.dtype).itemsize * 8)
-  if min_block_m > m:
-    raise NotImplementedError(
-        f'Tiling {a} elements needs {min_block_m} rows; the shape has {m}.'
-    )
+  # A shape with fewer rows than the floor gets the floor anyway, and `_grid`
+  # declines it. Raising here would pre-empt the `vmap` rule in `_fwd`, which
+  # is the one that can still find the rows, in the batch axes.
+  min_block_m = _min_block_m(a, jnp.dtype(x.dtype).itemsize * 8, m)
   block_m = min_block_m if (scale is None and offset is None) else max(
       min_block_m, min(32, prev_power_of_2(m))
   )
@@ -261,10 +303,16 @@ def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
   return Config(block_m=block_m, block_n=None)
 
 def _grid(x_shape, block) -> tuple[int, ...]:
-  """Returns the launch grid, rejecting blocks the launch cannot express."""
+  """Returns the launch grid, declining blocks the launch cannot express.
+
+  A block wider than its axis is a shape this kernel has no tiling for, not a
+  bug in the caller, so it declines and lets another impl take it.
+  """
   for (s, b) in zip(x_shape, block):
     if s < b:
-      raise ValueError(f'Block {b} is larger than the axis it tiles ({s}).')
+      raise NotImplementedError(
+        f'Block {b} is larger than the axis it tiles ({s}).'
+      )
   return tuple(pl.cdiv(s, b) for (s, b) in zip(x_shape, block))
 
 def _block_index(x_shape, block, idx):
@@ -272,9 +320,7 @@ def _block_index(x_shape, block, idx):
 
   Shapes need not be multiples of the block: a trailing partial block is shifted
   back to end at the array's edge, so it overlaps its predecessor and recomputes
-  the shared elements. The loads stay unpredicated and the duplicated stores
-  write the same values twice, which is harmless -- except for the VJP's dparam
-  reductions, where the repeats are masked out.
+  the shared elements.
   """
   return tuple(
     pl.ds(jnp.minimum(i * b, s - b), b) for i, s, b in zip(idx, x_shape, block)
@@ -306,8 +352,73 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     return_residuals: bool,
     config: Config,
   ) -> tuple[jax.Array, base.Residuals | None]:
+    """Launches the kernel, folding `vmap`'s axes into M where they can be.
+
+    Left to itself, `vmap` gives each batch element its own grid slot, so the
+    block is left tiling the inner rows alone -- fewer than the layout needs,
+    for an A the lanes cannot cover on their own (see `_min_block_m`). But the
+    batch axis lands left of the reduced one, where `canonicalize_shape_3d`
+    folds it into M, and the block then draws rows from it like any other.
+
+    Only `x` folds. A batched `scale`/`offset` varies along the rows one block
+    spans and the kernel has a single param vector per launch, so those keep
+    `vmap`'s own rule.
+    """
     if callable(x):
       x = x()
+
+    rest = dict(
+      epsilon=epsilon,
+      scale_offset=scale_offset,
+      subtract_mean=subtract_mean,
+      return_residuals=return_residuals,
+    )
+
+    def with_vmap(axis, config):
+      def launch(x, scale, offset):
+        return self._launch(x, scale, offset, axis=axis, config=config, **rest)
+
+      fwd = jax.custom_batching.custom_vmap(launch)
+
+      def vmap_rule(axis_size, in_batched, x, scale, offset):
+        del axis_size
+        x_batched, *params_batched = in_batched
+        if x_batched and not any(jax.tree.leaves(params_batched)):
+          # The batch arrives at axis 0, so the reduced axis has shifted right.
+          # The config goes back to `None` to be re-derived: the one we were
+          # handed describes the shape as it was before the fold. Recursing
+          # through `with_vmap` leaves the new call batchable in turn, which is
+          # what lets a second `vmap` fold its axis in as well.
+          new_axis = axis + 1 if axis >= 0 else axis
+          out = with_vmap(new_axis, None)(x, scale, offset)
+        else:
+          in_axes = [0 if b else None for b in in_batched]
+          out = jax.vmap(launch, in_axes=in_axes)(x, scale, offset)
+        return out, jax.tree.map(lambda _: True, out)
+
+      fwd.def_vmap(vmap_rule)
+      return fwd
+
+    return with_vmap(axis, config)(x, scale, offset)
+
+  def _launch(
+    self,
+    x: jax.Array,
+    scale: jax.Array | None,
+    offset: jax.Array | None,
+    *,
+    axis: int,
+    epsilon: float,
+    scale_offset: float,
+    subtract_mean: bool,
+    return_residuals: bool,
+    config: Config | None,
+  ) -> tuple[jax.Array, base.Residuals | None]:
+    """One kernel launch. `config` is `None` when it has to be re-derived."""
+    if config is None:
+      config = _heuristics_config(
+        x, scale, offset, axis=axis, vmap_axis_sizes=()
+      )
 
     dtype = x.dtype
     orig_x_shape = x.shape
@@ -323,14 +434,28 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
     layout = _tiled_layout(block_m, A, block_n, dtype.itemsize * 8)
 
+    # `_block_index` shifts a trailing partial block back to end at the array's
+    # edge, which needs a whole block to shift within. Too few rows for even one
+    # -- a shape below `_min_block_m`, which `vmap` hands over all the time --
+    # and the rows are padded up to a block.
+    rows = x_shape[0]
+    pad_m = max(0, block_m - rows)
+    x = x.reshape(x_shape)
+    if pad_m:
+      x = jnp.pad(x, ((0, pad_m), (0, 0), (0, 0)))
+      x_shape = (block_m,) + x_shape[1:]
+
     # A trailing partial block re-reads rows a neighbouring CTA writes, so
-    # writing `y` over `x` would race; fall back to a separate output.
-    alias = bool(self.input_output_alias) and all(
-      s % b == 0 for (s, b) in zip(x_shape, block)
+    # writing `y` over `x` would race; fall back to a separate output. Padding
+    # makes `x` a fresh buffer, so there is nothing left worth aliasing either.
+    alias = (
+      bool(self.input_output_alias)
+      and not pad_m
+      and all(s % b == 0 for (s, b) in zip(x_shape, block))
     )
     # A ref is written in place, so the kernel writes `y` over `x` and XLA gets
     # to drop the copy `new_ref` starts with whenever `x` is dead afterwards.
-    x_operand = jax.new_ref(x.reshape(x_shape)) if alias else x.reshape(x_shape)
+    x_operand = jax.new_ref(x) if alias else x
 
     def kernel(*refs):
       it = iter(refs)  # Inputs then outputs, optional ones only if present.
@@ -390,14 +515,15 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     else:
       y, *stats = outs
 
-    y = y.reshape(orig_x_shape)
+    unpad = lambda a: a[:rows] if pad_m else a
+    y = unpad(y).reshape(orig_x_shape)
     if not return_residuals:
       return y, None
 
     stat_shape = list(orig_x_shape)
     stat_shape[axis] = 1
-    mean = stats[0].reshape(stat_shape) if return_mean else None
-    rstddev = stats[-1].reshape(stat_shape)
+    mean = unpad(stats[0]).reshape(stat_shape) if return_mean else None
+    rstddev = unpad(stats[-1]).reshape(stat_shape)
     return y, (mean, rstddev)
 
   @override
