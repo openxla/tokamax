@@ -9,6 +9,10 @@ name: CI-Build
 #  `report` the selection is logged and every shard runs anyway. Anything
 #  that cannot be analysed runs everything, as does a `workflow_dispatch`.
 #
+#  `collect-tests` is the one job that ignores all of that and imports the
+#  whole suite in a single process, because some failures are properties of
+#  the collection rather than of any test.
+#
 #  Require `shard-all-tests-passed` in branch protection, not the shard jobs,
 #  whose names and number change whenever the SHARDS table is rebalanced.
 on:
@@ -152,6 +156,46 @@ jobs:
             python3 .github/ci/shards.py explain --changed-from /tmp/changed
           fi
 
+  collect-tests:
+    # Whole-tree collection, deliberately unsharded and never narrowed.
+    needs: shard-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
+        with:
+          python-version: 3.12
+
+      - name: Install dependencies
+        # No device extra: nothing here executes a kernel.  JAX is pinned to
+        # the latest version that was installed in CI.
+        run: |
+          JAX_PIN=$(python -c 'import sys; sys.path.insert(0, ".github/ci"); import shards; print(shards.latest_jax())')
+          echo "Installing dependencies on cpu, jax ${JAX_PIN}"
+          # No need to put `jaxlib` in the constraint file: jax's own metadata
+          # pins it from there.
+          printf 'jax==%s\n' "${JAX_PIN}" > /tmp/jax-pin.txt
+          python -m pip install --upgrade pip
+          python -m pip install --constraint /tmp/jax-pin.txt -e ".[test]"
+          python -m pip freeze
+          got=$(python -c 'import jax; print(jax.__version__)')
+          [[ "${got}" == "${JAX_PIN}" ]] || {
+            echo "::error::asked for jax ${JAX_PIN}, got ${got}"; exit 1; }
+
+      - name: Collect every test
+        env:
+          PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
+        run: |
+          # `--collect-only` imports every test module and reports what it
+          # found without running any of it.
+          printf '%s tokamax' "${PYTEST_FLAGS}" \
+            | xargs pytest --collect-only -q
+
   shard-tests:
     name: shard-tests (${{ matrix.runner_short }}, ${{ matrix.shard_name }})
     needs: shard-matrix
@@ -214,7 +258,7 @@ jobs:
     # The idea here is that rather than checking for specific shard names to pass, we centralize
     # the bookkeeping here, and then Copybara checks that this "result-aggregating" job passed.
     name: shard-all-tests-passed
-    needs: [shard-matrix, shard-tests]
+    needs: [shard-matrix, collect-tests, shard-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -240,14 +284,19 @@ jobs:
       - name: Check results
         env:
           MATRIX: ${{ needs.shard-matrix.result }}
+          COLLECT: ${{ needs.collect-tests.result }}
           TESTS: ${{ needs.shard-tests.result }}
           INCLUDE: ${{ needs.shard-matrix.outputs.include }}
         run: |
-          echo "shard-matrix=${MATRIX} tests=${TESTS}"
+          echo "shard-matrix=${MATRIX} collect=${COLLECT} tests=${TESTS}"
           # Only `success` counts. `cancelled` in particular is not a result,
           # and treating it as one is how a cancelled run reports green.
           if [[ "${MATRIX}" != "success" ]]; then
             echo "::error::shard-matrix did not succeed"
+            exit 1
+          fi
+          if [[ "${COLLECT}" != "success" ]]; then
+            echo "::error::collect-tests reported ${COLLECT}"
             exit 1
           fi
           # `skipped` is expected when the change only touches non-test files
