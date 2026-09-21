@@ -671,14 +671,21 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       mode=("forward", "backward"),
       qk_diag_grid=(2, 4),
       head_dim_qk=(128, 192),
+      q_layout=(splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR),
+      k_layout=(splash.QKVLayout.HEAD_DIM_MINOR, splash.QKVLayout.SEQ_MINOR),
   )
-  def test_qk_diag_skip_bit_exact(self, mode, qk_diag_grid, head_dim_qk):
+  def test_qk_diag_skip_bit_exact(
+      self, mode, qk_diag_grid, head_dim_qk, q_layout, k_layout
+  ):
     """`qk_diag_skip` must be BIT-EXACT vs the stock (`qk_diag_skip=False`) path.
 
     The skip fills `mask_value` on fully-masked (kv > q) diagonal sub-tiles, which the
     softmax's `jnp.where` overwrites — so the output is identical for any `qk_diag_grid`.
     Covers forward `O` and backward `dQ/dK/dV` on a causal mask with square, power-of-2
-    blocks, at two head dims (incl. the DS-v3 192/128 shape).
+    blocks, at two head dims (incl. the DS-v3 192/128 shape), for both q and k
+    layouts. The kernels keep q and k in their configured layouts rather than
+    transposing, so `SEQ_MINOR` moves the sequence axis and the diagonal
+    sub-tiles must be sliced along the axis that actually carries it.
     """
     seq_len, num_heads, block = 512, 2, 256
     k1, k2, k3, k4 = random.split(random.key(0), 4)
@@ -694,6 +701,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
           block_q_dkv=block, block_kv_dkv=block, block_kv_dkv_compute=block,
           use_fused_bwd_kernel=True, residual_checkpoint_name="context",
           qk_diag_skip=qk_diag_skip, qk_diag_grid=qk_diag_grid,
+          q_layout=q_layout, k_layout=k_layout,
           interpret=self.INTERPRET,
       )
       attn = splash.make_splash_mha_single_device(mask, config=config)
