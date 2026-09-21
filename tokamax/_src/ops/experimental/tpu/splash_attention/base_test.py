@@ -15,6 +15,7 @@
 
 """Tests for base SplashAttention operator and reference implementation."""
 
+import functools
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -146,9 +147,17 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     with self.assertRaises(TypeError):
       self.op(q, q, q, mask="invalid_mask", is_mqa=False)
 
-    # return_residuals error
+    # return_residuals success
+    out, res = self.op(q, q, q, mask, return_residuals=True, is_mqa=False)
+    self.assertEqual(out.shape, (4, 128, 64))
+    self.assertLen(res, 2)
+    self.assertEqual(res[0].shape, (4, 128))
+    self.assertEqual(res[1].shape, (4, 128))
+
+    # VJP return_residuals not supported
+    assert self.op.vjp is not None
     with self.assertRaises(NotImplementedError):
-      self.op(q, q, q, mask, return_residuals=True, is_mqa=False)
+      self.op.vjp(res, out, out, q, q, q, mask, return_residuals=True)
 
   def test_symbolic_mask_direct(self):
     q = jnp.ones((2, 128, 64))
@@ -198,6 +207,83 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     vmapped_op = jax.vmap(self.op, in_axes=(0, 0, 0, None))
     out = vmapped_op(q, k, v, mask)
     self.assertEqual(out.shape, (batch_size, num_heads, seq_len, head_dim))
+
+  @parameterized.parameters(
+      (4, 4, 128, 128, 64, False, None),
+      (4, 1, 128, 128, 64, True, None),
+      (2, 2, 128, 128, 64, False, 30.0),
+  )
+  def test_vjp_equivalence(
+      self,
+      num_q_heads,
+      num_kv_heads,
+      q_seq_len,
+      kv_seq_len,
+      head_dim,
+      is_mqa,
+      attn_logits_soft_cap,
+  ):
+    dtype = jnp.float32
+    q = jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim), dtype=dtype)
+    if is_mqa:
+      k = jax.ShapeDtypeStruct((kv_seq_len, head_dim), dtype=dtype)
+      v = jax.ShapeDtypeStruct((kv_seq_len, head_dim), dtype=dtype)
+    else:
+      k = jax.ShapeDtypeStruct(
+          (num_kv_heads, kv_seq_len, head_dim), dtype=dtype
+      )
+      v = jax.ShapeDtypeStruct(
+          (num_kv_heads, kv_seq_len, head_dim), dtype=dtype
+      )
+    do = jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim), dtype=dtype)
+    q, k, v, do = numerics.random_initialize((q, k, v, do))
+
+    mask = base.CAUSAL_MASK
+
+    kwargs = dict(
+        mask=mask,
+        is_mqa=is_mqa,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+    )
+
+    out, f_vjp = jax.vjp(
+        functools.partial(self.op, **kwargs),
+        q,
+        k,
+        v,
+    )
+    dq, dk, dv = f_vjp(do)
+
+    out_ref, stats_ref = reference.attention_reference(
+        q=q,
+        k=k,
+        v=v,
+        mask=mask.as_array(q_seq_len, kv_seq_len),
+        is_mqa=is_mqa,
+        save_residuals=True,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+    )
+    dq_ref, dk_ref, dv_ref, _ = reference.attention_reference_vjp(
+        do=do,
+        q=q,
+        k=k if not (is_mqa and k.ndim == 3) else k[0],
+        v=v if not (is_mqa and v.ndim == 3) else v[0],
+        mask=mask.as_array(q_seq_len, kv_seq_len),
+        segment_ids=None,
+        sinks=None,
+        o=out_ref,
+        logsumexp=stats_ref["logsumexp"],
+        is_mqa=is_mqa,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+    )
+    if is_mqa and k.ndim == 3:
+      dk_ref = dk_ref.reshape(k.shape)
+      dv_ref = dv_ref.reshape(v.shape)
+
+    chex.assert_trees_all_close(out, out_ref, atol=1e-5)
+    chex.assert_trees_all_close(dq, dq_ref, atol=1e-5)
+    chex.assert_trees_all_close(dk, dk_ref, atol=1e-5)
+    chex.assert_trees_all_close(dv, dv_ref, atol=1e-5)
 
 
 if __name__ == "__main__":

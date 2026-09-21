@@ -20,12 +20,13 @@ from typing import Annotated, ClassVar, Final, override
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
 import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.tpu.splash_attention import base
+from tokamax._src.ops.experimental.tpu.splash_attention import pallas_mosaic_tpu_vjp
 from tokamax._src.ops.experimental.tpu.splash_attention import reference
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
@@ -75,6 +76,14 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
 
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(
+          self,
+          "vjp",
+          pallas_mosaic_tpu_vjp.PallasMosaicTpuSplashAttentionVjp(),
+      )
+
   @jaxtyping.jaxtyped
   @override
   def _fwd(
@@ -82,17 +91,17 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
       q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
       k: Float[Array, "..."],
       v: Float[Array, "..."],
+      *,
       mask: base.Mask | mask_lib.Mask,
       segment_ids: reference.SegmentIds | None = None,
       sinks: Float[Array, "..."] | None = None,
-      *,
       is_mqa: bool = False,
       mask_value: float = reference.DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
       return_residuals: bool = False,
       config: Config,
-  ) -> tuple[jax.Array, None]:
+  ) -> tuple[jax.Array, base.Residuals | None]:
     if dropout_rate != 0.0:
       raise NotImplementedError(
           "Dropout is not supported in PallasMosaicTpuSplashAttention."
@@ -101,6 +110,9 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
     splash_config = dataclasses.replace(
         splash_attention_kernel.SplashConfig.get_default(),
         attn_logits_soft_cap=attn_logits_soft_cap,
+        block_q_dkv=None,
+        block_kv_dkv=None,
+        block_kv_dkv_compute=None,
         **dataclasses.asdict(config),
     )
 
@@ -139,6 +151,7 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
           jnp.asarray(splash_mask),
           config=splash_config,
           mask_value=mask_value,
+          save_residuals=return_residuals,
       )
     else:
       splash_maker = (
@@ -150,16 +163,23 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
           splash_mask,
           config=splash_config,
           mask_value=mask_value,
+          save_residuals=return_residuals,
       )
 
-    out = attn_fn(
+    splash_output = attn_fn(
         q,
         k_in,
         v_in,
         segment_ids=segment_ids,
         sinks=sinks,
     )
-    return out, None
+    if return_residuals:
+      out, stats = splash_output
+      residuals = (stats["max_logits"], stats["logsumexp"])
+    else:
+      out = splash_output
+      residuals = None
+    return out, residuals
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
