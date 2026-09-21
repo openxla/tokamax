@@ -105,8 +105,25 @@ def canonicalize_shape_3d(
 ) -> tuple[int, int, int]:
   return (math.prod(shape[:axis]), shape[axis], math.prod(shape[axis:][1:]))
 
+def _min_block_m(A: int, bitwidth: int) -> int:
+  """The fewest rows a block can have, with no N to block.
+
+  With only M and A to tile, the block has to hold enough for 128 threads to
+  divide it. `_tiled_layout` is the authority on that, so we ask it rather than
+  re-deriving the rule.
+  """
+  for block_m in (1, 2, 4, 8, 16, 32, 64, 128):
+    try:
+      _tiled_layout(block_m, A, bitwidth, reduce_axis=1)
+      return block_m
+    except NotImplementedError:
+      continue
+  raise NotImplementedError(f'No tiling for {A=} at any block_m.')
+
 def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
   m, a, n = canonicalize_shape_3d(x.shape, axis)
+  # A block never exceeds the axis it tiles, and stays a power of two.
+  prev_power_of_2 = lambda s: 1 << (s.bit_length() - 1)
 
   if len(x.shape[axis:]) > 1:
     if n % 128 == 0:
@@ -116,26 +133,59 @@ def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
       els_per_cache_line = (
           gpu_utils.CACHE_LINE_SIZE_BYTES // jnp.dtype(x.dtype).itemsize
       )
-      block_n = min(els_per_cache_line, pl.next_power_of_2(n))
+      block_n = min(els_per_cache_line, prev_power_of_2(n))
     # Blocking N already gives each block a full cache line, so there is nothing
     # left for `block_m > 1` to re-use.
     return Config(block_m=1, block_n=block_n)
 
   # Reducing the trailing axis: there is no N to block, so the only re-use of
   # `scale`/`offset` across rows comes from M. Halve `block_m` until the block
-  # fits in registers and enough blocks are launched to fill the device.
-  block_m = 1 if (scale is None and offset is None) else 32
+  # fits in registers and enough blocks are launched to fill the device, but
+  # never below what the tiling needs: M is carrying the warps and whatever
+  # lanes A could not take.
+  min_block_m = _min_block_m(a, jnp.dtype(x.dtype).itemsize * 8)
+  if min_block_m > m:
+    raise NotImplementedError(
+        f'Tiling {a} elements needs {min_block_m} rows; the shape has {m}.'
+    )
+  block_m = min_block_m if (scale is None and offset is None) else max(
+      min_block_m, min(32, prev_power_of_2(m))
+  )
   block_size = block_m * pl.next_power_of_2(a)
   num_blocks = pl.cdiv(m, block_m) * math.prod(vmap_axis_sizes)
   max_block_size = gpu_utils.NUM_REGISTERS_PER_SM // 4
   min_num_blocks = 4 * jax.devices()[0].core_count
-  while (block_m > 1) and (
+  while (block_m > min_block_m) and (
       (block_size > max_block_size) or (num_blocks < min_num_blocks)
   ):
     block_m //= 2
     block_size //= 2
     num_blocks *= 2
   return Config(block_m=block_m, block_n=None)
+
+def _grid(x_shape, block) -> tuple[int, ...]:
+  """Returns the launch grid, rejecting blocks the launch cannot express."""
+  for (s, b) in zip(x_shape, block):
+    if s < b:
+      raise ValueError(f'Block {b} is larger than the axis it tiles ({s}).')
+  return tuple(pl.cdiv(s, b) for (s, b) in zip(x_shape, block))
+
+def _block_index(x_shape, block, idx, squeeze):
+  """Start offsets for one CTA's block, clamped to keep the block in bounds.
+
+  Shapes need not be multiples of the block: a trailing partial block is shifted
+  back to end at the array's edge, so it overlaps its predecessor and recomputes
+  the shared elements. The loads stay unpredicated and the duplicated stores
+  write the same values twice, which is harmless.
+
+  Axis `squeeze` is blocked at 1 and gets a scalar index, which drops it from
+  the tile; see `_tiled_layout`.
+  """
+  return tuple(
+    jnp.minimum(i, s - 1) if ax == squeeze else pl.ds(jnp.minimum(i * b, s - b), b)
+    for ax, (i, s, b) in enumerate(zip(idx, x_shape, block))
+  )
+
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
@@ -183,7 +233,11 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
     layout = _tiled_layout(tile[0], tile[1], dtype.itemsize * 8,
                             reduce_axis=red)
 
-    alias = bool(self.input_output_alias)
+    # A trailing partial block re-reads rows a neighbouring CTA writes, so
+    # writing `y` over `x` would race; fall back to a separate output.
+    alias = bool(self.input_output_alias) and all(
+      s % b == 0 for (s, b) in zip(x_shape, block)
+    )
     # A ref is written in place, so the kernel writes `y` over `x` and XLA gets
     # to drop the copy `new_ref` starts with whenever `x` is dead afterwards.
     x_operand = jax.new_ref(x.reshape(x_shape)) if alias else x.reshape(x_shape)
@@ -198,10 +252,8 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       mean_gmem = take(return_mean)
       rstd_gmem = take(return_residuals)
 
-      index = tuple(
-        i if ax == squeeze else pl.ds(i * b, b)
-        for ax, (i, b) in enumerate(
-          zip([jax.lax.axis_index(j) for j in "man"], block))
+      index = _block_index(
+        x_shape, block, [jax.lax.axis_index(i) for i in 'man'], squeeze
       )
 
       stat_index = index[:1] + index[2:]
@@ -228,15 +280,14 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       y_gmem[index] = x.astype(dtype)
 
     stat = jax.ShapeDtypeStruct(x_shape[:1] + x_shape[2:], jnp.float32)
-    for (s,b) in zip(x_shape, block):
-      assert s % b == 0
+    grid = _grid(x_shape, block)
     outs = plgpu.kernel(
       kernel,
       out_type=(
         *([] if alias else [jax.ShapeDtypeStruct(x_shape, dtype)]),
         *[stat] * (return_mean + return_residuals),
       ),
-      grid=tuple(s//b for (s,b) in zip(x_shape, block)),
+      grid=grid,
       grid_names=('m', 'a', 'n')
     )(
       x_operand,

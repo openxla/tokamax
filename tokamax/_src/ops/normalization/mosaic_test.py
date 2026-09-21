@@ -23,17 +23,15 @@ shared cross-impl set and this kernel is only aimed at the benchmark ones.
 import inspect
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
+import jax.numpy as jnp
 from tokamax._src.ops.normalization import mosaic
 from tokamax._src.ops.normalization import test_base
 
 
 class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
   """Runs `test_base`'s benchmark-shape tests, and only those."""
-
-  # Everything the base class parameterizes over shapes of its own choosing.
-  # `test_bench` is what we keep.
-  _OUT_OF_SCOPE = ('test_layer_norm', 'test_rms_norm')
 
   def __init__(self, *args):
     # No backward kernel yet, and Mosaic GPU Pallas calls have no AD rule.
@@ -44,8 +42,8 @@ class PallasMosaicGpuNormalizationTest(test_base.NormalizationTestBase):
     )
 
   def setUp(self):
-    if self._testMethodName.startswith(self._OUT_OF_SCOPE):
-      self.skipTest('Only the benchmark shapes are in scope for this kernel.')
+    # if self._testMethodName.startswith(self._OUT_OF_SCOPE):
+    #   self.skipTest('Only the benchmark shapes are in scope for this kernel.')
     if not self._norm_fn.supported_on(jax.devices()[0]):
       self.skipTest('Mosaic GPU normalization not supported on this device.')
     super().setUp()
