@@ -31,11 +31,15 @@ from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import api as lsce_api
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import base as lsce_base
 from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu as pl_ragged_dot_mosaic_tpu
 from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+from tokamax._src.ops.triangle_multiplication import api as tri_mul_api
+from tokamax._src.ops.triangle_multiplication import base as tri_mul_base
 
 try:
   from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
@@ -62,8 +66,6 @@ class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
 
   def _get_heuristics_config(self, ba: op_lib.BoundArguments) -> _FakeOpConfig:
     return _HEURISTICS_CONFIG
-
-
 
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
@@ -117,6 +119,15 @@ class AutotuningTest(parameterized.TestCase):
         api.get_op_implementations(glu_base.GatedLinearUnit()),
         dict(glu_api.IMPLEMENTATIONS),
     )
+    self.assertDictEqual(
+        api.get_op_implementations(lsce_base.LinearSoftmaxCrossEntropyLoss()),
+        dict(lsce_api.IMPLEMENTATIONS),
+    )
+    self.assertDictEqual(
+        api.get_op_implementations(tri_mul_base.TriangleMultiplication()),
+        dict(tri_mul_api.IMPLEMENTATIONS),
+    )
+
     if jax.default_backend() != "tpu":
       assert triton_glu is not None
       self.assertDictEqual(
@@ -264,8 +275,6 @@ class AutotuningTest(parameterized.TestCase):
     self.assertNotEmpty(result.data)
     _, autotune_data = result.data[0]
     self.assertIn(_HEURISTICS_CONFIG, autotune_data)
-
-
 
   def test_bound_args_to_from_json(self):
     if jax.default_backend() == "tpu":
@@ -456,6 +465,7 @@ class AutotuningTest(parameterized.TestCase):
 
       expected_len = 1 if ignore_cache else 0
       self.assertLen(res_new.data, expected_len)
+
 
 if __name__ == "__main__":
   absltest.main()
