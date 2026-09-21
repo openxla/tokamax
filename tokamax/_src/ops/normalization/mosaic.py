@@ -67,15 +67,30 @@ def _vector_length(block_n: int, A: int, bitwidth: int) -> int:
       return vec
     vec //= 2
 
+def _lanes_along_a(vec: int, A: int) -> int:
+  """How many of the 32 lanes go along A; the rest spread along M.
+
+  A lane holds `A // la` elements of the reduced axis, which the vector then has
+  to tile, so `la` must divide A and leave a multiple of `vec` behind. A is not
+  always obliging -- A=40 with a 4-element vector admits la=2 at most, and A=42
+  only la=1 -- and every lane A cannot take is a lane M has to, which is what
+  makes `block_m` the heuristic's problem. See `_min_block_m`.
+  """
+  for la in (32, 16, 8, 4, 2, 1):
+    if A % la == 0 and (A // la) % vec == 0:
+      return la
+  raise ValueError(f'Cannot spread lanes over {A=} with {vec=}.')
+
 def _vec_along_a(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
   """Tiles a warp's block when the vector spans whole N rows (vec >= block_n).
-  The 32 lanes go along the reduced axis, one vector each, and any lanes left
-  over once it is exhausted spread along M.
+  The 32 lanes go along the reduced axis, as many as it can take, and the ones
+  left over once it is exhausted spread along M.
   """
-  a = A // vec  # Vectors along the reduced axis.
-  if a >= 32:
-    return (M, A // 32, N)
-  return (M // (32 // a), vec, N)
+  la = _lanes_along_a(vec, A)
+  lm = 32 // la
+  if M % lm:
+    raise ValueError(f'Cannot spread {lm} lanes over {M=} rows per warp.')
+  return (M // lm, A // la, N)
 
 def _vec_along_n(vec: int, M: int, A: int, N: int) -> tuple[int, int, int]:
   """Tiles a warp's block when the vector fits inside an N row (vec < block_n).
@@ -187,12 +202,25 @@ def canonicalize_shape_3d(
 ) -> tuple[int, int, int]:
   return (math.prod(shape[:axis]), shape[axis], math.prod(shape[axis:][1:]))
 
+def _min_block_m(A: int, bitwidth: int) -> int:
+  """The fewest rows a block can have, with no N to block.
+
+  All four warps go along M (`_warp_blocks` has nowhere else to put them), and
+  so do the `32 // la` lanes A had no room for, so the block needs one row per
+  warp per leftover lane before the layout can tile it at all. A=64 asks for 8
+  rows, A=40 for 64, A=42 for 128.
+  """
+  la = _lanes_along_a(_vector_length(1, A, bitwidth), A)
+  return 4 * (32 // la)
+
 def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
   """Picks the block shape.
 
   The kernel is always a single warpgroup, so there is no warp count to pick.
   """
   m, a, n = canonicalize_shape_3d(x.shape, axis)
+  # A block never exceeds the axis it tiles, and stays a power of two.
+  prev_power_of_2 = lambda s: 1 << (s.bit_length() - 1)
 
   if len(x.shape[axis:]) > 1:
     if n % 128 == 0:
@@ -202,20 +230,29 @@ def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
       els_per_cache_line = (
           gpu_utils.CACHE_LINE_SIZE_BYTES // jnp.dtype(x.dtype).itemsize
       )
-      block_n = min(els_per_cache_line, pl.next_power_of_2(n))
+      block_n = min(els_per_cache_line, prev_power_of_2(n))
     # Blocking N already gives each block a full cache line, so there is nothing
     # left for `block_m > 1` to re-use.
     return Config(block_m=1, block_n=block_n)
 
   # Reducing the trailing axis: there is no N to block, so the only re-use of
   # `scale`/`offset` across rows comes from M. Halve `block_m` until the block
-  # fits in registers and enough blocks are launched to fill the device.
-  block_m = 1 if (scale is None and offset is None) else 32
+  # fits in registers and enough blocks are launched to fill the device, but
+  # never below what the tiling needs: M is carrying the warps and whatever
+  # lanes A could not take.
+  min_block_m = _min_block_m(a, jnp.dtype(x.dtype).itemsize * 8)
+  if min_block_m > m:
+    raise NotImplementedError(
+        f'Tiling {a} elements needs {min_block_m} rows; the shape has {m}.'
+    )
+  block_m = min_block_m if (scale is None and offset is None) else max(
+      min_block_m, min(32, prev_power_of_2(m))
+  )
   block_size = block_m * pl.next_power_of_2(a)
   num_blocks = pl.cdiv(m, block_m) * math.prod(vmap_axis_sizes)
   max_block_size = gpu_utils.NUM_REGISTERS_PER_SM // 4
   min_num_blocks = 4 * jax.devices()[0].core_count
-  while (block_m > 1) and (
+  while (block_m > min_block_m) and (
       (block_size > max_block_size) or (num_blocks < min_num_blocks)
   ):
     block_m //= 2
@@ -226,8 +263,22 @@ def _heuristics_config(x, scale, offset, *, axis, vmap_axis_sizes) -> Config:
 def _grid(x_shape, block) -> tuple[int, ...]:
   """Returns the launch grid, rejecting blocks the launch cannot express."""
   for (s, b) in zip(x_shape, block):
-    assert s % b == 0
-  return tuple(s // b for (s, b) in zip(x_shape, block))
+    if s < b:
+      raise ValueError(f'Block {b} is larger than the axis it tiles ({s}).')
+  return tuple(pl.cdiv(s, b) for (s, b) in zip(x_shape, block))
+
+def _block_index(x_shape, block, idx):
+  """Start offsets for one CTA's block, clamped to keep the block in bounds.
+
+  Shapes need not be multiples of the block: a trailing partial block is shifted
+  back to end at the array's edge, so it overlaps its predecessor and recomputes
+  the shared elements. The loads stay unpredicated and the duplicated stores
+  write the same values twice, which is harmless -- except for the VJP's dparam
+  reductions, where the repeats are masked out.
+  """
+  return tuple(
+    pl.ds(jnp.minimum(i * b, s - b), b) for i, s, b in zip(idx, x_shape, block)
+  )
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
@@ -272,7 +323,11 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
 
     layout = _tiled_layout(block_m, A, block_n, dtype.itemsize * 8)
 
-    alias = bool(self.input_output_alias)
+    # A trailing partial block re-reads rows a neighbouring CTA writes, so
+    # writing `y` over `x` would race; fall back to a separate output.
+    alias = bool(self.input_output_alias) and all(
+      s % b == 0 for (s, b) in zip(x_shape, block)
+    )
     # A ref is written in place, so the kernel writes `y` over `x` and XLA gets
     # to drop the copy `new_ref` starts with whenever `x` is dead afterwards.
     x_operand = jax.new_ref(x.reshape(x_shape)) if alias else x.reshape(x_shape)
@@ -287,8 +342,9 @@ class PallasMosaicGpuNormalization(base.Normalization[Config, Key]):
       mean_gmem = take(return_mean)
       rstd_gmem = take(return_residuals)
 
-      index = tuple(pl.ds(s * b, b) for (s, b) in
-        zip([jax.lax.axis_index(i) for i in "man"], block))
+      index = _block_index(
+        x_shape, block, [jax.lax.axis_index(i) for i in 'man']
+      )
 
       stat_index = index[:1] + index[2:]
       x = plgpu.load(x_gmem.at[index], layout=layout, optimized=False).astype(jnp.float32)
@@ -418,6 +474,8 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
     # Reductions across singleton dimensions are not supported
     reduced = tuple(ax for ax in (2, 0) if block[ax] > 1)
     kept = tuple(ax for ax in range(3) if ax not in reduced)
+    # Only the axes with a clamped trailing block need the dedup mask.
+    dup_axes = tuple(ax for ax in reduced if x_shape[ax] % block[ax])
 
     def kernel(*refs):
       it = iter(refs)  # Inputs then outputs, optional ones only if present.
@@ -428,7 +486,10 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
       dscale_gmem, doffset_gmem = take(has_scale), take(has_offset)
 
       m, _, n = [jax.lax.axis_index(i) for i in 'man']
-      index = tuple(pl.ds(i * b, b) for (i, b) in zip((m, 0, n), block))
+      index = _block_index(x_shape, block, (m, 0, n))
+      # How far each axis' block was shifted back to stay in bounds; the first
+      # `dup` elements along that axis were already covered by the CTA before.
+      dups = [i * b - s.start for (i, b, s) in zip((m, 0, n), block, index)]
       load = lambda ref: plgpu.load(
         ref.at[index], layout=layout, optimized=False
       ).astype(jnp.float32)
@@ -448,6 +509,9 @@ class PallasMosaicGpuNormalizationVjp(base.NormalizationVjp[Config, Key]):
       dout = load(dout_gmem)
 
       def reduce_mn(a): # Multi axis reduce on mosaic not yet implemented
+        for ax in dup_axes:  # Count the re-read elements once, not twice.
+          iota = plgpu.broadcasted_iota(jnp.int32, block, ax, layout=layout)
+          a = jnp.where(iota >= dups[ax], a, 0.0)
         for ax in reduced:
           a = jnp.sum(a, axis=ax)  # N first, so M stays at axis 0.
         return a
