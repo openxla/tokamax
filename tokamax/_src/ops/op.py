@@ -22,6 +22,7 @@ import contextvars
 import dataclasses
 import functools
 import inspect
+import re
 from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final, overload
 
 from absl import logging
@@ -52,6 +53,7 @@ class NullConfig:
 
 
 _NULL_CONFIG: Final[NullConfig] = NullConfig()
+_CAMEL_TO_SNAKE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?!^)([A-Z])")
 
 
 @jax.tree_util.register_dataclass
@@ -408,6 +410,12 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     """Returns whether this op runs on the given device."""
     del device  # Unused.
     return True
+
+
+def snake_case_name(op: Op) -> str:  # pylint: disable=g-bare-generic
+  """Returns the snake_case name of the op implementation."""
+  cls = op if isinstance(op, type) else type(op)
+  return _CAMEL_TO_SNAKE_PATTERN.sub(r"_\1", cls.__name__).lower()
 
 
 type AutotuningCache = dict[DeviceKind, dict[Any, AutotuningData[Any]]]

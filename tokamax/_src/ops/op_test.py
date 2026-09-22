@@ -112,6 +112,19 @@ class OpTest(parameterized.TestCase):
     y = jnp.ones((1, 2))
     self.assertEqual(_FakeOp().bind(x, y).args, (x, y))
 
+  def test_snake_case_name(self):
+    self.assertEqual(
+        op_lib.snake_case_name(norm_base.Normalization()), "normalization"
+    )
+    self.assertEqual(
+        op_lib.snake_case_name(ragged_dot_base.RaggedDot()), "ragged_dot"
+    )
+    self.assertEqual(
+        op_lib.snake_case_name(pl_ragged_dot.PallasTritonRaggedDot()),
+        "pallas_triton_ragged_dot",
+    )
+    self.assertEqual(op_lib.snake_case_name(_FakeOp()), "__fake_op")
+
   def test_device_restriction_raises_on_unsupported_device(self):
     x = jnp.zeros((1, 2))
     y = jnp.ones((1, 2))

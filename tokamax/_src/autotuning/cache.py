@@ -32,6 +32,7 @@ type DeviceAutotuningCache = dict[Any, AutotuningData[Any]]
 
 
 CACHE_PATH: Final[str] = "data/autotuning"
+_CAMEL_TO_SNAKE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?!^)([A-Z])")
 
 
 def _get_cache_adapter(op) -> pydantic.TypeAdapter:
@@ -80,7 +81,9 @@ class AutotuningCache(dict[DeviceKind, DeviceAutotuningCache]):
 
     device_kind = device_kind.lower().replace(" ", "_")
     # Convert to snake case.
-    op_name = re.sub(r"(?!^)([A-Z])", r"_\1", type(self.op).__name__).lower()
+    op_name = _CAMEL_TO_SNAKE_PATTERN.sub(
+        r"_\1", type(self.op).__name__
+    ).lower()
 
     tokamax_files = resources.files("tokamax")
     out = {}
