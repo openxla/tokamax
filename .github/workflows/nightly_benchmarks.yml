@@ -49,3 +49,5 @@ jobs:
       environment_filter: ${{ inputs.environment_filter || '' }}
       custom_metadata: ${{ inputs.custom_metadata || '{}' }}
       experiment_ref: ${{ inputs.experiment_ref || '' }}
+      custom_env_vars: |
+        PIP_CONSTRAINT=.github/ci/constraints.txt

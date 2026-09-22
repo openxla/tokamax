@@ -1,0 +1,5 @@
+# Constraints for Tokamax nightly benchmarks.
+# Pinned to match the latest JAX in the supported CI window (.github/ci/shards.py).
+# Otherwise, when JAX releases a new version, Tokamax may not work out of the box
+# hence the nightly benchmark will fail.
+jax==0.11.1

@@ -497,6 +497,22 @@ class JaxVersionTest(unittest.TestCase):
       )
       self.assertEqual(shards.oldest_jax(), '0.11.0')
 
+  def test_constraints_file_matches_latest_jax(self) -> None:
+    constraints_path = os.path.join(
+        os.path.dirname(__file__), 'constraints.txt'
+    )
+    with open(constraints_path) as f:
+      content = f.read()
+    expected = f'jax=={shards.latest_jax()}'
+    self.assertIn(
+        expected,
+        content,
+        f'constraints.txt is out of sync with shards.latest_jax()'
+        f'({shards.latest_jax()}).'
+        f'Please update {constraints_path} to use the latest supported JAX'
+        f' version ({shards.latest_jax()}).',
+    )
+
 
 class CompatMatrixTest(unittest.TestCase):
 
