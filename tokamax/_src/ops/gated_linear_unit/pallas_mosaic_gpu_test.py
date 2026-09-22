@@ -39,6 +39,12 @@ class PallasMosaicGpuGatedLinearUnitTest(test_base.GatedLinearUnitTestBase):
     for _ in self._glu_fn._get_autotuning_configs(self._glu_fn.bind(x, w)):
       pass
 
+  def test_unsupported_dtype_raises_not_implemented(self):
+    x = jnp.zeros((64, 64), dtype=jnp.float32)
+    w = jnp.zeros((64, 2, 64), dtype=jnp.float32)
+    with self.assertRaises(NotImplementedError):
+      self._glu_fn(x, w)
+
 
 if __name__ == "__main__":
   absltest.main()
