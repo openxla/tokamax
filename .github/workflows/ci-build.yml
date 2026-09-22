@@ -197,7 +197,9 @@ jobs:
             | xargs pytest --collect-only -q
 
   shard-tests:
-    name: shard-tests (${{ matrix.runner_short }}, ${{ matrix.shard_name }})
+    # This is an if statement: if `matrix.shard_name` doesn't exist, the `name` is changed to be the 
+    # readable `shard-tests (no shard selected)`, rather than the raw template.
+    name: ${{ matrix.shard_name && format('shard-tests ({0}, {1})', matrix.runner_short, matrix.shard_name) || 'shard-tests (no shard selected)' }}
     needs: shard-matrix
     # A change that reaches no test -- documentation, a benchmark script --
     # selects no shard, and a matrix with an empty `include` is not a job with
