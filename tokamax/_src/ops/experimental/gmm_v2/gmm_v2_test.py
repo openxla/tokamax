@@ -1144,6 +1144,90 @@ class GmmTest(parameterized.TestCase):
 
   @parameterized.product(
       batch_size=[128],
+      in_size=[768],
+      out_size=[512],
+      num_groups=[16],
+      weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+      activation_dtype=[
+          None,
+          jnp.int8,
+          jnp.float8_e4m3fn,
+      ],
+      block_size=[256, 768],
+      group_offset=[0],
+  )
+  @pytest.mark.long
+  def test_gmm_activation_weight_quantized_misaligned_block_sizes(
+      self,
+      batch_size,
+      in_size,
+      out_size,
+      num_groups,
+      weight_dtype,
+      activation_dtype,
+      block_size,
+      group_offset,
+  ):
+    """Tests activation and weight quantization with misaligned block sizes."""
+    if weight_dtype == jnp.float4_e2m1fn and test_utils.get_tpu_version() < 7:
+      self.skipTest("Expect TPUv7+")
+    if block_size > in_size:
+      self.skipTest("block_size must be <= in_size")
+    if in_size % block_size != 0:
+      self.skipTest("in_size must be divisible by block_size")
+    if activation_dtype is not None:
+      tpu_info = pltpu.get_tpu_info()
+      if not (
+          tpu_info.is_matmul_supported(activation_dtype, weight_dtype)
+      ) and not gmm_v2.is_manually_cast_matmul_dtype_combo(
+          activation_dtype, weight_dtype
+      ):
+        self.skipTest(
+            f"Combination {activation_dtype} and {weight_dtype} not supported"
+            " by the kernel."
+        )
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+
+    lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, weight_dtype, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+    expected = reference_gmm(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+    )
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        maybe_quantize_lhs=True,
+        lhs_quant_dtype=activation_dtype,
+    ).astype(lhs.dtype)
+
+    # e5m2 introduces increased rounding error compared to e4m3
+    if activation_dtype == jnp.float8_e5m2:
+      atol, rtol = 2.25, 1.1
+    else:
+      atol, rtol = 1.1, 1.1
+
+    chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+
+  @parameterized.product(
+      batch_size=[128],
       in_size=[1024],
       out_size=[1024],
       num_groups=[16, 32],
