@@ -497,6 +497,22 @@ class JaxVersionTest(unittest.TestCase):
       )
       self.assertEqual(shards.oldest_jax(), '0.11.0')
 
+  def test_bench_jax_pin_matches_latest_jax(self) -> None:
+    pyproject_path = os.path.join(
+        os.path.dirname(__file__), '..', '..', 'pyproject.toml'
+    )
+    with open(pyproject_path, 'rb') as f:
+      bench_deps = shards.tomllib.load(f)['project']['optional-dependencies']['bench']
+    self.assertIn(
+        f'jax=={shards.latest_jax()}',
+        bench_deps,
+        msg=(
+            '[project.optional-dependencies].bench in pyproject.toml is out of'
+            ' sync with JAX_VERSIONS in shards.py. Update `jax==...` under'
+            ' `bench` in pyproject.toml to match `shards.latest_jax()`.'
+        ),
+    )
+
 
 class CompatMatrixTest(unittest.TestCase):
 

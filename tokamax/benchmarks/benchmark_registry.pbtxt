@@ -252,6 +252,7 @@ benchmarks {
     action: "./ml_actions/actions/workload_executors/python"
     action_inputs { key: "script_path" value: "tokamax/benchmarks/mla.py" }
     action_inputs { key: "python_version" value: "3.13" }
+    action_inputs { key: "extras" value: "bench" }
   }
 
   environment_configs {

@@ -62,6 +62,7 @@ test = [
 
 bench = [
     "google-benchmark>=1.9.0",
+    "jax==0.11.1",
 ]
 
 cuda = [
