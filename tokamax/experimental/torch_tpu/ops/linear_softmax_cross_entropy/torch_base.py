@@ -32,7 +32,6 @@ class _LinearSoftmaxCrossEntropyLossVjp[Config](torch_op.TorchOp[None]):
     super().__init__()
     self.op_impl_jax = jax_base.LinearSoftmaxCrossEntropyLossVjp()
     self.jax_op_name = "base_linear_softmax_cross_entropy_loss_vjp"
-    self.backward_param_names = ("residuals", "out", "dout")
     self.is_vjp = True
 
   @override
