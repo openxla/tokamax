@@ -40,6 +40,8 @@ from tokamax._src.ops.experimental.kda import api as kda_api
 from tokamax._src.ops.experimental.kda import base as kda_base
 from tokamax._src.ops.experimental.mla import api as mla_api
 from tokamax._src.ops.experimental.mla import base as mla_base
+from tokamax._src.ops.experimental.tpu.splash_attention import api as splash_attention_api
+from tokamax._src.ops.experimental.tpu.splash_attention import base as splash_attention_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import api as linear_softmax_cross_entropy_loss_api
@@ -276,6 +278,7 @@ _API_IMPLEMENTATIONS: Final[
     triangle_multiplication_base.TriangleMultiplication: (
         triangle_multiplication_api.IMPLEMENTATIONS
     ),
+    splash_attention_base.SplashAttention: splash_attention_api.IMPLEMENTATIONS,
 })
 
 

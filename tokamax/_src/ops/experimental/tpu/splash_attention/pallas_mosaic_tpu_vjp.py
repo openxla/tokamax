@@ -235,6 +235,8 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
               block_kv_dkv_compute=bkv_c,
           )
       )
+    if not configs:
+      configs.add(self._get_heuristics_config(ba))
     return configs
 
   @override

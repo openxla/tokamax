@@ -41,7 +41,7 @@ except ImportError:
   pass
 
 IMPLEMENTATIONS: Final[
-    immutabledict.immutabledict[str, Callable[..., jax.Array]]
+    immutabledict.immutabledict[str, base.SplashAttention[Any]]
 ] = immutabledict.immutabledict(_IMPLEMENTATIONS)
 del _IMPLEMENTATIONS
 

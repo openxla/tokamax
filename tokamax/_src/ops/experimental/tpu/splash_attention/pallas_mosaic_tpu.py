@@ -278,6 +278,8 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
                   qk_diag_grid=qk_grid_size,
               )
           )
+    if not configs:
+      configs.add(self._get_heuristics_config(ba))
     return configs
 
   @override

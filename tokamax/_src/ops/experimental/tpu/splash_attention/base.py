@@ -205,7 +205,7 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, Residuals, _Config, Any]):
       residuals = (stats["max_logits"], stats["logsumexp"])
     else:
       residuals = None
-    return out, residuals
+    return out.astype(q.dtype), residuals
 
 
 class SplashAttentionGrads(TypedDict):
