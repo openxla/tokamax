@@ -123,13 +123,6 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
     )
 
   @parameterized.named_parameters(
-      (
-          "preactivated_gate",
-          False,
-          -5.0,
-          True,
-          "use_gate_in_kernel=True",
-      ),
       ("missing_lower_bound", True, None, False, "lower_bound.*set"),
       ("unsafe_gate", True, -5.0, False, "safe_gate=True"),
   )
@@ -144,35 +137,40 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
       )
 
   @parameterized.named_parameters(
-      ("preactivated_gate", False, -5.0, "use_gate_in_kernel=True"),
-      ("missing_lower_bound", True, None, "lower_bound.*set"),
+      ("default_safe_gate", None, True),
+      ("explicit_unsafe_gate", -5.0, False),
   )
-  def test_rejects_unsupported_gate_before_kernel(
-      self, use_gate_in_kernel, lower_bound, expected_error
-  ):
+  def test_allows_preactivated_gate_config(self, lower_bound, safe_gate):
+    pallas_mosaic_tpu._check_gate_support(  # pylint: disable=protected-access
+        use_gate_in_kernel=False,
+        lower_bound=lower_bound,
+        safe_gate=safe_gate,
+    )
+
+  def test_rejects_missing_lower_bound_before_kernel(self):
     q = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
     v = jnp.ones_like(q)
 
-    with self.assertRaisesRegex(NotImplementedError, expected_error):
+    with self.assertRaisesRegex(NotImplementedError, "lower_bound.*set"):
       _call_attention(
           "mosaic",
           q,
           v,
-          use_gate_in_kernel=use_gate_in_kernel,
-          lower_bound=lower_bound,
+          use_gate_in_kernel=True,
+          lower_bound=None,
       )
 
   def test_unsupported_gate_config_falls_back_to_xla(self):
     q = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
     v = jnp.ones_like(q)
     expected = _call_attention(
-        "xla", q, v, use_gate_in_kernel=False, lower_bound=None
+        "xla", q, v, use_gate_in_kernel=True, lower_bound=None
     )
     actual = _call_attention(
         ("mosaic", "xla"),
         q,
         v,
-        use_gate_in_kernel=False,
+        use_gate_in_kernel=True,
         lower_bound=None,
     )
 

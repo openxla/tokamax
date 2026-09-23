@@ -112,9 +112,11 @@ def kimi_delta_attention(
       `"xla"` evaluates the recurrent reference implementation. `"mosaic"`
       uses the experimental Pallas/Mosaic TPU forward and custom VJP
       implementation. `"xla_chunked"` evaluates a pure-JAX chunked forward and
-      VJP lowered by XLA on the active backend. Both chunked implementations
-      target the production-aligned bounded-gate configuration and require
-      fused gate activation, a configured lower bound, and safe-gate factoring.
+      VJP lowered by XLA on the active backend. The `"xla_chunked"` backend
+      requires fused gate activation, a configured lower bound, and safe-gate
+      factoring. `"mosaic"` requires these for fused activation but also
+      supports pre-activated log-space gates; their numerical range remains
+      the caller's responsibility.
       A sequence tries implementations in order, falling back when an
       implementation raises `NotImplementedError`.
 

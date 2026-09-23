@@ -52,10 +52,11 @@ class Config:
   """Autotuning and execution configuration for Mosaic TPU KDA.
 
   `safe_gate=None` selects the exponent-stabilization strategy from the gate
-  activation mode. The public backend supports only bounded gate configurations
-  that resolve to `safe_gate=True`. `rematerialize_for_backward=True` omits
-  chunk hidden states from forward residuals and manually rebuilds them in the
-  custom backward.
+  activation mode. Fused gate activation requires a lower bound and
+  `safe_gate=True`; pre-activated gates retain the existing caller-provided
+  log-space path without an inferred numerical bound.
+  `rematerialize_for_backward=True` omits chunk hidden states from forward
+  residuals and manually rebuilds them in the custom backward.
   """
 
   chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
@@ -81,11 +82,10 @@ def _check_gate_support(
     lower_bound: float | None,
     safe_gate: bool,
 ) -> None:
-  """Checks the numerically bounded production gate configuration."""
+  """Checks the numerically bounded fused gate configuration."""
   if not use_gate_in_kernel:
-    raise NotImplementedError(
-        "`mosaic` requires `use_gate_in_kernel=True`."
-    )
+    # The caller supplies log-space gates; lower_bound does not constrain them.
+    return
   if lower_bound is None:
     raise NotImplementedError("`mosaic` requires `lower_bound` to be set.")
   if not safe_gate:
