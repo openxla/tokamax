@@ -1,0 +1,551 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Shared correctness tests for Causal Conv1D Gated Delta Rule.
+
+Each implementation gets a thin subclass of `CausalConv1dGatedDeltaRuleTestBase`
+(and `CausalConv1dGatedDeltaRuleSecurityTestBase`) that supplies the callable
+under test. Every implementation is compared against
+`base.CausalConv1dGatedDeltaRule`, which is the numerical reference.
+"""
+
+from collections.abc import Sequence
+
+from absl.testing import absltest
+from absl.testing import parameterized
+import jax
+from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
+import numpy as np
+from tokamax._src import mosaic_tpu
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import base
+
+
+# Argument names that must be static for every implementation. `config` is
+# additionally static for `op.Op`-derived implementations.
+STATIC_ARGNAMES: Sequence[str] = ("n_kq", "n_v", "d_k", "d_v", "kernel_size")
+OP_STATIC_ARGNAMES: Sequence[str] = (*STATIC_ARGNAMES, "config")
+
+# Shapes exercised by the shared correctness sweep. Kept in sync with the
+# `ci_tests`-tagged arg specs in `arg_specs.py`.
+_LOCAL_ATTENTION_CASES = (
+    dict(
+        testcase_name="prefill",
+        max_reqs=1,
+        lengths=[8192],
+        q_loc=[0, 8192],
+        distribution=[0, 0, 3],
+    ),
+    dict(
+        testcase_name="mixed",
+        max_reqs=3,
+        lengths=[256, 128, 128],
+        q_loc=[0, 256, 384, 512],
+        distribution=[0, 3, 3],
+    ),
+    dict(
+        testcase_name="decode_only",
+        max_reqs=64,
+        lengths=[1] * 64,
+        q_loc=list(range(65)),
+        distribution=[64, 64, 64],
+    ),
+    dict(
+        testcase_name="mixed_prefill_decode",
+        max_reqs=11,
+        lengths=[1] * 8 + [128, 128, 256],
+        q_loc=[0, 1, 2, 3, 4, 5, 6, 7, 8, 136, 264, 520],
+        distribution=[8, 11, 11],
+    ),
+    dict(
+        testcase_name="padded_mixed_prefill",
+        max_reqs=16,
+        lengths=[128, 64, 32, 16, 8],
+        q_loc=[0, 128, 192, 224, 240, 248] + [1] * 11,
+        distribution=[0, 5, 5],
+    ),
+    dict(
+        testcase_name="padded_decode_only",
+        max_reqs=512,
+        lengths=[1] * 64,
+        q_loc=list(range(65)) + [1] * 448,
+        distribution=[64, 64, 64],
+    ),
+    dict(
+        testcase_name="prefill_fused",
+        max_reqs=1,
+        lengths=[8192],
+        q_loc=[0, 8192],
+        distribution=[0, 0, 3],
+    ),
+    dict(
+        testcase_name="mixed_fused",
+        max_reqs=3,
+        lengths=[256, 128, 128],
+        q_loc=[0, 256, 384, 512],
+        distribution=[0, 3, 3],
+    ),
+)
+
+
+def skip_if_unsupported(test_case: absltest.TestCase) -> None:
+  """Skips `test_case` unless running on a TPU v6 or newer."""
+  if jax.default_backend() != "tpu":
+    test_case.skipTest("Only supported on TPUs.")
+  try:
+    if not pltpu.get_tpu_info().generation >= 6:
+      test_case.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
+  except Exception:  # pylint: disable=broad-except
+    test_case.skipTest("Failed to get TPU info.")
+
+
+# pylint: disable=missing-function-docstring
+class CausalConv1dGatedDeltaRuleTestBase(parameterized.TestCase):
+  """Base class for Causal Conv1D Gated Delta Rule correctness tests."""
+
+  def __init__(self, *args, gdn_fn, static_argnames=STATIC_ARGNAMES):
+    super().__init__(*args)
+    self._gdn_fn = gdn_fn
+    self._static_argnames = list(static_argnames)
+
+  def setUp(self):
+    super().setUp()
+    skip_if_unsupported(self)
+    self._gdn_jitted = jax.jit(
+        self._gdn_fn, static_argnames=self._static_argnames
+    )
+
+  @parameterized.named_parameters(*_LOCAL_ATTENTION_CASES)
+  def test_run_jax_gdn_attention_local(
+      self, max_reqs, lengths, q_loc, distribution
+  ):
+    kq_head_dim = 128
+    v_head_dim = 128
+    n_kq = 2
+    n_v = 8
+    kernel_size = 4
+
+    num_tokens = sum(lengths)
+
+    q_loc = jnp.array(q_loc)
+    distribution = jnp.array(distribution, dtype=jnp.int32)
+
+    # recurrent_state[0] and conv_state[0] are reserved for null blocks
+    # (invalid / padded tokens). so start with index 1
+    state_indices = jnp.arange(1, max_reqs + 1)
+    num_blocks = max_reqs + 1
+
+    rngs = iter(jax.random.split(jax.random.key(0), 12))
+
+    query = jax.random.normal(next(rngs), (num_tokens, n_kq * kq_head_dim))
+    key = jax.random.normal(next(rngs), (num_tokens, n_kq * kq_head_dim))
+    value = jax.random.normal(next(rngs), (num_tokens, n_v * v_head_dim))
+    b = jax.random.normal(next(rngs), (num_tokens, n_v))
+    a = jax.random.normal(next(rngs), (num_tokens, n_v))
+
+    conv_state_q = jnp.zeros((num_blocks, kernel_size - 1, n_kq * kq_head_dim))
+    conv_state_k = jnp.zeros((num_blocks, kernel_size - 1, n_kq * kq_head_dim))
+    conv_state_v = jnp.zeros((num_blocks, kernel_size - 1, n_v * v_head_dim))
+    recurrent_state = jnp.zeros((num_blocks, n_v, kq_head_dim, v_head_dim))
+
+    conv_weight_q = jax.random.normal(
+        next(rngs), (n_kq * kq_head_dim, 1, kernel_size)
+    )
+    conv_weight_k = jax.random.normal(
+        next(rngs), (n_kq * kq_head_dim, 1, kernel_size)
+    )
+    conv_weight_v = jax.random.normal(
+        next(rngs), (n_v * v_head_dim, 1, kernel_size)
+    )
+
+    conv_bias_q = jax.random.normal(next(rngs), (n_kq * kq_head_dim,))
+    conv_bias_k = jax.random.normal(next(rngs), (n_kq * kq_head_dim,))
+    conv_bias_v = jax.random.normal(next(rngs), (n_v * v_head_dim,))
+
+    a_log = jax.random.normal(next(rngs), (n_v,))
+    dt_bias = jax.random.normal(jax.random.key(0), (n_v,))
+
+    mixed_qkv = jnp.concatenate([query, key, value], axis=-1)
+    conv_state = jnp.concatenate(
+        [conv_state_q, conv_state_k, conv_state_v], axis=-1
+    )
+    conv_weight = jnp.concatenate(
+        [conv_weight_q, conv_weight_k, conv_weight_v], axis=0
+    )
+    conv_bias = jnp.concatenate(
+        [conv_bias_q, conv_bias_k, conv_bias_v], axis=-1
+    )
+
+    run_ref_jitted = jax.jit(
+        base.CausalConv1dGatedDeltaRule(),
+        static_argnames=list(OP_STATIC_ARGNAMES),
+    )
+
+    # All sequences in this test start from a fresh slot; the existing
+    # parametrizations don't exercise prefix-cache-hit / chunked-prefill
+    # continuation. ``seq_lens == query_lens`` (context_len = 0)
+    # reproduces the prior behavior (zero initial state regardless of
+    # slot contents).
+    seq_lens = jnp.asarray(
+        q_loc[1 : max_reqs + 1] - q_loc[:max_reqs], dtype=jnp.int32
+    )
+
+    common_kwargs = dict(
+        qkv=mixed_qkv,
+        b=b,
+        a=a,
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=q_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        seq_lens=seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=kq_head_dim,
+        d_v=v_head_dim,
+        kernel_size=kernel_size,
+    )
+
+    # Run ref via base op
+    new_states_ref, output_ref = run_ref_jitted(**common_kwargs)
+
+    # Run chunked
+    new_states_chunked, output_chunked = self._gdn_jitted(**common_kwargs)
+
+    # Compare results
+    np.testing.assert_allclose(output_chunked, output_ref, rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(
+        new_states_chunked[0], new_states_ref[0], rtol=2e-2, atol=2e-2
+    )
+    np.testing.assert_allclose(
+        new_states_chunked[1], new_states_ref[1], rtol=2e-2, atol=2e-2
+    )
+
+  def test_has_initial_state_zeros_stale_slot(self):
+    """A new prefill must ignore whatever state its slot already held.
+
+    A prefill landing on a slot whose previous tenant left non-zero state must
+    produce the same output and final state as it would on a fresh-zero slot.
+    """
+    kq_head_dim = 128
+    v_head_dim = 128
+    n_kq = 2
+    n_v = 8
+    kernel_size = 4
+
+    # Two requests, one prefill of 64 tokens each.
+    max_reqs = 2
+    lengths = [64, 64]
+    q_loc = jnp.array([0, 64, 128])
+    distribution = jnp.array([0, 2, 2], dtype=jnp.int32)
+    num_tokens = sum(lengths)
+
+    state_indices = jnp.arange(1, max_reqs + 1)
+    num_blocks = max_reqs + 1
+
+    rngs = iter(jax.random.split(jax.random.key(7), 12))
+    query = jax.random.normal(next(rngs), (num_tokens, n_kq * kq_head_dim))
+    key = jax.random.normal(next(rngs), (num_tokens, n_kq * kq_head_dim))
+    value = jax.random.normal(next(rngs), (num_tokens, n_v * v_head_dim))
+    b = jax.random.normal(next(rngs), (num_tokens, n_v))
+    a = jax.random.normal(next(rngs), (num_tokens, n_v))
+
+    conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+    conv_state_fresh = jnp.zeros((num_blocks, kernel_size - 1, conv_dim))
+    recurrent_state_fresh = jnp.zeros(
+        (num_blocks, n_v, kq_head_dim, v_head_dim)
+    )
+
+    # Build a "stale" pair where the slots that the two new requests
+    # land on are filled with arbitrary nonzero values.
+    stale_conv = jax.random.normal(
+        next(rngs), (num_blocks, kernel_size - 1, conv_dim)
+    )
+    stale_recurrent = jax.random.normal(
+        next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim)
+    )
+    # Slot 0 is the null block; leave it zero.
+    conv_state_stale = conv_state_fresh.at[1:].set(stale_conv[1:])
+    recurrent_state_stale = recurrent_state_fresh.at[1:].set(
+        stale_recurrent[1:]
+    )
+
+    conv_weight = jax.random.normal(next(rngs), (conv_dim, 1, kernel_size))
+    conv_bias = jax.random.normal(next(rngs), (conv_dim,))
+    a_log = jax.random.normal(next(rngs), (n_v,))
+    dt_bias = jax.random.normal(next(rngs), (n_v,))
+
+    mixed_qkv = jnp.concatenate([query, key, value], axis=-1)
+
+    # Both requests are brand new — no prior context. seq_lens equals
+    # query_lens so context_len = 0 → has_initial_state = False.
+    seq_lens_new = jnp.asarray(lengths, dtype=jnp.int32)
+
+    common_kwargs = dict(
+        qkv=mixed_qkv,
+        b=b,
+        a=a,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=q_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        seq_lens=seq_lens_new,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=kq_head_dim,
+        d_v=v_head_dim,
+        kernel_size=kernel_size,
+    )
+
+    # Reference run: fresh-zero slots.
+    (new_conv_fresh, new_rec_fresh), output_fresh = self._gdn_jitted(
+        conv_state=conv_state_fresh,
+        recurrent_state=recurrent_state_fresh,
+        **common_kwargs,
+    )
+    # Stale-slot run: same inputs, but the slots already contain a
+    # prior request's state. With the fix, has_initial_state=False
+    # masks that out — outputs and the writeback at the active slots
+    # must match the fresh-zero run.
+    (new_conv_stale, new_rec_stale), output_stale = self._gdn_jitted(
+        conv_state=conv_state_stale,
+        recurrent_state=recurrent_state_stale,
+        **common_kwargs,
+    )
+
+    np.testing.assert_allclose(output_fresh, output_stale, rtol=1e-5, atol=1e-5)
+    # Compare the active slots (1..max_reqs+1); slot 0 (null) is
+    # untouched in both runs and inactive slots are unused.
+    np.testing.assert_allclose(
+        new_conv_fresh[1 : max_reqs + 1],
+        new_conv_stale[1 : max_reqs + 1],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        new_rec_fresh[1 : max_reqs + 1],
+        new_rec_stale[1 : max_reqs + 1],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+  def test_has_initial_state_preserves_continuation(self):
+    """A continuation prefill must resume from the slot's existing state.
+
+    When ``has_initial_state[i]`` is True, the kernel must use the slot's
+    existing state as the prefill's initial state.
+    """
+    kq_head_dim = 128
+    v_head_dim = 128
+    n_kq = 2
+    n_v = 8
+    kernel_size = 4
+
+    # One request, prefill split into two halves of 32 tokens each.
+    half = 32
+    full = 64
+    state_indices = jnp.array([1])
+    num_blocks = 2
+
+    rngs = iter(jax.random.split(jax.random.key(11), 12))
+    query = jax.random.normal(next(rngs), (full, n_kq * kq_head_dim))
+    key = jax.random.normal(next(rngs), (full, n_kq * kq_head_dim))
+    value = jax.random.normal(next(rngs), (full, n_v * v_head_dim))
+    b = jax.random.normal(next(rngs), (full, n_v))
+    a = jax.random.normal(next(rngs), (full, n_v))
+
+    conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+    conv_weight = jax.random.normal(next(rngs), (conv_dim, 1, kernel_size))
+    conv_bias = jax.random.normal(next(rngs), (conv_dim,))
+    a_log = jax.random.normal(next(rngs), (n_v,))
+    dt_bias = jax.random.normal(next(rngs), (n_v,))
+
+    mixed_qkv_full = jnp.concatenate([query, key, value], axis=-1)
+    mixed_qkv_a = mixed_qkv_full[:half]
+    mixed_qkv_b = mixed_qkv_full[half:]
+
+    conv_state_zero = jnp.zeros((num_blocks, kernel_size - 1, conv_dim))
+    recurrent_state_zero = jnp.zeros((num_blocks, n_v, kq_head_dim, v_head_dim))
+
+    common_static = dict(
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        state_indices=state_indices,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=kq_head_dim,
+        d_v=v_head_dim,
+        kernel_size=kernel_size,
+    )
+
+    # Single-shot reference (all 64 tokens, zero state, has_initial=False
+    # encoded as seq_lens == query_lens == [full]).
+    (_, _), output_ref = self._gdn_jitted(
+        qkv=mixed_qkv_full,
+        b=b,
+        a=a,
+        conv_state=conv_state_zero,
+        recurrent_state=recurrent_state_zero,
+        query_start_loc=jnp.array([0, full]),
+        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+        seq_lens=jnp.array([full], dtype=jnp.int32),
+        **common_static,
+    )
+
+    # Step A: first 32 tokens, zero state, has_initial=False.
+    (conv_after_a, rec_after_a), output_a = self._gdn_jitted(
+        qkv=mixed_qkv_a,
+        b=b[:half],
+        a=a[:half],
+        conv_state=conv_state_zero,
+        recurrent_state=recurrent_state_zero,
+        query_start_loc=jnp.array([0, half]),
+        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+        seq_lens=jnp.array([half], dtype=jnp.int32),
+        **common_static,
+    )
+
+    # Step B: next 32 tokens, slot now holds Step A's state.
+    # seq_lens=[full] with query_lens=[half] gives context_len=half>0,
+    # i.e., has_initial=True so the kernel continues from that state.
+    (_, _), output_b = self._gdn_fn(
+        qkv=mixed_qkv_b,
+        b=b[half:],
+        a=a[half:],
+        conv_state=conv_after_a,
+        recurrent_state=rec_after_a,
+        query_start_loc=jnp.array([0, half]),
+        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+        seq_lens=jnp.array([full], dtype=jnp.int32),
+        **common_static,
+    )
+
+    # Step A's output must match the first half of the single-shot
+    # reference; Step B (continuation) must match the second half.
+    np.testing.assert_allclose(
+        output_a, output_ref[:half], rtol=2e-2, atol=2e-2
+    )
+    np.testing.assert_allclose(
+        output_b, output_ref[half:], rtol=2e-2, atol=2e-2
+    )
+
+
+class CausalConv1dGatedDeltaRuleSecurityTestBase(absltest.TestCase):
+  """Base class for Causal Conv1D Gated Delta Rule isolation tests."""
+
+  def __init__(self, *args, gdn_fn):
+    super().__init__(*args)
+    self._gdn_fn = gdn_fn
+
+  def setUp(self):
+    super().setUp()
+    skip_if_unsupported(self)
+
+  def test_uninitialized_memory_robustness(self):
+    mosaic_tpu.poison_tpu_memory()
+    seq_lens = jnp.array([128], dtype=jnp.int32)
+    mixed_qkv = jnp.zeros((128, 1536), dtype=jnp.float32)
+    new_states, output = self._gdn_fn(
+        qkv=mixed_qkv,
+        seq_lens=seq_lens,
+        b=jnp.zeros((128, 8), dtype=jnp.float32),
+        a=jnp.zeros((128, 8), dtype=jnp.float32),
+        conv_state=jnp.zeros((2, 3, 1536), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((2, 8, 128, 128), dtype=jnp.float32),
+        conv_weight=jnp.zeros((1536, 1, 4), dtype=jnp.float32),
+        conv_bias=jnp.zeros((1536,), dtype=jnp.float32),
+        a_log=jnp.zeros((8,), dtype=jnp.float32),
+        dt_bias=jnp.zeros((8,), dtype=jnp.float32),
+        query_start_loc=jnp.array([0, 128]),
+        state_indices=jnp.array([1]),
+        distribution=jnp.array([0, 3, 3], dtype=jnp.int32),
+        n_kq=2,
+        n_v=8,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+    )
+    for new_state in new_states:
+      self.assertFalse(jnp.any(jnp.isnan(new_state)))
+    self.assertFalse(jnp.any(jnp.isnan(output)))
+
+  def test_security_isolation(self):
+    # Configure two request sequences sharing the same local layer runner
+    seq_lens = jnp.array([128, 128], dtype=jnp.int32)
+    mixed_qkv = jnp.zeros((256, 1536), dtype=jnp.float32)
+
+    # Baseline clean context evaluation
+    _, output_clean = self._gdn_fn(
+        qkv=mixed_qkv,
+        seq_lens=seq_lens,
+        b=jnp.zeros((256, 8), dtype=jnp.float32),
+        a=jnp.zeros((256, 8), dtype=jnp.float32),
+        conv_state=jnp.zeros((3, 3, 1536), dtype=jnp.float32),
+        recurrent_state=jnp.zeros((3, 8, 128, 128), dtype=jnp.float32),
+        conv_weight=jnp.zeros((1536, 1, 4), dtype=jnp.float32),
+        conv_bias=jnp.zeros((1536,), dtype=jnp.float32),
+        a_log=jnp.zeros((8,), dtype=jnp.float32),
+        dt_bias=jnp.zeros((8,), dtype=jnp.float32),
+        query_start_loc=jnp.array([0, 128, 256]),
+        state_indices=jnp.array([1, 2]),
+        distribution=jnp.array([0, 3, 3], dtype=jnp.int32),
+        n_kq=2,
+        n_v=8,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+    )
+
+    # Inject NaNs into the second request's allocated recurrent state buffer
+    recurrent_state_malicious = (
+        jnp.zeros((3, 8, 128, 128), dtype=jnp.float32).at[2].set(jnp.nan)
+    )
+    _, output_malicious = self._gdn_fn(
+        qkv=mixed_qkv,
+        seq_lens=seq_lens,
+        b=jnp.zeros((256, 8), dtype=jnp.float32),
+        a=jnp.zeros((256, 8), dtype=jnp.float32),
+        conv_state=jnp.zeros((3, 3, 1536), dtype=jnp.float32),
+        recurrent_state=recurrent_state_malicious,
+        conv_weight=jnp.zeros((1536, 1, 4), dtype=jnp.float32),
+        conv_bias=jnp.zeros((1536,), dtype=jnp.float32),
+        a_log=jnp.zeros((8,), dtype=jnp.float32),
+        dt_bias=jnp.zeros((8,), dtype=jnp.float32),
+        query_start_loc=jnp.array([0, 128, 256]),
+        state_indices=jnp.array([1, 2]),
+        distribution=jnp.array([0, 3, 3], dtype=jnp.int32),
+        n_kq=2,
+        n_v=8,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+    )
+
+    # Assert strict sequence isolation for the first sequence
+    np.testing.assert_allclose(
+        np.array(output_malicious[:128]),
+        np.array(output_clean[:128]),
+        atol=0,
+        rtol=0,
+    )
