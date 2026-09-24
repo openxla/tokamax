@@ -47,9 +47,7 @@ def _make_argspec(
           "start": numerics.RangedArrayInitializer(
               (1,), jnp.int32, start, start + 1
           ),
-          "end": numerics.RangedArrayInitializer(
-              (1,), jnp.int32, end, end + 1
-          ),
+          "end": numerics.RangedArrayInitializer((1,), jnp.int32, end, end + 1),
       },
       project=project,
       name=name,
@@ -75,5 +73,32 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         hidden_size=512,
         start=10,
         end=422,
+    ),
+    _make_argspec(
+        name="512x1024_8192_bf16",
+        project="inference",
+        in_size=512,
+        out_size=1024,
+        hidden_size=8192,
+        start=0,
+        end=1024,
+    ),
+    _make_argspec(
+        name="1024x2048_8192_bf16",
+        project="inference",
+        in_size=1024,
+        out_size=2048,
+        hidden_size=8192,
+        start=0,
+        end=2048,
+    ),
+    _make_argspec(
+        name="2048x4096_8192_bf16",
+        project="inference",
+        in_size=2048,
+        out_size=4096,
+        hidden_size=8192,
+        start=0,
+        end=4096,
     ),
 )
