@@ -33,3 +33,5 @@ toc:
   section:
   - title: Splash Attention
     path: /tokamax/splash_attention
+  - title: Multi-Head Latent Attention (MLA)
+    path: /tokamax/mla
