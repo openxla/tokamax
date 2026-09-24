@@ -19,6 +19,7 @@ from absl.testing import parameterized
 import hypothesis as hp
 import hypothesis.strategies as hps
 import jax
+from jax.experimental.pallas import tpu as pltpu
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
@@ -44,8 +45,11 @@ class MlaKernelTest(parameterized.TestCase):
 
   @hp.given(hps.data())
   def test_mla_output_shapes(self, data):
-    if backend.get_default_device().device_kind != "TPU7x":
-      self.skipTest("Only tested on TPU7x.")
+    if (
+        backend.get_default_device().platform != "tpu"
+        or pltpu.get_tpu_info().generation < 7
+    ):
+      self.skipTest("Only tested on TPU version >= 7.")
 
     page_size = 16
     num_heads = data.draw(hps.sampled_from([4, 8]))
@@ -123,8 +127,11 @@ class MlaKernelTest(parameterized.TestCase):
 
   @hp.given(hps.data())
   def test_mla_correctness(self, data):
-    if backend.get_default_device().device_kind != "TPU7x":
-      self.skipTest("Only tested on TPU7x.")
+    if (
+        backend.get_default_device().platform != "tpu"
+        or pltpu.get_tpu_info().generation < 7
+    ):
+      self.skipTest("Only tested on TPU version >= 7.")
 
     page_size = data.draw(hps.sampled_from([16, 256, 1024]))
     num_heads = data.draw(hps.sampled_from([4, 8, 64, 128, 256]))

@@ -15,6 +15,7 @@
 from abc import ABC, abstractmethod
 import dataclasses
 import functools
+import math
 from typing import Any, Callable, Tuple
 
 import jax
@@ -554,6 +555,11 @@ def inner_kernel(
 
     valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
     if is_last_k_step and valid_k != 0:
+      # `lhs` needs to be masked over k-axis iff `lhs` contains `jnp.nan`s
+      # Otherwise, only masking `rhs` to zeros is sufficient.
+      mask_lhs = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1) < valid_k
+      tiled_lhs = jnp.where(mask_lhs, tiled_lhs, 0)
+
       mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
       tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
@@ -615,6 +621,11 @@ def inner_kernel(
       # result of [tile_m, mxu_size] becomes available at the end of every k
       # inner loop which can be used to pipeline subsequent VPU or VST ops with
       # MXU ops for the next [tile_m, mxu_size].
+      step_k = (
+          math.gcd(q_block_size, rhs_qbs)  # pyrefly: ignore[bad-argument-type]
+          if cfgs.rhs_cfgs.should_dequantize_after_matmul
+          else q_block_size
+      )
       for start_n in range(0, rhs_tile_n, mxu_size):
         end_n = min(rhs_tile_n, start_n + mxu_size)
         col_size = end_n - start_n
@@ -653,27 +664,35 @@ def inner_kernel(
           if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
             block_rhs = block_rhs.astype(lhs_q_dtype)
 
-          block_acc = jnp.matmul(
-              block_lhs_q,
-              block_rhs,
-              preferred_element_type=preferred_element_type,
-          ).astype(acc_ref.dtype)
+          block_len = end_k - start_k
+          # Initialize to None rather than jnp.zeros to avoid emitting an extra
+          # VPU add instruction on the first sub-block in Pallas/Mosaic lowering.
+          block_acc = None
+          for sub_k in range(0, block_len, step_k):  # pyrefly: ignore[bad-argument-type]
+            sub_end_k = min(block_len, sub_k + step_k)  # pyrefly: ignore[unsupported-operation]
+            sub_acc = jnp.matmul(
+                block_lhs_q[:, sub_k:sub_end_k],
+                block_rhs[sub_k:sub_end_k, :],
+                preferred_element_type=preferred_element_type,
+            ).astype(acc_ref.dtype)
 
+            # Apply rhs subchannel scale per quant block.
+            if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+              if cfgs.transpose_rhs:
+                raise NotImplementedError(
+                    "should_dequantize_after_matmul is not supported with"
+                    " transpose_rhs."
+                )
+              b_id = (start_k + sub_k) // rhs_qbs  # pyrefly: ignore[unsupported-operation]
+              rhs_scale_replicated = tiled_rhs_ref.get_scale(
+                  replicate_size=bucket_m
+              )[b_id, :, start_n : start_n + col_size]
+              sub_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+
+            block_acc = sub_acc if block_acc is None else block_acc + sub_acc
+
+          assert block_acc is not None
           block_acc *= block_scale.astype(acc_ref.dtype)
-
-          # Apply rhs subchannel scale per quant block.
-          if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-            if cfgs.transpose_rhs:
-              raise NotImplementedError(
-                  "should_dequantize_after_matmul is not supported with"
-                  " transpose_rhs."
-              )
-            b_id = start_k // rhs_qbs  # pyrefly: ignore[unsupported-operation]
-            rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                replicate_size=bucket_m
-            )[b_id, :, start_n : start_n + col_size]
-            block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
-
           acc_n += block_acc
         acc_list.append(acc_n)
 

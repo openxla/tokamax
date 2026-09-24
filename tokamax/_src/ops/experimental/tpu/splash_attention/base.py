@@ -16,7 +16,7 @@
 """Base operator for Splash Attention."""
 
 import dataclasses
-from typing import Any, Final, TypeVar, override
+from typing import Any, Final, NotRequired, TypeAlias, TypeVar, TypedDict, override
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
@@ -34,6 +34,11 @@ SplashCustomReturnType = reference.SplashCustomReturnType
 SplashResidualsType = reference.SplashResidualsType
 attention_reference = reference.attention_reference
 attention_reference_vjp = reference.attention_reference_vjp
+
+Residuals: TypeAlias = tuple[
+    Float[Array, "num_q_heads q_seq_len"],
+    Float[Array, "num_q_heads q_seq_len"],
+]
 
 
 @jax.tree_util.register_dataclass
@@ -74,9 +79,36 @@ CAUSAL_MASK: Final[Mask] = Mask(is_causal=True)
 FULL_MASK: Final[Mask] = Mask()
 
 
+def _canonicalize_mask(
+    mask: Bool[Array, "q_seq_len kv_seq_len"] | Mask | mask_lib.Mask | None,
+) -> Mask:
+  """Canonicalizes a mask argument."""
+  if mask is None:
+    return Mask()
+  if isinstance(mask, (jax.Array, np.ndarray)):
+    return Mask(bool_mask=mask)
+  if isinstance(mask, mask_lib.CausalMask):
+    return Mask(is_causal=True)
+  if isinstance(mask, mask_lib.FullMask):
+    return Mask()
+  if isinstance(mask, mask_lib.Mask):
+    return Mask(bool_mask=jnp.asarray(mask[:, :]))
+  if isinstance(mask, Mask):
+    return mask
+  raise TypeError(f"Unsupported mask type: {type(mask)}")
+
+
 @dataclasses.dataclass(frozen=True)
-class SplashAttention[_Config](op.Op[Any, jax.Array, None, _Config, Any]):
+class SplashAttention[_Config](op.Op[Any, jax.Array, Residuals, _Config, Any]):
   """Tokamax operator template for Splash Attention."""
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(
+          self,
+          "vjp",
+          SplashAttentionVjp(),
+      )
 
   def bind(
       self,
@@ -97,11 +129,6 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, None, _Config, Any]):
   ) -> op.BoundArguments:
     """Binds and validates arguments for Splash Attention."""
 
-    if return_residuals:
-      raise NotImplementedError(
-          "return_residuals=True is not yet supported for Splash Attention."
-      )
-
     if not (0.0 <= dropout_rate < 1.0):
       raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
 
@@ -112,23 +139,12 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, None, _Config, Any]):
             f" ({k.shape[0]})."
         )
 
-    if mask is None:
-      mask = Mask()
-    elif isinstance(mask, (jax.Array, np.ndarray)):
-      mask = Mask(bool_mask=mask)
-    elif isinstance(mask, mask_lib.CausalMask):
-      mask = Mask(is_causal=True)
-    elif isinstance(mask, mask_lib.FullMask):
-      mask = Mask()
-    elif isinstance(mask, mask_lib.Mask):
-      mask = Mask(bool_mask=jnp.asarray(mask[:, :]))
-    elif not isinstance(mask, Mask):
-      raise TypeError(f"Unsupported mask type: {type(mask)}")
+    mask = _canonicalize_mask(mask)
 
     return super().bind(
-        q=q,
-        k=k,
-        v=v,
+        q,
+        k,
+        v,
         mask=mask,
         segment_ids=segment_ids,
         sinks=sinks,
@@ -146,18 +162,18 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, None, _Config, Any]):
       q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
       k: Float[Array, "..."],
       v: Float[Array, "..."],
+      *,
       mask: Mask,
       segment_ids: SegmentIds | None = None,
       sinks: Float[Array, "..."] | None = None,
-      *,
       is_mqa: bool = False,
       mask_value: float = DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
       return_residuals: bool = False,
       config: _Config,
-  ) -> tuple[jax.Array, None]:
-    del config, return_residuals
+  ) -> tuple[jax.Array, Residuals | None]:
+    del config
 
     q_seq_len = q.shape[1]
     kv_seq_len = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
@@ -180,8 +196,138 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, None, _Config, Any]):
         dropout_mask=None,
         is_mqa=is_mqa,
         mask_value=mask_value,
-        save_residuals=False,
+        save_residuals=return_residuals,
         attn_logits_soft_cap=attn_logits_soft_cap,
         dropout_rate=dropout_rate,
     )
-    return out, None
+    if return_residuals:
+      out, stats = out
+      residuals = (stats["max_logits"], stats["logsumexp"])
+    else:
+      residuals = None
+    return out.astype(q.dtype), residuals
+
+
+class SplashAttentionGrads(TypedDict):
+  q: Float[Array, "num_q_heads q_seq_len head_dim_qk"]
+  k: Float[Array, "..."]
+  v: Float[Array, "..."]
+  sinks: NotRequired[Float[Array, "..."] | None]
+
+
+class SplashAttentionVjp[_Config](
+    op.Op[Any, SplashAttentionGrads, None, _Config, Any]
+):
+  """Splash attention VJP."""
+
+  def bind(
+      self,
+      residuals: Residuals,
+      out: Float[Array, "num_q_heads q_seq_len head_dim_v"],
+      dout: Float[Array, "num_q_heads q_seq_len head_dim_v"],
+      q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
+      k: Float[Array, "..."],
+      v: Float[Array, "..."],
+      mask: (
+          Bool[Array, "q_seq_len kv_seq_len"] | Mask | mask_lib.Mask | None
+      ) = None,
+      segment_ids: SegmentIds | None = None,
+      sinks: Float[Array, "..."] | None = None,
+      *,
+      is_mqa: bool = False,
+      mask_value: float = DEFAULT_MASK_VALUE,
+      attn_logits_soft_cap: float | None = None,
+      dropout_rate: float = 0.0,
+      return_residuals: bool = False,
+  ) -> op.BoundArguments:
+    """Binds and validates arguments for Splash Attention VJP."""
+    if not (0.0 <= dropout_rate < 1.0):
+      raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
+
+    if not is_mqa and k.ndim == 3 and q.ndim == 3:
+      if q.shape[0] % k.shape[0] != 0:
+        raise ValueError(
+            f"num_q_heads ({q.shape[0]}) must be divisible by num_kv_heads"
+            f" ({k.shape[0]})."
+        )
+
+    mask = _canonicalize_mask(mask)
+
+    return super().bind(
+        residuals,
+        out,
+        dout,
+        q,
+        k,
+        v,
+        mask=mask,
+        segment_ids=segment_ids,
+        sinks=sinks,
+        is_mqa=is_mqa,
+        mask_value=mask_value,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
+        return_residuals=return_residuals,
+    )
+
+  @jaxtyping.jaxtyped
+  @override
+  def _fwd(
+      self,
+      residuals: Residuals,
+      out: Float[Array, "num_q_heads q_seq_len head_dim_v"],
+      dout: Float[Array, "num_q_heads q_seq_len head_dim_v"],
+      q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
+      k: Float[Array, "..."],
+      v: Float[Array, "..."],
+      *,
+      mask: Mask,
+      segment_ids: SegmentIds | None = None,
+      sinks: Float[Array, "..."] | None = None,
+      is_mqa: bool = False,
+      mask_value: float = DEFAULT_MASK_VALUE,
+      attn_logits_soft_cap: float | None = None,
+      dropout_rate: float = 0.0,
+      return_residuals: bool = False,
+      config: _Config,
+  ) -> tuple[SplashAttentionGrads, None]:
+    """Computes attention VJP."""
+    del config
+
+    if return_residuals:
+      raise NotImplementedError("`return_residuals` not supported.")
+
+    _, lse = residuals
+
+    seq_len_q = q.shape[1]
+    seq_len_kv = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
+    mask_array = mask.as_array(seq_len_q, seq_len_kv)
+
+    if is_mqa and k.ndim == 3:
+      k_in = k[0]
+      v_in = v[0]
+    else:
+      k_in = k
+      v_in = v
+
+    dq, dk, dv, dsinks = reference.attention_reference_vjp(
+        do=dout,
+        q=q,
+        k=k_in,
+        v=v_in,
+        mask=mask_array,
+        segment_ids=segment_ids,
+        sinks=sinks,
+        o=out,
+        logsumexp=lse,
+        is_mqa=is_mqa,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
+    )
+
+    if is_mqa and k.ndim == 3:
+      dk = dk.reshape(k.shape)
+      dv = dv.reshape(v.shape)
+
+    grads = SplashAttentionGrads(q=dq, k=dk, v=dv, sinks=dsinks)
+    return grads, None

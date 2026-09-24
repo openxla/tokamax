@@ -679,7 +679,6 @@ def flash_attention_kernel(
         config.qk_diag_skip
         and has_partial_mask
         and num_stacked_q_heads == 1
-        and config.k_layout == HEAD_DIM_MINOR
         and bq % _g == 0
         and bkv_compute % _g == 0
     ):
@@ -689,7 +688,13 @@ def flash_attention_kernel(
       sq = bq // _g
       sk = bkv_compute // _g
       q_parts = [q_flat[i * sq:(i + 1) * sq, :] for i in range(_g)]
-      k_parts = [k[j * sk:(j + 1) * sk, :] for j in range(_g)]
+      # `k` is kept in its configured layout above (it is always the RHS of the
+      # qk matmul), so the kv sequence axis is the major one under
+      # HEAD_DIM_MINOR and the minor one under SEQ_MINOR.
+      if config.k_layout == HEAD_DIM_MINOR:
+        k_parts = [k[j * sk:(j + 1) * sk, :] for j in range(_g)]
+      else:
+        k_parts = [k[:, j * sk:(j + 1) * sk] for j in range(_g)]
       rows = []
       for qi in range(_g):  # q row-band
         cols = []
@@ -1732,7 +1737,13 @@ def _flash_attention_dkv_kernel(
       sk = bkv_compute // _g
       sq = bq // _g
       k_parts = [k[i * sk:(i + 1) * sk, :] for i in range(_g)]
-      q_parts = [scaled_q[j * sq:(j + 1) * sq, :] for j in range(_g)]
+      # `scaled_q` is kept in its original layout here (it is always the RHS of
+      # the qk matmul), so the q sequence axis is the minor one under
+      # SEQ_MINOR and the major one under HEAD_DIM_MINOR.
+      if config.q_layout == HEAD_DIM_MINOR:
+        q_parts = [scaled_q[j * sq:(j + 1) * sq, :] for j in range(_g)]
+      else:
+        q_parts = [scaled_q[:, j * sq:(j + 1) * sq] for j in range(_g)]
       _mm = lambda kk, qq: lax.dot_general(
           kk, qq, qk_dims, preferred_element_type=jnp.float32
       )

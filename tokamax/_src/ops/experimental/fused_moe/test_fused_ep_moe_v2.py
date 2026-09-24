@@ -70,6 +70,8 @@ def _require_eight_devices():
                     "devices")
 
 
+# The expert-parallel width, and the tile height the serving adapter passes
+# the kernel as its capacity (moe_fused_ep._TILE_M upstream).
 EP = 8
 CAPACITY = 128
 
@@ -495,8 +497,62 @@ def test_any_mesh_axis_name_works():
                                  token_bound=FP8_TOKEN_BOUND)
 
 
+def test_fp4_block512_tracks_dense_reference_and_routing_plan():
+    """FP4 block scales and FP8 transport, including a single-block W2."""
+    mesh = _mesh()
+    shard = NamedSharding(mesh, P(AXIS))
+    rng = np.random.default_rng(42)
+    weights, scales, decoded = [], [], []
+    for shape in ((32, 1024, 1024), (32, 512, 1024)):
+        raw = rng.normal(0, 0.1, shape).astype(np.float32)
+        grouped = raw.reshape(shape[0], shape[1] // 512, 512, shape[2])
+        scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
+        normalized = (grouped / scale[:, :, None, :]).reshape(shape)
+        w = jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn)
+        s = jax.device_put(scale, shard)
+        dequant = (w.astype(jnp.float32).reshape(grouped.shape) *
+                   s[:, :, None, :]).reshape(shape)
+        weights.append(w)
+        scales.append(s)
+        decoded.append(dequant)
+    x, gating = _make_inputs(mesh, 43, tokens=256, hidden=1024, e_total=32)
+    common = dict(topk=4,
+                  renormalize=True,
+                  mesh=mesh,
+                  capacity=CAPACITY,
+                  weight_format=WeightFormat.FP4,
+                  rhs_qb=512)
+    out = fused_ep_moe_v2(x,
+                          *weights,
+                          *scales,
+                          gating,  # pyrefly: ignore[bad-argument-count]
+                          sharded_plan=True,
+                          **common)
+    replicated = fused_ep_moe_v2(x,
+                                 *weights,
+                                 *scales,
+                                 gating,  # pyrefly: ignore[bad-argument-count]
+                                 sharded_plan=False,
+                                 **common)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(replicated))
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=4)  # pyrefly: ignore[bad-argument-count]
+    error = _relative_l2(out, ref)
+    worst = _worst_token_relative_l2(out, ref)
+    print(f"FP4 block512 relative_l2={error} worst_token={worst}")
+    assert error < FP8_RELATIVE_BOUND
+    assert worst < FP8_TOKEN_BOUND
+    wrong = _dense_reference(mesh,
+                             x,
+                             jnp.roll(decoded[0], 1, axis=0),
+                             jnp.roll(decoded[1], 1, axis=0),
+                             None,
+                             None,
+                             gating,
+                             topk=4)
+    assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
+
+
 if __name__ == "__main__":
     import sys
     from absl import app
     app.run(lambda argv: sys.exit(pytest.main([__file__] + argv[1:])))
-

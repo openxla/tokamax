@@ -892,6 +892,50 @@ class GmmTest(parameterized.TestCase):
     # 3. Verify that the output is NaN-free
     self.assertFalse(jnp.any(jnp.isnan(actual)))
 
+  @parameterized.parameters(64, 129, 160)
+  def test_gmm_unaligned_k_to_tpu_num_lanes_with_nans(self, k: int):
+    """The last k tile requires proper masking when `% num_lanes !=0` especially with NaNs."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    self.assertNotEqual(k % num_lanes, 0)
+
+    batch_size = 128
+    out_size = 512
+    num_groups = 4
+    key = jax.random.key(10)
+    k0, k1, k2 = jax.random.split(key, 3)
+
+    # Mark half of the tokens as paddings to stress-test GMM
+    is_padding = jax.random.bernoulli(k2, p=0.5, shape=(batch_size, 1))
+
+    aligned_k = pl.cdiv(k, num_lanes) * num_lanes
+    # On the k-dimension, we allocate `num_lanes`-aligned array so that we can
+    # fill `[k:aligned_k]` as `jnp.nan`s and TPU will load those `[k:aligned_k]`
+    # nans into VMEM.
+    lhs_padded = jax.random.normal(
+        k0, (batch_size, aligned_k), dtype=jnp.bfloat16
+    )
+    lhs_padded = jnp.where(is_padding, jnp.nan, lhs_padded)
+    lhs_padded = lhs_padded.at[:, k:].set(jnp.nan)
+
+    lhs = lhs_padded[:, :k]
+
+    rhs = jax.random.normal(
+        k1, (num_groups, k, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = jnp.array(
+        [batch_size // num_groups] * num_groups, dtype=jnp.int32
+    )
+
+    # Re-masking because we only care about the output values on non-paddings
+    # across different implementations.
+    expected = reference_gmm(lhs, rhs, group_sizes)
+    expected = jnp.where(is_padding, jnp.nan, expected)
+
+    actual = gmm_v2.gmm_v2(lhs, rhs, group_sizes)
+    actual = jnp.where(is_padding, jnp.nan, actual)
+
+    assert_arrays_all_close(actual, expected)
+
   @parameterized.product(
       batch_size=[128],
       in_size=[1024],
@@ -1100,6 +1144,90 @@ class GmmTest(parameterized.TestCase):
 
   @parameterized.product(
       batch_size=[128],
+      in_size=[768],
+      out_size=[512],
+      num_groups=[16],
+      weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+      activation_dtype=[
+          None,
+          jnp.int8,
+          jnp.float8_e4m3fn,
+      ],
+      block_size=[256, 768],
+      group_offset=[0],
+  )
+  @pytest.mark.long
+  def test_gmm_activation_weight_quantized_misaligned_block_sizes(
+      self,
+      batch_size,
+      in_size,
+      out_size,
+      num_groups,
+      weight_dtype,
+      activation_dtype,
+      block_size,
+      group_offset,
+  ):
+    """Tests activation and weight quantization with misaligned block sizes."""
+    if weight_dtype == jnp.float4_e2m1fn and test_utils.get_tpu_version() < 7:
+      self.skipTest("Expect TPUv7+")
+    if block_size > in_size:
+      self.skipTest("block_size must be <= in_size")
+    if in_size % block_size != 0:
+      self.skipTest("in_size must be divisible by block_size")
+    if activation_dtype is not None:
+      tpu_info = pltpu.get_tpu_info()
+      if not (
+          tpu_info.is_matmul_supported(activation_dtype, weight_dtype)
+      ) and not gmm_v2.is_manually_cast_matmul_dtype_combo(
+          activation_dtype, weight_dtype
+      ):
+        self.skipTest(
+            f"Combination {activation_dtype} and {weight_dtype} not supported"
+            " by the kernel."
+        )
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+
+    lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, weight_dtype, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+    expected = reference_gmm(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+    )
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        maybe_quantize_lhs=True,
+        lhs_quant_dtype=activation_dtype,
+    ).astype(lhs.dtype)
+
+    # e5m2 introduces increased rounding error compared to e4m3
+    if activation_dtype == jnp.float8_e5m2:
+      atol, rtol = 2.25, 1.1
+    else:
+      atol, rtol = 1.1, 1.1
+
+    chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+
+  @parameterized.product(
+      batch_size=[128],
       in_size=[1024],
       out_size=[1024],
       num_groups=[16, 32],
@@ -1119,6 +1247,9 @@ class GmmTest(parameterized.TestCase):
     """LHS quantized with a user provided lhs_scale."""
     if block_size > in_size:
       self.skipTest("block_size must be <= in_size")
+    if pltpu.get_tpu_info().generation <= 5:
+      self.skipTest("FP8 is only supported after TPU generation 6")
+
     # Per-tensor fp8 quant scale (bound / finfo(fp8).max = 224 / 448),
     # matching qwix's "fixed,-224,224" act calibration.
     lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)

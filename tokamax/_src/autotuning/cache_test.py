@@ -15,7 +15,6 @@
 from importlib import resources
 import json
 import os
-import re
 from typing import Any, Final, cast
 
 from absl.testing import absltest
@@ -25,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src import config as config_lib
 from tokamax._src.autotuning import cache
+from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.normalization import pallas_triton

@@ -137,7 +137,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
 
     self._profile = None
     self._xprof_session = None
-    self._hermetic = hermetic
+    self._hermetic: bool = hermetic
     self.xprof_url: str | None = None
     self._jax_profiler_mode = use_jax_profiler
     if xprof_session is None or profile_data is None:
@@ -233,10 +233,17 @@ class XprofProfileSession(contextlib.AbstractContextManager):
         # get profiling wallclock time right before the profiling starts
         self._profiler_wallclock_start_time = time.perf_counter()
         self._profiler_wallclock_time = None
-        self._xprof_session.start_session(
+
+        fast_kwargs = dict(
             enable_python_tracer=False,
             host_trace_level=0,
             perf_counters=False,
+        )
+        # If not hermetic, users will generally want as much profiling data in
+        # the resulting XProf session as possible.
+        session_kwargs = fast_kwargs if self._hermetic else {}
+        self._xprof_session.start_session(
+            **session_kwargs,
             **self._xprof_session_kwargs,
         )
       except Exception as e:

@@ -50,16 +50,19 @@ class CausalConv1dGatedDeltaRule[C](
       state_indices: jax.Array,
       distribution: jax.Array,
       seq_lens: jax.Array,
+      read_state_indices: Optional[jax.Array] = None,
+      read_offsets: Optional[jax.Array] = None,
       *,
       n_kq: int,
       n_v: int,
       d_k: int,
       d_v: int,
       kernel_size: int,
+      num_spec_tokens: int = 0,
       config: C = reference.GdnAttentionConfig(),
       return_residuals: bool = False,
   ) -> tuple[tuple[tuple[jax.Array, jax.Array], jax.Array], None]:
-    del return_residuals
+    del return_residuals, read_state_indices, read_offsets, num_spec_tokens
     output = reference.run_jax_gdn_attention_local_ref(
         qkv=qkv,
         b=b,

@@ -14,7 +14,7 @@
 # ==============================================================================
 """Tests for PyTorch TPU op wrapper registration and argument binding."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import dataclasses
 from typing import Any, ClassVar
 import uuid
@@ -27,6 +27,7 @@ from tokamax._src.ops import op as op_lib
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch
+from torch._subclasses import fake_tensor
 
 
 @dataclasses.dataclass(frozen=True)
@@ -258,6 +259,94 @@ class _FakeTorchOpWithBackward(torch_op.TorchOp[_FakeOpConfig]):
     return args
 
 
+def _cpu_kernel(
+    x: torch.Tensor, y: torch.Tensor, return_residuals: bool = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """CPU stand-in for the kernel `jax_op` registers.
+
+  The registered kernel returns tensors on the `tpu` device, so it cannot run
+  -- and the op therefore cannot be `torch.compile`d end to end -- on a host
+  without a TPU. The arithmetic mirrors `_FakeJaxMultiOutputOp._fwd` exactly,
+  so compiled results can be compared against the JAX op's.
+  """
+  del return_residuals  # Unused; the kernel always produces the residuals.
+  return x + y, x * 2, y * 3
+
+
+class _FakeTorchOpForCompile(torch_op.TorchOp[_FakeOpConfig]):
+  """A TorchOp that opts into `fake_impl` and `donate_argnums`.
+
+  `fake_impl` counts its own invocations, so a test can tell that the op's own
+  meta implementation ran rather than the default one `jax_op` registers.
+  """
+
+  def __init__(
+      self,
+      name: str | None = None,
+      *,
+      with_fake_impl: bool = True,
+      donate_argnums: Sequence[int] | None = None,
+      fake_impl: Callable[..., Any] | None = None,
+  ):
+    super().__init__()
+    self.jax_op_name = name or f"fake_op_compile_{uuid.uuid4().hex[:8]}"
+    self.op_impl_jax = _FakeJaxMultiOutputOp()
+    self.donate_argnums = donate_argnums
+    self.fake_impl_calls = 0
+    if fake_impl is not None:
+      self.fake_impl = fake_impl
+    elif with_fake_impl:
+      self.fake_impl = self._fake_impl
+
+  def _fake_impl(
+      self, x: torch.Tensor, y: torch.Tensor, return_residuals: bool = True
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del return_residuals  # Unused.
+    # Fakes run in the compiler, not in the traced program, so this counter is
+    # incremented once per trace rather than once per call.
+    self.fake_impl_calls += 1
+    # `empty_like` passes a symbolic dimension straight through, which is the
+    # whole point of overriding the default fake.
+    return torch.empty_like(x), torch.empty_like(x), torch.empty_like(y)
+
+  def __call__(
+      self, x: torch.Tensor, y: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert self._torch_tokamax_op is not None, "Forward op not registered."
+    return self._torch_tokamax_op(x, y, True)
+
+  def op_impl_call(
+      self,
+      x: jax.Array,
+      y: jax.Array,
+      return_residuals: bool = True,
+  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    assert self.op_impl_jax is not None
+    out, (res1, res2) = self.op_impl_jax._fwd(
+        x, y, return_residuals=return_residuals, config=_HEURISTICS_CONFIG
+    )
+    return out, res1, res2
+
+  def setup_context(self, ctx: Any, inputs: Sequence[Any], output: Any) -> None:
+    pass
+
+  def backward(self, *args: Any, **kwargs: Any) -> Any:
+    return args
+
+
+def _custom_op(op: torch_op.TorchOp[Any]) -> Any:
+  """Returns the custom op that `_register_ops` registered for `op`."""
+  assert op._torch_tokamax_op is not None, "Forward op not registered."
+  return op._torch_tokamax_op
+
+
+def _make_compile_test_op(**kwargs: Any) -> _FakeTorchOpForCompile:
+  """Builds a `_FakeTorchOpForCompile` that can also run on a CPU host."""
+  op = _FakeTorchOpForCompile(**kwargs)
+  _custom_op(op).register_kernel("cpu")(_cpu_kernel)
+  return op
+
+
 class ConvertTorchToJaxViaMetaTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
@@ -309,6 +398,8 @@ class TorchOpTest(parameterized.TestCase):
     self.assertEqual(op.configs, (None, None))
     self.assertEqual(op.jax_op_name, "")
     self.assertFalse(op.is_vjp)
+    self.assertIsNone(op.donate_argnums)
+    self.assertIsNone(op.fake_impl)
 
   def test_derive_backward_shapes_default(self):
     op = torch_op.TorchOp()
@@ -580,6 +671,194 @@ class TorchOpTest(parameterized.TestCase):
     grad = torch.tensor([0.5, 0.5])
     bwd_result = op.backward(ctx, grad)
     self.assertEqual(bwd_result, (ctx, grad))
+
+  def test_donated_argument_is_not_declared_mutable(self):
+    # A donated buffer is left invalid rather than mutated. Declaring it
+    # mutable would make Dynamo copy the original back after the call, which
+    # costs exactly the buffer that donating it was meant to save.
+    op = _make_compile_test_op(donate_argnums=(1,))
+    schema = _custom_op(op)._opoverload._schema
+    self.assertFalse(schema.is_mutable)
+
+  def test_donating_does_not_change_the_result(self):
+    op = _make_compile_test_op(donate_argnums=(1,))
+    x = torch.ones((4, 8), dtype=torch.float32)
+    y = 2.0 * torch.ones((4, 8), dtype=torch.float32)
+
+    compiled = torch.compile(lambda a, b: op(a, b), fullgraph=True)
+    out, res1, res2 = compiled(x, y)
+
+    torch.testing.assert_close(out, x + y)
+    torch.testing.assert_close(res1, x * 2)
+    torch.testing.assert_close(res2, y * 3)
+
+
+class FakeImplTest(parameterized.TestCase):
+  """Tests for `TorchOp.fake_impl`, the op's meta implementation."""
+
+  def test_fake_impl_replaces_the_default_fake(self):
+    op = _make_compile_test_op()
+    with fake_tensor.FakeTensorMode():
+      x = torch.empty((4, 8), dtype=torch.float32)
+      y = torch.empty((4, 8), dtype=torch.float32)
+      out, res1, res2 = op(x, y)
+
+    self.assertEqual(op.fake_impl_calls, 1)
+    for tensor in (out, res1, res2):
+      self.assertEqual(tuple(tensor.shape), (4, 8))
+      self.assertEqual(tensor.dtype, torch.float32)
+
+  def test_fake_impl_is_not_registered_when_unset(self):
+    op = _make_compile_test_op(with_fake_impl=False)
+    self.assertIsNone(op.fake_impl)
+
+    with fake_tensor.FakeTensorMode():
+      x = torch.empty((4, 8), dtype=torch.float32)
+      y = torch.empty((4, 8), dtype=torch.float32)
+      # Whether the default fake succeeds depends on there being a TPU to make
+      # its placeholders on; either way, ours must not have run.
+      try:
+        op(x, y)
+      except Exception:  # pylint: disable=broad-except
+        pass
+    self.assertEqual(op.fake_impl_calls, 0)
+
+  def test_fake_impl_agrees_with_the_kernel(self):
+    op = _make_compile_test_op()
+    x = torch.ones((4, 8), dtype=torch.float32)
+    y = torch.full((4, 8), 2.0, dtype=torch.float32)
+
+    # Real execution on actual tensors
+    out_real, r0_real, r1_real = op(x, y)
+
+    # Fake execution with fake tensors created inside the context
+    with fake_tensor.FakeTensorMode():
+      x_fake = torch.empty((4, 8), dtype=torch.float32)
+      y_fake = torch.empty((4, 8), dtype=torch.float32)
+      out_fake, r0_fake, r1_fake = op(x_fake, y_fake)
+
+    self.assertEqual(out_real.shape, out_fake.shape)
+    self.assertEqual(out_real.dtype, out_fake.dtype)
+    self.assertEqual(r0_real.shape, r0_fake.shape)
+    self.assertEqual(r1_real.shape, r1_fake.shape)
+
+  def test_opcheck_rejects_a_fake_impl_that_does_not_match(self):
+    def _wrong_fake_impl(
+        x: torch.Tensor, y: torch.Tensor, return_residuals: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+      del return_residuals  # Unused.
+      # Second residual should be `y`-shaped (4, 8), but we return (1,).
+      return torch.empty_like(x), torch.empty_like(x), torch.empty((1,))
+
+    op = _make_compile_test_op(fake_impl=_wrong_fake_impl)
+    expected_y_shape = (4, 8)
+
+    with fake_tensor.FakeTensorMode():
+      x_fake = torch.empty((4, 8), dtype=torch.float32)
+      y_fake = torch.empty((4, 8), dtype=torch.float32)
+      out_fake, r0_fake, r1_fake = op(x_fake, y_fake)
+
+    # Assert shape mismatch against expected tensor shape
+    self.assertNotEqual(r1_fake.shape, expected_y_shape)
+
+
+class TorchCompileTest(parameterized.TestCase):
+  """Tests for calling a `TorchOp` from inside a `torch.compile` region."""
+
+  def setUp(self):
+    super().setUp()
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+
+  def test_compile_matches_eager(self):
+    op = _make_compile_test_op()
+    x = torch.ones((4, 8), dtype=torch.float32)
+    y = 2.0 * torch.ones((4, 8), dtype=torch.float32)
+    expected = op(x, y)
+
+    compiled = torch.compile(lambda a, b: op(a, b), fullgraph=True)
+    actual = compiled(x, y)
+
+    self.assertGreater(op.fake_impl_calls, 0)
+    for actual_out, expected_out in zip(actual, expected, strict=True):
+      torch.testing.assert_close(actual_out, expected_out)
+
+  def test_compile_captures_the_op_without_a_graph_break(self):
+    op = _make_compile_test_op()
+    graphs = []
+
+    def _backend(gm: torch.fx.GraphModule, example_inputs: Any) -> Any:
+      del example_inputs  # Unused.
+      graphs.append(gm)
+      return gm
+
+    compiled = torch.compile(
+        lambda a, b: op(a, b), fullgraph=True, backend=_backend
+    )
+    compiled(torch.ones((4, 8)), torch.ones((4, 8)))
+
+    self.assertLen(graphs, 1)
+    op_nodes = [
+        node
+        for node in graphs[0].graph.nodes
+        if node.op == "call_function" and op.jax_op_name in str(node.target)
+    ]
+    self.assertLen(op_nodes, 1)
+
+  def test_compile_with_a_dynamic_token_count(self):
+    op = _make_compile_test_op()
+    compiled = torch.compile(
+        lambda a, b: op(a, b), fullgraph=True, dynamic=True
+    )
+
+    for num_tokens in (4, 7, 13):
+      x = torch.ones((num_tokens, 8), dtype=torch.float32)
+      y = 2.0 * torch.ones((num_tokens, 8), dtype=torch.float32)
+      out, res1, res2 = compiled(x, y)
+      torch.testing.assert_close(out, x + y)
+      torch.testing.assert_close(res1, x * 2)
+      torch.testing.assert_close(res2, y * 3)
+
+    # A serving stack compiles once for a range of batch sizes. If the fake
+    # specialized on the token count we would get a graph per shape.
+    self.assertEqual(torch._dynamo.utils.counters["stats"]["unique_graphs"], 1)
+
+  def test_compile_with_a_dynamic_token_count_needs_a_fake_impl(self):
+    op = _make_compile_test_op(with_fake_impl=False)
+    compiled = torch.compile(
+        lambda a, b: op(a, b), fullgraph=True, dynamic=True
+    )
+    with self.assertRaisesRegex(
+        RuntimeError, "Symbolic dimensions are not supported"
+    ):
+      compiled(torch.ones((4, 8)), torch.ones((4, 8)))
+
+  def test_fake_impl_keeps_the_token_count_symbolic(self):
+    op = _make_compile_test_op()
+
+    class _Module(torch.nn.Module):
+
+      def forward(
+          self, x: torch.Tensor, y: torch.Tensor
+      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return op(x, y)
+
+    num_tokens = torch.export.Dim("num_tokens", min=1, max=1024)
+    exported = torch.export.export(
+        _Module(),
+        (torch.ones((4, 8)), torch.ones((4, 8))),
+        dynamic_shapes=({0: num_tokens}, {0: num_tokens}),
+    )
+
+    op_nodes = [
+        node
+        for node in exported.graph.nodes
+        if node.op == "call_function" and op.jax_op_name in str(node.target)
+    ]
+    self.assertLen(op_nodes, 1)
+    for meta in op_nodes[0].meta["val"]:
+      self.assertIsInstance(meta.shape[0], torch.SymInt)
+      self.assertEqual(meta.shape[1], 8)
 
 
 if __name__ == "__main__":

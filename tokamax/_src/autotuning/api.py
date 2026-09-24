@@ -34,12 +34,20 @@ from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import api as causal_conv1d_gated_delta_rule_api
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import base as causal_conv1d_gated_delta_rule_base
+from tokamax._src.ops.experimental.batched_rpa import api as batched_rpa_api
+from tokamax._src.ops.experimental.batched_rpa import base as batched_rpa_base
 from tokamax._src.ops.experimental.kda import api as kda_api
 from tokamax._src.ops.experimental.kda import base as kda_base
 from tokamax._src.ops.experimental.mla import api as mla_api
 from tokamax._src.ops.experimental.mla import base as mla_base
+from tokamax._src.ops.experimental.tpu.splash_attention import api as splash_attention_api
+from tokamax._src.ops.experimental.tpu.splash_attention import base as splash_attention_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import api as linear_softmax_cross_entropy_loss_api
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import base as linear_softmax_cross_entropy_loss_base
 from tokamax._src.ops.normalization import api as normalization_api
 from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
@@ -48,10 +56,10 @@ from tokamax._src.ops.ragged_gather import api as ragged_gather_api
 from tokamax._src.ops.ragged_gather import base as ragged_gather_base
 from tokamax._src.ops.ragged_gather_reduce import api as ragged_gather_reduce_api
 from tokamax._src.ops.ragged_gather_reduce import base as ragged_gather_reduce_base
-from tokamax._src.ops.experimental.batched_rpa import api as batched_rpa_api
-from tokamax._src.ops.experimental.batched_rpa import base as batched_rpa_base
 from tokamax._src.ops.ragged_scatter import api as ragged_scatter_api
 from tokamax._src.ops.ragged_scatter import base as ragged_scatter_base
+from tokamax._src.ops.triangle_multiplication import api as triangle_multiplication_api
+from tokamax._src.ops.triangle_multiplication import base as triangle_multiplication_base
 import tqdm
 
 type BoundArgsAutotuningData = tuple[
@@ -266,6 +274,16 @@ _API_IMPLEMENTATIONS: Final[
     ),
     batched_rpa_base.BatchedRpa: batched_rpa_api.IMPLEMENTATIONS,
     kda_base.KimiDeltaAttention: kda_api.IMPLEMENTATIONS,
+    linear_softmax_cross_entropy_loss_base.LinearSoftmaxCrossEntropyLoss: (
+        linear_softmax_cross_entropy_loss_api.IMPLEMENTATIONS
+    ),
+    triangle_multiplication_base.TriangleMultiplication: (
+        triangle_multiplication_api.IMPLEMENTATIONS
+    ),
+    splash_attention_base.SplashAttention: splash_attention_api.IMPLEMENTATIONS,
+    causal_conv1d_gated_delta_rule_base.CausalConv1dGatedDeltaRule: (
+        causal_conv1d_gated_delta_rule_api.IMPLEMENTATIONS
+    ),
 })
 
 

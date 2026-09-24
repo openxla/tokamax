@@ -44,7 +44,16 @@ _Config = TypeVar("_Config")
   - op_impl_jax: the JAX Tokamax op class to wrap using torch_tpu.jax_op.
   - is_vjp: whether the Torch Op is a VJP op. This is false for the forward pass
     and true for the backward pass.
-  
+
+  Optionally, also in the constructor:
+  - donate_argnums: positional indices of op_impl_call's inputs whose buffers
+    the kernel may reuse for its outputs. These are passed through to jax.jit
+    which uses them to reduce the number of buffers that need to be allocated.
+  - fake_impl: a meta implementation, needed when the op is called from inside
+    a torch.compile region with a dynamic dimension. If not supplied, the
+    default implementation will re-export the JAX function, which rejects
+    symbolic shapes.
+
   In both classes, implement the following methods:
   - op_impl_call: The kernel invocation method for the JAX Tokamax op. This must
     invoke op_impl_jax with the full list of inputs and config to run the
@@ -148,6 +157,19 @@ class TorchOp(Generic[_Config]):
 
     # Whether the Torch Op is a VJP op.
     self.is_vjp = False
+
+    # Positional indices of op_impl_call's arguments whose buffers the kernel
+    # is allowed to reuse for its outputs. See the Jax Buffer Donation article
+    # for more information. The inheriting class sets this in its constructor;
+    # None donates nothing.
+    self.donate_argnums: Sequence[int] | None = None
+
+    # Meta/fake implementation for the registered custom op. jax_op registers
+    # a default that re-exports the JAX function, which rejects symbolic
+    # shapes, so an op that is called from inside a torch.compile region with
+    # a dynamic dimension has to supply its own. The inheriting class sets
+    # this in its constructor; None keeps jax_op's default.
+    self.fake_impl: Callable[..., Any] | None = None
 
   def __init_subclass__(cls, **kwargs: Any) -> None:
     """Initializes the TorchOp subclass and automatically registers ops."""
@@ -290,7 +312,12 @@ class TorchOp(Generic[_Config]):
     self._torch_tokamax_op = torch_tpu._internal.pallas.pallas.jax_op(
         f"tokamax::{self.jax_op_name}",
         self.op_impl_call,
+        donate_argnums=self.donate_argnums,
     )
+
+    if self.fake_impl is not None:
+      # Replaces the default fake that jax_op registers.
+      self._torch_tokamax_op.register_fake(self.fake_impl)
 
     torch_utils.inspect_for_attribute(self.__call__, "_torch_tokamax_op")
 
