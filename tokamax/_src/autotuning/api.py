@@ -34,6 +34,8 @@ from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import api as causal_conv1d_gated_delta_rule_api
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import base as causal_conv1d_gated_delta_rule_base
 from tokamax._src.ops.experimental.batched_rpa import api as batched_rpa_api
 from tokamax._src.ops.experimental.batched_rpa import base as batched_rpa_base
 from tokamax._src.ops.experimental.kda import api as kda_api
@@ -279,6 +281,9 @@ _API_IMPLEMENTATIONS: Final[
         triangle_multiplication_api.IMPLEMENTATIONS
     ),
     splash_attention_base.SplashAttention: splash_attention_api.IMPLEMENTATIONS,
+    causal_conv1d_gated_delta_rule_base.CausalConv1dGatedDeltaRule: (
+        causal_conv1d_gated_delta_rule_api.IMPLEMENTATIONS
+    ),
 })
 
 
