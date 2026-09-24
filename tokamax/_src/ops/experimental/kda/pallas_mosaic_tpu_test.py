@@ -28,6 +28,10 @@ from tokamax._src.ops.experimental.kda.cp_utils import ContextParallelMetadata
 
 
 def _call_attention(implementation, q, v, **kwargs):
+  kwargs.setdefault("use_gate_in_kernel", True)
+  kwargs.setdefault("a_log", jnp.zeros((q.shape[0],), dtype=jnp.float32))
+  kwargs.setdefault("lower_bound", -5.0)
+
   def call():
     return api.kimi_delta_attention(
         q,
@@ -40,7 +44,10 @@ def _call_attention(implementation, q, v, **kwargs):
         **kwargs,
     )
 
-  if implementation != "mosaic":
+  uses_mosaic = implementation == "mosaic" or (
+      not isinstance(implementation, str) and "mosaic" in implementation
+  )
+  if not uses_mosaic:
     return call()
   # Exercise Mosaic's public API validation on every test platform without
   # tracing a kernel: every case below is rejected at the start of `_fwd`.
@@ -114,6 +121,63 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
             lower_bound=None,
         )
     )
+
+  @parameterized.named_parameters(
+      (
+          "preactivated_gate",
+          False,
+          -5.0,
+          True,
+          "use_gate_in_kernel=True",
+      ),
+      ("missing_lower_bound", True, None, False, "lower_bound.*set"),
+      ("unsafe_gate", True, -5.0, False, "safe_gate=True"),
+  )
+  def test_rejects_unsupported_gate_config(
+      self, use_gate_in_kernel, lower_bound, safe_gate, expected_error
+  ):
+    with self.assertRaisesRegex(NotImplementedError, expected_error):
+      pallas_mosaic_tpu._check_gate_support(  # pylint: disable=protected-access
+          use_gate_in_kernel=use_gate_in_kernel,
+          lower_bound=lower_bound,
+          safe_gate=safe_gate,
+      )
+
+  @parameterized.named_parameters(
+      ("preactivated_gate", False, -5.0, "use_gate_in_kernel=True"),
+      ("missing_lower_bound", True, None, "lower_bound.*set"),
+  )
+  def test_rejects_unsupported_gate_before_kernel(
+      self, use_gate_in_kernel, lower_bound, expected_error
+  ):
+    q = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
+    v = jnp.ones_like(q)
+
+    with self.assertRaisesRegex(NotImplementedError, expected_error):
+      _call_attention(
+          "mosaic",
+          q,
+          v,
+          use_gate_in_kernel=use_gate_in_kernel,
+          lower_bound=lower_bound,
+      )
+
+  def test_unsupported_gate_config_falls_back_to_xla(self):
+    q = jnp.ones((1, 1, 64, 1), dtype=jnp.float32)
+    v = jnp.ones_like(q)
+    expected = _call_attention(
+        "xla", q, v, use_gate_in_kernel=False, lower_bound=None
+    )
+    actual = _call_attention(
+        ("mosaic", "xla"),
+        q,
+        v,
+        use_gate_in_kernel=False,
+        lower_bound=None,
+    )
+
+    self.assertTrue(jnp.array_equal(actual[0], expected[0]))
+    self.assertEqual(actual[1], expected[1])
 
   def test_large_key_dimension_is_mosaic_specific(self):
     q = jnp.ones((1, 1, 1, 257), dtype=jnp.float32)
