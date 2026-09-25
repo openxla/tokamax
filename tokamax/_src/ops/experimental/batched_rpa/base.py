@@ -19,6 +19,7 @@ from typing import Any, ClassVar, TypeVar
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.batched_rpa import reference
@@ -30,7 +31,7 @@ from typing_extensions import override
 
 _Config = TypeVar("_Config")
 
-AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray | np.ndarray
 
 
 @dataclasses.dataclass(frozen=True)
