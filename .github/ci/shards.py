@@ -144,7 +144,7 @@ EXCLUDED_TESTS = ()
 # installs; every version in `older_jaxs()` gets a compat rerun
 # on each of `COMPAT_RUNNERS`, so that a downstream still on
 # the older release is not broken by a change that only works on the newer one.
-JAX_VERSIONS = ('0.11.1', '0.11.0')
+JAX_VERSIONS = ('0.11.2', '0.11.1', '0.11.0')
 
 # TODO: Enable the backward compatibility test for GPU kernels by
 # adding 'linux-x86-a3-8g-h100-1gpu' to COMPAT_RUNNERS.
@@ -690,8 +690,10 @@ def jax_floor(pyproject: str = 'pyproject.toml') -> str:
     )
   return floors.pop()
 
+
 def _version_key(version: str) -> tuple[int, ...]:
   return tuple(int(part) for part in version.split('.'))
+
 
 def sorted_jax_versions() -> tuple[str, ...]:
   """Returns `JAX_VERSIONS` in version order, newest first."""
@@ -931,7 +933,9 @@ def resolve_shards(
     del shards[_CATCH_ALL_SHARD]
   return shards, catch_all, excluded, ignored
 
+
 jax_version_re = re.compile(r'\d+(\.\d+)*')
+
 
 def check_consistency(
     shards: ShardMap,
@@ -1096,17 +1100,17 @@ def check_consistency(
     if runner not in RUNNERS:
       errors.append(f'COMPAT_RUNNERS {runner!r} is not in RUNNERS.')
 
-  if len(JAX_VERSIONS) != 2:
+  if len(JAX_VERSIONS) != 3:
     errors.append(
         f'JAX_VERSIONS is {JAX_VERSIONS}: tokamax supports 2 latest JAX'
         ' versions for backward compatibility.'
     )
   if sorted({v for v in JAX_VERSIONS if JAX_VERSIONS.count(v) > 1}):
-    errors.append(
-        f'Duplicated JAX version found in {JAX_VERSIONS}.'
-    )
+    errors.append(f'Duplicated JAX version found in {JAX_VERSIONS}.')
   if bad := sorted(v for v in JAX_VERSIONS if not jax_version_re.fullmatch(v)):
-    errors.append('Invalid JAX version found in JAX_VERSIONS: ' + ', '.join(bad))
+    errors.append(
+        'Invalid JAX version found in JAX_VERSIONS: ' + ', '.join(bad)
+    )
     return errors
 
   if pyproject is not None:
@@ -1322,8 +1326,8 @@ def select(
   Args:
     shards: Shard name to spec, as `resolve_shards` returns it.
     test_files: The universe to select from, as from `all_test_files`.
-    changed_from: File of NUL-separated changed paths, or None for no
-      narrowing at all.
+    changed_from: File of NUL-separated changed paths, or None for no narrowing
+      at all.
 
   Returns:
     `(names, reason)`. `names` is the shards to run, or None meaning every
@@ -1394,11 +1398,15 @@ def explain(
   out += [f'      {f}' for f in sorted(changed)]
   out += [
       '',
-      f'reaching {len(affected)} test file(s) in {len(names)} of'
-      f' {len(shards)} shards.',
+      (
+          f'reaching {len(affected)} test file(s) in {len(names)} of'
+          f' {len(shards)} shards.'
+      ),
       '  `edited` was changed directly, `import` reaches one that was.',
-      '  the clock is measured wall time: what shards are sized on, not'
-      ' file count.',
+      (
+          '  the clock is measured wall time: what shards are sized on, not'
+          ' file count.'
+      ),
       '',
   ]
   claimed = set()
@@ -1460,22 +1468,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     SystemExit: If `check_consistency` finds a problem.
   """
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument(
-      'command', choices=('matrix', 'check', 'list', 'explain')
-  )
+  parser.add_argument('command', choices=('matrix', 'check', 'list', 'explain'))
   parser.add_argument(
       '--changed-from',
       metavar='FILE',
-      help='Path to file containing NUL-separated changed file paths (e.g. from'
-      ' `git diff --name-only -z`). Narrows the test matrix to affected shards.'
-      ' If omitted, all shards run.',
+      help=(
+          'Path to file containing NUL-separated changed file paths (e.g. from'
+          ' `git diff --name-only -z`). Narrows the test matrix to affected'
+          ' shards. If omitted, all shards run.'
+      ),
   )
   parser.add_argument(
       '--dry-run',
       action='store_true',
-      help='Calculate and log shard selection without filtering the matrix'
-      ' (emits all shards). Used to validate selection behavior before'
-      ' enforcing it.',
+      help=(
+          'Calculate and log shard selection without filtering the matrix'
+          ' (emits all shards). Used to validate selection behavior before'
+          ' enforcing it.'
+      ),
   )
   args = parser.parse_args(argv)
 
