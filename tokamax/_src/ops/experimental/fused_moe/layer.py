@@ -17,6 +17,7 @@
 fused_ep_moe_v2 wraps the kernel builder in a shard_map over the
 expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
+
 import threading
 
 import jax
@@ -24,17 +25,38 @@ import jax.numpy as jnp
 from jax import lax
 
 from .host import (
-    HIDDEN_LANE_BLOCK, MAX_ROUTING_BLOCK, QB4, ROWBLK, U32_SUBLANE_TILE,
-    GatheredPairs, WeightFormat, act_scale_slab_rows, align_up,
-    build_routing_tables, build_routing_tables_sharded, expert_visit_list,
-    local_slab_rows, pair_block_hist, pow2_shift, ragged_stride_bound,
-    routing_block, shard_count_vector, shard_expert_slabs,
-    shard_push_tables_in_rows, shard_token_gather,
-    shard_transport_tables_in_blocks, token_gather_window_rows, weight_form,
-    weight_format_of_dtype)
+    HIDDEN_LANE_BLOCK,
+    MAX_ROUTING_BLOCK,
+    QB4,
+    ROWBLK,
+    U32_SUBLANE_TILE,
+    GatheredPairs,
+    WeightFormat,
+    act_scale_slab_rows,
+    align_up,
+    build_routing_tables,
+    build_routing_tables_sharded,
+    expert_visit_list,
+    local_slab_rows,
+    pair_block_hist,
+    pow2_shift,
+    ragged_stride_bound,
+    routing_block,
+    shard_count_vector,
+    shard_expert_slabs,
+    shard_push_tables_in_rows,
+    shard_token_gather,
+    shard_transport_tables_in_blocks,
+    token_gather_window_rows,
+    weight_form,
+    weight_format_of_dtype,
+)
 from .kernel import (
-    build_combine_kernel, build_fused_ep_moe_kernel, combine_step_tokens,
-    rowquant_fp8)
+    build_combine_kernel,
+    build_fused_ep_moe_kernel,
+    combine_step_tokens,
+    rowquant_fp8,
+)
 from .router_ops import pallas_select
 from .token_parallel import TokenReplicaLayout
 
@@ -44,7 +66,7 @@ SCORING_FNS = ("softmax", "sigmoid", "sqrtsoftplus")
 
 
 def _apply_scoring_fn(logits, scoring_fn):
-    """Gate logits -> f32 routing scores. """
+    """Gate logits -> f32 routing scores."""
     scores = logits.astype(jnp.float32)
     if scoring_fn == "softmax":
         return jax.nn.softmax(scores, axis=-1)
@@ -53,12 +75,13 @@ def _apply_scoring_fn(logits, scoring_fn):
     if scoring_fn == "sqrtsoftplus":
         return jnp.sqrt(jax.nn.softplus(scores))
     raise NotImplementedError(
-        f"the fused EP MoE router scores with {SCORING_FNS}; got "
-        f"{scoring_fn!r}")
+        f"the fused EP MoE router scores with {SCORING_FNS}; got {scoring_fn!r}"
+    )
 
 
-def _combine_arrivals(arrivals, arrival_scales, pos, mirror_pos, topk_weights,
-                      out_dtype):
+def _combine_arrivals(
+    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
 
     Two tables index two different objects, so each owns its own clamp.
@@ -90,24 +113,26 @@ def _combine_arrivals(arrivals, arrival_scales, pos, mirror_pos, topk_weights,
     rows = jnp.minimum(pos, recv_rows - 1)
     shift = pow2_shift(tile_m, "the mirror's lane count")
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
-    row_scales = arrival_scales[jnp.right_shift(scl, shift),
-                                scl & (tile_m - 1)]
+    row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
     coef = row_scales * topk_weights.astype(jnp.float32)
     if combine_step_tokens(t_local):
-        combine = build_combine_kernel(t_local=t_local,
-                                       topk=topk,
-                                       hidden=hidden,
-                                       lane_blocks=lane_blocks,
-                                       wire_dtype=arrivals.dtype,
-                                       out_dtype=out_dtype)
+        combine = build_combine_kernel(
+            t_local=t_local,
+            topk=topk,
+            hidden=hidden,
+            lane_blocks=lane_blocks,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+        )
         return combine(arrivals, coef, rows)
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
     coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
     terms = []
     for k in range(topk):
-        slot_rows = lax.slice(rows_fp8, (k * t_local, 0, 0),
-                              ((k + 1) * t_local, lane_blocks, lanes))
-        slot_coef = lax.slice(coef_k, (k * t_local, ), ((k + 1) * t_local, ))
+        slot_rows = lax.slice(
+            rows_fp8, (k * t_local, 0, 0), ((k + 1) * t_local, lane_blocks, lanes)
+        )
+        slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
         terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
     return sum(terms).astype(out_dtype).reshape(t_local, hidden)
 
@@ -137,11 +162,11 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
     from its own copy, so the wire never carries it.
     """
     scale_at, count_at, _ = layout
-    parts = [pairs, jnp.zeros((scale_at - pairs.size, ), jnp.int32)]
+    parts = [pairs, jnp.zeros((scale_at - pairs.size,), jnp.int32)]
     if scale_bits is not None:
         parts += [
             scale_bits,
-            jnp.zeros((count_at - scale_at - scale_bits.size, ), jnp.int32)
+            jnp.zeros((count_at - scale_at - scale_bits.size,), jnp.int32),
         ]
     parts.append(counts)
     return jnp.concatenate([p for p in parts if p.size])
@@ -157,8 +182,11 @@ def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
     scale_at, count_at, _ = layout
     ep = exchange.shape[0]
     pairs = lax.slice(exchange, (0, 0), (ep, t_local * topk))
-    scale_bits = None if scale_at == count_at else lax.slice(
-        exchange, (0, scale_at), (ep, scale_at + t_local)).reshape(-1)
+    scale_bits = (
+        None
+        if scale_at == count_at
+        else lax.slice(exchange, (0, scale_at), (ep, scale_at + t_local)).reshape(-1)
+    )
     counts = lax.slice(exchange, (0, count_at), (ep, count_at + e_total))
     return pairs, scale_bits, counts
 
@@ -180,13 +208,15 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
         return topk_idx
     ep = len(mesh_ep_ranks)
     if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
-        raise ValueError("mesh_ep_ranks must be a permutation of "
-                         f"range({ep}); got {mesh_ep_ranks}")
+        raise ValueError(
+            f"mesh_ep_ranks must be a permutation of range({ep}); got {mesh_ep_ranks}"
+        )
     owning_rank = topk_idx // g_local
     mesh_block = jnp.zeros_like(topk_idx)
     for mesh_index, ep_rank in enumerate(mesh_ep_ranks):
-        mesh_block = jnp.where(owning_rank == ep_rank, jnp.int32(mesh_index),
-                               mesh_block)
+        mesh_block = jnp.where(
+            owning_rank == ep_rank, jnp.int32(mesh_index), mesh_block
+        )
     return mesh_block * g_local + topk_idx % g_local
 
 
@@ -203,31 +233,33 @@ _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
 
-def fused_ep_moe_v2(x,
-                    w1,
-                    w2,
-                    w1_scale,
-                    w2_scale,
-                    gating,
-                    w1_bias=None,
-                    w2_bias=None,
-                    *,
-                    topk,
-                    renormalize,
-                    mesh,
-                    capacity,
-                    block=None,
-                    ragged_stride=None,
-                    weight_format=WeightFormat.FP8,
-                    rhs_qb=None,
-                    act_fn="silu",
-                    rank=None,
-                    mesh_ep_ranks=None,
-                    sharded_plan=False,
-                    scoring_fn="softmax",
-                    score_bias=None,
-                    routed_scaling_factor=1.0,
-                    token_replica_groups=None):
+def fused_ep_moe_v2(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    gating,
+    w1_bias=None,
+    w2_bias=None,
+    *,
+    topk,
+    renormalize,
+    mesh,
+    capacity,
+    block=None,
+    ragged_stride=None,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=None,
+    act_fn="silu",
+    rank=None,
+    mesh_ep_ranks=None,
+    sharded_plan=False,
+    scoring_fn="softmax",
+    score_bias=None,
+    routed_scaling_factor=1.0,
+    token_replica_groups=None,
+):
     """Run one MoE layer through the fused expert-parallel kernel.
 
     x [tokens, hidden], w1 [experts, hidden, 2 * inter], w2 [experts,
@@ -294,14 +326,16 @@ def fused_ep_moe_v2(x,
                 f"weight format {weight_format!r} takes "
                 f"{jnp.dtype(form.weight_dtype).name} expert weights and "
                 f"{name} is {jnp.dtype(w.dtype).name}"
-                f"{f', which is the {actual!r} form' if actual else ''}")
+                f"{f', which is the {actual!r} form' if actual else ''}"
+            )
     if form.has_scales != (w1_scale is not None):
-        raise ValueError(f"weight format {weight_format!r} carries "
-                         f"{form.scale_layout} weight scales and w1_scale is "
-                         f"{'present' if w1_scale is not None else 'absent'}")
-    if (w1_scale is None) != (w2_scale is None):
         raise ValueError(
-            "both weight scales are supplied together or neither is")
+            f"weight format {weight_format!r} carries "
+            f"{form.scale_layout} weight scales and w1_scale is "
+            f"{'present' if w1_scale is not None else 'absent'}"
+        )
+    if (w1_scale is None) != (w2_scale is None):
+        raise ValueError("both weight scales are supplied together or neither is")
     T, hidden = x.shape
     e_total = w1.shape[0]
     inter = w1.shape[2] // 2
@@ -314,28 +348,37 @@ def fused_ep_moe_v2(x,
     # loader's singleton axes is refused rather than reshaped.
     if form.has_scales:
         ndim = 3 if form.scale_layout == "per_contraction_block" else 2
-        for name, s, n in (("w1_scale", w1_scale, 2 * inter),
-                           ("w2_scale", w2_scale, hidden)):
+        for name, s, n in (
+            ("w1_scale", w1_scale, 2 * inter),
+            ("w2_scale", w2_scale, hidden),
+        ):
             if s.ndim != ndim or s.shape[0] != e_total or s.shape[-1] != n:
                 want = (e_total, "blocks", n) if ndim == 3 else (e_total, n)
-                raise ValueError(f"{name} layout {tuple(s.shape)} is not the "
-                                 f"{form.scale_layout} form {want} the kernel "
-                                 f"takes")
-    (ax, ) = mesh.axis_names
+                raise ValueError(
+                    f"{name} layout {tuple(s.shape)} is not the "
+                    f"{form.scale_layout} form {want} the kernel "
+                    f"takes"
+                )
+    (ax,) = mesh.axis_names
     ep = mesh.shape[ax]
     if mesh_ep_ranks is not None:
         mesh_ep_ranks = tuple(int(rank) for rank in mesh_ep_ranks)
         if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
-            raise ValueError("mesh_ep_ranks must be a permutation of "
-                             f"range({ep}); got {mesh_ep_ranks}")
+            raise ValueError(
+                "mesh_ep_ranks must be a permutation of "
+                f"range({ep}); got {mesh_ep_ranks}"
+            )
     g_local = e_total // ep
     if T % ep or gating.shape != (T, e_total):
         raise ValueError(
-            "input and gating rows must agree and partition evenly over EP")
-    token_layout = TokenReplicaLayout.create(ep=ep,
-                                             input_rows=T // ep,
-                                             groups=token_replica_groups,
-                                             row_alignment=U32_SUBLANE_TILE)
+            "input and gating rows must agree and partition evenly over EP"
+        )
+    token_layout = TokenReplicaLayout.create(
+        ep=ep,
+        input_rows=T // ep,
+        groups=token_replica_groups,
+        row_alignment=U32_SUBLANE_TILE,
+    )
     t_local = token_layout.local_rows
     T = ep * t_local
     P = jax.sharding.PartitionSpec
@@ -347,33 +390,37 @@ def fused_ep_moe_v2(x,
     if ragged_stride % capacity != 0:
         raise ValueError(
             f"ragged_stride must be a multiple of capacity {capacity}; got "
-            f"{ragged_stride}. Pass {stride_bound}.")
+            f"{ragged_stride}. Pass {stride_bound}."
+        )
     if ragged_stride < stride_bound:
         raise ValueError(
             f"ragged_stride {ragged_stride} is below the no-drop bound "
             f"{stride_bound}, so one shard's slab could bleed into the "
-            f"next. Pass {stride_bound} or more.")
+            f"next. Pass {stride_bound} or more."
+        )
     has_w1_bias = w1_bias is not None
     has_w2_bias = w2_bias is not None
     has_score_bias = score_bias is not None
     if scoring_fn not in SCORING_FNS:
-        raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got "
-                         f"{scoring_fn!r}")
-    if has_score_bias and score_bias.shape != (e_total, ):
+        raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
+    if has_score_bias and score_bias.shape != (e_total,):
         raise ValueError(
             f"score_bias must be one value per global expert, [{e_total}]; "
-            f"got {tuple(score_bias.shape)}")
-    kfn = build_fused_ep_moe_kernel(g_local=g_local,
-                                    capacity=capacity,
-                                    hidden=hidden,
-                                    inter=inter,
-                                    ep=ep,
-                                    ragged_rows_alloc=ragged_stride,
-                                    weight_format=weight_format,
-                                    rhs_qb=rhs_qb,
-                                    act_fn=act_fn,
-                                    has_w1_bias=has_w1_bias,
-                                    has_w2_bias=has_w2_bias)
+            f"got {tuple(score_bias.shape)}"
+        )
+    kfn = build_fused_ep_moe_kernel(
+        g_local=g_local,
+        capacity=capacity,
+        hidden=hidden,
+        inter=inter,
+        ep=ep,
+        ragged_rows_alloc=ragged_stride,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        act_fn=act_fn,
+        has_w1_bias=has_w1_bias,
+        has_w2_bias=has_w2_bias,
+    )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
@@ -403,20 +450,21 @@ def fused_ep_moe_v2(x,
             # The rows go on the wire as they arrived. There is no scale to
             # carry, so nothing downstream builds or ships one.
             q_l, row_scale_l = rows_bf16, None
-        q_g = lax.all_gather(q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK,
-                                         HIDDEN_LANE_BLOCK),
-                             ax,
-                             axis=0,
-                             tiled=True)
+        q_g = lax.all_gather(
+            q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
+            ax,
+            axis=0,
+            tiled=True,
+        )
 
         scores = _apply_scoring_fn(gate_l, scoring_fn)
         select_rows = MAX_ROUTING_BLOCK
         while t_local % select_rows:
             select_rows //= 2
         if score_bias_l is None:
-            topk_weights, topk_idx = pallas_select(scores,
-                                                   topk=topk,
-                                                   block_rows=select_rows)
+            topk_weights, topk_idx = pallas_select(
+                scores, topk=topk, block_rows=select_rows
+            )
         else:
             # Selection is based on (scores + score_bias_l); the weights come
             # from the scores.
@@ -424,9 +472,11 @@ def fused_ep_moe_v2(x,
                 scores + score_bias_l.astype(jnp.float32)[None, :],
                 topk=topk,
                 block_rows=select_rows,
-                weight_scores=scores)
+                weight_scores=scores,
+            )
         topk_idx = _relabel_expert_ids_to_mesh_order(
-            topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks)
+            topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
+        )
         # A row of scores carrying no real value routes nowhere. It was
         # dropped by arithmetic accident: the selector gives every slot of
         # such a row a large negative sentinel, and the renormalization below
@@ -438,8 +488,7 @@ def fused_ep_moe_v2(x,
         # routed at full weight to expert zero. Mask it explicitly instead.
         row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
         if renormalize:
-            denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True),
-                                1e-20)
+            denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
         if routed_scaling_factor != 1.0:
             topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
@@ -455,50 +504,57 @@ def fused_ep_moe_v2(x,
         # were quantized, and the per-expert pair counts the routing plan
         # would otherwise exchange in a collective of its own.
         local_blocks = topk_idx.astype(jnp.int32).reshape(
-            t_local * topk // block, block)
+            t_local * topk // block, block
+        )
         block_hist = pair_block_hist(local_blocks, e_total)
-        scale_bits_l = None if row_scale_l is None else (
-            lax.bitcast_convert_type(row_scale_l[:, 0].astype(jnp.float32),
-                                     jnp.int32))
-        layout = _exchange_layout(t_local, topk, e_total,
-                                  form.quantized_activations)
-        exchange = lax.all_gather(_pack_routing_exchange(
-            local_blocks.reshape(-1), scale_bits_l, block_hist.sum(axis=0),
-            layout),
-                                  ax,
-                                  axis=0,
-                                  tiled=True).reshape(ep, layout[-1])
+        scale_bits_l = (
+            None
+            if row_scale_l is None
+            else (
+                lax.bitcast_convert_type(
+                    row_scale_l[:, 0].astype(jnp.float32), jnp.int32
+                )
+            )
+        )
+        layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
+        exchange = lax.all_gather(
+            _pack_routing_exchange(
+                local_blocks.reshape(-1), scale_bits_l, block_hist.sum(axis=0), layout
+            ),
+            ax,
+            axis=0,
+            tiled=True,
+        ).reshape(ep, layout[-1])
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
-            exchange, layout, t_local, topk, e_total)
-        gathered = GatheredPairs(expert_blocks=pairs_g.reshape(
-            T * topk // block, block),
-                                 local_blocks=local_blocks,
-                                 block_hist=block_hist,
-                                 rows_by_dest=rows_by_dest,
-                                 n_tokens=T,
-                                 topk=topk)
+            exchange, layout, t_local, topk, e_total
+        )
+        gathered = GatheredPairs(
+            expert_blocks=pairs_g.reshape(T * topk // block, block),
+            local_blocks=local_blocks,
+            block_hist=block_hist,
+            rows_by_dest=rows_by_dest,
+            n_tokens=T,
+            topk=topk,
+        )
 
-        plan_kw = dict(e_total=e_total,
-                       ep=ep,
-                       t_local=t_local,
-                       block=block,
-                       tile_m=capacity,
-                       shard_stride=ragged_stride)
+        plan_kw = dict(
+            e_total=e_total,
+            ep=ep,
+            t_local=t_local,
+            block=block,
+            tile_m=capacity,
+            shard_stride=ragged_stride,
+        )
         if sharded_plan:
-            routing = build_routing_tables_sharded(None,
-                                                   me,
-                                                   gathered=gathered,
-                                                   **plan_kw)
+            routing = build_routing_tables_sharded(
+                None, me, gathered=gathered, **plan_kw
+            )
         else:
             routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
-        block_tables = shard_transport_tables_in_blocks(routing,
-                                                        me,
-                                                        e_total=e_total,
-                                                        ep=ep)
-        row_tables = shard_push_tables_in_rows(routing,
-                                               me,
-                                               e_total=e_total,
-                                               ep=ep)
+        block_tables = shard_transport_tables_in_blocks(
+            routing, me, e_total=e_total, ep=ep
+        )
+        row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
         # Both slab tables scatter onto this shard's own slab. The rows of
         # the other shards are dropped where they are computed rather than
         # built into a replicated slab and sliced away afterwards.
@@ -512,16 +568,14 @@ def fused_ep_moe_v2(x,
         # either way; only the queue moves.
         if t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(routing,
-                                          me,
-                                          shard_stride=ragged_stride,
-                                          rows=slab_row)
+        token_gather = shard_token_gather(
+            routing, me, shard_stride=ragged_stride, rows=slab_row
+        )
         # The kernel DMA-aligns each logical expert window down by as much as
         # 127 int32 rows and always copies a full fixed window. Pad after the
         # scatter (rather than enlarging its destination) so the off-shard
         # sentinel remains out of range and cannot write a live padding row.
-        token_gather = jnp.pad(token_gather,
-                               (0, token_gather_window_rows(capacity)))
+        token_gather = jnp.pad(token_gather, (0, token_gather_window_rows(capacity)))
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on. It exists only where the rows were quantized.
         #
@@ -541,21 +595,19 @@ def fused_ep_moe_v2(x,
             scale_bits = jnp.repeat(scale_bits_g, topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK, ),
-                          jnp.int32).at[slab_row].add(scale_bits, mode="drop"),
-                jnp.float32).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                .at[slab_row]
+                .add(scale_bits, mode="drop"),
+                jnp.float32,
+            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
-        expert_rows, slab_base = shard_expert_slabs(routing,
-                                                    me,
-                                                    e_total=e_total,
-                                                    ep=ep)
+        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
         bias_it = operands
-        w1b_k = next(bias_it).reshape(g_local, 2 *
-                                      inter) if has_w1_bias else None
+        w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
         w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
         # The empty experts drop out of the visit list, so an empty
         # expert's weight slab never streams. How MANY are visited is a
@@ -565,11 +617,7 @@ def fused_ep_moe_v2(x,
         visit, _ = expert_visit_list(expert_rows, g_local)
         # One pass builds every count the kernel needs, still spread over
         # the expert-parallel axis; the kernel's scalar core closes them.
-        counts = shard_count_vector(routing,
-                                    expert_rows,
-                                    me,
-                                    e_total=e_total,
-                                    ep=ep)
+        counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
 
         # The kernel takes four of the seven transport tables and one of the
         # three push tables. The two totals are rows of `counts`, and three
@@ -580,31 +628,43 @@ def fused_ep_moe_v2(x,
         # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
         # fit in 1 MB of SMEM.
         kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
-        arrivals, arrival_scales = kfn(kernel_tables,
-                                       token_gather,
-                                       expert_rows,
-                                       slab_base,
-                                       q_g,
-                                       scale_slab,
-                                       w1_l,
-                                       w2_l,
-                                       w1s_l,
-                                       w2s_l,
-                                       w1b_k,
-                                       w2b_k,
-                                       recv_rows=recv_rows,
-                                       visit=visit,
-                                       counts=counts,
-                                       rank=rank_l)
+        arrivals, arrival_scales = kfn(
+            kernel_tables,
+            token_gather,
+            expert_rows,
+            slab_base,
+            q_g,
+            scale_slab,
+            w1_l,
+            w2_l,
+            w1s_l,
+            w2s_l,
+            w1b_k,
+            w2b_k,
+            recv_rows=recv_rows,
+            visit=visit,
+            counts=counts,
+            rank=rank_l,
+        )
 
         # The destination's own table: one arrival row per selection slot.
-        pos = routing.pos if sharded_plan else lax.dynamic_slice(
-            routing.arrival_row, (me * t_local, 0), (t_local, topk))
-        mirror_pos = routing.mirror_pos if sharded_plan else \
-            lax.dynamic_slice(routing.mirror_row, (me * t_local, 0),
-                              (t_local, topk))
-        combined = _combine_arrivals(arrivals, arrival_scales, pos, mirror_pos,
-                                     topk_weights, x_l.dtype)
+        pos = (
+            routing.pos
+            if sharded_plan
+            else lax.dynamic_slice(
+                routing.arrival_row, (me * t_local, 0), (t_local, topk)
+            )
+        )
+        mirror_pos = (
+            routing.mirror_pos
+            if sharded_plan
+            else lax.dynamic_slice(
+                routing.mirror_row, (me * t_local, 0), (t_local, topk)
+            )
+        )
+        combined = _combine_arrivals(
+            arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
+        )
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they
@@ -626,33 +686,56 @@ def fused_ep_moe_v2(x,
     # expert set, so `P()` hands each shard the whole [e_total] vector.
     # Sharding it would give each shard a 1/ep slice of the experts and
     # silently bias the wrong ones.
-    score_bias_args = (score_bias, ) if has_score_bias else ()
-    in_specs = ((P(ax), ) * (5 + len(scale_args)) +
-                (P(), ) * len(score_bias_args) + (P(ax), ) * len(bias_args))
-    args = ((x, rank, w1, w2) + scale_args + (gating, ) + score_bias_args +
-            bias_args)
+    score_bias_args = (score_bias,) if has_score_bias else ()
+    in_specs = (
+        (P(ax),) * (5 + len(scale_args))
+        + (P(),) * len(score_bias_args)
+        + (P(ax),) * len(bias_args)
+    )
+    args = (x, rank, w1, w2) + scale_args + (gating,) + score_bias_args + bias_args
     NS = jax.sharding.NamedSharding
-    args = tuple(
-        jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
+    args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
     # are the shard_map arguments -- so this key is exact.
-    key = (mesh, T, hidden, e_total, inter, topk, bool(renormalize), capacity,
-           block, ragged_stride,
-           weight_format, rhs_qb, act_fn, mesh_ep_ranks, token_layout,
-           bool(sharded_plan), x.dtype, w1.dtype, w2.dtype, form.has_scales
-           and w1_scale.dtype, gating.dtype, has_w1_bias
-           and w1_bias.dtype, has_w2_bias
-           and w2_bias.dtype, scoring_fn, has_score_bias and score_bias.dtype,
-           float(routed_scaling_factor))
+    key = (
+        mesh,
+        T,
+        hidden,
+        e_total,
+        inter,
+        topk,
+        bool(renormalize),
+        capacity,
+        block,
+        ragged_stride,
+        weight_format,
+        rhs_qb,
+        act_fn,
+        mesh_ep_ranks,
+        token_layout,
+        bool(sharded_plan),
+        x.dtype,
+        w1.dtype,
+        w2.dtype,
+        form.has_scales and w1_scale.dtype,
+        gating.dtype,
+        has_w1_bias and w1_bias.dtype,
+        has_w2_bias and w2_bias.dtype,
+        scoring_fn,
+        has_score_bias and score_bias.dtype,
+        float(routed_scaling_factor),
+    )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
         with _LAYER_SM_CACHE_LOCK:
             sm = _LAYER_SM_CACHE.get(key)
             if sm is None:
-                sm = jax.shard_map(local_fn,
-                                   mesh=mesh,
-                                   in_specs=in_specs,
-                                   out_specs=P(ax),
-                                   check_vma=False)
+                sm = jax.shard_map(
+                    local_fn,
+                    mesh=mesh,
+                    in_specs=in_specs,
+                    out_specs=P(ax),
+                    check_vma=False,
+                )
                 _LAYER_SM_CACHE[key] = sm
     return sm(*args)

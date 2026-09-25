@@ -29,7 +29,9 @@ PACK4 = host.PACK4
 HIDDEN_LANE_BLOCK = host.HIDDEN_LANE_BLOCK
 HIDDEN_MAX_BLOCKS = host.HIDDEN_MAX_BLOCKS
 MIN_GENERATION = host.MIN_GENERATION
-NBUF = host.NBUF
+# The weight-slot ceiling, not a build's slot count: a build reads its own
+# off fit_weight_slots, which walks down from here until its buffers fit.
+MAX_NBUF = host.MAX_NBUF
 ROWBLK = host.ROWBLK
 U32_SUBLANE_TILE = host.U32_SUBLANE_TILE
 WIDEN_KCHUNK = host.WIDEN_KCHUNK
@@ -45,6 +47,7 @@ weight_format_of_dtype = host.weight_format_of_dtype
 routing_block = host.routing_block
 ragged_stride_bound = host.ragged_stride_bound
 vmem_estimate_bytes = host.vmem_estimate_bytes
+fit_weight_slots = host.fit_weight_slots
 vmem_limit = host.vmem_limit
 
 # The declared surface: the entry point, what the kernel takes, and the
@@ -54,6 +57,9 @@ vmem_limit = host.vmem_limit
 # they are the part most likely to change and they are not API: a caller
 # outside this repository binds to the five names below.
 __all__ = [
-    "WEIGHT_FORMS", "WeightFormat", "fused_ep_moe_v2", "vmem_estimate_bytes",
-    "vmem_limit"
+    "WEIGHT_FORMS",
+    "WeightFormat",
+    "fused_ep_moe_v2",
+    "vmem_estimate_bytes",
+    "vmem_limit",
 ]
