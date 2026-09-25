@@ -63,7 +63,7 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
       chunk_prefill_size: int | None = None,
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
-      skip_kv_update: bool = True,
+      skip_kv_update: bool = False,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
       return_lse: bool = False,
@@ -130,7 +130,7 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
       out_dtype: Any = None,
-      skip_kv_update: bool = True,
+      skip_kv_update: bool = False,
       kv_layout: (
           jax_types.KVLayout | str
       ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,

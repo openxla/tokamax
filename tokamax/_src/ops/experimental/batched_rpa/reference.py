@@ -84,7 +84,7 @@ def batched_ragged_paged_attention_reference(
     k_scale: float | None = None,
     v_scale: float | None = None,
     decode_query_size: int = 1,
-    skip_kv_update: bool = True,
+    skip_kv_update: bool = False,
     kv_layout: Any = None,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
@@ -153,16 +153,19 @@ def batched_ragged_paged_attention_reference(
   active_count = distribution[-1]
   valid_token = (token_indices < cu_q_lens[active_count]) & (seq_idx < active_count)
 
-  # Append a dummy page to absorb invalid token writes safely.
-  dummy_page = jnp.zeros(
-      (1, page_size, num_kv_heads_x2, head_dim_aligned), dtype=kv_cache.dtype
-  )
-  padded_cache = jnp.concatenate([kv_cache, dummy_page], axis=0)
+  if not skip_kv_update:
+    # Append a dummy page to absorb invalid token writes safely.
+    dummy_page = jnp.zeros(
+        (1, page_size, num_kv_heads_x2, head_dim_aligned), dtype=kv_cache.dtype
+    )
+    padded_cache = jnp.concatenate([kv_cache, dummy_page], axis=0)
 
-  safe_page_idx = jnp.where(valid_token, page_idx, total_pages)
-  safe_page_offset = jnp.where(valid_token, page_offset, 0)
-  padded_cache = padded_cache.at[safe_page_idx, safe_page_offset].set(merged_kv)
-  updated_kv_cache = padded_cache[:total_pages]
+    safe_page_idx = jnp.where(valid_token, page_idx, total_pages)
+    safe_page_offset = jnp.where(valid_token, page_offset, 0)
+    padded_cache = padded_cache.at[safe_page_idx, safe_page_offset].set(merged_kv)
+    updated_kv_cache = padded_cache[:total_pages]
+  else:
+    updated_kv_cache = kv_cache
 
   # Step 2: Unpage full K and V tensors for each sequence.
   page_table = page_indices.reshape(max_num_seqs, pages_per_seq)

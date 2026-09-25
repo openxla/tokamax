@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 import jax
 import jax.numpy as jnp
 from jax import lax
 
-from tokamax._src.ops.experimental.batched_rpa.kernel import (configs,
-                                                                    utils)
+from tokamax._src.ops.experimental.batched_rpa.kernel import configs, utils
 
 
 def flash_attention_qk_softmax(
@@ -31,6 +29,8 @@ def flash_attention_qk_softmax(
     *,
     custom_mask: jax.Array,
     cfgs: configs.RpaConfigs,
+    bq_start: int,
+    k_scale: jax.Array | float | None = None,  # [B, KV, S]
 ):
     """Flash attention kernel."""
     b, k_heads, tq, h_size = q.shape
@@ -60,13 +60,17 @@ def flash_attention_qk_softmax(
             dimension_numbers=(([2], [2]), ([0], [0])),
             preferred_element_type=jnp.float32,
         )
-    qk = qk.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, s)
+    qk = qk.reshape(b, k_heads, tq, s)
 
     qk *= cfgs.model.sm_scale
-    if cfgs.serve.scale_k is not None:
-        qk *= cfgs.serve.scale_k
     if cfgs.serve.scale_q is not None:
         qk *= cfgs.serve.scale_q
+    if k_scale is not None:
+        qk *= k_scale
+
+    # We convert to the output dtype after scaling, because especially for very
+    # low precision, we want to have 32-bit scale factors and do scaling in fp32.
+    qk = qk.astype(cfgs.serve.dtype_out)
 
     if cfgs.model.soft_cap is not None:
         qk = cfgs.model.soft_cap * jnp.tanh(qk / cfgs.model.soft_cap)
@@ -111,9 +115,20 @@ def flash_attention_pv(
     alpha_list: list[jax.Array],  # B * [KV, TQ, 128]
     o_prev: jax.Array,  # [KV, TQ, H]
     cfgs: configs.RpaConfigs,
+    v_scale: jax.Array | None = None,  # [B, KV, S]
 ):
     """Flash attention kernel."""
     b, k_heads, tq, s = p.shape
+
+    # Because we sum along the sequence dimension in this matmul, we must do the
+    # per-token scaling before the matmul. Therefore, there is separate logic
+    # here for per-token and per-tensor scaling, unlike the qk matmul.
+    if cfgs.serve.per_token_scale:
+        assert v_scale is not None
+        v_sc = v_scale[:, :, jnp.newaxis, :]
+        # We can scale p or v, and because p will be smaller especially for decode
+        # workflows, we scale p to save some time.
+        p = p.astype(v_sc.dtype) * v_sc
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         h_size = v.shape[-2]
@@ -133,7 +148,7 @@ def flash_attention_pv(
         )
     pv = pv.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, h_size)
 
-    if cfgs.serve.scale_v is not None:
+    if not cfgs.serve.per_token_scale and cfgs.serve.scale_v is not None:
         pv *= cfgs.serve.scale_v
 
     o_next_list = []

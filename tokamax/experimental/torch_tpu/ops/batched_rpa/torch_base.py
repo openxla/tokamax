@@ -63,7 +63,7 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
       prefill_block_sizes: jax_types.BlockSizes | None = None,
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
-      skip_kv_update: bool = True,
+      skip_kv_update: bool = False,
       kv_layout: (
           jax_types.KVLayout | str
       ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,
@@ -139,7 +139,7 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
       chunk_prefill_size: int | None = None,
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
-      skip_kv_update: bool = True,
+      skip_kv_update: bool = False,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
       return_lse: bool = False,

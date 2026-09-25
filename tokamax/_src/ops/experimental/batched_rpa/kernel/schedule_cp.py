@@ -21,8 +21,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from tokamax._src.ops.experimental.batched_rpa.kernel import (configs,
-                                                                    schedule)
+from tokamax._src.ops.experimental.batched_rpa.kernel import configs, schedule
 
 
 @jax.tree_util.register_dataclass
@@ -61,14 +60,15 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
     """Context Parallel (CP) metadata scheduler: overrides only k_loop and schema."""
 
     @classmethod
-    def get_rpa_schedule(cls,
-                         cfgs: configs.RpaConfigs,
-                         multiplier: int = 1) -> schedule.RpaSchedule:
+    def get_rpa_schedule(
+        cls, cfgs: configs.RpaConfigs, multiplier: int = 1
+    ) -> schedule.RpaSchedule:
         """Returns the RpaSchedule shape/dtype struct with CP-specific DMA struct."""
-        dma_kv_new_struct_cls = (HeadAlongSublaneDmaNewCP
-                                 if cfgs.serve.kv_layout
-                                 == configs.KVLayout.HEAD_ALONG_SUBLANE else
-                                 schedule.SeqAlongLaneDmaNew)
+        dma_kv_new_struct_cls = (
+            HeadAlongSublaneDmaNewCP
+            if cfgs.serve.kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
+            else schedule.SeqAlongLaneDmaNew
+        )
         return schedule.RpaSchedule.create_shape_dtype(
             cfgs,
             dma_kv_new_struct_cls=dma_kv_new_struct_cls,
@@ -76,14 +76,14 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         )
 
     def __init__(
-            self,
-            schedule: schedule.RpaSchedule,
-            schedule_hbm_ref: schedule.RpaSchedule,
-            dma_sem: jax.Ref,
-            *,
-            cfgs: configs.RpaConfigs,
-            extra_refs: Sequence[jax.Ref] = (),
-            **kwargs,
+        self,
+        schedule: schedule.RpaSchedule,
+        schedule_hbm_ref: schedule.RpaSchedule,
+        dma_sem: jax.Ref,
+        *,
+        cfgs: configs.RpaConfigs,
+        extra_refs: Sequence[jax.Ref] = (),
+        **kwargs,
     ):
         super().__init__(
             schedule=schedule,
@@ -151,15 +151,13 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                     )
                     sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm_cp
                 else:  # CACHE_ONLY
-                    src_hbm = jnp.minimum(p_offset + i,
-                                          cfgs.serve.num_page_indices - 1)
+                    src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
                     dma_valid = jnp.where(dma_sz > 0, 1, 0)
                     sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
                 sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
                 sched.dma_kv_cache[step, target_lane, i, 2] = dma_valid
             else:
-                src_hbm = jnp.minimum(p_offset + i,
-                                      cfgs.serve.num_page_indices - 1)
+                src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
                 sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
                 sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
                 if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
@@ -188,8 +186,9 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                     0,
                 )
                 fetch_val = jnp.where(i < num_pages_to_fetch, 1, 0)
-                new_page_start = (hbm_token_idx_base -
-                                  new_tok_offset) + i * cfgs.serve.page_size
+                new_page_start = (
+                    hbm_token_idx_base - new_tok_offset
+                ) + i * cfgs.serve.page_size
                 fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
                 p_idx = jnp.minimum(
                     (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
@@ -198,7 +197,8 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 local_slot = p_idx // cp_group_size
                 dst_hbm = s_idx * cfgs.serve.pages_per_seq + local_slot
                 wb_val = jnp.where(
-                    (dma_sz > 0) & (p_idx % cp_group_size == self.rank), 1, 0)
+                    (dma_sz > 0) & (p_idx % cp_group_size == self.rank), 1, 0
+                )
                 dma_entry.fetch_hbm[...] = new_page_start
                 dma_entry.fetch_vmem[...] = fetch_vmem
                 dma_entry.wb_hbm[...] = dst_hbm
@@ -212,10 +212,13 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 )
                 p_off = tok_idx & cfgs.serve.page_size_mask
                 local_slot = p_idx // cp_group_size
-                dst_hbm = ((s_idx * cfgs.serve.pages_per_seq + local_slot) <<
-                           cfgs.serve.page_size_log2) | p_off
-                wb_val = jnp.where(p_idx % cp_group_size == self.rank, dma_sz,
-                                   jnp.int32(0))
+                dst_hbm = (
+                    (s_idx * cfgs.serve.pages_per_seq + local_slot)
+                    << cfgs.serve.page_size_log2
+                ) | p_off
+                wb_val = jnp.where(
+                    p_idx % cp_group_size == self.rank, dma_sz, jnp.int32(0)
+                )
                 dma_entry.fetch_hbm[...] = src_hbm
                 dma_entry.fetch_vmem[...] = dst_vmem
                 dma_entry.wb_hbm[...] = dst_hbm
@@ -226,8 +229,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
             curr_vmem = bkv_sz_cache
             curr_rem = new_sz
             for i in range(cfgs.bkv_p_new):
-                slot_start = (curr_vmem //
-                              cfgs.serve.page_size) * cfgs.serve.page_size
+                slot_start = (curr_vmem // cfgs.serve.page_size) * cfgs.serve.page_size
                 slot_end = slot_start + cfgs.serve.page_size
                 dma_sz = jnp.minimum(curr_rem, slot_end - curr_vmem)
                 dma_sz = jnp.where(curr_rem > 0, dma_sz, 0)
