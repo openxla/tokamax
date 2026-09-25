@@ -330,42 +330,66 @@ def rpa_kernel(
     attention_sink_hbm: jax.Array | None,
     *,
     cfgs: configs.RpaConfigs,
+    smem_prefetch: schedule.SmemPrefetch,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
-  """Launches the Batched RPA attention Pallas kernel over `schedule_hbm`."""
+  """Launches the Batched RPA attention Pallas kernel over `schedule_hbm`.
+
+  Args:
+    schedule_hbm: Output of `scheduler.generate_rpa_metadata`.
+    q_hbm: Packed queries, aliased to the output.
+    new_kv_hbm: Packed new KV tokens.
+    kv_cache_hbm: Paged KV cache, aliased to the output.
+    lse_hbm: Log-sum-exp buffer aliased to the output, or `None`.
+    attention_sink_hbm: Per q head sink logits, or `None`.
+    cfgs: Configuration of the kernel.
+    smem_prefetch: Outputs of `schedule.smem_prefetch_start(schedule_hbm)`. Its
+      DMAs are started before this kernel and waited on inside it. The schedule
+      chunk buffers hold the first schedule chunk on entry and are the kernel's
+      only SMEM schedule buffers: later chunks are DMA'd into them in place.
+
+  Returns:
+    `(o_hbm, kv_cache_hbm, lse_hbm)`; `lse_hbm` is `None` unless
+    `cfgs.serve.return_lse`.
+  """
   return_lse = cfgs.serve.return_lse
 
   def ragged_paged_attention_pipeline(
+      # Scalar prefetch.
+      schedule_smem_ref: schedule.RpaSchedule,
+      # Inputs.
       schedule_hbm_ref: schedule.RpaSchedule,
       q_hbm_ref: jax.Ref,
       new_kv_hbm_ref: jax.Ref,
       kv_cache_hbm_ref: jax.Ref,
       lse_hbm_ref: jax.Ref | None,
       attention_sink_ref: jax.Ref | None,
+      prefetch_sem: jax.Ref,
+      # Outputs.
       o_hbm_ref: jax.Ref,
       o_kv_cache_hbm_ref: jax.Ref,
-      o_lse_hbm_ref: jax.Ref | None = None,
+      o_lse_hbm_ref: jax.Ref | None,
+      o_schedule_smem_ref: schedule.RpaSchedule,
   ):
-    del o_kv_cache_hbm_ref, o_lse_hbm_ref
+    # The aliased outputs are the same buffers as their inputs.
+    del o_kv_cache_hbm_ref, o_lse_hbm_ref, o_schedule_smem_ref
 
     q_alloc, kv_cache_alloc, o_alloc, lse_alloc = memory_ref.create_allocs(
         kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
     )
 
     max_steps_ub = schedule.RpaSchedule.max_steps_ub(cfgs)
-    actual_steps = schedule_hbm_ref.actual_steps[0]
-    num_safe_step_iterations = pl.cdiv(actual_steps, max_steps_ub)
+    assert max_steps_ub % schedule.RpaSchedule.DMA_STEP_ALIGN == 0
+    # Set by `smem_prefetch_start` with a scalar store, so it is valid before
+    # the prefetch DMAs are waited on.
+    actual_steps = schedule_smem_ref.actual_steps[0]
 
     @pl.with_scoped(
         final_allocs=(q_alloc, kv_cache_alloc, o_alloc, lse_alloc),
-        schedule_ref=schedule.RpaSchedule.create_shape_dtype(
-            cfgs
-        ).scratch_shapes(),
         dma_sem=pltpu.SemaphoreType.DMA((1,)),
         scratches=vmem_ldst.SoftmaxScratch.scratch_shapes(cfgs),
     )
-    def _run(final_allocs, schedule_ref, dma_sem, scratches):
+    def _run(final_allocs, dma_sem, scratches):
       q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
-      schedule_ref.actual_steps[0] = actual_steps
       vmem_ldst.SoftmaxScratch.init(
           scratches[0],
           scratches[1],
@@ -377,10 +401,7 @@ def rpa_kernel(
           q_alloc, kv_cache_alloc, num_lanes=cfgs.layout.num_lanes
       )
 
-      def execute_schedule_chunk(start_step, num_steps):
-        total_steps = schedule_ref.read_chunk_from_hbm(
-            schedule_hbm_ref, start_step, num_steps, dma_sem
-        )
+      def run_schedule_pipeline(schedule_ref, total_steps):
         kv_bound = kv_cache_alloc.bind(
             src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
             dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
@@ -428,34 +449,77 @@ def rpa_kernel(
             lse_bref=lse_bound,
         )
 
-      @pl.loop(0, num_safe_step_iterations)
-      def loop_body(step_idx):
-        start = step_idx * max_steps_ub
-        rem = actual_steps % max_steps_ub
-        last_step_size = jnp.where(rem == 0, max_steps_ub, rem)
-        is_last_step = step_idx == num_safe_step_iterations - 1
-        size = jnp.where(is_last_step, last_step_size, max_steps_ub)
-        execute_schedule_chunk(start, size)
+      # Wait for the DMAs issued by `smem_prefetch_start` before this kernel
+      # started, so by now they should have landed.
+      @pl.when(actual_steps > 0)
+      def _():
+        for copy in schedule.smem_prefetch_copies(
+            schedule_hbm_ref,
+            schedule_smem_ref,
+            prefetch_sem,
+            actual_steps=actual_steps,
+        ):
+          copy.wait()
+
+      @pl.loop(0, pl.cdiv(actual_steps, max_steps_ub))
+      def _(chunk_idx):
+        start = chunk_idx * max_steps_ub
+        size = jnp.minimum(max_steps_ub, actual_steps - start)
+
+        # Chunk 0 was prefetched into `schedule_smem_ref` by
+        # `smem_prefetch_start`; later chunks are DMA'd into it in place.
+        @pl.when(chunk_idx > 0)
+        def _():
+          schedule_smem_ref.read_chunk_from_hbm(
+              schedule_hbm_ref, start, size, dma_sem
+          )
+
+        run_schedule_pipeline(schedule_smem_ref, size)
 
     _run()
 
-  out_shape = [q_hbm, kv_cache_hbm, lse_hbm if return_lse else None]
+  # The SMEM schedule filled by `smem_prefetch_start` is a scalar prefetch
+  # operand, used in place with no copy at kernel entry. It is aliased
+  # input -> output because the kernel DMAs later schedule chunks into it.
+  schedule_smem = smem_prefetch.schedule
+  schedule_smem_out_shape = schedule.RpaSchedule.create_shape_dtype(
+      cfgs
+  ).scratch_shapes()
+  out_shape = [
+      q_hbm,
+      kv_cache_hbm,
+      lse_hbm if return_lse else None,
+      schedule_smem_out_shape,
+  ]
 
   schedule_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
+  schedule_smem_leaves = len(jax.tree_util.tree_leaves(schedule_smem))
+  assert schedule_smem_leaves == schedule_leaves
+  # Flat input order: SMEM schedule, HBM schedule, q, new_kv, kv_cache, lse.
+  q_idx = schedule_smem_leaves + schedule_leaves
   input_output_aliases = {
-      schedule_leaves: 0,
-      schedule_leaves + 2: 1,
+      q_idx: 0,
+      q_idx + 2: 1,
   }
   if return_lse:
-    input_output_aliases[schedule_leaves + 3] = 2
+    input_output_aliases[q_idx + 3] = 2
+  # The SMEM schedule outputs follow the HBM outputs.
+  num_hbm_outs = 3 if return_lse else 2
+  for j in range(schedule_smem_leaves):
+    input_output_aliases[j] = num_hbm_outs + j
 
-  return pl.pallas_call(
+  o_out, kv_out, lse_out, _ = pl.pallas_call(
       ragged_paged_attention_pipeline,
       out_shape=out_shape,
       grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=0,
+          num_scalar_prefetch=1,
           in_specs=[
-              schedule_hbm.in_specs(),
+              # `actual_steps` is read from the SMEM schedule instead, so keep
+              # it in HBM to avoid an SMEM copy at kernel entry.
+              dataclasses.replace(
+                  schedule_hbm.in_specs(),
+                  actual_steps=pl.BlockSpec(memory_space=pltpu.HBM),
+              ),
               pl.BlockSpec(memory_space=pltpu.HBM),
               pl.BlockSpec(memory_space=pltpu.HBM),
               pl.BlockSpec(memory_space=pltpu.HBM),
@@ -463,11 +527,16 @@ def rpa_kernel(
               pl.BlockSpec(memory_space=pltpu.VMEM)
               if attention_sink_hbm is not None
               else None,
+              pl.BlockSpec(memory_space=pltpu.SEMAPHORE),  # prefetch_sem
           ],
           out_specs=[
               pl.BlockSpec(memory_space=pltpu.HBM),
               pl.BlockSpec(memory_space=pltpu.HBM),
               pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
+              jax.tree.map(
+                  lambda _: pl.BlockSpec(memory_space=pltpu.SMEM),
+                  schedule_smem_out_shape,
+              ),
           ],
       ),
       compiler_params=pltpu.CompilerParams(
@@ -481,6 +550,7 @@ def rpa_kernel(
       name=get_kernel_name(cfgs),
       metadata=typing.cast(typing.Any, get_kernel_metadata(cfgs)),
   )(
+      schedule_smem,
       schedule_hbm,
       q_hbm,
       new_kv_hbm,
@@ -489,4 +559,6 @@ def rpa_kernel(
       None
       if attention_sink_hbm is None
       else attention_sink_hbm.astype(cfgs.layout.softmax_dtype),
+      smem_prefetch.sem,
   )
+  return o_out, kv_out, lse_out

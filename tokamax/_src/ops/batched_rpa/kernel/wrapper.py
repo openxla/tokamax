@@ -21,6 +21,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.batched_rpa.kernel import configs
 from tokamax._src.ops.batched_rpa.kernel import kernel
+from tokamax._src.ops.batched_rpa.kernel import schedule
 from tokamax._src.ops.batched_rpa.kernel import scheduler as scheduler_lib
 from tokamax._src.ops.batched_rpa.kernel import tuning
 from tokamax._src.ops.batched_rpa.kernel import utils
@@ -315,6 +316,16 @@ def ragged_paged_attention(
         scheduler=scheduler,
         extra_scalars=extra_scalars,
     )
+    # Prefetch the first schedule chunk into SMEM before the RPA kernel starts.
+    # Multi-element sources are pinned to HBM so XLA keeps them alive until the
+    # RPA kernel waits on these DMAs.
+    schedule_hbm = jax.tree.map(
+        lambda x: pltpu.with_memory_space_constraint(x, memory_space=pltpu.HBM)
+        if x.size > 1
+        else x,
+        schedule_hbm,
+    )
+    smem_prefetch = schedule.smem_prefetch_start(schedule_hbm, cfgs=cfgs)
     result = kernel.rpa_kernel(
         schedule_hbm,
         o_hbm_alias_q_hbm,
@@ -323,6 +334,7 @@ def ragged_paged_attention(
         lse_hbm_in,
         attention_sink_hbm,
         cfgs=cfgs,
+        smem_prefetch=smem_prefetch,
     )
     if return_lse:
       o_out, kv_out, lse_out = result
