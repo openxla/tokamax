@@ -22,6 +22,18 @@ from tokamax._src import config as config_lib
 NUM_REGISTERS_PER_SM: Final[int] = 64 * 1024  # P100, V100, A100, H100, B200
 CACHE_LINE_SIZE_BYTES: Final[int] = 128
 
+# Maximum opt-in shared memory per block, keyed by SM version.
+SMEM_CAPACITY_BYTES: Final[dict[str, int]] = {
+    'sm_80': (164 - 1) * 1024,
+    'sm_86': (100 - 1) * 1024,
+    'sm_89': (100 - 1) * 1024,
+    'sm_90': (228 - 1) * 1024,
+    'sm_100': (228 - 1) * 1024,
+    'sm_103': (228 - 1) * 1024,
+    'sm_120': (100 - 1) * 1024,
+    'sm_121': (100 - 1) * 1024,
+}
+
 
 def _compute_capability(device: jax.Device | None = None) -> float | None:
   """Returns the compute capability of the device."""
@@ -43,6 +55,13 @@ def _cc_between(
   if (cc := _compute_capability(device)) is None:
     return False
   return cc >= lower and cc < upper
+
+
+def smem_capacity(device: jax.Device | None = None) -> int | None:
+  """Returns the per-block shared memory limit, or `None` if unknown."""
+  if (cc := _compute_capability(device)) is None:
+    return None
+  return SMEM_CAPACITY_BYTES.get(f'sm_{round(cc * 10)}')
 
 
 def is_sm80(device: jax.Device | None = None) -> bool:
