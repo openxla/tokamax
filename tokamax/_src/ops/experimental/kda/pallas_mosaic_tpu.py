@@ -52,8 +52,11 @@ class Config:
   """Autotuning and execution configuration for Mosaic TPU KDA.
 
   `safe_gate=None` selects the exponent-stabilization strategy from the gate
-  activation mode. `rematerialize_for_backward=True` omits chunk hidden states
-  from forward residuals and manually rebuilds them in the custom backward.
+  activation mode. Fused gate activation requires a lower bound and
+  `safe_gate=True`; pre-activated gates retain the existing caller-provided
+  log-space path without an inferred numerical bound.
+  `rematerialize_for_backward=True` omits chunk hidden states from forward
+  residuals and manually rebuilds them in the custom backward.
   """
 
   chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
@@ -71,6 +74,22 @@ def _resolve_safe_gate(
   if config.safe_gate is not None:
     return config.safe_gate
   return not use_gate_in_kernel or lower_bound is not None
+
+
+def _check_gate_support(
+    *,
+    use_gate_in_kernel: bool,
+    lower_bound: float | None,
+    safe_gate: bool,
+) -> None:
+  """Checks the numerically bounded fused gate configuration."""
+  if not use_gate_in_kernel:
+    # The caller supplies log-space gates; lower_bound does not constrain them.
+    return
+  if lower_bound is None:
+    raise NotImplementedError("`mosaic` requires `lower_bound` to be set.")
+  if not safe_gate:
+    raise NotImplementedError("`mosaic` requires `safe_gate=True`.")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -378,6 +397,11 @@ class PallasMosaicTpuKimiDeltaAttention(
         use_gate_in_kernel=use_gate_in_kernel,
         lower_bound=lower_bound,
     )
+    _check_gate_support(
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        safe_gate=safe_gate,
+    )
     save_intermediates_for_backward = not config.rematerialize_for_backward
 
     # Reject unsupported calls before preprocessing or tracing a Pallas kernel,
@@ -490,6 +514,16 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     # in `residuals`. Reusing these arguments would skip that preprocessing.
     del out, query, key, value, gate, beta, output_final_state, return_residuals
     chunk_size = config.chunk_size
+    safe_gate = _resolve_safe_gate(
+        config,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+    )
+    _check_gate_support(
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        safe_gate=safe_gate,
+    )
     # The forward residual set records the selected policy: a retained hidden
     # state means backward can use the saved-state path; otherwise it must
     # rematerialize the forward state recurrence.
