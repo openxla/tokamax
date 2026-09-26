@@ -96,6 +96,20 @@ _LOCAL_ATTENTION_CASES = (
         q_loc=[0, 256, 384, 512],
         distribution=[0, 3, 3],
     ),
+    dict(
+        testcase_name="long_context",
+        max_reqs=2,
+        lengths=[65536, 65536],
+        q_loc=[0, 65536, 131072],
+        distribution=[0, 2, 2],
+    ),
+    dict(
+        testcase_name="long_context_ragged",
+        max_reqs=2,
+        lengths=[1, 131071],
+        q_loc=[0, 1, 131072],
+        distribution=[0, 2, 2],
+    ),
 )
 
 
