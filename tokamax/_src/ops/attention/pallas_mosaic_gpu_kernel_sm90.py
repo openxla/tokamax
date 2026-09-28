@@ -58,7 +58,7 @@ class Config(common.ConfigBase):
 
 def _pad_qkv(q, k, v):
   # The sequence dimensions must be a multiple of 8.
-  k, v = map(lambda x: shape_lib.pad_to_next_multiple_of(x, 8, 0), (k, v))
+  q, k, v = map(lambda x: shape_lib.pad_to_next_multiple_of(x, 8, 0), (q, k, v))
   q, k, v = map(common.pad_head_dim_to_next_multiple_of_min_swizzle, (q, k, v))
   return q, k, v
 
@@ -213,7 +213,7 @@ def flash_attention_kernel(
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Flash attention with Mosaic GPU."""
 
-  _, num_q_heads, _ = q.shape
+  orig_q_seq_len, num_q_heads, _ = q.shape
   _, num_kv_heads, orig_head_dim_out = v.shape
 
   if num_q_heads % num_kv_heads:
@@ -229,7 +229,12 @@ def flash_attention_kernel(
   num_stages = config.num_stages
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
 
+  if bias is not None and bias.shape[-2] != 1:
+    bias = shape_lib.pad_to_next_multiple_of(bias, 8, -2)
+
   if mask is not None:
+    if mask.shape[-2] != 1:
+      mask = shape_lib.pad_to_next_multiple_of(mask, 8, -2)
     mask = mask.astype(jnp.int8)
 
   as_2d = lambda x: None if x is None else jax.lax.broadcast_to_rank(x, 2)
@@ -611,7 +616,10 @@ def flash_attention_kernel(
   elif k_start.shape[-1] == 1:
     k_start_minmax = (k_start, k_start)
   else:
-    k_start_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_start)
+    k_start_ = shape_lib.pad_to_next_multiple_of(
+        k_start, 2 * block_q, -1, kv_seq_len
+    )
+    k_start_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_start_)
     k_start_minmax = (jnp.min(k_start_, -1), jnp.max(k_start_, -1))
 
   if k_end is None:
@@ -619,7 +627,8 @@ def flash_attention_kernel(
   elif k_end.shape[-1] == 1:
     k_end_minmax = (k_end, k_end)
   else:
-    k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end)
+    k_end_ = shape_lib.pad_to_next_multiple_of(k_end, 2 * block_q, -1, 0)
+    k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end_)
     k_end_minmax = (jnp.min(k_end_, -1), jnp.max(k_end_, -1))
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
@@ -652,5 +661,6 @@ def flash_attention_kernel(
       kernel_name="flash_attention_sm90",
   )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
 
-  residuals = tuple(res[..., :q_seq_len] for res in residuals)
+  out = out[:orig_q_seq_len, ...]
+  residuals = tuple(res[..., :orig_q_seq_len] for res in residuals)
   return (out[..., :orig_head_dim_out], residuals if residuals else None)

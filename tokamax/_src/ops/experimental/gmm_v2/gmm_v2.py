@@ -614,6 +614,13 @@ def inner_kernel(
       if should_use_external_scale:
         lhs_scale = tiled_lhs_ref.get_scale().astype(acc_ref.dtype)
         lhs_scale_inv = 1.0 / lhs_scale
+      # With a k-invariant lhs scale, sub-block results accumulate directly
+      # into acc_n and the scale is applied once after the k loop.
+      ext_lhs_scale_const_k = (
+          should_use_external_scale
+          and lhs_scale is not None
+          and lhs_scale.shape[-1] == 1
+      )
 
       # Without n outer loop, result of quantized matmul becomes available only
       # at the last iteration of the loop. This means [tile_m, tile_n] value
@@ -666,8 +673,8 @@ def inner_kernel(
 
           block_len = end_k - start_k
           # Initialize to None rather than jnp.zeros to avoid emitting an extra
-          # VPU add instruction on the first sub-block in Pallas/Mosaic lowering.
-          block_acc = None
+          # VPU add instruction on the first sub-block in Pallas/Mosaic lowering
+          block_acc = acc_n if ext_lhs_scale_const_k else None
           for sub_k in range(0, block_len, step_k):  # pyrefly: ignore[bad-argument-type]
             sub_end_k = min(block_len, sub_k + step_k)  # pyrefly: ignore[unsupported-operation]
             sub_acc = jnp.matmul(
@@ -692,8 +699,14 @@ def inner_kernel(
             block_acc = sub_acc if block_acc is None else block_acc + sub_acc
 
           assert block_acc is not None
-          block_acc *= block_scale.astype(acc_ref.dtype)
-          acc_n += block_acc
+          if ext_lhs_scale_const_k:
+            acc_n = block_acc
+          else:
+            block_acc *= block_scale.astype(acc_ref.dtype)
+            acc_n += block_acc
+        if ext_lhs_scale_const_k:
+          assert lhs_scale is not None
+          acc_n *= lhs_scale
         acc_list.append(acc_n)
 
     acc = jnp.concatenate(acc_list, axis=1)

@@ -19,6 +19,7 @@ from typing import Any, ClassVar, TypeVar
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.batched_rpa import reference
@@ -30,7 +31,7 @@ from typing_extensions import override
 
 _Config = TypeVar("_Config")
 
-AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray | np.ndarray
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,7 +70,7 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       debug_mode: bool = False,
       out_dtype: Any = None,
       use_causal_mask: bool = True,
-      skip_kv_update: bool = True,
+      skip_kv_update: bool = False,
       kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
@@ -148,7 +149,7 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       debug_mode: bool = False,
       out_dtype: Any = None,
       use_causal_mask: bool = True,
-      skip_kv_update: bool = True,
+      skip_kv_update: bool = False,
       kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,

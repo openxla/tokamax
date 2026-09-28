@@ -28,6 +28,8 @@ from tokamax._src.ops.ragged_dot import arg_specs
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu as pl_mgpu
 from tokamax._src.ops.ragged_dot import pallas_triton
+from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot
+
 ARG_SPECS = arg_specs.ARG_SPECS
 
 
@@ -57,7 +59,8 @@ def _flops(lhs, rhs, *, group_sizes) -> int:
 
 
 _IMPLS = dict(
-    triton=pallas_triton.PallasTritonRaggedDot(),
+    pallas_triton=pallas_triton.PallasTritonRaggedDot(),
+    triton=triton_ragged_dot.TritonRaggedDot(),
     mosaic=pl_mgpu.PallasMosaicGpuRaggedDot(),
     xla=base.RaggedDot(),
     xla_only_group0=_xla_only_group0,

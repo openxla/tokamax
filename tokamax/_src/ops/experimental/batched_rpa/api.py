@@ -64,7 +64,7 @@ def batched_ragged_paged_attention(
     debug_mode: bool = False,
     out_dtype: Any = None,
     use_causal_mask: bool = True,
-    skip_kv_update: bool = True,
+    skip_kv_update: bool = False,
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     decode_query_size: int = 1,
     cp_group_size: int | None = None,
