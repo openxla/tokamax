@@ -31,6 +31,7 @@ import numpy as np
 from tokamax._src.autotuning import arg_spec
 
 ShapeDtype = jax.ShapeDtypeStruct
+ArgSpec = arg_spec.ArgSpec
 
 
 class _HashableNPArray(np.ndarray):
