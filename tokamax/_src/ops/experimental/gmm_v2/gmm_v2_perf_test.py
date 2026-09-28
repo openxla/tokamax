@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import time
+
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -246,6 +248,65 @@ class GmmPerfTest(parameterized.TestCase):
     res = benchmarking.benchmark(fn, args, method="hermetic_xprof")
     logging.info("Benchmark time (ms): %s", res.median_evaluation_time_ms)
     self.assertLessEqual(res.median_evaluation_time_ms, threshold)
+
+
+class GmmCompilePerfTest(parameterized.TestCase):
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    super().setUp()
+
+  def test_tgmm_trace_and_lowering_time_independent_of_num_groups(self):
+    # Compares against a baseline with fewer groups, rather than an absolute
+    # threshold, so the test doesn't depend on machine speed.
+    tpu_gen = pltpu.get_tpu_info().generation
+    if tpu_gen < 7:
+      self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
+    m, k, n = 262144, 7168, 1024
+    lhs = jax.ShapeDtypeStruct((m, k), jnp.float8_e4m3fn)
+    grad_q = jax.ShapeDtypeStruct((m, n), jnp.float8_e5m2)
+    grad_scale = jax.ShapeDtypeStruct((1, 1, n), jnp.float32)
+
+    def measure(num_groups):
+      group_sizes = jax.ShapeDtypeStruct((num_groups,), jnp.int32)
+      trace_times, lowering_times = [], []
+      for _ in range(3):
+        jax.clear_caches()
+        start = time.perf_counter()
+        traced = tgmm_backend.tgmm_v2.trace(
+            lhs,
+            grad_q,
+            group_sizes,
+            num_groups,
+            rhs_scale=grad_scale,
+            preferred_element_type=jnp.bfloat16,
+        )
+        trace_times.append(time.perf_counter() - start)
+
+        start = time.perf_counter()
+        traced.lower()
+        lowering_times.append(time.perf_counter() - start)
+      return min(trace_times), min(lowering_times)
+
+    num_groups = 16
+    trace_time, lowering_time = measure(num_groups)
+    trace_time_3x, lowering_time_3x = measure(3 * num_groups)
+    logging.info(
+        "num_groups=%d: trace %.3fs, lowering %.3fs; num_groups=%d: trace"
+        " %.3fs, lowering %.3fs",
+        num_groups,
+        trace_time,
+        lowering_time,
+        3 * num_groups,
+        trace_time_3x,
+        lowering_time_3x,
+    )
+    # If the kernel is unrolled over the groups, the trace/lower time grows
+    # linearly with `num_groups`.
+    max_ratio = 1.5
+    self.assertLess(trace_time_3x / trace_time, max_ratio)
+    self.assertLess(lowering_time_3x / lowering_time, max_ratio)
 
 
 if __name__ == "__main__":

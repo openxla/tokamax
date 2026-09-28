@@ -543,15 +543,15 @@ def zero_out_start(
         ).start(priority=1)
     return 1
 
-  num_groups_to_zero = 0
   group_offset = group_offset_ref[0]
-  for local_group_id in range(num_actual_groups):
+
+  def body(local_group_id, num_groups_to_zero):
     global_group_id = local_group_id + group_offset
     should_copy = lhs_group_sizes_ref[global_group_id] == 0
-    num_groups_to_zero += should_copy.astype(int)
     fill_zero(local_group_id, should_copy)
+    return num_groups_to_zero + should_copy.astype(jnp.int32)
 
-  return num_groups_to_zero
+  return lax.fori_loop(0, num_actual_groups, body, jnp.int32(0))
 
 
 def zero_out_end(
