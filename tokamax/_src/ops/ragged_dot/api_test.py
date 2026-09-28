@@ -65,6 +65,9 @@ class RaggedDotTest(parameterized.TestCase):
     if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
 
+    if implementation == "triton" and activation is not None and gpu_utils.is_sm90():
+      self.skipTest("Triton ragged_dot with activation VJP crashes on SM90.")
+
     # Current default backend if implementation is None is "mosaic".
     if implementation == "mosaic" or implementation is None:
       if (
@@ -347,6 +350,19 @@ class RaggedDotXlaTest(RaggedDotImplementationTest):
 
   def __init__(self, *args):
     super().__init__(*args, implementation="xla")
+
+  def _test_quantized(self, *args, **kwargs):
+    if jax.default_backend() == "gpu":
+      self.skipTest("Quantized ragged_dot not supported on GPU for XLA.")
+    super()._test_quantized(*args, **kwargs)
+
+  def _test_bench(self, spec):
+    if jax.default_backend() == "gpu" and (
+        isinstance(spec.get("lhs"), qwix.QArray)
+        or isinstance(spec.get("rhs"), qwix.QArray)
+    ):
+      self.skipTest("Quantized ragged_dot not supported on GPU for XLA.")
+    super()._test_bench(spec)
 
 
 if __name__ == "__main__":
