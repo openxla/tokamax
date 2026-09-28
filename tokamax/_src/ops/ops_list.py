@@ -814,4 +814,29 @@ OPS: tuple[Op, ...] = (
             ),
         ),
     ),
+    Op(
+        name="fused_qkv_proj",
+        apis=(),
+        impls=(
+            Impl(
+                name="gqa",
+                backend=MOSAIC_TPU,
+                module=(
+                    "_src/ops/experimental/fused_qkv_proj/kernel/gqa/kernel.py"
+                ),
+            ),
+            Impl(
+                name="gdn",
+                backend=MOSAIC_TPU,
+                module=(
+                    "_src/ops/experimental/fused_qkv_proj/kernel/gdn/kernel.py"
+                ),
+            ),
+            Impl(
+                name="out_proj",
+                backend=MOSAIC_TPU,
+                module="_src/ops/experimental/fused_qkv_proj/kernel/out_proj/kernel.py",
+            ),
+        ),
+    ),
 )
