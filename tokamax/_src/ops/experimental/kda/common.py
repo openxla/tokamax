@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""KDA helpers shared by the Pallas TPU forward and backward paths."""
+"""KDA helpers shared by the XLA and Pallas forward/backward paths."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda.utils import (
@@ -958,6 +958,7 @@ def kda_gate_chunk_cumsum(
   delta_time_bias: Float[Array, "H*K"] | None = None,
   output_dtype: jax.typing.DTypeLike = jnp.float32,
   lower_bound: float | None = None,
+  valid_mask: Bool[Array, "B T"] | None = None,
 ) -> Float[Array, "H B T K"]:
   """Applies the KDA gate activation and its chunk-local cumulative sum."""
   H, B, T, K = g.shape
@@ -972,6 +973,9 @@ def kda_gate_chunk_cumsum(
     g_act = -jnp.exp(A).reshape(H, 1, 1, 1) * jax.nn.softplus(g_f32)
   else:
     g_act = lower_bound * jax.nn.sigmoid(jnp.exp(A).reshape(H, 1, 1, 1) * g_f32)
+
+  if valid_mask is not None:
+    g_act = jnp.where(valid_mask[None, :, :, None], g_act, 0)
 
   return chunk_local_cumsum_vector(
     g_act,
