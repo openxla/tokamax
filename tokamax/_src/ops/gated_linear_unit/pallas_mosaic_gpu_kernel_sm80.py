@@ -129,6 +129,8 @@ def gated_linear_unit(
     config: common.Config,
 ) -> Float[Array, "*B M N"]:
   """Gated Linear Unit implementation for SM80."""
+  if jax.__version_info__ < (0, 11, 0):
+    raise NotImplementedError("SM80 Mosaic GPU GLU requires JAX >= 0.11.0.")
   if x.dtype != weights.dtype:
     raise ValueError(
         f"Matmul operands have incompatible dtypes {x.dtype} vs {weights.dtype}"

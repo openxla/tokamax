@@ -86,6 +86,10 @@ def ragged_dot_kernel(
     activation: base.ActivationFunction | None = None,
 ) -> jax.Array:
   """Ragged dot for SM80."""
+  if jax.__version_info__ < (0, 11, 0):
+    raise NotImplementedError(
+        "SM80 Mosaic GPU ragged dot requires JAX >= 0.11.0."
+    )
   common.check_bf16xbf16_or_f16xf16(lhs, rhs)
 
   if config.split_k != 1:

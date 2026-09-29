@@ -144,7 +144,7 @@ EXCLUDED_TESTS = ()
 # installs; every version in `older_jaxs()` gets a compat rerun
 # on each of `COMPAT_RUNNERS`, so that a downstream still on
 # the older release is not broken by a change that only works on the newer one.
-JAX_VERSIONS = ('0.11.2', '0.11.1', '0.11.0')
+JAX_VERSIONS = ('0.11.2', '0.11.1', '0.11.0', '0.10.2')
 
 # TODO: Enable the backward compatibility test for GPU kernels by
 # adding 'linux-x86-a3-8g-h100-1gpu' to COMPAT_RUNNERS.
@@ -1100,7 +1100,7 @@ def check_consistency(
     if runner not in RUNNERS:
       errors.append(f'COMPAT_RUNNERS {runner!r} is not in RUNNERS.')
 
-  if len(JAX_VERSIONS) != 3:
+  if len(JAX_VERSIONS) < 3:
     errors.append(
         f'JAX_VERSIONS is {JAX_VERSIONS}: tokamax supports 2 latest JAX'
         ' versions for backward compatibility.'
