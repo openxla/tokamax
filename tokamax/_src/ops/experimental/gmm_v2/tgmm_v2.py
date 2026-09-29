@@ -347,12 +347,12 @@ def tgmm_inner_kernel(
     # But without masking both, we sometimes see the result contain NaNs so we
     # decide to mask both to be safe.
     rhs_iota = lax.broadcasted_iota(
-        jnp.int32, (bucket_m, tiled_rhs_ref.shape[-1]), 0
+        jnp.int32, (bucket_m, tiled_rhs_ref.shape[-1]), 0  # pyrefly: ignore[missing-attribute]
     )
     rhs_mask = jnp.logical_and(
         m_start_local <= rhs_iota, rhs_iota < m_end_local
     )
-    rhs_masked = jnp.where(rhs_mask, tiled_rhs_ref[:bucket_m], 0)
+    rhs_masked = jnp.where(rhs_mask, tiled_rhs_ref[:bucket_m], 0)  # pyrefly: ignore[bad-index]
 
     acc = jax.lax.dot_general(
         lhs_masked,

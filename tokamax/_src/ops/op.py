@@ -678,7 +678,7 @@ class _AlwaysEqual:
 @functools.lru_cache
 def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
   spec = pydantic_lib.get_arg_spec_model(f"{type(op).__name__}Spec", op._fwd_signature)  # pylint: disable=protected-access
-  return pydantic_lib.get_adapter(spec)
+  return pydantic_lib.get_adapter(spec)  # pyrefly: ignore[bad-return]
 
 
 BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(BoundArguments)

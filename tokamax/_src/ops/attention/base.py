@@ -434,7 +434,7 @@ class DotProductAttention[C, K: Hashable](
     # Ensure that `q_indices` is specified when sharding the q-sequence with
     # causal masking enabled.
     if _mesh_axis_size(mesh, seq_q_axis) != 1:
-      if mask.is_causal and q_indices is None:
+      if mask.is_causal and q_indices is None:  # pyrefly: ignore[missing-attribute]
         q_indices = jnp.arange(q.shape[-3])
 
     qkv_axes = lambda x, axes: jax.tree.map(lambda _: axes, x)
@@ -445,13 +445,13 @@ class DotProductAttention[C, K: Hashable](
         qkv_axes(k, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),
         qkv_axes(v, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),
         [*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # bias
-        dataclasses.replace(
+        dataclasses.replace(  # pyrefly: ignore[bad-specialization]
             mask,
-            bool_mask=[*batch_axes, heads_axis, seq_q_axis, seq_k_axis],
-            q_start=[*batch_axes, heads_axis, seq_k_axis],
-            q_end=[*batch_axes, heads_axis, seq_k_axis],
-            k_start=[*batch_axes, k_heads_axis, seq_q_axis],
-            k_end=[*batch_axes, k_heads_axis, seq_q_axis],
+            bool_mask=[*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
+            q_start=[*batch_axes, heads_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
+            q_end=[*batch_axes, heads_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
+            k_start=[*batch_axes, k_heads_axis, seq_q_axis],  # pyrefly: ignore[bad-argument-type]
+            k_end=[*batch_axes, k_heads_axis, seq_q_axis],  # pyrefly: ignore[bad-argument-type]
         ),
         [*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # dropout_mask
         PagingInfo([*batch_axes], [*batch_axes, None], [*k_batch_axes]),  # pyrefly: ignore[bad-argument-type]

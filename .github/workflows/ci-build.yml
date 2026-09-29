@@ -95,8 +95,56 @@ jobs:
           echo "Changed against origin/${BASE_REF}:"
           tr '\0' '\n' < /tmp/changed | sed 's/^/  /'
 
+      - name: Skip a push that repeats a passing one
+        # Copybara re-exports a change as a new commit whose only difference
+        # is the committer timestamp: same files, same parent, new SHA.
+        #
+        # We compare tree SHA's of this PR's most recent passing run, not
+        # the push just before to determine whether or not to skip the run.
+        #
+        id: repeat
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A run only counts if it came from this repository.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          # `GITHUB_HEAD_REF` is the PR's branch; empty outside `pull_request`.
+          if [[ -z "${GITHUB_HEAD_REF}" || -z "${HEAD_REPO}" ]]; then
+            echo "Not a pull request: nothing to compare against."
+            exit 0
+          fi
+          if ! prev=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?branch=${GITHUB_HEAD_REF}&event=pull_request&status=success&per_page=50" \
+              --jq '[.workflow_runs[]
+                     | select(.path == ".github/workflows/ci-build.yml")
+                     | select(.head_repository.full_name == env.HEAD_REPO)
+                    ][0].head_sha // ""'); then
+            echo "::warning::Could not list earlier runs; running normally."
+            exit 0
+          fi
+          if [[ -z "${prev}" ]]; then
+            echo "No earlier passing run on ${HEAD_REPO}:${GITHUB_HEAD_REF}."
+            exit 0
+          fi
+          if ! prev_tree=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/git/commits/${prev}" --jq .tree.sha); then
+            echo "::warning::Could not read ${prev}; running normally."
+            exit 0
+          fi
+          tree=$(git rev-parse 'HEAD^{tree}')
+          if [[ -z "${prev_tree}" || "${tree}" != "${prev_tree}" ]]; then
+            echo "Last pass was ${prev}; files differ from it, or main has moved."
+            exit 0
+          fi
+          echo "Same files as ${prev} (tree ${tree}), which passed: skipping."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "skip_from=${prev}" >> "$GITHUB_OUTPUT"
+
       - name: Build test matrix
         id: compute
+        env:
+          SKIP: ${{ steps.repeat.outputs.skip }}
+          SKIP_FROM: ${{ steps.repeat.outputs.skip_from }}
         run: |
           set -o pipefail
           # `--changed-from` narrows the matrix to the shards those files can
@@ -116,6 +164,14 @@ jobs:
               > /tmp/outputs.txt 2> /tmp/summary.txt; then
             cat /tmp/summary.txt
             exit 1
+          fi
+          # Empty the *output* so that no shards run.
+          if [[ "${SKIP}" == "true" ]]; then
+            sed -i 's/^include=.*/include=[]/' /tmp/outputs.txt
+            # Rewrite the one `selection:` line rather than adding a second,
+            # so the summary does not say both "every shard" and "none".
+            sed -i "s/^selection: \(.*\)/selection: same files as ${SKIP_FROM}, which passed -- no shard runs (selection would have been: \1)/" \
+              /tmp/summary.txt
           fi
           cat /tmp/outputs.txt >> "$GITHUB_OUTPUT"
           cat /tmp/summary.txt

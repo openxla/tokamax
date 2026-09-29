@@ -19,6 +19,9 @@ from jax.experimental import pallas as pl
 import jax.numpy as jnp
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
 
+DECODE_TILE_SIZES = (32, 16, 8, 4, 2, 1)
+MIXED_TILE_SIZES = (128, 64, 32, 16, 8, 4, 2, 1)
+
 
 def align_to(x: int, alignment: int) -> int:
   """Aligns an integer upward to the nearest multiple of alignment."""
@@ -147,7 +150,7 @@ def calculate_decode_tile_size(
 
   # Search descending power-of-2 tile candidates (up to 32) bounded by
   # batch size.
-  decode_candidates = [c for c in (32, 16, 8, 4, 2, 1) if c <= batch_size]
+  decode_candidates = [c for c in DECODE_TILE_SIZES if c <= batch_size]
   decode_tile_size = decode_candidates[-1]
 
   for cand in decode_candidates:
@@ -228,7 +231,7 @@ def calculate_mixed_tile_size(
   max_chunk_cap = 64 if n_v >= 64 else 128
   prefill_candidates = [
       c
-      for c in (128, 64, 32, 16, 8, 4, 2, 1)
+      for c in MIXED_TILE_SIZES
       if c <= seq_len and c <= max_chunk_cap
   ]
   mixed_tile_size = prefill_candidates[-1]

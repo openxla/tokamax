@@ -77,7 +77,7 @@ def _serialize_bound_args_autotuning_data(
   del ba_data["op"]["vjp"]
   config_cls = ba.op.config_cls
   data_adapter = pydantic_lib.get_adapter(autotuner.AutotuningData[config_cls])
-  data = data_adapter.dump_python(data, info, round_trip=True)
+  data = data_adapter.dump_python(data, info, round_trip=True)  # pyrefly: ignore[bad-argument-type]
   return ba_data, data
 
 
