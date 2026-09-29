@@ -476,10 +476,7 @@ def _all_pairs_barrier(ep):
     barrier_sem = pltpu.get_barrier_semaphore()
     for i in range(ep):
         pl.semaphore_signal(
-            barrier_sem,
-            inc=1,
-            device_id=(jnp.int32(i),),
-            device_id_type=pl.DeviceIdType.MESH,
+            barrier_sem, inc=1, device_id=(jnp.int32(i),)
         )
     pl.semaphore_wait(barrier_sem, ep)
 
@@ -487,10 +484,7 @@ def _all_pairs_barrier(ep):
     def _(second):
         for i in range(ep):
             pl.semaphore_signal(
-                second,
-                inc=1,
-                device_id=(jnp.int32(i),),
-                device_id_type=pl.DeviceIdType.MESH,
+                second, inc=1, device_id=(jnp.int32(i),),
             )
         pl.semaphore_wait(second, ep)
 
@@ -1410,7 +1404,6 @@ def _build_fused_ep_moe_kernel(
                             send_sem=send_sems.at[parity],
                             recv_sem=recv_sem,
                             device_id=(jnp.int32(d),),
-                            device_id_type=pl.DeviceIdType.MESH,
                         ).start()
 
                     # The own-destination run needs no fabric, and it moves
@@ -1435,7 +1428,6 @@ def _build_fused_ep_moe_kernel(
                             send_sem=send_scl_sems.at[parity],
                             recv_sem=recv_scl_sem,
                             device_id=(jnp.int32(d),),
-                            device_id_type=pl.DeviceIdType.MESH,
                         ).start()
 
                     @pl.when(_and_nonempty(is_me, overlap))
@@ -1776,8 +1768,7 @@ def _build_fused_ep_moe_kernel(
                             send_sem=send_sem,
                             recv_sem=recv_sem,
                             device_id=(jnp.int32(d),),
-                            device_id_type=pl.DeviceIdType.MESH,
-                        ).start()
+                            ).start()
 
                     # A nonempty region can hold an empty (e, d) run.
                     pl.when(true_rows > 0)(push_run)
@@ -1791,7 +1782,6 @@ def _build_fused_ep_moe_kernel(
                         send_sem=send_scl_sem,
                         recv_sem=recv_scl_sem,
                         device_id=(jnp.int32(d),),
-                        device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
                 # Safe to defer: recv is read only after the drain.
