@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import collections
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -1676,6 +1677,72 @@ class GmmTest(parameterized.TestCase):
     assert actual.shape == (batch_size, out_size)
     chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
 
+
+
+class GmmV2CalculateTilingTest(parameterized.TestCase):
+  """Tests for calculate_tiling edge cases regarding vmem floor limits."""
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="tile_n_floor_overshoot_memory_fits",
+          # tile_n shrinks to limit, but actually goes slightly below it due to
+          # alignment/math. The memory actually fits. We expect tile_n to step
+          # back up to the limit (or its aligned nearest above limit) and tile_k
+          # should not shrink because memory fits.
+          vmem_limit=3000000,
+          expected_tile_n_less_than_limit=False,
+      ),
+      dict(
+          testcase_name="tile_n_floor_overshoot_memory_exceeded",
+          # tile_n shrinks to limit, memory is still exceeded. tile_n steps back
+          # up and then tile_k shrinks to fit.
+          vmem_limit=1000000,
+          expected_tile_n_less_than_limit=False,
+      ),
+  )
+  @mock.patch("tokamax._src.ops.experimental.gmm_v2.gmm_v2.pltpu.get_tpu_info")
+  def test_calculate_tiling_edge_cases(
+      self, mock_get_tpu_info, vmem_limit, expected_tile_n_less_than_limit
+  ):
+    mock_tpu_info = mock.MagicMock()
+    mock_tpu_info.num_lanes = 128
+    mock_tpu_info.mxu_column_size = 128
+    mock_get_tpu_info.return_value = mock_tpu_info
+
+    dims = gmm_v2.Dimensions(
+        size_m=512,
+        size_k=4096,
+        size_n=4096,
+        size_group=1,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    lhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=None,
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+    )
+    rhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=None,
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+        is_transposed=False,
+    )
+
+    tiles = gmm_v2.calculate_tiling(
+        dims=dims,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        vmem_limit_bytes=vmem_limit,
+    )
+
+    tile_n_limit = mock_tpu_info.mxu_column_size * 2
+    if not expected_tile_n_less_than_limit:
+      self.assertGreaterEqual(tiles.tile_n, tile_n_limit)
 
 class GmmV2VmemStressTest(parameterized.TestCase):
   """AOT compilation and VMEM stress tests for GMM v2.

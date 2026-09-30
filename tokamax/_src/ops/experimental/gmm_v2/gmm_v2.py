@@ -1124,6 +1124,8 @@ def calculate_tiling(
     tile_n_limit //= fuse_act_factor
 
   def _is_tile_k_quant_block_compatible(tk: int) -> bool:
+    if rhs_cfgs.quant_block_size is None:
+      return True
     if (
         tk % rhs_cfgs.quant_block_size != 0  # pyrefly: ignore[unsupported-operation]
         and rhs_cfgs.quant_block_size % tk != 0  # pyrefly: ignore[unsupported-operation]
@@ -1184,11 +1186,14 @@ def calculate_tiling(
     num_n_tiles += 1
     tile_n = align_to(size_n_per_rhs, num_n_tiles * num_lanes) // num_n_tiles
 
-  # If decreasing tile_n is no longer possible, we decrease tile_k instead.
+  # If we overshot the floor, step back up to the limit.
   if tile_n < tile_n_limit:
     num_n_tiles -= 1
     tile_n = align_to(size_n_per_rhs, num_n_tiles * num_lanes) // num_n_tiles
 
+  # If memory is STILL exceeded after tile_n adjustment, we must decrease
+  # tile_k.
+  if _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes:
     # Decrease tile_k until total memory fits in vmem limit and tile_k is valid.
     while (
         _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes
