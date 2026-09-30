@@ -386,6 +386,9 @@ SHARDS: ShardMap = {
     ),
     'splash-misc': Spec(
         paths=(
+            'tokamax/_src/ops/experimental/tpu/splash_attention/api_test.py',
+            'tokamax/_src/ops/experimental/tpu/splash_attention/base_test.py',
+            'tokamax/_src/ops/experimental/tpu/splash_attention/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/experimental/tpu/splash_attention/ring_attention_kernel_test.py',
             'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_sharded_test.py',
             'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_mask_test.py',
@@ -499,6 +502,7 @@ SHARDS: ShardMap = {
     'ops-causal-conv1d': Spec(
         paths=(
             'tokamax/_src/ops/causal_conv1d_gated_delta_rule/base_test.py',
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/gdn_attention_test.py',
             'tokamax/_src/ops/causal_conv1d_gated_delta_rule/pallas_mosaic_tpu_test.py',
         ),
         minutes=5,
@@ -523,6 +527,7 @@ SHARDS: ShardMap = {
         paths=(
             'tokamax/_src/ops/gated_linear_unit/api_test.py',
             'tokamax/_src/ops/gated_linear_unit/base_test.py',
+            'tokamax/_src/ops/gated_linear_unit/cutedsl_test.py',
             'tokamax/_src/ops/gated_linear_unit/pallas_mosaic_gpu_test.py',
             'tokamax/_src/ops/gated_linear_unit/triton_test.py',
         ),
@@ -576,11 +581,36 @@ SHARDS: ShardMap = {
         ),
         minutes=6,
     ),
+    'experimental-batched-rpa': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/batched_rpa/base_test.py',
+            'tokamax/_src/ops/experimental/batched_rpa/kernel/configs_test.py',
+            'tokamax/_src/ops/experimental/batched_rpa/kernel/seq_along_lane_parity_test.py',
+            'tokamax/_src/ops/experimental/batched_rpa/kernel/speculative_decode_test.py',
+            'tokamax/_src/ops/experimental/batched_rpa/kernel/stacked_rpa_kv_writeback_test.py',
+            'tokamax/_src/ops/experimental/batched_rpa/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=2,
+    ),
+    'experimental-fused-moe': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/fused_moe/base_test.py',
+            'tokamax/_src/ops/experimental/fused_moe/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_router.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_tables.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_tp_tokens.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_weight_slots.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_tp_token_layout.py',
+        ),
+        minutes=2,
+    ),
     # The kda tests that are not the kernel; see `experimental-kda-kernel`.
     'experimental-kda': Spec(
         paths=(
             'tokamax/_src/ops/experimental/kda/base_test.py',
             'tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/kda/xla_chunked_test.py',
         ),
         minutes=1,
     ),
