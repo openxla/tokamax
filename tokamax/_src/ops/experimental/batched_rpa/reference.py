@@ -29,18 +29,28 @@ def _align_to(val: int, align: int) -> int:
   return (val + align - 1) // align * align
 
 
-def _merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
-  """Concatenate and format key and value tensors."""
+def _merge_kv(k: jax.Array, v: jax.Array, kv_packing: int = 1) -> jax.Array:
+  """Concatenate and format key and value tensors into 5D packed VREG slice."""
   max_num_tokens, actual_num_kv_heads, actual_head_dim = k.shape
   actual_num_kv_heads_x2 = actual_num_kv_heads * 2
   head_dim_aligned = _align_to(actual_head_dim, 128)
+  num_kv_heads_x2_aligned = _align_to(actual_num_kv_heads_x2, kv_packing)
   kv_concat = jnp.concatenate([k, v], axis=-1).reshape(
       max_num_tokens, actual_num_kv_heads_x2, actual_head_dim
   )
   kv_padded = jnp.pad(
       kv_concat,
-      ((0, 0), (0, 0), (0, head_dim_aligned - actual_head_dim)),
+      (
+          (0, 0),
+          (0, num_kv_heads_x2_aligned - actual_num_kv_heads_x2),
+          (0, head_dim_aligned - actual_head_dim),
+      ),
       constant_values=0,
+  ).reshape(
+      max_num_tokens,
+      num_kv_heads_x2_aligned // kv_packing,
+      kv_packing,
+      head_dim_aligned,
   )
   return kv_padded
 
@@ -53,9 +63,16 @@ def _merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
         "soft_cap",
         "mask_value",
         "out_dtype",
+        "use_per_token_scale",
+        "per_token_scale_dtype",
         "q_scale",
         "k_scale",
         "v_scale",
+        "chunk_prefill_size",
+        "decode_block_sizes",
+        "prefill_block_sizes",
+        "vmem_limit_bytes",
+        "debug_mode",
         "decode_query_size",
         "skip_kv_update",
         "kv_layout",
@@ -79,10 +96,19 @@ def batched_ragged_paged_attention_reference(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = None,
-    out_dtype: Any = None,
+    out_dtype: jax.typing.DTypeLike | None = None,
+    use_per_token_scale: bool = False,
+    per_token_scale_dtype: jax.typing.DTypeLike | None = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    dynamic_k_scale: jax.Array | None = None,
+    dynamic_v_scale: jax.Array | None = None,
+    chunk_prefill_size: int | None = None,
+    decode_block_sizes: Any = None,
+    prefill_block_sizes: Any = None,
+    vmem_limit_bytes: int | None = None,
+    debug_mode: bool = False,
     decode_query_size: int = 1,
     skip_kv_update: bool = False,
     kv_layout: Any = None,
@@ -98,7 +124,7 @@ def batched_ragged_paged_attention_reference(
     queries: [total_q_tokens, num_q_heads, head_dim]
     keys: [total_q_tokens, num_kv_heads, head_dim]
     values: [total_q_tokens, num_kv_heads, head_dim]
-    kv_cache: [total_pages, page_size, num_kv_heads * 2, head_dim_aligned]
+    kv_cache: [total_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim_aligned]
     kv_lens: [max_num_seqs] sequence lengths for each request.
     page_indices: [max_num_seqs * pages_per_seq] page allocation mapping.
     cu_q_lens: [max_num_seqs + 1] cumulative query tokens per request.
@@ -123,8 +149,14 @@ def batched_ragged_paged_attention_reference(
   actual_num_kv_heads = keys.shape[1]
   actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
-  merged_kv = _merge_kv(keys, values)
-  total_pages, page_size, num_kv_heads_x2, head_dim_aligned = kv_cache.shape
+  if kv_cache.ndim != 5:
+    raise ValueError(
+        f"kv_cache must be 5D, matching get_kv_cache_shape. Got {kv_cache.ndim}D with shape {kv_cache.shape}"
+    )
+
+  total_pages, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim_aligned = kv_cache.shape
+  num_kv_heads_x2 = num_kv_heads_x2_per_kv_packing * kv_packing
+  merged_kv = _merge_kv(keys, values, kv_packing=kv_packing)
   max_num_seqs = kv_lens.shape[0]
   pages_per_seq = page_indices.shape[0] // max_num_seqs
   max_kv_len = pages_per_seq * page_size
@@ -156,7 +188,7 @@ def batched_ragged_paged_attention_reference(
   if not skip_kv_update:
     # Append a dummy page to absorb invalid token writes safely.
     dummy_page = jnp.zeros(
-        (1, page_size, num_kv_heads_x2, head_dim_aligned), dtype=kv_cache.dtype
+        (1, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim_aligned), dtype=kv_cache.dtype
     )
     padded_cache = jnp.concatenate([kv_cache, dummy_page], axis=0)
 
@@ -171,7 +203,7 @@ def batched_ragged_paged_attention_reference(
   page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
   seq_kv_pages = updated_kv_cache[page_table]
   flat_kv = seq_kv_pages.reshape(
-      max_num_seqs, max_kv_len, actual_num_kv_heads * 2, head_dim_aligned
+      max_num_seqs, max_kv_len, num_kv_heads_x2, head_dim_aligned
   )
 
   all_k = flat_kv[:, :, 0::2, :actual_head_dim]

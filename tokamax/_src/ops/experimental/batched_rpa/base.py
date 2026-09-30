@@ -60,17 +60,22 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       sliding_window: int | None = None,
       soft_cap: float | None = None,
       mask_value: float | None = None,
+      use_per_token_scale: bool = False,
+      per_token_scale_dtype: jax.typing.DTypeLike | None = None,
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      dynamic_k_scale: Shaped[Array | AbstractArray, "..."] | None = None,
+      dynamic_v_scale: Shaped[Array | AbstractArray, "..."] | None = None,
       chunk_prefill_size: int | None = None,
       decode_block_sizes: BlockSizes | None = None,
       prefill_block_sizes: BlockSizes | None = None,
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
-      out_dtype: Any = None,
+      out_dtype: jax.typing.DTypeLike | None = None,
       use_causal_mask: bool = True,
       skip_kv_update: bool = False,
+      update_kv_cache: bool | None = None,
       kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
@@ -80,6 +85,8 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Validates structural dimensions and binds input arguments."""
+    if update_kv_cache is not None:
+      skip_kv_update = not update_kv_cache
     total_q_tokens, num_q_heads, head_dim = queries.shape
     _, num_kv_heads, kv_head_dim = keys.shape
     assert head_dim == kv_head_dim, f"Head dim mismatch: {head_dim} vs {kv_head_dim}"
@@ -102,9 +109,13 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,
+        use_per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=per_token_scale_dtype,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        dynamic_k_scale=dynamic_k_scale,
+        dynamic_v_scale=dynamic_v_scale,
         chunk_prefill_size=chunk_prefill_size,
         decode_block_sizes=decode_block_sizes,
         prefill_block_sizes=prefill_block_sizes,
@@ -139,17 +150,22 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       sliding_window: int | None = None,
       soft_cap: float | None = None,
       mask_value: float | None = None,
+      use_per_token_scale: bool = False,
+      per_token_scale_dtype: jax.typing.DTypeLike | None = None,
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      dynamic_k_scale: jax.Array | None = None,
+      dynamic_v_scale: jax.Array | None = None,
       chunk_prefill_size: int | None = None,
       decode_block_sizes: BlockSizes | None = None,
       prefill_block_sizes: BlockSizes | None = None,
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
-      out_dtype: Any = None,
+      out_dtype: jax.typing.DTypeLike | None = None,
       use_causal_mask: bool = True,
       skip_kv_update: bool = False,
+      update_kv_cache: bool | None = None,
       kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
@@ -161,6 +177,8 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
   ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None]:
     """Invokes standard reference implementation."""
     del config, return_residuals
+    if update_kv_cache is not None:
+      skip_kv_update = not update_kv_cache
     ref_res = reference.batched_ragged_paged_attention_reference(
         queries=queries,
         keys=keys,
@@ -176,9 +194,13 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
         soft_cap=soft_cap,
         mask_value=mask_value,
         out_dtype=out_dtype,
+        use_per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=per_token_scale_dtype,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        dynamic_k_scale=dynamic_k_scale,
+        dynamic_v_scale=dynamic_v_scale,
         chunk_prefill_size=chunk_prefill_size,
         decode_block_sizes=decode_block_sizes,
         prefill_block_sizes=prefill_block_sizes,

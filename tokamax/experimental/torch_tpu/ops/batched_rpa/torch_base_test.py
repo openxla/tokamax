@@ -59,7 +59,7 @@ class BaseTest(parameterized.TestCase):
         device=device,
     )
     kv_cache = torch.zeros(
-        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=torch.bfloat16,
         device=device,
     )

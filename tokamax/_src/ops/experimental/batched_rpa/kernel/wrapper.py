@@ -29,6 +29,14 @@ Compared to the default RPA kernel, this kernel does the following:
 scheduler.py kernel. Kernel is calculated once and ammortized across different layers in a model.
 
 Note: batched_rpa is build on top / derived from RPA3.
+
+Contract:
+- KV Cache Layout: assumes `pallas_batched_rpa_token_first_v1` layout allocated
+  via `get_kv_cache_shape`.
+- LibTPU SMEM: Requires `--xla_tpu_use_dynamic_smem_negotiation=true` in
+  `LIBTPU_INIT_ARGS` so libtpu dynamically sizes SMEM for scheduler metadata.
+- Kernel Names: Kernels are prefixed with `DECODE_KERNEL_PREFIX` ("RPAd") and
+  `MIXED_KERNEL_PREFIX` ("RPAm").
 """
 
 import jax
@@ -43,7 +51,6 @@ from tokamax._src.ops.experimental.batched_rpa.kernel import (
     schedule_cp,
     utils,
 )
-
 
 def prepare_inputs(
     q: jax.Array,
@@ -529,9 +536,6 @@ def ragged_paged_attention(
     v_scale: float | None = None,
     dynamic_k_scale: jax.Array | None = None,
     dynamic_v_scale: jax.Array | None = None,
-    dynamic_scale_k: jax.Array | None = None,
-    dynamic_scale_v: jax.Array | None = None,
-    use_per_token_quantization: bool = False,
     chunk_prefill_size: int | None = None,
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
@@ -586,6 +590,14 @@ def ragged_paged_attention(
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
         use_causal_mask: Not used.
+        skip_kv_update: If True, don't write keys/values back to kv_cache
+            (KV-share). Without CP, all kv (including this step's tokens) is
+            read from kv_cache. With CP the cache is page-sharded across ranks,
+            so this step's tokens are still read from `keys`/`values` and only
+            the writeback is skipped.
+        update_kv_cache: If set, overrides skip_kv_update (update_kv_cache=False
+            is the same as skip_kv_update=True). None (default) uses
+            skip_kv_update.
         decode_query_size: Number of query tokens in decode (1 by default, can be
             higher in case of speculative decoding).
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
@@ -618,23 +630,14 @@ def ragged_paged_attention(
         mask_value = jnp.finfo(out_dtype).min
     if vmem_limit_bytes is None:
         vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-    if dynamic_scale_k is not None:
-        dynamic_k_scale = dynamic_scale_k
-    if dynamic_scale_v is not None:
-        dynamic_v_scale = dynamic_scale_v
-    if use_per_token_quantization:
-        use_per_token_scale = True
     if update_kv_cache is not None:
         skip_kv_update = not update_kv_cache
 
-    orig_kv_cache_ndim = kv_cache.ndim
-    if kv_cache.ndim == 4:
-        if kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE:
-            kv_packing = utils.get_dtype_packing(kv_cache.dtype)
-            num_pages, page_sz, kv_heads_x2, h_dim = kv_cache.shape
-            kv_cache = kv_cache.reshape(
-                num_pages, page_sz, kv_heads_x2 // kv_packing, kv_packing, h_dim
-            )
+    if kv_cache.ndim != 5:
+        raise ValueError(
+            f"ragged_paged_attention expects 5D kv_cache matching get_kv_cache_shape, "
+            f"got {kv_cache.ndim}D shape {kv_cache.shape}"
+        )
 
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
@@ -832,13 +835,6 @@ def ragged_paged_attention(
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
-    if orig_kv_cache_ndim == 4 and kv_cache.ndim == 5:
-        kv_cache = kv_cache.reshape(
-            kv_cache.shape[0],
-            kv_cache.shape[1],
-            kv_cache.shape[2] * kv_cache.shape[3],
-            kv_cache.shape[4],
-        )
 
     if not return_lse:
         return o_hbm, kv_cache
