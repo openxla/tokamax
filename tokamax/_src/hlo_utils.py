@@ -255,6 +255,9 @@ _KERNEL_GETTER: Final[
     hlo_utils_common.PALLAS_TRITON_KEY: _kernel_info_getter(
         hlo_utils_common.TritonKernelInfo
     ),
+    hlo_utils_common.TRITON_FFI_KEY: _kernel_info_getter(
+        hlo_utils_common.TritonKernelInfo
+    ),
 })
 _get_tokamax_xla_kernel_info = _kernel_info_getter(
     hlo_utils_common.TokamaxXlaKernelInfo

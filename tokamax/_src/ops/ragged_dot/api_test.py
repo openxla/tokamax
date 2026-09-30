@@ -331,6 +331,15 @@ class RaggedDotTritonTest(RaggedDotImplementationTest):
 
   def __init__(self, *args):
     super().__init__(*args, implementation="triton")
+    dot_fn = self._dot_fn
+
+    def fn(lhs, rhs, *, activation=None, **kwargs):
+      # Triton kernels only support known `jax.nn` activations.
+      if activation is test_base.relu:
+        activation = jax.nn.relu
+      return dot_fn(lhs, rhs, activation=activation, **kwargs)
+
+    self._dot_fn = fn
 
   def setUp(self):
     if jax.default_backend() != "gpu":

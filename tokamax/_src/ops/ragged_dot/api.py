@@ -32,9 +32,9 @@ _IMPLEMENTATIONS = dict(xla=base.RaggedDot())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.ragged_dot import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.ragged_dot import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  _IMPLEMENTATIONS["triton"] = pallas_triton.PallasTritonRaggedDot()
+  _IMPLEMENTATIONS["triton"] = triton.TritonRaggedDot()
   _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass

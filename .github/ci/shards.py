@@ -415,7 +415,7 @@ SHARDS: ShardMap = {
         minutes=13,
     ),
     'ragged-dot-triton': Spec(
-        paths=('tokamax/_src/ops/ragged_dot/pallas_triton_test.py',),
+        paths=('tokamax/_src/ops/ragged_dot/triton_test.py',),
         minutes=8,
     ),
     # The ragged_dot tests with no shard of their own.

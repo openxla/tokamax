@@ -37,7 +37,6 @@ from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu as pl_ragged_dot_mosaic_tpu
-from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
 from tokamax._src.ops.triangle_multiplication import api as tri_mul_api
 from tokamax._src.ops.triangle_multiplication import base as tri_mul_base
 
@@ -45,6 +44,11 @@ try:
   from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 except ImportError:
   triton_glu = None  # pyrefly: ignore[assignment]
+
+try:
+  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  triton_ragged_dot = None  # pyrefly: ignore[assignment]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,9 +146,9 @@ class AutotuningTest(parameterized.TestCase):
             device=backend.get_default_device(),
         )
         self.assertNotIn(pl_norm.PallasTritonNormalization(), tpu_norm_impls)
-      elif jax.default_backend() == "gpu":
+      elif jax.default_backend() == "gpu" and triton_ragged_dot is not None:
         ragged_dot_impls = api.get_op_implementations(
-            pl_ragged_dot.PallasTritonRaggedDot(),
+            triton_ragged_dot.TritonRaggedDot(),
             device=backend.get_default_device(),
         )
         self.assertNotIn(
