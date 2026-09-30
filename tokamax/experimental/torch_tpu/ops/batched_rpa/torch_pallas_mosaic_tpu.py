@@ -45,7 +45,7 @@ class _PallasMosaicTpuBatchedRpa(
   def deconstruct_config(
       self, config: Config | tuple[Any, ...] | list[Any] | None
   ) -> tuple[tuple[int, ...] | None, str | None]:
-    """Breaks Config into a 6-int tuple and kv_layout str for jax_op."""
+    """Breaks Config into a tuple of its int fields and kv_layout str."""
     if config is None:
       return None, None
     config_tuple = (
@@ -53,11 +53,11 @@ class _PallasMosaicTpuBatchedRpa(
         if isinstance(config, (tuple, list))
         else dataclasses.astuple(config)
     )
-    return config_tuple[:6], config_tuple[6]
+    return config_tuple[:-1], config_tuple[-1]
 
   @override
   def reconstruct_config(self, *config_parts: Any) -> Config:
-    """Rebuilds the 6-int tuple and kv_layout str back into a Config."""
+    """Rebuilds the int field tuple and kv_layout str back into a Config."""
     config = config_parts[0]
     config_kv_layout = config_parts[1] if len(config_parts) > 1 else None
     if config_kv_layout is not None:

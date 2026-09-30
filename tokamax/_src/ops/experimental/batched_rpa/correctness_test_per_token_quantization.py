@@ -19,11 +19,12 @@ from typing import Any
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-
+from jax import dtypes
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 
+from tokamax._src import test_utils as jtu
 from tokamax._src.ops.experimental.batched_rpa.kernel import configs
 from tokamax._src.ops.experimental.batched_rpa.kernel.utils import (
     align_to, get_dtype_packing
@@ -400,7 +401,7 @@ def ref_ragged_paged_attention(
   )
 
 
-class RaggedPagedAttentionKernelTest(parameterized.TestCase):
+class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
   """Correctness tests for quantized batched ragged paged attention.
 
   This suite has been pruned to the minimum set of tests required to validate:
@@ -414,17 +415,6 @@ class RaggedPagedAttentionKernelTest(parameterized.TestCase):
   4. Mixed prefill/decode scheduling with quantization (quantized_mixed).
   5. Layout/padding edge cases with scale channels (quantized_complex).
   """
-
-  def assertAllClose(self, x, y, atol=None, rtol=None):
-    kwargs = {}
-    if atol is not None:
-      kwargs["atol"] = atol
-    if rtol is not None:
-      kwargs["rtol"] = rtol
-    np.testing.assert_allclose(x, y, **kwargs)
-
-  def assertArraysEqual(self, x, y):
-    np.testing.assert_array_equal(x, y)
 
   def _test_ragged_paged_attention(
       self,
@@ -467,13 +457,8 @@ class RaggedPagedAttentionKernelTest(parameterized.TestCase):
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
       page_size = 128
 
-    if jax.default_backend() != "tpu":
-      self.skipTest("Expect TPU")
-    try:
-      if pltpu.get_tpu_info().generation < 4:
-        self.skipTest("Expect TPUv4+")
-    except (ValueError, RuntimeError, AttributeError):
-      self.skipTest("Failed to get TPU info.")
+    if not jtu.is_device_tpu_at_least(version=4):
+      self.skipTest("Expect TPUv4+")
     cu_q_lens = [0]
     kv_lens = []
     for q_len, kv_len in seq_lens:
@@ -744,11 +729,9 @@ class RaggedPagedAttentionKernelTest(parameterized.TestCase):
     )
 
     rpa_bkv_sz = bkv_sz
-    rpa_n_buffer = 3
     rpa_batch_size = 2
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
       rpa_bkv_sz = max(bkv_sz, 128)
-      rpa_n_buffer = 2
       rpa_batch_size = 1
 
     decode_block_sizes = configs.BlockSizes(
@@ -756,14 +739,12 @@ class RaggedPagedAttentionKernelTest(parameterized.TestCase):
         bq_c_sz=bq_csz,
         bkv_sz=rpa_bkv_sz,
         batch_size=rpa_batch_size,
-        n_buffer=rpa_n_buffer,
     )
     prefill_block_sizes = configs.BlockSizes(
         bq_sz=bq_sz,
         bq_c_sz=bq_csz,
         bkv_sz=rpa_bkv_sz,
         batch_size=rpa_batch_size,
-        n_buffer=rpa_n_buffer,
     )
 
     output, updated_kv_cache = ragged_paged_attention(
@@ -778,7 +759,7 @@ class RaggedPagedAttentionKernelTest(parameterized.TestCase):
       updated_kv_cache = unpack_kv_cache_uint8_to_fp4(updated_kv_cache)
     output = output[: cu_q_lens[distribution[-1]]]
 
-    dtype_bits = jax.dtypes.itemsize_bits(jnp.dtype(kv_dtype))
+    dtype_bits = dtypes.itemsize_bits(jnp.dtype(kv_dtype))
     tols = {
         32: 0.15,
         16: 0.2,
@@ -1366,4 +1347,4 @@ class RaggedPagedAttentionKernelTest(parameterized.TestCase):
 
 
 if __name__ == "__main__":
-  absltest.main()
+  absltest.main(testLoader=jtu.JaxTestLoader())
