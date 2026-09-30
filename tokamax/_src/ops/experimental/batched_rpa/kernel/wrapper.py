@@ -364,7 +364,12 @@ def calculate_block_sizes(
         # costs. Therefore, we conservatively only use 80% of the VMEM budget.
         capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
 
-        bkv_sz = bkv_stride = mxu_column_size
+        # To maximize MXU, we want bkv_sz to be at least MXU size.
+        bkv_default = mxu_column_size
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            # SEQ-ALONG-LANE does not support intra-page DMA offset.
+            bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
+        bkv_sz = bkv_stride = bkv_default
         if fixed_bq_sz is None:
             bq_sz = bq_stride = bkv_sz
         else:
@@ -431,8 +436,14 @@ def calculate_block_sizes(
         tpu_info = pltpu.get_tpu_info()
         is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
 
+        # chip_version is a pltpu.ChipVersion enum on hardware (value "8i")
+        # but may be a plain string in tests.
+        chip_version = str(
+            getattr(tpu_info.chip_version, "value", tpu_info.chip_version)
+        )
+
         match tpu_info.generation:
-            case 8 if "8i" in tpu_info.chip_version or "v8i" in tpu_info.chip_version:
+            case 8 if "8i" in chip_version:
                 threshold = 800
             case 7:
                 threshold = 1500
