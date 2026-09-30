@@ -26,6 +26,11 @@ from tokamax._src.ops.experimental.batched_rpa.kernel import wrapper as rpa_wrap
 from typing_extensions import override
 
 
+# Number of Q/KV pipeline buffers. Fixed for now (matches vllm-torchtpu's
+# heuristic block sizes); not exposed as a tunable Config parameter.
+_NUM_BUFFERS = 3
+
+
 @pydantic.dataclasses.dataclass(frozen=True)
 class Config:
   """Autotuning parameters for Batched RPA Mosaic TPU kernel."""
@@ -33,9 +38,8 @@ class Config:
   # Prefill block tuning
   prefill_bq_sz: Annotated[int, pydantic.Field(gt=0, multiple_of=16)] = 128
   prefill_bq_c_sz: Annotated[int, pydantic.Field(gt=0, multiple_of=16)] = 64
-  # Shared KV tile and buffer configuration
+  # Shared KV tile configuration
   bkv_sz: Annotated[int, pydantic.Field(gt=0, multiple_of=128)] = 512
-  n_buffer: Annotated[int, pydantic.Field(ge=1, le=4)] = 3
   # Batch sizes (decode fixed at bq_sz=1, bq_c_sz=1 for fast single-token path)
   decode_batch_size: Annotated[int, pydantic.Field(gt=0)] = 8
   prefill_batch_size: Annotated[int, pydantic.Field(gt=0)] = 2
@@ -50,6 +54,12 @@ class Config:
           f"{self.prefill_bq_c_sz=} cannot be greater than"
           f" {self.prefill_bq_sz=}."
       )
+
+
+# Requesting the full VMEM capacity as scoped VMEM can exceed the compiler's
+# limit when the runtime reserves a small slice (e.g. 64 KiB under the
+# profiler on TPU7x), so leave headroom like other Tokamax TPU kernels.
+_VMEM_LIMIT_FRACTION = 0.9
 
 
 class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
@@ -119,13 +129,18 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
     else:
       effective_kv_layout = base.KVLayout(kv_layout)
 
+    if vmem_limit_bytes is None:
+      vmem_limit_bytes = int(
+          _VMEM_LIMIT_FRACTION * pltpu.get_tpu_info().vmem_capacity_bytes
+      )
+
     if decode_block_sizes is None:
       decode_block_sizes = rpa_configs.BlockSizes(
           bq_sz=decode_query_size,
           bq_c_sz=1,
           bkv_sz=config.bkv_sz,
           batch_size=config.decode_batch_size,
-          n_buffer=config.n_buffer,
+          n_buffer=_NUM_BUFFERS,
       )
     if prefill_block_sizes is None:
       prefill_block_sizes = rpa_configs.BlockSizes(
@@ -133,7 +148,7 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
           bq_c_sz=config.prefill_bq_c_sz,
           bkv_sz=config.bkv_sz,
           batch_size=config.prefill_batch_size,
-          n_buffer=config.n_buffer,
+          n_buffer=_NUM_BUFFERS,
       )
 
     result = rpa_wrapper.ragged_paged_attention(
@@ -182,7 +197,6 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
         bkv_sz=512,
         decode_batch_size=8,
         prefill_batch_size=2,
-        n_buffer=3,
     )
 
   @override
@@ -194,17 +208,15 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       for bkv in (256, 512, 1024, 2048):
         for prefill_bs in (1, 2):
           for decode_bs in (4, 8):
-            for nbuf in (2, 3):
-              configs.add(
-                  Config(
-                      prefill_bq_sz=prefill_bq,
-                      prefill_bq_c_sz=min(64, prefill_bq),
-                      bkv_sz=bkv,
-                      decode_batch_size=decode_bs,
-                      prefill_batch_size=prefill_bs,
-                      n_buffer=nbuf,
-                  )
-              )
+            configs.add(
+                Config(
+                    prefill_bq_sz=prefill_bq,
+                    prefill_bq_c_sz=min(64, prefill_bq),
+                    bkv_sz=bkv,
+                    decode_batch_size=decode_bs,
+                    prefill_batch_size=prefill_bs,
+                )
+            )
     return configs
 
   @override
