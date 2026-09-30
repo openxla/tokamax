@@ -33,9 +33,8 @@ class Config:
   # Prefill block tuning
   prefill_bq_sz: Annotated[int, pydantic.Field(gt=0, multiple_of=16)] = 128
   prefill_bq_c_sz: Annotated[int, pydantic.Field(gt=0, multiple_of=16)] = 64
-  # Shared KV tile and buffer configuration
+  # Shared KV tile configuration
   bkv_sz: Annotated[int, pydantic.Field(gt=0, multiple_of=128)] = 512
-  n_buffer: Annotated[int, pydantic.Field(ge=1, le=4)] = 3
   # Batch sizes (decode fixed at bq_sz=1, bq_c_sz=1 for fast single-token path)
   decode_batch_size: Annotated[int, pydantic.Field(gt=0)] = 8
   prefill_batch_size: Annotated[int, pydantic.Field(gt=0)] = 2
@@ -125,7 +124,6 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
           bq_c_sz=1,
           bkv_sz=config.bkv_sz,
           batch_size=config.decode_batch_size,
-          n_buffer=config.n_buffer,
       )
     if prefill_block_sizes is None:
       prefill_block_sizes = rpa_configs.BlockSizes(
@@ -133,7 +131,6 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
           bq_c_sz=config.prefill_bq_c_sz,
           bkv_sz=config.bkv_sz,
           batch_size=config.prefill_batch_size,
-          n_buffer=config.n_buffer,
       )
 
     result = rpa_wrapper.ragged_paged_attention(
@@ -182,7 +179,6 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
         bkv_sz=512,
         decode_batch_size=8,
         prefill_batch_size=2,
-        n_buffer=3,
     )
 
   @override
@@ -194,17 +190,15 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       for bkv in (256, 512, 1024, 2048):
         for prefill_bs in (1, 2):
           for decode_bs in (4, 8):
-            for nbuf in (2, 3):
-              configs.add(
-                  Config(
-                      prefill_bq_sz=prefill_bq,
-                      prefill_bq_c_sz=min(64, prefill_bq),
-                      bkv_sz=bkv,
-                      decode_batch_size=decode_bs,
-                      prefill_batch_size=prefill_bs,
-                      n_buffer=nbuf,
-                  )
-              )
+            configs.add(
+                Config(
+                    prefill_bq_sz=prefill_bq,
+                    prefill_bq_c_sz=min(64, prefill_bq),
+                    bkv_sz=bkv,
+                    decode_batch_size=decode_bs,
+                    prefill_batch_size=prefill_bs,
+                )
+            )
     return configs
 
   @override

@@ -14,6 +14,10 @@
 # ==============================================================================
 """Tokamax test utilities."""
 
+import functools
+
+from absl.testing import absltest
+from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
@@ -104,3 +108,82 @@ def get_tpu_version() -> int:
     return 7
   assert kind[:-1] == "TPU v", kind
   return int(kind[-1])
+
+
+# Stand-ins for the parts of `jax._src.test_util` that batched RPA tests use.
+# `jax._src` is not visible outside JAX, so those tests import this module as
+# `jtu` instead.
+
+JaxTestLoader = absltest.TestLoader
+
+# Default tolerances when a caller passes neither atol nor rtol, mirroring
+# `jax._src.test_util`'s per-dtype defaults for the dtypes used here.
+_DEFAULT_TOLERANCE = {
+    np.dtype(jnp.float8_e4m3fn): 1e-1,
+    np.dtype(jnp.float8_e5m2): 1e-1,
+    np.dtype(jnp.bfloat16): 1e-2,
+    np.dtype(np.float16): 1e-3,
+    np.dtype(np.float32): 1e-6,
+    np.dtype(np.float64): 1e-15,
+}
+
+
+def _tolerance(x, y) -> float:
+  tols = [
+      _DEFAULT_TOLERANCE.get(np.dtype(getattr(a, "dtype", np.float32)), 0.0)
+      for a in (x, y)
+  ]
+  return max(tols)
+
+
+def is_device_tpu_at_least(version: int) -> bool:
+  if jax.default_backend() != "tpu":
+    return False
+  try:
+    return get_tpu_version() >= version
+  except (AssertionError, ValueError):
+    return False
+
+
+def with_config(**config):
+  """Class decorator that applies `jax.config` values for each test."""
+
+  def decorator(cls):
+    original_setup = cls.setUp
+    original_teardown = cls.tearDown
+
+    @functools.wraps(original_setup)
+    def setUp(self):  # pylint: disable=invalid-name
+      self._jtu_saved_config = {k: getattr(jax.config, k) for k in config}
+      for k, v in config.items():
+        jax.config.update(k, v)
+      original_setup(self)
+
+    @functools.wraps(original_teardown)
+    def tearDown(self):  # pylint: disable=invalid-name
+      original_teardown(self)
+      for k, v in self._jtu_saved_config.items():
+        jax.config.update(k, v)
+
+    cls.setUp = setUp
+    cls.tearDown = tearDown
+    return cls
+
+  return decorator
+
+
+class JaxTestCase(parameterized.TestCase):
+  """Test case with the `assertAllClose`/`assertArraysEqual` helpers."""
+
+  def assertAllClose(self, x, y, *, atol=None, rtol=None, err_msg=""):  # pylint: disable=invalid-name
+    tol = _tolerance(x, y)
+    np.testing.assert_allclose(
+        np.asarray(x, dtype=np.float32),
+        np.asarray(y, dtype=np.float32),
+        atol=tol if atol is None else atol,
+        rtol=tol if rtol is None else rtol,
+        err_msg=err_msg,
+    )
+
+  def assertArraysEqual(self, x, y, *, err_msg=""):  # pylint: disable=invalid-name
+    np.testing.assert_array_equal(np.asarray(x), np.asarray(y), err_msg=err_msg)
