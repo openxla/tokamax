@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 WORKLOAD_ARTIFACTS_DIR_VARNAME: Final[str] = 'WORKLOAD_ARTIFACTS_DIR'
 RETAIN_ARTIFACTS_VARNAME: Final[str] = 'TOKAMAX_DUMP_XPROF'
 
+# Profiling sessions can fail transiently, e.g. when an external XProf session
+# (such as periodic fleet-wide profiling, which lasts ~10s) overlaps ours.
+_PROFILE_ATTEMPTS: Final[int] = 3
+_PROFILE_RETRY_DELAY_S: Final[float] = 6.0
+
 
 def get_tempdir(
     prefix: str, dir: str | pathlib.Path | None = None
@@ -517,15 +522,30 @@ def xprof_timer[T](
 ) -> Timer:
   def timer(return_metadata):
     jax.block_until_ready(f(args))  # Warmup.
-    with XprofProfileSession(
-        hermetic=not return_metadata,
-        event_filter_regex=event_filter_regex,
-        use_jax_profiler=use_jax_profiler,
-    ) as profile:
-      jax.block_until_ready(f(args))
-
-    metadata = dict(xprof_url=profile.xprof_url) if return_metadata else {}
-    return profile.total_op_time / datetime.timedelta(milliseconds=1), metadata
+    attempt = 1
+    while True:
+      try:
+        with XprofProfileSession(
+            hermetic=not return_metadata,
+            event_filter_regex=event_filter_regex,
+            use_jax_profiler=use_jax_profiler,
+        ) as profile:
+          jax.block_until_ready(f(args))
+        dt = profile.total_op_time / datetime.timedelta(milliseconds=1)
+        metadata = dict(xprof_url=profile.xprof_url) if return_metadata else {}
+        return dt, metadata
+      except RuntimeError:
+        if attempt >= _PROFILE_ATTEMPTS:
+          raise
+        logger.warning(
+            'Profiling attempt %d/%d failed; retrying in %.0fs.',
+            attempt,
+            _PROFILE_ATTEMPTS,
+            _PROFILE_RETRY_DELAY_S,
+            exc_info=True,
+        )
+        time.sleep(_PROFILE_RETRY_DELAY_S)
+        attempt += 1
 
   return timer
 
