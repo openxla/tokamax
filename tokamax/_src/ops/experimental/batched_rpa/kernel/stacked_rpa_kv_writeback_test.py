@@ -262,6 +262,77 @@ class StackedRpaKvWritebackTest(parameterized.TestCase):
             " wrong lane",
         )
 
+  def test_kv_share_with_seq_along_lane_multitoken_decode(self):
+    """Regression test for KV sharing with SEQ_ALONG_LANE and multi-token decode (909fa46c6).
+
+    In KV sharing (skip_kv_update=True / update_kv_cache=False), the KV cache
+    already holds the latest tokens (written by the source layer). With
+    SEQ_ALONG_LANE and decode_query_size > 1, stitch_new_kv_lane must NOT
+    splice unfetched garbage over the newest valid tokens in the cache.
+    """
+    kv_layout = configs.KVLayout.SEQ_ALONG_LANE
+    bucket = 4
+    num_seqs = 2
+    q_lens = (bucket, bucket)
+    kv_lens = (128 + bucket, 256 + bucket)
+    pages_per_seq = 4
+    total_tokens = sum(q_lens)
+    rng = np.random.default_rng(42)
+
+    shape = wrapper.get_kv_cache_shape(
+        num_seqs * pages_per_seq + 4,
+        PAGE_SIZE,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        jnp.bfloat16,
+        kv_layout=kv_layout,
+    )
+    cache_init = jnp.asarray(rng.standard_normal(shape) * 0.5, jnp.bfloat16)
+    page_indices = jnp.asarray(
+        rng.permutation(shape[0])[: num_seqs * pages_per_seq], dtype=jnp.int32
+    )
+    q = jnp.asarray(
+        rng.standard_normal((total_tokens, NUM_Q_HEADS, HEAD_DIM)) * 0.5,
+        jnp.bfloat16,
+    )
+    k_garbage = jnp.full(
+        (total_tokens, NUM_KV_HEADS, HEAD_DIM), np.nan, dtype=jnp.bfloat16
+    )
+    v_garbage = jnp.full(
+        (total_tokens, NUM_KV_HEADS, HEAD_DIM), np.nan, dtype=jnp.bfloat16
+    )
+
+    cache_init_np = np.asarray(cache_init.astype(jnp.float32))
+
+    for kwarg in ({"skip_kv_update": True}, {"update_kv_cache": False}):
+      cache_input = jnp.asarray(cache_init_np, dtype=jnp.bfloat16)
+      out, new_cache = wrapper.ragged_paged_attention(
+          q,
+          k_garbage,
+          v_garbage,
+          cache_input,
+          jnp.asarray(kv_lens, dtype=jnp.int32),
+          page_indices,
+          jnp.asarray([0, bucket, 2 * bucket], dtype=jnp.int32),
+          jnp.asarray([num_seqs, num_seqs, num_seqs], dtype=jnp.int32),
+          sm_scale=HEAD_DIM**-0.5,
+          decode_query_size=bucket,
+          kv_layout=kv_layout,
+          **kwarg,
+      )
+      out, new_cache = jax.block_until_ready((out, new_cache))
+      out_np = np.asarray(out.astype(jnp.float32))
+      cache_np = np.asarray(new_cache.astype(jnp.float32))
+
+      self.assertTrue(np.isfinite(out_np).all())
+      self.assertTrue(np.isfinite(cache_np).all())
+      np.testing.assert_array_equal(
+          cache_np,
+          cache_init_np,
+          err_msg=f"Cache was clobbered under {kwarg}",
+      )
+
 
 if __name__ == "__main__":
   absltest.main()
+
