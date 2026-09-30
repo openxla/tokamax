@@ -270,6 +270,28 @@ class BenchmarkingTest(parameterized.TestCase):
         with benchmarking.XprofProfileSession(use_jax_profiler=True):
           pass
 
+  def test_xprof_timer_retries_failed_profile(self):
+    if jax.default_backend() == 'cpu':
+      self.skipTest('XProf profiling is only supported on GPU or TPU.')
+    x = jnp.ones((512, 512))
+    real_stop_trace = jax.profiler.stop_trace
+    num_failures = 0
+
+    def flaky_stop_trace():
+      nonlocal num_failures
+      if num_failures == 0:
+        num_failures += 1
+        raise RuntimeError('Simulated trace export failure.')
+      return real_stop_trace()
+
+    with (
+        mock.patch.object(jax.profiler, 'stop_trace', flaky_stop_trace),
+        mock.patch.object(benchmarking, '_PROFILE_RETRY_DELAY_S', 0.0),
+    ):
+      dt_ms, _ = benchmarking.hermetic_xprof_timer(_matmul_sum, x)(False)
+    self.assertEqual(num_failures, 1)
+    self.assertGreater(dt_ms, 0)
+
 
 if __name__ == '__main__':
   absltest.main()
