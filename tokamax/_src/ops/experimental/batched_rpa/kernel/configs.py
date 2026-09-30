@@ -122,6 +122,20 @@ class RpaConfigs:
     def n_buffer(self) -> int:
         return self.block.n_buffer
 
+    def seq_range(
+        self, distribution: jax.Array
+    ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+        """Sequences this kernel call schedules.
+
+        Batched RPA has no specialised prefill-only path, so MIXED also covers the
+        prefill-only segment [distribution[0], distribution[1]).
+        """
+        if self.mode == RpaCase.DECODE:
+            return 0, distribution[0]
+        if self.mode == RpaCase.MIXED:
+            return distribution[0], distribution[2]
+        raise ValueError(f"Batched RPA does not dispatch {self.mode}; use MIXED.")
+
     # Define derived values.
 
     @property

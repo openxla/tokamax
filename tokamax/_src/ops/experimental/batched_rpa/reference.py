@@ -102,7 +102,7 @@ def batched_ragged_paged_attention_reference(
     kv_lens: [max_num_seqs] sequence lengths for each request.
     page_indices: [max_num_seqs * pages_per_seq] page allocation mapping.
     cu_q_lens: [max_num_seqs + 1] cumulative query tokens per request.
-    distribution: [3] active counts for [prefill, decode, mixed] batch splits.
+    distribution: [3] cumulative end indices for decode, prefill-only, and mixed batch splits.
     use_causal_mask: Whether to apply lower-triangular causal masking.
     sm_scale: Softmax scaling factor (typically 1 / sqrt(head_dim)).
     sliding_window: Optional local attention window size.

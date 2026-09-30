@@ -806,7 +806,7 @@ class BaseMetadataComputer:
             kv_cache_lens_ref=kv_cache_lens_ref,
             kv_new_lens_ref=kv_new_lens_ref,
         )
-        start_seq_idx, end_seq_idx = self.cfgs.mode.get_range(
+        start_seq_idx, end_seq_idx = self.cfgs.seq_range(
             distribution_ref  # pyrefly: ignore[bad-argument-type]
         )  # pytype: disable=bad-argument-type
         init_carry = LoopCarry(0, 0)

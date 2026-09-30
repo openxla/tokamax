@@ -563,7 +563,9 @@ def ragged_paged_attention(
             length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
             b=cu_q_lens[i+1] represents q/k/v of sequence i.
         distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
-            sequences. distribution[2] represents total number of sequences.
+            sequences (cumulative end indices for decode, prefill-only, and mixed).
+            The prefill-only segment is handled by the mixed kernel call.
+            distribution[2] represents total number of sequences.
         sm_scale: Softmax scale value.
         sliding_window: Size of sliding window (also known as local attention). kvs
             outside of the window is not fetched from hbm and masked out during
@@ -818,9 +820,6 @@ def ragged_paged_attention(
 
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
-    )
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.PREFILL, o_hbm_alias_q_hbm, kv_cache, lse_hbm
     )
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm

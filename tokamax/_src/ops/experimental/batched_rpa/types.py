@@ -101,7 +101,9 @@ class RpaCase(enum.StrEnum):
   """Represents the different cases for Ragged Paged Attention.
 
   - DECODE: Sequences are in decode-only mode (q_len = 1).
-  - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
+  - PREFILL: Sequences are in prefill-only mode (q_len > 1, static). Note that
+    Batched RPA folds PREFILL into MIXED, but the enum value is kept because
+    distribution still has three entries and RPA v3 / MLA use it.
   - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
   """
 
