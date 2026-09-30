@@ -303,6 +303,11 @@ def calculate_block_sizes(
         # Sum up all buffer memory usage (scales are co-located inside bkv_bytes).
         buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
 
+        if serve_cfgs.return_lse:
+            lse_array_size = bq_sz * aligned_num_q_heads * num_lanes
+            lse_bytes = lse_array_size * out_bytes * 2
+            buffer_bytes += lse_bytes
+
         # Step 2: Calculate worst case memory usage during computation.
 
         # Calculate the size of loaded bq and bkv size.
@@ -340,6 +345,17 @@ def calculate_block_sizes(
 
         # Account for batch size.
         total_bytes *= batch_size
+
+        # Online-softmax scratch (m, l, and the output accumulator)
+        lm_array_size = (
+            model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+        )
+        acc_array_size = (
+            model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+        )
+        # m and l scratches share the same shape.
+        scratch_bytes = (2 * lm_array_size + acc_array_size) * out_bytes
+        total_bytes += scratch_bytes
 
         return total_bytes
 
