@@ -627,14 +627,11 @@ def ragged_paged_attention(
     if update_kv_cache is not None:
         skip_kv_update = not update_kv_cache
 
-    orig_kv_cache_ndim = kv_cache.ndim
-    if kv_cache.ndim == 4:
-        if kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE:
-            kv_packing = utils.get_dtype_packing(kv_cache.dtype)
-            num_pages, page_sz, kv_heads_x2, h_dim = kv_cache.shape
-            kv_cache = kv_cache.reshape(
-                num_pages, page_sz, kv_heads_x2 // kv_packing, kv_packing, h_dim
-            )
+    if kv_cache.ndim != 5:
+        raise ValueError(
+            f"ragged_paged_attention expects 5D kv_cache matching get_kv_cache_shape, "
+            f"got {kv_cache.ndim}D shape {kv_cache.shape}"
+        )
 
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
@@ -832,13 +829,6 @@ def ragged_paged_attention(
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
-    if orig_kv_cache_ndim == 4 and kv_cache.ndim == 5:
-        kv_cache = kv_cache.reshape(
-            kv_cache.shape[0],
-            kv_cache.shape[1],
-            kv_cache.shape[2] * kv_cache.shape[3],
-            kv_cache.shape[4],
-        )
 
     if not return_lse:
         return o_hbm, kv_cache
