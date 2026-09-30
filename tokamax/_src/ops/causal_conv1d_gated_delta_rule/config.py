@@ -129,6 +129,29 @@ class GDNConfig:
     num_lanes = tpu_info.num_lanes
     return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
+  @property
+  def is_kda(self) -> bool:
+    return getattr(self, "attention_mode", None) == "kda"
+
+  @property
+  def triangular_block_size(self) -> int:
+    """Diagonal block size B for `invert_triangular_matrix`."""
+    # Within-block forward substitution issues head_groups * B / 2 broadcasts
+    # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
+    # - GDN issues O(1 / B) between-block solver matmuls per token, so scale
+    #   B inversely with head_groups (head_groups * B <= 16).
+    # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
+    #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
+    head_groups = pl.cdiv(self.num_v_heads, 8)
+    # KDA
+    if self.is_kda:
+      for b in (16, 8, 4):
+        if head_groups * b * b <= 256:
+          return b
+      return 2
+    # GDN
+    return max(2, min(16, 16 // head_groups))
+
   def get_kernel_name(self) -> str:
     # Windows of different sizes compile to different kernels; keep them
     # distinguishable in profiles.

@@ -34,8 +34,8 @@ def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
 
 
 # NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
-def invert_triangular_matrix(t: jax.Array, block_size: int = 16) -> jax.Array:
-  """Compute invert matrix of a given triauglar matrix."""
+def invert_triangular_matrix(t: jax.Array, block_size: int) -> jax.Array:
+  """Inverts a unit lower-triangular matrix in blocks of block_size rows."""
 
   # NOTE: if chunk_size=1, compiler will perform DCE.
   out_dtype = t.dtype
@@ -169,7 +169,7 @@ def chunked_gdn_per_seq(
   t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
 
   # [num_v_heads, chunk, chunk]
-  t_inv = invert_triangular_matrix(t)
+  t_inv = invert_triangular_matrix(t, block_size=cfg.triangular_block_size)
 
   # [num_v_heads, chunk, v_head_dim]
   v_beta_large = v_large * beta_large
