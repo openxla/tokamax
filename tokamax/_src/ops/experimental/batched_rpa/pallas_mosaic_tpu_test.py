@@ -94,7 +94,7 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
     )
     kv_cache = jax.random.normal(
         k4,
-        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=jnp.bfloat16,
     )
 
