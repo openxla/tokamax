@@ -225,7 +225,7 @@ def make_tgmm_configs(
           " Sub-channel quantization is not implemented."
       )
     assert rhs_scale.shape == (1, 1, size_n), (
-        f"expecting rhs_scale.shape to be (1, 1, size_n) but got"
+        "expecting rhs_scale.shape to be (1, 1, size_n) but got"
         f" {rhs_scale.shape}"
     )
   # size_lhs_sublane is used in tgmm_inner_kernel to set the
@@ -269,7 +269,13 @@ def make_tgmm_configs(
   else:
     tiles = tile_info(
         # pyrefly: ignore[bad-argument-type]
-        dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, out_dtype, acc_dtype,
+        dims,
+        lhs_cfgs,
+        rhs_cfgs,
+        # pyrefly: ignore[bad-argument-type]
+        vmem_limit_bytes,
+        out_dtype,
+        acc_dtype,
         target_zero_ref_bytes,
     )
   assert tiles.tile_m % tiles.bucket_base == 0, (
@@ -560,9 +566,7 @@ def zero_out_end(
     semaphore_ref,  # [1]
 ):
   """Drain the DMAs started by zero_out_start."""
-  dst = out_ref.at[
-      pl.ds(0, num_groups_to_zero),
-  ]
+  dst = out_ref.at[pl.ds(0, num_groups_to_zero),]
   src = dst
   pltpu.make_async_copy(
       src_ref=src,
@@ -841,7 +845,9 @@ def tgmm_v2(
   return pl.kernel(
       functools.partial(tgmm_kernel_main, cfgs=cfgs),
       out_type=out_init,
-      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      mesh=pltpu.create_tensorcore_mesh(axis_name="core")
+      if jax.__version_info__ < (0, 11, 0)
+      else pltpu.TensorCoreMesh(axis_name="core"),
       # pyrefly: ignore[bad-argument-type]
       scratch_types=scratch_shapes,
       compiler_params=pltpu.CompilerParams(

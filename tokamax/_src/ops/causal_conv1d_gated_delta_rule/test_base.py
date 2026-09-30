@@ -31,7 +31,6 @@ import numpy as np
 from tokamax._src import mosaic_tpu
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import base
 
-
 # Argument names that must be static for every implementation. `config` is
 # additionally static for `op.Op`-derived implementations.
 STATIC_ARGNAMES: Sequence[str] = ("n_kq", "n_v", "d_k", "d_v", "kernel_size")
@@ -144,6 +143,8 @@ class CausalConv1dGatedDeltaRuleTestBase(parameterized.TestCase):
   def test_run_jax_gdn_attention_local(
       self, max_reqs, lengths, q_loc, distribution
   ):
+    if jax.__version_info__ < (0, 11, 0):
+      self.skipTest("JAX v0.11.0 or newer is required.")
     kq_head_dim = 128
     v_head_dim = 128
     n_kq = 2

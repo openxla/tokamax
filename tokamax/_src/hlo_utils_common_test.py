@@ -22,10 +22,11 @@ from tokamax._src import hlo_utils_common
 class HloUtilsCommonTest(absltest.TestCase):
 
   def test_kernel_name_consistency(self):
-    self.assertEqual(
-        hlo_utils_common.PALLAS_TRITON_KEY,
-        pallas_triton.CUSTOM_CALL_TARGET_NAME,
-    )
+    if hasattr(pallas_triton, "CUSTOM_CALL_TARGET_NAME"):
+      self.assertEqual(
+          hlo_utils_common.PALLAS_TRITON_KEY,
+          pallas_triton.CUSTOM_CALL_TARGET_NAME,
+      )
 
 
 if __name__ == "__main__":
