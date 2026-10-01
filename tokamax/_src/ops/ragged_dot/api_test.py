@@ -402,14 +402,21 @@ class RaggedDotMosaicTpuV2Test(RaggedDotImplementationTest):
       # v2 does not support the element-wise `activation`.
       if kwargs.get("activation") is not None:
         self.skipTest("v2 does not support `activation`.")
-      # v2 accepts only raw arrays; `QArray`/`AsQArray` inputs are rejected.
       lhs_ = jax.eval_shape(quantization.as_array_or_qarray, lhs)
       rhs_ = jax.eval_shape(quantization.as_array_or_qarray, rhs)
-      if isinstance(lhs_, qwix.QArray) or isinstance(rhs_, qwix.QArray):
-        with self.assertRaises(NotImplementedError) as e:
-          _ = dot_fn(lhs, rhs, **kwargs)
-        self.skipTest(f"Test not supported: {e.msg}")
-      return dot_fn(lhs, rhs, **kwargs)
+      if not isinstance(lhs_, qwix.QArray) and (
+          not isinstance(rhs_, qwix.QArray)
+          or (
+              rhs_.scale.ndim == 3
+              and rhs_.scale.shape[0] == rhs_.shape[0]
+              and rhs_.scale.shape[2] == rhs_.shape[2]
+              and rhs_.shape[1] % rhs_.scale.shape[1] == 0
+          )
+      ):
+        return dot_fn(lhs, rhs, **kwargs)
+      with self.assertRaises(NotImplementedError) as e:
+        _ = dot_fn(lhs, rhs, **kwargs)
+      self.skipTest(f"Test not supported: {e.msg}")
 
     self._dot_fn = fn
 
@@ -429,6 +436,28 @@ class RaggedDotMosaicTpuV2Test(RaggedDotImplementationTest):
       super()._test_simple(dtype)
 
   @override
+  def _test_quantized(
+      self,
+      a_dtype,
+      b_dtype,
+      a_tile_shape,
+      b_tile_shape,
+      use_as_qarray,
+      activation=None,
+      task=(8, 512, 256, 512),
+  ):
+    with test_base.override_chex_args(atol=0.4, rtol=0.1):
+      super()._test_quantized(
+          a_dtype,
+          b_dtype,
+          a_tile_shape,
+          b_tile_shape,
+          use_as_qarray,
+          activation,
+          task,
+      )
+
+  @override
   def _test_vjp(self, num_groups, m, k, n, activation=None):
     # There is a Mosaic compile error most likely comes from the f32 dout /
     # f32 output combination. Since we mainly use bf16 for inputs and outputs,
@@ -443,7 +472,9 @@ class RaggedDotMosaicTpuV2Test(RaggedDotImplementationTest):
         "TPU v5p",
     ):
       self.skipTest("gmm_v2 tiling exceeds scoped VMEM on TPU v5.")
-    super()._test_bench(spec)
+    tol = dict(atol=0.7, rtol=0.1) if "i4" in self._testMethodName else {}
+    with test_base.override_chex_args(**tol):
+      super()._test_bench(spec)
 
 
 class RaggedDotMosaicTpuV2KwargsTest(parameterized.TestCase):
@@ -457,8 +488,6 @@ class RaggedDotMosaicTpuV2KwargsTest(parameterized.TestCase):
     super().setUp()
 
   @parameterized.named_parameters(
-      ("rhs_bias", "rhs_bias"),
-      ("rhs_scale", "rhs_scale"),
       ("fuse_gateup_activation", "fuse_gateup_activation"),
       ("group_offset", "group_offset"),
       ("zero_initialize", "zero_initialize"),
@@ -467,20 +496,16 @@ class RaggedDotMosaicTpuV2KwargsTest(parameterized.TestCase):
     num_groups, m, k, n = 4, 256, 256, 256
     lhs, rhs, group_sizes = _get_input_data(num_groups, m, k, n)
     kwargs = {}
-    if kwarg == "rhs_bias":
-      kwargs["rhs_bias"] = jnp.ones((num_groups, 1, n), jnp.bfloat16)
-    elif kwarg == "rhs_scale":
-      rhs = rhs.astype(jnp.float8_e4m3fn)
-      kwargs["rhs_scale"] = jnp.full((num_groups, 1, 1, n), 0.5, jnp.float32)
-    elif kwarg == "fuse_gateup_activation":
+    if kwarg == "fuse_gateup_activation":
       kwargs["fuse_gateup_activation"] = "silu"
     elif kwarg == "group_offset":
       group_offset = 1
       # `rhs` holds only the local groups; `group_sizes` stays global.
       rhs = rhs[group_offset:]
       kwargs["group_offset"] = jnp.array([group_offset], jnp.int32)
+      kwargs["zero_initialize"] = True
     elif kwarg == "zero_initialize":
-      kwargs["zero_initialize"] = False
+      kwargs["zero_initialize"] = True
 
     actual = api.ragged_dot(
         lhs, rhs, group_sizes, implementation="mosaic_tpu_v2", **kwargs
@@ -493,14 +518,8 @@ class RaggedDotMosaicTpuV2KwargsTest(parameterized.TestCase):
 
 _V2_KWARGS: dict[str, Callable[[int, int], Any]] = {
     "group_offset": lambda g, n: jnp.array([0], jnp.int32),
-    "rhs_scale": lambda g, n: jnp.ones((g, 1, 1, n), jnp.float32),
-    "rhs_bias": lambda g, n: jnp.ones((g, 1, n), jnp.bfloat16),
-    "maybe_quantize_lhs": lambda g, n: True,
-    "lhs_scale": lambda g, n: jnp.ones((1, 1), jnp.float32),
-    "zero_initialize": lambda g, n: False,
+    "zero_initialize": lambda g, n: True,
     "fuse_gateup_activation": lambda g, n: "silu",
-    "lhs_quantization_dtype": lambda g, n: jnp.float8_e4m3fn,
-    "rhs_quantization_dtype": lambda g, n: jnp.float8_e4m3fn,
 }
 
 

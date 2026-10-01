@@ -20,7 +20,9 @@ from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+import qwix
 from tokamax._src import benchmarking
+from tokamax._src import quantization
 from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.experimental.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
@@ -51,16 +53,14 @@ class GmmPerfTest(parameterized.TestCase):
         rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
-    lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=lhs,
-        rhs=rhs_q,
+        lhs=quantization.AsQArray(
+            lhs, jnp.float8_e4m3fn, calibration_method="fixed,-224,224"
+        ),
+        rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
-        rhs_scale=rhs_scale,
-        maybe_quantize_lhs=True,
-        lhs_scale=lhs_scale,
         preferred_element_type=jnp.bfloat16,
     )
     fn, args = benchmarking.standardize_function(
@@ -100,9 +100,8 @@ class GmmPerfTest(parameterized.TestCase):
     )
     benchmark_config = dict(
         lhs=lhs,
-        rhs=grad_q,
+        rhs=qwix.QArray(grad_q, grad_scale),
         group_sizes=group_sizes,
-        rhs_scale=grad_scale,
         ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS,
         preferred_element_type=jnp.bfloat16,
     )
@@ -228,12 +227,10 @@ class GmmPerfTest(parameterized.TestCase):
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=lhs,
-        rhs=rhs_q,
+        lhs=quantization.AsQArray(lhs, jnp.float8_e4m3fn),
+        rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
         group_offset=jnp.array([group_offset], jnp.int32),
-        rhs_scale=rhs_scale,
-        maybe_quantize_lhs=True,
         # The MoE layer writes only the rows owned by this shard.
         zero_initialize=False,
         fuse_gateup_activation=fuse_act,

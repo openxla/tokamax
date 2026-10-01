@@ -90,14 +90,8 @@ def ragged_dot(
         | None
     ) = None,
     bypass_device_check: bool | None = None,
-    rhs_scale: Array | None = None,
-    rhs_bias: Array | None = None,
-    maybe_quantize_lhs: bool = False,
-    lhs_scale: Array | None = None,
-    zero_initialize: bool = True,
+    zero_initialize: bool = False,
     fuse_gateup_activation: str | None = None,
-    lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-    rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
 ) -> Float[Array, "M N"]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -127,20 +121,11 @@ def ragged_dot(
       that doesn't raise a `NotImplementedError` is used.
     bypass_device_check: Whether to bypass device validation. If None (default),
       bypasses device check when an implementation is explicitly passed in.
-    rhs_scale: GMM v2 feature. The rhs scale when rhs is quantized.
-    rhs_bias: GMM v2 feature. The rhs bias: ragged_dot(lhs, rhs) + rhs_bias.
-    maybe_quantize_lhs: GMM v2 feature. Quantize lhs if set to True and rhs is
-      quantized.
-    lhs_scale: GMM v2 feature. The lhs scale when maybe_quantize_lhs is True.
     zero_initialize: GMM v2 feature. Whether to initialize unvisited output
-      elements to zero. Defaults to True (standard behavior).
+      elements to zero. Defaults to False.
     fuse_gateup_activation: GMM v2 feature. Name of a gated activation to fuse
       into the kernel: `activate(out[:, :n // 2]) * out[:, n // 2:]`. This is
       different from `activation`, which is applied to the full output.
-    lhs_quantization_dtype: GMM v2 feature. The dtype to use for the lhs
-      quantization.
-    rhs_quantization_dtype: GMM v2 feature. The dtype to use for the rhs
-      quantization.
 
   Returns:
     (m, n) shaped array with `preferred_element_type` element type.
@@ -157,14 +142,8 @@ def ragged_dot(
       manual_axis_type=manual_axis_type,
       implementation=implementation,
       bypass_device_check=bypass_device_check,
-      rhs_scale=rhs_scale,
-      rhs_bias=rhs_bias,
-      maybe_quantize_lhs=maybe_quantize_lhs,
-      lhs_scale=lhs_scale,
       zero_initialize=zero_initialize,
       fuse_gateup_activation=fuse_gateup_activation,
-      lhs_quantization_dtype=lhs_quantization_dtype,
-      rhs_quantization_dtype=rhs_quantization_dtype,
   )
 
 
@@ -185,14 +164,8 @@ def ragged_dot_general(
         | None
     ) = None,
     bypass_device_check: bool | None = None,
-    rhs_scale: Array | None = None,
-    rhs_bias: Array | None = None,
-    maybe_quantize_lhs: bool = False,
-    lhs_scale: Array | None = None,
-    zero_initialize: bool = True,
+    zero_initialize: bool = False,
     fuse_gateup_activation: str | None = None,
-    lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-    rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
 ) -> Float[Array, "..."]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -222,20 +195,11 @@ def ragged_dot_general(
     bypass_device_check: Whether to bypass device validation on the op. If None
       (default), bypasses device check when an implementation is explicitly
       passed in (manual implementation).
-    rhs_scale: GMM v2 feature. The rhs scale when rhs is quantized.
-    rhs_bias: GMM v2 feature. The rhs bias: ragged_dot(lhs, rhs) + rhs_bias.
-    maybe_quantize_lhs: GMM v2 feature. Quantize lhs if set to True and rhs is
-      quantized.
-    lhs_scale: GMM v2 feature. The lhs scale when maybe_quantize_lhs is True.
     zero_initialize: GMM v2 feature. Whether to initialize unvisited output
-      elements to zero. Defaults to True (standard behavior).
+      elements to zero. Defaults to False.
     fuse_gateup_activation: GMM v2 feature. Name of a gated activation to fuse
       into the kernel: `activate(out[:, :n // 2]) * out[:, n // 2:]`. This is
       different from `activation`, which is applied to the full output.
-    lhs_quantization_dtype: GMM v2 feature. The dtype to use for the lhs
-      quantization.
-    rhs_quantization_dtype: GMM v2 feature. The dtype to use for the rhs
-      quantization.
 
   Returns:
     An array with `preferred_element_type` element type.
@@ -291,22 +255,10 @@ def ragged_dot_general(
         kwargs["manual_axis_type"] = manual_axis_type
       if group_offset is not None:
         kwargs["group_offset"] = group_offset
-      if rhs_scale is not None:
-        kwargs["rhs_scale"] = rhs_scale
-      if rhs_bias is not None:
-        kwargs["rhs_bias"] = rhs_bias
-      if maybe_quantize_lhs:
-        kwargs["maybe_quantize_lhs"] = maybe_quantize_lhs
-      if lhs_scale is not None:
-        kwargs["lhs_scale"] = lhs_scale
-      if not zero_initialize:
+      if zero_initialize:
         kwargs["zero_initialize"] = zero_initialize
       if fuse_gateup_activation is not None:
         kwargs["fuse_gateup_activation"] = fuse_gateup_activation
-      if lhs_quantization_dtype is not None:
-        kwargs["lhs_quantization_dtype"] = lhs_quantization_dtype
-      if rhs_quantization_dtype is not None:
-        kwargs["rhs_quantization_dtype"] = rhs_quantization_dtype
       if bypass_device_check and isinstance(impl, base.op.Op):
         impl = impl.replace(bypass_device_check=True)
 

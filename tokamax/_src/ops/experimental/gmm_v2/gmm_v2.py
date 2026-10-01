@@ -1241,6 +1241,8 @@ def is_manually_cast_matmul_dtype_combo(
       # (lhs_dtype, rhs_dtype)
       (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.int4)),
       (jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.int4)),
+      (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float4_e2m1fn)),
+      (jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.float4_e2m1fn)),
       (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.bfloat16)),
       (jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.bfloat16)),
   }
