@@ -566,6 +566,15 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           v_dim=10000,
           reduction="sum",
       ),
+      dict(
+          testcase_name=(
+              "bwd_all_non_aligned_b4096_h1288_v2664_sum_reduction_test"
+          ),
+          b_dim=4096,
+          h_dim=1288,
+          v_dim=2664,
+          reduction="sum",
+      ),
   )
   def test_kernel_bwd_matches_reference(self, b_dim, h_dim, v_dim, reduction):
     config = kernel.get_heuristic_bwd_config(b_dim, h_dim, v_dim)
@@ -650,6 +659,154 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           b_block_size=config.b_block_size,
           h_block_size=config.h_block_size,
           v_block_size=config.v_block_size,
+      )
+
+  def test_bwd_odd_num_v_blocks_multi_core(self):
+    b_dim, h_dim, v_dim = 1024, 512, 2560
+    b_block_size, h_block_size, v_block_size = 1024, 512, 1024
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), jnp.float32)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
+    )
+    lse = jax.nn.logsumexp(x @ w, axis=-1)
+    dout = numerics.random_initialize(
+        (jax.ShapeDtypeStruct((), jnp.float32),), seed=42
+    )[0]
+
+    kernel_grad_x, kernel_grad_w = (
+        kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+            dout,
+            lse,
+            x,
+            labels,
+            w,
+            reduction="sum",
+            b_block_size=b_block_size,
+            h_block_size=h_block_size,
+            v_block_size=v_block_size,
+        )
+    )
+    self.assertEqual(kernel_grad_x.shape, (b_dim, h_dim))
+    self.assertEqual(kernel_grad_w.shape, (h_dim, v_dim))
+
+    ref_grad_x, ref_grad_w = (
+        reference.linear_softmax_cross_entropy_loss_bwd_reference(
+            dout, lse, x, labels, w, reduction="sum"
+        )
+    )
+    self._assert_allclose(
+        kernel_grad_x, ref_grad_x, atol=5e-2, rtol=5e-2, name="grad_x"
+    )
+    self._assert_allclose(
+        kernel_grad_w, ref_grad_w, atol=5e-2, rtol=5e-2, name="grad_w"
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="b1024_h520_v2048",
+          b_dim=1024,
+          h_dim=520,
+          v_dim=2048,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+      dict(
+          testcase_name="b1024_h640_v2048",
+          b_dim=1024,
+          h_dim=640,
+          v_dim=2048,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+      dict(
+          testcase_name="b2048_h520_v2048",
+          b_dim=2048,
+          h_dim=520,
+          v_dim=2048,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+      dict(
+          testcase_name="b1024_h1024_v2048",
+          b_dim=1024,
+          h_dim=1024,
+          v_dim=2048,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+      dict(
+          testcase_name="b1024_h520_v2049",
+          b_dim=1024,
+          h_dim=520,
+          v_dim=2049,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+  )
+  def test_kernel_bwd_explicit_block_sizes_matches_reference(
+      self,
+      b_dim: int,
+      h_dim: int,
+      v_dim: int,
+      b_block_size: int,
+      h_block_size: int,
+      v_block_size: int,
+  ):
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), jnp.float32)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
+    )
+    lse = jax.nn.logsumexp(x @ w, axis=-1)
+    dout = numerics.random_initialize(
+        (jax.ShapeDtypeStruct((), jnp.float32),), seed=42
+    )[0]
+
+    ref_grad_x, ref_grad_w = (
+        reference.linear_softmax_cross_entropy_loss_bwd_reference(
+            dout, lse, x, labels, w, reduction="sum"
+        )
+    )
+
+    for i in range(3):
+      kernel_grad_x, kernel_grad_w = (
+          kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+              dout,
+              lse,
+              x,
+              labels,
+              w,
+              reduction="sum",
+              b_block_size=b_block_size,
+              h_block_size=h_block_size,
+              v_block_size=v_block_size,
+          )
+      )
+      self._assert_allclose(
+          kernel_grad_x,
+          ref_grad_x,
+          atol=5e-2,
+          rtol=5e-2,
+          name=f"grad_x_run_{i}",
+      )
+      self._assert_allclose(
+          kernel_grad_w,
+          ref_grad_w,
+          atol=5e-2,
+          rtol=5e-2,
+          name=f"grad_w_run_{i}",
       )
 
 
@@ -739,7 +896,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=16 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=256
+              b_block_size=1024, h_block_size=512, v_block_size=128
           ),
       ),
       dict(
@@ -759,7 +916,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=57 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=2048
+              b_block_size=1024, h_block_size=512, v_block_size=1024
           ),
       ),
   )
@@ -856,6 +1013,80 @@ class CostEstimateTest(parameterized.TestCase):
     self.assertEqual(cost.flops, expected_flops)
     self.assertEqual(cost.transcendentals, expected_transcendentals)
     self.assertEqual(cost.bytes_accessed, expected_bytes)
+
+
+class SafeInputOutputBufferCountTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="out_1_passthrough",
+          requested=(2, 1),
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+      dict(
+          testcase_name="none_revisit_passthrough",
+          requested=(2, 2),
+          revisit_distance=None,
+          expected=(2, 2),
+      ),
+      dict(
+          testcase_name="distance_1_passthrough",
+          requested=(2, 2),
+          revisit_distance=1,
+          expected=(2, 2),
+      ),
+      dict(
+          testcase_name="distance_2_fallback",
+          requested=(2, 2),
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+      dict(
+          testcase_name="distance_3_safe",
+          requested=(2, 2),
+          revisit_distance=3,
+          expected=(2, 2),
+      ),
+      dict(
+          testcase_name="in_1_out_2_distance_2_safe",
+          requested=(1, 2),
+          revisit_distance=2,
+          expected=(1, 2),
+      ),
+      dict(
+          testcase_name="in_3_out_2_distance_2_fallback",
+          requested=(3, 2),
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+      dict(
+          testcase_name="in_3_out_1_distance_2_fallback",
+          requested=(3, 1),
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+      dict(
+          testcase_name="int_input_safe",
+          requested=2,
+          revisit_distance=2,
+          expected=2,
+      ),
+      dict(
+          testcase_name="int_input_fallback",
+          requested=3,
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+  )
+  def test_safe_input_output_buffer_count(
+      self,
+      requested: tuple[int, int] | int,
+      revisit_distance: int | None,
+      expected: tuple[int, int] | int,
+  ):
+    actual = kernel._safe_input_output_buffer_count(requested, revisit_distance)
+    self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":
