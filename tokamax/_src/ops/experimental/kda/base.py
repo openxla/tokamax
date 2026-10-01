@@ -77,6 +77,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
   """
 
   supports_symbolic_shapes = False
+  residuals_checkpoint_name = "kda_residuals"
 
   @jaxtyping.jaxtyped
   @override
@@ -85,7 +86,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       query: Float[Array | AbstractArray, "H B T K"],
       key: Float[Array | AbstractArray, "H B T K"],
       value: Float[Array | AbstractArray, "H B T V"],
-      gate: Float[Array | AbstractArray, "H B T K"],
+      gate: Float[Array | AbstractArray, "H B T GW"],
       beta: Float[Array | AbstractArray, "H B T"],
       *,
       a_log: Float[Array | AbstractArray, "H"] | None = None,
@@ -97,6 +98,8 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       output_final_state: bool = False,
       use_qk_l2norm: bool = False,
       use_gate_in_kernel: bool = False,
+      per_channel_gate: bool = True,
+      chunk_size: int | None = None,
       segment_ids: Int[Array | AbstractArray, "B T"] | None = None,
       lower_bound: float | None = None,
       context_parallel_metadata: ContextParallelMetadata | None = None,
@@ -134,6 +137,36 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
           "`max_num_segments` is required when `segment_ids` is provided "
           "without `initial_state`."
       )
+    gate_width = gate.shape[-1]
+    if per_channel_gate:
+      if gate_width != key_dim:
+        raise ValueError(
+            f"`gate` last dimension {gate_width} must equal the key dimension"
+            f" {key_dim} when `per_channel_gate=True`."
+        )
+    elif gate_width not in (1, key_dim):
+      raise ValueError(
+          f"`gate` last dimension {gate_width} must be 1 (one value per head"
+          f" and token) or {key_dim} when `per_channel_gate=False`."
+      )
+    if not per_channel_gate and use_gate_in_kernel:
+      raise ValueError(
+          "`use_gate_in_kernel=True` needs a per-channel gate:"
+          " `delta_time_bias` is per key channel."
+      )
+    if chunk_size is not None:
+      if chunk_size not in (16, 32, 64, 128, 256, 512):
+        raise NotImplementedError(
+            f"`chunk_size` must be a power of two in [16, 512]; got"
+            f" {chunk_size}."
+        )
+      if per_channel_gate and chunk_size != 64:
+        raise NotImplementedError(
+            "`chunk_size` other than 64 is only supported with a scalar gate"
+            " (`per_channel_gate=False`). Kimi Delta Attention is validated at"
+            f" 64 only; got {chunk_size}."
+        )
+
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,
         a_log=a_log,
@@ -159,6 +192,8 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         output_final_state=output_final_state,
         use_qk_l2norm=use_qk_l2norm,
         use_gate_in_kernel=use_gate_in_kernel,
+        per_channel_gate=per_channel_gate,
+        chunk_size=chunk_size,
         segment_ids=segment_ids,
         lower_bound=lower_bound,
         context_parallel_metadata=context_parallel_metadata,
@@ -173,7 +208,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       query: Float[Array, "H B T K"],
       key: Float[Array, "H B T K"],
       value: Float[Array, "H B T V"],
-      gate: Float[Array, "H B T K"],
+      gate: Float[Array, "H B T GW"],
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None,
@@ -183,6 +218,8 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       output_final_state: bool,
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
+      per_channel_gate: bool,
+      chunk_size: int | None,
       segment_ids: Int[Array, "B T"] | None,
       lower_bound: float | None,
       context_parallel_metadata: ContextParallelMetadataArg,
@@ -191,7 +228,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       config: _Config,
   ) -> tuple[Output, Residuals]:
     """Dispatches to the pure JAX KDA reference implementation."""
-    del config, return_residuals
+    del config, return_residuals, per_channel_gate, chunk_size
     _validate_beta(beta)
     output = reference.kimi_delta_attention(
         query,

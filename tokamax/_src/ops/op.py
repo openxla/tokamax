@@ -28,6 +28,7 @@ from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final
 from absl import logging
 import immutabledict
 import jax
+from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import xla_metadata
 from jax.extend import backend
 import jax.numpy as jnp
@@ -162,6 +163,9 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
   # instances in array shapes.
   supports_symbolic_shapes: ClassVar[bool] = True
   supports_batched_args_capture: ClassVar[bool] = True
+  # Optional checkpoint name applied to forward residuals so jax.checkpoint
+  # policies (e.g., save_only_these_names) can retain them instead of recomputing.
+  residuals_checkpoint_name: ClassVar[str | None] = None
 
   config: C | None = None
   _: dataclasses.KW_ONLY
@@ -310,8 +314,23 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
 
         return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
 
+    fwd_for_vjp = fwd
+    if (res_name := self.residuals_checkpoint_name) is not None:
+
+      def fwd_for_vjp(*arrays):  # pylint: disable=function-redefined
+        """Tags forward residuals with checkpoint_name outside custom_vmap."""
+        ret, res = fwd(*arrays)
+        if isinstance(res, _FlatTree):
+          res = _FlatTree(
+              [checkpoint_name(v, res_name) if isinstance(v, jax.Array) else v
+               for v in res.values],
+              res.tree,
+          )
+        return ret, res
+
     f = jax.custom_vjp(f)
-    f.defvjp(fwd, bwd, optimize_remat=True)
+    # Disable optimize_remat when residuals are named so checkpoint policies can retain them.
+    f.defvjp(fwd_for_vjp, bwd, optimize_remat=res_name is None)
     return f(*arrays)
 
   def bind(

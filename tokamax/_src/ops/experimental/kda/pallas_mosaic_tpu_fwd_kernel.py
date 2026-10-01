@@ -586,6 +586,33 @@ def _solve_unit_lower_triangular_neumann_batched(A, b):
 # Fused gate cumsum and intra-chunk solve
 # =============================================================================
 
+def _scalar_gate_intra(q_f32, k_f32, g_cumsum, beta_f32, *, BT: int, scale: float):
+  """Computes intra-chunk Aqk and L for a scalar gate (Gated Delta Net)."""
+  gs = g_cumsum[:, :, 0]                                       # [MB, BT]
+  row = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
+  col = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
+  causal = row >= col
+  strict = row > col
+
+  # Mask pairwise differences before exp2 to prevent overflow on anti-causal entries.
+  diff = gs[:, :, None] - gs[:, None, :]                       # [MB, BT, BT]
+  decay = jnp.exp2(jnp.where(causal[None], diff, jnp.float32(0.0)))
+
+  qk = jax.lax.dot_general(
+    q_f32, k_f32, (((2,), (2,)), ((0,), (0,))),
+    preferred_element_type=jnp.float32,
+  )                                                            # [MB, BT, BT]
+  kk = jax.lax.dot_general(
+    k_f32, k_f32, (((2,), (2,)), ((0,), (0,))),
+    preferred_element_type=jnp.float32,
+  )                                                            # [MB, BT, BT]
+
+  zero = jnp.float32(0.0)
+  Aqk = jnp.where(causal[None], qk * decay * scale, zero)
+  L = jnp.where(strict[None], kk * decay * beta_f32, zero)
+  return Aqk, L
+
+
 def _fused_gate_intra_kernel(
   q_ref,
   k_ref,
@@ -610,6 +637,7 @@ def _fused_gate_intra_kernel(
   fuse_cumsum: bool,
   disable_recompute: bool,
   safe_gate: bool,
+  per_channel_gate: bool,
   use_gate_in_kernel: bool,
   lower_bound: float | None,
   mini_batch: int = 1,
@@ -643,14 +671,19 @@ def _fused_gate_intra_kernel(
   # Load all MB heads at once
   q = q_ref[:, 0, 0]        # [MB, BT, K]
   k = k_ref[:, 0, 0]        # [MB, BT, K]
-  g = g_ref[:, 0, 0]        # [MB, BT, K]
-  beta = beta_ref[:, 0, 0]  # [MB, BT, 1]
+  # Transpose width-1 inputs stored as [.., 1, BT] back to [MB, BT, 1].
+  if g_ref.shape[-2] == 1:
+    g = g_ref[:, 0, 0, 0][..., None]  # [MB, BT] -> [MB, BT, 1]
+  else:
+    g = g_ref[:, 0, 0]      # [MB, BT, K]
+  beta = beta_ref[:, 0, 0, 0][..., None]  # [MB, BT] -> [MB, BT, 1]
   v = v_ref[:, 0, 0]        # [MB, BT, V]
 
   # --- Gate activation + cumsum ---
   g_f32 = g.astype(jnp.float32)
 
   if use_gate_in_kernel:
+    assert per_channel_gate, "use_gate_in_kernel requires per_channel_gate=True"
     dt_b = delta_time_bias_ref[:, 0, 0, 0]        # [MB, K]
     g_f32 = g_f32 + dt_b[:, None, :]       # [MB, BT, K]
     A_val = a_log_ref[:, 0, 0, 0, 0]       # [MB]
@@ -696,7 +729,7 @@ def _fused_gate_intra_kernel(
 
   Aqk_rows = []
   L_rows = []
-  for i_sc in range(NC):
+  for i_sc in range(NC) if per_channel_gate else ():
     i_s = i_sc * BC
     q_i = q_f32[:, i_s : i_s + BC]       # [MB, BC, K]
     k_i = k_f32[:, i_s : i_s + BC]       # [MB, BC, K]
@@ -739,8 +772,14 @@ def _fused_gate_intra_kernel(
     Aqk_rows.append(Aqk_row)
     L_rows.append(Akk_row)
 
-  Aqk = jnp.concatenate(Aqk_rows, axis=1).astype(dtype)  # [MB, BT, BT]
-  L = jnp.concatenate(L_rows, axis=1)                     # [MB, BT, BT]
+  if per_channel_gate:
+    Aqk = jnp.concatenate(Aqk_rows, axis=1).astype(dtype)  # [MB, BT, BT]
+    L = jnp.concatenate(L_rows, axis=1)                     # [MB, BT, BT]
+  else:
+    Aqk, L = _scalar_gate_intra(
+      q_f32, k_f32, g_cumsum, beta_f32, BT=BT, scale=scale
+    )
+    Aqk = Aqk.astype(dtype)
 
   # --- Solve (I + L) x = rhs ---
   v_beta = v.astype(jnp.float32) * beta_f32          # [MB, BT, V]
@@ -797,6 +836,7 @@ def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
     "chunk_size",
     "scale",
     "safe_gate",
+    "per_channel_gate",
     "disable_recompute",
     "cumsum_scale",
     "use_gate_in_kernel",
@@ -809,11 +849,12 @@ def pallas_kda_fwd_intra_fused(
   q: Float[Array, "H B T K"],
   k: Float[Array, "H B T K"],
   v: Float[Array, "H B T V"],
-  g: Float[Array, "H B T K"],
+  g: Float[Array, "H B T GW"],
   beta: Float[Array, "H B T"],
   scale: float,
   chunk_size: int = 64,
   safe_gate: bool = True,
+  per_channel_gate: bool = True,
   disable_recompute: bool = False,
   cumsum_scale: float = RCP_LN2,
   a_log: Float[Array, "H"] | None = None,
@@ -828,7 +869,7 @@ def pallas_kda_fwd_intra_fused(
     Float[Array, "H B T K"],
     Float[Array, "H B T BT"],
     Float[Array, "H B T BT"],
-    Float[Array, "H B T K"],
+    Float[Array, "H B T GW"],
 ]:
   """Fuses gate cumsum with the fixed-length intra-chunk solve.
 
@@ -853,8 +894,11 @@ def pallas_kda_fwd_intra_fused(
   # [H, B, T, K] -> [H, B, NC, BT, K]
   q_r = q.reshape(H, B, NC, BT, K)
   k_r = k.reshape(H, B, NC, BT, K)
-  g_r = g.reshape(H, B, NC, BT, K)
-  beta_r = beta.reshape(H, B, NC, BT, 1)
+  GW = g.shape[-1]
+  scalar_gate = GW == 1
+  # Store width-1 axes as [.., 1, BT] to avoid 128-lane minor-axis padding in HBM.
+  g_r = g.reshape(H, B, NC, 1, BT) if scalar_gate else g.reshape(H, B, NC, BT, GW)
+  beta_r = beta.reshape(H, B, NC, 1, BT)
   v_r = v.reshape(H, B, NC, BT, V)
 
   if use_gate_in_kernel:
@@ -882,6 +926,13 @@ def pallas_kda_fwd_intra_fused(
       block_shape=(MB, 1, 1, 1, last_dim),
     )
 
+  def _make_narrow_spec():
+    """For an operand stored `[.., 1, BT]` to keep its size-1 axis off lanes."""
+    return pl.BlockSpec(
+      index_map=lambda i, j, l: (i, j, l, 0, 0),
+      block_shape=(MB, 1, 1, 1, BT),
+    )
+
   (u_r, w_r, qg_r, kg_r, Aqk_r, Akk_inv_r, g_cumsum_r) = pl.pallas_call(
     functools.partial(
       _fused_gate_intra_kernel,
@@ -893,6 +944,7 @@ def pallas_kda_fwd_intra_fused(
       fuse_cumsum=True,
       disable_recompute=disable_recompute,
       safe_gate=safe_gate,
+      per_channel_gate=per_channel_gate,
       use_gate_in_kernel=use_gate_in_kernel,
       lower_bound=lower_bound,
       mini_batch=MB,
@@ -905,13 +957,13 @@ def pallas_kda_fwd_intra_fused(
       jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
       jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
       jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, K), jnp.float32),
+      jax.ShapeDtypeStruct((H, B, NC, BT, GW), jnp.float32),
     ],
     in_specs=[
       _make_spec(K),
       _make_spec(K),
-      _make_spec(K),
-      _make_spec(1),
+      _make_narrow_spec() if scalar_gate else _make_spec(GW),
+      _make_narrow_spec(),
       _make_spec(V),
       _make_per_head_spec(1),
       _make_per_head_spec(K),
@@ -923,7 +975,7 @@ def pallas_kda_fwd_intra_fused(
       _make_spec(K),
       _make_spec(BT),
       _make_spec(BT),
-      _make_spec(K),
+      _make_spec(GW),
     ],
     grid=grid,
     compiler_params=pltpu.CompilerParams(
@@ -941,7 +993,7 @@ def pallas_kda_fwd_intra_fused(
   )
   Aqk_flat = Aqk_r.reshape(H, B, NC * BT, BT)
   Akk_flat = Akk_inv_r.reshape(H, B, NC * BT, BT)
-  g_cumsum_out = g_cumsum_r.reshape(H, B, T, K)
+  g_cumsum_out = g_cumsum_r.reshape(H, B, T, GW)
 
   return w_out, u_out, qg_out, kg_out, Aqk_flat, Akk_flat, g_cumsum_out
 
@@ -957,6 +1009,7 @@ def kda_fwd_intra_fused(
   chunk_size: int = 64,
   chunk_indices: jax.Array | None = None,
   safe_gate: bool = True,
+  per_channel_gate: bool = True,
   disable_recompute: bool = False,
   cumsum_scale: float = RCP_LN2,
   a_log: jax.Array | None = None,
@@ -973,14 +1026,20 @@ def kda_fwd_intra_fused(
   Returns:
       7-tuple: (w, u, qg, kg, Aqk, Akk, g_cumsum).
   """
-  assert chunk_size == 64, f"Expected chunk_size=64, got {chunk_size}"
+  assert per_channel_gate is False or chunk_size == 64, (
+    f"per-channel gate is validated at chunk_size=64 only; got {chunk_size}"
+  )
+  assert chunk_size in (16, 32, 64, 128, 256, 512), (
+    f"chunk_size must be a power of two in [16, 512]; got {chunk_size}"
+  )
 
   # The caller has already BT-aligned varlen inputs, so the same contiguous
   # fused kernel handles both fixed-length and variable-length batches.
   return pallas_kda_fwd_intra_fused(
     q=q, k=k, v=v, g=g, beta=beta,
     scale=scale, chunk_size=chunk_size,
-    safe_gate=safe_gate, disable_recompute=disable_recompute,
+    safe_gate=safe_gate, per_channel_gate=per_channel_gate,
+    disable_recompute=disable_recompute,
     cumsum_scale=cumsum_scale,
     a_log=a_log, delta_time_bias=delta_time_bias,
     use_gate_in_kernel=use_gate_in_kernel,
@@ -1153,7 +1212,7 @@ def chunk_kda_fwd_h_o_varlen(
   w: Float[Array, "H B T K"],
   u: Float[Array, "H B T V"],
   kg: Float[Array, "H B T K"],
-  gk: Float[Array, "H B T K"],
+  gk: Float[Array, "H B T GW"],
   q: Float[Array, "H B T K"],
   A: Float[Array, "H B T BT"],
   cu_seqlens: Int[Array, "N_CU"] | Int[Array, "B N_CU"],
@@ -1242,9 +1301,10 @@ def chunk_kda_fwd_h_o_varlen(
       x = jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, dim_pad)))
     return x
 
+  GW = gk.shape[-1]   # K for a per-channel gate, 1 for a scalar one
   w_t  = _pad_kdim_then_t(w,  K_PADSIZE - K)
   kg_t = _pad_kdim_then_t(kg, K_PADSIZE - K)
-  gk_t = _pad_kdim_then_t(gk, K_PADSIZE - K)
+  gk_t = _pad_kdim_then_t(gk, (K_PADSIZE - K) if GW == K else 0)
   q_t  = _pad_kdim_then_t(q,  K_PADSIZE - K)
   u_t  = _pad_kdim_then_t(u,  V_ALIGNED - V)
 
@@ -1271,6 +1331,9 @@ def chunk_kda_fwd_h_o_varlen(
     return (h, b, c, 0)
 
   bspec_k = pl.BlockSpec([MB, 1, BT, K_PADSIZE], index_map=_t_index_map)
+  # Narrow when the gate is scalar; identical to bspec_k otherwise.
+  bspec_gk = pl.BlockSpec(
+    [MB, 1, BT, K_PADSIZE if GW == K else GW], index_map=_t_index_map)
   bspec_v = pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_t_index_map)
   bspec_a = pl.BlockSpec([MB, 1, BT, BT],        index_map=_A_index_map)
   bspec_h0 = (
@@ -1359,7 +1422,7 @@ def chunk_kda_fwd_h_o_varlen(
         bspec_k,   # w
         bspec_v,   # u
         bspec_k,   # kg
-        bspec_k,   # gk
+        bspec_gk,  # gk
         bspec_k,   # q
         bspec_a,   # A
         bspec_h0,  # h0
@@ -1426,7 +1489,7 @@ def chunk_kda_fwd_custom(
     q: Float[Array, "H B T_ALIGNED K"],
     k: Float[Array, "H B T_ALIGNED K"],
     v: Float[Array, "H B T_ALIGNED V"],
-    g: Float[Array, "H B T_ALIGNED K"],
+    g: Float[Array, "H B T_ALIGNED GW"],
     beta: Float[Array, "H B T_ALIGNED"],
     a_log: Float[Array, "H"] | None = None,
     delta_time_bias: Float[Array, "H*K"] | None = None,
@@ -1438,6 +1501,7 @@ def chunk_kda_fwd_custom(
     use_gate_in_kernel: bool = False,
     segment_ids: Int[Array, "B T"] | None = None,
     safe_gate: bool = True,
+    per_channel_gate: bool = True,
     lower_bound: float | None = None,
     disable_recompute: bool = True,
     context_parallel_metadata: ContextParallelMetadata | None = None,
@@ -1497,6 +1561,7 @@ def chunk_kda_fwd_custom(
     chunk_size=BT,
     chunk_indices=chunk_indices,
     safe_gate=safe_gate,
+    per_channel_gate=per_channel_gate,
     disable_recompute=save_for_backward,
     cumsum_scale=RCP_LN2,
     a_log=a_log,
