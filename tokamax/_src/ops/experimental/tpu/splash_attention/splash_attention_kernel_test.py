@@ -822,6 +822,90 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     with self.assertRaisesRegex(ValueError, "CausalMask"):
       splash.make_splash_mha_single_device(local, config=config)
 
+  @parameterized.product(
+      is_causal=(False, True),
+      is_mqa=(False, True),
+  )
+  def test_segmented_tile_and_subtile_skipping(self, is_causal, is_mqa):
+    """Verifies forward and backward segmented attention with bkv > bkv_compute."""
+    seq_len, num_q_heads, head_dim = 512, 4, 128
+    k1, k2, k3, k4 = random.split(random.key(42), 4)
+    q = random.uniform(k1, (num_q_heads, seq_len, head_dim), dtype=jnp.bfloat16)
+    kv_shape = (
+        (seq_len, head_dim) if is_mqa else (num_q_heads, seq_len, head_dim)
+    )
+    k = random.uniform(k2, kv_shape, dtype=jnp.bfloat16)
+    v = random.uniform(k3, kv_shape, dtype=jnp.bfloat16)
+    do = random.uniform(
+        k4, (num_q_heads, seq_len, head_dim), dtype=jnp.bfloat16
+    )
+
+    # Segments:
+    # - Segment 0: [0, 128) (aligned with sub-tile 0 of KV block 0)
+    # - Segment 1: [128, 320) (spans sub-tile 1 of KV block 0 and part of
+    #   sub-tile 0 of KV block 1)
+    # - Segment 2: [320, 512) (starts mid-sub-tile 0 of KV block 1 and covers
+    #   sub-tile 1)
+    seg = jnp.concatenate([
+        jnp.zeros(128, dtype=jnp.int32),
+        jnp.ones(192, dtype=jnp.int32),
+        jnp.full(192, 2, dtype=jnp.int32),
+    ])
+    segment_ids = splash.SegmentIds(q=seg, kv=seg)
+
+    mask = (
+        mask_lib.CausalMask(shape=(seq_len, seq_len))
+        if is_causal
+        else mask_lib.FullMask(_shape=(seq_len, seq_len))
+    )
+    config = splash.SplashConfig(
+        block_q=128,
+        block_kv=256,
+        block_kv_compute=128,
+        block_q_dkv=128,
+        block_kv_dkv=256,
+        block_kv_dkv_compute=128,
+        interpret=self.INTERPRET,
+    )
+    make_fn = (
+        splash.make_splash_mqa_single_device
+        if is_mqa
+        else splash.make_splash_mha_single_device
+    )
+    attn = make_fn(mask, config=config)
+
+    o, vjp_fn = jax.vjp(lambda q, k, v: attn(q, k, v, segment_ids), q, k, v)
+    dq, dk, dv = vjp_fn(do)
+
+    dense_mask = jnp.array(mask[:, :])
+    o_ref, stats_ref = base.attention_reference(
+        q.astype(jnp.float32),
+        k.astype(jnp.float32),
+        v.astype(jnp.float32),
+        dense_mask,
+        segment_ids,
+        is_mqa=is_mqa,
+        save_residuals=True,
+    )
+    dq_ref, dk_ref, dv_ref, _ = base.attention_reference_vjp(
+        do.astype(jnp.float32),
+        q.astype(jnp.float32),
+        k.astype(jnp.float32),
+        v.astype(jnp.float32),
+        dense_mask,
+        segment_ids,
+        None,
+        o.astype(jnp.float32),
+        stats_ref["logsumexp"],
+        is_mqa=is_mqa,
+        backward_impl="flash",
+    )
+
+    self._assert_allclose(o, o_ref, atol=8e-3, rtol=3e-3)
+    self._assert_allclose(dq, dq_ref, atol=8e-2, rtol=3e-2)
+    self._assert_allclose(dk, dk_ref, atol=7e-2, rtol=3e-2)
+    self._assert_allclose(dv, dv_ref, atol=2e-2, rtol=3e-2)
+
 
 def _rel_l2(x: jax.Array, y: jax.Array) -> float:
   """Relative L2 error ‖x - y‖ / ‖y‖."""
