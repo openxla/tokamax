@@ -23,7 +23,6 @@ import jax
 from tokamax._src.ops.experimental.batched_rpa.kernel import configs as jax_types
 import tokamax._src.ops.experimental.batched_rpa.pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
-from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch
 import torch_tpu._internal.pallas.pallas
 
@@ -148,20 +147,7 @@ class _PallasMosaicTpuBatchedRpa(torch_op.TorchOp):
         "Forward op not registered. self.op_impl_jax was not set in the"
         " constructor."
     )
-    if config is None:
-      self.configs = torch_utils.get_configs(
-          self,
-          queries,
-          keys,
-          values,
-          kv_cache,
-          kv_lens,
-          page_indices,
-          cu_q_lens,
-          distribution,
-      )
-    else:
-      self.configs = (config, None)
+    self.configs = (config, None)
 
     # Store the inputs that cannot go through jax_op.
     self.out_dtype = out_dtype

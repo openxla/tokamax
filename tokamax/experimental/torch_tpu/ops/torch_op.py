@@ -57,8 +57,12 @@ _Config = TypeVar("_Config")
   In both classes, implement the following methods:
   - op_impl_call: The kernel invocation method for the JAX Tokamax op. This must
     invoke op_impl_jax with the full list of inputs and config to run the
-    kernel. TorchOp's register_ops will wrap this method in a custom PyTorch op
-    called _torch_tokamax_op.
+    kernel. TorchOp's __init_subclass__ automatically decorates op_impl_call
+    with ensure_op_impl_call_config_setup so that op_impl_call_config_setup is
+    always invoked before op_impl_call runs, storing the returned config in
+    self.configs. This is done to ensure that there is a valid config for the
+    kernel before it is invoked. TorchOp's register_ops will wrap this method in
+    a custom PyTorch op called _torch_tokamax_op.
   - __call__: The main function that will be called by the user. This must
     call _torch_tokamax_op with the correct arguments. This function will take
     in the configs for the forward and backward pass additionally.
@@ -87,6 +91,146 @@ _Config = TypeVar("_Config")
   
   Finally, in the module, make the forward TorchOp class a singleton instance.
 """
+
+
+def _unwrap_dynamo_var(var: Any) -> Any:
+  """Unwraps a TorchDynamo VariableTracker into its underlying Python value."""
+  if hasattr(var, "value"):
+    return var.value
+  if hasattr(var, "items"):
+    if isinstance(var.items, dict):
+      return {
+          _unwrap_dynamo_var(k): _unwrap_dynamo_var(v)
+          for k, v in var.items.items()
+      }
+    if isinstance(var.items, (list, tuple)):
+      seq = (_unwrap_dynamo_var(x) for x in var.items)
+      return list(seq) if var.python_type() is list else tuple(seq)
+  if hasattr(var, "as_python_constant"):
+    return var.as_python_constant()
+  return var
+
+
+def _sync_dynamo_side_effects(instance: Any) -> None:
+  """Flushes pending TorchDynamo attribute mutations onto `instance`.
+
+  When TorchDynamo (`torch.compile`) traces a Python function, it separates
+  tensor operations from Python object mutations:
+  - Tensor operations are captured into an FX graph, which cannot directly
+    mutate arbitrary Python object attributes.
+  - Python attribute assignments (such as `self.configs = ...` in
+    `TorchOp.__call__`) are not applied to the live Python object during
+    tracing (so TorchDynamo can safely roll back and restart if tracing hits a
+    graph break). Instead, they are buffered in TorchDynamo's `SideEffects`
+    table (`store_attr_mutations`).
+  - TorchDynamo then generates a Python wrapper function that first calls the
+    compiled FX graph, and then runs a bytecode "epilogue" immediately after
+    the FX graph returns. This epilogue replays all buffered mutations from
+    `store_attr_mutations` (via `setattr`) onto the live Python objects so that
+    Python state changes made inside the compiled function are visible after it
+    returns.
+
+  Because `op_impl_call` runs inside a custom op (outside of TorchDynamo's
+  bytecode tracer) before the epilogue executes, we must:
+  1. Apply any pending attribute mutations from `TorchOp.__call__` onto the
+     live `instance` before `op_impl_call_config_setup` and `op_impl_call` run.
+  2. Remove `"configs"` from TorchDynamo's pending `store_attr_mutations` so
+     the compiled frame's epilogue does not overwrite the config resolved by
+     `op_impl_call_config_setup` back to `(None, None)`.
+
+  For example, suppose `op(x)` (with default `config=None`) is called inside a
+  `@torch.compile` function after a previous call left `op.configs = (ConfigA,
+  None)`. If `_sync_dynamo_side_effects` did not exist:
+  1. In `op.__call__`, `self.configs = (None, None)` is intercepted by
+     TorchDynamo and buffered in `store_attr_mutations` rather than mutating the
+     live `op.configs` attribute immediately.
+  2. When `self._torch_tokamax_op(x)` runs `_OpImplCallDescriptor.__call__`
+     outside of TorchDynamo's tracer, the live `op.configs[0]` would still hold
+     the stale `ConfigA` instead of `None` (and other attributes assigned in
+     `__call__`, such as `self.kv_layout`, would be stale or unset). Even if
+     `op.configs` started as `(None, None)` and `_OpImplCallDescriptor.__call__`
+     resolved the heuristics config `ConfigB` and set `op.configs = (ConfigB,
+     None)`, TorchDynamo would not know about that mutation.
+  3. After the compiled FX graph finishes running, TorchDynamo's epilogue
+     replays its buffered mutation `op.configs = (None, None)` onto the live
+     `op` instance, overwriting `(ConfigB, None)` back to `(None, None)`.
+
+  This can be removed once Arian's CL is in.
+
+  Args:
+    instance: The `TorchOp` instance whose pending TorchDynamo side effects
+      should be flushed.
+  """
+  symbolic_convert = getattr(
+      getattr(torch, "_dynamo", None), "symbolic_convert", None
+  )
+  tx = getattr(getattr(symbolic_convert, "tls", None), "current_tx", None)
+  if tx is None:
+    return
+  side_effects = tx.output.side_effects
+  var = side_effects.id_to_variable.get(id(instance))
+  if var is None or var not in side_effects.store_attr_mutations:
+    return
+  mutations = side_effects.store_attr_mutations[var]
+  for attr_name, attr_vt in list(mutations.items()):
+    setattr(instance, attr_name, _unwrap_dynamo_var(attr_vt))
+  mutations.pop("configs", None)
+  if var in side_effects.attr_mutation_kinds:
+    side_effects.attr_mutation_kinds[var].pop("configs", None)
+  side_effects.deferred_attr_mutations.pop((id(var), "configs"), None)
+  if not mutations:
+    del side_effects.store_attr_mutations[var]
+    side_effects.attr_mutation_kinds.pop(var, None)
+
+
+class _OpImplCallDescriptor:
+  """Descriptor ensuring op_impl_call_config_setup runs before op_impl_call."""
+
+  def __init__(self, fn: Callable[..., Any]) -> None:
+    # Unwrap `fn` in case the decorator is applied more than once (e.g. both
+    # explicitly with `@ensure_op_impl_call_config_setup` and automatically via
+    # `TorchOp.__init_subclass__`), and copy its function metadata onto `self`.
+    self._fn = inspect.unwrap(fn)
+    wraps(self._fn)(self)
+
+  def __call__(self, instance: Any, *args: Any, **kwargs: Any) -> Any:
+    _sync_dynamo_side_effects(instance)
+    # Read the forward or backward config set on `instance.configs` by
+    # `TorchOp.__call__`. If it is `None`, `op_impl_call_config_setup` computes
+    # and returns the default config, which is stored in `instance.configs` so
+    # `op_impl_call` can pass `self.configs[0]` (or `self.configs[1]`) to the
+    # JAX op.
+    config = instance.configs[1] if instance.is_vjp else instance.configs[0]
+    config = instance.op_impl_call_config_setup(*args, config=config, **kwargs)
+    if instance.is_vjp:
+      instance.configs = (instance.configs[0], config)
+    else:
+      instance.configs = (config, instance.configs[1])
+    return self._fn(instance, *args, **kwargs)
+
+  def __get__(self, instance: Any, owner: Any = None) -> Callable[..., Any]:
+    del owner
+    if instance is None:
+      return self
+    # Bind `self._fn` to `instance` so `inspect.unwrap(op.op_impl_call)` returns
+    # a bound method with `self` already bound, matching a standard method for
+    # `torch_tpu.jax_op` and `torch_utils.inspect_for_attribute`.
+    bound_fn = types.MethodType(self._fn, instance)
+
+    @wraps(bound_fn)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+      return self(instance, *args, **kwargs)
+
+    return wrapped
+
+
+def ensure_op_impl_call_config_setup(
+    fn: Callable[..., Any],
+) -> Callable[..., Any]:
+  """Decorator that ensures op_impl_call_config_setup runs before op_impl_call."""
+  if isinstance(fn, _OpImplCallDescriptor):
+    return fn
+  return _OpImplCallDescriptor(fn)
 
 
 class TorchOp(Generic[_Config]):
@@ -119,6 +263,9 @@ class TorchOp(Generic[_Config]):
 
   register_ops will check to ensure that op_impl_jax is used in
   op_impl_call and backward_op_torch is used in backward (if applicable).
+  __init_subclass__ also wraps op_impl_call with
+  ensure_op_impl_call_config_setup so that op_impl_call_config_setup is always
+  invoked prior to executing op_impl_call.
 
   Note:
   All Torch Tokamax ops are singleton instances. You may not have
@@ -175,6 +322,11 @@ class TorchOp(Generic[_Config]):
     """Initializes the TorchOp subclass and automatically registers ops."""
     super().__init_subclass__(**kwargs)
 
+    if "op_impl_call" in cls.__dict__:
+      cls.op_impl_call = ensure_op_impl_call_config_setup(  # type: ignore[assignment]
+          cls.__dict__["op_impl_call"]
+      )
+
     # Capture the child class's __init__
     original_init: Callable[..., None] = cls.__init__
 
@@ -183,9 +335,10 @@ class TorchOp(Generic[_Config]):
       # 1. Run the child's initialization logic
       original_init(self, *args, **kwargs)
 
-      # 2. Automatically invoke register_ops once
-      if not getattr(self, "_ops_registered", False):
-        self._ops_registered = True
+      # 2. Automatically invoke register_ops once when the most-derived
+      # subclass __init__ finishes.
+      if self.__class__ is cls and not getattr(self, "_ops_registered", False):
+        setattr(self, "_ops_registered", True)
         self._register_ops()
 
     cls.__init__ = wrapped_init
@@ -197,8 +350,27 @@ class TorchOp(Generic[_Config]):
   ) -> jax_tokamax_op.BoundArguments:
     """Returns the BoundArguments for the JAX Tokamax op.
 
-    This code will handle both standard forward ops and VJP ops. It detects
-    whether the op is a VJP op by checking if  is_vjp is True.
+    This handles both standard forward ops and VJP ops (when `self.is_vjp` is
+    True).
+    
+    This function figures out the correct positional arguments for the JAX op by
+    comparing the positional arguments of `op_impl_call` and the forward JAX
+    op's signature then binds all arguments by name to create a
+    `BoundArguments` object. It does this in 4 steps:
+    
+    1. Inspect `self.op_impl_jax._fwd`'s parameters (excluding `config`) and
+       identify any backward-only parameter names via
+       `self.derive_backward_shapes({})`. This builds the forward and backward
+       parameter names.
+       
+    2. Map positional `args` into `bound_kwargs` by parameter name.
+    
+    3. Populate `abstract_argument_dict` in `_fwd` parameter order from
+       `bound_kwargs`, `self` attributes, and `_fwd` parameter defaults.
+
+    4. If this is a VJP op, populate backward-only shapes via
+       `self.derive_backward_shapes(abstract_argument_dict)` and return
+       `BoundArguments`.
 
     Args:
       *args: Positional arguments to the JAX Tokamax op.
@@ -209,79 +381,86 @@ class TorchOp(Generic[_Config]):
     """
     assert self.op_impl_jax is not None, "Forward class not set."
 
-    def _fwd_signature(fwd: Any) -> inspect.Signature:
-      sig = inspect.signature(fwd)
-      params = sig.parameters.copy()
-      del params["config"]
-      return sig.replace(parameters=tuple(params.values()))
+    def _to_abstract(val: Any) -> Any:
+      if isinstance(val, torch.Tensor):
+        return torch_utils.convert_torch_to_jax_via_meta(val)
+      if isinstance(val, jax.Array):
+        return jax.ShapeDtypeStruct(shape=val.shape, dtype=val.dtype)
+      return val
 
-    sig = _fwd_signature(self.op_impl_jax._fwd)
-
-    # For backward ops, we need to bind using the backward shapes.
-    # We use derive_backward_shapes to get the backward shapes and help identify
-    # the forward pass inputs.
+    # 1. Get `_fwd`'s parameters excluding `config`.
+    sig = inspect.signature(
+        self.op_impl_jax._fwd  # pylint: disable=protected-access
+    )
+    sig_params = {k: p for k, p in sig.parameters.items() if k != "config"}
     backward_param_names = set(self.derive_backward_shapes({}).keys())
+
+    # 2. Map positional `args` to parameter names:
+    #    - When a VJP op is called with only forward inputs (e.g. from
+    #      `torch_utils.get_configs`), map `args` to `_fwd`'s forward positional
+    #      parameters (skipping backward-only parameters like `residuals`).
+    #    - Otherwise (when called from `op_impl_call_config_setup`), map `args`
+    #      using `op_impl_call`'s positional parameter names so arguments that
+    #      are positional in `op_impl_call` but keyword-only in `_fwd` (such as
+    #      `cp_rank` or `reduction`) are bound by name.
+    fwd_pos_names = [
+        name
+        for name, p in sig_params.items()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    forward_only_pos_names = [
+        name for name in fwd_pos_names if name not in backward_param_names
+    ]
+    op_call_pos_names = [
+        p.name
+        for p in inspect.signature(
+            inspect.unwrap(self.op_impl_call)
+        ).parameters.values()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+
+    if self.is_vjp and len(args) <= len(forward_only_pos_names):
+      pos_names = forward_only_pos_names
+    else:
+      pos_names = op_call_pos_names or fwd_pos_names
+
+    bound_kwargs = dict(zip(pos_names, args), **kwargs)
+
+    # 3. Populate `abstract_argument_dict` for each `_fwd` parameter from:
+    #    (a) explicitly passed arguments (converted to `jax.ShapeDtypeStruct`),
+    #    (b) attributes saved on `self` in `__call__` (e.g. `self.kv_layout`),
+    #    (c) `_fwd` parameter defaults (or `return_residuals = not self.is_vjp`
+    #        when omitted).
     abstract_argument_dict: dict[str, Any] = {}
+    for name, param in sig_params.items():
+      if name in bound_kwargs:
+        abstract_argument_dict[name] = jax.tree.map(
+            _to_abstract, bound_kwargs[name]
+        )
+      elif name in backward_param_names:
+        continue
+      elif hasattr(self, name):
+        abstract_argument_dict[name] = getattr(self, name)
+      elif param.default is not inspect.Parameter.empty:
+        abstract_argument_dict[name] = param.default
+      elif name == "return_residuals":
+        abstract_argument_dict[name] = not self.is_vjp
 
+    # 4. For VJP ops, derive backward-only shapes (e.g. `residuals`, `out`,
+    #    `dout`) from the forward input shapes.
     if self.is_vjp:
-      # --- Handling VJP / Backward Op ---
-      # Identify parameters that represent the original forward inputs
-      forward_positional_params = [
-          param
-          for name, param in sig.parameters.items()
-          if name not in backward_param_names
-          and param.kind
-          in (
-              inspect.Parameter.POSITIONAL_ONLY,
-              inspect.Parameter.POSITIONAL_OR_KEYWORD,
-          )
-      ]
-
-      # Map any number of positional args to forward positional parameters
-      for param, arg in zip(forward_positional_params, args):
-        abstract_argument_dict[param.name] = (
-            torch_utils.convert_torch_to_jax_via_meta(arg)
-            if isinstance(arg, torch.Tensor)
-            else arg
-        )
-
-      # Map keyword arguments
-      for k, v in kwargs.items():
-        abstract_argument_dict[k] = (
-            torch_utils.convert_torch_to_jax_via_meta(v)
-            if isinstance(v, torch.Tensor)
-            else v
-        )
-
-      # Apply defaults from signature for any omitted parameters
-      for name, param in sig.parameters.items():
-        if (
-            name not in abstract_argument_dict
-            and name not in backward_param_names
-        ):
-          if param.default is not inspect.Parameter.empty:
-            abstract_argument_dict[name] = param.default
-          elif name == "return_residuals":
-            abstract_argument_dict[name] = False
-
-      # Populate backward shapes dynamically using the mapped forward abstract
-      # shapes
       abstract_argument_dict.update(
           self.derive_backward_shapes(abstract_argument_dict)
       )
 
-    else:
-      # --- Handling Standard Forward Op ---
-      ba = sig.bind(*args, return_residuals=True, **kwargs)
-      ba.apply_defaults()
-      abstract_argument_dict = {
-          name: (
-              torch_utils.convert_torch_to_jax_via_meta(arg)
-              if isinstance(arg, torch.Tensor)
-              else arg
-          )
-          for name, arg in ba.arguments.items()
-      }
     return jax_tokamax_op.BoundArguments(
         self.op_impl_jax, abstract_argument_dict
     )
@@ -352,6 +531,16 @@ class TorchOp(Generic[_Config]):
         "__call__ not implemented. The inheriting class must implement this"
         " method."
     )
+
+  def op_impl_call_config_setup(
+      self, *args: Any, config: Any = None, **kwargs: Any
+  ) -> Any:
+    """Sets up the config for the JAX Tokamax op."""
+    if config is None:
+      config = self.get_bound_args(*args, **kwargs).get_config(
+          check_autotuning_cache=False,
+      )
+    return config
 
   @abstractmethod
   def op_impl_call(self, *args: Any, **kwargs: Any) -> Any:
