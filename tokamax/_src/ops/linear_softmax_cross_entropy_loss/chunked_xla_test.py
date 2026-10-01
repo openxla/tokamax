@@ -49,6 +49,12 @@ def _chunked_xla_test_cases():
 
 class ChunkedXlaTest(parameterized.TestCase):
 
+  def setUp(self):
+    super().setUp()
+    # Maintain high precision on GPU to avoid numerical discrepancies under the
+    # BF16 default flag flip.
+    self.enter_context(jax.default_matmul_precision("high"))
+
   @parameterized.named_parameters(*_chunked_xla_test_cases())
   def test_fwd_matches_reference(
       self,

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import functools
+import os
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -21,6 +22,13 @@ import jax
 import jax.numpy as jnp
 from tokamax._src import numerics
 from tokamax._src import precision
+
+# Maintain TF32 default dot precision on GPU to match `_F32_DOT_PRECISION_MAP`
+# under the BF16 default flag flip.
+os.environ['XLA_FLAGS'] = (
+    os.environ.get('XLA_FLAGS', '')
+    + ' --xla_gpu_default_to_alg_dot_bf16_bf16_f32=false'
+)
 
 
 class PrecisionTest(parameterized.TestCase):
