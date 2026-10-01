@@ -20,7 +20,7 @@ from typing import Any, Literal, cast, override
 
 from absl import logging
 import jax
-from tokamax._src.ops.experimental.batched_rpa import types as jax_types
+from tokamax._src.ops.experimental.batched_rpa.kernel import configs as jax_types
 import tokamax._src.ops.experimental.batched_rpa.pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils

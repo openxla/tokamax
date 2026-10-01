@@ -36,8 +36,6 @@ from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import api as causal_conv1d_gated_delta_rule_api
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import base as causal_conv1d_gated_delta_rule_base
-from tokamax._src.ops.experimental.batched_rpa import api as batched_rpa_api
-from tokamax._src.ops.experimental.batched_rpa import base as batched_rpa_base
 from tokamax._src.ops.experimental.kda import api as kda_api
 from tokamax._src.ops.experimental.kda import base as kda_base
 from tokamax._src.ops.experimental.mla import api as mla_api
@@ -272,7 +270,6 @@ _API_IMPLEMENTATIONS: Final[
     ragged_gather_reduce_base.RaggedGatherReduce: (
         ragged_gather_reduce_api.IMPLEMENTATIONS
     ),
-    batched_rpa_base.BatchedRpa: batched_rpa_api.IMPLEMENTATIONS,
     kda_base.KimiDeltaAttention: kda_api.IMPLEMENTATIONS,
     linear_softmax_cross_entropy_loss_base.LinearSoftmaxCrossEntropyLoss: (
         linear_softmax_cross_entropy_loss_api.IMPLEMENTATIONS

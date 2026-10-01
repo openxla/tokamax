@@ -18,13 +18,13 @@ from typing import Any, Literal
 import immutabledict
 import jax
 from tokamax._src.ops.experimental.batched_rpa import base
-from tokamax._src.ops.experimental.batched_rpa import types
+from tokamax._src.ops.experimental.batched_rpa.kernel import configs
 
 Implementation = Literal["mosaic_tpu", "reference"]
-AttentionScope = types.AttentionScope
-BlockSizes = types.BlockSizes
-KVLayout = types.KVLayout
-RpaCase = types.RpaCase
+AttentionScope = configs.AttentionScope
+BlockSizes = configs.BlockSizes
+KVLayout = configs.KVLayout
+RpaCase = configs.RpaCase
 
 _IMPLEMENTATIONS: dict[str, base.BatchedRpa] = dict(reference=base.BatchedRpa())
 
