@@ -730,23 +730,164 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         use_fused_bwd_kernel=True, residual_checkpoint_name="context",
         interpret=self.INTERPRET,
     )
-    # Non-square forward blocks -> raises in SplashConfig.__post_init__.
-    with self.assertRaisesRegex(ValueError, "square forward blocks"):
+    # Misaligned forward blocks (block_q != block_kv) -> raises in __post_init__.
+    with self.assertRaisesRegex(ValueError, "block_q == block_kv"):
       splash.SplashConfig(
           **{**square, "block_kv": block // 2, "block_kv_compute": block // 2},
           qk_diag_skip=True,
       )
-    # Non-power-of-2 grid -> raises in __post_init__.
-    with self.assertRaisesRegex(ValueError, "power of 2"):
-      splash.SplashConfig(**square, qk_diag_skip=True, qk_diag_grid=3)
-    # Non-causal mask -> raises in make_splash_mha (the skip assumes kv > q is masked).
+    # Non-square dkv blocks -> raises.
+    with self.assertRaisesRegex(ValueError, "square backward blocks"):
+      splash.SplashConfig(
+          **{**square, "block_kv_dkv_compute": block // 2}, qk_diag_skip=True
+      )
+    # Non-power-of-2 grid (in any form) -> raises in __post_init__.
+    for grid in (3, (2, 3), [(2, 2), (4, 6)]):
+      with self.assertRaisesRegex(ValueError, "power of 2"):
+        splash.SplashConfig(**square, qk_diag_skip=True, qk_diag_grid=grid)
+    with self.assertRaisesRegex(ValueError, "qk_diag_grid must be"):
+      splash.SplashConfig(
+          **square,
+          qk_diag_skip=True,
+          qk_diag_grid=(2, 2, 2),  # pyrefly: ignore[bad-argument-type]
+      )
+    # A causal mask with an offset admits kv > q entries -> raises.
     seq_len = 512
     config = splash.SplashConfig(**square, qk_diag_skip=True)
+    with self.assertRaisesRegex(ValueError, "offset 0"):
+      splash.make_splash_mha_single_device(
+          mask_lib.CausalMask(shape=(seq_len, seq_len), offset=128),
+          config=config,
+      )
+    # Non-causal mask -> raises in make_splash_mha (the skip assumes kv > q is masked).
     local = mask_lib.LocalMask(
         shape=(seq_len, seq_len), window_size=(128, 0), offset=0
     )
     with self.assertRaisesRegex(ValueError, "CausalMask"):
       splash.make_splash_mha_single_device(local, config=config)
+
+  @parameterized.product(
+      mode=("forward", "backward"),
+      is_segmented=(False, True),
+      qk_diag_grid=(2, 4, (4, 2), ((2, 2), (4, 4))),
+  )
+  def test_qk_diag_skip_non_square_forward(
+      self, mode, is_segmented, qk_diag_grid
+  ):
+    """`qk_diag_skip` with block_kv_compute < block_kv in the forward is bit-exact.
+
+    Production forward tilings have `block_kv_compute < block_kv` (DeepSeek V3:
+    1024/1024/512) while the dkv tiles are square. The forward skips the q rows
+    that see none of a compute tile and the triangle sub-tiles; the dkv skips
+    the triangle sub-tiles. Output and dQ/dK/dV must match the stock kernel bit
+    for bit, with and without segment ids, for every grid form.
+    """
+    seq_len, num_heads, block, block_compute = 2048, 2, 1024, 512
+    head_dim_qk, head_dim_v = 192, 128
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(jnp.bfloat16)
+    k = (random.normal(k2, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(jnp.bfloat16)
+    v = (random.normal(k3, (num_heads, seq_len, head_dim_v)) * 0.5).astype(jnp.bfloat16)
+    do = (random.normal(k4, (num_heads, seq_len, head_dim_v)) * 0.5).astype(jnp.bfloat16)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+    segment_ids = None
+    if is_segmented:
+      ids = jnp.concatenate([
+          jnp.zeros((seq_len // 2 + 128,), jnp.int32),
+          jnp.ones((seq_len // 2 - 128,), jnp.int32),
+      ])
+      segment_ids = splash.SegmentIds(q=ids, kv=ids)
+
+    def build(qk_diag_skip):
+      config = splash.SplashConfig(
+          block_q=block, block_kv=block, block_kv_compute=block_compute,
+          block_q_dkv=block, block_kv_dkv=block, block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True, residual_checkpoint_name="context",
+          qk_diag_skip=qk_diag_skip, qk_diag_grid=qk_diag_grid,
+          interpret=self.INTERPRET,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+      fwd = lambda q, k, v: attn(q, k, v, segment_ids)
+      if mode == "forward":
+        return jax.jit(fwd)
+
+      def bwd(q, k, v, do):
+        _, vjp = jax.vjp(fwd, q, k, v)
+        return vjp(do)
+
+      return jax.jit(bwd)
+
+    args = (q, k, v) if mode == "forward" else (q, k, v, do)
+    ref = jax.tree.leaves(build(False)(*args))
+    opt = jax.tree.leaves(build(True)(*args))
+    self.assertNotEmpty(ref)
+    for r, o in zip(ref, opt):
+      np.testing.assert_array_equal(np.asarray(o), np.asarray(r))
+
+  @parameterized.parameters("forward", "backward")
+  def test_qk_diag_skip_with_dropout(self, mode):
+    """`qk_diag_skip` on non-square forward tiles is bit-exact under dropout.
+
+    The forward diagonal path builds its own dropout tile for the causal
+    triangle; it must apply the same mask and scale as the stock kernel.
+    """
+    seq_len, num_heads, block, block_compute = 2048, 2, 1024, 512
+    head_dim_qk, head_dim_v = 192, 128
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(jnp.bfloat16)
+    k = (random.normal(k2, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(jnp.bfloat16)
+    v = (random.normal(k3, (num_heads, seq_len, head_dim_v)) * 0.5).astype(jnp.bfloat16)
+    do = (random.normal(k4, (num_heads, seq_len, head_dim_v)) * 0.5).astype(jnp.bfloat16)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+    prng_key = random.key(1234)
+
+    def build(qk_diag_skip):
+      config = splash.SplashConfig(
+          block_q=block, block_kv=block, block_kv_compute=block_compute,
+          block_q_dkv=block, block_kv_dkv=block, block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True, residual_checkpoint_name="context",
+          dropout_rate=0.1, dropout_block_q=256, dropout_block_kv=256,
+          qk_diag_skip=qk_diag_skip, interpret=self.INTERPRET,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+      fwd = lambda q, k, v: attn(q, k, v, prng_key=prng_key)
+      if mode == "forward":
+        return jax.jit(fwd)
+
+      def bwd(q, k, v, do):
+        _, vjp = jax.vjp(fwd, q, k, v)
+        return vjp(do)
+
+      return jax.jit(bwd)
+
+    args = (q, k, v) if mode == "forward" else (q, k, v, do)
+    ref = jax.tree.leaves(build(False)(*args))
+    opt = jax.tree.leaves(build(True)(*args))
+    self.assertNotEmpty(ref)
+    for r, o in zip(ref, opt):
+      np.testing.assert_array_equal(np.asarray(o), np.asarray(r))
+
+  def test_qk_diag_grid_forms(self):
+    """`qk_diag_grid` accepts int / pair / per-phase pairs and stays hashable."""
+    square = dict(
+        block_q=512, block_kv=512, block_kv_compute=512,
+        block_q_dkv=512, block_kv_dkv=512, block_kv_dkv_compute=512,
+        use_fused_bwd_kernel=True, qk_diag_skip=True,
+    )
+    self.assertEqual(splash.SplashConfig(**square).qk_diag_grid_fwd, (2, 2))
+    self.assertEqual(splash.SplashConfig(**square).qk_diag_grid_dkv, (2, 2))
+    cases: tuple[tuple[Any, tuple[int, int], tuple[int, int]], ...] = (
+        (2, (2, 2), (2, 2)),
+        (4, (4, 4), (4, 4)),
+        ((4, 2), (4, 2), (4, 2)),
+        ([(2, 2), (8, 4)], (2, 2), (8, 4)),
+        ([(2, 4), (4, 4)], (2, 4), (4, 4)),
+    )
+    for grid, fwd, dkv in cases:
+      config = splash.SplashConfig(**square, qk_diag_grid=grid)
+      self.assertEqual(config.qk_diag_grid_fwd, fwd)
+      self.assertEqual(config.qk_diag_grid_dkv, dkv)
+      hash(config)  # A static jit argument: lists must have become tuples.
 
   @parameterized.named_parameters(
       dict(testcase_name="grid2", qk_diag_grid=2, head_dim_qk=128),
