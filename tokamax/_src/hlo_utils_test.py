@@ -32,7 +32,10 @@ from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
 from tokamax._src import hlo_utils_common
 from tokamax._src import numerics
+from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
+from tokamax._src.ops.gated_linear_unit import base as glu_base
+from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 
@@ -539,6 +542,66 @@ class HloUtilsHelpersTest(parameterized.TestCase):
     self.assertEqual(
         [i.name for i in hlo_utils_common.dedupe_wrapper_kernels(records)],
         ['norm_kernel', 'cudnn_transpose'],
+    )
+
+  def test_get_opspecs_stacked_payloads(self):
+    op1 = norm_base.Normalization()
+    ba1 = op1.bind(
+        jax.ShapeDtypeStruct((64, 128), jnp.bfloat16),
+        scale=jax.ShapeDtypeStruct((128,), jnp.bfloat16),
+        offset=jax.ShapeDtypeStruct((128,), jnp.bfloat16),
+    )
+    json_op1 = op1.replace(vjp=None)
+    json_ba1 = op_lib.BoundArguments(
+        json_op1, op_lib._abstractify(dict(ba1.arguments))
+    )
+    json1 = str(op_lib.BOUND_ARGS_ADAPTER.dump_json(json_ba1), 'utf-8')
+
+    op2 = glu_base.GatedLinearUnit()
+    ba2 = op2.bind(
+        jax.ShapeDtypeStruct((64, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((128, 2, 128), jnp.bfloat16),
+        activation=jax.nn.swish,
+    )
+    json_op2 = op2.replace(vjp=None)
+    json_ba2 = op_lib.BoundArguments(
+        json_op2, op_lib._abstractify(dict(ba2.arguments))
+    )
+    json2 = str(op_lib.BOUND_ARGS_ADAPTER.dump_json(json_ba2), 'utf-8')
+    stacked = f'tokamax:{json1}/tokamax:{json2}'
+
+    kernel = hlo_utils.TritonKernelInfo(
+        name='pallas_call',
+        inputs=(),
+        outputs=(),
+        op_name='custom_call',
+        source_file='test.py',
+        source_line=1,
+        hlo_module_name='module',
+        metadata_payload=stacked,
+    )
+    wrapper_specs = hlo_utils.get_opspecs(kernel)
+    self.assertLen(wrapper_specs, 1)
+    self.assertIsInstance(
+        wrapper_specs[0].op, norm_base.Normalization
+    )
+
+    nested_specs = hlo_utils.get_opspecs(kernel, include_nested=True)
+    self.assertLen(nested_specs, 2)
+    self.assertIsInstance(
+        nested_specs[0].op, norm_base.Normalization
+    )
+    self.assertIsInstance(
+        nested_specs[1].op, glu_base.GatedLinearUnit
+    )
+
+    fn_nested_specs = hlo_utils.get_nested_opspecs(kernel)
+    self.assertLen(fn_nested_specs, 2)
+    self.assertIsInstance(
+        fn_nested_specs[0].op, norm_base.Normalization
+    )
+    self.assertIsInstance(
+        fn_nested_specs[1].op, glu_base.GatedLinearUnit
     )
 
 
