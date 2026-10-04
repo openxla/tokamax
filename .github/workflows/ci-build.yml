@@ -285,18 +285,8 @@ jobs:
           DEVICE: ${{ matrix.device }}
           JAX_PIN: ${{ matrix.jax_pin }}
         run: |
-          echo "Installing dependencies on device ${DEVICE}, jax ${JAX_PIN}"
-          # No need to put `jax[tpu]` or `jaxlib` in the constraint file.
-          # `jax==` bounds `jax[tpu]` too, and jax's own metadata pins jaxlib
-          # (unconditionally), libtpu and the CUDA plugin from there.
-          printf 'jax==%s\n' "${JAX_PIN}" > /tmp/jax-pin.txt
-          python3.12 -m uv pip install --upgrade pip
-          python3.12 -m uv pip --version
-          python3.12 -m uv pip install --constraint /tmp/jax-pin.txt -e ".[${DEVICE},test]"
-          python3.12 -m uv pip freeze
-          got=$(python3.12 -c 'import jax; print(jax.__version__)')
-          [[ "${got}" == "${JAX_PIN}" ]] || {
-            echo "::error::asked for jax ${JAX_PIN}, got ${got}"; exit 1; }
+          # See the script for why it upgrades uv and retries downloads.
+          bash .github/ci/install_deps.sh "${DEVICE}" "${JAX_PIN}"
 
       - name: Run shard
         env:
