@@ -40,6 +40,8 @@ from tokamax._src.ops.experimental.kda import api as kda_api
 from tokamax._src.ops.experimental.kda import base as kda_base
 from tokamax._src.ops.experimental.mla import api as mla_api
 from tokamax._src.ops.experimental.mla import base as mla_base
+from tokamax._src.ops.experimental.tpu.csa_gather import api as csa_gather_api
+from tokamax._src.ops.experimental.tpu.csa_gather import base as csa_gather_base
 from tokamax._src.ops.experimental.tpu.splash_attention import api as splash_attention_api
 from tokamax._src.ops.experimental.tpu.splash_attention import base as splash_attention_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
@@ -281,6 +283,7 @@ _API_IMPLEMENTATIONS: Final[
     causal_conv1d_gated_delta_rule_base.CausalConv1dGatedDeltaRule: (
         causal_conv1d_gated_delta_rule_api.IMPLEMENTATIONS
     ),
+    csa_gather_base.CsaGather: csa_gather_api.IMPLEMENTATIONS,
 })
 
 
