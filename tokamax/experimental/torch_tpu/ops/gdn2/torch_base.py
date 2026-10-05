@@ -36,9 +36,13 @@ class _GatedDeltaNet2:
     self._torch_tokamax_op = None
     try:
       from torch_tpu._internal import pallas
-      self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
-    except Exception:
-      pass
+    except ImportError:
+      pallas = None
+    else:
+      try:
+        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+      except Exception:
+        self._torch_tokamax_op = None
 
   def op_impl_call(
       self,
@@ -65,9 +69,10 @@ class _GatedDeltaNet2:
       w: torch.Tensor,
       chunk_size: int = 64,
   ) -> torch.Tensor:
-    b_dim, t, h, d = q.shape
-    if t % chunk_size != 0:
-      raise ValueError(f"Sequence length ({t}) must be divisible by chunk_size ({chunk_size})")
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    del batch_size, num_heads, head_dim
+    if seq_len % chunk_size != 0:
+      raise ValueError(f"Sequence length ({seq_len}) must be divisible by chunk_size ({chunk_size})")
 
     g = torch.clamp(g, max=0.0)
     b = torch.clamp(b, min=0.0, max=1.0)
@@ -89,19 +94,19 @@ class _GatedDeltaNet2:
       chunk_size: int = 64,
   ) -> torch.Tensor:
     """Pure PyTorch fallback for GDN-2."""
-    b_dim, t, h, k_dim = q.shape
-    v_dim = v.shape[-1]
-    nt = t // chunk_size
+    batch_size, seq_len, num_heads, key_dim = q.shape
+    val_dim = v.shape[-1]
+    num_chunks = seq_len // chunk_size
     outs = []
 
-    state = torch.zeros(b_dim, h, k_dim, v_dim, device=q.device, dtype=torch.float32)
+    state = torch.zeros(batch_size, num_heads, key_dim, val_dim, device=q.device, dtype=torch.float32)
     strictly_lower = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device), diagonal=-1)
     causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device), diagonal=0)
     eye = torch.eye(chunk_size, device=q.device)
 
-    for i in range(nt):
-      st = i * chunk_size
-      en = (i + 1) * chunk_size
+    for chunk_idx in range(num_chunks):
+      st = chunk_idx * chunk_size
+      en = (chunk_idx + 1) * chunk_size
       qc = q[:, st:en].permute(0, 2, 1, 3).float()
       kc = k[:, st:en].permute(0, 2, 1, 3).float()
       vc = v[:, st:en].permute(0, 2, 1, 3).float()

@@ -33,31 +33,30 @@ def naive_chunk_gdn2_ref(
     chunk_size: int = 64,
 ) -> torch.Tensor:
   """Canonical mathematical reference implementation of chunked GDN-2."""
-  b, t, h, k_dim = q.shape
-  v_dim = v.shape[-1]
-  bt = chunk_size
-  nt = t // bt
+  batch_size, seq_len, num_heads, key_dim = q.shape
+  val_dim = v.shape[-1]
+  num_chunks = seq_len // chunk_size
 
-  q_c = q.reshape(b, nt, bt, h, k_dim).permute(0, 3, 1, 2, 4)
-  k_c = k.reshape(b, nt, bt, h, k_dim).permute(0, 3, 1, 2, 4)
-  v_c = v.reshape(b, nt, bt, h, v_dim).permute(0, 3, 1, 2, 4)
-  g_c = g.reshape(b, nt, bt, h, k_dim).permute(0, 3, 1, 2, 4).cumsum(dim=-2)
-  b_c = b_gate.reshape(b, nt, bt, h, k_dim).permute(0, 3, 1, 2, 4)
-  w_c = w_gate.reshape(b, nt, bt, h, v_dim).permute(0, 3, 1, 2, 4)
+  q_c = q.reshape(batch_size, num_chunks, chunk_size, num_heads, key_dim).permute(0, 3, 1, 2, 4)
+  k_c = k.reshape(batch_size, num_chunks, chunk_size, num_heads, key_dim).permute(0, 3, 1, 2, 4)
+  v_c = v.reshape(batch_size, num_chunks, chunk_size, num_heads, val_dim).permute(0, 3, 1, 2, 4)
+  g_c = g.reshape(batch_size, num_chunks, chunk_size, num_heads, key_dim).permute(0, 3, 1, 2, 4).cumsum(dim=-2)
+  b_c = b_gate.reshape(batch_size, num_chunks, chunk_size, num_heads, key_dim).permute(0, 3, 1, 2, 4)
+  w_c = w_gate.reshape(batch_size, num_chunks, chunk_size, num_heads, val_dim).permute(0, 3, 1, 2, 4)
 
-  s = torch.zeros(b, h, k_dim, v_dim, dtype=torch.float32, device=q.device)
-  strictly_lower = torch.tril(torch.ones(bt, bt, device=q.device), diagonal=-1)
-  causal_mask = torch.tril(torch.ones(bt, bt, device=q.device), diagonal=0)
-  eye = torch.eye(bt, device=q.device)
+  s = torch.zeros(batch_size, num_heads, key_dim, val_dim, dtype=torch.float32, device=q.device)
+  strictly_lower = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device), diagonal=-1)
+  causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device), diagonal=0)
+  eye = torch.eye(chunk_size, device=q.device)
 
   o_chunks = []
-  for i in range(nt):
-    qi = q_c[:, :, i]
-    ki = k_c[:, :, i]
-    vi = v_c[:, :, i]
-    gi = g_c[:, :, i]
-    bi = b_c[:, :, i]
-    wi = w_c[:, :, i]
+  for chunk_idx in range(num_chunks):
+    qi = q_c[:, :, chunk_idx]
+    ki = k_c[:, :, chunk_idx]
+    vi = v_c[:, :, chunk_idx]
+    gi = g_c[:, :, chunk_idx]
+    bi = b_c[:, :, chunk_idx]
+    wi = w_c[:, :, chunk_idx]
 
     g_diff = torch.clamp(gi[:, :, :, None, :] - gi[:, :, None, :, :], max=0.0)
     bk = bi * ki
@@ -88,7 +87,7 @@ def naive_chunk_gdn2_ref(
   return (
       torch.stack(o_chunks, dim=2)
       .permute(0, 2, 3, 1, 4)
-      .reshape(b, t, h, v_dim)
+      .reshape(batch_size, seq_len, num_heads, val_dim)
       .to(q.dtype)
   )
 
@@ -101,36 +100,36 @@ class GDN2PallasKernelTest(unittest.TestCase):
     chunk_size = 64
 
     for seq_len in (64, 128, 256):
-      b, nheads, head_dim = 2, 4, 16
+      batch_size, num_heads, head_dim = 2, 4, 16
       torch.manual_seed(42)
       q = (
           torch.randn(
-              b, seq_len, nheads, head_dim, device=device, dtype=torch.float32
+              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
           )
           * (head_dim**-0.5)
       )
       k = (
           torch.randn(
-              b, seq_len, nheads, head_dim, device=device, dtype=torch.float32
+              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
           )
           * (head_dim**-0.5)
       )
       v = torch.randn(
-          b, seq_len, nheads, head_dim, device=device, dtype=torch.float32
+          batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
       )
       g = -torch.sigmoid(
           torch.randn(
-              b, seq_len, nheads, head_dim, device=device, dtype=torch.float32
+              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
           )
       )
       b_mat = torch.sigmoid(
           torch.randn(
-              b, seq_len, nheads, head_dim, device=device, dtype=torch.float32
+              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
           )
       )
       w_mat = torch.sigmoid(
           torch.randn(
-              b, seq_len, nheads, head_dim, device=device, dtype=torch.float32
+              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
           )
       )
 
@@ -141,7 +140,7 @@ class GDN2PallasKernelTest(unittest.TestCase):
           q, k, v, g, b_mat, w_mat, chunk_size=chunk_size
       )
 
-      self.assertEqual(actual.shape, (b, seq_len, nheads, head_dim))
+      self.assertEqual(actual.shape, (batch_size, seq_len, num_heads, head_dim))
       torch.testing.assert_close(
           actual.cpu(), expected.cpu(), rtol=1e-4, atol=1e-4
       )
@@ -165,24 +164,24 @@ class GDN2PallasKernelTest(unittest.TestCase):
 
   def test_backward_autograd(self):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    b, seq_len, nheads, head_dim = 2, 128, 4, 16
+    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
     chunk_size = 64
 
     torch.manual_seed(42)
     q = (
-        torch.randn(b, seq_len, nheads, head_dim, device=device)
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
         * (head_dim**-0.5)
     ).requires_grad_(True)
     k = (
-        torch.randn(b, seq_len, nheads, head_dim, device=device)
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
         * (head_dim**-0.5)
     ).requires_grad_(True)
     v = torch.randn(
-        b, seq_len, nheads, head_dim, device=device, requires_grad=True
+        batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True
     )
-    g = (-torch.sigmoid(torch.randn(b, seq_len, nheads, head_dim, device=device))).requires_grad_(True)
-    b_mat = (torch.sigmoid(torch.randn(b, seq_len, nheads, head_dim, device=device))).requires_grad_(True)
-    w_mat = (torch.sigmoid(torch.randn(b, seq_len, nheads, head_dim, device=device))).requires_grad_(True)
+    g = (-torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))).requires_grad_(True)
+    b_mat = (torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))).requires_grad_(True)
+    w_mat = (torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))).requires_grad_(True)
 
     out = gdn2_pallas.gdn2_pallas_delta_rule(
         q, k, v, g, b_mat, w_mat, chunk_size=chunk_size
