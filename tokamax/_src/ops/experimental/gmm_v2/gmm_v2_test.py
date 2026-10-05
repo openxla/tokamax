@@ -644,6 +644,77 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  def test_tgmm_multi_tile(self):
+    """num_k>1 and num_n>1 combined with multi-gm groups.
+    """
+    batch_size, in_size, out_size = 128, 256, 256
+    group_sizes = jnp.array([8, 10, 50, 2, 3, 47, 8], dtype=jnp.int32)
+    num_groups = group_sizes.size
+    num_local_groups = num_groups
+    assert jnp.sum(group_sizes) == batch_size
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_offset = jnp.array(0, dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1),
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+        preferred_element_type=jnp.bfloat16,
+        tile_info=gmm_v2.TileSizes(
+            tile_m=32, tile_k=128, tile_n=128, bucket_base=32
+        ),
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    assert_arrays_all_close(actual, expected)
+
+  def test_tgmm_with_group_offset_and_empties(self):
+    """group_offset>0 with empty groups both inside and outside the window.
+    """
+    batch_size, in_size, out_size = 128, 128, 128
+    group_sizes = jnp.array([10, 0, 8, 0, 50, 2, 58, 0], dtype=jnp.int32)
+    num_groups = group_sizes.size
+    group_offset_val = 2
+    num_local_groups = num_groups - group_offset_val
+    assert jnp.sum(group_sizes) == batch_size
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_offset = jnp.array(group_offset_val, dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1),
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+        preferred_element_type=jnp.bfloat16,
+        tile_info=gmm_v2.TileSizes(
+            tile_m=32, tile_k=128, tile_n=128, bucket_base=32
+        ),
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    assert_arrays_all_close(actual, expected)
+
   @parameterized.product(
       batch_size=[128],
       in_size=[256],
