@@ -412,7 +412,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     return True
 
 
-def snake_case_name(op: Op) -> str:  # pylint: disable=g-bare-generic
+def snake_case_name(op: type[Op] | Op) -> str:  # pylint: disable=g-bare-generic
   """Returns the snake_case name of the op implementation."""
   cls = op if isinstance(op, type) else type(op)
   return _CAMEL_TO_SNAKE_PATTERN.sub(r"_\1", cls.__name__).lower()
