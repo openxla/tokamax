@@ -834,14 +834,18 @@ def _get_dropout_mask_kernel(
     prng_key_ref: jax.Ref,
     out_ref: jax.Ref,
     *,
+    q_seq_len: int,
+    kv_seq_len: int,
     bq: int,
     bkv_compute: int,
     canonical_q: int,
     canonical_kv: int,
     dropout_rate: float,
 ):
+  n_q_blocks = (q_seq_len + canonical_q - 1) // canonical_q
+  n_kv_blocks = (kv_seq_len + canonical_kv - 1) // canonical_kv
   # pylint: disable-next=protected-access
-  out_ref[...] = splash._dropout_mask_tile(
+  scaled_mask = splash._dropout_mask_tile(
       prng_key_ref,
       head_idx=pl.program_id(0),
       q_block_idx=pl.program_id(1),
@@ -851,7 +855,11 @@ def _get_dropout_mask_kernel(
       canonical_q=canonical_q,
       canonical_kv=canonical_kv,
       dropout_rate=dropout_rate,
+      n_q_blocks=n_q_blocks,
+      n_kv_blocks=n_kv_blocks,
   )
+  # out_ref is a boolean dropout mask.
+  out_ref[...] = scaled_mask == 0.0
 
 
 def _get_dropout_mask(
@@ -890,6 +898,8 @@ def _get_dropout_mask(
     return pl.pallas_call(
         partial(
             _get_dropout_mask_kernel,
+            q_seq_len=q_seq_len,
+            kv_seq_len=kv_seq_len,
             bq=bq,
             bkv_compute=bkv_compute,
             canonical_q=canonical_q,
@@ -924,13 +934,16 @@ def _restated_dropout_mask_kernel(
     dropout_rate: float,
 ):
   """Restates the derivation `_generate_blockwise_dropout_mask` implements."""
-  key_h = random.fold_in(prng_key_ref[...], pl.program_id(0))
-  for i in range(out_ref.shape[0] // bq):
-    key_q = random.fold_in(key_h, i)
-    for j in range(out_ref.shape[1] // bkv):
-      out_ref[i * bq : (i + 1) * bq, j * bkv : (j + 1) * bkv] = (
-          random.bernoulli(random.fold_in(key_q, j), dropout_rate, (bq, bkv))
-      )
+  head_idx = pl.program_id(0)
+  threshold = np.uint32(dropout_rate * (2**32))
+  n_q_blocks = (out_ref.shape[0] + bq - 1) // bq
+  n_kv_blocks = (out_ref.shape[1] + bkv - 1) // bkv
+  for i in range(n_q_blocks):
+    for j in range(n_kv_blocks):
+      tile_id = (head_idx * n_q_blocks + i) * n_kv_blocks + j
+      sub_key = random.fold_in(prng_key_ref[...], tile_id)
+      bits = random.bits(sub_key, (bq, bkv), dtype=jnp.uint32)
+      out_ref[i * bq : (i + 1) * bq, j * bkv : (j + 1) * bkv] = bits < threshold
 
 
 def _restated_dropout_mask(
@@ -945,9 +958,9 @@ def _restated_dropout_mask(
   `_get_dropout_mask` calls the kernel's own `_generate_blockwise_dropout_mask`,
   so on its own it can only show that the forward and backward passes agree with
   each other --- it cannot show that they agree with the *intended* scheme. This
-  spells the scheme out a second time: fold head, then canonical q block, then
-  canonical kv block into the key, in that order, and draw a
-  (dropout_block_q, dropout_block_kv) tile.
+  spells the scheme out a second time: pack head, canonical q block, and
+  canonical kv block into a single integer tile_id, fold into the key, and
+  compare random uint32 bits against the threshold.
 
   The two differ structurally on purpose. Here the grid is over heads alone and
   the block loop is unrolled inside the kernel with Python ints, so the block

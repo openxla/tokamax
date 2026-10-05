@@ -130,31 +130,17 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       activation: base.ActivationFunction | None = None,
       manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
-      rhs_scale: jax.Array | None = None,
-      rhs_bias: jax.Array | None = None,
-      maybe_quantize_lhs: bool = False,
-      lhs_scale: jax.Array | None = None,
-      zero_initialize: bool = True,
+      zero_initialize: bool = False,
       fuse_gateup_activation: str | None = None,
-      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
     if (
         group_offset is not None
-        or rhs_scale is not None
-        or rhs_bias is not None
-        or maybe_quantize_lhs
-        or lhs_scale is not None
-        or not zero_initialize
+        or zero_initialize
         or fuse_gateup_activation is not None
-        or lhs_quantization_dtype is not None
-        or rhs_quantization_dtype is not None
     ):
       raise NotImplementedError(
           "The Pallas-Mosaic-TPU-v1 implementation does not support"
-          " group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
-          " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
-          " or rhs_quantization_dtype."
+          " group_offset, zero_initialize, or fuse_gateup_activation."
       )
 
     # TODO: Support more ragged_dot_dimension_numbers

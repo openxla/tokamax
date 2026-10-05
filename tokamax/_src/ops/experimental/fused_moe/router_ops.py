@@ -24,6 +24,7 @@ than relying on the sentinels to sum to something the renormalization turns
 into zero -- that outcome was a property of the accumulation dtype and the
 association order rather than of the design.
 """
+
 import functools
 
 import jax
@@ -49,8 +50,9 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None):
         picked = iota == idx[:, None]
         # noaux selects with biased scores but emits unbiased weights.
         # A masked sum reads the resident tile without a dynamic lane gather.
-        w_ref[:, j] = (m[:, 0] if v is None else jnp.sum(
-            jnp.where(picked, v, 0.0), axis=1))
+        w_ref[:, j] = (
+            m[:, 0] if v is None else jnp.sum(jnp.where(picked, v, 0.0), axis=1)
+        )
         i_ref[:, j] = idx.astype(jnp.int32)
         x = jnp.where(picked, NEG, x)
 
@@ -65,11 +67,7 @@ def _select_kernel_split(x_ref, v_ref, w_ref, i_ref, *, topk, n):
     _select_kernel(x_ref, w_ref, i_ref, topk=topk, n=n, v_ref=v_ref)
 
 
-def pallas_select(scores,
-                  topk=10,
-                  block_rows=256,
-                  weight_scores=None,
-                  interpret=False):
+def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret=False):
     """Top-k over [R, N] scores -> (weights f32, indices i32) [R, topk].
 
     With `weight_scores=None`, return the selected scores as weights.
@@ -88,23 +86,21 @@ def pallas_select(scores,
     assert R % block_rows == 0, (R, block_rows)
     if weight_scores is not None and weight_scores.shape != scores.shape:
         raise ValueError(
-            f"weight_scores {weight_scores.shape} must match scores "
-            f"{scores.shape}")
-    grid = (R // block_rows, )
+            f"weight_scores {weight_scores.shape} must match scores {scores.shape}"
+        )
+    grid = (R // block_rows,)
     out_shapes = (
         jax.ShapeDtypeStruct((R, topk), jnp.float32),
         jax.ShapeDtypeStruct((R, topk), jnp.int32),
     )
     in_spec = pl.BlockSpec((block_rows, N), lambda i: (i, 0))
-    bs = (in_spec, ) if weight_scores is None else (in_spec, in_spec)
+    bs = (in_spec,) if weight_scores is None else (in_spec, in_spec)
     os = (
         pl.BlockSpec((block_rows, topk), lambda i: (i, 0)),
         pl.BlockSpec((block_rows, topk), lambda i: (i, 0)),
     )
-    kernel = (_select_kernel
-              if weight_scores is None else _select_kernel_split)
-    operands = ((scores, ) if weight_scores is None else
-                (scores, weight_scores))
+    kernel = _select_kernel if weight_scores is None else _select_kernel_split
+    operands = (scores,) if weight_scores is None else (scores, weight_scores)
     return pl.pallas_call(
         functools.partial(kernel, topk=topk, n=N),
         grid=grid,

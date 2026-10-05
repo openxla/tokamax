@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited. All Rights Reserved.
+# Copyright 2026 DeepMind Technologies Limited. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from typing import override
+
+import functools
+from typing import Any, override
 from unittest import mock
 
 from absl.testing import absltest
@@ -20,14 +22,34 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
-from tokamax._src.ops.ragged_dot import pallas_triton
 from tokamax._src.ops.ragged_dot import test_base
 
+try:
+  import jax_triton as jt
+except ImportError:
+  triton = None  # pyrefly: ignore[assignment]
+  _JAX_TRITON_AVAILABLE = False
+  _TestTritonRaggedDot: Any = object
+else:
+  from tokamax._src.ops.ragged_dot import triton
+  _JAX_TRITON_AVAILABLE = jt.__version_info__ >= (0, 4, 1)
+  del jt
 
-class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
+  class _TestTritonRaggedDot(triton.TritonRaggedDot):
+
+    @override
+    @functools.wraps(triton.TritonRaggedDot._fwd)
+    def _fwd(self, *args, activation=None, **kwargs):
+      if activation is test_base.relu:
+        activation = jax.nn.relu
+      return super()._fwd(*args, activation=activation, **kwargs)
+
+
+@absltest.skipIf(not _JAX_TRITON_AVAILABLE, "Requires jax_triton >=0.4.1.")
+class TritonRaggedDotTest(test_base.RaggedDotTestBase):
 
   def __init__(self, *args):
-    super().__init__(*args, dot_fn=pallas_triton.PallasTritonRaggedDot())
+    super().__init__(*args, dot_fn=_TestTritonRaggedDot())
 
   def setUp(self):
     if jax.default_backend() == "tpu":
@@ -36,7 +58,8 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
 
   @parameterized.parameters(2, 4)
   def test_split_k(self, split_k):
-    config = pallas_triton.Config(
+    assert triton is not None
+    config = triton.Config(
         block_m=128,
         block_n=128,
         block_k=32,
@@ -44,14 +67,15 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
         num_warps=4,
         num_stages=4,
     )
-    split_k_dot = pallas_triton.PallasTritonRaggedDot(config=config)
+    split_k_dot = _TestTritonRaggedDot(config=config)
 
     with mock.patch.object(self, "_dot_fn", split_k_dot):
       with test_base.override_chex_args(atol=2e-5):
         self.test_simple1()  # pyrefly: ignore[missing-attribute]
 
   def test_split_k_quantized(self):
-    config = pallas_triton.Config(
+    assert triton is not None
+    config = triton.Config(
         block_m=128,
         block_n=128,
         block_k=32,
@@ -59,7 +83,7 @@ class PallasTritonRaggedDotTest(test_base.RaggedDotTestBase):
         num_warps=4,
         num_stages=4,
     )
-    split_k_dot = pallas_triton.PallasTritonRaggedDot(
+    split_k_dot = _TestTritonRaggedDot(
         config=config, split_k_intermediate_dtype=jnp.float32
     )
 

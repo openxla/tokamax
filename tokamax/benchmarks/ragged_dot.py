@@ -25,8 +25,10 @@ from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+import qwix
 from tensorboardX import writer
 import tokamax
+from tokamax._src import quantization
 
 from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.experimental.gmm_v2 import util as gmm_util
@@ -123,17 +125,15 @@ class RaggedDotBenchmark(parameterized.TestCase):
     group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=lhs,
-        rhs=rhs_q,
+        lhs=quantization.AsQArray(lhs, jnp.float8_e4m3fn),
+        rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
-        rhs_scale=rhs_scale,
-        maybe_quantize_lhs=True,
         preferred_element_type=jnp.bfloat16,
     )
     fn, args = tokamax.standardize_function(
@@ -160,7 +160,7 @@ class RaggedDotBenchmark(parameterized.TestCase):
     group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
     grad_q, grad_scale = gmm_util.quantize_tensor(
-        grad, jnp.float8_e5m2, axis=0, block_size=m
+        grad, jnp.float8_e5m2, axis=0, block_size=m  # pyrefly: ignore[bad-argument-type]
     )
     grad_scale = jnp.expand_dims(grad_scale, axis=1)
 
@@ -171,9 +171,8 @@ class RaggedDotBenchmark(parameterized.TestCase):
     )
     benchmark_config = dict(
         lhs=lhs,
-        rhs=grad_q,
+        rhs=qwix.QArray(grad_q, grad_scale),
         group_sizes=group_sizes,
-        rhs_scale=grad_scale,
         ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS,
         preferred_element_type=jnp.bfloat16,
     )
@@ -284,12 +283,10 @@ class RaggedDotBenchmark(parameterized.TestCase):
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=lhs,
-        rhs=rhs_q,
+        lhs=quantization.AsQArray(lhs, jnp.float8_e4m3fn),
+        rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
         group_offset=jnp.array([group_offset], jnp.int32),
-        rhs_scale=rhs_scale,
-        maybe_quantize_lhs=True,
         zero_initialize=False,
         fuse_gateup_activation=fuse_act,
         preferred_element_type=jnp.bfloat16,

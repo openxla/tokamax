@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.batched_rpa import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_base
 from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_pallas_mosaic_tpu
 import torch
@@ -153,6 +154,164 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
     torch.testing.assert_close(
         pallas_out, ref_out_as_torch, atol=0.15, rtol=0.15
     )
+
+  def test_call_without_config_uses_heuristics_config(self):
+    device = "tpu"
+    torch.manual_seed(0)
+
+    seq_lens = [128, 128]
+    q_lens = [1, 1]
+    page_size = 128
+    num_seqs = len(seq_lens)
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    head_dim_aligned = 128
+    total_q_tokens = sum(q_lens)
+
+    cu_q_lens = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    pages_per_seq = max((sl + page_size - 1) // page_size for sl in seq_lens)
+    total_pages = num_seqs * pages_per_seq
+    page_indices = torch.arange(total_pages, dtype=torch.int32, device=device)
+    kv_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    distribution = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
+
+    queries = torch.randn(
+        (total_q_tokens, num_q_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    keys = torch.randn(
+        (total_q_tokens, num_kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    values = torch.randn(
+        (total_q_tokens, num_kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv_cache = torch.randn(
+        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    op_pallas = torch_pallas_mosaic_tpu.PallasMosaicTpuBatchedRpa
+    expected_config, _ = torch_utils.get_configs(
+        op_pallas,
+        queries,
+        keys,
+        values,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        from_autotuning_cache=False,
+    )
+
+    op_pallas(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+    )
+    self.assertEqual(op_pallas.configs[0], expected_config)
+
+  def test_torch_compile_call_without_config_uses_heuristics_config(self):
+    device = "tpu"
+    torch.manual_seed(0)
+
+    seq_lens = [128, 128, 128]
+    q_lens = [1, 1, 1]
+    page_size = 128
+    num_seqs = len(seq_lens)
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    head_dim_aligned = 128
+    total_q_tokens = sum(q_lens)
+
+    cu_q_lens = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    pages_per_seq = max((sl + page_size - 1) // page_size for sl in seq_lens)
+    total_pages = num_seqs * pages_per_seq
+    page_indices = torch.arange(total_pages, dtype=torch.int32, device=device)
+    kv_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    distribution = torch.tensor([3, 3, 3], dtype=torch.int32, device=device)
+
+    queries = torch.randn(
+        (total_q_tokens, num_q_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    keys = torch.randn(
+        (total_q_tokens, num_kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    values = torch.randn(
+        (total_q_tokens, num_kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv_cache = torch.randn(
+        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    op_pallas = torch_pallas_mosaic_tpu.PallasMosaicTpuBatchedRpa
+    expected_config, _ = torch_utils.get_configs(
+        op_pallas,
+        queries,
+        keys,
+        values,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        from_autotuning_cache=False,
+    )
+
+    @torch.compile(fullgraph=True, dynamic=False)
+    def compiled_fn(
+        queries,
+        keys,
+        values,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    ):
+      return op_pallas(
+          queries=queries,
+          keys=keys,
+          values=values,
+          kv_cache=kv_cache,
+          kv_lens=kv_lens,
+          page_indices=page_indices,
+          cu_q_lens=cu_q_lens,
+          distribution=distribution,
+      )
+
+    compiled_fn(
+        queries,
+        keys,
+        values,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
+    self.assertEqual(op_pallas.configs[0], expected_config)
 
 
 if __name__ == "__main__":
