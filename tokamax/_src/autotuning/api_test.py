@@ -14,6 +14,7 @@
 # ==============================================================================
 import dataclasses
 import functools
+import gc
 import time
 from typing import Any, override
 
@@ -436,7 +437,9 @@ class AutotuningTest(parameterized.TestCase):
 
     class _FakeErrorOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
 
-      def _fwd(self, x, *, config, return_residuals):
+      def _fwd(self, x: jax.Array, *, config, return_residuals):
+        if config.foo == 42:
+          return x + 1, None
         raise ValueError("Fake error")
 
       @override
@@ -447,11 +450,25 @@ class AutotuningTest(parameterized.TestCase):
         return set([_FakeOpConfig(42), _FakeOpConfig(43)])
 
     op = _FakeErrorOp()
-    ba = op.bind(jnp.zeros((1, 2)))
-    result = ba.autotune()
-    self.assertNotEmpty(result.items())
-    benchmark_data = list(result.values())[0]
+    ba = op.bind(jax.ShapeDtypeStruct((17, 23), jnp.float32))
+    ba.autotune()
+    jax.clear_caches()
+    gc.collect()
+
+    cached = op.get_autotuning_cache()[ba.autotuning_cache_key]
+    self.assertNotEmpty(cached.items())
+    benchmark_data = cached[_FakeOpConfig(43)]
     self.assertIsInstance(benchmark_data, Exception)
+    with self.subTest("no_leaked_executables"):
+      self.assertEmpty([
+          o for o in gc.get_objects() if isinstance(o, jax.stages.Compiled)
+      ])
+    with self.subTest("no_leaked_arrays"):
+      self.assertEmpty([
+          o
+          for o in gc.get_objects()
+          if isinstance(o, jax.Array) and o.shape == (17, 23)
+      ])
 
   @parameterized.parameters(True, False)
   def test_autotuning_ignore_cache(self, ignore_cache):
