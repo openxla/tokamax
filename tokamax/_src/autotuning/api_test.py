@@ -42,14 +42,14 @@ from tokamax._src.ops.triangle_multiplication import api as tri_mul_api
 from tokamax._src.ops.triangle_multiplication import base as tri_mul_base
 
 try:
-  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_glu = None  # pyrefly: ignore[assignment]
+  triton_glu = None
 
 try:
-  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_ragged_dot = None  # pyrefly: ignore[assignment]
+  triton_ragged_dot = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,8 +101,8 @@ def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
 
     x, scale, offset, weights = map(as_batched, args, ax)
   expected_bound_args = (
-      norm.bind(x, scale, offset, epsilon=eps),  # pyrefly: ignore[bad-argument-type]
-      glu.bind(x, weights, activation=act),  # pyrefly: ignore[bad-argument-type]
+      norm.bind(x, scale, offset, epsilon=eps),
+      glu.bind(x, weights, activation=act),
   )
   return f, args, expected_bound_args
 
@@ -190,8 +190,8 @@ class AutotuningTest(parameterized.TestCase):
         x=jax.ShapeDtypeStruct((64, 128), dtype=jnp.bfloat16),
         weights=jax.ShapeDtypeStruct((128, 2, 128), dtype=jnp.bfloat16),
     )
-    bound_arg0 = triton_glu.TritonGatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
-    bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)  # pyrefly: ignore[bad-argument-type]
+    bound_arg0 = triton_glu.TritonGatedLinearUnit().bind(**shapes)
+    bound_arg1 = glu_base.GatedLinearUnit().bind(**shapes)
     assert bound_arg0.autotuning_cache_key == bound_arg1.autotuning_cache_key
     expected = (bound_arg0, bound_arg1)
     f_lowered = jax.jit(f).lower(**shapes)
@@ -213,7 +213,7 @@ class AutotuningTest(parameterized.TestCase):
     x = jax.ShapeDtypeStruct(x_shape, dtype=jnp.bfloat16)
     weights = jax.ShapeDtypeStruct((d, 2, d), dtype=jnp.bfloat16)
     actual = api.get_bound_args(jax.jit(g).lower(x, weights))
-    bound_arg = glu.bind(x, weights, activation=act, return_residuals=True)  # pyrefly: ignore[bad-argument-type]
+    bound_arg = glu.bind(x, weights, activation=act, return_residuals=True)
     vjp_bound_arg = glu.vjp.bind(**bound_arg.vjp_arg_spec)  # pyrefly: ignore[missing-attribute]
     self.assertCountEqual(actual, (bound_arg, vjp_bound_arg))
 

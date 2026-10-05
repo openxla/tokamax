@@ -327,8 +327,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           if explicit_tiles is not None
           else gmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
-          precision=precision,  # pyrefly: ignore[bad-argument-type]
-          preferred_element_type=preferred_element_type,  # pyrefly: ignore[bad-argument-type]
+          precision=precision,
+          preferred_element_type=preferred_element_type,
           acc_dtype=acc_dtype,
           maybe_quantize_lhs=maybe_quantize_lhs,
           zero_initialize=zero_initialize,
@@ -369,8 +369,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           if explicit_tiles is not None
           else gmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
-          precision=precision,  # pyrefly: ignore[bad-argument-type]
-          preferred_element_type=preferred_element_type  # pyrefly: ignore[bad-argument-type]
+          precision=precision,
+          preferred_element_type=preferred_element_type
           if preferred_element_type is not None
           else lhs_val.dtype,
           acc_dtype=acc_dtype,
@@ -416,8 +416,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           if explicit_tiles is not None
           else tgmm_backend.calculate_tgmm_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
-          precision=precision,  # pyrefly: ignore[bad-argument-type]
-          preferred_element_type=preferred_element_type  # pyrefly: ignore[bad-argument-type]
+          precision=precision,
+          preferred_element_type=preferred_element_type
           if preferred_element_type is not None
           else lhs_val.dtype,
           acc_dtype=acc_dtype,

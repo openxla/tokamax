@@ -35,9 +35,9 @@ from tokamax._src.ops.attention import pallas_triton as pl_attn
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 
 try:
-  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_ragged_dot = None  # pyrefly: ignore[assignment]
+  triton_ragged_dot = None
 
 A_SYMBOLIC, B_SYMBOLIC = export.symbolic_shape("a, b")
 

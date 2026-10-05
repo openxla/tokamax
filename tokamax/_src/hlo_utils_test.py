@@ -40,14 +40,14 @@ from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 
 try:
-  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_glu = None  # pyrefly: ignore[assignment]
+  triton_glu = None
 
 try:
-  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_ragged_dot = None  # pyrefly: ignore[assignment]
+  triton_ragged_dot = None
 
 RepresentationTypes = Literal['lowered', 'mlir']
 
@@ -261,13 +261,13 @@ class DumpHloLibTest(parameterized.TestCase):
     op_specs = hlo_utils.get_opspecs(computation)
 
     norm_spec = norm_op.bind(
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
     )
     glu_spec = glu_op.bind(
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),
         activation=jax.nn.swish,
     )
 
@@ -286,9 +286,9 @@ class DumpHloLibTest(parameterized.TestCase):
     op_specs = hlo_utils.get_opspecs(computation, include_xla_kernels=False)
 
     norm_spec = norm_op.bind(
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
         return_residuals=True,
     )
     norm_vjp_op = typing.cast(
@@ -319,9 +319,9 @@ class DumpHloLibTest(parameterized.TestCase):
     # TODO: Add a test for vmap.
     op = pl_norm.PallasTritonNormalization()
     ba = op.bind(
-        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
+        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
     )
 
     fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
@@ -346,8 +346,8 @@ class DumpHloLibTest(parameterized.TestCase):
 
     op = triton_ragged_dot.TritonRaggedDot()
     ba = op.bind(
-        jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),
         group_sizes=[128] * 8,
     )
 

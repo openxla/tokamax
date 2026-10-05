@@ -267,7 +267,6 @@ def make_tgmm_configs(
     tiles = tile_info
   else:
     tiles = tile_info(
-        # pyrefly: ignore[bad-argument-type]
         dims,
         lhs_cfgs,
         rhs_cfgs,
@@ -788,7 +787,6 @@ def tgmm_v2(
   ]
 
   if rhs_scale is not None:
-    # pyrefly: ignore[bad-assignment]
     rhs_scale = rhs_scale.astype(jnp.float32)
     pad_n = aligned_n - dims.size_n
     if pad_n > 0:

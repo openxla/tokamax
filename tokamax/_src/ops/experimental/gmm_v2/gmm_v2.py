@@ -1117,8 +1117,8 @@ def calculate_tiling(
     if rhs_cfgs.quant_block_size is None:
       return True
     if (
-        tk % rhs_cfgs.quant_block_size != 0  # pyrefly: ignore[unsupported-operation]
-        and rhs_cfgs.quant_block_size % tk != 0  # pyrefly: ignore[unsupported-operation]
+        tk % rhs_cfgs.quant_block_size != 0
+        and rhs_cfgs.quant_block_size % tk != 0
     ):
       return False
     return True
@@ -1444,7 +1444,7 @@ def make_gmm_configs(
       # Choose lhs quantization dtype based on TPU hardware support
       # only if lhs_quant_dtype is not provided.
       assert rhs_quant_dtype is not None
-      is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)  # pyrefly: ignore[bad-argument-type]
+      is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
       tpu_info = pltpu.get_tpu_info()
       # Check if there is hardware compute support for rhs dtype group.
       if tpu_info.fp8_ops_per_second > 0:
@@ -1452,7 +1452,7 @@ def make_gmm_configs(
         # without a numeric issues. Note that this is not the case for 4-bit
         # floating rhs as conversion to int8 will cause numeric issues.
         # see is_manually_cast_matmul_dtype_combo()
-        is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4  # pyrefly: ignore[bad-argument-type]
+        is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4
         if is_rhs_float or is_rhs_4bits:
           lhs_q_dtype = jnp.float8_e4m3fn.dtype
       if tpu_info.int8_ops_per_second > 0:
