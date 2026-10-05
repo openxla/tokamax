@@ -27,14 +27,14 @@ class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
 
   def test_pallas_fwd_matches_reference(self):
     key = jax.random.PRNGKey(123)
-    b, h, t, d = 2, 4, 512, 16
+    batch_size, num_heads, seq_len, head_dim = 2, 4, 512, 16
     chunk_size = 256
     topk = 2
 
     k0, k1, k2 = jax.random.split(key, 3)
-    q = jax.random.normal(k0, (b, h, t, d), dtype=jnp.float32)
-    k = jax.random.normal(k1, (b, h, t, d), dtype=jnp.float32)
-    v = jax.random.normal(k2, (b, h, t, d), dtype=jnp.float32)
+    q = jax.random.normal(k0, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+    k = jax.random.normal(k1, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+    v = jax.random.normal(k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
 
     op_instance = pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention()
     (actual_out, _), _ = op_instance._fwd(

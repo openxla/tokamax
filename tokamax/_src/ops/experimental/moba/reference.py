@@ -36,53 +36,60 @@ def _single_seq_moba(
   k_s = k_s.astype(jnp.float32)
   v_s = v_s.astype(jnp.float32)
 
-  h, t, d = q_s.shape
-  bq = chunk_size
-  nq_blocks = t // bq
-  k_eff = min(topk, nq_blocks)
-  bk_sub = (k_eff + 1) * bq
+  num_heads, seq_len, head_dim = q_s.shape
+  block_q = chunk_size
+  num_q_blocks = seq_len // block_q
+  effective_topk = min(topk, num_q_blocks)
+  block_k_sub = (effective_topk + 1) * block_q
 
-  q_blocks = q_s.reshape(h, nq_blocks, bq, d)
-  k_blocks = k_s.reshape(h, nq_blocks, bq, d)
-  v_blocks = v_s.reshape(h, nq_blocks, bq, d)
+  q_blocks = q_s.reshape(num_heads, num_q_blocks, block_q, head_dim)
+  k_blocks = k_s.reshape(num_heads, num_q_blocks, block_q, head_dim)
+  v_blocks = v_s.reshape(num_heads, num_q_blocks, block_q, head_dim)
 
   q_mean = jnp.mean(q_blocks, axis=2)
   k_mean = jnp.mean(k_blocks, axis=2)
 
   routing_scores = jnp.einsum("hqd,hnd->hqn", q_mean, k_mean) * scale
-  q_idx = jnp.arange(nq_blocks)[:, None]
-  k_idx = jnp.arange(nq_blocks)[None, :]
+  q_idx = jnp.arange(num_q_blocks)[:, None]
+  k_idx = jnp.arange(num_q_blocks)[None, :]
   historical_mask = k_idx < q_idx
   masked_routing = jnp.where(historical_mask[None], routing_scores, -jnp.inf)
-  _, topk_idx = jax.lax.top_k(masked_routing, k_eff)
+  _, topk_idx = jax.lax.top_k(masked_routing, effective_topk)
   topk_idx = jax.lax.stop_gradient(topk_idx)
 
-  causal_diag = jnp.tril(jnp.ones((bq, bq), dtype=bool))
-  ranks = jnp.arange(k_eff)
+  causal_diag = jnp.tril(jnp.ones((block_q, block_q), dtype=bool))
+  ranks = jnp.arange(effective_topk)
 
   def head_fn(
       q_h: jax.Array, k_h: jax.Array, v_h: jax.Array, topk_h: jax.Array
   ) -> jax.Array:
-    def block_fn(i: int | Any) -> jax.Array:
-      q_i = q_h[i]
-      k_diag = k_h[i][None, :, :]
-      v_diag = v_h[i][None, :, :]
-      k_hist = k_h[topk_h[i]]
-      v_hist = v_h[topk_h[i]]
-      k_sub = jnp.concatenate([k_diag, k_hist], axis=0).reshape(bk_sub, d)
-      v_sub = jnp.concatenate([v_diag, v_hist], axis=0).reshape(bk_sub, d)
+    def block_fn(block_idx: int | Any) -> jax.Array:
+      q_i = q_h[block_idx]
+      k_diag = k_h[block_idx][None, :, :]
+      v_diag = v_h[block_idx][None, :, :]
+      k_hist = k_h[topk_h[block_idx]]
+      v_hist = v_h[topk_h[block_idx]]
+      k_sub = jnp.concatenate([k_diag, k_hist], axis=0).reshape(
+          block_k_sub, head_dim
+      )
+      v_sub = jnp.concatenate([v_diag, v_hist], axis=0).reshape(
+          block_k_sub, head_dim
+      )
 
       valid_hist = jnp.broadcast_to(
-          jnp.repeat(ranks < i, bq)[None, :], (bq, k_eff * bq)
+          jnp.repeat(ranks < block_idx, block_q)[None, :],
+          (block_q, effective_topk * block_q),
       )
       mask_sub = jnp.concatenate([causal_diag, valid_hist], axis=1)
 
       logits = jnp.matmul(q_i, k_sub.T) * scale
       logits = jnp.where(mask_sub, logits, -1e9)
-      w = jax.nn.softmax(logits, axis=-1)
-      return jnp.matmul(w, v_sub)
+      weights = jax.nn.softmax(logits, axis=-1)
+      return jnp.matmul(weights, v_sub)
 
-    return jax.vmap(block_fn)(jnp.arange(nq_blocks)).reshape(t, d)
+    return jax.vmap(block_fn)(jnp.arange(num_q_blocks)).reshape(
+        seq_len, head_dim
+    )
 
   out = jax.vmap(head_fn)(q_blocks, k_blocks, v_blocks, topk_idx)
   return out.astype(orig_dtype)
@@ -99,7 +106,8 @@ def moba_reference(
 ) -> tuple[jax.Array, None]:
   """Reference implementation of Mixture of Block Attention (MoBA)."""
   if scale is None:
-    scale = q.shape[-1] ** -0.5
+    head_dim = q.shape[-1]
+    scale = head_dim ** -0.5
 
   def batch_fn(q_b: jax.Array, k_b: jax.Array, v_b: jax.Array) -> jax.Array:
     return _single_seq_moba(q_b, k_b, v_b, scale, topk, chunk_size)

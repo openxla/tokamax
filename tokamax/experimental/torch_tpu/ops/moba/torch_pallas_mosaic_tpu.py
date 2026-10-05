@@ -30,17 +30,22 @@ class _PallasTpuMixtureOfBlockAttention(torch_base._MixtureOfBlockAttention):
   def __init__(self):
     super().__init__()
     self.op_impl_jax = jax_pallas.PallasTpuMixtureOfBlockAttention()
-    self.jax_op_name = "torch_tpu_pallas_moba"
+    self._torch_tokamax_op = None
     try:
       from torch_tpu._internal import pallas
-      self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
-      self._setup_autograd(pallas)
-    except Exception:
-      pass
+    except ImportError:
+      pallas = None
+    else:
+      try:
+        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+        self._setup_autograd(pallas)
+      except Exception:
+        self._torch_tokamax_op = None
 
   def _setup_autograd(self, pallas_module):
     def bwd_jax(q, k, v, do, topk=4, chunk_size=256, scale=None):
-      scale_val = scale if scale is not None else (q.shape[-1] ** -0.5)
+      head_dim = q.shape[-1]
+      scale_val = scale if scale is not None else (head_dim ** -0.5)
       orig_dtype = q.dtype
 
       def single_bwd(carry, inputs):

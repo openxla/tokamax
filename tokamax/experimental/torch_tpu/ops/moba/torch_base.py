@@ -38,9 +38,13 @@ class _MixtureOfBlockAttention:
     self._torch_tokamax_op = None
     try:
       from torch_tpu._internal import pallas
-      self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
-    except Exception:
-      pass
+    except ImportError:
+      pallas = None
+    else:
+      try:
+        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+      except Exception:
+        self._torch_tokamax_op = None
 
   def op_impl_call(
       self,
@@ -65,10 +69,11 @@ class _MixtureOfBlockAttention:
       topk: int = _TOPK,
       scale: Optional[float] = None,
   ) -> torch.Tensor:
-    b, t, h, d = q.shape
-    if t % chunk_size != 0:
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    del head_dim
+    if seq_len % chunk_size != 0:
       raise ValueError(
-          f"Sequence length ({t}) must be divisible by chunk_size ({chunk_size})"
+          f"Sequence length ({seq_len}) must be divisible by chunk_size ({chunk_size})"
       )
 
     q_t = q.transpose(1, 2).contiguous()
@@ -97,50 +102,54 @@ class _MixtureOfBlockAttention:
       scale: Optional[float] = None,
   ) -> torch.Tensor:
     """Pure PyTorch vectorized fallback executing block-level MoBA attention."""
-    b, h, t, d = q.shape
-    scale = scale or (d ** -0.5)
-    nb = t // chunk_size
-    k_eff = min(topk, nb)
-    bk_sub = (k_eff + 1) * chunk_size
+    batch_size, num_heads, seq_len, head_dim = q.shape
+    scale = scale or (head_dim ** -0.5)
+    num_blocks = seq_len // chunk_size
+    effective_topk = min(topk, num_blocks)
+    block_k_sub = (effective_topk + 1) * chunk_size
 
-    q_blocks = q.view(b, h, nb, chunk_size, d)
-    k_blocks = k.view(b, h, nb, chunk_size, d)
-    v_blocks = v.view(b, h, nb, chunk_size, d)
+    q_blocks = q.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
+    k_blocks = k.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
+    v_blocks = v.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
 
     q_mean = q_blocks.mean(dim=3)
     k_mean = k_blocks.mean(dim=3)
 
     routing = torch.einsum("bhqd,bhnd->bhqn", q_mean, k_mean) * scale
-    q_idx = torch.arange(nb, device=q.device).unsqueeze(1)
-    k_idx = torch.arange(nb, device=q.device).unsqueeze(0)
+    q_idx = torch.arange(num_blocks, device=q.device).unsqueeze(1)
+    k_idx = torch.arange(num_blocks, device=q.device).unsqueeze(0)
     hist_mask = k_idx < q_idx
     routing = torch.where(hist_mask.unsqueeze(0).unsqueeze(0), routing, -float("inf"))
-    topk_idx = torch.topk(routing, k_eff, dim=-1).indices
+    topk_idx = torch.topk(routing, effective_topk, dim=-1).indices
 
     causal_diag = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool))
 
     outs = []
-    for i in range(nb):
-      q_i = q_blocks[:, :, i]
-      k_diag = k_blocks[:, :, i:i+1]
-      v_diag = v_blocks[:, :, i:i+1]
+    for block_idx in range(num_blocks):
+      q_i = q_blocks[:, :, block_idx]
+      k_diag = k_blocks[:, :, block_idx:block_idx+1]
+      v_diag = v_blocks[:, :, block_idx:block_idx+1]
 
-      if k_eff > 0:
-        slot_idx = topk_idx[:, :, i, :][:, :, :, None, None]
-        k_hist = torch.gather(k_blocks, 2, slot_idx.expand(b, h, k_eff, chunk_size, d))
-        v_hist = torch.gather(v_blocks, 2, slot_idx.expand(b, h, k_eff, chunk_size, d))
+      if effective_topk > 0:
+        slot_idx = topk_idx[:, :, block_idx, :][:, :, :, None, None]
+        k_hist = torch.gather(
+            k_blocks, 2, slot_idx.expand(batch_size, num_heads, effective_topk, chunk_size, head_dim)
+        )
+        v_hist = torch.gather(
+            v_blocks, 2, slot_idx.expand(batch_size, num_heads, effective_topk, chunk_size, head_dim)
+        )
 
-        k_sub = torch.cat([k_diag, k_hist], dim=2).view(b, h, bk_sub, d)
-        v_sub = torch.cat([v_diag, v_hist], dim=2).view(b, h, bk_sub, d)
+        k_sub = torch.cat([k_diag, k_hist], dim=2).view(batch_size, num_heads, block_k_sub, head_dim)
+        v_sub = torch.cat([v_diag, v_hist], dim=2).view(batch_size, num_heads, block_k_sub, head_dim)
 
-        ranks = torch.arange(k_eff, device=q.device)
-        valid_hist = (ranks < i).repeat_interleave(chunk_size).view(1, 1, 1, -1).expand(b, h, chunk_size, -1)
-        mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(b, h, -1, -1)
+        ranks = torch.arange(effective_topk, device=q.device)
+        valid_hist = (ranks < block_idx).repeat_interleave(chunk_size).view(1, 1, 1, -1).expand(batch_size, num_heads, chunk_size, -1)
+        mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(batch_size, num_heads, -1, -1)
         mask_sub = torch.cat([mask_diag, valid_hist], dim=-1)
       else:
-        k_sub = k_diag.view(b, h, chunk_size, d)
-        v_sub = v_diag.view(b, h, chunk_size, d)
-        mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(b, h, -1, -1)
+        k_sub = k_diag.view(batch_size, num_heads, chunk_size, head_dim)
+        v_sub = v_diag.view(batch_size, num_heads, chunk_size, head_dim)
+        mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(batch_size, num_heads, -1, -1)
 
       scores = torch.matmul(q_i, k_sub.transpose(-1, -2)) * scale
       scores = torch.where(mask_sub, scores, -1e9)

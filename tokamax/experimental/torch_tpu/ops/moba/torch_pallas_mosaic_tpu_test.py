@@ -27,13 +27,13 @@ class MoBAPallasKernelTest(unittest.TestCase):
 
   def test_forward_shape_and_parity(self):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    b, seq_len, nheads, head_dim = 2, 128, 4, 16
+    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
     chunk_size, topk = 64, 2
 
     torch.manual_seed(42)
-    q = torch.randn(b, seq_len, nheads, head_dim, device=device, dtype=torch.float32)
-    k = torch.randn(b, seq_len, nheads, head_dim, device=device, dtype=torch.float32)
-    v = torch.randn(b, seq_len, nheads, head_dim, device=device, dtype=torch.float32)
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
+    k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
+    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
 
     actual_out = moba_pallas(
         q, k, v, chunk_size=chunk_size, topk=topk
@@ -42,7 +42,7 @@ class MoBAPallasKernelTest(unittest.TestCase):
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), chunk_size=chunk_size, topk=topk
     ).transpose(1, 2)
 
-    self.assertEqual(actual_out.shape, (b, seq_len, nheads, head_dim))
+    self.assertEqual(actual_out.shape, (batch_size, seq_len, num_heads, head_dim))
     torch.testing.assert_close(
         actual_out.cpu(), expected_out.cpu(), rtol=1e-3, atol=1e-3
     )
@@ -59,13 +59,13 @@ class MoBAPallasKernelTest(unittest.TestCase):
 
   def test_backward_autograd(self):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    b, seq_len, nheads, head_dim = 2, 64, 4, 16
+    batch_size, seq_len, num_heads, head_dim = 2, 64, 4, 16
     chunk_size, topk = 64, 1
 
     torch.manual_seed(42)
-    q = torch.randn(b, seq_len, nheads, head_dim, device=device, requires_grad=True)
-    k = torch.randn(b, seq_len, nheads, head_dim, device=device, requires_grad=True)
-    v = torch.randn(b, seq_len, nheads, head_dim, device=device, requires_grad=True)
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
+    k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
+    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
 
     out = moba_pallas(
         q, k, v, chunk_size=chunk_size, topk=topk
