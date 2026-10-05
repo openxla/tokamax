@@ -14,6 +14,7 @@
 # ==============================================================================
 """Tests for the baseline JAX implementation of Multi-Head Latent Attention."""
 
+from tokamax._src.mosaic_tpu import pl_align_to, pl_cdiv
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -65,7 +66,7 @@ class BaselineMlaTest(parameterized.TestCase):
   ):
     total_q_len = sum(s[0] for s in seq_lens_list)
     total_kv_tokens = sum(s[1] for s in seq_lens_list)
-    num_pages = utils.cdiv(total_kv_tokens, page_size) + len(seq_lens_list)
+    num_pages = pl_cdiv(total_kv_tokens, page_size) + len(seq_lens_list)
     mask_value = float(jnp.finfo(kv_dtype).min)
 
     inputs = utils.generate_mla_inputs(
