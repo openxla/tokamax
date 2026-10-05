@@ -119,39 +119,33 @@ def _generate_blockwise_dropout_mask(
     q_block_size: int,
     kv_block_size: int,
     dropout_rate: float,
+    n_q_blocks: int | jax.Array,
+    n_kv_blocks: int | jax.Array,
 ) -> jax.Array:
   """Generates the dropout mask of a single (head, q block, kv block) tile.
 
   The mask is a pure function of the key and the block coordinates, so the
   forward and backward kernels regenerate the identical mask without either
   materializing the full [heads, q, kv] mask in HBM or saving it as a residual.
-  True means "dropped".
+  Returns float32 weights in {0.0, 1.0 / (1.0 - dropout_rate)}.
 
   The block coordinates are indices into the canonical dropout grid, which is
   independent of the kernel's block sizes; callers go through
   `_dropout_mask_tile` rather than calling this directly.
-
-  The batch dimension is not folded in here: the kernels are written for a
-  single batch element, so the caller is responsible for folding a batch index
-  into `prng_key` before it reaches the kernel.
   """
-  # TODO: Optimize key derivation by using one fold_in instead of three.
-  # We can collapse the serial chain (head -> q_block -> kv_block) if we pass static
-  # grid extents (n_q_blocks, n_kv_blocks) from config:
-  # block_id = (head_idx * n_q_blocks + q_block_idx) * n_kv_blocks + kv_block_idx
-  # sub_key = jax.random.fold_in(prng_key[...], block_id)
-  sub_key = prng_key[...]
-  sub_key = jax.random.fold_in(sub_key, head_idx)
-  sub_key = jax.random.fold_in(sub_key, q_block_idx)
-  sub_key = jax.random.fold_in(sub_key, kv_block_idx)
-  # TODO: Avoid float round-trip in bernoulli mask generation.
-  # jax.random.bernoulli builds float32 uniform then does f32 compare.
-  # We can use raw bits and compare with threshold directly:
-  # bits = jax.random.bits(sub_key, (q_block_size, kv_block_size), jnp.uint32)
-  # return bits < np.uint32(dropout_rate * 2**32)
-  return jax.random.bernoulli(
-      sub_key, dropout_rate, (q_block_size, kv_block_size)
+  tile_id = (head_idx * n_q_blocks + q_block_idx) * n_kv_blocks + kv_block_idx
+  sub_key = jax.random.fold_in(prng_key[...], tile_id)
+
+  # Direct integer threshold mask generation in uint32 ALU, avoiding float32 round-trip.
+  threshold = np.uint32(dropout_rate * (2**32))
+  bits = jax.random.bits(
+      sub_key, (q_block_size, kv_block_size), dtype=jnp.uint32
   )
+  dropped = bits < threshold
+
+  # Pre-scaled mask returns float multiplier directly.
+  scale = jnp.float32(1.0 / (1.0 - dropout_rate))
+  return jnp.where(dropped, 0.0, scale)
 
 
 def _dropout_mask_tile(
@@ -165,6 +159,8 @@ def _dropout_mask_tile(
     canonical_q: int,
     canonical_kv: int,
     dropout_rate: float,
+    n_q_blocks: int | jax.Array,
+    n_kv_blocks: int | jax.Array,
 ) -> jax.Array:
   """Builds the [q_block_size, kv_block_size] dropout mask of one kernel tile.
 
@@ -188,6 +184,21 @@ def _dropout_mask_tile(
   nkv, rem = divmod(kv_block_size, canonical_kv)
   assert rem == 0, f"{kv_block_size=} must be a multiple of {canonical_kv=}"
 
+  # Fast-path: single canonical block tile (1:1), avoids loop,
+  # list, and concat overhead.
+  if nq == 1 and nkv == 1:
+    return _generate_blockwise_dropout_mask(
+        prng_key,
+        head_idx=head_idx,
+        q_block_idx=q_block_idx,
+        kv_block_idx=kv_block_idx,
+        q_block_size=canonical_q,
+        kv_block_size=canonical_kv,
+        dropout_rate=dropout_rate,
+        n_q_blocks=n_q_blocks,
+        n_kv_blocks=n_kv_blocks,
+    )
+
   # Block indices, not element offsets: the canonical index of a tile's first
   # block is exact without a division on a traced value.
   q_base = q_block_idx * nq
@@ -203,6 +214,8 @@ def _dropout_mask_tile(
             q_block_size=canonical_q,
             kv_block_size=canonical_kv,
             dropout_rate=dropout_rate,
+            n_q_blocks=n_q_blocks,
+            n_kv_blocks=n_kv_blocks,
         )
         for b in range(nkv)
     ]
@@ -579,6 +592,7 @@ def flash_attention_kernel(
     o_scratch_ref,
     *,
     mask_value: float,
+    q_steps: int,
     kv_steps: int,
     bq: int,
     bkv: int,
@@ -768,6 +782,10 @@ def flash_attention_kernel(
     # the survivors: only the numerator (the s @ v product) sees the mask.
     if dropout_rate:
       global_kv_block_idx = j * (bkv // bkv_compute) + kv_compute_index
+      canonical_q = config.active_dropout_block_q
+      canonical_kv = config.active_dropout_block_kv
+      n_q_blocks = q_steps * (bq // canonical_q)
+      n_kv_blocks = kv_steps * (bkv // canonical_kv)
       # One mask per stacked head, assembled into the (heads, bq, bkv) tile:
       # writing them in with `.at[head].set` would lower to a scatter, which
       # Mosaic does not implement. Built with an explicit loop rather than a
@@ -783,13 +801,15 @@ def flash_attention_kernel(
                 kv_block_idx=global_kv_block_idx,
                 q_block_size=bq,
                 kv_block_size=bkv_compute,
-                canonical_q=config.active_dropout_block_q,
-                canonical_kv=config.active_dropout_block_kv,
+                canonical_q=canonical_q,
+                canonical_kv=canonical_kv,
                 dropout_rate=dropout_rate,
+                n_q_blocks=n_q_blocks,
+                n_kv_blocks=n_kv_blocks,
             )
         )
-      dropout_mask = jnp.stack(head_masks, axis=0)
-      s_curr = jnp.where(dropout_mask, 0.0, s_curr) / (1.0 - dropout_rate)
+      dropout_scale = jnp.stack(head_masks, axis=0)
+      s_curr = s_curr * dropout_scale
 
     s_curr_flat = s_curr.reshape((num_stacked_q_heads * bq, bkv_compute))
 
@@ -1238,6 +1258,7 @@ def _splash_attention_forward(
         partial(
             flash_attention_kernel,
             mask_value=mask_value,
+            q_steps=q_seq_len // bq,
             kv_steps=kv_steps,
             bq=bq,
             bkv=bkv,
@@ -1551,7 +1572,7 @@ def _flash_attention_dq_kernel(
         q_segment_ids_ref,
         kv_segment_ids_ref,
         attn_logits_soft_cap=attn_logits_soft_cap,
-        k_slice=pl.ds(0, bkv),  # pyrefly: ignore[bad-argument-type]
+        k_slice=pl.ds(0, bkv),
         k_offset=kv_index * bkv,
         bq=bq,
         mask_function=mask_function,
@@ -1632,6 +1653,7 @@ def _flash_attention_dkv_kernel(
     *,
     mask_value: float,
     q_steps: int,
+    kv_steps: int,
     bq: int,
     bkv_compute: int,
     bkv: int,
@@ -1770,7 +1792,7 @@ def _flash_attention_dkv_kernel(
         q_segment_ids_ref,
         kv_segment_ids_ref,
         attn_logits_soft_cap=attn_logits_soft_cap,
-        k_slice=slice_k,  # pyrefly: ignore[bad-argument-type]
+        k_slice=slice_k,
         k_offset=kv_index * bkv + i * bkv_compute,
         bq=bq,
         k_in_lanes=False,
@@ -1780,6 +1802,7 @@ def _flash_attention_dkv_kernel(
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     p = exp(qk - logsumexp)
 
+    dropout_scale: jax.Array | None = None
     if dropout_rate:
       # Regenerated, not saved: the canonical blocks this tile covers are the
       # same ones the forward covered over the same (query, key) range, so the
@@ -1787,20 +1810,26 @@ def _flash_attention_dkv_kernel(
       # the tile is [kv, q] rather than [q, kv], hence the transpose (only
       # float32 transposes lower).
       global_kv_block_idx = kv_index * (bkv // bkv_compute) + i
-      dropout_mask = _dropout_mask_tile(
+      canonical_q = config.active_dropout_block_q
+      canonical_kv = config.active_dropout_block_kv
+      n_q_blocks = q_steps * (bq // canonical_q)
+      n_kv_blocks = kv_steps * (bkv // canonical_kv)
+      dropout_scale = _dropout_mask_tile(
           prng_key_ref,
           head_idx=q_head,
           q_block_idx=q_index,
           kv_block_idx=global_kv_block_idx,
           q_block_size=bq,
           kv_block_size=bkv_compute,
-          canonical_q=config.active_dropout_block_q,
-          canonical_kv=config.active_dropout_block_kv,
+          canonical_q=canonical_q,
+          canonical_kv=canonical_kv,
           dropout_rate=dropout_rate,
+          n_q_blocks=n_q_blocks,
+          n_kv_blocks=n_kv_blocks,
       )
-      dropout_mask = dropout_mask.astype(jnp.float32).T.astype(jnp.bool_)
+      dropout_scale = dropout_scale.T
       # dv sees the dropped weights, matching the forward's numerator.
-      pr = jnp.where(dropout_mask, 0.0, p) / (1.0 - dropout_rate)
+      pr = p * dropout_scale
     else:
       pr = p
 
@@ -1815,8 +1844,8 @@ def _flash_attention_dkv_kernel(
         preferred_element_type=jnp.float32,
     )
     if dropout_rate:
-      assert dropout_mask is not None
-      dp = jnp.where(dropout_mask, 0.0, dp) / (1.0 - dropout_rate)
+      assert dropout_scale is not None
+      dp = dp * dropout_scale
     # `p` here is deliberately the *undropped* softmax weight: `di` is
     # rowsum(do * o), which already equals rowsum(dp_dropped * p).
     ds = (dp - di) * p
@@ -2139,6 +2168,7 @@ def _splash_attention_bwd_dkv(
       _flash_attention_dkv_kernel,
       mask_value=mask_value,
       q_steps=q_steps,
+      kv_steps=kv_steps,
       bq=bq,
       bkv_compute=bkv_compute,
       config=config,

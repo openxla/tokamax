@@ -22,6 +22,7 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax.sharding import ManualAxisType
 import pydantic
+from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.gmm_v2 import gmm_v2 as gmm_backend
 from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
@@ -162,22 +163,9 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
       group_offset: jax.Array | None = None,
       activation: base.ActivationFunction | None = None,
       manual_axis_type: ManualAxisType | None = None,
-      rhs_scale: jax.Array | None = None,
-      rhs_bias: jax.Array | None = None,
-      maybe_quantize_lhs: bool = False,
-      lhs_scale: jax.Array | None = None,
-      zero_initialize: bool = True,
+      zero_initialize: bool = False,
       fuse_gateup_activation: str | None = None,
-      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
-    if isinstance(lhs, (QArray, AsQArray)) or isinstance(
-        rhs, (QArray, AsQArray)
-    ):
-      raise NotImplementedError(
-          "v2 accepts only raw arrays; pass quantization via the"
-          " rhs_scale/rhs_bias API kwargs instead."
-      )
     if _has_manual_axes(manual_axis_type):
       raise NotImplementedError(
           "v2 does not support manual_axis_type yet. But got"
@@ -216,49 +204,181 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         )
     )
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
+      if isinstance(rhs, AsQArray):
+        rhs = rhs.as_qarray()
+      if isinstance(rhs, QArray):
+        if rhs.zero_point is not None:
+          raise NotImplementedError("Zero point quantization is not supported.")
+        rhs_val = rhs.qvalue
+        rhs_scale = rhs.scale
+        if rhs_scale.ndim == 3:
+          rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+        elif rhs_scale.ndim == 2:
+          rhs_scale = rhs_scale[:, None, None, :]
+        rhs_quant_dtype = (
+            jnp.dtype(rhs.qtype) if rhs.qtype is not None else rhs.qvalue.dtype
+        )
+        packing_factor = gmm_backend.get_packing_factor(
+            rhs_val.dtype, rhs_quant_dtype
+        )
+        size_group, size_k, size_n = rhs_val.shape
+        size_k *= packing_factor
+        if (
+            rhs_scale.ndim != 4
+            or rhs_scale.shape != (size_group, rhs_scale.shape[1], 1, size_n)
+            or size_k % rhs_scale.shape[1] != 0
+        ):
+          raise NotImplementedError(
+              f"Unsupported rhs_scale shape {rhs.scale.shape} for rhs shape"
+              f" {rhs.shape}."
+          )
+      else:
+        rhs_val = rhs
+        rhs_scale = None
+        rhs_quant_dtype = None
+
+      if isinstance(lhs, AsQArray):
+        if lhs.channelwise_axes or (
+            lhs.tiled_axes is not None
+            and dict(lhs.tiled_axes) != {0: 1, 1: 512}
+        ):
+          raise NotImplementedError(
+              "v2 only supports default AsQArray tiling (block size 512 along"
+              f" axis 1) for lhs, got {lhs.channelwise_axes=},"
+              f" {lhs.tiled_axes=}."
+          )
+        lhs_val = lhs.value
+        maybe_quantize_lhs = True
+        lhs_qtype = jnp.dtype(lhs.qtype) if lhs.qtype is not None else None
+        lhs_quant_dtype = (
+            lhs_qtype
+            if lhs_qtype not in (jnp.float32, jnp.bfloat16, jnp.float16)
+            else None
+        )
+        if lhs_quant_dtype is not None:
+          tpu_info = pltpu.get_tpu_info()
+          if not tpu_info.is_matmul_supported(
+              lhs_quant_dtype, rhs_val.dtype
+          ) and not gmm_backend.is_manually_cast_matmul_dtype_combo(
+              lhs_quant_dtype, rhs_val.dtype
+          ):
+            raise NotImplementedError(
+                f"lhs_quant_dtype ({lhs_quant_dtype}) and rhs dtype"
+                f" ({rhs_val.dtype}) are not a supported combination."
+            )
+        if lhs.calibration_method.lower().startswith("fixed"):
+          _, *args = lhs.calibration_method.lower().split(",")
+          float_args = [float(a) for a in args]
+          bound = abs(float_args[-1])
+          target_dtype = lhs_quant_dtype or (
+              rhs_quant_dtype
+              if rhs_quant_dtype is not None
+              else jnp.float8_e4m3fn
+          )
+          dtype_max = float(jnp.finfo(target_dtype).max)
+          lhs_scale = jnp.full((1, 1), bound / dtype_max, dtype=jnp.float32)
+        else:
+          lhs_scale = None
+      elif isinstance(lhs, QArray):
+        if lhs.zero_point is not None:
+          raise NotImplementedError("Zero point quantization is not supported.")
+        if lhs.scale is not None and lhs.scale.size != 1:
+          raise NotImplementedError(
+              "Only per-tensor lhs_scale of size 1 is supported for QArray lhs,"
+              f" got {lhs.scale.shape}."
+          )
+        lhs_val = quantization.as_array(lhs)
+        maybe_quantize_lhs = True
+        lhs_scale = lhs.scale
+        if lhs_scale is not None and lhs_scale.ndim != 2:
+          lhs_scale = lhs_scale.reshape(1, 1)
+        lhs_qtype = jnp.dtype(lhs.qtype) if lhs.qtype is not None else None
+        lhs_quant_dtype = (
+            lhs_qtype
+            if lhs_qtype not in (jnp.float32, jnp.bfloat16, jnp.float16)
+            else None
+        )
+        if lhs_quant_dtype is not None:
+          tpu_info = pltpu.get_tpu_info()
+          if not tpu_info.is_matmul_supported(
+              lhs_quant_dtype, rhs_val.dtype
+          ) and not gmm_backend.is_manually_cast_matmul_dtype_combo(
+              lhs_quant_dtype, rhs_val.dtype
+          ):
+            raise NotImplementedError(
+                f"lhs_quant_dtype ({lhs_quant_dtype}) and rhs dtype"
+                f" ({rhs_val.dtype}) are not a supported combination."
+            )
+      else:
+        lhs_val = lhs
+        maybe_quantize_lhs = False
+        lhs_scale = None
+        lhs_quant_dtype = None
+
       out = gmm_backend.gmm_v2(
-          lhs,
-          rhs,
+          lhs_val,
+          rhs_val,
           group_sizes,
           rhs_scale,
-          rhs_bias,
+          None,  # rhs_bias
           group_offset,
           lhs_scale,
           tile_info=explicit_tiles
           if explicit_tiles is not None
           else gmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
-          precision=precision,  # pyrefly: ignore[bad-argument-type]
-          preferred_element_type=preferred_element_type,  # pyrefly: ignore[bad-argument-type]
+          precision=precision,
+          preferred_element_type=preferred_element_type,
           acc_dtype=acc_dtype,
           maybe_quantize_lhs=maybe_quantize_lhs,
           zero_initialize=zero_initialize,
           fuse_act=fuse_gateup_activation,
-          lhs_quant_dtype=lhs_quantization_dtype,
+          lhs_quant_dtype=lhs_quant_dtype,
+          rhs_quant_dtype=rhs_quant_dtype,
       )
     elif ragged_dot_dimension_numbers == DLHS_RAGGED_DOT_DIM_NUMS:  # dlhs
+      if isinstance(lhs, AsQArray):
+        lhs_val = lhs.value
+        maybe_quantize_lhs = True
+        lhs_scale = None
+        lhs_quant_dtype = lhs.qtype
+      elif isinstance(lhs, QArray):
+        lhs_val = lhs.qvalue
+        maybe_quantize_lhs = True
+        lhs_scale = lhs.scale
+        if lhs_scale is not None and lhs_scale.ndim != 2:
+          lhs_scale = lhs_scale.reshape(1, 1)
+        lhs_quant_dtype = lhs.qtype
+      else:
+        lhs_val = lhs
+        maybe_quantize_lhs = False
+        lhs_scale = None
+        lhs_quant_dtype = None
+
+      rhs_val = quantization.as_array(rhs)
+
       out = gmm_backend.gmm_v2(
-          lhs,  # [m, n]
-          rhs,  # [num_groups, k, n]
+          lhs_val,  # [m, n]
+          rhs_val,  # [num_groups, k, n]
           group_sizes,
           None,  # rhs_scale
           None,  # rhs_bias
           group_offset,
-          None,  # lhs_scale
+          lhs_scale,
           tile_info=explicit_tiles
           if explicit_tiles is not None
           else gmm_backend.calculate_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
-          precision=precision,  # pyrefly: ignore[bad-argument-type]
-          preferred_element_type=preferred_element_type  # pyrefly: ignore[bad-argument-type]
+          precision=precision,
+          preferred_element_type=preferred_element_type
           if preferred_element_type is not None
-          else lhs.dtype,
+          else lhs_val.dtype,
           acc_dtype=acc_dtype,
           maybe_quantize_lhs=maybe_quantize_lhs,
           zero_initialize=zero_initialize,
           fuse_act=None,
           transpose_rhs=True,
-          lhs_quant_dtype=lhs_quantization_dtype,
+          lhs_quant_dtype=lhs_quant_dtype,
       )
     elif ragged_dot_dimension_numbers == DRHS_RAGGED_DOT_DIM_NUMS:  # drhs
       # Captured from the original local weights in the custom vjp. Under
@@ -271,9 +391,23 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             " is only available on the autodiff backward path."
         )
       num_actual_groups = self.num_actual_groups
+
+      lhs_val = quantization.as_array(lhs)
+
+      if isinstance(rhs, AsQArray):
+        rhs = rhs.as_qarray()
+      if isinstance(rhs, QArray):
+        rhs_val = rhs.qvalue
+        rhs_scale = rhs.scale
+        if rhs_scale is not None:
+          rhs_scale = rhs_scale.reshape(1, 1, -1)
+      else:
+        rhs_val = rhs
+        rhs_scale = None
+
       out = tgmm_backend.tgmm_v2(
-          lhs,  # [m, k]
-          rhs,  # [m, n]
+          lhs_val,  # [m, k]
+          rhs_val,  # [m, n]
           group_sizes,
           num_actual_groups,
           rhs_scale=rhs_scale,
@@ -282,10 +416,10 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           if explicit_tiles is not None
           else tgmm_backend.calculate_tgmm_tiling,
           vmem_limit_bytes=vmem_limit_bytes,
-          precision=precision,  # pyrefly: ignore[bad-argument-type]
-          preferred_element_type=preferred_element_type  # pyrefly: ignore[bad-argument-type]
+          precision=precision,
+          preferred_element_type=preferred_element_type
           if preferred_element_type is not None
-          else lhs.dtype,
+          else lhs_val.dtype,
           acc_dtype=acc_dtype,
       )
     else:

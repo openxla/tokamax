@@ -453,7 +453,6 @@ def kernel_main_fused_rs(
             pl.semaphore_signal(
                 barrier_sem,
                 device_id={ep_axis_name: jnp.int32(i)},
-                device_id_type=pl.DeviceIdType.MESH,
             )
         pl.semaphore_wait(barrier_sem, ep_size)
 
@@ -1042,7 +1041,6 @@ def kernel_main_fused_rs(
                                 device_id={
                                     ep_axis_name: dest_chip
                                 },
-                                device_id_type=pl.DeviceIdType.MESH,
                             ).start()
                             pltpu.make_async_remote_copy(
                                 src_ref=scatter_scale_3x_ref.at[
@@ -1054,7 +1052,6 @@ def kernel_main_fused_rs(
                                 device_id={
                                     ep_axis_name: dest_chip
                                 },
-                                device_id_type=pl.DeviceIdType.MESH,
                             ).start()
 
                             pltpu.make_async_copy(
@@ -1083,7 +1080,6 @@ def kernel_main_fused_rs(
                                 device_id={
                                     ep_axis_name: dest_chip
                                 },
-                                device_id_type=pl.DeviceIdType.MESH,
                             ).start()
 
                             pltpu.make_async_copy(

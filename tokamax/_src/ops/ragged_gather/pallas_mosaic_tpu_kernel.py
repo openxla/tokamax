@@ -218,7 +218,7 @@ def calculate_col_size(hidden_size: int) -> int:
   match tpu_info.generation:
     case 6:
       target_bytes = (256 * 1024) * 0.8
-    case 7:
+    case 5 | 7:
       target_bytes = (512 * 1024) * 0.8
     case _:
       target_bytes = (128 * 1024) * 0.8

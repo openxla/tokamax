@@ -32,15 +32,22 @@ from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
 from tokamax._src import hlo_utils_common
 from tokamax._src import numerics
+from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
+from tokamax._src.ops.gated_linear_unit import base as glu_base
+from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
-from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
 
 try:
-  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_glu = None  # pyrefly: ignore[assignment]
+  triton_glu = None
+
+try:
+  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
+except ImportError:
+  triton_ragged_dot = None
 
 RepresentationTypes = Literal['lowered', 'mlir']
 
@@ -254,13 +261,13 @@ class DumpHloLibTest(parameterized.TestCase):
     op_specs = hlo_utils.get_opspecs(computation)
 
     norm_spec = norm_op.bind(
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
     )
     glu_spec = glu_op.bind(
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),
         activation=jax.nn.swish,
     )
 
@@ -279,9 +286,9 @@ class DumpHloLibTest(parameterized.TestCase):
     op_specs = hlo_utils.get_opspecs(computation, include_xla_kernels=False)
 
     norm_spec = norm_op.bind(
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
         return_residuals=True,
     )
     norm_vjp_op = typing.cast(
@@ -312,9 +319,9 @@ class DumpHloLibTest(parameterized.TestCase):
     # TODO: Add a test for vmap.
     op = pl_norm.PallasTritonNormalization()
     ba = op.bind(
-        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
+        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
     )
 
     fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
@@ -335,10 +342,12 @@ class DumpHloLibTest(parameterized.TestCase):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
-    op = pl_ragged_dot.PallasTritonRaggedDot()
+    assert triton_ragged_dot is not None
+
+    op = triton_ragged_dot.TritonRaggedDot()
     ba = op.bind(
-        jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),
         group_sizes=[128] * 8,
     )
 
@@ -533,6 +542,66 @@ class HloUtilsHelpersTest(parameterized.TestCase):
     self.assertEqual(
         [i.name for i in hlo_utils_common.dedupe_wrapper_kernels(records)],
         ['norm_kernel', 'cudnn_transpose'],
+    )
+
+  def test_get_opspecs_stacked_payloads(self):
+    op1 = norm_base.Normalization()
+    ba1 = op1.bind(
+        jax.ShapeDtypeStruct((64, 128), jnp.bfloat16),
+        scale=jax.ShapeDtypeStruct((128,), jnp.bfloat16),
+        offset=jax.ShapeDtypeStruct((128,), jnp.bfloat16),
+    )
+    json_op1 = op1.replace(vjp=None)
+    json_ba1 = op_lib.BoundArguments(
+        json_op1, op_lib._abstractify(dict(ba1.arguments))
+    )
+    json1 = str(op_lib.BOUND_ARGS_ADAPTER.dump_json(json_ba1), 'utf-8')
+
+    op2 = glu_base.GatedLinearUnit()
+    ba2 = op2.bind(
+        jax.ShapeDtypeStruct((64, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((128, 2, 128), jnp.bfloat16),
+        activation=jax.nn.swish,
+    )
+    json_op2 = op2.replace(vjp=None)
+    json_ba2 = op_lib.BoundArguments(
+        json_op2, op_lib._abstractify(dict(ba2.arguments))
+    )
+    json2 = str(op_lib.BOUND_ARGS_ADAPTER.dump_json(json_ba2), 'utf-8')
+    stacked = f'tokamax:{json1}/tokamax:{json2}'
+
+    kernel = hlo_utils.TritonKernelInfo(
+        name='pallas_call',
+        inputs=(),
+        outputs=(),
+        op_name='custom_call',
+        source_file='test.py',
+        source_line=1,
+        hlo_module_name='module',
+        metadata_payload=stacked,
+    )
+    wrapper_specs = hlo_utils.get_opspecs(kernel)
+    self.assertLen(wrapper_specs, 1)
+    self.assertIsInstance(
+        wrapper_specs[0].op, norm_base.Normalization
+    )
+
+    nested_specs = hlo_utils.get_opspecs(kernel, include_nested=True)
+    self.assertLen(nested_specs, 2)
+    self.assertIsInstance(
+        nested_specs[0].op, norm_base.Normalization
+    )
+    self.assertIsInstance(
+        nested_specs[1].op, glu_base.GatedLinearUnit
+    )
+
+    fn_nested_specs = hlo_utils.get_nested_opspecs(kernel)
+    self.assertLen(fn_nested_specs, 2)
+    self.assertIsInstance(
+        fn_nested_specs[0].op, norm_base.Normalization
+    )
+    self.assertIsInstance(
+        fn_nested_specs[1].op, glu_base.GatedLinearUnit
     )
 
 

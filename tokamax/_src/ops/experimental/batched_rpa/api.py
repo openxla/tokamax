@@ -18,13 +18,13 @@ from typing import Any, Literal
 import immutabledict
 import jax
 from tokamax._src.ops.experimental.batched_rpa import base
-from tokamax._src.ops.experimental.batched_rpa import types
+from tokamax._src.ops.experimental.batched_rpa.kernel import configs
 
 Implementation = Literal["mosaic_tpu", "reference"]
-AttentionScope = types.AttentionScope
-BlockSizes = types.BlockSizes
-KVLayout = types.KVLayout
-RpaCase = types.RpaCase
+AttentionScope = configs.AttentionScope
+BlockSizes = configs.BlockSizes
+KVLayout = configs.KVLayout
+RpaCase = configs.RpaCase
 
 _IMPLEMENTATIONS: dict[str, base.BatchedRpa] = dict(reference=base.BatchedRpa())
 
@@ -64,7 +64,7 @@ def batched_ragged_paged_attention(
     debug_mode: bool = False,
     out_dtype: Any = None,
     use_causal_mask: bool = True,
-    skip_kv_update: bool = True,
+    skip_kv_update: bool = False,
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     decode_query_size: int = 1,
     cp_group_size: int | None = None,

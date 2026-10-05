@@ -14,19 +14,27 @@
 # ==============================================================================
 """Triangle Multiplication API."""
 
-from collections.abc import Sequence
-from typing import Final, Literal
+from collections.abc import Callable, Sequence
+import typing
+from typing import Any, Final, Literal
 
+import immutabledict
 import jax
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.triangle_multiplication import base
 
-
 type Implementation = Literal["xla", "triton", "mosaic"]
 
-IMPLEMENTATIONS = dict(xla=base.TriangleMultiplication())
-_DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = ("xla",)
+_IMPLEMENTATIONS: dict[str, Callable[..., Any]] = dict(
+    xla=base.TriangleMultiplication()
+)
+_DEFAULT_IMPLEMENTATIONS: tuple[Implementation, ...] = ("xla",)  # pylint: disable=invalid-name
+
+IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
+    immutabledict.immutabledict(_IMPLEMENTATIONS)
+)
+del _IMPLEMENTATIONS
 
 
 @jaxtyping.jaxtyped
@@ -74,8 +82,15 @@ def triangle_multiplication(
       work on all platforms. If a sequence is passed, the first implementation
       that doesn't raise a `NotImplementedError` is used.
 
+  Raises:
+    ValueError: if `implementation` is an empty sequence or refers to an
+      unregistered backend.
+    NotImplementedError: if `implementation` is not supported.
+    ExceptionGroup: if all implementations fail. This will contain the errors
+      from each implementation.
+
   Returns:
-    The normalized array with the same shape as the input `x`.
+    The result of triangle multiplication of shape `[N, N, D]`.
   """
   if implementation is None:
     implementation = _DEFAULT_IMPLEMENTATIONS
@@ -84,29 +99,38 @@ def triangle_multiplication(
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
 
-  supported_implementations = ("xla", "triton", "mosaic")
+  supported_implementations = typing.get_args(Implementation.__value__)
+  errors = []
   for impl in implementation:
-    if impl not in supported_implementations:
-      raise NotImplementedError(
-          f"Implementation '{impl}' is not supported."
-      )
-    if impl == "mosaic" and impl not in IMPLEMENTATIONS:
-      raise ValueError(f"Unknown implementation: {impl}.")
+    if isinstance(impl, str):
+      if impl not in supported_implementations:
+        raise NotImplementedError(f"Implementation '{impl}' is not supported.")
+      if impl not in IMPLEMENTATIONS:
+        raise ValueError(f"Unknown implementation: {impl}.")
+      fn = IMPLEMENTATIONS[impl]
+      sub_impl: base.Implementation | None = "xla" if impl == "xla" else None
+    else:
+      fn = impl
+      sub_impl = None
 
-  impl = IMPLEMENTATIONS["xla"]
-  return impl(
-      x=x,
-      mask=mask,
-      projection_in_weights=projection_in_weights,
-      gate_in_weights=gate_in_weights,
-      projection_out_weights=projection_out_weights,
-      gate_out_weights=gate_out_weights,
-      layernorm_in_scale=layernorm_in_scale,
-      layernorm_in_offset=layernorm_in_offset,
-      layernorm_out_scale=layernorm_out_scale,
-      layernorm_out_offset=layernorm_out_offset,
-      triangle_type=triangle_type,
-      precision=precision,
-      epsilon=epsilon,
-      implementation=implementation,
-  )
+    try:
+      return fn(
+          x=x,
+          mask=mask,
+          projection_in_weights=projection_in_weights,
+          gate_in_weights=gate_in_weights,
+          projection_out_weights=projection_out_weights,
+          gate_out_weights=gate_out_weights,
+          layernorm_in_scale=layernorm_in_scale,
+          layernorm_in_offset=layernorm_in_offset,
+          layernorm_out_scale=layernorm_out_scale,
+          layernorm_out_offset=layernorm_out_offset,
+          triangle_type=triangle_type,
+          precision=precision,
+          epsilon=epsilon,
+          implementation=sub_impl,
+      )
+    except NotImplementedError as e:
+      errors.append(e)
+
+  raise ExceptionGroup("all implementations failed", errors)
