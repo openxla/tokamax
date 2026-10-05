@@ -22,10 +22,12 @@ import jax.numpy as jnp
 _CHUNK_SIZE = 64
 
 
-def _chunkify(x: jax.Array, b: int, nt: int, bt: int) -> jax.Array:
-  # (B, T, H, ...) -> (B, H, NT, BT, ...)
+def _chunkify(
+    x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int
+) -> jax.Array:
+  # (batch_size, seq_len, num_heads, ...) -> (batch_size, num_heads, num_chunks, chunk_size, ...)
   rest = x.shape[3:]
-  x = x.reshape((b, nt, bt, x.shape[2]) + rest)
+  x = x.reshape((batch_size, num_chunks, chunk_size, x.shape[2]) + rest)
   perm = (0, 3, 1, 2) + tuple(range(4, x.ndim))
   return jnp.transpose(x, perm)
 
@@ -33,8 +35,8 @@ def _chunkify(x: jax.Array, b: int, nt: int, bt: int) -> jax.Array:
 def _stage1_intra_one_plain(
     q_i: jax.Array, k_i: jax.Array, s_i: jax.Array, g_i: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-  bt = q_i.shape[0]
-  mask_upper = jnp.triu(jnp.ones((bt, bt), dtype=bool), k=1)
+  chunk_size = q_i.shape[0]
+  mask_upper = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=1)
   qk = jnp.where(
       mask_upper,
       0.0,
@@ -62,15 +64,14 @@ def raven_stage1_reference(
     output_final_state: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
   """Stage 1 reference: decay on slot output (M) axis."""
-  b_dim, t, h, k_dim = q.shape
-  m_dim = s.shape[-1]
-  bt = chunk_size
-  nt = t // bt
+  batch_size, seq_len, num_heads, key_dim = q.shape
+  num_slots = s.shape[-1]
+  num_chunks = seq_len // chunk_size
 
-  q_c = _chunkify(q, b_dim, nt, bt)
-  k_c = _chunkify(k, b_dim, nt, bt)
-  s_c = _chunkify(s, b_dim, nt, bt)
-  g_c = jnp.cumsum(_chunkify(g, b_dim, nt, bt), axis=-2)
+  q_c = _chunkify(q, batch_size, num_chunks, chunk_size)
+  k_c = _chunkify(k, batch_size, num_chunks, chunk_size)
+  s_c = _chunkify(s, batch_size, num_chunks, chunk_size)
+  g_c = jnp.cumsum(_chunkify(g, batch_size, num_chunks, chunk_size), axis=-2)
 
   vmap_intra = jax.vmap(jax.vmap(jax.vmap(_stage1_intra_one_plain)))
   y_diag, state_contrib, g_last_block = vmap_intra(q_c, k_c, s_c, g_c)
@@ -95,7 +96,7 @@ def raven_stage1_reference(
   scan_body_batched = jax.vmap(jax.vmap(scan_body))
 
   if initial_state is None:
-    s0 = jnp.zeros((b_dim, h, k_dim, m_dim), dtype=jnp.float32)
+    s0 = jnp.zeros((batch_size, num_heads, key_dim, num_slots), dtype=jnp.float32)
   else:
     s0 = initial_state.astype(jnp.float32)
 
@@ -103,5 +104,5 @@ def raven_stage1_reference(
       scan_body_batched, s0, (q_s, g_s, y_diag_s, sc_s, glast_s)
   )
   o = jnp.moveaxis(o_stacked, 0, 2)
-  o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(b_dim, t, h, m_dim)
+  o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(batch_size, seq_len, num_heads, num_slots)
   return o, (s_final if output_final_state else None)

@@ -27,14 +27,14 @@ class PallasTpuRavenGSATest(absltest.TestCase):
 
   def test_pallas_fwd_matches_reference(self):
     key = jax.random.PRNGKey(123)
-    b, t, h, k_dim, num_slots = 2, 128, 4, 16, 8
+    batch_size, seq_len, num_heads, key_dim, num_slots = 2, 128, 4, 16, 8
     chunk_size = 64
 
     k0, k1, k2, k3 = jax.random.split(key, 4)
-    q = jax.random.normal(k0, (b, t, h, k_dim), dtype=jnp.float32)
-    k = jax.random.normal(k1, (b, t, h, k_dim), dtype=jnp.float32)
-    s = jax.random.normal(k2, (b, t, h, num_slots), dtype=jnp.float32)
-    g = -jax.nn.sigmoid(jax.random.normal(k3, (b, t, h, num_slots), dtype=jnp.float32))
+    q = jax.random.normal(k0, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32)
+    k = jax.random.normal(k1, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32)
+    s = jax.random.normal(k2, (batch_size, seq_len, num_heads, num_slots), dtype=jnp.float32)
+    g = -jax.nn.sigmoid(jax.random.normal(k3, (batch_size, seq_len, num_heads, num_slots), dtype=jnp.float32))
 
     op_instance = pallas_mosaic_tpu.PallasTpuRavenGSA()
     (actual_out, _), _ = op_instance._fwd(
