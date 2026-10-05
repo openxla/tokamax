@@ -33,7 +33,11 @@ from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import base as attn_base
 from tokamax._src.ops.attention import pallas_triton as pl_attn
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
-from tokamax._src.ops.ragged_dot import pallas_triton as pl_ragged_dot
+
+try:
+  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  triton_ragged_dot = None  # pyrefly: ignore[assignment]
 
 A_SYMBOLIC, B_SYMBOLIC = export.symbolic_shape("a, b")
 
@@ -71,20 +75,23 @@ class _Foo:
 
 
 _PL_ATTN_CFG = pl_attn.Config(block_q=64, block_k=64, num_stages=2, num_warps=4)
-_PL_DOT_CFG = pl_ragged_dot.Config(
-    block_m=128, block_n=128, block_k=32, num_stages=2
-)
 _OPS = (
     attn_base.DotProductAttention(),
     pl_attn.PallasTritonFlashAttention(),
     pl_attn.PallasTritonFlashAttention(use_stable_softmax=True),
     pl_attn.PallasTritonFlashAttention(config=_PL_ATTN_CFG),
     ragged_dot_base.RaggedDot(),
-    pl_ragged_dot.PallasTritonRaggedDot(),
-    pl_ragged_dot.PallasTritonRaggedDot(
-        config=_PL_DOT_CFG, split_k_intermediate_dtype=jnp.float32
-    ),
 )
+if triton_ragged_dot is not None:
+  _TRITON_DOT_CFG = triton_ragged_dot.Config(
+      block_m=128, block_n=128, block_k=32, num_stages=2
+  )
+  _OPS += (
+      triton_ragged_dot.TritonRaggedDot(),
+      triton_ragged_dot.TritonRaggedDot(
+          config=_TRITON_DOT_CFG, split_k_intermediate_dtype=jnp.float32
+      ),
+  )
 
 
 class PydanticTest(parameterized.TestCase):

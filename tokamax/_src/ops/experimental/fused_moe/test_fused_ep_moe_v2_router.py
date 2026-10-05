@@ -57,8 +57,7 @@ def _select(scores, weight_scores=None, topk=TOPK, block_rows=None):
         jnp.asarray(scores),
         topk=topk,
         block_rows=rows if block_rows is None else block_rows,
-        weight_scores=None
-        if weight_scores is None else jnp.asarray(weight_scores),
+        weight_scores=None if weight_scores is None else jnp.asarray(weight_scores),
         interpret=True,
     )
     return np.asarray(w), np.asarray(i)
@@ -78,12 +77,12 @@ def _reference(scores, weight_scores, topk=TOPK):
 
 def _scores(rows, seed, scale=1.0):
     rng = np.random.default_rng(seed)
-    return (rng.random(
-        (rows, EXPERTS), dtype=np.float32) * scale).astype(np.float32)
+    return (rng.random((rows, EXPERTS), dtype=np.float32) * scale).astype(np.float32)
 
 
-@pytest.mark.parametrize("rows,block_rows", [(8, 8), (256, 256), (512, 256),
-                                             (1024, 256)])
+@pytest.mark.parametrize(
+    "rows,block_rows", [(8, 8), (256, 256), (512, 256), (1024, 256)]
+)
 def test_one_table_mode_is_unchanged(rows, block_rows):
     """The default path still returns the selected scores as the weights.
 
@@ -98,8 +97,9 @@ def test_one_table_mode_is_unchanged(rows, block_rows):
     np.testing.assert_array_equal(w, ref_w)
 
 
-@pytest.mark.parametrize("rows,block_rows", [(8, 8), (256, 256), (512, 256),
-                                             (1024, 256)])
+@pytest.mark.parametrize(
+    "rows,block_rows", [(8, 8), (256, 256), (512, 256), (1024, 256)]
+)
 def test_weights_come_from_the_second_table(rows, block_rows):
     """Indices from `scores`, weights from `weight_scores`, exactly."""
     scores = _scores(rows, seed=rows)
@@ -135,10 +135,5 @@ def test_the_bias_moves_the_selection_and_not_the_weights():
     _, unbiased_i = _reference(raw, raw)
     assert not np.array_equal(i, unbiased_i), (
         "the fixture's bias does not reorder the top-k, so this test cannot "
-        "tell a kernel that applies it from one that ignores it")
-
-
-if __name__ == "__main__":
-    import sys
-    from absl import app
-    app.run(lambda argv: sys.exit(pytest.main([__file__] + argv[1:])))
+        "tell a kernel that applies it from one that ignores it"
+    )

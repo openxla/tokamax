@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""KDA helpers shared by the Pallas TPU forward and backward paths."""
+"""KDA helpers shared by the XLA and Pallas forward/backward paths."""
 
 from __future__ import annotations
 
@@ -27,15 +27,17 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 
 from tokamax._src import jaxtyping
-from tokamax._src.ops.experimental.kda.utils import (
-  align_up,
-  cdiv,
-  exp,
-  exp2,
-  get_interpret,
-  pad_to_multiple,
+from tokamax._src.ops.experimental.kda.utils import (  # pylint: disable=g-multiple-import,g-importing-member,unused-import
+    RCP_LN2,
+    align_up,
+    cdiv,
+    chunk_local_cumsum_vector,
+    exp,
+    exp2,
+    get_interpret,
+    kda_gate_chunk_cumsum,
+    pad_to_multiple,
 )
-RCP_LN2 = 1.0 / math.log(2)
 
 _TPU_VMEM_USAGE_FRACTION = 0.9
 
@@ -158,57 +160,6 @@ def _hillis_steele_scan(
     acc = jax.lax.concatenate([prefix, suffix + shifted], dimension=axis)
 
   return acc
-
-# =============================================================================
-# Public API
-# =============================================================================
-
-@functools.partial(
-  jax.jit,
-  static_argnames=["chunk_size", "reverse", "scale", "output_dtype"],
-)
-@jaxtyping.jaxtyped
-def chunk_local_cumsum_vector(
-  g: Float[Array, "H B T K"],
-  chunk_size: int,
-  reverse: bool = False,
-  scale: float | None = None,
-  output_dtype: jax.typing.DTypeLike = jnp.float32,
-) -> Float[Array, "H B T K"]:
-  """Computes prefix or suffix sums independently within each chunk."""
-  assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
-    "chunk_size must be power of 2"
-  )
-
-  BT = chunk_size
-  out_dtype = output_dtype or g.dtype
-
-  H, B, T, S = g.shape
-
-  NT = (T + BT - 1) // BT
-  T_padded = NT * BT
-  pad_t = T_padded - T
-
-  g_work = jnp.pad(g, ((0, 0), (0, 0), (0, pad_t), (0, 0))) if pad_t > 0 else g
-  g_chunked = g_work.reshape(H, B, NT, BT, S).astype(jnp.float32)
-
-  if reverse:
-    cum_mask = jnp.triu(jnp.ones((BT, BT), dtype=jnp.float32))
-  else:
-    cum_mask = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
-
-  o_chunked = jnp.einsum(
-    "ij,hbnjs->hbnis",
-    cum_mask,
-    g_chunked,
-    precision=jax.lax.Precision.HIGHEST,
-  )
-  o = o_chunked.reshape(H, B, T_padded, S)[:, :, :T, :]
-
-  if scale is not None:
-    o = o * scale
-
-  return o.astype(out_dtype)
 
 # =============================================================================
 # Delta-rule hidden-state kernels
@@ -947,35 +898,3 @@ def chunk_gated_delta_rule_fwd_h(
       use_exp2=use_exp2,
     )
     return h, v_new, final_state
-
-
-@jaxtyping.jaxtyped
-def kda_gate_chunk_cumsum(
-  g: Float[Array, "H B T K"],
-  a_log: Float[Array, "H"],
-  chunk_size: int,
-  scale: float | None = None,
-  delta_time_bias: Float[Array, "H*K"] | None = None,
-  output_dtype: jax.typing.DTypeLike = jnp.float32,
-  lower_bound: float | None = None,
-) -> Float[Array, "H B T K"]:
-  """Applies the KDA gate activation and its chunk-local cumulative sum."""
-  H, B, T, K = g.shape
-  g_f32 = g.astype(jnp.float32)
-
-  if delta_time_bias is not None:
-    g_f32 = g_f32 + delta_time_bias.astype(jnp.float32).reshape(H, 1, 1, K)
-
-  A = a_log.astype(jnp.float32)
-
-  if lower_bound is None:
-    g_act = -jnp.exp(A).reshape(H, 1, 1, 1) * jax.nn.softplus(g_f32)
-  else:
-    g_act = lower_bound * jax.nn.sigmoid(jnp.exp(A).reshape(H, 1, 1, 1) * g_f32)
-
-  return chunk_local_cumsum_vector(
-    g_act,
-    chunk_size=chunk_size,
-    scale=scale,
-    output_dtype=output_dtype or jnp.float32,
-  )

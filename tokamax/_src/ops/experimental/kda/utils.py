@@ -18,14 +18,20 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+import functools
+import math
 import os
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.kda.cp_utils import (
     ContextParallelMetadata,
     _derive_cp_metadata_from_segment_ids,
 )
+
+RCP_LN2 = 1.0 / math.log(2)
 
 
 def exp(x):
@@ -433,3 +439,90 @@ def prepare_chunk_indices(
   )
   block_ids = jnp.arange(total_nt, dtype=jnp.int32) - seq_offsets
   return jnp.stack([seq_ids, block_ids], axis=1)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=["chunk_size", "reverse", "scale", "output_dtype"],
+)
+@jaxtyping.jaxtyped
+def chunk_local_cumsum_vector(
+    g: Float[Array, "H B T K"],
+    chunk_size: int,
+    reverse: bool = False,
+    scale: float | None = None,
+    output_dtype: jax.typing.DTypeLike = jnp.float32,
+) -> Float[Array, "H B T K"]:
+  """Computes prefix or suffix sums independently within each chunk."""
+  assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
+      "chunk_size must be power of 2"
+  )
+
+  bt = chunk_size
+  out_dtype = output_dtype or g.dtype
+
+  h, b, t, s = g.shape
+
+  nt = (t + bt - 1) // bt
+  t_padded = nt * bt
+  pad_t = t_padded - t
+
+  g_work = jnp.pad(g, ((0, 0), (0, 0), (0, pad_t), (0, 0))) if pad_t > 0 else g
+  g_chunked = g_work.reshape(h, b, nt, bt, s).astype(jnp.float32)
+
+  if reverse:
+    cum_mask = jnp.triu(jnp.ones((bt, bt), dtype=jnp.float32))
+  else:
+    cum_mask = jnp.tril(jnp.ones((bt, bt), dtype=jnp.float32))
+
+  o_chunked = jnp.einsum(
+      "ij,hbnjs->hbnis",
+      cum_mask,
+      g_chunked,
+      precision=jax.lax.Precision.HIGHEST,
+  )
+  o = o_chunked.reshape(h, b, t_padded, s)[:, :, :t, :]
+
+  if scale is not None:
+    o = o * scale
+
+  return o.astype(out_dtype)
+
+
+@jaxtyping.jaxtyped
+def kda_gate_chunk_cumsum(
+    g: Float[Array, "H B T K"],
+    a_log: Float[Array, "H"],
+    chunk_size: int,
+    scale: float | None = None,
+    delta_time_bias: Float[Array, "H*K"] | None = None,
+    output_dtype: jax.typing.DTypeLike = jnp.float32,
+    lower_bound: float | None = None,
+    valid_mask: Bool[Array, "B T"] | None = None,
+) -> Float[Array, "H B T K"]:
+  """Applies the KDA gate activation and its chunk-local cumulative sum."""
+  h, _, _, k = g.shape
+  g_f32 = g.astype(jnp.float32)
+
+  if delta_time_bias is not None:
+    g_f32 = g_f32 + delta_time_bias.astype(jnp.float32).reshape(h, 1, 1, k)
+
+  a = a_log.astype(jnp.float32)
+
+  if lower_bound is None:
+    g_act = -jnp.exp(a).reshape(h, 1, 1, 1) * jax.nn.softplus(g_f32)
+  else:
+    g_act = lower_bound * jax.nn.sigmoid(
+        jnp.exp(a).reshape(h, 1, 1, 1) * g_f32
+    )
+
+  if valid_mask is not None:
+    g_act = jnp.where(valid_mask[None, :, :, None], g_act, 0)
+
+  return chunk_local_cumsum_vector(
+      g_act,
+      chunk_size=chunk_size,
+      scale=scale,
+      output_dtype=output_dtype or jnp.float32,
+  )
+

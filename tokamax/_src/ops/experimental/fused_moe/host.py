@@ -16,6 +16,7 @@
 constants the two halves share, the routing tables a call builds before it
 enters the kernel, and the VMEM accounting that answers whether a build
 fits. Nothing here runs inside the Pallas body."""
+
 import enum
 import math
 from typing import NamedTuple
@@ -48,12 +49,37 @@ WIDEN_KCHUNK = 512
 # How far ahead of the expert being computed the next weight refill goes
 # out: at expert e's head the kernel issues the refill for expert e + 2.
 # Two is a schedule choice -- one refill in flight per weight buffer, one
-# expert of slack -- not a hardware fact.
-WEIGHT_PREFETCH_DISTANCE = 2
-# Weight buffer slots. A refill writes its slot while the readers of the
-# prefetch distance's worth of earlier experts are still live, so the slot
-# count has to exceed the distance for all of them to stay distinct.
-NBUF = WEIGHT_PREFETCH_DISTANCE + 1
+# expert of slack -- not a hardware fact, which is why it is tunable.
+#
+# It is the CEILING a build starts from, not the distance a build runs at.
+# Every slot of runway is a whole expert's weights held in VMEM, so whether
+# a shape can afford the distance is a property of THAT SHAPE and not of the
+# schedule: `fit_weight_slots` starts here and steps the distance down one
+# at a time until the build's buffers fit under the budget.
+#
+# Zero is the useful other end: no runway at all, one weight slot, an expert
+# starting its own weights at its head and waiting on them.
+MAX_WEIGHT_PREFETCH_DISTANCE = 2
+
+
+def nbuf_for(distance):
+    """Weight buffer slots a prefetch distance needs.
+
+    A refill writes its slot while the readers of the prefetch distance's
+    worth of earlier experts are still live, so the slot count has to exceed
+    the distance for all of them to stay distinct. At distance zero there are
+    no earlier readers to stay clear of and the one slot is the expert's own.
+
+    This relation IS what a distance costs, and it is written once here
+    rather than at each build, because the two numbers travel together
+    everywhere: a build that lowered one and kept the other would either
+    overwrite a slab a live reader is still contracting against or pay VMEM
+    for a slot nothing addresses.
+    """
+    return distance + 1
+
+
+MAX_NBUF = nbuf_for(MAX_WEIGHT_PREFETCH_DISTANCE)
 # Every transport moves whole blocks of this many rows; dynamic DMA offsets
 # are block-aligned. It is also the padding each (expert, dest) run rounds up
 # to, so it sets how many rows the gather fetches, the FFN computes and the
@@ -76,7 +102,7 @@ TOKEN_GATHER_TILES_PER_WINDOW = 1
 # and needs one extra HBM tile of overfetch.
 TOKEN_GATHER_DMA_ALIGNMENT = HIDDEN_LANE_BLOCK
 # The most of those blocks the kernel's row staging holds.
-HIDDEN_MAX_BLOCKS = 32
+HIDDEN_MAX_BLOCKS = 64
 # The share of the chip's VMEM the kernel may claim.
 VMEM_FRACTION = 0.98
 # The routing tables pack an arrival position and an alignment slot into
@@ -121,7 +147,8 @@ def pow2_shift(m, what):
             "plan writes its divisions and remainders by this width as a "
             "shift and a mask, which is an identity only for a power of "
             "two, so this width cannot be changed without restoring the "
-            "division at every site that reads these constants.")
+            "division at every site that reads these constants."
+        )
     return m.bit_length() - 1
 
 
@@ -158,8 +185,7 @@ def align_up(v, m):
 
 def token_gather_window_rows(tile_m):
     """Int32 rows in one aligned HBM-to-SMEM token-gather window."""
-    return (TOKEN_GATHER_TILES_PER_WINDOW * tile_m +
-            TOKEN_GATHER_DMA_ALIGNMENT)
+    return TOKEN_GATHER_TILES_PER_WINDOW * tile_m + TOKEN_GATHER_DMA_ALIGNMENT
 
 
 def token_gather_smem_bytes(tile_m):
@@ -174,7 +200,8 @@ def mirror_run_tiles(run_start, run_rows, tile_m):
     return jnp.where(
         run_rows > 0,
         jnp.right_shift(last, shift) - jnp.right_shift(run_start, shift) + 1,
-        0)
+        0,
+    )
 
 
 def contrib_mirror_rows(rows_alloc, g_local, tile_m):
@@ -236,6 +263,7 @@ class WeightFormat(str, enum.Enum):
     one that does not exist is refused by the table below rather than
     carried as far as the first comparison that quietly fails.
     """
+
     FP8 = "fp8"
     FP4 = "fp4"
     INT8 = "int8"
@@ -266,6 +294,7 @@ class WeightForm(NamedTuple):
     transport in; it follows the activation format, because an arrival row
     re-enters its token owner's sum as one more term of the same kind.
     """
+
     name: WeightFormat
     weight_dtype: object
     act_dtype: object
@@ -301,15 +330,16 @@ class WeightForm(NamedTuple):
 # integer-four form would be one more row here plus the bitcast and widening
 # target in the block reader -- the body itself would be reused verbatim.
 WEIGHT_FORMS = {
-    WeightFormat.FP8:
-    WeightForm(WeightFormat.FP8, FP8, FP8, FP8_MAX, "per_channel", FP8),
-    WeightFormat.FP4:
-    WeightForm(WeightFormat.FP4, FP4, FP8, FP8_MAX, "per_contraction_block",
-               FP8),
-    WeightFormat.INT8:
-    WeightForm(WeightFormat.INT8, INT8, BF16, None, "per_channel", BF16),
-    WeightFormat.BF16:
-    WeightForm(WeightFormat.BF16, BF16, BF16, None, "none", BF16),
+    WeightFormat.FP8: WeightForm(
+        WeightFormat.FP8, FP8, FP8, FP8_MAX, "per_channel", FP8
+    ),
+    WeightFormat.FP4: WeightForm(
+        WeightFormat.FP4, FP4, FP8, FP8_MAX, "per_contraction_block", FP8
+    ),
+    WeightFormat.INT8: WeightForm(
+        WeightFormat.INT8, INT8, BF16, None, "per_channel", BF16
+    ),
+    WeightFormat.BF16: WeightForm(WeightFormat.BF16, BF16, BF16, None, "none", BF16),
 }
 
 WEIGHT_FORMAT_NAMES = tuple(WEIGHT_FORMS)
@@ -322,7 +352,8 @@ def weight_form(weight_format):
     except ValueError:
         raise NotImplementedError(
             f"the fused EP MoE kernel takes weight formats "
-            f"{WEIGHT_FORMAT_NAMES}; got {weight_format!r}") from None
+            f"{WEIGHT_FORMAT_NAMES}; got {weight_format!r}"
+        ) from None
 
 
 def weight_format_of_dtype(dtype):
@@ -359,8 +390,7 @@ def ragged_stride_bound(num_tokens, topk, e_total, capacity):
     computes. That is a design change rather than a bound, and it is not
     made here.
     """
-    return align_up(num_tokens * topk + (ROWBLK - 1) * e_total + capacity,
-                    capacity)
+    return align_up(num_tokens * topk + (ROWBLK - 1) * e_total + capacity, capacity)
 
 
 def gather_clamp_bounds(T):
@@ -398,6 +428,7 @@ class RoutingTables(NamedTuple):
     functions below, which is why the whole set is replicated rather than
     sharded.
     """
+
     # [T, K]: the arrival row each token's k-th selection comes back on.
     arrival_row: jax.Array
     # [T, K]: the arrival MIRROR element that row's scale comes back in.
@@ -438,9 +469,12 @@ def _lookup_per_pair(table, expert_blocks, bins):
     lowering this lookup as a gather cuts FLOPs but increases device traffic
     by more than an order of magnitude.
     """
-    return jnp.sum(jnp.where(expert_blocks[:, :, None] == bins[None, None, :],
-                             table[:, None, :], 0),
-                   axis=2)
+    return jnp.sum(
+        jnp.where(
+            expert_blocks[:, :, None] == bins[None, None, :], table[:, None, :], 0
+        ),
+        axis=2,
+    )
 
 
 def _refuse_bad_plan_args(T, K, *, e_total, ep, t_local, block, tile_m):
@@ -449,60 +483,67 @@ def _refuse_bad_plan_args(T, K, *, e_total, ep, t_local, block, tile_m):
     if T < 1:
         raise ValueError(
             "the routing tables need at least one token; an empty batch "
-            "builds a gather table with no in-bounds row to clamp to")
+            "builds a gather table with no in-bounds row to clamp to"
+        )
     if e_total % ep:
-        raise ValueError(f"expert count {e_total} is not divisible by the "
-                         f"expert-parallel width {ep}")
+        raise ValueError(
+            f"expert count {e_total} is not divisible by the expert-parallel width {ep}"
+        )
     if (ROWBLK - 1) * (ep - 1) >= ALIGNMENT_SLOT_FIELD:
         raise ValueError(
             f"ep={ep} needs up to {(ROWBLK - 1) * (ep - 1)} alignment slots "
             f"and the routing tables pack them into {ALIGNMENT_SLOT_FIELD}; "
             f"widths up to {1 + (ALIGNMENT_SLOT_FIELD - 1) // (ROWBLK - 1)} "
-            "are representable")
+            "are representable"
+        )
     max_pos = n + (ROWBLK - 1) * e_total
     if max_pos * ALIGNMENT_SLOT_FIELD >= 2**31:
         raise ValueError(
             f"the routing tables would carry up to {max_pos} arrival rows "
             f"per shard, and packing one alongside a {ALIGNMENT_SLOT_FIELD}"
             f"-wide alignment slot holds {2**31 // ALIGNMENT_SLOT_FIELD}: "
-            f"past that the two fields corrupt each other silently")
+            f"past that the two fields corrupt each other silently"
+        )
     if n % block:
-        raise ValueError(f"the {n} routed pairs are not a whole number of "
-                         f"{block}-pair routing blocks")
+        raise ValueError(
+            f"the {n} routed pairs are not a whole number of "
+            f"{block}-pair routing blocks"
+        )
     if (t_local * K) % block:
-        raise ValueError(f"this shard's {t_local * K} routed pairs are not a "
-                         f"whole number of {block}-pair routing blocks")
+        raise ValueError(
+            f"this shard's {t_local * K} routed pairs are not a "
+            f"whole number of {block}-pair routing blocks"
+        )
     if tile_m % ROWBLK:
-        raise ValueError(f"tile height {tile_m} is not a whole number of "
-                         f"{ROWBLK}-row blocks")
+        raise ValueError(
+            f"tile height {tile_m} is not a whole number of {ROWBLK}-row blocks"
+        )
 
 
-def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
-                         shard_stride):
+def build_routing_tables(
+    topk_idx, *, e_total, ep, t_local, block, tile_m, shard_stride
+):
     """Assign every routed (token, expert) pair the slab row it computes on."""
     # topk_idx [T, K] i32 expert ids, all-gathered. Rows order by expert then
     # by owning shard, each run padded to ROWBLK.
     T, K = topk_idx.shape
     n = T * K
     g_local = e_total // ep
-    _refuse_bad_plan_args(T,
-                          K,
-                          e_total=e_total,
-                          ep=ep,
-                          t_local=t_local,
-                          block=block,
-                          tile_m=tile_m)
+    _refuse_bad_plan_args(
+        T, K, e_total=e_total, ep=ep, t_local=t_local, block=block, tile_m=tile_m
+    )
     expert_of_pair = topk_idx.reshape(-1).astype(jnp.int32)
     n_blocks = n // block
     expert_blocks = expert_of_pair.reshape(n_blocks, block)
     bins = jnp.arange(e_total, dtype=jnp.int32)
 
     block_hist = jnp.sum(
-        (expert_blocks[:, :, None] == bins[None, None, :]).astype(jnp.int32),
-        axis=1)  # [n_blocks, E]
+        (expert_blocks[:, :, None] == bins[None, None, :]).astype(jnp.int32), axis=1
+    )  # [n_blocks, E]
     block_off = jnp.cumsum(block_hist, axis=0) - block_hist  # excl over blocks
-    base_per_slot = _lookup_per_pair(block_off, expert_blocks,
-                                     bins)  # [n_blocks, block]
+    base_per_slot = _lookup_per_pair(
+        block_off, expert_blocks, bins
+    )  # [n_blocks, block]
     eq = expert_blocks[:, :, None] == expert_blocks[:, None, :]
     tri = jnp.tril(jnp.ones((block, block), dtype=jnp.bool_), k=-1)
     rank = jnp.sum((eq & tri[None]).astype(jnp.int32), axis=2)
@@ -516,19 +557,21 @@ def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
     # Rounding up to a whole block: one add and one mask, where the
     # negate-divide-negate spelling owed a signed division's fixup.
     run_rows_aligned = (run_rows + (ROWBLK - 1)) & jnp.int32(-ROWBLK)
-    run_start_aligned = (jnp.cumsum(run_rows_aligned, axis=1) -
-                         run_rows_aligned)
+    run_start_aligned = jnp.cumsum(run_rows_aligned, axis=1) - run_rows_aligned
     slot_shift = run_start_aligned - run_start  # slot = pair_rank + shift
 
     # Ragged expert slabs: shard s owns rows [s*stride, (s+1)*stride).
     expert_rows_aligned = run_rows_aligned.sum(axis=1)  # [E] 8-aligned
     if shard_stride % tile_m:
-        raise ValueError(f"the per-shard slab stride {shard_stride} is not a "
-                         f"whole number of {tile_m}-row tiles")
+        raise ValueError(
+            f"the per-shard slab stride {shard_stride} is not a "
+            f"whole number of {tile_m}-row tiles"
+        )
     rows_by_shard = expert_rows_aligned.reshape(ep, g_local)
     local_base = jnp.cumsum(rows_by_shard, axis=1) - rows_by_shard  # [s, G]
-    expert_base = (local_base + (jnp.arange(ep, dtype=jnp.int32)[:, None] *
-                                 shard_stride)).reshape(e_total)
+    expert_base = (
+        local_base + (jnp.arange(ep, dtype=jnp.int32)[:, None] * shard_stride)
+    ).reshape(e_total)
     rows_alloc = ep * shard_stride
 
     # Every push is per expert, so a receive region is one (source, expert)
@@ -536,22 +579,21 @@ def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
     region_rows = run_rows_aligned.reshape(ep, g_local, ep)  # [s, g, d]
     rows_per_dest = region_rows.transpose(2, 0, 1).reshape(ep, ep * g_local)
     recv_base = (jnp.cumsum(rows_per_dest, axis=1) - rows_per_dest).reshape(
-        ep, ep, g_local)  # [d, s, g]
+        ep, ep, g_local
+    )  # [d, s, g]
     recv_rows = rows_per_dest.sum(axis=1)  # [d] incl. self
 
     pos_shift = recv_base.transpose(1, 2, 0).reshape(e_total, ep) - run_start
-    dest_of_block = (jnp.arange(n_blocks, dtype=jnp.int32) *
-                     block) // (t_local * K)
+    dest_of_block = (jnp.arange(n_blocks, dtype=jnp.int32) * block) // (t_local * K)
 
     # One packed pass over both shifts; the ragged expert base needs its
     # own select-sum because its value range is too wide for the word.
     packed = pos_shift * ALIGNMENT_SLOT_FIELD + slot_shift
     packed_blocks = jnp.take(packed.T, dest_of_block, axis=0)  # [n_blocks, E]
-    packed_sel = _lookup_per_pair(packed_blocks, expert_blocks,
-                                  bins).reshape(-1)
+    packed_sel = _lookup_per_pair(packed_blocks, expert_blocks, bins).reshape(-1)
     base_of_pair = _lookup_per_pair(
-        jnp.broadcast_to(expert_base[None, :], (n_blocks, e_total)),
-        expert_blocks, bins).reshape(-1)
+        jnp.broadcast_to(expert_base[None, :], (n_blocks, e_total)), expert_blocks, bins
+    ).reshape(-1)
     # Unpacking the two fields of the packed word: the position is the
     # high part and the slot is the low part, which is a shift and a mask.
     pos = pair_rank + jnp.right_shift(packed_sel, SLOT_FIELD_SHIFT)
@@ -564,28 +606,33 @@ def build_routing_tables(topk_idx, *, e_total, ep, t_local, block, tile_m,
     shift = pow2_shift(tile_m, "tile_m")
     rb = recv_base.transpose(1, 2, 0).reshape(e_total, ep)
     mirror_shift = (
-        (jnp.right_shift(rb, shift) +
-         2 * jnp.arange(e_total, dtype=jnp.int32)[:, None]) * tile_m +
-        (run_start_aligned & (tile_m - 1)) - run_start)
+        (jnp.right_shift(rb, shift) + 2 * jnp.arange(e_total, dtype=jnp.int32)[:, None])
+        * tile_m
+        + (run_start_aligned & (tile_m - 1))
+        - run_start
+    )
     mirror_blocks = jnp.take(mirror_shift.T, dest_of_block, axis=0)
-    mirror_row = pair_rank + _lookup_per_pair(mirror_blocks, expert_blocks,
-                                              bins).reshape(-1)
+    mirror_row = pair_rank + _lookup_per_pair(
+        mirror_blocks, expert_blocks, bins
+    ).reshape(-1)
 
     slab_row = base_of_pair + slot  # always < total
 
-    return RoutingTables(arrival_row=pos.reshape(T, K),
-                         mirror_row=mirror_row.reshape(T, K),
-                         run_tiles=run_tiles,
-                         slab_row=slab_row,
-                         run_rows=run_rows,
-                         run_rows_aligned=run_rows_aligned,
-                         run_start_aligned=run_start_aligned,
-                         region_rows=region_rows,
-                         recv_base=recv_base,
-                         recv_rows=recv_rows,
-                         expert_rows_aligned=expert_rows_aligned,
-                         expert_base=expert_base,
-                         rows_alloc=rows_alloc)
+    return RoutingTables(
+        arrival_row=pos.reshape(T, K),
+        mirror_row=mirror_row.reshape(T, K),
+        run_tiles=run_tiles,
+        slab_row=slab_row,
+        run_rows=run_rows,
+        run_rows_aligned=run_rows_aligned,
+        run_start_aligned=run_start_aligned,
+        region_rows=region_rows,
+        recv_base=recv_base,
+        recv_rows=recv_rows,
+        expert_rows_aligned=expert_rows_aligned,
+        expert_base=expert_base,
+        rows_alloc=rows_alloc,
+    )
 
 
 class ShardRoutingTables(NamedTuple):
@@ -597,6 +644,7 @@ class ShardRoutingTables(NamedTuple):
     ``RoutingTables`` and are reconstructed from an ``[ep, e_total]`` count
     table.
     """
+
     pos: jax.Array
     mirror_pos: jax.Array
     run_tiles: jax.Array
@@ -620,8 +668,7 @@ class ShardRoutingTables(NamedTuple):
 
 def off_shard_slab_row(shard_stride, ep):
     """Sentinel beyond both slab destinations after any shard rebasing."""
-    return (ep * shard_stride +
-            act_scale_slab_rows(shard_stride) * HIDDEN_LANE_BLOCK)
+    return ep * shard_stride + act_scale_slab_rows(shard_stride) * HIDDEN_LANE_BLOCK
 
 
 def _rank_within_block(expert_blocks, block):
@@ -634,8 +681,8 @@ def _rank_within_block(expert_blocks, block):
 def _block_hist(expert_blocks, bins):
     """Number of pairs per routing block and expert bin."""
     return jnp.sum(
-        (expert_blocks[:, :, None] == bins[None, None, :]).astype(jnp.int32),
-        axis=1)
+        (expert_blocks[:, :, None] == bins[None, None, :]).astype(jnp.int32), axis=1
+    )
 
 
 def pair_block_hist(expert_blocks, e_total):
@@ -663,9 +710,9 @@ def _per_sub_block(x, window):
     """
     n_blocks, n_sub = x.shape[:2]
     tail = x.shape[2:]
-    return jnp.broadcast_to(x[:, :, None],
-                            (n_blocks, n_sub, window) + tail).reshape(
-                                n_blocks, n_sub * window, *tail)
+    return jnp.broadcast_to(x[:, :, None], (n_blocks, n_sub, window) + tail).reshape(
+        n_blocks, n_sub * window, *tail
+    )
 
 
 def _rank_within_window(expert_blocks, window):
@@ -681,12 +728,15 @@ def _rank_within_window(expert_blocks, window):
     if window == block:
         return _rank_within_block(expert_blocks, block)
     peers = _per_sub_block(
-        expert_blocks.reshape(n_blocks, block // window, window), window)
-    lower = (jnp.arange(window, dtype=jnp.int32)[None, :]
-             < jnp.arange(block, dtype=jnp.int32)[:, None] % window)
+        expert_blocks.reshape(n_blocks, block // window, window), window
+    )
+    lower = (
+        jnp.arange(window, dtype=jnp.int32)[None, :]
+        < jnp.arange(block, dtype=jnp.int32)[:, None] % window
+    )
     return jnp.sum(
-        ((expert_blocks[:, :, None] == peers) & lower[None]).astype(jnp.int32),
-        axis=2)
+        ((expert_blocks[:, :, None] == peers) & lower[None]).astype(jnp.int32), axis=2
+    )
 
 
 def _window_hist(expert_blocks, bins, window):
@@ -699,16 +749,14 @@ def _window_hist(expert_blocks, bins, window):
     if window == block:
         return _block_hist(expert_blocks, bins)[:, None, :]
     eb = expert_blocks.reshape(n_blocks, block // window, window)
-    return jnp.sum((eb[:, :, :, None] == bins[None, None,
-                                              None, :]).astype(jnp.int32),
-                   axis=2)
+    return jnp.sum(
+        (eb[:, :, :, None] == bins[None, None, None, :]).astype(jnp.int32), axis=2
+    )
 
 
 def _over_sub_blocks(window_hist):
     """The per-block histogram a sub-block histogram refines."""
-    return (window_hist[:,
-                        0] if window_hist.shape[1] == 1 else window_hist.sum(
-                            axis=1))
+    return window_hist[:, 0] if window_hist.shape[1] == 1 else window_hist.sum(axis=1)
 
 
 def _window_table(table, window_hist):
@@ -726,9 +774,9 @@ def _window_table(table, window_hist):
     if n_sub == 1:
         return table[:, None, :]
     tri = jnp.tril(jnp.ones((n_sub, n_sub), dtype=jnp.bool_), k=-1)
-    return table[:, None, :] + jnp.sum(jnp.where(
-        tri[None, :, :, None], window_hist[:, None, :, :], 0),
-                                       axis=2)
+    return table[:, None, :] + jnp.sum(
+        jnp.where(tri[None, :, :, None], window_hist[:, None, :, :], 0), axis=2
+    )
 
 
 def _lookup_per_sub_pair(table, expert_blocks, bins, window):
@@ -740,9 +788,14 @@ def _lookup_per_sub_pair(table, expert_blocks, bins, window):
     """
     if table.shape[1] == 1:
         return _lookup_per_pair(table[:, 0], expert_blocks, bins)
-    return jnp.sum(jnp.where(expert_blocks[:, :, None] == bins[None, None, :],
-                             _per_sub_block(table, window), 0),
-                   axis=2)
+    return jnp.sum(
+        jnp.where(
+            expert_blocks[:, :, None] == bins[None, None, :],
+            _per_sub_block(table, window),
+            0,
+        ),
+        axis=2,
+    )
 
 
 class GatheredPairs(NamedTuple):
@@ -756,6 +809,7 @@ class GatheredPairs(NamedTuple):
     already, and handing them over removes this builder's own collective and
     the ``[T, topk]`` selection array it would otherwise reshape.
     """
+
     expert_blocks: jax.Array
     local_blocks: jax.Array
     block_hist: jax.Array
@@ -764,17 +818,19 @@ class GatheredPairs(NamedTuple):
     topk: int
 
 
-def build_routing_tables_sharded(topk_idx,
-                                 me,
-                                 *,
-                                 e_total,
-                                 ep,
-                                 t_local,
-                                 block,
-                                 tile_m,
-                                 shard_stride,
-                                 all_gather_rows=None,
-                                 gathered=None):
+def build_routing_tables_sharded(
+    topk_idx,
+    me,
+    *,
+    e_total,
+    ep,
+    t_local,
+    block,
+    tile_m,
+    shard_stride,
+    all_gather_rows=None,
+    gathered=None,
+):
     """Build only the routing-plan slices consumed by shard ``me``.
 
     The replicated builder performs four one-hot passes over
@@ -791,33 +847,34 @@ def build_routing_tables_sharded(topk_idx,
     """
     if (gathered is None) == (all_gather_rows is None):
         raise ValueError("pass exactly one of all_gather_rows and gathered")
-    T, K = (topk_idx.shape if gathered is None else
-            (gathered.n_tokens, gathered.topk))
+    T, K = topk_idx.shape if gathered is None else (gathered.n_tokens, gathered.topk)
     n = T * K
     g_local = e_total // ep
-    _refuse_bad_plan_args(T,
-                          K,
-                          e_total=e_total,
-                          ep=ep,
-                          t_local=t_local,
-                          block=block,
-                          tile_m=tile_m)
+    _refuse_bad_plan_args(
+        T, K, e_total=e_total, ep=ep, t_local=t_local, block=block, tile_m=tile_m
+    )
     if shard_stride % tile_m:
-        raise ValueError(f"the per-shard slab stride {shard_stride} is not a "
-                         f"whole number of {tile_m}-row tiles")
+        raise ValueError(
+            f"the per-shard slab stride {shard_stride} is not a "
+            f"whole number of {tile_m}-row tiles"
+        )
 
     n_blocks = n // block
     blocks_per_dest = (t_local * K) // block
-    expert_blocks = (topk_idx.reshape(-1).astype(jnp.int32).reshape(
-        n_blocks, block) if gathered is None else gathered.expert_blocks)
+    expert_blocks = (
+        topk_idx.reshape(-1).astype(jnp.int32).reshape(n_blocks, block)
+        if gathered is None
+        else gathered.expert_blocks
+    )
     bins = jnp.arange(e_total, dtype=jnp.int32)
     window = rank_window(block, blocks_per_dest * block)
 
     # This rank's token block across every expert. Its histogram row is the
     # only non-local input needed by the small-table reconstruction below.
     if gathered is None:
-        my_blocks = lax.dynamic_slice(expert_blocks, (me * blocks_per_dest, 0),
-                                      (blocks_per_dest, block))
+        my_blocks = lax.dynamic_slice(
+            expert_blocks, (me * blocks_per_dest, 0), (blocks_per_dest, block)
+        )
         my_hist = _block_hist(my_blocks, bins)
         rows_by_dest = all_gather_rows(my_hist.sum(axis=0, keepdims=True))
     else:
@@ -827,44 +884,54 @@ def build_routing_tables_sharded(topk_idx,
 
     run_rows = rows_by_dest.T
     run_rows_aligned = (run_rows + (ROWBLK - 1)) & jnp.int32(-ROWBLK)
-    run_start_aligned = (jnp.cumsum(run_rows_aligned, axis=1) -
-                         run_rows_aligned)
+    run_start_aligned = jnp.cumsum(run_rows_aligned, axis=1) - run_rows_aligned
     expert_rows_aligned = run_rows_aligned.sum(axis=1)
     rows_by_shard = expert_rows_aligned.reshape(ep, g_local)
     local_base = jnp.cumsum(rows_by_shard, axis=1) - rows_by_shard
-    expert_base = (local_base + (jnp.arange(ep, dtype=jnp.int32)[:, None] *
-                                 shard_stride)).reshape(e_total)
+    expert_base = (
+        local_base + (jnp.arange(ep, dtype=jnp.int32)[:, None] * shard_stride)
+    ).reshape(e_total)
     region_rows = run_rows_aligned.reshape(ep, g_local, ep)
     rows_per_dest = region_rows.transpose(2, 0, 1).reshape(ep, ep * g_local)
     recv_base = (jnp.cumsum(rows_per_dest, axis=1) - rows_per_dest).reshape(
-        ep, ep, g_local)
+        ep, ep, g_local
+    )
     recv_rows = rows_per_dest.sum(axis=1)
 
     # For a pair in this rank's token block the source prefix cancels from
     # the arrival row, leaving the destination receive base plus its offset
     # within the source's expert run.
-    my_recv_base = lax.dynamic_slice(recv_base, (me, 0, 0),
-                                     (1, ep, g_local)).reshape(e_total)
+    my_recv_base = lax.dynamic_slice(recv_base, (me, 0, 0), (1, ep, g_local)).reshape(
+        e_total
+    )
     pos_table = my_off + my_recv_base[None, :]
     # The rank pass this consumer needs is the block-wide one restricted to
     # this rank's own blocks, which is that pass over those blocks alone.
     my_rank = _rank_within_block(my_blocks, block)
-    pos = (_lookup_per_pair(pos_table, my_blocks, bins) + my_rank).reshape(
-        t_local, K)
+    pos = (_lookup_per_pair(pos_table, my_blocks, bins) + my_rank).reshape(t_local, K)
 
     # The mirror position of the same pair: its offset within the run, past
     # the lane its source tile's sublane starts on. Same shape of lookup as
     # `pos`, over the one-hot the compiler shares between them.
     run_tiles = mirror_run_tiles(run_start_aligned, run_rows_aligned, tile_m)
     shift = pow2_shift(tile_m, "tile_m")
-    my_run_start = lax.dynamic_slice(run_start_aligned, (0, me),
-                                     (e_total, 1)).reshape(e_total)
-    mirror_table = my_off + (
-        (jnp.right_shift(my_recv_base, shift) +
-         2 * jnp.arange(e_total, dtype=jnp.int32)) * tile_m +
-        (my_run_start & (tile_m - 1)))[None, :]
-    mirror_pos = (_lookup_per_pair(mirror_table, my_blocks, bins) +
-                  my_rank).reshape(t_local, K)
+    my_run_start = lax.dynamic_slice(run_start_aligned, (0, me), (e_total, 1)).reshape(
+        e_total
+    )
+    mirror_table = (
+        my_off
+        + (
+            (
+                jnp.right_shift(my_recv_base, shift)
+                + 2 * jnp.arange(e_total, dtype=jnp.int32)
+            )
+            * tile_m
+            + (my_run_start & (tile_m - 1))
+        )[None, :]
+    )
+    mirror_pos = (_lookup_per_pair(mirror_table, my_blocks, bins) + my_rank).reshape(
+        t_local, K
+    )
 
     # Across all tokens, compute offsets only for this rank's local experts.
     first = me * g_local
@@ -873,45 +940,45 @@ def build_routing_tables_sharded(topk_idx,
     hist_mine = _over_sub_blocks(win_hist)
     by_source = hist_mine.reshape(ep, blocks_per_dest, g_local)
     off_in_source = jnp.cumsum(by_source, axis=1) - by_source
-    run_base = (lax.dynamic_slice(expert_base, (first, ),
-                                  (g_local, ))[None, :] +
-                lax.dynamic_slice(run_start_aligned, (first, 0),
-                                  (g_local, ep)).T)
+    run_base = (
+        lax.dynamic_slice(expert_base, (first,), (g_local,))[None, :]
+        + lax.dynamic_slice(run_start_aligned, (first, 0), (g_local, ep)).T
+    )
     row_table = _window_table(
-        (off_in_source + run_base[:, None, :]).reshape(n_blocks,
-                                                       g_local), win_hist)
+        (off_in_source + run_base[:, None, :]).reshape(n_blocks, g_local), win_hist
+    )
     on_me = (expert_blocks >= first) & (expert_blocks < first + g_local)
-    my_row = (
-        _lookup_per_sub_pair(row_table, expert_blocks, my_experts, window) +
-        _rank_within_window(expert_blocks, window))
-    slab_row = jnp.where(on_me, my_row,
-                         jnp.int32(off_shard_slab_row(shard_stride,
-                                                      ep))).reshape(-1)
+    my_row = _lookup_per_sub_pair(
+        row_table, expert_blocks, my_experts, window
+    ) + _rank_within_window(expert_blocks, window)
+    slab_row = jnp.where(
+        on_me, my_row, jnp.int32(off_shard_slab_row(shard_stride, ep))
+    ).reshape(-1)
 
-    return ShardRoutingTables(pos=pos,
-                              mirror_pos=mirror_pos,
-                              run_tiles=run_tiles,
-                              slab_row=slab_row,
-                              run_rows=run_rows,
-                              run_rows_aligned=run_rows_aligned,
-                              run_start_aligned=run_start_aligned,
-                              region_rows=region_rows,
-                              recv_base=recv_base,
-                              recv_rows=recv_rows,
-                              expert_rows_aligned=expert_rows_aligned,
-                              expert_base=expert_base,
-                              rows_alloc=ep * shard_stride,
-                              n_tokens=T,
-                              topk=K)
+    return ShardRoutingTables(
+        pos=pos,
+        mirror_pos=mirror_pos,
+        run_tiles=run_tiles,
+        slab_row=slab_row,
+        run_rows=run_rows,
+        run_rows_aligned=run_rows_aligned,
+        run_start_aligned=run_start_aligned,
+        region_rows=region_rows,
+        recv_base=recv_base,
+        recv_rows=recv_rows,
+        expert_rows_aligned=expert_rows_aligned,
+        expert_base=expert_base,
+        rows_alloc=ep * shard_stride,
+        n_tokens=T,
+        topk=K,
+    )
 
 
 def shard_expert_slabs(routing, me, *, e_total, ep):
     """Shard `me`'s local experts: (rows, slab start) i32 [G], in row units."""
     g_local = e_total // ep
-    rows = lax.dynamic_slice(routing.expert_rows_aligned, (me * g_local, ),
-                             (g_local, ))
-    base_g = lax.dynamic_slice(routing.expert_base, (me * g_local, ),
-                               (g_local, ))
+    rows = lax.dynamic_slice(routing.expert_rows_aligned, (me * g_local,), (g_local,))
+    base_g = lax.dynamic_slice(routing.expert_base, (me * g_local,), (g_local,))
     base = base_g - base_g[0]
     return rows.astype(jnp.int32), base.astype(jnp.int32)
 
@@ -931,8 +998,9 @@ def local_slab_rows(routing, me, *, shard_stride):
     negative index around the destination instead of dropping it.
     """
     base = me * shard_stride
-    return jnp.where(routing.slab_row < base, jnp.int32(shard_stride),
-                     routing.slab_row - base)
+    return jnp.where(
+        routing.slab_row < base, jnp.int32(shard_stride), routing.slab_row - base
+    )
 
 
 def shard_token_gather(routing, me, *, shard_stride, rows=None):
@@ -962,12 +1030,17 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
     # of two, so this is the spelling that removes the division rather
     # than the one that shifts it.
     token_of_pair = jnp.broadcast_to(
-        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)).reshape(-1)
-    row = (local_slab_rows(routing, me, shard_stride=shard_stride)
-           if rows is None else rows)
+        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
+    ).reshape(-1)
+    row = (
+        local_slab_rows(routing, me, shard_stride=shard_stride)
+        if rows is None
+        else rows
+    )
     gather_lo, gather_hi = gather_clamp_bounds(T)
-    scattered = jnp.zeros((shard_stride, ),
-                          jnp.int32).at[row].add(token_of_pair, mode="drop")
+    scattered = (
+        jnp.zeros((shard_stride,), jnp.int32).at[row].add(token_of_pair, mode="drop")
+    )
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
 
@@ -996,9 +1069,9 @@ def expert_visit_list(rows, g_local):
     # module in the compiled program, one of its largest, for 64 elements.
     key = order - rows_i * g_local
     rank = jnp.sum((key[None, :] < key[:, None]).astype(jnp.int32), axis=1)
-    perm = jnp.sum(jnp.where(rank[None, :] == order[:, None], order[None, :],
-                             0),
-                   axis=1)
+    perm = jnp.sum(
+        jnp.where(rank[None, :] == order[:, None], order[None, :], 0), axis=1
+    )
     visit = jnp.minimum(perm, jnp.int32(g_local - 1)).astype(jnp.int32)
     return visit, n_visit
 
@@ -1011,20 +1084,22 @@ def shard_push_tables_in_rows(routing, me, *, e_total, ep):
     # arrival tables do not move.
     g_local = e_total // ep
     all_run_rows = routing.run_rows  # [E, ep]
-    true_rows = lax.dynamic_slice(all_run_rows, (me * g_local, 0),
-                                  (g_local, ep))
+    true_rows = lax.dynamic_slice(all_run_rows, (me * g_local, 0), (g_local, ep))
     recv_base = routing.recv_base  # [d, s, g]
-    my_recv_base = lax.dynamic_slice(recv_base, (0, me, 0),
-                                     (ep, 1, g_local))[:, 0]
+    my_recv_base = lax.dynamic_slice(recv_base, (0, me, 0), (ep, 1, g_local))[:, 0]
     recv_row_off = my_recv_base.T  # [G, d]
     not_me = (jnp.arange(ep) != me).astype(true_rows.dtype)
     send_true = (true_rows * not_me[None, :]).sum()
     self_true = (true_rows * (1 - not_me)[None, :]).sum()
-    recv_true = lax.dynamic_slice(
-        all_run_rows.sum(axis=0).astype(jnp.int32), (me,), (1,))[0] \
+    recv_true = (
+        lax.dynamic_slice(all_run_rows.sum(axis=0).astype(jnp.int32), (me,), (1,))[0]
         - self_true
-    return (true_rows.astype(jnp.int32), recv_row_off.astype(jnp.int32),
-            jnp.stack([send_true, recv_true]).astype(jnp.int32))
+    )
+    return (
+        true_rows.astype(jnp.int32),
+        recv_row_off.astype(jnp.int32),
+        jnp.stack([send_true, recv_true]).astype(jnp.int32),
+    )
 
 
 def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
@@ -1034,15 +1109,18 @@ def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
     g_local = e_total // ep
     # Every table value below is in 8-row BLOCK units, which the
     # conversions at the bottom reach by a shift.
-    aligned_rows = lax.dynamic_slice(routing.run_rows_aligned,
-                                     (me * g_local, 0), (g_local, ep))
-    run_start = lax.dynamic_slice(routing.run_start_aligned, (me * g_local, 0),
-                                  (g_local, ep))
-    my_region_rows = lax.dynamic_slice(routing.region_rows, (me, 0, 0),
-                                       (1, g_local, ep))[0]
+    aligned_rows = lax.dynamic_slice(
+        routing.run_rows_aligned, (me * g_local, 0), (g_local, ep)
+    )
+    run_start = lax.dynamic_slice(
+        routing.run_start_aligned, (me * g_local, 0), (g_local, ep)
+    )
+    my_region_rows = lax.dynamic_slice(
+        routing.region_rows, (me, 0, 0), (1, g_local, ep)
+    )[0]
     recv_base = routing.recv_base  # [d, s, g]
 
-    not_me = (jnp.arange(ep) != me)
+    not_me = jnp.arange(ep) != me
     # contrib includes the own-dest region, which hops to recvbuf later.
     out_total = my_region_rows.sum(axis=0)  # [d] incl. me
     contrib_base = jnp.cumsum(out_total) - out_total  # [d]
@@ -1054,25 +1132,32 @@ def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
     push_src = contrib_base[None, :] + grp_off  # [g, d]
     push_len = my_region_rows
     # recv_base[d (receiver), me (src), g] for every d: [d, g] -> [g, d].
-    my_recv_base = lax.dynamic_slice(recv_base, (0, me, 0),
-                                     (ep, 1, g_local))[:, 0]
+    my_recv_base = lax.dynamic_slice(recv_base, (0, me, 0), (ep, 1, g_local))[:, 0]
     push_dst = my_recv_base.T
     not_me_i = not_me.astype(my_region_rows.dtype)
     send_rows = (my_region_rows * not_me_i[None, :]).sum()
     self_rows = jnp.sum(aligned_rows * (1 - not_me_i)[None, :])
-    recv_remote = lax.dynamic_slice(routing.recv_rows, (me,), (1,))[0] \
-        - self_rows
-    totals = jnp.stack([
-        jnp.right_shift(send_rows, ROWBLK_SHIFT),
-        jnp.right_shift(recv_remote, ROWBLK_SHIFT),
-    ]).astype(jnp.int32)
+    recv_remote = lax.dynamic_slice(routing.recv_rows, (me,), (1,))[0] - self_rows
+    totals = jnp.stack(
+        [
+            jnp.right_shift(send_rows, ROWBLK_SHIFT),
+            jnp.right_shift(recv_remote, ROWBLK_SHIFT),
+        ]
+    ).astype(jnp.int32)
 
     def i32(a):
         """One table in block units: the row count's high bits."""
         return jnp.right_shift(a, ROWBLK_SHIFT).astype(jnp.int32)
 
-    return (i32(run_start), i32(aligned_rows), i32(contrib_off), i32(push_src),
-            i32(push_len), i32(push_dst), totals)
+    return (
+        i32(run_start),
+        i32(aligned_rows),
+        i32(contrib_off),
+        i32(push_src),
+        i32(push_len),
+        i32(push_dst),
+        totals,
+    )
 
 
 # Rows of the count table, in the order the kernel reads them. The two
@@ -1130,14 +1215,17 @@ def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
     """
     g_local = e_total // ep
     all_run_rows = routing.run_rows  # [E, ep]
-    true_rows = lax.dynamic_slice(all_run_rows, (me * g_local, 0),
-                                  (g_local, ep)).astype(jnp.int32)
-    aligned = lax.dynamic_slice(routing.run_rows_aligned, (me * g_local, 0),
-                                (g_local, ep)).astype(jnp.int32)
+    true_rows = lax.dynamic_slice(
+        all_run_rows, (me * g_local, 0), (g_local, ep)
+    ).astype(jnp.int32)
+    aligned = lax.dynamic_slice(
+        routing.run_rows_aligned, (me * g_local, 0), (g_local, ep)
+    ).astype(jnp.int32)
     mine = (jnp.arange(ep, dtype=jnp.int32) == me).astype(jnp.int32)  # [ep]
     other = 1 - mine
-    first = (jnp.arange(g_local, dtype=jnp.int32) == 0).astype(
-        jnp.int32)[:, None]  # [G, 1]
+    first = (jnp.arange(g_local, dtype=jnp.int32) == 0).astype(jnp.int32)[
+        :, None
+    ]  # [G, 1]
     recv_rows_all = all_run_rows.sum(axis=0).astype(jnp.int32)  # [ep]
     recv_total = routing.recv_rows.astype(jnp.int32)  # [ep]
     all_tiles = routing.run_tiles.astype(jnp.int32)  # [E, ep]
@@ -1149,25 +1237,37 @@ def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
         """One count's reduction, keeping the expert-parallel axis."""
         return term.sum(axis=0, keepdims=True)  # [1, ep]
 
-    return jnp.concatenate([
-        over_experts(true_rows * other[None, :]),
-        over_experts((recv_rows_all * mine)[None, :] * first -
-                     true_rows * mine[None, :]),
-        over_experts(aligned * other[None, :]),
-        over_experts((recv_total * mine)[None, :] * first -
-                     aligned * mine[None, :]),
-        over_experts(active * mine[None, :]),
-        over_experts(tiles * other[None, :]),
-        over_experts((recv_tiles_all * mine)[None, :] * first -
-                     tiles * mine[None, :]),
-        over_experts(tiles * mine[None, :]),
-    ],
-                           axis=0).astype(jnp.int32)  # [N_COUNTS, ep]
+    return jnp.concatenate(
+        [
+            over_experts(true_rows * other[None, :]),
+            over_experts(
+                (recv_rows_all * mine)[None, :] * first - true_rows * mine[None, :]
+            ),
+            over_experts(aligned * other[None, :]),
+            over_experts(
+                (recv_total * mine)[None, :] * first - aligned * mine[None, :]
+            ),
+            over_experts(active * mine[None, :]),
+            over_experts(tiles * other[None, :]),
+            over_experts(
+                (recv_tiles_all * mine)[None, :] * first - tiles * mine[None, :]
+            ),
+            over_experts(tiles * mine[None, :]),
+        ],
+        axis=0,
+    ).astype(jnp.int32)  # [N_COUNTS, ep]
 
 
-def vmem_limit():
-    """VMEM budget for the kernel, read from this generation's capacity."""
-    return int(pltpu.get_tpu_info().vmem_capacity_bytes * VMEM_FRACTION)
+def vmem_limit(info=None):
+    """VMEM budget for the kernel, read from this generation's capacity.
+
+    Takes the device record the rest of the accounting already holds, so a
+    caller sizing several candidate builds against one budget reads the
+    device once rather than once per candidate.
+    """
+    if info is None:
+        info = pltpu.get_tpu_info()
+    return int(info.vmem_capacity_bytes * VMEM_FRACTION)
 
 
 # The oldest chip generation this kernel has been built and measured on.
@@ -1241,19 +1341,22 @@ def check_u32_sublane_tile(info=None):
             f"and this chip tiles them to {queried}; the packed-weight row "
             f"tile the block size is checked against is written for "
             f"{U32_SUBLANE_TILE} and the buffers beside it are sized from "
-            "the device record, so the two no longer describe one layout")
+            "the device record, so the two no longer describe one layout"
+        )
 
 
-def vmem_scratch_arrays(g_local,
-                        capacity,
-                        hidden,
-                        inter,
-                        *,
-                        nbuf=NBUF,
-                        weight_format=WeightFormat.FP8,
-                        rhs_qb=QB4,
-                        has_w1_bias=False,
-                        has_w2_bias=False):
+def vmem_scratch_arrays(
+    g_local,
+    capacity,
+    hidden,
+    inter,
+    *,
+    nbuf,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    has_w1_bias=False,
+    has_w2_bias=False,
+):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
     _build_fused_ep_moe_kernel declares its scratch from this list, in this
@@ -1277,16 +1380,17 @@ def vmem_scratch_arrays(g_local,
     lane_blocks = row_lane_blocks(hidden)
     # The tile height IS the capacity, and the out pair is in tile units.
     tile_m = capacity
-    # Every local expert's scale table is resident. At four-bit block scales
-    # that makes the two scale tables some of the largest buffers here.
+    # A scale table rides the weight slots, not the expert list: it is read
+    # only alongside the slab it scales, so it is staged with that slab and
+    # is nbuf deep.
     if weight_format == WeightFormat.FP4:
         # Four-bit weights stream as PACKED u32 words ([K/8, N]), so the
         # transfer moves half the bytes an eight-bit slab would.
         weights = [
             ("w1_vm", (nbuf, hidden // PACK4, 2 * inter), jnp.uint32),
             ("w2_vm", (nbuf, inter // PACK4, hidden), jnp.uint32),
-            ("w1s_vm", (g_local, hidden // rhs_qb, 2 * inter), jnp.float32),
-            ("w2s_vm", (g_local, inter // rhs_qb, hidden), jnp.float32),
+            ("w1s_vm", (nbuf, hidden // rhs_qb, 2 * inter), jnp.float32),
+            ("w2s_vm", (nbuf, inter // rhs_qb, hidden), jnp.float32),
         ]
     else:
         weights = [
@@ -1295,8 +1399,8 @@ def vmem_scratch_arrays(g_local,
         ]
         if form.has_scales:
             weights += [
-                ("w1s_vm", (g_local, 2 * inter), jnp.float32),
-                ("w2s_vm", (g_local, hidden), jnp.float32),
+                ("w1s_vm", (nbuf, 2 * inter), jnp.float32),
+                ("w2s_vm", (nbuf, hidden), jnp.float32),
             ]
     # The optional expert biases are resident for every local expert, one
     # row per expert on each matmul's output channels. They carry no block
@@ -1314,29 +1418,40 @@ def vmem_scratch_arrays(g_local,
     # WEIGHT slabs need so a refill and the live readers of the prefetch
     # distance's worth of earlier experts occupy distinct slots, which is a
     # different question and a larger answer.
-    act_scale = ([("ls_vm", (OUT_PARITIES, act_scale_window_rows(capacity),
-                             HIDDEN_LANE_BLOCK),
-                   jnp.float32)] if form.quantized_activations else [])
+    act_scale = (
+        [
+            (
+                "ls_vm",
+                (OUT_PARITIES, act_scale_window_rows(capacity), HIDDEN_LANE_BLOCK),
+                jnp.float32,
+            )
+        ]
+        if form.quantized_activations
+        else []
+    )
     return [
         # The indirect form keeps each token row as one lane-block row.
         # Parity-deep for the same reason ls_vm is.
-        ("lhs_vm", (OUT_PARITIES, capacity, lane_blocks, HIDDEN_LANE_BLOCK),
-         form.act_dtype),
+        (
+            "lhs_vm",
+            (OUT_PARITIES, capacity, lane_blocks, HIDDEN_LANE_BLOCK),
+            form.act_dtype,
+        ),
         *weights,
         *biases,
         *act_scale,
-        ("out_vm", (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
-         form.wire_dtype),
+        (
+            "out_vm",
+            (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
+            form.wire_dtype,
+        ),
         ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
     ]
 
 
-def vmem_tile_body_arrays(capacity,
-                          hidden,
-                          inter,
-                          *,
-                          weight_format=WeightFormat.FP8,
-                          rhs_qb=QB4):
+def vmem_tile_body_arrays(
+    capacity, hidden, inter, *, weight_format=WeightFormat.FP8, rhs_qb=QB4
+):
     """What one tile body keeps live, as (name, shape, dtype).
 
     These are not declared scratch: the compiler places them, in the same
@@ -1382,25 +1497,36 @@ def vmem_tile_body_arrays(capacity,
     if form.wire_dtype is FP8:
         arrays.append(("wire_rows", (tile_m, hidden), FP8))
     if weight_format == WeightFormat.FP4:
-        arrays.append(("widened_weight_block", (WIDENED_BLOCK_BUFFERS, rhs_qb,
-                                                max(2 * inter, hidden)), FP8))
+        arrays.append(
+            (
+                "widened_weight_block",
+                (WIDENED_BLOCK_BUFFERS, rhs_qb, max(2 * inter, hidden)),
+                FP8,
+            )
+        )
     elif weight_format == WeightFormat.INT8:
         arrays.append(
-            ("widened_weight_block", (WIDENED_BLOCK_BUFFERS, WIDEN_KCHUNK,
-                                      max(2 * inter, hidden)), BF16))
+            (
+                "widened_weight_block",
+                (WIDENED_BLOCK_BUFFERS, WIDEN_KCHUNK, max(2 * inter, hidden)),
+                BF16,
+            )
+        )
     return arrays
 
 
-def vmem_estimate_bytes(g_local,
-                        capacity,
-                        hidden,
-                        inter,
-                        nbuf=NBUF,
-                        weight_format=WeightFormat.FP8,
-                        rhs_qb=QB4,
-                        has_w1_bias=False,
-                        has_w2_bias=False,
-                        info=None):
+def vmem_estimate_bytes(
+    g_local,
+    capacity,
+    hidden,
+    inter,
+    nbuf,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    has_w1_bias=False,
+    has_w2_bias=False,
+    info=None,
+):
     """VMEM one built kernel occupies, from the arrays it declares.
 
     An upper bound, and deliberately so: the declared scratch is live for
@@ -1415,19 +1541,102 @@ def vmem_estimate_bytes(g_local,
     """
     if info is None:
         info = pltpu.get_tpu_info()
-    arrays = vmem_scratch_arrays(g_local,
-                                 capacity,
-                                 hidden,
-                                 inter,
-                                 nbuf=nbuf,
-                                 weight_format=weight_format,
-                                 rhs_qb=rhs_qb,
-                                 has_w1_bias=has_w1_bias,
-                                 has_w2_bias=has_w2_bias)
-    arrays += vmem_tile_body_arrays(capacity,
-                                    hidden,
-                                    inter,
-                                    weight_format=weight_format,
-                                    rhs_qb=rhs_qb)
-    return sum(
-        array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
+    arrays = vmem_scratch_arrays(
+        g_local,
+        capacity,
+        hidden,
+        inter,
+        nbuf=nbuf,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        has_w1_bias=has_w1_bias,
+        has_w2_bias=has_w2_bias,
+    )
+    arrays += vmem_tile_body_arrays(
+        capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
+    )
+    return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
+
+
+class WeightSlots(NamedTuple):
+    """The weight-slot schedule one build runs at, and what it costs.
+
+    `distance` is how far ahead of the computing expert a refill goes out,
+    `nbuf` the slots that distance needs, `vmem_bytes` what the whole build
+    comes to at that depth and `limit` the budget it was measured against.
+    """
+
+    distance: int
+    nbuf: int
+    vmem_bytes: int
+    limit: int
+
+    @property
+    def fits(self):
+        """Whether the build at this depth is inside the budget."""
+        return self.vmem_bytes <= self.limit
+
+
+def fit_weight_slots(
+    g_local,
+    capacity,
+    hidden,
+    inter,
+    *,
+    max_distance=MAX_WEIGHT_PREFETCH_DISTANCE,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    has_w1_bias=False,
+    has_w2_bias=False,
+    info=None,
+    limit=None,
+):
+    """The deepest prefetch schedule this shape's VMEM leaves room for.
+
+    The weight slabs are the only buffer sized by the schedule rather than
+    by the model: they are `nbuf` copies of one expert, and `nbuf` is ours
+    to pick. So a shape that misses at the ceiling often fits one slot
+    shallower. Walk down a slot at a time rather than dropping to zero --
+    even distance one keeps a refill in flight, which is most of the win.
+
+    Distance zero has nothing left to give back. A shape still over budget
+    there is returned NOT FITTING rather than raised on, carrying the
+    distance-zero figures for the builder to quote in its refusal.
+
+    Queries the device record once and reuses it for every candidate.
+    """
+    if max_distance < 0:
+        raise ValueError(
+            f"the maximum prefetch distance is {max_distance}; a negative "
+            "distance is not a schedule, and zero already means no "
+            "prefetching"
+        )
+    if info is None:
+        info = pltpu.get_tpu_info()
+    if limit is None:
+        limit = vmem_limit(info)
+    slots = None
+    for distance in range(max_distance, -1, -1):
+        nbuf = nbuf_for(distance)
+        slots = WeightSlots(
+            distance,
+            nbuf,
+            vmem_estimate_bytes(
+                g_local,
+                capacity,
+                hidden,
+                inter,
+                nbuf=nbuf,
+                weight_format=weight_format,
+                rhs_qb=rhs_qb,
+                has_w1_bias=has_w1_bias,
+                has_w2_bias=has_w2_bias,
+                info=info,
+            ),
+            limit,
+        )
+        if slots.fits:
+            break
+    # The first depth that fits, or distance zero over budget for the
+    # caller to refuse by name.
+    return slots
