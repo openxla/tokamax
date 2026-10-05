@@ -14,7 +14,7 @@
 # ==============================================================================
 """Tokamax operator wrapper for Pallas Mosaic TPU Batched RPA."""
 
-from typing import Annotated, Any, ClassVar, Literal
+from typing import Annotated, Any, ClassVar
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import pydantic
@@ -40,9 +40,7 @@ class Config:
   decode_batch_size: Annotated[int, pydantic.Field(gt=0)] = 8
   prefill_batch_size: Annotated[int, pydantic.Field(gt=0)] = 2
   # KV memory layout
-  kv_layout: Literal["HEAD_ALONG_SUBLANE", "SEQ_ALONG_LANE"] = (
-      "HEAD_ALONG_SUBLANE"
-  )
+  kv_layout: str = "HEAD_ALONG_SUBLANE"
 
   def __post_init__(self):
     if self.prefill_bq_c_sz > self.prefill_bq_sz:
@@ -84,7 +82,7 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       debug_mode: bool = False,
       out_dtype: Any = None,
       use_causal_mask: bool = True,
-      skip_kv_update: bool = True,
+      skip_kv_update: bool = False,
       kv_layout: base.KVLayout | str = base.KVLayout.HEAD_ALONG_SUBLANE,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,

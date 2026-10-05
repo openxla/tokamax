@@ -789,7 +789,7 @@ def _kernel_dkv(
       if bias_gmem is None:
         bias = None
       elif bias_smem is None:
-        bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)  # pyrefly: ignore[bad-argument-type]
+        bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)
       else:
         plgpu.barrier_wait(bias_produced)  # pyrefly: ignore[bad-argument-type]
         bias = plgpu.load(bias_smem, layout=_TCGEN05)
@@ -838,7 +838,7 @@ def _kernel_dkv(
       if mask_gmem is not None:
         if mask_smem is None:
           if loop_invariant_mask is None:
-            mask = _load_bcast(mask_gmem, (hi, ks, qs), layout=_TCGEN05)  # pyrefly: ignore[bad-argument-type]
+            mask = _load_bcast(mask_gmem, (hi, ks, qs), layout=_TCGEN05)
           else:
             mask = lax.broadcast_in_dim(loop_invariant_mask, s.shape, [0])
         else:

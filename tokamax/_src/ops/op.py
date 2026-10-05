@@ -412,7 +412,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     return True
 
 
-def snake_case_name(op: Op) -> str:  # pylint: disable=g-bare-generic
+def snake_case_name(op: type[Op] | Op) -> str:  # pylint: disable=g-bare-generic
   """Returns the snake_case name of the op implementation."""
   cls = op if isinstance(op, type) else type(op)
   return _CAMEL_TO_SNAKE_PATTERN.sub(r"_\1", cls.__name__).lower()
@@ -678,7 +678,7 @@ class _AlwaysEqual:
 @functools.lru_cache
 def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
   spec = pydantic_lib.get_arg_spec_model(f"{type(op).__name__}Spec", op._fwd_signature)  # pylint: disable=protected-access
-  return pydantic_lib.get_adapter(spec)
+  return pydantic_lib.get_adapter(spec)  # pyrefly: ignore[bad-return]
 
 
 BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(BoundArguments)

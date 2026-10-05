@@ -324,6 +324,98 @@ class PallasMosaicTpuTest(parameterized.TestCase):
     self.assertIsNotNone(loss_compiled)
     self.assertIsNotNone(lse_compiled)
 
+  def test_call_without_configs_uses_heuristics_config(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("This op only works on TPU.")
+
+    x, labels, w = self._generate_random_data(b_dim=2048, h_dim=512, v_dim=2048)
+    x_expected = x.clone().detach().requires_grad_(True)
+    w_expected = w.clone().detach().requires_grad_(True)
+    reduction = "mean"
+    op_lsce = (
+        torch_pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss
+    )
+    expected_fwd_config, expected_bwd_config = torch_utils.get_configs(
+        op_lsce,
+        x,
+        labels,
+        w,
+        reduction=reduction,
+        from_autotuning_cache=False,
+    )
+
+    loss, lse = op_lsce(
+        x,
+        labels,
+        w,
+        reduction=reduction,
+    )
+    loss.backward()
+
+    expected_loss, expected_lse = op_lsce(
+        x_expected,
+        labels,
+        w_expected,
+        reduction=reduction,
+        configs=(expected_fwd_config, expected_bwd_config),
+    )
+    expected_loss.backward()
+
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(lse, expected_lse)
+    torch.testing.assert_close(x.grad, x_expected.grad)
+    torch.testing.assert_close(w.grad, w_expected.grad)
+
+  def test_torch_compile_call_without_configs_uses_heuristics_config(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("This op only works on TPU.")
+
+    x, labels, w = self._generate_random_data(
+        b_dim=2048, h_dim=1024, v_dim=2048
+    )
+    x_expected = x.clone().detach().requires_grad_(True)
+    w_expected = w.clone().detach().requires_grad_(True)
+    reduction = "mean"
+    op_lsce = (
+        torch_pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss
+    )
+    expected_fwd_config, expected_bwd_config = torch_utils.get_configs(
+        op_lsce,
+        x,
+        labels,
+        w,
+        reduction=reduction,
+        from_autotuning_cache=False,
+    )
+
+    @torch.compile(fullgraph=True, dynamic=False)
+    def compiled_fn(
+        x: torch.Tensor, labels: torch.Tensor, w: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+      return op_lsce(
+          x,
+          labels,
+          w,
+          reduction=reduction,
+      )
+
+    loss, lse = compiled_fn(x, labels, w)
+    loss.backward()
+
+    expected_loss, expected_lse = op_lsce(
+        x_expected,
+        labels,
+        w_expected,
+        reduction=reduction,
+        configs=(expected_fwd_config, expected_bwd_config),
+    )
+    expected_loss.backward()
+
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(lse, expected_lse)
+    torch.testing.assert_close(x.grad, x_expected.grad)
+    torch.testing.assert_close(w.grad, w_expected.grad)
+
 
 if __name__ == "__main__":
   absltest.main()

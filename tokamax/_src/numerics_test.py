@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -113,12 +115,14 @@ class NumericsTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(kwargs, kwargs_expected)
 
-  @parameterized.parameters(jnp.bool_, jnp.float32, jnp.int32, jnp.uint8)
-  def test_random_initialize_layout(self, dtype):
+  @parameterized.product(
+      dtype=(jnp.bool_, jnp.float32, jnp.int32, jnp.uint8),
+      shape=((2, 3, 4), (64, 128, 128)),
+  )
+  def test_random_initialize_layout(self, dtype, shape):
     if jax.default_backend() == 'tpu':
       self.skipTest('Test broken on TPU')
 
-    shape = (2, 3, 4)
     no_sharding = jax.sharding.make_single_device_sharding(jax.devices()[0])
     format_ = layout.Format(layout.Layout((1, 2, 0), ()), no_sharding)
     spec_with_layout = jax.ShapeDtypeStruct(shape, dtype, sharding=format_)
@@ -129,6 +133,7 @@ class NumericsTest(parameterized.TestCase):
 
   @parameterized.product(
       qtype=(jnp.float8_e4m3fn, jnp.int8, jnp.int4),
+      shape=((256, 256), (1024, 1024)),
       scale=(
           jax.ShapeDtypeStruct((1, 128), jnp.bfloat16),
           jax.ShapeDtypeStruct((128, 1), jnp.bfloat16),
@@ -136,8 +141,8 @@ class NumericsTest(parameterized.TestCase):
       ),
       explicit_qtype=(True, False),
   )
-  def test_random_initialize_qarray(self, qtype, scale, explicit_qtype):
-    qvalue = jax.ShapeDtypeStruct((256, 256), qtype)
+  def test_random_initialize_qarray(self, qtype, shape, scale, explicit_qtype):
+    qvalue = jax.ShapeDtypeStruct(shape, qtype)
     kwargs = dict(qtype=qtype) if explicit_qtype else {}
     q = qwix.QArray(qvalue, scale, **kwargs)  # pyrefly: ignore[bad-argument-type]
     q = numerics.random_initialize(q)
@@ -156,9 +161,24 @@ class NumericsTest(parameterized.TestCase):
     self.assertEqual(jnp.min(x), 3)
     self.assertEqual(jnp.max(x), 6)
 
-  def test_seed(self):
-    a = batching.BatchedShapeDtype((16,), jnp.int4, vmap_axes=((0, 16),))
-    b = jax.ShapeDtypeStruct((16, 16), jnp.int4)
+  @parameterized.parameters(((16, 16), 2), ((1024, 1024), 0))
+  def test_host_vs_device_initialization(self, shape, expected_device_puts):
+    qvalue = jax.ShapeDtypeStruct(shape, jnp.int4)
+    scale = jax.ShapeDtypeStruct((shape[0], 4), jnp.bfloat16)
+    spec = {
+        'a': qvalue,
+        'q': qwix.QArray(qvalue, scale),  # pyrefly: ignore[bad-argument-type]
+    }
+    with mock.patch.object(
+        jax, 'device_put', wraps=jax.device_put
+    ) as mock_device_put:
+      numerics.random_initialize(spec)
+    self.assertEqual(mock_device_put.call_count, expected_device_puts)
+
+  @parameterized.parameters(16, 1024)
+  def test_seed(self, n):
+    a = batching.BatchedShapeDtype((n,), jnp.int4, vmap_axes=((0, n),))
+    b = jax.ShapeDtypeStruct((n, n), jnp.int4)
 
     a_random = numerics.random_initialize(a)
     b_random = numerics.random_initialize(b)
