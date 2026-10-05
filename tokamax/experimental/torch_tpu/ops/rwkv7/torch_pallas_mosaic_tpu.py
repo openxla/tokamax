@@ -31,12 +31,17 @@ class _PallasTpuRWKV7(torch_base._RWKV7):
     super().__init__()
     self.op_impl_jax = jax_pallas.PallasTpuRWKV7()
     self.jax_op_name = "torch_tpu_pallas_rwkv7"
+    self._torch_tokamax_op = None
     try:
       from torch_tpu._internal import pallas
-      self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
-      self._setup_autograd(pallas)
-    except Exception:
-      pass
+    except ImportError:
+      pallas = None
+    else:
+      try:
+        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+        self._setup_autograd(pallas)
+      except Exception:
+        self._torch_tokamax_op = None
 
   def _setup_autograd(self, pallas_module):
     def bwd_jax(q, k, v, alpha, beta, gk, do, chunk_size=64):

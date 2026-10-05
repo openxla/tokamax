@@ -27,16 +27,16 @@ class RWKV7BaseTest(absltest.TestCase):
 
   def test_base_matches_reference(self):
     key = jax.random.PRNGKey(42)
-    b, t, h, k_dim, v_dim = 2, 128, 4, 16, 16
+    batch_size, seq_len, num_heads, key_dim, val_dim = 2, 128, 4, 16, 16
     chunk_size = 64
 
     k0, k1, k2, k3, k4, k5 = jax.random.split(key, 6)
-    q = jax.random.normal(k0, (b, t, h, k_dim), dtype=jnp.float32) * (k_dim**-0.5)
-    k = jax.random.normal(k1, (b, t, h, k_dim), dtype=jnp.float32) * (k_dim**-0.5)
-    v = jax.random.normal(k2, (b, t, h, v_dim), dtype=jnp.float32)
-    alpha = jax.random.normal(k3, (b, t, h, k_dim), dtype=jnp.float32) * (k_dim**-0.5)
-    beta = jax.random.normal(k4, (b, t, h, k_dim), dtype=jnp.float32) * (k_dim**-0.5)
-    gk = -jax.nn.sigmoid(jax.random.normal(k5, (b, t, h, k_dim), dtype=jnp.float32))
+    q = jax.random.normal(k0, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * (key_dim**-0.5)
+    k = jax.random.normal(k1, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * (key_dim**-0.5)
+    v = jax.random.normal(k2, (batch_size, seq_len, num_heads, val_dim), dtype=jnp.float32)
+    alpha = jax.random.normal(k3, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * (key_dim**-0.5)
+    beta = jax.random.normal(k4, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * (key_dim**-0.5)
+    gk = -jax.nn.sigmoid(jax.random.normal(k5, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32))
 
     op_instance = base.RWKV7()
     (actual_out, _), _ = op_instance._fwd(
