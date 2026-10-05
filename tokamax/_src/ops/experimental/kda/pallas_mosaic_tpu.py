@@ -109,6 +109,15 @@ class _PreparedKdaInputs:
   k_rstd: jax.Array | None
 
 
+def _requested_chunk_size(ba) -> int:
+  """Returns the requested chunk_size, defaulting to 64 (mandatory for per-channel gates)."""
+  args = getattr(ba, "arguments", None) or {}
+  requested = args.get("chunk_size")
+  if requested is None or args.get("per_channel_gate", True):
+    return 64
+  return int(requested)
+
+
 def check_inputs_support(
     q: jax.Array,
     v: jax.Array,
@@ -119,6 +128,7 @@ def check_inputs_support(
     context_parallel_metadata: ContextParallelMetadata | None,
     chunk_size: int,
     max_num_segments: int | None,
+    per_channel_gate: bool = True,
 ) -> None:
   """Checks whether the Pallas/Mosaic TPU backend supports static inputs."""
   if q.dtype not in (jnp.bfloat16, jnp.float32):
@@ -179,8 +189,18 @@ def check_inputs_support(
           "recurrent state per batch item; got "
           f"N={initial_state.shape[1]}."
       )
-  if chunk_size != 64:
-    raise NotImplementedError("`mosaic` currently supports chunk_size=64.")
+  # Per-channel gates require chunk_size=64; scalar gates support powers of 2 in [16, 512].
+  if per_channel_gate:
+    if chunk_size != 64:
+      raise NotImplementedError(
+          "`mosaic` supports chunk_size=64 with a per-channel gate; got"
+          f" {chunk_size}."
+      )
+  elif chunk_size not in (16, 32, 64, 128, 256, 512):
+    raise NotImplementedError(
+        "`mosaic` scalar-gate path needs a power-of-two chunk_size in"
+        f" [16, 512]; got {chunk_size}."
+    )
   if segment_ids is None and seq_len % chunk_size != 0:
     raise NotImplementedError(
         "`mosaic` requires the sequence length to be divisible by "
@@ -206,15 +226,13 @@ class PallasMosaicTpuKimiDeltaAttention(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return Config(chunk_size=64)
+    return Config(chunk_size=_requested_chunk_size(ba))
 
   @override
   def _get_autotuning_configs(
       self, ba: op.BoundArguments
   ) -> set[Config]:
-    del ba
-    return {Config(chunk_size=64)}
+    return {Config(chunk_size=_requested_chunk_size(ba))}
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -374,7 +392,7 @@ class PallasMosaicTpuKimiDeltaAttention(
       query: Float[Array, "H B T K"],
       key: Float[Array, "H B T K"],
       value: Float[Array, "H B T V"],
-      gate: Float[Array, "H B T K"],
+      gate: Float[Array, "H B T GW"],
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None,
@@ -384,6 +402,8 @@ class PallasMosaicTpuKimiDeltaAttention(
       output_final_state: bool,
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
+      per_channel_gate: bool,
+      chunk_size: int | None,
       segment_ids: Int[Array, "B T"] | None,
       lower_bound: float | None,
       context_parallel_metadata: ContextParallelMetadataArg,
@@ -415,6 +435,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         context_parallel_metadata=context_parallel_metadata,
         chunk_size=chunk_size,
         max_num_segments=max_num_segments,
+        per_channel_gate=per_channel_gate,
     )
 
     prepared = self._preprocess_inputs(
@@ -445,6 +466,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         initial_state=prepared.initial_state,
         output_final_state=output_final_state,
         use_gate_in_kernel=use_gate_in_kernel,
+        per_channel_gate=per_channel_gate,
         segment_ids=segment_ids,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
@@ -474,15 +496,13 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return Config(chunk_size=64)
+    return Config(chunk_size=_requested_chunk_size(ba))
 
   @override
   def _get_autotuning_configs(
       self, ba: op.BoundArguments
   ) -> set[Config]:
-    del ba
-    return {Config(chunk_size=64)}
+    return {Config(chunk_size=_requested_chunk_size(ba))}
 
   def _fwd(
       self,
@@ -502,6 +522,8 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       output_final_state: bool,
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
+      per_channel_gate: bool,
+      chunk_size: int | None,
       segment_ids: jax.Array | None,
       lower_bound: float | None,
       context_parallel_metadata: ContextParallelMetadataArg,
@@ -551,6 +573,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         initial_state is not None,
         residuals,
         dout,
+        per_channel_gate=per_channel_gate,
     )
 
     grads = {
