@@ -16,13 +16,13 @@ import typing
 from typing import Final
 from absl.testing import absltest
 from absl.testing import parameterized
+import chex
 import jax
 import jax.numpy as jnp
+from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
 from tokamax._src import jaxtyping
 from tokamax._src import numerics
-from tokamax._src.ops.gated_linear_unit import api as glu_api
-from tokamax._src.ops.normalization import api as norm_api
 from tokamax._src.ops.triangle_multiplication import api
 
 _IMPLEMENTATIONS: Final[tuple[str | None, ...]] = typing.get_args(
@@ -54,9 +54,30 @@ class TriangleMultiplicationTest(parameterized.TestCase):
       implementation=_IMPLEMENTATIONS,
   )
   def test_triangle_multiplication(self, triangle_type, dtype, implementation):
-    n = 8
+    if implementation == "triton":
+      if (
+          "triton" not in api.IMPLEMENTATIONS
+          or not gpu_utils.has_triton_support()
+      ):
+        self.skipTest("Triton not supported on this platform.")
+      if dtype == jnp.float32:
+        self.skipTest("Triton kernel does not support float32.")
+    if implementation == "mosaic":
+      if (
+          "mosaic" not in api.IMPLEMENTATIONS
+          or not gpu_utils.has_mosaic_gpu_support()
+      ):
+        self.skipTest("Mosaic not supported on this platform.")
+
+    n = 128
     d = 64
-    params = _get_params(n=n, c=16, h=32, d=d, dtype=dtype)
+    params = _get_params(n=n, c=32, h=32, d=d, dtype=dtype)
+
+    @jax.jit
+    def f_ref(params):
+      return api.triangle_multiplication(
+          **params, triangle_type=triangle_type, implementation="xla"
+      )
 
     @jax.jit
     def f(params):
@@ -64,46 +85,28 @@ class TriangleMultiplicationTest(parameterized.TestCase):
           **params, triangle_type=triangle_type, implementation=implementation
       )
 
-    try:
-      out = f(params)
-    except (NotImplementedError, ValueError, ExceptionGroup) as e:
-      if implementation not in ("xla", None):
-        raise absltest.SkipTest(
-            f"Implementation {implementation} not supported on this"
-            f" platform: {e}"
-        )
-      raise
-    self.assertEqual(out.shape, (n, n, d))
-    self.assertEqual(out.dtype, dtype)
+    out_ref = f_ref(params)
+    out = f(params)
+    atol = 0.15 if dtype == jnp.bfloat16 else 1e-5
+    rtol = 0.05 if dtype == jnp.bfloat16 else 1e-5
+    chex.assert_trees_all_close(out, out_ref, atol=atol, rtol=rtol)
 
     with self.subTest("correct_implementation_used"):
-      # This op has no kernel of its own: it forwards `implementation` to the
-      # `normalization` and `gated_linear_unit` ops it is built from. Shape and
-      # dtype are identical whichever way those dispatch, so only the lowered
-      # HLO distinguishes "used the requested kernels" from "silently fell back
-      # to XLA".
-      lowered = f.lower(params)
-      opspecs = hlo_utils.get_nested_opspecs(lowered, include_xla_kernels=False)
-      used = {type(spec.op) for spec in opspecs}
-      if implementation == "xla":
-        self.assertEmpty(opspecs)
-      elif implementation == "triton":
-        # The call above raises (and skips) unless both sub-ops can use Triton,
-        # so reaching here means both kernels have to be in the lowering.
-        self.assertContainsSubset(
-            {
-                type(norm_api.IMPLEMENTATIONS["triton"]),
-                type(glu_api.IMPLEMENTATIONS["triton"]),
-            },
-            used,
-        )
+      args = hlo_utils.get_bound_args(f, params)
+      self.assertLen(args, 1)
+      if implementation is not None:
+        impl = api.IMPLEMENTATIONS[implementation]
+        self.assertIsInstance(args[0].op, impl.__class__)
+      elif (
+          "triton" in api.IMPLEMENTATIONS
+          and gpu_utils.has_triton_support()
+          and dtype == jnp.bfloat16
+      ):
+        impl = api.IMPLEMENTATIONS["triton"]
+        self.assertIsInstance(args[0].op, impl.__class__)
       else:
-        # `None` picks the best available backend, which differs per platform.
-        # Assert only that every kernel used belongs to one of the two sub-ops.
-        allowed_impls = {
-            type(impl) for impl in norm_api.IMPLEMENTATIONS.values()
-        } | {type(impl) for impl in glu_api.IMPLEMENTATIONS.values()}
-        self.assertContainsSubset(used, allowed_impls)
+        impl = api.IMPLEMENTATIONS["xla"]
+        self.assertIsInstance(args[0].op, impl.__class__)
 
   def test_unsupported_implementation(self):
     params = _get_params(n=8, c=16, h=32, d=64, dtype=jnp.float32)
