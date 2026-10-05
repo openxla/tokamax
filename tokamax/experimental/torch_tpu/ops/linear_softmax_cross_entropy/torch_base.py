@@ -24,7 +24,7 @@ import torch
 from typing_extensions import override
 
 
-class _LinearSoftmaxCrossEntropyLossVjp[Config](torch_op.TorchOp[None]):
+class _LinearSoftmaxCrossEntropyLossVjp[Config](torch_op.TorchOp[Config]):
   """Linear Softmax Cross-Entropy Loss PyTorch Op VJP API using reference impl."""
 
   def __init__(self):
@@ -43,9 +43,8 @@ class _LinearSoftmaxCrossEntropyLossVjp[Config](torch_op.TorchOp[None]):
       labels: torch.Tensor,
       w: torch.Tensor,
       reduction: str,
-      config: Config | None = None,
+      config: Any = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    self.configs = (None, config)
     assert (
         self._torch_tokamax_op is not None
     ), "Forward op not registered. This means that self.op_impl_jax is not set"
@@ -59,6 +58,7 @@ class _LinearSoftmaxCrossEntropyLossVjp[Config](torch_op.TorchOp[None]):
         w,
         reduction=reduction,
         return_residuals=False,
+        config=self.deconstruct_config(config),
     )
 
   @override
@@ -72,7 +72,9 @@ class _LinearSoftmaxCrossEntropyLossVjp[Config](torch_op.TorchOp[None]):
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
+      config: tuple[int, int, int] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
+    del config
     reduction = cast(Literal["mean", "none", "sum"], reduction)
     assert self.op_impl_jax is not None, "Forward class not set."
     (x_grad, _, w_grad), _ = self.op_impl_jax._fwd(
@@ -84,7 +86,7 @@ class _LinearSoftmaxCrossEntropyLossVjp[Config](torch_op.TorchOp[None]):
         w,
         reduction=reduction,
         return_residuals=return_residuals,
-        config=self.configs[1],
+        config=None,
     )
     return x_grad, w_grad
 
@@ -143,21 +145,22 @@ class _LinearSoftmaxCrossEntropyLoss[Config](torch_op.TorchOp[Config]):
       labels: torch.Tensor,
       w: torch.Tensor,
       reduction: str,
-      configs: tuple[Any, Any] | None = None,
+      configs: tuple[Config | None, Config | None] | None = None,
   ):
-    if configs is None:
-      configs = (None, None)
-    self.configs = configs
+    fwd_config, bwd_config = (None, None) if configs is None else configs
     assert (
         self._torch_tokamax_op is not None
     ), "Forward op not registered. This means that self.op_impl_jax is not set"
     " in the constructor."
+    assert self.backward_op_torch is not None, "Backward op not set."
     loss, lse = self._torch_tokamax_op(
         x,
         labels,
         w,
         reduction=reduction,
         return_residuals=True,
+        config=self.deconstruct_config(fwd_config),
+        bwd_config=self.backward_op_torch.deconstruct_config(bwd_config),
     )
     return loss, lse
 
@@ -169,7 +172,10 @@ class _LinearSoftmaxCrossEntropyLoss[Config](torch_op.TorchOp[Config]):
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
+      config: tuple[int, int, int] | None = None,
+      bwd_config: tuple[int, int, int] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
+    del config, bwd_config
     reduction = cast(Literal["mean", "none", "sum"], reduction)
     assert self.op_impl_jax is not None, "Forward class not set."
     loss, (lse,) = self.op_impl_jax._fwd(
@@ -178,7 +184,7 @@ class _LinearSoftmaxCrossEntropyLoss[Config](torch_op.TorchOp[Config]):
         w,
         reduction=reduction,
         return_residuals=return_residuals,
-        config=self.configs[0],
+        config=None,
     )
     return loss, lse
 
@@ -190,10 +196,11 @@ class _LinearSoftmaxCrossEntropyLoss[Config](torch_op.TorchOp[Config]):
       output: Any,
   ) -> None:
     """Saves tensors to the context for the backward pass."""
-    x, labels, w, reduction, _ = inputs
+    x, labels, w, reduction, _, _, bwd_config = inputs
     loss, lse = output
     ctx.save_for_backward(x, labels, w, lse, loss)
     ctx.reduction = reduction
+    ctx.bwd_config = bwd_config
 
   @override
   def backward(
@@ -201,7 +208,7 @@ class _LinearSoftmaxCrossEntropyLoss[Config](torch_op.TorchOp[Config]):
       ctx: Any,
       d_loss: torch.Tensor,
       d_lse: torch.Tensor,
-  ) -> tuple[torch.Tensor, None, torch.Tensor, None, None]:
+  ) -> tuple[torch.Tensor, None, torch.Tensor, None, None, None, None]:
     """Callback for torch register_autograd."""
     del d_lse  # Unused
     assert self.backward_op_torch is not None, "Backward op not set."
@@ -215,9 +222,9 @@ class _LinearSoftmaxCrossEntropyLoss[Config](torch_op.TorchOp[Config]):
         labels,
         w,
         reduction=ctx.reduction,
-        config=self.configs[1],
+        config=ctx.bwd_config,
     )
-    return grad_x, None, grad_w, None, None
+    return grad_x, None, grad_w, None, None, None, None
 
 
 # Singleton instance of the LinearSoftmaxCrossEntropyLoss.

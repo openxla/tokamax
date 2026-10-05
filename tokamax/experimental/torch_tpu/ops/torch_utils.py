@@ -20,8 +20,30 @@ import inspect
 import textwrap
 from typing import Any, Callable, Generic, Optional, TypeVar, overload
 import jax
+from jax import numpy as jnp
 from tokamax._src.ops import op as jax_tokamax_op
 import torch
+
+
+def dtype_to_str(
+    dtype: torch.dtype | jax.typing.DTypeLike | str | None,
+) -> str | None:
+  """Converts a PyTorch or JAX dtype to its string name for static_argnums."""
+  if dtype is None:
+    return None
+  if isinstance(dtype, torch.dtype):
+    return str(dtype).split(".")[-1]
+  if isinstance(dtype, str):
+    return dtype
+  return jnp.dtype(dtype).name
+
+
+def str_to_jax_dtype(
+    dtype: torch.dtype | jax.typing.DTypeLike | str | None,
+) -> jnp.dtype | None:
+  """Converts a PyTorch, JAX, or string dtype to a jnp.dtype."""
+  dtype_str = dtype_to_str(dtype)
+  return jnp.dtype(dtype_str) if dtype_str is not None else None
 
 
 def convert_torch_to_jax_via_meta(
@@ -83,6 +105,7 @@ def get_configs(
         if from_autotuning_cache
         else vjp_bound_args.heuristics_config
     )
+
   return fwd_config, vjp_config
 
 

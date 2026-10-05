@@ -29,7 +29,7 @@ Config = jax_pallas_mosaic_tpu.Config
 
 
 class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
-    torch_base._LinearSoftmaxCrossEntropyLossVjp
+    torch_base._LinearSoftmaxCrossEntropyLossVjp[Config]  # pylint: disable=protected-access
 ):
   """This is the Pallas Mosaic TPU Tokamax LSCE VJP Op wrapped for PyTorch."""
 
@@ -53,9 +53,8 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       labels: torch.Tensor,
       w: torch.Tensor,
       reduction: str,
-      config: Config | None = None,
+      config: Config | tuple[int, ...] | list[int] | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    self.configs = (None, config)
     assert (
         self._torch_tokamax_op is not None
     ), "Forward op not registered. This means that self.op_impl_jax is not set"
@@ -69,6 +68,7 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
         w,
         reduction=reduction,
         return_residuals=False,
+        config=self.deconstruct_config(config),
     )
 
   @override
@@ -82,9 +82,12 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
+      config: tuple[int, int, int] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
     reduction = cast(Literal["mean", "none", "sum"], reduction)
     assert self.op_impl_jax is not None, "Forward class not set."
+    assert config is not None, "Backward config not set."
+    kernel_config = self.reconstruct_config(config)
     output, _ = self.op_impl_jax._fwd(
         (residuals,),
         out,
@@ -93,7 +96,7 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
         labels,
         w,
         reduction=reduction,
-        config=self.configs[1],
+        config=kernel_config,
         return_residuals=return_residuals,
     )
     x_grad, _, w_grad = output
@@ -122,18 +125,21 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       labels: torch.Tensor,
       w: torch.Tensor,
       reduction: str,
-      configs: tuple[Any, Any] | None = None,
+      configs: tuple[Config | None, Config | None] | None = None,
   ):
-    self.configs = (None, None) if configs is None else configs
+    fwd_config, bwd_config = (None, None) if configs is None else configs
     assert (
         self._torch_tokamax_op is not None
     ), "Forward op not registered. Call register_ops first."
+    assert self.backward_op_torch is not None, "Backward op not set."
     loss, lse = self._torch_tokamax_op(
         x,
         labels,
         w,
         reduction=reduction,
         return_residuals=not self.is_vjp,  # Only return residuals for forward pass.
+        config=self.deconstruct_config(fwd_config),
+        bwd_config=self.backward_op_torch.deconstruct_config(bwd_config),
     )
     return loss, lse
 
@@ -145,16 +151,21 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
+      config: tuple[int, int, int] | None = None,
+      bwd_config: tuple[int, int, int] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
+    del bwd_config
     reduction = cast(Literal["mean", "none", "sum"], reduction)
     assert self.op_impl_jax is not None, "Forward class not set."
+    assert config is not None, "Forward config not set."
+    kernel_config = self.reconstruct_config(config)
     loss, (lse,) = self.op_impl_jax._fwd(
         x,
         labels,
         w,
         reduction=reduction,
         return_residuals=return_residuals,
-        config=self.configs[0],
+        config=kernel_config,
     )
     return loss, lse
 
@@ -172,10 +183,13 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
         w,
         reduction,
         _,
+        _,
+        bwd_config,
     ) = inputs
     loss, lse = output
     ctx.save_for_backward(x, labels, w, lse, loss)
     ctx.reduction = reduction
+    ctx.bwd_config = bwd_config
 
   @override
   def backward(
@@ -183,7 +197,7 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       ctx: Any,
       d_loss: torch.Tensor,
       d_lse: torch.Tensor,
-  ) -> tuple[torch.Tensor, None, torch.Tensor, None, None]:
+  ) -> tuple[torch.Tensor, None, torch.Tensor, None, None, None, None]:
     """Callback for torch register_autograd."""
     del d_lse  # Unused
     x, labels, w, lse, loss = ctx.saved_tensors
@@ -196,9 +210,9 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
         labels,
         w,
         reduction=ctx.reduction,
-        config=self.configs[1],
+        config=ctx.bwd_config,
     )
-    return grad_x, None, grad_w, None, None
+    return grad_x, None, grad_w, None, None, None, None
 
 
 # Singleton instance of the Pallas Mosaic TPU Linear Softmax Cross-Entropy Loss.
