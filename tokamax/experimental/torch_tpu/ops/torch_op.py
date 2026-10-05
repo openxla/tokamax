@@ -17,6 +17,7 @@
 
 from abc import abstractmethod
 from collections.abc import Sequence
+import dataclasses
 from functools import wraps
 import inspect
 import logging
@@ -59,13 +60,29 @@ _Config = TypeVar("_Config")
     invoke op_impl_jax with the full list of inputs and config to run the
     kernel. TorchOp's __init_subclass__ automatically decorates op_impl_call
     with ensure_op_impl_call_config_setup so that op_impl_call_config_setup is
-    always invoked before op_impl_call runs, storing the returned config in
-    self.configs. This is done to ensure that there is a valid config for the
-    kernel before it is invoked. TorchOp's register_ops will wrap this method in
-    a custom PyTorch op called _torch_tokamax_op.
+    always invoked before op_impl_call runs, passing the resolved config tuple
+    into op_impl_call. This is done to ensure that there is a valid config for
+    the kernel before it is invoked. TorchOp's register_ops will wrap this
+    method in a custom PyTorch op called _torch_tokamax_op.
   - __call__: The main function that will be called by the user. This must
     call _torch_tokamax_op with the correct arguments. This function will take
-    in the configs for the forward and backward pass additionally.
+    in the configs for the forward and backward pass additionally, deconstructing
+    them via deconstruct_config before passing them to _torch_tokamax_op.
+
+  Optionally, override the following config serialization methods:
+  - deconstruct_config and reconstruct_config: PyTorch custom ops
+    (torch_tpu.jax_op) only support primitive types and homogeneously typed
+    sequences (e.g. tuple[int, ...], str, int, float, bool) in their schema and
+    cannot accept arbitrary Config objects directly. deconstruct_config converts
+    a Config object in __call__ into jax_op-compatible primitive/tuple types
+    before calling _torch_tokamax_op, and reconstruct_config rebuilds the Config
+    object inside op_impl_call before invoking op_impl_jax. By default,
+    deconstruct_config converts the Config dataclass into a single tuple via
+    dataclasses.astuple, and reconstruct_config unpacks that tuple into
+    op_impl_jax.config_cls(*config). Override these methods when the Config
+    contains mixed field types (e.g. both int fields and a str field) or nested
+    structures that must be split into multiple separate jax_op-compatible
+    arguments and reassembled in op_impl_call.
     
   If there is a backward pass:
   - In the forward Op constructor, set backward_op_torch to an instance of the
@@ -93,96 +110,6 @@ _Config = TypeVar("_Config")
 """
 
 
-def _unwrap_dynamo_var(var: Any) -> Any:
-  """Unwraps a TorchDynamo VariableTracker into its underlying Python value."""
-  if hasattr(var, "value"):
-    return var.value
-  if hasattr(var, "items"):
-    if isinstance(var.items, dict):
-      return {
-          _unwrap_dynamo_var(k): _unwrap_dynamo_var(v)
-          for k, v in var.items.items()
-      }
-    if isinstance(var.items, (list, tuple)):
-      seq = (_unwrap_dynamo_var(x) for x in var.items)
-      return list(seq) if var.python_type() is list else tuple(seq)
-  if hasattr(var, "as_python_constant"):
-    return var.as_python_constant()
-  return var
-
-
-def _sync_dynamo_side_effects(instance: Any) -> None:
-  """Flushes pending TorchDynamo attribute mutations onto `instance`.
-
-  When TorchDynamo (`torch.compile`) traces a Python function, it separates
-  tensor operations from Python object mutations:
-  - Tensor operations are captured into an FX graph, which cannot directly
-    mutate arbitrary Python object attributes.
-  - Python attribute assignments (such as `self.configs = ...` in
-    `TorchOp.__call__`) are not applied to the live Python object during
-    tracing (so TorchDynamo can safely roll back and restart if tracing hits a
-    graph break). Instead, they are buffered in TorchDynamo's `SideEffects`
-    table (`store_attr_mutations`).
-  - TorchDynamo then generates a Python wrapper function that first calls the
-    compiled FX graph, and then runs a bytecode "epilogue" immediately after
-    the FX graph returns. This epilogue replays all buffered mutations from
-    `store_attr_mutations` (via `setattr`) onto the live Python objects so that
-    Python state changes made inside the compiled function are visible after it
-    returns.
-
-  Because `op_impl_call` runs inside a custom op (outside of TorchDynamo's
-  bytecode tracer) before the epilogue executes, we must:
-  1. Apply any pending attribute mutations from `TorchOp.__call__` onto the
-     live `instance` before `op_impl_call_config_setup` and `op_impl_call` run.
-  2. Remove `"configs"` from TorchDynamo's pending `store_attr_mutations` so
-     the compiled frame's epilogue does not overwrite the config resolved by
-     `op_impl_call_config_setup` back to `(None, None)`.
-
-  For example, suppose `op(x)` (with default `config=None`) is called inside a
-  `@torch.compile` function after a previous call left `op.configs = (ConfigA,
-  None)`. If `_sync_dynamo_side_effects` did not exist:
-  1. In `op.__call__`, `self.configs = (None, None)` is intercepted by
-     TorchDynamo and buffered in `store_attr_mutations` rather than mutating the
-     live `op.configs` attribute immediately.
-  2. When `self._torch_tokamax_op(x)` runs `_OpImplCallDescriptor.__call__`
-     outside of TorchDynamo's tracer, the live `op.configs[0]` would still hold
-     the stale `ConfigA` instead of `None` (and other attributes assigned in
-     `__call__`, such as `self.kv_layout`, would be stale or unset). Even if
-     `op.configs` started as `(None, None)` and `_OpImplCallDescriptor.__call__`
-     resolved the heuristics config `ConfigB` and set `op.configs = (ConfigB,
-     None)`, TorchDynamo would not know about that mutation.
-  3. After the compiled FX graph finishes running, TorchDynamo's epilogue
-     replays its buffered mutation `op.configs = (None, None)` onto the live
-     `op` instance, overwriting `(ConfigB, None)` back to `(None, None)`.
-
-  This can be removed once Arian's CL is in.
-
-  Args:
-    instance: The `TorchOp` instance whose pending TorchDynamo side effects
-      should be flushed.
-  """
-  symbolic_convert = getattr(
-      getattr(torch, "_dynamo", None), "symbolic_convert", None
-  )
-  tx = getattr(getattr(symbolic_convert, "tls", None), "current_tx", None)
-  if tx is None:
-    return
-  side_effects = tx.output.side_effects
-  var = side_effects.id_to_variable.get(id(instance))
-  if var is None or var not in side_effects.store_attr_mutations:
-    return
-  mutations = side_effects.store_attr_mutations[var]
-  for attr_name, attr_vt in list(mutations.items()):
-    setattr(instance, attr_name, _unwrap_dynamo_var(attr_vt))
-  mutations.pop("configs", None)
-  if var in side_effects.attr_mutation_kinds:
-    side_effects.attr_mutation_kinds[var].pop("configs", None)
-  side_effects.deferred_attr_mutations.pop((id(var), "configs"), None)
-  if not mutations:
-    del side_effects.store_attr_mutations[var]
-    side_effects.attr_mutation_kinds.pop(var, None)
-
-
 class _OpImplCallDescriptor:
   """Descriptor ensuring op_impl_call_config_setup runs before op_impl_call."""
 
@@ -194,18 +121,27 @@ class _OpImplCallDescriptor:
     wraps(self._fn)(self)
 
   def __call__(self, instance: Any, *args: Any, **kwargs: Any) -> Any:
-    _sync_dynamo_side_effects(instance)
-    # Read the forward or backward config set on `instance.configs` by
-    # `TorchOp.__call__`. If it is `None`, `op_impl_call_config_setup` computes
-    # and returns the default config, which is stored in `instance.configs` so
-    # `op_impl_call` can pass `self.configs[0]` (or `self.configs[1]`) to the
-    # JAX op.
-    config = instance.configs[1] if instance.is_vjp else instance.configs[0]
-    config = instance.op_impl_call_config_setup(*args, config=config, **kwargs)
-    if instance.is_vjp:
-      instance.configs = (instance.configs[0], config)
-    else:
-      instance.configs = (config, instance.configs[1])
+    # If `op_impl_call` accepts a `config` parameter, bind the call arguments
+    # to extract `config` (whether passed positionally, by keyword, or defaulted
+    # to `None`), resolve it via `op_impl_call_config_setup` (which computes a
+    # default config tuple when `config` is `None`), and pass the resolved
+    # `config` into `op_impl_call`. Otherwise, still run
+    # `op_impl_call_config_setup` before invoking `op_impl_call` without a
+    # `config` argument.
+    sig = inspect.signature(self._fn)
+    if "config" in sig.parameters:
+      bound = sig.bind_partial(instance, *args, **kwargs)
+      bound.apply_defaults()
+      config = bound.arguments.get("config")
+      kwargs_without_config = {k: v for k, v in kwargs.items() if k != "config"}
+      config = instance.op_impl_call_config_setup(
+          *args, config=config, **kwargs_without_config
+      )
+      bound.arguments["config"] = config
+      return self._fn(*bound.args, **bound.kwargs)
+
+    config = kwargs.pop("config", None)
+    instance.op_impl_call_config_setup(*args, config=config, **kwargs)
     return self._fn(instance, *args, **kwargs)
 
   def __get__(self, instance: Any, owner: Any = None) -> Callable[..., Any]:
@@ -293,10 +229,6 @@ class TorchOp(Generic[_Config]):
     # inheriting class must set this attribute in the constructor. If there is
     # no backward pass, this should be None.
     self.backward_op_torch: Any | None = None
-
-    # Configs for the forward and backward pass.
-    # This should be passed in from the __call__ function.
-    self.configs: tuple[Any, Any] = (None, None)
 
     # jax_op_name should be unique to the Torch Op. This is the name that will
     # be used in the custom op name in torch_tpu.jax_op.
@@ -436,8 +368,7 @@ class TorchOp(Generic[_Config]):
 
     # 3. Populate `abstract_argument_dict` for each `_fwd` parameter from:
     #    (a) explicitly passed arguments (converted to `jax.ShapeDtypeStruct`),
-    #    (b) attributes saved on `self` in `__call__` (e.g. `self.kv_layout`),
-    #    (c) `_fwd` parameter defaults (or `return_residuals = not self.is_vjp`
+    #    (b) `_fwd` parameter defaults (or `return_residuals = not self.is_vjp`
     #        when omitted).
     abstract_argument_dict: dict[str, Any] = {}
     for name, param in sig_params.items():
@@ -447,8 +378,6 @@ class TorchOp(Generic[_Config]):
         )
       elif name in backward_param_names:
         continue
-      elif hasattr(self, name):
-        abstract_argument_dict[name] = getattr(self, name)
       elif param.default is not inspect.Parameter.empty:
         abstract_argument_dict[name] = param.default
       elif name == "return_residuals":
@@ -532,13 +461,32 @@ class TorchOp(Generic[_Config]):
         " method."
     )
 
+  def deconstruct_config(
+      self, config: _Config | tuple[Any, ...] | list[Any] | None
+  ) -> Any:
+    """Deconstructs a Config object into jax_op-compatible primitive/tuple types."""
+    if config is None:
+      return None
+    if isinstance(config, (tuple, list)):
+      return tuple(config)
+    return dataclasses.astuple(config)  # type: ignore[arg-type]
+
+  def reconstruct_config(self, *config_parts: Any) -> _Config:
+    """Reconstructs a Config object from its deconstructed representation."""
+    assert self.op_impl_jax is not None, "Forward class not set."
+    config = config_parts[0]
+    assert config is not None, "Config not set."
+    return self.op_impl_jax.config_cls(*config)
+
   def op_impl_call_config_setup(
       self, *args: Any, config: Any = None, **kwargs: Any
   ) -> Any:
     """Sets up the config for the JAX Tokamax op."""
     if config is None:
-      config = self.get_bound_args(*args, **kwargs).get_config(
-          check_autotuning_cache=False,
+      config = dataclasses.astuple(
+          self.get_bound_args(*args, **kwargs).get_config(
+              check_autotuning_cache=False,
+          )
       )
     return config
 

@@ -211,17 +211,29 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         from_autotuning_cache=False,
     )
 
-    op_pallas(
+    out, kv = op_pallas(
         queries=queries,
         keys=keys,
         values=values,
-        kv_cache=kv_cache,
+        kv_cache=kv_cache.clone(),
         kv_lens=kv_lens,
         page_indices=page_indices,
         cu_q_lens=cu_q_lens,
         distribution=distribution,
     )
-    self.assertEqual(op_pallas.configs[0], expected_config)
+    expected_out, expected_kv = op_pallas(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache.clone(),
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        config=expected_config,
+    )
+    torch.testing.assert_close(out, expected_out)
+    torch.testing.assert_close(kv, expected_kv)
 
   def test_torch_compile_call_without_config_uses_heuristics_config(self):
     device = "tpu"
@@ -301,17 +313,29 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
           distribution=distribution,
       )
 
-    compiled_fn(
+    out, kv = compiled_fn(
         queries,
         keys,
         values,
-        kv_cache,
+        kv_cache.clone(),
         kv_lens,
         page_indices,
         cu_q_lens,
         distribution,
     )
-    self.assertEqual(op_pallas.configs[0], expected_config)
+    expected_out, expected_kv = op_pallas(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache.clone(),
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        config=expected_config,
+    )
+    torch.testing.assert_close(out, expected_out)
+    torch.testing.assert_close(kv, expected_kv)
 
 
 if __name__ == "__main__":

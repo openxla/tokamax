@@ -124,9 +124,9 @@ def annotate(ty: Any) -> Any:
   if origin is Annotated:
     return Annotated[annotate(ty.__origin__), *ty.__metadata__]  # pyrefly: ignore[invalid-annotation]
   if origin is Union or isinstance(ty, types.UnionType):
-    return Union[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[invalid-annotation, not-a-type]
+    return Union[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[invalid-annotation]
   if origin is tuple:
-    return tuple[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[invalid-annotation, not-a-type]
+    return tuple[tuple(map(annotate, typing.get_args(ty)))]  # pyrefly: ignore[invalid-annotation]
   if origin in (type, Callable):
     return pydantic.ImportString[ty]
   if origin is Mapping:

@@ -169,7 +169,7 @@ class SmemArrayOfStructs(SmemWrapper):
     @classmethod
     def create_shape_dtype(  # pyrefly: ignore[bad-override]
         cls, shape, struct_cls, struct_size
-    ):  # pytype: disable=bad-override
+    ):
         assert struct_size == struct_cls.num_fields()
         return cls(
             data=jax.ShapeDtypeStruct((np.prod(shape) * struct_size,), jnp.int32),
@@ -358,7 +358,7 @@ def _write_schedule_to_hbm(
     """Writes `num_steps` of metadata from `schedule_smem` to `schedule_hbm` at `hbm_offset`."""
     hbm_offset_aligned = pl.multiple_of(
         hbm_offset, 128  # pyrefly: ignore[bad-argument-type]
-    )  # pytype: disable=bad-argument-type
+    )
     flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
     flat_smem = jax.tree_util.tree_leaves(schedule_smem)
     dma_list = []
@@ -808,7 +808,7 @@ class BaseMetadataComputer:
         )
         start_seq_idx, end_seq_idx = self.cfgs.mode.get_range(
             distribution_ref  # pyrefly: ignore[bad-argument-type]
-        )  # pytype: disable=bad-argument-type
+        )
         init_carry = LoopCarry(0, 0)
         return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop_fn, init_carry)
 

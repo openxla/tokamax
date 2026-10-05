@@ -30,7 +30,7 @@ try:
 
   _CUDNN_AVAILABLE = True
 except ImportError:
-  cutedsl = None  # pyrefly: ignore[assignment]
+  cutedsl = None
   _CUDNN_AVAILABLE = False
 
 

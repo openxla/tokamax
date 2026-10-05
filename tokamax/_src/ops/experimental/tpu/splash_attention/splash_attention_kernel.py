@@ -1572,7 +1572,7 @@ def _flash_attention_dq_kernel(
         q_segment_ids_ref,
         kv_segment_ids_ref,
         attn_logits_soft_cap=attn_logits_soft_cap,
-        k_slice=pl.ds(0, bkv),  # pyrefly: ignore[bad-argument-type]
+        k_slice=pl.ds(0, bkv),
         k_offset=kv_index * bkv,
         bq=bq,
         mask_function=mask_function,
@@ -1792,7 +1792,7 @@ def _flash_attention_dkv_kernel(
         q_segment_ids_ref,
         kv_segment_ids_ref,
         attn_logits_soft_cap=attn_logits_soft_cap,
-        k_slice=slice_k,  # pyrefly: ignore[bad-argument-type]
+        k_slice=slice_k,
         k_offset=kv_index * bkv + i * bkv_compute,
         bq=bq,
         k_in_lanes=False,

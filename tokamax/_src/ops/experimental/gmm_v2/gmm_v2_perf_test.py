@@ -221,7 +221,7 @@ class GmmPerfTest(parameterized.TestCase):
     group_sizes = jnp.full((num_groups,), m // num_groups, jnp.int32)
 
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, weight_dtype, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
+        rhs, weight_dtype, axis=1, block_size=block_size
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 

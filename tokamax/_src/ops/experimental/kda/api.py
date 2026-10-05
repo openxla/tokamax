@@ -32,7 +32,7 @@ IMPLEMENTATIONS = dict(
 )
 
 try:
-  from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+  from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   IMPLEMENTATIONS["mosaic_tpu"] = (
       pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention()
