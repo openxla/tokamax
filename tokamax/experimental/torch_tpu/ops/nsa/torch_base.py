@@ -40,9 +40,13 @@ class _NativeSparseAttention:
     self._torch_tokamax_op = None
     try:
       from torch_tpu._internal import pallas
-      self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
-    except Exception:
-      pass
+    except ImportError:
+      pallas = None
+    else:
+      try:
+        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+      except Exception:
+        self._torch_tokamax_op = None
 
   def op_impl_call(
       self,
@@ -87,10 +91,11 @@ class _NativeSparseAttention:
       cmp_block_size: int = _CMP_BLOCK_SIZE,
       scale: Optional[float] = None,
   ) -> torch.Tensor:
-    b, t, h, d = q.shape
-    if t % chunk_size != 0:
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    del batch_size, num_heads, head_dim
+    if seq_len % chunk_size != 0:
       raise ValueError(
-          f"Sequence length ({t}) must be divisible by chunk_size ({chunk_size})"
+          f"Sequence length ({seq_len}) must be divisible by chunk_size ({chunk_size})"
       )
 
     if g_cmp is None:
@@ -156,58 +161,62 @@ class _NativeSparseAttention:
       scale: Optional[float] = None,
   ) -> torch.Tensor:
     """Pure PyTorch fallback evaluating the three NSA branches."""
-    b, h, t, d = q.shape
-    scale = scale or (d ** -0.5)
+    batch_size, num_heads, seq_len, head_dim = q.shape
+    scale = scale or (head_dim ** -0.5)
 
     # 1. Coarse compression branch
-    nc = t // cmp_block_size
-    k_cmp = k.view(b, h, nc, cmp_block_size, d).mean(dim=3)
-    v_cmp = v.view(b, h, nc, cmp_block_size, d).mean(dim=3)
+    num_cmp_blocks = seq_len // cmp_block_size
+    k_cmp = k.view(batch_size, num_heads, num_cmp_blocks, cmp_block_size, head_dim).mean(dim=3)
+    v_cmp = v.view(batch_size, num_heads, num_cmp_blocks, cmp_block_size, head_dim).mean(dim=3)
     scores_cmp = torch.einsum("bhtd,bhcd->bhtc", q, k_cmp) * scale
-    q_pos = torch.arange(t, device=q.device).unsqueeze(1)
-    c_pos = (torch.arange(nc, device=q.device) * cmp_block_size).unsqueeze(0)
+    q_pos = torch.arange(seq_len, device=q.device).unsqueeze(1)
+    c_pos = (torch.arange(num_cmp_blocks, device=q.device) * cmp_block_size).unsqueeze(0)
     mask_cmp = c_pos < q_pos
     scores_cmp = torch.where(mask_cmp.unsqueeze(0).unsqueeze(0), scores_cmp, -1e9)
     w_cmp = torch.softmax(scores_cmp, dim=-1)
     o_cmp = torch.einsum("bhtc,bhcd->bhtd", w_cmp, v_cmp)
 
     # 2. Fine-grained selection branch
-    nb = t // chunk_size
-    k_eff = min(topk, nb)
-    bk_sub = (k_eff + 1) * chunk_size
-    q_b = q.view(b, h, nb, chunk_size, d)
-    k_b = k.view(b, h, nb, chunk_size, d)
-    v_b = v.view(b, h, nb, chunk_size, d)
+    num_blocks = seq_len // chunk_size
+    effective_topk = min(topk, num_blocks)
+    block_k_sub = (effective_topk + 1) * chunk_size
+    q_b = q.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
+    k_b = k.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
+    v_b = v.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
     q_mean = q_b.mean(dim=3)
     k_mean = k_b.mean(dim=3)
     routing = torch.einsum("bhqd,bhnd->bhqn", q_mean, k_mean) * scale
-    q_idx = torch.arange(nb, device=q.device).unsqueeze(1)
-    k_idx = torch.arange(nb, device=q.device).unsqueeze(0)
+    q_idx = torch.arange(num_blocks, device=q.device).unsqueeze(1)
+    k_idx = torch.arange(num_blocks, device=q.device).unsqueeze(0)
     routing = torch.where((k_idx < q_idx).unsqueeze(0).unsqueeze(0), routing, -float("inf"))
-    topk_idx = torch.topk(routing, k_eff, dim=-1).indices
+    topk_idx = torch.topk(routing, effective_topk, dim=-1).indices
 
     causal_diag = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool))
     slc_outs = []
-    for i in range(nb):
-      q_i = q_b[:, :, i]
-      k_diag = k_b[:, :, i:i+1]
-      v_diag = v_b[:, :, i:i+1]
+    for block_idx in range(num_blocks):
+      q_i = q_b[:, :, block_idx]
+      k_diag = k_b[:, :, block_idx:block_idx+1]
+      v_diag = v_b[:, :, block_idx:block_idx+1]
 
-      if k_eff > 0:
-        slot_idx = topk_idx[:, :, i, :][:, :, :, None, None]
-        k_hist = torch.gather(k_b, 2, slot_idx.expand(b, h, k_eff, chunk_size, d))
-        v_hist = torch.gather(v_b, 2, slot_idx.expand(b, h, k_eff, chunk_size, d))
-        k_sub = torch.cat([k_diag, k_hist], dim=2).view(b, h, bk_sub, d)
-        v_sub = torch.cat([v_diag, v_hist], dim=2).view(b, h, bk_sub, d)
+      if effective_topk > 0:
+        slot_idx = topk_idx[:, :, block_idx, :][:, :, :, None, None]
+        k_hist = torch.gather(
+            k_b, 2, slot_idx.expand(batch_size, num_heads, effective_topk, chunk_size, head_dim)
+        )
+        v_hist = torch.gather(
+            v_b, 2, slot_idx.expand(batch_size, num_heads, effective_topk, chunk_size, head_dim)
+        )
+        k_sub = torch.cat([k_diag, k_hist], dim=2).view(batch_size, num_heads, block_k_sub, head_dim)
+        v_sub = torch.cat([v_diag, v_hist], dim=2).view(batch_size, num_heads, block_k_sub, head_dim)
 
-        ranks = torch.arange(k_eff, device=q.device)
-        valid_hist = (ranks < i).repeat_interleave(chunk_size).view(1, 1, 1, -1).expand(b, h, chunk_size, -1)
-        mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(b, h, -1, -1)
+        ranks = torch.arange(effective_topk, device=q.device)
+        valid_hist = (ranks < block_idx).repeat_interleave(chunk_size).view(1, 1, 1, -1).expand(batch_size, num_heads, chunk_size, -1)
+        mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(batch_size, num_heads, -1, -1)
         mask_sub = torch.cat([mask_diag, valid_hist], dim=-1)
       else:
-        k_sub = k_diag.view(b, h, chunk_size, d)
-        v_sub = v_diag.view(b, h, chunk_size, d)
-        mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(b, h, -1, -1)
+        k_sub = k_diag.view(batch_size, num_heads, chunk_size, head_dim)
+        v_sub = v_diag.view(batch_size, num_heads, chunk_size, head_dim)
+        mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(batch_size, num_heads, -1, -1)
 
       scores = torch.matmul(q_i, k_sub.transpose(-1, -2)) * scale
       scores = torch.where(mask_sub, scores, -1e9)
@@ -217,7 +226,7 @@ class _NativeSparseAttention:
 
     # 3. Sliding window branch
     scores_swa = torch.einsum("bhtd,bhsd->bhts", q, k) * scale
-    s_pos = torch.arange(t, device=q.device).unsqueeze(0)
+    s_pos = torch.arange(seq_len, device=q.device).unsqueeze(0)
     mask_swa = (s_pos <= q_pos) & (s_pos >= q_pos - window)
     scores_swa = torch.where(mask_swa.unsqueeze(0).unsqueeze(0), scores_swa, -1e9)
     w_swa = torch.softmax(scores_swa, dim=-1)

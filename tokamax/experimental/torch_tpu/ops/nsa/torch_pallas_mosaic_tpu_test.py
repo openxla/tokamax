@@ -27,16 +27,16 @@ class NSAPallasKernelTest(unittest.TestCase):
 
   def test_forward_shape_and_parity(self):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    b, seq_len, nheads, head_dim = 2, 128, 4, 16
+    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
     chunk_size, topk, window, cmp_size = 64, 2, 32, 16
 
     torch.manual_seed(42)
-    q = torch.randn(b, seq_len, nheads, head_dim, device=device, dtype=torch.float32)
-    k = torch.randn(b, seq_len, nheads, head_dim, device=device, dtype=torch.float32)
-    v = torch.randn(b, seq_len, nheads, head_dim, device=device, dtype=torch.float32)
-    gc = torch.sigmoid(torch.randn(b, seq_len, nheads, head_dim, device=device))
-    gs = torch.sigmoid(torch.randn(b, seq_len, nheads, head_dim, device=device))
-    gw = torch.sigmoid(torch.randn(b, seq_len, nheads, head_dim, device=device))
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
+    k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
+    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
+    gc = torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))
+    gs = torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))
+    gw = torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))
 
     actual = nsa_pallas(
         q,
@@ -64,7 +64,7 @@ class NSAPallasKernelTest(unittest.TestCase):
         scale=None,
     ).transpose(1, 2)
 
-    self.assertEqual(actual.shape, (b, seq_len, nheads, head_dim))
+    self.assertEqual(actual.shape, (batch_size, seq_len, num_heads, head_dim))
     torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3)
     logging.info("NSA forward shape and parity test passed.")
 
@@ -79,16 +79,16 @@ class NSAPallasKernelTest(unittest.TestCase):
 
   def test_backward_autograd(self):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    b, seq_len, nheads, head_dim = 2, 64, 4, 16
+    batch_size, seq_len, num_heads, head_dim = 2, 64, 4, 16
     chunk_size, topk, window, cmp_size = 64, 1, 32, 16
 
     torch.manual_seed(42)
-    q = torch.randn(b, seq_len, nheads, head_dim, device=device, requires_grad=True)
-    k = torch.randn(b, seq_len, nheads, head_dim, device=device, requires_grad=True)
-    v = torch.randn(b, seq_len, nheads, head_dim, device=device, requires_grad=True)
-    gc = torch.sigmoid(torch.randn(b, seq_len, nheads, head_dim, device=device)).detach().requires_grad_(True)
-    gs = torch.sigmoid(torch.randn(b, seq_len, nheads, head_dim, device=device)).detach().requires_grad_(True)
-    gw = torch.sigmoid(torch.randn(b, seq_len, nheads, head_dim, device=device)).detach().requires_grad_(True)
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
+    k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
+    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
+    gc = torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)).detach().requires_grad_(True)
+    gs = torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)).detach().requires_grad_(True)
+    gw = torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)).detach().requires_grad_(True)
 
     out = nsa_pallas(
         q,

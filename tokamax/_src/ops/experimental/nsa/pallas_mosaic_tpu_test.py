@@ -27,19 +27,19 @@ class PallasTpuNativeSparseAttentionTest(absltest.TestCase):
 
   def test_pallas_fwd_matches_reference(self):
     key = jax.random.PRNGKey(42)
-    b, h, t, d = 2, 4, 256, 16
+    batch_size, num_heads, seq_len, head_dim = 2, 4, 256, 16
     chunk_size = 64
     topk = 2
     window = 32
     cmp_size = 16
 
     k0, k1, k2, k3, k4, k5 = jax.random.split(key, 6)
-    q = jax.random.normal(k0, (b, h, t, d), dtype=jnp.float32)
-    k = jax.random.normal(k1, (b, h, t, d), dtype=jnp.float32)
-    v = jax.random.normal(k2, (b, h, t, d), dtype=jnp.float32)
-    gc = jax.nn.sigmoid(jax.random.normal(k3, (b, h, t, d), dtype=jnp.float32))
-    gs = jax.nn.sigmoid(jax.random.normal(k4, (b, h, t, d), dtype=jnp.float32))
-    gw = jax.nn.sigmoid(jax.random.normal(k5, (b, h, t, d), dtype=jnp.float32))
+    q = jax.random.normal(k0, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+    k = jax.random.normal(k1, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+    v = jax.random.normal(k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+    gc = jax.nn.sigmoid(jax.random.normal(k3, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32))
+    gs = jax.nn.sigmoid(jax.random.normal(k4, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32))
+    gw = jax.nn.sigmoid(jax.random.normal(k5, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32))
 
     op_instance = pallas_mosaic_tpu.PallasTpuNativeSparseAttention()
     config = pallas_mosaic_tpu.Config(
