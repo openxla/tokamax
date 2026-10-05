@@ -324,6 +324,78 @@ class PallasMosaicTpuTest(parameterized.TestCase):
     self.assertIsNotNone(loss_compiled)
     self.assertIsNotNone(lse_compiled)
 
+  def test_call_without_configs_uses_heuristics_config(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("This op only works on TPU.")
+
+    x, labels, w = self._generate_random_data(b_dim=2048, h_dim=512, v_dim=2048)
+    reduction = "mean"
+    op_lsce = (
+        torch_pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss
+    )
+    expected_fwd_config, expected_bwd_config = torch_utils.get_configs(
+        op_lsce,
+        x,
+        labels,
+        w,
+        reduction=reduction,
+        from_autotuning_cache=False,
+    )
+
+    loss, _ = op_lsce(
+        x,
+        labels,
+        w,
+        reduction=reduction,
+    )
+    self.assertEqual(op_lsce.configs[0], expected_fwd_config)
+
+    loss.backward()
+    assert op_lsce.backward_op_torch is not None
+    self.assertEqual(
+        op_lsce.backward_op_torch.configs[1], expected_bwd_config
+    )
+
+  def test_torch_compile_call_without_configs_uses_heuristics_config(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("This op only works on TPU.")
+
+    x, labels, w = self._generate_random_data(
+        b_dim=2048, h_dim=1024, v_dim=2048
+    )
+    reduction = "mean"
+    op_lsce = (
+        torch_pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss
+    )
+    expected_fwd_config, expected_bwd_config = torch_utils.get_configs(
+        op_lsce,
+        x,
+        labels,
+        w,
+        reduction=reduction,
+        from_autotuning_cache=False,
+    )
+
+    @torch.compile(fullgraph=True, dynamic=False)
+    def compiled_fn(
+        x: torch.Tensor, labels: torch.Tensor, w: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+      return op_lsce(
+          x,
+          labels,
+          w,
+          reduction=reduction,
+      )
+
+    loss, _ = compiled_fn(x, labels, w)
+    self.assertEqual(op_lsce.configs[0], expected_fwd_config)
+
+    loss.backward()
+    assert op_lsce.backward_op_torch is not None
+    self.assertEqual(
+        op_lsce.backward_op_torch.configs[1], expected_bwd_config
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

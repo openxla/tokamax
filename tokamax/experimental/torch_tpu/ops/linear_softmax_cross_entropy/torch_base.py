@@ -20,7 +20,6 @@ import jax
 from jax import numpy as jnp
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base as jax_base
 from tokamax.experimental.torch_tpu.ops import torch_op
-from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch
 from typing_extensions import override
 
@@ -32,7 +31,6 @@ class _LinearSoftmaxCrossEntropyLossVjp[Config](torch_op.TorchOp[None]):
     super().__init__()
     self.op_impl_jax = jax_base.LinearSoftmaxCrossEntropyLossVjp()
     self.jax_op_name = "base_linear_softmax_cross_entropy_loss_vjp"
-    self.backward_param_names = ("residuals", "out", "dout")
     self.is_vjp = True
 
   @override
@@ -148,16 +146,8 @@ class _LinearSoftmaxCrossEntropyLoss[Config](torch_op.TorchOp[Config]):
       configs: tuple[Any, Any] | None = None,
   ):
     if configs is None:
-      self.configs = torch_utils.get_configs(
-          self,
-          x,
-          labels,
-          w,
-          reduction=reduction,
-          from_autotuning_cache=False,
-      )
-    else:
-      self.configs = configs
+      configs = (None, None)
+    self.configs = configs
     assert (
         self._torch_tokamax_op is not None
     ), "Forward op not registered. This means that self.op_impl_jax is not set"

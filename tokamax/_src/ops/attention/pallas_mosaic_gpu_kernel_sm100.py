@@ -837,7 +837,7 @@ def flash_attention_kernel(
               l_i *= alpha
             m_i *= 1 / math.log2(math.e)
             for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
-              if jax.__version_info__ >= (0, 11, 2):
+              if jax.__version_info__ >= (0, 11, 3):
                 plgpu.store(
                     gmem_ref.at[hi, qs],
                     residual.astype(gmem_ref.dtype),

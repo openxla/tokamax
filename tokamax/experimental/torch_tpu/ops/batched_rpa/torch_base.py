@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from typing import Any, TypeVar, override
 import jax
 from tokamax._src.ops.experimental.batched_rpa import base as jax_base
-from tokamax._src.ops.experimental.batched_rpa import types as jax_types
+from tokamax._src.ops.experimental.batched_rpa.kernel import configs as jax_types
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 import torch_tpu
@@ -63,7 +63,7 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
       prefill_block_sizes: jax_types.BlockSizes | None = None,
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
-      skip_kv_update: bool = True,
+      skip_kv_update: bool = False,
       kv_layout: (
           jax_types.KVLayout | str
       ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,
@@ -132,14 +132,13 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
       sliding_window: int | None = None,
       soft_cap: float | None = None,
       mask_value: float | None = None,
-      out_dtype: Any = None,
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
       chunk_prefill_size: int | None = None,
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
-      skip_kv_update: bool = True,
+      skip_kv_update: bool = False,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
       return_lse: bool = False,
@@ -161,7 +160,7 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,
-        out_dtype=out_dtype,
+        out_dtype=self.out_dtype,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,

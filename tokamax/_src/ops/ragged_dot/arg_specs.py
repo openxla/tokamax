@@ -20,6 +20,10 @@ from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.ragged_dot import base
 
 
+QArray = base.QArray
+AsQArray = base.AsQArray
+
+
 SPEC_SHAPES = {
     'compute_bound': (
         8,
@@ -118,18 +122,17 @@ def _make_maxtext_gmm_v2_spec(
   """Make a GMM v2 spec based on MaxText shapes."""
   lhs = jax.ShapeDtypeStruct((m, k), jnp.bfloat16)
   if quantized:
-    rhs = jax.ShapeDtypeStruct((num_groups, k, n), jnp.float8_e4m3fn)
-    rhs_scale = jax.ShapeDtypeStruct(
-        (num_groups, k // block_size, 1, n), jnp.bfloat16
-    )
     args = dict(
-        lhs=lhs,
-        rhs=rhs,
+        lhs=AsQArray(lhs, jnp.float8_e4m3fn),  # pyrefly: ignore[bad-argument-type]
+        rhs=QArray(
+            qvalue=jax.ShapeDtypeStruct((num_groups, k, n), jnp.float8_e4m3fn),  # pyrefly: ignore[bad-argument-type]
+            scale=jax.ShapeDtypeStruct(  # pyrefly: ignore[bad-argument-type]
+                (num_groups, k // block_size, n), jnp.bfloat16
+            ),
+        ),
         group_sizes=base.GroupSizes(
             jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), m
         ),
-        rhs_scale=rhs_scale,
-        maybe_quantize_lhs=True,
         preferred_element_type=jnp.bfloat16,
     )
   else:
@@ -165,19 +168,21 @@ def _make_ullm_gmm_v2_spec(
 ) -> arg_spec.ArgSpec:
   """Make a ULLM MoE GMM v2 spec."""
   num_q_blocks = k // block_size
-  lhs = jax.ShapeDtypeStruct((m, k), jnp.bfloat16)
-  rhs = jax.ShapeDtypeStruct((num_groups, k, n), weight_dtype)
-  rhs_scale = jax.ShapeDtypeStruct((num_groups, num_q_blocks, 1, n), jnp.bfloat16)
   group_sizes = base.GroupSizes(
       jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
       tuple([m // num_groups] * num_groups),
   )
   args = dict(
-      lhs=lhs,
-      rhs=rhs,
+      lhs=AsQArray(
+          jax.ShapeDtypeStruct((m, k), jnp.bfloat16), jnp.float8_e4m3fn  # pyrefly: ignore[bad-argument-type]
+      ),
+      rhs=QArray(
+          qvalue=jax.ShapeDtypeStruct((num_groups, k, n), weight_dtype),  # pyrefly: ignore[bad-argument-type]
+          scale=jax.ShapeDtypeStruct(  # pyrefly: ignore[bad-argument-type]
+              (num_groups, num_q_blocks, n), jnp.bfloat16
+          ),
+      ),
       group_sizes=group_sizes,
-      rhs_scale=rhs_scale,
-      maybe_quantize_lhs=True,
       zero_initialize=False,
       fuse_gateup_activation=fuse_act,
       preferred_element_type=jnp.bfloat16,

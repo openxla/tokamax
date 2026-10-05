@@ -34,12 +34,14 @@ from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.attention import base as attention_base
-from tokamax._src.ops.experimental.batched_rpa import api as batched_rpa_api
-from tokamax._src.ops.experimental.batched_rpa import base as batched_rpa_base
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import api as causal_conv1d_gated_delta_rule_api
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import base as causal_conv1d_gated_delta_rule_base
 from tokamax._src.ops.experimental.kda import api as kda_api
 from tokamax._src.ops.experimental.kda import base as kda_base
 from tokamax._src.ops.experimental.mla import api as mla_api
 from tokamax._src.ops.experimental.mla import base as mla_base
+from tokamax._src.ops.experimental.tpu.csa_gather import api as csa_gather_api
+from tokamax._src.ops.experimental.tpu.csa_gather import base as csa_gather_base
 from tokamax._src.ops.experimental.tpu.splash_attention import api as splash_attention_api
 from tokamax._src.ops.experimental.tpu.splash_attention import base as splash_attention_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
@@ -75,7 +77,7 @@ def _serialize_bound_args_autotuning_data(
   del ba_data["op"]["vjp"]
   config_cls = ba.op.config_cls
   data_adapter = pydantic_lib.get_adapter(autotuner.AutotuningData[config_cls])
-  data = data_adapter.dump_python(data, info, round_trip=True)
+  data = data_adapter.dump_python(data, info, round_trip=True)  # pyrefly: ignore[bad-argument-type]
   return ba_data, data
 
 
@@ -270,7 +272,6 @@ _API_IMPLEMENTATIONS: Final[
     ragged_gather_reduce_base.RaggedGatherReduce: (
         ragged_gather_reduce_api.IMPLEMENTATIONS
     ),
-    batched_rpa_base.BatchedRpa: batched_rpa_api.IMPLEMENTATIONS,
     kda_base.KimiDeltaAttention: kda_api.IMPLEMENTATIONS,
     linear_softmax_cross_entropy_loss_base.LinearSoftmaxCrossEntropyLoss: (
         linear_softmax_cross_entropy_loss_api.IMPLEMENTATIONS
@@ -279,6 +280,10 @@ _API_IMPLEMENTATIONS: Final[
         triangle_multiplication_api.IMPLEMENTATIONS
     ),
     splash_attention_base.SplashAttention: splash_attention_api.IMPLEMENTATIONS,
+    causal_conv1d_gated_delta_rule_base.CausalConv1dGatedDeltaRule: (
+        causal_conv1d_gated_delta_rule_api.IMPLEMENTATIONS
+    ),
+    csa_gather_base.CsaGather: csa_gather_api.IMPLEMENTATIONS,
 })
 
 

@@ -82,30 +82,34 @@ class TokamaxXlaKernelInfo(KernelInfoBase):
   """Tokamax XLA kernel information."""
 
 
-def get_json_from_name(op_name: str) -> str | None:
-  """Returns the JSON data from the op name."""
+def get_jsons_from_name(op_name: str) -> list[str]:
+  """Returns all JSON data payloads from the op name in order."""
   marker = TOKAMAX_NAME + ':'
-  idx = op_name.find(marker)
-  # For XLA kernels, sometimes the op info is not present, eg.
-  # jit(tokamax_norm_and_glu)/convert_element_type.
-  if idx == -1:
-    return None
-  json_data = op_name[idx + len(marker) :]
-  count = 0
-  # A VJP op may have multiple op specs in the HLO. Find the position of the
-  # end brace for the first op spec. We only return the first op (the VJP), as
-  # the forward op will be present in the HLO elsewhere.
-  for i, c in enumerate(json_data):
-    if c == '{':
-      count += 1
-    elif c == '}':
-      count -= 1
-      if count < 1:
-        # This might mean that we have more end braces than opening braces,
-        # but in that case the `validate_json` call below will fail.
-        json_data = json_data[: i + 1]
-        break
-  return json_data
+  results = []
+  pos = 0
+  while (idx := op_name.find(marker, pos)) != -1:
+    json_data = op_name[idx + len(marker) :]
+    count = 0
+    matched = False
+    for i, c in enumerate(json_data):
+      if c == '{':
+        count += 1
+      elif c == '}':
+        count -= 1
+        if count < 1:
+          results.append(json_data[: i + 1])
+          pos = idx + len(marker) + i + 1
+          matched = True
+          break
+    if not matched:
+      break
+  return results
+
+
+def get_json_from_name(op_name: str) -> str | None:
+  """Returns the first JSON data from the op name."""
+  jsons = get_jsons_from_name(op_name)
+  return jsons[0] if jsons else None
 
 
 def ir_module_from_lowered(

@@ -45,6 +45,16 @@ CanonicalPrecision = precision_lib.CanonicalPrecision
 QArray = qwix.QArray
 
 
+def _mesh_axis_size(
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh, axis: Any
+) -> int:
+  """Returns the number of shards for a PartitionSpec entry on `mesh`."""
+  if axis is None:
+    return 1
+  axis_names = axis if isinstance(axis, tuple) else (axis,)
+  return math.prod(mesh.shape[name] for name in axis_names)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class Mask:
@@ -413,18 +423,18 @@ class DotProductAttention[C, K: Hashable](
       k_spec = k_sharding.spec
       k_axes = tuple(k_spec) + (None,) * (k.ndim - len(k_spec))
       *k_batch_axes, seq_k_axis, k_heads_axis, k_head_dim_axis = k_axes
-      if seq_k_axis is not None and mesh.shape[seq_k_axis] != 1:
+      if _mesh_axis_size(mesh, seq_k_axis) != 1:
         raise ValueError("Sharding along seq_k_axis unsupported.")
-      if k_head_dim_axis is not None and mesh.shape[k_head_dim_axis] != 1:
+      if _mesh_axis_size(mesh, k_head_dim_axis) != 1:
         raise ValueError("Sharding along head_dim unsupported.")
 
-    if head_dim_axis is not None and mesh.shape[head_dim_axis] != 1:
+    if _mesh_axis_size(mesh, head_dim_axis) != 1:
       raise ValueError("Sharding along head_dim unsupported.")
 
     # Ensure that `q_indices` is specified when sharding the q-sequence with
     # causal masking enabled.
-    if seq_q_axis is not None and mesh.shape[seq_q_axis] != 1:
-      if mask.is_causal and q_indices is None:
+    if _mesh_axis_size(mesh, seq_q_axis) != 1:
+      if mask.is_causal and q_indices is None:  # pyrefly: ignore[missing-attribute]
         q_indices = jnp.arange(q.shape[-3])
 
     qkv_axes = lambda x, axes: jax.tree.map(lambda _: axes, x)
@@ -435,13 +445,13 @@ class DotProductAttention[C, K: Hashable](
         qkv_axes(k, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),
         qkv_axes(v, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),
         [*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # bias
-        dataclasses.replace(
+        dataclasses.replace(  # pyrefly: ignore[bad-specialization]
             mask,
-            bool_mask=[*batch_axes, heads_axis, seq_q_axis, seq_k_axis],
-            q_start=[*batch_axes, heads_axis, seq_k_axis],
-            q_end=[*batch_axes, heads_axis, seq_k_axis],
-            k_start=[*batch_axes, k_heads_axis, seq_q_axis],
-            k_end=[*batch_axes, k_heads_axis, seq_q_axis],
+            bool_mask=[*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
+            q_start=[*batch_axes, heads_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
+            q_end=[*batch_axes, heads_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
+            k_start=[*batch_axes, k_heads_axis, seq_q_axis],  # pyrefly: ignore[bad-argument-type]
+            k_end=[*batch_axes, k_heads_axis, seq_q_axis],  # pyrefly: ignore[bad-argument-type]
         ),
         [*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # dropout_mask
         PagingInfo([*batch_axes], [*batch_axes, None], [*k_batch_axes]),  # pyrefly: ignore[bad-argument-type]

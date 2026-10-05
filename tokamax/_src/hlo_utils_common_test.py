@@ -22,11 +22,39 @@ from tokamax._src import hlo_utils_common
 class HloUtilsCommonTest(absltest.TestCase):
 
   def test_kernel_name_consistency(self):
+    if hasattr(pallas_triton, 'CUSTOM_CALL_TARGET_NAME'):
+      self.assertEqual(
+          hlo_utils_common.PALLAS_TRITON_KEY,
+          pallas_triton.CUSTOM_CALL_TARGET_NAME,
+      )
+
+  def test_get_json_from_name(self):
+    self.assertIsNone(hlo_utils_common.get_json_from_name('no_marker_here'))
+    payload = 'tokamax:{"op": "foo"}'
     self.assertEqual(
-        hlo_utils_common.PALLAS_TRITON_KEY,
-        pallas_triton.CUSTOM_CALL_TARGET_NAME,
+        hlo_utils_common.get_json_from_name(payload), '{"op": "foo"}'
     )
 
+  def test_get_jsons_from_name_stacked_payloads(self):
+    stacked = (
+        'tokamax:{"op": "outer", "nested": {"a": 1}}/'
+        'tokamax:{"op": "inner", "val": [2, 3]}'
+    )
+    self.assertEqual(
+        hlo_utils_common.get_jsons_from_name(stacked),
+        [
+            '{"op": "outer", "nested": {"a": 1}}',
+            '{"op": "inner", "val": [2, 3]}',
+        ],
+    )
+    self.assertEqual(
+        hlo_utils_common.get_json_from_name(stacked),
+        '{"op": "outer", "nested": {"a": 1}}',
+    )
 
-if __name__ == "__main__":
+  def test_get_jsons_from_name_empty(self):
+    self.assertEqual(hlo_utils_common.get_jsons_from_name('no_marker'), [])
+
+
+if __name__ == '__main__':
   absltest.main()
