@@ -31,9 +31,9 @@ from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu_kernel
 
 @pydantic.dataclasses.dataclass(frozen=True)
 class Config:
-  num_kv_pages_per_block: Annotated[int, pydantic.Field(multiple_of=2, gt=0)]
+  num_kv_pages_per_block: Annotated[int, pydantic.Field(multiple_of=1, gt=0)]
   num_queries_per_block: Annotated[int, pydantic.Field(multiple_of=1, gt=0)]
-  vmem_limit_bytes: Annotated[int, pydantic.Field(multiple_of=16, gt=0)]
+  vmem_limit_bytes: Annotated[int, pydantic.Field(multiple_of=1, gt=0)]
   chunk_prefill_size: Annotated[int, pydantic.Field(multiple_of=256, ge=0)]
   decode_batch_size: Annotated[int, pydantic.Field(multiple_of=1, gt=0)]
 
@@ -114,7 +114,7 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
     return Config(
         num_kv_pages_per_block=16,
         num_queries_per_block=1,
-        vmem_limit_bytes=64 * 1024 * 1024,
+        vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
         chunk_prefill_size=0,
         decode_batch_size=1,
     )
@@ -122,17 +122,22 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
   @override
   def _get_autotuning_configs(self, ba) -> set[Config]:
     configs = set()
-    for decode_batch_size, kv, q, vmem_size in itertools.product(
+    vmem_capacity = pltpu.get_tpu_info().vmem_capacity_bytes
+    vmem_limits = [
+        int(vmem_capacity * fraction) // 16 * 16
+        for fraction in (0.5, 0.8, 1.0)
+    ]
+    for decode_batch_size, kv, q, vmem_limit_bytes in itertools.product(
         [8],
         [1, 4, 8, 16, 32, 48, 64],
         [1],
-        [48, 56, 64],
+        vmem_limits,
     ):
       configs.add(
           Config(
               num_kv_pages_per_block=kv,
               num_queries_per_block=q,
-              vmem_limit_bytes=vmem_size * 1024 * 1024,
+              vmem_limit_bytes=vmem_limit_bytes,
               decode_batch_size=decode_batch_size,
               chunk_prefill_size=0,
           )
@@ -141,4 +146,4 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
 
   @override
   def supported_on(self, device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 7

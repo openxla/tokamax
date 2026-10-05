@@ -23,7 +23,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src import config
 
 # Util.
 
@@ -185,6 +184,11 @@ class WeightsRef(RhsRef):
   def get_scale(self, replicate_size: int | None = None) -> jax.Array:
     assert self.scale is not None
     if replicate_size is not None:
+      if jax.__version_info__ < (0, 11, 0):
+        scale = self.scale[...]
+        return jnp.broadcast_to(
+            scale, (scale.shape[0], replicate_size, scale.shape[2])
+        )
       # Perform zero-stride load for efficient broadcasting across sublanes.
       return self.scale[:, pl.ds(0, replicate_size, 0), :]
     return self.scale[...]
@@ -614,6 +618,13 @@ def inner_kernel(
       if should_use_external_scale:
         lhs_scale = tiled_lhs_ref.get_scale().astype(acc_ref.dtype)
         lhs_scale_inv = 1.0 / lhs_scale
+      # With a k-invariant lhs scale, sub-block results accumulate directly
+      # into acc_n and the scale is applied once after the k loop.
+      ext_lhs_scale_const_k = (
+          should_use_external_scale
+          and lhs_scale is not None
+          and lhs_scale.shape[-1] == 1
+      )
 
       # Without n outer loop, result of quantized matmul becomes available only
       # at the last iteration of the loop. This means [tile_m, tile_n] value
@@ -666,8 +677,8 @@ def inner_kernel(
 
           block_len = end_k - start_k
           # Initialize to None rather than jnp.zeros to avoid emitting an extra
-          # VPU add instruction on the first sub-block in Pallas/Mosaic lowering.
-          block_acc = None
+          # VPU add instruction on the first sub-block in Pallas/Mosaic lowering
+          block_acc = acc_n if ext_lhs_scale_const_k else None
           for sub_k in range(0, block_len, step_k):  # pyrefly: ignore[bad-argument-type]
             sub_end_k = min(block_len, sub_k + step_k)  # pyrefly: ignore[unsupported-operation]
             sub_acc = jnp.matmul(
@@ -692,8 +703,14 @@ def inner_kernel(
             block_acc = sub_acc if block_acc is None else block_acc + sub_acc
 
           assert block_acc is not None
-          block_acc *= block_scale.astype(acc_ref.dtype)
-          acc_n += block_acc
+          if ext_lhs_scale_const_k:
+            acc_n = block_acc
+          else:
+            block_acc *= block_scale.astype(acc_ref.dtype)
+            acc_n += block_acc
+        if ext_lhs_scale_const_k:
+          assert lhs_scale is not None
+          acc_n *= lhs_scale
         acc_list.append(acc_n)
 
     acc = jnp.concatenate(acc_list, axis=1)
@@ -1033,22 +1050,13 @@ def kernel_main(
 
   # Partition output tiles across TCs in MegaCore mode over both parallel
   # dimensions.
-  # TODO: Revert temporary fallback to unblock vmap on older JAX.
-  # DO NOT EDIT THIS BLOCK: This path is a temporary fallback to unblock
-  # until Tokamax updates its JAX version.
-  core_axis_name = None if config.disable_multi_core_mode.value else "core"
-  dimension_semantics = (
-      None
-      if config.disable_multi_core_mode.value
-      else (pltpu.PARALLEL, pltpu.ARBITRARY, pltpu.ARBITRARY)
-  )
   pipeline_fn = pltpu.emit_pipeline(
       functools.partial(inner_kernel, cfgs=cfgs),
       grid=(num_n, num_gm, num_k),
       in_specs=(lhs_spec, rhs_spec),
       out_specs=out_spec,
-      core_axis_name=core_axis_name,
-      dimension_semantics=dimension_semantics,
+      core_axis_name="core",
+      dimension_semantics=(pltpu.PARALLEL, pltpu.ARBITRARY, pltpu.ARBITRARY),
   )
 
   # Bounded slice requires second last dim to be aligned to the sublane size.
@@ -1106,6 +1114,8 @@ def calculate_tiling(
     tile_n_limit //= fuse_act_factor
 
   def _is_tile_k_quant_block_compatible(tk: int) -> bool:
+    if rhs_cfgs.quant_block_size is None:
+      return True
     if (
         tk % rhs_cfgs.quant_block_size != 0  # pyrefly: ignore[unsupported-operation]
         and rhs_cfgs.quant_block_size % tk != 0  # pyrefly: ignore[unsupported-operation]
@@ -1166,11 +1176,14 @@ def calculate_tiling(
     num_n_tiles += 1
     tile_n = align_to(size_n_per_rhs, num_n_tiles * num_lanes) // num_n_tiles
 
-  # If decreasing tile_n is no longer possible, we decrease tile_k instead.
+  # If we overshot the floor, step back up to the limit.
   if tile_n < tile_n_limit:
     num_n_tiles -= 1
     tile_n = align_to(size_n_per_rhs, num_n_tiles * num_lanes) // num_n_tiles
 
+  # If memory is STILL exceeded after tile_n adjustment, we must decrease
+  # tile_k.
+  if _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes:
     # Decrease tile_k until total memory fits in vmem limit and tile_k is valid.
     while (
         _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes
@@ -1218,6 +1231,8 @@ def is_manually_cast_matmul_dtype_combo(
       # (lhs_dtype, rhs_dtype)
       (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.int4)),
       (jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.int4)),
+      (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float4_e2m1fn)),
+      (jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.float4_e2m1fn)),
       (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.bfloat16)),
       (jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.bfloat16)),
   }
@@ -1676,51 +1691,6 @@ def gmm_v2(
   lhs_in = LhsRef(value=lhs, scale=lhs_scale)
   rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
-  # TODO: Revert temporary fallback to unblock vmap on older JAX.
-  # DO NOT EDIT THIS BLOCK: This path is a temporary fallback to unblock
-  # until Tokamax updates its JAX version.
-  if config.disable_multi_core_mode.value:
-    lhs_scale_spec = None
-    if cfgs.lhs_cfgs.has_scale:
-      lhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-
-    rhs_scale_spec = rhs_bias_spec = None
-    if rhs_scale is not None:
-      rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-    if rhs_bias is not None:
-      rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-
-    return pl.pallas_call(
-        functools.partial(kernel_main, cfgs=cfgs),
-        out_shape=out_init,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=[
-                LhsRef(
-                    value=pl.BlockSpec(memory_space=pltpu.HBM),
-                    scale=lhs_scale_spec,
-                ),
-                WeightsRef(
-                    weight=pl.BlockSpec(memory_space=pltpu.HBM),
-                    scale=rhs_scale_spec,
-                    bias=rhs_bias_spec,
-                ),
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-            # pyrefly: ignore[bad-argument-type]
-            scratch_shapes=scratch_shapes,
-        ),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=vmem_limit_bytes,
-            disable_bounds_checks=True,
-        ),
-        name=get_scope_name(cfgs),
-        cost_estimate=get_cost_estimate(cfgs),
-        metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
-    )(group_sizes, group_offset, lhs_in, rhs_weights)[
-        :size_m, : cfgs.out_size_n
-    ]
-
   group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
 
@@ -1728,7 +1698,9 @@ def gmm_v2(
   return pl.kernel(
       functools.partial(kernel_main, cfgs=cfgs),
       out_type=out_init,
-      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      mesh=pltpu.create_tensorcore_mesh(axis_name="core")
+      if jax.__version_info__ < (0, 11, 0)
+      else pltpu.TensorCoreMesh(axis_name="core"),
       scratch_types=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=vmem_limit_bytes,

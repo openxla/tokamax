@@ -22,7 +22,6 @@ from absl import logging
 import jax
 import tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
-from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.linear_softmax_cross_entropy import torch_base
 import torch
 
@@ -125,17 +124,7 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       reduction: str,
       configs: tuple[Any, Any] | None = None,
   ):
-    if configs is None:
-      self.configs = torch_utils.get_configs(
-          self,
-          x,
-          labels,
-          w,
-          reduction=reduction,
-          from_autotuning_cache=False,
-      )
-    else:
-      self.configs = configs
+    self.configs = (None, None) if configs is None else configs
     assert (
         self._torch_tokamax_op is not None
     ), "Forward op not registered. Call register_ops first."

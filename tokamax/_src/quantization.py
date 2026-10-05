@@ -51,8 +51,7 @@ class AsQArray:
   calibration_method: str = "absmax"
 
   def __post_init__(self):
-    if self.channelwise_axes:
-      object.__setattr__(self, "channelwise_axes", tuple(self.channelwise_axes))
+    object.__setattr__(self, "channelwise_axes", tuple(self.channelwise_axes))
     if self.tiled_axes is not None:
       tiled_axes = immutabledict.immutabledict(self.tiled_axes)
       object.__setattr__(self, "tiled_axes", tiled_axes)
