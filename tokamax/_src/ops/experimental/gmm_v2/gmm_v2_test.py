@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import collections
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -21,7 +22,6 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src import config
 from tokamax._src import mosaic_tpu
 from tokamax._src import test_utils
 from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
@@ -236,9 +236,8 @@ class GmmTest(parameterized.TestCase):
 
   @parameterized.product(
       batch_size=[73, 117],
-      disable_multi_core_mode=[False, True],
   )
-  def test_gmm_unaligned_m(self, batch_size, disable_multi_core_mode):
+  def test_gmm_unaligned_m(self, batch_size):
     in_size = 512
     out_size = 512
     num_groups = 16
@@ -252,8 +251,7 @@ class GmmTest(parameterized.TestCase):
     group_sizes = get_group_sizes(batch_size, num_groups)
     expected = reference_gmm(lhs, rhs, group_sizes)
 
-    with config.disable_multi_core_mode(disable_multi_core_mode):
-      actual = gmm_v2.gmm_v2(lhs, rhs, group_sizes)
+    actual = gmm_v2.gmm_v2(lhs, rhs, group_sizes)
 
     self.assertEqual(actual.shape, (batch_size, out_size))
     assert_arrays_all_close(actual, expected)
@@ -1677,6 +1675,72 @@ class GmmTest(parameterized.TestCase):
     chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
 
 
+
+class GmmV2CalculateTilingTest(parameterized.TestCase):
+  """Tests for calculate_tiling edge cases regarding vmem floor limits."""
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="tile_n_floor_overshoot_memory_fits",
+          # tile_n shrinks to limit, but actually goes slightly below it due to
+          # alignment/math. The memory actually fits. We expect tile_n to step
+          # back up to the limit (or its aligned nearest above limit) and tile_k
+          # should not shrink because memory fits.
+          vmem_limit=3000000,
+          expected_tile_n_less_than_limit=False,
+      ),
+      dict(
+          testcase_name="tile_n_floor_overshoot_memory_exceeded",
+          # tile_n shrinks to limit, memory is still exceeded. tile_n steps back
+          # up and then tile_k shrinks to fit.
+          vmem_limit=1000000,
+          expected_tile_n_less_than_limit=False,
+      ),
+  )
+  @mock.patch("tokamax._src.ops.experimental.gmm_v2.gmm_v2.pltpu.get_tpu_info")
+  def test_calculate_tiling_edge_cases(
+      self, mock_get_tpu_info, vmem_limit, expected_tile_n_less_than_limit
+  ):
+    mock_tpu_info = mock.MagicMock()
+    mock_tpu_info.num_lanes = 128
+    mock_tpu_info.mxu_column_size = 128
+    mock_get_tpu_info.return_value = mock_tpu_info
+
+    dims = gmm_v2.Dimensions(
+        size_m=512,
+        size_k=4096,
+        size_n=4096,
+        size_group=1,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    lhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=None,
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+    )
+    rhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=None,
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+        is_transposed=False,
+    )
+
+    tiles = gmm_v2.calculate_tiling(
+        dims=dims,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        vmem_limit_bytes=vmem_limit,
+    )
+
+    tile_n_limit = mock_tpu_info.mxu_column_size * 2
+    if not expected_tile_n_less_than_limit:
+      self.assertGreaterEqual(tiles.tile_n, tile_n_limit)
+
 class GmmV2VmemStressTest(parameterized.TestCase):
   """AOT compilation and VMEM stress tests for GMM v2.
 
@@ -1755,18 +1819,15 @@ class GmmV2VmapTest(parameterized.TestCase):
   """Tests verifying jax.vmap compatibility for GMM and TGMM v2."""
 
   def setUp(self):
+    if jax.__version_info__ <= (0, 11, 2):
+      self.skipTest("vmap requires JAX > 0.11.2.")
     if jax.default_backend() != "tpu":
       self.skipTest("Only supported on TPUs.")
     if pltpu.get_tpu_info().generation < 5:
       self.skipTest("Only supported on TPU gen 5+.")
     super().setUp()
 
-  # TODO: Re-enable ("multi_core_mode", False) once JAX loop-based
-  # fallback for batched scalar prefetch lands in Pallas.
-  @parameterized.named_parameters(
-      ("single_core_fallback", True),
-  )
-  def test_gmm_vmap(self, disable_multi_core_mode: bool):
+  def test_gmm_vmap(self):
     # Tests jax.vmap on gmm_v2 with batched LHS and group_sizes.
     batch_size = 128
     in_size = 256
@@ -1790,9 +1851,8 @@ class GmmV2VmapTest(parameterized.TestCase):
     def gmm_fn(x, w, gs):
       return gmm_v2.gmm_v2(x, w, gs)
 
-    with config.disable_multi_core_mode(disable_multi_core_mode):
-      vmapped_fn = jax.jit(jax.vmap(gmm_fn, in_axes=(0, None, 0)))
-      actual = vmapped_fn(lhs, rhs, group_sizes)
+    vmapped_fn = jax.jit(jax.vmap(gmm_fn, in_axes=(0, None, 0)))
+    actual = vmapped_fn(lhs, rhs, group_sizes)
 
     # Verify numerical equivalence with batched reference.
     expected = jnp.stack([
@@ -1801,12 +1861,7 @@ class GmmV2VmapTest(parameterized.TestCase):
     ])
     assert_arrays_all_close(actual, expected)
 
-  # TODO: Re-enable ("multi_core_mode", False) once JAX loop-based
-  # fallback for batched scalar prefetch lands in Pallas.
-  @parameterized.named_parameters(
-      ("single_core_fallback", True),
-  )
-  def test_tgmm_vmap(self, disable_multi_core_mode: bool):
+  def test_tgmm_vmap(self):
     # Tests jax.vmap on tgmm_v2 with batched LHS, RHS, and group_sizes.
     batch_size = 128
     in_size = 256
@@ -1836,9 +1891,8 @@ class GmmV2VmapTest(parameterized.TestCase):
           preferred_element_type=jnp.bfloat16,
       )
 
-    with config.disable_multi_core_mode(disable_multi_core_mode):
-      vmapped_fn = jax.jit(jax.vmap(tgmm_fn, in_axes=(0, 0, 0)))
-      actual = vmapped_fn(lhs, rhs, group_sizes)
+    vmapped_fn = jax.jit(jax.vmap(tgmm_fn, in_axes=(0, 0, 0)))
+    actual = vmapped_fn(lhs, rhs, group_sizes)
 
     # Verify numerical equivalence with batched reference.
     expected = jnp.stack([

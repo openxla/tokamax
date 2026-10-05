@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 import dataclasses
 
 import jax
@@ -20,8 +19,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from tokamax._src.ops.experimental.batched_rpa.kernel import (configs,
-                                                                    schedule)
+from tokamax._src.ops.experimental.batched_rpa.kernel import configs, schedule
 
 
 @jax.tree_util.register_dataclass
@@ -85,7 +83,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
                 p_idx, dst_off, dma_valid = schedule_ref.get_dma_kv_cache(
-                    block_idx, b, i)
+                    block_idx, b, i
+                )
                 hbm_p_idx = page_indices_ref[p_idx]
                 sz = dma_valid * self.cfgs.serve.page_size
                 num_lanes = pltpu.get_tpu_info().num_lanes
@@ -94,10 +93,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
                 # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
                 pltpu.make_async_copy(
-                    kv_cache_hbm.at[hbm_p_idx, :, :, :,
-                                    pl.ds(0, sz)],
-                    vmem_dst_lane.at[b, :, :, :,
-                                     pl.ds(dst_off, sz)],
+                    kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
+                    vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, sz)],
                     sem,
                 ).start()
 
@@ -114,8 +111,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
                 pltpu.make_async_copy(
                     new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
-                    vmem_dst_lane.at[b, :, :, :,
-                                     pl.ds(dst_vmem_off, sz)],
+                    vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
                     sem,
                 ).start()
 
@@ -138,15 +134,12 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 src_vmem_off = dma_entry.wb_vmem[...]
                 dma_valid = dma_entry.wb_val
                 hbm_p_idx = page_indices_ref[dst_hbm_p]
-                sz = jnp.where(do_writeback,
-                               dma_valid * self.cfgs.serve.page_size, 0)
+                sz = jnp.where(do_writeback, dma_valid * self.cfgs.serve.page_size, 0)
                 src_vmem_off = pl.multiple_of(src_vmem_off, 128)
                 sz = pl.multiple_of(sz, 128)
                 pltpu.make_async_copy(
-                    vmem_src_lane.at[b, :, :, :,
-                                     pl.ds(src_vmem_off, sz)],
-                    kv_out_ref.at[hbm_p_idx, :, :, :,
-                                  pl.ds(0, sz)],
+                    vmem_src_lane.at[b, :, :, :, pl.ds(src_vmem_off, sz)],
+                    kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
                     sem,
                 ).start()
 
@@ -238,7 +231,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         sem = self.sem_recvs.at[slot]
         block_idx = jnp.maximum(grid_indices[0], 0)
 
-        vmem_dst = self.window_ref.at[slot, :, :, :self.cfgs.kv_hbm_stride]
+        vmem_dst = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
         # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
         # kv_cache_hbm_flat: (num_pages * num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
         kv_cache_hbm_flat = kv_cache_hbm.reshape(-1, *kv_cache_hbm.shape[2:])
@@ -248,8 +241,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
 
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
-                p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(
-                    block_idx, b, i)
+                p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
                 src_off = page_indices_ref[p_idx] * self.cfgs.serve.page_size
                 dma_list_cache.append((src_off, dst_off, sz, b))
 
@@ -290,7 +282,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         block_idx = grid_indices[0]
 
         kv_out_ref_flat = kv_out_ref.reshape(-1, *kv_out_ref.shape[2:])
-        vmem_src = self.window_ref.at[slot, :, :, :self.cfgs.kv_hbm_stride]
+        vmem_src = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
 
         for b in range(self.cfgs.batch_size):
             do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
@@ -301,8 +293,9 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                 new_sz = dma_entry.wb_val
                 global_p_idx = encoded_dst_hbm_off >> self.cfgs.serve.page_size_log2
                 p_off = encoded_dst_hbm_off & self.cfgs.serve.page_size_mask
-                dst_hbm_off = (page_indices_ref[global_p_idx] <<
-                               self.cfgs.serve.page_size_log2) | p_off
+                dst_hbm_off = (
+                    page_indices_ref[global_p_idx] << self.cfgs.serve.page_size_log2
+                ) | p_off
                 sz = jnp.where(do_writeback, new_sz, 0)
                 pltpu.make_async_copy(
                     vmem_src.at[b, pl.ds(src_vmem_off, sz)],
@@ -439,6 +432,7 @@ class BatchingORef(pltpu.BufferedRef):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class BatchingLSERef(pltpu.BufferedRef):
     """Handles writing LSE values to HBM, overlapped with compute via double buffering."""
+
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
@@ -485,8 +479,8 @@ class BatchingLSERef(pltpu.BufferedRef):
             dma_list.append((q_src, q_sz, b))
         for i in range(len(dma_list)):
             q_src, q_sz, b = dma_list[i]
-            q_src = q_src * self.cfgs.aligned_num_q_heads_per_kv_head
-            q_sz = q_sz * self.cfgs.aligned_num_q_heads_per_kv_head
+            # Tokens are a leading dimension, outside the tiled head/lane
+            # axes. Copy whole token records, matching BatchingORef.
             pltpu.make_async_copy(
                 vmem_src.at[b, :, pl.ds(0, q_sz)],
                 lse_hbm.at[:, pl.ds(q_src, q_sz)],
@@ -503,7 +497,7 @@ class BatchingLSERef(pltpu.BufferedRef):
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
         wait_lanes = schedule_ref.total_wait_lse_out[block_idx]
-        wait_lanes = pl.multiple_of(wait_lanes, 8)
+        # Packed token records can contribute fewer than eight u32 rows.
         ref_u32 = lse_hbm.bitcast(jnp.uint32)
         flat_ref = ref_u32.reshape((-1, 128))
         pltpu.make_async_copy(

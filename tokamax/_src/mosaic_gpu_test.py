@@ -35,7 +35,9 @@ class PallasMosaicGpuUtilsTest(parameterized.TestCase):
       self.skipTest("The test is only for Hopper and Blackwell gen gpus")
     super().setUp()
 
-  def test_encode_i4_as_biased_f8e4m3fn(self,):
+  def test_encode_i4_as_biased_f8e4m3fn(
+      self,
+  ):
 
     shape = (128, 128)
 
@@ -47,7 +49,7 @@ class PallasMosaicGpuUtilsTest(parameterized.TestCase):
       layout = plgpu.Layout.WGMMA_UPCAST_4X
       x = plgpu.load(x_ref, layout=layout, optimized=False)
       x = common.int4_as_biased_f8e4m3fn(x, layout)
-      if jax.__version_info__ >= (0, 11, 2):
+      if jax.__version_info__ >= (0, 11, 3):
         plgpu.store(o_ref, x, optimized=False)
       else:
         o_ref[...] = x
@@ -115,7 +117,7 @@ class PallasMosaicGpuUtilsTest(parameterized.TestCase):
         # `S * D - Z * row_sum(A)` where S is scale=512 and Z is bias=8
         acc = 512 * plgpu.async_load_tmem(acc_tmem, layout=plgpu.Layout.TCGEN05)
         acc -= 8 * lax.broadcast_in_dim(a_row_sum, acc.shape, [0])
-        if jax.__version_info__ >= (0, 11, 2):
+        if jax.__version_info__ >= (0, 11, 3):
           plgpu.store(out_gmem, acc, optimized=False)
         else:
           out_gmem[...] = acc

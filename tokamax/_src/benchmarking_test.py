@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import time
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -22,6 +23,11 @@ import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
 from tokamax._src import numerics
+
+
+@jax.jit
+def _matmul_sum(x: jax.Array) -> jax.Array:
+  return jnp.sum(x @ x)
 
 
 class BenchmarkingTest(parameterized.TestCase):
@@ -236,6 +242,33 @@ class BenchmarkingTest(parameterized.TestCase):
       _ = 1 + 1
     with self.assertRaises(ValueError):
       _ = profile.total_op_time
+
+  def test_xprof_profile_session_recovers_from_stale_profile(self):
+    x = jnp.ones((512, 512))
+
+    stale_dir = self.create_tempdir('stale_trace').full_path
+    jax.profiler.start_trace(stale_dir)
+
+    with benchmarking.XprofProfileSession(use_jax_profiler=True) as profile:
+      jax.block_until_ready(_matmul_sum(x))
+
+    self.assertGreater(profile.total_op_time.total_seconds(), 0)
+    self.assertIsNone(profile.xprof_url)
+
+  def test_xprof_profile_session_stale_profile_retry_failure(self):
+    with mock.patch.object(
+        jax.profiler,
+        'start_trace',
+        side_effect=RuntimeError(
+            'Profile has already been started. Only one profile may be run at a'
+            ' time.'
+        ),
+    ):
+      with self.assertRaisesRegex(
+          RuntimeError, 'Unable to start jax profiling session.'
+      ):
+        with benchmarking.XprofProfileSession(use_jax_profiler=True):
+          pass
 
 
 if __name__ == '__main__':

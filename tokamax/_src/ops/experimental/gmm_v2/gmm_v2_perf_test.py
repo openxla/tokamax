@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import time
+
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+import qwix
 from tokamax._src import benchmarking
+from tokamax._src import quantization
 from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.experimental.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
@@ -49,16 +53,14 @@ class GmmPerfTest(parameterized.TestCase):
         rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
-    lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=lhs,
-        rhs=rhs_q,
+        lhs=quantization.AsQArray(
+            lhs, jnp.float8_e4m3fn, calibration_method="fixed,-224,224"
+        ),
+        rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
-        rhs_scale=rhs_scale,
-        maybe_quantize_lhs=True,
-        lhs_scale=lhs_scale,
         preferred_element_type=jnp.bfloat16,
     )
     fn, args = benchmarking.standardize_function(
@@ -98,9 +100,8 @@ class GmmPerfTest(parameterized.TestCase):
     )
     benchmark_config = dict(
         lhs=lhs,
-        rhs=grad_q,
+        rhs=qwix.QArray(grad_q, grad_scale),
         group_sizes=group_sizes,
-        rhs_scale=grad_scale,
         ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS,
         preferred_element_type=jnp.bfloat16,
     )
@@ -220,18 +221,16 @@ class GmmPerfTest(parameterized.TestCase):
     group_sizes = jnp.full((num_groups,), m // num_groups, jnp.int32)
 
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, weight_dtype, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
+        rhs, weight_dtype, axis=1, block_size=block_size
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=lhs,
-        rhs=rhs_q,
+        lhs=quantization.AsQArray(lhs, jnp.float8_e4m3fn),
+        rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
         group_offset=jnp.array([group_offset], jnp.int32),
-        rhs_scale=rhs_scale,
-        maybe_quantize_lhs=True,
         # The MoE layer writes only the rows owned by this shard.
         zero_initialize=False,
         fuse_gateup_activation=fuse_act,
@@ -246,6 +245,65 @@ class GmmPerfTest(parameterized.TestCase):
     res = benchmarking.benchmark(fn, args, method="hermetic_xprof")
     logging.info("Benchmark time (ms): %s", res.median_evaluation_time_ms)
     self.assertLessEqual(res.median_evaluation_time_ms, threshold)
+
+
+class GmmCompilePerfTest(parameterized.TestCase):
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    super().setUp()
+
+  def test_tgmm_trace_and_lowering_time_independent_of_num_groups(self):
+    # Compares against a baseline with fewer groups, rather than an absolute
+    # threshold, so the test doesn't depend on machine speed.
+    tpu_gen = pltpu.get_tpu_info().generation
+    if tpu_gen < 7:
+      self.skipTest(f"Unsupported TPU generation: {tpu_gen}")
+    m, k, n = 262144, 7168, 1024
+    lhs = jax.ShapeDtypeStruct((m, k), jnp.float8_e4m3fn)
+    grad_q = jax.ShapeDtypeStruct((m, n), jnp.float8_e5m2)
+    grad_scale = jax.ShapeDtypeStruct((1, 1, n), jnp.float32)
+
+    def measure(num_groups):
+      group_sizes = jax.ShapeDtypeStruct((num_groups,), jnp.int32)
+      trace_times, lowering_times = [], []
+      for _ in range(3):
+        jax.clear_caches()
+        start = time.perf_counter()
+        traced = tgmm_backend.tgmm_v2.trace(
+            lhs,
+            grad_q,
+            group_sizes,
+            num_groups,
+            rhs_scale=grad_scale,
+            preferred_element_type=jnp.bfloat16,
+        )
+        trace_times.append(time.perf_counter() - start)
+
+        start = time.perf_counter()
+        traced.lower()
+        lowering_times.append(time.perf_counter() - start)
+      return min(trace_times), min(lowering_times)
+
+    num_groups = 16
+    trace_time, lowering_time = measure(num_groups)
+    trace_time_3x, lowering_time_3x = measure(3 * num_groups)
+    logging.info(
+        "num_groups=%d: trace %.3fs, lowering %.3fs; num_groups=%d: trace"
+        " %.3fs, lowering %.3fs",
+        num_groups,
+        trace_time,
+        lowering_time,
+        3 * num_groups,
+        trace_time_3x,
+        lowering_time_3x,
+    )
+    # If the kernel is unrolled over the groups, the trace/lower time grows
+    # linearly with `num_groups`.
+    max_ratio = 1.5
+    self.assertLess(trace_time_3x / trace_time, max_ratio)
+    self.assertLess(lowering_time_3x / lowering_time, max_ratio)
 
 
 if __name__ == "__main__":

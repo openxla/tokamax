@@ -266,7 +266,7 @@ def calculate_col_size(hidden_size: int) -> int:
   match tpu_info.generation:
     case 6:
       vmem_capacity = _VMEM_CAPACITY_GEN6_BYTES
-    case 7:
+    case 5 | 7:
       vmem_capacity = _VMEM_CAPACITY_GEN7_BYTES
     case _:
       vmem_capacity = _VMEM_CAPACITY_DEFAULT_BYTES
