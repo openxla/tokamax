@@ -15,38 +15,42 @@
 """Tests for base TopK operator."""
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.tpu.topk import base
+from tokamax._src.ops.experimental.tpu.topk import test_base
 
-# TODO: Add more tests.
 
+class BaseTopKTest(test_base.TopKTestBase):
 
-class BaseTopKTest(parameterized.TestCase):
+  def __init__(self, *args):
+    super().__init__(*args, topk_fn=base.TopK())
 
-  def setUp(self):
-    super().setUp()
-    if jax.default_backend() != "tpu":
-      self.skipTest("Only tested on TPU.")
-
-  def test_base_topk(self):
+  def test_known_values(self):
     op = base.TopK()
-    keys = jnp.array([[3.0, 1.0, 4.0, 2.0], [5.0, 9.0, 2.0, 6.0]])
-    k = 2
-    topk_keys, topk_vals = op(keys, k)
-    np.testing.assert_allclose(topk_keys, np.array([[4.0, 3.0], [9.0, 6.0]]))
-    np.testing.assert_array_equal(topk_vals, np.array([[2, 0], [1, 3]]))
+    scores = jnp.array(
+        [[3.0, 1.0, 4.0, 2.0], [5.0, -jnp.inf, 2.0, 6.0]], dtype=jnp.float32
+    )
+    row_lengths = jnp.array([4, 3], dtype=jnp.int32)
+    indices, scores_bits = op(
+        scores, 3, row_lengths=row_lengths, return_scores=True
+    )
+    np.testing.assert_array_equal(
+        indices, np.array([[2, 0, 3], [0, 2, -1]], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(
+        jax.lax.bitcast_convert_type(scores_bits, jnp.float32),
+        np.array([[4.0, 3.0, 2.0], [5.0, 2.0, -np.inf]], dtype=np.float32),
+    )
 
-  def test_base_topk_with_values(self):
+  def test_bind_validation(self):
     op = base.TopK()
-    keys = jnp.array([[3.0, 1.0, 4.0, 2.0]])
-    values = jnp.array([[10, 20, 30, 40]], dtype=jnp.int32)
-    k = 2
-    topk_keys, topk_vals = op(keys, k, values)
-    np.testing.assert_allclose(topk_keys, np.array([[4.0, 3.0]]))
-    np.testing.assert_array_equal(topk_vals, np.array([[30, 10]]))
+    scores = jnp.zeros((2, 4), dtype=jnp.float32)
+    with self.assertRaises(ValueError):
+      op.bind(scores, 0)
+    with self.assertRaises(ValueError):
+      op.bind(scores, 5)
 
 
 if __name__ == "__main__":

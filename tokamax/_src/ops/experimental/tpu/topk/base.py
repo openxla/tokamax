@@ -14,86 +14,51 @@
 # ==============================================================================
 """Base class for TopK operator."""
 
-import functools
 from typing import Any, override
 
 import jax
-import jax.numpy as jnp
-from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
+from tokamax._src.ops.experimental.tpu.topk import reference
 
 AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 
 
-@functools.partial(jax.jit, static_argnames=["k", "axis", "is_stable"])
-def topk(
-    operand: jax.Array,
-    k: int,
-    values: jax.Array | None = None,
-    *,
-    axis: int = -1,
-    is_stable: bool = True,
-) -> tuple[jax.Array, jax.Array]:
-  """Pure JAX reference implementation for TopK.
-
-  Args:
-    operand: Input operand array of shape (*batch_dims, N).
-    k: Number of top elements to select.
-    values: Optional input values of shape (*batch_dims, N) with int32 dtype. If
-      None, 0..N-1 indices along the last dimension are used as values.
-    axis: Optional integer specifying the axis along which to compute top k.
-    is_stable: Optional boolean specifying whether to preserve relative order.
-
-  Returns:
-    A tuple (topk_values, topk_indices), both of shape (*batch_dims, k).
-  """
-  if values is None:
-    top_keys, top_indices = jax.lax.top_k(operand, k, axis=axis)
-    return top_keys, top_indices.astype(jnp.int32)
-  else:
-    top_keys, top_indices = jax.lax.top_k(operand, k, axis=axis)
-    top_values = jnp.take_along_axis(values, top_indices, axis=axis)
-    return top_keys, top_values
-
-
-class TopK[C](op.Op[Any, tuple[jax.Array, jax.Array], None, C, Any]):
+class TopK[C](
+    op.Op[Any, jax.Array | tuple[jax.Array, jax.Array], None, C, Any]
+):
   """Tokamax operator for TopK."""
 
   @jaxtyping.jaxtyped
   def bind(
       self,
-      operand: Shaped[Array | AbstractArray, "*batch N"],
+      scores: (
+          Float[Array | AbstractArray, "b n"]
+          | Int[Array | AbstractArray, "b n"]
+      ),
       k: int,
-      values: Int[Array | AbstractArray, "*batch N"] | None = None,
+      row_lengths: Int[Array | AbstractArray, "b"] | None = None,
       *,
-      axis: int = -1,
-      is_stable: bool = True,
+      return_scores: bool = False,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     if k <= 0:
       raise ValueError(f"k must be positive, got {k}.")
-    if axis != -1 and axis != operand.ndim - 1:
-      raise NotImplementedError(
-          f"Only axis=-1 is currently supported, got axis={axis}."
-      )
-    if operand.shape[axis] < k:
+    if scores.shape[-1] < k:
       raise ValueError(
-          f"Dimension {axis} of operand ({operand.shape[axis]}) must be >= k"
-          f" ({k})."
+          f"Last dimension of scores ({scores.shape[-1]}) must be >= k ({k})."
       )
-    if values is not None:
-      if values.shape != operand.shape:
-        raise ValueError(
-            f"values shape {values.shape} must match operand shape"
-            f" {operand.shape}."
-        )
+    if row_lengths is not None and row_lengths.shape != (scores.shape[0],):
+      raise ValueError(
+          f"row_lengths shape {row_lengths.shape} must match batch dimension"
+          f" ({scores.shape[0]},)."
+      )
     return super().bind(
-        operand=operand,
+        scores=scores,
         k=k,
-        values=values,
-        axis=axis,
-        is_stable=is_stable,
+        row_lengths=row_lengths,
+        return_scores=return_scores,
         return_residuals=return_residuals,
     )
 
@@ -101,16 +66,21 @@ class TopK[C](op.Op[Any, tuple[jax.Array, jax.Array], None, C, Any]):
   @jaxtyping.jaxtyped
   def _fwd(
       self,
-      operand: Shaped[Array, "*batch N"],
+      scores: Float[Array, "b n"] | Int[Array, "b n"],
       k: int,
-      values: Int[Array, "*batch N"] | None = None,
+      row_lengths: Int[Array, "b"] | None = None,
       *,
-      axis: int = -1,
-      is_stable: bool = True,
+      return_scores: bool = False,
       return_residuals: bool = False,
       config: C | None = None,
-  ) -> tuple[tuple[jax.Array, jax.Array], None]:
+  ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], None]:
+    del config, return_residuals
     return (
-        topk(operand, k, values, axis=axis, is_stable=is_stable),
+        reference.topk(
+            scores,
+            k,
+            row_lengths,
+            return_scores=return_scores,
+        ),
         None,
     )

@@ -15,43 +15,26 @@
 """Tests for Pallas TPU TopK operator wrapper."""
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
-import jax.numpy as jnp
-import numpy as np
-from tokamax._src.ops.experimental.tpu.topk import base
 from tokamax._src.ops.experimental.tpu.topk import pallas_mosaic_tpu
+from tokamax._src.ops.experimental.tpu.topk import test_base
 
 
 # TODO: Add more tests.
-class PallasTpuTopKTest(parameterized.TestCase):
+class PallasTpuTopKTest(test_base.TopKTestBase):
+
+  def __init__(self, *args):
+    super().__init__(*args, topk_fn=pallas_mosaic_tpu.PallasTpuTopK())
 
   def setUp(self):
     super().setUp()
     if jax.default_backend() != "tpu":
       self.skipTest("Only supported on TPUs.")
-    if not pltpu.get_tpu_info().generation >= 6:
-      self.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
-
-  def test_pallas_tpu_op(self):
-    op = pallas_mosaic_tpu.PallasTpuTopK()
-    keys = jnp.arange(128, 0, -1.0, dtype=jnp.float32)[None, :]
-    k = 4
-    res_k, res_v = op(keys, k)
-    ref_k, ref_v = base.topk(keys, k)
-    np.testing.assert_allclose(res_k, ref_k)
-    np.testing.assert_array_equal(res_v, ref_v)
-
-  def test_pallas_tpu_op_with_values(self):
-    op = pallas_mosaic_tpu.PallasTpuTopK()
-    keys = jnp.arange(128, 0, -1.0, dtype=jnp.float32)[None, :]
-    values = jnp.arange(128, dtype=jnp.int32)[None, :]
-    k = 8
-    res_k, res_v = op(keys, k, values)
-    ref_k, ref_v = base.topk(keys, k, values)
-    np.testing.assert_allclose(res_k, ref_k)
-    np.testing.assert_array_equal(res_v, ref_v)
+    if not pltpu.get_tpu_info().generation >= 7:
+      self.skipTest(
+          "SparseCore TopK Pallas TPU kernel requires TPU v7 or newer."
+      )
 
 
 if __name__ == "__main__":

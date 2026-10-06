@@ -18,7 +18,7 @@ from collections.abc import Callable, Sequence
 from typing import Literal
 import immutabledict
 import jax
-from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src.ops.experimental.tpu.topk import base
 
 type Implementation = Literal["mosaic_tpu", "xla"]
@@ -38,57 +38,41 @@ IMPLEMENTATIONS = immutabledict.immutabledict(_implementations)
 
 
 def top_k(
-    operand: Shaped[Array, "*batch N"],
+    scores: Float[Array, "b n"] | Int[Array, "b n"],
     k: int,
-    values: Int[Array, "*batch N"] | None = None,
+    row_lengths: Int[Array, "b"] | None = None,
     *,
-    axis: int = -1,
-    is_stable: bool = True,
+    return_scores: bool = False,
     implementation: (
         Implementation
-        | Sequence[Implementation | Callable[..., tuple[jax.Array, jax.Array]]]
+        | Sequence[Implementation | Callable[..., jax.Array]]
         | None
     ) = None,
-) -> tuple[jax.Array, jax.Array]:
-  """Based on the jax.lax.top_k API.
-
-  Returns top ``k`` values and their indices along the specified axis of
-  ``operand``.
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+  """Selects exact top-k indices per row.
 
   Args:
-    operand: N-dimensional array of non-complex type. Shape (*batch_dims, N).
-    k: Integer specifying the number of top entries.
-    values: Optional input values array of shape (*batch_dims, N) with integer
-      dtype. If None, 0..N-1 indices along the last dimension are used.
-    axis: Optional integer specifying the axis along which to compute the top
-      ``k`` entries. Default is -1, indicating the last axis.
-    is_stable: Optional boolean specifying whether to preserve the relative
-      order of equal elements. If True (default), equal elements preserve their
-      relative order from the input; otherwise, their order is unspecified.
-    implementation: By default `None` will be used to pick the best available
-      backend. Can be set to "mosaic_tpu" or "xla" explicitly.
+    scores: 2D array of shape (b, n), with float32 dtype or int32 holding raw
+      float32 bits.
+    k: Integer specifying the number of top entries per row.
+    row_lengths: Optional int32 array of shape (b,) specifying effective row
+      lengths. Defaults to n for all rows.
+    return_scores: If True, also returns the selected scores as int32 raw
+      float32 bits (-inf bits in padded slots).
+    implementation: Can be set to "mosaic_tpu" or "xla" explicitly.
 
   Returns:
-    A tuple (values, indices) where
-
-    - values is an array containing the top k values along the specified axis.
-    - indices is an array containing the indices corresponding to values.
-
-  Raises:
-    ValueError: If an unsupported implementation is specified.
-    NotImplementedError: If an unsupported axis is specified.
-    ExceptionGroup: If all implementations fail.
+    Top-k column indices of shape (b, k) with int32 dtype, -1 suffix-padded, or
+    a tuple (indices, scores_bits) if `return_scores=True`.
   """
-  if axis != -1 and axis != operand.ndim - 1:
-    raise NotImplementedError(
-        f"Only axis=-1 is currently supported, got axis={axis}."
-    )
-
   if implementation is not None:
     if isinstance(implementation, str):
       if implementation in IMPLEMENTATIONS:
         return IMPLEMENTATIONS[implementation](
-            operand, k, values, axis=axis, is_stable=is_stable
+            scores,
+            k,
+            row_lengths,
+            return_scores=return_scores,
         )
       else:
         raise ValueError(f"Unsupported implementation: {implementation}")
@@ -106,10 +90,15 @@ def top_k(
       impl_fn = impl
 
     try:
-      return impl_fn(operand, k, values, axis=axis, is_stable=is_stable)
+      return impl_fn(
+          scores,
+          k,
+          row_lengths,
+          return_scores=return_scores,
+      )
     except NotImplementedError as e:
       if len(impl_seq) == 1:
         raise
       errors.append(e)
 
-  raise ExceptionGroup("all implementations failed", errors)
+  raise ExceptionGroup("All implementations failed", errors)
