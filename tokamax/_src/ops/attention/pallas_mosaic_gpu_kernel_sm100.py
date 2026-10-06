@@ -18,7 +18,7 @@ import dataclasses
 import functools
 import itertools
 import math
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import jax
 from jax import lax
@@ -88,7 +88,7 @@ class Config(common.ConfigBase):
 
   num_tma_splits: pydantic.PositiveInt = 1
   collective: pydantic.StrictBool = True
-  persistent: pydantic.StrictBool = False
+  persistent: pydantic.StrictBool | Literal["static"] = False
 
   def __post_init__(self):
     block_q_per_cta = self.block_q // 2 if self.collective else self.block_q
@@ -273,7 +273,7 @@ def get_heuristics_config(
         q, k, v, bias, mask, out_dtype, config, normalize_output=norm
     )
     smem_bytes = mgpu_lib.estimate_smem_bytes(
-        scratch, uses_dynamic_scheduling_loop=config.persistent
+        scratch, uses_dynamic_scheduling_loop=config.persistent is True  # pylint: disable=g-bool-id-comparison
     )
     if smem_bytes <= 227 * 1024:
       return config
@@ -296,7 +296,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
         # TODO: Investigate why split_k=2 doesn't work with block_kv=128.
         for split_k in [1, 2] if block_kv == 64 else [1]:
           for collective in [False, True] if split_k == 1 else [False]:
-            for persistent in [False, True]:
+            for persistent in [False, True, "static"]:
               q, k, v, bias, mask = eval_in_shapes(
                   collective=collective, split_k=split_k
               )
@@ -321,7 +321,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                   q, k, v, bias, mask, out_dtype, config, normalize_output=norm
               )
               smem_bytes = mgpu_lib.estimate_smem_bytes(
-                  scratch, uses_dynamic_scheduling_loop=persistent
+                  scratch, uses_dynamic_scheduling_loop=persistent is True  # pylint: disable=g-bool-id-comparison
               )
               if smem_bytes <= 227 * 1024:
                 configs.add(config)
@@ -1017,7 +1017,11 @@ def flash_attention_kernel(
       profile_dir="sponge" if profile else "",
   )
 
-  if config.persistent:
+  if config.persistent == "static":
+    maybe_persistent_kernel = mgpu_lib.static_scheduling_persistent_kernel
+  elif not isinstance(config.persistent, bool):
+    raise ValueError("config.persistent must be 'static' or True/False")
+  elif config.persistent:
     maybe_persistent_kernel = mgpu_lib.dynamic_scheduling_persistent_kernel
   else:
     maybe_persistent_kernel = mgpu_lib.not_persistent_grid_loop_kernel
