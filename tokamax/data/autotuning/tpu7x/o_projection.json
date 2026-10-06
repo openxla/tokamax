@@ -1,0 +1,47 @@
+{
+  "{\"x\":\"bf16[128,128,512]\",\"positions\":\"i32[128]\",\"cos_sin_cache\":\"f32[65536,64]\",\"wo_a\":\"f8_e4m3fn[4096,16384]\",\"wo_a_scale\":\"f32[16384]\",\"inverse\":true,\"quantize_activations\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 782.0492789614946,
+      "lower_time_ms": 26.403603958897293,
+      "evaluation_times_ms": [
+        0.179,
+        0.179,
+        0.179,
+        0.179,
+        0.178
+      ],
+      "metadata": {},
+      "peak_memory_mb": 260.112896
+    }
+  },
+  "{\"x\":\"bf16[1024,128,512]\",\"positions\":\"i32[1024]\",\"cos_sin_cache\":\"f32[65536,64]\",\"wo_a\":\"f8_e4m3fn[4096,16384]\",\"wo_a_scale\":\"f32[16384]\",\"inverse\":true,\"quantize_activations\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1767.8768030018546,
+      "lower_time_ms": 26.0161180049181,
+      "evaluation_times_ms": [
+        0.94,
+        0.939,
+        0.939,
+        0.938,
+        0.94
+      ],
+      "metadata": {},
+      "peak_memory_mb": 906.62912
+    }
+  },
+  "{\"x\":\"bf16[4096,128,512]\",\"positions\":\"i32[4096]\",\"cos_sin_cache\":\"f32[65536,64]\",\"wo_a\":\"f8_e4m3fn[4096,16384]\",\"wo_a_scale\":\"f32[16384]\",\"inverse\":true,\"quantize_activations\":true,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 2011.5058380179107,
+      "lower_time_ms": 26.959552080370486,
+      "evaluation_times_ms": [
+        3.565,
+        3.565,
+        3.563,
+        3.562,
+        3.568
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3173.138432
+    }
+  }
+}

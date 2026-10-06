@@ -1,0 +1,62 @@
+{
+  "{\"x\":\"bf16[128,128,512]\",\"positions\":\"i32[128]\",\"cos_sin_cache\":\"f32[65536,64]\",\"mode\":\"qnorm_rope\",\"inverse\":false,\"eps\":1e-6,\"quant_dtype\":null,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 252.46745895128697,
+      "lower_time_ms": 20.625216071493924,
+      "evaluation_times_ms": [
+        0.116,
+        0.117,
+        0.116,
+        0.116,
+        0.116
+      ],
+      "metadata": {},
+      "peak_memory_mb": 121.635328
+    }
+  },
+  "{\"x\":\"bf16[4096,128,512]\",\"positions\":\"i32[4096]\",\"cos_sin_cache\":\"f32[65536,64]\",\"mode\":\"qnorm_rope\",\"inverse\":false,\"eps\":1e-6,\"quant_dtype\":null,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 370.1025979826227,
+      "lower_time_ms": 20.396039995830506,
+      "evaluation_times_ms": [
+        2.76,
+        2.755,
+        2.753,
+        2.755,
+        2.754
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2904.571904
+    }
+  },
+  "{\"x\":\"bf16[4096,512]\",\"positions\":\"i32[4096]\",\"cos_sin_cache\":\"f32[65536,64]\",\"mode\":\"rope\",\"inverse\":false,\"eps\":1e-6,\"quant_dtype\":null,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 630.3628419991583,
+      "lower_time_ms": 17.36096991226077,
+      "evaluation_times_ms": [
+        0.044,
+        0.043,
+        0.044,
+        0.044,
+        0.044
+      ],
+      "metadata": {},
+      "peak_memory_mb": 60.850176
+    }
+  },
+  "{\"x\":\"bf16[4096,64,128]\",\"positions\":\"i32[4096]\",\"cos_sin_cache\":\"f32[65536,64]\",\"mode\":\"rope_quant\",\"inverse\":false,\"eps\":1e-6,\"quant_dtype\":\"float8_e4m3fn\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 478.18456904497,
+      "lower_time_ms": 23.123318096622825,
+      "evaluation_times_ms": [
+        0.524,
+        0.524,
+        0.524,
+        0.525,
+        0.524
+      ],
+      "metadata": {},
+      "peak_memory_mb": 521.158688
+    }
+  }
+}
