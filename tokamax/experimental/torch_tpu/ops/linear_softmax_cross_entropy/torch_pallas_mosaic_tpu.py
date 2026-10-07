@@ -28,6 +28,89 @@ import torch
 Config = jax_pallas_mosaic_tpu.Config
 
 
+def _deconstruct_config(
+    config: Config | tuple[Any, ...] | list[Any] | None,
+) -> tuple[int, ...] | None:
+  """Deconstructs a Config object or tuple into a flat tuple of ints."""
+  if config is None:
+    return None
+  if isinstance(config, (tuple, list)):
+    flat: list[int] = []
+    for item in config:
+      if isinstance(item, (tuple, list)):
+        flat.extend(int(x) for x in item)
+      else:
+        flat.append(int(item))
+    return tuple(flat)
+  b = config.b_block_size
+  h = config.h_block_size
+  v = config.v_block_size
+  bc = config.buffer_count
+  if isinstance(bc, (tuple, list)):
+    return (b, h, v, *[int(x) for x in bc])
+  return (b, h, v, int(bc))
+
+
+def _reconstruct_config(
+    *config_parts: Any,
+) -> Config:
+  """Reconstructs a Config object from a deconstructed tuple or Config."""
+  if not config_parts:
+    raise ValueError("Config parts cannot be empty.")
+  raw: Any = config_parts[0]
+  if isinstance(raw, Config):
+    return raw
+  if raw is None:
+    raise ValueError("Config cannot be None.")
+
+  def _flatten(items: Sequence[Any] | tuple[Any, ...] | list[Any]) -> list[int]:
+    flat: list[int] = []
+    for item in items:
+      if isinstance(item, (tuple, list)):
+        flat.extend(_flatten(item))
+      elif item is None:
+        raise ValueError("Config elements cannot be None.")
+      else:
+        flat.append(int(item))
+    return flat
+
+  elements: Sequence[int]
+  if len(config_parts) == 1:
+    if not isinstance(raw, (tuple, list)):
+      raise ValueError(
+          f"Expected tuple or list for config, got {type(raw).__name__}"
+      )
+    elements = _flatten(raw)
+  else:
+    elements = _flatten(config_parts)
+
+  if len(elements) == 3:
+    return Config(
+        b_block_size=elements[0],
+        h_block_size=elements[1],
+        v_block_size=elements[2],
+    )
+  elif len(elements) == 4:
+    return Config(
+        b_block_size=elements[0],
+        h_block_size=elements[1],
+        v_block_size=elements[2],
+        buffer_count=elements[3],
+    )
+  elif len(elements) == 5:
+    return Config(
+        b_block_size=elements[0],
+        h_block_size=elements[1],
+        v_block_size=elements[2],
+        buffer_count=(elements[3], elements[4]),
+    )
+  else:
+    raise ValueError(
+        f"Invalid config tuple length: {len(elements)}. Expected 3, 4, or 5"
+        " elements."
+    )
+
+
 class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
     torch_base._LinearSoftmaxCrossEntropyLossVjp[Config]  # pylint: disable=protected-access
 ):
@@ -42,6 +125,16 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
     )
     self.jax_op_name = "pallas_mosaic_tpu_linear_softmax_cross_entropy_loss_vjp"
     self.is_vjp = True
+
+  @override
+  def deconstruct_config(
+      self, config: Config | tuple[Any, ...] | list[Any] | None
+  ) -> tuple[int, ...] | None:
+    return _deconstruct_config(config)
+
+  @override
+  def reconstruct_config(self, *config_parts: Any) -> Config:
+    return _reconstruct_config(*config_parts)
 
   @override
   def __call__(
@@ -82,7 +175,7 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
-      config: tuple[int, int, int] | None = None,
+      config: tuple[int, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
     reduction = cast(Literal["mean", "none", "sum"], reduction)
     assert self.op_impl_jax is not None, "Forward class not set."
@@ -119,6 +212,16 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     self.backward_op_torch = _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp()
 
   @override
+  def deconstruct_config(
+      self, config: Config | tuple[Any, ...] | list[Any] | None
+  ) -> tuple[int, ...] | None:
+    return _deconstruct_config(config)
+
+  @override
+  def reconstruct_config(self, *config_parts: Any) -> Config:
+    return _reconstruct_config(*config_parts)
+
+  @override
   def __call__(
       self,
       x: torch.Tensor,
@@ -151,8 +254,8 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
-      config: tuple[int, int, int] | None = None,
-      bwd_config: tuple[int, int, int] | None = None,
+      config: tuple[int, ...] | None = None,
+      bwd_config: tuple[int, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
     del bwd_config
     reduction = cast(Literal["mean", "none", "sum"], reduction)

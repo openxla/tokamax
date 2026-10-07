@@ -17,15 +17,15 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.linear_softmax_cross_entropy_loss.base import (
-    LinearSoftmaxCrossEntropyLoss,
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu
+from tokamax._src.ops.linear_softmax_cross_entropy_loss import test_utils
+
+generate_random_data = test_utils.generate_random_data
+PallasMosaicTpuLinearSoftmaxCrossEntropyLoss = (
+    pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss
 )
-from tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu import (
-    PallasMosaicTpuLinearSoftmaxCrossEntropyLoss,
-)
-from tokamax._src.ops.linear_softmax_cross_entropy_loss.test_utils import (
-    generate_random_data,
-)
+LinearSoftmaxCrossEntropyLoss = base.LinearSoftmaxCrossEntropyLoss
 
 
 class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
@@ -103,4 +103,3 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
 
 if __name__ == "__main__":
   absltest.main()
-

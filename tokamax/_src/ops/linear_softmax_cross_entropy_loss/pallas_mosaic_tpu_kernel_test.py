@@ -13,6 +13,9 @@
 # limitations under the License.
 # ==============================================================================
 
+import math
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -21,6 +24,33 @@ from tokamax._src import numerics
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference
+
+
+def _skip_if_partial_blocks_on_old_jax(
+    test_case: parameterized.TestCase,
+    *,
+    b_dim: int,
+    h_dim: int,
+    v_dim: int,
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+) -> None:
+  """Skips test on JAX < 0.11.1 if any dimension has a partial final block.
+
+  Before jax-ml/jax@4700d0c (released in JAX 0.11.1), emit_pipeline did not
+  round in-bounds BoundedSlice sizes up to the tiling, so the kernel's clamped
+  partial final blocks produce non-tile-aligned DMAs on those versions.
+  """
+  if jax.__version_info__ < (0, 11, 1):
+    if (
+        b_dim % b_block_size != 0
+        or h_dim % h_block_size != 0
+        or v_dim % v_block_size != 0
+    ):
+      test_case.skipTest(
+          "Partial final blocks fail in JAX 0.11.0; fixed in JAX 0.11.1."
+      )
 
 
 class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
@@ -566,9 +596,27 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           v_dim=10000,
           reduction="sum",
       ),
+      dict(
+          testcase_name=(
+              "bwd_all_non_aligned_b4096_h1288_v2664_sum_reduction_test"
+          ),
+          b_dim=4096,
+          h_dim=1288,
+          v_dim=2664,
+          reduction="sum",
+      ),
   )
   def test_kernel_bwd_matches_reference(self, b_dim, h_dim, v_dim, reduction):
     config = kernel.get_heuristic_bwd_config(b_dim, h_dim, v_dim)
+    _skip_if_partial_blocks_on_old_jax(
+        self,
+        b_dim=b_dim,
+        h_dim=h_dim,
+        v_dim=v_dim,
+        b_block_size=config.b_block_size,
+        h_block_size=config.h_block_size,
+        v_block_size=config.v_block_size,
+    )
     x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
     labels_shape = numerics.RangedArrayInitializer(
         (b_dim,), jnp.int32, 0, v_dim
@@ -651,6 +699,267 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           h_block_size=config.h_block_size,
           v_block_size=config.v_block_size,
       )
+
+  def test_bwd_odd_num_v_blocks_multi_core(self):
+    b_dim, h_dim, v_dim = 1024, 512, 2560
+    b_block_size, h_block_size, v_block_size = 1024, 512, 1024
+    _skip_if_partial_blocks_on_old_jax(
+        self,
+        b_dim=b_dim,
+        h_dim=h_dim,
+        v_dim=v_dim,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+    )
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), jnp.float32)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
+    )
+    lse = jax.nn.logsumexp(x @ w, axis=-1)
+    dout = numerics.random_initialize(
+        (jax.ShapeDtypeStruct((), jnp.float32),), seed=42
+    )[0]
+
+    kernel_grad_x, kernel_grad_w = (
+        kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+            dout,
+            lse,
+            x,
+            labels,
+            w,
+            reduction="sum",
+            b_block_size=b_block_size,
+            h_block_size=h_block_size,
+            v_block_size=v_block_size,
+        )
+    )
+    self.assertEqual(kernel_grad_x.shape, (b_dim, h_dim))
+    self.assertEqual(kernel_grad_w.shape, (h_dim, v_dim))
+
+    ref_grad_x, ref_grad_w = (
+        reference.linear_softmax_cross_entropy_loss_bwd_reference(
+            dout, lse, x, labels, w, reduction="sum"
+        )
+    )
+    self._assert_allclose(
+        kernel_grad_x, ref_grad_x, atol=5e-2, rtol=5e-2, name="grad_x"
+    )
+    self._assert_allclose(
+        kernel_grad_w, ref_grad_w, atol=5e-2, rtol=5e-2, name="grad_w"
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="b1024_h520_v2048",
+          b_dim=1024,
+          h_dim=520,
+          v_dim=2048,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+      dict(
+          testcase_name="b1024_h640_v2048",
+          b_dim=1024,
+          h_dim=640,
+          v_dim=2048,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+      dict(
+          testcase_name="b2048_h520_v2048",
+          b_dim=2048,
+          h_dim=520,
+          v_dim=2048,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+      dict(
+          testcase_name="b1024_h1024_v2048",
+          b_dim=1024,
+          h_dim=1024,
+          v_dim=2048,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+      dict(
+          testcase_name="b1024_h520_v2049",
+          b_dim=1024,
+          h_dim=520,
+          v_dim=2049,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+  )
+  def test_kernel_bwd_explicit_block_sizes_matches_reference(
+      self,
+      b_dim: int,
+      h_dim: int,
+      v_dim: int,
+      b_block_size: int,
+      h_block_size: int,
+      v_block_size: int,
+  ):
+    _skip_if_partial_blocks_on_old_jax(
+        self,
+        b_dim=b_dim,
+        h_dim=h_dim,
+        v_dim=v_dim,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+    )
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), jnp.float32)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
+    )
+    lse = jax.nn.logsumexp(x @ w, axis=-1)
+    dout = numerics.random_initialize(
+        (jax.ShapeDtypeStruct((), jnp.float32),), seed=42
+    )[0]
+
+    ref_grad_x, ref_grad_w = (
+        reference.linear_softmax_cross_entropy_loss_bwd_reference(
+            dout, lse, x, labels, w, reduction="sum"
+        )
+    )
+
+    for i in range(3):
+      kernel_grad_x, kernel_grad_w = (
+          kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+              dout,
+              lse,
+              x,
+              labels,
+              w,
+              reduction="sum",
+              b_block_size=b_block_size,
+              h_block_size=h_block_size,
+              v_block_size=v_block_size,
+          )
+      )
+      self._assert_allclose(
+          kernel_grad_x,
+          ref_grad_x,
+          atol=5e-2,
+          rtol=5e-2,
+          name=f"grad_x_run_{i}",
+      )
+      self._assert_allclose(
+          kernel_grad_w,
+          ref_grad_w,
+          atol=5e-2,
+          rtol=5e-2,
+          name=f"grad_w_run_{i}",
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="both_b_and_h_revisits",
+          b_dim=2048,
+          h_dim=1024,
+          v_dim=2048,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+      dict(
+          testcase_name="non_aligned_heuristic_blocks",
+          b_dim=5136,
+          h_dim=1288,
+          v_dim=2664,
+          b_block_size=None,
+          h_block_size=None,
+          v_block_size=None,
+      ),
+      dict(
+          testcase_name="odd_num_v_blocks_multi_core",
+          b_dim=1024,
+          h_dim=512,
+          v_dim=2560,
+          b_block_size=1024,
+          h_block_size=512,
+          v_block_size=1024,
+      ),
+  )
+  def test_kernel_bwd_single_buffered_matches_reference(
+      self,
+      b_dim: int,
+      h_dim: int,
+      v_dim: int,
+      b_block_size: int | None,
+      h_block_size: int | None,
+      v_block_size: int | None,
+  ) -> None:
+    if b_block_size is None or h_block_size is None or v_block_size is None:
+      config = kernel.get_heuristic_bwd_config(b_dim, h_dim, v_dim)
+      b_block_size = config.b_block_size
+      h_block_size = config.h_block_size
+      v_block_size = config.v_block_size
+
+    _skip_if_partial_blocks_on_old_jax(
+        self,
+        b_dim=b_dim,
+        h_dim=h_dim,
+        v_dim=v_dim,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+    )
+
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), jnp.float32)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
+    )
+    lse = jax.nn.logsumexp(x @ w, axis=-1)
+    dout = numerics.random_initialize(
+        (jax.ShapeDtypeStruct((), jnp.float32),), seed=42
+    )[0]
+
+    ref_grad_x, ref_grad_w = (
+        reference.linear_softmax_cross_entropy_loss_bwd_reference(
+            dout, lse, x, labels, w, reduction="sum"
+        )
+    )
+
+    kernel_grad_x, kernel_grad_w = (
+        kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+            dout,
+            lse,
+            x,
+            labels,
+            w,
+            reduction="sum",
+            b_block_size=b_block_size,
+            h_block_size=h_block_size,
+            v_block_size=v_block_size,
+            buffer_count=1,
+        )
+    )
+
+    self._assert_allclose(
+        kernel_grad_x, ref_grad_x, atol=5e-2, rtol=5e-2, name="grad_x"
+    )
+    self._assert_allclose(
+        kernel_grad_w, ref_grad_w, atol=5e-2, rtol=5e-2, name="grad_w"
+    )
 
 
 class HeuristicConfigTest(parameterized.TestCase):
@@ -739,7 +1048,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=16 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=256
+              b_block_size=1024, h_block_size=512, v_block_size=128
           ),
       ),
       dict(
@@ -759,7 +1068,7 @@ class HeuristicConfigTest(parameterized.TestCase):
           v_dim=32768,
           vmem_limit_bytes=57 * 1024 * 1024,
           expected_config=kernel.Config(
-              b_block_size=1024, h_block_size=512, v_block_size=2048
+              b_block_size=1024, h_block_size=512, v_block_size=1024
           ),
       ),
   )
@@ -801,6 +1110,44 @@ class HeuristicConfigTest(parameterized.TestCase):
         dtype=dtype,  # pyrefly: ignore[bad-argument-type]
     )
     self.assertLessEqual(vmem_used, vmem_limit_bytes)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="h1024", h_dim=1024),
+      dict(testcase_name="h640", h_dim=640),
+      dict(testcase_name="h520", h_dim=520),
+      dict(testcase_name="h768", h_dim=768),
+      dict(testcase_name="h256", h_dim=256),
+      dict(testcase_name="h200", h_dim=200),
+      dict(testcase_name="h2048", h_dim=2048),
+      dict(testcase_name="h4096", h_dim=4096),
+  )
+  def test_heuristic_bwd_never_two_h_blocks(self, h_dim: int):
+    config = kernel.get_heuristic_bwd_config(
+        b_dim=4096,
+        h_dim=h_dim,
+        v_dim=119548,
+        dtype=jnp.dtype(jnp.float32),
+    )
+    num_h_blocks = math.ceil(h_dim / config.h_block_size)
+    self.assertNotEqual(
+        num_h_blocks,
+        2,
+        f"h_dim={h_dim} yielded exactly 2 H blocks ({config.h_block_size=}), "
+        "triggering the slow single-buffered x_grad fallback.",
+    )
+    for vmem_mb in (16, 32):
+      cfg_constrained = kernel.get_heuristic_bwd_config(
+          b_dim=4096,
+          h_dim=h_dim,
+          v_dim=32768,
+          dtype=jnp.dtype(jnp.float32),
+          vmem_limit_bytes=vmem_mb * 1024 * 1024,
+      )
+      self.assertNotEqual(
+          math.ceil(h_dim / cfg_constrained.h_block_size),
+          2,
+          f"h_dim={h_dim} at {vmem_mb}MB VMEM yielded exactly 2 H blocks.",
+      )
 
 
 class CostEstimateTest(parameterized.TestCase):
@@ -856,6 +1203,163 @@ class CostEstimateTest(parameterized.TestCase):
     self.assertEqual(cost.flops, expected_flops)
     self.assertEqual(cost.transcendentals, expected_transcendentals)
     self.assertEqual(cost.bytes_accessed, expected_bytes)
+
+
+class SafeInputOutputBufferCountTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="out_1_passthrough",
+          requested=(2, 1),
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+      dict(
+          testcase_name="none_revisit_passthrough",
+          requested=(2, 2),
+          revisit_distance=None,
+          expected=(2, 2),
+      ),
+      dict(
+          testcase_name="distance_1_passthrough",
+          requested=(2, 2),
+          revisit_distance=1,
+          expected=(2, 2),
+      ),
+      dict(
+          testcase_name="distance_2_fallback",
+          requested=(2, 2),
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+      dict(
+          testcase_name="distance_3_safe",
+          requested=(2, 2),
+          revisit_distance=3,
+          expected=(2, 2),
+      ),
+      dict(
+          testcase_name="in_1_out_2_distance_2_safe",
+          requested=(1, 2),
+          revisit_distance=2,
+          expected=(1, 2),
+      ),
+      dict(
+          testcase_name="in_3_out_2_distance_2_fallback",
+          requested=(3, 2),
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+      dict(
+          testcase_name="in_3_out_1_distance_2_fallback",
+          requested=(3, 1),
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+      dict(
+          testcase_name="int_input_safe",
+          requested=2,
+          revisit_distance=2,
+          expected=2,
+      ),
+      dict(
+          testcase_name="int_input_fallback",
+          requested=3,
+          revisit_distance=2,
+          expected=(2, 1),
+      ),
+  )
+  def test_safe_input_output_buffer_count(
+      self,
+      requested: tuple[int, int] | int,
+      revisit_distance: int | None,
+      expected: tuple[int, int] | int,
+  ):
+    actual = kernel._safe_input_output_buffer_count(requested, revisit_distance)
+    self.assertEqual(actual, expected)
+
+
+class InputOutputBufferCountTest(parameterized.TestCase):
+
+  def test_has_separate_input_output_buffering_flag_on_head(self) -> None:
+    if jax.__version_info__ < (0, 12, 0):
+      self.skipTest(
+          "Separate input_output buffering is only expected on JAX >= 0.12.0."
+      )
+    self.assertTrue(
+        kernel._HAS_SEPARATE_INPUT_OUTPUT_BUFFERING,
+        msg=(
+            "kernel._HAS_SEPARATE_INPUT_OUTPUT_BUFFERING is unexpectedly False"
+            f" on JAX {jax.__version__}. Check if BufferedRef.in_buffer_count"
+            " was renamed."
+        ),
+    )
+
+  @parameterized.product(
+      requested=[(2, 2), (3, 2), (2, 1), 2, 1],
+      revisit_distance=[None, 1, 2, 8],
+  )
+  def test_fallback_returns_one_when_buffering_unsupported(
+      self,
+      requested: tuple[int, int] | int,
+      revisit_distance: int | None,
+  ) -> None:
+    with mock.patch.object(
+        kernel, "_HAS_SEPARATE_INPUT_OUTPUT_BUFFERING", False
+    ):
+      self.assertEqual(
+          kernel._input_output_buffer_count(requested, revisit_distance), 1
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="tuple_2_2_none",
+          requested=(2, 2),
+          revisit_distance=None,
+      ),
+      dict(
+          testcase_name="tuple_2_2_dist_1",
+          requested=(2, 2),
+          revisit_distance=1,
+      ),
+      dict(
+          testcase_name="tuple_2_2_dist_2",
+          requested=(2, 2),
+          revisit_distance=2,
+      ),
+      dict(
+          testcase_name="tuple_2_2_dist_8",
+          requested=(2, 2),
+          revisit_distance=8,
+      ),
+      dict(
+          testcase_name="tuple_3_2_dist_2",
+          requested=(3, 2),
+          revisit_distance=2,
+      ),
+      dict(
+          testcase_name="tuple_2_1_dist_2",
+          requested=(2, 1),
+          revisit_distance=2,
+      ),
+      dict(testcase_name="int_2_dist_2", requested=2, revisit_distance=2),
+      dict(testcase_name="int_1_dist_2", requested=1, revisit_distance=2),
+  )
+  def test_delegates_to_safe_helper_when_buffering_supported(
+      self,
+      requested: tuple[int, int] | int,
+      revisit_distance: int | None,
+  ) -> None:
+    with mock.patch.object(
+        kernel, "_HAS_SEPARATE_INPUT_OUTPUT_BUFFERING", True
+    ):
+      expected = kernel._safe_input_output_buffer_count(
+          requested, revisit_distance
+      )
+      self.assertEqual(
+          kernel._input_output_buffer_count(requested, revisit_distance),
+          expected,
+      )
 
 
 if __name__ == "__main__":
