@@ -18,6 +18,8 @@
 import dataclasses
 from typing import Any, Literal
 
+import jax
+
 # Tags are used to quickly identify different workloads for the same op.
 # forward_only models are models that only require forward passes - meaning no
 # vjp tuning is required.
@@ -38,7 +40,9 @@ class ArgSpec:
     name: The name of the argument specification.
     tags: Tags for the argument specification.
     excluded_platforms: Platforms to exclude from tuning for this argument
-      specification.
+      specification. Each entry is either a platform (e.g. 'gpu', 'tpu'),
+      excluding all devices of that platform, or an exact device kind (e.g.
+      'TPU v5 lite'), excluding only that device kind.
   """
 
   args: dict[str, Any]
@@ -51,3 +55,10 @@ class ArgSpec:
   def full_name(self) -> str:
     """The full name (including project name)."""
     return '_'.join(filter(bool, (self.project, self.name)))
+
+  def is_excluded_on(self, device: jax.Device) -> bool:
+    """Returns whether this argument specification is excluded on `device`."""
+    return any(
+        p.lower() == device.platform or p == device.device_kind
+        for p in self.excluded_platforms
+    )

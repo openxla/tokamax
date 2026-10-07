@@ -315,7 +315,7 @@ class RaggedDotTestBase(parameterized.TestCase):
 
   @parameterized.named_parameters(NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
-    if jax.devices()[0].device_kind in spec.excluded_platforms:
+    if spec.is_excluded_on(jax.devices()[0]):
       self.skipTest(f"Skip the test on {jax.devices()[0].device_kind}.")
 
     if "m1179648" in self._testMethodName and jax.default_backend() == "gpu":
