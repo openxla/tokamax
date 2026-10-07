@@ -98,5 +98,5 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
     )
     if return_residuals:
       out, residuals = fn(return_residuals=True)
-      return out, residuals
+      return out, residuals  # pyrefly: ignore[bad-return]
     return fn(), None

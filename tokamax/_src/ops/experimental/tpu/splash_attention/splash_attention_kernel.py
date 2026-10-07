@@ -1635,7 +1635,7 @@ def _splash_attention_custom(
     if config.use_base2_exp:  # for user, output values in natural base
       stats["logsumexp"] = stats["logsumexp"] / LOG2E
       stats["max_logits"] = stats["max_logits"] / LOG2E
-    return out, stats
+    return out, stats  # pyrefly: ignore[bad-return]
   else:
     return ret
 
