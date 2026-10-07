@@ -19,6 +19,7 @@ import contextlib
 import dataclasses
 import datetime
 import inspect
+import json
 import logging
 import os
 import pathlib
@@ -355,12 +356,10 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     trace_matchers = None if (re := self._event_filter_regex) is None else (re,)
 
     try:
-      self._timing_summary = get_kernel_stats_tool.compute_kernel_stats(
-          self._profile,
-          output_format='dict',
-          include_summary=True,
-          trace_matchers=trace_matchers,
+      timing_summary = get_kernel_stats_tool.compute_kernel_stats(
+          self._profile, include_summary=True, trace_matchers=trace_matchers
       )
+      self._timing_summary = json.loads(timing_summary)
     except Exception as e:
       raise RuntimeError(
           f'Could not compute timing summary via xprof_cli for {self._profile}.'
