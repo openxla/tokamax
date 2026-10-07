@@ -35,6 +35,19 @@ import jax.numpy as jnp
 # `w` being slab byte `(b, w)`. The kernel addresses both as uint8 slabs.
 SLAB_ROWS = 4  # uint8 sub-rows per 32-bit row.
 
+# Fraction of the device's VMEM the kernel may use as scoped VMEM, as other
+# Tokamax TPU kernels do. Upstream's heuristic `tile_k` for CSA with
+# `hidden_size = 7168` and f32 weights needs more than XLA's default 32 MiB.
+# Upstream vllm-torchtpu raises the limit process-wide with
+# `--xla_tpu_scoped_vmem_limit_kib`; setting it per kernel keeps the kernel
+# self-contained.
+_VMEM_USAGE_FRACTION = 0.9
+
+
+def vmem_limit_bytes() -> int:
+  """Returns the kernel's scoped VMEM limit for the current TPU."""
+  return int(_VMEM_USAGE_FRACTION * pltpu.get_tpu_info().vmem_capacity_bytes)
+
 
 def is_word_array(dtype: Any) -> bool:
   """Whether a cache is declared as 32-bit words rather than uint8 slabs."""
@@ -499,6 +512,7 @@ def proj_and_save_state(
       input_output_aliases={5: 0},  # Alias output to cache (index 5)
       compiler_params=pltpu.CompilerParams(
           disable_bounds_checks=True,
+          vmem_limit_bytes=None if interpret else vmem_limit_bytes(),
       ),
       interpret=interpret,
       name="proj_and_save_state",

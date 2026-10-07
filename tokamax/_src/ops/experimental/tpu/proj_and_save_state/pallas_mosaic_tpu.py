@@ -45,8 +45,8 @@ _TILE_N_CANDIDATES = (256, 512)
 # this are skipped, so they compile under XLA's default 32 MiB scoped VMEM limit:
 # on TPU7x an estimate of 30.25 MiB compiles and one of 32.5 MiB runs out of
 # VMEM. Upstream's heuristic config is always kept; for CSA with
-# `hidden_size = 7168` and f32 weights it needs a larger limit, which upstream
-# vllm-torchtpu sets (`--xla_tpu_scoped_vmem_limit_kib=65536`).
+# `hidden_size = 7168` and f32 weights it needs a larger limit, which the kernel
+# sets itself from the device (`pallas_mosaic_tpu_kernel.vmem_limit_bytes`).
 _VMEM_BUDGET_BYTES = 31 * 2**20
 
 
