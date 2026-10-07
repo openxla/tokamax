@@ -2263,20 +2263,45 @@ def _splash_attention_bwd_dkv(
       v_index_map,
   )
 
+  # On the dynamic grid (`grid = (num_q_heads, grid_size)`), GQA/MQA normally
+  # accumulates `dk`/`dv` across the `q_heads_per_kv_head` query heads in a KV
+  # group through an aliased HBM buffer (`dk_ref = dk_alias + dk_scratch`),
+  # cycling through `j = 0 .. kv_steps - 1` within each `q_head`. Pallas TPU's
+  # 2-deep input/output DMA pipeline requires at least 3 distinct blocks in that
+  # cycle (matching `dq_reduction_steps = 3`); when `kv_steps <= 2`, the next
+  # `q_head` prefetches `dk_alias` before the previous `q_head`'s store lands in
+  # HBM (or coalesces the load when `kv_steps == 1`). Write per-`q_head` outputs
+  # and reduce outside the kernel instead.
+  reduce_dkv_over_q_heads = (
+      dynamic_grid and q_heads_per_kv_head != 1 and kv_steps <= 2
+  )
+  alias_dkv = (
+      dynamic_grid and q_heads_per_kv_head != 1 and not reduce_dkv_over_q_heads
+  )
+
   def create_dkv_index_map(h, i, j, *_):
     del i  # Unused.
-    prefix = () if is_mqa else (_div(h, q_heads_per_kv_head),)
+    if reduce_dkv_over_q_heads:
+      prefix = (h,)
+    elif is_mqa:
+      prefix = ()
+    else:
+      prefix = (_div(h, q_heads_per_kv_head),)
     return (*prefix, j, 0)
 
   dkv_index_map = unravel(create_dkv_index_map)
 
   dk_spec = pl.BlockSpec(
-      (bkv, head_dim_qk) if is_mqa else (None, bkv, head_dim_qk),
+      (bkv, head_dim_qk)
+      if (is_mqa and not reduce_dkv_over_q_heads)
+      else (None, bkv, head_dim_qk),
       dkv_index_map,
   )
 
   dv_spec = pl.BlockSpec(
-      (bkv, head_dim_v) if is_mqa else (None, bkv, head_dim_v),
+      (bkv, head_dim_v)
+      if (is_mqa and not reduce_dkv_over_q_heads)
+      else (None, bkv, head_dim_v),
       dkv_index_map,
   )
   mask_spec = pl.BlockSpec((None, bkv, bq), mask_index_map)
@@ -2366,7 +2391,7 @@ def _splash_attention_bwd_dkv(
   else:
     dq_scratch = pltpu.VMEM((bq, head_dim_qk), jnp.float32)
 
-  if dynamic_grid and q_heads_per_kv_head != 1:
+  if alias_dkv:
     # in/out aliasing to accumulate within kv groups.
     in_specs += [dk_spec, dv_spec]
     dk = lax.empty(k.shape, dtype=jnp.float32)
@@ -2376,13 +2401,23 @@ def _splash_attention_bwd_dkv(
   else:
     in_specs += [None, None]
     dk, dv = None, None
-    dk_type = k.dtype
-    dv_type = v.dtype
+    dk_type = jnp.float32 if reduce_dkv_over_q_heads else k.dtype
+    dv_type = jnp.float32 if reduce_dkv_over_q_heads else v.dtype
 
+  dk_shape = (
+      (num_q_heads, kv_seq_len, head_dim_qk)
+      if reduce_dkv_over_q_heads
+      else k.shape
+  )
+  dv_shape = (
+      (num_q_heads, kv_seq_len, head_dim_v)
+      if reduce_dkv_over_q_heads
+      else v.shape
+  )
   out_shapes = [
       dq_shape,
-      jax.ShapeDtypeStruct(k.shape, dk_type),
-      jax.ShapeDtypeStruct(v.shape, dv_type),
+      jax.ShapeDtypeStruct(dk_shape, dk_type),
+      jax.ShapeDtypeStruct(dv_shape, dv_type),
   ]
   out_specs = [dq_spec, dk_spec, dv_spec]
 
@@ -2442,11 +2477,11 @@ def _splash_attention_bwd_dkv(
   num_args = sum(1 for x in args if x is not None)
   input_output_aliases = {}
   if dq_reduction_steps == 3:
-    if dynamic_grid and q_heads_per_kv_head != 1:
+    if alias_dkv:
       input_output_aliases = {num_args: 0, num_args + 1: 1, num_args + 2: 2}
     else:
       input_output_aliases = {num_args: 0}
-  elif dynamic_grid and q_heads_per_kv_head != 1:
+  elif alias_dkv:
     input_output_aliases = {num_args: 1, num_args + 1: 2}
 
   scratch_shapes = [
@@ -2557,6 +2592,16 @@ def _splash_attention_bwd_dkv(
         metadata=metadata,
     )(*args, dq, dk, dv)
   dq = dq_unreduced.sum(axis=0)
+  if reduce_dkv_over_q_heads:
+    dk = dk.reshape(
+        num_kv_heads, q_heads_per_kv_head, kv_seq_len, head_dim_qk
+    ).sum(axis=1)
+    dv = dv.reshape(
+        num_kv_heads, q_heads_per_kv_head, kv_seq_len, head_dim_v
+    ).sum(axis=1)
+    if is_mqa:
+      dk = jnp.squeeze(dk, axis=0)
+      dv = jnp.squeeze(dv, axis=0)
   dq = dq.astype(q.dtype)
   dk = dk.astype(k.dtype)
   dv = dv.astype(v.dtype)

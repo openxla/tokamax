@@ -356,28 +356,32 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
       self.skipTest("End-to-end Pallas Splash kernel requires TPU.")
 
   @parameterized.named_parameters(
-      ("causal_aligned_mha", True, (256, 256, 256, 256), 2, 2),
-      ("causal_straddling_mha", True, (180, 332, 200, 312), 2, 2),
-      ("causal_aligned_gqa", True, (256, 256, 256, 256), 4, 2),
-      ("full_aligned_mha", False, (256, 256, 256, 256), 2, 2),
-      ("full_straddling_gqa", False, (180, 332, 200, 312), 4, 2),
+      ("causal_aligned_mha", True, (256, 256, 256, 256), 2, 2, False),
+      ("causal_straddling_mha", True, (180, 332, 200, 312), 2, 2, False),
+      ("causal_aligned_gqa", True, (256, 256, 256, 256), 4, 2, False),
+      ("causal_short_1step_gqa", True, (64, 64), 4, 2, False),
+      ("causal_short_2step_gqa", True, (128, 128), 4, 2, False),
+      ("causal_short_3step_gqa", True, (128, 128, 128), 4, 2, False),
+      ("causal_short_1step_mqa", True, (64, 64), 4, 1, True),
+      ("causal_short_2step_mqa", True, (128, 128), 4, 1, True),
+      ("full_aligned_mha", False, (256, 256, 256, 256), 2, 2, False),
+      ("full_straddling_gqa", False, (180, 332, 200, 312), 4, 2, False),
   )
   def test_fwd_and_bwd_match_reference(
-      self, is_causal, lengths, num_q_heads, num_kv_heads
+      self, is_causal, lengths, num_q_heads, num_kv_heads, is_mqa
   ):
     seq_len = sum(lengths)
     head_dim = 128
     bq = bkv = 128
+    kv_shape = (
+        (seq_len, head_dim) if is_mqa else (num_kv_heads, seq_len, head_dim)
+    )
     k1, k2, k3, k4 = jax.random.split(jax.random.key(0), 4)
     q = jax.random.normal(
         k1, (num_q_heads, seq_len, head_dim), jnp.bfloat16
     ) / np.sqrt(head_dim).astype(jnp.bfloat16)
-    k = jax.random.normal(
-        k2, (num_kv_heads, seq_len, head_dim), jnp.bfloat16
-    ) * jnp.bfloat16(0.5)
-    v = jax.random.normal(
-        k3, (num_kv_heads, seq_len, head_dim), jnp.bfloat16
-    ) * jnp.bfloat16(0.5)
+    k = jax.random.normal(k2, kv_shape, jnp.bfloat16) * jnp.bfloat16(0.5)
+    v = jax.random.normal(k3, kv_shape, jnp.bfloat16) * jnp.bfloat16(0.5)
     do = jax.random.normal(
         k4, (num_q_heads, seq_len, head_dim), jnp.bfloat16
     ) * jnp.bfloat16(0.5)
@@ -396,7 +400,12 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
         block_kv_dkv=bkv,
         block_kv_dkv_compute=bkv,
     )
-    attn = splash.make_splash_mha_single_device(mask, config=config)
+    make_attn = (
+        splash.make_splash_mqa_single_device
+        if is_mqa
+        else splash.make_splash_mha_single_device
+    )
+    attn = make_attn(mask, config=config)
     o, attn_vjp = jax.vjp(attn, q, k, v, segment_ids)
     dq, dk, dv, _ = attn_vjp(do)
 
@@ -411,7 +420,7 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
         dense_mask,
         segment_ids,
         None,
-        is_mqa=False,
+        is_mqa=is_mqa,
         save_residuals=True,
     )
     dq_ref, dk_ref, dv_ref, _ = base.attention_reference_vjp(
@@ -424,7 +433,7 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
         None,
         o_ref,
         stats_ref["logsumexp"],
-        is_mqa=False,
+        is_mqa=is_mqa,
     )
 
     np.testing.assert_allclose(o, o_ref, atol=2e-2, rtol=2e-2)
