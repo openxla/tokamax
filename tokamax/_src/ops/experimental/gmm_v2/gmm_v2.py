@@ -258,6 +258,7 @@ class TileSizes:
   tile_k: int
   tile_n: int
   bucket_base: int
+  lhs_buffer_count: int = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -430,6 +431,7 @@ def generate_block_specs(
   lhs_value_spec = pl.BlockSpec(
       (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_k),
       index_map.lhs_index_map,
+      pipeline_mode=pl.Buffered(buffer_count=cfgs.tiles.lhs_buffer_count),
   )
   lhs_scale_spec = None
   if cfgs.lhs_cfgs.has_scale:
@@ -1129,10 +1131,12 @@ def calculate_tiling(
   tile_k = align_to(dims.size_k, num_lanes)
   tile_n = align_to(size_n_per_rhs, num_lanes)
 
-  def _gmm_vmem_estimate(tm: int, tn: int, tk: int) -> int:
-    # 1. LHS tile (double-buffered HBM load)
+  def _gmm_vmem_estimate(
+      tm: int, tn: int, tk: int, lhs_buffer_count: int = 2
+  ) -> int:
+    # 1. LHS tile (double- or triple-buffered HBM load)
     lhs_tile_bytes = lhs_bits // 8
-    lhs_vmem = 2 * tm * tk * lhs_tile_bytes
+    lhs_vmem = lhs_buffer_count * tm * tk * lhs_tile_bytes
     # If LHS is quantized on-the-fly, we need an extra single-buffered cast
     # buffer in VMEM.
     if lhs_cfgs.should_quantize:
@@ -1218,8 +1222,19 @@ def calculate_tiling(
       break
     tile_m = new_tile_m
 
+  lhs_buffer_count = (
+      3
+      if _gmm_vmem_estimate(tile_m, tile_n, tile_k, lhs_buffer_count=3)
+      <= vmem_limit_bytes
+      else 2
+  )
+
   return TileSizes(
-      tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
+      tile_m=tile_m,
+      tile_k=tile_k,
+      tile_n=tile_n,
+      bucket_base=bucket_base,
+      lhs_buffer_count=lhs_buffer_count,
   )
 
 

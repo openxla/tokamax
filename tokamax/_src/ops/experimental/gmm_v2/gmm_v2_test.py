@@ -1746,7 +1746,6 @@ class GmmTest(parameterized.TestCase):
     chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
 
 
-
 class GmmV2CalculateTilingTest(parameterized.TestCase):
   """Tests for calculate_tiling edge cases regarding vmem floor limits."""
 
@@ -1811,6 +1810,79 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
     tile_n_limit = mock_tpu_info.mxu_column_size * 2
     if not expected_tile_n_less_than_limit:
       self.assertGreaterEqual(tiles.tile_n, tile_n_limit)
+
+  @mock.patch.object(gmm_v2.pltpu, "get_tpu_info")
+  def test_lhs_buffer_count_fallback(self, mock_get_tpu_info):
+    mock_tpu_info = mock.create_autospec(
+        gmm_v2.pltpu.TpuInfo, instance=True, spec_set=False
+    )
+    mock_tpu_info.num_lanes = 128
+    mock_tpu_info.mxu_column_size = 128
+    mock.seal(mock_tpu_info)
+    mock_get_tpu_info.return_value = mock_tpu_info
+
+    dims = gmm_v2.Dimensions(
+        size_m=256,
+        size_k=1024,
+        size_n=1024,
+        size_group=1,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    lhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=None,
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+    )
+    rhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=None,
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+        is_transposed=False,
+    )
+
+    # Test with very large memory limit -> should use 3 buffers
+    tiles_large = gmm_v2.calculate_tiling(
+        dims=dims,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        vmem_limit_bytes=100000000,
+    )
+    self.assertEqual(tiles_large.lhs_buffer_count, 3)
+
+    # Calculate memory for a 3-buffer tile vs 2-buffer tile to find the threshold
+    # Instead of guessing, we can try a limit that allows the exact tiles_large sizes
+    # for 2 buffers, but rejects it for 3 buffers.
+    # LHS vmem = lhs_buffer_count * tm * tk * 2 bytes.
+    # RHS weight vmem = 3 * tk * tn * 2 bytes (always 3 buffers).
+    tk, tn, tm = tiles_large.tile_k, tiles_large.tile_n, tiles_large.tile_m
+    rhs_weight_size = tk * tn * 2
+    lhs_tile_size = tm * tk * 2
+    acc_vmem = tm * tn * 4
+    out_vmem = 2 * tm * tn * 2
+    base_vmem = acc_vmem + out_vmem + 3 * rhs_weight_size
+
+    # Limit to enough memory for 2 buffers but not 3 buffers
+    tight_limit = base_vmem + 2 * lhs_tile_size
+
+    tiles_tight = gmm_v2.calculate_tiling(
+        dims=dims,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        vmem_limit_bytes=tight_limit,
+    )
+    self.assertEqual(tiles_tight.lhs_buffer_count, 2)
+
+    # Ensure tiles_tight was able to preserve the same tile sizes as tiles_large
+    # (since the whole point of falling back to 2 is to avoid shrinking tiles)
+    self.assertEqual(tiles_tight.tile_m, tiles_large.tile_m)
+    self.assertEqual(tiles_tight.tile_n, tiles_large.tile_n)
+    self.assertEqual(tiles_tight.tile_k, tiles_large.tile_k)
+
 
 class GmmV2VmemStressTest(parameterized.TestCase):
   """AOT compilation and VMEM stress tests for GMM v2.
