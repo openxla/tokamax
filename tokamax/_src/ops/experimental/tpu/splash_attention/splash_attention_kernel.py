@@ -312,7 +312,10 @@ class SplashConfig:
   # The fused bwd kernel accumulates dq at every grid step. To safely avoid
   # read/write conflicts we conservatively avoid *any* in-kernel reductions.
   # This parameter allows to override this behavior and specifies the number of
-  # reduction steps. For now, only 3 or all the kv steps are supported.
+  # reduction steps. For now, only 3 or all the kv steps are supported. 1
+  # accumulates dq in VMEM; it requires a dynamic dkv grid that visits every q
+  # block in one run of consecutive steps (see
+  # `mask_info_lib.dkv_q_blocks_are_contiguous`).
   dq_reduction_steps: int | None = None
   # An experimental scheduler that sometimes produces better softmax overlap.
   use_experimental_scheduler: bool = False
@@ -336,6 +339,13 @@ class SplashConfig:
   # block, split the SV matmul into a qk_diag_grid x qk_diag_grid sub-grid and
   # skip sub-tiles strictly above the diagonal (kj > qi) during dot_general.
   sv_diag_skip: bool = False
+  # With qk_diag_skip, run the dkv kernel's causal diagonal block as
+  # qk_diag_grid kv row-bands, each over only the queries it attends to, so the
+  # softmax and dv/dp/dk/dq work also skip the strictly-above-diagonal tiles.
+  # The bands accumulate dq into the VMEM dq scratch, so in the fused kernel
+  # this needs dq_reduction_steps=1 (qk_diag_skip forces square dkv blocks,
+  # which otherwise have no dq scratch); without it the stock path is used.
+  diag_band_skip: bool = False
   # Attention dropout probability, applied to the softmax weights. The mask is
   # generated inside the kernel per (head, q block, kv block) tile from a
   # `prng_key` passed at call time, so it costs no HBM traffic and is never
@@ -380,9 +390,9 @@ class SplashConfig:
     if self.block_kv_dkv_compute is None:
       object.__setattr__(self, "block_kv_dkv_compute", self.block_kv_dkv)
 
-    if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
+    if self.dq_reduction_steps not in (None, 1, 3):
       raise ValueError(
-          f"Invalid dq_reduction_steps: {self.dq_reduction_steps}, only 3 or"
+          f"Invalid dq_reduction_steps: {self.dq_reduction_steps}, only 1, 3 or"
           " None are supported."
       )
     if not self.use_fused_bwd_kernel:
@@ -1911,6 +1921,7 @@ def _flash_attention_dkv_kernel(
     mask_function: MaskFunctionType | None,
     q_heads_per_kv_head: int,
     config: SplashConfig,
+    use_vmem_dq_reduction: bool = False,
 ):
   del mask_next_ref
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
@@ -1919,6 +1930,7 @@ def _flash_attention_dkv_kernel(
   if attn_logits_soft_cap is not None and config.use_base2_exp:
     attn_logits_soft_cap *= LOG2E
 
+  should_initialize_dq = should_write_dq = True
   if active_rows_ref is not None:
     assert bounds_start_ref is not None
     assert bounds_end_ref is not None
@@ -1926,6 +1938,17 @@ def _flash_attention_dkv_kernel(
     kv_index = active_rows_ref[grid_idx].astype(jnp.int32)
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
+    if use_vmem_dq_reduction:
+      # A q block's kv steps are consecutive, so dq stays in VMEM across them.
+      col = lambda g: active_cols_ref[g].astype(jnp.int32)
+      last = pl.num_programs(1) - 1
+      should_initialize_dq = jnp.logical_or(
+          grid_idx == 0, col(jnp.maximum(grid_idx - 1, 0)) != col(grid_idx)
+      )
+      should_write_dq = jnp.logical_or(
+          grid_idx == last,
+          col(jnp.minimum(grid_idx + 1, last)) != col(grid_idx),
+      )
     if dropout_rate:
       # Mirrors the fwd indices: rows are kv blocks and cols are q blocks here.
       q_head = pl.program_id(0)
@@ -2000,6 +2023,91 @@ def _flash_attention_dkv_kernel(
         NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
     _g = config.qk_diag_grid
+    sk, sq = bkv_compute // _g, bq // _g
+    if (
+        config.qk_diag_skip
+        and config.diag_band_skip
+        and has_partial_mask
+        and not dropout_rate
+        and (dq_scratch_ref is not None or dq_ref is None)
+        and bkv_compute % _g == 0
+        and bq % _g == 0
+        and sk % NUM_LANES == 0
+        and sq % NUM_LANES == 0
+    ):
+      # Row-band diagonal skip: on an aligned causal diagonal block, kv band ki
+      # only attends to queries [ki * sq, bq), so run the backward for each band
+      # on that contiguous query suffix instead of the full tile.
+      exp = jnp.exp2 if config.use_base2_exp else jnp.exp
+      dk_dims = (
+          NN_DIM_NUMBERS
+          if config.q_layout == HEAD_DIM_MINOR
+          else NT_DIM_NUMBERS
+      )
+      q_view = lambda ref, s: None if ref is None else ref.at[:, s]
+      for ki in range(_g):
+        q0, k0 = ki * sq, ki * sk
+        qs = pl.ds(q0, bq - q0)
+        if config.q_layout == HEAD_DIM_MINOR:
+          q_b, scaled_q_b = q[q0:, :], scaled_q[q0:, :]
+        else:
+          q_b, scaled_q_b = q[:, q0:], scaled_q[:, q0:]
+        k_b, v_b, do_b = k[k0 : k0 + sk, :], v[k0 : k0 + sk, :], do[q0:, :]
+        qk_b = lax.dot_general(
+            k_b, scaled_q_b, qk_dims, preferred_element_type=jnp.float32
+        )
+        p_b = exp(
+            _apply_mask_and_soft_cap(
+                qk_b,
+                mask_value,
+                q_view(mask_ref, qs),
+                q_view(q_sequence_ref, qs),
+                q_view(q_segment_ids_ref, qs),
+                kv_segment_ids_ref,
+                attn_logits_soft_cap=attn_logits_soft_cap,
+                k_slice=pl.ds(i * bkv_compute + k0, sk),
+                k_offset=kv_index * bkv + i * bkv_compute + k0,
+                bq=bq - q0,
+                k_in_lanes=False,
+                mask_function=mask_function,
+                has_partial_mask=True,
+            )
+            - logsumexp[:, q0:]
+        )
+        dp_b = lax.dot_general(
+            v_b, do_b, NT_DIM_NUMBERS, preferred_element_type=jnp.float32
+        )
+        ds_b = (dp_b - di[:, q0:]) * p_b
+        if attn_logits_soft_cap is not None:
+          d = jnp.tanh(qk_b / attn_logits_soft_cap)
+          ds_b = ds_b * (1 - d * d)
+        kv_rows = pl.ds(i * bkv_compute + k0, sk)
+        dv_scratch_ref[kv_rows, :] += lax.dot(
+            p_b.astype(do.dtype), do_b, preferred_element_type=jnp.float32
+        ).astype(dv_scratch_ref.dtype)
+        dk_b = lax.dot_general(
+            ds_b.astype(do.dtype),
+            scaled_q_b if config.dkv_reuse_scaled_q else q_b,
+            dk_dims,
+            preferred_element_type=jnp.float32,
+        )
+        if config.use_base2_exp and (
+            config.dkv_reuse_scaled_q or config.q_prescaled_log2e
+        ):
+          dk_b = dk_b / LOG2E
+        dk_scratch_ref[kv_rows, :] += dk_b.astype(dk_scratch_ref.dtype)
+        if dq_scratch_ref is not None:
+          dq_b = lax.dot_general(
+              ds_b.T if _is_fp8(k) else ds_b.T.astype(k.dtype),
+              k_b,
+              NN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )
+          if config.q_prescaled_log2e:
+            dq_b = dq_b / LOG2E
+          dq_scratch_ref[q0:, :] += dq_b
+      return
+
     if (
         config.qk_diag_skip
         and has_partial_mask
@@ -2143,7 +2251,11 @@ def _flash_attention_dkv_kernel(
           dq_ref[...] = dq.astype(dq_ref.dtype)
 
   if dq_scratch_ref is not None:
-    dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
+
+    @pl.when(should_initialize_dq)
+    def _init_dq_scratch():
+      dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
+
   elif dq_alias is not None:
     dq_ref[...] = dq_alias[...]
   else:
@@ -2164,10 +2276,13 @@ def _flash_attention_dkv_kernel(
     )
 
   if dq_scratch_ref is not None:
-    if dq_alias is not None:
-      dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
-    else:
-      dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
+
+    @pl.when(should_write_dq)
+    def _write_dq_scratch():
+      if dq_alias is not None:
+        dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
+      else:
+        dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
   if dk_alias is None:
     assert dv_alias is None
@@ -2419,12 +2534,18 @@ def _splash_attention_bwd_dkv(
     q_sequence = None
     in_specs.append(None)
 
+  use_vmem_dq_reduction = dynamic_grid and config.dq_reduction_steps == 1
   dq_reduction_steps = 3 if dynamic_grid else config.dq_reduction_steps
   if not dynamic_grid and kv_steps <= 3 and dq_reduction_steps == 3:
     dq_reduction_steps = None
+  if use_vmem_dq_reduction:
+    dq_reduction_steps = None  # dq is not accumulated or aliased in HBM.
 
   dq = dq_alias_spec = None
-  if dq_reduction_steps == 3:
+  if use_vmem_dq_reduction:
+    dq_spec = pl.BlockSpec((None, bq, head_dim_qk), o_index_map)
+    dq_shape = jax.ShapeDtypeStruct(q.shape, _unquantized_dtype(q))
+  elif dq_reduction_steps == 3:
     dq_index_map = (
         (lambda h, g, r, c, *_: (g % 3, h, to_i32(c[g]), 0))
         if dynamic_grid
@@ -2446,7 +2567,7 @@ def _splash_attention_bwd_dkv(
 
   in_specs += [dq_alias_spec]
 
-  if bkv == bkv_compute:
+  if bkv == bkv_compute and not use_vmem_dq_reduction:
     dq_scratch = None
   else:
     dq_scratch = pltpu.VMEM((bq, head_dim_qk), jnp.float32)
@@ -2492,6 +2613,7 @@ def _splash_attention_bwd_dkv(
       bkv=bkv,
       mask_function=mask_function,
       q_heads_per_kv_head=q_heads_per_kv_head,
+      use_vmem_dq_reduction=use_vmem_dq_reduction,
   )
 
   kernel_name = get_kernel_name(
@@ -2651,7 +2773,7 @@ def _splash_attention_bwd_dkv(
         interpret=config.interpret,
         metadata=metadata,
     )(*args, dq, dk, dv)
-  dq = dq_unreduced.sum(axis=0)
+  dq = dq_unreduced if use_vmem_dq_reduction else dq_unreduced.sum(axis=0)
   if reduce_dkv_over_q_heads:
     dk = dk.reshape(
         num_kv_heads, q_heads_per_kv_head, kv_seq_len, head_dim_qk
@@ -2927,8 +3049,20 @@ def _make_splash_attention(
         mask,
         (bq_dkv, bkv_dkv),
         is_dkv=True,
-        return_dynamic_grid=config.dq_reduction_steps == 3,
+        return_dynamic_grid=config.dq_reduction_steps in (1, 3),
     )
+    assert bq_dkv is not None
+    q_blocks_per_shard = mask.shape[0] // q_seq_shards // bq_dkv
+    if config.dq_reduction_steps == 1 and not (
+        mask_info_lib.dkv_q_blocks_are_contiguous(
+            dkv_mask_info, q_blocks_per_shard
+        )
+    ):
+      raise ValueError(
+          "dq_reduction_steps=1 requires the dkv grid to visit every q block in"
+          " one run of consecutive steps, which this mask and block sizes do"
+          " not. Use dq_reduction_steps=3 or None."
+      )
 
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 

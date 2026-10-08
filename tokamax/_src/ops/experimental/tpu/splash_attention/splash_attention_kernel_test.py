@@ -779,6 +779,58 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     with self.assertRaisesRegex(ValueError, "CausalMask"):
       splash.make_splash_mha_single_device(local, config=config)
 
+  @parameterized.product(
+      # (diag_band_skip, dq_reduction_steps). The band path accumulates dq in
+      # the VMEM scratch, which square dkv tiles only have with
+      # dq_reduction_steps=1, so there is no band-only case here.
+      band_and_dq=((False, 1), (True, 1)),
+      scaled_q=(False, True),
+      qk_dtype=("bfloat16", "float8_e4m3fn"),
+  )
+  def test_diag_band_skip_and_vmem_dq_reduction(
+      self, band_and_dq, scaled_q, qk_dtype
+  ):
+    """Row-band diagonal skip and VMEM dq reduction match the stock bwd."""
+    diag_band_skip, dq_reduction_steps = band_and_dq
+    seq_len, num_heads, head_dim_qk, block = 1024, 2, 192, 512
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        qk_dtype
+    )
+    k = (random.normal(k2, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        qk_dtype
+    )
+    v = (random.normal(k3, (num_heads, seq_len, 128)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    do = (random.normal(k4, (num_heads, seq_len, 128)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def grads(optimized: bool):
+      config = splash.SplashConfig(
+          block_q=block, block_kv=block, block_kv_compute=block,
+          block_q_dkv=block, block_kv_dkv=block, block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True, residual_checkpoint_name="context",
+          qk_diag_grid=4, interpret=self.INTERPRET,
+          use_base2_exp=scaled_q, dkv_reuse_scaled_q=scaled_q,
+          q_prescaled_log2e=scaled_q,
+          qk_diag_skip=optimized,
+          diag_band_skip=optimized and diag_band_skip,
+          dq_reduction_steps=dq_reduction_steps if optimized else None,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+
+      def bwd(q, k, v, do):
+        _, vjp = jax.vjp(lambda q, k, v: attn(q, k, v), q, k, v)
+        return vjp(do)
+
+      return jax.jit(bwd)(q, k, v, do)
+
+    for r, g in zip(grads(False), grads(True)):
+      self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
+
   @parameterized.named_parameters(
       dict(testcase_name="grid2", qk_diag_grid=2, head_dim_qk=128),
       dict(testcase_name="grid4", qk_diag_grid=4, head_dim_qk=192),
