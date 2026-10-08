@@ -15,9 +15,7 @@
 """Tests for Pallas/Mosaic Ragged Gather V2 operator on TPU."""
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
-import jax.numpy as jnp
 from tokamax._src.ops.ragged_gather import pallas_mosaic_v2_tpu
 from tokamax._src.ops.ragged_gather import test_base
 
@@ -31,14 +29,23 @@ class PallasTpuRaggedGatherV2Test(test_base.RaggedGatherTestBase):
         *args, gather_fn=pallas_mosaic_v2_tpu.PallasV2TpuRaggedGather()
     )
 
-  @parameterized.product(
-      in_out_size=[(512, 32), (512, 400), (512, 1024)],
-      start_end=[(3, 28), (3, 338), (10, 422)],
-      hidden_size=[128, 512, 8192],
-      dtype=[jnp.int4],
-  )
-  def test_sc_gather_int4(self, in_out_size, hidden_size, start_end, dtype):
-    self.check_sc_gather(in_out_size, hidden_size, start_end, dtype)
+  def check_sc_gather(
+      self, in_out_size, hidden_size, start_end, dtype, **kwargs
+  ):
+    for max_row_subchunks in [1, 4]:
+      for trim_rows in [True, False]:
+        with self.subTest(
+            max_row_subchunks=max_row_subchunks, trim_rows=trim_rows
+        ):
+          super().check_sc_gather(
+              in_out_size,
+              hidden_size,
+              start_end,
+              dtype,
+              max_row_subchunks=max_row_subchunks,
+              trim_rows=trim_rows,
+              **kwargs,
+          )
 
 
 if __name__ == "__main__":

@@ -34,7 +34,9 @@ class RaggedGatherTestBase(parameterized.TestCase):
     super().__init__(*args)
     self._gather_fn = gather_fn
 
-  def check_sc_gather(self, in_out_size, hidden_size, start_end, dtype):
+  def check_sc_gather(
+      self, in_out_size, hidden_size, start_end, dtype, **kwargs
+  ):
     """Checks the gathered rows in `[start, end)` match `base.RaggedGather`."""
     if backend.get_default_device().device_kind != "TPU7x":
       self.skipTest("Only tested on TPU7x.")
@@ -51,7 +53,13 @@ class RaggedGatherTestBase(parameterized.TestCase):
     start_arr = jnp.array([start], jnp.int32)
     end_arr = jnp.array([end], jnp.int32)
 
-    actual = self._gather_fn(x, indices, start_arr, end_arr)
+    actual = self._gather_fn(x, indices, start_arr, end_arr, **kwargs)
+
+    self.assertEqual(actual.shape[1], hidden_size)
+    if kwargs.get("trim_rows", True):
+      self.assertEqual(actual.shape[0], out_size)
+    else:
+      self.assertGreaterEqual(actual.shape[0], out_size)
 
     base_op = base.RaggedGather()
     desired = base_op(x, indices, start_arr, end_arr)
@@ -64,9 +72,20 @@ class RaggedGatherTestBase(parameterized.TestCase):
       in_out_size=[(512, 32), (512, 400), (512, 1024)],
       start_end=[(3, 28), (3, 338), (10, 422)],
       hidden_size=[128, 512, 8192],
-      dtype=[jnp.int8, jnp.bfloat16, jnp.float32],
+      dtype=[jnp.int4, jnp.int8, jnp.bfloat16, jnp.float32],
   )
   def test_sc_gather(self, in_out_size, hidden_size, start_end, dtype):
     """Checks the gathered rows in `[start, end)` match `base.RaggedGather`."""
     self.check_sc_gather(in_out_size, hidden_size, start_end, dtype)
+
+  @parameterized.parameters(
+      (512, 1024, 8192),
+      (1024, 2048, 8192),
+      (2048, 4096, 8192),
+  )
+  def test_benchmark_shapes(self, in_size, out_size, hidden_size):
+    """Checks benchmark shapes match `base.RaggedGather`."""
+    self.check_sc_gather(
+        (in_size, out_size), hidden_size, (0, out_size), jnp.bfloat16
+    )
 
