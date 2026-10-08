@@ -26,6 +26,14 @@ import jax.numpy as jnp
 DEFAULT_VMEM_LIMIT_FACTOR: float = 0.80
 
 
+class AttentionMode(enum.StrEnum):
+  # Gated Delta Net: one scalar gate per value head.
+  GDN = enum.auto()
+  # Kimi Delta Attention: the gate is per-channel, so it carries
+  # `kq_head_dim` values per value head instead of one.
+  KDA = enum.auto()
+
+
 class GDNMode(enum.StrEnum):
   BATCHED = enum.auto()
   PER_SEQ = enum.auto()
@@ -72,6 +80,10 @@ class GDNConfig:
   num_v_heads: int
   kq_head_dim: int
   v_head_dim: int
+  attention_mode: AttentionMode = AttentionMode.GDN
+  # KDA only, and must be negative. Selects the bounded gate form over the
+  # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
+  gate_lower_bound: float | None = None
   num_buffers: int = 2
   # Max tokens per speculative verify window (= num_speculative_tokens + 1),
   # which is also the number of state checkpoints kept per sequence. The
@@ -131,7 +143,19 @@ class GDNConfig:
 
   @property
   def is_kda(self) -> bool:
-    return getattr(self, "attention_mode", None) == "kda"
+    return self.attention_mode == AttentionMode.KDA
+
+  @property
+  def gate_dim(self) -> int:
+    """Width of the gate activation `a`, in elements per token."""
+    if self.is_kda:
+      return self.num_v_heads * self.kq_head_dim
+    return self.num_v_heads
+
+  @property
+  def aligned_gate_dim(self) -> int:
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    return pl.cdiv(self.gate_dim, num_lanes) * num_lanes
 
   @property
   def triangular_block_size(self) -> int:
@@ -156,9 +180,11 @@ class GDNConfig:
     # Windows of different sizes compile to different kernels; keep them
     # distinguishable in profiles.
     suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
+    if self.is_kda and self.gate_lower_bound is not None:
+      suffix += "_bounded"
     return (
-        f"fused_conv1d_gdn_{self.mode.value}_b{self.seq_tile_size}"
-        f"_c{self.chunk_size}{suffix}"
+        f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
+        f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
     )
 
   def get_metadata(self) -> dict[str, str | int | float]:

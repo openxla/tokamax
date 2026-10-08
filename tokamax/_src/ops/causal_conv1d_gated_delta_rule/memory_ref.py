@@ -480,7 +480,10 @@ def create_allocs(
     OutBufferedRef,
 ]:
   qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
-  ba_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
+  b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
+  # Same shape as b under GDN; under KDA the gate is per-channel, so it is
+  # d_k times wider (see GDNConfig.gate_dim).
+  a_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_gate_dim)
 
   out_shape = (
       cfg.seq_tile_size,
@@ -515,7 +518,8 @@ def create_allocs(
   )
 
   qkv_spec = block_spec_partial(block_shape=qkv_shape)
-  ba_spec = block_spec_partial(block_shape=ba_shape)
+  b_spec = block_spec_partial(block_shape=b_shape)
+  a_spec = block_spec_partial(block_shape=a_shape)
   in_buffered_partial = functools.partial(
       InBufferedRef.input,
       buffer_count=pipeline_mode.buffer_count,
@@ -524,8 +528,8 @@ def create_allocs(
       metadata_ref=metadata_ref,
   )
   qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
-  b_alloc = in_buffered_partial(spec=ba_spec, dtype_or_type=b_ref)
-  a_alloc = in_buffered_partial(spec=ba_spec, dtype_or_type=a_ref)
+  b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
+  a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
 
   out_alloc = OutBufferedRef.output(
       spec=block_spec_partial(block_shape=out_shape),

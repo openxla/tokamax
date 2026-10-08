@@ -14,6 +14,9 @@
 # ==============================================================================
 """Tests for GDN kernel synced from tpu-inference."""
 
+import dataclasses
+import functools
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -1060,6 +1063,310 @@ class GDNAttentionTest(parameterized.TestCase):
         np.any(np.asarray(rec_after_b[write_slot]) != 0.0),
         "write_slot should hold the step's final recurrent state",
     )
+
+  def test_per_seq_rolls_read_offsets_with_start_seq(self):
+    """PER_SEQ continuation behind a decode sequence honors read_offsets."""
+    kq_head_dim = 128
+    v_head_dim = 128
+    n_kq = 2
+    n_v = 8
+    kernel_size = 4
+    conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+
+    # Seq 0: 1-token decode at slot 1 with read_offset=0.
+    # Seq 1: 32-token continuation prefill with base state_indices=10,
+    # read_offsets=2 (initial state lives at slot 12), writing final state to
+    # base slot 10.
+    num_blocks = 16
+    rngs = iter(jax.random.split(jax.random.key(31), 10))
+    qkv = jax.random.normal(next(rngs), (33, conv_dim))
+    b = jax.random.normal(next(rngs), (33, n_v))
+    a = jax.random.normal(next(rngs), (33, n_v))
+    conv_weight = jax.random.normal(next(rngs), (conv_dim, 1, kernel_size))
+    conv_bias = jax.random.normal(next(rngs), (conv_dim,))
+    a_log = jax.random.normal(next(rngs), (n_v,))
+    dt_bias = jax.random.normal(next(rngs), (n_v,))
+
+    conv_state = jax.random.normal(
+        next(rngs), (num_blocks, kernel_size - 1, conv_dim)
+    )
+    recurrent_state = jax.random.normal(
+        next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim)
+    )
+
+    common_static = dict(
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=kq_head_dim,
+        d_v=v_head_dim,
+        kernel_size=kernel_size,
+        # Same chunk schedule in both calls, so 1e-5 compares like for like.
+        mixed_tile_size=32,
+    )
+
+    (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_state=jnp.array(conv_state),
+        recurrent_state=jnp.array(recurrent_state),
+        query_start_loc=jnp.array([0, 1, 33], dtype=jnp.int32),
+        state_indices=jnp.array([1, 10], dtype=jnp.int32),
+        read_state_indices=jnp.array([1, 10], dtype=jnp.int32),
+        read_offsets=jnp.array([0, 2], dtype=jnp.int32),
+        distribution=jnp.array([1, 2, 2], dtype=jnp.int32),
+        seq_lens=jnp.array([10, 64], dtype=jnp.int32),
+        **common_static,
+    )
+
+    # Reference: run Seq 1 directly reading from slot 12 (10 + 2) and writing
+    # to slot 10 with read_offsets=0.
+    (conv_ref, rec_ref), out_ref = wrapper.fused_conv1d_gdn(
+        qkv=qkv[1:],
+        b=b[1:],
+        a=a[1:],
+        conv_state=jnp.array(conv_state),
+        recurrent_state=jnp.array(recurrent_state),
+        query_start_loc=jnp.array([0, 32], dtype=jnp.int32),
+        state_indices=jnp.array([10], dtype=jnp.int32),
+        read_state_indices=jnp.array([12], dtype=jnp.int32),
+        read_offsets=jnp.array([0], dtype=jnp.int32),
+        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+        seq_lens=jnp.array([64], dtype=jnp.int32),
+        **common_static,
+    )
+
+    np.testing.assert_allclose(out[1:], out_ref, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(conv_out[10], conv_ref[10], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(rec_out[10], rec_ref[10], rtol=1e-5, atol=1e-5)
+
+  def test_inner_kernel_explicit_p_id_matches_default(self):
+    """Explicit p_id in inner_kernel overrides pl.program_id(0)."""
+    config = wrapper.config
+    memory_ref = wrapper.memory_ref
+    metadata = wrapper.metadata
+    tiling = wrapper.tiling
+    pl = wrapper.pl
+    kq_head_dim = 128
+    v_head_dim = 128
+    n_kq = 2
+    n_v = 8
+    kernel_size = 4
+    batch_size = 32
+    dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+    num_blocks = 4
+
+    rngs = iter(jax.random.split(jax.random.key(41), 10))
+    qkv = jax.random.normal(next(rngs), (batch_size, dim))
+    b = jax.random.normal(next(rngs), (batch_size, n_v))
+    a = jax.random.normal(next(rngs), (batch_size, n_v))
+    conv_weight = jax.random.normal(next(rngs), (dim, 1, kernel_size))
+    conv_bias = jax.random.normal(next(rngs), (dim,))
+    a_log = jax.random.normal(next(rngs), (n_v,))
+    dt_bias = jax.random.normal(next(rngs), (n_v,))
+    conv_state = jax.random.normal(
+        next(rngs), (num_blocks, kernel_size - 1, dim)
+    )
+    recurrent_state = jax.random.normal(
+        next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim)
+    )
+
+    query_start_loc = jnp.array([0, batch_size], dtype=jnp.int32)
+    state_indices = jnp.array([1], dtype=jnp.int32)
+    distribution = jnp.array([0, 1, 1], dtype=jnp.int32)
+    seq_lens = jnp.array([batch_size], dtype=jnp.int32)
+
+    (conv_ref, rec_ref), out_ref = wrapper.fused_conv1d_gdn(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_state=jnp.array(conv_state),
+        recurrent_state=jnp.array(recurrent_state),
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=query_start_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        seq_lens=seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=kq_head_dim,
+        d_v=v_head_dim,
+        kernel_size=kernel_size,
+        mixed_tile_size=batch_size,
+    )
+
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    aligned_num_v_heads = tiling.align_to(n_v, num_lanes)
+    num_v_pad = aligned_num_v_heads - n_v
+    qkv_3d = qkv.reshape(batch_size, 1, -1)
+    b_3d = jnp.pad(b, ((0, 0), (0, num_v_pad))).reshape(batch_size, 1, -1)
+    a_3d = jnp.pad(a, ((0, 0), (0, num_v_pad))).reshape(batch_size, 1, -1)
+    in_conv = jnp.array(conv_state).reshape(-1, kernel_size - 1, 1, dim)
+    in_rec = jnp.array(recurrent_state)
+    weights = memory_ref.WeightRefs(
+        conv=memory_ref.ConvWeightsRef(
+            weight=conv_weight.swapaxes(0, 2).astype(jnp.float32),
+            bias=conv_bias.astype(jnp.float32),
+        ),
+        gdn=memory_ref.GDNWeightsRef(a_log=a_log, dt_bias=dt_bias),
+    )
+
+    cfg = config.GDNConfig(
+        mode=config.GDNMode.PER_SEQ,
+        batch_size=batch_size,
+        kernel_size=kernel_size,
+        tile_size=batch_size,
+        window_size=1,
+        dim_size=dim,
+        num_kq_heads=n_kq,
+        num_v_heads=n_v,
+        kq_head_dim=kq_head_dim,
+        v_head_dim=v_head_dim,
+        dtypes=config.Dtypes(
+            act_in=qkv.dtype,
+            act_out=qkv.dtype,
+            compute=jnp.float32.dtype,
+            recurrent_state=in_rec.dtype,
+            conv_state=in_conv.dtype,
+        ),
+    )
+    dma_meta = metadata.compute_per_seq_metadata(
+        cfg=cfg,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        state_indices=state_indices,
+        start_seq=distribution[0],
+        end_seq=distribution[-1],
+        read_indices=state_indices,
+        read_offsets=jnp.zeros_like(state_indices),
+    )
+    # Place the valid tile record at index 1 and zero out index 0 so a kernel
+    # that ignores p_id=1 and reads pl.program_id(0)==0 sees r_size=0.
+    s = memory_ref.PackedPIdRecord.STRUCT_SIZE
+    shifted_records = (
+        jnp.zeros((2 * s,), dtype=dma_meta.records.dtype)
+        .at[s : 2 * s]
+        .set(dma_meta.records[:s])
+    )
+    inner_meta = dataclasses.replace(dma_meta, records=shifted_records)
+
+    def custom_outer(
+        dma_meta_ref,
+        inner_meta_ref,
+        qkv_ref,
+        b_ref,
+        a_ref,
+        conv_state_ref,
+        recurrent_state_ref,
+        _,
+        weights_ref,
+        out_ref,
+        conv_state_out_ref,
+        recurrent_state_out_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+    ):
+      del conv_state_out_ref, recurrent_state_out_ref
+      allocs = memory_ref.create_allocs(
+          metadata_ref=dma_meta_ref,
+          qkv_ref=qkv_ref,
+          b_ref=b_ref,
+          a_ref=a_ref,
+          out_ref=out_ref,
+          conv_state_ref=conv_state_ref,
+          recurrent_state_ref=recurrent_state_ref,
+          cfg=cfg,
+      )
+      qkv_a, b_a, a_a, conv_a, rec_a, out_a = allocs
+      pipeline_fn = pltpu.emit_pipeline(
+          body=functools.partial(
+              wrapper.inner_kernel, cfg=cfg, p_id=jnp.int32(1)
+          ),
+          grid=(dma_meta_ref.num_tiles[...],),
+          in_specs=(
+              qkv_a.spec,
+              b_a.spec,
+              a_a.spec,
+              conv_a.spec,
+              rec_a.spec,
+          ),
+          out_specs=(out_a.spec,),
+      )
+
+      @pl.with_scoped(allocations=allocs)
+      def _run(allocations):
+        pipeline_fn(
+            qkv_ref,
+            b_ref,
+            a_ref,
+            conv_state_ref,
+            recurrent_state_ref,
+            out_ref,
+            scratches=(
+                inner_meta_ref,
+                weights_ref,
+                carry_conv_scratch_ref,
+                carry_recurrent_scratch_ref,
+            ),
+            allocations=allocations,
+        )
+
+      _run()
+
+    smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    meta_spec = jax.tree.map(lambda _: smem_spec, dma_meta)
+    weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
+    out_init = jnp.zeros_like(cfg.get_out_shape())
+    n_meta = 2 * len(dma_meta)
+    aliases = {n_meta + 3: 1, n_meta + 4: 2, n_meta + 5: 0}
+
+    out_act, conv_out, rec_out = pl.pallas_call(
+        custom_outer,
+        out_shape=(out_init, in_conv, in_rec),
+        in_specs=(
+            meta_spec,
+            meta_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            weights_spec,
+        ),
+        out_specs=(hbm_spec, hbm_spec, hbm_spec),
+        scratch_shapes=cfg.get_scratch_shape_dict(),
+        input_output_aliases=aliases,
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+            vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
+        ),
+    )(
+        dma_meta,
+        inner_meta,
+        qkv_3d,
+        b_3d,
+        a_3d,
+        in_conv,
+        in_rec,
+        out_init,
+        weights,
+    )
+
+    out_act = out_act.reshape(batch_size, -1)
+    conv_out = conv_out.reshape(conv_state.shape)
+    np.testing.assert_array_equal(out_act, out_ref)
+    np.testing.assert_array_equal(conv_out[1], conv_ref[1])
+    np.testing.assert_array_equal(rec_out[1], rec_ref[1])
 
 
 if __name__ == "__main__":
