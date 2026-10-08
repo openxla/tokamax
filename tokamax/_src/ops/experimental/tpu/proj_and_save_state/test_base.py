@@ -21,6 +21,7 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
 from tokamax._src.ops.experimental.tpu.proj_and_save_state import reference
 
 # Numerics, measured on TPU7x. The state is an f32 matmul over `hidden_size`,
@@ -148,7 +149,7 @@ def make_inputs(
 def _as_words(cache: jax.Array) -> np.ndarray:
   """Returns the cache as int32 `(num_pages, page_size, lanes)` words."""
   if cache.dtype == jnp.uint8:
-    cache = reference.slabs_to_words(cache)
+    cache = csa_cache_layout.slabs_to_words(cache)
   return np.asarray(cache)
 
 

@@ -18,8 +18,8 @@ The tests are kept as they are upstream: same oracles, shapes, seeds, named
 cases, skips and bit-exact comparisons (up to the sign of zeros), calling the
 raw kernel entry point with its default `tile_n`. Upstream's
 `compress_store_ref` is `reference` here, and its Kernel 1 reference
-(`project_and_save_state_ref.ref_wkv_proj_and_save_state`) is
-`test_utils.ref_wkv_proj_and_save_state`.
+(`project_and_save_state_ref.ref_wkv_proj_and_save_state`) is the
+`proj_and_save_state` op's `reference.ref_wkv_proj_and_save_state`.
 """
 
 from absl.testing import absltest
@@ -33,7 +33,7 @@ from tokamax._src.ops.experimental.tpu.compress_store import config
 from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
 from tokamax._src.ops.experimental.tpu.compress_store import pallas_mosaic_tpu_kernel
 from tokamax._src.ops.experimental.tpu.compress_store import reference
-from tokamax._src.ops.experimental.tpu.compress_store import test_utils
+from tokamax._src.ops.experimental.tpu.proj_and_save_state import reference as proj_and_save_state_ref
 
 jax.config.parse_flags_with_absl()
 
@@ -220,7 +220,7 @@ class CompressStoreTest(parameterized.TestCase):
     )
 
     ref_wkv_proj_and_save_state_jit = jax.jit(
-        test_utils.ref_wkv_proj_and_save_state,
+        proj_and_save_state_ref.ref_wkv_proj_and_save_state,
         static_argnums=(6, 7, 8, 9),
     )
     # The state scatter targets the state array, which is `init_cache`

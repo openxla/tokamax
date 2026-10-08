@@ -23,12 +23,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
 
-# DeepSeek-V4 CSA compressed-KV cache layout. Both caches are int32 arrays with
-# 128 lanes: the NoPE cache holds one 128-word row per token, and the RoPE cache
-# packs 4 tokens per row, 32 words per token.
-ROW_WORDS = 128
-ROPE_WORDS = 32
 # Upper bound on `num_streams`. Larger values hang the kernel on TPU7x.
 MAX_NUM_STREAMS = 4
 
@@ -251,15 +247,15 @@ def csa_gather(
   assert indices.ndim == 1, "Indices must be 1D."
   assert nope_cache.dtype == rope_cache.dtype, "Caches must share a dtype."
   assert nope_cache.dtype == jnp.int32, "Caches must be int32."
-  assert nope_cache.shape[2] == ROW_WORDS
-  assert rope_cache.shape[2] == ROW_WORDS
+  assert nope_cache.shape[2] == csa_cache_layout.ROW_WORDS
+  assert rope_cache.shape[2] == csa_cache_layout.ROW_WORDS
 
   # Free reshapes: a 128-lane int32 array's T(8,128) tiling is byte-identical
   # to row-major, and the kernel takes its operands untiled
   # (`use_tc_tiling_on_sc=False`), so token t's rope is words
   # [32 t, 32 t + 32).
-  nope_cache = nope_cache.reshape(-1, ROW_WORDS)
-  rope_cache = rope_cache.reshape(-1, ROPE_WORDS)
+  nope_cache = nope_cache.reshape(-1, csa_cache_layout.ROW_WORDS)
+  rope_cache = rope_cache.reshape(-1, csa_cache_layout.ROPE_WORDS)
   sc_info = pltpu.get_tpu_info().sparse_core
   assert sc_info is not None, "SparseCore info is missing."
   out_size = indices.size
@@ -316,9 +312,11 @@ def csa_gather(
           top_k=top_k,
       ),
       out_type=(
-          jax.ShapeDtypeStruct((out_size + out_pad_size, ROW_WORDS), jnp.int32),
           jax.ShapeDtypeStruct(
-              ((out_size + out_pad_size) // 4, ROW_WORDS),
+              (out_size + out_pad_size, csa_cache_layout.ROW_WORDS), jnp.int32
+          ),
+          jax.ShapeDtypeStruct(
+              ((out_size + out_pad_size) // 4, csa_cache_layout.ROW_WORDS),
               jnp.int32,
           ),
       ),

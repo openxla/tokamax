@@ -19,8 +19,8 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
 from tokamax._src.ops.experimental.tpu.csa_gather import base
-from tokamax._src.ops.experimental.tpu.csa_gather import reference
 from tokamax._src.ops.experimental.tpu.csa_gather import test_base
 
 jax.config.parse_flags_with_absl()
@@ -28,7 +28,9 @@ jax.config.parse_flags_with_absl()
 
 def _rope_values(rope_cache: np.ndarray, token: int) -> np.ndarray:
   """Returns the 64 bf16 RoPE values of `token` as uint16 bit patterns."""
-  words = rope_cache.reshape(-1, reference.ROPE_WORDS)[token].view(np.uint32)
+  words = rope_cache.reshape(-1, csa_cache_layout.ROPE_WORDS)[token].view(
+      np.uint32
+  )
   return np.concatenate([words & 0xFFFF, words >> 16]).astype(np.uint16)
 
 

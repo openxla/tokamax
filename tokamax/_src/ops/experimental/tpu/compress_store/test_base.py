@@ -26,10 +26,11 @@ import numpy as np
 from tokamax._src.ops.experimental.tpu.compress_store import config
 from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
 from tokamax._src.ops.experimental.tpu.compress_store import reference
-from tokamax._src.ops.experimental.tpu.compress_store import test_utils
+from tokamax._src.ops.experimental.tpu.proj_and_save_state import reference as proj_and_save_state_ref
 
 _proj_and_save_state = jax.jit(
-    test_utils.ref_wkv_proj_and_save_state, static_argnums=(6, 7, 8, 9)
+    proj_and_save_state_ref.ref_wkv_proj_and_save_state,
+    static_argnums=(6, 7, 8, 9),
 )
 _ref_compress_norm_rope_store = jax.jit(
     reference.ref_compress_norm_rope_store,

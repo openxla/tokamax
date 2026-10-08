@@ -25,11 +25,11 @@ from jaxtyping import Array, Float, Int, Shaped  # pylint: disable=g-multiple-im
 import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
+from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
 from tokamax._src.ops.experimental.tpu.proj_and_save_state import reference
 
 AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray | np.ndarray
 
-_SLAB_ROWS = 4  # uint8 sub-rows per 32-bit row.
 _F32_BYTES = 4
 
 
@@ -59,10 +59,10 @@ class ProjAndSaveState[C](op.Op[Any, jax.Array, None, C, Any]):
           f" ({compress_ratio}, {state_width}), got {ape.shape}."
       )
     if cache.dtype == jnp.uint8 and cache.ndim == 4:
-      if cache.shape[2] != _SLAB_ROWS:
+      if cache.shape[2] != csa_cache_layout.SLAB_ROWS:
         raise ValueError(
-            f"A uint8 cache must be (num_pages, page_size, {_SLAB_ROWS},"
-            f" lanes), got {cache.shape}."
+            "A uint8 cache must be (num_pages, page_size,"
+            f" {csa_cache_layout.SLAB_ROWS}, lanes), got {cache.shape}."
         )
     elif cache.dtype != jnp.int32 or cache.ndim != 3:
       raise ValueError(
@@ -75,7 +75,9 @@ class ProjAndSaveState[C](op.Op[Any, jax.Array, None, C, Any]):
           f"The cache lane count ({lanes}) must be a multiple of 128 that"
           f" divides state_width ({state_width})."
       )
-    rows_per_token = state_dim * _F32_BYTES // (_SLAB_ROWS * lanes)
+    rows_per_token = (
+        state_dim * _F32_BYTES // (csa_cache_layout.SLAB_ROWS * lanes)
+    )
     if cache.shape[1] % rows_per_token:
       raise ValueError(
           f"page_size ({cache.shape[1]}) must be a multiple of the"

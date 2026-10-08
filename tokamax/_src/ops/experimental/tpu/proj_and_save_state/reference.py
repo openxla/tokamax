@@ -31,10 +31,8 @@ lanes]` instead, where word `l` of a row is the f32 bit pattern of value `l`.
 import functools
 
 import jax
-from jax import lax
 import jax.numpy as jnp
-
-SLAB_ROWS = 4  # uint8 sub-rows per 32-bit row.
+from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
 
 
 def ref_wkv_proj_and_save_state(
@@ -113,23 +111,6 @@ def ref_wkv_proj_and_save_state(
   return new_cache
 
 
-def words_to_slabs(w: jax.Array) -> jax.Array:
-  """int32 `[..., n]` -> uint8 `[..., 4, n]`; byte b goes to sub-row b."""
-  w = lax.bitcast_convert_type(w, jnp.uint32)
-  return jnp.stack(
-      [((w >> (8 * b)) & 0xFF).astype(jnp.uint8) for b in range(SLAB_ROWS)],
-      axis=-2,
-  )
-
-
-def slabs_to_words(x: jax.Array) -> jax.Array:
-  """uint8 `[..., 4, n]` -> int32 `[..., n]`; inverse of `words_to_slabs`."""
-  x = x.astype(jnp.uint32)
-  words = x[..., 0, :] | (x[..., 1, :] << 8) | (x[..., 2, :] << 16)
-  words = words | (x[..., 3, :] << 24)
-  return lax.bitcast_convert_type(words, jnp.int32)
-
-
 @functools.partial(jax.jit, static_argnames=("compress_ratio",))
 def proj_and_save_state(
     hidden_states: jax.Array,
@@ -168,8 +149,8 @@ def proj_and_save_state(
     The updated cache, with the shape and dtype of `cache`.
   """
   state_width = wkv_wgate.shape[1] // 2
-  is_words = jnp.dtype(cache.dtype).itemsize == 4
-  slabs = words_to_slabs(cache) if is_words else cache
+  is_words = csa_cache_layout.is_word_array(cache.dtype)
+  slabs = csa_cache_layout.words_to_slabs(cache) if is_words else cache
   _, page_size, d1, d2 = slabs.shape
   rows_per_token = 2 * state_width * 4 // (d1 * d2)
   new_slabs = ref_wkv_proj_and_save_state(
@@ -184,4 +165,4 @@ def proj_and_save_state(
       compress_ratio=compress_ratio,
       overlap=False,
   )
-  return slabs_to_words(new_slabs) if is_words else new_slabs
+  return csa_cache_layout.slabs_to_words(new_slabs) if is_words else new_slabs

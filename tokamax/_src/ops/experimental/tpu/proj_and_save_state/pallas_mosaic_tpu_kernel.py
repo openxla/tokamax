@@ -21,19 +21,13 @@ state into its paged slot of the cache in HBM.
 
 import dataclasses
 import functools
-from typing import Any
 
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-
-# DeepSeek-V4 compressed-KV cache layout. A cache is either a
-# `uint8[num_pages, rows, 4, lanes]` array of slabs, or CSA's
-# `int32[num_pages, rows, lanes]` array holding the same bytes, byte `b` of word
-# `w` being slab byte `(b, w)`. The kernel addresses both as uint8 slabs.
-SLAB_ROWS = 4  # uint8 sub-rows per 32-bit row.
+from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
 
 # Fraction of the device's VMEM the kernel may use as scoped VMEM, as other
 # Tokamax TPU kernels do. Upstream's heuristic `tile_k` for CSA with
@@ -47,31 +41,6 @@ _VMEM_USAGE_FRACTION = 0.9
 def vmem_limit_bytes() -> int:
   """Returns the kernel's scoped VMEM limit for the current TPU."""
   return int(_VMEM_USAGE_FRACTION * pltpu.get_tpu_info().vmem_capacity_bytes)
-
-
-def is_word_array(dtype: Any) -> bool:
-  """Whether a cache is declared as 32-bit words rather than uint8 slabs."""
-  return jnp.dtype(dtype).itemsize == 4
-
-
-def as_u8_slabs(ref: Any) -> Any:
-  """Views a cache ref as `uint8[num_pages, rows, 4, lanes]` slabs.
-
-  For an int32 `(num_pages, rows, lanes)` ref this is a free bitcast: Mosaic
-  packs 4 consecutive uint8 sub-rows into one 32-bit row, little endian, which
-  is exactly how XLA lays out the uint8 slab array. uint8 refs pass through
-  unchanged.
-
-  Args:
-    ref: The cache ref.
-
-  Returns:
-    The uint8 slab view of `ref`.
-  """
-  if not is_word_array(ref.dtype):
-    return ref
-  num_pages, rows, lanes = ref.shape
-  return ref.bitcast(jnp.uint8).reshape(num_pages, rows, SLAB_ROWS, lanes)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,7 +162,7 @@ def kernel(
   slots_per_m_tile = tile_m // last_dim
   acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
   # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
-  cache = as_u8_slabs(cache)
+  cache = csa_cache_layout.as_u8_slabs(cache)
   write_counts_ref[0] = 0
   write_counts_ref[1] = 0
 
