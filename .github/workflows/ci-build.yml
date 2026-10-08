@@ -102,15 +102,28 @@ jobs:
         # We compare tree SHA's of this PR's most recent passing run, not
         # the push just before to determine whether or not to skip the run.
         #
+        # After submit, Copybara also pushes the commit it landed on the base
+        # branch to the PR branch. That head is already on the base branch, so
+        # its diff is empty, which would otherwise run every shard.
+        #
         id: repeat
         env:
           GH_TOKEN: ${{ github.token }}
           # A run only counts if it came from this repository.
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # `GITHUB_HEAD_REF` is the PR's branch; empty outside `pull_request`.
           if [[ -z "${GITHUB_HEAD_REF}" || -z "${HEAD_REPO}" ]]; then
             echo "Not a pull request: nothing to compare against."
+            exit 0
+          fi
+          # Exit 1 (not an ancestor) and any git error both fall through.
+          if git merge-base --is-ancestor "${HEAD_SHA}" "origin/${BASE_REF}"; then
+            echo "${HEAD_SHA} is already on origin/${BASE_REF}: skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_why=${HEAD_SHA} is already on origin/${BASE_REF}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! prev=$(gh api \
@@ -138,13 +151,13 @@ jobs:
           fi
           echo "Same files as ${prev} (tree ${tree}), which passed: skipping."
           echo "skip=true" >> "$GITHUB_OUTPUT"
-          echo "skip_from=${prev}" >> "$GITHUB_OUTPUT"
+          echo "skip_why=same files as ${prev}, which passed" >> "$GITHUB_OUTPUT"
 
       - name: Build test matrix
         id: compute
         env:
           SKIP: ${{ steps.repeat.outputs.skip }}
-          SKIP_FROM: ${{ steps.repeat.outputs.skip_from }}
+          SKIP_WHY: ${{ steps.repeat.outputs.skip_why }}
         run: |
           set -o pipefail
           # `--changed-from` narrows the matrix to the shards those files can
@@ -169,8 +182,9 @@ jobs:
           if [[ "${SKIP}" == "true" ]]; then
             sed -i 's/^include=.*/include=[]/' /tmp/outputs.txt
             # Rewrite the one `selection:` line rather than adding a second,
-            # so the summary does not say both "every shard" and "none".
-            sed -i "s/^selection: \(.*\)/selection: same files as ${SKIP_FROM}, which passed -- no shard runs (selection would have been: \1)/" \
+            # so the summary does not say both "every shard" and "none". `|`
+            # rather than `/` as the delimiter: the reason can name a ref.
+            sed -i "s|^selection: \(.*\)|selection: ${SKIP_WHY} -- no shard runs (selection would have been: \1)|" \
               /tmp/summary.txt
           fi
           cat /tmp/outputs.txt >> "$GITHUB_OUTPUT"
