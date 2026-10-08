@@ -29,8 +29,14 @@ from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.normalization import base as normalization_base
 from tokamax._src.ops.normalization import pallas_triton
 
+try:
+  from tokamax._src.ops.normalization import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  triton = None  # pyrefly: ignore[assignment]
+
 _KNOWN_CACHE_FILE_NAMES: Final[tuple[str, ...]] = (
     "nvidia_h100_80gb_hbm3/pallas_triton_normalization.json",
+    "nvidia_h100_80gb_hbm3/triton_normalization.json",
     "nvidia_h100_80gb_hbm3/pallas_mosaic_gpu_flash_attention.json",
     "nvidia_h100_80gb_hbm3/pallas_mosaic_gpu_ragged_dot.json",
     "tpu7x/pallas_mosaic_tpu_ragged_dot.json",
@@ -49,6 +55,14 @@ class CacheTest(parameterized.TestCase):
       ("NVIDIA H100 80GB HBM3", pallas_triton.PallasTritonNormalization),
       ("TPU7x", attention_base.DotProductAttention),
       ("not_a_real_device", pallas_triton.PallasTritonNormalization),
+      *(
+          ()
+          if triton is None
+          else (
+              ("NVIDIA H100 80GB HBM3", triton.TritonNormalization),
+              ("not_a_real_device", triton.TritonNormalization),
+          )
+      ),
   )
   def test_load_cache(self, device: str, op_cls: Any):
     device_cache = cache.AutotuningCache(op_cls())._load_cache(device)

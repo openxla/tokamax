@@ -21,11 +21,13 @@ import google_benchmark
 from tokamax._src import benchmarking
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import pallas_triton as pl_norm
+from tokamax._src.ops.normalization import triton as triton_norm
 from tokamax._src.ops.normalization import arg_specs
 
 
 _IMPLS = dict(
     pallas=pl_norm.PallasTritonNormalization(input_output_alias=False),
+    triton=triton_norm.TritonNormalization(input_output_alias=False),
     xla=base.Normalization(),
 )
 _BENCHMARK_IMPLS_FWD = flags.DEFINE_list(
