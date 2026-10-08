@@ -24,7 +24,6 @@ from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch
 import torch_tpu
-import torch_tpu._internal.pallas.pallas
 
 _Config = TypeVar("_Config")
 

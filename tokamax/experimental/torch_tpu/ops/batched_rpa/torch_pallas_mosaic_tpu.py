@@ -25,7 +25,6 @@ from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_base
 import torch
-import torch_tpu._internal.pallas.pallas
 
 Config = jax_pallas_mosaic_tpu.Config
 
