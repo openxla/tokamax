@@ -17,6 +17,7 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
@@ -28,16 +29,24 @@ from tokamax._src.ops.experimental.tpu.csa_gather import test_base
 jax.config.parse_flags_with_absl()
 
 
+def _tpu_older_than_7x() -> bool:
+  """Whether the default device is not a TPU7x or newer chip."""
+  return (
+      backend.get_default_device().platform != "tpu"
+      or pltpu.get_tpu_info().generation < 7
+  )
+
+
 class ApiTest(parameterized.TestCase):
 
   @parameterized.product(
       num_indices_top_k=[(4096, 512), (8192, 1024)],
       num_valid_indices=[None, 2048],
-      impl=["xla", "mosaic", "mosaic_tpu"],
+      impl=["xla", "mosaic_tpu"],
   )
   def test_basic_api(self, num_indices_top_k, num_valid_indices, impl):
-    if "mosaic" in impl and backend.get_default_device().device_kind != "TPU7x":
-      self.skipTest("Only tested on TPU7x.")
+    if "mosaic" in impl and _tpu_older_than_7x():
+      self.skipTest("Only tested on TPU7x and newer.")
 
     num_indices, top_k = num_indices_top_k
     num_pages, page_size = 64, 256

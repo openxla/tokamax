@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.tpu.csa_gather import base
 
-type Implementation = Literal["xla", "mosaic", "mosaic_tpu"]
+type Implementation = Literal["xla", "mosaic_tpu"]
 
 _IMPLEMENTATIONS = dict(xla=base.CsaGather())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
@@ -90,8 +90,6 @@ def csa_gather(
   errors = []
   for impl in implementation:
     if isinstance(impl, str):
-      if impl == "mosaic":
-        impl = "mosaic_tpu"
       if impl not in IMPLEMENTATIONS:
         raise ValueError(
             f"Unknown implementation: {impl}. You may need to add a dependency"
