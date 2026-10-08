@@ -157,6 +157,79 @@ class SeqAlongLaneParityTest(parameterized.TestCase):
     np.testing.assert_allclose(out_lane, out_sublane, atol=2e-2, rtol=0)
     self.assertTrue(np.isfinite(out_lane).all())
 
+  @parameterized.named_parameters(
+      ("prefill_32_16", 32, 16, (0, 0, 1)),
+      ("spec_decode_37_4", 37, 4, (0, 0, 1)),
+      ("decode_33_1", 33, 1, (1, 1, 1)),
+  )
+  def test_skip_kv_update_matches_head_along_sublane(
+      self, kv_len, q_len, distribution
+  ):
+    # With KV sharing (`skip_kv_update=True`), the source layer has already
+    # written this step's tokens, so the kernel reads all `kv_len` tokens from
+    # the cache and never reads the new K/V. SEQ_ALONG_LANE stitches the new
+    # tokens into the fetched cache block, HEAD_ALONG_SUBLANE never does, so
+    # the two must agree. Regression test for vllm-torchtpu PR #1092: without
+    # it, SEQ_ALONG_LANE spliced unfetched data over the newest token.
+    rng = np.random.default_rng(0)
+    dtype = jnp.bfloat16
+    head_dim = 128
+    num_kv_heads, num_q_heads = 2, 4
+    page_size, total_pages = 128, 8
+    sm_scale = head_dim**-0.5
+    page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+
+    def r(*shape):
+      return (rng.standard_normal(shape) * 0.5).astype(np.float32)
+
+    target_k = r(kv_len, num_kv_heads, head_dim)
+    target_v = r(kv_len, num_kv_heads, head_dim)
+    query = r(q_len, num_q_heads, head_dim)
+    # Never read under `skip_kv_update`.
+    unused_new_kv = np.zeros((q_len, num_kv_heads, head_dim), np.float32)
+
+    def run(kv_layout):
+      cache = _build_cache(
+          kv_layout,
+          target_k,
+          target_v,
+          kv_len,
+          total_pages,
+          page_size,
+          num_q_heads,
+          num_kv_heads,
+          head_dim,
+          dtype,
+          page_indices,
+          sm_scale,
+      )
+      cache_before = np.asarray(cache.astype(jnp.float32))
+      out, cache_after = wrapper.ragged_paged_attention(
+          jnp.asarray(query, dtype),
+          jnp.asarray(unused_new_kv, dtype),
+          jnp.asarray(unused_new_kv, dtype),
+          cache,
+          jnp.array([kv_len], jnp.int32),
+          page_indices,
+          jnp.array([0, q_len], jnp.int32),
+          jnp.asarray(distribution, jnp.int32),
+          sm_scale=sm_scale,
+          decode_block_sizes=_DECODE_BLOCKS,
+          prefill_block_sizes=_PREFILL_BLOCKS,
+          kv_layout=kv_layout,
+          skip_kv_update=True,
+      )
+      np.testing.assert_array_equal(
+          np.asarray(cache_after.astype(jnp.float32)), cache_before
+      )
+      return np.asarray(out.astype(jnp.float32))
+
+    out_sublane = run(configs.KVLayout.HEAD_ALONG_SUBLANE)
+    out_lane = run(configs.KVLayout.SEQ_ALONG_LANE)
+
+    self.assertTrue(np.isfinite(out_lane).all())
+    np.testing.assert_allclose(out_lane, out_sublane, atol=2e-2, rtol=0)
+
 
 if __name__ == "__main__":
   absltest.main()
