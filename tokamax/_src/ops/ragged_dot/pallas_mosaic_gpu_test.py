@@ -76,7 +76,7 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
           )
       elif "a100" in device_kind:
         has_custom_dims = "ragged_dot_dimension_numbers" in kwargs
-        if has_custom_dims or jax.__version_info__ < (0, 11, 0):
+        if has_custom_dims:
           expect_supported = False
         else:
           config = pallas_mosaic_gpu.Config(
@@ -124,7 +124,6 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
     configs = op._get_autotuning_configs(ba)
     self.assertIsNotNone(configs)
     self.assertNotEmpty(configs)
-
 
 
 if __name__ == "__main__":

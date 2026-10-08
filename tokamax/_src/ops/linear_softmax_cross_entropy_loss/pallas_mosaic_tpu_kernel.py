@@ -829,9 +829,7 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
 
   @pl.kernel(
       out_type=out_type,
-      mesh=pltpu.create_tensorcore_mesh(axis_name="core")
-      if jax.__version_info__ < (0, 11, 0)
-      else pltpu.TensorCoreMesh(axis_name="core"),
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
       scratch_types=(
           pltpu.VMEM(
               (b_block_size, v_block_size), dtype=jnp.float32
@@ -1147,12 +1145,8 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   )
 
   @pl.kernel(
-      out_type=[pltpu.HBM(t.shape, t.dtype) for t in out_type]
-      if jax.__version_info__ < (0, 11, 0)
-      else out_type,
-      mesh=pltpu.create_tensorcore_mesh(axis_name="core", num_cores=num_cores)
-      if jax.__version_info__ < (0, 11, 0)
-      else pltpu.TensorCoreMesh(axis_name="core", num_cores=num_cores),
+      out_type=out_type,
+      mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=num_cores),
       scratch_types=(
           pltpu.VMEM(
               (2, b_block_size, v_block_size), dtype=jnp.float32
@@ -1527,8 +1521,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
   x_grad_blocks, w_grad = bwd_kernel(dout, x, labels, w, lse)
   x_grad = jnp.sum(x_grad_blocks, axis=0)
   w_grad = w_grad[:, :v_dim]
-  if jax.__version_info__ < (0, 11, 0):
-    x_grad, w_grad = jax.device_put((x_grad, w_grad), jax.memory.Space.Device)
   return x_grad, w_grad
 
 

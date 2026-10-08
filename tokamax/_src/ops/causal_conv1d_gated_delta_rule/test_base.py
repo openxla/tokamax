@@ -143,8 +143,6 @@ class CausalConv1dGatedDeltaRuleTestBase(parameterized.TestCase):
   def test_run_jax_gdn_attention_local(
       self, max_reqs, lengths, q_loc, distribution
   ):
-    if jax.__version_info__ < (0, 11, 0):
-      self.skipTest("JAX v0.11.0 or newer is required.")
     kq_head_dim = 128
     v_head_dim = 128
     n_kq = 2

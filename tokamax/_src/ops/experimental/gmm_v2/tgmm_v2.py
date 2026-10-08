@@ -801,9 +801,7 @@ def tgmm_v2(
   return pl.kernel(
       functools.partial(tgmm_kernel_main, cfgs=cfgs),
       out_type=out_init,
-      mesh=pltpu.create_tensorcore_mesh(axis_name="core")
-      if jax.__version_info__ < (0, 11, 0)
-      else pltpu.TensorCoreMesh(axis_name="core"),
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
       # pyrefly: ignore[bad-argument-type]
       scratch_types=scratch_shapes,
       compiler_params=pltpu.CompilerParams(

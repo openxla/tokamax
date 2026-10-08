@@ -293,8 +293,5 @@ def gated_linear_unit(
           consumed_barrier_0=plgpu.Barrier(**consumed_barrier_kwargs),
           consumed_barrier_1=plgpu.Barrier(**consumed_barrier_kwargs),
       ),
-      compiler_params=plgpu.CompilerParams(
-          lowering_semantics=plgpu.LoweringSemantics.Warpgroup
-      ),
   )
   return jnp.reshape(kernel(x, weights), (*orig_x_shape[:-1], n))

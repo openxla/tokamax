@@ -48,7 +48,7 @@ def _get_kernel_module():
     return sm100
   if gpu_utils.is_sm90():
     return sm90
-  if gpu_utils.is_sm80() and jax.__version_info__ >= (0, 11, 0):
+  if gpu_utils.is_sm80():
     return sm80
   raise NotImplementedError("Only supported for sm80, sm90, and sm100 GPUs.")
 
@@ -62,7 +62,7 @@ class PallasMosaicGpuGatedLinearUnit(base.GatedLinearUnit[Config, Key]):
   @override
   def supported_on(self, device: jax.Device) -> bool:
     return (
-        (gpu_utils.is_sm80(device) and jax.__version_info__ >= (0, 11, 0))
+        gpu_utils.is_sm80(device)
         or gpu_utils.is_sm90(device)
         or gpu_utils.is_sm100(device)
     )

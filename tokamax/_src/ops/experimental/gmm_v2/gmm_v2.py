@@ -184,11 +184,6 @@ class WeightsRef(RhsRef):
   def get_scale(self, replicate_size: int | None = None) -> jax.Array:
     assert self.scale is not None
     if replicate_size is not None:
-      if jax.__version_info__ < (0, 11, 0):
-        scale = self.scale[...]
-        return jnp.broadcast_to(
-            scale, (scale.shape[0], replicate_size, scale.shape[2])
-        )
       # Perform zero-stride load for efficient broadcasting across sublanes.
       return self.scale[:, pl.ds(0, replicate_size, 0), :]
     return self.scale[...]
@@ -1713,9 +1708,7 @@ def gmm_v2(
   return pl.kernel(
       functools.partial(kernel_main, cfgs=cfgs),
       out_type=out_init,
-      mesh=pltpu.create_tensorcore_mesh(axis_name="core")
-      if jax.__version_info__ < (0, 11, 0)
-      else pltpu.TensorCoreMesh(axis_name="core"),
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
       scratch_types=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=vmem_limit_bytes,
