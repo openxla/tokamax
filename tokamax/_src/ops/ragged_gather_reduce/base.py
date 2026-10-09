@@ -12,31 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Base class for Ragged Gather Reduce."""
+"""Base class for Ragged Gather Reduce.
+
+See `reference` for the semantics of the op.
+"""
 
 from typing import Any, override
 
 import jax
-import jax.numpy as jnp
 from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
+from tokamax._src.ops.ragged_gather_reduce import reference
 
 AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
-
-
-def ragged_gather_reduce(
-    x: jax.Array,
-    indices: jax.Array,
-    topk_weights: jax.Array,
-    valid_rows_mask: jax.Array,
-    reduce_group_size: int,
-) -> jax.Array:
-  """Pure JAX reference implementation for ragged gather reduce."""
-  out = x[indices] * topk_weights[:, None].astype(jnp.float32)
-  out = jnp.where(valid_rows_mask[:, None], out, 0)
-  out = out.reshape(-1, reduce_group_size, out.shape[-1])
-  return jnp.sum(out, axis=1).astype(x.dtype)
 
 
 class RaggedGatherReduce[C](op.Op[Any, jax.Array, None, C, Any]):
@@ -45,7 +34,7 @@ class RaggedGatherReduce[C](op.Op[Any, jax.Array, None, C, Any]):
   @jaxtyping.jaxtyped
   def bind(
       self,
-      x: Shaped[Array | AbstractArray, "input_size hidden_size"],
+      x: Shaped[Array | AbstractArray, "num_rows hidden_size"],
       indices: Int[Array | AbstractArray, "input_size"],
       topk_weights: Shaped[Array | AbstractArray, "input_size"],
       valid_rows_mask: Shaped[Array | AbstractArray, "input_size"],
@@ -53,6 +42,15 @@ class RaggedGatherReduce[C](op.Op[Any, jax.Array, None, C, Any]):
       reduce_group_size: int,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
+    if reduce_group_size <= 0:
+      raise ValueError(
+          f"reduce_group_size must be positive, got {reduce_group_size}."
+      )
+    if indices.shape[0] % reduce_group_size:
+      raise ValueError(
+          f"Number of routes ({indices.shape[0]}) must be a multiple of"
+          f" reduce_group_size ({reduce_group_size})."
+      )
     return super().bind(
         x=x,
         indices=indices,
@@ -66,7 +64,7 @@ class RaggedGatherReduce[C](op.Op[Any, jax.Array, None, C, Any]):
   @jaxtyping.jaxtyped
   def _fwd(
       self,
-      x: Shaped[Array, "input_size hidden_size"],
+      x: Shaped[Array, "num_rows hidden_size"],
       indices: Int[Array, "input_size"],
       topk_weights: Shaped[Array, "input_size"],
       valid_rows_mask: Shaped[Array, "input_size"],
@@ -76,7 +74,7 @@ class RaggedGatherReduce[C](op.Op[Any, jax.Array, None, C, Any]):
       config: C | None = None,
   ) -> tuple[jax.Array, None]:
     return (
-        ragged_gather_reduce(
+        reference.ragged_gather_reduce(
             x, indices, topk_weights, valid_rows_mask, reduce_group_size
         ),
         None,

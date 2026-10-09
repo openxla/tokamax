@@ -12,46 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for Ragged Gather Reduce API."""
+"""Tests for the Ragged Gather Reduce API."""
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src import hlo_utils
 from tokamax._src.ops.ragged_gather_reduce import api
-from tokamax._src.ops.ragged_gather_reduce import base
+from tokamax._src.ops.ragged_gather_reduce import reference
+from tokamax._src.ops.ragged_gather_reduce import test_base
 
 jax.config.parse_flags_with_absl()
+
+
+def _tpu_older_than_7x() -> bool:
+  """Whether the default device is not a TPU7x or newer chip."""
+  return (
+      backend.get_default_device().platform != "tpu"
+      or pltpu.get_tpu_info().generation < 7
+  )
 
 
 class ApiTest(parameterized.TestCase):
 
   @parameterized.product(
-      dtype=[jnp.bfloat16, jnp.float32],
-      impl=["xla", "mosaic", "mosaic_tpu"],
+      shape=[(2048, 8, 2048), (1024, 8, 7168)],
+      impl=["xla", "mosaic_tpu"],
   )
-  def test_basic_api(self, dtype, impl):
-    if "mosaic" in impl:
-      mosaic_op = api.IMPLEMENTATIONS.get("mosaic_tpu")
-      supported_on = getattr(mosaic_op, "supported_on", None)
-      if supported_on is None or not supported_on(backend.get_default_device()):
-        self.skipTest("mosaic_tpu implementation not supported on this device.")
+  def test_basic_api(self, shape, impl):
+    if "mosaic" in impl and _tpu_older_than_7x():
+      self.skipTest("Only tested on TPU7x and newer.")
 
-    input_size = 1024
-    hidden_size = 128
-    reduce_group_size = 4
-    key = jax.random.key(0)
-    x = jax.random.normal(key, (input_size, hidden_size), jnp.float32).astype(
-        dtype
+    num_tokens, reduce_group_size, hidden_size = shape
+    x, indices, topk_weights, valid_rows_mask = test_base.make_inputs(
+        num_tokens, reduce_group_size, hidden_size
     )
-    indices = jax.random.randint(key, (input_size,), 0, input_size, jnp.int32)
-    topk_weights = jax.random.normal(key, (input_size,), jnp.float32).astype(
-        dtype
-    )
-    valid_rows_mask = jnp.ones((input_size,), jnp.bool_)
 
     @jax.jit
     def f(x, indices, topk_weights, valid_rows_mask):
@@ -64,29 +63,60 @@ class ApiTest(parameterized.TestCase):
           implementation=impl,
       )
 
-    actual = f(x, indices, topk_weights, valid_rows_mask)
-    desired = base.ragged_gather_reduce(
+    out = f(x, indices, topk_weights, valid_rows_mask)
+    expected = reference.ragged_gather_reduce(
         x, indices, topk_weights, valid_rows_mask, reduce_group_size
     )
 
     with self.subTest("value"):
       np.testing.assert_allclose(
-          actual.astype(jnp.float32),
-          desired.astype(jnp.float32),
-          rtol=1e-2,
-          atol=1e-2,
+          np.asarray(out, np.float32),
+          np.asarray(expected, np.float32),
+          atol=test_base.ATOL,
+          rtol=test_base.RTOL,
       )
 
     with self.subTest("correct_implementation_used"):
-      lowered = f.lower(x, indices, topk_weights, valid_rows_mask)
-      opspecs = hlo_utils.get_opspecs(lowered, include_xla_kernels=False)
+      # Check the lowered HLO for the kernel that was really used.
+      opspecs = hlo_utils.get_opspecs(
+          f.lower(x, indices, topk_weights, valid_rows_mask),
+          include_xla_kernels=False,
+      )
       if impl == "xla":
         self.assertEmpty(opspecs)
-      elif opspecs:
-        # "mosaic" is an alias the API resolves to the TPU kernel.
+      else:
+        self.assertNotEmpty(opspecs)
         self.assertIsInstance(
             opspecs[0].op, type(api.IMPLEMENTATIONS["mosaic_tpu"])
         )
+
+  def test_unsupported_dtype_falls_back_to_xla(self):
+    if _tpu_older_than_7x():
+      self.skipTest("Only tested on TPU7x and newer.")
+    num_tokens, reduce_group_size, hidden_size = 64, 4, 128
+    x, indices, topk_weights, valid_rows_mask = test_base.make_inputs(
+        num_tokens, reduce_group_size, hidden_size
+    )
+    x = x.astype(jnp.float32)
+
+    with self.assertRaisesRegex(NotImplementedError, "bfloat16"):
+      api.ragged_gather_reduce(
+          x,
+          indices,
+          topk_weights,
+          valid_rows_mask,
+          reduce_group_size,
+          implementation="mosaic_tpu",
+      )
+
+    # The default implementations fall back to XLA.
+    out = api.ragged_gather_reduce(
+        x, indices, topk_weights, valid_rows_mask, reduce_group_size
+    )
+    expected = reference.ragged_gather_reduce(
+        x, indices, topk_weights, valid_rows_mask, reduce_group_size
+    )
+    np.testing.assert_allclose(out, expected, atol=1e-5, rtol=1e-5)
 
   def test_unknown_implementation(self):
     input_size = 8
