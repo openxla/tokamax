@@ -27,7 +27,6 @@ from tokamax._src.autotuning import cache
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.normalization import base as normalization_base
-from tokamax._src.ops.normalization import pallas_triton
 
 try:
   from tokamax._src.ops.normalization import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
@@ -35,7 +34,6 @@ except ImportError:
   triton = None  # pyrefly: ignore[assignment]
 
 _KNOWN_CACHE_FILE_NAMES: Final[tuple[str, ...]] = (
-    "nvidia_h100_80gb_hbm3/pallas_triton_normalization.json",
     "nvidia_h100_80gb_hbm3/triton_normalization.json",
     "nvidia_h100_80gb_hbm3/pallas_mosaic_gpu_flash_attention.json",
     "nvidia_h100_80gb_hbm3/pallas_mosaic_gpu_ragged_dot.json",
@@ -52,9 +50,7 @@ _CACHE_PATHS: Final[immutabledict.immutabledict[str, str]] = (
 class CacheTest(parameterized.TestCase):
 
   @parameterized.parameters(
-      ("NVIDIA H100 80GB HBM3", pallas_triton.PallasTritonNormalization),
       ("TPU7x", attention_base.DotProductAttention),
-      ("not_a_real_device", pallas_triton.PallasTritonNormalization),
       *(
           ()
           if triton is None
@@ -84,17 +80,19 @@ class CacheTest(parameterized.TestCase):
             json.loads(cache_file.read_text())
 
   def test_ignore_cache(self):
+    if triton is None:
+      self.skipTest("Triton implementation is not available.")
     with config_lib.ignore_autotuning_cache(True):
       self.assertEmpty(
-          cache.AutotuningCache(
-              pallas_triton.PallasTritonNormalization()
-          )._load_cache("NVIDIA H100 80GB HBM3")
+          cache.AutotuningCache(triton.TritonNormalization())._load_cache(
+              "NVIDIA H100 80GB HBM3"
+          )
       )
     with config_lib.ignore_autotuning_cache(False):
       self.assertNotEmpty(
-          cache.AutotuningCache(
-              pallas_triton.PallasTritonNormalization()
-          )._load_cache("NVIDIA H100 80GB HBM3")
+          cache.AutotuningCache(triton.TritonNormalization())._load_cache(
+              "NVIDIA H100 80GB HBM3"
+          )
       )
 
   def test_caches_exist(self):

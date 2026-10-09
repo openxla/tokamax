@@ -35,7 +35,7 @@ from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import api as lsce_api
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base as lsce_base
 from tokamax._src.ops.normalization import api as norm_api
-from tokamax._src.ops.normalization import pallas_triton as pl_norm
+from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu as pl_ragged_dot_mosaic_tpu
 from tokamax._src.ops.triangle_multiplication import api as tri_mul_api
@@ -45,6 +45,11 @@ try:
   from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top
 except ImportError:
   triton_glu = None
+
+try:
+  from tokamax._src.ops.normalization import triton as triton_norm  # pylint: disable=g-import-not-at-top
+except ImportError:
+  triton_norm = None
 
 try:
   from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
@@ -74,8 +79,9 @@ class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
 
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
+  assert triton_norm is not None
   assert triton_glu is not None
-  norm = pl_norm.PallasTritonNormalization()
+  norm = triton_norm.TritonNormalization()
   glu = triton_glu.TritonGatedLinearUnit()
   eps = 0.32
   act = jax.nn.swish
@@ -117,7 +123,7 @@ class AutotuningTest(parameterized.TestCase):
 
   def test_get_op_implementations(self):
     self.assertDictEqual(
-        api.get_op_implementations(pl_norm.PallasTritonNormalization()),
+        api.get_op_implementations(norm_base.Normalization()),
         dict(norm_api.IMPLEMENTATIONS),
     )
     self.assertDictEqual(
@@ -134,6 +140,11 @@ class AutotuningTest(parameterized.TestCase):
     )
 
     if jax.default_backend() != "tpu":
+      assert triton_norm is not None
+      self.assertDictEqual(
+          api.get_op_implementations(triton_norm.TritonNormalization()),
+          dict(norm_api.IMPLEMENTATIONS),
+      )
       assert triton_glu is not None
       self.assertDictEqual(
           api.get_op_implementations(triton_glu.TritonGatedLinearUnit()),
@@ -141,12 +152,12 @@ class AutotuningTest(parameterized.TestCase):
       )
 
     with self.subTest("current_device_only"):
-      if jax.default_backend() == "tpu":
+      if jax.default_backend() == "tpu" and triton_norm is not None:
         tpu_norm_impls = api.get_op_implementations(
-            pl_norm.PallasTritonNormalization(),
+            triton_norm.TritonNormalization(),
             device=backend.get_default_device(),
         )
-        self.assertNotIn(pl_norm.PallasTritonNormalization(), tpu_norm_impls)
+        self.assertNotIn(triton_norm.TritonNormalization(), tpu_norm_impls)
       elif jax.default_backend() == "gpu" and triton_ragged_dot is not None:
         ragged_dot_impls = api.get_op_implementations(
             triton_ragged_dot.TritonRaggedDot(),

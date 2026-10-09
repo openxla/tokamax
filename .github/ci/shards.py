@@ -508,6 +508,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/normalization/api_test.py',
             'tokamax/_src/ops/normalization/base_test.py',
             'tokamax/_src/ops/normalization/pallas_triton_test.py',
+            'tokamax/_src/ops/normalization/triton_test.py',
         ),
         minutes=3,
     ),

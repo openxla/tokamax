@@ -29,7 +29,7 @@ from tokamax._src.ops.normalization import api as norm_api
 try:
   from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
   from tokamax._src.ops.attention import pallas_triton_vjp as pl_triton_attn_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
-  from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.normalization import triton as triton_norm  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 except ImportError:
   pass
 
@@ -93,7 +93,7 @@ class TokamaxTest(absltest.TestCase):
             # pallas_mosaic_gpu_vjp.PallasMosaicGpuFlashAttentionVjp,
             norm_api.IMPLEMENTATIONS["triton"].__class__,
             pl_triton_attn_vjp.PallasTritonFlashAttentionVjp,
-            pl_norm_vjp.PallasTritonNormalizationVjp,
+            triton_norm.TritonNormalizationVjp,
         ])
       else:
         ops_expected = set([

@@ -29,9 +29,9 @@ _IMPLEMENTATIONS = dict(xla=base.Normalization())
 _DEFAULT_IMPLEMENTATIONS = ('xla',)
 
 try:
-  from tokamax._src.ops.normalization import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.normalization import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  _IMPLEMENTATIONS['triton'] = pallas_triton.PallasTritonNormalization()
+  _IMPLEMENTATIONS['triton'] = triton.TritonNormalization()
   _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
