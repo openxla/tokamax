@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 import copy
 import dataclasses
 import json
@@ -225,6 +225,13 @@ class PydanticTest(parameterized.TestCase):
         pydantic_lib.annotate(tuple[jax.Array, int]), config=config
     )
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+
+  def test_collection_annotation_roundtrip(self):
+    data: Collection[int] = (1, 2, 3)
+    adapter = pydantic.TypeAdapter(pydantic_lib.annotate(Collection[int]))
+    self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+    self.assertEqual(data, adapter.validate_json(adapter.dump_json(list(data))))
+    self.assertEqual(data, adapter.validate_json(adapter.dump_json(set(data))))
 
   @parameterized.parameters(*_OPS)
   def test_op_roundtrip(self, op):
