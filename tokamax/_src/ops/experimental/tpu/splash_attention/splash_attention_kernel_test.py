@@ -16,7 +16,6 @@
 from collections.abc import Callable
 import dataclasses
 import functools
-import math
 from typing import Any
 
 from absl.testing import absltest
@@ -33,6 +32,7 @@ from tokamax._src.ops.experimental.tpu.splash_attention import base
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_test_utils as test_utils
+
 
 jax.config.parse_flags_with_absl()
 
@@ -550,27 +550,12 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     downcast_smem_data = data.draw(hp.strategies.booleans())
     fuse_reciprocal = data.draw(hp.strategies.booleans())
     use_base2_exp = data.draw(hp.strategies.booleans())
-    dkv_reuse_scaled_q = data.draw(hp.strategies.booleans())
-    q_prescaled_log2e = data.draw(hp.strategies.booleans()) and use_base2_exp
 
     model_config = data.draw(model_config_strategy())
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
     q, k, v, sinks, segment_ids, do = _generate_inputs(
         data, model_config, is_mqa, is_segmented, use_sinks=use_sinks
     )
-    q_quant_mode = data.draw(hp.strategies.booleans())
-    if q_quant_mode:
-      q = q.astype(jnp.float8_e4m3fn)
-    k_quant_mode = data.draw(hp.strategies.booleans())
-    if k_quant_mode:
-      k = k.astype(jnp.float8_e4m3fn)
-    has_fp8_input = q_quant_mode or k_quant_mode
-
-    # The reference kernel does the LOG2(E) scaling inside the kernel, so if
-    # q_prescaled_log2e is on we make a copy.
-    q_in = q
-    if q_prescaled_log2e:
-      q_in = q * math.log2(math.e)
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
     check_mask_no_empty_rows(mask, segment_ids)
@@ -587,8 +572,6 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         interpret=self.INTERPRET,
         use_base2_exp=use_base2_exp,
         dq_reduction_steps=dq_reduction_steps,
-        dkv_reuse_scaled_q=dkv_reuse_scaled_q,
-        q_prescaled_log2e=q_prescaled_log2e,
     )
     if is_mqa:
       if not is_dynamic_mask:
@@ -621,23 +604,23 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     if save_residuals:
       (o, stats), attn_vjp = jax.vjp(
           partial(attn, max_logit_value=max_logit_value),
-          q_in,
+          q,
           k,
           v,
           segment_ids,
           sinks,
       )
-      cotangents = (do.astype(o.dtype), jax.tree.map(jnp.zeros_like, stats))
+      cotangents = (do, jax.tree.map(jnp.zeros_like, stats))
     else:
       o, attn_vjp = jax.vjp(
           partial(attn, max_logit_value=max_logit_value),
-          q_in,
+          q,
           k,
           v,
           segment_ids,
           sinks,
       )
-      cotangents = do.astype(o.dtype)
+      cotangents = do
     q32, k32, v32 = jax.tree.map(lambda x: x.astype(jnp.float32), (q, k, v))
     o_ref, stats_ref = base.attention_reference(
         q32,
@@ -650,9 +633,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         save_residuals=True,
         attn_logits_soft_cap=attn_logits_soft_cap,
     )
-    if has_fp8_input:
-      o_tol = dict(atol=8e-2, rtol=2e-1)
-    elif use_sinks:
+    if use_sinks:
       o_tol = dict(atol=1e-2, rtol=1e-2)
     elif (use_base2_exp or use_max_logit_estimate is not None
           or not fuse_reciprocal):
@@ -676,27 +657,15 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         backward_impl="flash",
         attn_logits_soft_cap=attn_logits_soft_cap,
     )
-    # If q_prescaled_log2e is True, we differentiate w.r.t Q * LOG2(E). In the
-    # reference kernel, dQ is differentiated w.r.t Q, so we need to account for
-    # this factor to compares the outputs.
-    if q_prescaled_log2e:
-      dq *= math.log2(math.e)
 
-    dq_atol = 2.0 if has_fp8_input else (8e-2 if use_base2_exp else 2e-2)
-    dk_atol = 2.0 if has_fp8_input else (7e-2 if use_base2_exp else 2e-2)
-    dv_atol = 5e-1 if has_fp8_input else (2e-2 if use_base2_exp else 2e-2)
-    dq_rtol = 1.5e-1 if has_fp8_input else 3e-2
-    dk_rtol = 1.5e-1 if has_fp8_input else 3e-2
-    dv_rtol = 1.5e-1 if has_fp8_input else 3e-2
-    self._assert_allclose(dq, dq_ref, atol=dq_atol, rtol=dq_rtol)
-    self._assert_allclose(dk, dk_ref, atol=dk_atol, rtol=dk_rtol)
-    self._assert_allclose(dv, dv_ref, atol=dv_atol, rtol=dv_rtol)
+    dq_atol = 8e-2 if use_base2_exp else 2e-2
+    dk_atol = 7e-2 if use_base2_exp else 2e-2
+    dv_atol = 2e-2 if use_base2_exp else 2e-2
+    self._assert_allclose(dq, dq_ref, atol=dq_atol, rtol=3e-2)
+    self._assert_allclose(dk, dk_ref, atol=dk_atol, rtol=3e-2)
+    self._assert_allclose(dv, dv_ref, atol=dv_atol, rtol=3e-2)
     if use_sinks:
-      dsinks_atol = 5e-1 if has_fp8_input else 4e-3
-      dsinks_rtol = 1.5e-1 if has_fp8_input else 6e-3
-      self._assert_allclose(
-          dsinks, dsinks_ref, atol=dsinks_atol, rtol=dsinks_rtol
-      )
+      self._assert_allclose(dsinks, dsinks_ref, atol=4e-3, rtol=6e-3)
 
   @parameterized.product(
       mode=("forward", "backward"),
