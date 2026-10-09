@@ -24,14 +24,14 @@ import jax_triton as jt
 from tokamax._src import gpu_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.normalization import base
-from tokamax._src.ops.normalization import pallas_triton_config
-from tokamax._src.ops.normalization import pallas_triton_vjp_config
+from tokamax._src.ops.normalization import triton_config
+from tokamax._src.ops.normalization import triton_vjp_config
 import triton
 import triton.language as tl
 
 
-Config = pallas_triton_config.Config
-Key = pallas_triton_config.Key
+Config = triton_config.Config
+Key = triton_config.Key
 _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
 
 
@@ -204,7 +204,7 @@ class TritonNormalization(base.Normalization[Config, Key]):
       input_output_alias = not return_residuals
 
     orig_x_shape = x.shape
-    m, a, n = pallas_triton_config.canonicalize_shape_3d(orig_x_shape, axis)
+    m, a, n = triton_config.canonicalize_shape_3d(orig_x_shape, axis)
     x = x.reshape(m, a, n)
 
     block_m = config.block_m
@@ -278,20 +278,20 @@ class TritonNormalization(base.Normalization[Config, Key]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return pallas_triton_config.get_heuristics_config(
+    return triton_config.get_heuristics_config(
         *ba.args, vmap_axis_sizes=ba.vmap_axis_sizes, **ba.kwargs
     )
 
   @override
   def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
     # TODO: Use batched args.
-    return pallas_triton_config.get_key(*ba.args, **ba.kwargs)
+    return triton_config.get_key(*ba.args, **ba.kwargs)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     x = ba.args[0]
     axis = ba.kwargs['axis']
-    x_shape = pallas_triton_config.canonicalize_shape(x.shape, axis)
+    x_shape = triton_config.canonicalize_shape(x.shape, axis)
     configs = set()
     # `num_stages` has no effect, as there is no loop within kernel.
     for num_warps in [1, 2, 4, 8, 16]:
@@ -424,7 +424,7 @@ class TritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
       raise ValueError('`mean` residual inconsistent with `subtract_mean`.')
 
     orig_x_shape = x.shape
-    m, a, n = pallas_triton_config.canonicalize_shape_3d(orig_x_shape, axis)
+    m, a, n = triton_config.canonicalize_shape_3d(orig_x_shape, axis)
     x = x.reshape(m, a, n)
     dout = dout.reshape(m, a, n)
     if mean is not None:
@@ -505,7 +505,7 @@ class TritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     _, _, _, x, scale, offset = ba.args
-    return pallas_triton_config.get_heuristics_config(
+    return triton_config.get_heuristics_config(
         x,
         scale,
         offset,
@@ -516,12 +516,12 @@ class TritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
 
   @override
   def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Key:
-    return pallas_triton_vjp_config.get_key(*ba.args, **ba.kwargs)
+    return triton_vjp_config.get_key(*ba.args, **ba.kwargs)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     axis = ba.kwargs['axis']
-    dout_shape = pallas_triton_config.canonicalize_shape(ba.args[1].shape, axis)
+    dout_shape = triton_config.canonicalize_shape(ba.args[1].shape, axis)
     configs = set()
     # `num_stages` has no effect, as there is no loop within kernel.
     for num_warps in [1, 2, 4, 8, 16]:
