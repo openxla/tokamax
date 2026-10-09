@@ -510,6 +510,23 @@ class MoEKernelTest(parameterized.TestCase):
     )
 
   @parameterized.product(
+      num_tokens=[2, 16],
+      use_ep=[False, True],
+  )
+  def test_lowtok_decode(self, num_tokens, use_ep):
+    self._test_moe(
+        dtype=jnp.bfloat16,
+        top_k=8,
+        num_experts=128,
+        hidden_size=1024,
+        intermediate_size=1024,
+        num_tokens=num_tokens,
+        seed=1234,
+        renormalize_topk_logits=True,
+        use_ep=use_ep,
+    )
+
+  @parameterized.product(
       act_fn=["silu", "swigluoai"],
   )
   def test_activation(self, act_fn):

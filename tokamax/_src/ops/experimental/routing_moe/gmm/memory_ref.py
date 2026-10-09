@@ -142,11 +142,13 @@ class RoutingBufferedRef(_BypassBufferedRef):
       *args: Any,
       metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
+      idx_ref: Any = None,
       **kwargs,
   ):
     standard_ref = _BypassBufferedRef.create(*args, **kwargs)
     return cls(
         metadata_ref=metadata_ref,
+        idx_ref=metadata_ref.idx_ref if idx_ref is None else idx_ref,
         cfg=cfg,
         **{
             f.name: getattr(standard_ref, f.name)
@@ -388,6 +390,9 @@ class BranchlessBufferedRef(RoutingBufferedRef):
       self, grid_indices: GridIndices, rows_ds: pl.Slice
   ) -> jax.Array:
     """SMEM offset that accounts for N tile dim buffering."""
+    rows_ds_start = jnp.uint32(rows_ds.start)
+    if self.metadata_ref.idx_ref is not None:
+      return rows_ds_start
     idx_buffer_size = jnp.uint32(self.cfg.plan.idx_buffer_size)
     ring_size = jnp.uint32(self.cfg.plan.idx_ring_size)
     num_idx_buffers = jnp.uint32(self.cfg.plan.num_idx_buffers)
@@ -395,7 +400,6 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     # Buffer is divided into two where only even/odd n_id can use to avoid
     # first step of n_id oveerwriting value of last step at n_id - 1.
     n_offset = lax.rem(n_id, num_idx_buffers) * idx_buffer_size
-    rows_ds_start = jnp.uint32(rows_ds.start)
     return n_offset + lax.rem(rows_ds_start, ring_size)
 
   @override
@@ -833,6 +837,7 @@ class PipelineAllocs:
         grid_rank=3,
         cfg=cfg,
         metadata_ref=metadata_ref,
+        idx_ref=metadata_ref.gather_idx_ref,
     )
     out_bref = _get_buffered_ref(cfg.out.mode).output(
         spec=pipeline_block_specs.get_out_spec(),
@@ -841,6 +846,7 @@ class PipelineAllocs:
         grid_rank=3,
         cfg=cfg,
         metadata_ref=metadata_ref,
+        idx_ref=metadata_ref.scatter_idx_ref,
     )
     if cfg.out.mode == config.RoutingMode.REMOTE:
       out_bref = dataclasses.replace(
