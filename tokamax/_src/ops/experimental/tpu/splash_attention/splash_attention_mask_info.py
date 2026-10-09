@@ -16,6 +16,7 @@
 """Mini-mask creation library."""
 
 import collections
+from collections.abc import Callable
 import functools
 from typing import Any, NamedTuple
 
@@ -352,6 +353,226 @@ def _process_dynamic_mask(
       num_active_blocks=num_active_blocks,
       partial_mask_blocks=mask_blocks,
       q_sequence=None,
+  )
+
+
+def _downcast_jax(array: jax.Array, max_value: int) -> jax.Array:
+  """Downcast a int32 jax.Array to the smallest signed integer type that fits max_value."""
+  if array.size == 0:
+    return array
+  if max_value <= np.iinfo(np.int8).max:
+    return array.astype(jnp.int8)
+  elif max_value <= np.iinfo(np.int16).max:
+    return array.astype(jnp.int16)
+  else:
+    return array.astype(jnp.int32)
+
+
+def _onehot_lookup(table: jax.Array, idx: jax.Array) -> jax.Array:
+  """Returns `table[idx]` for in-range `idx` without emitting an XLA gather."""
+  onehot = idx[..., None] == jnp.arange(table.shape[-1], dtype=idx.dtype)
+  return jnp.sum(jnp.where(onehot, table, jnp.zeros_like(table)), axis=-1)
+
+
+def refine_mask_info_with_segments(
+    mask_info: MaskInfo,
+    q_segment_ids: jax.Array,
+    kv_segment_ids: jax.Array,
+    block_shape: tuple[int, int],
+    bkv_compute: int,
+    is_dkv: bool,
+    *,
+    unvmap_any: Callable[[jax.Array], jax.Array] = lambda x: x,
+    unvmap_all: Callable[[jax.Array], jax.Array] = lambda x: x,
+) -> MaskInfo:
+  """Refines MaskInfo using runtime segment_ids to skip cross-segment tiles.
+
+  Block mask encoding:
+    - 0: inactive block (skipped).
+    - Low 2 bits (bm & 3) when > 0:
+      - 1: partial 2D mask (and potentially partial segment mask).
+      - 2: full 2D mask and uniform single segment across the entire block.
+      - 3: full 2D mask and partial segment mask.
+    - Upper bits (bm >> 2) when bkv > bkv_compute and (bm & 3) in (1, 3):
+      - Bit (t + 2) is 1 if KV compute sub-tile `t` overlaps with the Q block's
+        segments, and 0 otherwise.
+
+  Args:
+    mask_info: The static or dynamic 2D MaskInfo for the current shard.
+    q_segment_ids: 1D jax.Array of shape [q_seq_len].
+    kv_segment_ids: 1D jax.Array of shape [kv_seq_len].
+    block_shape: (block_q, block_kv) tuple.
+    bkv_compute: Sub-tile compute size along KV.
+    is_dkv: True if refining the backward dKV MaskInfo.
+    unvmap_any: Optional callable to reduce boolean overlap masks across any
+      active `vmap` batch dimensions with `any`.
+    unvmap_all: Optional callable to reduce boolean uniformity masks across any
+      active `vmap` batch dimensions with `all`.
+
+  Returns:
+    A refined MaskInfo with cross-segment blocks removed from active_rows and
+    active_cols.
+  """
+  q_seq_len = q_segment_ids.shape[-1]
+  kv_seq_len = kv_segment_ids.shape[-1]
+  q_block_size, kv_block_size = block_shape
+  q_steps = q_seq_len // q_block_size
+  kv_steps = kv_seq_len // kv_block_size
+  num_iters = kv_block_size // bkv_compute
+
+  q_seg_blocks = q_segment_ids.reshape(
+      *q_segment_ids.shape[:-1], q_steps, q_block_size
+  )
+  q_min = jnp.min(q_seg_blocks, axis=-1)  # [..., q_steps]
+  q_max = jnp.max(q_seg_blocks, axis=-1)  # [..., q_steps]
+
+  kv_seg_subblocks = kv_segment_ids.reshape(
+      *kv_segment_ids.shape[:-1], kv_steps, num_iters, bkv_compute
+  )
+  kv_sub_min = jnp.min(kv_seg_subblocks, axis=-1)  # [..., kv_steps, num_iters]
+  kv_sub_max = jnp.max(kv_seg_subblocks, axis=-1)  # [..., kv_steps, num_iters]
+  kv_min = jnp.min(kv_sub_min, axis=-1)  # [..., kv_steps]
+  kv_max = jnp.max(kv_sub_max, axis=-1)  # [..., kv_steps]
+
+  num_rows, num_cols = (kv_steps, q_steps) if is_dkv else (q_steps, kv_steps)
+  if mask_info.active_rows is None:
+    m_size = num_rows * num_cols
+    rows, cols = jnp.unravel_index(
+        jnp.arange(m_size, dtype=jnp.int32), (num_rows, num_cols)
+    )
+    num_active = jnp.array([m_size], dtype=jnp.int32)
+  else:
+    rows = jnp.asarray(mask_info.active_rows, dtype=jnp.int32)
+    cols = jnp.asarray(mask_info.active_cols, dtype=jnp.int32)
+    m_size = rows.size
+    if m_size == 0:
+      return mask_info
+    num_active = jnp.asarray(mask_info.num_active_blocks, dtype=jnp.int32)
+
+  orig_bm = (
+      jnp.full((m_size,), 2, dtype=jnp.int32)
+      if mask_info.block_mask is None
+      else jnp.asarray(mask_info.block_mask, dtype=jnp.int32).reshape(m_size)
+  )
+  idx = jnp.arange(m_size, dtype=jnp.int32)
+  valid_static = (orig_bm > 0) & (idx < num_active[0])
+
+  rows_c = jnp.clip(rows, 0, num_rows - 1)
+  cols_c = jnp.clip(cols, 0, num_cols - 1)
+  q_idx, kv_idx = (cols_c, rows_c) if is_dkv else (rows_c, cols_c)
+
+  q_lo = _onehot_lookup(q_min, q_idx)
+  q_hi = _onehot_lookup(q_max, q_idx)
+  kv_lo = _onehot_lookup(kv_min, kv_idx)
+  kv_hi = _onehot_lookup(kv_max, kv_idx)
+
+  seg_uniform = unvmap_all(
+      (q_lo == q_hi) & (kv_lo == kv_hi) & (q_lo == kv_lo)
+  )
+  if num_iters > 1:
+    sub_overlap = jnp.stack(
+        [
+            unvmap_any(
+                (q_hi >= _onehot_lookup(kv_sub_min[..., t], kv_idx))
+                & (_onehot_lookup(kv_sub_max[..., t], kv_idx) >= q_lo)
+            )
+            for t in range(num_iters)
+        ],
+        axis=-1,
+    )
+    seg_any = jnp.any(sub_overlap, axis=-1)
+  else:
+    sub_overlap = None
+    seg_any = unvmap_any((q_hi >= kv_lo) & (kv_hi >= q_lo))
+
+  active = valid_static & seg_any
+  bm_type = jnp.where(
+      active,
+      jnp.where((orig_bm == 2) & ~seg_uniform, jnp.int32(3), orig_bm),
+      jnp.int32(0),
+  )
+  if num_iters > 1:
+    assert sub_overlap is not None
+    shifts = jnp.arange(2, num_iters + 2, dtype=jnp.int32)
+    sub_bits = jnp.sum(
+        sub_overlap.astype(jnp.int32) << shifts[None, :], axis=-1
+    )
+    new_bm = jnp.where(
+        (bm_type == 1) | (bm_type == 3), bm_type | sub_bits, bm_type
+    )
+  else:
+    new_bm = bm_type
+
+  # Every output row needs >= 1 scheduled step (with block_mask=0 if inactive)
+  # so `bounds_start`/`bounds_end` still zero-initialize and write that row.
+  # Per-tile row lookups go through the `row_eq` one-hot rather than
+  # `table[rows_c]`, and compaction below uses `lax.sort` rather than
+  # `x[argsort(...)]`: this function emits no XLA gather (see `_onehot_lookup`).
+  row_eq = (idx < num_active[0])[:, None] & (
+      rows_c[:, None] == jnp.arange(num_rows, dtype=jnp.int32)[None, :]
+  )
+  row_has_active = jnp.any(row_eq & active[:, None], axis=0)
+  first_in_row = jnp.argmax(row_eq, axis=0).astype(jnp.int32)
+  keep = active | (
+      (idx < num_active[0])
+      & (is_dkv | jnp.any(active))
+      & ~jnp.any(row_eq & row_has_active[None, :], axis=1)
+      & (idx == jnp.sum(jnp.where(row_eq, first_in_row[None, :], 0), axis=1))
+  )
+
+  mask_next = (
+      None
+      if mask_info.mask_next is None
+      else jnp.asarray(mask_info.mask_next).reshape(m_size)
+  )
+
+  # A stable sort on `~keep` moves kept tiles to the front in schedule order.
+  new_num_active = jnp.sum(keep.astype(jnp.int32), keepdims=True)
+  payload = (rows_c, cols_c, new_bm) + (
+      () if mask_next is None else (mask_next,)
+  )
+  _, *payload = lax.sort(
+      ((~keep).astype(jnp.int32), *payload), num_keys=1, is_stable=True
+  )
+  is_active_slot = idx < new_num_active[0]
+  rows_s = jnp.where(is_active_slot, payload[0], -1)
+  cols_s = jnp.where(is_active_slot, payload[1], -1)
+  block_mask_s = jnp.where(is_active_slot, payload[2], 0)
+  mask_next_s = (
+      jnp.where(is_active_slot, payload[3], -1).astype(mask_next.dtype)
+      if mask_next is not None
+      else None
+  )
+
+  downcast = (
+      mask_info.block_mask is None or mask_info.block_mask.dtype != jnp.int32
+  )
+  if downcast:
+    active_rows = (
+        _downcast_jax(rows_s, num_rows)
+        if mask_info.active_rows is None
+        else rows_s.astype(mask_info.active_rows.dtype)
+    )
+    active_cols = (
+        _downcast_jax(cols_s, num_cols)
+        if mask_info.active_cols is None
+        else cols_s.astype(mask_info.active_cols.dtype)
+    )
+    max_bm_val = (1 << (num_iters + 2)) - 1 if num_iters > 1 else 3
+    block_mask = _downcast_jax(block_mask_s, max_bm_val)
+  else:
+    active_rows = rows_s.astype(jnp.int32)
+    active_cols = cols_s.astype(jnp.int32)
+    block_mask = block_mask_s.astype(jnp.int32)
+
+  return MaskInfo(
+      mask_next=mask_next_s,
+      active_rows=active_rows,
+      active_cols=active_cols,
+      block_mask=block_mask,
+      num_active_blocks=new_num_active,
+      partial_mask_blocks=mask_info.partial_mask_blocks,
+      q_sequence=mask_info.q_sequence,
   )
 
 

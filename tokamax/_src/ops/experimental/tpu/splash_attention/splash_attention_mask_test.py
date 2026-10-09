@@ -1751,5 +1751,121 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         np.testing.assert_array_equal(start[:n], np.array(exp_start)[:n])
         np.testing.assert_array_equal(end[:n], np.array(exp_end)[:n])
 
+  def test_refine_mask_info_with_segments_causal(self):
+    q_seq_len, kv_seq_len = 8, 8
+    block_shape = (2, 2)
+    causal_mask = mask_lib.CausalMask((q_seq_len, kv_seq_len))
+    mask_info, _ = mask_info_lib.process_mask(causal_mask, block_shape)
+    mask_info = jax.tree_util.tree_map(jax.numpy.array, mask_info)
+
+    # Without segment refinement, lower triangle of 4x4 has 1+2+3+4 = 10 blocks.
+    assert mask_info.num_active_blocks is not None
+    self.assertEqual(int(mask_info.num_active_blocks[0]), 10)
+
+    # Two segments: [0..3] has id 0, [4..7] has id 1.
+    seg_ids = jax.numpy.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int32)
+    refined = mask_info_lib.refine_mask_info_with_segments(
+        mask_info, seg_ids, seg_ids, block_shape, bkv_compute=2, is_dkv=False
+    )
+    assert refined.num_active_blocks is not None
+    assert refined.active_rows is not None
+    assert refined.active_cols is not None
+    assert refined.block_mask is not None
+    n = int(refined.num_active_blocks[0])
+    # Cross-segment blocks (2,0), (2,1), (3,0), (3,1) are skipped -> 6 active.
+    self.assertEqual(n, 6)
+    np.testing.assert_array_equal(
+        np.asarray(refined.active_rows[:n]), np.array([0, 1, 1, 2, 3, 3])
+    )
+    np.testing.assert_array_equal(
+        np.asarray(refined.active_cols[:n]), np.array([0, 0, 1, 2, 2, 3])
+    )
+    # Diagonal blocks (0,0), (1,1), (2,2), (3,3) have partial 2D mask (1);
+    # off-diagonal intra-segment blocks (1,0), (3,2) have full 2D mask and
+    # uniform single segment (2).
+    np.testing.assert_array_equal(
+        np.asarray(refined.block_mask[:n]), np.array([1, 2, 1, 1, 2, 1])
+    )
+
+  def test_refine_mask_info_with_segments_full_mask_and_subtiles(self):
+    q_seq_len, kv_seq_len = 8, 8
+    block_shape = (2, 4)
+    bkv_compute = 2
+    full_mask = mask_lib.FullMask((q_seq_len, kv_seq_len))
+    mask_info, _ = mask_info_lib.process_mask(full_mask, block_shape)
+
+    # Q blocks (size 2): [0,0], [1,1], [1,1], [2,2]
+    # KV blocks (size 4, sub-tiles of size 2):
+    #   KV block 0: sub-tile 0 = [0,0], sub-tile 1 = [1,1]
+    #   KV block 1: sub-tile 0 = [1,1], sub-tile 1 = [2,2]
+    seg_ids = jax.numpy.array([0, 0, 1, 1, 1, 1, 2, 2], dtype=np.int32)
+    refined = mask_info_lib.refine_mask_info_with_segments(
+        mask_info,
+        seg_ids,
+        seg_ids,
+        block_shape,
+        bkv_compute=bkv_compute,
+        is_dkv=False,
+    )
+    assert refined.num_active_blocks is not None
+    assert refined.active_rows is not None
+    assert refined.active_cols is not None
+    assert refined.block_mask is not None
+    n = int(refined.num_active_blocks[0])
+    # Active (q_blk, kv_blk): (0,0), (1,0), (1,1), (2,0), (2,1), (3,1) -> 6
+    self.assertEqual(n, 6)
+    np.testing.assert_array_equal(
+        np.asarray(refined.active_rows[:n]), np.array([0, 1, 1, 2, 2, 3])
+    )
+    np.testing.assert_array_equal(
+        np.asarray(refined.active_cols[:n]), np.array([0, 0, 1, 0, 1, 1])
+    )
+    # Every active KV block has mixed segments (0&1 or 1&2), so low 2 bits = 3.
+    # Sub-tile bit 2 (sub-tile 0) = 4, sub-tile bit 3 (sub-tile 1) = 8:
+    # (0,0): sub-tile 0 only -> 3 | 4 = 7
+    # (1,0): sub-tile 1 only -> 3 | 8 = 11
+    # (1,1): sub-tile 0 only -> 3 | 4 = 7
+    # (2,0): sub-tile 1 only -> 3 | 8 = 11
+    # (2,1): sub-tile 0 only -> 3 | 4 = 7
+    # (3,1): sub-tile 1 only -> 3 | 8 = 11
+    np.testing.assert_array_equal(
+        np.asarray(refined.block_mask[:n]), np.array([7, 11, 7, 11, 7, 11])
+    )
+
+  def test_refine_mask_info_with_segments_empty_rows(self):
+    q_seq_len, kv_seq_len = 8, 8
+    block_shape = (2, 2)
+    full_mask = mask_lib.FullMask((q_seq_len, kv_seq_len))
+    mask_info, _ = mask_info_lib.process_mask(full_mask, block_shape)
+
+    # Q block 3 has segment id 9, which does not exist in KV.
+    q_seg = jax.numpy.array([0, 0, 0, 0, 1, 1, 9, 9], dtype=np.int32)
+    kv_seg = jax.numpy.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int32)
+    refined = mask_info_lib.refine_mask_info_with_segments(
+        mask_info, q_seg, kv_seg, block_shape, bkv_compute=2, is_dkv=False
+    )
+    assert refined.num_active_blocks is not None
+    assert refined.active_rows is not None
+    assert refined.block_mask is not None
+    n = int(refined.num_active_blocks[0])
+    # Rows 0, 1 each match cols 0, 1 (4 blocks); row 2 matches cols 2, 3 (2
+    # blocks); empty row 3 retains 1 dummy entry (col 0, block_mask=0) -> 7.
+    self.assertEqual(n, 7)
+    np.testing.assert_array_equal(
+        np.asarray(refined.active_rows[:n]), np.array([0, 0, 1, 1, 2, 2, 3])
+    )
+    np.testing.assert_array_equal(
+        np.asarray(refined.block_mask[:n]), np.array([2, 2, 2, 2, 2, 2, 0])
+    )
+
+    # When ALL Q rows are disjoint from KV in forward, num_active_blocks is 0.
+    q_disjoint = jax.numpy.full((q_seq_len,), 9, dtype=np.int32)
+    refined_empty = mask_info_lib.refine_mask_info_with_segments(
+        mask_info, q_disjoint, kv_seg, block_shape, bkv_compute=2, is_dkv=False
+    )
+    assert refined_empty.num_active_blocks is not None
+    self.assertEqual(int(refined_empty.num_active_blocks[0]), 0)
+
+
 if __name__ == "__main__":
   absltest.main()
