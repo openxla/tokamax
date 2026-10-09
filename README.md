@@ -13,6 +13,8 @@ provides state-of-the-art custom kernel implementations built on top of
 Tokamax also provides tooling for users to build and autotune their own custom
 accelerator kernels.
 
+Test
+
 ## Status
 
 Tokamax is still heavily under development. Incomplete features and API changes
