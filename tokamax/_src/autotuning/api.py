@@ -40,8 +40,18 @@ from tokamax._src.ops.experimental.kda import api as kda_api
 from tokamax._src.ops.experimental.kda import base as kda_base
 from tokamax._src.ops.experimental.mla import api as mla_api
 from tokamax._src.ops.experimental.mla import base as mla_base
+from tokamax._src.ops.experimental.tpu.compress_store import api as compress_store_api
+from tokamax._src.ops.experimental.tpu.compress_store import base as compress_store_base
 from tokamax._src.ops.experimental.tpu.csa_gather import api as csa_gather_api
 from tokamax._src.ops.experimental.tpu.csa_gather import base as csa_gather_base
+from tokamax._src.ops.experimental.tpu.mhc import api as mhc_api
+from tokamax._src.ops.experimental.tpu.mhc import base as mhc_base
+from tokamax._src.ops.experimental.tpu.o_projection import api as o_projection_api
+from tokamax._src.ops.experimental.tpu.o_projection import base as o_projection_base
+from tokamax._src.ops.experimental.tpu.proj_and_save_state import api as proj_and_save_state_api
+from tokamax._src.ops.experimental.tpu.proj_and_save_state import base as proj_and_save_state_base
+from tokamax._src.ops.experimental.tpu.rope import api as rope_api
+from tokamax._src.ops.experimental.tpu.rope import base as rope_base
 from tokamax._src.ops.experimental.tpu.splash_attention import api as splash_attention_api
 from tokamax._src.ops.experimental.tpu.splash_attention import base as splash_attention_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
@@ -284,6 +294,15 @@ _API_IMPLEMENTATIONS: Final[
         causal_conv1d_gated_delta_rule_api.IMPLEMENTATIONS
     ),
     csa_gather_base.CsaGather: csa_gather_api.IMPLEMENTATIONS,
+    compress_store_base.CompressStore: compress_store_api.IMPLEMENTATIONS,
+    o_projection_base.OProjection: o_projection_api.IMPLEMENTATIONS,
+    proj_and_save_state_base.ProjAndSaveState: (
+        proj_and_save_state_api.IMPLEMENTATIONS
+    ),
+    rope_base.Rope: rope_api.IMPLEMENTATIONS,
+    mhc_base.MhcPre: mhc_api.PRE_IMPLEMENTATIONS,
+    mhc_base.MhcPost: mhc_api.POST_IMPLEMENTATIONS,
+    mhc_base.MhcFusedPostPre: mhc_api.FUSED_POST_PRE_IMPLEMENTATIONS,
 })
 
 
