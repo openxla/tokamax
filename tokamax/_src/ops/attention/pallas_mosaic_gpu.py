@@ -30,14 +30,16 @@ from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_kernel_sm100 as sm100
+from tokamax._src.ops.attention import pallas_mosaic_gpu_kernel_sm80 as sm80
 from tokamax._src.ops.attention import pallas_mosaic_gpu_kernel_sm90 as sm90
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as vjp
 
 
 # TODO: Make attention Config a pydantic discriminated union.
+ConfigSM80 = sm80.Config
 ConfigSM90 = sm90.Config
 ConfigSM100 = sm100.Config
-type Config = ConfigSM90 | ConfigSM100
+type Config = ConfigSM80 | ConfigSM90 | ConfigSM100
 type Key = immutabledict.immutabledict[str, Any]
 Mask = base.Mask
 PagingInfo = base.PagingInfo
@@ -48,9 +50,13 @@ Residuals = base.Residuals
 def _get_kernel_module():
   if not gpu_utils.has_mosaic_gpu_support():
     raise NotImplementedError("Mosaic GPU not supported on this platform.")
-  if not (gpu_utils.is_sm90() or gpu_utils.is_sm100()):
-    raise NotImplementedError("Only supported for sm90 and sm100 GPUs.")
-  return sm100 if gpu_utils.is_sm100() else sm90
+  if gpu_utils.is_sm80():
+    return sm80
+  if gpu_utils.is_sm90():
+    return sm90
+  if gpu_utils.is_sm100():
+    return sm100
+  raise NotImplementedError("Only supported for sm80, sm90 and sm100 GPUs.")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,9 +116,9 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     if not gpu_utils.has_mosaic_gpu_support():
       raise NotImplementedError("Mosaic GPU not supported on this platform.")
 
-    if not (gpu_utils.is_sm90() or gpu_utils.is_sm100()):
+    if not (gpu_utils.is_sm80() or gpu_utils.is_sm90() or gpu_utils.is_sm100()):
       raise NotImplementedError(
-          "Mosaic GPU backend only supported for sm90+ GPUs for now."
+          "Mosaic GPU backend only supported for sm80+ GPUs for now."
       )
 
     supported_dtypes = (jnp.float32, jnp.float16, jnp.bfloat16)
@@ -160,6 +166,10 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         use_stable_softmax = base.needs_stable_softmax(
             logits_dtype, logits_soft_cap
         )
+    elif isinstance(config, ConfigSM80):
+      kernel_module = sm80
+      if use_stable_softmax is base.AUTO:
+        use_stable_softmax = True
     else:
       raise TypeError(f"Unsupported config type: {type(config)}")
 
