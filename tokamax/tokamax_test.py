@@ -23,12 +23,11 @@ import numpy as np
 import tokamax
 from tokamax._src import version
 from tokamax._src.autotuning import api as autotuning
-from tokamax._src.ops.attention import api as attention_api
+from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.normalization import api as norm_api
 
 try:
   from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
-  from tokamax._src.ops.attention import pallas_triton_vjp as pl_triton_attn_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
   from tokamax._src.ops.normalization import triton as triton_norm  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 except ImportError:
   pass
@@ -44,11 +43,11 @@ class TokamaxTest(absltest.TestCase):
   def test_full_example(self):
     impl = "triton" if jax.default_backend() == "gpu" else "xla"
 
-    def loss(x, scale):
+    def loss(x, weights, scale):
       x = tokamax.layer_norm(
           x, scale=scale, offset=None, implementation=impl
       )
-      x = tokamax.dot_product_attention(x, x, x, implementation=impl)
+      x = tokamax.gated_linear_unit(x, weights, implementation=impl)
       x = tokamax.layer_norm(x, scale=scale, offset=None, implementation=None)
       # TODO: Remove once Mosaic supports non-bfloat16 types.
       # x = tokamax.dot_product_attention(x, x, x, implementation="mosaic")
@@ -59,13 +58,17 @@ class TokamaxTest(absltest.TestCase):
     batch_size = 1
     num_heads = 8
 
-    rng0, rng1 = np.random.default_rng(0).spawn(2)
+    rng0, rng1, rng2 = np.random.default_rng(0).spawn(3)
     x_size = (batch_size, seq_len, num_heads, channels)
+    w_size = (channels, 2, channels)
     scale = jax.device_put(rng0.uniform(low=-1.0, size=(channels,)))
     x = jax.device_put(rng1.uniform(low=-1.0, size=x_size)).astype(jnp.bfloat16)
+    weights = jax.device_put(rng2.uniform(low=-1.0, size=w_size)).astype(
+        jnp.bfloat16
+    )
 
     f_grad = jax.jit(jax.grad(loss))
-    out = f_grad(x, scale)
+    out = f_grad(x, weights, scale)
 
     with self.subTest("DISABLE_JAX_EXPORT_CHECKS"):
       exported = export.export(
@@ -73,31 +76,31 @@ class TokamaxTest(absltest.TestCase):
           disabled_checks=tokamax.DISABLE_JAX_EXPORT_CHECKS,
       )(
           jax.ShapeDtypeStruct(x.shape, x.dtype),
+          jax.ShapeDtypeStruct(weights.shape, weights.dtype),
           jax.ShapeDtypeStruct(scale.shape, scale.dtype),
       )
       serialized = exported.serialize()
       f_grad_roundtrip = export.deserialize(serialized)
-      out_roundtrip = jax.jit(f_grad_roundtrip.call)(x, scale)
+      out_roundtrip = jax.jit(f_grad_roundtrip.call)(x, weights, scale)
       rtol = 5e-2 if jax.default_backend() == "tpu" else 1e-5
       atol = 0.125 if jax.default_backend() == "tpu" else 1e-5
       chex.assert_trees_all_close(out, out_roundtrip, rtol=rtol, atol=atol)
 
     with self.subTest("has_correct_kernels"):
-      arg_specs = autotuning.get_bound_args(f_grad, x, scale)
+      arg_specs = autotuning.get_bound_args(f_grad, x, weights, scale)
       ops = set(a.op.__class__ for a in arg_specs)
       if jax.default_backend() == "gpu":
         ops_expected = set([
-            attention_api.IMPLEMENTATIONS["triton"].__class__,
+            glu_api.IMPLEMENTATIONS["triton"].__class__,
             # TODO: Remove once Mosaic supports non-bfloat16 types.
             # attention_api.IMPLEMENTATIONS["mosaic_gpu"].__class__,
             # pallas_mosaic_gpu_vjp.PallasMosaicGpuFlashAttentionVjp,
             norm_api.IMPLEMENTATIONS["triton"].__class__,
-            pl_triton_attn_vjp.PallasTritonFlashAttentionVjp,
             triton_norm.TritonNormalizationVjp,
         ])
       else:
         ops_expected = set([
-            attention_api.IMPLEMENTATIONS["xla"].__class__,
+            glu_api.IMPLEMENTATIONS["xla"].__class__,
             # TODO: Remove once Mosaic supports non-bfloat16 types.
             # attention_api.IMPLEMENTATIONS["mosaic_tpu"].__class__,
             # pallas_mosaic_tpu_vjp.PallasMosaicTpuFlashAttentionVjp,
@@ -106,10 +109,10 @@ class TokamaxTest(absltest.TestCase):
       self.assertContainsSubset(ops_expected, ops)
 
     with self.subTest("Autotune"):
-      autotune_res = tokamax.autotune(f_grad, x, scale)
+      autotune_res = tokamax.autotune(f_grad, x, weights, scale)
       self.assertIsInstance(autotune_res, tokamax.AutotuningResult)
       with autotune_res:
-        out_autotuned = f_grad(x, scale)
+        out_autotuned = f_grad(x, weights, scale)
 
         # TODO: Reduce tolerance once mgpu attention supports higher precision.
         def l2_rel(a, b):
@@ -123,7 +126,7 @@ class TokamaxTest(absltest.TestCase):
         )
 
     with self.subTest("Benchmark"):
-      f_std, args = tokamax.standardize_function(f_grad, x, scale)
+      f_std, args = tokamax.standardize_function(f_grad, x, weights, scale)
       bench: tokamax.BenchmarkData = tokamax.benchmark(f_std, args)
       self.assertGreater(bench.median_evaluation_time_ms, 0.0)
 

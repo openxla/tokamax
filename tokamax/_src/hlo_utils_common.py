@@ -24,9 +24,8 @@ TOKAMAX_NAME: Final[str] = 'tokamax'
 
 MOSAIC_GPU_KEY: Final[str] = 'mosaic_gpu_v2'
 MOSAIC_TPU_KEY: Final[str] = 'tpu_custom_call'
-# These names are exposed in Triton Pallas and jax_triton, but we don't want
-# dependencies on these here. So the equivalence is tested against.
-PALLAS_TRITON_KEY: Final[str] = '__gpu$xla.gpu.triton'
+# Exposed in jax_triton, but we don't want a dependency on it here. So the
+# equivalence is tested against.
 TRITON_FFI_KEY: Final[str] = 'triton_kernel_call_ffi'
 
 

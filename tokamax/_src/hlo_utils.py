@@ -30,7 +30,6 @@ from tokamax._src import hlo_utils_common
 from tokamax._src.ops import op as op_lib
 
 DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
-    export.DisabledSafetyCheck.custom_call(hlo_utils_common.PALLAS_TRITON_KEY),
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_FFI_KEY),
 )
 type HloComputation = (
@@ -264,9 +263,6 @@ _KERNEL_GETTER: Final[
     ),
     hlo_utils_common.MOSAIC_TPU_KEY: _kernel_info_getter(
         hlo_utils_common.MosaicTpuKernelInfo
-    ),
-    hlo_utils_common.PALLAS_TRITON_KEY: _kernel_info_getter(
-        hlo_utils_common.TritonKernelInfo
     ),
     hlo_utils_common.TRITON_FFI_KEY: _kernel_info_getter(
         hlo_utils_common.TritonKernelInfo

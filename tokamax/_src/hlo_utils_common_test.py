@@ -14,18 +14,11 @@
 # ==============================================================================
 
 from absl.testing import absltest
-from jax.experimental.pallas import triton as pallas_triton
 
 from tokamax._src import hlo_utils_common
 
 
 class HloUtilsCommonTest(absltest.TestCase):
-
-  def test_kernel_name_consistency(self):
-    self.assertEqual(
-        hlo_utils_common.PALLAS_TRITON_KEY,
-        pallas_triton.CUSTOM_CALL_TARGET_NAME,
-    )
 
   def test_get_json_from_name(self):
     self.assertIsNone(hlo_utils_common.get_json_from_name('no_marker_here'))

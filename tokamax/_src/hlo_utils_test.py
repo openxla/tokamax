@@ -24,7 +24,6 @@ import jax
 from jax import export
 from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
-from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
@@ -67,39 +66,13 @@ def _computation_from_lowered(
       return hlo_utils_common.ir_module_from_lowered(x)
 
 
-def add_vectors_kernel(x_ref, y_ref, o_ref):
-  x, y = x_ref[...], y_ref[...]
-  o_ref[...] = x + y
-
-
-def add_vector_two(x_ref, o_ref):
-  o_ref[...] = x_ref[...] + 2
-
-
-@jax.jit
-def add_vectors_pallas_triton(x: jax.Array, y: jax.Array) -> jax.Array:
-  call_1 = pl.pallas_call(
-      add_vectors_kernel,
-      out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-      name='add_vectors_kernel_1',
-      compiler_params=plgpu.CompilerParams(num_warps=2, num_stages=1),
-  )
-  call_2 = pl.pallas_call(
-      add_vector_two,
-      grid=(8, 1, 1),
-      out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-      name='add_vector_two',
-      compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=3),
-  )
-  out = call_1(x, y)
-  out *= call_2(out)
-  return jnp.sin(out) + jnp.cos(out)
-
-
 class DumpHloLibTest(parameterized.TestCase):
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
-  def test_pallas_gpu_tpu(self, representation):
+  def test_pallas_tpu(self, representation):
+    if jax.default_backend() != 'tpu':
+      self.skipTest('This test only runs on TPU.')
+
     # Example taken from https://docs.jax.dev/en/latest/pallas/quickstart.html.
     def add_vectors_kernel(x_ref, y_ref, o_ref):
       x, y = x_ref[...], y_ref[...]
@@ -110,9 +83,6 @@ class DumpHloLibTest(parameterized.TestCase):
       return pl.pallas_call(
           add_vectors_kernel,
           out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-          compiler_params=(
-              plgpu.CompilerParams() if jax.default_backend() == 'gpu' else None
-          ),
       )(x, y)
 
     x = jnp.arange(8)
@@ -128,64 +98,11 @@ class DumpHloLibTest(parameterized.TestCase):
         computation, include_xla_kernels=False
     )
 
-    expected_class = (
-        hlo_utils_common.TritonKernelInfo
-        if jax.default_backend() == 'gpu'
-        else hlo_utils_common.MosaicTpuKernelInfo
-    )
-    self.assertIsInstance(kernel_info, expected_class)
+    self.assertIsInstance(kernel_info, hlo_utils_common.MosaicTpuKernelInfo)
     self.assertEqual(
         kernel_info.outputs,
         (jax.ShapeDtypeStruct(shape=(8,), dtype=jnp.int32),),
     )
-
-  @parameterized.parameters(*REPRESENTATION_TYPES)
-  def test_simple_pallas_triton(self, representation):
-
-    if jax.default_backend() != 'gpu':
-      self.skipTest('This test only runs on GPU.')
-
-    dtype = jnp.int32
-    x = jnp.arange(8, dtype=dtype)
-    computation = _computation_from_lowered(
-        add_vectors_pallas_triton.lower(x=x, y=x), representation
-    )
-    kernel_info = hlo_utils.get_kernel_info(
-        computation, include_xla_kernels=False
-    )
-    self.assertLen(kernel_info, 2)
-    kernel_1, kernel_2 = kernel_info
-
-    self.assertIsInstance(kernel_1, hlo_utils_common.TritonKernelInfo)
-    self.assertIsInstance(kernel_2, hlo_utils_common.TritonKernelInfo)
-
-    # TODO: Re-enable checks after bug is fixed.
-    _ = """
-    self.assertEqual(kernel_1.num_stages, 1)
-    self.assertEqual(kernel_2.num_stages, 3)
-    """
-
-    shape = jax.ShapeDtypeStruct(shape=(8,), dtype=dtype)
-    self.assertEqual(kernel_1.inputs, (shape, shape))
-    self.assertEqual(kernel_2.inputs, (shape,))
-
-    # Note that Pallas Triton kernels are considered unstable for the purposes
-    # of JAX StableHLO export. Test that DISABLE_JAX_EXPORT_CHECKS works as
-    # expected.
-    with self.subTest('serialization'):
-      shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
-      with self.assertRaises(ValueError):
-        export.export(add_vectors_pallas_triton)(shape, shape)
-
-      exported_fn = export.export(
-          add_vectors_pallas_triton,
-          disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
-      )(shape, shape)
-      serialized = exported_fn.serialize()
-      f_roundtrip = export.deserialize(serialized)
-      out_roundtrip = jax.jit(f_roundtrip.call)(x, x)
-      out = add_vectors_pallas_triton(x, x)
-      chex.assert_trees_all_equal(out, out_roundtrip)
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_triton_norm(self, representation):
@@ -234,6 +151,22 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertEqual(forward.inputs, inputs_ref)
 
     # TODO: add tests for axis once this is in the Pallas HLO.
+
+    # Test that DISABLE_JAX_EXPORT_CHECKS works as expected for Triton kernels.
+    with self.subTest('serialization'):
+      fn = jax.jit(f)
+      with self.assertRaises(ValueError):
+        export.export(fn)(x, scale, offset)
+
+      exported_fn = export.export(
+          fn,
+          disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
+      )(x, scale, offset)
+      serialized = exported_fn.serialize()
+      f_roundtrip = export.deserialize(serialized)
+      out_roundtrip = jax.jit(f_roundtrip.call)(x, scale, offset)
+      out = fn(x, scale, offset)
+      chex.assert_trees_all_equal(out, out_roundtrip)
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_get_opspecs_from_lowered_jax(self, representation):
@@ -382,7 +315,7 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertGreater(diff_summary.percent_close * 100, 99.99)
 
   @parameterized.product(
-      implementation=['mosaic', 'triton', 'xla', 'xla_chunked', 'cudnn', None],
+      implementation=['mosaic', 'xla', 'xla_chunked', 'cudnn', None],
       representation=REPRESENTATION_TYPES,
   )
   def test_opspec_attention_all_implementations(
@@ -390,7 +323,7 @@ class DumpHloLibTest(parameterized.TestCase):
   ):
     """Tests that attention opspecs are returned for all implementations."""
 
-    if implementation in ('triton', 'cudnn') and jax.default_backend() != 'gpu':
+    if implementation == 'cudnn' and jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
     if implementation == 'mosaic' and not gpu_utils.has_mosaic_gpu_support():
       self.skipTest('mosaic is not supported on this GPU version.')
