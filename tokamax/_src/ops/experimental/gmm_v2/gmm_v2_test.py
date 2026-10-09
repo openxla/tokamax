@@ -1971,12 +1971,13 @@ class GmmV2VmapTest(parameterized.TestCase):
       self.skipTest("Only supported on TPU gen 5+.")
     super().setUp()
 
-  # TODO: Re-enable ("multi_core_mode", False) once JAX loop-based
-  # fallback for batched scalar prefetch lands in Pallas.
   @parameterized.named_parameters(
+      ("multi_core_mode", False),
       ("single_core_fallback", True),
   )
   def test_gmm_vmap(self, disable_multi_core_mode: bool):
+    if not disable_multi_core_mode and jax.__version_info__ <= (0, 11, 2):
+      self.skipTest("Multi-core vmap requires JAX > 0.11.2.")
     # Tests jax.vmap on gmm_v2 with batched LHS and group_sizes.
     batch_size = 128
     in_size = 256
@@ -2011,12 +2012,13 @@ class GmmV2VmapTest(parameterized.TestCase):
     ])
     assert_arrays_all_close(actual, expected)
 
-  # TODO: Re-enable ("multi_core_mode", False) once JAX loop-based
-  # fallback for batched scalar prefetch lands in Pallas.
   @parameterized.named_parameters(
+      ("multi_core_mode", False),
       ("single_core_fallback", True),
   )
   def test_tgmm_vmap(self, disable_multi_core_mode: bool):
+    if not disable_multi_core_mode and jax.__version_info__ <= (0, 11, 2):
+      self.skipTest("Multi-core vmap requires JAX > 0.11.2.")
     # Tests jax.vmap on tgmm_v2 with batched LHS, RHS, and group_sizes.
     batch_size = 128
     in_size = 256
