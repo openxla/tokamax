@@ -1,7 +1,7 @@
 # Tokamax
 
 [![nightly](https://img.shields.io/github/actions/workflow/status/openxla/tokamax/ci-nightly.yml?label=nightly&logo=githubactions&logoColor=white)](https://github.com/openxla/tokamax/actions/workflows/ci-nightly.yml)
-[![PyPI version](https://img.shields.io/pypi/v/tokamax)](https://pypi.org/project/tokamax/)
+[![PyPI version](https://img.shields.io/pypi/v/tokamax?color=blue)](https://pypi.org/project/tokamax/)
 ![Static Badge](https://img.shields.io/badge/Under_Development-red)
 
 Tokamax is a library of custom accelerator kernels, supporting both NVIDIA GPUs
