@@ -45,7 +45,30 @@ def exp2(x):
 
 def get_interpret() -> bool:
   env = os.environ.get("PALLAS_INTERPRET", "")
-  return env.strip().lower() in ("1", "true")
+  return env.strip().lower() in ("1", "true") or jax.default_backend() == "cpu"
+
+
+def get_chain_precision() -> jax.lax.Precision:
+  """Precision for the two matmuls on the forward's serial recurrent chain.
+
+  Set by `KDA_CHAIN_PRECISION`: `highest` (default), `high` or `default`.
+  The two matmuls are `w @ h` and `kg^T @ v_new` in
+  `pallas_mosaic_tpu_fwd_kernel`. Their operands are read from bf16 buffers,
+  so lower precision uses fewer MXU passes. `v_new` feeds the recurrent state,
+  so errors compound across chunks; validate accuracy on TPU (CPU interpret
+  mode does not model TPU matmul precision).
+  """
+  env = os.environ.get("KDA_CHAIN_PRECISION", "highest").strip().lower()
+  try:
+    return {
+        "highest": jax.lax.Precision.HIGHEST,
+        "high": jax.lax.Precision.HIGH,
+        "default": jax.lax.Precision.DEFAULT,
+    }[env]
+  except KeyError:
+    raise ValueError(
+        f"KDA_CHAIN_PRECISION must be highest, high or default; got {env!r}."
+    ) from None
 
 
 def cdiv(x, y: int):
@@ -268,7 +291,6 @@ def _align_seqs(
   )
 
 
-
 def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
   """Reverse _align_seqs: scatter aligned output back to original positions.
 
@@ -310,7 +332,6 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
   gather_idx = jnp.full(T_out, safe_default, dtype=jnp.int32)
   gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
   return o[:, :, gather_idx]
-
 
 
 def align_segment_ids(
@@ -525,4 +546,3 @@ def kda_gate_chunk_cumsum(
       scale=scale,
       output_dtype=output_dtype or jnp.float32,
   )
-

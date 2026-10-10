@@ -85,23 +85,30 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       query: Float[Array | AbstractArray, "H B T K"],
       key: Float[Array | AbstractArray, "H B T K"],
       value: Float[Array | AbstractArray, "H B T V"],
-      gate: Float[Array | AbstractArray, "H B T K"],
+      gate: Float[Array | AbstractArray, "H B T GW"],
       beta: Float[Array | AbstractArray, "H B T"],
       *,
       a_log: Float[Array | AbstractArray, "H"] | None = None,
       delta_time_bias: Float[Array | AbstractArray, "H*K"] | None = None,
       scale: float | None = None,
-      initial_state: (
-          Float[Array | AbstractArray, "B N H K V"] | None
-      ) = None,
+      initial_state: Float[Array | AbstractArray, "B N H K V"] | None = None,
       output_final_state: bool = False,
       use_qk_l2norm: bool = False,
       use_gate_in_kernel: bool = False,
+      per_channel_gate: bool = True,
+      chunk_size: int | None = None,
       segment_ids: Int[Array | AbstractArray, "B T"] | None = None,
       lower_bound: float | None = None,
       context_parallel_metadata: ContextParallelMetadata | None = None,
       max_num_segments: int | None = None,
       return_residuals: bool = False,
+      conv_weight_q: Float[Array | AbstractArray, "H_Q W K"] | None = None,
+      conv_weight_k: Float[Array | AbstractArray, "H_K W K"] | None = None,
+      conv_weight_v: Float[Array | AbstractArray, "H W V"] | None = None,
+      conv_bias_q: Float[Array | AbstractArray, "H_Q K"] | None = None,
+      conv_bias_k: Float[Array | AbstractArray, "H_K K"] | None = None,
+      conv_bias_v: Float[Array | AbstractArray, "H V"] | None = None,
+      use_conv1d_in_kernel: bool = False,
   ) -> op.BoundArguments:
     """Binds KDA arguments and validates semantic constraints."""
     heads, _, _, key_dim = query.shape
@@ -134,6 +141,31 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
           "`max_num_segments` is required when `segment_ids` is provided "
           "without `initial_state`."
       )
+    gate_width = gate.shape[-1]
+    if per_channel_gate:
+      if gate_width != key_dim:
+        raise ValueError(
+            f"`gate` last dimension {gate_width} must equal the key dimension"
+            f" {key_dim} when `per_channel_gate=True`."
+        )
+    elif gate_width != 1:
+      raise ValueError(
+          f"`gate` last dimension {gate_width} must be 1 (one value per head"
+          " and token) when `per_channel_gate=False`."
+      )
+    if not per_channel_gate and use_gate_in_kernel:
+      raise ValueError(
+          "`use_gate_in_kernel=True` needs a per-channel gate:"
+          " `delta_time_bias` is per key channel."
+      )
+    if use_conv1d_in_kernel and (
+        conv_weight_q is None or conv_weight_k is None or conv_weight_v is None
+    ):
+      raise ValueError(
+          "`conv_weight_q`, `conv_weight_k` and `conv_weight_v` must all be"
+          " provided when `use_conv1d_in_kernel=True`."
+      )
+
     _validate_gate_args(
         use_gate_in_kernel=use_gate_in_kernel,
         a_log=a_log,
@@ -159,11 +191,20 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         output_final_state=output_final_state,
         use_qk_l2norm=use_qk_l2norm,
         use_gate_in_kernel=use_gate_in_kernel,
+        per_channel_gate=per_channel_gate,
+        chunk_size=chunk_size,
         segment_ids=segment_ids,
         lower_bound=lower_bound,
         context_parallel_metadata=context_parallel_metadata,
         max_num_segments=max_num_segments,
         return_residuals=return_residuals,
+        conv_weight_q=conv_weight_q,
+        conv_weight_k=conv_weight_k,
+        conv_weight_v=conv_weight_v,
+        conv_bias_q=conv_bias_q,
+        conv_bias_k=conv_bias_k,
+        conv_bias_v=conv_bias_v,
+        use_conv1d_in_kernel=use_conv1d_in_kernel,
     )
 
   @jaxtyping.jaxtyped
@@ -173,7 +214,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       query: Float[Array, "H B T K"],
       key: Float[Array, "H B T K"],
       value: Float[Array, "H B T V"],
-      gate: Float[Array, "H B T K"],
+      gate: Float[Array, "H B T GW"],
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None,
@@ -183,15 +224,24 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       output_final_state: bool,
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
+      per_channel_gate: bool,
+      chunk_size: int | None,
       segment_ids: Int[Array, "B T"] | None,
       lower_bound: float | None,
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
+      conv_weight_q: Float[Array, "H_Q W K"] | None = None,
+      conv_weight_k: Float[Array, "H_K W K"] | None = None,
+      conv_weight_v: Float[Array, "H W V"] | None = None,
+      conv_bias_q: Float[Array, "H_Q K"] | None = None,
+      conv_bias_k: Float[Array, "H_K K"] | None = None,
+      conv_bias_v: Float[Array, "H V"] | None = None,
+      use_conv1d_in_kernel: bool = False,
       config: _Config,
   ) -> tuple[Output, Residuals]:
     """Dispatches to the pure JAX KDA reference implementation."""
-    del config, return_residuals
+    del config, return_residuals, per_channel_gate, chunk_size
     _validate_beta(beta)
     output = reference.kimi_delta_attention(
         query,
@@ -210,5 +260,12 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         lower_bound=lower_bound,
         context_parallel_metadata=context_parallel_metadata,
         max_num_segments=max_num_segments,
+        conv_weight_q=conv_weight_q,
+        conv_weight_k=conv_weight_k,
+        conv_weight_v=conv_weight_v,
+        conv_bias_q=conv_bias_q,
+        conv_bias_k=conv_bias_k,
+        conv_bias_v=conv_bias_v,
+        use_conv1d_in_kernel=use_conv1d_in_kernel,
     )
     return output, None
