@@ -46,6 +46,17 @@ NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))  # standard matmul
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))  # RHS transposed
 
 LOG2E = math.log2(math.e)
+
+
+def _is_fp8(x) -> bool:
+  return x.dtype == jnp.float8_e4m3fn
+
+
+def _unquantized_dtype(x):
+  """bf16 for fp8 inputs; otherwise the input dtype (pre-cl/978108475 behavior)."""
+  return jnp.bfloat16 if _is_fp8(x) else x.dtype
+
+
 LOG2E_INV = 1 / LOG2E
 
 # mypy: ignore-errors
@@ -338,6 +349,16 @@ class SplashConfig:
   # common grid). Set smaller to decouple block sizes that aren't multiples.
   dropout_block_q: int | None = None
   dropout_block_kv: int | None = None
+  # [experimental] In the fused dkv kernel, reuse the
+  # LOG2E-scaled q for the dK matmul and undo the scale with dk /= LOG2E
+  # (exact grad w.r.t. the rounded fp8 q; one fewer q tile live).
+  # False = previous behavior.
+  dkv_reuse_scaled_q: bool = False
+  # [experimental] q arrives already multiplied by LOG2E (the caller folds it
+  # into the softmax scale before the fp8 cast, so q is rounded to fp8 once).
+  # The kernel skips its own q scaling and returns dq, dk w.r.t. the
+  # pre-scaled input (both divided by LOG2E). Subsumes dkv_reuse_scaled_q.
+  q_prescaled_log2e: bool = False
 
   @property
   def active_dropout_block_q(self) -> int:
@@ -366,6 +387,8 @@ class SplashConfig:
       )
     if not self.use_fused_bwd_kernel:
       raise ValueError("Only the fused bwd kernel is supported.")
+    if self.q_prescaled_log2e and not self.use_base2_exp:
+      raise ValueError("q_prescaled_log2e requires use_base2_exp=True.")
 
     if self.dropout_rate:
       # The backward regenerates the mask rather than reloading it, so the two
@@ -696,8 +719,11 @@ def flash_attention_kernel(
     assert l_prev.shape == (num_stacked_q_heads, bq, NUM_LANES)
 
     q = q_ref[...] if config.q_layout == HEAD_DIM_MINOR else q_ref[...].mT
-    if config.use_base2_exp:
-      q *= LOG2E
+    if config.use_base2_exp and not config.q_prescaled_log2e:
+      if q.dtype == jnp.float8_e4m3fn:
+        q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
+      else:
+        q *= LOG2E
 
     head_dim_qk = q.shape[-1]
     # Collapse the head and sequence dimensions for a larger matmul.
@@ -862,13 +888,25 @@ def flash_attention_kernel(
       v_parts = [v[j * sk : (j + 1) * sk, :] for j in range(_g)]
       o_rows = []
       for qi in range(_g):
-        o_row = lax.dot_general(s_parts[qi][0], v_parts[0], sv_dims)
+        o_row = lax.dot_general(
+            s_parts[qi][0],
+            v_parts[0],
+            sv_dims,
+            preferred_element_type=jnp.float32,
+        )
         for kj in range(1, qi + 1):
-          o_row = o_row + lax.dot_general(s_parts[qi][kj], v_parts[kj], sv_dims)
+          o_row = o_row + lax.dot_general(
+              s_parts[qi][kj],
+              v_parts[kj],
+              sv_dims,
+              preferred_element_type=jnp.float32,
+          )
         o_rows.append(o_row)
       o_curr_flat = jnp.concatenate(o_rows, axis=0)
     else:
-      o_curr_flat = lax.dot_general(s_curr_flat, v, sv_dims)
+      o_curr_flat = lax.dot_general(
+          s_curr_flat, v, sv_dims, preferred_element_type=jnp.float32
+      )
     o_curr = o_curr_flat.reshape((num_stacked_q_heads, bq, head_dim_v))
 
     if max_logit_estimate is None:
@@ -1358,7 +1396,9 @@ def _splash_attention_forward(
     in_specs.append(None)  # pyrefly: ignore[bad-argument-type]
 
   out_shapes = [
-      jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim_v), q.dtype),
+      jax.ShapeDtypeStruct(
+          (num_q_heads, q_seq_len, head_dim_v), _unquantized_dtype(q)
+      ),
   ]
   out_specs = [
       pl.BlockSpec((num_stacked_q_heads, bq, head_dim_v), out_index_map),
@@ -1757,8 +1797,11 @@ def _flash_attention_dq_kernel(
 
   def body(has_partial_mask: bool = False):
     q = q_ref[...] if config.q_layout == HEAD_DIM_MINOR else q_ref[...].mT
-    if config.use_base2_exp:
-      q *= LOG2E
+    if config.use_base2_exp and not config.q_prescaled_log2e:
+      if q.dtype == jnp.float8_e4m3fn:
+        q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
+      else:
+        q *= LOG2E
     # We keep k and v possibly transposed, since they are RHS of dots.
     k = k_ref[...]
     v = v_ref[...]
@@ -1791,7 +1834,7 @@ def _flash_attention_dq_kernel(
         NT_DIM_NUMBERS if config.v_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
     dp = lax.dot_general(
-        do.astype(v.dtype),
+        do if _is_fp8(v) else do.astype(v.dtype),
         v,
         dp_dims,
         preferred_element_type=jnp.float32,
@@ -1806,7 +1849,7 @@ def _flash_attention_dq_kernel(
         NN_DIM_NUMBERS if config.k_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
     )
     dq_scratch_ref[...] += lax.dot_general(
-        ds.astype(k.dtype),
+        ds if _is_fp8(k) else ds.astype(k.dtype),
         k,
         dq_dims,
         preferred_element_type=jnp.float32,
@@ -1933,8 +1976,11 @@ def _flash_attention_dkv_kernel(
     dropout_mask = None
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
     q = q_ref[...]  # We keep q potentially transposed, since it's always RHS
-    if config.use_base2_exp:
-      scaled_q = q * LOG2E
+    if config.use_base2_exp and not config.q_prescaled_log2e:
+      if q.dtype == jnp.float8_e4m3fn:
+        scaled_q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
+      else:
+        scaled_q = q * LOG2E
     else:
       scaled_q = q
 
@@ -2064,17 +2110,27 @@ def _flash_attention_dkv_kernel(
         NN_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
     )
     dk = lax.dot_general(
-        ds.astype(do.dtype), q, dk_dims, preferred_element_type=jnp.float32
+        ds.astype(do.dtype),
+        scaled_q if config.dkv_reuse_scaled_q else q,
+        dk_dims,
+        preferred_element_type=jnp.float32,
     )
+    # Post-dK correction to undo the LOG2E scaling.
+    if config.use_base2_exp and (
+        config.dkv_reuse_scaled_q or config.q_prescaled_log2e
+    ):
+      dk = dk / LOG2E
     dk = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
     dk_scratch_ref[slice_k, :] = dk
     if dq_scratch_ref is not None or dq_ref is not None:
       dq = lax.dot_general(
-          ds.T.astype(k.dtype),
+          ds.T if _is_fp8(k) else ds.T.astype(k.dtype),
           k,
           NN_DIM_NUMBERS,
           preferred_element_type=jnp.float32,
       )
+      if config.q_prescaled_log2e:
+        dq = dq / LOG2E
       if dq_scratch_ref is not None:
         # Compute block size != memory block size
         dq_scratch_ref[...] += dq
@@ -2375,13 +2431,16 @@ def _splash_attention_bwd_dkv(
     )
     dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
     dq_alias_spec = dq_spec
-    dq_shape = jax.ShapeDtypeStruct((3, *q.shape), q.dtype)
+    dq_shape = jax.ShapeDtypeStruct((3, *q.shape), _unquantized_dtype(q))
     dq = jnp.zeros_like(dq_shape)
   else:
     dq_index_map = unravel(lambda h, i, j: (j, h, i, 0))
     dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
     # Only accumulate in fp32 if there's a small number of reduction steps.
-    q_dtype = q.dtype if kv_steps <= 4 else jnp.float32
+    if _is_fp8(q):
+      q_dtype = jnp.bfloat16
+    else:
+      q_dtype = q.dtype if kv_steps <= 4 else jnp.float32
     dq_shape = jax.ShapeDtypeStruct((kv_steps, *q.shape), q_dtype)
 
   in_specs += [dq_alias_spec]
@@ -2401,8 +2460,8 @@ def _splash_attention_bwd_dkv(
   else:
     in_specs += [None, None]
     dk, dv = None, None
-    dk_type = jnp.float32 if reduce_dkv_over_q_heads else k.dtype
-    dv_type = jnp.float32 if reduce_dkv_over_q_heads else v.dtype
+    dk_type = jnp.float32 if reduce_dkv_over_q_heads else _unquantized_dtype(k)
+    dv_type = jnp.float32 if reduce_dkv_over_q_heads else _unquantized_dtype(v)
 
   dk_shape = (
       (num_q_heads, kv_seq_len, head_dim_qk)
@@ -2602,9 +2661,9 @@ def _splash_attention_bwd_dkv(
     if is_mqa:
       dk = jnp.squeeze(dk, axis=0)
       dv = jnp.squeeze(dv, axis=0)
-  dq = dq.astype(q.dtype)
-  dk = dk.astype(k.dtype)
-  dv = dv.astype(v.dtype)
+  dq = dq.astype(_unquantized_dtype(q))
+  dk = dk.astype(_unquantized_dtype(k))
+  dv = dv.astype(_unquantized_dtype(v))
   return dq, dk, dv
 
 
