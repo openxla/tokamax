@@ -60,6 +60,7 @@ def splash_attention(
     mask_value: float = reference.DEFAULT_MASK_VALUE,
     attn_logits_soft_cap: float | None = None,
     dropout_rate: float = 0.0,
+    prng_key: jax.Array | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> jax.Array:
   """Splash Attention.
@@ -77,6 +78,7 @@ def splash_attention(
     mask_value: Additive mask value for masked-out positions (defaults to -1e30)
     attn_logits_soft_cap: Optional logits soft cap.
     dropout_rate: Dropout probability in [0, 1).
+    prng_key: PRNG key for generating dropout masks when dropout_rate > 0.
     implementation: The implementation to use ('mosaic_tpu', 'base', or None for
       automatic selection). If a sequence is passed, the first implementation
       that doesn't raise a NotImplementedError is used.
@@ -116,6 +118,7 @@ def splash_attention(
           mask_value=mask_value,
           attn_logits_soft_cap=attn_logits_soft_cap,
           dropout_rate=dropout_rate,
+          prng_key=prng_key,
       )
     except NotImplementedError as e:
       if len(implementations) == 1:

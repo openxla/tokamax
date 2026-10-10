@@ -37,6 +37,8 @@ def _create_spec(
     is_causal: bool = True,
     is_mqa: bool = False,
     attn_logits_soft_cap: float | None = None,
+    dropout_rate: float = 0.0,
+    prng_key: jax.Array | ShapeDtype | None = None,
     project: str = "",
     tags: tuple[arg_spec.Tag, ...] = (),
 ) -> arg_spec.ArgSpec:
@@ -56,11 +58,16 @@ def _create_spec(
       "k": k,
       "v": v,
       "mask": mask,
+      "dropout_rate": dropout_rate,
+      "prng_key": prng_key,
       "is_mqa": is_mqa,
   }
 
   if attn_logits_soft_cap is not None:
     args["attn_logits_soft_cap"] = attn_logits_soft_cap
+
+  if dropout_rate > 0.0 and prng_key is None:
+    args["prng_key"] = ShapeDtype((2,), jnp.uint32)
 
   return arg_spec.ArgSpec(
       args=args,
@@ -70,6 +77,41 @@ def _create_spec(
   )
 
 
+def _splash_attention_arg_specs() -> tuple[arg_spec.ArgSpec, ...]:
+  """Create Splash Attention argument specs."""
+  num_q_heads = 32
+  num_kv_heads = 8
+  head_dim_sizes = [(128, 128), (192, 128), (256, 256)]
+  seq_lens = [4096, 8192, 32768, 131072]
+  dropout_rates = [0.0, 0.1]
+  specs = []
+
+  for seq_len in seq_lens:
+    for head_dim_qk, head_dim_v in head_dim_sizes:
+      for dropout_rate in dropout_rates:
+        name = f"q32_kv8_s{seq_len}_dqk{head_dim_qk}_dv{head_dim_v}"
+        prng_key = None
+        if dropout_rate > 0.0:
+          name = f"{name}_do{dropout_rate}"
+          prng_key = ShapeDtype((2,), jnp.uint32)
+        spec = _create_spec(
+            name=name,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            q_seq_len=seq_len,
+            kv_seq_len=seq_len,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
+            dtype=jnp.bfloat16,
+            is_causal=True,
+            is_mqa=False,
+            dropout_rate=dropout_rate,
+            prng_key=prng_key,
+        )
+        specs.append(spec)
+  return tuple(specs)
+
+
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     _create_spec(
         name="q64_kv8_s8192_dqk128_dv128",
@@ -77,6 +119,19 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         num_kv_heads=8,
         q_seq_len=8192,
         kv_seq_len=8192,
+        head_dim_qk=128,
+        head_dim_v=128,
+        dtype=jnp.bfloat16,
+        is_causal=True,
+        is_mqa=False,
+        tags=("primary",),
+    ),
+    _create_spec(
+        name="q64_kv8_sq16384_skv131072_dqk128_dv128",
+        num_q_heads=64,
+        num_kv_heads=8,
+        q_seq_len=16384,
+        kv_seq_len=131072,
         head_dim_qk=128,
         head_dim_v=128,
         dtype=jnp.bfloat16,
@@ -110,4 +165,4 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         is_mqa=False,
         tags=("primary",),
     ),
-)
+) + _splash_attention_arg_specs()

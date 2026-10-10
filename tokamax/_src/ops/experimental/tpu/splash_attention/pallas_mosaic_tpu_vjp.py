@@ -42,7 +42,14 @@ class Config:
   block_kv_dkv_compute: Annotated[
       int, pydantic.Field(multiple_of=NUM_LANES, gt=0)
   ]
+  dropout_block_q: (
+      Annotated[int, pydantic.Field(multiple_of=NUM_LANES, gt=0)] | None
+  ) = None
+  dropout_block_kv: (
+      Annotated[int, pydantic.Field(multiple_of=NUM_LANES, gt=0)] | None
+  ) = None
   use_base2_exp: bool = True
+  dq_reduction_steps: int | None = None
 
   def __post_init__(self):
     if self.block_kv_dkv % self.block_kv_dkv_compute:
@@ -50,6 +57,26 @@ class Config:
       block_kv_dkv_compute = self.block_kv_dkv_compute
       raise ValueError(
           f"{block_kv_dkv=} must be a multiple of {block_kv_dkv_compute=}."
+      )
+    if (
+        self.dropout_block_q is not None
+        and self.block_q_dkv % self.dropout_block_q
+    ):
+      raise ValueError(
+          f"{self.block_q_dkv=} must be a multiple of {self.dropout_block_q=}."
+      )
+    if (
+        self.dropout_block_kv is not None
+        and self.block_kv_dkv_compute % self.dropout_block_kv
+    ):
+      raise ValueError(
+          f"{self.block_kv_dkv_compute=} must be a multiple of"
+          f" {self.dropout_block_kv=}."
+      )
+    if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
+      raise ValueError(
+          f"dq_reduction_steps has value: {self.dq_reduction_steps}, only 3"
+          " or None are supported."
       )
 
 
@@ -78,14 +105,10 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
       mask_value: float = base.DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
+      prng_key: jax.Array | None = None,
       return_residuals: bool = False,
       config: Config,
   ) -> tuple[base.SplashAttentionGrads, None]:
-    if dropout_rate != 0.0:
-      raise NotImplementedError(
-          "Dropout is not supported in Pallas/Mosaic TPU VJP."
-      )
-
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
 
@@ -121,6 +144,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     splash_config = dataclasses.replace(
         splash_attention_kernel.SplashConfig.get_default(),
         attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
         block_q=config.block_q_dkv,
         block_kv=config.block_kv_dkv,
         block_kv_compute=config.block_kv_dkv_compute,
@@ -159,7 +183,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         out,
         lse,
         attn_fn.dkv_mask_info,
-        None,
+        prng_key,
     )
 
     splash_fn_kwargs = attn_fn.kwargs
@@ -186,13 +210,45 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
+    q = ba.arguments["q"]
+    k = ba.arguments["k"]
+    is_mqa = ba.arguments.get("is_mqa", False)
+    dropout_rate = ba.arguments.get("dropout_rate", 0.0)
+    q_seq_len = q.shape[1]
+
+    kv_seq_len = k.shape[1]
+    if is_mqa and k.ndim == 2:
+      kv_seq_len = k.shape[0]
+
+    # Use larger block sizes for longer sequences if possible
+    block_q_dkv = 128
+    if q_seq_len >= 1024 and q_seq_len % 1024 == 0:
+      block_q_dkv = 1024
+
+    block_kv_dkv = 128
+    block_kv_dkv_compute = 128
+    if kv_seq_len >= 1024 and kv_seq_len % 1024 == 0:
+      block_kv_dkv = 1024
+      block_kv_dkv_compute = 512
+
+    dropout_block_q = block_q_dkv if dropout_rate > 0.0 else None
+    dropout_block_kv = block_kv_dkv_compute if dropout_rate > 0.0 else None
+
+    kv_steps = kv_seq_len // block_kv_dkv
+
+    # Similar heuristic is used in the splash attention kernel
+    dq_reduction_steps = None
+    if kv_steps > 3:
+      dq_reduction_steps = 3
 
     return Config(
-        block_q_dkv=128,
-        block_kv_dkv=128,
-        block_kv_dkv_compute=128,
+        block_q_dkv=block_q_dkv,
+        block_kv_dkv=block_kv_dkv,
+        block_kv_dkv_compute=block_kv_dkv_compute,
+        dropout_block_q=dropout_block_q,
+        dropout_block_kv=dropout_block_kv,
         use_base2_exp=True,
+        dq_reduction_steps=dq_reduction_steps,
     )
 
   @override
@@ -200,15 +256,21 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     q = ba.arguments["q"]
     k = ba.arguments["k"]
     is_mqa = ba.arguments.get("is_mqa", False)
+    dropout_rate = ba.arguments.get("dropout_rate", 0.0)
     q_seq_len = q.shape[1]
     kv_seq_len = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
 
     tiles = [128, 256, 512, 1024, 2048]
+    # TODO: Unify forward and VJP autotuning so that they use the
+    # same dropout block shapes.
+    dropout_tiles = tiles if dropout_rate > 0.0 else [None]
     configs = set()
-    for bq, bkv, bkv_c in itertools.product(
+    for bq, bkv, bkv_c, dbq, dbkv in itertools.product(
         tiles,
         tiles,
         tiles,
+        dropout_tiles,
+        dropout_tiles,
     ):
       if bq > q_seq_len or q_seq_len % bq != 0:
         continue
@@ -216,10 +278,18 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         continue
       if bkv % bkv_c != 0:
         continue
+      if dbq is not None and bq % dbq != 0:
+        continue
+      if dbkv is not None and bkv_c % dbkv != 0:
+        continue
 
       if q_seq_len >= 1024 and bq < 1024:
         continue
       if kv_seq_len >= 1024 and bkv < 1024:
+        continue
+      if q_seq_len >= 1024 and dbq is not None and dbq < 1024:
+        continue
+      if kv_seq_len >= 1024 and dbkv is not None and dbkv < min(1024, bkv_c):
         continue
       # TODO: Make these conditions more configurable
       if bkv_c > 1024:
@@ -228,11 +298,19 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
       if bq >= 4096 or bkv >= 4096:
         continue
 
+      kv_steps = kv_seq_len // bkv
+      dq_reduction_steps = None
+      if kv_steps > 3:
+        dq_reduction_steps = 3
+
       configs.add(
           Config(
               block_q_dkv=bq,
               block_kv_dkv=bkv,
               block_kv_dkv_compute=bkv_c,
+              dropout_block_q=dbq,
+              dropout_block_kv=dbkv,
+              dq_reduction_steps=dq_reduction_steps,
           )
       )
     if not configs:

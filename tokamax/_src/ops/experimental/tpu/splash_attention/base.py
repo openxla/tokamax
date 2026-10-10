@@ -125,12 +125,15 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, Residuals, _Config, Any]):
       mask_value: float = DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
+      prng_key: jax.Array | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Binds and validates arguments for Splash Attention."""
 
     if not (0.0 <= dropout_rate < 1.0):
       raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
+    if dropout_rate > 0.0 and prng_key is None:
+      raise ValueError("prng_key must be provided when dropout_rate > 0.")
 
     if not is_mqa and k.ndim == 3 and q.ndim == 3:
       if q.shape[0] % k.shape[0] != 0:
@@ -152,6 +155,7 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, Residuals, _Config, Any]):
         mask_value=mask_value,
         attn_logits_soft_cap=attn_logits_soft_cap,
         dropout_rate=dropout_rate,
+        prng_key=prng_key,
         return_residuals=return_residuals,
     )
 
@@ -170,6 +174,7 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, Residuals, _Config, Any]):
       mask_value: float = DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
+      prng_key: jax.Array | None = None,
       return_residuals: bool = False,
       config: _Config,
   ) -> tuple[jax.Array, Residuals | None]:
@@ -178,6 +183,13 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, Residuals, _Config, Any]):
     q_seq_len = q.shape[1]
     kv_seq_len = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
     mask_array = mask.as_array(q_seq_len, kv_seq_len)
+
+    dropout_mask = None
+    if dropout_rate > 0.0:
+      assert prng_key is not None
+      dropout_mask = jax.random.bernoulli(
+          prng_key, dropout_rate, (q.shape[0], q_seq_len, kv_seq_len)
+      )
 
     if is_mqa and k.ndim == 3:
       k_in = k[0]
@@ -193,7 +205,7 @@ class SplashAttention[_Config](op.Op[Any, jax.Array, Residuals, _Config, Any]):
         mask=mask_array,
         segment_ids=segment_ids,
         sinks=sinks,
-        dropout_mask=None,
+        dropout_mask=dropout_mask,
         is_mqa=is_mqa,
         mask_value=mask_value,
         save_residuals=return_residuals,
@@ -238,11 +250,14 @@ class SplashAttentionVjp[_Config](
       mask_value: float = DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
+      prng_key: jax.Array | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Binds and validates arguments for Splash Attention VJP."""
     if not (0.0 <= dropout_rate < 1.0):
       raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
+    if dropout_rate > 0.0 and prng_key is None:
+      raise ValueError("prng_key must be provided when dropout_rate > 0.")
 
     if not is_mqa and k.ndim == 3 and q.ndim == 3:
       if q.shape[0] % k.shape[0] != 0:
@@ -267,6 +282,7 @@ class SplashAttentionVjp[_Config](
         mask_value=mask_value,
         attn_logits_soft_cap=attn_logits_soft_cap,
         dropout_rate=dropout_rate,
+        prng_key=prng_key,
         return_residuals=return_residuals,
     )
 
@@ -288,6 +304,7 @@ class SplashAttentionVjp[_Config](
       mask_value: float = DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
+      prng_key: jax.Array | None = None,
       return_residuals: bool = False,
       config: _Config,
   ) -> tuple[SplashAttentionGrads, None]:
@@ -302,6 +319,13 @@ class SplashAttentionVjp[_Config](
     seq_len_q = q.shape[1]
     seq_len_kv = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
     mask_array = mask.as_array(seq_len_q, seq_len_kv)
+
+    dropout_mask = None
+    if dropout_rate > 0.0:
+      assert prng_key is not None
+      dropout_mask = jax.random.bernoulli(
+          prng_key, dropout_rate, (q.shape[0], seq_len_q, seq_len_kv)
+      )
 
     if is_mqa and k.ndim == 3:
       k_in = k[0]
@@ -320,6 +344,7 @@ class SplashAttentionVjp[_Config](
         sinks=sinks,
         o=out,
         logsumexp=lse,
+        dropout_mask=dropout_mask,
         is_mqa=is_mqa,
         attn_logits_soft_cap=attn_logits_soft_cap,
         dropout_rate=dropout_rate,

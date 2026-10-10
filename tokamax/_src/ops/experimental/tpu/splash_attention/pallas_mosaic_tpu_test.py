@@ -291,6 +291,114 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
             vjp_config=config,
         )
 
+  def test_dropout(self):
+    seq_len = 256
+    head_dim = seq_len
+    num_heads = 4
+    dropout_rate = 0.25
+    dtype = jnp.float32
+
+    q = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), dtype)
+    k = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), dtype)
+    q, k = numerics.random_initialize((q, k))
+    q = q * (head_dim**-0.5)
+
+    eye = jnp.broadcast_to(
+        jnp.eye(seq_len, dtype=dtype), (num_heads, seq_len, head_dim)
+    )
+    v = eye
+    do = eye
+    mask = base.FULL_MASK
+    prng_key = jax.random.key(42)
+
+    config = pallas_mosaic_tpu.Config(
+        block_q=128,
+        block_kv=256,
+        block_kv_compute=128,
+        dropout_block_q=128,
+        dropout_block_kv=128,
+        q_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        k_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        v_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        use_experimental_scheduler=True,
+    )
+    vjp_config = sp_vjp.Config(
+        block_q_dkv=256,
+        block_kv_dkv=256,
+        block_kv_dkv_compute=256,
+        dropout_block_q=128,
+        dropout_block_kv=128,
+        use_base2_exp=True,
+    )
+    vjp = sp_vjp.PallasMosaicTpuSplashAttentionVjp(config=vjp_config)
+    attention_impl = PallasTpuSplash(config=config, vjp=vjp)
+    reference_impl = ReferenceSplash()
+
+    def make_step(impl):
+      @jax.jit
+      def step(query, key, value, dout, rng):
+        primals, f_vjp = jax.vjp(
+            functools.partial(
+                impl,
+                mask=mask,
+                dropout_rate=dropout_rate,
+                prng_key=rng,
+            ),
+            query,
+            key,
+            value,
+        )
+        return primals, f_vjp(dout)
+
+      return step
+
+    f_pallas = make_step(attention_impl)
+    f_base = make_step(reference_impl)
+
+    out_pallas, (dq_pallas, dk_pallas, dv_pallas) = f_pallas(
+        q, k, v, do, prng_key
+    )
+    out_pallas2, (dq_pallas2, dk_pallas2, dv_pallas2) = f_pallas(
+        q, k, v, do, prng_key
+    )
+    out_diff_key, _ = f_pallas(q, k, v, do, jax.random.key(99))
+    out_base, (_, _, dv_base) = f_base(q, k, v, do, prng_key)
+
+    chex.assert_trees_all_equal(
+        (out_pallas, dq_pallas, dk_pallas, dv_pallas),
+        (out_pallas2, dq_pallas2, dk_pallas2, dv_pallas2),
+    )
+    self.assertGreater(float(jnp.abs(out_pallas - out_diff_key).max()), 1e-2)
+
+    dropped_pallas = out_pallas == 0.0
+    dropped_base = out_base == 0.0
+    self.assertAlmostEqual(
+        float(jnp.mean(dropped_pallas)), dropout_rate, delta=1e-2
+    )
+    self.assertAlmostEqual(
+        float(jnp.mean(dropped_base)), dropout_rate, delta=1e-2
+    )
+
+    chex.assert_trees_all_equal(
+        dv_pallas == 0.0, jnp.swapaxes(dropped_pallas, -1, -2)
+    )
+    chex.assert_trees_all_equal(
+        dv_base == 0.0, jnp.swapaxes(dropped_base, -1, -2)
+    )
+
+    both_kept = (~dropped_pallas) & (~dropped_base)
+    both_kept_t = jnp.swapaxes(both_kept, -1, -2)
+    chex.assert_trees_all_close(
+        jnp.where(both_kept, out_pallas, 0.0),
+        jnp.where(both_kept, out_base, 0.0),
+        atol=1e-3,
+    )
+    chex.assert_trees_all_close(
+        jnp.where(both_kept_t, dv_pallas, 0.0),
+        jnp.where(both_kept_t, dv_base, 0.0),
+        atol=1e-3,
+    )
+
 
 if __name__ == '__main__':
   absltest.main()
