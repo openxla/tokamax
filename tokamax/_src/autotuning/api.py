@@ -52,6 +52,8 @@ from tokamax._src.ops.experimental.tpu.proj_and_save_state import api as proj_an
 from tokamax._src.ops.experimental.tpu.proj_and_save_state import base as proj_and_save_state_base
 from tokamax._src.ops.experimental.tpu.rope import api as rope_api
 from tokamax._src.ops.experimental.tpu.rope import base as rope_base
+from tokamax._src.ops.experimental.tpu.router_topk import api as router_topk_api
+from tokamax._src.ops.experimental.tpu.router_topk import base as router_topk_base
 from tokamax._src.ops.experimental.tpu.splash_attention import api as splash_attention_api
 from tokamax._src.ops.experimental.tpu.splash_attention import base as splash_attention_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
@@ -303,6 +305,7 @@ _API_IMPLEMENTATIONS: Final[
     mhc_base.MhcPre: mhc_api.PRE_IMPLEMENTATIONS,
     mhc_base.MhcPost: mhc_api.POST_IMPLEMENTATIONS,
     mhc_base.MhcFusedPostPre: mhc_api.FUSED_POST_PRE_IMPLEMENTATIONS,
+    router_topk_base.RouterTopK: router_topk_api.IMPLEMENTATIONS,
 })
 
 
