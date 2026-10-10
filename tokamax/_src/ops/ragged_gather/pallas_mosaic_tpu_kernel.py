@@ -12,208 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""optimized TPU Pallas/Mosaic kernel for Ragged Gather."""
+"""Optimized TPU Pallas/Mosaic kernel V2 for Ragged Gather."""
 
 import functools
 import jax
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 import jax.numpy as jnp
 
 
-def main_kernel(
-    # Inputs.
-    start_ref: jax.Ref,
-    end_ref: jax.Ref,
-    in_hbm_ref: jax.Ref,
-    indices_hbm_ref: jax.Ref,
-    # Outputs.
-    out_hbm_ref: jax.Ref,
-    # Scratch.
-    start_vmem_ref: jax.Ref,
-    end_vmem_ref: jax.Ref,
-    out_vmem_ref: jax.Ref,
-    indices_vmem_ref: jax.Ref,
-    sem_ref: jax.Ref,
-    *,
-    core_axis_name: str,
-    subcore_axis_name: str,
-):
+def calculate_col_size(hidden_size: int, packing: int) -> int:
+  """Calculates the max column size bounded by VMEM limits and hidden_size divisibility."""
   tpu_info = pltpu.get_tpu_info()
   sc_info = tpu_info.sparse_core
-  assert sc_info is not None
-  num_simd_lanes = sc_info.num_lanes
-  num_lanes = tpu_info.num_lanes
-  hidden_size = in_hbm_ref.shape[-1]
-  col_size = out_vmem_ref.shape[-1]
-
-  num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
-  block_size = num_simd_lanes * num_cores
-
-  recv_sem = sem_ref.at[0]
-  send_sem = sem_ref.at[1]
-
-  # Read start and end tensor values.
-  dma_list = []
-  dma = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], recv_sem)
-  dma_list.append(dma)
-  dma = pltpu.make_async_copy(end_ref, end_vmem_ref.at[:1], recv_sem)
-  dma_list.append(dma)
-
-  jax.tree.map(lambda x: x.start(), dma_list)
-  jax.tree.map(lambda x: x.wait(), dma_list)
-
-  # Calculate number of tiles to visit using start and end arrays.
-  start = start_vmem_ref[...][0]
-  end = end_vmem_ref[...][0]
-
-  block_start = start // block_size
-  block_end = pl.cdiv(end, block_size)
-  num_blocks = block_end - block_start
-  num_blocks = jnp.where(end == start, 0, num_blocks)
-  aligned_start = block_start * block_size
-
-  num_cols = pl.cdiv(hidden_size, col_size)
-
-  @functools.partial(
-      pltpu.emit_pipeline,
-      grid=(num_blocks, num_cores, num_cols),
-      core_axis_name=(core_axis_name, subcore_axis_name),
-      dimension_semantics=(pltpu.ARBITRARY, pltpu.PARALLEL, pltpu.ARBITRARY),
-  )
-  def inner_kernel():
-    block_id = pl.program_id(0)
-    core_id = pl.program_id(1)
-    col_id = pl.program_id(2)
-
-    row_tile_start = (
-        aligned_start + block_id * block_size + core_id * num_simd_lanes
-    )
-    col_tile_start = col_id * col_size
-
-    @pl.when(col_id == 0)
-    def _():
-      pltpu.sync_copy(
-          indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
-          indices_vmem_ref,
-      )
-
-    # HBM to VMEM transfer.
-    indices = indices_vmem_ref[...]
-
-    dtype = out_hbm_ref.dtype
-    dtype_bits = jax.dtypes.itemsize_bits(dtype)
-    packing = 32 // dtype_bits
-
-    # To fetch only one sublane at a time, we need to use (packing, 128) layout.
-    # But, the inputs are in (8, 128) layout and thus we need to perform
-    # relayout. For 32-bits, this can be done with a simple reinterpretation,
-    # but for other bitwidths, this is not possible. Therefore, we bitcast data
-    # into 32-bits first to fetch packing number of rows per dma and later
-    # perform bitwise unpacking / packing to obtain desired results.
-    in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
-    out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)  # pyrefly: ignore[missing-attribute]
-
-    for col_vmem_start in range(0, col_size, num_lanes):
-      col_hbm_start = pl.multiple_of(col_tile_start + col_vmem_start, num_lanes)
-      for row_vmem in range(num_simd_lanes):
-        row_hbm = indices[row_vmem] // packing
-        # Since we have changed layout from (8, 128) to (1, 128), continuous
-        # memory addresss does not yield desired values anymore. Therefore,
-        # we break up a dmas into multiple num_lanes sized requests.
-        pltpu.make_async_copy(
-            in_32b_hbm_ref.at[row_hbm, pl.ds(col_hbm_start, num_lanes)],
-            out_vmem_ref.at[row_vmem, pl.ds(col_vmem_start, num_lanes)],
-            recv_sem,
-        ).start()
-
-    # VMEM to HBM transfer.
-    # Use dynamic loop to minimize register spills.
-    @pl.loop(0, col_size, step=num_lanes)
-    @jax.named_scope("dma_write_loop")
-    def dma_write_loop(col_vmem_start):
-      col_hbm_start = col_tile_start + col_vmem_start
-
-      # Wait for data to be received.
-      # NOTE: Because a single semaphore was used for all dma calls, we need
-      # to make sure the order of the wait is the same as order of start.
-      # Otherwise, a dma finish can trigger wrong dma wait to exit.
-      for _ in range(num_simd_lanes):
-        pltpu.make_async_copy(
-            in_32b_hbm_ref.at[0, :num_lanes],
-            out_vmem_ref.at[0, :num_lanes],
-            recv_sem,
-        ).wait()
-
-      # If multiple elements are packed in single 32-bits, extract the desired
-      # elements and reorder them.
-      if packing > 1:
-        for col_compute_offset in range(0, num_lanes, num_simd_lanes):
-          col_slice = pl.ds(col_vmem_start + col_compute_offset, num_simd_lanes)
-
-          out = None
-          for row_src in range(num_simd_lanes):
-            row_src_pack = indices[row_src] % packing
-            row_dst_pack = row_src % packing
-
-            rightshift_bits = row_src_pack * dtype_bits
-            leftshift_bits = row_dst_pack * dtype_bits
-
-            # Load data from vmem.
-            data = out_vmem_ref[row_src, col_slice]
-
-            # Right shift to make first n bits stores target data.
-            data = jnp.bitwise_right_shift(data, rightshift_bits)
-            # Mask out unwanted bits.
-            data = jnp.bitwise_and(data, 2**dtype_bits - 1)
-            # Left shift data into the target bit location.
-            data = jnp.bitwise_left_shift(data, leftshift_bits)
-
-            if row_dst_pack == 0:
-              out = data
-            else:
-              assert out is not None
-              out = jnp.bitwise_or(out, data)
-
-            if row_dst_pack == packing - 1:
-              # Store packed data into correct position.
-              row_dst = row_src // packing
-              # Instead of creating a separate buffer for saving the result,
-              # we reuse existing buffer to minimize vmem requirement.
-              # We can safely overwrite the buffer because the new values are
-              # the packed values of the existing values.
-              out_vmem_ref[row_dst, col_slice] = out
-              out = None
-
-      # Start dma write.
-      for row_vmem in range(num_simd_lanes // packing):
-        row_hbm = row_tile_start // packing + row_vmem
-        pltpu.make_async_copy(
-            out_vmem_ref.at[row_vmem, pl.ds(col_vmem_start, num_lanes)],
-            out_32b_hbm_ref.at[row_hbm, pl.ds(col_hbm_start, num_lanes)],
-            send_sem,
-        ).start()
-
-    # Wait for dma write to finish.
-    for _ in range(0, col_size, num_lanes):
-      for _ in range(num_simd_lanes // packing):
-        pltpu.make_async_copy(
-            out_vmem_ref.at[0, :num_lanes],
-            out_32b_hbm_ref.at[0, :num_lanes],
-            send_sem,
-        ).wait()
-
-  inner_kernel()
-
-
-def calculate_col_size(hidden_size: int) -> int:
-  """Calculate col size for ragged gather kernel."""
-  tpu_info = pltpu.get_tpu_info()
-  sc_info = tpu_info.sparse_core
-  assert sc_info is not None
-  num_lanes = tpu_info.num_lanes
-  num_simd_lanes = sc_info.num_lanes
+  assert sc_info is not None, "SparseCore info is missing."
+  lanes = sc_info.num_lanes
 
   match tpu_info.generation:
     case 6:
@@ -223,22 +38,195 @@ def calculate_col_size(hidden_size: int) -> int:
     case _:
       target_bytes = (128 * 1024) * 0.8
 
-  base_bytes = num_simd_lanes * hidden_size * (32 // 8)
-  num_cols = 1
+  # Calculate max safe column size based on VMEM budget and aligned to 128.
+  num_buffers = 2
+  bytes_per_col = (lanes + lanes // packing) * 4 * num_buffers
+  max_safe_col = int((target_bytes // bytes_per_col) // 128) * 128
 
-  while pl.cdiv(base_bytes, num_cols * num_lanes) * num_lanes > target_bytes:
-    num_cols += 1
-  return pl.cdiv(hidden_size, (num_cols * num_lanes)) * num_lanes
+  # Search for the largest divisor of hidden_size bounded by max_safe_col.
+  # The first divisor found is the maximum.
+  start_col = (min(hidden_size, max_safe_col) // 128) * 128
+  for c in range(start_col, 127, -128):
+    if hidden_size % c == 0:
+      return c
+  return max_safe_col
 
 
-@jax.jit
+def main_kernel_v2(
+    start_ref: jax.Ref,
+    end_ref: jax.Ref,
+    in_hbm_ref: jax.Ref,
+    indices_hbm_ref: jax.Ref,
+    out_hbm_ref: jax.Ref,
+    start_vmem_ref: jax.Ref,
+    end_vmem_ref: jax.Ref,
+    sem_ref: jax.Ref,
+    *,
+    core_axis_name: str,
+    subcore_axis_name: str,
+    num_row_subchunks: int,
+    col_size: int,
+):
+  tpu_info = pltpu.get_tpu_info()
+  sc_info = tpu_info.sparse_core
+  assert sc_info is not None
+  num_simd_lanes = sc_info.num_lanes
+  hidden_size = in_hbm_ref.shape[-1]
+
+  assert isinstance(
+      hidden_size, int
+  ), f"hidden_size must be int, got {type(hidden_size)}"
+  num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
+  row_subchunk_size = num_simd_lanes
+  row_chunk_size = row_subchunk_size * num_row_subchunks
+  block_size = row_chunk_size * num_cores
+
+  recv_sem = sem_ref.at[0]
+
+  copy_start = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], recv_sem)
+  copy_end = pltpu.make_async_copy(end_ref, end_vmem_ref.at[:1], recv_sem)
+  copy_start.start()
+  copy_end.start()
+  copy_start.wait()
+  copy_end.wait()
+
+  start = start_vmem_ref[...][0]
+  end = end_vmem_ref[...][0]
+
+  block_start = start // block_size
+  block_end = pl.cdiv(end, block_size)
+  num_blocks = block_end - block_start
+  num_blocks = jnp.where(end <= start, 0, num_blocks)
+
+  num_cols = pl.cdiv(hidden_size, col_size)
+
+  dtype = out_hbm_ref.dtype
+  dtype_bits = jax.dtypes.itemsize_bits(dtype)
+  packing = 32 // dtype_bits
+
+  core_index = lax.axis_index((core_axis_name, subcore_axis_name))
+
+  # SparseCore `.bitcast()` leverages hardware Row-Packing for 16-bit -> 32-bit
+  # conversion. The logical row count halves, while physical column dimensions
+  # remain unchanged.
+  in_hbm_i32 = in_hbm_ref.bitcast(jnp.int32)  # pyrefly: ignore[missing-attribute]
+  out_hbm_i32 = out_hbm_ref.bitcast(jnp.int32)  # pyrefly: ignore[missing-attribute]
+
+  num_phys_cols = col_size
+
+  # The outer pipeline runs on the Vector Core, hoisting the integer arithmetic
+  # required to decode the row-packed indices. This prevents scalar-core
+  # instruction starvation during the execution of the indirect `in_specs`
+  # block lambdas.
+
+  def col_loop(col_base, gather_ref, out_ref, idx_rem, unpack_col_chunk):
+    col_slice = pl.ds(col_base, unpack_col_chunk)
+    if packing == 1:
+      gather_dt = gather_ref.bitcast(dtype)
+      out_dt = out_ref.bitcast(dtype)
+      out_dt[:, col_slice] = gather_dt[:, col_slice]
+    else:
+      # Manual bitwise extraction and packing for packing >= 2
+      # (bfloat16, int8, int4)
+      # bf16: 0xFFFF, int8: 0xFF, int4: 0xF
+      mask = (1 << dtype_bits) - 1
+      shift_multiplier = dtype_bits.bit_length() - 1
+      for i in range(num_simd_lanes // packing):
+        packed_row = jnp.zeros((1, unpack_col_chunk), dtype=jnp.int32)
+        for j in range(packing):
+          k = i * packing + j
+          dynamic_shift = jnp.left_shift(idx_rem[k], shift_multiplier)
+          val = jnp.bitwise_right_shift(
+              gather_ref[pl.ds(k, 1), col_slice], dynamic_shift
+          )
+          val = jnp.bitwise_and(val, mask)
+          pack_shift = j * dtype_bits
+          packed_row = jnp.bitwise_or(
+              packed_row, jnp.left_shift(val, pack_shift)
+          )
+        out_ref[pl.ds(i, 1), col_slice] = packed_row
+
+  def inner_pipeline(gather_ref, out_ref, idx_ref, unpack_col_chunk):
+    row_slice = pl.ds(pl.program_id(0) * row_subchunk_size, row_subchunk_size)
+    subchunk_idxs = idx_ref[row_slice]
+    if packing > 1:
+      # Equivalent to `subchunk_idxs % packing`
+      idx_rem = jnp.bitwise_and(subchunk_idxs, packing - 1)
+    else:
+      idx_rem = jnp.zeros_like(subchunk_idxs)
+
+    col_loop_fn = functools.partial(
+        col_loop,
+        gather_ref=gather_ref,
+        out_ref=out_ref,
+        idx_rem=idx_rem,
+        unpack_col_chunk=unpack_col_chunk,
+    )
+    plsc.parallel_loop(0, num_phys_cols, step=unpack_col_chunk)(col_loop_fn)
+
+  def outer_pipeline(idx_ref):
+    b = pl.program_id(0)
+    b_global = b + block_start
+
+    unpack_col_chunk = 128
+    assert num_phys_cols % unpack_col_chunk == 0
+    shift_amount = packing.bit_length() - 1
+    pltpu.emit_pipeline(
+        functools.partial(
+            inner_pipeline, idx_ref=idx_ref, unpack_col_chunk=unpack_col_chunk
+        ),
+        grid=(num_row_subchunks, num_cols),
+        in_specs=pl.BlockSpec(
+            (pl.Indirect(row_subchunk_size), num_phys_cols),
+            lambda r, col_id: (
+                jnp.bitwise_right_shift(
+                    idx_ref[pl.ds(r * row_subchunk_size, row_subchunk_size)],
+                    shift_amount,
+                ),
+                col_id,
+            ),
+        ),
+        out_specs=pl.BlockSpec(
+            (row_subchunk_size // packing, num_phys_cols),
+            lambda r, col_id: (
+                (b_global * num_cores + core_index) * num_row_subchunks + r,
+                col_id,
+            ),
+        ),
+    )(in_hbm_i32, out_hbm_i32)
+
+  pltpu.emit_pipeline(
+      outer_pipeline,
+      grid=(num_blocks,),
+      in_specs=pl.BlockSpec(
+          (row_chunk_size,),
+          lambda b: ((b + block_start) * num_cores + core_index,),
+      ),
+  )(indices_hbm_ref)
+
+
+@functools.partial(jax.jit, static_argnames=("max_row_subchunks", "trim_rows"))
 def ragged_gather_pallas(
     x: jax.Array,
     indices: jax.Array,
     start: jax.Array,
     end: jax.Array,
+    *,
+    max_row_subchunks: int = 4,
+    trim_rows: bool = True,
 ) -> jax.Array:
-  """Perform gather on indices within dynamic array start and end."""
+  """Perform gather on indices within dynamic array start and end using BlockSpec.
+
+  Rows outside [start, end) are not meaningful. The kernel writes whole
+  blocks of num_lanes * num_cores * num_row_subchunks rows, so the output is
+  padded up to a multiple of the block size.
+
+  max_row_subchunks caps num_row_subchunks. Smaller blocks move fewer rows
+  when [start, end) is a small part of `indices`.
+
+  trim_rows=True copies the output down to indices.size rows;
+  trim_rows=False skips that copy and returns the padded output.
+  """
 
   assert x.ndim == 2, "Ragged gather only supports 2d inputs."
   assert indices.ndim == 1, "Ragged gather only supports 1d indices."
@@ -249,25 +237,45 @@ def ragged_gather_pallas(
     end = end[None]
 
   dtype = x.dtype
+  dtype_bits = jax.dtypes.itemsize_bits(dtype)
+  if dtype_bits not in (4, 8, 16, 32):
+    raise ValueError(
+        f"dtype bit width must be one of 4, 8, 16, or 32, but got {dtype_bits}"
+        f" ({dtype})"
+    )
 
   sc_info = pltpu.get_tpu_info().sparse_core
   if sc_info is None:
-    # Sparse core is not available. Fallback to regular gather.
     return x[indices]
 
   hidden_size = x.shape[-1]
   out_size = indices.size
 
+  packing = 32 // dtype_bits
+  col_size = calculate_col_size(hidden_size, packing)
+
+  aligned_hidden_size = ((hidden_size + col_size - 1) // col_size) * col_size
+
   num_simd_lanes = sc_info.num_lanes
   num_cores = sc_info.num_cores * sc_info.num_subcores
-  block_size = num_simd_lanes * num_cores
-  col_size = calculate_col_size(hidden_size)
+  base_block_size = num_simd_lanes * num_cores
 
-  # Pad to align to the block size.
-  out_pad_size = pl.cdiv(out_size, block_size) * block_size - out_size
+  # Calculate ideal num_row_subchunks to avoid too much padding overhead.
+  num_row_subchunks = max(
+      1,
+      min(
+          max_row_subchunks, (out_size + base_block_size - 1) // base_block_size
+      ),
+  )
+
+  row_subchunk_size = num_simd_lanes
+  row_chunk_size = row_subchunk_size * num_row_subchunks
+  block_size = row_chunk_size * num_cores
+
+  out_pad_size = (
+      (out_size + block_size - 1) // block_size
+  ) * block_size - out_size
   indices = jnp.pad(indices, ((0, out_pad_size)))
-
-  aligned_hidden_size = pl.cdiv(hidden_size, col_size) * col_size
 
   vector_mesh = plsc.VectorSubcoreMesh(
       num_cores=sc_info.num_cores,
@@ -275,26 +283,28 @@ def ragged_gather_pallas(
       core_axis_name="core",
       subcore_axis_name="subcore",
   )
-  return pl.kernel(
+  out = pl.kernel(
       functools.partial(
-          main_kernel,
+          main_kernel_v2,
           core_axis_name=vector_mesh.core_axis_name,
           subcore_axis_name=vector_mesh.subcore_axis_name,
+          num_row_subchunks=num_row_subchunks,
+          col_size=col_size,
       ),
       out_type=jax.ShapeDtypeStruct(
           (out_size + out_pad_size, aligned_hidden_size), dtype
       ),
       compiler_params=pltpu.CompilerParams(
           use_tc_tiling_on_sc=True,
+          needs_layout_passes=True,
           disable_bounds_checks=True,
       ),
-      scratch_types=dict(
-          start_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
-          end_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
-          out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
-          indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
-          sem_ref=pltpu.SemaphoreType.DMA((2,)),
-      ),
+      scratch_types=[
+          pltpu.VMEM((16,), jnp.int32),
+          pltpu.VMEM((16,), jnp.int32),
+          pltpu.SemaphoreType.DMA((1,)),
+      ],
       mesh=vector_mesh,
-      name="sc_ragged_gather",
-  )(start, end, x, indices)[:out_size, :hidden_size]
+      name="sc_ragged_gather_v2",
+  )(start, end, x, indices)
+  return out[:out_size, :hidden_size] if trim_rows else out[:, :hidden_size]

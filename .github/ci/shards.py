@@ -470,7 +470,6 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/ragged_gather/api_test.py',
             'tokamax/_src/ops/ragged_gather/base_test.py',
             'tokamax/_src/ops/ragged_gather/pallas_mosaic_tpu_test.py',
-            'tokamax/_src/ops/ragged_gather/pallas_mosaic_v2_tpu_test.py',
         ),
         minutes=20,
     ),

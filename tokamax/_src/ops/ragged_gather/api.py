@@ -21,7 +21,7 @@ import immutabledict
 import jax
 from tokamax._src.ops.ragged_gather import base
 
-type Implementation = Literal["xla", "mosaic", "mosaic_tpu", "mosaic_tpu_v2"]
+type Implementation = Literal["xla", "mosaic"]
 
 _IMPLEMENTATIONS = dict(xla=base.RaggedGather())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
@@ -29,17 +29,8 @@ _DEFAULT_IMPLEMENTATIONS = ("xla",)
 try:
   from tokamax._src.ops.ragged_gather import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  _IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasTpuRaggedGather()
-  _DEFAULT_IMPLEMENTATIONS = ("mosaic_tpu",) + _DEFAULT_IMPLEMENTATIONS
-except ImportError:
-  pass
-
-try:
-  from tokamax._src.ops.ragged_gather import pallas_mosaic_v2_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
-
-  _IMPLEMENTATIONS["mosaic_tpu_v2"] = pallas_mosaic_v2_tpu.PallasV2TpuRaggedGather()
-  if "mosaic_tpu_v2" not in _DEFAULT_IMPLEMENTATIONS:
-    _DEFAULT_IMPLEMENTATIONS = ("mosaic_tpu_v2",) + _DEFAULT_IMPLEMENTATIONS
+  _IMPLEMENTATIONS["mosaic"] = pallas_mosaic_tpu.PallasTpuRaggedGather()
+  _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
 
@@ -83,12 +74,6 @@ def ragged_gather(
   errors = []
   for impl in implementation:
     if isinstance(impl, str):
-      if impl == "mosaic":
-        impl = (
-            "mosaic_tpu_v2"
-            if "mosaic_tpu_v2" in IMPLEMENTATIONS
-            else "mosaic_tpu"
-        )
       if impl not in IMPLEMENTATIONS:
         raise ValueError(
             f"Unknown implementation: {impl}. You may need to add a dependency"
