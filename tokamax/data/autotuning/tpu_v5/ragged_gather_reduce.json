@@ -1,0 +1,62 @@
+{
+  "{\"x\":\"bf16[8192,4096]\",\"indices\":\"i32[8192]\",\"topk_weights\":\"bf16[8192]\",\"valid_rows_mask\":\"bool[8192]\",\"reduce_group_size\":8,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 2898.444405000191,
+      "lower_time_ms": 14.937644999008626,
+      "evaluation_times_ms": [
+        0.231,
+        0.233,
+        0.212,
+        0.192,
+        0.215
+      ],
+      "metadata": {},
+      "peak_memory_mb": 143.351808
+    }
+  },
+  "{\"x\":\"bf16[8192,4096]\",\"indices\":\"i32[8192]\",\"topk_weights\":\"bf16[8192]\",\"valid_rows_mask\":\"bool[8192]\",\"reduce_group_size\":8,\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 2886.908311978914,
+      "lower_time_ms": 15.077915042638779,
+      "evaluation_times_ms": [
+        0.212,
+        0.214,
+        0.212,
+        0.223,
+        0.221
+      ],
+      "metadata": {},
+      "peak_memory_mb": 143.351808
+    }
+  },
+  "{\"x\":\"bf16[1024,512]\",\"indices\":\"i32[1024]\",\"topk_weights\":\"bf16[1024]\",\"valid_rows_mask\":\"bool[1024]\",\"reduce_group_size\":4,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 284.32415499992203,
+      "lower_time_ms": 14.92248400245444,
+      "evaluation_times_ms": [
+        0.013,
+        0.013,
+        0.013,
+        0.012,
+        0.013
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4.463616
+    }
+  },
+  "{\"x\":\"bf16[1024,512]\",\"indices\":\"i32[1024]\",\"topk_weights\":\"bf16[1024]\",\"valid_rows_mask\":\"bool[1024]\",\"reduce_group_size\":4,\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 281.44459798932076,
+      "lower_time_ms": 15.18234598916024,
+      "evaluation_times_ms": [
+        0.013,
+        0.013,
+        0.013,
+        0.013,
+        0.013
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4.463616
+    }
+  }
+}

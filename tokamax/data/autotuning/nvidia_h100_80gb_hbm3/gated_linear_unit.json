@@ -3639,5 +3639,102 @@
       "metadata": {},
       "peak_memory_mb": 279.969792
     }
-  }
+  },
+  "{\"x\":\"f32[3840,3840,128]\",\"weights\":\"f32[128,2,256]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {},
+  "{\"x\":\"bf16[3840,3840,64]\",\"weights\":\"bf16[64,2,128]\",\"activation\":\"jax._src.nn.functions.sigmoid\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 518.9000880000094,
+      "lower_time_ms": 11.065216999995187,
+      "evaluation_times_ms": [
+        6.950545999999999,
+        6.959574999999999,
+        6.9557649999999995,
+        6.9598949999999995,
+        6.953781
+      ],
+      "metadata": {},
+      "peak_memory_mb": 13212.090368
+    }
+  },
+  "{\"x\":\"bf16[3840,3840,64]\",\"weights\":\"bf16[64,2,128]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 114.23855300000696,
+      "lower_time_ms": 12.201446999995369,
+      "evaluation_times_ms": [
+        6.961078,
+        6.953523,
+        6.962967000000001,
+        6.961752,
+        6.962359
+      ],
+      "metadata": {},
+      "peak_memory_mb": 13212.090368
+    }
+  },
+  "{\"x\":\"bf16[4096,4096,64]\",\"weights\":\"bf16[64,2,128]\",\"activation\":\"jax._src.nn.functions.sigmoid\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 632.018786855042,
+      "lower_time_ms": 13.85584007948637,
+      "evaluation_times_ms": [
+        7.923253,
+        7.917333,
+        7.910453,
+        7.918069000000001,
+        7.919637
+      ],
+      "metadata": {},
+      "peak_memory_mb": 15032.418304
+    }
+  },
+  "{\"x\":\"bf16[4096,4096,64]\",\"weights\":\"bf16[64,2,128]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 108.69740694761276,
+      "lower_time_ms": 14.837075024843216,
+      "evaluation_times_ms": [
+        7.913461,
+        7.912341,
+        7.914292999999999,
+        7.917045,
+        7.921845
+      ],
+      "metadata": {},
+      "peak_memory_mb": 15032.418304
+    }
+  },
+  "{\"x\":\"bf16[1,4352,4352,128]\",\"weights\":\"bf16[128,2,256]\",\"activation\":\"jax._src.nn.functions.sigmoid\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1080.7464379999915,
+      "lower_time_ms": 17.76752400000703,
+      "evaluation_times_ms": [
+        18.727627,
+        18.745157,
+        18.880498,
+        18.847773,
+        18.872021
+      ],
+      "metadata": {},
+      "peak_memory_mb": 33940.43904
+    }
+  },
+  "{\"x\":\"bf16[1,4352,4352,128]\",\"weights\":\"bf16[128,2,512]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {},
+  "{\"x\":\"bf16[4352,4352,128]\",\"weights\":\"bf16[128,2,256]\",\"activation\":\"jax._src.nn.functions.sigmoid\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 182.32039500000496,
+      "lower_time_ms": 10.998986999993576,
+      "evaluation_times_ms": [
+        18.694121000000003,
+        18.794466,
+        18.739223000000003,
+        18.799615,
+        18.739128
+      ],
+      "metadata": {},
+      "peak_memory_mb": 33940.43904
+    }
+  },
+  "{\"x\":\"bf16[4352,4352,128]\",\"weights\":\"bf16[128,2,512]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {},
+  "{\"x\":\"f32[4352,4352,128]\",\"weights\":\"f32[128,2,256]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {},
+  "{\"x\":\"bf16[4352,4352,64]\",\"weights\":\"bf16[64,2,128]\",\"activation\":\"jax._src.nn.functions.sigmoid\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {},
+  "{\"x\":\"bf16[4352,4352,64]\",\"weights\":\"bf16[64,2,128]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {},
+  "{\"x\":\"f32[5120,5120,128]\",\"weights\":\"f32[128,2,256]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {}
 }

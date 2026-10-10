@@ -1,0 +1,47 @@
+{
+  "{\"residuals\":[\"f32[64,8192]\",\"f32[64,8192]\"],\"out\":\"bf16[64,8192,128]\",\"dout\":\"bf16[64,8192,128]\",\"q\":\"bf16[64,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 292.41453500071657,
+      "lower_time_ms": 28.380313000525348,
+      "evaluation_times_ms": [
+        57.429,
+        57.434,
+        57.437,
+        57.45,
+        57.432
+      ],
+      "metadata": {},
+      "peak_memory_mb": 35238.445088
+    }
+  },
+  "{\"residuals\":[\"f32[128,8192]\",\"f32[128,8192]\"],\"out\":\"bf16[128,8192,128]\",\"dout\":\"bf16[128,8192,128]\",\"q\":\"bf16[128,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 310.3845319710672,
+      "lower_time_ms": 28.312134963925928,
+      "evaluation_times_ms": [
+        114.292,
+        114.267,
+        114.232,
+        114.246,
+        114.29
+      ],
+      "metadata": {},
+      "peak_memory_mb": 70409.78128
+    }
+  },
+  "{\"residuals\":[\"f32[128,4096]\",\"f32[128,4096]\"],\"out\":\"bf16[128,4096,128]\",\"dout\":\"bf16[128,4096,128]\",\"q\":\"bf16[128,4096,192]\",\"k\":\"bf16[128,4096,192]\",\"v\":\"bf16[128,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 628.4995290006918,
+      "lower_time_ms": 26.906420000159414,
+      "evaluation_times_ms": [
+        28.408,
+        28.415,
+        28.401,
+        28.378,
+        28.394
+      ],
+      "metadata": {},
+      "peak_memory_mb": 18528.337952
+    }
+  }
+}

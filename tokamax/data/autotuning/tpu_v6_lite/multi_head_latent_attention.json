@@ -1,0 +1,47 @@
+{
+  "{\"ql_nope\":\"bf16[3,128,512]\",\"q_pe\":\"bf16[3,128,64]\",\"new_kv_c\":\"bf16[3,512]\",\"new_k_pe\":\"bf16[3,64]\",\"cache_kv\":\"bf16[128,128,2,640]\",\"kv_lens\":\"i32[3]\",\"page_indices\":\"i32[96]\",\"cu_q_lens\":\"i32[4]\",\"distribution\":\"i32[3]\",\"sm_scale\":1.0,\"sliding_window\":null,\"soft_cap\":null,\"mask_value\":null,\"q_scale\":null,\"k_scale\":null,\"v_scale\":null,\"s_dtype\":\"jax.numpy.bfloat16\",\"debug_mode\":false,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 857.8969159862027,
+      "lower_time_ms": 53.78034198656678,
+      "evaluation_times_ms": [
+        0.18,
+        0.18,
+        0.18,
+        0.18,
+        0.18
+      ],
+      "metadata": {},
+      "peak_memory_mb": 168.647712
+    }
+  },
+  "{\"ql_nope\":\"bf16[4096,128,512]\",\"q_pe\":\"bf16[4096,128,64]\",\"new_kv_c\":\"bf16[4096,512]\",\"new_k_pe\":\"bf16[4096,64]\",\"cache_kv\":\"bf16[128,128,2,640]\",\"kv_lens\":\"i32[2]\",\"page_indices\":\"i32[16]\",\"cu_q_lens\":\"i32[3]\",\"distribution\":\"i32[3]\",\"sm_scale\":1.0,\"sliding_window\":null,\"soft_cap\":null,\"mask_value\":null,\"q_scale\":null,\"k_scale\":null,\"v_scale\":null,\"s_dtype\":\"jax.numpy.bfloat16\",\"debug_mode\":false,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1744.2831640000804,
+      "lower_time_ms": 50.326471000516904,
+      "evaluation_times_ms": [
+        41.89,
+        42.012,
+        42.169,
+        42.035,
+        41.922
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4056.965152
+    }
+  },
+  "{\"ql_nope\":\"f8_e4m3fn[128,128,512]\",\"q_pe\":\"f8_e4m3fn[128,128,64]\",\"new_kv_c\":\"f8_e4m3fn[128,512]\",\"new_k_pe\":\"f8_e4m3fn[128,64]\",\"cache_kv\":\"f8_e4m3fn[4096,64,4,640]\",\"kv_lens\":\"i32[128]\",\"page_indices\":\"i32[4096]\",\"cu_q_lens\":\"i32[129]\",\"distribution\":\"i32[3]\",\"sm_scale\":1.0,\"sliding_window\":null,\"soft_cap\":null,\"mask_value\":null,\"q_scale\":null,\"k_scale\":null,\"v_scale\":null,\"s_dtype\":\"jax.numpy.bfloat16\",\"debug_mode\":false,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 16440.321685746312,
+      "lower_time_ms": 545.04887573421,
+      "evaluation_times_ms": [
+        19.684,
+        19.69,
+        19.691,
+        19.688,
+        19.689
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2433.8632
+    }
+  }
+}
