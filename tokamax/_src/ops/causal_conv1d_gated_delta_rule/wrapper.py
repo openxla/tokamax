@@ -462,7 +462,9 @@ def fused_conv1d_gdn(
   packing = 4 // act_in_dtype.itemsize
   padded_batch_size = pl.cdiv(batch_size, packing) * packing
   conv_state_dim_size = conv_state.shape[-1]
-
+  window_size = num_spec_tokens + 1
+  decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+  mixed_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes()
   decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
       batch_size=batch_size,
       num_seqs=num_seqs,
@@ -473,55 +475,29 @@ def fused_conv1d_gdn(
       d_v=d_v,
       kernel_size=kernel_size,
       conv_state_dim_size=conv_state_dim_size,
-      act_in_dtype=act_in_dtype,
       act_out_dtype=act_out_dtype,
-      conv_state_dtype=conv_state.dtype,
       recurrent_state_dtype=recurrent_state.dtype,
       num_lanes=num_lanes,
+      decode_vmem_limit_bytes=decode_vmem_limit_bytes,
+      mixed_vmem_limit_bytes=mixed_vmem_limit_bytes,
+      window_size=window_size,
       decode_tile_size=decode_tile_size,
       mixed_tile_size=mixed_tile_size,
   )
 
   aligned_num_v_heads = tiling.align_to(n_v, num_lanes)
 
-  if num_spec_tokens > 0:
-    # A verify window holds one state checkpoint per window position per
-    # sequence in VMEM, which multiplies the per-sequence footprint by
-    # the window size. Shrink the tile so the double-buffered windows
-    # fit in roughly half the scoped-VMEM budget (the rest goes to
-    # weights, activations scratch and compiler temporaries).
-    window = num_spec_tokens + 1
-    num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-    bytes_per_seq = window * (
-        # Recurrent checkpoints (fp32) — the dominant term.
-        n_v * d_k * d_v * 4
-        # Conv checkpoints (fp32).
-        + (kernel_size - 1) * dim * 4
-        # qkv (fp32), b/a (fp32), out (act_out).
-        + dim * 4
-        + 2 * aligned_num_v_heads * 4
-        + n_v * d_v * 2
-    )
-    vmem_budget = int(
-        config.GDNConfig.WINDOWED_VMEM_FRACTION
-        * pltpu.get_tpu_info().vmem_capacity_bytes
-    )
-    spec_tile_budget = (vmem_budget // 2) // num_buffers
-    decode_tile_size = max(
-        1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
-    )
-
-    if is_kda:
-      # Keep exactly one KDA sequence in each window tile.  The state
-      # pipeline issues one async recurrent-state DMA per sequence but
-      # shares a semaphore and drains the tile with one aggregate wait.
-      # Bounding only the total bytes is insufficient: TP32's four
-      # 3-head sequences have the same 6 MiB footprint as one TP8
-      # 12-head sequence, but the former still has four independent DMA
-      # starts and corrupts recurrent checkpoints in long-running
-      # serving.  A one-sequence tile is the only schedule validated for
-      # repeated rollback and slot reuse on v7, independent of TP size.
-      decode_tile_size = 1
+  if num_spec_tokens > 0 and is_kda:
+    # Keep exactly one KDA sequence in each window tile.  The state
+    # pipeline issues one async recurrent-state DMA per sequence but
+    # shares a semaphore and drains the tile with one aggregate wait.
+    # Bounding only the total bytes is insufficient: TP32's four
+    # 3-head sequences have the same 6 MiB footprint as one TP8
+    # 12-head sequence, but the former still has four independent DMA
+    # starts and corrupts recurrent checkpoints in long-running
+    # serving.  A one-sequence tile is the only schedule validated for
+    # repeated rollback and slot reuse on v7, independent of TP size.
+    decode_tile_size = 1
 
   batch_padding_size = padded_batch_size - batch_size
   num_v_padding_size = aligned_num_v_heads - n_v
@@ -565,9 +541,11 @@ def fused_conv1d_gdn(
       tile_size = mixed_tile_size
       # Prefill / mixed sequences keep a single state checkpoint.
       window_size = 1
+      vmem_limit_bytes = mixed_vmem_limit_bytes
     else:
       tile_size = decode_tile_size
       window_size = num_spec_tokens + 1
+      vmem_limit_bytes = decode_vmem_limit_bytes
 
     cfg = config.GDNConfig(
         mode=mode,
@@ -647,7 +625,7 @@ def fused_conv1d_gdn(
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
-            vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
+            vmem_limit_bytes=vmem_limit_bytes,
         ),
         name=cfg.get_kernel_name(),
         metadata=cfg.get_metadata(),  # pyrefly: ignore[bad-argument-type]

@@ -15,15 +15,12 @@
 
 import dataclasses
 import enum
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-
-
-DEFAULT_VMEM_LIMIT_FACTOR: float = 0.80
 
 
 class AttentionMode(enum.StrEnum):
@@ -57,14 +54,6 @@ class Dtypes:
   compute: jnp.dtype
   recurrent_state: jnp.dtype
   conv_state: jnp.dtype
-
-
-def get_vmem_limit_bytes(
-    vmem_limit_factor: float = DEFAULT_VMEM_LIMIT_FACTOR,
-) -> int:
-  """Returns the maximum allowable VMEM capacity budget in bytes."""
-  tpu_info = pltpu.get_tpu_info()
-  return int(vmem_limit_factor * tpu_info.vmem_capacity_bytes)
 
 
 @jax.tree_util.register_dataclass
@@ -207,17 +196,22 @@ class GDNConfig:
   # state checkpoint per position in VMEM, so for large-head models the
   # default 0.80 budget is not enough; those get a higher limit and the
   # wrapper sizes the tile against the same factor.
-  DEFAULT_VMEM_FRACTION = 0.80
-  WINDOWED_VMEM_FRACTION = 0.9
+  DEFAULT_VMEM_FRACTION: ClassVar[float] = 0.80
+  WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
+  # Cap decode tiles at 16 sequences: larger tiles increase per-slot state DMA
+  # descriptors and register spills without reducing per-slot compute.
+  DECODE_TILE_SIZES: ClassVar[tuple[int, ...]] = (16, 8, 4, 2, 1)
+  MIXED_TILE_SIZES: ClassVar[tuple[int, ...]] = (128, 64, 32, 16, 8, 4, 2, 1)
 
-  def get_vmem_limit_bytes(self) -> int:
-    tpu_info = pltpu.get_tpu_info()
+  @classmethod
+  def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+    """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
     fraction = (
-        self.WINDOWED_VMEM_FRACTION
-        if self.window_size > 1
-        else self.DEFAULT_VMEM_FRACTION
+        cls.WINDOWED_VMEM_FRACTION
+        if window_size > 1
+        else cls.DEFAULT_VMEM_FRACTION
     )
-    return int(fraction * tpu_info.vmem_capacity_bytes)
+    return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
 
   def get_scratch_shape_dict(self) -> dict[str, Any]:
     conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)

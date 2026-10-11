@@ -66,6 +66,7 @@ def make_gdn_spec(
     max_reqs: int | None = None,
     num_decode_seqs: int | None = None,
     distribution: Sequence[int] | None = None,
+    num_spec_tokens: int = 0,
     dtype: jax.typing.DTypeLike = jnp.bfloat16,
     state_dtype: jax.typing.DTypeLike = jnp.bfloat16,
     tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
@@ -78,10 +79,18 @@ def make_gdn_spec(
     raise ValueError(
         f"max_reqs ({max_reqs}) must be >= len(lengths) ({num_seqs})"
     )
+  # Speculative verify windows: every sequence holds up to `window` tokens
+  # and owns `window` consecutive state slots (one checkpoint per position).
+  window = num_spec_tokens + 1
+  if num_spec_tokens > 0 and any(not 1 <= l <= window for l in lengths):
+    raise ValueError(
+        f"spec-decode lengths must be in [1, {window}]; got {lengths}"
+    )
 
   num_tokens = sum(lengths)
   dim_size = 2 * n_kq * d_k + n_v * d_v
-  num_blocks = max_reqs + 1  # Slot 0 is reserved for null/padding block.
+  # Slot 0 is reserved for the null/padding block.
+  num_blocks = 1 + max_reqs * window
 
   # Build cumulative query start locations of shape (max_reqs + 1,).
   q_loc = np.cumsum([0] + list(lengths), dtype=np.int32)
@@ -113,15 +122,18 @@ def make_gdn_spec(
     dist_array = np.array(distribution, dtype=np.int32)
   else:
     if num_decode_seqs is None:
-      num_decode_seqs = 0
-      for l in lengths:
-        if l == 1:
-          num_decode_seqs += 1
-        else:
-          break
+      if num_spec_tokens > 0:
+        num_decode_seqs = num_seqs
+      else:
+        num_decode_seqs = 0
+        for l in lengths:
+          if l == 1:
+            num_decode_seqs += 1
+          else:
+            break
     dist_array = np.array([num_decode_seqs, num_seqs, num_seqs], dtype=np.int32)
 
-  state_indices = np.arange(1, max_reqs + 1, dtype=np.int32)
+  state_indices = np.arange(1, 1 + max_reqs * window, window, dtype=np.int32)
 
   args = {
       "qkv": ShapeDtype((num_tokens, dim_size), dtype),
@@ -143,6 +155,12 @@ def make_gdn_spec(
       "d_v": d_v,
       "kernel_size": kernel_size,
   }
+  if num_spec_tokens > 0:
+    # Last-step acceptance offsets cycle through the window positions.
+    read_offsets = np.zeros((max_reqs,), dtype=np.int32)
+    read_offsets[:num_seqs] = [i % window for i in range(num_seqs)]
+    args["read_offsets"] = _HashableNPArray(read_offsets)
+    args["num_spec_tokens"] = num_spec_tokens
 
   return arg_spec.ArgSpec(
       args=args,
@@ -564,5 +582,132 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         context_lens=1024,
         n_kq=2,
         n_v=16,
+    ),
+    # Speculative decoding verify windows (W = num_spec_tokens + 1).
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="tp8_spec3_decode_4_ctx1024",
+        lengths=[4] * 4,
+        context_lens=1024,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=3,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="tp8_spec3_decode_8_ctx1024",
+        lengths=[4] * 8,
+        context_lens=1024,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=3,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="tp8_spec3_decode_16_ctx1024",
+        lengths=[4] * 16,
+        context_lens=1024,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=3,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="tp8_spec3_decode_32_ctx1024",
+        lengths=[4] * 32,
+        context_lens=1024,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=3,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="tp8_spec3_decode_64_ctx1024",
+        lengths=[4] * 64,
+        context_lens=1024,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=3,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="tp8_spec1_decode_16_ctx1024",
+        lengths=[2] * 16,
+        context_lens=1024,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=1,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="tp8_spec1_decode_64_ctx1024",
+        lengths=[2] * 64,
+        context_lens=1024,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=1,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="tp8_spec7_decode_16_ctx1024",
+        lengths=[8] * 16,
+        context_lens=1024,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=7,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="tp8_spec7_decode_64_ctx1024",
+        lengths=[8] * 64,
+        context_lens=1024,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=7,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="dp4_ep8_spec3_decode_16_ctx1024",
+        lengths=[4] * 16,
+        context_lens=1024,
+        n_kq=8,
+        n_v=32,
+        num_spec_tokens=3,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="dp4_ep8_spec3_decode_32_ctx1024",
+        lengths=[4] * 32,
+        context_lens=1024,
+        n_kq=8,
+        n_v=32,
+        num_spec_tokens=3,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="dp8_ep8_spec3_decode_8_ctx1024",
+        lengths=[4] * 8,
+        context_lens=1024,
+        n_kq=16,
+        n_v=64,
+        num_spec_tokens=3,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="dp8_ep8_spec3_decode_32_ctx1024",
+        lengths=[4] * 32,
+        context_lens=1024,
+        n_kq=16,
+        n_v=64,
+        num_spec_tokens=3,
+    ),
+    _make_gdn_spec(
+        project="qwen3_5_397b",
+        name="dp8_ep8_spec3_decode_64_ctx1024",
+        lengths=[4] * 64,
+        context_lens=1024,
+        n_kq=16,
+        n_v=64,
+        num_spec_tokens=3,
     ),
 )

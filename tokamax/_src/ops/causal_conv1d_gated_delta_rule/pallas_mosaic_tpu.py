@@ -25,7 +25,6 @@ import pydantic
 from tokamax._src.ops import op
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import base
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import config as gdn_config
-from tokamax._src.ops.causal_conv1d_gated_delta_rule import tiling
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import wrapper
 
 GDNConfig = gdn_config.GDNConfig
@@ -130,7 +129,7 @@ class PallasMosaicTpuCausalConv1dGatedDeltaRule(
     return {
         Config(decode_tile_size=decode_size, mixed_tile_size=mixed_size)
         for decode_size, mixed_size in itertools.product(
-            tiling.DECODE_TILE_SIZES, tiling.MIXED_TILE_SIZES
+            GDNConfig.DECODE_TILE_SIZES, GDNConfig.MIXED_TILE_SIZES
         )
         if decode_size <= num_tokens and mixed_size <= num_tokens
     }

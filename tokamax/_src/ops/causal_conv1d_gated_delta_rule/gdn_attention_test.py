@@ -1348,7 +1348,7 @@ class GDNAttentionTest(parameterized.TestCase):
         input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
-            vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
+            vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
         ),
     )(
         dma_meta,
