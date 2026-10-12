@@ -420,7 +420,9 @@ def _sc_topk_direct(
       ),
       out_type=out_type,
       compiler_params=pltpu.CompilerParams(
-          disable_bounds_checks=True, needs_layout_passes=False
+          disable_bounds_checks=True,
+          needs_layout_passes=False,
+          opt_level=jax.experimental.mosaic.OptLevel.O3,
       ),
       scratch_types=scratch_types,
       mesh=mesh,
