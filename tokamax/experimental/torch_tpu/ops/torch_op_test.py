@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops import op as op_lib
 from tokamax.experimental.torch_tpu.ops import torch_op
+from tokamax.experimental.torch_tpu.ops import torch_test_utils
 from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch
 from torch._subclasses import fake_tensor
@@ -420,6 +421,23 @@ class ConvertTorchToJaxViaMetaTest(parameterized.TestCase):
     self.assertIsInstance(meta, jax.ShapeDtypeStruct)
     self.assertEqual(meta.shape, (4, 8))
     self.assertEqual(meta.dtype, jnp.bfloat16)
+
+  @parameterized.named_parameters(
+      ("float32", torch.float32, jnp.float32),
+      ("bfloat16", torch.bfloat16, jnp.bfloat16),
+      ("int32", torch.int32, jnp.int32),
+  )
+  def test_torch_to_jax_and_jax_to_torch_roundtrip(
+      self, torch_dtype: torch.dtype, expected_jax_dtype: Any
+  ):
+    t = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch_dtype, device="cpu")
+    jax_arr = torch_test_utils.torch_to_jax(t)
+    self.assertEqual(jax_arr.shape, (2, 3))
+    self.assertEqual(jax_arr.dtype, expected_jax_dtype)
+    roundtrip = torch_test_utils.jax_to_torch(jax_arr, device="cpu")
+    self.assertEqual(roundtrip.shape, (2, 3))
+    self.assertEqual(roundtrip.dtype, torch_dtype)
+    torch.testing.assert_close(roundtrip, t)
 
 
 class TorchOpTest(parameterized.TestCase):
