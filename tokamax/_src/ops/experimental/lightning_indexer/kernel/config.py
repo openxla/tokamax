@@ -40,7 +40,7 @@ class MlaCase(enum.Enum):
     }[self]
 
 
-class KVLayout(enum.Enum):
+class KVLayout(enum.StrEnum):
   """Memory layout of the packed FP8 index KV cache.
 
   - HEAD_ALONG_SUBLANE: `[pages, page_size // packing, packing, width]`.
@@ -63,8 +63,8 @@ class KVLayout(enum.Enum):
     lane broadcast of the dequantization scale becomes free.
   """
 
-  HEAD_ALONG_SUBLANE = 0
-  SEQ_ALONG_LANE = 1
+  HEAD_ALONG_SUBLANE = enum.auto()
+  SEQ_ALONG_LANE = enum.auto()
 
   @classmethod
   def parse(cls, value: "str | KVLayout | None") -> "KVLayout":
