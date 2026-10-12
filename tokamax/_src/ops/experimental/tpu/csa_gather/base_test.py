@@ -19,9 +19,9 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
 from tokamax._src.ops.experimental.tpu.csa_gather import base
 from tokamax._src.ops.experimental.tpu.csa_gather import test_base
+from tokamax._src.ops.experimental.tpu.dsv4_compressor import csa_cache_layout
 
 jax.config.parse_flags_with_absl()
 

@@ -32,7 +32,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
+from tokamax._src.ops.experimental.tpu.dsv4_compressor import csa_cache_layout
 
 
 def ref_wkv_proj_and_save_state(

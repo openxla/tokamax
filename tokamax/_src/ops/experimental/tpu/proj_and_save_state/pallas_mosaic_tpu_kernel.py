@@ -27,7 +27,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
+from tokamax._src.ops.experimental.tpu.dsv4_compressor import csa_cache_layout
 
 # Fraction of the device's VMEM the kernel may use as scoped VMEM, as other
 # Tokamax TPU kernels do. Upstream's heuristic `tile_k` for CSA with

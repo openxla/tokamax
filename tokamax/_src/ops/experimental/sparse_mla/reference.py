@@ -19,7 +19,7 @@ import functools
 import jax
 from jax import lax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
+from tokamax._src.ops.experimental.tpu.dsv4_compressor import csa_cache_layout
 
 ROPE_WORDS = csa_cache_layout.ROPE_WORDS
 ROPE_DIM = csa_cache_layout.ROPE_DIM

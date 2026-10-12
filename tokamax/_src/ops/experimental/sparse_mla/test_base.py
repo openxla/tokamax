@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.sparse_mla import reference
-from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
+from tokamax._src.ops.experimental.tpu.dsv4_compressor import csa_cache_layout
 
 ATOL = RTOL = 0.1
 

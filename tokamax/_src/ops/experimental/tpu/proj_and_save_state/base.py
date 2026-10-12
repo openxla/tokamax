@@ -25,7 +25,7 @@ from jaxtyping import Array, Float, Int, Shaped  # pylint: disable=g-multiple-im
 import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
-from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
+from tokamax._src.ops.experimental.tpu.dsv4_compressor import csa_cache_layout
 from tokamax._src.ops.experimental.tpu.proj_and_save_state import reference
 
 AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray | np.ndarray

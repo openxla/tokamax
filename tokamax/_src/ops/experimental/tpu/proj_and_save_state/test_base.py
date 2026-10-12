@@ -21,7 +21,7 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.compress_store import csa_cache_layout
+from tokamax._src.ops.experimental.tpu.dsv4_compressor import csa_cache_layout
 from tokamax._src.ops.experimental.tpu.proj_and_save_state import reference
 
 # Numerics, measured on TPU7x. The state is an f32 matmul over `hidden_size`,

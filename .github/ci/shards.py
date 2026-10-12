@@ -556,6 +556,18 @@ SHARDS: ShardMap = {
         ),
         minutes=21,
     ),
+    # The DeepSeek-V4 sparse MLA op, new since the last rebalance. Timed from
+    # the catch-all of run 38087594559, where it was the only file group: 11.2m
+    # on tpu7x for the `Run shard` step (1.4m on tpu6e, 1.1m on h100).
+    'experimental-sparse-mla': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/sparse_mla/api_test.py',
+            'tokamax/_src/ops/experimental/sparse_mla/base_test.py',
+            'tokamax/_src/ops/experimental/sparse_mla/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/experimental/sparse_mla/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=11,
+    ),
     # The DeepSeek-V4 compressor projection. Out of the catch-all, where it
     # was the largest single op at 7.7m on tpu6e, nearly all of it
     # `pallas_mosaic_tpu_test.py`.
@@ -596,35 +608,36 @@ SHARDS: ShardMap = {
         ),
         minutes=5,
     ),
-    # The rest of the DeepSeek-V4 ops -- compress_store, o_projection, rope --
-    # out of the catch-all, one op per shard like the two above.
-    'experimental-compress-store': Spec(
+    # The rest of the DeepSeek-V4 ops -- dsv4_compressor, grouped_lowrank_proj,
+    # deepseek_rope -- out of the catch-all, one op per shard like the two
+    # above.
+    'experimental-dsv4-compressor': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/compress_store/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/compress_store/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/compress_store/compress_store_test.py',
-            'tokamax/_src/ops/experimental/tpu/compress_store/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/compress_store/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/api_test.py',
+            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/base_test.py',
+            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/dsv4_compressor_test.py',
+            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/pallas_mosaic_tpu_test.py',
         ),
         minutes=5,
     ),
-    'experimental-o-projection': Spec(
+    'experimental-grouped-lowrank-proj': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/o_projection/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/o_projection/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/o_projection/o_projection_test.py',
-            'tokamax/_src/ops/experimental/tpu/o_projection/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/o_projection/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/api_test.py',
+            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/base_test.py',
+            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/grouped_lowrank_proj_test.py',
+            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/pallas_mosaic_tpu_test.py',
         ),
         minutes=4,
     ),
-    'experimental-rope': Spec(
+    'experimental-deepseek-rope': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/rope/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/rope/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/rope/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/rope/pallas_mosaic_tpu_test.py',
-            'tokamax/_src/ops/experimental/tpu/rope/rope_test.py',
+            'tokamax/_src/ops/experimental/tpu/deepseek_rope/api_test.py',
+            'tokamax/_src/ops/experimental/tpu/deepseek_rope/base_test.py',
+            'tokamax/_src/ops/experimental/tpu/deepseek_rope/deepseek_rope_test.py',
+            'tokamax/_src/ops/experimental/tpu/deepseek_rope/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/experimental/tpu/deepseek_rope/pallas_mosaic_tpu_test.py',
         ),
         minutes=3,
     ),
@@ -691,6 +704,20 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_tp_tokens.py',
             'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_weight_slots.py',
             'tokamax/_src/ops/experimental/fused_moe/test_tp_token_layout.py',
+        ),
+        minutes=1,
+    ),
+    # The masked dense MLA op, new since the last rebalance. Not timed on its
+    # own: the catch-all of run 38004010741 ran it with `sparse_mla` in 10.8m on
+    # tpu7x, no longer than `sparse_mla` alone (11.2m), so an estimate.
+    'experimental-masked-dense-mla': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/masked_dense_mla/api_test.py',
+            'tokamax/_src/ops/experimental/masked_dense_mla/base_test.py',
+            'tokamax/_src/ops/experimental/masked_dense_mla/kv_cache_utils_test.py',
+            'tokamax/_src/ops/experimental/masked_dense_mla/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/experimental/masked_dense_mla/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/masked_dense_mla/scatter_test.py',
         ),
         minutes=1,
     ),
