@@ -34,10 +34,12 @@ def inner_kernel(
     qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
     b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
     a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
-    conv_state_slot_ref: jax.Ref,  # [seq, prev_kernel_size, 1, dim_size]
-    recurrent_slot_ref: jax.Ref,  # [seq, num_v_heads, kq_head, v_head]
+    conv_state_in_slot_ref: jax.Ref,  # [seq, 1, prev_kernel_size, 1, dim_size]
+    recurrent_in_slot_ref: jax.Ref,  # [seq, 1, num_v_heads, kq_head, v_head]
     # Outputs.
-    out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
+    out_slot_ref: jax.Array,  # [seq, chunk, num_v_heads, v_head]
+    conv_state_out_slot_ref: jax.Ref,  # [seq, window, prev_kernel_size, 1, dim]
+    recurrent_out_slot_ref: jax.Ref,  # [seq, window, num_v_heads, kq, v]
     # Scratches.
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
@@ -58,11 +60,11 @@ def inner_kernel(
     qkv_slot_ref: qkv VMEM ref that stores data loaded from HBM.
     b_slot_ref: b VMEM ref that stores data loaded from HBM.
     a_slot_ref: a VMEM ref that stores data loaded from HBM.
-    conv_state_slot_ref: Convolution state VMEM ref that stores data loaded from
-      HBM. Data written into this VMEM ref will be used for VMEM to HBM write.
-    recurrent_slot_ref: Recurrent state VMEM ref that stores data loaded from
-      HBM. Data written into this VMEM ref will be used for VMEM to HBM write.
+    conv_state_in_slot_ref: Convolution state VMEM ref loaded from HBM.
+    recurrent_in_slot_ref: Recurrent state VMEM ref loaded from HBM.
     out_slot_ref: Output VMEM ref that will be used for VMEM to HBM write.
+    conv_state_out_slot_ref: Convolution state VMEM ref written to HBM.
+    recurrent_out_slot_ref: Recurrent state VMEM ref written to HBM.
     metadata_ref: Metadata reference containing grid and sequence mappings.
     weights_ref: Weight references for Conv1D and GDN in VMEM.
     carry_conv_scratch_ref: Optional VMEM scratch reference for inter-tile
@@ -82,8 +84,8 @@ def inner_kernel(
   real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
       metadata_ref=metadata_ref,
       p_id=p_id,
-      conv_state_slot_ref=conv_state_slot_ref,
-      recurrent_slot_ref=recurrent_slot_ref,
+      conv_state_in_slot_ref=conv_state_in_slot_ref,
+      recurrent_in_slot_ref=recurrent_in_slot_ref,
       carry_conv_scratch_ref=carry_conv_scratch_ref,
       carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
       cfg=cfg,
@@ -112,7 +114,7 @@ def inner_kernel(
       cfg=cfg,
   )
 
-  conv_state_slot_ref[...] = new_conv_state
+  conv_state_out_slot_ref[...] = new_conv_state
   if carry_conv_scratch_ref is not None:
     # The next tile resumes from the state after this tile's last token,
     # which is the final checkpoint.
@@ -201,7 +203,9 @@ def inner_kernel(
 
   # Store output and recurrent to vmem.
   out_slot_ref[...] = out.astype(out_slot_ref.dtype)
-  recurrent_slot_ref[...] = new_recurrent_state.astype(recurrent_slot_ref.dtype)
+  recurrent_out_slot_ref[...] = new_recurrent_state.astype(
+      recurrent_out_slot_ref.dtype
+  )
 
   if carry_recurrent_scratch_ref is not None:
     carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
@@ -228,19 +232,23 @@ def outer_kernel(
     cfg: config.GDNConfig,
 ) -> None:
   """Setup memory allocations and emit pipeline for running inner_kernel."""
-  del conv_state_out_ref, recurrent_state_out_ref
 
-  qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc = (
-      memory_ref.create_allocs(
-          metadata_ref=metadata_ref,
-          qkv_ref=qkv_ref,
-          b_ref=b_ref,
-          a_ref=a_ref,
-          out_ref=out_ref,
-          conv_state_ref=conv_state_ref,
-          recurrent_state_ref=recurrent_state_ref,
-          cfg=cfg,
-      )
+  (
+      qkv_alloc,
+      b_alloc,
+      a_alloc,
+      conv_in_alloc,
+      recurrent_in_alloc,
+      out_alloc,
+      conv_out_alloc,
+      recurrent_out_alloc,
+  ) = memory_ref.create_allocs(
+      metadata_ref=metadata_ref,
+      qkv_ref=qkv_ref,
+      b_ref=b_ref,
+      a_ref=a_ref,
+      out_ref=out_ref,
+      cfg=cfg,
   )
 
   num_tiles = metadata_ref.num_tiles[...]
@@ -255,10 +263,14 @@ def outer_kernel(
           qkv_alloc.spec,
           b_alloc.spec,
           a_alloc.spec,
-          conv_alloc.spec,
-          recurrent_alloc.spec,
+          conv_in_alloc.spec,
+          recurrent_in_alloc.spec,
       ),
-      out_specs=(out_alloc.spec,),
+      out_specs=(
+          out_alloc.spec,
+          conv_out_alloc.spec,
+          recurrent_out_alloc.spec,
+      ),
   )
 
   @pl.with_scoped(
@@ -266,9 +278,11 @@ def outer_kernel(
           qkv_alloc,
           b_alloc,
           a_alloc,
-          conv_alloc,
-          recurrent_alloc,
+          conv_in_alloc,
+          recurrent_in_alloc,
           out_alloc,
+          conv_out_alloc,
+          recurrent_out_alloc,
       ),
   )
   def _run(allocations):
@@ -279,6 +293,8 @@ def outer_kernel(
         conv_state_ref,
         recurrent_state_ref,
         out_ref,
+        conv_state_out_ref,
+        recurrent_state_out_ref,
         scratches=(
             metadata_ref,
             weights_ref,
@@ -486,18 +502,6 @@ def fused_conv1d_gdn(
   )
 
   aligned_num_v_heads = tiling.align_to(n_v, num_lanes)
-
-  if num_spec_tokens > 0 and is_kda:
-    # Keep exactly one KDA sequence in each window tile.  The state
-    # pipeline issues one async recurrent-state DMA per sequence but
-    # shares a semaphore and drains the tile with one aggregate wait.
-    # Bounding only the total bytes is insufficient: TP32's four
-    # 3-head sequences have the same 6 MiB footprint as one TP8
-    # 12-head sequence, but the former still has four independent DMA
-    # starts and corrupts recurrent checkpoints in long-running
-    # serving.  A one-sequence tile is the only schedule validated for
-    # repeated rollback and slot reuse on v7, independent of TP size.
-    decode_tile_size = 1
 
   batch_padding_size = padded_batch_size - batch_size
   num_v_padding_size = aligned_num_v_heads - n_v

@@ -84,15 +84,19 @@ def get_vmem_estimate_bytes(
   a_bytes = 2 * (tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes)
 
   # 2. Double-buffered state cache buffers (convolution and recurrent states).
+  # Input state windows hold 1 state per sequence; output state windows hold
+  # `window_size` checkpoints per sequence, giving `1 + window_size` state
+  # slots per sequence per buffer.
+  state_slots_per_seq = 1 + window_size
   conv_state_buffer_bytes = 2 * (
       tile_b
-      * window_size
+      * state_slots_per_seq
       * max(0, kernel_size - 1)
       * conv_state_dim_size
       * carry_scratch_bytes
   )
   recurrent_state_buffer_bytes = 2 * (
-      tile_b * window_size * n_v * d_v * d_k * rec_state_bytes
+      tile_b * state_slots_per_seq * n_v * d_v * d_k * rec_state_bytes
   )
 
   # 3. Double-buffered output activation buffer.

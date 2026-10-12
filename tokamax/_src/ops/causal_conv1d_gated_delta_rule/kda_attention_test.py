@@ -34,10 +34,12 @@ from typing import Any
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import test_base
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import tiling
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import wrapper
 
 
@@ -594,6 +596,127 @@ class KdaAttentionTest(parameterized.TestCase):
     kwargs.update(overrides)
     with self.assertRaises(error):
       wrapper.fused_conv1d_gdn(**kwargs)
+
+  def test_kda_spec_window_multi_sequence_tile(self):
+    """KDA verify window (W=4, n_v=3) runs at multi-sequence tile T >= 2."""
+    n_kq = n_v = 3
+    d_k = d_v = 128
+    kernel_size = 4
+    num_spec_tokens = 3
+    window = num_spec_tokens + 1
+    num_seqs = 24
+    batch_size = num_seqs * window
+    dim_size = 2 * n_kq * d_k + n_v * d_v
+    num_blocks = 1 + num_seqs * window
+
+    decode_tile, _ = tiling.get_tile_sizes(
+        batch_size=batch_size,
+        num_seqs=num_seqs,
+        padded_batch_size=batch_size,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        conv_state_dim_size=dim_size,
+        act_out_dtype=jnp.dtype(jnp.bfloat16),
+        recurrent_state_dtype=jnp.dtype(jnp.float32),
+        num_lanes=pltpu.get_tpu_info().num_lanes,
+        decode_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(window),
+        mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+        window_size=window,
+    )
+    self.assertGreaterEqual(decode_tile, 2)
+    self.assertGreaterEqual((num_seqs + decode_tile - 1) // decode_tile, 3)
+
+    q_loc = jnp.arange(0, batch_size + 1, window, dtype=jnp.int32)
+    distribution = jnp.array([num_seqs, num_seqs, num_seqs], dtype=jnp.int32)
+    state_indices = jnp.array(
+        [1 + i * window for i in range(num_seqs)], dtype=jnp.int32
+    )
+    read_offsets_arr = jnp.array(
+        [i % window for i in range(num_seqs)], dtype=jnp.int32
+    )
+    seq_lens = jnp.full((num_seqs,), window + 10, dtype=jnp.int32)
+
+    rngs = iter(jax.random.split(jax.random.key(29), 8))
+    qkv = jax.random.normal(
+        next(rngs), (batch_size, dim_size), dtype=jnp.bfloat16
+    )
+    b = jax.random.normal(next(rngs), (batch_size, n_v), dtype=jnp.bfloat16)
+    a = jax.random.normal(
+        next(rngs), (batch_size, n_v * d_k), dtype=jnp.bfloat16
+    )
+    conv_state = jax.random.normal(
+        next(rngs),
+        (num_blocks, kernel_size - 1, dim_size),
+        dtype=jnp.bfloat16,
+    )
+    recurrent_state = jax.random.normal(
+        next(rngs), (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
+    )
+    conv_weight = jax.random.normal(
+        next(rngs), (dim_size, 1, kernel_size), dtype=jnp.bfloat16
+    )
+    a_log = jax.random.normal(next(rngs), (n_v,))
+    dt_bias = jax.random.normal(next(rngs), (n_v, d_k))
+
+    common_kwargs = dict(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        conv_weight=conv_weight,
+        conv_bias=None,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=q_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        seq_lens=seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        gate_lower_bound=-5.0,
+    )
+
+    (ref_conv, ref_rec), ref_out = kda_attention_spec_ref(
+        **common_kwargs,
+        read_offsets=read_offsets_arr,
+        num_spec_seqs=num_seqs,
+    )
+    for _ in range(3):
+      (new_conv, new_rec), out = wrapper.fused_conv1d_gdn(
+          **(
+              common_kwargs
+              | dict(
+                  conv_state=conv_state.copy(),
+                  recurrent_state=recurrent_state.copy(),
+              )
+          ),
+          read_offsets=read_offsets_arr,
+          num_spec_tokens=num_spec_tokens,
+          attention_mode=config.AttentionMode.KDA,
+      )
+      np.testing.assert_allclose(out, ref_out, rtol=2e-2, atol=5e-3)
+      for slot in range(num_blocks):
+        np.testing.assert_allclose(
+            new_conv[slot],
+            ref_conv[slot],
+            rtol=2e-2,
+            atol=5e-3,
+            err_msg=f"conv checkpoint mismatch at slot {slot}",
+        )
+        np.testing.assert_allclose(
+            new_rec[slot],
+            ref_rec[slot],
+            rtol=2e-2,
+            atol=1e-2,
+            err_msg=f"recurrent checkpoint mismatch at slot {slot}",
+        )
 
 
 if __name__ == "__main__":
