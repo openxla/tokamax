@@ -91,20 +91,8 @@ class PallasMosaicTpuRaggedGatherTest(parameterized.TestCase):
     start_jax = jnp.array(start_torch.detach().cpu().numpy(), dtype=jnp.int32)
     end_jax = jnp.array(end_torch.detach().cpu().numpy(), dtype=jnp.int32)
 
-    actual_torch = torch_pallas_mosaic_tpu.PallasMosaicTpuRaggedGather(
-        x_torch, indices_torch, start_torch, end_torch
-    )
-    desired_pallas_jax = jax_pallas_mosaic_tpu.PallasTpuRaggedGather()(
-        x_jax, indices_jax, start_jax, end_jax
-    )
     desired_base_jax = jax_base.RaggedGather()(
         x_jax, indices_jax, start_jax, end_jax
-    )
-
-    desired_pallas_torch = torch.as_tensor(
-        np.asarray(desired_pallas_jax, dtype=np.float32),
-        device=device,
-        dtype=dtype,
     )
     desired_base_torch = torch.as_tensor(
         np.asarray(desired_base_jax, dtype=np.float32),
@@ -112,19 +100,46 @@ class PallasMosaicTpuRaggedGatherTest(parameterized.TestCase):
         dtype=dtype,
     )
 
-    self.assertEqual(actual_torch.shape, desired_pallas_jax.shape)
-    torch.testing.assert_close(
-        actual_torch[start:end],
-        desired_pallas_torch[start:end],
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    torch.testing.assert_close(
-        actual_torch[start:end],
-        desired_base_torch[start:end],
-        rtol=1e-2,
-        atol=1e-2,
-    )
+    for max_row_subchunks in [1, 4]:
+      for trim_rows in [True, False]:
+        with self.subTest(
+            max_row_subchunks=max_row_subchunks, trim_rows=trim_rows
+        ):
+          actual_torch = torch_pallas_mosaic_tpu.PallasMosaicTpuRaggedGather(
+              x_torch,
+              indices_torch,
+              start_torch,
+              end_torch,
+              max_row_subchunks=max_row_subchunks,
+              trim_rows=trim_rows,
+          )
+          desired_pallas_jax = jax_pallas_mosaic_tpu.PallasTpuRaggedGather()(
+              x_jax,
+              indices_jax,
+              start_jax,
+              end_jax,
+              max_row_subchunks=max_row_subchunks,
+              trim_rows=trim_rows,
+          )
+          desired_pallas_torch = torch.as_tensor(
+              np.asarray(desired_pallas_jax, dtype=np.float32),
+              device=device,
+              dtype=dtype,
+          )
+
+          self.assertEqual(actual_torch.shape, desired_pallas_jax.shape)
+          torch.testing.assert_close(
+              actual_torch[start:end],
+              desired_pallas_torch[start:end],
+              rtol=1e-2,
+              atol=1e-2,
+          )
+          torch.testing.assert_close(
+              actual_torch[start:end],
+              desired_base_torch[start:end],
+              rtol=1e-2,
+              atol=1e-2,
+          )
 
   def test_fake_impl(self):
     with fake_tensor.FakeTensorMode():
@@ -135,8 +150,14 @@ class PallasMosaicTpuRaggedGatherTest(parameterized.TestCase):
       out = torch_pallas_mosaic_tpu.PallasMosaicTpuRaggedGather(
           x_fake, indices_fake, start_fake, end_fake
       )
+      out_untrimmed = torch_pallas_mosaic_tpu.PallasMosaicTpuRaggedGather(
+          x_fake, indices_fake, start_fake, end_fake, trim_rows=False
+      )
     self.assertEqual(tuple(out.shape), (32, 128))
     self.assertEqual(out.dtype, torch.float32)
+    self.assertGreaterEqual(out_untrimmed.shape[0], 32)
+    self.assertEqual(out_untrimmed.shape[1], 128)
+    self.assertEqual(out_untrimmed.dtype, torch.float32)
 
   def test_torch_compile(self):
     device = "tpu"
