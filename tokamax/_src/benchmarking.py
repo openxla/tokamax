@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import pathlib
-import shutil
 import tempfile
 import time
 from typing import Any, Final, Literal, cast, overload
@@ -135,9 +134,8 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       hermetic: If False, creates XProf server session, with the URL accessible
         via self.xprof_url. If True (default), `self.xprof_url=None` and this
         context manager is hermetic.
-      use_jax_profiler: Profile with the jax.profiler API writing a temporary
-        profile file instead of invoking xprof directly. If False (default),
-        profile with xprof directly.
+      use_jax_profiler: Profile with the jax.profiler API instead of invoking
+        xprof directly. If False (default), profile with xprof directly.
       event_filter_regex: A regex pattern to include only matching event names.
       **xprof_session_kwargs: Additional keyword arguments to pass to
         `xprof_session.start_session`.
@@ -155,7 +153,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       self._jax_profiler_mode = True
     self._profiler_wallclock_start_time: float | None = None
     self._profiler_wallclock_time: float | None = None
-    self._profile_tempdir: pathlib.Path | None = None
+    self._jax_profile_session: jax.profiler.ProfileSession | None = None
     self._event_filter_regex = event_filter_regex
     self._xprof_session_kwargs = xprof_session_kwargs
     self._retain_artifacts = False
@@ -185,9 +183,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     ``compute_kernel_stats(include_summary=True)``.
 
     The timing is pre-computed during ``__exit__`` and cached in
-    ``_timing_summary`` rather than evaluated on-demand, because the temporary
-    profile trace files are deleted upon context exit (``shutil.rmtree``),
-    making direct re-evaluation impossible after the session closes.
+    ``_timing_summary``.
 
     Raises:
       ValueError: If timing summary failed to compute or no XLA code executed.
@@ -222,18 +218,15 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     ).lower() in ['true', '1', 't', 'y', 'yes']
     if self._jax_profiler_mode:
       try:
-        root_dir = os.environ.get(WORKLOAD_ARTIFACTS_DIR_VARNAME, None)
-        self._profile_tempdir = get_tempdir(
-            prefix='tokamax_xprof_profile_', dir=root_dir
+        self._jax_profile_session = jax.profiler.ProfileSession(
+            profiler_options=self._profiler_options
         )
         # get profiling wallclock time right before the profiling starts
         self._profiler_wallclock_start_time = time.perf_counter()
         self._profiler_wallclock_time = None
 
         try:
-          jax.profiler.start_trace(
-              self._profile_tempdir, profiler_options=self._profiler_options
-          )
+          self._jax_profile_session.start()
         except RuntimeError as e:
           if 'already been started' not in str(e):
             raise
@@ -250,11 +243,9 @@ class XprofProfileSession(contextlib.AbstractContextManager):
             )
             _safe_reset_jax_profiler_state()
           self._profiler_wallclock_start_time = time.perf_counter()
-          jax.profiler.start_trace(
-              self._profile_tempdir, profiler_options=self._profiler_options
-          )
-        logger.info('Writing JAX profiler trace to: %s', self._profile_tempdir)
+          self._jax_profile_session.start()
       except Exception as e:
+        self._jax_profile_session = None
         raise RuntimeError('Unable to start jax profiling session.') from e
     else:
       if profile_data is None or xprof_session is None:
@@ -285,23 +276,19 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     del exc_type, exc_tb
 
     if self._jax_profiler_mode:
+      assert self._jax_profile_session is not None
+      self._profile = None
       try:
-        jax.profiler.stop_trace()
+        self._profile = self._jax_profile_session.stop()
       except Exception:  # pylint: disable=broad-exception-caught
         logger.warning('Failed to stop JAX profiler trace.', exc_info=True)
         _safe_reset_jax_profiler_state()
         if exc_value is None:
           raise
+      finally:
+        self._jax_profile_session = None
 
       if exc_value is not None:
-        if (
-            not self._retain_artifacts
-            or WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ
-        ) and (
-            self._profile_tempdir is not None and self._profile_tempdir.exists()
-        ):
-          shutil.rmtree(self._profile_tempdir, ignore_errors=True)
-        self._profile_tempdir = None
         return
 
       # get profiling wallclock time right after the profiling ends
@@ -309,26 +296,16 @@ class XprofProfileSession(contextlib.AbstractContextManager):
       assert (start_time := self._profiler_wallclock_start_time) is not None
       self._profiler_wallclock_start_time = None
       self._profiler_wallclock_time = end_time - start_time
-      assert self._profile_tempdir is not None, 'Profile tempdir should be set.'
-      profile_paths = list(
-          pathlib.Path(self._profile_tempdir).glob('**/*.xplane.pb')
-      )
-      if len(profile_paths) != 1:
-        raise RuntimeError(
-            f'Expected exactly one profile file, but found {len(profile_paths)}'
-        )
-      profile_path = profile_paths[0]
-      self._profile = jax.profiler.ProfileData.from_serialized_xspace(
-          profile_path.read_bytes()
-      )
+      if self._profile is None:
+        raise RuntimeError('Expected profile data from JAX profiler session.')
       if (
-          not self._retain_artifacts
-          or WORKLOAD_ARTIFACTS_DIR_VARNAME not in os.environ
+          self._retain_artifacts
+          and (root_dir := os.environ.get(WORKLOAD_ARTIFACTS_DIR_VARNAME))
+          is not None
       ):
-        if self._profile_tempdir is not None and self._profile_tempdir.exists():
-          shutil.rmtree(self._profile_tempdir)
-      logger.info('JAX profiler trace file written to: %s', profile_path)
-      self._profile_tempdir = None
+        profile_dir = get_tempdir(prefix='tokamax_xprof_profile_', dir=root_dir)
+        jax.profiler.export_profile_data(self._profile, profile_dir)
+        logger.info('JAX profiler trace file written to: %s', profile_dir)
     else:
       assert self._xprof_session is not None
       if self._hermetic:
