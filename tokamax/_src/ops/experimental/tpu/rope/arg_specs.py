@@ -38,7 +38,7 @@ def _make_argspec(
     x_shape: tuple[int, ...],
     mode: base.Mode,
     dtype: jax.typing.DTypeLike = jnp.bfloat16,
-    tags: tuple[arg_spec.Tag, ...] = ("primary", "ci_tests", "forward_only"),
+    tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
 ) -> arg_spec.ArgSpec:
   """Makes an argspec for the DeepSeek-V4 RoPE."""
   return arg_spec.ArgSpec(
@@ -64,22 +64,26 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         name="dsv4_qnorm_rope_q_t128_h128_d512",
         x_shape=(128, 128, 512),
         mode="qnorm_rope",
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name="dsv4_qnorm_rope_q_t4096_h128_d512",
         x_shape=(4096, 128, 512),
         mode="qnorm_rope",
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     # The single-head compressed KV.
     _make_argspec(
         name="dsv4_rope_kv_t4096_d512",
         x_shape=(4096, 512),
         mode="rope",
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     # The indexer query: RoPE and fp8 quantization over 64 heads of 128.
     _make_argspec(
         name="dsv4_rope_quant_indexer_q_t4096_h64_d128",
         x_shape=(4096, 64, 128),
         mode="rope_quant",
+        tags=("primary", "ci_tests", "forward_only"),
     ),
 )

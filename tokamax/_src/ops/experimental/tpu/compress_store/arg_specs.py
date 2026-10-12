@@ -74,7 +74,7 @@ def _make_argspec(
     token_to_req_indices: np.ndarray,
     state_physical_page_size: int | None = None,
     quant_block: int = 64,
-    tags: tuple[arg_spec.Tag, ...] = ("primary", "ci_tests", "forward_only"),
+    tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
 ) -> arg_spec.ArgSpec:
   """Makes an argspec for the compress-and-store with consistent metadata."""
   positions = positions.astype(np.int64)
@@ -223,23 +223,27 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         positions=_decode_positions(4),
         token_to_req_indices=np.arange(_DECODE_BATCH),
         **_CSA,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name=f"dsv4_csa_prefill_t{_PREFILL_LEN}",
         positions=_prefill_positions(4),
         token_to_req_indices=np.zeros(_PREFILL_LEN // 4, dtype=np.int32),
         **_CSA,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name=f"dsv4_hca_prefill_t{_PREFILL_LEN}",
         positions=_prefill_positions(128),
         token_to_req_indices=np.zeros(_PREFILL_LEN // 128, dtype=np.int32),
         **_HCA,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name=f"dsv4_csa_indexer_prefill_t{_PREFILL_LEN}",
         positions=_prefill_positions(4),
         token_to_req_indices=np.zeros(_PREFILL_LEN // 4, dtype=np.int32),
         **_CSA_INDEXER,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
 )

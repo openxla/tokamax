@@ -40,7 +40,7 @@ def _make_argspec(
     num_tokens: int,
     num_groups: int,
     lora_rank: int,
-    tags: tuple[arg_spec.Tag, ...] = ("primary", "ci_tests", "forward_only"),
+    tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
 ) -> arg_spec.ArgSpec:
   """Makes an argspec for the `wo_a` projection."""
   num_heads = num_groups * base.HEADS_PER_GROUP
@@ -73,17 +73,20 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         num_tokens=128,
         num_groups=16,
         lora_rank=1024,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name="dsv4_t1024_g16_r1024",
         num_tokens=1024,
         num_groups=16,
         lora_rank=1024,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name="dsv4_t4096_g16_r1024",
         num_tokens=4096,
         num_groups=16,
         lora_rank=1024,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
 )

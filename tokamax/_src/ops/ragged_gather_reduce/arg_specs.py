@@ -33,7 +33,7 @@ def _make_argspec(
     reduce_group_size: int,
     dtype: jax.typing.DTypeLike = jnp.bfloat16,
     indices_dtype: jax.typing.DTypeLike = jnp.int32,
-    tags: tuple[arg_spec.Tag, ...] = ("primary", "ci_tests", "forward_only"),
+    tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
 ) -> arg_spec.ArgSpec:
   """Make argspec for ragged gather reduce."""
   return arg_spec.ArgSpec(
@@ -59,6 +59,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         input_size=8192,
         hidden_size=4096,
         reduce_group_size=8,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name="1024x512_group4_bf16",
@@ -66,6 +67,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         input_size=1024,
         hidden_size=512,
         reduce_group_size=4,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name="16384x7168_group8_bf16",
@@ -73,5 +75,6 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         input_size=16384,
         hidden_size=7168,
         reduce_group_size=8,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
 )

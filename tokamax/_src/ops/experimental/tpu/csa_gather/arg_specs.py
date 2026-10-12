@@ -31,7 +31,7 @@ def _make_argspec(
     page_size: int,
     num_indices: int,
     top_k: int,
-    tags: tuple[arg_spec.Tag, ...] = ("primary", "ci_tests", "forward_only"),
+    tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
 ) -> arg_spec.ArgSpec:
   """Makes an argspec for the CSA gather."""
   return arg_spec.ArgSpec(
@@ -56,6 +56,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         page_size=256,
         num_indices=4096,
         top_k=512,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name="dsv4_1000x256_n131072_topk1024",
@@ -63,6 +64,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         page_size=256,
         num_indices=128 * 1024,
         top_k=1024,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name="dsv4_1000x256_n131072_topk2048",
@@ -70,5 +72,6 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         page_size=256,
         num_indices=128 * 1024,
         top_k=2048,
+        tags=("primary", "ci_tests", "forward_only"),
     ),
 )

@@ -14,7 +14,7 @@
 # ==============================================================================
 """mHC benchmark argument specifications."""
 
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import jax
 import jax.numpy as jnp
@@ -33,9 +33,6 @@ _GATE_CONSTANTS: Final[dict[str, Any]] = dict(
     hc_post_mult_value=2.0,
     sinkhorn_repeat=20,
 )
-# Decode batch, a mid-size batch and a prefill chunk.
-_NUM_TOKENS = (16, 512, 8192)
-_TAGS: Final[tuple[arg_spec.Tag, ...]] = ("primary", "ci_tests", "forward_only")
 
 
 def _pre_args(num_tokens: int) -> dict[str, Any]:
@@ -69,23 +66,76 @@ def _name(num_tokens: int) -> str:
   return f"dsv4_t{num_tokens}_m{_HC_MULT}_h{_HIDDEN_SIZE}"
 
 
-PRE_ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = tuple(
-    arg_spec.ArgSpec(
-        args=_pre_args(t), project="inference", name=_name(t), tags=_TAGS
-    )
-    for t in _NUM_TOKENS
+_ARGS_FNS = {
+    "pre": _pre_args,
+    "post": _post_args,
+    "fused_post_pre": _fused_args,
+}
+
+
+def _make_argspec(
+    *,
+    op: Literal["pre", "post", "fused_post_pre"],
+    num_tokens: int,
+    tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
+) -> arg_spec.ArgSpec:
+  """Makes an argspec for one of the mHC ops.
+
+  Args:
+    op: Which mHC op the argspec is for.
+    num_tokens: The number of tokens.
+    tags: The arg spec tags.
+
+  Returns:
+    The arg spec.
+  """
+  return arg_spec.ArgSpec(
+      args=_ARGS_FNS[op](num_tokens),
+      project="inference",
+      name=_name(num_tokens),
+      tags=tags,
+  )
+
+
+# A decode batch, a mid-size batch and a prefill chunk for each op.
+PRE_ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
+    _make_argspec(
+        op="pre", num_tokens=16, tags=("primary", "ci_tests", "forward_only")
+    ),
+    _make_argspec(
+        op="pre", num_tokens=512, tags=("primary", "ci_tests", "forward_only")
+    ),
+    _make_argspec(
+        op="pre", num_tokens=8192, tags=("primary", "ci_tests", "forward_only")
+    ),
 )
 
-POST_ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = tuple(
-    arg_spec.ArgSpec(
-        args=_post_args(t), project="inference", name=_name(t), tags=_TAGS
-    )
-    for t in _NUM_TOKENS
+POST_ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
+    _make_argspec(
+        op="post", num_tokens=16, tags=("primary", "ci_tests", "forward_only")
+    ),
+    _make_argspec(
+        op="post", num_tokens=512, tags=("primary", "ci_tests", "forward_only")
+    ),
+    _make_argspec(
+        op="post", num_tokens=8192, tags=("primary", "ci_tests", "forward_only")
+    ),
 )
 
-FUSED_POST_PRE_ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = tuple(
-    arg_spec.ArgSpec(
-        args=_fused_args(t), project="inference", name=_name(t), tags=_TAGS
-    )
-    for t in _NUM_TOKENS
+FUSED_POST_PRE_ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
+    _make_argspec(
+        op="fused_post_pre",
+        num_tokens=16,
+        tags=("primary", "ci_tests", "forward_only"),
+    ),
+    _make_argspec(
+        op="fused_post_pre",
+        num_tokens=512,
+        tags=("primary", "ci_tests", "forward_only"),
+    ),
+    _make_argspec(
+        op="fused_post_pre",
+        num_tokens=8192,
+        tags=("primary", "ci_tests", "forward_only"),
+    ),
 )

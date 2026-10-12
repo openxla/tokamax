@@ -85,7 +85,7 @@ def _make_argspec(
     layout: Literal["decode", "prefill"],
     hidden_size: int = _HIDDEN_SIZE,
     dtype: jax.typing.DTypeLike = jnp.bfloat16,
-    tags: tuple[arg_spec.Tag, ...] = ("primary", "ci_tests", "forward_only"),
+    tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
 ) -> arg_spec.ArgSpec:
   """Makes an argspec for the compressor projection.
 
@@ -141,23 +141,27 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         geometry=_CSA,
         num_tokens=128,
         layout="decode",
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name=f"dsv4_csa_prefill_t4096_h{_HIDDEN_SIZE}",
         geometry=_CSA,
         num_tokens=4096,
         layout="prefill",
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name=f"dsv4_hca_prefill_t4096_h{_HIDDEN_SIZE}",
         geometry=_HCA,
         num_tokens=4096,
         layout="prefill",
+        tags=("primary", "ci_tests", "forward_only"),
     ),
     _make_argspec(
         name=f"dsv4_indexer_prefill_t4096_h{_HIDDEN_SIZE}",
         geometry=_INDEXER,
         num_tokens=4096,
         layout="prefill",
+        tags=("primary", "ci_tests", "forward_only"),
     ),
 )
