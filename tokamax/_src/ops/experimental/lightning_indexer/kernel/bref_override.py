@@ -69,7 +69,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
   chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
 
   @classmethod
-  def create(  # pytype: disable=signature-mismatch
+  def create(  # pyrefly: ignore[bad-override]
       cls,
       spec: pl.BlockSpec,
       dtype_or_type: Any,
@@ -107,7 +107,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     )
 
   @classmethod
-  def input(  # pytype: disable=signature-mismatch
+  def input(  # pyrefly: ignore[bad-override]
       cls,
       spec: pl.BlockSpec,
       dtype_or_type: Any,
@@ -137,7 +137,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         chunk_idx=chunk_idx,
     )
 
-  def copy_in(  # pytype: disable=attribute-error
+  def copy_in(
       self,
       src_ref: tuple[jax.Ref, jax.Ref, Any],
       grid_indices: tuple[int | jax.Array, ...],
@@ -152,10 +152,10 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     assert isinstance(cache_kv_hbm, jax.Ref)
     slot = self.current_copy_in_slot
     sem = self.sem_recvs.at[slot]
-    vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+    vmem_dst: Any = self.window_ref.at[slot]
 
     reshaped_cache_hbm_ref: Any = (
-        cache_kv_hbm.reshape(  # pytype: disable=attribute-error
+        cache_kv_hbm.reshape(  # pyrefly: ignore[missing-attribute]
             cache_kv_hbm.shape[0] * self.page_size_per_kv_packing,
             self.kv_packing,
             cache_kv_hbm.shape[-1],
@@ -180,7 +180,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             reshaped_cache_hbm_ref.at[
                 pl.ds(safe_page_offset, self.page_size_per_kv_packing)
             ],
-            vmem_dst.at[  # pytype: disable=attribute-error
+            vmem_dst.at[
                 batch_idx,
                 pl.ds(
                     i * self.page_size_per_kv_packing,
@@ -202,7 +202,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     assert self.window_ref is not None
     slot = self.current_wait_in_slot
     sem = self.sem_recvs.at[slot]
-    vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+    vmem_dst: Any = self.window_ref.at[slot]
     pltpu.make_async_copy(
         vmem_dst,
         vmem_dst,
@@ -229,7 +229,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
   chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
 
   @classmethod
-  def create(  # pytype: disable=signature-mismatch
+  def create(  # pyrefly: ignore[bad-override]
       cls,
       spec: pl.BlockSpec,
       dtype_or_type: Any,
@@ -265,7 +265,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
     )
 
   @classmethod
-  def input(  # pytype: disable=signature-mismatch
+  def input(  # pyrefly: ignore[bad-override]
       cls,
       spec: pl.BlockSpec,
       dtype_or_type: Any,
@@ -293,7 +293,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         chunk_idx=chunk_idx,
     )
 
-  def copy_in(  # pytype: disable=attribute-error
+  def copy_in(
       self,
       src_ref: tuple[jax.Ref, jax.Ref, Any],
       grid_indices: tuple[int | jax.Array, ...],
@@ -308,7 +308,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
     assert isinstance(cache_kv_hbm, jax.Ref)
     slot = self.current_copy_in_slot
     sem = self.sem_recvs.at[slot]
-    vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+    vmem_dst: Any = self.window_ref.at[slot]
 
     max_hbm_pages = cache_kv_hbm.shape[0]
     num_page_indices = page_indices_ref.shape[0]
@@ -329,7 +329,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         dst_lane_start = i * self.page_size
         pltpu.make_async_copy(
             cache_kv_hbm.at[safe_page],
-            vmem_dst.at[  # pytype: disable=attribute-error
+            vmem_dst.at[
                 batch_idx,
                 :,
                 :,
@@ -350,7 +350,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
     assert self.window_ref is not None
     slot = self.current_wait_in_slot
     sem = self.sem_recvs.at[slot]
-    vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+    vmem_dst: Any = self.window_ref.at[slot]
     pltpu.make_async_copy(
         vmem_dst,
         vmem_dst,
@@ -369,7 +369,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
   chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
 
   @classmethod
-  def create(  # pytype: disable=signature-mismatch
+  def create(  # pyrefly: ignore[bad-override]
       cls,
       spec: pl.BlockSpec,
       dtype_or_type: Any,
@@ -403,7 +403,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
     )
 
   @classmethod
-  def input(  # pytype: disable=signature-mismatch
+  def input(  # pyrefly: ignore[bad-override]
       cls,
       spec: pl.BlockSpec,
       dtype_or_type: Any,
@@ -429,7 +429,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
         chunk_idx=chunk_idx,
     )
 
-  def copy_in(  # pytype: disable=attribute-error
+  def copy_in(
       self,
       src_ref: tuple[Any, ...],
       grid_indices: tuple[int | jax.Array, ...],
@@ -439,7 +439,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
     assert self.window_ref is not None
     slot = self.current_copy_in_slot
     sem = self.sem_recvs.at[slot]
-    vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+    vmem_dst: Any = self.window_ref.at[slot]
 
     q_len_start, total_sz = _token_window(
         src_ref,
@@ -452,7 +452,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
 
     pltpu.make_async_copy(
         q_hbm.at[pl.ds(q_len_start, total_sz)],
-        vmem_dst.at[pl.ds(0, total_sz)],  # pytype: disable=attribute-error
+        vmem_dst.at[pl.ds(0, total_sz)],
         sem,
     ).start()
 
@@ -468,7 +468,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
     assert self.window_ref is not None
     slot = self.current_wait_in_slot
     sem = self.sem_recvs.at[slot]
-    vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+    vmem_dst: Any = self.window_ref.at[slot]
     # Must match copy_in's size exactly or the semaphore never clears.
     _, total_sz = _token_window(
         src_ref,
@@ -497,7 +497,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
   chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
 
   @classmethod
-  def create(  # pytype: disable=signature-mismatch
+  def create(  # pyrefly: ignore[bad-override]
       cls,
       spec: pl.BlockSpec,
       dtype_or_type: Any,
@@ -531,7 +531,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
     )
 
   @classmethod
-  def output(  # pytype: disable=signature-mismatch
+  def output(  # pyrefly: ignore[bad-override]
       cls,
       spec: pl.BlockSpec,
       dtype_or_type: Any,
@@ -557,7 +557,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
         chunk_idx=chunk_idx,
     )
 
-  def copy_out(  # pytype: disable=attribute-error
+  def copy_out(
       self,
       dst_ref: tuple[Any, ...],
       grid_indices: tuple[int | jax.Array, ...],
@@ -571,7 +571,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
     assert self.window_ref is not None
     slot = self.current_copy_out_slot
     sem = self.sem_sends.at[slot]
-    vmem_src: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+    vmem_src: Any = self.window_ref.at[slot]
 
     token_start, total_sz = _token_window(
         dst_ref,
@@ -586,7 +586,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
     sublane_start = bkv_idx * self.num_sublanes
 
     pltpu.make_async_copy(
-        vmem_src.at[pl.ds(0, total_sz)],  # pytype: disable=attribute-error
+        vmem_src.at[pl.ds(0, total_sz)],
         scores_hbm.at[
             pl.ds(dst_start, total_sz),
             pl.ds(sublane_start, self.num_sublanes),
@@ -606,7 +606,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
     assert self.window_ref is not None
     slot = self.current_wait_out_slot
     sem = self.sem_sends.at[slot]
-    vmem_src: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+    vmem_src: Any = self.window_ref.at[slot]
 
     # Must match copy_out's size exactly or the semaphore never clears.
     _, total_sz = _token_window(
