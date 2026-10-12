@@ -587,7 +587,7 @@ def _apply_mask_and_soft_cap(
 
   def cap_logits(logits):
     if attn_logits_soft_cap is not None:
-      logits = jnp.tanh(logits * (1.0 / attn_logits_soft_cap))
+      logits = jnp.tanh(qk / attn_logits_soft_cap)
       return logits * attn_logits_soft_cap
     else:
       return logits
@@ -719,16 +719,15 @@ def flash_attention_kernel(
     assert l_prev.shape == (num_stacked_q_heads, bq, NUM_LANES)
 
     q = q_ref[...] if config.q_layout == HEAD_DIM_MINOR else q_ref[...].mT
+    if config.use_base2_exp and not config.q_prescaled_log2e:
+      if q.dtype == jnp.float8_e4m3fn:
+        q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
+      else:
+        q *= LOG2E
+
     head_dim_qk = q.shape[-1]
     # Collapse the head and sequence dimensions for a larger matmul.
     q_flat = q.reshape((num_stacked_q_heads * bq, head_dim_qk))
-    if config.use_base2_exp and not config.q_prescaled_log2e:
-      if q_flat.dtype == jnp.float8_e4m3fn:
-        q_flat = (q_flat.astype(jnp.bfloat16) * LOG2E).astype(
-            jnp.float8_e4m3fn
-        )
-      else:
-        q_flat *= LOG2E
 
     if config.k_layout == HEAD_DIM_MINOR:
       k = k_ref[slice_k, :]
@@ -1840,11 +1839,11 @@ def _flash_attention_dq_kernel(
         dp_dims,
         preferred_element_type=jnp.float32,
     )
-    if attn_logits_soft_cap is not None:
-      normalized = qk_uncapped * (1.0 / attn_logits_soft_cap)
-      d = jnp.tanh(normalized)
-      p = p * (1 - d * d)
     ds = (dp - di) * p
+    if attn_logits_soft_cap is not None:
+      normalized = qk_uncapped / attn_logits_soft_cap
+      d = jnp.tanh(normalized)
+      ds = ds * (1 - d * d)
 
     dq_dims = (
         NN_DIM_NUMBERS if config.k_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
@@ -2100,13 +2099,13 @@ def _flash_attention_dkv_kernel(
     if dropout_rate:
       assert dropout_scale is not None
       dp = dp * dropout_scale
-    if attn_logits_soft_cap is not None:
-      normalized = qk_uncapped * (1.0 / attn_logits_soft_cap)
-      d = jnp.tanh(normalized)
-      p = p * (1 - d * d)
     # `p` here is deliberately the *undropped* softmax weight: `di` is
     # rowsum(do * o), which already equals rowsum(dp_dropped * p).
     ds = (dp - di) * p
+    if attn_logits_soft_cap is not None:
+      normalized = qk_uncapped / attn_logits_soft_cap
+      d = jnp.tanh(normalized)
+      ds = ds * (1 - d * d)
     dk_dims = (
         NN_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NT_DIM_NUMBERS
     )
