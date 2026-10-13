@@ -58,6 +58,14 @@ SAME_QUANTIZATION_TOL = 2e-2
 # a real bug (a wrong scale shows up as tens of percent).
 FP8_NOISE_TOL = 5e-2
 
+# Relative error (in norm) between a float32 product computed at
+# `Precision.HIGHEST` and the same product with bf16 rounding in the way: the
+# bf16 output cast, and on TPU the default-precision matmul, which rounds its
+# float32 operands to bf16. Each bf16 rounding is at most 2^-9 (~0.2%) per
+# element; 1% covers a few of them with margin, while a wrong operand or scale
+# shows up as tens of percent.
+BF16_ROUNDING_TOL = 1e-2
+
 # Elementwise tolerance for reconstructing an operand from its FP8 value and
 # scale: half an e4m3 ulp is 6.25% at the bottom of a binade, plus a little
 # from rounding the scale to bf16 inside the quantizer.

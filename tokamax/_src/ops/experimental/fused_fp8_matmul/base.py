@@ -25,9 +25,12 @@ The op computes `lhs @ rhs` with both operands in `float8_e4m3fn` on the MXU:
 
 The output is `(lhs_q @ rhs_q) * (lhs_scale * rhs_scale)` cast to `lhs.dtype`.
 
-The default VJP is a plain-XLA reference. The gradient with respect to a plain
-`rhs` array is the usual `dout`-weighted product; a `QArray` `rhs` receives a
-zero gradient (pass the unquantized weight if you want to train it).
+The default VJP is a plain-XLA reference with FP8 training numerics: the
+activation gradient `dlhs = dout @ rhs^T` quantizes the cotangent to FP8 (one
+scale per row, after folding in the weight's column scales) so it runs on the
+FP8 MXU like the forward pass. The weight gradient is accumulated from the FP8
+residuals in float32. A `QArray` `rhs` receives a zero gradient (pass the
+unquantized weight if you want to train it).
 """
 
 import dataclasses
@@ -114,29 +117,76 @@ def fused_fp8_matmul_reference(
   return out, (lhs_q, lhs_scale, rhs_q, rhs_scale)
 
 
+def fused_fp8_dlhs_reference(
+    dout: jax.Array, rhs_q: jax.Array, rhs_scale: jax.Array
+) -> jax.Array:
+  """XLA reference for the activation gradient `dlhs = dout @ rhs^T` in FP8.
+
+  The contraction runs over `n`, so the weight's per-column scale cannot be
+  factored out of it: it is folded into the cotangent first. The scaled
+  cotangent is then quantized with one scale per row, exactly like the
+  activation in the forward pass, and that row scale is applied to the FP8
+  product.
+
+  Args:
+    dout: Cotangent of the output, shape `(m, n)`, `bfloat16` or `float32`.
+    rhs_q: The `(k, n)` FP8 weight.
+    rhs_scale: The `(n,)` float32 per-column weight scales.
+
+  Returns:
+    `dlhs` of shape `(m, k)` in `dout.dtype`.
+  """
+  dout_q, dout_scale = quantize_rows_fp8(dout * rhs_scale.astype(dout.dtype))
+  # Contract the last dims directly rather than spelling it `rhs_q.T`: on TPUs
+  # without an FP8 MXU (v6e), XLA's handling of a transposed FP8 operand made
+  # the jitted VJP take minutes to compile.
+  acc = jax.lax.dot_general(
+      dout_q,
+      rhs_q,
+      dimension_numbers=(((1,), (1,)), ((), ())),
+      preferred_element_type=jnp.float32,
+  )
+  return (acc * dout_scale).astype(dout.dtype)
+
+
+def fused_fp8_drhs_reference(
+    lhs_q: jax.Array, lhs_scale: jax.Array, dout: jax.Array
+) -> jax.Array:
+  """XLA reference for the weight gradient `drhs = lhs^T @ dout`.
+
+  The activation is reconstructed from its FP8 residual and the product is
+  accumulated in float32. The cotangent is not quantized.
+
+  Args:
+    lhs_q: The `(m, k)` FP8 activation.
+    lhs_scale: The `(m, 1)` float32 per-row activation scales.
+    dout: Cotangent of the output, shape `(m, n)`.
+
+  Returns:
+    `drhs` of shape `(k, n)` in `dout.dtype`.
+  """
+  lhs = lhs_q.astype(jnp.float32) * lhs_scale
+  return jnp.matmul(lhs.T, dout.astype(jnp.float32)).astype(dout.dtype)
+
+
 def fused_fp8_matmul_vjp_reference(
     residuals: Residuals, dout: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
   """XLA reference VJP from the FP8 residuals.
-
-  `dlhs = dout @ rhs^T` and `drhs = lhs^T @ dout`, with `lhs` and `rhs`
-  reconstructed from their FP8 values and scales. Both gradients are
-  accumulated in float32.
 
   Args:
     residuals: `(lhs_q, lhs_scale, rhs_q, rhs_scale)` from the forward pass.
     dout: Cotangent of the output, shape `(m, n)`.
 
   Returns:
-    `(dlhs, drhs)` in `dout.dtype`.
+    `(dlhs, drhs)` in `dout.dtype`, see `fused_fp8_dlhs_reference` and
+    `fused_fp8_drhs_reference`.
   """
   lhs_q, lhs_scale, rhs_q, rhs_scale = residuals
-  rhs = rhs_q.astype(jnp.float32) * rhs_scale
-  lhs = lhs_q.astype(jnp.float32) * lhs_scale
-  dout_f32 = dout.astype(jnp.float32)
-  dlhs = jnp.matmul(dout_f32, rhs.T).astype(dout.dtype)
-  drhs = jnp.matmul(lhs.T, dout_f32).astype(dout.dtype)
-  return dlhs, drhs
+  return (
+      fused_fp8_dlhs_reference(dout, rhs_q, rhs_scale),
+      fused_fp8_drhs_reference(lhs_q, lhs_scale, dout),
+  )
 
 
 def _validate_rhs_qarray(rhs: QArray, k: int, n: int) -> None:
@@ -158,8 +208,9 @@ class FusedFp8Matmul[C](op.Op[Any, jax.Array, Residuals | None, C, None]):
 
   def __post_init__(self):
     # The reference VJP takes no config. A backend with its own backward kernel
-    # overrides this with a VJP op carrying that kernel's config.
-    object.__setattr__(self, "vjp", FusedFp8MatmulVjp())
+    # installs a VJP op carrying that kernel's config instead.
+    if self.vjp is None:
+      object.__setattr__(self, "vjp", FusedFp8MatmulVjp())
 
   @override
   def bind(
