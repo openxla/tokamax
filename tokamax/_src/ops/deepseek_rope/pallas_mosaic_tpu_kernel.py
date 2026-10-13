@@ -25,12 +25,10 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 
 # Native lane count; the roped channels are the tail of the last lane block.
 LANE = 128
-
-# Upstream's limit. Mosaic caps it at the VMEM capacity (64 MiB on TPU7x).
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 def largest_divisor(x: int, cap: int) -> int:
@@ -509,7 +507,7 @@ def _rope_call(
       grid_spec=grid_spec,
       input_output_aliases=input_output_aliases,
       compiler_params=pltpu.CompilerParams(
-          vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+          vmem_limit_bytes=mosaic_tpu.default_tc_vmem_limit_bytes(),
           disable_bounds_checks=True,
       ),
       name=name,
@@ -624,7 +622,7 @@ def qnorm_rope(
       grid_spec=grid_spec,
       input_output_aliases={1: 0},  # x (after the scalar prefetch) -> out
       compiler_params=pltpu.CompilerParams(
-          vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+          vmem_limit_bytes=mosaic_tpu.default_tc_vmem_limit_bytes(),
           disable_bounds_checks=True,
       ),
       name=name,

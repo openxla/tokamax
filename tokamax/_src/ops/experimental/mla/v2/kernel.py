@@ -27,6 +27,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.experimental.mla.v2 import kv_utils
 from tokamax._src.ops.experimental.mla.v2.transpose import xpose_pipeline
 
@@ -2297,15 +2298,14 @@ def prepare_outputs(
         "p_same_dtype_as_v",
         "debug_mode",
     ),
-    donate_argnames=("cache_kv", ),
+    donate_argnames=("cache_kv",),
 )
 def mla_ragged_paged_attention(
     ql_nope: jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
     q_pe: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_r_dim]
     new_kv_c: jax.Array,  # [max_num_tokens, actual_lkv_dim]
     new_k_pe: jax.Array,  # [max_num_tokens, actual_r_dim]
-    cache_kv: jax.
-    Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128)] if not transpose_kv_cache else [total_num_pages, lkv_dim, page_size]
+    cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128)] if not transpose_kv_cache else [total_num_pages, lkv_dim, page_size]
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -2334,9 +2334,8 @@ def mla_ragged_paged_attention(
     # Debug params.
     debug_mode: bool = False,
 ) -> tuple[
-        jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
-        jax.
-        Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128) + align_to(r_dim, 128)]
+    jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
+    jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128) + align_to(r_dim, 128)]
 ]:
   """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -2399,7 +2398,7 @@ def mla_ragged_paged_attention(
     num_queries_per_blocks = num_queries_per_block
 
   if vmem_limit_bytes is None:
-    vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
 
   static_validate_inputs(
       ql_nope,

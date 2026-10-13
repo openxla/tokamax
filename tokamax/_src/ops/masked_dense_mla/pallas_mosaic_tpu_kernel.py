@@ -36,6 +36,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.masked_dense_mla import csa_mask
 
 
@@ -53,8 +54,6 @@ def get_dtype_packing(dtype):
 
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
-
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 class MlaCase(enum.Enum):
@@ -605,7 +604,7 @@ def masked_dense_ragged_paged_attention(
     # If passed in as int, all cases are the same.
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
     sequence_start: jax.Array | None = None,
 ) -> jax.Array:
   """Masked-dense MLA ragged paged attention supporting mixed batches.
@@ -655,7 +654,8 @@ def masked_dense_ragged_paged_attention(
     num_kv_pages_per_block: KV pages per streamed block, per (decode, prefill,
       mixed) case.
     num_queries_per_block: query tokens per block, per case.
-    vmem_limit_bytes: the vmem limit for the pallas kernel.
+    vmem_limit_bytes: the vmem limit for the pallas kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
     sequence_start: first sequence to attend, as a device scalar. When set,
       sequences `[0, sequence_start)` are assumed already attended by the
       caller: the decode and prefill-only launches are skipped, the mixed launch
@@ -665,6 +665,8 @@ def masked_dense_ragged_paged_attention(
   Returns:
     The output of attention, `[max_num_tokens, num_q_heads, head_dim]`.
   """
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
   if mask_value is None:
     mask_value = DEFAULT_MASK_VALUE
 

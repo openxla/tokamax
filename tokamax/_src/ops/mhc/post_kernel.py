@@ -20,8 +20,8 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.mhc import utils
-from tokamax._src.ops.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES  # pylint: disable=g-importing-member
 
 
 def _post_kernel(
@@ -56,7 +56,7 @@ def mhc_post_2d(
     comb_res_mix: jax.Array,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
   """2D-native entry: the kernel's own layout as public API.
 
@@ -67,15 +67,17 @@ def mhc_post_2d(
   Args:
     x: (num_tokens, hidden_size), bfloat16 — the sublayer output.
     res2d: (num_tokens, hc_mult * hidden_size), bfloat16.
-    post_layer_mix: (num_tokens, hc_mult, 1) or (num_tokens, hc_mult),
-      float32.
+    post_layer_mix: (num_tokens, hc_mult, 1) or (num_tokens, hc_mult), float32.
     comb_res_mix: (num_tokens, hc_mult, hc_mult), float32.
     token_block_size: Tokens per grid step.
-    vmem_limit_bytes: Scoped-VMEM budget for the kernel.
+    vmem_limit_bytes: Scoped-VMEM budget for the kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
 
   Returns:
     (num_tokens, hc_mult * hidden_size) in `res2d.dtype`.
   """
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
   assert res2d.dtype == jnp.bfloat16, res2d.dtype
   assert post_layer_mix.dtype == jnp.float32, post_layer_mix.dtype
   assert comb_res_mix.dtype == jnp.float32, comb_res_mix.dtype
@@ -138,7 +140,7 @@ def mhc_post(
     comb_res_mix: jax.Array,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
   """Pallas mHC post on `(..., hc_mult, hidden_size)` residual streams.
 
@@ -150,7 +152,8 @@ def mhc_post(
     post_layer_mix: (..., hc_mult, 1), float32.
     comb_res_mix: (..., hc_mult, hc_mult), float32.
     token_block_size: Tokens per grid step.
-    vmem_limit_bytes: Scoped-VMEM budget for the kernel.
+    vmem_limit_bytes: Scoped-VMEM budget for the kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
 
   Returns:
     (..., hc_mult, hidden_size) in `residual.dtype`.

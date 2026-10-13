@@ -40,13 +40,12 @@ class Config:
     num_queries_per_block: Query tokens per block for (decode, prefill, mixed)
       cases.
     vmem_limit_bytes: VMEM capacity limit in bytes for the Pallas kernel.
+      Defaults to `mosaic_tpu.default_tc_vmem_limit_bytes()` when None.
   """
 
   num_kv_pages_per_block: tuple[int, int, int] | int = (1, 1, 1)
   num_queries_per_block: tuple[int, int, int] | int = (1, 16, 16)
-  vmem_limit_bytes: Annotated[int, pydantic.Field(gt=0)] = (
-      pallas_mosaic_tpu_kernel.DEFAULT_VMEM_LIMIT_BYTES
-  )
+  vmem_limit_bytes: Annotated[int, pydantic.Field(gt=0)] | None = None
 
 
 class PallasTpuMaskedDenseMla(base.MaskedDenseMla[Config]):
@@ -105,7 +104,6 @@ class PallasTpuMaskedDenseMla(base.MaskedDenseMla[Config]):
     return Config(
         num_kv_pages_per_block=(1, 1, 1),
         num_queries_per_block=(1, 16, 16),
-        vmem_limit_bytes=pallas_mosaic_tpu_kernel.DEFAULT_VMEM_LIMIT_BYTES,
     )
 
   @override

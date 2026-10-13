@@ -51,7 +51,9 @@ class _PallasMosaicTpuSparseMla(
     return (
         config.gather_and_attention_chunk_size,
         config.attention_kernel_batch_size,
-        config.vmem_limit_bytes,
+        # `None` (use `mosaic_tpu.default_tc_vmem_limit_bytes()`) is passed as
+        # -1.
+        -1 if config.vmem_limit_bytes is None else config.vmem_limit_bytes,
     )
 
   @override
@@ -66,7 +68,7 @@ class _PallasMosaicTpuSparseMla(
     return Config(
         gather_and_attention_chunk_size=int(flat[0]),
         attention_kernel_batch_size=int(flat[1]),
-        vmem_limit_bytes=int(flat[2]),
+        vmem_limit_bytes=None if flat[2] <= 0 else int(flat[2]),
     )
 
   @override

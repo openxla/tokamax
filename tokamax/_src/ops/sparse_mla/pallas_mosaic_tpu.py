@@ -40,15 +40,14 @@ class Config:
     attention_kernel_batch_size: Number of query tokens processed per TensorCore
       Pallas grid step inside a chunk.
     vmem_limit_bytes: VMEM capacity limit in bytes for the Pallas kernel.
+      Defaults to `mosaic_tpu.default_tc_vmem_limit_bytes()` when None.
   """
 
   gather_and_attention_chunk_size: Annotated[
       int, pydantic.Field(gt=0, multiple_of=4)
   ] = 128
   attention_kernel_batch_size: Annotated[int, pydantic.Field(gt=0)] = 16
-  vmem_limit_bytes: Annotated[int, pydantic.Field(gt=0)] = (
-      pallas_mosaic_tpu_kernel.DEFAULT_VMEM_LIMIT_BYTES
-  )
+  vmem_limit_bytes: Annotated[int, pydantic.Field(gt=0)] | None = None
 
 
 class PallasTpuSparseMla(base.SparseMla[Config]):
@@ -105,7 +104,6 @@ class PallasTpuSparseMla(base.SparseMla[Config]):
     return Config(
         gather_and_attention_chunk_size=128,
         attention_kernel_batch_size=16,
-        vmem_limit_bytes=pallas_mosaic_tpu_kernel.DEFAULT_VMEM_LIMIT_BYTES,
     )
 
   @override
