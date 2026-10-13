@@ -19,6 +19,7 @@ from tokamax.experimental.torch_tpu.ops import torch_utils as tokamax_torch_util
 from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_pallas_mosaic_tpu as batched_rpa
 from tokamax.experimental.torch_tpu.ops.causal_conv1d_gated_delta_rule import torch_pallas_mosaic_tpu as causal_conv1d_gated_delta_rule
 from tokamax.experimental.torch_tpu.ops.csa_gather import torch_pallas_mosaic_tpu as csa_gather
+from tokamax.experimental.torch_tpu.ops.deepseek_rope import torch_pallas_mosaic_tpu as deepseek_rope
 from tokamax.experimental.torch_tpu.ops.fused_moe import torch_pallas_mosaic_tpu as fused_moe
 from tokamax.experimental.torch_tpu.ops.linear_softmax_cross_entropy import torch_pallas_mosaic_tpu as linear_softmax_cross_entropy_loss
 from tokamax.experimental.torch_tpu.ops.ragged_dot import torch_pallas_mosaic_tpu as ragged_dot
