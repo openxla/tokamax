@@ -168,7 +168,7 @@ class XprofProfileSession(contextlib.AbstractContextManager):
     if jax.default_backend() == 'tpu':
       options.advanced_configuration = {
           'tpu_trace_mode': 'TRACE_ONLY_XLA',
-          'tpu_perf_counters': True,
+          'tpu_perf_counters': False,
       }
     self._profiler_options = options
 
