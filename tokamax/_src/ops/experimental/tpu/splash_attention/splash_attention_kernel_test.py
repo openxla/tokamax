@@ -558,6 +558,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     q, k, v, sinks, segment_ids, do = _generate_inputs(
         data, model_config, is_mqa, is_segmented, use_sinks=use_sinks
     )
+    q = q / np.sqrt(model_config.head_dim_qk).astype(q.dtype)
     q_quant_mode = data.draw(hp.strategies.booleans())
     if q_quant_mode:
       q = q.astype(jnp.float8_e4m3fn)
@@ -601,7 +602,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       else:
         make_mask_fn = splash.make_dynamic_splash_mha
 
-    max_logit_value, max_val = None, 30.0
+    max_logit_value, max_val = None, 4.0
     if use_max_logit_estimate == "const":
       config = dataclasses.replace(config, max_logit_const=max_val)
     elif use_max_logit_estimate == "value_1d":
