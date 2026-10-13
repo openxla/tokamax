@@ -14,15 +14,13 @@
 # ==============================================================================
 """Autotuning API."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from concurrent import futures
 import dataclasses
-import inspect
 import json
-from typing import Annotated, Any, Final, Self, Sequence, cast
+from typing import Annotated, Any, Self, Sequence, cast
 
 from absl import logging
-import immutabledict
 import jax
 from jax.extend import backend
 import pydantic
@@ -32,46 +30,6 @@ from tokamax._src import version
 from tokamax._src.autotuning import autotuner
 from tokamax._src.autotuning import cache as cache_lib
 from tokamax._src.ops import op as op_lib
-from tokamax._src.ops.attention import api as attention_api
-from tokamax._src.ops.attention import base as attention_base
-from tokamax._src.ops.causal_conv1d_gated_delta_rule import api as causal_conv1d_gated_delta_rule_api
-from tokamax._src.ops.causal_conv1d_gated_delta_rule import base as causal_conv1d_gated_delta_rule_base
-from tokamax._src.ops.experimental.kda import api as kda_api
-from tokamax._src.ops.experimental.kda import base as kda_base
-from tokamax._src.ops.experimental.mla import api as mla_api
-from tokamax._src.ops.experimental.mla import base as mla_base
-from tokamax._src.ops.experimental.tpu.csa_gather import api as csa_gather_api
-from tokamax._src.ops.experimental.tpu.csa_gather import base as csa_gather_base
-from tokamax._src.ops.experimental.tpu.deepseek_rope import api as deepseek_rope_api
-from tokamax._src.ops.experimental.tpu.deepseek_rope import base as deepseek_rope_base
-from tokamax._src.ops.experimental.tpu.dsv4_compressor import api as dsv4_compressor_api
-from tokamax._src.ops.experimental.tpu.dsv4_compressor import base as dsv4_compressor_base
-from tokamax._src.ops.experimental.tpu.grouped_lowrank_proj import api as grouped_lowrank_proj_api
-from tokamax._src.ops.experimental.tpu.grouped_lowrank_proj import base as grouped_lowrank_proj_base
-from tokamax._src.ops.experimental.tpu.mhc import api as mhc_api
-from tokamax._src.ops.experimental.tpu.mhc import base as mhc_base
-from tokamax._src.ops.experimental.tpu.proj_and_save_state import api as proj_and_save_state_api
-from tokamax._src.ops.experimental.tpu.proj_and_save_state import base as proj_and_save_state_base
-from tokamax._src.ops.experimental.tpu.router_topk import api as router_topk_api
-from tokamax._src.ops.experimental.tpu.router_topk import base as router_topk_base
-from tokamax._src.ops.experimental.tpu.splash_attention import api as splash_attention_api
-from tokamax._src.ops.experimental.tpu.splash_attention import base as splash_attention_base
-from tokamax._src.ops.gated_linear_unit import api as glu_api
-from tokamax._src.ops.gated_linear_unit import base as glu_base
-from tokamax._src.ops.linear_softmax_cross_entropy_loss import api as linear_softmax_cross_entropy_loss_api
-from tokamax._src.ops.linear_softmax_cross_entropy_loss import base as linear_softmax_cross_entropy_loss_base
-from tokamax._src.ops.normalization import api as normalization_api
-from tokamax._src.ops.normalization import base as normalization_base
-from tokamax._src.ops.ragged_dot import api as ragged_dot_api
-from tokamax._src.ops.ragged_dot import base as ragged_dot_base
-from tokamax._src.ops.ragged_gather import api as ragged_gather_api
-from tokamax._src.ops.ragged_gather import base as ragged_gather_base
-from tokamax._src.ops.ragged_gather_reduce import api as ragged_gather_reduce_api
-from tokamax._src.ops.ragged_gather_reduce import base as ragged_gather_reduce_base
-from tokamax._src.ops.ragged_scatter import api as ragged_scatter_api
-from tokamax._src.ops.ragged_scatter import base as ragged_scatter_base
-from tokamax._src.ops.triangle_multiplication import api as triangle_multiplication_api
-from tokamax._src.ops.triangle_multiplication import base as triangle_multiplication_base
 import tqdm
 
 type BoundArgsAutotuningData = tuple[
@@ -223,9 +181,7 @@ _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
 _BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_lib.BoundArguments)
 
 
-# Re-exported from `hlo_utils`, which is where it lives so that callers only
-# wanting to read ops back out of a lowered function need not import the op
-# modules that `_API_IMPLEMENTATIONS` below requires.
+# Re-exported from `hlo_utils`, which is where it lives.
 get_bound_args = hlo_utils.get_bound_args
 
 
@@ -271,68 +227,6 @@ def bound_args_from_json_file(filename: str) -> list[op_lib.BoundArguments]:
     return bound_args_from_json(f.read())
 
 
-_API_IMPLEMENTATIONS: Final[
-    Mapping[type[op_lib.Op], Mapping[str, Callable[..., Any]]]
-] = immutabledict.immutabledict({
-    normalization_base.Normalization: normalization_api.IMPLEMENTATIONS,
-    glu_base.GatedLinearUnit: glu_api.IMPLEMENTATIONS,
-    ragged_dot_base.RaggedDot: ragged_dot_api.IMPLEMENTATIONS,
-    ragged_scatter_base.RaggedScatter: ragged_scatter_api.IMPLEMENTATIONS,
-    attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,
-    mla_base.MultiHeadLatentAttention: mla_api.IMPLEMENTATIONS,
-    ragged_gather_base.RaggedGather: ragged_gather_api.IMPLEMENTATIONS,
-    ragged_gather_reduce_base.RaggedGatherReduce: (
-        ragged_gather_reduce_api.IMPLEMENTATIONS
-    ),
-    kda_base.KimiDeltaAttention: kda_api.IMPLEMENTATIONS,
-    linear_softmax_cross_entropy_loss_base.LinearSoftmaxCrossEntropyLoss: (
-        linear_softmax_cross_entropy_loss_api.IMPLEMENTATIONS
-    ),
-    triangle_multiplication_base.TriangleMultiplication: (
-        triangle_multiplication_api.IMPLEMENTATIONS
-    ),
-    splash_attention_base.SplashAttention: splash_attention_api.IMPLEMENTATIONS,
-    causal_conv1d_gated_delta_rule_base.CausalConv1dGatedDeltaRule: (
-        causal_conv1d_gated_delta_rule_api.IMPLEMENTATIONS
-    ),
-    csa_gather_base.CsaGather: csa_gather_api.IMPLEMENTATIONS,
-    dsv4_compressor_base.Dsv4Compressor: dsv4_compressor_api.IMPLEMENTATIONS,
-    grouped_lowrank_proj_base.GroupedLowrankProj: (
-        grouped_lowrank_proj_api.IMPLEMENTATIONS
-    ),
-    proj_and_save_state_base.ProjAndSaveState: (
-        proj_and_save_state_api.IMPLEMENTATIONS
-    ),
-    deepseek_rope_base.DeepseekRope: deepseek_rope_api.IMPLEMENTATIONS,
-    mhc_base.MhcPre: mhc_api.PRE_IMPLEMENTATIONS,
-    mhc_base.MhcPost: mhc_api.POST_IMPLEMENTATIONS,
-    mhc_base.MhcFusedPostPre: mhc_api.FUSED_POST_PRE_IMPLEMENTATIONS,
-    router_topk_base.RouterTopK: router_topk_api.IMPLEMENTATIONS,
-})
-
-
-def get_op_implementations(
-    op: op_lib.Op,
-    device: jax.Device | None = None,
-) -> dict[str, Callable[..., Any]]:
-  """Returns all implementations of the given op.
-
-  Args:
-    op: The op for which to get the implementations.
-    device: The device to get implementations for. If not provided, all
-      implementations will be returned.
-
-  Returns:
-    An (implementation name, implementation) mapping.
-  """
-  mro = inspect.getmro(op.__class__)
-  impls = dict(_API_IMPLEMENTATIONS.get(mro[mro.index(op_lib.Op) - 1], {}))
-
-  if device is not None:
-    impls = {k: v for k, v in impls.items() if v.supported_on(device)}  # pyrefly: ignore[missing-attribute]
-  return impls
-
-
 def autotune(
     f: (
         Callable[..., Any]
@@ -341,7 +235,6 @@ def autotune(
     ),
     *args,
     ignore_cache: bool = False,
-    all_implementations: bool = False,
     progress_bar: bool = True,
     timeout: float | None = 600.0,
     max_workers: int | None = None,
@@ -355,8 +248,6 @@ def autotune(
       `tokamax.get_bound_args(f, *args, **kwargs)` to `autotune`.
     ignore_cache: . If `False` (default), only autotune ops that are not in the
       autotuning cache. If `True` autotune all Tokamax ops found in `f`.
-    all_implementations: Whether to autotune all implementations of the op that
-      is tunable on the current device.
     progress_bar: Whether to show a progress bar (default: `True`).
     timeout: The time limit (in seconds) for compiling a config in the
       autotuning search space. If `None`, there is no time limit. This is useful
@@ -387,15 +278,6 @@ def autotune(
     device_kind = device_kinds.pop()
   else:
     raise ValueError(f"Multiple device kinds found: {device_kinds}")
-
-  if all_implementations:
-    default_device = backend.get_default_device()
-    bound_args = tuple(
-        op_lib.BoundArguments(op, ba.arguments)  # pylint: disable=g-complex-comprehension
-        for ba in bound_args
-        for op in get_op_implementations(ba.op, device=default_device).values()
-        if isinstance(op, op_lib.Op)
-    )
 
   data = []
   if progress_bar:
