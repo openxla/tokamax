@@ -18,9 +18,11 @@ from collections.abc import Callable, Hashable
 import dataclasses
 import functools
 import math
+import operator
 from typing import Any, Literal, NotRequired, TypedDict, cast, overload, override
 
 import jax
+from jax import lax
 from jax.experimental import shard_map
 import jax.numpy as jnp
 from jax.typing import DTypeLike  # pylint: disable=g-importing-member
@@ -53,6 +55,96 @@ def _mesh_axis_size(
     return 1
   axis_names = axis if isinstance(axis, tuple) else (axis,)
   return math.prod(mesh.shape[name] for name in axis_names)
+
+
+def unravel_3d_coords(
+    idx: jax.Array,
+    latent_shape: tuple[int, ...],
+    sfc_block_sizes: tuple[int, ...] | None = None,
+) -> list[jax.Array]:
+  """Unravels 1D latent token indices into nD grid coordinates."""
+  div_fn = lax.div if isinstance(idx, jax.Array) else operator.floordiv
+  rem_fn = lax.rem if isinstance(idx, jax.Array) else operator.mod
+  ndim = len(latent_shape)
+  if sfc_block_sizes is None:
+    coords = []
+    rem = idx
+    for i, dim_size in enumerate(reversed(latent_shape)):
+      coords.append(rem if i == ndim - 1 else rem_fn(rem, dim_size))
+      if i < ndim - 1:
+        rem = div_fn(rem, dim_size)
+    coords.reverse()
+    return coords
+
+  block_vol = math.prod(sfc_block_sizes)
+  outer_idx = div_fn(idx, block_vol)
+  inner_idx = rem_fn(idx, block_vol)
+  outer_shape = tuple(
+      dim // block for dim, block in zip(latent_shape, sfc_block_sizes)
+  )
+  outer_coords = []
+  rem_outer = outer_idx
+  for i, dim_size in enumerate(reversed(outer_shape)):
+    outer_coords.append(
+        rem_outer if i == ndim - 1 else rem_fn(rem_outer, dim_size)
+    )
+    if i < ndim - 1:
+      rem_outer = div_fn(rem_outer, dim_size)
+  outer_coords.reverse()
+
+  inner_coords = []
+  rem_inner = inner_idx
+  for i, b_size in enumerate(reversed(sfc_block_sizes)):
+    inner_coords.append(
+        rem_inner if i == ndim - 1 else rem_fn(rem_inner, b_size)
+    )
+    if i < ndim - 1:
+      rem_inner = div_fn(rem_inner, b_size)
+  inner_coords.reverse()
+
+  return [
+      outer_c * block_size + inner_c
+      for outer_c, inner_c, block_size in zip(
+          outer_coords, inner_coords, sfc_block_sizes
+      )
+  ]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Local3DConfig:
+  """Configuration for analytical 3D/nD local window attention masking."""
+
+  latent_shape: tuple[int, ...]
+  window_sizes: tuple[tuple[int, int], ...]
+  q_seq_len: int
+  kv_seq_len: int
+  sfc_block_sizes: tuple[int, ...] | None = None
+  attend_over_conditioning: bool = False
+
+  def as_bool_mask(
+      self, q_indices: jax.Array, k_indices: jax.Array
+  ) -> jax.Array:
+    """Computes the boolean 3D local mask for given q_indices and k_indices."""
+    q_coords = unravel_3d_coords(
+        q_indices, self.latent_shape, self.sfc_block_sizes
+    )
+    k_coords = unravel_3d_coords(
+        k_indices, self.latent_shape, self.sfc_block_sizes
+    )
+    mask = None
+    for qc, kc, (left_w, right_w) in zip(q_coords, k_coords, self.window_sizes):
+      in_dim = (kc >= qc - left_w) & (kc <= qc + right_w)
+      mask = in_dim if mask is None else (mask & in_dim)
+    assert mask is not None
+    flat_latent_len = math.prod(self.latent_shape)
+    if self.q_seq_len > flat_latent_len or self.kv_seq_len > flat_latent_len:
+      is_q_cond = q_indices >= flat_latent_len
+      is_k_cond = k_indices >= flat_latent_len
+      if self.attend_over_conditioning:
+        mask = mask | is_q_cond | is_k_cond
+      else:
+        mask = (mask & ~is_q_cond & ~is_k_cond) | (is_q_cond & is_k_cond)
+    return mask
 
 
 @jax.tree_util.register_dataclass
@@ -106,6 +198,9 @@ class Mask:
   k_start: Int[Array, "*#B #h #T"] | None = None
   k_end: Int[Array, "*#B #h #T"] | None = None
   is_causal: bool = dataclasses.field(default=False, metadata=dict(static=True))
+  local_3d_config: Local3DConfig | Any = dataclasses.field(
+      default=None, metadata=dict(static=True)
+  )
 
   def as_array(
       self,
@@ -133,6 +228,9 @@ class Mask:
       _ = jnp.broadcast_shapes(
           q_indices.shape, k_indices.shape, self.bool_mask.shape
       )
+
+    if self.local_3d_config is not None:
+      mask.append(self.local_3d_config.as_bool_mask(q_indices, k_indices))
 
     if self.q_start is not None:
       mask.append(q_indices >= self.q_start[..., None, :])
@@ -167,6 +265,7 @@ class Mask:
         or self.q_end is not None
         or self.k_start is not None
         or self.k_end is not None
+        or self.local_3d_config is not None
     )
 
   def __and__(self, other: "Bool[Array, '*#B #H #T #t'] | Mask") -> "Mask":
@@ -177,6 +276,13 @@ class Mask:
     def combine(fn):
       return lambda a, b: b if a is None else a if b is None else fn(a, b)
 
+    if (
+        self.local_3d_config is not None
+        and other.local_3d_config is not None
+        and self.local_3d_config != other.local_3d_config
+    ):
+      raise ValueError("Cannot combine two different Local3DConfigs.")
+
     return Mask(
         bool_mask=combine(jnp.logical_and)(self.bool_mask, other.bool_mask),
         q_start=combine(jnp.maximum)(self.q_start, other.q_start),
@@ -184,6 +290,7 @@ class Mask:
         k_start=combine(jnp.maximum)(self.k_start, other.k_start),
         k_end=combine(jnp.minimum)(self.k_end, other.k_end),
         is_causal=self.is_causal or other.is_causal,
+        local_3d_config=self.local_3d_config or other.local_3d_config,
     )
 
 

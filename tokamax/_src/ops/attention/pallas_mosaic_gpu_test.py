@@ -14,6 +14,7 @@
 # ==============================================================================
 import dataclasses
 import functools
+import math
 from types import UnionType  # pylint: disable=g-importing-member
 from typing import Union, cast, get_origin, override
 from unittest import mock
@@ -243,6 +244,62 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         super()._test_vmap(vmap_in_axes)
     else:
       super()._test_vmap(vmap_in_axes)
+
+  @parameterized.parameters(
+      dict(
+          latent_shape=(4, 16, 16), per_query_k_end=False, sfc_block_sizes=None
+      ),
+      dict(
+          latent_shape=(2, 23, 40), per_query_k_end=False, sfc_block_sizes=None
+      ),
+      dict(
+          latent_shape=(2, 23, 40), per_query_k_end=True, sfc_block_sizes=None
+      ),
+      dict(
+          latent_shape=(2, 40, 23), per_query_k_end=True, sfc_block_sizes=None
+      ),
+      dict(
+          latent_shape=(4, 23, 40),
+          per_query_k_end=True,
+          sfc_block_sizes=(1, 23, 1),
+      ),
+      dict(
+          latent_shape=(4, 24, 40),
+          per_query_k_end=True,
+          sfc_block_sizes=(4, 6, 1),
+      ),
+      dict(
+          latent_shape=(10, 16, 20),
+          per_query_k_end=True,
+          sfc_block_sizes=(10, 8, 1),
+      ),
+  )
+  def test_local_3d_config(
+      self, latent_shape, per_query_k_end, sfc_block_sizes
+  ):
+    if not gpu_utils.is_sm90():
+      self.skipTest("Analytical 3D local attention is only supported on SM90.")
+    seq_len = math.prod(latent_shape)
+    cfg = base.Local3DConfig(
+        latent_shape=latent_shape,
+        window_sizes=((2, 2), (6, 6), (6, 6)),
+        q_seq_len=seq_len,
+        kv_seq_len=seq_len,
+        sfc_block_sizes=sfc_block_sizes,
+    )
+    k_end = (
+        jnp.full((1, 1, seq_len), seq_len, dtype=jnp.int32)
+        if per_query_k_end
+        else None
+    )
+    mask = base.Mask(local_3d_config=cfg, k_end=k_end)
+    self._run_test(
+        (1, seq_len, 4, 128),
+        impl_kwargs=dict(mask=mask),
+        ref_kwargs=dict(mask=mask.as_array(seq_len, seq_len)),
+        test_vjp=False,
+        atol=0.015,
+    )
 
 
 # TODO: Add manual partitioning test.

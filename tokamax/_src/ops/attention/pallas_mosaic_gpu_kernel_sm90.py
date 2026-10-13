@@ -210,6 +210,7 @@ def flash_attention_kernel(
     use_stable_softmax: bool,
     rescale_threshold: float,
     config: Config,
+    local_3d_config: base.Local3DConfig | None = None,
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Flash attention with Mosaic GPU."""
 
@@ -274,6 +275,8 @@ def flash_attention_kernel(
           k_end_gmem,
           k_start_minmax_gmems,
           k_end_minmax_gmems,
+          kv_tiles_gmem,
+          num_kv_tiles_gmem,
           o_gmem,
           *residual_gmems,
       ) = gmems
@@ -303,6 +306,10 @@ def flash_attention_kernel(
         else:
           k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_gmems)
           ub = lax.min(ub, pl.cdiv(k_end_max, block_kv))
+
+        if num_kv_tiles_gmem is not None:
+          ub = jnp.where(ub > lb, num_kv_tiles_gmem[qi], 0)
+          lb = 0
 
         return lb, ub, k_start_max, k_end_min
 
@@ -358,6 +365,14 @@ def flash_attention_kernel(
         k_start = None if k_start_gmem is None else load_k_range(k_start_gmem)
         k_end = None if k_end_gmem is None else load_k_range(k_end_gmem)
         lb, ub, k_start_max, k_end_min = get_kv_ranges()
+        q_iota_1d = lambda: plgpu.broadcasted_iota(
+            jnp.int32, (block_q,), dimension=0, layout=_WGMMA_ROW
+        )
+        compute_3d_mask = None
+        if local_3d_config is not None:
+          compute_3d_mask = common.make_3d_mask_fn(
+              q_base, q_iota_1d, iota, (block_q, block_kv), local_3d_config
+          )
 
         def await_k():
           @pl.when(ub > lb)
@@ -380,7 +395,8 @@ def flash_attention_kernel(
         def kv_loop(ki, carry, *, do_causal=False):
           acc, m_scale, m_i, l_i = carry
           si = lax.rem(prev_iters + ki - lb, num_stages)
-          k_base = ki * block_kv
+          actual_ki = ki if kv_tiles_gmem is None else kv_tiles_gmem[qi, ki]
+          k_base = actual_ki * block_kv
           ks = cast(pl.Slice, pl.ds(k_base, block_kv))
 
           def compute_qk(acc):
@@ -409,6 +425,9 @@ def flash_attention_kernel(
 
           if mask is not None:
             s = jnp.where(mask, s, -jnp.inf)
+
+          if compute_3d_mask is not None:
+            s = compute_3d_mask(s, k_base)
 
           bcast = lambda x, tgt=s: lax.broadcast_in_dim(x, tgt.shape, [0])
 
@@ -443,7 +462,9 @@ def flash_attention_kernel(
           scale *= math.log2(math.e)
           if use_stable_softmax:
             m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
-            m_valid = (mask is None and not has_k_range) | (m_i != -jnp.inf)
+            m_valid = (
+                mask is None and compute_3d_mask is None and not has_k_range
+            ) | (m_i != -jnp.inf)
             alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
             threshold_is_1 = rescale_threshold == 1.0
             needs_rescale = alpha < rescale_threshold
@@ -508,7 +529,9 @@ def flash_attention_kernel(
           else:
             schedule_barrier_arrive()
 
-        m_valid = (mask is None and not has_k_range) | (m_i != -jnp.inf)
+        m_valid = (
+            mask is None and compute_3d_mask is None and not has_k_range
+        ) | (m_i != -jnp.inf)
         alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
 
         if return_residuals:
@@ -581,7 +604,8 @@ def flash_attention_kernel(
             @pl.loop(lb, ub)
             def kv_loop(ki):
               si = lax.rem(prev_iters + ki - lb, num_stages)
-              ks = block.ds(ki, block_kv)
+              actual_ki = ki if kv_tiles_gmem is None else kv_tiles_gmem[qi, ki]
+              ks = block.ds(actual_ki, block_kv)
               mgpu_lib.bar_sync(k_consumed_barrier + si, num_threads=288)
               cp(k_gmem.at[ks, hi_kv], k_smem, k_bias_produced, si)
               if bias_gmem_ is not None:
@@ -616,10 +640,10 @@ def flash_attention_kernel(
   elif k_start.shape[-1] == 1:
     k_start_minmax = (k_start, k_start)
   else:
-    k_start_ = shape_lib.pad_to_next_multiple_of(
+    k_start = shape_lib.pad_to_next_multiple_of(
         k_start, 2 * block_q, -1, kv_seq_len
     )
-    k_start_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_start_)
+    k_start_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_start)
     k_start_minmax = (jnp.min(k_start_, -1), jnp.max(k_start_, -1))
 
   if k_end is None:
@@ -627,9 +651,21 @@ def flash_attention_kernel(
   elif k_end.shape[-1] == 1:
     k_end_minmax = (k_end, k_end)
   else:
-    k_end_ = shape_lib.pad_to_next_multiple_of(k_end, 2 * block_q, -1, 0)
-    k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end_)
+    k_end = shape_lib.pad_to_next_multiple_of(k_end, 2 * block_q, -1, 0)
+    k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end)
     k_end_minmax = (jnp.min(k_end_, -1), jnp.max(k_end_, -1))
+
+  if local_3d_config is not None:
+    kv_tiles, num_kv_tiles = common.build_3d_kv_tile_schedule(
+        local_3d_config,
+        q_seq_len=q_seq_len,
+        kv_seq_len=kv_seq_len,
+        q_tile_size=2 * block_q,
+        block_kv=block_kv,
+    )
+  else:
+    kv_tiles = None
+    num_kv_tiles = None
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:
@@ -659,7 +695,19 @@ def flash_attention_kernel(
           reduction_scratch_bytes=0,
       ),
       kernel_name="flash_attention_sm90",
-  )(q, k, v, bias, mask, k_start, k_end, k_start_minmax, k_end_minmax)
+  )(
+      q,
+      k,
+      v,
+      bias,
+      mask,
+      k_start,
+      k_end,
+      k_start_minmax,
+      k_end_minmax,
+      kv_tiles,
+      num_kv_tiles,
+  )
 
   out = out[:orig_q_seq_len, ...]
   residuals = tuple(res[..., :orig_q_seq_len] for res in residuals)
