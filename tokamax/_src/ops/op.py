@@ -238,7 +238,12 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       # Serialize args into the HLO to allow for, e.g., offline autotuning.
       json_op = self.replace(config=config, vjp=None)
       json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
-      json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
+      try:
+        json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
+      except Exception:  # pylint: disable=broad-exception-caught
+        # Abstract/symbolic arguments seen while tracing a model for export
+        # may not be serializable; the metadata is best-effort.
+        json_data = "{}"
 
       with _tokamax_metadata(json_data):
         if fwd_res and self.vjp is None and batched_args is not None:
@@ -559,13 +564,17 @@ class BoundArguments[C, K: Hashable]:
       return self.op.get_autotuning_cache(device_kind)[key]
     except KeyError:
       key = cast(Mapping[str, Any], key)
-      json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
+      try:
+        json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
+        key_str = str(json_key_bytes, "utf-8")
+      except Exception:  # pylint: disable=broad-exception-caught
+        key_str = str(key)  # Best-effort: key may not be serializable.
 
       logging.warning(
           "Autotuning cache miss for %s on %s with key %s",
           self.op,
           device_kind,
-          str(json_key_bytes, "utf-8"),
+          key_str,
       )
       return None
 
