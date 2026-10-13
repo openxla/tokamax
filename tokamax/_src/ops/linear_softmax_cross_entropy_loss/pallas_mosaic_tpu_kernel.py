@@ -1586,6 +1586,10 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
       v_block_size=v_block_size,
   )
 
+  if preferred_element_type is None:
+    preferred_element_type = jnp.dtype(jnp.float32)  # pyrefly: ignore[bad-assignment]
+  lse = lse.astype(preferred_element_type)
+
   if x.dtype == jnp.float16:
     x = x.astype(preferred_element_type)
   if w.dtype == jnp.float16:

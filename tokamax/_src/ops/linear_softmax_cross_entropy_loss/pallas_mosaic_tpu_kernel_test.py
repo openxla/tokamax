@@ -14,11 +14,12 @@
 # ==============================================================================
 
 import math
+from typing import Any
 from unittest import mock
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src import numerics
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu
@@ -1360,6 +1361,591 @@ class InputOutputBufferCountTest(parameterized.TestCase):
           kernel._input_output_buffer_count(requested, revisit_distance),
           expected,
       )
+
+
+class AutotuningCandidateConfigsTest(parameterized.TestCase):
+  """Tests that `_get_autotuning_configs` generates valid candidate search spaces.
+
+  Note: This does NOT test or assert an autotuned "best" config (which is an
+  empirical result that can vary across tuning runs, JAX/Pallas releases, or
+  hardware platforms). Instead, it unit tests the candidate generation and
+  pruning logic to ensure that every candidate configuration admitted into the
+  autotuner search space satisfies hardware feasibility invariants:
+    1. VMEM capacity: Candidate block sizes fit within hardware VMEM limits
+       (calculated via `_calculate_{fwd,bwd}_vmem_bytes`), preventing compiler
+       VMEM OOM crashes during fleet-scale autotuning sweeps.
+    2. Multi-core partitioning: The number of vocabulary blocks divides evenly
+       across cores when >= max_cores, avoiding idle cores or sequencer hangs.
+    3. Pipeline safety (bwd): Excludes `ceil(h_dim / h_block_size) == 2` to
+       avoid the synchronous `(in, 1)` output-buffer fallback in
+       `emit_pipeline`.
+  """
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    super().setUp()
+
+  def test_get_autotuning_configs_fwd(self):
+    op = pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss()
+    x = jnp.zeros((4096, 4096), dtype=jnp.bfloat16)
+    labels = jnp.zeros((4096,), dtype=jnp.int32)
+    w = jnp.zeros((4096, 119548), dtype=jnp.bfloat16)
+    ba = op.bind(x=x, labels=labels, w=w, reduction="sum")
+    configs = op._get_autotuning_configs(ba)
+    self.assertNotEmpty(configs)
+
+    vmem_limit_bytes = kernel._get_vmem_limit_bytes()
+    max_cores = pltpu.get_tpu_info().num_cores
+
+    for config in configs:
+      # 1. VMEM capacity check
+      vmem_used = kernel._calculate_fwd_vmem_bytes(
+          config.b_block_size,
+          config.h_block_size,
+          config.v_block_size,
+          dtype=x.dtype,
+      )
+      self.assertLessEqual(vmem_used, vmem_limit_bytes)
+
+      # 2. Multi-core partitioning compatibility check
+      num_v_blocks = math.ceil(119548 / config.v_block_size)
+      if max_cores > 1 and num_v_blocks >= max_cores:
+        self.assertEqual(num_v_blocks % max_cores, 0)
+
+  @parameterized.named_parameters(
+      ("h_dim_512", 512),
+      ("h_dim_1024", 1024),
+      ("h_dim_4096", 4096),
+  )
+  def test_get_autotuning_configs_bwd(self, h_dim: int):
+    op_vjp = pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp()
+    x = jnp.zeros((4096, h_dim), dtype=jnp.bfloat16)
+    labels = jnp.zeros((4096,), dtype=jnp.int32)
+    w = jnp.zeros((h_dim, 119548), dtype=jnp.bfloat16)
+    lse = jnp.zeros((4096,), dtype=jnp.float32)
+    dout = jnp.zeros((), dtype=jnp.float32)
+    out = jnp.zeros((), dtype=jnp.float32)
+    ba = op_vjp.bind(
+        residuals=(lse,),
+        out=out,
+        dout=dout,
+        x=x,
+        labels=labels,
+        w=w,
+        reduction="sum",
+        return_residuals=False,
+    )
+    configs = op_vjp._get_autotuning_configs(ba)
+    self.assertNotEmpty(configs)
+
+    vmem_limit_bytes = kernel._get_vmem_limit_bytes()
+    max_cores = pltpu.get_tpu_info().num_cores
+
+    for config in configs:
+      # 1. VMEM capacity check
+      vmem_used = kernel._calculate_bwd_vmem_bytes(
+          b_block_size=config.b_block_size,
+          h_block_size=config.h_block_size,
+          v_block_size=config.v_block_size,
+          dtype=x.dtype,
+          buffer_count=config.buffer_count,
+      )
+      self.assertLessEqual(vmem_used, vmem_limit_bytes)
+
+      # 2. Multi-core partitioning compatibility check
+      num_v_blocks = math.ceil(119548 / config.v_block_size)
+      if max_cores > 1 and num_v_blocks >= max_cores:
+        self.assertEqual(num_v_blocks % max_cores, 0)
+
+      # 3. Synchronous (2, 1) output fallback avoidance check
+      self.assertNotEqual(math.ceil(h_dim / config.h_block_size), 2)
+
+
+_NON_ALIGNED_VOCAB_CONFIGS = (
+    ("heuristic", (2, 2)),
+    (5504, (2, 2)),
+    (6144, (2, 2)),
+    (4096, (2, 2)),
+    (4096, (3, 3)),
+)
+
+_NON_ALIGNED_VOCAB_DTYPES = (
+    ("bf16_bf16", jnp.bfloat16, jnp.bfloat16),
+    ("f32_bf16", jnp.float32, jnp.bfloat16),
+)
+
+_NON_ALIGNED_VOCAB_SCENARIOS = (
+    "random_normal",
+    "padded_batch_realistic",
+    "all_masked",
+    "large_magnitude_logits",
+    "nan_in_x",
+)
+
+_NON_ALIGNED_VOCAB_B4096_CONFIGS = (
+    (
+        "f32_f32_candidate_config_b2048_v2048_buf3_2",
+        jnp.float32,
+        jnp.float32,
+        2048,
+        256,
+        2048,
+        (3, 2),
+    ),
+    (
+        "f32_f32_heuristic",
+        jnp.float32,
+        jnp.float32,
+        None,
+        None,
+        "heuristic",
+        (2, 2),
+    ),
+    (
+        "f32_f32_b1024_v5504_buf2_2",
+        jnp.float32,
+        jnp.float32,
+        1024,
+        256,
+        5504,
+        (2, 2),
+    ),
+    (
+        "f32_bf16_candidate_config_b1024_v5504_buf2_2",
+        jnp.float32,
+        jnp.bfloat16,
+        1024,
+        256,
+        5504,
+        (2, 2),
+    ),
+    (
+        "bf16_bf16_candidate_config_b1024_v6144_buf2_2",
+        jnp.bfloat16,
+        jnp.bfloat16,
+        1024,
+        256,
+        6144,
+        (2, 2),
+    ),
+    (
+        "bf16_f32_candidate_config_b2048_v2048_buf2_3",
+        jnp.bfloat16,
+        jnp.float32,
+        2048,
+        256,
+        2048,
+        (2, 3),
+    ),
+)
+
+
+def _generate_non_aligned_vocab_test_cases() -> list[dict[str, Any]]:
+  cases = []
+  for dtype_name, x_dtype, w_dtype in _NON_ALIGNED_VOCAB_DTYPES:
+    for v_block_size, buffer_count in _NON_ALIGNED_VOCAB_CONFIGS:
+      name = (
+          f"{dtype_name}_v_{v_block_size}_buf_"
+          f"{buffer_count[0]}_{buffer_count[1]}"
+      )
+      cases.append(
+          dict(
+              testcase_name=name,
+              x_dtype=x_dtype,
+              w_dtype=w_dtype,
+              v_block_size=v_block_size,
+              buffer_count=buffer_count,
+          )
+      )
+  return cases
+
+
+def _generate_non_aligned_vocab_b4096_test_cases() -> list[dict[str, Any]]:
+  cases = []
+  for (
+      name_suffix,
+      x_dtype,
+      w_dtype,
+      b_block_size,
+      h_block_size,
+      v_block_size,
+      buffer_count,
+  ) in _NON_ALIGNED_VOCAB_B4096_CONFIGS:
+    cases.append(
+        dict(
+            testcase_name=name_suffix,
+            x_dtype=x_dtype,
+            w_dtype=w_dtype,
+            b_block_size=b_block_size,
+            h_block_size=h_block_size,
+            v_block_size=v_block_size,
+            buffer_count=buffer_count,
+        )
+    )
+  return cases
+
+
+class NonAlignedVocabBwdTest(parameterized.TestCase):
+  """Tests the backward kernel at large non-aligned vocabulary shapes.
+
+  Uses V=119548, which is not divisible by the tested `v_block_size` values or
+  by 128, so the final vocabulary block is partial and must be tail-masked.
+  """
+
+  def setUp(self) -> None:
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    super().setUp()
+
+  def _assert_allclose(
+      self,
+      actual: jax.Array,
+      expected: jax.Array,
+      atol: float = 1e-4,
+      rtol: float = 1e-4,
+      name: str = "",
+  ) -> None:
+    """Asserts that two arrays are close, printing detailed diagnostic info on failure."""
+    abs_err = jnp.abs(actual - expected)
+    max_abs_err = float(jnp.max(abs_err))
+    max_rel_err = float(jnp.max(abs_err / (jnp.abs(expected) + 1e-7)))
+    mismatched = abs_err > (atol + rtol * jnp.abs(expected))
+    mismatch_count = int(jnp.sum(mismatched))
+    total_elements = actual.size
+
+    diag = ""
+    if mismatch_count > 0:
+      if actual.ndim == 0:
+        first_idx: tuple[int, ...] = ()
+      else:
+        first_idx = tuple(int(x[0]) for x in jnp.where(mismatched))
+      diag = (
+          f"\n[{name}] NUMERICAL MISMATCH:\n"
+          f"  Shape: {actual.shape}, Dtype: {actual.dtype}\n"
+          f"  Max Absolute Error: {max_abs_err:.6e}  (tolerance atol={atol})\n"
+          f"  Max Relative Error: {max_rel_err:.6e}  (tolerance rtol={rtol})\n"
+          f"  Mismatched Elements: {mismatch_count} / {total_elements} "
+          f"({100.0 * mismatch_count / total_elements:.2f}%)\n"
+          f"  First mismatch at index {first_idx}:\n"
+          f"    Actual (Kernel):   {actual[first_idx]}\n"
+          f"    Expected (Ref):    {expected[first_idx]}\n"
+          f"    Absolute Diff:     {abs_err[first_idx]}\n"
+      )
+
+    self.assertEqual(
+        mismatch_count,
+        0,
+        msg=diag
+        or f"[{name}] arrays are not close within atol={atol}, rtol={rtol}",
+    )
+
+  def _generate_inputs(
+      self,
+      scenario: str,
+      x_dtype: jnp.dtype,
+      w_dtype: jnp.dtype,
+      rng_key: jax.Array,
+      b: int = 1024,
+  ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    h, v = 256, 119548
+    k1, k2, k3, k4 = jax.random.split(rng_key, 4)
+    x = jax.random.normal(k1, (b, h), dtype=x_dtype)
+    w = jax.random.normal(k2, (h, v), dtype=w_dtype) / math.sqrt(h)
+    labels = jax.random.randint(k3, (b,), minval=0, maxval=v, dtype=jnp.int32)
+    dout = jax.random.normal(k4, (b,), dtype=jnp.float32)
+
+    if scenario == "random_normal":
+      pass
+    elif scenario == "padded_batch_realistic":
+      # ~50% masked rows simulating padded sequence batches:
+      valid_mask = jnp.arange(b) % 2 == 0
+      x = jnp.where(valid_mask[:, None], x, jnp.zeros_like(x))
+      tail_labels = jnp.array([v - 1, v - 2, v - 100, v - 500], dtype=jnp.int32)
+      valid_indices = jnp.array([0, 2, 4, 6], dtype=jnp.int32)
+      labels = labels.at[valid_indices].set(tail_labels)
+      labels = jnp.where(valid_mask, labels, 0)
+      dout = jnp.where(valid_mask, dout, 0.0)
+    elif scenario == "all_masked":
+      x = jnp.zeros((b, h), dtype=x_dtype)
+      labels = jnp.zeros((b,), dtype=jnp.int32)
+      dout = jnp.zeros((b,), dtype=jnp.float32)
+    elif scenario == "large_magnitude_logits":
+      x = x * 1000.0
+    elif scenario == "nan_in_x":
+      nan_indices = jnp.array([0, 5, 42])
+      x = x.at[nan_indices].set(jnp.nan)
+    else:
+      raise ValueError(f"Unknown scenario: {scenario}")
+
+    return x, labels, w, dout
+
+  def test_heuristic_bwd_config_non_aligned_vocab(self) -> None:
+    cfg_bf16 = kernel.get_heuristic_bwd_config(
+        1024,
+        256,
+        119548,
+        dtype=jnp.dtype(jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+    )
+    cfg_f32 = kernel.get_heuristic_bwd_config(
+        1024,
+        256,
+        119548,
+        dtype=jnp.dtype(jnp.float32),  # pyrefly: ignore[bad-argument-type]
+    )
+    self.assertEqual(cfg_bf16.b_block_size, 1024)
+    self.assertEqual(cfg_bf16.h_block_size, 256)
+    self.assertEqual(cfg_f32.b_block_size, 1024)
+    self.assertEqual(cfg_f32.h_block_size, 256)
+
+    cfg_b4096_f32 = kernel.get_heuristic_bwd_config(
+        4096,
+        256,
+        119548,
+        dtype=jnp.dtype(jnp.float32),  # pyrefly: ignore[bad-argument-type]
+    )
+    self.assertEqual(cfg_b4096_f32.b_block_size, 1024)
+    self.assertEqual(cfg_b4096_f32.h_block_size, 256)
+
+  def _run_non_aligned_vocab_bwd_test(
+      self,
+      b_dim: int,
+      x_dtype: jnp.dtype,
+      w_dtype: jnp.dtype,
+      resolved_config: kernel.Config,
+  ) -> None:
+    _skip_if_partial_blocks_on_old_jax(
+        self,
+        b_dim=b_dim,
+        h_dim=256,
+        v_dim=119548,
+        b_block_size=resolved_config.b_block_size,
+        h_block_size=resolved_config.h_block_size,
+        v_block_size=resolved_config.v_block_size,
+    )
+    rng_key = jax.random.key(42)
+    op = pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
+        config=resolved_config
+    )
+
+    for scenario in _NON_ALIGNED_VOCAB_SCENARIOS:
+      x, labels, w, dout = self._generate_inputs(
+          scenario, x_dtype, w_dtype, rng_key, b=b_dim
+      )
+
+      # Reference in f32
+      x_f32 = x.astype(jnp.float32)
+      w_f32 = w.astype(jnp.float32)
+      dout_f32 = dout.astype(jnp.float32)
+
+      ref_loss, ref_lse = (
+          reference.linear_softmax_cross_entropy_loss_fwd_reference(
+              x_f32, labels, w_f32, reduction="none"
+          )
+      )
+      ref_dx, ref_dw = (
+          reference.linear_softmax_cross_entropy_loss_bwd_reference(
+              dout_f32, ref_lse, x_f32, labels, w_f32, reduction="none"
+          )
+      )
+
+      try:
+        # Kernel forward
+        k_loss, k_lse = (
+            kernel.linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
+                x,
+                labels,
+                w,
+                b_block_size=resolved_config.b_block_size,
+                h_block_size=resolved_config.h_block_size,
+                v_block_size=resolved_config.v_block_size,
+                reduction="none",
+            )
+        )
+
+        # Kernel direct backward
+        k_dx, k_dw = (
+            kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+                dout,
+                k_lse,
+                x,
+                labels,
+                w,
+                reduction="none",
+                b_block_size=resolved_config.b_block_size,
+                h_block_size=resolved_config.h_block_size,
+                v_block_size=resolved_config.v_block_size,
+                buffer_count=resolved_config.buffer_count,
+            )
+        )
+
+        loss_vjp = dx_vjp = dw_vjp = None
+        if scenario == "random_normal":
+          # Kernel via Op VJP (verified once per config to avoid duplicate
+          # XLA compilations across input scenarios)
+          def fwd_fn(_x: jax.Array, _w: jax.Array) -> jax.Array:
+            return op(_x, labels, _w, reduction="none")
+
+          loss_vjp, vjp_fn = jax.vjp(fwd_fn, x, w)
+          dx_vjp, dw_vjp = vjp_fn(dout)
+      except Exception as e:
+        if "Ran out of memory in memory space vmem" in str(e):
+          self.skipTest(
+              f"Config {resolved_config} exceeds hardware VMEM on this"
+              f" platform: {e}"
+          )
+        raise
+
+      with self.subTest(scenario=scenario):
+        # Consistency check between VJP and direct kernel call
+        if scenario == "random_normal":
+          assert (
+              loss_vjp is not None and dx_vjp is not None and dw_vjp is not None
+          )
+          self._assert_allclose(
+              loss_vjp, k_loss, atol=1e-4, rtol=1e-4, name="loss_vjp_vs_direct"
+          )
+          self._assert_allclose(
+              dx_vjp, k_dx, atol=1e-4, rtol=1e-4, name="dx_vjp_vs_direct"
+          )
+          self._assert_allclose(
+              dw_vjp, k_dw, atol=1e-4, rtol=1e-4, name="dw_vjp_vs_direct"
+          )
+
+        if scenario == "nan_in_x":
+          nan_indices = jnp.array([0, 5, 42])
+          non_nan_mask = jnp.ones(b_dim, dtype=bool).at[nan_indices].set(False)
+
+          # Check finiteness on non-NaN rows
+          self.assertTrue(
+              bool(jnp.all(jnp.isfinite(k_loss[non_nan_mask]))),
+              msg="Kernel loss has NaNs in non-NaN rows",
+          )
+          self.assertTrue(
+              bool(jnp.all(jnp.isfinite(k_lse[non_nan_mask]))),
+              msg="Kernel lse has NaNs in non-NaN rows",
+          )
+          self.assertTrue(
+              bool(jnp.all(jnp.isfinite(k_dx[non_nan_mask]))),
+              msg="Kernel dx has NaNs in non-NaN rows",
+          )
+
+          # Assert non-NaN rows of dx match reference
+          self._assert_allclose(
+              k_dx[non_nan_mask],
+              ref_dx[non_nan_mask],
+              atol=1e-1,
+              rtol=1e-1,
+              name="nan_in_x_dx_valid_rows",
+          )
+        else:
+          # Assert finiteness where reference is finite
+          self.assertTrue(
+              bool(jnp.all(jnp.isfinite(k_loss))),
+              msg=f"Non-finite values in kernel loss for {scenario}",
+          )
+          self.assertTrue(
+              bool(jnp.all(jnp.isfinite(k_lse))),
+              msg=f"Non-finite values in kernel lse for {scenario}",
+          )
+          self.assertTrue(
+              bool(jnp.all(jnp.isfinite(k_dx))),
+              msg=f"Non-finite values in kernel dx for {scenario}",
+          )
+          self.assertTrue(
+              bool(jnp.all(jnp.isfinite(k_dw))),
+              msg=f"Non-finite values in kernel dw for {scenario}",
+          )
+
+          if scenario == "all_masked":
+            tol = 1e-4
+            dw_tol = 1e-4
+          elif scenario == "large_magnitude_logits":
+            tol = 2e-1
+            dw_tol = 2e-1
+          elif x_dtype == jnp.float32:
+            tol = 1e-4
+            dw_tol = 2e-4  # Headroom for B=1024/4096 dot_general reduction
+          else:
+            tol = 5e-2
+            dw_tol = 5e-2
+
+          self._assert_allclose(
+              k_loss, ref_loss, atol=tol, rtol=tol, name=f"{scenario}_loss"
+          )
+          self._assert_allclose(
+              k_dx, ref_dx, atol=tol, rtol=tol, name=f"{scenario}_dx"
+          )
+          self._assert_allclose(
+              k_dw, ref_dw, atol=dw_tol, rtol=dw_tol, name=f"{scenario}_dw"
+          )
+
+  @parameterized.named_parameters(*_generate_non_aligned_vocab_test_cases())
+  def test_non_aligned_vocab_bwd(
+      self,
+      x_dtype: jnp.dtype,
+      w_dtype: jnp.dtype,
+      v_block_size: int | str,
+      buffer_count: tuple[int, int],
+  ) -> None:
+    b_dim, h_dim, v_dim = 1024, 256, 119548
+    if v_block_size == "heuristic":
+      resolved_config = kernel.get_heuristic_bwd_config(
+          b_dim=b_dim,
+          h_dim=h_dim,
+          v_dim=v_dim,
+          dtype=jnp.dtype(x_dtype),  # pyrefly: ignore[bad-argument-type]
+          buffer_count=buffer_count,
+      )
+    else:
+      resolved_config = kernel.Config(
+          b_block_size=1024,
+          h_block_size=256,
+          v_block_size=int(v_block_size),
+          buffer_count=buffer_count,
+      )
+    self._run_non_aligned_vocab_bwd_test(
+        b_dim=b_dim,
+        x_dtype=x_dtype,
+        w_dtype=w_dtype,
+        resolved_config=resolved_config,
+    )
+
+  @parameterized.named_parameters(
+      *_generate_non_aligned_vocab_b4096_test_cases()
+  )
+  def test_non_aligned_vocab_bwd_b4096(
+      self,
+      x_dtype: jnp.dtype,
+      w_dtype: jnp.dtype,
+      b_block_size: int | None,
+      h_block_size: int | None,
+      v_block_size: int | str,
+      buffer_count: tuple[int, int],
+  ) -> None:
+    b_dim, h_dim, v_dim = 4096, 256, 119548
+    if v_block_size == "heuristic":
+      resolved_config = kernel.get_heuristic_bwd_config(
+          b_dim=b_dim,
+          h_dim=h_dim,
+          v_dim=v_dim,
+          dtype=jnp.dtype(x_dtype),  # pyrefly: ignore[bad-argument-type]
+          buffer_count=buffer_count,
+      )
+    else:
+      assert b_block_size is not None and h_block_size is not None
+      resolved_config = kernel.Config(
+          b_block_size=b_block_size,
+          h_block_size=h_block_size,
+          v_block_size=int(v_block_size),
+          buffer_count=buffer_count,
+      )
+    self._run_non_aligned_vocab_bwd_test(
+        b_dim=b_dim,
+        x_dtype=x_dtype,
+        w_dtype=w_dtype,
+        resolved_config=resolved_config,
+    )
 
 
 if __name__ == "__main__":

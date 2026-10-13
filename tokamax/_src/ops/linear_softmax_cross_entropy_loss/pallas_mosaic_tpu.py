@@ -17,6 +17,7 @@
 
 import dataclasses
 import itertools
+import math
 from typing import ClassVar, Literal, override
 
 import jax
@@ -130,16 +131,46 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
         + [128 * 2**i for i in range(6) if 128 * 2**i < v_dim]
     )
 
-    return set(
-        Config(
-            b_block_size=b_block_size,
-            h_block_size=h_block_size,
-            v_block_size=v_block_size,
-        )
-        for b_block_size, h_block_size, v_block_size in itertools.product(
-            b_block_size_range, h_block_size_range, v_block_size_range
-        )
-    )
+    vmem_limit_bytes = kernel._get_vmem_limit_bytes()
+    max_cores = pltpu.get_tpu_info().num_cores
+
+    configs = set()
+    for b_block_size, h_block_size, v_block_size in itertools.product(
+        b_block_size_range, h_block_size_range, v_block_size_range
+    ):
+      num_v_blocks = math.ceil(v_dim / v_block_size)
+      if (
+          max_cores > 1
+          and num_v_blocks >= max_cores
+          and num_v_blocks % max_cores != 0
+      ):
+        continue
+      if (
+          kernel._calculate_fwd_vmem_bytes(
+              b_block_size, h_block_size, v_block_size, dtype=x.dtype
+          )
+          > vmem_limit_bytes
+      ):
+        continue
+      configs.add(
+          Config(
+              b_block_size=b_block_size,
+              h_block_size=h_block_size,
+              v_block_size=v_block_size,
+          )
+      )
+
+    if not configs:
+      configs.add(
+          kernel.get_heuristic_fwd_config(
+              b_dim,
+              h_dim,
+              v_dim,
+              dtype=x.dtype,
+              vmem_limit_bytes=vmem_limit_bytes,
+          )
+      )
+    return configs
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -236,16 +267,64 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
         + [128 * 2**i for i in range(6) if 128 * 2**i < v_dim]
     )
 
-    return set(
-        Config(
-            b_block_size=b_block_size,
-            h_block_size=h_block_size,
-            v_block_size=v_block_size,
-        )
-        for b_block_size, h_block_size, v_block_size in itertools.product(
-            b_block_size_range, h_block_size_range, v_block_size_range
-        )
-    )
+    buffer_count_range = [(2, 2), (2, 3), (3, 2), (3, 3)]
+
+    vmem_limit_bytes = kernel._get_vmem_limit_bytes()
+    max_cores = pltpu.get_tpu_info().num_cores
+
+    configs = set()
+    for (
+        b_block_size,
+        h_block_size,
+        v_block_size,
+        buffer_count,
+    ) in itertools.product(
+        b_block_size_range,
+        h_block_size_range,
+        v_block_size_range,
+        buffer_count_range,
+    ):
+      num_v_blocks = math.ceil(v_dim / v_block_size)
+      if (
+          max_cores > 1
+          and num_v_blocks >= max_cores
+          and num_v_blocks % max_cores != 0
+      ):
+        continue
+      if math.ceil(h_dim / h_block_size) == 2:
+        continue
+      if (
+          kernel._calculate_bwd_vmem_bytes(
+              b_block_size,
+              h_block_size,
+              v_block_size,
+              dtype=x.dtype,
+              buffer_count=buffer_count,
+          )
+          > vmem_limit_bytes
+      ):
+        continue
+      configs.add(
+          Config(
+              b_block_size=b_block_size,
+              h_block_size=h_block_size,
+              v_block_size=v_block_size,
+              buffer_count=buffer_count,
+          )
+      )
+
+    if not configs:
+      configs.add(
+          kernel.get_heuristic_bwd_config(
+              b_dim,
+              h_dim,
+              v_dim,
+              dtype=x.dtype,
+              vmem_limit_bytes=vmem_limit_bytes,
+              buffer_count=(2, 2),
+          )
+      )
+    return configs
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
