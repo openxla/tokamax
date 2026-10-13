@@ -61,6 +61,14 @@ VMEM_BUDGET_BYTES = 56 * 1024 * 1024
 SX_LANES = 128
 
 
+def fp8_matmul_supported_on(device: jax.Device) -> bool:
+  """Whether `device` is a TPU whose MXU takes `float8_e4m3fn` operands."""
+  if device.platform != "tpu":
+    return False
+  fp8 = jnp.float8_e4m3fn
+  return pltpu.get_tpu_info().is_matmul_supported(fp8, fp8)
+
+
 def pick_tile(dim: int, candidates: tuple[int, ...]) -> int:
   """Returns the first candidate that evenly divides `dim`, else a fallback.
 

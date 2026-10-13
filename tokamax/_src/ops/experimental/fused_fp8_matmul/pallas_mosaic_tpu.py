@@ -20,12 +20,11 @@ import itertools
 from typing import Annotated, ClassVar, override
 
 import jax
-from jax.experimental.pallas import tpu as pltpu
-import jax.numpy as jnp
 import pydantic
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.fused_fp8_matmul import base
 from tokamax._src.ops.experimental.fused_fp8_matmul import pallas_mosaic_tpu_kernel as kernel
+from tokamax._src.ops.experimental.fused_fp8_matmul import pallas_mosaic_tpu_vjp
 
 QArray = base.QArray
 
@@ -59,12 +58,19 @@ def get_heuristics_config(m: int, k: int, n: int) -> Config:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuFusedFp8Matmul(base.FusedFp8Matmul[Config]):
-  """Fused FP8 matmul using the Pallas Mosaic TPU forward kernel.
+  """Fused FP8 matmul using the Pallas Mosaic TPU kernels.
 
-  The backward pass currently uses the XLA reference VJP from the base class.
+  The backward pass is `pallas_mosaic_tpu_vjp.PallasMosaicTpuFusedFp8MatmulVjp`
+  unless a `vjp` is given.
   """
 
   config_cls: ClassVar[type[Config]] = Config
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(
+          self, "vjp", pallas_mosaic_tpu_vjp.PallasMosaicTpuFusedFp8MatmulVjp()
+      )
 
   @override
   def _fwd(
@@ -125,7 +131,4 @@ class PallasMosaicTpuFusedFp8Matmul(base.FusedFp8Matmul[Config]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    if device.platform != "tpu":
-      return False
-    fp8 = jnp.float8_e4m3fn
-    return pltpu.get_tpu_info().is_matmul_supported(fp8, fp8)
+    return kernel.fp8_matmul_supported_on(device)
