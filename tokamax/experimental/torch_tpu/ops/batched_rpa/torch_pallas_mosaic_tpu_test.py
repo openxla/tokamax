@@ -211,11 +211,12 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         from_autotuning_cache=False,
     )
 
+    kv_cache_expected = kv_cache.cpu().to(device)
     out, kv = op_pallas(
         queries=queries,
         keys=keys,
         values=values,
-        kv_cache=kv_cache.clone(),
+        kv_cache=kv_cache,
         kv_lens=kv_lens,
         page_indices=page_indices,
         cu_q_lens=cu_q_lens,
@@ -225,7 +226,7 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         queries=queries,
         keys=keys,
         values=values,
-        kv_cache=kv_cache.clone(),
+        kv_cache=kv_cache_expected,
         kv_lens=kv_lens,
         page_indices=page_indices,
         cu_q_lens=cu_q_lens,
@@ -313,11 +314,12 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
           distribution=distribution,
       )
 
+    kv_cache_expected = kv_cache.cpu().to(device)
     out, kv = compiled_fn(
         queries,
         keys,
         values,
-        kv_cache.clone(),
+        kv_cache,
         kv_lens,
         page_indices,
         cu_q_lens,
@@ -327,7 +329,7 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         queries=queries,
         keys=keys,
         values=values,
-        kv_cache=kv_cache.clone(),
+        kv_cache=kv_cache_expected,
         kv_lens=kv_lens,
         page_indices=page_indices,
         cu_q_lens=cu_q_lens,

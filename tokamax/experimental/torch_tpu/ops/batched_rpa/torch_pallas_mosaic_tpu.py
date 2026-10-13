@@ -28,6 +28,11 @@ import torch
 
 Config = jax_pallas_mosaic_tpu.Config
 
+# Index of `kv_cache` in `op_impl_call`'s positional arguments. The kernel
+# writes the new keys and values into the cache and returns it, so the input
+# buffer is dead on return; donating it saves a copy of the whole pool per call.
+_KV_CACHE_ARGNUM = 3
+
 
 class _PallasMosaicTpuBatchedRpa(
     torch_base._BatchedRpa[Config]  # pylint: disable=protected-access
@@ -39,6 +44,9 @@ class _PallasMosaicTpuBatchedRpa(
     self.jax_op_name = "torch_tpu_pallas_mosaic_tpu_batched_rpa"
     self.op_impl_jax = jax_pallas_mosaic_tpu.PallasTpuBatchedRpa()
     self.is_vjp = False
+    # TODO: support donate_argnames.
+    self.donate_argnums = (_KV_CACHE_ARGNUM,)
+    self.fake_impl = self._fake_impl
 
   @override
   def deconstruct_config(
@@ -140,6 +148,63 @@ class _PallasMosaicTpuBatchedRpa(
         config=kernel_config,
     )
     return out, kv_cache
+
+  def _fake_impl(
+      self,
+      queries: torch.Tensor,
+      keys: torch.Tensor,
+      values: torch.Tensor,
+      kv_cache: torch.Tensor,
+      kv_lens: torch.Tensor,
+      page_indices: torch.Tensor,
+      cu_q_lens: torch.Tensor,
+      distribution: torch.Tensor,
+      cp_rank: torch.Tensor | None = None,
+      *,
+      use_causal_mask: bool = True,
+      sm_scale: float = 1.0,
+      sliding_window: int | None = None,
+      soft_cap: float | None = None,
+      mask_value: float | None = None,
+      out_dtype: str | None = None,
+      q_scale: float | None = None,
+      k_scale: float | None = None,
+      v_scale: float | None = None,
+      chunk_prefill_size: int | None = None,
+      decode_block_sizes: tuple[int, ...] | None = None,
+      prefill_block_sizes: tuple[int, ...] | None = None,
+      vmem_limit_bytes: int | None = None,
+      debug_mode: bool = False,
+      skip_kv_update: bool = False,
+      kv_layout: (
+          jax_types.KVLayout | str
+      ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,
+      decode_query_size: int = 1,
+      cp_group_size: int | None = None,
+      attention_scope: (
+          jax_types.AttentionScope | str
+      ) = jax_types.AttentionScope.FULL,
+      return_lse: bool = False,
+      return_residuals: bool = False,
+      config: tuple[int, ...] | None = None,
+      config_kv_layout: str | None = None,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Meta shapes for the registered op.
+
+    jax_op's default fake re-exports the JAX function, which rejects a
+    `torch.SymInt` token count, and serving stacks compile once for a range of
+    batch sizes. The output is query-shaped and the cache keeps its shape.
+    """
+    if return_lse:
+      raise NotImplementedError(
+          "return_lse adds an output and is not supported through the torch"
+          " operator."
+      )
+    jax_dtype = torch_utils.str_to_jax_dtype(out_dtype)
+    if jax_dtype is None:
+      return torch.empty_like(queries), torch.empty_like(kv_cache)
+    dtype = getattr(torch, jax_dtype.name)
+    return torch.empty_like(queries, dtype=dtype), torch.empty_like(kv_cache)
 
   @override
   def __call__(
