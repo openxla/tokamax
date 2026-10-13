@@ -663,6 +663,8 @@ SHARDS: ShardMap = {
         paths=(
             'tokamax/_src/ops/experimental/tpu/csa_gather/api_test.py',
             'tokamax/_src/ops/experimental/tpu/csa_gather/base_test.py',
+            'tokamax/_src/ops/experimental/tpu/csa_gather/csa_gather_test.py',
+            'tokamax/_src/ops/experimental/tpu/csa_gather/pallas_mosaic_tpu_kernel_test.py',
             'tokamax/_src/ops/experimental/tpu/csa_gather/pallas_mosaic_tpu_test.py',
         ),
         minutes=2,
