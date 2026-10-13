@@ -221,17 +221,17 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     else:
       raise NotImplementedError("Unsupported GPU architecture.")
 
-    if isinstance(group_sizes, GroupSizes):
-      group_sizes = jnp.array(group_sizes)
-
-    if preferred_element_type is None:
-      preferred_element_type = jnp.promote_types(lhs.dtype, rhs.dtype)
-
     if fn is None:
       raise NotImplementedError(
           f"Unsupported config: {config=} {ragged_dot_dimension_numbers=}"
           f" {lhs.dtype=} {rhs.dtype=} {preferred_element_type=} {precision=}"
       )
+
+    if isinstance(group_sizes, GroupSizes):
+      group_sizes = jnp.array(group_sizes)
+
+    if preferred_element_type is None:
+      preferred_element_type = jnp.result_type(lhs, rhs)
 
     dot_out = fn(
         lhs,  # pyrefly: ignore[bad-argument-type]

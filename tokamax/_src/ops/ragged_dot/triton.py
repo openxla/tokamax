@@ -556,9 +556,7 @@ class TritonRaggedDot(base.RaggedDot[Config, None]):
       raise NotImplementedError("float8_e4m3fn is not supported on SM80.")
 
     if preferred_element_type is None:
-      out_dtype = jnp.promote_types(lhs.dtype, rhs.dtype)
-    else:
-      out_dtype = preferred_element_type
+      preferred_element_type = jnp.result_type(lhs, rhs)
 
     if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
       rhs = rhs.mT  # TODO: Fuse transpose into kernel.
@@ -582,7 +580,7 @@ class TritonRaggedDot(base.RaggedDot[Config, None]):
         rhs,
         group_sizes=jnp.asarray(group_sizes),
         precision=precision,
-        out_dtype=out_dtype,
+        out_dtype=preferred_element_type,
         config=config,
         activation=None if return_residuals else activation,
     )
