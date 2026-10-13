@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float, Int
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.experimental.mla import base
 from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu_kernel
 
@@ -47,12 +48,8 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
   @jaxtyping.jaxtyped
   def _fwd(
       self,
-      ql_nope: Float[
-          Array, "max_num_tokens actual_num_q_heads actual_lkv_dim"
-      ],
-      q_pe: Float[
-          Array, "max_num_tokens actual_num_q_heads actual_r_dim"
-      ],
+      ql_nope: Float[Array, "max_num_tokens actual_num_q_heads actual_lkv_dim"],
+      q_pe: Float[Array, "max_num_tokens actual_num_q_heads actual_r_dim"],
       new_kv_c: Float[Array, "max_num_tokens actual_lkv_dim"],
       new_k_pe: Float[Array, "max_num_tokens actual_r_dim"],
       cache_kv: Float[
@@ -114,7 +111,7 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
     return Config(
         num_kv_pages_per_block=16,
         num_queries_per_block=1,
-        vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+        vmem_limit_bytes=mosaic_tpu.default_tc_vmem_limit_bytes(),
         chunk_prefill_size=0,
         decode_batch_size=1,
     )
@@ -122,10 +119,9 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
   @override
   def _get_autotuning_configs(self, ba) -> set[Config]:
     configs = set()
-    vmem_capacity = pltpu.get_tpu_info().vmem_capacity_bytes
     vmem_limits = [
-        int(vmem_capacity * fraction) // 16 * 16
-        for fraction in (0.5, 0.8, 1.0)
+        mosaic_tpu.default_tc_vmem_limit_bytes(fraction) // 16 * 16
+        for fraction in (0.5, 0.8, mosaic_tpu.DEFAULT_TC_VMEM_LIMIT_FRACTION)
     ]
     for decode_batch_size, kv, q, vmem_limit_bytes in itertools.product(
         [8],
