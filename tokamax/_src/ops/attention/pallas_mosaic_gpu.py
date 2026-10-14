@@ -134,6 +134,17 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     out_dtype = q.dtype
     orig_seq_len_q = q.shape[-3]
     orig_seq_len_k = k.shape[-3]
+    supports_local_3d = isinstance(config, ConfigSM90)
+    local_3d_config = None
+    if (
+        mask is not None
+        and supports_local_3d
+        and config.split_k == 1
+        and q_indices is None
+        and k_indices is None
+        and not config.fold_q_sequence_heads
+    ):
+      local_3d_config = mask.local_3d_config
     q, k, v, bias, mask, is_causal, k_start, k_end = common.prepare_inputs(
         q,
         k,
@@ -144,6 +155,8 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         k_indices=k_indices,
         precision=precision,
         fold_q_sequence_heads=config.fold_q_sequence_heads,
+        split_k=config.split_k,
+        supports_local_3d=supports_local_3d,
     )
 
     if orig_seq_len_k % (config.split_k * config.block_kv) != 0:
@@ -173,6 +186,9 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     else:
       raise TypeError(f"Unsupported config type: {type(config)}")
 
+    kernel_kwargs = (
+        dict(local_3d_config=local_3d_config) if supports_local_3d else {}
+    )
     f = functools.partial(
         kernel_module.flash_attention_kernel,
         is_causal=is_causal,
@@ -184,6 +200,7 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         use_stable_softmax=use_stable_softmax,
         rescale_threshold=self.rescale_threshold,
         config=config,
+        **kernel_kwargs,
     )
 
     def pad_seq_k(x, axis):
