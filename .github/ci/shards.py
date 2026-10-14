@@ -343,8 +343,12 @@ SHARDS: ShardMap = {
         paths=('tokamax/_src/ops/attention/xla_chunked_test.py',),
         minutes=6,
     ),
-    'attention-triton': Spec(
+    'attention-pallas-triton': Spec(
         paths=('tokamax/_src/ops/attention/pallas_triton_test.py',),
+        minutes=5,
+    ),
+    'attention-triton': Spec(
+        paths=('tokamax/_src/ops/attention/triton_test.py',),
         minutes=5,
     ),
     'attention-api': Spec(
