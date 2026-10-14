@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 from tokamax._src import gpu_utils
+from tokamax._src import triton_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.normalization import base
 from tokamax._src.ops.normalization import triton_config
@@ -33,32 +34,6 @@ import triton.language as tl
 Config = triton_config.Config
 Key = triton_config.Key
 _NUM_REGISTERS_PER_SM = gpu_utils.NUM_REGISTERS_PER_SM
-
-
-def _vmap_kernel(launch_fn, batch_shape=(), batched=()):
-  """Wraps a kernel launch to support (nested) `jax.vmap`.
-
-  `launch_fn(batch_shape, batch_strides, *args)` must return outputs with
-  leading `batch_shape` dims. `batched[i][j]` is whether arg `j` is batched
-  along `batch_shape[i]`; unbatched args get a zero batch stride.
-  """
-
-  @jax.custom_batching.custom_vmap
-  def f(*args):
-    strides = []
-    for i, x in enumerate(args):
-      x_strides = iter(() if x is None else jt.strides_from_shape(x.shape))
-      strides.append(tuple(next(x_strides) if b[i] else 0 for b in batched))
-    return launch_fn(batch_shape, strides, *args)
-
-  @f.def_vmap
-  def _(axis_size, in_batched, *args):
-    out = _vmap_kernel(
-        launch_fn, (axis_size, *batch_shape), (in_batched, *batched)
-    )(*args)
-    return out, jax.tree.map(lambda _: True, out)
-
-  return f
 
 
 @triton.jit
@@ -98,15 +73,6 @@ def _program_ids(m, n, block_m, block_n, batch_shape):
 
 
 @triton.jit
-def _batch_offset(pid_b, batch_shape, batch_strides):
-  offset = 0
-  for i in tl.static_range(len(batch_shape) - 1, -1, -1):
-    offset += (pid_b % batch_shape[i]) * batch_strides[i]
-    pid_b //= batch_shape[i]
-  return offset
-
-
-@triton.jit
 def _normalization_kernel(
     x_ptr,
     scale_ptr,
@@ -135,7 +101,9 @@ def _normalization_kernel(
   )
 
   dtype = tl.float64 if x_ptr.dtype.element_ty == tl.float64 else tl.float32
-  x_ptr += _batch_offset(pid_b, batch_shape, x_batch_strides) + x_base
+  x_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, x_batch_strides) + x_base
+  )
   x = tl.load(x_ptr + x_offs, mask=x_mask, other=0.0).to(dtype)
 
   if subtract_mean:
@@ -155,13 +123,17 @@ def _normalization_kernel(
   x *= rstddev
 
   if scale_ptr is not None:
-    scale_ptr += _batch_offset(pid_b, batch_shape, scale_batch_strides)
+    scale_ptr += triton_utils.batch_offset(
+        pid_b, batch_shape, scale_batch_strides
+    )
     scale = tl.load(scale_ptr + offs_a, mask=mask_a, other=0.0).to(dtype)
     if scale_offset != 0.0:
       scale += scale_offset
     x *= scale[None, :, None]
   if offset_ptr is not None:
-    offset_ptr += _batch_offset(pid_b, batch_shape, offset_batch_strides)
+    offset_ptr += triton_utils.batch_offset(
+        pid_b, batch_shape, offset_batch_strides
+    )
     offset = tl.load(offset_ptr + offs_a, mask=mask_a, other=0.0).to(dtype)
     x += offset[None, :, None]
 
@@ -217,7 +189,7 @@ class TritonNormalization(base.Normalization[Config, Key]):
     if return_residuals:
       name += '_fwd_res'
 
-    @_vmap_kernel
+    @triton_utils.vmap_kernel
     def fwd_call(batch_shape, batch_strides, x, scale, offset):
       x_strides, scale_strides, offset_strides = batch_strides
       # `x` cannot be overwritten if it is shared across the batch.
@@ -350,18 +322,26 @@ def _normalization_vjp_kernel(
   )
 
   dtype = tl.float64 if x_ptr.dtype.element_ty == tl.float64 else tl.float32
-  x_ptr += _batch_offset(pid_b, batch_shape, x_batch_strides) + x_base
+  x_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, x_batch_strides) + x_base
+  )
   x_norm = tl.load(x_ptr + x_offs, mask=x_mask, other=0.0).to(dtype)
   if mean_ptr is not None:
     mean_ptr += (
-        _batch_offset(pid_b, batch_shape, mean_batch_strides) + stat_base
+        triton_utils.batch_offset(pid_b, batch_shape, mean_batch_strides)
+        + stat_base
     )
     x_norm -= tl.load(mean_ptr + stat_offs, mask=stat_mask, other=0.0).to(dtype)
-  rstd_ptr += _batch_offset(pid_b, batch_shape, rstd_batch_strides) + stat_base
+  rstd_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, rstd_batch_strides)
+      + stat_base
+  )
   rstddev = tl.load(rstd_ptr + stat_offs, mask=stat_mask, other=0.0).to(dtype)
   x_norm *= rstddev
 
-  dout_ptr += _batch_offset(pid_b, batch_shape, dout_batch_strides) + x_base
+  dout_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, dout_batch_strides) + x_base
+  )
   dout = tl.load(dout_ptr + x_offs, mask=x_mask, other=0.0).to(dtype)
   dparam_offs = tl.program_id(0).to(tl.int64) * a + offs_a
 
@@ -372,7 +352,9 @@ def _normalization_vjp_kernel(
   if dscale_ptr is not None:
     dscale = tl.sum(tl.sum(dout * x_norm, axis=2), axis=0)
     tl.store(dscale_ptr + dparam_offs, dscale, mask=mask_a)
-    scale_ptr += _batch_offset(pid_b, batch_shape, scale_batch_strides)
+    scale_ptr += triton_utils.batch_offset(
+        pid_b, batch_shape, scale_batch_strides
+    )
     scale = tl.load(scale_ptr + offs_a, mask=mask_a, other=0.0).to(dtype)
     if scale_offset != 0.0:
       scale += scale_offset
@@ -438,7 +420,7 @@ class TritonNormalizationVjp(base.NormalizationVjp[Config, Key]):
     grid_n = triton.cdiv(n, block_n)
     name = 'triton_rms_norm_vjp' if mean is None else 'triton_layer_norm_vjp'
 
-    @_vmap_kernel
+    @triton_utils.vmap_kernel
     def vjp_call(batch_shape, batch_strides, dout, x, scale, mean, rstddev):
       (
           dout_strides,

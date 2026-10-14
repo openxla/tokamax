@@ -15,6 +15,7 @@
 """Triton utilities."""
 
 from collections.abc import Callable
+import math
 
 import jax
 import jax.numpy as jnp
@@ -24,8 +25,47 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
-
 get_cheapest_grid_grouping = grid.get_cheapest_grid_grouping
+
+
+def vmap_kernel(launch_fn, batch_shape=(), batched=()):
+  """Wraps a kernel launch to support (nested) `jax.vmap`.
+
+  `launch_fn(batch_shape, batch_strides, *args)` must return outputs with
+  leading `batch_shape` dims. `batched[i][j]` is whether arg `j` is batched
+  along `batch_shape[i]`; unbatched args get a zero batch stride.
+  """
+
+  @jax.custom_batching.custom_vmap
+  def f(*args):
+    strides = []
+    for i, x in enumerate(args):
+      x_strides = (
+          iter(())
+          if x is None
+          else (math.prod(x.shape[d + 1 :]) for d in range(x.ndim))
+      )
+      strides.append(tuple(next(x_strides) if b[i] else 0 for b in batched))
+    return launch_fn(batch_shape, tuple(strides), *args)
+
+  @f.def_vmap
+  def _(axis_size, in_batched, *args):
+    out = vmap_kernel(
+        launch_fn, (axis_size, *batch_shape), (in_batched, *batched)
+    )(*args)
+    return out, jax.tree.map(lambda _: True, out)
+
+  return f
+
+
+@triton.jit
+def batch_offset(pid_b, batch_shape, batch_strides):
+  """Unravels `pid_b` over `batch_shape` and dots with `batch_strides`."""
+  offset = tl.full((), 0, tl.int64)
+  for i in tl.static_range(len(batch_shape) - 1, 0, -1):
+    offset += (pid_b % batch_shape[i]) * batch_strides[i]
+    pid_b //= batch_shape[i]
+  return offset if batch_shape == () else offset + pid_b * batch_strides[0]
 
 
 @triton.jit
