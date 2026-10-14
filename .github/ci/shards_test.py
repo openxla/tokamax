@@ -30,6 +30,7 @@ from collections.abc import Collection, Iterable, Mapping
 import contextlib
 import io
 import os
+import shlex
 import tempfile
 import textwrap
 from typing import NoReturn
@@ -492,9 +493,7 @@ class JaxVersionTest(unittest.TestCase):
           ('0.12.0', '0.11.10', '0.11.2', '0.11.0'),
       )
       self.assertEqual(shards.latest_jax(), '0.12.0')
-      self.assertEqual(
-          shards.older_jaxs(), ('0.11.10', '0.11.2', '0.11.0')
-      )
+      self.assertEqual(shards.older_jaxs(), ('0.11.10', '0.11.2', '0.11.0'))
       self.assertEqual(shards.oldest_jax(), '0.11.0')
 
   def test_bench_jax_pin_matches_latest_jax(self) -> None:
@@ -502,7 +501,9 @@ class JaxVersionTest(unittest.TestCase):
         os.path.dirname(__file__), '..', '..', 'pyproject.toml'
     )
     with open(pyproject_path, 'rb') as f:
-      bench_deps = shards.tomllib.load(f)['project']['optional-dependencies']['bench']
+      bench_deps = shards.tomllib.load(f)['project']['optional-dependencies'][
+          'bench'
+      ]
     self.assertIn(
         f'jax=={shards.latest_jax()}',
         bench_deps,
@@ -516,51 +517,142 @@ class JaxVersionTest(unittest.TestCase):
 
 class CompatMatrixTest(unittest.TestCase):
 
-  def matrix(self) -> list[shards.MatrixEntry]:
+  def resolved(self) -> shards.ShardMap:
     resolved, *_ = shards.resolve_shards()
-    return list(shards.build_matrix(resolved))
+    return resolved
 
-  def test_every_version_runs_every_shard(self) -> None:
-    shards_by_pin = collections.defaultdict(set)
-    runners_by_pin = collections.defaultdict(set)
-    for entry in self.matrix():
-      shards_by_pin[entry['jax_pin']].add(entry['shard_name'])
-      runners_by_pin[entry['jax_pin']].add(entry['runner'])
-    self.assertCountEqual(shards_by_pin, shards.JAX_VERSIONS)
-    for version in shards.older_jaxs():
-      self.assertEqual(
-          shards_by_pin[version], shards_by_pin[shards.latest_jax()]
-      )
-      self.assertCountEqual(runners_by_pin[version], shards.COMPAT_RUNNERS)
+  def test_primary_jobs_are_on_the_latest_jax_only(self) -> None:
+    pins = {e['jax_pin'] for e in shards.build_matrix(self.resolved())}
+    self.assertEqual(pins, {shards.latest_jax()})
+
+  def test_every_older_version_runs_every_bin_on_every_compat_runner(
+      self,
+  ) -> None:
+    resolved = self.resolved()
+    bins = shards.compat_bins(resolved)
+    jobs = shards.build_compat_matrix(resolved)
+    self.assertCountEqual(
+        [(j['runner'], j['jax_pin'], j['shard_name']) for j in jobs],
+        [
+            (runner, version, f'compat-{i}')
+            for runner in shards.COMPAT_RUNNERS
+            for version in shards.older_jaxs()
+            for i in range(1, len(bins) + 1)
+        ],
+    )
+
+  def test_every_shard_is_in_exactly_one_bin(self) -> None:
+    resolved = self.resolved()
+    binned = [n for names in shards.compat_bins(resolved) for n in names]
+    self.assertCountEqual(binned, list(resolved))
+
+  def test_a_bin_runs_all_of_its_shards_paths(self) -> None:
+    resolved = self.resolved()
+    for job in shards.build_compat_matrix(resolved):
+      expected = [
+          p for n in job['shards'].split() for p in resolved[n]['paths']
+      ]
+      self.assertEqual(shlex.split(job['test_paths']), expected)
 
   def test_job_names_are_unique(self) -> None:
-    jobs = [(e['runner_short'], e['shard_name']) for e in self.matrix()]
+    resolved = self.resolved()
+    jobs = [
+        (prefix, e['runner_short'], e['shard_name'])
+        for prefix, matrix in (
+            ('shard-tests', shards.build_matrix(resolved)),
+            ('compat-tests', shards.build_compat_matrix(resolved)),
+        )
+        for e in matrix
+    ]
     duplicates = [
         job for job, count in collections.Counter(jobs).items() if count > 1
     ]
     self.assertEqual(duplicates, [])
 
   def test_every_job_preserves_runner_device(self) -> None:
-    for entry in self.matrix():
+    resolved = self.resolved()
+    for entry in [
+        *shards.build_matrix(resolved),
+        *shards.build_compat_matrix(resolved),
+    ]:
       expected_device = shards.RUNNERS[entry['runner']][0]
       self.assertEqual(entry['device'], expected_device)
 
   def test_total_matrix_job_count(self) -> None:
-    resolved, *_ = shards.resolve_shards()
-    expected_per_shard = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
-        shards.COMPAT_RUNNERS
+    resolved = self.resolved()
+    self.assertEqual(
+        len(shards.build_matrix(resolved)), len(resolved) * len(shards.RUNNERS)
     )
-    self.assertEqual(len(self.matrix()), len(resolved) * expected_per_shard)
+    self.assertEqual(
+        len(shards.build_compat_matrix(resolved)),
+        len(shards.compat_bins(resolved))
+        * len(shards.older_jaxs())
+        * len(shards.COMPAT_RUNNERS),
+    )
 
   def test_matrix_with_only_filters_all_versions(self) -> None:
-    resolved, *_ = shards.resolve_shards()
+    resolved = self.resolved()
     only = {'core-api'}
     jobs = shards.build_matrix(resolved, only=only)
     self.assertTrue(all(j['shard_name'] == 'core-api' for j in jobs))
-    expected = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
-        shards.COMPAT_RUNNERS
+    self.assertEqual(len(jobs), len(shards.RUNNERS))
+    compat = shards.build_compat_matrix(resolved, only=only)
+    self.assertTrue(all(j['shards'] == 'core-api' for j in compat))
+    self.assertEqual(
+        len(compat), len(shards.older_jaxs()) * len(shards.COMPAT_RUNNERS)
     )
-    self.assertEqual(len(jobs), expected)
+
+
+class CompatBinTest(unittest.TestCase):
+  """Packing shards into compat bins, against a made-up table."""
+
+  def bins(self, **sizes: float | None) -> list[list[str]]:
+    table = {
+        name: (
+            dict(paths=(f'tokamax/{name}_test.py',))
+            | ({} if minutes is None else dict(minutes=minutes))
+        )
+        for name, minutes in sizes.items()
+    }
+    return shards.compat_bins(table)
+
+  def test_small_shards_share_a_bin(self) -> None:
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      self.assertEqual(self.bins(a=5, b=5, c=5), [['a', 'b', 'c']])
+
+  def test_no_bin_exceeds_the_budget_unless_one_shard_does(self) -> None:
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      bins = self.bins(big=45, a=12, b=9, c=8, d=7, e=3)
+    self.assertEqual(bins[0], ['big'])
+    sizes = dict(big=45, a=12, b=9, c=8, d=7, e=3)
+    for names in bins[1:]:
+      self.assertLessEqual(sum(sizes[n] for n in names), 20)
+
+  def test_an_unmeasured_shard_runs_alone(self) -> None:
+    # Absent is an unknown, not a zero: sharing a bin, it could be the job
+    # that sets the compat wall clock.
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      bins = self.bins(unknown=None, a=1, b=1)
+    self.assertIn(['unknown'], bins)
+
+  def test_compat_minutes_wins_over_minutes(self) -> None:
+    table = {
+        'slow': dict(
+            paths=('tokamax/slow_test.py',), minutes=40, compat_minutes=2
+        ),
+        'fast': dict(paths=('tokamax/fast_test.py',), minutes=3),
+    }
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      self.assertEqual(shards.compat_bins(table), [['fast', 'slow']])
+
+  def test_fullest_bin_comes_first(self) -> None:
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      bins = self.bins(a=4, b=18, c=19)
+    self.assertEqual(bins[0], ['c'])
+
+  def test_bad_compat_minutes_is_rejected(self) -> None:
+    errors = check({'s1': dict(paths=FILES, compat_minutes=0)})
+    self.assertIn('compat_minutes=0', ' '.join(errors))
 
 
 class JaxConsistencyTest(unittest.TestCase):
@@ -585,7 +677,8 @@ class JaxConsistencyTest(unittest.TestCase):
       self.assertTrue(
           any(
               'the JAX lower bound and the oldest JAX version the CI tests'
-              ' against have to be the same.' in e
+              ' against have to be the same.'
+              in e
               for e in errors
           )
       )
@@ -596,15 +689,14 @@ class JaxConsistencyTest(unittest.TestCase):
       self.assertTrue(
           any(
               'tokamax supports 2 latest JAX versions for backward'
-              ' compatibility.' in e
+              ' compatibility.'
+              in e
               for e in errors
           )
       )
 
   def test_duplicated_jax_version_is_caught(self) -> None:
-    with mock.patch.object(
-        shards, 'JAX_VERSIONS', ('0.11.0', '0.11.0')
-    ):
+    with mock.patch.object(shards, 'JAX_VERSIONS', ('0.11.0', '0.11.0')):
       errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
       self.assertTrue(any('Duplicated JAX version found' in e for e in errors))
 
@@ -652,8 +744,18 @@ class RealRepositoryTest(unittest.TestCase):
 
   def test_every_matrix_entry_has_paths(self) -> None:
     resolved, *_ = shards.resolve_shards()
-    for combo in shards.build_matrix(resolved):
+    for combo in [
+        *shards.build_matrix(resolved),
+        *shards.build_compat_matrix(resolved),
+    ]:
       self.assertTrue(combo['test_paths'], combo)
+
+  def test_whole_matrix_fits_githubs_job_limit(self) -> None:
+    # GitHub caps one job's matrix at 256 entries; a matrix past it fails to
+    # start rather than running a subset.
+    resolved, *_ = shards.resolve_shards()
+    self.assertLessEqual(len(shards.build_matrix(resolved)), 256)
+    self.assertLessEqual(len(shards.build_compat_matrix(resolved)), 256)
 
 
 class SelectionTest(unittest.TestCase):
@@ -813,16 +915,21 @@ class SelectionTest(unittest.TestCase):
     picked = sorted(resolved)[:2]
     combos = shards.build_matrix(resolved, only=picked)
     self.assertEqual({c['shard_name'] for c in combos}, set(picked))
-    # For the latest JAX version, it runs len(shards.RUNNERS) times.
-    num_runs_per_shards = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
-        shards.COMPAT_RUNNERS
-    )
-    self.assertEqual(len(combos), len(picked) * num_runs_per_shards)
+    self.assertEqual(len(combos), len(picked) * len(shards.RUNNERS))
+    # The compat check is narrowed by the same selection.
+    binned = {
+        name
+        for names in shards.compat_bins(resolved, only=picked)
+        for name in names
+    }
+    self.assertEqual(binned, set(picked))
 
   def test_matrix_with_no_shards_is_empty_not_everything(self) -> None:
     resolved, *_ = shards.resolve_shards()
     self.assertEqual(shards.build_matrix(resolved, only=set()), [])
     self.assertNotEqual(shards.build_matrix(resolved, only=None), [])
+    self.assertEqual(shards.build_compat_matrix(resolved, only=set()), [])
+    self.assertNotEqual(shards.build_compat_matrix(resolved, only=None), [])
 
   def test_reading_a_change_list_drops_the_trailing_empty(self) -> None:
     self.assertEqual(
@@ -969,6 +1076,8 @@ class DryRunTest(unittest.TestCase):
     # half of this test would pass for the wrong reason.
     self.assertNotEqual(live['include'], full['include'])
     self.assertEqual(dry['include'], full['include'])
+    self.assertNotEqual(live['compat_include'], full['compat_include'])
+    self.assertEqual(dry['compat_include'], full['compat_include'])
     # The reason reaches the run summary through this line only.
     self.assertIn('DRY RUN', log.partition('\n')[0])
     self.assertIn('would select', log)
@@ -989,6 +1098,12 @@ class DryRunTest(unittest.TestCase):
     # A documentation-only change selects nothing, and `include` being `[]`
     # is what skips `shard-tests`. A dry run must not trip that path.
     self.assertNotEqual(dry['include'], '[]')
+    self.assertNotEqual(dry['compat_include'], '[]')
+
+  def test_documentation_selects_no_compat_bin_either(self) -> None:
+    live, _ = self._matrix('--changed-from', self._changed('README.md'))
+    self.assertEqual(live['include'], '[]')
+    self.assertEqual(live['compat_include'], '[]')
 
 
 if __name__ == '__main__':

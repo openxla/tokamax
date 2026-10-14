@@ -13,6 +13,10 @@ name: CI-Build
 #  whole suite in a single process, because some failures are properties of
 #  the collection rather than of any test.
 #
+#  `compat-tests` reruns the selected shards on the older JAX versions, one
+#  case per test function, packed into a few bins rather than a job per shard.
+#  See `COMPAT_BIN_MINUTES` in `shards.py`.
+#
 #  Require `shard-all-tests-passed` in branch protection, not the shard jobs,
 #  whose names and number change whenever the SHARDS table is rebalanced.
 on:
@@ -49,6 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       include: ${{ steps.compute.outputs.include }}
+      compat_include: ${{ steps.compute.outputs.compat_include }}
       # The pytest flags that decide which tests are selected, as opposed to
       # how they are reported. Emitted by the same module that builds the
       # shard paths so the two cannot disagree about what the suite is.
@@ -178,9 +183,10 @@ jobs:
             cat /tmp/summary.txt
             exit 1
           fi
-          # Empty the *output* so that no shards run.
+          # Empty the *outputs* so that no shards run, compat bins included.
           if [[ "${SKIP}" == "true" ]]; then
-            sed -i 's/^include=.*/include=[]/' /tmp/outputs.txt
+            sed -i -e 's/^include=.*/include=[]/' \
+              -e 's/^compat_include=.*/compat_include=[]/' /tmp/outputs.txt
             # Rewrite the one `selection:` line rather than adding a second,
             # so the summary does not say both "every shard" and "none". `|`
             # rather than `/` as the delimiter: the reason can name a ref.
@@ -316,11 +322,55 @@ jobs:
           printf '%s %s' "${PYTEST_FLAGS}" "${TEST_PATHS}" \
             | xargs -r pytest -s --durations=25
 
+  compat-tests:
+    # The backward compatibility check: each bin is several shards, rerun on
+    # an older JAX in smoke mode. Its own job, so `fail-fast` here cancels the
+    # other compat bins only -- once one older JAX has failed, the rest of the
+    # check has nothing to add -- and never the `shard-tests` jobs.
+    name: ${{ matrix.shard_name && format('compat-tests ({0}, {1})', matrix.runner_short, matrix.shard_name) || 'compat-tests (no shard selected)' }}
+    needs: shard-matrix
+    if: needs.shard-matrix.outputs.compat_include != '[]'
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJson(needs.shard-matrix.outputs.compat_include) }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        env:
+          DEVICE: ${{ matrix.device }}
+          JAX_PIN: ${{ matrix.jax_pin }}
+        run: |
+          bash .github/ci/install_deps.sh "${DEVICE}" "${JAX_PIN}"
+
+      - name: Run compat bin
+        env:
+          PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
+          TEST_PATHS: ${{ matrix.test_paths }}
+          SHARDS: ${{ matrix.shards }}
+          # One case per test function; see `tokamax/conftest.py`.
+          TOKAMAX_COMPAT_SMOKE: '1'
+        run: |
+          echo "Shards in this bin: ${SHARDS}"
+          printf '%s %s' "${PYTEST_FLAGS}" "${TEST_PATHS}" \
+            | xargs -r pytest -s --durations=25
+
   shard-all-tests-passed:
     # The idea here is that rather than checking for specific shard names to pass, we centralize
     # the bookkeeping here, and then Copybara checks that this "result-aggregating" job passed.
     name: shard-all-tests-passed
-    needs: [shard-matrix, collect-tests, shard-tests]
+    needs: [shard-matrix, collect-tests, shard-tests, compat-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -349,8 +399,10 @@ jobs:
           COLLECT: ${{ needs.collect-tests.result }}
           TESTS: ${{ needs.shard-tests.result }}
           INCLUDE: ${{ needs.shard-matrix.outputs.include }}
+          COMPAT: ${{ needs.compat-tests.result }}
+          COMPAT_INCLUDE: ${{ needs.shard-matrix.outputs.compat_include }}
         run: |
-          echo "shard-matrix=${MATRIX} collect=${COLLECT} tests=${TESTS}"
+          echo "shard-matrix=${MATRIX} collect=${COLLECT} tests=${TESTS} compat=${COMPAT}"
           # Only `success` counts. `cancelled` in particular is not a result,
           # and treating it as one is how a cancelled run reports green.
           if [[ "${MATRIX}" != "success" ]]; then
@@ -359,6 +411,13 @@ jobs:
           fi
           if [[ "${COLLECT}" != "success" ]]; then
             echo "::error::collect-tests reported ${COLLECT}"
+            exit 1
+          fi
+          # Same rule as `shard-tests` below: `skipped` passes only when there
+          # was no bin to run.
+          if [[ "${COMPAT}" != "success" ]] &&
+             ! [[ "${COMPAT}" == "skipped" && "${COMPAT_INCLUDE}" == "[]" ]]; then
+            echo "::error::compat-tests reported ${COMPAT}"
             exit 1
           fi
           # `skipped` is expected when the change only touches non-test files
