@@ -432,7 +432,7 @@ def calculate_block_sizes(
         is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
 
         match tpu_info.generation:
-            case 8 if "8i" in tpu_info.chip_version or "v8i" in tpu_info.chip_version:
+            case 8 if tpu_info.chip_version == pltpu.ChipVersion.TPU_8I:
                 threshold = 800
             case 7:
                 threshold = 1500

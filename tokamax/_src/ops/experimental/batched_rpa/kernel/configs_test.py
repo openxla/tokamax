@@ -23,11 +23,13 @@ import jax.numpy as jnp
 from tokamax._src.ops.experimental.batched_rpa.kernel import configs
 from tokamax._src.ops.experimental.batched_rpa.kernel import wrapper
 
+_TPU_8T = getattr(pltpu.ChipVersion, "TPU_8T", None)
+
 
 @dataclasses.dataclass
 class _MockTpuInfo:
   generation: int
-  chip_version: str = "v8i"
+  chip_version: pltpu.ChipVersion = pltpu.ChipVersion.TPU_8I
   num_lanes: int = 128
   num_sublanes: int = 16
   mxu_column_size: int = 128
@@ -39,7 +41,7 @@ class _MockTpuInfo:
 
 def _create_mock_tpu_info(
     generation: int,
-    chip_version: str = "v8i",
+    chip_version: pltpu.ChipVersion = pltpu.ChipVersion.TPU_8I,
     num_lanes: int = 128,
     num_sublanes: int = 16,
     mxu_column_size: int = 128,
@@ -64,13 +66,13 @@ def _create_mock_tpu_info(
 class ConfigsTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
-      ("v8i_fp8", 8, "v8i", True, 1),
-      ("v8i_bf16", 8, "v8i", False, 1),
-      ("v8t_fp8", 8, "v8t", True, 1),
-      ("v8t_bf16", 8, "v8t", False, 1),
-      ("v7x_fp8", 7, "v7x", True, 1),
-      ("v7x_bf16", 7, "v7x", False, 1),
-      ("v5p_bf16", 5, "v5p", False, 1),
+      ("v8i_fp8", 8, pltpu.ChipVersion.TPU_8I, True, 1),
+      ("v8i_bf16", 8, pltpu.ChipVersion.TPU_8I, False, 1),
+      ("v8t_fp8", 8, _TPU_8T, True, 1),
+      ("v8t_bf16", 8, _TPU_8T, False, 1),
+      ("v7x_fp8", 7, pltpu.ChipVersion.TPU_7X, True, 1),
+      ("v7x_bf16", 7, pltpu.ChipVersion.TPU_7X, False, 1),
+      ("v5p_bf16", 5, pltpu.ChipVersion.TPU_V5P, False, 1),
   )
   def test_calculate_block_sizes_generation(
       self, generation, chip_version, is_8bit, expected_bq_c_min
