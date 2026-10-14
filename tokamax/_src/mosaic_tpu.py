@@ -40,7 +40,10 @@ def _adaptive_sublane_size() -> int:
   return 16 if pltpu.get_tpu_info().generation >= 7 else 8
 
 
-# TODO: Add tests for this file.
+# TODO(mosaic_tpu): Add unit tests for ScalesTilingInfo, quantization helpers
+# (pack_int4, load_quantized_tile), and tile/lane computation utilities in this
+# file. These are critical TPU-specific primitives used by multiple kernel
+# implementations.
 
 
 @jax.tree_util.register_static
