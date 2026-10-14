@@ -361,10 +361,8 @@ def ragged_dot_gpu_quant_blackwell_kernel(
                 acc_tmem.at[:, pl.ds(mi * split_block_m, split_block_m)]
             )
             plgpu.wait_load_tmem()
-
-            @pl.when(mi == split_m - 1)
-            def _():
-              plgpu.barrier_arrive(acc_consumed_barrier)
+            is_last_iter = mi == split_m - 1
+            plgpu.barrier_arrive(acc_consumed_barrier, predicate=is_last_iter)
 
             # Apply activation function to the output in dtype of acc if
             # provided.

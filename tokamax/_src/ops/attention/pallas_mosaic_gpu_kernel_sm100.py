@@ -434,6 +434,7 @@ def flash_attention_kernel(
 
     @grid_loop(init_carry=0)
     def grid_loop_body(gmems, loop_info: plgpu.NDLoopInfo, carry):
+      is_first_grid_iter = jnp.asarray(loop_info.local_index == 0)
       prev_iters = carry
       (
           q_gmem,
@@ -619,11 +620,7 @@ def flash_attention_kernel(
             @pl.when(warp_id == _MMA_WARP)
             def tma_load_q_mma_warp():
               assert q_consumed is not None
-
-              @pl.when(loop_info.local_index == 0)
-              def prologue():
-                plgpu.barrier_arrive(q_consumed)
-
+              plgpu.barrier_arrive(q_consumed, predicate=is_first_grid_iter)
               plgpu.async_prefetch(
                   q_gmem.at[qs_cluster, hi],
                   collective_axes=collective_axis,
@@ -671,14 +668,11 @@ def flash_attention_kernel(
       @pl.when(wg == _SOFTMAX_WG)
       def softmax_wg():
         plgpu.set_max_registers(256, action="increase")
-
-        @pl.when(loop_info.local_index == 0)
-        def prologue():
-          plgpu.barrier_arrive(s_consumed)
-          if bias_consumed is not None:
-            plgpu.barrier_arrive(bias_consumed)
-          if mask_consumed is not None:
-            plgpu.barrier_arrive(mask_consumed)
+        plgpu.barrier_arrive(s_consumed, predicate=is_first_grid_iter)
+        if bias_consumed is not None:
+          plgpu.barrier_arrive(bias_consumed, predicate=is_first_grid_iter)
+        if mask_consumed is not None:
+          plgpu.barrier_arrive(mask_consumed, predicate=is_first_grid_iter)
 
         @pl.when(ub > lb)
         def compute():
@@ -854,10 +848,10 @@ def flash_attention_kernel(
         def prologue():
           mgpu_lib.bar_arrive(_L_CONSUMED, num_threads=256)
 
-        @pl.when(ub > lb)
-        def release_out_scaled_barriers():
-          for i in range(num_tma_splits):
-            plgpu.barrier_arrive(acc_produced.at[i])
+        for i in range(num_tma_splits):
+          plgpu.barrier_arrive(
+              acc_produced.at[i], predicate=jnp.asarray(ub > lb)
+          )
 
         def two_in_flight(iterable):
           for a, _ in itertools.pairwise(itertools.chain(iterable, [None])):
