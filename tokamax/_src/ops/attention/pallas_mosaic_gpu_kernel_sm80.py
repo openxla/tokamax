@@ -37,7 +37,7 @@ Architecture Overview:
 """
 
 import math
-from typing import Annotated, Any
+from typing import Annotated
 
 import jax
 from jax import lax
@@ -151,19 +151,6 @@ def _get_q_staging_slots(
     head_dim: int, block_q: int, block_kv: int, stages_k: int
 ) -> int:
   return head_dim // _CHUNK_SIZE if block_q <= stages_k * block_kv else 1
-
-
-def _create_tiled_smem(shape: tuple[int, ...], dtype: jnp.dtype) -> Any:
-  bits = jnp.dtype(dtype).itemsize * 8
-  swizzle = plgpu.find_swizzle(shape[-1] * bits)
-  return plgpu.SMEM(
-      shape,
-      dtype,
-      transforms=(
-          plgpu.TilingTransform((8, 8 * swizzle // bits)),
-          plgpu.SwizzleTransform(swizzle),
-      ),
-  )
 
 
 def _async_copy_gmem_to_smem(src, dst):
@@ -699,23 +686,22 @@ def flash_attention_kernel(
 
     _split_head_pipeline()
 
-  k_smem_type = _create_tiled_smem((1, stages_k, block_kv, head_dim), dtype)
+  tiled_smem = mgpu_lib.tiled_swizzled_smem
+  k_scratch = tiled_smem((1, stages_k, block_kv, head_dim), dtype)
   if use_q_smem_resident:
-    qk_smem = (_create_tiled_smem((block_q, head_dim), dtype), k_smem_type)
+    qk_scratch = (tiled_smem((block_q, head_dim), dtype), k_scratch)
   else:
-    q_stage_shape = (1, num_staging_slots, block_q, _CHUNK_SIZE)
-    q_stage_type = _create_tiled_smem(q_stage_shape, dtype)
-    qk_smem = plgpu.RefUnion((q_stage_type,), (k_smem_type,))
-
+    q_scratch = tiled_smem((1, num_staging_slots, block_q, _CHUNK_SIZE), dtype)
+    qk_scratch = plgpu.RefUnion((q_scratch,), (k_scratch,))
+  if v_split0:
+    v0_scratch = tiled_smem((1, stages_v, block_kv, v_split0), dtype)
+  else:
+    v0_scratch = None
   scratch_allocations = dict(
-      qk_smem=qk_smem,
-      v0_smem=(
-          _create_tiled_smem((1, stages_v, block_kv, v_split0), dtype)
-          if v_split0
-          else None
-      ),
-      v1_smem=_create_tiled_smem((stages_v, block_kv, v_split1), dtype),
-      p_smem=_create_tiled_smem((num_p_slots, block_q, block_kv), dtype),
+      qk_smem=qk_scratch,
+      v0_smem=v0_scratch,
+      v1_smem=tiled_smem((stages_v, block_kv, v_split1), dtype),
+      p_smem=tiled_smem((num_p_slots, block_q, block_kv), dtype),
       al_smem=plgpu.SMEM((num_p_slots + 1, block_q), jnp.float32),
       p_ready_barrier=plgpu.Barrier(num_arrivals=1, num_barriers=num_p_slots),
       p_done_barrier=plgpu.Barrier(num_arrivals=1, num_barriers=num_p_slots),
