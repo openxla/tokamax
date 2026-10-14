@@ -17,11 +17,12 @@
 
 import jax
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.routing_moe.common import arg
 
 
 @jax.jit(static_argnames=("num_local_experts",))
 def output_reduce_unpack(
-    rows: jax.Array,
+    rows: arg.ActivationWrapper[jax.Array],
     weights: jax.Array,
     topk_indices: jax.Array,
     group_offset: jax.Array,
@@ -31,7 +32,7 @@ def output_reduce_unpack(
   # TODO: Replace with custom Pallas output_reduce_unpack kernel.
 
   num_tokens, topk = weights.shape
-  rows3d = rows.reshape(num_tokens, topk, -1)
+  rows3d = rows.data.reshape(num_tokens, topk, -1)
 
   group_start = group_offset
   group_end = group_start + num_local_experts
@@ -39,4 +40,4 @@ def output_reduce_unpack(
   rows3d = jnp.where(local.reshape(-1, topk, 1), rows3d, 0)
 
   x = rows3d * weights.astype(jnp.float32).reshape(-1, topk, 1)
-  return x.sum(axis=1).astype(rows.dtype)
+  return x.sum(axis=1).astype(rows.spec.dtype)

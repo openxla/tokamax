@@ -91,15 +91,13 @@ def matmul(
   # Step 2: Matmul.
   acc_list = []
 
-  if not cfg.x.should_quantize:
+  if cfg.x.dynamic_quant is None:
     block_acc = jnp.matmul(x, w, preferred_element_type=jnp.float32)
-    acc_list.append(block_acc.astype(cfg.acc_dtype))
+    acc_list.append(block_acc.astype(cfg.plan.acc_dtype))
   else:
     # Quantized matmul path.
-    x_q_dtype = cfg.x.quant_dtype
-    q_block_size = cfg.x.quant_block_size
-    assert q_block_size is not None
-    assert x_q_dtype is not None
+    x_q_dtype = cfg.x.dynamic_quant.dtype
+    q_block_size = cfg.x.dynamic_quant.block_size
 
     if jnp.issubdtype(x_q_dtype, jnp.floating):
       dtype_max = float(jnp.finfo(x_q_dtype).max)
@@ -118,7 +116,7 @@ def matmul(
       end_n = min(tile_n, start_n + mxu_size)
       col_size = end_n - start_n
 
-      acc_n = jnp.zeros((tile_m, col_size), dtype=cfg.acc_dtype)
+      acc_n = jnp.zeros((tile_m, col_size), dtype=cfg.plan.acc_dtype)
       for start_k in range(0, tile_k, q_block_size):
         end_k = min(tile_k, start_k + q_block_size)
 
@@ -148,13 +146,15 @@ def matmul(
             block_x_q,
             block_w,
             preferred_element_type=preferred_element_type,
-        ).astype(cfg.acc_dtype)
+        ).astype(cfg.plan.acc_dtype)
 
         if w_scale is not None:
           # TODO: Support subchannel quantization.
-          block_acc *= w_scale[0, :, start_n:end_n].astype(cfg.acc_dtype)
+          block_acc *= w_scale[0, :, start_n:end_n].astype(
+              cfg.plan.acc_dtype
+          )
 
-        block_acc *= block_scale.astype(cfg.acc_dtype)
+        block_acc *= block_scale.astype(cfg.plan.acc_dtype)
 
         acc_n += block_acc
       acc_list.append(acc_n)

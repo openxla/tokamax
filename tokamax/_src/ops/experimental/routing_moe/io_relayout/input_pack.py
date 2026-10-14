@@ -16,13 +16,22 @@
 """Input relayout helper from large to compact layout."""
 
 import jax
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import arg
 
 
 @jax.jit
-def input_pack(x: jax.Array) -> jax.Array:
+def input_pack(x: jax.Array) -> arg.ActivationWrapper[jax.Array]:
   """Placeholder for input_pack kernel from large to compact layout."""
   # TODO: Replace with custom Pallas input_pack kernel.
-  x_shape = x.shape
-  assert len(x_shape) == 2
-  return x.reshape(layout_util.to_compact_shape(x_shape, x.dtype))
+  assert x.ndim == 2
+  row_size, col_size = x.shape
+  spec = arg.ActivationSpec(
+      row_size=row_size,
+      col_size=col_size,
+      dtype=x.dtype,
+  )
+  return arg.ActivationWrapper(
+      data=x.reshape(spec.compact_shape),
+      scale=None,
+      spec=spec,
+  )

@@ -59,13 +59,13 @@ def inner_pipeline(
   def _bucket_fn(bucket_m: int) -> None:
     # Step 1: Wait DMA for the current step slot.
     x_bref.branchless_wait_in(gm_id)
-    out_bref.branchless_wait_out(gm_id - cfg.tile.num_xo_buffers)
+    out_bref.branchless_wait_out(gm_id - cfg.plan.num_xo_buffers)
 
     # Step 2: Start DMA for previous step slot.
     # NOTE: While we typically issue DMA for the other slots before waiting for
     # current slot, that will prevent DMA instructions to be pipelined with
     # compute.  Therefore, DMA is issued after the waiting.
-    x_bref.branchless_copy_in(gm_id + cfg.tile.num_xo_buffers - 1)
+    x_bref.branchless_copy_in(gm_id + cfg.plan.num_xo_buffers - 1)
     out_bref.branchless_copy_out(gm_id - 1)
 
     # Step 3: Load data from VMEM.
@@ -87,21 +87,21 @@ def inner_pipeline(
   # Select which bucket to choose based on number of active rows of given tile.
   num_rows = metadata_ref.get_num_rows(gm_id)
   bucket_idx = pl.cdiv(
-      jnp.maximum(num_rows - cfg.tile.bucket_base, 0), cfg.tile.bucket_base
+      jnp.maximum(num_rows - cfg.plan.bucket_base, 0), cfg.plan.bucket_base
   )
 
   lax.switch(
       bucket_idx,
       [
           functools.partial(_bucket_fn, bucket_m)
-          for bucket_m in cfg.tile.bucket_rows
+          for bucket_m in cfg.plan.bucket_rows
       ],
   )
 
 
 def outer_pipeline(
     metadata_ref: metadata.MetadataRef,
-    in_hbm_ref: memory_ref.PipelineInputs,
+    in_hbm_ref: memory_ref.PipelineInputs[hijax.TransformedRef],
     out_hbm_ref: hijax.TransformedRef,
     *,
     cfg: config.RoutingGmmConfig,
@@ -132,13 +132,13 @@ def outer_pipeline(
     if isinstance(gather_idx, memory_ref.IndexBufferedRef):
       # Prefetch num_xo_buffers - 1 worth of indices into gather SMEM.
       offset = gather_idx.fetch_offset
-      for gm_id in range(cfg.tile.num_xo_buffers - 1):
+      for gm_id in range(cfg.plan.num_xo_buffers - 1):
         gather_idx.copy_in(in_hbm_ref.gather_idx, (0, gm_id - offset, 0))
       # NOTE: Even if number of gather idx buffers is smaller than
       # num_xo_buffers - 1, it does not cause any race condition as semaphores
       # merely counts the size of the total data transfer without concerning
       # each individual DMA instructions.
-      for gm_id in range(cfg.tile.num_xo_buffers - 1):
+      for gm_id in range(cfg.plan.num_xo_buffers - 1):
         gather_idx.wait_in(in_hbm_ref.gather_idx, (0, gm_id - offset, 0))
 
       inputs = dataclasses.replace(inputs, x=inputs.x.bind_idx_ref(gather_idx))
@@ -147,7 +147,7 @@ def outer_pipeline(
     final_allocs = dataclasses.replace(final_allocs, inputs=inputs, out=out)
 
     # Prologue: Prefetch first num_xo_buffers - 1 input tiles.
-    for gm_id in range(cfg.tile.num_xo_buffers - 1):
+    for gm_id in range(cfg.plan.num_xo_buffers - 1):
       final_allocs.inputs.x.branchless_copy_in(gm_id)
 
     # TODO: Add support for N/K dim tiling.
@@ -175,7 +175,7 @@ def outer_pipeline(
     # crresponding copy_out dma performed. Below code ensures that the output
     # from the last step is correctly issued.
     final_allocs.out.branchless_copy_out(num_gm - 1)
-    for buf_idx in range(cfg.tile.num_xo_buffers):
+    for buf_idx in range(cfg.plan.num_xo_buffers):
       final_allocs.out.branchless_wait_out(
-          num_gm - cfg.tile.num_xo_buffers + buf_idx
+          num_gm - cfg.plan.num_xo_buffers + buf_idx
       )

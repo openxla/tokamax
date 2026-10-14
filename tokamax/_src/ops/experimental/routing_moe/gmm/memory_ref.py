@@ -55,18 +55,20 @@ class AbstractWeightRef(abc.ABC):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class SingleWeightRef(AbstractWeightRef):
+class SingleWeightRef[T](AbstractWeightRef):
   """Dataclass for a single weights."""
 
-  weight: Any
-  scale: Any | None
-  bias: Any | None
+  weight: T
+  scale: T | None
+  bias: T | None
 
   def get_weight(self) -> jax.Array:
+    assert isinstance(self.weight, hijax.TransformedRef)
     return self.weight[...]
 
   def get_scale(self, replicate_size: int | None = None) -> jax.Array:
     assert self.scale is not None
+    assert isinstance(self.scale, hijax.TransformedRef)
     if replicate_size is not None:
       # Perform zero-stride load for efficient broadcasting across sublanes.
       return self.scale[:, pl.ds(0, replicate_size, 0), :]
@@ -74,16 +76,17 @@ class SingleWeightRef(AbstractWeightRef):
 
   def get_bias(self) -> jax.Array:
     assert self.bias is not None
+    assert isinstance(self.bias, hijax.TransformedRef)
     return self.bias[...]
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class FusedWeightsRef(AbstractWeightRef):
+class FusedWeightsRef[T](AbstractWeightRef):
   """Dataclass for gate and up weights used in fused activation."""
 
-  gate: SingleWeightRef
-  up: SingleWeightRef
+  gate: SingleWeightRef[T]
+  up: SingleWeightRef[T]
 
   def get_weight(self) -> jax.Array:
     w_gate = self.gate.get_weight()
@@ -272,7 +275,7 @@ class IndexBufferedRef(pltpu.BufferedRef):
 
   def _aligned_range(self, tile_id) -> tuple[jax.Array, jax.Array]:
     """Returns an tile range aligned to block size tile_m_idx."""
-    block_size = self.cfg.tile.tile_m_idx
+    block_size = self.cfg.plan.tile_m_idx
     m_start = self.metadata_ref.get_m_offset(tile_id)
     m_end = m_start + self.metadata_ref.get_num_rows(tile_id)
     aligned_start = (m_start // block_size) * block_size
@@ -290,7 +293,7 @@ class IndexBufferedRef(pltpu.BufferedRef):
     gm_id = grid_indices[1]
 
     aligned_start, aligned_size = self._aligned_range(gm_id + self.fetch_offset)
-    local_start = aligned_start % self.cfg.tile.idx_buffer_size
+    local_start = aligned_start % self.cfg.plan.idx_buffer_size
     pltpu.make_async_copy(
         src_ref=idx_hbm_ref.at[pl.ds(aligned_start, aligned_size)],
         dst_ref=window_ref.at[pl.ds(local_start, aligned_size)],
@@ -327,7 +330,7 @@ class IndexBufferedRef(pltpu.BufferedRef):
       @pl.when(is_last_gm)
       def _():
         aligned_start, aligned_size = self._aligned_range(gm_id)
-        local_start = aligned_start % self.cfg.tile.idx_buffer_size
+        local_start = aligned_start % self.cfg.plan.idx_buffer_size
         # NOTE: Because this copy_in is manually triggered at the last step,
         # the caller MUST trigger corresponding wait_in at the epilogue.
         pltpu.make_async_copy(
@@ -343,7 +346,7 @@ class BranchlessBufferedRef(RoutingBufferedRef):
   """BufferedRef that performs branchless DMA to allow matmul overlap."""
 
   def _slot(self, gm_id: jax.Array | int) -> jax.Array:
-    return jnp.mod(gm_id, self.cfg.tile.num_xo_buffers)
+    return jnp.mod(gm_id, self.cfg.plan.num_xo_buffers)
 
   @override
   def branchless_copy_in(self, gm_id: jax.Array | int) -> None:
@@ -359,11 +362,11 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     hbm_src = self.src_ref
     blocks = hbm_src.shape[1]
 
-    idx_buffer_size = self.cfg.tile.idx_buffer_size
+    idx_buffer_size = self.cfg.plan.idx_buffer_size
     offset = self.metadata_ref.get_m_offset(gm_id) % idx_buffer_size
     rows = self.metadata_ref.get_num_rows(gm_id)
 
-    for r in range(self.cfg.tile.tile_m):
+    for r in range(self.cfg.plan.tile_m):
       size = jnp.where(r < rows, 1, 0)
       row = self.idx_ref[offset + r]
       pltpu.make_async_copy(
@@ -386,11 +389,11 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     hbm_dst = self.dst_ref
     blocks = hbm_dst.shape[1]
 
-    idx_buffer_size = self.cfg.tile.idx_buffer_size
+    idx_buffer_size = self.cfg.plan.idx_buffer_size
     offset = self.metadata_ref.get_m_offset(gm_id) % idx_buffer_size
     rows = self.metadata_ref.get_num_rows(gm_id)
 
-    for r in range(self.cfg.tile.tile_m):
+    for r in range(self.cfg.plan.tile_m):
       size = jnp.where(r < rows, 1, 0)
       row = self.idx_ref[offset + r]
       pltpu.make_async_copy(
@@ -493,7 +496,7 @@ class PipelineBlockSpecs:
   def _act_spec(self, hbm_shape: tuple[int, ...]) -> pl.BlockSpec:
     num_chunks = layout_util.to_bank_conflict_aware_stride(hbm_shape[1])
     block_shape = (
-        pl.BoundedSlice(self.cfg.tile.tile_m),
+        pl.BoundedSlice(self.cfg.plan.tile_m),
         pl.BoundedSlice(num_chunks),
         *hbm_shape[2:],
     )
@@ -506,20 +509,20 @@ class PipelineBlockSpecs:
         memory_space=pltpu.VMEM,
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
-        pipeline_mode=pl.Buffered(buffer_count=self.cfg.tile.num_xo_buffers),
+        pipeline_mode=pl.Buffered(buffer_count=self.cfg.plan.num_xo_buffers),
     )
 
   def get_x_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the input activation tensor."""
-    return self._act_spec(self.cfg.x.compact_shape)
+    return self._act_spec(self.cfg.x.spec.compact_shape)
 
   def get_out_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the output activation tensor."""
-    return self._act_spec(self.cfg.out.compact_shape)
+    return self._act_spec(self.cfg.out.spec.compact_shape)
 
   def get_weight_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the expert weight tensor."""
-    block_shape = (None, self.cfg.tile.tile_k, self.cfg.tile.tile_n)
+    block_shape = (None, self.cfg.plan.tile_k, self.cfg.plan.tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.weight_index,
@@ -527,13 +530,13 @@ class PipelineBlockSpecs:
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
         pipeline_mode=pl.Buffered(
-            buffer_count=self.cfg.tile.num_w_buffers, use_lookahead=True
+            buffer_count=self.cfg.plan.num_w_buffers, use_lookahead=True
         ),
     )
 
   def get_scale_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the quantization scale tensor."""
-    block_shape = (None, 1, 1, self.cfg.tile.tile_n)
+    block_shape = (None, 1, 1, self.cfg.plan.tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.scale_index,
@@ -541,7 +544,7 @@ class PipelineBlockSpecs:
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
         pipeline_mode=pl.Buffered(
-            buffer_count=self.cfg.tile.num_w_buffers, use_lookahead=True
+            buffer_count=self.cfg.plan.num_w_buffers, use_lookahead=True
         ),
     )
 
@@ -553,7 +556,7 @@ class PipelineBlockSpecs:
     # NOTE: Technically we can tighten this to use much less SMEM, but when
     # considering this approach does not take up too much SMEM, it is better
     # to just keep things simple.
-    block_shape = (self.cfg.tile.idx_buffer_size,)
+    block_shape = (self.cfg.plan.idx_buffer_size,)
 
     return pl.BlockSpec(
         block_shape=block_shape,
@@ -567,7 +570,7 @@ class PipelineBlockSpecs:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class PipelineInputs:
+class PipelineInputs[T]:
   """Pipelined input parameter bundle for the routing GMM kernel.
 
   Devoid of stateful data management so emit_pipeline and inner_pipeline can
@@ -580,12 +583,14 @@ class PipelineInputs:
     scatter_idx: Row indices used by out. Set to None when DIRECT mode is used.
   """
 
-  x: Any
+  x: T
   w: AbstractWeightRef
-  gather_idx: Any | None = None
-  scatter_idx: Any | None = None
+  gather_idx: T | None = None
+  scatter_idx: T | None = None
 
-  def transform_for_pipeline(self, cfg: config.RoutingGmmConfig):
+  def transform_for_pipeline(
+      self, cfg: config.RoutingGmmConfig
+  ):
     """Returns inputs with weights sliced for fused gate/up activation."""
     if cfg.fuse_act is None:
       return self
@@ -610,13 +615,13 @@ class PipelineAllocs:
     out: Output activation BufferedRef.
   """
 
-  inputs: PipelineInputs
+  inputs: PipelineInputs[RoutingBufferedRef]
   out: RoutingBufferedRef
 
   @classmethod
   def create(
       cls,
-      in_hbm_ref: PipelineInputs,
+      in_hbm_ref: PipelineInputs[hijax.TransformedRef],
       out_hbm_ref: hijax.TransformedRef,
       metadata_ref: metadata.MetadataRef,
       cfg: config.RoutingGmmConfig,
@@ -644,7 +649,7 @@ class PipelineAllocs:
       scale_bref = pltpu.BufferedRef.input(
           spec=pipeline_block_specs.get_scale_spec(),
           dtype_or_type=w_hbm_ref.scale.dtype,
-          buffer_count=cfg.tile.num_w_buffers,
+          buffer_count=cfg.plan.num_w_buffers,
           use_lookahead=True,
           grid_rank=3,
       )
@@ -652,7 +657,7 @@ class PipelineAllocs:
     weight_bref = pltpu.BufferedRef.input(
         spec=pipeline_block_specs.get_weight_spec(),
         dtype_or_type=w_hbm_ref.weight.dtype,
-        buffer_count=cfg.tile.num_w_buffers,
+        buffer_count=cfg.plan.num_w_buffers,
         use_lookahead=True,
         grid_rank=3,
     )
@@ -674,7 +679,7 @@ class PipelineAllocs:
     x_bref = _get_buffered_ref(cfg.x.mode).input(
         spec=pipeline_block_specs.get_x_spec(),
         dtype_or_type=x_hbm_ref.dtype,
-        buffer_count=cfg.tile.num_xo_buffers,
+        buffer_count=cfg.plan.num_xo_buffers,
         grid_rank=3,
         metadata_ref=metadata_ref,
         src_ref=x_hbm_ref,
@@ -683,7 +688,7 @@ class PipelineAllocs:
     out_bref = _get_buffered_ref(cfg.out.mode).output(
         spec=pipeline_block_specs.get_out_spec(),
         dtype_or_type=out_hbm_ref.dtype,
-        buffer_count=cfg.tile.num_xo_buffers,
+        buffer_count=cfg.plan.num_xo_buffers,
         grid_rank=3,
         cfg=cfg,
         metadata_ref=metadata_ref,
@@ -695,7 +700,7 @@ class PipelineAllocs:
     gather_bref = scatter_bref = None
     if in_hbm_ref.gather_idx is not None:
       # At step i the inner_pipeline gathers tile i + (num_xo_buffers - 1).
-      fetch_offset = cfg.tile.num_xo_buffers - 1
+      fetch_offset = cfg.plan.num_xo_buffers - 1
       gather_bref = IndexBufferedRef.input(
           spec=pipeline_block_specs.get_index_spec(),
           dtype_or_type=in_hbm_ref.gather_idx.dtype,
@@ -727,12 +732,14 @@ class PipelineAllocs:
     )
 
   @property
-  def all_tree(self) -> tuple[PipelineInputs, RoutingBufferedRef]:
+  def all_tree(
+      self,
+  ) -> tuple[PipelineInputs[RoutingBufferedRef], RoutingBufferedRef]:
     """The tuple of (inputs, out) BufferedRefs for pipeline allocation."""
     return (self.inputs, self.out)
 
   @property
-  def in_specs(self) -> PipelineInputs:
+  def in_specs(self) -> PipelineInputs[pl.BlockSpec]:
     """The BlockSpec PyTree corresponding to the pipelined inputs."""
     return jax.tree.map(
         lambda bref: bref.spec,

@@ -13,7 +13,11 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Module for static config object."""
+"""Resolved static configuration of the routing GMM kernel.
+
+Config is the single source of truth that kernel modules read: specs, derived
+sizes, and the resolved plans. No execution decision is made by config.
+"""
 
 import dataclasses
 import enum
@@ -22,92 +26,106 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.gmm import plan as plan_lib
 
 
 class RoutingMode(enum.StrEnum):
-  """Instructs how DMA for input and output should be done."""
+  """Instructions on how DMA for input and output should be done."""
 
   DIRECT = enum.auto()  # DMA is performed on continuous memory region.
   LOCAL = enum.auto()  # Local DMA is performed in per-row basis.
-  # TODO: Support remove DMA.
+  # TODO: Support remote DMA.
   REMOTE = enum.auto()  # Remote DMA is performed in per-row basis.
 
 
 @dataclasses.dataclass(frozen=True)
-class WeightConfig:
-  quant_dtype: jnp.dtype | None
-  quant_block_size: int | None
+class DynamicQuantConfig:
+  """Dynamic quantization of an activation as seen by compute."""
+
   dtype: jnp.dtype
-  has_bias: bool = False
-  has_scale: bool = False
+  block_size: int
 
 
 @dataclasses.dataclass(frozen=True)
 class ActivationConfig:
-  """Contains how activation should be processed."""
+  """User provided spec of an activation and the kernel's decisions on it."""
 
-  rows: int
-  cols: int
-  dtype: jnp.dtype
-  quant_dtype: jnp.dtype | None
-  quant_block_size: int | None
+  spec: arg.ActivationSpec
   mode: RoutingMode
-
-  @property
-  def should_quantize(self) -> bool:
-    if self.quant_dtype is None:
-      return False
-    return self.quant_dtype != self.dtype
-
-  @property
-  def compact_shape(self) -> tuple[int, int, int, int]:
-    return layout_util.to_compact_shape((self.rows, self.cols), self.dtype)
+  dynamic_quant: DynamicQuantConfig | None = None
 
 
 @dataclasses.dataclass(frozen=True)
 class Dimension:
-  size_m: int
+  """Problem sizes derived from the specs."""
+
+  size_m: int  # Rows of x.
   size_k: int
-  size_n: int
+  size_n: int  # Columns of w, including both halves when gate/up fused.
   size_out_m: int
   size_out_n: int
   size_local_groups: int
   size_global_groups: int
 
+  @classmethod
+  def create(
+      cls,
+      *,
+      x: arg.ActivationSpec,
+      w: arg.WeightSpec,
+      num_global_groups: int,
+      gather: arg.RoutingSpec | None,
+      scatter: arg.RoutingSpec | None,
+      fuse_act: str | None,
+  ):
+    """Validates the specs against each other and derives problem sizes."""
+    if x.col_size != w.in_size:
+      raise ValueError(
+          f"x col_size ({x.col_size}) must match w in_size ({w.in_size})."
+      )
+    if num_global_groups < w.group_size:
+      raise ValueError(
+          f"group_sizes must cover at least {w.group_size} groups. Got"
+          f" {num_global_groups}."
+      )
+    if fuse_act is not None and not w.fused_gate_up:
+      raise ValueError("fuse_act requires a weight with fused_gate_up=True.")
+    if w.has_bias:
+      raise NotImplementedError("Bias is not supported yet.")
+    if gather is not None and scatter is not None:
+      raise NotImplementedError(
+          "Simultaneous gather and scatter is not supported."
+      )
 
-@dataclasses.dataclass(frozen=True)
-class TileConfig:
-  """Contains how input and output should be tiled."""
+    size_m = x.row_size
+    # The fused activation combines a gate column and an up column into one, so
+    # the output halves only when fuse_act is applied. fused_gate_up alone does
+    # not change the width.
+    size_out_n = w.out_size // 2 if fuse_act is not None else w.out_size
+    size_out_m = size_m
+    if gather is not None:
+      if gather.remote_axis is not None:
+        raise NotImplementedError("Remote gather is not supported.")
+      size_out_m = gather.num_indices
+    if scatter is not None:
+      if scatter.num_indices != size_m:
+        raise ValueError(
+            f"scatter must map every x row ({size_m}). Got num_indices"
+            f" {scatter.num_indices}."
+        )
+      if scatter.remote_axis is not None:
+        raise NotImplementedError("Remote scatter is not supported.")
 
-  tile_m: int
-  tile_k: int
-  tile_n: int
-  bucket_base: int
-  num_xo_buffers: int = 3
-  num_w_buffers: int = 2
-
-  @property
-  def bucket_rows(self):
-    bucket_base = self.bucket_base
-    # Explicitly include tile_m in case tile_m % bucket_base != 0.
-    return [*range(bucket_base, self.tile_m, bucket_base), self.tile_m]
-
-  @property
-  def tile_m_idx(self):
-    # TODO: Fetch this from tpu_info instead of using magic numbers.
-    num_lanes = 128
-    return pl.cdiv(self.tile_m, num_lanes) * num_lanes
-
-  @property
-  def idx_buffer_size(self):
-    # idx buffer requires at least one gap between read range and write range
-    # to avoid corruption.
-    return self.tile_m_idx * max(self.num_xo_buffers, 3)
-
-  @property
-  def num_max_buffers(self):
-    return max(self.num_xo_buffers, self.num_w_buffers)
+    return cls(
+        size_m=size_m,
+        size_k=x.col_size,
+        size_n=w.out_size,
+        size_out_m=size_out_m,
+        size_out_n=size_out_n,
+        size_local_groups=w.group_size,
+        size_global_groups=num_global_groups,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,122 +133,116 @@ class RoutingGmmConfig:
   """Stores compile time static information of routing gmm."""
 
   dim: Dimension
-  tile: TileConfig
+  plan: plan_lib.ResolvedPlan
   x: ActivationConfig
-  w: WeightConfig
+  w: arg.WeightSpec
   out: ActivationConfig
-  tpu_info: pltpu.TpuInfo
+  gather: arg.RoutingSpec | None
+  scatter: arg.RoutingSpec | None
   fuse_act: str | None
-  acc_dtype: jnp.dtype
+  tpu_info: pltpu.TpuInfo
 
   @classmethod
   def create(
       cls,
-      x: jax.Array,
-      w: jax.Array,
-      w_scale: jax.Array | None,
-      group_sizes: jax.Array,
-      group_offset: jax.Array | None,
-      gather_indices: jax.Array | None,
-      scatter_indices: jax.Array | None,
-      tile: TileConfig | None,
+      *,
+      x: arg.ActivationSpec,
+      w: arg.WeightSpec,
+      dim: Dimension,
+      plan: plan_lib.ResolvedPlan,
+      gather: arg.RoutingSpec | None,
+      scatter: arg.RoutingSpec | None,
       fuse_act: str | None,
-      acc_dtype: jnp.dtype,
+      out_dtype: jnp.dtype | None,
+      tpu_info: pltpu.TpuInfo,
   ):
-    """Create routing gmm config object based on arguments."""
+    """Assembles the config and validates the plan against specs and HW."""
+    if x.quant is not None:
+      # TODO: Load pre-computed scales in compute.
+      raise NotImplementedError("Pre-quantized x is not supported yet.")
 
-    del group_offset
+    # Spec states dtype of the input and plan states conversion during compute.
+    # Neither alone states the dtype compute sees. Config derives it from both.
+    x_quant = None
+    if plan.matmul_dtype != x.dtype:
+      assert plan.x_quant_block_size is not None
+      x_quant = DynamicQuantConfig(
+          dtype=plan.matmul_dtype, block_size=plan.x_quant_block_size
+      )
 
-    if tile is not None:
-      raise NotImplementedError("Overriding tile config is not supported.")
-
-    size_local_groups, size_k, size_n = w.shape
-    size_global_groups = group_sizes.size
-
-    size_m = size_out_m = x.shape[0]
-
-    # Step 1: Initialize static config objects.
-    x_mode = out_mode = RoutingMode.DIRECT
-    if gather_indices is not None and scatter_indices is not None:
-      raise NotImplementedError()
-    elif gather_indices is not None:
-      x_mode = RoutingMode.LOCAL
-      size_out_m = gather_indices.shape[0]
-    elif scatter_indices is not None:
-      out_mode = RoutingMode.LOCAL
-      size_out_m = scatter_indices.shape[0]
-
-    w_quant_block_size = None
-    w_quant_dtype = None
-    x_quant_dtype = None
-    has_scale = False
-    if w_scale is not None:
-      num_scales = w_scale.shape[1]
-      w_quant_block_size = size_k
-      w_quant_dtype = w.dtype
-      has_scale = True
-
-      # TODO: Support mixed precision.
-      x_quant_dtype = w.dtype
-
-    w_cfg = WeightConfig(
-        quant_dtype=w_quant_dtype,
-        dtype=w.dtype,
-        quant_block_size=w_quant_block_size,
-        has_scale=has_scale,
+    out_spec = arg.ActivationSpec(
+        row_size=dim.size_out_m,
+        col_size=dim.size_out_n,
+        dtype=x.dtype if out_dtype is None else out_dtype,
     )
 
-    x_cfg = ActivationConfig(
-        rows=size_m,
-        cols=size_k,
-        mode=x_mode,
-        quant_dtype=x_quant_dtype,
-        dtype=x.dtype,
-        # TODO: Choose different block size based on HW.
-        quant_block_size=512,
-    )
+    def _resolve_mode(routing: arg.RoutingSpec | None) -> RoutingMode:
+      if routing is None:
+        return RoutingMode.DIRECT
+      if routing.remote_axis is None:
+        return RoutingMode.LOCAL
+      return RoutingMode.REMOTE
 
-    size_out_n = size_n
-    if fuse_act is not None:
-      size_out_n //= 2
-    out_cfg = ActivationConfig(
-        rows=size_out_m,
-        cols=size_out_n,
-        mode=out_mode,
-        dtype=x.dtype,
-        quant_dtype=None,
-        quant_block_size=None,
-    )
+    x_mode = _resolve_mode(gather)
+    out_mode = _resolve_mode(scatter)
 
-    dim = Dimension(
-        size_m=size_m,
-        size_k=size_k,
-        size_n=size_n,
-        size_out_m=size_out_m,
-        size_out_n=size_out_n,
-        size_local_groups=size_local_groups,
-        size_global_groups=size_global_groups,
-    )
-
-    tile = calculate_tile_size(x_cfg, w_cfg, out_cfg, dim)
-
-    return cls(
-        tpu_info=pltpu.get_tpu_info(),
-        fuse_act=fuse_act,
+    cfg = cls(
         dim=dim,
-        tile=tile,
-        x=x_cfg,
-        w=w_cfg,
-        out=out_cfg,
-        acc_dtype=acc_dtype,
+        plan=plan,
+        x=ActivationConfig(spec=x, mode=x_mode, dynamic_quant=x_quant),
+        w=w,
+        out=ActivationConfig(spec=out_spec, mode=out_mode),
+        gather=gather,
+        scatter=scatter,
+        fuse_act=fuse_act,
+        tpu_info=tpu_info,
     )
+
+    x_bits = jax.dtypes.itemsize_bits(cfg.plan.matmul_dtype)
+    if x_bits < jax.dtypes.itemsize_bits(cfg.w.dtype):
+      raise ValueError(
+          f"x_exec_dtype ({cfg.plan.matmul_dtype}) must not be narrower"
+          f" than w dtype ({cfg.w.dtype})."
+      )
+    if cfg.x.dynamic_quant is None and cfg.plan.x_quant_block_size is not None:
+      raise ValueError(
+          "plan.x_quant_block_size has no effect when x is not quantized."
+      )
+    if cfg.plan.acc_dtype not in (jnp.bfloat16.dtype, jnp.float32.dtype):
+      raise ValueError(
+          "acc_dtype must be bfloat16 or float32. Got"
+          f" {cfg.plan.acc_dtype}."
+      )
+    tiles_kn = (cfg.plan.tile_k, cfg.plan.tile_n)
+    if tiles_kn != (cfg.dim.size_k, cfg.dim.size_out_n):
+      raise NotImplementedError("N/K dim tiling is not supported yet.")
+    if not 0 < cfg.plan.bucket_base <= cfg.plan.tile_m:
+      raise ValueError(
+          f"bucket_base ({cfg.plan.bucket_base}) must be in (0, tile_m="
+          f"{cfg.plan.tile_m}]."
+      )
+    if cfg.plan.num_xo_buffers < 3:
+      raise ValueError(
+          "To overlap DMA SALU, activation buffer counts must be at least 3."
+      )
+    if cfg.plan.num_w_buffers < 2:
+      raise ValueError("Buffer counts must be at least 2.")
+    smem_threshold = int(0.45 * tpu_info.smem_capacity_bytes)
+    # 3: _to_group_id, _to_m_offset, _to_num_rows. 4: int32.
+    smem_allocation = (cfg.max_num_gm * 3) * 4
+    if smem_allocation >= smem_threshold:
+      raise ValueError(
+          f"Total number of SMEM allocation must be less than {smem_threshold}"
+          f" to avoid OOM. Got {smem_allocation}"
+      )
+    return cfg
 
   @property
   def max_num_gm(self) -> int:
     """Returns maximum number of possible tiles including OOB safety padding."""
-    max_num_single_group = pl.cdiv(self.dim.size_out_m, self.tile.tile_m)
+    max_num_single_group = pl.cdiv(self.dim.size_out_m, self.plan.tile_m)
     # Padd left and right by number of buffers to avoid OOB access.
-    safety_padding = self.tile.num_max_buffers * 2
+    safety_padding = self.plan.num_max_buffers * 2
     return self.dim.size_local_groups + max_num_single_group + safety_padding
 
   @property
@@ -238,61 +250,7 @@ class RoutingGmmConfig:
     name = f"routing_gmm-{self.x.mode}-{self.out.mode}"
     name += f"-g{self.dim.size_local_groups}-m{self.dim.size_out_m}"
     name += f"-k{self.dim.size_k}-n{self.dim.size_out_n}"
+    name += f"-tm{self.plan.tile_m}"
+    if self.x.dynamic_quant is not None:
+      name += f"-xq{self.x.dynamic_quant.dtype.name}"
     return name
-
-  def validate(self, x, w, w_scale, group_sizes):
-    """Validate if arguments are correct."""
-
-    # TODO: Maybe perform this while config creation phase?
-
-    if x.shape != self.x.compact_shape:
-      raise ValueError(
-          f"Input x must have shae of {self.x.compact_shape}. Got {x.shape}."
-      )
-    w_shape = (self.dim.size_local_groups, self.dim.size_k, self.dim.size_n)
-    if w.shape != w_shape:
-      raise ValueError(f"Weight shape must be {w_shape}. Got {w.shape}.")
-
-    if group_sizes.size < self.dim.size_local_groups:
-      raise ValueError(
-          f"group_sizes must be {self.dim.size_local_groups}. Got"
-          f" {group_sizes.shape}."
-      )
-    scale_shape = (self.dim.size_local_groups, 1, 1, self.dim.size_n)
-    if w_scale is not None and w_scale.shape != scale_shape:
-      raise ValueError(
-          f"w_scale must be per channel with shape {scale_shape}. Got"
-          f" {w_scale.shape}."
-      )
-
-    smem_threshold = int(0.45 * self.tpu_info.smem_capacity_bytes)
-    # 3: _to_group_id, _to_m_offset, _to_num_rows. 4: int32.
-    smem_allocation = (self.max_num_gm * 3) * 4
-    if smem_allocation >= smem_threshold:
-      raise ValueError(
-          f"Total number of SMEM allocation must be less than {smem_threshold}"
-          f" to avoid OOM. Got {smem_allocation}"
-      )
-
-
-def calculate_tile_size(
-    x: ActivationConfig, w: WeightConfig, out: ActivationConfig, dim: Dimension
-) -> TileConfig:
-  """Utilize heuristic to calculate tile size for given inputs."""
-
-  del x, w, out
-
-  # TODO: Add more sophisticated tile selection logic.
-  tile_m = min(256, dim.size_out_m)
-  bucket_base = min(128, tile_m)
-
-  # TODO: Support N/K dim tiling.
-  tile_n = dim.size_out_n
-  tile_k = dim.size_k
-
-  return TileConfig(
-      tile_m=tile_m,
-      tile_k=tile_k,
-      tile_n=tile_n,
-      bucket_base=bucket_base,
-  )

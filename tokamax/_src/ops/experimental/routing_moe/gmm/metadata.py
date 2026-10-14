@@ -63,7 +63,7 @@ class MetadataRef:
     )
 
   def _real_gm_id(self, gm_id: jax.Array | int) -> jax.Array | int:
-    return gm_id + self.cfg.tile.num_max_buffers
+    return gm_id + self.cfg.plan.num_max_buffers
 
   def get_num_rows(self, gm_id: jax.Array | int) -> jax.Array:
     return self._gm_id_to_num_rows[self._real_gm_id(gm_id)]
@@ -83,7 +83,7 @@ class MetadataRef:
 
     group_start = self.group_offset[0]
     group_end = group_start + self.cfg.dim.size_local_groups
-    num_buffers = self.cfg.tile.num_max_buffers
+    num_buffers = self.cfg.plan.num_max_buffers
 
     # To avoid any runtime out-of-the-bounds check overhead, we intentially
     # start gm_id from num_buffers so that trying to DMA wait gm_id -
@@ -95,7 +95,7 @@ class MetadataRef:
 
     @jax.named_scope("write_tile")
     def write_tile(gm_id, offset, *, local_group_id, end):
-      num_rows = jnp.minimum(end - offset, self.cfg.tile.tile_m)
+      num_rows = jnp.minimum(end - offset, self.cfg.plan.tile_m)
       self._gm_id_to_group_id[gm_id] = local_group_id
       self._gm_id_to_m_offset[gm_id] = offset
       self._gm_id_to_num_rows[gm_id] = num_rows
@@ -105,7 +105,7 @@ class MetadataRef:
     def write_group(group_id, num_gm):
       start = self.group_cum_sum[group_id]
       end = self.group_cum_sum[group_id + 1]
-      next_num_gm = num_gm + pl.cdiv(end - start, self.cfg.tile.tile_m)
+      next_num_gm = num_gm + pl.cdiv(end - start, self.cfg.plan.tile_m)
       local_group_id = group_id - group_start
 
       jax.lax.fori_loop(

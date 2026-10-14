@@ -27,6 +27,7 @@
 ```text
 routing_moe/
 ├── common/
+│   ├── arg.py: Spec and wrapper of inputs for communicating between modules.
 │   └── layout_util.py: Utility for compact and large layout transformation.
 ├── gmm/
 │   ├── compute.py: Stateless matrix multiplication logic.
@@ -34,6 +35,7 @@ routing_moe/
 │   ├── kernel.py: gmm entry point that expects compact layout for activations.
 │   ├── memory_ref.py: Memory module that handles buffer management and DMA.
 │   ├── metadata.py: Dynamic per-step metadata consumed by pipeline and memory module.
+│   ├── plan.py: Tunable parameters for kernel execution that has no impact on outputs.
 │   └── pipeline.py: Main Orchestrator for stateful DMA and stateless compute.
 ├── io_relayout/
 │   ├── input_pack.py: Handles large -> compact layout transformation.

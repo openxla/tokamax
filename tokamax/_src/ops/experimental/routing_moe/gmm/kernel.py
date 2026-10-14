@@ -26,42 +26,62 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 from tokamax._src.ops.experimental.routing_moe.gmm import pipeline
+from tokamax._src.ops.experimental.routing_moe.gmm import plan
 
 
-@jax.jit(static_argnames=("tile", "fuse_act", "acc_dtype"))
+@jax.jit(static_argnames=("fuse_act", "out_dtype", "custom_plan"))
 def routing_gmm(
-    x: jax.Array,  # [m_in, k // lane_size // packing, packing, lane_size]
-    w: jax.Array,  # [local_groups, k, n]
+    x: arg.ActivationWrapper[jax.Array],
+    w: arg.SingleWeightWrapper[jax.Array],
     group_sizes: jax.Array,  # [global_groups]
-    w_scale: jax.Array | None = None,  # [local_groups, num_scales, 1, n]
     *,
-    acc_dtype: jnp.dtype = jnp.bfloat16.dtype,
     group_offset: jax.Array | None = None,  # [1]
-    gather_indices: jax.Array | None = None,  # [m_out]
-    scatter_indices: jax.Array | None = None,  # [m_out]
-    tile: config.TileConfig | None = None,
+    gather: arg.RoutingWrapper[jax.Array] | None = None,
+    scatter: arg.RoutingWrapper[jax.Array] | None = None,
     fuse_act: str | None = None,
-) -> jax.Array:
+    out_dtype: jnp.dtype | None = None,
+    custom_plan: plan.RoutingGmmPlan | None = None,
+) -> arg.ActivationWrapper[jax.Array]:
   """GMM that pipelines routing and compute for both input and output."""
 
-  # Step 1: Create config object.
-  cfg = config.RoutingGmmConfig.create(
-      x=x,
-      w=w,
-      w_scale=w_scale,
-      group_sizes=group_sizes,
-      group_offset=group_offset,
-      gather_indices=gather_indices,
-      scatter_indices=scatter_indices,
-      tile=tile,
+  gather_spec = None if gather is None else gather.spec
+  scatter_spec = None if scatter is None else scatter.spec
+
+  # Step 1: Derive sizes, resolve the plan, and construct the config.
+  tpu_info = pltpu.get_tpu_info()
+  dim = config.Dimension.create(
+      x=x.spec,
+      w=w.spec,
+      num_global_groups=group_sizes.size,
+      gather=gather_spec,
+      scatter=scatter_spec,
       fuse_act=fuse_act,
-      acc_dtype=acc_dtype,
   )
-  cfg.validate(x, w, w_scale, group_sizes)
+  resolved_plan = plan.ResolvedPlan.create(
+      custom_plan,
+      x=x.spec,
+      w=w.spec,
+      size_out_m=dim.size_out_m,
+      size_k=dim.size_k,
+      size_out_n=dim.size_out_n,
+      tpu_info=tpu_info,
+  )
+  cfg = config.RoutingGmmConfig.create(
+      x=x.spec,
+      w=w.spec,
+      dim=dim,
+      plan=resolved_plan,
+      gather=gather_spec,
+      scatter=scatter_spec,
+      fuse_act=fuse_act,
+      out_dtype=out_dtype,
+      tpu_info=tpu_info,
+  )
 
   # Step 2: Pre-process inputs.
   if group_offset is None:
@@ -71,19 +91,23 @@ def routing_gmm(
       group_offset = group_offset[None]
   group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
 
-  # Step 3: Wrap inputs in parameter object.
+  # Pad indices by tile_m_idx to ensure DMA and indexing does not trigger OOB.
+  def _padded_indices(routing: arg.RoutingWrapper[jax.Array] | None):
+    if routing is None:
+      return None
+    return jnp.pad(routing.indices, (0, cfg.plan.tile_m_idx))
+
+  # Step 3: Wrap inputs in the pipeline's parameter object. emit_pipeline needs
+  # HBM refs and VMEM allocations to share one pytree structure, so the API
+  # wrappers are reduced to their data here.
+  w_scale = w.scale
   if w_scale is not None:
     w_scale = w_scale.astype(jnp.float32)
-  wrapped_w = memory_ref.SingleWeightRef(weight=w, scale=w_scale, bias=None)
-
-  # Pad indices by tile_m_idx to ensure DMA and indexing does not trigger OOB.
-  if gather_indices is not None:
-    gather_indices = jnp.pad(gather_indices, (0, cfg.tile.tile_m_idx))
-  if scatter_indices is not None:
-    scatter_indices = jnp.pad(scatter_indices, (0, cfg.tile.tile_m_idx))
-
-  inputs = memory_ref.PipelineInputs(
-      x=x, w=wrapped_w, gather_idx=gather_indices, scatter_idx=scatter_indices
+  inputs = memory_ref.PipelineInputs[jax.Array](
+      x=x.data,
+      w=memory_ref.SingleWeightRef(weight=w.weight, scale=w_scale, bias=w.bias),
+      gather_idx=_padded_indices(gather),
+      scatter_idx=_padded_indices(scatter),
   )
 
   metadata_obj = metadata.MetadataRef.create(group_cum_sum, group_offset, cfg)
@@ -92,19 +116,19 @@ def routing_gmm(
   inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
   metadata_obj = memory_ref.map_memory_constraint(metadata_obj, pltpu.SMEM)
   out = memory_ref.map_memory_constraint(
-      jnp.empty(cfg.out.compact_shape, cfg.out.dtype), pltpu.HBM
+      jnp.empty(cfg.out.spec.compact_shape, cfg.out.spec.dtype), pltpu.HBM
   )
 
   # Step 5: Call kernel.
   num_cores = cfg.tpu_info.num_cores
   # NOTE: On megacore hardware, this will incur redundant compute. Furture work
   # is needed to enable parallelism in such hardware.
-  return pl.kernel(
+  out_data = pl.kernel(
       functools.partial(pipeline.outer_pipeline, cfg=cfg),
       mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=num_cores),
       out_type=out,
       compiler_params=pltpu.CompilerParams(
-          vmem_limit_bytes=cfg.tpu_info.vmem_capacity_bytes,
+          vmem_limit_bytes=cfg.plan.vmem_limit_bytes,
           disable_bounds_checks=True,
           # NOTE: This is critical to ensure DMA instruction are correctly
           # scheduled to avoid resource contention.
@@ -112,3 +136,4 @@ def routing_gmm(
       ),
       name=cfg.kernel_name,
   )(metadata_obj, inputs)
+  return arg.ActivationWrapper(data=out_data, scale=None, spec=cfg.out.spec)

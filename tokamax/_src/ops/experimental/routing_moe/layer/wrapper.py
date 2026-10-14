@@ -20,6 +20,7 @@ import functools
 import jax
 from jax import numpy as jnp
 from jax import sharding
+from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel as gmm
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.experimental.routing_moe.io_relayout import output_reduce
@@ -100,7 +101,7 @@ def routing_moe_local(
   # repacking triggers both input and output relayout. Thus, we need to perform
   # repacking after all-gather.
   # TODO: Support all-gather with compact layout.
-  x = input_pack.input_pack(x)
+  x_compact = input_pack.input_pack(x)
 
   # Step 4: Sort indices and compute expert group sizes.
   # NOTE: Unlike topk, index sorting has to be done after all-gather to ensure
@@ -108,14 +109,12 @@ def routing_moe_local(
   topk_indices_flat = topk_indices.flatten()
   topk_argsort_indices = jnp.argsort(topk_indices_flat)
   group_sizes = jnp.bincount(topk_indices_flat, length=global_num_experts)
-
   # Step 5: Invoke GMM Gate and Up.
   gmm1_res = gmm.routing_gmm(
-      x=x,
-      w=w1,
-      w_scale=w1_scale,
+      x=x_compact,
+      w=arg.make_weight_wrapper(w1, w1_scale, w1_bias, fused_gate_up=True),
       group_sizes=group_sizes,
-      gather_indices=topk_argsort_indices // topk,
+      gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
       fuse_act=activation,
       group_offset=group_offset,
   )
@@ -123,10 +122,9 @@ def routing_moe_local(
   # Step 6: Invoke GMM Down.
   gmm2_res = gmm.routing_gmm(
       x=gmm1_res,
-      w=w2,
-      w_scale=w2_scale,
+      w=arg.make_weight_wrapper(w2, w2_scale, w2_bias),
       group_sizes=group_sizes,
-      scatter_indices=topk_argsort_indices,
+      scatter=arg.make_routing_wrapper(topk_argsort_indices),
       group_offset=group_offset,
   )
 

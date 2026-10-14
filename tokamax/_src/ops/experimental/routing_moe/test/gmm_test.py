@@ -23,8 +23,9 @@ import numpy as np
 from tokamax._src import benchmarking
 from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
 from tokamax._src.ops.experimental.gmm_v2 import util as gmm_util
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel as gmm
+from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.ragged_gather.pallas_mosaic_tpu_kernel import ragged_gather_pallas
 from tokamax._src.ops.ragged_scatter.pallas_mosaic_tpu_kernel import ragged_scatter_pallas
 
@@ -124,10 +125,16 @@ class RoutingGmmTest(parameterized.TestCase):
     self.lhs_gathered = self.lhs[self.gather_indices]
 
     # routing_gmm reads lhs in the compact layout.
-    self.lhs_compact = self.lhs.reshape(
-        layout_util.to_compact_shape(self.lhs.shape, self.lhs.dtype)
+    self.lhs_compact = input_pack.input_pack(self.lhs)
+    self.lhs_gathered_compact = input_pack.input_pack(self.lhs_gathered)
+
+    # routing_gmm takes weights and indices with their specs attached.
+    self.rhs_wrapped = arg.make_weight_wrapper(self.rhs)
+    self.rhs_q_wrapped = arg.make_weight_wrapper(
+        self.rhs_q, self.rhs_scale, fused_gate_up=True
     )
-    self.lhs_gathered_compact = self.lhs_compact[self.gather_indices]
+    self.gather = arg.make_routing_wrapper(self.gather_indices)
+    self.scatter = arg.make_routing_wrapper(self.topk_argsort_indices)
 
   def _benchmark_and_profile(self, plain, ragged, fused):
     latency_ms = {}
@@ -155,13 +162,12 @@ class RoutingGmmTest(parameterized.TestCase):
     )
     actual = gmm.routing_gmm(
         self.lhs_compact,
-        self.rhs_q,
+        self.rhs_q_wrapped,
         self.group_sizes,
-        self.rhs_scale,
-        gather_indices=self.gather_indices,
+        gather=self.gather,
         fuse_act="silu",
     )
-    actual = actual.reshape(layout_util.to_large_shape(actual.shape))
+    actual = actual.data.reshape(actual.spec.large_shape)
     np.testing.assert_allclose(
         actual[: self.num_valid_rows],
         expected[: self.num_valid_rows],
@@ -177,11 +183,11 @@ class RoutingGmmTest(parameterized.TestCase):
     )
     actual = gmm.routing_gmm(
         self.lhs_gathered_compact,
-        self.rhs,
+        self.rhs_wrapped,
         self.group_sizes,
-        scatter_indices=self.topk_argsort_indices,
+        scatter=self.scatter,
     )
-    actual = actual.reshape(layout_util.to_large_shape(actual.shape))
+    actual = actual.data.reshape(actual.spec.large_shape)
     np.testing.assert_allclose(
         actual[self.topk_argsort_indices[: self.num_valid_rows]],
         expected[: self.num_valid_rows],
@@ -212,10 +218,9 @@ class RoutingGmmTest(parameterized.TestCase):
     fused = benchmarking.standardize_function(
         gmm.routing_gmm,
         self.lhs_compact,
-        self.rhs_q,
+        self.rhs_q_wrapped,
         self.group_sizes,
-        self.rhs_scale,
-        kwargs=dict(gather_indices=self.gather_indices, fuse_act="silu"),
+        kwargs=dict(gather=self.gather, fuse_act="silu"),
     )
     self._benchmark_and_profile(plain, ragged, fused)
 
@@ -240,9 +245,9 @@ class RoutingGmmTest(parameterized.TestCase):
     fused = benchmarking.standardize_function(
         gmm.routing_gmm,
         self.lhs_gathered_compact,
-        self.rhs,
+        self.rhs_wrapped,
         self.group_sizes,
-        kwargs=dict(scatter_indices=self.topk_argsort_indices),
+        kwargs=dict(scatter=self.scatter),
     )
     self._benchmark_and_profile(plain, ragged, fused)
 
