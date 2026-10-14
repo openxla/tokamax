@@ -22,7 +22,6 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.experimental
-from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
@@ -32,14 +31,7 @@ from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
-from tokamax._src.ops.linear_softmax_cross_entropy_loss import api as lsce_api
-from tokamax._src.ops.linear_softmax_cross_entropy_loss import base as lsce_base
-from tokamax._src.ops.normalization import api as norm_api
-from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu as pl_ragged_dot_mosaic_tpu
-from tokamax._src.ops.triangle_multiplication import api as tri_mul_api
-from tokamax._src.ops.triangle_multiplication import base as tri_mul_base
 
 try:
   from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top
@@ -50,11 +42,6 @@ try:
   from tokamax._src.ops.normalization import triton as triton_norm  # pylint: disable=g-import-not-at-top
 except ImportError:
   triton_norm = None
-
-try:
-  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
-except ImportError:
-  triton_ragged_dot = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,53 +108,6 @@ def _slow_fn_factory(config):
 
 class AutotuningTest(parameterized.TestCase):
 
-  def test_get_op_implementations(self):
-    self.assertDictEqual(
-        api.get_op_implementations(norm_base.Normalization()),
-        dict(norm_api.IMPLEMENTATIONS),
-    )
-    self.assertDictEqual(
-        api.get_op_implementations(glu_base.GatedLinearUnit()),
-        dict(glu_api.IMPLEMENTATIONS),
-    )
-    self.assertDictEqual(
-        api.get_op_implementations(lsce_base.LinearSoftmaxCrossEntropyLoss()),
-        dict(lsce_api.IMPLEMENTATIONS),
-    )
-    self.assertDictEqual(
-        api.get_op_implementations(tri_mul_base.TriangleMultiplication()),
-        dict(tri_mul_api.IMPLEMENTATIONS),
-    )
-
-    if jax.default_backend() != "tpu":
-      assert triton_norm is not None
-      self.assertDictEqual(
-          api.get_op_implementations(triton_norm.TritonNormalization()),
-          dict(norm_api.IMPLEMENTATIONS),
-      )
-      assert triton_glu is not None
-      self.assertDictEqual(
-          api.get_op_implementations(triton_glu.TritonGatedLinearUnit()),
-          dict(glu_api.IMPLEMENTATIONS),
-      )
-
-    with self.subTest("current_device_only"):
-      if jax.default_backend() == "tpu" and triton_norm is not None:
-        tpu_norm_impls = api.get_op_implementations(
-            triton_norm.TritonNormalization(),
-            device=backend.get_default_device(),
-        )
-        self.assertNotIn(triton_norm.TritonNormalization(), tpu_norm_impls)
-      elif jax.default_backend() == "gpu" and triton_ragged_dot is not None:
-        ragged_dot_impls = api.get_op_implementations(
-            triton_ragged_dot.TritonRaggedDot(),
-            device=backend.get_default_device(),
-        )
-        self.assertNotIn(
-            pl_ragged_dot_mosaic_tpu.PallasMosaicTpuRaggedDot(),
-            ragged_dot_impls,
-        )
-
   def test_get_bound_args_from_callable(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Currently only supported on GPU.")
@@ -233,12 +173,12 @@ class AutotuningTest(parameterized.TestCase):
       self.skipTest("Currently only supported on GPU.")
 
     f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
-    result = api.autotune(f, *args, all_implementations=False)
+    result = api.autotune(f, *args)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
     self.assertEqual(tuple(x[0] for x in result.data), expected)
 
     f_lowered = jax.jit(f).lower(*args)
-    result = api.autotune(f_lowered, all_implementations=False)
+    result = api.autotune(f_lowered)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
     self.assertEqual(tuple(x[0] for x in result.data), expected)
 
@@ -434,7 +374,7 @@ class AutotuningTest(parameterized.TestCase):
         num_experts=8, m=128, k=128, n=128
     )
     ragged_dot_lowered = f.lower(lhs, rhs, group_sizes=group_sizes)
-    result = api.autotune(ragged_dot_lowered, all_implementations=False)
+    result = api.autotune(ragged_dot_lowered)
     self.assertNotEmpty(result.data)
     for _, data in result.data:
       for _, benchmark in data.items():
