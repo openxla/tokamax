@@ -212,6 +212,46 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
         q, k, v, do, mask=mask, config=config, vjp_config=vjp_config
     )
 
+  def test_custom_config_nonsquare_fwd_and_band_skip_vjp(self):
+    q_seq_len, kv_seq_len, head_dim = 512, 512, 64
+    num_heads = 2
+    dtype = jnp.float32
+
+    q = jax.ShapeDtypeStruct((num_heads, q_seq_len, head_dim), dtype)
+    k = jax.ShapeDtypeStruct((num_heads, kv_seq_len, head_dim), dtype)
+    v = jax.ShapeDtypeStruct((num_heads, kv_seq_len, head_dim), dtype)
+    do = jax.ShapeDtypeStruct((num_heads, q_seq_len, head_dim), dtype)
+
+    mask = base.CAUSAL_MASK
+
+    q, k, v, do = numerics.random_initialize((q, k, v, do))
+
+    config = pallas_mosaic_tpu.Config(
+        block_q=256,
+        block_kv=256,
+        block_kv_compute=128,
+        q_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        k_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        v_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        use_experimental_scheduler=True,
+        qk_diag_skip=True,
+        qk_diag_grid=2,
+        sv_diag_skip=False,
+    )
+    vjp_config = sp_vjp.Config(
+        block_q_dkv=256,
+        block_kv_dkv=256,
+        block_kv_dkv_compute=256,
+        use_base2_exp=True,
+        dq_reduction_steps=1,
+        qk_diag_skip=True,
+        qk_diag_grid=2,
+        diag_band_skip=True,
+    )
+    self._test_attention(
+        q, k, v, do, mask=mask, config=config, vjp_config=vjp_config
+    )
+
   def test_autotune_configs(self):
     head_dim = 64
     q_seq_len = 256
