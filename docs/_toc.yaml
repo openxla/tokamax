@@ -23,6 +23,8 @@ toc:
     path: /tokamax/autotuning
   - title: Benchmarking
     path: /tokamax/benchmarking
+  - title: PyTorch TPU API
+    path: /tokamax/pytorch
   - title: Library Design
     path: /tokamax/library_design
   - title: Contributing
