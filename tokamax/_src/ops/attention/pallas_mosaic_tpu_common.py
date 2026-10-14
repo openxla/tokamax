@@ -60,6 +60,10 @@ def check_inputs_support(
     raise NotImplementedError("mask.k_start is not supported.")
   if mask.k_end is not None:
     raise NotImplementedError("mask.k_end is not supported.")
+  if mask.causal_mask is not None and not mask.is_causal:
+    raise NotImplementedError(
+        "Causal offset and window size are not supported."
+    )
 
 
 def build_splash_kernel(

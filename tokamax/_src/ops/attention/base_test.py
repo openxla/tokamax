@@ -51,6 +51,12 @@ class MaskTest(absltest.TestCase):
     chex.assert_trees_all_equal(actual, mask_array[None, ...])
     self.assertTrue(is_causal)
 
+    causal_mask = base.Mask(mask_array, causal_mask=base.CausalMask(42))
+    causal_mask, causal = causal_mask.take("causal_mask")
+    actual = causal_mask.as_array(32, 32)
+    chex.assert_trees_all_equal(actual, mask_array[None, ...])
+    self.assertEqual(causal, base.CausalMask(42))
+
   def test_k_range(self):
     k_start = jnp.array([0, 0, 1, 2])
     k_end = jnp.array([1, 2, 3, 4])
@@ -68,12 +74,33 @@ class MaskTest(absltest.TestCase):
     )
     chex.assert_trees_all_equal(actual, expected)
 
-  def test_is_causal(self):
+  def test_causal(self):
     actual = base.Mask(is_causal=True).as_array(4, 4)
     expected = jnp.array(
         [[[1, 0, 0, 0], [1, 1, 0, 0], [1, 1, 1, 0], [1, 1, 1, 1]]], dtype=bool
     )
     chex.assert_trees_all_equal(actual, expected)
+
+    actual = base.Mask(
+        causal_mask=base.CausalMask(offset=1, window_size=2)
+    ).as_array(4, 4)
+    expected = jnp.array(
+        [[[1, 1, 0, 0], [0, 1, 1, 0], [0, 0, 1, 1], [0, 0, 0, 1]]], dtype=bool
+    )
+    chex.assert_trees_all_equal(actual, expected)
+
+    actual = base.Mask(
+        causal_mask=base.CausalMask(
+            offset=jnp.array(-1), window_size=jnp.array(2)
+        )
+    ).as_array(4, 4)
+    expected = jnp.array(
+        [[[0, 0, 0, 0], [1, 0, 0, 0], [1, 1, 0, 0], [0, 1, 1, 0]]], dtype=bool
+    )
+    chex.assert_trees_all_equal(actual, expected)
+
+    with self.assertRaises(ValueError):
+      base.Mask(causal_mask=base.CausalMask(), is_causal=True)
 
   def test_intersection(self):
     mask0 = jax.random.bernoulli(jax.random.PRNGKey(0), shape=(32, 32))
@@ -105,6 +132,17 @@ class MaskTest(absltest.TestCase):
       for b in [True, False]:
         mask = base.Mask(is_causal=a) & base.Mask(is_causal=b)
         self.assertEqual(mask.is_causal, a or b)
+
+    causal0 = base.CausalMask(offset=2, window_size=5)
+    causal1 = base.CausalMask(offset=0, window_size=4)
+    combined = base.Mask(causal_mask=causal0) & causal1
+    self.assertEqual(
+        combined.causal_mask, base.CausalMask(offset=0, window_size=3)
+    )
+    arr0 = base.Mask(causal_mask=causal0).as_array(8, 8)
+    arr1 = base.Mask(causal_mask=causal1).as_array(8, 8)
+    assert arr0 is not None and arr1 is not None
+    chex.assert_trees_all_equal(combined.as_array(8, 8), arr0 & arr1)
 
     two_sequence_mask = jnp.array(
         [[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1]], dtype=bool

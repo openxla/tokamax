@@ -57,13 +57,71 @@ def _mesh_axis_size(
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
+class CausalMask:
+  """A causal mask with optional offset and sliding window size.
+
+  For query index `q` (row) and key index `k` (column), an entry is unmasked
+  (`1`) when `k <= q + offset` (and `k > q + offset - window_size` if
+  `window_size` is specified):
+
+  Examples:
+  ```
+  a) offset=0,         b) offset=1,         c) offset=1,
+     window_size=None     window_size=None     window_size=3
+
+     1 0 0 0 0 0 0 0      1 1 0 0 0 0 0 0      1 1 0 0 0 0 0 0
+     1 1 0 0 0 0 0 0      1 1 1 0 0 0 0 0      1 1 1 0 0 0 0 0
+     1 1 1 0 0 0 0 0      1 1 1 1 0 0 0 0      0 1 1 1 0 0 0 0
+     1 1 1 1 0 0 0 0      1 1 1 1 1 0 0 0      0 0 1 1 1 0 0 0
+     1 1 1 1 1 0 0 0      1 1 1 1 1 1 0 0      0 0 0 1 1 1 0 0
+     1 1 1 1 1 1 0 0      1 1 1 1 1 1 1 0      0 0 0 0 1 1 1 0
+     1 1 1 1 1 1 1 0      1 1 1 1 1 1 1 1      0 0 0 0 0 1 1 1
+     1 1 1 1 1 1 1 1      1 1 1 1 1 1 1 1      0 0 0 0 0 0 1 1
+  ```
+
+  Attributes:
+    offset: Diagonal offset from the main diagonal (`q == k`). Positive values
+      shift the causal boundary to the right (future); negative values shift it
+      to the left (past).
+    window_size: Maximum number of keys each query can attend to. If `None`, no
+      lower bound is applied.
+  """
+
+  offset: int | Int[Array, ""] = 0
+  window_size: int | Int[Array, ""] | None = None
+
+  def __and__(self, other: "CausalMask") -> "CausalMask":
+    """Returns the intersection of two causal masks."""
+    if isinstance(self.offset, int) and isinstance(other.offset, int):
+      offset = min(self.offset, other.offset)
+    else:
+      offset = jnp.minimum(self.offset, other.offset)
+
+    lb0 = None if (ws := self.window_size) is None else (self.offset - ws)
+    lb1 = None if (ws := other.window_size) is None else (other.offset - ws)
+
+    if lb0 is None:
+      lb = lb1
+    elif lb1 is None:
+      lb = lb0
+    elif isinstance(lb0, int) and isinstance(lb1, int):
+      lb = max(lb0, lb1)
+    else:
+      lb = jnp.maximum(lb0, lb1)
+
+    return CausalMask(offset, None if lb is None else offset - lb)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, slots=True, init=False)
 class Mask:
   """An attention mask.
 
   `k_start` (inclusive) and `k_end` (exclusive) define range of enabled
   k-sequence values for each row of logits.
 
-  For example, a local attention mask could be defined as follows:
+  For example, a local attention mask could be defined as follows (though you
+  should use `CausalMask(window_size=window_size)` instead):
   ```
   seq_len_q = seq_len_k = 4
   window_size = 2
@@ -101,11 +159,43 @@ class Mask:
 
   bool_mask: Bool[Array, "*#B #H #T #t"] | None = None
   _: dataclasses.KW_ONLY
+  causal_mask: CausalMask | None = None
   q_start: Int[Array, "*#B #H #t"] | None = None
   q_end: Int[Array, "*#B #H #t"] | None = None
   k_start: Int[Array, "*#B #h #T"] | None = None
   k_end: Int[Array, "*#B #h #T"] | None = None
-  is_causal: bool = dataclasses.field(default=False, metadata=dict(static=True))
+
+  def __init__(
+      self,
+      bool_mask: Bool[Array | AbstractArray, "*#B #H #T #t"] | None = None,
+      *,
+      causal_mask: CausalMask | None = None,
+      q_start: Int[Array, "*#B #H #t"] | None = None,
+      q_end: Int[Array, "*#B #H #t"] | None = None,
+      k_start: Int[Array, "*#B #h #T"] | None = None,
+      k_end: Int[Array, "*#B #h #T"] | None = None,
+      is_causal: bool = False,
+  ):
+    if is_causal:
+      if causal_mask is not None:
+        raise ValueError("Cannot specify both `causal_mask` and `is_causal`.")
+      causal_mask = CausalMask()
+    object.__setattr__(self, "bool_mask", bool_mask)
+    object.__setattr__(self, "causal_mask", causal_mask)
+    object.__setattr__(self, "q_start", q_start)
+    object.__setattr__(self, "q_end", q_end)
+    object.__setattr__(self, "k_start", k_start)
+    object.__setattr__(self, "k_end", k_end)
+
+  @property
+  def is_causal(self) -> bool:
+    """Returns `True` if the mask has a standard causal mask."""
+    return (
+        self.causal_mask is not None
+        and isinstance(self.causal_mask.offset, int)
+        and self.causal_mask.offset == 0
+        and self.causal_mask.window_size is None
+    )
 
   def as_array(
       self,
@@ -134,6 +224,11 @@ class Mask:
           q_indices.shape, k_indices.shape, self.bool_mask.shape
       )
 
+    if (causal := self.causal_mask) is not None:
+      mask.append(q_indices >= k_indices - causal.offset)
+      if causal.window_size is not None:
+        mask.append(q_indices < k_indices - causal.offset + causal.window_size)
+
     if self.q_start is not None:
       mask.append(q_indices >= self.q_start[..., None, :])
 
@@ -146,32 +241,39 @@ class Mask:
     if self.k_end is not None:
       mask.append(k_indices < self.k_end[..., None])
 
-    if self.is_causal:
-      mask.append(q_indices >= k_indices)
-
     logical_and = functools.partial(functools.reduce, jnp.logical_and)
     return jax.lax.broadcast_to_rank(logical_and(mask), 3) if mask else None
 
   def take(self, *attrs: str) -> tuple[Any, ...]:
     """Returns a mask with attrs removed and the removed attrs."""
     default_mask = type(self)()
-    replacements = {attr: getattr(default_mask, attr) for attr in attrs}
-    values = (getattr(self, attr) for attr in attrs)
+    values = [getattr(self, attr) for attr in attrs]
+    replacements = {}
+    for attr in attrs:
+      if attr == "is_causal":
+        if self.is_causal:
+          replacements["causal_mask"] = None
+      else:
+        replacements[attr] = getattr(default_mask, attr)
     return dataclasses.replace(self, **replacements), *values
 
   def __bool__(self):
     return (
         self.bool_mask is not None
-        or self.is_causal
+        or self.causal_mask is not None
         or self.q_start is not None
         or self.q_end is not None
         or self.k_start is not None
         or self.k_end is not None
     )
 
-  def __and__(self, other: "Bool[Array, '*#B #H #T #t'] | Mask") -> "Mask":
+  def __and__(
+      self, other: "Bool[Array, '*#B #H #T #t'] | CausalMask | Mask"
+  ) -> "Mask":
     """Returns the intersection of two masks."""
-    if not isinstance(other, Mask):
+    if isinstance(other, CausalMask):
+      other = Mask(causal_mask=other)
+    elif not isinstance(other, Mask):
       other = Mask(other)
 
     def combine(fn):
@@ -179,15 +281,14 @@ class Mask:
 
     return Mask(
         bool_mask=combine(jnp.logical_and)(self.bool_mask, other.bool_mask),
+        causal_mask=combine(CausalMask.__and__)(
+            self.causal_mask, other.causal_mask
+        ),
         q_start=combine(jnp.maximum)(self.q_start, other.q_start),
         q_end=combine(jnp.minimum)(self.q_end, other.q_end),
         k_start=combine(jnp.maximum)(self.k_start, other.k_start),
         k_end=combine(jnp.minimum)(self.k_end, other.k_end),
-        is_causal=self.is_causal or other.is_causal,
     )
-
-
-CAUSAL_MASK = Mask(is_causal=True)
 
 
 @jax.tree_util.register_dataclass
@@ -204,7 +305,7 @@ class PagingInfo:
 
   Note:
     - "Each query" means one per batch element in the `q` array.
-    - `is_causal`, `k_start` and `k_end` are invalid when paging is used. Each
+    - `causal`, `k_start` and `k_end` are invalid when paging is used. Each
       page is assumed to be valid from the start of its sequence, up to its
       corresponding `length`.
   """
@@ -240,7 +341,7 @@ class DotProductAttention[C, K: Hashable](
       logits_scale: float | type[AUTO] = ...,
       bias: Float[Array, "*#B #H #T #t"] | None = ...,
       logits_soft_cap: float | None = ...,
-      mask: Bool[Array, "*#B #H #T #t"] | Mask | None = ...,
+      mask: Bool[Array, "*#B #H #T #t"] | CausalMask | Mask | None = ...,
       is_causal: bool = ...,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = ...,
       dropout_rate: float = ...,
@@ -269,7 +370,7 @@ class DotProductAttention[C, K: Hashable](
       logits_scale: float | type[AUTO] = ...,
       bias: Float[Array, "*#B #H #T #t"] | None = ...,
       logits_soft_cap: float | None = ...,
-      mask: Bool[Array, "*#B #H #T #t"] | Mask | None = ...,
+      mask: Bool[Array, "*#B #H #T #t"] | CausalMask | Mask | None = ...,
       is_causal: bool = ...,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = ...,
       dropout_rate: float = ...,
@@ -298,7 +399,7 @@ class DotProductAttention[C, K: Hashable](
       logits_scale: float | type[AUTO] = AUTO,
       bias: Float[Array, "*#B #H #T #t"] | None = None,
       logits_soft_cap: float | None = None,
-      mask: Bool[Array, "*#B #H #T #t"] | Mask | None = None,
+      mask: Bool[Array, "*#B #H #T #t"] | CausalMask | Mask | None = None,
       is_causal: bool = False,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = None,
       dropout_rate: float = 0.0,
@@ -374,7 +475,7 @@ class DotProductAttention[C, K: Hashable](
     params = locals().copy()
     params.pop("q_sharding")
     params.pop("k_sharding")
-    mask = type(self).bind(**params).kwargs["mask"]
+    mask: Mask = type(self).bind(**params).kwargs["mask"]
     del is_causal  # Combined into `mask`.
 
     def fwd_closed(
@@ -434,7 +535,7 @@ class DotProductAttention[C, K: Hashable](
     # Ensure that `q_indices` is specified when sharding the q-sequence with
     # causal masking enabled.
     if _mesh_axis_size(mesh, seq_q_axis) != 1:
-      if mask.is_causal and q_indices is None:  # pyrefly: ignore[missing-attribute]
+      if mask.causal_mask is not None and q_indices is None:
         q_indices = jnp.arange(q.shape[-3])
 
     qkv_axes = lambda x, axes: jax.tree.map(lambda _: axes, x)
@@ -445,9 +546,9 @@ class DotProductAttention[C, K: Hashable](
         qkv_axes(k, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),
         qkv_axes(v, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),
         [*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # bias
-        dataclasses.replace(  # pyrefly: ignore[bad-specialization]
-            mask,
+        Mask(
             bool_mask=[*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
+            causal_mask=CausalMask([], []),  # pyrefly: ignore[bad-argument-type]
             q_start=[*batch_axes, heads_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
             q_end=[*batch_axes, heads_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
             k_start=[*batch_axes, k_heads_axis, seq_q_axis],  # pyrefly: ignore[bad-argument-type]
@@ -499,7 +600,9 @@ class DotProductAttention[C, K: Hashable](
       logits_scale: float | type[AUTO] = AUTO,
       bias: Float[Array | AbstractArray, "*#B #H #T #t"] | None = None,
       logits_soft_cap: float | None = None,
-      mask: Bool[Array | AbstractArray, "*#B #H #T #t"] | Mask | None = None,
+      mask: (
+          Bool[Array | AbstractArray, "*#B #H #T #t"] | CausalMask | Mask | None
+      ) = None,
       is_causal: bool = False,
       dropout_mask: Bool[Array | AbstractArray, "*#B #H #T #t"] | None = None,
       dropout_rate: float = 0.0,
@@ -538,11 +641,13 @@ class DotProductAttention[C, K: Hashable](
     if logits_scale is AUTO:
       logits_scale = 1 / math.sqrt(q.shape[-1])
 
-    if not isinstance(mask, Mask):
+    if isinstance(mask, CausalMask):
+      mask = Mask(causal_mask=mask)
+    elif not isinstance(mask, Mask):
       mask = Mask(mask)  # pyrefly: ignore[bad-argument-type]
 
     if is_causal:
-      mask &= CAUSAL_MASK
+      mask &= CausalMask()
 
     return super().bind(
         q,
@@ -871,33 +976,10 @@ class DotProductAttentionVjp[C, K: Hashable](
           return_residuals=True,
           config=None,
       )
-      residuals_ = (
-          q,
-          k,
-          v,
-          bias,
-          mask,
-          dropout_mask,
-          paging_info,
-          q_indices,
-          k_indices,
-      )
-      residuals_ += (out, softmax_residual)
-      return out, residuals_
+      return out, (q, k, v, bias, out, softmax_residual)
 
     vjp = ad.get_vjp_taking_residuals(attend, q, k, v, bias)
     assert vjp is not None
-    residuals_ = (
-        q,
-        k,
-        v,
-        bias,
-        mask,
-        dropout_mask,
-        paging_info,
-        q_indices,
-        k_indices,
-    )
-    residuals_ += (out, residuals)
+    residuals_ = (q, k, v, bias, out, residuals)
     dq, dk, dv, dbias = vjp(residuals_, dout)
     return DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
