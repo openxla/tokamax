@@ -109,6 +109,24 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
   return mask, is_causal, k_start, k_end
 
 
+def k_range_block_minmax(
+    k_range: jax.Array | None, kv_seq_len: int, block_q: int
+) -> tuple[jax.Array, jax.Array] | None:
+  """Pre-reduces `k_start` or `k_end` to `(min, max)` per Q-block of `block_q`."""
+  if k_range is None:
+    return None
+  if k_range.shape[-1] == 1:
+    return k_range, k_range
+
+  def pad_reduce(pad_value: int):
+    k_range_ = shape_lib.pad_to_next_multiple_of(
+        k_range, block_q, -1, pad_value
+    )
+    return shape_lib.einshape("...(bq)->...bq", q=block_q)(k_range_)
+
+  return jnp.min(pad_reduce(kv_seq_len), -1), jnp.max(pad_reduce(0), -1)
+
+
 def cast_qkv[
     Q: (jax.Array, QArray), K: (jax.Array, QArray), V: (jax.Array, QArray)
 ](

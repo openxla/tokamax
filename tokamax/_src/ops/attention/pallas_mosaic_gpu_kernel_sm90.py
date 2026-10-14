@@ -611,25 +611,8 @@ def flash_attention_kernel(
 
   # Pre-reduce the k_start/k_end to a single value per `2 * block_q` (as compute
   # warpgroups share the same k/v blocks).
-  if k_start is None:
-    k_start_minmax = None
-  elif k_start.shape[-1] == 1:
-    k_start_minmax = (k_start, k_start)
-  else:
-    k_start_ = shape_lib.pad_to_next_multiple_of(
-        k_start, 2 * block_q, -1, kv_seq_len
-    )
-    k_start_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_start_)
-    k_start_minmax = (jnp.min(k_start_, -1), jnp.max(k_start_, -1))
-
-  if k_end is None:
-    k_end_minmax = None
-  elif k_end.shape[-1] == 1:
-    k_end_minmax = (k_end, k_end)
-  else:
-    k_end_ = shape_lib.pad_to_next_multiple_of(k_end, 2 * block_q, -1, 0)
-    k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end_)
-    k_end_minmax = (jnp.min(k_end_, -1), jnp.max(k_end_, -1))
+  k_start_minmax = common.k_range_block_minmax(k_start, kv_seq_len, 2 * block_q)
+  k_end_minmax = common.k_range_block_minmax(k_end, kv_seq_len, 2 * block_q)
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:

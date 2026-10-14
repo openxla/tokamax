@@ -314,18 +314,6 @@ def _load_q_to_registers(
   return chunks
 
 
-def _compute_k_range_minmax(
-    k_range_ref: jax.Array | None, block_q: int
-) -> tuple[jax.Array | None, jax.Array | None]:
-  """Extracts block-level min and max bounds for k_start / k_end."""
-  if k_range_ref is None:
-    return None, None
-  if k_range_ref.shape[-1] == 1:
-    return k_range_ref, k_range_ref
-  reshaped = k_range_ref.reshape(*k_range_ref.shape[:-1], -1, block_q)
-  return reshaped.min(-1), reshaped.max(-1)
-
-
 @jaxtyping.jaxtyped
 def flash_attention_kernel(
     q: Float[Array, "T H D"],
@@ -395,15 +383,10 @@ def flash_attention_kernel(
   as_2d = lambda x: None if x is None else jax.lax.broadcast_to_rank(x, 2)
   k_start, k_end = map(as_2d, (k_start, k_end))
 
-  if k_start is not None and k_start.shape[-1] != 1:
-    k_start = shape_lib.pad_to_next_multiple_of(k_start, block_q, -1, kv_seq)
-  if k_end is not None and k_end.shape[-1] != 1:
-    k_end = shape_lib.pad_to_next_multiple_of(k_end, block_q, -1, 0)
-
   use_q_smem_resident = config.q_smem
   num_p_slots = config.num_p_slots
-  k_start_min, _ = _compute_k_range_minmax(k_start, block_q)
-  _, k_end_max = _compute_k_range_minmax(k_end, block_q)
+  k_start_minmax = common.k_range_block_minmax(k_start, kv_seq, block_q)
+  k_end_minmax = common.k_range_block_minmax(k_end, kv_seq, block_q)
   v_split0 = config.v_split0
   v_split1 = head_dim - v_split0
 
@@ -428,8 +411,8 @@ def flash_attention_kernel(
       bias_gmem,
       k_start_gmem,
       k_end_gmem,
-      k_start_min_gmem,
-      k_end_max_gmem,
+      k_start_minmax_gmems,
+      k_end_minmax_gmems,
       *output_gmems,
       qk_smem,
       v0_smem,
@@ -462,10 +445,12 @@ def flash_attention_kernel(
         else num_kv_blocks
     )
     lb = 0
-    if k_start_min_gmem is not None:
+    if k_start_minmax_gmems is not None:
+      k_start_min_gmem, _ = k_start_minmax_gmems
       val = common.load_bcast(k_start_min_gmem, (hi, qi), layout=None)
       lb = lax.max(lb, lax.div(val, block_kv))
-    if k_end_max_gmem is not None:
+    if k_end_minmax_gmems is not None:
+      _, k_end_max_gmem = k_end_minmax_gmems
       val = common.load_bcast(k_end_max_gmem, (hi, qi), layout=None)
       ub = jnp.minimum(ub, pl.cdiv(val, block_kv))
 
@@ -754,7 +739,7 @@ def flash_attention_kernel(
           lowering_semantics=plgpu.LoweringSemantics.Lane,
       ),
       kernel_name="flash_attention_sm80_split_head",
-  )(q, k, v, mask, bias, k_start, k_end, k_start_min, k_end_max)
+  )(q, k, v, mask, bias, k_start, k_end, k_start_minmax, k_end_minmax)
 
   out = jnp.swapaxes(out, -3, -2)[:orig_q_seq_len, :, :orig_head_dim_out]
   residuals = tuple(res[..., :orig_q_seq_len] for res in residuals)

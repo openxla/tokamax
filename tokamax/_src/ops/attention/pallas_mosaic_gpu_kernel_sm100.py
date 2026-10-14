@@ -972,20 +972,8 @@ def flash_attention_kernel(
 
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-  def pre_reduce_k_range_per_qtile(range_ref):
-    if range_ref is None:
-      return None
-
-    def pad_reduce(pad_value: int):
-      k_range_ = shape_lib.pad_to_next_multiple_of(
-          range_ref, block_q, -1, pad_value
-      )
-      return shape_lib.einshape("...(bq)->...bq", q=block_q)(k_range_)
-
-    return (jnp.min(pad_reduce(kv_seq_len), -1), jnp.max(pad_reduce(0), -1))
-
-  k_start_minmax = pre_reduce_k_range_per_qtile(k_start)
-  k_end_minmax = pre_reduce_k_range_per_qtile(k_end)
+  k_start_minmax = common.k_range_block_minmax(k_start, kv_seq_len, block_q)
+  k_end_minmax = common.k_range_block_minmax(k_end, kv_seq_len, block_q)
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:
