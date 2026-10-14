@@ -242,6 +242,17 @@ def load_bcast(
   return value if layout is None else plgpu.layout_cast(value, layout)
 
 
+MASK_PACK_DTYPE = jnp.int8
+MASK_PACKED_BITS = mgpu_lib.num_bits(MASK_PACK_DTYPE)
+MIN_MASK_COLS = 128 // MASK_PACKED_BITS
+
+
+def pack_mask(mask: jax.Array) -> jax.Array:
+  """Packs a boolean mask into bits."""
+  mask = jnp.packbits(mask, axis=-1, bitorder="little").view(MASK_PACK_DTYPE)
+  return shape_lib.pad_to_next_multiple_of(mask, m=MIN_MASK_COLS, axis=-1)
+
+
 def unpack_bool_bits_tmem_native(a):
   """Unpacks boolean bits from an int packed array in TMEM_NATIVE layout."""
   packed_bits = mgpu_lib.num_bits(a.dtype)

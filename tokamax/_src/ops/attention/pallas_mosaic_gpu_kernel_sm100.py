@@ -65,11 +65,7 @@ _L_CONSUMED = 5
 _ALPHA_PRODUCED = 6  # There are two barriers for alpha.
 
 _load_bcast = common.load_bcast
-
-_MASK_PACK_DTYPE = jnp.int8
-_MASK_PACKED_BITS = mgpu_lib.num_bits(_MASK_PACK_DTYPE)
-_MIN_MASK_COLS = 128 // _MASK_PACKED_BITS
-
+_MASK_PACKED_BITS = common.MASK_PACKED_BITS
 _FORBID_EXTRA = pydantic.ConfigDict(extra="forbid")
 
 
@@ -190,8 +186,8 @@ def _get_scratch_types(
     scratch["bias_consumed"] = plgpu.Barrier()
 
   if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
-    shape = (tile_q, max(block_kv // _MASK_PACKED_BITS, _MIN_MASK_COLS))
-    scratch["mask_smem"] = plgpu.SMEM(shape, _MASK_PACK_DTYPE)
+    shape = (tile_q, max(block_kv // _MASK_PACKED_BITS, common.MIN_MASK_COLS))
+    scratch["mask_smem"] = plgpu.SMEM(shape, common.MASK_PACK_DTYPE)
     scratch["mask_produced"] = plgpu.Barrier()
     scratch["mask_consumed"] = plgpu.Barrier()
 
@@ -382,15 +378,13 @@ def flash_attention_kernel(
     if mask.shape[-2] == 1 or mask.shape[-1] == 1:
       mask = mask.astype(jnp.int8)
     else:
-      mask = jnp.packbits(mask, axis=-1, bitorder="little")
-      mask = mask.view(_MASK_PACK_DTYPE)
-      mask = shape_lib.pad_to_next_multiple_of(mask, m=_MIN_MASK_COLS, axis=-1)
+      mask = common.pack_mask(mask)
 
   block_q = config.block_q
   block_kv = config.block_kv
   num_q_tiles = pl.cdiv(q_seq_len, block_q)
   mask_block_kv = block_kv // _MASK_PACKED_BITS
-  mask_block_size = max(mask_block_kv, _MIN_MASK_COLS)
+  mask_block_size = max(mask_block_kv, common.MIN_MASK_COLS)
   num_stages = config.num_stages
   num_tma_splits = config.num_tma_splits
 
