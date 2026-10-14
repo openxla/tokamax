@@ -15,6 +15,7 @@
 
 """Main kernel module for orchestrating DMA and computation pipeline."""
 
+import dataclasses
 import functools
 
 from jax import lax
@@ -33,8 +34,8 @@ def inner_pipeline(
     in_ref: memory_ref.PipelineInputs,
     out_ref: hijax.TransformedRef,
     *,
-    x_bref: memory_ref.CustomBufferedRef,
-    out_bref: memory_ref.CustomBufferedRef,
+    x_bref: memory_ref.RoutingBufferedRef,
+    out_bref: memory_ref.RoutingBufferedRef,
     metadata_ref: metadata.MetadataRef,
     cfg: config.RoutingGmmConfig,
 ) -> None:
@@ -124,6 +125,27 @@ def outer_pipeline(
   @functools.partial(pl.run_scoped, final_allocs=allocs)
   def _run(final_allocs: memory_ref.PipelineAllocs):
 
+    inputs = final_allocs.inputs
+    out = final_allocs.out
+    gather_idx = inputs.gather_idx
+    scatter_idx = inputs.scatter_idx
+    if isinstance(gather_idx, memory_ref.IndexBufferedRef):
+      # Prefetch num_xo_buffers - 1 worth of indices into gather SMEM.
+      offset = gather_idx.fetch_offset
+      for gm_id in range(cfg.tile.num_xo_buffers - 1):
+        gather_idx.copy_in(in_hbm_ref.gather_idx, (0, gm_id - offset, 0))
+      # NOTE: Even if number of gather idx buffers is smaller than
+      # num_xo_buffers - 1, it does not cause any race condition as semaphores
+      # merely counts the size of the total data transfer without concerning
+      # each individual DMA instructions.
+      for gm_id in range(cfg.tile.num_xo_buffers - 1):
+        gather_idx.wait_in(in_hbm_ref.gather_idx, (0, gm_id - offset, 0))
+
+      inputs = dataclasses.replace(inputs, x=inputs.x.bind_idx_ref(gather_idx))
+    if isinstance(scatter_idx, memory_ref.IndexBufferedRef):
+      out = out.bind_idx_ref(scatter_idx)
+    final_allocs = dataclasses.replace(final_allocs, inputs=inputs, out=out)
+
     # Prologue: Prefetch first num_xo_buffers - 1 input tiles.
     for gm_id in range(cfg.tile.num_xo_buffers - 1):
       final_allocs.inputs.x.branchless_copy_in(gm_id)
@@ -143,6 +165,9 @@ def outer_pipeline(
         out_specs=allocs.out_spec,
         grid=(num_n, num_gm, num_k),
     )(in_hbm_ref, out_hbm_ref, allocations=final_allocs.all_tree)
+
+    if isinstance(scatter_idx, memory_ref.IndexBufferedRef):
+      scatter_idx.wait_in(in_hbm_ref.scatter_idx, (0, num_gm, 0))
 
     # Epilogue: Issue DMA for final compute tile and drain all output buffers.
     # NOTE: If output is written into VMEM at step i, output DMA is performed

@@ -32,6 +32,15 @@ jax.config.parse_flags_with_absl()
 
 SHAPES = [
     dict(
+        testcase_name="prefill_64k",
+        num_tokens=65536,
+        size_k=4096,
+        size_n=2048,
+        num_experts=512,
+        ep_size=8,
+        topk=10,
+    ),
+    dict(
         testcase_name="prefill_8k",
         num_tokens=8192,
         size_k=4096,

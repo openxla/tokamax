@@ -36,8 +36,10 @@ class MetadataRef:
   _gm_id_to_group_id: jax.Array | hijax.TransformedRef
   _gm_id_to_m_offset: jax.Array | hijax.TransformedRef
   _gm_id_to_num_rows: jax.Array | hijax.TransformedRef
-  gather_idx: jax.Array | hijax.TransformedRef | None
-  scatter_idx: jax.Array | hijax.TransformedRef | None
+  # Unlike _gm_id_*, num_gm is a scalar and already stored minus padding size.
+  # For instance, get_num_rows(metadata_ref.num_gm[0] - 1) will yield correct
+  # expected value. Thus, it can be accessed directly without much concerns.
+  num_gm: jax.Array | hijax.TransformedRef
   group_cum_sum: jax.Array | hijax.TransformedRef
   group_offset: jax.Array | hijax.TransformedRef
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
@@ -45,26 +47,16 @@ class MetadataRef:
   @classmethod
   def create(
       cls,
-      gather_idx: jax.Array | None,
-      scatter_idx: jax.Array | None,
       group_cum_sum: jax.Array,
       group_offset: jax.Array,
       cfg: config.RoutingGmmConfig,
   ):
-    """Performs simple preprocessing and wraps scalar data for metadata."""
-
-    # Padd indices by tile_m to avoid any out of bound access at last steps.
-    if gather_idx is not None:
-      gather_idx = jnp.pad(gather_idx, (0, cfg.tile.tile_m))
-    if scatter_idx is not None:
-      scatter_idx = jnp.pad(scatter_idx, (0, cfg.tile.tile_m))
-
+    """Wraps scalar data for metadata."""
     return cls(
         _gm_id_to_group_id=jnp.empty((cfg.max_num_gm,), jnp.int32),
         _gm_id_to_m_offset=jnp.empty((cfg.max_num_gm,), jnp.int32),
         _gm_id_to_num_rows=jnp.empty((cfg.max_num_gm,), jnp.int32),
-        gather_idx=gather_idx,
-        scatter_idx=scatter_idx,
+        num_gm=jnp.empty((1,), jnp.int32),
         group_cum_sum=group_cum_sum,
         group_offset=group_offset,
         cfg=cfg,
@@ -134,4 +126,6 @@ class MetadataRef:
       self._gm_id_to_num_rows[num_gm + b] = 0
 
     # Return real number of buffers minus left and right padding.
-    return num_gm - num_buffers
+    real_num_gm = num_gm - num_buffers
+    self.num_gm[0] = real_num_gm
+    return real_num_gm

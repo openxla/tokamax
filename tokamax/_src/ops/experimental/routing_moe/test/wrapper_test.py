@@ -540,11 +540,6 @@ class MoEKernelTest(parameterized.TestCase):
   ):
     if use_ep:
       self.skipTest("TODO: Support EP and N/K tiling in routing_moe.")
-    if num_tokens == 32768:
-      self.skipTest(
-          "TODO: Support routed rows exceeding SMEM capacity in"
-          " routing_moe."
-      )
     if len(self.mesh_devices) < 8:
       self.skipTest("Skipping due to insufficient number of chips.")
     num_experts = 128

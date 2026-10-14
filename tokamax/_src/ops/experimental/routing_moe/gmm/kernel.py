@@ -13,7 +13,12 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Module that invokes routing gmm pallas kernel."""
+"""Module that handles XLA side preprocessing and invokes routing gmm kernel.
+
+Many of the tensor manipulation logics are intentionally placed here instead of
+other modules. This is because we want any XLA side logic that is handled
+outside of the kernel to be consolidated here without scavanging other modules.
+"""
 
 import functools
 
@@ -29,7 +34,7 @@ from tokamax._src.ops.experimental.routing_moe.gmm import pipeline
 
 @jax.jit(static_argnames=("tile", "fuse_act", "acc_dtype"))
 def routing_gmm(
-    x: jax.Array,  # [m_in, k // 128 // packing, packing, lane_size]
+    x: jax.Array,  # [m_in, k // lane_size // packing, packing, lane_size]
     w: jax.Array,  # [local_groups, k, n]
     group_sizes: jax.Array,  # [global_groups]
     w_scale: jax.Array | None = None,  # [local_groups, num_scales, 1, n]
@@ -41,7 +46,7 @@ def routing_gmm(
     tile: config.TileConfig | None = None,
     fuse_act: str | None = None,
 ) -> jax.Array:
-  """GMM that can pipelines routing and compute for both input and output."""
+  """GMM that pipelines routing and compute for both input and output."""
 
   # Step 1: Create config object.
   cfg = config.RoutingGmmConfig.create(
@@ -70,11 +75,18 @@ def routing_gmm(
   if w_scale is not None:
     w_scale = w_scale.astype(jnp.float32)
   wrapped_w = memory_ref.SingleWeightRef(weight=w, scale=w_scale, bias=None)
-  inputs = memory_ref.PipelineInputs(x=x, w=wrapped_w)
 
-  metadata_obj = metadata.MetadataRef.create(
-      gather_indices, scatter_indices, group_cum_sum, group_offset, cfg
+  # Pad indices by tile_m_idx to ensure DMA and indexing does not trigger OOB.
+  if gather_indices is not None:
+    gather_indices = jnp.pad(gather_indices, (0, cfg.tile.tile_m_idx))
+  if scatter_indices is not None:
+    scatter_indices = jnp.pad(scatter_indices, (0, cfg.tile.tile_m_idx))
+
+  inputs = memory_ref.PipelineInputs(
+      x=x, w=wrapped_w, gather_idx=gather_indices, scatter_idx=scatter_indices
   )
+
+  metadata_obj = metadata.MetadataRef.create(group_cum_sum, group_offset, cfg)
 
   # Step 4: Specify memory space.
   inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
@@ -84,9 +96,12 @@ def routing_gmm(
   )
 
   # Step 5: Call kernel.
+  num_cores = cfg.tpu_info.num_cores
+  # NOTE: On megacore hardware, this will incur redundant compute. Furture work
+  # is needed to enable parallelism in such hardware.
   return pl.kernel(
       functools.partial(pipeline.outer_pipeline, cfg=cfg),
-      mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=1),
+      mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=num_cores),
       out_type=out,
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=cfg.tpu_info.vmem_capacity_bytes,

@@ -94,6 +94,18 @@ class TileConfig:
     return [*range(bucket_base, self.tile_m, bucket_base), self.tile_m]
 
   @property
+  def tile_m_idx(self):
+    # TODO: Fetch this from tpu_info instead of using magic numbers.
+    num_lanes = 128
+    return pl.cdiv(self.tile_m, num_lanes) * num_lanes
+
+  @property
+  def idx_buffer_size(self):
+    # idx buffer requires at least one gap between read range and write range
+    # to avoid corruption.
+    return self.tile_m_idx * max(self.num_xo_buffers, 3)
+
+  @property
   def num_max_buffers(self):
     return max(self.num_xo_buffers, self.num_w_buffers)
 
@@ -222,11 +234,6 @@ class RoutingGmmConfig:
     return self.dim.size_local_groups + max_num_single_group + safety_padding
 
   @property
-  def max_routed_rows(self) -> int:
-    """Returns maximum number of supported rows based on SMEM capacity."""
-    return int(0.45 * self.tpu_info.smem_capacity_bytes) // 4
-
-  @property
   def kernel_name(self):
     name = f"routing_gmm-{self.x.mode}-{self.out.mode}"
     name += f"-g{self.dim.size_local_groups}-m{self.dim.size_out_m}"
@@ -257,10 +264,14 @@ class RoutingGmmConfig:
           f"w_scale must be per channel with shape {scale_shape}. Got"
           f" {w_scale.shape}."
       )
-    if not 0 < self.dim.size_out_m <= self.max_routed_rows:
+
+    smem_threshold = int(0.45 * self.tpu_info.smem_capacity_bytes)
+    # 3: _to_group_id, _to_m_offset, _to_num_rows. 4: int32.
+    smem_allocation = (self.max_num_gm * 3) * 4
+    if smem_allocation >= smem_threshold:
       raise ValueError(
-          f"Output rows must be less than {self.max_routed_rows} to avoid SMEM "
-          f"OOM. Got {self.dim.size_out_m}."
+          f"Total number of SMEM allocation must be less than {smem_threshold}"
+          f" to avoid OOM. Got {smem_allocation}"
       )
 
 
