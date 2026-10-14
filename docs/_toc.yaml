@@ -23,6 +23,8 @@ toc:
     path: /tokamax/autotuning
   - title: Benchmarking and Numerics
     path: /tokamax/benchmarking
+  - title: Library Design
+    path: /tokamax/library_design
   - title: Contributing
     path: /tokamax/contributing
 - title: Demo Notebook
