@@ -29,6 +29,8 @@ toc:
     path: /tokamax/library_design
   - title: Contributing
     path: /tokamax/contributing
+  - title: Code Style
+    path: /tokamax/code_style
 - title: Demo Notebook
   section:
   - title: Tokamax Demo
