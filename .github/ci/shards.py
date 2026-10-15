@@ -440,8 +440,7 @@ SHARDS: ShardMap = {
     ),
     'ragged-dot-sm100': Spec(
         paths=(
-            'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py',
-            'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py',
+            'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_quant_test.py',
         ),
         minutes=1,
     ),

@@ -35,7 +35,6 @@ def silu(x):
   return x * jax.nn.sigmoid(x)
 
 
-# Config for enabling use_native_int8_mma for testing quant_i8 kernel.
 _CONFIG = pallas_mosaic_gpu.Config(
     block_m=16,
     block_n=128,
@@ -49,23 +48,24 @@ _CONFIG = pallas_mosaic_gpu.Config(
 )
 
 
-class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
-  """Tests for Pallas Mosaic GPU kernel with fp8xi4 quantization."""
+class _Sm100QuantTestBase(test_base.RaggedDotTestBase):
+  """Shared base class for SM100 8-bit x int4 quantized ragged dot tests."""
+
+  _quant_a_dtype: jax.typing.DTypeLike = jnp.float8_e4m3fn
+  _default_block_k: int = 128
 
   def __init__(self, *args):
     op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
 
-    def fn(lhs, rhs, **kwargs):
-      config = test_base.test_config.get()
-      expect_supported = True
+    def fn(lhs, rhs, *, config=None, **kwargs):
+      if config is None:
+        config = test_base.test_config.get()
+      if config is None:
+        config = dataclasses.replace(_CONFIG, block_k=self._default_block_k)
+
+      expect_supported = gpu_utils.is_sm100()
       lhs_ = jax.eval_shape(quantization.as_array_or_qarray, lhs)
       rhs_ = jax.eval_shape(quantization.as_array_or_qarray, rhs)
-
-      if not gpu_utils.is_sm100():
-        expect_supported = False
-
-      if config is None:
-        config = _CONFIG
 
       tile_k = rhs_.scale_tile_shape[1] if isinstance(rhs_, qwix.QArray) else 0
       config = dataclasses.replace(
@@ -81,7 +81,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
       ):
         expect_supported = False
 
-      if isinstance(lhs_, qwix.QArray) and lhs_.qtype != jnp.float8_e4m3fn:
+      if isinstance(lhs_, qwix.QArray) and lhs_.qtype != self._quant_a_dtype:
         expect_supported = False
 
       if expect_supported:
@@ -93,6 +93,13 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
     super().__init__(*args, dot_fn=fn)
 
+  def setUp(self):
+    if jax.default_backend() == "tpu":
+      self.skipTest("Not supported on TPUs.")
+    if not gpu_utils.is_sm100():
+      self.skipTest("Not supported on non-sm100 GPUs.")
+    super().setUp()
+
   @override
   def _test_quantized(
       self,
@@ -102,39 +109,9 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
       b_tile_shape,
       use_as_qarray,
       activation=None,
-      # (num_groups, m, k, n)
       task=(8, 512, 256, 512),
   ):
     self.skipTest("Not supported.")
-
-  @parameterized.product(
-      subchannels=(512, 256, 128),
-      use_as_qarray=(True, False),
-      activation=(None, test_base.relu, jax.nn.tanh),
-      task=(
-          (8, 512, 512, 512),
-          (16, 1024, 1024, 1024),
-          (16, 2048, 1024, 1024),
-      ),
-      block_m=(16, 32),
-      block_k=(512, 256, 128),
-  )
-  def test_wi4_afp8_quantized(
-      self, subchannels, use_as_qarray, activation, task, block_m, block_k
-  ):
-    if subchannels < block_k:
-      self.skipTest("subchannels < block_k")
-    config = dataclasses.replace(_CONFIG, block_m=block_m, block_k=block_k)
-    with test_base.ConfigManager(config):
-      super()._test_quantized(
-          "float8_e4m3fn",
-          "int4",
-          (1, subchannels),
-          (1, subchannels, 1),
-          use_as_qarray,
-          activation,
-          task,
-      )
 
   @override
   def _test_preferred_element_type(self, out_type):
@@ -163,7 +140,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         jnp.bfloat16,
         random_groups=True,
         use_as_qarray=True,
-        quant_a_dtype=jnp.float8_e4m3fn,
+        quant_a_dtype=self._quant_a_dtype,
         a_tile_shape=(1, 128),
         quant_b_dtype=jnp.int4,
         b_tile_shape=(1, 128, 1),
@@ -186,7 +163,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         jnp.bfloat16,
         random_groups=False,
         use_as_qarray=True,
-        quant_a_dtype=jnp.float8_e4m3fn,
+        quant_a_dtype=self._quant_a_dtype,
         a_tile_shape=(1, 128),
         quant_b_dtype=jnp.int4,
         b_tile_shape=(1, 128, 1),
@@ -207,13 +184,12 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         jnp.bfloat16,
         random_groups=True,
         use_as_qarray=True,
-        quant_a_dtype=jnp.float8_e4m3fn,
+        quant_a_dtype=self._quant_a_dtype,
         a_tile_shape=(1, 256),
         quant_b_dtype=jnp.int4,
         b_tile_shape=(1, 256, 1),
     )
 
-    # Test all possible patterns of zero group sizes.
     for i in range(2**num_groups):
       group_sizes_ = jnp.where(jnp.unpackbits(jnp.uint8(i)), group_sizes, 0)
       with self.subTest(f"group_sizes={group_sizes_.tolist()}"):
@@ -224,6 +200,43 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
             actual[:count], expected[:count], atol=0.01, rtol=0.005
         )
 
+
+class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
+  """Tests for Pallas Mosaic GPU kernel with fp8xi4 quantization."""
+
+  _quant_a_dtype = jnp.float8_e4m3fn
+  _default_block_k = 128
+
+  @parameterized.product(
+      subchannels=(512, 256, 128),
+      use_as_qarray=(True, False),
+      activation=(None, test_base.relu, jax.nn.tanh),
+      task=(
+          (8, 512, 512, 512),
+          (16, 1024, 1024, 1024),
+          (16, 2048, 1024, 1024),
+      ),
+      block_m=(16, 32),
+      block_k=(512, 256, 128),
+  )
+  def test_wi4_afp8_quantized(
+      self, subchannels, use_as_qarray, activation, task, block_m, block_k
+  ):
+    if subchannels < block_k:
+      self.skipTest("subchannels < block_k")
+    config = dataclasses.replace(_CONFIG, block_m=block_m, block_k=block_k)
+    with test_base.ConfigManager(config):
+      test_base.RaggedDotTestBase._test_quantized(
+          self,
+          "float8_e4m3fn",
+          "int4",
+          (1, subchannels),
+          (1, subchannels, 1),
+          use_as_qarray,
+          activation,
+          task,
+      )
+
   def _dequant(self, qarray: qwix.QArray, subchannel: int) -> jax.Array:
     q = qarray.qvalue.astype(jnp.float32)
     s = jnp.repeat(qarray.scale.astype(jnp.float32), subchannel, axis=1)
@@ -233,8 +246,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
       block_k=(128,), activation=(None, test_base.relu, silu)
   )
   def test_epilogue_quant(self, block_k, activation):
-    # New arch: ONE accumulator of block_n N-cols per CTA -> the fused output
-    # subchannel must equal block_n (= 128). Activation subchannel matched.
     num_groups, m, k, n = 8, 512, 256, 512
     sub = 128
     a, b, group_sizes = self._create_inputs(
@@ -265,11 +276,9 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     actual = self._dequant(out, sub)
     expected = test_base.ref(a, b, group_sizes, activation)
     count = int(sum(group_sizes))
-    # fp8_e4m3fn-quantized output -> a few % error.
     chex.assert_trees_all_close(
         actual[:count], expected[:count], atol=0.06, rtol=0.1
     )
-    # Determinism: a second launch must be bit-identical (cheap race detector).
     out2 = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
         a, b, jnp.asarray(group_sizes), jnp.bfloat16, config, activation
     )
@@ -279,10 +288,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
   @parameterized.product(block_k=(128,), activation=(None, test_base.relu))
   def test_relaxed_activation_subchannel(self, block_k, activation):
-    # Activation subchannel (128) finer than weight subchannel (512); dense out.
-    # NOTE: uses a 4x ratio (weight 512 / act 128). A 2x ratio (tile_k ==
-    # 2*tile_xk) collides with the production kernel's x_sum-encoded-scale
-    # detection (`scales.shape[1] == 2 * (k_x // tile_k)`) and is unsupported.
     num_groups, m, k, n = 8, 512, 512, 512
     a, b, group_sizes = self._create_inputs(
         num_groups,
@@ -313,23 +318,14 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
       activation=(None, test_base.relu),
       block_m=(16, 64),
       group_sizes_pat=(
-          # cumsum starts not multiples of align_tile(8) -> a tile straddles two
-          # groups (start_within_block != 0); the fused scale store must write
-          # ONLY this group's valid rows, not the whole aligned bucket.
-          (33, 67, 50, 80, 70, 60, 90, 62),  # mixed ragged
-          # size-1 groups (actual_size==1 single-row scatter) next to big groups
-          # that span many tiles (first ragged, middle aligned, last partial).
+          (33, 67, 50, 80, 70, 60, 90, 62),
           (1, 7, 199, 1, 100, 50, 151, 3),
-          # zero-size groups (actual_size==0 -> no write) interleaved.
           (0, 130, 0, 200, 0, 98, 84, 0),
       ),
   )
   def test_epilogue_quant_ragged(
       self, block_k, activation, block_m, group_sizes_pat
   ):
-    # Corner cases for the ragged fused scale store: a tile straddling two
-    # groups must scatter only [start_within_block, +actual_size); the old store
-    # wrote the whole bucket and corrupted neighbours' scale rows.
     num_groups, m, k, n = 8, 512, 256, 512
     sub = 128
     a, b, _ = self._create_inputs(
@@ -367,9 +363,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
   @parameterized.product(block_m=(128, 256))
   def test_epilogue_quant_ragged_large_block_m(self, block_m):
-    # cluster_block_m > 128 (256) -> more tokens than lanes, so the masked scale
-    # store must loop each lane over rows {lane, lane+128, ...}. 128 is the
-    # lane-count boundary. Ragged groups (size-1 + big) sum to m.
     num_groups, m, k, n = 8, 1024, 256, 512
     sub = 128
     a, b, _ = self._create_inputs(
@@ -407,9 +400,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
   @parameterized.product(activation=(None, test_base.relu, silu))
   def test_epilogue_quant_prod_config(self, activation):
-    # The production autotuned config for this fused kernel: block_m=32,
-    # block_k=256 (with weight subchannel 512, so block_k <= subchannel: 2
-    # block_k per subchannel, exercised by k=1024 -> 2 subchannels). Ragged.
     num_groups, m, k, n = 8, 512, 1024, 512
     sub = 512
     a, b, _ = self._create_inputs(
@@ -447,7 +437,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
   @parameterized.product(activation=(None, test_base.relu))
   def test_epilogue_quant_target_config(self, activation):
-    # Verify target benchmark config correctness.
     num_groups, m, k, n = 8, 512, 1024, 512
     sub = 512
     a, b, _ = self._create_inputs(
@@ -486,9 +475,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
   @parameterized.product(activation=(None, test_base.relu, silu))
   def test_chained_two_ragged_dots(self, activation):
-    # quant -> dot -> quant -> dot, fused vs unfused. Both run the
-    # kernel; the fused chain folds the middle quant into dot1 (fp8 QArray out),
-    # the baseline keeps a standalone qwix.quantize between the dots.
     num_groups, m, k, n = 8, 512, 256, 512
     sub = 128
     a, w1, group_sizes = self._create_inputs(
@@ -529,13 +515,11 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     )
     kernel = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
 
-    # Fused: dot1 emits the fp8 QArray, dot2 consumes it directly.
     h_fused = kernel(a, w1, gs, jnp.bfloat16, cfg_fused, activation)
     self.assertIsInstance(h_fused, qwix.QArray)
     self.assertEqual(h_fused.qvalue.dtype, jnp.float8_e4m3fn)
     y_fused = kernel(h_fused, w2, gs, jnp.bfloat16, cfg_plain, None)
 
-    # Baseline: dot1 -> bf16, explicit middle quant, then dot2.
     h_bf16 = kernel(a, w1, gs, jnp.bfloat16, cfg_plain, activation)
     self.assertIsInstance(h_bf16, jax.Array)
     h_base = qwix.quantize(h_bf16, jnp.float8_e4m3fn, tiled_axes={0: 1, 1: sub})
@@ -543,9 +527,9 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
 
     count = int(sum(group_sizes))
     fused = jnp.asarray(y_fused[:count], jnp.float32)
-    base = jnp.asarray(y_base[:count], jnp.float32)
-    rel_mae = jnp.abs(fused - base).mean() / jnp.maximum(
-        jnp.abs(base).mean(), 1e-6
+    base_out = jnp.asarray(y_base[:count], jnp.float32)
+    rel_mae = jnp.abs(fused - base_out).mean() / jnp.maximum(
+        jnp.abs(base_out).mean(), 1e-6
     )
     self.assertLess(float(rel_mae), 0.1)
 
@@ -558,7 +542,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     )
     w_i4 = quantization.AsQArray(w, jnp.int4, tiled_axes={0: 1, 1: 128, 2: 1})
 
-    # 1. Test enabled path (enable_fused_epilogue_quant=True)
     op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(
         enable_fused_epilogue_quant=True
     )
@@ -569,7 +552,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
       )
       return op._get_heuristics_config(ba).epilogue_quant_qtype
 
-    # fp8 x int4, fp8 output -> fuse; everything else -> baseline (None).
     self.assertEqual(
         jnp.dtype(epi_qtype(x_fp8, w_i4, jnp.float8_e4m3fn)), jnp.float8_e4m3fn
     )
@@ -577,7 +559,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     self.assertIsNone(epi_qtype(x_fp8, w_i4, None))
     self.assertIsNone(epi_qtype(x, w, jnp.float8_e4m3fn))
 
-    # 2. Test disabled path (enable_fused_epilogue_quant=False, default)
     op_disabled = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
 
     def epi_qtype_disabled(lhs, rhs, pet):
@@ -695,8 +676,6 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     )
     expected = test_base.ref(a, b, group_sizes, None)
 
-    # Manually compute subchannel row-sum and concatenate to scales,
-    # simulating the scale hack / compute_subchannel_sum=True from
     qvalue_f32 = a.qvalue.astype(jnp.float32)
     rowsum = qvalue_f32.reshape(m, -1, sub).sum(-1)
     a_scales = jnp.concatenate([a.scale.astype(jnp.float32), rowsum], axis=1)
@@ -715,19 +694,37 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     )
     self.assertNotIsInstance(out, qwix.QArray)
     count = int(sum(group_sizes))
-
-    # Assert that this passes successfully now that the double-subtraction
-    # bug in the kernel is fixed.
     chex.assert_trees_all_close(
         out[:count], expected[:count], atol=0.015, rtol=0.01
     )
 
-  def setUp(self):
-    if jax.default_backend() == "tpu":
-      self.skipTest("Not supported on TPUs.")
-    if not gpu_utils.is_sm100():
-      self.skipTest("Not supported on non-sm100 GPUs.")
-    super().setUp()
+
+class PallasMosaicGpuKernelSm100I8QuantTest(_Sm100QuantTestBase):
+  """Tests for Pallas Mosaic GPU kernel with i8xi4 quantization."""
+
+  _quant_a_dtype = jnp.int8
+  _default_block_k = 512
+
+  @parameterized.product(
+      tile_shape=(
+          (1, 512, 1),
+          (1, 256, 1),
+      ),
+      use_as_qarray=(True, False),
+      activation=(None, test_base.relu, jax.nn.tanh),
+      task=((8, 512, 512, 512),),
+  )
+  def test_wi4_ai8_quantized(self, tile_shape, use_as_qarray, activation, task):
+    test_base.RaggedDotTestBase._test_quantized(
+        self,
+        "int8",
+        "int4",
+        tile_shape,
+        tile_shape,
+        use_as_qarray,
+        activation,
+        task,
+    )
 
 
 if __name__ == "__main__":
