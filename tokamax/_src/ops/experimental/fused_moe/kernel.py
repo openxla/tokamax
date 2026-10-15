@@ -60,7 +60,7 @@ from .host import (
 
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
 # implementation, called here rather than copied.
-from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import (
+from tokamax._src.ops.gmm_v2.gmm_v2 import (
     silu_and_mul_with_clamp,
     swigluoai,
 )

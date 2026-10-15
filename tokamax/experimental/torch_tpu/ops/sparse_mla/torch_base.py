@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from typing import Any, TypeVar, override
 
 import jax
-from tokamax._src.ops.experimental.sparse_mla import base as jax_base
+from tokamax._src.ops.sparse_mla import base as jax_base
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 

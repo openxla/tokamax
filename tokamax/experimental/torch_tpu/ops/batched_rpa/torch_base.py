@@ -18,8 +18,8 @@ from collections.abc import Sequence
 import dataclasses
 from typing import Any, TypeVar, override
 import jax
-from tokamax._src.ops.experimental.batched_rpa import base as jax_base
-from tokamax._src.ops.experimental.batched_rpa.kernel import configs as jax_types
+from tokamax._src.ops.batched_rpa import base as jax_base
+from tokamax._src.ops.batched_rpa.kernel import configs as jax_types
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch

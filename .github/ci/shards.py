@@ -446,11 +446,11 @@ SHARDS: ShardMap = {
     ),
     # -- gmm ---------------------------------------------------------------
     'gmm-v2-perf': Spec(
-        paths=('tokamax/_src/ops/experimental/gmm_v2/gmm_v2_perf_test.py',),
+        paths=('tokamax/_src/ops/gmm_v2/gmm_v2_perf_test.py',),
         minutes=5,
     ),
     'gmm-v2-kernel': Spec(
-        paths=('tokamax/_src/ops/experimental/gmm_v2/gmm_v2_test.py',),
+        paths=('tokamax/_src/ops/gmm_v2/gmm_v2_test.py',),
         minutes=4,
     ),
     # -- ops ---------------------------------------------------------------
@@ -513,7 +513,7 @@ SHARDS: ShardMap = {
         minutes=3,
     ),
     'ops-flex-attention': Spec(
-        paths=('tokamax/_src/ops/flex_attention/base_test.py',),
+        paths=('tokamax/_src/ops/experimental/flex_attention/base_test.py',),
         minutes=2,
     ),
     'ops-gated-linear-unit': Spec(
@@ -555,7 +555,7 @@ SHARDS: ShardMap = {
     # either waste a GPU job or drop the CUDA coverage.
     'experimental-kda-kernel': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',
         ),
         minutes=21,
     ),
@@ -564,10 +564,10 @@ SHARDS: ShardMap = {
     # on tpu7x for the `Run shard` step (1.4m on tpu6e, 1.1m on h100).
     'experimental-sparse-mla': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/sparse_mla/api_test.py',
-            'tokamax/_src/ops/experimental/sparse_mla/base_test.py',
-            'tokamax/_src/ops/experimental/sparse_mla/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/sparse_mla/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/sparse_mla/api_test.py',
+            'tokamax/_src/ops/sparse_mla/base_test.py',
+            'tokamax/_src/ops/sparse_mla/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/sparse_mla/pallas_mosaic_tpu_test.py',
         ),
         minutes=11,
     ),
@@ -602,12 +602,12 @@ SHARDS: ShardMap = {
     ),
     'experimental-batched-rpa': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/batched_rpa/base_test.py',
-            'tokamax/_src/ops/experimental/batched_rpa/kernel/configs_test.py',
-            'tokamax/_src/ops/experimental/batched_rpa/kernel/seq_along_lane_parity_test.py',
-            'tokamax/_src/ops/experimental/batched_rpa/kernel/speculative_decode_test.py',
-            'tokamax/_src/ops/experimental/batched_rpa/kernel/stacked_rpa_kv_writeback_test.py',
-            'tokamax/_src/ops/experimental/batched_rpa/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/batched_rpa/base_test.py',
+            'tokamax/_src/ops/batched_rpa/kernel/configs_test.py',
+            'tokamax/_src/ops/batched_rpa/kernel/seq_along_lane_parity_test.py',
+            'tokamax/_src/ops/batched_rpa/kernel/speculative_decode_test.py',
+            'tokamax/_src/ops/batched_rpa/kernel/stacked_rpa_kv_writeback_test.py',
+            'tokamax/_src/ops/batched_rpa/pallas_mosaic_tpu_test.py',
         ),
         minutes=5,
     ),
@@ -646,12 +646,12 @@ SHARDS: ShardMap = {
     ),
     'experimental-lightning-indexer': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/lightning_indexer/api_test.py',
-            'tokamax/_src/ops/experimental/lightning_indexer/base_test.py',
-            'tokamax/_src/ops/experimental/lightning_indexer/kernel/metadata_test.py',
-            'tokamax/_src/ops/experimental/lightning_indexer/kernel/streamindex_topk_dcp_test.py',
-            'tokamax/_src/ops/experimental/lightning_indexer/kernel/streamindex_topk_test.py',
-            'tokamax/_src/ops/experimental/lightning_indexer/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/lightning_indexer/api_test.py',
+            'tokamax/_src/ops/lightning_indexer/base_test.py',
+            'tokamax/_src/ops/lightning_indexer/kernel/metadata_test.py',
+            'tokamax/_src/ops/lightning_indexer/kernel/streamindex_topk_dcp_test.py',
+            'tokamax/_src/ops/lightning_indexer/kernel/streamindex_topk_test.py',
+            'tokamax/_src/ops/lightning_indexer/pallas_mosaic_tpu_test.py',
         ),
         minutes=3,
     ),
@@ -675,9 +675,9 @@ SHARDS: ShardMap = {
     # The kda tests that are not the kernel; see `experimental-kda-kernel`.
     'experimental-kda': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/kda/base_test.py',
-            'tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_test.py',
-            'tokamax/_src/ops/experimental/kda/xla_chunked_test.py',
+            'tokamax/_src/ops/kda/base_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/kda/xla_chunked_test.py',
         ),
         minutes=2,
     ),
@@ -717,12 +717,12 @@ SHARDS: ShardMap = {
     # tpu7x, no longer than `sparse_mla` alone (11.2m), so an estimate.
     'experimental-masked-dense-mla': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/masked_dense_mla/api_test.py',
-            'tokamax/_src/ops/experimental/masked_dense_mla/base_test.py',
-            'tokamax/_src/ops/experimental/masked_dense_mla/kv_cache_utils_test.py',
-            'tokamax/_src/ops/experimental/masked_dense_mla/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/masked_dense_mla/pallas_mosaic_tpu_test.py',
-            'tokamax/_src/ops/experimental/masked_dense_mla/scatter_test.py',
+            'tokamax/_src/ops/masked_dense_mla/api_test.py',
+            'tokamax/_src/ops/masked_dense_mla/base_test.py',
+            'tokamax/_src/ops/masked_dense_mla/kv_cache_utils_test.py',
+            'tokamax/_src/ops/masked_dense_mla/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/masked_dense_mla/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/masked_dense_mla/scatter_test.py',
         ),
         minutes=1,
     ),

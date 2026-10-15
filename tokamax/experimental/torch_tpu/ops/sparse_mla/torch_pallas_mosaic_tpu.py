@@ -18,7 +18,7 @@ import dataclasses
 from typing import Any, override
 
 import jax
-from tokamax._src.ops.experimental.sparse_mla import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.sparse_mla import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops.sparse_mla import torch_base
 import torch

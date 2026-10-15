@@ -21,10 +21,10 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.sparse_mla import base as jax_base
-from tokamax._src.ops.experimental.sparse_mla import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
-from tokamax._src.ops.experimental.sparse_mla import reference as jax_reference
-from tokamax._src.ops.experimental.sparse_mla import test_base as jax_test_base
+from tokamax._src.ops.sparse_mla import base as jax_base
+from tokamax._src.ops.sparse_mla import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.sparse_mla import reference as jax_reference
+from tokamax._src.ops.sparse_mla import test_base as jax_test_base
 from tokamax._src.ops.dsv4_compressor import csa_cache_layout
 from tokamax.experimental.torch_tpu.ops import torch_test_utils
 from tokamax.experimental.torch_tpu.ops import torch_utils

@@ -21,11 +21,11 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src import benchmarking
-from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
-from tokamax._src.ops.experimental.gmm_v2 import util as gmm_util
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel as gmm
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
+from tokamax._src.ops.gmm_v2 import gmm_v2
+from tokamax._src.ops.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_gather.pallas_mosaic_tpu_kernel import ragged_gather_pallas
 from tokamax._src.ops.ragged_scatter.pallas_mosaic_tpu_kernel import ragged_scatter_pallas
 

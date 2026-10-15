@@ -20,7 +20,7 @@ import functools
 import jax
 from jax import sharding
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.gmm_v2 import gmm_v2
+from tokamax._src.ops.gmm_v2 import gmm_v2
 from tokamax._src.ops.ragged_gather.pallas_mosaic_tpu_kernel import ragged_gather_pallas
 from tokamax._src.ops.ragged_gather_reduce.pallas_mosaic_tpu_kernel import ragged_gather_reduce
 

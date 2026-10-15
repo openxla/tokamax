@@ -19,8 +19,8 @@ import dataclasses
 from typing import Any, override
 
 import jax
-from tokamax._src.ops.experimental.batched_rpa.kernel import configs as jax_types
-import tokamax._src.ops.experimental.batched_rpa.pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.batched_rpa.kernel import configs as jax_types
+import tokamax._src.ops.batched_rpa.pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_base

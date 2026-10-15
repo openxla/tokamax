@@ -24,8 +24,8 @@ import jax
 import jax.numpy as jnp
 import tokamax
 from tokamax._src import numerics
-from tokamax._src.ops.experimental.kda import api as kda_api
-from tokamax._src.ops.experimental.kda import arg_specs as kda_specs
+from tokamax._src.ops.kda import api as kda_api
+from tokamax._src.ops.kda import arg_specs as kda_specs
 from tokamax.benchmarks import common
 
 

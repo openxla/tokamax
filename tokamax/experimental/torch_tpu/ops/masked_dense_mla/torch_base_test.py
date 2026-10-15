@@ -22,8 +22,8 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.masked_dense_mla import base as jax_base
-from tokamax._src.ops.experimental.masked_dense_mla import reference
+from tokamax._src.ops.masked_dense_mla import base as jax_base
+from tokamax._src.ops.masked_dense_mla import reference
 from tokamax.experimental.torch_tpu.ops.masked_dense_mla import torch_base
 import torch
 from torch._subclasses import fake_tensor

@@ -24,8 +24,8 @@ from jax.sharding import ManualAxisType
 import pydantic
 from tokamax._src import quantization
 from tokamax._src.ops import op
-from tokamax._src.ops.experimental.gmm_v2 import gmm_v2 as gmm_backend
-from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
+from tokamax._src.ops.gmm_v2 import gmm_v2 as gmm_backend
+from tokamax._src.ops.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.ragged_dot import base
 
 

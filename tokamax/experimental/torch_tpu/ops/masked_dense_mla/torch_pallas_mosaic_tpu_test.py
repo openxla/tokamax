@@ -22,9 +22,9 @@ from absl.testing import parameterized
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.masked_dense_mla import base as jax_base
-from tokamax._src.ops.experimental.masked_dense_mla import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
-from tokamax._src.ops.experimental.masked_dense_mla import reference
+from tokamax._src.ops.masked_dense_mla import base as jax_base
+from tokamax._src.ops.masked_dense_mla import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.masked_dense_mla import reference
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.masked_dense_mla import torch_base
 from tokamax.experimental.torch_tpu.ops.masked_dense_mla import torch_pallas_mosaic_tpu

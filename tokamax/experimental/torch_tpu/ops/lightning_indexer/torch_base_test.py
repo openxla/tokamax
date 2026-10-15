@@ -22,9 +22,9 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.lightning_indexer import base as jax_base
-from tokamax._src.ops.experimental.lightning_indexer import test_base as jax_test_base
-from tokamax._src.ops.experimental.lightning_indexer.kernel import config as kernel_config
+from tokamax._src.ops.lightning_indexer import base as jax_base
+from tokamax._src.ops.lightning_indexer import test_base as jax_test_base
+from tokamax._src.ops.lightning_indexer.kernel import config as kernel_config
 from tokamax.experimental.torch_tpu.ops.lightning_indexer import torch_base
 import torch
 from torch._subclasses import fake_tensor
