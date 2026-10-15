@@ -46,8 +46,9 @@ class _PallasMosaicTpuCausalConv1dGatedDeltaRule(
   def get_bound_args(self, *args: Any, **kwargs: Any) -> Any:
     norm_kwargs = dict(kwargs)
     if "compute_precision" in norm_kwargs:
-      norm_kwargs["compute_precision"] = torch_utils.str_to_jax_dtype(
-          norm_kwargs["compute_precision"]
+      norm_kwargs["compute_precision"] = (
+          torch_utils.to_jax_dtype(norm_kwargs["compute_precision"])
+          or jnp.float32.dtype
       )
     return super().get_bound_args(*args, **norm_kwargs)
 
@@ -163,7 +164,7 @@ class _PallasMosaicTpuCausalConv1dGatedDeltaRule(
       kernel_size: int,
       num_spec_tokens: int = 0,
       zero_initialize_out: bool = True,
-      compute_precision: Any = jnp.float32.dtype,
+      compute_precision: torch.dtype | str | None = torch.float32,
       decode_tile_size: int | None = None,
       mixed_tile_size: int | None = None,
       config: Config | None = None,
@@ -243,7 +244,7 @@ class _PallasMosaicTpuCausalConv1dGatedDeltaRule(
     assert config is not None, "Forward config not set."
     kernel_config = self.reconstruct_config(config)
     precision = (
-        torch_utils.str_to_jax_dtype(compute_precision) or jnp.float32.dtype
+        torch_utils.to_jax_dtype(compute_precision) or jnp.float32.dtype
     )
     ((new_conv_state, new_recurrent_state), out), _ = (
         self.op_impl_jax._fwd(  # pylint: disable=protected-access

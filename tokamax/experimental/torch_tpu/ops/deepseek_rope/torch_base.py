@@ -32,7 +32,7 @@ def _to_torch_quant_dtype(
     quant_dtype: str | None,
 ) -> torch.dtype:
   """Resolves `quant_dtype` to a `torch.dtype` (default `torch.float8_e4m3fn`)."""
-  return torch_utils.str_to_torch_dtype(quant_dtype) or torch.float8_e4m3fn
+  return torch_utils.to_torch_dtype(quant_dtype) or torch.float8_e4m3fn
 
 
 def canonicalize_jax_quant_dtype(
@@ -44,7 +44,7 @@ def canonicalize_jax_quant_dtype(
     return None
   if quant_dtype is None:
     return jnp.dtype(jnp.float8_e4m3fn)
-  return torch_utils.str_to_jax_dtype(quant_dtype)
+  return torch_utils.to_jax_dtype(quant_dtype)
 
 
 class _DeepseekRope(torch_op.TorchOp[_Config]):

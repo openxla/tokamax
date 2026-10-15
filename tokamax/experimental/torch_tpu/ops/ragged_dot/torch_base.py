@@ -375,7 +375,7 @@ def _normalize_bound_args_inputs(
   normalized_kwargs["precision"] = precision_to_jax(
       normalized_kwargs.get("precision")
   )
-  normalized_kwargs["preferred_element_type"] = torch_utils.str_to_jax_dtype(
+  normalized_kwargs["preferred_element_type"] = torch_utils.to_jax_dtype(
       normalized_kwargs.get("preferred_element_type")
   )
   normalized_kwargs["activation"] = None
@@ -483,7 +483,7 @@ class _RaggedDot[Config](torch_op.TorchOp[Config]):
     assert self.op_impl_jax is not None, "Forward class not set."
     dim_nums = dim_nums_to_jax(ragged_dot_dimension_numbers)
     canon_precision = precision_to_jax(precision)
-    preferred_element_type_dtype = torch_utils.str_to_jax_dtype(
+    preferred_element_type_dtype = torch_utils.to_jax_dtype(
         preferred_element_type
     )
 

@@ -130,7 +130,7 @@ class _PallasMosaicTpuRaggedDot(
     kernel_config = self.reconstruct_config(config)
     dim_nums = torch_base.dim_nums_to_jax(ragged_dot_dimension_numbers)
     canon_precision = torch_base.precision_to_jax(precision)
-    preferred_element_type_dtype = torch_utils.str_to_jax_dtype(
+    preferred_element_type_dtype = torch_utils.to_jax_dtype(
         preferred_element_type
     )
     op_impl_jax = self.op_impl_jax

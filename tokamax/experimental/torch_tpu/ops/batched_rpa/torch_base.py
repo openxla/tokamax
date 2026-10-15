@@ -77,7 +77,7 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
           norm_kwargs["prefill_block_sizes"]
       )
     if "out_dtype" in norm_kwargs:
-      norm_kwargs["out_dtype"] = torch_utils.str_to_jax_dtype(
+      norm_kwargs["out_dtype"] = torch_utils.to_jax_dtype(
           norm_kwargs["out_dtype"]
       )
     return super().get_bound_args(*args, **norm_kwargs)
@@ -205,7 +205,7 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,
-        out_dtype=torch_utils.str_to_jax_dtype(out_dtype),
+        out_dtype=torch_utils.to_jax_dtype(out_dtype),
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,

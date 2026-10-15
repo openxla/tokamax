@@ -127,7 +127,7 @@ class _PallasMosaicTpuBatchedRpa(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,
-        out_dtype=torch_utils.str_to_jax_dtype(out_dtype),
+        out_dtype=torch_utils.to_jax_dtype(out_dtype),
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
@@ -192,7 +192,7 @@ class _PallasMosaicTpuBatchedRpa(
           "return_lse adds an output and is not supported through the torch"
           " operator."
       )
-    jax_dtype = torch_utils.str_to_jax_dtype(out_dtype)
+    jax_dtype = torch_utils.to_jax_dtype(out_dtype)
     if jax_dtype is None:
       return torch.empty_like(queries), torch.empty_like(kv_cache)
     dtype = getattr(torch, jax_dtype.name)
