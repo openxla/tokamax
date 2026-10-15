@@ -26,7 +26,6 @@ from tokamax.experimental.torch_tpu.ops.lightning_indexer import torch_base
 import torch
 
 Config = jax_pallas_mosaic_tpu.Config
-KVLayout = kernel_config.KVLayout
 
 
 def _to_triple(val: Sequence[int] | int) -> tuple[int, int, int]:
@@ -124,7 +123,7 @@ class _PallasMosaicTpuLightningIndexer(
       distribution: torch.Tensor,
       k: int,
       compression_ratio: int = 1,
-      kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       cp_size: int = 1,
       cp_rank: torch.Tensor | int = 0,
       interleave_size: int = 1,
@@ -172,7 +171,7 @@ class _PallasMosaicTpuLightningIndexer(
       distribution: jax.Array,
       k: int,
       compression_ratio: int = 1,
-      kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       cp_size: int = 1,
       cp_rank: int = 0,
       interleave_size: int = 1,
@@ -196,7 +195,7 @@ class _PallasMosaicTpuLightningIndexer(
         distribution,
         k=k,
         compression_ratio=compression_ratio,
-        kv_layout=kv_layout,
+        kv_layout=kernel_config.KVLayout(kv_layout),
         cp_size=cp_size,
         cp_rank=cp_rank,
         interleave_size=interleave_size,

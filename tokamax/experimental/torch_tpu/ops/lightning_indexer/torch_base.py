@@ -23,7 +23,6 @@ from tokamax._src.ops.experimental.lightning_indexer.kernel import config as ker
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 
-KVLayout = kernel_config.KVLayout
 _Config = TypeVar("_Config")
 
 
@@ -48,7 +47,7 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
       distribution: torch.Tensor,
       k: int,
       compression_ratio: int = 1,
-      kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       cp_size: int = 1,
       cp_rank: int = 0,
       interleave_size: int = 1,
@@ -78,7 +77,7 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
       distribution: torch.Tensor,
       k: int,
       compression_ratio: int = 1,
-      kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       cp_size: int = 1,
       cp_rank: torch.Tensor | int = 0,
       interleave_size: int = 1,
@@ -126,7 +125,7 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
       distribution: jax.Array,
       k: int,
       compression_ratio: int = 1,
-      kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       cp_size: int = 1,
       cp_rank: int = 0,
       interleave_size: int = 1,
@@ -149,7 +148,7 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
         distribution,
         k=k,
         compression_ratio=compression_ratio,
-        kv_layout=kv_layout,
+        kv_layout=kernel_config.KVLayout(kv_layout),
         cp_size=cp_size,
         cp_rank=cp_rank,
         interleave_size=interleave_size,
