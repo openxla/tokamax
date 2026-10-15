@@ -99,14 +99,10 @@ class _PallasMosaicTpuBatchedRpa(
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
       skip_kv_update: bool = False,
-      kv_layout: (
-          jax_types.KVLayout | str
-      ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
-      attention_scope: (
-          jax_types.AttentionScope | str
-      ) = jax_types.AttentionScope.FULL,
+      attention_scope: str = "full",
       return_lse: bool = False,
       return_residuals: bool = False,
       config: tuple[int, ...] | None = None,
@@ -137,10 +133,10 @@ class _PallasMosaicTpuBatchedRpa(
         v_scale=v_scale,
         decode_query_size=decode_query_size,
         skip_kv_update=skip_kv_update,
-        kv_layout=kv_layout,
+        kv_layout=jax_types.KVLayout(kv_layout),
         cp_group_size=cp_group_size,
         cp_rank=cp_rank,
-        attention_scope=attention_scope,
+        attention_scope=jax_types.AttentionScope(attention_scope),
         return_lse=return_lse,
         decode_block_sizes=torch_base.to_block_sizes(decode_block_sizes),
         prefill_block_sizes=torch_base.to_block_sizes(prefill_block_sizes),
@@ -176,14 +172,10 @@ class _PallasMosaicTpuBatchedRpa(
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
       skip_kv_update: bool = False,
-      kv_layout: (
-          jax_types.KVLayout | str
-      ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
-      attention_scope: (
-          jax_types.AttentionScope | str
-      ) = jax_types.AttentionScope.FULL,
+      attention_scope: str = "full",
       return_lse: bool = False,
       return_residuals: bool = False,
       config: tuple[int, ...] | None = None,
@@ -234,14 +226,10 @@ class _PallasMosaicTpuBatchedRpa(
       debug_mode: bool = False,
       out_dtype: Any = None,
       skip_kv_update: bool = False,
-      kv_layout: (
-          jax_types.KVLayout | str
-      ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
-      attention_scope: (
-          jax_types.AttentionScope | str
-      ) = jax_types.AttentionScope.FULL,
+      attention_scope: str = "full",
       return_lse: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
@@ -281,10 +269,10 @@ class _PallasMosaicTpuBatchedRpa(
         vmem_limit_bytes=vmem_limit_bytes,
         debug_mode=debug_mode,
         skip_kv_update=skip_kv_update,
-        kv_layout=str(kv_layout),
+        kv_layout=kv_layout,
         decode_query_size=decode_query_size,
         cp_group_size=cp_group_size,
-        attention_scope=str(attention_scope),
+        attention_scope=attention_scope,
         return_lse=return_lse,
         return_residuals=return_residuals,
         config=config_ints,
