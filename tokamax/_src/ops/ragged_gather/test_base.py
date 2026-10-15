@@ -38,8 +38,8 @@ class RaggedGatherTestBase(parameterized.TestCase):
       self, in_out_size, hidden_size, start_end, dtype, **kwargs
   ):
     """Checks the gathered rows in `[start, end)` match `base.RaggedGather`."""
-    if backend.get_default_device().device_kind != "TPU7x":
-      self.skipTest("Only tested on TPU7x.")
+    if backend.get_default_device().device_kind not in ("TPU7x", "TPU8i"):
+      self.skipTest("Only tested on TPU7x and TPU8i.")
 
     in_size, out_size = in_out_size
     start, end = start_end

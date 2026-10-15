@@ -169,8 +169,71 @@ class PallasTpuRaggedGatherReduceTest(test_base.RaggedGatherReduceTestBase):
       (1, 1, 256, "random", 8, 2, 5),
       (64, 1, 1024, "all", 1, 8, 0),
   )
-  def test_kernel_matches_reference_examples(self, *args):
-    self._check_kernel_matches_reference(*args)
+  def test_kernel_matches_reference_examples(
+      self,
+      num_tokens,
+      reduce_group_size,
+      hidden_size,
+      valid_mode,
+      num_rows,
+      num_column_partitions,
+      seed,
+  ):
+    if (
+        num_column_partitions is not None
+        and not pallas_mosaic_tpu_kernel.is_valid_num_column_partitions(
+            num_column_partitions, hidden_size, pltpu.get_tpu_info()
+        )
+    ):
+      self.skipTest(
+          f"{num_column_partitions=} is not valid on this TPU generation."
+      )
+    self._check_kernel_matches_reference(
+        num_tokens,
+        reduce_group_size,
+        hidden_size,
+        valid_mode,
+        num_rows,
+        num_column_partitions,
+        seed,
+    )
+
+  @parameterized.parameters("TPU7x", "TPU8i")
+  def test_sparse_core_vmem_capacity_bytes(self, device_kind):
+    device = jax.sharding.AbstractDevice(
+        device_kind=device_kind, num_cores=1, platform="tpu"
+    )
+    with jax.sharding.use_abstract_mesh(
+        jax.sharding.AbstractMesh((), (), abstract_device=device)
+    ):
+      sc_info = pltpu.get_tpu_info().sparse_core
+      self.assertIsNotNone(sc_info)
+      self.assertEqual(sc_info.vmem_capacity_bytes, 512 * 1024)
+
+  @parameterized.product(
+      device_kind=("TPU7x", "TPU8i"),
+      case=(
+          (128, 8, 128),
+          (896, 8, 896),
+          (1024, 8, 1024),
+          (2048, 8, 1024),
+          (7168, 8, 1024),
+          (7296, 8, 384),
+      ),
+  )
+  def test_select_col_chunk_size(self, device_kind, case):
+    col_size, reduce_group_size, expected = case
+    device = jax.sharding.AbstractDevice(
+        device_kind=device_kind, num_cores=1, platform="tpu"
+    )
+    with jax.sharding.use_abstract_mesh(
+        jax.sharding.AbstractMesh((), (), abstract_device=device)
+    ):
+      tpu_info = pltpu.get_tpu_info()
+      chunk_size = pallas_mosaic_tpu_kernel.select_col_chunk_size(
+          col_size, reduce_group_size, tpu_info
+      )
+    self.assertEqual(chunk_size, expected)
 
   @parameterized.product(
       col_size=(128, 896, 1024, 2048, 7168, 7296), reduce_group_size=(1, 8, 64)
