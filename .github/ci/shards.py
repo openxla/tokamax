@@ -150,6 +150,14 @@ JAX_VERSIONS = ('0.11.2', '0.11.1', '0.11.0')
 # adding 'linux-x86-a3-8g-h100-1gpu' to COMPAT_RUNNERS.
 COMPAT_RUNNERS = ('linux-x86-tpu7x-56-1tpu',)
 
+# The compat reruns are not one job per shard. They run in smoke mode --
+# `TOKAMAX_COMPAT_SMOKE=1`, one case per test function, see `tokamax/conftest.py`
+# -- which is a fraction of a shard's full run, so `compat_bins` packs the
+# selected shards into bins of about this many minutes and each older JAX runs
+# each bin once. Sized against `compat_minutes` where a shard has one, and its
+# full `minutes` otherwise, which over-estimates and so errs toward more bins.
+COMPAT_BIN_MINUTES = 20
+
 
 class _RequiredSpec(TypedDict):
   """The part of a shard spec every shard has."""
@@ -167,6 +175,7 @@ class Spec(_RequiredSpec, total=False):
   """
 
   minutes: float
+  compat_minutes: float
 
 
 # Shard name -> spec, as `SHARDS` and as `resolve_shards` returns it.
@@ -209,6 +218,12 @@ MatrixEntry = dict[str, str]
 #            number yet, which is not the same as fast. The one exception is
 #            the catch-all shard, where it is a target rather than a
 #            measurement -- see its entry.
+#   compat_minutes
+#            measured wall clock of the shard's tests in compat smoke mode on
+#            a compat runner, which `compat_bins` packs by. Same rule as
+#            `minutes`: only from a real run. Until a shard has one it is
+#            packed by `minutes`, which over-counts it and so costs an extra
+#            compat job, never a slow one.
 #
 # There is no key for which runners a shard belongs on, and `Spec` has no
 # field for one: every shard runs on every runner in `RUNNERS`. Restricting a
@@ -225,7 +240,10 @@ MatrixEntry = dict[str, str]
 #            reruns included, since they are jobs the run waits for too. That
 #            is not a formality: `splash-kernel`, `experimental-kda-kernel`
 #            and `ops-ragged-gather` are all slowest on tpu7x with an older
-#            JAX, not on the latest one.
+#            JAX, not on the latest one. That was when every shard had a full
+#            compat rerun of its own; the compat jobs are now smoke-mode bins
+#            (see `COMPAT_BIN_MINUTES`), so the next re-measure is over
+#            `latest_jax()` jobs only, and these numbers will mostly come down.
 #
 #            Files that were in the catch-all in those runs -- the shards new
 #            since, and the files added to existing ones -- have no step of
@@ -1143,14 +1161,17 @@ def check_consistency(
         claims[file].append((name, selector))
     # `minutes` is sorted on and printed, so a string or a zero would quietly
     # misplace the shard rather than fail. Absent says there is no number yet.
-    minutes = spec.get('minutes')
-    if minutes is not None and (
-        not isinstance(minutes, (int, float)) or minutes <= 0
-    ):
-      errors.append(
-          f'shard {name!r} has minutes={minutes!r}: expected a positive'
-          ' number, or the key omitted if unmeasured'
-      )
+    # `compat_minutes` is packed on, where a zero would let a bin grow without
+    # limit.
+    for key in ('minutes', 'compat_minutes'):
+      value = spec.get(key)
+      if value is not None and (
+          not isinstance(value, (int, float)) or value <= 0
+      ):
+        errors.append(
+            f'shard {name!r} has {key}={value!r}: expected a positive'
+            ' number, or the key omitted if unmeasured'
+        )
     # Every shard runs on every runner, so `Spec` has no key for restricting
     # one and nothing here reads such a key. An entry carrying a `devices` key
     # would be silently ignored, and would read to anyone editing the table as
@@ -1380,11 +1401,11 @@ def build_matrix(
   """Builds `strategy.matrix.include`, one entry per (shard, runner) job.
 
   Every shard runs on every runner, so this is the full cross product unless
-  `only` narrows it. Every
-  shard then runs once more per version in `older_jaxs()`, on each of
-  `COMPAT_RUNNERS`, for the backward compatibility check.
+  `only` narrows it. The backward compatibility check on `older_jaxs()` is not
+  here: it is a separate job, from `build_compat_matrix`.
 
-  The only place a shard's `paths` becomes a command line: the workflow reads
+  One of the two places a shard's `paths` becomes a command line, with
+  `build_compat_matrix`: the workflow reads
   `test_paths` as one string and splits it back into arguments with `xargs`,
   so `shlex.join` quotes it here rather than trusting every path to be free of
   whitespace and quoting characters.
@@ -1396,8 +1417,7 @@ def build_matrix(
       that reaches no test and correctly runs nothing.
 
   Returns:
-    A job per shard per runner, in `shard_order` within each runner, then the
-    backward compatible jobs.
+    A job per shard per runner, in `shard_order` within each runner.
   """
   ordered = sorted(shards.items(), key=shard_order)
   jobs = []
@@ -1418,20 +1438,94 @@ def build_matrix(
           'test_paths': shlex.join(spec['paths']),
           'jax_pin': latest_jax(),
       })
+  return jobs
 
+
+def compat_size(spec: Spec) -> float:
+  """Minutes a shard is expected to take in a compat bin.
+
+  Args:
+    spec: One shard's spec.
+
+  Returns:
+    `compat_minutes` if measured, else `minutes`, which over-counts smoke mode.
+    An unmeasured shard counts as a whole bin, so it is packed alone: absent
+    is an unknown, not a zero, and an unknown sharing a bin could make it the
+    slowest job of the run.
+  """
+  return spec.get('compat_minutes') or spec.get('minutes') or COMPAT_BIN_MINUTES
+
+
+def compat_bins(
+    shards: ShardMap, only: Collection[str] | None = None
+) -> list[list[str]]:
+  """Packs the shards to rerun on older JAX into bins of `COMPAT_BIN_MINUTES`.
+
+  First-fit decreasing: largest shard first, each into the first bin it fits.
+  A shard bigger than a bin gets a bin of its own rather than being split,
+  because the shard is already the smallest unit `paths` can address.
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    only: As in `build_matrix`. `None` packs every shard; empty packs none.
+
+  Returns:
+    Shard names per bin, fullest bin first. Every packed shard is in exactly
+    one bin.
+  """
+  sizes = {
+      name: compat_size(spec)
+      for name, spec in shards.items()
+      if spec['paths'] and (only is None or name in only)
+  }
+  bins: list[list[str]] = []
+  loads: list[float] = []
+  for name in sorted(sizes, key=lambda n: (-sizes[n], n)):
+    for i, load in enumerate(loads):
+      if load + sizes[name] <= COMPAT_BIN_MINUTES:
+        loads[i] += sizes[name]
+        bins[i].append(name)
+        break
+    else:
+      bins.append([name])
+      loads.append(sizes[name])
+  return [bins[i] for i in sorted(range(len(bins)), key=lambda i: -loads[i])]
+
+
+def build_compat_matrix(
+    shards: ShardMap, only: Collection[str] | None = None
+) -> list[MatrixEntry]:
+  """Builds the `compat-tests` job's `strategy.matrix.include`.
+
+  One entry per (bin, older JAX, compat runner), each running its bin's shards
+  in one pytest session in smoke mode. A separate job from `shard-tests` so
+  that its `fail-fast` only cancels other compat bins: a compat failure stops
+  the compat check early without taking the primary results with it.
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    only: As in `build_matrix`; selection narrows the compat check the same way.
+
+  Returns:
+    The compat jobs, fullest bin first, every version of a bin together, so
+    that the jobs that set the compat wall clock are the first to get runners.
+  """
+  bins = compat_bins(shards, only)
+  jobs = []
   for runner in COMPAT_RUNNERS:
-    for name, spec in ordered:
+    device, short = RUNNERS[runner]
+    for index, names in enumerate(bins, start=1):
+      paths = [p for name in names for p in shards[name]['paths']]
       for version in older_jaxs():
-        if only is not None and name not in only:
-          continue
-        if not spec['paths']:
-          continue
         jobs.append({
             'runner': runner,
-            'runner_short': f'{RUNNERS[runner][1]}-jax{version}',
-            'device': RUNNERS[runner][0],
-            'shard_name': name,
-            'test_paths': shlex.join(spec['paths']),
+            'runner_short': f'{short}-jax{version}',
+            'device': device,
+            'shard_name': f'compat-{index}',
+            # Which shards the bin holds, for the job log: the job title only
+            # has room for the bin's number.
+            'shards': ' '.join(names),
+            'test_paths': shlex.join(paths),
             'jax_pin': version,
         })
   return jobs
@@ -1658,6 +1752,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Under `--dry-run` the selection is computed and reported but not acted
     # on, so the matrix is every shard whatever `select` decided.
     combos = build_matrix(shards, None if args.dry_run else only)
+    compat = build_compat_matrix(shards, None if args.dry_run else only)
     flags = shlex.join(PYTEST_SELECT_FLAGS)
     # Diagnostics on stderr, so they land in the job log rather than in
     # $GITHUB_OUTPUT, which stdout is redirected to.
@@ -1669,12 +1764,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f'selection: {reason}', file=sys.stderr)
     # What actually runs, always. The block below is what selection thought,
     # which is the same thing unless this is a dry run.
-    print(f'{len(shards)} shards, {len(combos)} jobs', file=sys.stderr)
+    print(
+        f'{len(shards)} shards, {len(combos)} jobs, {len(compat)} compat jobs',
+        file=sys.stderr,
+    )
     if only is not None:
       verb = 'would select' if args.dry_run else 'selected'
       print(f'{verb} {len(only)} of {len(shards)} shards:', file=sys.stderr)
       for name in sorted(only):
         print(f'  {name}', file=sys.stderr)
+    for index, names in enumerate(
+        compat_bins(shards, None if args.dry_run else only), start=1
+    ):
+      print(f'compat-{index}: {" ".join(names)}', file=sys.stderr)
     print(f'not run by design: {sorted(excluded)}', file=sys.stderr)
     print(f'pytest select flags: {flags}', file=sys.stderr)
     # Only the values something reads. The reason goes to stderr above and
@@ -1683,6 +1785,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # newline would break -- and `-z` exists precisely because such a path can
     # come out of a pull request.
     print(f'include={json.dumps(combos)}')
+    print(f'compat_include={json.dumps(compat)}')
     print(f'pytest_flags={flags}')
     # The catch-all is empty in the ordinary case, and the workflow turns a
     # non-empty one into a `::warning::` annotation. On stdout as an output
@@ -1692,8 +1795,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
   combos = build_matrix(shards)
+  compat = build_compat_matrix(shards)
   per_shard = collections.Counter(c['shard_name'] for c in combos)
-  print(f'{len(shards)} shards, {len(combos)} jobs')
+  print(f'{len(shards)} shards, {len(combos)} jobs, {len(compat)} compat jobs')
   # Longest first, shards without a number last. An absent `minutes` is an
   # unknown, so it sorts to the bottom rather than being read as a zero.
   order = sorted(shards.items(), key=shard_order)
@@ -1719,6 +1823,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f'      excluded         {path}')
   for path in sorted(ignored):
     print(f'      never collected  {path}')
+
+  print()
+  print(
+      f'  compat bins, each run once per {", ".join(older_jaxs())} on'
+      f' {", ".join(RUNNERS[r][1] for r in COMPAT_RUNNERS)}:'
+  )
+  for index, names in enumerate(compat_bins(shards), start=1):
+    load = sum(compat_size(shards[n]) for n in names)
+    print(f'  compat-{index:<3d} {load:5.1f}m  {" ".join(names)}')
   return 0
 
 
