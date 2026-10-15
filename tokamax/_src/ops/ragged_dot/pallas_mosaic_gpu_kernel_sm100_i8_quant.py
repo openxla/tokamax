@@ -529,34 +529,18 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
             plgpu.commit_smem()
 
           with jax.named_scope("SMEM -> GMEM"):
-            # Write out the largest power of two rows first,
-            # then the next largest, etc.
-            # This allows us to coalesce writes as much as possible.
-            offset = start_within_block
-            size = 1 << (min(block_m, m).bit_length() - 1)
-            while size > 0:
-
-              @pl.when(actual_size & size != 0)
-              def _():
-                for ni in range(_DEQ_WG):
-                  out_smem_slice = out_smem.at[ni, pl.ds(offset, size)]
-                  o_gref_slice = out_gmem.at[
-                      pl.ds(block_start + offset, size),
-                      pl.ds(
-                          tid_n * block_n * _DEQ_WG
-                          + ni * block_n
-                          + cluster_idx * tile_n,
-                          tile_n,
-                      ),
-                  ]
-                  plgpu.copy_smem_to_gmem(
-                      out_smem_slice, o_gref_slice, commit_group=False
-                  )
-
-              offset += actual_size & size
-              size //= 2
-            plgpu.commit_smem_to_gmem_group()
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            common.copy_ragged_smem_to_gmem(
+                out_smem,
+                out_gmem,
+                block_start=block_start,
+                start_within_block=start_within_block,
+                actual_size=actual_size,
+                ns=pl.ds(
+                    tid_n * block_n * _DEQ_WG + cluster_idx * tile_n, tile_n
+                ),
+                max_rows=min(block_m, m),
+                col_stride=block_n,
+            )
 
       return carry + (actual_size > 0)
 

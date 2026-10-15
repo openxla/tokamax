@@ -842,28 +842,15 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
                 block_start,
                 cluster_block_m,
             )
-          # Write out the largest power of two rows first,
-          # then the next largest, etc.
-          # This allows us to coalesce writes as much as possible.
-          offset = start_within_block
-          size = 1 << (min(cluster_block_m, m).bit_length() - 1)
-          while size > 0:
-
-            @pl.when(actual_size & size != 0)
-            def _():
-              out_smem_slice = out_smem.at[pl.ds(offset, size)]
-              o_gref_slice = out_gmem.at[
-                  pl.ds(block_start + offset, size),
-                  slice_n,
-              ]
-              plgpu.copy_smem_to_gmem(
-                  out_smem_slice, o_gref_slice, commit_group=False
-              )
-
-            offset += actual_size & size
-            size //= 2
-          plgpu.commit_smem_to_gmem_group()
-          plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+          common.copy_ragged_smem_to_gmem(
+              out_smem,
+              out_gmem,
+              block_start=block_start,
+              start_within_block=start_within_block,
+              actual_size=actual_size,
+              ns=slice_n,
+              max_rows=min(cluster_block_m, m),
+          )
 
   def kernel_entry(*refs):
     x_smem = plgpu.SMEM(
