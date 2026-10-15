@@ -1471,6 +1471,9 @@ class GDNAttentionTest(parameterized.TestCase):
             d_v=d_v,
             kernel_size=kernel_size,
             decode_tile_size=decode_tile,
+            # CPU interpret mode does not support ref.reshape on the C > 1
+            # chunked prefill path; each 1-token prefill is one tile at C = 1.
+            mixed_tile_size=1,
         )
         jax.block_until_ready((conv_out, rec_out, out))
       self.assertTrue(races_per_call)
@@ -1804,6 +1807,160 @@ class GDNAttentionTest(parameterized.TestCase):
       np.testing.assert_allclose(out, out_ref, rtol=1e-2, atol=1e-2)
       np.testing.assert_allclose(conv_out, conv_ref, rtol=1e-2, atol=1e-2)
       np.testing.assert_allclose(rec_out, rec_ref, rtol=1e-2, atol=1e-2)
+
+  def test_qwen3_5_397b_parallelism_tile_selection(self):
+    """Selects optimal (decode_tile, mixed_tile) across Qwen3.5-397B parallelisms."""
+    d_k, d_v, kernel_size = 128, 128, 4
+    f32 = jnp.dtype(jnp.float32)
+    bf16 = jnp.dtype(jnp.bfloat16)
+    # Use the 64 MiB TPU v7x VMEM budget (0.8 default, 0.9 windowed)
+    # so the expected tile table is identical across TPU test targets.
+    vmem_64m = 64 * 1024 * 1024
+    limit_w1 = int(config.GDNConfig.DEFAULT_VMEM_FRACTION * vmem_64m)
+    limit_w4 = int(config.GDNConfig.WINDOWED_VMEM_FRACTION * vmem_64m)
+
+    # (label, n_kq, n_v, batch_size, num_seqs, window_size, state_dtype, expected)
+    cases = [
+        # TP8 + DCP=4 (n_kq=2, n_v=8, W=4 for MTP=3): warmup & verify buckets
+        ("tp8_dcp4_c16_b4", 2, 8, 4, 16, 4, f32, (2, 4)),
+        ("tp8_dcp4_c16_b8", 2, 8, 8, 16, 4, f32, (4, 8)),
+        ("tp8_dcp4_c16_b16", 2, 8, 16, 16, 4, f32, (4, 16)),
+        ("tp8_dcp4_c16_b32", 2, 8, 32, 16, 4, f32, (4, 32)),
+        ("tp8_dcp4_c16_b64", 2, 8, 64, 16, 4, f32, (4, 64)),
+        ("tp8_dcp4_c32_b128", 2, 8, 128, 32, 4, f32, (8, 128)),
+        ("tp8_dcp4_c64_b256", 2, 8, 256, 64, 4, f32, (8, 128)),
+        # TP8 + DCP=1 (n_kq=2, n_v=8, W=1 and W=4) and padded slot table
+        ("tp8_dcp1_c8_mtp3_b32", 2, 8, 32, 8, 4, f32, (4, 32)),
+        ("tp8_dcp1_c32_b16", 2, 8, 16, 32, 1, f32, (4, 16)),
+        ("tp8_dcp1_c64_b64", 2, 8, 64, 64, 1, f32, (8, 64)),
+        ("tp8_padded_n512_b64", 2, 8, 64, 512, 1, bf16, (8, 64)),
+        # PCP8 + TP1 disagg prefill (n_kq=2, n_v=8, W=1)
+        ("pcp8_prefill_b4096", 2, 8, 4096, 16, 1, f32, (4, 128)),
+        # DP4 + TP2 + EP8 (n_kq=8, n_v=32, W=1 and W=4)
+        ("dp4tp2_c64_b8", 8, 32, 8, 32, 1, f32, (2, 8)),
+        ("dp4tp2_c64_b32", 8, 32, 32, 32, 1, f32, (4, 32)),
+        ("dp4tp2_c64_b2048", 8, 32, 2048, 32, 1, f32, (4, 128)),
+        ("dp4tp2_mtp3_c16_b64_f32", 8, 32, 64, 16, 4, f32, (2, 64)),
+        ("dp4tp2_mtp3_c32_b128_f32", 8, 32, 128, 32, 4, f32, (2, 128)),
+        ("dp4tp2_mtp3_c32_b128_bf16", 8, 32, 128, 32, 4, bf16, (4, 128)),
+        # DP8 + TP1 + EP8 (n_kq=16, n_v=64, W=1 and W=4)
+        ("dp8_c128_b8", 16, 64, 8, 16, 1, f32, (1, 8)),
+        ("dp8_c128_b16", 16, 64, 16, 16, 1, f32, (2, 16)),
+        ("dp8_c256_b32_f32", 16, 64, 32, 32, 1, f32, (2, 32)),
+        ("dp8_c256_b32_bf16", 16, 64, 32, 32, 1, bf16, (2, 32)),
+        ("dp8_c256_b320_f32", 16, 64, 320, 32, 1, f32, (2, 64)),
+        ("dp8_mtp3_c32_b128_f32", 16, 64, 128, 32, 4, f32, (1, 64)),
+        ("dp8_mtp3_c32_b128_bf16", 16, 64, 128, 32, 4, bf16, (2, 64)),
+    ]
+    for label, n_kq, n_v, b, n, w, state_dtype, expected in cases:
+      with self.subTest(label=label):
+        dim = 2 * n_kq * d_k + n_v * d_v
+        got = tiling.get_tile_sizes(
+            batch_size=b,
+            num_seqs=n,
+            padded_batch_size=b,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            conv_state_dim_size=dim,
+            act_out_dtype=bf16,
+            recurrent_state_dtype=state_dtype,
+            num_lanes=128,
+            decode_vmem_limit_bytes=limit_w4 if w > 1 else limit_w1,
+            mixed_vmem_limit_bytes=limit_w1,
+            window_size=w,
+        )
+        self.assertEqual(got, expected, msg=label)
+
+  def test_qwen3_5_397b_parallelism_execution(self):
+    """Executes default-tiled GDN across Qwen3.5-397B head splits and DCP=4."""
+    d_k, d_v, kernel_size = 128, 128, 4
+    rng = jax.random.key(42)
+
+    for n_kq, n_v, num_seqs, num_spec_tokens, prefill_len, num_decodes in [
+        (2, 8, 16, 3, 16, 0),  # TP8 DCP=4 c=16 MTP=3: 16-tok prefill in B=16
+        (2, 8, 16, 3, 0, 16),  # TP8 DCP=4 c=16 MTP=3 warmup: 16 decodes, B=16
+        (8, 32, 16, 0, 12, 4),  # DP4TP2: 4 decodes + 12-tok prefill in B=16
+        (16, 64, 16, 0, 12, 4),  # DP8: 4 decodes + 12-tok prefill in B=16
+    ]:
+      with self.subTest(
+          n_kq=n_kq,
+          n_v=n_v,
+          num_spec_tokens=num_spec_tokens,
+          prefill_len=prefill_len,
+          num_decodes=num_decodes,
+      ):
+        dim = 2 * n_kq * d_k + n_v * d_v
+        window = num_spec_tokens + 1
+        batch_size = num_decodes + prefill_len
+        num_blocks = num_seqs * window + 4
+        k1, k2, k3, k4, k5, k6, k7, k8, k9, rng = jax.random.split(rng, 10)
+        init_conv = jax.random.normal(
+            k8, (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
+        )
+        init_rec = jax.random.normal(
+            k9, (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
+        )
+        active_seqs = num_decodes + (1 if prefill_len > 0 else 0)
+        state_indices = jnp.arange(num_seqs, dtype=jnp.int32) * window
+        common_kwargs = dict(
+            qkv=jax.random.normal(k1, (batch_size, dim), dtype=jnp.bfloat16),
+            b=jax.random.normal(k2, (batch_size, n_v), dtype=jnp.bfloat16),
+            a=jax.random.normal(k3, (batch_size, n_v), dtype=jnp.bfloat16),
+            conv_weight=jax.random.normal(
+                k4, (dim, 1, kernel_size), dtype=jnp.bfloat16
+            ),
+            conv_bias=jax.random.normal(k5, (dim,), dtype=jnp.bfloat16),
+            a_log=jax.random.normal(k6, (n_v,), dtype=jnp.float32),
+            dt_bias=jax.random.normal(k7, (n_v,), dtype=jnp.float32),
+            query_start_loc=jnp.array(
+                list(range(num_decodes + 1))
+                + [batch_size] * (num_seqs - num_decodes),
+                dtype=jnp.int32,
+            ),
+            state_indices=state_indices,
+            distribution=jnp.array(
+                [num_decodes, num_decodes, active_seqs], dtype=jnp.int32
+            ),
+            seq_lens=jnp.array(
+                [10] * num_decodes
+                + ([prefill_len + 10] if prefill_len > 0 else [])
+                + [0] * (num_seqs - active_seqs),
+                dtype=jnp.int32,
+            ),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        (conv_ref, rec_ref), out_ref = gdn_attention_ref(
+            conv_state=init_conv,
+            recurrent_state=init_rec,
+            **common_kwargs,
+        )
+        (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+            conv_state=init_conv.copy(),
+            recurrent_state=init_rec.copy(),
+            read_offsets=(
+                jnp.zeros((num_seqs,), dtype=jnp.int32)
+                if num_spec_tokens > 0
+                else None
+            ),
+            num_spec_tokens=num_spec_tokens,
+            **common_kwargs,
+        )
+        np.testing.assert_allclose(out, out_ref, rtol=2e-2, atol=2e-2)
+        for s in range(active_seqs):
+          slot = int(state_indices[s])
+          np.testing.assert_allclose(
+              conv_out[slot], conv_ref[slot], rtol=2e-2, atol=2e-2
+          )
+          np.testing.assert_allclose(
+              rec_out[slot], rec_ref[slot], rtol=3e-2, atol=3e-2
+          )
 
 
 if __name__ == "__main__":

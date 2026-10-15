@@ -333,11 +333,12 @@ def get_tile_sizes(
   Returns:
     Tuple of (decode_tile_size, mixed_tile_size).
   """
+  # A batch of padded_batch_size tokens spans at most padded_batch_size
+  # active sequences even when num_seqs reflects a larger static slot table.
+  active_num_seqs = max(1, min(padded_batch_size, num_seqs))
   if decode_tile_size is None or decode_tile_size <= 0:
     vmem_fit = calculate_decode_tile_size(
-        # BATCHED tiles over sequences; a tile never needs more slots than
-        # there are sequences.
-        batch_size=min(padded_batch_size, num_seqs),
+        batch_size=active_num_seqs,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -350,15 +351,14 @@ def get_tile_sizes(
         kernel_size=kernel_size,
         window_size=window_size,
     )
-    decode_tile_size = min(decode_tile_target(num_seqs, n_v), vmem_fit)
+    decode_tile_size = min(decode_tile_target(active_num_seqs, n_v), vmem_fit)
 
   if mixed_tile_size is None or mixed_tile_size <= 0:
-    # When batch_size <= num_seqs * window_size, average tokens per slot fit
-    # inside the decode/verify window; sizing the 0-tile per_seq kernel to C=1
-    # avoids multi-MiB pipeline prefetch DMAs on pure decode steps.
-    prefill_seq_len = 1 if batch_size <= num_seqs * window_size else batch_size
+    # Size C from the token bucket: a static (B, N, W) shape cannot tell a
+    # decode step from a prefill, and an empty PER_SEQ launch costs the
+    # same at any C.
     vmem_fit = calculate_mixed_tile_size(
-        seq_len=prefill_seq_len,
+        seq_len=batch_size,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
