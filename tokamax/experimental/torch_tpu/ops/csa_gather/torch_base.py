@@ -16,7 +16,7 @@
 
 from typing import Any, TypeVar
 import jax
-from tokamax._src.ops.experimental.tpu.csa_gather import base as jax_base
+from tokamax._src.ops.csa_gather import base as jax_base
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 from typing_extensions import override

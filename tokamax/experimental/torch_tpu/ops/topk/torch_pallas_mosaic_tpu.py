@@ -17,7 +17,7 @@
 from typing import Any
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.topk import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.topk import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops.topk import torch_base
 import torch

@@ -21,7 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.csa_gather import pallas_mosaic_tpu_kernel as csa_gather
+from tokamax._src.ops.csa_gather import pallas_mosaic_tpu_kernel as csa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 

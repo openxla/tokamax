@@ -576,10 +576,10 @@ SHARDS: ShardMap = {
     # `pallas_mosaic_tpu_test.py`.
     'experimental-proj-and-save-state': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/proj_and_save_state/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/proj_and_save_state/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/proj_and_save_state/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/proj_and_save_state/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/proj_and_save_state/api_test.py',
+            'tokamax/_src/ops/proj_and_save_state/base_test.py',
+            'tokamax/_src/ops/proj_and_save_state/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/proj_and_save_state/pallas_mosaic_tpu_test.py',
         ),
         minutes=8,
     ),
@@ -592,11 +592,11 @@ SHARDS: ShardMap = {
     ),
     'experimental-mhc': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/mhc/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/mhc/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/mhc/mhc_test.py',
-            'tokamax/_src/ops/experimental/tpu/mhc/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/mhc/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/mhc/api_test.py',
+            'tokamax/_src/ops/mhc/base_test.py',
+            'tokamax/_src/ops/mhc/mhc_test.py',
+            'tokamax/_src/ops/mhc/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/mhc/pallas_mosaic_tpu_test.py',
         ),
         minutes=6,
     ),
@@ -616,31 +616,31 @@ SHARDS: ShardMap = {
     # above.
     'experimental-dsv4-compressor': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/dsv4_compressor_test.py',
-            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/dsv4_compressor/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/dsv4_compressor/api_test.py',
+            'tokamax/_src/ops/dsv4_compressor/base_test.py',
+            'tokamax/_src/ops/dsv4_compressor/dsv4_compressor_test.py',
+            'tokamax/_src/ops/dsv4_compressor/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/dsv4_compressor/pallas_mosaic_tpu_test.py',
         ),
         minutes=5,
     ),
     'experimental-grouped-lowrank-proj': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/grouped_lowrank_proj_test.py',
-            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/grouped_lowrank_proj/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/grouped_lowrank_proj/api_test.py',
+            'tokamax/_src/ops/grouped_lowrank_proj/base_test.py',
+            'tokamax/_src/ops/grouped_lowrank_proj/grouped_lowrank_proj_test.py',
+            'tokamax/_src/ops/grouped_lowrank_proj/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/grouped_lowrank_proj/pallas_mosaic_tpu_test.py',
         ),
         minutes=4,
     ),
     'experimental-deepseek-rope': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/deepseek_rope/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/deepseek_rope/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/deepseek_rope/deepseek_rope_test.py',
-            'tokamax/_src/ops/experimental/tpu/deepseek_rope/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/deepseek_rope/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/deepseek_rope/api_test.py',
+            'tokamax/_src/ops/deepseek_rope/base_test.py',
+            'tokamax/_src/ops/deepseek_rope/deepseek_rope_test.py',
+            'tokamax/_src/ops/deepseek_rope/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/deepseek_rope/pallas_mosaic_tpu_test.py',
         ),
         minutes=3,
     ),
@@ -664,11 +664,11 @@ SHARDS: ShardMap = {
     ),
     'experimental-csa-gather': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/csa_gather/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/csa_gather/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/csa_gather/csa_gather_test.py',
-            'tokamax/_src/ops/experimental/tpu/csa_gather/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/csa_gather/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/csa_gather/api_test.py',
+            'tokamax/_src/ops/csa_gather/base_test.py',
+            'tokamax/_src/ops/csa_gather/csa_gather_test.py',
+            'tokamax/_src/ops/csa_gather/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/csa_gather/pallas_mosaic_tpu_test.py',
         ),
         minutes=2,
     ),
@@ -693,9 +693,9 @@ SHARDS: ShardMap = {
     # tpu6e, nearly all of it `pallas_mosaic_tpu_test.py`.
     'experimental-router-topk': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/router_topk/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/router_topk/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/router_topk/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/router_topk/api_test.py',
+            'tokamax/_src/ops/router_topk/base_test.py',
+            'tokamax/_src/ops/router_topk/pallas_mosaic_tpu_test.py',
         ),
         minutes=2,
     ),
@@ -731,15 +731,15 @@ SHARDS: ShardMap = {
     # run everywhere; merging them would drop the CUDA coverage.
     'experimental-topk': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/topk/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/topk/base_test.py',
+            'tokamax/_src/ops/topk/api_test.py',
+            'tokamax/_src/ops/topk/base_test.py',
         ),
         minutes=1,
     ),
     'experimental-topk-kernel': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/topk/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/topk/pallas_mosaic_tpu_test.py',
         ),
         minutes=1,
     ),

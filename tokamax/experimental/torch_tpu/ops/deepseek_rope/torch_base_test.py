@@ -20,8 +20,8 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.deepseek_rope import base as jax_base
-from tokamax._src.ops.experimental.tpu.deepseek_rope import test_base as jax_test_base
+from tokamax._src.ops.deepseek_rope import base as jax_base
+from tokamax._src.ops.deepseek_rope import test_base as jax_test_base
 from tokamax.experimental.torch_tpu.ops import torch_test_utils
 from tokamax.experimental.torch_tpu.ops.deepseek_rope import torch_base
 import torch

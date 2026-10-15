@@ -20,7 +20,7 @@ from typing import Any, TypeVar, cast, override
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops import op as jax_tokamax_op
-from tokamax._src.ops.experimental.tpu.deepseek_rope import base as jax_base
+from tokamax._src.ops.deepseek_rope import base as jax_base
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch

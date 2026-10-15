@@ -19,8 +19,8 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.csa_gather import base as jax_base
-from tokamax._src.ops.experimental.tpu.csa_gather import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.csa_gather import base as jax_base
+from tokamax._src.ops.csa_gather import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.csa_gather import torch_base
 from tokamax.experimental.torch_tpu.ops.csa_gather import torch_pallas_mosaic_tpu

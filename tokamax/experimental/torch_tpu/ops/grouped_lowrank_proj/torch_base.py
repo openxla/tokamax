@@ -17,7 +17,7 @@
 from typing import Any, TypeVar, override
 
 import jax
-from tokamax._src.ops.experimental.tpu.grouped_lowrank_proj import base as jax_base
+from tokamax._src.ops.grouped_lowrank_proj import base as jax_base
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 

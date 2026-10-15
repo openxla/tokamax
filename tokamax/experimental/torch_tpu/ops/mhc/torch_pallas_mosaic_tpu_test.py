@@ -19,9 +19,9 @@ from typing import Any
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-from tokamax._src.ops.experimental.tpu.mhc import base as jax_base
-from tokamax._src.ops.experimental.tpu.mhc import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
-from tokamax._src.ops.experimental.tpu.mhc import test_base as jax_test_base
+from tokamax._src.ops.mhc import base as jax_base
+from tokamax._src.ops.mhc import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.mhc import test_base as jax_test_base
 from tokamax.experimental.torch_tpu.ops import torch_test_utils
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.mhc import torch_base

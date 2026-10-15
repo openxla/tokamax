@@ -20,8 +20,8 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.topk import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
-from tokamax._src.ops.experimental.tpu.topk import test_base
+from tokamax._src.ops.topk import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.topk import test_base
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.topk import torch_pallas_mosaic_tpu
 import torch

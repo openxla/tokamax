@@ -17,8 +17,8 @@
 from typing import Any, TypeVar, override
 
 import jax
-from tokamax._src.ops.experimental.tpu.mhc import base as jax_base
-from tokamax._src.ops.experimental.tpu.mhc import reference as jax_reference
+from tokamax._src.ops.mhc import base as jax_base
+from tokamax._src.ops.mhc import reference as jax_reference
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 

@@ -16,7 +16,7 @@
 
 from typing import Any
 import jax
-from tokamax._src.ops.experimental.tpu.csa_gather import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.csa_gather import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops.csa_gather import torch_base
 import torch

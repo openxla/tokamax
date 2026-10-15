@@ -29,7 +29,7 @@ from tokamax._src.ops.experimental.lightning_indexer.kernel import (
     dcp_sc_compact,
     metadata,
 )
-from tokamax._src.ops.experimental.tpu.topk import pallas_mosaic_tpu_kernel
+from tokamax._src.ops.topk import pallas_mosaic_tpu_kernel
 
 BITS_NEG_INF = pallas_mosaic_tpu_kernel.BITS_NEG_INF
 sparsecore_topk = pallas_mosaic_tpu_kernel.sparsecore_topk

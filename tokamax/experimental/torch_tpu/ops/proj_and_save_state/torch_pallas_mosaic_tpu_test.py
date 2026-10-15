@@ -21,9 +21,9 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import numpy as np
-from tokamax._src.ops.experimental.tpu.proj_and_save_state import base as jax_base
-from tokamax._src.ops.experimental.tpu.proj_and_save_state import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
-from tokamax._src.ops.experimental.tpu.proj_and_save_state import test_base as jax_test_base
+from tokamax._src.ops.proj_and_save_state import base as jax_base
+from tokamax._src.ops.proj_and_save_state import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.proj_and_save_state import test_base as jax_test_base
 from tokamax.experimental.torch_tpu.ops import torch_test_utils
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.proj_and_save_state import torch_base

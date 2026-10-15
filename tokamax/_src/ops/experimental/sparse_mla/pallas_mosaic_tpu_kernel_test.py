@@ -27,7 +27,7 @@ from tokamax._src.ops.experimental.sparse_mla.pallas_mosaic_tpu_kernel import (
     cdiv,
     get_kv_cache_shape,
 )
-from tokamax._src.ops.experimental.tpu.dsv4_compressor import csa_cache_layout
+from tokamax._src.ops.dsv4_compressor import csa_cache_layout
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 

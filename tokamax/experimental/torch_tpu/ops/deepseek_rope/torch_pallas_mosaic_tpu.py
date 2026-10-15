@@ -19,8 +19,8 @@ from typing import Any, cast, override
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.deepseek_rope import base as jax_base
-from tokamax._src.ops.experimental.tpu.deepseek_rope import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.deepseek_rope import base as jax_base
+from tokamax._src.ops.deepseek_rope import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.deepseek_rope import torch_base

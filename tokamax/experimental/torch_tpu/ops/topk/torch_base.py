@@ -17,7 +17,7 @@
 from typing import Any, TypeVar
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.topk import base as jax_base
+from tokamax._src.ops.topk import base as jax_base
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 from typing_extensions import override

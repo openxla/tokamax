@@ -22,9 +22,9 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 from jax.extend import backend
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.tpu.deepseek_rope import base as jax_base
-from tokamax._src.ops.experimental.tpu.deepseek_rope import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
-from tokamax._src.ops.experimental.tpu.deepseek_rope import test_base as jax_test_base
+from tokamax._src.ops.deepseek_rope import base as jax_base
+from tokamax._src.ops.deepseek_rope import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.deepseek_rope import test_base as jax_test_base
 from tokamax.experimental.torch_tpu.ops import torch_test_utils
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.deepseek_rope import torch_base

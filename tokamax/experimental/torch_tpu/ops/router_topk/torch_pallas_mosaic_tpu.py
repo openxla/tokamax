@@ -17,7 +17,7 @@
 import dataclasses
 from typing import Any
 import jax
-from tokamax._src.ops.experimental.tpu.router_topk import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.router_topk import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops.router_topk import torch_base
 import torch

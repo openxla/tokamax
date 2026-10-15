@@ -20,8 +20,8 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import numpy as np
-from tokamax._src.ops.experimental.tpu.grouped_lowrank_proj import base as jax_base
-from tokamax._src.ops.experimental.tpu.grouped_lowrank_proj import test_base as jax_test_base
+from tokamax._src.ops.grouped_lowrank_proj import base as jax_base
+from tokamax._src.ops.grouped_lowrank_proj import test_base as jax_test_base
 from tokamax.experimental.torch_tpu.ops import torch_test_utils
 from tokamax.experimental.torch_tpu.ops.grouped_lowrank_proj import torch_base
 import torch

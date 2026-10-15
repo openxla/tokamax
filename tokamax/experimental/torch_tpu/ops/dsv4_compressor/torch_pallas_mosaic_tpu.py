@@ -18,8 +18,8 @@ import dataclasses
 from typing import Any, override
 
 import jax
-from tokamax._src.ops.experimental.tpu.dsv4_compressor import base as jax_base
-from tokamax._src.ops.experimental.tpu.dsv4_compressor import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.dsv4_compressor import base as jax_base
+from tokamax._src.ops.dsv4_compressor import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops.dsv4_compressor import torch_base
 import torch
