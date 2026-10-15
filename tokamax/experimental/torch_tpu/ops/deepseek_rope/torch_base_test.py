@@ -69,6 +69,19 @@ class DeepseekRopeBaseTest(parameterized.TestCase):
       self.skipTest("Only supported on TPUs.")
     torch.manual_seed(0)
 
+  def test_canonicalize_jax_quant_dtype(self):
+    self.assertIsNone(torch_base.canonicalize_jax_quant_dtype("rope", None))
+    self.assertEqual(
+        torch_base.canonicalize_jax_quant_dtype("rope_quant", None),
+        jnp.dtype(jnp.float8_e4m3fn),
+    )
+    self.assertEqual(
+        torch_base.canonicalize_jax_quant_dtype(
+            "rope_quant", torch.float8_e5m2
+        ),
+        jnp.dtype(jnp.float8_e5m2),
+    )
+
   @parameterized.product(
       shape=(
           (8, jax_test_base.NUM_HEADS, jax_test_base.HEAD_DIM),
@@ -143,7 +156,6 @@ class DeepseekRopeBaseTest(parameterized.TestCase):
       quant_dtype=(
           None,
           torch.float8_e4m3fn,
-          jnp.float8_e4m3fn,
           "float8_e4m3fn",
       ),
   )

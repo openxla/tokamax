@@ -80,6 +80,13 @@ def str_to_jax_dtype(
   return jnp.dtype(dtype_str) if dtype_str is not None else None
 
 
+def str_to_torch_dtype(
+    dtype: str | None,
+) -> torch.dtype | None:
+  """Converts a string dtype to a `torch.dtype`."""
+  return getattr(torch, dtype) if dtype is not None else None
+
+
 def convert_torch_to_jax_via_meta(
     torch_tensor: torch.Tensor,
 ) -> jax.ShapeDtypeStruct:

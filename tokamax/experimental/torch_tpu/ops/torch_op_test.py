@@ -439,6 +439,41 @@ class ConvertTorchToJaxViaMetaTest(parameterized.TestCase):
     self.assertEqual(roundtrip.dtype, torch_dtype)
     torch.testing.assert_close(roundtrip, t)
 
+  @parameterized.named_parameters(
+      ("float32", torch.float32, jnp.float32, "float32"),
+      ("bfloat16", torch.bfloat16, jnp.bfloat16, "bfloat16"),
+      ("float16", torch.float16, jnp.float16, "float16"),
+      (
+          "float8_e4m3fn",
+          torch.float8_e4m3fn,
+          jnp.float8_e4m3fn,
+          "float8_e4m3fn",
+      ),
+      ("float8_e5m2", torch.float8_e5m2, jnp.float8_e5m2, "float8_e5m2"),
+      ("int32", torch.int32, jnp.int32, "int32"),
+      ("bool", torch.bool, jnp.bool_, "bool"),
+  )
+  def test_str_to_jax_dtype_and_str_to_torch_dtype(
+      self,
+      torch_dtype: torch.dtype,
+      jax_dtype: Any,
+      dtype_str: str,
+  ):
+    self.assertEqual(
+        torch_utils.str_to_jax_dtype(torch_dtype), jnp.dtype(jax_dtype)
+    )
+    self.assertEqual(
+        torch_utils.str_to_jax_dtype(dtype_str), jnp.dtype(jax_dtype)
+    )
+    self.assertEqual(
+        torch_utils.str_to_jax_dtype(jax_dtype), jnp.dtype(jax_dtype)
+    )
+    self.assertEqual(torch_utils.str_to_torch_dtype(dtype_str), torch_dtype)
+
+  def test_str_to_jax_dtype_and_str_to_torch_dtype_none(self):
+    self.assertIsNone(torch_utils.str_to_jax_dtype(None))
+    self.assertIsNone(torch_utils.str_to_torch_dtype(None))
+
 
 class TorchOpTest(parameterized.TestCase):
 

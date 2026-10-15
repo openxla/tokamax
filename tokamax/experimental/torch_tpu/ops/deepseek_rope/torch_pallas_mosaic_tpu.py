@@ -27,7 +27,6 @@ from tokamax.experimental.torch_tpu.ops.deepseek_rope import torch_base
 import torch
 
 Config = jax_pallas_mosaic_tpu.Config
-Mode = jax_base.Mode
 
 
 class _PallasMosaicTpuDeepseekRope(
@@ -83,10 +82,10 @@ class _PallasMosaicTpuDeepseekRope(
       x: torch.Tensor,
       positions: torch.Tensor,
       cos_sin_cache: torch.Tensor,
-      mode: Mode = "rope",
+      mode: str = "rope",
       inverse: bool = False,
       eps: float = 1e-6,
-      quant_dtype: torch.dtype | jax.typing.DTypeLike | str | None = None,
+      quant_dtype: torch.dtype | str | None = None,
       return_residuals: bool = False,
       config: Config | None = None,
       configs: tuple[Config | None, Any] | None = None,
@@ -132,7 +131,7 @@ class _PallasMosaicTpuDeepseekRope(
         x,
         positions,
         cos_sin_cache,
-        mode=cast(Mode, mode),
+        mode=cast(jax_base.Mode, mode),
         inverse=inverse,
         eps=eps,
         quant_dtype=torch_base.canonicalize_jax_quant_dtype(mode, quant_dtype),

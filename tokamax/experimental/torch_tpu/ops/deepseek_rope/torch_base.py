@@ -25,26 +25,19 @@ from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch
 
-Mode = jax_base.Mode
 _Config = TypeVar("_Config")
 
 
 def _to_torch_quant_dtype(
-    quant_dtype: torch.dtype | jax.typing.DTypeLike | str | None,
+    quant_dtype: str | None,
 ) -> torch.dtype:
   """Resolves `quant_dtype` to a `torch.dtype` (default `torch.float8_e4m3fn`)."""
-  if quant_dtype is None:
-    return torch.float8_e4m3fn
-  if isinstance(quant_dtype, torch.dtype):
-    return quant_dtype
-  dtype_str = torch_utils.dtype_to_str(quant_dtype)
-  assert dtype_str is not None
-  return getattr(torch, dtype_str)
+  return torch_utils.str_to_torch_dtype(quant_dtype) or torch.float8_e4m3fn
 
 
 def canonicalize_jax_quant_dtype(
     mode: str,
-    quant_dtype: torch.dtype | jax.typing.DTypeLike | str | None,
+    quant_dtype: torch.dtype | str | None,
 ) -> jnp.dtype | None:
   """Canonicalizes `quant_dtype` to match `jax_base.DeepseekRope.bind`."""
   if mode != "rope_quant":
@@ -113,10 +106,10 @@ class _DeepseekRope(torch_op.TorchOp[_Config]):
       x: torch.Tensor,
       positions: torch.Tensor,
       cos_sin_cache: torch.Tensor,
-      mode: Mode = "rope",
+      mode: str = "rope",
       inverse: bool = False,
       eps: float = 1e-6,
-      quant_dtype: torch.dtype | jax.typing.DTypeLike | str | None = None,
+      quant_dtype: torch.dtype | str | None = None,
       return_residuals: bool = False,
       config: _Config | None = None,
       configs: tuple[Any, Any] | None = None,
@@ -161,7 +154,7 @@ class _DeepseekRope(torch_op.TorchOp[_Config]):
         x,
         positions,
         cos_sin_cache,
-        mode=cast(Mode, mode),
+        mode=cast(jax_base.Mode, mode),
         inverse=inverse,
         eps=eps,
         quant_dtype=canonicalize_jax_quant_dtype(mode, quant_dtype),
