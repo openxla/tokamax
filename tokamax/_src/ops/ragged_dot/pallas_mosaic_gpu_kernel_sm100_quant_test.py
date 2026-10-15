@@ -83,6 +83,11 @@ class _Sm100QuantTestBase(test_base.RaggedDotTestBase):
 
       if isinstance(lhs_, qwix.QArray) and lhs_.qtype != self._quant_a_dtype:
         expect_supported = False
+      if (
+          self._quant_a_dtype == jnp.int8
+          and not gpu_utils.has_tcgen05_int8_support()
+      ):
+        expect_supported = False
 
       if expect_supported:
         return op.replace(config=config)(lhs, rhs, **kwargs)

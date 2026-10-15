@@ -181,6 +181,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       if isinstance(rhs, QArray):
         if isinstance(lhs, QArray):
           if lhs.qtype == jnp.int8:
+            if not gpu_utils.has_tcgen05_int8_support():
+              raise NotImplementedError(
+                  "int8 x int4 MMA (.kind::i8) is not supported on sm103+."
+              )
             fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
           elif lhs.qtype == jnp.float8_e4m3fn:
             fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
