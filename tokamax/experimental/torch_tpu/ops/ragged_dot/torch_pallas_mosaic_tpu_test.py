@@ -325,16 +325,45 @@ class PallasMosaicTpuRaggedDotTest(parameterized.TestCase):
     torch.testing.assert_close(lhs.grad, lhs_expected.grad)
     torch.testing.assert_close(rhs.grad, rhs_expected.grad)
 
-  def test_activation_raises_error(self):
-    lhs, rhs, group_sizes, _ = self._generate_random_data(
-        m=256, k=128, n=256, num_groups=4
+  def test_call_with_explicit_pytorch_types(self):
+    lhs, rhs, group_sizes, dout = self._generate_random_data(
+        m=256, k=128, n=256, num_groups=4, dtype=torch.bfloat16
     )
     op_rd = torch_pallas_mosaic_tpu.PallasMosaicTpuRaggedDot
-    with self.assertRaisesRegex(
-        NotImplementedError,
-        "activations are not supported on Torch TPU Tokamax",
-    ):
-      op_rd(lhs, rhs, group_sizes, activation=jax.nn.relu)
+    configs = torch_utils.get_configs(
+        op_rd,
+        lhs,
+        rhs,
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=torch_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+        precision=torch_base.Precision.DEFAULT,
+        preferred_element_type=torch.bfloat16,
+        from_autotuning_cache=False,
+    )
+    out = op_rd(
+        lhs,
+        rhs,
+        group_sizes,
+        ragged_dot_dimension_numbers=torch_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+        precision=torch_base.Precision.DEFAULT,
+        preferred_element_type=torch.bfloat16,
+        configs=configs,
+    )
+    self.assertEqual(out.dtype, torch.bfloat16)
+    out.backward(dout)
+    self.assertIsNotNone(lhs.grad)
+    self.assertIsNotNone(rhs.grad)
+
+    with torch.no_grad():
+      out_f32 = op_rd(
+          lhs,
+          rhs,
+          group_sizes,
+          ragged_dot_dimension_numbers=torch_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+          precision=torch_base.Precision.DEFAULT,
+          preferred_element_type=torch.float32,
+      )
+      self.assertEqual(out_f32.dtype, torch.float32)
 
 
 if __name__ == "__main__":

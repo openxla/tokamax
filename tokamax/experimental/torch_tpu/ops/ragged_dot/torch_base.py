@@ -15,6 +15,8 @@
 """Ragged Dot PyTorch Op API using reference implementation."""
 
 from collections.abc import Sequence
+import dataclasses
+import enum
 from typing import Any
 import jax
 from jax import numpy as jnp
@@ -25,14 +27,147 @@ from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch
 from typing_extensions import override
 
+DotDimensionNumbers = tuple[
+    tuple[Sequence[int], Sequence[int]],
+    tuple[Sequence[int], Sequence[int]],
+]
+
+
+# This is a direct copy of jax_base.RaggedDotDimensionNumbers but replicated
+# here to avoid users needing to import `jax`.
+@dataclasses.dataclass(frozen=True)
+class RaggedDotDimensionNumbers:
+  """Describes ragged, group, and dot dimensions for ragged dot general.
+
+  Attributes:
+    dot_dimension_numbers: A tuple of tuples of sequences of ints of the form
+      `((lhs_contracting_dims, rhs_contracting_dims), (lhs_batch_dims,
+      rhs_batch_dims))`.
+    lhs_ragged_dimensions: A sequence of ints indicating the `lhs` ragged
+      dimensions.
+    rhs_group_dimensions: A sequence of ints indicating the `rhs` group
+      dimensions.
+  """
+
+  dot_dimension_numbers: DotDimensionNumbers
+  lhs_ragged_dimensions: Sequence[int]
+  rhs_group_dimensions: Sequence[int]
+
+  def __init__(
+      self,
+      dot_dimension_numbers: DotDimensionNumbers,
+      lhs_ragged_dimensions: Sequence[int],
+      rhs_group_dimensions: Sequence[int],
+  ) -> None:
+    object.__setattr__(
+        self,
+        "dot_dimension_numbers",
+        tuple(tuple(map(tuple, t)) for t in dot_dimension_numbers),
+    )
+    object.__setattr__(
+        self, "lhs_ragged_dimensions", tuple(lhs_ragged_dimensions)
+    )
+    object.__setattr__(
+        self, "rhs_group_dimensions", tuple(rhs_group_dimensions)
+    )
+
+
+DEFAULT_RAGGED_DOT_DIM_NUMS = RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(([1], [1]), ([], [])),
+    lhs_ragged_dimensions=[0],
+    rhs_group_dimensions=[0],
+)
+TRANS_RHS_RAGGED_DOT_DIM_NUMS = RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(([1], [2]), ([], [])),
+    lhs_ragged_dimensions=[0],
+    rhs_group_dimensions=[0],
+)
+RAGGED_CONTRACTING_DOT_DIM_NUMS = RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(([0], [0]), ([], [])),
+    lhs_ragged_dimensions=[0],
+    rhs_group_dimensions=[],
+)
+
+_PRECISION_STRINGS: dict[Any, "Precision"] = {}
+
+# This is a copy of jax.lax.Precision but replicated here to avoid users
+# needing to import `jax`.
+class Precision(enum.Enum):
+  """Precision enum for matrix multiply related functions."""
+
+  DEFAULT = 0
+  HIGH = 1
+  HIGHEST = 2
+
+  @classmethod
+  def _missing_(cls, value: object) -> "Precision | None":
+    if isinstance(value, str):
+      return _PRECISION_STRINGS.get(value.lower())
+    return _PRECISION_STRINGS.get(value)
+
+  def __repr__(self) -> str:
+    return f"{self.__class__.__name__}.{self.name}"
+
+  def __str__(self) -> str:
+    return self.name
+
+
+_PRECISION_STRINGS["highest"] = Precision.HIGHEST
+_PRECISION_STRINGS["float32"] = Precision.HIGHEST
+_PRECISION_STRINGS["high"] = Precision.HIGH
+_PRECISION_STRINGS["bfloat16_3x"] = Precision.HIGH
+_PRECISION_STRINGS["tensorfloat32"] = Precision.HIGH
+_PRECISION_STRINGS["default"] = Precision.DEFAULT
+_PRECISION_STRINGS["bfloat16"] = Precision.DEFAULT
+_PRECISION_STRINGS["fastest"] = Precision.DEFAULT
+_PRECISION_STRINGS[None] = Precision.DEFAULT
+
+
+class DotAlgorithmPreset(enum.Enum):
+  """An enum of known algorithms for computing dot products."""
+
+  DEFAULT = enum.auto()
+  ANY_F8_ANY_F8_F32 = enum.auto()
+  ANY_F8_ANY_F8_F32_FAST_ACCUM = enum.auto()
+  ANY_F8_ANY_F8_ANY = enum.auto()
+  ANY_F8_ANY_F8_ANY_FAST_ACCUM = enum.auto()
+  F16_F16_F16 = enum.auto()
+  F16_F16_F32 = enum.auto()
+  BF16_BF16_BF16 = enum.auto()
+  BF16_BF16_F32 = enum.auto()
+  BF16_BF16_F32_X3 = enum.auto()
+  BF16_BF16_F32_X6 = enum.auto()
+  BF16_BF16_F32_X9 = enum.auto()
+  TF32_TF32_F32 = enum.auto()
+  TF32_TF32_F32_X3 = enum.auto()
+  F32_F32_F32 = enum.auto()
+  F64_F64_F64 = enum.auto()
+
+  def __repr__(self) -> str:
+    return f"{self.__class__.__name__}.{self.name}"
+
+  def __str__(self) -> str:
+    return self.name
+
+
+CanonicalPrecision = tuple[Precision, Precision] | DotAlgorithmPreset
+PrecisionLike = (
+    None
+    | str
+    | Precision
+    | tuple[str, str]
+    | tuple[Precision, Precision]
+    | DotAlgorithmPreset
+)
+
 
 def dim_nums_to_tuple(
-    dim_nums: jax.lax.RaggedDotDimensionNumbers | Sequence[int] | None,
+    dim_nums: RaggedDotDimensionNumbers | Sequence[int] | None,
 ) -> tuple[int, ...]:
   """Serializes RaggedDotDimensionNumbers into a flat tuple of ints for jax_op."""
   if dim_nums is None:
-    dim_nums = jax_base.DEFAULT_RAGGED_DOT_DIM_NUMS
-  if not isinstance(dim_nums, jax.lax.RaggedDotDimensionNumbers):
+    dim_nums = DEFAULT_RAGGED_DOT_DIM_NUMS
+  if not isinstance(dim_nums, RaggedDotDimensionNumbers):
     return tuple(dim_nums)
   (lhs_c, rhs_c), (lhs_b, rhs_b) = dim_nums.dot_dimension_numbers
   lhs_r = dim_nums.lhs_ragged_dimensions
@@ -45,12 +180,12 @@ def dim_nums_to_tuple(
 
 
 def tuple_to_dim_nums(
-    dim_nums: jax.lax.RaggedDotDimensionNumbers | Sequence[int] | None,
-) -> jax.lax.RaggedDotDimensionNumbers:
+    dim_nums: RaggedDotDimensionNumbers | Sequence[int] | None,
+) -> RaggedDotDimensionNumbers:
   """Reconstructs RaggedDotDimensionNumbers from its flat int-tuple encoding."""
   if dim_nums is None:
-    return jax_base.DEFAULT_RAGGED_DOT_DIM_NUMS
-  if isinstance(dim_nums, jax.lax.RaggedDotDimensionNumbers):
+    return DEFAULT_RAGGED_DOT_DIM_NUMS
+  if isinstance(dim_nums, RaggedDotDimensionNumbers):
     return dim_nums
   lengths = dim_nums[:6]
   idx = 6
@@ -58,42 +193,117 @@ def tuple_to_dim_nums(
   for length in lengths:
     parts.append(list(dim_nums[idx : idx + length]))
     idx += length
-  return jax.lax.RaggedDotDimensionNumbers(
+  return RaggedDotDimensionNumbers(
       dot_dimension_numbers=((parts[0], parts[1]), (parts[2], parts[3])),
       lhs_ragged_dimensions=parts[4],
       rhs_group_dimensions=parts[5],
   )
 
 
+def dim_nums_to_jax(
+    dim_nums: RaggedDotDimensionNumbers | Sequence[int] | None,
+) -> jax.lax.RaggedDotDimensionNumbers:
+  """Converts PyTorch RaggedDotDimensionNumbers to jax.lax.RaggedDotDimensionNumbers."""
+  torch_dim_nums = tuple_to_dim_nums(dim_nums)
+  return jax.lax.RaggedDotDimensionNumbers(
+      dot_dimension_numbers=torch_dim_nums.dot_dimension_numbers,
+      lhs_ragged_dimensions=torch_dim_nums.lhs_ragged_dimensions,
+      rhs_group_dimensions=torch_dim_nums.rhs_group_dimensions,
+  )
+
+
+def jax_to_dim_nums(
+    dim_nums: jax.lax.RaggedDotDimensionNumbers | None,
+) -> RaggedDotDimensionNumbers:
+  """Converts jax.lax.RaggedDotDimensionNumbers to PyTorch RaggedDotDimensionNumbers."""
+  if dim_nums is None:
+    return DEFAULT_RAGGED_DOT_DIM_NUMS
+  return RaggedDotDimensionNumbers(
+      dot_dimension_numbers=dim_nums.dot_dimension_numbers,
+      lhs_ragged_dimensions=dim_nums.lhs_ragged_dimensions,
+      rhs_group_dimensions=dim_nums.rhs_group_dimensions,
+  )
+
+
+def canonicalize_precision(precision: PrecisionLike) -> CanonicalPrecision:
+  """Canonicalizes a PyTorch `PrecisionLike`."""
+  if precision is None:
+    return (Precision.DEFAULT, Precision.DEFAULT)
+  if isinstance(precision, str):
+    if "," in precision:
+      p0, p1 = precision.split(",", 1)
+      return (Precision(p0), Precision(p1))
+    if precision in DotAlgorithmPreset.__members__:
+      return DotAlgorithmPreset[precision]
+    try:
+      return (Precision(precision),) * 2
+    except ValueError:
+      raise ValueError(  # pylint: disable=raise-missing-from
+          f"Unsupported enum value: {precision}. Must refer to either"
+          " a `DotAlgorithmPreset` or a `Precision` enum."
+      )
+  if isinstance(precision, Precision):
+    return (precision, precision)
+  if isinstance(precision, DotAlgorithmPreset):
+    return precision
+  if isinstance(precision, (list, tuple)) and len(precision) == 2:
+    p0, p1 = precision
+    if isinstance(p0, Precision) and isinstance(p1, Precision):
+      return (p0, p1)
+    if isinstance(p0, str) and isinstance(p1, str):
+      return (Precision(p0), Precision(p1))
+  raise ValueError(f"Invalid precision: {precision}")
+
+
 def precision_to_str(
-    precision: jax.lax.PrecisionLike,
+    precision: PrecisionLike,
 ) -> str | None:
   """Serializes PrecisionLike into a string for jax_op."""
   if precision is None:
     return None
-  if isinstance(precision, str) and "," in precision:
-    return precision
+  canon = canonicalize_precision(precision)
+  if isinstance(canon, DotAlgorithmPreset):
+    return canon.name
+  return f"{canon[0].name.lower()},{canon[1].name.lower()}"
+
+
+def str_to_precision(
+    precision: PrecisionLike,
+) -> CanonicalPrecision:
+  """Reconstructs PyTorch CanonicalPrecision from its string representation."""
+  return canonicalize_precision(precision)
+
+
+def precision_to_jax(
+    precision: PrecisionLike,
+) -> jax_base.CanonicalPrecision:
+  """Converts a PyTorch PrecisionLike to a JAX CanonicalPrecision."""
+  if precision is None:
+    return precision_lib.canonicalize_precision(None)
+  canon = str_to_precision(precision)
+  if isinstance(canon, DotAlgorithmPreset):
+    return jax.lax.DotAlgorithmPreset[canon.name]
+  return (
+      jax.lax.Precision[canon[0].name],
+      jax.lax.Precision[canon[1].name],
+  )
+
+
+def jax_to_precision(
+    precision: jax.lax.PrecisionLike,
+) -> CanonicalPrecision:
+  """Converts a jax.lax.PrecisionLike to a PyTorch CanonicalPrecision."""
   canon = precision_lib.canonicalize_precision(precision)
   if isinstance(canon, jax.lax.DotAlgorithmPreset):
-    return canon.name
+    return DotAlgorithmPreset[canon.name]
   if (
       isinstance(canon, tuple)
       and len(canon) == 2
       and isinstance(canon[0], jax.lax.Precision)
       and isinstance(canon[1], jax.lax.Precision)
   ):
-    return f"{canon[0].name.lower()},{canon[1].name.lower()}"
-  raise NotImplementedError(f"Unsupported precision: {precision}")
-
-
-def str_to_precision(
-    precision: jax.lax.PrecisionLike,
-) -> jax_base.CanonicalPrecision:
-  """Reconstructs CanonicalPrecision from its string representation."""
-  if isinstance(precision, str) and "," in precision:
-    p0, p1 = precision.split(",", 1)
-    return precision_lib.canonicalize_precision((p0, p1))
-  return precision_lib.canonicalize_precision(precision)
+    return (Precision[canon[0].name], Precision[canon[1].name])
+  raise NotImplementedError(f"Unsupported JAX precision: {precision}")
 
 
 # Why `_normalize_bound_args_inputs` is needed:
@@ -156,13 +366,13 @@ def _normalize_bound_args_inputs(
   ):
     normalized_kwargs.pop(ignored, None)
 
-  ragged_dot_dimension_numbers = tuple_to_dim_nums(
+  ragged_dot_dimension_numbers = dim_nums_to_jax(
       normalized_kwargs.get("ragged_dot_dimension_numbers")
   )
   normalized_kwargs["ragged_dot_dimension_numbers"] = (
       ragged_dot_dimension_numbers
   )
-  normalized_kwargs["precision"] = str_to_precision(
+  normalized_kwargs["precision"] = precision_to_jax(
       normalized_kwargs.get("precision")
   )
   normalized_kwargs["preferred_element_type"] = torch_utils.str_to_jax_dtype(
@@ -222,20 +432,13 @@ class _RaggedDot[Config](torch_op.TorchOp[Config]):
       rhs: torch.Tensor,
       group_sizes: torch.Tensor,
       ragged_dot_dimension_numbers: (
-          jax.lax.RaggedDotDimensionNumbers | Sequence[int] | None
+          RaggedDotDimensionNumbers | Sequence[int] | None
       ) = None,
-      precision: jax.lax.PrecisionLike = None,
-      preferred_element_type: (
-          torch.dtype | jax.typing.DTypeLike | str | None
-      ) = None,
+      precision: PrecisionLike = None,
+      preferred_element_type: torch.dtype | str | None = None,
       return_residuals: bool = False,
-      activation: jax_base.ActivationFunction | None = None,
       configs: tuple[Config | None, Config | None] | None = None,
   ) -> Any:
-    if activation is not None:
-      raise NotImplementedError(
-          "activations are not supported on Torch TPU Tokamax"
-      )
     dim_nums = tuple_to_dim_nums(ragged_dot_dimension_numbers)
     dim_nums_tuple = dim_nums_to_tuple(dim_nums)
     precision_str = precision_to_str(precision)
@@ -249,7 +452,7 @@ class _RaggedDot[Config](torch_op.TorchOp[Config]):
         " in the constructor."
     )
     assert self.backward_op_torch is not None, "Backward op not set."
-    is_fwd = dim_nums == jax_base.DEFAULT_RAGGED_DOT_DIM_NUMS
+    is_fwd = dim_nums == DEFAULT_RAGGED_DOT_DIM_NUMS
     out, residuals = self._torch_tokamax_op(
         lhs,
         rhs,
@@ -278,8 +481,8 @@ class _RaggedDot[Config](torch_op.TorchOp[Config]):
   ) -> tuple[jax.Array, jax.Array]:
     del config, bwd_config
     assert self.op_impl_jax is not None, "Forward class not set."
-    dim_nums = tuple_to_dim_nums(ragged_dot_dimension_numbers)
-    canon_precision = str_to_precision(precision)
+    dim_nums = dim_nums_to_jax(ragged_dot_dimension_numbers)
+    canon_precision = precision_to_jax(precision)
     preferred_element_type_dtype = torch_utils.str_to_jax_dtype(
         preferred_element_type
     )
@@ -337,8 +540,8 @@ class _RaggedDot[Config](torch_op.TorchOp[Config]):
     assert self.backward_op_torch is not None, "Backward op not set."
     lhs, rhs, group_sizes, _, _ = ctx.saved_tensors
 
-    dlhs_dim_nums = jax_base.TRANS_RHS_RAGGED_DOT_DIM_NUMS
-    drhs_dim_nums = jax_base.RAGGED_CONTRACTING_DOT_DIM_NUMS
+    dlhs_dim_nums = TRANS_RHS_RAGGED_DOT_DIM_NUMS
+    drhs_dim_nums = RAGGED_CONTRACTING_DOT_DIM_NUMS
 
     # Execute dlhs and drhs using the ragged_dot op itself (since
     # self.backward_op_torch is self), retrieving the config for each backward

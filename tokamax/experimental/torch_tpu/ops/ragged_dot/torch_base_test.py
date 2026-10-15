@@ -170,20 +170,94 @@ class RaggedDotBaseTest(parameterized.TestCase):
     self.assertIsNotNone(out)
     self.assertIsNotNone(residuals)
 
-  def test_activation_raises_error(self):
-    lhs_torch, rhs_torch, group_sizes_torch, _ = self._generate_random_data(
-        m=256, k=128, n=256, num_groups=4, dtype=torch.float32
-    )
-    with self.assertRaisesRegex(
-        NotImplementedError,
-        "activations are not supported on Torch TPU Tokamax",
+  def test_dim_nums_conversions(self):
+    for torch_dim_nums, jax_dim_nums in (
+        (
+            torch_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+            jax_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+        ),
+        (
+            torch_base.TRANS_RHS_RAGGED_DOT_DIM_NUMS,
+            jax_base.TRANS_RHS_RAGGED_DOT_DIM_NUMS,
+        ),
+        (
+            torch_base.RAGGED_CONTRACTING_DOT_DIM_NUMS,
+            jax_base.RAGGED_CONTRACTING_DOT_DIM_NUMS,
+        ),
     ):
-      torch_base.RaggedDot(
-          lhs_torch,
-          rhs_torch,
-          group_sizes_torch,
-          activation=jax.nn.relu,
-      )
+      encoded = torch_base.dim_nums_to_tuple(torch_dim_nums)
+      self.assertEqual(torch_base.tuple_to_dim_nums(encoded), torch_dim_nums)
+      self.assertEqual(torch_base.dim_nums_to_jax(torch_dim_nums), jax_dim_nums)
+      self.assertEqual(torch_base.dim_nums_to_jax(encoded), jax_dim_nums)
+      self.assertEqual(torch_base.jax_to_dim_nums(jax_dim_nums), torch_dim_nums)
+
+    self.assertEqual(
+        torch_base.tuple_to_dim_nums(None),
+        torch_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+    )
+    self.assertEqual(
+        torch_base.dim_nums_to_jax(None),
+        jax_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+    )
+    self.assertEqual(
+        torch_base.jax_to_dim_nums(None),
+        torch_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+    )
+
+  def test_precision_conversions(self):
+    for torch_prec, jax_prec in (
+        (None, None),
+        (torch_base.Precision.DEFAULT, jax.lax.Precision.DEFAULT),
+        (torch_base.Precision.HIGH, jax.lax.Precision.HIGH),
+        (torch_base.Precision.HIGHEST, jax.lax.Precision.HIGHEST),
+        ("high", "high"),
+        ("bfloat16_3x", "bfloat16_3x"),
+        (
+            (torch_base.Precision.HIGH, torch_base.Precision.HIGHEST),
+            (jax.lax.Precision.HIGH, jax.lax.Precision.HIGHEST),
+        ),
+        (("default", "high"), ("default", "high")),
+        (
+            torch_base.DotAlgorithmPreset.BF16_BF16_F32,
+            jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+        ),
+        ("BF16_BF16_F32", "BF16_BF16_F32"),
+    ):
+      jax_canon = torch_base.precision_to_jax(torch_prec)
+      torch_canon = torch_base.jax_to_precision(jax_prec)
+      self.assertEqual(torch_base.precision_to_jax(torch_canon), jax_canon)
+      self.assertEqual(torch_base.jax_to_precision(jax_canon), torch_canon)
+      prec_str = torch_base.precision_to_str(torch_prec)
+      self.assertEqual(torch_base.str_to_precision(prec_str), torch_canon)
+
+  def test_call_with_explicit_pytorch_types(self):
+    lhs, rhs, group_sizes, dout = self._generate_random_data(
+        m=256, k=128, n=256, num_groups=4, dtype=torch.bfloat16
+    )
+    dout = dout.to(torch.float32)
+    configs = torch_utils.get_configs(
+        torch_base.RaggedDot,
+        lhs,
+        rhs,
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=torch_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+        precision=torch_base.Precision.HIGH,
+        preferred_element_type=torch.float32,
+        from_autotuning_cache=False,
+    )
+    out = torch_base.RaggedDot(
+        lhs,
+        rhs,
+        group_sizes,
+        ragged_dot_dimension_numbers=torch_base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+        precision=torch_base.Precision.HIGH,
+        preferred_element_type=torch.float32,
+        configs=configs,
+    )
+    self.assertEqual(out.dtype, torch.float32)
+    out.backward(dout)
+    self.assertIsNotNone(lhs.grad)
+    self.assertIsNotNone(rhs.grad)
 
 
 if __name__ == "__main__":
