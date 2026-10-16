@@ -839,7 +839,9 @@ def fold_q_sequence_heads(
   bias, dropout_mask = map(fold, (bias, dropout_mask))
 
   if mask is not None:
-    mask, k_start, k_end, is_causal = mask.take("k_start", "k_end", "is_causal")
+    mask, k_start, k_end, causal_mask = mask.take(
+        "k_start", "k_end", "causal_mask"
+    )
     q_start = q_end = None
     # `q_{start,end}` don't have a q-sequence dimensions, so we cannot fold.
     # If `q_{start,end}` is not broadcast along the heads dimension, we leave
@@ -853,11 +855,11 @@ def fold_q_sequence_heads(
     mask = fold(mask.as_array(q_indices, seq_len_k))
     mask = Mask(
         mask,
+        causal_mask=causal_mask,
         q_start=q_start,
         q_end=q_end,
         k_start=fold(k_start, False),
         k_end=fold(k_end, False),
-        is_causal=is_causal,
     )
 
   q_indices_shape = (*q_indices.shape[:-2], num_heads_q, seq_len_q)

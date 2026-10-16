@@ -87,15 +87,25 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
   k_end = None
 
   if k_indices is None:
-    mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
+    is_causal = mask.is_causal
+    mask, causal_mask, k_start, k_end = mask.take(
+        "causal_mask", "k_start", "k_end"
+    )
 
-    # Fold `is_causal` into `k_end`. If `q_indices` is not `None`, then this is
-    # necessary for correctness. Otherwise, it is a performance optimization.
-    if is_causal and (q_indices is not None or k_end is not None):
+    # Fold `causal_mask` into `k_end`. If `q_indices` is not `None`, then this
+    # is necessary for correctness. Otherwise, it is a performance optimization.
+    if causal_mask is not None and (
+        not is_causal or q_indices is not None or k_end is not None
+    ):
       if q_indices is None:
         q_indices = jnp.arange(q.shape[-3])
-      k_end_ = q_indices + 1
+      k_end_ = q_indices + (causal_mask.offset + 1)
       k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
+      if causal_mask.window_size is not None:
+        k_start_ = k_end_ - causal_mask.window_size
+        k_start = (
+            k_start_ if k_start is None else jnp.maximum(k_start, k_start_)
+        )
       is_causal = False
 
     if k_start is not None:
