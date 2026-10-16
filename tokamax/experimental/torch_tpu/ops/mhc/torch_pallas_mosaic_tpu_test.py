@@ -797,14 +797,19 @@ class PallasMosaicTpuMhcTest(parameterized.TestCase):
     ):
       with self.subTest(op_name=op_pallas.jax_op_name):
         cfg = Config(token_block_size=32)
-        reconstructed = op_pallas.reconstruct_config(32)
+        deconstructed = op_pallas.deconstruct_config(cfg)
+        self.assertEqual(deconstructed, 32)
+        reconstructed = op_pallas.reconstruct_config(deconstructed)
         self.assertEqual(reconstructed, cfg)
 
         default_cfg = Config()
         self.assertEqual(
-            op_pallas.reconstruct_config(default_cfg.token_block_size),
+            op_pallas.reconstruct_config(
+                op_pallas.deconstruct_config(default_cfg)
+            ),
             default_cfg,
         )
+        self.assertIsNone(op_pallas.deconstruct_config(None))
         with self.assertRaises(AssertionError):
           op_pallas.reconstruct_config(None)
 

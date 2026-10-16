@@ -83,12 +83,8 @@ class _PallasMosaicTpuSplashAttention(
         block_q=int(config[0]),
         block_kv=int(config[1]),
         block_kv_compute=int(config[2]),
-        dropout_block_q=(
-            None if config[3] is None or config[3] < 0 else int(config[3])
-        ),
-        dropout_block_kv=(
-            None if config[4] is None or config[4] < 0 else int(config[4])
-        ),
+        dropout_block_q=None if config[3] < 0 else int(config[3]),
+        dropout_block_kv=None if config[4] < 0 else int(config[4]),
         q_layout=QKVLayout(int(config[5])),
         k_layout=QKVLayout(int(config[6])),
         v_layout=QKVLayout(int(config[7])),
@@ -98,18 +94,6 @@ class _PallasMosaicTpuSplashAttention(
         qk_diag_grid=int(config[11]),
         sv_diag_skip=bool(config[12]),
     )
-
-  @override
-  def op_impl_call_config_setup(
-      self, *args: Any, config: Any = None, **kwargs: Any
-  ) -> tuple[int, ...] | None:
-    if config is None:
-      config = self.deconstruct_config(
-          self.get_bound_args(*args, **kwargs).get_config(
-              check_autotuning_cache=False,
-          )
-      )
-    return config
 
   @override
   def __call__(

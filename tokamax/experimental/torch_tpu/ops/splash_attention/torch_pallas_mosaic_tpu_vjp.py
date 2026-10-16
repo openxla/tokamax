@@ -69,16 +69,10 @@ class _PallasMosaicTpuSplashAttentionVjp(
         block_q_dkv=int(config[0]),
         block_kv_dkv=int(config[1]),
         block_kv_dkv_compute=int(config[2]),
-        dropout_block_q=(
-            None if config[3] is None or config[3] < 0 else int(config[3])
-        ),
-        dropout_block_kv=(
-            None if config[4] is None or config[4] < 0 else int(config[4])
-        ),
+        dropout_block_q=None if config[3] < 0 else int(config[3]),
+        dropout_block_kv=None if config[4] < 0 else int(config[4]),
         use_base2_exp=bool(config[5]),
-        dq_reduction_steps=(
-            None if config[6] is None or config[6] < 0 else int(config[6])
-        ),
+        dq_reduction_steps=None if config[6] < 0 else int(config[6]),
     )
 
   @override
@@ -89,18 +83,6 @@ class _PallasMosaicTpuSplashAttentionVjp(
         args, kwargs, is_vjp=True
     )
     return torch_op.TorchOp.get_bound_args(self, *pos_args, **updated_kwargs)
-
-  @override
-  def op_impl_call_config_setup(
-      self, *args: Any, config: Any = None, **kwargs: Any
-  ) -> tuple[int, ...] | None:
-    if config is None:
-      config = self.deconstruct_config(
-          self.get_bound_args(*args, **kwargs).get_config(
-              check_autotuning_cache=False,
-          )
-      )
-    return config
 
   @override
   def __call__(

@@ -26,6 +26,24 @@ import torch
 Config = jax_pallas_mosaic_tpu.Config
 
 
+def _deconstruct_config(config: Config | int | None) -> int | None:
+  if config is None:
+    return None
+  if isinstance(config, Config):
+    assert len(dataclasses.fields(config)) == 1, (
+        f"Expected 1 field in Config, got {len(dataclasses.fields(config))}."
+    )
+    return int(config.token_block_size)
+  return int(config)
+
+
+def _reconstruct_config(*config_parts: Any) -> Config:
+  assert config_parts and config_parts[0] is not None, (
+      "Forward config not set."
+  )
+  return Config(token_block_size=int(config_parts[0]))
+
+
 class _PallasMosaicTpuMhcPre(
     torch_base._MhcPre[Config]  # pylint: disable=protected-access
 ):
@@ -39,25 +57,14 @@ class _PallasMosaicTpuMhcPre(
     self.fake_impl = self._fake_impl
 
   @override
-  def reconstruct_config(self, *config_parts: Any) -> Config:
-    assert config_parts and config_parts[0] is not None, (
-        "Forward config not set."
-    )
-    return Config(token_block_size=int(config_parts[0]))
+  def deconstruct_config(  # pyrefly: ignore[bad-override]
+      self, config: Config | int | None
+  ) -> int | None:
+    return _deconstruct_config(config)
 
   @override
-  def op_impl_call_config_setup(
-      self, *args: Any, config: Any = None, **kwargs: Any
-  ) -> int:
-    if config is None:
-      cfg = self.get_bound_args(*args, **kwargs).get_config(
-          check_autotuning_cache=False,
-      )
-      assert len(dataclasses.fields(cfg)) == 1, (
-          f"Expected 1 field in Config, got {len(dataclasses.fields(cfg))}."
-      )
-      config = int(cfg.token_block_size)
-    return config
+  def reconstruct_config(self, *config_parts: Any) -> Config:
+    return _reconstruct_config(*config_parts)
 
   @override
   def _fake_impl(
@@ -101,7 +108,7 @@ class _PallasMosaicTpuMhcPre(
       hc_post_mult_value: float,
       sinkhorn_repeat: int,
       return_residuals: bool = False,
-      configs: tuple[int | None, Any] | None = None,
+      configs: tuple[Config | int | None, Any] | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     fwd_config, _ = (None, None) if configs is None else configs
     assert self._torch_tokamax_op is not None, (
@@ -119,7 +126,7 @@ class _PallasMosaicTpuMhcPre(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
         return_residuals=return_residuals,
-        config=fwd_config,
+        config=self.deconstruct_config(fwd_config),
     )
 
   @override
@@ -172,25 +179,14 @@ class _PallasMosaicTpuMhcPost(
     self.fake_impl = self._fake_impl
 
   @override
-  def reconstruct_config(self, *config_parts: Any) -> Config:
-    assert config_parts and config_parts[0] is not None, (
-        "Forward config not set."
-    )
-    return Config(token_block_size=int(config_parts[0]))
+  def deconstruct_config(  # pyrefly: ignore[bad-override]
+      self, config: Config | int | None
+  ) -> int | None:
+    return _deconstruct_config(config)
 
   @override
-  def op_impl_call_config_setup(
-      self, *args: Any, config: Any = None, **kwargs: Any
-  ) -> int:
-    if config is None:
-      cfg = self.get_bound_args(*args, **kwargs).get_config(
-          check_autotuning_cache=False,
-      )
-      assert len(dataclasses.fields(cfg)) == 1, (
-          f"Expected 1 field in Config, got {len(dataclasses.fields(cfg))}."
-      )
-      config = int(cfg.token_block_size)
-    return config
+  def reconstruct_config(self, *config_parts: Any) -> Config:
+    return _reconstruct_config(*config_parts)
 
   @override
   def _fake_impl(
@@ -219,7 +215,7 @@ class _PallasMosaicTpuMhcPost(
       post_layer_mix: torch.Tensor,
       comb_res_mix: torch.Tensor,
       return_residuals: bool = False,
-      configs: tuple[int | None, Any] | None = None,
+      configs: tuple[Config | int | None, Any] | None = None,
   ) -> torch.Tensor:
     fwd_config, _ = (None, None) if configs is None else configs
     assert self._torch_tokamax_op is not None, (
@@ -232,7 +228,7 @@ class _PallasMosaicTpuMhcPost(
         post_layer_mix,
         comb_res_mix,
         return_residuals=return_residuals,
-        config=fwd_config,
+        config=self.deconstruct_config(fwd_config),
     )
 
   @override
@@ -275,25 +271,14 @@ class _PallasMosaicTpuMhcFusedPostPre(
     self.fake_impl = self._fake_impl
 
   @override
-  def reconstruct_config(self, *config_parts: Any) -> Config:
-    assert config_parts and config_parts[0] is not None, (
-        "Forward config not set."
-    )
-    return Config(token_block_size=int(config_parts[0]))
+  def deconstruct_config(  # pyrefly: ignore[bad-override]
+      self, config: Config | int | None
+  ) -> int | None:
+    return _deconstruct_config(config)
 
   @override
-  def op_impl_call_config_setup(
-      self, *args: Any, config: Any = None, **kwargs: Any
-  ) -> int:
-    if config is None:
-      cfg = self.get_bound_args(*args, **kwargs).get_config(
-          check_autotuning_cache=False,
-      )
-      assert len(dataclasses.fields(cfg)) == 1, (
-          f"Expected 1 field in Config, got {len(dataclasses.fields(cfg))}."
-      )
-      config = int(cfg.token_block_size)
-    return config
+  def reconstruct_config(self, *config_parts: Any) -> Config:
+    return _reconstruct_config(*config_parts)
 
   @override
   def _fake_impl(
@@ -346,7 +331,7 @@ class _PallasMosaicTpuMhcFusedPostPre(
       hc_post_mult_value: float,
       sinkhorn_repeat: int,
       return_residuals: bool = False,
-      configs: tuple[int | None, Any] | None = None,
+      configs: tuple[Config | int | None, Any] | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     fwd_config, _ = (None, None) if configs is None else configs
     assert self._torch_tokamax_op is not None, (
@@ -367,7 +352,7 @@ class _PallasMosaicTpuMhcFusedPostPre(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
         return_residuals=return_residuals,
-        config=fwd_config,
+        config=self.deconstruct_config(fwd_config),
     )
 
   @override

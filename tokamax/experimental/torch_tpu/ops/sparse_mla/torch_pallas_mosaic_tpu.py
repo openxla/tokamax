@@ -69,20 +69,6 @@ class _PallasMosaicTpuSparseMla(
         vmem_limit_bytes=int(flat[2]),
     )
 
-  # Overridden so default config resolution routes through
-  # `self.deconstruct_config` instead of the base class's `dataclasses.astuple`.
-  @override
-  def op_impl_call_config_setup(
-      self, *args: Any, config: Any = None, **kwargs: Any
-  ) -> tuple[int, int, int] | None:
-    if config is None:
-      config = self.deconstruct_config(
-          self.get_bound_args(*args, **kwargs).get_config(
-              check_autotuning_cache=False,
-          )
-      )
-    return config
-
   @override
   def __call__(
       self,

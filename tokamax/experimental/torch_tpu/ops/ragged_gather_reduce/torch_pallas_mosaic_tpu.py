@@ -56,26 +56,12 @@ class _PallasMosaicTpuRaggedGatherReduce(
     """Rebuilds the 1-int tuple back into a Config."""
     config = config_parts[0]
     assert config is not None, "Forward config not set."
-    num_column_partitions = config[0] if config else None
+    (num_column_partitions,) = config
     return Config(
         num_column_partitions=(
-            None
-            if num_column_partitions is None or num_column_partitions < 0
-            else int(num_column_partitions)
+            None if num_column_partitions < 0 else int(num_column_partitions)
         )
     )
-
-  @override
-  def op_impl_call_config_setup(
-      self, *args: Any, config: Any = None, **kwargs: Any
-  ) -> tuple[int, ...] | None:
-    if config is None:
-      config = self.deconstruct_config(
-          self.get_bound_args(*args, **kwargs).get_config(
-              check_autotuning_cache=False,
-          )
-      )
-    return config
 
   @override
   def op_impl_call(

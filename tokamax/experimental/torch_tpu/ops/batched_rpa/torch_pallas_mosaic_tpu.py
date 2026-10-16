@@ -27,6 +27,7 @@ from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_base
 import torch
 
 Config = jax_pallas_mosaic_tpu.Config
+_KV_LAYOUTS = tuple(jax_types.KVLayout.__members__)
 
 # Index of `kv_cache` in `op_impl_call`'s positional arguments. The kernel
 # writes the new keys and values into the cache and returns it, so the input
@@ -49,27 +50,31 @@ class _PallasMosaicTpuBatchedRpa(
     self.fake_impl = self._fake_impl
 
   @override
-  def deconstruct_config(
-      self, config: Config | tuple[Any, ...] | list[Any] | None
-  ) -> tuple[tuple[int, ...] | None, str | None]:
-    """Breaks Config into a 6-int tuple and kv_layout str for jax_op."""
+  def deconstruct_config(  # pyrefly: ignore[bad-override]
+      self, config: Config | None
+  ) -> tuple[int, ...] | None:
+    """Deconstructs a Config object into a 7-int tuple for jax_op."""
     if config is None:
-      return None, None
-    config_tuple = (
-        tuple(config)
-        if isinstance(config, (tuple, list))
-        else dataclasses.astuple(config)
+      return None
+    assert len(dataclasses.fields(config)) == 7, (
+        f"Expected 7 fields in Config, got {len(dataclasses.fields(config))}."
     )
-    return config_tuple[:6], config_tuple[6]
+    return (
+        config.prefill_bq_sz,
+        config.prefill_bq_c_sz,
+        config.bkv_sz,
+        config.n_buffer,
+        config.decode_batch_size,
+        config.prefill_batch_size,
+        _KV_LAYOUTS.index(config.kv_layout.upper()),
+    )
 
   @override
   def reconstruct_config(self, *config_parts: Any) -> Config:
-    """Rebuilds the 6-int tuple and kv_layout str back into a Config."""
+    """Rebuilds the deconstructed 7-int tuple back into a Config."""
     config = config_parts[0]
-    config_kv_layout = config_parts[1] if len(config_parts) > 1 else None
-    if config_kv_layout is not None:
-      return Config(*config, kv_layout=config_kv_layout)
-    return Config(*config)
+    assert config is not None, "Forward config not set."
+    return Config(*config[:6], kv_layout=_KV_LAYOUTS[config[6]])
 
   @override
   def op_impl_call(
@@ -106,13 +111,12 @@ class _PallasMosaicTpuBatchedRpa(
       return_lse: bool = False,
       return_residuals: bool = False,
       config: tuple[int, ...] | None = None,
-      config_kv_layout: str | None = None,
   ) -> tuple[jax.Array, jax.Array]:
     assert (
         self.op_impl_jax is not None
     ), "Forward class not set. self.op_impl_jax was not set in the constructor."
     assert config is not None, "Forward config not set."
-    kernel_config = self.reconstruct_config(config, config_kv_layout)
+    kernel_config = self.reconstruct_config(config)
     (out, kv_cache), _ = self.op_impl_jax._fwd(
         queries,
         keys,
@@ -179,7 +183,6 @@ class _PallasMosaicTpuBatchedRpa(
       return_lse: bool = False,
       return_residuals: bool = False,
       config: tuple[int, ...] | None = None,
-      config_kv_layout: str | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
     """Meta shapes for the registered op.
 
@@ -240,8 +243,6 @@ class _PallasMosaicTpuBatchedRpa(
         " constructor."
     )
 
-    config_ints, config_kv_layout = self.deconstruct_config(config)
-
     return self._torch_tokamax_op(
         queries,
         keys,
@@ -275,8 +276,7 @@ class _PallasMosaicTpuBatchedRpa(
         attention_scope=attention_scope,
         return_lse=return_lse,
         return_residuals=return_residuals,
-        config=config_ints,
-        config_kv_layout=config_kv_layout,
+        config=self.deconstruct_config(config),
     )
 
 

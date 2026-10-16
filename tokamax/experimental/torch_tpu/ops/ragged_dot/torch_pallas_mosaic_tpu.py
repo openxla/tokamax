@@ -61,7 +61,7 @@ class _PallasMosaicTpuRaggedDot(
     config = config_parts[0]
     assert config is not None, "Config not set."
     tile_m, tile_k, tile_n, bucket_base = (
-        None if x is None or x <= 0 else x for x in config
+        None if x <= 0 else x for x in config
     )
     return Config(
         tile_m=tile_m,

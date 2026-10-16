@@ -64,9 +64,10 @@ class _PallasMosaicTpuCausalConv1dGatedDeltaRule(
         if isinstance(config, (tuple, list))
         else dataclasses.astuple(config)
     )
-    if decode_tile_size is None or mixed_tile_size is None:
-      return None
-    return decode_tile_size, mixed_tile_size
+    return (
+        -1 if decode_tile_size is None else int(decode_tile_size),
+        -1 if mixed_tile_size is None else int(mixed_tile_size),
+    )
 
   @override
   def reconstruct_config(self, *config_parts: Any) -> Config:
@@ -75,8 +76,16 @@ class _PallasMosaicTpuCausalConv1dGatedDeltaRule(
     assert config is not None, "Config not set."
     decode_tile_size, mixed_tile_size = config
     return Config(
-        decode_tile_size=decode_tile_size,
-        mixed_tile_size=mixed_tile_size,
+        decode_tile_size=(
+            None
+            if decode_tile_size is None or decode_tile_size <= 0
+            else int(decode_tile_size)
+        ),
+        mixed_tile_size=(
+            None
+            if mixed_tile_size is None or mixed_tile_size <= 0
+            else int(mixed_tile_size)
+        ),
     )
 
   @override

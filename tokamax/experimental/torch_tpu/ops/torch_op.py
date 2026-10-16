@@ -484,7 +484,7 @@ class TorchOp(Generic[_Config]):
   ) -> Any:
     """Sets up the config for the JAX Tokamax op."""
     if config is None:
-      config = dataclasses.astuple(
+      config = self.deconstruct_config(
           self.get_bound_args(*args, **kwargs).get_config(
               check_autotuning_cache=False,
           )

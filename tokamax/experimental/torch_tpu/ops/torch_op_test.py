@@ -890,6 +890,35 @@ class TorchOpTest(parameterized.TestCase):
     self.assertEqual(deconstructed, (7,))
     self.assertEqual(op.reconstruct_config(deconstructed), _FakeOpConfig(7))
 
+  def test_op_impl_call_config_setup_calls_deconstruct_config(self):
+    deconstruct_calls = 0
+
+    class _CustomDeconstructOp(_FakeTorchOp):
+
+      def deconstruct_config(
+          self, config: _FakeOpConfig | tuple[Any, ...] | list[Any] | None
+      ) -> tuple[int, ...] | None:
+        nonlocal deconstruct_calls
+        deconstruct_calls += 1
+        if config is None:
+          return None
+        assert isinstance(config, _FakeOpConfig)
+        return (config.blah + 10,)
+
+      def reconstruct_config(self, *config_parts: Any) -> _FakeOpConfig:
+        config = config_parts[0]
+        assert config is not None
+        return _FakeOpConfig(config[0] - 10)
+
+    op = _CustomDeconstructOp()
+    x_jax = jnp.ones((2, 4), dtype=jnp.float32)
+    y_jax = 2.0 * jnp.ones((2, 4), dtype=jnp.float32)
+
+    resolved = op.op_impl_call_config_setup(x_jax, y_jax)
+    self.assertEqual(deconstruct_calls, 1)
+    self.assertEqual(resolved, (_HEURISTICS_CONFIG.blah + 10,))
+    self.assertEqual(op.reconstruct_config(resolved), _HEURISTICS_CONFIG)
+
   def test_torch_utils_get_configs(self):
     op = _FakeTorchOp()
     x = torch.zeros((2, 4), dtype=torch.float32)

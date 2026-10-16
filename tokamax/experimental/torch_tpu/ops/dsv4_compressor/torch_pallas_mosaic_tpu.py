@@ -62,20 +62,6 @@ class _PallasMosaicTpuDsv4Compressor(
     assert len(flat) == 1, f"Invalid config: {flat!r}"
     return Config(tile_n=int(flat[0]))
 
-  # Overridden so default config resolution routes through
-  # `self.deconstruct_config` instead of the base class's `dataclasses.astuple`.
-  @override
-  def op_impl_call_config_setup(
-      self, *args: Any, config: Any = None, **kwargs: Any
-  ) -> tuple[int, ...] | None:
-    if config is None:
-      config = self.deconstruct_config(
-          self.get_bound_args(*args, **kwargs).get_config(
-              check_autotuning_cache=False,
-          )
-      )
-    return config
-
   @override
   def __call__(
       self,

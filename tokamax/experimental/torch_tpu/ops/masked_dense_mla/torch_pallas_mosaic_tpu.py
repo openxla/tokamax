@@ -52,21 +52,11 @@ class _PallasMosaicTpuMaskedDenseMla(
 
   @override
   def deconstruct_config(  # pyrefly: ignore[bad-override]
-      self, config: Config | tuple[Any, ...] | list[Any] | None
+      self, config: Config | None
   ) -> tuple[int, ...] | None:
     """Deconstructs a Config object into a flat 7-int tuple for jax_op."""
     if config is None:
       return None
-    if isinstance(config, (tuple, list)):
-      if len(config) == 7:
-        return tuple(int(x) for x in config)
-      if len(config) == 3:
-        return (
-            *_to_triple(config[0]),
-            *_to_triple(config[1]),
-            int(config[2]),
-        )
-      raise ValueError(f"Invalid config tuple length: {len(config)}.")
     assert (
         len(dataclasses.fields(config)) == 3
     ), f"Expected 3 fields in Config, got {len(dataclasses.fields(config))}."
@@ -83,30 +73,12 @@ class _PallasMosaicTpuMaskedDenseMla(
     flat = config_parts[0]
     if isinstance(flat, Config):
       return flat
-    if len(flat) == 3:
-      return Config(
-          num_kv_pages_per_block=_to_triple(flat[0]),
-          num_queries_per_block=_to_triple(flat[1]),
-          vmem_limit_bytes=int(flat[2]),
-      )
     assert len(flat) == 7, f"Invalid config: {flat!r}"
     return Config(
         num_kv_pages_per_block=(int(flat[0]), int(flat[1]), int(flat[2])),
         num_queries_per_block=(int(flat[3]), int(flat[4]), int(flat[5])),
         vmem_limit_bytes=int(flat[6]),
     )
-
-  @override
-  def op_impl_call_config_setup(
-      self, *args: Any, config: Any = None, **kwargs: Any
-  ) -> tuple[int, ...] | None:
-    if config is None:
-      config = self.deconstruct_config(
-          self.get_bound_args(*args, **kwargs).get_config(
-              check_autotuning_cache=False,
-          )
-      )
-    return config
 
   @override
   def __call__(

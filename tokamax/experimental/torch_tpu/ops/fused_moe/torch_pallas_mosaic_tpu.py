@@ -67,19 +67,11 @@ class _PallasMosaicTpuFusedMoe(
     config = config_parts[0]
     assert config is not None, "Config not set."
     capacity, block, ragged_stride, rhs_qb, sharded_plan = config
-    # When `config=None` is passed to `__call__`, `deconstruct_config(None)`
-    # returns `None` and `TorchOp.op_impl_call_config_setup` populates `config`
-    # via `dataclasses.astuple` (bypassing `deconstruct_config`), so optional
-    # fields arrive here as `None` rather than `-1`.
     return Config(
         capacity=int(capacity),
-        block=None if block is None or block < 0 else int(block),
-        ragged_stride=(
-            None
-            if ragged_stride is None or ragged_stride < 0
-            else int(ragged_stride)
-        ),
-        rhs_qb=None if rhs_qb is None or rhs_qb < 0 else int(rhs_qb),
+        block=None if block < 0 else int(block),
+        ragged_stride=None if ragged_stride < 0 else int(ragged_stride),
+        rhs_qb=None if rhs_qb < 0 else int(rhs_qb),
         sharded_plan=bool(sharded_plan),
     )
 
