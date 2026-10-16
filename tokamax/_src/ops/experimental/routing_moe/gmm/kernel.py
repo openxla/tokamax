@@ -47,13 +47,22 @@ def routing_gmm(
     out_dtype: jnp.dtype | None = None,
     custom_plan: plan.RoutingGmmPlan | None = None,
 ) -> arg.ActivationWrapper[jax.Array]:
-  """GMM that pipelines routing and compute for both input and output."""
+  """GMM that pipelines routing and compute for both input and output.
+
+  With `scatter.spec.remote_axis` (inside shard_map), a row scattered to global
+  row `i` lands on device `i // rows_per_dev` along that axis, and each device
+  returns its `m_out // axis_size` rows. Scatter indices across all devices must
+  then fill every output row exactly once, or the kernel hangs.
+  """
 
   gather_spec = None if gather is None else gather.spec
   scatter_spec = None if scatter is None else scatter.spec
 
   # Step 1: Derive sizes, resolve the plan, and construct the config.
   tpu_info = pltpu.get_tpu_info()
+  size_ep = 1
+  if scatter_spec is not None and scatter_spec.remote_axis is not None:
+    size_ep = jax.lax.axis_size(scatter_spec.remote_axis)
   dim = config.Dimension.create(
       x=x.spec,
       w=w.spec,
@@ -61,6 +70,7 @@ def routing_gmm(
       gather=gather_spec,
       scatter=scatter_spec,
       fuse_act=fuse_act,
+      size_ep=size_ep,
   )
   resolved_plan = plan.ResolvedPlan.create(
       custom_plan,
@@ -103,6 +113,7 @@ def routing_gmm(
   w_scale = w.scale
   if w_scale is not None:
     w_scale = w_scale.astype(jnp.float32)
+  remote = cfg.out.mode == config.RoutingMode.REMOTE
   inputs = memory_ref.PipelineInputs[jax.Array](
       x=x.data,
       w=memory_ref.SingleWeightRef(weight=w.weight, scale=w_scale, bias=w.bias),
@@ -130,6 +141,8 @@ def routing_gmm(
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=cfg.plan.vmem_limit_bytes,
           disable_bounds_checks=True,
+          # Remote DMA barriers use the collective barrier semaphore.
+          collective_id=0 if remote else None,
           # NOTE: This is critical to ensure DMA instruction are correctly
           # scheduled to avoid resource contention.
           flags={"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True},

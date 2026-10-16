@@ -239,7 +239,9 @@ def make_weight_wrapper(
 
 def make_routing_wrapper(
     indices: jax.Array,  # [num_indices]
+    *,
+    remote_axis: str | None = None,
 ) -> RoutingWrapper[jax.Array]:
-  """Builds a routing wrapper for a local row-index map."""
-  spec = RoutingSpec(num_indices=indices.shape[0])
+  """Builds a routing wrapper for a row-index map, local unless remote_axis."""
+  spec = RoutingSpec(num_indices=indices.shape[0], remote_axis=remote_axis)
   return RoutingWrapper(indices=indices, spec=spec)

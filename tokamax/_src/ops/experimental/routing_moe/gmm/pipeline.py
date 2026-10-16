@@ -66,7 +66,6 @@ def inner_pipeline(
     # current slot, that will prevent DMA instructions to be pipelined with
     # compute.  Therefore, DMA is issued after the waiting.
     x_bref.branchless_copy_in(gm_id + cfg.plan.num_xo_buffers - 1)
-    out_bref.branchless_copy_out(gm_id - 1)
 
     # Step 3: Load data from VMEM.
     x = layout_util.load_compact_to_large(x_ref.at[:bucket_m], cfg.dim.size_k)
@@ -80,6 +79,11 @@ def inner_pipeline(
     # Step 4: Perform computation.
     out = compute.matmul(cfg, x, weight, weight_scale, None)
     out = compute.apply_act_fn(out, cfg.fuse_act).astype(out_ref.dtype)
+
+    # Start output DMA for previous step slot after the loads: a remote DMA is
+    # a global memory barrier, so issuing it earlier would hold every load and
+    # the matmul behind it instead of sharing bundles with the matmul.
+    out_bref.branchless_copy_out(gm_id - 1)
 
     # Step 5: Store output into VMEM.
     layout_util.store_large_to_compact(out_ref.at[:bucket_m], out)
@@ -145,6 +149,8 @@ def outer_pipeline(
     if isinstance(scatter_idx, memory_ref.IndexBufferedRef):
       out = out.bind_idx_ref(scatter_idx)
     final_allocs = dataclasses.replace(final_allocs, inputs=inputs, out=out)
+    final_allocs.inputs.x.prologue()
+    final_allocs.out.prologue()
 
     # Prologue: Prefetch first num_xo_buffers - 1 input tiles.
     for gm_id in range(cfg.plan.num_xo_buffers - 1):
@@ -179,3 +185,6 @@ def outer_pipeline(
       final_allocs.out.branchless_wait_out(
           num_gm - cfg.plan.num_xo_buffers + buf_idx
       )
+
+    final_allocs.inputs.x.epilogue()
+    final_allocs.out.epilogue()

@@ -35,8 +35,12 @@ class RoutingMode(enum.StrEnum):
 
   DIRECT = enum.auto()  # DMA is performed on continuous memory region.
   LOCAL = enum.auto()  # Local DMA is performed in per-row basis.
-  # TODO: Support remote DMA.
-  REMOTE = enum.auto()  # Remote DMA is performed in per-row basis.
+  # Remote DMA to the device that owns the row, per row. Output only.
+  # TODO: Unlike DIRECT and LOCAL, REMOTE also changes the output
+  # layout (each device keeps only its rows). Consider renaming LOCAL to HBM and
+  # moving remote-ness into ActivationConfig, so remote vs local differs only in
+  # the per-row DMA.
+  REMOTE = enum.auto()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -67,6 +71,8 @@ class Dimension:
   size_out_n: int
   size_local_groups: int
   size_global_groups: int
+  # Devices that output rows are split across by a remote scatter.
+  size_ep: int = 1
 
   @classmethod
   def create(
@@ -78,8 +84,12 @@ class Dimension:
       gather: arg.RoutingSpec | None,
       scatter: arg.RoutingSpec | None,
       fuse_act: str | None,
+      size_ep: int = 1,
   ):
-    """Validates the specs against each other and derives problem sizes."""
+    """Validates the specs against each other and derives problem sizes.
+
+    `size_ep` is the size of `scatter.remote_axis`, 1 for a local scatter.
+    """
     if x.col_size != w.in_size:
       raise ValueError(
           f"x col_size ({x.col_size}) must match w in_size ({w.in_size})."
@@ -114,8 +124,13 @@ class Dimension:
             f"scatter must map every x row ({size_m}). Got num_indices"
             f" {scatter.num_indices}."
         )
-      if scatter.remote_axis is not None:
-        raise NotImplementedError("Remote scatter is not supported.")
+    if (scatter is None or scatter.remote_axis is None) and size_ep != 1:
+      raise ValueError(f"size_ep ({size_ep}) requires a remote scatter.")
+    if size_out_m % size_ep != 0:
+      raise ValueError(
+          f"Output rows ({size_out_m}) must divide evenly across"
+          f" {size_ep} devices."
+      )
 
     return cls(
         size_m=size_m,
@@ -125,6 +140,7 @@ class Dimension:
         size_out_n=size_out_n,
         size_local_groups=w.group_size,
         size_global_groups=num_global_groups,
+        size_ep=size_ep,
     )
 
 
@@ -170,8 +186,9 @@ class RoutingGmmConfig:
           dtype=plan.matmul_dtype, block_size=plan.x_quant_block_size
       )
 
+    # A remote scatter leaves each device only the rows it owns.
     out_spec = arg.ActivationSpec(
-        row_size=dim.size_out_m,
+        row_size=dim.size_out_m // dim.size_ep,
         col_size=dim.size_out_n,
         dtype=x.dtype if out_dtype is None else out_dtype,
     )

@@ -174,6 +174,12 @@ class RoutingBufferedRef(_BypassBufferedRef):
   def branchless_wait_out(self, gm_id: jax.Array | int) -> None:
     ...
 
+  def prologue(self) -> None:
+    """Runs once before the pipeline."""
+
+  def epilogue(self) -> None:
+    """Runs once after the last DMA wait."""
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -394,13 +400,26 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     rows = self.metadata_ref.get_num_rows(gm_id)
 
     for r in range(self.cfg.plan.tile_m):
-      size = jnp.where(r < rows, 1, 0)
-      row = self.idx_ref[offset + r]
-      pltpu.make_async_copy(
-          src_ref=vmem_src.at[pl.ds(r, size), :blocks],
-          dst_ref=hbm_dst.at[pl.ds(row, size)],
-          sem=sem,
-      ).start(priority=1)
+      live = r < rows
+      size = jnp.where(live, 1, 0)
+      src = vmem_src.at[pl.ds(r, size), :blocks]
+      self._copy_out_row(src, self.idx_ref[offset + r], size, live, sem)
+
+  def _copy_out_row(
+      self,
+      src: hijax.TransformedRef,
+      idx: jax.Array,
+      size: jax.Array,
+      live: jax.Array,
+      sem: Any,
+  ) -> None:
+    """Starts the DMA of one VMEM row `src` to output row `idx`."""
+    del live
+    pltpu.make_async_copy(
+        src_ref=src,
+        dst_ref=self.dst_ref.at[pl.ds(idx, size)],
+        sem=sem,
+    ).start(priority=1)
 
   @override
   def branchless_wait_in(self, gm_id: jax.Array | int) -> None:
@@ -431,6 +450,72 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     del ref, grid_indices
 
   copy_in = copy_out = wait_in = wait_out = _no_op
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
+  """Output ref that DMAs each row to the device that owns it.
+
+  Attributes:
+    recv_sem: DMA semaphore counting the rows this device receives from all
+      devices.
+  """
+
+  recv_sem: Any = None
+
+  @override
+  def _copy_out_row(
+      self,
+      src: hijax.TransformedRef,
+      idx: jax.Array,
+      size: jax.Array,
+      live: jax.Array,
+      sem: Any,
+  ) -> None:
+    assert self.cfg.scatter is not None
+    axis = self.cfg.scatter.remote_axis
+    assert axis is not None
+    assert self.recv_sem is not None
+    # Unsigned lax div/rem skip the sign fixups of int32 jnp.divmod.
+    rows_per_dev = jnp.uint32(self.cfg.out.spec.row_size)
+    uidx = idx.astype(jnp.uint32)
+    dev = jax.lax.div(uidx, rows_per_dev).astype(jnp.int32)
+    row = jax.lax.rem(uidx, rows_per_dev).astype(jnp.int32)
+    # Remote DMAs must use priority 0. A dead row may read a stale index, so
+    # its empty DMA is aimed at a real device.
+    pltpu.make_async_remote_copy(
+        src_ref=src,
+        dst_ref=self.dst_ref.at[pl.ds(row, size)],
+        send_sem=sem,
+        recv_sem=self.recv_sem,
+        device_id={axis: jnp.where(live, dev, 0)},
+    ).start()
+
+  @override
+  def prologue(self) -> None:
+    # Every peer's output buffer must exist before the first row lands.
+    self._barrier()
+
+  @override
+  def epilogue(self) -> None:
+    # Wait for every row owned here before the output is read.
+    recv = self.dst_ref.at[pl.ds(0, self.cfg.out.spec.row_size)]
+    pltpu.make_async_copy(recv, recv, self.recv_sem).wait()
+
+  def _barrier(self) -> None:
+    """EP barrier; a second round keeps the semaphore from early reuse."""
+    assert self.cfg.scatter is not None
+    axis, ep = self.cfg.scatter.remote_axis, self.cfg.dim.size_ep
+    assert axis is not None
+
+    def signal_all(sem):
+      for i in range(ep):
+        pl.semaphore_signal(sem, 1, device_id={axis: jnp.int32(i)})
+      pl.semaphore_wait(sem, ep)
+
+    signal_all(pltpu.get_barrier_semaphore())
+    pl.run_scoped(signal_all, pltpu.SemaphoreType.REGULAR)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -669,12 +754,12 @@ class PipelineAllocs:
       match mode:
         case config.RoutingMode.LOCAL:
           return BranchlessBufferedRef
+        case config.RoutingMode.REMOTE:
+          return RemoteBranchlessBufferedRef
         case config.RoutingMode.DIRECT:
           return BranchedBufferedRef
         case _:
-          raise NotImplementedError(
-              "Only direct or local routing is supported."
-          )
+          raise NotImplementedError(f"Unsupported routing mode: {mode}.")
 
     x_bref = _get_buffered_ref(cfg.x.mode).input(
         spec=pipeline_block_specs.get_x_spec(),
@@ -694,6 +779,10 @@ class PipelineAllocs:
         metadata_ref=metadata_ref,
         dst_ref=out_hbm_ref,
     )
+    if cfg.out.mode == config.RoutingMode.REMOTE:
+      out_bref = dataclasses.replace(
+          out_bref, recv_sem=pltpu.SemaphoreType.DMA(())
+      )
 
     # TODO: Support use case when indices are not stream from HBM and
     # instead entirely stored in SMEM.

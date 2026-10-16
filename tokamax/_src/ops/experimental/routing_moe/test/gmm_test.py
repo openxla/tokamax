@@ -13,10 +13,13 @@
 # limitations under the License.
 # ==============================================================================
 
+import math
+
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax import sharding
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
@@ -28,6 +31,10 @@ from tokamax._src.ops.gmm_v2 import gmm_v2
 from tokamax._src.ops.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_gather.pallas_mosaic_tpu_kernel import ragged_gather_pallas
 from tokamax._src.ops.ragged_scatter.pallas_mosaic_tpu_kernel import ragged_scatter_pallas
+
+P = sharding.PartitionSpec
+NamedSharding = sharding.NamedSharding
+Mesh = sharding.Mesh
 
 jax.config.parse_flags_with_absl()
 
@@ -84,6 +91,107 @@ def ragged_gmm_unpermute(lhs, rhs, group_sizes, topk_argsort_revert_indices):
       jnp.array(0, jnp.int32),
       group_sizes.sum(),
   )
+
+
+EP_AXIS = "model"
+
+
+def make_mesh(mesh_shape):
+  """Mesh over the first `math.prod(mesh_shape)` devices; last axis is EP."""
+  devices = jax.devices()[: math.prod(mesh_shape)]
+  return Mesh(
+      np.array(devices).reshape(mesh_shape),
+      axis_names=("data", EP_AXIS)[-len(mesh_shape) :],
+  )
+
+
+def random_topk_indices(key, num_tokens, topk, num_experts, num_skipped):
+  """Top-k experts per token, never picking the last `num_skipped` experts."""
+  gating_output = jax.random.uniform(key, (num_tokens, num_experts))
+  gating_output = gating_output.at[:, num_experts - num_skipped :].set(-1)
+  _, topk_indices = jax.lax.top_k(gating_output, topk)
+  return topk_indices
+
+
+def balanced_topk_indices(key, num_tokens, topk, num_experts, ep_size):
+  """Top-k experts per token; the k-th is on EP shard `k // (topk / ep_size)`."""
+  num_local_experts = num_experts // ep_size
+  gating_output = jax.random.uniform(
+      key, (num_tokens, ep_size, num_local_experts)
+  )
+  _, local_indices = jax.lax.top_k(gating_output, topk // ep_size)
+  shard_offsets = jnp.arange(ep_size)[:, None] * num_local_experts
+  return (local_indices + shard_offsets).reshape(num_tokens, topk)
+
+
+def _routing_gmm_shard(lhs, rhs, group_sizes, group_offset, scatter_indices):
+  """Per-shard body of `remote_gmm_unpermute`."""
+  out = gmm.routing_gmm(
+      lhs,
+      arg.make_weight_wrapper(rhs),
+      group_sizes,
+      group_offset=group_offset,
+      scatter=arg.make_routing_wrapper(scatter_indices, remote_axis=EP_AXIS),
+  )
+  return out.data
+
+
+@jax.jit(static_argnames=("mesh",))
+def remote_gmm_unpermute(lhs, rhs, group_sizes, topk_argsort_indices, *, mesh):
+  """Each EP shard DMAs its rows straight to the shard that owns the token."""
+  num_experts = rhs.shape[0]
+  num_local_experts = num_experts // mesh.shape[EP_AXIS]
+  group_offset = jnp.arange(0, num_experts, num_local_experts)
+
+  return jax.shard_map(
+      _routing_gmm_shard,
+      mesh=mesh,
+      in_specs=(P(), P(EP_AXIS), P(), P(EP_AXIS), P()),
+      out_specs=P(EP_AXIS),
+      check_vma=False,
+  )(lhs, rhs, group_sizes, group_offset, topk_argsort_indices)
+
+
+@jax.jit(static_argnames=("mesh", "topk", "all_to_all"))
+def local_gmm_unpermute(
+    lhs, rhs, group_sizes, local_scatter_indices, *, mesh, topk, all_to_all=True
+):
+  """Each EP shard unpermutes locally, then an all_to_all reshards by token.
+
+  Each shard writes its `topk / ep_size` rows per token to a dense
+  `[num_tokens, topk / ep_size]` block. The all_to_all splits the block by
+  token and stacks it by k. `all_to_all=False` skips it to time the kernel.
+  """
+  ep_size = mesh.shape[EP_AXIS]
+  num_experts = rhs.shape[0]
+  group_offset = jnp.arange(0, num_experts, num_experts // ep_size)
+
+  def unpermute(lhs, rhs, group_sizes, group_offset, scatter_indices):
+    out = gmm.routing_gmm(
+        lhs,
+        arg.make_weight_wrapper(rhs),
+        group_sizes,
+        group_offset=group_offset,
+        scatter=arg.make_routing_wrapper(scatter_indices),
+    ).data
+    if not all_to_all:
+      return out
+    num_tokens, topk_per_shard = lhs.spec.row_size // topk, topk // ep_size
+    row_shape = out.shape[1:]
+    out = out[: num_tokens * topk_per_shard]
+    out = out.reshape((num_tokens, topk_per_shard) + row_shape)
+    out = jax.lax.all_to_all(
+        out, EP_AXIS, split_axis=0, concat_axis=1, tiled=True
+    )
+    return out.reshape((-1,) + row_shape)
+
+  return jax.shard_map(
+      unpermute,
+      mesh=mesh,
+      in_specs=(P(), P(EP_AXIS), P(), P(EP_AXIS), P()),
+      out_specs=P(EP_AXIS),
+      check_vma=False,
+  )(lhs, rhs, group_sizes, group_offset, local_scatter_indices)
 
 
 class RoutingGmmTest(parameterized.TestCase):
@@ -250,6 +358,167 @@ class RoutingGmmTest(parameterized.TestCase):
         kwargs=dict(scatter=self.scatter),
     )
     self._benchmark_and_profile(plain, ragged, fused)
+
+
+class RemoteRoutingGmmTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if jax.device_count() < 4:
+      self.skipTest("Needs 4 devices.")
+
+  def _setup_inputs(
+      self,
+      mesh_shape,
+      num_tokens,
+      topk,
+      num_experts,
+      size_k,
+      size_n,
+      *,
+      balanced=False,
+      skip_last_shard=False,
+  ):
+    self.mesh = make_mesh(mesh_shape)
+    ep_size = self.mesh.shape[EP_AXIS]
+    num_local_experts = num_experts // ep_size
+
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(k0, (num_tokens, size_k), jnp.bfloat16) / 10
+    self.rhs = (
+        jax.random.normal(k1, (num_experts, size_k, size_n), jnp.bfloat16) / 10
+    )
+
+    if balanced:
+      topk_indices = balanced_topk_indices(
+          k2, num_tokens, topk, num_experts, ep_size
+      )
+    else:
+      num_skipped = num_local_experts if skip_last_shard else 0
+      topk_indices = random_topk_indices(
+          k2, num_tokens, topk, num_experts, num_skipped
+      )
+    topk_indices_flat = topk_indices.flatten()
+    self.topk_argsort_indices = jnp.argsort(topk_indices_flat)
+    self.gather_indices = self.topk_argsort_indices // topk
+    self.group_sizes = jnp.bincount(topk_indices_flat, length=num_experts)
+
+    # The local baseline writes each row to its shard's dense
+    # [num_tokens, topk / ep_size] block instead of to its final slot.
+    token = self.topk_argsort_indices // topk
+    k = self.topk_argsort_indices % topk
+    topk_per_shard = topk // ep_size
+    self.local_scatter_indices = token * topk_per_shard + k % topk_per_shard
+
+    # routing_gmm reads lhs in the compact layout.
+    self.lhs_gathered_compact = input_pack.input_pack(lhs[self.gather_indices])
+
+  def _benchmark_and_profile(self, local, local_kernel, remote):
+    """Returns median latencies in us and trace links of local, remote."""
+    latency_us = {}
+    for name, (fn, args) in [
+        ("local", local),
+        ("local_kernel", local_kernel),
+        ("remote", remote),
+    ]:
+      latency_us[name] = 1e3 * (
+          benchmarking.benchmark(
+              fn, args, method="hermetic_xprof"
+          ).median_evaluation_time_ms
+      )
+
+    trace = ""
+    return latency_us, trace
+
+  @parameterized.product(
+      mesh_shape=((4,), (2, 2)),
+      num_tokens_topk=((256, 2), (1024, 4)),
+      skip_last_shard=(False, True),
+  )
+  def test_remote_gmm_unpermute_numerics(
+      self, mesh_shape, num_tokens_topk, skip_last_shard
+  ):
+    num_tokens, topk = num_tokens_topk
+    self._setup_inputs(
+        mesh_shape,
+        num_tokens,
+        topk,
+        num_experts=16,
+        size_k=1024,
+        size_n=512,
+        skip_last_shard=skip_last_shard,
+    )
+    # One device holding all experts.
+    expected = gmm.routing_gmm(
+        self.lhs_gathered_compact,
+        arg.make_weight_wrapper(self.rhs),
+        self.group_sizes,
+        scatter=arg.make_routing_wrapper(self.topk_argsort_indices),
+    ).data
+    actual = remote_gmm_unpermute(
+        self.lhs_gathered_compact,
+        self.rhs,
+        self.group_sizes,
+        self.topk_argsort_indices,
+        mesh=self.mesh,
+    )
+    np.testing.assert_array_equal(actual, expected)
+
+  def test_remote_gmm_unpermute_benchmark(self):
+    """Prints remote vs local + all_to_all for the Qwen 3.5 combine at EP=4."""
+    topk, num_experts, size_k, size_n = 8, 256, 1024, 4096
+    rows = []
+    for num_tokens in (1280, 2560, 5120, 10240):
+      self._setup_inputs(
+          (4,), num_tokens, topk, num_experts, size_k, size_n, balanced=True
+      )
+      # Shard rhs up front so the timed functions do not reshard it.
+      rhs = jax.device_put(self.rhs, NamedSharding(self.mesh, P(EP_AXIS)))
+      args = (self.lhs_gathered_compact, rhs, self.group_sizes)
+      local = benchmarking.standardize_function(
+          local_gmm_unpermute,
+          *args,
+          self.local_scatter_indices,
+          kwargs=dict(mesh=self.mesh, topk=topk),
+      )
+      local_kernel = benchmarking.standardize_function(
+          local_gmm_unpermute,
+          *args,
+          self.local_scatter_indices,
+          kwargs=dict(mesh=self.mesh, topk=topk, all_to_all=False),
+      )
+      remote = benchmarking.standardize_function(
+          remote_gmm_unpermute,
+          *args,
+          self.topk_argsort_indices,
+          kwargs=dict(mesh=self.mesh),
+      )
+      (local_fn, local_args), (remote_fn, remote_args) = local, remote
+      np.testing.assert_array_equal(
+          remote_fn(remote_args), local_fn(local_args)
+      )
+
+      latency_us, trace = self._benchmark_and_profile(
+          local, local_kernel, remote
+      )
+      local_us, kernel_us = latency_us["local"], latency_us["local_kernel"]
+      remote_us = latency_us["remote"]
+      rows.append(
+          f"| {num_tokens} | {local_us:.0f} | {kernel_us:.0f} | "
+          f"{local_us - kernel_us:.0f} | {remote_us:.0f} | "
+          f"{remote_us / local_us:.2f}x | {trace} |"
+      )
+
+    print(
+        f"=== combine: topk={topk} ep=4 K={size_k} N={size_n} E={num_experts};"
+        " a2a = local total - local kernel ==="
+    )
+    print(
+        "| tokens | local total (us) | local kernel (us) | local a2a (us) | "
+        "remote (us) | remote / local | trace |"
+    )
+    print("|---|---|---|---|---|---|---|")
+    print("\n".join(rows), flush=True)
 
 
 if __name__ == "__main__":
