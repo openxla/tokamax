@@ -37,9 +37,9 @@ table.ops-table code {
   <thead>
     <tr>
       <th colspan="2" width="28%" align="left" style="width: 28%; text-align: left;">Op</th>
-      <th width="10%" align="left" style="width: 10%; text-align: left;">Hardware</th>
-      <th width="10%" align="center" style="width: 10%; text-align: center;">PyTorch-TPU API</th>
-      <th width="10%" align="center" style="width: 10%; text-align: center;">Includes Backward Pass</th>
+      <th width="10%" align="left" style="width: 10%; text-align: left;">HW</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">PyTorch TPU API</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">Bwd Pass</th>
       <th width="42%" align="left" style="width: 42%; text-align: left;">Summary</th>
     </tr>
   </thead>
@@ -66,7 +66,7 @@ table.ops-table code {
       <td>Fuses causal 1D convolution with <a href="https://arxiv.org/abs/2412.06464">Gated DeltaNet (GDN)</a> or Kimi Delta Attention (KDA) linear attention state updates for inference in hybrid linear-attention models (e.g., Qwen 3.5, Kimi Linear).</td>
     </tr>
     <tr>
-      <td rowspan="9" width="10%" align="center" valign="middle" style="width: 10%; vertical-align: middle; text-align: center;"><a href="https://arxiv.org/abs/2512.02556">DeepSeek Sparse Attention (DSA)</a></td>
+      <td rowspan="10" width="10%" align="center" valign="middle" style="width: 10%; vertical-align: middle; text-align: center;"><a href="https://arxiv.org/abs/2512.02556">DeepSeek Sparse Attention (DSA)</a></td>
       <td width="18%" style="width: 18%;"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/deepseek_rope"><code>deepseek_rope</code></a></td>
       <td>TPU</td>
       <td align="center" style="text-align: center;">✅</td>
@@ -123,6 +123,13 @@ table.ops-table code {
       <td>Computes Multi-Head Latent Attention (MLA) restricted to a selected top-k subset of KV positions via a dense mask, used for shorter sequences in GLM-5.2, DeepSeek-V3.2, and DeepSeek-V4.</td>
     </tr>
     <tr>
+      <td><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/mla_swa"><code>mla_swa</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;"></td>
+      <td align="center" style="text-align: center;"></td>
+      <td>Computes Multi-Head Latent Sliding Window Attention over a paged KV cache (optionally returning partial softmax accumulators to combine with <code>sparse_mla</code>) for DeepSeek-V4 inference.</td>
+    </tr>
+    <tr>
       <td><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/grouped_lowrank_proj"><code>grouped_lowrank_proj</code></a></td>
       <td>TPU</td>
       <td align="center" style="text-align: center;">✅</td>
@@ -173,9 +180,9 @@ table.ops-table code {
   <thead>
     <tr>
       <th width="28%" align="left" style="width: 28%; text-align: left;">Op</th>
-      <th width="10%" align="left" style="width: 10%; text-align: left;">Hardware</th>
-      <th width="10%" align="center" style="width: 10%; text-align: center;">PyTorch-TPU API</th>
-      <th width="10%" align="center" style="width: 10%; text-align: center;">Includes Backward Pass</th>
+      <th width="10%" align="left" style="width: 10%; text-align: left;">HW</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">PyTorch TPU API</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">Bwd Pass</th>
       <th width="42%" align="left" style="width: 42%; text-align: left;">Summary</th>
     </tr>
   </thead>
@@ -245,9 +252,9 @@ table.ops-table code {
   <thead>
     <tr>
       <th width="28%" align="left" style="width: 28%; text-align: left;">Op</th>
-      <th width="10%" align="left" style="width: 10%; text-align: left;">Hardware</th>
-      <th width="10%" align="center" style="width: 10%; text-align: center;">PyTorch-TPU API</th>
-      <th width="10%" align="center" style="width: 10%; text-align: center;">Includes Backward Pass</th>
+      <th width="10%" align="left" style="width: 10%; text-align: left;">HW</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">PyTorch TPU API</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">Bwd Pass</th>
       <th width="42%" align="left" style="width: 42%; text-align: left;">Summary</th>
     </tr>
   </thead>
