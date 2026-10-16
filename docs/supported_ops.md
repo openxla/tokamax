@@ -2,9 +2,10 @@
 
 <style>
 table.ops-table {
-  width: 100%;
-  table-layout: fixed;
-  border-collapse: collapse;
+  display: table !important;
+  width: 100% !important;
+  table-layout: fixed !important;
+  border-collapse: collapse !important;
 }
 table.ops-table th,
 table.ops-table td {
@@ -12,32 +13,39 @@ table.ops-table td {
   padding: 8px 12px;
   vertical-align: middle !important;
   overflow-wrap: break-word;
+  word-wrap: break-word;
+  word-break: break-word;
+}
+table.ops-table code {
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
 }
 </style>
 
 ### Attention Variants
 
-<table class="ops-table">
+<table class="ops-table fixed" width="100%" style="display: table; width: 100%; table-layout: fixed; border-collapse: collapse;">
   <colgroup>
-    <col style="width: 10%;">
-    <col style="width: 16%;">
-    <col style="width: 10%;">
-    <col style="width: 8%;">
-    <col style="width: 10%;">
-    <col style="width: 46%;">
+    <col width="10%" style="width: 10%;">
+    <col width="18%" style="width: 18%;">
+    <col width="10%" style="width: 10%;">
+    <col width="10%" style="width: 10%;">
+    <col width="10%" style="width: 10%;">
+    <col width="42%" style="width: 42%;">
   </colgroup>
   <thead>
     <tr>
-      <th colspan="2" align="left" style="width: 26%; text-align: left;">Op</th>
-      <th align="left" style="width: 10%; text-align: left;">Hardware</th>
-      <th align="center" style="width: 8%; text-align: center;">TorchTPU API</th>
-      <th align="center" style="width: 10%; text-align: center;">Includes Backward Pass</th>
-      <th align="left" style="width: 46%; text-align: left;">Summary</th>
+      <th colspan="2" width="28%" align="left" style="width: 28%; text-align: left;">Op</th>
+      <th width="10%" align="left" style="width: 10%; text-align: left;">Hardware</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">PyTorch-TPU API</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">Includes Backward Pass</th>
+      <th width="42%" align="left" style="width: 42%; text-align: left;">Summary</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/splash_attention"><code>splash_attention</code></a></td>
+      <td colspan="2" width="28%"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/splash_attention"><code>splash_attention</code></a></td>
       <td>TPU</td>
       <td align="center" style="text-align: center;">✅</td>
       <td align="center" style="text-align: center;">✅</td>
@@ -58,8 +66,8 @@ table.ops-table td {
       <td>Fuses causal 1D convolution with <a href="https://arxiv.org/abs/2412.06464">Gated DeltaNet (GDN)</a> or Kimi Delta Attention (KDA) linear attention state updates for inference in hybrid linear-attention models (e.g., Qwen 3.5, Kimi Linear).</td>
     </tr>
     <tr>
-      <td rowspan="9" align="center" valign="middle" style="width: 10%; vertical-align: middle; text-align: center;"><a href="https://arxiv.org/abs/2512.02556">DeepSeek Sparse Attention (DSA)</a></td>
-      <td style="width: 16%;"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/deepseek_rope"><code>deepseek_rope</code></a></td>
+      <td rowspan="9" width="10%" align="center" valign="middle" style="width: 10%; vertical-align: middle; text-align: center;"><a href="https://arxiv.org/abs/2512.02556">DeepSeek Sparse Attention (DSA)</a></td>
+      <td width="18%" style="width: 18%;"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/deepseek_rope"><code>deepseek_rope</code></a></td>
       <td>TPU</td>
       <td align="center" style="text-align: center;">✅</td>
       <td align="center" style="text-align: center;"></td>
@@ -154,21 +162,21 @@ table.ops-table td {
 
 ### Mixture-of-Experts (MoE) Components
 
-<table class="ops-table">
+<table class="ops-table fixed" width="100%" style="display: table; width: 100%; table-layout: fixed; border-collapse: collapse;">
   <colgroup>
-    <col style="width: 26%;">
-    <col style="width: 10%;">
-    <col style="width: 8%;">
-    <col style="width: 10%;">
-    <col style="width: 46%;">
+    <col width="28%" style="width: 28%;">
+    <col width="10%" style="width: 10%;">
+    <col width="10%" style="width: 10%;">
+    <col width="10%" style="width: 10%;">
+    <col width="42%" style="width: 42%;">
   </colgroup>
   <thead>
     <tr>
-      <th align="left" style="width: 26%; text-align: left;">Op</th>
-      <th align="left" style="width: 10%; text-align: left;">Hardware</th>
-      <th align="center" style="width: 8%; text-align: center;">TorchTPU API</th>
-      <th align="center" style="width: 10%; text-align: center;">Includes Backward Pass</th>
-      <th align="left" style="width: 46%; text-align: left;">Summary</th>
+      <th width="28%" align="left" style="width: 28%; text-align: left;">Op</th>
+      <th width="10%" align="left" style="width: 10%; text-align: left;">Hardware</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">PyTorch-TPU API</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">Includes Backward Pass</th>
+      <th width="42%" align="left" style="width: 42%; text-align: left;">Summary</th>
     </tr>
   </thead>
   <tbody>
@@ -226,30 +234,30 @@ table.ops-table td {
 
 ### Miscellaneous
 
-<table class="ops-table">
+<table class="ops-table fixed" width="100%" style="display: table; width: 100%; table-layout: fixed; border-collapse: collapse;">
   <colgroup>
-    <col style="width: 26%;">
-    <col style="width: 10%;">
-    <col style="width: 8%;">
-    <col style="width: 10%;">
-    <col style="width: 46%;">
+    <col width="28%" style="width: 28%;">
+    <col width="10%" style="width: 10%;">
+    <col width="10%" style="width: 10%;">
+    <col width="10%" style="width: 10%;">
+    <col width="42%" style="width: 42%;">
   </colgroup>
   <thead>
     <tr>
-      <th align="left" style="width: 26%; text-align: left;">Op</th>
-      <th align="left" style="width: 10%; text-align: left;">Hardware</th>
-      <th align="center" style="width: 8%; text-align: center;">TorchTPU API</th>
-      <th align="center" style="width: 10%; text-align: center;">Includes Backward Pass</th>
-      <th align="left" style="width: 46%; text-align: left;">Summary</th>
+      <th width="28%" align="left" style="width: 28%; text-align: left;">Op</th>
+      <th width="10%" align="left" style="width: 10%; text-align: left;">Hardware</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">PyTorch-TPU API</th>
+      <th width="10%" align="center" style="width: 10%; text-align: center;">Includes Backward Pass</th>
+      <th width="42%" align="left" style="width: 42%; text-align: left;">Summary</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/linear_softmax_cross_entropy_loss"><code>linear_softmax_cross_entropy_loss</code></a></td>
+      <td><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/linear_softmax_cross_entropy_loss"><code>linear_softmax_xent_loss</code></a></td>
       <td>TPU</td>
       <td align="center" style="text-align: center;">✅</td>
       <td align="center" style="text-align: center;">✅</td>
-      <td>Fuses the final linear projection with softmax cross-entropy loss to avoid materializing the full vocabulary logits tensor in memory.</td>
+      <td>Fuses the final linear projection with softmax cross-entropy loss (<code>linear_softmax_cross_entropy_loss</code>) to avoid materializing the full vocabulary logits tensor in memory.</td>
     </tr>
     <tr>
       <td><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/mhc"><code>mhc</code></a></td>
