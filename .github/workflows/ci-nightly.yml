@@ -9,6 +9,9 @@ on:
     #   GitHub's scheduler does not adjust for DST.
     - cron: '0 5 * * *'
   workflow_dispatch: # Allows manual triggering from the Actions tab
+  # `workflow_call` makes CI-Nightly a reusable workflow, so another workflow
+  # can run it as one of its jobs.
+  workflow_call:
 
 # Constants for the workflow that are shared across jobs.
 env:
@@ -40,7 +43,7 @@ jobs:
     defaults:
       run:
         shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
     timeout-minutes: 600
     steps:
       - name: Checkout Tokamax
@@ -79,7 +82,7 @@ jobs:
     defaults:
       run:
         shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
     timeout-minutes: 600
     steps:
       - name: Checkout Tokamax
@@ -121,7 +124,7 @@ jobs:
     defaults:
       run:
         shell: bash
-    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15'
+    container: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
     timeout-minutes: 600
     steps:
       - name: Checkout Tokamax
