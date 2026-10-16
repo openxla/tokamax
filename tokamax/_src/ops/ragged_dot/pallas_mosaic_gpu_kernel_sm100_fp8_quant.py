@@ -262,8 +262,15 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
     out_dtype,
     config: common.Config,
     activation: base.ActivationFunction | None = None,
+    *,
+    int4_to_fp8_offline_permute: bool = False,
 ) -> Float[Array, "M N"] | qwix.QArray:
   """Returns the Pallas kernel for fp8xint4 ragged dot.
+
+  If `int4_to_fp8_offline_permute` is True, `rhs.qvalue` must have been
+  permuted offline with
+  `mosaic_gpu.apply_int4_to_fp8_offline_permute(qvalue, axis=1)`, which lets
+  the dequant skip the nibble-reordering PRMTs.
 
   The kernel is using the trick of biased fp8 encoding to avoid explicit
   dequantization from int4 to float8_e4m3fn.
@@ -693,7 +700,9 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
               plgpu.barrier_arrive(w_consumed_barrier.at[data_slot])
 
             with jax.named_scope("dequant"):
-              w = mgpu_lib.int4_as_biased_f8e4m3fn(w, _TMEM(8))
+              w = mgpu_lib.int4_as_biased_f8e4m3fn(
+                  w, _TMEM(8), offline_permuted=int4_to_fp8_offline_permute
+              )
             w = plgpu.layout_cast(w, _TMEM(4))
             if di == 0:
 
@@ -959,9 +968,12 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
       cluster=(1 + collective,),
       cluster_names=("x",),
       kernel_name=(
-          "ragged_dot_fp8_quant_fused_output_sm100"
-          if epilogue_quant_enabled
-          else "ragged_dot_fp8_quant_sm100"
+          (
+              "ragged_dot_fp8_quant_fused_output_sm100"
+              if epilogue_quant_enabled
+              else "ragged_dot_fp8_quant_sm100"
+          )
+          + ("_offline_permute" if int4_to_fp8_offline_permute else "")
       ),
       compiler_params=plgpu.CompilerParams(
           approx_math=True,

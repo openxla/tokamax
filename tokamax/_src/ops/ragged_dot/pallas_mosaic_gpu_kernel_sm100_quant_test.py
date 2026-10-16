@@ -14,7 +14,7 @@
 # ==============================================================================
 
 import dataclasses
-from typing import override
+from typing import cast, override
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import qwix
 from tokamax._src import gpu_utils
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
@@ -317,6 +318,82 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
     chex.assert_trees_all_close(
         out[:count], expected[:count], atol=0.01, rtol=0.005
     )
+
+  def _offline_permute_inputs(self, m=512):
+    num_groups, k, n = 8, 1024, 512
+    a, b, group_sizes = self._create_inputs(
+        num_groups,
+        m,
+        k,
+        n,
+        jnp.bfloat16,
+        use_as_qarray=False,
+        quant_a_dtype=jnp.float8_e4m3fn,
+        a_tile_shape=(1, 512),
+        quant_b_dtype=jnp.int4,
+        b_tile_shape=(1, 512, 1),
+    )
+    b_permuted = dataclasses.replace(
+        b, qvalue=mgpu_lib.apply_int4_to_fp8_offline_permute(b.qvalue, axis=1)
+    )
+    return a, b, b_permuted, jnp.asarray(group_sizes)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="decode"),
+      dict(testcase_name="decode_silu", activation=silu),
+      # Uneven and empty groups, so tiles straddle group boundaries.
+      dict(testcase_name="ragged", group_sizes=(0, 130, 0, 200, 0, 98, 84, 0)),
+      # m >= 8192 selects the prefill warpgroup config.
+      dict(testcase_name="prefill_collective", m=8192, collective=True),
+  )
+  def test_int4_to_fp8_offline_permute_kernel(
+      self, m=512, group_sizes=None, activation=None, collective=False
+  ):
+    a, b, b_permuted, default_group_sizes = self._offline_permute_inputs(m)
+    if group_sizes is None:
+      group_sizes = default_group_sizes
+    else:
+      group_sizes = jnp.array(group_sizes, jnp.int32)
+    config = dataclasses.replace(
+        _CONFIG, block_m=32 if collective else 16, collective=collective
+    )
+    kernel = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+    expected = kernel(a, b, group_sizes, jnp.bfloat16, config, activation)
+    actual = kernel(
+        a,
+        b_permuted,
+        group_sizes,
+        jnp.bfloat16,
+        config,
+        activation,
+        int4_to_fp8_offline_permute=True,
+    )
+    chex.assert_trees_all_equal(actual, expected)
+    # Negative control: permuted weights without the flag must differ.
+    wrong = kernel(a, b_permuted, group_sizes, jnp.bfloat16, config, activation)
+    self.assertFalse(
+        bool(jnp.array_equal(cast(jax.Array, wrong), cast(jax.Array, expected)))
+    )
+
+  def test_int4_to_fp8_offline_permute_op(self):
+    a, b, b_permuted, group_sizes = self._offline_permute_inputs()
+    expected = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()(
+        a, b, group_sizes=group_sizes
+    )
+    actual = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(
+        int4_to_fp8_offline_permute=True
+    )(a, b_permuted, group_sizes=group_sizes)
+    chex.assert_trees_all_equal(actual, expected)
+
+  def test_int4_to_fp8_offline_permute_unsupported_raises(self):
+    _, b, _, group_sizes = self._offline_permute_inputs()
+    lhs = jnp.ones((512, 1024), jnp.bfloat16)  # Non-fp8 lhs -> other kernel.
+    with self.assertRaisesRegex(
+        NotImplementedError, "int4_to_fp8_offline_permute"
+    ):
+      pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(
+          int4_to_fp8_offline_permute=True
+      )(lhs, b, group_sizes=group_sizes)
 
   @parameterized.product(
       block_k=(128,),

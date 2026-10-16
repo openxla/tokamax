@@ -91,6 +91,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   enable_fused_epilogue_quant: bool = False
+  # If True, int4 `rhs.qvalue` was permuted offline along K with
+  # `mosaic_gpu.apply_int4_to_fp8_offline_permute`. Only supported by the SM100
+  # fp8 x int4 kernel.
+  int4_to_fp8_offline_permute: bool = False
 
   def __post_init__(self):
     if self.vjp is None:
@@ -236,6 +240,18 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
     if preferred_element_type is None:
       preferred_element_type = jnp.result_type(lhs, rhs)
+
+    if self.int4_to_fp8_offline_permute:
+      if (
+          fn is not sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+          or not isinstance(rhs, QArray)
+          or rhs.qtype != jnp.int4
+      ):
+        raise NotImplementedError(
+            "`int4_to_fp8_offline_permute` is only supported by the SM100 fp8"
+            " x int4 kernel."
+        )
+      fn = partial(fn, int4_to_fp8_offline_permute=True)
 
     dot_out = fn(
         lhs,  # pyrefly: ignore[bad-argument-type]
