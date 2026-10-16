@@ -41,7 +41,7 @@ class KdaResiduals:
   k: Float[Array, "H B T_ALIGNED K"]
   v: Float[Array, "H B T_ALIGNED V"]
   beta: Float[Array, "H B T_ALIGNED"]
-  g_cumsum: Float[Array, "H B T_ALIGNED K"] | None
+  g_cumsum: Float[Array, "H B T_ALIGNED GW"] | None
   aqk: Float[Array, "H B T_ALIGNED BT"]
   akk: Float[Array, "H B T_ALIGNED BT"]
   initial_state: (
@@ -60,3 +60,13 @@ class KdaResiduals:
   aligned_segment_ids: Int[Array, "B T_ALIGNED"] | None
   segment_ids: Int[Array, "B T_ORIG"] | None
   cp_metadata: CpMetadata
+  v_new: Float[Array, "H B T_ALIGNED V"] | None = None
+  q_raw: Float[Array, "H B T_ALIGNED K"] | None = None
+  k_raw: Float[Array, "H B T_ALIGNED K"] | None = None
+  v_raw: Float[Array, "H B T_ALIGNED V"] | None = None
+  conv_weight_q: Float[Array, "H_Q W K"] | None = None
+  conv_weight_k: Float[Array, "H_K W K"] | None = None
+  conv_weight_v: Float[Array, "H W V"] | None = None
+  conv_bias_q: Float[Array, "H_Q K"] | None = None
+  conv_bias_k: Float[Array, "H_K K"] | None = None
+  conv_bias_v: Float[Array, "H V"] | None = None

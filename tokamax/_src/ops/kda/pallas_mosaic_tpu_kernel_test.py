@@ -17,6 +17,7 @@
 from collections.abc import Sequence
 import dataclasses
 import math
+from typing import Any
 
 from absl import logging
 import jax
@@ -99,6 +100,8 @@ def compare_tensor(
   max_value = np.max(np.abs(expected_np))
   max_relative_diff = np.max(diff / (np.abs(expected_np) + 1e-12))
   rms_error_ratio = None
+  ulp = None
+  tolerance = None
   if max_rms_error_ratio is not None:
     rms_error = np.sqrt(np.mean(np.square(diff)))
     reference_rms = np.sqrt(np.mean(np.square(expected_np)))
@@ -141,6 +144,7 @@ def compare_tensor(
       logging.error("    Diff            = %s", diff[index])
       return False
 
+    assert tolerance is not None and ulp is not None
     error_ratio = diff / (tolerance + 1e-12)
     index = np.unravel_index(np.argmax(error_ratio), error_ratio.shape)
     logging.error("  Max Mismatch details at index %s:", index)
@@ -343,7 +347,7 @@ def _varlen_case(
   layouts = batch_seq_lens if batch_seq_lens is not None else (seq_lens,)
   assert layouts is not None
   if T is None:
-    T = max(sum(layout) for layout in layouts)
+    T = max(sum(layout) for layout in layouts if layout is not None)
   is_bf16 = dtype == jnp.bfloat16
   forward_atol = kwargs.pop("forward_atol", 0.05 if is_bf16 else 5e-4)
   forward_rtol = kwargs.pop("forward_rtol", 0.05 if is_bf16 else 5e-4)
@@ -407,7 +411,9 @@ def _cp_case(
       D=128,
       seq_lens=seq_lens,
       batch_seq_lens=batch_seq_lens,
-      max_num_segments_override=max(len(layout) for layout in layouts),
+      max_num_segments_override=max(
+          len(layout) for layout in layouts if layout is not None
+      ),
       cp_size=cp_size,
       dtype=dtype,
       input_profile=input_profile,
@@ -988,7 +994,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
   return inputs
 
 
-def _attention_kwargs(case: TestConfig, inputs: _Inputs) -> dict[str, object]:
+def _attention_kwargs(case: TestConfig, inputs: _Inputs) -> dict[str, Any]:
   return dict(
       a_log=inputs.a_log if case.use_gate_in_kernel else None,
       delta_time_bias=inputs.delta_time_bias if case.use_gate_in_kernel else None,
@@ -1349,5 +1355,134 @@ def test_chunk_kda_backward(case: TestConfig):
     ), f"Gradient mismatch for {name}"
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("scalar_gate", [True, False])
+def test_saved_v_new_vs_recomputed_v_new(dtype, scalar_gate):
+  if jax.default_backend() != "tpu":
+    pytest.skip("TPU required")
+  from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_kernel
+  from tokamax._src.ops.kda import pallas_mosaic_tpu_fwd_kernel
+
+  H, B, T, K, V = 4, 2, 256, 128, 128
+  chunk_size = 64
+  key = jax.random.PRNGKey(42)
+  k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
+  q = jax.random.normal(k1, (H, B, T, K), dtype=dtype) * 0.1
+  k = jax.random.normal(k2, (H, B, T, K), dtype=dtype) * 0.1
+  v = jax.random.normal(k3, (H, B, T, V), dtype=dtype) * 0.1
+  g_shape = (H, B, T, 1) if scalar_gate else (H, B, T, K)
+  g = -jnp.abs(jax.random.uniform(k4, g_shape, dtype=dtype)) * 0.5
+  beta = jax.random.uniform(k5, (H, B, T), dtype=dtype) * 0.5
+  do = jax.random.normal(k6, (H, B, T, V), dtype=dtype) * 0.1
+
+  (_, _), residuals = pallas_mosaic_tpu_fwd_kernel.chunk_kda_fwd_custom(
+      q=q,
+      k=k,
+      v=v,
+      g=g,
+      beta=beta,
+      scale=K**-0.5,
+      initial_state=None,
+      output_final_state=False,
+      use_gate_in_kernel=False,
+      a_log=None,
+      delta_time_bias=None,
+      safe_gate=True,
+      per_channel_gate=not scalar_gate,
+      lower_bound=None,
+      disable_recompute=True,
+      chunk_size=chunk_size,
+      return_residuals=True,
+  )
+  assert residuals is not None
+  assert (
+      residuals.v_new is not None
+  ), "Expected v_new to be saved in forward residuals"
+
+  grads_saved = pallas_mosaic_tpu_bwd_kernel.chunk_kda_bwd_custom(
+      scale=K**-0.5,
+      use_qk_l2norm=False,
+      use_gate_in_kernel=False,
+      disable_recompute=True,
+      lower_bound=None,
+      chunk_size=chunk_size,
+      max_num_segments=None,
+      has_initial_state=False,
+      per_channel_gate=not scalar_gate,
+      context_parallel_metadata=None,
+      residuals=residuals,
+      grad_outputs=(do, None),
+  )
+
+  residuals_recompute = dataclasses.replace(residuals, v_new=None)
+  grads_recomp = pallas_mosaic_tpu_bwd_kernel.chunk_kda_bwd_custom(
+      scale=K**-0.5,
+      use_qk_l2norm=False,
+      use_gate_in_kernel=False,
+      disable_recompute=True,
+      lower_bound=None,
+      chunk_size=chunk_size,
+      max_num_segments=None,
+      has_initial_state=False,
+      per_channel_gate=not scalar_gate,
+      context_parallel_metadata=None,
+      residuals=residuals_recompute,
+      grad_outputs=(do, None),
+  )
+
+  names = ("dq", "dk", "dv", "dg", "db")
+  for name, g_saved, g_recomp in zip(names, grads_saved[:5], grads_recomp[:5]):
+    a = np.asarray(g_saved, dtype=np.float64)
+    b = np.asarray(g_recomp, dtype=np.float64)
+    abs_diff = np.abs(a - b)
+    max_abs = float(np.max(abs_diff))
+    max_val = float(np.max(np.abs(b)))
+    rel_linf = max_abs / (max_val + 1e-12)
+    rel_l2 = float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12))
+    sig_mask = np.abs(b) > 0.01 * max_val
+    max_rel_sig = (
+        float(np.max(abs_diff[sig_mask] / np.abs(b[sig_mask])))
+        if np.any(sig_mask)
+        else 0.0
+    )
+    msg = (
+        f"[saved_vs_recomp dtype={dtype} scalar_gate={scalar_gate} {name}] "
+        f"max_abs_err={max_abs:.6e} rel_linf_err={rel_linf:.6e} "
+        f"rel_l2_err={rel_l2:.6e} max_rel_sig={max_rel_sig:.6e}"
+    )
+    logging.info(msg)
+    print(msg)
+    assert compare_tensor(
+        name,
+        g_recomp,
+        g_saved,
+        atol=1e-4 if dtype == jnp.bfloat16 else 1e-5,
+        rtol=1e-3 if dtype == jnp.bfloat16 else 1e-5,
+        dtype=dtype,
+    ), f"Mismatch in {name} between saved v_new and recomputed v_new"
+
+
+class _ShardPlugin:
+
+  def pytest_collection_modifyitems(self, items):
+    import os
+
+    status_file = os.environ.get("TEST_SHARD_STATUS_FILE")
+    if status_file:
+      with open(status_file, "w") as f:
+        f.write("")
+    total = int(os.environ.get("TEST_TOTAL_SHARDS", "1"))
+    idx = int(os.environ.get("TEST_SHARD_INDEX", "0"))
+    if total > 1:
+      items[:] = [item for i, item in enumerate(items) if i % total == idx]
+
+
 if __name__ == "__main__":
-  pytest.main([__file__, "-v"])
+  import sys
+  from absl import app
+
+  app.run(
+      lambda argv: sys.exit(
+          pytest.main([__file__, "-v"], plugins=[_ShardPlugin()])
+      )
+  )
