@@ -18,8 +18,8 @@ from collections.abc import Sequence
 import dataclasses
 from typing import Any
 import jax
-from tokamax._src.ops.experimental.tpu.splash_attention import base as jax_base
-from tokamax._src.ops.experimental.tpu.splash_attention import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.splash_attention import base as jax_base
+from tokamax._src.ops.splash_attention import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops.splash_attention import torch_base
 from tokamax.experimental.torch_tpu.ops.splash_attention import torch_pallas_mosaic_tpu_vjp
 import torch

@@ -391,19 +391,19 @@ SHARDS: ShardMap = {
     # ~10m; going further needs pytest-split, or a smaller grid upstream.
     'splash-kernel': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_test.py',
+            'tokamax/_src/ops/splash_attention/splash_attention_kernel_test.py',
         ),
         minutes=46,
     ),
     'splash-misc': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/splash_attention/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/splash_attention/base_test.py',
-            'tokamax/_src/ops/experimental/tpu/splash_attention/pallas_mosaic_tpu_test.py',
-            'tokamax/_src/ops/experimental/tpu/splash_attention/ring_attention_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_sharded_test.py',
-            'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_mask_test.py',
-            'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_segments_test.py',
+            'tokamax/_src/ops/splash_attention/api_test.py',
+            'tokamax/_src/ops/splash_attention/base_test.py',
+            'tokamax/_src/ops/splash_attention/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/splash_attention/ring_attention_kernel_test.py',
+            'tokamax/_src/ops/splash_attention/splash_attention_kernel_sharded_test.py',
+            'tokamax/_src/ops/splash_attention/splash_attention_mask_test.py',
+            'tokamax/_src/ops/splash_attention/splash_attention_segments_test.py',
         ),
         minutes=2,
     ),

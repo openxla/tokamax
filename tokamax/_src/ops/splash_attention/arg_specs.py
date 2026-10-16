@@ -18,7 +18,7 @@ from typing import Any, Final
 import jax
 import jax.numpy as jnp
 from tokamax._src.autotuning import arg_spec
-from tokamax._src.ops.experimental.tpu.splash_attention import base
+from tokamax._src.ops.splash_attention import base
 
 ShapeDtype = jax.ShapeDtypeStruct
 Mask = base.Mask

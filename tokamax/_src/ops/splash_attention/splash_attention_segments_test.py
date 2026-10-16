@@ -22,10 +22,10 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.splash_attention import base
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
+from tokamax._src.ops.splash_attention import base
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
 
 
 def _ids_from_lengths(lengths: tuple[int, ...]) -> np.ndarray:

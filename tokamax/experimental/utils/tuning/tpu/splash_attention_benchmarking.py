@@ -27,8 +27,8 @@ import jax
 from jax import random  # pylint: disable=g-importing-member
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 import tune_jax
 
 

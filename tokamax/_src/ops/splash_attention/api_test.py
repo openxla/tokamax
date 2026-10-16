@@ -22,10 +22,10 @@ import jax
 import jax.numpy as jnp
 from tokamax._src import hlo_utils
 from tokamax._src import numerics
-from tokamax._src.ops.experimental.tpu.splash_attention import api
-from tokamax._src.ops.experimental.tpu.splash_attention import base
-from tokamax._src.ops.experimental.tpu.splash_attention import reference
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import api
+from tokamax._src.ops.splash_attention import base
+from tokamax._src.ops.splash_attention import reference
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 
 
 class SplashAttentionApiTest(parameterized.TestCase):

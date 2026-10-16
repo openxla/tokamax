@@ -23,8 +23,8 @@ from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-
 import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
-from tokamax._src.ops.experimental.tpu.splash_attention import reference
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import reference
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 
 _Config = TypeVar("_Config")
 
