@@ -30,7 +30,6 @@ from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.gmm_v2 import gmm_v2
 from tokamax._src.ops.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_gather.pallas_mosaic_tpu_kernel import ragged_gather_pallas
-from tokamax._src.ops.ragged_scatter.pallas_mosaic_tpu_kernel import ragged_scatter_pallas
 
 P = sharding.PartitionSpec
 NamedSharding = sharding.NamedSharding
@@ -83,14 +82,11 @@ def ragged_permute_gmm(lhs, rhs, rhs_scale, group_sizes, gather_indices):
   )
 
 
-def ragged_gmm_unpermute(lhs, rhs, group_sizes, topk_argsort_revert_indices):
+def ragged_gmm_unpermute(lhs, rhs, group_sizes, topk_argsort_indices):
   out = gmm_v2.gmm_v2(lhs, rhs, group_sizes, zero_initialize=False)
-  return ragged_scatter_pallas(
-      out,
-      topk_argsort_revert_indices,
-      jnp.array(0, jnp.int32),
-      group_sizes.sum(),
-  )
+  mask = jnp.arange(out.shape[0]) < group_sizes.sum()
+  out = jnp.where(mask[:, None], out, 0)
+  return jnp.zeros_like(out).at[topk_argsort_indices].set(out)
 
 
 EP_AXIS = "model"
@@ -335,7 +331,6 @@ class RoutingGmmTest(parameterized.TestCase):
   @parameterized.named_parameters(*SHAPES)
   def test_gmm_unpermute_benchmark(self, **shape):
     self._setup_inputs(**shape)
-    topk_argsort_revert_indices = jnp.argsort(self.topk_argsort_indices)
     plain = benchmarking.standardize_function(
         gmm_v2.gmm_v2,
         self.lhs_gathered,
@@ -348,7 +343,7 @@ class RoutingGmmTest(parameterized.TestCase):
         self.lhs_gathered,
         self.rhs,
         self.group_sizes,
-        topk_argsort_revert_indices,
+        self.topk_argsort_indices,
     )
     fused = benchmarking.standardize_function(
         gmm.routing_gmm,

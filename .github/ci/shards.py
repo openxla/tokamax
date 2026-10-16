@@ -504,14 +504,6 @@ SHARDS: ShardMap = {
         ),
         minutes=6,
     ),
-    'ops-ragged-scatter': Spec(
-        paths=(
-            'tokamax/_src/ops/ragged_scatter/api_test.py',
-            'tokamax/_src/ops/ragged_scatter/base_test.py',
-            'tokamax/_src/ops/ragged_scatter/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=3,
-    ),
     'ops-flex-attention': Spec(
         paths=('tokamax/_src/ops/experimental/flex_attention/base_test.py',),
         minutes=2,

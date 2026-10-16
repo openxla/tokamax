@@ -66,8 +66,6 @@ from tokamax._src.ops.ragged_gather import api as ragged_gather_api
 from tokamax._src.ops.ragged_gather import base as ragged_gather_base
 from tokamax._src.ops.ragged_gather_reduce import api as ragged_gather_reduce_api
 from tokamax._src.ops.ragged_gather_reduce import base as ragged_gather_reduce_base
-from tokamax._src.ops.ragged_scatter import api as ragged_scatter_api
-from tokamax._src.ops.ragged_scatter import base as ragged_scatter_base
 from tokamax._src.ops.router_topk import api as router_topk_api
 from tokamax._src.ops.router_topk import base as router_topk_base
 from tokamax._src.ops.triangle_multiplication import api as triangle_multiplication_api
@@ -277,7 +275,6 @@ _API_IMPLEMENTATIONS: Final[
     normalization_base.Normalization: normalization_api.IMPLEMENTATIONS,
     glu_base.GatedLinearUnit: glu_api.IMPLEMENTATIONS,
     ragged_dot_base.RaggedDot: ragged_dot_api.IMPLEMENTATIONS,
-    ragged_scatter_base.RaggedScatter: ragged_scatter_api.IMPLEMENTATIONS,
     attention_base.DotProductAttention: attention_api.IMPLEMENTATIONS,
     mla_base.MultiHeadLatentAttention: mla_api.IMPLEMENTATIONS,
     ragged_gather_base.RaggedGather: ragged_gather_api.IMPLEMENTATIONS,
