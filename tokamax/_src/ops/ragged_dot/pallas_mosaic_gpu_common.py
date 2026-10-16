@@ -30,6 +30,7 @@ from tokamax._src import mosaic_gpu as mgpu_lib
 
 SMEM_CAPACITY_MAP = {
     "sm_120": (100 - 1) * 1024,
+    "sm_107": (228 - 1) * 1024,
     "sm_103": (228 - 1) * 1024,
     "sm_100": (228 - 1) * 1024,
     "sm_90": (228 - 1) * 1024,
@@ -175,9 +176,7 @@ def get_smem_capacity() -> int:
   device = backend.get_default_device()
 
   if device.platform != "gpu":
-    raise NotImplementedError(
-        f"Unsupported device platform: {device}"
-    )
+    raise NotImplementedError(f"Unsupported device platform: {device}")
   capacity = int(float(getattr(device, "compute_capability", 0)) * 10)
   sm_version = f"sm_{capacity}"
   if sm_version not in SMEM_CAPACITY_MAP:

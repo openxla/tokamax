@@ -60,6 +60,13 @@ class GpuUtilsTest(absltest.TestCase):
     self.assertTrue(gpu_utils.is_sm103(sm103_dev))
     self.assertTrue(gpu_utils.is_sm100(sm103_dev))
 
+  def test_is_sm107(self):
+    sm100_dev = mock.Mock(platform="gpu", compute_capability="10.0")
+    sm107_dev = mock.Mock(platform="gpu", compute_capability="10.7")
+    self.assertFalse(gpu_utils.is_sm107(sm100_dev))
+    self.assertTrue(gpu_utils.is_sm107(sm107_dev))
+    self.assertTrue(gpu_utils.is_sm100(sm107_dev))
+
   def test_has_tcgen05_int8_support(self):
     self.assertEqual(
         gpu_utils.has_tcgen05_int8_support(),
@@ -67,8 +74,10 @@ class GpuUtilsTest(absltest.TestCase):
     )
     sm100_dev = mock.Mock(platform="gpu", compute_capability="10.0")
     sm103_dev = mock.Mock(platform="gpu", compute_capability="10.3")
+    sm107_dev = mock.Mock(platform="gpu", compute_capability="10.7")
     self.assertTrue(gpu_utils.has_tcgen05_int8_support(sm100_dev))
     self.assertFalse(gpu_utils.has_tcgen05_int8_support(sm103_dev))
+    self.assertFalse(gpu_utils.has_tcgen05_int8_support(sm107_dev))
 
 
 if __name__ == "__main__":
