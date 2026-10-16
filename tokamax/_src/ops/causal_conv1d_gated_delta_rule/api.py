@@ -18,9 +18,11 @@ from typing import Final
 
 import immutabledict
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import base
+from tokamax._src.ops.fused_causal_conv1d_gated_delta_rule import fused_conv1d_gdn as fused_op
 
 _IMPLEMENTATIONS: dict[str, base.CausalConv1dGatedDeltaRule] = dict(
     xla=base.CausalConv1dGatedDeltaRule(),
+    fused=fused_op.FusedCausalConv1dGatedDeltaRule(),
 )
 
 try:
@@ -35,4 +37,3 @@ except ImportError:
 IMPLEMENTATIONS: Final[
     immutabledict.immutabledict[str, base.CausalConv1dGatedDeltaRule]
 ] = immutabledict.immutabledict(_IMPLEMENTATIONS)
-
