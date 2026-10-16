@@ -39,6 +39,14 @@ def _tpu_older_than_7x() -> bool:
   )
 
 
+def _is_tpu8i() -> bool:
+  """Whether the default device is a TPU8i, whose SparseCore has 4 subcores."""
+  return (
+      backend.get_default_device().platform == "tpu"
+      and pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_8I
+  )
+
+
 hp.settings.register_profile(
     name="deterministic",
     database=None,
@@ -76,6 +84,8 @@ class PallasTpuRaggedGatherReduceTest(test_base.RaggedGatherReduceTestBase):
   @parameterized.parameters(1024, 2048, 4096)
   def test_autotuning_configs(self, hidden_size):
     """Checks every autotuning config matches the reference."""
+    if _is_tpu8i() and hidden_size == 4096:
+      self.skipTest("TPU8i's 4 SparseCore subcores allow only one config.")
     reduce_group_size = 8
     # 64 MiB of `x`, so the op runs the kernel rather than its XLA fallback.
     x, indices, topk_weights, valid_rows_mask = test_base.make_inputs(
@@ -170,6 +180,12 @@ class PallasTpuRaggedGatherReduceTest(test_base.RaggedGatherReduceTestBase):
       (64, 1, 1024, "all", 1, 8, 0),
   )
   def test_kernel_matches_reference_examples(self, *args):
+    num_column_partitions = args[5]
+    if _is_tpu8i() and num_column_partitions in (8, 16):
+      self.skipTest(
+          f"{num_column_partitions=} doesn't divide TPU8i's 4 SparseCore"
+          " subcores."
+      )
     self._check_kernel_matches_reference(*args)
 
   @parameterized.product(
