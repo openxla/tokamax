@@ -418,30 +418,10 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
     )
 
   x_dtype = lhs.qtype
-  try:
-    swizzle = plgpu.find_swizzle(block_k * jnp.dtype(x_dtype).itemsize * 8)
-  except ValueError as e:
-    raise NotImplementedError("No possible swizzle.") from e
-
-  swizzle_elems = swizzle // jnp.dtype(x_dtype).itemsize
-
-  try:
-    transforms = (
-        plgpu.TilingTransform((8, swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle),
-    )
-  except ValueError as e:
-    raise NotImplementedError(
-        f"{swizzle=} {swizzle_elems=} unsupported."
-    ) from e
-
-  w_elem_bits = 4
-  try:
-    w_swizzle = plgpu.find_swizzle(block_k * w_elem_bits)  # n,k
-  except ValueError as e:
-    raise NotImplementedError("No possible swizzle.") from e
-
-  w_swizzle_elems = (w_swizzle * 8) // w_elem_bits
+  x_smem_shape = (data_stages, block_m, block_k)
+  w_smem_shape = (data_stages, block_n, block_k)
+  x_smem = common.tiled_swizzled_smem(x_smem_shape, x_dtype, "x")
+  w_smem = common.tiled_swizzled_smem(w_smem_shape, w.dtype, "w")
 
   x, scales = lhs.qvalue, lhs.scale
   expected_d = k_x // tile_k
@@ -853,19 +833,6 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
           )
 
   def kernel_entry(*refs):
-    x_smem = plgpu.SMEM(
-        (data_stages, block_m, block_k),
-        dtype=x_dtype,
-        transforms=transforms,
-    )
-    w_smem = plgpu.SMEM(
-        (data_stages, block_n, block_k),
-        dtype=w.dtype,
-        transforms=(
-            plgpu.TilingTransform((8, w_swizzle_elems)),
-            plgpu.SwizzleTransform(w_swizzle),
-        ),
-    )
     w_tmem = plgpu.TMEM(
         (block_n, deq_stages * block_k),
         dtype=x_dtype,
@@ -884,19 +851,10 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         (scale_stages, max(cluster_block_m, 64)),
         dtype=x_sum.dtype,
     )
+    out_smem_shape = (cluster_block_m, block_n)
     out_smem_dtype = epilogue_quant_dtype or out_dtype
-    out_smem = plgpu.SMEM(
-        (cluster_block_m, block_n),
-        dtype=out_smem_dtype,
-        # workaround for ValueError: Dynamic slice base index (which is a
-        # dynamic value) cannot be statically proven to be divisible by
-        # the tiling (8)
-        transforms=(
-            plgpu.TilingTransform(
-                (1, 128 // jnp.dtype(out_smem_dtype).itemsize)
-            ),
-            plgpu.SwizzleTransform(128),
-        ),
+    out_smem = common.tiled_swizzled_smem(
+        out_smem_shape, out_smem_dtype, "out", swizzle=128, tiling_prefix=(1,)
     )
     acc_tmem = plgpu.TMEM(
         (block_n, acc_stages * cluster_block_m),

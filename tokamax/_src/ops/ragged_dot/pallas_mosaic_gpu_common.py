@@ -26,6 +26,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 import pydantic
+from tokamax._src import mosaic_gpu as mgpu_lib
 
 SMEM_CAPACITY_MAP = {
     "sm_120": (100 - 1) * 1024,
@@ -150,6 +151,23 @@ class GroupInfo:
         task_valid_starts - task_starts,
         task_valid_size,
     )
+
+
+def tiled_swizzled_smem(
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike,
+    what: str = "",
+    *,
+    swizzle: int | None = None,
+    tiling_prefix: tuple[int, ...] = (8,),
+) -> pl.MemoryRef:
+  """Returns a tiled and swizzled SMEM reference."""
+  try:
+    return mgpu_lib.tiled_swizzled_smem(
+        shape, dtype, what, swizzle=swizzle, tiling_prefix=tiling_prefix
+    )
+  except ValueError as e:
+    raise NotImplementedError("No possible swizzle.") from e
 
 
 def get_smem_capacity() -> int:

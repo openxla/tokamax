@@ -206,14 +206,15 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
         num_barriers=2, orders_tensor_core=True
     )
 
-  tiled_smem = mgpu_lib.tiled_swizzled_smem
+  x_smem_shape = (num_stages, block_m, block_k)
+  w_smem_shape = (num_stages, block_n, block_k)
   scratch_shapes = dict(
-      x_smem=tiled_smem((num_stages, block_m, block_k), lhs.dtype, "x"),
-      w_smem=tiled_smem((num_stages, block_n, block_k), rhs.dtype, "w"),
+      x_smem=common.tiled_swizzled_smem(x_smem_shape, lhs.dtype, "x"),
+      w_smem=common.tiled_swizzled_smem(w_smem_shape, rhs.dtype, "w"),
       acc_tmem=plgpu.TMEM(
           (block_n, cluster_block_m * 2), jnp.float32, collective=collective
       ),
-      acc_smem=tiled_smem(
+      acc_smem=common.tiled_swizzled_smem(
           (cluster_block_m, block_n), out_dtype, "acc", tiling_prefix=(1,)
       ),
       xw_barrier=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),

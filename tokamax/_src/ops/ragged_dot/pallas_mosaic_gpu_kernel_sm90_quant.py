@@ -303,17 +303,11 @@ def ragged_dot_quantized_kernel(
   if out_swizzle_elems != block_n:
     raise NotImplementedError(f"{out_swizzle_elems=} must equal {block_n=}")
 
-  def tiled_smem(*args):
-    try:
-      return mgpu_lib.tiled_swizzled_smem(*args)
-    except ValueError as e:
-      raise NotImplementedError from e
-
+  x_smem_shape = (num_stages, block_m, block_k)
+  w_smem_shape = (num_stages, _COMPUTE_WGS * block_n, block_k)
   scratch_shapes = dict(
-      x_smem=tiled_smem((num_stages, block_m, block_k), x.dtype, "x"),
-      w_smem=tiled_smem(
-          (num_stages, _COMPUTE_WGS * block_n, block_k), w.dtype, "w"
-      ),
+      x_smem=common.tiled_swizzled_smem(x_smem_shape, x.dtype, "x"),
+      w_smem=common.tiled_swizzled_smem(w_smem_shape, w.dtype, "w"),
       w_scales_smem=plgpu.SMEM(
           (num_stages, _COMPUTE_WGS * block_n), w_scales.dtype
       ),
