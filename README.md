@@ -46,7 +46,7 @@ pip install git+https://github.com/openxla/tokamax.git
 
 ### Usage Examples
 
-Please see the Colab notebook [here](https://openxla.org/tokamax/tokamax_demo)
+Please see the Colab notebooks [here](https://openxla.org/tokamax/tokamax_demos)
 for usage examples.
 
 ### Contributing

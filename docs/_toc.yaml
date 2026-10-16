@@ -31,7 +31,7 @@ toc:
     path: /tokamax/contributing
   - title: Code Style
     path: /tokamax/code_style
-- title: Demo Notebook
+- title: Demo Notebooks
   section:
-  - title: Tokamax Demo
-    path: /tokamax/tokamax_demo
+  - title: Tokamax Demos
+    path: /tokamax/tokamax_demos

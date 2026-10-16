@@ -54,7 +54,7 @@ Each operator family provides two callable singleton objects that share the same
 PyTorch call signature: a wrapper around the pure-XLA reference implementation
 to serve as the ground truth for correctness and numerics, and a wrapper around
 the high-performance Pallas kernel implementation. For a more in-depth example,
-please see the [demo colab](https://openxla.org/tokamax/tokamax_demo).
+please see the [demo colabs](https://openxla.org/tokamax/tokamax_demos).
 
 ### Kernel Configurations and Autotuning Cache
 
