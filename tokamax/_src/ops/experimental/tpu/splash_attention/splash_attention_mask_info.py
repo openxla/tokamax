@@ -22,7 +22,7 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 
 # mypy: ignore-errors
 

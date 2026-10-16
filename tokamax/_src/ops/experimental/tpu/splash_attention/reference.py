@@ -20,7 +20,7 @@ from typing import Final
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
 
 MaskInfo = mask_info_lib.MaskInfo
 

@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from tokamax._src.ops.splash_attention import base
+from tokamax._src.ops.experimental.tpu.splash_attention import base
 
 
 def test_device_matches(devices: list[str]) -> bool:

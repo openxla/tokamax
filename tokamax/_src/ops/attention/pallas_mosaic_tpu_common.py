@@ -21,8 +21,8 @@ from typing import Any, Final
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import base
-from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
-from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 
 NUM_LANES: Final[int] = 128
 

@@ -19,9 +19,9 @@ from typing import Any, Final, Literal
 import immutabledict
 import jax
 from jaxtyping import Array, Bool, Float
-from tokamax._src.ops.splash_attention import base
-from tokamax._src.ops.splash_attention import reference
-from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.experimental.tpu.splash_attention import base
+from tokamax._src.ops.experimental.tpu.splash_attention import reference
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
 
 type Implementation = Literal["mosaic_tpu", "base"]
 
@@ -31,7 +31,7 @@ _IMPLEMENTATIONS = dict(
 _DEFAULT_IMPLEMENTATIONS = ("base",)
 
 try:
-  from tokamax._src.ops.splash_attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.experimental.tpu.splash_attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS["mosaic_tpu"] = (
       pallas_mosaic_tpu.PallasMosaicTpuSplashAttention()

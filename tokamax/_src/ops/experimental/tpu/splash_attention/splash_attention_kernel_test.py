@@ -29,10 +29,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.splash_attention import base
-from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
-from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
-from tokamax._src.ops.splash_attention import splash_attention_test_utils as test_utils
+from tokamax._src.ops.experimental.tpu.splash_attention import base
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_test_utils as test_utils
 
 jax.config.parse_flags_with_absl()
 
