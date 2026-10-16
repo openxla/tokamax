@@ -293,20 +293,22 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
 
         if isinstance(grads, dict):
           grads_ba = ba.signature.bind_partial(**grads)
+          in_args = ba.signature.bind_partial(*args, **kwargs).arguments
         else:
           grads_ba = ba.signature.bind_partial(*grads)
+          in_args = kwargs
 
-        # Check that grads is tree with same structure as args.
-        dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
-
-        for k, v in kwargs.items():
-          if (dv := grads_ba.kwargs.get(k)) is None:
+        for k, v in in_args.items():
+          if (dv := grads_ba.arguments.get(k)) is None:
             # Set any missing grads to zeros.
             zeros_like = lambda x: jnp.zeros_like(x) if is_array(x) else x
             grads_ba.arguments[k] = jax.tree.map(zeros_like, v)
           else:
-            # Check that grads is tree with same structure as kwarg value.
+            # Check that grads is tree with same structure as arg/kwarg value.
             grads_ba.arguments[k] = jax.tree.map(lambda _, g: g, v, dv)
+
+        # Check that grads is tree with same structure as args.
+        dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
 
         return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
 
