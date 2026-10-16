@@ -58,5 +58,20 @@
       "metadata": {},
       "peak_memory_mb": 4.466688
     }
+  },
+  "{\"x\":\"bf16[16384,7168]\",\"indices\":\"i32[16384]\",\"topk_weights\":\"bf16[16384]\",\"valid_rows_mask\":\"bool[16384]\",\"reduce_group_size\":8,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 741.3059760001488,
+      "lower_time_ms": 16.041650000261143,
+      "evaluation_times_ms": [
+        0.455,
+        0.454,
+        0.454,
+        0.456,
+        0.453
+      ],
+      "metadata": {},
+      "peak_memory_mb": 499.3024
+    }
   }
 }
