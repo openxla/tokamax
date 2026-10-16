@@ -34,6 +34,56 @@ Integer = jt.Integer
 Real = jt.Real
 
 
+def _lane_aligned_range(dim: int, num_lanes: int) -> set[int]:
+  """Returns non-empty lane-aligned block-size candidates for `dim`."""
+  divisors = [
+      num_lanes + i * num_lanes
+      for i in range(32)
+      if dim % (num_lanes + i * num_lanes) == 0
+  ]
+  powers_of_two = [num_lanes * 2**i for i in range(6) if num_lanes * 2**i < dim]
+  return set(divisors + powers_of_two) or {num_lanes}
+
+
+def _get_autotuning_block_size_ranges(
+    b_dim: int, h_dim: int, v_dim: int
+) -> tuple[set[int], set[int], set[int]]:
+  """Returns non-empty lane-aligned (b, h, v) block-size candidate ranges.
+
+  All candidate block sizes are multiples of the TPU lane count. When a
+  dimension is smaller than the minimum block size (so no lane-aligned divisor
+  or smaller power-of-two multiple exists), its range falls back to the
+  minimum valid block size (`min_b_block_size` for `b_dim`, `num_lanes` for
+  `h_dim` and `v_dim`) so that autotuning still searches across the remaining
+  dimensions.
+
+  Args:
+    b_dim: Batch dimension size.
+    h_dim: Hidden dimension size.
+    v_dim: Vocabulary dimension size.
+  """
+  tpu_info = pltpu.get_tpu_info()
+  num_lanes = tpu_info.num_lanes
+  min_b_block_size = tpu_info.num_sublanes * num_lanes
+
+  b_block_size_range = set(
+      [
+          min_b_block_size + i * num_lanes
+          for i in range(32)
+          if b_dim % (min_b_block_size + i * num_lanes) == 0
+      ]
+      + [
+          min_b_block_size + i * 4 * num_lanes
+          for i in range(8)
+          if min_b_block_size + i * 4 * num_lanes < b_dim
+      ]
+  ) or {min_b_block_size}
+  h_block_size_range = _lane_aligned_range(h_dim, num_lanes)
+  v_block_size_range = _lane_aligned_range(v_dim, num_lanes)
+
+  return b_block_size_range, h_block_size_range, v_block_size_range
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     base.LinearSoftmaxCrossEntropyLoss[Config]
@@ -118,17 +168,8 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     b_dim, h_dim = x.shape
     v_dim = w.shape[1]
 
-    b_block_size_range = set(
-        [1024 + i * 128 for i in range(32) if b_dim % (1024 + i * 128) == 0]
-        + [1024 + i * 512 for i in range(8) if 1024 + i * 512 < b_dim]
-    )
-    h_block_size_range = set(
-        [128 + i * 128 for i in range(32) if h_dim % (128 + i * 128) == 0]
-        + [128 * 2**i for i in range(6) if 128 * 2**i < h_dim]
-    )
-    v_block_size_range = set(
-        [128 + i * 128 for i in range(32) if v_dim % (128 + i * 128) == 0]
-        + [128 * 2**i for i in range(6) if 128 * 2**i < v_dim]
+    b_block_size_range, h_block_size_range, v_block_size_range = (
+        _get_autotuning_block_size_ranges(b_dim, h_dim, v_dim)
     )
 
     vmem_limit_bytes = kernel._get_vmem_limit_bytes()
@@ -254,17 +295,8 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
     b_dim, h_dim = x.shape
     v_dim = w.shape[1]
 
-    b_block_size_range = set(
-        [1024 + i * 128 for i in range(32) if b_dim % (1024 + i * 128) == 0]
-        + [1024 + i * 512 for i in range(8) if 1024 + i * 512 < b_dim]
-    )
-    h_block_size_range = set(
-        [128 + i * 128 for i in range(32) if h_dim % (128 + i * 128) == 0]
-        + [128 * 2**i for i in range(6) if 128 * 2**i < h_dim]
-    )
-    v_block_size_range = set(
-        [128 + i * 128 for i in range(32) if v_dim % (128 + i * 128) == 0]
-        + [128 * 2**i for i in range(6) if 128 * 2**i < v_dim]
+    b_block_size_range, h_block_size_range, v_block_size_range = (
+        _get_autotuning_block_size_ranges(b_dim, h_dim, v_dim)
     )
 
     buffer_count_range = [(2, 2), (2, 3), (3, 2), (3, 3)]

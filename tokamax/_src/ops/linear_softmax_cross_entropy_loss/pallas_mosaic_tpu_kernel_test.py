@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import dataclasses
 import math
 from typing import Any
 from unittest import mock
@@ -25,6 +26,12 @@ from tokamax._src import numerics
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import pallas_mosaic_tpu_kernel as kernel
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import reference
+
+
+def setUpModule() -> None:
+  # Initialize the default backend so that every test shard touches the
+  # accelerator, including shards that only run host-side heuristic test cases.
+  jax.devices()
 
 
 def _skip_if_partial_blocks_on_old_jax(
@@ -318,6 +325,16 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
           testcase_name="fwd_bfloat16_sum_reduction_test",
           b_dim=4096,
           h_dim=512,
+          v_dim=2048,
+          reduction="sum",
+          dtype=jnp.bfloat16,
+      ),
+      dict(
+          # h_dim is a multiple of num_sublanes (8) but not of the bf16 sublane
+          # tiling (16).
+          testcase_name="fwd_bfloat16_h_not_multiple_of_sublane_tiling_test",
+          b_dim=4096,
+          h_dim=1288,
           v_dim=2048,
           reduction="sum",
           dtype=jnp.bfloat16,
@@ -1278,6 +1295,251 @@ class SafeInputOutputBufferCountTest(parameterized.TestCase):
   ):
     actual = kernel._safe_input_output_buffer_count(requested, revisit_distance)
     self.assertEqual(actual, expected)
+
+
+def _mock_tpu_info(**overrides: int) -> kernel.pltpu.TpuInfo:
+  """Returns a hermetic TpuInfo based on TPU v6e with the given overrides.
+
+  Uses `get_tpu_info_for_chip` rather than `get_tpu_info` so that tests do not
+  depend on (or fail without) the physical device the test runs on.
+
+  Args:
+    **overrides: TpuInfo fields to override (e.g. `num_lanes=256`).
+  """
+  base_info = kernel.pltpu.get_tpu_info_for_chip(
+      kernel.pltpu.ChipVersion.TPU_V6E, 1
+  )
+  overrides.setdefault("vmem_capacity_bytes", 128 * 1024 * 1024)
+  return dataclasses.replace(base_info, **overrides)
+
+
+class TpuLaneAndSublaneAlignmentTest(parameterized.TestCase):
+  """Tests heuristics and validation on TPUs with non-default lane counts."""
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="default_mxu",
+          b_dim=2048,
+          h_dim=384,
+          v_dim=384,
+          tpu_overrides={},
+          vmem_limit_bytes=None,
+          dtype=jnp.float32,
+      ),
+      dict(
+          testcase_name="raw_h_dim_max_below_num_lanes",
+          b_dim=2048,
+          h_dim=384,
+          v_dim=384,
+          tpu_overrides=dict(mxu_column_size=128, num_mxus=1),
+          vmem_limit_bytes=None,
+          dtype=jnp.float32,
+      ),
+      dict(
+          testcase_name="raw_h_dim_max_not_multiple_of_num_lanes",
+          b_dim=2048,
+          h_dim=1008,
+          v_dim=1000,
+          tpu_overrides=dict(mxu_column_size=128, num_mxus=3),
+          vmem_limit_bytes=None,
+          dtype=jnp.float32,
+      ),
+      dict(
+          testcase_name="h_dim_768",
+          b_dim=2048,
+          h_dim=768,
+          v_dim=4096,
+          tpu_overrides={},
+          vmem_limit_bytes=None,
+          dtype=jnp.bfloat16,
+      ),
+      dict(
+          testcase_name="two_h_block_avoidance",
+          b_dim=2048,
+          h_dim=1024,
+          v_dim=4096,
+          tpu_overrides={},
+          vmem_limit_bytes=None,
+          dtype=jnp.bfloat16,
+      ),
+      dict(
+          testcase_name="small_dims",
+          b_dim=512,
+          h_dim=128,
+          v_dim=128,
+          tpu_overrides={},
+          vmem_limit_bytes=None,
+          dtype=jnp.float32,
+      ),
+      dict(
+          testcase_name="non_power_of_two_batch",
+          b_dim=1280,
+          h_dim=1280,
+          v_dim=2816,
+          tpu_overrides={},
+          vmem_limit_bytes=None,
+          dtype=jnp.bfloat16,
+      ),
+      dict(
+          testcase_name="tight_vmem_fallback",
+          b_dim=2048,
+          h_dim=1024,
+          v_dim=4096,
+          tpu_overrides={},
+          vmem_limit_bytes=1024,
+          dtype=jnp.float32,
+      ),
+      dict(
+          testcase_name="num_lanes_384",
+          b_dim=4608,
+          h_dim=768,
+          v_dim=1536,
+          tpu_overrides=dict(num_lanes=384),
+          vmem_limit_bytes=None,
+          dtype=jnp.float32,
+      ),
+  )
+  def test_heuristic_respects_custom_tpu_lane_count(
+      self,
+      b_dim: int,
+      h_dim: int,
+      v_dim: int,
+      tpu_overrides: dict[str, int],
+      vmem_limit_bytes: int | None,
+      dtype: jnp.dtype,
+  ) -> None:
+    """Heuristic block sizes are positive, lane-aligned, and pass validation."""
+    overrides = dict(num_lanes=256, num_sublanes=16)
+    overrides.update(tpu_overrides)
+    mock_tpu_info = _mock_tpu_info(**overrides)
+    num_lanes = mock_tpu_info.num_lanes
+    x = jnp.zeros((b_dim, h_dim), dtype=dtype)
+    labels = jnp.zeros((b_dim,), dtype=jnp.int32)
+    w = jnp.zeros((h_dim, v_dim), dtype=dtype)
+
+    with mock.patch.object(
+        kernel.pltpu, "get_tpu_info", return_value=mock_tpu_info
+    ):
+      fwd_cfg = kernel.get_heuristic_fwd_config(
+          b_dim, h_dim, v_dim, dtype=dtype, vmem_limit_bytes=vmem_limit_bytes
+      )
+      bwd_cfg = kernel.get_heuristic_bwd_config(
+          b_dim, h_dim, v_dim, dtype=dtype, vmem_limit_bytes=vmem_limit_bytes
+      )
+      for name, cfg in (("fwd", fwd_cfg), ("bwd", bwd_cfg)):
+        with self.subTest(name):
+          self.assertGreaterEqual(
+              cfg.b_block_size, mock_tpu_info.num_sublanes * num_lanes
+          )
+          self.assertGreater(cfg.h_block_size, 0)
+          self.assertGreater(cfg.v_block_size, 0)
+          self.assertEqual(cfg.b_block_size % num_lanes, 0)
+          self.assertEqual(cfg.h_block_size % num_lanes, 0)
+          self.assertEqual(cfg.v_block_size % num_lanes, 0)
+          # Must not raise.
+          kernel.validate_inputs(
+              x,
+              labels,
+              w,
+              b_block_size=cfg.b_block_size,
+              h_block_size=cfg.h_block_size,
+              v_block_size=cfg.v_block_size,
+          )
+
+  def test_heuristic_avoids_two_h_blocks_in_bwd(self) -> None:
+    """The 2-H-block bwd avoidance never yields 2 lane-aligned blocks."""
+    mock_tpu_info = _mock_tpu_info(num_lanes=256, num_sublanes=16)
+    with mock.patch.object(
+        kernel.pltpu, "get_tpu_info", return_value=mock_tpu_info
+    ):
+      fwd_cfg = kernel.get_heuristic_fwd_config(
+          2048, 1024, 4096, dtype=jnp.dtype(jnp.bfloat16)
+      )
+      bwd_cfg = kernel.get_heuristic_bwd_config(
+          2048, 1024, 4096, dtype=jnp.dtype(jnp.bfloat16)
+      )
+    # Precondition: the forward heuristic picks 2 H blocks for this shape.
+    self.assertEqual(math.ceil(1024 / fwd_cfg.h_block_size), 2)
+    self.assertNotEqual(math.ceil(1024 / bwd_cfg.h_block_size), 2)
+    self.assertEqual(bwd_cfg.h_block_size % 256, 0)
+
+  def test_validate_inputs_enforces_lane_alignment(self) -> None:
+    """validate_inputs enforces custom lane and sublane alignment."""
+    mock_tpu_info = _mock_tpu_info(num_lanes=256, num_sublanes=16)
+    x = jnp.zeros((1024, 256), dtype=jnp.float32)
+    labels = jnp.zeros((1024,), dtype=jnp.int32)
+    w = jnp.zeros((256, 1024), dtype=jnp.float32)
+
+    with mock.patch.object(
+        kernel.pltpu, "get_tpu_info", return_value=mock_tpu_info
+    ):
+      # 256-lane / 16-sublane aligned inputs should pass without raising,
+      # including b_block_size < 1024.
+      cfg_small_b = kernel.Config(
+          b_block_size=256, h_block_size=256, v_block_size=256
+      )
+      kernel.validate_inputs(
+          x,
+          labels,
+          w,
+          b_block_size=cfg_small_b.b_block_size,
+          h_block_size=cfg_small_b.h_block_size,
+          v_block_size=cfg_small_b.v_block_size,
+      )
+      kernel.validate_inputs(
+          x, labels, w, b_block_size=1280, h_block_size=512, v_block_size=768
+      )
+      # Non-positive or 128-aligned (not 256-aligned) should raise ValueError.
+      for bad_b in (0, -256, 1152):
+        with self.assertRaisesRegex(
+            ValueError, r"b_block_size must be a positive multiple of 256"
+        ):
+          kernel.validate_inputs(
+              x,
+              labels,
+              w,
+              b_block_size=bad_b,
+              h_block_size=256,
+              v_block_size=256,
+          )
+      for bad_h in (0, -256, 128):
+        with self.assertRaisesRegex(
+            ValueError, r"h_block_size must be a positive multiple of 256"
+        ):
+          kernel.validate_inputs(
+              x,
+              labels,
+              w,
+              b_block_size=1024,
+              h_block_size=bad_h,
+              v_block_size=256,
+          )
+      for bad_v in (0, -256, 128):
+        with self.assertRaisesRegex(
+            ValueError, r"v_block_size must be a positive multiple of 256"
+        ):
+          kernel.validate_inputs(
+              x,
+              labels,
+              w,
+              b_block_size=1024,
+              h_block_size=256,
+              v_block_size=bad_v,
+          )
+      # 8-aligned but not 16-aligned sublane dimension should raise ValueError
+      w_bad_h = jnp.zeros((248, 1024), dtype=jnp.float32)
+      x_bad_h = jnp.zeros((1024, 248), dtype=jnp.float32)
+      with self.assertRaisesRegex(
+          ValueError, r"hidden dimension of w must be a multiple of 16, got 248"
+      ):
+        kernel.validate_inputs(
+            x_bad_h,
+            labels,
+            w_bad_h,
+            b_block_size=1024,
+            h_block_size=256,
+            v_block_size=256,
+        )
 
 
 class InputOutputBufferCountTest(parameterized.TestCase):

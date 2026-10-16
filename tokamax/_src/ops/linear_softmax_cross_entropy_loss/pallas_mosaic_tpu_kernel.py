@@ -15,15 +15,15 @@
 
 """Linear Cross-Entropy kernel implementation."""
 
+import dataclasses
 import functools
 import math
-from typing import Annotated, Literal, Sequence
+from typing import Literal, Sequence
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import jaxtyping as jt
-import pydantic
 
 Array = jt.Array
 Integer = jt.Integer
@@ -34,7 +34,7 @@ partial = functools.partial
 reduce = functools.reduce
 
 
-@pydantic.dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Config:
   """The configuration specific for the Pallas Mosaic TPU kernel.
 
@@ -48,9 +48,9 @@ class Config:
       input_output buffers are single-buffered (buffer_count=1).
   """
 
-  b_block_size: Annotated[int, pydantic.Field(ge=1024, multiple_of=128)] = 1024
-  h_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 512
-  v_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 2048
+  b_block_size: int = 1024
+  h_block_size: int = 512
+  v_block_size: int = 2048
   buffer_count: tuple[int, int] | int = (2, 2)
 
 
@@ -237,25 +237,34 @@ def _get_heuristic_config(
       else _calculate_fwd_vmem_bytes
   )
   dtype_bytes = jnp.dtype(dtype).itemsize
+  tpu_info = pltpu.get_tpu_info()
+  num_lanes = tpu_info.num_lanes
 
-  # 1. Choose b_block_size: needs at least 1024, multiple of 128.
-  # Prefer b_block_size such that b_dim % b_block_size == 0.
+  # 1. Choose b_block_size: needs at least num_sublanes * num_lanes, multiple of
+  # num_lanes. Prefer b_block_size such that b_dim % b_block_size == 0.
+  min_b_block_size = tpu_info.num_sublanes * num_lanes
   b_candidates = [
-      b for b in range(1024, max(1025, b_dim + 1), 128) if b_dim % b == 0
+      b
+      for b in range(
+          min_b_block_size, max(min_b_block_size + 1, b_dim + 1), num_lanes
+      )
+      if b_dim % b == 0
   ]
   if b_candidates:
     b_block_size = b_candidates[0]
   else:
-    b_block_size = 1024
+    b_block_size = min_b_block_size
 
-  # 2. Choose h_block_size: at least 128, multiple of 128, close to h_dim_max.
-  # Prefer h_block_size such that h_dim % h_block_size == 0.
-  h_dim_max = (
-      pltpu.get_tpu_info().mxu_column_size
-      * pltpu.get_tpu_info().num_mxus
-  )
+  # 2. Choose h_block_size: at least num_lanes, multiple of num_lanes, close to
+  # h_dim_max. Prefer h_block_size such that h_dim % h_block_size == 0.
+  # Align h_dim_max down to a multiple of num_lanes (and at least num_lanes) so
+  # that the fallbacks below always produce a lane-aligned h_block_size.
+  raw_h_dim_max = tpu_info.mxu_column_size * tpu_info.num_mxus
+  h_dim_max = max(num_lanes, (raw_h_dim_max // num_lanes) * num_lanes)
   h_candidates = [
-      h for h in range(128, max(129, h_dim + 1), 128) if h_dim % h == 0
+      h
+      for h in range(num_lanes, max(num_lanes + 1, h_dim + 1), num_lanes)
+      if h_dim % h == 0
   ]
   if h_candidates:
     h_block_size = min(
@@ -268,7 +277,7 @@ def _get_heuristic_config(
   else:
     if h_dim < h_dim_max:
       h_candidates_non_div = [
-          h for h in range(128, h_dim_max + 1, 128) if h >= h_dim
+          h for h in range(num_lanes, h_dim_max + 1, num_lanes) if h >= h_dim
       ]
       if h_candidates_non_div:
         h_block_size = min(
@@ -291,25 +300,28 @@ def _get_heuristic_config(
   # the single-buffered output fallback (2, 1), which forces a synchronous
   # HBM write-back and reload on every grid step.
   # To avoid this fallback:
-  # 1. Prefer 1 H block (round_up(h_dim, 128)) if it fits VMEM with a
-  #    reasonable v_block_size (>= 512). This measured fastest in hardware
-  #    sweeps by eliminating cross-step hazards and keeping all of H resident
-  #    in VMEM.
+  # 1. Prefer 1 H block (round_up(h_dim, num_lanes)) if it fits VMEM with a
+  #    reasonable v_block_size (>= 4 * num_lanes).
+  #    This measured fastest in hardware sweeps by eliminating cross-step
+  #    hazards and keeping all of H resident in VMEM.
   # 2. Otherwise fall back to a 4-block geometry
-  #    (round_up(ceil(h_dim / 4), 128)), which ensures num_h_blocks >= 3
+  #    (round_up(ceil(h_dim / 4), num_lanes)), which ensures num_h_blocks >= 3
   #    (revisit_distance >= 3) while keeping VMEM per tile small.
   if is_bwd and math.ceil(h_dim / h_block_size) == 2:
-    h_one_block = int(math.ceil(h_dim / 128) * 128)
+    h_one_block = int(math.ceil(h_dim / num_lanes) * num_lanes)
+    min_v_trial = 4 * num_lanes
     if (
-        calc_vmem_fn(b_block_size, h_one_block, 512, dtype=dtype)
+        calc_vmem_fn(b_block_size, h_one_block, min_v_trial, dtype=dtype)
         <= vmem_limit_bytes
     ):
       h_block_size = h_one_block
     else:
-      h_block_size = max(128, int(math.ceil(h_dim / 4 / 128) * 128))
+      h_block_size = max(
+          num_lanes, int(math.ceil(h_dim / 4 / num_lanes) * num_lanes)
+      )
 
   # 3. Choose v_block_size: as large as possible to fit VMEM.
-  # Must be >= 128, multiple of 128. Divisible by v_dim if possible.
+  # Must be >= num_lanes, multiple of num_lanes. Divisible by v_dim if possible.
   h_alloc = 1 << (h_block_size - 1).bit_length()
   if is_bwd:
     # Note: grad_bytes is an upper bound when single-buffered output fallback
@@ -354,15 +366,12 @@ def _get_heuristic_config(
   if vmem_limit_bytes > fixed_bytes:
     max_v_vmem = (vmem_limit_bytes - fixed_bytes) // per_v_bytes
   else:
-    max_v_vmem = 128
+    max_v_vmem = num_lanes
 
   max_v = min(v_dim, max_v_vmem)
-  max_v_aligned = max(128, (max_v // 128) * 128)
+  max_v_aligned = max(num_lanes, (max_v // num_lanes) * num_lanes)
 
-  try:
-    max_cores = pltpu.get_tpu_info().num_cores
-  except Exception:  # pylint: disable=broad-except
-    max_cores = 1
+  max_cores = tpu_info.num_cores
 
   def is_mc_compatible(v: int) -> bool:
     if max_cores <= 1:
@@ -373,7 +382,7 @@ def _get_heuristic_config(
   # 1. First try to find a divisor of v_dim that fits in VMEM and is multi-core
   # compatible.
   v_block_size = None
-  for v in range(max_v_aligned, 127, -128):
+  for v in range(max_v_aligned, num_lanes - 1, -num_lanes):
     if (
         v_dim % v == 0
         and is_mc_compatible(v)
@@ -383,9 +392,10 @@ def _get_heuristic_config(
       v_block_size = v
       break
 
-  # 2. If no divisor fits, pick a multiple of 128 that is multi-core compatible
+  # 2. If no divisor fits, pick a multiple of num_lanes that is multi-core
+  # compatible
   if v_block_size is None:
-    for v in range(max_v_aligned, 127, -128):
+    for v in range(max_v_aligned, num_lanes - 1, -num_lanes):
       if (
           is_mc_compatible(v)
           and calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype)
@@ -396,7 +406,7 @@ def _get_heuristic_config(
 
   # 3. Fallback: try divisor of v_dim that fits in VMEM
   if v_block_size is None:
-    for v in range(max_v_aligned, 127, -128):
+    for v in range(max_v_aligned, num_lanes - 1, -num_lanes):
       if (
           v_dim % v == 0
           and calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype)
@@ -405,9 +415,9 @@ def _get_heuristic_config(
         v_block_size = v
         break
 
-  # 4. Fallback: pick the largest multiple of 128 that fits
+  # 4. Fallback: pick the largest multiple of num_lanes that fits
   if v_block_size is None:
-    for v in range(max_v_aligned, 127, -128):
+    for v in range(max_v_aligned, num_lanes - 1, -num_lanes):
       if (
           calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype)
           <= vmem_limit_bytes
@@ -415,7 +425,7 @@ def _get_heuristic_config(
         v_block_size = v
         break
     if v_block_size is None:
-      v_block_size = 128
+      v_block_size = num_lanes
 
   return Config(
       b_block_size=b_block_size,
@@ -465,12 +475,12 @@ def get_heuristic_bwd_config(
 
 def validate_inputs(
     x: Real[Array, "B H"],
-    labels: Real[Array, "B V"],
+    labels: Integer[Array, "B"],
     w: Real[Array, "H V"],
     b_block_size: int,
-    h_block_size: int,  # pylint: disable=unused-argument
-    v_block_size: int,  # pylint: disable=unused-argument
-):
+    h_block_size: int,
+    v_block_size: int,
+) -> None:
   """Validates the inputs to the kernels.
 
   Validate inputs and raise ValueError if the inputs are invalid.
@@ -488,7 +498,23 @@ def validate_inputs(
   Raises:
     ValueError: If the inputs are invalid.
   """
-  del b_block_size  # Currently unused.
+  tpu_info = pltpu.get_tpu_info()
+  num_lanes = tpu_info.num_lanes
+  if b_block_size <= 0 or b_block_size % num_lanes != 0:
+    raise ValueError(
+        f"b_block_size must be a positive multiple of {num_lanes}, got"
+        f" {b_block_size}."
+    )
+  if h_block_size <= 0 or h_block_size % num_lanes != 0:
+    raise ValueError(
+        f"h_block_size must be a positive multiple of {num_lanes}, got"
+        f" {h_block_size}."
+    )
+  if v_block_size <= 0 or v_block_size % num_lanes != 0:
+    raise ValueError(
+        f"v_block_size must be a positive multiple of {num_lanes}, got"
+        f" {v_block_size}."
+    )
 
   if labels.shape[0] != x.shape[0]:
     raise ValueError(
@@ -502,8 +528,12 @@ def validate_inputs(
         f" w hidden dimension ({w.shape[0]})."
     )
 
-  if w.shape[0] % 8 != 0:
-    raise ValueError("The hidden dimension of w must be a multiple of 8")
+  num_sublanes = tpu_info.num_sublanes
+  if w.shape[0] % num_sublanes != 0:
+    raise ValueError(
+        f"The hidden dimension of w must be a multiple of {num_sublanes}, got"
+        f" {w.shape[0]}."
+    )
 
 
 @jax.named_scope("calculate_xw_tiled")
