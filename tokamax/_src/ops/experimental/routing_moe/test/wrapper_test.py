@@ -417,8 +417,6 @@ class MoEKernelTest(parameterized.TestCase):
       use_sp=[True, False],
   )
   def test_benchmark_qwen_235(self, use_ep, use_sp):
-    if use_ep:
-      self.skipTest("TODO: Support N/K tiling in routing_moe.")
     num_experts = 128
     top_k = 8
     hidden_size = 4096
@@ -485,8 +483,6 @@ class MoEKernelTest(parameterized.TestCase):
       use_sp,
       active_expert_ratio,
   ):
-    if use_ep:
-      self.skipTest("TODO: Support N/K tiling in routing_moe.")
     if len(self.mesh_devices) < 8:
       self.skipTest("Skipping due to insufficient number of chips.")
     num_experts = 160
@@ -538,8 +534,6 @@ class MoEKernelTest(parameterized.TestCase):
       use_sp,
       active_expert_ratio,
   ):
-    if use_ep:
-      self.skipTest("TODO: Support EP and N/K tiling in routing_moe.")
     if len(self.mesh_devices) < 8:
       self.skipTest("Skipping due to insufficient number of chips.")
     num_experts = 128

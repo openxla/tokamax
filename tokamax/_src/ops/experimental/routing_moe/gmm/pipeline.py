@@ -18,11 +18,11 @@
 import dataclasses
 import functools
 
+import jax
 from jax import lax
 from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.gmm import compute
 from tokamax._src.ops.experimental.routing_moe.gmm import config
@@ -36,6 +36,8 @@ def inner_pipeline(
     *,
     x_bref: memory_ref.RoutingBufferedRef,
     out_bref: memory_ref.RoutingBufferedRef,
+    x_hbm_ref: hijax.TransformedRef,
+    out_hbm_ref: hijax.TransformedRef,
     metadata_ref: metadata.MetadataRef,
     cfg: config.RoutingGmmConfig,
 ) -> None:
@@ -47,25 +49,31 @@ def inner_pipeline(
     x_bref: BufferedRef for the input activation used for manual DMA scheduling.
     out_bref: BufferedRef for the output activation used for manual DMA
       scheduling.
+    x_hbm_ref: HBM reference of the input activation.
+    out_hbm_ref: HBM reference of the output activation.
     metadata_ref: SMEM metadata reference for routing and tile row counts.
     cfg: Static configuration for the routing GMM kernel.
   """
 
-  gm_id = pl.program_id(1)
+  n_id, gm_id, k_id = pl.program_id(0), pl.program_id(1), pl.program_id(2)
+  num_xo_buffers = cfg.plan.num_xo_buffers
+
+  def _at(gm_offset: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return (n_id, gm_id + gm_offset, k_id)
 
   x_ref = pltpu.annotate(in_ref.x, no_hazard_no_deps=True)
   out_ref = pltpu.annotate(out_ref, no_hazard_no_deps=True)
 
   def _bucket_fn(bucket_m: int) -> None:
     # Step 1: Wait DMA for the current step slot.
-    x_bref.branchless_wait_in(gm_id)
-    out_bref.branchless_wait_out(gm_id - cfg.plan.num_xo_buffers)
+    x_bref.branchless_wait_in(x_hbm_ref, _at(0))
+    out_bref.branchless_wait_out(out_hbm_ref, _at(-num_xo_buffers))
 
     # Step 2: Start DMA for previous step slot.
     # NOTE: While we typically issue DMA for the other slots before waiting for
     # current slot, that will prevent DMA instructions to be pipelined with
     # compute.  Therefore, DMA is issued after the waiting.
-    x_bref.branchless_copy_in(gm_id + cfg.plan.num_xo_buffers - 1)
+    x_bref.branchless_copy_in(x_hbm_ref, _at(num_xo_buffers - 1))
 
     # Step 3: Load data from VMEM.
     x = layout_util.load_compact_to_large(x_ref.at[:bucket_m], cfg.dim.size_k)
@@ -83,16 +91,16 @@ def inner_pipeline(
     # Start output DMA for previous step slot after the loads: a remote DMA is
     # a global memory barrier, so issuing it earlier would hold every load and
     # the matmul behind it instead of sharing bundles with the matmul.
-    out_bref.branchless_copy_out(gm_id - 1)
+    out_bref.branchless_copy_out(out_hbm_ref, _at(-1))
 
     # Step 5: Store output into VMEM.
     layout_util.store_large_to_compact(out_ref.at[:bucket_m], out)
 
   # Select which bucket to choose based on number of active rows of given tile.
-  num_rows = metadata_ref.get_num_rows(gm_id)
-  bucket_idx = pl.cdiv(
-      jnp.maximum(num_rows - cfg.plan.bucket_base, 0), cfg.plan.bucket_base
-  )
+  num_rows = metadata_ref.gm_id_to_num_rows[gm_id]
+  bucket_base = cfg.plan.bucket_base
+  num_buckets = (num_rows + bucket_base - 1) // bucket_base
+  bucket_idx = num_buckets - 1
 
   lax.switch(
       bucket_idx,
@@ -127,7 +135,7 @@ def outer_pipeline(
   in_hbm_ref = in_hbm_ref.transform_for_pipeline(cfg)
 
   @functools.partial(pl.run_scoped, final_allocs=allocs)
-  def _run(final_allocs: memory_ref.PipelineAllocs):
+  def _run(final_allocs: memory_ref.PipelineAllocs) -> None:
 
     inputs = final_allocs.inputs
     out = final_allocs.out
@@ -154,10 +162,8 @@ def outer_pipeline(
 
     # Prologue: Prefetch first num_xo_buffers - 1 input tiles.
     for gm_id in range(cfg.plan.num_xo_buffers - 1):
-      final_allocs.inputs.x.branchless_copy_in(gm_id)
+      final_allocs.inputs.x.branchless_copy_in(in_hbm_ref.x, (0, gm_id, 0))
 
-    # TODO: Add support for N/K dim tiling.
-    num_n = num_k = 1
     # Body:
     pltpu.emit_pipeline(
         functools.partial(
@@ -166,25 +172,28 @@ def outer_pipeline(
             metadata_ref=metadata_ref,
             x_bref=final_allocs.inputs.x,
             out_bref=final_allocs.out,
+            x_hbm_ref=in_hbm_ref.x,
+            out_hbm_ref=out_hbm_ref,
         ),
         in_specs=(allocs.in_specs,),
         out_specs=allocs.out_spec,
-        grid=(num_n, num_gm, num_k),
+        grid=(cfg.num_n, num_gm, cfg.num_k),
     )(in_hbm_ref, out_hbm_ref, allocations=final_allocs.all_tree)
 
+    last_n = cfg.num_n - 1
     if isinstance(scatter_idx, memory_ref.IndexBufferedRef):
-      scatter_idx.wait_in(in_hbm_ref.scatter_idx, (0, num_gm, 0))
+      scatter_idx.wait_in(in_hbm_ref.scatter_idx, (last_n, num_gm, 0))
 
     # Epilogue: Issue DMA for final compute tile and drain all output buffers.
     # NOTE: If output is written into VMEM at step i, output DMA is performed
     # at step i + 1. Therefore, output from last compute step had no
     # crresponding copy_out dma performed. Below code ensures that the output
     # from the last step is correctly issued.
-    final_allocs.out.branchless_copy_out(num_gm - 1)
+    final_allocs.out.branchless_copy_out(out_hbm_ref, (last_n, num_gm - 1, 0))
     for buf_idx in range(cfg.plan.num_xo_buffers):
       final_allocs.out.branchless_wait_out(
-          num_gm - cfg.plan.num_xo_buffers + buf_idx
+          out_hbm_ref, (last_n, num_gm - cfg.plan.num_xo_buffers + buf_idx, 0)
       )
 
-    final_allocs.inputs.x.epilogue()
-    final_allocs.out.epilogue()
+    final_allocs.inputs.x.epilogue(in_hbm_ref.x)
+    final_allocs.out.epilogue(out_hbm_ref)

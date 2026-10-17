@@ -26,6 +26,7 @@ import numpy as np
 from tokamax._src import benchmarking
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel as gmm
+from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.gmm_v2 import gmm_v2
 from tokamax._src.ops.gmm_v2 import util as gmm_util
@@ -202,7 +203,7 @@ class RoutingGmmTest(parameterized.TestCase):
     super().setUp()
 
   def _setup_inputs(
-      self, num_tokens, size_k, size_n, num_experts, ep_size, topk
+      self, num_tokens, size_k, size_n, num_experts, ep_size, topk, **_
   ):
     num_local_experts = num_experts // ep_size
 
@@ -253,8 +254,11 @@ class RoutingGmmTest(parameterized.TestCase):
       logging.info("%s: %.3f ms", name, latency_ms[name])
     self.assertLess(latency_ms["fused"], latency_ms["ragged"])
 
-  @parameterized.named_parameters(*SHAPES)
-  def test_permute_gmm_numerics(self, **shape):
+  @parameterized.product(
+      SHAPES,
+      tile_n=[None, 512],
+  )
+  def test_permute_gmm_numerics(self, tile_n, **shape):
     self._setup_inputs(**shape)
     expected = gmm_v2.gmm_v2(
         self.lhs_gathered,
@@ -270,6 +274,7 @@ class RoutingGmmTest(parameterized.TestCase):
         self.group_sizes,
         gather=self.gather,
         fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(tile_n=tile_n),
     )
     actual = actual.data.reshape(actual.spec.large_shape)
     np.testing.assert_allclose(
@@ -279,8 +284,11 @@ class RoutingGmmTest(parameterized.TestCase):
         atol=5e-2,
     )
 
-  @parameterized.named_parameters(*SHAPES)
-  def test_gmm_unpermute_numerics(self, **shape):
+  @parameterized.product(
+      SHAPES,
+      tile_n=[None, 512],
+  )
+  def test_gmm_unpermute_numerics(self, tile_n, **shape):
     self._setup_inputs(**shape)
     expected = gmm_v2.gmm_v2(
         self.lhs_gathered, self.rhs, self.group_sizes, zero_initialize=False
@@ -290,6 +298,7 @@ class RoutingGmmTest(parameterized.TestCase):
         self.rhs_wrapped,
         self.group_sizes,
         scatter=self.scatter,
+        custom_plan=gmm_plan.RoutingGmmPlan(tile_n=tile_n),
     )
     actual = actual.data.reshape(actual.spec.large_shape)
     np.testing.assert_allclose(

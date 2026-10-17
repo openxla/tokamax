@@ -21,6 +21,7 @@ import functools
 from typing import Any, override
 
 import jax
+from jax import lax
 from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -28,6 +29,9 @@ import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
+
+
+GridIndices = tuple[jax.Array | int, jax.Array | int, jax.Array | int]
 
 
 def map_memory_constraint(obj, memory_space):
@@ -121,13 +125,9 @@ class _BypassBufferedRef(pltpu.BufferedRef):
 class RoutingBufferedRef(_BypassBufferedRef):
   """Shared common interface for both all routed BufferedRef instances."""
 
-  # TODO: Most of the objects are not used by BranchedBufferedRef.
-  # Separate them out to ensure interface remains clean.
   metadata_ref: metadata.MetadataRef = dataclasses.field(
       metadata=dict(static=True)
   )
-  src_ref: Any = dataclasses.field(metadata=dict(static=True))
-  dst_ref: Any = dataclasses.field(metadata=dict(static=True))
   # SMEM ref used for indexing src or dst ref.
   idx_ref: Any = dataclasses.field(default=None, metadata=dict(static=True))
 
@@ -140,17 +140,13 @@ class RoutingBufferedRef(_BypassBufferedRef):
   def create(
       cls,
       *args: Any,
-      cfg: config.RoutingGmmConfig,
       metadata_ref: metadata.MetadataRef,
-      src_ref=None,
-      dst_ref=None,
+      cfg: config.RoutingGmmConfig,
       **kwargs,
   ):
     standard_ref = _BypassBufferedRef.create(*args, **kwargs)
     return cls(
         metadata_ref=metadata_ref,
-        src_ref=src_ref,
-        dst_ref=dst_ref,
         cfg=cfg,
         **{
             f.name: getattr(standard_ref, f.name)
@@ -159,25 +155,33 @@ class RoutingBufferedRef(_BypassBufferedRef):
     )
 
   @abc.abstractmethod
-  def branchless_copy_in(self, gm_id: jax.Array | int) -> None:
+  def branchless_copy_in(
+      self, src_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     ...
 
   @abc.abstractmethod
-  def branchless_wait_in(self, gm_id: jax.Array | int) -> None:
+  def branchless_wait_in(
+      self, src_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     ...
 
   @abc.abstractmethod
-  def branchless_copy_out(self, gm_id: jax.Array | int) -> None:
+  def branchless_copy_out(
+      self, dst_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     ...
 
   @abc.abstractmethod
-  def branchless_wait_out(self, gm_id: jax.Array | int) -> None:
+  def branchless_wait_out(
+      self, dst_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     ...
 
   def prologue(self) -> None:
     """Runs once before the pipeline."""
 
-  def epilogue(self) -> None:
+  def epilogue(self, dst_ref: hijax.TransformedRef) -> None:
     """Runs once after the last DMA wait."""
 
 
@@ -186,8 +190,8 @@ class RoutingBufferedRef(_BypassBufferedRef):
 class BranchedBufferedRef(RoutingBufferedRef):
   """BufferedRef managed by emit_pipeline. Not overlaped with compute."""
 
-  def _no_op(self, gm_id: jax.Array | int) -> None:
-    del gm_id
+  def _no_op(self, ref, grid_indices) -> None:
+    del ref, grid_indices
 
   branchless_copy_in = branchless_wait_in = branchless_copy_out = (
       branchless_wait_out
@@ -279,14 +283,34 @@ class IndexBufferedRef(pltpu.BufferedRef):
         },
     )
 
-  def _aligned_range(self, tile_id) -> tuple[jax.Array, jax.Array]:
-    """Returns an tile range aligned to block size tile_m_idx."""
-    block_size = self.cfg.plan.tile_m_idx
-    m_start = self.metadata_ref.get_m_offset(tile_id)
-    m_end = m_start + self.metadata_ref.get_num_rows(tile_id)
-    aligned_start = (m_start // block_size) * block_size
+  def _aligned_range(
+      self,
+      n_id: jax.Array | int,
+      gm_id: jax.Array | int,
+      k_id: jax.Array | int,
+  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Returns (hbm start, local start, size) aligned to tile_m_idx."""
+    block_size = jnp.uint32(self.cfg.plan.tile_m_idx)
+    ring_size = jnp.uint32(self.cfg.plan.idx_ring_size)
+    idx_buffer_size = jnp.uint32(self.cfg.plan.idx_buffer_size)
+    buffer_count = jnp.uint32(self.buffer_count)
+    n_id, gm_id, _ = self.metadata_ref.resolve(
+        n_id, gm_id, k_id, dtype=jnp.uint32
+    )
+    # Calculate hbm address.
+    m_start = self.metadata_ref.gm_id_to_m_offset[gm_id].astype(jnp.uint32)
+    m_size = self.metadata_ref.gm_id_to_num_rows[gm_id].astype(jnp.uint32)
+    m_end = m_start + m_size
+    aligned_start = lax.div(m_start, block_size) * block_size
     aligned_end = pl.cdiv(m_end, block_size) * block_size
-    return aligned_start, aligned_end - aligned_start
+
+    # Calculate smem address. Each odd/even n value uses a different buffer
+    # to ensure first step of n + 1 never overwrites the last step of n.
+    buffer_offset = lax.rem(n_id, buffer_count) * idx_buffer_size
+    local_start = lax.rem(m_start, ring_size)
+    aligned_local_start = lax.div(local_start, block_size) * block_size
+    aligned_buffer_start = buffer_offset + aligned_local_start
+    return aligned_start, aligned_buffer_start, aligned_end - aligned_start
 
   @override
   def copy_in(self, idx_hbm_ref, grid_indices):
@@ -296,14 +320,16 @@ class IndexBufferedRef(pltpu.BufferedRef):
     window_ref = self.window_ref
     assert sem_recvs is not None
     assert window_ref is not None
-    gm_id = grid_indices[1]
+    n_id, gm_id, k_id = grid_indices
+    slot = self.metadata_ref.slot(n_id, gm_id, k_id, self.buffer_count)
 
-    aligned_start, aligned_size = self._aligned_range(gm_id + self.fetch_offset)
-    local_start = aligned_start % self.cfg.plan.idx_buffer_size
+    aligned_start, local_start, aligned_size = self._aligned_range(
+        n_id, gm_id + self.fetch_offset, k_id
+    )
     pltpu.make_async_copy(
         src_ref=idx_hbm_ref.at[pl.ds(aligned_start, aligned_size)],
         dst_ref=window_ref.at[pl.ds(local_start, aligned_size)],
-        sem=sem_recvs.at[gm_id % self.buffer_count],
+        sem=sem_recvs.at[slot],
     ).start()
 
   @override
@@ -314,12 +340,14 @@ class IndexBufferedRef(pltpu.BufferedRef):
     window_ref = self.window_ref
     assert sem_recvs is not None
     assert window_ref is not None
-    gm_id = grid_indices[1]
-    sem = sem_recvs.at[gm_id % self.buffer_count]
+    n_id, gm_id, k_id = grid_indices
+    slot = self.metadata_ref.slot(n_id, gm_id, k_id, self.buffer_count)
 
-    aligned_size = self._aligned_range(gm_id + self.fetch_offset)[-1]
+    aligned_size = self._aligned_range(n_id, gm_id + self.fetch_offset, k_id)[
+        -1
+    ]
     copied = window_ref.at[pl.ds(0, aligned_size)]
-    pltpu.make_async_copy(copied, copied, sem).wait()
+    pltpu.make_async_copy(copied, copied, sem_recvs.at[slot]).wait()
 
     if self.fetch_offset < 0:
       # One of the unfortunate side-effect of piggy-backing on emit_pipeline
@@ -327,124 +355,131 @@ class IndexBufferedRef(pltpu.BufferedRef):
       # ends at (num_gm - 1) - fetch_offset. Therefore, we have to manually
       # perform fetch for the last gm_id.
       assert self.fetch_offset == -1
-      num_gm = self.metadata_ref.num_gm[0]
-      is_last_gm = (num_gm - 1) == gm_id
+      step = self.metadata_ref.step(n_id, gm_id, k_id)
+      is_last_step = step == self.metadata_ref.num_steps - 1
 
       # This can probably be done with branchless DMA but unlikely to be worth
       # it since this entire wait_in is already executed under emit_pipeline's
       # dynamic branch anyway.
-      @pl.when(is_last_gm)
+      @pl.when(is_last_step)
       def _():
-        aligned_start, aligned_size = self._aligned_range(gm_id)
-        local_start = aligned_start % self.cfg.plan.idx_buffer_size
+        next_slot = self.metadata_ref.slot(
+            n_id, gm_id + 1, k_id, self.buffer_count
+        )
+
+        aligned_start, local_start, aligned_size = self._aligned_range(
+            n_id, gm_id, k_id
+        )
         # NOTE: Because this copy_in is manually triggered at the last step,
         # the caller MUST trigger corresponding wait_in at the epilogue.
         pltpu.make_async_copy(
             src_ref=idx_hbm_ref.at[pl.ds(aligned_start, aligned_size)],
             dst_ref=window_ref.at[pl.ds(local_start, aligned_size)],
-            sem=sem_recvs.at[(gm_id + 1) % self.buffer_count],
+            sem=sem_recvs.at[next_slot],
         ).start()
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class BranchlessBufferedRef(RoutingBufferedRef):
-  """BufferedRef that performs branchless DMA to allow matmul overlap."""
+  """BufferedRef that performs branchless DMAs to allow matmul overlap."""
 
-  def _slot(self, gm_id: jax.Array | int) -> jax.Array:
-    return jnp.mod(gm_id, self.cfg.plan.num_xo_buffers)
+  def _idx_offset(
+      self, grid_indices: GridIndices, rows_ds: pl.Slice
+  ) -> jax.Array:
+    """SMEM offset that accounts for N tile dim buffering."""
+    idx_buffer_size = jnp.uint32(self.cfg.plan.idx_buffer_size)
+    ring_size = jnp.uint32(self.cfg.plan.idx_ring_size)
+    num_idx_buffers = jnp.uint32(self.cfg.plan.num_idx_buffers)
+    n_id, _, _ = self.metadata_ref.resolve(*grid_indices, dtype=jnp.uint32)
+    # Buffer is divided into two where only even/odd n_id can use to avoid
+    # first step of n_id oveerwriting value of last step at n_id - 1.
+    n_offset = lax.rem(n_id, num_idx_buffers) * idx_buffer_size
+    rows_ds_start = jnp.uint32(rows_ds.start)
+    return n_offset + lax.rem(rows_ds_start, ring_size)
 
   @override
-  def branchless_copy_in(self, gm_id: jax.Array | int) -> None:
+  def branchless_copy_in(
+      self, src_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     assert self.sem_recvs is not None
-    assert self.window_ref is not None
-    assert self.src_ref is not None
     assert self.idx_ref is not None
 
-    slot = self._slot(gm_id)
+    slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
+    rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
     sem = self.sem_recvs.at[slot]
-    vmem_dst = self.window_ref.at[slot]
-    vmem_dst = pltpu.annotate(vmem_dst, no_hazard_no_deps=True)
-    hbm_src = self.src_ref
-    blocks = hbm_src.shape[1]
-
-    idx_buffer_size = self.cfg.plan.idx_buffer_size
-    offset = self.metadata_ref.get_m_offset(gm_id) % idx_buffer_size
-    rows = self.metadata_ref.get_num_rows(gm_id)
+    vmem_dst = pltpu.annotate(self._window_ref_at(slot), no_hazard_no_deps=True)
+    offset = self._idx_offset(grid_indices, rows_ds)
 
     for r in range(self.cfg.plan.tile_m):
-      size = jnp.where(r < rows, 1, 0)
+      size = jnp.where(r < rows_ds.size, 1, 0)
       row = self.idx_ref[offset + r]
       pltpu.make_async_copy(
-          src_ref=hbm_src.at[pl.ds(row, size)],
-          dst_ref=vmem_dst.at[pl.ds(r, size), :blocks],
+          src_ref=src_ref.at[pl.ds(row, size), cols_ds],
+          dst_ref=vmem_dst.at[pl.ds(r, size), pl.ds(0, cols_ds.size)],
           sem=sem,
       ).start()
 
   @override
-  def branchless_copy_out(self, gm_id: jax.Array | int) -> None:
+  def branchless_copy_out(
+      self, dst_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     assert self.sem_sends is not None
-    assert self.window_ref is not None
-    assert self.dst_ref is not None
     assert self.idx_ref is not None
 
-    slot = self._slot(gm_id)
+    slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
+    rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
     sem = self.sem_sends.at[slot]
-    vmem_src = self.window_ref.at[slot]
-    vmem_src = pltpu.annotate(vmem_src, no_hazard_no_deps=True)
-    hbm_dst = self.dst_ref
-    blocks = hbm_dst.shape[1]
-
-    idx_buffer_size = self.cfg.plan.idx_buffer_size
-    offset = self.metadata_ref.get_m_offset(gm_id) % idx_buffer_size
-    rows = self.metadata_ref.get_num_rows(gm_id)
+    vmem_src = pltpu.annotate(self._window_ref_at(slot), no_hazard_no_deps=True)
+    offset = self._idx_offset(grid_indices, rows_ds)
 
     for r in range(self.cfg.plan.tile_m):
-      live = r < rows
+      live = r < rows_ds.size
       size = jnp.where(live, 1, 0)
-      src = vmem_src.at[pl.ds(r, size), :blocks]
-      self._copy_out_row(src, self.idx_ref[offset + r], size, live, sem)
+      src = vmem_src.at[pl.ds(r, size), pl.ds(0, cols_ds.size)]
+      row = self.idx_ref[offset + r]
+      self._copy_out_row(src, dst_ref, row, size, cols_ds, live, sem)
 
   def _copy_out_row(
       self,
-      src: hijax.TransformedRef,
+      src_ref: hijax.TransformedRef,
+      dst_ref: hijax.TransformedRef,
       idx: jax.Array,
       size: jax.Array,
+      cols_ds: pl.Slice,
       live: jax.Array,
       sem: Any,
   ) -> None:
     """Starts the DMA of one VMEM row `src` to output row `idx`."""
     del live
     pltpu.make_async_copy(
-        src_ref=src,
-        dst_ref=self.dst_ref.at[pl.ds(idx, size)],
+        src_ref=src_ref,
+        dst_ref=dst_ref.at[pl.ds(idx, size), cols_ds],
         sem=sem,
     ).start(priority=1)
 
   @override
-  def branchless_wait_in(self, gm_id: jax.Array | int) -> None:
+  def branchless_wait_in(
+      self, src_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     assert self.sem_recvs is not None
-    assert self.window_ref is not None
 
-    slot = self._slot(gm_id)
-    sem = self.sem_recvs.at[slot]
-    hbm_src = self.src_ref
-
-    rows = self.metadata_ref.get_num_rows(gm_id)
-    copied = hbm_src.at[pl.ds(0, rows)]
-    pltpu.make_async_copy(copied, copied, sem).wait()
+    slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
+    rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
+    # Only the byte count matters to the wait, so src_ref stands in for both.
+    copied = src_ref.at[pl.ds(0, rows_ds.size), cols_ds]
+    pltpu.make_async_copy(copied, copied, self.sem_recvs.at[slot]).wait()
 
   @override
-  def branchless_wait_out(self, gm_id: jax.Array | int) -> None:
+  def branchless_wait_out(
+      self, dst_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     assert self.sem_sends is not None
-    assert self.window_ref is not None
 
-    slot = self._slot(gm_id)
-    sem = self.sem_sends.at[slot]
-    hbm_dst = self.dst_ref
-    rows = self.metadata_ref.get_num_rows(gm_id)
-    copied = hbm_dst.at[pl.ds(0, rows)]
-    pltpu.make_async_copy(copied, copied, sem).wait()
+    slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
+    rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
+    copied = dst_ref.at[pl.ds(0, rows_ds.size), cols_ds]
+    pltpu.make_async_copy(copied, copied, self.sem_sends.at[slot]).wait()
 
   def _no_op(self, ref, grid_indices):
     del ref, grid_indices
@@ -462,14 +497,16 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
       devices.
   """
 
-  recv_sem: Any = None
+  recv_sem: hijax.TransformedRef | None = None
 
   @override
   def _copy_out_row(
       self,
-      src: hijax.TransformedRef,
+      src_ref: hijax.TransformedRef,
+      dst_ref: hijax.TransformedRef,
       idx: jax.Array,
       size: jax.Array,
+      cols_ds: pl.Slice,
       live: jax.Array,
       sem: Any,
   ) -> None:
@@ -480,13 +517,13 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
     # Unsigned lax div/rem skip the sign fixups of int32 jnp.divmod.
     rows_per_dev = jnp.uint32(self.cfg.out.spec.row_size)
     uidx = idx.astype(jnp.uint32)
-    dev = jax.lax.div(uidx, rows_per_dev).astype(jnp.int32)
-    row = jax.lax.rem(uidx, rows_per_dev).astype(jnp.int32)
+    dev = lax.div(uidx, rows_per_dev).astype(jnp.int32)
+    row = lax.rem(uidx, rows_per_dev).astype(jnp.int32)
     # Remote DMAs must use priority 0. A dead row may read a stale index, so
     # its empty DMA is aimed at a real device.
     pltpu.make_async_remote_copy(
-        src_ref=src,
-        dst_ref=self.dst_ref.at[pl.ds(row, size)],
+        src_ref=src_ref,
+        dst_ref=dst_ref.at[pl.ds(row, size), cols_ds],
         send_sem=sem,
         recv_sem=self.recv_sem,
         device_id={axis: jnp.where(live, dev, 0)},
@@ -495,16 +532,6 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
   @override
   def prologue(self) -> None:
     # Every peer's output buffer must exist before the first row lands.
-    self._barrier()
-
-  @override
-  def epilogue(self) -> None:
-    # Wait for every row owned here before the output is read.
-    recv = self.dst_ref.at[pl.ds(0, self.cfg.out.spec.row_size)]
-    pltpu.make_async_copy(recv, recv, self.recv_sem).wait()
-
-  def _barrier(self) -> None:
-    """EP barrier; a second round keeps the semaphore from early reuse."""
     assert self.cfg.scatter is not None
     axis, ep = self.cfg.scatter.remote_axis, self.cfg.dim.size_ep
     assert axis is not None
@@ -517,13 +544,16 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
     signal_all(pltpu.get_barrier_semaphore())
     pl.run_scoped(signal_all, pltpu.SemaphoreType.REGULAR)
 
+  @override
+  def epilogue(self, dst_ref: hijax.TransformedRef) -> None:
+    # Wait for every row owned here before the output is read.
+    recv = dst_ref.at[pl.ds(0, self.cfg.out.spec.row_size)]
+    pltpu.make_async_copy(recv, recv, self.recv_sem).wait()
+
 
 @dataclasses.dataclass(frozen=True)
 class PipelineIndexMaps:
   """Provides grid-to-tile index mapping functions for pipeline BlockSpecs.
-
-  Note that this is only for emit_pipeline managed indexing. Custom BufferedRef
-  handles its own grid-to-tile indexing.
 
   Attributes:
     metadata_ref: SMEM metadata reference providing per-step group and row
@@ -534,41 +564,64 @@ class PipelineIndexMaps:
   metadata_ref: metadata.MetadataRef
   cfg: config.RoutingGmmConfig
 
-  def act_index(self, n_id, gm_id, k_id, *, hbm_shape):
-    """Returns the block index tuple for an activation tensor."""
-    del n_id, k_id
+  def _rows(self, gm_id: jax.Array) -> pl.Slice:
+    m_offset = self.metadata_ref.gm_id_to_m_offset[gm_id]
+    m_size = self.metadata_ref.gm_id_to_num_rows[gm_id]
+    return pl.ds(m_offset, m_size)
 
-    num_chunks = hbm_shape[1]
-    m_offset = self.metadata_ref.get_m_offset(gm_id)
-    m_size = self.metadata_ref.get_num_rows(gm_id)
-    return (pl.ds(m_offset, m_size), pl.ds(0, num_chunks), 0, 0)
+  def x_index(
+      self,
+      n_id: jax.Array | int,
+      gm_id: jax.Array | int,
+      k_id: jax.Array | int,
+      *,
+      hbm_shape: tuple[int, int, int, int],
+  ) -> tuple[pl.Slice, pl.Slice, int, int]:
+    """Returns the block index tuple for the input activation."""
+    chunks = hbm_shape[1] // self.cfg.num_k
+    _, gm_id, k_id = self.metadata_ref.resolve(n_id, gm_id, k_id)
+    return (self._rows(gm_id), pl.ds(k_id * chunks, chunks), 0, 0)
 
-  def weight_index(self, n_id, gm_id, k_id):
+  def out_index(
+      self,
+      n_id: jax.Array | int,
+      gm_id: jax.Array | int,
+      k_id: jax.Array | int,
+      *,
+      hbm_shape: tuple[int, int, int, int],
+  ) -> tuple[pl.Slice, pl.Slice, int, int]:
+    """Returns the block index tuple for the output activation."""
+    chunks = hbm_shape[1] // self.cfg.num_n
+    n_id, gm_id, _ = self.metadata_ref.resolve(n_id, gm_id, k_id)
+    return (self._rows(gm_id), pl.ds(n_id * chunks, chunks), 0, 0)
+
+  def weight_index(
+      self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
+  ) -> tuple[jax.Array, int, jax.Array | int]:
     """Returns the block index tuple for an expert weight tensor."""
-    del n_id, k_id
-    return (self.metadata_ref.get_group_id(gm_id), 0, 0)
+    del k_id
+    return (self.metadata_ref.gm_id_to_group_id[gm_id], 0, n_id)
 
-  def scale_index(self, n_id, gm_id, k_id):
+  def scale_index(
+      self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
+  ) -> tuple[jax.Array, int, int, jax.Array | int]:
     """Returns the block index tuple for a quantization scale tensor."""
-    del n_id, k_id
-    return (self.metadata_ref.get_group_id(gm_id), 0, 0, 0)
+    del k_id
+    return (self.metadata_ref.gm_id_to_group_id[gm_id], 0, 0, n_id)
 
-  def get_dummy_index(self, rank_size):
-    """Dummy index that ensures custom copy_* and wait_* is always triggered."""
-
-    def _dummy_index(n_id, gm_id, k_id):
-      # TODO: Fix this logic when num_k > 1.
-      return (n_id + gm_id + k_id,) * rank_size
-
-    return _dummy_index
+  def idx_index(
+      self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
+  ) -> jax.Array:
+    """Returns an index that changes every step so copy_* always triggers."""
+    return self.metadata_ref.step(n_id, gm_id, k_id)
 
 
 @dataclasses.dataclass(frozen=True)
 class PipelineBlockSpecs:
   """Factory for routing GMM pipeline BlockSpecs.
 
-  While index map might not be respected for custom BufferedRefs, when it comes
-  to buffer memory allocation, everything is coordinated by this factory method.
+  Both DMA paths locate a tile through these index maps, while buffer sizing
+  is decided here alone.
 
   Attributes:
     cfg: Static configuration for the routing GMM kernel.
@@ -578,16 +631,17 @@ class PipelineBlockSpecs:
   cfg: config.RoutingGmmConfig
   index_map_provider: PipelineIndexMaps
 
-  def _act_spec(self, hbm_shape: tuple[int, ...]) -> pl.BlockSpec:
-    num_chunks = layout_util.to_bank_conflict_aware_stride(hbm_shape[1])
+  def _act_spec(
+      self, hbm_shape: tuple[int, ...], num_tiles: int, index_map
+  ) -> pl.BlockSpec:
+    tile_chunks = hbm_shape[1] // num_tiles
+    num_tile_chunks = layout_util.to_bank_conflict_aware_stride(tile_chunks)
     block_shape = (
         pl.BoundedSlice(self.cfg.plan.tile_m),
-        pl.BoundedSlice(num_chunks),
+        pl.BoundedSlice(num_tile_chunks),
         *hbm_shape[2:],
     )
-    index_map = functools.partial(
-        self.index_map_provider.act_index, hbm_shape=hbm_shape
-    )
+    index_map = functools.partial(index_map, hbm_shape=hbm_shape)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=index_map,
@@ -599,11 +653,19 @@ class PipelineBlockSpecs:
 
   def get_x_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the input activation tensor."""
-    return self._act_spec(self.cfg.x.spec.compact_shape)
+    return self._act_spec(
+        self.cfg.x.spec.compact_shape,
+        self.cfg.num_k,
+        self.index_map_provider.x_index,
+    )
 
   def get_out_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the output activation tensor."""
-    return self._act_spec(self.cfg.out.spec.compact_shape)
+    return self._act_spec(
+        self.cfg.out.spec.compact_shape,
+        self.cfg.num_n,
+        self.index_map_provider.out_index,
+    )
 
   def get_weight_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the expert weight tensor."""
@@ -638,18 +700,15 @@ class PipelineBlockSpecs:
     # Single index buffer can houses not just one, but up-to entire
     # num_xo_buffers amount of data. Despite this, the consumer does not need
     # to know about this kind of additional padded allocation.
-    # NOTE: Technically we can tighten this to use much less SMEM, but when
-    # considering this approach does not take up too much SMEM, it is better
-    # to just keep things simple.
     block_shape = (self.cfg.plan.idx_buffer_size,)
 
     return pl.BlockSpec(
         block_shape=block_shape,
-        index_map=self.index_map_provider.get_dummy_index(1),
+        index_map=self.index_map_provider.idx_index,
         memory_space=pltpu.SMEM,
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
-        pipeline_mode=pl.Buffered(buffer_count=2),
+        pipeline_mode=pl.Buffered(buffer_count=self.cfg.plan.num_idx_buffers),
     )
 
 
@@ -766,9 +825,8 @@ class PipelineAllocs:
         dtype_or_type=x_hbm_ref.dtype,
         buffer_count=cfg.plan.num_xo_buffers,
         grid_rank=3,
-        metadata_ref=metadata_ref,
-        src_ref=x_hbm_ref,
         cfg=cfg,
+        metadata_ref=metadata_ref,
     )
     out_bref = _get_buffered_ref(cfg.out.mode).output(
         spec=pipeline_block_specs.get_out_spec(),
@@ -777,7 +835,6 @@ class PipelineAllocs:
         grid_rank=3,
         cfg=cfg,
         metadata_ref=metadata_ref,
-        dst_ref=out_hbm_ref,
     )
     if cfg.out.mode == config.RoutingMode.REMOTE:
       out_bref = dataclasses.replace(
@@ -793,10 +850,9 @@ class PipelineAllocs:
       gather_bref = IndexBufferedRef.input(
           spec=pipeline_block_specs.get_index_spec(),
           dtype_or_type=in_hbm_ref.gather_idx.dtype,
-          # Use 2 buffers because index size is small enough that it doesn't
-          # benefit much from larger buffers. Additionally, with small number
-          # of buffers, less chance of worrying about overwrite issue.
-          buffer_count=2,
+          # IndexBufferedRef alternates two buffers by n. This ensures first
+          # tile of n + 1 never overwrites the last tile's n.
+          buffer_count=cfg.plan.num_idx_buffers,
           cfg=cfg,
           metadata_ref=metadata_ref,
           fetch_offset=fetch_offset,
@@ -807,7 +863,7 @@ class PipelineAllocs:
       scatter_bref = IndexBufferedRef.input(
           spec=pipeline_block_specs.get_index_spec(),
           dtype_or_type=in_hbm_ref.scatter_idx.dtype,
-          buffer_count=2,
+          buffer_count=cfg.plan.num_idx_buffers,
           cfg=cfg,
           metadata_ref=metadata_ref,
           fetch_offset=fetch_offset,

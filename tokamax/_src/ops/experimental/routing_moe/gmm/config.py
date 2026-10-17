@@ -230,9 +230,18 @@ class RoutingGmmConfig:
           "acc_dtype must be bfloat16 or float32. Got"
           f" {cfg.plan.acc_dtype}."
       )
-    tiles_kn = (cfg.plan.tile_k, cfg.plan.tile_n)
-    if tiles_kn != (cfg.dim.size_k, cfg.dim.size_out_n):
-      raise NotImplementedError("N/K dim tiling is not supported yet.")
+    if cfg.plan.tile_k != cfg.dim.size_k:
+      raise NotImplementedError("K dim tiling is not supported yet.")
+    if cfg.dim.size_out_n % cfg.plan.tile_n != 0:
+      raise ValueError(
+          f"tile_n ({cfg.plan.tile_n}) must divide the output width"
+          f" ({cfg.dim.size_out_n})."
+      )
+    if cfg.out.spec.compact_shape[1] % cfg.num_n != 0:
+      raise ValueError(
+          f"tile_n ({cfg.plan.tile_n}) must be a multiple of the output's"
+          " compact chunk width."
+      )
     if not 0 < cfg.plan.bucket_base <= cfg.plan.tile_m:
       raise ValueError(
           f"bucket_base ({cfg.plan.bucket_base}) must be in (0, tile_m="
@@ -256,18 +265,27 @@ class RoutingGmmConfig:
 
   @property
   def max_num_gm(self) -> int:
-    """Returns maximum number of possible tiles including OOB safety padding."""
+    """Returns maximum number of possible tiles."""
     max_num_single_group = pl.cdiv(self.dim.size_out_m, self.plan.tile_m)
-    # Padd left and right by number of buffers to avoid OOB access.
-    safety_padding = self.plan.num_max_buffers * 2
-    return self.dim.size_local_groups + max_num_single_group + safety_padding
+    return self.dim.size_local_groups + max_num_single_group
+
+  @property
+  def num_n(self) -> int:
+    return pl.cdiv(self.dim.size_out_n, self.plan.tile_n)
+
+  @property
+  def num_k(self) -> int:
+    num_k = pl.cdiv(self.dim.size_k, self.plan.tile_k)
+    # TODO: Add support for K dim tiling.
+    assert num_k == 1
+    return num_k
 
   @property
   def kernel_name(self):
     name = f"routing_gmm-{self.x.mode}-{self.out.mode}"
     name += f"-g{self.dim.size_local_groups}-m{self.dim.size_out_m}"
     name += f"-k{self.dim.size_k}-n{self.dim.size_out_n}"
-    name += f"-tm{self.plan.tile_m}"
+    name += f"-tm{self.plan.tile_m}-tn{self.plan.tile_n}"
     if self.x.dynamic_quant is not None:
       name += f"-xq{self.x.dynamic_quant.dtype.name}"
     return name

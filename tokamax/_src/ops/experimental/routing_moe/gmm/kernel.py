@@ -102,7 +102,9 @@ def routing_gmm(
   group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
 
   # Pad indices by tile_m_idx to ensure DMA and indexing does not trigger OOB.
-  def _padded_indices(routing: arg.RoutingWrapper[jax.Array] | None):
+  def _padded_indices(
+      routing: arg.RoutingWrapper[jax.Array] | None,
+  ) -> jax.Array | None:
     if routing is None:
       return None
     return jnp.pad(routing.indices, (0, cfg.plan.tile_m_idx))
