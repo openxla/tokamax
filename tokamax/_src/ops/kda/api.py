@@ -50,7 +50,7 @@ def kimi_delta_attention(
     query: Float[Array, "H B T K"],
     key: Float[Array, "H B T K"],
     value: Float[Array, "H B T V"],
-    gate: Float[Array, "H B T K"],
+    gate: Float[Array, "H B T GW"],
     beta: Float[Array, "H B T"],
     *,
     a_log: Float[Array, "H"] | None = None,
@@ -60,10 +60,19 @@ def kimi_delta_attention(
     output_final_state: bool = False,
     use_qk_l2norm: bool = False,
     use_gate_in_kernel: bool = False,
+    per_channel_gate: bool = True,
+    chunk_size: int | None = None,
     segment_ids: Int[Array, "B T"] | None = None,
     lower_bound: float | None = None,
     context_parallel_metadata: ContextParallelMetadata | None = None,
     max_num_segments: int | None = None,
+    conv_weight_q: Float[Array, "H_Q W K"] | None = None,
+    conv_weight_k: Float[Array, "H_K W K"] | None = None,
+    conv_weight_v: Float[Array, "H W V"] | None = None,
+    conv_bias_q: Float[Array, "H_Q K"] | None = None,
+    conv_bias_k: Float[Array, "H_K K"] | None = None,
+    conv_bias_v: Float[Array, "H V"] | None = None,
+    use_conv1d_in_kernel: bool = False,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> tuple[Float[Array, "H B T V"], Float[Array, "B N H K V"] | None]:
   """Kimi Delta Attention.
@@ -77,48 +86,49 @@ def kimi_delta_attention(
     key: Key tensor with shape `[H, B, T, K]`.
     value: Value tensor with shape `[H, B, T, V]`.
     gate: Per-channel gate tensor with shape `[H, B, T, K]`. When
-      `use_gate_in_kernel=True`, this is the raw delta-time input; otherwise,
-      it is already the log-space decay.
+      `use_gate_in_kernel=True`, this is the raw delta-time input; otherwise, it
+      is already the log-space decay.
     beta: Post-activation per-token delta-rule learning-rate tensor with values
       in `[0, 1]`, shape `[H, B, T]`.
     a_log: Per-head log decay-rate parameter, shape `[H]`. Required when
       `use_gate_in_kernel=True`.
     delta_time_bias: Optional per-head, per-key-channel bias added to the raw
       gate before the delta-time activation, shape `[H * K]`. In the standard
-      activation path, KDA computes
-      `delta_time = softplus(gate + delta_time_bias)` and
-      `log_decay = -exp(a_log) * delta_time`. This argument is used only when
-      `use_gate_in_kernel=True`.
+      activation path, KDA computes `delta_time = softplus(gate +
+      delta_time_bias)` and `log_decay = -exp(a_log) * delta_time`. This
+      argument is used only when `use_gate_in_kernel=True`.
     scale: Query scale. Defaults to `K ** -0.5`.
     initial_state: Optional initial recurrent state, shape `[B, N, H, K, V]`.
-      Its segment dimension `N` determines `max_num_segments` when the latter
-      is omitted.
+      Its segment dimension `N` determines `max_num_segments` when the latter is
+      omitted.
     output_final_state: Whether to return the final recurrent state.
+    per_channel_gate: Whether `gate` has an independent value per key channel
+      (True, shape `[..., K]`) or a scalar per head/token (False, shape `[...,
+      1]`).
     use_qk_l2norm: Whether to normalize query/key on the last dimension before
       running KDA.
     use_gate_in_kernel: Whether `gate` is raw input that should be activated
       with `a_log` and `delta_time_bias`. When false, `gate` is already in log
       space.
-    segment_ids: Optional 1-indexed varlen segment IDs, shape `[B, T]`.
-      Padding is represented by 0.
+    segment_ids: Optional 1-indexed varlen segment IDs, shape `[B, T]`. Padding
+      is represented by 0.
     lower_bound: Optional sigmoid-gate lower bound.
-    context_parallel_metadata: Optional context-parallel metadata. Construct
-      it with `kda.ContextParallelMetadata(mesh, axis_name)`.
+    context_parallel_metadata: Optional context-parallel metadata. Construct it
+      with `kda.ContextParallelMetadata(mesh, axis_name)`.
     max_num_segments: Static upper bound for the number of varlen segments.
-      Required when `segment_ids` is provided without `initial_state`;
-      otherwise inferred from the initial state's segment dimension.
+      Required when `segment_ids` is provided without `initial_state`; otherwise
+      inferred from the initial state's segment dimension.
     implementation: The implementation to use. By default, the Mosaic TPU
       implementation is attempted first when available, with XLA as a fallback.
-      `"xla"` evaluates the recurrent reference implementation. `"mosaic"`
-      uses the experimental Pallas/Mosaic TPU forward and custom VJP
-      implementation. `"xla_chunked"` evaluates a pure-JAX chunked forward and
-      VJP lowered by XLA on the active backend. The `"xla_chunked"` backend
-      requires fused gate activation, a configured lower bound, and safe-gate
-      factoring. `"mosaic"` requires these for fused activation but also
-      supports pre-activated log-space gates; their numerical range remains
-      the caller's responsibility.
-      A sequence tries implementations in order, falling back when an
-      implementation raises `NotImplementedError`.
+      `"xla"` evaluates the recurrent reference implementation. `"mosaic"` uses
+      the experimental Pallas/Mosaic TPU forward and custom VJP implementation.
+      `"xla_chunked"` evaluates a pure-JAX chunked forward and VJP lowered by
+      XLA on the active backend. The `"xla_chunked"` backend requires fused gate
+      activation, a configured lower bound, and safe-gate factoring. `"mosaic"`
+      requires these for fused activation but also supports pre-activated
+      log-space gates; their numerical range remains the caller's
+      responsibility. A sequence tries implementations in order, falling back
+      when an implementation raises `NotImplementedError`.
 
   Returns:
     A pair `(output, final_state)`. The output has shape `[H, B, T, V]`.
@@ -153,10 +163,19 @@ def kimi_delta_attention(
           output_final_state=output_final_state,
           use_qk_l2norm=use_qk_l2norm,
           use_gate_in_kernel=use_gate_in_kernel,
+          per_channel_gate=per_channel_gate,
+          chunk_size=chunk_size,
           segment_ids=segment_ids,
           lower_bound=lower_bound,
           context_parallel_metadata=context_parallel_metadata,
           max_num_segments=max_num_segments,
+          conv_weight_q=conv_weight_q,
+          conv_weight_k=conv_weight_k,
+          conv_weight_v=conv_weight_v,
+          conv_bias_q=conv_bias_q,
+          conv_bias_k=conv_bias_k,
+          conv_bias_v=conv_bias_v,
+          use_conv1d_in_kernel=use_conv1d_in_kernel,
       )
     except NotImplementedError as e:
       if len(implementation) == 1:

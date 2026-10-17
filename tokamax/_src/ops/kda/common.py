@@ -509,20 +509,20 @@ def _chunk_gated_delta_rule_fwd_varlen(
 
 
 def _chunk_gated_delta_rule_fwd_kernel(
-  k_ref,  # [1, 1, BT, K_PADSIZE]
-  v_ref,  # [1, 1, BT, V_ALIGNED]
-  w_ref,  # [1, 1, BT, K_PADSIZE]
-  g_ref,  # [1, 1, BT, G_PAD]
-  gk_ref,  # [1, 1, BT, K_PADSIZE]
-  h0_ref,  # [1, 1, K_PADSIZE, V_ALIGNED]
-  # outputs
-  h_ref,  # [1, NT, 1, K_PADSIZE, V_ALIGNED]
-  v_new_ref,  # [1, 1, BT, V_ALIGNED]
-  ht_ref,  # [1, 1, K_PADSIZE, V_ALIGNED]
-  scratch_ref,  # [K_PADSIZE, V_ALIGNED]
-  *,
-  NT,
-  USE_EXP2,
+    k_ref,  # [1, 1, BT, K_PADSIZE]
+    v_ref,  # [1, 1, BT, V_ALIGNED]
+    w_ref,  # [1, 1, BT, K_PADSIZE]
+    g_ref,  # [1, 1, BT, G_PAD]
+    gk_ref,  # [1, 1, BT, K_PADSIZE]
+    h0_ref,  # [1, 1, K_PADSIZE, V_ALIGNED]
+    # outputs
+    h_ref,  # [1, 1, 1, K_PADSIZE, V_ALIGNED] -- this chunk's slice only
+    v_new_ref,  # [1, 1, BT, V_ALIGNED]
+    ht_ref,  # [1, 1, K_PADSIZE, V_ALIGNED]
+    scratch_ref,  # [K_PADSIZE, V_ALIGNED]
+    *,
+    NT,
+    USE_EXP2,
 ):
   """Pallas kernel for one chunk of the gated delta-rule inter-chunk forward pass.
 
@@ -554,7 +554,7 @@ def _chunk_gated_delta_rule_fwd_kernel(
     if h0_ref is not None:
       scratch_ref[...] = h0_ref[0, 0].astype(jnp.float32)
 
-  h_ref[0, 0, idx_nt] = scratch_ref[...].astype(h_ref.dtype)
+  h_ref[0, 0, 0] = scratch_ref[...].astype(h_ref.dtype)
 
   b_w = w_ref[0, 0]
   b_v = jnp.dot(
@@ -741,8 +741,9 @@ def _chunk_gated_delta_rule_fwd(
     else None
   )
 
+  # Slice one chunk per grid step to avoid allocating the full [NT, K, V] output in VMEM.
   h_blockspec_out = pl.BlockSpec(
-    [1, 1, NT, K_PADSIZE, V_ALIGNED], lambda b, h, nt: (h, b, 0, 0, 0)
+      [1, 1, 1, K_PADSIZE, V_ALIGNED], lambda b, h, nt: (h, b, nt, 0, 0)
   )
   v_new_blockspec_out = (
     pl.BlockSpec([1, 1, BT, V_ALIGNED], lambda b, h, nt: (h, b, nt, 0))
@@ -818,22 +819,21 @@ def _chunk_gated_delta_rule_fwd(
 
 @jaxtyping.jaxtyped
 def chunk_gated_delta_rule_fwd_h(
-  k: Float[Array, "H B T K"],
-  w: Float[Array, "H B T K"],
-  u: Float[Array, "H B T V"],
-  g: Float[Array, "H B T"] | None = None,
-  gk: Float[Array, "H B T K"] | None = None,
-  initial_state: (
-      Float[Array, "N_STATE H K V"]
-      | Float[Array, "B N_STATE H K V"]
-      | None
-  ) = None,
-  output_final_state: bool = False,
-  chunk_size: int = 64,
-  save_new_value: bool = True,
-  use_exp2: bool = True,
-  cu_seqlens: Int[Array, "N_CU"] | Int[Array, "B N_CU"] | None = None,
-  chunk_indices: Int[Array, "NT 2"] | Int[Array, "B NT 2"] | None = None,
+    k: Float[Array, "H B T K"],
+    w: Float[Array, "H B T K"],
+    u: Float[Array, "H B T V"],
+    g: Float[Array, "H B T"] | None = None,
+    # GW, not K: a scalar gate arrives at width 1 and broadcasts from there.
+    gk: Float[Array, "H B T GW"] | None = None,
+    initial_state: (
+        Float[Array, "N_STATE H K V"] | Float[Array, "B N_STATE H K V"] | None
+    ) = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    use_exp2: bool = True,
+    cu_seqlens: Int[Array, "N_CU"] | Int[Array, "B N_CU"] | None = None,
+    chunk_indices: Int[Array, "NT 2"] | Int[Array, "B NT 2"] | None = None,
 ) -> tuple[
     Float[Array, "H B NT K V"],
     Float[Array, "H B T V"] | None,
