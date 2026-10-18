@@ -342,7 +342,7 @@ def main_kernel(
               jnp.left_shift(value_i32, shift),
               jnp.int32(-65536),  # 0xFFFF0000
           )
-          value_f32 = plsc.bitcast(shifted, jnp.float32)
+          value_f32 = pltpu.bitcast(shifted, jnp.float32, dim=-1)
           return value_f32 * route_weights[route_lane]
 
         def fixed_two_route_column_loop(col_offset):
@@ -421,16 +421,12 @@ def main_kernel(
               accum_row_start=accum_row_start,
           ):
             col_slice = pl.ds(col_offset, TOKEN_SUBCHUNK)
-            for token_lane in range(0, TOKEN_SUBCHUNK, 2):
-              accum_row = accum_row_start + token_lane
-              packed_bf16 = plsc.pack(
-                  accum_vmem_ref[accum_row, col_slice],
-                  accum_vmem_ref[accum_row + 1, col_slice],
-                  format=plsc.PackFormat.INTERLEAVED,
-              )
-              out_tile_vmem_ref[output_buffer, token_lane // 2, col_slice] = (
-                  plsc.bitcast(packed_bf16, jnp.uint32)
-              )
+            rows_bf16 = accum_vmem_ref[
+                pl.ds(accum_row_start, TOKEN_SUBCHUNK), col_slice
+            ].astype(jnp.bfloat16)
+            out_tile_vmem_ref[output_buffer, :, col_slice] = pltpu.bitcast(
+                rows_bf16, jnp.uint32
+            )
 
           plsc.parallel_loop(0, col_chunk_size, step=TOKEN_SUBCHUNK)(
               cast_column
@@ -682,9 +678,7 @@ def ragged_gather_reduce(
           pltpu.SemaphoreType.DMA((2,)),
       ),
       compiler_params=pltpu.CompilerParams(
-          use_tc_tiling_on_sc=True,
-          disable_bounds_checks=True,
-          needs_layout_passes=False,
+          use_tc_tiling_on_sc=True, disable_bounds_checks=True
       ),
       mesh=vector_mesh,
       name="sc_ragged_gather_reduce",
