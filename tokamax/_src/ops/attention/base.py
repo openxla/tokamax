@@ -733,7 +733,14 @@ class DotProductAttention[C, K: Hashable](
       # This is not `-inf` as this can lead to `NaN`s when a full softmax row is
       # masked (with stable softmax). This is because the maximum value for the
       # row will be `-inf`, leading to `(-inf) - (-inf)` in the softmax.
-      logits = jnp.where(mask, logits, float(jnp.finfo(logits.dtype).min))
+      mask_val = float(jnp.finfo(logits.dtype).min)
+      logits = jax.lax.platform_dependent(
+          mask,
+          logits,
+          cpu=lambda m, l: l
+          + jnp.where(m, jnp.zeros((), l.dtype), 0.5 * mask_val),
+          default=lambda m, l: jnp.where(m, l, mask_val),
+      )
 
     weights, softmax_residuals = _softmax(logits, normalize_output)
 
