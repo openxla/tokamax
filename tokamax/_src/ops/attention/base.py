@@ -740,12 +740,26 @@ class DotProductAttention[C, K: Hashable](
     if dropout_mask is not None:
       weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
 
-    out = jnp.einsum(
-        "...hqk,...khd->...qhd",
-        weights,
-        v,
-        precision=weights_v_dot_precision,
-        preferred_element_type=weights_v_dot_precision.accumulation_type,
+    def _weights_v_dot_cpu(w, v_arr):
+      return jnp.einsum(
+          "...hqk,...khd->...hqd",
+          w,
+          v_arr,
+          precision=weights_v_dot_precision,
+          preferred_element_type=weights_v_dot_precision.accumulation_type,
+      ).swapaxes(-3, -2)
+
+    def _weights_v_dot_default(w, v_arr):
+      return jnp.einsum(
+          "...hqk,...khd->...qhd",
+          w,
+          v_arr,
+          precision=weights_v_dot_precision,
+          preferred_element_type=weights_v_dot_precision.accumulation_type,
+      )
+
+    out = jax.lax.platform_dependent(
+        weights, v, cpu=_weights_v_dot_cpu, default=_weights_v_dot_default
     ).astype(q.dtype)
     return out, (softmax_residuals if return_residuals else None)
 
