@@ -96,8 +96,13 @@ class GatedLinearUnit[C, K: Hashable](op.Op[Any, jax.Array, Residuals, C, K]):
       The output array.
     """
     del config  # Unused.
-    if isinstance(weights, tuple):
-      gate_weights, projection_weights = weights
+
+    def _unfused(x, weights):
+      gate_weights, projection_weights = (
+          weights
+          if isinstance(weights, tuple)
+          else (weights[:, 0], weights[:, 1])
+      )
       projection = jnp.matmul(x, projection_weights, precision=precision)
       gate = jnp.matmul(x, gate_weights, precision=precision)
       dtype = jnp.promote_types(x.dtype, jnp.float32)
@@ -112,18 +117,24 @@ class GatedLinearUnit[C, K: Hashable](op.Op[Any, jax.Array, Residuals, C, K]):
       out = (gate * projection).astype(x.dtype)
       return out, y
 
-    y = jnp.einsum('...k,kjn->...jn', x, weights, precision=precision)
-    # Apply activation and compute product of FP8/FP16/BF16 in FP32.
-    dtype = jnp.promote_types(x.dtype, jnp.float32)
-    gate, projection = jnp.split(
-        jax.lax.collapse(y, -2).astype(dtype),
-        2,
-        axis=-1,
-    )
-    if activation is not None:
-      gate = activation(gate)
-    out = (gate * projection).astype(x.dtype)
-    return out, (y if return_residuals else None)
+    if isinstance(weights, tuple):
+      return _unfused(x, weights)
+
+    def _fused(x, weights):
+      y = jnp.einsum('...k,kjn->...jn', x, weights, precision=precision)
+      # Apply activation and compute product of FP8/FP16/BF16 in FP32.
+      dtype = jnp.promote_types(x.dtype, jnp.float32)
+      gate, projection = jnp.split(
+          jax.lax.collapse(y, -2).astype(dtype),
+          2,
+          axis=-1,
+      )
+      if activation is not None:
+        gate = activation(gate)
+      out = (gate * projection).astype(x.dtype)
+      return out, (y if return_residuals else None)
+
+    return jax.lax.platform_dependent(x, weights, cpu=_unfused, default=_fused)
 
   def _with_vmap[T](
       self,
