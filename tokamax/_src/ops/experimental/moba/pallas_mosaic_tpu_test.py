@@ -19,8 +19,8 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.moba import base
 from tokamax._src.ops.experimental.moba import pallas_mosaic_tpu
-from tokamax._src.ops.experimental.moba import reference
 
 
 class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
@@ -32,19 +32,47 @@ class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
     topk = 2
 
     k0, k1, k2 = jax.random.split(key, 3)
-    q = jax.random.normal(k0, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
-    k = jax.random.normal(k1, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
-    v = jax.random.normal(k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+    q = jax.random.normal(
+        k0, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+    k = jax.random.normal(
+        k1, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+    v = jax.random.normal(
+        k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
 
     op_instance = pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention()
     (actual_out, _), _ = op_instance._fwd(
         q, k, v, topk=topk, chunk_size=chunk_size
     )
-    expected_out, _ = reference.moba_reference(
+    expected_out, _ = base.moba_reference(
         q, k, v, topk=topk, chunk_size=chunk_size
     )
 
     np.testing.assert_allclose(actual_out, expected_out, rtol=1e-5, atol=1e-5)
+
+  def test_invalid_seq_len_raises(self):
+    q = jnp.zeros((1, 2, 300, 16))
+    k = jnp.zeros((1, 2, 300, 16))
+    v = jnp.zeros((1, 2, 300, 16))
+    op_instance = pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention()
+    with self.assertRaisesRegex(ValueError, "must be divisible by chunk_size"):
+      op_instance._fwd(q, k, v, chunk_size=256)
+
+  def test_invalid_config_raises(self):
+    q = jnp.zeros((1, 2, 256, 16))
+    k = jnp.zeros((1, 2, 256, 16))
+    v = jnp.zeros((1, 2, 256, 16))
+    op_instance = pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention()
+    with self.assertRaises(NotImplementedError):
+      op_instance._fwd(
+          q,
+          k,
+          v,
+          chunk_size=256,
+          topk=-1,
+      )
 
 
 if __name__ == "__main__":

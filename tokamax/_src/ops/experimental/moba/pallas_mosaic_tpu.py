@@ -15,7 +15,6 @@
 
 """Tokamax operator wrapper for Mixture of Block Attention (MoBA)."""
 
-import dataclasses
 from typing import Annotated, Any, ClassVar
 import jax
 import pydantic
@@ -49,9 +48,31 @@ class PallasTpuMixtureOfBlockAttention(base.MixtureOfBlockAttention[Config]):
       chunk_size: int = 256,
       scale: float | None = None,
       config: Config | None = None,
+      return_residuals: bool = False,
   ) -> tuple[base.Output, None]:
-    resolved_chunk_size = config.chunk_size if config is not None else chunk_size
+    del return_residuals
+    if q.shape != k.shape or q.shape != v.shape:
+      raise ValueError(
+          f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape},"
+          f" v={v.shape}"
+      )
+    seq_len = q.shape[2]
+    if seq_len % chunk_size != 0:
+      raise ValueError(
+          f"Sequence length ({seq_len}) must be divisible by chunk_size"
+          f" ({chunk_size})."
+      )
+    resolved_chunk_size = (
+        config.chunk_size if config is not None else chunk_size
+    )
     resolved_topk = config.topk if config is not None else topk
+    if resolved_chunk_size <= 0:
+      raise NotImplementedError(
+          f"chunk_size must be positive, got {resolved_chunk_size}"
+      )
+    if resolved_topk <= 0:
+      raise NotImplementedError(f"topk must be positive, got {resolved_topk}")
+
     out, _ = pallas_mosaic_tpu_kernel.moba_pallas_fwd(
         q,
         k,
@@ -68,5 +89,8 @@ class PallasTpuMixtureOfBlockAttention(base.MixtureOfBlockAttention[Config]):
     return Config(chunk_size=256, topk=4)
 
   @override
-  def supported_on(self, device: Any) -> bool:
-    return True
+  def supported_on(self, device: jax.Device) -> bool:
+    try:
+      return device.platform == "tpu"
+    except Exception:
+      return False

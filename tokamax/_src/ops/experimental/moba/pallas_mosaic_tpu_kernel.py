@@ -37,7 +37,15 @@ def _compute_block_selection(
   q_mean = jnp.mean(q_blocks, axis=3)
   k_mean = jnp.mean(k_blocks, axis=3)
 
-  routing_scores = jnp.einsum("bhqd,bhnd->bhqn", q_mean, k_mean) * scale
+  routing_scores = (
+      jnp.einsum(
+          "bhqd,bhnd->bhqn",
+          q_mean,
+          k_mean,
+          precision=jax.lax.Precision.HIGHEST,
+      )
+      * scale
+  )
   q_idx = jnp.arange(num_blocks)[:, None]
   k_idx = jnp.arange(num_blocks)[None, :]
   historical_mask = k_idx < q_idx
@@ -50,23 +58,53 @@ def _compute_block_selection(
   return topk_idx
 
 
-def _make_flash_moba_kernel(block_q: int, effective_topk: int, scale: float) -> Any:
-  del effective_topk
+def _make_flash_moba_kernel(scale: float) -> Any:
   def _kernel(
-      q_ref: Any,
-      k_sub_ref: Any,
-      v_sub_ref: Any,
-      mask_ref: Any,
-      o_ref: Any,
+      # Inputs.
+      q_ref,  # [1, 1, 1, block_q, head_dim] dtype
+      k_ref,  # [1, 1, num_blocks, block_q, head_dim] dtype
+      v_ref,  # [1, 1, num_blocks, block_q, head_dim] dtype
+      topk_ref,  # [1, 1, 1, effective_topk] int32
+      # Outputs.
+      o_ref,  # [1, 1, 1, block_q, head_dim] dtype
   ) -> None:
-    q_i = q_ref[0, 0, 0]  # (block_q, head_dim)
-    k_sub = k_sub_ref[0, 0, 0]  # (block_k_sub, head_dim)
-    v_sub = v_sub_ref[0, 0, 0]  # (block_k_sub, head_dim)
-    mask_sub = mask_ref[0, 0, 0]  # (block_q, block_k_sub)
+    # Dimensions.
+    q_idx = pl.program_id(2)
+    q_i = q_ref[0, 0, 0]  # [block_q, head_dim]
+    block_q = q_i.shape[0]
+    head_dim = q_i.shape[1]
+    topk_i = topk_ref[0, 0, 0]  # [effective_topk]
+    effective_topk = topk_i.shape[0]
+
+    # Gather diagonal and historical keys/values directly in VMEM.
+    k_all = k_ref[0, 0]  # [num_blocks, block_q, head_dim]
+    k_diag = k_all[q_idx]  # [block_q, head_dim]
+    k_hist = k_all[topk_i]  # [effective_topk, block_q, head_dim]
+    k_sub = jnp.concatenate([k_diag[None], k_hist], axis=0).reshape(
+        -1, head_dim
+    )
+
+    v_all = v_ref[0, 0]  # [num_blocks, block_q, head_dim]
+    v_diag = v_all[q_idx]  # [block_q, head_dim]
+    v_hist = v_all[topk_i]  # [effective_topk, block_q, head_dim]
+    v_sub = jnp.concatenate([v_diag[None], v_hist], axis=0).reshape(
+        -1, head_dim
+    )
 
     qk = jnp.matmul(q_i, k_sub.T, preferred_element_type=jnp.float32) * scale
-    qk = jnp.where(mask_sub, qk, -1e9)
 
+    # Construct causal and routing mask in-kernel without HBM allocation.
+    row_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 0)
+    col_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 1)
+    causal_diag = col_idx <= row_idx
+    ranks = jnp.arange(effective_topk)
+    valid_hist = jnp.broadcast_to(
+        jnp.repeat(ranks < q_idx, block_q)[None, :],
+        (block_q, effective_topk * block_q),
+    )
+    mask_sub = jnp.concatenate([causal_diag, valid_hist], axis=1)
+
+    qk = jnp.where(mask_sub, qk, -1e9)
     max_scores = jnp.max(qk, axis=-1, keepdims=True)
     exp_scores = jnp.exp(qk - max_scores)
     denominator = jnp.sum(exp_scores, axis=-1, keepdims=True)
@@ -90,74 +128,38 @@ def _flash_moba_pallas(
   block_q = chunk_size
   num_q_blocks = seq_len // block_q
   effective_topk = topk_idx.shape[-1]
-  block_k_sub = (effective_topk + 1) * block_q
 
   q_blocks = q.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
   k_blocks = k.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
   v_blocks = v.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
 
-  def gather_sub(
-      k_bh: jax.Array, v_bh: jax.Array, topk_bh: jax.Array
-  ) -> tuple[jax.Array, jax.Array]:
-    def for_i(block_idx: int | Any) -> tuple[jax.Array, jax.Array]:
-      k_diag = k_bh[block_idx][None, :, :]
-      v_diag = v_bh[block_idx][None, :, :]
-      k_hist = k_bh[topk_bh[block_idx]]
-      v_hist = v_bh[topk_bh[block_idx]]
-      k_s = jnp.concatenate([k_diag, k_hist], axis=0).reshape(block_k_sub, head_dim)
-      v_s = jnp.concatenate([v_diag, v_hist], axis=0).reshape(block_k_sub, head_dim)
-      return k_s, v_s
-
-    return jax.vmap(for_i)(jnp.arange(num_q_blocks))
-
-  k_sub, v_sub = jax.vmap(jax.vmap(gather_sub))(k_blocks, v_blocks, topk_idx)
-
-  causal_diag = jnp.tril(jnp.ones((block_q, block_q), dtype=bool))
-
-  def make_mask_i(block_idx: int | Any) -> jax.Array:
-    ranks = jnp.arange(effective_topk)
-    valid_hist = jnp.broadcast_to(
-        jnp.repeat(ranks < block_idx, block_q)[None, :],
-        (block_q, effective_topk * block_q),
-    )
-    return jnp.concatenate([causal_diag, valid_hist], axis=1)
-
-  mask_sub = jax.vmap(make_mask_i)(jnp.arange(num_q_blocks))
-  mask_sub_b = jnp.broadcast_to(
-      mask_sub[None, None],
-      (batch_size, num_heads, num_q_blocks, block_q, block_k_sub),
-  )
-
-  kernel = _make_flash_moba_kernel(block_q, effective_topk, scale)
+  kernel = _make_flash_moba_kernel(scale)
 
   grid = (batch_size, num_heads, num_q_blocks)
-  q_spec = pl.BlockSpec(
-      (1, 1, 1, block_q, head_dim), lambda i, j, n: (i, j, n, 0, 0)
+  blk = lambda i, j, n: (i, j, n, 0, 0)
+  q_spec = pl.BlockSpec((1, 1, 1, block_q, head_dim), blk)
+  k_spec = pl.BlockSpec(
+      (1, 1, num_q_blocks, block_q, head_dim), lambda i, j, n: (i, j, 0, 0, 0)
   )
-  k_sub_spec = pl.BlockSpec(
-      (1, 1, 1, block_k_sub, head_dim), lambda i, j, n: (i, j, n, 0, 0)
+  v_spec = pl.BlockSpec(
+      (1, 1, num_q_blocks, block_q, head_dim), lambda i, j, n: (i, j, 0, 0, 0)
   )
-  v_sub_spec = pl.BlockSpec(
-      (1, 1, 1, block_k_sub, head_dim), lambda i, j, n: (i, j, n, 0, 0)
+  topk_spec = pl.BlockSpec(
+      (1, 1, 1, effective_topk), lambda i, j, n: (i, j, n, 0)
   )
-  mask_spec = pl.BlockSpec(
-      (1, 1, 1, block_q, block_k_sub), lambda i, j, n: (i, j, n, 0, 0)
-  )
-  o_spec = pl.BlockSpec(
-      (1, 1, 1, block_q, head_dim), lambda i, j, n: (i, j, n, 0, 0)
-  )
+  o_spec = pl.BlockSpec((1, 1, 1, block_q, head_dim), blk)
 
   interpret = jax.default_backend() == "cpu"
   out = pl.pallas_call(
       kernel,
       grid=grid,
-      in_specs=[q_spec, k_sub_spec, v_sub_spec, mask_spec],
+      in_specs=[q_spec, k_spec, v_spec, topk_spec],
       out_specs=o_spec,
       out_shape=jax.ShapeDtypeStruct(
           (batch_size, num_heads, num_q_blocks, block_q, head_dim), q.dtype
       ),
       interpret=interpret,
-  )(q_blocks, k_sub, v_sub, mask_sub_b)
+  )(q_blocks, k_blocks, v_blocks, topk_idx)
   return out.reshape(batch_size, num_heads, seq_len, head_dim)
 
 

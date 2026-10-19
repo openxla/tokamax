@@ -13,38 +13,84 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Unit tests for MoBA base operator."""
+"""Unit tests for MoBA base operator and API."""
 
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.moba import api
 from tokamax._src.ops.experimental.moba import base
-from tokamax._src.ops.experimental.moba import reference
 
 
 class MixtureOfBlockAttentionBaseTest(absltest.TestCase):
 
-  def test_base_matches_reference(self):
+  def test_base_forward(self):
     key = jax.random.PRNGKey(42)
     batch_size, num_heads, seq_len, head_dim = 2, 4, 512, 16
     chunk_size = 256
     topk = 2
 
     k0, k1, k2 = jax.random.split(key, 3)
-    q = jax.random.normal(k0, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
-    k = jax.random.normal(k1, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
-    v = jax.random.normal(k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32)
+    q = jax.random.normal(
+        k0, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+    k = jax.random.normal(
+        k1, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+    v = jax.random.normal(
+        k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
 
     op_instance = base.MixtureOfBlockAttention()
     (actual_out, _), _ = op_instance._fwd(
         q, k, v, topk=topk, chunk_size=chunk_size
     )
-    expected_out, _ = reference.moba_reference(
+    expected_out, _ = base.moba_reference(
         q, k, v, topk=topk, chunk_size=chunk_size
     )
 
     np.testing.assert_allclose(actual_out, expected_out, rtol=1e-5, atol=1e-5)
+    self.assertEqual(actual_out.shape, (batch_size, num_heads, seq_len, head_dim))
+
+  def test_api_forward(self):
+    key = jax.random.PRNGKey(101)
+    batch_size, num_heads, seq_len, head_dim = 1, 2, 512, 16
+    chunk_size = 256
+    topk = 2
+
+    k0, k1, k2 = jax.random.split(key, 3)
+    q = jax.random.normal(
+        k0, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+    k = jax.random.normal(
+        k1, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+    v = jax.random.normal(
+        k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+
+    api_out, _ = api.mixture_of_block_attention(
+        q, k, v, topk=topk, chunk_size=chunk_size, implementation="xla"
+    )
+    ref_out, _ = base.moba_reference(q, k, v, topk=topk, chunk_size=chunk_size)
+    np.testing.assert_allclose(api_out, ref_out, rtol=1e-5, atol=1e-5)
+
+  def test_invalid_seq_len_raises(self):
+    q = jnp.zeros((1, 2, 300, 16))
+    k = jnp.zeros((1, 2, 300, 16))
+    v = jnp.zeros((1, 2, 300, 16))
+    op_instance = base.MixtureOfBlockAttention()
+    with self.assertRaisesRegex(ValueError, "must be divisible by chunk_size"):
+      op_instance._fwd(q, k, v, chunk_size=256)
+
+  def test_shape_mismatch_raises(self):
+    q = jnp.zeros((1, 2, 256, 16))
+    k = jnp.zeros((1, 2, 256, 32))
+    v = jnp.zeros((1, 2, 256, 16))
+    op_instance = base.MixtureOfBlockAttention()
+    with self.assertRaisesRegex(ValueError, "Shapes of q, k, v must match"):
+      op_instance._fwd(q, k, v, chunk_size=256)
 
 
 if __name__ == "__main__":
