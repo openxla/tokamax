@@ -101,34 +101,35 @@ class _RWKV7:
 
     state = torch.zeros(batch_size, num_heads, key_dim, val_dim, device=q.device, dtype=torch.float32)
 
+    row_idx = torch.arange(chunk_size, device=q.device).unsqueeze(1)
+    col_idx = torch.arange(chunk_size, device=q.device).unsqueeze(0)
+    incl_causal = (col_idx <= row_idx).float()
+    strict_causal = (col_idx < row_idx).float()
+    eye = torch.eye(chunk_size, device=q.device, dtype=torch.float32)
+
     for chunk_idx in range(num_chunks):
-      st = chunk_idx * chunk_size
-      en = (chunk_idx + 1) * chunk_size
-      q_c = q[:, st:en].permute(0, 2, 1, 3).float()
-      k_c = k[:, st:en].permute(0, 2, 1, 3).float()
-      v_c = v[:, st:en].permute(0, 2, 1, 3).float()
-      a_c = alpha[:, st:en].permute(0, 2, 1, 3).float()
-      b_c = beta[:, st:en].permute(0, 2, 1, 3).float()
-      g_c = gk[:, st:en].permute(0, 2, 1, 3).float()
+      start_idx = chunk_idx * chunk_size
+      end_idx = (chunk_idx + 1) * chunk_size
+      q_c = q[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      k_c = k[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      v_c = v[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      alpha_c = alpha[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      beta_c = beta[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      gk_c = gk[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
 
-      g_cs = torch.cumsum(g_c, dim=2)
-      row_idx = torch.arange(chunk_size, device=q.device).unsqueeze(1)
-      col_idx = torch.arange(chunk_size, device=q.device).unsqueeze(0)
-      incl_causal = (col_idx <= row_idx).float()
-      strict_causal = (col_idx < row_idx).float()
+      gk_cs = torch.cumsum(gk_c, dim=2)
 
-      diff_incl = torch.clamp(g_cs.unsqueeze(3) - g_cs.unsqueeze(2), max=0.0)
+      diff_incl = torch.clamp(gk_cs.unsqueeze(3) - gk_cs.unsqueeze(2), max=0.0)
       decay_incl = torch.exp(diff_incl)
       aqk = torch.sum(q_c.unsqueeze(3) * k_c.unsqueeze(2) * decay_incl, dim=-1) * incl_causal
-      aqb = torch.sum(q_c.unsqueeze(3) * b_c.unsqueeze(2) * decay_incl, dim=-1) * incl_causal
+      aqb = torch.sum(q_c.unsqueeze(3) * beta_c.unsqueeze(2) * decay_incl, dim=-1) * incl_causal
 
-      g_excl = g_cs - g_c
-      diff_excl = torch.clamp(g_excl.unsqueeze(3) - g_cs.unsqueeze(2), max=0.0)
+      gk_excl = gk_cs - gk_c
+      diff_excl = torch.clamp(gk_excl.unsqueeze(3) - gk_cs.unsqueeze(2), max=0.0)
       decay_excl = torch.exp(diff_excl)
-      a_ab = torch.sum(a_c.unsqueeze(3) * b_c.unsqueeze(2) * decay_excl, dim=-1) * strict_causal
-      a_ak = torch.sum(a_c.unsqueeze(3) * k_c.unsqueeze(2) * decay_excl, dim=-1) * strict_causal
+      a_ab = torch.sum(alpha_c.unsqueeze(3) * beta_c.unsqueeze(2) * decay_excl, dim=-1) * strict_causal
+      a_ak = torch.sum(alpha_c.unsqueeze(3) * k_c.unsqueeze(2) * decay_excl, dim=-1) * strict_causal
 
-      eye = torch.eye(chunk_size, device=q.device, dtype=torch.float32)
       p_mat = eye + a_ab
       curr = a_ab
       for _ in range(1, 6):
@@ -137,25 +138,25 @@ class _RWKV7:
       a_ab_inv = p_mat
 
       ak_v = torch.matmul(a_ak, v_c)
-      decayed_alpha = torch.exp(torch.clamp(g_excl, max=0.0)) * a_c
+      decayed_alpha = torch.exp(torch.clamp(gk_excl, max=0.0)) * alpha_c
       merged_rhs = torch.cat([ak_v, decayed_alpha], dim=-1)
       merged_uw = torch.matmul(a_ab_inv, merged_rhs)
-      u_c = merged_uw[:, :, :, :v_dim]
-      w_c = merged_uw[:, :, :, v_dim:]
+      u_c = merged_uw[:, :, :, :val_dim]
+      w_c = merged_uw[:, :, :, val_dim:]
 
       v2_c = u_c + torch.matmul(w_c, state.to(w_c.dtype))
       o_1 = torch.matmul(aqk, v_c)
       o_2 = torch.matmul(aqb, v2_c)
-      o_3 = torch.matmul(q_c * torch.exp(torch.clamp(g_cs, max=0.0)), state.to(q_c.dtype))
+      o_3 = torch.matmul(q_c * torch.exp(torch.clamp(gk_cs, max=0.0)), state.to(q_c.dtype))
       o_c = o_1 + o_2 + o_3
       outs.append(o_c.permute(0, 2, 1, 3).to(q.dtype))
 
-      g_last = g_cs[:, :, -1, :]
-      decay_last = torch.exp(torch.clamp(g_last[:, :, None, :] - g_cs, max=0.0))
+      g_last = gk_cs[:, :, -1, :]
+      decay_last = torch.exp(torch.clamp(g_last[:, :, None, :] - gk_cs, max=0.0))
       state = (
           state * torch.exp(torch.clamp(g_last, max=0.0))[:, :, :, None]
           + torch.matmul((k_c * decay_last).transpose(-1, -2), v_c)
-          + torch.matmul((b_c * decay_last).transpose(-1, -2), v2_c)
+          + torch.matmul((beta_c * decay_last).transpose(-1, -2), v2_c)
       )
 
     return torch.cat(outs, dim=1)

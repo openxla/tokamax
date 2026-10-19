@@ -22,7 +22,6 @@ from tokamax._src.ops import op
 from tokamax._src.ops.experimental.rwkv7 import reference
 from typing_extensions import override
 
-_Config = TypeVar("_Config")
 Output: TypeAlias = tuple[jax.Array, jax.Array | None]
 Residuals: TypeAlias = Any
 

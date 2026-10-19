@@ -31,6 +31,29 @@ def _chunkify(x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int) -
   return jnp.transpose(x, perm)
 
 
+def _move_nt_front(x: jax.Array) -> jax.Array:
+  return jnp.moveaxis(x, 2, 0)
+
+
+def _scan_body(s: jax.Array, chunk_inputs: tuple[Any, ...]) -> tuple[jax.Array, jax.Array]:
+  q_i, k_i, v_i, beta_i, gk_cs_i, aqk_i, aqb_i, u_i, w_i = chunk_inputs
+  v2_i = u_i + jnp.matmul(w_i, s, preferred_element_type=jnp.float32)
+  o_1 = jnp.matmul(aqk_i, v_i, preferred_element_type=jnp.float32)
+  o_2 = jnp.matmul(aqb_i, v2_i, preferred_element_type=jnp.float32)
+  o_3 = jnp.matmul(
+      q_i * jnp.exp(jnp.minimum(gk_cs_i, 0.0)), s, preferred_element_type=jnp.float32
+  )
+  o_i = o_1 + o_2 + o_3
+  g_last = gk_cs_i[-1]
+  decay_last = jnp.exp(jnp.minimum(g_last[None, :] - gk_cs_i, 0.0))
+  s_new = (
+      s * jnp.exp(jnp.minimum(g_last, 0.0))[:, None]
+      + jnp.matmul((k_i * decay_last).T, v_i, preferred_element_type=jnp.float32)
+      + jnp.matmul((beta_i * decay_last).T, v2_i, preferred_element_type=jnp.float32)
+  )
+  return s_new.astype(s.dtype), o_i.astype(u_i.dtype)
+
+
 def _make_rwkv7_intra_chunk_kernel(bt: int) -> Any:
   def _kernel(
       q_ref: Any,
@@ -162,32 +185,11 @@ def rwkv7_pallas_fwd(
       q_c, k_c, v_c, alpha_c, beta_c, gk_c, gk_cs_c
   )
 
-  def move_nt_front(x: jax.Array) -> jax.Array:
-    return jnp.moveaxis(x, 2, 0)
-
   q_s, k_s, v_s, beta_s, gk_cs_s, aqk_s, aqb_s, u_s, w_s = map(
-      move_nt_front, (q_c, k_c, v_c, beta_c, gk_cs_c, aqk, aqb, u, w)
+      _move_nt_front, (q_c, k_c, v_c, beta_c, gk_cs_c, aqk, aqb, u, w)
   )
 
-  def scan_body(s, chunk_inputs):
-    q_i, k_i, v_i, beta_i, gk_cs_i, aqk_i, aqb_i, u_i, w_i = chunk_inputs
-    v2_i = u_i + jnp.matmul(w_i, s, preferred_element_type=jnp.float32)
-    o_1 = jnp.matmul(aqk_i, v_i, preferred_element_type=jnp.float32)
-    o_2 = jnp.matmul(aqb_i, v2_i, preferred_element_type=jnp.float32)
-    o_3 = jnp.matmul(
-        q_i * jnp.exp(jnp.minimum(gk_cs_i, 0.0)), s, preferred_element_type=jnp.float32
-    )
-    o_i = o_1 + o_2 + o_3
-    g_last = gk_cs_i[-1]
-    decay_last = jnp.exp(jnp.minimum(g_last[None, :] - gk_cs_i, 0.0))
-    s_new = (
-        s * jnp.exp(jnp.minimum(g_last, 0.0))[:, None]
-        + jnp.matmul((k_i * decay_last).T, v_i, preferred_element_type=jnp.float32)
-        + jnp.matmul((beta_i * decay_last).T, v2_i, preferred_element_type=jnp.float32)
-    )
-    return s_new.astype(s.dtype), o_i.astype(u_i.dtype)
-
-  scan_body_batched = jax.vmap(jax.vmap(scan_body))
+  scan_body_batched = jax.vmap(jax.vmap(_scan_body))
 
   if initial_state is None:
     s0 = jnp.zeros((batch_size, num_heads, key_dim, val_dim), dtype=jnp.float32)
