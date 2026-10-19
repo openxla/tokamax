@@ -15,6 +15,15 @@
 
 """Pallas TPU compute kernel for Mixture of Block Attention (MoBA)."""
 
+# Dimensions:
+# B: batch_size
+# H: num_heads
+# T: seq_len
+# D: head_dim
+# NB: num_blocks (T // block_q)
+# BQ: block_q (chunk_size)
+# K_eff: effective_topk
+
 from typing import Any
 import jax
 from jax.experimental import pallas as pl
@@ -61,30 +70,30 @@ def _compute_block_selection(
 def _make_flash_moba_kernel(scale: float) -> Any:
   def _kernel(
       # Inputs.
-      q_ref,  # [1, 1, 1, block_q, head_dim] dtype
-      k_ref,  # [1, 1, num_blocks, block_q, head_dim] dtype
-      v_ref,  # [1, 1, num_blocks, block_q, head_dim] dtype
-      topk_ref,  # [1, 1, 1, effective_topk] int32
+      q_vmem_ref,  # [1, 1, 1, block_q, head_dim] dtype
+      k_vmem_ref,  # [1, 1, num_blocks, block_q, head_dim] dtype
+      v_vmem_ref,  # [1, 1, num_blocks, block_q, head_dim] dtype
+      topk_vmem_ref,  # [1, 1, 1, effective_topk] int32
       # Outputs.
-      o_ref,  # [1, 1, 1, block_q, head_dim] dtype
+      o_vmem_ref,  # [1, 1, 1, block_q, head_dim] dtype
   ) -> None:
     # Dimensions.
     q_idx = pl.program_id(2)
-    q_i = q_ref[0, 0, 0]  # [block_q, head_dim]
+    q_i = q_vmem_ref[0, 0, 0]  # [block_q, head_dim]
     block_q = q_i.shape[0]
     head_dim = q_i.shape[1]
-    topk_i = topk_ref[0, 0, 0]  # [effective_topk]
+    topk_i = topk_vmem_ref[0, 0, 0]  # [effective_topk]
     effective_topk = topk_i.shape[0]
 
     # Gather diagonal and historical keys/values directly in VMEM.
-    k_all = k_ref[0, 0]  # [num_blocks, block_q, head_dim]
+    k_all = k_vmem_ref[0, 0]  # [num_blocks, block_q, head_dim]
     k_diag = k_all[q_idx]  # [block_q, head_dim]
     k_hist = k_all[topk_i]  # [effective_topk, block_q, head_dim]
     k_sub = jnp.concatenate([k_diag[None], k_hist], axis=0).reshape(
         -1, head_dim
     )
 
-    v_all = v_ref[0, 0]  # [num_blocks, block_q, head_dim]
+    v_all = v_vmem_ref[0, 0]  # [num_blocks, block_q, head_dim]
     v_diag = v_all[q_idx]  # [block_q, head_dim]
     v_hist = v_all[topk_i]  # [effective_topk, block_q, head_dim]
     v_sub = jnp.concatenate([v_diag[None], v_hist], axis=0).reshape(
@@ -111,7 +120,7 @@ def _make_flash_moba_kernel(scale: float) -> Any:
     weights = exp_scores / denominator
 
     o_i = jnp.matmul(weights, v_sub, preferred_element_type=jnp.float32)
-    o_ref[0, 0, 0] = o_i.astype(o_ref.dtype)
+    o_vmem_ref[0, 0, 0] = o_i.astype(o_vmem_ref.dtype)
 
   return _kernel
 
