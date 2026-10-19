@@ -256,6 +256,37 @@ class PydanticTest(parameterized.TestCase):
     self.assertEqual("bfloat16", adapter.dump_python(ml_dtypes.bfloat16))
     self.assertEqual(ml_dtypes.bfloat16, adapter.validate_json('"bfloat16"'))
 
+  def test_mesh_serialization(self):
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]),
+        ("d",),
+        axis_types=(jax.sharding.AxisType.Explicit,),
+    )
+    adapter = pydantic.TypeAdapter(
+        pydantic_lib.annotate(jax.sharding.Mesh | None)
+    )
+    self.assertIs(mesh, adapter.validate_python(adapter.dump_python(mesh)))
+    expected = dict(axis_names=["d"], axis_sizes=[1], axis_types=["Explicit"])
+    self.assertEqual(expected, json.loads(adapter.dump_json(mesh)))
+    mesh_roundtrip = adapter.validate_json(adapter.dump_json(mesh))
+    self.assertIsInstance(mesh_roundtrip, jax.sharding.AbstractMesh)
+    self.assertEqual(
+        jax.sharding.AbstractMesh(
+            (1,), ("d",), axis_types=(jax.sharding.AxisType.Explicit,)
+        ),
+        mesh_roundtrip,
+    )
+    self.assertIsNone(adapter.validate_json(adapter.dump_json(None)))
+
+  def test_abstract_mesh_roundtrip(self):
+    mesh = jax.sharding.AbstractMesh(
+        (2, 4), ("x", "y"), axis_types=(jax.sharding.AxisType.Auto,) * 2
+    )
+    adapter = pydantic.TypeAdapter(
+        pydantic_lib.annotate(jax.sharding.AbstractMesh)
+    )
+    self.assertEqual(mesh, adapter.validate_json(adapter.dump_json(mesh)))
+
 
 if __name__ == "__main__":
   absltest.main()

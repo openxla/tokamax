@@ -62,3 +62,19 @@ class ArgSpec:
         p.lower() == device.platform or p == device.device_kind
         for p in self.excluded_platforms
     )
+
+  @property
+  def num_devices(self) -> int:
+    """The number of devices required, i.e. the size of the largest mesh.
+
+    Meshes are found in `args`, either directly or in `jax.NamedSharding`s of
+    array-like arguments. Arg specs without a mesh require a single device.
+    """
+    sizes = [1]
+    for x in jax.tree.leaves(self.args):
+      sharding = getattr(x, 'sharding', None)
+      if isinstance(x, (jax.sharding.Mesh, jax.sharding.AbstractMesh)):
+        sizes.append(x.size)
+      elif isinstance(sharding, jax.NamedSharding):
+        sizes.append(sharding.mesh.size)
+    return max(sizes)

@@ -113,6 +113,8 @@ def annotate(ty: Any) -> Any:
       return Annotated[ty, EnumByName]
     if issubclass(ty, np.dtype):
       return NumpyDtype
+    if issubclass(ty, (jax.sharding.Mesh, jax.sharding.AbstractMesh)):
+      return Annotated[ty, MeshShape]
 
   origin = typing.get_origin(ty) or ty
   if hasattr(origin, '__get_pydantic_core_schema__'):
@@ -270,6 +272,60 @@ EnumByName = pydantic.GetPydanticSchema(
         ),
     )
 )
+
+
+class MeshShape:
+  """Serializes `jax.sharding.Mesh`es to their abstract shape.
+
+  Only the axis names, sizes and types are serialized, so (like arrays, which
+  deserialize to `jax.ShapeDtypeStruct`s) meshes deserialize to
+  `jax.sharding.AbstractMesh`es.
+  """
+
+  @classmethod
+  def __get_pydantic_core_schema__(cls, source, handler):
+    del handler  # Unused.
+    assert issubclass(source, (jax.sharding.Mesh, jax.sharding.AbstractMesh))
+
+    def serialize(mesh, info) -> Any:
+      if info.mode == 'python':
+        return mesh
+      return dict(
+          axis_names=list(mesh.axis_names),
+          axis_sizes=list(mesh.axis_sizes),
+          axis_types=[t.name for t in mesh.axis_types],
+      )
+
+    def to_abstract_mesh(value: dict[str, Any]) -> jax.sharding.AbstractMesh:
+      axis_types = tuple(jax.sharding.AxisType[t] for t in value['axis_types'])
+      return jax.sharding.AbstractMesh(
+          tuple(value['axis_sizes']),
+          tuple(value['axis_names']),
+          axis_types=axis_types,
+      )
+
+    list_field = lambda s: cs.typed_dict_field(cs.list_schema(s))
+    dict_schema = cs.typed_dict_schema(
+        dict(
+            axis_names=list_field(cs.str_schema()),
+            axis_sizes=list_field(cs.int_schema()),
+            axis_types=list_field(cs.str_schema()),
+        )
+    )
+    from_dict_schema = cs.chain_schema(
+        [dict_schema, cs.no_info_plain_validator_function(to_abstract_mesh)]
+    )
+    return cs.json_or_python_schema(
+        json_schema=from_dict_schema,
+        python_schema=cs.union_schema([
+            cs.is_instance_schema(jax.sharding.Mesh),
+            cs.is_instance_schema(jax.sharding.AbstractMesh),
+            from_dict_schema,
+        ]),
+        serialization=cs.plain_serializer_function_ser_schema(
+            serialize, info_arg=True
+        ),
+    )
 
 
 class ShapeDtype:
