@@ -59,6 +59,7 @@ def routing_moe_local(
     ep_axis: str | None,
     tp_axis: str | None,
     use_sp: bool,
+    remote_combine: bool,
 ) -> jax.Array:
   """MPMD MoE function that invokes io kernels and routing gmm."""
 
@@ -119,16 +120,22 @@ def routing_moe_local(
       group_offset=group_offset,
   )
 
-  # Step 6: Invoke GMM Down.
+  # Step 6: Invoke GMM Down. With remote_combine, each row is DMAed to the
+  # device that owns its token, so every device ends up with all topk rows of
+  # its own token shard.
   gmm2_res = gmm.routing_gmm(
       x=gmm1_res,
       w=arg.make_weight_wrapper(w2, w2_scale, w2_bias),
       group_sizes=group_sizes,
-      scatter=arg.make_routing_wrapper(topk_argsort_indices),
+      scatter=arg.make_routing_wrapper(
+          topk_argsort_indices,
+          remote_axis=reduction_axis if remote_combine else None,
+      ),
       group_offset=group_offset,
   )
 
-  # Step 7: Postprocess outputs from routing gmm.
+  # Step 7: Postprocess outputs from routing gmm. With remote_combine, the rows
+  # are already this device's token shard and are reduced as such.
   out = output_reduce.output_reduce_unpack(
       gmm2_res,
       topk_weights,
@@ -137,6 +144,12 @@ def routing_moe_local(
       w1.shape[0],
   )
 
+  # Step 8: Combine across devices. A remote combine already left each device
+  # with its own tokens' output.
+  if remote_combine:
+    if use_sp:
+      return out
+    return jax.lax.all_gather(out, axis_name=reduction_axis, axis=0, tiled=True)
   if use_sp:
     out = jax.lax.psum_scatter(
         out, axis_name=reduction_axis, scatter_dimension=0, tiled=True
@@ -154,6 +167,7 @@ def routing_moe_local(
         "ep_axis",
         "tp_axis",
         "use_sp",
+        "remote_combine",
         "activation",
         "scoring_fn",
     )
@@ -175,6 +189,7 @@ def routing_moe(
     tp_axis: str | None,
     ep_axis: str | None,
     use_sp: bool = False,
+    remote_combine: bool = False,
 ) -> jax.Array:
   """Route tokens in hidden_states into each experts based on routing.
 
@@ -195,6 +210,8 @@ def routing_moe(
       tp_axis: tensor parallelism axis name.
       ep_axis: expert parallelism axis name.
       use_sp: use sequence parallelism.
+      remote_combine: with ep_axis, DMA each output row straight to the device
+        that owns its token instead of reducing across devices.
 
   Returns:
       Output of moe operation [num_tokens, hidden_size]
@@ -211,6 +228,8 @@ def routing_moe(
 
   if w1_bias is not None or w2_bias is not None:
     raise NotImplementedError("Bias is currently not supported.")
+  if remote_combine and ep_axis is None:
+    raise ValueError("remote_combine requires ep_axis.")
 
   w1_spec = P(ep_axis, None, tp_axis)
   w1_scale_spec = None if w1_scale is None else P(ep_axis, None, None, tp_axis)
@@ -229,6 +248,7 @@ def routing_moe(
           ep_axis=ep_axis,
           tp_axis=tp_axis,
           use_sp=use_sp,
+          remote_combine=remote_combine,
       ),
       mesh=mesh,
       in_specs=(

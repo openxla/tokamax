@@ -57,7 +57,9 @@ def gmm_wrapper(
       rhs_bias=rhs_bias,
       group_sizes=group_sizes,
       group_offset=group_offset[0],
-      zero_initialize=False,
+      # ragged_gather_reduce multiplies other shards' rows by 0 instead of
+      # skipping them, so a NaN left in uninitialized rows would survive.
+      zero_initialize=True,
       fuse_act=fuse_act,
   )
 

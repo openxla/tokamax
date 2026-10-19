@@ -191,6 +191,7 @@ class RoutingGmmConfig:
         row_size=dim.size_out_m // dim.size_ep,
         col_size=dim.size_out_n,
         dtype=x.dtype if out_dtype is None else out_dtype,
+        row_shard_axis=None if scatter is None else scatter.remote_axis,
     )
 
     def _resolve_mode(routing: arg.RoutingSpec | None) -> RoutingMode:

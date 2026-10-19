@@ -175,6 +175,7 @@ class MoEKernelTest(parameterized.TestCase):
       rtol: float = 2e-2,
       capture_xprof: bool = False,
       num_cores: int | None = None,
+      remote_combine: bool = False,
   ):
     if num_cores is None:
       num_cores = len(self.mesh_devices)
@@ -305,6 +306,7 @@ class MoEKernelTest(parameterized.TestCase):
         ep_axis=ep_axis,
         tp_axis=tp_axis,
         use_sp=use_sp,
+        remote_combine=remote_combine,
         scoring_fn="softmax",
     )
 
@@ -336,6 +338,47 @@ class MoEKernelTest(parameterized.TestCase):
         num_tokens=num_tokens,
         seed=1234,
         renormalize_topk_logits=renormalize_topk_logits,
+    )
+
+  @parameterized.product(use_sp=[True, False])
+  def test_remote_combine(self, use_sp):
+    self._test_moe(
+        dtype=jnp.bfloat16,
+        top_k=8,
+        num_experts=128,
+        hidden_size=1024,
+        intermediate_size=1024,
+        num_tokens=8 * 32,
+        seed=1234,
+        renormalize_topk_logits=True,
+        use_ep=True,
+        use_sp=use_sp,
+        remote_combine=True,
+    )
+
+  @parameterized.product(
+      num_tokens=[1280, 10240],
+      use_sp=[True, False],
+      remote_combine=[False, True],
+  )
+  def test_benchmark_remote_combine(self, num_tokens, use_sp, remote_combine):
+    """Whole MoE layer at EP=4, local vs remote combine."""
+    if len(self.mesh_devices) < 4:
+      self.skipTest("Skipping due to insufficient number of chips.")
+    self._test_moe(
+        dtype=jnp.bfloat16,
+        top_k=8,
+        num_experts=256,
+        hidden_size=4096,
+        intermediate_size=1024,
+        num_tokens=num_tokens,
+        seed=54321,
+        renormalize_topk_logits=True,
+        use_ep=True,
+        use_sp=use_sp,
+        remote_combine=remote_combine,
+        num_cores=4,
+        capture_xprof=True,
     )
 
   @parameterized.product(
