@@ -120,25 +120,15 @@ def _bar_operation(
 
     @plgpu.inline_mgpu()
     def bar_op(_):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [],
-          f"bar.{operation} {barrier_id}, {num_threads};",
-          "",
-          has_side_effects=True,
-      )
+      mgpu.utils.inline_ptx(f"bar.{operation} {barrier_id}, {num_threads};")
 
     bar_op()
   else:
 
     @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
     def bar_op(_, barrier_id):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [barrier_id.registers[()]],
-          f"bar.{operation} $0, {num_threads};",
-          "r",
-          has_side_effects=True,
+      mgpu.utils.inline_ptx(
+          f"bar.{operation} $0, {num_threads};", barrier_id.registers[()]
       )
 
     bar_op(barrier_id)
