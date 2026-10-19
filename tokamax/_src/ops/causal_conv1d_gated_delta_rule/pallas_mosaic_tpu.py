@@ -19,6 +19,7 @@ import itertools
 from typing import Annotated, ClassVar, Optional, override
 
 import jax
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import pydantic
@@ -119,8 +120,36 @@ class PallasMosaicTpuCausalConv1dGatedDeltaRule(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba  # Unused.
-    return Config()
+    # Resolve the VMEM heuristic to concrete tile sizes, mirroring
+    # `wrapper.fused_conv1d_gdn`. Returning `Config()` instead would make the
+    # heuristic a separate autotuning candidate that duplicates one of the
+    # explicit configs and is serialized as null tile sizes in the cache.
+    args = ba.arguments
+    qkv = args["qkv"]
+    batch_size = qkv.shape[0]
+    num_seqs = args["state_indices"].shape[0]
+    window_size = args["num_spec_tokens"] + 1
+    packing = 4 // jnp.dtype(qkv.dtype).itemsize
+    decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+        batch_size=batch_size,
+        num_seqs=num_seqs,
+        padded_batch_size=pl.cdiv(batch_size, packing) * packing,
+        n_kq=args["n_kq"],
+        n_v=args["n_v"],
+        d_k=args["d_k"],
+        d_v=args["d_v"],
+        kernel_size=args["kernel_size"],
+        conv_state_dim_size=args["conv_state"].shape[-1],
+        act_out_dtype=qkv.dtype,
+        recurrent_state_dtype=args["recurrent_state"].dtype,
+        num_lanes=pltpu.get_tpu_info().num_lanes,
+        decode_vmem_limit_bytes=GDNConfig.get_vmem_limit_bytes(window_size),
+        mixed_vmem_limit_bytes=GDNConfig.get_vmem_limit_bytes(),
+        window_size=window_size,
+    )
+    return Config(
+        decode_tile_size=decode_tile_size, mixed_tile_size=mixed_tile_size
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
