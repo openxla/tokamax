@@ -68,6 +68,40 @@ SHAPES = [
     ),
 ]
 
+# Add test cases with less rows than experts, for utilization of our code.
+DECODE_SHAPES = [
+    dict(
+        testcase_name="decode_16",
+        num_tokens=16,
+        size_k=512,
+        size_n=1024,
+        num_experts=512,
+        ep_size=1,
+        topk=10,
+    ),
+    dict(
+        testcase_name="decode_64_ep8",
+        num_tokens=64,
+        size_k=512,
+        size_n=1024,
+        num_experts=512,
+        ep_size=8,
+        topk=10,
+    ),
+]
+
+# Decode shapes with an explicit skip_metadata_size: 0 (the plain loop), small
+# and large skips, and one past the number of groups.
+SKIP_METADATA_SHAPES = [
+    dict(
+        shape,
+        testcase_name=f"{shape['testcase_name']}_skip{skip}",
+        skip_metadata_size=skip,
+    )
+    for shape in DECODE_SHAPES
+    for skip in (0, 1, 2, 63, 1024)
+]
+
 
 def ragged_permute_gmm(lhs, rhs, rhs_scale, group_sizes, gather_indices):
   lhs = ragged_gather_pallas(
@@ -255,7 +289,7 @@ class RoutingGmmTest(parameterized.TestCase):
     self.assertLess(latency_ms["fused"], latency_ms["ragged"])
 
   @parameterized.product(
-      SHAPES,
+      [*SHAPES, *DECODE_SHAPES],
       tile_n=[None, 512],
   )
   def test_permute_gmm_numerics(self, tile_n, **shape):
@@ -285,7 +319,7 @@ class RoutingGmmTest(parameterized.TestCase):
     )
 
   @parameterized.product(
-      SHAPES,
+      [*SHAPES, *DECODE_SHAPES],
       tile_n=[None, 512],
   )
   def test_gmm_unpermute_numerics(self, tile_n, **shape):
@@ -307,6 +341,54 @@ class RoutingGmmTest(parameterized.TestCase):
         rtol=2e-2,
         atol=1e-2,
     )
+
+  @parameterized.named_parameters(*SKIP_METADATA_SHAPES)
+  def test_skip_metadata_size(self, skip_metadata_size, **shape):
+    # Skipping only changes how the metadata walks the groups, not the tiles it
+    # writes, so any skip must give the same output as the default plan.
+    self._setup_inputs(**shape)
+    custom_plan = gmm_plan.RoutingGmmPlan(skip_metadata_size=skip_metadata_size)
+    # Only rows of this shard's groups are written.
+    gathered_rows = np.arange(self.num_valid_rows)
+    scattered_rows = self.topk_argsort_indices[: self.num_valid_rows]
+    for rows, kwargs in (
+        (
+            gathered_rows,
+            dict(
+                x=self.lhs_compact,
+                w=self.rhs_q_wrapped,
+                gather=self.gather,
+                fuse_act="silu",
+            ),
+        ),
+        (
+            scattered_rows,
+            dict(
+                x=self.lhs_gathered_compact,
+                w=self.rhs_wrapped,
+                scatter=self.scatter,
+            ),
+        ),
+    ):
+      expected = gmm.routing_gmm(group_sizes=self.group_sizes, **kwargs)
+      actual = gmm.routing_gmm(
+          group_sizes=self.group_sizes, custom_plan=custom_plan, **kwargs
+      )
+      expected = expected.data.reshape(expected.spec.large_shape)
+      actual = actual.data.reshape(actual.spec.large_shape)
+      np.testing.assert_array_equal(actual[rows], expected[rows])
+
+  def test_negative_skip_metadata_size(self):
+    self._setup_inputs(**DECODE_SHAPES[0])
+    with self.assertRaisesRegex(ValueError, "skip_metadata_size"):
+      gmm.routing_gmm(
+          self.lhs_compact,
+          self.rhs_q_wrapped,
+          self.group_sizes,
+          gather=self.gather,
+          fuse_act="silu",
+          custom_plan=gmm_plan.RoutingGmmPlan(skip_metadata_size=-1),
+      )
 
   @parameterized.named_parameters(*SHAPES)
   def test_permute_gmm_benchmark(self, **shape):

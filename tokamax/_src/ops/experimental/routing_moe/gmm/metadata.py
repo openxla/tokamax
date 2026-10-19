@@ -148,6 +148,27 @@ class MetadataRef:
       )
       return next_num_gm
 
-    num_gm = jax.lax.fori_loop(group_start, group_end, write_group, 0)
+    # Walk the groups, but skip over "skip" consecutive empty elements.
+    skip = self.cfg.plan.skip_metadata_size
+
+    def step(carry):
+      group_id, num_gm = carry
+      ahead = jnp.minimum(group_id + skip + 1, group_end)
+      empty = self.group_cum_sum[ahead] == self.group_cum_sum[group_id]
+      # If the cumulative sum hasn't changed, then we can skip these.
+      num_gm = write_group(
+          group_id, num_gm
+      )  # if the group is empty, nothing is written.
+      return jnp.where(empty, ahead, group_id + 1), num_gm
+
+    if skip == 0:
+      # There's overhead of our checks, so standard fori is better here.
+      num_gm = jax.lax.fori_loop(group_start, group_end, write_group, 0)
+    else:
+      _, num_gm = jax.lax.while_loop(
+          lambda carry: carry[0] < group_end,
+          step,
+          (group_start, jnp.int32(0)),
+      )
     self.num_gm[0] = num_gm
     return num_gm

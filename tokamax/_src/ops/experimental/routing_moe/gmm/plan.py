@@ -47,6 +47,8 @@ class RoutingGmmPlan:
   # Block size if dynamic quantization is performed.
   x_quant_block_size: int | None = None
   vmem_limit_bytes: int | None = None
+  # Size of gap to try skipping when writing to metadata.
+  skip_metadata_size: int | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -64,6 +66,7 @@ class ResolvedPlan(RoutingGmmPlan):
   # None unless x is dynamically quantized.
   x_quant_block_size: int | None
   vmem_limit_bytes: int
+  skip_metadata_size: int
 
   @property
   def bucket_rows(self):
@@ -101,6 +104,7 @@ class ResolvedPlan(RoutingGmmPlan):
       x: arg.ActivationSpec,
       w: arg.WeightSpec,
       size_out_m: int,
+      size_global_groups: int,
       size_k: int,
       size_out_n: int,
       tpu_info: pltpu.TpuInfo,
@@ -126,6 +130,16 @@ class ResolvedPlan(RoutingGmmPlan):
     acc_dtype = plan.acc_dtype
     if acc_dtype is None:
       acc_dtype = jnp.bfloat16.dtype
+
+    skip_metadata_size = plan.skip_metadata_size
+    if skip_metadata_size is None:
+      # largest power of 2 <= expected gap between touched experts
+      gap = max(1, size_global_groups // size_out_m)
+      skip_metadata_size = (1 << (gap.bit_length() - 1)) - 1
+    if skip_metadata_size < 0:
+      raise ValueError(
+          f"skip_metadata_size must be >= 0. Got {skip_metadata_size}."
+      )
 
     vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
     tile_m, tile_k, tile_n, bucket_base, num_xo_buffers, num_w_buffers = (
@@ -153,6 +167,7 @@ class ResolvedPlan(RoutingGmmPlan):
         matmul_dtype=matmul_dtype,
         x_quant_block_size=x_quant_block_size,
         vmem_limit_bytes=vmem_limit_bytes,
+        skip_metadata_size=skip_metadata_size,
     )
 
 

@@ -77,6 +77,7 @@ def routing_gmm(
       x=x.spec,
       w=w.spec,
       size_out_m=dim.size_out_m,
+      size_global_groups=dim.size_global_groups,
       size_k=dim.size_k,
       size_out_n=dim.size_out_n,
       tpu_info=tpu_info,
