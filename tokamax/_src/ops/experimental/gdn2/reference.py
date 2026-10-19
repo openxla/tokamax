@@ -30,6 +30,23 @@ def _chunkify(x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int) -
   return jnp.transpose(x, perm)
 
 
+def _move_nt_front(x: jax.Array) -> jax.Array:
+  return jnp.moveaxis(x, 2, 0)
+
+
+def _scan_body(s: jax.Array, chunk_inputs: tuple[Any, ...]) -> tuple[jax.Array, jax.Array]:
+  q_i, k_i, g_i, wwy_i, u_i, aqk_i = chunk_inputs
+  v_i = u_i - jnp.matmul(wwy_i, s, preferred_element_type=jnp.float32)
+  o_i = jnp.matmul(
+      q_i * jnp.exp(g_i), s, preferred_element_type=jnp.float32
+  ) + jnp.matmul(aqk_i, v_i, preferred_element_type=jnp.float32)
+  g_last = g_i[-1]
+  decayed_k = jnp.exp(g_last[None, :] - g_i) * k_i
+  s_update = jnp.matmul(decayed_k.T, v_i, preferred_element_type=jnp.float32)
+  s_new = s * jnp.exp(g_last)[:, None] + s_update
+  return s_new.astype(s.dtype), o_i.astype(u_i.dtype)
+
+
 def _intra_chunk_one_plain(
     q_i: jax.Array,
     k_i: jax.Array,
@@ -102,26 +119,11 @@ def gdn2_reference(
   vmap_intra = jax.vmap(jax.vmap(jax.vmap(_intra_chunk_one_plain)))
   wwy, u, aqk = vmap_intra(q_c, k_c, v_c, g_c, b_c, w_c)
 
-  def move_nt_front(x: jax.Array) -> jax.Array:
-    return jnp.moveaxis(x, 2, 0)
-
   q_s, k_s, g_s, wwy_s, u_s, aqk_s = map(
-      move_nt_front, (q_c, k_c, g_c, wwy, u, aqk)
+      _move_nt_front, (q_c, k_c, g_c, wwy, u, aqk)
   )
 
-  def scan_body(s, chunk_inputs):
-    q_i, k_i, g_i, wwy_i, u_i, aqk_i = chunk_inputs
-    v_i = u_i - jnp.matmul(wwy_i, s, preferred_element_type=jnp.float32)
-    o_i = jnp.matmul(
-        q_i * jnp.exp(g_i), s, preferred_element_type=jnp.float32
-    ) + jnp.matmul(aqk_i, v_i, preferred_element_type=jnp.float32)
-    g_last = g_i[-1]
-    decayed_k = jnp.exp(g_last[None, :] - g_i) * k_i
-    s_update = jnp.matmul(decayed_k.T, v_i, preferred_element_type=jnp.float32)
-    s_new = s * jnp.exp(g_last)[:, None] + s_update
-    return s_new.astype(s.dtype), o_i.astype(u_i.dtype)
-
-  scan_body_batched = jax.vmap(jax.vmap(scan_body))
+  scan_body_batched = jax.vmap(jax.vmap(_scan_body))
 
   if initial_state is None:
     s0 = jnp.zeros((batch_size, num_heads, key_dim, val_dim), dtype=jnp.float32)

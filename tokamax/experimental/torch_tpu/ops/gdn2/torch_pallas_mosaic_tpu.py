@@ -47,9 +47,9 @@ class _PallasTpuGatedDeltaNet2(torch_base._GatedDeltaNet2):
     def bwd_jax(q, k, v, g, b, w, do, chunk_size=64):
       def loss_fn(q_, k_, v_, g_, b_, w_):
         (out, _), _ = self.op_impl_jax._fwd(
-            q_[None], k_[None], v_[None], g_[None], b_[None], w_[None], chunk_size=chunk_size
+            q_, k_, v_, g_, b_, w_, chunk_size=chunk_size
         )
-        return jnp.sum(out[0].astype(jnp.float32) * do.astype(jnp.float32))
+        return jnp.sum(out.astype(jnp.float32) * do.astype(jnp.float32))
 
       return jax.grad(loss_fn, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, g, b, w)
 
@@ -58,11 +58,15 @@ class _PallasTpuGatedDeltaNet2(torch_base._GatedDeltaNet2):
     def setup_context(ctx, inputs, output):
       del output
       ctx.save_for_backward(*inputs[:6])
-      ctx.chunk_size = inputs[6] if len(inputs) > 6 else 64
+      ctx.has_chunk_size_arg = len(inputs) > 6
+      ctx.chunk_size = inputs[6] if ctx.has_chunk_size_arg else 64
 
     def backward(ctx, do):
       saved = ctx.saved_tensors
-      return bwd_op(*saved, do, chunk_size=ctx.chunk_size)
+      grads = bwd_op(*saved, do, chunk_size=ctx.chunk_size)
+      if ctx.has_chunk_size_arg:
+        return (*grads, None)
+      return grads
 
     self._torch_tokamax_op.register_autograd(backward, setup_context=setup_context)
 

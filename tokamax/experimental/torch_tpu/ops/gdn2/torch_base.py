@@ -105,20 +105,20 @@ class _GatedDeltaNet2:
     eye = torch.eye(chunk_size, device=q.device)
 
     for chunk_idx in range(num_chunks):
-      st = chunk_idx * chunk_size
-      en = (chunk_idx + 1) * chunk_size
-      qc = q[:, st:en].permute(0, 2, 1, 3).float()
-      kc = k[:, st:en].permute(0, 2, 1, 3).float()
-      vc = v[:, st:en].permute(0, 2, 1, 3).float()
-      gc = g[:, st:en].permute(0, 2, 1, 3).float()
-      bc = b[:, st:en].permute(0, 2, 1, 3).float()
-      wc = w[:, st:en].permute(0, 2, 1, 3).float()
+      start_idx = chunk_idx * chunk_size
+      end_idx = (chunk_idx + 1) * chunk_size
+      q_c = q[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      k_c = k[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      v_c = v[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      g_c = g[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      b_c = b[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+      w_c = w[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
 
-      gcs = torch.cumsum(gc, dim=2)
-      bk = bc * kc
-      diff = torch.clamp(gcs.unsqueeze(3) - gcs.unsqueeze(2), max=0.0)
+      g_cs = torch.cumsum(g_c, dim=2)
+      bk = b_c * k_c
+      diff = torch.clamp(g_cs.unsqueeze(3) - g_cs.unsqueeze(2), max=0.0)
       decay = torch.exp(diff)
-      t_mat = torch.sum(bk.unsqueeze(3) * kc.unsqueeze(2) * decay, dim=-1)
+      t_mat = torch.sum(bk.unsqueeze(3) * k_c.unsqueeze(2) * decay, dim=-1)
       t_mat = -t_mat * strictly_lower
 
       p_mat = eye + t_mat
@@ -128,23 +128,23 @@ class _GatedDeltaNet2:
         p_mat = torch.matmul(p_mat, eye + curr)
       a_mat = p_mat
 
-      k_g_b = torch.exp(gcs) * kc * bc
-      wv = wc * vc
+      k_g_b = torch.exp(g_cs) * k_c * b_c
+      wv = w_c * v_c
       merged_rhs = torch.cat([k_g_b, wv], dim=-1)
       merged_out = torch.matmul(a_mat, merged_rhs)
-      wwy = merged_out[:, :, :, :k_dim]
-      u = merged_out[:, :, :, k_dim:]
+      wwy = merged_out[:, :, :, :key_dim]
+      u = merged_out[:, :, :, key_dim:]
 
-      qg = qc.unsqueeze(3) * decay
-      aqk = torch.sum(qg * kc.unsqueeze(2), dim=-1) * causal_mask
+      qg = q_c.unsqueeze(3) * decay
+      aqk = torch.sum(qg * k_c.unsqueeze(2), dim=-1) * causal_mask
 
       vi = u - torch.matmul(wwy, state.to(u.dtype))
-      oi = torch.matmul(qc * torch.exp(gcs), state.to(qc.dtype)) + torch.matmul(aqk, vi)
+      oi = torch.matmul(q_c * torch.exp(g_cs), state.to(q_c.dtype)) + torch.matmul(aqk, vi)
       outs.append(oi.permute(0, 2, 1, 3).to(q.dtype))
 
-      glast = gcs[:, :, -1:, :]
-      decayed_k = torch.exp(torch.clamp(glast - gcs, max=0.0)) * kc
+      g_last = g_cs[:, :, -1:, :]
+      decayed_k = torch.exp(torch.clamp(g_last - g_cs, max=0.0)) * k_c
       s_update = torch.matmul(decayed_k.transpose(-1, -2), vi)
-      state = state * torch.exp(torch.clamp(glast, max=0.0)).transpose(-1, -2) + s_update
+      state = state * torch.exp(torch.clamp(g_last, max=0.0)).transpose(-1, -2) + s_update
 
     return torch.cat(outs, dim=1)
