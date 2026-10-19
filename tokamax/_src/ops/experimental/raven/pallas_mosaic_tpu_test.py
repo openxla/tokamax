@@ -30,11 +30,11 @@ class PallasTpuRavenGSATest(absltest.TestCase):
     batch_size, seq_len, num_heads, key_dim, num_slots = 2, 128, 4, 16, 8
     chunk_size = 64
 
-    k0, k1, k2, k3 = jax.random.split(key, 4)
-    q = jax.random.normal(k0, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32)
-    k = jax.random.normal(k1, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32)
-    s = jax.random.normal(k2, (batch_size, seq_len, num_heads, num_slots), dtype=jnp.float32)
-    g = -jax.nn.sigmoid(jax.random.normal(k3, (batch_size, seq_len, num_heads, num_slots), dtype=jnp.float32))
+    key_q, key_k, key_s, key_g = jax.random.split(key, 4)
+    q = jax.random.normal(key_q, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32)
+    k = jax.random.normal(key_k, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32)
+    s = jax.random.normal(key_s, (batch_size, seq_len, num_heads, num_slots), dtype=jnp.float32)
+    g = -jax.nn.sigmoid(jax.random.normal(key_g, (batch_size, seq_len, num_heads, num_slots), dtype=jnp.float32))
 
     op_instance = pallas_mosaic_tpu.PallasTpuRavenGSA()
     (actual_out, _), _ = op_instance._fwd(

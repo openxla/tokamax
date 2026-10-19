@@ -38,8 +38,11 @@ class _RavenGSA:
       from torch_tpu._internal import pallas
     except ImportError:
       pallas = None
-    if pallas is not None:
-      self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+    else:
+      try:
+        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+      except Exception:
+        self._torch_tokamax_op = None
 
   def op_impl_call(
       self,
@@ -89,6 +92,9 @@ class _RavenGSA:
     outs = []
 
     state = torch.zeros(batch_size, num_heads, key_dim, num_slots, device=q.device, dtype=torch.float32)
+    row_idx = torch.arange(chunk_size, device=q.device).unsqueeze(1)
+    col_idx = torch.arange(chunk_size, device=q.device).unsqueeze(0)
+    causal = (col_idx <= row_idx).float()
 
     for chunk_idx in range(num_chunks):
       start_idx = chunk_idx * chunk_size
@@ -99,9 +105,6 @@ class _RavenGSA:
       g_c = g[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
 
       g_cs = torch.cumsum(g_c, dim=2)
-      row_idx = torch.arange(chunk_size, device=q.device).unsqueeze(1)
-      col_idx = torch.arange(chunk_size, device=q.device).unsqueeze(0)
-      causal = (col_idx <= row_idx).float()
 
       qk = torch.matmul(q_c, k_c.transpose(-1, -2)) * causal
       diff = torch.clamp(g_cs.unsqueeze(3) - g_cs.unsqueeze(2), max=0.0)
@@ -110,14 +113,14 @@ class _RavenGSA:
 
       g_last = g_cs[:, :, -1:, :]
       decay_tail = torch.exp(torch.clamp(g_last - g_cs, max=0.0))
-      sc = torch.matmul(k_c.transpose(-1, -2), s_c * decay_tail)
+      state_contrib = torch.matmul(k_c.transpose(-1, -2), s_c * decay_tail)
 
-      qs = torch.matmul(q_c, state.to(q.dtype))
+      q_state = torch.matmul(q_c, state.to(q.dtype))
       decay_local = torch.exp(torch.clamp(g_cs, max=0.0))
-      y_inter = qs * decay_local
+      y_inter = q_state * decay_local
 
       outs.append((y_diag + y_inter).permute(0, 2, 1, 3).to(q.dtype))
 
-      state = state * torch.exp(torch.clamp(g_last, max=0.0)) + sc
+      state = state * torch.exp(torch.clamp(g_last, max=0.0)) + state_contrib
 
     return torch.cat(outs, dim=1)

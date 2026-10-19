@@ -45,10 +45,12 @@ class RavenPallasKernelTest(unittest.TestCase):
 
   def test_chunk_size_validation(self):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    q = torch.randn(2, 100, 4, 16, device=device)
-    k = torch.randn(2, 100, 4, 16, device=device)
-    s = torch.randn(2, 100, 4, 8, device=device)
-    g = torch.randn(2, 100, 4, 8, device=device)
+    batch_size, unaligned_seq_len, num_heads, head_dim = 2, 100, 4, 16
+    num_slots = 8
+    q = torch.randn(batch_size, unaligned_seq_len, num_heads, head_dim, device=device)
+    k = torch.randn(batch_size, unaligned_seq_len, num_heads, head_dim, device=device)
+    s = torch.randn(batch_size, unaligned_seq_len, num_heads, num_slots, device=device)
+    g = torch.randn(batch_size, unaligned_seq_len, num_heads, num_slots, device=device)
 
     with self.assertRaises(ValueError):
       raven_pallas.raven_pallas_gsa(q, k, s, g, chunk_size=64)

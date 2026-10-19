@@ -31,13 +31,17 @@ class _PallasTpuRavenGSA(torch_base._RavenGSA):
     super().__init__()
     self.op_impl_jax = jax_pallas.PallasTpuRavenGSA()
     self.jax_op_name = "torch_tpu_pallas_raven_gsa"
+    self._torch_tokamax_op = None
     try:
       from torch_tpu._internal import pallas
     except ImportError:
       pallas = None
-    if pallas is not None:
-      self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
-      self._setup_autograd(pallas)
+    else:
+      try:
+        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+        self._setup_autograd(pallas)
+      except Exception:
+        self._torch_tokamax_op = None
 
   def _setup_autograd(self, pallas_module):
     def bwd_jax(q, k, s, g, grad_output, chunk_size=64):
@@ -54,11 +58,15 @@ class _PallasTpuRavenGSA(torch_base._RavenGSA):
     def setup_context(ctx, inputs, output):
       del output
       ctx.save_for_backward(*inputs[:4])
-      ctx.chunk_size = inputs[4] if len(inputs) > 4 else 64
+      ctx.has_chunk_size_arg = len(inputs) > 4
+      ctx.chunk_size = inputs[4] if ctx.has_chunk_size_arg else 64
 
     def backward(ctx, grad_output):
       saved = ctx.saved_tensors
-      return bwd_op(*saved, grad_output, chunk_size=ctx.chunk_size)
+      grads = bwd_op(*saved, grad_output, chunk_size=ctx.chunk_size)
+      if ctx.has_chunk_size_arg:
+        return (*grads, None)
+      return grads
 
     self._torch_tokamax_op.register_autograd(backward, setup_context=setup_context)
 

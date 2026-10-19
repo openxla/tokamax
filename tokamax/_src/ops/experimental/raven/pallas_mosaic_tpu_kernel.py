@@ -71,6 +71,23 @@ def _make_raven_stage1_kernel(chunk_size: int) -> Any:
   return _kernel
 
 
+def _move_nt_front(x: jax.Array) -> jax.Array:
+  return jnp.moveaxis(x, 2, 0)
+
+
+def _stage1_scan_step(
+    s_state: jax.Array,
+    inputs: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+) -> tuple[jax.Array, jax.Array]:
+  q_i, g_i, y_diag_i, state_contrib_i, g_last_i = inputs
+  y_off = jnp.matmul(
+      q_i, s_state, preferred_element_type=jnp.float32
+  ) * jnp.exp(g_i)
+  y = y_diag_i + y_off
+  s_new = s_state * jnp.exp(g_last_i)[None, :] + state_contrib_i
+  return s_new.astype(s_state.dtype), y.astype(y_diag_i.dtype)
+
+
 def _stage1_intra_raven_pallas(
     q_c: jax.Array, k_c: jax.Array, s_c: jax.Array, g_c: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -79,16 +96,16 @@ def _stage1_intra_raven_pallas(
   kernel = _make_raven_stage1_kernel(chunk_size)
   grid = (batch_size, num_heads, num_chunks)
   bspec_k = pl.BlockSpec((1, 1, 1, chunk_size, key_dim), lambda i, j, n: (i, j, n, 0, 0))
-  bspec_m = pl.BlockSpec((1, 1, 1, chunk_size, num_slots), lambda i, j, n: (i, j, n, 0, 0))
-  bspec_sc = pl.BlockSpec((1, 1, 1, key_dim, num_slots), lambda i, j, n: (i, j, n, 0, 0))
-  bspec_glast = pl.BlockSpec((1, 1, 1, 1, num_slots), lambda i, j, n: (i, j, n, 0, 0))
+  bspec_slots = pl.BlockSpec((1, 1, 1, chunk_size, num_slots), lambda i, j, n: (i, j, n, 0, 0))
+  bspec_state_contrib = pl.BlockSpec((1, 1, 1, key_dim, num_slots), lambda i, j, n: (i, j, n, 0, 0))
+  bspec_g_last = pl.BlockSpec((1, 1, 1, 1, num_slots), lambda i, j, n: (i, j, n, 0, 0))
 
   interpret = jax.default_backend() == "cpu"
   return pl.pallas_call(
       kernel,
       grid=grid,
-      in_specs=[bspec_k, bspec_k, bspec_m, bspec_m],
-      out_specs=[bspec_m, bspec_sc, bspec_glast],
+      in_specs=[bspec_k, bspec_k, bspec_slots, bspec_slots],
+      out_specs=[bspec_slots, bspec_state_contrib, bspec_g_last],
       out_shape=[
           jax.ShapeDtypeStruct((batch_size, num_heads, num_chunks, chunk_size, num_slots), q_c.dtype),
           jax.ShapeDtypeStruct((batch_size, num_heads, num_chunks, key_dim, num_slots), q_c.dtype),
@@ -123,31 +140,23 @@ def raven_pallas_stage1_fwd(
   )
   g_last = g_last_block[..., 0, :]
 
-  def move_nt_front(x: jax.Array) -> jax.Array:
-    return jnp.moveaxis(x, 2, 0)
-
-  q_s, g_s, y_diag_s, sc_s, glast_s = map(
-      move_nt_front, (q_c, g_c, y_diag, state_contrib, g_last)
+  q_s, g_s, y_diag_s, state_contrib_s, g_last_s = map(
+      _move_nt_front, (q_c, g_c, y_diag, state_contrib, g_last)
   )
 
-  def scan_body(s_state, inputs):
-    q_i, g_i, y_diag_i, sc_i, glast_i = inputs
-    y_off = jnp.matmul(
-        q_i, s_state, preferred_element_type=jnp.float32
-    ) * jnp.exp(g_i)
-    y = y_diag_i + y_off
-    s_new = s_state * jnp.exp(glast_i)[None, :] + sc_i
-    return s_new.astype(s_state.dtype), y.astype(y_diag_i.dtype)
-
-  scan_body_batched = jax.vmap(jax.vmap(scan_body))
+  scan_body_batched = jax.vmap(jax.vmap(_stage1_scan_step))
 
   if initial_state is None:
-    s0 = jnp.zeros((batch_size, num_heads, key_dim, num_slots), dtype=jnp.float32)
+    initial_recurrent_state = jnp.zeros(
+        (batch_size, num_heads, key_dim, num_slots), dtype=jnp.float32
+    )
   else:
-    s0 = initial_state.astype(jnp.float32)
+    initial_recurrent_state = initial_state.astype(jnp.float32)
 
   s_final, o_stacked = jax.lax.scan(
-      scan_body_batched, s0, (q_s, g_s, y_diag_s, sc_s, glast_s)
+      scan_body_batched,
+      initial_recurrent_state,
+      (q_s, g_s, y_diag_s, state_contrib_s, g_last_s),
   )
   o = jnp.moveaxis(o_stacked, 0, 2)
   o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(batch_size, seq_len, num_heads, num_slots)

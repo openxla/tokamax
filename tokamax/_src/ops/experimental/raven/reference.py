@@ -32,6 +32,23 @@ def _chunkify(
   return jnp.transpose(x, perm)
 
 
+def _move_nt_front(x: jax.Array) -> jax.Array:
+  return jnp.moveaxis(x, 2, 0)
+
+
+def _stage1_scan_step(
+    s_state: jax.Array,
+    inputs: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+) -> tuple[jax.Array, jax.Array]:
+  q_i, g_i, y_diag_i, state_contrib_i, g_last_i = inputs
+  y_off = jnp.matmul(
+      q_i, s_state, preferred_element_type=jnp.float32
+  ) * jnp.exp(g_i)
+  y = y_diag_i + y_off
+  s_new = s_state * jnp.exp(g_last_i)[None, :] + state_contrib_i
+  return s_new.astype(s_state.dtype), y.astype(y_diag_i.dtype)
+
+
 def _stage1_intra_one_plain(
     q_i: jax.Array, k_i: jax.Array, s_i: jax.Array, g_i: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -77,31 +94,23 @@ def raven_stage1_reference(
   y_diag, state_contrib, g_last_block = vmap_intra(q_c, k_c, s_c, g_c)
   g_last = g_last_block[..., 0, :]
 
-  def move_nt_front(x: jax.Array) -> jax.Array:
-    return jnp.moveaxis(x, 2, 0)
-
-  q_s, g_s, y_diag_s, sc_s, glast_s = map(
-      move_nt_front, (q_c, g_c, y_diag, state_contrib, g_last)
+  q_s, g_s, y_diag_s, state_contrib_s, g_last_s = map(
+      _move_nt_front, (q_c, g_c, y_diag, state_contrib, g_last)
   )
 
-  def scan_body(s_state, inputs):
-    q_i, g_i, y_diag_i, sc_i, glast_i = inputs
-    y_off = jnp.matmul(
-        q_i, s_state, preferred_element_type=jnp.float32
-    ) * jnp.exp(g_i)
-    y = y_diag_i + y_off
-    s_new = s_state * jnp.exp(glast_i)[None, :] + sc_i
-    return s_new.astype(s_state.dtype), y.astype(y_diag_i.dtype)
-
-  scan_body_batched = jax.vmap(jax.vmap(scan_body))
+  scan_body_batched = jax.vmap(jax.vmap(_stage1_scan_step))
 
   if initial_state is None:
-    s0 = jnp.zeros((batch_size, num_heads, key_dim, num_slots), dtype=jnp.float32)
+    initial_recurrent_state = jnp.zeros(
+        (batch_size, num_heads, key_dim, num_slots), dtype=jnp.float32
+    )
   else:
-    s0 = initial_state.astype(jnp.float32)
+    initial_recurrent_state = initial_state.astype(jnp.float32)
 
   s_final, o_stacked = jax.lax.scan(
-      scan_body_batched, s0, (q_s, g_s, y_diag_s, sc_s, glast_s)
+      scan_body_batched,
+      initial_recurrent_state,
+      (q_s, g_s, y_diag_s, state_contrib_s, g_last_s),
   )
   o = jnp.moveaxis(o_stacked, 0, 2)
   o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(batch_size, seq_len, num_heads, num_slots)
