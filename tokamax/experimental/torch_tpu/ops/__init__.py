@@ -16,14 +16,13 @@
 
 # pylint: disable=g-importing-member,useless-import-alias
 from tokamax.experimental.torch_tpu.ops import torch_utils as tokamax_torch_utils
-from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_pallas_mosaic_tpu as batched_rpa
-from tokamax.experimental.torch_tpu.ops.causal_conv1d_gated_delta_rule import torch_pallas_mosaic_tpu as causal_conv1d_gated_delta_rule
-from tokamax.experimental.torch_tpu.ops.csa_gather import torch_pallas_mosaic_tpu as csa_gather
-from tokamax.experimental.torch_tpu.ops.deepseek_rope import torch_pallas_mosaic_tpu as deepseek_rope
-from tokamax.experimental.torch_tpu.ops.fused_moe import torch_pallas_mosaic_tpu as fused_moe
-from tokamax.experimental.torch_tpu.ops.linear_softmax_cross_entropy import torch_pallas_mosaic_tpu as linear_softmax_cross_entropy_loss
-from tokamax.experimental.torch_tpu.ops.ragged_dot import torch_pallas_mosaic_tpu as ragged_dot
-from tokamax.experimental.torch_tpu.ops.ragged_gather import torch_pallas_mosaic_tpu as ragged_gather
-from tokamax.experimental.torch_tpu.ops.topk import torch_pallas_mosaic_tpu as topk
+from tokamax.experimental.torch_tpu.ops.batched_rpa.torch_pallas_mosaic_tpu import PallasMosaicTpuBatchedRpa as batched_rpa
+from tokamax.experimental.torch_tpu.ops.causal_conv1d_gated_delta_rule.torch_pallas_mosaic_tpu import PallasMosaicTpuCausalConv1dGatedDeltaRule as causal_conv1d_gated_delta_rule
+from tokamax.experimental.torch_tpu.ops.csa_gather.torch_pallas_mosaic_tpu import PallasMosaicTpuCsaGather as csa_gather
+from tokamax.experimental.torch_tpu.ops.fused_moe.torch_pallas_mosaic_tpu import PallasMosaicTpuFusedMoe as fused_moe
+from tokamax.experimental.torch_tpu.ops.linear_softmax_cross_entropy.torch_pallas_mosaic_tpu import PallasMosaicTpuLinearSoftmaxCrossEntropyLoss as linear_softmax_cross_entropy_loss
+from tokamax.experimental.torch_tpu.ops.ragged_dot.torch_pallas_mosaic_tpu import PallasMosaicTpuRaggedDot as ragged_dot
+from tokamax.experimental.torch_tpu.ops.ragged_gather.torch_pallas_mosaic_tpu import PallasMosaicTpuRaggedGather as ragged_gather
+from tokamax.experimental.torch_tpu.ops.topk.torch_pallas_mosaic_tpu import PallasMosaicTpuTopK as topk
 
 # pylint: enable=g-importing-member,useless-import-alias
