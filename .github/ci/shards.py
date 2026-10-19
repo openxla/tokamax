@@ -735,6 +735,12 @@ SHARDS: ShardMap = {
         ),
         minutes=1,
     ),
+    'experimental-routing-moe': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/wrapper_test.py',
+        ),
+    ),
     # -- core --------------------------------------------------------------
     # The library internals under `tokamax/_src/`, none of which is slow enough
     # to deserve a shard. Enumerated file by file rather than given as the
