@@ -15,13 +15,12 @@
 
 """Tokamax operator wrapper for GDN-2 Pallas TPU kernel."""
 
-import dataclasses
-from typing import Annotated, Any, ClassVar
+from typing import Annotated, ClassVar
+
 import jax
 import pydantic
 from tokamax._src.ops import op
-from tokamax._src.ops.experimental.gdn2 import base
-from tokamax._src.ops.experimental.gdn2 import pallas_mosaic_tpu_kernel
+from tokamax._src.ops.experimental.gdn2 import base, pallas_mosaic_tpu_kernel
 from typing_extensions import override
 
 
@@ -51,8 +50,10 @@ class PallasTpuGatedDeltaNet2(base.GatedDeltaNet2[Config]):
       scale: float | None = None,
       initial_state: jax.Array | None = None,
       output_final_state: bool = False,
+      return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[base.Output, None]:
+    del return_residuals
     resolved_chunk_size = config.chunk_size if config is not None else chunk_size
     out = pallas_mosaic_tpu_kernel.gdn2_pallas_fwd(
         q,
@@ -74,5 +75,5 @@ class PallasTpuGatedDeltaNet2(base.GatedDeltaNet2[Config]):
     return Config(chunk_size=64)
 
   @override
-  def supported_on(self, device: Any) -> bool:
-    return True
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu"

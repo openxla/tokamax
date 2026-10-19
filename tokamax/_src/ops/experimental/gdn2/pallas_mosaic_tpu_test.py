@@ -15,12 +15,11 @@
 
 """Unit tests for GDN-2 Pallas TPU operator."""
 
-from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.gdn2 import pallas_mosaic_tpu
-from tokamax._src.ops.experimental.gdn2 import reference
+from absl.testing import absltest
+from tokamax._src.ops.experimental.gdn2 import base, pallas_mosaic_tpu
 
 
 class PallasTpuGatedDeltaNet2Test(absltest.TestCase):
@@ -39,14 +38,15 @@ class PallasTpuGatedDeltaNet2Test(absltest.TestCase):
     w_gate = jax.nn.sigmoid(jax.random.normal(k5, (batch_size, seq_len, num_heads, val_dim), dtype=jnp.float32))
 
     op_instance = pallas_mosaic_tpu.PallasTpuGatedDeltaNet2()
-    (actual_out, _), _ = op_instance._fwd(
-        q, k, v, g, b_gate, w_gate, chunk_size=chunk_size, scale=1.0
+    (actual_out, actual_s), _ = op_instance._fwd(
+        q, k, v, g, b_gate, w_gate, chunk_size=chunk_size, scale=1.0, output_final_state=True
     )
-    expected_out, _ = reference.gdn2_reference(
-        q, k, v, g, b_gate, w_gate, chunk_size=chunk_size, scale=1.0
+    expected_out, expected_s = base.gdn2_reference(
+        q, k, v, g, b_gate, w_gate, chunk_size=chunk_size, scale=1.0, output_final_state=True
     )
 
     np.testing.assert_allclose(actual_out, expected_out, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(actual_s, expected_s, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

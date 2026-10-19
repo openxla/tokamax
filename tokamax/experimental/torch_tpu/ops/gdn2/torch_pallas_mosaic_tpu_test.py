@@ -16,10 +16,10 @@
 """Unit tests for Gated Delta Net 2 (GDN-2) Pallas kernel."""
 
 import unittest
+
+import torch
 from absl import logging
 from absl.testing import absltest
-import torch
-
 from tokamax.experimental.torch_tpu.ops.gdn2 import gdn2 as gdn2_pallas
 
 

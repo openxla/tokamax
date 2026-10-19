@@ -15,13 +15,10 @@
 
 """PyTorch interface for Pallas TPU GDN-2 operator."""
 
-from typing import Any
 import jax
 import jax.numpy as jnp
-import torch
 from tokamax._src.ops.experimental.gdn2 import pallas_mosaic_tpu as jax_pallas
 from tokamax.experimental.torch_tpu.ops.gdn2 import torch_base
-from typing_extensions import override
 
 
 class _PallasTpuGatedDeltaNet2(torch_base._GatedDeltaNet2):
@@ -40,7 +37,7 @@ class _PallasTpuGatedDeltaNet2(torch_base._GatedDeltaNet2):
       try:
         self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
         self._setup_autograd(pallas)
-      except Exception:
+      except (ImportError, AttributeError, RuntimeError):
         self._torch_tokamax_op = None
 
   def _setup_autograd(self, pallas_module):

@@ -15,16 +15,16 @@
 
 """PyTorch interface for Gated Delta Net 2 (GDN-2) operator."""
 
-from typing import Any
+import math
+
 import jax
 import torch
-import torch.nn.functional as F
 from tokamax._src.ops.experimental.gdn2 import base as jax_base
+
 try:
   from tokamax.experimental.torch_tpu.ops import torch_op
 except ImportError:
   torch_op = None
-from typing_extensions import override
 
 
 class _GatedDeltaNet2:
@@ -41,7 +41,7 @@ class _GatedDeltaNet2:
     else:
       try:
         self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
-      except Exception:
+      except (ImportError, AttributeError, RuntimeError):
         self._torch_tokamax_op = None
 
   def op_impl_call(
@@ -123,7 +123,8 @@ class _GatedDeltaNet2:
 
       p_mat = eye + t_mat
       curr = t_mat
-      for _ in range(1, 6):
+      num_doubling_steps = max(0, math.ceil(math.log2(chunk_size)) - 1)
+      for _ in range(num_doubling_steps):
         curr = torch.matmul(curr, curr)
         p_mat = torch.matmul(p_mat, eye + curr)
       a_mat = p_mat
