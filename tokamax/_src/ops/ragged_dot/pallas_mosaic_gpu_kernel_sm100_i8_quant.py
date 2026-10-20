@@ -17,14 +17,10 @@
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
-import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
-from jaxlib.mlir import ir
-from jaxlib.mlir.dialects import arith
-import numpy as np
 import qwix
 from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_dot import base
@@ -46,60 +42,6 @@ _TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
 _TCGEN05 = plgpu.Layout.TCGEN05
 _TCGEN05_COL = _TCGEN05.reduce(0)
 _TCGEN05_ROW = _TCGEN05.reduce(1)
-
-
-def rescale_i32_tcgen05_acc(running_acc, acc, row_scale, col_scale):
-  """Dequantizes S32 TCGEN05 accumulator and adds it to a running f32 accumulator."""
-
-  @plgpu.inline_mgpu(
-      arg_types=(
-          _TCGEN05,
-          _TCGEN05,
-          _TCGEN05_ROW,
-          _TCGEN05_COL,
-      ),
-      return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.float32, _TCGEN05),  # pyrefly: ignore[bad-argument-type]
-  )
-  def rescale(
-      _,
-      running_acc: mgpu.FragmentedArray,
-      a: mgpu.FragmentedArray,
-      rs: mgpu.FragmentedArray,
-      cs: mgpu.FragmentedArray,
-  ):
-    # Example of register shapes for (128, 64):
-    # TCGEN05     (1, 8, 1, 1, 4, 1, 1, 1, 1)
-    # TCGEN05_ROW (1, 1, 4, 1, 1)
-    # TCGEN05_COL (8, 1, 1)
-    f32 = ir.F32Type.get()
-    out_vec_ty = ir.VectorType.get((2,), f32)
-    f32_registers = running_acc.registers
-    for idx, reg_a in np.ndenumerate(a.registers):
-      rs_reg = rs.registers[(0, 0, idx[4], 0, 0)]
-      cs_reg = cs.registers[(idx[1], 0, 0)]
-      out_reg = arith.sitofp(out_vec_ty, reg_a)
-      scale_reg = arith.mulf(
-          mgpu.utils.vector_concat([rs_reg, rs_reg]),
-          cs_reg,
-          fastmath=arith.FastMathFlags.fast,
-      )
-      out_reg = arith.mulf(
-          out_reg,
-          scale_reg,
-          fastmath=arith.FastMathFlags.fast,
-      )
-      f32_registers[idx] = arith.addf(
-          out_reg,
-          f32_registers[idx],
-          fastmath=arith.FastMathFlags.fast,
-      )
-    return mgpu.FragmentedArray(
-        _registers=f32_registers,
-        _layout=mgpu.TCGEN05_LAYOUT,
-        _is_signed=None,
-    )
-
-  return rescale(running_acc, acc, row_scale, col_scale)
 
 
 @jaxtyping.jaxtyped
@@ -483,7 +425,7 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
 
             for ni in range(_DEQ_WG):
               ws, local_acc = load_ws_acc(ni)
-              acc_carry[ni] = rescale_i32_tcgen05_acc(
+              acc_carry[ni] = common.rescale_tcgen05_acc(
                   acc_carry[ni], local_acc, ws, x_scale
               )
               del ws

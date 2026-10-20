@@ -22,11 +22,19 @@ from typing import Annotated, Any
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import arith
+import numpy as np
 import pydantic
 from tokamax._src import mosaic_gpu as mgpu_lib
+
+_TCGEN05 = plgpu.Layout.TCGEN05
+_TCGEN05_COL = _TCGEN05.reduce(0)
+_TCGEN05_ROW = _TCGEN05.reduce(1)
 
 SMEM_CAPACITY_MAP = {
     "sm_120": (100 - 1) * 1024,
@@ -238,3 +246,55 @@ def check_bf16xbf16_or_f16xf16(lhs: jax.Array, rhs: jax.Array):
     raise NotImplementedError(
         f"Only bfloat16/float16 inputs are supported (got {lhs.dtype=})."
     )
+
+
+def rescale_tcgen05_acc(running_acc, acc, row_scale, col_scale):
+  """Rescales a TCGEN05 accumulator (f32 or i32) and adds it to `running_acc`."""
+
+  @plgpu.inline_mgpu(
+      arg_types=(
+          _TCGEN05,
+          _TCGEN05,
+          _TCGEN05_ROW,
+          _TCGEN05_COL,
+      ),
+      return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.float32, _TCGEN05),  # pyrefly: ignore[bad-argument-type]
+  )
+  def rescale(
+      _,
+      running_acc: mgpu.FragmentedArray,
+      a: mgpu.FragmentedArray,
+      rs: mgpu.FragmentedArray,
+      cs: mgpu.FragmentedArray,
+  ):
+    f32 = ir.F32Type.get()
+    out_vec_ty = ir.VectorType.get((2,), f32)
+    f32_registers = running_acc.registers
+    for idx, reg_a in np.ndenumerate(a.registers):
+      rs_reg = rs.registers[(0, 0, idx[4], 0, 0)]
+      cs_reg = cs.registers[(idx[1], 0, 0)]
+      out_reg = (
+          reg_a if a.mlir_dtype == f32 else arith.sitofp(out_vec_ty, reg_a)
+      )
+      scale_reg = arith.mulf(
+          mgpu.utils.vector_concat([rs_reg, rs_reg]),
+          cs_reg,
+          fastmath=arith.FastMathFlags.fast,
+      )
+      out_reg = arith.mulf(
+          out_reg,
+          scale_reg,
+          fastmath=arith.FastMathFlags.fast,
+      )
+      f32_registers[idx] = arith.addf(
+          out_reg,
+          f32_registers[idx],
+          fastmath=arith.FastMathFlags.fast,
+      )
+    return mgpu.FragmentedArray(
+        _registers=f32_registers,
+        _layout=mgpu.TCGEN05_LAYOUT,
+        _is_signed=None,
+    )
+
+  return rescale(running_acc, acc, row_scale, col_scale)

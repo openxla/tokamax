@@ -28,7 +28,6 @@ from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import arith
 from jaxlib.mlir.dialects import gpu
 from jaxlib.mlir.dialects import memref as memref_dialect
-import numpy as np
 import qwix
 from tokamax._src import jaxtyping
 from tokamax._src import mosaic_gpu as mgpu_lib
@@ -99,58 +98,6 @@ DECODE_CONFIG = KernelConfig(
     deq_wg_regs=128,
     store_wg_regs=152,
 )
-
-
-def rescale_tcgen05_acc(running_acc, acc, row_scale, col_scale):
-  """Dequantizes S32 TCGEN05 accumulator and adds it to a running f32 accumulator."""
-
-  @plgpu.inline_mgpu(
-      arg_types=(
-          _TCGEN05,
-          _TCGEN05,
-          _TCGEN05_ROW,
-          _TCGEN05_COL,
-      ),
-      return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.float32, _TCGEN05),  # pyrefly: ignore[bad-argument-type]
-  )
-  def rescale(
-      _,
-      running_acc: mgpu.FragmentedArray,
-      a: mgpu.FragmentedArray,
-      rs: mgpu.FragmentedArray,
-      cs: mgpu.FragmentedArray,
-  ):
-    # Example of register shapes for (128, 64):
-    # TCGEN05     (1, 8, 1, 1, 4, 1, 1, 1, 1)
-    # TCGEN05_ROW (1, 1, 4, 1, 1)
-    # TCGEN05_COL (8, 1, 1)
-    f32_registers = running_acc.registers
-    for idx, reg_a in np.ndenumerate(a.registers):
-      rs_reg = rs.registers[(0, 0, idx[4], 0, 0)]
-      cs_reg = cs.registers[(idx[1], 0, 0)]
-      out_reg = reg_a
-      scale_reg = arith.mulf(
-          mgpu.utils.vector_concat([rs_reg, rs_reg]),
-          cs_reg,
-          fastmath=arith.FastMathFlags.fast,
-      )
-      out_reg = arith.mulf(
-          out_reg,
-          scale_reg,
-          fastmath=arith.FastMathFlags.fast,
-      )
-      f32_registers[idx] = arith.addf(
-          out_reg,
-          f32_registers[idx],
-          fastmath=arith.FastMathFlags.fast,
-      )
-    return mgpu.FragmentedArray(
-        _registers=f32_registers,
-        _layout=mgpu.TCGEN05_LAYOUT,
-        _is_signed=None,
-    )
-
-  return rescale(running_acc, acc, row_scale, col_scale)
 
 
 def _compute_stages(
@@ -769,7 +716,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
                 _TCGEN05,
             )
             acc = acc * 512 + int_bias
-            return rescale_tcgen05_acc(
+            return common.rescale_tcgen05_acc(
                 acc_carry,
                 acc,
                 ws,
