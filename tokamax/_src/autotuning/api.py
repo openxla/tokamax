@@ -44,8 +44,6 @@ from tokamax._src.ops.dsv4_compressor import api as dsv4_compressor_api
 from tokamax._src.ops.dsv4_compressor import base as dsv4_compressor_base
 from tokamax._src.ops.experimental.mla import api as mla_api
 from tokamax._src.ops.experimental.mla import base as mla_base
-from tokamax._src.ops.experimental.tpu.splash_attention import api as splash_attention_api
-from tokamax._src.ops.experimental.tpu.splash_attention import base as splash_attention_base
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.grouped_lowrank_proj import api as grouped_lowrank_proj_api
@@ -68,6 +66,8 @@ from tokamax._src.ops.ragged_gather_reduce import api as ragged_gather_reduce_ap
 from tokamax._src.ops.ragged_gather_reduce import base as ragged_gather_reduce_base
 from tokamax._src.ops.router_topk import api as router_topk_api
 from tokamax._src.ops.router_topk import base as router_topk_base
+from tokamax._src.ops.splash_attention import api as splash_attention_api
+from tokamax._src.ops.splash_attention import base as splash_attention_base
 from tokamax._src.ops.triangle_multiplication import api as triangle_multiplication_api
 from tokamax._src.ops.triangle_multiplication import base as triangle_multiplication_base
 import tqdm

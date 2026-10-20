@@ -22,10 +22,10 @@ import chex
 import jax
 import jax.numpy as jnp
 from tokamax._src import numerics
-from tokamax._src.ops.experimental.tpu.splash_attention import base
-from tokamax._src.ops.experimental.tpu.splash_attention import pallas_mosaic_tpu
-from tokamax._src.ops.experimental.tpu.splash_attention import pallas_mosaic_tpu_vjp as sp_vjp
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import base
+from tokamax._src.ops.splash_attention import pallas_mosaic_tpu
+from tokamax._src.ops.splash_attention import pallas_mosaic_tpu_vjp as sp_vjp
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 
 PallasTpuSplash = pallas_mosaic_tpu.PallasMosaicTpuSplashAttention
 ReferenceSplash = base.SplashAttention

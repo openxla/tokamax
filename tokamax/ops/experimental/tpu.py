@@ -23,8 +23,8 @@ from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu import Config as MultiH
 from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu import PallasTpuMultiHeadLatentAttention as MultiHeadLatentAttention
 from tokamax._src.ops.experimental.mla_swa.pallas_mosaic_tpu import Config as MlaSwaConfig
 from tokamax._src.ops.experimental.mla_swa.pallas_mosaic_tpu import PallasTpuMlaSwa as MlaSwa
-from tokamax._src.ops.experimental.tpu.splash_attention.pallas_mosaic_tpu import Config as SplashAttentionConfig
-from tokamax._src.ops.experimental.tpu.splash_attention.pallas_mosaic_tpu import PallasMosaicTpuSplashAttention as SplashAttention
+from tokamax._src.ops.splash_attention.pallas_mosaic_tpu import Config as SplashAttentionConfig
+from tokamax._src.ops.splash_attention.pallas_mosaic_tpu import PallasMosaicTpuSplashAttention as SplashAttention
 
 # pylint: enable=g-importing-member,useless-import-alias
 

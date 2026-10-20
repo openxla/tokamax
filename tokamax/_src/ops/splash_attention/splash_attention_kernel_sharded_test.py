@@ -24,10 +24,10 @@ import jax
 from jax import random
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.splash_attention import base
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_test_utils as test_utils
+from tokamax._src.ops.splash_attention import base
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import splash_attention_test_utils as test_utils
 
 
 PartitionSpec = jax.sharding.PartitionSpec

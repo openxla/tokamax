@@ -23,10 +23,10 @@ from jax import lax
 from jax import tree_util
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.splash_attention import base
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash_kernel
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as mask_info_lib
+from tokamax._src.ops.splash_attention import base
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash_kernel
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
 
 P = jax.P
 MaskInfo = mask_info_lib.MaskInfo
