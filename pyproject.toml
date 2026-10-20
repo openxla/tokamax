@@ -78,5 +78,10 @@ tpu = [
     "jax[tpu]>=0.11.1",
 ]
 
+torch_tpu = [
+    "torch",
+    "torch-tpu",
+]
+
 [tool.pytest.ini_options]
 markers = ["long: tests that will take a long time to run and are used in weekly runs"]
