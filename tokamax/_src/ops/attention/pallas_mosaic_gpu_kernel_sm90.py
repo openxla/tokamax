@@ -375,7 +375,7 @@ def flash_attention_kernel(
             lambda: (await_k(), plgpu.barrier_wait(q_produced)),
         )
 
-        pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
+        schedule_barrier_arrive_and_wait(predicate=wg == 1)
 
         def kv_loop(ki, carry, *, do_causal=False):
           acc, m_scale, m_i, l_i = carry
@@ -499,14 +499,16 @@ def flash_attention_kernel(
         else:
           acc, m_scale, m_i, l_i = lax.fori_loop(lb, ub, kv_loop, carry)
 
-        @pl.when(wg == 0)
-        def unblock_wg1_and_q_load():
-          if config.persistent:
-            # We must sync here to ensure that WG1 is finished with `q_smem`.
-            mgpu_lib.bar_sync(schedule_barrier + 1, num_threads=256)
-            mgpu_lib.bar_arrive(q_consumed_barrier, num_threads=160)
-          else:
-            schedule_barrier_arrive()
+        if config.persistent:
+          # We must sync here to ensure that WG1 is finished with `q_smem`.
+          mgpu_lib.bar_sync(
+              schedule_barrier + 1, num_threads=256, predicate=wg == 0
+          )
+          mgpu_lib.bar_arrive(
+              q_consumed_barrier, num_threads=160, predicate=wg == 0
+          )
+        else:
+          schedule_barrier_arrive(predicate=wg == 0)
 
         m_valid = (mask is None and not has_k_range) | (m_i != -jnp.inf)
         alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)

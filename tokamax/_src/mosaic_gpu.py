@@ -113,25 +113,34 @@ def fence_async_shared_cta(_):
 
 
 def _bar_operation(
-    operation: str, barrier_id: int | jax.Array, num_threads: int
+    operation: str,
+    barrier_id: int | jax.Array,
+    num_threads: int,
+    predicate: bool | jax.Array | None = None,
 ):
   """Performs a PTX CTA barrier operation."""
+  if isinstance(predicate, (bool, np.bool_)):
+    if not predicate:
+      return
+    predicate = None
+
   if isinstance(barrier_id, int):
-
-    @plgpu.inline_mgpu()
-    def bar_op(_):
-      mgpu.utils.inline_ptx(f"bar.{operation} {barrier_id}, {num_threads};")
-
-    bar_op()
+    args, bar_id = [], barrier_id
   else:
+    args, bar_id = [barrier_id], "$0"
 
-    @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
-    def bar_op(_, barrier_id):
-      mgpu.utils.inline_ptx(
-          f"bar.{operation} $0, {num_threads};", barrier_id.registers[()]
-      )
+  if predicate is not None:
+    args.append(predicate)
 
-    bar_op(barrier_id)
+  @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,) * len(args))
+  def bar_op(_, *args):
+    args = [a.registers[()] for a in args]
+    pred = None if predicate is None else args.pop()
+    mgpu.utils.inline_ptx(
+        f"bar.{operation} {bar_id}, {num_threads};", *args, predicate=pred
+    )
+
+  bar_op(*args)
 
 
 bar_arrive = functools.partial(_bar_operation, "arrive")
