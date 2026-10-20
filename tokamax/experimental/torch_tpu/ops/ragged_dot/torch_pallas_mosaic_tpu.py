@@ -60,7 +60,7 @@ class _PallasMosaicTpuRaggedDot(
     """Reconstructs a Config object from its deconstructed representation."""
     config = config_parts[0]
     assert config is not None, "Config not set."
-    tile_m, tile_k, tile_n, bucket_base = (
+    tile_m, tile_k, tile_n, bucket_base, lhs_buffer_count = (
         None if x <= 0 else x for x in config
     )
     return Config(
@@ -68,6 +68,7 @@ class _PallasMosaicTpuRaggedDot(
         tile_k=tile_k,
         tile_n=tile_n,
         bucket_base=bucket_base,
+        lhs_buffer_count=lhs_buffer_count,
     )
 
   @override

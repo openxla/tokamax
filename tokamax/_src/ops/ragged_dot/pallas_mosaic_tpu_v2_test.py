@@ -609,6 +609,43 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     chex.assert_trees_all_close(dlhs, dlhs_ref, atol=2e-2, rtol=2e-2)
     chex.assert_trees_all_close(drhs, drhs_ref, atol=2e-2, rtol=2e-2)
 
+  def test_autotuning_configs(self):
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(k0, (128, 128), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (4, 128, 128), jnp.bfloat16)
+    group_sizes = jnp.array([32, 32, 32, 32], jnp.int32)
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+    configs = op.bind(lhs, rhs, group_sizes=group_sizes).autotuning_configs
+    self.assertGreater(len(configs), 1)
+    expected = gmm_backend.gmm_v2(
+        lhs, rhs, group_sizes=group_sizes, zero_initialize=True
+    )
+    for config in configs:
+      with self.subTest(f"{config=}"):
+        actual = op.replace(config=config)(
+            lhs, rhs, group_sizes=group_sizes, zero_initialize=True
+        )
+        chex.assert_trees_all_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    dlhs_configs = op.bind(
+        jax.ShapeDtypeStruct((128, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16),
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DLHS_RAGGED_DOT_DIM_NUMS,
+    ).autotuning_configs - {pallas_mosaic_tpu_v2.Config()}
+    self.assertTrue(all(c.tile_k == 128 for c in dlhs_configs))
+    self.assertIn(256, {c.tile_n for c in dlhs_configs})
+
+    drhs_configs = op.bind(
+        jax.ShapeDtypeStruct((128, 7168), jnp.bfloat16),
+        jax.ShapeDtypeStruct((128, 2048), jnp.bfloat16),
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS,
+    ).autotuning_configs - {pallas_mosaic_tpu_v2.Config()}
+    self.assertTrue(all(c.tile_k % 128 == 0 for c in drhs_configs))
+    self.assertTrue(all(c.lhs_buffer_count is None for c in drhs_configs))
+
+
 
 if __name__ == "__main__":
   absltest.main()

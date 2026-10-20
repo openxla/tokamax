@@ -365,6 +365,26 @@ class PallasMosaicTpuRaggedDotTest(parameterized.TestCase):
       )
       self.assertEqual(out_f32.dtype, torch.float32)
 
+  def test_deconstruct_and_reconstruct_config_roundtrip(self):
+    op_rd = torch_pallas_mosaic_tpu.PallasMosaicTpuRaggedDot
+    for cfg, expected_tuple in (
+        (Config(), (0, 0, 0, 0, 0)),
+        (
+            Config(
+                tile_m=128,
+                tile_k=128,
+                tile_n=256,
+                bucket_base=64,
+                lhs_buffer_count=3,
+            ),
+            (128, 128, 256, 64, 3),
+        ),
+    ):
+      deconstructed = op_rd.deconstruct_config(cfg)
+      self.assertEqual(deconstructed, expected_tuple)
+      self.assertEqual(op_rd.reconstruct_config(deconstructed), cfg)
+    self.assertIsNone(op_rd.deconstruct_config(None))
+
 
 if __name__ == "__main__":
   absltest.main()
