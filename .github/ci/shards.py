@@ -530,6 +530,7 @@ SHARDS: ShardMap = {
         paths=(
             'tokamax/_src/ops/triangle_multiplication/api_test.py',
             'tokamax/_src/ops/triangle_multiplication/base_test.py',
+            'tokamax/_src/ops/triangle_multiplication/triton_test.py',
         ),
         minutes=1,
     ),
