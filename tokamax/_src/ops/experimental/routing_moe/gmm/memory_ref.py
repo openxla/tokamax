@@ -142,11 +142,13 @@ class RoutingBufferedRef(_BypassBufferedRef):
       *args: Any,
       metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
+      idx_ref: Any = None,
       **kwargs,
   ):
     standard_ref = _BypassBufferedRef.create(*args, **kwargs)
     return cls(
         metadata_ref=metadata_ref,
+        idx_ref=metadata_ref.idx_ref if idx_ref is None else idx_ref,
         cfg=cfg,
         **{
             f.name: getattr(standard_ref, f.name)
@@ -388,14 +390,17 @@ class BranchlessBufferedRef(RoutingBufferedRef):
       self, grid_indices: GridIndices, rows_ds: pl.Slice
   ) -> jax.Array:
     """SMEM offset that accounts for N tile dim buffering."""
+    rows_ds_start = jnp.uint32(rows_ds.start)
+    if self.metadata_ref.idx_ref is not None:
+      return rows_ds_start
     idx_buffer_size = jnp.uint32(self.cfg.plan.idx_buffer_size)
     ring_size = jnp.uint32(self.cfg.plan.idx_ring_size)
     num_idx_buffers = jnp.uint32(self.cfg.plan.num_idx_buffers)
-    n_id, _, _ = self.metadata_ref.resolve(*grid_indices, dtype=jnp.uint32)
+    n_id, gm_id, _ = self.metadata_ref.resolve(*grid_indices, dtype=jnp.uint32)
+    n_id = jnp.where(gm_id == self.metadata_ref.sink_gm_id, 0, n_id)
     # Buffer is divided into two where only even/odd n_id can use to avoid
     # first step of n_id oveerwriting value of last step at n_id - 1.
     n_offset = lax.rem(n_id, num_idx_buffers) * idx_buffer_size
-    rows_ds_start = jnp.uint32(rows_ds.start)
     return n_offset + lax.rem(rows_ds_start, ring_size)
 
   @override
@@ -551,6 +556,86 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
     pltpu.make_async_copy(recv, recv, self.recv_sem).wait()
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class VmemBufferedRef(BranchlessBufferedRef):
+  """BufferedRef that performs branchless per-row VMEM load/store."""
+
+  @override
+  def branchless_copy_in(
+      self, src_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
+    assert self.idx_ref is not None
+
+    slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
+    rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
+    vmem_dst = pltpu.annotate(
+        self._window_ref_at(slot), no_hazard_no_deps=True
+    )
+    vmem_src = pltpu.annotate(src_ref, no_store=True)
+    src_chunks, dst_stride, lanes = (
+        vmem_src.shape[1],
+        vmem_dst.shape[1],
+        vmem_src.shape[3],
+    )
+    src_u32 = vmem_src.bitcast(jnp.uint32).reshape(-1, lanes)
+    dst_u32 = vmem_dst.bitcast(jnp.uint32).reshape(-1, lanes)
+    offset = self._idx_offset(grid_indices, rows_ds)
+    chunks = cols_ds.size
+    col_offset = cols_ds.start if self.cfg.num_k > 1 else 0
+
+    max_rows = min(self.cfg.plan.tile_m, self.cfg.dim.size_out_m)
+    for i in range(max_rows):
+      live = i < rows_ds.size
+      row = jnp.where(live, self.idx_ref[offset + i], 0)
+      dst_u32[pl.ds(i * dst_stride, chunks)] = src_u32[
+          pl.ds(row * src_chunks + col_offset, chunks)
+      ]
+
+  @override
+  def branchless_copy_out(
+      self, dst_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
+    assert self.idx_ref is not None
+
+    slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
+    rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
+    vmem_src = pltpu.annotate(
+        self._window_ref_at(slot), no_hazard_no_deps=True
+    )
+    vmem_dst = pltpu.annotate(dst_ref, no_hazard_no_deps=True)
+    dst_chunks, src_stride, lanes = (
+        vmem_dst.shape[1],
+        vmem_src.shape[1],
+        vmem_dst.shape[3],
+    )
+    src_u32 = vmem_src.bitcast(jnp.uint32).reshape(-1, lanes)
+    dst_u32 = vmem_dst.bitcast(jnp.uint32).reshape(-1, lanes)
+    offset = self._idx_offset(grid_indices, rows_ds)
+    chunks = cols_ds.size
+    col_offset = cols_ds.start if self.cfg.num_n > 1 else 0
+
+    max_rows = min(self.cfg.plan.tile_m, self.cfg.dim.size_out_m)
+    for i in range(max_rows):
+      # NOTE: Garbage read is fine, but garbage out is not fine as it can
+      # overwrite existing data and lead to incorrect output results.
+      live = i < rows_ds.size
+      row = jnp.where(live, self.idx_ref[offset + i], 0)
+      val = src_u32[pl.ds(i * src_stride, chunks)]
+      pltpu.store(
+          dst_u32.at[pl.ds(row * dst_chunks + col_offset, chunks)],
+          val,
+          mask=jnp.broadcast_to(live, val.shape),
+      )
+
+  def _branchless_no_op(
+      self, ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
+    del ref, grid_indices
+
+  branchless_wait_in = branchless_wait_out = _branchless_no_op
+
+
 @dataclasses.dataclass(frozen=True)
 class PipelineIndexMaps:
   """Provides grid-to-tile index mapping functions for pipeline BlockSpecs.
@@ -580,6 +665,7 @@ class PipelineIndexMaps:
     """Returns the block index tuple for the input activation."""
     chunks = hbm_shape[1] // self.cfg.num_k
     _, gm_id, k_id = self.metadata_ref.resolve(n_id, gm_id, k_id)
+    k_id = jnp.where(gm_id == self.metadata_ref.sink_gm_id, 0, k_id)
     return (self._rows(gm_id), pl.ds(k_id * chunks, chunks), 0, 0)
 
   def out_index(
@@ -593,6 +679,7 @@ class PipelineIndexMaps:
     """Returns the block index tuple for the output activation."""
     chunks = hbm_shape[1] // self.cfg.num_n
     n_id, gm_id, _ = self.metadata_ref.resolve(n_id, gm_id, k_id)
+    n_id = jnp.where(gm_id == self.metadata_ref.sink_gm_id, 0, n_id)
     return (self._rows(gm_id), pl.ds(n_id * chunks, chunks), 0, 0)
 
   def weight_index(
@@ -821,6 +908,8 @@ class PipelineAllocs:
           return BranchlessBufferedRef
         case config.RoutingMode.REMOTE:
           return RemoteBranchlessBufferedRef
+        case config.RoutingMode.VMEM:
+          return VmemBufferedRef
         case config.RoutingMode.DIRECT:
           return BranchedBufferedRef
         case _:
@@ -833,6 +922,7 @@ class PipelineAllocs:
         grid_rank=3,
         cfg=cfg,
         metadata_ref=metadata_ref,
+        idx_ref=metadata_ref.gather_idx_ref,
     )
     out_bref = _get_buffered_ref(cfg.out.mode).output(
         spec=pipeline_block_specs.get_out_spec(),
@@ -841,6 +931,7 @@ class PipelineAllocs:
         grid_rank=3,
         cfg=cfg,
         metadata_ref=metadata_ref,
+        idx_ref=metadata_ref.scatter_idx_ref,
     )
     if cfg.out.mode == config.RoutingMode.REMOTE:
       out_bref = dataclasses.replace(

@@ -28,6 +28,12 @@ from tokamax._src.ops.experimental.routing_moe.io_relayout import output_reduce
 from tokamax._src.ops.experimental.routing_moe.layer import config
 from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
 
+# Up to this many routed rows (tokens x topk), the routing is built inside the
+# routing gmm kernels from the top-k ids, instead of sorted by XLA. Each routing
+# gmm builds it, and its scalar cost grows with the rows; at Qwen3.5-397B shapes
+# it breaks even near 160.
+_LOWTOK_MAX_ROUTED_ROWS = 160
+
 P = sharding.PartitionSpec
 NamedSharding = sharding.NamedSharding
 Mesh = sharding.Mesh
@@ -95,16 +101,30 @@ def _routing_moe_local(
   # NOTE: Unlike topk, index sorting has to be done after all-gather to ensure
   # all shards have the same information.
   topk_indices_flat = topk_indices.flatten()
-  # One stable sort gives both the order of the routed rows and, as its sorted
-  # keys, the group of each sorted row (`row_group`), so the latter is free.
-  row_group, topk_argsort_indices = jax.lax.sort_key_val(
-      topk_indices_flat,
-      jnp.arange(topk_indices_flat.size, dtype=jnp.int32),
-      is_stable=True,
-  )
-  group_sizes = jax.nn.one_hot(
-      topk_indices_flat, global_num_experts, dtype=jnp.int32
-  ).sum(axis=0)
+  if (
+      not cfg.plan.remote_scatter
+      and topk_indices_flat.size <= _LOWTOK_MAX_ROUTED_ROWS
+  ):
+    # Few rows: the kernels build the routing from the top-k ids themselves.
+    group_sizes = None
+    gather_indices = scatter_indices = topk_indices_flat
+    lowtok = dict(topk=topk, num_global_groups=global_num_experts)
+    row_group = None
+  else:
+    # One stable sort gives both the order of the routed rows and, as its
+    # sorted keys, the group of each sorted row (`row_group`), so the latter is
+    # free.
+    row_group, topk_argsort_indices = jax.lax.sort_key_val(
+        topk_indices_flat,
+        jnp.arange(topk_indices_flat.size, dtype=jnp.int32),
+        is_stable=True,
+    )
+    group_sizes = jax.nn.one_hot(
+        topk_indices_flat, global_num_experts, dtype=jnp.int32
+    ).sum(axis=0)
+    gather_indices = topk_argsort_indices // topk
+    scatter_indices = topk_argsort_indices
+    lowtok = {}
 
   # Step 5: Invoke GMM Gate and Up.
   gmm_res = gmm.routing_gmm(
@@ -114,15 +134,16 @@ def _routing_moe_local(
           arg.make_weight_wrapper(w2, w2_scale, w2_bias),
       ),
       group_sizes=group_sizes,
-      gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
+      gather=arg.make_routing_wrapper(gather_indices),
       scatter=arg.make_routing_wrapper(
-          topk_argsort_indices,
+          scatter_indices,
           remote_axis=cfg.reduction_axis if cfg.plan.remote_scatter else None,
       ),
       fuse_act=cfg.activation,
       group_offset=group_offset,
       row_group=row_group,
       custom_plan=gmm_plan,
+      **lowtok,
   )
 
   # Step 6: Postprocess outputs from routing gmm. With remote_scatter or

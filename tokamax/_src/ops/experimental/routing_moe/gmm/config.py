@@ -41,6 +41,7 @@ class RoutingMode(enum.StrEnum):
   # moving remote-ness into ActivationConfig, so remote vs local differs only in
   # the per-row DMA.
   REMOTE = enum.auto()
+  VMEM = enum.auto()  # Dynamic VMEM indexing is performed in per-row basis.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,6 +58,10 @@ class ActivationConfig:
 
   spec: arg.ActivationSpec
   mode: RoutingMode
+
+  @property
+  def memory_space(self) -> pltpu.MemorySpace:
+    return pltpu.VMEM if self.mode == RoutingMode.VMEM else pltpu.HBM
 
 
 @dataclasses.dataclass(frozen=True)
@@ -245,9 +250,9 @@ class RoutingGmmConfig:
     def _resolve_mode(routing: arg.RoutingSpec | None) -> RoutingMode:
       if routing is None:
         return RoutingMode.DIRECT
-      if routing.remote_axis is None:
-        return RoutingMode.LOCAL
-      return RoutingMode.REMOTE
+      if routing.remote_axis is not None:
+        return RoutingMode.REMOTE
+      return RoutingMode.VMEM if plan.vmem_routing else RoutingMode.LOCAL
 
     x_mode = _resolve_mode(gather)
     out_mode = _resolve_mode(scatter)

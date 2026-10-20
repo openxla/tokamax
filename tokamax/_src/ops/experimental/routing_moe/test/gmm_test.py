@@ -504,6 +504,134 @@ class RoutingGmmTest(parameterized.TestCase):
           custom_plan=gmm_plan.RoutingGmmPlan(skip_metadata_size=-1),
       )
 
+  @parameterized.product(
+      num_tokens=[1, 4, 16],
+      shard=[(512, 0), (64, 0), (64, 128)],
+      tile_n=[None, 512],
+  )
+  def test_lowtok_matches_sorted(self, num_tokens, shard, tile_n):
+    num_local_experts, group_offset_val = shard
+    num_experts = 512
+    topk = 10
+    size_k = 1024
+    size_n = 512
+
+    key0, key1, key2, key3 = jax.random.split(jax.random.key(0), 4)
+    lhs = jax.random.normal(key0, (num_tokens, size_k), jnp.bfloat16) / 10
+    rhs1 = (
+        jax.random.normal(
+            key1, (num_local_experts, size_k, 2 * size_n), jnp.bfloat16
+        )
+        / 10
+    )
+    rhs1_q, rhs1_scale = gmm_util.quantize_tensor(
+        rhs1, jnp.float8_e4m3fn, axis=1, block_size=size_k
+    )
+    rhs1_scale = jnp.expand_dims(rhs1_scale, axis=2)
+    rhs2 = (
+        jax.random.normal(
+            key2, (num_local_experts, size_n, size_k), jnp.bfloat16
+        )
+        / 10
+    )
+
+    gating_output = jax.random.uniform(key3, (num_tokens, num_experts))
+    _, topk_indices = jax.lax.top_k(gating_output, topk)
+    topk_indices_flat = topk_indices.flatten()
+    topk_argsort_indices = jnp.argsort(topk_indices_flat)
+    group_sizes = jnp.bincount(topk_indices_flat, length=num_experts)
+    group_offset = jnp.array([group_offset_val], dtype=jnp.int32)
+
+    lhs_compact = input_pack.input_pack(lhs)
+    w1_wrapped = arg.make_weight_wrapper(
+        rhs1_q, rhs1_scale, fused_gate_up=True
+    )
+    w2_wrapped = arg.make_weight_wrapper(rhs2)
+    custom_plan = gmm_plan.RoutingGmmPlan(tile_n=tile_n)
+
+    sorted_mid = gmm.routing_gmm(
+        lhs_compact,
+        (w1_wrapped,),
+        group_sizes,
+        group_offset=group_offset,
+        gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
+        fuse_act="silu",
+        custom_plan=custom_plan,
+    )
+    sorted_out = gmm.routing_gmm(
+        sorted_mid,
+        (w2_wrapped,),
+        group_sizes,
+        group_offset=group_offset,
+        scatter=arg.make_routing_wrapper(topk_argsort_indices),
+        custom_plan=custom_plan,
+    )
+
+    slots_wrapped = arg.make_routing_wrapper(topk_indices_flat)
+    lowtok_mid = gmm.routing_gmm(
+        lhs_compact,
+        (w1_wrapped,),
+        None,
+        group_offset=group_offset,
+        gather=slots_wrapped,
+        fuse_act="silu",
+        custom_plan=custom_plan,
+        topk=topk,
+        num_global_groups=num_experts,
+    )
+    lowtok_out = gmm.routing_gmm(
+        lowtok_mid,
+        (w2_wrapped,),
+        None,
+        group_offset=group_offset,
+        scatter=slots_wrapped,
+        custom_plan=custom_plan,
+        topk=topk,
+        num_global_groups=num_experts,
+    )
+
+    written = (topk_indices_flat >= group_offset_val) & (
+        topk_indices_flat < group_offset_val + num_local_experts
+    )
+    sorted_rows = sorted_out.data.reshape(sorted_out.spec.large_shape)
+    lowtok_rows = lowtok_out.data.reshape(lowtok_out.spec.large_shape)
+    np.testing.assert_array_equal(lowtok_rows[written], sorted_rows[written])
+
+    if tile_n is None:
+      w1_bf16 = arg.make_weight_wrapper(rhs1, fused_gate_up=True)
+      fused_plan = gmm_plan.RoutingGmmPlan(fuse_up_and_down=True)
+      sorted_fused = gmm.routing_gmm(
+          lhs_compact,
+          (w1_bf16, w2_wrapped),
+          group_sizes,
+          group_offset=group_offset,
+          gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
+          scatter=arg.make_routing_wrapper(topk_argsort_indices),
+          fuse_act="silu",
+          custom_plan=fused_plan,
+      )
+      lowtok_fused = gmm.routing_gmm(
+          lhs_compact,
+          (w1_bf16, w2_wrapped),
+          None,
+          group_offset=group_offset,
+          gather=slots_wrapped,
+          scatter=slots_wrapped,
+          fuse_act="silu",
+          custom_plan=fused_plan,
+          topk=topk,
+          num_global_groups=num_experts,
+      )
+      sorted_fused_rows = sorted_fused.data.reshape(
+          sorted_fused.spec.large_shape
+      )
+      lowtok_fused_rows = lowtok_fused.data.reshape(
+          lowtok_fused.spec.large_shape
+      )
+      np.testing.assert_array_equal(
+          lowtok_fused_rows[written], sorted_fused_rows[written]
+      )
+
   @parameterized.named_parameters(*SHAPES)
   def test_permute_gmm_benchmark(self, **shape):
     self._setup_inputs(**shape)
@@ -699,6 +827,247 @@ class RoutingGmmTest(parameterized.TestCase):
       # and with 64 groups the gap is within noise, so those only log.
       if num_local_experts >= 512 and shape["num_tokens"] == 1:
         self.assertLess(latency_us[True], latency_us[False])
+
+  @parameterized.product(
+      LIVE_GROUP_WALK_SHAPES,
+      tile_n=[None, 512],
+      mode=["sorted", "live_group", "lowtok"],
+  )
+  def test_vmem_routing(
+      self,
+      tile_n: int | None,
+      mode: str,
+      num_tokens: int,
+      num_experts: int,
+      num_local_experts: int,
+      group_offset: int,
+      topk: int,
+      size_k: int,
+      size_n: int,
+      testcase_name: str = "",
+  ):
+    del testcase_name
+    key0, key1, key2, key3 = jax.random.split(jax.random.key(0), 4)
+    lhs = jax.random.normal(key0, (num_tokens, size_k), jnp.bfloat16) / 10
+    rhs1 = (
+        jax.random.normal(
+            key1, (num_local_experts, size_k, size_n), jnp.bfloat16
+        )
+        / 10
+    )
+    rhs2 = (
+        jax.random.normal(
+            key2, (num_local_experts, size_k, size_n), jnp.bfloat16
+        )
+        / 10
+    )
+
+    gating_output = jax.random.uniform(key3, (num_tokens, num_experts))
+    gating_output = gating_output.at[0, group_offset].set(2.0)
+    _, topk_indices = jax.lax.top_k(gating_output, topk)
+    topk_indices_flat = topk_indices.flatten()
+    topk_argsort_indices = jnp.argsort(topk_indices_flat)
+    row_group = topk_indices_flat[topk_argsort_indices]
+    group_sizes = jnp.bincount(topk_indices_flat, length=num_experts)
+
+    group_offset_arr = jnp.array([group_offset], dtype=jnp.int32)
+    group_start = group_offset
+    group_end = group_start + num_local_experts
+    group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
+    start_row = int(group_cum_sum[group_start])
+    end_row = int(group_cum_sum[group_end])
+    num_valid_rows = end_row - start_row
+    self.assertGreater(num_valid_rows, 0)
+
+    lhs_compact = input_pack.input_pack(lhs)
+    rhs1_wrapped = arg.make_weight_wrapper(rhs1, fused_gate_up=True)
+    lhs_gathered = lhs[topk_argsort_indices // topk]
+    lhs_gathered_compact = input_pack.input_pack(lhs_gathered)
+    rhs2_wrapped = arg.make_weight_wrapper(rhs2)
+
+    if mode == "sorted":
+      gather = arg.make_routing_wrapper(topk_argsort_indices // topk)
+      scatter = arg.make_routing_wrapper(topk_argsort_indices)
+      plan_vmem = gmm_plan.RoutingGmmPlan(
+          tile_n=tile_n, live_group_walk=False, vmem_routing=True
+      )
+      plan_hbm = gmm_plan.RoutingGmmPlan(
+          tile_n=tile_n, live_group_walk=False, vmem_routing=False
+      )
+      vmem_gmm1 = gmm.routing_gmm(
+          lhs_compact,
+          (rhs1_wrapped,),
+          group_sizes,
+          group_offset=group_offset_arr,
+          gather=gather,
+          fuse_act="silu",
+          row_group=row_group,
+          custom_plan=plan_vmem,
+      )
+      hbm_gmm1 = gmm.routing_gmm(
+          lhs_compact,
+          (rhs1_wrapped,),
+          group_sizes,
+          group_offset=group_offset_arr,
+          gather=gather,
+          fuse_act="silu",
+          row_group=row_group,
+          custom_plan=plan_hbm,
+      )
+      vmem_gmm2 = gmm.routing_gmm(
+          lhs_gathered_compact,
+          (rhs2_wrapped,),
+          group_sizes,
+          group_offset=group_offset_arr,
+          scatter=scatter,
+          row_group=row_group,
+          custom_plan=plan_vmem,
+      )
+      hbm_gmm2 = gmm.routing_gmm(
+          lhs_gathered_compact,
+          (rhs2_wrapped,),
+          group_sizes,
+          group_offset=group_offset_arr,
+          scatter=scatter,
+          row_group=row_group,
+          custom_plan=plan_hbm,
+      )
+      vmem_g1 = vmem_gmm1.data.reshape(vmem_gmm1.spec.large_shape)
+      hbm_g1 = hbm_gmm1.data.reshape(hbm_gmm1.spec.large_shape)
+      np.testing.assert_array_equal(
+          vmem_g1[start_row:end_row],
+          hbm_g1[start_row:end_row],
+      )
+      vmem_g2 = vmem_gmm2.data.reshape(vmem_gmm2.spec.large_shape)
+      hbm_g2 = hbm_gmm2.data.reshape(hbm_gmm2.spec.large_shape)
+      written_indices = topk_argsort_indices[start_row:end_row]
+      np.testing.assert_array_equal(
+          vmem_g2[written_indices],
+          hbm_g2[written_indices],
+      )
+    elif mode == "live_group":
+      gather = arg.make_routing_wrapper(topk_argsort_indices // topk)
+      scatter = arg.make_routing_wrapper(topk_argsort_indices)
+      plan_vmem = gmm_plan.RoutingGmmPlan(
+          tile_n=tile_n, live_group_walk=True, vmem_routing=True
+      )
+      plan_hbm = gmm_plan.RoutingGmmPlan(
+          tile_n=tile_n, live_group_walk=True, vmem_routing=False
+      )
+      vmem_gmm1 = gmm.routing_gmm(
+          lhs_compact,
+          (rhs1_wrapped,),
+          group_sizes,
+          group_offset=group_offset_arr,
+          gather=gather,
+          fuse_act="silu",
+          row_group=row_group,
+          custom_plan=plan_vmem,
+      )
+      hbm_gmm1 = gmm.routing_gmm(
+          lhs_compact,
+          (rhs1_wrapped,),
+          group_sizes,
+          group_offset=group_offset_arr,
+          gather=gather,
+          fuse_act="silu",
+          row_group=row_group,
+          custom_plan=plan_hbm,
+      )
+      vmem_gmm2 = gmm.routing_gmm(
+          lhs_gathered_compact,
+          (rhs2_wrapped,),
+          group_sizes,
+          group_offset=group_offset_arr,
+          scatter=scatter,
+          row_group=row_group,
+          custom_plan=plan_vmem,
+      )
+      hbm_gmm2 = gmm.routing_gmm(
+          lhs_gathered_compact,
+          (rhs2_wrapped,),
+          group_sizes,
+          group_offset=group_offset_arr,
+          scatter=scatter,
+          row_group=row_group,
+          custom_plan=plan_hbm,
+      )
+      vmem_g1 = vmem_gmm1.data.reshape(vmem_gmm1.spec.large_shape)
+      hbm_g1 = hbm_gmm1.data.reshape(hbm_gmm1.spec.large_shape)
+      np.testing.assert_array_equal(
+          vmem_g1[start_row:end_row],
+          hbm_g1[start_row:end_row],
+      )
+      vmem_g2 = vmem_gmm2.data.reshape(vmem_gmm2.spec.large_shape)
+      hbm_g2 = hbm_gmm2.data.reshape(hbm_gmm2.spec.large_shape)
+      written_indices = topk_argsort_indices[start_row:end_row]
+      np.testing.assert_array_equal(
+          vmem_g2[written_indices],
+          hbm_g2[written_indices],
+      )
+    elif mode == "lowtok":
+      slots_wrapped = arg.make_routing_wrapper(topk_indices_flat)
+      plan_vmem = gmm_plan.RoutingGmmPlan(tile_n=tile_n, vmem_routing=True)
+      plan_hbm = gmm_plan.RoutingGmmPlan(tile_n=tile_n, vmem_routing=False)
+      vmem_gmm1 = gmm.routing_gmm(
+          lhs_compact,
+          (rhs1_wrapped,),
+          None,
+          group_offset=group_offset_arr,
+          gather=slots_wrapped,
+          fuse_act="silu",
+          custom_plan=plan_vmem,
+          topk=topk,
+          num_global_groups=num_experts,
+      )
+      hbm_gmm1 = gmm.routing_gmm(
+          lhs_compact,
+          (rhs1_wrapped,),
+          None,
+          group_offset=group_offset_arr,
+          gather=slots_wrapped,
+          fuse_act="silu",
+          custom_plan=plan_hbm,
+          topk=topk,
+          num_global_groups=num_experts,
+      )
+      vmem_gmm2 = gmm.routing_gmm(
+          lhs_gathered_compact,
+          (rhs2_wrapped,),
+          None,
+          group_offset=group_offset_arr,
+          scatter=slots_wrapped,
+          custom_plan=plan_vmem,
+          topk=topk,
+          num_global_groups=num_experts,
+      )
+      hbm_gmm2 = gmm.routing_gmm(
+          lhs_gathered_compact,
+          (rhs2_wrapped,),
+          None,
+          group_offset=group_offset_arr,
+          scatter=slots_wrapped,
+          custom_plan=plan_hbm,
+          topk=topk,
+          num_global_groups=num_experts,
+      )
+      vmem_g1 = vmem_gmm1.data.reshape(vmem_gmm1.spec.large_shape)
+      hbm_g1 = hbm_gmm1.data.reshape(hbm_gmm1.spec.large_shape)
+      np.testing.assert_array_equal(
+          vmem_g1[:num_valid_rows],
+          hbm_g1[:num_valid_rows],
+      )
+      vmem_g2 = vmem_gmm2.data.reshape(vmem_gmm2.spec.large_shape)
+      hbm_g2 = hbm_gmm2.data.reshape(hbm_gmm2.spec.large_shape)
+      written = (topk_indices_flat >= group_offset) & (
+          topk_indices_flat < group_offset + num_local_experts
+      )
+      np.testing.assert_array_equal(
+          vmem_g2[written],
+          hbm_g2[written],
+      )
+    else:
+      raise ValueError(f"Unknown mode: {mode}")
 
 
 class RemoteRoutingGmmTest(parameterized.TestCase):

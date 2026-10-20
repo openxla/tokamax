@@ -24,6 +24,7 @@ import jax
 from jax import lax
 from jax.experimental import hijax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 
@@ -46,6 +47,21 @@ class AbstractMetadataRef(abc.ABC):
         gm_id_to_num_rows=jnp.empty((cfg.max_num_gm,), jnp.int32),
         num_gm=jnp.empty((1,), jnp.int32),
     )
+
+  @property
+  def idx_ref(self) -> jax.Array | hijax.TransformedRef | None:
+    """SMEM-resident row-index table, or None when streamed from HBM."""
+    return None
+
+  @property
+  def gather_idx_ref(self) -> jax.Array | hijax.TransformedRef | None:
+    """SMEM-resident gather row-index table, or None when streamed from HBM."""
+    return self.idx_ref
+
+  @property
+  def scatter_idx_ref(self) -> jax.Array | hijax.TransformedRef | None:
+    """SMEM-resident scatter row-index table, or None when streamed from HBM."""
+    return self.idx_ref
 
   @property
   def sink_gm_id(self) -> int:
@@ -95,6 +111,11 @@ class AbstractMetadataRef(abc.ABC):
         jnp.asarray(gm_id, dtype),
         jnp.asarray(k_id, dtype),
     )
+
+  @abc.abstractmethod
+  def fill_metadata_and_return_num_gm(self) -> jax.Array:
+    """Fills the tables and returns the number of tiles."""
+    ...
 
 
 @jax.tree_util.register_dataclass
@@ -261,18 +282,209 @@ class LiveGroupMetadataRef(SortedMetadataRef):
     return num_gm
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class LowTokMetadataRef(AbstractMetadataRef):
+  """Metadata built in the kernel from the raw top-k ids, for few tokens.
+
+  Nothing is sorted outside the kernel. The fill visits the routed slots
+  (tokens x topk) three times on the scalar core: it finds this shard's
+  distinct groups, in order of first appearance, and counts their rows; lays
+  out each group's rows contiguously and writes its tiles; then gives every slot
+  the next row of its group and writes that row's gather index (slot // topk)
+  or scatter index (slot). The cost grows with the number of slots, not with
+  the number of groups.
+
+  Rows of a group keep slot order, as a stable sort does, so the routing gmm
+  computes the same rows as with `SortedMetadataRef`; only the order of the
+  groups differs. The routing gmms of a layer must see the same slots, so that
+  they agree on where each row is.
+  """
+
+  gather_idx: jax.Array | hijax.TransformedRef | None
+  scatter_idx: jax.Array | hijax.TransformedRef | None
+  slot_group: jax.Array | hijax.TransformedRef  # [slots]: global group ids.
+  group_offset: jax.Array | hijax.TransformedRef
+  topk: int = dataclasses.field(metadata=dict(static=True))
+
+  @property
+  def idx_ref(self) -> jax.Array | hijax.TransformedRef | None:
+    return self.gather_idx if self.gather_idx is not None else self.scatter_idx
+
+  @property
+  def gather_idx_ref(self) -> jax.Array | hijax.TransformedRef | None:
+    return self.gather_idx
+
+  @property
+  def scatter_idx_ref(self) -> jax.Array | hijax.TransformedRef | None:
+    return self.scatter_idx
+
+  @classmethod
+  def create(
+      cls,
+      gather_slots: jax.Array | None,
+      scatter_slots: jax.Array | None,
+      group_offset: jax.Array,
+      cfg: config.RoutingGmmConfig,
+      topk: int,
+  ) -> "LowTokMetadataRef":
+    """Creates SMEM metadata and resident index table for LowTok routing."""
+    if not isinstance(topk, int) or isinstance(topk, bool) or topk <= 0:
+      raise ValueError(f"topk must be a positive int. Got {topk}.")
+    if gather_slots is None and scatter_slots is None:
+      raise ValueError("At least one of gather or scatter slots is required.")
+    if cfg.out.mode == config.RoutingMode.REMOTE:
+      raise NotImplementedError("LowTok does not support remote routing.")
+    slots = gather_slots if gather_slots is not None else scatter_slots
+    assert slots is not None
+    # Filled by the kernel; padded by tile_m like the sorted indices.
+    idx_shape = (slots.shape[0] + cfg.plan.tile_m,)
+    gather_idx = (
+        None if gather_slots is None else jnp.empty(idx_shape, jnp.int32)
+    )
+    scatter_idx = (
+        None if scatter_slots is None else jnp.empty(idx_shape, jnp.int32)
+    )
+    return cls(
+        **cls._empty_tables(cfg),
+        gather_idx=gather_idx,
+        scatter_idx=scatter_idx,
+        slot_group=slots.astype(jnp.int32),
+        group_offset=group_offset,
+        cfg=cfg,
+        topk=topk,
+    )
+
+  def fill_metadata_and_return_num_gm(self) -> jax.Array:
+    num_slots = int(self.slot_group.shape[0])
+    num_groups = int(self.cfg.dim.size_local_groups)
+    tile_m = self.cfg.plan.tile_m
+    max_distinct = min(num_slots, num_groups)
+    group_start = self.group_offset[0]
+
+    def body(seen, distinct, count, cursor, slot_distinct):
+      # Pass 1: this shard's distinct groups and their number of rows.
+      def find(slot_id, num_seen):
+        group_id = self.slot_group[slot_id] - group_start
+        local = (group_id >= 0) & (group_id < num_groups)
+        group_id = jnp.clip(group_id, 0, num_groups - 1)
+        # seen[group_id] is group_id's 1-based position in `distinct`, valid
+        # only if `distinct` agrees, so that no pass has to clear the table.
+        dist_id = seen[group_id] - 1
+        known = (dist_id >= 0) & (dist_id < num_seen)
+        known &= distinct[jnp.clip(dist_id, 0, max_distinct - 1)] == group_id
+        new = local & jnp.logical_not(known)
+        dist_id = jnp.where(known, dist_id, num_seen)
+
+        @pl.when(new)
+        def _():
+          distinct[num_seen] = group_id
+          seen[group_id] = num_seen + 1
+          count[num_seen] = 0
+
+        @pl.when(local)
+        def _():
+          count[dist_id] = count[dist_id] + 1
+
+        slot_distinct[slot_id] = jnp.where(local, dist_id, -1)
+        return num_seen + new.astype(jnp.int32)
+
+      num_distinct = jax.lax.fori_loop(0, num_slots, find, jnp.int32(0))
+
+      # Pass 2: lay out each group's rows contiguously and write its tiles.
+      self.gm_id_to_group_id[self.sink_gm_id] = 0
+      self.gm_id_to_m_offset[self.sink_gm_id] = 0
+      self.gm_id_to_num_rows[self.sink_gm_id] = 0
+
+      def lay_out(dist_id, carry):
+        num_gm, start = carry
+        group_id = distinct[dist_id]
+        end = start + count[dist_id]
+        cursor[dist_id] = start
+
+        def write_tile(gm_id, offset):
+          num_rows = jnp.minimum(end - offset, tile_m)
+          self.gm_id_to_group_id[gm_id] = group_id
+          self.gm_id_to_m_offset[gm_id] = offset
+          self.gm_id_to_num_rows[gm_id] = num_rows
+          return offset + num_rows
+
+        next_num_gm = num_gm + pl.cdiv(end - start, tile_m)
+        jax.lax.fori_loop(num_gm, next_num_gm, write_tile, start)
+        return next_num_gm, end
+
+      num_gm, num_rows = jax.lax.fori_loop(
+          0, num_distinct, lay_out, (jnp.int32(0), jnp.int32(0))
+      )
+      self.num_gm[0] = num_gm
+
+      # Pass 3: give each slot the next row of its group.
+      def place(slot_id, carry):
+        dist_id = slot_distinct[slot_id]
+
+        @pl.when(dist_id >= 0)
+        def _():
+          row = cursor[dist_id]
+          cursor[dist_id] = row + 1
+          if self.gather_idx is not None:
+            self.gather_idx[row] = slot_id // self.topk
+          if self.scatter_idx is not None:
+            self.scatter_idx[row] = slot_id
+
+        return carry
+
+      jax.lax.fori_loop(0, num_slots, place, 0)
+
+      # The last tile reads up to tile_m indices past the last row.
+      def clear(i, carry):
+        if self.gather_idx is not None:
+          self.gather_idx[num_rows + i] = 0
+        if self.scatter_idx is not None:
+          self.scatter_idx[num_rows + i] = 0
+        return carry
+
+      jax.lax.fori_loop(0, tile_m, clear, 0)
+      return num_gm
+
+    return pl.run_scoped(
+        body,
+        pltpu.SMEM((num_groups,), jnp.int32),
+        pltpu.SMEM((max_distinct,), jnp.int32),
+        pltpu.SMEM((max_distinct,), jnp.int32),
+        pltpu.SMEM((max_distinct,), jnp.int32),
+        pltpu.SMEM((num_slots,), jnp.int32),
+    )
+
+
 def create_metadata_ref(
-    group_cum_sum: jax.Array,
+    group_cum_sum: jax.Array | None,
     group_offset: jax.Array,
     cfg: config.RoutingGmmConfig,
     *,
     row_group: jax.Array | None = None,
+    gather_idx: jax.Array | None = None,
+    scatter_idx: jax.Array | None = None,
+    topk: int | None = None,
 ) -> AbstractMetadataRef:
   """Returns the metadata ref that fills the tables for this config.
 
-  This is the one place that picks the walk: `row_group` reaches the kernel
-  only when the plan selects the live walk, and is unused otherwise.
+  Args:
+    group_cum_sum: The cumulative rows of the groups, without `topk`.
+    group_offset: The first group of this shard.
+    cfg: The routing gmm config.
+    row_group: Without `topk`, the group of each sorted routed row; if given
+      and the plan selects it, only the groups with rows are walked.
+    gather_idx: With `topk`, the group of each routed slot for gather.
+    scatter_idx: With `topk`, the group of each routed slot for scatter.
+    topk: Groups per token. If given, the routing is built in the kernel from
+      the raw top-k ids (`LowTokMetadataRef`).
   """
+  if topk is not None:
+    return LowTokMetadataRef.create(
+        gather_idx, scatter_idx, group_offset, cfg, topk
+    )
+  if group_cum_sum is None:
+    raise ValueError("group_cum_sum is required when topk is None.")
   if row_group is not None and cfg.plan.live_group_walk:
     return LiveGroupMetadataRef.create(
         group_cum_sum, group_offset, cfg, row_group=row_group
