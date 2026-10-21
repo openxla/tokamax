@@ -1182,7 +1182,10 @@ def _fused_dhu_wy_intra_cumsum_kernel(
 
   @pl.when(is_last_chunk)
   def _():
-    dh_tmp_ref[:] = dht_ref[:, 0, 0, :].astype(dh_tmp_ref.dtype)
+    if dht_ref is None:
+      dh_tmp_ref[:] = jnp.zeros(dh_tmp_ref.shape, dh_tmp_ref.dtype)
+    else:
+      dh_tmp_ref[:] = dht_ref[:, 0, 0, :].astype(dh_tmp_ref.dtype)
 
   dh = dh_tmp_ref[:].astype(jnp.float32)
   bq = q_ref[:, 0, 0].astype(jnp.float32)
@@ -1237,7 +1240,8 @@ def _fused_dhu_wy_intra_cumsum_kernel(
 
   @pl.when(is_first_chunk)
   def _():
-    dh0_ref[:, 0, 0, :] = dh_tmp_ref[:].astype(dh0_ref.dtype)
+    if dh0_ref is not None:
+      dh0_ref[:, 0, 0, :] = dh_tmp_ref[:].astype(dh0_ref.dtype)
 
 
 def _saved_state_backward_kernel(
@@ -1374,7 +1378,8 @@ def _packed_saved_state_backward_kernel(
   """Stage original packed Q/K/V/beta for the reverse chunk traversal."""
   batch = pl.program_id(1)
   chunk = kwargs["NT"] - 1 - pl.program_id(2)
-  start, end = windows_ref[batch, chunk, 0], windows_ref[batch, chunk, 1]
+  offset_index = 2 * (batch * kwargs["NT"] + chunk)
+  start, end = windows_ref[offset_index], windows_ref[offset_index + 1]
   offset = start % 8
   branches = tuple(
       (lambda x, i=i: x[:, :, i : i + kwargs["BT"], :]) for i in range(8)
@@ -1476,7 +1481,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     N = 1  # uniform: one sequence per batch element
   if dht is not None:
     assert dht.shape[1] == N, f"dht has N={dht.shape[1]}, expected {N}"
-  dht_arr = dht if dht is not None else jnp.zeros((B, N, H, K, V), dtype=jnp.float32)
+  dht_arr = dht
 
   if mini_batch is None:
     elem_size = 2 if q.dtype == jnp.bfloat16 else 4
@@ -1528,7 +1533,8 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     return (head_group, batch, seq_idx, 0, 0)
 
   # dht_arr [B, N, H, K, V] → [H, B, N, K, V]
-  dht_arr = dht_arr.transpose(2, 0, 1, 3, 4)
+  if dht_arr is not None:
+    dht_arr = dht_arr.transpose(2, 0, 1, 3, 4)
 
   qk_spec = pl.BlockSpec((MB, 1, 1, BT, K), index_map=idx_chunk)
   v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
@@ -1553,12 +1559,12 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     jax.ShapeDtypeStruct((H, B, NT, BT, V), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, BT, 1), jnp.float32),
     jax.ShapeDtypeStruct((H, B, NT, BT, K), jnp.float32),
-    jax.ShapeDtypeStruct((H, B, N, K, V), jnp.float32),
+    jax.ShapeDtypeStruct((H, B, N, K, V), jnp.float32) if return_dh0 else None,
   ]
 
   in_specs = [qk_spec, qk_spec, v_spec, v_spec, qk_spec, qk_spec,
               qk_spec, qk_spec, b_spec, A_spec, h_spec, v_spec, v_spec,
-              A_spec, state_spec]
+              A_spec, state_spec if dht_arr is not None else None]
   kernel_inputs = [q_r, k_r, v_r, vn_r, qg_r, kg_r, w_r, g_r, beta_r,
                    A_r, h_r, do_r, dv0_r, dAqk_r, dht_arr]
   scratch_shapes = [dh_tmp]
@@ -1576,7 +1582,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         A_spec,
         h_spec,
         v_spec,
-        state_spec,
+        state_spec if dht_arr is not None else None,
         v_spec if vn_r is not None else None,
     ]
     kernel_inputs = [
@@ -1622,10 +1628,12 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     windows = jnp.stack(
         [jnp.where(active, start, 0), jnp.where(active, end, 0)], axis=-1
     )
-    scalar_inputs.append(windows.astype(jnp.int32))
+    # A narrow [..., 2] SMEM table is physically tiled/padded. Flatten it so
+    # large aligned workspaces do not turn a small logical map into >1 MiB.
+    scalar_inputs.append(windows.reshape(-1).astype(jnp.int32))
 
     def packed_index(h, b, c, _, windows):
-      start = windows[b, NT - 1 - c, 0]
+      start = windows[2 * (b * NT + NT - 1 - c)]
       return h * MB, b, pl.multiple_of(start - start % 8, 8), 0
 
     pq, pk, pv, pb = packed_inputs
@@ -1655,7 +1663,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       num_scalar_prefetch=len(scalar_inputs),
       grid=(H // MB, B, NT),
       in_specs=in_specs,
-      out_specs=[qk_spec, qk_spec, v_spec, b_spec, qk_spec, state_spec],
+      out_specs=[
+          qk_spec, qk_spec, v_spec, b_spec, qk_spec,
+          state_spec if return_dh0 else None,
+      ],
       scratch_shapes=scratch_shapes,
     ),
     compiler_params=pltpu.CompilerParams(
