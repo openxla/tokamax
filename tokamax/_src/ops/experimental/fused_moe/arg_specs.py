@@ -114,6 +114,7 @@ def _qwen3_5_397b_specs() -> tuple[arg_spec.ArgSpec, ...]:
           top_k=10,
           ep=8,
           project="qwen3.5_397b",
+          tags=("primary", "forward_only"),
       )
       for name, t in num_tokens.items()
   )
