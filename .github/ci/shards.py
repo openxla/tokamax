@@ -124,8 +124,9 @@ IGNORED_GLOBS = tuple(
 # that the name in a job title, in `--durations` output, and in this table are
 # the same string, and there is nothing to keep in agreement. Within a theme,
 # `build_matrix` orders by `minutes`, longest first: the top of each group is
-# the job that sets that theme's wall clock. Shards with no timing sort last,
-# because an absent number is an unknown, not a zero.
+# the job that sets that theme's wall clock. Shards with no timing sort as
+# though they took `UNMEASURED_MINUTES`, because an absent number is an
+# unknown, not a zero.
 THEMES = (
     'attention',
     'splash',
@@ -157,6 +158,16 @@ COMPAT_RUNNERS = ('linux-x86-tpu7x-56-1tpu',)
 # each bin once. Sized against `compat_minutes` where a shard has one, and its
 # full `minutes` otherwise, which over-estimates and so errs toward more bins.
 COMPAT_BIN_MINUTES = 20
+
+# What `shard_order` assumes a shard with no `minutes` takes. Only the job
+# order reads it: the table, `list` and `explain` still show such a shard as
+# unmeasured, and `compat_size` packs it as a whole bin. Not a zero, because a
+# shard usually lands here new, out of the catch-all, before anyone has timed
+# it -- and the catch-all is where unscheduled files that turned out slow were
+# found. Ordered last, as if instant, one of those would start once every
+# measured shard had a runner and could set the run's wall clock on its own;
+# 10 starts it alongside the mid-sized shards instead.
+UNMEASURED_MINUTES = 10
 
 
 class _RequiredSpec(TypedDict):
@@ -215,9 +226,10 @@ MatrixEntry = dict[str, str]
 #            model below.
 #   minutes  measured wall clock, worst case across the runners the shard is
 #            scheduled on. Set it only from a real run: omitting it means no
-#            number yet, which is not the same as fast. The one exception is
-#            the catch-all shard, where it is a target rather than a
-#            measurement -- see its entry.
+#            number yet, which is not the same as fast -- `shard_order`
+#            schedules such a shard as `UNMEASURED_MINUTES`. The one
+#            exception is the catch-all shard, where it is a target rather
+#            than a measurement -- see its entry.
 #   compat_minutes
 #            measured wall clock of the shard's tests in compat smoke mode on
 #            a compat runner, which `compat_bins` packs by. Like `minutes`, it
@@ -1300,7 +1312,7 @@ def shard_theme(name: str) -> tuple[int, str] | None:
   return None
 
 
-def shard_order(item: tuple[str, Spec]) -> tuple[bool, bool, float, int, str]:
+def shard_order(item: tuple[str, Spec]) -> tuple[bool, float, int, str]:
   """Sorts shards: catch-all first, then longest first, then by theme, then by name.
 
   The catch-all shard always runs first so newly added or unscheduled tests run
@@ -1312,17 +1324,16 @@ def shard_order(item: tuple[str, Spec]) -> tuple[bool, bool, float, int, str]:
     item: A `(shard name, spec)` pair, as from `dict.items`.
 
   Returns:
-    A sort key: catch-all shard first, then measured shards before unmeasured
-    ones, then descending `minutes`, then theme in `THEMES` order with themeless
-    shards last, then the name.
+    A sort key: catch-all shard first, then descending `minutes` -- with
+    `UNMEASURED_MINUTES` standing in for a shard that has none -- then theme in
+    `THEMES` order with themeless shards last, then the name.
   """
   name, spec = item
   theme = shard_theme(name)
   minutes = spec.get('minutes')
   return (
       name != _CATCH_ALL_SHARD,
-      minutes is None,  # unmeasured last, since absent is not zero
-      -(minutes or 0),
+      -(UNMEASURED_MINUTES if minutes is None else minutes),
       len(THEMES) if theme is None else theme[0],
       name,
   )
@@ -1803,8 +1814,9 @@ def main(argv: Sequence[str] | None = None) -> int:
   compat = build_compat_matrix(shards)
   per_shard = collections.Counter(c['shard_name'] for c in combos)
   print(f'{len(shards)} shards, {len(combos)} jobs, {len(compat)} compat jobs')
-  # Longest first, shards without a number last. An absent `minutes` is an
-  # unknown, so it sorts to the bottom rather than being read as a zero.
+  # Longest first, shards without a number placed as if they took
+  # `UNMEASURED_MINUTES`: an absent `minutes` is an unknown, so it is not read
+  # as a zero and sorted to the bottom.
   order = sorted(shards.items(), key=shard_order)
   for name, spec in order:
     print(f'  {name:32s} x{per_shard[name]}')
