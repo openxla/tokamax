@@ -110,41 +110,35 @@ def routing_moe_local(
   topk_indices_flat = topk_indices.flatten()
   topk_argsort_indices = jnp.argsort(topk_indices_flat)
   group_sizes = jnp.bincount(topk_indices_flat, length=global_num_experts)
+
   # Step 5: Invoke GMM Gate and Up.
-  gmm1_res = gmm.routing_gmm(
+  gmm_res = gmm.routing_gmm(
       x=x_compact,
-      w=arg.make_weight_wrapper(w1, w1_scale, w1_bias, fused_gate_up=True),
+      w=(
+          arg.make_weight_wrapper(w1, w1_scale, w1_bias, fused_gate_up=True),
+          arg.make_weight_wrapper(w2, w2_scale, w2_bias),
+      ),
       group_sizes=group_sizes,
       gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
-      fuse_act=activation,
-      group_offset=group_offset,
-  )
-
-  # Step 6: Invoke GMM Down. With remote_combine, each row is DMAed to the
-  # device that owns its token, so every device ends up with all topk rows of
-  # its own token shard.
-  gmm2_res = gmm.routing_gmm(
-      x=gmm1_res,
-      w=arg.make_weight_wrapper(w2, w2_scale, w2_bias),
-      group_sizes=group_sizes,
       scatter=arg.make_routing_wrapper(
           topk_argsort_indices,
           remote_axis=reduction_axis if remote_combine else None,
       ),
+      fuse_act=activation,
       group_offset=group_offset,
   )
 
-  # Step 7: Postprocess outputs from routing gmm. With remote_combine, the rows
+  # Step 6: Postprocess outputs from routing gmm. With remote_combine, the rows
   # are already this device's token shard and are reduced as such.
   out = output_reduce.output_reduce_unpack(
-      gmm2_res,
+      gmm_res,
       topk_weights,
       topk_indices,
       group_offset,
       w1.shape[0],
   )
 
-  # Step 8: Combine across devices. A remote combine already left each device
+  # Step 7: Combine across devices. A remote combine already left each device
   # with its own tokens' output.
   if remote_combine:
     if use_sp:

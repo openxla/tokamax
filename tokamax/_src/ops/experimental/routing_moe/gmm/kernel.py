@@ -20,6 +20,7 @@ other modules. This is because we want any XLA side logic that is handled
 outside of the kernel to be consolidated here without scavanging other modules.
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -37,7 +38,7 @@ from tokamax._src.ops.experimental.routing_moe.gmm import plan
 @jax.jit(static_argnames=("fuse_act", "out_dtype", "custom_plan"))
 def routing_gmm(
     x: arg.ActivationWrapper[jax.Array],
-    w: arg.SingleWeightWrapper[jax.Array],
+    w: tuple[arg.SingleWeightWrapper[jax.Array], ...],
     group_sizes: jax.Array,  # [global_groups]
     *,
     group_offset: jax.Array | None = None,  # [1]
@@ -55,8 +56,10 @@ def routing_gmm(
   then fill every output row exactly once, or the kernel hangs.
   """
 
+  assert len(w) in (1, 2)
   gather_spec = None if gather is None else gather.spec
   scatter_spec = None if scatter is None else scatter.spec
+  w_specs = tuple(ww.spec for ww in w)
 
   # Step 1: Derive sizes, resolve the plan, and construct the config.
   tpu_info = pltpu.get_tpu_info()
@@ -65,7 +68,7 @@ def routing_gmm(
     size_ep = jax.lax.axis_size(scatter_spec.remote_axis)
   dim = config.Dimension.create(
       x=x.spec,
-      w=w.spec,
+      w=w_specs,
       num_global_groups=group_sizes.size,
       gather=gather_spec,
       scatter=scatter_spec,
@@ -75,16 +78,44 @@ def routing_gmm(
   resolved_plan = plan.ResolvedPlan.create(
       custom_plan,
       x=x.spec,
-      w=w.spec,
+      w=w_specs,
+      out_dtype=out_dtype,
       size_out_m=dim.size_out_m,
       size_global_groups=dim.size_global_groups,
       size_k=dim.size_k,
       size_out_n=dim.size_out_n,
       tpu_info=tpu_info,
   )
+  if len(w) == 2 and not resolved_plan.fuse_up_and_down:
+    unfused_plan = (
+        None
+        if custom_plan is None
+        else dataclasses.replace(
+            custom_plan, tile_k=None, tile_n=None, fuse_up_and_down=False
+        )
+    )
+    gmm1_res = routing_gmm(
+        x=x,
+        w=(w[0],),
+        group_sizes=group_sizes,
+        group_offset=group_offset,
+        gather=gather,
+        fuse_act=fuse_act,
+        custom_plan=unfused_plan,
+    )
+    return routing_gmm(
+        x=gmm1_res,
+        w=(w[1],),
+        group_sizes=group_sizes,
+        group_offset=group_offset,
+        scatter=scatter,
+        out_dtype=out_dtype,
+        custom_plan=unfused_plan,
+    )
+
   cfg = config.RoutingGmmConfig.create(
       x=x.spec,
-      w=w.spec,
+      w=w_specs,
       dim=dim,
       plan=resolved_plan,
       gather=gather_spec,
@@ -113,13 +144,18 @@ def routing_gmm(
   # Step 3: Wrap inputs in the pipeline's parameter object. emit_pipeline needs
   # HBM refs and VMEM allocations to share one pytree structure, so the API
   # wrappers are reduced to their data here.
-  w_scale = w.scale
-  if w_scale is not None:
-    w_scale = w_scale.astype(jnp.float32)
+  def _weight_ref(wrapper: arg.SingleWeightWrapper[jax.Array]):
+    w_scale = wrapper.scale
+    if w_scale is not None:
+      w_scale = w_scale.astype(jnp.float32)
+    return memory_ref.SingleWeightRef(
+        weight=wrapper.weight, scale=w_scale, bias=wrapper.bias
+    )
+
   remote = cfg.out.mode == config.RoutingMode.REMOTE
   inputs = memory_ref.PipelineInputs[jax.Array](
       x=x.data,
-      w=memory_ref.SingleWeightRef(weight=w.weight, scale=w_scale, bias=w.bias),
+      w=tuple(_weight_ref(ww) for ww in w),
       gather_idx=_padded_indices(gather),
       scatter_idx=_padded_indices(scatter),
   )

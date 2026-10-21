@@ -76,17 +76,23 @@ def inner_pipeline(
     x_bref.branchless_copy_in(x_hbm_ref, _at(num_xo_buffers - 1))
 
     # Step 3: Load data from VMEM.
-    x = layout_util.load_compact_to_large(x_ref.at[:bucket_m], cfg.dim.size_k)
-    weight = in_ref.w.get_weight()
+    act = layout_util.load_compact_to_large(x_ref.at[:bucket_m], cfg.dim.size_k)
 
-    # TODO: Potentially move this branching lgoci into matmul.
-    weight_scale = None
-    if cfg.w.has_scale:
-      weight_scale = in_ref.w.get_scale()
-
-    # Step 4: Perform computation.
-    out = compute.matmul(cfg, x, weight, weight_scale, None)
-    out = compute.apply_act_fn(out, cfg.fuse_act).astype(out_ref.dtype)
+    # Step 4: Perform computation across GMM stage(s).
+    for i, (stage, w_ref) in enumerate(zip(cfg.stages, in_ref.w, strict=True)):
+      if i > 0:
+        act = act.astype(x_ref.dtype)
+      weight = w_ref.get_weight()
+      weight_scale = w_ref.get_scale() if stage.w.has_scale else None
+      act = compute.matmul(
+          stage,
+          act,
+          weight,
+          weight_scale,
+          None,
+          tpu_info=cfg.tpu_info,
+      )
+      act = compute.apply_act_fn(act, stage.fuse_act)
 
     # Start output DMA for previous step slot after the loads: a remote DMA is
     # a global memory barrier, so issuing it earlier would hold every load and
@@ -94,7 +100,9 @@ def inner_pipeline(
     out_bref.branchless_copy_out(out_hbm_ref, _at(-1))
 
     # Step 5: Store output into VMEM.
-    layout_util.store_large_to_compact(out_ref.at[:bucket_m], out)
+    layout_util.store_large_to_compact(
+        out_ref.at[:bucket_m], act.astype(out_ref.dtype)
+    )
 
   # Select which bucket to choose based on number of active rows of given tile.
   num_rows = metadata_ref.gm_id_to_num_rows[gm_id]

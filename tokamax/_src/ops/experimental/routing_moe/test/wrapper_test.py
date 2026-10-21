@@ -628,11 +628,11 @@ class MoEKernelTest(parameterized.TestCase):
       use_sp,
       active_expert_ratio,
   ):
-    if not use_ep:
-      self.skipTest(
-          "TODO: Support case sharded dimension size is less than "
-          "lane_size * packing in routing_moe."
-      )
+    # When TP is used, sharded dimension size is less than lane_size * packing.
+    # But this is ok, since this model runs fused up-and-down gmms, in this
+    # situation, sharded dimension size is not required to be multiple of
+    # lane_size * packing.
+
     if len(self.mesh_devices) < 8:
       self.skipTest("Skipping due to insufficient number of chips.")
     num_experts = 512
