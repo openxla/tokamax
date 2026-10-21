@@ -61,7 +61,9 @@ def test_cp_megakernel(dtype, split, state_policy, cp_size):
   results = []
   for fused in (False, True, "reference"):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, 
+        config=mosaic.Config(
+            fuse_forward=True,
+            fuse_backward=True,
             cp_megakernel=fused is True,
             rematerialize_for_backward=state_policy != "saved",
             fuse_rematerialization=state_policy == "remat",
@@ -132,22 +134,26 @@ def test_cp_megakernel_initial_state_grad(state_policy, cp_size):
   meta = ContextParallelMetadata(mesh=mesh, axis_name="context")
   tokens = 128 * cp_size
   keys = jax.random.split(jax.random.key(103), 4)
-  q = (jax.random.normal(keys[0], (2, 2, tokens, 128)) * 0.05).astype(jnp.bfloat16)
+  q = (jax.random.normal(keys[0], (2, 2, tokens, 128)) * 0.05).astype(
+      jnp.bfloat16
+  )
   k = (jax.random.normal(keys[1], q.shape) * 0.05).astype(jnp.bfloat16)
   v = jax.random.normal(keys[2], q.shape).astype(jnp.bfloat16)
   g = jnp.full_like(q, -0.01)
   beta = jnp.full(q.shape[:-1], 0.5, jnp.bfloat16)
   segments = jnp.ones((2, tokens), jnp.int32)
   # Simulated user-supplied initial state, varlen form [B, N, H, K, V].
-  initial_state = jax.random.normal(
-      keys[3], (2, 2, 2, 128, 128), jnp.float32
-  ) * 0.05
+  initial_state = (
+      jax.random.normal(keys[3], (2, 2, 2, 128, 128), jnp.float32) * 0.05
+  )
 
   kernels.chunk_kda_bwd_custom.clear_cache()
   results = []
   for fused in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, 
+        config=mosaic.Config(
+            fuse_forward=True,
+            fuse_backward=True,
             cp_megakernel=fused is True,
             rematerialize_for_backward=state_policy != "saved",
             fuse_rematerialization=state_policy == "remat",
@@ -217,6 +223,6 @@ def test_cp_megakernel_initial_state_grad(state_policy, cp_size):
   # asserted on the fused path directly.
   f._assert_close(results[1][:5], results[0][:5], tolerance=0.02)
   max_grad = jnp.max(jnp.abs(results[1][5]))
-  assert max_grad > 1e-6, (
-      "CP megakernel initial_state gradient is zero; dh0 was discarded"
-  )
+  assert (
+      max_grad > 1e-6
+  ), "CP megakernel initial_state gradient is zero; dh0 was discarded"

@@ -65,7 +65,9 @@ def test_cp_local_fusion(dtype, split, state_policy, monkeypatch):
   results = []
   for fused in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, 
+        config=mosaic.Config(
+            fuse_forward=True,
+            fuse_backward=True,
             fuse_cp_backward=fused,
             rematerialize_for_backward=state_policy != "saved",
             fuse_rematerialization=state_policy == "remat",
