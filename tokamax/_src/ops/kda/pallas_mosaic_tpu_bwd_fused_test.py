@@ -37,6 +37,11 @@ def test_packed_padding_and_empty_state_gradients(
 ):
   args, kwargs = forward_tests._inputs(jnp.float32, True)
   kwargs.update(lower_bound=lower_bound, output_final_state=output_final_state)
+  if lower_bound is None:
+    # Upstream requires bounded raw gates. Exercise the supported preactivated
+    # log-gate contract here; keep bounded raw gate/parameter gradients below.
+    args = (*args[:3], -jax.nn.softplus(args[3]), *args[4:6], None, None)
+    kwargs["use_gate_in_kernel"] = False
   op = mosaic.PallasMosaicTpuKimiDeltaAttention(
       config=mosaic.Config(
           fuse_forward=True,
@@ -61,6 +66,17 @@ def test_packed_padding_and_empty_state_gradients(
   np.testing.assert_allclose(
       np.asarray(results[0][5][:, 2]), 0.1 if output_final_state else 0
   )
+
+
+@pytest.mark.parametrize("fuse_backward", [False, True])
+def test_unbounded_raw_gate_is_rejected(fuse_backward):
+  args, kwargs = forward_tests._inputs(jnp.float32, True)
+  kwargs["lower_bound"] = None
+  op = mosaic.PallasMosaicTpuKimiDeltaAttention(
+      config=mosaic.Config(fuse_forward=True, fuse_backward=fuse_backward)
+  )
+  with pytest.raises(NotImplementedError, match="requires `lower_bound`"):
+    forward_tests._call(op, kwargs, *args)
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])

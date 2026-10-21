@@ -53,7 +53,7 @@ def test_all_window_offsets_without_initial_state(raw_gate):
       max_num_segments=10,
       output_final_state=False,
       use_gate_in_kernel=raw_gate,
-      lower_bound=None,
+      lower_bound=-1.0 if raw_gate else None,
   )
   args = (
       *args[:3],
