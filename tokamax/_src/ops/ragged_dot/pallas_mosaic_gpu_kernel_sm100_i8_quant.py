@@ -17,14 +17,10 @@
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
-import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
-from jaxlib.mlir import ir
-from jaxlib.mlir.dialects import arith
-import numpy as np
 import qwix
 from tokamax._src import jaxtyping
 from tokamax._src.ops.ragged_dot import base
@@ -46,60 +42,6 @@ _TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
 _TCGEN05 = plgpu.Layout.TCGEN05
 _TCGEN05_COL = _TCGEN05.reduce(0)
 _TCGEN05_ROW = _TCGEN05.reduce(1)
-
-
-def rescale_i32_tcgen05_acc(running_acc, acc, row_scale, col_scale):
-  """Dequantizes S32 TCGEN05 accumulator and adds it to a running f32 accumulator."""
-
-  @plgpu.inline_mgpu(
-      arg_types=(
-          _TCGEN05,
-          _TCGEN05,
-          _TCGEN05_ROW,
-          _TCGEN05_COL,
-      ),
-      return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.float32, _TCGEN05),
-  )
-  def rescale(
-      _,
-      running_acc: mgpu.FragmentedArray,
-      a: mgpu.FragmentedArray,
-      rs: mgpu.FragmentedArray,
-      cs: mgpu.FragmentedArray,
-  ):
-    # Example of register shapes for (128, 64):
-    # TCGEN05     (1, 8, 1, 1, 4, 1, 1, 1, 1)
-    # TCGEN05_ROW (1, 1, 4, 1, 1)
-    # TCGEN05_COL (8, 1, 1)
-    f32 = ir.F32Type.get()
-    out_vec_ty = ir.VectorType.get((2,), f32)
-    f32_registers = running_acc.registers
-    for idx, reg_a in np.ndenumerate(a.registers):
-      rs_reg = rs.registers[(0, 0, idx[4], 0, 0)]
-      cs_reg = cs.registers[(idx[1], 0, 0)]
-      out_reg = arith.sitofp(out_vec_ty, reg_a)
-      scale_reg = arith.mulf(
-          mgpu.utils.vector_concat([rs_reg, rs_reg]),
-          cs_reg,
-          fastmath=arith.FastMathFlags.fast,
-      )
-      out_reg = arith.mulf(
-          out_reg,
-          scale_reg,
-          fastmath=arith.FastMathFlags.fast,
-      )
-      f32_registers[idx] = arith.addf(
-          out_reg,
-          f32_registers[idx],
-          fastmath=arith.FastMathFlags.fast,
-      )
-    return mgpu.FragmentedArray(
-        _registers=f32_registers,
-        _layout=mgpu.TCGEN05_LAYOUT,
-        _is_signed=None,
-    )
-
-  return rescale(running_acc, acc, row_scale, col_scale)
 
 
 @jaxtyping.jaxtyped
@@ -191,30 +133,10 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
     )
 
   x_dtype = lhs.qtype
-  try:
-    swizzle = plgpu.find_swizzle(block_k * jnp.dtype(x_dtype).itemsize * 8)
-  except ValueError as e:
-    raise NotImplementedError("No possible swizzle.") from e
-
-  swizzle_elems = swizzle // jnp.dtype(x_dtype).itemsize
-
-  try:
-    transforms = (
-        plgpu.TilingTransform((8, swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle),
-    )
-  except ValueError as e:
-    raise NotImplementedError(
-        f"{swizzle=} {swizzle_elems=} unsupported."
-    ) from e
-
-  w_elem_bits = 4
-  try:
-    w_swizzle = plgpu.find_swizzle(block_k * w_elem_bits)  # n,k
-  except ValueError as e:
-    raise NotImplementedError("No possible swizzle.") from e
-
-  w_swizzle_elems = (w_swizzle * 8) // w_elem_bits
+  x_smem_shape = (num_stages, tile_m, block_k)
+  w_smem_shape = (_DEQ_WG * num_stages, tile_n, block_k)
+  x_smem = common.tiled_swizzled_smem(x_smem_shape, x_dtype, "x")
+  w_smem = common.tiled_swizzled_smem(w_smem_shape, w.dtype, "w")
 
   x, x_scales = lhs.qvalue, lhs.scale.mT
   tile_xk = k_x // x_scales.shape[0]
@@ -503,7 +425,7 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
 
             for ni in range(_DEQ_WG):
               ws, local_acc = load_ws_acc(ni)
-              acc_carry[ni] = rescale_i32_tcgen05_acc(
+              acc_carry[ni] = common.rescale_tcgen05_acc(
                   acc_carry[ni], local_acc, ws, x_scale
               )
               del ws
@@ -529,67 +451,31 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
             plgpu.commit_smem()
 
           with jax.named_scope("SMEM -> GMEM"):
-            # Write out the largest power of two rows first,
-            # then the next largest, etc.
-            # This allows us to coalesce writes as much as possible.
-            offset = start_within_block
-            size = 1 << (min(block_m, m).bit_length() - 1)
-            while size > 0:
-
-              @pl.when(actual_size & size != 0)
-              def _():
-                for ni in range(_DEQ_WG):
-                  out_smem_slice = out_smem.at[ni, pl.ds(offset, size)]
-                  o_gref_slice = out_gmem.at[
-                      pl.ds(block_start + offset, size),
-                      pl.ds(
-                          tid_n * block_n * _DEQ_WG
-                          + ni * block_n
-                          + cluster_idx * tile_n,
-                          tile_n,
-                      ),
-                  ]
-                  plgpu.copy_smem_to_gmem(
-                      out_smem_slice, o_gref_slice, commit_group=False
-                  )
-
-              offset += actual_size & size
-              size //= 2
-            plgpu.commit_smem_to_gmem_group()
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            common.copy_ragged_smem_to_gmem(
+                out_smem,
+                out_gmem,
+                block_start=block_start,
+                start_within_block=start_within_block,
+                actual_size=actual_size,
+                ns=pl.ds(
+                    tid_n * block_n * _DEQ_WG + cluster_idx * tile_n, tile_n
+                ),
+                max_rows=min(block_m, m),
+                col_stride=block_n,
+            )
 
       return carry + (actual_size > 0)
 
   def kernel_entry(*refs):
-    x_smem = plgpu.SMEM(
-        (num_stages, tile_m, block_k),
-        dtype=x.dtype,
-        transforms=transforms,
-    )
-    w_smem = plgpu.SMEM(
-        (_DEQ_WG * num_stages, tile_n, block_k),
-        dtype=w.dtype,
-        transforms=(
-            plgpu.TilingTransform((8, w_swizzle_elems)),
-            plgpu.SwizzleTransform(w_swizzle),
-        ),
-    )
     w_i8_tmem = plgpu.TMEM(
         (tile_n, _DEQ_WG * block_k),
         dtype=jnp.int8,
         packed=True,
         collective=collective,
     )
-    out_smem = plgpu.SMEM(
-        (_DEQ_WG, block_m, tile_n),
-        dtype=out_dtype,
-        # workaround for ValueError: Dynamic slice base index (which is a
-        # dynamic value) cannot be statically proven to be divisible by
-        # the tiling (8)
-        transforms=(
-            plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
-            plgpu.SwizzleTransform(128),
-        ),
+    out_smem_shape = (_DEQ_WG, block_m, tile_n)
+    out_smem = common.tiled_swizzled_smem(
+        out_smem_shape, out_dtype, "out", swizzle=128, tiling_prefix=(1,)
     )
     acc_tmem = plgpu.TMEM(
         (tile_n, _DEQ_WG * num_stages * block_m),

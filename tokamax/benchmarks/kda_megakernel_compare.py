@@ -30,7 +30,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tokamax
-from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu as mosaic
+from tokamax._src.ops.kda import pallas_mosaic_tpu as mosaic
 
 
 def _report(name, fn, args, iterations):
@@ -97,13 +97,13 @@ def _training(suite, iterations, baseline, heads, tokens, num_segments):
                    packed_output=True))]
     mode = "forward"
   elif suite == "backward":
-    configs = [("staged", mosaic.Config(fuse_backward=False)),
-               ("fused", mosaic.Config(fuse_backward=True))]
+    configs = [("staged", mosaic.Config(fuse_forward=True, fuse_backward=False)),
+               ("fused", mosaic.Config(fuse_forward=True, fuse_backward=True))]
     mode = "forward_and_vjp"
   else:
-    configs = [("aligned", mosaic.Config(fuse_backward=True)),
+    configs = [("aligned", mosaic.Config(fuse_forward=True, fuse_backward=True)),
                ("native-packed", mosaic.Config(
-                   fuse_backward=True, packed_forward=True,
+                   fuse_forward=True, fuse_backward=True, packed_forward=True,
                    packed_output=True, packed_backward=True,
                    packed_gradients=True))]
     mode = "forward_and_vjp"
@@ -117,7 +117,7 @@ def _training(suite, iterations, baseline, heads, tokens, num_segments):
 def _cp(iterations, baseline, tokens):
   from jax.sharding import Mesh, PartitionSpec as P
   from tokamax._src import jaxtyping
-  from tokamax._src.ops.experimental.kda.cp_utils import ContextParallelMetadata
+  from tokamax._src.ops.kda.cp_utils import ContextParallelMetadata
 
   cp_size = 4
   if jax.device_count() < cp_size:
@@ -160,9 +160,9 @@ def _cp(iterations, baseline, tokens):
 
 
 def _inference(iterations, tokens, baseline):
-  from tokamax._src.ops.experimental.kda import api
+  from tokamax._src.ops.kda import api
   if not baseline:
-    from tokamax._src.ops.experimental.kda import inference
+    from tokamax._src.ops.kda import inference
 
   heads, dim = 8, 128
   q, k, v, g = [

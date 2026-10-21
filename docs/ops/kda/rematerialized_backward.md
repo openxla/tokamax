@@ -47,7 +47,7 @@ tests compare reconstructed h/FP32 v_new directly, exercise two heads and
 two batches with K/V=256, and check saved-state/disabled-fusion fallbacks.
 
 ```bash
-python -m pytest tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_remat_test.py -v
+python -m pytest tokamax/_src/ops/kda/pallas_mosaic_tpu_remat_test.py -v
 python -m tokamax.benchmarks.kda --skip_implementations=xla,mosaic_staged,mosaic_fwd_fused,mosaic_fused
 ```
 

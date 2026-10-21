@@ -67,11 +67,25 @@ class FlashLceReferenceTest(parameterized.TestCase):
         jax.random.key(42), b_dim, h_dim, v_dim
     )
 
-    self.assertIsNotNone(
-        reference.linear_softmax_cross_entropy_loss_fwd_reference(
-            x, labels, w, reduction=reduction
-        )
+    loss, lse = reference.linear_softmax_cross_entropy_loss_fwd_reference(
+        x, labels, w, reduction=reduction
     )
+    self.assertIsNotNone(loss)
+    self.assertEqual(lse.dtype, jnp.float32)
+
+  @parameterized.named_parameters(
+      ("bf16", jnp.bfloat16),
+      ("f16", jnp.float16),
+      ("f32", jnp.float32),
+  )
+  def test_reference_lse_dtype_float32(self, dtype):
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(42), 128, 64, 256, dtype=dtype
+    )
+    _, lse = reference.linear_softmax_cross_entropy_loss_fwd_reference(
+        x, labels, w
+    )
+    self.assertEqual(lse.dtype, jnp.float32)
 
   @parameterized.named_parameters(
       dict(

@@ -21,7 +21,7 @@ import immutabledict
 import jax
 from tokamax._src.ops.ragged_gather_reduce import base
 
-type Implementation = Literal["xla", "mosaic", "mosaic_tpu"]
+type Implementation = Literal["xla", "mosaic_tpu"]
 
 _IMPLEMENTATIONS = dict(xla=base.RaggedGatherReduce())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
@@ -58,13 +58,19 @@ def ragged_gather_reduce(
 ) -> jax.Array:
   """Ragged gather reduce operation.
 
+  Computes the MoE output combine: output token `t` is the sum over routes
+  `r` in `[t * reduce_group_size, (t + 1) * reduce_group_size)` with
+  `valid_rows_mask[r]` of `topk_weights[r] * x[indices[r]]`, accumulated in
+  float32. See `reference.ragged_gather_reduce`.
+
   Args:
-    x: Input array of shape (in_size, hidden_size).
-    indices: 1D array of indices of shape (in_size,).
+    x: Input array of shape (num_rows, hidden_size).
+    indices: 1D array of indices into the rows of `x`, of shape (in_size,).
     topk_weights: 1D array of weights of shape (in_size,).
     valid_rows_mask: 1D boolean array indicating valid rows of shape (in_size,).
     reduce_group_size: Number of consecutive rows to reduce (sum) together.
-    implementation: The implementation to use.
+    implementation: The implementation to use. By default, the SparseCore kernel
+      (`"mosaic_tpu"`) is tried first, falling back to `"xla"`.
 
   Returns:
     Reduced array of shape (in_size // reduce_group_size, hidden_size).
@@ -79,8 +85,6 @@ def ragged_gather_reduce(
   errors = []
   for impl in implementation:
     if isinstance(impl, str):
-      if impl in ("mosaic", "mosaic_tpu"):
-        impl = "mosaic_tpu"
       if impl not in IMPLEMENTATIONS:
         raise ValueError(
             f"Unknown implementation: {impl}. You may need to add a dependency"

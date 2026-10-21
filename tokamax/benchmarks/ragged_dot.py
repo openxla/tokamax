@@ -25,11 +25,13 @@ from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+import qwix
 from tensorboardX import writer
 import tokamax
+from tokamax._src import quantization
 
-from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
-from tokamax._src.ops.experimental.gmm_v2 import util as gmm_util
+from tokamax._src.ops.gmm_v2 import tgmm_v2 as tgmm_backend
+from tokamax._src.ops.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
 
 SummaryWriter = writer.SummaryWriter
@@ -56,6 +58,15 @@ EXAMPLE = {
 
 class RaggedDotBenchmark(parameterized.TestCase):
   """Benchmarks for ragged dot."""
+
+  def tearDown(self):
+    """Frees any resources that may be held by the runner."""
+    super().tearDown()
+    # Free any live arrays left around by previous runs.
+    for arr in jax.live_arrays():
+      arr.delete()
+    # Clear program memory in HBM as well.
+    jax.clear_caches()
 
   def _write_benchmark_res(
       self, res: tokamax.BenchmarkData, metric_tag: str
@@ -114,17 +125,15 @@ class RaggedDotBenchmark(parameterized.TestCase):
     group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=lhs,
-        rhs=rhs_q,
+        lhs=quantization.AsQArray(lhs, jnp.float8_e4m3fn),
+        rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
-        rhs_scale=rhs_scale,
-        maybe_quantize_lhs=True,
         preferred_element_type=jnp.bfloat16,
     )
     fn, args = tokamax.standardize_function(
@@ -151,7 +160,7 @@ class RaggedDotBenchmark(parameterized.TestCase):
     group_sizes = gmm_util.get_group_sizes(m, num_groups)
 
     grad_q, grad_scale = gmm_util.quantize_tensor(
-        grad, jnp.float8_e5m2, axis=0, block_size=m
+        grad, jnp.float8_e5m2, axis=0, block_size=m  # pyrefly: ignore[bad-argument-type]
     )
     grad_scale = jnp.expand_dims(grad_scale, axis=1)
 
@@ -162,9 +171,8 @@ class RaggedDotBenchmark(parameterized.TestCase):
     )
     benchmark_config = dict(
         lhs=lhs,
-        rhs=grad_q,
+        rhs=qwix.QArray(grad_q, grad_scale),
         group_sizes=group_sizes,
-        rhs_scale=grad_scale,
         ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS,
         preferred_element_type=jnp.bfloat16,
     )
@@ -179,43 +187,89 @@ class RaggedDotBenchmark(parameterized.TestCase):
 
   @parameterized.named_parameters(
       dict(
-          testcase_name='prefill_gate_up',
+          testcase_name='fp8_prefill_gate_up',
           m=81920,  # 8192 tokens * topk 10.
           k=4096,  # hidden_size.
           n=2 * 1024,  # gate and up, each moe_intermediate_size wide.
           fuse_act='silu',
+          weight_dtype=jnp.float8_e4m3fn,
+          block_size=4096,
       ),
       dict(
-          testcase_name='prefill_down',
+          testcase_name='fp8_prefill_down',
           m=81920,
           k=1024,  # moe_intermediate_size.
           n=4096,  # hidden_size.
           fuse_act=None,
+          weight_dtype=jnp.float8_e4m3fn,
+          block_size=1024,
       ),
       dict(
-          testcase_name='decode_gate_up',
+          testcase_name='fp8_decode_gate_up',
           m=1280,  # 128 tokens * topk 10.
           k=4096,
           n=2 * 1024,
           fuse_act='silu',
+          weight_dtype=jnp.float8_e4m3fn,
+          block_size=4096,
       ),
       dict(
-          testcase_name='decode_down',
+          testcase_name='fp8_decode_down',
           m=1280,
           k=1024,
           n=4096,
           fuse_act=None,
+          weight_dtype=jnp.float8_e4m3fn,
+          block_size=1024,
+      ),
+      dict(
+          testcase_name='fp4_prefill_gate_up',
+          m=81920,
+          k=4096,
+          n=2 * 1024,
+          fuse_act='silu',
+          weight_dtype=jnp.float4_e2m1fn,
+          block_size=64,
+      ),
+      dict(
+          testcase_name='fp4_prefill_down',
+          m=81920,
+          k=1024,
+          n=4096,
+          fuse_act=None,
+          weight_dtype=jnp.float4_e2m1fn,
+          block_size=64,
+      ),
+      dict(
+          testcase_name='fp4_decode_gate_up',
+          m=1280,
+          k=4096,
+          n=2 * 1024,
+          fuse_act='silu',
+          weight_dtype=jnp.float4_e2m1fn,
+          block_size=64,
+      ),
+      dict(
+          testcase_name='fp4_decode_down',
+          m=1280,
+          k=1024,
+          n=4096,
+          fuse_act=None,
+          weight_dtype=jnp.float4_e2m1fn,
+          block_size=64,
       ),
   )
-  def test_gmm_v2_ullm(self, m, k, n, fuse_act):
+  def test_gmm_v2_ullm(self, m, k, n, fuse_act, weight_dtype, block_size):
     device = jax.devices()[0]
-    if not (device.platform == 'tpu' and pltpu.get_tpu_info().generation >= 5):
-      self.skipTest('ULLM MoE GMM v2 benchmark requires TPU v5+.')
+    min_gen = 7 if weight_dtype == jnp.float4_e2m1fn else 5
+    if not (
+        device.platform == 'tpu' and pltpu.get_tpu_info().generation >= min_gen
+    ):
+      self.skipTest(f'ULLM MoE GMM v2 benchmark requires TPU v{min_gen}+.')
 
     num_groups = 512  # Global number of experts.
     num_local_groups = 64  # Experts per EP shard (512 / 8).
     group_offset = 256  # First expert of EP shard 4 (a middle shard).
-    block_size = k
     k0, k1 = jax.random.split(jax.random.key(0), 2)
 
     lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
@@ -223,18 +277,16 @@ class RaggedDotBenchmark(parameterized.TestCase):
     group_sizes = jnp.full((num_groups,), m // num_groups, jnp.int32)
 
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, weight_dtype, axis=1, block_size=block_size
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=lhs,
-        rhs=rhs_q,
+        lhs=quantization.AsQArray(lhs, jnp.float8_e4m3fn),
+        rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
         group_offset=jnp.array([group_offset], jnp.int32),
-        rhs_scale=rhs_scale,
-        maybe_quantize_lhs=True,
         zero_initialize=False,
         fuse_gateup_activation=fuse_act,
         preferred_element_type=jnp.bfloat16,

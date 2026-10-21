@@ -20,6 +20,58 @@ from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
 
 
+def load_strided_heads(
+    vmem_ref: jax.Ref, num_heads: int, head_dim: int, lane_offset: int = 0
+) -> jax.Array:
+  """Use strided LDST to split heads along the last dim and transpose.
+
+  Args:
+    vmem_ref: One slot's VMEM reference of shape [chunk_size, 1, cols].
+    num_heads: Number of heads to split out.
+    head_dim: Width of one head, in elements.
+    lane_offset: Lane the first head starts at, for a region that is part of a
+      larger tensor (k and v within the fused qkv).
+
+  Returns:
+    [num_heads, chunk_size, head_dim]
+  """
+  num_lanes = pltpu.get_tpu_info().num_lanes
+  lanes_per_col = vmem_ref.shape[-1] // num_lanes
+  lanes_per_head = head_dim // num_lanes
+
+  flat_ref = vmem_ref.reshape(-1, num_lanes)  # pyrefly: ignore[missing-attribute]
+  head_list = []
+  for head in range(num_heads):
+    head_lanes = [
+        flat_ref[lane_offset + head * lanes_per_head + lane :: lanes_per_col]
+        for lane in range(lanes_per_head)
+    ]
+    head_list.append(jnp.concat(head_lanes, axis=-1))
+  return jnp.stack(head_list, axis=0)
+
+
+def load_compact_heads(
+    vmem_ref: jax.Ref, num_heads: int, head_dim: int, dim_offset: int = 0
+) -> jax.Array:
+  """Use contiguous slices to split heads along the last dim and stack.
+
+  Args:
+    vmem_ref: VMEM reference of shape [seq_tile_size, chunk_size, 1, cols].
+    num_heads: Number of heads to split out.
+    head_dim: Width of one head, in elements.
+    dim_offset: Element the first head starts at, for a region that is part of a
+      larger tensor (k and v within the fused qkv).
+
+  Returns:
+    [seq_tile_size, num_heads, chunk_size, 1, head_dim]
+  """
+  head_list = []
+  for head in range(num_heads):
+    start = dim_offset + head * head_dim
+    head_list.append(vmem_ref[..., start : start + head_dim])
+  return jnp.stack(head_list, axis=1)
+
+
 def load_as_qkv_large(
     qkv_vmem_ref: jax.Ref, cfgs: config.GDNConfig
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -138,8 +190,8 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
-    conv_state_slot_ref: jax.Ref,
-    recurrent_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
@@ -154,10 +206,10 @@ def load_and_select_states(
   Args:
     metadata_ref: Metadata reference containing grid and sequence mappings.
     p_id: Current Pallas program ID.
-    conv_state_slot_ref: Convolution state read from HBM of shape
-      [seq_tile_size, prev_kernel_size, 1, dim_size].
-    recurrent_slot_ref: Recurrent state read from HBM of shape [seq_tile_size,
-      num_v_heads, kq_head_dim, v_head_dim].
+    conv_state_in_slot_ref: Convolution state read from HBM of shape
+      [seq_tile_size, 1, prev_kernel_size, 1, dim_size].
+    recurrent_in_slot_ref: Recurrent state read from HBM of shape
+      [seq_tile_size, 1, num_v_heads, kq_head_dim, v_head_dim].
     carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
       [seq_tile_size, prev_kernel_size, 1, dim_size].
     carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
@@ -177,13 +229,16 @@ def load_and_select_states(
   prev_recurrent_state_list = []
 
   for idx in range(cfg.seq_tile_size):
-    s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
-    real_sizes = metadata_ref.p_id_to_r_size[p_id, idx]
-    is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
+    record = metadata_ref.get_record(p_id, idx)
+    s_idx = record.s_idx
+    real_sizes = record.r_size
+    is_first_tile = record.is_first_tile
     has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
+    # NOTE: The input VMEM window holds one initial state per sequence at
+    # position 0.
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
-    hbm_conv_state = conv_state_slot_ref[idx].astype(jnp.float32)
+    hbm_conv_state = conv_state_in_slot_ref[idx, 0].astype(jnp.float32)
     prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
 
     if carry_conv_scratch_ref is not None:
@@ -192,7 +247,7 @@ def load_and_select_states(
           is_first_tile, prev_conv_state, prev_tile_conv
       )
 
-    hbm_recurrent_state = recurrent_slot_ref[idx]
+    hbm_recurrent_state = recurrent_in_slot_ref[idx, 0]
     prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
 
     if carry_recurrent_scratch_ref is not None:
@@ -224,7 +279,14 @@ def load_activation_as_compact(
   qkv_vmem_ref[...] = qkv_vreg
   q_compact, k_compact, v_compact = load_as_qkv_compact(qkv_vmem_ref, cfgs)
   b_compact = jnp.expand_dims(b_vmem_ref[...], axis=1)
-  a_compact = jnp.expand_dims(a_vmem_ref[...], axis=1)
+  if cfgs.is_kda:
+    # KDA's gate is per-channel, so it splits into heads like q/k/v do
+    # instead of occupying a single lane per head.
+    a_compact = load_compact_heads(
+        a_vmem_ref, cfgs.num_v_heads, cfgs.kq_head_dim
+    )
+  else:
+    a_compact = jnp.expand_dims(a_vmem_ref[...], axis=1)
   return q_compact, k_compact, v_compact, b_compact, a_compact
 
 
@@ -242,18 +304,28 @@ def load_activation_as_large(
   q_large_list = []
   k_large_list = []
   v_large_list = []
+  a_large_list = []
   for idx in range(cfgs.seq_tile_size):
     q_large, k_large, v_large = load_as_qkv_large(qkv_vmem_ref.at[idx], cfgs)
     q_large_list.append(q_large)
     k_large_list.append(k_large)
     v_large_list.append(v_large)
+    if cfgs.is_kda:
+      # Per-channel gate: split into heads and transpose like q/k/v.
+      a_large_list.append(
+          load_strided_heads(
+              a_vmem_ref.at[idx], cfgs.num_v_heads, cfgs.kq_head_dim
+          )
+      )
 
   q_large = jnp.stack(q_large_list, axis=0)
   k_large = jnp.stack(k_large_list, axis=0)
   v_large = jnp.stack(v_large_list, axis=0)
   b_large = load_compact_to_large(b_vmem_ref)
-  a_large = load_compact_to_large(a_vmem_ref)
   b_large = jnp.expand_dims(b_large, axis=1)
-  a_large = jnp.expand_dims(a_large, axis=1)
+  if cfgs.is_kda:
+    a_large = jnp.stack(a_large_list, axis=0)
+  else:
+    a_large = jnp.expand_dims(load_compact_to_large(a_vmem_ref), axis=1)
 
   return q_large, k_large, v_large, b_large, a_large

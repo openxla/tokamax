@@ -91,6 +91,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   enable_fused_epilogue_quant: bool = False
+  # If True, int4 `rhs.qvalue` was permuted offline along K with
+  # `mosaic_gpu.apply_int4_to_fp8_offline_permute`. Only supported by the SM100
+  # fp8 x int4 kernel.
+  int4_to_fp8_offline_permute: bool = False
 
   def __post_init__(self):
     if self.vjp is None:
@@ -114,33 +118,19 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       activation: base.ActivationFunction | None = None,
       manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
-      rhs_scale: jax.Array | None = None,
-      rhs_bias: jax.Array | None = None,
-      maybe_quantize_lhs: bool = False,
-      lhs_scale: jax.Array | None = None,
-      zero_initialize: bool = True,
+      zero_initialize: bool = False,
       fuse_gateup_activation: str | None = None,
-      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
     # TODO: Support returning residuals from mosaic GPU kernel.
 
     if (
         group_offset is not None
-        or rhs_scale is not None
-        or rhs_bias is not None
-        or maybe_quantize_lhs
-        or lhs_scale is not None
-        or not zero_initialize
+        or zero_initialize
         or fuse_gateup_activation is not None
-        or lhs_quantization_dtype is not None
-        or rhs_quantization_dtype is not None
     ):
       raise NotImplementedError(
           "The Pallas-Mosaic-GPU implementation does not support group_offset,"
-          " rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale, zero_initialize,"
-          " fuse_gateup_activation, lhs_quantization_dtype,"
-          " or rhs_quantization_dtype."
+          " zero_initialize, or fuse_gateup_activation."
       )
 
     # None of the kernels support zero point yet.
@@ -195,6 +185,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       if isinstance(rhs, QArray):
         if isinstance(lhs, QArray):
           if lhs.qtype == jnp.int8:
+            if not gpu_utils.has_tcgen05_int8_support():
+              raise NotImplementedError(
+                  "int8 x int4 MMA (.kind::i8) is not supported on sm103+."
+              )
             fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
           elif lhs.qtype == jnp.float8_e4m3fn:
             fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
@@ -235,17 +229,29 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     else:
       raise NotImplementedError("Unsupported GPU architecture.")
 
-    if isinstance(group_sizes, GroupSizes):
-      group_sizes = jnp.array(group_sizes)
-
-    if preferred_element_type is None:
-      preferred_element_type = jnp.promote_types(lhs.dtype, rhs.dtype)
-
     if fn is None:
       raise NotImplementedError(
           f"Unsupported config: {config=} {ragged_dot_dimension_numbers=}"
           f" {lhs.dtype=} {rhs.dtype=} {preferred_element_type=} {precision=}"
       )
+
+    if isinstance(group_sizes, GroupSizes):
+      group_sizes = jnp.array(group_sizes)
+
+    if preferred_element_type is None:
+      preferred_element_type = jnp.result_type(lhs, rhs)
+
+    if self.int4_to_fp8_offline_permute:
+      if (
+          fn is not sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+          or not isinstance(rhs, QArray)
+          or rhs.qtype != jnp.int4
+      ):
+        raise NotImplementedError(
+            "`int4_to_fp8_offline_permute` is only supported by the SM100 fp8"
+            " x int4 kernel."
+        )
+      fn = partial(fn, int4_to_fp8_offline_permute=True)
 
     dot_out = fn(
         lhs,  # pyrefly: ignore[bad-argument-type]

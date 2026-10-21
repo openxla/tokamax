@@ -21,6 +21,7 @@ from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
@@ -57,8 +58,11 @@ def _generate_mla_params():
 
 class MultiHeadLatentAttentionTest(parameterized.TestCase):
   def test_mla_benchmark_correctness(self):
-    if backend.get_default_device().device_kind != "TPU7x":
-      self.skipTest("Only tested on TPU7x.")
+    if (
+        backend.get_default_device().platform != "tpu"
+        or pltpu.get_tpu_info().generation < 7
+    ):
+      self.skipTest("Only tested on TPU version >= 7.")
     (
         batch_size,
         q_len,

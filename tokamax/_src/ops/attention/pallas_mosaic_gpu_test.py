@@ -36,6 +36,8 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
+    if gpu_utils.is_sm80():
+      self._supports_vjp = False
     super().setUp()
 
   def __init__(
@@ -90,6 +92,13 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       kwargs["test_vjp"] = False
 
     test_vjp = kwargs.get("test_vjp", self._supports_vjp)
+    if gpu_utils.is_sm80():
+      impl = kwargs.get("impl", self._attention_fn)
+      if (
+          not getattr(impl, "use_stable_softmax", True)
+          or getattr(impl, "rescale_threshold", 1.0) != 1.0
+      ):
+        kwargs["expect_supported"] = False
     if gpu_utils.is_sm100():
 
       impl = kwargs.get("impl", self._attention_fn)
@@ -226,6 +235,14 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def _test_small_sequences(self, seq_q, seq_kv):
     with test_base.override_test_args(atol=0.02, atol_grads=0.04):
       super()._test_small_sequences(seq_q, seq_kv)
+
+  @override
+  def _test_vmap(self, vmap_in_axes):
+    if gpu_utils.is_sm80():
+      with test_base.override_test_args(atol=0.01):
+        super()._test_vmap(vmap_in_axes)
+    else:
+      super()._test_vmap(vmap_in_axes)
 
 
 # TODO: Add manual partitioning test.

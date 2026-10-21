@@ -21,8 +21,8 @@ from typing import Any, Final
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import base
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 
 NUM_LANES: Final[int] = 128
 
@@ -60,6 +60,10 @@ def check_inputs_support(
     raise NotImplementedError("mask.k_start is not supported.")
   if mask.k_end is not None:
     raise NotImplementedError("mask.k_end is not supported.")
+  if mask.causal_mask is not None and not mask.is_causal:
+    raise NotImplementedError(
+        "Causal offset and window size are not supported."
+    )
 
 
 def build_splash_kernel(

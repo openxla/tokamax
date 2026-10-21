@@ -15,15 +15,15 @@
 
 """Linear Cross-Entropy kernel implementation."""
 
+import dataclasses
 import functools
 import math
-from typing import Annotated, Literal, Sequence
+from typing import Literal, Sequence
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import jaxtyping as jt
-import pydantic
 
 Array = jt.Array
 Integer = jt.Integer
@@ -34,7 +34,7 @@ partial = functools.partial
 reduce = functools.reduce
 
 
-@pydantic.dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Config:
   """The configuration specific for the Pallas Mosaic TPU kernel.
 
@@ -42,18 +42,113 @@ class Config:
     b_block_size: The block size for the batch dimension.
     h_block_size: The block size for the hidden dimension.
     v_block_size: The block size for the vocabulary dimension.
+    buffer_count: The buffer count configuration for input/output buffering. Can
+      be an integer or a tuple of (input_buffer_count, output_buffer_count). On
+      JAX versions without separate input/output buffering support, gradient
+      input_output buffers are single-buffered (buffer_count=1).
   """
 
-  b_block_size: Annotated[int, pydantic.Field(ge=1024, multiple_of=128)] = 1024
-  h_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 512
-  v_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 2048
+  b_block_size: int = 1024
+  h_block_size: int = 512
+  v_block_size: int = 2048
+  buffer_count: tuple[int, int] | int = (2, 2)
+
+
+# Separate (in, out) input_output buffering was added to Pallas TPU
+# emit_pipeline in jax-ml/jax@c7dadc8 (first released in JAX 0.12.0).
+# Older JAX shares the N slots between prefetch and async write-back, which
+# races for N > 1, so only buffer_count=1 is safe there.
+_HAS_SEPARATE_INPUT_OUTPUT_BUFFERING: bool = hasattr(
+    pltpu.BufferedRef, "in_buffer_count"
+)
+
+
+def _safe_input_output_buffer_count(
+    requested: tuple[int, int] | int,
+    revisit_distance: int | None,
+) -> tuple[int, int] | int:
+  """Returns safe buffer count avoiding emit_pipeline read-after-write hazards.
+
+  In Pallas emit_pipeline (third_party/py/jax/_src/pallas/mosaic/pipeline.py),
+  each grid step executes copy_in, wait_in, body, copy_out, wait_out. When an
+  input_output BufferedRef has output buffering (out_count > 1), copy_out is
+  asynchronous and awaited out_count - 1 steps later. If the same HBM block is
+  revisited, copy_in prefetches it in_count - 1 steps before the visit.
+  Consequently, visits must be at least in_count + out_count - 1 grid steps
+  apart (the rule stated by emit_pipeline's make_output_bref).
+
+  If revisit_distance is shorter than this threshold, pipelined writeback
+  causes an HBM read-after-write hazard where stale data is prefetched. In
+  that case, we fall back to (min(in_count, revisit_distance), 1): with out=1
+  the write-back is synchronous, and in <= revisit_distance guarantees the
+  prefetch is issued after the previous visit's write-back.
+
+  Args:
+    requested: Requested buffer count, either an (in, out) pair or single int.
+    revisit_distance: Steps between successive visits to the same HBM block, or
+      None if visited once, or 1 if visited on consecutive steps.
+
+  Returns:
+    Safe buffer count: requested if safe, or (min(in, revisit_distance), 1).
+  """
+  if isinstance(requested, int):
+    in_count, out_count = requested, 1
+  else:
+    in_count, out_count = requested
+
+  if (
+      revisit_distance is None
+      or revisit_distance == 1
+      or revisit_distance >= in_count + out_count - 1
+  ):
+    return requested
+  return (min(in_count, revisit_distance), 1)
+
+
+def _input_output_buffer_count(
+    requested: tuple[int, int] | int,
+    revisit_distance: int | None,
+) -> tuple[int, int] | int:
+  """Returns a safe buffer count, falling back to 1 on older JAX versions.
+
+  On JAX builds without separate input/output buffering (released JAX
+  <= 0.11.2), an input_output BufferedRef with buffer_count=N > 1 rotates
+  prefetch and asynchronous write-back through the same N VMEM slots, so
+  prefetching the next block can overwrite a slot whose previous write-back is
+  still in flight. Single buffering (synchronous write-back) is the only safe
+  choice there, so return 1. Otherwise, delegate to
+  _safe_input_output_buffer_count.
+
+  Args:
+    requested: Requested buffer count, either an (in, out) pair or single int.
+    revisit_distance: Steps between successive visits to the same HBM block, or
+      None if visited once, or 1 if visited on consecutive steps.
+
+  Returns:
+    1 if separate input/output buffering is unsupported; otherwise, the result
+    of _safe_input_output_buffer_count(requested, revisit_distance).
+  """
+  if not _HAS_SEPARATE_INPUT_OUTPUT_BUFFERING:
+    return 1
+  return _safe_input_output_buffer_count(requested, revisit_distance)
+
+
+def _calculate_grad_bytes_per_elem(
+    buffer_count: tuple[int, int] | int,
+) -> int:
+  """Calculates VMEM gradient bytes per element based on buffer count."""
+  input_buffer_count, output_buffer_count = (
+      (buffer_count, 1) if isinstance(buffer_count, int) else buffer_count
+  )
+  total_buffers = input_buffer_count + output_buffer_count - 1
+  return total_buffers * 4 + 4
 
 
 def _calculate_fwd_vmem_bytes(
     b_block_size: int,
     h_block_size: int,
     v_block_size: int,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
 ) -> int:
   """Calculates VMEM memory usage in bytes for the forward kernel."""
   dtype_bytes = jnp.dtype(dtype).itemsize
@@ -81,26 +176,30 @@ def _calculate_bwd_vmem_bytes(
     b_block_size: int,
     h_block_size: int,
     v_block_size: int,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
+    buffer_count: tuple[int, int] | int = (2, 2),
 ) -> int:
   """Calculates VMEM memory usage in bytes for the backward kernel."""
   dtype_bytes = jnp.dtype(dtype).itemsize
   h_alloc = 1 << (h_block_size - 1).bit_length()
+  # Note: grad_bytes is an upper bound when single-buffered output fallback
+  # engages.
+  grad_bytes = _calculate_grad_bytes_per_elem(buffer_count)
   return (
       # (B, H) shapes:
       # x tile (B, H) in input dtype (double buff for in_specs: 2 * dt)
-      # + x_grad_tile accumulator (B, H) in float32 (single scratch buffer: 4B)
+      # + x_grad tile accumulator (B, H) in float32 (total_buffers * 4B)
       # + dot_general intermediate result in accumulate_x_grad (float32: 4B)
-      b_block_size * h_alloc * (2 * dtype_bytes + 8)
+      b_block_size * h_alloc * (2 * dtype_bytes + grad_bytes)
       # (B) shapes
       # labels (8 bytes), lse (8 bytes), and dout (8 bytes) tiles (all double
       # buffered for in_specs inputs, 24 bytes per batch elem total)
       + 2 * 3 * 4 * b_block_size
       # (H, V) shapes:
       # 2x w tiles (w_v & w_vm1 double buff for in_specs: 4 * dt)
-      # + w_grad_tile accumulator (H, V) in float32 (single scratch buffer: 4B)
+      # + w_grad tile accumulator (H, V) in float32 (total_buffers * 4B)
       # + dot_general intermediate result in accumulate_w_grad (float32: 4B)
-      + h_alloc * v_block_size * (4 * dtype_bytes + 8)
+      + h_alloc * v_block_size * (4 * dtype_bytes + grad_bytes)
       # (B, V) shapes:
       # logits/softmax tile (B, V) in float32 accumulator:
       # Ping-pong xw_scratch_ref: 2 x (B, V) explicit float32 buffers (8B/elem)
@@ -109,6 +208,8 @@ def _calculate_bwd_vmem_bytes(
       # extra (B, V) buffers. Total 3 simultaneous (B, V) float32 buffers
       # (12B/elem)
       + 3 * b_block_size * v_block_size * 4
+      # Compiler stack, descriptor, and 2D layout alignment padding (~384KB)
+      + 384 * 1024
   )
 
 
@@ -122,37 +223,48 @@ def _get_heuristic_config(
     v_dim: int,
     *,
     is_bwd: bool = False,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     vmem_limit_bytes: int | None = None,
+    buffer_count: tuple[int, int] | int = (2, 2),
 ) -> Config:
   """Calculates heuristic config based on VMEM size, dtype, and divisibility."""
   if vmem_limit_bytes is None:
     vmem_limit_bytes = _get_vmem_limit_bytes()
 
   calc_vmem_fn = (
-      _calculate_bwd_vmem_bytes if is_bwd else _calculate_fwd_vmem_bytes
+      functools.partial(_calculate_bwd_vmem_bytes, buffer_count=buffer_count)
+      if is_bwd
+      else _calculate_fwd_vmem_bytes
   )
   dtype_bytes = jnp.dtype(dtype).itemsize
+  tpu_info = pltpu.get_tpu_info()
+  num_lanes = tpu_info.num_lanes
 
-  # 1. Choose b_block_size: needs at least 1024, multiple of 128.
-  # Prefer b_block_size such that b_dim % b_block_size == 0.
+  # 1. Choose b_block_size: needs at least num_sublanes * num_lanes, multiple of
+  # num_lanes. Prefer b_block_size such that b_dim % b_block_size == 0.
+  min_b_block_size = tpu_info.num_sublanes * num_lanes
   b_candidates = [
-      b for b in range(1024, max(1025, b_dim + 1), 128) if b_dim % b == 0
+      b
+      for b in range(
+          min_b_block_size, max(min_b_block_size + 1, b_dim + 1), num_lanes
+      )
+      if b_dim % b == 0
   ]
   if b_candidates:
     b_block_size = b_candidates[0]
   else:
-    b_block_size = 1024
+    b_block_size = min_b_block_size
 
-  # 2. Choose h_block_size: at least 128, multiple of 128, close to h_dim_max.
-  # Prefer h_block_size such that h_dim % h_block_size == 0.
-  h_dim_max = (
-      pltpu.get_tpu_info().mxu_column_size
-      * pltpu.get_tpu_info().num_mxus
-      // pltpu.get_tpu_info().num_cores
-  )
+  # 2. Choose h_block_size: at least num_lanes, multiple of num_lanes, close to
+  # h_dim_max. Prefer h_block_size such that h_dim % h_block_size == 0.
+  # Align h_dim_max down to a multiple of num_lanes (and at least num_lanes) so
+  # that the fallbacks below always produce a lane-aligned h_block_size.
+  raw_h_dim_max = tpu_info.mxu_column_size * tpu_info.num_mxus
+  h_dim_max = max(num_lanes, (raw_h_dim_max // num_lanes) * num_lanes)
   h_candidates = [
-      h for h in range(128, max(129, h_dim + 1), 128) if h_dim % h == 0
+      h
+      for h in range(num_lanes, max(num_lanes + 1, h_dim + 1), num_lanes)
+      if h_dim % h == 0
   ]
   if h_candidates:
     h_block_size = min(
@@ -165,7 +277,7 @@ def _get_heuristic_config(
   else:
     if h_dim < h_dim_max:
       h_candidates_non_div = [
-          h for h in range(128, h_dim_max + 1, 128) if h >= h_dim
+          h for h in range(num_lanes, h_dim_max + 1, num_lanes) if h >= h_dim
       ]
       if h_candidates_non_div:
         h_block_size = min(
@@ -180,65 +292,97 @@ def _get_heuristic_config(
     else:
       h_block_size = h_dim_max
 
+  # Avoid exactly 2 H blocks in the backward kernel.
+  # With num_h_blocks == 2, the innermost grid dimension iterates over 2
+  # blocks, causing each x_grad tile to recur every 2 grid steps. Because
+  # pipelined write-back for (2, 2) buffering requires revisit_distance >=
+  # in + out - 1 = 3 to prevent read-after-write hazards, 2 blocks triggers
+  # the single-buffered output fallback (2, 1), which forces a synchronous
+  # HBM write-back and reload on every grid step.
+  # To avoid this fallback:
+  # 1. Prefer 1 H block (round_up(h_dim, num_lanes)) if it fits VMEM with a
+  #    reasonable v_block_size (>= 4 * num_lanes).
+  #    This measured fastest in hardware sweeps by eliminating cross-step
+  #    hazards and keeping all of H resident in VMEM.
+  # 2. Otherwise fall back to a 4-block geometry
+  #    (round_up(ceil(h_dim / 4), num_lanes)), which ensures num_h_blocks >= 3
+  #    (revisit_distance >= 3) while keeping VMEM per tile small.
+  if is_bwd and math.ceil(h_dim / h_block_size) == 2:
+    h_one_block = int(math.ceil(h_dim / num_lanes) * num_lanes)
+    min_v_trial = 4 * num_lanes
+    if (
+        calc_vmem_fn(b_block_size, h_one_block, min_v_trial, dtype=dtype)
+        <= vmem_limit_bytes
+    ):
+      h_block_size = h_one_block
+    else:
+      h_block_size = max(
+          num_lanes, int(math.ceil(h_dim / 4 / num_lanes) * num_lanes)
+      )
+
   # 3. Choose v_block_size: as large as possible to fit VMEM.
-  # Must be >= 128, multiple of 128. Divisible by v_dim if possible.
+  # Must be >= num_lanes, multiple of num_lanes. Divisible by v_dim if possible.
+  h_alloc = 1 << (h_block_size - 1).bit_length()
   if is_bwd:
+    # Note: grad_bytes is an upper bound when single-buffered output fallback
+    # engages.
+    grad_bytes = _calculate_grad_bytes_per_elem(buffer_count)
     # fixed_bytes accounts for VMEM costs that do not scale with V:
-    #   - x tile (2 * dt) + x_grad_tile (4B) + dot_general res (4B) =
-    #          b_block_size * h_block_size * (2 * dtype_bytes + 8)
+    #   - x tile (2 * dt) + x_grad tile (accum in float32: total_buffers * 4B) +
+    #     dot_general res (4B) =
+    #          b_block_size * h_alloc * (2 * dtype_bytes + grad_bytes)
     #   - labels (8 bytes) + lse (8 bytes) + dout (8 bytes) = 24 * b_block_size
+    #   - compiler stack, descriptor, and 2D layout alignment padding = 384KB
     fixed_bytes = (
-        b_block_size * h_block_size * (2 * dtype_bytes + 8) + 24 * b_block_size
+        b_block_size * h_alloc * (2 * dtype_bytes + grad_bytes)
+        + 24 * b_block_size
+        + 384 * 1024
     )
     # per_v_bytes accounts for all VMEM costs per column of V:
     #   - 2x w tiles (w_v & w_vm1 double-buffered in dtype: 4 * dt) +
-    #       w_grad_tile (4B) + dot_general res (4B) =
-    #       h_block_size * (4 * dtype_bytes + 8)
+    #       w_grad tile (accum in float32: total_buffers * 4B) +
+    #       dot_general res (4B) =
+    #       h_alloc * (4 * dtype_bytes + grad_bytes)
     #   - 3 simultaneous float32 (B, V) buffers on the VMEM stack:
     #       1-2) 2x xw_scratch_ref (explicit VMEM scratch ping-pong: 8B/elem)
     #       3) diff/prob temporary on the stack during compute_s (4B/elem)
     #       Total 3 * 4 = 12 bytes per element across b_block_size
-    per_v_bytes = h_block_size * (4 * dtype_bytes + 8) + 12 * b_block_size
+    per_v_bytes = h_alloc * (4 * dtype_bytes + grad_bytes) + 12 * b_block_size
   else:
     # fixed_bytes accounts for VMEM costs that do not scale with V:
-    #   - x tile = 2 * b_block_size * h_block_size * dtype_bytes
+    #   - x tile = 2 * b_block_size * h_alloc * dtype_bytes
     #   - labels (8 bytes) + lse (8 bytes) + loss (8 bytes) = 24 * b_block_size
-    fixed_bytes = (
-        2 * b_block_size * h_block_size * dtype_bytes + 24 * b_block_size
-    )
+    fixed_bytes = 2 * b_block_size * h_alloc * dtype_bytes + 24 * b_block_size
     # per_v_bytes accounts for all VMEM costs per column of V:
-    #   - w tile (double-buff in dtype: 2 * dt) = 2 * h_block_size * dtype_bytes
+    #   - w tile (double-buff in dtype: 2 * dt) = 2 * h_alloc * dtype_bytes
     #   - 4 simultaneous float32 (B, V) buffers on the VMEM stack:
     #     (4 * 4 = 16 bytes per element across b_block_size):
     #       1) xw_tiled (explicit scratch buffer)
     #       2) labels_one_hot (HLO stack temporary in accumulate_loss)
     #       3) diff = xw_tiled - max (HLO stack temporary in logsumexp)
     #       4) exp(diff) (HLO stack temporary in logsumexp)
-    per_v_bytes = 2 * h_block_size * dtype_bytes + 16 * b_block_size
+    per_v_bytes = 2 * h_alloc * dtype_bytes + 16 * b_block_size
 
   if vmem_limit_bytes > fixed_bytes:
     max_v_vmem = (vmem_limit_bytes - fixed_bytes) // per_v_bytes
   else:
-    max_v_vmem = 128
+    max_v_vmem = num_lanes
 
   max_v = min(v_dim, max_v_vmem)
-  max_v_aligned = max(128, (max_v // 128) * 128)
+  max_v_aligned = max(num_lanes, (max_v // num_lanes) * num_lanes)
 
-  try:
-    max_cores = pltpu.get_tpu_info().num_cores
-  except Exception:  # pylint: disable=broad-except
-    max_cores = 1
+  max_cores = tpu_info.num_cores
 
   def is_mc_compatible(v: int) -> bool:
     if max_cores <= 1:
       return True
     n_v_b = math.ceil(v_dim / v)
-    return n_v_b < max_cores or n_v_b % max_cores == 0
+    return n_v_b % max_cores == 0
 
   # 1. First try to find a divisor of v_dim that fits in VMEM and is multi-core
   # compatible.
   v_block_size = None
-  for v in range(max_v_aligned, 127, -128):
+  for v in range(max_v_aligned, num_lanes - 1, -num_lanes):
     if (
         v_dim % v == 0
         and is_mc_compatible(v)
@@ -248,9 +392,10 @@ def _get_heuristic_config(
       v_block_size = v
       break
 
-  # 2. If no divisor fits, pick a multiple of 128 that is multi-core compatible
+  # 2. If no divisor fits, pick a multiple of num_lanes that is multi-core
+  # compatible
   if v_block_size is None:
-    for v in range(max_v_aligned, 127, -128):
+    for v in range(max_v_aligned, num_lanes - 1, -num_lanes):
       if (
           is_mc_compatible(v)
           and calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype)
@@ -261,7 +406,7 @@ def _get_heuristic_config(
 
   # 3. Fallback: try divisor of v_dim that fits in VMEM
   if v_block_size is None:
-    for v in range(max_v_aligned, 127, -128):
+    for v in range(max_v_aligned, num_lanes - 1, -num_lanes):
       if (
           v_dim % v == 0
           and calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype)
@@ -270,9 +415,9 @@ def _get_heuristic_config(
         v_block_size = v
         break
 
-  # 4. Fallback: pick the largest multiple of 128 that fits
+  # 4. Fallback: pick the largest multiple of num_lanes that fits
   if v_block_size is None:
-    for v in range(max_v_aligned, 127, -128):
+    for v in range(max_v_aligned, num_lanes - 1, -num_lanes):
       if (
           calc_vmem_fn(b_block_size, h_block_size, v, dtype=dtype)
           <= vmem_limit_bytes
@@ -280,12 +425,13 @@ def _get_heuristic_config(
         v_block_size = v
         break
     if v_block_size is None:
-      v_block_size = 128
+      v_block_size = num_lanes
 
   return Config(
       b_block_size=b_block_size,
       h_block_size=h_block_size,
       v_block_size=v_block_size,
+      buffer_count=buffer_count,
   )
 
 
@@ -293,7 +439,7 @@ def get_heuristic_fwd_config(
     b_dim: int,
     h_dim: int,
     v_dim: int,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     vmem_limit_bytes: int | None = None,
 ) -> Config:
   """Returns heuristic config for forward pass based on VMEM size and dtype."""
@@ -311,8 +457,9 @@ def get_heuristic_bwd_config(
     b_dim: int,
     h_dim: int,
     v_dim: int,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     vmem_limit_bytes: int | None = None,
+    buffer_count: tuple[int, int] | int = (2, 2),
 ) -> Config:
   """Returns heuristic config for backward pass based on VMEM size and dtype."""
   return _get_heuristic_config(
@@ -322,17 +469,18 @@ def get_heuristic_bwd_config(
       is_bwd=True,
       dtype=dtype,
       vmem_limit_bytes=vmem_limit_bytes,
+      buffer_count=buffer_count,
   )
 
 
 def validate_inputs(
     x: Real[Array, "B H"],
-    labels: Real[Array, "B V"],
+    labels: Integer[Array, "B"],
     w: Real[Array, "H V"],
     b_block_size: int,
-    h_block_size: int,  # pylint: disable=unused-argument
-    v_block_size: int,  # pylint: disable=unused-argument
-):
+    h_block_size: int,
+    v_block_size: int,
+) -> None:
   """Validates the inputs to the kernels.
 
   Validate inputs and raise ValueError if the inputs are invalid.
@@ -350,7 +498,23 @@ def validate_inputs(
   Raises:
     ValueError: If the inputs are invalid.
   """
-  del b_block_size  # Currently unused.
+  tpu_info = pltpu.get_tpu_info()
+  num_lanes = tpu_info.num_lanes
+  if b_block_size <= 0 or b_block_size % num_lanes != 0:
+    raise ValueError(
+        f"b_block_size must be a positive multiple of {num_lanes}, got"
+        f" {b_block_size}."
+    )
+  if h_block_size <= 0 or h_block_size % num_lanes != 0:
+    raise ValueError(
+        f"h_block_size must be a positive multiple of {num_lanes}, got"
+        f" {h_block_size}."
+    )
+  if v_block_size <= 0 or v_block_size % num_lanes != 0:
+    raise ValueError(
+        f"v_block_size must be a positive multiple of {num_lanes}, got"
+        f" {v_block_size}."
+    )
 
   if labels.shape[0] != x.shape[0]:
     raise ValueError(
@@ -364,8 +528,12 @@ def validate_inputs(
         f" w hidden dimension ({w.shape[0]})."
     )
 
-  if w.shape[0] % 8 != 0:
-    raise ValueError("The hidden dimension of w must be a multiple of 8")
+  num_sublanes = tpu_info.num_sublanes
+  if w.shape[0] % num_sublanes != 0:
+    raise ValueError(
+        f"The hidden dimension of w must be a multiple of {num_sublanes}, got"
+        f" {w.shape[0]}."
+    )
 
 
 @jax.named_scope("calculate_xw_tiled")
@@ -721,9 +889,6 @@ def linear_softmax_cross_entropy_loss_forward_pallas_kernel(
         xw_tiled,
     ):
       b_index, v_index, h_index = (pl.program_id(i) for i in range(3))
-      num_b_blocks, num_v_blocks, num_h_blocks = (
-          pl.num_programs(i) for i in range(3)
-      )
 
       # xw_tiled += x_ref @ w_ref
       calculate_xw_tiled(
@@ -874,7 +1039,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
     h_block_size: int = 512,
     v_block_size: int = 2048,
     reduction: Literal["sum", "mean", "none"] = "sum",
-    preferred_element_type: jnp.dtype = jnp.float32,
+    preferred_element_type: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[Real[Scalar, ""] | Real[Array, "B"], Real[Array, "B"]]:
   """The pallas kernel implementation of linear softmax cross-entropy loss.
 
@@ -941,11 +1106,11 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
 
 
 def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
-    dout,
-    x,
-    labels,
-    w,
-    lse,
+    dout: Real[Array, "B"],
+    x: Real[Array, "B H"],
+    labels: Integer[Array, "B"],
+    w: Real[Array, "H V"],
+    lse: Real[Array, "B"],
     *,
     b_dim: int,
     h_dim: int,
@@ -954,6 +1119,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     b_block_size: int,
     h_block_size: int,
     v_block_size: int,
+    buffer_count: tuple[int, int] | int = (2, 2),
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """Pallas kernel for the backward pass of Linear Softmax Cross-Entropy Loss.
 
@@ -970,31 +1136,33 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     b_block_size: Block size for batch dimension.
     h_block_size: Block size for hidden dimension.
     v_block_size: Block size for vocabulary dimension.
+    buffer_count: The buffer count configuration for input/output buffering. On
+      JAX versions without separate input/output buffering support, gradient
+      input_output buffers are single-buffered (buffer_count=1).
 
   Returns:
     A tuple of (x_grad, w_grad).
   """
   num_b_blocks = math.ceil(b_dim / b_block_size)
   num_h_blocks = math.ceil(h_dim / h_block_size)
-  num_v_blocks = math.ceil(v_dim / v_block_size)
+  num_v_blocks_unpadded = math.ceil(v_dim / v_block_size)
+  num_v_blocks = num_v_blocks_unpadded
   max_cores = pltpu.get_tpu_info().num_cores
-  num_cores = math.gcd(num_v_blocks, max_cores)
-  if num_cores == 0:
+  if max_cores > 1:
+    if num_v_blocks % max_cores != 0:
+      num_v_blocks = int(math.ceil(num_v_blocks / max_cores) * max_cores)
+    num_cores = max_cores
+  else:
     num_cores = 1
   num_v_blocks_per_core = num_v_blocks // num_cores
   num_v_steps = num_v_blocks_per_core + 1
-  major_align = 32 // x.dtype.itemsize
-  b_dim_aligned = int(math.ceil(b_dim / major_align) * major_align)
-  h_dim_128_aligned = int(math.ceil(h_dim / 128) * 128)
-  h_dim_8_aligned = int(math.ceil(h_dim / 8) * 8)
-  v_dim_aligned = int(math.ceil(v_dim / 128) * 128)
 
   out_type = [
       jax.ShapeDtypeStruct(
-          (num_cores, b_dim_aligned, h_dim_128_aligned), dtype=jnp.float32
+          (num_cores, b_dim, h_dim), dtype=jnp.float32
       ),  # x_grad
       jax.ShapeDtypeStruct(
-          (h_dim_8_aligned, v_dim_aligned), dtype=jnp.float32
+          (h_dim, num_v_blocks * v_block_size), dtype=jnp.float32
       ),  # w_grad
   ]
   cost_estimate = linear_softmax_cross_entropy_loss_bwd_cost_estimate(
@@ -1008,21 +1176,11 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
   @pl.kernel(
       out_type=out_type,
-      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+      mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=num_cores),
       scratch_types=(
           pltpu.VMEM(
               (2, b_block_size, v_block_size), dtype=jnp.float32
           ),  # xw_scratch
-          pltpu.VMEM(
-              (b_block_size, h_block_size), dtype=jnp.float32
-          ),  # x_grad_tile
-          pltpu.VMEM(
-              (h_block_size, v_block_size), dtype=jnp.float32
-          ),  # w_grad_tile
-          pltpu.SemaphoreType.DMA,  # x_read_sem
-          pltpu.SemaphoreType.DMA,  # w_read_sem
-          pltpu.SemaphoreType.DMA,  # x_write_sem
-          pltpu.SemaphoreType.DMA,  # w_write_sem
       ),
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=_get_vmem_limit_bytes(),
@@ -1043,14 +1201,131 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       x_grad_hbm_ref,
       w_grad_hbm_ref,
       xw_scratch_ref,
-      x_grad_tile_ref,
-      w_grad_tile_ref,
-      x_read_sem,
-      w_read_sem,
-      x_write_sem,
-      w_write_sem,
   ):
     c_index = jax.lax.axis_index("core")
+    grid = (
+        num_b_blocks,
+        num_v_steps,
+        num_h_blocks,
+    )
+    get_b_ds = lambda i: pl.ds(
+        i * b_block_size, jnp.minimum(b_block_size, b_dim - i * b_block_size)
+    )
+    get_h_ds = lambda k: pl.ds(
+        k * h_block_size, jnp.minimum(h_block_size, h_dim - k * h_block_size)
+    )
+
+    def get_v_ds_w(j: jax.Array | int) -> pl.Slice:
+      j_clamped = jnp.minimum(j, num_v_blocks_unpadded - 1)
+      return pl.ds(
+          j_clamped * v_block_size,
+          jnp.minimum(v_block_size, v_dim - j_clamped * v_block_size),
+      )
+
+    def get_v_ds_w_grad(j: jax.Array | int) -> pl.Slice:
+      return pl.ds(j * v_block_size, v_block_size)
+
+    in_specs = [
+        pl.BlockSpec(  # dout
+            (pl.BoundedSlice(b_block_size),),
+            lambda i, j, k: (get_b_ds(i),),
+            memory_space=pltpu.VMEM,
+        ),
+        pl.BlockSpec(  # x
+            (pl.BoundedSlice(b_block_size), pl.BoundedSlice(h_block_size)),
+            lambda i, j, k: (get_b_ds(i), get_h_ds(k)),
+            memory_space=pltpu.VMEM,
+        ),
+        pl.BlockSpec(  # labels
+            (pl.BoundedSlice(b_block_size),),
+            lambda i, j, k: (get_b_ds(i),),
+            memory_space=pltpu.VMEM,
+        ),
+        # Notes for w_v and w_vm1:
+        # - V is split across cores
+        # - We have one extra V block for additional pipelining in
+        #   the v dimension.
+        pl.BlockSpec(  # w_v
+            (pl.BoundedSlice(h_block_size), pl.BoundedSlice(v_block_size)),
+            lambda i, j, k: (
+                get_h_ds(k),
+                get_v_ds_w(
+                    c_index * num_v_blocks_per_core
+                    + jnp.minimum(j, num_v_blocks_per_core - 1),
+                ),
+            ),
+            memory_space=pltpu.VMEM,
+        ),
+        pl.BlockSpec(  # w_vm1
+            (pl.BoundedSlice(h_block_size), pl.BoundedSlice(v_block_size)),
+            lambda i, j, k: (
+                get_h_ds(k),
+                get_v_ds_w(
+                    c_index * num_v_blocks_per_core + jnp.maximum(0, j - 1),
+                ),
+            ),
+            memory_space=pltpu.VMEM,
+        ),
+        pl.BlockSpec(  # lse
+            (pl.BoundedSlice(b_block_size),),
+            lambda i, j, k: (get_b_ds(i),),
+            memory_space=pltpu.VMEM,
+        ),
+    ]
+    out_specs = [
+        pl.BlockSpec(  # x_grad
+            (
+                None,
+                pl.BoundedSlice(b_block_size),
+                pl.BoundedSlice(h_block_size),
+            ),
+            lambda i, j, k: (c_index, get_b_ds(i), get_h_ds(k)),
+            memory_space=pltpu.VMEM,
+        ),
+        pl.BlockSpec(  # w_grad
+            (pl.BoundedSlice(h_block_size), pl.BoundedSlice(v_block_size)),
+            lambda i, j, k: (
+                get_h_ds(k),
+                get_v_ds_w_grad(
+                    c_index * num_v_blocks_per_core + jnp.maximum(0, j - 1)
+                ),
+            ),
+            memory_space=pltpu.VMEM,
+        ),
+    ]
+    x_grad_revisit = None if num_h_blocks == 1 else num_h_blocks
+    # Within a B block, w_grad visits block 0 at v_step 0 and v_step 1.
+    # v_step 0 does not write to w_grad, so that recurrence is content-benign.
+    # The first real write is at v_step 1, and the block recurs at v_step 0 of
+    # the next B block, exactly num_v_blocks_per_core * num_h_blocks steps
+    # later.
+    w_grad_revisit = (
+        None if num_b_blocks == 1 else num_v_blocks_per_core * num_h_blocks
+    )
+    x_grad_buffer_count = _input_output_buffer_count(
+        buffer_count, x_grad_revisit
+    )
+    w_grad_buffer_count = _input_output_buffer_count(
+        buffer_count, w_grad_revisit
+    )
+    inner_allocs = [
+        pltpu.BufferedRef.input(in_specs[0], dout.dtype),
+        pltpu.BufferedRef.input(in_specs[1], x.dtype),
+        pltpu.BufferedRef.input(in_specs[2], labels.dtype),
+        pltpu.BufferedRef.input(in_specs[3], w.dtype),
+        pltpu.BufferedRef.input(in_specs[4], w.dtype),
+        pltpu.BufferedRef.input(in_specs[5], lse.dtype),
+        pltpu.BufferedRef.input_output(
+            out_specs[0],
+            jnp.float32,
+            buffer_count=x_grad_buffer_count,
+        ),
+        pltpu.BufferedRef.input_output(
+            out_specs[1],
+            jnp.float32,
+            buffer_count=w_grad_buffer_count,
+        ),
+    ]
 
     def bwd_pipeline(
         dout_ref,
@@ -1059,15 +1334,9 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         w_v_ref,
         w_vm1_ref,
         lse_ref,
-        x_grad_hbm_ref,
-        w_grad_hbm_ref,
+        x_grad_ref,
+        w_grad_ref,
         xw_scratch_ref,
-        x_grad_tile_ref,
-        w_grad_tile_ref,
-        x_read_sem,
-        w_read_sem,
-        x_write_sem,
-        w_write_sem,
     ):
       b_index, v_step, h_index = (pl.program_id(i) for i in range(3))
       global_v = c_index * num_v_blocks_per_core + v_step
@@ -1160,86 +1429,6 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             lambda: None,
         )
 
-      # 3. Gradient calculation for current tile (v_step - 1)
-      # Calculate actual block size if v_dim not a multiple of v_block_size
-      cur_v_block_size = jnp.maximum(
-          0, jnp.minimum(v_dim - v_block_size * global_v_vm1, v_block_size)
-      )
-
-      # V Block size must be multiple of 128 to perform DMA (copy).
-      cur_v_block_size = pl.multiple_of(
-          (pl.cdiv(cur_v_block_size, 128) * 128).astype(jnp.int32), 128
-      )
-
-      # Calculate actual block size if h_dim not a multiple of h_block_size
-      cur_h_block_size = jnp.minimum(
-          h_dim - h_block_size * h_index, h_block_size
-      )
-
-      # H Block size must be multiple of 128 of major dimension, and 8 of
-      # minor dimension to perform DMA.
-      cur_h_block_128_aligned_size = pl.multiple_of(
-          (pl.cdiv(cur_h_block_size, 128) * 128).astype(jnp.int32), 128
-      )
-      cur_h_block_8_aligned_size = pl.multiple_of(
-          (pl.cdiv(cur_h_block_size, 8) * 8).astype(jnp.int32), 8
-      )
-
-      # Major dimension DMA requires 32-byte alignment (8 for fp32, 16 for
-      # bf16/fp16, 32 for int8).
-      major_align = 32 // x_ref.dtype.itemsize
-
-      # Calculate actual block size if b_dim not a multiple of b_block_size
-      cur_b_block_size = jnp.minimum(
-          b_dim - b_block_size * b_index, b_block_size
-      )
-      cur_b_block_aligned_size = pl.multiple_of(
-          (pl.cdiv(cur_b_block_size, major_align) * major_align).astype(
-              jnp.int32
-          ),
-          major_align,
-      )
-
-      # Slicing x_grad and w_grad HBM ref to prepare for tiled read / write
-      x_grad_slice = x_grad_hbm_ref.at[
-          c_index,
-          pl.ds(b_index * b_block_size, cur_b_block_aligned_size),
-          pl.ds(h_index * h_block_size, cur_h_block_128_aligned_size),
-      ]
-      w_grad_slice = w_grad_hbm_ref.at[
-          pl.ds(h_index * h_block_size, cur_h_block_8_aligned_size),
-          pl.ds(global_v_vm1 * v_block_size, cur_v_block_size),
-      ]
-
-      x_grad_tile_slice = x_grad_tile_ref.at[
-          pl.ds(0, cur_b_block_aligned_size),
-          pl.ds(0, cur_h_block_128_aligned_size),
-      ]
-      w_grad_tile_slice = w_grad_tile_ref.at[
-          pl.ds(0, cur_h_block_8_aligned_size), pl.ds(0, cur_v_block_size)
-      ]
-
-      # Async copy ops defined here. Only starts after calling .start().
-      x_grad_write_future = pltpu.make_async_copy(
-          x_grad_tile_slice, x_grad_slice, sem=x_write_sem
-      )
-      w_grad_write_future = pltpu.make_async_copy(
-          w_grad_tile_slice, w_grad_slice, sem=w_write_sem
-      )
-      x_grad_read_future = pltpu.make_async_copy(
-          x_grad_slice, x_grad_tile_slice, sem=x_read_sem
-      )
-      w_grad_read_future = pltpu.make_async_copy(
-          w_grad_slice, w_grad_tile_slice, sem=w_read_sem
-      )
-
-      # Preload w_grad async before computing gradients.
-      # There's no accumulation on first batch block so we skip the read.
-      @pl.when((b_index != 0) & (v_step > 0))
-      @jax.named_scope("w_grad_read_start")
-      def w_read():
-        w_grad_read_future.start()
-
       @jax.named_scope("get_clean_x")
       def get_clean_x():
         """Zeros out out-of-bounds padding elements in x_ref in VMEM."""
@@ -1291,145 +1480,77 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           )
         return w_val
 
-      # Preload x_grad async when accumulating across V (v_step > 1).
-      @pl.when(v_step > 1)
-      @jax.named_scope("x_grad_read_start")
-      def x_read():
-        x_grad_read_future.start()
-
+      # 3. Gradient calculation for current tile (v_step - 1)
       # Init W gradient
       @pl.when((v_step > 0) & (b_index == 0))
       @jax.named_scope("init_w_grad")
       def init_w_grad():
-        w_grad_tile_ref[...] = jax.lax.dot_general(
+        w_grad_ref[...] = jax.lax.dot_general(
             get_clean_x(),
             xw_scratch_ref.at[vm1_buf_idx][...],
             (((0,), (0,)), ((), ())),
         )
-        w_grad_write_future.start()
 
       # Init X gradient
       @pl.when(v_step == 1)
       @jax.named_scope("init_x_grad")
       def init_x_grad():
-        x_grad_tile_ref[...] = jax.lax.dot_general(
+        x_grad_ref[...] = jax.lax.dot_general(
             xw_scratch_ref.at[vm1_buf_idx][...],
             get_clean_w_vm1(),
             (((1,), (1,)), ((), ())),
         )
-        x_grad_write_future.start()
 
       # Accumulate W grad on B dimension
       @pl.when((v_step > 0) & (b_index != 0))
       @jax.named_scope("accumulate_w_grad")
       def accumulate_w_grad():
-        res = jax.lax.dot_general(
+        w_grad_ref[...] += jax.lax.dot_general(
             get_clean_x(),
             xw_scratch_ref.at[vm1_buf_idx][...],
             (((0,), (0,)), ((), ())),
         )
-        w_grad_read_future.wait()
-        w_grad_tile_ref[...] += res
-        w_grad_write_future.start()
 
       # Accumulate X grad on V dimension
       @pl.when(v_step > 1)
       @jax.named_scope("accumulate_x_grad")
       def accumulate_x_grad():
-        res = jax.lax.dot_general(
+        x_grad_ref[...] += jax.lax.dot_general(
             xw_scratch_ref.at[vm1_buf_idx][...],
             get_clean_w_vm1(),
             (((1,), (1,)), ((), ())),
         )
-        x_grad_read_future.wait()
-        x_grad_tile_ref[...] += res
-        x_grad_write_future.start()
 
-      # Lastly make sure to wait x_grad, w_grad write before next iteration
-      @pl.when(v_step > 0)
-      @jax.named_scope("wait_grads")
-      def wait_grads():
-        w_grad_write_future.wait()
-        x_grad_write_future.wait()
+    def run_pipeline(allocations):
+      pltpu.emit_pipeline(
+          bwd_pipeline,
+          grid=grid,
+          in_specs=in_specs,
+          out_specs=out_specs,
+          dimension_semantics=(
+              pltpu.PARALLEL,
+              pltpu.ARBITRARY,
+              pltpu.ARBITRARY,
+          ),
+      )(
+          dout_hbm_ref,
+          x_hbm_ref,
+          labels_hbm_ref,
+          w_hbm_ref,
+          w_hbm_ref,
+          lse_hbm_ref,
+          x_grad_hbm_ref,
+          w_grad_hbm_ref,
+          scratches=(xw_scratch_ref,),
+          allocations=allocations,
+      )
 
-    pltpu.emit_pipeline(
-        bwd_pipeline,
-        grid=(
-            num_b_blocks,
-            num_v_steps,
-            num_h_blocks,
-        ),
-        in_specs=[
-            pl.BlockSpec(  # dout
-                (b_block_size,),
-                lambda i, j, k: (i,),
-                memory_space=pltpu.VMEM,
-            ),
-            pl.BlockSpec(  # x
-                (b_block_size, h_block_size),
-                lambda i, j, k: (i, k),
-                memory_space=pltpu.VMEM,
-            ),
-            pl.BlockSpec(  # labels
-                (b_block_size,),
-                lambda i, j, k: (i,),
-                memory_space=pltpu.VMEM,
-            ),
-            # Notes for w_v and w_vm1:
-            # - V is split across cores
-            # - We have one extra V block for additional pipelining in
-            #   the v dimension.
-            pl.BlockSpec(  # w_v
-                (h_block_size, v_block_size),
-                lambda i, j, k: (
-                    k,
-                    c_index * num_v_blocks_per_core
-                    + jnp.minimum(j, num_v_blocks_per_core - 1),
-                ),
-                memory_space=pltpu.VMEM,
-            ),
-            pl.BlockSpec(  # w_vm1
-                (h_block_size, v_block_size),
-                lambda i, j, k: (
-                    k,
-                    c_index * num_v_blocks_per_core + jnp.maximum(0, j - 1),
-                ),
-                memory_space=pltpu.VMEM,
-            ),
-            pl.BlockSpec(  # lse
-                (b_block_size,),
-                lambda i, j, k: (i,),
-                memory_space=pltpu.VMEM,
-            ),
-        ],
-        out_specs=[
-            pl.BlockSpec(memory_space=pltpu.HBM),  # x_grad
-            pl.BlockSpec(memory_space=pltpu.HBM),  # w_grad
-        ],
-    )(
-        dout_hbm_ref,
-        x_hbm_ref,
-        labels_hbm_ref,
-        w_hbm_ref,
-        w_hbm_ref,
-        lse_hbm_ref,
-        x_grad_hbm_ref,
-        w_grad_hbm_ref,
-        scratches=(
-            xw_scratch_ref,
-            x_grad_tile_ref,
-            w_grad_tile_ref,
-            x_read_sem,
-            w_read_sem,
-            x_write_sem,
-            w_write_sem,
-        ),
-    )
+    pl.run_scoped(run_pipeline, inner_allocs)
 
   # pylint: disable-next=unpacking-non-sequence
   x_grad_blocks, w_grad = bwd_kernel(dout, x, labels, w, lse)
-  x_grad = jnp.sum(x_grad_blocks, axis=0)[:b_dim, :h_dim]
-  w_grad = w_grad[:h_dim, :v_dim]
+  x_grad = jnp.sum(x_grad_blocks, axis=0)
+  w_grad = w_grad[:, :v_dim]
   return x_grad, w_grad
 
 
@@ -1441,6 +1562,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         "v_block_size",
         "reduction",
         "preferred_element_type",
+        "buffer_count",
     ],
 )
 def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
@@ -1454,7 +1576,8 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     h_block_size: int = 512,
     v_block_size: int = 2048,
     reduction: Literal["sum", "mean", "none"] = "sum",
-    preferred_element_type: jnp.dtype = jnp.float32,
+    preferred_element_type: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
+    buffer_count: tuple[int, int] | int = (2, 2),
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """Pallas kernel implementation of Linear Softmax Cross-Entropy Loss backward.
 
@@ -1477,6 +1600,9 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     reduction: The reduction method for the cross entropy loss. Can be set to
       "sum", "mean" or "none" explicitly.
     preferred_element_type: Preferred element type for computation.
+    buffer_count: The buffer count configuration for input/output buffering. On
+      JAX versions without separate input/output buffering support, gradient
+      input_output buffers are single-buffered (buffer_count=1).
 
   Returns:
     The tuple of gradient of the loss with respect to x and w.
@@ -1489,6 +1615,10 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
       h_block_size=h_block_size,
       v_block_size=v_block_size,
   )
+
+  if preferred_element_type is None:
+    preferred_element_type = jnp.dtype(jnp.float32)  # pyrefly: ignore[bad-assignment]
+  lse = lse.astype(preferred_element_type)
 
   if x.dtype == jnp.float16:
     x = x.astype(preferred_element_type)
@@ -1529,6 +1659,7 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
       b_block_size=b_block_size,
       h_block_size=h_block_size,
       v_block_size=v_block_size,
+      buffer_count=buffer_count,
   )
 
   # There is no gradient for the labels
