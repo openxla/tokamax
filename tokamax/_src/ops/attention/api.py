@@ -153,9 +153,8 @@ def dot_product_attention(
     local_window_size = (local_window_size, local_window_size)
 
   if local_window_size is not None:
-    k_indices = jnp.arange(key.shape[-3])
     pre, post = local_window_size
-    mask_ &= base.Mask(k_start=k_indices - pre, k_end=k_indices + (post + 1))
+    mask_ &= base.CausalMask(offset=post, window_size=post + pre + 1)
 
   errors = []
   for impl in implementation:

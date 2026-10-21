@@ -18,6 +18,7 @@
 from tokamax import autotuning as autotuning
 from tokamax import benchmarking as benchmarking
 from tokamax import config as config
+from tokamax import ops as ops
 from tokamax._src.autotuning.api import autotune as autotune
 from tokamax._src.autotuning.api import AutotuningResult as AutotuningResult
 from tokamax._src.batching import BatchedShapeDtype as BatchedShapeDtype
@@ -32,6 +33,7 @@ from tokamax._src.ops.linear_softmax_cross_entropy_loss.api import linear_softma
 from tokamax._src.ops.normalization.api import layer_norm as layer_norm
 from tokamax._src.ops.op import BoundArguments as BoundArguments
 from tokamax._src.ops.op import Op as Op
+from tokamax._src.ops.op import snake_case_name as snake_case_name
 from tokamax._src.ops.ragged_dot.api import ragged_dot as ragged_dot
 from tokamax._src.ops.ragged_dot.api import ragged_dot_general as ragged_dot_general
 from tokamax._src.ops.ragged_dot.base import generate_group_sizes as generate_ragged_dot_group_sizes

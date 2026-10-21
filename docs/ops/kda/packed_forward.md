@@ -42,7 +42,7 @@ initial/final states, and cover multiple head groups, batches and an empty
 batch. Fixed-length calls explicitly verify fallback dispatch.
 
 ```bash
-python -m pytest tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_packed_test.py -v
+python -m pytest tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_test.py -v
 python -m tokamax.benchmarks.kda --skip_implementations=xla,mosaic_staged,mosaic_fwd_fused
 ```
 

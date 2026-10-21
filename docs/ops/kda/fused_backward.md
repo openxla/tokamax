@@ -56,8 +56,8 @@ comparisons to all tokens and state slots and adds raw-gate regressions
 against XLA autodiff, without accepting non-finite values.
 
 ```bash
-python -m pytest tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_bwd_fused_test.py -v
-python -m pytest tokamax/_src/ops/experimental/kda -v
+python -m pytest tokamax/_src/ops/kda/pallas_mosaic_tpu_bwd_fused_test.py -v
+python -m pytest tokamax/_src/ops/kda -v
 python -m tokamax.benchmarks.kda --skip_implementations=xla
 ```
 

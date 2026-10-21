@@ -24,9 +24,9 @@ import jax
 import jax.numpy as jnp
 import tokamax
 from tokamax._src import numerics
-from tokamax._src.ops.experimental.kda import api as kda_api
-from tokamax._src.ops.experimental.kda import arg_specs as kda_specs
-from tokamax._src.ops.experimental.kda import pallas_mosaic_tpu
+from tokamax._src.ops.kda import api as kda_api
+from tokamax._src.ops.kda import arg_specs as kda_specs
+from tokamax._src.ops.kda import pallas_mosaic_tpu
 from tokamax.benchmarks import common
 
 _TENSORBOARD_OUTPUT_ENV_VAR = flags.DEFINE_string(
@@ -68,6 +68,8 @@ class KdaBenchmark(parameterized.TestCase):
   @parameterized.product(
       implementation=(
           "xla",
+          "xla_chunked",
+          "mosaic",
           "mosaic_staged",
           "mosaic_fwd_fused",
           "mosaic_packed_inputs",
@@ -90,14 +92,14 @@ class KdaBenchmark(parameterized.TestCase):
           f"Skipping implementation '{implementation}' as per"
           " --skip_implementations flag."
       )
-    if jax.default_backend() != "tpu" and implementation != "xla":
+    if jax.default_backend() != "tpu" and implementation not in ("xla", "xla_chunked"):
       self.skipTest("Mosaic TPU implementation is only supported on TPU.")
 
     example = _make_example(
-        args_spec_name, "xla" if implementation == "xla" else "mosaic"
+        args_spec_name, implementation if implementation in ("xla", "xla_chunked", "mosaic") else "mosaic"
     )
     attention = kda_api.kimi_delta_attention
-    if implementation != "xla":
+    if implementation not in ("xla", "xla_chunked", "mosaic"):
       example.pop("implementation")
       attention = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention(
           config=pallas_mosaic_tpu.Config(

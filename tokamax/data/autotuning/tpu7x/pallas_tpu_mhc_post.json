@@ -1,0 +1,47 @@
+{
+  "{\"x\":\"bf16[16,7168]\",\"residual\":\"bf16[16,28672]\",\"post_layer_mix\":\"f32[16,4]\",\"comb_res_mix\":\"f32[16,4,4]\",\"return_residuals\":false}": {
+    "{\"token_block_size\":64}": {
+      "compile_time_ms": 218.5493410215713,
+      "lower_time_ms": 37.7214050386101,
+      "evaluation_times_ms": [
+        0.005,
+        0.005,
+        0.005,
+        0.005,
+        0.005
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2.091008
+    }
+  },
+  "{\"x\":\"bf16[512,7168]\",\"residual\":\"bf16[512,28672]\",\"post_layer_mix\":\"f32[512,4]\",\"comb_res_mix\":\"f32[512,4,4]\",\"return_residuals\":false}": {
+    "{\"token_block_size\":32}": {
+      "compile_time_ms": 393.40559899574146,
+      "lower_time_ms": 42.42959601106122,
+      "evaluation_times_ms": [
+        0.042,
+        0.043,
+        0.043,
+        0.043,
+        0.043
+      ],
+      "metadata": {},
+      "peak_memory_mb": 66.625536
+    }
+  },
+  "{\"x\":\"bf16[8192,7168]\",\"residual\":\"bf16[8192,28672]\",\"post_layer_mix\":\"f32[8192,4]\",\"comb_res_mix\":\"f32[8192,4,4]\",\"return_residuals\":false}": {
+    "{\"token_block_size\":64}": {
+      "compile_time_ms": 807.7723970054649,
+      "lower_time_ms": 28.990506019908935,
+      "evaluation_times_ms": [
+        0.572,
+        0.572,
+        0.573,
+        0.573,
+        0.573
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1066.008576
+    }
+  }
+}

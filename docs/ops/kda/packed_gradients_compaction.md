@@ -30,7 +30,7 @@ calls verify fallback dispatch. Shared compactor tests cover poisoned tails,
 empty batches and memory/shape fallbacks.
 
 ```bash
-python -m pytest tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_packed_gradients_test.py -v
+python -m pytest tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_gradients_test.py -v
 ```
 
 The benchmark's `mosaic_packed_gradients` differs from `mosaic_packed_backward`

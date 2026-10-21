@@ -17,19 +17,21 @@ toc:
   path: /tokamax
 - title: Developer Guide
   section:
-  - title: Supported Ops and Hardware
+  - title: Supported Operators
     path: /tokamax/supported_ops
   - title: Autotuning
     path: /tokamax/autotuning
-  - title: Benchmarking and Numerics
+  - title: Benchmarking
     path: /tokamax/benchmarking
+  - title: PyTorch TPU API
+    path: /tokamax/pytorch
+  - title: Library Design
+    path: /tokamax/library_design
   - title: Contributing
     path: /tokamax/contributing
-- title: Demo Notebook
+  - title: Code Style
+    path: /tokamax/code_style
+- title: Demo Notebooks
   section:
-  - title: Tokamax Demo
-    path: /tokamax/tokamax_demo
-- title: Op-specific Documentation
-  section:
-  - title: Splash Attention
-    path: /tokamax/splash_attention
+  - title: Tokamax Demos
+    path: /tokamax/tokamax_demos

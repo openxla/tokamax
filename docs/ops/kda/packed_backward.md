@@ -52,7 +52,7 @@ batches, no initial/final state, preactivated gates and K/V=256. Dispatch tests
 retain fixed-length, disabled-fusion and staged-rematerialization fallbacks.
 
 ```bash
-python -m pytest tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_packed_bwd_test.py -v
+python -m pytest tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_bwd_test.py -v
 python -m tokamax.benchmarks.kda --skip_implementations=xla,mosaic_staged,mosaic_fwd_fused,mosaic_fused,mosaic_packed_inputs,mosaic_remat,mosaic_remat_fused
 ```
 

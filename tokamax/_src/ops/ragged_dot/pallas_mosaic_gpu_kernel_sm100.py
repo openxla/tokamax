@@ -103,72 +103,71 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
       @pl.when(actual_size > 0)
       def compute():
-        @pl.when(wg == _COMPUTE_WG)
-        def compute_wg():
-          @plgpu.warp_map
-          def per_warp(warp_id):
-            cluster_axis = "cluster" if collective else None
 
-            @pl.when(warp_id == _TMA_WARP)
-            def tma_warp():
+        @mgpu_lib.warp_map_when(wg == _COMPUTE_WG)
+        def compute_wg_warp(warp_id):
+          cluster_axis = "cluster" if collective else None
 
-              @pl.loop(0, k_iters)
-              def tma_loop(ki):
-                ks = pl.ds(ki * block_k, block_k)
-                step = carry * k_iters + ki
-                si = lax.rem(step, num_stages)
+          @pl.when(warp_id == _TMA_WARP)
+          def tma_warp():
 
-                @pl.when(step >= num_stages)
-                def _():
-                  plgpu.barrier_wait(xw_consumed_barrier.at[si])
+            @pl.loop(0, k_iters)
+            def tma_loop(ki):
+              ks = pl.ds(ki * block_k, block_k)
+              step = carry * k_iters + ki
+              si = lax.rem(step, num_stages)
 
-                plgpu.copy_gmem_to_smem(
-                    x_gmem.at[ms, ks],
-                    x_smem.at[si],
-                    xw_barrier.at[si],
-                    leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
-                    if collective
-                    else None,
-                    collective_axes=cluster_axis,
-                )
-                plgpu.copy_gmem_to_smem(
-                    w_gmem.at[group_id, ns, ks],
-                    w_smem.at[si],
-                    xw_barrier.at[si],
-                    leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
-                    if collective
-                    else None,
-                    collective_axes=cluster_axis,
-                )
-
-            @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
-            def mma_warp():
-              si_acc = lax.rem(carry, jnp.int32(2))
-              ms_acc = pl.ds(si_acc * cluster_block_m, cluster_block_m)
-
-              @pl.when(carry > 1)
+              @pl.when(step >= num_stages)
               def _():
-                with jax.named_scope("wait for store"):
-                  plgpu.barrier_wait(acc_consumed_barrier.at[si_acc])
+                plgpu.barrier_wait(xw_consumed_barrier.at[si])
 
-              @pl.loop(0, k_iters)
-              def mma_loop_body(ki):
-                si_tma = lax.rem(carry * k_iters + ki, num_stages)
-                with jax.named_scope("wait for xw"):
-                  plgpu.barrier_wait(xw_barrier.at[si_tma])
-                with jax.named_scope("issuing mma"):
-                  plgpu.tcgen05_mma(
-                      acc_tmem.at[:, ms_acc],
-                      w_smem.at[si_tma],
-                      x_smem.at[si_tma].T,
-                      xw_consumed_barrier.at[si_tma],
-                      accumulate=(ki > 0),
-                      collective_axis=cluster_axis,
-                  )
-
-              plgpu.tcgen05_commit_arrive(
-                  acc_barrier.at[si_acc], collective_axis=cluster_axis
+              plgpu.copy_gmem_to_smem(
+                  x_gmem.at[ms, ks],
+                  x_smem.at[si],
+                  xw_barrier.at[si],
+                  leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+                  if collective
+                  else None,
+                  collective_axes=cluster_axis,
               )
+              plgpu.copy_gmem_to_smem(
+                  w_gmem.at[group_id, ns, ks],
+                  w_smem.at[si],
+                  xw_barrier.at[si],
+                  leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+                  if collective
+                  else None,
+                  collective_axes=cluster_axis,
+              )
+
+          @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
+          def mma_warp():
+            si_acc = lax.rem(carry, jnp.int32(2))
+            ms_acc = pl.ds(si_acc * cluster_block_m, cluster_block_m)
+
+            @pl.when(carry > 1)
+            def _():
+              with jax.named_scope("wait for store"):
+                plgpu.barrier_wait(acc_consumed_barrier.at[si_acc])
+
+            @pl.loop(0, k_iters)
+            def mma_loop_body(ki):
+              si_tma = lax.rem(carry * k_iters + ki, num_stages)
+              with jax.named_scope("wait for xw"):
+                plgpu.barrier_wait(xw_barrier.at[si_tma])
+              with jax.named_scope("issuing mma"):
+                plgpu.tcgen05_mma(
+                    acc_tmem.at[:, ms_acc],
+                    w_smem.at[si_tma],
+                    x_smem.at[si_tma].T,
+                    xw_consumed_barrier.at[si_tma],
+                    accumulate=(ki > 0),
+                    collective_axis=cluster_axis,
+                )
+
+            plgpu.tcgen05_commit_arrive(
+                acc_barrier.at[si_acc], collective_axis=cluster_axis
+            )
 
         @pl.when(wg == _EPILOGUE_WG)
         def epilogue_wg():
@@ -186,26 +185,15 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
             plgpu.commit_smem()
 
           with jax.named_scope("smem -> gmem"):
-            # Write out the largest power of two rows first,
-            # then the next largest, etc.
-            # This allows us to coalesce writes as much as possible.
-            offset = start_within_block
-            size = 1 << (min(cluster_block_m, m).bit_length() - 1)
-            while size > 0:
-              ns = pl.ds(ni * cluster_block_n + cluster_idx * block_n, block_n)
-
-              @pl.when(actual_size & size != 0)
-              def _():
-                ms = pl.ds(block_start + offset, size)
-                out_smem_slice = acc_smem.at[pl.ds(offset, size)]
-                plgpu.copy_smem_to_gmem(
-                    out_smem_slice, out_gmem.at[ms, ns], commit_group=False
-                )
-
-              offset += actual_size & size
-              size //= 2
-            plgpu.commit_smem_to_gmem_group()
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            common.copy_ragged_smem_to_gmem(
+                acc_smem,
+                out_gmem,
+                block_start=block_start,
+                start_within_block=start_within_block,
+                actual_size=actual_size,
+                ns=pl.ds(ni * cluster_block_n + cluster_idx * block_n, block_n),
+                max_rows=min(cluster_block_m, m),
+            )
 
       return carry + (actual_size > 0)
 
@@ -218,14 +206,15 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
         num_barriers=2, orders_tensor_core=True
     )
 
-  tiled_smem = mgpu_lib.tiled_swizzled_smem
+  x_smem_shape = (num_stages, block_m, block_k)
+  w_smem_shape = (num_stages, block_n, block_k)
   scratch_shapes = dict(
-      x_smem=tiled_smem((num_stages, block_m, block_k), lhs.dtype, "x"),
-      w_smem=tiled_smem((num_stages, block_n, block_k), rhs.dtype, "w"),
+      x_smem=common.tiled_swizzled_smem(x_smem_shape, lhs.dtype, "x"),
+      w_smem=common.tiled_swizzled_smem(w_smem_shape, rhs.dtype, "w"),
       acc_tmem=plgpu.TMEM(
           (block_n, cluster_block_m * 2), jnp.float32, collective=collective
       ),
-      acc_smem=tiled_smem(
+      acc_smem=common.tiled_swizzled_smem(
           (cluster_block_m, block_n), out_dtype, "acc", tiling_prefix=(1,)
       ),
       xw_barrier=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),

@@ -32,9 +32,9 @@ _IMPLEMENTATIONS = dict(xla=base.RaggedDot())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.ragged_dot import pallas_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.ragged_dot import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  _IMPLEMENTATIONS["triton"] = pallas_triton.PallasTritonRaggedDot()
+  _IMPLEMENTATIONS["triton"] = triton.TritonRaggedDot()
   _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
@@ -90,6 +90,8 @@ def ragged_dot(
         | None
     ) = None,
     bypass_device_check: bool | None = None,
+    zero_initialize: bool = False,
+    fuse_gateup_activation: str | None = None,
 ) -> Float[Array, "M N"]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -119,6 +121,11 @@ def ragged_dot(
       that doesn't raise a `NotImplementedError` is used.
     bypass_device_check: Whether to bypass device validation. If None (default),
       bypasses device check when an implementation is explicitly passed in.
+    zero_initialize: GMM v2 feature. Whether to initialize unvisited output
+      elements to zero. Defaults to False.
+    fuse_gateup_activation: GMM v2 feature. Name of a gated activation to fuse
+      into the kernel: `activate(out[:, :n // 2]) * out[:, n // 2:]`. This is
+      different from `activation`, which is applied to the full output.
 
   Returns:
     (m, n) shaped array with `preferred_element_type` element type.
@@ -135,6 +142,8 @@ def ragged_dot(
       manual_axis_type=manual_axis_type,
       implementation=implementation,
       bypass_device_check=bypass_device_check,
+      zero_initialize=zero_initialize,
+      fuse_gateup_activation=fuse_gateup_activation,
   )
 
 
@@ -155,6 +164,8 @@ def ragged_dot_general(
         | None
     ) = None,
     bypass_device_check: bool | None = None,
+    zero_initialize: bool = False,
+    fuse_gateup_activation: str | None = None,
 ) -> Float[Array, "..."]:  # pylint: disable=g-doc-args
   """Ragged matrix multiplication.
 
@@ -184,13 +195,15 @@ def ragged_dot_general(
     bypass_device_check: Whether to bypass device validation on the op. If None
       (default), bypasses device check when an implementation is explicitly
       passed in (manual implementation).
+    zero_initialize: GMM v2 feature. Whether to initialize unvisited output
+      elements to zero. Defaults to False.
+    fuse_gateup_activation: GMM v2 feature. Name of a gated activation to fuse
+      into the kernel: `activate(out[:, :n // 2]) * out[:, n // 2:]`. This is
+      different from `activation`, which is applied to the full output.
 
   Returns:
     An array with `preferred_element_type` element type.
   """
-  if group_offset is not None:
-    raise NotImplementedError("`group_offset` is not yet supported.")
-
   if bypass_device_check is None:
     # Auto-selection and fallback sequences enforce device checks;
     # a single explicit implementation bypasses them for CPU export.
@@ -234,11 +247,18 @@ def ragged_dot_general(
       impl = IMPLEMENTATIONS[impl]
 
     try:
-      # We only pass manual_axis_type if it is explicitly set, since older
-      # implementations might not support this argument yet.
+      # We only pass the optional arguments below if they are explicitly set
+      # (i.e. non-default), since older implementations or custom callables
+      # might not support them.
       kwargs = {}
       if manual_axis_type is not None:
         kwargs["manual_axis_type"] = manual_axis_type
+      if group_offset is not None:
+        kwargs["group_offset"] = group_offset
+      if zero_initialize:
+        kwargs["zero_initialize"] = zero_initialize
+      if fuse_gateup_activation is not None:
+        kwargs["fuse_gateup_activation"] = fuse_gateup_activation
       if bypass_device_check and isinstance(impl, base.op.Op):
         impl = impl.replace(bypass_device_check=True)
 

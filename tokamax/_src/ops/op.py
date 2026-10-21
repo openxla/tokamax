@@ -22,6 +22,7 @@ import contextvars
 import dataclasses
 import functools
 import inspect
+import re
 from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final, overload
 
 from absl import logging
@@ -52,6 +53,7 @@ class NullConfig:
 
 
 _NULL_CONFIG: Final[NullConfig] = NullConfig()
+_CAMEL_TO_SNAKE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?!^)([A-Z])")
 
 
 @jax.tree_util.register_dataclass
@@ -410,6 +412,12 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     return True
 
 
+def snake_case_name(op: type[Op] | Op) -> str:  # pylint: disable=g-bare-generic
+  """Returns the snake_case name of the op implementation."""
+  cls = op if isinstance(op, type) else type(op)
+  return _CAMEL_TO_SNAKE_PATTERN.sub(r"_\1", cls.__name__).lower()
+
+
 type AutotuningCache = dict[DeviceKind, dict[Any, AutotuningData[Any]]]
 
 _AUTOTUNING_CACHE: dict[Op, AutotuningCache] = {}  # pylint: disable=g-bare-generic
@@ -548,7 +556,7 @@ class BoundArguments[C, K: Hashable]:
         return data
 
     try:
-      return self.op.get_autotuning_cache()[key]
+      return self.op.get_autotuning_cache(device_kind)[key]
     except KeyError:
       key = cast(Mapping[str, Any], key)
       json_key_bytes = _get_arg_spec_adapter(self.op).dump_json(dict(key))
@@ -670,7 +678,7 @@ class _AlwaysEqual:
 @functools.lru_cache
 def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
   spec = pydantic_lib.get_arg_spec_model(f"{type(op).__name__}Spec", op._fwd_signature)  # pylint: disable=protected-access
-  return pydantic_lib.get_adapter(spec)
+  return pydantic_lib.get_adapter(spec)  # pyrefly: ignore[bad-return]
 
 
 BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(BoundArguments)
@@ -692,6 +700,10 @@ def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
   """Infers the device kind from bound array arguments."""
   device_kinds = {d.device_kind for d in infer_devices(ba)}
   if not device_kinds:
+    # Fall back to active abstract mesh during export or cross-compilation.
+    abstract_mesh = jax.sharding.get_abstract_mesh()
+    if abstract_mesh.abstract_device is not None:
+      return abstract_mesh.abstract_device.device_kind
     return None
   if len(device_kinds) == 1:
     return device_kinds.pop()

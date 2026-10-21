@@ -116,7 +116,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
       )
 
       lse_b__ = jnp.logaddexp(
-          lse_b_, jax.nn.logsumexp(logits_bv.astype(dtype), axis=-1)
+          lse_b_, jax.nn.logsumexp(logits_bv.astype(jnp.float32), axis=-1)
       )
       # If labels_b - v_start < 0 or labels_b - v_start >= v_block_sz, then
       # one_hot will be all zeros.
@@ -133,7 +133,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
         num_v_blocks,
         v_loop_body,
         (
-            jnp.full((b_block_sz,), -jnp.inf, dtype=dtype),
+            jnp.full((b_block_sz,), -jnp.inf, dtype=jnp.float32),
             jnp.zeros((b_block_sz,), dtype=dtype),
         ),
         unroll=unroll_factor,
@@ -147,10 +147,12 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
 
     lse_all = jax.lax.dynamic_update_slice(lse_all, lse_b, (b_start,))
     if reduction == "none":
-      loss_b = b_loss_sum_neg_logits + lse_b_masked
+      loss_b = b_loss_sum_neg_logits + lse_b_masked.astype(dtype)
       loss_acc = jax.lax.dynamic_update_slice(loss_acc, loss_b, (b_start,))
     else:
-      loss_acc += jnp.sum(b_loss_sum_neg_logits) + jnp.sum(lse_b_masked)
+      loss_acc += jnp.sum(b_loss_sum_neg_logits) + jnp.sum(
+          lse_b_masked.astype(dtype)
+      )
     return lse_all, loss_acc
 
   if reduction == "none":
@@ -162,7 +164,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
       0,
       num_b_blocks,
       b_loop_body,
-      (jnp.zeros(b_dim_padded, dtype=dtype), init_loss),
+      (jnp.zeros(b_dim_padded, dtype=jnp.float32), init_loss),
   )
 
   lse_all = lse_all[:b_dim]
@@ -265,9 +267,11 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
       labels_one_hot_bv = jax.nn.one_hot(
           labels_b - v_start, v_block_sz, dtype=dtype
       )
-      s_bv = jnp.exp(logits_bv - lse_b[:, None]) - labels_one_hot_bv
+      s_bv = (jnp.exp(logits_bv - lse_b[:, None]) - labels_one_hot_bv).astype(
+          logits_bv.dtype
+      )
       if reduction == "none":
-        s_bv = s_bv * dout_b[:, None]
+        s_bv = (s_bv * dout_b[:, None]).astype(logits_bv.dtype)
 
       dx_b += jnp.dot(
           s_bv, w_v.T, preferred_element_type=preferred_element_type

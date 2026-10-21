@@ -1,7 +1,7 @@
 name: Publish to PyPI
 
 on:
-  # Event manually triggered (in the Github UI)
+  # Manually triggered (in the GitHub UI) for numbered releases.
   workflow_dispatch:
   # Nightly wheels: publish automatically once the nightly tests pass.
   # `types: [completed]` fires on any finish, so the job `if:` below filters
@@ -20,16 +20,33 @@ on:
 # See https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments
 # and https://blog.pypi.org/posts/2023-04-20-introducing-trusted-publishers for more details.
 jobs:
+  tests:
+    if: github.event_name == 'workflow_dispatch' # only for numbered releases
+    uses: ./.github/workflows/ci-nightly.yml # run CI-Nightly's jobs here
+    permissions:
+      contents: read
+
   pypi-publish:
-    # On a manual run `github.event.workflow_run` does not exist.
+    needs: tests
+    # On a manual run `github.event.workflow_run` does not exist. Nightly tests must all pass before
+    # you can release.
     # `workflow_run.head_repository.full_name == github.repository`
     # ensures this job does not run on a CI-Nightly run whose head commit
     # came from a fork.
+    # `!cancelled()` is needed because: when a job has `needs:`, GitHub quietly adds
+    # `success()` to its `if:`. That means the job runs only if every job it
+    # needs succeeded. On a nightly run, `tests` is skipped because the successful nightly tests
+    # triggered this workflow, and a skipped job
+    # doesn't count as a success. So without `!cancelled()`, `pypi-publish` would
+    # also be skipped on nightly runs, and nightly publishing would stop.
+    # If the `if:` contains a status function such as `!cancelled()`,
+    # GitHub doesn't add that hidden `success()`. So the nightly release is not impacted.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      !cancelled() && (
+      (github.event_name == 'workflow_dispatch' && needs.tests.result == 'success') ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'main' &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
+       github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # release-nightly environment and release environment use different
@@ -46,10 +63,12 @@ jobs:
     - name: Checkout Tokamax
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
-        # Pin to the commit CI-Nightly tested. Without this a workflow_run job
+        # For nightly releases, pin to the commit CI-Nightly tested. Without this a workflow_run job
         # checks out the default branch's current HEAD, which may have moved
         # since that run started. Empty on manual dispatch, so it falls back.
-        ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+        # For numbered releases, use `github.sha` (commit ID) to publish the
+        # commit that we tested instead of `github.ref` (branch name).
+        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
         persist-credentials: false
 
     - name: Install Python 3.12
@@ -80,3 +99,5 @@ jobs:
 
     - name: Publish package distributions to PyPI
       uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
+      with:
+        verbose: true

@@ -27,6 +27,7 @@ from jaxlib.mlir.dialects import arith
 from jaxlib.mlir.dialects import memref
 import qwix
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_gpu as mgpu_lib
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
@@ -124,28 +125,12 @@ def ragged_dot_gpu_quant_blackwell_kernel(
         f"Expected block_m ({block_m}) to be divisible by split_m ({split_m})"
     )
 
-  try:
-    swizzle = plgpu.find_swizzle(block_k * jnp.dtype(x.dtype).itemsize * 8)
-  except ValueError as e:
-    raise NotImplementedError("No possible swizzle.") from e
-
-  swizzle_elems = swizzle // jnp.dtype(x.dtype).itemsize
-
-  try:
-    transforms = (
-        plgpu.TilingTransform((8, swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle),
-    )
-  except ValueError as e:
-    raise NotImplementedError(
-        f"{swizzle=} {swizzle_elems=} unsupported."
-    ) from e
-
-  w_elem_bits = 4
-  w_swizzle = plgpu.find_swizzle(block_k * w_elem_bits)  # n,k
-  w_swizzle_elems = (w_swizzle * 8) // w_elem_bits
   # num_stages must be less than or equal to the number of blocks
   num_stages = min(num_stages, k_w // block_k)
+  x_smem_shape = (num_stages, tile_m, block_k)
+  w_smem_shape = (num_stages, tile_n, block_k)
+  x_smem = common.tiled_swizzled_smem(x_smem_shape, x.dtype, "x")
+  w_smem = common.tiled_swizzled_smem(w_smem_shape, w.dtype, "w")
 
   align_tile = 8
   group_info = common.GroupInfo.create_aligned(
@@ -209,110 +194,109 @@ def ragged_dot_gpu_quant_blackwell_kernel(
 
       @pl.when(actual_size > 0)
       def _body():
-        @pl.when(wg == _MAIN_WG)
-        def _():
-          @plgpu.warp_map
-          def _per_warp(warp_id):
 
-            @pl.when(warp_id == _W_TMA_WARP)
-            def w_tma_warp():
-              def do_tma_w(ki, slot):
-                plgpu.copy_gmem_to_smem(  # e,n,k
-                    w_gmem.at[
-                        group_id,
-                        slice_n,
-                        pl.ds(ki * block_k, block_k),
-                    ],
-                    w_smem.at[slot],
-                    w_tma_barrier.at[slot],
-                )
-                plgpu.copy_gmem_to_smem(  # e,k//t,n
-                    w_scales_gmem.at[
-                        group_id,
-                        lax.div((ki * block_k), tile_k),
-                        slice_n,
-                    ],
-                    w_scales_smem.at[slot],
-                    w_tma_barrier.at[slot],
-                )
+        @mgpu_lib.warp_map_when(wg == _MAIN_WG)
+        def _main_wg_warp(warp_id):
 
-              def _iter_w(ki, _):
-                slot = lax.rem(ki, num_stages)
+          @pl.when(warp_id == _W_TMA_WARP)
+          def w_tma_warp():
+            def do_tma_w(ki, slot):
+              plgpu.copy_gmem_to_smem(  # e,n,k
+                  w_gmem.at[
+                      group_id,
+                      slice_n,
+                      pl.ds(ki * block_k, block_k),
+                  ],
+                  w_smem.at[slot],
+                  w_tma_barrier.at[slot],
+              )
+              plgpu.copy_gmem_to_smem(  # e,k//t,n
+                  w_scales_gmem.at[
+                      group_id,
+                      lax.div((ki * block_k), tile_k),
+                      slice_n,
+                  ],
+                  w_scales_smem.at[slot],
+                  w_tma_barrier.at[slot],
+              )
 
-                @pl.when((ki >= num_stages) | (carry > 0))
-                def _():
-                  plgpu.barrier_wait(w_tma_consumed_barrier.at[slot])
+            def _iter_w(ki, _):
+              slot = lax.rem(ki, num_stages)
 
-                do_tma_w(ki, slot)
-
-              lax.fori_loop(0, num_k_iters, _iter_w, None)
-
-            @pl.when(warp_id == _X_TMA_WARP)
-            def x_tma_warp():
-              def do_tma_x(ki, slot):
-                plgpu.copy_gmem_to_smem(  # m,k
-                    x_gmem.at[
-                        slice_m,
-                        pl.ds(ki * block_k, block_k),
-                    ],
-                    x_smem.at[slot],
-                    x_tma_barrier.at[slot],
-                    leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
-                    if collective
-                    else None,
-                    collective_axes="x" if collective else None,
-                )
-
-              def _iter_x(ki, _):
-                slot = lax.rem(ki, num_stages)
-
-                @pl.when((ki >= num_stages) | (carry > 0))
-                def _():
-                  # Wait for the previous mma to complete.
-                  plgpu.barrier_wait(x_consumed_tcgen05_barrier.at[slot])
-
-                do_tma_x(ki, slot)
-
-              lax.fori_loop(0, num_k_iters, _iter_x, None)
-
-            @pl.when((warp_id == _MMA_WARP) & is_lead_block)
-            def mma_warp():
-              def do_mma(ki, _):
-                slot = lax.rem(ki, num_stages)
-                is_last_iter = ki >= num_k_iters - 1
-
-                with jax.named_scope("wait_wbf16"):
-                  plgpu.barrier_wait(w_bf16_barrier.at[slot])
-                with jax.named_scope("wait_x"):
-                  plgpu.barrier_wait(x_tma_barrier.at[slot])
-                with jax.named_scope("issuing mma"):
-                  plgpu.tcgen05_mma(
-                      acc_tmem,
-                      w_bf16_tmem.at[:, pl.ds(slot * block_k, block_k)],
-                      x_smem.at[slot].T,
-                      x_consumed_tcgen05_barrier.at[slot],
-                      accumulate=(ki > 0),
-                      collective_axis="x" if collective else None,
-                  )
-                  plgpu.tcgen05_commit_arrive(
-                      w_consumed_tcgen05_barrier.at[slot],
-                      collective_axis="x" if collective else None,
-                  )
-
-                  @pl.when(is_last_iter)
-                  def _():
-                    plgpu.tcgen05_commit_arrive(
-                        mma_done_barrier,
-                        collective_axis="x" if collective else None,
-                    )
-
-              @pl.when(carry > 0)
+              @pl.when((ki >= num_stages) | (carry > 0))
               def _():
-                # wait for the previous mma to complete
-                # to ensure the acc_tmem is consumed.
-                plgpu.barrier_wait(acc_consumed_barrier)
+                plgpu.barrier_wait(w_tma_consumed_barrier.at[slot])
 
-              lax.fori_loop(0, num_k_iters, do_mma, None)
+              do_tma_w(ki, slot)
+
+            lax.fori_loop(0, num_k_iters, _iter_w, None)
+
+          @pl.when(warp_id == _X_TMA_WARP)
+          def x_tma_warp():
+            def do_tma_x(ki, slot):
+              plgpu.copy_gmem_to_smem(  # m,k
+                  x_gmem.at[
+                      slice_m,
+                      pl.ds(ki * block_k, block_k),
+                  ],
+                  x_smem.at[slot],
+                  x_tma_barrier.at[slot],
+                  leader_tracked=plgpu.CopyPartition.PARTITIONED(0)
+                  if collective
+                  else None,
+                  collective_axes="x" if collective else None,
+              )
+
+            def _iter_x(ki, _):
+              slot = lax.rem(ki, num_stages)
+
+              @pl.when((ki >= num_stages) | (carry > 0))
+              def _():
+                # Wait for the previous mma to complete.
+                plgpu.barrier_wait(x_consumed_tcgen05_barrier.at[slot])
+
+              do_tma_x(ki, slot)
+
+            lax.fori_loop(0, num_k_iters, _iter_x, None)
+
+          @pl.when((warp_id == _MMA_WARP) & is_lead_block)
+          def mma_warp():
+            def do_mma(ki, _):
+              slot = lax.rem(ki, num_stages)
+              is_last_iter = ki >= num_k_iters - 1
+
+              with jax.named_scope("wait_wbf16"):
+                plgpu.barrier_wait(w_bf16_barrier.at[slot])
+              with jax.named_scope("wait_x"):
+                plgpu.barrier_wait(x_tma_barrier.at[slot])
+              with jax.named_scope("issuing mma"):
+                plgpu.tcgen05_mma(
+                    acc_tmem,
+                    w_bf16_tmem.at[:, pl.ds(slot * block_k, block_k)],
+                    x_smem.at[slot].T,
+                    x_consumed_tcgen05_barrier.at[slot],
+                    accumulate=(ki > 0),
+                    collective_axis="x" if collective else None,
+                )
+                plgpu.tcgen05_commit_arrive(
+                    w_consumed_tcgen05_barrier.at[slot],
+                    collective_axis="x" if collective else None,
+                )
+
+                @pl.when(is_last_iter)
+                def _():
+                  plgpu.tcgen05_commit_arrive(
+                      mma_done_barrier,
+                      collective_axis="x" if collective else None,
+                  )
+
+            @pl.when(carry > 0)
+            def _():
+              # wait for the previous mma to complete
+              # to ensure the acc_tmem is consumed.
+              plgpu.barrier_wait(acc_consumed_barrier)
+
+            lax.fori_loop(0, num_k_iters, do_mma, None)
 
         @pl.when(wg == _DEQ_WG)
         def _():
@@ -361,10 +345,8 @@ def ragged_dot_gpu_quant_blackwell_kernel(
                 acc_tmem.at[:, pl.ds(mi * split_block_m, split_block_m)]
             )
             plgpu.wait_load_tmem()
-
-            @pl.when(mi == split_m - 1)
-            def _():
-              plgpu.barrier_arrive(acc_consumed_barrier)
+            is_last_iter = mi == split_m - 1
+            plgpu.barrier_arrive(acc_consumed_barrier, predicate=is_last_iter)
 
             # Apply activation function to the output in dtype of acc if
             # provided.
@@ -380,13 +362,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           with jax.named_scope("T->S"):
             lax.fori_loop(0, split_m, tmem_to_smem_loop_body, None)
 
-          # Write out the largest power of two rows first,
-          # then the next largest, etc.
-          # This allows us to coalesce writes as much as possible.
           def store_loop_body(index, _):
-            # Write out the largest power of two rows first,
-            # then the next largest, etc.
-            # This allows us to coalesce writes as much as possible.
             global_start = lax.max(start_within_block, index * split_block_m)
             global_end = lax.min(
                 start_within_block + actual_size,
@@ -395,29 +371,15 @@ def ragged_dot_gpu_quant_blackwell_kernel(
 
             @pl.when(global_end > global_start)
             def _():
-              length = global_end - global_start
-              local_start = global_start - index * split_block_m
-              offset = 0
-              size = 1 << (min(split_block_m, m).bit_length() - 1)
-              while size > 0:
-
-                @pl.when(length & size != 0)
-                def _():
-                  acc_smem_slice = out_smem.at[
-                      index, pl.ds(local_start + offset, size)
-                  ]
-                  o_gref_slice = out_gmem.at[
-                      pl.ds(block_start + global_start + offset, size),
-                      pl.ds(ni * block_n + cluster_idx * tile_n, tile_n),
-                  ]
-                  plgpu.copy_smem_to_gmem(
-                      acc_smem_slice, o_gref_slice, commit_group=False
-                  )
-
-                offset += length & size
-                size //= 2
-              plgpu.commit_smem_to_gmem_group()
-              plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+              common.copy_ragged_smem_to_gmem(
+                  out_smem.at[index],
+                  out_gmem,
+                  block_start=block_start + index * split_block_m,
+                  start_within_block=global_start - index * split_block_m,
+                  actual_size=global_end - global_start,
+                  ns=pl.ds(ni * block_n + cluster_idx * tile_n, tile_n),
+                  max_rows=min(split_block_m, m),
+              )
 
           with jax.named_scope("S->G"):
             lax.fori_loop(0, split_m, store_loop_body, None)
@@ -425,29 +387,9 @@ def ragged_dot_gpu_quant_blackwell_kernel(
       return carry + (actual_size > 0)
 
   def kernel_entry(*refs):
-    x_smem = plgpu.SMEM(
-        (num_stages, tile_m, block_k),
-        dtype=x.dtype,
-        transforms=transforms,
-    )
-    out_smem = plgpu.SMEM(
-        (split_m, block_m // split_m, tile_n),
-        dtype=out_dtype,
-        # workaround for ValueError: Dynamic slice base index (which is a
-        # dynamic value) cannot be statically proven to be divisible by
-        # the tiling (8)
-        transforms=(
-            plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
-            plgpu.SwizzleTransform(128),
-        ),
-    )
-    w_smem = plgpu.SMEM(
-        (num_stages, tile_n, block_k),
-        dtype=w.dtype,
-        transforms=(
-            plgpu.TilingTransform((8, w_swizzle_elems)),
-            plgpu.SwizzleTransform(w_swizzle),
-        ),
+    out_smem_shape = (split_m, block_m // split_m, tile_n)
+    out_smem = common.tiled_swizzled_smem(
+        out_smem_shape, out_dtype, "out", swizzle=128, tiling_prefix=(1,)
     )
     w_bf16_tmem = plgpu.TMEM(
         (tile_n, num_stages * block_k),

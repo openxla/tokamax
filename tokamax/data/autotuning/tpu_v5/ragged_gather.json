@@ -1,0 +1,122 @@
+{
+  "{\"x\":\"bf16[8192,4096]\",\"indices\":\"i32[81920]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 3082.1021600022505,
+      "lower_time_ms": 10.042549998615868,
+      "evaluation_times_ms": [
+        1.197,
+        1.182,
+        1.16,
+        1.153,
+        1.185
+      ],
+      "metadata": {},
+      "peak_memory_mb": 738.853888
+    }
+  },
+  "{\"x\":\"bf16[8192,4096]\",\"indices\":\"i32[81920]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 3096.8288570293225,
+      "lower_time_ms": 10.252760024741292,
+      "evaluation_times_ms": [
+        1.225,
+        1.179,
+        1.234,
+        1.243,
+        1.212
+      ],
+      "metadata": {},
+      "peak_memory_mb": 738.853888
+    }
+  },
+  "{\"x\":\"bf16[512,512]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 64.26152099811588,
+      "lower_time_ms": 10.20473699827562,
+      "evaluation_times_ms": [
+        0.004,
+        0.004,
+        0.004,
+        0.004,
+        0.004
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2.106368
+    }
+  },
+  "{\"x\":\"bf16[512,512]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 64.31036500725895,
+      "lower_time_ms": 10.508753010071814,
+      "evaluation_times_ms": [
+        0.004,
+        0.004,
+        0.004,
+        0.004,
+        0.004
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2.106368
+    }
+  },
+  "{\"x\":\"bf16[512,8192]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 207.60628499556333,
+      "lower_time_ms": 9.883450984489173,
+      "evaluation_times_ms": [
+        0.01,
+        0.01,
+        0.011,
+        0.011,
+        0.011
+      ],
+      "metadata": {},
+      "peak_memory_mb": 33.563648
+    }
+  },
+  "{\"x\":\"bf16[1024,8192]\",\"indices\":\"i32[2048]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 1387.0207099826075,
+      "lower_time_ms": 9.99368098564446,
+      "evaluation_times_ms": [
+        0.079,
+        0.075,
+        0.077,
+        0.077,
+        0.08
+      ],
+      "metadata": {},
+      "peak_memory_mb": 50.349056
+    }
+  },
+  "{\"x\":\"bf16[2048,8192]\",\"indices\":\"i32[4096]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 3117.4150579972775,
+      "lower_time_ms": 10.191515997576062,
+      "evaluation_times_ms": [
+        0.193,
+        0.183,
+        0.193,
+        0.2,
+        0.187
+      ],
+      "metadata": {},
+      "peak_memory_mb": 100.697088
+    }
+  },
+  "{\"x\":\"bf16[2048,8192]\",\"indices\":\"i32[4096]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 3111.425852999673,
+      "lower_time_ms": 10.04756499605719,
+      "evaluation_times_ms": [
+        0.186,
+        0.169,
+        0.183,
+        0.182,
+        0.17
+      ],
+      "metadata": {},
+      "peak_memory_mb": 100.697088
+    }
+  }
+}
