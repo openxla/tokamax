@@ -31,7 +31,7 @@ def test_packed_forward(dtype):
   results = []
   for packed in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(packed_forward=packed)
+        config=mosaic.Config(fuse_forward=True, packed_forward=packed)
     )
     call = functools.partial(forward_tests._call, op, kwargs)
     results.append(jax.jit(call)(*args))
@@ -65,7 +65,7 @@ def test_all_window_offsets_without_initial_state(raw_gate):
   outputs = []
   for packed in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(packed_forward=packed)
+        config=mosaic.Config(fuse_forward=True, packed_forward=packed)
     )
     outputs.append(
         jax.jit(functools.partial(forward_tests._call, op, kwargs))(*args)
@@ -84,7 +84,7 @@ def test_fixed_length_falls_back(monkeypatch):
   )
   args, kwargs = forward_tests._inputs(jnp.float32, False)
   op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-      config=mosaic.Config(packed_forward=True)
+      config=mosaic.Config(fuse_forward=True, packed_forward=True)
   )
   actual = forward_tests._call(op, kwargs, *args)
   expected = forward_tests._call(
@@ -110,7 +110,7 @@ def test_multiple_head_groups_and_empty_batch(monkeypatch):
   outputs = []
   for packed in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(packed_forward=packed)
+        config=mosaic.Config(fuse_forward=True, packed_forward=packed)
     )
     outputs.append(
         jax.jit(functools.partial(forward_tests._call, op, kwargs))(*args)
