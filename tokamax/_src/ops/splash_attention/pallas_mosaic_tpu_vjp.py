@@ -128,7 +128,9 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
       elif mask.bool_mask is not None:
         splash_mask = mask.bool_mask
       elif mask.is_causal:
-        splash_mask = mask_lib.CausalMask(shape=mask_shape, shard_count=1)
+        splash_mask = mask_lib.CausalMask(
+            shape=mask_shape, offset=mask.offset, shard_count=1
+        )
       else:
         splash_mask = mask_lib.FullMask(mask_shape)
     else:

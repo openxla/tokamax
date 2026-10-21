@@ -44,11 +44,26 @@ Residuals: TypeAlias = tuple[
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class Mask:
-  """An attention mask dataclass."""
+  """An attention mask dataclass.
+
+  Attributes:
+    bool_mask: An optional explicit 2D boolean mask.
+    is_causal: Whether causal masking is applied.
+    offset: Offset of q start with respect to kv. Only meaningful when
+      is_causal=True. Semantics match splash_attention_mask.CausalMask.offset
+      (q_idx + offset >= kv_idx). A positive offset allows queries to attend to
+      more key/value tokens (shifts triangle upward); a negative offset allows
+      fewer key/value tokens (shifts triangle downward).
+  """
 
   bool_mask: Bool[jax.Array, "q_seq_len kv_seq_len"] | None = None
   _: dataclasses.KW_ONLY
   is_causal: bool = dataclasses.field(default=False, metadata=dict(static=True))
+  offset: int = dataclasses.field(default=0, metadata=dict(static=True))
+
+  def __post_init__(self):
+    if self.offset != 0 and not self.is_causal:
+      raise ValueError("`offset` can only be non-zero when `is_causal=True`.")
 
   def as_array(
       self,
@@ -56,18 +71,19 @@ class Mask:
       kv_seq_len: int,
   ) -> Bool[Array, "q_seq_len kv_seq_len"]:
     """Returns the mask as a 2D boolean array."""
-
     q_idx = jnp.arange(q_seq_len)[:, None]
     kv_idx = jnp.arange(kv_seq_len)[None, :]
 
     if self.bool_mask is not None and self.is_causal:
-      return jnp.logical_and(jnp.asarray(self.bool_mask), q_idx >= kv_idx)
+      return jnp.logical_and(
+          jnp.asarray(self.bool_mask), q_idx + self.offset >= kv_idx
+      )
 
     if self.bool_mask is not None:
       return jnp.asarray(self.bool_mask)
 
     if self.is_causal:
-      return q_idx >= kv_idx
+      return q_idx + self.offset >= kv_idx
 
     return jnp.ones((q_seq_len, kv_seq_len), dtype=jnp.bool_)
 
@@ -88,7 +104,7 @@ def _canonicalize_mask(
   if isinstance(mask, (jax.Array, np.ndarray)):
     return Mask(bool_mask=mask)
   if isinstance(mask, mask_lib.CausalMask):
-    return Mask(is_causal=True)
+    return Mask(is_causal=True, offset=mask.offset)
   if isinstance(mask, mask_lib.FullMask):
     return Mask()
   if isinstance(mask, mask_lib.Mask):
