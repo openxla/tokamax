@@ -238,7 +238,7 @@ def _align_seqs(
     )
   else:
     padded_cu = aligned_cu_seqlens
-  T_new = ((T_old + N * (align - 1) + align - 1) // align) * align
+  T_new = _aligned_token_bound(T_old, N, align)
 
   def _build_gather(i, gather_idx):
     old_start = cu_seqlens[i]
@@ -250,7 +250,16 @@ def _align_seqs(
     return jnp.where(in_seg, src, gather_idx)
 
   gather_idx = jnp.full(T_new, T_old, dtype=jnp.int32)
-  gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
+  if N > 8192:
+    positions = jnp.arange(T_new, dtype=jnp.int32)
+    seq = jnp.minimum(
+        jnp.searchsorted(padded_cu[1:], positions, side="right"), N - 1
+    )
+    offset = positions - padded_cu[seq]
+    valid = (positions < padded_cu[-1]) & (offset < seg_lens[seq])
+    gather_idx = jnp.where(valid, cu_seqlens[seq] + offset, T_old)
+  else:
+    gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
 
   def repack_4d(t):
     # t: [H, B, T, K] — gather along axis 2 (T dimension)
@@ -292,6 +301,17 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
 
   # --- Single-batch path (original) ---
   N = orig_cu_seqlens.shape[0] - 1
+  if N > 8192:
+    positions = jnp.arange(T_out, dtype=jnp.int32)
+    seq = jnp.minimum(
+        jnp.searchsorted(orig_cu_seqlens[1:], positions, side="right"),
+        N - 1,
+    )
+    source = aligned_cu_seqlens[seq] + positions - orig_cu_seqlens[seq]
+    valid = positions < orig_cu_seqlens[-1]
+    values = o[:, :, jnp.where(valid, source, 0)]
+    mask = valid.reshape((1, 1, T_out) + (1,) * (o.ndim - 3))
+    return jnp.where(mask, values, 0)
   orig_seg_lens = orig_cu_seqlens[1:] - orig_cu_seqlens[:-1]
 
   def _build_gather(i, gather_idx):
@@ -311,6 +331,24 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
   gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
   return o[:, :, gather_idx]
 
+
+
+def _bounded_chunk_boundaries(boundaries, mapping):
+  """Flatten large per-chunk boundary windows to avoid narrow-tile padding."""
+  if boundaries.size <= 8193:
+    return boundaries.astype(jnp.int32)
+  starts = jnp.take_along_axis(boundaries[:, :-1], mapping, axis=1)
+  ends = jnp.take_along_axis(boundaries[:, 1:], mapping, axis=1)
+  return jnp.stack((starts, ends), axis=-1).reshape(-1).astype(jnp.int32)
+
+
+def _aligned_token_bound(tokens, capacity, chunk_size):
+  """Bound padding by nonempty runs without changing public state capacity."""
+  if capacity <= 8192:
+    return align_up(tokens + capacity * (chunk_size - 1), chunk_size)
+  # Each nonempty run consumes at least one original token. Keep a zero guard
+  # chunk even when every token forms its own run (unalignment reads the tail).
+  return align_up(tokens + min(capacity, tokens) * (chunk_size - 1), chunk_size) + chunk_size
 
 
 def align_segment_ids(
@@ -350,9 +388,7 @@ def align_segment_ids(
       jnp.cumsum(aligned_lens)[:-1],
   ])
 
-  T_aligned = (
-      (T + max_num_segments * (chunk_size - 1) + chunk_size - 1) // chunk_size
-  ) * chunk_size
+  T_aligned = _aligned_token_bound(T, max_num_segments, chunk_size)
   out = jnp.zeros((T_aligned,), dtype=jnp.int32)
   apos = jnp.arange(T_aligned, dtype=jnp.int32)
 
@@ -362,6 +398,12 @@ def align_segment_ids(
     mask = is_real[i] & (apos >= start) & (apos < end)
     return jnp.where(mask, seg_labels[i], ids)
 
+  if max_num_segments > 8192:
+    ends = aligned_starts + aligned_lens
+    seq = jnp.minimum(
+        jnp.searchsorted(ends, apos, side="right"), max_num_segments - 1
+    )
+    return jnp.where(apos < ends[-1], seg_labels[seq], 0)
   return jax.lax.fori_loop(0, max_num_segments, body, out)
 
 

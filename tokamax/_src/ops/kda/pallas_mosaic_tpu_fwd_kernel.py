@@ -65,6 +65,7 @@ def _pre_process_kernel(
   *,
   BT,
   MB,
+  BOUNDED_METADATA=False,
 ):
   """Fused (S_ext, M) pre-process Pallas kernel for KDA CP forward.
 
@@ -90,8 +91,12 @@ def _pre_process_kernel(
   i_c = pl.program_id(1)
   seq_idx = chunk_to_seq_ref[i_c]
   last_seg_idx = last_seg_idx_ref[0]
-  bos = seqlens_ref[seq_idx]
-  eos = seqlens_ref[seq_idx + 1]
+  if BOUNDED_METADATA:
+    bos = seqlens_ref[2 * i_c]
+    eos = seqlens_ref[2 * i_c + 1]
+  else:
+    bos = seqlens_ref[seq_idx]
+    eos = seqlens_ref[seq_idx + 1]
   t0 = i_c * BT
 
   K = k_ref.shape[-1]
@@ -275,7 +280,10 @@ def _pre_process_pallas(
   interpret = get_interpret()
 
   S_ext_pad, M_pad = pl.pallas_call(
-    functools.partial(_pre_process_kernel, BT=BT, MB=MB),
+    functools.partial(
+        _pre_process_kernel, BT=BT, MB=MB,
+        BOUNDED_METADATA=cu_seqlens.size > 8193,
+    ),
     grid_spec=pltpu.PrefetchScalarGridSpec(
       num_scalar_prefetch=3,
       grid=grid,
@@ -288,7 +296,10 @@ def _pre_process_pallas(
     ),
     out_shape=[S_ext_shape, M_shape],
     interpret=interpret,
-  )(cu_seqlens.astype(jnp.int32), chunk_to_seq, real_last_seg_idx_arr,
+  )(
+    (_bounded_chunk_boundaries(cu_seqlens[None], chunk_to_seq[None])
+     if cu_seqlens.size > 8193 else cu_seqlens.astype(jnp.int32)),
+    chunk_to_seq, real_last_seg_idx_arr,
     k_t, w_t, u_t, gk_t)
 
   # Trim K/V padding back to original shape.
@@ -1038,8 +1049,13 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   i_c = pl.program_id(2)
   seq_idx = chunk_to_seq_ref[i_b, i_c]
 
-  bos = seqlens_ref[i_b, seq_idx]
-  eos = seqlens_ref[i_b, seq_idx + 1]
+  if seqlens_ref.ndim == 1:
+    offset = 2 * (i_b * chunk_to_seq_ref.shape[1] + i_c)
+    bos = seqlens_ref[offset]
+    eos = seqlens_ref[offset + 1]
+  else:
+    bos = seqlens_ref[i_b, seq_idx]
+    eos = seqlens_ref[i_b, seq_idx + 1]
   t0 = i_c * BT
 
   K = w_ref.shape[3]
@@ -1374,7 +1390,10 @@ def chunk_kda_fwd_h_o_varlen(
     ),
     out_shape=[o_shape, ht_shape, h_out_shape, v_new_out_shape],
     interpret=interpret,
-  )(cu_seqlens.astype(jnp.int32), chunk_to_seq, w_t, u_t, kg_t, gk_t, q_t, A_t, h0)
+  )(
+      _bounded_chunk_boundaries(cu_seqlens, chunk_to_seq), chunk_to_seq,
+      w_t, u_t, kg_t, gk_t, q_t, A_t, h0,
+  )
 
   # Post-process: o is [H, 1, T, V_ALIGNED]
   if V_ALIGNED > V:
@@ -1532,9 +1551,18 @@ def _packed_fused_forward_kernel(
   chunk_size = kwargs["chunk_size"]
   batch, chunk = pl.program_id(1), pl.program_id(2)
   seq = mapping_ref[batch, chunk]
-  block = chunk - seqlens_ref[batch, seq] // chunk_size
-  start = packed_seqlens_ref[batch, seq] + block * chunk_size
-  end = packed_seqlens_ref[batch, seq + 1]
+  offset = 2 * (batch * mapping_ref.shape[1] + chunk)
+  if seqlens_ref.ndim == 1:
+    aligned_start = seqlens_ref[offset]
+  else:
+    aligned_start = seqlens_ref[batch, seq]
+  block = chunk - aligned_start // chunk_size
+  if packed_seqlens_ref.ndim == 1:
+    start = packed_seqlens_ref[offset] + block * chunk_size
+    end = packed_seqlens_ref[offset + 1]
+  else:
+    start = packed_seqlens_ref[batch, seq] + block * chunk_size
+    end = packed_seqlens_ref[batch, seq + 1]
   active = (block >= 0) & (start < end)
   start = jnp.where(active, start, 0)
   offset = start % 8
@@ -1553,6 +1581,15 @@ def _packed_fused_forward_kernel(
   _fused_forward_kernel(
       seqlens_ref, mapping_ref, *refs[-5:], *refs[5:-5], **kwargs
   )
+
+
+def _bounded_chunk_boundaries(boundaries, mapping):
+  """Avoid scalar-prefetching an entire large sequence-capacity table."""
+  if boundaries.size <= 8193:
+    return boundaries.astype(jnp.int32)
+  starts = jnp.take_along_axis(boundaries[:, :-1], mapping, axis=1)
+  ends = jnp.take_along_axis(boundaries[:, 1:], mapping, axis=1)
+  return jnp.stack((starts, ends), axis=-1).reshape(-1).astype(jnp.int32)
 
 
 @functools.partial(
@@ -1643,7 +1680,7 @@ def chunk_kda_fwd_fused(
     )
 
   scalar_inputs = [
-      cu_seqlens.astype(jnp.int32),
+      _bounded_chunk_boundaries(cu_seqlens, chunk_indices[..., 0]),
       chunk_indices[..., 0].astype(jnp.int32),
   ]
   input_values = [
@@ -1659,7 +1696,9 @@ def chunk_kda_fwd_fused(
   if packed:
     if packed_cu_seqlens is None:
       raise ValueError("Packed inputs require original sequence boundaries.")
-    scalar_inputs.append(packed_cu_seqlens.astype(jnp.int32))
+    scalar_inputs.append(
+        _bounded_chunk_boundaries(packed_cu_seqlens, chunk_indices[..., 0])
+    )
     pq, pk, pv, pg, pb = packed_inputs
     # Round the allocation to eight rows and append a full guard window.
     input_values = [
@@ -1671,9 +1710,13 @@ def chunk_kda_fwd_fused(
 
     def packed_index(h, b, c, aligned, mapping, original):
       seq = mapping[b, c]
-      block = c - aligned[b, seq] // chunk_size
-      start = original[b, seq] + block * chunk_size
-      active = (block >= 0) & (start < original[b, seq + 1])
+      offset = 2 * (b * mapping.shape[1] + c)
+      aligned_start = aligned[offset] if aligned.ndim == 1 else aligned[b, seq]
+      block = c - aligned_start // chunk_size
+      original_start = original[offset] if original.ndim == 1 else original[b, seq]
+      end = original[offset + 1] if original.ndim == 1 else original[b, seq + 1]
+      start = original_start + block * chunk_size
+      active = (block >= 0) & (start < end)
       start = jnp.where(active, start, 0)
       return h * mini_batch, b, pl.multiple_of(start - start % 8, 8), 0
 
