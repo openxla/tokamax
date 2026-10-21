@@ -29,6 +29,10 @@ from tokamax._src.ops.ragged_dot.pallas_mosaic_gpu import Config as PallasMosaic
 from tokamax._src.ops.ragged_dot.pallas_mosaic_gpu import PallasMosaicGpuRaggedDot as PallasMosaicRaggedDot
 from tokamax._src.ops.ragged_dot.triton import Config as PallasTritonRaggedDotConfig
 from tokamax._src.ops.ragged_dot.triton import TritonRaggedDot as PallasTritonRaggedDot
+from tokamax._src.ops.triangle_multiplication.pallas_mosaic_gpu import Config as PallasMosaicTriangleMultiplicationConfig
+from tokamax._src.ops.triangle_multiplication.pallas_mosaic_gpu import PallasMosaicGpuTriangleMultiplication as PallasMosaicTriangleMultiplication
+from tokamax._src.ops.triangle_multiplication.triton import Config as TritonTriangleMultiplicationConfig
+from tokamax._src.ops.triangle_multiplication.triton import TritonTriangleMultiplication as TritonTriangleMultiplication
 
 # pylint: enable=g-importing-member,useless-import-alias
 
@@ -41,10 +45,14 @@ __all__ = (
     "PallasMosaicGatedLinearUnitConfig",
     "PallasMosaicRaggedDot",
     "PallasMosaicRaggedDotConfig",
+    "PallasMosaicTriangleMultiplication",
+    "PallasMosaicTriangleMultiplicationConfig",
     "PallasTritonFlashAttention",
     "PallasTritonFlashAttentionConfig",
     "PallasTritonGatedLinearUnit",
     "PallasTritonGatedLinearUnitConfig",
     "PallasTritonRaggedDot",
     "PallasTritonRaggedDotConfig",
+    "TritonTriangleMultiplication",
+    "TritonTriangleMultiplicationConfig",
 )

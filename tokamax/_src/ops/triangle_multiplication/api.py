@@ -20,6 +20,7 @@ from typing import Any, Final, Literal
 
 import immutabledict
 import jax
+from jax.extend import backend
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.triangle_multiplication import base
@@ -36,6 +37,27 @@ try:
 
   _IMPLEMENTATIONS["triton"] = triton.TritonTriangleMultiplication()
   _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS  # pylint: disable=invalid-name
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.triangle_multiplication import pallas_mosaic_gpu as pl_mgpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS["mosaic_gpu"] = (
+      pl_mgpu.PallasMosaicGpuTriangleMultiplication()
+  )
+  _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS  # pylint: disable=invalid-name
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.triangle_multiplication import pallas_mosaic_tpu as pl_mtpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS["mosaic_tpu"] = (
+      pl_mtpu.PallasMosaicTpuTriangleMultiplication()
+  )
+  if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
+    _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS  # pylint: disable=invalid-name
 except ImportError:
   pass
 
@@ -100,7 +122,8 @@ def triangle_multiplication(
   Returns:
     The result of triangle multiplication of shape `[N, N, D]`.
   """
-  if implementation is None:
+  is_default = implementation is None
+  if is_default:
     implementation = _DEFAULT_IMPLEMENTATIONS
   elif isinstance(implementation, str):
     implementation = (implementation,)
@@ -113,7 +136,37 @@ def triangle_multiplication(
     if isinstance(impl, str):
       if impl not in supported_implementations:
         raise NotImplementedError(f"Implementation '{impl}' is not supported.")
+      if impl == "mosaic":
+        device = None
+        sharding = getattr(x, "sharding", None)
+        if sharding is not None:
+          device_set = getattr(sharding, "device_set", None)
+          if device_set:
+            device = next(iter(device_set))
+        if device is None and isinstance(x, jax.Array):
+          try:
+            device = next(iter(x.devices()), None)
+          except jax.errors.ConcretizationTypeError:
+            pass
+        if device is None:
+          device = backend.get_default_device()
+        if device.platform == "gpu":
+          impl = "mosaic_gpu"
+        elif device.platform == "tpu":
+          impl = "mosaic_tpu"
+        else:
+          errors.append(
+              NotImplementedError(
+                  f"Mosaic is not supported on {device.platform}."
+              )
+          )
+          continue
       if impl not in IMPLEMENTATIONS:
+        if is_default:
+          errors.append(
+              NotImplementedError(f"Implementation '{impl}' is not registered.")
+          )
+          continue
         raise ValueError(f"Unknown implementation: {impl}.")
       fn = IMPLEMENTATIONS[impl]
       sub_impl: base.Implementation | None = "xla" if impl == "xla" else None
@@ -141,4 +194,6 @@ def triangle_multiplication(
     except NotImplementedError as e:
       errors.append(e)
 
+  if len(errors) == 1:
+    raise errors[0]
   raise ExceptionGroup("all implementations failed", errors)

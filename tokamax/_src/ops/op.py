@@ -393,18 +393,11 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
   @property
   def signature(self) -> inspect.Signature:
     """Infers signature of the op."""
-    # Use `bind` if available (to get default values), otherwise use `_fwd` and
-    # infer the signature.
-    if self.bind.__func__ is not Op.bind:
-      return inspect.signature(self.bind)
-    return self._fwd_signature
+    return _cached_op_signature(type(self))
 
   @property
   def _fwd_signature(self) -> inspect.Signature:
-    sig = inspect.signature(self._fwd)
-    params = sig.parameters.copy()
-    del params["config"]
-    return sig.replace(parameters=tuple(params.values()))
+    return _cached_op_fwd_signature(type(self))
 
   __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
@@ -412,6 +405,25 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     """Returns whether this op runs on the given device."""
     del device  # Unused.
     return True
+
+
+@functools.lru_cache
+def _cached_op_fwd_signature(cls: type[Op]) -> inspect.Signature:  # pylint: disable=g-bare-generic
+  sig = inspect.signature(cls._fwd)  # pylint: disable=protected-access
+  params = [
+      p
+      for p in list(sig.parameters.values())[1:]
+      if p.name != "config"
+  ]
+  return sig.replace(parameters=tuple(params))
+
+
+@functools.lru_cache
+def _cached_op_signature(cls: type[Op]) -> inspect.Signature:  # pylint: disable=g-bare-generic
+  if cls.bind is not Op.bind:
+    sig = inspect.signature(cls.bind)
+    return sig.replace(parameters=tuple(list(sig.parameters.values())[1:]))
+  return _cached_op_fwd_signature(cls)
 
 
 def snake_case_name(op: type[Op] | Op) -> str:  # pylint: disable=g-bare-generic
