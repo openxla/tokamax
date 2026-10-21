@@ -66,3 +66,12 @@ Mosaic variants on the same inputs and default device timer. Compare the
 latter two forward+VJP times to isolate this PR's effect. TPU compilation,
 correctness, memory use and device-time results must be recorded before
 marking the PR ready; no performance gain is inferred from CPU execution.
+# Optional-state allocation contract
+
+An absent final-state cotangent is represented by a Pallas `None` operand,
+not a capacity-sized FP32 zero tensor. The last chunk initializes its VMEM
+carry to zero directly. Likewise, no initial-state gradient output is allocated
+when the caller does not request it. Supplied state cotangents and requested
+initial-state gradients retain their original shapes, indexing and arithmetic.
+Validate both optional-state cases, saved/rematerialized paths, and the complete
+public forward plus VJP before accepting resource or performance claims.

@@ -28,6 +28,24 @@ from tokamax._src.ops.kda import pallas_mosaic_tpu_fwd_fused_test as forward_tes
 interpret_on_cpu = forward_tests.interpret_on_cpu
 
 
+def test_absent_state_has_no_capacity_sized_zero_buffer():
+  q = jnp.zeros((2, 2, 64, 128), jnp.bfloat16)
+  matrix = jnp.zeros((2, 2, 64, 64), q.dtype)
+  h = jnp.zeros((2, 2, 1, 128, 128), q.dtype)
+
+  def run(q, matrix, h):
+    return kernels._fused_dhu_wy_intra_cumsum_pallas_jit(
+        q, q, q, q, q, q, q, q, q[..., 0], matrix, h, q, q,
+        matrix, None, 128**-0.5, segment_ids=jnp.ones((2, 64), jnp.int32),
+        max_num_segments=8192, return_dh0=False,
+    )
+
+  traced = jax.make_jaxpr(run)(q, matrix, h)
+  text = str(traced)
+  assert "2,2,8192,128,128" not in text
+  assert jax.eval_shape(run, q, matrix, h)[-1] is None
+
+
 @pytest.mark.parametrize("fuse_backward", [False, True])
 @pytest.mark.parametrize("rematerialize", [False, True])
 @pytest.mark.parametrize("lower_bound", [None, -1.0])
