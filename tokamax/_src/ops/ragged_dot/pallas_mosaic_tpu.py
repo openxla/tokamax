@@ -24,7 +24,6 @@ import jax.numpy as jnp
 import numpy as np
 import pydantic
 import qwix
-from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
@@ -43,7 +42,7 @@ InputBufferCount = pydantic.PositiveInt
 
 QArray = base.QArray
 AsQArray = base.AsQArray
-Residuals = None
+Residuals = base.Residuals
 
 
 def _group_sizes_to_indices(gs: jax.Array, *, m: int) -> jax.Array:
@@ -130,31 +129,17 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
       activation: base.ActivationFunction | None = None,
       manual_axis_type: jax.sharding.ManualAxisType | None = None,
       group_offset: jax.Array | None = None,
-      rhs_scale: jax.Array | None = None,
-      rhs_bias: jax.Array | None = None,
-      maybe_quantize_lhs: bool = False,
-      lhs_scale: jax.Array | None = None,
-      zero_initialize: bool = True,
+      zero_initialize: bool = False,
       fuse_gateup_activation: str | None = None,
-      lhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-      rhs_quantization_dtype: jax.typing.DTypeLike | None = None,
-  ) -> tuple[jax.Array, base.Residuals]:
+  ) -> tuple[jax.Array, Residuals]:
     if (
         group_offset is not None
-        or rhs_scale is not None
-        or rhs_bias is not None
-        or maybe_quantize_lhs
-        or lhs_scale is not None
-        or not zero_initialize
+        or zero_initialize
         or fuse_gateup_activation is not None
-        or lhs_quantization_dtype is not None
-        or rhs_quantization_dtype is not None
     ):
       raise NotImplementedError(
           "The Pallas-Mosaic-TPU-v1 implementation does not support"
-          " group_offset, rhs_scale, rhs_bias, maybe_quantize_lhs, lhs_scale,"
-          " zero_initialize, fuse_gateup_activation, lhs_quantization_dtype,"
-          " or rhs_quantization_dtype."
+          " group_offset, zero_initialize, or fuse_gateup_activation."
       )
 
     # TODO: Support more ragged_dot_dimension_numbers
@@ -169,21 +154,18 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
           f"RaggedDot inputs must be >= 128, but {lhs.shape=}, {rhs.shape=}"
       )
 
+    if isinstance(group_sizes, base.GroupSizes):
+      group_sizes = jnp.array(group_sizes)
+
+    if preferred_element_type is None:
+      preferred_element_type = jnp.result_type(lhs, rhs)
+
     def maybe_quantize(x, tile_shape):
       if isinstance(x, QArray) or self.qdtype is None:
         return x
       tiled_axes = {i: d for i, d in enumerate(tile_shape)}
       return qwix.quantize(x, self.qdtype, tiled_axes=tiled_axes)
 
-    if isinstance(group_sizes, base.GroupSizes):
-      group_sizes = jnp.array(group_sizes)
-
-    if preferred_element_type is None:
-      preferred_element_type = (
-          precision_lib.default_output_dtype_from_input_dtypes(
-              lhs.dtype, rhs.dtype
-          )
-      )
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
       # STRATEGY 1: full-channel quantization along the reduction dimension
       lhs = maybe_quantize(lhs, (1, lhs.shape[1]))

@@ -105,6 +105,22 @@ class ChunkedXlaTest(parameterized.TestCase):
         jnp.allclose(chunked_lse, ref_lse, atol=atol, rtol=rtol),
         f"LSE mismatch: max diff {jnp.max(jnp.abs(chunked_lse - ref_lse))}",
     )
+    self.assertEqual(chunked_lse.dtype, jnp.float32)
+    self.assertEqual(ref_lse.dtype, jnp.float32)
+
+  @parameterized.named_parameters(
+      ("bf16", jnp.bfloat16),
+      ("f16", jnp.float16),
+      ("f32", jnp.float32),
+  )
+  def test_chunked_xla_lse_dtype_float32(self, dtype):
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(42), 256, 128, 512, dtype=dtype
+    )
+    _, lse = chunked_xla.linear_softmax_cross_entropy_loss_fwd_chunked_xla(
+        x, labels, w, b_block_sz=128, v_block_sz=256
+    )
+    self.assertEqual(lse.dtype, jnp.float32)
 
   @parameterized.named_parameters(*_chunked_xla_test_cases())
   def test_bwd_matches_reference(

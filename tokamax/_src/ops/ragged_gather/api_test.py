@@ -20,6 +20,7 @@ import jax
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src import hlo_utils
 from tokamax._src.ops.ragged_gather import api
 
 jax.config.parse_flags_with_absl()
@@ -32,7 +33,7 @@ class ApiTest(parameterized.TestCase):
       start_end=[(3, 338), (10, 422), (3, 28)],
       hidden_size=[128, 512],
       dtype=[jnp.bfloat16, jnp.float32],
-      impl=["xla", "mosaic", "mosaic_tpu", "mosaic_tpu_v2"],
+      impl=["xla", "mosaic"],
   )
   def test_basic_api(self, in_out_size, hidden_size, start_end, dtype, impl):
     if "mosaic" in impl and backend.get_default_device().device_kind != "TPU7x":
@@ -51,14 +52,31 @@ class ApiTest(parameterized.TestCase):
     start_arr = jnp.array([start], jnp.int32)
     end_arr = jnp.array([end], jnp.int32)
 
-    actual = api.ragged_gather(
-        x, indices, start_arr, end_arr, implementation=impl
-    )
+    @jax.jit
+    def f(x, indices, start, end):
+      return api.ragged_gather(x, indices, start, end, implementation=impl)
+
+    actual = f(x, indices, start_arr, end_arr)
     desired = x[indices]
 
-    np.testing.assert_allclose(
-        actual[start:end], desired[start:end], rtol=1e-2, atol=1e-2
-    )
+    with self.subTest("value"):
+      np.testing.assert_allclose(
+          actual[start:end], desired[start:end], rtol=1e-2, atol=1e-2
+      )
+
+    with self.subTest("correct_implementation_used"):
+      # Check the lowered HLO for the kernel that was really used.
+      opspecs = hlo_utils.get_opspecs(
+          f.lower(x, indices, start_arr, end_arr), include_xla_kernels=False
+      )
+      if impl == "xla":
+        self.assertEmpty(opspecs)
+      else:
+        expected = impl
+        self.assertNotEmpty(opspecs)
+        self.assertIsInstance(
+            opspecs[0].op, type(api.IMPLEMENTATIONS[expected])
+        )
 
 
 if __name__ == "__main__":

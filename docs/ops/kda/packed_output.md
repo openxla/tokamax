@@ -50,7 +50,7 @@ backward. The memory-fallback tests force retracing when hardware limits
 change and verify which branch actually executes.
 
 ```bash
-python -m pytest tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_output_test.py -v
+python -m pytest tokamax/_src/ops/kda/pallas_mosaic_tpu_output_test.py -v
 python -m tokamax.benchmarks.kda --skip_implementations=xla,mosaic_staged,mosaic_fwd_fused,mosaic_fused,mosaic_remat,mosaic_remat_fused
 ```
 

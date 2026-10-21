@@ -1,0 +1,62 @@
+{
+  "{\"x\":\"bf16[128,128,512]\",\"positions\":\"i32[128]\",\"cos_sin_cache\":\"f32[65536,64]\",\"mode\":\"qnorm_rope\",\"inverse\":false,\"eps\":1e-6,\"quant_dtype\":null,\"return_residuals\":false}": {
+    "{\"tile_n\":32}": {
+      "compile_time_ms": 516.3611129974015,
+      "lower_time_ms": 127.62006797129288,
+      "evaluation_times_ms": [
+        0.048,
+        0.048,
+        0.048,
+        0.048,
+        0.048
+      ],
+      "metadata": {},
+      "peak_memory_mb": 83.886592
+    }
+  },
+  "{\"x\":\"bf16[4096,128,512]\",\"positions\":\"i32[4096]\",\"cos_sin_cache\":\"f32[65536,64]\",\"mode\":\"qnorm_rope\",\"inverse\":false,\"eps\":1e-6,\"quant_dtype\":null,\"return_residuals\":false}": {
+    "{\"tile_n\":64}": {
+      "compile_time_ms": 1031.1272609978914,
+      "lower_time_ms": 199.326874979306,
+      "evaluation_times_ms": [
+        0.699,
+        0.699,
+        0.699,
+        0.699,
+        0.699
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1124.089856
+    }
+  },
+  "{\"x\":\"bf16[4096,512]\",\"positions\":\"i32[4096]\",\"cos_sin_cache\":\"f32[65536,64]\",\"mode\":\"rope\",\"inverse\":false,\"eps\":1e-6,\"quant_dtype\":null,\"return_residuals\":false}": {
+    "{\"tile_n\":256}": {
+      "compile_time_ms": 274.337976006791,
+      "lower_time_ms": 237.98285401426256,
+      "evaluation_times_ms": [
+        0.053,
+        0.053,
+        0.053,
+        0.052,
+        0.053
+      ],
+      "metadata": {},
+      "peak_memory_mb": 58.73664
+    }
+  },
+  "{\"x\":\"bf16[4096,64,128]\",\"positions\":\"i32[4096]\",\"cos_sin_cache\":\"f32[65536,64]\",\"mode\":\"rope_quant\",\"inverse\":false,\"eps\":1e-6,\"quant_dtype\":\"float8_e4m3fn\",\"return_residuals\":false}": {
+    "{\"tile_n\":256}": {
+      "compile_time_ms": 1365.8624709933065,
+      "lower_time_ms": 496.23094202252105,
+      "evaluation_times_ms": [
+        0.116,
+        0.117,
+        0.117,
+        0.117,
+        0.117
+      ],
+      "metadata": {},
+      "peak_memory_mb": 154.157088
+    }
+  }
+}

@@ -14,7 +14,7 @@
 # ==============================================================================
 """Mosaic-GPU utils."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 import dataclasses
 import functools
 import math
@@ -76,6 +76,13 @@ def tiled_swizzled_block_spec(
   return plgpu.BlockSpec(shape, index_map, transforms=transforms, **kwargs)
 
 
+def warp_map_when(
+    pred: jax.Array | bool,
+) -> Callable[[Callable[[jax.Array], None]], None]:
+  """Runs a function with single warp semantics when the condition is true."""
+  return lambda body: pl.when(pred)(lambda: plgpu.warp_map(body))
+
+
 warpgroup_barrier = plgpu.inline_mgpu()(lambda _: mgpu.warpgroup_barrier())
 
 
@@ -95,48 +102,81 @@ def tcgen05_fence_before_thread_sync(_):
 
 
 @plgpu.inline_mgpu()
+def tcgen05_fence_after_thread_sync(_):
+  nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+
+
+@plgpu.inline_mgpu()
 def fence_async_shared_cta(_):
   space = nvvm.SharedSpace.shared_cta
   nvvm.fence_proxy(nvvm.ProxyKind.async_shared, space=space)
 
 
 def _bar_operation(
-    operation: str, barrier_id: int | jax.Array, num_threads: int
+    operation: str,
+    barrier_id: int | jax.Array,
+    num_threads: int,
+    predicate: bool | jax.Array | None = None,
 ):
   """Performs a PTX CTA barrier operation."""
+  if isinstance(predicate, (bool, np.bool_)):
+    if not predicate:
+      return
+    predicate = None
+
   if isinstance(barrier_id, int):
-
-    @plgpu.inline_mgpu()
-    def bar_op(_):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [],
-          f"bar.{operation} {barrier_id}, {num_threads};",
-          "",
-          has_side_effects=True,
-      )
-
-    bar_op()
+    args, bar_id = [], barrier_id
   else:
+    args, bar_id = [barrier_id], "$0"
 
-    @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
-    def bar_op(_, barrier_id):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [barrier_id.registers[()]],
-          f"bar.{operation} $0, {num_threads};",
-          "r",
-          has_side_effects=True,
-      )
+  if predicate is not None:
+    args.append(predicate)
 
-    bar_op(barrier_id)
+  @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,) * len(args))
+  def bar_op(_, *args):
+    args = [a.registers[()] for a in args]
+    pred = None if predicate is None else args.pop()
+    mgpu.utils.inline_ptx(
+        f"bar.{operation} {bar_id}, {num_threads};", *args, predicate=pred
+    )
+
+  bar_op(*args)
 
 
 bar_arrive = functools.partial(_bar_operation, "arrive")
 bar_sync = functools.partial(_bar_operation, "sync")
 
 
-def int4_as_biased_f8e4m3fn(x, layout):
+def apply_int4_to_fp8_offline_permute(x: jax.Array, axis: int) -> jax.Array:
+  """Permutes an int4 array offline for the permute-free int4 -> fp8 upcast.
+
+  This is the layout `int4_as_biased_f8e4m3fn(offline_permuted=True)` expects:
+  within every aligned group of 8 elements along `axis`, storage slot `p` holds
+  original element `(0, 4, 1, 5, 2, 6, 3, 7)[p]` (the two halves of the group
+  interleaved), so each packed byte `i` becomes `(e[i + 4] << 4) | e[i]` and the
+  upcast needs no byte permutes. Uses reshape + transpose rather than a gather
+  so that it also works under symbolic checkpoint evaluation.
+
+  Args:
+    x: The int4 array.
+    axis: The contraction axis to permute along.
+
+  Returns:
+    The permuted array, with the same shape and dtype as `x`.
+  """
+  axis = axis % x.ndim
+  k = x.shape[axis]
+  if k % 8:
+    raise ValueError(f"Contraction dim must be a multiple of 8, got {k}.")
+  x8 = x.astype(jnp.int8)
+  x8 = x8.reshape(*x.shape[:axis], k // 8, 2, 4, *x.shape[axis + 1 :])
+  x8 = jnp.swapaxes(x8, axis + 1, axis + 2)
+  return x8.reshape(x.shape).astype(x.dtype)
+
+
+def int4_as_biased_f8e4m3fn(
+    x: jax.Array, layout: Any, *, offline_permuted: bool = False
+) -> jax.Array:
   """Encodes a packed `int4` array as an `f8e4m3fn` array with an implicit +8 bias.
 
   Mathematically, for any int4 value `x` in the range [-8, 7], this encoding
@@ -196,15 +236,42 @@ def int4_as_biased_f8e4m3fn(x, layout):
   Args:
     x: A `jax.Array` containing packed int4 values.
     layout: The `plgpu.Layout` of the fragmented array `x`.
+    offline_permuted: Whether `x` was permuted offline with
+      `apply_int4_to_fp8_offline_permute` along the contraction dim. Saves two
+      `prmt` per 8 elements.
 
   Returns:
-    A `mgpu.FragmentedArray` containing the encoded values in biased `f8e4m3fn`
-    format with the specified layout.
+    A `jax.Array` containing the encoded values in biased `f8e4m3fn` format
+    with the specified layout.
   """
+  if offline_permuted:
+    # byte i = (e[i + 4] << 4) | e[i]: lo/hi nibbles already are [e0..e3] and
+    # [e4..e7], so only the mask and the +8 bias (xor) remain.
+    asm = """
+        {{
+        .reg .b32 hi_raw, c_mask;
+        mov.b32 c_mask, 0x0F0F0F0F;
+        shr.u32 hi_raw, $2, 4;
+        lop3.b32 $0, $2, 0x08080808, c_mask, 0x6c;
+        lop3.b32 $1, hi_raw, 0x08080808, c_mask, 0x6c;
+        }}
+        """
+  else:
+    asm = """
+        {{
+        .reg .b32 odds_raw, c_mask;
+        mov.b32 c_mask, 0x0F0F0F0F;
+        shr.u32 odds_raw, $2, 4;
+        prmt.b32 $0, $2, odds_raw, 0x5140;
+        prmt.b32 $1, $2, odds_raw, 0x7362;
+        lop3.b32 $0, $0, 0x08080808, c_mask, 0x6c;
+        lop3.b32 $1, $1, 0x08080808, c_mask, 0x6c;
+        }}
+        """
 
   @plgpu.inline_mgpu(
       arg_types=(layout,),
-      return_type=plgpu.ShapeDtypeStruct(x.shape, jnp.float8_e4m3fn, layout),
+      return_type=plgpu.ShapeDtypeStruct(x.shape, jnp.float8_e4m3fn, layout),  # pyrefly: ignore[bad-argument-type]
   )
   def encode(_, fa: mgpu.FragmentedArray):
     [vector_len] = ir.VectorType(fa.registers.flat[0].type).shape
@@ -223,17 +290,7 @@ def int4_as_biased_f8e4m3fn(x, layout):
           llvm.inline_asm(
               llvm.StructType.get_literal((i32, i32)),
               [reg],
-              """
-              {{
-              .reg .b32 odds_raw, c_mask;
-              mov.b32 c_mask, 0x0F0F0F0F;
-              shr.u32 odds_raw, $2, 4;
-              prmt.b32 $0, $2, odds_raw, 0x5140;
-              prmt.b32 $1, $2, odds_raw, 0x7362;
-              lop3.b32 $0, $0, 0x08080808, c_mask, 0x6c;
-              lop3.b32 $1, $1, 0x08080808, c_mask, 0x6c;
-              }}
-              """,
+              asm,
               "=r,=r,r",
           ),
       )
@@ -271,13 +328,101 @@ def _get_smem_bytes(x: Any) -> int:
   return 0
 
 
-def estimate_smem_bytes(scratch_types: Any) -> int:
+def estimate_smem_bytes(
+    scratch_types: Any, uses_dynamic_scheduling_loop: bool = False
+) -> int:
   """Estimates the total SMEM usage in bytes for the given scratch types."""
+  if uses_dynamic_scheduling_loop:
+    scratch_types = (
+        scratch_types,
+        plgpu.TryClusterCancelResult(2),
+        plgpu.Barrier(num_barriers=2),  # try cancel barrier
+        plgpu.Barrier(num_barriers=2),  # cancel used barrier
+    )
+
   is_ref_union = lambda x: isinstance(x, plgpu.RefUnion)
   flat = jax.tree.leaves(scratch_types, is_leaf=is_ref_union)
   # TMEM allocation uses 4 bytes of SMEM to return the address.
   uses_tmem = any(getattr(x, "memory_space", None) == plgpu.TMEM for x in flat)
   return sum(map(_get_smem_bytes, flat)) + (4 if uses_tmem else 0)
+
+
+def _batched_persistent_body(body, in_batched, out_batched):
+
+  def batched_body(batched_grid_loop, **scratch_ref_kwargs):
+
+    def grid_loop[T](init_carry: T = None) -> Callable[[Callable[..., T]], T]:
+
+      def decorator(body: Callable[..., T]) -> T:
+
+        def wrapper(refs, batched_loop_info: plgpu.NDLoopInfo, carry: T) -> T:
+          batch_idx, *idx = batched_loop_info.index
+          slice_ref = lambda r, b: (r.at[batch_idx] if b else r)
+          if isinstance(out_batched, (tuple, list)):
+            batched = (*in_batched, *out_batched)
+          else:
+            batched = (*in_batched, out_batched)
+          refs = jax.tree.map(slice_ref, refs, batched)
+          loop_info = dataclasses.replace(batched_loop_info, index=tuple(idx))
+          return body(refs, loop_info, carry)
+
+        return batched_grid_loop(init_carry=init_carry)(wrapper)
+
+      return decorator
+
+    return body(grid_loop, **scratch_ref_kwargs)
+
+  return batched_body
+
+
+def _persistent_kernel(
+    recurse_fn: Callable[..., Any],
+    loop_fn: Callable[..., Any],
+    body: Callable[..., None],
+    out_type: Any = (),
+    *,
+    grid: tuple[int, ...] = (),
+    grid_names: tuple[str, ...] = (),
+    launch_grid: tuple[int, ...] = (),
+    launch_grid_names: tuple[str, ...] = (),
+    **kwargs: Any,
+) -> Callable[..., Any]:
+
+  @jax.custom_batching.custom_vmap
+  def wrapper(*args):
+
+    def wrapped_body(*refs, **scratch_ref_kwargs):
+
+      def grid_loop[T](init_carry: T = None) -> Callable[[Callable[..., T]], T]:
+        return lambda body: loop_fn(init_carry=init_carry)(
+            functools.partial(body, refs)
+        )
+
+      return body(grid_loop, **scratch_ref_kwargs)
+
+    return plgpu.kernel(
+        wrapped_body,
+        out_type=out_type,
+        grid=launch_grid,
+        grid_names=launch_grid_names,
+        **kwargs,
+    )(*args)
+
+  @wrapper.def_vmap
+  def vmap_rule(axis_size, in_batched, *args):
+    out_batched = jax.tree.map(lambda _: True, out_type)
+    batched_body = _batched_persistent_body(body, in_batched, out_batched)
+    add_batch_dim = lambda x: x.update(shape=(axis_size, *x.shape))
+    out = recurse_fn(
+        batched_body,
+        out_type=jax.tree.map(add_batch_dim, out_type),
+        grid=(axis_size, *grid),
+        grid_names=(f"$$__batch_{len(grid_names)}__$$", *grid_names),
+        **kwargs,
+    )(*args)
+    return out, out_batched
+
+  return wrapper
 
 
 def static_scheduling_persistent_kernel(
@@ -288,67 +433,65 @@ def static_scheduling_persistent_kernel(
     cluster: tuple[int, ...] = (),
     **kwargs: Any,
 ) -> Callable[..., Any]:
-  """Entry point for defining a persistent Mosaic GPU kernel."""
+  """Entry point for defining a static scheduling persistent Mosaic GPU kernel."""
+  cluster_size = math.prod(cluster)
+  launch_grid_name = "$$__sm__$$" if cluster_size == 1 else "$$__cluster__$$"
 
-  launch_grid = (backend.get_default_device().core_count // math.prod(cluster),)
-  launch_grid_name = "$$__sm__$$"
+  return _persistent_kernel(
+      static_scheduling_persistent_kernel,
+      functools.partial(plgpu.nd_loop, grid, collective_axes=launch_grid_name),
+      body,
+      out_type,
+      grid=grid,
+      launch_grid=(backend.get_default_device().core_count // cluster_size,),
+      launch_grid_names=(launch_grid_name,),
+      cluster=cluster,
+      **kwargs,
+  )
 
-  @jax.custom_batching.custom_vmap
-  def wrapper(*args):
 
-    def wrapped_body(*refs, **scratch_ref_kwargs):
+def dynamic_scheduling_persistent_kernel(
+    body: Callable[..., None],
+    out_type: Any = (),
+    *,
+    grid: tuple[int, ...] = (),
+    grid_names: tuple[str, ...] = (),
+    cluster: tuple[int, ...] = (),
+    cluster_names: tuple[str, ...] = (),
+    thread_name: str | None = None,
+    **kwargs: Any,
+) -> Callable[..., Any]:
+  """Entry point for defining a dynamic scheduling persistent Mosaic GPU kernel."""
+  return _persistent_kernel(
+      dynamic_scheduling_persistent_kernel,
+      functools.partial(
+          plgpu.dynamic_scheduling_loop,
+          grid_names=grid_names,
+          thread_axis=thread_name,
+          cluster_axes=cluster_names,
+      ),
+      body,
+      out_type,
+      grid=grid,
+      grid_names=grid_names,
+      launch_grid=grid,
+      launch_grid_names=grid_names,
+      cluster=cluster,
+      cluster_names=cluster_names,
+      thread_name=thread_name,
+      **kwargs,
+  )
 
-      def grid_loop[T](init_carry: T = None) -> Callable[[Callable[..., T]], T]:
-        return lambda body: plgpu.nd_loop(
-            grid, collective_axes=launch_grid_name, init_carry=init_carry
-        )(functools.partial(body, refs))
 
-      return body(grid_loop, **scratch_ref_kwargs)
+def not_persistent_grid_loop_kernel(
+    body: Callable[..., None], *, grid_names: tuple[str, ...] = (), **kwargs
+):
+  """A standard kernel that can swapped in for the persistent kernels."""
 
-    return plgpu.kernel(
-        wrapped_body,
-        out_type=out_type,
-        grid=launch_grid,
-        grid_names=(launch_grid_name,),
-        cluster=cluster,
-        **kwargs,
-    )(*args)
+  def wrapped_body(*args, **kwargs):
+    idx = tuple(map(jax.lax.axis_index, grid_names))
+    loop_info = plgpu.NDLoopInfo(idx, local_index=0, num_local_steps=1)
+    grid_loop = lambda init_carry: lambda f: f(args, loop_info, init_carry)
+    return body(grid_loop, **kwargs)
 
-  @wrapper.def_vmap
-  def vmap_rule(axis_size, in_batched, *args):
-    out_batched = jax.tree.map(lambda _: True, out_type)
-
-    def batched_body(batched_grid_loop, **scratch_ref_kwargs):
-
-      def grid_loop[T](init_carry: T = None) -> Callable[[Callable[..., T]], T]:
-
-        def decorator(body: Callable[..., T]) -> T:
-
-          def wrapper(refs, batched_loop_info: plgpu.NDLoopInfo, carry: T) -> T:
-            batch_idx, *idx = batched_loop_info.index
-            slice_ref = lambda r, b: (r.at[batch_idx] if b else r)
-            if isinstance(out_batched, (tuple, list)):
-              batched = (*in_batched, *out_batched)
-            else:
-              batched = (*in_batched, out_batched)
-            refs = jax.tree.map(slice_ref, refs, batched)
-            loop_info = dataclasses.replace(batched_loop_info, index=tuple(idx))
-            return body(refs, loop_info, carry)
-
-          return batched_grid_loop(init_carry=init_carry)(wrapper)
-
-        return decorator
-
-      return body(grid_loop, **scratch_ref_kwargs)
-
-    add_batch_dim = lambda x: x.update(shape=(axis_size, *x.shape))
-    out = static_scheduling_persistent_kernel(
-        batched_body,
-        out_type=jax.tree.map(add_batch_dim, out_type),
-        grid=(axis_size,) + grid,
-        cluster=cluster,
-        **kwargs,
-    )(*args)
-    return out, out_batched
-
-  return wrapper
+  return plgpu.kernel(wrapped_body, grid_names=grid_names, **kwargs)

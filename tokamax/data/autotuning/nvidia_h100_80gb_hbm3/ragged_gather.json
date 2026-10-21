@@ -1,0 +1,152 @@
+{
+  "{\"x\":\"bf16[8192,4096]\",\"indices\":\"i32[81920]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 199.73601399999552,
+      "lower_time_ms": 37.056762999995385,
+      "evaluation_times_ms": [
+        0.506907,
+        0.507612,
+        0.50694,
+        0.506652,
+        0.507164
+      ],
+      "metadata": {},
+      "peak_memory_mb": 738.525192
+    }
+  },
+  "{\"x\":\"bf16[8192,4096]\",\"indices\":\"i32[81920]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 61.38028879649937,
+      "lower_time_ms": 10.522814001888037,
+      "evaluation_times_ms": [
+        0.507676,
+        0.506652,
+        0.507036,
+        0.508636,
+        0.507196
+      ],
+      "metadata": {},
+      "peak_memory_mb": 738.525192
+    }
+  },
+  "{\"x\":\"bf16[512,512]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 177.72327799997356,
+      "lower_time_ms": 34.957784000027914,
+      "evaluation_times_ms": [
+        0.001759,
+        0.001791,
+        0.001791,
+        0.001822,
+        0.001759
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1.576968
+    }
+  },
+  "{\"x\":\"bf16[512,512]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 68.47900804132223,
+      "lower_time_ms": 10.44356171041727,
+      "evaluation_times_ms": [
+        0.001856,
+        0.001824,
+        0.001792,
+        0.001824,
+        0.001824
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1.576968
+    }
+  },
+  "{\"x\":\"bf16[512,8192]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 183.62121600000592,
+      "lower_time_ms": 37.776225000015984,
+      "evaluation_times_ms": [
+        0.011142,
+        0.011109,
+        0.011076,
+        0.011077,
+        0.011078
+      ],
+      "metadata": {},
+      "peak_memory_mb": 25.169928
+    }
+  },
+  "{\"x\":\"bf16[512,8192]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 55.69062405265868,
+      "lower_time_ms": 10.052863042801619,
+      "evaluation_times_ms": [
+        0.011104,
+        0.011104,
+        0.011104,
+        0.011136,
+        0.011104
+      ],
+      "metadata": {},
+      "peak_memory_mb": 25.169928
+    }
+  },
+  "{\"x\":\"bf16[1024,8192]\",\"indices\":\"i32[2048]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 63.73888603411615,
+      "lower_time_ms": 10.370505042374134,
+      "evaluation_times_ms": [
+        0.02256,
+        0.022848,
+        0.022336,
+        0.022272,
+        0.022079
+      ],
+      "metadata": {},
+      "peak_memory_mb": 50.339848
+    }
+  },
+  "{\"x\":\"bf16[1024,8192]\",\"indices\":\"i32[2048]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 186.08608200000276,
+      "lower_time_ms": 36.85926400000028,
+      "evaluation_times_ms": [
+        0.023754,
+        0.022186,
+        0.022698,
+        0.022986,
+        0.022538
+      ],
+      "metadata": {},
+      "peak_memory_mb": 50.339848
+    }
+  },
+  "{\"x\":\"bf16[2048,8192]\",\"indices\":\"i32[4096]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 181.24436799999444,
+      "lower_time_ms": 39.77171500000054,
+      "evaluation_times_ms": [
+        0.048417,
+        0.047425,
+        0.048417,
+        0.048289,
+        0.047392
+      ],
+      "metadata": {},
+      "peak_memory_mb": 100.679688
+    }
+  },
+  "{\"x\":\"bf16[2048,8192]\",\"indices\":\"i32[4096]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 55.140899028629065,
+      "lower_time_ms": 9.737882064655423,
+      "evaluation_times_ms": [
+        0.04736,
+        0.046688,
+        0.047136,
+        0.04768,
+        0.047584
+      ],
+      "metadata": {},
+      "peak_memory_mb": 100.679688
+    }
+  }
+}

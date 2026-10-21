@@ -175,14 +175,16 @@ def flash_attention_vjp_kernel(
     Float[Array, "H T t"] | None,  # ds
 ]:
   orig_q_seq_len, _, orig_head_dim = q.shape
-  orig_head_dim_out = v.shape[-1]
+  orig_kv_seq_len, _, orig_head_dim_out = v.shape
   pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
   q, k, v, out, dout = map(pad_head_dim, (q, k, v, out, dout))
   m, l = residuals
 
   # TODO: Remove padding along q sequence length.
-  pad_q_seq = lambda x, a: shape_lib.pad_to_next_multiple_of(x, 8, a)
-  q, m, l = map(pad_q_seq, (q, m, l), (-3, -1, -1))
+  pad_seq = lambda seq, a: shape_lib.pad_to_next_multiple_of(seq, 8, a)
+  q, k, v, out, dout = map(pad_seq, (q, k, v, out, dout), (-3, -3, -3, -3, -3))
+  m = shape_lib.pad_to_next_multiple_of(m, 8, -1, pad_value=jnp.inf)
+  l = shape_lib.pad_to_next_multiple_of(l, 8, -1, pad_value=1.0)
 
   q_seq_len, num_q_heads, head_dim = q.shape
   kv_seq_len, num_kv_heads, head_dim_out = v.shape
@@ -201,8 +203,23 @@ def flash_attention_vjp_kernel(
   block_kv_dq = config.block_kv_dq
   compute_wgs = config.compute_wgs
 
+  if bias is not None:
+    if bias.shape[-2] != 1:
+      bias = pad_seq(bias, -2)
+    if bias.shape[-1] != 1:
+      bias = pad_seq(bias, -1)
+
   if mask is not None:
+    if mask.shape[-2] != 1:
+      mask = pad_seq(mask, -2)
+    if mask.shape[-1] != 1:
+      mask = pad_seq(mask, -1)
     mask = mask.astype(jnp.int8)
+
+  if k_start is not None and k_start.shape[-1] != 1:
+    k_start = pad_seq(k_start, -1)
+  if k_end is not None and k_end.shape[-1] != 1:
+    k_end = pad_seq(k_end, -1)
 
   # TODO: Avoid broadcast.
   bcast = lambda x: jnp.broadcast_to(x, (x.shape[-2], q_seq_len))
@@ -212,7 +229,6 @@ def flash_attention_vjp_kernel(
   delta = jnp.einsum(
       "qhd,qhd->hq", out, dout, preferred_element_type=jnp.float32
   )
-  delta = pad_q_seq(delta, -1)
 
   def kernel_dq(
       q_gmem,
@@ -732,7 +748,7 @@ def flash_attention_vjp_kernel(
   )(q, k, v, dout, m, l, delta, bias, mask, k_start, k_end)
 
   dq = dq[..., :orig_q_seq_len, :, :orig_head_dim]
-  dk = dk[..., :orig_head_dim]
-  dv = dv[..., :orig_head_dim_out]
-  ds = None if ds is None else ds[:, :orig_q_seq_len, :kv_seq_len]
+  dk = dk[..., :orig_kv_seq_len, :, :orig_head_dim]
+  dv = dv[..., :orig_kv_seq_len, :, :orig_head_dim_out]
+  ds = None if ds is None else ds[:, :orig_q_seq_len, :orig_kv_seq_len]
   return dq, dk, dv, ds

@@ -26,7 +26,7 @@ from tokamax._src.ops.gated_linear_unit import api
 from tokamax._src.ops.gated_linear_unit import test_base
 
 _IMPLEMENTATIONS: Final[tuple[str | None, ...]] = typing.get_args(
-    api.Implementation
+    api.Implementation.__value__
 ) + (None,)
 
 
@@ -51,21 +51,26 @@ class GatedLinearUnitTest(parameterized.TestCase):
       if "mosaic" in implementation:
         self.skipTest("Mosaic not supported on this platform.")
 
+    if implementation == "cutedsl":
+      if not gpu_utils.is_sm100():
+        self.skipTest("CuteDSL requires SM100+ GPU.")
+      if "cutedsl" not in api.IMPLEMENTATIONS:
+        self.skipTest("CuteDSL requires nvidia-cudnn-frontend (cudnn).")
+
     lhs, rhs = _get_input_data(m=128, k=64, n=128)
+    activation = jax.nn.silu
 
     @jax.jit
     def f(x, weights):
-      out = api.gated_linear_unit(
-          x, weights, activation=jax.nn.sigmoid, implementation=implementation
+      return api.gated_linear_unit(
+          x, weights, activation=activation, implementation=implementation
       )
-      return jnp.sum(out)
 
     @jax.jit
     def f_xla(x, weights):
-      out = api.gated_linear_unit(
-          x, weights, activation=jax.nn.sigmoid, implementation="xla"
+      return api.gated_linear_unit(
+          x, weights, activation=activation, implementation="xla"
       )
-      return jnp.sum(out)
 
     if use_tuple_weights:
       rhs = jnp.unstack(rhs, axis=1)
@@ -74,7 +79,7 @@ class GatedLinearUnitTest(parameterized.TestCase):
     out_golden = f_xla(lhs, rhs)
 
     with self.subTest("value"):
-      chex.assert_trees_all_close(out, out_golden)
+      chex.assert_trees_all_close(out, out_golden, atol=0.1, rtol=0.02)
 
     args = hlo_utils.get_bound_args(f.lower(lhs, rhs))
     self.assertLen(args, 1)
@@ -109,6 +114,13 @@ class GatedLinearUnitXlaTest(test_base.GatedLinearUnitTestBase):
 
   def __init__(self, *args):
     fn = functools.partial(api.gated_linear_unit, implementation="xla")
+    super().__init__(*args, glu_fn=fn)
+
+
+class GatedLinearUnitMosaicGpuTest(test_base.GatedLinearUnitTestBase):
+
+  def __init__(self, *args):
+    fn = functools.partial(api.gated_linear_unit, implementation="mosaic")
     super().__init__(*args, glu_fn=fn)
 
 

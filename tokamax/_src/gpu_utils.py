@@ -56,8 +56,23 @@ def is_sm90(device: jax.Device | None = None) -> bool:
 
 
 def is_sm100(device: jax.Device | None = None) -> bool:
-  """Returns True if the device is a Blackwell GPU and False otherwise."""
+  """Returns True if the device is a Blackwell/SM100-family (10.x) GPU."""
   return _cc_between(10.0, 11.0, device)
+
+
+def is_sm103(device: jax.Device | None = None) -> bool:
+  """Returns True if the device is a GB300 (sm103) GPU and False otherwise."""
+  return _cc_between(10.3, 10.4, device)
+
+
+def is_sm107(device: jax.Device | None = None) -> bool:
+  """Returns True if the device is a VR200 (sm107) GPU and False otherwise."""
+  return _cc_between(10.7, 10.8, device)
+
+
+def has_tcgen05_int8_support(device: jax.Device | None = None) -> bool:
+  """Returns True if the device supports tcgen05 .kind::i8 (int8 x int4) MMA."""
+  return _cc_between(10.0, 10.2, device)
 
 
 def has_mosaic_gpu_support(device: jax.Device | None = None) -> bool:

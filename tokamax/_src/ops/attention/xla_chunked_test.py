@@ -182,9 +182,10 @@ class XlaPagedAttentionTest(test_base.AttentionTestBase):
     )
 
     impl_kwargs = kwargs.pop("impl_kwargs", {})
+    mask = impl_kwargs.get("mask", xla_chunked.Mask())
     if (
         impl_kwargs.get("is_causal", False)
-        or impl_kwargs.get("mask", xla_chunked.Mask()).is_causal
+        or (isinstance(mask, xla_chunked.Mask) and mask.is_causal)
         or kwargs.get("is_causal", False)
     ):
       self.skipTest("Causal mask unsupported with paged attention.")

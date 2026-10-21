@@ -26,7 +26,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.normalization import api as norm_api
 
-
+type AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 type Implementation = Literal["xla", "triton"]
 type Residuals = None
 CanonicalPrecision = precision_lib.CanonicalPrecision
@@ -38,16 +38,16 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   @override
   def bind(
       self,
-      x: Float[Array, "N N C"],
-      mask: Bool[Array, "N N"],
-      projection_in_weights: Float[Array, "C 2 H"],
-      gate_in_weights: Float[Array, "C 2 H"],
-      projection_out_weights: Float[Array, "H D"],
-      gate_out_weights: Float[Array, "C D"],
-      layernorm_in_scale: Float[Array, "C"],
-      layernorm_in_offset: Float[Array, "C"],
-      layernorm_out_scale: Float[Array, "H"],
-      layernorm_out_offset: Float[Array, "H"],
+      x: Float[Array | AbstractArray, "N N C"],
+      mask: Bool[Array | AbstractArray, "N N"],
+      projection_in_weights: Float[Array | AbstractArray, "C 2 H"],
+      gate_in_weights: Float[Array | AbstractArray, "C 2 H"],
+      projection_out_weights: Float[Array | AbstractArray, "H D"],
+      gate_out_weights: Float[Array | AbstractArray, "C D"],
+      layernorm_in_scale: Float[Array | AbstractArray, "C"],
+      layernorm_in_offset: Float[Array | AbstractArray, "C"],
+      layernorm_out_scale: Float[Array | AbstractArray, "H"],
+      layernorm_out_offset: Float[Array | AbstractArray, "H"],
       triangle_type: Literal["incoming", "outgoing"],
       *,
       precision: jax.lax.PrecisionLike = None,
