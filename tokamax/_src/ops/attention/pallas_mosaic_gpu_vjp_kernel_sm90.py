@@ -207,13 +207,13 @@ def flash_attention_vjp_kernel(
     if bias.shape[-2] != 1:
       bias = pad_seq(bias, -2)
     if bias.shape[-1] != 1:
-      bias = pad_seq(bias, -1)
+      bias = shape_lib.pad_to_next_multiple_of(bias, 64, -1)
 
   if mask is not None:
     if mask.shape[-2] != 1:
-      mask = pad_seq(mask, -2)
+      mask = shape_lib.pad_to_next_multiple_of(mask, block_q_dkv, -2)
     if mask.shape[-1] != 1:
-      mask = pad_seq(mask, -1)
+      mask = shape_lib.pad_to_next_multiple_of(mask, block_kv_dq, -1)
     mask = mask.astype(jnp.int8)
 
   if k_start is not None and k_start.shape[-1] != 1:

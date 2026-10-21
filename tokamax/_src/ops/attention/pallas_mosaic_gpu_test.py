@@ -236,6 +236,18 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     with test_base.override_test_args(atol=0.02, atol_grads=0.04):
       super()._test_small_sequences(seq_q, seq_kv)
 
+  def test_unaligned_seq_kv_bias_and_mask_vjp(self):
+    self._run_test(
+        q_shape=(2, 129, 4, 64),
+        kv_shape=(2, 129, 4, 64),
+        bias_shape=(2, 4, 129, 129),
+        mask_shape=(2, 4, 129, 129),
+        dtype=jnp.bfloat16,
+        atol=0.02,
+        atol_grads=0.04,
+        expect_supported=self._supports_bias and self._supports_mask,
+    )
+
   @override
   def _test_vmap(self, vmap_in_axes):
     if gpu_utils.is_sm80():
