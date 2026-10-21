@@ -569,7 +569,7 @@ SHARDS: ShardMap = {
         paths=('tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',),
         minutes=21,
     ),
-    'kda-megakernel-forward': Spec(
+    'experimental-kda-megakernel-forward': Spec(
         paths=(
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_fused_test.py',
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_test.py',
@@ -577,7 +577,7 @@ SHARDS: ShardMap = {
         ),
         minutes=10,
     ),
-    'kda-megakernel-backward': Spec(
+    'experimental-kda-megakernel-backward': Spec(
         paths=(
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_bwd_fused_test.py',
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_remat_test.py',
