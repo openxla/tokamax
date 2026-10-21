@@ -97,13 +97,13 @@ def _training(suite, iterations, baseline, heads, tokens, num_segments):
                    packed_output=True))]
     mode = "forward"
   elif suite == "backward":
-    configs = [("staged", mosaic.Config(fuse_backward=False)),
-               ("fused", mosaic.Config(fuse_backward=True))]
+    configs = [("staged", mosaic.Config(fuse_forward=True, fuse_backward=False)),
+               ("fused", mosaic.Config(fuse_forward=True, fuse_backward=True))]
     mode = "forward_and_vjp"
   else:
-    configs = [("aligned", mosaic.Config(fuse_backward=True)),
+    configs = [("aligned", mosaic.Config(fuse_forward=True, fuse_backward=True)),
                ("native-packed", mosaic.Config(
-                   fuse_backward=True, packed_forward=True,
+                   fuse_forward=True, fuse_backward=True, packed_forward=True,
                    packed_output=True, packed_backward=True,
                    packed_gradients=True))]
     mode = "forward_and_vjp"
