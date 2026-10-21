@@ -416,7 +416,7 @@ class DotProductAttentionCudnnTest(DotProductAttentionTest):
         )
 
   def test_impl_in_hlo(self):
-    fn = functools.partial(api.dot_product_attention, implementation=self.IMPL)
+    fn = functools.partial(api.dot_product_attention, implementation=self.IMPL)  # pyrefly: ignore[bad-argument-type]
     x = jax.ShapeDtypeStruct((2, 256, 4, 64), dtype=jnp.bfloat16)
     lowered = jax.jit(fn).lower(x, x, x)
     self.assertIsNotNone(hlo := lowered.compiler_ir('hlo'))

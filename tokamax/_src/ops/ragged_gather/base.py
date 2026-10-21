@@ -21,6 +21,8 @@ from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
+
 
 def ragged_gather(
     x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
@@ -35,10 +37,10 @@ class RaggedGather[C](op.Op[Any, jax.Array, None, C, Any]):
   @jaxtyping.jaxtyped
   def bind(
       self,
-      x: Shaped[Array, "in_size hidden_size"],
-      indices: Int[Array, "out_size"],
-      start: Int[Array, "1"],
-      end: Int[Array, "1"],
+      x: Shaped[Array | AbstractArray, "in_size hidden_size"],
+      indices: Int[Array | AbstractArray, "out_size"],
+      start: Int[Array | AbstractArray, "1"],
+      end: Int[Array | AbstractArray, "1"],
       *,
       return_residuals: bool = False,
   ) -> op.BoundArguments:

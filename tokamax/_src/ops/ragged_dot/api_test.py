@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from collections.abc import Callable
 import functools
-from typing import override
+from typing import Any, override
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -57,13 +58,25 @@ class _MockDeviceRestrictedOp(base.RaggedDot):
 class RaggedDotTest(parameterized.TestCase):
 
   @parameterized.product(
-      implementation=[None, "xla", "mosaic", "triton"],
+      implementation=[None, "xla", "mosaic", "triton", "mosaic_tpu_v2"],
       activation=[None, relu],
   )
   def test_basic_api(self, implementation, activation):
 
     if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
+
+    if implementation == "triton" and activation is not None and gpu_utils.is_sm90():
+      self.skipTest("Triton ragged_dot with activation VJP crashes on SM90.")
+
+    if implementation == "mosaic_tpu_v2":
+      if (
+          jax.default_backend() != "tpu"
+          or "mosaic_tpu_v2" not in api.IMPLEMENTATIONS
+      ):
+        self.skipTest("mosaic_tpu_v2 is only supported on TPU.")
+      if activation is not None:
+        self.skipTest("mosaic_tpu_v2 does not support `activation`.")
 
     # Current default backend if implementation is None is "mosaic".
     if implementation == "mosaic" or implementation is None:
@@ -138,6 +151,10 @@ class RaggedDotTest(parameterized.TestCase):
           self.assertEmpty(opspecs)
         case "mosaic":
           self.assertIsInstance(opspecs[0].op, mosaic_impl)
+        case "mosaic_tpu_v2":
+          self.assertIsInstance(
+              opspecs[0].op, type(api.IMPLEMENTATIONS["mosaic_tpu_v2"])
+          )
         case None:
           if jax.default_backend() == "gpu":
             # Ensure either a Triton or Mosaic kernel is used.
@@ -245,7 +262,7 @@ class RaggedDotTest(parameterized.TestCase):
 
       # StableHLO export on CPU succeeds with custom call check disabled.
       exported = export.export(
-          dot_fn,
+          dot_fn,  # pyrefly: ignore[bad-argument-type]
           disabled_checks=[
               export.DisabledSafetyCheck.custom_call("tpu_custom_call")
           ],
@@ -265,6 +282,7 @@ class RaggedDotTest(parameterized.TestCase):
 class RaggedDotImplementationTest(test_base.RaggedDotTestBase):
 
   def __init__(self, *args, implementation=None):
+    self._implementation = implementation
     dot_fn = functools.partial(api.ragged_dot, implementation=implementation)
     super().__init__(*args, dot_fn=dot_fn)
 
@@ -279,7 +297,10 @@ class RaggedDotImplementationTest(test_base.RaggedDotTestBase):
     # As Tokamax converts jax.lax.Precision.HIGHEST to BF16_BF16_F32_X6 on TPU,
     # this causes numerical inconsistencies with the tests using
     # jax.lax.Precision.HIGHEST.
-    if jax.default_backend() == "tpu":
+    if (
+        jax.default_backend() == "tpu"
+        and self._implementation != "mosaic_tpu_v2"
+    ):
       self.skipTest("Test disabled on TPU.")
 
     super().setUp()
@@ -328,6 +349,15 @@ class RaggedDotTritonTest(RaggedDotImplementationTest):
 
   def __init__(self, *args):
     super().__init__(*args, implementation="triton")
+    dot_fn = self._dot_fn
+
+    def fn(lhs, rhs, *, activation=None, **kwargs):
+      # Triton kernels only support known `jax.nn` activations.
+      if activation is test_base.relu:
+        activation = jax.nn.relu
+      return dot_fn(lhs, rhs, activation=activation, **kwargs)
+
+    self._dot_fn = fn
 
   def setUp(self):
     if jax.default_backend() != "gpu":
@@ -347,6 +377,196 @@ class RaggedDotXlaTest(RaggedDotImplementationTest):
 
   def __init__(self, *args):
     super().__init__(*args, implementation="xla")
+
+  def _test_quantized(self, *args, **kwargs):
+    if jax.default_backend() == "gpu":
+      self.skipTest("Quantized ragged_dot not supported on GPU for XLA.")
+    super()._test_quantized(*args, **kwargs)
+
+  def _test_bench(self, spec):
+    if jax.default_backend() == "gpu" and (
+        isinstance(spec.get("lhs"), qwix.QArray)
+        or isinstance(spec.get("rhs"), qwix.QArray)
+    ):
+      self.skipTest("Quantized ragged_dot not supported on GPU for XLA.")
+    super()._test_bench(spec)
+
+
+class RaggedDotMosaicTpuV2Test(RaggedDotImplementationTest):
+
+  def __init__(self, *args):
+    super().__init__(*args, implementation="mosaic_tpu_v2")
+    dot_fn = self._dot_fn
+
+    def fn(lhs, rhs, **kwargs):
+      # v2 does not support the element-wise `activation`.
+      if kwargs.get("activation") is not None:
+        self.skipTest("v2 does not support `activation`.")
+      lhs_ = jax.eval_shape(quantization.as_array_or_qarray, lhs)
+      rhs_ = jax.eval_shape(quantization.as_array_or_qarray, rhs)
+      if not isinstance(lhs_, qwix.QArray) and (
+          not isinstance(rhs_, qwix.QArray)
+          or (
+              rhs_.scale.ndim == 3
+              and rhs_.scale.shape[0] == rhs_.shape[0]
+              and rhs_.scale.shape[2] == rhs_.shape[2]
+              and rhs_.shape[1] % rhs_.scale.shape[1] == 0
+          )
+      ):
+        return dot_fn(lhs, rhs, **kwargs)
+      with self.assertRaises(NotImplementedError) as e:
+        _ = dot_fn(lhs, rhs, **kwargs)
+      self.skipTest(f"Test not supported: {e.msg}")
+
+    self._dot_fn = fn
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("mosaic_tpu_v2 is only supported on TPU.")
+    if "mosaic_tpu_v2" not in api.IMPLEMENTATIONS:
+      self.skipTest("mosaic_tpu_v2 implementation not registered.")
+    super().setUp()
+
+  @override
+  def _test_simple(self, dtype):
+    # v2 ignores `precision` and computes on the bf16 MXU, so f32 inputs
+    # requested at `Precision.HIGHEST` are compared at bf16 tolerance.
+    tol = dict(atol=2e-2, rtol=2e-2) if jnp.dtype(dtype) == jnp.float32 else {}
+    with test_base.override_chex_args(**tol):
+      super()._test_simple(dtype)
+
+  @override
+  def _test_quantized(
+      self,
+      a_dtype,
+      b_dtype,
+      a_tile_shape,
+      b_tile_shape,
+      use_as_qarray,
+      activation=None,
+      task=(8, 512, 256, 512),
+  ):
+    with test_base.override_chex_args(atol=0.4, rtol=0.1):
+      super()._test_quantized(
+          a_dtype,
+          b_dtype,
+          a_tile_shape,
+          b_tile_shape,
+          use_as_qarray,
+          activation,
+          task,
+      )
+
+  @override
+  def _test_vjp(self, num_groups, m, k, n, activation=None):
+    # There is a Mosaic compile error most likely comes from the f32 dout /
+    # f32 output combination. Since we mainly use bf16 for inputs and outputs,
+    # this test is skipped. The bf16 path is tested in `RaggedDotTest`.
+    self.skipTest("gmm_v2 dlhs kernel fails to compile in Mosaic.")
+
+  @override
+  def _test_bench(self, spec):
+    device_kind = jax.devices()[0].device_kind
+    if self._testMethodName.endswith("mixtral_8x7b") and device_kind in (
+        "TPU v5",
+        "TPU v5p",
+    ):
+      self.skipTest("gmm_v2 tiling exceeds scoped VMEM on TPU v5.")
+    tol = dict(atol=0.7, rtol=0.1) if "i4" in self._testMethodName else {}
+    with test_base.override_chex_args(**tol):
+      super()._test_bench(spec)
+
+
+class RaggedDotMosaicTpuV2KwargsTest(parameterized.TestCase):
+  """Tests that GMM v2 kwargs are forwarded by `api.ragged_dot` to v2."""
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("mosaic_tpu_v2 is only supported on TPU.")
+    if "mosaic_tpu_v2" not in api.IMPLEMENTATIONS:
+      self.skipTest("mosaic_tpu_v2 implementation not registered.")
+    super().setUp()
+
+  @parameterized.named_parameters(
+      ("fuse_gateup_activation", "fuse_gateup_activation"),
+      ("group_offset", "group_offset"),
+      ("zero_initialize", "zero_initialize"),
+  )
+  def test_kwarg_forwarded(self, kwarg):
+    num_groups, m, k, n = 4, 256, 256, 256
+    lhs, rhs, group_sizes = _get_input_data(num_groups, m, k, n)
+    kwargs = {}
+    if kwarg == "fuse_gateup_activation":
+      kwargs["fuse_gateup_activation"] = "silu"
+    elif kwarg == "group_offset":
+      group_offset = 1
+      # `rhs` holds only the local groups; `group_sizes` stays global.
+      rhs = rhs[group_offset:]
+      kwargs["group_offset"] = jnp.array([group_offset], jnp.int32)
+      kwargs["zero_initialize"] = True
+    elif kwarg == "zero_initialize":
+      kwargs["zero_initialize"] = True
+
+    actual = api.ragged_dot(
+        lhs, rhs, group_sizes, implementation="mosaic_tpu_v2", **kwargs
+    )
+    expected = api.IMPLEMENTATIONS["mosaic_tpu_v2"](
+        lhs, rhs, group_sizes=group_sizes, **kwargs
+    )
+    chex.assert_trees_all_equal(actual, expected)
+
+
+_V2_KWARGS: dict[str, Callable[[int, int], Any]] = {
+    "group_offset": lambda g, n: jnp.array([0], jnp.int32),
+    "zero_initialize": lambda g, n: True,
+    "fuse_gateup_activation": lambda g, n: "silu",
+}
+
+
+class RaggedDotGmmV2CompatibilityAPITest(parameterized.TestCase):
+  """Tests that non-v2 implementations reject the GMM v2 kwargs."""
+
+  def _assert_rejects(self, implementation, kwarg):
+    lhs, rhs, group_sizes = _get_input_data(num_experts=2, m=256, k=128, n=128)
+    value = _V2_KWARGS[kwarg](rhs.shape[0], rhs.shape[-1])
+    with self.assertRaisesRegex(NotImplementedError, kwarg):
+      api.ragged_dot(
+          lhs,
+          rhs,
+          group_sizes,
+          implementation=implementation,
+          **{kwarg: value},
+      )
+
+  def test_xla_rejects_group_offset(self):
+    self._assert_rejects("xla", "group_offset")
+
+  @parameterized.parameters(*_V2_KWARGS)
+  def test_mosaic_tpu_rejects_v2_kwargs(self, kwarg):
+    if (
+        jax.default_backend() != "tpu"
+        or "mosaic_tpu" not in api.IMPLEMENTATIONS
+    ):
+      self.skipTest("Requires TPU and mosaic_tpu.")
+    self._assert_rejects("mosaic_tpu", kwarg)
+
+  @parameterized.parameters(*_V2_KWARGS)
+  def test_triton_rejects_v2_kwargs(self, kwarg):
+    if (
+        "triton" not in api.IMPLEMENTATIONS
+        or not gpu_utils.has_triton_support()
+    ):
+      self.skipTest("Triton not supported on this platform.")
+    self._assert_rejects("triton", kwarg)
+
+  @parameterized.parameters(*_V2_KWARGS)
+  def test_mosaic_gpu_rejects_v2_kwargs(self, kwarg):
+    if (
+        "mosaic_gpu" not in api.IMPLEMENTATIONS
+        or not gpu_utils.has_mosaic_gpu_support()
+    ):
+      self.skipTest("Mosaic GPU not supported on this platform.")
+    self._assert_rejects("mosaic_gpu", kwarg)
 
 
 if __name__ == "__main__":

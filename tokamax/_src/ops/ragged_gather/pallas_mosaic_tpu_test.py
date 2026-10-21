@@ -15,50 +15,35 @@
 """Tests for Pallas/Mosaic Ragged Gather operator on TPU."""
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
-from jax.extend import backend
-import jax.numpy as jnp
-import numpy as np
-from tokamax._src.ops.ragged_gather import base
 from tokamax._src.ops.ragged_gather import pallas_mosaic_tpu
+from tokamax._src.ops.ragged_gather import test_base
 
 jax.config.parse_flags_with_absl()
 
 
-class PallasTpuRaggedGatherTest(parameterized.TestCase):
+class PallasTpuRaggedGatherTest(test_base.RaggedGatherTestBase):
 
-  @parameterized.product(
-      in_out_size=[(512, 32), (512, 400), (512, 1024)],
-      start_end=[(3, 28), (3, 338), (10, 422)],
-      hidden_size=[128, 512, 8192],
-      dtype=[jnp.int8, jnp.bfloat16, jnp.float32],
-  )
-  def test_sc_gather(self, in_out_size, hidden_size, start_end, dtype):
-    if backend.get_default_device().device_kind != "TPU7x":
-      self.skipTest("Only tested on TPU7x.")
+  def __init__(self, *args):
+    super().__init__(*args, gather_fn=pallas_mosaic_tpu.PallasTpuRaggedGather())
 
-    in_size, out_size = in_out_size
-    start, end = start_end
-    start = min(start, out_size)
-    end = min(end, out_size)
-    key = jax.random.key(0)
-    x = jax.random.normal(key, (in_size, hidden_size), jnp.float32)
-    x = x.astype(dtype)
-    indices = jax.random.randint(key, (out_size,), 0, in_size, jnp.int32)
-
-    start_arr = jnp.array([start], jnp.int32)
-    end_arr = jnp.array([end], jnp.int32)
-
-    op = pallas_mosaic_tpu.PallasTpuRaggedGather()
-    actual = op(x, indices, start_arr, end_arr)
-
-    base_op = base.RaggedGather()
-    desired = base_op(x, indices, start_arr, end_arr)
-
-    np.testing.assert_allclose(
-        actual[start:end], desired[start:end], rtol=1e-2, atol=1e-2
-    )
+  def check_sc_gather(
+      self, in_out_size, hidden_size, start_end, dtype, **kwargs
+  ):
+    for max_row_subchunks in [1, 4]:
+      for trim_rows in [True, False]:
+        with self.subTest(
+            max_row_subchunks=max_row_subchunks, trim_rows=trim_rows
+        ):
+          super().check_sc_gather(
+              in_out_size,
+              hidden_size,
+              start_end,
+              dtype,
+              max_row_subchunks=max_row_subchunks,
+              trim_rows=trim_rows,
+              **kwargs,
+          )
 
 
 if __name__ == "__main__":

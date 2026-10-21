@@ -159,14 +159,14 @@ class Autotuner:
               executor_args[config] = (compiled_fn, initialized_args)
             except Exception as e:  # pylint: disable=broad-exception-caught
               vlog_exc_info("Config failed to compile: %s", config)
-              results[config] = e
+              results[config] = e.with_traceback(None)
         except TimeoutError as e:
           slow_configs = [c for c in configs if c not in executor_args]
           vlog_exc_info(
               "Configs timed out during compilation: %s", slow_configs
           )
           for config in slow_configs:
-            results[config] = e
+            results[config] = e.with_traceback(None)
     else:
       for config in configs:
         executor_args[config] = (_benchmark, fn_factory, config, args, kwargs)
@@ -183,10 +183,10 @@ class Autotuner:
             data = future.result()
           except process.BrokenProcessPool as e:
             vlog_exc_info("Config broken: %s", config)
-            results[config] = e
+            results[config] = e.with_traceback(None)
           except Exception as e:  # pylint: disable=broad-exception-caught
             vlog_exc_info("Config failed: %s", config)
-            results[config] = e
+            results[config] = e.with_traceback(None)
           else:
             logging.vlog(
                 1,

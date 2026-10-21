@@ -79,8 +79,8 @@ also compare finite parameter gradients with XLA autodiff. This PR does not
 change backward padding semantics to work around that baseline limitation.
 
 ```bash
-python -m pytest tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_fwd_fused_test.py -v
-python -m pytest tokamax/_src/ops/experimental/kda -v
+python -m pytest tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_fused_test.py -v
+python -m pytest tokamax/_src/ops/kda -v
 python -m tokamax.benchmarks.kda --skip_implementations=xla
 ```
 

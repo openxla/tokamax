@@ -66,15 +66,14 @@ def get_grid_pids(
   return pid_m, pid_n
 
 
-def get_cheapest_grid_pids(
-    pid: ScalarInt,
+def get_cheapest_grid_grouping(
     *,
     grid_m: int,
     grid_n: int,
     block_m_cost: int,
     block_n_cost: int,
-) -> tuple[ScalarInt, ScalarInt]:
-  """Returns the grouped program IDs that minimize the total cost."""
+) -> tuple[int, bool]:
+  """Returns (group_size, group_by_m) that minimizes total cache cost."""
   num_live_progs = jax.devices()[0].core_count
 
   def group_size_m_usage(group_size_m):
@@ -96,7 +95,26 @@ def get_cheapest_grid_pids(
   )
 
   if group_size_m_usage(group_size_m) <= group_size_n_usage(group_size_n):
-    pid_m, pid_n = get_grid_pids(pid, grid_m, grid_n, group_size_m)
-  else:
-    pid_n, pid_m = get_grid_pids(pid, grid_n, grid_m, group_size_n)
+    return group_size_m, True
+  return group_size_n, False
+
+
+def get_cheapest_grid_pids(
+    pid: ScalarInt,
+    *,
+    grid_m: int,
+    grid_n: int,
+    block_m_cost: int,
+    block_n_cost: int,
+) -> tuple[ScalarInt, ScalarInt]:
+  """Returns the grouped program IDs that minimize the total cost."""
+  group_size, group_by_m = get_cheapest_grid_grouping(
+      grid_m=grid_m,
+      grid_n=grid_n,
+      block_m_cost=block_m_cost,
+      block_n_cost=block_n_cost,
+  )
+  if group_by_m:
+    return get_grid_pids(pid, grid_m, grid_n, group_size)
+  pid_n, pid_m = get_grid_pids(pid, grid_n, grid_m, group_size)
   return pid_m, pid_n

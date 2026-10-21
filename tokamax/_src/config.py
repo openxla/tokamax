@@ -25,6 +25,23 @@ import jax
 _DEFAULT = object()
 
 
+def _tokamax_argv() -> list[str]:
+  """Returns `sys.argv` filtered down to the program name and Tokamax flags."""
+  argv = [sys.argv[0]]
+  args = sys.argv[1:]
+  for i, arg in enumerate(args):
+    name = arg.split("=", 1)[0].lstrip("-")
+    if not name.startswith(("tokamax_", "notokamax_")):
+      continue
+    argv.append(arg)
+    # A flag can be in 3 forms: `--tokamax_enum=b`, `--tokamax_enum b`,
+    # or `--tokamax_bool`.
+    # The condition below is for `--tokamax_enum b`.
+    if "=" not in arg and i + 1 < len(args) and not args[i + 1].startswith("-"):
+      argv.append(args[i + 1])
+  return argv
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class _ConfigOption[T]:
   """A configuration option."""
@@ -50,12 +67,15 @@ class _ConfigOption[T]:
   @property
   def value(self) -> T:
     if not flags.FLAGS.is_parsed():
-      # `known_only=True` parses the flags absl actually defines (so any
-      # `--tokamax_*` flags on the command line still take effect) and ignores
-      # the rest instead of raising `UnrecognizedFlagError`. Tokamax is a
-      # library, so `sys.argv` may carry flags owned by the host program
-      # (pytest's `-s`, vLLM's CLI args, etc.) that absl does not recognize.
-      flags.FLAGS(sys.argv, known_only=True)
+      # Tokamax is a library, so `sys.argv` belongs to the host program, not to
+      # us. Parsing all of it means absl interprets the host's arguments: e.g.
+      # `pytest -v -x` makes absl read `-x` as the value of its own integer
+      # `--verbosity` flag and raise. `known_only=True` does not help, because
+      # the damage is done by a flag absl does know (-v). So feed absl only the
+      # `--tokamax_*` arguments, which are unambiguously ours, and let the rest
+      # through untouched. Calling `FLAGS` marks the flags parsed, so later
+      # reads go straight to the flag values.
+      flags.FLAGS(_tokamax_argv(), known_only=True)
     return self.flag.value if (v := self.config.value) is _DEFAULT else v
 
 

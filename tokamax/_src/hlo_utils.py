@@ -30,7 +30,6 @@ from tokamax._src import hlo_utils_common
 from tokamax._src.ops import op as op_lib
 
 DISABLE_JAX_EXPORT_CHECKS: Final[tuple[export.DisabledSafetyCheck, ...]] = (
-    export.DisabledSafetyCheck.custom_call(hlo_utils_common.PALLAS_TRITON_KEY),
     export.DisabledSafetyCheck.custom_call(hlo_utils_common.TRITON_FFI_KEY),
 )
 type HloComputation = (
@@ -63,6 +62,7 @@ def get_kernel_info(
 def get_opspecs(
     x: HloComputation | KernelInfoBase,
     include_xla_kernels: bool = True,
+    include_nested: bool = False,
 ) -> tuple[op_lib.BoundArguments, ...]:
   """Returns `BoundArguments` for all Tokamax ops in a given computation."""
 
@@ -78,13 +78,25 @@ def get_opspecs(
       op_name = kernel.op_name
     else:
       op_name = kernel.metadata_payload
-    json_data = hlo_utils_common.get_json_from_name(op_name)
-    if json_data is None:
-      continue
-
-    op_specs.append(op_lib.BOUND_ARGS_ADAPTER.validate_json(json_data))
+    if include_nested:
+      for json_data in hlo_utils_common.get_jsons_from_name(op_name):
+        op_specs.append(op_lib.BOUND_ARGS_ADAPTER.validate_json(json_data))
+    else:
+      json_data = hlo_utils_common.get_json_from_name(op_name)
+      if json_data is not None:
+        op_specs.append(op_lib.BOUND_ARGS_ADAPTER.validate_json(json_data))
 
   return tuple(op_specs)
+
+
+def get_nested_opspecs(
+    x: HloComputation | KernelInfoBase,
+    include_xla_kernels: bool = True,
+) -> tuple[op_lib.BoundArguments, ...]:
+  """Returns `BoundArguments` for all Tokamax ops including nested sub-ops."""
+  return get_opspecs(
+      x, include_xla_kernels=include_xla_kernels, include_nested=True
+  )
 
 
 def get_bound_args[**P](
@@ -112,7 +124,7 @@ def get_bound_args[**P](
   elif args or kwargs:
     raise ValueError('`args` / `kwargs` are only supported if `f` is callable.')
 
-  bound_args = get_opspecs(f)
+  bound_args = get_opspecs(f)  # pyrefly: ignore[bad-argument-type]
 
   # Filter out bound args so that only unique ones remain.
   seen_keys = set()
@@ -252,7 +264,7 @@ _KERNEL_GETTER: Final[
     hlo_utils_common.MOSAIC_TPU_KEY: _kernel_info_getter(
         hlo_utils_common.MosaicTpuKernelInfo
     ),
-    hlo_utils_common.PALLAS_TRITON_KEY: _kernel_info_getter(
+    hlo_utils_common.TRITON_FFI_KEY: _kernel_info_getter(
         hlo_utils_common.TritonKernelInfo
     ),
 })

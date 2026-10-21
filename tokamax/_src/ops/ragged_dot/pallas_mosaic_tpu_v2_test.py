@@ -20,9 +20,11 @@ import chex
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.gmm_v2 import gmm_v2 as gmm_backend
-from tokamax._src.ops.experimental.gmm_v2 import tgmm_v2 as tgmm_backend
-from tokamax._src.ops.experimental.gmm_v2 import util as gmm_util
+import qwix
+from tokamax._src import quantization
+from tokamax._src.ops.gmm_v2 import gmm_v2 as gmm_backend
+from tokamax._src.ops.gmm_v2 import tgmm_v2 as tgmm_backend
+from tokamax._src.ops.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
 
 
@@ -52,33 +54,43 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
       *,
       op_kwargs,
       kernel_kwargs,
+      op_lhs=None,
+      op_rhs=None,
       atol=2e-2,
-      rtol=2e-2
+      rtol=2e-2,
   ):
+    if (
+        "zero_initialize" not in op_kwargs
+        and "zero_initialize" not in kernel_kwargs
+    ):
+      op_kwargs = dict(zero_initialize=True, **op_kwargs)
+      kernel_kwargs = dict(zero_initialize=True, **kernel_kwargs)
     op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
-    via_op = op(lhs, rhs, group_sizes=group_sizes, **op_kwargs)
+    via_op = op(
+        lhs if op_lhs is None else op_lhs,
+        rhs if op_rhs is None else op_rhs,
+        group_sizes=group_sizes,
+        **op_kwargs,
+    )
     via_kernel = gmm_backend.gmm_v2(
-        lhs, rhs, group_sizes=group_sizes, **kernel_kwargs)
+        lhs, rhs, group_sizes=group_sizes, **kernel_kwargs
+    )
     chex.assert_trees_all_close(via_op, via_kernel, atol=atol, rtol=rtol)
 
   def test_gmm_basic_pipes(self):
-    # Mirrors test_gmm_basic: exercises `rhs_bias` + `group_offset`.
+    # Mirrors test_gmm_basic: exercises `group_offset`.
     batch_size, in_size, out_size = 256, 256, 256
     num_groups, group_offset = 4, 1
     num_local_groups = num_groups - group_offset
-    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
 
     lhs = jax.random.normal(k0, (batch_size, in_size), jnp.bfloat16)
     rhs = jax.random.normal(
         k1, (num_local_groups, in_size, out_size), jnp.bfloat16
     )
-    rhs_bias = jax.random.normal(
-        k2, (num_local_groups, 1, out_size), jnp.bfloat16
-    )
     group_sizes = gmm_util.get_group_sizes(batch_size, num_groups)
 
     kwargs = dict(
-        rhs_bias=rhs_bias,
         group_offset=jnp.array([group_offset], jnp.int32),
     )
     self._assert_gmm_api_matches_kernel(
@@ -181,7 +193,7 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     grad = jax.random.normal(k1, (m, n), jnp.float32)  # [m, n]
     grad_q, grad_scale = gmm_util.quantize_tensor(
         grad,
-        rhs_quant_dtype,
+        rhs_quant_dtype,  # pyrefly: ignore[bad-argument-type]
         axis=0,
         block_size=m,
     )
@@ -194,9 +206,8 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     )
     via_op = drhs_op(
         lhs,
-        grad_q,
+        qwix.QArray(grad_q, grad_scale),
         group_sizes=group_sizes,
-        rhs_scale=grad_scale,
         ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS,
         preferred_element_type=jnp.bfloat16,
     )
@@ -212,7 +223,7 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
 
   def test_gmm_weight_quantized_pipes(self):
     # Mirrors test_gmm_weight_quantized: jnp.float8_e4m3fn
-    # `rhs` + `rhs_scale` + `rhs_bias` +
+    # `rhs` + `rhs_scale` +
     # `group_offset`, with `maybe_quantize_lhs=False`.
     batch_size, in_size, out_size = 128, 512, 512
     num_groups, group_offset, block_size = 4, 1, 256
@@ -224,17 +235,17 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
         key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
     )
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
-    rhs_bias = jax.random.normal(
-        key, (num_local_groups, 1, out_size), jnp.bfloat16
-    )
     group_sizes = gmm_util.get_group_sizes(batch_size, num_groups)
 
-    kwargs = dict(
+    op_rhs = qwix.QArray(rhs_q, rhs_scale)
+    op_kwargs = dict(
+        group_offset=jnp.array([group_offset], jnp.int32),
+    )
+    kernel_kwargs = dict(
         rhs_scale=rhs_scale,
-        rhs_bias=rhs_bias,
         group_offset=jnp.array([group_offset], jnp.int32),
         maybe_quantize_lhs=False,
     )
@@ -242,14 +253,25 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
         lhs,
         rhs_q,
         group_sizes,
-        op_kwargs=kwargs,
-        kernel_kwargs=kwargs,
+        op_rhs=op_rhs,
+        op_kwargs=op_kwargs,
+        kernel_kwargs=kernel_kwargs,
     )
 
   def test_gmm_activation_weight_quantized_pipes(self):
     # Mirrors test_gmm_activation_weight_quantized:
     # jnp.float8_e4m3fn `rhs` + `rhs_scale` with
     # `maybe_quantize_lhs=True` (the lhs-quantization path).
+    tpu_info = pltpu.get_tpu_info()
+    if not (
+        tpu_info.is_matmul_supported(jnp.float8_e4m3fn, jnp.float8_e4m3fn)
+    ) and not gmm_backend.is_manually_cast_matmul_dtype_combo(
+        jnp.float8_e4m3fn, jnp.float8_e4m3fn
+    ):
+      self.skipTest(
+          "Combination float8_e4m3fn and float8_e4m3fn not supported by the"
+          " kernel."
+      )
     batch_size, in_size, out_size = 128, 512, 512
     num_groups, block_size = 4, 512
     key = jax.random.key(0)
@@ -259,24 +281,37 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
         key, (num_groups, in_size, out_size), jnp.bfloat16, -1, 1
     )
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     group_sizes = gmm_util.get_group_sizes(batch_size, num_groups)
 
-    kwargs = dict(rhs_scale=rhs_scale, maybe_quantize_lhs=True)
+    op_lhs = quantization.AsQArray(lhs, jnp.float8_e4m3fn)
+    op_rhs = qwix.QArray(rhs_q, rhs_scale)
     self._assert_gmm_api_matches_kernel(
         lhs,
         rhs_q,
         group_sizes,
-        op_kwargs=kwargs,
-        kernel_kwargs=kwargs,
+        op_lhs=op_lhs,
+        op_rhs=op_rhs,
+        op_kwargs={},
+        kernel_kwargs=dict(rhs_scale=rhs_scale, maybe_quantize_lhs=True),
     )
 
   def test_gmm_quantize_lhs_with_lhs_scale_pipes(self):
     # Mirrors test_gmm_quantize_lhs_with_lhs_scale:
     # jnp.float8_e4m3fn `rhs` + `rhs_scale` with
     # `maybe_quantize_lhs=True` and a user-provided `lhs_scale`.
+    tpu_info = pltpu.get_tpu_info()
+    if not (
+        tpu_info.is_matmul_supported(jnp.float8_e4m3fn, jnp.float8_e4m3fn)
+    ) and not gmm_backend.is_manually_cast_matmul_dtype_combo(
+        jnp.float8_e4m3fn, jnp.float8_e4m3fn
+    ):
+      self.skipTest(
+          "Combination float8_e4m3fn and float8_e4m3fn not supported by the"
+          " kernel."
+      )
     batch_size, in_size, out_size = 128, 512, 512
     num_groups, group_offset, block_size = 4, 1, 512
     num_local_groups = num_groups - group_offset
@@ -287,13 +322,20 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
         key, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
     )
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     lhs_scale = jnp.full((1, 1), 224.0 / 448.0, dtype=jnp.float32)
     group_sizes = gmm_util.get_group_sizes(batch_size, num_groups)
 
-    kwargs = dict(
+    op_lhs = quantization.AsQArray(
+        lhs, jnp.float8_e4m3fn, calibration_method="fixed,-224,224"
+    )
+    op_rhs = qwix.QArray(rhs_q, rhs_scale)
+    op_kwargs = dict(
+        group_offset=jnp.array([group_offset], jnp.int32),
+    )
+    kernel_kwargs = dict(
         rhs_scale=rhs_scale,
         group_offset=jnp.array([group_offset], jnp.int32),
         maybe_quantize_lhs=True,
@@ -303,31 +345,29 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
         lhs,
         rhs_q,
         group_sizes,
-        op_kwargs=kwargs,
-        kernel_kwargs=kwargs,
+        op_lhs=op_lhs,
+        op_rhs=op_rhs,
+        op_kwargs=op_kwargs,
+        kernel_kwargs=kernel_kwargs,
     )
 
   def test_gmm_implicit_padding_pipes(self):
-    # Mirrors test_gmm_implicit_padding: non-tile-aligned `in_size`/`out_size`
-    # with `rhs_bias`.
+    # Mirrors test_gmm_implicit_padding: non-tile-aligned `in_size`/`out_size`.
     batch_size, in_size, out_size = 128, 255, 255
     num_groups = 4
-    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
 
     lhs = jax.random.normal(k0, (batch_size, in_size), jnp.bfloat16)
     rhs = jax.random.normal(k1, (num_groups, in_size, out_size), jnp.bfloat16)
-    rhs_bias = jax.random.normal(k2, (num_groups, 1, out_size), jnp.bfloat16)
     group_sizes = gmm_util.get_group_sizes(batch_size, num_groups)
 
-    kwargs = dict(rhs_bias=rhs_bias)
     self._assert_gmm_api_matches_kernel(
-        lhs, rhs, group_sizes, op_kwargs=kwargs, kernel_kwargs=kwargs
+        lhs, rhs, group_sizes, op_kwargs={}, kernel_kwargs={}
     )
 
   def test_gmm_weight_quantized_padding_pipes(self):
     # Mirrors test_gmm_weight_quantized_padding:
-    # jnp.float8_e4m3fn `rhs` + `rhs_scale` +
-    # `rhs_bias` with a non-tile-aligned `out_size`.
+    # jnp.float8_e4m3fn `rhs` + `rhs_scale` with a non-tile-aligned `out_size`.
     batch_size, in_size, out_size = 128, 512, 500
     num_groups, block_size = 4, 512
     key = jax.random.key(0)
@@ -335,21 +375,23 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     lhs = jax.random.normal(key, (batch_size, in_size), jnp.bfloat16)
     rhs = jax.random.normal(key, (num_groups, in_size, out_size), jnp.bfloat16)
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
-    rhs_bias = jax.random.normal(key, (num_groups, 1, out_size), jnp.bfloat16)
     group_sizes = gmm_util.get_group_sizes(batch_size, num_groups)
 
-    kwargs = dict(
-        rhs_scale=rhs_scale, rhs_bias=rhs_bias, maybe_quantize_lhs=False
+    op_rhs = qwix.QArray(rhs_q, rhs_scale)
+    op_kwargs = dict()
+    kernel_kwargs = dict(
+        rhs_scale=rhs_scale, maybe_quantize_lhs=False
     )
     self._assert_gmm_api_matches_kernel(
         lhs,
         rhs_q,
         group_sizes,
-        op_kwargs=kwargs,
-        kernel_kwargs=kwargs,
+        op_rhs=op_rhs,
+        op_kwargs=op_kwargs,
+        kernel_kwargs=kernel_kwargs,
     )
 
   def test_gmm_nonlocal_groups_produce_zeros_pipes(self):
@@ -366,13 +408,9 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     rhs = jax.random.normal(
         key, (num_local_groups, in_size, out_size), jnp.bfloat16
     )
-    rhs_bias = jax.random.normal(
-        key, (num_local_groups, 1, out_size), jnp.bfloat16
-    )
     group_sizes = gmm_util.get_group_sizes(batch_size, num_groups)
 
     kwargs = dict(
-        rhs_bias=rhs_bias,
         group_offset=jnp.array([group_offset], jnp.int32),
     )
     self._assert_gmm_api_matches_kernel(
@@ -384,22 +422,21 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     )
 
   def test_gmm_fused_activation_pipes(self):
-    # Mirrors test_gmm_fused_activation: `fuse_act` (GLU-style, halves `n`) plus
-    # `rhs_bias`. `out_size` is a multiple of 2 * num_lanes (256) so the gate/up
+    # Mirrors test_gmm_fused_activation: `fuse_act` (GLU-style, halves `n`).
+    # `out_size` is a multiple of 2 * num_lanes (256) so the gate/up
     # split validates.
     batch_size, in_size, out_size = 128, 512, 512
     num_groups = 4
-    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
 
     lhs = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
     rhs = jax.random.uniform(
         k1, (num_groups, in_size, out_size), jnp.bfloat16, -1, 1
     )
-    rhs_bias = jax.random.normal(k2, (num_groups, 1, out_size), jnp.bfloat16)
     group_sizes = gmm_util.get_group_sizes(batch_size, num_groups)
 
-    op_kwargs = dict(rhs_bias=rhs_bias, fuse_gateup_activation="silu")
-    kernel_kwargs = dict(rhs_bias=rhs_bias, fuse_act="silu")
+    op_kwargs = dict(fuse_gateup_activation="silu")
+    kernel_kwargs = dict(fuse_act="silu")
     self._assert_gmm_api_matches_kernel(
         lhs,
         rhs,
@@ -465,25 +502,22 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     tokens, hidden, intermediate = 256, 256, 256
     n = 2 * intermediate  # fused gate/up; `fuse_act` halves it back down.
     num_experts = 4
-    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
 
     x = jax.random.uniform(k0, (tokens, hidden), jnp.bfloat16, -1, 1)
     w1 = jax.random.uniform(k1, (num_experts, hidden, n), jnp.bfloat16, -1, 1)
-    w1_bias = jax.random.normal(k2, (num_experts, 1, n), jnp.bfloat16)
     group_sizes = gmm_util.get_group_sizes(tokens, num_experts)
     # tpu-inference passes `group_offset[0]` (a 0-d scalar) from
     # `jnp.array([0])`.
     group_offset = jnp.array([0], jnp.int32)[0]
 
     op_kwargs = dict(
-        rhs_bias=w1_bias,
         group_offset=group_offset,
         fuse_gateup_activation="silu",
         zero_initialize=False,
         preferred_element_type=x.dtype,
     )
     kernel_kwargs = dict(
-        rhs_bias=w1_bias,
         group_offset=group_offset,
         fuse_act="silu",
         zero_initialize=False,
@@ -510,7 +544,7 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     # MaxText quantizes the expert weights and passes `rhs_scale` to the forward
     # gmm; mirror that with a quantized rhs here.
     rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size
+        rhs, jnp.float8_e4m3fn, axis=1, block_size=block_size  # pyrefly: ignore[bad-argument-type]
     )
     rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
 
@@ -524,9 +558,8 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     # Forward: gmm over the quantized weights (DEFAULT dims).
     out = op(
         lhs,
-        rhs_q,
+        qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
-        rhs_scale=rhs_scale,
         preferred_element_type=jnp.bfloat16,
     )
     # Backward dlhs: gmm over a transposed rhs (DLHS dims; the op transposes the
@@ -575,6 +608,43 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     chex.assert_trees_all_close(out, out_ref, atol=2e-2, rtol=2e-2)
     chex.assert_trees_all_close(dlhs, dlhs_ref, atol=2e-2, rtol=2e-2)
     chex.assert_trees_all_close(drhs, drhs_ref, atol=2e-2, rtol=2e-2)
+
+  def test_autotuning_configs(self):
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(k0, (128, 128), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (4, 128, 128), jnp.bfloat16)
+    group_sizes = jnp.array([32, 32, 32, 32], jnp.int32)
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+    configs = op.bind(lhs, rhs, group_sizes=group_sizes).autotuning_configs
+    self.assertGreater(len(configs), 1)
+    expected = gmm_backend.gmm_v2(
+        lhs, rhs, group_sizes=group_sizes, zero_initialize=True
+    )
+    for config in configs:
+      with self.subTest(f"{config=}"):
+        actual = op.replace(config=config)(
+            lhs, rhs, group_sizes=group_sizes, zero_initialize=True
+        )
+        chex.assert_trees_all_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    dlhs_configs = op.bind(
+        jax.ShapeDtypeStruct((128, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16),
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DLHS_RAGGED_DOT_DIM_NUMS,
+    ).autotuning_configs - {pallas_mosaic_tpu_v2.Config()}
+    self.assertTrue(all(c.tile_k == 128 for c in dlhs_configs))
+    self.assertIn(256, {c.tile_n for c in dlhs_configs})
+
+    drhs_configs = op.bind(
+        jax.ShapeDtypeStruct((128, 7168), jnp.bfloat16),
+        jax.ShapeDtypeStruct((128, 2048), jnp.bfloat16),
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS,
+    ).autotuning_configs - {pallas_mosaic_tpu_v2.Config()}
+    self.assertTrue(all(c.tile_k % 128 == 0 for c in drhs_configs))
+    self.assertTrue(all(c.lhs_buffer_count is None for c in drhs_configs))
+
 
 
 if __name__ == "__main__":
