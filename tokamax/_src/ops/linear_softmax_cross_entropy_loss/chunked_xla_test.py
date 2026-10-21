@@ -15,6 +15,7 @@
 
 """Tests for chunked XLA implementation of linear softmax cross-entropy loss."""
 
+import functools
 import itertools
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -187,6 +188,73 @@ class ChunkedXlaTest(parameterized.TestCase):
         jnp.allclose(chunked_dw, ref_dw, atol=atol, rtol=rtol),
         f"dW mismatch: max diff {jnp.max(jnp.abs(chunked_dw - ref_dw))}",
     )
+
+  def _run_loss_and_grads_comparison(self, v_dim):
+    b_dim = 128
+    h_dim = 64
+    b_block_size = 128
+    v_block_size = 256
+    x_input, labels, weights = test_utils.generate_random_data(
+        jax.random.key(42), b_dim, h_dim, v_dim, dtype=jnp.float32
+    )
+    weights = weights / jnp.sqrt(h_dim)
+
+    test_loss_fn = functools.partial(
+        _chunked_xla_loss_with_config,
+        labels=labels,
+        b_block_size=b_block_size,
+        v_block_size=v_block_size,
+    )
+    chunked_loss, (chunked_dx, chunked_dw) = jax.value_and_grad(
+        test_loss_fn, argnums=(0, 1)
+    )(x_input, weights)
+
+    ref_loss_fn = functools.partial(
+        _plain_reference_loss,
+        labels=labels,
+    )
+    ref_loss, (ref_dx, ref_dw) = jax.value_and_grad(
+        ref_loss_fn, argnums=(0, 1)
+    )(x_input, weights)
+
+    self.assertTrue(
+        jnp.allclose(chunked_loss, ref_loss, atol=1e-3, rtol=1e-3),
+        f"Loss mismatch: chunked={chunked_loss}, ref={ref_loss},"
+        f" diff={jnp.abs(chunked_loss - ref_loss)}",
+    )
+    self.assertTrue(
+        jnp.allclose(chunked_dx, ref_dx, atol=1e-3, rtol=1e-3),
+        f"dX mismatch: max diff {jnp.max(jnp.abs(chunked_dx - ref_dx))}",
+    )
+    self.assertTrue(
+        jnp.allclose(chunked_dw, ref_dw, atol=1e-3, rtol=1e-3),
+        f"dW mismatch: max diff {jnp.max(jnp.abs(chunked_dw - ref_dw))}",
+    )
+
+  def test_unaligned_v_dim_matches_reference(self):
+    self._run_loss_and_grads_comparison(v_dim=300)
+
+  def test_aligned_v_dim_matches_reference(self):
+    self._run_loss_and_grads_comparison(v_dim=512)
+
+
+def _plain_reference_loss(x_input, weights, labels):
+  logits = jnp.dot(x_input, weights)
+  return jnp.sum(
+      jax.nn.logsumexp(logits, axis=-1)
+      - logits[jnp.arange(labels.shape[0]), labels]
+  )
+
+
+def _chunked_xla_loss_with_config(
+    x_input, weights, labels, b_block_size, v_block_size
+):
+  op_instance = chunked_xla.ChunkedXlaLinearSoftmaxCrossEntropyLoss(
+      config=chunked_xla.Config(
+          b_block_size=b_block_size, v_block_size=v_block_size
+      )
+  )
+  return op_instance(x_input, labels, weights, reduction="sum")
 
 
 if __name__ == "__main__":
