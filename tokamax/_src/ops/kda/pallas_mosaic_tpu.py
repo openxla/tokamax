@@ -291,17 +291,27 @@ class PallasMosaicTpuKimiDeltaAttention(
         aligned_starts = aligned_cu_seqlens[..., :-1]
         positions = jnp.arange(aligned_seq_len)
         for batch_index in range(cu_seqlens.shape[0]):
-          in_range = (
-              positions[None, :]
-              >= aligned_starts[batch_index, :, None]
-          ) & (
-              positions[None, :]
-              < (
-                  aligned_starts[batch_index]
-                  + original_lengths[batch_index]
-              )[:, None]
-          )
-          valid_mask = in_range.any(axis=0)
+          if cu_seqlens.shape[-1] > 8193:
+            boundaries = aligned_cu_seqlens[batch_index]
+            seq = jnp.minimum(
+                jnp.searchsorted(boundaries[1:], positions, side="right"),
+                original_lengths.shape[-1] - 1,
+            )
+            valid_mask = (positions < boundaries[-1]) & (
+                positions - boundaries[seq] < original_lengths[batch_index, seq]
+            )
+          else:
+            in_range = (
+                positions[None, :]
+                >= aligned_starts[batch_index, :, None]
+            ) & (
+                positions[None, :]
+                < (
+                    aligned_starts[batch_index]
+                    + original_lengths[batch_index]
+                )[:, None]
+            )
+            valid_mask = in_range.any(axis=0)
           g_aligned = g_aligned.at[:, batch_index].set(
               jnp.where(
                   valid_mask[None, :, None],
