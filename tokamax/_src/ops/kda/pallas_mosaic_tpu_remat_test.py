@@ -33,7 +33,9 @@ def test_rematerialized_backward(dtype, packed):
   results = []
   for fused in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, 
+        config=mosaic.Config(
+            fuse_forward=True,
+            fuse_backward=True,
             rematerialize_for_backward=True,
             fuse_rematerialization=fused,
         )
@@ -62,7 +64,8 @@ def test_dispatch_requires_rematerialization_and_backward_fusion(
   monkeypatch.setattr(kernels, "_rematerialize_states_pallas", unexpected)
   args, kwargs = forward_tests._inputs(jnp.float32, False)
   op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-      config=mosaic.Config(fuse_forward=True, 
+      config=mosaic.Config(
+          fuse_forward=True,
           rematerialize_for_backward=not save_state,
           fuse_backward=save_state,
           fuse_rematerialization=True,
@@ -78,7 +81,9 @@ def test_dispatch_requires_rematerialization_and_backward_fusion(
 def test_fp32_value_correction_preserves_running_state():
   args, kwargs = forward_tests._inputs(jnp.bfloat16, False)
   op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-      config=mosaic.Config(fuse_forward=True, fuse_backward=True, rematerialize_for_backward=True)
+      config=mosaic.Config(
+          fuse_forward=True, fuse_backward=True, rematerialize_for_backward=True
+      )
   )
   _, residuals = forward_tests._call(
       op, dict(kwargs, return_residuals=True), *args
@@ -123,8 +128,11 @@ def test_multiple_heads_batches_without_state(key_dim, value_dim):
   results = []
   for fused in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, 
-            rematerialize_for_backward=True, fuse_rematerialization=fused
+        config=mosaic.Config(
+            fuse_forward=True,
+            fuse_backward=True,
+            rematerialize_for_backward=True,
+            fuse_rematerialization=fused,
         )
     )
     output, pullback = jax.vjp(op, *args)

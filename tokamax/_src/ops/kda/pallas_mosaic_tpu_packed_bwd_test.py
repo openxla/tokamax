@@ -33,7 +33,9 @@ def test_packed_backward(dtype, rematerialize):
   results = []
   for packed in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, 
+        config=mosaic.Config(
+            fuse_forward=True,
+            fuse_backward=True,
             packed_forward=True,
             packed_backward=packed,
             rematerialize_for_backward=rematerialize,
@@ -73,7 +75,9 @@ def test_every_offset_multiple_groups_and_empty_batch(monkeypatch):
   results = []
   for packed in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, packed_backward=packed)
+        config=mosaic.Config(
+            fuse_forward=True, fuse_backward=True, packed_backward=packed
+        )
     )
     output, pullback = jax.vjp(
         functools.partial(forward_tests._call, op, kwargs), *args
@@ -92,7 +96,8 @@ def test_fallback_dispatch(mode, monkeypatch):
   )
   args, kwargs = forward_tests._inputs(jnp.float32, mode != "fixed")
   op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-      config=mosaic.Config(fuse_forward=True, 
+      config=mosaic.Config(
+          fuse_forward=True,
           packed_backward=True,
           fuse_backward=mode != "no_fusion",
           rematerialize_for_backward=mode == "staged_remat",
@@ -124,7 +129,9 @@ def test_wide_values_and_keys(key_dim, value_dim):
   results = []
   for packed in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, packed_backward=packed)
+        config=mosaic.Config(
+            fuse_forward=True, fuse_backward=True, packed_backward=packed
+        )
     )
     call = functools.partial(op, segment_ids=segments, max_num_segments=2)
     output, pullback = jax.vjp(call, *args)

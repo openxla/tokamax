@@ -93,7 +93,12 @@ def test_compaction_forward(dtype):
   results = []
   for compact in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, packed_output=compact, packed_forward=True)
+        config=mosaic.Config(
+            fuse_forward=True,
+            fuse_backward=True,
+            packed_output=compact,
+            packed_forward=True,
+        )
     )
     call = functools.partial(forward_tests._call, op, kwargs)
     results.append(jax.jit(call)(*args))

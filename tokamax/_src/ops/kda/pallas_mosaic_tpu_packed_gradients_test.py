@@ -39,7 +39,9 @@ def test_full_gradient_compaction(dtype, rematerialize):
   results = []
   for compact in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, 
+        config=mosaic.Config(
+            fuse_forward=True,
+            fuse_backward=True,
             packed_forward=True,
             packed_output=True,
             packed_backward=True,
@@ -68,7 +70,9 @@ def test_fixed_length_retains_existing_path(monkeypatch):
   monkeypatch.setattr(kernels, "compact_output", unexpected)
   args, kwargs = forward_tests._inputs(jnp.float32, False)
   op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-      config=mosaic.Config(fuse_forward=True, fuse_backward=True, packed_gradients=True)
+      config=mosaic.Config(
+          fuse_forward=True, fuse_backward=True, packed_gradients=True
+      )
   )
   output, pullback = jax.vjp(
       functools.partial(forward_tests._call, op, kwargs), *args
@@ -98,7 +102,9 @@ def test_preactivated_gate_without_normalization_or_state(key_dim):
   results = []
   for compact in (False, True):
     op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-        config=mosaic.Config(fuse_forward=True, fuse_backward=True, packed_gradients=compact)
+        config=mosaic.Config(
+            fuse_forward=True, fuse_backward=True, packed_gradients=compact
+        )
     )
     output, pullback = jax.vjp(
         functools.partial(forward_tests._call, op, kwargs), *args

@@ -38,7 +38,8 @@ def test_packed_padding_and_empty_state_gradients(
   args, kwargs = forward_tests._inputs(jnp.float32, True)
   kwargs.update(lower_bound=lower_bound, output_final_state=output_final_state)
   op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-      config=mosaic.Config(fuse_forward=True, 
+      config=mosaic.Config(
+          fuse_forward=True,
           fuse_backward=fuse_backward,
           rematerialize_for_backward=rematerialize,
       )
@@ -101,7 +102,8 @@ def test_backward_gate_gradients_against_autodiff(rematerialize):
         functools.partial(api.kimi_delta_attention, implementation="xla")
         if implementation == "xla"
         else mosaic.PallasMosaicTpuKimiDeltaAttention(
-            config=mosaic.Config(fuse_forward=True, 
+            config=mosaic.Config(
+                fuse_forward=True,
                 fuse_backward=implementation == "fused",
                 rematerialize_for_backward=rematerialize,
             )
@@ -130,7 +132,9 @@ def test_rematerialization_keeps_staged_path(monkeypatch):
       kernels, "_saved_state_backward_kernel", unexpected_fusion
   )
   op = mosaic.PallasMosaicTpuKimiDeltaAttention(
-      config=mosaic.Config(fuse_forward=True, fuse_backward=True, rematerialize_for_backward=True),
+      config=mosaic.Config(
+          fuse_forward=True, fuse_backward=True, rematerialize_for_backward=True
+      ),
   )
   output, pullback = jax.vjp(
       functools.partial(forward_tests._call, op, kwargs), *args
