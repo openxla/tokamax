@@ -213,6 +213,8 @@ class OutputRef(_BufferedRef):
         ).wait()
 
   def copy_out(self, dest_ref, grid_indices):
+    if self.cfgs.dims.seq_along_lane:
+      return
     slot = self.current_copy_out_slot
     sem = self.sem_sends.at[slot]
     src_ref = self.window_ref.at[slot]
@@ -262,6 +264,8 @@ class OutputRef(_BufferedRef):
             pltpu.make_async_copy(src_nope, dest_nope, sem).start()
 
   def wait_out(self, dest_ref, grid_indices):
+    if self.cfgs.dims.seq_along_lane:
+      return
     slot = self.current_wait_out_slot
     sem = self.sem_sends.at[slot]
     vmem_ref = self.window_ref.at[slot]
@@ -484,8 +488,11 @@ def create_allocs_and_specs(
       index_map=lambda i: (i, 0, 0, 0),
   )
   is_indexer = cfgs.dims.mode == config.Mode.CSA_INDEXER
+  # SAL writes the cache after the pipeline (128-lane tiles span many grid
+  # steps), so the pipeline neither reads nor writes `cache_ref`.
+  rmw = is_indexer and not cfgs.dims.seq_along_lane
   buffer_type = (
-      pltpu.BufferType.INPUT_OUTPUT if is_indexer else pltpu.BufferType.OUTPUT
+      pltpu.BufferType.INPUT_OUTPUT if rmw else pltpu.BufferType.OUTPUT
   )
   output_alloc = OutputRef.create(
       spec=output_spec,
@@ -495,7 +502,7 @@ def create_allocs_and_specs(
       use_lookahead=False,
       cfgs=cfgs,
   )
-  if is_indexer:
+  if is_indexer and not cfgs.dims.seq_along_lane:
     output_args = (cache_ref, kv_slot_mapping_ref, is_first_mask_ref)
   else:
     output_args = (cache_ref, kv_slot_mapping_ref)
