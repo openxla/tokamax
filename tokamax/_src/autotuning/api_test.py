@@ -498,6 +498,120 @@ class AutotuningTest(parameterized.TestCase):
       expected_len = 1 if ignore_cache else 0
       self.assertLen(res_new.data, expected_len)
 
+  def test_autotuning_result_merge_distinct_ops_same_cache_key(self):
+    device_kind = jax.devices()[0].device_kind
+    bmark_data = benchmarking.BenchmarkData(
+        compile_time_ms=0.0,
+        lower_time_ms=0.0,
+        evaluation_times_ms=(0.0,),
+        metadata={},
+        peak_memory_mb=0.0,
+    )
+    op_xla = lsce_api.IMPLEMENTATIONS["xla"]
+    op_chunked = lsce_api.IMPLEMENTATIONS["chunked_xla"]
+
+    x_struct = jax.ShapeDtypeStruct((8, 16), dtype=jnp.float32)
+    labels_struct = jax.ShapeDtypeStruct((8,), dtype=jnp.int32)
+    w_struct = jax.ShapeDtypeStruct((16, 32), dtype=jnp.float32)
+
+    bound_arg_xla = op_xla.bind(x_struct, labels_struct, w_struct)
+    bound_arg_chunked = op_chunked.bind(x_struct, labels_struct, w_struct)
+
+    self.assertEqual(
+        bound_arg_xla.autotuning_cache_key,
+        bound_arg_chunked.autotuning_cache_key,
+    )
+    self.assertNotEqual(bound_arg_xla.op, bound_arg_chunked.op)
+
+    config_xla = _FakeOpConfig(101)
+    config_chunked = _FakeOpConfig(102)
+    data_xla = autotuner.AutotuningData({config_xla: bmark_data})
+    data_chunked = autotuner.AutotuningData({config_chunked: bmark_data})
+
+    result_xla = api.AutotuningResult(
+        device_kind, ((bound_arg_xla, data_xla),)
+    )
+    result_chunked = api.AutotuningResult(
+        device_kind, ((bound_arg_chunked, data_chunked),)
+    )
+
+    merged = result_xla | result_chunked
+    self.assertLen(merged.data, 2)
+    merged_ops = [entry[0].op for entry in merged.data]
+    self.assertIn(op_xla, merged_ops)
+    self.assertIn(op_chunked, merged_ops)
+
+  def test_autotuning_result_merge_empty_preserves_distinct_ops(self):
+    device_kind = jax.devices()[0].device_kind
+    bmark_data = benchmarking.BenchmarkData(
+        compile_time_ms=0.0,
+        lower_time_ms=0.0,
+        evaluation_times_ms=(0.0,),
+        metadata={},
+        peak_memory_mb=0.0,
+    )
+    op_xla = lsce_api.IMPLEMENTATIONS["xla"]
+    op_chunked = lsce_api.IMPLEMENTATIONS["chunked_xla"]
+
+    x_struct = jax.ShapeDtypeStruct((8, 16), dtype=jnp.float32)
+    labels_struct = jax.ShapeDtypeStruct((8,), dtype=jnp.int32)
+    w_struct = jax.ShapeDtypeStruct((16, 32), dtype=jnp.float32)
+
+    bound_arg_xla = op_xla.bind(x_struct, labels_struct, w_struct)
+    bound_arg_chunked = op_chunked.bind(x_struct, labels_struct, w_struct)
+
+    config_xla = _FakeOpConfig(201)
+    config_chunked = _FakeOpConfig(202)
+    data_xla = autotuner.AutotuningData({config_xla: bmark_data})
+    data_chunked = autotuner.AutotuningData({config_chunked: bmark_data})
+
+    combined_initial = api.AutotuningResult(
+        device_kind,
+        ((bound_arg_xla, data_xla), (bound_arg_chunked, data_chunked)),
+    )
+    empty_result = api.AutotuningResult(device_kind, ())
+
+    merged_with_empty = combined_initial | empty_result
+    self.assertLen(merged_with_empty.data, 2)
+    merged_ops = [entry[0].op for entry in merged_with_empty.data]
+    self.assertIn(op_xla, merged_ops)
+    self.assertIn(op_chunked, merged_ops)
+
+  def test_autotuning_result_merge_same_op(self):
+    device_kind = jax.devices()[0].device_kind
+    bmark_data = benchmarking.BenchmarkData(
+        compile_time_ms=0.0,
+        lower_time_ms=0.0,
+        evaluation_times_ms=(0.0,),
+        metadata={},
+        peak_memory_mb=0.0,
+    )
+    op_xla = lsce_api.IMPLEMENTATIONS["xla"]
+
+    x_struct = jax.ShapeDtypeStruct((8, 16), dtype=jnp.float32)
+    labels_struct = jax.ShapeDtypeStruct((8,), dtype=jnp.int32)
+    w_struct = jax.ShapeDtypeStruct((16, 32), dtype=jnp.float32)
+
+    bound_arg_first = op_xla.bind(x_struct, labels_struct, w_struct)
+    bound_arg_second = op_xla.bind(x_struct, labels_struct, w_struct)
+
+    config_first = _FakeOpConfig(301)
+    config_second = _FakeOpConfig(302)
+    data_first = autotuner.AutotuningData({config_first: bmark_data})
+    data_second = autotuner.AutotuningData({config_second: bmark_data})
+
+    result_first = api.AutotuningResult(
+        device_kind, ((bound_arg_first, data_first),)
+    )
+    result_second = api.AutotuningResult(
+        device_kind, ((bound_arg_second, data_second),)
+    )
+
+    merged = result_first | result_second
+    self.assertLen(merged.data, 1)
+    self.assertEqual(merged.data[0][0].op, op_xla)
+    self.assertEqual(merged.data[0][1], data_first | data_second)
+
 
 if __name__ == "__main__":
   absltest.main()

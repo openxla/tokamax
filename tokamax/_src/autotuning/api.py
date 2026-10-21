@@ -191,9 +191,9 @@ class AutotuningResult:
   def __or__(self, other: "AutotuningResult") -> "AutotuningResult":
     """Returns a new AutotuningResult that is the merge of `self` and `other`.
 
-    When there are multiple BoundArguments with the same autotuning cache key,
-    the autotuning data for that key will be merged with data from the
-    right-hand side taking precedence.
+    When there are multiple BoundArguments with the same autotuning cache key
+    for the same op, the autotuning data for that key will be merged with data
+    from the right-hand side taking precedence.
 
     Args:
       other: The AutotuningResult to combine with `self`.
@@ -206,10 +206,10 @@ class AutotuningResult:
     """
     if self.device_kind != other.device_kind:
       raise ValueError("Device kinds do not match.")
-    data = {ba.autotuning_cache_key: (ba, d) for ba, d in self.data}
+    data = {(ba.op, ba.autotuning_cache_key): (ba, d) for ba, d in self.data}
 
     for new_ba, new_data in other.data:
-      key = new_ba.autotuning_cache_key
+      key = (new_ba.op, new_ba.autotuning_cache_key)
       ba, d = data.setdefault(key, (new_ba, new_data))
       if d is not new_data:
         data[key] = (ba, d | new_data)
