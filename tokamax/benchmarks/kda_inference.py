@@ -19,7 +19,7 @@ from absl.testing import absltest, parameterized
 import jax
 import jax.numpy as jnp
 import tokamax
-from tokamax._src.ops.experimental.kda import api, inference
+from tokamax._src.ops.kda import api, inference
 
 
 class KdaInferenceBenchmark(parameterized.TestCase):
