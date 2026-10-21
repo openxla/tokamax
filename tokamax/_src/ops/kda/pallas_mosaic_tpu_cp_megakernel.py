@@ -1742,28 +1742,26 @@ def _bwd_mega_kernel(
 
           @pl.when(is_last_chunk & (~is_last_local_segment))
           def _load_dht_cp():
-            _dma_state_in(
-                dht_ref,
-                dh_tmp_ref,
-                state_sems_bwd.at[1],
-                mb_offset,
-                batch_idx,
-                seq_idx,
-            )
+            if dht_ref is None:
+              dh_tmp_ref[:] = jnp.zeros(dh_tmp_ref.shape, dh_tmp_ref.dtype)
+            else:
+              _dma_state_in(
+                  dht_ref, dh_tmp_ref, state_sems_bwd.at[1],
+                  mb_offset, batch_idx, seq_idx,
+              )
 
         else:
 
           @pl.when(is_last_chunk)
           def load_dht():
             with jax.named_scope("_dma_state_in"):
-              _dma_state_in(
-                  dht_ref,
-                  dh_tmp_ref,
-                  state_sems_bwd.at[1],
-                  mb_offset,
-                  batch_idx,
-                  seq_idx,
-              )
+              if dht_ref is None:
+                dh_tmp_ref[:] = jnp.zeros(dh_tmp_ref.shape, dh_tmp_ref.dtype)
+              else:
+                _dma_state_in(
+                    dht_ref, dh_tmp_ref, state_sems_bwd.at[1],
+                    mb_offset, batch_idx, seq_idx,
+                )
 
         @pl.when(jnp.logical_not(is_valid))
         def _zero_invalid_slot():
@@ -1898,15 +1896,12 @@ def _bwd_mega_kernel(
 
         @pl.when(is_first_chunk)
         def write_dh0():
-          with jax.named_scope("_dma_state_out"):
-            _dma_state_out(
-                dh_tmp_ref,
-                dh0_ref,
-                state_sems_bwd.at[2],
-                mb_offset,
-                batch_idx,
-                seq_idx,
-            )
+          if dh0_ref is not None:
+            with jax.named_scope("_dma_state_out"):
+              _dma_state_out(
+                  dh_tmp_ref, dh0_ref, state_sems_bwd.at[2],
+                  mb_offset, batch_idx, seq_idx,
+              )
 
       assert DMA_INPUT_BUFFER_COUNT == 2 and DMA_OUTPUT_BUFFER_COUNT == 2
 
@@ -2307,19 +2302,16 @@ def chunk_kda_bwd_fusion(
   chunk_seg_ids = segment_ids.reshape(B, NT, BT)[:, :, 0]
   cu_seqlens = jnp.zeros((B, 1), dtype=jnp.int32)
   aligned_cu_seqlens = cu_seqlens
-  chunk_indices = jnp.zeros((B, NT, 2), dtype=jnp.int32)
+  # Aligned execution never reads packed chunk metadata.
+  chunk_indices = jnp.zeros((1,), dtype=jnp.int32)
   compact_chunk_metadata = False
   chunk_metadata = chunk_indices
 
-  dht_arr = (
-      dht
-      if dht is not None
-      else jnp.zeros((B, N_MAX, H, K, V), dtype=jnp.float32)
-  )
+  dht_arr = dht
   initial_state_arr = (
       initial_state
       if initial_state is not None
-      else jnp.zeros((B, N_MAX, H, K, V), dtype=jnp.float32)
+      else jnp.zeros((1, 1, 1, 1, 1), dtype=jnp.float32)
   )
 
   # Match the compact PR #463 M4 layout: one 128-wide row per head/chunk,
@@ -2383,7 +2375,7 @@ def chunk_kda_bwd_fusion(
           (N_HG * B * DB_NT * MB_PAD, BETA_pad), beta.dtype
       ),  # db
       jax.ShapeDtypeStruct((H, B, NT, BT, K), dg_out_dtype),  # dg
-      jax.ShapeDtypeStruct((H, B, N_MAX, K, V), jnp.float32),  # dh0
+      jax.ShapeDtypeStruct((H, B, N_MAX, K, V), jnp.float32) if return_dh0 else None,
       jax.ShapeDtypeStruct(
           (H, B, NT, K, V) if not disable_recompute else (1, 1, 1, 1, 1),
           jnp.float32,
@@ -2408,15 +2400,16 @@ def chunk_kda_bwd_fusion(
   Aqk_r = _pad_bt_4d(Aqk).reshape(H, B, NT, BT, BT_pad)
   Akk_r = _pad_bt_4d(Akk).reshape(H, B, NT, BT, BT_pad)
   do_r = do if packed_inputs else do.reshape(H, B, NT, BT, V)
-  dht_arr = dht_arr.astype(jnp.float32).transpose(2, 0, 1, 3, 4)
+  if dht_arr is not None:
+    dht_arr = dht_arr.astype(jnp.float32).transpose(2, 0, 1, 3, 4)
   dq_r, dk_r, dv_r, db_r, dg_r, dh0_r, _ = pl.pallas_call(
       kernel,
       out_shape=out_shape,
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=5,
           grid=(),
-          in_specs=[any_spec] * 11,
-          out_specs=[any_spec] * 7,
+          in_specs=[any_spec] * 9 + [any_spec if dht_arr is not None else None, any_spec],
+          out_specs=[any_spec] * 5 + [any_spec if return_dh0 else None, any_spec],
       ),
       compiler_params=pltpu.CompilerParams(
           disable_bounds_checks=True,
@@ -2459,8 +2452,8 @@ def chunk_kda_bwd_fusion(
 
   pass
 
-  dh0_out = dh0_r.transpose(1, 2, 0, 3, 4)
-  if initial_state is not None:
+  dh0_out = dh0_r.transpose(1, 2, 0, 3, 4) if return_dh0 else None
+  if dh0_out is not None and initial_state is not None:
     dh0_out = dh0_out.astype(initial_state.dtype)
   return (
       dq_r.reshape(H, B, T, K),

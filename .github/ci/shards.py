@@ -574,6 +574,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_fused_test.py',
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_test.py',
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_output_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_resource_test.py',
         ),
         minutes=10,
     ),
@@ -590,6 +591,8 @@ SHARDS: ShardMap = {
         paths=(
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_cp_fused_test.py',
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_cp_megakernel_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_workspace_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_workspace_tpu_test.py',
         ),
         minutes=10,
     ),

@@ -90,6 +90,7 @@ def compact_output(output, original_cu, aligned_cu, tokens, *, chunk_size=64):
   )
   if (
       chunk_size != 64
+      or original_cu.size + aligned_cu.size > 2 * 8193
       or width % 128
       or heads % mini_batch
       or per_head * mini_batch > limits.vmem_limit_bytes
