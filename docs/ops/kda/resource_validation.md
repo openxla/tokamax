@@ -94,8 +94,10 @@ summed. No jax.debug.callback or io_callback is inserted into the graph.
 
 ## Correctness and resource evidence
 
-- Forward branch alone: 32 native tests passed (forward fusion plus 13 resource
-  tests); inference branch alone: 22 native tests passed.
+- Forward branch alone: 32 tests passed in the TPU environment (forward fusion
+  plus 13 resource tests, including dispatch/metadata checks). Inference branch:
+  22 passed, comprising 12 native numerical cases, six unsupported-entry checks
+  and four abstract TPU export checks. Pass counts are not kernel-launch counts.
 - Cumulative integration: 66 native tests passed, including optional-state,
   packed backward/gradient compaction and resource tests. Earlier 78 native
   backward/CP tests also passed; these sets overlap and must not be summed.
