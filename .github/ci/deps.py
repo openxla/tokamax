@@ -69,7 +69,7 @@ TEST_FILE_PREFIX: Final[str] = 'test_'
 
 # Non-Python files that cannot change what a test does, and so do not force a
 # full run.
-INERT_SUFFIXES: Final[tuple[str, ...]] = ('.md', '.rst', '.pdf')
+INERT_SUFFIXES: Final[tuple[str, ...]] = ('.md', '.rst', '.pdf', '.ipynb')
 
 
 def python_files(root: str = PACKAGE_ROOT) -> list[str]:

@@ -219,7 +219,12 @@ class FailOpenTest(DepsTestCase):
     # live inside the package, and every README or docs/ change cost a full
     # run of every shard. Documentation is the common case for a no-test PR,
     # so getting this backwards was the expensive way round.
-    for path in ('README.md', 'docs/index.md', 'docs/ops/kda/index.md'):
+    for path in (
+        'README.md',
+        'docs/index.md',
+        'docs/ops/kda/index.md',
+        'docs/tokamax_ops.ipynb',
+    ):
       with self.subTest(path=path):
         tests, reason = self.affected(path)
         self.assertEqual(tests, set())
