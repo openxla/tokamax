@@ -42,7 +42,10 @@ def _stage1_scan_step(
 ) -> tuple[jax.Array, jax.Array]:
   q_i, g_i, y_diag_i, state_contrib_i, g_last_i = inputs
   y_off = jnp.matmul(
-      q_i, s_state, preferred_element_type=jnp.float32
+      q_i,
+      s_state,
+      preferred_element_type=jnp.float32,
+      precision=jax.lax.Precision.HIGHEST,
   ) * jnp.exp(g_i)
   y = y_diag_i + y_off
   s_new = s_state * jnp.exp(g_last_i)[None, :] + state_contrib_i

@@ -15,13 +15,9 @@
 
 """PyTorch interface for Pallas TPU Raven GSA operator."""
 
-from typing import Any
-import jax
-import jax.numpy as jnp
-import torch
 from tokamax._src.ops.experimental.raven import pallas_mosaic_tpu as jax_pallas
+from tokamax._src.ops.experimental.raven import pallas_mosaic_tpu_bwd_kernel
 from tokamax.experimental.torch_tpu.ops.raven import torch_base
-from typing_extensions import override
 
 
 class _PallasTpuRavenGSA(torch_base._RavenGSA):
@@ -45,13 +41,21 @@ class _PallasTpuRavenGSA(torch_base._RavenGSA):
 
   def _setup_autograd(self, pallas_module):
     def bwd_jax(q, k, s, g, grad_output, chunk_size=64):
-      def loss_fn(q_, k_, s_, g_):
-        (out, _), _ = self.op_impl_jax._fwd(
-            q_[None], k_[None], s_[None], g_[None], chunk_size=chunk_size
+      is_unbatched = q.ndim == 3
+      if is_unbatched:
+        q, k, s, g, grad_output = (
+            q[None],
+            k[None],
+            s[None],
+            g[None],
+            grad_output[None],
         )
-        return jnp.sum(out[0].astype(jnp.float32) * grad_output.astype(jnp.float32))
-
-      return jax.grad(loss_fn, argnums=(0, 1, 2, 3))(q, k, s, g)
+      dq, dk, ds, dg, _ = pallas_mosaic_tpu_bwd_kernel.raven_pallas_stage1_bwd(
+          q, k, s, g, grad_output, chunk_size=chunk_size
+      )
+      if is_unbatched:
+        dq, dk, ds, dg = dq[0], dk[0], ds[0], dg[0]
+      return dq, dk, ds, dg
 
     bwd_op = pallas_module.jax_op(f"{self.jax_op_name}_bwd", bwd_jax)
 
