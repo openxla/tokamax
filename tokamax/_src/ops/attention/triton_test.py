@@ -67,6 +67,36 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
 
     super()._run_test(q_shape, *args, **kwargs)
 
+  @override
+  @absltest.skip("Not implemented yet.")
+  def _test_quantized_int8(self, channelwise_axes, quantize_q):
+    expected_int8_dots = int(quantize_q and 3 not in channelwise_axes)
+    actual_int8_dots = 0
+
+    lax = sys.modules["jax._src.lax"]
+    orig_dot_general = lax.dot_general
+
+    def my_dot_general(
+        lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None
+    ):
+      nonlocal actual_int8_dots
+      a_dt, b_dt, acc_dt = lhs.dtype, rhs.dtype, preferred_element_type
+      is_int8 = a_dt == jnp.int8 and b_dt == jnp.int8 and acc_dt == jnp.int32
+      actual_int8_dots += int(is_int8)
+      return orig_dot_general(
+          lhs, rhs, dimension_numbers, precision, preferred_element_type
+      )
+
+    with mock.patch.object(lax, "dot_general", my_dot_general):
+      super()._test_quantized_int8(channelwise_axes, quantize_q)
+
+    self.assertEqual(expected_int8_dots, actual_int8_dots)
+
+  @override
+  @absltest.skip("Not implemented yet.")
+  def _test_quantized_int4(self, subchannel_size):
+    super()._test_quantized_int4(subchannel_size)
+
   @absltest.skip("Not implemented yet.")
   def test_block_d(self):
     """Tests `block_d != None` with quantization and different head_dim_out."""
