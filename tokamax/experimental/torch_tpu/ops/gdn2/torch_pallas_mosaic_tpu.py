@@ -15,9 +15,8 @@
 
 """PyTorch interface for Pallas TPU GDN-2 operator."""
 
-import jax
-import jax.numpy as jnp
 from tokamax._src.ops.experimental.gdn2 import pallas_mosaic_tpu as jax_pallas
+from tokamax._src.ops.experimental.gdn2 import pallas_mosaic_tpu_bwd_kernel
 from tokamax.experimental.torch_tpu.ops.gdn2 import torch_base
 
 
@@ -42,13 +41,23 @@ class _PallasTpuGatedDeltaNet2(torch_base._GatedDeltaNet2):
 
   def _setup_autograd(self, pallas_module):
     def bwd_jax(q, k, v, g, b, w, do, chunk_size=64):
-      def loss_fn(q_, k_, v_, g_, b_, w_):
-        (out, _), _ = self.op_impl_jax._fwd(
-            q_, k_, v_, g_, b_, w_, chunk_size=chunk_size
+      is_unbatched = q.ndim == 3
+      if is_unbatched:
+        q, k, v, g, b, w, do = (
+            q[None],
+            k[None],
+            v[None],
+            g[None],
+            b[None],
+            w[None],
+            do[None],
         )
-        return jnp.sum(out.astype(jnp.float32) * do.astype(jnp.float32))
-
-      return jax.grad(loss_fn, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, g, b, w)
+      dq, dk, dv, dg, db, dw, _ = pallas_mosaic_tpu_bwd_kernel.gdn2_pallas_bwd(
+          q, k, v, g, b, w, do, chunk_size=chunk_size
+      )
+      if is_unbatched:
+        dq, dk, dv, dg, db, dw = dq[0], dk[0], dv[0], dg[0], db[0], dw[0]
+      return dq, dk, dv, dg, db, dw
 
     bwd_op = pallas_module.jax_op(f"{self.jax_op_name}_bwd", bwd_jax)
 

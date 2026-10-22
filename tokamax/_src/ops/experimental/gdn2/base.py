@@ -35,10 +35,20 @@ def _step_token(
   q_t, k_t, v_t, g_t, b_t, w_t = inputs
   state_decay = state * jnp.exp(g_t)[:, None]
   beta = b_t * k_t
-  v_pred = beta @ state_decay
+  v_pred = jnp.matmul(
+      beta,
+      state_decay,
+      preferred_element_type=jnp.float32,
+      precision=jax.lax.Precision.HIGHEST,
+  )
   v_new = (w_t * v_t) - v_pred
   state_new = state_decay + k_t[:, None] * v_new[None, :]
-  out_t = q_t @ state_new
+  out_t = jnp.matmul(
+      q_t,
+      state_new,
+      preferred_element_type=jnp.float32,
+      precision=jax.lax.Precision.HIGHEST,
+  )
   return state_new, out_t
 
 
