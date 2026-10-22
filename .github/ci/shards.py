@@ -566,10 +566,17 @@ SHARDS: ShardMap = {
     # `base_test.py` runs all 20 everywhere, so pinning them together would
     # either waste a GPU job or drop the CUDA coverage.
     'experimental-kda-kernel': Spec(
-        paths=(
-            'tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',
-        ),
+        paths=('tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',),
         minutes=21,
+    ),
+    'experimental-kda-megakernel-forward': Spec(
+        paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_fused_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_output_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_resource_test.py',
+        ),
+        minutes=10,
     ),
     # The DeepSeek-V4 sparse MLA op, new since the last rebalance. Timed from
     # the catch-all of run 38087594559, where it was the only file group: 11.2m
