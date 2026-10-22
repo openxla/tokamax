@@ -48,7 +48,7 @@ class _F32PrecisionXlaAttentionVjp(base.DotProductAttentionVjp):
     )
 
 
-@absltest.skip("Not implemented yet.")
+@absltest.skipIf(fa is None, "Requires jax_triton.")
 class TritonFlashAttentionTest(test_base.AttentionTestBase):
 
   def __init__(self, *args):
@@ -67,6 +67,7 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
 
     super()._run_test(q_shape, *args, **kwargs)
 
+  @absltest.skip("Not implemented yet.")
   def test_block_d(self):
     """Tests `block_d != None` with quantization and different head_dim_out."""
     assert fa is not None
@@ -94,6 +95,27 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
     x = [jax.random.normal(k, (2, 256, 2, d)) for k, d in zip(keys, head_dims)]
     self._run_test_with_inputs(*x, impl=impl, ref_impl=ref_impl, test_vjp=False)
 
+  def test_block_d_unquantized(self):
+    assert fa is not None
+    assert isinstance(self._attention_fn, fa.TritonFlashAttention)
+    config = fa.Config(
+        block_q=64,
+        block_k=64,
+        block_d=64,
+        block_d_out=32,
+        num_warps=4,
+        num_stages=1,
+    )
+    keys = jax.random.split(jax.random.PRNGKey(0), 3)
+    head_dims = (512, 512, 256)
+    x = [jax.random.normal(k, (2, 256, 2, d)) for k, d in zip(keys, head_dims)]
+    self._run_test_with_inputs(
+        *x,
+        impl=self._attention_fn.replace(config=config),
+        atol=5e-6,
+        test_vjp=False,
+    )
+
   @parameterized.parameters(1, 2)
   def test_small_block_q(self, block_q: int):
     assert fa is not None
@@ -103,7 +125,67 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
     impl = self._attention_fn.replace(config=config)
     self._run_test((2, 256, 2, 64), impl=impl)
 
+  def test_k_range_non_divisible_seq_len_q(self):
+    assert fa is not None
+    assert isinstance(self._attention_fn, fa.TritonFlashAttention)
+    config = fa.Config(block_q=64, block_k=64, num_warps=4, num_stages=2)
+    seq_len = 1000
+    q_idx = jnp.arange(seq_len)
+    mask = base.Mask(
+        k_start=(jnp.minimum(q_idx, 300) // 2)[None],
+        k_end=jnp.minimum(q_idx + 1, 500)[None],
+    )
+    self._run_test(
+        (2, seq_len, 4, 64),
+        impl=self._attention_fn.replace(config=config),
+        impl_kwargs=dict(mask=mask),
+        ref_kwargs=dict(mask=mask.as_array(seq_len, seq_len)),
+        atol_grads=2e-5,
+    )
+
+  def test_neg_inf_bias(self):
+    assert fa is not None
+    assert isinstance(self._attention_fn, fa.TritonFlashAttention)
+    config = fa.Config(block_q=64, block_k=64, num_warps=4, num_stages=2)
+    seq_len = 256
+    keys = jax.random.split(jax.random.PRNGKey(0), 3)
+    q, k, v = (jax.random.normal(key, (2, seq_len, 2, 64)) for key in keys)
+    # Odd rows see only `-inf` logits in the first k blocks they visit.
+    row, col = jnp.arange(seq_len)[:, None], jnp.arange(seq_len)[None, :]
+    bias = jnp.where((row % 2 == 1) & (col < 128), float("-inf"), 0.0)
+    self._run_test_with_inputs(
+        q,
+        k,
+        v,
+        bias=bias[None, None],
+        impl=self._attention_fn.replace(config=config),
+        test_vjp=False,
+    )
+
+  @parameterized.parameters(1, 2)
+  def test_use_base2(self, split_k):
+    assert fa is not None
+    assert isinstance(self._attention_fn, fa.TritonFlashAttention)
+    config = fa.Config(
+        block_q=64, block_k=64, num_warps=4, num_stages=2, split_k=split_k
+    )
+    impl = self._attention_fn.replace(use_base2=True, config=config)
+    self._run_test((2, 256, 2, 64), impl=impl)
+
+  def test_tanh_clipping_float16(self):
+    self._run_test(
+        (2, 256, 2, 64),
+        dtype=jnp.float16,
+        ref_impl=base.DotProductAttention(),
+        logits_soft_cap=30.0,
+        # Unscaled logits push unshifted `exp(s)` past the float16 range.
+        logits_scale=1.0,
+        atol=1e-2,
+        test_vjp=False,
+    )
+
   @parameterized.parameters(2, 3, 4)
+  @absltest.skip("Not implemented yet.")
   def test_split_k(self, split_k):
     self.skipTest("Too slow for OSS")
     assert fa is not None
@@ -129,6 +211,29 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
         impl=impl,
         ref_impl=ref_impl,
         expect_supported=shape[-3] % split_k == 0,
+        test_vjp=False,
+    )
+
+  @parameterized.parameters(2, 4)
+  def test_split_k_k_range(self, split_k):
+    assert fa is not None
+    assert isinstance(self._attention_fn, fa.TritonFlashAttention)
+    config = fa.Config(
+        block_q=64, block_k=64, num_warps=4, num_stages=2, split_k=split_k
+    )
+    seq_len = 512
+    q_idx = jnp.arange(seq_len)
+    # `is_causal` is folded into `k_end`, so it is allowed with `split_k`.
+    mask = base.Mask(
+        k_start=jnp.maximum(q_idx - 300, 0)[None],
+        k_end=jnp.minimum(q_idx + 200, seq_len)[None],
+        is_causal=True,
+    )
+    self._run_test(
+        (2, seq_len, 2, 64),
+        impl=self._attention_fn.replace(config=config),
+        impl_kwargs=dict(mask=mask),
+        ref_kwargs=dict(mask=mask.as_array(seq_len, seq_len)),
         test_vjp=False,
     )
 
