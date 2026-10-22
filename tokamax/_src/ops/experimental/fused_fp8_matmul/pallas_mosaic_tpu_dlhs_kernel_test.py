@@ -115,6 +115,50 @@ class DlhsKernelTest(parameterized.TestCase):
         test_base.SAME_QUANTIZATION_TOL,
     )
 
+  def _assert_pipelined_matches_blocked(self, dout, rhs_q, rhs_scale, **tiles):
+    m, n = dout.shape
+    k = rhs_q.shape[0]
+    if kernel._pipelined_geometry(m, k, n, tiles["bm"], k, n) is None:
+      self.skipTest("The pipelined kernel does not apply on this device.")
+    tiles |= dict(bk=k, bn=n)
+    pipelined = self._dlhs(dout, rhs_q, rhs_scale, **tiles)
+    blocked = self._dlhs(dout, rhs_q, rhs_scale, pipelined=False, **tiles)
+    self.assertEqual(pipelined.dtype, blocked.dtype)
+    self.assertTrue(jnp.array_equal(pipelined, blocked, equal_nan=True))
+
+  @parameterized.named_parameters(
+      dict(testcase_name="production", shape=(32768, 3072, 4096), bm=1024),
+      dict(testcase_name="single_m_block", shape=(1024, 3072, 4096), bm=1024),
+      dict(testcase_name="two_accumulator_sets", shape=(1024, 3072, 4096), bm=512),
+      dict(testcase_name="three_m_blocks", shape=(768, 1536, 768), bm=256),
+      dict(testcase_name="smallest", shape=(256, 512, 256), bm=32),
+  )
+  def test_pipelined_matches_blocked(self, shape, bm):
+    self._assert_pipelined_matches_blocked(*_inputs(*shape), bm=bm)
+
+  def test_pipelined_float32_cotangent_and_out_dtype(self):
+    dout, rhs_q, rhs_scale = _inputs(512, 1024, 1024, jnp.float32)
+    self._assert_pipelined_matches_blocked(dout, rhs_q, rhs_scale, bm=512)
+    self._assert_pipelined_matches_blocked(
+        dout, rhs_q, rhs_scale, bm=512, out_dtype=jnp.bfloat16
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="nan_scale_first_lanes", where="scale", value=5),
+      dict(testcase_name="nan_scale_later_column", where="scale", value=300),
+      dict(testcase_name="inf_cotangent", where="dout", value=jnp.inf),
+      dict(testcase_name="nan_cotangent", where="dout", value=jnp.nan),
+  )
+  def test_pipelined_non_finite(self, where, value):
+    # The pipelined kernel's scheduling dependence selects on `isnan` of the
+    # column scales; non-finite inputs must still match the blocked kernel.
+    dout, rhs_q, rhs_scale = _inputs(2048, 1024, 2048)
+    if where == "scale":
+      rhs_scale = rhs_scale.at[value].set(jnp.nan)
+    else:
+      dout = dout.at[3, 17].set(value)
+    self._assert_pipelined_matches_blocked(dout, rhs_q, rhs_scale, bm=512)
+
   @parameterized.named_parameters(
       dict(
           testcase_name="contracting_dims_differ",
