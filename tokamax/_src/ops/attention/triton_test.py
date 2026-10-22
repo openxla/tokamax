@@ -239,7 +239,7 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
 
 
 @pytest.mark.skip(reason="Too slow for OSS regression tests.")
-@absltest.skip("Not implemented yet.")
+@absltest.skipIf(fa is None, "Requires jax_triton.")
 class TritonFlashAttentionWithTritonVjpTest(test_base.AttentionTestBase):
 
   def __init__(self, *args):

@@ -16,23 +16,397 @@
 
 import dataclasses
 import functools
-from typing import ClassVar, override
+import math
+from typing import Any, ClassVar, override
 
 import jax
 import jax.numpy as jnp
+import jax_triton as jt
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import gpu_utils
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import pydantic as pydantic_lib
+from tokamax._src import triton_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 import triton
+import triton.language as tl
 
 Mask = base.Mask
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
+
+_F32_TINY = tl.constexpr(float(jnp.finfo(jnp.float32).tiny))
+
+
+@triton.jit
+def _load_2d_bcast(ptr, offs_r, offs_c, shape, other=0.0):
+  """Loads a block from the trailing two (broadcastable) dims of `shape`."""
+  bound_r: tl.constexpr = shape[1]
+  bound_c: tl.constexpr = shape[2]
+  block_r: tl.constexpr = offs_r.shape[0]
+  block_c: tl.constexpr = offs_c.shape[0]
+  # Broadcast dims still get a size-1 axis, so callers can transpose the block.
+  zero = tl.zeros((1, 1), dtype=tl.int64)
+  r = zero if bound_r == 1 else offs_r[:, None].to(tl.int64) * bound_c
+  c = zero if bound_c == 1 else offs_c[None, :].to(tl.int64)
+  check_r: tl.constexpr = bound_r > 1 and bound_r % block_r != 0
+  check_c: tl.constexpr = bound_c > 1 and bound_c % block_c != 0
+  mask = triton_utils.mask_2d(
+      offs_r, bound_r, offs_c, bound_c, check_r, check_c
+  )
+  return tl.load(ptr + r + c, mask=mask, other=None if mask is None else other)
+
+
+@triton.jit
+def _dot(a, b, input_precision, input_dtype):
+  """Casts both operands to `input_dtype` before `tl.dot`."""
+  return tl.dot(
+      a.to(input_dtype), b.to(input_dtype), input_precision=input_precision
+  )
+
+
+@triton.jit
+def _bwd_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    bias_ptr,
+    mask_ptr,
+    m_ptr,
+    l_ptr,
+    delta_ptr,
+    dout_ptr,
+    dq_ptr,
+    dk_ptr,
+    dv_ptr,
+    ds_ptr,
+    batch_shape: tl.constexpr,
+    batch_strides: tl.constexpr,
+    seq_len_q: tl.constexpr,
+    num_heads_q: tl.constexpr,
+    head_dim: tl.constexpr,
+    seq_len_k: tl.constexpr,
+    num_heads_k: tl.constexpr,
+    head_dim_out: tl.constexpr,
+    head_dim_pow2: tl.constexpr,
+    head_dim_out_pow2: tl.constexpr,
+    block_m1: tl.constexpr,
+    block_n1: tl.constexpr,
+    block_m2: tl.constexpr,
+    block_n2: tl.constexpr,
+    bias_shape: tl.constexpr,
+    mask_shape: tl.constexpr,
+    sm_scale: tl.constexpr,
+    logits_dtype: tl.constexpr,
+    qk_prec: tl.constexpr,
+    qk_dtype: tl.constexpr,
+    wv_prec: tl.constexpr,
+    wv_dtype: tl.constexpr,
+):
+  """Triton MHA backward kernel."""
+  grid_dkdv: tl.constexpr = tl.cdiv(seq_len_k, block_n1)
+  grid_dq: tl.constexpr = tl.cdiv(seq_len_q, block_m2)
+  grid_0: tl.constexpr = tl.constexpr(
+      grid_dkdv if grid_dkdv >= grid_dq else grid_dq
+  )
+  pid_1d = tl.program_id(0)
+  pid = (pid_1d % grid_0).to(tl.int32)
+  pid_h = (pid_1d // grid_0 % num_heads_q).to(tl.int64)
+  pid_b = (
+      tl.full((), 0, tl.int64)
+      if batch_shape == ()
+      else (pid_1d // (grid_0 * num_heads_q)).to(tl.int64)
+  )
+  pid_h_kv = pid_h // (num_heads_q // num_heads_k)
+
+  (
+      stride_qb,
+      stride_kb,
+      stride_vb,
+      stride_bias_b,
+      stride_mask_b,
+      stride_m_b,
+      stride_l_b,
+      stride_delta_b,
+      stride_dout_b,
+  ) = batch_strides
+
+  q_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_qb) + (
+      pid_h * head_dim
+  )
+  k_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_kb) + (
+      pid_h_kv * head_dim
+  )
+  v_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_vb) + (
+      pid_h_kv * head_dim_out
+  )
+  if bias_ptr is not None:
+    bias_ptr = triton_utils.advance_bcast_ptr(
+        bias_ptr,
+        pid_b,
+        batch_shape,
+        stride_bias_b,
+        pid_h,
+        num_heads_q,
+        bias_shape,
+    )
+  if mask_ptr is not None:
+    mask_ptr = triton_utils.advance_bcast_ptr(
+        mask_ptr,
+        pid_b,
+        batch_shape,
+        stride_mask_b,
+        pid_h,
+        num_heads_q,
+        mask_shape,
+    )
+  m_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_m_b) + (
+      pid_h * seq_len_q
+  )
+  l_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_l_b) + (
+      pid_h * seq_len_q
+  )
+  delta_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_delta_b) + (
+      pid_h * seq_len_q
+  )
+  dout_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_dout_b) + (
+      pid_h * head_dim_out
+  )
+
+  dq_ptr += pid_b * (seq_len_q * num_heads_q * head_dim) + pid_h * head_dim
+  dk_ptr += pid_b * (seq_len_k * num_heads_q * head_dim) + pid_h * head_dim
+  dv_ptr += (
+      pid_b * (seq_len_k * num_heads_q * head_dim_out) + pid_h * head_dim_out
+  )
+  if ds_ptr is not None:
+    ds_ptr += pid_b * (num_heads_q * seq_len_q * seq_len_k) + (
+        pid_h * seq_len_q * seq_len_k
+    )
+
+  offs_d = tl.arange(0, head_dim_pow2)
+  offs_d_out = tl.arange(0, head_dim_out_pow2)
+  check_d: tl.constexpr = head_dim != head_dim_pow2
+  check_d_out: tl.constexpr = head_dim_out != head_dim_out_pow2
+  q_stride_m: tl.constexpr = num_heads_q * head_dim
+  do_stride_m: tl.constexpr = num_heads_q * head_dim_out
+  k_stride_n: tl.constexpr = num_heads_k * head_dim
+  v_stride_n: tl.constexpr = num_heads_k * head_dim_out
+  qk_compute_dtype = tl.float64 if qk_dtype == tl.float64 else tl.float32
+
+  start_n = pid * block_n1
+  if start_n < seq_len_k:
+    offs_n1 = start_n + tl.arange(0, block_n1)
+    check_n1: tl.constexpr = seq_len_k % block_n1 != 0
+    k_mask1 = triton_utils.mask_2d(
+        offs_n1, seq_len_k, offs_d, head_dim, check_n1, check_d
+    )
+    k1 = tl.load(
+        k_ptr + offs_n1[:, None].to(tl.int64) * k_stride_n + offs_d[None, :],
+        mask=k_mask1,
+        other=None if k_mask1 is None else 0.0,
+    )
+    k1 = (k1.to(qk_compute_dtype) * sm_scale).to(qk_dtype)
+
+    v_mask1 = triton_utils.mask_2d(
+        offs_n1, seq_len_k, offs_d_out, head_dim_out, check_n1, check_d_out
+    )
+    v1 = tl.load(
+        v_ptr
+        + offs_n1[:, None].to(tl.int64) * v_stride_n
+        + offs_d_out[None, :],
+        mask=v_mask1,
+        other=None if v_mask1 is None else 0.0,
+    )
+
+    dv = tl.zeros((block_n1, head_dim_out_pow2), dtype=tl.float32)
+    dk = tl.zeros((block_n1, head_dim_pow2), dtype=tl.float32)
+
+    check_m1: tl.constexpr = seq_len_q % block_m1 != 0
+    for i in range(tl.cdiv(seq_len_q, block_m1)):
+      offs_m1 = i * block_m1 + tl.arange(0, block_m1)
+      mask_m1_1d = (offs_m1 < seq_len_q) if check_m1 else None
+
+      q_mask1 = triton_utils.mask_2d(
+          offs_m1, seq_len_q, offs_d, head_dim, check_m1, check_d
+      )
+      q1 = tl.load(
+          q_ptr + offs_m1[:, None].to(tl.int64) * q_stride_m + offs_d[None, :],
+          mask=q_mask1,
+          other=None if q_mask1 is None else 0.0,
+      )
+      m1 = tl.load(
+          m_ptr + offs_m1,
+          mask=mask_m1_1d,
+          other=None if mask_m1_1d is None else float("inf"),
+      )
+      l1 = tl.load(
+          l_ptr + offs_m1,
+          mask=mask_m1_1d,
+          other=None if mask_m1_1d is None else _F32_TINY,
+      )
+      sT = _dot(k1, tl.trans(q1), qk_prec, qk_dtype).to(logits_dtype)
+
+      if bias_ptr is not None:
+        b1 = _load_2d_bcast(bias_ptr, offs_m1, offs_n1, bias_shape).to(
+            logits_dtype
+        )
+        sT += tl.trans(b1)
+      sT = sT.to(tl.float32)
+
+      if mask_ptr is not None:
+        mask_val1 = _load_2d_bcast(mask_ptr, offs_m1, offs_n1, mask_shape, 0)
+        sT = tl.where(tl.trans(mask_val1) != 0, sT, float("-inf"))
+
+      if check_n1:
+        sT = tl.where((offs_n1 < seq_len_k)[:, None], sT, float("-inf"))
+
+      pT = tl.math.exp(sT - m1[None, :]) / l1[None, :]
+      # Rows that saw no keys in the forward pass are left with `l == tiny`.
+      pT = tl.where((l1 == _F32_TINY)[None, :], 0.0, pT)
+      do_mask1 = triton_utils.mask_2d(
+          offs_m1, seq_len_q, offs_d_out, head_dim_out, check_m1, check_d_out
+      )
+      do1 = tl.load(
+          dout_ptr
+          + offs_m1[:, None].to(tl.int64) * do_stride_m
+          + offs_d_out[None, :],
+          mask=do_mask1,
+          other=None if do_mask1 is None else 0.0,
+      )
+      dv += _dot(pT, do1, wv_prec, wv_dtype).to(tl.float32)
+      delta1 = tl.load(
+          delta_ptr + offs_m1,
+          mask=mask_m1_1d,
+          other=None if mask_m1_1d is None else 0.0,
+      )
+      dpT = (
+          _dot(v1, tl.trans(do1), wv_prec, wv_dtype).to(tl.float32)
+          - delta1[None, :]
+      )
+      dsT = pT * dpT
+
+      if ds_ptr is not None:
+        ds_mask = triton_utils.mask_2d(
+            offs_m1, seq_len_q, offs_n1, seq_len_k, check_m1, check_n1
+        )
+        tl.store(
+            ds_ptr
+            + offs_m1[:, None].to(tl.int64) * seq_len_k
+            + offs_n1[None, :],
+            tl.trans(dsT).to(ds_ptr.dtype.element_ty),
+            mask=ds_mask,
+        )
+
+      dk += _dot(dsT, q1, qk_prec, qk_dtype).to(tl.float32)
+
+    tl.store(
+        dv_ptr
+        + offs_n1[:, None].to(tl.int64) * do_stride_m
+        + offs_d_out[None, :],
+        dv.to(dv_ptr.dtype.element_ty),
+        mask=v_mask1,
+    )
+    tl.store(
+        dk_ptr + offs_n1[:, None].to(tl.int64) * q_stride_m + offs_d[None, :],
+        (dk * sm_scale).to(dk_ptr.dtype.element_ty),
+        mask=k_mask1,
+    )
+
+  start_m = pid * block_m2
+  if start_m < seq_len_q:
+    offs_m2 = start_m + tl.arange(0, block_m2)
+    check_m2: tl.constexpr = seq_len_q % block_m2 != 0
+    mask_m2_1d = (offs_m2 < seq_len_q) if check_m2 else None
+    q_mask2 = triton_utils.mask_2d(
+        offs_m2, seq_len_q, offs_d, head_dim, check_m2, check_d
+    )
+    q2 = tl.load(
+        q_ptr + offs_m2[:, None].to(tl.int64) * q_stride_m + offs_d[None, :],
+        mask=q_mask2,
+        other=None if q_mask2 is None else 0.0,
+    )
+    q2 = (q2.to(qk_compute_dtype) * sm_scale).to(qk_dtype)
+
+    do_mask2 = triton_utils.mask_2d(
+        offs_m2, seq_len_q, offs_d_out, head_dim_out, check_m2, check_d_out
+    )
+    do2 = tl.load(
+        dout_ptr
+        + offs_m2[:, None].to(tl.int64) * do_stride_m
+        + offs_d_out[None, :],
+        mask=do_mask2,
+        other=None if do_mask2 is None else 0.0,
+    )
+    m2 = tl.load(
+        m_ptr + offs_m2,
+        mask=mask_m2_1d,
+        other=None if mask_m2_1d is None else float("inf"),
+    )[:, None]
+    l2 = tl.load(
+        l_ptr + offs_m2,
+        mask=mask_m2_1d,
+        other=None if mask_m2_1d is None else _F32_TINY,
+    )[:, None]
+    delta2 = tl.load(
+        delta_ptr + offs_m2,
+        mask=mask_m2_1d,
+        other=None if mask_m2_1d is None else 0.0,
+    )[:, None]
+
+    dq = tl.zeros((block_m2, head_dim_pow2), dtype=tl.float32)
+
+    check_n2: tl.constexpr = seq_len_k % block_n2 != 0
+    for i in range(tl.cdiv(seq_len_k, block_n2)):
+      offs_n2 = i * block_n2 + tl.arange(0, block_n2)
+
+      k_mask2 = triton_utils.mask_2d(
+          offs_n2, seq_len_k, offs_d, head_dim, check_n2, check_d
+      )
+      k2 = tl.load(
+          k_ptr + offs_n2[:, None].to(tl.int64) * k_stride_n + offs_d[None, :],
+          mask=k_mask2,
+          other=None if k_mask2 is None else 0.0,
+      )
+      v_mask2 = triton_utils.mask_2d(
+          offs_n2, seq_len_k, offs_d_out, head_dim_out, check_n2, check_d_out
+      )
+      v2 = tl.load(
+          v_ptr
+          + offs_n2[:, None].to(tl.int64) * v_stride_n
+          + offs_d_out[None, :],
+          mask=v_mask2,
+          other=None if v_mask2 is None else 0.0,
+      )
+      s = _dot(q2, tl.trans(k2), qk_prec, qk_dtype).to(logits_dtype)
+
+      if bias_ptr is not None:
+        s += _load_2d_bcast(bias_ptr, offs_m2, offs_n2, bias_shape).to(
+            logits_dtype
+        )
+      s = s.to(tl.float32)
+
+      if mask_ptr is not None:
+        mask_val2 = _load_2d_bcast(mask_ptr, offs_m2, offs_n2, mask_shape, 0)
+        s = tl.where(mask_val2 != 0, s, float("-inf"))
+
+      if check_n2:
+        s = tl.where((offs_n2 < seq_len_k)[None, :], s, float("-inf"))
+
+      p = tl.math.exp(s - m2) / l2
+      p = tl.where(l2 == _F32_TINY, 0.0, p)
+
+      dp = _dot(do2, tl.trans(v2), wv_prec, wv_dtype).to(tl.float32) - delta2
+      ds = p * dp
+      dq += _dot(ds, k2, qk_prec, qk_dtype).to(tl.float32)
+
+    tl.store(
+        dq_ptr + offs_m2[:, None].to(tl.int64) * q_stride_m + offs_d[None, :],
+        (dq * sm_scale).to(dq_ptr.dtype.element_ty),
+        mask=q_mask2,
+    )
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -46,7 +420,7 @@ class Config:
 
 
 @jaxtyping.jaxtyped
-def _bwd(  # pylint: disable=unused-argument,unused-variable
+def _bwd(
     q: Float[Array, "T H D"],
     k: Float[Array, "t h D"],
     v: Float[Array, "t h d"],
@@ -83,6 +457,10 @@ def _bwd(  # pylint: disable=unused-argument,unused-variable
   seq_len_q, num_heads_q, head_dim = q.shape
   seq_len_k, num_heads_k, head_dim_out = v.shape
 
+  if is_causal:
+    causal_mask = jnp.tri(seq_len_q, seq_len_k, dtype=bool)[None]
+    mask = causal_mask if mask is None else mask & causal_mask
+
   m, l = residuals
   delta = jnp.einsum(
       "qhd,qhd->hq", out, dout, preferred_element_type=jnp.float32
@@ -91,10 +469,88 @@ def _bwd(  # pylint: disable=unused-argument,unused-variable
   head_dim_pow2 = max(16, triton.next_power_of_2(head_dim))
   head_dim_out_pow2 = max(16, triton.next_power_of_2(head_dim_out))
 
+  qk_dtype, qk_prec = triton_utils.get_dot_dtype_and_precision(
+      q_k_dot_precision, q.dtype, k.dtype
+  )
+  wv_dtype, wv_prec = triton_utils.get_dot_dtype_and_precision(
+      weights_v_dot_precision, v.dtype, v.dtype
+  )
+  logits_tl_dtype = triton_utils.jnp_to_tl_dtype(logits_dtype)
+
   grid_dkdv = triton.cdiv(seq_len_k, config.block_n1)
   grid_dq = triton.cdiv(seq_len_q, config.block_m2)
 
-  raise NotImplementedError("TODO")
+  @triton_utils.vmap_kernel
+  def bwd_call(
+      batch_shape, batch_strides, q, k, v, bias, mask, m, l, delta, dout
+  ):
+    dq_shape = jax.ShapeDtypeStruct(
+        (*batch_shape, seq_len_q, num_heads_q, head_dim), q.dtype
+    )
+    dk_shape = jax.ShapeDtypeStruct(
+        (*batch_shape, seq_len_k, num_heads_q, head_dim), k.dtype
+    )
+    dv_shape = jax.ShapeDtypeStruct(
+        (*batch_shape, seq_len_k, num_heads_q, head_dim_out), v.dtype
+    )
+    if bias is None:
+      ds_shape_dtype = None
+      none_outs: dict[str, Any] = {"ds_ptr": None}
+    else:
+      ds_shape_dtype = jax.ShapeDtypeStruct(
+          (*batch_shape, num_heads_q, seq_len_q, seq_len_k), ds_dtype
+      )
+      none_outs = {}
+    out_type = (dq_shape, dk_shape, dv_shape, ds_shape_dtype)
+    return jt.triton_call(
+        q,
+        k,
+        v,
+        bias,
+        mask,
+        m,
+        l,
+        delta,
+        dout,
+        kernel=_bwd_kernel,
+        out_type=out_type,
+        grid=(math.prod(batch_shape) * num_heads_q * max(grid_dkdv, grid_dq),),
+        name="triton_flash_attention_vjp",
+        num_stages=config.num_stages,
+        num_warps=config.num_warps,
+        batch_shape=batch_shape,
+        batch_strides=batch_strides,
+        seq_len_q=seq_len_q,
+        num_heads_q=num_heads_q,
+        head_dim=head_dim,
+        seq_len_k=seq_len_k,
+        num_heads_k=num_heads_k,
+        head_dim_out=head_dim_out,
+        head_dim_pow2=head_dim_pow2,
+        head_dim_out_pow2=head_dim_out_pow2,
+        block_m1=config.block_m1,
+        block_n1=config.block_n1,
+        block_m2=config.block_m2,
+        block_n2=config.block_n2,
+        bias_shape=(1, 1, 1) if bias is None else bias.shape[-3:],
+        mask_shape=(1, 1, 1) if mask is None else mask.shape[-3:],
+        sm_scale=float(logits_scale),
+        logits_dtype=logits_tl_dtype,
+        qk_prec=qk_prec,
+        qk_dtype=qk_dtype,
+        wv_prec=wv_prec,
+        wv_dtype=wv_dtype,
+        **none_outs,
+    )
+
+  dq, dk, dv, ds = bwd_call(q, k, v, bias, mask, m, l, delta, dout)
+
+  if num_heads_k < num_heads_q:
+    sum_shape = dk.shape[:-2] + (num_heads_k, num_heads_q // num_heads_k, -1)
+    dk = jnp.sum(dk.reshape(sum_shape), axis=-2)
+    dv = jnp.sum(dv.reshape(sum_shape), axis=-2)
+
+  return dq, dk, dv, ds
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
