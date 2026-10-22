@@ -208,3 +208,31 @@ def get_dot_dtype_and_precision(
   input_precision = get_input_precision(precision, dot_jnp_dtype)
   return jnp_to_tl_dtype(dot_jnp_dtype), input_precision
 
+
+@triton.jit
+def advance_bcast_ptr(
+    ptr, pid_b, batch_shape, batch_strides, pid_h, num_heads, shape
+):
+  """Advances `ptr` to the `(pid_b, pid_h)` slice of a broadcastable array.
+
+  `shape` is the per-batch shape, whose leading (head) dim is either `1` or a
+  divisor of `num_heads`.
+  """
+  ptr += batch_offset(pid_b, batch_shape, batch_strides)
+  if shape[0] != 1:
+    stride: tl.constexpr = shape[1] if len(shape) == 2 else shape[1] * shape[2]
+    ptr += pid_h // (num_heads // shape[0]) * stride
+  return ptr
+
+
+@triton.jit
+def mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c):
+  """Returns the in-bounds mask for a 2D block, or `None` if not needed."""
+  if check_r and check_c:
+    return (offs_r[:, None] < bound_r) & (offs_c[None, :] < bound_c)
+  elif check_r:
+    return offs_r[:, None] < bound_r
+  elif check_c:
+    return offs_c[None, :] < bound_c
+  else:
+    return None

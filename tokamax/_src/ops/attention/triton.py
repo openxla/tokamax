@@ -44,31 +44,6 @@ QArray = base.QArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
 
-@triton.jit
-def _advance_bcast_ptr(
-    ptr, pid_b, batch_shape, batch_strides, pid_h, num_heads_q, shape
-):
-  if ptr is not None:
-    ptr += triton_utils.batch_offset(pid_b, batch_shape, batch_strides)
-    if shape[0] != 1:
-      stride: tl.constexpr = (
-          shape[1] if len(shape) == 2 else shape[1] * shape[2]
-      )
-      ptr += pid_h // (num_heads_q // shape[0]) * stride
-  return ptr
-
-
-@triton.jit
-def _mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c):
-  if check_r and check_c:
-    return (offs_r[:, None] < bound_r) & (offs_c[None, :] < bound_c)
-  elif check_r:
-    return offs_r[:, None] < bound_r
-  elif check_c:
-    return offs_c[None, :] < bound_c
-  else:
-    return None
-
 
 @triton.jit
 def _load_1d_bcast(ptr, offs, shape, other=0):
@@ -85,7 +60,7 @@ def _load_1d_bcast(ptr, offs, shape, other=0):
 def _load_2d(ptr, offs_r, bound_r, stride_r, start_c, bound_c, block_c):
   block_r: tl.constexpr = offs_r.shape[0]
   offs_c = start_c + tl.arange(0, block_c)
-  mask = _mask_2d(
+  mask = triton_utils.mask_2d(
       offs_r,
       bound_r,
       offs_c,
@@ -110,7 +85,9 @@ def _load_2d_bcast(ptr, offs_r, offs_c, shape, other=0.0):
   c = 0 if bound_c == 1 else offs_c[None, :].to(tl.int64)
   check_r: tl.constexpr = bound_r > 1 and bound_r % block_r != 0
   check_c: tl.constexpr = bound_c > 1 and bound_c % block_c != 0
-  mask = _mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c)
+  mask = triton_utils.mask_2d(
+      offs_r, bound_r, offs_c, bound_c, check_r, check_c
+  )
   return tl.load(ptr + r + c, mask=mask, other=None if mask is None else other)
 
 
@@ -225,39 +202,56 @@ def _fwd_kernel(
       + pid_h_kv * head_dim_out
   )
 
-  bias_ptr = _advance_bcast_ptr(
-      bias_ptr, pid_b, batch_shape, stride_bias_b, pid_h, num_heads_q, bias_shape
-  )
-  mask_ptr = _advance_bcast_ptr(
-      mask_ptr, pid_b, batch_shape, stride_mask_b, pid_h, num_heads_q, mask_shape
-  )
-  dropout_mask_ptr = _advance_bcast_ptr(
-      dropout_mask_ptr,
-      pid_b,
-      batch_shape,
-      stride_dropout_b,
-      pid_h,
-      num_heads_q,
-      dropout_shape,
-  )
-  k_start_ptr = _advance_bcast_ptr(
-      k_start_ptr,
-      pid_b,
-      batch_shape,
-      stride_k_start_b,
-      pid_h,
-      num_heads_q,
-      k_start_shape,
-  )
-  k_end_ptr = _advance_bcast_ptr(
-      k_end_ptr,
-      pid_b,
-      batch_shape,
-      stride_k_end_b,
-      pid_h,
-      num_heads_q,
-      k_end_shape,
-  )
+  if bias_ptr is not None:
+    bias_ptr = triton_utils.advance_bcast_ptr(
+        bias_ptr,
+        pid_b,
+        batch_shape,
+        stride_bias_b,
+        pid_h,
+        num_heads_q,
+        bias_shape,
+    )
+  if mask_ptr is not None:
+    mask_ptr = triton_utils.advance_bcast_ptr(
+        mask_ptr,
+        pid_b,
+        batch_shape,
+        stride_mask_b,
+        pid_h,
+        num_heads_q,
+        mask_shape,
+    )
+  if dropout_mask_ptr is not None:
+    dropout_mask_ptr = triton_utils.advance_bcast_ptr(
+        dropout_mask_ptr,
+        pid_b,
+        batch_shape,
+        stride_dropout_b,
+        pid_h,
+        num_heads_q,
+        dropout_shape,
+    )
+  if k_start_ptr is not None:
+    k_start_ptr = triton_utils.advance_bcast_ptr(
+        k_start_ptr,
+        pid_b,
+        batch_shape,
+        stride_k_start_b,
+        pid_h,
+        num_heads_q,
+        k_start_shape,
+    )
+  if k_end_ptr is not None:
+    k_end_ptr = triton_utils.advance_bcast_ptr(
+        k_end_ptr,
+        pid_b,
+        batch_shape,
+        stride_k_end_b,
+        pid_h,
+        num_heads_q,
+        k_end_shape,
+    )
 
   # See base class for explanation of why this is not `-inf`.
   mask_value = float(jnp.finfo(jnp.float32).min)
@@ -434,7 +428,7 @@ def _fwd_kernel(
     if normalize_output:
       acc /= l_i[:, None]
     offs_d_out = i_o * block_d_out + tl.arange(0, block_d_out)
-    out_mask = _mask_2d(
+    out_mask = triton_utils.mask_2d(
         span_m, seq_len_q, offs_d_out, head_dim_out, check_m, check_d_out
     )
     tl.store(
