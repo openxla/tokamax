@@ -716,12 +716,13 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
                 _TCGEN05,
             )
             acc = acc * 512 + int_bias
-            return common.rescale_tcgen05_acc(
-                acc_carry,
-                acc,
-                ws,
-                x_scale,
+            ws = plgpu.layout_cast(
+                lax.broadcast_in_dim(ws, acc.shape, (0,)), _TCGEN05
             )
+            x_scale = plgpu.layout_cast(
+                lax.broadcast_in_dim(x_scale, acc.shape, (1,)), _TCGEN05
+            )
+            return acc_carry + acc * (ws * x_scale)
 
         acc_carry = lax.fori_loop(0, num_k_iters, _loop_body, acc_carry)
         if activation is not None:
