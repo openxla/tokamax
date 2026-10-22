@@ -19,5 +19,8 @@ from tokamax._src.autotuning.api import (
     bound_args_from_json_file as bound_args_from_json_file,
     bound_args_from_json as bound_args_from_json,
     bound_args_to_json as bound_args_to_json,
+    dump_bound_args_to_json as dump_bound_args_to_json,
     get_bound_args as get_bound_args,
 )
+from tokamax._src.autotuning.autotuner import AutotuningData as AutotuningData
+from tokamax._src.ops.op import infer_device_kind as infer_device_kind
