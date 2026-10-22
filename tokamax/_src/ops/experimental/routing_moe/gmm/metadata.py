@@ -15,8 +15,10 @@
 
 """Module that encapsulates metadata used for DMA and scheduling."""
 
+import abc
 import dataclasses
 import functools
+from typing import Any
 
 import jax
 from jax import lax
@@ -26,35 +28,23 @@ import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class MetadataRef:
+class AbstractMetadataRef(abc.ABC):
   """Stores scalar data used for routing and pipeline scheudling."""
 
   gm_id_to_group_id: jax.Array | hijax.TransformedRef
   gm_id_to_m_offset: jax.Array | hijax.TransformedRef
   gm_id_to_num_rows: jax.Array | hijax.TransformedRef
   num_gm: jax.Array | hijax.TransformedRef
-  group_cum_sum: jax.Array | hijax.TransformedRef
-  group_offset: jax.Array | hijax.TransformedRef
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
 
-  @classmethod
-  def create(
-      cls,
-      group_cum_sum: jax.Array,
-      group_offset: jax.Array,
-      cfg: config.RoutingGmmConfig,
-  ):
-    """Wraps scalar data for metadata."""
-    return cls(
+  @staticmethod
+  def _empty_tables(cfg: config.RoutingGmmConfig) -> dict[str, Any]:
+    return dict(
         gm_id_to_group_id=jnp.empty((cfg.max_num_gm,), jnp.int32),
         gm_id_to_m_offset=jnp.empty((cfg.max_num_gm,), jnp.int32),
         gm_id_to_num_rows=jnp.empty((cfg.max_num_gm,), jnp.int32),
         num_gm=jnp.empty((1,), jnp.int32),
-        group_cum_sum=group_cum_sum,
-        group_offset=group_offset,
-        cfg=cfg,
     )
 
   @property
@@ -104,6 +94,34 @@ class MetadataRef:
         jnp.asarray(n_id, dtype),
         jnp.asarray(gm_id, dtype),
         jnp.asarray(k_id, dtype),
+    )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class SortedMetadataRef(AbstractMetadataRef):
+  """Metadata from routing sorted outside the kernel.
+
+  XLA sorts the routed rows by group and counts the rows of each group
+  (`group_cum_sum`); the kernel walks this shard's groups to lay out the tiles.
+  """
+
+  group_cum_sum: jax.Array | hijax.TransformedRef
+  group_offset: jax.Array | hijax.TransformedRef
+
+  @classmethod
+  def create(
+      cls,
+      group_cum_sum: jax.Array,
+      group_offset: jax.Array,
+      cfg: config.RoutingGmmConfig,
+  ) -> "SortedMetadataRef":
+    """Wraps scalar data for metadata."""
+    return cls(
+        **cls._empty_tables(cfg),
+        group_cum_sum=group_cum_sum,
+        group_offset=group_offset,
+        cfg=cfg,
     )
 
   def fill_metadata_and_return_num_gm(self) -> jax.Array:
@@ -172,3 +190,12 @@ class MetadataRef:
       )
     self.num_gm[0] = num_gm
     return num_gm
+
+
+def create_metadata_ref(
+    group_cum_sum: jax.Array,
+    group_offset: jax.Array,
+    cfg: config.RoutingGmmConfig,
+) -> AbstractMetadataRef:
+  """Returns the metadata ref that fills the tables for this config."""
+  return SortedMetadataRef.create(group_cum_sum, group_offset, cfg)

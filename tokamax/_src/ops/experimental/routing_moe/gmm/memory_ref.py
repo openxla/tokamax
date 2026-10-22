@@ -125,7 +125,7 @@ class _BypassBufferedRef(pltpu.BufferedRef):
 class RoutingBufferedRef(_BypassBufferedRef):
   """Shared common interface for both all routed BufferedRef instances."""
 
-  metadata_ref: metadata.MetadataRef = dataclasses.field(
+  metadata_ref: metadata.AbstractMetadataRef = dataclasses.field(
       metadata=dict(static=True)
   )
   # SMEM ref used for indexing src or dst ref.
@@ -140,7 +140,7 @@ class RoutingBufferedRef(_BypassBufferedRef):
   def create(
       cls,
       *args: Any,
-      metadata_ref: metadata.MetadataRef,
+      metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
       **kwargs,
   ):
@@ -257,7 +257,7 @@ class IndexBufferedRef(pltpu.BufferedRef):
     code can cleanly perform idx[offset + i] without worrying about OOB access.
   """
 
-  metadata_ref: metadata.MetadataRef = dataclasses.field(
+  metadata_ref: metadata.AbstractMetadataRef = dataclasses.field(
       metadata=dict(static=True)
   )
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
@@ -268,7 +268,7 @@ class IndexBufferedRef(pltpu.BufferedRef):
       cls,
       *args: Any,
       cfg: config.RoutingGmmConfig,
-      metadata_ref: metadata.MetadataRef,
+      metadata_ref: metadata.AbstractMetadataRef,
       fetch_offset: int,
       **kwargs,
   ):
@@ -561,7 +561,7 @@ class PipelineIndexMaps:
     cfg: Static configuration for the routing GMM kernel.
   """
 
-  metadata_ref: metadata.MetadataRef
+  metadata_ref: metadata.AbstractMetadataRef
   cfg: config.RoutingGmmConfig
 
   def _rows(self, gm_id: jax.Array) -> pl.Slice:
@@ -772,7 +772,7 @@ class PipelineAllocs:
       cls,
       in_hbm_ref: PipelineInputs[hijax.TransformedRef],
       out_hbm_ref: hijax.TransformedRef,
-      metadata_ref: metadata.MetadataRef,
+      metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
   ):
     """Creates BufferedRef allocations for all pipeline inputs and outputs.

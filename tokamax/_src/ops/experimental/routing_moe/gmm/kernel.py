@@ -160,7 +160,7 @@ def routing_gmm(
       scatter_idx=_padded_indices(scatter),
   )
 
-  metadata_obj = metadata.MetadataRef.create(group_cum_sum, group_offset, cfg)
+  metadata_obj = metadata.create_metadata_ref(group_cum_sum, group_offset, cfg)
 
   # Step 4: Specify memory space.
   inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
