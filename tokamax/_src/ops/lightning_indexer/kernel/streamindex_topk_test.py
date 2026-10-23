@@ -1632,6 +1632,99 @@ class ChunkedStreamIndexTopKTest(parameterized.TestCase):
         " fallback that the cases above rely on has changed"
     )
 
+  @parameterized.product(
+      kv_layout=[_HAS, _SAL],
+      block_sizes=[((1, 128, 128), (32, 32, 16)), (8, 2)],
+      verify_q_len=[6, 7],
+  )
+  def test_static_verify_segment_matches_mixed_pass(
+      self, verify_q_len, block_sizes, kv_layout
+  ):
+    """Verify windows of a fixed length (1 + K) in the distribution's middle
+
+    segment run the static query-length pass (`uniform_q_len`). They must
+    select the same positions, with the same scores, as the same step with the
+    windows in the mixed segment, and match the naive reference. Covers the 6-
+    and 7-row query blocks (padded to 8 rows per head) that only this pass
+    runs, in both cache layouts and with the serving block sizes.
+    """
+    bq_sz, bkv_p = block_sizes
+    page_size, H_I, D, comp_ratio = 128, 4, 128, 1
+    T_list = (1, 1, verify_q_len, verify_q_len, verify_q_len, 3, 12)
+    B = len(T_list)
+    S = 2 * page_size
+    S_list = (S,) * B
+    # k == the number of candidate positions: every visible column is selected,
+    # so no tie at the top-k boundary can make two correct answers differ.
+    k = S
+    inputs = _chunk_inputs(T_list, _fragmented_pages(B, 2), page_size, H_I, D)
+    kwargs = self._chunk_call_kwargs(
+        inputs,
+        T_list,
+        S_list,
+        k,
+        comp_ratio,
+        bq_sz,
+        bkv_p,
+        kv_layout,
+        None,
+        return_scores=True,
+    )
+    assert kwargs["distribution"] == (
+        2,
+        2,
+        B,
+    ), "windows start on the mixed pass"
+    mixed_idx, mixed_scores = (np.array(a) for a in streamindex_topk(**kwargs))
+    static_idx, static_scores = (
+        np.array(a)
+        for a in streamindex_topk(**{
+            **kwargs,
+            "distribution": (2, 5, B),
+            "uniform_q_len": verify_q_len,
+        })
+    )
+
+    expected = streamindex_topk_ref(
+        q=inputs.q,
+        weights=inputs.weights,
+        kv=inputs.dequantized_kv,
+        block_table=inputs.block_table,
+        T_list=list(T_list),
+        S_list=list(S_list),
+        cu_q_lens=np.concatenate([[0], np.cumsum(T_list)]).astype(np.int32),
+        k=k,
+        comp_ratio=comp_ratio,
+        H_I=H_I,
+        H_KV=1,
+    )
+    self._verify_padding_at_end(static_idx)
+    np.testing.assert_array_equal(
+        np.sort(static_idx, axis=-1),
+        np.sort(expected, axis=-1),
+        err_msg="static-q verify pass did not match the naive ground truth",
+    )
+
+    # Same positions with bit-identical scores as the mixed pass, row by row,
+    # and rows outside the segment untouched by the split.
+    def by_position(idx, scores):
+      rows = []
+      for i, s in zip(idx, scores):
+        valid = i >= 0
+        order = np.argsort(i[valid], kind="stable")
+        rows.append((i[valid][order], s[valid][order]))
+      return rows
+
+    for row, (mi, ms), (si, ss) in zip(
+        range(len(mixed_idx)),
+        by_position(mixed_idx, mixed_scores),
+        by_position(static_idx, static_scores),
+    ):
+      np.testing.assert_array_equal(
+          si, mi, err_msg=f"row {row}: positions differ"
+      )
+      np.testing.assert_array_equal(ss, ms, err_msg=f"row {row}: scores differ")
+
 
 if __name__ == "__main__":
   absltest.main()
