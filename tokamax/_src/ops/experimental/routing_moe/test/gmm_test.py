@@ -102,6 +102,49 @@ SKIP_METADATA_SHAPES = [
     for skip in (0, 1, 2, 63, 1024)
 ]
 
+LIVE_GROUP_WALK_SHAPES = (
+    dict(
+        testcase_name="single_token_offset0",
+        num_tokens=1,
+        num_experts=512,
+        num_local_experts=512,
+        group_offset=0,
+        topk=10,
+        size_k=512,
+        size_n=1024,
+    ),
+    dict(
+        testcase_name="multi_token_offset0",
+        num_tokens=16,
+        num_experts=512,
+        num_local_experts=512,
+        group_offset=0,
+        topk=10,
+        size_k=512,
+        size_n=1024,
+    ),
+    dict(
+        testcase_name="single_token_offset128",
+        num_tokens=1,
+        num_experts=512,
+        num_local_experts=64,
+        group_offset=128,
+        topk=10,
+        size_k=512,
+        size_n=1024,
+    ),
+    dict(
+        testcase_name="multi_token_offset128",
+        num_tokens=16,
+        num_experts=512,
+        num_local_experts=64,
+        group_offset=128,
+        topk=10,
+        size_k=512,
+        size_n=1024,
+    ),
+)
+
 
 def ragged_permute_gmm(lhs, rhs, rhs_scale, group_sizes, gather_indices):
   lhs = ragged_gather_pallas(
@@ -515,6 +558,147 @@ class RoutingGmmTest(parameterized.TestCase):
         kwargs=dict(scatter=self.scatter),
     )
     self._benchmark_and_profile(plain, ragged, fused)
+
+  def _live_group_walk_stages(
+      self,
+      *,
+      num_tokens: int,
+      num_experts: int,
+      num_local_experts: int,
+      group_offset: int,
+      topk: int,
+      size_k: int,
+      size_n: int,
+  ):
+    """Returns `(x, w, kwargs, written rows)` of the gather and scatter stages."""
+    key0, key1, key2, key3 = jax.random.split(jax.random.key(0), 4)
+    lhs = jax.random.normal(key0, (num_tokens, size_k), jnp.bfloat16) / 10
+    rhs1 = (
+        jax.random.normal(
+            key1, (num_local_experts, size_k, size_n), jnp.bfloat16
+        )
+        / 10
+    )
+    rhs2 = (
+        jax.random.normal(
+            key2, (num_local_experts, size_k, size_n), jnp.bfloat16
+        )
+        / 10
+    )
+
+    gating_output = jax.random.uniform(key3, (num_tokens, num_experts))
+    # Ensure at least one token routes to this shard's experts.
+    gating_output = gating_output.at[0, group_offset].set(2.0)
+    _, topk_indices = jax.lax.top_k(gating_output, topk)
+    topk_indices_flat = topk_indices.flatten()
+    # The same sort as the MoE wrapper, whose sorted keys are `row_group`.
+    row_group, topk_argsort_indices = jax.lax.sort_key_val(
+        topk_indices_flat,
+        jnp.arange(topk_indices_flat.size, dtype=jnp.int32),
+        is_stable=True,
+    )
+    group_sizes = jnp.bincount(topk_indices_flat, length=num_experts)
+
+    group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
+    start_row = int(group_cum_sum[group_offset])
+    end_row = int(group_cum_sum[group_offset + num_local_experts])
+    self.assertGreater(end_row - start_row, 0)
+
+    common = dict(
+        group_sizes=group_sizes,
+        group_offset=jnp.array([group_offset], dtype=jnp.int32),
+        row_group=row_group,
+    )
+    # 1. Gather (gmm1) with fuse_act="silu": writes the shard's sorted rows.
+    gather_stage = (
+        input_pack.input_pack(lhs),
+        (arg.make_weight_wrapper(rhs1, fused_gate_up=True),),
+        dict(
+            common,
+            gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
+            fuse_act="silu",
+        ),
+        np.arange(start_row, end_row),
+    )
+    # 2. Scatter (gmm2): writes the shard's rows back to their routed slots.
+    scatter_stage = (
+        input_pack.input_pack(lhs[topk_argsort_indices // topk]),
+        (arg.make_weight_wrapper(rhs2),),
+        dict(common, scatter=arg.make_routing_wrapper(topk_argsort_indices)),
+        topk_argsort_indices[start_row:end_row],
+    )
+    return {"gather": gather_stage, "scatter": scatter_stage}
+
+  @parameterized.product(
+      LIVE_GROUP_WALK_SHAPES,
+      tile_n=[None, 512],
+  )
+  def test_live_group_walk(
+      self, tile_n: int | None, testcase_name: str = "", **shape
+  ):
+    del testcase_name
+    stages = self._live_group_walk_stages(**shape)
+    for x, w, kwargs, rows in stages.values():
+      actual, expected = (
+          gmm.routing_gmm(
+              x,
+              w,
+              custom_plan=gmm_plan.RoutingGmmPlan(
+                  tile_n=tile_n, live_group_walk=live_group_walk
+              ),
+              **kwargs,
+          )
+          for live_group_walk in (True, False)
+      )
+      actual = actual.data.reshape(actual.spec.large_shape)
+      expected = expected.data.reshape(expected.spec.large_shape)
+      np.testing.assert_array_equal(actual[rows], expected[rows])
+
+  @parameterized.named_parameters(*LIVE_GROUP_WALK_SHAPES)
+  def test_live_group_walk_benchmark(self, **shape):
+    """Logs the time of each metadata walk at decode and checks the live wins.
+
+    Run with --test_filter=test_live_group_walk_benchmark after changing the
+    metadata to check for regressions at decode.
+    """
+    num_local_experts = shape["num_local_experts"]
+    stages = self._live_group_walk_stages(**shape)
+    for name, (x, w, kwargs, _) in stages.items():
+      latency_us, trace = {}, {}
+      for live_group_walk in (False, True):
+        fn, args = benchmarking.standardize_function(
+            gmm.routing_gmm,
+            x,
+            w,
+            kwargs=dict(
+                kwargs,
+                custom_plan=gmm_plan.RoutingGmmPlan(
+                    live_group_walk=live_group_walk
+                ),
+            ),
+        )
+        latency_us[live_group_walk] = 1e3 * (
+            benchmarking.benchmark(
+                fn, args, method="hermetic_xprof"
+            ).median_evaluation_time_ms
+        )
+        trace[live_group_walk] = ""
+      logging.info(
+          "%s, %d tokens, %d local groups: all groups %.1f us%s, groups with"
+          " rows %.1f us%s",
+          name,
+          shape["num_tokens"],
+          num_local_experts,
+          latency_us[False],
+          trace[False],
+          latency_us[True],
+          trace[True],
+      )
+      # At one token the walk over 512 local groups is a large share of the
+      # kernel (about 3 us of 20-25 us). With more tokens the matmul dominates,
+      # and with 64 groups the gap is within noise, so those only log.
+      if num_local_experts >= 512 and shape["num_tokens"] == 1:
+        self.assertLess(latency_us[True], latency_us[False])
 
 
 class RemoteRoutingGmmTest(parameterized.TestCase):

@@ -53,6 +53,9 @@ class RoutingGmmPlan:
   vmem_usage_fraction: float = 0.9
   # Size of gap to try skipping when writing to metadata.
   skip_metadata_size: int | None = None
+  # Walk only the groups with rows when building the metadata (needs the
+  # `row_group` input of routing_gmm).
+  live_group_walk: bool | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -73,6 +76,7 @@ class ResolvedPlan(RoutingGmmPlan):
   vmem_limit_bytes: int
   vmem_usage_fraction: float
   skip_metadata_size: int
+  live_group_walk: bool
 
   @property
   def bucket_rows(self):
@@ -149,6 +153,10 @@ class ResolvedPlan(RoutingGmmPlan):
           f"skip_metadata_size must be >= 0. Got {skip_metadata_size}."
       )
 
+    live_group_walk = plan.live_group_walk
+    if live_group_walk is None:
+      live_group_walk = size_out_m < w[0].group_size
+
     vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
     tile_m, tile_k, tile_n, bucket_base, num_xo_buffers, num_w_buffers = (
         calculate_tiling(
@@ -204,6 +212,7 @@ class ResolvedPlan(RoutingGmmPlan):
         vmem_limit_bytes=vmem_limit_bytes,
         vmem_usage_fraction=plan.vmem_usage_fraction,
         skip_metadata_size=skip_metadata_size,
+        live_group_walk=live_group_walk,
     )
 
 

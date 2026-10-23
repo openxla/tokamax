@@ -41,6 +41,7 @@ def routing_gmm(
     w: tuple[arg.SingleWeightWrapper[jax.Array], ...],
     group_sizes: jax.Array,  # [global_groups]
     *,
+    row_group: jax.Array | None = None,
     group_offset: jax.Array | None = None,  # [1]
     gather: arg.RoutingWrapper[jax.Array] | None = None,
     scatter: arg.RoutingWrapper[jax.Array] | None = None,
@@ -54,6 +55,9 @@ def routing_gmm(
   row `i` lands on device `i // rows_per_dev` along that axis, and each device
   returns its `m_out // axis_size` rows. Scatter indices across all devices must
   then fill every output row exactly once, or the kernel hangs.
+  `row_group` is the global group id of each sorted routed row, i.e. the sorted
+  keys of the sort that orders the rows by group; when given and the plan
+  selects it, the metadata walks only groups with rows.
   """
 
   assert len(w) in (1, 2)
@@ -98,6 +102,7 @@ def routing_gmm(
         x=x,
         w=(w[0],),
         group_sizes=group_sizes,
+        row_group=row_group,
         group_offset=group_offset,
         gather=gather,
         fuse_act=fuse_act,
@@ -107,6 +112,7 @@ def routing_gmm(
         x=gmm1_res,
         w=(w[1],),
         group_sizes=group_sizes,
+        row_group=row_group,
         group_offset=group_offset,
         scatter=scatter,
         out_dtype=out_dtype,
@@ -160,7 +166,10 @@ def routing_gmm(
       scatter_idx=_padded_indices(scatter),
   )
 
-  metadata_obj = metadata.create_metadata_ref(group_cum_sum, group_offset, cfg)
+  row_group_i32 = None if row_group is None else row_group.astype(jnp.int32)
+  metadata_obj = metadata.create_metadata_ref(
+      group_cum_sum, group_offset, cfg, row_group=row_group_i32
+  )
 
   # Step 4: Specify memory space.
   inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)

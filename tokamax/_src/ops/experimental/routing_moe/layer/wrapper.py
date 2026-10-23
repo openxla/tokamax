@@ -108,7 +108,13 @@ def routing_moe_local(
   # NOTE: Unlike topk, index sorting has to be done after all-gather to ensure
   # all shards have the same information.
   topk_indices_flat = topk_indices.flatten()
-  topk_argsort_indices = jnp.argsort(topk_indices_flat)
+  # One stable sort gives both the order of the routed rows and, as its sorted
+  # keys, the group of each sorted row (`row_group`), so the latter is free.
+  row_group, topk_argsort_indices = jax.lax.sort_key_val(
+      topk_indices_flat,
+      jnp.arange(topk_indices_flat.size, dtype=jnp.int32),
+      is_stable=True,
+  )
   group_sizes = jnp.bincount(topk_indices_flat, length=global_num_experts)
 
   # Step 5: Invoke GMM Gate and Up.
@@ -126,6 +132,7 @@ def routing_moe_local(
       ),
       fuse_act=activation,
       group_offset=group_offset,
+      row_group=row_group,
   )
 
   # Step 6: Postprocess outputs from routing gmm. With remote_combine, the rows
