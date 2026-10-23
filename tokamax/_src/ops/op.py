@@ -16,18 +16,20 @@
 
 import abc
 import collections
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable, Mapping, Sequence
 import contextlib
 import contextvars
 import dataclasses
 import functools
 import inspect
 import re
-from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final, overload
+import types
+from typing import Any, ClassVar, Concatenate, Final, Literal, Self, cast, final, overload, override
 
 from absl import logging
 import immutabledict
 import jax
+from jax.experimental import hijax
 from jax.experimental import xla_metadata
 from jax.extend import backend
 import jax.numpy as jnp
@@ -39,7 +41,6 @@ from tokamax._src import benchmarking
 from tokamax._src import config as config_lib
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import shape
-from tokamax._src import utils
 from tokamax._src.autotuning import autotuner as autotuner_lib
 from tokamax._src.autotuning import cache as autotuning_cache
 
@@ -54,50 +55,6 @@ class NullConfig:
 
 _NULL_CONFIG: Final[NullConfig] = NullConfig()
 _CAMEL_TO_SNAKE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?!^)([A-Z])")
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, slots=True)
-class _FlatTree:
-  values: list[jax.Array]
-  tree: jax.tree_util.PyTreeDef = dataclasses.field(metadata=dict(static=True))
-
-
-@jax.tree_util.register_pytree_node_class
-@dataclasses.dataclass(frozen=True, slots=True)
-class Residuals[T, R]:
-  """Complete arguments and residual values passed to VJP."""
-
-  args: tuple[Any, ...]
-  kwargs: dict[str, Any]
-  out: T
-  residuals: R
-
-  def tree_flatten(self) -> tuple[Any, Any]:  # pylint: disable=missing-function-docstring
-    args_flat, args_tree = jax.tree.flatten((self.args, self.kwargs))
-    arrays = []
-    array_idxs = []
-    other = []
-    for i, arg in enumerate(args_flat):
-      if isinstance(arg, jax.Array):
-        array_idxs.append(i)
-        arrays.append(arg)
-      else:
-        other.append(arg)
-    aux = (args_tree, tuple(array_idxs), tuple(other))
-    return (arrays, self.out, self.residuals), aux
-
-  @classmethod
-  def tree_unflatten(cls, aux_data, children) -> Self:
-    args_tree, array_idxs, other = aux_data
-    arrays, out, residuals = children
-    arrays, other = map(lambda x: list(reversed(x)), (arrays, other))
-    args, kwargs = args_tree.unflatten((
-        arrays.pop() if i in array_idxs else other.pop()
-        for i in range(len(array_idxs) + len(other))
-    ))
-    return cls(args, kwargs, out, residuals)
-
 
 _ACTIVE_TOKAMAX_PAYLOAD: contextvars.ContextVar[str] = contextvars.ContextVar(
     "tokamax_payload", default=""
@@ -147,13 +104,19 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     - Implement the `bind` method, performing any necessary validation and
       canonicalization of the arguments.
     - Implement the `_fwd` method, providing a default XLA implementation.
+    - Optionally, override the `_abstract_eval` method, to evaluate the output
+      shapes without evaluating `_fwd`.
 
   Implementors of new op backends should do the following:
     - Create a subclass of the base class, e.g. `PallasMosaicGpuRaggedDot`.
     - Optionally, define a config class for the backend.
     - Override the `_fwd` method, providing a backend-specific implementation.
+    - Optionally, override the `_abstract_eval` method, to check for inputs that
+      are valid in the base class, but not in the backend.
     - Optionally, override `_get_heuristics_config` and
       `_get_autotuning_configs`.
+    - Optionally, override `supported_on` to specify which devices the backend
+      supports.
     - Optionally, set a default `vjp` function.
   """
 
@@ -161,7 +124,6 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
   # Whether an op allows abstract inputs with `jax.export.symbolic_shape`
   # instances in array shapes.
   supports_symbolic_shapes: ClassVar[bool] = True
-  supports_batched_args_capture: ClassVar[bool] = True
 
   config: C | None = None
   _: dataclasses.KW_ONLY
@@ -204,122 +166,34 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
   ) -> T | tuple[T, R]:
     """Applies the operation with the given arguments."""
 
-    if not self.supports_symbolic_shapes and shape.contains_symbolic_shape(
-        (args, kwargs)
-    ):
-      raise NotImplementedError("This op does not support symbolic shapes.")
+    if not self.supports_symbolic_shapes:
+      if shape.contains_symbolic_shape((args, kwargs)):
+        raise NotImplementedError("This op does not support symbolic shapes.")
 
-    bind = cast(Callable[P, Any], self.bind)  # Work around pytype bug.
-    ba = bind(*args, **kwargs)
+    ba = self.bind(*args, return_residuals=return_residuals, **kwargs)  # pyrefly: ignore[unexpected-keyword]
 
-    bypass = self.bypass_device_check or config_lib.cross_compile.value
-    if not bypass:
+    if not (self.bypass_device_check or config_lib.cross_compile.value):
       for device in infer_devices(ba) or {backend.get_default_device()}:
         if not self.supported_on(device):
           raise NotImplementedError(f"Not supported on {device.device_kind}.")
 
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
-    is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
-    arrays, other, merge = utils.split_merge(is_array, args_flat)
+    mask = tuple(map(_is_array, args_flat))
+    arrays = tuple(x for x, m in zip(args_flat, mask) if m)
+    other = tuple(x for x, m in zip(args_flat, mask) if not m)
+    restorer = _BoundArgumentsRestorer(args_tree, other, mask)
 
-    @self._capture_batched_args
-    def fwd(*arrays, batched_args, fwd_res=True):
-      args, kwargs = args_tree.unflatten(merge(arrays, other))
-      kwargs["return_residuals"] = fwd_res or return_residuals
-      ba = self.bind(*args, **kwargs)
-      if batched_args is not None:
-        bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
-        bkwargs["return_residuals"] = fwd_res or return_residuals
-        arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
-        ba = BoundArguments(self, arguments)
-
-      config = ba.default_config
-
-      # Serialize args into the HLO to allow for, e.g., offline autotuning.
-      json_op = self.replace(config=config, vjp=None)
-      json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
-      json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
-
-      with _tokamax_metadata(json_data):
-        if fwd_res and self.vjp is None and batched_args is not None:
-
-          def fwd_flat(*arrays):
-            args, kwargs = args_tree.unflatten(merge(arrays, other))
-            kwargs["return_residuals"] = return_residuals
-            return self._fwd(*args, config=config, **kwargs)
-
-          try:
-            out, f_vjp, residuals = jax.vjp(fwd_flat, *arrays, has_aux=True)
-            f_vjp.fun = _AlwaysEqual(f_vjp.fun)  # type: ignore
-          except Exception as e:  # pylint: disable=broad-except
-            out, residuals = fwd_flat(*arrays)
-
-            def f_vjp(_, e=e):
-              raise NotImplementedError("vjp not implemented") from e
-
-            f_vjp = jax.tree_util.Partial(_AlwaysEqual(f_vjp))
-
-          ret = (out, residuals) if return_residuals else out
-          return ret, f_vjp
-
-        out, residuals = self._fwd(*args, config=config, **kwargs)
-
-      ret = (out, residuals) if return_residuals else out
-      full_residuals = Residuals(args, kwargs, out, residuals)
-      return ret, _FlatTree(*jax.tree.flatten(full_residuals))
-
-    def f(*arrays):
-      return fwd(*arrays, fwd_res=False)[0]
-
-    if self.vjp is None:
-      if not self.supports_batched_args_capture:
-        return f(*arrays)
-
-      # We must wrap the op in a `custom_vjp`, even if no `vjp` function is
-      # provided, as we use `custom_batching` to capture the batched arguments,
-      # and `custom_batching` doesn't support `jax.vjp`.
-      bwd = lambda f_vjp, dout: f_vjp(dout[0] if return_residuals else dout)
-    else:
-
-      def bwd(residuals, dout):  # pylint: disable=function-redefined
-        residuals = residuals.tree.unflatten(residuals.values)
-        args = residuals.args
-        kwargs = residuals.kwargs
-        kwargs.pop("return_residuals")
-        out = residuals.out
-        residuals = residuals.residuals
-        dout = dout[0] if return_residuals else dout
-        grads = self.vjp(residuals, out, dout, *args, **kwargs)
-
-        if isinstance(grads, dict):
-          grads_ba = ba.signature.bind_partial(**grads)
-        else:
-          grads_ba = ba.signature.bind_partial(*grads)
-
-        # Check that grads is tree with same structure as args.
-        dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
-
-        for k, v in kwargs.items():
-          if (dv := grads_ba.kwargs.get(k)) is None:
-            # Set any missing grads to zeros.
-            zeros_like = lambda x: jnp.zeros_like(x) if is_array(x) else x
-            grads_ba.arguments[k] = jax.tree.map(zeros_like, v)
-          else:
-            # Check that grads is tree with same structure as kwarg value.
-            grads_ba.arguments[k] = jax.tree.map(lambda _, g: g, v, dv)
-
-        return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
-
-    f = jax.custom_vjp(f)
-    f.defvjp(fwd, bwd, optimize_remat=True)
-    return f(*arrays)
+    in_avals = tuple(map(jax.typeof, arrays))
+    out_aval = self._abstract_eval(restorer(self, in_avals))
+    out, residuals = _OpPrimitive(self, in_avals, out_aval, restorer)(*arrays)
+    return (out, residuals) if return_residuals else out
 
   def bind(
       self, *args: P.args, return_residuals: bool = False, **kwargs: P.kwargs  # pyrefly: ignore[bad-function-definition]
   ) -> "BoundArguments":
     """Binds the op to the given arguments."""
     sig = self._fwd_signature
-    ba = sig.bind(*args, return_residuals=return_residuals, **kwargs)
+    ba = sig.bind(*args, return_residuals=return_residuals, **kwargs)  # pyrefly: ignore[unexpected-keyword]
     ba.apply_defaults()
     return BoundArguments(self, ba.arguments)
 
@@ -381,13 +255,6 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     del ba  # Unused.
     return set()
 
-  def _capture_batched_args[_T2](
-      self, fn: Callable[..., _T2]
-  ) -> Callable[..., _T2]:
-    if self.supports_batched_args_capture:
-      return batching.capture_batched_args(fn)
-    return lambda *args, **kwargs: fn(*args, batched_args=None, **kwargs)
-
   @property
   def signature(self) -> inspect.Signature:
     """Infers signature of the op."""
@@ -404,12 +271,29 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     del params["config"]
     return sig.replace(parameters=tuple(params.values()))
 
-  __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+  def _abstract_eval(self, ba: "BoundArguments") -> Any:
+    """Returns output shapes of the op."""
+    args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
+    mask = tuple(isinstance(x, jax.core.ShapedArray) for x in args_flat)
+    arrays = tuple(
+        jax.ShapeDtypeStruct(x.shape, x.dtype)
+        for x, m in zip(args_flat, mask) if m
+    )
+    other = tuple(x for x, m in zip(args_flat, mask) if not m)
+    restorer = _BoundArgumentsRestorer(args_tree, other, mask)
+
+    def fwd_flat(arrays):
+      ba = restorer(self, arrays)
+      return self._fwd(*ba.args, config=ba.default_config, **ba.kwargs)
+
+    return jax.tree.map(jax.typeof, jax.eval_shape(fwd_flat, arrays))
 
   def supported_on(self, device: jax.Device) -> bool:
     """Returns whether this op runs on the given device."""
     del device  # Unused.
     return True
+
+  __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
 
 def snake_case_name(op: type[Op] | Op) -> str:  # pylint: disable=g-bare-generic
@@ -663,16 +547,252 @@ class BoundArguments[C, K: Hashable]:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _AlwaysEqual:
-  """A class that is always equal to another instance of itself."""
+class _BoundArgumentsRestorer:
+  """Restores arguments from a flattened list."""
 
-  value: Any
+  args_tree: jax.tree_util.PyTreeDef
+  other_args: tuple[Any, ...]
+  is_array_mask: tuple[bool, ...]
 
-  def __call__(self, *args, **kwargs) -> Any:
-    return self.value(*args, **kwargs)
+  def __call__[C, K](
+      self, op: Op[..., Any, Any, C, K], arrays: Sequence[Any]
+  ) -> BoundArguments[C, K]:
+    arrays_iter = iter(arrays)
+    other_iter = iter(self.other_args)
+    flat = [
+        next(arrays_iter) if is_arr else next(other_iter)
+        for is_arr in self.is_array_mask
+    ]
+    args, kwargs = self.args_tree.unflatten(flat)
+    ba = op._fwd_signature.bind(*args, **kwargs)
+    return BoundArguments(op, ba.arguments)
 
-  def __eq__(self, other):
-    return isinstance(other, _AlwaysEqual)
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ConvertedClosure[**P, T]:
+  """A closure converted to a pure function and closed arguments."""
+
+  f: Callable[..., T] = dataclasses.field(metadata=dict(static=True))
+  closure_args: tuple[Any, ...] | None
+  default_args: tuple[Any, ...] | None
+  default_kwargs: dict[str, Any] | None
+
+  @property
+  def __wrapped__(self) -> Callable[..., T]:
+    return self.f
+
+  def __call__(self, *args: P.args, **kwargs: P.kwargs) -> T:
+    assert inspect.isfunction(self.f)
+
+    if (closure := self.closure_args) is not None:
+      closure = tuple(types.CellType(v) for v in self.closure_args)
+
+    f_closure = types.FunctionType(
+        self.f.__code__,
+        self.f.__globals__,
+        self.f.__name__,
+        self.default_args,
+        closure=closure,
+    )
+    f_closure.__kwdefaults__ = self.default_kwargs
+    return f_closure(*args, **kwargs)
+
+
+def convert_closure[**P, T](f: Callable[P, T]) -> Callable[P, T]:
+  """Converts a closure to a `_ConvertedClosure` with explicit arguments."""
+  if not inspect.isfunction(f):
+    raise ValueError(f"Expected a function, got {type(f)}")
+
+  if f.__closure__ is None:
+    if f.__defaults__ is None and f.__kwdefaults__ is None:
+      return f
+    closure_args = ()
+  else:
+    closure_args = tuple(cell.cell_contents for cell in f.__closure__)
+
+  return _ConvertedClosure(f, closure_args, f.__defaults__, f.__kwdefaults__)
+
+
+def _strip_vjps(x: Any) -> Any:
+  if isinstance(x, Op):
+    kwargs = {}
+    if hasattr(x, "vjp") and x.vjp is not None:
+      kwargs["vjp"] = None
+    if hasattr(x, "impl") and x.impl is not None:
+      kwargs["impl"] = _strip_vjps(x.impl)
+    return x.replace(**kwargs) if kwargs else x
+  return x
+
+
+class _OpPrimitive[T, R](batching.ExpandWithVmapData):
+  """`Op` primitive to capture the batch environment and handle VJPs."""
+
+  op: Op[..., T, R, Any, Any]
+  restorer: _BoundArgumentsRestorer
+
+  def __init__(
+      self,
+      op: Op[..., T, R, Any, Any],
+      in_avals: tuple[Any, ...],
+      out_aval: Any,
+      restorer: _BoundArgumentsRestorer,
+  ):
+    self.in_avals = in_avals
+    self.out_aval = out_aval
+    self.params = dict(op=op, restorer=restorer)
+    super().__init__()
+
+  @override
+  def expand_with_vmap_data(self, vmap_data, *args) -> tuple[T, R | None]:
+    batched_args = tuple(
+        batching.BatchedShapeDtype(x.shape, x.dtype, ()) for x in args
+    )
+
+    for axis_data, dims in vmap_data:
+      size = axis_data.size
+      batched_args = tuple(
+          batching.BatchedShapeDtype(
+              x.shape, x.dtype, (*x.vmap_axes, None if d is None else (d, size))
+          )
+          for x, d in zip(batched_args, dims, strict=True)
+      )
+
+    # We first bind the batched args to get the config (as we need vmap axes).
+    ba = self.restorer(self.op, batched_args)
+    config = ba.default_config
+
+    # Serialize args into the HLO to allow for, e.g., offline autotuning.
+    json_ba = ba.replace(op=_strip_vjps(self.op.replace(config=config)))
+    json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
+
+    ba = self.restorer(self.op, args)
+    with _tokamax_metadata(json_data):
+      return self.op._fwd(*ba.args, config=config, **ba.kwargs)  # pylint: disable=protected-access
+
+  @override
+  def vjp_fwd(self, nzs_in, *args) -> tuple[tuple[T, R], Any]:
+    if self.op.vjp is None:
+      return hijax.vjp_from_jvp[0](self, nzs_in, *args)
+
+    out, residuals = self._with_kwargs(return_residuals=True)(*args)
+    ba = self.restorer(self.op, args)
+    if ba.kwargs["return_residuals"]:
+      ret = (out, residuals)
+    else:
+      ret = (out, jax.tree.map(jnp.zeros_like, self.out_aval[1]))
+    return ret, (args, out, residuals)
+
+  @override
+  def vjp_bwd_retval(self, res, outgrad) -> tuple[jax.Array, ...]:
+    if self.op.vjp is None:
+      return hijax.vjp_from_jvp[1](self, res, outgrad)
+    return super().vjp_bwd_retval(res, outgrad)
+
+  @override
+  def vjp_bwd_retval_with_vmap_data(
+      self, vmap_data, res, outgrad
+  ) -> tuple[jax.Array, ...]:
+    del vmap_data
+    assert self.op.vjp is not None
+    args, out, residuals = res
+    is_zero = lambda x: isinstance(x, hijax.Zero)
+    to_array = (
+        lambda x: hijax.instantiate_zeros(x) if is_zero(x) else jnp.asarray(x)
+    )
+    dout = jax.tree.map(to_array, outgrad[0], is_leaf=is_zero)
+    ba = self.restorer(self.op, args)
+    kwargs = ba.kwargs
+    kwargs.pop("return_residuals")
+    grads = self.op.vjp(residuals, out, dout, *ba.args, **kwargs)
+
+    # We allow the VJP function to return either a tuple of gradients for
+    # the positional args, or a dict mapping arg names to gradients.
+    if isinstance(grads, dict):
+      grads_ba = self.op._fwd_signature.bind_partial(**grads)  # pylint: disable=protected-access
+    else:
+      grads_ba = self.op._fwd_signature.bind_partial(*grads)  # pylint: disable=protected-access
+
+    # Check that grads is tree with same structure as args.
+    dargs = jax.tree.map(lambda _, g: g, ba.args, grads_ba.args)
+
+    for k, v in kwargs.items():
+      if (dv := grads_ba.kwargs.get(k)) is None:
+        # Set any missing grads to zeros.
+        zeros_like = lambda x: jnp.zeros_like(x) if _is_array(x) else x
+        grads_ba.arguments[k] = jax.tree.map(zeros_like, v)
+      else:
+        # Check that grads is tree with same structure as kwarg value.
+        grads_ba.arguments[k] = jax.tree.map(lambda _, g: g, v, dv)
+
+    return tuple(filter(_is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
+
+  @override
+  def batch_dim_rule(self, axis_data, in_dims):
+    out_dim = None if all(d is None for d in jax.tree.leaves(in_dims)) else 0
+    return jax.tree.map(lambda _: out_dim, self.out_aval)
+
+  @override
+  def res_batch_dim_rule(self, axis_data, in_dims):
+    out_dim = None if all(d is None for d in jax.tree.leaves(in_dims)) else 0
+    return (in_dims, out_dim, out_dim)
+
+  @override
+  def jvp(self, primals, tangents) -> tuple[tuple[T, R], tuple[T, R]]:
+    primals = tuple(map(jnp.asarray, primals))
+    is_zero = lambda x: isinstance(x, hijax.Zero)
+    to_array = (
+        lambda x: hijax.instantiate_zeros(x) if is_zero(x) else jnp.asarray(x)
+    )
+    tangents_instantiated = jax.tree.map(to_array, tangents, is_leaf=is_zero)
+    try:
+      return jax.jvp(self.expand, primals, tangents_instantiated)
+    except NotImplementedError:
+      if self.op.vjp is None:
+        raise
+
+    nzs_in = tuple(
+        jax.tree.map(lambda t: not is_zero(t), t, is_leaf=is_zero)
+        for t in tangents
+    )
+    primals_out, residuals = self.vjp_fwd(nzs_in, *primals)
+    nzs_in_flat = [True] * len(self.in_avals_flat)
+    nzs_out_flat = [True] * len(self.out_avals_flat)
+    tangents_flat = jax.tree.leaves(tangents_instantiated)
+    tangents_out_flat = jax._src.hijax.fake_linear_op(  # pylint: disable=protected-access
+        self, nzs_in_flat, nzs_out_flat, residuals, None, *tangents_flat
+    )
+    tangents_out = jax.tree.unflatten(self.out_tree, tangents_out_flat)
+    return primals_out, tangents_out
+
+  @override
+  def dce(self, used_outs, live_ins):
+    del live_ins
+    used_primals, used_res = used_outs
+    if any(jax.tree.leaves(used_res)):
+      return True, (True, True), self
+    elif any(jax.tree.leaves(used_primals)):
+      return True, (True, False), self._with_kwargs(return_residuals=False)
+    else:
+      return False, (False, False), None
+
+  def _with_kwargs(self, **kwargs) -> "_OpPrimitive":
+    in_avals = self.in_avals
+    for axis_data, dims in self.vmap_data:
+      map_aval = functools.partial(jax._src.core.mapped_aval, axis_data.size)  # pylint: disable=protected-access
+      maybe_map_aval = lambda a, d: (a if d is None else map_aval(d, a))  # pylint: disable=cell-var-from-loop
+      in_avals = jax.tree.map(maybe_map_aval, in_avals, dims)
+    ba = self.restorer(self.op, in_avals)
+    ba = dataclasses.replace(ba, arguments=dict(ba.arguments) | kwargs)
+    out_aval = self.op._abstract_eval(ba)  # pylint: disable=protected-access
+    args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
+    mask = self.restorer.is_array_mask
+    other = tuple(x for x, m in zip(args_flat, mask) if not m)
+    restorer = _BoundArgumentsRestorer(args_tree, other, mask)
+    prim = _OpPrimitive(self.op, in_avals, out_aval, restorer)
+    for axis_data, dims in reversed(self.vmap_data):
+      prim, _ = prim.batch_prim(axis_data, dims)
+    return prim
 
 
 @functools.lru_cache
@@ -710,10 +830,11 @@ def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
   raise ValueError(f"Multiple device kinds found: {device_kinds}")
 
 
+_is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))  # pylint: disable=invalid-name
+
+
 def _abstractify(pytree):
   def abstractify_leaf(x):
-    if isinstance(x, (jax.Array, np.ndarray)):
-      return jax.ShapeDtypeStruct(x.shape, x.dtype)
-    return x
+    return jax.ShapeDtypeStruct(x.shape, x.dtype) if _is_array(x) else x
 
   return jax.tree.map(abstractify_leaf, pytree)

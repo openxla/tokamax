@@ -577,3 +577,26 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
           else jnp.zeros_like(segment_ids)
       )
     return grads, None
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    if ba.kwargs["return_residuals"]:
+      raise NotImplementedError("`return_residuals` not supported.")
+    _, _, _, query, key, value, gate, beta = ba.args
+    grads = {
+        "query": query,
+        "key": key,
+        "value": value,
+        "gate": gate,
+        "beta": beta,
+    }
+    if (a_log := ba.kwargs["a_log"]) is not None:
+      grads["a_log"] = a_log
+    if (delta_time_bias := ba.kwargs["delta_time_bias"]) is not None:
+      grads["delta_time_bias"] = delta_time_bias
+    if (initial_state := ba.kwargs["initial_state"]) is not None:
+      grads["initial_state"] = initial_state
+    if (segment_ids := ba.kwargs["segment_ids"]) is not None:
+      grads["segment_ids"] = segment_ids
+    return grads, None
+

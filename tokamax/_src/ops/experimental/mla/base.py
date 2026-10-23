@@ -148,3 +148,8 @@ class MultiHeadLatentAttention[C](op.Op[Any, Any, None, C, Any]):
         ),
         None,
     )
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    ql_nope, _, _, _, cache_kv, _, _, _, _ = ba.args
+    return (ql_nope, cache_kv), None

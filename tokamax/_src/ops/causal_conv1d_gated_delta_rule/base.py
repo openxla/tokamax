@@ -85,3 +85,11 @@ class CausalConv1dGatedDeltaRule[C](
         config=config,  # pyrefly: ignore[bad-argument-type]
     )
     return output, None
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    qkv, _, _, conv_state, recurrent_state, *_ = ba.args
+    n_v = ba.kwargs["n_v"]
+    d_v = ba.kwargs["d_v"]
+    out = jax.core.ShapedArray((qkv.shape[0], n_v * d_v), qkv.dtype)
+    return ((conv_state, recurrent_state), out), None

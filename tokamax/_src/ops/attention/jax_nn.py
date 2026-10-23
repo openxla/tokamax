@@ -16,7 +16,7 @@
 
 import dataclasses
 import math
-from typing import Literal, override
+from typing import Any, Literal, override
 
 import jax
 import jax.numpy as jnp
@@ -64,22 +64,8 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       return_residuals: bool,
       config: op.NullConfig,
   ) -> tuple[Float[Array, "*B T H d"], None]:
-    del config  # Unused.
-
-    if precision[0] != precision[1]:
-      raise NotImplementedError("Both precisions must be the same.")
-    if logits_dtype != jnp.float32:
-      raise NotImplementedError("`logits_dtype` must be `jnp.float32`.")
-    if logits_soft_cap is not None:
-      raise NotImplementedError("`logits_soft_cap` not supported.")
-    if dropout_mask is not None or dropout_rate != 0.0:
-      raise NotImplementedError("dropout not supported.")
-    if not normalize_output:
-      raise NotImplementedError("`normalize_output=False` not supported.")
-    if return_residuals:
-      raise NotImplementedError("`return_residuals=True` not supported.")
-    if paging_info is not None:
-      raise NotImplementedError("Paged attention not supported.")
+    del config, logits_dtype, logits_soft_cap, dropout_mask, dropout_rate
+    del paging_info, normalize_output, return_residuals  # Unused.
 
     q, k, v = map(quantization.as_array, (q, k, v))
     precision_str = str(
@@ -150,6 +136,28 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       )
     out = out.reshape(*batch, seq_len_q, num_heads, out.shape[-1])
     return out[..., :head_dim_out], None
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments[Any, Any]) -> Any:
+    precision = ba.kwargs["precision"]
+    if precision[0] != precision[1]:
+      raise NotImplementedError("Both precisions must be the same.")
+    if ba.kwargs["logits_dtype"] != jnp.float32:
+      raise NotImplementedError("`logits_dtype` must be `jnp.float32`.")
+    if ba.kwargs["logits_soft_cap"] is not None:
+      raise NotImplementedError("`logits_soft_cap` not supported.")
+    if (
+        ba.kwargs["dropout_mask"] is not None
+        or ba.kwargs["dropout_rate"] != 0.0
+    ):
+      raise NotImplementedError("dropout not supported.")
+    if not ba.kwargs["normalize_output"]:
+      raise NotImplementedError("`normalize_output=False` not supported.")
+    if ba.kwargs["return_residuals"]:
+      raise NotImplementedError("`return_residuals=True` not supported.")
+    if ba.kwargs["paging_info"] is not None:
+      raise NotImplementedError("Paged attention not supported.")
+    return super()._abstract_eval(ba)
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

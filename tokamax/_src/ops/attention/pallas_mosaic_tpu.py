@@ -22,6 +22,7 @@ import immutabledict
 import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
+from jax.typing import DTypeLike  # pylint: disable=g-importing-member
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
@@ -33,10 +34,13 @@ from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp
 from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
 
 
+AbstractArray = base.AbstractArray
+Mask = base.Mask
 QArray = base.QArray
 Residuals = base.Residuals
 PagingInfo = base.PagingInfo
 type Key = immutabledict.immutabledict[str, Any]
+AUTO = base.AUTO
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -98,17 +102,6 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
       config: Config,
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     """Performs attention, optionally returning softmax residuals."""
-    common.check_inputs_support(
-        q,
-        k,
-        v,
-        bias=bias,
-        logits_dtype=logits_dtype,
-        dropout_mask=dropout_mask,
-        dropout_rate=dropout_rate,
-        paging_info=paging_info,
-        mask=mask,
-    )
 
     q = quantization.as_array(q)
     q *= logits_scale
@@ -173,6 +166,22 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     # Reshape back to original shape.
     out = out.reshape(*orig_q_shape[:-1], out.shape[-1])[..., :head_dim_out]
     return out, residuals
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments[Any, Any]) -> Any:
+    q, k, v = ba.args
+    common.check_inputs_support(
+        q,
+        k,
+        v,
+        bias=ba.kwargs["bias"],
+        logits_dtype=ba.kwargs["logits_dtype"],
+        dropout_mask=ba.kwargs["dropout_mask"],
+        dropout_rate=ba.kwargs["dropout_rate"],
+        paging_info=ba.kwargs["paging_info"],
+        mask=ba.kwargs["mask"],
+    )
+    return super()._abstract_eval(ba)
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments):

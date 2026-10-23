@@ -79,3 +79,12 @@ class RaggedGatherReduce[C](op.Op[Any, jax.Array, None, C, Any]):
         ),
         None,
     )
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    x, _, _, _ = ba.args
+    reduce_group_size = ba.kwargs["reduce_group_size"]
+    out = jax.core.ShapedArray(
+        (x.shape[0] // reduce_group_size, x.shape[1]), x.dtype
+    )
+    return out, None
