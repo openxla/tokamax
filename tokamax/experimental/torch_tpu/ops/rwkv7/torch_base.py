@@ -32,7 +32,7 @@ class _RWKV7:
 
   def __init__(self):
     self.op_impl_jax = jax_base.RWKV7()
-    self.jax_op_name = "torch_base_rwkv7"
+    self.jax_op_name = "tokamax::torch_base_rwkv7"
     self._torch_tokamax_op = None
     try:
       from torch_tpu._internal import pallas

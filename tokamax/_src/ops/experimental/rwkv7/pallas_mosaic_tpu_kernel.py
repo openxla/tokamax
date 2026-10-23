@@ -15,46 +15,45 @@
 
 """Pallas TPU compute kernel for RWKV-7 (DPLR Delta Rule)."""
 
+import math
 from typing import Any
+
 import jax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
 _CHUNK_SIZE = 64
 
 
-def _chunkify(x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int) -> jax.Array:
-  # (batch_size, seq_len, num_heads, ...) -> (batch_size, num_heads, num_chunks, chunk_size, ...)
+def _pick_mb(bh: int) -> int:
+  for candidate in (4, 2, 1):
+    if bh % candidate == 0:
+      return candidate
+  return 1
+
+
+def _chunkify(
+    x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int
+) -> jax.Array:
   rest = x.shape[3:]
   x = x.reshape((batch_size, num_chunks, chunk_size, x.shape[2]) + rest)
   perm = (0, 3, 1, 2) + tuple(range(4, x.ndim))
   return jnp.transpose(x, perm)
 
 
-def _move_nt_front(x: jax.Array) -> jax.Array:
-  return jnp.moveaxis(x, 2, 0)
-
-
-def _scan_body(s: jax.Array, chunk_inputs: tuple[Any, ...]) -> tuple[jax.Array, jax.Array]:
-  q_i, k_i, v_i, beta_i, gk_cs_i, aqk_i, aqb_i, u_i, w_i = chunk_inputs
-  v2_i = u_i + jnp.matmul(w_i, s, preferred_element_type=jnp.float32)
-  o_1 = jnp.matmul(aqk_i, v_i, preferred_element_type=jnp.float32)
-  o_2 = jnp.matmul(aqb_i, v2_i, preferred_element_type=jnp.float32)
-  o_3 = jnp.matmul(
-      q_i * jnp.exp(jnp.minimum(gk_cs_i, 0.0)), s, preferred_element_type=jnp.float32
+def _mm(x: jax.Array, y: jax.Array) -> jax.Array:
+  return jnp.matmul(
+      x,
+      y,
+      preferred_element_type=jnp.float32,
+      precision=jax.lax.Precision.HIGHEST,
   )
-  o_i = o_1 + o_2 + o_3
-  g_last = gk_cs_i[-1]
-  decay_last = jnp.exp(jnp.minimum(g_last[None, :] - gk_cs_i, 0.0))
-  s_new = (
-      s * jnp.exp(jnp.minimum(g_last, 0.0))[:, None]
-      + jnp.matmul((k_i * decay_last).T, v_i, preferred_element_type=jnp.float32)
-      + jnp.matmul((beta_i * decay_last).T, v2_i, preferred_element_type=jnp.float32)
-  )
-  return s_new.astype(s.dtype), o_i.astype(u_i.dtype)
 
 
-def _make_rwkv7_intra_chunk_kernel(bt: int) -> Any:
+def _make_rwkv7_fwd_kernel(bt: int, nt: int, mb: int) -> Any:
+  """Builds single-pass fused RWKV-7 forward Pallas kernel."""
+
   def _kernel(
       q_ref: Any,
       k_ref: Any,
@@ -63,64 +62,96 @@ def _make_rwkv7_intra_chunk_kernel(bt: int) -> Any:
       beta_ref: Any,
       gk_ref: Any,
       gk_cs_ref: Any,
-      aqk_ref: Any,
-      aqb_ref: Any,
-      u_ref: Any,
-      w_ref: Any,
+      s0_ref: Any,
+      o_ref: Any,
+      a_ab_inv_ref: Any,
+      merged_out_ref: Any,
+      s_in_ref: Any,
+      s_final_ref: Any,
+      s_scratch: Any,
   ) -> None:
-    q_i = q_ref[0, 0, 0]  # (BT, K)
-    k_i = k_ref[0, 0, 0]  # (BT, K)
-    v_i = v_ref[0, 0, 0]  # (BT, V)
-    alpha_i = alpha_ref[0, 0, 0]  # (BT, K)
-    beta_i = beta_ref[0, 0, 0]  # (BT, K)
-    gk_i = gk_ref[0, 0, 0]  # (BT, K)
-    gk_cs = gk_cs_ref[0, 0, 0]  # (BT, K)
+    c = pl.program_id(1)
 
-    row_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 0)
-    col_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 1)
+    @pl.when(c == 0)
+    def _init_state() -> None:
+      s_scratch[...] = s0_ref[0].astype(jnp.float32)
+
+    q_i = q_ref[0, 0].astype(jnp.float32)
+    k_i = k_ref[0, 0].astype(jnp.float32)
+    v_i = v_ref[0, 0].astype(jnp.float32)
+    alpha_i = alpha_ref[0, 0].astype(jnp.float32)
+    beta_i = beta_ref[0, 0].astype(jnp.float32)
+    gk_i = gk_ref[0, 0].astype(jnp.float32)
+    gk_cs = gk_cs_ref[0, 0].astype(jnp.float32)
+    k_dim = q_i.shape[-1]
+
+    row_idx = jax.lax.broadcasted_iota(jnp.int32, (1, bt, bt), 1)
+    col_idx = jax.lax.broadcasted_iota(jnp.int32, (1, bt, bt), 2)
     incl_causal = (col_idx <= row_idx).astype(jnp.float32)
     strict_causal = (col_idx < row_idx).astype(jnp.float32)
-
-    decay_incl = jnp.exp(
-        jnp.minimum(gk_cs[:, None, :] - gk_cs[None, :, :], 0.0)
-    )
-    aqk = jnp.sum(q_i[:, None, :] * k_i[None, :, :] * decay_incl, axis=-1) * incl_causal
-    aqb = jnp.sum(q_i[:, None, :] * beta_i[None, :, :] * decay_incl, axis=-1) * incl_causal
+    eye = (row_idx == col_idx).astype(jnp.float32)
 
     gk_excl = gk_cs - gk_i
-    decay_excl = jnp.exp(
-        jnp.minimum(gk_excl[:, None, :] - gk_cs[None, :, :], 0.0)
-    )
-    a_ab = jnp.sum(alpha_i[:, None, :] * beta_i[None, :, :] * decay_excl, axis=-1) * strict_causal
-    a_ak = jnp.sum(alpha_i[:, None, :] * k_i[None, :, :] * decay_excl, axis=-1) * strict_causal
+    g0 = gk_cs[:, bt // 2 : bt // 2 + 1, :]
+    exp_pos_incl = jnp.exp(jnp.clip(gk_cs - g0, -80.0, 80.0))
+    exp_pos_excl = jnp.exp(jnp.clip(gk_excl - g0, -80.0, 80.0))
+    exp_neg = jnp.exp(jnp.clip(g0 - gk_cs, -80.0, 80.0))
 
-    # Schulz polynomial doubling
-    eye = jnp.eye(bt, dtype=jnp.float32)
-    a_ab_f32 = a_ab.astype(jnp.float32)
-    p_mat = eye + a_ab_f32
-    curr = a_ab_f32
-    for _ in range(1, 6):
-      curr = jnp.matmul(curr, curr, preferred_element_type=jnp.float32)
-      p_mat = jnp.matmul(p_mat, eye + curr, preferred_element_type=jnp.float32)
+    q_hat = q_i * exp_pos_incl
+    alpha_hat = alpha_i * exp_pos_excl
+    k_hat = k_i * exp_neg
+    beta_hat = beta_i * exp_neg
+
+    a_qk = _mm(q_hat, k_hat.swapaxes(-1, -2)) * incl_causal
+    a_qb = _mm(q_hat, beta_hat.swapaxes(-1, -2)) * incl_causal
+    a_ab = _mm(alpha_hat, beta_hat.swapaxes(-1, -2)) * strict_causal
+    a_ak = _mm(alpha_hat, k_hat.swapaxes(-1, -2)) * strict_causal
+
+    p_mat = eye + a_ab
+    curr = a_ab
+    num_doubling_steps = max(0, math.ceil(math.log2(bt)) - 1)
+    for _ in range(num_doubling_steps):
+      curr = _mm(curr, curr)
+      p_mat = _mm(p_mat, eye + curr)
     a_ab_inv = p_mat
+    a_ab_inv_ref[0, 0] = a_ab_inv.astype(a_ab_inv_ref.dtype)
 
-    v_dim = v_i.shape[-1]
-    ak_v = jnp.matmul(a_ak, v_i, preferred_element_type=jnp.float32)
+    ak_v = _mm(a_ak, v_i)
     decayed_alpha = jnp.exp(jnp.minimum(gk_excl, 0.0)) * alpha_i
-    merged_rhs = jnp.concat([ak_v, decayed_alpha], axis=-1)
-    merged_uw = jnp.matmul(a_ab_inv, merged_rhs, preferred_element_type=jnp.float32)
-    u_i = merged_uw[:, :v_dim]
-    w_i = merged_uw[:, v_dim:]
+    merged_rhs = jnp.concatenate([decayed_alpha, ak_v], axis=-1)
+    merged_uw = _mm(a_ab_inv, merged_rhs)
+    merged_out_ref[0, 0] = merged_uw.astype(merged_out_ref.dtype)
+    w_i = merged_uw[:, :, :k_dim]
+    u_i = merged_uw[:, :, k_dim:]
 
-    aqk_ref[0, 0, 0] = aqk.astype(aqk_ref.dtype)
-    aqb_ref[0, 0, 0] = aqb.astype(aqb_ref.dtype)
-    u_ref[0, 0, 0] = u_i.astype(u_ref.dtype)
-    w_ref[0, 0, 0] = w_i.astype(w_ref.dtype)
+    s_prev = s_scratch[...]
+    s_in_ref[0, 0] = s_prev.astype(s_in_ref.dtype)
+
+    v2_i = u_i + _mm(w_i, s_prev)
+    q_exp = q_i * jnp.exp(jnp.minimum(gk_cs, 0.0))
+    o_i = _mm(q_exp, s_prev) + _mm(a_qk, v_i) + _mm(a_qb, v2_i)
+    o_ref[0, 0] = o_i.astype(o_ref.dtype)
+
+    g_last = gk_cs[:, -1:, :]
+    exp_g_last = jnp.exp(jnp.minimum(g_last, 0.0)).swapaxes(-1, -2)
+    decay_last = jnp.exp(jnp.minimum(g_last - gk_cs, 0.0))
+    dk_i = k_i * decay_last
+    db_i = beta_i * decay_last
+    s_new = (
+        s_prev * exp_g_last
+        + _mm(dk_i.swapaxes(-1, -2), v_i)
+        + _mm(db_i.swapaxes(-1, -2), v2_i)
+    )
+    s_scratch[...] = s_new
+
+    @pl.when(c == nt - 1)
+    def _store_final() -> None:
+      s_final_ref[0] = s_new.astype(s_final_ref.dtype)
 
   return _kernel
 
 
-def _intra_chunk_rwkv7_pallas(
+def _rwkv7_fwd_pallas(
     q_c: jax.Array,
     k_c: jax.Array,
     v_c: jax.Array,
@@ -128,29 +159,103 @@ def _intra_chunk_rwkv7_pallas(
     beta_c: jax.Array,
     gk_c: jax.Array,
     gk_cs_c: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    s0: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Executes single-pass fused RWKV-7 forward kernel."""
   batch_size, num_heads, num_chunks, chunk_size, key_dim = q_c.shape
   val_dim = v_c.shape[-1]
-  kernel = _make_rwkv7_intra_chunk_kernel(chunk_size)
-  grid = (batch_size, num_heads, num_chunks)
-  bspec_k = pl.BlockSpec((1, 1, 1, chunk_size, key_dim), lambda i, j, n: (i, j, n, 0, 0))
-  bspec_v = pl.BlockSpec((1, 1, 1, chunk_size, val_dim), lambda i, j, n: (i, j, n, 0, 0))
-  bspec_qq = pl.BlockSpec((1, 1, 1, chunk_size, chunk_size), lambda i, j, n: (i, j, n, 0, 0))
+  bh = batch_size * num_heads
+  mb = _pick_mb(bh)
+  nb = bh // mb
+
+  def _prep_in(x: jax.Array, d: int) -> jax.Array:
+    return jnp.swapaxes(x.reshape(nb, mb, num_chunks, chunk_size, d), 1, 2)
+
+  q_in = _prep_in(q_c, key_dim)
+  k_in = _prep_in(k_c, key_dim)
+  v_in = _prep_in(v_c, val_dim)
+  alpha_in = _prep_in(alpha_c, key_dim)
+  beta_in = _prep_in(beta_c, key_dim)
+  gk_in = _prep_in(gk_c, key_dim)
+  gk_cs_in = _prep_in(gk_cs_c, key_dim)
+  s0_in = s0.reshape(nb, mb, key_dim, val_dim).astype(jnp.float32)
+
+  kernel = _make_rwkv7_fwd_kernel(chunk_size, num_chunks, mb)
+  grid = (nb, num_chunks)
+  bspec_k = pl.BlockSpec(
+      (1, 1, mb, chunk_size, key_dim), lambda i_b, c: (i_b, c, 0, 0, 0)
+  )
+  bspec_v = pl.BlockSpec(
+      (1, 1, mb, chunk_size, val_dim), lambda i_b, c: (i_b, c, 0, 0, 0)
+  )
+  bspec_bt = pl.BlockSpec(
+      (1, 1, mb, chunk_size, chunk_size), lambda i_b, c: (i_b, c, 0, 0, 0)
+  )
+  bspec_kv = pl.BlockSpec(
+      (1, 1, mb, chunk_size, key_dim + val_dim),
+      lambda i_b, c: (i_b, c, 0, 0, 0),
+  )
+  bspec_s_in = pl.BlockSpec(
+      (1, 1, mb, key_dim, val_dim), lambda i_b, c: (i_b, c, 0, 0, 0)
+  )
+  bspec_s = pl.BlockSpec(
+      (1, mb, key_dim, val_dim), lambda i_b, c: (i_b, 0, 0, 0)
+  )
 
   interpret = jax.default_backend() == "cpu"
-  return pl.pallas_call(
+  o_out, a_ab_inv_out, merged_out, s_in_out, s_final_out = pl.pallas_call(
       kernel,
-      grid=grid,
-      in_specs=[bspec_k, bspec_k, bspec_v, bspec_k, bspec_k, bspec_k, bspec_k],
-      out_specs=[bspec_qq, bspec_qq, bspec_v, bspec_k],
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=0,
+          grid=grid,
+          in_specs=[
+              bspec_k,
+              bspec_k,
+              bspec_v,
+              bspec_k,
+              bspec_k,
+              bspec_k,
+              bspec_k,
+              bspec_s,
+          ],
+          out_specs=[bspec_v, bspec_bt, bspec_kv, bspec_s_in, bspec_s],
+          scratch_shapes=[pltpu.VMEM((mb, key_dim, val_dim), jnp.float32)],
+      ),
       out_shape=[
-          jax.ShapeDtypeStruct((batch_size, num_heads, num_chunks, chunk_size, chunk_size), q_c.dtype),
-          jax.ShapeDtypeStruct((batch_size, num_heads, num_chunks, chunk_size, chunk_size), q_c.dtype),
-          jax.ShapeDtypeStruct((batch_size, num_heads, num_chunks, chunk_size, val_dim), v_c.dtype),
-          jax.ShapeDtypeStruct((batch_size, num_heads, num_chunks, chunk_size, key_dim), q_c.dtype),
+          jax.ShapeDtypeStruct(
+              (nb, num_chunks, mb, chunk_size, val_dim), v_c.dtype
+          ),
+          jax.ShapeDtypeStruct(
+              (nb, num_chunks, mb, chunk_size, chunk_size), q_c.dtype
+          ),
+          jax.ShapeDtypeStruct(
+              (nb, num_chunks, mb, chunk_size, key_dim + val_dim), jnp.float32
+          ),
+          jax.ShapeDtypeStruct(
+              (nb, num_chunks, mb, key_dim, val_dim), jnp.float32
+          ),
+          jax.ShapeDtypeStruct((nb, mb, key_dim, val_dim), jnp.float32),
       ],
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel", "arbitrary")
+      ),
       interpret=interpret,
-  )(q_c, k_c, v_c, alpha_c, beta_c, gk_c, gk_cs_c)
+  )(q_in, k_in, v_in, alpha_in, beta_in, gk_in, gk_cs_in, s0_in)
+
+  o_c = jnp.swapaxes(o_out, 1, 2).reshape(
+      batch_size, num_heads, num_chunks, chunk_size, val_dim
+  )
+  a_ab_inv_c = jnp.swapaxes(a_ab_inv_out, 1, 2).reshape(
+      batch_size, num_heads, num_chunks, chunk_size, chunk_size
+  )
+  merged_out_c = jnp.swapaxes(merged_out, 1, 2).reshape(
+      batch_size, num_heads, num_chunks, chunk_size, key_dim + val_dim
+  )
+  s_in = jnp.swapaxes(s_in_out, 1, 2).reshape(
+      batch_size, num_heads, num_chunks, key_dim, val_dim
+  )
+  s_final = s_final_out.reshape(batch_size, num_heads, key_dim, val_dim)
+  return o_c, a_ab_inv_c, merged_out_c, s_in, s_final
 
 
 def rwkv7_pallas_fwd(
@@ -165,8 +270,11 @@ def rwkv7_pallas_fwd(
     scale: float | None = None,
     initial_state: jax.Array | None = None,
     output_final_state: bool = False,
-) -> tuple[jax.Array, jax.Array | None]:
-  """Computes RWKV-7 forward pass using Pallas TPU intra-chunk kernel."""
+    return_residuals: bool = False,
+) -> tuple[jax.Array, jax.Array | None] | tuple[
+    jax.Array, jax.Array | None, jax.Array, jax.Array, jax.Array
+]:
+  """Computes RWKV-7 forward pass using single-pass fused Pallas TPU kernel."""
   batch_size, seq_len, num_heads, key_dim = q.shape
   val_dim = v.shape[-1]
   num_chunks = seq_len // chunk_size
@@ -179,26 +287,23 @@ def rwkv7_pallas_fwd(
   alpha_c = _chunkify(alpha, batch_size, num_chunks, chunk_size)
   beta_c = _chunkify(beta, batch_size, num_chunks, chunk_size)
   gk_c = _chunkify(gk, batch_size, num_chunks, chunk_size)
-  gk_cs_c = jnp.cumsum(gk_c, axis=-2)
-
-  aqk, aqb, u, w = _intra_chunk_rwkv7_pallas(
-      q_c, k_c, v_c, alpha_c, beta_c, gk_c, gk_cs_c
-  )
-
-  q_s, k_s, v_s, beta_s, gk_cs_s, aqk_s, aqb_s, u_s, w_s = map(
-      _move_nt_front, (q_c, k_c, v_c, beta_c, gk_cs_c, aqk, aqb, u, w)
-  )
-
-  scan_body_batched = jax.vmap(jax.vmap(_scan_body))
+  gk_cs_c = jnp.cumsum(gk_c.astype(jnp.float32), axis=-2)
 
   if initial_state is None:
-    s0 = jnp.zeros((batch_size, num_heads, key_dim, val_dim), dtype=jnp.float32)
+    s0 = jnp.zeros(
+        (batch_size, num_heads, key_dim, val_dim), dtype=jnp.float32
+    )
   else:
     s0 = initial_state.astype(jnp.float32)
 
-  s_final, o_stacked = jax.lax.scan(
-      scan_body_batched, s0, (q_s, k_s, v_s, beta_s, gk_cs_s, aqk_s, aqb_s, u_s, w_s)
+  o_c, a_ab_inv_c, merged_out_c, s_in, s_final = _rwkv7_fwd_pallas(
+      q_c, k_c, v_c, alpha_c, beta_c, gk_c, gk_cs_c, s0
   )
-  o = jnp.moveaxis(o_stacked, 0, 2)
-  o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(batch_size, seq_len, num_heads, val_dim)
-  return o, (s_final if output_final_state else None)
+
+  o = jnp.transpose(o_c, (0, 2, 3, 1, 4)).reshape(
+      batch_size, seq_len, num_heads, val_dim
+  ).astype(q.dtype)
+  final_state = s_final.astype(q.dtype) if output_final_state else None
+  if return_residuals:
+    return o, final_state, a_ab_inv_c, merged_out_c, s_in
+  return o, final_state

@@ -34,21 +34,30 @@ def _move_nt_front(x: jax.Array) -> jax.Array:
   return jnp.moveaxis(x, 2, 0)
 
 
+def _mm(x: jax.Array, y: jax.Array) -> jax.Array:
+  return jnp.matmul(
+      x,
+      y,
+      preferred_element_type=jnp.float32,
+      precision=jax.lax.Precision.HIGHEST,
+  )
+
+
 def _scan_body(s: jax.Array, chunk_inputs: tuple[Any, ...]) -> tuple[jax.Array, jax.Array]:
   q_i, k_i, v_i, beta_i, gk_cs_i, aqk_i, aqb_i, u_i, w_i = chunk_inputs
-  v2_i = u_i + jnp.matmul(w_i, s, preferred_element_type=jnp.float32)
-  o_1 = jnp.matmul(aqk_i, v_i, preferred_element_type=jnp.float32)
-  o_2 = jnp.matmul(aqb_i, v2_i, preferred_element_type=jnp.float32)
-  o_3 = jnp.matmul(
-      q_i * jnp.exp(jnp.minimum(gk_cs_i, 0.0)), s, preferred_element_type=jnp.float32
+  v2_i = u_i + _mm(w_i, s)
+  o_1 = _mm(aqk_i, v_i)
+  o_2 = _mm(aqb_i, v2_i)
+  o_3 = _mm(
+      q_i * jnp.exp(jnp.minimum(gk_cs_i, 0.0)), s
   )
   o_i = o_1 + o_2 + o_3
   g_last = gk_cs_i[-1]
   decay_last = jnp.exp(jnp.minimum(g_last[None, :] - gk_cs_i, 0.0))
   s_new = (
       s * jnp.exp(jnp.minimum(g_last, 0.0))[:, None]
-      + jnp.matmul((k_i * decay_last).T, v_i, preferred_element_type=jnp.float32)
-      + jnp.matmul((beta_i * decay_last).T, v2_i, preferred_element_type=jnp.float32)
+      + _mm((k_i * decay_last).T, v_i)
+      + _mm((beta_i * decay_last).T, v2_i)
   )
   return s_new.astype(s.dtype), o_i.astype(u_i.dtype)
 
@@ -86,15 +95,15 @@ def _intra_chunk_one_plain(
   p = eye + a_ab_f32
   curr = a_ab_f32
   for _ in range(1, 6):
-    curr = jnp.matmul(curr, curr, preferred_element_type=jnp.float32)
-    p = jnp.matmul(p, eye + curr, preferred_element_type=jnp.float32)
+    curr = _mm(curr, curr)
+    p = _mm(p, eye + curr)
   a_ab_inv = p
 
   v_dim = v_i.shape[-1]
-  ak_v = jnp.matmul(a_ak, v_i, preferred_element_type=jnp.float32)
+  ak_v = _mm(a_ak, v_i)
   decayed_alpha = jnp.exp(jnp.minimum(gk_excl, 0.0)) * alpha_i
   merged_rhs = jnp.concat([ak_v, decayed_alpha], axis=-1)
-  merged_uw = jnp.matmul(a_ab_inv, merged_rhs, preferred_element_type=jnp.float32)
+  merged_uw = _mm(a_ab_inv, merged_rhs)
   u_i = merged_uw[:, :v_dim]
   w_i = merged_uw[:, v_dim:]
 

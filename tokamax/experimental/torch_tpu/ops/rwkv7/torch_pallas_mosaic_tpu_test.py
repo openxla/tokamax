@@ -16,6 +16,7 @@
 """Unit tests for RWKV-7 PyTorch operator."""
 
 import unittest
+
 from absl import logging
 from absl.testing import absltest
 import torch
@@ -26,28 +27,92 @@ from tokamax.experimental.torch_tpu.ops.rwkv7 import rwkv7 as rwkv7_pallas
 class RWKV7PallasKernelTest(unittest.TestCase):
   """Tests for RWKV-7 operator on TPU and fallback devices."""
 
+  def _get_device(self) -> str:
+    if hasattr(torch, "tpu") and torch.tpu.is_available():
+      return "tpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
   def test_forward_shape_and_parity(self):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
+    device = self._get_device()
     chunk_size = 64
 
-    torch.manual_seed(42)
-    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32) * (head_dim ** -0.5)
-    k = F.normalize(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32), p=2, dim=-1)
-    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
-    alpha = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32) * (head_dim ** -0.5)
-    beta = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32) * (head_dim ** -0.5)
-    gk = -torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))
+    for seq_len in (64, 128, 256):
+      batch_size, num_heads, head_dim = 2, 4, 16
+      torch.manual_seed(42)
+      q = (
+          torch.randn(
+              batch_size,
+              seq_len,
+              num_heads,
+              head_dim,
+              device=device,
+              dtype=torch.float32,
+          )
+          * (head_dim**-0.5)
+      )
+      k = F.normalize(
+          torch.randn(
+              batch_size,
+              seq_len,
+              num_heads,
+              head_dim,
+              device=device,
+              dtype=torch.float32,
+          ),
+          p=2,
+          dim=-1,
+      )
+      v = torch.randn(
+          batch_size,
+          seq_len,
+          num_heads,
+          head_dim,
+          device=device,
+          dtype=torch.float32,
+      )
+      alpha = (
+          torch.randn(
+              batch_size,
+              seq_len,
+              num_heads,
+              head_dim,
+              device=device,
+              dtype=torch.float32,
+          )
+          * (head_dim**-0.5)
+      )
+      beta = (
+          torch.randn(
+              batch_size,
+              seq_len,
+              num_heads,
+              head_dim,
+              device=device,
+              dtype=torch.float32,
+          )
+          * (head_dim**-0.5)
+      )
+      gk = -torch.sigmoid(
+          torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+      )
 
-    actual = rwkv7_pallas.rwkv7_pallas_delta_rule(q, k, v, alpha, beta, gk, chunk_size=chunk_size)
-    expected = rwkv7_pallas._cpu_fallback(q, k, v, alpha, beta, gk, chunk_size=chunk_size)
+      actual = rwkv7_pallas.rwkv7_pallas_delta_rule(
+          q, k, v, alpha, beta, gk, chunk_size=chunk_size
+      )
+      expected = rwkv7_pallas._cpu_fallback(
+          q.cpu(), k.cpu(), v.cpu(), alpha.cpu(), beta.cpu(), gk.cpu(), chunk_size=chunk_size
+      )
 
-    self.assertEqual(actual.shape, (batch_size, seq_len, num_heads, head_dim))
-    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3)
-    logging.info("RWKV-7 forward shape and parity test passed.")
+      self.assertEqual(actual.shape, (batch_size, seq_len, num_heads, head_dim))
+      torch.testing.assert_close(
+          actual.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3
+      )
+      logging.info(
+          "RWKV-7 forward shape and parity test passed for seq_len=%d.", seq_len
+      )
 
   def test_chunk_size_validation(self):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = self._get_device()
     q = torch.randn(2, 100, 4, 16, device=device)
     k = torch.randn(2, 100, 4, 16, device=device)
     v = torch.randn(2, 100, 4, 16, device=device)
@@ -56,28 +121,84 @@ class RWKV7PallasKernelTest(unittest.TestCase):
     gk = torch.randn(2, 100, 4, 16, device=device)
 
     with self.assertRaises(ValueError):
-      rwkv7_pallas.rwkv7_pallas_delta_rule(q, k, v, alpha, beta, gk, chunk_size=64)
+      rwkv7_pallas.rwkv7_pallas_delta_rule(
+          q, k, v, alpha, beta, gk, chunk_size=64
+      )
 
   def test_backward_autograd(self):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size, seq_len, num_heads, head_dim = 2, 64, 4, 16
+    device = self._get_device()
+    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
     chunk_size = 64
 
     torch.manual_seed(42)
-    q = (torch.randn(batch_size, seq_len, num_heads, head_dim, device=device) * (head_dim ** -0.5)).detach().requires_grad_(True)
-    k = (F.normalize(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device), p=2, dim=-1)).detach().requires_grad_(True)
-    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
-    alpha = (torch.randn(batch_size, seq_len, num_heads, head_dim, device=device) * (head_dim ** -0.5)).detach().requires_grad_(True)
-    beta = (torch.randn(batch_size, seq_len, num_heads, head_dim, device=device) * (head_dim ** -0.5)).detach().requires_grad_(True)
-    gk = (-torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))).detach().requires_grad_(True)
+    q = (
+        (
+            torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+            * (head_dim**-0.5)
+        )
+        .detach()
+        .requires_grad_(True)
+    )
+    k = (
+        F.normalize(
+            torch.randn(
+                batch_size, seq_len, num_heads, head_dim, device=device
+            ),
+            p=2,
+            dim=-1,
+        )
+        .detach()
+        .requires_grad_(True)
+    )
+    v = torch.randn(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        device=device,
+        requires_grad=True,
+    )
+    alpha = (
+        (
+            torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+            * (head_dim**-0.5)
+        )
+        .detach()
+        .requires_grad_(True)
+    )
+    beta = (
+        (
+            torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+            * (head_dim**-0.5)
+        )
+        .detach()
+        .requires_grad_(True)
+    )
+    gk = (
+        -torch.sigmoid(
+            torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+        )
+    ).detach().requires_grad_(True)
 
-    out = rwkv7_pallas.rwkv7_pallas_delta_rule(q, k, v, alpha, beta, gk, chunk_size=chunk_size)
+    out = rwkv7_pallas.rwkv7_pallas_delta_rule(
+        q, k, v, alpha, beta, gk, chunk_size=chunk_size
+    )
     loss = out.sum()
     loss.backward()
 
-    for tensor, name in [(q, "q"), (k, "k"), (v, "v"), (alpha, "alpha"), (beta, "beta"), (gk, "gk")]:
+    for tensor, name in [
+        (q, "q"),
+        (k, "k"),
+        (v, "v"),
+        (alpha, "alpha"),
+        (beta, "beta"),
+        (gk, "gk"),
+    ]:
       self.assertIsNotNone(tensor.grad, f"{name}.grad should not be None")
-      self.assertTrue(torch.isfinite(tensor.grad).all(), f"{name}.grad contains non-finite values")
+      self.assertTrue(
+          torch.isfinite(tensor.grad).all(),
+          f"{name}.grad contains non-finite values",
+      )
     logging.info("RWKV-7 backward autograd test passed.")
 
 
