@@ -14,12 +14,36 @@
 # ==============================================================================
 """Kalman Delta Attention (KDA) operator."""
 
-from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import kda_scan_pure_jax
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _bwd_ds0_jax
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _bwd_jax
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _fwd_jax
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _kda_bwd_pallas
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _kda_fwd_pallas
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _kda_ring_phase1_fwd_pallas
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _kda_state_bwd_ds0_pallas
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _kda_state_fwd_pallas
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _ring_phase1_fwd_jax
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import _state_fwd_jax
 from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import kda_bwd_jax
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import kda_pallas_bwd
 from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import kda_pallas_delta_rule
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import kda_pallas_fwd
+from tokamax.experimental.torch_tpu.ops.kda.kda_kernel import kda_scan_pure_jax
 
 __all__ = [
-    "kda_scan_pure_jax",
+    "_bwd_ds0_jax",
+    "_bwd_jax",
+    "_fwd_jax",
+    "_kda_bwd_pallas",
+    "_kda_fwd_pallas",
+    "_kda_ring_phase1_fwd_pallas",
+    "_kda_state_bwd_ds0_pallas",
+    "_kda_state_fwd_pallas",
+    "_ring_phase1_fwd_jax",
+    "_state_fwd_jax",
     "kda_bwd_jax",
+    "kda_pallas_bwd",
     "kda_pallas_delta_rule",
+    "kda_pallas_fwd",
+    "kda_scan_pure_jax",
 ]
