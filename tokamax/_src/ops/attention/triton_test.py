@@ -188,6 +188,18 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
         test_vjp=False,
     )
 
+  @parameterized.parameters(
+      dict(block_q=48),
+      dict(block_k=8),
+      dict(block_d=8),
+      dict(block_d_out=24),
+  )
+  def test_config_rejects_invalid_block_sizes(self, **invalid):
+    assert fa is not None
+    valid = dict(block_q=64, block_k=64, num_warps=4, num_stages=2)
+    with self.assertRaises(ValueError):
+      fa.Config(**(valid | invalid))
+
   def test_neg_inf_bias(self):
     assert fa is not None
     assert isinstance(self._attention_fn, fa.TritonFlashAttention)

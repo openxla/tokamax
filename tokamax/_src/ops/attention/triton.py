@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import math
-from typing import Any, ClassVar, override
+from typing import Annotated, Any, ClassVar, override
 
 import jax
 from jax.extend import backend
@@ -617,14 +617,17 @@ def _can_have_block_d(*args):
   return True
 
 
+_PowerOfTwoGe16 = Annotated[pydantic_lib.PowerOfTwo, pydantic.Field(ge=16)]
+
+
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_q: pydantic.PositiveInt
-  block_k: pydantic.PositiveInt
+  block_q: pydantic_lib.PowerOfTwo
+  block_k: _PowerOfTwoGe16
   num_stages: pydantic.PositiveInt
   num_warps: pydantic_lib.PowerOfTwo
-  block_d: pydantic.PositiveInt | None = None
-  block_d_out: pydantic.PositiveInt | None = None
+  block_d: _PowerOfTwoGe16 | None = None
+  block_d_out: _PowerOfTwoGe16 | None = None
   split_k: pydantic.PositiveInt = 1
   pack_mask: bool = False
 
@@ -777,7 +780,9 @@ class TritonFlashAttention(base.DotProductAttention[Config, None]):
 
       if _can_have_block_d(q, k, v):
         block_qk = block_q * block_k
-        block_d = triton.next_power_of_2(min(head_dim, 64**3 // block_qk))
+        block_d = max(
+            16, triton.next_power_of_2(min(head_dim, 64**3 // block_qk))
+        )
 
     return Config(
         block_q=block_q,
