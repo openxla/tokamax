@@ -45,26 +45,42 @@ _load_bcast = common.load_bcast
 _tiled_spec = mgpu_lib.tiled_swizzled_block_spec
 
 
-def _estimate_dq_smem_bytes(ba, block_q, block_kv, num_stages, ds_dtype):
+def _get_bound_args(ba: op.BoundArguments):
+  """Extracts attention input arguments from BoundArguments."""
+  args_dict = getattr(ba, "arguments", {})
+
+  def _get(name, pos):
+    if name in args_dict:
+      return args_dict[name]
+    if pos >= 0 and len(ba.args) > pos:
+      return ba.args[pos]
+    return ba.kwargs.get(name)
+
+  q, k, v = _get("q", 3), _get("k", 4), _get("v", 5)
+  bias, mask = _get("bias", -1), _get("mask", -1)
+  q_indices, k_indices = _get("q_indices", -1), _get("k_indices", -1)
+  return q, k, v, bias, mask, q_indices, k_indices
+
+
+def _estimate_dq_smem_bytes(
+    ba, block_q, block_kv, num_stages, ds_dtype, compute_wgs=2
+):
   """Estimates the dq kernel smem usage in bytes for a given configuration."""
-  _, _, _, q, k, v = ba.args
-  tile_q = 2 * block_q
+  q, k, v, bias, mask, q_indices, k_indices = _get_bound_args(ba)
+  tile_q = compute_wgs * block_q
 
   # 32-bit floats are downcast to 16-bit before the kernel call.
   dtype_bits = jnp.finfo(jnp.bfloat16).bits
   block_d = pl.cdiv(q.shape[-1], 64) * 64
-  block_d_out = v.shape[-1]
+  block_d_out = pl.cdiv(v.shape[-1], 64) * 64
   bytes_per_stage = block_kv * (block_d + block_d_out) * dtype_bits // 8  # k,v
-  if (bias := ba.kwargs["bias"]) is None:
+  if bias is None:
     ds_bytes = 0
   else:
     ds_bytes = tile_q * block_kv * jnp.finfo(ds_dtype).bits // 8
     if bias.shape[-2] != 1 and bias.shape[-1] != 1:
       bytes_per_stage += tile_q * block_kv * jnp.finfo(bias.dtype).bits // 8
 
-  mask = ba.kwargs["mask"]
-  q_indices = ba.kwargs["q_indices"]
-  k_indices = ba.kwargs["k_indices"]
   mask, *_ = jax.eval_shape(
       common.decompose_mask, mask, q, k, q_indices, k_indices
   )
@@ -79,24 +95,21 @@ def _estimate_dq_smem_bytes(ba, block_q, block_kv, num_stages, ds_dtype):
   )
 
 
-def _estimate_dkv_smem_bytes(ba, block_q, block_kv, num_stages):
+def _estimate_dkv_smem_bytes(ba, block_q, block_kv, num_stages, compute_wgs=2):
   """Estimates the dkv kernel smem usage in bytes for a given configuration."""
-  _, _, _, q, k, v = ba.args
-  tile_kv = 2 * block_kv
+  q, k, v, bias, mask, q_indices, k_indices = _get_bound_args(ba)
+  tile_kv = compute_wgs * block_kv
 
   # 32-bit floats are downcast to 16-bit before the kernel call.
   dtype_bits = jnp.finfo(jnp.bfloat16).bits
   block_d = pl.cdiv(q.shape[-1], 64) * 64
-  block_d_out = v.shape[-1]
+  block_d_out = pl.cdiv(v.shape[-1], 64) * 64
   bytes_per_stage = block_q * (block_d + block_d_out) * dtype_bits // 8  # q, do
   bytes_per_stage += 3 * block_q * _F32_BYTES  # m, l, delta
-  if (bias := ba.kwargs["bias"]) is not None:
+  if bias is not None:
     if bias.shape[-2] != 1 and bias.shape[-1] != 1:
       bytes_per_stage += block_q * tile_kv * jnp.finfo(bias.dtype).bits // 8
 
-  mask = ba.kwargs["mask"]
-  q_indices = ba.kwargs["q_indices"]
-  k_indices = ba.kwargs["k_indices"]
   mask, *_ = jax.eval_shape(
       common.decompose_mask, mask, q, k, q_indices, k_indices
   )
@@ -109,8 +122,7 @@ def _estimate_dkv_smem_bytes(ba, block_q, block_kv, num_stages):
 
 
 def get_heuristics_config(ba: op.BoundArguments) -> Config:
-  _, _, _, q, k, _ = ba.args
-  bias = ba.kwargs["bias"]
+  q, k, _, bias, *_ = _get_bound_args(ba)
   dbias_intermediate_dtype = getattr(ba.op, "dbias_intermediate_dtype", None)
   ds_dtype = vjp_common.get_ds_dtype(q, k, bias, dbias_intermediate_dtype)
 
@@ -131,22 +143,34 @@ def get_heuristics_config(ba: op.BoundArguments) -> Config:
 
 def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   # TODO: Expand vjp search space.
-  del ba
+  q, k, _, bias, *_ = _get_bound_args(ba)
+  dbias_intermediate_dtype = getattr(ba.op, "dbias_intermediate_dtype", None)
+  ds_dtype = vjp_common.get_ds_dtype(q, k, bias, dbias_intermediate_dtype)
   configs = set()
   for block_q in [64, 128]:
     for block_kv in [64, 128]:
-      for num_stages in [2, 3]:
+      for num_stages in [1, 2, 3]:
         for compute_wgs in [1, 2]:
-          configs.add(
-              Config(
-                  block_q_dkv=block_q,
-                  block_kv_dkv=block_kv,
-                  block_q_dq=block_q,
-                  block_kv_dq=block_kv,
-                  num_stages=num_stages,
-                  compute_wgs=compute_wgs,
+          if (
+              _estimate_dq_smem_bytes(
+                  ba, block_q, block_kv, num_stages, ds_dtype, compute_wgs
               )
-          )
+              <= _SMEM_SIZE_BYTES
+              and _estimate_dkv_smem_bytes(
+                  ba, block_q, block_kv, num_stages, compute_wgs
+              )
+              <= _SMEM_SIZE_BYTES
+          ):
+            configs.add(
+                Config(
+                    block_q_dkv=block_q,
+                    block_kv_dkv=block_kv,
+                    block_q_dq=block_q,
+                    block_kv_dq=block_kv,
+                    num_stages=num_stages,
+                    compute_wgs=compute_wgs,
+                )
+            )
   return configs
 
 
@@ -180,11 +204,24 @@ def flash_attention_vjp_kernel(
   q, k, v, out, dout = map(pad_head_dim, (q, k, v, out, dout))
   m, l = residuals
 
+  block_q_dq = config.block_q_dq
+  block_q_dkv = config.block_q_dkv
+  block_kv_dkv = config.block_kv_dkv
+  block_kv_dq = config.block_kv_dq
+  compute_wgs = config.compute_wgs
+  tile_q_dq = compute_wgs * block_q_dq
+  tile_kv_dkv = compute_wgs * block_kv_dkv
+  pad_q = math.lcm(tile_q_dq, block_q_dkv)
+  pad_kv = math.lcm(block_kv_dq, tile_kv_dkv)
+
   # TODO: Remove padding along q sequence length.
-  pad_seq = lambda seq, a: shape_lib.pad_to_next_multiple_of(seq, 8, a)
-  q, k, v, out, dout = map(pad_seq, (q, k, v, out, dout), (-3, -3, -3, -3, -3))
-  m = shape_lib.pad_to_next_multiple_of(m, 8, -1, pad_value=jnp.inf)
-  l = shape_lib.pad_to_next_multiple_of(l, 8, -1, pad_value=1.0)
+  pad_seq_q = lambda seq, a: shape_lib.pad_to_next_multiple_of(seq, pad_q, a)
+  pad_seq_kv = lambda seq, a: shape_lib.pad_to_next_multiple_of(seq, pad_kv, a)
+  q, out, dout = map(pad_seq_q, (q, out, dout), (-3, -3, -3))
+  k, v = map(pad_seq_kv, (k, v), (-3, -3))
+  m = jnp.where((m == -jnp.inf) | (l == 0.0), jnp.inf, m)
+  m = shape_lib.pad_to_next_multiple_of(m, pad_q, -1, pad_value=jnp.inf)
+  l = shape_lib.pad_to_next_multiple_of(l, pad_q, -1, pad_value=0.0)
 
   q_seq_len, num_q_heads, head_dim = q.shape
   kv_seq_len, num_kv_heads, head_dim_out = v.shape
@@ -197,29 +234,23 @@ def flash_attention_vjp_kernel(
     raise ValueError(f"{num_q_heads=} must be divisible by and {num_kv_heads=}")
   q_heads_per_kv_head = num_q_heads // num_kv_heads
 
-  block_q_dq = config.block_q_dq
-  block_q_dkv = config.block_q_dkv
-  block_kv_dkv = config.block_kv_dkv
-  block_kv_dq = config.block_kv_dq
-  compute_wgs = config.compute_wgs
-
   if bias is not None:
     if bias.shape[-2] != 1:
-      bias = pad_seq(bias, -2)
+      bias = pad_seq_q(bias, -2)
     if bias.shape[-1] != 1:
-      bias = shape_lib.pad_to_next_multiple_of(bias, 64, -1)
+      bias = pad_seq_kv(bias, -1)
 
   if mask is not None:
     if mask.shape[-2] != 1:
-      mask = shape_lib.pad_to_next_multiple_of(mask, block_q_dkv, -2)
+      mask = pad_seq_q(mask, -2)
     if mask.shape[-1] != 1:
-      mask = shape_lib.pad_to_next_multiple_of(mask, block_kv_dq, -1)
+      mask = pad_seq_kv(mask, -1)
     mask = mask.astype(jnp.int8)
 
   if k_start is not None and k_start.shape[-1] != 1:
-    k_start = pad_seq(k_start, -1)
+    k_start = pad_seq_q(k_start, -1)
   if k_end is not None and k_end.shape[-1] != 1:
-    k_end = pad_seq(k_end, -1)
+    k_end = pad_seq_q(k_end, -1)
 
   # TODO: Avoid broadcast.
   bcast = lambda x: jnp.broadcast_to(x, (x.shape[-2], q_seq_len))
@@ -227,7 +258,10 @@ def flash_attention_vjp_kernel(
   k_end = None if k_end is None else bcast(k_end)
   has_k_range = k_start is not None or k_end is not None
   delta = jnp.einsum(
-      "qhd,qhd->hq", out, dout, preferred_element_type=jnp.float32
+      "qhd,qhd->hq",
+      out.astype(jnp.float32),
+      dout.astype(jnp.float32),
+      precision=jax.lax.Precision.HIGHEST,
   )
 
   def kernel_dq(
@@ -296,7 +330,7 @@ def flash_attention_vjp_kernel(
       k_start = load_k_range(k_start_gmem)
       k_end = load_k_range(k_end_gmem)
       m *= math.log2(math.e)
-      l_rcp = 1.0 / (l + jnp.finfo(jnp.float32).tiny)
+      l_rcp = jnp.where(l == 0.0, 0.0, 1.0 / (l + jnp.finfo(jnp.float32).tiny))
 
       plgpu.barrier_wait(barrier)
 
@@ -482,8 +516,8 @@ def flash_attention_vjp_kernel(
     tile_kv = compute_wgs * block_kv
     kv_base = ki * tile_kv + wg * block_kv
     ks = cast(pl.Slice, pl.ds(kv_base, block_kv))
-    lb = lax.div(ki * tile_kv, block_q) if is_causal else 0
     ub = num_q_tiles = pl.cdiv(q_seq_len, block_q)
+    lb = lax.min(ub, lax.div(ki * tile_kv, block_q)) if is_causal else 0
 
     k_smem = k_smems.at[wg]
     v_smem = v_smems.at[wg]
@@ -494,7 +528,11 @@ def flash_attention_vjp_kernel(
       plgpu.copy_gmem_to_smem(v_gmem.at[ks, hi_kv], v_smem, barrier)
       if mask_gmem is None:
         mask = None
-      elif mask_gmem.shape[-3] != 1 or mask_gmem.shape[-1] != 1:
+      elif (
+          mask_gmem.shape[-3] != 1
+          or mask_gmem.shape[-2] == 1
+          or mask_gmem.shape[-1] != 1
+      ):
         mask = None
       else:  # The mask is loop invariant.
         idx = (0, ks, 0)
@@ -541,7 +579,7 @@ def flash_attention_vjp_kernel(
       qi = lb + i
       q_base = qi * block_q
       qs = cast(pl.Slice, pl.ds(q_base, block_q))
-      hi = q_heads_per_kv_head * j + hi_kv
+      hi = q_heads_per_kv_head * hi_kv + j
       dk_acc, dv_acc, loop_invariant_mask = carry
 
       def compute_s(acc):
@@ -554,11 +592,13 @@ def flash_attention_vjp_kernel(
         else:
           idx = pl.ds(wg * block_kv, block_kv)
           bias = plgpu.load(bias_smem.T.at[idx], layout=_WGMMA_TRANSPOSED)
+          mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(bias_consumed)
 
         m = plgpu.load(m_smem, layout=_WGMMA_COL)
         l = plgpu.load(l_smem, layout=_WGMMA_COL)
         delta = plgpu.load(delta_smem, layout=_WGMMA_COL)
+        mgpu_lib.fence_async_shared_cta()
         plgpu.barrier_arrive(m_consumed)
         plgpu.barrier_arrive(l_consumed)
         plgpu.barrier_arrive(delta_consumed)
@@ -589,7 +629,8 @@ def flash_attention_vjp_kernel(
       m *= math.log2(math.e)
       bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [1])
       epsilon = float(jnp.finfo(jnp.float32).tiny)  # Avoid division by zero.
-      p = jnp.exp2(s * scale - bcast(m)) / bcast(l + epsilon)
+      l_rcp = jnp.where(l == 0.0, 0.0, 1.0 / (l + epsilon))
+      p = jnp.exp2(s * scale - bcast(m)) * bcast(l_rcp)
 
       def load_k_range(ref):
         hi_ = 0 if ref.shape[0] == 1 else hi
@@ -612,6 +653,7 @@ def flash_attention_vjp_kernel(
             mask = lax.broadcast_in_dim(loop_invariant_mask, s.shape, [0])
         else:
           mask = mask_smem[pl.ds(wg * block_kv, block_kv)]
+          mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(mask_consumed)
 
         p = jnp.where(mask, p, 0.0)
