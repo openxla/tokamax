@@ -62,8 +62,14 @@ def _check_supported(
     segment_ids: jax.Array | None,
     context_parallel_metadata: ContextParallelMetadataArg,
     chunk_size: int,
+    per_channel_gate: bool = True,
+    use_conv1d: bool = False,
 ) -> None:
   """Validates that the inputs and configuration are supported by xla_chunked."""
+  if not per_channel_gate:
+    raise NotImplementedError("`xla_chunked` requires a per-channel gate.")
+  if use_conv1d:
+    raise NotImplementedError("`xla_chunked` does not support a fused conv1d.")
   if not use_gate_in_kernel:
     raise NotImplementedError(
         "`xla_chunked` requires `use_gate_in_kernel=True`."
@@ -115,7 +121,7 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
       query: Float[Array, "H B T K"],
       key: Float[Array, "H B T K"],
       value: Float[Array, "H B T V"],
-      gate: Float[Array, "H B T K"],
+      gate: Float[Array, "H B T GW"],
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None,
@@ -125,11 +131,20 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
       output_final_state: bool,
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
+      per_channel_gate: bool,
+      chunk_size: int | None,
       segment_ids: Int[Array, "B T"] | None,
       lower_bound: float | None,
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
+      conv_weight_q: Float[Array, "H_Q W K"] | None = None,
+      conv_weight_k: Float[Array, "H_K W K"] | None = None,
+      conv_weight_v: Float[Array, "H W V"] | None = None,
+      conv_bias_q: Float[Array, "H_Q K"] | None = None,
+      conv_bias_k: Float[Array, "H_K K"] | None = None,
+      conv_bias_v: Float[Array, "H V"] | None = None,
+      use_conv1d_in_kernel: bool = False,
       config: Config,
   ) -> tuple[base.Output, None]:
     del return_residuals
@@ -145,7 +160,12 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
         safe_gate=safe_gate,
         segment_ids=segment_ids,
         context_parallel_metadata=context_parallel_metadata,
-        chunk_size=config.chunk_size,
+        chunk_size=config.chunk_size if chunk_size is None else chunk_size,
+        per_channel_gate=per_channel_gate,
+        use_conv1d=use_conv1d_in_kernel
+        or any(
+            w is not None for w in (conv_weight_q, conv_weight_k, conv_weight_v)
+        ),
     )
     base._validate_beta(beta)  # pylint: disable=protected-access
     output = chunk_kda_fwd(
@@ -206,11 +226,20 @@ class XlaChunkedKimiDeltaAttentionVjp(
       output_final_state: bool,
       use_qk_l2norm: bool,
       use_gate_in_kernel: bool,
+      per_channel_gate: bool,
+      chunk_size: int | None,
       segment_ids: jax.Array | None,
       lower_bound: float | None,
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
       return_residuals: bool,
+      conv_weight_q: jax.Array | None = None,
+      conv_weight_k: jax.Array | None = None,
+      conv_weight_v: jax.Array | None = None,
+      conv_bias_q: jax.Array | None = None,
+      conv_bias_k: jax.Array | None = None,
+      conv_bias_v: jax.Array | None = None,
+      use_conv1d_in_kernel: bool = False,
       config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
     del residuals, out, return_residuals
@@ -226,7 +255,12 @@ class XlaChunkedKimiDeltaAttentionVjp(
         safe_gate=safe_gate,
         segment_ids=segment_ids,
         context_parallel_metadata=context_parallel_metadata,
-        chunk_size=config.chunk_size,
+        chunk_size=config.chunk_size if chunk_size is None else chunk_size,
+        per_channel_gate=per_channel_gate,
+        use_conv1d=use_conv1d_in_kernel
+        or any(
+            w is not None for w in (conv_weight_q, conv_weight_k, conv_weight_v)
+        ),
     )
     dq, dk, dv, dg, db, da, dbias, dh0 = chunk_kda_bwd(
         query,
