@@ -28,6 +28,8 @@ from tokamax._src.ops.experimental.mhc_lite import mhc_xla
 
 xprof_session = None
 
+jax.config.parse_flags_with_absl()
+
 # Default benchmark dimensions.
 BATCH, SEQ, STREAMS, EMB = 128, 1536, 4, 512
 EPS = 1e-6

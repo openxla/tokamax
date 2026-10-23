@@ -41,36 +41,39 @@ def pre_hc(
     common.UnsupportedInputError: If `x` is not rank 2 or 4 or `weights.w_pre`
       is not rank 1 or 2.
   """
-  if x.ndim not in (2, 4):
-    raise common.UnsupportedInputError(
-        "Expected x to have shape (batch, sequence, streams, embedding) or"
-        f" (tokens, streams * embedding); got {x.shape}."
-    )
-  streams = weights.w_pre.shape[0]
-  if x.ndim == 2:
-    if x.shape[1] % streams != 0:
+  with jax.named_scope("hc_pre_xla"):
+    if x.ndim not in (2, 4):
       raise common.UnsupportedInputError(
-          f"Expected 2D x.shape[1] ({x.shape[1]}) to be divisible by streams"
-          f" ({streams})."
+          "Expected x to have shape (batch, sequence, streams, embedding) or"
+          f" (tokens, streams * embedding); got {x.shape}."
       )
-    x_streams = x.reshape(x.shape[0], streams, x.shape[1] // streams)
-  else:
-    x_streams = x
-  w_pre = weights.w_pre.astype(x.dtype)
-  if w_pre.ndim == 2:
-    layer_input = jnp.einsum("...kd,kd->...d", x_streams, w_pre)
-  elif w_pre.ndim == 1:
-    layer_input = jnp.einsum("...kd,k->...d", x_streams, w_pre)
-  else:
-    raise common.UnsupportedInputError(
-        f"Expected w_pre to have rank 1 or 2; got shape {weights.w_pre.shape}."
+    streams = weights.w_pre.shape[0]
+    if x.ndim == 2:
+      if x.shape[1] % streams != 0:
+        raise common.UnsupportedInputError(
+            f"Expected 2D x.shape[1] ({x.shape[1]}) to be divisible by streams"
+            f" ({streams})."
+        )
+      x_streams = x.reshape(x.shape[0], streams, x.shape[1] // streams)
+    else:
+      x_streams = x
+    w_pre = weights.w_pre.astype(x.dtype)
+    with jax.named_scope("pre_stream_collapse"):
+      if w_pre.ndim == 2:
+        layer_input = jnp.einsum("...kd,kd->...d", x_streams, w_pre)
+      elif w_pre.ndim == 1:
+        layer_input = jnp.einsum("...kd,k->...d", x_streams, w_pre)
+      else:
+        raise common.UnsupportedInputError(
+            "Expected w_pre to have rank 1 or 2; got shape"
+            f" {weights.w_pre.shape}."
+        )
+    return layer_input, common.MHCContext(
+        x=x,
+        h_post=weights.w_post,
+        residual=weights.w_res,
+        implementation="hc",
     )
-  return layer_input, common.MHCContext(
-      x=x,
-      h_post=weights.w_post,
-      residual=weights.w_res,
-      implementation="hc",
-  )
 
 
 def post_hc(
@@ -96,31 +99,35 @@ def post_hc(
   Raises:
     common.UnsupportedInputError: If `layer_output` is not rank 2 or 3.
   """
-  if layer_output.ndim not in (2, 3):
-    raise common.UnsupportedInputError(
-        "Expected layer_output to have shape (batch, sequence, embedding) or"
-        f" (tokens, embedding); got {layer_output.shape}."
-    )
-  x = context.x
-  streams = context.residual.shape[-1]
-  embedding = layer_output.shape[-1]
-  x_streams = x.reshape(*layer_output.shape[:-1], streams, embedding)
-  w_res = context.residual.astype(x.dtype)
-  res_out = jnp.einsum("...kd,mk->...md", x_streams, w_res)
+  with jax.named_scope("hc_post_xla"):
+    if layer_output.ndim not in (2, 3):
+      raise common.UnsupportedInputError(
+          "Expected layer_output to have shape (batch, sequence, embedding) or"
+          f" (tokens, embedding); got {layer_output.shape}."
+      )
+    x = context.x
+    streams = context.residual.shape[-1]
+    embedding = layer_output.shape[-1]
+    x_streams = x.reshape(*layer_output.shape[:-1], streams, embedding)
+    w_res = context.residual.astype(x.dtype)
+    with jax.named_scope("residual_stream_mix"):
+      res_out = jnp.einsum("...kd,mk->...md", x_streams, w_res)
 
-  w_post = context.h_post.astype(x.dtype)
-  if w_post.ndim == 1:
-    w_post = w_post[:, None]
-  post_out = jnp.expand_dims(layer_output.astype(x.dtype), axis=-2) * w_post
-  out = (res_out.astype(jnp.float32) + post_out.astype(jnp.float32)).astype(
-      x.dtype
-  )
-  out_shape = (
-      (*layer_output.shape[:2], streams, embedding)
-      if layer_output.ndim == 3
-      else (layer_output.shape[0], streams * embedding)
-  )
-  return out.reshape(out_shape)
+    w_post = context.h_post.astype(x.dtype)
+    if w_post.ndim == 1:
+      w_post = w_post[:, None]
+    with jax.named_scope("post_gate_scale"):
+      post_out = jnp.expand_dims(layer_output.astype(x.dtype), axis=-2) * w_post
+    with jax.named_scope("combine_post_output"):
+      out = (res_out.astype(jnp.float32) + post_out.astype(jnp.float32)).astype(
+          x.dtype
+      )
+    out_shape = (
+        (*layer_output.shape[:2], streams, embedding)
+        if layer_output.ndim == 3
+        else (layer_output.shape[0], streams * embedding)
+    )
+    return out.reshape(out_shape)
 
 
 def post_and_pre_hc(
@@ -129,5 +136,6 @@ def post_and_pre_hc(
     next_weights: common.HcWeights,
 ) -> tuple[jax.Array, common.MHCContext]:
   """Reference JAX-only implementation of fused Stage-1 post and Stage-2 pre for static HC."""
-  x_next = post_hc(layer_output, context)
-  return pre_hc(x_next, next_weights)
+  with jax.named_scope("hc_post_and_pre_xla"):
+    x_next = post_hc(layer_output, context)
+    return pre_hc(x_next, next_weights)

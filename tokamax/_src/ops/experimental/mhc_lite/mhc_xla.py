@@ -26,7 +26,8 @@ def _gate_logits(
     b: jax.Array,
 ) -> jax.Array:
   """Computes float32 gate logits `alpha * (normalized @ w) + b`."""
-  return alpha * jnp.dot(normalized, w) + b
+  with jax.named_scope("gate_logits"):
+    return alpha * jnp.dot(normalized, w) + b
 
 
 def pre_xla(
@@ -37,61 +38,69 @@ def pre_xla(
     config: common.MhcKernelConfig = common.MhcKernelConfig(),
 ) -> tuple[jax.Array, common.MHCContext]:
   """Reference JAX-only implementation of the mHC-lite pre-branch stage."""
-  if x.ndim == 2:
-    tokens, flattened_size = x.shape
-    streams = permutations.shape[1]
-    embedding = flattened_size // streams
-    layer_input_shape = (tokens, embedding)
-  elif x.ndim == 4:
-    batch, sequence, streams, embedding = x.shape
-    tokens = batch * sequence
-    flattened_size = streams * embedding
-    layer_input_shape = (batch, sequence, embedding)
-  else:
-    raise common.UnsupportedInputError(
-        "Expected x to have shape (batch, sequence, streams, embedding) or"
-        f" (tokens, streams * embedding); got {x.shape}."
-    )
-  dtype = jnp.promote_types(x.dtype, jnp.float32)
-  x_f32 = x.reshape(tokens, streams, embedding).astype(dtype)
-  flat_f32 = x_f32.reshape(tokens, flattened_size)
-  inv_rms = jax.lax.rsqrt(
-      jnp.mean(jnp.square(flat_f32), axis=-1, keepdims=True)
-      + config.rms_epsilon
-  )
-  normalized = flat_f32 * inv_rms * weights.norm_scale
+  with jax.named_scope("mhc_pre_xla"):
+    if x.ndim == 2:
+      tokens, flattened_size = x.shape
+      streams = permutations.shape[1]
+      embedding = flattened_size // streams
+      layer_input_shape = (tokens, embedding)
+    elif x.ndim == 4:
+      batch, sequence, streams, embedding = x.shape
+      tokens = batch * sequence
+      flattened_size = streams * embedding
+      layer_input_shape = (batch, sequence, embedding)
+    else:
+      raise common.UnsupportedInputError(
+          "Expected x to have shape (batch, sequence, streams, embedding) or"
+          f" (tokens, streams * embedding); got {x.shape}."
+      )
+    dtype = jnp.promote_types(x.dtype, jnp.float32)
+    with jax.named_scope("rms_norm"):
+      x_f32 = x.reshape(tokens, streams, embedding).astype(dtype)
+      flat_f32 = x_f32.reshape(tokens, flattened_size)
+      inv_rms = jax.lax.rsqrt(
+          jnp.mean(jnp.square(flat_f32), axis=-1, keepdims=True)
+          + config.rms_epsilon
+      )
+      normalized = flat_f32 * inv_rms * weights.norm_scale
 
-  h_pre = (
-      jax.nn.sigmoid(
+    with jax.named_scope("h_pre_gate"):
+      h_pre = (
+          jax.nn.sigmoid(
+              _gate_logits(
+                  normalized, weights.w_pre, weights.alpha_pre, weights.b_pre
+              )
+          )
+          + config.pre_mapping_epsilon
+      )
+    with jax.named_scope("stream_collapse"):
+      layer_input = (
+          jnp.sum(h_pre[:, :, None] * x_f32, axis=1)
+          .astype(x.dtype)
+          .reshape(layer_input_shape)
+      )
+
+    with jax.named_scope("h_post_gate"):
+      h_post = 2.0 * jax.nn.sigmoid(
           _gate_logits(
-              normalized, weights.w_pre, weights.alpha_pre, weights.b_pre
+              normalized, weights.w_post, weights.alpha_post, weights.b_post
           )
       )
-      + config.pre_mapping_epsilon
-  )
-  layer_input = (
-      jnp.sum(h_pre[:, :, None] * x_f32, axis=1)
-      .astype(x.dtype)
-      .reshape(layer_input_shape)
-  )
-
-  h_post = 2.0 * jax.nn.sigmoid(
-      _gate_logits(
-          normalized, weights.w_post, weights.alpha_post, weights.b_post
+    with jax.named_scope("residual_bvn_mix"):
+      weights_res = jax.nn.softmax(
+          _gate_logits(
+              normalized, weights.w_res, weights.alpha_res, weights.b_res
+          ),
+          axis=-1,
       )
-  )
-  weights_res = jax.nn.softmax(
-      _gate_logits(normalized, weights.w_res, weights.alpha_res, weights.b_res),
-      axis=-1,
-  )
-  residual = jnp.einsum("tp,pkj->tjk", weights_res, permutations)
+      residual = jnp.einsum("tp,pkj->tjk", weights_res, permutations)
 
-  return layer_input, common.MHCContext(
-      x=x,
-      h_post=h_post,
-      residual=residual,
-      implementation="xla",
-  )
+    return layer_input, common.MHCContext(
+        x=x,
+        h_post=h_post,
+        residual=residual,
+        implementation="xla",
+    )
 
 
 def post_xla(
@@ -99,25 +108,31 @@ def post_xla(
     context: common.MHCContext,
 ) -> jax.Array:
   """Reference JAX-only implementation of the mHC-lite post-branch stage."""
-  embedding = layer_output.shape[-1]
-  streams = context.h_post.shape[-1]
-  tokens = (
-      layer_output.shape[0]
-      if layer_output.ndim == 2
-      else layer_output.shape[0] * layer_output.shape[1]
-  )
-  out_shape = (
-      (tokens, streams * embedding)
-      if layer_output.ndim == 2
-      else (*layer_output.shape[:2], streams, embedding)
-  )
-  dtype = jnp.promote_types(context.x.dtype, jnp.float32)
-  x_f32 = context.x.reshape(tokens, streams, embedding).astype(dtype)
-  layer_output_f32 = layer_output.reshape(tokens, embedding).astype(dtype)
-  residual = context.residual.reshape(tokens, streams, streams)
-  residual_mix = jnp.einsum("tjk,tkd->tjd", residual, x_f32)
-  post_mix = context.h_post[:, :, None] * layer_output_f32[:, None, :]
-  return (residual_mix + post_mix).astype(context.x.dtype).reshape(out_shape)
+  with jax.named_scope("mhc_post_xla"):
+    embedding = layer_output.shape[-1]
+    streams = context.h_post.shape[-1]
+    tokens = (
+        layer_output.shape[0]
+        if layer_output.ndim == 2
+        else layer_output.shape[0] * layer_output.shape[1]
+    )
+    out_shape = (
+        (tokens, streams * embedding)
+        if layer_output.ndim == 2
+        else (*layer_output.shape[:2], streams, embedding)
+    )
+    dtype = jnp.promote_types(context.x.dtype, jnp.float32)
+    x_f32 = context.x.reshape(tokens, streams, embedding).astype(dtype)
+    layer_output_f32 = layer_output.reshape(tokens, embedding).astype(dtype)
+    residual = context.residual.reshape(tokens, streams, streams)
+    with jax.named_scope("residual_stream_mix"):
+      residual_mix = jnp.einsum("tjk,tkd->tjd", residual, x_f32)
+    with jax.named_scope("post_gate_scale"):
+      post_mix = context.h_post[:, :, None] * layer_output_f32[:, None, :]
+    with jax.named_scope("combine_post_output"):
+      return (
+          (residual_mix + post_mix).astype(context.x.dtype).reshape(out_shape)
+      )
 
 
 def post_and_pre_xla(
@@ -129,5 +144,6 @@ def post_and_pre_xla(
     config: common.MhcKernelConfig = common.MhcKernelConfig(),
 ) -> tuple[jax.Array, common.MHCContext]:
   """Reference JAX-only implementation of fused Stage-1 post and Stage-2 pre."""
-  x_next = post_xla(layer_output, context)
-  return pre_xla(x_next, next_weights, permutations, config=config)
+  with jax.named_scope("mhc_post_and_pre_xla"):
+    x_next = post_xla(layer_output, context)
+    return pre_xla(x_next, next_weights, permutations, config=config)
