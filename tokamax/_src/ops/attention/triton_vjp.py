@@ -20,6 +20,7 @@ import math
 from typing import Any, ClassVar, override
 
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 import jax_triton as jt
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
@@ -657,15 +658,37 @@ class TritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     # TODO: Implement heuristics.
+    q = ba.arguments["q"]
+    k = ba.arguments["k"]
+    v = ba.arguments["v"]
+    q_k_dot_precision, weights_v_dot_precision = ba.arguments["precision"]
+    q_k_dot_dtype = precision_lib.precision_input_dtype(
+        precision_lib.to_dot_algorithm_preset(
+            q.dtype, k.dtype, q_k_dot_precision
+        )
+    )
+    weights_v_dot_dtype = precision_lib.precision_input_dtype(
+        precision_lib.to_dot_algorithm_preset(
+            v.dtype, v.dtype, weights_v_dot_precision
+        )
+    )
+    head_dim = max(q.shape[-1], v.shape[-1])
+    max_itemsize = max(
+        jnp.dtype(d).itemsize
+        for d in (q.dtype, k.dtype, v.dtype, q_k_dot_dtype, weights_v_dot_dtype)
+    )
+    devices = op.infer_devices(ba) or {backend.get_default_device()}
+    is_sm80 = any(map(gpu_utils.is_sm80, devices))
+    head_dim_bytes = max_itemsize * triton.next_power_of_2(head_dim)
+    num_stages = 1 if head_dim_bytes >= (512 if is_sm80 else 1024) else 2
+    block_n1 = 32 if head_dim_bytes >= 1024 else 64
     return Config(
         block_m1=32,
-        block_n1=64,
-        block_m2=64,
-        # block_n1=128,
-        # block_m2=128,
+        block_n1=block_n1,
+        block_m2=block_n1,
         block_n2=32,
         num_warps=4,
-        num_stages=2,  # 5,
+        num_stages=num_stages,
     )
 
   # TODO: Implement an autotuning search space.
