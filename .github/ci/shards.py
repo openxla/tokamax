@@ -901,6 +901,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/hlo_utils_test.py',
             'tokamax/_src/jaxtyping_test.py',
             'tokamax/_src/mosaic_gpu_test.py',
+            'tokamax/_src/mosaic_tpu_test.py',
             'tokamax/_src/numerics_test.py',
             'tokamax/_src/ops/op_test.py',
             'tokamax/_src/pallas/block_test.py',
