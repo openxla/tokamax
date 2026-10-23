@@ -15,7 +15,7 @@
 
 """Implementation of Sparse Flash Attention, a.k.a. "Splash" attention."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import dataclasses
 import enum
 import functools
@@ -34,7 +34,6 @@ import numpy as np
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
-
 
 P = jax.P
 MaskInfo = mask_info_lib.MaskInfo
@@ -110,6 +109,7 @@ class SegmentIds(NamedTuple):
 
   q: jax.Array  # [q_seq_len]
   kv: jax.Array  # [kv_seq_len]
+
 
 MaskFunctionType = Callable[..., jax.Array]
 
@@ -271,6 +271,44 @@ def _check_dropout_args(
   return pltpu.to_pallas_key(prng_key)
 
 
+def _above_diag(q_band: int, q_size: int, kv_band: int, kv_size: int) -> bool:
+  """Whether a diagonal-block sub-tile lies entirely in kv > q (masked)."""
+  return kv_band * kv_size >= (q_band + 1) * q_size
+
+
+def _is_int(value: Any) -> bool:
+  return isinstance(value, (int, np.integer)) and not isinstance(value, bool)
+
+
+def _canonical_diag_grid(grid: Any, name: str) -> int | tuple[int, int]:
+  """Validates a diagonal-skip grid and returns it as an int or a pair of ints.
+
+  Args:
+    grid: An int g, or a (q splits, kv splits) pair of ints (any sequence, so
+      lists from config files work; the config is a static jit argument, so the
+      result must hash).
+    name: Field name for the error message.
+
+  Returns:
+    `grid` as a Python int or a tuple of two Python ints.
+  """
+  if _is_int(grid):
+    return int(grid)
+  if isinstance(grid, Sequence) and len(grid) == 2 and all(map(_is_int, grid)):
+    return int(grid[0]), int(grid[1])
+  raise ValueError(
+      f"{name} must be an int or a (q, kv) pair of ints; got {grid!r}."
+  )
+
+
+def _diag_grid_pair(grid: int | tuple[int, int] | None) -> tuple[int, int]:
+  """(q splits, kv splits) of a canonical diagonal-skip grid."""
+  if isinstance(grid, int):
+    return grid, grid
+  assert grid is not None
+  return grid
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class SplashConfig:
   """Tile sizes parameterizing SplashAttention kernels.
@@ -312,30 +350,52 @@ class SplashConfig:
   # The fused bwd kernel accumulates dq at every grid step. To safely avoid
   # read/write conflicts we conservatively avoid *any* in-kernel reductions.
   # This parameter allows to override this behavior and specifies the number of
-  # reduction steps. For now, only 3 or all the kv steps are supported.
+  # reduction steps. For now, only 3 or all the kv steps are supported. 1
+  # accumulates dq in VMEM; it requires a dynamic dkv grid that visits every q
+  # block in one run of consecutive steps (see
+  # `mask_info_lib.dkv_q_blocks_are_contiguous`).
   dq_reduction_steps: int | None = None
   # An experimental scheduler that sometimes produces better softmax overlap.
   use_experimental_scheduler: bool = False
-  # Skip the wasted causal-diagonal QK matmul. On a partial-mask (diagonal) block,
-  # split the QK matmul into a qk_diag_grid x qk_diag_grid sub-grid over (kv rows,
-  # q cols) and skip every sub-tile that lies entirely above the causal line
-  # (kv > q), filling mask_value instead of computing it. Those entries are
-  # overwritten to mask_value by _apply_mask_and_soft_cap regardless, so the result
-  # is bit-exact; the elementwise/softmax ops still run on the full assembled tile.
-  # PRECONDITION (enforced below): pure CausalMask + aligned SQUARE blocks with a
-  # single compute tile per block (block_q == block_kv == block_kv_compute, and the
-  # backward trio), and sequence length a multiple of the block. Any other config
-  # raises (it does not silently corrupt); a non-causal mask raises too.
+  # Skip the wasted causal-diagonal work. Bit-exact: the output, dQ, dK and dV
+  # are identical to qk_diag_skip=False.
+  # Forward: requires block_q == block_kv (block_kv_compute may be smaller). On
+  # a diagonal block, compute tile c covers kv [c * bkc, (c + 1) * bkc) of the
+  # block (bkc = block_kv_compute). q rows [0, c * bkc) see no kv in it, so
+  # their QK, softmax and SV are skipped (an exact no-op for the online
+  # softmax). Rows [c * bkc, (c + 1) * bkc) form the causal triangle: the QK
+  # matmul is split into a qk_diag_grid sub-grid and sub-tiles fully above the
+  # diagonal are filled with mask_value instead of being computed, and the SV
+  # matmul runs on the visible kv prefix of each row band. Rows below the
+  # triangle are one dense matmul.
+  # Backward (dkv): requires square tiles (block_q_dkv == block_kv_dkv ==
+  # block_kv_dkv_compute); the QK^T sub-tiles of the qk_diag_grid_dkv sub-grid
+  # fully above the diagonal are skipped the same way.
+  # PRECONDITION (enforced): pure CausalMask with offset 0, and the block
+  # conditions above. Any other config raises; it never silently corrupts.
   qk_diag_skip: bool = False
-  # Granularity of the diagonal skip: grid=2 -> quadrants (skip 1/4 of the diagonal
-  # block, per-block waste 1/2 -> 1/4); grid=4 -> 4x4 (skip 6/16, waste -> 1/8).
-  # Larger grid skips more of the triangle but uses smaller (less MXU-efficient)
-  # matmuls; grid=4 is a good default at S=4096/block=2048. Must be a power of 2.
-  qk_diag_grid: int = 2
+  # Sub-grid of the diagonal skip, as (q splits, kv splits) of the causal
+  # triangle; an int g means (g, g). A finer grid skips more of the triangle
+  # but issues smaller matmuls. Every entry must be a power of 2 (1 = no split
+  # along that dimension). Used by the forward (also by sv_diag_skip) and, by
+  # default, by the backward dkv kernel.
+  qk_diag_grid: int | tuple[int, int] = 2
+  # Sub-grid of the backward dkv diagonal skip (and of diag_band_skip), in the
+  # same format; None (the default) uses qk_diag_grid.
+  qk_diag_grid_dkv: int | tuple[int, int] | None = None
   # Skip the wasted causal-diagonal SV matmul. On a partial-mask (diagonal)
-  # block, split the SV matmul into a qk_diag_grid x qk_diag_grid sub-grid and
-  # skip sub-tiles strictly above the diagonal (kj > qi) during dot_general.
+  # block, split the SV matmul into the qk_diag_grid sub-grid and skip
+  # sub-tiles fully above the diagonal during dot_general. Redundant with
+  # qk_diag_skip, which already skips SV in the forward.
   sv_diag_skip: bool = False
+  # With qk_diag_skip, run the dkv kernel's causal diagonal block as
+  # qk_diag_grid_dkv kv row-bands, each over only the queries it attends to, so
+  # the softmax and dv/dp/dk/dq work also skip the strictly-above-diagonal
+  # tiles. The bands accumulate dq into the VMEM dq scratch, so in the fused
+  # kernel this needs dq_reduction_steps=1 (qk_diag_skip forces square dkv
+  # blocks, which otherwise have no dq scratch); without it the stock path is
+  # used.
+  diag_band_skip: bool = False
   # Attention dropout probability, applied to the softmax weights. The mask is
   # generated inside the kernel per (head, q block, kv block) tile from a
   # `prng_key` passed at call time, so it costs no HBM traffic and is never
@@ -380,9 +440,9 @@ class SplashConfig:
     if self.block_kv_dkv_compute is None:
       object.__setattr__(self, "block_kv_dkv_compute", self.block_kv_dkv)
 
-    if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
+    if self.dq_reduction_steps not in (None, 1, 3):
       raise ValueError(
-          f"Invalid dq_reduction_steps: {self.dq_reduction_steps}, only 3 or"
+          f"Invalid dq_reduction_steps: {self.dq_reduction_steps}, only 1, 3 or"
           " None are supported."
       )
     if not self.use_fused_bwd_kernel:
@@ -439,29 +499,75 @@ class SplashConfig:
             f" multiple of dropout_block_kv={self.dropout_block_kv}."
         )
 
-    if self.qk_diag_skip:
-      # The skip fills mask_value for sub-tiles where kv > q, relying on the mask to
-      # mask EXACTLY those. That holds only for aligned SQUARE blocks (kv-band > q-band
-      # <=> fully above the causal line, single compute tile per block) — enforce it or
-      # the skip silently corrupts. Causality is checked in _make_splash_attention.
-      if not (self.block_q == self.block_kv == self.block_kv_compute):
-        raise ValueError(
-            "qk_diag_skip requires square forward blocks "
-            "(block_q == block_kv == block_kv_compute); got "
-            f"{self.block_q}/{self.block_kv}/{self.block_kv_compute}."
-        )
-      if self.has_backward_blocks and not (
-          self.block_q_dkv == self.block_kv_dkv == self.block_kv_dkv_compute
+    # The config is a static jit argument, so the grids are stored in a
+    # hashable canonical form (lists become tuples, np.integer becomes int).
+    object.__setattr__(
+        self,
+        "qk_diag_grid",
+        _canonical_diag_grid(self.qk_diag_grid, "qk_diag_grid"),
+    )
+    if self.qk_diag_grid_dkv is None:
+      object.__setattr__(self, "qk_diag_grid_dkv", self.qk_diag_grid)
+    else:
+      object.__setattr__(
+          self,
+          "qk_diag_grid_dkv",
+          _canonical_diag_grid(self.qk_diag_grid_dkv, "qk_diag_grid_dkv"),
+      )
+    fwd_grid = _diag_grid_pair(self.qk_diag_grid)
+    dkv_grid = _diag_grid_pair(self.qk_diag_grid_dkv)
+    if self.qk_diag_skip or self.sv_diag_skip:
+      for name, grid in (
+          ("qk_diag_grid", fwd_grid),
+          ("qk_diag_grid_dkv", dkv_grid),
       ):
+        # 1 is allowed: no split along that dimension.
+        if any(g < 1 or g & (g - 1) for g in grid):
+          raise ValueError(
+              f"{name} entries must each be a power of 2; got {grid}."
+          )
+      assert self.block_kv_compute is not None
+      if any(self.block_kv_compute % g for g in fwd_grid):
         raise ValueError(
-            "qk_diag_skip requires square backward blocks "
-            "(block_q_dkv == block_kv_dkv == block_kv_dkv_compute); got "
-            f"{self.block_q_dkv}/{self.block_kv_dkv}/{self.block_kv_dkv_compute}."
+            f"qk_diag_grid {fwd_grid} must divide"
+            f" block_kv_compute={self.block_kv_compute}."
         )
-      if self.qk_diag_grid < 2 or (self.qk_diag_grid & (self.qk_diag_grid - 1)):
+
+    if self.qk_diag_skip:
+      # The skip fills mask_value / skips work exactly where kv > q, so it needs
+      # the diagonal blocks to be aligned (block_q == block_kv); causality and
+      # offset 0 are checked in _make_splash_attention.
+      assert self.block_kv_compute is not None
+      if self.block_q != self.block_kv:
         raise ValueError(
-            f"qk_diag_grid must be a power of 2 >= 2; got {self.qk_diag_grid}."
+            "qk_diag_skip requires block_q == block_kv in the forward; got"
+            f" {self.block_q}/{self.block_kv}."
         )
+      if self.block_kv % self.block_kv_compute:
+        raise ValueError(
+            f"qk_diag_skip requires block_kv_compute={self.block_kv_compute}"
+            f" to divide block_kv={self.block_kv}."
+        )
+      if self.has_backward_blocks:
+        assert self.block_q_dkv is not None
+        assert self.block_kv_dkv_compute is not None
+        if not (
+            self.block_q_dkv == self.block_kv_dkv == self.block_kv_dkv_compute
+        ):
+          raise ValueError(
+              "qk_diag_skip requires square backward blocks "
+              "(block_q_dkv == block_kv_dkv == block_kv_dkv_compute); got "
+              f"{self.block_q_dkv}/{self.block_kv_dkv}/"
+              f"{self.block_kv_dkv_compute}."
+          )
+        if (
+            self.block_q_dkv % dkv_grid[0]
+            or self.block_kv_dkv_compute % dkv_grid[1]
+        ):
+          raise ValueError(
+              f"qk_diag_grid_dkv {dkv_grid} must divide the dkv blocks"
+              f" {self.block_q_dkv}/{self.block_kv_dkv_compute}."
+          )
 
     if self.sv_diag_skip:
       # The skip assumes the kv > q region is masked. That holds only for aligned
@@ -473,10 +579,6 @@ class SplashConfig:
             "sv_diag_skip requires square forward blocks "
             "(block_q == block_kv == block_kv_compute); got "
             f"{self.block_q}/{self.block_kv}/{self.block_kv_compute}."
-        )
-      if self.qk_diag_grid < 2 or (self.qk_diag_grid & (self.qk_diag_grid - 1)):
-        raise ValueError(
-            f"qk_diag_grid must be a power of 2 >= 2; got {self.qk_diag_grid}."
         )
 
   @property
@@ -712,13 +814,160 @@ def flash_attention_kernel(
           sink - jnp.full_like(l_scratch_ref, max_logit_estimate)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
       )
 
-  def body(kv_compute_index, _, has_partial_mask=False):
-    slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-    m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
-    assert m_prev.shape == (num_stacked_q_heads, bq, NUM_LANES)
-    assert l_prev.shape == (num_stacked_q_heads, bq, NUM_LANES)
+  def qk_matmul(q_flat, k, qk_dims, *, diag):
+    """Returns q_flat @ k.T in f32.
 
-    q = q_ref[...] if config.q_layout == HEAD_DIM_MINOR else q_ref[...].mT
+    On a diagonal tile (see `body`), rows [0, bkv_compute) of `q_flat` are the
+    causal triangle: only the sub-tiles of the qk_diag_grid sub-grid on or
+    below the diagonal are computed; the rest are filled with mask_value, which
+    the mask would write there anyway. Rows below the triangle see the whole
+    tile.
+
+    Args:
+      q_flat: The (scaled) queries, (rows, head_dim_qk).
+      k: The keys of the compute tile, in `config.k_layout`.
+      qk_dims: Dimension numbers of the q @ k.T dot.
+      diag: Whether this is a diagonal tile of `body`.
+    """
+    if not diag:
+      return lax.dot_general(q_flat, k, qk_dims, preferred_element_type=float32)
+    gq, gk = _diag_grid_pair(config.qk_diag_grid)
+    sq, sk = bkv_compute // gq, bkv_compute // gk
+    if config.k_layout == HEAD_DIM_MINOR:
+      k_parts = [k[t * sk : (t + 1) * sk, :] for t in range(gk)]
+    else:
+      k_parts = [k[:, t * sk : (t + 1) * sk] for t in range(gk)]
+    qk_rows = []
+    for qi in range(gq):
+      q_part = q_flat[qi * sq : (qi + 1) * sq, :]
+      cols = []
+      for kj in range(gk):
+        if _above_diag(qi, sq, kj, sk):
+          cols.append(jnp.full((sq, sk), mask_value, dtype=float32))
+        else:
+          cols.append(
+              lax.dot_general(
+                  q_part, k_parts[kj], qk_dims, preferred_element_type=float32
+              )
+          )
+      qk_rows.append(jnp.concatenate(cols, axis=1))
+    if q_flat.shape[0] > bkv_compute:  # Rows below the triangle.
+      qk_rows.append(
+          lax.dot_general(
+              q_flat[bkv_compute:, :],
+              k,
+              qk_dims,
+              preferred_element_type=float32,
+          )
+      )
+    return jnp.concatenate(qk_rows, axis=0)
+
+  def sv_matmul(s_flat, v, sv_dims, *, has_partial_mask, diag):
+    """Returns s_flat @ v in f32, skipping the part of s that is exactly 0.
+
+    Args:
+      s_flat: The softmax numerators, (rows, bkv_compute).
+      v: The values of the compute tile, in `config.v_layout`.
+      sv_dims: Dimension numbers of the s @ v dot.
+      has_partial_mask: Whether the block is partially masked.
+      diag: Whether this is a diagonal tile of `body`.
+    """
+    gq, gk = _diag_grid_pair(config.qk_diag_grid)
+    if diag:
+      # Each row band of the triangle only multiplies the kv prefix it can see
+      # (the rest of its s is exactly 0). One dot per band over the prefix, not
+      # a sum of per-sub-tile dots, keeps the f32 accumulation identical to the
+      # dense matmul. Bands are at least 256 rows: on TPU7x an M=128 dot rounds
+      # differently from the dense one (o off by 1 bf16 ulp).
+      sv_bands = 1  # Largest power of 2 <= gq that keeps bands >= 256 rows.
+      while sv_bands * 2 <= gq and bkv_compute // (sv_bands * 2) >= 256:
+        sv_bands *= 2
+      band = bkv_compute // sv_bands
+      o_rows = []
+      for b in range(sv_bands):
+        kv_end = (b + 1) * band
+        if config.v_layout == HEAD_DIM_MINOR:
+          v_pre = v[:kv_end, :]
+        else:
+          v_pre = v[:, :kv_end]
+        o_rows.append(
+            lax.dot_general(
+                s_flat[b * band : (b + 1) * band, :kv_end],
+                v_pre,
+                sv_dims,
+                preferred_element_type=float32,
+            )
+        )
+      if s_flat.shape[0] > bkv_compute:  # Rows below the triangle.
+        o_rows.append(
+            lax.dot_general(
+                s_flat[bkv_compute:, :],
+                v,
+                sv_dims,
+                preferred_element_type=float32,
+            )
+        )
+      return jnp.concatenate(o_rows, axis=0)
+    if (
+        config.sv_diag_skip
+        and has_partial_mask
+        and num_stacked_q_heads == 1
+        and config.v_layout == HEAD_DIM_MINOR
+        and bq % gq == 0
+        and bkv_compute % gk == 0
+    ):
+      # sv_diag_skip: skip the sub-tiles of the qk_diag_grid sub-grid that lie
+      # entirely above the diagonal of the (square) diagonal block.
+      sq = bq // gq
+      sk = bkv_compute // gk
+      v_parts = [v[t * sk : (t + 1) * sk, :] for t in range(gk)]
+      o_rows = []
+      for qi in range(gq):
+        o_row = None
+        for kj in range(gk):
+          if _above_diag(qi, sq, kj, sk):
+            continue
+          part = lax.dot_general(
+              s_flat[qi * sq : (qi + 1) * sq, kj * sk : (kj + 1) * sk],
+              v_parts[kj],
+              sv_dims,
+              preferred_element_type=float32,
+          )
+          o_row = part if o_row is None else o_row + part
+        o_rows.append(o_row)
+      return jnp.concatenate(o_rows, axis=0)
+    return lax.dot_general(s_flat, v, sv_dims, preferred_element_type=float32)
+
+  def body(kv_compute_index, _, has_partial_mask=False, diag=False):
+    """Runs the online softmax update for one compute tile of the kv block.
+
+    Args:
+      kv_compute_index: Index of the compute tile within the kv block; a
+        static int when `diag` is set.
+      _: Unused loop carry.
+      has_partial_mask: Whether the block is partially masked.
+      diag: `qk_diag_skip` on an aligned causal diagonal block (bq == bkv,
+        offset 0). The tile covers kv [r0, r0 + bkv_compute) of the block with
+        r0 = kv_compute_index * bkv_compute, so q rows [0, r0) see none of it:
+        their m and l stay unchanged and their o gets nothing added, exactly
+        what the online softmax would do with an all-masked row (alpha = 1,
+        s = 0). Only rows [r0, bq) are processed, and `qk_matmul` and
+        `sv_matmul` skip the sub-tiles above the diagonal.
+    """
+    r0 = kv_compute_index * bkv_compute if diag else 0
+    nq = bq - r0
+    # Index of the processed rows [r0, bq) in the (heads, bq, ...) refs.
+    rows = (slice(None), slice(r0, bq), slice(None)) if diag else ...
+    row_view = lambda ref: ref.at[r0:bq] if diag and ref is not None else ref
+    slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
+    m_prev, l_prev = m_scratch_ref[rows], l_scratch_ref[rows]
+    assert m_prev.shape == (num_stacked_q_heads, nq, NUM_LANES)
+    assert l_prev.shape == (num_stacked_q_heads, nq, NUM_LANES)
+
+    if config.q_layout == HEAD_DIM_MINOR:
+      q = q_ref[rows]
+    else:
+      q = q_ref[(slice(None), slice(None), slice(r0, bq)) if diag else ...].mT
     if config.use_base2_exp and not config.q_prescaled_log2e:
       if q.dtype == jnp.float8_e4m3fn:
         q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
@@ -727,7 +976,7 @@ def flash_attention_kernel(
 
     head_dim_qk = q.shape[-1]
     # Collapse the head and sequence dimensions for a larger matmul.
-    q_flat = q.reshape((num_stacked_q_heads * bq, head_dim_qk))
+    q_flat = q.reshape((num_stacked_q_heads * nq, head_dim_qk))
 
     if config.k_layout == HEAD_DIM_MINOR:
       k = k_ref[slice_k, :]
@@ -736,68 +985,29 @@ def flash_attention_kernel(
       k = k_ref[:, slice_k]
       qk_dims = NN_DIM_NUMBERS
 
-    _g = config.qk_diag_grid
-    if (
-        config.qk_diag_skip
-        and has_partial_mask
-        and num_stacked_q_heads == 1
-        and bq % _g == 0
-        and bkv_compute % _g == 0
-    ):
-      # Diagonal skip (forward): qk tile is [q, kv]. On an aligned square diagonal
-      # block, sub-tile (q-band qi, kv-band kj) with kj > qi is fully above the causal
-      # boundary (kv > q) -> masked to mask_value anyway -> skip its matmul.
-      sq = bq // _g
-      sk = bkv_compute // _g
-      q_parts = [q_flat[i * sq:(i + 1) * sq, :] for i in range(_g)]
-      # `k` is kept in its configured layout above (it is always the RHS of the
-      # qk matmul), so the kv sequence axis is the major one under
-      # HEAD_DIM_MINOR and the minor one under SEQ_MINOR.
-      if config.k_layout == HEAD_DIM_MINOR:
-        k_parts = [k[j * sk:(j + 1) * sk, :] for j in range(_g)]
-      else:
-        k_parts = [k[:, j * sk:(j + 1) * sk] for j in range(_g)]
-      rows = []
-      for qi in range(_g):  # q row-band
-        cols = []
-        for kj in range(_g):  # kv col-band
-          if kj > qi:  # fully masked -> skip matmul
-            cols.append(jnp.full((sq, sk), mask_value, dtype=float32))
-          else:
-            cols.append(lax.dot_general(
-                q_parts[qi], k_parts[kj], qk_dims, preferred_element_type=float32
-            ))
-        rows.append(jnp.concatenate(cols, axis=1))
-      qk_flat = jnp.concatenate(rows, axis=0)
-    else:
-      qk_flat = lax.dot_general(
-          q_flat, k, qk_dims, preferred_element_type=float32
-      )
-    qk = qk_flat.reshape((num_stacked_q_heads, bq, bkv_compute))
+    qk_flat = qk_matmul(q_flat, k, qk_dims, diag=diag)
+    qk = qk_flat.reshape((num_stacked_q_heads, nq, bkv_compute))
 
-    apply_mask_and_soft_cap = functools.partial(
-        _apply_mask_and_soft_cap,
+    qk = _apply_mask_and_soft_cap(
         qk,
         mask_value,
-        mask_ref,
-        q_sequence_ref,
-        q_segment_ids_ref,
+        row_view(mask_ref),
+        row_view(q_sequence_ref),
+        row_view(q_segment_ids_ref),
         kv_segment_ids_ref,
         attn_logits_soft_cap=attn_logits_soft_cap,
         k_slice=slice_k,
         k_offset=j * bkv + kv_compute_index * bkv_compute,
-        bq=bq,
+        bq=nq,
         mask_function=mask_function,
         has_partial_mask=has_partial_mask,
     )
 
-    qk = apply_mask_and_soft_cap()
-
     if max_logit_estimate is None:
       m_curr = qk.max(axis=-1)[..., None]  # pyrefly: ignore[missing-attribute]
-      assert m_curr.shape == (num_stacked_q_heads, bq, 1)
+      assert m_curr.shape == (num_stacked_q_heads, nq, 1)
       m_next = jnp.maximum(m_prev, m_curr)
-      assert m_next.shape == (num_stacked_q_heads, bq, NUM_LANES)
+      assert m_next.shape == (num_stacked_q_heads, nq, NUM_LANES)
     else:
       m_next = None
 
@@ -812,18 +1022,18 @@ def flash_attention_kernel(
       s_curr = exp(qk - jnp.tile(m_next, (1, 1, bkv_repeats)))  # pyrefly: ignore[bad-argument-type, unsupported-operation]
     else:
       s_curr = exp(qk - max_logit_estimate)  # pyrefly: ignore[unsupported-operation]
-    assert s_curr.shape == (num_stacked_q_heads, bq, bkv_compute)
+    assert s_curr.shape == (num_stacked_q_heads, nq, bkv_compute)
 
     l_curr = jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0, 1))
-    assert l_curr.shape == (num_stacked_q_heads, bq, NUM_LANES)
+    assert l_curr.shape == (num_stacked_q_heads, nq, NUM_LANES)
 
     if max_logit_estimate is None:
       alpha = exp(m_prev - m_next)
       l_next = l_curr + alpha * l_prev
-      m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
+      m_scratch_ref[rows], l_scratch_ref[rows] = m_next, l_next
     else:
       alpha = None
-      l_scratch_ref[...] = l_curr + l_prev
+      l_scratch_ref[rows] = l_curr + l_prev
 
     # Dropout is applied *after* the running softmax denominator has been
     # accumulated from the undropped weights, so it does not renormalize over
@@ -841,25 +1051,24 @@ def flash_attention_kernel(
       # comprehension (PEP 709) that reads it would bind the shadowed local.
       head_masks = []
       for head in range(num_stacked_q_heads):
-        head_masks.append(
-            _dropout_mask_tile(
-                prng_key_ref,
-                head_idx=h * num_stacked_q_heads + head,
-                q_block_idx=i,
-                kv_block_idx=global_kv_block_idx,
-                q_block_size=bq,
-                kv_block_size=bkv_compute,
-                canonical_q=canonical_q,
-                canonical_kv=canonical_kv,
-                dropout_rate=dropout_rate,
-                n_q_blocks=n_q_blocks,
-                n_kv_blocks=n_kv_blocks,
-            )
+        head_mask = _dropout_mask_tile(
+            prng_key_ref,
+            head_idx=h * num_stacked_q_heads + head,
+            q_block_idx=i,
+            kv_block_idx=global_kv_block_idx,
+            q_block_size=bq,
+            kv_block_size=bkv_compute,
+            canonical_q=canonical_q,
+            canonical_kv=canonical_kv,
+            dropout_rate=dropout_rate,
+            n_q_blocks=n_q_blocks,
+            n_kv_blocks=n_kv_blocks,
         )
+        head_masks.append(head_mask[r0:, :] if diag else head_mask)
       dropout_scale = jnp.stack(head_masks, axis=0)
       s_curr = s_curr * dropout_scale
 
-    s_curr_flat = s_curr.reshape((num_stacked_q_heads * bq, bkv_compute))
+    s_curr_flat = s_curr.reshape((num_stacked_q_heads * nq, bkv_compute))
 
     if config.v_layout == HEAD_DIM_MINOR:
       v = v_ref[slice_k, :]
@@ -868,57 +1077,30 @@ def flash_attention_kernel(
       v = v_ref[:, slice_k]
       sv_dims = NT_DIM_NUMBERS
 
-    if (
-        config.sv_diag_skip
-        and has_partial_mask
-        and num_stacked_q_heads == 1
-        and config.v_layout == HEAD_DIM_MINOR
-        and bq % _g == 0
-        and bkv_compute % _g == 0
-    ):
-      sq = bq // _g
-      sk = bkv_compute // _g
-      s_parts = [
-          [
-              s_curr_flat[i * sq : (i + 1) * sq, j * sk : (j + 1) * sk]
-              for j in range(_g)
-          ]
-          for i in range(_g)
-      ]
-      v_parts = [v[j * sk : (j + 1) * sk, :] for j in range(_g)]
-      o_rows = []
-      for qi in range(_g):
-        o_row = lax.dot_general(
-            s_parts[qi][0],
-            v_parts[0],
-            sv_dims,
-            preferred_element_type=jnp.float32,
-        )
-        for kj in range(1, qi + 1):
-          o_row = o_row + lax.dot_general(
-              s_parts[qi][kj],
-              v_parts[kj],
-              sv_dims,
-              preferred_element_type=jnp.float32,
-          )
-        o_rows.append(o_row)
-      o_curr_flat = jnp.concatenate(o_rows, axis=0)
-    else:
-      o_curr_flat = lax.dot_general(
-          s_curr_flat, v, sv_dims, preferred_element_type=jnp.float32
-      )
-    o_curr = o_curr_flat.reshape((num_stacked_q_heads, bq, head_dim_v))
+    o_curr_flat = sv_matmul(
+        s_curr_flat, v, sv_dims, has_partial_mask=has_partial_mask, diag=diag
+    )
+    o_curr = o_curr_flat.reshape((num_stacked_q_heads, nq, head_dim_v))
 
     if max_logit_estimate is None:
       alpha_o = jnp.tile(alpha, (1, 1, head_dim_v_repeats))  # pyrefly: ignore[bad-argument-type]
       alpha_o = alpha_o[..., : o_scratch_ref.shape[-1]]
-      o_scratch_ref[...] = alpha_o * o_scratch_ref[...] + o_curr
+      o_scratch_ref[rows] = alpha_o * o_scratch_ref[rows] + o_curr
     else:
-      o_scratch_ref[...] = o_scratch_ref[...] + o_curr
+      o_scratch_ref[rows] = o_scratch_ref[rows] + o_curr
 
   assert bkv % bkv_compute == 0
   num_iters = (
       k_ref.shape[0 if config.k_layout == HEAD_DIM_MINOR else 1] // bkv_compute
+  )
+  # The diagonal path may only run on diagonal blocks, so the partial blocks
+  # must be known: that needs the block mask (without it every block is
+  # "partial").
+  use_diag = (
+      config.qk_diag_skip
+      and block_mask_ref is not None
+      and num_stacked_q_heads == 1
+      and bq == bkv
   )
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
@@ -927,9 +1109,13 @@ def flash_attention_kernel(
 
   @pl.when(jnp.logical_and(jnp.logical_not(should_not_mask), should_run))
   def _():
-    lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
-    )
+    if use_diag:
+      for c in range(num_iters):  # Static c: the diagonal path slices by it.
+        body(c, None, has_partial_mask=True, diag=True)
+    else:
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+      )
 
   @pl.when(should_write)
   def end():
@@ -1419,19 +1605,13 @@ def _splash_attention_forward(
         jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32),
     ]
     out_specs += [
-        pl.BlockSpec(
-            (num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map
-        )
+        pl.BlockSpec((num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map)
         if fuse_reciprocal
         else None,
-        pl.BlockSpec(
-            (num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map
-        )
+        pl.BlockSpec((num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map)
         if not fuse_reciprocal
         else None,
-        pl.BlockSpec(
-            (num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map
-        ),
+        pl.BlockSpec((num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map),
     ]
   else:
     out_shapes += [None, None, None]
@@ -1910,6 +2090,7 @@ def _flash_attention_dkv_kernel(
     mask_function: MaskFunctionType | None,
     q_heads_per_kv_head: int,
     config: SplashConfig,
+    use_vmem_dq_reduction: bool = False,
 ):
   del mask_next_ref
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
@@ -1918,6 +2099,7 @@ def _flash_attention_dkv_kernel(
   if attn_logits_soft_cap is not None and config.use_base2_exp:
     attn_logits_soft_cap *= LOG2E
 
+  should_initialize_dq = should_write_dq = True
   if active_rows_ref is not None:
     assert bounds_start_ref is not None
     assert bounds_end_ref is not None
@@ -1925,6 +2107,17 @@ def _flash_attention_dkv_kernel(
     kv_index = active_rows_ref[grid_idx].astype(jnp.int32)
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
+    if use_vmem_dq_reduction:
+      # A q block's kv steps are consecutive, so dq stays in VMEM across them.
+      col = lambda g: active_cols_ref[g].astype(jnp.int32)
+      last = pl.num_programs(1) - 1
+      should_initialize_dq = jnp.logical_or(
+          grid_idx == 0, col(jnp.maximum(grid_idx - 1, 0)) != col(grid_idx)
+      )
+      should_write_dq = jnp.logical_or(
+          grid_idx == last,
+          col(jnp.minimum(grid_idx + 1, last)) != col(grid_idx),
+      )
     if dropout_rate:
       # Mirrors the fwd indices: rows are kv blocks and cols are q blocks here.
       q_head = pl.program_id(0)
@@ -1998,35 +2191,121 @@ def _flash_attention_dkv_kernel(
     qk_dims = (
         NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
-    _g = config.qk_diag_grid
+    gq, gk = _diag_grid_pair(config.qk_diag_grid_dkv)
+    sk, sq = bkv_compute // gk, bq // gq
+    if (
+        config.qk_diag_skip
+        and config.diag_band_skip
+        and gq == gk
+        and has_partial_mask
+        and not dropout_rate
+        and (dq_scratch_ref is not None or dq_ref is None)
+        and bkv_compute % gk == 0
+        and bq % gq == 0
+        and sk % NUM_LANES == 0
+        and sq % NUM_LANES == 0
+    ):
+      # Row-band diagonal skip: on an aligned causal diagonal block, kv band ki
+      # only attends to queries [ki * sq, bq), so run the backward for each band
+      # on that contiguous query suffix instead of the full tile.
+      exp = jnp.exp2 if config.use_base2_exp else jnp.exp
+      dk_dims = (
+          NN_DIM_NUMBERS
+          if config.q_layout == HEAD_DIM_MINOR
+          else NT_DIM_NUMBERS
+      )
+      q_view = lambda ref, s: None if ref is None else ref.at[:, s]
+      for ki in range(gk):
+        q0, k0 = ki * sq, ki * sk
+        qs = pl.ds(q0, bq - q0)
+        if config.q_layout == HEAD_DIM_MINOR:
+          q_b, scaled_q_b = q[q0:, :], scaled_q[q0:, :]
+        else:
+          q_b, scaled_q_b = q[:, q0:], scaled_q[:, q0:]
+        k_b, v_b, do_b = k[k0 : k0 + sk, :], v[k0 : k0 + sk, :], do[q0:, :]
+        qk_b = lax.dot_general(
+            k_b, scaled_q_b, qk_dims, preferred_element_type=jnp.float32
+        )
+        p_b = exp(
+            _apply_mask_and_soft_cap(
+                qk_b,
+                mask_value,
+                q_view(mask_ref, qs),
+                q_view(q_sequence_ref, qs),
+                q_view(q_segment_ids_ref, qs),
+                kv_segment_ids_ref,
+                attn_logits_soft_cap=attn_logits_soft_cap,
+                k_slice=pl.ds(i * bkv_compute + k0, sk),
+                k_offset=kv_index * bkv + i * bkv_compute + k0,
+                bq=bq - q0,
+                k_in_lanes=False,
+                mask_function=mask_function,
+                has_partial_mask=True,
+            )
+            - logsumexp[:, q0:]
+        )
+        dp_b = lax.dot_general(
+            v_b, do_b, NT_DIM_NUMBERS, preferred_element_type=jnp.float32
+        )
+        ds_b = (dp_b - di[:, q0:]) * p_b
+        if attn_logits_soft_cap is not None:
+          d = jnp.tanh(qk_b / attn_logits_soft_cap)
+          ds_b = ds_b * (1 - d * d)
+        kv_rows = pl.ds(i * bkv_compute + k0, sk)
+        dv_scratch_ref[kv_rows, :] += lax.dot(
+            p_b.astype(do.dtype), do_b, preferred_element_type=jnp.float32
+        ).astype(dv_scratch_ref.dtype)
+        dk_b = lax.dot_general(
+            ds_b.astype(do.dtype),
+            scaled_q_b if config.dkv_reuse_scaled_q else q_b,
+            dk_dims,
+            preferred_element_type=jnp.float32,
+        )
+        if config.use_base2_exp and (
+            config.dkv_reuse_scaled_q or config.q_prescaled_log2e
+        ):
+          dk_b = dk_b / LOG2E
+        dk_scratch_ref[kv_rows, :] += dk_b.astype(dk_scratch_ref.dtype)
+        if dq_scratch_ref is not None:
+          dq_b = lax.dot_general(
+              ds_b.T if _is_fp8(k) else ds_b.T.astype(k.dtype),
+              k_b,
+              NN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )
+          if config.q_prescaled_log2e:
+            dq_b = dq_b / LOG2E
+          dq_scratch_ref[q0:, :] += dq_b
+      return
+
     if (
         config.qk_diag_skip
         and has_partial_mask
-        and bkv_compute % _g == 0
-        and bq % _g == 0
+        and bkv_compute % gk == 0
+        and bq % gq == 0
     ):
-      # Diagonal skip (backward dkv): qk tile is [kv, q]. On an aligned square diagonal
-      # block, sub-tile (kv-band ki, q-band qj) with ki > qj is fully above the causal
-      # boundary (kv > q) -> overwritten to mask_value anyway -> skip its matmul; compute
-      # only ki <= qj sub-tiles; assemble the full tile for the single exp/ds/dv/dk.
-      sk = bkv_compute // _g
-      sq = bq // _g
-      k_parts = [k[i * sk:(i + 1) * sk, :] for i in range(_g)]
+      # Diagonal skip (backward dkv): qk tile is [kv, q]. On an aligned square
+      # diagonal block, a sub-tile (kv-band ki, q-band qj) that lies entirely in
+      # kv > q is overwritten to mask_value anyway -> skip its matmul; assemble
+      # the full tile for the single exp/ds/dv/dk.
+      sk = bkv_compute // gk
+      sq = bq // gq
+      k_parts = [k[t * sk : (t + 1) * sk, :] for t in range(gk)]
       # `scaled_q` is kept in its original layout here (it is always the RHS of
       # the qk matmul), so the q sequence axis is the minor one under
       # SEQ_MINOR and the major one under HEAD_DIM_MINOR.
       if config.q_layout == HEAD_DIM_MINOR:
-        q_parts = [scaled_q[j * sq:(j + 1) * sq, :] for j in range(_g)]
+        q_parts = [scaled_q[t * sq : (t + 1) * sq, :] for t in range(gq)]
       else:
-        q_parts = [scaled_q[:, j * sq:(j + 1) * sq] for j in range(_g)]
+        q_parts = [scaled_q[:, t * sq : (t + 1) * sq] for t in range(gq)]
       _mm = lambda kk, qq: lax.dot_general(
           kk, qq, qk_dims, preferred_element_type=jnp.float32
       )
       rows = []
-      for ki in range(_g):  # kv row-band
+      for ki in range(gk):  # kv row-band
         cols = []
-        for qj in range(_g):  # q col-band
-          if ki > qj:  # fully masked -> skip matmul
+        for qj in range(gq):  # q col-band
+          if _above_diag(qj, sq, ki, sk):  # fully masked -> skip matmul
             cols.append(jnp.full((sk, sq), mask_value, dtype=jnp.float32))
           else:
             cols.append(_mm(k_parts[ki], q_parts[qj]))
@@ -2142,7 +2421,11 @@ def _flash_attention_dkv_kernel(
           dq_ref[...] = dq.astype(dq_ref.dtype)
 
   if dq_scratch_ref is not None:
-    dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
+
+    @pl.when(should_initialize_dq)
+    def _init_dq_scratch():
+      dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
+
   elif dq_alias is not None:
     dq_ref[...] = dq_alias[...]
   else:
@@ -2163,10 +2446,13 @@ def _flash_attention_dkv_kernel(
     )
 
   if dq_scratch_ref is not None:
-    if dq_alias is not None:
-      dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
-    else:
-      dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
+
+    @pl.when(should_write_dq)
+    def _write_dq_scratch():
+      if dq_alias is not None:
+        dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
+      else:
+        dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
   if dk_alias is None:
     assert dv_alias is None
@@ -2418,12 +2704,18 @@ def _splash_attention_bwd_dkv(
     q_sequence = None
     in_specs.append(None)
 
+  use_vmem_dq_reduction = dynamic_grid and config.dq_reduction_steps == 1
   dq_reduction_steps = 3 if dynamic_grid else config.dq_reduction_steps
+  if use_vmem_dq_reduction:
+    dq_reduction_steps = None  # dq is not accumulated or aliased in HBM.
   if not dynamic_grid and kv_steps <= 3 and dq_reduction_steps == 3:
     dq_reduction_steps = None
 
   dq = dq_alias_spec = None
-  if dq_reduction_steps == 3:
+  if use_vmem_dq_reduction:
+    dq_spec = pl.BlockSpec((None, bq, head_dim_qk), o_index_map)
+    dq_shape = jax.ShapeDtypeStruct(q.shape, _unquantized_dtype(q))
+  elif dq_reduction_steps == 3:
     dq_index_map = (
         (lambda h, g, r, c, *_: (g % 3, h, to_i32(c[g]), 0))
         if dynamic_grid
@@ -2445,7 +2737,7 @@ def _splash_attention_bwd_dkv(
 
   in_specs += [dq_alias_spec]
 
-  if bkv == bkv_compute:
+  if bkv == bkv_compute and not use_vmem_dq_reduction:
     dq_scratch = None
   else:
     dq_scratch = pltpu.VMEM((bq, head_dim_qk), jnp.float32)
@@ -2491,6 +2783,7 @@ def _splash_attention_bwd_dkv(
       bkv=bkv,
       mask_function=mask_function,
       q_heads_per_kv_head=q_heads_per_kv_head,
+      use_vmem_dq_reduction=use_vmem_dq_reduction,
   )
 
   kernel_name = get_kernel_name(
@@ -2643,14 +2936,19 @@ def _splash_attention_bwd_dkv(
         #     megacore
         # 3) for q_seq_len, we are reducing over it to compute dkv
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",) * len(grid)
+            dimension_semantics=("arbitrary",) * len(grid),
+            vmem_limit_bytes=(
+                64 * 1024 * 1024
+                if (use_vmem_dq_reduction or bkv_compute >= 2048)
+                else None
+            ),
         ),
         name=kernel_name,
         cost_estimate=cost_estimate,
         interpret=config.interpret,
         metadata=metadata,
     )(*args, dq, dk, dv)
-  dq = dq_unreduced.sum(axis=0)
+  dq = dq_unreduced if use_vmem_dq_reduction else dq_unreduced.sum(axis=0)
   if reduce_dkv_over_q_heads:
     dk = dk.reshape(
         num_kv_heads, q_heads_per_kv_head, kv_seq_len, head_dim_qk
@@ -2891,17 +3189,22 @@ def _make_splash_attention(
   if config is None:
     config = SplashConfig.get_default()
 
-  if (config.qk_diag_skip or config.sv_diag_skip) and not isinstance(
-      mask, mask_lib.CausalMask
+  if (config.qk_diag_skip or config.sv_diag_skip) and not (
+      isinstance(mask, mask_lib.CausalMask) and mask.offset == 0
   ):
-    # The skip assumes kv > q is ALWAYS masked — a pure-causal property. Any mask
-    # that admits a valid kv > q entry (bidirectional, local/sliding window, custom)
-    # would be silently corrupted, so fail loud. (Square-block preconditions are
+    # The skip assumes kv > q is ALWAYS masked and kv <= q never is — a property
+    # of the pure causal mask with offset 0. Any mask that admits a valid kv > q
+    # entry (bidirectional, local/sliding window, positive offset, custom) would
+    # be silently corrupted, so fail loud. (Block-shape preconditions are
     # enforced in SplashConfig.__post_init__.)
     param_name = "sv_diag_skip" if config.sv_diag_skip else "qk_diag_skip"
+    # The mask classes define no useful repr, so describe the mask by hand.
+    mask_desc = type(mask).__name__
+    if isinstance(mask, mask_lib.CausalMask):
+      mask_desc += f" with offset {mask.offset}"
     raise ValueError(
-        f"{param_name}=True requires a pure CausalMask (the skip assumes the"
-        f" kv > q region is masked); got {type(mask).__name__}. Disable"
+        f"{param_name}=True requires a pure CausalMask with offset 0 (the skip"
+        f" assumes the kv > q region is masked); got {mask_desc}. Disable"
         f" {param_name} for non-causal masks."
     )
 
@@ -2926,8 +3229,20 @@ def _make_splash_attention(
         mask,
         (bq_dkv, bkv_dkv),
         is_dkv=True,
-        return_dynamic_grid=config.dq_reduction_steps == 3,
+        return_dynamic_grid=config.dq_reduction_steps in (1, 3),
     )
+    assert bq_dkv is not None
+    q_blocks_per_shard = mask.shape[0] // q_seq_shards // bq_dkv
+    if config.dq_reduction_steps == 1 and not (
+        mask_info_lib.dkv_q_blocks_are_contiguous(
+            dkv_mask_info, q_blocks_per_shard
+        )
+    ):
+      raise ValueError(
+          "dq_reduction_steps=1 requires the dkv grid to visit every q block in"
+          " one run of consecutive steps, which this mask and block sizes do"
+          " not. Use dq_reduction_steps=3 or None."
+      )
 
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 
@@ -2974,6 +3289,16 @@ def _make_dynamic_splash_attention(
 
   if config is None:
     config = SplashConfig.get_default()
+
+  if config.qk_diag_skip or config.sv_diag_skip:
+    # The skip treats every partial block as an aligned causal diagonal block,
+    # which only a static pure CausalMask guarantees; a dynamic mask can have
+    # off-diagonal or non-causal partial blocks, which would be corrupted.
+    param_name = "sv_diag_skip" if config.sv_diag_skip else "qk_diag_skip"
+    raise ValueError(
+        f"{param_name}=True is not supported with dynamic masks (the skip"
+        " assumes a static pure CausalMask with offset 0)."
+    )
 
   # This is the only mode that supports the dynamic grid.
   config = dataclasses.replace(config, dq_reduction_steps=3)
