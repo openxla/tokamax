@@ -40,6 +40,10 @@ Residuals = base.Residuals
 PagingInfo = base.PagingInfo
 
 _F32_TINY = tl.constexpr(float(jnp.finfo(jnp.float32).tiny))
+# Tiles on the causal diagonal are processed in slices this many times smaller.
+# This skips fully masked elements only when `block_m1 > block_n1` (for dK/dV)
+# or `block_n2 > block_m2` (for dQ).
+_MASK_BLOCK_SLICE_FACTOR = tl.constexpr(2)
 
 
 @triton.jit
@@ -101,6 +105,7 @@ def _bwd_kernel(
     bias_shape: tl.constexpr,
     mask_shape: tl.constexpr,
     sm_scale: tl.constexpr,
+    is_causal: tl.constexpr,
     logits_dtype: tl.constexpr,
     qk_prec: tl.constexpr,
     qk_dtype: tl.constexpr,
@@ -195,6 +200,15 @@ def _bwd_kernel(
   do_stride_m: tl.constexpr = num_heads_q * head_dim_out
   k_stride_n: tl.constexpr = num_heads_k * head_dim
   v_stride_n: tl.constexpr = num_heads_k * head_dim_out
+  num_phases: tl.constexpr = tl.constexpr(2 if is_causal else 1)
+  # Slicing must not make tiles narrower than 16, the `tl.dot` minimum.
+  min_sliced_block: tl.constexpr = 16 * _MASK_BLOCK_SLICE_FACTOR
+  slice_m1: tl.constexpr = tl.constexpr(
+      1 if block_m1 < min_sliced_block else _MASK_BLOCK_SLICE_FACTOR
+  )
+  slice_n2: tl.constexpr = tl.constexpr(
+      1 if block_n2 < min_sliced_block else _MASK_BLOCK_SLICE_FACTOR
+  )
   qk_compute_dtype = tl.float64 if qk_dtype == tl.float64 else tl.float32
 
   start_n = pid * block_n1
@@ -225,83 +239,127 @@ def _bwd_kernel(
     dv = tl.zeros((block_n1, head_dim_out_pow2), dtype=tl.float32)
     dk = tl.zeros((block_n1, head_dim_pow2), dtype=tl.float32)
 
-    check_m1: tl.constexpr = seq_len_q % block_m1 != 0
-    for i in range(tl.cdiv(seq_len_q, block_m1)):
-      offs_m1 = i * block_m1 + tl.arange(0, block_m1)
-      mask_m1_1d = (offs_m1 < seq_len_q) if check_m1 else None
+    block_m1_mask: tl.constexpr = block_m1 // slice_m1
+    hi_mask_max1 = tl.cdiv(seq_len_q, block_m1_mask)
+    lo_mask1 = tl.minimum(start_n // block_m1_mask, hi_mask_max1)
+    lo_full1 = tl.cdiv(start_n + block_n1, block_m1)
+    hi_mask1 = tl.minimum(lo_full1 * slice_m1, hi_mask_max1)
 
-      q_mask1 = triton_utils.mask_2d(
-          offs_m1, seq_len_q, offs_d, head_dim, check_m1, check_d
+     # Static since each phase needs its own compile-time tile size and mask.
+    for phase in tl.static_range(num_phases):
+      lo1 = (
+          lo_mask1
+          if is_causal and phase == 0
+          else (lo_full1 if is_causal else 0)
       )
-      q1 = tl.load(
-          q_ptr + offs_m1[:, None].to(tl.int64) * q_stride_m + offs_d[None, :],
-          mask=q_mask1,
-          other=None if q_mask1 is None else 0.0,
+      hi1 = (
+          hi_mask1 if is_causal and phase == 0 else tl.cdiv(seq_len_q, block_m1)
       )
-      m1 = tl.load(
-          m_ptr + offs_m1,
-          mask=mask_m1_1d,
-          other=None if mask_m1_1d is None else float("inf"),
-      )
-      l1 = tl.load(
-          l_ptr + offs_m1,
-          mask=mask_m1_1d,
-          other=None if mask_m1_1d is None else _F32_TINY,
-      )
-      sT = _dot(k1, tl.trans(q1), qk_prec, qk_dtype).to(logits_dtype)
 
-      if bias_ptr is not None:
-        b1 = _load_2d_bcast(bias_ptr, offs_m1, offs_n1, bias_shape).to(
-            logits_dtype
+      for i in range(lo1, hi1):
+        # A `tl.constexpr` can't be reassigned, and only this loop (not the
+        # unrolled phase loop) gets a fresh scope for each phase.
+        masked1: tl.constexpr = tl.constexpr(is_causal and phase == 0)
+        cur_block_m1: tl.constexpr = tl.constexpr(
+            block_m1_mask if masked1 else block_m1
         )
-        sT += tl.trans(b1)
-      sT = sT.to(tl.float32)
+        check_m1: tl.constexpr = seq_len_q % cur_block_m1 != 0
+        offs_m1 = i * cur_block_m1 + tl.arange(0, cur_block_m1)
+        mask_m1_1d = (offs_m1 < seq_len_q) if check_m1 else None
 
-      if mask_ptr is not None:
-        mask_val1 = _load_2d_bcast(mask_ptr, offs_m1, offs_n1, mask_shape, 0)
-        sT = tl.where(tl.trans(mask_val1) != 0, sT, float("-inf"))
+        q_mask1 = triton_utils.mask_2d(
+            offs_m1, seq_len_q, offs_d, head_dim, check_m1, check_d
+        )
+        q1 = tl.load(
+            q_ptr
+            + offs_m1[:, None].to(tl.int64) * q_stride_m
+            + offs_d[None, :],
+            mask=q_mask1,
+            other=None if q_mask1 is None else 0.0,
+        )
+        m1 = tl.load(
+            m_ptr + offs_m1,
+            mask=mask_m1_1d,
+            other=None if mask_m1_1d is None else float("inf"),
+        )
+        l1 = tl.load(
+            l_ptr + offs_m1,
+            mask=mask_m1_1d,
+            other=None if mask_m1_1d is None else _F32_TINY,
+        )
+        sT = _dot(k1, tl.trans(q1), qk_prec, qk_dtype).to(logits_dtype)
 
-      if check_n1:
-        sT = tl.where((offs_n1 < seq_len_k)[:, None], sT, float("-inf"))
+        if bias_ptr is not None:
+          b1 = _load_2d_bcast(bias_ptr, offs_m1, offs_n1, bias_shape).to(
+              logits_dtype
+          )
+          sT += tl.trans(b1)
+        sT = sT.to(tl.float32)
 
-      pT = tl.math.exp(sT - m1[None, :]) / l1[None, :]
-      # Rows that saw no keys in the forward pass are left with `l == tiny`.
-      pT = tl.where((l1 == _F32_TINY)[None, :], 0.0, pT)
-      do_mask1 = triton_utils.mask_2d(
-          offs_m1, seq_len_q, offs_d_out, head_dim_out, check_m1, check_d_out
-      )
-      do1 = tl.load(
-          dout_ptr
-          + offs_m1[:, None].to(tl.int64) * do_stride_m
-          + offs_d_out[None, :],
-          mask=do_mask1,
-          other=None if do_mask1 is None else 0.0,
-      )
-      dv += _dot(pT, do1, wv_prec, wv_dtype).to(tl.float32)
-      delta1 = tl.load(
-          delta_ptr + offs_m1,
-          mask=mask_m1_1d,
-          other=None if mask_m1_1d is None else 0.0,
-      )
-      dpT = (
-          _dot(v1, tl.trans(do1), wv_prec, wv_dtype).to(tl.float32)
-          - delta1[None, :]
-      )
-      dsT = pT * dpT
+        if mask_ptr is not None:
+          mask_val1 = _load_2d_bcast(mask_ptr, offs_m1, offs_n1, mask_shape, 0)
+          sT = tl.where(tl.trans(mask_val1) != 0, sT, float("-inf"))
 
-      if ds_ptr is not None:
-        ds_mask = triton_utils.mask_2d(
-            offs_m1, seq_len_q, offs_n1, seq_len_k, check_m1, check_n1
+        if masked1:
+          sT = tl.where(offs_m1[None, :] >= offs_n1[:, None], sT, float("-inf"))
+
+        if check_n1:
+          sT = tl.where((offs_n1 < seq_len_k)[:, None], sT, float("-inf"))
+
+        pT = tl.math.exp(sT - m1[None, :]) / l1[None, :]
+        # Rows that saw no keys in the forward pass are left with `l == tiny`.
+        pT = tl.where((l1 == _F32_TINY)[None, :], 0.0, pT)
+        do_mask1 = triton_utils.mask_2d(
+            offs_m1, seq_len_q, offs_d_out, head_dim_out, check_m1, check_d_out
+        )
+        do1 = tl.load(
+            dout_ptr
+            + offs_m1[:, None].to(tl.int64) * do_stride_m
+            + offs_d_out[None, :],
+            mask=do_mask1,
+            other=None if do_mask1 is None else 0.0,
+        )
+        dv += _dot(pT, do1, wv_prec, wv_dtype).to(tl.float32)
+        delta1 = tl.load(
+            delta_ptr + offs_m1,
+            mask=mask_m1_1d,
+            other=None if mask_m1_1d is None else 0.0,
+        )
+        dpT = (
+            _dot(v1, tl.trans(do1), wv_prec, wv_dtype).to(tl.float32)
+            - delta1[None, :]
+        )
+        dsT = pT * dpT
+
+        if ds_ptr is not None:
+          ds_mask = triton_utils.mask_2d(
+              offs_m1, seq_len_q, offs_n1, seq_len_k, check_m1, check_n1
+          )
+          tl.store(
+              ds_ptr
+              + offs_m1[:, None].to(tl.int64) * seq_len_k
+              + offs_n1[None, :],
+              tl.trans(dsT).to(ds_ptr.dtype.element_ty),
+              mask=ds_mask,
+          )
+
+        dk += _dot(dsT, q1, qk_prec, qk_dtype).to(tl.float32)
+
+    if is_causal and ds_ptr is not None:
+      check_m_zero: tl.constexpr = seq_len_q % block_m1_mask != 0
+      z = tl.zeros((block_m1_mask, block_n1), dtype=ds_ptr.dtype.element_ty)
+      for i in range(0, lo_mask1):
+        offs_m_zero = i * block_m1_mask + tl.arange(0, block_m1_mask)
+        mask_zero = triton_utils.mask_2d(
+            offs_m_zero, seq_len_q, offs_n1, seq_len_k, check_m_zero, check_n1
         )
         tl.store(
             ds_ptr
-            + offs_m1[:, None].to(tl.int64) * seq_len_k
+            + offs_m_zero[:, None].to(tl.int64) * seq_len_k
             + offs_n1[None, :],
-            tl.trans(dsT).to(ds_ptr.dtype.element_ty),
-            mask=ds_mask,
+            z,
+            mask=mask_zero,
         )
-
-      dk += _dot(dsT, q1, qk_prec, qk_dtype).to(tl.float32)
 
     tl.store(
         dv_ptr
@@ -359,49 +417,79 @@ def _bwd_kernel(
 
     dq = tl.zeros((block_m2, head_dim_pow2), dtype=tl.float32)
 
-    check_n2: tl.constexpr = seq_len_k % block_n2 != 0
-    for i in range(tl.cdiv(seq_len_k, block_n2)):
-      offs_n2 = i * block_n2 + tl.arange(0, block_n2)
+    block_n2_mask: tl.constexpr = block_n2 // slice_n2
+    hi_full2 = tl.cdiv(seq_len_k, block_n2)
+    lo_mask2 = (start_m // block_n2) * slice_n2
+    hi_mask2 = tl.minimum(
+        tl.cdiv(start_m + block_m2, block_n2_mask),
+        tl.cdiv(seq_len_k, block_n2_mask),
+    )
 
-      k_mask2 = triton_utils.mask_2d(
-          offs_n2, seq_len_k, offs_d, head_dim, check_n2, check_d
+    # Static since each phase needs its own compile-time tile size and mask.
+    for phase in tl.static_range(num_phases):
+      lo2 = lo_mask2 if is_causal and phase == 0 else 0
+      hi2 = (
+          hi_mask2
+          if is_causal and phase == 0
+          else (
+              tl.minimum(start_m // block_n2, hi_full2)
+              if is_causal
+              else hi_full2
+          )
       )
-      k2 = tl.load(
-          k_ptr + offs_n2[:, None].to(tl.int64) * k_stride_n + offs_d[None, :],
-          mask=k_mask2,
-          other=None if k_mask2 is None else 0.0,
-      )
-      v_mask2 = triton_utils.mask_2d(
-          offs_n2, seq_len_k, offs_d_out, head_dim_out, check_n2, check_d_out
-      )
-      v2 = tl.load(
-          v_ptr
-          + offs_n2[:, None].to(tl.int64) * v_stride_n
-          + offs_d_out[None, :],
-          mask=v_mask2,
-          other=None if v_mask2 is None else 0.0,
-      )
-      s = _dot(q2, tl.trans(k2), qk_prec, qk_dtype).to(logits_dtype)
 
-      if bias_ptr is not None:
-        s += _load_2d_bcast(bias_ptr, offs_m2, offs_n2, bias_shape).to(
-            logits_dtype
+      for i in range(lo2, hi2):
+        masked2: tl.constexpr = tl.constexpr(is_causal and phase == 0)
+        cur_block_n2: tl.constexpr = tl.constexpr(
+            block_n2_mask if masked2 else block_n2
         )
-      s = s.to(tl.float32)
+        check_n2: tl.constexpr = seq_len_k % cur_block_n2 != 0
+        offs_n2 = i * cur_block_n2 + tl.arange(0, cur_block_n2)
 
-      if mask_ptr is not None:
-        mask_val2 = _load_2d_bcast(mask_ptr, offs_m2, offs_n2, mask_shape, 0)
-        s = tl.where(mask_val2 != 0, s, float("-inf"))
+        k_mask2 = triton_utils.mask_2d(
+            offs_n2, seq_len_k, offs_d, head_dim, check_n2, check_d
+        )
+        k2 = tl.load(
+            k_ptr
+            + offs_n2[:, None].to(tl.int64) * k_stride_n
+            + offs_d[None, :],
+            mask=k_mask2,
+            other=None if k_mask2 is None else 0.0,
+        )
+        v_mask2 = triton_utils.mask_2d(
+            offs_n2, seq_len_k, offs_d_out, head_dim_out, check_n2, check_d_out
+        )
+        v2 = tl.load(
+            v_ptr
+            + offs_n2[:, None].to(tl.int64) * v_stride_n
+            + offs_d_out[None, :],
+            mask=v_mask2,
+            other=None if v_mask2 is None else 0.0,
+        )
+        s = _dot(q2, tl.trans(k2), qk_prec, qk_dtype).to(logits_dtype)
 
-      if check_n2:
-        s = tl.where((offs_n2 < seq_len_k)[None, :], s, float("-inf"))
+        if bias_ptr is not None:
+          s += _load_2d_bcast(bias_ptr, offs_m2, offs_n2, bias_shape).to(
+              logits_dtype
+          )
+        s = s.to(tl.float32)
 
-      p = tl.math.exp(s - m2) / l2
-      p = tl.where(l2 == _F32_TINY, 0.0, p)
+        if mask_ptr is not None:
+          mask_val2 = _load_2d_bcast(mask_ptr, offs_m2, offs_n2, mask_shape, 0)
+          s = tl.where(mask_val2 != 0, s, float("-inf"))
 
-      dp = _dot(do2, tl.trans(v2), wv_prec, wv_dtype).to(tl.float32) - delta2
-      ds = p * dp
-      dq += _dot(ds, k2, qk_prec, qk_dtype).to(tl.float32)
+        if masked2:
+          s = tl.where(offs_m2[:, None] >= offs_n2[None, :], s, float("-inf"))
+
+        if check_n2:
+          s = tl.where((offs_n2 < seq_len_k)[None, :], s, float("-inf"))
+
+        p = tl.math.exp(s - m2) / l2
+        p = tl.where(l2 == _F32_TINY, 0.0, p)
+
+        dp = _dot(do2, tl.trans(v2), wv_prec, wv_dtype).to(tl.float32) - delta2
+        ds = p * dp
+        dq += _dot(ds, k2, qk_prec, qk_dtype).to(tl.float32)
 
     tl.store(
         dq_ptr + offs_m2[:, None].to(tl.int64) * q_stride_m + offs_d[None, :],
@@ -457,10 +545,6 @@ def _bwd(
 
   seq_len_q, num_heads_q, head_dim = q.shape
   seq_len_k, num_heads_k, head_dim_out = v.shape
-
-  if is_causal:
-    causal_mask = jnp.tri(seq_len_q, seq_len_k, dtype=bool)[None]
-    mask = causal_mask if mask is None else mask & causal_mask
 
   m, l = residuals
   delta = jnp.einsum(
@@ -536,6 +620,7 @@ def _bwd(
         bias_shape=(1, 1, 1) if bias is None else bias.shape[-3:],
         mask_shape=(1, 1, 1) if mask is None else mask.shape[-3:],
         sm_scale=float(logits_scale),
+        is_causal=is_causal,
         logits_dtype=logits_tl_dtype,
         qk_prec=qk_prec,
         qk_dtype=qk_dtype,
