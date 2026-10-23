@@ -173,6 +173,21 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
         atol_grads=2e-5,
     )
 
+  def test_k_end_near_int32_max(self):
+    seq_len_q, seq_len_k = 64, 128
+    # Mixes a small and an "unbounded" `k_end` within one query tile.
+    k_end = jnp.where(
+        jnp.arange(seq_len_q) % 2 == 0, 37, jnp.iinfo(jnp.int32).max
+    )
+    mask = base.Mask(k_end=k_end)
+    self._run_test(
+        (2, seq_len_q, 2, 64),
+        kv_shape=(2, seq_len_k, 2, 64),
+        impl_kwargs=dict(mask=mask),
+        ref_kwargs=dict(mask=mask.as_array(seq_len_q, seq_len_k)),
+        test_vjp=False,
+    )
+
   def test_neg_inf_bias(self):
     assert fa is not None
     assert isinstance(self._attention_fn, fa.TritonFlashAttention)

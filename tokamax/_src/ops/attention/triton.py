@@ -281,9 +281,9 @@ def _fwd_kernel(
       mid = tl.minimum(
           tl.maximum(tl.min(k_end, axis=0) // block_k, 0), num_k_blocks
       )
-      hi = tl.minimum(
-          tl.maximum(tl.cdiv(tl.max(k_end, axis=0), block_k), 0), num_k_blocks
-      )
+      # Clamped first, since `tl.cdiv` overflows for `k_end` near the int32 max.
+      k_end_max = tl.minimum(tl.max(k_end, axis=0), seq_len_k)
+      hi = tl.maximum(tl.cdiv(k_end_max, block_k), 0)
     mid = tl.maximum(lo, mid)
 
     use_mask_k: tl.constexpr = seq_len_k % block_k != 0
