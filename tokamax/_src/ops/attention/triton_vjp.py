@@ -61,6 +61,10 @@ def _bwd_kernel(
     v_ptr,
     bias_ptr,
     mask_ptr,
+    q_start_ptr,
+    q_end_ptr,
+    k_start_ptr,
+    k_end_ptr,
     m_ptr,
     l_ptr,
     delta_ptr,
@@ -85,6 +89,8 @@ def _bwd_kernel(
     block_n2: tl.constexpr,
     bias_shape: tl.constexpr,
     mask_shape: tl.constexpr,
+    k_start_shape: tl.constexpr,
+    k_end_shape: tl.constexpr,
     sm_scale: tl.constexpr,
     is_causal: tl.constexpr,
     logits_dtype: tl.constexpr,
@@ -115,6 +121,10 @@ def _bwd_kernel(
       stride_vb,
       stride_bias_b,
       stride_mask_b,
+      stride_q_start_b,
+      stride_q_end_b,
+      stride_k_start_b,
+      stride_k_end_b,
       stride_m_b,
       stride_l_b,
       stride_delta_b,
@@ -149,6 +159,36 @@ def _bwd_kernel(
         pid_h,
         num_heads_q,
         mask_shape,
+    )
+  q_start = 0
+  if q_start_ptr is not None:
+    q_start_ptr += triton_utils.batch_offset(
+        pid_b, batch_shape, stride_q_start_b
+    )
+    q_start = tl.load(q_start_ptr)
+  q_end = 0
+  if q_end_ptr is not None:
+    q_end_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_q_end_b)
+    q_end = tl.load(q_end_ptr)
+  if k_start_ptr is not None:
+    k_start_ptr = triton_utils.advance_bcast_ptr(
+        k_start_ptr,
+        pid_b,
+        batch_shape,
+        stride_k_start_b,
+        pid_h,
+        num_heads_q,
+        k_start_shape,
+    )
+  if k_end_ptr is not None:
+    k_end_ptr = triton_utils.advance_bcast_ptr(
+        k_end_ptr,
+        pid_b,
+        batch_shape,
+        stride_k_end_b,
+        pid_h,
+        num_heads_q,
+        k_end_shape,
     )
   m_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_m_b) + (
       pid_h * seq_len_q
@@ -283,6 +323,23 @@ def _bwd_kernel(
           )
           sT = tl.where(tl.trans(mask_val1) != 0, sT, float("-inf"))
 
+        if q_start_ptr is not None:
+          sT = tl.where(offs_m1[None, :] >= q_start, sT, float("-inf"))
+        if q_end_ptr is not None:
+          sT = tl.where(offs_m1[None, :] < q_end, sT, float("-inf"))
+        if k_start_ptr is not None:
+          k_start1 = triton_utils.load_1d_bcast(
+              k_start_ptr, offs_m1, k_start_shape, other=seq_len_k
+          )
+          sT = tl.where(
+              offs_n1[:, None] >= k_start1[None, :], sT, float("-inf")
+          )
+        if k_end_ptr is not None:
+          k_end1 = triton_utils.load_1d_bcast(
+              k_end_ptr, offs_m1, k_end_shape, other=0
+          )
+          sT = tl.where(offs_n1[:, None] < k_end1[None, :], sT, float("-inf"))
+
         if masked1:
           sT = tl.where(offs_m1[None, :] >= offs_n1[:, None], sT, float("-inf"))
 
@@ -397,6 +454,16 @@ def _bwd_kernel(
         mask=mask_m2_1d,
         other=None if mask_m2_1d is None else 0.0,
     )[:, None]
+    k_start2 = 0
+    if k_start_ptr is not None:
+      k_start2 = triton_utils.load_1d_bcast(
+          k_start_ptr, offs_m2, k_start_shape, other=seq_len_k
+      )[:, None]
+    k_end2 = seq_len_k
+    if k_end_ptr is not None:
+      k_end2 = triton_utils.load_1d_bcast(
+          k_end_ptr, offs_m2, k_end_shape, other=0
+      )[:, None]
 
     dq = tl.zeros((block_m2, head_dim_pow2), dtype=tl.float32)
 
@@ -463,6 +530,15 @@ def _bwd_kernel(
           )
           s = tl.where(mask_val2 != 0, s, float("-inf"))
 
+        if q_start_ptr is not None:
+          s = tl.where(offs_m2[:, None] >= q_start, s, float("-inf"))
+        if q_end_ptr is not None:
+          s = tl.where(offs_m2[:, None] < q_end, s, float("-inf"))
+        if k_start_ptr is not None:
+          s = tl.where(offs_n2[None, :] >= k_start2, s, float("-inf"))
+        if k_end_ptr is not None:
+          s = tl.where(offs_n2[None, :] < k_end2, s, float("-inf"))
+
         if masked2:
           s = tl.where(offs_m2[:, None] >= offs_n2[None, :], s, float("-inf"))
 
@@ -504,6 +580,10 @@ def _bwd(
     bias: Float[Array, "#H #T #t"] | None,
     mask: Bool[Array, "#H #T #t"] | None,
     dropout_mask: Bool[Array, "#H #T #t"] | None,
+    q_start: Int[Array, "#H #t"] | None,
+    q_end: Int[Array, "#H #t"] | None,
+    k_start: Int[Array, "#H #T"] | None,
+    k_end: Int[Array, "#H #T"] | None,
     residuals: Residuals,
     out: Float[Array, "T H d"],
     dout: Float[Array, "T H d"],
@@ -555,7 +635,21 @@ def _bwd(
 
   @triton_utils.vmap_kernel
   def bwd_call(
-      batch_shape, batch_strides, q, k, v, bias, mask, m, l, delta, dout
+      batch_shape,
+      batch_strides,
+      q,
+      k,
+      v,
+      bias,
+      mask,
+      q_start,
+      q_end,
+      k_start,
+      k_end,
+      m,
+      l,
+      delta,
+      dout,
   ):
     dq_shape = jax.ShapeDtypeStruct(
         (*batch_shape, seq_len_q, num_heads_q, head_dim), q.dtype
@@ -581,6 +675,10 @@ def _bwd(
         v,
         bias,
         mask,
+        q_start,
+        q_end,
+        k_start,
+        k_end,
         m,
         l,
         delta,
@@ -607,6 +705,8 @@ def _bwd(
         block_n2=config.block_n2,
         bias_shape=(1, 1, 1) if bias is None else bias.shape[-3:],
         mask_shape=(1, 1, 1) if mask is None else mask.shape[-3:],
+        k_start_shape=(1, 1) if k_start is None else k_start.shape[-2:],
+        k_end_shape=(1, 1) if k_end is None else k_end.shape[-2:],
         sm_scale=float(logits_scale),
         is_causal=is_causal,
         logits_dtype=logits_tl_dtype,
@@ -617,7 +717,9 @@ def _bwd(
         **none_outs,
     )
 
-  dq, dk, dv, ds = bwd_call(q, k, v, bias, mask, m, l, delta, dout)
+  dq, dk, dv, ds = bwd_call(
+      q, k, v, bias, mask, q_start, q_end, k_start, k_end, m, l, delta, dout
+  )
 
   if num_heads_k < num_heads_q:
     sum_shape = dk.shape[:-2] + (num_heads_k, num_heads_q // num_heads_k, -1)
@@ -625,6 +727,51 @@ def _bwd(
     dv = jnp.sum(dv.reshape(sum_shape), axis=-2)
 
   return dq, dk, dv, ds
+
+
+def _broadcast_to_rank(x, rank):
+  return None if x is None else jax.lax.broadcast_to_rank(x, rank)
+
+
+def _decompose_mask(mask, q, k, q_indices, k_indices):
+  """Decomposes `mask` into a mask array, `is_causal` and {k,q}_{start,end}."""
+  if mask is None:
+    return None, False, None, None, None, None
+
+  is_causal = False
+  q_start = None
+  q_end = None
+  k_start = None
+  k_end = None
+
+  if k_indices is None:
+    mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
+    if q_indices is None:
+      if mask.q_start is not None and mask.q_start.size == 1:
+        mask, q_start = mask.take("q_start")
+        q_start = _broadcast_to_rank(q_start, 2)
+      if mask.q_end is not None and mask.q_end.size == 1:
+        mask, q_end = mask.take("q_end")
+        q_end = _broadcast_to_rank(q_end, 2)
+    elif is_causal:
+      # The kernel's causal path assumes that query positions are row indices.
+      k_end_ = q_indices + 1
+      k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
+      is_causal = False
+
+    k_start = _broadcast_to_rank(k_start, 2)
+    k_end = _broadcast_to_rank(k_end, 2)
+
+  q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
+  k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
+  return (
+      mask.as_array(q_len_or_indices, k_len_or_indices),
+      is_causal,
+      q_start,
+      q_end,
+      k_start,
+      k_end,
+  )
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -669,24 +816,18 @@ class TritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
 
-    is_causal = False
-    if mask is None:
-      mask_ = None
-    else:
-      if q_indices is None and k_indices is None:
-        mask, is_causal = mask.take("is_causal")
-
-      q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
-      k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
-      mask_ = mask.as_array(q_len_or_indices, k_len_or_indices)
-
-    def broadcast_to_rank(x, rank):
-      return None if x is None else jax.lax.broadcast_to_rank(x, rank)
+    mask_, is_causal, q_start, q_end, k_start, k_end = _decompose_mask(
+        mask, q, k, q_indices, k_indices
+    )
 
     orig_bias_shape = None if bias is None else bias.shape
-    bias = broadcast_to_rank(bias, q.ndim)
-    mask_ = broadcast_to_rank(mask_, q.ndim)
-    dropout_mask = broadcast_to_rank(dropout_mask, q.ndim)
+    bias = _broadcast_to_rank(bias, q.ndim)
+    mask_ = _broadcast_to_rank(mask_, q.ndim)
+    dropout_mask = _broadcast_to_rank(dropout_mask, q.ndim)
+    q_start = _broadcast_to_rank(q_start, q.ndim - 1)
+    q_end = _broadcast_to_rank(q_end, q.ndim - 1)
+    k_start = _broadcast_to_rank(k_start, q.ndim - 1)
+    k_end = _broadcast_to_rank(k_end, q.ndim - 1)
 
     if bias is None:
       ds_dtype = None
@@ -718,7 +859,21 @@ class TritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
     )
     f = base.vmap_batch_dims(f)
 
-    dq, dk, dv, ds = f(q, k, v, bias, mask_, dropout_mask, residuals, out, dout)
+    dq, dk, dv, ds = f(
+        q,
+        k,
+        v,
+        bias,
+        mask_,
+        dropout_mask,
+        q_start,
+        q_end,
+        k_start,
+        k_end,
+        residuals,
+        out,
+        dout,
+    )
     if bias is None:
       dbias = None
     else:

@@ -46,17 +46,6 @@ PagingInfo = base.PagingInfo
 
 
 @triton.jit
-def _load_1d_bcast(ptr, offs, shape, other=0):
-  bound: tl.constexpr = shape[1]
-  block: tl.constexpr = offs.shape[0]
-  if bound == 1:
-    offs = tl.zeros((1,), dtype=tl.int32)
-  check: tl.constexpr = bound > 1 and bound % block != 0
-  mask = offs < bound if check else None
-  return tl.load(ptr + offs, mask=mask, other=None if mask is None else other)
-
-
-@triton.jit
 def _load_2d(ptr, offs_r, bound_r, stride_r, start_c, bound_c, block_c):
   block_r: tl.constexpr = offs_r.shape[0]
   offs_c = start_c + tl.arange(0, block_c)
@@ -272,12 +261,14 @@ def _fwd_kernel(
     k_start = (
         None
         if k_start_ptr is None
-        else _load_1d_bcast(k_start_ptr, span_m, k_start_shape, other=seq_len_k)
+        else triton_utils.load_1d_bcast(
+            k_start_ptr, span_m, k_start_shape, other=seq_len_k
+        )
     )
     k_end = (
         None
         if k_end_ptr is None
-        else _load_1d_bcast(k_end_ptr, span_m, k_end_shape, other=0)
+        else triton_utils.load_1d_bcast(k_end_ptr, span_m, k_end_shape, other=0)
     )
 
     lo, mid, hi = 0, num_k_blocks, num_k_blocks

@@ -239,6 +239,18 @@ def mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c):
 
 
 @triton.jit
+def load_1d_bcast(ptr, offs, shape, other=0):
+  """Loads a block from the trailing (broadcastable) dim of `shape`."""
+  bound: tl.constexpr = shape[1]
+  block: tl.constexpr = offs.shape[0]
+  if bound == 1:
+    offs = tl.zeros((1,), dtype=tl.int32)
+  check: tl.constexpr = bound > 1 and bound % block != 0
+  mask = offs < bound if check else None
+  return tl.load(ptr + offs, mask=mask, other=None if mask is None else other)
+
+
+@triton.jit
 def load_2d_bcast(ptr, offs_r, offs_c, shape, other=0.0):
   """Loads a block from the trailing two (broadcastable) dims of `shape`."""
   bound_r: tl.constexpr = shape[1]
