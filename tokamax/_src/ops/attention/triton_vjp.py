@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import math
-from typing import Any, ClassVar, override
+from typing import Annotated, Any, ClassVar, override
 
 import jax
 from jax.extend import backend
@@ -483,12 +483,15 @@ def _bwd_kernel(
     )
 
 
+_PowerOfTwoGe16 = Annotated[pydantic_lib.PowerOfTwo, pydantic.Field(ge=16)]
+
+
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_m1: pydantic.PositiveInt
-  block_n1: pydantic.PositiveInt
-  block_m2: pydantic.PositiveInt
-  block_n2: pydantic.PositiveInt
+  block_m1: _PowerOfTwoGe16
+  block_n1: _PowerOfTwoGe16
+  block_m2: _PowerOfTwoGe16
+  block_n2: _PowerOfTwoGe16
   num_stages: pydantic.PositiveInt
   num_warps: pydantic_lib.PowerOfTwo
 
@@ -765,16 +768,18 @@ class TritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     configs = set()
-    for block_m in [16, 32, 64, 128, 256]:
-      for block_n in [16, 32, 64, 128, 256]:
+    for block_m in [32, 64, 128, 256]:
+      for block_n in [32, 64, 128, 256]:
+        if block_n < block_m:
+          continue
         for num_warps in [2, 4]:
           for num_stages in [1, 2, 3, 4]:
             configs.add(
                 Config(
                     block_m1=block_m,
-                    block_m2=block_m,
                     block_n1=block_n,
-                    block_n2=block_n,
+                    block_m2=block_n,
+                    block_n2=block_m,
                     num_warps=num_warps,
                     num_stages=num_stages,
                 )
