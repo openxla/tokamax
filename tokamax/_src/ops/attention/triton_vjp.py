@@ -47,25 +47,6 @@ _MASK_BLOCK_SLICE_FACTOR = tl.constexpr(2)
 
 
 @triton.jit
-def _load_2d_bcast(ptr, offs_r, offs_c, shape, other=0.0):
-  """Loads a block from the trailing two (broadcastable) dims of `shape`."""
-  bound_r: tl.constexpr = shape[1]
-  bound_c: tl.constexpr = shape[2]
-  block_r: tl.constexpr = offs_r.shape[0]
-  block_c: tl.constexpr = offs_c.shape[0]
-  # Broadcast dims still get a size-1 axis, so callers can transpose the block.
-  zero = tl.zeros((1, 1), dtype=tl.int64)
-  r = zero if bound_r == 1 else offs_r[:, None].to(tl.int64) * bound_c
-  c = zero if bound_c == 1 else offs_c[None, :].to(tl.int64)
-  check_r: tl.constexpr = bound_r > 1 and bound_r % block_r != 0
-  check_c: tl.constexpr = bound_c > 1 and bound_c % block_c != 0
-  mask = triton_utils.mask_2d(
-      offs_r, bound_r, offs_c, bound_c, check_r, check_c
-  )
-  return tl.load(ptr + r + c, mask=mask, other=None if mask is None else other)
-
-
-@triton.jit
 def _dot(a, b, input_precision, input_dtype):
   """Casts both operands to `input_dtype` before `tl.dot`."""
   return tl.dot(
@@ -290,14 +271,16 @@ def _bwd_kernel(
         sT = _dot(k1, tl.trans(q1), qk_prec, qk_dtype).to(logits_dtype)
 
         if bias_ptr is not None:
-          b1 = _load_2d_bcast(bias_ptr, offs_m1, offs_n1, bias_shape).to(
-              logits_dtype
-          )
+          b1 = triton_utils.load_2d_bcast(
+              bias_ptr, offs_m1, offs_n1, bias_shape
+          ).to(logits_dtype)
           sT += tl.trans(b1)
         sT = sT.to(tl.float32)
 
         if mask_ptr is not None:
-          mask_val1 = _load_2d_bcast(mask_ptr, offs_m1, offs_n1, mask_shape, 0)
+          mask_val1 = triton_utils.load_2d_bcast(
+              mask_ptr, offs_m1, offs_n1, mask_shape, 0
+          )
           sT = tl.where(tl.trans(mask_val1) != 0, sT, float("-inf"))
 
         if masked1:
@@ -469,13 +452,15 @@ def _bwd_kernel(
         s = _dot(q2, tl.trans(k2), qk_prec, qk_dtype).to(logits_dtype)
 
         if bias_ptr is not None:
-          s += _load_2d_bcast(bias_ptr, offs_m2, offs_n2, bias_shape).to(
-              logits_dtype
-          )
+          s += triton_utils.load_2d_bcast(
+              bias_ptr, offs_m2, offs_n2, bias_shape
+          ).to(logits_dtype)
         s = s.to(tl.float32)
 
         if mask_ptr is not None:
-          mask_val2 = _load_2d_bcast(mask_ptr, offs_m2, offs_n2, mask_shape, 0)
+          mask_val2 = triton_utils.load_2d_bcast(
+              mask_ptr, offs_m2, offs_n2, mask_shape, 0
+          )
           s = tl.where(mask_val2 != 0, s, float("-inf"))
 
         if masked2:

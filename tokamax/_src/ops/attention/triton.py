@@ -76,22 +76,6 @@ def _load_2d(ptr, offs_r, bound_r, stride_r, start_c, bound_c, block_c):
 
 
 @triton.jit
-def _load_2d_bcast(ptr, offs_r, offs_c, shape, other=0.0):
-  bound_r: tl.constexpr = shape[1]
-  bound_c: tl.constexpr = shape[2]
-  block_r: tl.constexpr = offs_r.shape[0]
-  block_c: tl.constexpr = offs_c.shape[0]
-  r = 0 if bound_r == 1 else offs_r[:, None].to(tl.int64) * bound_c
-  c = 0 if bound_c == 1 else offs_c[None, :].to(tl.int64)
-  check_r: tl.constexpr = bound_r > 1 and bound_r % block_r != 0
-  check_c: tl.constexpr = bound_c > 1 and bound_c % block_c != 0
-  mask = triton_utils.mask_2d(
-      offs_r, bound_r, offs_c, bound_c, check_r, check_c
-  )
-  return tl.load(ptr + r + c, mask=mask, other=None if mask is None else other)
-
-
-@triton.jit
 def _fwd_kernel(
     q_start_ptr,
     q_end_ptr,
@@ -337,9 +321,9 @@ def _fwd_kernel(
         s = s.to(logits_dtype)
 
         if bias_ptr is not None:
-          s += _load_2d_bcast(bias_ptr, span_m, span_k, bias_shape).to(
-              logits_dtype
-          )
+          s += triton_utils.load_2d_bcast(
+              bias_ptr, span_m, span_k, bias_shape
+          ).to(logits_dtype)
 
         if logits_soft_cap is not None:
           s = logits_soft_cap * libdevice.tanh(
@@ -350,7 +334,7 @@ def _fwd_kernel(
           s *= math.log2(math.e)
 
         if mask_ptr is not None:
-          mask_val = _load_2d_bcast(
+          mask_val = triton_utils.load_2d_bcast(
               mask_ptr,
               span_m,
               span_k // 8 if pack_mask else span_k,
@@ -390,7 +374,7 @@ def _fwd_kernel(
         l_i += tl.sum(p, axis=1)
 
         if dropout_mask_ptr is not None:
-          dropout_mask = _load_2d_bcast(
+          dropout_mask = triton_utils.load_2d_bcast(
               dropout_mask_ptr, span_m, span_k, dropout_shape, 0
           )
           p *= (dropout_mask != 0).to(p.dtype) / (1.0 - dropout_rate)
