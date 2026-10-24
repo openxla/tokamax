@@ -342,7 +342,7 @@ def main_kernel(
               jnp.left_shift(value_i32, shift),
               jnp.int32(-65536),  # 0xFFFF0000
           )
-          value_f32 = plsc.bitcast(shifted, jnp.float32)
+          value_f32 = jax.lax.bitcast_convert_type(shifted, jnp.float32)
           return value_f32 * route_weights[route_lane]
 
         def fixed_two_route_column_loop(col_offset):
