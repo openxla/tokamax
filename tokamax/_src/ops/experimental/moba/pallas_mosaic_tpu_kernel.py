@@ -1,0 +1,192 @@
+# Copyright 2026 Google LLC. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""Pallas TPU compute kernel for Mixture of Block Attention (MoBA)."""
+
+# Dimensions:
+# B: batch_size
+# H: num_heads
+# T: seq_len
+# D: head_dim
+# NB: num_blocks (T // block_q)
+# BQ: block_q (chunk_size)
+# K_eff: effective_topk
+
+from typing import Any
+import jax
+from jax.experimental import pallas as pl
+import jax.numpy as jnp
+
+_CHUNK_SIZE = 256
+_TOPK = 4
+
+
+def _compute_block_selection(
+    q: jax.Array, k: jax.Array, scale: float, topk: int, chunk_size: int = _CHUNK_SIZE
+) -> jax.Array:
+  """Hardware-aligned Option 1 Query-Block routing."""
+  batch_size, num_heads, seq_len, head_dim = q.shape
+  block_chunk = chunk_size
+  num_blocks = seq_len // block_chunk
+
+  q_blocks = q.reshape(batch_size, num_heads, num_blocks, block_chunk, head_dim)
+  k_blocks = k.reshape(batch_size, num_heads, num_blocks, block_chunk, head_dim)
+  q_mean = jnp.mean(q_blocks, axis=3)
+  k_mean = jnp.mean(k_blocks, axis=3)
+
+  routing_scores = (
+      jnp.einsum(
+          "bhqd,bhnd->bhqn",
+          q_mean,
+          k_mean,
+          precision=jax.lax.Precision.HIGHEST,
+      )
+      * scale
+  )
+  q_idx = jnp.arange(num_blocks)[:, None]
+  k_idx = jnp.arange(num_blocks)[None, :]
+  historical_mask = k_idx < q_idx
+
+  masked_routing = jnp.where(
+      historical_mask[None, None], routing_scores, -jnp.inf
+  )
+  effective_topk = min(topk, num_blocks)
+  _, topk_idx = jax.lax.top_k(masked_routing, effective_topk)
+  return topk_idx
+
+
+def _make_flash_moba_kernel(scale: float) -> Any:
+  def _kernel(
+      # Inputs.
+      q_vmem_ref,  # [1, 1, 1, block_q, head_dim] dtype
+      k_vmem_ref,  # [1, 1, num_blocks, block_q, head_dim] dtype
+      v_vmem_ref,  # [1, 1, num_blocks, block_q, head_dim] dtype
+      topk_vmem_ref,  # [1, 1, 1, effective_topk] int32
+      # Outputs.
+      o_vmem_ref,  # [1, 1, 1, block_q, head_dim] dtype
+  ) -> None:
+    # Dimensions.
+    q_idx = pl.program_id(2)
+    q_i = q_vmem_ref[0, 0, 0]  # [block_q, head_dim]
+    block_q = q_i.shape[0]
+    head_dim = q_i.shape[1]
+    topk_i = topk_vmem_ref[0, 0, 0]  # [effective_topk]
+    effective_topk = topk_i.shape[0]
+
+    # Gather diagonal and historical keys/values directly in VMEM.
+    k_all = k_vmem_ref[0, 0]  # [num_blocks, block_q, head_dim]
+    k_diag = k_all[q_idx]  # [block_q, head_dim]
+    k_hist = k_all[topk_i]  # [effective_topk, block_q, head_dim]
+    k_sub = jnp.concatenate([k_diag[None], k_hist], axis=0).reshape(
+        -1, head_dim
+    )
+
+    v_all = v_vmem_ref[0, 0]  # [num_blocks, block_q, head_dim]
+    v_diag = v_all[q_idx]  # [block_q, head_dim]
+    v_hist = v_all[topk_i]  # [effective_topk, block_q, head_dim]
+    v_sub = jnp.concatenate([v_diag[None], v_hist], axis=0).reshape(
+        -1, head_dim
+    )
+
+    qk = jnp.matmul(q_i, k_sub.T, preferred_element_type=jnp.float32) * scale
+
+    # Construct causal and routing mask in-kernel without HBM allocation.
+    row_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 0)
+    col_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 1)
+    causal_diag = col_idx <= row_idx
+    ranks = jnp.arange(effective_topk)
+    valid_hist = jnp.broadcast_to(
+        jnp.repeat(ranks < q_idx, block_q)[None, :],
+        (block_q, effective_topk * block_q),
+    )
+    mask_sub = jnp.concatenate([causal_diag, valid_hist], axis=1)
+
+    qk = jnp.where(mask_sub, qk, -1e9)
+    max_scores = jnp.max(qk, axis=-1, keepdims=True)
+    exp_scores = jnp.exp(qk - max_scores)
+    denominator = jnp.sum(exp_scores, axis=-1, keepdims=True)
+    weights = exp_scores / denominator
+
+    o_i = jnp.matmul(weights, v_sub, preferred_element_type=jnp.float32)
+    o_vmem_ref[0, 0, 0] = o_i.astype(o_vmem_ref.dtype)
+
+  return _kernel
+
+
+def _flash_moba_pallas(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    topk_idx: jax.Array,
+    scale: float,
+    chunk_size: int = _CHUNK_SIZE,
+) -> jax.Array:
+  batch_size, num_heads, seq_len, head_dim = q.shape
+  block_q = chunk_size
+  num_q_blocks = seq_len // block_q
+  effective_topk = topk_idx.shape[-1]
+
+  q_blocks = q.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
+  k_blocks = k.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
+  v_blocks = v.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
+
+  kernel = _make_flash_moba_kernel(scale)
+
+  grid = (batch_size, num_heads, num_q_blocks)
+  blk = lambda i, j, n: (i, j, n, 0, 0)
+  q_spec = pl.BlockSpec((1, 1, 1, block_q, head_dim), blk)
+  k_spec = pl.BlockSpec(
+      (1, 1, num_q_blocks, block_q, head_dim), lambda i, j, n: (i, j, 0, 0, 0)
+  )
+  v_spec = pl.BlockSpec(
+      (1, 1, num_q_blocks, block_q, head_dim), lambda i, j, n: (i, j, 0, 0, 0)
+  )
+  topk_spec = pl.BlockSpec(
+      (1, 1, 1, effective_topk), lambda i, j, n: (i, j, n, 0)
+  )
+  o_spec = pl.BlockSpec((1, 1, 1, block_q, head_dim), blk)
+
+  interpret = jax.default_backend() == "cpu"
+  out = pl.pallas_call(
+      kernel,
+      grid=grid,
+      in_specs=[q_spec, k_spec, v_spec, topk_spec],
+      out_specs=o_spec,
+      out_shape=jax.ShapeDtypeStruct(
+          (batch_size, num_heads, num_q_blocks, block_q, head_dim), q.dtype
+      ),
+      interpret=interpret,
+  )(q_blocks, k_blocks, v_blocks, topk_idx)
+  return out.reshape(batch_size, num_heads, seq_len, head_dim)
+
+
+def moba_pallas_fwd(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    *,
+    topk: int = _TOPK,
+    chunk_size: int = _CHUNK_SIZE,
+    scale: float | None = None,
+) -> tuple[jax.Array, None]:
+  """Computes MoBA forward pass using Pallas TPU kernel."""
+  if scale is None:
+    head_dim = q.shape[-1]
+    scale = head_dim ** -0.5
+  topk_idx = jax.lax.stop_gradient(
+      _compute_block_selection(q, k, scale, topk, chunk_size)
+  )
+  out = _flash_moba_pallas(q, k, v, topk_idx, scale, chunk_size)
+  return out, None
