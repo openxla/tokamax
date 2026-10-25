@@ -461,6 +461,24 @@ class StreamIndexTopKTest(parameterized.TestCase):
                   12,
               ]],
           ),
+          # 8. Mixed batch with max_num_seqs == max_num_tokens (B=4, T=4):
+          # 2 decode sequences (T=1), 1 chunked-prefill sequence (T=2), and
+          # 1 padded inactive sequence (T=0). S_list // comp_ratio > k so
+          # _common_path is exercised even with enable_early_exit=True.
+          (
+              4,
+              [1, 1, 2, 0],
+              [64, 80, 96, 0],
+              128,
+              4,
+              1,
+              128,
+              16,
+              2,
+              8,
+              2,
+              [[1, 3], [0, 2], [4, 5], [0, 0]],
+          ),
       ],
   )
   def test_streamindex_topk_numerical_correctness(
