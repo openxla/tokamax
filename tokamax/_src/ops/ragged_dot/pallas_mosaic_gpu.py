@@ -69,15 +69,41 @@ def _input_quant_bits(x) -> int:
     return jnp.finfo(qtype).bits
 
 
-def _input_subchannel(x) -> int | None:
+def _input_subchannel(x, contracting_dim: int = 1) -> int | None:
+  """Sub-channel (scale tile along the contraction axis) of a quantized input.
+
+  Args:
+    x: The (possibly quantized) input.
+    contracting_dim: The contraction axis of `x` *as bound* (1 for the default
+      `[G, K, N]` rhs layout, 2 for `TRANS_RHS` `[G, N, K]`); see
+      `_rhs_contracting_dim`. Hard-coding index 1 gave 1 (the N tile) for a
+      TRANS_RHS QArray and hence an unusable `block_k=1`.
+
+  Returns:
+    The sub-channel size along the contraction axis, or None if `x` is not
+    quantized.
+  """
   if isinstance(x, AsQArray):
     x_flat, x_tree = jax.tree.flatten(x)
     x = jax.eval_shape(lambda xs: x_tree.unflatten(xs).as_qarray(), x_flat)
   if isinstance(x, QArray):
-    return x.scale_tile_shape[1]  # contraction-axis (index 1) tile
+    return x.scale_tile_shape[contracting_dim]
   if x.__class__.__name__ == "PreQuantizedInputFusionGPU":
     return x.subchannel_size
   return None
+
+
+def _rhs_contracting_dim(ba: op.BoundArguments) -> int:
+  """Contracting axis of the bound rhs (before `_fwd` normalises TRANS_RHS)."""
+  dims = ba.kwargs.get("ragged_dot_dimension_numbers")
+  if dims is None:
+    return 1
+  (_, rhs_contract), _ = dims.dot_dimension_numbers
+  return int(rhs_contract[0])
+
+
+# Smallest M covered by the sm90 int8 autotune behind `_get_heuristics_config`.
+_SM90_INT8_TUNED_MIN_M = 16384
 
 
 # TODO: Natively support mk,ekn->mn.
@@ -304,7 +330,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     _is_int8 = lambda x: _input_qtype(x) == jnp.int8
 
     # avoid OOMs by having too large block_k
-    rhs_subchannel = _input_subchannel(rhs)
+    rhs_cdim = _rhs_contracting_dim(ba)
+    rhs_subchannel = _input_subchannel(rhs, rhs_cdim)
     block_k = min(rhs_subchannel, 256) if rhs_subchannel is not None else 128
     if gpu_utils.is_sm100():
       # Clamp to the activation subchannel so a finer lhs (e.g. fp8 output of a
@@ -314,6 +341,45 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         block_k = min(block_k, lhs_subchannel)
 
     if gpu_utils.is_sm90():
+      # Large-M int8 expert weights (MoE serving) get configs from a full-space
+      # sm90 autotune on H100 (G=128, K/N = 2048/4096 and 4096/2048, bf16 lhs,
+      # int8 rhs with 256-wide sub-channels, M in {16384, ..., 65536}):
+      # `block_m=128` beats the default below at every measured shape
+      # (-11..-24% kernel time), one config per weight aspect ratio is within
+      # ~1% of the per-M optimum, and the best block_k / stages / persistence
+      # depend on that aspect ratio (K < N: gate/up; K > N: down projection).
+      # Everything outside the measured regime (quantized lhs, non-int8 rhs,
+      # M < 16384 or symbolic M) keeps the previous default.
+      m = lhs.shape[0]
+      if (
+          isinstance(rhs, (QArray, AsQArray))
+          and _is_int8(rhs)
+          and not _is_quantized_input(lhs)
+          and isinstance(m, int)
+          and m >= _SM90_INT8_TUNED_MIN_M
+      ):
+        k, n = rhs.shape[rhs_cdim], rhs.shape[3 - rhs_cdim]
+        if k < n:
+          return Config(
+              block_m=128,
+              block_n=64,
+              block_k=min(block_k, 128),
+              num_stages=4,
+              split_k=1,
+              persistent=True,
+              grid_minor_dim=common.MatmulDimension.M,
+              grid_tile_width=1,
+          )
+        return Config(
+            block_m=128,
+            block_n=64,
+            block_k=block_k,
+            num_stages=2,
+            split_k=1,
+            persistent=False,
+            grid_minor_dim=common.MatmulDimension.M,
+            grid_tile_width=1,
+        )
       return Config(
           block_m=64,
           block_n=64,
@@ -389,7 +455,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
     if _is_quantized_input(rhs):
       rhs_dtype_bits = _input_quant_bits(rhs)
-      scale_tile_shape = _input_subchannel(rhs) or 0
+      scale_tile_shape = _input_subchannel(rhs, _rhs_contracting_dim(ba)) or 0
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
       scale_tile_shape = 0
@@ -434,7 +500,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
     if _is_quantized_input(rhs):
       rhs_dtype_bits = _input_quant_bits(rhs)
-      scale_tile_shape = _input_subchannel(rhs) or 0
+      scale_tile_shape = _input_subchannel(rhs, _rhs_contracting_dim(ba)) or 0
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
       scale_tile_shape = 0
