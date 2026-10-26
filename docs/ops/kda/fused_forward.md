@@ -66,17 +66,19 @@ fixed/packed inputs, initial/final state, empty state slots, normalization,
 gate activation, and both rematerialization settings. The existing KDA
 kernel suite continues to compare Mosaic with XLA, including CP fallbacks.
 
-CPU interpretation exposes a pre-existing limitation of the staged packed
-raw-gate backward: unwritten padding values can propagate into a_log/bias
-gradient reductions; padding-token and empty-slot gradients can also be
-non-finite. The focused tests follow the existing suite's gradient comparison
-domain (valid tokens and occupied state slots), not a validation of empty-slot
-gradient semantics. They check forward and valid token/state
-gradients first, then explicitly xfail the affected CPU cases when the
-staged parameter gradients are non-finite. These cases are not xfailed on
-TPU and must pass before the change is ready. Fixed-length raw-gate tests
-also compare finite parameter gradients with XLA autodiff. This PR does not
-change backward padding semantics to work around that baseline limitation.
+Packed backward masks unwritten padding lanes before gate-parameter
+reductions and restores the final-state cotangent for empty initial-state
+slots. Focused tests compare the complete gradient tree, explicitly require
+zero padding gradients and the empty-slot identity derivative, and retain
+the original tolerances without xfails for these cases.
+
+Non-TPU interpretation uses highest matrix-multiply precision to avoid a
+backend-selected reduced-precision FP32 reference. Interpretation also keeps
+optimization barriers at the rounded inter-phase tensors: the staged path
+materializes these tensors between calls, whereas the fused interpreter
+otherwise compiles both phases together. Native Mosaic keeps the VMEM
+boundaries and its existing precision configuration. CUDA validation of the
+interpreter comparison is tracked separately from native TPU correctness.
 
 ```bash
 python -m pytest tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_fused_test.py -v

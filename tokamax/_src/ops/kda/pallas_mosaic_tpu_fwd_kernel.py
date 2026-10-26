@@ -783,13 +783,20 @@ def _fused_gate_intra_kernel(
   qg = q_f32 * exp2(g_cumsum) if disable_recompute else jnp.zeros_like(q_f32)
 
   # --- Store all MB heads ---
-  u_out_ref[:, 0, 0] = u.astype(u_out_ref.dtype)
-  w_out_ref[:, 0, 0] = w.astype(w_out_ref.dtype)
-  qg_out_ref[:, 0, 0] = qg.astype(qg_out_ref.dtype)
-  kg_out_ref[:, 0, 0] = kg.astype(kg_out_ref.dtype)
-  Aqk_out_ref[:, 0, 0] = Aqk.astype(Aqk_out_ref.dtype)
-  Akk_inv_out_ref[:, 0, 0] = A_inv.astype(Akk_inv_out_ref.dtype)
-  g_cumsum_out_ref[:, 0, 0] = g_cumsum
+  def bridge(value, output_dtype):
+    value = value.astype(output_dtype)
+    # The staged path materializes these rounded tensors between calls.
+    # Preserve that numerical boundary when CUDA interprets both phases in
+    # one compiled program. Native Mosaic retains the VMEM ref boundary.
+    return jax.lax.optimization_barrier(value) if get_interpret() else value
+
+  u_out_ref[:, 0, 0] = bridge(u, u_out_ref.dtype)
+  w_out_ref[:, 0, 0] = bridge(w, w_out_ref.dtype)
+  qg_out_ref[:, 0, 0] = bridge(qg, qg_out_ref.dtype)
+  kg_out_ref[:, 0, 0] = bridge(kg, kg_out_ref.dtype)
+  Aqk_out_ref[:, 0, 0] = bridge(Aqk, Aqk_out_ref.dtype)
+  Akk_inv_out_ref[:, 0, 0] = bridge(A_inv, Akk_inv_out_ref.dtype)
+  g_cumsum_out_ref[:, 0, 0] = bridge(g_cumsum, g_cumsum_out_ref.dtype)
 
 
 def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
