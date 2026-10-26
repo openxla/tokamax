@@ -25,6 +25,11 @@ from tokamax._src.ops.experimental.moba import pallas_mosaic_tpu
 
 class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
 
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() == "gpu":
+      self.skipTest("Pallas Mosaic TPU kernel is not supported on GPU.")
+
   def test_pallas_fwd_matches_reference(self):
     key = jax.random.PRNGKey(123)
     batch_size, num_heads, seq_len, head_dim = 2, 4, 256, 16

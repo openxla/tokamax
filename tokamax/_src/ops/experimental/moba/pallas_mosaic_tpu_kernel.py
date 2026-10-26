@@ -212,7 +212,7 @@ def _flash_moba_pallas(
   scratch_shape = pltpu.VMEM((block_q, head_dim), jnp.float32)
 
   if interpret is None:
-    interpret = jax.default_backend() == "cpu"
+    interpret = jax.default_backend() != "tpu"
   out_blocks = pl.pallas_call(
       functools.partial(_flash_moba_kernel, scale=scale),
       grid_spec=pltpu.PrefetchScalarGridSpec(
