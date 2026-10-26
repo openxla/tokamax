@@ -15,14 +15,25 @@
 
 """Pallas TPU analytical backward kernel for RWKV-7 (DPLR Delta Rule)."""
 
-import math
-from typing import Any
+import functools
 
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.rwkv7 import pallas_mosaic_tpu_kernel
+
+# Dimensions:
+#   B: batch size
+#   T: sequence length (NT * BT)
+#   H: number of attention heads
+#   BH: flattened batch-head count (B * H)
+#   MB: stream micro-batch size dividing BH
+#   NB: number of micro-batches (BH // MB)
+#   NT: number of chunks (T // BT)
+#   BT: chunk size (chunk_size)
+#   K: key head dimension (key_dim)
+#   V: value head dimension (val_dim)
 
 _CHUNK_SIZE = pallas_mosaic_tpu_kernel._CHUNK_SIZE
 _pick_mb = pallas_mosaic_tpu_kernel._pick_mb
@@ -38,156 +49,158 @@ def _unchunkify(
   )
 
 
-def _make_rwkv7_bwd_kernel(bt: int, nt: int, mb: int) -> Any:
-  """Builds single-pass fused analytical backward kernel for RWKV-7."""
+def _rwkv7_bwd_kernel(
+    # Inputs.
+    q_vmem_ref,  # [1, 1, MB, BT, K] dtype
+    k_vmem_ref,  # [1, 1, MB, BT, K] dtype
+    v_vmem_ref,  # [1, 1, MB, BT, V] dtype
+    alpha_vmem_ref,  # [1, 1, MB, BT, K] dtype
+    beta_vmem_ref,  # [1, 1, MB, BT, K] dtype
+    gk_vmem_ref,  # [1, 1, MB, BT, K] dtype
+    gk_cs_vmem_ref,  # [1, 1, MB, BT, K] float32
+    a_ab_inv_vmem_ref,  # [1, 1, MB, BT, BT] dtype
+    merged_out_vmem_ref,  # [1, 1, MB, BT, K + V] float32
+    s_in_vmem_ref,  # [1, 1, MB, K, V] float32
+    do_vmem_ref,  # [1, 1, MB, BT, V] dtype
+    d_s_final_vmem_ref,  # [1, MB, K, V] float32
+    # Outputs.
+    dq_vmem_ref,  # [1, 1, MB, BT, K] float32
+    dk_vmem_ref,  # [1, 1, MB, BT, K] float32
+    dv_vmem_ref,  # [1, 1, MB, BT, V] float32
+    dalpha_vmem_ref,  # [1, 1, MB, BT, K] float32
+    dbeta_vmem_ref,  # [1, 1, MB, BT, K] float32
+    dgk_vmem_ref,  # [1, 1, MB, BT, K] float32
+    d_s0_vmem_ref,  # [1, MB, K, V] float32
+    # Scratch.
+    ds_scratch_vmem_ref,  # [MB, K, V] float32
+    *,
+    num_chunks: int,
+) -> None:
+  """Single-pass fused analytical backward kernel for RWKV-7."""
+  c = pl.program_id(1)
+  bt = q_vmem_ref.shape[3]
+  k_dim = q_vmem_ref.shape[4]
 
-  def _kernel(
-      q_ref: Any,
-      k_ref: Any,
-      v_ref: Any,
-      alpha_ref: Any,
-      beta_ref: Any,
-      gk_ref: Any,
-      gk_cs_ref: Any,
-      a_ab_inv_ref: Any,
-      merged_out_ref: Any,
-      s_in_ref: Any,
-      do_ref: Any,
-      d_s_final_ref: Any,
-      dq_ref: Any,
-      dk_ref: Any,
-      dv_ref: Any,
-      dalpha_ref: Any,
-      dbeta_ref: Any,
-      dgk_ref: Any,
-      d_s0_ref: Any,
-      ds_scratch: Any,
-  ) -> None:
-    c = pl.program_id(1)
+  @pl.when(c == 0)
+  def _init_ds() -> None:
+    ds_scratch_vmem_ref[...] = d_s_final_vmem_ref[0].astype(jnp.float32)
 
-    @pl.when(c == 0)
-    def _init_ds() -> None:
-      ds_scratch[...] = d_s_final_ref[0].astype(jnp.float32)
+  q_i = q_vmem_ref[0, 0].astype(jnp.float32)
+  k_i = k_vmem_ref[0, 0].astype(jnp.float32)
+  v_i = v_vmem_ref[0, 0].astype(jnp.float32)
+  alpha_i = alpha_vmem_ref[0, 0].astype(jnp.float32)
+  beta_i = beta_vmem_ref[0, 0].astype(jnp.float32)
+  gk_i = gk_vmem_ref[0, 0].astype(jnp.float32)
+  gk_cs = gk_cs_vmem_ref[0, 0].astype(jnp.float32)
+  a_ab_inv = a_ab_inv_vmem_ref[0, 0].astype(jnp.float32)
+  merged_uw = merged_out_vmem_ref[0, 0].astype(jnp.float32)
+  s_prev = s_in_vmem_ref[0, 0].astype(jnp.float32)
+  do_i = do_vmem_ref[0, 0].astype(jnp.float32)
+  ds_new = ds_scratch_vmem_ref[...]
 
-    q_i = q_ref[0, 0].astype(jnp.float32)
-    k_i = k_ref[0, 0].astype(jnp.float32)
-    v_i = v_ref[0, 0].astype(jnp.float32)
-    alpha_i = alpha_ref[0, 0].astype(jnp.float32)
-    beta_i = beta_ref[0, 0].astype(jnp.float32)
-    gk_i = gk_ref[0, 0].astype(jnp.float32)
-    gk_cs = gk_cs_ref[0, 0].astype(jnp.float32)
-    a_ab_inv = a_ab_inv_ref[0, 0].astype(jnp.float32)
-    merged_uw = merged_out_ref[0, 0].astype(jnp.float32)
-    s_prev = s_in_ref[0, 0].astype(jnp.float32)
-    do_i = do_ref[0, 0].astype(jnp.float32)
-    ds_new = ds_scratch[...]
-    k_dim = q_i.shape[-1]
+  w_i = merged_uw[:, :, :k_dim]
+  u_i = merged_uw[:, :, k_dim:]
 
-    w_i = merged_uw[:, :, :k_dim]
-    u_i = merged_uw[:, :, k_dim:]
+  row_idx = jax.lax.broadcasted_iota(jnp.int32, (1, bt, bt), 1)
+  col_idx = jax.lax.broadcasted_iota(jnp.int32, (1, bt, bt), 2)
+  incl_causal = (col_idx <= row_idx).astype(jnp.float32)
+  strict_causal = (col_idx < row_idx).astype(jnp.float32)
 
-    row_idx = jax.lax.broadcasted_iota(jnp.int32, (1, bt, bt), 1)
-    col_idx = jax.lax.broadcasted_iota(jnp.int32, (1, bt, bt), 2)
-    incl_causal = (col_idx <= row_idx).astype(jnp.float32)
-    strict_causal = (col_idx < row_idx).astype(jnp.float32)
+  gk_excl = gk_cs - gk_i
+  g0 = gk_cs[:, bt // 2 : bt // 2 + 1, :]
+  exp_pos_incl = jnp.exp(jnp.clip(gk_cs - g0, -80.0, 80.0))
+  exp_pos_excl = jnp.exp(jnp.clip(gk_excl - g0, -80.0, 80.0))
+  exp_neg = jnp.exp(jnp.clip(g0 - gk_cs, -80.0, 80.0))
 
-    gk_excl = gk_cs - gk_i
-    g0 = gk_cs[:, bt // 2 : bt // 2 + 1, :]
-    exp_pos_incl = jnp.exp(jnp.clip(gk_cs - g0, -80.0, 80.0))
-    exp_pos_excl = jnp.exp(jnp.clip(gk_excl - g0, -80.0, 80.0))
-    exp_neg = jnp.exp(jnp.clip(g0 - gk_cs, -80.0, 80.0))
+  q_hat = q_i * exp_pos_incl
+  alpha_hat = alpha_i * exp_pos_excl
+  k_hat = k_i * exp_neg
+  beta_hat = beta_i * exp_neg
 
-    q_hat = q_i * exp_pos_incl
-    alpha_hat = alpha_i * exp_pos_excl
-    k_hat = k_i * exp_neg
-    beta_hat = beta_i * exp_neg
+  a_qk = _mm(q_hat, k_hat.swapaxes(-1, -2)) * incl_causal
+  a_qb = _mm(q_hat, beta_hat.swapaxes(-1, -2)) * incl_causal
+  a_ak = _mm(alpha_hat, k_hat.swapaxes(-1, -2)) * strict_causal
 
-    a_qk = _mm(q_hat, k_hat.swapaxes(-1, -2)) * incl_causal
-    a_qb = _mm(q_hat, beta_hat.swapaxes(-1, -2)) * incl_causal
-    a_ak = _mm(alpha_hat, k_hat.swapaxes(-1, -2)) * strict_causal
+  exp_gk_excl = jnp.exp(jnp.minimum(gk_excl, 0.0))
+  v2_i = u_i + _mm(w_i, s_prev)
 
-    exp_gk_excl = jnp.exp(jnp.minimum(gk_excl, 0.0))
-    v2_i = u_i + _mm(w_i, s_prev)
+  g_last = gk_cs[:, -1:, :]
+  exp_g_last = jnp.exp(jnp.minimum(g_last, 0.0)).swapaxes(-1, -2)
+  decay_last = jnp.exp(jnp.minimum(g_last - gk_cs, 0.0))
+  dk_i = k_i * decay_last
+  db_i = beta_i * decay_last
 
-    g_last = gk_cs[:, -1:, :]
-    exp_g_last = jnp.exp(jnp.minimum(g_last, 0.0)).swapaxes(-1, -2)
-    decay_last = jnp.exp(jnp.minimum(g_last - gk_cs, 0.0))
-    dk_i = k_i * decay_last
-    db_i = beta_i * decay_last
+  s_new = (
+      s_prev * exp_g_last
+      + _mm(dk_i.swapaxes(-1, -2), v_i)
+      + _mm(db_i.swapaxes(-1, -2), v2_i)
+  )
 
-    s_new = (
-        s_prev * exp_g_last
-        + _mm(dk_i.swapaxes(-1, -2), v_i)
-        + _mm(db_i.swapaxes(-1, -2), v2_i)
-    )
+  dv2 = _mm(a_qb.swapaxes(-1, -2), do_i) + _mm(db_i, ds_new)
+  dz = _mm(a_ab_inv.swapaxes(-1, -2), dv2)
+  dv_i = (
+      _mm(a_qk.swapaxes(-1, -2), do_i)
+      + _mm(dk_i, ds_new)
+      + _mm(a_ak.swapaxes(-1, -2), dz)
+  )
 
-    dv2 = _mm(a_qb.swapaxes(-1, -2), do_i) + _mm(db_i, ds_new)
-    dz = _mm(a_ab_inv.swapaxes(-1, -2), dv2)
-    dv_i = (
-        _mm(a_qk.swapaxes(-1, -2), do_i)
-        + _mm(dk_i, ds_new)
-        + _mm(a_ak.swapaxes(-1, -2), dz)
-    )
+  exp_gk_cs = jnp.exp(jnp.minimum(gk_cs, 0.0))
+  q_exp = q_i * exp_gk_cs
+  ds_prev = (
+      ds_new * exp_g_last
+      + _mm(q_exp.swapaxes(-1, -2), do_i)
+      + _mm(w_i.swapaxes(-1, -2), dv2)
+  )
+  ds_scratch_vmem_ref[...] = ds_prev
 
-    exp_gk_cs = jnp.exp(jnp.minimum(gk_cs, 0.0))
-    q_exp = q_i * exp_gk_cs
-    ds_prev = (
-        ds_new * exp_g_last
-        + _mm(q_exp.swapaxes(-1, -2), do_i)
-        + _mm(w_i.swapaxes(-1, -2), dv2)
-    )
-    ds_scratch[...] = ds_prev
+  d_aqk = _mm(do_i, v_i.swapaxes(-1, -2)) * incl_causal
+  d_aqb = _mm(do_i, v2_i.swapaxes(-1, -2)) * incl_causal
+  d_aab = _mm(dz, v2_i.swapaxes(-1, -2)) * strict_causal
+  d_aak = _mm(dz, v_i.swapaxes(-1, -2)) * strict_causal
 
-    d_aqk = _mm(do_i, v_i.swapaxes(-1, -2)) * incl_causal
-    d_aqb = _mm(do_i, v2_i.swapaxes(-1, -2)) * incl_causal
-    d_aab = _mm(dz, v2_i.swapaxes(-1, -2)) * strict_causal
-    d_aak = _mm(dz, v_i.swapaxes(-1, -2)) * strict_causal
+  dq_o3 = _mm(do_i, s_prev.swapaxes(-1, -2)) * exp_gk_cs
+  dq_gram = exp_pos_incl * (_mm(d_aqk, k_hat) + _mm(d_aqb, beta_hat))
+  dq_i = dq_o3 + dq_gram
 
-    dq_o3 = _mm(do_i, s_prev.swapaxes(-1, -2)) * exp_gk_cs
-    dq_gram = exp_pos_incl * (_mm(d_aqk, k_hat) + _mm(d_aqb, beta_hat))
-    dq_i = dq_o3 + dq_gram
+  dalpha_w = _mm(dz, s_prev.swapaxes(-1, -2)) * exp_gk_excl
+  dalpha_gram = exp_pos_excl * (_mm(d_aab, beta_hat) + _mm(d_aak, k_hat))
+  dalpha_i = dalpha_w + dalpha_gram
 
-    dalpha_w = _mm(dz, s_prev.swapaxes(-1, -2)) * exp_gk_excl
-    dalpha_gram = exp_pos_excl * (_mm(d_aab, beta_hat) + _mm(d_aak, k_hat))
-    dalpha_i = dalpha_w + dalpha_gram
+  dk_s = _mm(v_i, ds_new.swapaxes(-1, -2)) * decay_last
+  dk_gram = exp_neg * (
+      _mm(d_aqk.swapaxes(-1, -2), q_hat)
+      + _mm(d_aak.swapaxes(-1, -2), alpha_hat)
+  )
+  dk_out = dk_s + dk_gram
 
-    dk_s = _mm(v_i, ds_new.swapaxes(-1, -2)) * decay_last
-    dk_gram = exp_neg * (
-        _mm(d_aqk.swapaxes(-1, -2), q_hat)
-        + _mm(d_aak.swapaxes(-1, -2), alpha_hat)
-    )
-    dk_out = dk_s + dk_gram
+  dbeta_s = _mm(v2_i, ds_new.swapaxes(-1, -2)) * decay_last
+  dbeta_gram = exp_neg * (
+      _mm(d_aqb.swapaxes(-1, -2), q_hat)
+      + _mm(d_aab.swapaxes(-1, -2), alpha_hat)
+  )
+  dbeta_out = dbeta_s + dbeta_gram
 
-    dbeta_s = _mm(v2_i, ds_new.swapaxes(-1, -2)) * decay_last
-    dbeta_gram = exp_neg * (
-        _mm(d_aqb.swapaxes(-1, -2), q_hat)
-        + _mm(d_aab.swapaxes(-1, -2), alpha_hat)
-    )
-    dbeta_out = dbeta_s + dbeta_gram
+  dg_cs = q_i * dq_i - k_i * dk_out - beta_i * dbeta_out
+  dg_last = jnp.sum(s_new * ds_new, axis=-1)
+  last_mask = (
+      jax.lax.broadcasted_iota(jnp.int32, (1, bt, 1), 1) == (bt - 1)
+  ).astype(jnp.float32)
+  dg_cs = dg_cs + dg_last[:, None, :] * last_mask
+  dg_excl = alpha_i * dalpha_i
 
-    dg_cs = q_i * dq_i - k_i * dk_out - beta_i * dbeta_out
-    dg_last = jnp.sum(s_new * ds_new, axis=-1)
-    last_mask = (
-        jax.lax.broadcasted_iota(jnp.int32, (1, bt, 1), 1) == (bt - 1)
-    ).astype(jnp.float32)
-    dg_cs = dg_cs + dg_last[:, None, :] * last_mask
-    dg_excl = alpha_i * dalpha_i
+  dg_total = dg_cs + dg_excl
+  dgk_out = _mm(incl_causal.swapaxes(-1, -2), dg_total) - dg_excl
 
-    dg_total = dg_cs + dg_excl
-    dgk_out = _mm(incl_causal.swapaxes(-1, -2), dg_total) - dg_excl
+  dq_vmem_ref[0, 0] = dq_i.astype(dq_vmem_ref.dtype)
+  dk_vmem_ref[0, 0] = dk_out.astype(dk_vmem_ref.dtype)
+  dv_vmem_ref[0, 0] = dv_i.astype(dv_vmem_ref.dtype)
+  dalpha_vmem_ref[0, 0] = dalpha_i.astype(dalpha_vmem_ref.dtype)
+  dbeta_vmem_ref[0, 0] = dbeta_out.astype(dbeta_vmem_ref.dtype)
+  dgk_vmem_ref[0, 0] = dgk_out.astype(dgk_vmem_ref.dtype)
 
-    dq_ref[0, 0] = dq_i.astype(dq_ref.dtype)
-    dk_ref[0, 0] = dk_out.astype(dk_ref.dtype)
-    dv_ref[0, 0] = dv_i.astype(dv_ref.dtype)
-    dalpha_ref[0, 0] = dalpha_i.astype(dalpha_ref.dtype)
-    dbeta_ref[0, 0] = dbeta_out.astype(dbeta_ref.dtype)
-    dgk_ref[0, 0] = dgk_out.astype(dgk_ref.dtype)
-
-    @pl.when(c == nt - 1)
-    def _store_ds0() -> None:
-      d_s0_ref[0] = ds_prev.astype(d_s0_ref.dtype)
-
-  return _kernel
+  @pl.when(c == num_chunks - 1)
+  def _store_ds0() -> None:
+    d_s0_vmem_ref[0] = ds_prev.astype(d_s0_vmem_ref.dtype)
 
 
 def _rwkv7_bwd_pallas(
@@ -239,7 +252,6 @@ def _rwkv7_bwd_pallas(
       jnp.float32
   )
 
-  kernel = _make_rwkv7_bwd_kernel(chunk_size, num_chunks, mb)
   grid = (nb, num_chunks)
   bspec_k_rev = pl.BlockSpec(
       (1, 1, mb, chunk_size, key_dim),
@@ -268,7 +280,7 @@ def _rwkv7_bwd_pallas(
   interpret = jax.default_backend() == "cpu"
   dq_out, dk_out, dv_out, dalpha_out, dbeta_out, dgk_out, d_s0_out = (
       pl.pallas_call(
-          kernel,
+          functools.partial(_rwkv7_bwd_kernel, num_chunks=num_chunks),
           grid_spec=pltpu.PrefetchScalarGridSpec(
               num_scalar_prefetch=0,
               grid=grid,
@@ -383,23 +395,33 @@ def rwkv7_pallas_bwd(
 ]:
   """Computes RWKV-7 analytical backward pass using Pallas TPU kernel."""
   batch_size, seq_len, num_heads, key_dim = q.shape
+  if chunk_size <= 0 or seq_len % chunk_size != 0:
+    raise ValueError(
+        f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})."
+    )
+  if chunk_size > 64:
+    raise NotImplementedError(
+        f"chunk_size must be <= 64 for TPU VMEM layout, got {chunk_size}."
+    )
   val_dim = v.shape[-1]
   num_chunks = seq_len // chunk_size
   if scale is None:
     scale = key_dim**-0.5
 
   if a_ab_inv is None or merged_out is None or s_in is None:
-    _, _, a_ab_inv, merged_out, s_in = pallas_mosaic_tpu_kernel.rwkv7_pallas_fwd(
-        q,
-        k,
-        v,
-        alpha,
-        beta,
-        gk,
-        chunk_size=chunk_size,
-        scale=scale,
-        initial_state=initial_state,
-        return_residuals=True,
+    _, _, a_ab_inv, merged_out, s_in = (
+        pallas_mosaic_tpu_kernel.rwkv7_pallas_fwd(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            gk,
+            chunk_size=chunk_size,
+            scale=scale,
+            initial_state=initial_state,
+            return_residuals=True,
+        )
     )
 
   q_c = _chunkify(q, batch_size, num_chunks, chunk_size) * scale

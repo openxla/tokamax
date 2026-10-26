@@ -110,12 +110,12 @@ class PallasTpuRWKV7Vjp(op.Op[Any, dict[str, Any], None, Config, None]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return Config(chunk_size=64)
+    chunk_size = ba.arguments.get("chunk_size", 64)
+    return Config(chunk_size=chunk_size)
 
   @override
-  def supported_on(self, device: Any) -> bool:
-    return True
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu"
 
 
 PallasTpuRwkv7Vjp = PallasTpuRWKV7Vjp
@@ -200,9 +200,9 @@ class PallasTpuRWKV7(base.RWKV7[Config]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return Config(chunk_size=64)
+    chunk_size = ba.arguments.get("chunk_size", 64)
+    return Config(chunk_size=chunk_size)
 
   @override
-  def supported_on(self, device: Any) -> bool:
-    return True
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu"

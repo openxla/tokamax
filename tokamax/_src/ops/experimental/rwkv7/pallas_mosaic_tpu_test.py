@@ -19,8 +19,8 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.rwkv7 import base
 from tokamax._src.ops.experimental.rwkv7 import pallas_mosaic_tpu
-from tokamax._src.ops.experimental.rwkv7 import reference
 
 
 class PallasTpuRWKV7Test(absltest.TestCase):
@@ -64,7 +64,7 @@ class PallasTpuRWKV7Test(absltest.TestCase):
         scale=1.0,
         output_final_state=True,
     )
-    expected_out, expected_s = reference.rwkv7_reference(
+    expected_out, expected_s = base.rwkv7_reference(
         q,
         k,
         v,
@@ -149,7 +149,7 @@ class PallasTpuRWKV7Test(absltest.TestCase):
     )
 
     def loss_fn(q_, k_, v_, a_, b_, gk_, s0_):
-      out_ref, s_final_ref = reference.rwkv7_reference(
+      out_ref, s_final_ref = base.rwkv7_reference(
           q_,
           k_,
           v_,
@@ -198,6 +198,15 @@ class PallasTpuRWKV7Test(absltest.TestCase):
     np.testing.assert_allclose(
         actual_grads["initial_state"], expected_ds0, rtol=1e-4, atol=1e-4
     )
+
+  def test_invalid_chunk_size_raises(self):
+    q = jnp.ones((1, 100, 2, 16), dtype=jnp.float32)
+    op_instance = pallas_mosaic_tpu.PallasTpuRWKV7()
+    with self.assertRaises(ValueError):
+      op_instance._fwd(q, q, q, q, q, q, chunk_size=64)
+    with self.assertRaises(NotImplementedError):
+      q128 = jnp.ones((1, 128, 2, 16), dtype=jnp.float32)
+      op_instance._fwd(q128, q128, q128, q128, q128, q128, chunk_size=128)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Unit tests for RWKV-7 PyTorch operator."""
+"""Unit tests for RWKV-7 PyTorch Pallas operator."""
 
 import unittest
 
@@ -22,15 +22,16 @@ from absl.testing import absltest
 import torch
 import torch.nn.functional as F
 from tokamax.experimental.torch_tpu.ops.rwkv7 import rwkv7 as rwkv7_pallas
+from tokamax.experimental.torch_tpu.ops.rwkv7 import torch_base
 
 
 class RWKV7PallasKernelTest(unittest.TestCase):
-  """Tests for RWKV-7 operator on TPU and fallback devices."""
+  """Tests for RWKV-7 Pallas operator against base reference."""
 
   def _get_device(self) -> str:
     if hasattr(torch, "tpu") and torch.tpu.is_available():
       return "tpu"
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    return "cpu"
 
   def test_forward_shape_and_parity(self):
     device = self._get_device()
@@ -96,11 +97,9 @@ class RWKV7PallasKernelTest(unittest.TestCase):
           torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
       )
 
-      actual = rwkv7_pallas.rwkv7_pallas_delta_rule(
+      actual = rwkv7_pallas(q, k, v, alpha, beta, gk, chunk_size=chunk_size)
+      expected = torch_base.rwkv7_delta_rule(
           q, k, v, alpha, beta, gk, chunk_size=chunk_size
-      )
-      expected = rwkv7_pallas._cpu_fallback(
-          q.cpu(), k.cpu(), v.cpu(), alpha.cpu(), beta.cpu(), gk.cpu(), chunk_size=chunk_size
       )
 
       self.assertEqual(actual.shape, (batch_size, seq_len, num_heads, head_dim))
@@ -121,85 +120,78 @@ class RWKV7PallasKernelTest(unittest.TestCase):
     gk = torch.randn(2, 100, 4, 16, device=device)
 
     with self.assertRaises(ValueError):
-      rwkv7_pallas.rwkv7_pallas_delta_rule(
-          q, k, v, alpha, beta, gk, chunk_size=64
-      )
+      rwkv7_pallas(q, k, v, alpha, beta, gk, chunk_size=64)
 
-  def test_backward_autograd(self):
+  def test_backward_autograd_matches_reference(self):
     device = self._get_device()
     batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
     chunk_size = 64
 
     torch.manual_seed(42)
-    q = (
-        (
-            torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
-            * (head_dim**-0.5)
-        )
-        .detach()
-        .requires_grad_(True)
+    q0 = (
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+        * (head_dim**-0.5)
     )
-    k = (
-        F.normalize(
-            torch.randn(
-                batch_size, seq_len, num_heads, head_dim, device=device
-            ),
-            p=2,
-            dim=-1,
-        )
-        .detach()
-        .requires_grad_(True)
+    k0 = F.normalize(
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device),
+        p=2,
+        dim=-1,
     )
-    v = torch.randn(
-        batch_size,
-        seq_len,
-        num_heads,
-        head_dim,
-        device=device,
-        requires_grad=True,
+    v0 = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+    alpha0 = (
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+        * (head_dim**-0.5)
     )
-    alpha = (
-        (
-            torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
-            * (head_dim**-0.5)
-        )
-        .detach()
-        .requires_grad_(True)
+    beta0 = (
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+        * (head_dim**-0.5)
     )
-    beta = (
-        (
-            torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
-            * (head_dim**-0.5)
-        )
-        .detach()
-        .requires_grad_(True)
+    gk0 = -torch.sigmoid(
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
     )
-    gk = (
-        -torch.sigmoid(
-            torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
-        )
-    ).detach().requires_grad_(True)
+    do = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
 
-    out = rwkv7_pallas.rwkv7_pallas_delta_rule(
-        q, k, v, alpha, beta, gk, chunk_size=chunk_size
-    )
-    loss = out.sum()
-    loss.backward()
+    q_pal = q0.clone().detach().requires_grad_(True)
+    k_pal = k0.clone().detach().requires_grad_(True)
+    v_pal = v0.clone().detach().requires_grad_(True)
+    alpha_pal = alpha0.clone().detach().requires_grad_(True)
+    beta_pal = beta0.clone().detach().requires_grad_(True)
+    gk_pal = gk0.clone().detach().requires_grad_(True)
 
-    for tensor, name in [
-        (q, "q"),
-        (k, "k"),
-        (v, "v"),
-        (alpha, "alpha"),
-        (beta, "beta"),
-        (gk, "gk"),
+    out_pal = rwkv7_pallas(
+        q_pal, k_pal, v_pal, alpha_pal, beta_pal, gk_pal, chunk_size=chunk_size
+    )
+    (out_pal * do).sum().backward()
+
+    q_ref = q0.clone().detach().requires_grad_(True)
+    k_ref = k0.clone().detach().requires_grad_(True)
+    v_ref = v0.clone().detach().requires_grad_(True)
+    alpha_ref = alpha0.clone().detach().requires_grad_(True)
+    beta_ref = beta0.clone().detach().requires_grad_(True)
+    gk_ref = gk0.clone().detach().requires_grad_(True)
+
+    out_ref = torch_base.rwkv7_delta_rule(
+        q_ref, k_ref, v_ref, alpha_ref, beta_ref, gk_ref, chunk_size=chunk_size
+    )
+    (out_ref * do).sum().backward()
+
+    for pal_t, ref_t, name in [
+        (q_pal, q_ref, "q"),
+        (k_pal, k_ref, "k"),
+        (v_pal, v_ref, "v"),
+        (alpha_pal, alpha_ref, "alpha"),
+        (beta_pal, beta_ref, "beta"),
+        (gk_pal, gk_ref, "gk"),
     ]:
-      self.assertIsNotNone(tensor.grad, f"{name}.grad should not be None")
-      self.assertTrue(
-          torch.isfinite(tensor.grad).all(),
-          f"{name}.grad contains non-finite values",
+      self.assertIsNotNone(pal_t.grad, f"{name}.grad should not be None")
+      torch.testing.assert_close(
+          pal_t.grad.cpu(),
+          ref_t.grad.cpu(),
+          rtol=1e-3,
+          atol=1e-3,
+          msg=f"Gradient mismatch for {name}",
       )
-    logging.info("RWKV-7 backward autograd test passed.")
+    logging.info("RWKV-7 backward autograd parity test passed.")
 
 
 if __name__ == "__main__":

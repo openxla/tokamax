@@ -15,16 +15,28 @@
 
 """RWKV-7 (DPLR Delta Rule) Tokamax operator."""
 
-from tokamax._src.ops.experimental.rwkv7.base import RWKV7
+from tokamax._src.ops.experimental.rwkv7.api import (
+    rwkv7_delta_rule,
+)
+from tokamax._src.ops.experimental.rwkv7.arg_specs import (
+    ARG_SPECS,
+)
+from tokamax._src.ops.experimental.rwkv7.base import (
+    RWKV7,
+    rwkv7_reference,
+)
 from tokamax._src.ops.experimental.rwkv7.pallas_mosaic_tpu import (
     Config,
     PallasTpuRWKV7,
+    PallasTpuRWKV7Vjp,
 )
-from tokamax._src.ops.experimental.rwkv7.reference import rwkv7_reference
 
 __all__ = [
+    "ARG_SPECS",
     "Config",
     "PallasTpuRWKV7",
+    "PallasTpuRWKV7Vjp",
     "RWKV7",
+    "rwkv7_delta_rule",
     "rwkv7_reference",
 ]

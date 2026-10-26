@@ -15,7 +15,10 @@
 
 """PyTorch RWKV-7 (DPLR delta rule) operator."""
 
-from tokamax.experimental.torch_tpu.ops.rwkv7.torch_base import _RWKV7
+from tokamax.experimental.torch_tpu.ops.rwkv7.torch_base import (
+    _RWKV7,
+    rwkv7_delta_rule,
+)
 from tokamax.experimental.torch_tpu.ops.rwkv7.torch_pallas_mosaic_tpu import (
     _PallasTpuRWKV7,
     rwkv7,
@@ -25,8 +28,9 @@ from tokamax.experimental.torch_tpu.ops.rwkv7.torch_pallas_mosaic_tpu import (
 rwkv7_pallas_delta_rule = rwkv7
 
 __all__ = [
-    "_RWKV7",
     "_PallasTpuRWKV7",
+    "_RWKV7",
     "rwkv7",
+    "rwkv7_delta_rule",
     "rwkv7_pallas_delta_rule",
 ]
