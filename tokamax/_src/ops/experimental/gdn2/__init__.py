@@ -28,6 +28,7 @@ from tokamax._src.ops.experimental.gdn2.base import (
 from tokamax._src.ops.experimental.gdn2.pallas_mosaic_tpu import (
     Config,
     PallasTpuGatedDeltaNet2,
+    PallasTpuGatedDeltaNet2Vjp,
 )
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "Config",
     "GatedDeltaNet2",
     "PallasTpuGatedDeltaNet2",
+    "PallasTpuGatedDeltaNet2Vjp",
     "gated_delta_net_2",
     "gdn2_reference",
 ]

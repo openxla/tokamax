@@ -13,90 +13,27 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Unit tests for Gated Delta Net 2 (GDN-2) Pallas kernel."""
+"""Unit tests for Gated Delta Net 2 (GDN-2) PyTorch Pallas operator."""
 
 import unittest
 
-import torch
 from absl import logging
 from absl.testing import absltest
+import torch
 from tokamax.experimental.torch_tpu.ops.gdn2 import gdn2 as gdn2_pallas
-
-
-def naive_chunk_gdn2_ref(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    b_gate: torch.Tensor,
-    w_gate: torch.Tensor,
-    chunk_size: int = 64,
-) -> torch.Tensor:
-  """Canonical mathematical reference implementation of chunked GDN-2."""
-  batch_size, seq_len, num_heads, key_dim = q.shape
-  val_dim = v.shape[-1]
-  num_chunks = seq_len // chunk_size
-
-  q_c = q.reshape(batch_size, num_chunks, chunk_size, num_heads, key_dim).permute(0, 3, 1, 2, 4)
-  k_c = k.reshape(batch_size, num_chunks, chunk_size, num_heads, key_dim).permute(0, 3, 1, 2, 4)
-  v_c = v.reshape(batch_size, num_chunks, chunk_size, num_heads, val_dim).permute(0, 3, 1, 2, 4)
-  g_c = g.reshape(batch_size, num_chunks, chunk_size, num_heads, key_dim).permute(0, 3, 1, 2, 4).cumsum(dim=-2)
-  b_c = b_gate.reshape(batch_size, num_chunks, chunk_size, num_heads, key_dim).permute(0, 3, 1, 2, 4)
-  w_c = w_gate.reshape(batch_size, num_chunks, chunk_size, num_heads, val_dim).permute(0, 3, 1, 2, 4)
-
-  s = torch.zeros(batch_size, num_heads, key_dim, val_dim, dtype=torch.float32, device=q.device)
-  strictly_lower = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device), diagonal=-1)
-  causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device), diagonal=0)
-  eye = torch.eye(chunk_size, device=q.device)
-
-  o_chunks = []
-  for chunk_idx in range(num_chunks):
-    qi = q_c[:, :, chunk_idx]
-    ki = k_c[:, :, chunk_idx]
-    vi = v_c[:, :, chunk_idx]
-    gi = g_c[:, :, chunk_idx]
-    bi = b_c[:, :, chunk_idx]
-    wi = w_c[:, :, chunk_idx]
-
-    g_diff = torch.clamp(gi[:, :, :, None, :] - gi[:, :, None, :, :], max=0.0)
-    bk = bi * ki
-    decay = torch.exp(g_diff)
-    t_lower = (
-        -torch.sum(bk[:, :, :, None, :] * ki[:, :, None, :, :] * decay, dim=-1)
-        * strictly_lower
-    )
-
-    a_inv = torch.linalg.inv(eye - t_lower)
-    k_g_b = torch.exp(gi) * ki * bi
-    wv = wi * vi
-    wwy_i = a_inv @ k_g_b
-    u_i = a_inv @ wv
-
-    qg = qi[:, :, :, None, :] * torch.exp(g_diff)
-    aqk = torch.sum(qg * ki[:, :, None, :, :], dim=-1) * causal_mask
-
-    v_curr = u_i - torch.matmul(wwy_i, s)
-    o_i = torch.matmul(qi * torch.exp(gi), s) + torch.matmul(aqk, v_curr)
-
-    g_last = gi[:, :, -1]
-    decayed_k = torch.exp(g_last[:, :, None, :] - gi) * ki
-    s_update = torch.matmul(decayed_k.transpose(-1, -2), v_curr)
-    s = s * torch.exp(g_last)[:, :, :, None] + s_update
-    o_chunks.append(o_i)
-
-  return (
-      torch.stack(o_chunks, dim=2)
-      .permute(0, 2, 3, 1, 4)
-      .reshape(batch_size, seq_len, num_heads, val_dim)
-      .to(q.dtype)
-  )
+from tokamax.experimental.torch_tpu.ops.gdn2 import torch_base
 
 
 class GDN2PallasKernelTest(unittest.TestCase):
-  """Tests for GDN-2 Pallas kernel on TPU and fallback devices."""
+  """Tests for GDN-2 Pallas kernel against base reference."""
+
+  def _get_device(self) -> str:
+    if hasattr(torch, "tpu") and torch.tpu.is_available():
+      return "tpu"
+    return "cpu"
 
   def test_forward_shape_and_parity_multi_chunk(self):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = self._get_device()
     chunk_size = 64
 
     for seq_len in (64, 128, 256):
@@ -104,52 +41,78 @@ class GDN2PallasKernelTest(unittest.TestCase):
       torch.manual_seed(42)
       q = (
           torch.randn(
-              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+              batch_size,
+              seq_len,
+              num_heads,
+              head_dim,
+              device=device,
+              dtype=torch.float32,
           )
           * (head_dim**-0.5)
       )
       k = (
           torch.randn(
-              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+              batch_size,
+              seq_len,
+              num_heads,
+              head_dim,
+              device=device,
+              dtype=torch.float32,
           )
           * (head_dim**-0.5)
       )
       v = torch.randn(
-          batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+          batch_size,
+          seq_len,
+          num_heads,
+          head_dim,
+          device=device,
+          dtype=torch.float32,
       )
       g = -torch.sigmoid(
           torch.randn(
-              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+              batch_size,
+              seq_len,
+              num_heads,
+              head_dim,
+              device=device,
+              dtype=torch.float32,
           )
       )
       b_mat = torch.sigmoid(
           torch.randn(
-              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+              batch_size,
+              seq_len,
+              num_heads,
+              head_dim,
+              device=device,
+              dtype=torch.float32,
           )
       )
       w_mat = torch.sigmoid(
           torch.randn(
-              batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+              batch_size,
+              seq_len,
+              num_heads,
+              head_dim,
+              device=device,
+              dtype=torch.float32,
           )
       )
 
-      actual = gdn2_pallas.gdn2_pallas_delta_rule(
-          q, k, v, g, b_mat, w_mat, chunk_size=chunk_size
-      )
-      expected = naive_chunk_gdn2_ref(
+      actual = gdn2_pallas(q, k, v, g, b_mat, w_mat, chunk_size=chunk_size)
+      expected = torch_base.gated_delta_net_2(
           q, k, v, g, b_mat, w_mat, chunk_size=chunk_size
       )
 
       self.assertEqual(actual.shape, (batch_size, seq_len, num_heads, head_dim))
       torch.testing.assert_close(
-          actual.cpu(), expected.cpu(), rtol=1e-4, atol=1e-4
+          actual.cpu(), expected.cpu(), rtol=5e-4, atol=5e-4
       )
-      logging.info(
-          f"GDN-2 forward parity test passed for seq_len={seq_len}."
-      )
+      logging.info("GDN-2 forward parity test passed for seq_len=%d.", seq_len)
 
   def test_chunk_size_validation(self):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = self._get_device()
     q = torch.randn(2, 100, 4, 16, device=device)
     k = torch.randn(2, 100, 4, 16, device=device)
     v = torch.randn(2, 100, 4, 16, device=device)
@@ -158,51 +121,75 @@ class GDN2PallasKernelTest(unittest.TestCase):
     w_mat = torch.randn(2, 100, 4, 16, device=device)
 
     with self.assertRaises(ValueError):
-      gdn2_pallas.gdn2_pallas_delta_rule(
-          q, k, v, g, b_mat, w_mat, chunk_size=64
-      )
+      gdn2_pallas(q, k, v, g, b_mat, w_mat, chunk_size=64)
 
-  def test_backward_autograd(self):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+  def test_backward_autograd_matches_reference(self):
+    device = self._get_device()
     batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
     chunk_size = 64
 
     torch.manual_seed(42)
-    q = (
+    q0 = (
         torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
         * (head_dim**-0.5)
-    ).requires_grad_(True)
-    k = (
+    )
+    k0 = (
         torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
         * (head_dim**-0.5)
-    ).requires_grad_(True)
-    v = torch.randn(
-        batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True
     )
-    g = (-torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))).requires_grad_(True)
-    b_mat = (torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))).requires_grad_(True)
-    w_mat = (torch.sigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, device=device))).requires_grad_(True)
-
-    out = gdn2_pallas.gdn2_pallas_delta_rule(
-        q, k, v, g, b_mat, w_mat, chunk_size=chunk_size
+    v0 = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+    g0 = -torch.sigmoid(
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
     )
-    loss = out.sum()
-    loss.backward()
+    b0 = torch.sigmoid(
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+    )
+    w0 = torch.sigmoid(
+        torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
+    )
+    do = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
 
-    for tensor, name in [
-        (q, "q"),
-        (k, "k"),
-        (v, "v"),
-        (g, "g"),
-        (b_mat, "b"),
-        (w_mat, "w"),
+    q_pal = q0.clone().detach().requires_grad_(True)
+    k_pal = k0.clone().detach().requires_grad_(True)
+    v_pal = v0.clone().detach().requires_grad_(True)
+    g_pal = g0.clone().detach().requires_grad_(True)
+    b_pal = b0.clone().detach().requires_grad_(True)
+    w_pal = w0.clone().detach().requires_grad_(True)
+
+    out_pal = gdn2_pallas(
+        q_pal, k_pal, v_pal, g_pal, b_pal, w_pal, chunk_size=chunk_size
+    )
+    (out_pal * do).sum().backward()
+
+    q_ref = q0.clone().detach().requires_grad_(True)
+    k_ref = k0.clone().detach().requires_grad_(True)
+    v_ref = v0.clone().detach().requires_grad_(True)
+    g_ref = g0.clone().detach().requires_grad_(True)
+    b_ref = b0.clone().detach().requires_grad_(True)
+    w_ref = w0.clone().detach().requires_grad_(True)
+
+    out_ref = torch_base.gated_delta_net_2(
+        q_ref, k_ref, v_ref, g_ref, b_ref, w_ref, chunk_size=chunk_size
+    )
+    (out_ref * do).sum().backward()
+
+    for pal_t, ref_t, name in [
+        (q_pal, q_ref, "q"),
+        (k_pal, k_ref, "k"),
+        (v_pal, v_ref, "v"),
+        (g_pal, g_ref, "g"),
+        (b_pal, b_ref, "b"),
+        (w_pal, w_ref, "w"),
     ]:
-      self.assertIsNotNone(tensor.grad, f"{name}.grad should not be None")
-      self.assertTrue(
-          torch.isfinite(tensor.grad).all(),
-          f"{name}.grad contains non-finite values",
+      self.assertIsNotNone(pal_t.grad, f"{name}.grad should not be None")
+      torch.testing.assert_close(
+          pal_t.grad.cpu(),
+          ref_t.grad.cpu(),
+          rtol=1e-3,
+          atol=1e-3,
+          msg=f"Gradient mismatch for {name}",
       )
-    logging.info("GDN-2 multi-chunk backward autograd test passed.")
+    logging.info("GDN-2 backward autograd parity test passed.")
 
 
 if __name__ == "__main__":

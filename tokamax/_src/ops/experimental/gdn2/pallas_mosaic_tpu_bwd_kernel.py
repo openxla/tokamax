@@ -24,6 +24,17 @@ import jax.numpy as jnp
 
 from tokamax._src.ops.experimental.gdn2 import pallas_mosaic_tpu_kernel
 
+# Dimensions:
+#   B: batch size
+#   T: sequence length (NT * BT)
+#   H: number of attention heads
+#   BH: flattened batch-head count (B * H)
+#   MB: stream micro-batch size dividing BH
+#   NT: number of chunks (T // BT)
+#   BT: chunk size (chunk_size)
+#   K: key head dimension (key_dim)
+#   V: value head dimension (val_dim)
+
 _CHUNK_SIZE = 64
 _select_mb = pallas_mosaic_tpu_kernel._select_mb
 _chunkify = pallas_mosaic_tpu_kernel._chunkify
@@ -68,51 +79,51 @@ def _decayed_gram_bwd(
 
 def _gdn2_bwd_kernel(
     # Inputs.
-    q_ref,  # [MB, 1, BT, K] dtype
-    k_ref,  # [MB, 1, BT, K] dtype
-    v_ref,  # [MB, 1, BT, V] dtype
-    g_ref,  # [MB, 1, BT, K] float32
-    b_ref,  # [MB, 1, BT, K] dtype
-    w_ref,  # [MB, 1, BT, V] dtype
-    a_mat_ref,  # [MB, 1, BT, BT] dtype
-    merged_out_ref,  # [MB, 1, BT, K + V] float32
-    s_in_ref,  # [MB, 1, K, V] float32
-    do_ref,  # [MB, 1, BT, V] dtype
-    d_final_state_ref,  # [MB, K, V] float32
+    q_vmem_ref,  # [MB, 1, BT, K] dtype
+    k_vmem_ref,  # [MB, 1, BT, K] dtype
+    v_vmem_ref,  # [MB, 1, BT, V] dtype
+    g_vmem_ref,  # [MB, 1, BT, K] float32
+    b_vmem_ref,  # [MB, 1, BT, K] dtype
+    w_vmem_ref,  # [MB, 1, BT, V] dtype
+    a_mat_vmem_ref,  # [MB, 1, BT, BT] dtype
+    merged_out_vmem_ref,  # [MB, 1, BT, K + V] float32
+    s_in_vmem_ref,  # [MB, 1, K, V] float32
+    do_vmem_ref,  # [MB, 1, BT, V] dtype
+    d_final_state_vmem_ref,  # [MB, K, V] float32
     # Outputs.
-    dq_ref,  # [MB, 1, BT, K] float32
-    dk_ref,  # [MB, 1, BT, K] dtype
-    dv_ref,  # [MB, 1, BT, V] dtype
-    dg_ref,  # [MB, 1, BT, K] dtype
-    db_ref,  # [MB, 1, BT, K] dtype
-    dw_ref,  # [MB, 1, BT, V] dtype
-    ds0_ref,  # [MB, K, V] float32
+    dq_vmem_ref,  # [MB, 1, BT, K] float32
+    dk_vmem_ref,  # [MB, 1, BT, K] dtype
+    dv_vmem_ref,  # [MB, 1, BT, V] dtype
+    dg_vmem_ref,  # [MB, 1, BT, K] dtype
+    db_vmem_ref,  # [MB, 1, BT, K] dtype
+    dw_vmem_ref,  # [MB, 1, BT, V] dtype
+    ds0_vmem_ref,  # [MB, K, V] float32
     # Scratch.
-    scratch_ref,  # [MB, K, V] float32
+    scratch_vmem_ref,  # [MB, K, V] float32
     *,
     num_chunks: int,
 ) -> None:
   """Single-pass MB-batched reverse state + intra-chunk backward kernel."""
   rev_c = pl.program_id(1)
-  bt = q_ref.shape[2]
-  k_dim = q_ref.shape[3]
+  bt = q_vmem_ref.shape[2]
+  k_dim = q_vmem_ref.shape[3]
 
   @pl.when(rev_c == 0)
   def _():
-    scratch_ref[...] = d_final_state_ref[...].astype(jnp.float32)
+    scratch_vmem_ref[...] = d_final_state_vmem_ref[...].astype(jnp.float32)
 
-  ds_out = scratch_ref[...]
+  ds_out = scratch_vmem_ref[...]
 
-  q_i = q_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  k_i = k_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  v_i = v_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
-  g_i = g_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  b_i = b_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  w_i = w_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
-  a_mat = a_mat_ref[:, 0].astype(jnp.float32)  # [MB, BT, BT]
-  merged_out = merged_out_ref[:, 0].astype(jnp.float32)  # [MB, BT, K + V]
-  s_prev = s_in_ref[:, 0].astype(jnp.float32)  # [MB, K, V]
-  do_i = do_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
+  q_i = q_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
+  k_i = k_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
+  v_i = v_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
+  g_i = g_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
+  b_i = b_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
+  w_i = w_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
+  a_mat = a_mat_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, BT]
+  merged_out = merged_out_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K + V]
+  s_prev = s_in_vmem_ref[:, 0].astype(jnp.float32)  # [MB, K, V]
+  do_i = do_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
 
   row_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 0)
   col_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 1)
@@ -178,11 +189,11 @@ def _gdn2_bwd_kernel(
           precision=jax.lax.Precision.HIGHEST,
       )
   )
-  scratch_ref[...] = ds_prev
+  scratch_vmem_ref[...] = ds_prev
 
   @pl.when(rev_c == num_chunks - 1)
   def _():
-    ds0_ref[...] = ds_prev.astype(ds0_ref.dtype)
+    ds0_vmem_ref[...] = ds_prev.astype(ds0_vmem_ref.dtype)
 
   d_aqk = (
       jnp.matmul(
@@ -283,12 +294,12 @@ def _gdn2_bwd_kernel(
       precision=jax.lax.Precision.HIGHEST,
   )
 
-  dq_ref[:, 0] = dq.astype(dq_ref.dtype)
-  dk_ref[:, 0] = dk.astype(dk_ref.dtype)
-  dv_ref[:, 0] = dv.astype(dv_ref.dtype)
-  dg_ref[:, 0] = dg_raw.astype(dg_ref.dtype)
-  db_ref[:, 0] = db.astype(db_ref.dtype)
-  dw_ref[:, 0] = dw.astype(dw_ref.dtype)
+  dq_vmem_ref[:, 0] = dq.astype(dq_vmem_ref.dtype)
+  dk_vmem_ref[:, 0] = dk.astype(dk_vmem_ref.dtype)
+  dv_vmem_ref[:, 0] = dv.astype(dv_vmem_ref.dtype)
+  dg_vmem_ref[:, 0] = dg_raw.astype(dg_vmem_ref.dtype)
+  db_vmem_ref[:, 0] = db.astype(db_vmem_ref.dtype)
+  dw_vmem_ref[:, 0] = dw.astype(dw_vmem_ref.dtype)
 
 
 def _gdn2_bwd_pallas(
@@ -399,8 +410,8 @@ def gdn2_pallas_bwd(
     k: jax.Array,
     v: jax.Array,
     g: jax.Array,
-    b_gate: jax.Array,
-    w_gate: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
     grad_out: jax.Array,
     grad_final_state: jax.Array | None = None,
     *,
@@ -420,12 +431,16 @@ def gdn2_pallas_bwd(
     jax.Array | None,
 ]:
   """Analytical closed-form backward pass for GDN-2 operator using Pallas TPU."""
+  batch_size, seq_len, num_heads, key_dim = q.shape
+  if chunk_size <= 0 or seq_len % chunk_size != 0:
+    raise ValueError(
+        f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})."
+    )
   if chunk_size > 64:
     raise NotImplementedError(
         f"chunk_size must be <= 64 for TPU VMEM layout, got {chunk_size}."
     )
 
-  batch_size, seq_len, num_heads, key_dim = q.shape
   val_dim = v.shape[-1]
   bh = batch_size * num_heads
   num_chunks = seq_len // chunk_size
@@ -439,8 +454,8 @@ def gdn2_pallas_bwd(
             k,
             v,
             g,
-            b_gate,
-            w_gate,
+            b,
+            w,
             chunk_size=chunk_size,
             scale=scale,
             initial_state=initial_state,
@@ -458,8 +473,8 @@ def gdn2_pallas_bwd(
       _chunkify(g.astype(jnp.float32), batch_size, num_chunks, chunk_size),
       axis=-2,
   )
-  b_c = _chunkify(b_gate, batch_size, num_chunks, chunk_size)
-  w_c = _chunkify(w_gate, batch_size, num_chunks, chunk_size)
+  b_c = _chunkify(b, batch_size, num_chunks, chunk_size)
+  w_c = _chunkify(w, batch_size, num_chunks, chunk_size)
   do_c = _chunkify(grad_out, batch_size, num_chunks, chunk_size)
 
   if grad_final_state is None:
@@ -507,7 +522,7 @@ def gdn2_pallas_bwd(
       dk.astype(k.dtype),
       dv.astype(v.dtype),
       dg.astype(g.dtype),
-      db.astype(b_gate.dtype),
-      dw.astype(w_gate.dtype),
+      db.astype(b.dtype),
+      dw.astype(w.dtype),
       ds0_out,
   )

@@ -39,16 +39,16 @@ def _gdn2_workload_spec(
   v_shape = (batch_size, seq_len, num_heads, val_dim)
 
   args = {
-      "query": ShapeDtype(qk_shape, dtype),
-      "key": ShapeDtype(qk_shape, dtype),
-      "value": ShapeDtype(v_shape, dtype),
-      "gate": numerics.RangedArrayInitializer(
+      "q": ShapeDtype(qk_shape, dtype),
+      "k": ShapeDtype(qk_shape, dtype),
+      "v": ShapeDtype(v_shape, dtype),
+      "g": numerics.RangedArrayInitializer(
           shape=qk_shape, dtype=dtype, minval=-5.0, maxval=0.0
       ),
-      "beta": numerics.RangedArrayInitializer(
+      "b": numerics.RangedArrayInitializer(
           shape=qk_shape, dtype=dtype, minval=0.0, maxval=1.0
       ),
-      "weight": numerics.RangedArrayInitializer(
+      "w": numerics.RangedArrayInitializer(
           shape=v_shape, dtype=dtype, minval=0.0, maxval=1.0
       ),
       "chunk_size": 64,

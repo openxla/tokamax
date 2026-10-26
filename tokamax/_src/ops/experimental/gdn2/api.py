@@ -48,12 +48,12 @@ _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = (
 
 @jaxtyping.jaxtyped
 def gated_delta_net_2(
-    query: Float[Array, "B T H K"],
-    key: Float[Array, "B T H K"],
-    value: Float[Array, "B T H V"],
-    gate: Float[Array, "B T H K"],
-    beta: Float[Array, "B T H K"],
-    weight: Float[Array, "B T H V"],
+    q: Float[Array, "B T H K"],
+    k: Float[Array, "B T H K"],
+    v: Float[Array, "B T H V"],
+    g: Float[Array, "B T H K"],
+    b: Float[Array, "B T H K"],
+    w: Float[Array, "B T H V"],
     *,
     chunk_size: int = 64,
     scale: float | None = None,
@@ -64,15 +64,15 @@ def gated_delta_net_2(
   """Gated Delta Net 2 (GDN-2).
 
   GDN-2 is a linear recurrent delta-rule operator with input-dependent erase
-  gating (`beta`) and write gating (`weight`).
+  gating (`b`) and write gating (`w`).
 
   Args:
-    query: Query tensor with shape `[B, T, H, K]`.
-    key: Key tensor with shape `[B, T, H, K]`.
-    value: Value tensor with shape `[B, T, H, V]`.
-    gate: Per-channel log-space decay tensor with shape `[B, T, H, K]`.
-    beta: Per-token, per-channel erase gate tensor with shape `[B, T, H, K]`.
-    weight: Per-token, per-channel write gate tensor with shape `[B, T, H, V]`.
+    q: Query tensor with shape `[B, T, H, K]`.
+    k: Key tensor with shape `[B, T, H, K]`.
+    v: Value tensor with shape `[B, T, H, V]`.
+    g: Per-channel log-space decay tensor with shape `[B, T, H, K]`.
+    b: Per-token, per-channel erase gate tensor with shape `[B, T, H, K]`.
+    w: Per-token, per-channel write gate tensor with shape `[B, T, H, V]`.
     chunk_size: Chunk size for chunked execution. Defaults to 64.
     scale: Query scale. Defaults to `K ** -0.5`.
     initial_state: Optional initial recurrent state, shape `[B, H, K, V]`.
@@ -80,9 +80,9 @@ def gated_delta_net_2(
     implementation: The implementation to use. By default, the Mosaic TPU
       implementation is attempted first when available, with XLA as a fallback.
       `"xla"` evaluates the recurrent reference implementation. `"mosaic"` or
-      `"mosaic_tpu"` uses the experimental Pallas/Mosaic TPU forward kernel.
-      A sequence tries implementations in order, falling back when an
-      implementation raises `NotImplementedError`.
+      `"mosaic_tpu"` uses the experimental Pallas/Mosaic TPU kernel. A sequence
+      tries implementations in order, falling back when an implementation
+      raises `NotImplementedError`.
 
   Returns:
     A pair `(output, final_state)`. The output has shape `[B, T, H, V]`.
@@ -103,19 +103,18 @@ def gated_delta_net_2(
       raise ValueError(f"Unknown implementation: {impl}")
 
     try:
-      (out, final_state), _ = IMPLEMENTATIONS[impl]._fwd(
-          query,
-          key,
-          value,
-          gate,
-          beta,
-          weight,
+      return IMPLEMENTATIONS[impl](
+          q,
+          k,
+          v,
+          g,
+          b,
+          w,
           chunk_size=chunk_size,
           scale=scale,
           initial_state=initial_state,
           output_final_state=output_final_state,
       )
-      return out, final_state
     except NotImplementedError as e:
       if len(implementation) == 1:
         raise

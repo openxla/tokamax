@@ -21,7 +21,11 @@ from typing import Annotated, Any, ClassVar
 import jax
 import pydantic
 from tokamax._src.ops import op
-from tokamax._src.ops.experimental.gdn2 import base, pallas_mosaic_tpu_bwd_kernel, pallas_mosaic_tpu_kernel
+from tokamax._src.ops.experimental.gdn2 import (
+    base,
+    pallas_mosaic_tpu_bwd_kernel,
+    pallas_mosaic_tpu_kernel,
+)
 from typing_extensions import override
 
 
@@ -39,28 +43,17 @@ class PallasTpuGatedDeltaNet2Vjp(
   """Tokamax Op VJP wrapper for GDN-2 Pallas TPU backward path."""
 
   config_cls: ClassVar[type[Config]] = Config
+  supports_symbolic_shapes: ClassVar[bool] = False
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return Config(chunk_size=64)
+    chunk_size = ba.arguments.get("chunk_size", 64)
+    return Config(chunk_size=chunk_size)
 
+  @override
   def _fwd(
       self,
-      residuals: tuple[
-          jax.Array,
-          jax.Array,
-          jax.Array,
-          jax.Array,
-          jax.Array,
-          jax.Array,
-          jax.Array | None,
-          jax.Array,
-          jax.Array,
-          jax.Array,
-          int,
-          float | None,
-      ],
+      residuals: base.Residuals,
       out: base.Output,
       dout: base.Output,
       q: jax.Array,
@@ -74,40 +67,54 @@ class PallasTpuGatedDeltaNet2Vjp(
       scale: float | None = None,
       initial_state: jax.Array | None = None,
       output_final_state: bool = False,
+      return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[dict[str, jax.Array], None]:
-    del out, q, k, v, g, b, w, initial_state, output_final_state, config
-    (
-        res_q,
-        res_k,
-        res_v,
-        res_g,
-        res_b,
-        res_w,
-        res_s0,
-        res_a_mat_c,
-        res_merged_out_c,
-        res_s_in_c,
-        res_chunk_size,
-        res_scale,
-    ) = residuals
-    grad_out, grad_final_state = dout
+    del out, output_final_state, return_residuals
+    resolved_chunk_size = (
+        config.chunk_size if config is not None else chunk_size
+    )
+    a_mat_c = None
+    merged_out_c = None
+    s_in_c = None
+    if isinstance(residuals, tuple) and len(residuals) == 12:
+      (
+          q,
+          k,
+          v,
+          g,
+          b,
+          w,
+          initial_state,
+          a_mat_c,
+          merged_out_c,
+          s_in_c,
+          resolved_chunk_size,
+          scale,
+      ) = residuals
+    elif isinstance(residuals, tuple) and len(residuals) == 3:
+      a_mat_c, merged_out_c, s_in_c = residuals
+
+    if isinstance(dout, tuple):
+      grad_out, grad_final_state = dout
+    else:
+      grad_out, grad_final_state = dout, None
 
     dq, dk, dv, dg, db, dw, ds0 = pallas_mosaic_tpu_bwd_kernel.gdn2_pallas_bwd(
-        res_q,
-        res_k,
-        res_v,
-        res_g,
-        res_b,
-        res_w,
+        q,
+        k,
+        v,
+        g,
+        b,
+        w,
         grad_out,
         grad_final_state=grad_final_state,
-        chunk_size=res_chunk_size,
-        scale=res_scale,
-        initial_state=res_s0,
-        a_mat_c=res_a_mat_c,
-        merged_out_c=res_merged_out_c,
-        s_in_c=res_s_in_c,
+        chunk_size=resolved_chunk_size,
+        scale=scale,
+        initial_state=initial_state,
+        a_mat_c=a_mat_c,
+        merged_out_c=merged_out_c,
+        s_in_c=s_in_c,
     )
 
     grads = {
@@ -118,9 +125,13 @@ class PallasTpuGatedDeltaNet2Vjp(
         "b": db,
         "w": dw,
     }
-    if res_s0 is not None:
+    if initial_state is not None:
       grads["initial_state"] = ds0
     return grads, None
+
+  @override
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu"
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -147,8 +158,9 @@ class PallasTpuGatedDeltaNet2(base.GatedDeltaNet2[Config]):
       return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[base.Output, Any]:
-    del return_residuals
-    resolved_chunk_size = config.chunk_size if config is not None else chunk_size
+    resolved_chunk_size = (
+        config.chunk_size if config is not None else chunk_size
+    )
     out, (a_mat_c, merged_out_c, s_in_c) = (
         pallas_mosaic_tpu_kernel.gdn2_pallas_fwd(
             q,
@@ -178,12 +190,12 @@ class PallasTpuGatedDeltaNet2(base.GatedDeltaNet2[Config]):
         resolved_chunk_size,
         scale,
     )
-    return out, residuals
+    return out, (residuals if return_residuals else None)
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return Config(chunk_size=64)
+    chunk_size = ba.arguments.get("chunk_size", 64)
+    return Config(chunk_size=chunk_size)
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

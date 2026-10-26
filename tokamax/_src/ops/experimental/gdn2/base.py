@@ -29,7 +29,9 @@ Residuals: TypeAlias = Any
 
 def _step_token(
     state: jax.Array,
-    inputs: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    inputs: tuple[
+        jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
+    ],
 ) -> tuple[jax.Array, jax.Array]:
   """Single token recurrence step for GDN-2."""
   q_t, k_t, v_t, g_t, b_t, w_t = inputs
@@ -82,7 +84,6 @@ def gdn2_reference(
     output_final_state: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
   """Token-by-token recurrence reference implementation of GDN-2."""
-  del chunk_size
   (out, final_state), _ = GatedDeltaNet2()._fwd(
       q,
       k,
@@ -90,6 +91,7 @@ def gdn2_reference(
       g,
       b,
       w,
+      chunk_size=chunk_size,
       scale=scale,
       initial_state=initial_state,
       output_final_state=output_final_state,
@@ -124,8 +126,12 @@ class GatedDeltaNet2[C](op.Op[Any, Output, Residuals, C, None]):
       return_residuals: bool = False,
       config: C | None = None,
   ) -> tuple[Output, None]:
-    del chunk_size, return_residuals, config
-    batch_size, _, num_heads, key_dim = q.shape
+    del return_residuals, config
+    batch_size, seq_len, num_heads, key_dim = q.shape
+    if chunk_size <= 0 or seq_len % chunk_size != 0:
+      raise ValueError(
+          f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})."
+      )
     val_dim = v.shape[-1]
     if scale is None:
       scale = key_dim**-0.5

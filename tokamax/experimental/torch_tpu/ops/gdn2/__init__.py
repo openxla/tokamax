@@ -15,7 +15,10 @@
 
 """PyTorch GDN-2 (Gated Delta Net 2) operator."""
 
-from tokamax.experimental.torch_tpu.ops.gdn2.torch_base import _GatedDeltaNet2
+from tokamax.experimental.torch_tpu.ops.gdn2.torch_base import (
+    _GatedDeltaNet2,
+    gated_delta_net_2,
+)
 from tokamax.experimental.torch_tpu.ops.gdn2.torch_pallas_mosaic_tpu import (
     _PallasTpuGatedDeltaNet2,
     gdn2,
@@ -27,6 +30,7 @@ gdn2_pallas_delta_rule = gdn2
 __all__ = [
     "_GatedDeltaNet2",
     "_PallasTpuGatedDeltaNet2",
+    "gated_delta_net_2",
     "gdn2",
     "gdn2_pallas_delta_rule",
 ]
