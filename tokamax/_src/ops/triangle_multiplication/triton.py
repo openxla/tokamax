@@ -631,7 +631,7 @@ def _epilogue(
 
 
 def _xla_recompute_vjp(
-    residuals: Residuals,
+    residuals: Residuals | None,
     out: jax.Array,
     dout: jax.Array,
     *args,
@@ -721,7 +721,7 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
           base.Implementation | Sequence[base.Implementation] | None
       ) = None,
       config: Config,
-  ) -> tuple[Float[Array, "N N D"], Residuals]:
+  ) -> tuple[Float[Array, "N N D"], Residuals | None]:
     # There are no residuals; the VJP recomputes the forward pass.
     del return_residuals, implementation  # Unused.
 
