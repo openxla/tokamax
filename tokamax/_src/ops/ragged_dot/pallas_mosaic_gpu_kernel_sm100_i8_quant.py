@@ -398,6 +398,10 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
                   layout=_TCGEN05_COL,
                   optimized=False,
               ).astype(acc_dtype)
+              x_scale = plgpu.layout_cast(
+                  lax.broadcast_in_dim(x_scale, (tile_n, block_m), (1,)),
+                  _TCGEN05,
+              )
 
             def load_ws_acc(ni):
               ws = plgpu.load(
@@ -409,6 +413,9 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
                   layout=_TCGEN05_ROW,
                   optimized=False,
               ).astype(acc_dtype)
+              ws = plgpu.layout_cast(
+                  lax.broadcast_in_dim(ws, (tile_n, block_m), (0,)), _TCGEN05
+              )
               with jax.named_scope("MMA"):
                 plgpu.barrier_wait(tcgen05_barrier.at[ni * num_stages + slot])
               with jax.named_scope("T->R"):
@@ -425,9 +432,7 @@ def ragged_dot_gpu_i8_quant_blackwell_kernel(
 
             for ni in range(_DEQ_WG):
               ws, local_acc = load_ws_acc(ni)
-              acc_carry[ni] = common.rescale_tcgen05_acc(
-                  acc_carry[ni], local_acc, ws, x_scale
-              )
+              acc_carry[ni] += local_acc.astype(acc_dtype) * (ws * x_scale)
               del ws
             return acc_carry
 

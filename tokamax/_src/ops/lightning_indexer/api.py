@@ -60,6 +60,7 @@ def lightning_indexer(
     cp_rank: Int[Array, ""] | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    uniform_q_len: int | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Computes Lightning Indexer retrieval using the selected implementation.
@@ -83,6 +84,7 @@ def lightning_indexer(
       tokens.
     return_scores: If True, also returns the selected scores as int32 holding
       raw float32` its (-inf bits in padded slots).
+    uniform_q_len: Optional static query length for the uniform-q segment.
     implementation: Implementation(s) to try ("mosaic" or "xla"). If None, tries
       the default implementation order.
 
@@ -106,6 +108,7 @@ def lightning_indexer(
       cp_rank=cp_rank,
       interleave_size=interleave_size,
       return_scores=return_scores,
+      uniform_q_len=uniform_q_len,
   )
   if implementation is None:
     implementations = _DEFAULT_IMPLEMENTATION

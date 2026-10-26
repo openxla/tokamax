@@ -807,10 +807,12 @@ class SelectionTest(unittest.TestCase):
     # An empty set is a real answer, not a failure: `None` means "run
     # everything" and these two must never be confused.
     resolved, *_ = shards.resolve_shards()
-    only, _ = shards.select(
-        resolved, shards.all_test_files(), self._changed('README.md')
-    )
-    self.assertEqual(only, set())
+    for path in ('README.md', 'docs/tokamax_ops.ipynb'):
+      with self.subTest(path=path):
+        only, _ = shards.select(
+            resolved, shards.all_test_files(), self._changed(path)
+        )
+        self.assertEqual(only, set())
 
   def test_a_test_file_selects_its_own_shard(self) -> None:
     files = shards.all_test_files()

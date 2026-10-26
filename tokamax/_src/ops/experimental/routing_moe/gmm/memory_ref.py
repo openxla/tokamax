@@ -125,7 +125,7 @@ class _BypassBufferedRef(pltpu.BufferedRef):
 class RoutingBufferedRef(_BypassBufferedRef):
   """Shared common interface for both all routed BufferedRef instances."""
 
-  metadata_ref: metadata.MetadataRef = dataclasses.field(
+  metadata_ref: metadata.AbstractMetadataRef = dataclasses.field(
       metadata=dict(static=True)
   )
   # SMEM ref used for indexing src or dst ref.
@@ -140,7 +140,7 @@ class RoutingBufferedRef(_BypassBufferedRef):
   def create(
       cls,
       *args: Any,
-      metadata_ref: metadata.MetadataRef,
+      metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
       **kwargs,
   ):
@@ -257,7 +257,7 @@ class IndexBufferedRef(pltpu.BufferedRef):
     code can cleanly perform idx[offset + i] without worrying about OOB access.
   """
 
-  metadata_ref: metadata.MetadataRef = dataclasses.field(
+  metadata_ref: metadata.AbstractMetadataRef = dataclasses.field(
       metadata=dict(static=True)
   )
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
@@ -268,7 +268,7 @@ class IndexBufferedRef(pltpu.BufferedRef):
       cls,
       *args: Any,
       cfg: config.RoutingGmmConfig,
-      metadata_ref: metadata.MetadataRef,
+      metadata_ref: metadata.AbstractMetadataRef,
       fetch_offset: int,
       **kwargs,
   ):
@@ -561,7 +561,7 @@ class PipelineIndexMaps:
     cfg: Static configuration for the routing GMM kernel.
   """
 
-  metadata_ref: metadata.MetadataRef
+  metadata_ref: metadata.AbstractMetadataRef
   cfg: config.RoutingGmmConfig
 
   def _rows(self, gm_id: jax.Array) -> pl.Slice:
@@ -667,9 +667,9 @@ class PipelineBlockSpecs:
         self.index_map_provider.out_index,
     )
 
-  def get_weight_spec(self) -> pl.BlockSpec:
-    """Returns the BlockSpec for the expert weight tensor."""
-    block_shape = (None, self.cfg.plan.tile_k, self.cfg.plan.tile_n)
+  def get_weight_spec(self, cfg: config.SingleGmmConfig) -> pl.BlockSpec:
+    """Returns the BlockSpec for an expert weight tensor."""
+    block_shape = (None, cfg.tile_k, cfg.tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.weight_index,
@@ -681,9 +681,9 @@ class PipelineBlockSpecs:
         ),
     )
 
-  def get_scale_spec(self) -> pl.BlockSpec:
-    """Returns the BlockSpec for the quantization scale tensor."""
-    block_shape = (None, 1, 1, self.cfg.plan.tile_n)
+  def get_scale_spec(self, cfg: config.SingleGmmConfig) -> pl.BlockSpec:
+    """Returns the BlockSpec for a quantization scale tensor."""
+    block_shape = (None, 1, 1, cfg.tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.scale_index,
@@ -722,13 +722,14 @@ class PipelineInputs[T]:
 
   Attributes:
     x: Input activation reference, BlockSpec, or BufferedRef.
-    w: Expert weight reference, BlockSpec tree, or BufferedRef tree.
+    w: Tuple of expert weight references, BlockSpec trees, or BufferedRef trees
+      per GMM stage.
     gather_idx: Row indices used by x. Set to None when DIRECT mode is used.
     scatter_idx: Row indices used by out. Set to None when DIRECT mode is used.
   """
 
   x: T
-  w: AbstractWeightRef
+  w: tuple[AbstractWeightRef, ...]
   gather_idx: T | None = None
   scatter_idx: T | None = None
 
@@ -736,14 +737,18 @@ class PipelineInputs[T]:
       self, cfg: config.RoutingGmmConfig
   ):
     """Returns inputs with weights sliced for fused gate/up activation."""
-    if cfg.fuse_act is None:
-      return self
-    assert isinstance(self.w, SingleWeightRef)
-    w_fused = FusedWeightsRef(
-        gate=self.w,
-        up=jax.tree.map(lambda ref: ref.at[..., cfg.dim.size_out_n :], self.w),
-    )
-    return dataclasses.replace(self, w=w_fused)
+
+    w_fused_list = []
+    for w_ref, stage in zip(self.w, cfg.stages, strict=True):
+      if stage.fuse_act is None:
+        w_fused_list.append(w_ref)
+      else:
+        assert isinstance(w_ref, SingleWeightRef)
+        w_up = jax.tree.map(
+            lambda ref, n=stage.size_out_n: ref.at[..., n:], w_ref
+        )
+        w_fused_list.append(FusedWeightsRef(gate=w_ref, up=w_up))
+    return dataclasses.replace(self, w=tuple(w_fused_list))
 
 
 @jax.tree_util.register_dataclass
@@ -767,7 +772,7 @@ class PipelineAllocs:
       cls,
       in_hbm_ref: PipelineInputs[hijax.TransformedRef],
       out_hbm_ref: hijax.TransformedRef,
-      metadata_ref: metadata.MetadataRef,
+      metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
   ):
     """Creates BufferedRef allocations for all pipeline inputs and outputs.
@@ -784,30 +789,31 @@ class PipelineAllocs:
     pipeline_index_maps = PipelineIndexMaps(metadata_ref, cfg)
     pipeline_block_specs = PipelineBlockSpecs(cfg, pipeline_index_maps)
     x_hbm_ref = in_hbm_ref.x
-    w_hbm_ref = in_hbm_ref.w
-    assert isinstance(w_hbm_ref, SingleWeightRef)
 
-    scale_bref = None
-    if cfg.w.has_scale:
-      assert w_hbm_ref.scale is not None
-      scale_bref = pltpu.BufferedRef.input(
-          spec=pipeline_block_specs.get_scale_spec(),
-          dtype_or_type=w_hbm_ref.scale.dtype,
+    w_brefs = []
+    for w_hbm_ref, stage in zip(in_hbm_ref.w, cfg.stages, strict=True):
+      assert isinstance(w_hbm_ref, SingleWeightRef)
+      scale_bref = None
+      if stage.w.has_scale:
+        assert w_hbm_ref.scale is not None
+        scale_bref = pltpu.BufferedRef.input(
+            spec=pipeline_block_specs.get_scale_spec(stage),
+            dtype_or_type=w_hbm_ref.scale.dtype,
+            buffer_count=cfg.plan.num_w_buffers,
+            use_lookahead=True,
+            grid_rank=3,
+        )
+      weight_bref = pltpu.BufferedRef.input(
+          spec=pipeline_block_specs.get_weight_spec(stage),
+          dtype_or_type=w_hbm_ref.weight.dtype,
           buffer_count=cfg.plan.num_w_buffers,
           use_lookahead=True,
           grid_rank=3,
       )
-
-    weight_bref = pltpu.BufferedRef.input(
-        spec=pipeline_block_specs.get_weight_spec(),
-        dtype_or_type=w_hbm_ref.weight.dtype,
-        buffer_count=cfg.plan.num_w_buffers,
-        use_lookahead=True,
-        grid_rank=3,
-    )
-    w_bref = SingleWeightRef(weight=weight_bref, scale=scale_bref, bias=None)
-    if cfg.fuse_act is not None:
-      w_bref = FusedWeightsRef(gate=w_bref, up=w_bref)
+      w_bref = SingleWeightRef(weight=weight_bref, scale=scale_bref, bias=None)
+      if stage.fuse_act is not None:
+        w_bref = FusedWeightsRef(gate=w_bref, up=w_bref)
+      w_brefs.append(w_bref)
 
     def _get_buffered_ref(mode: config.RoutingMode) -> type[RoutingBufferedRef]:
       match mode:
@@ -871,7 +877,10 @@ class PipelineAllocs:
 
     return cls(
         inputs=PipelineInputs(
-            x=x_bref, w=w_bref, gather_idx=gather_bref, scatter_idx=scatter_bref
+            x=x_bref,
+            w=tuple(w_brefs),
+            gather_idx=gather_bref,
+            scatter_idx=scatter_bref,
         ),
         out=out_bref,
     )

@@ -63,8 +63,10 @@ class TritonNormalizationTest(test_base.NormalizationTestBase):
 
     # We expect to see a shape for non-vmapped and each layer of vmap.
     seen_vmap_axis_sizes = seen_vmap_axis_sizes[-1 :: -(len(vmap_in_axes) + 1)]
-    # We expect three calls from fwd, fwd res, and VJP.
-    self.assertEqual(seen_vmap_axis_sizes, [vmap_axis_sizes] * 3)
+    # We expect three calls from fwd, fwd res, and VJP (or four under
+    # custom_vjp3, which also traces and batches the primal function).
+    expected_calls = 4 if jax.config.jax_custom_vjp3 else 3
+    self.assertEqual(seen_vmap_axis_sizes, [vmap_axis_sizes] * expected_calls)
 
   def _assert_one_call_per_kernel(self, lowered):
     hlo = str(lowered.compiler_ir('stablehlo'))

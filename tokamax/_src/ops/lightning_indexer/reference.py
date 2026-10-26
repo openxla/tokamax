@@ -72,6 +72,7 @@ def _dequantize_cache_kv(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "uniform_q_len",
     ),
 )
 def lightning_indexer(
@@ -90,6 +91,7 @@ def lightning_indexer(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    uniform_q_len: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Pure JAX reference implementation for Lightning Indexer retrieval.
 
@@ -111,10 +113,12 @@ def lightning_indexer(
       tokens
     return_scores: If True, also return the winner scores as int32 holding raw
       float32 bits
+    uniform_q_len: Optional static query length for the uniform-q segment
 
   Returns
     top_indices of shape [max_num_tokens, k]
   """
+  del uniform_q_len
   kv_layout = KVLayout.parse(kv_layout)
   if (
       compression_ratio < 1

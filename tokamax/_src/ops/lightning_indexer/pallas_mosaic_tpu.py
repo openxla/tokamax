@@ -72,6 +72,7 @@ class PallasTpuLightningIndexer(base.LightningIndexer[Config]):
       cp_rank: Int[Array, ""] | int = 0,
       interleave_size: int = 1,
       return_scores: bool = False,
+      uniform_q_len: int | None = None,
       return_residuals: bool = False,
       config: Config,
   ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], None]:
@@ -98,6 +99,7 @@ class PallasTpuLightningIndexer(base.LightningIndexer[Config]):
         cp_rank=cp_rank,
         interleave_size=interleave_size,
         return_scores=return_scores,
+        uniform_q_len=uniform_q_len,
     )
     return out, None
 

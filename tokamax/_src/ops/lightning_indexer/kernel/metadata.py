@@ -202,9 +202,9 @@ def compute_batched_seq_metadata(
     req_max_steps = num_chunks * per_chunk_bq * max_bkv
   else:
     req_max_steps = total_max_bq * max_bkv
-  req_max_steps = pl.cdiv(req_max_steps, 1024) * 1024
+  req_max_steps = pl.cdiv(req_max_steps, 128) * 128
 
-  max_steps = max(1024, req_max_steps)
+  max_steps = max(128, req_max_steps)
 
   is_empty_pass = jnp.greater_equal(start_seq_idx, end_seq_idx)
 
@@ -228,7 +228,9 @@ def compute_batched_seq_metadata(
     all_seq_tiles = jnp.arange(max_seq_tiles, dtype=jnp.int32)
     padded_len = max_seq_tiles * seq_batch_size
     pad_size = padded_len - max_num_seqs
-    padded_seq_lens = jnp.pad(seq_lens, (0, pad_size))
+    padded_seq_lens = (
+        jnp.pad(seq_lens, (0, pad_size)) if pad_size > 0 else seq_lens
+    )
     # A sequence tile is a group of seq_batch_size sequences processed together
     # (e.g. 4 sequences per tile in decode mode, or 1 sequence per tile in
     # prefill mode).
@@ -293,8 +295,14 @@ def compute_batched_seq_metadata(
     # on one flat axis, so chunk m owns the max_seq_tiles segments starting at
     # m * max_seq_tiles, and everything below reads per segment exactly as it
     # used to read per sequence tile.
-    seg_num_bkv = jnp.tile(s_num_bkv, num_chunks)
-    seg_seq_tiles = jnp.tile(all_seq_tiles, num_chunks)
+    seg_num_bkv = (
+        s_num_bkv if num_chunks == 1 else jnp.tile(s_num_bkv, num_chunks)
+    )
+    seg_seq_tiles = (
+        all_seq_tiles
+        if num_chunks == 1
+        else jnp.tile(all_seq_tiles, num_chunks)
+    )
     seg_num_steps = num_bq.reshape(-1) * seg_num_bkv
     seg_start_step_id = jnp.cumulative_sum(seg_num_steps, include_initial=True)
 

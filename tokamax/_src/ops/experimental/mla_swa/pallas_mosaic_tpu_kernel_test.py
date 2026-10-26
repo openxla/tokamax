@@ -361,6 +361,7 @@ class CorrectnessTest(parameterized.TestCase):
       non_causal_block=False,
       num_queries_per_block=8,
       num_kv_pages_per_block=2,
+      chunk_prefill_size=None,
   ):
     total_tokens = q.shape[0]
     out_base, self.ref_cache, l_base, m_base = ref_implementation(
@@ -394,6 +395,7 @@ class CorrectnessTest(parameterized.TestCase):
             q_compute_block_size=2,
             logical_page_size=self.page_size,
             non_causal_block=non_causal_block,
+            chunk_prefill_size=chunk_prefill_size,
         )
     )
     self.swc_cache = self.from_host(swc_cache)
@@ -565,6 +567,88 @@ class CorrectnessTest(parameterized.TestCase):
         non_causal_block=True,
         num_queries_per_block=num_queries_per_block,
         num_kv_pages_per_block=num_kv_pages_per_block,
+    )
+
+  @parameterized.named_parameters(("causal", False), ("non_causal", True))
+  def test_static_verify_segment(self, non_causal_block):
+    """Speculative verify windows of a fixed length (1 + K) in the
+
+    distribution's middle segment, run by the static query-length pass:
+    [4 decodes][4 windows of 7][4 mixed]. The output must equal the same
+    step run with the windows in the mixed segment.
+    """
+    verify_q_len = 7
+    new_kv_lens = jnp.array(
+        [1, 8, 40] * (self.batch_size // 3), dtype=jnp.int32
+    )
+    cu_q_lens = jnp.concatenate(
+        [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+    )
+    self.kv_lens += new_kv_lens
+    total_tokens = jnp.sum(new_kv_lens)
+    q = self.gen_random(
+        (total_tokens, self.num_heads, self.head_dim), self.q_dtype
+    )
+    new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+    self.run_and_compare_outputs(
+        q,
+        new_kv,
+        self.kv_lens,
+        cu_q_lens,
+        jnp.array([0, 0, self.batch_size], dtype=jnp.int32),
+    )
+
+    n = self.batch_size // 3
+    q_lens = jnp.array(
+        [1] * n + [verify_q_len] * n + [3, 9, 2, 12][:n] + [5] * (n - 4),
+        dtype=jnp.int32,
+    )
+    cu_q_lens = jnp.concatenate(
+        [jnp.array([0]), jnp.cumulative_sum(q_lens, dtype=jnp.int32)]
+    )
+    self.kv_lens += q_lens
+    total_tokens = jnp.sum(q_lens)
+    q = self.gen_random(
+        (total_tokens, self.num_heads, self.head_dim), self.q_dtype
+    )
+    new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+
+    def run(distribution, cache):
+      return mla_swa.mla_sliding_window_ragged_paged_attention(
+          q,
+          new_kv,
+          self.to_host(cache),
+          self.kv_lens,
+          self.swc_page_indices,
+          cu_q_lens,
+          distribution,
+          self.attention_sinks,
+          sm_scale=1.0,
+          sliding_window=self.sliding_window,
+          num_queries_per_block=(1, 8, 8),
+          num_kv_pages_per_block=2,
+          q_compute_block_size=2,
+          logical_page_size=self.page_size,
+          non_causal_block=non_causal_block,
+          chunk_prefill_size=verify_q_len,
+      )
+
+    mixed = run(
+        jnp.array([n, n, self.batch_size], jnp.int32), self.swc_cache + 0
+    )
+    static = run(
+        jnp.array([n, 2 * n, self.batch_size], jnp.int32), self.swc_cache + 0
+    )
+    for a, b in zip(mixed, static):
+      np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    self.run_and_compare_outputs(
+        q,
+        new_kv,
+        self.kv_lens,
+        cu_q_lens,
+        jnp.array([n, 2 * n, self.batch_size], jnp.int32),
+        non_causal_block=non_causal_block,
+        chunk_prefill_size=verify_q_len,
     )
 
 

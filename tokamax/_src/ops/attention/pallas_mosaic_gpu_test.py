@@ -86,7 +86,8 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
 
     atol = kwargs.get("atol", 0.0)
     kwargs["atol"] = max(atol, 0.0045)
-    kwargs["atol_grads"] = None if bias is None else 0.02
+    atol_grads = kwargs.get("atol_grads", 0.0) or 0.0
+    kwargs["atol_grads"] = None if bias is None else max(atol_grads, 0.02)
 
     if not impl_kwargs.get("normalize_output", True):
       kwargs["test_vjp"] = False
@@ -194,6 +195,25 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         impl = type(self._attention_fn)(config)
         self._run_test_with_inputs(q, k, v, impl=impl)
 
+  def test_vjp_autotune_configs_smem_filtering(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    assert isinstance(self._attention_fn, base.DotProductAttention)
+    assert hasattr(self._attention_fn, "vjp")
+    attn_fn = self._attention_fn
+    vjp_fn = cast(fa_vjp.PallasMosaicGpuFlashAttentionVjp, attn_fn.vjp)
+    q = jax.ShapeDtypeStruct((2, 256, 4, 256), jnp.bfloat16)
+    ba = attn_fn.bind(q, q, q)
+    vjp_ba = vjp_fn.bind(**ba.vjp_arg_spec)
+    configs = vjp_fn._get_autotuning_configs(vjp_ba)
+    self.assertNotEmpty(configs)
+    if gpu_utils.is_sm100():
+      for cfg in configs:
+        self.assertEqual(cfg.num_stages, 1)
+    else:
+      for cfg in configs:
+        self.assertLessEqual(cfg.num_stages, 2)
+
   def test_vjp_autotune_configs(self):
     self.skipTest("TODO: Disable due to OOMs.")
     if not self._supports_vjp:
@@ -235,6 +255,131 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def _test_small_sequences(self, seq_q, seq_kv):
     with test_base.override_test_args(atol=0.02, atol_grads=0.04):
       super()._test_small_sequences(seq_q, seq_kv)
+
+  def test_unaligned_seq_kv_bias_and_mask_vjp(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    self._run_test(
+        q_shape=(2, 129, 4, 64),
+        kv_shape=(2, 129, 4, 64),
+        bias_shape=(2, 4, 129, 129),
+        mask_shape=(2, 4, 129, 129),
+        dtype=jnp.bfloat16,
+        atol=0.02,
+        atol_grads=0.04,
+        expect_supported=self._supports_bias and self._supports_mask,
+    )
+
+  def test_unaligned_seq_q_vjp(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    self._run_test(
+        q_shape=(2, 63, 4, 64),
+        kv_shape=(2, 128, 4, 64),
+        dtype=jnp.bfloat16,
+        atol=0.02,
+        atol_grads=0.04,
+    )
+    self._run_test(
+        q_shape=(2, 36, 4, 64),
+        kv_shape=(2, 128, 4, 64),
+        bias_shape=(2, 4, 36, 1),
+        dtype=jnp.bfloat16,
+        atol=0.02,
+        atol_grads=0.04,
+        expect_supported=self._supports_bias,
+    )
+
+  def test_unaligned_fp16_and_fully_masked_vjp(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    for seq_q in (16, 48, 72):
+      self._run_test(
+          q_shape=(1, seq_q, 4, 64),
+          kv_shape=(1, 65, 4, 64),
+          dtype=jnp.float16,
+          atol=0.02,
+          atol_grads=0.04,
+      )
+
+  def test_gqa_bcast_bias_and_mask_vjp(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    self._run_test(
+        q_shape=(1, 128, 8, 64),
+        kv_shape=(1, 128, 2, 64),
+        bias_shape=(1, 8, 128, 1),
+        mask_shape=(1, 8, 1, 128),
+        dtype=jnp.bfloat16,
+        ref_impl=base.DotProductAttention(),
+        atol=0.02,
+        atol_grads=0.04,
+        expect_supported=self._supports_bias and self._supports_mask,
+    )
+    self._run_test(
+        q_shape=(1, 128, 8, 64),
+        kv_shape=(1, 128, 2, 64),
+        mask_shape=(1, 1, 1, 1),
+        dtype=jnp.bfloat16,
+        ref_impl=base.DotProductAttention(),
+        atol=0.02,
+        atol_grads=0.04,
+        expect_supported=self._supports_mask,
+    )
+
+  def test_causal_bias_and_cross_attention_vjp(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    with test_base.override_test_args(atol=0.02, atol_grads=0.04):
+      self._run_test(
+          q_shape=(1, 256, 4, 64),
+          kv_shape=(1, 256, 4, 64),
+          bias_shape=(1, 4, 256, 256),
+          is_causal=True,
+          dtype=jnp.bfloat16,
+          ref_impl=base.DotProductAttention(),
+          expect_supported=self._supports_bias and self._supports_is_causal,
+      )
+      self._run_test(
+          q_shape=(1, 128, 4, 64),
+          kv_shape=(1, 256, 4, 64),
+          is_causal=True,
+          dtype=jnp.bfloat16,
+          ref_impl=base.DotProductAttention(),
+          expect_supported=self._supports_is_causal,
+      )
+
+  def test_head_dim_256_vjp(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    for seq_len in (64, 256):
+      for is_causal in (False, True):
+        self._run_test(
+            q_shape=(1, seq_len, 4, 256),
+            kv_shape=(1, seq_len, 4, 256),
+            dtype=jnp.bfloat16,
+            is_causal=is_causal,
+            ref_impl=base.DotProductAttention(),
+            atol=0.02,
+            atol_grads=0.04,
+        )
+
+  def test_fp32_inputs_vjp_grad_dtypes(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    q = jnp.ones((1, 128, 4, 64), dtype=jnp.float32)
+    k = jnp.ones((1, 128, 4, 64), dtype=jnp.float32)
+    v = jnp.ones((1, 128, 4, 64), dtype=jnp.float32)
+    fn = functools.partial(
+        self._attention_fn,
+        precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+    )
+    out, vjp_fn = jax.vjp(fn, q, k, v)
+    dq, dk, dv = vjp_fn(jnp.ones_like(out))
+    self.assertEqual(out.dtype, jnp.float32)
+    self.assertEqual(dq.dtype, jnp.float32)
+    self.assertEqual(dk.dtype, jnp.float32)
+    self.assertEqual(dv.dtype, jnp.float32)
 
   @override
   def _test_vmap(self, vmap_in_axes):
