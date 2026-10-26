@@ -212,3 +212,18 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
         max_num_segments=max_num_segments,
     )
     return output, None
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    query, _, value, _, _ = ba.args
+    h, b, t, _ = query.shape
+    v = value.shape[-1]
+    out = jax.core.ShapedArray((h, b, t, v), query.dtype)
+    if ba.kwargs["output_final_state"]:
+      n = ba.kwargs["max_num_segments"]
+      k = query.shape[-1]
+      state = jax.core.ShapedArray((b, n, h, k, v), query.dtype)
+    else:
+      state = None
+    return (out, state), None
+

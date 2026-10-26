@@ -121,7 +121,11 @@ def _run_test(
     output_mask = jnp.where(is_fully_masked, 0.0, 1.0)[..., None]
 
     def apply_output_mask(impl):
-      return lambda *args, **kwargs: impl(*args, **kwargs) * output_mask
+      def wrapped(*args, **kwargs):
+        out = impl(*args, **kwargs)
+        return out * output_mask.astype(out.dtype)
+
+      return wrapped
 
     impl = apply_output_mask(impl)
     ref_impl = apply_output_mask(ref_impl)

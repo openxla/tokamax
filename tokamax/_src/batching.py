@@ -15,17 +15,13 @@
 """Batching (a.k.a. `vmap`) utilities."""
 
 from collections.abc import Callable, Sequence
+import copy
 import functools
-import inspect
-from typing import Any
+from typing import Any, Self, override
 
 import jax
+from jax.experimental import hijax
 import jax.numpy as jnp
-import numpy as np
-from tokamax._src import utils
-
-
-_zip = functools.partial(zip, strict=True)
 
 
 def _broadcast_prefix(prefix_tree, full_tree):
@@ -155,65 +151,85 @@ def _unique_not_none_value(*args):
   return value
 
 
-def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
-  """Captures the batched arguments shapes and passes them to the function."""
+class ExpandWithVmapData(hijax.HiPrim):
+  """Primitive to make `vmap` data available when `expand`ing."""
 
-  def bind(*args, **kwargs):
-    kwargs.setdefault('batched_args', None)
-    ba = inspect.signature(fn).bind(*args, **kwargs)
-    ba.apply_defaults()
-    ba.arguments.pop('batched_args')
-    return ba
+  vmap_data: tuple[tuple[Any, Any], ...] = ()
 
-  @functools.wraps(fn)
-  def wrapped(*args, batched_args=None, **kwargs):
-    ba = bind(*args, batched_args=batched_args, **kwargs)
-    args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
-    is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
-    arrays, other, merge = utils.split_merge(is_array, args_flat)
+  @override
+  def expand(self, *args):
+    fn = functools.partial(self.expand_with_vmap_data, self.vmap_data)
+    for axis_data, in_dims in reversed(self.vmap_data):
+      out_dim = self.batch_dim_rule(axis_data, in_dims)
+      fn = hijax.vmap_rule(axis_data, fn, in_dims, out_dim)
+    return fn(*map(jnp.asarray, args))
 
-    if batched_args is None:
-      shapes = [BatchedShapeDtype(a.shape, a.dtype, ()) for a in arrays]
-    else:
-      bargs_bkwargs = (batched_args.args, batched_args.kwargs)
-      bargs_flat = args_tree.flatten_up_to(bargs_bkwargs)
-      shapes = [s for s, a in _zip(bargs_flat, args_flat) if is_array(a)]
+  def expand_with_vmap_data(self, vmap_data, *args):
+    """Expand the primitive with the given vmap data (axis data and dims)."""
+    raise NotImplementedError(
+        f'subclass {type(self)} must implement `expand_with_vmap_data`'
+    )
 
-    fn_flat_sig = inspect.Signature.from_callable(lambda *arrays: None)
-    batched_args = fn_flat_sig.bind(*shapes)
+  @override
+  def vjp_bwd_retval(self, res, outgrad):
+    fn = functools.partial(self.vjp_bwd_retval_with_vmap_data, self.vmap_data)
+    for axis_data, in_dims in reversed(self.vmap_data):
+      res_dim = self.res_batch_dim_rule(axis_data, in_dims)
+      out_dim = self.batch_dim_rule(axis_data, in_dims)
+      fn = hijax.vmap_rule(
+          axis_data, fn, (res_dim, out_dim), in_dims, sum_match=True
+      )
+    return fn(jax.tree.map(jnp.asarray, res), outgrad)
 
-    def fn_flat(*arrays, batched_args=batched_args):
-      args, kwargs = args_tree.unflatten(merge(arrays, other))
-      bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
-      return fn(*args, batched_args=bind(*bargs, **bkwargs), **kwargs)
+  def vjp_bwd_retval_with_vmap_data(self, vmap_data, res, outgrad):
+    raise NotImplementedError(
+        f'subclass {type(self)} must implement `vjp_bwd_retval` or'
+        ' `vjp_bwd_retval_with_vmap_data`'
+    )
 
-    def vmap_rule(axis_size, in_batched, *args):
-      in_axes = [0 if b else None for b in in_batched]
-      new_shapes = []
-      for arg, axis, shape in _zip(args, in_axes, shapes):
-        new_vmap_axis = None if axis is None else (axis, axis_size)
-        new_vmap_axes = (new_vmap_axis, *shape.vmap_axes)
-        new_shape = BatchedShapeDtype(shape.shape, shape.dtype, new_vmap_axes)
-        assert (arg.shape, arg.dtype) == (new_shape.vmap_shape, new_shape.dtype)
-        new_shapes.append(new_shape)
+  @override
+  def batch(self, axis_data, args, dims):
+    prim, out_dim = self.batch_prim(axis_data, dims)
+    return prim(*args), out_dim
 
-      @capture_batched_args
-      def vmap_fn_flat(*arrays, batched_args):
-        fn_flat_closed = functools.partial(fn_flat, batched_args=batched_args)
-        return jax.vmap(fn_flat_closed, in_axes=in_axes)(*arrays)
+  def batch_prim(self, axis_data, in_dims) -> tuple[Self, Any]:
+    out_dim = self.batch_dim_rule(axis_data, in_dims)
+    prim = copy.copy(self)
+    prim.in_avals = hijax.unmap_avals(axis_data, self.in_avals, in_dims)
+    prim.out_aval = hijax.unmap_avals(axis_data, self.out_aval, out_dim)
+    prim.vmap_data = ((axis_data, in_dims), *self.vmap_data)
+    prim.params = dict(self.params, vmap_data=prim.vmap_data)
+    super(ExpandWithVmapData, prim).__init__()
+    return prim, out_dim
 
-      out = vmap_fn_flat(*args, batched_args=fn_flat_sig.bind(*new_shapes))
-      return out, jax.tree.map(lambda _: True, out)
+  def batch_dim_rule(self, axis_data, dims):
+    raise NotImplementedError(
+        f'for vmap support, subclass {type(self)} must implement `batch` or'
+        ' `batch_dim_rule`'
+    )
 
-    fn_vmap = jax.custom_batching.custom_vmap(fn_flat)
-    fn_vmap.def_vmap(vmap_rule)
-    return fn_vmap(*arrays)
+  def res_batch_dim_rule(self, axis_data, dims):
+    raise NotImplementedError(
+        f'for vmap + vjp support, subclass {type(self)} must implement'
+        ' `vjp_bwd_retval` or `res_batch_dim_rule`'
+    )
 
-  orig_sig = inspect.signature(fn)
-  params = orig_sig.parameters.copy()
-  params['batched_args'] = params['batched_args'].replace(
-      kind=inspect.Parameter.KEYWORD_ONLY, default=None
-  )
-  sig = orig_sig.replace(parameters=tuple(params.values()))
-  setattr(wrapped, '__signature__', sig)
-  return wrapped
+
+# TODO: Remove this once fixed in JAX (`_shard_map_to_lojax` omits
+# `in_specs` for `consts` separated from `lo_jaxpr_`).
+_orig_shard_map_to_lojax = jax._src.shard_map.shard_map_p.to_lojax  # pylint: disable=protected-access
+
+
+def _shard_map_to_lojax(*args, **kwargs):
+  out = _orig_shard_map_to_lojax(*args, **kwargs)
+  eqn = jax._src.core.trace_ctx.trace.frame.tracing_eqns[-1]  # pylint: disable=protected-access
+  in_specs = eqn.params['in_specs']
+  if num_consts := (len(eqn.invars) - len(in_specs)):
+    const_specs = tuple(
+        jax._src.shard_map._repspec(t.aval) for t in eqn.invars[:num_consts]  # pylint: disable=protected-access
+    )
+    eqn.params['in_specs'] = (*const_specs, *in_specs)
+  return out
+
+
+jax._src.shard_map.shard_map_p.to_lojax = _shard_map_to_lojax  # pylint: disable=protected-access

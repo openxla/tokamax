@@ -149,6 +149,105 @@ class OpTest(parameterized.TestCase):
       out = _DeviceRestrictedOp()(x, y)
     self.assertTrue(jnp.array_equal(out, x + y))
 
+  def test_vmap_vjp_and_remat(self):
+    seen_vmap_axis_sizes = []
+
+    class _TrackedVjpOp(_FakeOp):
+      def _fwd(  # pyrefly: ignore[bad-override]
+          self,
+          res: tuple[jax.Array, jax.Array],
+          out: jax.Array,
+          dout: jax.Array,
+          x: jax.Array,
+          y: jax.Array,
+          *,
+          return_residuals: bool = False,
+          config=None,
+      ):
+        return (dout, dout), None
+
+      def _get_heuristics_config(self, ba: op_lib.BoundArguments):
+        seen_vmap_axis_sizes.append(("vjp", ba.vmap_axis_sizes))
+        return _HEURISTICS_CONFIG
+
+    class _TrackedOp(_FakeOp):
+      def _fwd(  # pyrefly: ignore[bad-override]
+          self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config
+      ):
+        return (x + y, (x, y)) if return_residuals else (x + y, None)
+
+      def _get_heuristics_config(self, ba: op_lib.BoundArguments):
+        seen_vmap_axis_sizes.append(("fwd", ba.vmap_axis_sizes))
+        return _HEURISTICS_CONFIG
+
+    op = _TrackedOp(vjp=_TrackedVjpOp())
+    x = jnp.zeros((4, 2))
+    y = jnp.ones((4, 2))
+
+    # 1. Test remat
+    g_remat = jax.value_and_grad(
+        lambda x, y: jax.remat(op)(x, y).sum(), argnums=(0, 1)
+    )
+    _, (gx, gy) = g_remat(x, y)
+    self.assertTrue(jnp.array_equal(gx, jnp.ones_like(x)))
+    self.assertTrue(jnp.array_equal(gy, jnp.ones_like(y)))
+
+    # 2. Test vmap
+    seen_vmap_axis_sizes.clear()
+    f = jax.vmap(op)
+
+    # 2a. Forward
+    y_out = f(x, y)
+    self.assertEqual([s for s in seen_vmap_axis_sizes if s[1]], [("fwd", (4,))])
+
+    # 2b. VJP fwd
+    seen_vmap_axis_sizes.clear()
+    y_out, vjp_fn = jax.vjp(f, x, y)
+    self.assertEqual([s for s in seen_vmap_axis_sizes if s[1]], [("fwd", (4,))])
+
+    # 2c. VJP bwd
+    seen_vmap_axis_sizes.clear()
+    gx, gy = vjp_fn(jnp.ones_like(y_out))  # pyrefly: ignore[bad-argument-type]
+    self.assertEqual([s for s in seen_vmap_axis_sizes if s[1]], [("vjp", (4,))])
+
+    # 3. Test direct JVP when _fwd supports it
+    primals_out, tangents_out = jax.jvp(
+        op, (x, y), (jnp.ones_like(x), jnp.full_like(y, 2.0))
+    )
+    self.assertTrue(jnp.array_equal(primals_out, x + y))
+    self.assertTrue(jnp.array_equal(tangents_out, jnp.full_like(x, 3.0)))
+
+    # 4. Test fallback to fake_linear_op under remat when _fwd does NOT support JVP
+    custom_no_jvp_p = jax.extend.core.Primitive("custom_no_jvp_p")
+    custom_no_jvp_p.def_impl(lambda x: x * 2.0)
+    custom_no_jvp_p.def_abstract_eval(lambda x: x)
+
+    class _NoJvpOp(_FakeOp):
+      def _fwd(  # pyrefly: ignore[bad-override]
+          self, x: jax.Array, *, return_residuals: bool, config
+      ):
+        out = custom_no_jvp_p.bind(x)
+        return (out, x) if return_residuals else (out, None)
+
+    class _NoJvpVjpOp(_FakeOp):
+      def _fwd(  # pyrefly: ignore[bad-override]
+          self,
+          res: jax.Array,
+          out: jax.Array,
+          dout: jax.Array,
+          x: jax.Array,
+          *,
+          return_residuals: bool = False,
+          config=None,
+      ):
+        return (dout * 2.0,), None
+
+    no_jvp_op = _NoJvpOp(vjp=_NoJvpVjpOp())
+    g_remat_fallback = jax.grad(lambda x: jax.remat(no_jvp_op)(x).sum())
+    self.assertTrue(jnp.array_equal(g_remat_fallback(x), jnp.full_like(x, 2.0)))
+
+
+
 
 class BoundArgumentsTest(parameterized.TestCase):
 

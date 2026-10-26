@@ -77,6 +77,9 @@ class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
   def _get_heuristics_config(self, ba: op_lib.BoundArguments) -> _FakeOpConfig:
     return _HEURISTICS_CONFIG
 
+  def _abstract_eval(self, ba: op_lib.BoundArguments) -> Any:
+    return ba.args[0], None
+
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
   assert triton_norm is not None
@@ -459,6 +462,10 @@ class AutotuningTest(parameterized.TestCase):
       ) -> set[_FakeOpConfig]:
         del ba  # Unused.
         return set([_FakeOpConfig(42), _FakeOpConfig(43)])
+
+      @override
+      def _abstract_eval(self, ba: op_lib.BoundArguments) -> Any:
+        return ba.args[0], None
 
     op = _FakeErrorOp()
     ba = op.bind(jax.ShapeDtypeStruct((17, 23), jnp.float32))

@@ -69,3 +69,9 @@ class RaggedGather[C](op.Op[Any, jax.Array, None, C, Any]):
         ragged_gather(x, indices, start, end),
         None,
     )
+
+  @override
+  def _abstract_eval(self, ba: op.BoundArguments) -> Any:
+    x, indices, _, _ = ba.args
+    out = jax.core.ShapedArray((indices.shape[0], x.shape[1]), x.dtype)
+    return out, None
