@@ -150,33 +150,12 @@ def test_forward_and_existing_vjp(dtype, packed, rematerialize):
       tolerance=0.05 if dtype == jnp.bfloat16 else 0.002,
   )
 
-  # Match the existing KDA suite's gradient comparison domain: valid tokens
-  # and occupied state slots. This does not validate padding/empty-slot
-  # gradient semantics. Parameter gradients must remain finite in full.
-  actual_grads, expected_grads = results[1][2], results[0][2]
-  for index, (actual, expected) in enumerate(
-      zip(actual_grads[:6], expected_grads[:6], strict=True)
-  ):
-    if packed:
-      if index == 5:
-        actual, expected = actual[:, :2], expected[:, :2]
-      else:
-        actual, expected = actual[:, :, :96], expected[:, :, :96]
-    _assert_close(actual, expected, tolerance=tolerance)
-  if packed and jax.default_backend() == "cpu":
-    # CPU interpretation initializes unwritten backward buffers to NaN.
-    # The unchanged raw-gate backward reduces these padding values into
-    # a_log/bias gradients in both paths. Keep this visible until validated
-    # on TPU; do not treat matching NaNs as a correctness pass.
-    baseline_parameters = jax.tree.leaves(expected_grads[6:])
-    if any(
-        not np.isfinite(np.asarray(x, np.float32)).all()
-        for x in baseline_parameters
-    ):
-      pytest.xfail(
-          "Staged CPU packed raw-gate backward has non-finite parameter gradients"
-      )
-  _assert_close(actual_grads[6:], expected_grads[6:], tolerance=tolerance)
+  _assert_close(results[1][2], results[0][2], tolerance=tolerance)
+  if packed:
+    for gradients in (results[0][2], results[1][2]):
+      for gradient in gradients[:5]:
+        np.testing.assert_array_equal(np.asarray(gradient[:, :, 96:]), 0)
+      np.testing.assert_allclose(np.asarray(gradients[5][:, 2]), 0.1)
 
 
 @pytest.mark.parametrize("rematerialize", [False, True])

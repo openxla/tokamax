@@ -1819,6 +1819,25 @@ def chunk_kda_bwd_custom(
     max_num_segments=max_num_segments,
   )
 
+  # Padding chunks need not write their backward output buffers. Clear those
+  # lanes before gate-parameter reductions, rather than reducing uninitialized
+  # values or multiplying a raw-gate -inf sentinel by a zero cotangent.
+  if segment_ids is not None:
+    valid = segment_ids[None, :, :] != 0
+    dq = jnp.where(valid[..., None], dq, 0)
+    dk = jnp.where(valid[..., None], dk, 0)
+    dv = jnp.where(valid[..., None], dv, 0)
+    dg = jnp.where(valid[..., None], dg, 0)
+    db = jnp.where(valid, db, 0)
+    if g_org is not None:
+      g_org = jnp.where(valid[..., None], g_org, 0)
+
+  # Empty sequences preserve their initial state, so their initial-state
+  # gradient is exactly the final-state cotangent (zero when not requested).
+  if dh0 is not None and cu_seqlens is not None:
+    empty = (jnp.diff(cu_seqlens, axis=-1) == 0)[..., None, None, None]
+    dh0 = jnp.where(empty, 0 if dht_m4 is None else dht_m4, dh0)
+
   dA, dbias = None, None
   if use_gate_in_kernel:
     assert g_org is not None and a_log is not None
