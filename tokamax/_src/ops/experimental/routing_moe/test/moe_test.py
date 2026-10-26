@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import functools
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -23,9 +21,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src import test_utils
-from tokamax._src.ops.experimental.routing_moe.layer import monolithic
-from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan
-from tokamax._src.ops.experimental.routing_moe.test import reference
+from tokamax._src.ops.experimental.routing_moe.test import moe_test_helper
 
 P = sharding.PartitionSpec
 NamedSharding = sharding.NamedSharding
@@ -70,6 +66,7 @@ def gen_moe_inputs(
     active_expert_ratio: float = 1.0,
     seed: int = 1234,
     has_bias: bool = False,
+    has_shared_expert: bool = False,
 ):
   key = jax.random.key(seed)
 
@@ -99,6 +96,22 @@ def gen_moe_inputs(
   else:
     b1 = b2 = None
 
+  if has_shared_expert:
+    k1, k2, k3 = jax.random.split(key, 3)
+    w1_shared = (
+        jax.random.normal(
+            k1, (1, hidden_size, 2 * intermediate_size), dtype=dtype
+        )
+        / 10
+    )
+    w2_shared = (
+        jax.random.normal(k2, (1, intermediate_size, hidden_size), dtype=dtype)
+        / 10
+    )
+    w_shared_gate = jax.random.normal(k3, (hidden_size, 1), dtype=dtype) / 10
+  else:
+    w1_shared = w2_shared = w_shared_gate = None
+
   gating_output = jax.random.uniform(
       key,
       (num_tokens, num_experts),
@@ -115,7 +128,17 @@ def gen_moe_inputs(
   mask = active_experts >= threshold
   gating_output = jnp.where(mask, gating_output, 0.0)
 
-  return a, w1, w2, b1, b2, gating_output
+  return (
+      a,
+      w1,
+      w2,
+      b1,
+      b2,
+      gating_output,
+      w1_shared,
+      w2_shared,
+      w_shared_gate,
+  )
 
 
 def sub_channel_quantize(x: jax.Array, quant_dtype: jnp.dtype, wsz: int = 256):
@@ -172,6 +195,8 @@ class MoEKernelTest(parameterized.TestCase):
       w_dtype: jnp.dtype | None = None,
       subc_quant_wsz: int | None = None,
       has_bias: bool = False,
+      has_shared_expert: bool = False,
+      fold_shared_expert: bool = False,
       use_ep: bool = False,
       use_sp: bool = False,
       atol: float | None = None,
@@ -181,6 +206,8 @@ class MoEKernelTest(parameterized.TestCase):
       remote_scatter: bool = False,
       reduce_output: bool = True,
   ):
+    if fold_shared_expert:
+      assert has_shared_expert and not use_ep
     if num_cores is None:
       num_cores = len(self.mesh_devices)
     mesh = Mesh(
@@ -197,7 +224,17 @@ class MoEKernelTest(parameterized.TestCase):
       aligned *= num_cores
     intermediate_size = aligned
 
-    a, w1, w2, b1, b2, gating_output = gen_moe_inputs(
+    (
+        a,
+        w1,
+        w2,
+        b1,
+        b2,
+        gating_output,
+        w1_shared,
+        w2_shared,
+        w_shared_gate,
+    ) = gen_moe_inputs(
         dtype,
         num_experts,
         hidden_size,
@@ -205,10 +242,16 @@ class MoEKernelTest(parameterized.TestCase):
         num_tokens,
         seed=seed,
         has_bias=has_bias,
+        has_shared_expert=has_shared_expert,
         active_expert_ratio=active_expert_ratio,
     )
 
     # Pre-process weights.
+    if fold_shared_expert:
+      w1 = jnp.concatenate([w1, w1_shared], axis=0)
+      w2 = jnp.concatenate([w2, w2_shared], axis=0)
+      w1_shared = w2_shared = None
+
     n_shards = mesh.shape["model"]
     if not use_ep:
       w1 = reorder_concatenated_tensor_for_sharding(
@@ -218,19 +261,30 @@ class MoEKernelTest(parameterized.TestCase):
         b1 = reorder_concatenated_tensor_for_sharding(
             b1, [intermediate_size, intermediate_size], n_shards, 2
         )
+    if w1_shared is not None:
+      w1_shared = reorder_concatenated_tensor_for_sharding(
+          w1_shared, [intermediate_size, intermediate_size], n_shards, 2
+      )
 
     # Quantize weights.
     w1_scale = w2_scale = None
+    w1_shared_scale = w2_shared_scale = None
     if w_dtype is not None:
-      if subc_quant_wsz is None:
-        w1, w1_scale = sub_channel_quantize(w1, w_dtype, w1.shape[1])
-        w2, w2_scale = sub_channel_quantize(w2, w_dtype, w2.shape[1])
-      else:
-        w1, w1_scale = sub_channel_quantize(w1, w_dtype, subc_quant_wsz)
-        w2, w2_scale = sub_channel_quantize(w2, w_dtype, subc_quant_wsz)
-
+      wsz1 = w1.shape[1] if subc_quant_wsz is None else subc_quant_wsz
+      wsz2 = w2.shape[1] if subc_quant_wsz is None else subc_quant_wsz
+      w1, w1_scale = sub_channel_quantize(w1, w_dtype, wsz1)
+      w2, w2_scale = sub_channel_quantize(w2, w_dtype, wsz2)
       w1_scale = jnp.expand_dims(w1_scale, axis=2)
       w2_scale = jnp.expand_dims(w2_scale, axis=2)
+      if w1_shared is not None:
+        w1_shared, w1_shared_scale = sub_channel_quantize(
+            w1_shared, w_dtype, wsz1
+        )
+        w2_shared, w2_shared_scale = sub_channel_quantize(
+            w2_shared, w_dtype, wsz2
+        )
+        w1_shared_scale = jnp.expand_dims(w1_shared_scale, axis=2)
+        w2_shared_scale = jnp.expand_dims(w2_shared_scale, axis=2)
 
     # Shard weights.
     if use_sp:
@@ -240,6 +294,11 @@ class MoEKernelTest(parameterized.TestCase):
 
     a = jax.device_put(a, in_sharding)
     gating_output = jax.device_put(gating_output, in_sharding)
+
+    tp_w1_sharding = NamedSharding(mesh, P(None, None, "model"))
+    tp_w2_sharding = NamedSharding(mesh, P(None, "model", None))
+    tp_w1_scale_sharding = NamedSharding(mesh, P(None, None, None, "model"))
+    replicated_sharding = NamedSharding(mesh, P(None, None))
 
     if use_ep:
       ep_sharding = NamedSharding(mesh, P("model"))
@@ -253,71 +312,77 @@ class MoEKernelTest(parameterized.TestCase):
         b1 = jax.device_put(b1, ep_sharding)
         b2 = jax.device_put(b2, ep_sharding)
     else:
-      w1 = jax.device_put(w1, NamedSharding(mesh, P(None, None, "model")))
-      w2 = jax.device_put(w2, NamedSharding(mesh, P(None, "model", None)))
+      w1 = jax.device_put(w1, tp_w1_sharding)
+      w2 = jax.device_put(w2, tp_w2_sharding)
       if w_dtype is not None:
-        w1_scale = jax.device_put(
-            w1_scale, NamedSharding(mesh, P(None, None, None, "model"))
-        )
-        w2_scale = jax.device_put(
-            w2_scale,
-            NamedSharding(mesh, P(None, None))
+        tp_w2_scale_sharding = (
+            replicated_sharding
             if w2_scale.shape[1] == 1
-            else NamedSharding(mesh, P(None, "model")),
+            else NamedSharding(mesh, P(None, "model"))
         )
+        w1_scale = jax.device_put(w1_scale, tp_w1_scale_sharding)
+        w2_scale = jax.device_put(w2_scale, tp_w2_scale_sharding)
       if has_bias:
-        b1 = jax.device_put(b1, NamedSharding(mesh, P(None, None, "model")))
-        b2 = jax.device_put(b2, NamedSharding(mesh, P(None, None)))
+        b1 = jax.device_put(b1, tp_w1_sharding)
+        b2 = jax.device_put(b2, replicated_sharding)
 
-    ep_axis = tp_axis = None
-    if use_ep:
-      ep_axis = "model"
-    else:
-      tp_axis = "model"
+    if has_shared_expert:
+      w_shared_gate = jax.device_put(w_shared_gate, replicated_sharding)
+      if w1_shared is not None:
+        w1_shared = jax.device_put(w1_shared, tp_w1_sharding)
+        w2_shared = jax.device_put(w2_shared, tp_w2_sharding)
+        if w_dtype is not None:
+          w1_shared_scale = jax.device_put(
+              w1_shared_scale, tp_w1_scale_sharding
+          )
+          w2_shared_scale = jax.device_put(w2_shared_scale, replicated_sharding)
 
-    expected = reference.reference_moe(
-        a,
-        w1,
-        w2,
+    ep_axis = "model" if use_ep else None
+    tp_axis = None if use_ep else "model"
+    common_kwargs = dict(
+        w1=w1,
+        w2=w2,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_bias=b1,
         w2_bias=b2,
-        activation=act_fn,
-        gating_output=gating_output,
+        w1_shared=w1_shared,
+        w2_shared=w2_shared,
+        w1_shared_scale=w1_shared_scale,
+        w2_shared_scale=w2_shared_scale,
+        w_shared_gate=w_shared_gate,
         topk=top_k,
         renormalize=renormalize_topk_logits,
         mesh=mesh,
-        ep_axis=ep_axis,
-        tp_axis=tp_axis,
-        use_sp=use_sp,
-        reduce_output=reduce_output,
+        activation=act_fn,
         scoring_fn="softmax",
+        tp_axis=tp_axis,
+        ep_axis=ep_axis,
+        use_sp=use_sp,
+        fold_shared_expert=fold_shared_expert,
     )
+    jax.block_until_ready((a, gating_output, common_kwargs))
 
-    actual = monolithic.gated_routing_moe(
+    expected = moe_test_helper.run_moe(
         a,
         gating_output,
-        w1,
-        w2,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        w1_bias=b1,
-        w2_bias=b2,
-        activation=act_fn,
-        topk=top_k,
-        renormalize=renormalize_topk_logits,
-        mesh=mesh,
-        ep_axis=ep_axis,
-        tp_axis=tp_axis,
-        use_sp=use_sp,
+        remote_scatter=False,
+        reduce_output=False,
+        use_reference=True,
+        **common_kwargs,
+    )
+    actual = moe_test_helper.run_moe(
+        a,
+        gating_output,
+        remote_scatter=remote_scatter,
+        use_reference=False,
         reduce_output=reduce_output,
-        moe_plan=moe_plan.RoutingMoEPlan(remote_scatter=remote_scatter),
-        scoring_fn="softmax",
+        **common_kwargs,
     )
 
     expected.block_until_ready()
     actual.block_until_ready()
+
     del capture_xprof
 
     if atol is None:
@@ -372,6 +437,30 @@ class MoEKernelTest(parameterized.TestCase):
         num_tokens=8 * 32,
         seed=1234,
         renormalize_topk_logits=True,
+        use_ep=use_ep,
+        use_sp=use_sp,
+        reduce_output=False,
+    )
+
+  @parameterized.product(
+      use_ep=[True, False],
+      use_sp=[True, False],
+      fold_shared_expert=[False, True],
+  )
+  def test_shared_expert(self, use_ep, use_sp, fold_shared_expert):
+    if use_ep and fold_shared_expert:
+      self.skipTest("fold_shared_expert is only supported under TP.")
+    self._test_moe(
+        dtype=jnp.bfloat16,
+        top_k=8,
+        num_experts=128,
+        hidden_size=1024,
+        intermediate_size=1024,
+        num_tokens=8 * 32,
+        seed=1234,
+        renormalize_topk_logits=True,
+        has_shared_expert=True,
+        fold_shared_expert=fold_shared_expert,
         use_ep=use_ep,
         use_sp=use_sp,
         reduce_output=False,
@@ -651,11 +740,12 @@ class MoEKernelTest(parameterized.TestCase):
     )
 
   @parameterized.product(
-      num_tokens=[64, 128, 256, 512, 8192],
+      num_tokens=[8, 32, 256, 8192],
       w_dtype=[jnp.float8_e4m3fn],
       block_size=[None],
       use_ep=[True, False],
       use_sp=[True, False],
+      remote_scatter=[True, False],
       active_expert_ratio=[1.0],
   )
   def test_benchmark_qwen_35_397b(
@@ -666,6 +756,7 @@ class MoEKernelTest(parameterized.TestCase):
       use_ep,
       use_sp,
       active_expert_ratio,
+      remote_scatter,
   ):
     # When TP is used, sharded dimension size is less than lane_size * packing.
     # But this is ok, since this model runs fused up-and-down gmms, in this
@@ -674,6 +765,9 @@ class MoEKernelTest(parameterized.TestCase):
 
     if len(self.mesh_devices) < 8:
       self.skipTest("Skipping due to insufficient number of chips.")
+    if not use_ep and remote_scatter:
+      self.skipTest("Not a valid config.")
+
     num_experts = 512
     top_k = 10
 
@@ -682,6 +776,12 @@ class MoEKernelTest(parameterized.TestCase):
       subc_quant_wsz = block_size
     hidden_size = 4096
     intermediate_size = 1024
+
+    reduce_output = False
+    if remote_scatter:
+      reduce_output = True
+
+    print(f"kky {reduce_output=} {remote_scatter=}")
 
     dtype = jnp.bfloat16
 
@@ -698,9 +798,13 @@ class MoEKernelTest(parameterized.TestCase):
         renormalize_topk_logits=renormalize_topk_logits,
         subc_quant_wsz=subc_quant_wsz,
         w_dtype=w_dtype,
+        has_shared_expert=True,
+        fold_shared_expert=not use_ep,
         use_ep=use_ep,
         use_sp=use_sp,
+        reduce_output=reduce_output,
         active_expert_ratio=active_expert_ratio,
+        remote_scatter=remote_scatter,
         act_fn="silu",
         num_cores=8,
         capture_xprof=True,
