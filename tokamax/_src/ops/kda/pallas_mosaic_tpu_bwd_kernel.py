@@ -54,6 +54,12 @@ from tokamax._src.ops.kda.utils import (
 )
 
 
+def _storage_boundary(value, dtype):
+  """Keep staged materialization boundaries in the fused interpreter."""
+  value = value.astype(dtype)
+  return jax.lax.optimization_barrier(value) if get_interpret() else value
+
+
 # =============================================================================
 # Context-parallel backward pre-process
 # =============================================================================
@@ -540,6 +546,8 @@ def _recompute_w_u_fwd(q, k, v, beta, A, gk, chunk_size):
   ).astype(k.dtype)
   qg = (q_chunks * g_exp).astype(q.dtype)
   kg = (k_chunks * jnp.exp2(g_chunks[:, -1:, :] - g_chunks)).astype(k.dtype)
+  if get_interpret():
+    u, w, qg, kg = jax.lax.optimization_barrier((u, w, qg, kg))
 
   return (
       w.reshape(H, B, T, K),
@@ -580,7 +588,7 @@ def _rematerialize_states_kernel(
       )
 
   state = state_ref[...]
-  h_ref[:, 0, 0] = state.astype(h_ref.dtype)
+  h_ref[:, 0, 0] = _storage_boundary(state, h_ref.dtype)
   w, u, _, kg = _recompute_w_u_fwd(
       q_ref[...],
       k_ref[...],
@@ -597,7 +605,9 @@ def _rematerialize_states_kernel(
       precision=jax.lax.Precision.HIGHEST,
       preferred_element_type=jnp.float32,
   )
-  v_new_ref[:, 0] = jnp.where(valid, v_new, 0)
+  v_new_ref[:, 0] = _storage_boundary(
+      jnp.where(valid, v_new, 0), v_new_ref.dtype
+  )
   gate_last = g_ref[:, 0, -1].astype(jnp.float32)
   state = state * exp2(gate_last)[:, :, None] + jnp.matmul(
       kg.astype(jnp.float32).transpose(0, 2, 1),
@@ -817,10 +827,10 @@ def _fused_recompute_w_u_vnew_from_h_kernel(
 
   u, w, v_new, qg, kg = compute_m1_recompute(q, k, v, beta, A, g, h, k_ref.dtype)
 
-  w_ref[:] = w.astype(w_ref.dtype)
-  qg_ref[:] = qg.astype(qg_ref.dtype)
-  kg_ref[:] = kg.astype(kg_ref.dtype)
-  v_new_ref[:] = v_new.astype(v_new_ref.dtype)
+  w_ref[:] = _storage_boundary(w, w_ref.dtype)
+  qg_ref[:] = _storage_boundary(qg, qg_ref.dtype)
+  kg_ref[:] = _storage_boundary(kg, kg_ref.dtype)
+  v_new_ref[:] = _storage_boundary(v_new, v_new_ref.dtype)
 
 
 @partial(jax.jit, static_argnames=["chunk_size", "mini_batch"])
@@ -1301,10 +1311,14 @@ def _saved_state_backward_kernel(
         precision=precision,
         preferred_element_type=jnp.float32,
     )
-    w_ref[:, 0, 0] = w.astype(w_ref.dtype)
-    qg_ref[:, 0, 0] = (q * gate_exp).astype(qg_ref.dtype)
-    kg_ref[:, 0, 0] = (k * jnp.exp2(g[:, -1:] - g)).astype(kg_ref.dtype)
-    v_new_ref[...] = rematerialized_v_new_ref[...]
+    w_ref[:, 0, 0] = _storage_boundary(w, w_ref.dtype)
+    qg_ref[:, 0, 0] = _storage_boundary(q * gate_exp, qg_ref.dtype)
+    kg_ref[:, 0, 0] = _storage_boundary(
+        k * jnp.exp2(g[:, -1:] - g), kg_ref.dtype
+    )
+    v_new_ref[...] = _storage_boundary(
+        rematerialized_v_new_ref[...], v_new_ref.dtype
+    )
   else:
     # Load beta before dropping its trailing singleton dimension. Passing a
     # squeezed Ref view is illegal for the nested tiled VMEM layout.
@@ -1754,8 +1768,8 @@ def _chunk_kda_bwd_dAv_kernel(
   # Apply causal mask and scale
   b_dA = jnp.where(m_causal[None, :, :], b_dA * scale, 0.0)
 
-  dA_ref[:] = b_dA
-  dv_ref[:] = b_dv.astype(do_ref.dtype)
+  dA_ref[:] = _storage_boundary(b_dA, dA_ref.dtype)
+  dv_ref[:] = _storage_boundary(b_dv, dv_ref.dtype)
 
 
 @functools.partial(

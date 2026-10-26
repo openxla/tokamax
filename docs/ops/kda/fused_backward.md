@@ -75,3 +75,13 @@ when the caller does not request it. Supplied state cotangents and requested
 initial-state gradients retain their original shapes, indexing and arithmetic.
 Validate both optional-state cases, saved/rematerialized paths, and the complete
 public forward plus VJP before accepting resource or performance claims.
+
+## Interpreter numerical boundaries
+
+The staged calls materialize recomputed WY values, corrected values, chunk
+states, and dAv outputs before the next phase. CUDA interpretation of the
+fused program must preserve these storage-dtype boundaries as well. The
+interpreter uses optimization barriers at those values, including the
+rematerialized-state path, instead of changing BF16 casts or test tolerances.
+These barriers are absent from native Mosaic execution and do not alter its
+precision policy or allocation contract.
