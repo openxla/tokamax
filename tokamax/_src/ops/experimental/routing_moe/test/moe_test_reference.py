@@ -329,31 +329,26 @@ def expert_parallel_gmm(
 
 @jax.jit(
     static_argnames=(
-        "topk",
-        "renormalize",
         "mesh",
         "ep_axis",
         "tp_axis",
         "use_sp",
         "reduce_output",
         "activation",
-        "scoring_fn",
     )
 )
 def reference_moe(
     hidden_states: jax.Array,
+    topk_weights: jax.Array,
+    topk_indices: jax.Array,
     w1: jax.Array,
     w2: jax.Array,
     w1_scale: jax.Array | None,
     w2_scale: jax.Array | None,
     w1_bias: jax.Array | None,
     w2_bias: jax.Array | None,
-    gating_output: jax.Array,
-    topk: int,
-    renormalize: bool,
     mesh: Mesh,
     activation: str,
-    scoring_fn: str,
     tp_axis: str | None,
     ep_axis: str | None,
     use_sp: bool = False,
@@ -362,44 +357,37 @@ def reference_moe(
   """Route tokens in hidden_states into each experts based on routing.
 
   Args:
-      hidden_states: [num_tokens, hidden_size]
-      w1: first moe weights [num_experts, hidden_size, intermediate_size * 2]
-      w2: second moe weights [num_experts, intermediate_size, hidden_size]
-      w1_scale: w1 scale [num_experts, num_blocks, 1, intermediate_size * 2]
-      w2_scale: w2 scale [num_experts, num_blocks, 1, hidden_size]
-      w1_bias: optional bias of w1 [num_experts, 1, intermediate_size * 2]
-      w2_bias: optional bias of w2 [num_experts, 1, hidden_size]
-      gating_output: routing information of tokens [num_tokens, num_experts]
-      topk: number of experts to choose per token.
-      renormalize: normalize gating_output.
-      mesh: mesh to perform moe.
-      activation: activation function to perform on the output of w1.
-      scoring_fn: scoring function to apply on gating_output.
-      tp_axis: tensor parallelism axis name.
-      ep_axis: expert parallelism axis name.
-      use_sp: use sequence parallelism.
+    hidden_states: [num_tokens, hidden_size]
+    topk_weights: routing weights of selected experts [num_tokens, topk]
+    topk_indices: expert indices of selected experts [num_tokens, topk]
+    w1: first moe weights [num_experts, hidden_size, intermediate_size * 2]
+    w2: second moe weights [num_experts, intermediate_size, hidden_size]
+    w1_scale: w1 scale [num_experts, num_blocks, 1, intermediate_size * 2]
+    w2_scale: w2 scale [num_experts, num_blocks, 1, hidden_size]
+    w1_bias: optional bias of w1 [num_experts, 1, intermediate_size * 2]
+    w2_bias: optional bias of w2 [num_experts, 1, hidden_size]
+    mesh: mesh to perform moe.
+    activation: activation function to perform on the output of w1.
+    tp_axis: tensor parallelism axis name.
+    ep_axis: expert parallelism axis name.
+    use_sp: use sequence parallelism.
+    reduce_output: reduce output across devices.
+    moe_plan: optional MoE layer execution plan.
+    gmm_plan: optional GMM kernel execution plan.
+    shard_idx: optional int32 [num_shards] that holds each shard's index.
 
   Returns:
-      Output of moe operation [num_tokens, hidden_size]
+    Output of moe operation. [num_tokens, hidden_size] if reduce_output=True,
+      else [num_shards * num_tokens, hidden_size].
   """
   if tp_axis is not None and ep_axis is not None:
     raise NotImplementedError("Hybrid parallelism is not yet supported.")
 
-  num_tokens, hidden_size = hidden_states.shape
+  hidden_size = hidden_states.shape[-1]
   global_num_experts, padded_hidden_size, _ = w1.shape
+  topk = topk_weights.shape[-1]
   dtype = hidden_states.dtype
 
-  assert (num_tokens * topk) % 16 == 0, (
-      "The kernel requires num_tokens * topk to be a multiple of "
-      f"16 but got {num_tokens}*{topk}={num_tokens*topk}"
-  )
-
-  assert gating_output.shape == (num_tokens, global_num_experts)
-
-  topk_weights = apply_scoring_fn(scoring_fn, gating_output)
-  topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
-  if renormalize:
-    topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
   topk_weights = topk_weights.astype(dtype)
   if use_sp:
     # Make sure topk_weights is replicated across shards before passing into
@@ -501,3 +489,61 @@ def reference_moe(
     )
 
   return x[:, :hidden_size]
+
+
+@jax.jit(
+    static_argnames=(
+        "topk",
+        "renormalize",
+        "mesh",
+        "ep_axis",
+        "tp_axis",
+        "use_sp",
+        "reduce_output",
+        "activation",
+        "scoring_fn",
+    )
+)
+def gated_reference_moe(
+    hidden_states: jax.Array,
+    gating_output: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk: int,
+    renormalize: bool,
+    mesh: Mesh,
+    activation: str,
+    scoring_fn: str,
+    tp_axis: str | None,
+    ep_axis: str | None,
+    use_sp: bool = False,
+    reduce_output: bool = True,
+) -> jax.Array:
+  """Routes tokens in hidden_states into experts based on gating logits."""
+  assert gating_output.shape == (hidden_states.shape[0], w1.shape[0])
+  topk_weights = apply_scoring_fn(scoring_fn, gating_output)
+  topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
+  if renormalize:
+    topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+
+  return reference_moe(
+      hidden_states=hidden_states,
+      topk_weights=topk_weights,
+      topk_indices=topk_indices,
+      w1=w1,
+      w2=w2,
+      w1_scale=w1_scale,
+      w2_scale=w2_scale,
+      w1_bias=w1_bias,
+      w2_bias=w2_bias,
+      mesh=mesh,
+      activation=activation,
+      tp_axis=tp_axis,
+      ep_axis=ep_axis,
+      use_sp=use_sp,
+      reduce_output=reduce_output,
+  )
