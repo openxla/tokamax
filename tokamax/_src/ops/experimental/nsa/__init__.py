@@ -15,25 +15,29 @@
 
 """Native Sparse Attention (NSA) Tokamax operators."""
 
-from tokamax._src.ops.experimental.nsa import base
-from tokamax._src.ops.experimental.nsa import pallas_mosaic_tpu
-from tokamax._src.ops.experimental.nsa import pallas_mosaic_tpu_kernel
-from tokamax._src.ops.experimental.nsa import reference
-
-Config = pallas_mosaic_tpu.Config
-NativeSparseAttention = base.NativeSparseAttention
-PallasTpuNativeSparseAttention = (
-    pallas_mosaic_tpu.PallasTpuNativeSparseAttention
+from tokamax._src.ops.experimental.nsa.api import native_sparse_attention
+from tokamax._src.ops.experimental.nsa.arg_specs import ARG_SPECS
+from tokamax._src.ops.experimental.nsa.base import (
+    NativeSparseAttention,
+    nsa_reference,
 )
+from tokamax._src.ops.experimental.nsa.pallas_mosaic_tpu import (
+    Config,
+    PallasTpuNativeSparseAttention,
+)
+from tokamax._src.ops.experimental.nsa.pallas_mosaic_tpu_kernel import (
+    nsa_pallas_fwd,
+)
+
 nsa = PallasTpuNativeSparseAttention()
-nsa_reference = reference.nsa_reference
-nsa_pallas_fwd = pallas_mosaic_tpu_kernel.nsa_pallas_fwd
 
 __all__ = [
+    "ARG_SPECS",
     "Config",
     "NativeSparseAttention",
     "PallasTpuNativeSparseAttention",
+    "native_sparse_attention",
     "nsa",
-    "nsa_reference",
     "nsa_pallas_fwd",
+    "nsa_reference",
 ]

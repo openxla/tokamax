@@ -15,8 +15,7 @@
 
 """Tokamax operator wrapper for Native Sparse Attention (NSA)."""
 
-import dataclasses
-from typing import Annotated, Any, ClassVar
+from typing import Annotated, ClassVar
 import jax
 import pydantic
 from tokamax._src.ops import op
@@ -56,11 +55,31 @@ class PallasTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
       cmp_block_size: int = 64,
       scale: float | None = None,
       config: Config | None = None,
+      return_residuals: bool = False,
   ) -> tuple[base.Output, None]:
-    resolved_chunk_size = config.chunk_size if config is not None else chunk_size
+    del return_residuals
+    resolved_chunk_size = (
+        config.chunk_size if config is not None else chunk_size
+    )
     resolved_topk = config.topk if config is not None else topk
     resolved_window = config.window if config is not None else window
-    resolved_cmp_size = config.cmp_block_size if config is not None else cmp_block_size
+    resolved_cmp_size = (
+        config.cmp_block_size if config is not None else cmp_block_size
+    )
+    if resolved_chunk_size <= 0:
+      raise NotImplementedError(
+          f"chunk_size must be positive, got {resolved_chunk_size}"
+      )
+    if resolved_topk <= 0:
+      raise NotImplementedError(f"topk must be positive, got {resolved_topk}")
+    if resolved_window <= 0:
+      raise NotImplementedError(
+          f"window must be positive, got {resolved_window}"
+      )
+    if resolved_cmp_size <= 0:
+      raise NotImplementedError(
+          f"cmp_block_size must be positive, got {resolved_cmp_size}"
+      )
 
     out, _ = pallas_mosaic_tpu_kernel.nsa_pallas_fwd(
         q,
@@ -75,13 +94,20 @@ class PallasTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
         cmp_block_size=resolved_cmp_size,
         scale=scale,
     )
-    return (out, None), None
+    return out, None
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return Config(chunk_size=256, topk=4, window=128, cmp_block_size=64)
+    return Config(
+        chunk_size=ba.arguments.get("chunk_size", 256),
+        topk=ba.arguments.get("topk", 4),
+        window=ba.arguments.get("window", 128),
+        cmp_block_size=ba.arguments.get("cmp_block_size", 64),
+    )
 
   @override
-  def supported_on(self, device: Any) -> bool:
-    return True
+  def supported_on(self, device: jax.Device) -> bool:
+    try:
+      return device.platform == "tpu"
+    except Exception:
+      return False

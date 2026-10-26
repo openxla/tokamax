@@ -17,6 +17,7 @@
 
 from tokamax.experimental.torch_tpu.ops.nsa.torch_base import (
     _NativeSparseAttention,
+    native_sparse_attention,
 )
 from tokamax.experimental.torch_tpu.ops.nsa.torch_pallas_mosaic_tpu import (
     _PallasTpuNativeSparseAttention,
@@ -30,6 +31,7 @@ flash_nsa_pallas = nsa
 __all__ = [
     "_NativeSparseAttention",
     "_PallasTpuNativeSparseAttention",
+    "native_sparse_attention",
     "nsa",
     "nsa_pallas_attention",
     "flash_nsa_pallas",

@@ -15,10 +15,12 @@
 
 """PyTorch interface for Pallas TPU Native Sparse Attention (NSA) operator."""
 
-from typing import Any, Optional
+from typing import Optional
 import jax
 import jax.numpy as jnp
+import numpy as np
 import torch
+from tokamax._src.ops.experimental.nsa import base as jax_base
 from tokamax._src.ops.experimental.nsa import pallas_mosaic_tpu as jax_pallas
 from tokamax.experimental.torch_tpu.ops.nsa import torch_base
 from typing_extensions import override
@@ -28,21 +30,110 @@ class _PallasTpuNativeSparseAttention(torch_base._NativeSparseAttention):
   """PyTorch wrapper for Pallas TPU NSA operator."""
 
   def __init__(self):
-    super().__init__()
-    self.op_impl_jax = jax_pallas.PallasTpuNativeSparseAttention()
-    self._torch_tokamax_op = None
+    super().__init__(
+        op_impl_jax=jax_pallas.PallasTpuNativeSparseAttention(),
+        jax_op_name="torch_tpu_pallas_nsa",
+    )
+
+  def _register_ops(self) -> None:
+    if hasattr(super(), "_register_ops"):
+      super()._register_ops()
     try:
-      from torch_tpu._internal import pallas
+      from torch_tpu._internal import pallas  # pylint: disable=g-import-not-at-top
     except ImportError:
-      pallas = None
+      pass
     else:
-      try:
-        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+      if self._torch_tokamax_op is not None:
         self._setup_autograd(pallas)
-      except Exception:
-        self._torch_tokamax_op = None
+
+  @override
+  def _cpu_fallback(
+      self,
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      g_cmp: torch.Tensor,
+      g_slc: torch.Tensor,
+      g_swa: torch.Tensor,
+      chunk_size: int = torch_base._CHUNK_SIZE,
+      topk: int = torch_base._TOPK,
+      window: int = torch_base._WINDOW,
+      cmp_block_size: int = torch_base._CMP_BLOCK_SIZE,
+      scale: Optional[float] = None,
+  ) -> torch.Tensor:
+    """Executes the Pallas TPU NSA kernel in interpret mode via JAX."""
+    op_self = self
+
+    class _PallasCpuFn(torch.autograd.Function):
+
+      @staticmethod
+      def forward(ctx, q_t, k_t, v_t, gc_t, gs_t, gw_t):
+        ctx.save_for_backward(q_t, k_t, v_t, gc_t, gs_t, gw_t)
+        q_j = jnp.asarray(q_t.detach().cpu().numpy())
+        k_j = jnp.asarray(k_t.detach().cpu().numpy())
+        v_j = jnp.asarray(v_t.detach().cpu().numpy())
+        gc_j = jnp.asarray(gc_t.detach().cpu().numpy())
+        gs_j = jnp.asarray(gs_t.detach().cpu().numpy())
+        gw_j = jnp.asarray(gw_t.detach().cpu().numpy())
+        out_j = op_self.op_impl_call(
+            q_j,
+            k_j,
+            v_j,
+            g_cmp=gc_j,
+            g_slc=gs_j,
+            g_swa=gw_j,
+            chunk_size=chunk_size,
+            topk=topk,
+            window=window,
+            cmp_block_size=cmp_block_size,
+            scale=scale,
+        )
+        return torch.from_numpy(np.array(out_j, copy=True)).to(
+            device=q_t.device, dtype=q_t.dtype
+        )
+
+      @staticmethod
+      def backward(ctx, do_t):
+        q_t, k_t, v_t, gc_t, gs_t, gw_t = ctx.saved_tensors
+        q_j = jnp.asarray(q_t.detach().cpu().float().numpy())
+        k_j = jnp.asarray(k_t.detach().cpu().float().numpy())
+        v_j = jnp.asarray(v_t.detach().cpu().float().numpy())
+        gc_j = jnp.asarray(gc_t.detach().cpu().float().numpy())
+        gs_j = jnp.asarray(gs_t.detach().cpu().float().numpy())
+        gw_j = jnp.asarray(gw_t.detach().cpu().float().numpy())
+        do_j = jnp.asarray(do_t.detach().cpu().float().numpy())
+        ref_op = jax_base.NativeSparseAttention()
+
+        def _fwd_fn(q_, k_, v_, gc_, gs_, gw_):
+          out_, _ = ref_op._fwd(
+              q_,
+              k_,
+              v_,
+              g_cmp=gc_,
+              g_slc=gs_,
+              g_swa=gw_,
+              chunk_size=chunk_size,
+              topk=topk,
+              window=window,
+              cmp_block_size=cmp_block_size,
+              scale=scale,
+          )
+          return out_
+
+        _, vjp_fn = jax.vjp(_fwd_fn, q_j, k_j, v_j, gc_j, gs_j, gw_j)
+        grads_j = vjp_fn(do_j)
+        return tuple(
+            torch.from_numpy(np.array(g, copy=True)).to(
+                device=t.device, dtype=t.dtype
+            )
+            for g, t in zip(grads_j, (q_t, k_t, v_t, gc_t, gs_t, gw_t))
+        )
+
+    return _PallasCpuFn.apply(q, k, v, g_cmp, g_slc, g_swa)
 
   def _setup_autograd(self, pallas_module):
+    ref_op = jax_base.NativeSparseAttention()
+
     def bwd_jax(
         q,
         k,
@@ -72,7 +163,7 @@ class _PallasTpuNativeSparseAttention(torch_base._NativeSparseAttention):
         do_f = do_b.astype(jnp.float32)
 
         def loss_fn(q_, k_, v_, gc_, gs_, gw_):
-          (out, _), _ = self.op_impl_jax._fwd(
+          out, _ = ref_op._fwd(
               q_[None],
               k_[None],
               v_[None],
@@ -127,7 +218,9 @@ class _PallasTpuNativeSparseAttention(torch_base._NativeSparseAttention):
           scale=ctx.scale,
       )
 
-    self._torch_tokamax_op.register_autograd(backward, setup_context=setup_context)
+    self._torch_tokamax_op.register_autograd(
+        backward, setup_context=setup_context
+    )
 
 
 # Singleton instance

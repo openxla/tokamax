@@ -30,24 +30,28 @@ _TOPK = 4
 _WINDOW = 128
 _CMP_BLOCK_SIZE = 64
 
+_BaseTorchOp = torch_op.TorchOp if torch_op is not None else object
 
-class _NativeSparseAttention:
+
+class _NativeSparseAttention(_BaseTorchOp):
   """PyTorch wrapper for base Native Sparse Attention (NSA) operator."""
 
-  def __init__(self):
-    self.op_impl_jax = jax_base.NativeSparseAttention()
-    self.jax_op_name = "torch_base_nsa"
+  def __init__(
+      self,
+      op_impl_jax: Any = None,
+      jax_op_name: str = "torch_base_nsa",
+  ):
+    if torch_op is not None:
+      super().__init__()
+    self.op_impl_jax = (
+        op_impl_jax
+        if op_impl_jax is not None
+        else jax_base.NativeSparseAttention()
+    )
+    self.jax_op_name = jax_op_name
     self._torch_tokamax_op = None
-    try:
-      from torch_tpu._internal import pallas
-    except ImportError:
-      pallas = None
-    else:
-      try:
-        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
-      except Exception:
-        self._torch_tokamax_op = None
 
+  @override
   def op_impl_call(
       self,
       q: jax.Array,
@@ -62,7 +66,7 @@ class _NativeSparseAttention:
       cmp_block_size: int = _CMP_BLOCK_SIZE,
       scale: Optional[float] = None,
   ) -> jax.Array:
-    (out, _), _ = self.op_impl_jax._fwd(
+    out, _ = self.op_impl_jax._fwd(
         q,
         k,
         v,
@@ -77,6 +81,7 @@ class _NativeSparseAttention:
     )
     return out
 
+  @override
   def __call__(
       self,
       q: torch.Tensor,
@@ -95,7 +100,13 @@ class _NativeSparseAttention:
     del batch_size, num_heads, head_dim
     if seq_len % chunk_size != 0:
       raise ValueError(
-          f"Sequence length ({seq_len}) must be divisible by chunk_size ({chunk_size})"
+          f"Sequence length ({seq_len}) must be divisible by chunk_size"
+          f" ({chunk_size})"
+      )
+    if seq_len % cmp_block_size != 0:
+      raise ValueError(
+          f"Sequence length ({seq_len}) must be divisible by cmp_block_size"
+          f" ({cmp_block_size})"
       )
 
     if g_cmp is None:
@@ -166,14 +177,27 @@ class _NativeSparseAttention:
 
     # 1. Coarse compression branch
     num_cmp_blocks = seq_len // cmp_block_size
-    k_cmp = k.view(batch_size, num_heads, num_cmp_blocks, cmp_block_size, head_dim).mean(dim=3)
-    v_cmp = v.view(batch_size, num_heads, num_cmp_blocks, cmp_block_size, head_dim).mean(dim=3)
+    k_cmp = k.view(
+        batch_size, num_heads, num_cmp_blocks, cmp_block_size, head_dim
+    ).mean(dim=3)
+    v_cmp = v.view(
+        batch_size, num_heads, num_cmp_blocks, cmp_block_size, head_dim
+    ).mean(dim=3)
     scores_cmp = torch.einsum("bhtd,bhcd->bhtc", q, k_cmp) * scale
     q_pos = torch.arange(seq_len, device=q.device).unsqueeze(1)
-    c_pos = (torch.arange(num_cmp_blocks, device=q.device) * cmp_block_size).unsqueeze(0)
-    mask_cmp = c_pos < q_pos
-    scores_cmp = torch.where(mask_cmp.unsqueeze(0).unsqueeze(0), scores_cmp, -1e9)
+    c_pos = (
+        torch.arange(num_cmp_blocks, device=q.device) * cmp_block_size
+    ).unsqueeze(0)
+    mask_cmp = (c_pos + cmp_block_size - 1) <= q_pos
+    scores_cmp = torch.where(
+        mask_cmp.unsqueeze(0).unsqueeze(0), scores_cmp, -1e9
+    )
     w_cmp = torch.softmax(scores_cmp, dim=-1)
+    w_cmp = torch.where(
+        (q_pos >= cmp_block_size - 1).unsqueeze(0).unsqueeze(0),
+        w_cmp,
+        torch.zeros_like(w_cmp),
+    )
     o_cmp = torch.einsum("bhtc,bhcd->bhtd", w_cmp, v_cmp)
 
     # 2. Fine-grained selection branch
@@ -188,35 +212,60 @@ class _NativeSparseAttention:
     routing = torch.einsum("bhqd,bhnd->bhqn", q_mean, k_mean) * scale
     q_idx = torch.arange(num_blocks, device=q.device).unsqueeze(1)
     k_idx = torch.arange(num_blocks, device=q.device).unsqueeze(0)
-    routing = torch.where((k_idx < q_idx).unsqueeze(0).unsqueeze(0), routing, -float("inf"))
+    routing = torch.where(
+        (k_idx < q_idx).unsqueeze(0).unsqueeze(0), routing, -float("inf")
+    )
     topk_idx = torch.topk(routing, effective_topk, dim=-1).indices
 
-    causal_diag = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool))
+    causal_diag = torch.tril(
+        torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool)
+    )
     slc_outs = []
     for block_idx in range(num_blocks):
       q_i = q_b[:, :, block_idx]
-      k_diag = k_b[:, :, block_idx:block_idx+1]
-      v_diag = v_b[:, :, block_idx:block_idx+1]
+      k_diag = k_b[:, :, block_idx : block_idx + 1]
+      v_diag = v_b[:, :, block_idx : block_idx + 1]
 
       if effective_topk > 0:
         slot_idx = topk_idx[:, :, block_idx, :][:, :, :, None, None]
         k_hist = torch.gather(
-            k_b, 2, slot_idx.expand(batch_size, num_heads, effective_topk, chunk_size, head_dim)
+            k_b,
+            2,
+            slot_idx.expand(
+                batch_size, num_heads, effective_topk, chunk_size, head_dim
+            ),
         )
         v_hist = torch.gather(
-            v_b, 2, slot_idx.expand(batch_size, num_heads, effective_topk, chunk_size, head_dim)
+            v_b,
+            2,
+            slot_idx.expand(
+                batch_size, num_heads, effective_topk, chunk_size, head_dim
+            ),
         )
-        k_sub = torch.cat([k_diag, k_hist], dim=2).view(batch_size, num_heads, block_k_sub, head_dim)
-        v_sub = torch.cat([v_diag, v_hist], dim=2).view(batch_size, num_heads, block_k_sub, head_dim)
+        k_sub = torch.cat([k_diag, k_hist], dim=2).view(
+            batch_size, num_heads, block_k_sub, head_dim
+        )
+        v_sub = torch.cat([v_diag, v_hist], dim=2).view(
+            batch_size, num_heads, block_k_sub, head_dim
+        )
 
         ranks = torch.arange(effective_topk, device=q.device)
-        valid_hist = (ranks < block_idx).repeat_interleave(chunk_size).view(1, 1, 1, -1).expand(batch_size, num_heads, chunk_size, -1)
-        mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(batch_size, num_heads, -1, -1)
+        valid_hist = (
+            (ranks < block_idx)
+            .repeat_interleave(chunk_size)
+            .view(1, 1, 1, -1)
+            .expand(batch_size, num_heads, chunk_size, -1)
+        )
+        mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(
+            batch_size, num_heads, -1, -1
+        )
         mask_sub = torch.cat([mask_diag, valid_hist], dim=-1)
       else:
         k_sub = k_diag.view(batch_size, num_heads, chunk_size, head_dim)
         v_sub = v_diag.view(batch_size, num_heads, chunk_size, head_dim)
-        mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(batch_size, num_heads, -1, -1)
+        mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(
+            batch_size, num_heads, -1, -1
+        )
 
       scores = torch.matmul(q_i, k_sub.transpose(-1, -2)) * scale
       scores = torch.where(mask_sub, scores, -1e9)
@@ -228,8 +277,13 @@ class _NativeSparseAttention:
     scores_swa = torch.einsum("bhtd,bhsd->bhts", q, k) * scale
     s_pos = torch.arange(seq_len, device=q.device).unsqueeze(0)
     mask_swa = (s_pos <= q_pos) & (s_pos >= q_pos - window)
-    scores_swa = torch.where(mask_swa.unsqueeze(0).unsqueeze(0), scores_swa, -1e9)
+    scores_swa = torch.where(
+        mask_swa.unsqueeze(0).unsqueeze(0), scores_swa, -1e9
+    )
     w_swa = torch.softmax(scores_swa, dim=-1)
     o_swa = torch.einsum("bhts,bhsd->bhtd", w_swa, v)
 
     return g_cmp * o_cmp + g_slc * o_slc + g_swa * o_swa
+
+
+native_sparse_attention = _NativeSparseAttention()
