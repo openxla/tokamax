@@ -30,6 +30,7 @@ from tokamax._src.ops.kda import pallas_mosaic_tpu_fwd_kernel as kernels
 @pytest.fixture(autouse=True)
 def interpret_on_cpu(monkeypatch):
   if jax.default_backend() == "tpu":
+    yield
     return
   monkeypatch.setenv("PALLAS_INTERPRET", "1")
   monkeypatch.setattr(
@@ -46,6 +47,13 @@ def interpret_on_cpu(monkeypatch):
       "supported_on",
       lambda self, device: True,
   )
+  # CUDA interpretation executes the kernels' FP32 contractions on the GPU.
+  # Its default TF32 precision can change across the fused/staged JIT
+  # boundaries, even though the native TPU schedules agree. Keep the
+  # interpreter comparison in FP32; explicit BF16 casts and the numerical
+  # tolerances stay unchanged. Native TPU execution keeps its own precision.
+  with jax.default_matmul_precision("highest"):
+    yield
 
 
 def _inputs(dtype, packed, *, key_dim=128, heads=1, batch=1):
