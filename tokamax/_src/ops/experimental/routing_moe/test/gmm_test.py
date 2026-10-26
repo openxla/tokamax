@@ -102,6 +102,49 @@ SKIP_METADATA_SHAPES = [
     for skip in (0, 1, 2, 63, 1024)
 ]
 
+LIVE_GROUP_WALK_SHAPES = (
+    dict(
+        testcase_name="single_token_offset0",
+        num_tokens=1,
+        num_experts=512,
+        num_local_experts=512,
+        group_offset=0,
+        topk=10,
+        size_k=512,
+        size_n=1024,
+    ),
+    dict(
+        testcase_name="multi_token_offset0",
+        num_tokens=16,
+        num_experts=512,
+        num_local_experts=512,
+        group_offset=0,
+        topk=10,
+        size_k=512,
+        size_n=1024,
+    ),
+    dict(
+        testcase_name="single_token_offset128",
+        num_tokens=1,
+        num_experts=512,
+        num_local_experts=64,
+        group_offset=128,
+        topk=10,
+        size_k=512,
+        size_n=1024,
+    ),
+    dict(
+        testcase_name="multi_token_offset128",
+        num_tokens=16,
+        num_experts=512,
+        num_local_experts=64,
+        group_offset=128,
+        topk=10,
+        size_k=512,
+        size_n=1024,
+    ),
+)
+
 
 def ragged_permute_gmm(lhs, rhs, rhs_scale, group_sizes, gather_indices):
   lhs = ragged_gather_pallas(
@@ -159,7 +202,7 @@ def _routing_gmm_shard(lhs, rhs, group_sizes, group_offset, scatter_indices):
   """Per-shard body of `remote_gmm_unpermute`."""
   out = gmm.routing_gmm(
       lhs,
-      arg.make_weight_wrapper(rhs),
+      (arg.make_weight_wrapper(rhs),),
       group_sizes,
       group_offset=group_offset,
       scatter=arg.make_routing_wrapper(scatter_indices, remote_axis=EP_AXIS),
@@ -200,7 +243,7 @@ def local_gmm_unpermute(
   def unpermute(lhs, rhs, group_sizes, group_offset, scatter_indices):
     out = gmm.routing_gmm(
         lhs,
-        arg.make_weight_wrapper(rhs),
+        (arg.make_weight_wrapper(rhs),),
         group_sizes,
         group_offset=group_offset,
         scatter=arg.make_routing_wrapper(scatter_indices),
@@ -241,7 +284,7 @@ class RoutingGmmTest(parameterized.TestCase):
   ):
     num_local_experts = num_experts // ep_size
 
-    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    k0, k1, k2, k3 = jax.random.split(jax.random.key(0), 4)
     self.lhs = jax.random.normal(k0, (num_tokens, size_k), jnp.bfloat16) / 10
     self.rhs = (
         jax.random.normal(k1, (num_local_experts, size_k, size_n), jnp.bfloat16)
@@ -251,6 +294,17 @@ class RoutingGmmTest(parameterized.TestCase):
         self.rhs, jnp.float8_e4m3fn, axis=1, block_size=size_k
     )
     self.rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    # Down projection from the activated gate/up output back to size_k.
+    self.rhs2 = (
+        jax.random.normal(
+            k3, (num_local_experts, size_n // 2, size_k), jnp.bfloat16
+        )
+        / 10
+    )
+    self.rhs2_q, rhs2_scale = gmm_util.quantize_tensor(
+        self.rhs2, jnp.float8_e4m3fn, axis=1, block_size=size_n // 2
+    )
+    self.rhs2_scale = jnp.expand_dims(rhs2_scale, axis=2)
 
     gating_output = jax.random.uniform(k2, (num_tokens, num_experts))
     _, topk_indices = jax.lax.top_k(gating_output, topk)
@@ -268,10 +322,12 @@ class RoutingGmmTest(parameterized.TestCase):
     self.lhs_gathered_compact = input_pack.input_pack(self.lhs_gathered)
 
     # routing_gmm takes weights and indices with their specs attached.
-    self.rhs_wrapped = arg.make_weight_wrapper(self.rhs)
+    self.rhs_wrapped = arg.make_weight_wrapper(self.rhs, fused_gate_up=True)
     self.rhs_q_wrapped = arg.make_weight_wrapper(
         self.rhs_q, self.rhs_scale, fused_gate_up=True
     )
+    self.rhs2_wrapped = arg.make_weight_wrapper(self.rhs2)
+    self.rhs2_q_wrapped = arg.make_weight_wrapper(self.rhs2_q, self.rhs2_scale)
     self.gather = arg.make_routing_wrapper(self.gather_indices)
     self.scatter = arg.make_routing_wrapper(self.topk_argsort_indices)
 
@@ -304,7 +360,7 @@ class RoutingGmmTest(parameterized.TestCase):
     )
     actual = gmm.routing_gmm(
         self.lhs_compact,
-        self.rhs_q_wrapped,
+        (self.rhs_q_wrapped,),
         self.group_sizes,
         gather=self.gather,
         fuse_act="silu",
@@ -313,6 +369,64 @@ class RoutingGmmTest(parameterized.TestCase):
     actual = actual.data.reshape(actual.spec.large_shape)
     np.testing.assert_allclose(
         actual[: self.num_valid_rows],
+        expected[: self.num_valid_rows],
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+  @parameterized.product(
+      SHAPES,
+      (
+          dict(quant_w1=True, quant_w2=True, fuse_up_and_down=None),
+          dict(quant_w1=True, quant_w2=True, fuse_up_and_down=True),
+          dict(quant_w1=True, quant_w2=True, fuse_up_and_down=False),
+          dict(quant_w1=False, quant_w2=False, fuse_up_and_down=None),
+          dict(quant_w1=False, quant_w2=False, fuse_up_and_down=True),
+          dict(quant_w1=False, quant_w2=False, fuse_up_and_down=False),
+          dict(quant_w1=True, quant_w2=False, fuse_up_and_down=None),
+      ),
+  )
+  def test_permute_gmm_gmm_unpermute_numerics(
+      self, quant_w1, quant_w2, fuse_up_and_down, **shape
+  ):
+    self._setup_inputs(**shape)
+    rhs1, scale1, w1 = (
+        (self.rhs_q, self.rhs_scale, self.rhs_q_wrapped)
+        if quant_w1
+        else (self.rhs, None, self.rhs_wrapped)
+    )
+    rhs2, scale2, w2 = (
+        (self.rhs2_q, self.rhs2_scale, self.rhs2_q_wrapped)
+        if quant_w2
+        else (self.rhs2, None, self.rhs2_wrapped)
+    )
+    hidden = gmm_v2.gmm_v2(
+        self.lhs_gathered,
+        rhs1,
+        self.group_sizes,
+        rhs_scale=scale1,
+        zero_initialize=False,
+        fuse_act="silu",
+    )
+    expected = gmm_v2.gmm_v2(
+        hidden,
+        rhs2,
+        self.group_sizes,
+        rhs_scale=scale2,
+        zero_initialize=False,
+    )
+    actual = gmm.routing_gmm(
+        self.lhs_compact,
+        (w1, w2),
+        self.group_sizes,
+        gather=self.gather,
+        scatter=self.scatter,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
+    )
+    actual = actual.data.reshape(actual.spec.large_shape)
+    np.testing.assert_allclose(
+        actual[self.topk_argsort_indices[: self.num_valid_rows]],
         expected[: self.num_valid_rows],
         rtol=5e-2,
         atol=5e-2,
@@ -329,7 +443,7 @@ class RoutingGmmTest(parameterized.TestCase):
     )
     actual = gmm.routing_gmm(
         self.lhs_gathered_compact,
-        self.rhs_wrapped,
+        (self.rhs_wrapped,),
         self.group_sizes,
         scatter=self.scatter,
         custom_plan=gmm_plan.RoutingGmmPlan(tile_n=tile_n),
@@ -356,7 +470,7 @@ class RoutingGmmTest(parameterized.TestCase):
             gathered_rows,
             dict(
                 x=self.lhs_compact,
-                w=self.rhs_q_wrapped,
+                w=(self.rhs_q_wrapped,),
                 gather=self.gather,
                 fuse_act="silu",
             ),
@@ -365,7 +479,7 @@ class RoutingGmmTest(parameterized.TestCase):
             scattered_rows,
             dict(
                 x=self.lhs_gathered_compact,
-                w=self.rhs_wrapped,
+                w=(self.rhs_wrapped,),
                 scatter=self.scatter,
             ),
         ),
@@ -383,7 +497,7 @@ class RoutingGmmTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "skip_metadata_size"):
       gmm.routing_gmm(
           self.lhs_compact,
-          self.rhs_q_wrapped,
+          (self.rhs_q_wrapped,),
           self.group_sizes,
           gather=self.gather,
           fuse_act="silu",
@@ -413,7 +527,7 @@ class RoutingGmmTest(parameterized.TestCase):
     fused = benchmarking.standardize_function(
         gmm.routing_gmm,
         self.lhs_compact,
-        self.rhs_q_wrapped,
+        (self.rhs_q_wrapped,),
         self.group_sizes,
         kwargs=dict(gather=self.gather, fuse_act="silu"),
     )
@@ -439,11 +553,152 @@ class RoutingGmmTest(parameterized.TestCase):
     fused = benchmarking.standardize_function(
         gmm.routing_gmm,
         self.lhs_gathered_compact,
-        self.rhs_wrapped,
+        (self.rhs_wrapped,),
         self.group_sizes,
         kwargs=dict(scatter=self.scatter),
     )
     self._benchmark_and_profile(plain, ragged, fused)
+
+  def _live_group_walk_stages(
+      self,
+      *,
+      num_tokens: int,
+      num_experts: int,
+      num_local_experts: int,
+      group_offset: int,
+      topk: int,
+      size_k: int,
+      size_n: int,
+  ):
+    """Returns `(x, w, kwargs, written rows)` of the gather and scatter stages."""
+    key0, key1, key2, key3 = jax.random.split(jax.random.key(0), 4)
+    lhs = jax.random.normal(key0, (num_tokens, size_k), jnp.bfloat16) / 10
+    rhs1 = (
+        jax.random.normal(
+            key1, (num_local_experts, size_k, size_n), jnp.bfloat16
+        )
+        / 10
+    )
+    rhs2 = (
+        jax.random.normal(
+            key2, (num_local_experts, size_k, size_n), jnp.bfloat16
+        )
+        / 10
+    )
+
+    gating_output = jax.random.uniform(key3, (num_tokens, num_experts))
+    # Ensure at least one token routes to this shard's experts.
+    gating_output = gating_output.at[0, group_offset].set(2.0)
+    _, topk_indices = jax.lax.top_k(gating_output, topk)
+    topk_indices_flat = topk_indices.flatten()
+    # The same sort as the MoE wrapper, whose sorted keys are `row_group`.
+    row_group, topk_argsort_indices = jax.lax.sort_key_val(
+        topk_indices_flat,
+        jnp.arange(topk_indices_flat.size, dtype=jnp.int32),
+        is_stable=True,
+    )
+    group_sizes = jnp.bincount(topk_indices_flat, length=num_experts)
+
+    group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
+    start_row = int(group_cum_sum[group_offset])
+    end_row = int(group_cum_sum[group_offset + num_local_experts])
+    self.assertGreater(end_row - start_row, 0)
+
+    common = dict(
+        group_sizes=group_sizes,
+        group_offset=jnp.array([group_offset], dtype=jnp.int32),
+        row_group=row_group,
+    )
+    # 1. Gather (gmm1) with fuse_act="silu": writes the shard's sorted rows.
+    gather_stage = (
+        input_pack.input_pack(lhs),
+        (arg.make_weight_wrapper(rhs1, fused_gate_up=True),),
+        dict(
+            common,
+            gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
+            fuse_act="silu",
+        ),
+        np.arange(start_row, end_row),
+    )
+    # 2. Scatter (gmm2): writes the shard's rows back to their routed slots.
+    scatter_stage = (
+        input_pack.input_pack(lhs[topk_argsort_indices // topk]),
+        (arg.make_weight_wrapper(rhs2),),
+        dict(common, scatter=arg.make_routing_wrapper(topk_argsort_indices)),
+        topk_argsort_indices[start_row:end_row],
+    )
+    return {"gather": gather_stage, "scatter": scatter_stage}
+
+  @parameterized.product(
+      LIVE_GROUP_WALK_SHAPES,
+      tile_n=[None, 512],
+  )
+  def test_live_group_walk(
+      self, tile_n: int | None, testcase_name: str = "", **shape
+  ):
+    del testcase_name
+    stages = self._live_group_walk_stages(**shape)
+    for x, w, kwargs, rows in stages.values():
+      actual, expected = (
+          gmm.routing_gmm(
+              x,
+              w,
+              custom_plan=gmm_plan.RoutingGmmPlan(
+                  tile_n=tile_n, live_group_walk=live_group_walk
+              ),
+              **kwargs,
+          )
+          for live_group_walk in (True, False)
+      )
+      actual = actual.data.reshape(actual.spec.large_shape)
+      expected = expected.data.reshape(expected.spec.large_shape)
+      np.testing.assert_array_equal(actual[rows], expected[rows])
+
+  @parameterized.named_parameters(*LIVE_GROUP_WALK_SHAPES)
+  def test_live_group_walk_benchmark(self, **shape):
+    """Logs the time of each metadata walk at decode and checks the live wins.
+
+    Run with --test_filter=test_live_group_walk_benchmark after changing the
+    metadata to check for regressions at decode.
+    """
+    num_local_experts = shape["num_local_experts"]
+    stages = self._live_group_walk_stages(**shape)
+    for name, (x, w, kwargs, _) in stages.items():
+      latency_us, trace = {}, {}
+      for live_group_walk in (False, True):
+        fn, args = benchmarking.standardize_function(
+            gmm.routing_gmm,
+            x,
+            w,
+            kwargs=dict(
+                kwargs,
+                custom_plan=gmm_plan.RoutingGmmPlan(
+                    live_group_walk=live_group_walk
+                ),
+            ),
+        )
+        latency_us[live_group_walk] = 1e3 * (
+            benchmarking.benchmark(
+                fn, args, method="hermetic_xprof"
+            ).median_evaluation_time_ms
+        )
+        trace[live_group_walk] = ""
+      logging.info(
+          "%s, %d tokens, %d local groups: all groups %.1f us%s, groups with"
+          " rows %.1f us%s",
+          name,
+          shape["num_tokens"],
+          num_local_experts,
+          latency_us[False],
+          trace[False],
+          latency_us[True],
+          trace[True],
+      )
+      # At one token the walk over 512 local groups is a large share of the
+      # kernel (about 3 us of 20-25 us). With more tokens the matmul dominates,
+      # and with 64 groups the gap is within noise, so those only log.
+      if num_local_experts >= 512 and shape["num_tokens"] == 1:
+        self.assertLess(latency_us[True], latency_us[False])
 
 
 class RemoteRoutingGmmTest(parameterized.TestCase):
@@ -537,7 +792,7 @@ class RemoteRoutingGmmTest(parameterized.TestCase):
     # One device holding all experts.
     expected = gmm.routing_gmm(
         self.lhs_gathered_compact,
-        arg.make_weight_wrapper(self.rhs),
+        (arg.make_weight_wrapper(self.rhs),),
         self.group_sizes,
         scatter=arg.make_routing_wrapper(self.topk_argsort_indices),
     ).data

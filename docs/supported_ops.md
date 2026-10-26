@@ -45,7 +45,7 @@ table.ops-table code {
   </thead>
   <tbody>
     <tr>
-      <td colspan="2" width="28%"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/tpu/splash_attention"><code>splash_attention</code></a></td>
+      <td colspan="2" width="28%"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/splash_attention"><code>splash_attention</code></a></td>
       <td>TPU</td>
       <td align="center" style="text-align: center;">✅</td>
       <td align="center" style="text-align: center;">✅</td>

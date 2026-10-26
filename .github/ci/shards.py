@@ -234,33 +234,39 @@ MatrixEntry = dict[str, str]
 # rebalanced whenever the timings move, so a per-file fact stated at shard
 # granularity gets forced onto every file that happens to be grouped with it.
 #
-#            Every shard below is measured, from the 35 `ci-build.yml` runs
-#            of 2026-10-05 to 2026-10-07 (runs 37387952688 through
-#            37669785741) that the GitHub API would return jobs for. Each
-#            number is the `Run shard` step's median over a shard's green jobs
-#            on one (runner, JAX version) pair, worst pair taken -- the compat
-#            reruns included, since they are jobs the run waits for too. That
-#            is not a formality: `splash-kernel`, `experimental-kda-kernel`
-#            and `ops-ragged-gather` are all slowest on tpu7x with an older
-#            JAX, not on the latest one. Re-measure from `latest_jax()` jobs
-#            only: the compat jobs are smoke-mode bins, sized by
-#            `compat_minutes` (see `COMPAT_BIN_MINUTES`).
+#            Every shard below is measured, from the `ci-build.yml` runs of
+#            2026-10-16 to 2026-10-21 (runs 38829132068 through 39651533822)
+#            that had a green shard job. Change-based selection is enforced,
+#            so most runs schedule only the shards a change reaches; each
+#            number is therefore the `Run shard` step's median over a shard's
+#            10 most recent green jobs on one runner, with `latest_jax()`,
+#            worst runner taken. The compat jobs are not included: they are
+#            smoke-mode bins now, and are what `compat_minutes` measures
+#            instead.
+#
+#            `compat_minutes` is the same per-file arithmetic as below, applied
+#            to the logs of the smoke-mode `compat-tests` jobs since
+#            2026-10-20 (the median of up to six bins per file), re-summed
+#            against the `paths` here. A shard's first file in a bin also
+#            carries the bin's collection time, so these err high, which only
+#            ever costs an extra bin.
 #
 #            Files that were in the catch-all in those runs -- the shards new
 #            since, and the files added to existing ones -- have no step of
 #            their own to time. Their numbers are per-file times recovered from
-#            the catch-all job logs of run 37657251865, green on all six jobs,
-#            re-summed against the `paths` here, plus 0.3m for the fixed cost
-#            either side of the pytest session. pytest flushes a progress line
-#            when the file finishes, so the timestamp on `foo_test.py ....` is
-#            that file's end, and the gap back to the previous one is its
-#            duration.
+#            the catch-all job logs (the five most recent green jobs per
+#            runner), re-summed against the `paths` here, plus 0.3m for the
+#            fixed cost either side of the pytest session. pytest flushes a
+#            progress line when the file finishes, so the timestamp on
+#            `foo_test.py ....` is that file's end, and the gap back to the
+#            previous one is its duration.
 #
-#            The previous numbers came the same per-file way from run
-#            33423920015 (2026-08-31), and most have since moved, in both
-#            directions: `attention-base-vjp` went from 37m to 13m, and
-#            `ops-ragged-gather` from 8m to 20m. Treat these as a snapshot and
-#            re-measure rather than adjust one by hand.
+#            The previous numbers came from the runs of 2026-10-05 to
+#            2026-10-07, and many have since moved, in both directions:
+#            `ops-ragged-gather` went from 20m to 7m, `experimental-sparse-mla`
+#            from 11m to 2m, and `ops-linear-softmax-xent` from 13m to 20m.
+#            Treat these as a snapshot and re-measure rather than adjust one by
+#            hand.
 #
 #            Two traps, if this is ever redone per file.
 #
@@ -287,8 +293,9 @@ MatrixEntry = dict[str, str]
 #            either mistake.
 #
 #            Rounded up to whole minutes, floored at 1, because the field must
-#            be a positive number and 12 shards here finish in under a minute.
-#            A 1 means "too fast to matter", not "measured at 60s".
+#            be a positive number and 9 shards here finish in under a minute.
+#            A 1 means "too fast to matter", not "measured at 60s". The same
+#            rounding applies to `compat_minutes`, where most shards are a 1.
 #
 # Every file is named. No shard targets a directory, which is why there are no
 # `--ignore=` flags either: a directory target and the file shards carved out
@@ -345,11 +352,15 @@ SHARDS: ShardMap = {
     # `check_consistency` parses this file and fails if it grows a class that
     # neither shard names -- the failure the node IDs introduce, and the only
     # one no path here going stale would catch.
+    #
+    # Their `compat_minutes` are per class group, not per file: the two halves
+    # never shared a compat bin, so each bin's time for the file is its half's.
     'attention-base-vjp': Spec(
         paths=(
             'tokamax/_src/ops/attention/base_test.py::DotProductAttentionWithExplicitVjpTest',
         ),
         minutes=13,
+        compat_minutes=9,
     ),
     'attention-base': Spec(
         paths=(
@@ -357,22 +368,29 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/attention/base_test.py::DotProductAttentionTest',
         ),
         minutes=11,
+        compat_minutes=8,
     ),
     'attention-xla-chunked': Spec(
         paths=('tokamax/_src/ops/attention/xla_chunked_test.py',),
         minutes=6,
+        compat_minutes=3,
     ),
     'attention-pallas-triton': Spec(
         paths=('tokamax/_src/ops/attention/pallas_triton_test.py',),
         minutes=5,
+        compat_minutes=1,
     ),
+    # GPU only: `TritonFlashAttentionTest` skips itself on TPU. Its forward
+    # tests run since openxla/tokamax#1706 (2026-10-22), 3.4-4.0m on h100.
     'attention-triton': Spec(
         paths=('tokamax/_src/ops/attention/triton_test.py',),
-        minutes=5,
+        minutes=4,
+        compat_minutes=1,
     ),
     'attention-api': Spec(
         paths=('tokamax/_src/ops/attention/api_test.py',),
-        minutes=3,
+        minutes=2,
+        compat_minutes=1,
     ),
     # CUDA-pinned on measurement, not on inspection: 0 of its 257 cases run on
     # either TPU runner, and `jax_nn_test.py` says why -- two
@@ -381,10 +399,11 @@ SHARDS: ShardMap = {
     'attention-jax-nn': Spec(
         paths=('tokamax/_src/ops/attention/jax_nn_test.py',),
         minutes=2,
+        compat_minutes=1,
     ),
-    # Three files that were a shard each, all well under a minute. Every shard
-    # costs one job per runner and JAX pin (5 today) against GitHub's 256-job
-    # matrix limit, so shards this small are merged rather than kept apart.
+    # Files that were a shard each, all well under a minute. Every shard
+    # costs one job per runner (3 today) against GitHub's 256-job matrix
+    # limit, so shards this small are merged rather than kept apart.
     'attention-misc': Spec(
         paths=(
             'tokamax/_src/ops/attention/api_sharding_test.py',
@@ -392,27 +411,30 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py',
         ),
         minutes=1,
+        compat_minutes=1,
     ),
     # -- splash ------------------------------------------------------------
     # The longest job in CI, and the only shard whose runtime is set by
-    # something other than the hardware: 337 tests, 41m on tpu6e, 39m on
-    # tpu7x with the latest JAX and up to 45m on the tpu7x compat reruns with
-    # older ones. It sets the wall clock of every run, so splitting it is the
-    # only thing that shortens one.
+    # something other than the hardware: 399 tests, 42m on tpu6e and 39m on
+    # tpu7x. It sets the wall clock of every run, so splitting it is the only
+    # thing that shortens one.
     #
-    # It cannot be split the way `attention-base` below is. The file declares
-    # one test class, so there is no class boundary to cut on, and its five
-    # methods are `parameterized.product` grids -- `test_splash_attention_fwd`
-    # alone is 256 of the 337 cases. absl names product cases by index
-    # (`test_splash_attention_fwd0`, `...1`), not by argument, so neither a
-    # node ID nor `-k` can address a subset of one grid by what it varies.
-    # Splitting the remaining 81 cases off would leave a ~35m shard and gain
-    # ~10m; going further needs pytest-split, or a smaller grid upstream.
+    # It cannot usefully be split the way `attention-base` above is. The file
+    # now declares a second test class, `SplashAttentionDropoutTest`, but none
+    # of the 25 slowest cases is in it, so cutting there would move little;
+    # and it also declares public helper classes (`ModelConfig`, the `Mask`
+    # family) that `check_consistency` would require a node ID for. The time
+    # is in `SplashAttentionTest`, whose methods are `parameterized.product`
+    # grids. absl names product cases by index (`test_splash_attention_fwd0`,
+    # `...1`), not by argument, so neither a node ID nor `-k` can address a
+    # subset of one grid by what it varies. Going further needs pytest-split,
+    # or a smaller grid upstream.
     'splash-kernel': Spec(
         paths=(
             'tokamax/_src/ops/splash_attention/splash_attention_kernel_test.py',
         ),
-        minutes=46,
+        minutes=42,
+        compat_minutes=2,
     ),
     'splash-misc': Spec(
         paths=(
@@ -425,11 +447,12 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/splash_attention/splash_attention_segments_test.py',
         ),
         minutes=2,
+        compat_minutes=2,
     ),
     # -- ragged-dot --------------------------------------------------------
     # Split out rather than split up: 925 of its 1117 cases run on h100, all in
     # one class, so there is no class boundary to cut on and node IDs would not
-    # help. On its own it sets the h100 wall clock at ~29m, which is under
+    # help. On its own it sets the h100 wall clock at ~25m, which is under
     # `splash-kernel`, so cutting it further would not shorten a CI run --
     # something else has to get faster first.
     #
@@ -437,11 +460,13 @@ SHARDS: ShardMap = {
     # and 6 seconds of TPU is not worth the chance of losing them silently.
     'ragged-dot-api': Spec(
         paths=('tokamax/_src/ops/ragged_dot/api_test.py',),
-        minutes=29,
+        minutes=25,
+        compat_minutes=1,
     ),
     'ragged-dot-mosaic-gpu': Spec(
         paths=('tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py',),
-        minutes=12,
+        minutes=11,
+        compat_minutes=1,
     ),
     # The ragged_dot tests with no shard of their own.
     'ragged-dot-misc': Spec(
@@ -451,26 +476,31 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/ragged_dot/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/ragged_dot/pallas_mosaic_tpu_v2_test.py',
         ),
-        minutes=8,
+        minutes=7,
+        compat_minutes=2,
     ),
     'ragged-dot-triton': Spec(
         paths=('tokamax/_src/ops/ragged_dot/triton_test.py',),
         minutes=6,
+        compat_minutes=1,
     ),
     'ragged-dot-sm100': Spec(
         paths=(
             'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_quant_test.py',
         ),
         minutes=1,
+        compat_minutes=1,
     ),
     # -- gmm ---------------------------------------------------------------
-    'gmm-v2-perf': Spec(
-        paths=('tokamax/_src/ops/gmm_v2/gmm_v2_perf_test.py',),
-        minutes=5,
-    ),
     'gmm-v2-kernel': Spec(
         paths=('tokamax/_src/ops/gmm_v2/gmm_v2_test.py',),
         minutes=4,
+        compat_minutes=2,
+    ),
+    'gmm-v2-perf': Spec(
+        paths=('tokamax/_src/ops/gmm_v2/gmm_v2_perf_test.py',),
+        minutes=4,
+        compat_minutes=3,
     ),
     # -- ops ---------------------------------------------------------------
     # Split one-op-per-shard. It costs 5 shards and 15 jobs at worst, and buys
@@ -485,25 +515,8 @@ SHARDS: ShardMap = {
     # `tokamax/__init__.py`, so a change to a *base* module still fans out
     # widely regardless of how these are packed. Splitting helps at the leaves,
     # not at the roots.
-    # The longest ops shard, and only on tpu7x: 18-20m there against well
-    # under a minute on h100 and tpu6e.
-    'ops-ragged-gather': Spec(
-        paths=(
-            'tokamax/_src/ops/ragged_gather/api_test.py',
-            'tokamax/_src/ops/ragged_gather/base_test.py',
-            'tokamax/_src/ops/ragged_gather/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=20,
-    ),
-    'ops-causal-conv1d': Spec(
-        paths=(
-            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/base_test.py',
-            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/gdn_attention_test.py',
-            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/kda_attention_test.py',
-            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=16,
-    ),
+    # The longest ops shard, nearly all of it `pallas_mosaic_tpu_kernel_test.py`:
+    # 17m of the 20m on tpu6e, 12m of 14m on tpu7x, and nothing on h100.
     'ops-linear-softmax-xent': Spec(
         paths=(
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/api_test.py',
@@ -513,7 +526,29 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/reference_test.py',
         ),
-        minutes=13,
+        minutes=20,
+        compat_minutes=4,
+    ),
+    'ops-causal-conv1d': Spec(
+        paths=(
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/base_test.py',
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/gdn_attention_test.py',
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/kda_attention_test.py',
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=15,
+        compat_minutes=8,
+    ),
+    # Slow only on tpu7x: 6m there against well under a minute on h100 and
+    # tpu6e. It was 18-20m there in the previous measurement.
+    'ops-ragged-gather': Spec(
+        paths=(
+            'tokamax/_src/ops/ragged_gather/api_test.py',
+            'tokamax/_src/ops/ragged_gather/base_test.py',
+            'tokamax/_src/ops/ragged_gather/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=7,
+        compat_minutes=1,
     ),
     'ops-normalization': Spec(
         paths=(
@@ -521,11 +556,31 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/normalization/base_test.py',
             'tokamax/_src/ops/normalization/triton_test.py',
         ),
-        minutes=6,
+        minutes=3,
+        compat_minutes=1,
+    ),
+    'ops-ragged-gather-reduce': Spec(
+        paths=(
+            'tokamax/_src/ops/ragged_gather_reduce/api_test.py',
+            'tokamax/_src/ops/ragged_gather_reduce/base_test.py',
+            'tokamax/_src/ops/ragged_gather_reduce/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=3,
+        compat_minutes=1,
     ),
     'ops-flex-attention': Spec(
         paths=('tokamax/_src/ops/experimental/flex_attention/base_test.py',),
         minutes=2,
+        compat_minutes=1,
+    ),
+    'ops-triangle-multiplication': Spec(
+        paths=(
+            'tokamax/_src/ops/triangle_multiplication/api_test.py',
+            'tokamax/_src/ops/triangle_multiplication/base_test.py',
+            'tokamax/_src/ops/triangle_multiplication/triton_test.py',
+        ),
+        minutes=2,
+        compat_minutes=1,
     ),
     'ops-gated-linear-unit': Spec(
         paths=(
@@ -536,27 +591,13 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/gated_linear_unit/triton_test.py',
         ),
         minutes=1,
-    ),
-    'ops-ragged-gather-reduce': Spec(
-        paths=(
-            'tokamax/_src/ops/ragged_gather_reduce/api_test.py',
-            'tokamax/_src/ops/ragged_gather_reduce/base_test.py',
-            'tokamax/_src/ops/ragged_gather_reduce/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=1,
-    ),
-    'ops-triangle-multiplication': Spec(
-        paths=(
-            'tokamax/_src/ops/triangle_multiplication/api_test.py',
-            'tokamax/_src/ops/triangle_multiplication/base_test.py',
-            'tokamax/_src/ops/triangle_multiplication/triton_test.py',
-        ),
-        minutes=1,
+        compat_minutes=1,
     ),
     # -- experimental ------------------------------------------------------
     'experimental-mla-v2-kernel': Spec(
         paths=('tokamax/_src/ops/experimental/mla/v2/mla_kernel_v2_test.py',),
         minutes=35,
+        compat_minutes=4,
     ),
     # kda was in the catch-all, which is where an unscheduled file is supposed
     # to end up and be noticed: at 15.4m on tpu6e it was the entire catch-all's
@@ -566,8 +607,11 @@ SHARDS: ShardMap = {
     # `base_test.py` runs all 20 everywhere, so pinning them together would
     # either waste a GPU job or drop the CUDA coverage.
     'experimental-kda-kernel': Spec(
-        paths=('tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',),
-        minutes=21,
+        paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',
+        ),
+        minutes=16,
+        compat_minutes=1,
     ),
     'experimental-kda-megakernel-forward': Spec(
         paths=(
@@ -596,17 +640,32 @@ SHARDS: ShardMap = {
         ),
         minutes=10,
     ),
-    # The DeepSeek-V4 sparse MLA op, new since the last rebalance. Timed from
-    # the catch-all of run 38087594559, where it was the only file group: 11.2m
-    # on tpu7x for the `Run shard` step (1.4m on tpu6e, 1.1m on h100).
-    'experimental-sparse-mla': Spec(
+    # Unmeasured until now. Slow only on tpu7x, against well under a minute on
+    # h100 and tpu6e: 10m there (`gmm_test.py` 5.7m, `moe_test.py` 4.4m)
+    # until the gmm-up/gmm-down fusion change of 2026-10-21, and 14-15m in
+    # each of the three runs since.
+    'experimental-routing-moe': Spec(
         paths=(
-            'tokamax/_src/ops/sparse_mla/api_test.py',
-            'tokamax/_src/ops/sparse_mla/base_test.py',
-            'tokamax/_src/ops/sparse_mla/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/sparse_mla/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/moe_test.py',
         ),
-        minutes=11,
+        minutes=15,
+        compat_minutes=1,
+    ),
+    # The masked dense MLA op. Its 1 was an estimate, from a catch-all run
+    # that held it together with `sparse_mla`; timed on its own it is 10m on
+    # tpu7x, 8m of that `scatter_test.py`, and about a minute elsewhere.
+    'experimental-masked-dense-mla': Spec(
+        paths=(
+            'tokamax/_src/ops/masked_dense_mla/api_test.py',
+            'tokamax/_src/ops/masked_dense_mla/base_test.py',
+            'tokamax/_src/ops/masked_dense_mla/kv_cache_utils_test.py',
+            'tokamax/_src/ops/masked_dense_mla/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/masked_dense_mla/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/masked_dense_mla/scatter_test.py',
+        ),
+        minutes=10,
+        compat_minutes=3,
     ),
     # The DeepSeek-V4 compressor projection. Out of the catch-all, where it
     # was the largest single op at 7.7m on tpu6e, nearly all of it
@@ -619,23 +678,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/proj_and_save_state/pallas_mosaic_tpu_test.py',
         ),
         minutes=8,
-    ),
-    'experimental-mla-v2': Spec(
-        paths=(
-            'tokamax/_src/ops/experimental/mla/v2/mla_transpose_test.py',
-            'tokamax/_src/ops/experimental/mla/v2/test_mla_tuned_params.py',
-        ),
-        minutes=6,
-    ),
-    'experimental-mhc': Spec(
-        paths=(
-            'tokamax/_src/ops/mhc/api_test.py',
-            'tokamax/_src/ops/mhc/base_test.py',
-            'tokamax/_src/ops/mhc/mhc_test.py',
-            'tokamax/_src/ops/mhc/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/mhc/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=6,
+        compat_minutes=3,
     ),
     'experimental-batched-rpa': Spec(
         paths=(
@@ -646,11 +689,31 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/batched_rpa/kernel/stacked_rpa_kv_writeback_test.py',
             'tokamax/_src/ops/batched_rpa/pallas_mosaic_tpu_test.py',
         ),
+        minutes=6,
+        compat_minutes=2,
+    ),
+    'experimental-mla-v2': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/mla/v2/mla_transpose_test.py',
+            'tokamax/_src/ops/experimental/mla/v2/test_mla_tuned_params.py',
+        ),
+        minutes=6,
+        compat_minutes=1,
+    ),
+    'experimental-mhc': Spec(
+        paths=(
+            'tokamax/_src/ops/mhc/api_test.py',
+            'tokamax/_src/ops/mhc/base_test.py',
+            'tokamax/_src/ops/mhc/mhc_test.py',
+            'tokamax/_src/ops/mhc/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/mhc/pallas_mosaic_tpu_test.py',
+        ),
         minutes=5,
+        compat_minutes=2,
     ),
     # The rest of the DeepSeek-V4 ops -- dsv4_compressor, grouped_lowrank_proj,
-    # deepseek_rope -- out of the catch-all, one op per shard like the two
-    # above.
+    # deepseek_rope -- out of the catch-all, one op per shard like
+    # `experimental-sparse-mla` and `experimental-proj-and-save-state`.
     'experimental-dsv4-compressor': Spec(
         paths=(
             'tokamax/_src/ops/dsv4_compressor/api_test.py',
@@ -659,7 +722,20 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/dsv4_compressor/pallas_mosaic_tpu_kernel_test.py',
             'tokamax/_src/ops/dsv4_compressor/pallas_mosaic_tpu_test.py',
         ),
-        minutes=5,
+        minutes=4,
+        compat_minutes=2,
+    ),
+    # The dlhs-kernel and vjp tests joined from the catch-all, at 0.5m between
+    # them on tpu7x and nothing elsewhere.
+    'experimental-fused-fp8-matmul': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/fused_fp8_matmul/base_test.py',
+            'tokamax/_src/ops/experimental/fused_fp8_matmul/pallas_mosaic_tpu_dlhs_kernel_test.py',
+            'tokamax/_src/ops/experimental/fused_fp8_matmul/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/fused_fp8_matmul/pallas_mosaic_tpu_vjp_test.py',
+        ),
+        minutes=4,
+        compat_minutes=2,
     ),
     'experimental-grouped-lowrank-proj': Spec(
         paths=(
@@ -670,16 +746,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/grouped_lowrank_proj/pallas_mosaic_tpu_test.py',
         ),
         minutes=4,
-    ),
-    'experimental-deepseek-rope': Spec(
-        paths=(
-            'tokamax/_src/ops/deepseek_rope/api_test.py',
-            'tokamax/_src/ops/deepseek_rope/base_test.py',
-            'tokamax/_src/ops/deepseek_rope/deepseek_rope_test.py',
-            'tokamax/_src/ops/deepseek_rope/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/deepseek_rope/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=3,
+        compat_minutes=2,
     ),
     'experimental-lightning-indexer': Spec(
         paths=(
@@ -690,14 +757,42 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/lightning_indexer/kernel/streamindex_topk_test.py',
             'tokamax/_src/ops/lightning_indexer/pallas_mosaic_tpu_test.py',
         ),
-        minutes=3,
+        minutes=4,
+        compat_minutes=2,
     ),
-    'experimental-fused-fp8-matmul': Spec(
+    # The mHC-lite op, out of the catch-all, where it landed after the timing
+    # window: 3.2m on h100, nearly all of it `api_test.py`, and about a minute
+    # on either TPU.
+    'experimental-mhc-lite': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/fused_fp8_matmul/base_test.py',
-            'tokamax/_src/ops/experimental/fused_fp8_matmul/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/mhc_lite/api_test.py',
+            'tokamax/_src/ops/experimental/mhc_lite/mhc_test.py',
+        ),
+        minutes=4,
+        compat_minutes=1,
+    ),
+    # The sliding-window MLA op, out of the catch-all: 2.9m on tpu7x, nearly
+    # all of it the two TPU tests, and well under a minute elsewhere.
+    'experimental-mla-swa': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/mla_swa/api_test.py',
+            'tokamax/_src/ops/experimental/mla_swa/base_test.py',
+            'tokamax/_src/ops/experimental/mla_swa/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/experimental/mla_swa/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=4,
+        compat_minutes=3,
+    ),
+    'experimental-deepseek-rope': Spec(
+        paths=(
+            'tokamax/_src/ops/deepseek_rope/api_test.py',
+            'tokamax/_src/ops/deepseek_rope/base_test.py',
+            'tokamax/_src/ops/deepseek_rope/deepseek_rope_test.py',
+            'tokamax/_src/ops/deepseek_rope/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/deepseek_rope/pallas_mosaic_tpu_test.py',
         ),
         minutes=3,
+        compat_minutes=1,
     ),
     'experimental-csa-gather': Spec(
         paths=(
@@ -708,6 +803,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/csa_gather/pallas_mosaic_tpu_test.py',
         ),
         minutes=2,
+        compat_minutes=1,
     ),
     # The kda tests that are not the kernel; see `experimental-kda-kernel`.
     'experimental-kda': Spec(
@@ -717,6 +813,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/kda/xla_chunked_test.py',
         ),
         minutes=2,
+        compat_minutes=1,
     ),
     'experimental-mla': Spec(
         paths=(
@@ -725,6 +822,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/experimental/mla/pallas_mosaic_tpu_test.py',
         ),
         minutes=2,
+        compat_minutes=2,
     ),
     # Timed per file from the catch-all logs of run 37853506309: 1.8m on
     # tpu6e, nearly all of it `pallas_mosaic_tpu_test.py`.
@@ -735,9 +833,24 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/router_topk/pallas_mosaic_tpu_test.py',
         ),
         minutes=2,
+        compat_minutes=1,
+    ),
+    # The DeepSeek-V4 sparse MLA op. First timed from the catch-all of run
+    # 38087594559, where it was the only file group, at 11.2m on tpu7x; on
+    # its own it now takes 1.7m there.
+    'experimental-sparse-mla': Spec(
+        paths=(
+            'tokamax/_src/ops/sparse_mla/api_test.py',
+            'tokamax/_src/ops/sparse_mla/base_test.py',
+            'tokamax/_src/ops/sparse_mla/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/sparse_mla/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=2,
+        compat_minutes=2,
     ),
     'experimental-fused-moe': Spec(
         paths=(
+            'tokamax/_src/ops/experimental/fused_moe/api_test.py',
             'tokamax/_src/ops/experimental/fused_moe/base_test.py',
             'tokamax/_src/ops/experimental/fused_moe/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2.py',
@@ -748,20 +861,20 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/experimental/fused_moe/test_tp_token_layout.py',
         ),
         minutes=1,
+        compat_minutes=1,
     ),
-    # The masked dense MLA op, new since the last rebalance. Not timed on its
-    # own: the catch-all of run 38004010741 ran it with `sparse_mla` in 10.8m on
-    # tpu7x, no longer than `sparse_mla` alone (11.2m), so an estimate.
-    'experimental-masked-dense-mla': Spec(
+    # The fused MoE decode op, out of the catch-all: 0.5m on tpu7x, less
+    # elsewhere. Its own shard rather than folded into `experimental-fused-moe`
+    # so that selection can tell the two ops apart.
+    'experimental-fused-moe-decode': Spec(
         paths=(
-            'tokamax/_src/ops/masked_dense_mla/api_test.py',
-            'tokamax/_src/ops/masked_dense_mla/base_test.py',
-            'tokamax/_src/ops/masked_dense_mla/kv_cache_utils_test.py',
-            'tokamax/_src/ops/masked_dense_mla/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/masked_dense_mla/pallas_mosaic_tpu_test.py',
-            'tokamax/_src/ops/masked_dense_mla/scatter_test.py',
+            'tokamax/_src/ops/experimental/fused_moe_decode/api_test.py',
+            'tokamax/_src/ops/experimental/fused_moe_decode/base_test.py',
+            'tokamax/_src/ops/experimental/fused_moe_decode/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/fused_moe_decode/test_fused_moe_decode_kernel.py',
         ),
         minutes=1,
+        compat_minutes=1,
     ),
     # The topk tests that are not the kernel. Separate from
     # `experimental-topk-kernel` because that one is TPU-pinned and these two
@@ -772,6 +885,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/topk/base_test.py',
         ),
         minutes=1,
+        compat_minutes=1,
     ),
     'experimental-topk-kernel': Spec(
         paths=(
@@ -779,14 +893,23 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/topk/pallas_mosaic_tpu_test.py',
         ),
         minutes=1,
-    ),
-    'experimental-routing-moe': Spec(
-        paths=(
-            'tokamax/_src/ops/experimental/routing_moe/test/gmm_test.py',
-            'tokamax/_src/ops/experimental/routing_moe/test/wrapper_test.py',
-        ),
+        compat_minutes=1,
     ),
     # -- core --------------------------------------------------------------
+    'core-autotuning': Spec(
+        paths=(
+            'tokamax/_src/autotuning/api_test.py',
+            'tokamax/_src/autotuning/cache_test.py',
+        ),
+        minutes=2,
+        compat_minutes=1,
+    ),
+    # Public-API smoke test: the canary for an import or packaging break.
+    'core-api': Spec(
+        paths=('tokamax/tokamax_test.py',),
+        minutes=1,
+        compat_minutes=1,
+    ),
     # The library internals under `tokamax/_src/`, none of which is slow enough
     # to deserve a shard. Enumerated file by file rather than given as the
     # directory `tokamax/_src/`, which would swallow every op subdirectory, and
@@ -805,6 +928,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/hlo_utils_test.py',
             'tokamax/_src/jaxtyping_test.py',
             'tokamax/_src/mosaic_gpu_test.py',
+            'tokamax/_src/mosaic_tpu_test.py',
             'tokamax/_src/numerics_test.py',
             'tokamax/_src/ops/op_test.py',
             'tokamax/_src/pallas/block_test.py',
@@ -813,19 +937,8 @@ SHARDS: ShardMap = {
             'tokamax/_src/shape_test.py',
             'tokamax/_src/test_utils_test.py',
         ),
-        minutes=4,
-    ),
-    # Public-API smoke test: the canary for an import or packaging break.
-    'core-api': Spec(
-        paths=('tokamax/tokamax_test.py',),
-        minutes=3,
-    ),
-    'core-autotuning': Spec(
-        paths=(
-            'tokamax/_src/autotuning/api_test.py',
-            'tokamax/_src/autotuning/cache_test.py',
-        ),
-        minutes=3,
+        minutes=1,
+        compat_minutes=1,
     ),
     # -- catch-all ---------------------------------------------------------
     # Temporary shard that ideally should be empty. It's filled in by

@@ -25,6 +25,7 @@ installed.
   python3 -m unittest discover -s .github/ci -p '*_test.py'
 """
 
+import ast
 import os
 import tempfile
 import textwrap
@@ -74,6 +75,15 @@ FAKE_PACKAGE = {
     'tokamax/_src/cycle_b.py': 'from tokamax._src import cycle_a\n',
     # Imported by nothing: changing it must select no test, not every test.
     'tokamax/_src/orphan.py': 'import jax\n',
+    # An op the autotuning cache serves, and its table. The table is named
+    # after the class, as `cache.py` names it, so module and table disagree
+    # the way they do in the real package: nothing about `ragged.py` says
+    # `pallas_mosaic_tpu_ragged_dot`.
+    'tokamax/_src/ops/ragged.py': (
+        'import jax\n\n\nclass PallasMosaicTpuRaggedDot(Op):\n  pass\n'
+    ),
+    'tokamax/_src/ops/ragged_test.py': 'from tokamax._src.ops import ragged\n',
+    'tokamax/data/autotuning/tpu7x/pallas_mosaic_tpu_ragged_dot.json': '{}\n',
 }
 
 # Kept out of the package above and written only by the tests that want it.
@@ -173,6 +183,13 @@ class GraphTest(DepsTestCase):
         'tokamax/_src/core_test.py', index['tokamax/_src/__init__.py']
     )
 
+  def test_follows_lazy_submodules_declared_in_package_all(self):
+    self.add('tokamax/ops/__init__.py', '__all__ = ("tpu",)\n')
+    self.add('tokamax/ops/tpu.py', 'from tokamax._src.ops import ragged\n')
+    self.add('tokamax/ops/lazy_test.py', 'from tokamax import ops\n')
+    tests, _ = self.affected('tokamax/_src/ops/ragged.py')
+    self.assertIn('tokamax/ops/lazy_test.py', tests)
+
   def test_cycles_terminate(self):
     tests, _ = self.affected('tokamax/_src/cycle_a.py')
     self.assertEqual(tests, set())
@@ -219,7 +236,12 @@ class FailOpenTest(DepsTestCase):
     # live inside the package, and every README or docs/ change cost a full
     # run of every shard. Documentation is the common case for a no-test PR,
     # so getting this backwards was the expensive way round.
-    for path in ('README.md', 'docs/index.md', 'docs/ops/kda/index.md'):
+    for path in (
+        'README.md',
+        'docs/index.md',
+        'docs/ops/kda/index.md',
+        'docs/tokamax_ops.ipynb',
+    ):
       with self.subTest(path=path):
         tests, reason = self.affected(path)
         self.assertEqual(tests, set())
@@ -422,6 +444,212 @@ class NewFileTest(DepsTestCase):
     tests, reason = self.affected('tokamax/_src/brand_new.py')
     self.assertEqual(tests, set())
     self.assertIsNone(reason)
+
+
+class AutotuningTableTest(DepsTestCase):
+
+  TABLE = 'tokamax/data/autotuning/tpu7x/pallas_mosaic_tpu_ragged_dot.json'
+
+  def assert_full_run(self, path, *fragments):
+    tests, reason = self.affected(path)
+    self.assertIsNone(tests, f'{path} should force a full run')
+    for fragment in fragments:
+      self.assertIn(fragment, reason)
+
+  def test_a_table_reaches_only_its_ops_tests(self):
+    tests, reason = self.affected(self.TABLE)
+    self.assertIsNone(reason)
+    self.assertEqual(tests, {'tokamax/_src/ops/ragged_test.py'})
+
+  def test_a_table_is_matched_by_class_name_not_module_name(self):
+    self.assert_full_run(
+        'tokamax/data/autotuning/tpu7x/ragged.json', 'ragged.json', "'ragged'"
+    )
+
+  def test_a_table_for_no_op_runs_everything(self):
+    self.add(
+        'tokamax/ops.py',
+        'from tokamax._src.ops.ragged import PallasMosaicTpuRaggedDot as'
+        ' PallasTritonRaggedDot\n',
+    )
+    self.assert_full_run(
+        'tokamax/data/autotuning/tpu7x/pallas_triton_ragged_dot.json',
+        "'pallas_triton_ragged_dot'",
+        'no class',
+    )
+
+  def test_other_package_data_still_runs_everything(self):
+    for path in (
+        'tokamax/benchmarks/benchmark_registry.pbtxt',
+        'tokamax/data/autotuning/pallas_mosaic_tpu_ragged_dot.json',
+        'tokamax/data/autotuning/tpu7x/v2/pallas_mosaic_tpu_ragged_dot.json',
+        'tokamax/data/autotuning/tpu7x/pallas_mosaic_tpu_ragged_dot.txt',
+    ):
+      with self.subTest(path=path):
+        self.assert_full_run(path, os.path.basename(path), 'package data')
+
+  def test_a_deleted_table_selects_the_same_tests_as_an_edited_one(self):
+    self.remove(self.TABLE)
+    tests, reason = self.affected(self.TABLE)
+    self.assertIsNone(reason)
+    self.assertEqual(tests, {'tokamax/_src/ops/ragged_test.py'})
+
+  def test_a_class_name_defined_twice_reaches_both(self):
+    self.add(
+        'tokamax/_src/ops/ragged_copy.py',
+        'class PallasMosaicTpuRaggedDot(Op):\n  pass\n',
+    )
+    self.add(
+        'tokamax/_src/ops/ragged_copy_test.py',
+        'from tokamax._src.ops import ragged_copy\n',
+    )
+    tests, reason = self.affected(self.TABLE)
+    self.assertIsNone(reason)
+    self.assertEqual(
+        tests,
+        {
+            'tokamax/_src/ops/ragged_test.py',
+            'tokamax/_src/ops/ragged_copy_test.py',
+        },
+    )
+
+  def test_a_table_is_walked_through_the_graph_like_its_module(self):
+    self.add('tokamax/_src/wrapper.py', 'from tokamax._src.ops import ragged\n')
+    self.add(
+        'tokamax/_src/wrapper_test.py', 'from tokamax._src import wrapper\n'
+    )
+    tests, _ = self.affected(self.TABLE)
+    self.assertIn('tokamax/_src/wrapper_test.py', tests)
+
+  def test_a_table_does_not_exempt_the_rest_of_the_changeset(self):
+    tests, reason = self.affected(self.TABLE, 'tokamax/data/tuning.json')
+    self.assertIsNone(tests)
+    self.assertIn('tuning.json', reason)
+
+  def test_without_the_op_index_a_table_is_ordinary_package_data(self):
+    reason = deps.full_run_reason([self.TABLE], self.unparsed, self.files)
+    self.assertIn('package data', reason)
+
+  def test_an_unparseable_file_still_comes_first(self):
+    self.add('tokamax/_src/broken.py', UNPARSEABLE)
+    tests, reason = self.affected(self.TABLE)
+    self.assertIsNone(tests)
+    self.assertIn('broken.py', reason)
+
+  def test_a_table_also_selects_the_cache_test(self):
+    self.add(deps.AUTOTUNING_CACHE_TEST, 'from tokamax._src import core\n')
+    tests, reason = self.affected(self.TABLE)
+    self.assertIsNone(reason)
+    self.assertEqual(
+        tests,
+        {'tokamax/_src/ops/ragged_test.py', deps.AUTOTUNING_CACHE_TEST},
+    )
+
+  def test_a_table_whose_op_reaches_no_test_runs_everything(self):
+    self.add(deps.AUTOTUNING_CACHE_TEST, 'from tokamax._src import core\n')
+    self.remove('tokamax/_src/ops/ragged_test.py')
+    self.assert_full_run(self.TABLE, 'reaches no test')
+
+  def test_non_op_classes_are_not_indexed(self):
+    self.remove('tokamax/_src/ops/ragged.py')
+    self.add(
+        'tokamax/_src/core.py',
+        'class PallasMosaicTpuRaggedDot(Op):\n  pass\n',
+    )
+    self.add(
+        'tokamax/_src/ops/ragged_test.py',
+        'class PallasMosaicTpuRaggedDot(Op):\n  pass\n',
+    )
+    self.add(
+        'tokamax/_src/ops/config.py',
+        'class PallasMosaicTpuRaggedDot:\n  pass\n',
+    )
+    self.assert_full_run(self.TABLE, 'no class')
+
+
+class LoaderAgreementTest(unittest.TestCase):
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
+    )
+    cls.pkg = os.path.join(root, deps.PACKAGE_ROOT)
+    if not os.path.isdir(cls.pkg):
+      cls.pkg = root
+    path = os.path.join(cls.pkg, '_src', 'autotuning', 'cache.py')
+    with open(path, encoding='utf-8') as f:
+      cls.tree = ast.parse(f.read(), filename=path)
+
+  def constant(self, name):
+    for node in ast.walk(self.tree):
+      if (
+          isinstance(node, ast.AnnAssign)
+          and isinstance(node.target, ast.Name)
+          and node.target.id == name
+      ):
+        return node.value
+    self.fail(f'cache.py no longer defines {name}')
+
+  def test_the_table_directory(self):
+    self.assertEqual(
+        f'{deps.PACKAGE_ROOT}/{ast.literal_eval(self.constant("CACHE_PATH"))}',
+        deps.AUTOTUNING_DATA,
+    )
+
+  def test_the_cache_test_exists(self):
+    rel = deps.AUTOTUNING_CACHE_TEST.removeprefix(f'{deps.PACKAGE_ROOT}/')
+    self.assertTrue(os.path.isfile(os.path.join(self.pkg, rel)))
+
+  def test_every_resolved_table_reaches_an_op_test(self):
+    cwd = os.getcwd()
+    self.addCleanup(os.chdir, cwd)
+    os.chdir(os.path.dirname(self.pkg))
+    files = deps.python_files()
+    edges, unparsed = deps.import_graph(files)
+    self.assertFalse(unparsed)
+    index = deps.dependents(edges, files)
+    ops = deps.op_modules(files)
+    tables = sorted(
+        os.path.join(d, f).replace(os.sep, '/')
+        for d, _, fs in os.walk(deps.AUTOTUNING_DATA)
+        for f in fs
+    )
+    self.assertTrue(tables)
+    for table in tables:
+      name = deps.autotuning_op_name(table)
+      self.assertIsNotNone(name, table)
+      if modules := ops.get(name):
+        op_tests = set().union(*(index.get(m, set()) for m in modules))
+        self.assertTrue(op_tests, f'{table} reaches no op test')
+
+  def test_the_class_name_to_op_name_pattern(self):
+    call = self.constant('_CAMEL_TO_SNAKE_PATTERN')
+    self.assertEqual(
+        ast.literal_eval(call.args[0]), deps._CAMEL_TO_SNAKE.pattern
+    )
+
+  def test_the_op_name_is_taken_from_the_op_class_name(self):
+    subs = [
+        (ast.literal_eval(node.args[0]), ast.unparse(node.args[1]))
+        for node in ast.walk(self.tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == '_CAMEL_TO_SNAKE_PATTERN'
+        and node.func.attr == 'sub'
+    ]
+    self.assertIn((r'_\1', 'type(self.op).__name__'), subs)
+
+  def test_the_table_path_is_device_then_op(self):
+    joins = [
+        ', '.join(ast.unparse(arg) for arg in node.args[1:])
+        for node in ast.walk(self.tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, 'attr', None) == 'joinpath'
+    ]
+    self.assertIn("device_kind, f'{op_name}.json'", joins)
 
 
 class ClosureInvariantTest(DepsTestCase):

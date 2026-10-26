@@ -374,6 +374,9 @@ def flash_attention_kernel(
   head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
 
+  if bias is not None and bias.shape[-2] != 1:
+    bias = shape_lib.pad_to_next_multiple_of(bias, 8, -2)
+
   if mask is not None:
     if mask.shape[-2] == 1 or mask.shape[-1] == 1:
       mask = mask.astype(jnp.int8)

@@ -15,10 +15,7 @@
 
 ## Roadmap
 
-- Replace compiler based helper functions with more efficient kernels.
-- Support in-kernel random remote HBM read/write to hide collective behind compute.
 - Support FP8 remote HBM read/write to minimize penalty of pre-topk reduce collective.
-- Support up and down fusion to increase arithmetic intensity.
 - Support subchannel quantized weight and bias.
 - Support calculating near-optimal routing strategy at compile time for good OOTB experience.
 
@@ -41,8 +38,11 @@ routing_moe/
 │   ├── input_pack.py: Handles large -> compact layout transformation.
 │   └── output_reduce.py: Handles topk reduce and compact -> large transformation.
 ├── layer/
-│   └── wrapper.py: MoE entry point that accepts activation and router output.
+│   ├── config.py: Compile time static configuration object for MoE layer.
+│   ├── modular.py: Modular MoE entry point accepting pre-computed top-k weights and indices.
+│   ├── monolithic.py: Monolithic MoE entry point that computes routing and invokes modular MoE.
+│   └── plan.py: Tunable parameters for MoE layer execution that have no impact on outputs.
 └── test/
     ├── gmm_test.py: Standalone test for grouped matrix multiplication.
-    └── wrapper_test.py: A test for entire single MoE layer.
+    └── moe_test.py: A test for entire single MoE layer.
 ```
