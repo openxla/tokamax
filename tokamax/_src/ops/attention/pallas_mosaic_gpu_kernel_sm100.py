@@ -804,13 +804,16 @@ def flash_attention_kernel(
           # in 2CTA we have non square blocks hence we may need to process
           # M//N steps with a mask, for M=256, N=128 this means 2 steps
           causal_blocks = int(is_causal) * (block_q // block_kv)
-          carry = lax.fori_loop(
-              lb, ub - causal_blocks, kv_loop, (m_i, m_i, l_i)
-          )
+          # Never start the causal loop before `lb`: with fewer than
+          # `causal_blocks` KV blocks (e.g. 2CTA with a single KV block), we
+          # would otherwise run more iterations than the MMA warp, and wait on
+          # `s_produced` forever.
+          ub_no_causal = lax.max(lb, ub - causal_blocks) if is_causal else ub
+          carry = lax.fori_loop(lb, ub_no_causal, kv_loop, (m_i, m_i, l_i))
 
           if is_causal:
             causal_kv_loop = functools.partial(kv_loop, do_causal=True)
-            carry = lax.fori_loop(ub - causal_blocks, ub, causal_kv_loop, carry)
+            carry = lax.fori_loop(ub_no_causal, ub, causal_kv_loop, carry)
 
           m_scale, m_i, l_i = carry
 
