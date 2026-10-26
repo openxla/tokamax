@@ -25,6 +25,7 @@ import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.kda import base
+from tokamax._src.ops.kda import compact
 from tokamax._src.ops.kda.cp_utils import (
     ContextParallelMetadata,
     ContextParallelMetadataArg,
@@ -70,6 +71,10 @@ class Config:
   `fuse_backward=True` also fuses the non-CP saved-state backward. Manual
   state rematerialization is fused separately with `fuse_rematerialization=True`;
   CP retains its existing backward path.
+  `compact_forward=True` selects the original-token grid for supported non-CP
+  BF16 saved-state profiles. The paired compact backward consumes its tape.
+  `compact_sorted_segments=True` declares grouped labels and trailing padding,
+  omitting the general input permutation and its worst-case temporary buffers.
   """
 
   chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
@@ -84,6 +89,10 @@ class Config:
   fuse_backward: bool = False
   # Opt-in until TPU compilation and device-time validation completes.
   fuse_rematerialization: bool = False
+  # Original-token grid; the dependent backward increment consumes its tape.
+  compact_forward: bool = False
+  # Static packed-input contract avoids allocating an interleaved-label fallback.
+  compact_sorted_segments: bool = False
 
 
 def _resolve_safe_gate(
@@ -211,9 +220,7 @@ def check_inputs_support(
 
 
 @dataclasses.dataclass(frozen=True)
-class PallasMosaicTpuKimiDeltaAttention(
-    base.KimiDeltaAttention[Config, Any]
-):
+class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
   """Pallas/Mosaic TPU KDA backend.
 
   This adapter preserves Tokamax's experimental head-first KDA contract:
@@ -232,9 +239,7 @@ class PallasMosaicTpuKimiDeltaAttention(
     return Config(chunk_size=64)
 
   @override
-  def _get_autotuning_configs(
-      self, ba: op.BoundArguments
-  ) -> set[Config]:
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     del ba
     return {Config(chunk_size=64)}
 
@@ -314,14 +319,12 @@ class PallasMosaicTpuKimiDeltaAttention(
             )
           else:
             in_range = (
-                positions[None, :]
-                >= aligned_starts[batch_index, :, None]
+                positions[None, :] >= aligned_starts[batch_index, :, None]
             ) & (
                 positions[None, :]
-                < (
-                    aligned_starts[batch_index]
-                    + original_lengths[batch_index]
-                )[:, None]
+                < (aligned_starts[batch_index] + original_lengths[batch_index])[
+                    :, None
+                ]
             )
             valid_mask = in_range.any(axis=0)
           g_aligned = g_aligned.at[:, batch_index].set(
@@ -449,6 +452,33 @@ class PallasMosaicTpuKimiDeltaAttention(
         max_num_segments=max_num_segments,
     )
 
+    if compact.supported(
+        query,
+        value,
+        segment_ids=segment_ids,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm=use_qk_l2norm,
+        context_parallel_metadata=context_parallel_metadata,
+        config=config,
+    ):
+      return compact.forward(
+          query,
+          key,
+          value,
+          gate,
+          beta,
+          a_log=a_log,
+          delta_time_bias=delta_time_bias,
+          scale=scale,
+          segment_ids=segment_ids,
+          lower_bound=lower_bound,
+          use_gate_in_kernel=use_gate_in_kernel,
+          return_residuals=return_residuals,
+          sorted_segments=config.compact_sorted_segments,
+          max_num_segments=max_num_segments,
+      )
+
     prepared = self._preprocess_inputs(
         query,
         key,
@@ -515,6 +545,7 @@ class PallasMosaicTpuKimiDeltaAttention(
       final_state = final_state[:, None]
     return (value, final_state), residuals
 
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PallasMosaicTpuKimiDeltaAttentionVjp(
     op.Op[Any, dict[str, Any], None, Config, Any]
@@ -529,15 +560,13 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     return Config(chunk_size=64)
 
   @override
-  def _get_autotuning_configs(
-      self, ba: op.BoundArguments
-  ) -> set[Config]:
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     del ba
     return {Config(chunk_size=64)}
 
   def _fwd(
       self,
-      residuals: KdaResiduals,
+      residuals: KdaResiduals | compact.CompactResiduals,
       out: base.Output,
       dout: base.Output,
       query: jax.Array,
@@ -560,6 +589,22 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       return_residuals: bool,
       config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
+    if isinstance(residuals, compact.CompactResiduals):
+      gradients = compact.backward(
+          residuals,
+          dout,
+          query=query,
+          value=value,
+          gate=gate,
+          scale=scale,
+          lower_bound=lower_bound,
+          use_gate_in_kernel=use_gate_in_kernel,
+          a_log=a_log,
+          delta_time_bias=delta_time_bias,
+      )
+      if segment_ids is not None:
+        gradients["segment_ids"] = jnp.zeros_like(segment_ids)
+      return gradients, None
     # Packed loading normalizes the replayed original Q/K explicitly. The
     # aligned residuals still supply gate prefixes and normalization backward.
     del out, gate, output_final_state, return_residuals
