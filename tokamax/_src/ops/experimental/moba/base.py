@@ -23,7 +23,7 @@ from tokamax._src.ops import op
 from typing_extensions import override
 
 _Config = TypeVar("_Config")
-Output: TypeAlias = tuple[jax.Array, None]
+Output: TypeAlias = jax.Array
 Residuals: TypeAlias = Any
 
 
@@ -122,7 +122,8 @@ def moba_reference(
   """Reference implementation of Mixture of Block Attention (MoBA)."""
   if q.shape != k.shape or q.shape != v.shape:
     raise ValueError(
-        f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape}, v={v.shape}"
+        f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape},"
+        f" v={v.shape}"
     )
   seq_len = q.shape[2]
   if seq_len % chunk_size != 0:
@@ -173,4 +174,4 @@ class MixtureOfBlockAttention[C](op.Op[Any, Output, Residuals, C, None]):
         chunk_size=chunk_size,
         scale=scale,
     )
-    return (out, None), None
+    return out, None

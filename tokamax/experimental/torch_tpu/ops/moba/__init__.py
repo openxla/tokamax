@@ -17,6 +17,7 @@
 
 from tokamax.experimental.torch_tpu.ops.moba.torch_base import (
     _MixtureOfBlockAttention,
+    mixture_of_block_attention,
 )
 from tokamax.experimental.torch_tpu.ops.moba.torch_pallas_mosaic_tpu import (
     _PallasTpuMixtureOfBlockAttention,
@@ -30,6 +31,7 @@ flash_moba_pallas = moba
 __all__ = [
     "_MixtureOfBlockAttention",
     "_PallasTpuMixtureOfBlockAttention",
+    "mixture_of_block_attention",
     "moba",
     "moba_pallas_attention",
     "flash_moba_pallas",

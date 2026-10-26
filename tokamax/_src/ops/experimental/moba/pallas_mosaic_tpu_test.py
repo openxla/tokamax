@@ -27,8 +27,8 @@ class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
 
   def test_pallas_fwd_matches_reference(self):
     key = jax.random.PRNGKey(123)
-    batch_size, num_heads, seq_len, head_dim = 2, 4, 512, 16
-    chunk_size = 256
+    batch_size, num_heads, seq_len, head_dim = 2, 4, 256, 16
+    chunk_size = 64
     topk = 2
 
     k0, k1, k2 = jax.random.split(key, 3)
@@ -42,8 +42,10 @@ class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
         k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
     )
 
-    op_instance = pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention()
-    (actual_out, _), _ = op_instance._fwd(
+    op_instance = pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention(
+        bypass_device_check=True
+    )
+    actual_out = op_instance(
         q, k, v, topk=topk, chunk_size=chunk_size
     )
     expected_out, _ = base.moba_reference(
@@ -73,6 +75,18 @@ class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
           chunk_size=256,
           topk=-1,
       )
+
+  def test_tpu_export_lowering(self):
+    shape = jax.ShapeDtypeStruct((2, 2, 256, 16), jnp.float32)
+    exported = jax.export.export(
+        jax.jit(
+            lambda q, k, v: pallas_mosaic_tpu.pallas_mosaic_tpu_kernel.moba_pallas_fwd(
+                q, k, v, topk=2, chunk_size=64, interpret=False
+            )[0]
+        ),
+        platforms=("tpu",),
+    )(shape, shape, shape)
+    self.assertIsNotNone(exported.mlir_module())
 
 
 if __name__ == "__main__":

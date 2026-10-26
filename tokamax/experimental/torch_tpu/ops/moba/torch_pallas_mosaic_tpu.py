@@ -15,10 +15,12 @@
 
 """PyTorch interface for Pallas TPU Mixture of Block Attention (MoBA) operator."""
 
-from typing import Any, Optional
+from typing import Optional
 import jax
 import jax.numpy as jnp
+import numpy as np
 import torch
+from tokamax._src.ops.experimental.moba import base as jax_base
 from tokamax._src.ops.experimental.moba import pallas_mosaic_tpu as jax_pallas
 from tokamax.experimental.torch_tpu.ops.moba import torch_base
 from typing_extensions import override
@@ -28,21 +30,89 @@ class _PallasTpuMixtureOfBlockAttention(torch_base._MixtureOfBlockAttention):
   """PyTorch wrapper for Pallas TPU MoBA operator."""
 
   def __init__(self):
-    super().__init__()
-    self.op_impl_jax = jax_pallas.PallasTpuMixtureOfBlockAttention()
-    self._torch_tokamax_op = None
+    super().__init__(
+        op_impl_jax=jax_pallas.PallasTpuMixtureOfBlockAttention(),
+        jax_op_name="torch_tpu_pallas_moba",
+    )
+
+  def _register_ops(self) -> None:
+    if hasattr(super(), "_register_ops"):
+      super()._register_ops()
     try:
-      from torch_tpu._internal import pallas
+      from torch_tpu._internal import pallas  # pylint: disable=g-import-not-at-top
     except ImportError:
-      pallas = None
+      pass
     else:
-      try:
-        self._torch_tokamax_op = pallas.jax_op(self.jax_op_name, self.op_impl_call)
+      if self._torch_tokamax_op is not None:
         self._setup_autograd(pallas)
-      except Exception:
-        self._torch_tokamax_op = None
+
+  @override
+  def _cpu_fallback(
+      self,
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      chunk_size: int = torch_base._CHUNK_SIZE,
+      topk: int = torch_base._TOPK,
+      scale: Optional[float] = None,
+  ) -> torch.Tensor:
+    """Executes the Pallas TPU MoBA kernel in interpret mode via JAX."""
+    op_self = self
+
+    class _PallasCpuFn(torch.autograd.Function):
+
+      @staticmethod
+      def forward(ctx, q_t, k_t, v_t):
+        ctx.save_for_backward(q_t, k_t, v_t)
+        q_j = jnp.asarray(q_t.detach().cpu().numpy())
+        k_j = jnp.asarray(k_t.detach().cpu().numpy())
+        v_j = jnp.asarray(v_t.detach().cpu().numpy())
+        out_j = op_self.op_impl_call(
+            q_j,
+            k_j,
+            v_j,
+            topk=topk,
+            chunk_size=chunk_size,
+            scale=scale,
+        )
+        return torch.from_numpy(np.array(out_j, copy=True)).to(
+            device=q_t.device, dtype=q_t.dtype
+        )
+
+      @staticmethod
+      def backward(ctx, do_t):
+        q_t, k_t, v_t = ctx.saved_tensors
+        q_j = jnp.asarray(q_t.detach().cpu().float().numpy())
+        k_j = jnp.asarray(k_t.detach().cpu().float().numpy())
+        v_j = jnp.asarray(v_t.detach().cpu().float().numpy())
+        do_j = jnp.asarray(do_t.detach().cpu().float().numpy())
+        ref_op = jax_base.MixtureOfBlockAttention()
+
+        def _fwd_fn(q_, k_, v_):
+          out_, _ = ref_op._fwd(
+              q_,
+              k_,
+              v_,
+              topk=topk,
+              chunk_size=chunk_size,
+              scale=scale,
+          )
+          return out_
+
+        _, vjp_fn = jax.vjp(_fwd_fn, q_j, k_j, v_j)
+        grads_j = vjp_fn(do_j)
+        return tuple(
+            torch.from_numpy(np.array(g, copy=True)).to(
+                device=t.device, dtype=t.dtype
+            )
+            for g, t in zip(grads_j, (q_t, k_t, v_t))
+        )
+
+    return _PallasCpuFn.apply(q, k, v)
 
   def _setup_autograd(self, pallas_module):
+    ref_op = jax_base.MixtureOfBlockAttention()
+
     def bwd_jax(q, k, v, do, topk=4, chunk_size=256, scale=None):
       head_dim = q.shape[-1]
       scale_val = scale if scale is not None else (head_dim ** -0.5)
@@ -56,7 +126,7 @@ class _PallasTpuMixtureOfBlockAttention(torch_base._MixtureOfBlockAttention):
         do_f = do_b.astype(jnp.float32)
 
         def loss_fn(q_, k_, v_):
-          (out, _), _ = self.op_impl_jax._fwd(
+          out, _ = ref_op._fwd(
               q_[None],
               k_[None],
               v_[None],
@@ -87,9 +157,17 @@ class _PallasTpuMixtureOfBlockAttention(torch_base._MixtureOfBlockAttention):
 
     def backward(ctx, do):
       saved = ctx.saved_tensors
-      return bwd_op(*saved, do, topk=ctx.topk, chunk_size=ctx.chunk_size, scale=ctx.scale)
+      return bwd_op(
+          *saved,
+          do,
+          topk=ctx.topk,
+          chunk_size=ctx.chunk_size,
+          scale=ctx.scale,
+      )
 
-    self._torch_tokamax_op.register_autograd(backward, setup_context=setup_context)
+    self._torch_tokamax_op.register_autograd(
+        backward, setup_context=setup_context
+    )
 
 
 # Singleton instance

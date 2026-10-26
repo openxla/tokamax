@@ -20,6 +20,7 @@ from absl import logging
 from absl.testing import absltest
 import torch
 from tokamax.experimental.torch_tpu.ops.moba import moba as moba_pallas
+from tokamax.experimental.torch_tpu.ops.moba import torch_base
 
 
 class MoBAPallasKernelTest(unittest.TestCase):
@@ -31,18 +32,26 @@ class MoBAPallasKernelTest(unittest.TestCase):
     chunk_size, topk = 64, 2
 
     torch.manual_seed(42)
-    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
-    k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
-    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32)
+    q = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+    )
+    v = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+    )
 
     actual_out = moba_pallas(
         q, k, v, chunk_size=chunk_size, topk=topk
     )
-    expected_out = moba_pallas._cpu_fallback(
-        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), chunk_size=chunk_size, topk=topk
-    ).transpose(1, 2)
+    expected_out = torch_base.mixture_of_block_attention(
+        q, k, v, chunk_size=chunk_size, topk=topk
+    )
 
-    self.assertEqual(actual_out.shape, (batch_size, seq_len, num_heads, head_dim))
+    self.assertEqual(
+        actual_out.shape, (batch_size, seq_len, num_heads, head_dim)
+    )
     torch.testing.assert_close(
         actual_out.cpu(), expected_out.cpu(), rtol=1e-3, atol=1e-3
     )
@@ -63,9 +72,15 @@ class MoBAPallasKernelTest(unittest.TestCase):
     chunk_size, topk = 64, 1
 
     torch.manual_seed(42)
-    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
-    k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
-    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True)
+    q = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True
+    )
+    v = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True
+    )
 
     out = moba_pallas(
         q, k, v, chunk_size=chunk_size, topk=topk
@@ -75,7 +90,10 @@ class MoBAPallasKernelTest(unittest.TestCase):
 
     for tensor, name in [(q, "q"), (k, "k"), (v, "v")]:
       self.assertIsNotNone(tensor.grad, f"{name}.grad should not be None")
-      self.assertTrue(torch.isfinite(tensor.grad).all(), f"{name}.grad contains non-finite values")
+      self.assertTrue(
+          torch.isfinite(tensor.grad).all(),
+          f"{name}.grad contains non-finite values",
+      )
     logging.info("MoBA backward autograd test passed.")
 
 

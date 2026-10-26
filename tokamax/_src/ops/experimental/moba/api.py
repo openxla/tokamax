@@ -52,7 +52,7 @@ def mixture_of_block_attention(
     chunk_size: int = 256,
     scale: float | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
-) -> tuple[Float[Array, "B H T D"], None]:
+) -> Float[Array, "B H T D"]:
   """Computes Mixture of Block Attention (MoBA).
 
   Args:
@@ -60,14 +60,14 @@ def mixture_of_block_attention(
     k: Key tensor with shape `[B, H, T, D]`.
     v: Value tensor with shape `[B, H, T, D]`.
     topk: Number of historical blocks to route to per query block.
-    chunk_size: Sequence chunk size per block. Sequence length must be a multiple
-      of chunk_size.
+    chunk_size: Sequence chunk size per block. Sequence length must be a
+      multiple of chunk_size.
     scale: Softmax scale factor. Defaults to `head_dim ** -0.5`.
     implementation: Which implementation(s) to use, e.g. `"mosaic_tpu"`,
       `"xla"`. If None, attempts TPU kernel first with fallback to XLA.
 
   Returns:
-    A tuple `(output, None)` where output has shape `[B, H, T, D]`.
+    Output tensor with shape `[B, H, T, D]`.
 
   Raises:
     ValueError: If shapes are invalid or implementation is unknown.

@@ -15,7 +15,7 @@
 
 """Tokamax operator wrapper for Mixture of Block Attention (MoBA)."""
 
-from typing import Annotated, Any, ClassVar
+from typing import Annotated, ClassVar
 import jax
 import pydantic
 from tokamax._src.ops import op
@@ -57,11 +57,6 @@ class PallasTpuMixtureOfBlockAttention(base.MixtureOfBlockAttention[Config]):
           f" v={v.shape}"
       )
     seq_len = q.shape[2]
-    if seq_len % chunk_size != 0:
-      raise ValueError(
-          f"Sequence length ({seq_len}) must be divisible by chunk_size"
-          f" ({chunk_size})."
-      )
     resolved_chunk_size = (
         config.chunk_size if config is not None else chunk_size
     )
@@ -72,6 +67,11 @@ class PallasTpuMixtureOfBlockAttention(base.MixtureOfBlockAttention[Config]):
       )
     if resolved_topk <= 0:
       raise NotImplementedError(f"topk must be positive, got {resolved_topk}")
+    if seq_len % resolved_chunk_size != 0:
+      raise ValueError(
+          f"Sequence length ({seq_len}) must be divisible by chunk_size"
+          f" ({resolved_chunk_size})."
+      )
 
     out, _ = pallas_mosaic_tpu_kernel.moba_pallas_fwd(
         q,
@@ -81,12 +81,14 @@ class PallasTpuMixtureOfBlockAttention(base.MixtureOfBlockAttention[Config]):
         chunk_size=resolved_chunk_size,
         scale=scale,
     )
-    return (out, None), None
+    return out, None
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    del ba
-    return Config(chunk_size=256, topk=4)
+    return Config(
+        chunk_size=ba.arguments.get("chunk_size", 256),
+        topk=ba.arguments.get("topk", 4),
+    )
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

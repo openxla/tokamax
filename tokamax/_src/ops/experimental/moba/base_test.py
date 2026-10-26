@@ -43,7 +43,7 @@ class MixtureOfBlockAttentionBaseTest(absltest.TestCase):
     )
 
     op_instance = base.MixtureOfBlockAttention()
-    (actual_out, _), _ = op_instance._fwd(
+    actual_out, _ = op_instance._fwd(
         q, k, v, topk=topk, chunk_size=chunk_size
     )
     expected_out, _ = base.moba_reference(
@@ -51,7 +51,9 @@ class MixtureOfBlockAttentionBaseTest(absltest.TestCase):
     )
 
     np.testing.assert_allclose(actual_out, expected_out, rtol=1e-5, atol=1e-5)
-    self.assertEqual(actual_out.shape, (batch_size, num_heads, seq_len, head_dim))
+    self.assertEqual(
+        actual_out.shape, (batch_size, num_heads, seq_len, head_dim)
+    )
 
   def test_api_forward(self):
     key = jax.random.PRNGKey(101)
@@ -70,7 +72,7 @@ class MixtureOfBlockAttentionBaseTest(absltest.TestCase):
         k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
     )
 
-    api_out, _ = api.mixture_of_block_attention(
+    api_out = api.mixture_of_block_attention(
         q, k, v, topk=topk, chunk_size=chunk_size, implementation="xla"
     )
     ref_out, _ = base.moba_reference(q, k, v, topk=topk, chunk_size=chunk_size)
