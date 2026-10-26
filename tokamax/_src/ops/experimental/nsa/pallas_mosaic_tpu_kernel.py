@@ -244,7 +244,7 @@ def _compute_slc_pallas(
   scratch_shape = pltpu.VMEM((block_q, head_dim), jnp.float32)
 
   if interpret is None:
-    interpret = jax.default_backend() == "cpu"
+    interpret = jax.default_backend() != "tpu"
   out_blocks = pl.pallas_call(
       functools.partial(_flash_slc_kernel, scale=scale),
       grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -406,7 +406,7 @@ def _compute_swa_pallas(
   scratch_shape = pltpu.VMEM((block_q, head_dim), jnp.float32)
 
   if interpret is None:
-    interpret = jax.default_backend() == "cpu"
+    interpret = jax.default_backend() != "tpu"
   out_blocks = pl.pallas_call(
       functools.partial(
           _flash_swa_kernel,
