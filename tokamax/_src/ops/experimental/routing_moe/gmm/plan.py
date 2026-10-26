@@ -59,7 +59,7 @@ class RoutingGmmPlan:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class ResolvedPlan(RoutingGmmPlan):
+class ResolvedGmmPlan(RoutingGmmPlan):
   """Plan that used heuristic to resolve `None` fields from user's plan."""
 
   tile_m: int

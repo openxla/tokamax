@@ -1,0 +1,127 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""Resolved static configuration of the routing MoE layer."""
+
+import dataclasses
+import enum
+
+from jax import sharding
+from tokamax._src.ops.experimental.routing_moe.layer import plan as plan_lib
+
+P = sharding.PartitionSpec
+
+
+class OutputCollective(enum.StrEnum):
+  """Cross-device collective applied to unpacked MoE outputs."""
+
+  NONE = enum.auto()
+  ALL_GATHER = enum.auto()
+  REDUCE_SCATTER = enum.auto()
+  ALL_REDUCE = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class RoutingMoEConfig:
+  """Compile-time static configuration of the routing MoE layer.
+
+  Attributes:
+    tp_axis: Tensor parallelism mesh axis name, or `None` if disabled.
+    ep_axis: Expert parallelism mesh axis name, or `None` if disabled.
+    use_sp: Whether inputs are sequence-parallel along the reduction axis.
+    reduce_output: Whether to reduce the output across devices.
+    activation: Activation function applied to the gate/up projection.
+    plan: Resolved execution plan for the MoE layer.
+  """
+
+  tp_axis: str | None
+  ep_axis: str | None
+  use_sp: bool
+  reduce_output: bool
+  activation: str
+  plan: plan_lib.ResolvedMoEPlan
+
+  @classmethod
+  def create(
+      cls,
+      *,
+      tp_axis: str | None,
+      ep_axis: str | None,
+      use_sp: bool,
+      reduce_output: bool,
+      activation: str,
+      plan: plan_lib.ResolvedMoEPlan,
+  ):
+    """Assembles the config and validates the plan against layer parameters."""
+    if tp_axis is not None and ep_axis is not None:
+      raise NotImplementedError("Hybrid parallelism is not yet supported.")
+    if plan.remote_scatter and ep_axis is None:
+      raise ValueError("remote_scatter requires ep_axis.")
+    if plan.remote_scatter and not reduce_output:
+      raise ValueError(
+          "remote_scatter cannot be True when reduce_output is False."
+      )
+
+    return cls(
+        tp_axis=tp_axis,
+        ep_axis=ep_axis,
+        use_sp=use_sp,
+        reduce_output=reduce_output,
+        activation=activation,
+        plan=plan,
+    )
+
+  @property
+  def reduction_axis(self) -> str | None:
+    """The mesh axis name over which partial MoE outputs are combined."""
+    if self.tp_axis is not None:
+      return self.tp_axis
+    return self.ep_axis
+
+  @property
+  def act_spec(self) -> P:
+    """The PartitionSpec of the input activations and top-k routing tensors."""
+    return P(self.reduction_axis) if self.use_sp else P(None)
+
+  @property
+  def out_spec(self) -> P:
+    """The PartitionSpec of the layer output."""
+    if self.reduce_output:
+      return self.act_spec
+    # Ideally, we want to use P(unreduced={axis}) but that is only supported in
+    # explicit mesh mode. Instead, we create an axis where output is unreduced.
+    # TODO: Make gmm work in explicit mesh mode.
+    return P(self.reduction_axis)
+
+  @property
+  def output_collective(self) -> OutputCollective:
+    """The cross-device collective applied to unpacked MoE outputs."""
+    if self.plan.remote_scatter:
+      output_spec = P(self.reduction_axis)
+    else:
+      output_spec = P(None, unreduced={self.reduction_axis})
+
+    if self.reduce_output:
+      expected_out_spec = self.act_spec
+    else:
+      expected_out_spec = P(None, unreduced={self.reduction_axis})
+
+    if output_spec == expected_out_spec:
+      return OutputCollective.NONE
+    if not output_spec.unreduced:
+      return OutputCollective.ALL_GATHER
+    if expected_out_spec == P(self.reduction_axis):
+      return OutputCollective.REDUCE_SCATTER
+    return OutputCollective.ALL_REDUCE

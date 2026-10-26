@@ -79,7 +79,7 @@ def routing_gmm(
       fuse_act=fuse_act,
       size_ep=size_ep,
   )
-  resolved_plan = plan.ResolvedPlan.create(
+  resolved_plan = plan.ResolvedGmmPlan.create(
       custom_plan,
       x=x.spec,
       w=w_specs,

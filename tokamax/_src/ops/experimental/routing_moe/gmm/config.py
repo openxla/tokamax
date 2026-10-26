@@ -177,7 +177,7 @@ class RoutingGmmConfig:
   """Stores compile time static information of routing gmm."""
 
   dim: Dimension
-  plan: plan_lib.ResolvedPlan
+  plan: plan_lib.ResolvedGmmPlan
   x: ActivationConfig
   stages: tuple[SingleGmmConfig, ...]
   out: ActivationConfig
@@ -192,7 +192,7 @@ class RoutingGmmConfig:
       x: arg.ActivationSpec,
       w: tuple[arg.WeightSpec, ...],
       dim: Dimension,
-      plan: plan_lib.ResolvedPlan,
+      plan: plan_lib.ResolvedGmmPlan,
       gather: arg.RoutingSpec | None,
       scatter: arg.RoutingSpec | None,
       fuse_act: str | None,

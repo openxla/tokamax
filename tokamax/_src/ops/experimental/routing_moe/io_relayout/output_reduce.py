@@ -254,6 +254,7 @@ def output_reduce_unpack(
     topk_indices: jax.Array | None = None,
     group_offset: jax.Array | int | None = None,
     num_local_experts: int | None = None,
+    shard_idx: jax.Array | None = None,
     *,
     out_dtype: jax.typing.DTypeLike = jnp.bfloat16,
     acc_dtype: jax.typing.DTypeLike = jnp.bfloat16,
@@ -295,7 +296,12 @@ def output_reduce_unpack(
       raise ValueError(
           f"{num_tokens} tokens must divide evenly across axis {axis!r}."
       )
-    start = jax.lax.axis_index(axis) * num_local_tokens
+
+    if shard_idx is None:
+      shard_idx = jax.lax.axis_index(axis)
+    elif not jnp.isscalar(shard_idx):
+      shard_idx = shard_idx[0]
+    start = shard_idx * num_local_tokens
     weights = jax.lax.dynamic_slice_in_dim(weights, start, num_local_tokens)
     num_tokens = num_local_tokens
   else:
