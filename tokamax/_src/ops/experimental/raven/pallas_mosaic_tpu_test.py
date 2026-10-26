@@ -29,6 +29,11 @@ from tokamax._src.ops.experimental.raven import pallas_mosaic_tpu_kernel
 
 class PallasTpuRavenGSATest(absltest.TestCase):
 
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() == "gpu":
+      self.skipTest("Pallas Mosaic TPU kernel is not supported on GPU.")
+
   def test_pallas_fwd_matches_reference(self):
     key = jax.random.PRNGKey(123)
     batch_size, seq_len, num_heads, key_dim, num_slots = 2, 128, 4, 16, 8

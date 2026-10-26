@@ -85,11 +85,14 @@ def _stage1_intra_one_plain(
           precision=jax.lax.Precision.HIGHEST,
       ),
   )
-  diff = jnp.minimum(g_i[:, None, :] - g_i[None, :, :], 0.0)
+  diff = jnp.where(
+      mask_upper[:, :, None], 0.0, g_i[:, None, :] - g_i[None, :, :]
+  )
   decay = jnp.exp(diff)
   y_diag = jnp.sum(qk[:, :, None] * decay * s_i[None, :, :], axis=1)
   g_last = g_i[-1]
-  decay_tail = jnp.exp(jnp.minimum(g_last[None, :] - g_i, 0.0))
+  mask_last = (jnp.arange(chunk_size) == (chunk_size - 1))[:, None]
+  decay_tail = jnp.exp(jnp.where(mask_last, 0.0, g_last[None, :] - g_i))
   state_contrib = jnp.matmul(
       k_i.T,
       s_i * decay_tail,
@@ -184,7 +187,9 @@ def _stage2_intra_one_plain(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   chunk_size = qv_i.shape[0]
   mask_upper = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=1)
-  diff = jnp.minimum(g_i[:, None, :] - g_i[None, :, :], 0.0)
+  diff = jnp.where(
+      mask_upper[:, :, None], 0.0, g_i[:, None, :] - g_i[None, :, :]
+  )
   decay = jnp.exp(diff)
   aqk_raw = jnp.einsum(
       "tm,nm,tnm->tn",
@@ -202,7 +207,8 @@ def _stage2_intra_one_plain(
       precision=jax.lax.Precision.HIGHEST,
   )
   g_last = g_i[-1]
-  decay_tail = jnp.exp(jnp.minimum(g_last[None, :] - g_i, 0.0))
+  mask_last = (jnp.arange(chunk_size) == (chunk_size - 1))[:, None]
+  decay_tail = jnp.exp(jnp.where(mask_last, 0.0, g_last[None, :] - g_i))
   state_contrib = jnp.matmul(
       (s_i * decay_tail).T,
       v_i,

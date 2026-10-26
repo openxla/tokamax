@@ -48,7 +48,7 @@ def _resolve_interpret(interpret: bool | None = None) -> bool:
     return False
   if env in ("1", "true"):
     return True
-  return jax.default_backend() == "cpu"
+  return jax.default_backend() != "tpu"
 
 
 def _validate_chunk_size(seq_len: int, chunk_size: int) -> None:
