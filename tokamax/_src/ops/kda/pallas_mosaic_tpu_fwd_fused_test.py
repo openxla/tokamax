@@ -153,6 +153,11 @@ def test_forward_and_existing_vjp(dtype, packed, rematerialize):
   )
 
   _assert_close(results[1][2], results[0][2], tolerance=tolerance)
+  if packed:
+    for gradients in (results[0][2], results[1][2]):
+      for gradient in gradients[:5]:
+        np.testing.assert_array_equal(np.asarray(gradient[:, :, 96:]), 0)
+      np.testing.assert_allclose(np.asarray(gradients[5][:, 2]), 0.1)
 
 
 @pytest.mark.parametrize("rematerialize", [False, True])
