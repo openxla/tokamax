@@ -241,7 +241,7 @@ def _gdn2_fwd_pallas(
   bspec_s = pl.BlockSpec((mb, key_dim, val_dim), lambda i, n: (i, 0, 0))
   bspec_s_in = pl.BlockSpec((mb, 1, key_dim, val_dim), idx)
 
-  interpret = jax.default_backend() == "cpu"
+  interpret = jax.default_backend() != "tpu"
   return pl.pallas_call(
       functools.partial(_gdn2_fwd_kernel, num_chunks=num_chunks),
       grid=grid,

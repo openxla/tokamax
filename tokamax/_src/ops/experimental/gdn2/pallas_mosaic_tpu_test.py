@@ -24,6 +24,11 @@ from tokamax._src.ops.experimental.gdn2 import base, pallas_mosaic_tpu
 
 class PallasTpuGatedDeltaNet2Test(absltest.TestCase):
 
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() == "gpu":
+      self.skipTest("Pallas Mosaic TPU kernel is not supported on GPU.")
+
   def test_pallas_fwd_matches_reference(self):
     key = jax.random.PRNGKey(123)
     batch_size, seq_len, num_heads, key_dim, val_dim = 2, 128, 4, 16, 16
