@@ -109,15 +109,20 @@ def _call(op, kwargs, q, k, v, g, beta, h0, a_log, bias):
 
 def _assert_close(actual, expected, *, tolerance):
   assert jax.tree.structure(actual) == jax.tree.structure(expected)
-  for a, b in zip(
-      jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True
+  for (path, a), (_, b) in zip(
+      jax.tree_util.tree_flatten_with_path(actual)[0],
+      jax.tree_util.tree_flatten_with_path(expected)[0],
+      strict=True,
   ):
     assert a.shape == b.shape
     assert a.dtype == b.dtype
     a, b = np.asarray(a, np.float32), np.asarray(b, np.float32)
     assert np.isfinite(a).all()
     assert np.isfinite(b).all()
-    np.testing.assert_allclose(a, b, rtol=tolerance, atol=tolerance)
+    np.testing.assert_allclose(
+        a, b, rtol=tolerance, atol=tolerance,
+        err_msg=f"KDA result leaf {jax.tree_util.keystr(path)}",
+    )
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
