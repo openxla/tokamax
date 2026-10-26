@@ -796,8 +796,26 @@ def inner_kernel(
   branches = []
   for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
     branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-  bucket_idx = m_end_local // cfgs.tiles.bucket_base
+  bucket_idx = select_bucket_idx(m_end_local, cfgs.tiles.bucket_base)
   lax.switch(bucket_idx, branches)
+
+
+def select_bucket_idx(m_end_local: jax.Array, bucket_base: int) -> jax.Array:
+  """Returns the index of the smallest bucket that covers rows [0, m_end_local).
+
+  Bucket `i` computes `bucket_base * (i + 1)` rows, so the result is
+  `ceil(m_end_local / bucket_base) - 1`.
+
+  Args:
+    m_end_local: One past the last row of the current group, relative to the
+      start of the tile.
+    bucket_base: Number of rows in the smallest bucket.
+  """
+  # m_end_local is one past the last row, so the last row is m_end_local - 1.
+  # Using m_end_local directly picks one bucket too many whenever the row count
+  # is a multiple of bucket_base. lax.switch clamps the index, so -1 (no rows)
+  # selects the smallest bucket.
+  return (m_end_local - 1) // bucket_base
 
 
 def fill_metadata(

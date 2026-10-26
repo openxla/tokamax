@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import collections
+import math
 from unittest import mock
 
 from absl.testing import absltest
@@ -357,6 +358,86 @@ class GmmTest(parameterized.TestCase):
         rhs,
         group_sizes,
         group_offset=group_offset_arr,
+        tile_info=tile_info,
+        transpose_rhs=transpose_rhs,
+    )
+
+    assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      bucket_base=[64, 128],
+      num_buckets=[1, 2, 4],
+  )
+  def test_select_bucket_idx_exact_multiple(self, bucket_base, num_buckets):
+    """Row counts that are exact multiples of bucket_base select their bucket.
+
+    Bucket i covers bucket_base * (i + 1) rows, so a group of `rows` rows must
+    select bucket ceil(rows / bucket_base) - 1, not the next larger one.
+
+    Args:
+      bucket_base: Number of rows in the smallest bucket.
+      num_buckets: Number of buckets, i.e. tile_m // bucket_base.
+    """
+    branches = [lambda i=i: jnp.int32(i) for i in range(num_buckets)]
+
+    @jax.jit
+    def selected_bucket(m_end_local):
+      # Mirrors inner_kernel: the index feeds lax.switch over the buckets.
+      bucket_idx = gmm_v2.select_bucket_idx(m_end_local, bucket_base)
+      return bucket_idx, jax.lax.switch(bucket_idx, branches)
+
+    for multiple in range(1, num_buckets + 1):
+      rows = multiple * bucket_base
+      expected = math.ceil(rows / bucket_base) - 1
+      with self.subTest(rows=rows):
+        bucket_idx, selected = selected_bucket(jnp.int32(rows))
+        self.assertEqual(int(bucket_idx), expected)
+        self.assertEqual(int(selected), expected)
+
+  def test_select_bucket_idx_not_multiple(self):
+    bucket_base = 64
+    for rows in (1, 63, 65, 127, 129, 255):
+      expected = math.ceil(rows / bucket_base) - 1
+      with self.subTest(rows=rows):
+        self.assertEqual(
+            int(gmm_v2.select_bucket_idx(jnp.int32(rows), bucket_base)),
+            expected,
+        )
+
+  @parameterized.product(
+      rows_per_group=[64, 128, 192, 256],
+      transpose_rhs=[False, True],
+  )
+  def test_gmm_equal_groups_exact_bucket_multiple(
+      self, rows_per_group, transpose_rhs
+  ):
+    """Equal group sizes that are exact multiples of bucket_base."""
+    num_groups = 8
+    in_size = 512
+    out_size = 512
+    batch_size = rows_per_group * num_groups
+    key = jax.random.key(0)
+    k0, k1 = jax.random.split(key, 2)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = jnp.full((num_groups,), rows_per_group, dtype=jnp.int32)
+    expected = reference_gmm(lhs, rhs, group_sizes)
+
+    if transpose_rhs:
+      rhs = jnp.swapaxes(rhs, 1, 2)
+    tile_info = gmm_v2.TileSizes(
+        tile_m=256,
+        tile_k=in_size,
+        tile_n=out_size,
+        bucket_base=64,
+    )
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
         tile_info=tile_info,
         transpose_rhs=transpose_rhs,
     )
