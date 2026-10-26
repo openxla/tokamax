@@ -483,8 +483,10 @@ class AutotuningTest(parameterized.TestCase):
 
   @parameterized.parameters(True, False)
   def test_autotuning_ignore_cache(self, ignore_cache):
-    f = jax.jit(lambda x: _FakeOp()(x, x))
-    x = jnp.zeros((3, 7))
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    # Use a shape not used by other tests, as the autotuning cache is global.
+    x = jnp.zeros((2, 11))
 
     res = api.autotune(f, x, ignore_cache=ignore_cache)
     self.assertLen(res.data, 1)
@@ -492,11 +494,172 @@ class AutotuningTest(parameterized.TestCase):
     res = api.autotune(f, x, ignore_cache=ignore_cache)
     self.assertLen(res.data, 1)
 
-    with res:
-      res_new = api.autotune(f, x, ignore_cache=ignore_cache)
+    # Populate the autotuning cache via `BoundArguments.autotune`.
+    ba, _ = res.data[0]
+    ba.autotune(cache_results=True)
+    # `get_autotuning_cache` returns the live cache dict, so remove the entry
+    # afterwards to avoid leaking state into other tests.
+    self.addCleanup(
+        op.get_autotuning_cache(res.device_kind).pop,
+        ba.autotuning_cache_key,
+        None,
+    )
 
-      expected_len = 1 if ignore_cache else 0
-      self.assertLen(res_new.data, expected_len)
+    res_new = api.autotune(f, x, ignore_cache=ignore_cache)
+    expected_len = 1 if ignore_cache else 0
+    self.assertLen(res_new.data, expected_len)
+
+  @parameterized.parameters(True, False)
+  def test_autotuning_result_context_append(self, ignore_cache):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    y = jnp.zeros((4, 8))
+    z = jnp.zeros((5, 9))
+
+    res_x = api.autotune(f, x, ignore_cache=ignore_cache)
+    self.assertLen(res_x.data, 1)
+    ba_x, data_x = res_x.data[0]
+
+    with res_x:
+      res_same = api.autotune(f, x, ignore_cache=ignore_cache)
+      self.assertLen(res_same.data, 1)
+      self.assertIs(res_same.data[0][1], data_x)
+
+      f_xy = jax.jit(lambda a, b: (op(a, a), op(b, b)))
+      res_xy = api.autotune(f_xy, x, y, ignore_cache=ignore_cache)
+
+    # Original context manager object remains immutable.
+    self.assertLen(res_x.data, 1)
+    self.assertLen(res_xy.data, 2)
+    self.assertEqual(res_xy.data[0], (ba_x, data_x))
+    self.assertIs(res_xy.data[0][1], data_x)
+    self.assertEqual(
+        res_xy.data[1][0].autotuning_cache_key,
+        op.bind(y, y).autotuning_cache_key,
+    )
+
+    # Stacked context managers should skip all existing results and merge them.
+    res_y = api.autotune(f, y, ignore_cache=ignore_cache)
+    _, data_y = res_y.data[0]
+    f_xyz = jax.jit(lambda a, b, c: (op(a, a), op(b, b), op(c, c)))
+    with res_x:
+      with res_y:
+        res_xyz = api.autotune(f_xyz, x, y, z, ignore_cache=ignore_cache)
+    self.assertLen(res_xyz.data, 3)
+    self.assertIs(res_xyz.data[0][1], data_x)
+    self.assertIs(res_xyz.data[1][1], data_y)
+    self.assertEqual(
+        res_xyz.data[2][0].autotuning_cache_key,
+        op.bind(z, z).autotuning_cache_key,
+    )
+
+  @parameterized.parameters(True, False)
+  def test_autotuning_result_param_append(self, ignore_cache):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    y = jnp.zeros((4, 8))
+
+    res_x = api.autotune(f, x, ignore_cache=ignore_cache)
+    self.assertLen(res_x.data, 1)
+    ba_x, data_x = res_x.data[0]
+
+    res_same = api.autotune(
+        f, x, ignore_cache=ignore_cache, autotuning_result=res_x
+    )
+    self.assertLen(res_same.data, 1)
+    self.assertIs(res_same.data[0][1], data_x)
+
+    f_xy = jax.jit(lambda a, b: (op(a, a), op(b, b)))
+    res_xy = api.autotune(
+        f_xy, x, y, ignore_cache=ignore_cache, autotuning_result=res_x
+    )
+    self.assertLen(res_x.data, 1)
+    self.assertLen(res_xy.data, 2)
+    self.assertEqual(res_xy.data[0], (ba_x, data_x))
+    self.assertIs(res_xy.data[0][1], data_x)
+    self.assertEqual(
+        res_xy.data[1][0].autotuning_cache_key,
+        op.bind(y, y).autotuning_cache_key,
+    )
+
+  def test_autotuning_result_param_and_context_append(self):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    y = jnp.zeros((4, 8))
+    z = jnp.zeros((5, 9))
+    res_x = api.autotune(f, x)
+    res_y = api.autotune(f, y)
+    _, data_x = res_x.data[0]
+    _, data_y = res_y.data[0]
+
+    f_xyz = jax.jit(lambda a, b, c: (op(a, a), op(b, b), op(c, c)))
+    with res_x:
+      res_xyz = api.autotune(f_xyz, x, y, z, autotuning_result=res_y)
+
+    self.assertLen(res_xyz.data, 3)
+    self.assertIs(res_xyz.data[0][1], data_x)
+    self.assertIs(res_xyz.data[1][1], data_y)
+    self.assertEqual(
+        res_xyz.data[2][0].autotuning_cache_key,
+        op.bind(z, z).autotuning_cache_key,
+    )
+
+  def test_autotuning_result_param_device_kind_mismatch(self):
+    f = jax.jit(lambda x: _FakeOp()(x, x))
+    x = jnp.zeros((3, 7))
+    res_x = api.autotune(f, x)
+    other_res_x = dataclasses.replace(res_x, device_kind="fake_device_kind")
+
+    with self.assertRaisesRegex(ValueError, "does not match the device kind"):
+      api.autotune(f, x, autotuning_result=other_res_x)
+
+  def test_autotuning_result_context_ignores_other_device_kinds(self):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    y = jnp.zeros((4, 8))
+    res_x = api.autotune(f, x)
+    res_y = api.autotune(f, y)
+    _, data_x = res_x.data[0]
+    _, data_y = res_y.data[0]
+    other_res_x = dataclasses.replace(res_x, device_kind="fake_device_kind")
+    other_res_y = dataclasses.replace(res_y, device_kind="fake_device_kind")
+
+    f_xy = jax.jit(lambda a, b: (op(a, a), op(b, b)))
+    with other_res_y:
+      with res_x:
+        with other_res_x:
+          res_xy = api.autotune(f_xy, x, y)
+
+    self.assertEqual(res_xy.device_kind, res_x.device_kind)
+    self.assertLen(res_xy.data, 2)
+    # `x` is taken from the result with the matching device kind.
+    self.assertIs(res_xy.data[0][1], data_x)
+    # `y` is only in a result with a different device kind, so is re-autotuned.
+    self.assertEqual(
+        res_xy.data[1][0].autotuning_cache_key,
+        op.bind(y, y).autotuning_cache_key,
+    )
+    self.assertIsNot(res_xy.data[1][1], data_y)
+
+  def test_autotuning_result_context_exit_restores_state(self):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    res_x = api.autotune(f, x)
+    _, data_x = res_x.data[0]
+
+    with self.assertRaisesRegex(RuntimeError, "Fake error"):
+      with res_x:
+        raise RuntimeError("Fake error")
+
+    # After exiting the context, `res_x` is no longer used for appending.
+    res_new = api.autotune(f, x)
+    self.assertLen(res_new.data, 1)
+    self.assertIsNot(res_new.data[0][1], data_x)
 
 
 if __name__ == "__main__":

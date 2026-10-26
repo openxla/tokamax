@@ -16,9 +16,12 @@
 
 from collections.abc import Callable, Mapping
 from concurrent import futures
+import contextvars
 import dataclasses
+import functools
 import inspect
 import json
+import operator
 from typing import Annotated, Any, Final, Self, Sequence, cast
 
 from absl import logging
@@ -114,6 +117,11 @@ class AutotuningResult:
   fallback to the default autotuning cache if not found. Multiple
   `AutotuningResult`s contexts can be stacked, with the innermost one taking
   precedence.
+
+  When `tokamax.autotune` is called within the context, ops already present in
+  any active `AutotuningResult` with a matching device kind are skipped, and the
+  returned `AutotuningResult` contains both the existing and the newly autotuned
+  results. The active `AutotuningResult`s themselves are not modified.
   """
 
   device_kind: str
@@ -177,6 +185,10 @@ class AutotuningResult:
       overlay.setdefault(ba.op, {}).setdefault(self.device_kind, {})[key] = data
     stack = op_lib.AUTOTUNING_CACHE_OVERLAY_STACK
     object.__setattr__(self, "_token", stack.set(stack.get() + (overlay,)))
+    result_stack = _AUTOTUNING_RESULT_OVERLAY_STACK
+    object.__setattr__(
+        self, "_result_token", result_stack.set(result_stack.get() + (self,))
+    )
     config = op_lib.AUTOTUNING_CACHE_OVERLAY_JAX_CONFIG
     object.__setattr__(self, "_context", config(config.value + (id(self),)))
     self._context.__enter__()  # pyrefly: ignore[missing-attribute]
@@ -185,14 +197,16 @@ class AutotuningResult:
   def __exit__(self, exc_type, exc_value, traceback):
     self._context.__exit__(exc_type, exc_value, traceback)  # pyrefly: ignore[missing-attribute]
     object.__delattr__(self, "_context")
+    self._result_token.var.reset(self._result_token)  # pyrefly: ignore[missing-attribute]
+    object.__delattr__(self, "_result_token")
     self._token.var.reset(self._token)  # pyrefly: ignore[missing-attribute]
     object.__delattr__(self, "_token")
 
   def __or__(self, other: "AutotuningResult") -> "AutotuningResult":
     """Returns a new AutotuningResult that is the merge of `self` and `other`.
 
-    When there are multiple BoundArguments with the same autotuning cache key,
-    the autotuning data for that key will be merged with data from the
+    When there are multiple BoundArguments with the same op and autotuning cache
+    key, the autotuning data for that key will be merged with data from the
     right-hand side taking precedence.
 
     Args:
@@ -206,10 +220,10 @@ class AutotuningResult:
     """
     if self.device_kind != other.device_kind:
       raise ValueError("Device kinds do not match.")
-    data = {ba.autotuning_cache_key: (ba, d) for ba, d in self.data}
+    data = {(ba.op, ba.autotuning_cache_key): (ba, d) for ba, d in self.data}
 
     for new_ba, new_data in other.data:
-      key = new_ba.autotuning_cache_key
+      key = (new_ba.op, new_ba.autotuning_cache_key)
       ba, d = data.setdefault(key, (new_ba, new_data))
       if d is not new_data:
         data[key] = (ba, d | new_data)
@@ -217,6 +231,9 @@ class AutotuningResult:
     return AutotuningResult(self.device_kind, tuple(data.values()))
 
 
+_AUTOTUNING_RESULT_OVERLAY_STACK: Final[
+    contextvars.ContextVar[tuple[AutotuningResult, ...]]
+] = contextvars.ContextVar("_AUTOTUNING_RESULT_OVERLAY_STACK", default=())
 _AUTOTUNING_RESULT_ADAPTER = pydantic.TypeAdapter(AutotuningResult)
 _BOUND_ARGS_ADAPTER = pydantic_lib.TypeAdapter(op_lib.BoundArguments)
 
@@ -342,6 +359,7 @@ def autotune(
     progress_bar: bool = True,
     timeout: float | None = 600.0,
     max_workers: int | None = None,
+    autotuning_result: AutotuningResult | None = None,
 ) -> AutotuningResult:
   """Autotunes all captured ops in x.
 
@@ -350,8 +368,11 @@ def autotune(
     *args: Positional arguments to `f` (only valid if `f` is callable). NOTE -
       To autotune a callable with keyword arguments, pass the results of
       `tokamax.get_bound_args(f, *args, **kwargs)` to `autotune`.
-    ignore_cache: . If `False` (default), only autotune ops that are not in the
-      autotuning cache. If `True` autotune all Tokamax ops found in `f`.
+    ignore_cache: If `False` (default), only autotune ops that are not in the
+      autotuning cache. If `True`, ignore the autotuning cache and autotune all
+      Tokamax ops found in `f`. In either case, ops already present in an active
+      `AutotuningResult` context (with a matching device kind) or in
+      `autotuning_result` are skipped.
     all_implementations: Whether to autotune all implementations of the op that
       is tunable on the current device.
     progress_bar: Whether to show a progress bar (default: `True`).
@@ -361,9 +382,19 @@ def autotune(
       compile.
     max_workers: Maximum number of worker threads for parallel compilation
       during autotuning.
+    autotuning_result: An optional `AutotuningResult` to append to. Ops already
+      present in `autotuning_result` will be skipped, and the returned
+      `AutotuningResult` will contain both existing and newly autotuned results.
+      `autotuning_result` itself is not modified.
 
   Returns:
-    An `AutotuningResult` object of the autotuned ops.
+    An `AutotuningResult` object of the autotuned ops, merged with the results
+    from any active `AutotuningResult` contexts (with a matching device kind)
+    and `autotuning_result`, with `autotuning_result` taking precedence.
+
+  Raises:
+    ValueError: If `autotuning_result` has a different device kind than the ops
+      being autotuned.
   """
 
   if isinstance(f, (list, tuple)) and isinstance(f[0], op_lib.BoundArguments):
@@ -372,9 +403,6 @@ def autotune(
     bound_args = tuple(f)
   else:
     bound_args = get_bound_args(f, *args)  # pyrefly: ignore[bad-argument-type]
-
-  if not ignore_cache:
-    bound_args = [ba for ba in bound_args if ba.cached_autotuning_data is None]
 
   device_kinds = map(op_lib.infer_device_kind, bound_args)
   device_kinds = {k for k in device_kinds if k is not None}
@@ -385,6 +413,29 @@ def autotune(
   else:
     raise ValueError(f"Multiple device kinds found: {device_kinds}")
 
+  if (
+      autotuning_result is not None
+      and autotuning_result.device_kind != device_kind
+  ):
+    raise ValueError(
+        f"`autotuning_result` device kind {autotuning_result.device_kind!r}"
+        f" does not match the device kind {device_kind!r} of the ops being"
+        " autotuned."
+    )
+
+  # Only results for the same device kind are merged; results for other device
+  # kinds are not applicable (and cannot be merged).
+  prev_results = tuple(
+      r
+      for r in _AUTOTUNING_RESULT_OVERLAY_STACK.get()
+      if r.device_kind == device_kind
+  )
+  if autotuning_result is not None:
+    prev_results += (autotuning_result,)
+  prev_result = (
+      functools.reduce(operator.or_, prev_results) if prev_results else None
+  )
+
   if all_implementations:
     default_device = backend.get_default_device()
     bound_args = tuple(
@@ -393,6 +444,19 @@ def autotune(
         for op in get_op_implementations(ba.op, device=default_device).values()
         if isinstance(op, op_lib.Op)
     )
+
+  if prev_result is not None:
+    existing_keys = {
+        (ba.op, ba.autotuning_cache_key) for ba, _ in prev_result.data
+    }
+    bound_args = [
+        ba
+        for ba in bound_args
+        if (ba.op, ba.autotuning_cache_key) not in existing_keys
+    ]
+
+  if not ignore_cache:
+    bound_args = [ba for ba in bound_args if ba.cached_autotuning_data is None]
 
   data = []
   if progress_bar:
@@ -435,4 +499,7 @@ def autotune(
     except Exception:  # pylint: disable=broad-exception-caught
       logging.exception("Failed to autotune for op %s", bound_arg.op)
 
-  return AutotuningResult(device_kind, tuple(data))
+  result = AutotuningResult(device_kind, tuple(data))
+  if prev_result is not None:
+    result = prev_result | result
+  return result
