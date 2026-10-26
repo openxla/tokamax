@@ -215,7 +215,7 @@ def _rwkv7_fwd_pallas(
       (1, mb, key_dim, val_dim), lambda i_b, c: (i_b, 0, 0, 0)
   )
 
-  interpret = jax.default_backend() == "cpu"
+  interpret = jax.default_backend() != "tpu"
   o_out, a_ab_inv_out, merged_out, s_in_out, s_final_out = pl.pallas_call(
       functools.partial(_rwkv7_fwd_kernel, num_chunks=num_chunks),
       grid_spec=pltpu.PrefetchScalarGridSpec(

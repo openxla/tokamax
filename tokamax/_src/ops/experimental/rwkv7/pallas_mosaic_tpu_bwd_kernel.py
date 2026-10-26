@@ -277,7 +277,7 @@ def _rwkv7_bwd_pallas(
       (1, mb, key_dim, val_dim), lambda i_b, c: (i_b, 0, 0, 0)
   )
 
-  interpret = jax.default_backend() == "cpu"
+  interpret = jax.default_backend() != "tpu"
   dq_out, dk_out, dv_out, dalpha_out, dbeta_out, dgk_out, d_s0_out = (
       pl.pallas_call(
           functools.partial(_rwkv7_bwd_kernel, num_chunks=num_chunks),
