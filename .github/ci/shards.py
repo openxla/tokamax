@@ -625,6 +625,7 @@ SHARDS: ShardMap = {
     ),
     'experimental-kda-megakernel-backward': Spec(
         paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_compact_backward_test.py',
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_bwd_fused_test.py',
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_remat_test.py',
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_bwd_test.py',

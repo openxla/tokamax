@@ -258,7 +258,112 @@ def backward(
     a_log,
     delta_time_bias,
 ):
-  """The dependent backward increment supplies the matching compact VJP."""
-  raise NotImplementedError(
-      "Compact training requires the companion compact backward increment."
+  """Consume the original-token tape with M5 and return public gradients."""
+  from tokamax._src.ops.kda.compact_backward import chunk_kda_bwd_fusion
+  from tokamax._src.ops.kda.compact_gate import kda_gate_bwd
+
+  r = residuals
+  heads, _, _, key_dim = query.shape
+  value_dim = value.shape[-1]
+  do = jnp.pad(
+      dout[0].transpose(1, 2, 0, 3),
+      ((0, 0), (0, 0), (0, 0), (0, r.v.shape[-1] - value_dim)),
   )
+  fused_gate = (
+      use_gate_in_kernel
+      and lower_bound == -5.0
+      and r.a_log is not None
+      and r.bias is not None
+  )
+
+  def run(reorder):
+    q, k, v, raw_gate, beta, dy = (
+        r.q,
+        r.k,
+        r.v,
+        r.gate,
+        r.beta.transpose(1, 2, 0),
+        do,
+    )
+    if reorder:
+      q, k, v, raw_gate, beta, dy = (
+          _take_tokens(x, r.permutation) for x in (q, k, v, raw_gate, beta, dy)
+      )
+    values = chunk_kda_bwd_fusion(
+        q=q,
+        k=k,
+        v=v,
+        beta=beta.transpose(2, 0, 1),
+        Aqk=r.aqk,
+        Akk=r.akk,
+        g=r.g_cumsum,
+        h=r.h,
+        do=dy,
+        dht=None,
+        initial_state=None,
+        scale=scale,
+        segment_ids=None,
+        cu_seqlens=r.cu_seqlens,
+        chunk_indices=None,
+        chunk_size=64,
+        use_exp2=True,
+        safe_gate=True,
+        lower_bound=lower_bound,
+        return_dh0=False,
+        disable_recompute=True,
+        cp_active=False,
+        has_initial_state=False,
+        N_MAX=r.cu_seqlens.shape[-1] - 1,
+        batch_first_inputs=True,
+        cast_dg_to_q_dtype=gate.dtype == query.dtype,
+        original_token_segment_ids=r.segment_ids,
+        original_token_segments=True,
+        raw_gate=raw_gate if fused_gate else None,
+        gate_A_log=r.a_log if fused_gate else None,
+        gate_dt_bias=r.bias if fused_gate else None,
+        fuse_gate_bwd=fused_gate,
+    )
+    dq, dk, dv, db, dg, _ = values[:6]
+    dA, dbias = values[6:] if fused_gate else (None, None)
+    if use_gate_in_kernel and not fused_gate:
+      valid = r.segment_ids[:, :, None, None] > 0
+      dg, dA, dbias = kda_gate_bwd(
+          jnp.where(valid, raw_gate, 0),
+          r.a_log,
+          r.bias,
+          jnp.where(valid, dg, 0),
+          lower_bound,
+          head_first=False,
+      )
+    if reorder:
+      dq, dk, dv, dg = (
+          _take_tokens(x, r.inverse_permutation) for x in (dq, dk, dv, dg)
+      )
+      db = _take_tokens(db.transpose(1, 2, 0), r.inverse_permutation).transpose(
+          2, 0, 1
+      )
+    return dq, dk, dv, db, dg, dA, dbias
+
+  dq, dk, dv, db, dg, dA, dbias = (
+      run(False)
+      if r.permutation is None
+      else jax.lax.cond(
+          r.ordered, lambda _: run(False), lambda _: run(True), None
+      )
+  )
+  gradients = dict(
+      query=dq[..., :key_dim].transpose(2, 0, 1, 3).astype(query.dtype),
+      key=dk[..., :key_dim].transpose(2, 0, 1, 3).astype(query.dtype),
+      value=dv[..., :value_dim].transpose(2, 0, 1, 3).astype(value.dtype),
+      gate=dg[..., :key_dim].transpose(2, 0, 1, 3).astype(gate.dtype),
+      beta=db.astype(r.beta.dtype),
+  )
+  if a_log is not None:
+    gradients["a_log"] = jnp.zeros_like(a_log) if dA is None else dA
+  if delta_time_bias is not None:
+    gradients["delta_time_bias"] = (
+        jnp.zeros_like(delta_time_bias)
+        if dbias is None
+        else dbias.reshape(heads, r.q.shape[-1])[:, :key_dim].reshape(-1)
+    )
+  return gradients

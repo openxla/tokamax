@@ -63,10 +63,12 @@ segment capacity, normalization, gate parameters and all enabled gradients.
 Run existing aligned-path regression tests without changing tolerances.
 
 On an independent TPU7x Pod, freeze dependencies and effective flags. Compare
-source, previous Tokamax, and the completed port on the same data. Report
+the pinned source and the completed port on the same data. Report
 forward-only and complete forward+VJP separately. Warm up 5 times and measure
 20 synchronized calls in each source/port/port/source order (40 samples per
 implementation). Exclude compilation and input creation. Save compiler memory
 analysis, HLO and XProf captures; report full device-module time separately
 from host wall time and individual Pallas events. Repeat any measured gain
 with a second independent capture before making a performance claim.
+
+Results and exact measurement contracts: [compact training results](compact_training_results.md).

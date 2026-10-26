@@ -49,6 +49,19 @@ EXAMPLES = immutabledict.immutabledict(
 )
 
 
+# The compact profile consumes pre-normalized packed Q/K. Keep this workload
+# distinct so its benchmark cannot silently select the aligned fallback.
+EXAMPLES = immutabledict.immutabledict(
+    {
+        **EXAMPLES,
+        "packed_training_b1_t8192_n25_bf16_pre_normalized": {
+            **EXAMPLES["packed_training_b1_t8192_n25_bf16"],
+            "use_qk_l2norm": False,
+        },
+    }
+)
+
+
 def _make_example(args_spec_name: str, implementation: str):
   """Initializes one valid KDA benchmark input."""
   example = dict(EXAMPLES[args_spec_name])
@@ -74,6 +87,7 @@ class KdaBenchmark(parameterized.TestCase):
           "mosaic_fwd_fused",
           "mosaic_packed_inputs",
           "mosaic_packed_outputs",
+          "mosaic_compact",
           "mosaic_fused",
           "mosaic_packed_backward",
           "mosaic_packed_gradients",
@@ -92,13 +106,24 @@ class KdaBenchmark(parameterized.TestCase):
           f"Skipping implementation '{implementation}' as per"
           " --skip_implementations flag."
       )
-    if jax.default_backend() != "tpu" and implementation not in ("xla", "xla_chunked"):
+    if jax.default_backend() != "tpu" and implementation not in (
+        "xla",
+        "xla_chunked",
+    ):
       self.skipTest("Mosaic TPU implementation is only supported on TPU.")
 
     example = _make_example(
-        args_spec_name, implementation if implementation in ("xla", "xla_chunked", "mosaic") else "mosaic"
+        args_spec_name,
+        implementation
+        if implementation in ("xla", "xla_chunked", "mosaic")
+        else "mosaic",
     )
     attention = kda_api.kimi_delta_attention
+    if implementation == "mosaic_compact" and (
+        example.get("use_qk_l2norm", False)
+        or example.get("segment_ids") is None
+    ):
+      self.skipTest("Compact benchmark requires pre-normalized packed inputs.")
     if implementation not in ("xla", "xla_chunked", "mosaic"):
       example.pop("implementation")
       attention = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention(
@@ -134,6 +159,8 @@ class KdaBenchmark(parameterized.TestCase):
                   "mosaic_remat"
               ),
               fuse_rematerialization=implementation == "mosaic_remat_fused",
+              compact_forward=implementation == "mosaic_compact",
+              compact_sorted_segments=implementation == "mosaic_compact",
           )
       )
     fn, args = tokamax.standardize_function(
