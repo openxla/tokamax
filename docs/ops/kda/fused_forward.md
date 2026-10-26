@@ -66,10 +66,19 @@ fixed/packed inputs, initial/final state, empty state slots, normalization,
 gate activation, and both rematerialization settings. The existing KDA
 kernel suite continues to compare Mosaic with XLA, including CP fallbacks.
 
-The separate [packed backward correctness fix](packed_gradients.md) resolves
-non-finite padding and empty-state gradients found during CPU interpretation.
-The focused suite now compares full gradients, including padding, empty
-states, and gate parameters; the former CPU xfails have been removed.
+Packed backward masks unwritten padding lanes before gate-parameter
+reductions and restores the final-state cotangent for empty initial-state
+slots. Focused tests compare the complete gradient tree, explicitly require
+zero padding gradients and the empty-slot identity derivative, and retain
+the original tolerances without xfails for these cases.
+
+Non-TPU interpretation uses highest matrix-multiply precision to avoid a
+backend-selected reduced-precision FP32 reference. Interpretation also keeps
+optimization barriers at the rounded inter-phase tensors: the staged path
+materializes these tensors between calls, whereas the fused interpreter
+otherwise compiles both phases together. Native Mosaic keeps the VMEM
+boundaries and its existing precision configuration. CUDA validation of the
+interpreter comparison is tracked separately from native TPU correctness.
 
 ```bash
 python -m pytest tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_fused_test.py -v
