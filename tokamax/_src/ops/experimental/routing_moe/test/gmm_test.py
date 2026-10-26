@@ -504,6 +504,134 @@ class RoutingGmmTest(parameterized.TestCase):
           custom_plan=gmm_plan.RoutingGmmPlan(skip_metadata_size=-1),
       )
 
+  @parameterized.product(
+      num_tokens=[1, 4, 16],
+      shard=[(512, 0), (64, 0), (64, 128)],
+      tile_n=[None, 512],
+  )
+  def test_lowtok_matches_sorted(self, num_tokens, shard, tile_n):
+    num_local_experts, group_offset_val = shard
+    num_experts = 512
+    topk = 10
+    size_k = 1024
+    size_n = 512
+
+    key0, key1, key2, key3 = jax.random.split(jax.random.key(0), 4)
+    lhs = jax.random.normal(key0, (num_tokens, size_k), jnp.bfloat16) / 10
+    rhs1 = (
+        jax.random.normal(
+            key1, (num_local_experts, size_k, 2 * size_n), jnp.bfloat16
+        )
+        / 10
+    )
+    rhs1_q, rhs1_scale = gmm_util.quantize_tensor(
+        rhs1, jnp.float8_e4m3fn, axis=1, block_size=size_k
+    )
+    rhs1_scale = jnp.expand_dims(rhs1_scale, axis=2)
+    rhs2 = (
+        jax.random.normal(
+            key2, (num_local_experts, size_n, size_k), jnp.bfloat16
+        )
+        / 10
+    )
+
+    gating_output = jax.random.uniform(key3, (num_tokens, num_experts))
+    _, topk_indices = jax.lax.top_k(gating_output, topk)
+    topk_indices_flat = topk_indices.flatten()
+    topk_argsort_indices = jnp.argsort(topk_indices_flat)
+    group_sizes = jnp.bincount(topk_indices_flat, length=num_experts)
+    group_offset = jnp.array([group_offset_val], dtype=jnp.int32)
+
+    lhs_compact = input_pack.input_pack(lhs)
+    w1_wrapped = arg.make_weight_wrapper(
+        rhs1_q, rhs1_scale, fused_gate_up=True
+    )
+    w2_wrapped = arg.make_weight_wrapper(rhs2)
+    custom_plan = gmm_plan.RoutingGmmPlan(tile_n=tile_n)
+
+    sorted_mid = gmm.routing_gmm(
+        lhs_compact,
+        (w1_wrapped,),
+        group_sizes,
+        group_offset=group_offset,
+        gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
+        fuse_act="silu",
+        custom_plan=custom_plan,
+    )
+    sorted_out = gmm.routing_gmm(
+        sorted_mid,
+        (w2_wrapped,),
+        group_sizes,
+        group_offset=group_offset,
+        scatter=arg.make_routing_wrapper(topk_argsort_indices),
+        custom_plan=custom_plan,
+    )
+
+    slots_wrapped = arg.make_routing_wrapper(topk_indices_flat)
+    lowtok_mid = gmm.routing_gmm(
+        lhs_compact,
+        (w1_wrapped,),
+        None,
+        group_offset=group_offset,
+        gather=slots_wrapped,
+        fuse_act="silu",
+        custom_plan=custom_plan,
+        topk=topk,
+        num_global_groups=num_experts,
+    )
+    lowtok_out = gmm.routing_gmm(
+        lowtok_mid,
+        (w2_wrapped,),
+        None,
+        group_offset=group_offset,
+        scatter=slots_wrapped,
+        custom_plan=custom_plan,
+        topk=topk,
+        num_global_groups=num_experts,
+    )
+
+    written = (topk_indices_flat >= group_offset_val) & (
+        topk_indices_flat < group_offset_val + num_local_experts
+    )
+    sorted_rows = sorted_out.data.reshape(sorted_out.spec.large_shape)
+    lowtok_rows = lowtok_out.data.reshape(lowtok_out.spec.large_shape)
+    np.testing.assert_array_equal(lowtok_rows[written], sorted_rows[written])
+
+    if tile_n is None:
+      w1_bf16 = arg.make_weight_wrapper(rhs1, fused_gate_up=True)
+      fused_plan = gmm_plan.RoutingGmmPlan(fuse_up_and_down=True)
+      sorted_fused = gmm.routing_gmm(
+          lhs_compact,
+          (w1_bf16, w2_wrapped),
+          group_sizes,
+          group_offset=group_offset,
+          gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
+          scatter=arg.make_routing_wrapper(topk_argsort_indices),
+          fuse_act="silu",
+          custom_plan=fused_plan,
+      )
+      lowtok_fused = gmm.routing_gmm(
+          lhs_compact,
+          (w1_bf16, w2_wrapped),
+          None,
+          group_offset=group_offset,
+          gather=slots_wrapped,
+          scatter=slots_wrapped,
+          fuse_act="silu",
+          custom_plan=fused_plan,
+          topk=topk,
+          num_global_groups=num_experts,
+      )
+      sorted_fused_rows = sorted_fused.data.reshape(
+          sorted_fused.spec.large_shape
+      )
+      lowtok_fused_rows = lowtok_fused.data.reshape(
+          lowtok_fused.spec.large_shape
+      )
+      np.testing.assert_array_equal(
+          lowtok_fused_rows[written], sorted_fused_rows[written]
+      )
+
   @parameterized.named_parameters(*SHAPES)
   def test_permute_gmm_benchmark(self, **shape):
     self._setup_inputs(**shape)

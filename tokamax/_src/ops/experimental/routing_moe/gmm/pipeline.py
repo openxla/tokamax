@@ -120,7 +120,7 @@ def inner_pipeline(
 
 
 def outer_pipeline(
-    metadata_ref: metadata.SortedMetadataRef,
+    metadata_ref: metadata.AbstractMetadataRef,
     in_hbm_ref: memory_ref.PipelineInputs[hijax.TransformedRef],
     out_hbm_ref: hijax.TransformedRef,
     *,
