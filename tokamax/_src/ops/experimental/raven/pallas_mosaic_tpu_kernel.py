@@ -16,6 +16,7 @@
 """Pallas TPU compute kernel for Raven Gated Slot Attention (GSA)."""
 
 import functools
+import os
 from typing import Any
 
 import jax
@@ -23,7 +24,45 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
+# Dimensions:
+#   B: batch size
+#   T: sequence length (seq_len)
+#   H: number of attention heads (num_heads)
+#   BH: flattened batch * heads (B * H)
+#   MB: stream-batching factor per Pallas program instance
+#   NT: number of chunks along sequence length (T // BT)
+#   BT: chunk size (chunk_size)
+#   K: key/query head dimension (key_dim)
+#   M: number of memory slots (num_slots)
+#   V: value head dimension (val_dim)
+
 _CHUNK_SIZE = 64
+
+
+def _resolve_interpret(interpret: bool | None = None) -> bool:
+  """Resolves whether ``pallas_call`` should run in CPU interpret mode."""
+  if interpret is not None:
+    return interpret
+  env = os.environ.get("PALLAS_INTERPRET", "").strip().lower()
+  if env in ("0", "false"):
+    return False
+  if env in ("1", "true"):
+    return True
+  return jax.default_backend() == "cpu"
+
+
+def _validate_chunk_size(seq_len: int, chunk_size: int) -> None:
+  """Validates that ``chunk_size`` is positive, divides ``seq_len``, and fits VMEM."""
+  if chunk_size <= 0:
+    raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+  if seq_len % chunk_size != 0:
+    raise ValueError(
+        f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})."
+    )
+  if chunk_size > 64:
+    raise NotImplementedError(
+        f"chunk_size must be <= 64 for TPU VMEM layout, got {chunk_size}."
+    )
 
 
 def _select_mb(bh: int) -> int:
@@ -37,7 +76,8 @@ def _select_mb(bh: int) -> int:
 def _chunkify(
     x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int
 ) -> jax.Array:
-  # (batch_size, seq_len, num_heads, ...) -> (batch_size, num_heads, num_chunks, chunk_size, ...)
+  # (batch_size, seq_len, num_heads, ...) ->
+  # (batch_size, num_heads, num_chunks, chunk_size, ...)
   rest = x.shape[3:]
   x = x.reshape((batch_size, num_chunks, chunk_size, x.shape[2]) + rest)
   perm = (0, 3, 1, 2) + tuple(range(4, x.ndim))
@@ -86,36 +126,40 @@ def _decayed_apply(qk: jax.Array, s: jax.Array, g: jax.Array) -> jax.Array:
 
 
 def _stage1_fwd_kernel(
-    q_ref: Any,
-    k_ref: Any,
-    s_ref: Any,
-    g_ref: Any,
-    s0_ref: Any,
-    ok_ref: Any,
-    s1_final_ref: Any,
-    s1_in_ref: Any,
-    scratch_ref: Any,
+    # Inputs.
+    q_vmem_ref,  # [MB, 1, BT, K]
+    k_vmem_ref,  # [MB, 1, BT, K]
+    s_vmem_ref,  # [MB, 1, BT, M]
+    g_vmem_ref,  # [MB, 1, BT, M]
+    s0_vmem_ref,  # [MB, K, M] f32
+    # Outputs.
+    ok_vmem_ref,  # [MB, 1, BT, M]
+    s1_final_vmem_ref,  # [MB, K, M] f32
+    s1_in_vmem_ref,  # [MB, 1, K, M] f32
+    # Scratch.
+    scratch_vmem_ref,  # [MB, K, M] f32
     *,
     num_chunks: int,
 ) -> None:
   """Fused single-pass MB-batched compute kernel for Raven Stage 1."""
-  c = pl.program_id(1)
-  bt = q_ref.shape[2]
+  # Dimensions.
+  chunk_size = q_vmem_ref.shape[2]
+  chunk_idx = pl.program_id(1)
 
-  @pl.when(c == 0)
+  @pl.when(chunk_idx == 0)
   def _() -> None:
-    scratch_ref[...] = s0_ref[...].astype(jnp.float32)
+    scratch_vmem_ref[...] = s0_vmem_ref[...].astype(jnp.float32)
 
-  s1 = scratch_ref[...]  # (MB, K, M)
-  s1_in_ref[:, 0] = s1.astype(s1_in_ref.dtype)
+  s1 = scratch_vmem_ref[...]  # [MB, K, M]
+  s1_in_vmem_ref[:, 0] = s1.astype(s1_in_vmem_ref.dtype)
 
-  q_i = q_ref[:, 0].astype(jnp.float32)  # (MB, BT, K)
-  k_i = k_ref[:, 0].astype(jnp.float32)  # (MB, BT, K)
-  s_i = s_ref[:, 0].astype(jnp.float32)  # (MB, BT, M)
-  g_i = g_ref[:, 0].astype(jnp.float32)  # (MB, BT, M)
+  q_i = q_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
+  k_i = k_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
+  s_i = s_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
+  g_i = g_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
 
-  row_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 0)
-  col_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 1)
+  row_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 0)
+  col_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 1)
   causal = (col_idx <= row_idx).astype(jnp.float32)
 
   qk = (
@@ -136,7 +180,7 @@ def _stage1_fwd_kernel(
   ) * jnp.exp(g_i)
   ok_i = y_diag + y_off
 
-  g_last = g_i[:, -1, :]  # (MB, M)
+  g_last = g_i[:, -1, :]  # [MB, M]
   decay_tail = jnp.exp(jnp.minimum(g_last[:, None, :] - g_i, 0.0))
   state_contrib = jnp.matmul(
       jnp.swapaxes(k_i, -1, -2),
@@ -146,12 +190,12 @@ def _stage1_fwd_kernel(
   )
   s1_new = s1 * jnp.exp(g_last)[:, None, :] + state_contrib
 
-  scratch_ref[...] = s1_new
-  ok_ref[:, 0] = ok_i.astype(ok_ref.dtype)
+  scratch_vmem_ref[...] = s1_new
+  ok_vmem_ref[:, 0] = ok_i.astype(ok_vmem_ref.dtype)
 
-  @pl.when(c == num_chunks - 1)
+  @pl.when(chunk_idx == num_chunks - 1)
   def _() -> None:
-    s1_final_ref[...] = s1_new.astype(s1_final_ref.dtype)
+    s1_final_vmem_ref[...] = s1_new.astype(s1_final_vmem_ref.dtype)
 
 
 def raven_pallas_stage1_fwd(
@@ -170,12 +214,8 @@ def raven_pallas_stage1_fwd(
     | tuple[tuple[jax.Array, jax.Array | None], jax.Array]
 ):
   """Computes Raven Stage 1 forward pass using a single-pass MB-batched Pallas kernel."""
-  if chunk_size > 64:
-    raise NotImplementedError(
-        f"chunk_size must be <= 64 for TPU VMEM layout, got {chunk_size}."
-    )
-
   batch_size, seq_len, num_heads, key_dim = q.shape
+  _validate_chunk_size(seq_len, chunk_size)
   num_slots = s.shape[-1]
   num_chunks = seq_len // chunk_size
   bh = batch_size * num_heads
@@ -217,7 +257,7 @@ def raven_pallas_stage1_fwd(
       (mb, 1, key_dim, num_slots), lambda i, n: (i, n, 0, 0)
   )
 
-  interpret = jax.default_backend() == "cpu"
+  interpret = _resolve_interpret()
   ok_c, s1_final, s1_in_c = pl.pallas_call(
       functools.partial(_stage1_fwd_kernel, num_chunks=num_chunks),
       grid=grid,
@@ -255,36 +295,40 @@ def raven_pallas_stage1_fwd(
 
 
 def _stage2_fwd_kernel(
-    qv_ref: Any,
-    s_ref: Any,
-    v_ref: Any,
-    g_ref: Any,
-    s0_ref: Any,
-    out_ref: Any,
-    s2_final_ref: Any,
-    s2_in_ref: Any,
-    scratch_ref: Any,
+    # Inputs.
+    qv_vmem_ref,  # [MB, 1, BT, M]
+    s_vmem_ref,  # [MB, 1, BT, M]
+    v_vmem_ref,  # [MB, 1, BT, V]
+    g_vmem_ref,  # [MB, 1, BT, M]
+    s0_vmem_ref,  # [MB, M, V] f32
+    # Outputs.
+    out_vmem_ref,  # [MB, 1, BT, V]
+    s2_final_vmem_ref,  # [MB, M, V] f32
+    s2_in_vmem_ref,  # [MB, 1, M, V] f32
+    # Scratch.
+    scratch_vmem_ref,  # [MB, M, V] f32
     *,
     num_chunks: int,
 ) -> None:
   """Fused single-pass MB-batched compute kernel for Raven Stage 2."""
-  c = pl.program_id(1)
-  bt = qv_ref.shape[2]
+  # Dimensions.
+  chunk_size = qv_vmem_ref.shape[2]
+  chunk_idx = pl.program_id(1)
 
-  @pl.when(c == 0)
+  @pl.when(chunk_idx == 0)
   def _() -> None:
-    scratch_ref[...] = s0_ref[...].astype(jnp.float32)
+    scratch_vmem_ref[...] = s0_vmem_ref[...].astype(jnp.float32)
 
-  s2 = scratch_ref[...]  # (MB, M, V)
-  s2_in_ref[:, 0] = s2.astype(s2_in_ref.dtype)
+  s2 = scratch_vmem_ref[...]  # [MB, M, V]
+  s2_in_vmem_ref[:, 0] = s2.astype(s2_in_vmem_ref.dtype)
 
-  qv_i = qv_ref[:, 0].astype(jnp.float32)  # (MB, BT, M)
-  s_i = s_ref[:, 0].astype(jnp.float32)  # (MB, BT, M)
-  v_i = v_ref[:, 0].astype(jnp.float32)  # (MB, BT, V)
-  g_i = g_ref[:, 0].astype(jnp.float32)  # (MB, BT, M)
+  qv_i = qv_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
+  s_i = s_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
+  v_i = v_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
+  g_i = g_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
 
-  row_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 0)
-  col_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 1)
+  row_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 0)
+  col_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 1)
   causal = (col_idx <= row_idx).astype(jnp.float32)
 
   aqk = _decayed_gram(qv_i, s_i, g_i, g_i) * causal
@@ -302,7 +346,7 @@ def _stage2_fwd_kernel(
   )
   out_i = y_diag + y_off
 
-  g_last = g_i[:, -1, :]  # (MB, M)
+  g_last = g_i[:, -1, :]  # [MB, M]
   decay_tail = jnp.exp(jnp.minimum(g_last[:, None, :] - g_i, 0.0))
   state_contrib = jnp.matmul(
       jnp.swapaxes(s_i * decay_tail, -1, -2),
@@ -312,12 +356,12 @@ def _stage2_fwd_kernel(
   )
   s2_new = s2 * jnp.exp(g_last)[:, :, None] + state_contrib
 
-  scratch_ref[...] = s2_new
-  out_ref[:, 0] = out_i.astype(out_ref.dtype)
+  scratch_vmem_ref[...] = s2_new
+  out_vmem_ref[:, 0] = out_i.astype(out_vmem_ref.dtype)
 
-  @pl.when(c == num_chunks - 1)
+  @pl.when(chunk_idx == num_chunks - 1)
   def _() -> None:
-    s2_final_ref[...] = s2_new.astype(s2_final_ref.dtype)
+    s2_final_vmem_ref[...] = s2_new.astype(s2_final_vmem_ref.dtype)
 
 
 def raven_pallas_stage2_fwd(
@@ -335,12 +379,8 @@ def raven_pallas_stage2_fwd(
     | tuple[tuple[jax.Array, jax.Array | None], jax.Array]
 ):
   """Computes Raven Stage 2 forward pass using a single-pass MB-batched Pallas kernel."""
-  if chunk_size > 64:
-    raise NotImplementedError(
-        f"chunk_size must be <= 64 for TPU VMEM layout, got {chunk_size}."
-    )
-
   batch_size, seq_len, num_heads, num_slots = qv.shape
+  _validate_chunk_size(seq_len, chunk_size)
   val_dim = v.shape[-1]
   num_chunks = seq_len // chunk_size
   bh = batch_size * num_heads
@@ -377,7 +417,7 @@ def raven_pallas_stage2_fwd(
       (mb, 1, num_slots, val_dim), lambda i, n: (i, n, 0, 0)
   )
 
-  interpret = jax.default_backend() == "cpu"
+  interpret = _resolve_interpret()
   out_c, s2_final, s2_in_c = pl.pallas_call(
       functools.partial(_stage2_fwd_kernel, num_chunks=num_chunks),
       grid=grid,
@@ -411,4 +451,83 @@ def raven_pallas_stage2_fwd(
   final_state = s2_final_4d.astype(v.dtype) if output_final_state else None
   if return_residuals:
     return (out, final_state), s2_in_5d
+  return out, final_state
+
+
+def raven_pallas_fwd(
+    q: jax.Array,
+    k: jax.Array,
+    s: jax.Array,
+    g: jax.Array,
+    v: jax.Array | None = None,
+    *,
+    chunk_size: int = _CHUNK_SIZE,
+    scale: float | None = None,
+    initial_state: (
+        jax.Array | tuple[jax.Array | None, jax.Array | None] | None
+    ) = None,
+    output_final_state: bool = False,
+    return_residuals: bool = False,
+) -> Any:
+  """Computes Raven GSA forward pass (Stage 1 when ``v is None``, or full 2-stage)."""
+  if v is None:
+    if isinstance(initial_state, tuple):
+      s1_init = initial_state[0]
+    else:
+      s1_init = initial_state
+    if return_residuals:
+      (ok, s1_final), s1_in_c = raven_pallas_stage1_fwd(
+          q,
+          k,
+          s,
+          g,
+          chunk_size=chunk_size,
+          scale=scale,
+          initial_state=s1_init,
+          output_final_state=output_final_state,
+          return_residuals=True,
+      )
+      return (ok, s1_final), (s1_in_c, None, None)
+    return raven_pallas_stage1_fwd(
+        q,
+        k,
+        s,
+        g,
+        chunk_size=chunk_size,
+        scale=scale,
+        initial_state=s1_init,
+        output_final_state=output_final_state,
+        return_residuals=False,
+    )
+
+  if isinstance(initial_state, tuple):
+    s1_init, s2_init = initial_state
+  else:
+    s1_init, s2_init = initial_state, None
+
+  (ok, s1_final), s1_in_c = raven_pallas_stage1_fwd(
+      q,
+      k,
+      s,
+      g,
+      chunk_size=chunk_size,
+      scale=scale,
+      initial_state=s1_init,
+      output_final_state=output_final_state,
+      return_residuals=True,
+  )
+  qv = jax.nn.softmax(ok.astype(jnp.float32), axis=-1).astype(v.dtype)
+  (out, s2_final), s2_in_c = raven_pallas_stage2_fwd(
+      qv,
+      s,
+      v,
+      g,
+      chunk_size=chunk_size,
+      initial_state=s2_init,
+      output_final_state=output_final_state,
+      return_residuals=True,
+  )
+  final_state = (s1_final, s2_final) if output_final_state else None
+  if return_residuals:
+    return (out, final_state), (s1_in_c, qv, s2_in_c)
   return out, final_state

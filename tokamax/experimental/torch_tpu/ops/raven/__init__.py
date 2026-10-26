@@ -15,9 +15,13 @@
 
 """PyTorch Raven Gated Slot Attention (GSA) operator."""
 
-from tokamax.experimental.torch_tpu.ops.raven.torch_base import _RavenGSA
+from tokamax.experimental.torch_tpu.ops.raven.torch_base import (
+    _RavenGSA,
+    raven_gsa as raven_base_gsa,
+)
 from tokamax.experimental.torch_tpu.ops.raven.torch_pallas_mosaic_tpu import (
     _PallasTpuRavenGSA,
+    _PallasTpuRavenGSAVjp,
     raven_gsa,
 )
 
@@ -26,6 +30,8 @@ raven_pallas_gsa = raven_gsa
 __all__ = [
     "_RavenGSA",
     "_PallasTpuRavenGSA",
+    "_PallasTpuRavenGSAVjp",
+    "raven_base_gsa",
     "raven_gsa",
     "raven_pallas_gsa",
 ]

@@ -15,16 +15,34 @@
 
 """Raven Gated Slot Attention (GSA) Tokamax operator."""
 
-from tokamax._src.ops.experimental.raven.base import RavenGSA
+from tokamax._src.ops.experimental.raven.api import (
+    IMPLEMENTATIONS,
+    Implementation,
+    raven_gsa,
+)
+from tokamax._src.ops.experimental.raven.arg_specs import ARG_SPECS
+from tokamax._src.ops.experimental.raven.base import (
+    RavenGSA,
+    raven_gsa_reference,
+    raven_stage1_reference,
+    raven_stage2_reference,
+)
 from tokamax._src.ops.experimental.raven.pallas_mosaic_tpu import (
     Config,
     PallasTpuRavenGSA,
+    PallasTpuRavenGSAVjp,
 )
-from tokamax._src.ops.experimental.raven.reference import raven_stage1_reference
 
 __all__ = [
+    "ARG_SPECS",
     "Config",
+    "IMPLEMENTATIONS",
+    "Implementation",
     "PallasTpuRavenGSA",
+    "PallasTpuRavenGSAVjp",
     "RavenGSA",
+    "raven_gsa",
+    "raven_gsa_reference",
     "raven_stage1_reference",
+    "raven_stage2_reference",
 ]
