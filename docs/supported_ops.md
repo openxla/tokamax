@@ -125,7 +125,7 @@ table.ops-table code {
     <tr>
       <td><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/mla_swa"><code>mla_swa</code></a> (experimental)</td>
       <td>TPU</td>
-      <td align="center" style="text-align: center;"></td>
+      <td align="center" style="text-align: center;">✅</td>
       <td align="center" style="text-align: center;"></td>
       <td>Computes Multi-Head Latent Sliding Window Attention over a paged KV cache (optionally returning partial softmax accumulators to combine with <code>sparse_mla</code>) for DeepSeek-V4 inference.</td>
     </tr>
