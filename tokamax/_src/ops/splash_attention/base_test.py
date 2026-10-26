@@ -207,6 +207,113 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     vmapped_op = jax.vmap(self.op, in_axes=(0, 0, 0, None))
     out = vmapped_op(q, k, v, mask)
     self.assertEqual(out.shape, (batch_size, num_heads, seq_len, head_dim))
+    expected = jnp.stack(
+        [self.op(q[i], k[i], v[i], mask) for i in range(batch_size)]
+    )
+    chex.assert_trees_all_close(out, expected, atol=1e-5)
+
+  @parameterized.parameters(
+      ((2,), 4, 4, False, False),
+      ((2,), 4, 2, False, False),
+      ((2,), 4, 1, True, True),
+      ((2,), 4, 1, True, False),
+      ((2, 3), 4, 2, False, False),
+      ((2, 3), 4, 1, True, True),
+  )
+  def test_batch_dimension_support(
+      self, batch_shape, num_q_heads, num_kv_heads, is_mqa, mqa_2d
+  ):
+    q_seq_len, kv_seq_len, head_dim = 64, 64, 32
+    dtype = jnp.float32
+
+    q_struct = jax.ShapeDtypeStruct(
+        (*batch_shape, num_q_heads, q_seq_len, head_dim), dtype=dtype
+    )
+    if mqa_2d:
+      k_struct = jax.ShapeDtypeStruct(
+          (*batch_shape, kv_seq_len, head_dim), dtype=dtype
+      )
+      v_struct = jax.ShapeDtypeStruct(
+          (*batch_shape, kv_seq_len, head_dim), dtype=dtype
+      )
+    else:
+      k_struct = jax.ShapeDtypeStruct(
+          (*batch_shape, num_kv_heads, kv_seq_len, head_dim), dtype=dtype
+      )
+      v_struct = jax.ShapeDtypeStruct(
+          (*batch_shape, num_kv_heads, kv_seq_len, head_dim), dtype=dtype
+      )
+
+    q, k, v = numerics.random_initialize((q_struct, k_struct, v_struct))
+    mask = base.CAUSAL_MASK
+
+    out = self.op(q, k, v, mask=mask, is_mqa=is_mqa)
+    chex.assert_shape(out, (*batch_shape, num_q_heads, q_seq_len, head_dim))
+
+    ref_fn = functools.partial(
+        reference.attention_reference,
+        mask=mask.as_array(q_seq_len, kv_seq_len),
+        is_mqa=is_mqa,
+    )
+    for _ in batch_shape:
+      ref_fn = jax.vmap(ref_fn)
+    ref_out = ref_fn(
+        q=q,
+        k=k if not (is_mqa and not mqa_2d) else jnp.squeeze(k, axis=-3),
+        v=v if not (is_mqa and not mqa_2d) else jnp.squeeze(v, axis=-3),
+    )
+    chex.assert_trees_all_close(out, ref_out, atol=1e-5)
+
+  @parameterized.parameters(False, True)
+  def test_batched_vjp(self, batched_sinks):
+    batch_size = 2
+    num_heads = 4
+    seq_len = 32
+    head_dim = 16
+    dtype = jnp.float32
+
+    q = jax.ShapeDtypeStruct((batch_size, num_heads, seq_len, head_dim), dtype)
+    k = jax.ShapeDtypeStruct((batch_size, num_heads, seq_len, head_dim), dtype)
+    v = jax.ShapeDtypeStruct((batch_size, num_heads, seq_len, head_dim), dtype)
+    do = jax.ShapeDtypeStruct((batch_size, num_heads, seq_len, head_dim), dtype)
+    sinks_shape = (batch_size, num_heads) if batched_sinks else (num_heads,)
+    sinks = jax.ShapeDtypeStruct(sinks_shape, dtype)
+
+    q, k, v, do, sinks = numerics.random_initialize((q, k, v, do, sinks))
+    mask = base.CAUSAL_MASK
+
+    f = lambda q, k, v, s: self.op(q, k, v, mask=mask, sinks=s)
+    out, vjp_fn = jax.vjp(f, q, k, v, sinks)
+    dq, dk, dv, dsinks = vjp_fn(do)
+
+    chex.assert_shape(out, (batch_size, num_heads, seq_len, head_dim))
+    chex.assert_shape(dq, (batch_size, num_heads, seq_len, head_dim))
+    chex.assert_shape(dk, (batch_size, num_heads, seq_len, head_dim))
+    chex.assert_shape(dv, (batch_size, num_heads, seq_len, head_dim))
+    chex.assert_shape(dsinks, sinks_shape)
+
+    f_single = lambda q_i, k_i, v_i, s_i: self.op(
+        q_i, k_i, v_i, mask=mask, sinks=s_i
+    )
+    out_refs, dq_refs, dk_refs, dv_refs, dsinks_refs = [], [], [], [], []
+    for i in range(batch_size):
+      s_i = sinks[i] if batched_sinks else sinks
+      out_i, vjp_i = jax.vjp(f_single, q[i], k[i], v[i], s_i)
+      dqi, dki, dvi, dsi = vjp_i(do[i])
+      out_refs.append(out_i)
+      dq_refs.append(dqi)
+      dk_refs.append(dki)
+      dv_refs.append(dvi)
+      dsinks_refs.append(dsi)
+
+    chex.assert_trees_all_close(out, jnp.stack(out_refs), atol=1e-3)
+    chex.assert_trees_all_close(dq, jnp.stack(dq_refs), atol=1e-3)
+    chex.assert_trees_all_close(dk, jnp.stack(dk_refs), atol=1e-3)
+    chex.assert_trees_all_close(dv, jnp.stack(dv_refs), atol=1e-3)
+    expected_dsinks = (
+        jnp.stack(dsinks_refs) if batched_sinks else sum(dsinks_refs)
+    )
+    chex.assert_trees_all_close(dsinks, expected_dsinks, atol=1e-3)
 
   @parameterized.parameters(
       (4, 4, 128, 128, 64, False, None),

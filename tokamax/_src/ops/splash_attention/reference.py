@@ -19,6 +19,7 @@ import functools
 from typing import Final
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Int
 import numpy as np
 from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
 
@@ -52,8 +53,8 @@ class SegmentIds:
     kv: segment ids along the KV sequence
   """
 
-  q: jax.Array | jax.sharding.PartitionSpec  # [q_seq_len]
-  kv: jax.Array | jax.sharding.PartitionSpec  # [kv_seq_len]
+  q: Int[Array, "*#B T"] | jax.sharding.PartitionSpec
+  kv: Int[Array, "*#B t"] | jax.sharding.PartitionSpec
 
 
 # Return type of SplashAttention function that implements the custom vjp rule.

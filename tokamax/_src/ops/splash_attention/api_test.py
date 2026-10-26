@@ -248,6 +248,52 @@ class SplashAttentionApiTest(parameterized.TestCase):
     )
 
   @parameterized.parameters(
+      ((2,), 4, 4, False, False),
+      ((2,), 4, 1, True, True),
+      ((2,), 4, 1, True, False),
+      ((2, 3), 4, 2, False, False),
+  )
+  def test_batched_splash_attention(
+      self, batch_shape, num_q_heads, num_kv_heads, is_mqa, mqa_2d
+  ):
+    seq_len, head_dim = 64, 32
+    dtype = jnp.float32
+
+    q_s = jax.ShapeDtypeStruct(
+        (*batch_shape, num_q_heads, seq_len, head_dim), dtype
+    )
+    if mqa_2d:
+      k_s = jax.ShapeDtypeStruct((*batch_shape, seq_len, head_dim), dtype)
+      v_s = jax.ShapeDtypeStruct((*batch_shape, seq_len, head_dim), dtype)
+    else:
+      k_s = jax.ShapeDtypeStruct(
+          (*batch_shape, num_kv_heads, seq_len, head_dim), dtype
+      )
+      v_s = jax.ShapeDtypeStruct(
+          (*batch_shape, num_kv_heads, seq_len, head_dim), dtype
+      )
+
+    q, k, v = numerics.random_initialize((q_s, k_s, v_s), seed=8)
+    out = api.splash_attention(
+        q, k, v, mask=base.CAUSAL_MASK, is_mqa=is_mqa, implementation="base"
+    )
+    chex.assert_shape(out, (*batch_shape, num_q_heads, seq_len, head_dim))
+
+    ref_fn = functools.partial(
+        reference.attention_reference,
+        mask=base.CAUSAL_MASK.as_array(seq_len, seq_len),
+        is_mqa=is_mqa,
+    )
+    for _ in batch_shape:
+      ref_fn = jax.vmap(ref_fn)
+    ref_out = ref_fn(
+        q=q,
+        k=k if not (is_mqa and not mqa_2d) else jnp.squeeze(k, axis=-3),
+        v=v if not (is_mqa and not mqa_2d) else jnp.squeeze(v, axis=-3),
+    )
+    chex.assert_trees_all_close(out, ref_out, atol=1e-5)
+
+  @parameterized.parameters(
       (4, 4, False, None),
       (4, 1, True, None),
       (2, 2, False, 30.0),

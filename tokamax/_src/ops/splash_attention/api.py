@@ -47,14 +47,12 @@ del _IMPLEMENTATIONS
 
 
 def splash_attention(
-    q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
-    k: Float[Array, "..."],
-    v: Float[Array, "..."],
-    mask: (
-        base.Mask | mask_lib.Mask | Bool[Array, "q_seq_len kv_seq_len"] | None
-    ) = None,
-    segment_ids: base.SegmentIds | reference.SegmentIds | None = None,
-    sinks: Float[Array, "..."] | None = None,
+    q: Float[Array, "*B H T D"],
+    k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
+    v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
+    mask: base.Mask | mask_lib.Mask | Bool[Array, "*#B T t"] | None = None,
+    segment_ids: base.SegmentIds | None = None,
+    sinks: Float[Array, "*#B H"] | None = None,
     *,
     is_mqa: bool = False,
     mask_value: float = reference.DEFAULT_MASK_VALUE,
@@ -62,15 +60,13 @@ def splash_attention(
     dropout_rate: float = 0.0,
     prng_key: jax.Array | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
-) -> jax.Array:
+) -> Float[Array, "*B H T d"]:
   """Splash Attention.
 
   Args:
-    q: Query array of shape (num_q_heads, q_seq_len, head_dim_qk).
-    k: Key array of shape (num_kv_heads, kv_seq_len, head_dim_qk) or
-      (kv_seq_len, head_dim_qk) if is_mqa=True.
-    v: Value array of shape (num_kv_heads, kv_seq_len, head_dim_v) or
-      (kv_seq_len, head_dim_v) if is_mqa=True.
+    q: Query array.
+    k: Key array.
+    v: Value array.
     mask: Optional attention mask (base.Mask, splash mask, boolean array, etc.).
     segment_ids: Optional document segment IDs.
     sinks: Optional attention sinks tensor.
@@ -84,7 +80,7 @@ def splash_attention(
       that doesn't raise a NotImplementedError is used.
 
   Returns:
-    Attention output array of shape (num_q_heads, q_seq_len, head_dim_v).
+    Attention output array.
 
   Raises:
     ExceptionGroup: If multiple implementations are provided and all of them

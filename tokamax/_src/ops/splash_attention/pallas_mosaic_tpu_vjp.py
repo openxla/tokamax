@@ -92,15 +92,15 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
   def _fwd(
       self,
       residuals: base.Residuals,
-      out: Float[Array, "num_q_heads q_seq_len head_dim_v"],
-      dout: Float[Array, "num_q_heads q_seq_len head_dim_v"],
-      q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
-      k: Float[Array, "..."],
-      v: Float[Array, "..."],
+      out: Float[Array, "*B H T d"],
+      dout: Float[Array, "*B H T d"],
+      q: Float[Array, "*B H T D"],
+      k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
+      v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
       *,
       mask: base.Mask | mask_lib.Mask,
       segment_ids: base.SegmentIds | None = None,
-      sinks: Float[Array, "..."] | None = None,
+      sinks: Float[Array, "*#B H"] | None = None,
       is_mqa: bool = False,
       mask_value: float = base.DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
@@ -116,15 +116,15 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     if config.use_base2_exp:
       lse = lse * LOG2E
 
-    seq_len_q = q.shape[1]
-    seq_len_kv = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
-    mask_shape = (seq_len_q, seq_len_kv)
+    q_seq_len = q.shape[-2]
+    kv_seq_len = k.shape[-2]
+    mask_shape = (q_seq_len, kv_seq_len)
 
     if isinstance(mask, mask_lib.Mask):
       splash_mask = mask
     elif isinstance(mask, base.Mask):
       if mask.bool_mask is not None and mask.is_causal:
-        splash_mask = mask.as_array(seq_len_q, seq_len_kv)
+        splash_mask = mask.as_array(q_seq_len, kv_seq_len)
       elif mask.bool_mask is not None:
         splash_mask = mask.bool_mask
       elif mask.is_causal:
@@ -134,9 +134,9 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     else:
       splash_mask = mask
 
-    if is_mqa and k.ndim == 3:
-      k_in = k[0]
-      v_in = v[0]
+    if is_mqa and k.ndim == q.ndim:
+      k_in = jnp.squeeze(k, axis=-3)
+      v_in = jnp.squeeze(v, axis=-3)
     else:
       k_in = k
       v_in = v
@@ -151,16 +151,67 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         **dataclasses.asdict(config),
     )
 
-    if isinstance(splash_mask, (jax.Array, np.ndarray)):
-      splash_maker = (
-          splash_attention_kernel.make_dynamic_splash_mqa
-          if is_mqa
-          else splash_attention_kernel.make_dynamic_splash_mha
+    orig_sinks_shape = None if sinks is None else sinks.shape
+    broadcast_to_rank = (
+        lambda x, rank: None
+        if x is None
+        else jax.lax.broadcast_to_rank(x, rank)
+    )
+
+    if segment_ids is not None:
+      segment_ids = base.SegmentIds(
+          q=jax.lax.broadcast_to_rank(segment_ids.q, q.ndim - 2)
+          if isinstance(segment_ids.q, (jax.Array, np.ndarray))
+          else segment_ids.q,
+          kv=jax.lax.broadcast_to_rank(segment_ids.kv, q.ndim - 2)
+          if isinstance(segment_ids.kv, (jax.Array, np.ndarray))
+          else segment_ids.kv,
       )
-      attn_fn = splash_maker(
-          jnp.asarray(splash_mask),
-          config=splash_config,
-          mask_value=mask_value,
+    sinks_bcast = broadcast_to_rank(sinks, q.ndim - 2)
+
+    if isinstance(splash_mask, (jax.Array, np.ndarray)):
+      splash_mask = broadcast_to_rank(jnp.asarray(splash_mask), q.ndim - 1)
+
+      def single_bwd_dynamic(dout, q, k, v, out, lse, mask, segment_ids, sinks):
+        splash_maker = (
+            splash_attention_kernel.make_dynamic_splash_mqa
+            if is_mqa
+            else splash_attention_kernel.make_dynamic_splash_mha
+        )
+        attn_fn = splash_maker(
+            mask,
+            config=splash_config,
+            mask_value=mask_value,
+        )
+        res = (
+            q,
+            k,
+            v,
+            segment_ids,
+            sinks,
+            out,
+            lse,
+            attn_fn.dkv_mask_info,
+            prng_key,
+        )
+        splash_fn_kwargs = attn_fn.kwargs
+        _, _, dq, dk, dv, _, dsinks, _, _ = (
+            splash_attention_kernel._splash_attention_bwd(  # pylint: disable=protected-access
+                save_residuals=False,
+                mask_value=mask_value,
+                is_mqa=is_mqa,
+                config=splash_fn_kwargs["config"],
+                mask_function=splash_fn_kwargs["mask_function"],
+                fwd_mask_sparsity=splash_fn_kwargs["fwd_mask_sparsity"],
+                dkv_mask_sparsity=splash_fn_kwargs["dkv_mask_sparsity"],
+                res=res,
+                grads=dout,
+            )
+        )
+        return dq, dk, dv, dsinks
+
+      dq, dk, dv, dsinks = base.vmap_batch_dims(single_bwd_dynamic)(
+          dout, q, k_in, v_in, out, lse, splash_mask, segment_ids, sinks_bcast
       )
     else:
       splash_maker = (
@@ -174,36 +225,52 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
           mask_value=mask_value,
       )
 
-    res = (
-        q,
-        k_in,
-        v_in,
-        segment_ids,
-        sinks,
-        out,
-        lse,
-        attn_fn.dkv_mask_info,
-        prng_key,
-    )
-
-    splash_fn_kwargs = attn_fn.kwargs
-    _, _, dq, dk, dv, _, dsinks, _, _ = (
-        splash_attention_kernel._splash_attention_bwd(  # pylint: disable=protected-access
-            save_residuals=False,
-            mask_value=mask_value,
-            is_mqa=is_mqa,
-            config=splash_fn_kwargs["config"],
-            mask_function=splash_fn_kwargs["mask_function"],
-            fwd_mask_sparsity=splash_fn_kwargs["fwd_mask_sparsity"],
-            dkv_mask_sparsity=splash_fn_kwargs["dkv_mask_sparsity"],
-            res=res,
-            grads=dout,
+      def single_bwd_static(dout, q, k, v, out, lse, segment_ids, sinks):
+        res = (
+            q,
+            k,
+            v,
+            segment_ids,
+            sinks,
+            out,
+            lse,
+            attn_fn.dkv_mask_info,
+            prng_key,
         )
-    )
+        splash_fn_kwargs = attn_fn.kwargs
+        _, _, dq, dk, dv, _, dsinks, _, _ = (
+            splash_attention_kernel._splash_attention_bwd(  # pylint: disable=protected-access
+                save_residuals=False,
+                mask_value=mask_value,
+                is_mqa=is_mqa,
+                config=splash_fn_kwargs["config"],
+                mask_function=splash_fn_kwargs["mask_function"],
+                fwd_mask_sparsity=splash_fn_kwargs["fwd_mask_sparsity"],
+                dkv_mask_sparsity=splash_fn_kwargs["dkv_mask_sparsity"],
+                res=res,
+                grads=dout,
+            )
+        )
+        return dq, dk, dv, dsinks
 
-    if is_mqa and k.ndim == 3:
-      dk = dk.reshape(k.shape)
-      dv = dv.reshape(v.shape)
+      dq, dk, dv, dsinks = base.vmap_batch_dims(single_bwd_static)(
+          dout, q, k_in, v_in, out, lse, segment_ids, sinks_bcast
+      )
+
+    if is_mqa and k.ndim == q.ndim:
+      dk = jnp.expand_dims(dk, axis=-3)
+      dv = jnp.expand_dims(dv, axis=-3)
+
+    if sinks is not None and dsinks is not None:
+      assert sinks_bcast is not None
+      broadcast_sinks_axes = [
+          i
+          for i, d in enumerate(sinks_bcast.shape)
+          if i < len(sinks_bcast.shape) - 1 and d == 1
+      ]
+      if broadcast_sinks_axes:
+        dsinks = jnp.sum(dsinks, axis=broadcast_sinks_axes)
+      dsinks = dsinks.astype(sinks.dtype).reshape(orig_sinks_shape)
 
     grads = base.SplashAttentionGrads(q=dq, k=dk, v=dv, sinks=dsinks)
     return grads, None
@@ -214,11 +281,8 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     k = ba.arguments["k"]
     is_mqa = ba.arguments.get("is_mqa", False)
     dropout_rate = ba.arguments.get("dropout_rate", 0.0)
-    q_seq_len = q.shape[1]
-
-    kv_seq_len = k.shape[1]
-    if is_mqa and k.ndim == 2:
-      kv_seq_len = k.shape[0]
+    q_seq_len = q.shape[-2]
+    kv_seq_len = k.shape[-2]
 
     # Use larger block sizes for longer sequences if possible
     block_q_dkv = 128
@@ -257,8 +321,8 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     k = ba.arguments["k"]
     is_mqa = ba.arguments.get("is_mqa", False)
     dropout_rate = ba.arguments.get("dropout_rate", 0.0)
-    q_seq_len = q.shape[1]
-    kv_seq_len = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
+    q_seq_len = q.shape[-2]
+    kv_seq_len = k.shape[-2]
 
     tiles = [128, 256, 512, 1024, 2048]
     # TODO: Unify forward and VJP autotuning so that they use the
