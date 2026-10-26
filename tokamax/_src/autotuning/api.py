@@ -367,7 +367,7 @@ def autotune(
     f: A callable, a list of bound arguments, or a lowered JAX function.
     *args: Positional arguments to `f` (only valid if `f` is callable). NOTE -
       To autotune a callable with keyword arguments, pass the results of
-      `tokamax.get_bound_args(f, *args, **kwargs)` to `autotune`.
+      `tokamax.autotuning.get_bound_args(f, *args, **kwargs)` to `autotune`.
     ignore_cache: If `False` (default), only autotune ops that are not in the
       autotuning cache. If `True`, ignore the autotuning cache and autotune all
       Tokamax ops found in `f`. In either case, ops already present in an active
