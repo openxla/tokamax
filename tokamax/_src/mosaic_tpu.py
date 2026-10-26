@@ -24,10 +24,38 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 import qwix
 
-
 QArray = qwix.QArray
 
 LANES = 128
+
+# The default fraction of the TensorCore VMEM capacity for `vmem_limit_bytes`.
+DEFAULT_TC_VMEM_LIMIT_FRACTION = 0.95
+
+
+def default_tc_vmem_limit_bytes(
+    fraction: float = DEFAULT_TC_VMEM_LIMIT_FRACTION,
+    tpu_info: pltpu.TpuInfo | None = None,
+) -> int:
+  """Returns a default TensorCore `vmem_limit_bytes` for Pallas TPU kernels.
+
+  This is the scoped VMEM limit for TensorCore kernels: `fraction` of the
+  TensorCore VMEM capacity, `TpuInfo.vmem_capacity_bytes`. It does not apply to
+  SparseCore memory. XLA reserves part of TensorCore VMEM for itself, so
+  requesting the full capacity exceeds the maximum scoped VMEM, which makes XLA
+  log an INVALID_ARGUMENT error and lower the limit. The headroom also covers
+  reservations that depend on the program. With the default fraction, this is
+  60.8 MiB on TPU7x, where the maximum is 63.94 MiB, and 182.4 MiB on TPU8i,
+  where the maximum is 190 MiB.
+
+  Args:
+    fraction: The fraction of the TensorCore VMEM capacity to use, in (0, 1].
+    tpu_info: The TPU to return the limit for. Defaults to the current device.
+  """
+  if not 0 < fraction <= 1:
+    raise ValueError(f"`fraction` must be in (0, 1], got {fraction}.")
+  if tpu_info is None:
+    tpu_info = pltpu.get_tpu_info()
+  return int(tpu_info.vmem_capacity_bytes * fraction)
 
 
 @functools.lru_cache

@@ -133,6 +133,7 @@ def _make_maxtext_gmm_v2_spec(
         group_sizes=base.GroupSizes(
             jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), m
         ),
+        zero_initialize=True,
         preferred_element_type=jnp.bfloat16,
     )
   else:
@@ -143,6 +144,7 @@ def _make_maxtext_gmm_v2_spec(
         group_sizes=base.GroupSizes(
             jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), m
         ),
+        zero_initialize=True,
         preferred_element_type=jnp.bfloat16,
     )
   return arg_spec.ArgSpec(

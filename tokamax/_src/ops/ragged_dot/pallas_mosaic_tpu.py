@@ -304,8 +304,7 @@ class PallasMosaicTpuRaggedDot(base.RaggedDot[Config, None]):
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     if self.qdtype is not None:
       return Config()
-    # Currently the heuristics are only implemented for TPU7x.
-    if pltpu.get_tpu_info().generation < 7:
+    if pltpu.get_tpu_info().generation < 5:
       return Config()
     lhs, rhs = ba.args
 

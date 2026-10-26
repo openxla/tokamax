@@ -55,6 +55,7 @@ class LightningIndexer[C](
       cp_rank: Int[Array | AbstractArray, ""] | int = 0,
       interleave_size: int = 1,
       return_scores: bool = False,
+      uniform_q_len: int | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Validates input shapes and binds arguments for Lightning Indexer."""
@@ -99,6 +100,7 @@ class LightningIndexer[C](
         cp_rank=cp_rank,
         interleave_size=interleave_size,
         return_scores=return_scores,
+        uniform_q_len=uniform_q_len,
         return_residuals=return_residuals,
     )
 
@@ -121,6 +123,7 @@ class LightningIndexer[C](
       cp_rank: Int[Array, ""] | int = 0,
       interleave_size: int = 1,
       return_scores: bool = False,
+      uniform_q_len: int | None = None,
       return_residuals: bool = False,
       config: C,
   ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], None]:
@@ -140,5 +143,6 @@ class LightningIndexer[C](
         cp_rank=cp_rank,
         interleave_size=interleave_size,
         return_scores=return_scores,
+        uniform_q_len=uniform_q_len,
     )
     return out, None

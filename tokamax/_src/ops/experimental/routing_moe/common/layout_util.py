@@ -40,6 +40,10 @@ def to_compact_shape(
   assert len(large_shape) == 2
   rows, cols = large_shape
   packing = 4 // jnp.dtype(dtype).itemsize
+  assert cols % (packing * lanes) == 0, (
+      f"cols ({cols}) must be a positive multiple of packing * lanes"
+      f" ({packing * lanes})."
+  )
   return (rows, cols // (packing * lanes), packing, lanes)
 
 

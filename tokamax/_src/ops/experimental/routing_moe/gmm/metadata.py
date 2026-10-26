@@ -15,8 +15,10 @@
 
 """Module that encapsulates metadata used for DMA and scheduling."""
 
+import abc
 import dataclasses
 import functools
+from typing import Any
 
 import jax
 from jax import lax
@@ -26,35 +28,23 @@ import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class MetadataRef:
+class AbstractMetadataRef(abc.ABC):
   """Stores scalar data used for routing and pipeline scheudling."""
 
   gm_id_to_group_id: jax.Array | hijax.TransformedRef
   gm_id_to_m_offset: jax.Array | hijax.TransformedRef
   gm_id_to_num_rows: jax.Array | hijax.TransformedRef
   num_gm: jax.Array | hijax.TransformedRef
-  group_cum_sum: jax.Array | hijax.TransformedRef
-  group_offset: jax.Array | hijax.TransformedRef
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
 
-  @classmethod
-  def create(
-      cls,
-      group_cum_sum: jax.Array,
-      group_offset: jax.Array,
-      cfg: config.RoutingGmmConfig,
-  ):
-    """Wraps scalar data for metadata."""
-    return cls(
+  @staticmethod
+  def _empty_tables(cfg: config.RoutingGmmConfig) -> dict[str, Any]:
+    return dict(
         gm_id_to_group_id=jnp.empty((cfg.max_num_gm,), jnp.int32),
         gm_id_to_m_offset=jnp.empty((cfg.max_num_gm,), jnp.int32),
         gm_id_to_num_rows=jnp.empty((cfg.max_num_gm,), jnp.int32),
         num_gm=jnp.empty((1,), jnp.int32),
-        group_cum_sum=group_cum_sum,
-        group_offset=group_offset,
-        cfg=cfg,
     )
 
   @property
@@ -106,6 +96,36 @@ class MetadataRef:
         jnp.asarray(k_id, dtype),
     )
 
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class SortedMetadataRef(AbstractMetadataRef):
+  """Metadata from routing sorted outside the kernel.
+
+  XLA sorts the routed rows by group and counts the rows of each group
+  (`group_cum_sum`); the kernel walks this shard's groups to lay out the tiles.
+  """
+
+  group_cum_sum: jax.Array | hijax.TransformedRef
+  group_offset: jax.Array | hijax.TransformedRef
+
+  @classmethod
+  def create(
+      cls,
+      group_cum_sum: jax.Array,
+      group_offset: jax.Array,
+      cfg: config.RoutingGmmConfig,
+      row_group: jax.Array | None = None,
+  ) -> "SortedMetadataRef":
+    """Wraps scalar data for metadata."""
+    del row_group
+    return cls(
+        **cls._empty_tables(cfg),
+        group_cum_sum=group_cum_sum,
+        group_offset=group_offset,
+        cfg=cfg,
+    )
+
   def fill_metadata_and_return_num_gm(self) -> jax.Array:
     """Iterate group sizes to metadata about DMA and pipeline schedule logic."""
 
@@ -148,6 +168,17 @@ class MetadataRef:
       )
       return next_num_gm
 
+    num_gm = self._walk_groups(write_group, group_start, group_end)
+    self.num_gm[0] = num_gm
+    return num_gm
+
+  def _walk_groups(
+      self,
+      write_group: Any,
+      group_start: jax.Array,
+      group_end: jax.Array,
+  ) -> jax.Array:
+    """Walks this shard's groups to lay out their tiles."""
     # Walk the groups, but skip over "skip" consecutive empty elements.
     skip = self.cfg.plan.skip_metadata_size
 
@@ -163,12 +194,87 @@ class MetadataRef:
 
     if skip == 0:
       # There's overhead of our checks, so standard fori is better here.
-      num_gm = jax.lax.fori_loop(group_start, group_end, write_group, 0)
-    else:
-      _, num_gm = jax.lax.while_loop(
-          lambda carry: carry[0] < group_end,
-          step,
-          (group_start, jnp.int32(0)),
-      )
-    self.num_gm[0] = num_gm
+      return jax.lax.fori_loop(group_start, group_end, write_group, 0)
+    _, num_gm = jax.lax.while_loop(
+        lambda carry: carry[0] < group_end,
+        step,
+        (group_start, jnp.int32(0)),
+    )
     return num_gm
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class LiveGroupMetadataRef(SortedMetadataRef):
+  """Metadata from routing sorted outside the kernel, walking only live groups.
+
+  Iterates only the local groups that have at least one routed row.
+  """
+
+  # The global group of each sorted routed row.
+  row_group: jax.Array | hijax.TransformedRef
+
+  @classmethod
+  def create(
+      cls,
+      group_cum_sum: jax.Array,
+      group_offset: jax.Array,
+      cfg: config.RoutingGmmConfig,
+      row_group: jax.Array | None = None,
+  ) -> "LiveGroupMetadataRef":
+    """Wraps scalar data for metadata and the group of each sorted row."""
+    assert row_group is not None
+    return cls(
+        **cls._empty_tables(cfg),
+        group_cum_sum=group_cum_sum,
+        group_offset=group_offset,
+        row_group=row_group,
+        cfg=cfg,
+    )
+
+  def _walk_groups(
+      self,
+      write_group: Any,
+      group_start: jax.Array,
+      group_end: jax.Array,
+  ) -> jax.Array:
+    """Walks only the local groups that have at least one routed row."""
+    row = self.group_cum_sum[group_start]
+    row_end = self.group_cum_sum[group_end]
+
+    def cond_fn(val: tuple[jax.Array, jax.Array]) -> jax.Array:
+      row_idx, _ = val
+      return row_idx < row_end
+
+    def body_fn(
+        val: tuple[jax.Array, jax.Array]
+    ) -> tuple[jax.Array, jax.Array]:
+      row_idx, num_gm = val
+      group_id = self.row_group[row_idx]
+      next_num_gm = write_group(group_id, num_gm)
+      next_row = self.group_cum_sum[group_id + 1]
+      return (next_row, next_num_gm)
+
+    _, num_gm = jax.lax.while_loop(
+        cond_fn, body_fn, (row, jnp.array(0, dtype=jnp.int32))
+    )
+    return num_gm
+
+
+def create_metadata_ref(
+    group_cum_sum: jax.Array,
+    group_offset: jax.Array,
+    cfg: config.RoutingGmmConfig,
+    *,
+    row_group: jax.Array | None = None,
+) -> AbstractMetadataRef:
+  """Returns the metadata ref that fills the tables for this config.
+
+  This is the one place that picks the walk: `row_group` reaches the kernel
+  only when the plan selects the live walk, and is unused otherwise.
+  """
+  if row_group is not None and cfg.plan.live_group_walk:
+    return LiveGroupMetadataRef.create(
+        group_cum_sum, group_offset, cfg, row_group=row_group
+    )
+  return SortedMetadataRef.create(group_cum_sum, group_offset, cfg)

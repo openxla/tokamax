@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import functools
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -21,7 +23,8 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src import test_utils
-from tokamax._src.ops.experimental.routing_moe.layer import wrapper
+from tokamax._src.ops.experimental.routing_moe.layer import monolithic
+from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan
 from tokamax._src.ops.experimental.routing_moe.test import reference
 
 P = sharding.PartitionSpec
@@ -175,7 +178,8 @@ class MoEKernelTest(parameterized.TestCase):
       rtol: float = 2e-2,
       capture_xprof: bool = False,
       num_cores: int | None = None,
-      remote_combine: bool = False,
+      remote_scatter: bool = False,
+      reduce_output: bool = True,
   ):
     if num_cores is None:
       num_cores = len(self.mesh_devices)
@@ -287,11 +291,13 @@ class MoEKernelTest(parameterized.TestCase):
         ep_axis=ep_axis,
         tp_axis=tp_axis,
         use_sp=use_sp,
+        reduce_output=reduce_output,
         scoring_fn="softmax",
     )
 
-    actual = wrapper.routing_moe(
+    actual = monolithic.gated_routing_moe(
         a,
+        gating_output,
         w1,
         w2,
         w1_scale=w1_scale,
@@ -299,20 +305,19 @@ class MoEKernelTest(parameterized.TestCase):
         w1_bias=b1,
         w2_bias=b2,
         activation=act_fn,
-        gating_output=gating_output,
         topk=top_k,
         renormalize=renormalize_topk_logits,
         mesh=mesh,
         ep_axis=ep_axis,
         tp_axis=tp_axis,
         use_sp=use_sp,
-        remote_combine=remote_combine,
+        reduce_output=reduce_output,
+        moe_plan=moe_plan.RoutingMoEPlan(remote_scatter=remote_scatter),
         scoring_fn="softmax",
     )
 
     expected.block_until_ready()
     actual.block_until_ready()
-
     del capture_xprof
 
     if atol is None:
@@ -341,7 +346,7 @@ class MoEKernelTest(parameterized.TestCase):
     )
 
   @parameterized.product(use_sp=[True, False])
-  def test_remote_combine(self, use_sp):
+  def test_remote_scatter(self, use_sp):
     self._test_moe(
         dtype=jnp.bfloat16,
         top_k=8,
@@ -353,16 +358,50 @@ class MoEKernelTest(parameterized.TestCase):
         renormalize_topk_logits=True,
         use_ep=True,
         use_sp=use_sp,
-        remote_combine=True,
+        remote_scatter=True,
     )
+
+  @parameterized.product(use_ep=[True, False], use_sp=[True, False])
+  def test_unreduced_output(self, use_ep, use_sp):
+    self._test_moe(
+        dtype=jnp.bfloat16,
+        top_k=8,
+        num_experts=128,
+        hidden_size=1024,
+        intermediate_size=1024,
+        num_tokens=8 * 32,
+        seed=1234,
+        renormalize_topk_logits=True,
+        use_ep=use_ep,
+        use_sp=use_sp,
+        reduce_output=False,
+    )
+
+  def test_unreduced_output_with_remote_scatter_raises(self):
+    with self.assertRaisesRegex(
+        ValueError, "remote_scatter cannot be True when reduce_output is False"
+    ):
+      self._test_moe(
+          dtype=jnp.bfloat16,
+          top_k=8,
+          num_experts=128,
+          hidden_size=1024,
+          intermediate_size=1024,
+          num_tokens=8 * 32,
+          seed=1234,
+          renormalize_topk_logits=True,
+          use_ep=True,
+          remote_scatter=True,
+          reduce_output=False,
+      )
 
   @parameterized.product(
       num_tokens=[1280, 10240],
       use_sp=[True, False],
-      remote_combine=[False, True],
+      remote_scatter=[False, True],
   )
-  def test_benchmark_remote_combine(self, num_tokens, use_sp, remote_combine):
-    """Whole MoE layer at EP=4, local vs remote combine."""
+  def test_benchmark_remote_scatter(self, num_tokens, use_sp, remote_scatter):
+    """Whole MoE layer at EP=4, local vs remote scatter."""
     if len(self.mesh_devices) < 4:
       self.skipTest("Skipping due to insufficient number of chips.")
     self._test_moe(
@@ -376,7 +415,7 @@ class MoEKernelTest(parameterized.TestCase):
         renormalize_topk_logits=True,
         use_ep=True,
         use_sp=use_sp,
-        remote_combine=remote_combine,
+        remote_scatter=remote_scatter,
         num_cores=4,
         capture_xprof=True,
     )
@@ -628,11 +667,11 @@ class MoEKernelTest(parameterized.TestCase):
       use_sp,
       active_expert_ratio,
   ):
-    if not use_ep:
-      self.skipTest(
-          "TODO: Support case sharded dimension size is less than "
-          "lane_size * packing in routing_moe."
-      )
+    # When TP is used, sharded dimension size is less than lane_size * packing.
+    # But this is ok, since this model runs fused up-and-down gmms, in this
+    # situation, sharded dimension size is not required to be multiple of
+    # lane_size * packing.
+
     if len(self.mesh_devices) < 8:
       self.skipTest("Skipping due to insufficient number of chips.")
     num_experts = 512
