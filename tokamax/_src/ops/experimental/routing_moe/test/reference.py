@@ -19,6 +19,7 @@ import functools
 
 import jax
 from jax import sharding
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.gmm_v2 import gmm_v2
 from tokamax._src.ops.ragged_gather.pallas_mosaic_tpu_kernel import ragged_gather_pallas
@@ -49,6 +50,7 @@ def gmm_wrapper(
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
+    zero_initialize: bool = False,
 ) -> jax.Array:
   return gmm_v2.gmm_v2(
       lhs=lhs,
@@ -57,10 +59,10 @@ def gmm_wrapper(
       rhs_bias=rhs_bias,
       group_sizes=group_sizes,
       group_offset=group_offset[0],
-      # ragged_gather_reduce multiplies other shards' rows by 0 instead of
-      # skipping them, so a NaN left in uninitialized rows would survive.
-      zero_initialize=True,
+      zero_initialize=zero_initialize,
       fuse_act=fuse_act,
+      # TODO: Fix gmm_v2?
+      vmem_limit_bytes=int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.92),
   )
 
 
@@ -100,6 +102,7 @@ def moe_gmm_local(
     ep_axis: str | None = None,
     tp_axis: str | None = None,
     use_sp: bool = False,
+    reduce_output: bool = True,
 ) -> jax.Array:
   """Main MoE logic on a local shard can run in TP or EP mode."""
   if tp_axis is not None and ep_axis is not None:
@@ -125,8 +128,17 @@ def moe_gmm_local(
     shard_id = jax.lax.axis_index(tp_axis).sum()
     w2_bias = jnp.where(shard_id == 0, w2_bias, 0)
   gmm1_res = gmm1_res[:, : w2.shape[1]]  # trim to hidden size if padded
+  # ragged_gather_reduce multiplies other shards' rows by 0 instead of
+  # skipping them, so a NaN left in uninitialized rows would survive.
+  # TODO: Fix ragged_gather_reduce?
   gmm2_res = gmm_wrapper(
-      gmm1_res, w2, w2_scale, w2_bias, group_sizes, group_offset
+      gmm1_res,
+      w2,
+      w2_scale,
+      w2_bias,
+      group_sizes,
+      group_offset,
+      zero_initialize=True,
   )
 
   batch_size = gmm2_res.shape[0]
@@ -151,6 +163,8 @@ def moe_gmm_local(
       mask.reshape(-1),
       topk,
   )
+  if not reduce_output:
+    return out
   if use_sp:
     out = jax.lax.psum_scatter(
         out, axis_name=reduction_axis, scatter_dimension=0, tiled=True
@@ -177,10 +191,14 @@ def tensor_parallel_gmm(
     mesh: Mesh,
     tp_axis: str | None,
     use_sp: bool = False,
+    reduce_output: bool = True,
 ) -> jax.Array:
   """Tensor-parallel GMM execution across the mesh."""
   data_p_spec = P(None)
-  out_p_spec = P(tp_axis) if use_sp else data_p_spec
+  if reduce_output:
+    out_p_spec = P(tp_axis) if use_sp else data_p_spec
+  else:
+    out_p_spec = P(tp_axis)
   group_offset = jnp.array([0])
 
   w1_spec = P(None, None, tp_axis)
@@ -200,6 +218,7 @@ def tensor_parallel_gmm(
           topk=topk,
           tp_axis=tp_axis,
           use_sp=use_sp,
+          reduce_output=reduce_output,
       ),
       mesh=mesh,
       in_specs=(
@@ -249,12 +268,16 @@ def expert_parallel_gmm(
     mesh: Mesh,
     ep_axis: str,
     use_sp: bool = False,
+    reduce_output: bool = True,
 ) -> jax.Array:
   """Expert-parallel GMM execution across the mesh."""
   ep_size = mesh.shape[ep_axis]
   ep_p_spec = P(ep_axis)
   data_p_spec = P(None)
-  out_p_spec = P(ep_axis) if use_sp else data_p_spec
+  if reduce_output:
+    out_p_spec = P(ep_axis) if use_sp else data_p_spec
+  else:
+    out_p_spec = P(ep_axis)
   num_experts = w1.shape[0]
   num_experts_per_shard = num_experts // ep_size
   group_offset = jnp.arange(0, num_experts, num_experts_per_shard)
@@ -271,6 +294,7 @@ def expert_parallel_gmm(
           topk=topk,
           ep_axis=ep_axis,
           use_sp=use_sp,
+          reduce_output=reduce_output,
       ),
       mesh=mesh,
       in_specs=(
@@ -311,6 +335,7 @@ def expert_parallel_gmm(
         "ep_axis",
         "tp_axis",
         "use_sp",
+        "reduce_output",
         "activation",
         "scoring_fn",
     )
@@ -332,6 +357,7 @@ def reference_moe(
     tp_axis: str | None,
     ep_axis: str | None,
     use_sp: bool = False,
+    reduce_output: bool = True,
 ) -> jax.Array:
   """Route tokens in hidden_states into each experts based on routing.
 
@@ -375,11 +401,12 @@ def reference_moe(
   if renormalize:
     topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
   topk_weights = topk_weights.astype(dtype)
-  # All-gather topk weights for attention dp
-  topk_weights = jax.lax.with_sharding_constraint(
-      topk_weights,
-      NamedSharding(mesh, P(None, None)),
-  )
+  if use_sp:
+    # Make sure topk_weights is replicated across shards before passing into
+    # shard_map, otherwise each shard will only get a slice of topk_weights.
+    topk_weights = jax.lax.with_sharding_constraint(
+        topk_weights, NamedSharding(mesh, P(None, None))
+    )
 
   def _process_tokens_locally(hidden_states_local, topk_indices_local):
     num_tokens_local = hidden_states_local.shape[0]
@@ -451,6 +478,7 @@ def reference_moe(
         mesh=mesh,
         ep_axis=ep_axis,
         use_sp=use_sp,
+        reduce_output=reduce_output,
     )
   else:
     x = tensor_parallel_gmm(
@@ -469,6 +497,7 @@ def reference_moe(
         mesh=mesh,
         tp_axis=tp_axis,
         use_sp=use_sp,
+        reduce_output=reduce_output,
     )
 
-  return x[:num_tokens, :hidden_size]
+  return x[:, :hidden_size]

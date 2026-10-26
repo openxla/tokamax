@@ -106,6 +106,38 @@ class MetadataTest(parameterized.TestCase):
 
     self.assertEqual(int(meta.num_steps[0]), 1)
 
+  def test_compute_metadata_static_verify_windows(self):
+    """Speculative verify windows on the static-q pass (PREFILL case with
+
+    `static_q_len` = 1 + K): one query block per sequence since the kernel
+    sets `bq_sz = static_q_len`, and the usual kv blocks.
+    """
+    seq_lens = jnp.array([128, 256, 200], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 7, 14, 21], dtype=jnp.int32)
+
+    meta = metadata.compute_metadata(
+        seq_lens=seq_lens,
+        cu_q_lens=cu_q_lens,
+        start_seq_idx=0,
+        end_seq_idx=3,
+        bq_sz=7,
+        bkv_sz=128,
+        pages_per_seq=2,
+        page_size=128,
+        max_num_tokens=21,
+        compression_ratio=1,
+        static_q_len=7,
+        seq_batch_size=1,
+    )
+
+    # kv blocks per sequence: 1, 2, 2 -> 5 tiles, each the single q block.
+    self.assertEqual(int(meta.num_steps[0]), 5)
+    np.testing.assert_array_equal(
+        np.array(meta.start_seq_idx)[:5], [0, 1, 1, 2, 2]
+    )
+    np.testing.assert_array_equal(np.array(meta.bq_idx)[:5], [0, 0, 0, 0, 0])
+    np.testing.assert_array_equal(np.array(meta.bkv_idx)[:5], [0, 0, 1, 0, 1])
+
   def test_compute_batched_seq_metadata_decode(self):
     seq_lens = jnp.array([128, 256, 512, 64], dtype=jnp.int32)
     cu_q_lens = jnp.array([0, 1, 2, 3, 4], dtype=jnp.int32)

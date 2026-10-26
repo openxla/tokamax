@@ -57,7 +57,31 @@ class ActivationConfig:
 
   spec: arg.ActivationSpec
   mode: RoutingMode
+
+
+@dataclasses.dataclass(frozen=True)
+class SingleGmmConfig:
+  """Resolved static configuration for a single GMM matmul stage."""
+
+  w: arg.WeightSpec
+  tile_k: int
+  tile_n: int
+  acc_dtype: jnp.dtype
   dynamic_quant: DynamicQuantConfig | None = None
+  fuse_act: str | None = None
+
+  @property
+  def size_k(self) -> int:
+    return self.w.in_size
+
+  @property
+  def size_out_n(self) -> int:
+    # The fused activation combines a gate column and an up column into one, so
+    # the output halves only when fuse_act is applied. fused_gate_up alone does
+    # not change the width.
+    return (
+        self.w.out_size // 2 if self.fuse_act is not None else self.w.out_size
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,7 +103,7 @@ class Dimension:
       cls,
       *,
       x: arg.ActivationSpec,
-      w: arg.WeightSpec,
+      w: tuple[arg.WeightSpec, ...],
       num_global_groups: int,
       gather: arg.RoutingSpec | None,
       scatter: arg.RoutingSpec | None,
@@ -90,39 +114,43 @@ class Dimension:
 
     `size_ep` is the size of `scatter.remote_axis`, 1 for a local scatter.
     """
-    if x.col_size != w.in_size:
+    assert len(w) in (1, 2)
+    if x.col_size != w[0].in_size:
       raise ValueError(
-          f"x col_size ({x.col_size}) must match w in_size ({w.in_size})."
+          f"x col_size ({x.col_size}) must match w in_size ({w[0].in_size})."
       )
-    if num_global_groups < w.group_size:
+    if num_global_groups < w[0].group_size:
       raise ValueError(
-          f"group_sizes must cover at least {w.group_size} groups. Got"
+          f"group_sizes must cover at least {w[0].group_size} groups. Got"
           f" {num_global_groups}."
       )
-    if fuse_act is not None and not w.fused_gate_up:
+    if fuse_act is not None and not w[0].fused_gate_up:
       raise ValueError("fuse_act requires a weight with fused_gate_up=True.")
-    if w.has_bias:
+    if any(w_spec.has_bias for w_spec in w):
       raise NotImplementedError("Bias is not supported yet.")
-    if gather is not None and scatter is not None:
-      raise NotImplementedError(
-          "Simultaneous gather and scatter is not supported."
-      )
 
     size_m = x.row_size
     # The fused activation combines a gate column and an up column into one, so
     # the output halves only when fuse_act is applied. fused_gate_up alone does
     # not change the width.
-    size_out_n = w.out_size // 2 if fuse_act is not None else w.out_size
+    size_out_n = w[0].out_size // 2 if fuse_act is not None else w[0].out_size
+    if len(w) == 2:
+      if fuse_act is None:
+        raise ValueError("w2 requires fuse_act to be set.")
+      if w[1].fused_gate_up:
+        raise ValueError("w2 cannot have fused_gate_up=True.")
+      size_out_n = w[1].out_size
+
     size_out_m = size_m
     if gather is not None:
       if gather.remote_axis is not None:
         raise NotImplementedError("Remote gather is not supported.")
       size_out_m = gather.num_indices
     if scatter is not None:
-      if scatter.num_indices != size_m:
+      if scatter.num_indices != size_out_m:
         raise ValueError(
-            f"scatter must map every x row ({size_m}). Got num_indices"
-            f" {scatter.num_indices}."
+            f"scatter must map every computed row ({size_out_m}). Got"
+            f" num_indices {scatter.num_indices}."
         )
     if (scatter is None or scatter.remote_axis is None) and size_ep != 1:
       raise ValueError(f"size_ep ({size_ep}) requires a remote scatter.")
@@ -135,10 +163,10 @@ class Dimension:
     return cls(
         size_m=size_m,
         size_k=x.col_size,
-        size_n=w.out_size,
+        size_n=w[0].out_size,
         size_out_m=size_out_m,
         size_out_n=size_out_n,
-        size_local_groups=w.group_size,
+        size_local_groups=w[0].group_size,
         size_global_groups=num_global_groups,
         size_ep=size_ep,
     )
@@ -149,13 +177,12 @@ class RoutingGmmConfig:
   """Stores compile time static information of routing gmm."""
 
   dim: Dimension
-  plan: plan_lib.ResolvedPlan
+  plan: plan_lib.ResolvedGmmPlan
   x: ActivationConfig
-  w: arg.WeightSpec
+  stages: tuple[SingleGmmConfig, ...]
   out: ActivationConfig
   gather: arg.RoutingSpec | None
   scatter: arg.RoutingSpec | None
-  fuse_act: str | None
   tpu_info: pltpu.TpuInfo
 
   @classmethod
@@ -163,9 +190,9 @@ class RoutingGmmConfig:
       cls,
       *,
       x: arg.ActivationSpec,
-      w: arg.WeightSpec,
+      w: tuple[arg.WeightSpec, ...],
       dim: Dimension,
-      plan: plan_lib.ResolvedPlan,
+      plan: plan_lib.ResolvedGmmPlan,
       gather: arg.RoutingSpec | None,
       scatter: arg.RoutingSpec | None,
       fuse_act: str | None,
@@ -184,6 +211,28 @@ class RoutingGmmConfig:
       assert plan.x_quant_block_size is not None
       x_quant = DynamicQuantConfig(
           dtype=plan.matmul_dtype, block_size=plan.x_quant_block_size
+      )
+
+    assert len(w) in (1, 2)
+    stages = [
+        SingleGmmConfig(
+            w=w[0],
+            tile_k=plan.tile_k,
+            tile_n=plan.tile_n,
+            acc_dtype=plan.acc_dtype,
+            dynamic_quant=x_quant,
+            fuse_act=fuse_act,
+        )
+    ]
+    if len(w) == 2:
+      stages.append(
+          SingleGmmConfig(
+              w=w[1],
+              tile_k=w[1].in_size,
+              tile_n=w[1].out_size,
+              acc_dtype=plan.acc_dtype,
+              dynamic_quant=x_quant,
+          )
       )
 
     # A remote scatter leaves each device only the rows it owns.
@@ -207,22 +256,21 @@ class RoutingGmmConfig:
     cfg = cls(
         dim=dim,
         plan=plan,
-        x=ActivationConfig(spec=x, mode=x_mode, dynamic_quant=x_quant),
-        w=w,
+        x=ActivationConfig(spec=x, mode=x_mode),
+        stages=tuple(stages),
         out=ActivationConfig(spec=out_spec, mode=out_mode),
         gather=gather,
         scatter=scatter,
-        fuse_act=fuse_act,
         tpu_info=tpu_info,
     )
 
-    x_bits = jax.dtypes.itemsize_bits(cfg.plan.matmul_dtype)
-    if x_bits < jax.dtypes.itemsize_bits(cfg.w.dtype):
-      raise ValueError(
-          f"x_exec_dtype ({cfg.plan.matmul_dtype}) must not be narrower"
-          f" than w dtype ({cfg.w.dtype})."
-      )
-    if cfg.x.dynamic_quant is None and cfg.plan.x_quant_block_size is not None:
+    if len(w) == 2 and (
+        w[1].dtype != w[0].dtype or (w[1].quant is None) != (w[0].quant is None)
+    ):
+      # The intermediate is fed to the second matmul in x's execution dtype,
+      # which is only valid when both weights share a precision.
+      raise NotImplementedError("w2 must match the precision of w.")
+    if x_quant is None and cfg.plan.x_quant_block_size is not None:
       raise ValueError(
           "plan.x_quant_block_size has no effect when x is not quantized."
       )
@@ -231,13 +279,20 @@ class RoutingGmmConfig:
           "acc_dtype must be bfloat16 or float32. Got"
           f" {cfg.plan.acc_dtype}."
       )
-    if cfg.plan.tile_k != cfg.dim.size_k:
-      raise NotImplementedError("K dim tiling is not supported yet.")
-    if cfg.dim.size_out_n % cfg.plan.tile_n != 0:
-      raise ValueError(
-          f"tile_n ({cfg.plan.tile_n}) must divide the output width"
-          f" ({cfg.dim.size_out_n})."
-      )
+    for stage in cfg.stages:
+      x_bits = jax.dtypes.itemsize_bits(cfg.plan.matmul_dtype)
+      if x_bits < jax.dtypes.itemsize_bits(stage.w.dtype):
+        raise ValueError(
+            f"x_exec_dtype ({cfg.plan.matmul_dtype}) must not be narrower"
+            f" than w dtype ({stage.w.dtype})."
+        )
+      if stage.tile_k != stage.size_k:
+        raise NotImplementedError("K dim tiling is not supported yet.")
+      if stage.size_out_n % stage.tile_n != 0:
+        raise ValueError(
+            f"tile_n ({stage.tile_n}) must divide the output width"
+            f" ({stage.size_out_n})."
+        )
     if cfg.out.spec.compact_shape[1] % cfg.num_n != 0:
       raise ValueError(
           f"tile_n ({cfg.plan.tile_n}) must be a multiple of the output's"
@@ -272,7 +327,7 @@ class RoutingGmmConfig:
 
   @property
   def num_n(self) -> int:
-    return pl.cdiv(self.dim.size_out_n, self.plan.tile_n)
+    return pl.cdiv(self.dim.size_out_n, self.stages[-1].tile_n)
 
   @property
   def num_k(self) -> int:
@@ -287,6 +342,8 @@ class RoutingGmmConfig:
     name += f"-g{self.dim.size_local_groups}-m{self.dim.size_out_m}"
     name += f"-k{self.dim.size_k}-n{self.dim.size_out_n}"
     name += f"-tm{self.plan.tile_m}-tn{self.plan.tile_n}"
-    if self.x.dynamic_quant is not None:
-      name += f"-xq{self.x.dynamic_quant.dtype.name}"
+    if len(self.stages) > 1:
+      name += "-fused"
+    if self.stages[0].dynamic_quant is not None:
+      name += f"-xq{self.stages[0].dynamic_quant.dtype.name}"
     return name

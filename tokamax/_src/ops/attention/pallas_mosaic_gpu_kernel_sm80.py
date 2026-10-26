@@ -184,7 +184,7 @@ def _compute_qk(
         else plgpu.load(q_smem.at[:, chunk_slice], layout=mma_lhs)
     )
     k_tile = plgpu.load(
-        plgpu.transpose_ref(k_smem.at[:, chunk_slice], (1, 0)),
+        k_smem.at[:, chunk_slice].T,
         layout=mma_rhs,
     )
     acc = plgpu.mma(acc, q_chunk, k_tile)

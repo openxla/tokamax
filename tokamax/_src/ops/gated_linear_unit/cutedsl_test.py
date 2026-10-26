@@ -14,14 +14,16 @@
 # ==============================================================================
 """Tests for CuTeDSL SM100 Gated Linear Unit."""
 
+from concurrent import futures
 import unittest
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
-import tokamax
 from tokamax._src import gpu_utils
+from tokamax._src import hlo_utils
+from tokamax._src.autotuning import autotuner
 from tokamax._src.ops.gated_linear_unit import base
 
 try:
@@ -69,16 +71,20 @@ class CuteDslGatedLinearUnitTest(parameterized.TestCase):
     out_ref = self.xla_op(x, w, activation=jax.nn.swish)
     chex.assert_trees_all_close(out, out_ref, atol=0.05, rtol=0.05)
 
-    bound_args = tokamax.autotuning.get_bound_args(f, x, w)
+    bound_args = hlo_utils.get_bound_args(f, x, w)
     assert cutedsl is not None
     self.assertIn(
         cutedsl.CuteDslGatedLinearUnit, [type(ba.op) for ba in bound_args]
     )
 
-    autotune_res = tokamax.autotune(f, x, w, max_workers=1, progress_bar=False)
-    self.assertIsInstance(autotune_res, tokamax.AutotuningResult)
-    with autotune_res:
-      out_autotuned = f(x, w)
+    custom_autotuner = autotuner.Autotuner(
+        compile_executor_fn=lambda **kwargs: futures.ThreadPoolExecutor(
+            max_workers=1
+        )
+    )
+    for ba in bound_args:
+      ba.autotune(autotuner=custom_autotuner)
+    out_autotuned = f(x, w)
     chex.assert_trees_all_close(out, out_autotuned, atol=0.05, rtol=0.05)
 
 

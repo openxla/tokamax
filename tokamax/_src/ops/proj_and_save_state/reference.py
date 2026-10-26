@@ -69,13 +69,18 @@ def ref_wkv_proj_and_save_state(
   bytes_per_slot = f32_per_slot * 4
   assert bytes_per_slot == slot_bytes
   tokens_per_page = page_size // slots_per_token
+  # A page may have trailing rows that do not form a full token state (e.g.
+  # the 33-row SEQ_ALONG_LANE indexer page, where 16 states occupy the first
+  # 32 rows); states live only in the first `used_rows` rows of each page.
+  used_rows = tokens_per_page * slots_per_token
   assert state_block_size <= tokens_per_page, (
       f"state_block_size {state_block_size} exceeds the {tokens_per_page} "
       f"token states a {page_size}-row page holds"
   )
 
   # 3. Unpack inline
-  cache_reshaped = cache.reshape(
+  state_rows = cache[:, :used_rows]
+  cache_reshaped = state_rows.reshape(
       num_pages, tokens_per_page, slots_per_token, d1, d2
   )
   cache_t = cache_reshaped.transpose(0, 1, 2, 4, 3)
@@ -88,7 +93,10 @@ def ref_wkv_proj_and_save_state(
   # 4. Scatter
   num_tokens_flat = num_pages * tokens_per_page
   valid = slot_mapping >= 0
-  slots = jnp.where(valid, slot_mapping // slots_per_token, num_tokens_flat)
+  token_index = (slot_mapping // page_size) * tokens_per_page + (
+      slot_mapping % page_size
+  ) // slots_per_token
+  slots = jnp.where(valid, token_index, num_tokens_flat)
   flat_padded = jnp.concatenate([flat, jnp.zeros((1, state_dim))], axis=0)
   flat_padded = flat_padded.at[slots].set(packed)
   flat = flat_padded[:-1]
@@ -102,13 +110,8 @@ def ref_wkv_proj_and_save_state(
       num_pages, tokens_per_page, slots_per_token, d2, d1
   )
   chunk_bytes_t = chunk_bytes_reshaped.transpose(0, 1, 2, 4, 3)
-  cache_view = cache.reshape(
-      num_pages, tokens_per_page, slots_per_token, d1, d2
-  )
-  cache_view = cache_view.at[:].set(chunk_bytes_t)
-  new_cache = cache_view.reshape(num_pages, page_size, d1, d2)
-
-  return new_cache
+  new_state_rows = chunk_bytes_t.reshape(num_pages, used_rows, d1, d2)
+  return cache.at[:, :used_rows].set(new_state_rows)
 
 
 @functools.partial(jax.jit, static_argnames=("compress_ratio",))

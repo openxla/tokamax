@@ -16,11 +16,13 @@
 
 import dataclasses
 import functools
-from typing import ClassVar, override
+import math
+from typing import Annotated, Any, ClassVar, override
 
 import jax
 from jax.extend import backend
 import jax.numpy as jnp
+import jax_triton as jt
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import batching
@@ -29,10 +31,13 @@ from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import quantization
+from tokamax._src import triton_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import triton_vjp as vjp
 import triton
+import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 Mask = base.Mask
 QArray = base.QArray
@@ -40,8 +45,378 @@ Residuals = base.Residuals
 PagingInfo = base.PagingInfo
 
 
+@triton.jit
+def _load_2d(ptr, offs_r, bound_r, stride_r, start_c, bound_c, block_c):
+  block_r: tl.constexpr = offs_r.shape[0]
+  offs_c = start_c + tl.arange(0, block_c)
+  mask = triton_utils.mask_2d(
+      offs_r,
+      bound_r,
+      offs_c,
+      bound_c,
+      bound_r % block_r != 0,
+      bound_c % block_c != 0,
+  )
+  return tl.load(
+      ptr + offs_r[:, None].to(tl.int64) * stride_r + offs_c[None, :],
+      mask=mask,
+      other=None if mask is None else 0.0,
+  )
+
+
+@triton.jit
+def _fwd_kernel(
+    q_start_ptr,
+    q_end_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    bias_ptr,
+    mask_ptr,
+    dropout_mask_ptr,
+    k_start_ptr,
+    k_end_ptr,
+    out_ptr,
+    l_ptr,
+    m_ptr,
+    batch_shape: tl.constexpr,
+    batch_strides: tl.constexpr,
+    seq_len_q: tl.constexpr,
+    num_heads_q: tl.constexpr,
+    head_dim: tl.constexpr,
+    seq_len_k: tl.constexpr,
+    num_heads_k: tl.constexpr,
+    head_dim_out: tl.constexpr,
+    block_m: tl.constexpr,
+    block_k: tl.constexpr,
+    block_d: tl.constexpr,
+    block_d_out: tl.constexpr,
+    bias_shape: tl.constexpr,
+    mask_shape: tl.constexpr,
+    dropout_shape: tl.constexpr,
+    k_start_shape: tl.constexpr,
+    k_end_shape: tl.constexpr,
+    sm_scale: tl.constexpr,
+    is_causal: tl.constexpr,
+    dropout_rate: tl.constexpr,
+    logits_dtype: tl.constexpr,
+    logits_soft_cap: tl.constexpr,
+    use_base2: tl.constexpr,
+    use_stable_softmax: tl.constexpr,
+    qk_prec: tl.constexpr,
+    qk_dtype: tl.constexpr,
+    wv_prec: tl.constexpr,
+    wv_dtype: tl.constexpr,
+    normalize_output: tl.constexpr,
+    pack_mask: tl.constexpr,
+):
+  """Triton MHA forward kernel."""
+  grid_m: tl.constexpr = tl.cdiv(seq_len_q, block_m)
+  pid_1d = tl.program_id(0)
+  pid_m = (pid_1d % grid_m).to(tl.int64)
+  pid_h = (pid_1d // grid_m % num_heads_q).to(tl.int64)
+  pid_b = (
+      tl.full((), 0, tl.int64)
+      if batch_shape == ()
+      else (pid_1d // (grid_m * num_heads_q)).to(tl.int64)
+  )
+  pid_h_kv = pid_h // (num_heads_q // num_heads_k)
+
+  start_m = pid_m.to(tl.int32) * block_m
+  span_m = start_m + tl.arange(0, block_m)
+  check_m: tl.constexpr = seq_len_q % block_m != 0
+  check_d_out: tl.constexpr = head_dim_out % block_d_out != 0
+  mask_m_1d = span_m < seq_len_q if check_m else None
+
+  out_stride_m: tl.constexpr = num_heads_q * head_dim_out
+  out_ptr += pid_b * seq_len_q * out_stride_m + pid_h * head_dim_out
+  if l_ptr is not None:
+    l_ptr += pid_b * num_heads_q * seq_len_q + pid_h * seq_len_q
+  if m_ptr is not None:
+    m_ptr += pid_b * num_heads_q * seq_len_q + pid_h * seq_len_q
+
+  (
+      stride_q_start_b,
+      stride_q_end_b,
+      stride_qb,
+      stride_kb,
+      stride_vb,
+      stride_bias_b,
+      stride_mask_b,
+      stride_dropout_b,
+      stride_k_start_b,
+      stride_k_end_b,
+  ) = batch_strides
+
+  skip_cond = tl.full((), 0, tl.int1)
+  q_start = 0
+  q_end = 0
+  if q_start_ptr is not None:
+    q_start_ptr += triton_utils.batch_offset(
+        pid_b, batch_shape, stride_q_start_b
+    )
+    q_start = tl.load(q_start_ptr)
+    skip_cond |= q_start >= start_m + block_m
+  if q_end_ptr is not None:
+    q_end_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_q_end_b)
+    q_end = tl.load(q_end_ptr)
+    skip_cond |= q_end <= start_m
+
+  q_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, stride_qb)
+      + pid_h * head_dim
+  )
+  k_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, stride_kb)
+      + pid_h_kv * head_dim
+  )
+  v_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, stride_vb)
+      + pid_h_kv * head_dim_out
+  )
+
+  if bias_ptr is not None:
+    bias_ptr = triton_utils.advance_bcast_ptr(
+        bias_ptr,
+        pid_b,
+        batch_shape,
+        stride_bias_b,
+        pid_h,
+        num_heads_q,
+        bias_shape,
+    )
+  if mask_ptr is not None:
+    mask_ptr = triton_utils.advance_bcast_ptr(
+        mask_ptr,
+        pid_b,
+        batch_shape,
+        stride_mask_b,
+        pid_h,
+        num_heads_q,
+        mask_shape,
+    )
+  if dropout_mask_ptr is not None:
+    dropout_mask_ptr = triton_utils.advance_bcast_ptr(
+        dropout_mask_ptr,
+        pid_b,
+        batch_shape,
+        stride_dropout_b,
+        pid_h,
+        num_heads_q,
+        dropout_shape,
+    )
+  if k_start_ptr is not None:
+    k_start_ptr = triton_utils.advance_bcast_ptr(
+        k_start_ptr,
+        pid_b,
+        batch_shape,
+        stride_k_start_b,
+        pid_h,
+        num_heads_q,
+        k_start_shape,
+    )
+  if k_end_ptr is not None:
+    k_end_ptr = triton_utils.advance_bcast_ptr(
+        k_end_ptr,
+        pid_b,
+        batch_shape,
+        stride_k_end_b,
+        pid_h,
+        num_heads_q,
+        k_end_shape,
+    )
+
+  # See base class for explanation of why this is not `-inf`.
+  mask_value = float(jnp.finfo(jnp.float32).min)
+
+  split_d: tl.constexpr = tl.cdiv(head_dim, block_d)
+  split_d_out: tl.constexpr = tl.cdiv(head_dim_out, block_d_out)
+  m_i = tl.full(
+      (block_m,),
+      mask_value if use_stable_softmax else 0.0,
+      dtype=tl.float32,
+  )
+  l_i = tl.zeros((block_m,), dtype=tl.float32)
+  accs = ()
+  for _ in tl.static_range(split_d_out):
+    accs += (tl.zeros((block_m, block_d_out), dtype=tl.float32),)
+
+  if not skip_cond:
+    qs = ()
+    for i_d in tl.static_range(split_d):
+      q = _load_2d(
+          q_ptr,
+          span_m,
+          seq_len_q,
+          num_heads_q * head_dim,
+          i_d * block_d,
+          head_dim,
+          block_d,
+      )
+      qs += ((q * sm_scale).to(qk_dtype),)
+
+    num_k_blocks = tl.cdiv(seq_len_k, block_k)
+    # Rows past ``seq_len_q`` get fill values that are neutral for the min/max
+    # reductions below, so they don't add k blocks to the loop.
+    k_start = (
+        None
+        if k_start_ptr is None
+        else triton_utils.load_1d_bcast(
+            k_start_ptr, span_m, k_start_shape, other=seq_len_k
+        )
+    )
+    k_end = (
+        None
+        if k_end_ptr is None
+        else triton_utils.load_1d_bcast(k_end_ptr, span_m, k_end_shape, other=0)
+    )
+
+    lo, mid, hi = 0, num_k_blocks, num_k_blocks
+    if k_start is not None:
+      lo = tl.maximum(tl.min(k_start, axis=0) // block_k, 0)
+    if is_causal:
+      mid = tl.minimum(start_m // block_k, num_k_blocks)
+      hi = tl.minimum(tl.cdiv(start_m + block_m, block_k), num_k_blocks)
+    elif k_end is not None:
+      mid = tl.minimum(
+          tl.maximum(tl.min(k_end, axis=0) // block_k, 0), num_k_blocks
+      )
+      # Clamped first, since `tl.cdiv` overflows for `k_end` near the int32 max.
+      k_end_max = tl.minimum(tl.max(k_end, axis=0), seq_len_k)
+      hi = tl.maximum(tl.cdiv(k_end_max, block_k), 0)
+    mid = tl.maximum(lo, mid)
+
+    use_mask_k: tl.constexpr = seq_len_k % block_k != 0
+    exp_fn: tl.constexpr = tl.math.exp2 if use_base2 else tl.math.exp
+
+    for phase in tl.static_range(
+        2 if is_causal or k_end_ptr is not None else 1
+    ):
+      for i_k in range(lo if phase == 0 else mid, mid if phase == 0 else hi):
+        start_k = i_k * block_k
+        span_k = start_k + tl.arange(0, block_k)
+        s = tl.zeros((block_m, block_k), dtype=tl.float32)
+        for i_d in tl.static_range(split_d):
+          k = _load_2d(
+              k_ptr,
+              span_k,
+              seq_len_k,
+              num_heads_k * head_dim,
+              i_d * block_d,
+              head_dim,
+              block_d,
+          )
+          s += tl.dot(
+              qs[i_d], tl.trans(k.to(qk_dtype)), input_precision=qk_prec
+          )
+        s = s.to(logits_dtype)
+
+        if bias_ptr is not None:
+          s += triton_utils.load_2d_bcast(
+              bias_ptr, span_m, span_k, bias_shape
+          ).to(logits_dtype)
+
+        if logits_soft_cap is not None:
+          s = logits_soft_cap * libdevice.tanh(
+              (s / logits_soft_cap).to(tl.float32)
+          )
+
+        if use_base2:
+          s *= math.log2(math.e)
+
+        if mask_ptr is not None:
+          mask_val = triton_utils.load_2d_bcast(
+              mask_ptr,
+              span_m,
+              span_k // 8 if pack_mask else span_k,
+              mask_shape,
+              0,
+          )
+          if pack_mask:
+            mask_val &= (1 << span_k % 8)[None, :]
+          s = tl.where(mask_val != 0, s, mask_value)
+
+        if q_start_ptr is not None:
+          s = tl.where(q_start <= span_m[:, None], s, mask_value)
+        if q_end_ptr is not None:
+          s = tl.where(q_end > span_m[:, None], s, mask_value)
+        if k_start is not None:
+          s = tl.where(k_start[:, None] <= span_k[None, :], s, mask_value)
+        if phase == 1 and k_end is not None:
+          s = tl.where(k_end[:, None] > span_k[None, :], s, mask_value)
+        if phase == 1 and is_causal:
+          s = tl.where(span_m[:, None] >= span_k[None, :], s, mask_value)
+
+        if use_mask_k:
+          s = tl.where((span_k < seq_len_k)[None, :], s, float("-inf"))
+
+        if use_stable_softmax:
+          m_ij = tl.maximum(m_i, tl.max(s, axis=1))
+          p = exp_fn(s - m_ij[:, None])
+          alpha = exp_fn(m_i - m_ij)
+          m_i = m_ij
+          rescaled_accs = ()
+          for i_o in tl.static_range(split_d_out):
+            rescaled_accs += (accs[i_o] * alpha[:, None],)
+          accs = rescaled_accs
+          l_i *= alpha
+        else:
+          p = exp_fn(s.to(tl.float32))
+        l_i += tl.sum(p, axis=1)
+
+        if dropout_mask_ptr is not None:
+          dropout_mask = triton_utils.load_2d_bcast(
+              dropout_mask_ptr, span_m, span_k, dropout_shape, 0
+          )
+          p *= (dropout_mask != 0).to(p.dtype) / (1.0 - dropout_rate)
+
+        p = p.to(wv_dtype)
+        new_accs = ()
+        for i_o in tl.static_range(split_d_out):
+          v = _load_2d(
+              v_ptr,
+              span_k,
+              seq_len_k,
+              num_heads_k * head_dim_out,
+              i_o * block_d_out,
+              head_dim_out,
+              block_d_out,
+          )
+          acc = accs[i_o] + tl.dot(p, v.to(wv_dtype), input_precision=wv_prec)
+          new_accs += (acc,)
+        accs = new_accs
+
+  # It is possible that every value in a row was masked to f32 min, and that
+  # `l_i` is `0` for that row. Add epsilon value to avoid NaNs from `0 / 0`.
+  l_i += float(jnp.finfo(jnp.float32).tiny)
+  if l_ptr is not None:
+    tl.store(l_ptr + span_m, l_i, mask=mask_m_1d)
+  if m_ptr is not None:
+    if use_base2:
+      # `m` consumers expect natural-log units, with `mask_value` marking fully
+      # masked rows.
+      m_i = tl.where(m_i == mask_value, m_i, m_i * math.log(2.0))
+    tl.store(m_ptr + span_m, m_i, mask=mask_m_1d)
+
+  for i_o in tl.static_range(split_d_out):
+    acc = accs[i_o]
+    if normalize_output:
+      acc /= l_i[:, None]
+    offs_d_out = i_o * block_d_out + tl.arange(0, block_d_out)
+    out_mask = triton_utils.mask_2d(
+        span_m, seq_len_q, offs_d_out, head_dim_out, check_m, check_d_out
+    )
+    tl.store(
+        out_ptr
+        + span_m[:, None].to(tl.int64) * out_stride_m
+        + offs_d_out[None, :],
+        acc.to(out_ptr.dtype.element_ty),
+        mask=out_mask,
+    )
+
+
 @jaxtyping.jaxtyped
-def _fwd(  # pylint: disable=unused-argument,unused-variable
+def _fwd(
     q: Float[Array | QArray, "T H D"],
     k: Float[Array | QArray, "t h D"],
     v: Float[Array | QArray, "t h d"],
@@ -68,6 +443,8 @@ def _fwd(  # pylint: disable=unused-argument,unused-variable
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Forward pass of Triton FlashAttention."""
   q, k, v = map(quantization.as_array_or_qarray_without_zero_point, (q, k, v))
+  if isinstance(q, QArray) or isinstance(k, QArray) or isinstance(v, QArray):
+    raise NotImplementedError("Quantized attention not supported yet.")
 
   seq_len_q, num_heads_q, head_dim = q.shape
   seq_len_k, num_heads_k, head_dim_out = v.shape
@@ -78,7 +455,105 @@ def _fwd(  # pylint: disable=unused-argument,unused-variable
   else:
     pack_mask = False
 
-  raise NotImplementedError("TODO")
+  block_m = config.block_q
+  block_k = config.block_k
+  block_d = max(
+      16, triton.next_power_of_2(min(config.block_d or head_dim, head_dim))
+  )
+  block_d_out = max(
+      16,
+      triton.next_power_of_2(
+          min(config.block_d_out or head_dim_out, head_dim_out)
+      ),
+  )
+
+  qk_dtype, qk_prec = triton_utils.get_dot_dtype_and_precision(
+      q_k_dot_precision, q.dtype, k.dtype
+  )
+  wv_dtype, wv_prec = triton_utils.get_dot_dtype_and_precision(
+      weights_v_dot_precision, v.dtype, v.dtype
+  )
+  logits_tl_dtype = triton_utils.jnp_to_tl_dtype(logits_dtype)
+  name = (
+      "triton_flash_attention_fwd_res"
+      if return_residuals
+      else "triton_flash_attention"
+  )
+
+  @triton_utils.vmap_kernel
+  def fwd_call(batch_shape, batch_strides, *args):
+    out_dtype = q.dtype if normalize_output else jnp.float32
+    out_shape = jax.ShapeDtypeStruct(
+        (*batch_shape, seq_len_q, num_heads_q, head_dim_out), out_dtype
+    )
+    residual_shape = jax.ShapeDtypeStruct(
+        (*batch_shape, num_heads_q, seq_len_q), jnp.float32
+    )
+    out_type = (
+        out_shape,
+        residual_shape if return_residuals else None,
+        residual_shape if return_residuals and use_stable_softmax else None,
+    )
+    none_outs: dict[str, Any] = {
+        k: None
+        for k, v in zip(("l_ptr", "m_ptr"), out_type[1:], strict=True)
+        if v is None
+    }
+    return jt.triton_call(
+        *args,
+        kernel=_fwd_kernel,
+        out_type=out_type,
+        grid=(
+            math.prod(batch_shape)
+            * num_heads_q
+            * triton.cdiv(seq_len_q, block_m),
+        ),
+        name=name,
+        num_stages=config.num_stages,
+        num_warps=config.num_warps,
+        batch_shape=batch_shape,
+        batch_strides=batch_strides,
+        seq_len_q=seq_len_q,
+        num_heads_q=num_heads_q,
+        head_dim=head_dim,
+        seq_len_k=seq_len_k,
+        num_heads_k=num_heads_k,
+        head_dim_out=head_dim_out,
+        block_m=block_m,
+        block_k=block_k,
+        block_d=block_d,
+        block_d_out=block_d_out,
+        bias_shape=(1, 1, 1) if bias is None else bias.shape[-3:],
+        mask_shape=(1, 1, 1) if mask is None else mask.shape[-3:],
+        dropout_shape=(
+            (1, 1, 1) if dropout_mask is None else dropout_mask.shape[-3:]
+        ),
+        k_start_shape=(1, 1) if k_start is None else k_start.shape[-2:],
+        k_end_shape=(1, 1) if k_end is None else k_end.shape[-2:],
+        sm_scale=float(logits_scale),
+        is_causal=is_causal,
+        dropout_rate=float(dropout_rate),
+        logits_dtype=logits_tl_dtype,
+        logits_soft_cap=(
+            None if logits_soft_cap is None else float(logits_soft_cap)
+        ),
+        use_base2=use_base2,
+        use_stable_softmax=use_stable_softmax,
+        qk_prec=qk_prec,
+        qk_dtype=qk_dtype,
+        wv_prec=wv_prec,
+        wv_dtype=wv_dtype,
+        normalize_output=normalize_output,
+        pack_mask=pack_mask,
+        **none_outs,
+    )
+
+  out, l, m = fwd_call(
+      q_start, q_end, q, k, v, bias, mask, dropout_mask, k_start, k_end
+  )
+  if not return_residuals:
+    return out, None
+  return out, (jnp.zeros_like(l) if m is None else m, l)
 
 
 def _broadcast_to_rank(x, rank):
@@ -142,14 +617,17 @@ def _can_have_block_d(*args):
   return True
 
 
+_PowerOfTwoGe16 = Annotated[pydantic_lib.PowerOfTwo, pydantic.Field(ge=16)]
+
+
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_q: pydantic.PositiveInt
-  block_k: pydantic.PositiveInt
+  block_q: pydantic_lib.PowerOfTwo
+  block_k: _PowerOfTwoGe16
   num_stages: pydantic.PositiveInt
   num_warps: pydantic_lib.PowerOfTwo
-  block_d: pydantic.PositiveInt | None = None
-  block_d_out: pydantic.PositiveInt | None = None
+  block_d: _PowerOfTwoGe16 | None = None
+  block_d_out: _PowerOfTwoGe16 | None = None
   split_k: pydantic.PositiveInt = 1
   pack_mask: bool = False
 
@@ -197,12 +675,6 @@ class TritonFlashAttention(base.DotProductAttention[Config, None]):
     if not _can_have_block_d(q, k, v) and not (block_d == block_d_out == None):
       raise ValueError("block_d[_out] unsupported for subchannel quantization.")
 
-    use_stable_softmax = self.use_stable_softmax
-    if use_stable_softmax is base.AUTO:
-      use_stable_softmax = base.needs_stable_softmax(
-          logits_dtype, logits_soft_cap
-      )
-
     mask, is_causal, q_start, q_end, k_start, k_end = _decompose_mask(
         mask, q, k, q_indices, k_indices
     )
@@ -214,6 +686,18 @@ class TritonFlashAttention(base.DotProductAttention[Config, None]):
     weights_v_dot_precision = precision_lib.to_dot_algorithm_preset(
         v.dtype, v.dtype, weights_v_dot_precision
     )
+
+    use_stable_softmax = self.use_stable_softmax
+    if use_stable_softmax is base.AUTO:
+      wv_dtype, _ = triton_utils.get_dot_dtype_and_precision(
+          weights_v_dot_precision, v.dtype, v.dtype
+      )
+      # Unshifted `exp(s)` can overflow float16 weights even with a soft cap.
+      use_stable_softmax = (
+          base.needs_stable_softmax(logits_dtype, logits_soft_cap)
+          or wv_dtype == tl.float16
+      )
+
     f = functools.partial(
         _fwd,
         is_causal=is_causal,
@@ -242,9 +726,26 @@ class TritonFlashAttention(base.DotProductAttention[Config, None]):
       # TODO: Handle `is_causal`.
       if is_causal:
         raise ValueError("`is_causal` not supported with `split_k` > 1.")
+      seq_len_k = k.shape[-3]
+      if seq_len_k % split_k != 0:
+        raise ValueError(
+            f"`seq_len_k` ({seq_len_k}) must be divisible by `split_k`"
+            f" ({split_k})."
+        )
+
+      # `k_{start,end}` hold global key indices, so give each part a copy
+      # relative to its chunk, concatenated along the split axis.
+      offsets = jnp.arange(split_k) * (seq_len_k // split_k)
+
+      def per_part(x):
+        if x is None:
+          return None
+        return (x[..., None, :] - offsets[:, None]).reshape(*x.shape[:-1], -1)
+
+      k_start, k_end = per_part(k_start), per_part(k_end)
 
       # Perform `split_k` using `vmap`.
-      seq_k_axes = (None, -3, -3, -1, -1, -1, -1, -1, None, None)
+      seq_k_axes = (None, -3, -3, -1, -1, -1, -1, -1, -1, -1)
       f = functools.partial(f, normalize_output=False, return_residuals=True)
       f = batching.vmap_split(f, in_axes=seq_k_axes, num_parts=split_k)
       combine_partial_results = functools.partial(
@@ -279,7 +780,9 @@ class TritonFlashAttention(base.DotProductAttention[Config, None]):
 
       if _can_have_block_d(q, k, v):
         block_qk = block_q * block_k
-        block_d = triton.next_power_of_2(min(head_dim, 64**3 // block_qk))
+        block_d = max(
+            16, triton.next_power_of_2(min(head_dim, 64**3 // block_qk))
+        )
 
     return Config(
         block_q=block_q,

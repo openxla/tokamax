@@ -138,9 +138,9 @@ def dot_product_attention(
     raise ValueError("`implementation` must not be an empty sequence.")
 
   if query_seq_lengths is not None:
-    query_seq_lengths = query_seq_lengths[:, None, None]
+    query_seq_lengths = query_seq_lengths[..., None, None]
   if key_value_seq_lengths is not None:
-    key_value_seq_lengths = key_value_seq_lengths[:, None, None]
+    key_value_seq_lengths = key_value_seq_lengths[..., None, None]
 
   mask_ = base.Mask(
       mask,
