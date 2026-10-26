@@ -58,7 +58,8 @@ def _routing_moe_local(
     global_num_experts = local_num_experts
     group_offset = jnp.array([0], dtype=jnp.int32)
   else:
-    global_num_experts = local_num_experts * jax.lax.axis_size(cfg.ep_axis)
+    num_ep_shards = jax.lax.axis_size(cfg.ep_axis)
+    global_num_experts = local_num_experts * num_ep_shards
     if shard_idx is None:
       shard_idx = jax.lax.axis_index(cfg.ep_axis)
     elif not jnp.isscalar(shard_idx):
@@ -66,12 +67,18 @@ def _routing_moe_local(
     group_offset = jnp.array([shard_idx * local_num_experts], dtype=jnp.int32)
     if w2_bias is not None:
       w2_bias = jnp.where(shard_idx == 0, w2_bias, 0)
+    if cfg.plan.remote_scatter and not cfg.use_sp:
+      num_local_tokens = topk_weights.shape[0] // num_ep_shards
+      topk_weights = jax.lax.dynamic_slice_in_dim(
+          topk_weights, shard_idx * num_local_tokens, num_local_tokens, axis=0
+      )
 
   if cfg.use_sp:
     # Step 2: If input is not replicated (SP), perform all-gather.
-    topk_weights = jax.lax.all_gather(
-        topk_weights, axis_name=cfg.reduction_axis, axis=0, tiled=True
-    )
+    if not cfg.plan.remote_scatter:
+      topk_weights = jax.lax.all_gather(
+          topk_weights, axis_name=cfg.reduction_axis, axis=0, tiled=True
+      )
     topk_indices = jax.lax.all_gather(
         topk_indices, axis_name=cfg.reduction_axis, axis=0, tiled=True
     )
@@ -118,16 +125,18 @@ def _routing_moe_local(
       custom_plan=gmm_plan,
   )
 
-  # Step 6: Postprocess outputs from routing gmm. With remote_scatter, the rows
-  # are already this device's token shard and are reduced as such.
-  out = output_reduce.output_reduce_unpack(
-      gmm_res,
-      topk_weights,
-      topk_indices,
-      group_offset,
-      w1.shape[0],
-      shard_idx,
-  )
+  # Step 6: Postprocess outputs from routing gmm. With remote_scatter or
+  # without EP sharding, every row in gmm_res is valid on this shard.
+  if cfg.plan.remote_scatter or cfg.ep_axis is None:
+    out = output_reduce.output_reduce_unpack(gmm_res, topk_weights)
+  else:
+    out = output_reduce.output_reduce_unpack(
+        gmm_res,
+        topk_weights,
+        topk_indices,
+        group_offset,
+        local_num_experts,
+    )
 
   # Step 7: Combine across devices.
   match cfg.output_collective:

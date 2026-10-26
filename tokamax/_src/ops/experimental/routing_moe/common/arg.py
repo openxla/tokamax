@@ -43,9 +43,6 @@ class ActivationSpec:
   col_size: int
   dtype: jnp.dtype
   quant: QuantSpec | None = None
-  # When set, rows are this device's token shard along this mesh axis, not the
-  # full activation.
-  row_shard_axis: str | None = None
 
   def __post_init__(self):
     if self.quant is not None and self.col_size % self.quant.block_size != 0:

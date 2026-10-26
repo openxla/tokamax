@@ -254,24 +254,13 @@ def output_reduce_unpack(
     topk_indices: jax.Array | None = None,
     group_offset: jax.Array | int | None = None,
     num_local_experts: int | None = None,
-    shard_idx: jax.Array | None = None,
     *,
     out_dtype: jax.typing.DTypeLike = jnp.bfloat16,
     acc_dtype: jax.typing.DTypeLike = jnp.bfloat16,
 ) -> jax.Array:
-  """Reduces top-k rows and unpacks from compact 4D layout to 2D large layout.
-
-  If `rows.spec.row_shard_axis` is set, `rows` hold all topk rows of this
-  device's token shard only: the output covers those tokens, and every row is
-  valid regardless of expert.
-  """
-  axis = None
+  """Reduces top-k rows and unpacks from compact 4D to large 2D layout."""
   if isinstance(rows, arg.ActivationWrapper):
-    axis = rows.spec.row_shard_axis
-    row_size = rows.spec.row_size
     rows = rows.data
-  else:
-    row_size = rows.shape[0]
 
   if (
       rows.dtype != jnp.bfloat16
@@ -286,46 +275,27 @@ def output_reduce_unpack(
     raise ValueError(f"weights must be 2D [T, K], got {weights.shape}")
 
   num_tokens, topk = weights.shape
-  if axis is not None:
-    num_local_tokens = row_size // topk
-    if num_local_tokens * topk != row_size:
+  if rows.shape[0] != num_tokens * topk:
+    raise ValueError(
+        f"weights must be [T, K] with T * K == {rows.shape[0]}, got"
+        f" {weights.shape}"
+    )
+  if topk_indices is not None:
+    if topk_indices.shape != weights.shape:
       raise ValueError(
-          f"Rows ({row_size}) must hold whole tokens of topk {topk}."
-      )
-    if num_local_tokens * jax.lax.axis_size(axis) != num_tokens:
-      raise ValueError(
-          f"{num_tokens} tokens must divide evenly across axis {axis!r}."
-      )
-
-    if shard_idx is None:
-      shard_idx = jax.lax.axis_index(axis)
-    elif not jnp.isscalar(shard_idx):
-      shard_idx = shard_idx[0]
-    start = shard_idx * num_local_tokens
-    weights = jax.lax.dynamic_slice_in_dim(weights, start, num_local_tokens)
-    num_tokens = num_local_tokens
-  else:
-    if rows.shape[0] != num_tokens * topk:
-      raise ValueError(
-          f"weights must be [T, K] with T * K == {rows.shape[0]}, got"
+          f"topk_indices.shape {topk_indices.shape} must match weights.shape"
           f" {weights.shape}"
       )
-    if topk_indices is not None:
-      if topk_indices.shape != weights.shape:
-        raise ValueError(
-            f"topk_indices.shape {topk_indices.shape} must match weights.shape"
-            f" {weights.shape}"
-        )
-      if group_offset is None or num_local_experts is None:
-        raise ValueError(
-            "group_offset and num_local_experts are required when"
-            " topk_indices is provided"
-        )
-      local = jnp.logical_and(
-          topk_indices >= group_offset,
-          topk_indices < group_offset + num_local_experts,
+    if group_offset is None or num_local_experts is None:
+      raise ValueError(
+          "group_offset and num_local_experts are required when"
+          " topk_indices is provided"
       )
-      weights = jnp.where(local, weights, 0)
+    local = jnp.logical_and(
+        topk_indices >= group_offset,
+        topk_indices < group_offset + num_local_experts,
+    )
+    weights = jnp.where(local, weights, 0)
 
   cfg = Config.create(
       num_tokens=num_tokens,
