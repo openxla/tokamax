@@ -141,7 +141,9 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
       elif mask.bool_mask is not None:
         splash_mask = mask.bool_mask
       elif mask.is_causal:
-        splash_mask = mask_lib.CausalMask(shape=mask_shape, shard_count=1)
+        splash_mask = mask_lib.CausalMask(
+            shape=mask_shape, offset=mask.offset, shard_count=1
+        )
       else:
         splash_mask = mask_lib.FullMask(mask_shape)
     else:
@@ -277,11 +279,12 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
     kv_seq_len = k.shape[-2]
 
     is_causal = False
-    if isinstance(mask, mask_lib.CausalMask):
+    if isinstance(mask, mask_lib.CausalMask) and mask.offset == 0:
       is_causal = True
     elif (
         isinstance(mask, base.Mask)
         and mask.is_causal
+        and mask.offset == 0
         and mask.bool_mask is None
     ):
       is_causal = True

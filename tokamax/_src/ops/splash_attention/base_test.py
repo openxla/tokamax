@@ -392,6 +392,47 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     chex.assert_trees_all_close(dk, dk_ref, atol=1e-5)
     chex.assert_trees_all_close(dv, dv_ref, atol=1e-5)
 
+  @parameterized.parameters(0, 4, -4)
+  def test_canonicalize_causal_mask_preserves_offset(self, offset: int):
+    causal_mask = mask_lib.CausalMask(shape=(16, 16), offset=offset)
+    canonical_mask = base._canonicalize_mask(causal_mask)
+    self.assertTrue(canonical_mask.is_causal)
+    self.assertEqual(canonical_mask.offset, offset)
+    self.assertIsNone(canonical_mask.bool_mask)
+    materialized = canonical_mask.as_array(16, 16)
+    expected = jnp.asarray(causal_mask[:, :])
+    chex.assert_trees_all_close(materialized, expected, atol=0)
+
+  @parameterized.parameters(4, -2)
+  def test_mask_offset_requires_causal(self, offset: int):
+    with self.assertRaises(ValueError):
+      base.Mask(is_causal=False, offset=offset)
+
+  @parameterized.parameters(0, 4)
+  def test_splash_attention_op_causal_mask_offset_preservation(
+      self, offset: int
+  ):
+    seq_len = 16
+    head_dim = 16
+    q_struct = jax.ShapeDtypeStruct((2, seq_len, head_dim), dtype=jnp.float32)
+    k_struct = jax.ShapeDtypeStruct((2, seq_len, head_dim), dtype=jnp.float32)
+    v_struct = jax.ShapeDtypeStruct((2, seq_len, head_dim), dtype=jnp.float32)
+    q_tensor, k_tensor, v_tensor = numerics.random_initialize(
+        (q_struct, k_struct, v_struct)
+    )
+
+    causal_mask = mask_lib.CausalMask(shape=(seq_len, seq_len), offset=offset)
+    explicit_mask = jnp.asarray(causal_mask[:, :])
+
+    out_symbolic = self.op(
+        q_tensor, k_tensor, v_tensor, mask=causal_mask, is_mqa=False
+    )
+    out_explicit = self.op(
+        q_tensor, k_tensor, v_tensor, mask=explicit_mask, is_mqa=False
+    )
+
+    chex.assert_trees_all_close(out_symbolic, out_explicit, atol=1e-5)
+
 
 if __name__ == "__main__":
   absltest.main()
