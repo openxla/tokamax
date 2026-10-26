@@ -35,11 +35,19 @@ from tokamax._src.ops.experimental.routing_moe.gmm import pipeline
 from tokamax._src.ops.experimental.routing_moe.gmm import plan
 
 
-@jax.jit(static_argnames=("fuse_act", "out_dtype", "custom_plan"))
+@jax.jit(
+    static_argnames=(
+        "fuse_act",
+        "out_dtype",
+        "custom_plan",
+        "topk",
+        "num_global_groups",
+    )
+)
 def routing_gmm(
     x: arg.ActivationWrapper[jax.Array],
     w: tuple[arg.SingleWeightWrapper[jax.Array], ...],
-    group_sizes: jax.Array,  # [global_groups]
+    group_sizes: jax.Array | None,  # [global_groups]
     *,
     row_group: jax.Array | None = None,
     group_offset: jax.Array | None = None,  # [1]
@@ -48,8 +56,17 @@ def routing_gmm(
     fuse_act: str | None = None,
     out_dtype: jnp.dtype | None = None,
     custom_plan: plan.RoutingGmmPlan | None = None,
+    topk: int | None = None,
+    num_global_groups: int | None = None,
 ) -> arg.ActivationWrapper[jax.Array]:
   """GMM that pipelines routing and compute for both input and output.
+
+  By default the routed rows come sorted by group: `group_sizes` counts them
+  and `gather` / `scatter` map each sorted row to its input / output row. With
+  `topk`, the routing is built inside the kernel instead
+  (`metadata.LowTokMetadataRef`): `gather` / `scatter` hold the group of each
+  routed slot (the flattened [tokens, topk] top-k ids), `group_sizes` may be
+  None, and `num_global_groups` gives the number of groups.
 
   With `scatter.spec.remote_axis` (inside shard_map), a row scattered to global
   row `i` lands on device `i // rows_per_dev` along that axis, and each device
@@ -65,6 +82,19 @@ def routing_gmm(
   scatter_spec = None if scatter is None else scatter.spec
   w_specs = tuple(ww.spec for ww in w)
 
+  if group_sizes is not None:
+    if (
+        num_global_groups is not None
+        and num_global_groups != group_sizes.size
+    ):
+      raise ValueError(
+          f"num_global_groups ({num_global_groups}) must match"
+          f" group_sizes.size ({group_sizes.size})."
+      )
+    num_global_groups = group_sizes.size
+  elif num_global_groups is None:
+    raise ValueError("Either group_sizes or num_global_groups is required.")
+
   # Step 1: Derive sizes, resolve the plan, and construct the config.
   tpu_info = pltpu.get_tpu_info()
   size_ep = 1
@@ -73,7 +103,7 @@ def routing_gmm(
   dim = config.Dimension.create(
       x=x.spec,
       w=w_specs,
-      num_global_groups=group_sizes.size,
+      num_global_groups=num_global_groups,
       gather=gather_spec,
       scatter=scatter_spec,
       fuse_act=fuse_act,
@@ -107,6 +137,8 @@ def routing_gmm(
         gather=gather,
         fuse_act=fuse_act,
         custom_plan=unfused_plan,
+        topk=topk,
+        num_global_groups=num_global_groups,
     )
     return routing_gmm(
         x=gmm1_res,
@@ -117,6 +149,8 @@ def routing_gmm(
         scatter=scatter,
         out_dtype=out_dtype,
         custom_plan=unfused_plan,
+        topk=topk,
+        num_global_groups=num_global_groups,
     )
 
   cfg = config.RoutingGmmConfig.create(
@@ -137,13 +171,25 @@ def routing_gmm(
   else:
     if jnp.isscalar(group_offset):
       group_offset = group_offset[None]
-  group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
+  group_cum_sum = None
+  if group_sizes is not None:
+    group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
+
+  metadata_obj = metadata.create_metadata_ref(
+      group_cum_sum,
+      group_offset,
+      cfg,
+      gather_idx=None if gather is None else gather.indices,
+      scatter_idx=None if scatter is None else scatter.indices,
+      topk=topk,
+      row_group=None if row_group is None else row_group.astype(jnp.int32),
+  )
 
   # Pad indices by tile_m_idx to ensure DMA and indexing does not trigger OOB.
   def _padded_indices(
       routing: arg.RoutingWrapper[jax.Array] | None,
   ) -> jax.Array | None:
-    if routing is None:
+    if routing is None or metadata_obj.idx_ref is not None:
       return None
     return jnp.pad(routing.indices, (0, cfg.plan.tile_m_idx))
 
@@ -166,17 +212,13 @@ def routing_gmm(
       scatter_idx=_padded_indices(scatter),
   )
 
-  row_group_i32 = None if row_group is None else row_group.astype(jnp.int32)
-  metadata_obj = metadata.create_metadata_ref(
-      group_cum_sum, group_offset, cfg, row_group=row_group_i32
-  )
-
   # Step 4: Specify memory space.
-  inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
-  metadata_obj = memory_ref.map_memory_constraint(metadata_obj, pltpu.SMEM)
-  out = memory_ref.map_memory_constraint(
-      jnp.empty(cfg.out.spec.compact_shape, cfg.out.spec.dtype), pltpu.HBM
+  inputs = dataclasses.replace(
+      memory_ref.map_memory_constraint(inputs, pltpu.HBM),
+      x=memory_ref.map_memory_constraint(x.data, cfg.x.memory_space),
   )
+  metadata_obj = memory_ref.map_memory_constraint(metadata_obj, pltpu.SMEM)
+  out = cfg.out.memory_space(cfg.out.spec.compact_shape, cfg.out.spec.dtype)
 
   # Step 5: Call kernel.
   num_cores = cfg.tpu_info.num_cores

@@ -56,6 +56,8 @@ class RoutingGmmPlan:
   # Walk only the groups with rows when building the metadata (needs the
   # `row_group` input of routing_gmm).
   live_group_walk: bool | None = None
+  # Route gather/scatter activations in VMEM instead of per-row HBM DMAs.
+  vmem_routing: bool | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -77,6 +79,7 @@ class ResolvedGmmPlan(RoutingGmmPlan):
   vmem_usage_fraction: float
   skip_metadata_size: int
   live_group_walk: bool
+  vmem_routing: bool
 
   @property
   def bucket_rows(self):
@@ -157,7 +160,25 @@ class ResolvedGmmPlan(RoutingGmmPlan):
     if live_group_walk is None:
       live_group_walk = size_out_m < w[0].group_size
 
-    vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
+    vmem_routing = plan.vmem_routing
+    if vmem_routing is None:
+      routed_vmem_bytes = (
+          max(x.row_size * x.col_size, size_out_m * size_out_n)
+          * jax.dtypes.itemsize_bits(x.dtype)
+          // 8
+      )
+      vmem_routing = (
+          size_out_m <= 160
+          and size_out_m < w[0].group_size
+          and routed_vmem_bytes
+          <= (plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes) // 8
+      )
+
+    if vmem_routing and plan.vmem_limit_bytes is None:
+      vmem_limit_bytes = tpu_info.vmem_capacity_bytes // 2
+    else:
+      vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
+
     tile_m, tile_k, tile_n, bucket_base, num_xo_buffers, num_w_buffers = (
         calculate_tiling(
             plan,
@@ -213,6 +234,7 @@ class ResolvedGmmPlan(RoutingGmmPlan):
         vmem_usage_fraction=plan.vmem_usage_fraction,
         skip_metadata_size=skip_metadata_size,
         live_group_walk=live_group_walk,
+        vmem_routing=vmem_routing,
     )
 
 
