@@ -58,5 +58,5 @@ SHA256 `2324a9c5c56b408efc3294761d7e80ac170a184991e7e088e8933d204d851792`;
 CRC32C `3MtjPQ==`; archived size/checksum verified.
 
 For a backward-configuration comparison with fixed forward flags, use
-`python -m tokamax.benchmarks.kda_megakernel_compare --suite backward` or
+`python -m tokamax.benchmarks.kda_backward_compare --suite backward` or
 `--suite backward-packed`. Those timers also cover the complete operator/VJP.
