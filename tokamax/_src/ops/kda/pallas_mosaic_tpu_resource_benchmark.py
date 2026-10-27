@@ -38,7 +38,7 @@ def main():
   parser.add_argument("--batch", type=int, default=2)
   parser.add_argument("--heads", type=int, default=8)
   parser.add_argument("--local-tokens", type=int, default=128)
-  parser.add_argument("--cp", type=int, default=8)
+  parser.add_argument("--cp", type=int, choices=(2, 4, 8), default=8)
   parser.add_argument("--capacity", type=int, default=32)
   parser.add_argument(
       "--route", choices=("plain", "bucket", "groups"), default="plain"
@@ -47,13 +47,11 @@ def main():
   parser.add_argument("--remat", action="store_true")
   parser.add_argument("--outer-remat", action="store_true")
   parser.add_argument("--over", action="store_true")
-  parser.add_argument("--fixed", action="store_true")
   parser.add_argument("--repeat", type=int, default=20)
   parser.add_argument("--warmup", type=int, default=5)
   parser.add_argument("--save-arrays", action="store_true")
   parser.add_argument("--profile", action="store_true")
   parser.add_argument("--profile-repeat", type=int, default=20)
-  parser.add_argument("--packed-backward", action="store_true")
   args = parser.parse_args()
   if jax.default_backend() != "tpu" or os.environ.get("PALLAS_INTERPRET"):
     raise RuntimeError("Native TPU execution is required")
@@ -107,22 +105,15 @@ def main():
       fuse_rematerialization=True,
       rematerialize_for_backward=args.remat,
       packed_forward=True,
-      packed_backward=args.packed_backward,
       packed_output=True,
       packed_gradients=True,
   )
-  if not config.fuse_backward or (
-      args.cp > 1 and not getattr(config, "fuse_cp_backward", False)
-  ):
+  if not config.fuse_backward or (not config.fuse_cp_backward):
     raise AssertionError("Requested backward schedule was not selected")
   result["config"] = dataclasses.asdict(config)
   attention = mosaic.PallasMosaicTpuKimiDeltaAttention(config=config)
   mesh = Mesh(np.array(jax.devices()[: args.cp]), ("context",))
-  meta = (
-      ContextParallelMetadata(mesh=mesh, axis_name="context")
-      if args.cp > 1
-      else None
-  )
+  meta = ContextParallelMetadata(mesh=mesh, axis_name="context")
 
   def local(q, k, v, g, beta, alog, bias, dout, ids):
     def call(q, k, v, g, beta, alog, bias):
@@ -131,7 +122,7 @@ def main():
           delta_time_bias=bias,
           use_gate_in_kernel=True,
           lower_bound=-1.0,
-          segment_ids=None if args.fixed else ids,
+          segment_ids=ids,
           max_num_segments=args.capacity,
           context_parallel_metadata=meta,
       )
@@ -155,36 +146,31 @@ def main():
       call = jax.checkpoint(call)
     output, pullback = jax.vjp(call, q, k, v, g, beta, alog, bias)
     gradients = pullback(dout)
-    if args.cp > 1:
-      gradients = (
-          *gradients[:5],
-          jax.lax.psum(gradients[5], "context"),
-          jax.lax.psum(gradients[6], "context"),
-      )
+    gradients = (
+        *gradients[:5],
+        jax.lax.psum(gradients[5], "context"),
+        jax.lax.psum(gradients[6], "context"),
+    )
     return output, gradients
 
   spec = P(None, None, "context", None)
   outspec = (spec, (spec, spec, spec, spec, P(None, None, "context"), P(), P()))
   with jaxtyping.disable_jaxtyping(), jax.set_mesh(mesh):
-    fn = (
-        jax.jit(
-            jax.shard_map(
-                local,
-                mesh=mesh,
-                in_specs=(spec,) * 4
-                + (
-                    P(None, None, "context"),
-                    P(),
-                    P(),
-                    spec,
-                    P(None, "context"),
-                ),
-                out_specs=outspec,
-                check_vma=False,
-            )
+    fn = jax.jit(
+        jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=(spec,) * 4
+            + (
+                P(None, None, "context"),
+                P(),
+                P(),
+                spec,
+                P(None, "context"),
+            ),
+            out_specs=outspec,
+            check_vma=False,
         )
-        if args.cp > 1
-        else jax.jit(local)
     )
     lowered = fn.lower(*inputs)
     compiled = lowered.compile()

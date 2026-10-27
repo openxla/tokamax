@@ -2301,7 +2301,6 @@ def chunk_kda_bwd_fusion(
   )
   chunk_seg_ids = segment_ids.reshape(B, NT, BT)[:, :, 0]
   cu_seqlens = jnp.zeros((B, 1), dtype=jnp.int32)
-  aligned_cu_seqlens = cu_seqlens
   # Aligned execution never reads packed chunk metadata.
   chunk_indices = jnp.zeros((1,), dtype=jnp.int32)
   compact_chunk_metadata = False
