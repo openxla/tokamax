@@ -34,9 +34,9 @@ are retained, and the large workspace win is not attributed to remote DMA.
 ## Protocol
 
 Frozen main: `4eeb302c1fe118c66274039ba4ac6b5b6753d0bd`. Candidate: `2379bd5ba29d3eafbaf478e8ea9e6839bea6c058`. TPU7x, dedicated 4-chip/8-device
-Pod; non-CP uses device 0. JAX/JAXLIB 0.11.2, libtpu 0.0.48, Python 3.12.15,
-Pydantic 2.14.1, XProf 2.23.1. Large second-minor layout enabled; interpretation
-disabled. No donation. Each executable warms up 5 times, then records 20 blocking
+Pod; these cases use CP4 or CP8. JAX/JAXLIB 0.11.2, libtpu 0.0.48, Python 3.12.15,
+Pydantic 2.14.1, NumPy 2.5.4, Flax 0.12.10, Qwix 0.1.8, XProf 2.23.1. Large second-minor layout enabled; interpretation
+disabled. No donation. Each main/candidate executable warms up 5 times, then records 20 blocking
 calls in each of two fresh-process sweeps with reversed variant order. All tables
 use the median of 40 raw host-wall samples; compilation/input creation excluded.
 Selected three-call device captures are repeated independently; CP reports the
@@ -47,13 +47,9 @@ of FP32 Gaussian std .1 then BF16. FP32 A_log uniform [-1,0], bias uniform [-4,-
 K=V=128, chunk size 64, scale=128**-.5, bounded raw gate lower=-5 except the
 explicit preactivated CP case. Inputs/cotangents are identical and hash-checked.
 No user state unless stated. All raw timings and correctness deltas are in the
-adjacent JSON. A main fixed-length baseline case was replayed at an idle boundary
-to exclude possible host-analysis overlap; the rejected samples are preserved.
+raw timing/diagnostic CSV.
 
-The fixed and packed training rows reproduce both declared KDA ArgSpec shapes
-and switches. The pinned main's obsolete float-initializer call is bypassed by
-constructing explicit deterministic arrays in valid ranges; operator code is
-unmodified. Additional compact/CP/inference cases extend that shape coverage.
+The parent-PR control uses two supplementary fresh-process repeats after the main/candidate sweeps, rather than the reversed variant ordering.
 
 Compiler temporary memory for `cp8_capacity`: **53,752,904,288 -> 362,021,856 bytes**. This excludes arguments/output buffers and is not a measured allocator or model live-HBM peak. Per-case argument/output sizes are in the raw data.
 
