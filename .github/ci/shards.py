@@ -613,6 +613,33 @@ SHARDS: ShardMap = {
         minutes=16,
         compat_minutes=1,
     ),
+    'experimental-kda-megakernel-forward': Spec(
+        paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_fused_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_output_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_resource_test.py',
+        ),
+        minutes=10,
+    ),
+    'experimental-kda-megakernel-backward': Spec(
+        paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_bwd_fused_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_remat_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_bwd_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_gradients_test.py',
+        ),
+        minutes=15,
+    ),
+    'experimental-kda-megakernel-cp': Spec(
+        paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_cp_fused_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_cp_megakernel_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_workspace_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_workspace_tpu_test.py',
+        ),
+        minutes=10,
+    ),
     # Unmeasured until now. Slow only on tpu7x, against well under a minute on
     # h100 and tpu6e: 10m there (`gmm_test.py` 5.7m, `moe_test.py` 4.4m)
     # until the gmm-up/gmm-down fusion change of 2026-10-21, and 14-15m in
