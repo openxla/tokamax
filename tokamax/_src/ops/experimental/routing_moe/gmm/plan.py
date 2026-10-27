@@ -63,6 +63,9 @@ class RoutingGmmPlan:
   # Walk only the groups with rows when building the metadata (needs the
   # row_group input of routing_gmm).
   live_group_walk: bool | None = None
+  # Stage the whole gather/scatter row-index tables into SMEM once with the
+  # metadata, instead of streaming each tile's indices from HBM.
+  resident_idx: bool | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -83,6 +86,7 @@ class ResolvedGmmPlan(RoutingGmmPlan):
   fuse_up_and_down: bool
   vmem_limit_bytes: int
   live_group_walk: bool
+  resident_idx: bool
 
   @property
   def bucket_rows(self) -> list[int]:
@@ -216,6 +220,13 @@ class ResolvedGmmPlan(RoutingGmmPlan):
     ) = tiling
     if not fuse_up_and_down and plan.tile_k2 is not None:
       raise ValueError("tile_k2 requires fuse_up_and_down=True.")
+    resident_idx = plan.resident_idx
+    if resident_idx is None:
+      # Keep both tables to a small share of SMEM next to the metadata.
+      resident_idx = (
+          resident_idx_bytes(size_out_m=size_out_m, tile_m=tile_m)
+          <= tpu_info.smem_capacity_bytes // 8
+      )
     return cls(
         tile_m=tile_m,
         tile_k=tile_k,
@@ -230,6 +241,7 @@ class ResolvedGmmPlan(RoutingGmmPlan):
         fuse_up_and_down=fuse_up_and_down,
         vmem_limit_bytes=vmem_limit_bytes,
         live_group_walk=live_group_walk,
+        resident_idx=resident_idx,
     )
 
 
@@ -281,6 +293,23 @@ def _choose_tiling_and_fusion(
   if plan.fuse_up_and_down or fits(default_tiling):
     return default_tiling, True
   return tiling, False
+
+
+def resident_idx_bytes(*, size_out_m: int, tile_m: int) -> int:
+  """SMEM bytes of both resident row-index tables (gather and scatter).
+
+  Each int32 table holds one index per routed row, padded by one index tile so
+  that a tile's branchless reads never run past its end.
+
+  Args:
+    size_out_m: Routed rows.
+    tile_m: Rows per tile.
+
+  Returns:
+    Bytes of the two tables together.
+  """
+  tile_m_idx = pl.cdiv(tile_m, 128) * 128
+  return 2 * (size_out_m + tile_m_idx) * 4
 
 
 def _vmem_estimate(

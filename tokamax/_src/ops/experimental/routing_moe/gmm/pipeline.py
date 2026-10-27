@@ -160,6 +160,12 @@ def outer_pipeline(
       inputs = dataclasses.replace(inputs, x=inputs.x.bind_idx_ref(gather_idx))
     if isinstance(scatter_idx, memory_ref.IndexBufferedRef):
       out = out.bind_idx_ref(scatter_idx)
+    if metadata_in_ref.gather_idx is not None:
+      inputs = dataclasses.replace(
+          inputs, x=inputs.x.with_idx_ref(metadata_in_ref.gather_idx)
+      )
+    if metadata_in_ref.scatter_idx is not None:
+      out = out.with_idx_ref(metadata_in_ref.scatter_idx)
     final_allocs = dataclasses.replace(final_allocs, inputs=inputs, out=out)
     final_allocs.inputs.x.prologue()
     final_allocs.out.prologue()

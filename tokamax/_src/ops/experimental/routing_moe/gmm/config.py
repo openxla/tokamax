@@ -375,6 +375,10 @@ class RoutingGmmConfig:
     smem_threshold = int(0.45 * tpu_info.smem_capacity_bytes)
     # 3: _to_group_id, _to_m_offset, _to_num_rows. 4: int32.
     smem_allocation = (cfg.max_num_gm * 3) * 4
+    if cfg.plan.resident_idx:
+      smem_allocation += plan_lib.resident_idx_bytes(
+          size_out_m=cfg.dim.size_out_m, tile_m=cfg.plan.tile_m
+      )
     if smem_allocation >= smem_threshold:
       raise ValueError(
           f"Total number of SMEM allocation must be less than {smem_threshold}"

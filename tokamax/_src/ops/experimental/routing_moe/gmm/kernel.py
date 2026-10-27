@@ -165,17 +165,25 @@ def routing_gmm(
     )
 
   remote = cfg.out.mode == config.RoutingMode.REMOTE
+  # With resident indices, the whole padded tables go to SMEM with the metadata
+  # instead of being streamed per tile from HBM.
+  resident = cfg.plan.resident_idx
   inputs = memory_ref.PipelineInputs[jax.Array](
       x=x.data,
       w=_weight_ref(w),
       w2=None if w2 is None else _weight_ref(w2),
-      gather_idx=_padded_indices(gather),
-      scatter_idx=_padded_indices(scatter),
+      gather_idx=None if resident else _padded_indices(gather),
+      scatter_idx=None if resident else _padded_indices(scatter),
   )
 
   row_group_i32 = None if row_group is None else row_group.astype(jnp.int32)
   metadata_in, metadata_scratch = metadata.create_metadata(
-      group_cum_sum, group_offset, cfg, row_group=row_group_i32
+      group_cum_sum,
+      group_offset,
+      cfg,
+      row_group=row_group_i32,
+      gather_idx=_padded_indices(gather) if resident else None,
+      scatter_idx=_padded_indices(scatter) if resident else None,
   )
 
   # Step 4: Specify memory space.
