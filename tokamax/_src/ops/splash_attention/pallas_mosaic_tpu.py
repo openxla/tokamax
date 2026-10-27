@@ -104,13 +104,13 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
   @override
   def _fwd(
       self,
-      q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
-      k: Float[Array, "..."],
-      v: Float[Array, "..."],
+      q: Float[Array, "*B H T D"],
+      k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
+      v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
       *,
       mask: base.Mask | mask_lib.Mask,
       segment_ids: reference.SegmentIds | None = None,
-      sinks: Float[Array, "..."] | None = None,
+      sinks: Float[Array, "*#B H"] | None = None,
       is_mqa: bool = False,
       mask_value: float = reference.DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
@@ -118,7 +118,7 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
       prng_key: jax.Array | None = None,
       return_residuals: bool = False,
       config: Config,
-  ) -> tuple[jax.Array, base.Residuals | None]:
+  ) -> tuple[Float[Array, "*B H T d"], base.Residuals | None]:
     splash_config = dataclasses.replace(
         splash_attention_kernel.SplashConfig.get_default(),
         attn_logits_soft_cap=attn_logits_soft_cap,
@@ -129,8 +129,8 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
         **dataclasses.asdict(config),
     )
 
-    q_seq_len = q.shape[1]
-    kv_seq_len = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
+    q_seq_len = q.shape[-2]
+    kv_seq_len = k.shape[-2]
     mask_shape = (q_seq_len, kv_seq_len)
 
     if isinstance(mask, mask_lib.Mask):
@@ -141,30 +141,62 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
       elif mask.bool_mask is not None:
         splash_mask = mask.bool_mask
       elif mask.is_causal:
-        splash_mask = mask_lib.CausalMask(shape=mask_shape, shard_count=1)
+        splash_mask = mask_lib.CausalMask(
+            shape=mask_shape, offset=mask.offset, shard_count=1
+        )
       else:
         splash_mask = mask_lib.FullMask(mask_shape)
     else:
       splash_mask = mask
 
-    if is_mqa and k.ndim == 3:
-      k_in = k[0]
-      v_in = v[0]
+    if is_mqa and k.ndim == q.ndim:
+      k_in = jnp.squeeze(k, axis=-3)
+      v_in = jnp.squeeze(v, axis=-3)
     else:
       k_in = k
       v_in = v
 
-    if isinstance(splash_mask, (jax.Array, np.ndarray)):
-      splash_maker = (
-          splash_attention_kernel.make_dynamic_splash_mqa
-          if is_mqa
-          else splash_attention_kernel.make_dynamic_splash_mha
+    broadcast_to_rank = (
+        lambda x, rank: None if x is None else jax.lax.broadcast_to_rank(x, rank)
+    )
+
+    if segment_ids is not None:
+      segment_ids = reference.SegmentIds(
+          q=jax.lax.broadcast_to_rank(segment_ids.q, q.ndim - 2)
+          if isinstance(segment_ids.q, (jax.Array, np.ndarray))
+          else segment_ids.q,
+          kv=jax.lax.broadcast_to_rank(segment_ids.kv, q.ndim - 2)
+          if isinstance(segment_ids.kv, (jax.Array, np.ndarray))
+          else segment_ids.kv,
       )
-      attn_fn = splash_maker(
-          jnp.asarray(splash_mask),
-          config=splash_config,
-          mask_value=mask_value,
-          save_residuals=return_residuals,
+    sinks = broadcast_to_rank(sinks, q.ndim - 2)
+
+    if isinstance(splash_mask, (jax.Array, np.ndarray)):
+      splash_mask = broadcast_to_rank(jnp.asarray(splash_mask), q.ndim - 1)
+
+      def single_fwd(q, k, v, mask, segment_ids, sinks):
+        splash_maker = (
+            splash_attention_kernel.make_dynamic_splash_mqa
+            if is_mqa
+            else splash_attention_kernel.make_dynamic_splash_mha
+        )
+        attn_fn = splash_maker(
+            mask,
+            config=splash_config,
+            mask_value=mask_value,
+            save_residuals=return_residuals,
+        )
+        return attn_fn(
+            q,
+            k,
+            v,
+            segment_ids=segment_ids,
+            sinks=sinks,
+            prng_key=prng_key,
+        )
+
+      splash_output = base.vmap_batch_dims(single_fwd)(
+          q, k_in, v_in, splash_mask, segment_ids, sinks
       )
     else:
       splash_maker = (
@@ -179,14 +211,20 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
           save_residuals=return_residuals,
       )
 
-    splash_output = attn_fn(
-        q,
-        k_in,
-        v_in,
-        segment_ids=segment_ids,
-        sinks=sinks,
-        prng_key=prng_key,
-    )
+      def single_fwd_static(q, k, v, segment_ids, sinks):
+        return attn_fn(
+            q,
+            k,
+            v,
+            segment_ids=segment_ids,
+            sinks=sinks,
+            prng_key=prng_key,
+        )
+
+      splash_output = base.vmap_batch_dims(single_fwd_static)(
+          q, k_in, v_in, segment_ids, sinks
+      )
+
     if return_residuals:
       out, stats = splash_output
       residuals = (stats["max_logits"], stats["logsumexp"])
@@ -201,11 +239,8 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
     k = ba.arguments["k"]
     is_mqa = ba.arguments.get("is_mqa", False)
     dropout_rate = ba.arguments.get("dropout_rate", 0.0)
-    q_seq_len = q.shape[1]
-
-    kv_seq_len = k.shape[1]
-    if is_mqa and k.ndim == 2:
-      kv_seq_len = k.shape[0]
+    q_seq_len = q.shape[-2]
+    kv_seq_len = k.shape[-2]
 
     block_q = 128
     if q_seq_len >= 1024 and q_seq_len % 1024 == 0:
@@ -240,15 +275,16 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
     is_mqa = ba.arguments.get("is_mqa", False)
     mask = ba.arguments.get("mask")
     dropout_rate = ba.arguments.get("dropout_rate", 0.0)
-    q_seq_len = q.shape[1]
-    kv_seq_len = k.shape[0] if is_mqa and k.ndim == 2 else k.shape[1]
+    q_seq_len = q.shape[-2]
+    kv_seq_len = k.shape[-2]
 
     is_causal = False
-    if isinstance(mask, mask_lib.CausalMask):
+    if isinstance(mask, mask_lib.CausalMask) and mask.offset == 0:
       is_causal = True
     elif (
         isinstance(mask, base.Mask)
         and mask.is_causal
+        and mask.offset == 0
         and mask.bool_mask is None
     ):
       is_causal = True

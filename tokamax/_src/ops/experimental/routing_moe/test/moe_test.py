@@ -781,8 +781,6 @@ class MoEKernelTest(parameterized.TestCase):
     if remote_scatter:
       reduce_output = True
 
-    print(f"kky {reduce_output=} {remote_scatter=}")
-
     dtype = jnp.bfloat16
 
     seed = 54321

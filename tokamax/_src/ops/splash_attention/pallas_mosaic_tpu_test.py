@@ -176,6 +176,35 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
 
     self._test_attention(q, k, v, do, mask=mask)
 
+  @parameterized.parameters(
+      (0, False),
+      (16, False),
+      (128, False),
+      (16, True),
+  )
+  def test_causal_mask_offset(self, offset, use_base_mask):
+    head_dim = 64
+    num_heads = 2
+    q_seq_len = 256
+    kv_seq_len = 256
+    dtype = jnp.float32
+
+    query = jax.ShapeDtypeStruct((num_heads, q_seq_len, head_dim), dtype)
+    key = jax.ShapeDtypeStruct((num_heads, kv_seq_len, head_dim), dtype)
+    value = jax.ShapeDtypeStruct((num_heads, kv_seq_len, head_dim), dtype)
+    dout = jax.ShapeDtypeStruct((num_heads, q_seq_len, head_dim), dtype)
+
+    if use_base_mask:
+      mask = base.Mask(is_causal=True, offset=offset)
+    else:
+      mask = mask_lib.CausalMask(shape=(q_seq_len, kv_seq_len), offset=offset)
+
+    query, key, value, dout = numerics.random_initialize(
+        (query, key, value, dout)
+    )
+
+    self._test_attention(query, key, value, dout, mask=mask)
+
   def test_custom_config(self):
     q_seq_len, kv_seq_len, head_dim = 128, 128, 64
     num_heads = 2

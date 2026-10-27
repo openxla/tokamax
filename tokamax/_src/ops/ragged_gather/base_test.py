@@ -26,17 +26,31 @@ jax.config.parse_flags_with_absl()
 class BaseRaggedGatherTest(absltest.TestCase):
 
   def test_base_running_correctly(self):
-    x = jax.random.normal(jax.random.PRNGKey(0), (512, 128), jnp.float32)
-    indices = jax.random.randint(
-        jax.random.PRNGKey(1), (400,), 0, 512, jnp.int32
+    in_size = 512
+    out_size = 400
+    hidden_size = 128
+    start = 3
+    end = 338
+    x = jax.random.normal(
+        jax.random.PRNGKey(0), (in_size, hidden_size), jnp.float32
     )
-    start_arr = jnp.array([3], jnp.int32)
-    end_arr = jnp.array([338], jnp.int32)
+    indices = jax.random.randint(
+        jax.random.PRNGKey(1), (out_size,), 0, in_size, jnp.int32
+    )
+    start_arr = jnp.array([start], jnp.int32)
+    end_arr = jnp.array([end], jnp.int32)
 
     op = base.RaggedGather()
-    actual = op(x, indices, start_arr, end_arr)
-    desired = x[indices]
-    np.testing.assert_allclose(actual, desired, rtol=1e-5, atol=1e-5)
+
+    @jax.jit
+    def run_op(x, indices, start_arr, end_arr):
+      return op(x, indices, start_arr, end_arr) + 1.0
+
+    actual = run_op(x, indices, start_arr, end_arr)
+    desired = np.asarray(x)[np.asarray(indices)] + 1.0
+    np.testing.assert_allclose(
+        actual[start:end], desired[start:end], rtol=1e-5, atol=1e-5
+    )
 
 
 if __name__ == "__main__":

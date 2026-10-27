@@ -79,31 +79,33 @@ class ResolvedGmmPlan(RoutingGmmPlan):
   live_group_walk: bool
 
   @property
-  def bucket_rows(self):
+  def bucket_rows(self) -> list[int]:
     bucket_base = self.bucket_base
     # Explicitly include tile_m in case tile_m % bucket_base != 0.
     return [*range(bucket_base, self.tile_m, bucket_base), self.tile_m]
 
   @property
-  def tile_m_idx(self):
+  def tile_m_idx(self) -> int:
     # TODO: Fetch this from tpu_info instead of using magic numbers.
     num_lanes = 128
     return pl.cdiv(self.tile_m, num_lanes) * num_lanes
 
   @property
-  def idx_ring_size(self):
+  def idx_ring_size(self) -> int:
     # Index uses 2 buffers. Despite this, we add at least one more gap to ensure
     # write slot does not overwrite read slot.
     return self.tile_m_idx * max(self.num_xo_buffers, 3)
 
   @property
-  def idx_buffer_size(self):
+  def idx_buffer_size(self) -> int:
     # Add tile_m_idx for "runaway" mentioned in IndexBufferedRef docstring.
     return self.idx_ring_size + self.tile_m_idx
 
   @property
-  def num_idx_buffers(self):
-    # TODO: Make this configurable?
+  def num_idx_buffers(self) -> int:
+    # We hardcode this and make it immutable since it is load bearing.
+    # It is because "2" works correctly for determining a slot index even when
+    # a dividend is underflowed uint.
     return 2
 
   @classmethod
