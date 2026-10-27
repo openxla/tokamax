@@ -37,7 +37,8 @@ checks and four abstract exports passed. Numerical comparisons retain relative
 L2 error <=2%. The scope cleanup reruns 22 local interpretation/contract/export
 checks; these are not counted as new native device passes. Both benchmark
 entry points share one tuple-callable input builder and return batch-first
-outputs. No standalone inference latency claim has been recorded.
+outputs. Current latency measurements and the H32/N25 regression are documented in
+[inference_latest_main_benchmark.md](inference_latest_main_benchmark.md).
 
 Token selection in the boundary recurrence uses mask/reduce, and output
 updates use select. JAX 0.11.1 TPU lowering does not support dynamic_slice or
