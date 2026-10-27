@@ -23,11 +23,17 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.gmm_v2 import gmm_v2
 from tokamax._src.ops.ragged_gather.pallas_mosaic_tpu_kernel import ragged_gather_pallas
+from tokamax._src.ops.ragged_gather_reduce import reference as ragged_gather_reduce_ref
 from tokamax._src.ops.ragged_gather_reduce.pallas_mosaic_tpu_kernel import ragged_gather_reduce
 
 P = sharding.PartitionSpec
 NamedSharding = sharding.NamedSharding
 Mesh = sharding.Mesh
+
+
+def use_sparse_core() -> bool:
+  """Whether to run SparseCore kernels. TPU 8i runs without them."""
+  return pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_8I
 
 
 def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
@@ -156,7 +162,12 @@ def moe_gmm_local(
 
   reduction_axis = tp_axis if tp_axis is not None else ep_axis
 
-  out = ragged_gather_reduce(
+  gather_reduce = (
+      ragged_gather_reduce
+      if use_sparse_core()
+      else ragged_gather_reduce_ref.ragged_gather_reduce
+  )
+  out = gather_reduce(
       gmm2_res,
       topk_argsort_revert_indices,
       topk_weights.reshape(-1),
@@ -423,12 +434,16 @@ def reference_moe(
     group_offsets = jnp.cumulative_sum(group_sizes_local, include_initial=True)
     shard_output_start = group_offsets[experts_start]
     shard_output_end = group_offsets[experts_end]
-    x = ragged_gather_pallas(
-        hidden_states_local,
-        token_indices_sorted,
-        shard_output_start,
-        shard_output_end,
-    )
+    if use_sparse_core():
+      x = ragged_gather_pallas(
+          hidden_states_local,
+          token_indices_sorted,
+          shard_output_start,
+          shard_output_end,
+      )
+    else:
+      # Rows outside [start, end) are unused, so a full gather is equivalent.
+      x = hidden_states_local[token_indices_sorted]
 
     return x, group_sizes_local, topk_argsort_revert_indices
 
