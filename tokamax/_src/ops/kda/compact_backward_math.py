@@ -14,10 +14,6 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
-from tokamax._src.ops.kda.utils import get_interpret
-from tokamax._src.ops.kda.compact_utils import align_up, assert_shape, assert_shape_or_none
-from tokamax._src.ops.kda.compact_hardware import get_tpu_config
 
 
 def _chunk_segment_metadata(chunk_seg_ids, batch_idx, chunk_id, NT):

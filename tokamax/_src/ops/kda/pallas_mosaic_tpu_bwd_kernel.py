@@ -45,7 +45,6 @@ from tokamax._src.ops.kda.utils import (
     _align_seqs,
     _unalign_output,
     align_up,
-    cdiv,
     exp,
     exp2,
     get_interpret,
