@@ -24,6 +24,13 @@ from tokamax._src.autotuning import arg_spec
 ShapeDtype = jax.ShapeDtypeStruct
 
 
+class _BetaInitializer(jax.ShapeDtypeStruct, numerics.ArrayInitializer):
+  """Post-activation floating-point beta in [0, 1]."""
+
+  def __call__(self, rng: np.random.Generator) -> np.ndarray:
+    return rng.uniform(0.0, 1.0, self.shape).astype(self.dtype)
+
+
 class _HashableNPArray(np.ndarray):
   """Numpy array that can be retained as a concrete argument in an ArgSpec."""
 
@@ -66,8 +73,8 @@ def _kimi_linear_48b_a3b_spec(
       "key": ShapeDtype(qkv_shape, dtype),
       "value": ShapeDtype(qkv_shape, dtype),
       "gate": ShapeDtype(qkv_shape, dtype),
-      "beta": numerics.RangedArrayInitializer(
-          shape=(num_heads, batch_size, seq_len), dtype=dtype, min=0.0, max=1.0
+      "beta": _BetaInitializer(
+          shape=(num_heads, batch_size, seq_len), dtype=dtype
       ),
       "a_log": ShapeDtype((num_heads,), jnp.float32),
       "delta_time_bias": ShapeDtype((num_heads * head_dim,), jnp.float32),
