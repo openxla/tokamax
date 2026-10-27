@@ -32,16 +32,17 @@ Run `python -m tokamax.benchmarks.kda_inference` on TPU to compare the native
 entry with existing Mosaic forward using the device timer. Keep this PR draft
 until TPU lowering, memory feasibility, accuracy and timings are recorded.
 
-Local results: 16 inference checks passed (including relative L2 error <=2%
-against XLA and race detection), 33 CI shard checks passed, shard consistency
-passed, and four TPU benchmark cases collected without timing. Interpreter
-execution completes before the CPU reference starts to avoid callback dispatch
-contention. Chunk size and head grouping are not public API tuning arguments.
+Recorded TPU validation: 12 native numerical cases, six unsupported-entry
+checks and four abstract exports passed. Numerical comparisons retain relative
+L2 error <=2%. The scope cleanup reruns 22 local interpretation/contract/export
+checks; these are not counted as new native device passes. Both benchmark
+entry points share one tuple-callable input builder and return batch-first
+outputs. No standalone inference latency claim has been recorded.
 
 Token selection in the boundary recurrence uses mask/reduce, and output
 updates use select. JAX 0.11.1 TPU lowering does not support dynamic_slice or
 dynamic_update_slice even when the interpreter accepts them. The loop remains
 rolled. Four inference_lowering_test.py cases export to an abstract TPU7x
 target with interpretation disabled, covering both initial/final-state options.
-These check Pallas lowering, not device execution or performance. The updated
-kernel passes the 16 numerical tests and four export tests locally.
+These check Pallas lowering, not device execution or performance. Chunk size
+and head grouping are not public API tuning arguments.

@@ -21,7 +21,6 @@ mega-kernel so inference optimization cannot change the training path.
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int
 from tokamax._src import jaxtyping
