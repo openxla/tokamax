@@ -462,12 +462,15 @@ class BranchlessBufferedRef(RoutingBufferedRef):
   def branchless_wait_in(
       self, src_ref: hijax.TransformedRef, grid_indices: GridIndices
   ) -> None:
+    del src_ref
     assert self.sem_recvs is not None
 
     slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
     rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
-    # Only the byte count matters to the wait, so src_ref stands in for both.
-    copied = src_ref.at[pl.ds(0, rows_ds.size), cols_ds]
+    # Only the byte count matters to the wait.
+    copied = self._window_ref_at(slot).at[
+        pl.ds(0, rows_ds.size), pl.ds(0, cols_ds.size)
+    ]
     pltpu.make_async_copy(copied, copied, self.sem_recvs.at[slot]).wait()
 
   @override

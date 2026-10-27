@@ -135,9 +135,8 @@ def _kernel(
   outs = pltpu.annotate(outs, no_hazard_no_deps=True)
   stage = pltpu.annotate(stage, no_hazard_no_deps=True)
   sem_rows, sem_out = sems.at[0], sems.at[1]
-  rows = rows_hbm.bitcast(jnp.uint32).reshape(
-      rows_hbm.shape[0] // K, K, chunks, lanes
-  )
+  rows = rows_hbm.reshape(rows_hbm.shape[0] // K, K, chunks, packing, lanes)
+  slots_flat = slots.reshape(cfg.slots, tpb * K, chunks, packing, lanes)
 
   def fetch_tok(
       batch: jax.Array | int, s: jax.Array | int, t: int
@@ -164,7 +163,7 @@ def _kernel(
           jnp.broadcast_to(batch_weights[t * K + k], (chunks, lanes)),
           jnp.bfloat16,
       )
-      weighted_row = pltpu.bitcast(slot[t, k], jnp.bfloat16) * weight
+      weighted_row = slot[t, k] * weight
       weighted_row = jnp.where(weight != 0, weighted_row, 0)
       acc = weighted_row if acc is None else acc + weighted_row
     assert acc is not None
@@ -186,7 +185,7 @@ def _kernel(
     s_fetch = lax.rem(next_b.astype(jnp.uint32), slots_u32)
 
     # Step 2: Wait for input DMA of current slot and output DMA of reused slot.
-    some = rows_hbm.at[pl.ds(0, n_valid_smem[s])]
+    some = slots_flat.at[s, pl.ds(0, n_valid_smem[s])]
     pltpu.make_async_copy(some, some, sem_rows.at[s]).wait()
     out_wait = jnp.where(batch >= cfg.slots, tpb, 0)
     pltpu.make_async_copy(
@@ -197,7 +196,7 @@ def _kernel(
 
     # Step 3: Reduce top-k picks for token pairs while issuing prefetch DMAs,
     # and pack transposed token pairs into the staging buffer.
-    slot = slots.at[s]
+    slot = slots.at[s].reshape(tpb, K, chunks * packing, lanes)
     out_slot = outs.at[s]
     batch_weights = w_smem.at[pl.ds(batch * (tpb * K), tpb * K)]
     n_valid = 0
@@ -337,8 +336,8 @@ def output_reduce_unpack(
       mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=1),
       scratch_types=dict(
           slots=pltpu.VMEM(
-              (cfg.slots, cfg.tpb, topk, cfg.chunks, cfg.lanes),
-              jnp.uint32,
+              (cfg.slots, cfg.tpb, topk, cfg.chunks, cfg.packing, cfg.lanes),
+              rows.dtype,
           ),
           outs=pltpu.VMEM((cfg.slots, cfg.tpb, cfg.hidden_size), out_dtype),
           stage=pltpu.VMEM(

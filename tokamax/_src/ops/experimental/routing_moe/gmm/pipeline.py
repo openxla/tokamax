@@ -120,22 +120,24 @@ def inner_pipeline(
 
 
 def outer_pipeline(
-    metadata_ref: metadata.SortedMetadataRef,
+    metadata_in_ref: metadata.MetadataInputs[hijax.TransformedRef],
     in_hbm_ref: memory_ref.PipelineInputs[hijax.TransformedRef],
     out_hbm_ref: hijax.TransformedRef,
+    metadata_ref: metadata.SortedMetadataRef,
     *,
     cfg: config.RoutingGmmConfig,
 ) -> None:
   """Allocates scoped buffers and schedules the routing GMM pipeline.
 
   Args:
-    metadata_ref: SMEM metadata reference for routing and tile scheduling.
+    metadata_in_ref: SMEM references for inputs required for metadata compute.
     in_hbm_ref: HBM references for the pipelined kernel inputs.
     out_hbm_ref: HBM reference for the kernel output.
+    metadata_ref: SMEM scratch reference for routing and tile scheduling.
     cfg: Static configuration for the routing GMM kernel.
   """
 
-  num_gm = metadata_ref.fill_metadata_and_return_num_gm()
+  num_gm = metadata_ref.fill_metadata_and_return_num_gm(metadata_in_ref)
 
   allocs = memory_ref.PipelineAllocs.create(
       in_hbm_ref, out_hbm_ref, metadata_ref, cfg

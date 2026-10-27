@@ -167,13 +167,13 @@ def routing_gmm(
   )
 
   row_group_i32 = None if row_group is None else row_group.astype(jnp.int32)
-  metadata_obj = metadata.create_metadata_ref(
+  metadata_in, metadata_scratch = metadata.create_metadata(
       group_cum_sum, group_offset, cfg, row_group=row_group_i32
   )
 
   # Step 4: Specify memory space.
   inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
-  metadata_obj = memory_ref.map_memory_constraint(metadata_obj, pltpu.SMEM)
+  metadata_in = memory_ref.map_memory_constraint(metadata_in, pltpu.SMEM)
   out = memory_ref.map_memory_constraint(
       jnp.empty(cfg.out.spec.compact_shape, cfg.out.spec.dtype), pltpu.HBM
   )
@@ -186,6 +186,7 @@ def routing_gmm(
       functools.partial(pipeline.outer_pipeline, cfg=cfg),
       mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=num_cores),
       out_type=out,
+      scratch_types=(metadata_scratch,),
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=cfg.plan.vmem_limit_bytes,
           disable_bounds_checks=True,
@@ -196,5 +197,5 @@ def routing_gmm(
           flags={"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True},
       ),
       name=cfg.kernel_name,
-  )(metadata_obj, inputs)
+  )(metadata_in, inputs)
   return arg.ActivationWrapper(data=out_data, scale=None, spec=cfg.out.spec)
