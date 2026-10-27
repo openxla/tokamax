@@ -57,7 +57,7 @@ def reorder_concatenated_tensor_for_sharding(
 
 
 def gen_moe_inputs(
-    dtype: jnp.dtype,
+    dtype: jax.typing.DTypeLike,
     num_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -141,7 +141,9 @@ def gen_moe_inputs(
   )
 
 
-def sub_channel_quantize(x: jax.Array, quant_dtype: jnp.dtype, wsz: int = 256):
+def sub_channel_quantize(
+    x: jax.Array, quant_dtype: jax.typing.DTypeLike, wsz: int = 256
+):
   """Quantizes x with sub-channel quantization on the 2nd minor."""
   if jnp.issubdtype(quant_dtype, jnp.floating):
     dtype_info = jnp.finfo(quant_dtype)
@@ -192,7 +194,7 @@ class MoEKernelTest(parameterized.TestCase):
       renormalize_topk_logits: bool,
       active_expert_ratio: float = 1.0,
       act_fn: str = "silu",
-      w_dtype: jnp.dtype | None = None,
+      w_dtype: jax.typing.DTypeLike | None = None,
       subc_quant_wsz: int | None = None,
       has_bias: bool = False,
       has_shared_expert: bool = False,
@@ -315,6 +317,7 @@ class MoEKernelTest(parameterized.TestCase):
       w1 = jax.device_put(w1, tp_w1_sharding)
       w2 = jax.device_put(w2, tp_w2_sharding)
       if w_dtype is not None:
+        assert w2_scale is not None
         tp_w2_scale_sharding = (
             replicated_sharding
             if w2_scale.shape[1] == 1

@@ -44,7 +44,7 @@ class ActivationSpec:
   dtype: jnp.dtype
   quant: QuantSpec | None = None
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     if self.quant is not None and self.col_size % self.quant.block_size != 0:
       raise ValueError(
           f"quant block_size ({self.quant.block_size}) must divide col_size"
@@ -75,7 +75,7 @@ class WeightSpec:
   # Columns hold the gate and up weights concatenated, each out_size // 2 wide.
   fused_gate_up: bool = False
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     if self.quant is not None and self.in_size % self.quant.block_size != 0:
       raise ValueError(
           f"quant block_size ({self.quant.block_size}) must divide in_size"
@@ -123,7 +123,7 @@ class ActivationWrapper[T]:
   scale: T | None
   spec: ActivationSpec = dataclasses.field(metadata=dict(static=True))
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     # Skip validation for non jax.Array.
     if not isinstance(self.data, jax.Array):
       return
@@ -154,7 +154,7 @@ class SingleWeightWrapper[T]:
   bias: T | None
   spec: WeightSpec = dataclasses.field(metadata=dict(static=True))
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     if not isinstance(self.weight, jax.Array):
       return
     if self.weight.shape != self.spec.shape:
@@ -199,7 +199,7 @@ class RoutingWrapper[T]:
   indices: T
   spec: RoutingSpec = dataclasses.field(metadata=dict(static=True))
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     if not isinstance(self.indices, jax.Array):
       return
     if self.indices.ndim != 1 or self.indices.shape[0] != self.spec.num_indices:

@@ -20,6 +20,7 @@ sharding. Unset fields are resolved by heuristics.
 """
 
 import dataclasses
+from typing import Self
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -41,7 +42,7 @@ class ResolvedMoEPlan(RoutingMoEPlan):
   remote_scatter: bool
 
   @classmethod
-  def create(cls, plan: RoutingMoEPlan | None):
+  def create(cls, plan: RoutingMoEPlan | None) -> Self:
     """Fills unset plan fields with heuristics."""
     if plan is None:
       plan = RoutingMoEPlan()

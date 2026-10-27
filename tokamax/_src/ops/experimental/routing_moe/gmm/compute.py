@@ -76,8 +76,8 @@ def matmul(
     w_bias: jax.Array | None,
     *,
     tpu_info: pltpu.TpuInfo,
-    is_last_k_step=True,
-    is_first_k_step=True,
+    is_last_k_step: bool = True,
+    is_first_k_step: bool = True,
 ) -> jax.Array:
   """Perform stateless matrix multiplication for a given arguments."""
 

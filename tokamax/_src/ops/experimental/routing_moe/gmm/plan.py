@@ -21,6 +21,7 @@ or placement. Unset fields are resolved by heuristics.
 
 import dataclasses
 import functools
+from typing import Self
 
 import jax
 from jax.experimental import pallas as pl
@@ -41,10 +42,10 @@ class RoutingGmmPlan:
   num_xo_buffers: int | None = None
   num_w_buffers: int | None = None
   # Accumulator dtype across quantization blocks and K tiles.
-  acc_dtype: jnp.dtype | None = None
+  acc_dtype: jax.typing.DTypeLike | None = None
   # Dtype in which inputs are fed to the MXU. Performs dynamic quantization if
   # the dtype does not match with storage dtype.
-  matmul_dtype: jnp.dtype | None = None
+  matmul_dtype: jax.typing.DTypeLike | None = None
   # Block size if dynamic quantization is performed.
   x_quant_block_size: int | None = None
   # Whether gate/up and down projections run in one fused kernel when w2 is set.
@@ -115,13 +116,13 @@ class ResolvedGmmPlan(RoutingGmmPlan):
       *,
       x: arg.ActivationSpec,
       w: tuple[arg.WeightSpec, ...],
-      out_dtype: jnp.dtype | None = None,
+      out_dtype: jax.typing.DTypeLike | None = None,
       size_out_m: int,
       size_global_groups: int,
       size_k: int,
       size_out_n: int,
       tpu_info: pltpu.TpuInfo,
-  ):
+  ) -> Self:
     """Fills unset plan fields with heuristics."""
     assert len(w) in (1, 2)
     if plan is None:
@@ -130,7 +131,7 @@ class ResolvedGmmPlan(RoutingGmmPlan):
     # A pre-quantized x already fixes the MXU dtype. Otherwise w's storage
     # dtype is used so that both operands enter the MXU in the same dtype.
     if plan.matmul_dtype is not None:
-      matmul_dtype = plan.matmul_dtype
+      matmul_dtype = jnp.dtype(plan.matmul_dtype)
     elif x.quant is None and w[0].quant is not None:
       # TODO: Support mixed precision and choose by hardware support.
       matmul_dtype = w[0].dtype
@@ -141,9 +142,10 @@ class ResolvedGmmPlan(RoutingGmmPlan):
       # TODO: Choose different block size based on HW.
       x_quant_block_size = 512
 
-    acc_dtype = plan.acc_dtype
-    if acc_dtype is None:
+    if plan.acc_dtype is None:
       acc_dtype = jnp.bfloat16.dtype
+    else:
+      acc_dtype = jnp.dtype(plan.acc_dtype)
 
     skip_metadata_size = plan.skip_metadata_size
     if skip_metadata_size is None:
@@ -188,7 +190,7 @@ class ResolvedGmmPlan(RoutingGmmPlan):
           w2=w[1],
           matmul_dtype=matmul_dtype,
           acc_dtype=acc_dtype,
-          out_dtype=x.dtype if out_dtype is None else out_dtype,
+          out_dtype=x.dtype if out_dtype is None else jnp.dtype(out_dtype),
           size_out_m=size_out_m,
           size_out_n=size_out_n,
           tile_m=tile_m,
@@ -254,14 +256,13 @@ def _vmem_estimate(
   out_vmem = num_xo_buffers * tile_m * out_chunks * chunk_bytes
 
   # Fusion does not support any weight tiling yet.
-  stages = (
-      ((w, tile_k, tile_n, size_out_n),)
-      if w2 is None
-      else (
-          (w, w.in_size, w2.in_size, w2.in_size),
-          (w2, w2.in_size, w2.out_size, size_out_n),
-      )
-  )
+  if w2 is None:
+    stages = ((w, tile_k, tile_n, size_out_n),)
+  else:
+    stages = (
+        (w, w.in_size, w2.in_size, w2.in_size),
+        (w2, w2.in_size, w2.out_size, size_out_n),
+    )
   w_vmem = 0
   scale_vmem = 0
   acc_vmem = 0

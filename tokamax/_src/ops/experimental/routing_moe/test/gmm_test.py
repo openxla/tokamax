@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import itertools
 import math
 
 from absl import logging
@@ -98,8 +99,7 @@ SKIP_METADATA_SHAPES = [
         testcase_name=f"{shape['testcase_name']}_skip{skip}",
         skip_metadata_size=skip,
     )
-    for shape in DECODE_SHAPES
-    for skip in (0, 1, 2, 63, 1024)
+    for shape, skip in itertools.product(DECODE_SHAPES, (0, 1, 2, 63, 1024))
 ]
 
 LIVE_GROUP_WALK_SHAPES = (
@@ -291,7 +291,7 @@ class RoutingGmmTest(parameterized.TestCase):
         / 10
     )
     self.rhs_q, rhs_scale = gmm_util.quantize_tensor(
-        self.rhs, jnp.float8_e4m3fn, axis=1, block_size=size_k
+        self.rhs, jnp.float8_e4m3fn.dtype, axis=1, block_size=size_k
     )
     self.rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
     # Down projection from the activated gate/up output back to size_k.
@@ -302,7 +302,7 @@ class RoutingGmmTest(parameterized.TestCase):
         / 10
     )
     self.rhs2_q, rhs2_scale = gmm_util.quantize_tensor(
-        self.rhs2, jnp.float8_e4m3fn, axis=1, block_size=size_n // 2
+        self.rhs2, jnp.float8_e4m3fn.dtype, axis=1, block_size=size_n // 2
     )
     self.rhs2_scale = jnp.expand_dims(rhs2_scale, axis=2)
 
@@ -638,7 +638,8 @@ class RoutingGmmTest(parameterized.TestCase):
   ):
     del testcase_name
     stages = self._live_group_walk_stages(**shape)
-    for x, w, kwargs, rows in stages.values():
+    for stage in stages.values():
+      x, w, kwargs, rows = stage
       actual, expected = (
           gmm.routing_gmm(
               x,

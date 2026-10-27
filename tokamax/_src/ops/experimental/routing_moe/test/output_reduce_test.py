@@ -96,7 +96,7 @@ class OutputReduceTest(parameterized.TestCase):
       ep_size: int = 1,
       active_expert_ratio: float = 1.0,
       renormalize_topk_logits: bool = True,
-      out_dtype: jnp.dtype = jnp.bfloat16,
+      out_dtype: jax.typing.DTypeLike = jnp.bfloat16,
       seed: int = 1234,
       atol: float | None = None,
       rtol: float = 2e-2,

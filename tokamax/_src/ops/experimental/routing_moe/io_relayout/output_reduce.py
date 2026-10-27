@@ -17,7 +17,9 @@
 
 import dataclasses
 import functools
+import json
 import math
+from typing import Self
 
 import jax
 from jax import lax
@@ -39,8 +41,8 @@ class Config:
   nb: int
   tpb: int
   tpu_info: pltpu.TpuInfo
-  out_dtype: jax.typing.DTypeLike = jnp.bfloat16
-  acc_dtype: jax.typing.DTypeLike = jnp.bfloat16
+  out_dtype: jnp.dtype = jnp.bfloat16.dtype
+  acc_dtype: jnp.dtype = jnp.bfloat16.dtype
   max_tpb: int = 128
   tile: int = 16
   slots: int = 3
@@ -56,8 +58,11 @@ class Config:
       chunks: int,
       out_dtype: jax.typing.DTypeLike = jnp.bfloat16,
       acc_dtype: jax.typing.DTypeLike = jnp.bfloat16,
-  ):
-    if jnp.dtype(acc_dtype) != jnp.bfloat16:
+  ) -> Self:
+    """Derives batching parameters and validates SMEM capacity."""
+    out_dtype = jnp.dtype(out_dtype)
+    acc_dtype = jnp.dtype(acc_dtype)
+    if acc_dtype != jnp.bfloat16:
       raise NotImplementedError(
           f"Only bfloat16 acc_dtype is supported, got {acc_dtype}."
       )
@@ -112,6 +117,19 @@ class Config:
   def kernel_name(self) -> str:
     return f"output_reduce-k_{self.topk}-h_{self.hidden_size}"
 
+  @property
+  def kernel_metadata(self) -> dict[str, str]:
+    """The JSON-serialized config metadata for XProf."""
+
+    def to_json(obj: object) -> object:
+      if isinstance(obj, pltpu.TpuInfo):
+        return str(obj.chip_version)
+      if dataclasses.is_dataclass(obj):
+        return vars(obj)
+      return str(obj)
+
+    return {"xprof_metadata": json.dumps(self, default=to_json)}
+
 
 def _kernel(
     k_lo_smem: hijax.TransformedRef,
@@ -128,15 +146,17 @@ def _kernel(
     cfg: Config,
 ) -> None:
   """Three slots: batch b is reduced from slot b % 3 while batch b + 2 is fetched."""
-  K, chunks, nb, tpb = cfg.topk, cfg.chunks, cfg.nb, cfg.tpb
+  topk, chunks, nb, tpb = cfg.topk, cfg.chunks, cfg.nb, cfg.tpb
   lanes, packing, stride = cfg.lanes, cfg.packing, cfg.stride
 
   slots = pltpu.annotate(slots, no_hazard_no_deps=True)
   outs = pltpu.annotate(outs, no_hazard_no_deps=True)
   stage = pltpu.annotate(stage, no_hazard_no_deps=True)
   sem_rows, sem_out = sems.at[0], sems.at[1]
-  rows = rows_hbm.reshape(rows_hbm.shape[0] // K, K, chunks, packing, lanes)
-  slots_flat = slots.reshape(cfg.slots, tpb * K, chunks, packing, lanes)
+  rows = rows_hbm.reshape(
+      rows_hbm.shape[0] // topk, topk, chunks, packing, lanes
+  )
+  slots_flat = slots.reshape(cfg.slots, tpb * topk, chunks, packing, lanes)
 
   def fetch_tok(
       batch: jax.Array | int, s: jax.Array | int, t: int
@@ -158,9 +178,9 @@ def _kernel(
   ) -> jax.Array:
     """Weighted sum across top-k picks for token t."""
     acc = None
-    for k in range(K):
+    for k in range(topk):
       weight = pltpu.bitcast(
-          jnp.broadcast_to(batch_weights[t * K + k], (chunks, lanes)),
+          jnp.broadcast_to(batch_weights[t * topk + k], (chunks, lanes)),
           jnp.bfloat16,
       )
       weighted_row = slot[t, k] * weight
@@ -196,9 +216,9 @@ def _kernel(
 
     # Step 3: Reduce top-k picks for token pairs while issuing prefetch DMAs,
     # and pack transposed token pairs into the staging buffer.
-    slot = slots.at[s].reshape(tpb, K, chunks * packing, lanes)
+    slot = slots.at[s].reshape(tpb, topk, chunks * packing, lanes)
     out_slot = outs.at[s]
-    batch_weights = w_smem.at[pl.ds(batch * (tpb * K), tpb * K)]
+    batch_weights = w_smem.at[pl.ds(batch * (tpb * topk), tpb * topk)]
     n_valid = 0
     for t0 in range(0, tpb, packing):
       acc0_u32 = reduce_tok(slot, batch_weights, t0)
@@ -331,7 +351,7 @@ def output_reduce_unpack(
   out = pl.kernel(
       functools.partial(_kernel, cfg=cfg),
       out_type=jax.ShapeDtypeStruct(
-          (cfg.nb * cfg.tpb, cfg.hidden_size), out_dtype
+          (cfg.nb * cfg.tpb, cfg.hidden_size), cfg.out_dtype
       ),
       mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=1),
       scratch_types=dict(
@@ -339,7 +359,7 @@ def output_reduce_unpack(
               (cfg.slots, cfg.tpb, topk, cfg.chunks, cfg.packing, cfg.lanes),
               rows.dtype,
           ),
-          outs=pltpu.VMEM((cfg.slots, cfg.tpb, cfg.hidden_size), out_dtype),
+          outs=pltpu.VMEM((cfg.slots, cfg.tpb, cfg.hidden_size), cfg.out_dtype),
           stage=pltpu.VMEM(
               (cfg.packing * cfg.chunks * cfg.stride, cfg.lanes),
               jnp.uint32,
@@ -352,5 +372,6 @@ def output_reduce_unpack(
           vmem_limit_bytes=cfg.tpu_info.vmem_capacity_bytes,
       ),
       name=cfg.kernel_name,
+      metadata=cfg.kernel_metadata,
   )(k_lo, span, w_u32, rows)
   return out[:num_tokens] if cfg.pad_t else out

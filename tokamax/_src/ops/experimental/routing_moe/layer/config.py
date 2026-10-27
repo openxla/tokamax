@@ -17,6 +17,7 @@
 
 import dataclasses
 import enum
+from typing import Self
 
 from jax import sharding
 from tokamax._src.ops.experimental.routing_moe.layer import plan as plan_lib
@@ -63,7 +64,7 @@ class RoutingMoEConfig:
       reduce_output: bool,
       activation: str,
       plan: plan_lib.ResolvedMoEPlan,
-  ):
+  ) -> Self:
     """Assembles the config and validates the plan against layer parameters."""
     if tp_axis is not None and ep_axis is not None:
       raise NotImplementedError("Hybrid parallelism is not yet supported.")

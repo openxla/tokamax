@@ -21,6 +21,8 @@ sizes, and the resolved plans. No execution decision is made by config.
 
 import dataclasses
 import enum
+import json
+from typing import Self
 
 import jax
 from jax.experimental import pallas as pl
@@ -109,7 +111,7 @@ class Dimension:
       scatter: arg.RoutingSpec | None,
       fuse_act: str | None,
       size_ep: int = 1,
-  ):
+  ) -> Self:
     """Validates the specs against each other and derives problem sizes.
 
     `size_ep` is the size of `scatter.remote_axis`, 1 for a local scatter.
@@ -196,9 +198,9 @@ class RoutingGmmConfig:
       gather: arg.RoutingSpec | None,
       scatter: arg.RoutingSpec | None,
       fuse_act: str | None,
-      out_dtype: jnp.dtype | None,
+      out_dtype: jax.typing.DTypeLike | None,
       tpu_info: pltpu.TpuInfo,
-  ):
+  ) -> Self:
     """Assembles the config and validates the plan against specs and HW."""
     if x.quant is not None:
       # TODO: Load pre-computed scales in compute.
@@ -239,7 +241,7 @@ class RoutingGmmConfig:
     out_spec = arg.ActivationSpec(
         row_size=dim.size_out_m // dim.size_ep,
         col_size=dim.size_out_n,
-        dtype=x.dtype if out_dtype is None else out_dtype,
+        dtype=x.dtype if out_dtype is None else jnp.dtype(out_dtype),
     )
 
     def _resolve_mode(routing: arg.RoutingSpec | None) -> RoutingMode:
@@ -336,13 +338,22 @@ class RoutingGmmConfig:
     return num_k
 
   @property
-  def kernel_name(self):
+  def kernel_name(self) -> str:
     name = f"routing_gmm-{self.x.mode}-{self.out.mode}"
     name += f"-g{self.dim.size_local_groups}-m{self.dim.size_out_m}"
     name += f"-k{self.dim.size_k}-n{self.dim.size_out_n}"
     name += f"-tm{self.plan.tile_m}-tn{self.plan.tile_n}"
-    if len(self.stages) > 1:
-      name += "-fused"
-    if self.stages[0].dynamic_quant is not None:
-      name += f"-xq{self.stages[0].dynamic_quant.dtype.name}"
     return name
+
+  @property
+  def kernel_metadata(self) -> dict[str, str]:
+    """The JSON-serialized config metadata for XProf."""
+
+    def to_json(obj: object) -> object:
+      if isinstance(obj, pltpu.TpuInfo):
+        return str(obj.chip_version)
+      if dataclasses.is_dataclass(obj):
+        return vars(obj)
+      return str(obj)
+
+    return {"xprof_metadata": json.dumps(self, default=to_json)}

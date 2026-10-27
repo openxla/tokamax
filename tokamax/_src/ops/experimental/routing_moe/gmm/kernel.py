@@ -46,7 +46,7 @@ def routing_gmm(
     gather: arg.RoutingWrapper[jax.Array] | None = None,
     scatter: arg.RoutingWrapper[jax.Array] | None = None,
     fuse_act: str | None = None,
-    out_dtype: jnp.dtype | None = None,
+    out_dtype: jax.typing.DTypeLike | None = None,
     custom_plan: plan.RoutingGmmPlan | None = None,
 ) -> arg.ActivationWrapper[jax.Array]:
   """GMM that pipelines routing and compute for both input and output.
@@ -91,13 +91,11 @@ def routing_gmm(
       tpu_info=tpu_info,
   )
   if len(w) == 2 and not resolved_plan.fuse_up_and_down:
-    unfused_plan = (
-        None
-        if custom_plan is None
-        else dataclasses.replace(
-            custom_plan, tile_k=None, tile_n=None, fuse_up_and_down=False
-        )
-    )
+    unfused_plan = None
+    if custom_plan is not None:
+      unfused_plan = dataclasses.replace(
+          custom_plan, tile_k=None, tile_n=None, fuse_up_and_down=False
+      )
     gmm1_res = routing_gmm(
         x=x,
         w=(w[0],),
@@ -150,7 +148,9 @@ def routing_gmm(
   # Step 3: Wrap inputs in the pipeline's parameter object. emit_pipeline needs
   # HBM refs and VMEM allocations to share one pytree structure, so the API
   # wrappers are reduced to their data here.
-  def _weight_ref(wrapper: arg.SingleWeightWrapper[jax.Array]):
+  def _weight_ref(
+      wrapper: arg.SingleWeightWrapper[jax.Array],
+  ) -> memory_ref.SingleWeightRef[jax.Array]:
     w_scale = wrapper.scale
     if w_scale is not None:
       w_scale = w_scale.astype(jnp.float32)
@@ -197,5 +197,6 @@ def routing_gmm(
           flags={"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True},
       ),
       name=cfg.kernel_name,
+      metadata=cfg.kernel_metadata,
   )(metadata_in, inputs)
   return arg.ActivationWrapper(data=out_data, scale=None, spec=cfg.out.spec)

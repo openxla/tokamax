@@ -16,9 +16,10 @@
 """Module that encapsulates memory references, BlockSpecs, and DMA logic."""
 
 import abc
+from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, override
+from typing import Any, Self, override
 
 import jax
 from jax import lax
@@ -34,7 +35,7 @@ from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 GridIndices = tuple[jax.Array | int, jax.Array | int, jax.Array | int]
 
 
-def map_memory_constraint(obj, memory_space):
+def map_memory_constraint[T](obj: T, memory_space: Any) -> T:
   return jax.tree.map(
       lambda x: pltpu.with_memory_space_constraint(x, memory_space), obj
   )
@@ -114,7 +115,7 @@ class _BypassBufferedRef(pltpu.BufferedRef):
   # NOTE: This is extremely hacky and only here until JAX version update
   # arrives which WILL eliminate the need for this hack.
   # TODO: Remove this after JAX version update.
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     # pallas doesn't allow you to set buffer_count > 2 for output refs, so
     # we override to bypass this check.
     pass
@@ -133,7 +134,7 @@ class RoutingBufferedRef(_BypassBufferedRef):
 
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
 
-  def bind_idx_ref(self, idx_bref):
+  def bind_idx_ref(self, idx_bref: pltpu.BufferedRef) -> Self:
     return dataclasses.replace(self, idx_ref=idx_bref.window_ref)
 
   @classmethod
@@ -142,8 +143,8 @@ class RoutingBufferedRef(_BypassBufferedRef):
       *args: Any,
       metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
-      **kwargs,
-  ):
+      **kwargs: Any,
+  ) -> Self:
     standard_ref = _BypassBufferedRef.create(*args, **kwargs)
     return cls(
         metadata_ref=metadata_ref,
@@ -270,8 +271,8 @@ class IndexBufferedRef(pltpu.BufferedRef):
       cfg: config.RoutingGmmConfig,
       metadata_ref: metadata.AbstractMetadataRef,
       fetch_offset: int,
-      **kwargs,
-  ):
+      **kwargs: Any,
+  ) -> Self:
     standard_ref = pltpu.BufferedRef.create(*args, **kwargs)
     return cls(
         metadata_ref=metadata_ref,
@@ -313,7 +314,9 @@ class IndexBufferedRef(pltpu.BufferedRef):
     return aligned_start, aligned_buffer_start, aligned_end - aligned_start
 
   @override
-  def copy_in(self, idx_hbm_ref, grid_indices):
+  def copy_in(
+      self, idx_hbm_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     assert self.is_input
     assert len(grid_indices) == 3
     sem_recvs = self.sem_recvs
@@ -333,7 +336,9 @@ class IndexBufferedRef(pltpu.BufferedRef):
     ).start()
 
   @override
-  def wait_in(self, idx_hbm_ref, grid_indices):
+  def wait_in(
+      self, idx_hbm_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     assert self.is_input
     assert len(grid_indices) == 3
     sem_recvs = self.sem_recvs
@@ -484,7 +489,9 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     copied = dst_ref.at[pl.ds(0, rows_ds.size), cols_ds]
     pltpu.make_async_copy(copied, copied, self.sem_sends.at[slot]).wait()
 
-  def _no_op(self, ref, grid_indices):
+  def _no_op(
+      self, ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     del ref, grid_indices
 
   copy_in = copy_out = wait_in = wait_out = _no_op
@@ -635,8 +642,12 @@ class PipelineBlockSpecs:
   index_map_provider: PipelineIndexMaps
 
   def _act_spec(
-      self, hbm_shape: tuple[int, ...], num_tiles: int, index_map
+      self,
+      hbm_shape: tuple[int, ...],
+      num_tiles: int,
+      index_map: Callable[..., tuple[pl.Slice, pl.Slice, int, int]],
   ) -> pl.BlockSpec:
+    """Builds the VMEM BlockSpec for a compact activation tensor."""
     tile_chunks = hbm_shape[1] // num_tiles
     num_tile_chunks = layout_util.to_bank_conflict_aware_stride(tile_chunks)
     block_shape = (
@@ -736,9 +747,7 @@ class PipelineInputs[T]:
   gather_idx: T | None = None
   scatter_idx: T | None = None
 
-  def transform_for_pipeline(
-      self, cfg: config.RoutingGmmConfig
-  ):
+  def transform_for_pipeline(self, cfg: config.RoutingGmmConfig) -> Self:
     """Returns inputs with weights sliced for fused gate/up activation."""
 
     w_fused_list = []
@@ -777,7 +786,7 @@ class PipelineAllocs:
       out_hbm_ref: hijax.TransformedRef,
       metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
-  ):
+  ) -> Self:
     """Creates BufferedRef allocations for all pipeline inputs and outputs.
 
     Args:

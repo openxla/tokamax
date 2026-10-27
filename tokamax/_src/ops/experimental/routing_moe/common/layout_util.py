@@ -15,6 +15,7 @@
 
 """Functions relevant to layouts. See https://openxla.org/xla/tiled_layout."""
 
+from collections.abc import Sequence
 import jax
 from jax.experimental import hijax
 from jax.experimental.pallas import tpu as pltpu
@@ -34,7 +35,7 @@ def get_uint_dtype(itemsize: int) -> jnp.dtype:
 
 
 def to_compact_shape(
-    large_shape: tuple[int, int], dtype: jnp.dtype, lanes: int = 128
+    large_shape: Sequence[int], dtype: jax.typing.DTypeLike, lanes: int = 128
 ) -> tuple[int, int, int, int]:
   """Returns compact layout shape of a given large layout shape."""
   assert len(large_shape) == 2
@@ -47,7 +48,7 @@ def to_compact_shape(
   return (rows, cols // (packing * lanes), packing, lanes)
 
 
-def to_large_shape(compact_shape: tuple[int, int, int, int]) -> tuple[int, int]:
+def to_large_shape(compact_shape: Sequence[int]) -> tuple[int, int]:
   """Returns large layout shape of a given compact layout shape."""
   assert len(compact_shape) == 4
   rows, chunks, packing, lanes = compact_shape
@@ -108,7 +109,7 @@ def load_compact_to_large(
   return jnp.concat(chunks, axis=-1)
 
 
-def store_large_to_compact(vmem: hijax.TransformedRef, vreg: jax.Array):
+def store_large_to_compact(vmem: hijax.TransformedRef, vreg: jax.Array) -> None:
   """Strided store a large layout VREG into compact layout VMEM."""
 
   dtype = vmem.dtype

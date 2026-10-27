@@ -16,9 +16,10 @@
 """Module that encapsulates metadata used for DMA and scheduling."""
 
 import abc
+from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, Callable
+from typing import Any
 
 import jax
 from jax import lax
@@ -156,8 +157,8 @@ class SortedMetadataRef(AbstractMetadataRef):
         offset: jax.Array,
         *,
         local_group_id: jax.Array,
-        end: jax.Array
-    ):
+        end: jax.Array,
+    ) -> jax.Array:
       num_rows = jnp.minimum(end - offset, self.cfg.plan.tile_m)
       self.gm_id_to_group_id[gm_id] = local_group_id
       self.gm_id_to_m_offset[gm_id] = offset
@@ -165,7 +166,7 @@ class SortedMetadataRef(AbstractMetadataRef):
       return offset + num_rows
 
     @jax.named_scope("write_group")
-    def write_group(group_id: jax.Array, num_gm: jax.Array):
+    def write_group(group_id: jax.Array, num_gm: jax.Array) -> jax.Array:
       start = metadata_in.group_cum_sum[group_id]
       end = metadata_in.group_cum_sum[group_id + 1]
       next_num_gm = num_gm + pl.cdiv(end - start, self.cfg.plan.tile_m)
@@ -194,7 +195,9 @@ class SortedMetadataRef(AbstractMetadataRef):
     # Walk the groups, but skip over "skip" consecutive empty elements.
     skip = self.cfg.plan.skip_metadata_size
 
-    def step(carry):
+    def step(
+        carry: tuple[jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array]:
       group_id, num_gm = carry
       ahead = jnp.minimum(group_id + skip + 1, group_end)
       empty = (
