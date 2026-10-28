@@ -41,9 +41,7 @@ def skip_unless_supported(
     test_case.skipTest(f"Requires at least {min_devices} devices.")
 
 
-def check_gmm_supported(
-    case: helper_cases.Case, *, live_group_walk: bool = False
-) -> None:
+def check_gmm_supported(case: helper_cases.Case) -> None:
   """Skips the test if `case` uses features unsupported by `routing_gmm`."""
   if case.shape.has_bias:
     raise absltest.SkipTest("TODO: Support bias in routing_moe.")
@@ -51,11 +49,6 @@ def check_gmm_supported(
     raise absltest.SkipTest(
         "TODO: Fix gmm/plan.py raising error if intermediate is not"
         " multiple of 256 even when up & down can be fused."
-    )
-  if live_group_walk and case.num_tokens >= 65536:
-    raise absltest.SkipTest(
-        "TODO: live_group_walk places row_group in SMEM, which overflows"
-        " at 64k tokens."
     )
 
 

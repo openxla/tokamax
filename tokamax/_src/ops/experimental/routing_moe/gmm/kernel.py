@@ -157,6 +157,7 @@ def routing_gmm(
       num_global_groups=group_sizes.size,
       fuse_act=fuse_act,
       size_ep=size_ep,
+      size_row_group=0 if row_group is None else row_group.size,
   )
   resolved_out_format = out_format_lib.ResolvedActivationFormat.create(
       out_format,

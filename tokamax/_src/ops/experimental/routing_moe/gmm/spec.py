@@ -95,6 +95,8 @@ class RoutingGmmSpec:
   fuse_act: str | None
   # Devices that output rows are split across by a remote scatter.
   size_ep: int
+  # Length of the `row_group` input, 0 when it is not given.
+  size_row_group: int
 
   def __post_init__(self) -> None:
     if self.x.col_size != self.w.in_size:
