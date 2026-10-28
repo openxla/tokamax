@@ -573,8 +573,8 @@ def _fwd(
     bias: Float[Array, "#H #T #t"] | None,
     mask: Bool[Array, "#H #T #t"] | Bool[Array, "#h #T #t"] | None,
     dropout_mask: Bool[Array, "#H #T #t"] | None,
-    q_start: Int[Array, "#H #t"] | None,
-    q_end: Int[Array, "#H #t"] | None,
+    q_start: Int[Array, "1 1"] | None,
+    q_end: Int[Array, "1 1"] | None,
     k_start: Int[Array, "#H #T"] | Int[Array, "#h #T"] | None,
     k_end: Int[Array, "#H #T"] | Int[Array, "#h #T"] | None,
     *,
@@ -765,6 +765,11 @@ def _broadcast_to_rank(x, rank):
   return None if x is None else jax.lax.broadcast_to_rank(x, rank)
 
 
+def _is_per_batch_scalar(x):
+  """Returns whether `x` holds a single value per batch element."""
+  return x is not None and x.size > 0 and math.prod(x.shape[-2:]) == 1
+
+
 def _decompose_mask(mask, q, k, q_indices, k_indices):
   """Decomposes `mask` into a mask array, `is_causal` and {k,q}_{start,end}."""
   if mask is None:
@@ -780,10 +785,10 @@ def _decompose_mask(mask, q, k, q_indices, k_indices):
   if k_indices is None:
     mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
     if q_indices is None:
-      if mask.q_start is not None and mask.q_start.size == 1:
+      if _is_per_batch_scalar(mask.q_start):
         mask, q_start = mask.take("q_start")
         q_start = _broadcast_to_rank(q_start, 2)
-      if mask.q_end is not None and mask.q_end.size == 1:
+      if _is_per_batch_scalar(mask.q_end):
         mask, q_end = mask.take("q_end")
         q_end = _broadcast_to_rank(q_end, 2)
 
