@@ -26,19 +26,35 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-# Native lane count; the roped channels are the tail of the last lane block.
+# Native lane and sublane counts; the roped channels are the tail of the last
+# lane block.
 LANE = 128
+SUBLANE = 8
 
 # Upstream's limit. Mosaic caps it at the VMEM capacity (64 MiB on TPU7x).
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
-def largest_divisor(x: int, cap: int) -> int:
-  """Largest divisor of ``x`` that is <= ``cap``."""
+def largest_divisor(x: int, cap: int, *, multiple_of: int = 1) -> int:
+  """Largest divisor of ``x`` up to ``cap`` and divisible by ``multiple_of``."""
   for candidate in range(min(x, cap), 0, -1):
-    if x % candidate == 0:
+    if x % candidate == 0 and candidate % multiple_of == 0:
       return candidate
   return 1
+
+
+def default_tile_n(
+    num_tokens: int, *, cap: int = 128, sublane_aligned: bool = False
+) -> int:
+  """Default ``tile_n`` for ``num_tokens`` tokens.
+
+  Returns the largest divisor of ``num_tokens`` up to ``cap``. When
+  ``sublane_aligned`` is true and ``num_tokens > cap`` (more than one tile),
+  prefers the largest divisor up to ``cap`` divisible by ``SUBLANE``.
+  """
+  if sublane_aligned and num_tokens > cap and num_tokens % SUBLANE == 0:
+    return largest_divisor(num_tokens, cap=cap, multiple_of=SUBLANE)
+  return largest_divisor(num_tokens, cap=cap)
 
 
 def dtype_max(dtype: jax.typing.DTypeLike) -> float:
@@ -456,7 +472,9 @@ def _rope_call(
     )
 
   if tile_n is None:
-    tile_n = largest_divisor(num_tokens, cap=128)
+    tile_n = default_tile_n(
+        num_tokens, sublane_aligned=x.ndim == 2 or quant_dtype is not None
+    )
   assert num_tokens % tile_n == 0
 
   x_block_shape = (

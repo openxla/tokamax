@@ -259,6 +259,19 @@ class PallasMosaicTpuKernelTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "head_dim"):
       pallas_mosaic_tpu_kernel.rope_quant(x, positions, cos_sin_cache)
 
+  @parameterized.parameters(jnp.float32, jnp.bfloat16)
+  def test_rope_rank_2_default_tile_n_sublane_aligned(self, dtype):
+    """368 tokens (16 * 23): `tile_n=None` picks 16 rather than unaligned 92."""
+    self.assertEqual(
+        pallas_mosaic_tpu_kernel.default_tile_n(368, sublane_aligned=True), 16
+    )
+    x, positions, cos_sin_cache = test_base.make_inputs((368, 512), dtype)
+    expected = reference.rope(x, positions, cos_sin_cache)
+    actual = pallas_mosaic_tpu_kernel.rope(
+        x, positions, cos_sin_cache, tile_n=None
+    )
+    _assert_close(actual, expected)
+
 
 if __name__ == "__main__":
   absltest.main()

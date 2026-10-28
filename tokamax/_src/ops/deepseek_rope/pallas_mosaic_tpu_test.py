@@ -68,6 +68,7 @@ class PallasTpuDeepseekRopeTest(test_base.DeepseekRopeTestBase):
   @parameterized.parameters(
       ("rope", (256, 64, 512), jnp.float32),
       ("rope", (1024, 512), jnp.float32),
+      ("rope", (368, 512), jnp.bfloat16),
       ("rope", (96, 8, 256), jnp.bfloat16),
       ("qnorm_rope", (256, 128, 512), jnp.bfloat16),
       ("qnorm_rope", (96, 64, 512), jnp.bfloat16),
@@ -153,6 +154,34 @@ class PallasTpuDeepseekRopeTest(test_base.DeepseekRopeTestBase):
       op = op.replace(config=pallas_mosaic_tpu.Config(tile_n=tile_n))
     with self.assertRaisesRegex(NotImplementedError, "multiple of 128"):
       op(x, positions, cos_sin_cache, mode="rope_quant")
+
+  def test_rank_2_rope_sublane_aligned_heuristic(self):
+    """368 tokens (16 * 23): rank-2 `rope` picks `tile_n=16` instead of 92."""
+    x, positions, cos_sin_cache = test_base.make_inputs(
+        (368, 512), jnp.bfloat16
+    )
+    op = pallas_mosaic_tpu.PallasTpuDeepseekRope()
+    ba = op.bind(x, positions, cos_sin_cache, mode="rope")
+    self.assertEqual(
+        op._get_heuristics_config(ba),  # pylint: disable=protected-access
+        pallas_mosaic_tpu.Config(tile_n=16),
+    )
+    expected = reference.rope(x, positions, cos_sin_cache)
+    out = op(x, positions, cos_sin_cache, mode="rope")
+    _check_output("rope", out, expected)
+
+  @parameterized.parameters(
+      dict(num_tokens=130, tile_n=None), dict(num_tokens=96, tile_n=12)
+  )
+  def test_unaligned_rank_2_rope_not_implemented(self, num_tokens, tile_n):
+    x, positions, cos_sin_cache = test_base.make_inputs(
+        (num_tokens, 512), jnp.bfloat16
+    )
+    op = pallas_mosaic_tpu.PallasTpuDeepseekRope()
+    if tile_n is not None:
+      op = op.replace(config=pallas_mosaic_tpu.Config(tile_n=tile_n))
+    with self.assertRaisesRegex(NotImplementedError, "multiple of 8"):
+      op(x, positions, cos_sin_cache, mode="rope")
 
 
 def base_fn(mode):

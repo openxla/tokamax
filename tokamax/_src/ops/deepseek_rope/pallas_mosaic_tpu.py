@@ -26,8 +26,10 @@ from tokamax._src.ops.deepseek_rope import base
 from tokamax._src.ops.deepseek_rope import pallas_mosaic_tpu_kernel
 
 _LANE = pallas_mosaic_tpu_kernel.LANE
-# The autotuner tries `tile_n = largest_divisor(num_tokens, cap)` for each of
-# these caps, besides upstream's heuristic (cap 128, or 64 for `qnorm_rope`).
+_SUBLANE = pallas_mosaic_tpu_kernel.SUBLANE
+# The autotuner tries `tile_n = default_tile_n(num_tokens, cap=cap, ...)` for
+# each of these caps, besides upstream's heuristic (cap 128, or 64 for
+# `qnorm_rope`).
 _TILE_N_CAPS = (8, 16, 32, 64, 128, 256)
 # Candidates whose estimated VMEM use (`_vmem_bytes`) exceeds this are skipped.
 # TPU7x has 64 MiB of VMEM; leave some of it for Mosaic's internal scratch.
@@ -75,11 +77,24 @@ def _rank_2_quant(ba: op.BoundArguments) -> bool:
   return ba.arguments["mode"] == "rope_quant" and ba.arguments["x"].ndim == 2
 
 
-def _default_tile_n(num_tokens: int, mode: base.Mode) -> int:
-  # Upstream's choice: the largest divisor of the number of tokens up to 128,
-  # or up to 64 for `qnorm_rope`, which buffers whole heads.
+def _aligned(tile: int, total: int) -> bool:
+  """Whether Mosaic accepts `tile`-row blocks of a `total`-row array."""
+  return tile % _SUBLANE == 0 or tile == total
+
+
+def _sublane_aligned(mode: base.Mode, rank: int) -> bool:
+  """Whether `mode` at `rank` pipelines a 2D (or 1D) block of `tile_n` rows."""
+  return rank == 2 or mode == "rope_quant"
+
+
+def _default_tile_n(num_tokens: int, mode: base.Mode, rank: int = 3) -> int:
+  # Upstream's choice: the largest divisor of the number of tokens up to 128
+  # (sublane-aligned when a 2D block is pipelined), or up to 64 for
+  # `qnorm_rope`, which buffers whole heads.
   cap = 64 if mode == "qnorm_rope" else 128
-  return pallas_mosaic_tpu_kernel.largest_divisor(num_tokens, cap=cap)
+  return pallas_mosaic_tpu_kernel.default_tile_n(
+      num_tokens, cap=cap, sublane_aligned=_sublane_aligned(mode, rank)
+  )
 
 
 class PallasTpuDeepseekRope(base.DeepseekRope[Config]):
@@ -93,6 +108,9 @@ class PallasTpuDeepseekRope(base.DeepseekRope[Config]):
 
   *   `"qnorm_rope"` with `head_dim == 128`: the kernel concatenates a
       zero-width NoPE part, which Mosaic rejects.
+  *   `"rope"` with a rank 2 `x` or `"rope_quant"` with a rank 3 `x` when
+      `tile_n` is neither a multiple of 8 nor all the tokens: the 2D block's
+      leading axis is its second-minor dimension, which must be sublane aligned.
   *   `"rope_quant"` with a rank 2 `x` and `tile_n` not a multiple of 128: the
       `(tile_n,)` block of the `(num_tokens,)` scales must be lane aligned.
   """
@@ -140,9 +158,20 @@ class PallasTpuDeepseekRope(base.DeepseekRope[Config]):
     Raises:
       NotImplementedError: For the shapes listed in the class docstring.
     """
-    tile_n = None if config is None else config.tile_n
+    num_tokens = x.shape[0]
+    tile_n = (
+        _default_tile_n(num_tokens, mode, x.ndim)
+        if config is None
+        else config.tile_n
+    )
     match mode:
       case "rope":
+        if x.ndim == 2 and not _aligned(tile_n, num_tokens):
+          raise NotImplementedError(
+              f"rope with a rank 2 x requires tile_n ({tile_n}) for"
+              f" {num_tokens} tokens to be a multiple of {_SUBLANE} or all the"
+              " tokens."
+          )
         out = pallas_mosaic_tpu_kernel.rope(
             x, positions, cos_sin_cache, inverse=inverse, tile_n=tile_n
         )
@@ -156,12 +185,16 @@ class PallasTpuDeepseekRope(base.DeepseekRope[Config]):
         )
       case "rope_quant":
         assert quant_dtype is not None  # Canonicalized by `bind`.
-        if tile_n is None:
-          tile_n = _default_tile_n(x.shape[0], mode)
         if x.ndim == 2 and tile_n % _LANE:
           raise NotImplementedError(
               "rope_quant with a rank 2 x requires tile_n to be a multiple of"
               f" {_LANE}, got {tile_n}."
+          )
+        if x.ndim == 3 and not _aligned(tile_n, num_tokens):
+          raise NotImplementedError(
+              f"rope_quant with a rank 3 x requires tile_n ({tile_n}) for"
+              f" {num_tokens} tokens to be a multiple of {_SUBLANE} or all the"
+              " tokens."
           )
         out = pallas_mosaic_tpu_kernel.rope_quant(
             x,
@@ -177,15 +210,21 @@ class PallasTpuDeepseekRope(base.DeepseekRope[Config]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    num_tokens = ba.arguments["x"].shape[0]
-    return Config(tile_n=_default_tile_n(num_tokens, ba.arguments["mode"]))
+    x = ba.arguments["x"]
+    return Config(
+        tile_n=_default_tile_n(x.shape[0], ba.arguments["mode"], x.ndim)
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    num_tokens = ba.arguments["x"].shape[0]
+    x = ba.arguments["x"]
+    num_tokens = x.shape[0]
+    sublane_aligned = _sublane_aligned(ba.arguments["mode"], x.ndim)
     configs = {
         Config(
-            tile_n=pallas_mosaic_tpu_kernel.largest_divisor(num_tokens, cap=cap)
+            tile_n=pallas_mosaic_tpu_kernel.default_tile_n(
+                num_tokens, cap=cap, sublane_aligned=sublane_aligned
+            )
         )
         for cap in _TILE_N_CAPS
     }
@@ -193,7 +232,9 @@ class PallasTpuDeepseekRope(base.DeepseekRope[Config]):
     if _rank_2_quant(ba):
       # Smaller tiles fail to lower (see the class docstring).
       configs = {c for c in configs if c.tile_n % _LANE == 0}
-    # Always keep upstream's heuristic.
+    elif sublane_aligned:
+      configs = {c for c in configs if _aligned(c.tile_n, num_tokens)}
+    # Always keep the heuristic config.
     return configs | {self._get_heuristics_config(ba)}
 
   @override
