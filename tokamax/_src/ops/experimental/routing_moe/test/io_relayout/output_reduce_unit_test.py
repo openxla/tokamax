@@ -42,7 +42,7 @@ class OutputReduceUnitTest(parameterized.TestCase):
       self, case_spec: test_cases.Case, out_dtype: jax.typing.DTypeLike
   ) -> None:
     case = output_reduce_test_lib.ReduceCase.make_case(case_spec, seed=42)
-    if case_spec.ep_size == 1:
+    if case_spec.sharding.ep == 1:
       actual = kernel.output_reduce_unpack(
           case.rows_compact, case.topk_weights, out_dtype=out_dtype
       )
@@ -80,7 +80,9 @@ class OutputReduceUnitTest(parameterized.TestCase):
       out_dtype: jax.typing.DTypeLike,
   ):
     shape = dataclasses.replace(test_shapes.BASIC, top_k=top_k)
-    case_spec = test_cases.Case("edge", shape, num_tokens, ep_size=ep_size)
+    case_spec = test_cases.Case(
+        "edge", shape, num_tokens, test_cases.MoESharding(ep=ep_size)
+    )
     self._assert_matches_reference(case_spec, out_dtype)
 
   def test_ragged_sum(self):
@@ -88,7 +90,13 @@ class OutputReduceUnitTest(parameterized.TestCase):
     ep_size = 8
     shape = test_shapes.MoEShape("ep", 512, 10, 2048, 1024)
     case = output_reduce_test_lib.ReduceCase.make_case(
-        test_cases.Case("ep", shape, num_tokens=256, ep_size=ep_size), seed=99
+        test_cases.Case(
+            "ep",
+            shape,
+            num_tokens=256,
+            sharding=test_cases.MoESharding(ep=ep_size),
+        ),
+        seed=99,
     )
     local = case.num_local_experts
 

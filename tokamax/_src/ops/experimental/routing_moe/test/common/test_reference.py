@@ -183,23 +183,32 @@ def compute_topk(
   )
 
 
-def _shared_expert(moe: test_inputs.MoEInputs, *, activation: str) -> jax.Array:
-  """Computes the unsharded shared-expert output for `moe`."""
-  assert (
-      moe.w1_shared is not None
-      and moe.w2_shared is not None
-      and moe.w_shared_gate is not None
-  )
-  x = moe.hidden_states
-  w1 = arg.make_weight_wrapper(
-      moe.w1_shared, moe.w1_shared_scale, fused_gate_up=True
-  )
-  w2 = arg.make_weight_wrapper(moe.w2_shared, moe.w2_shared_scale)
-  group_sizes = jnp.array([x.shape[0]], dtype=jnp.int32)
-  down = reference_gmm(x, (w1, w2), group_sizes, fuse_act=activation)
-  gate_logits = jnp.matmul(
-      x, moe.w_shared_gate, preferred_element_type=jnp.float32
-  )
+def _matmul(x: jax.Array, w: jax.Array, scale: jax.Array | None) -> jax.Array:
+  """Computes `x @ w[0]` in `float32`, applying sub-channel `scale` if set."""
+  if scale is None:
+    return jnp.matmul(x, w[0], preferred_element_type=jnp.float32)
+  num_blocks = scale.shape[1]
+  x_blocks = x.reshape(x.shape[0], num_blocks, -1).swapaxes(0, 1)
+  w_blocks = w.reshape(num_blocks, -1, w.shape[-1])
+  acc = jnp.matmul(x_blocks, w_blocks, preferred_element_type=jnp.float32)
+  return (acc * scale[0]).sum(axis=0)
+
+
+def shared_expert(
+    x: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w_gate: jax.Array,
+    *,
+    activation: str,
+) -> jax.Array:
+  """Computes the dense shared-expert gated MLP output in pure XLA."""
+  gate_up = _matmul(x, w1, w1_scale)
+  act = _apply_act_fn(gate_up, activation).astype(x.dtype)
+  down = _matmul(act, w2, w2_scale).astype(x.dtype)
+  gate_logits = jnp.matmul(x, w_gate, preferred_element_type=jnp.float32)
   return down * jax.nn.sigmoid(gate_logits).astype(x.dtype)
 
 
@@ -234,5 +243,14 @@ def reference_moe(
   dtype = moe.hidden_states.dtype
   out = topk_reduce(rows, topk_weights.astype(dtype), dtype)
   if moe.w1_shared is not None:
-    out += _shared_expert(moe, activation=shape.activation)
+    assert moe.w2_shared is not None and moe.w_shared_gate is not None
+    out += shared_expert(
+        moe.hidden_states,
+        moe.w1_shared,
+        moe.w2_shared,
+        moe.w1_shared_scale,
+        moe.w2_shared_scale,
+        moe.w_shared_gate,
+        activation=shape.activation,
+    )
   return out

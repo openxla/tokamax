@@ -22,6 +22,7 @@ from typing import Self
 from jax import sharding
 from tokamax._src.ops.experimental.routing_moe.layer import plan as plan_lib
 
+Mesh = sharding.Mesh
 P = sharding.PartitionSpec
 
 
@@ -64,16 +65,41 @@ class RoutingMoEConfig:
       reduce_output: bool,
       activation: str,
       plan: plan_lib.ResolvedMoEPlan,
+      mesh: Mesh,
   ) -> Self:
     """Assembles the config and validates the plan against layer parameters."""
-    if tp_axis is not None and ep_axis is not None:
-      raise NotImplementedError("Hybrid parallelism is not yet supported.")
-    if plan.remote_scatter and ep_axis is None:
-      raise ValueError("remote_scatter requires ep_axis.")
-    if plan.remote_scatter and not reduce_output:
+
+    if tp_axis is not None and tp_axis not in mesh.shape:
       raise ValueError(
-          "remote_scatter cannot be True when reduce_output is False."
+          f"{tp_axis=} is provided but it is not present at {mesh.shape=}"
       )
+    if ep_axis is not None and ep_axis not in mesh.shape:
+      raise ValueError(
+          f"{ep_axis=} is provided but it is not present at {mesh.shape=}"
+      )
+    if plan.remote_scatter:
+      if ep_axis is None:
+        raise ValueError("remote_scatter requires ep_axis.")
+      if tp_axis is not None:
+        raise NotImplementedError(
+            "remote_scatter with hybrid parallelism is not yet supported."
+        )
+      if not reduce_output:
+        raise ValueError(
+            "remote_scatter cannot be True when reduce_output is False."
+        )
+
+    if ep_axis is not None and tp_axis is not None:
+      # Supporting (TP, EP) is possible but number of potential use cases is too
+      # small to justify complexities on supporting both (EP, TP) and (TP, EP).
+      ep_axis_idx = mesh.axis_names.index(ep_axis)
+      tp_axis_idx = mesh.axis_names.index(tp_axis)
+
+      if ep_axis_idx > tp_axis_idx:
+        raise NotImplementedError(
+            "Only supports hybrid parallelism where ep_axis comes before"
+            f" tp_axis. Currently {ep_axis_idx=} and {tp_axis_idx=}"
+        )
 
     return cls(
         tp_axis=tp_axis,
@@ -85,11 +111,9 @@ class RoutingMoEConfig:
     )
 
   @property
-  def reduction_axis(self) -> str | None:
-    """The mesh axis name over which partial MoE outputs are combined."""
-    if self.tp_axis is not None:
-      return self.tp_axis
-    return self.ep_axis
+  def reduction_axis(self) -> tuple[str, ...]:
+    """The mesh axes over which partial MoE outputs are combined."""
+    return tuple(ax for ax in (self.ep_axis, self.tp_axis) if ax is not None)
 
   @property
   def act_spec(self) -> P:
@@ -109,15 +133,16 @@ class RoutingMoEConfig:
   @property
   def output_collective(self) -> OutputCollective:
     """The cross-device collective applied to unpacked MoE outputs."""
+    unreduced = set(self.reduction_axis)
     if self.plan.remote_scatter:
       output_spec = P(self.reduction_axis)
     else:
-      output_spec = P(None, unreduced={self.reduction_axis})
+      output_spec = P(None, unreduced=unreduced)
 
     if self.reduce_output:
       expected_out_spec = self.act_spec
     else:
-      expected_out_spec = P(None, unreduced={self.reduction_axis})
+      expected_out_spec = P(None, unreduced=unreduced)
 
     if output_spec == expected_out_spec:
       return OutputCollective.NONE

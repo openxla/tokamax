@@ -14,8 +14,6 @@
 # ==============================================================================
 """Production-shape numerics and benchmarks for output_reduce_unpack."""
 
-import dataclasses
-
 from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -35,11 +33,9 @@ class OutputReduceProdTest(parameterized.TestCase):
     test_util.skip_unless_supported(self)
     super().setUp()
 
-  @parameterized.product(case=test_cases.PROD_CASES, ep_size=[1, 8])
-  def test_prod_cases(self, case: test_cases.Case, ep_size: int):
-    case_inputs = output_reduce_test_lib.ReduceCase.make_case(
-        dataclasses.replace(case, ep_size=ep_size), seed=54321
-    )
+  @parameterized.product(case=test_cases.PROD_CASES)
+  def test_prod_cases(self, case: test_cases.Case):
+    case_inputs = output_reduce_test_lib.ReduceCase.make_case(case, seed=54321)
     xla = test_util.Timed.create(
         test_reference.xla_output_reduce_unpack,
         case_inputs.rows_clean_compact,

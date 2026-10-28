@@ -72,7 +72,7 @@ def gated_routing_moe(
     reduce_output: bool = True,
     moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
     gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
-    shard_idx: jax.Array | None = None,
+    ep_shard_idx: jax.Array | None = None,
 ) -> jax.Array:
   """Route tokens in hidden_states into each experts based on routing.
 
@@ -96,7 +96,7 @@ def gated_routing_moe(
     reduce_output: reduce output across devices.
     moe_plan: optional MoE layer execution plan.
     gmm_plan: optional GMM kernel execution plan.
-    shard_idx: optional int32 [num_shards] that holds each shard's index.
+    ep_shard_idx: optional int32 [num_shards] that holds each ep_shard's index.
 
   Returns:
     Output of moe operation. [num_tokens, hidden_size] if reduce_output=True,
@@ -125,5 +125,5 @@ def gated_routing_moe(
       reduce_output=reduce_output,
       moe_plan=moe_plan,
       gmm_plan=gmm_plan,
-      shard_idx=shard_idx,
+      ep_shard_idx=ep_shard_idx,
   )

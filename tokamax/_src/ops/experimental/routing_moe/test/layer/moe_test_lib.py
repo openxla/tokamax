@@ -16,14 +16,12 @@
 
 import dataclasses
 import functools
-import math
 from typing import Literal, Self
 
 import jax
 from jax import sharding
 import jax.numpy as jnp
 from tokamax._src import test_utils
-from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.layer import modular
 from tokamax._src.ops.experimental.routing_moe.layer import monolithic
 from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
@@ -38,41 +36,24 @@ NamedSharding = sharding.NamedSharding
 Mesh = sharding.Mesh
 
 Mode = Literal["modular", "monolithic"]
+AxisSpec = str | tuple[str, ...] | None
 
 
 @dataclasses.dataclass(frozen=True)
 class WeightLayout:
-  """How one layer weight is split over the mesh.
+  """How one layer's weights and activations are sharded across a mesh.
 
   Attributes:
-    use_ep: Shard the experts (expert parallel) instead of the intermediate
-      dimension (tensor parallel).
-    use_sp: Shard the tokens on input and output (sequence parallel).
-    fold_shared_expert: Append the shared expert to the routed experts and route
-      to it with a sigmoid gate. Only valid under TP, and only for the entries
-      that take an external top-k.
-    num_cores: Devices in the mesh. If None, all available devices are used.
+    sharding: Data-, expert-, and tensor-parallel shard counts.
+    use_sp: Whether tokens are sharded on input and output (sequence parallel).
+    fold_shared_expert: Whether to append the shared expert to the routed
+      experts and route to it with a sigmoid gate. Only valid when `sharding.ep
+      == 1` and for entries that take an external top-k.
   """
 
-  use_ep: bool = False
+  sharding: test_cases.MoESharding = test_cases.MoESharding()
   use_sp: bool = False
   fold_shared_expert: bool = False
-  num_cores: int | None = None
-
-  @property
-  def tp_axis(self) -> str | None:
-    """Mesh axis for tensor parallelism, or None under EP."""
-    return None if self.use_ep else test_inputs.MESH_AXIS
-
-  @property
-  def ep_axis(self) -> str | None:
-    """Mesh axis for expert parallelism, or None under TP."""
-    return test_inputs.MESH_AXIS if self.use_ep else None
-
-  @property
-  def reduction_axis(self) -> str:
-    """Mesh axis over which per-shard partial outputs are summed."""
-    return test_inputs.MESH_AXIS
 
 
 def _interleave_gate_up(w: jax.Array, n_shards: int) -> jax.Array:
@@ -83,71 +64,68 @@ def _interleave_gate_up(w: jax.Array, n_shards: int) -> jax.Array:
   return interleaved.reshape(w.shape)
 
 
+def _scale_block_axis(scale: jax.Array | None, axis: AxisSpec) -> AxisSpec:
+  """Returns `axis` when `scale` has multiple intermediate blocks, else None."""
+  # Because w2 is sharded along its contracting dimension while per-channel
+  # quantization has a single scale across all TP shards, the scale is
+  # replicated unless sub-channel blocks are present.
+  if scale is None or scale.shape[1] == 1:
+    return None
+  return axis
+
+
 def _shard_inputs(
     moe_in: test_inputs.MoEInputs, mesh: Mesh, layout: WeightLayout
 ) -> test_inputs.MoEInputs:
   """Places `moe_in` on `mesh` as the layer expects for `layout`."""
-  m = test_inputs.MESH_AXIS
-  n_shards = mesh.shape[m]
-  if not layout.use_ep:
+  sharding_spec = layout.sharding
+  if sharding_spec.tp > 1:
     moe_in = dataclasses.replace(
         moe_in,
-        w1=_interleave_gate_up(moe_in.w1, n_shards),
+        w1=_interleave_gate_up(moe_in.w1, sharding_spec.tp),
         w1_bias=None
         if moe_in.w1_bias is None
-        else _interleave_gate_up(moe_in.w1_bias, n_shards),
+        else _interleave_gate_up(moe_in.w1_bias, sharding_spec.tp),
     )
-  if moe_in.w1_shared is not None:
+  if moe_in.w1_shared is not None and sharding_spec.num_cores > 1:
     moe_in = dataclasses.replace(
-        moe_in, w1_shared=_interleave_gate_up(moe_in.w1_shared, n_shards)
+        moe_in,
+        w1_shared=_interleave_gate_up(
+            moe_in.w1_shared, sharding_spec.num_cores
+        ),
     )
 
-  def _maybe_put[T](x: T, *spec: str | None) -> T:
+  def _maybe_put[T](x: T, spec: tuple[AxisSpec, ...]) -> T:
     return jax.tree.map(
         lambda v: jax.device_put(v, NamedSharding(mesh, P(*spec))), x
     )
 
-  act = (m, None) if layout.use_sp else (None, None)
-  if layout.use_ep:
-    w1 = w2 = w1_scale = w2_scale = w1_bias = w2_bias = (m,)
-  else:
-    w1, w2 = (None, None, m), (None, m, None)
-    w1_scale = (None, None, None, m)
-    # Because w2 is sharded along its contracting dimension while per-channel
-    # quantization has a single scale across all TP shards, the scale is
-    # replicated unless sub-channel blocks are present.
-    w2_scale = (None, None)
-    if moe_in.w2_scale is not None and moe_in.w2_scale.shape[1] > 1:
-      w2_scale = (None, m)
-    w1_bias, w2_bias = (None, None, m), (None, None)
+  ep = layout.sharding.ep_axis
+  tp = layout.sharding.tp_axis
+  red = layout.sharding.reduction_axis
+  act = (red, None) if layout.use_sp else (None, None)
+  w2_block = _scale_block_axis(moe_in.w2_scale, tp)
+  w2_shared_block = _scale_block_axis(moe_in.w2_shared_scale, red)
 
   return test_inputs.MoEInputs(
-      hidden_states=_maybe_put(moe_in.hidden_states, *act),
-      gating_output=_maybe_put(moe_in.gating_output, *act),
-      w1=_maybe_put(moe_in.w1, *w1),
-      w2=_maybe_put(moe_in.w2, *w2),
-      w1_scale=_maybe_put(moe_in.w1_scale, *w1_scale),
-      w2_scale=_maybe_put(moe_in.w2_scale, *w2_scale),
-      w1_bias=_maybe_put(moe_in.w1_bias, *w1_bias),
-      w2_bias=_maybe_put(moe_in.w2_bias, *w2_bias),
-      w1_shared=_maybe_put(moe_in.w1_shared, None, None, m),
-      w2_shared=_maybe_put(moe_in.w2_shared, None, m, None),
-      w1_shared_scale=_maybe_put(moe_in.w1_shared_scale, None, None, None, m),
-      w2_shared_scale=_maybe_put(moe_in.w2_shared_scale, None, None),
-      w_shared_gate=_maybe_put(moe_in.w_shared_gate, None, None),
+      hidden_states=_maybe_put(moe_in.hidden_states, act),
+      gating_output=_maybe_put(moe_in.gating_output, act),
+      w1=_maybe_put(moe_in.w1, (ep, None, tp)),
+      w2=_maybe_put(moe_in.w2, (ep, tp, None)),
+      w1_scale=_maybe_put(moe_in.w1_scale, (ep, None, None, tp)),
+      w2_scale=_maybe_put(moe_in.w2_scale, (ep, w2_block, None, None)),
+      w1_bias=_maybe_put(moe_in.w1_bias, (ep, None, tp)),
+      w2_bias=_maybe_put(moe_in.w2_bias, (ep, None, None)),
+      w1_shared=_maybe_put(moe_in.w1_shared, (None, None, red)),
+      w2_shared=_maybe_put(moe_in.w2_shared, (None, red, None)),
+      w1_shared_scale=_maybe_put(
+          moe_in.w1_shared_scale, (None, None, None, red)
+      ),
+      w2_shared_scale=_maybe_put(
+          moe_in.w2_shared_scale, (None, w2_shared_block, None, None)
+      ),
+      w_shared_gate=_maybe_put(moe_in.w_shared_gate, (None, None)),
   )
-
-
-def _align_intermediate(
-    shape: test_shapes.MoEShape, layout: WeightLayout, num_cores: int
-) -> test_shapes.MoEShape:
-  """Aligns `intermediate_size` to a multiple of 128 per TP shard."""
-  lane_size = 128
-  n_shards = 1 if layout.use_ep else num_cores
-  per_shard_intermediate = shape.intermediate_size // n_shards
-  aligned_per_shard = math.ceil(per_shard_intermediate / lane_size) * lane_size
-  aligned_intermediate = aligned_per_shard * n_shards
-  return dataclasses.replace(shape, intermediate_size=aligned_intermediate)
 
 
 def _make_raw_inputs(
@@ -159,8 +137,12 @@ def _make_raw_inputs(
     active_expert_ratio: float = 1.0,
 ) -> test_inputs.MoEInputs:
   """Generates, folds, and quantizes the unsharded inputs of one layer call."""
-  if layout.fold_shared_expert:
-    assert shape.has_shared_expert and not layout.use_ep
+  if layout.fold_shared_expert and (
+      not shape.has_shared_expert or layout.sharding.ep > 1
+  ):
+    raise ValueError(
+        "fold_shared_expert requires has_shared_expert and sharding.ep == 1."
+    )
   moe = test_inputs.MoEInputs.generate(
       shape, num_tokens, seed=seed, active_expert_ratio=active_expert_ratio
   )
@@ -183,7 +165,7 @@ def _shared_expert(
   assert moe.w1_shared is not None
   assert moe.w2_shared is not None
   assert moe.w_shared_gate is not None
-  axis = layout.reduction_axis
+  axis = layout.sharding.reduction_axis
   act_spec = P(axis, None) if layout.use_sp else P(None, None)
   if reduce_output and not layout.use_sp:
     out_spec = P(None, None)
@@ -193,7 +175,10 @@ def _shared_expert(
   w1_scale_spec = (
       None if moe.w1_shared_scale is None else P(None, None, None, axis)
   )
-  w2_scale_spec = None if moe.w2_shared_scale is None else P(None, None)
+  w2_scale_spec = None
+  if moe.w2_shared_scale is not None:
+    block_axis = _scale_block_axis(moe.w2_shared_scale, axis)
+    w2_scale_spec = P(None, block_axis, None, None)
 
   def _local_fn(
       x: jax.Array,
@@ -205,14 +190,9 @@ def _shared_expert(
   ) -> jax.Array:
     if layout.use_sp:
       x = jax.lax.all_gather(x, axis_name=axis, axis=0, tiled=True)
-    w1_wrap = arg.make_weight_wrapper(w1, w1_scale, fused_gate_up=True)
-    w2_wrap = arg.make_weight_wrapper(w2, w2_scale)
-    group_sizes = jnp.array([x.shape[0]], dtype=jnp.int32)
-    down = test_reference.reference_gmm(
-        x, (w1_wrap, w2_wrap), group_sizes, fuse_act=activation
+    out = test_reference.shared_expert(
+        x, w1, w2, w1_scale, w2_scale, w_gate, activation=activation
     )
-    gate_logits = jnp.matmul(x, w_gate, preferred_element_type=jnp.float32)
-    out = down * jax.nn.sigmoid(gate_logits).astype(x.dtype)
     if reduce_output:
       if layout.use_sp:
         out = jax.lax.psum_scatter(
@@ -247,7 +227,7 @@ def _shared_expert(
 
 def _reduce(out: jax.Array, *, mesh: Mesh, layout: WeightLayout) -> jax.Array:
   """Sums the per-shard partial outputs, scattered by token under SP."""
-  axis = layout.reduction_axis
+  axis = layout.sharding.reduction_axis
   if layout.use_sp:
     reduce_fn = functools.partial(
         jax.lax.psum_scatter, axis_name=axis, scatter_dimension=0, tiled=True
@@ -291,8 +271,8 @@ def _run_moe(
       w2_bias=moe.w2_bias,
       mesh=mesh,
       activation=shape.activation,
-      tp_axis=layout.tp_axis,
-      ep_axis=layout.ep_axis,
+      tp_axis=layout.sharding.tp_axis,
+      ep_axis=layout.sharding.ep_axis,
       use_sp=layout.use_sp,
       reduce_output=reduce_output,
   )
@@ -343,7 +323,7 @@ class MoECase:
     raw: Unsharded layer inputs for the XLA reference.
     sharded: Mesh-sharded layer inputs for `_run_moe`.
     shape: Model shape with `intermediate_size` aligned per TP shard.
-    layout: Sharding layout with `num_cores` resolved.
+    layout: Sharding layout of the layer weights and activations.
     mesh: Device mesh for `sharded`.
   """
 
@@ -385,24 +365,22 @@ class MoECase:
   def make_case(
       cls,
       case: test_cases.Case,
-      layout: WeightLayout = WeightLayout(),
+      layout: WeightLayout | None = None,
       *,
+      remote_scatter: bool = False,
       seed: int = 1234,
   ) -> Self:
     """Builds and shards the layer inputs of `case` for `layout`."""
-    num_devices = jax.device_count()
-    num_cores = layout.num_cores or (
-        case.ep_size if case.ep_size > 1 else num_devices
+    if layout is None:
+      layout = WeightLayout(case.sharding)
+    else:
+      case = dataclasses.replace(case, sharding=layout.sharding)
+    test_util.check_moe_supported(case, remote_scatter=remote_scatter)
+    aligned = dataclasses.replace(
+        case.shape,
+        intermediate_size=case.local_intermediate_size * layout.sharding.tp,
     )
-    layout = dataclasses.replace(layout, num_cores=num_cores)
-    aligned = _align_intermediate(case.shape, layout, num_cores)
-    tp_shards = 1 if layout.use_ep else num_cores
-    test_util.check_moe_supported(
-        case,
-        per_shard_intermediate=aligned.intermediate_size // tp_shards,
-        num_cores=num_cores,
-    )
-    mesh = test_inputs.make_mesh((1, num_cores))
+    mesh = test_inputs.make_mesh(layout.sharding)
     raw = _make_raw_inputs(
         aligned,
         case.num_tokens,

@@ -36,21 +36,18 @@ class MoEProdTest(moe_test_base.MoETestCase):
 
   @parameterized.product(
       case=_NON_SHARED_EXPERT_CASES,
-      use_ep=[True, False],
       use_sp=[True, False],
   )
   def test_non_shared_expert_model(
       self,
       case: test_cases.Case,
-      use_ep: bool,
       use_sp: bool,
   ):
-    layout = moe_test_lib.WeightLayout(use_ep=use_ep, use_sp=use_sp)
+    layout = moe_test_lib.WeightLayout(case.sharding, use_sp=use_sp)
     self.check_case(case, layout, capture_xprof=True)
 
   @parameterized.product(
       case=_SHARED_EXPERT_CASES,
-      use_ep=[True, False],
       use_sp=[True, False],
       remote_scatter=[True, False],
       fold_shared_expert=[True, False],
@@ -58,17 +55,18 @@ class MoEProdTest(moe_test_base.MoETestCase):
   def test_shared_expert_model(
       self,
       case: test_cases.Case,
-      use_ep: bool,
       use_sp: bool,
       remote_scatter: bool,
       fold_shared_expert: bool,
   ):
-    if not use_ep and remote_scatter:
-      self.skipTest("Not a valid config.")
-    if fold_shared_expert and use_ep:
-      self.skipTest("fold_shared_expert is only supported under TP.")
+    if remote_scatter and case.sharding.ep == 1:
+      self.skipTest("remote_scatter is only valid when sharding.ep > 1.")
+    if fold_shared_expert and case.sharding.ep > 1:
+      self.skipTest("fold_shared_expert is only valid under pure TP.")
     layout = moe_test_lib.WeightLayout(
-        use_ep=use_ep, use_sp=use_sp, fold_shared_expert=fold_shared_expert
+        case.sharding,
+        use_sp=use_sp,
+        fold_shared_expert=fold_shared_expert,
     )
     self.check_case(
         case,
@@ -90,9 +88,12 @@ class MoEProdTest(moe_test_base.MoETestCase):
       remote_scatter: bool,
   ):
     case = test_cases.Case(
-        "remote_scatter", test_shapes.REMOTE_SCATTER, num_tokens, 4
+        "remote_scatter",
+        test_shapes.REMOTE_SCATTER,
+        num_tokens,
+        test_cases.MoESharding(ep=4),
     )
-    layout = moe_test_lib.WeightLayout(use_ep=True, use_sp=use_sp)
+    layout = moe_test_lib.WeightLayout(case.sharding, use_sp=use_sp)
     self.check_case(
         case, layout, remote_scatter=remote_scatter, capture_xprof=True
     )

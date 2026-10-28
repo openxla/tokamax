@@ -50,10 +50,15 @@ def check_gmm_supported(
     raise absltest.SkipTest(
         "TODO: Support sub-channel quantization in routing_moe."
     )
+  if case.local_intermediate_size % 256 != 0:
+    raise absltest.SkipTest(
+        "TODO: Fix gmm/plan.py raising error if intermediate is not"
+        " multiple of 256 even when up & down can be fused."
+    )
   if live_group_walk and case.num_tokens >= 65536:
     raise absltest.SkipTest(
-        "live_group_walk places row_group in SMEM, which overflows at 64k"
-        " tokens."
+        "TODO: live_group_walk places row_group in SMEM, which overflows"
+        " at 64k tokens."
     )
 
 
@@ -61,26 +66,19 @@ def check_output_reduce_supported(case: test_cases.Case) -> None:
   """Skips the test if `case` exceeds `output_reduce` SMEM limits."""
   if case.num_tokens >= 65536:
     raise absltest.SkipTest(
-        "TODO: Support SMEM streaming in output_reduce for 64k"
-        " tokens."
+        "TODO: Support SMEM streaming in output_reduce for 64k tokens."
     )
 
 
 def check_moe_supported(
-    case: test_cases.Case,
-    *,
-    per_shard_intermediate: int,
-    num_cores: int,
+    case: test_cases.Case, *, remote_scatter: bool = False
 ) -> None:
   """Skips the test if `case` or the mesh layout is unsupported."""
   check_gmm_supported(case)
   check_output_reduce_supported(case)
-  if jax.device_count() < num_cores:
-    raise absltest.SkipTest(f"Requires at least {num_cores} devices.")
-  if per_shard_intermediate % 256 != 0:
+  if remote_scatter and case.sharding.ep > 1 and case.sharding.tp > 1:
     raise absltest.SkipTest(
-        "TODO: Fix gmm/plan.py raising error if intermediate is not"
-        " multiple of 256 even when up & down can be fused."
+        "TODO: Support remote_scatter with hybrid parallelism."
     )
 
 

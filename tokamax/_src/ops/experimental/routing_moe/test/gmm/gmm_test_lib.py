@@ -90,7 +90,9 @@ class GmmCase:
   ) -> Self:
     """Builds the layer inputs of `case` for the shard at `group_offset`."""
     test_util.check_gmm_supported(case)
-    shape = case.shape
+    shape = dataclasses.replace(
+        case.shape, intermediate_size=case.local_intermediate_size
+    )
     quant_shape = shape.w_dtype is not None
     layer_inputs = test_inputs.MoEInputs.generate(
         shape,
@@ -150,7 +152,7 @@ def sharded_gmm_unpermute(
     all_to_all: bool = False,
 ) -> jax.Array:
   """Runs EP-sharded `routing_gmm` scatter, with fused or unfused all-to-all."""
-  axis = test_inputs.MESH_AXIS
+  axis = test_cases.EP_AXIS
   ep_size = mesh.shape[axis]
   num_experts = w.shape[0]
   group_offset = jnp.arange(0, num_experts, num_experts // ep_size)

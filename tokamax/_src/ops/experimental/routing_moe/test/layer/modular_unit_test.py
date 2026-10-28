@@ -19,6 +19,7 @@ import dataclasses
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
 from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_base
 from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_lib
@@ -33,8 +34,21 @@ class ModularMoEUnitTest(moe_test_base.MoEUnitTest):
   def test_folded_shared_expert(self, use_sp: bool):
     """Routes to the shared expert as an extra expert via external top-k."""
     shape = dataclasses.replace(test_shapes.BASIC, has_shared_expert=True)
-    layout = moe_test_lib.WeightLayout(use_sp=use_sp, fold_shared_expert=True)
+    layout = moe_test_lib.WeightLayout(
+        test_cases.MoESharding(tp=2), use_sp=use_sp, fold_shared_expert=True
+    )
     self.check_matches_reference(shape, layout, reduce_output=False)
+
+  def test_folded_shared_expert_with_ep_raises(self):
+    shape = dataclasses.replace(test_shapes.BASIC, has_shared_expert=True)
+    layout = moe_test_lib.WeightLayout(
+        test_cases.MoESharding(ep=2), fold_shared_expert=True
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        "fold_shared_expert requires has_shared_expert and sharding.ep == 1",
+    ):
+      self.check_matches_reference(shape, layout, reduce_output=False)
 
 
 if __name__ == "__main__":

@@ -189,18 +189,19 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
   def test_remote_vs_local_scatter(self, num_tokens: int):
     shape = test_shapes.REMOTE_SCATTER
     topk = shape.top_k
-    ep_size = 4
-    mesh = test_inputs.make_mesh((ep_size,))
-    topk_per_shard = topk // ep_size
+    moe_sharding = test_cases.MoESharding(ep=4)
+    mesh = test_inputs.make_mesh(moe_sharding)
+    topk_per_shard = topk // moe_sharding.ep
     case = gmm_test_lib.GmmCase.make_case(
-        test_cases.Case("remote", shape, num_tokens), balanced_ep=ep_size
+        test_cases.Case("remote", shape, num_tokens),
+        balanced_ep=moe_sharding.ep,
     )
     token = case.routing.sorted_to_flat // topk
     k = case.routing.sorted_to_flat % topk
     local_scatter_indices = token * topk_per_shard + k % topk_per_shard
     # Shard w up front so the timed functions do not reshard it.
     w = jax.device_put(
-        case.w1.weight, NamedSharding(mesh, P(test_inputs.MESH_AXIS))
+        case.w1.weight, NamedSharding(mesh, P(test_cases.EP_AXIS))
     )
     args = (case.x_sorted_compact, w, case.routing.group_sizes)
     local = test_util.Timed.create(

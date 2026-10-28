@@ -18,16 +18,13 @@ import dataclasses
 from typing import Self
 
 import jax
-from jax import sharding
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
 
-Mesh = sharding.Mesh
-
-# The mesh axis that shards experts (EP) or the intermediate dimension (TP).
-MESH_AXIS = "model"
+Mesh = jax.sharding.Mesh
 
 
 def mesh_devices() -> list[jax.Device]:
@@ -41,12 +38,14 @@ def mesh_devices() -> list[jax.Device]:
   )
 
 
-def make_mesh(mesh_shape: tuple[int, ...]) -> Mesh:
-  """Creates a mesh over `prod(mesh_shape)` devices with `MESH_AXIS` last."""
-  devices = mesh_devices()[: int(np.prod(mesh_shape))]
+def make_mesh(
+    sharding: test_cases.MoESharding = test_cases.MoESharding(),
+) -> Mesh:
+  """Creates a `(dp, ep, tp)` device mesh for `sharding`."""
+  devices = mesh_devices()[: sharding.num_cores]
   return Mesh(
-      np.array(devices).reshape(mesh_shape),
-      axis_names=("data", MESH_AXIS)[-len(mesh_shape) :],
+      np.array(devices).reshape(sharding),
+      axis_names=test_cases.MESH_AXES,
   )
 
 

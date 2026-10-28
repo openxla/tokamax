@@ -24,6 +24,12 @@ from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
 from tokamax._src.ops.experimental.routing_moe.test.common import test_util
 from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_lib
 
+_UNIT_SHARDINGS = (
+    test_cases.MoESharding(ep=2),
+    test_cases.MoESharding(tp=2),
+    test_cases.MoESharding(ep=2, tp=2),
+)
+
 
 class MoETestCase(parameterized.TestCase):
   """Base test case for verifying MoE layer execution against XLA reference."""
@@ -37,14 +43,18 @@ class MoETestCase(parameterized.TestCase):
   def check_case(
       self,
       case: test_cases.Case,
-      layout: moe_test_lib.WeightLayout = moe_test_lib.WeightLayout(),
+      layout: moe_test_lib.WeightLayout | None = None,
       *,
       remote_scatter: bool = False,
       reduce_output: bool = True,
       capture_xprof: bool = False,
   ) -> None:
     """Checks that the execution mode matches numerics on `case`."""
-    moe_case = moe_test_lib.MoECase.make_case(case, layout)
+    sharding = case.sharding if layout is None else layout.sharding
+    test_util.skip_unless_supported(self, min_devices=sharding.num_cores)
+    moe_case = moe_test_lib.MoECase.make_case(
+        case, layout, remote_scatter=remote_scatter
+    )
     actual = moe_case.run(
         self.mode, remote_scatter=remote_scatter, reduce_output=reduce_output
     )
@@ -80,28 +90,50 @@ class MoEUnitTest(MoETestCase):
 
   @parameterized.product(case=test_cases.UNIT_CASES)
   def test_unit_cases(self, case: test_cases.Case):
-    layout = moe_test_lib.WeightLayout(use_ep=case.ep_size > 1)
-    self.check_case(case, layout)
+    self.check_case(case)
 
   @parameterized.product(renormalize=[True, False])
   def test_basic(self, renormalize: bool):
     shape = dataclasses.replace(test_shapes.BASIC, renormalize=renormalize)
     self.check_matches_reference(shape)
 
+  @parameterized.product(
+      use_sp=[True, False],
+      remote_scatter=[True, False],
+      w_dtype=[None, jnp.float8_e4m3fn],
+  )
+  def test_hybrid(
+      self,
+      use_sp: bool,
+      remote_scatter: bool,
+      w_dtype: jax.typing.DTypeLike | None,
+  ):
+    """Checks hybrid EP+TP execution across SP, scatter, and quantization."""
+    dtype = None if w_dtype is None else jnp.dtype(w_dtype)
+    shape = dataclasses.replace(test_shapes.BASIC, w_dtype=dtype)
+    layout = moe_test_lib.WeightLayout(
+        test_cases.MoESharding(ep=2, tp=2), use_sp=use_sp
+    )
+    self.check_matches_reference(shape, layout, remote_scatter=remote_scatter)
+
   @parameterized.product(use_sp=[True, False])
   def test_remote_scatter(self, use_sp: bool):
-    layout = moe_test_lib.WeightLayout(use_ep=True, use_sp=use_sp)
+    layout = moe_test_lib.WeightLayout(
+        test_cases.MoESharding(ep=2), use_sp=use_sp
+    )
     self.check_matches_reference(test_shapes.BASIC, layout, remote_scatter=True)
 
-  @parameterized.product(use_ep=[True, False], use_sp=[True, False])
-  def test_unreduced_output(self, use_ep: bool, use_sp: bool):
-    layout = moe_test_lib.WeightLayout(use_ep=use_ep, use_sp=use_sp)
+  @parameterized.product(sharding=_UNIT_SHARDINGS, use_sp=[True, False])
+  def test_unreduced_output(
+      self, sharding: test_cases.MoESharding, use_sp: bool
+  ):
+    layout = moe_test_lib.WeightLayout(sharding, use_sp=use_sp)
     self.check_matches_reference(test_shapes.BASIC, layout, reduce_output=False)
 
-  @parameterized.product(use_ep=[True, False], use_sp=[True, False])
-  def test_shared_expert(self, use_ep: bool, use_sp: bool):
+  @parameterized.product(sharding=_UNIT_SHARDINGS, use_sp=[True, False])
+  def test_shared_expert(self, sharding: test_cases.MoESharding, use_sp: bool):
     shape = dataclasses.replace(test_shapes.BASIC, has_shared_expert=True)
-    layout = moe_test_lib.WeightLayout(use_ep=use_ep, use_sp=use_sp)
+    layout = moe_test_lib.WeightLayout(sharding, use_sp=use_sp)
     self.check_matches_reference(shape, layout, reduce_output=False)
 
   def test_unreduced_output_with_remote_scatter_raises(self):
@@ -110,10 +142,14 @@ class MoEUnitTest(MoETestCase):
     ):
       self.check_matches_reference(
           test_shapes.BASIC,
-          moe_test_lib.WeightLayout(use_ep=True),
+          moe_test_lib.WeightLayout(test_cases.MoESharding(ep=2)),
           remote_scatter=True,
           reduce_output=False,
       )
+
+  def test_remote_scatter_without_ep_raises(self):
+    with self.assertRaisesRegex(ValueError, "remote_scatter requires ep_axis"):
+      self.check_matches_reference(test_shapes.BASIC, remote_scatter=True)
 
   @parameterized.product(activation=["silu", "swigluoai"])
   def test_activation(self, activation: str):
@@ -127,7 +163,7 @@ class MoEUnitTest(MoETestCase):
     shape = dataclasses.replace(
         test_shapes.BASIC, w_dtype=jnp.dtype(w_dtype), quant_block_size=256
     )
-    self.check_matches_reference(shape, moe_test_lib.WeightLayout(use_ep=True))
+    self.check_matches_reference(shape)
 
   def test_bias(self):
     shape = dataclasses.replace(

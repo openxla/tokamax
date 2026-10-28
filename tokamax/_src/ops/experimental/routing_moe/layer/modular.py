@@ -43,7 +43,7 @@ def _routing_moe_local(
     w2_scale: jax.Array | None,
     w1_bias: jax.Array | None,
     w2_bias: jax.Array | None,
-    shard_idx: jax.Array | None,
+    ep_shard_idx: jax.Array | None,
     *,
     cfg: config.RoutingMoEConfig,
     gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
@@ -54,23 +54,28 @@ def _routing_moe_local(
   topk = topk_indices.shape[-1]
 
   # Step 1: Book keep sharding related logictics.
-  if cfg.tp_axis is not None:
+  if cfg.ep_axis is None:
     global_num_experts = local_num_experts
     group_offset = jnp.array([0], dtype=jnp.int32)
   else:
     num_ep_shards = jax.lax.axis_size(cfg.ep_axis)
     global_num_experts = local_num_experts * num_ep_shards
-    if shard_idx is None:
-      shard_idx = jax.lax.axis_index(cfg.ep_axis)
-    elif not jnp.isscalar(shard_idx):
-      shard_idx = shard_idx[0]
-    group_offset = jnp.array([shard_idx * local_num_experts], dtype=jnp.int32)
+    if ep_shard_idx is None:
+      ep_shard_idx = jax.lax.axis_index(cfg.ep_axis)
+    elif not jnp.isscalar(ep_shard_idx):
+      ep_shard_idx = ep_shard_idx[0]
+    group_offset = jnp.array(
+        [ep_shard_idx * local_num_experts], dtype=jnp.int32
+    )
     if w2_bias is not None:
-      w2_bias = jnp.where(shard_idx == 0, w2_bias, 0)
+      w2_bias = jnp.where(ep_shard_idx == 0, w2_bias, 0)
     if cfg.plan.remote_scatter and not cfg.use_sp:
       num_local_tokens = topk_weights.shape[0] // num_ep_shards
       topk_weights = jax.lax.dynamic_slice_in_dim(
-          topk_weights, shard_idx * num_local_tokens, num_local_tokens, axis=0
+          topk_weights,
+          ep_shard_idx * num_local_tokens,
+          num_local_tokens,
+          axis=0,
       )
 
   if cfg.use_sp:
@@ -117,7 +122,7 @@ def _routing_moe_local(
       gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
       scatter=arg.make_routing_wrapper(
           topk_argsort_indices,
-          remote_axis=cfg.reduction_axis if cfg.plan.remote_scatter else None,
+          remote_axis=cfg.ep_axis if cfg.plan.remote_scatter else None,
       ),
       fuse_act=cfg.activation,
       group_offset=group_offset,
@@ -184,7 +189,7 @@ def routing_moe(
     reduce_output: bool = True,
     moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
     gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
-    shard_idx: jax.Array | None = None,
+    ep_shard_idx: jax.Array | None = None,
 ) -> jax.Array:
   """Route tokens in hidden_states into each experts based on routing.
 
@@ -206,7 +211,7 @@ def routing_moe(
     reduce_output: reduce output across devices.
     moe_plan: optional MoE layer execution plan.
     gmm_plan: optional GMM kernel execution plan.
-    shard_idx: optional int32 [num_shards] that holds each shard's index.
+    ep_shard_idx: optional int32 [num_shards] that holds each ep_shard's index.
 
   Returns:
     Output of moe operation. [num_tokens, hidden_size] if reduce_output=True,
@@ -223,15 +228,19 @@ def routing_moe(
       reduce_output=reduce_output,
       activation=activation,
       plan=resolved_plan,
+      mesh=mesh,
   )
 
   w1_spec = P(ep_axis, None, tp_axis)
   w2_spec = P(ep_axis, tp_axis, None)
   w1_scale_spec = None if w1_scale is None else P(ep_axis, None, None, tp_axis)
-  w2_scale_spec = None if w2_scale is None else P(ep_axis, None, None, None)
+  w2_scale_spec = None
+  if w2_scale is not None:
+    block_axis = None if w2_scale.shape[1] == 1 else tp_axis
+    w2_scale_spec = P(ep_axis, block_axis, None, None)
   w1_bias_spec = None if w1_bias is None else P(ep_axis, None, tp_axis)
   w2_bias_spec = None if w2_bias is None else P(ep_axis, None, None)
-  shard_idx_spec = None if shard_idx is None else P(cfg.reduction_axis)
+  ep_shard_idx_spec = None if ep_shard_idx is None else P(ep_axis)
 
   return jax.shard_map(
       functools.partial(
@@ -250,7 +259,7 @@ def routing_moe(
           w2_scale_spec,
           w1_bias_spec,
           w2_bias_spec,
-          shard_idx_spec,
+          ep_shard_idx_spec,
       ),
       out_specs=(cfg.out_spec),
       check_vma=False,
@@ -264,5 +273,5 @@ def routing_moe(
       w2_scale,
       w1_bias,
       w2_bias,
-      shard_idx,
+      ep_shard_idx,
   )

@@ -180,20 +180,23 @@ class RemoteRoutingGmmUnitTest(parameterized.TestCase):
     super().setUp()
 
   @parameterized.product(
-      mesh_shape=[(4,), (2, 2)],
+      sharding=[
+          test_cases.MoESharding(ep=4),
+          test_cases.MoESharding(dp=2, ep=2),
+      ],
       num_tokens_topk=[(256, 2), (1024, 4)],
       skip_last_shard=[False, True],
   )
   def test_remote_scatter_matches_single_device(
       self,
-      mesh_shape: tuple[int, ...],
+      sharding: test_cases.MoESharding,
       num_tokens_topk: tuple[int, int],
       skip_last_shard: bool,
   ):
     num_tokens, topk = num_tokens_topk
     shape = test_shapes.MoEShape("remote", 16, topk, 1024, 256)
-    mesh = test_inputs.make_mesh(mesh_shape)
-    num_local = shape.num_experts // mesh.shape[test_inputs.MESH_AXIS]
+    mesh = test_inputs.make_mesh(sharding)
+    num_local = shape.num_experts // sharding.ep
     case = gmm_test_lib.GmmCase.make_case(
         test_cases.Case("remote", shape, num_tokens),
         num_skipped=num_local if skip_last_shard else 0,
