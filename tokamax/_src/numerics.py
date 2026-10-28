@@ -293,7 +293,13 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
   abstract_arrays, other, merge = utils.split_merge(is_abstract, x_flat)
   rngs = np.random.default_rng(seed).spawn(len(abstract_arrays))
 
-  with futures.ThreadPoolExecutor() as executor:
-    arrays = list(executor.map(init_with_layout, rngs, abstract_arrays))
+  if jax.process_count() > 1:
+    # Initializing arrays sharded across processes launches a program on every
+    # process. These must be launched in the same order on all processes, so we
+    # can't initialize concurrently.
+    arrays = list(map(init_with_layout, rngs, abstract_arrays))
+  else:
+    with futures.ThreadPoolExecutor() as executor:
+      arrays = list(executor.map(init_with_layout, rngs, abstract_arrays))
 
   return tree.unflatten(merge(arrays, other))
