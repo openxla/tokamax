@@ -104,6 +104,10 @@ class MoEProdTest(moe_test_base.MoETestCase):
           testcase_name="_unfused",
           gmm_plan=gmm_plan_lib.RoutingGmmPlan(fuse_up_and_down=False),
       ),
+      dict(
+          testcase_name="_tm32_b3",
+          gmm_plan=gmm_plan_lib.RoutingGmmPlan(tile_m=32, num_w_buffers=3),
+      ),
   )
   def test_gmm_plan(self, gmm_plan: gmm_plan_lib.RoutingGmmPlan):
     """Runs a production case with gmm plans other than the default one."""

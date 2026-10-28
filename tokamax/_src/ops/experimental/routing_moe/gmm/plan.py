@@ -19,9 +19,10 @@ Plan fields affect performance and numerics but not the output shape, dtype,
 or placement. Unset fields are resolved by heuristics.
 """
 
+from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Self
+from typing import Any, Self
 
 import jax
 from jax.experimental import pallas as pl
@@ -53,6 +54,12 @@ class RoutingGmmPlan:
   fuse_up_and_down: bool | None = None
   vmem_limit_bytes: int | None = None
   vmem_usage_fraction: float | None = None
+  # Upper bound when num_w_buffers is grown into spare VMEM, so that the next
+  # groups' weight DMAs stay in flight during the current group's compute.
+  # TODO: The default of 3 was chosen empirically (on decode tiles
+  # 3 buffers were faster than 2, 4 were even with 3 and 6 were slower).
+  # Revisit it based on per-group DMA vs. compute time.
+  max_num_w_buffers: int | None = None
   # Size of gap to try skipping when writing to metadata.
   skip_metadata_size: int | None = None
   # Walk only the groups with rows when building the metadata (needs the
@@ -173,15 +180,8 @@ class ResolvedGmmPlan(RoutingGmmPlan):
     vmem_usage_fraction = plan.vmem_usage_fraction or 0.9
     vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
     capped_vmem_limit_bytes = int(vmem_usage_fraction * vmem_limit_bytes)
-    (
-        tile_m,
-        tile_k,
-        tile_k2,
-        tile_n,
-        bucket_base,
-        num_xo_buffers,
-        num_w_buffers,
-    ) = calculate_tiling(
+    tiling_fn = functools.partial(
+        calculate_tiling,
         plan,
         x=x,
         w=w,
@@ -194,16 +194,10 @@ class ResolvedGmmPlan(RoutingGmmPlan):
         vmem_limit_bytes=capped_vmem_limit_bytes,
         tpu_info=tpu_info,
     )
-    # TODO: fusion-or-not, number of buffers for weights and
-    # activations, and tiling should be decided together by a single function
-    # with VMEM limit instead of separately.
-    if w2 is None:
-      fuse_up_and_down = False
-    elif plan.fuse_up_and_down is not None:
-      fuse_up_and_down = plan.fuse_up_and_down
-    else:
-      assert tile_k2 is not None
-      fuse_up_and_down = can_fuse_up_and_down(
+    can_fuse = None
+    if w2 is not None:
+      can_fuse = functools.partial(
+          can_fuse_up_and_down,
           x=x,
           w=w,
           w2=w2,
@@ -211,15 +205,21 @@ class ResolvedGmmPlan(RoutingGmmPlan):
           matmul_dtype=matmul_dtype,
           acc_dtype=acc_dtype,
           out_dtype=x.dtype if out_dtype is None else jnp.dtype(out_dtype),
-          tile_m=tile_m,
-          tile_k=tile_k,
-          tile_k2=tile_k2,
-          tile_n=tile_n,
-          num_xo_buffers=num_xo_buffers,
-          num_w_buffers=num_w_buffers,
           vmem_limit_bytes=capped_vmem_limit_bytes,
           tpu_info=tpu_info,
       )
+    tiling, fuse_up_and_down = _choose_tiling_and_fusion(
+        plan, tiling_fn=tiling_fn, can_fuse=can_fuse
+    )
+    (
+        tile_m,
+        tile_k,
+        tile_k2,
+        tile_n,
+        bucket_base,
+        num_xo_buffers,
+        num_w_buffers,
+    ) = tiling
     if not fuse_up_and_down and plan.tile_k2 is not None:
       raise ValueError("tile_k2 requires fuse_up_and_down=True.")
     return cls(
@@ -238,6 +238,56 @@ class ResolvedGmmPlan(RoutingGmmPlan):
         skip_metadata_size=skip_metadata_size,
         live_group_walk=live_group_walk,
     )
+
+
+def _choose_tiling_and_fusion(
+    plan: RoutingGmmPlan,
+    *,
+    tiling_fn: Callable[..., tuple[Any, ...]],
+    can_fuse: Callable[..., bool] | None,
+) -> tuple[tuple[Any, ...], bool]:
+  """Picks the tiling and whether the gate/up and down projections are fused.
+
+  Args:
+    plan: User plan.
+    tiling_fn: `calculate_tiling` with the problem bound. Takes
+      `allow_vmem_growth`.
+    can_fuse: `can_fuse_up_and_down` with everything but the tiling bound, or
+      None if there is no down projection.
+
+  Returns:
+    The tiling as returned by `calculate_tiling`, and whether to fuse.
+  """
+  tiling = tiling_fn()
+  # TODO: fusion-or-not, number of buffers for weights and
+  # activations, and tiling should be decided together by a single function
+  # with VMEM limit instead of separately.
+  if can_fuse is None:
+    return tiling, False
+  if plan.fuse_up_and_down is not None and not plan.fuse_up_and_down:
+    return tiling, False
+
+  def fits(tiling: tuple[Any, ...]) -> bool:
+    tile_m, tile_k, tile_k2, tile_n, _, num_xo_buffers, num_w_buffers = tiling
+    return can_fuse(
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_k2=tile_k2,
+        tile_n=tile_n,
+        num_xo_buffers=num_xo_buffers,
+        num_w_buffers=num_w_buffers,
+    )
+
+  if fits(tiling):
+    return tiling, True
+  # calculate_tiling only budgets w, so heuristics that use more VMEM than the
+  # default tiling (e.g. more weight buffers) can push the fused kernel past
+  # VMEM. Losing fusion costs more than they save, so keep the default tiling
+  # if it fuses, or if fusion is requested.
+  default_tiling = tiling_fn(allow_vmem_growth=False)
+  if plan.fuse_up_and_down or fits(default_tiling):
+    return default_tiling, True
+  return tiling, False
 
 
 def _vmem_estimate(
@@ -311,8 +361,29 @@ def calculate_tiling(
     size_out_n: int,
     vmem_limit_bytes: int,
     tpu_info: pltpu.TpuInfo,
+    allow_vmem_growth: bool = True,
 ) -> tuple[int, int, int | None, int, int, int, int]:
-  """Resolves tile sizes and buffer counts for routing GMM."""
+  """Resolves tile sizes and buffer counts for routing GMM.
+
+  Args:
+    plan: User plan. Fields that are set are kept.
+    x: Activation spec.
+    w: Weight spec of the first (or only) projection.
+    is_fused_act: Whether w holds both gate and up projections.
+    matmul_dtype: Dtype in which inputs are fed to the MXU.
+    acc_dtype: Accumulator dtype.
+    size_k: Contraction size of w.
+    size_k2: Contraction size of w2, or None without w2.
+    size_out_n: Output size of the layer.
+    vmem_limit_bytes: VMEM budget of the kernel.
+    tpu_info: TPU the kernel runs on.
+    allow_vmem_growth: Whether heuristics may pick settings that use more VMEM
+      than the default tiling (e.g. more weight buffers).
+
+  Returns:
+    (tile_m, tile_k, tile_k2, tile_n, bucket_base, num_xo_buffers,
+    num_w_buffers).
+  """
   # Slightly lower vmem limit than total required amount to be conservative.
 
   # Step 1: Set default values.
@@ -406,7 +477,20 @@ def calculate_tiling(
     if plan.bucket_base is None:
       tile_m = min(tile_m, max_group_rows)
 
-  estimate = estimate_vmem(tile_m=tile_m, tile_n=w_tile_n)
+  # Spend spare VMEM on deeper weight prefetch.
+  if plan.num_w_buffers is None and allow_vmem_growth:
+    max_num_w_buffers = plan.max_num_w_buffers or 3
+    while num_w_buffers < max_num_w_buffers and (
+        estimate_vmem(
+            tile_m=tile_m, tile_n=w_tile_n, num_w_buffers=num_w_buffers + 1
+        )
+        <= vmem_limit_bytes
+    ):
+      num_w_buffers += 1
+
+  estimate = estimate_vmem(
+      tile_m=tile_m, tile_n=w_tile_n, num_w_buffers=num_w_buffers
+  )
   if estimate > vmem_limit_bytes:
     raise ValueError(
         f"Tiles ({tile_m=}, {tile_k=}, tile_n={w_tile_n}) need an estimated"
