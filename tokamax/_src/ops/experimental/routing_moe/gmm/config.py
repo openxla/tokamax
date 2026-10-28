@@ -55,35 +55,20 @@ class DynamicQuantConfig:
 
 @dataclasses.dataclass(frozen=True)
 class ActivationConfig:
-  """User provided spec of an activation and the kernel's decisions on it."""
+  """User-provided spec of an activation and the kernel's decisions on it."""
 
   spec: arg.ActivationSpec
   mode: RoutingMode
+  dynamic_quant: DynamicQuantConfig | None = None
 
 
 @dataclasses.dataclass(frozen=True)
-class SingleGmmConfig:
-  """Resolved static configuration for a single GMM matmul stage."""
+class ComputeConfig:
+  """Resolved configuration for a single matrix multiplication."""
 
-  w: arg.WeightSpec
-  tile_k: int
-  tile_n: int
   acc_dtype: jnp.dtype
+  tpu_info: pltpu.TpuInfo
   dynamic_quant: DynamicQuantConfig | None = None
-  fuse_act: str | None = None
-
-  @property
-  def size_k(self) -> int:
-    return self.w.in_size
-
-  @property
-  def size_out_n(self) -> int:
-    # The fused activation combines a gate column and an up column into one, so
-    # the output halves only when fuse_act is applied. fused_gate_up alone does
-    # not change the width.
-    return (
-        self.w.out_size // 2 if self.fuse_act is not None else self.w.out_size
-    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,7 +77,8 @@ class Dimension:
 
   size_m: int  # Rows of x.
   size_k: int
-  size_n: int  # Columns of w, including both halves when gate/up fused.
+  size_k2: int | None
+  size_n: int  # Columns of output.
   size_out_m: int
   size_out_n: int
   size_local_groups: int
@@ -105,43 +91,50 @@ class Dimension:
       cls,
       *,
       x: arg.ActivationSpec,
-      w: tuple[arg.WeightSpec, ...],
+      w: arg.WeightSpec,
+      w2: arg.WeightSpec | None = None,
       num_global_groups: int,
       gather: arg.RoutingSpec | None,
       scatter: arg.RoutingSpec | None,
       fuse_act: str | None,
       size_ep: int = 1,
   ) -> Self:
-    """Validates the specs against each other and derives problem sizes.
-
-    `size_ep` is the size of `scatter.remote_axis`, 1 for a local scatter.
-    """
-    assert len(w) in (1, 2)
-    if x.col_size != w[0].in_size:
+    """Validates the specs against each other and derives problem sizes."""
+    if x.col_size != w.in_size:
       raise ValueError(
-          f"x col_size ({x.col_size}) must match w in_size ({w[0].in_size})."
+          f"x col_size ({x.col_size}) must match w in_size ({w.in_size})."
       )
-    if num_global_groups < w[0].group_size:
+    if num_global_groups < w.group_size:
       raise ValueError(
-          f"group_sizes must cover at least {w[0].group_size} groups. Got"
+          f"group_sizes must cover at least {w.group_size} groups. Got"
           f" {num_global_groups}."
       )
-    if fuse_act is not None and not w[0].fused_gate_up:
+    if fuse_act is not None and not w.fused_gate_up:
       raise ValueError("fuse_act requires a weight with fused_gate_up=True.")
-    if any(w_spec.has_bias for w_spec in w):
+    if w.has_bias or (w2 is not None and w2.has_bias):
       raise NotImplementedError("Bias is not supported yet.")
 
     size_m = x.row_size
     # The fused activation combines a gate column and an up column into one, so
     # the output halves only when fuse_act is applied. fused_gate_up alone does
     # not change the width.
-    size_out_n = w[0].out_size // 2 if fuse_act is not None else w[0].out_size
-    if len(w) == 2:
+    size_out_n = w.out_size
+    if fuse_act is not None:
+      size_out_n //= 2
+    size_k2 = None
+    if w2 is not None:
       if fuse_act is None:
         raise ValueError("w2 requires fuse_act to be set.")
-      if w[1].fused_gate_up:
+      if size_out_n != w2.in_size:
+        raise ValueError(f"w {size_out_n=} and {w2.in_size=} do not match.")
+      if w.group_size != w2.group_size:
+        raise ValueError(f"{w.group_size=} and {w2.group_size=} do not match.")
+      if w.in_size != w2.out_size:
+        raise ValueError(f"{w.in_size=} and {w2.out_size=} do not match.")
+      if w2.fused_gate_up:
         raise ValueError("w2 cannot have fused_gate_up=True.")
-      size_out_n = w[1].out_size
+      size_k2 = w2.in_size
+      size_out_n = w2.out_size
 
     size_out_m = size_m
     if gather is not None:
@@ -165,10 +158,11 @@ class Dimension:
     return cls(
         size_m=size_m,
         size_k=x.col_size,
-        size_n=w[0].out_size,
+        size_k2=size_k2,
+        size_n=size_out_n,
         size_out_m=size_out_m,
         size_out_n=size_out_n,
-        size_local_groups=w[0].group_size,
+        size_local_groups=w.group_size,
         size_global_groups=num_global_groups,
         size_ep=size_ep,
     )
@@ -176,15 +170,19 @@ class Dimension:
 
 @dataclasses.dataclass(frozen=True)
 class RoutingGmmConfig:
-  """Stores compile time static information of routing gmm."""
+  """Compile-time static configuration of the routing GMM kernel."""
 
   dim: Dimension
   plan: plan_lib.ResolvedGmmPlan
   x: ActivationConfig
-  stages: tuple[SingleGmmConfig, ...]
+  w: arg.WeightSpec
+  w2: arg.WeightSpec | None
+  compute: ComputeConfig
+  compute2: ComputeConfig | None
   out: ActivationConfig
   gather: arg.RoutingSpec | None
   scatter: arg.RoutingSpec | None
+  fuse_act: str | None
   tpu_info: pltpu.TpuInfo
 
   @classmethod
@@ -192,7 +190,8 @@ class RoutingGmmConfig:
       cls,
       *,
       x: arg.ActivationSpec,
-      w: tuple[arg.WeightSpec, ...],
+      w: arg.WeightSpec,
+      w2: arg.WeightSpec | None = None,
       dim: Dimension,
       plan: plan_lib.ResolvedGmmPlan,
       gather: arg.RoutingSpec | None,
@@ -215,28 +214,6 @@ class RoutingGmmConfig:
           dtype=plan.matmul_dtype, block_size=plan.x_quant_block_size
       )
 
-    assert len(w) in (1, 2)
-    stages = [
-        SingleGmmConfig(
-            w=w[0],
-            tile_k=plan.tile_k,
-            tile_n=plan.tile_n,
-            acc_dtype=plan.acc_dtype,
-            dynamic_quant=x_quant,
-            fuse_act=fuse_act,
-        )
-    ]
-    if len(w) == 2:
-      stages.append(
-          SingleGmmConfig(
-              w=w[1],
-              tile_k=w[1].in_size,
-              tile_n=w[1].out_size,
-              acc_dtype=plan.acc_dtype,
-              dynamic_quant=x_quant,
-          )
-      )
-
     # A remote scatter leaves each device only the rows it owns.
     out_spec = arg.ActivationSpec(
         row_size=dim.size_out_m // dim.size_ep,
@@ -253,25 +230,34 @@ class RoutingGmmConfig:
 
     x_mode = _resolve_mode(gather)
     out_mode = _resolve_mode(scatter)
+    compute_cfg = ComputeConfig(
+        acc_dtype=plan.acc_dtype,
+        tpu_info=tpu_info,
+        dynamic_quant=x_quant,
+    )
 
     cfg = cls(
         dim=dim,
         plan=plan,
-        x=ActivationConfig(spec=x, mode=x_mode),
-        stages=tuple(stages),
+        x=ActivationConfig(spec=x, mode=x_mode, dynamic_quant=x_quant),
+        w=w,
+        w2=w2,
+        compute=compute_cfg,
+        compute2=None if w2 is None else compute_cfg,
         out=ActivationConfig(spec=out_spec, mode=out_mode),
         gather=gather,
         scatter=scatter,
+        fuse_act=fuse_act,
         tpu_info=tpu_info,
     )
 
-    if len(w) == 2 and (
-        w[1].dtype != w[0].dtype or (w[1].quant is None) != (w[0].quant is None)
+    if w2 is not None and (
+        w2.dtype != w.dtype or (w2.quant is None) != (w.quant is None)
     ):
       # The intermediate is fed to the second matmul in x's execution dtype,
       # which is only valid when both weights share a precision.
       raise NotImplementedError("w2 must match the precision of w.")
-    if x_quant is None and cfg.plan.x_quant_block_size is not None:
+    if cfg.x.dynamic_quant is None and cfg.plan.x_quant_block_size is not None:
       raise ValueError(
           "plan.x_quant_block_size has no effect when x is not quantized."
       )
@@ -280,20 +266,26 @@ class RoutingGmmConfig:
           "acc_dtype must be bfloat16 or float32. Got"
           f" {cfg.plan.acc_dtype}."
       )
-    for stage in cfg.stages:
-      x_bits = jax.dtypes.itemsize_bits(cfg.plan.matmul_dtype)
-      if x_bits < jax.dtypes.itemsize_bits(stage.w.dtype):
-        raise ValueError(
-            f"x_exec_dtype ({cfg.plan.matmul_dtype}) must not be narrower"
-            f" than w dtype ({stage.w.dtype})."
+    x_bits = jax.dtypes.itemsize_bits(cfg.plan.matmul_dtype)
+    if x_bits < jax.dtypes.itemsize_bits(cfg.w.dtype):
+      raise ValueError(
+          f"x_exec_dtype ({cfg.plan.matmul_dtype}) must not be narrower"
+          f" than w dtype ({cfg.w.dtype})."
+      )
+    if cfg.plan.tile_k != cfg.dim.size_k:
+      raise NotImplementedError("K dim tiling is not supported yet.")
+    if cfg.w2 is not None:
+      if cfg.plan.tile_k2 != cfg.dim.size_k2:
+        raise NotImplementedError("K2 dim tiling is not supported yet.")
+      if cfg.plan.tile_n != cfg.dim.size_out_n:
+        raise NotImplementedError(
+            "N dim tiling is not supported when w2 is fused."
         )
-      if stage.tile_k != stage.size_k:
-        raise NotImplementedError("K dim tiling is not supported yet.")
-      if stage.size_out_n % stage.tile_n != 0:
-        raise ValueError(
-            f"tile_n ({stage.tile_n}) must divide the output width"
-            f" ({stage.size_out_n})."
-        )
+    if cfg.dim.size_out_n % cfg.plan.tile_n != 0:
+      raise ValueError(
+          f"tile_n ({cfg.plan.tile_n}) must divide the output width"
+          f" ({cfg.dim.size_out_n})."
+      )
     if cfg.out.spec.compact_shape[1] % cfg.num_n != 0:
       raise ValueError(
           f"tile_n ({cfg.plan.tile_n}) must be a multiple of the output's"
@@ -322,13 +314,13 @@ class RoutingGmmConfig:
 
   @property
   def max_num_gm(self) -> int:
-    """Returns maximum number of possible tiles."""
+    """Maximum number of possible tiles."""
     max_num_single_group = pl.cdiv(self.dim.size_out_m, self.plan.tile_m)
     return self.dim.size_local_groups + max_num_single_group
 
   @property
   def num_n(self) -> int:
-    return pl.cdiv(self.dim.size_out_n, self.stages[-1].tile_n)
+    return pl.cdiv(self.dim.size_out_n, self.plan.tile_n)
 
   @property
   def num_k(self) -> int:

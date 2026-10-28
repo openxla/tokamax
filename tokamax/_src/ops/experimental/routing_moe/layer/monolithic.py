@@ -100,7 +100,7 @@ def gated_routing_moe(
 
   Returns:
     Output of moe operation. [num_tokens, hidden_size] if reduce_output=True,
-      else [num_shards * num_tokens, hidden_size].
+    else [num_shards * num_tokens, hidden_size].
   """
   topk_weights = apply_scoring_fn(scoring_fn, gating_output)
   topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)

@@ -66,7 +66,7 @@ class RoutingGmmProdTest(parameterized.TestCase):
         fused=test_util.Timed.create(
             kernel.routing_gmm,
             case.x_compact,
-            (case.w1,),
+            case.w1,
             gather=routing.gather,
             fuse_act="silu",
             **routing.kernel_kwargs,
@@ -74,7 +74,7 @@ class RoutingGmmProdTest(parameterized.TestCase):
         gmm_only=test_util.Timed.create(
             test_reference.reference_gmm,
             case.x_sorted,
-            (case.w1,),
+            case.w1,
             routing.local_group_sizes,
             fuse_act="silu",
         ),
@@ -97,14 +97,14 @@ class RoutingGmmProdTest(parameterized.TestCase):
         fused=test_util.Timed.create(
             kernel.routing_gmm,
             case.x_sorted_compact,
-            (case.w1,),
+            case.w1,
             scatter=routing.scatter,
             **routing.kernel_kwargs,
         ),
         gmm_only=test_util.Timed.create(
             test_reference.reference_gmm,
             case.x_sorted,
-            (case.w1,),
+            case.w1,
             routing.local_group_sizes,
         ),
         unfused=test_util.Timed.create(
@@ -134,7 +134,7 @@ class RoutingGmmProdTest(parameterized.TestCase):
     case_spec, group_offset = case_offset
     case = gmm_test_lib.GmmCase.make_case(case_spec, group_offset=group_offset)
     routing = case.routing
-    stages = {
+    calls = {
         "gather": (
             case.x_compact,
             routing.sorted_rows,
@@ -146,14 +146,14 @@ class RoutingGmmProdTest(parameterized.TestCase):
             dict(scatter=routing.scatter),
         ),
     }
-    for name, (x, written, kwargs) in stages.items():
+    for name, (x, written, kwargs) in calls.items():
       outs = {}
       report = {}
       for live_group_walk in (False, True):
         timed = test_util.Timed.create(
             kernel.routing_gmm,
             x,
-            (case.w1,),
+            case.w1,
             custom_plan=gmm_plan.RoutingGmmPlan(
                 live_group_walk=live_group_walk
             ),

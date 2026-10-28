@@ -15,12 +15,11 @@
 
 """Module that handles XLA side preprocessing and invokes routing gmm kernel.
 
-Many of the tensor manipulation logics are intentionally placed here instead of
+Many of the tensor manipulation logic is intentionally placed here instead of
 other modules. This is because we want any XLA side logic that is handled
-outside of the kernel to be consolidated here without scavanging other modules.
+outside of the kernel to be consolidated here without scavenging other modules.
 """
 
-import dataclasses
 import functools
 
 import jax
@@ -38,32 +37,39 @@ from tokamax._src.ops.experimental.routing_moe.gmm import plan
 @jax.jit(static_argnames=("fuse_act", "out_dtype", "custom_plan"))
 def routing_gmm(
     x: arg.ActivationWrapper[jax.Array],
-    w: tuple[arg.SingleWeightWrapper[jax.Array], ...],
-    group_sizes: jax.Array,  # [global_groups]
+    w: arg.SingleWeightWrapper[jax.Array],
+    group_sizes: jax.Array,
     *,
+    w2: arg.SingleWeightWrapper[jax.Array] | None = None,
     row_group: jax.Array | None = None,
-    group_offset: jax.Array | None = None,  # [1]
+    group_offset: jax.Array | None = None,
     gather: arg.RoutingWrapper[jax.Array] | None = None,
     scatter: arg.RoutingWrapper[jax.Array] | None = None,
     fuse_act: str | None = None,
     out_dtype: jax.typing.DTypeLike | None = None,
     custom_plan: plan.RoutingGmmPlan | None = None,
 ) -> arg.ActivationWrapper[jax.Array]:
-  """GMM that pipelines routing and compute for both input and output.
+  """Computes grouped matrix multiplication with pipelined routing.
 
-  With `scatter.spec.remote_axis` (inside shard_map), a row scattered to global
-  row `i` lands on device `i // rows_per_dev` along that axis, and each device
-  returns its `m_out // axis_size` rows. Scatter indices across all devices must
-  then fill every output row exactly once, or the kernel hangs.
-  `row_group` is the global group id of each sorted routed row, i.e. the sorted
-  keys of the sort that orders the rows by group; when given and the plan
-  selects it, the metadata walks only groups with rows.
+  Args:
+    x: Input activation in compact layout.
+    w: First (or only) expert weight.
+    group_sizes: Row count per global expert group [global_groups].
+    w2: Optional second expert weight for the down projection.
+    row_group: Optional global group ID per sorted row [routed_rows].
+    group_offset: Optional starting global group index for this shard [1].
+    gather: Optional input row-index map. Reads x contiguously when None.
+    scatter: Optional output row-index map. Writes contiguously when None.
+    fuse_act: Optional gated activation applied after the w projection.
+    out_dtype: Optional output dtype. Defaults to x.spec.dtype when None.
+    custom_plan: Optional execution plan overriding heuristic defaults.
+
+  Returns:
+    Output activation in compact layout.
   """
-
-  assert len(w) in (1, 2)
   gather_spec = None if gather is None else gather.spec
   scatter_spec = None if scatter is None else scatter.spec
-  w_specs = tuple(ww.spec for ww in w)
+  w2_spec = None if w2 is None else w2.spec
 
   # Step 1: Derive sizes, resolve the plan, and construct the config.
   tpu_info = pltpu.get_tpu_info()
@@ -72,7 +78,8 @@ def routing_gmm(
     size_ep = jax.lax.axis_size(scatter_spec.remote_axis)
   dim = config.Dimension.create(
       x=x.spec,
-      w=w_specs,
+      w=w.spec,
+      w2=w2_spec,
       num_global_groups=group_sizes.size,
       gather=gather_spec,
       scatter=scatter_spec,
@@ -82,44 +89,43 @@ def routing_gmm(
   resolved_plan = plan.ResolvedGmmPlan.create(
       custom_plan,
       x=x.spec,
-      w=w_specs,
+      w=w.spec,
+      w2=w2_spec,
+      is_fused_act=fuse_act is not None,
       out_dtype=out_dtype,
       size_out_m=dim.size_out_m,
       size_global_groups=dim.size_global_groups,
       size_k=dim.size_k,
+      size_k2=dim.size_k2,
       size_out_n=dim.size_out_n,
       tpu_info=tpu_info,
   )
-  if len(w) == 2 and not resolved_plan.fuse_up_and_down:
-    unfused_plan = None
-    if custom_plan is not None:
-      unfused_plan = dataclasses.replace(
-          custom_plan, tile_k=None, tile_n=None, fuse_up_and_down=False
-      )
+  if w2 is not None and not resolved_plan.fuse_up_and_down:
     gmm1_res = routing_gmm(
         x=x,
-        w=(w[0],),
+        w=w,
         group_sizes=group_sizes,
         row_group=row_group,
         group_offset=group_offset,
         gather=gather,
         fuse_act=fuse_act,
-        custom_plan=unfused_plan,
+        custom_plan=custom_plan,
     )
     return routing_gmm(
         x=gmm1_res,
-        w=(w[1],),
+        w=w2,
         group_sizes=group_sizes,
         row_group=row_group,
         group_offset=group_offset,
         scatter=scatter,
         out_dtype=out_dtype,
-        custom_plan=unfused_plan,
+        custom_plan=custom_plan,
     )
 
   cfg = config.RoutingGmmConfig.create(
       x=x.spec,
-      w=w_specs,
+      w=w.spec,
+      w2=w2_spec,
       dim=dim,
       plan=resolved_plan,
       gather=gather_spec,
@@ -161,7 +167,8 @@ def routing_gmm(
   remote = cfg.out.mode == config.RoutingMode.REMOTE
   inputs = memory_ref.PipelineInputs[jax.Array](
       x=x.data,
-      w=tuple(_weight_ref(ww) for ww in w),
+      w=_weight_ref(w),
+      w2=None if w2 is None else _weight_ref(w2),
       gather_idx=_padded_indices(gather),
       scatter_idx=_padded_indices(scatter),
   )

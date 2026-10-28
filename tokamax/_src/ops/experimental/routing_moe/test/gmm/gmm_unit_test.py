@@ -46,7 +46,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     routing = case.routing
     actual = kernel.routing_gmm(
         case.x_compact,
-        (case.w1,),
+        case.w1,
         gather=routing.gather,
         fuse_act="silu",
         custom_plan=gmm_plan.RoutingGmmPlan(tile_n=tile_n),
@@ -54,7 +54,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     )
     expected = test_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
-        (case.w1,),
+        case.w1,
         routing.local_group_sizes,
         fuse_act="silu",
     )
@@ -74,14 +74,14 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     routing = case.routing
     actual = kernel.routing_gmm(
         case.x_sorted_compact,
-        (case.w1,),
+        case.w1,
         scatter=routing.scatter,
         custom_plan=gmm_plan.RoutingGmmPlan(tile_n=tile_n),
         **routing.kernel_kwargs,
     )
     expected = test_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
-        (case.w1,),
+        case.w1,
         routing.local_group_sizes,
     )
     np.testing.assert_allclose(
@@ -111,7 +111,8 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     routing = case.routing
     actual = kernel.routing_gmm(
         case.x_compact,
-        (case.w1, case.w2),
+        case.w1,
+        w2=case.w2,
         gather=routing.gather,
         scatter=routing.scatter,
         fuse_act="silu",
@@ -120,8 +121,9 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     )
     expected = test_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
-        (case.w1, case.w2),
+        case.w1,
         routing.local_group_sizes,
+        w2=case.w2,
         fuse_act="silu",
     )
     np.testing.assert_allclose(
@@ -130,6 +132,43 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         rtol=6e-2,
         atol=6e-2,
     )
+
+  def test_fuse_up_and_down_without_w2_raises(self):
+    case = gmm_test_lib.GmmCase.make_case(test_cases.DECODE_16)
+    with self.assertRaisesRegex(ValueError, "fuse_up_and_down"):
+      kernel.routing_gmm(
+          case.x_compact,
+          case.w1,
+          gather=case.routing.gather,
+          fuse_act="silu",
+          custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=True),
+          **case.routing.kernel_kwargs,
+      )
+
+  def test_tile_k2_without_fusion_raises(self):
+    case = gmm_test_lib.GmmCase.make_case(test_cases.DECODE_16)
+    with self.assertRaisesRegex(ValueError, "tile_k2"):
+      kernel.routing_gmm(
+          case.x_compact,
+          case.w1,
+          gather=case.routing.gather,
+          fuse_act="silu",
+          custom_plan=gmm_plan.RoutingGmmPlan(tile_k2=512),
+          **case.routing.kernel_kwargs,
+      )
+    with self.assertRaisesRegex(ValueError, "tile_k2"):
+      kernel.routing_gmm(
+          case.x_compact,
+          case.w1,
+          w2=case.w2,
+          gather=case.routing.gather,
+          scatter=case.routing.scatter,
+          fuse_act="silu",
+          custom_plan=gmm_plan.RoutingGmmPlan(
+              tile_k2=512, fuse_up_and_down=False
+          ),
+          **case.routing.kernel_kwargs,
+      )
 
   @parameterized.named_parameters(
       ("skip", gmm_plan.RoutingGmmPlan(skip_metadata_size=2)),
@@ -140,21 +179,19 @@ class RoutingGmmUnitTest(parameterized.TestCase):
       self, custom_plan: gmm_plan.RoutingGmmPlan
   ):
     # The walks themselves are checked in metadata_unit_test. This checks that
-    # the kernel plumbs `row_group` and the plan through to the same output.
+    # the kernel plumbs row_group and the plan through to the same output.
     case = gmm_test_lib.GmmCase.make_case(
         test_cases.DECODE_64_EP8, group_offset=128
     )
-    stages = (
+    calls = (
         (case.x_compact, dict(gather=case.routing.gather, fuse_act="silu")),
         (case.x_sorted_compact, dict(scatter=case.routing.scatter)),
     )
     rows = (case.routing.sorted_rows, case.routing.scattered_rows)
-    for (x, kwargs), written in zip(stages, rows, strict=True):
+    for (x, kwargs), written in zip(calls, rows, strict=True):
       kwargs = kwargs | case.routing.kernel_kwargs
-      expected = kernel.routing_gmm(x, (case.w1,), **kwargs)
-      actual = kernel.routing_gmm(
-          x, (case.w1,), custom_plan=custom_plan, **kwargs
-      )
+      expected = kernel.routing_gmm(x, case.w1, **kwargs)
+      actual = kernel.routing_gmm(x, case.w1, custom_plan=custom_plan, **kwargs)
       np.testing.assert_array_equal(
           gmm_test_lib.to_large_layout(actual)[written],
           gmm_test_lib.to_large_layout(expected)[written],
@@ -165,7 +202,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "skip_metadata_size"):
       kernel.routing_gmm(
           case.x_compact,
-          (case.w1,),
+          case.w1,
           gather=case.routing.gather,
           fuse_act="silu",
           custom_plan=gmm_plan.RoutingGmmPlan(skip_metadata_size=-1),
@@ -204,7 +241,7 @@ class RemoteRoutingGmmUnitTest(parameterized.TestCase):
     w = case.w1.weight
     expected = kernel.routing_gmm(
         case.x_sorted_compact,
-        (arg.make_weight_wrapper(w),),
+        arg.make_weight_wrapper(w),
         case.routing.group_sizes,
         scatter=case.routing.scatter,
     ).data

@@ -16,7 +16,6 @@
 """Functions required to perform matrix multiplication."""
 
 import jax
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.gmm import config
@@ -69,21 +68,20 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None) -> jax.Array:
 
 
 def matmul(
-    cfg: config.SingleGmmConfig,
+    cfg: config.ComputeConfig,
     x: jax.Array,
     w: jax.Array,
     w_scale: jax.Array | None,
     w_bias: jax.Array | None,
     *,
-    tpu_info: pltpu.TpuInfo,
     is_last_k_step: bool = True,
     is_first_k_step: bool = True,
 ) -> jax.Array:
-  """Perform stateless matrix multiplication for a given arguments."""
-
+  """Performs stateless matrix multiplication for a single tile."""
   # TODO: Support multiple N/K tiles.
-  assert is_last_k_step == is_first_k_step == True
+  assert is_last_k_step and is_first_k_step
 
+  tpu_info = cfg.tpu_info
   mxu_size = tpu_info.mxu_column_size
 
   # Step 1: Input pre-processing.

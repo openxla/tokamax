@@ -114,10 +114,8 @@ def _routing_moe_local(
   # Step 5: Invoke GMM Gate and Up.
   gmm_res = gmm.routing_gmm(
       x=x_compact,
-      w=(
-          arg.make_weight_wrapper(w1, w1_scale, w1_bias, fused_gate_up=True),
-          arg.make_weight_wrapper(w2, w2_scale, w2_bias),
-      ),
+      w=arg.make_weight_wrapper(w1, w1_scale, w1_bias, fused_gate_up=True),
+      w2=arg.make_weight_wrapper(w2, w2_scale, w2_bias),
       group_sizes=group_sizes,
       gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
       scatter=arg.make_routing_wrapper(
@@ -215,7 +213,7 @@ def routing_moe(
 
   Returns:
     Output of moe operation. [num_tokens, hidden_size] if reduce_output=True,
-      else [num_shards * num_tokens, hidden_size].
+    else [num_shards * num_tokens, hidden_size].
   """
   if w1_bias is not None or w2_bias is not None:
     raise NotImplementedError("Bias is currently not supported.")

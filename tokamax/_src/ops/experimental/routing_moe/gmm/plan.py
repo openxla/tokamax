@@ -33,10 +33,11 @@ from tokamax._src.ops.experimental.routing_moe.common import layout_util
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RoutingGmmPlan:
-  """User provided plan where `None` field will be determined by heuristic."""
+  """User-provided plan where None fields will be determined by heuristic."""
 
   tile_m: int | None = None
   tile_k: int | None = None
+  tile_k2: int | None = None
   tile_n: int | None = None
   bucket_base: int | None = None
   num_xo_buffers: int | None = None
@@ -51,31 +52,31 @@ class RoutingGmmPlan:
   # Whether gate/up and down projections run in one fused kernel when w2 is set.
   fuse_up_and_down: bool | None = None
   vmem_limit_bytes: int | None = None
-  vmem_usage_fraction: float = 0.9
+  vmem_usage_fraction: float | None = None
   # Size of gap to try skipping when writing to metadata.
   skip_metadata_size: int | None = None
   # Walk only the groups with rows when building the metadata (needs the
-  # `row_group` input of routing_gmm).
+  # row_group input of routing_gmm).
   live_group_walk: bool | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ResolvedGmmPlan(RoutingGmmPlan):
-  """Plan that used heuristic to resolve `None` fields from user's plan."""
+  """Plan with None fields from user-provided plan resolved by heuristic."""
 
   tile_m: int
   tile_k: int
+  tile_k2: int | None
   tile_n: int
   bucket_base: int
   num_xo_buffers: int
   num_w_buffers: int
   acc_dtype: jnp.dtype
   matmul_dtype: jnp.dtype
-  # None unless x is dynamically quantized.
+  # It is None unless x is dynamically quantized.
   x_quant_block_size: int | None
   fuse_up_and_down: bool
   vmem_limit_bytes: int
-  vmem_usage_fraction: float
   skip_metadata_size: int
   live_group_walk: bool
 
@@ -115,16 +116,18 @@ class ResolvedGmmPlan(RoutingGmmPlan):
       plan: RoutingGmmPlan | None,
       *,
       x: arg.ActivationSpec,
-      w: tuple[arg.WeightSpec, ...],
+      w: arg.WeightSpec,
+      w2: arg.WeightSpec | None = None,
+      is_fused_act: bool = False,
       out_dtype: jax.typing.DTypeLike | None = None,
       size_out_m: int,
       size_global_groups: int,
       size_k: int,
+      size_k2: int | None = None,
       size_out_n: int,
       tpu_info: pltpu.TpuInfo,
   ) -> Self:
     """Fills unset plan fields with heuristics."""
-    assert len(w) in (1, 2)
     if plan is None:
       plan = RoutingGmmPlan()
 
@@ -132,9 +135,9 @@ class ResolvedGmmPlan(RoutingGmmPlan):
     # dtype is used so that both operands enter the MXU in the same dtype.
     if plan.matmul_dtype is not None:
       matmul_dtype = jnp.dtype(plan.matmul_dtype)
-    elif x.quant is None and w[0].quant is not None:
+    elif x.quant is None and w.quant is not None:
       # TODO: Support mixed precision and choose by hardware support.
-      matmul_dtype = w[0].dtype
+      matmul_dtype = w.dtype
     else:
       matmul_dtype = x.dtype
     x_quant_block_size = plan.x_quant_block_size
@@ -149,7 +152,7 @@ class ResolvedGmmPlan(RoutingGmmPlan):
 
     skip_metadata_size = plan.skip_metadata_size
     if skip_metadata_size is None:
-      # largest power of 2 <= expected gap between touched experts
+      # Use the largest power of 2 <= expected gap between touched experts.
       gap = max(1, size_global_groups // size_out_m)
       skip_metadata_size = (1 << (gap.bit_length() - 1)) - 1
     if skip_metadata_size < 0:
@@ -159,52 +162,70 @@ class ResolvedGmmPlan(RoutingGmmPlan):
 
     live_group_walk = plan.live_group_walk
     if live_group_walk is None:
-      live_group_walk = size_out_m < w[0].group_size
+      live_group_walk = size_out_m < w.group_size
 
+    if w2 is None:
+      if plan.tile_k2 is not None:
+        raise ValueError("tile_k2 requires w2 to be set.")
+      if plan.fuse_up_and_down:
+        raise ValueError("fuse_up_and_down=True requires w2 to be set.")
+
+    vmem_usage_fraction = plan.vmem_usage_fraction or 0.9
     vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
-    tile_m, tile_k, tile_n, bucket_base, num_xo_buffers, num_w_buffers = (
-        calculate_tiling(
-            plan,
-            x=x,
-            w=w[0],
-            matmul_dtype=matmul_dtype,
-            acc_dtype=acc_dtype,
-            size_out_m=size_out_m,
-            size_k=size_k,
-            size_out_n=size_out_n if len(w) == 1 else w[1].in_size,
-            vmem_limit_bytes=vmem_limit_bytes,
-            tpu_info=tpu_info,
-        )
+    capped_vmem_limit_bytes = int(vmem_usage_fraction * vmem_limit_bytes)
+    (
+        tile_m,
+        tile_k,
+        tile_k2,
+        tile_n,
+        bucket_base,
+        num_xo_buffers,
+        num_w_buffers,
+    ) = calculate_tiling(
+        plan,
+        x=x,
+        w=w,
+        is_fused_act=is_fused_act,
+        matmul_dtype=matmul_dtype,
+        acc_dtype=acc_dtype,
+        size_k=size_k,
+        size_k2=size_k2,
+        size_out_n=size_out_n,
+        vmem_limit_bytes=capped_vmem_limit_bytes,
+        tpu_info=tpu_info,
     )
     # TODO: fusion-or-not, number of buffers for weights and
     # activations, and tiling should be decided together by a single function
     # with VMEM limit instead of separately.
-    if plan.fuse_up_and_down is not None:
-      fuse_up_and_down = plan.fuse_up_and_down
-    elif len(w) == 1:
+    if w2 is None:
       fuse_up_and_down = False
+    elif plan.fuse_up_and_down is not None:
+      fuse_up_and_down = plan.fuse_up_and_down
     else:
+      assert tile_k2 is not None
       fuse_up_and_down = can_fuse_up_and_down(
           x=x,
-          w=w[0],
-          w2=w[1],
+          w=w,
+          w2=w2,
+          is_fused_act=is_fused_act,
           matmul_dtype=matmul_dtype,
           acc_dtype=acc_dtype,
           out_dtype=x.dtype if out_dtype is None else jnp.dtype(out_dtype),
-          size_out_m=size_out_m,
-          size_out_n=size_out_n,
           tile_m=tile_m,
           tile_k=tile_k,
+          tile_k2=tile_k2,
           tile_n=tile_n,
           num_xo_buffers=num_xo_buffers,
           num_w_buffers=num_w_buffers,
-          vmem_limit_bytes=vmem_limit_bytes,
-          vmem_usage_fraction=plan.vmem_usage_fraction,
+          vmem_limit_bytes=capped_vmem_limit_bytes,
           tpu_info=tpu_info,
       )
+    if not fuse_up_and_down and plan.tile_k2 is not None:
+      raise ValueError("tile_k2 requires fuse_up_and_down=True.")
     return cls(
         tile_m=tile_m,
         tile_k=tile_k,
+        tile_k2=tile_k2,
         tile_n=tile_n,
         bucket_base=bucket_base,
         num_xo_buffers=num_xo_buffers,
@@ -214,7 +235,6 @@ class ResolvedGmmPlan(RoutingGmmPlan):
         x_quant_block_size=x_quant_block_size,
         fuse_up_and_down=fuse_up_and_down,
         vmem_limit_bytes=vmem_limit_bytes,
-        vmem_usage_fraction=plan.vmem_usage_fraction,
         skip_metadata_size=skip_metadata_size,
         live_group_walk=live_group_walk,
     )
@@ -225,19 +245,19 @@ def _vmem_estimate(
     x: arg.ActivationSpec,
     w: arg.WeightSpec,
     w2: arg.WeightSpec | None = None,
+    is_fused_act: bool = False,
     matmul_dtype: jnp.dtype,
     acc_dtype: jnp.dtype,
     out_dtype: jnp.dtype,
-    size_out_m: int,
-    size_out_n: int,
     tile_m: int,
     tile_k: int,
+    tile_k2: int | None = None,
     tile_n: int,
     num_xo_buffers: int,
     num_w_buffers: int,
     tpu_info: pltpu.TpuInfo,
 ) -> int:
-  """Estimates VMEM usage in bytes for a 1-stage or 2-stage routing GMM."""
+  """Estimates VMEM usage in bytes for routing GMM."""
   is_dynamic_quantized = matmul_dtype != x.dtype
   matmul_bits = jax.dtypes.itemsize_bits(matmul_dtype)
   acc_bits = jax.dtypes.itemsize_bits(acc_dtype)
@@ -246,50 +266,36 @@ def _vmem_estimate(
   chunk_bytes = 4 * tpu_info.num_lanes
   # NOTE: x_chunk size stays as-is since we don't support K tiling yet.
   x_chunks = layout_util.to_bank_conflict_aware_stride(x.compact_shape[1])
-  out_shape = layout_util.to_compact_shape((size_out_m, size_out_n), out_dtype)
-  out_chunk_cols = out_shape[2] * out_shape[3]
-  out_tile_n = tile_n if w2 is None else size_out_n
-  out_chunks = layout_util.to_bank_conflict_aware_stride(
-      out_tile_n // out_chunk_cols
-  )
+  out_shape = layout_util.to_compact_shape((tile_m, tile_n), out_dtype)
+  out_chunks = layout_util.to_bank_conflict_aware_stride(out_shape[1])
   x_vmem = num_xo_buffers * tile_m * x_chunks * chunk_bytes
   out_vmem = num_xo_buffers * tile_m * out_chunks * chunk_bytes
 
-  # Fusion does not support any weight tiling yet.
-  if w2 is None:
-    stages = ((w, tile_k, tile_n, size_out_n),)
-  else:
-    stages = (
-        (w, w.in_size, w2.in_size, w2.in_size),
-        (w2, w2.in_size, w2.out_size, size_out_n),
-    )
-  w_vmem = 0
-  scale_vmem = 0
-  acc_vmem = 0
-  for stage_w, stage_tile_k, stage_tile_n, stage_out_n in stages:
-    num_w_refs = stage_w.out_size // stage_out_n
-    w_bits = jax.dtypes.itemsize_bits(stage_w.dtype)
-    w_vmem += (
-        num_w_refs * num_w_buffers * stage_tile_k * stage_tile_n * w_bits // 8
-    )
-    if stage_w.quant is not None:
-      num_blocks = pl.cdiv(stage_tile_k, stage_w.quant.block_size)
-      scale_vmem += num_w_refs * num_w_buffers * num_blocks * stage_tile_n * 4
-
-    acc_vmem += num_w_refs * tile_m * stage_tile_n * acc_bits // 8
+  def _matmul_vmem(
+      weight: arg.WeightSpec, k_tile: int, n_tile: int, num_w_refs: int
+  ) -> int:
+    w_bits = jax.dtypes.itemsize_bits(weight.dtype)
+    w_vmem = num_w_refs * num_w_buffers * k_tile * n_tile * w_bits // 8
+    scale_vmem = 0
+    if weight.quant is not None:
+      num_blocks = pl.cdiv(k_tile, weight.quant.block_size)
+      scale_vmem = num_w_refs * num_w_buffers * num_blocks * n_tile * 4
+    acc_vmem = num_w_refs * tile_m * n_tile * acc_bits // 8
     # Dynamic quantization materializes a quantized copy of the x tile.
     if is_dynamic_quantized:
-      acc_vmem += tile_m * stage_tile_k * matmul_bits // 8
+      acc_vmem += tile_m * k_tile * matmul_bits // 8
+    return w_vmem + scale_vmem + acc_vmem
 
-  intermediate_act_vmem = 0
-  if w2 is not None:
-    intermediate_act_vmem = (
-        tile_m * w2.in_size * jax.dtypes.itemsize_bits(x.dtype) // 8
-    )
+  num_w1_refs = 2 if is_fused_act else 1
+  if w2 is None:
+    matmul_vmem = _matmul_vmem(w, tile_k, tile_n, num_w1_refs)
+  else:
+    assert tile_k2 is not None
+    matmul_vmem = _matmul_vmem(w, tile_k, tile_k2, num_w1_refs)
+    matmul_vmem += _matmul_vmem(w2, tile_k2, tile_n, 1)
+    matmul_vmem += tile_m * tile_k2 * jax.dtypes.itemsize_bits(x.dtype) // 8
 
-  return (
-      x_vmem + out_vmem + w_vmem + scale_vmem + acc_vmem + intermediate_act_vmem
-  )
+  return x_vmem + out_vmem + matmul_vmem
 
 
 def calculate_tiling(
@@ -297,17 +303,17 @@ def calculate_tiling(
     *,
     x: arg.ActivationSpec,
     w: arg.WeightSpec,
+    is_fused_act: bool = False,
     matmul_dtype: jnp.dtype,
     acc_dtype: jnp.dtype,
-    size_out_m: int,
     size_k: int,
+    size_k2: int | None = None,
     size_out_n: int,
     vmem_limit_bytes: int,
     tpu_info: pltpu.TpuInfo,
-) -> tuple[int, int, int, int, int, int]:
-  """Returns (tile_m, tile_k, tile_n, bucket_base, num_xo_buffers, num_w_buffers)."""
+) -> tuple[int, int, int | None, int, int, int, int]:
+  """Resolves tile sizes and buffer counts for routing GMM."""
   # Slightly lower vmem limit than total required amount to be conservative.
-  vmem_budget = int(vmem_limit_bytes * plan.vmem_usage_fraction)
 
   # Step 1: Set default values.
   num_xo_buffers = plan.num_xo_buffers or 3
@@ -329,9 +335,14 @@ def calculate_tiling(
     if plan.tile_m is not None:
       bucket_base = min(bucket_base, plan.tile_m)
 
+  # Size w's output tile against size_k2 when w2 is present, or size_out_n when
+  # w is the only weight.
+  w_out_n = size_out_n if size_k2 is None else size_k2
+  w_plan_tile_n = plan.tile_n if size_k2 is None else plan.tile_k2
+
   # out_dtype is not known to the plan, so x's dtype is used as the estimate.
   # TODO: Add ability to pass out_dtype.
-  out_shape = layout_util.to_compact_shape((size_out_m, size_out_n), x.dtype)
+  out_shape = layout_util.to_compact_shape((1, w_out_n), x.dtype)
   out_chunk_cols = out_shape[2] * out_shape[3]
 
   # Step 2: Bind VMEM calculation function to static problem parameters.
@@ -339,34 +350,33 @@ def calculate_tiling(
       _vmem_estimate,
       x=x,
       w=w,
+      is_fused_act=is_fused_act,
       matmul_dtype=matmul_dtype,
       acc_dtype=acc_dtype,
       out_dtype=x.dtype,
-      size_out_m=size_out_m,
-      size_out_n=size_out_n,
       tile_k=tile_k,
       num_xo_buffers=num_xo_buffers,
       num_w_buffers=num_w_buffers,
       tpu_info=tpu_info,
   )
 
-  # Split N into the fewest tiles that fit VMEM. tile_n is chosen before tile_m
-  # because the weight block usually dominates VMEM.
-  if plan.tile_n is not None:
-    tile_n = plan.tile_n
+  # Split w's output width into the fewest tiles that fit VMEM. This is chosen
+  # before tile_m because the weight block usually dominates VMEM.
+  if w_plan_tile_n is not None:
+    w_tile_n = w_plan_tile_n
   else:
     num_n_tiles = 1
-    tile_n = size_out_n
-    max_num_n_tiles = size_out_n // out_chunk_cols
+    w_tile_n = w_out_n
+    max_num_n_tiles = w_out_n // out_chunk_cols
     min_tile_m = plan.tile_m or bucket_base
     while (
-        estimate_vmem(tile_m=min_tile_m, tile_n=tile_n) > vmem_budget
+        estimate_vmem(tile_m=min_tile_m, tile_n=w_tile_n) > vmem_limit_bytes
         and num_n_tiles < max_num_n_tiles
     ):
       num_n_tiles += 1
-      # tile_n must divide size_out_n into whole compact chunks.
-      if size_out_n % (num_n_tiles * out_chunk_cols) == 0:
-        tile_n = size_out_n // num_n_tiles
+      # w_tile_n must divide w_out_n into whole compact chunks.
+      if w_out_n % (num_n_tiles * out_chunk_cols) == 0:
+        w_tile_n = w_out_n // num_n_tiles
 
   if plan.tile_m is not None:
     tile_m = plan.tile_m
@@ -382,20 +392,34 @@ def calculate_tiling(
       candidate = num_buckets * bucket_base
       if (
           candidate > max_tile_m
-          or estimate_vmem(tile_m=candidate, tile_n=tile_n) > vmem_budget
+          or estimate_vmem(tile_m=candidate, tile_n=w_tile_n) > vmem_limit_bytes
       ):
         break
       tile_m = candidate
 
-  estimate = estimate_vmem(tile_m=tile_m, tile_n=tile_n)
-  if estimate > vmem_budget:
+  estimate = estimate_vmem(tile_m=tile_m, tile_n=w_tile_n)
+  if estimate > vmem_limit_bytes:
     raise ValueError(
-        f"Tiles ({tile_m=}, {tile_k=}, {tile_n=}) need an estimated"
-        f" {estimate} bytes of VMEM, exceeding the budget of {vmem_budget}"
-        f" bytes (limit: {vmem_limit_bytes})."
+        f"Tiles ({tile_m=}, {tile_k=}, tile_n={w_tile_n}) need an estimated"
+        f" {estimate} bytes of VMEM, exceeding the budget of {vmem_limit_bytes}"
     )
 
-  return tile_m, tile_k, tile_n, bucket_base, num_xo_buffers, num_w_buffers
+  if size_k2 is None:
+    tile_k2 = None
+    tile_n = w_tile_n
+  else:
+    tile_k2 = w_tile_n
+    tile_n = plan.tile_n or size_out_n
+
+  return (
+      tile_m,
+      tile_k,
+      tile_k2,
+      tile_n,
+      bucket_base,
+      num_xo_buffers,
+      num_w_buffers,
+  )
 
 
 def can_fuse_up_and_down(
@@ -403,42 +427,39 @@ def can_fuse_up_and_down(
     x: arg.ActivationSpec,
     w: arg.WeightSpec,
     w2: arg.WeightSpec,
+    is_fused_act: bool = True,
     matmul_dtype: jnp.dtype,
     acc_dtype: jnp.dtype,
     out_dtype: jnp.dtype,
-    size_out_m: int,
-    size_out_n: int,
     tile_m: int,
     tile_k: int,
+    tile_k2: int,
     tile_n: int,
     num_xo_buffers: int,
     num_w_buffers: int,
     vmem_limit_bytes: int,
-    vmem_usage_fraction: float,
     tpu_info: pltpu.TpuInfo,
 ) -> bool:
   """Whether gate/up and down projections should run as one fused kernel."""
   if w.dtype != w2.dtype or (w.quant is None) != (w2.quant is None):
     return False
-  # tile_k and tile_n refer to tiling of w.
-  # k tiling of w is not supported;
-  # fusion + n tiling of w (thus k tiling of w2) is not supported.
-  if tile_k != x.col_size or tile_n != w2.in_size:
+  # Fused execution does not support weight tiling along K, K2, or N.
+  if tile_k != x.col_size or tile_k2 != w2.in_size or tile_n != w2.out_size:
     return False
   estimate = _vmem_estimate(
       x=x,
       w=w,
       w2=w2,
+      is_fused_act=is_fused_act,
       matmul_dtype=matmul_dtype,
       acc_dtype=acc_dtype,
       out_dtype=out_dtype,
-      size_out_m=size_out_m,
-      size_out_n=size_out_n,
       tile_m=tile_m,
       tile_k=tile_k,
+      tile_k2=tile_k2,
       tile_n=tile_n,
       num_xo_buffers=num_xo_buffers,
       num_w_buffers=num_w_buffers,
       tpu_info=tpu_info,
   )
-  return estimate <= int(vmem_usage_fraction * vmem_limit_bytes)
+  return estimate <= vmem_limit_bytes

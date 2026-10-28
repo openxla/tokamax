@@ -81,13 +81,11 @@ def make_gmm_config(
   x = arg.ActivationSpec(
       row_size=num_rows, col_size=size_k, dtype=jnp.dtype(jnp.bfloat16)
   )
-  w = (
-      arg.WeightSpec(
-          group_size=num_local_groups,
-          in_size=size_k,
-          out_size=size_n,
-          dtype=jnp.dtype(jnp.bfloat16),
-      ),
+  w = arg.WeightSpec(
+      group_size=num_local_groups,
+      in_size=size_k,
+      out_size=size_n,
+      dtype=jnp.dtype(jnp.bfloat16),
   )
   tpu_info = pltpu.get_tpu_info()
   dim = config.Dimension.create(

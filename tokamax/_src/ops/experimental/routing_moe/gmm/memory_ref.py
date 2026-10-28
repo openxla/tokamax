@@ -61,7 +61,7 @@ class AbstractWeightRef(abc.ABC):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class SingleWeightRef[T](AbstractWeightRef):
-  """Dataclass for a single weights."""
+  """Weight, optional scale, and optional bias references for one projection."""
 
   weight: T
   scale: T | None
@@ -88,7 +88,7 @@ class SingleWeightRef[T](AbstractWeightRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class FusedWeightsRef[T](AbstractWeightRef):
-  """Dataclass for gate and up weights used in fused activation."""
+  """Gate and up weight references for a fused gated activation."""
 
   gate: SingleWeightRef[T]
   up: SingleWeightRef[T]
@@ -455,7 +455,7 @@ class BranchlessBufferedRef(RoutingBufferedRef):
       live: jax.Array,
       sem: Any,
   ) -> None:
-    """Starts the DMA of one VMEM row `src` to output row `idx`."""
+    """Starts the DMA of one VMEM row src to output row idx."""
     del live
     pltpu.make_async_copy(
         src_ref=src_ref,
@@ -681,9 +681,9 @@ class PipelineBlockSpecs:
         self.index_map_provider.out_index,
     )
 
-  def get_weight_spec(self, cfg: config.SingleGmmConfig) -> pl.BlockSpec:
+  def get_weight_spec(self, tile_k: int, tile_n: int) -> pl.BlockSpec:
     """Returns the BlockSpec for an expert weight tensor."""
-    block_shape = (None, cfg.tile_k, cfg.tile_n)
+    block_shape = (None, tile_k, tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.weight_index,
@@ -695,9 +695,9 @@ class PipelineBlockSpecs:
         ),
     )
 
-  def get_scale_spec(self, cfg: config.SingleGmmConfig) -> pl.BlockSpec:
+  def get_scale_spec(self, tile_n: int) -> pl.BlockSpec:
     """Returns the BlockSpec for a quantization scale tensor."""
-    block_shape = (None, 1, 1, cfg.tile_n)
+    block_shape = (None, 1, 1, tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.scale_index,
@@ -732,35 +732,34 @@ class PipelineInputs[T]:
   """Pipelined input parameter bundle for the routing GMM kernel.
 
   Devoid of stateful data management so emit_pipeline and inner_pipeline can
-  remains in the main orchestrators.
+  remain in the main orchestrators.
 
   Attributes:
     x: Input activation reference, BlockSpec, or BufferedRef.
-    w: Tuple of expert weight references, BlockSpec trees, or BufferedRef trees
-      per GMM stage.
+    w: Expert weight reference, BlockSpec tree, or BufferedRef tree.
+    w2: Optional second expert weight reference, BlockSpec tree, or BufferedRef
+      tree for fused gate/up and down execution.
     gather_idx: Row indices used by x. Set to None when DIRECT mode is used.
     scatter_idx: Row indices used by out. Set to None when DIRECT mode is used.
   """
 
   x: T
-  w: tuple[AbstractWeightRef, ...]
+  w: AbstractWeightRef
+  w2: AbstractWeightRef | None = None
   gather_idx: T | None = None
   scatter_idx: T | None = None
 
   def transform_for_pipeline(self, cfg: config.RoutingGmmConfig) -> Self:
     """Returns inputs with weights sliced for fused gate/up activation."""
-
-    w_fused_list = []
-    for w_ref, stage in zip(self.w, cfg.stages, strict=True):
-      if stage.fuse_act is None:
-        w_fused_list.append(w_ref)
-      else:
-        assert isinstance(w_ref, SingleWeightRef)
-        w_up = jax.tree.map(
-            lambda ref, n=stage.size_out_n: ref.at[..., n:], w_ref
-        )
-        w_fused_list.append(FusedWeightsRef(gate=w_ref, up=w_up))
-    return dataclasses.replace(self, w=tuple(w_fused_list))
+    if cfg.fuse_act is None:
+      return self
+    assert isinstance(self.w, SingleWeightRef)
+    n = cfg.w.out_size // 2
+    w_fused = FusedWeightsRef(
+        gate=self.w,
+        up=jax.tree.map(lambda ref: ref.at[..., n:], self.w),
+    )
+    return dataclasses.replace(self, w=w_fused)
 
 
 @jax.tree_util.register_dataclass
@@ -769,7 +768,7 @@ class PipelineAllocs:
   """BufferedRef allocations for the routing GMM pipeline.
 
   Devoid of stateful data management so emit_pipeline and inner_pipeline can
-  remains in the main orchestrators.
+  remain in the main orchestrators.
 
   Attributes:
     inputs: Pipelined input BufferedRef bundle.
@@ -802,30 +801,54 @@ class PipelineAllocs:
     pipeline_block_specs = PipelineBlockSpecs(cfg, pipeline_index_maps)
     x_hbm_ref = in_hbm_ref.x
 
-    w_brefs = []
-    for w_hbm_ref, stage in zip(in_hbm_ref.w, cfg.stages, strict=True):
+    def _make_weight_bref(
+        w_hbm_ref: AbstractWeightRef,
+        has_scale: bool,
+        tile_k: int,
+        tile_n: int,
+        *,
+        fuse_act: bool = False,
+    ) -> AbstractWeightRef:
       assert isinstance(w_hbm_ref, SingleWeightRef)
       scale_bref = None
-      if stage.w.has_scale:
+      if has_scale:
         assert w_hbm_ref.scale is not None
         scale_bref = pltpu.BufferedRef.input(
-            spec=pipeline_block_specs.get_scale_spec(stage),
+            spec=pipeline_block_specs.get_scale_spec(tile_n),
             dtype_or_type=w_hbm_ref.scale.dtype,
             buffer_count=cfg.plan.num_w_buffers,
             use_lookahead=True,
             grid_rank=3,
         )
       weight_bref = pltpu.BufferedRef.input(
-          spec=pipeline_block_specs.get_weight_spec(stage),
+          spec=pipeline_block_specs.get_weight_spec(tile_k, tile_n),
           dtype_or_type=w_hbm_ref.weight.dtype,
           buffer_count=cfg.plan.num_w_buffers,
           use_lookahead=True,
           grid_rank=3,
       )
       w_bref = SingleWeightRef(weight=weight_bref, scale=scale_bref, bias=None)
-      if stage.fuse_act is not None:
+      if fuse_act:
         w_bref = FusedWeightsRef(gate=w_bref, up=w_bref)
-      w_brefs.append(w_bref)
+      return w_bref
+
+    w_tile_n = cfg.plan.tile_n if cfg.plan.tile_k2 is None else cfg.plan.tile_k2
+    w_bref = _make_weight_bref(
+        in_hbm_ref.w,
+        cfg.w.has_scale,
+        cfg.plan.tile_k,
+        w_tile_n,
+        fuse_act=cfg.fuse_act is not None,
+    )
+    w2_bref = None
+    if cfg.w2 is not None:
+      assert in_hbm_ref.w2 is not None and cfg.plan.tile_k2 is not None
+      w2_bref = _make_weight_bref(
+          in_hbm_ref.w2,
+          cfg.w2.has_scale,
+          cfg.plan.tile_k2,
+          cfg.plan.tile_n,
+      )
 
     def _get_buffered_ref(mode: config.RoutingMode) -> type[RoutingBufferedRef]:
       match mode:
@@ -890,7 +913,8 @@ class PipelineAllocs:
     return cls(
         inputs=PipelineInputs(
             x=x_bref,
-            w=tuple(w_brefs),
+            w=w_bref,
+            w2=w2_bref,
             gather_idx=gather_bref,
             scatter_idx=scatter_bref,
         ),

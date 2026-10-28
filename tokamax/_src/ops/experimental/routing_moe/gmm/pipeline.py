@@ -18,7 +18,6 @@
 import dataclasses
 import functools
 
-import jax
 from jax import lax
 from jax.experimental import hijax
 from jax.experimental import pallas as pl
@@ -58,7 +57,7 @@ def inner_pipeline(
   n_id, gm_id, k_id = pl.program_id(0), pl.program_id(1), pl.program_id(2)
   num_xo_buffers = cfg.plan.num_xo_buffers
 
-  def _at(gm_offset: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+  def _at(gm_offset: int) -> memory_ref.GridIndices:
     return (n_id, gm_id + gm_offset, k_id)
 
   x_ref = pltpu.annotate(in_ref.x, no_hazard_no_deps=True)
@@ -72,31 +71,27 @@ def inner_pipeline(
     # Step 2: Start DMA for previous step slot.
     # NOTE: While we typically issue DMA for the other slots before waiting for
     # current slot, that will prevent DMA instructions to be pipelined with
-    # compute.  Therefore, DMA is issued after the waiting.
+    # compute. Therefore, DMA is issued after the waiting.
     x_bref.branchless_copy_in(x_hbm_ref, _at(num_xo_buffers - 1))
 
     # Step 3: Load data from VMEM.
     act = layout_util.load_compact_to_large(x_ref.at[:bucket_m], cfg.dim.size_k)
 
-    # Step 4: Perform computation across GMM stage(s).
-    for i, (stage, w_ref) in enumerate(zip(cfg.stages, in_ref.w, strict=True)):
-      if i > 0:
-        act = act.astype(x_ref.dtype)
-      weight = w_ref.get_weight()
-      weight_scale = w_ref.get_scale() if stage.w.has_scale else None
-      act = compute.matmul(
-          stage,
-          act,
-          weight,
-          weight_scale,
-          None,
-          tpu_info=cfg.tpu_info,
-      )
-      act = compute.apply_act_fn(act, stage.fuse_act)
+    # Step 4: Perform computation.
+    weight = in_ref.w.get_weight()
+    weight_scale = in_ref.w.get_scale() if cfg.w.has_scale else None
+    act = compute.matmul(cfg.compute, act, weight, weight_scale, None)
+    act = compute.apply_act_fn(act, cfg.fuse_act)
+    if cfg.w2 is not None:
+      assert in_ref.w2 is not None and cfg.compute2 is not None
+      act = act.astype(x_ref.dtype)
+      weight2 = in_ref.w2.get_weight()
+      weight2_scale = in_ref.w2.get_scale() if cfg.w2.has_scale else None
+      act = compute.matmul(cfg.compute2, act, weight2, weight2_scale, None)
 
-    # Start output DMA for previous step slot after the loads: a remote DMA is
-    # a global memory barrier, so issuing it earlier would hold every load and
-    # the matmul behind it instead of sharing bundles with the matmul.
+    # Start output DMA for previous step slot after the loads because a remote
+    # DMA is a global memory barrier, so issuing it earlier would hold every
+    # load and the matmul behind it instead of sharing bundles with the matmul.
     out_bref.branchless_copy_out(out_hbm_ref, _at(-1))
 
     # Step 5: Store output into VMEM.

@@ -97,38 +97,44 @@ def _dequantize(
   return (w_f32 * scale.astype(jnp.float32)).reshape(g, -1, n).astype(dtype)
 
 
-@jax.jit(static_argnames=("fuse_act", "out_dtype"))
-def reference_gmm(
-    x_sorted: jax.Array,
-    w: tuple[arg.SingleWeightWrapper[jax.Array], ...],
+def _ragged_matmul(
+    x: jax.Array,
+    w: arg.SingleWeightWrapper[jax.Array],
     group_sizes: jax.Array,
-    *,
-    fuse_act: str | None = None,
-    out_dtype: jax.typing.DTypeLike | None = None,
 ) -> jax.Array:
-  """Computes a 1- or 2-stage grouped matmul on sorted rows in pure XLA."""
-  assert len(w) in (1, 2)
-  in_dtype = x_sorted.dtype
-  act = x_sorted
-  for i, stage_w in enumerate(w):
-    if i > 0:
-      act = act.astype(in_dtype)
-    acc = jax.lax.ragged_dot(
-        act,
-        _dequantize(stage_w.weight, stage_w.scale, act.dtype),
+  """Computes grouped x @ w + bias in float32."""
+  acc = jax.lax.ragged_dot(
+      x,
+      _dequantize(w.weight, w.scale, x.dtype),
+      group_sizes,
+      preferred_element_type=jnp.float32,
+  )
+  if w.bias is not None:
+    ones = jnp.ones((x.shape[0], 1), dtype=jnp.float32)
+    acc += jax.lax.ragged_dot(
+        ones,
+        w.bias.astype(jnp.float32),
         group_sizes,
         preferred_element_type=jnp.float32,
     )
-    if stage_w.bias is not None:
-      ones = jnp.ones((act.shape[0], 1), dtype=jnp.float32)
-      acc += jax.lax.ragged_dot(
-          ones,
-          stage_w.bias.astype(jnp.float32),
-          group_sizes,
-          preferred_element_type=jnp.float32,
-      )
-    act = _apply_act_fn(acc, fuse_act if i == 0 else None)
-  return act.astype(in_dtype if out_dtype is None else out_dtype)
+  return acc
+
+
+@jax.jit(static_argnames=("fuse_act", "out_dtype"))
+def reference_gmm(
+    x_sorted: jax.Array,
+    w: arg.SingleWeightWrapper[jax.Array],
+    group_sizes: jax.Array,
+    *,
+    w2: arg.SingleWeightWrapper[jax.Array] | None = None,
+    fuse_act: str | None = None,
+    out_dtype: jax.typing.DTypeLike | None = None,
+) -> jax.Array:
+  """Computes grouped matmul on sorted rows in pure XLA."""
+  act = _apply_act_fn(_ragged_matmul(x_sorted, w, group_sizes), fuse_act)
+  if w2 is not None:
+    act = _ragged_matmul(act.astype(x_sorted.dtype), w2, group_sizes)
+  return act.astype(x_sorted.dtype if out_dtype is None else out_dtype)
 
 
 @jax.jit
@@ -139,7 +145,7 @@ def unfused_gather_gmm(
     gather_indices: jax.Array,
 ) -> jax.Array:
   """Gathers rows and runs a grouped matmul as an unfused XLA baseline."""
-  return reference_gmm(x[gather_indices], (w,), group_sizes, fuse_act="silu")
+  return reference_gmm(x[gather_indices], w, group_sizes, fuse_act="silu")
 
 
 @jax.jit
@@ -150,7 +156,7 @@ def unfused_gmm_scatter(
     sorted_to_flat: jax.Array,
 ) -> jax.Array:
   """Runs a grouped matmul and scatters rows as an unfused XLA baseline."""
-  out = reference_gmm(x_sorted, (w,), group_sizes)
+  out = reference_gmm(x_sorted, w, group_sizes)
   mask = jnp.arange(out.shape[0]) < group_sizes.sum()
   out = jnp.where(mask[:, None], out, 0)
   return jnp.zeros_like(out).at[sorted_to_flat].set(out)
@@ -237,7 +243,7 @@ def reference_moe(
   )
   w2 = arg.make_weight_wrapper(moe.w2, moe.w2_scale, moe.w2_bias)
   out_sorted = reference_gmm(
-      x_sorted, (w1, w2), group_sizes, fuse_act=shape.activation
+      x_sorted, w1, group_sizes, w2=w2, fuse_act=shape.activation
   )
   rows = jnp.zeros_like(out_sorted).at[sorted_to_flat].set(out_sorted)
   dtype = moe.hidden_states.dtype

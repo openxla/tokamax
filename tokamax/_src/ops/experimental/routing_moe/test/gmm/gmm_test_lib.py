@@ -167,7 +167,7 @@ def sharded_gmm_unpermute(
   ) -> jax.Array:
     out = kernel.routing_gmm(
         x,
-        (arg.make_weight_wrapper(w),),
+        arg.make_weight_wrapper(w),
         group_sizes,
         group_offset=offset,
         scatter=arg.make_routing_wrapper(
