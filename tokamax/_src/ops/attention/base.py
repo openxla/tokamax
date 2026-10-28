@@ -794,6 +794,52 @@ def _softmax_jvp(normalize, primals, tangents):
   return (y, residual), (y_dot, jax.tree.map(jnp.zeros_like, residual))
 
 
+def repeat_kv_heads(x, axis: int, num_heads_q: int, num_heads_k: int):
+  """Repeats `x` along `axis` from `num_heads_k` to `num_heads_q` if needed."""
+  if (
+      x is not None
+      and 1 < num_heads_k < num_heads_q
+      and -x.ndim <= axis < x.ndim
+      and x.shape[axis] == num_heads_k
+  ):
+    return jnp.repeat(x, num_heads_q // num_heads_k, axis=axis)
+  return x
+
+
+def mask_as_array(mask: Mask, q, k, q_indices, k_indices):
+  """Converts `mask` to a boolean array, repeating KV-head dims if needed."""
+  num_heads_q, num_heads_k = q.shape[-2], k.shape[-2]
+  fields = (
+      (mask.bool_mask, -3),
+      (mask.q_start, -2),
+      (mask.q_end, -2),
+      (mask.k_start, -2),
+      (mask.k_end, -2),
+      (q_indices, -2),
+      (k_indices, -2),
+  )
+  if any(
+      x is not None and x.ndim >= -ax and x.shape[ax] == num_heads_q
+      for x, ax in fields
+  ):
+    rep = functools.partial(
+        repeat_kv_heads, num_heads_q=num_heads_q, num_heads_k=num_heads_k
+    )
+    mask = dataclasses.replace(
+        mask,
+        bool_mask=rep(mask.bool_mask, -3),
+        q_start=rep(mask.q_start, -2),
+        q_end=rep(mask.q_end, -2),
+        k_start=rep(mask.k_start, -2),
+        k_end=rep(mask.k_end, -2),
+    )
+    q_indices = rep(q_indices, -2)
+    k_indices = rep(k_indices, -2)
+  q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
+  k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
+  return mask.as_array(q_len_or_indices, k_len_or_indices)
+
+
 def fold_q_sequence_heads(
     q: Float[Array, "*B T H D"],
     bias: Float[Array, "*#B #H #T #t"] | None,

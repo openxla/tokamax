@@ -571,12 +571,12 @@ def _fwd(
     k: Float[Array | QArray, "t h D"],
     v: Float[Array | QArray, "t h d"],
     bias: Float[Array, "#H #T #t"] | None,
-    mask: Bool[Array, "#H #T #t"] | None,
+    mask: Bool[Array, "#H #T #t"] | Bool[Array, "#h #T #t"] | None,
     dropout_mask: Bool[Array, "#H #T #t"] | None,
     q_start: Int[Array, "#H #t"] | None,
     q_end: Int[Array, "#H #t"] | None,
-    k_start: Int[Array, "#H #T"] | None,
-    k_end: Int[Array, "#H #T"] | None,
+    k_start: Int[Array, "#H #T"] | Int[Array, "#h #T"] | None,
+    k_end: Int[Array, "#H #T"] | Int[Array, "#h #T"] | None,
     *,
     dropout_rate: float,
     logits_dtype: jnp.dtype,
@@ -770,6 +770,7 @@ def _decompose_mask(mask, q, k, q_indices, k_indices):
   if mask is None:
     return None, False, None, None, None, None
 
+  num_heads_q, num_heads_k = q.shape[-2], k.shape[-2]
   is_causal = False
   q_start = None
   q_end = None
@@ -792,16 +793,19 @@ def _decompose_mask(mask, q, k, q_indices, k_indices):
       if q_indices is None:
         q_indices = jnp.arange(q.shape[-3])
       k_end_ = q_indices + 1
+      if k_end is not None and any(
+          x.ndim >= 2 and x.shape[-2] == num_heads_q for x in (k_end, k_end_)
+      ):
+        k_end = base.repeat_kv_heads(k_end, -2, num_heads_q, num_heads_k)
+        k_end_ = base.repeat_kv_heads(k_end_, -2, num_heads_q, num_heads_k)
       k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
       is_causal = False
 
     k_start = _broadcast_to_rank(k_start, 2)
     k_end = _broadcast_to_rank(k_end, 2)
 
-  q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
-  k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
   return (
-      mask.as_array(q_len_or_indices, k_len_or_indices),
+      base.mask_as_array(mask, q, k, q_indices, k_indices),
       is_causal,
       q_start,
       q_end,
