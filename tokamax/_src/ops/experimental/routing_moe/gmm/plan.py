@@ -316,6 +316,14 @@ def calculate_tiling(
   # Slightly lower vmem limit than total required amount to be conservative.
 
   # Step 1: Set default values.
+  # A group gets at most one row per input token, so a tile never needs more
+  # rows than there are tokens (e.g. decode). Tiles stay a whole number of
+  # sublane tiles of x and, with dynamic quantization, of x in matmul_dtype.
+  min_tile_m = max(
+      tpu_info.get_sublane_tiling(x.dtype),
+      tpu_info.get_sublane_tiling(matmul_dtype),
+  )
+  max_group_rows = min_tile_m * pl.cdiv(x.row_size, min_tile_m)
   num_xo_buffers = plan.num_xo_buffers or 3
   num_w_buffers = plan.num_w_buffers or 2
   # TODO: Support K dim tiling.
@@ -332,8 +340,7 @@ def calculate_tiling(
     bucket_base = 128 // min(pl.cdiv(16, w_bits), 2)
     if is_mxu_quantized:
       bucket_base *= 2
-    if plan.tile_m is not None:
-      bucket_base = min(bucket_base, plan.tile_m)
+    bucket_base = min(bucket_base, plan.tile_m or max_group_rows)
 
   # Size w's output tile against size_k2 when w2 is present, or size_out_n when
   # w is the only weight.
@@ -396,6 +403,8 @@ def calculate_tiling(
       ):
         break
       tile_m = candidate
+    if plan.bucket_base is None:
+      tile_m = min(tile_m, max_group_rows)
 
   estimate = estimate_vmem(tile_m=tile_m, tile_n=w_tile_n)
   if estimate > vmem_limit_bytes:

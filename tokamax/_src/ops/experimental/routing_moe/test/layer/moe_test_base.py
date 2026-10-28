@@ -19,6 +19,7 @@ import dataclasses
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
 from tokamax._src.ops.experimental.routing_moe.test.common import test_util
@@ -48,6 +49,7 @@ class MoETestCase(parameterized.TestCase):
       remote_scatter: bool = False,
       reduce_output: bool = True,
       capture_xprof: bool = False,
+      gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
   ) -> None:
     """Checks that the execution mode matches numerics on `case`."""
     sharding = case.sharding if layout is None else layout.sharding
@@ -56,7 +58,10 @@ class MoETestCase(parameterized.TestCase):
         case, layout, remote_scatter=remote_scatter
     )
     actual = moe_case.run(
-        self.mode, remote_scatter=remote_scatter, reduce_output=reduce_output
+        self.mode,
+        remote_scatter=remote_scatter,
+        reduce_output=reduce_output,
+        gmm_plan=gmm_plan,
     )
     moe_case.assert_close(actual)
     if capture_xprof:
@@ -65,6 +70,7 @@ class MoETestCase(parameterized.TestCase):
             self.mode,
             remote_scatter=remote_scatter,
             reduce_output=reduce_output,
+            gmm_plan=gmm_plan,
         )
 
   def check_matches_reference(

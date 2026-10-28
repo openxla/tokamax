@@ -128,6 +128,12 @@ DECODE_1_EP8 = Case(
 DECODE_64_EP8 = Case(
     "decode_64_ep8", test_shapes.GMM_DECODE, 64, MoESharding(ep=8)
 )
+QWEN_38_FLASH_NEXT_8 = Case(
+    "qwen_38_flash_next_8_ep4",
+    test_shapes.QWEN_38_FLASH_NEXT,
+    8,
+    MoESharding(ep=4),
+)
 
 PREFILL_CASES = (PREFILL_64K, PREFILL_8K, TOP1_200)
 DECODE_CASES = (DECODE_16, DECODE_64_EP8)
@@ -169,5 +175,13 @@ PROD_CASES = (
         test_shapes.GPT_OSS_120,
         (64,),
         shardings=(MoESharding(ep=2), MoESharding(tp=2)),
+    ),
+    # Single-host decode: 1-3 sequences x 4 tokens (MTP, 3 draft tokens).
+    # Attention is TP over the host, so the MoE input is replicated and the MoE
+    # runs EP.
+    *_prod_sweep(
+        test_shapes.QWEN_38_FLASH_NEXT,
+        (4, 8, 12),
+        shardings=(MoESharding(ep=4),),
     ),
 )

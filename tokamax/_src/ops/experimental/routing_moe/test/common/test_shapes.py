@@ -87,6 +87,17 @@ QWEN_35_397B = MoEShape(
     w_dtype=jnp.dtype(jnp.float8_e4m3fn),
     has_shared_expert=True,
 )
+# The intermediate size is 640, padded to the next multiple of 256 until
+# `test_util.check_moe_supported` allows it.
+QWEN_38_FLASH_NEXT = MoEShape(
+    "qwen_38_flash_next",
+    512,
+    10,
+    2560,
+    768,
+    w_dtype=jnp.dtype(jnp.float8_e4m3fn),
+    has_shared_expert=True,
+)
 GPT_OSS_120 = MoEShape(
     "gpt_oss_120",
     128,

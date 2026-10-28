@@ -22,6 +22,7 @@ import jax
 from jax import sharding
 import jax.numpy as jnp
 from tokamax._src import test_utils
+from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
 from tokamax._src.ops.experimental.routing_moe.layer import modular
 from tokamax._src.ops.experimental.routing_moe.layer import monolithic
 from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
@@ -249,6 +250,7 @@ def _reduce(out: jax.Array, *, mesh: Mesh, layout: WeightLayout) -> jax.Array:
         "mesh",
         "remote_scatter",
         "reduce_output",
+        "gmm_plan",
     )
 )
 def _run_moe(
@@ -260,6 +262,7 @@ def _run_moe(
     mesh: Mesh,
     remote_scatter: bool = False,
     reduce_output: bool = True,
+    gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
 ) -> jax.Array:
   """Runs execution mode on routed and optional shared experts, then reduces."""
   routed_kwargs = dict(
@@ -275,6 +278,7 @@ def _run_moe(
       ep_axis=layout.sharding.ep_axis,
       use_sp=layout.use_sp,
       reduce_output=reduce_output,
+      gmm_plan=gmm_plan,
   )
   moe_plan = moe_plan_lib.RoutingMoEPlan(remote_scatter=remote_scatter)
 
@@ -339,6 +343,7 @@ class MoECase:
       *,
       remote_scatter: bool = False,
       reduce_output: bool = True,
+      gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
   ) -> jax.Array:
     """Runs `mode` on `sharded` and blocks until the output is ready."""
     out = _run_moe(
@@ -349,6 +354,7 @@ class MoECase:
         mesh=self.mesh,
         remote_scatter=remote_scatter,
         reduce_output=reduce_output,
+        gmm_plan=gmm_plan,
     )
     return jax.block_until_ready(out)
 

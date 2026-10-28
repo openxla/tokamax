@@ -17,6 +17,7 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
 from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_base
@@ -96,6 +97,21 @@ class MoEProdTest(moe_test_base.MoETestCase):
     layout = moe_test_lib.WeightLayout(case.sharding, use_sp=use_sp)
     self.check_case(
         case, layout, remote_scatter=remote_scatter, capture_xprof=True
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="_unfused",
+          gmm_plan=gmm_plan_lib.RoutingGmmPlan(fuse_up_and_down=False),
+      ),
+  )
+  def test_gmm_plan(self, gmm_plan: gmm_plan_lib.RoutingGmmPlan):
+    """Runs a production case with gmm plans other than the default one."""
+    self.check_case(
+        test_cases.QWEN_38_FLASH_NEXT_8,
+        reduce_output=False,
+        capture_xprof=True,
+        gmm_plan=gmm_plan,
     )
 
 
