@@ -276,7 +276,7 @@ def load_activation_as_compact(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
   """Load activations from VMEM as a compact layout."""
 
-  qkv_vmem_ref[...] = qkv_vreg
+  qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
   q_compact, k_compact, v_compact = load_as_qkv_compact(qkv_vmem_ref, cfgs)
   b_compact = jnp.expand_dims(b_vmem_ref[...], axis=1)
   if cfgs.is_kda:
@@ -299,7 +299,7 @@ def load_activation_as_large(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
   """Load activations from VMEM as a large layout."""
 
-  qkv_vmem_ref[...] = qkv_vreg
+  qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
 
   q_large_list = []
   k_large_list = []
