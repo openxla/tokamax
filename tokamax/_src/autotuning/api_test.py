@@ -17,6 +17,7 @@ import functools
 import gc
 import time
 from typing import Any, override
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -26,6 +27,7 @@ from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
+from tokamax._src import config as config_lib
 from tokamax._src import version
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
@@ -291,6 +293,28 @@ class AutotuningTest(parameterized.TestCase):
     self.assertNotEmpty(result.data)
     _, autotune_data = result.data[0]
     self.assertIn(_HEURISTICS_CONFIG, autotune_data)
+
+  @parameterized.parameters(True, False)
+  def test_autotune_auto_input_layouts(self, enabled):
+    def fn_factory(config):
+      return lambda x: jnp.sin(x.T) * config
+
+    with (
+        config_lib.autotuning_auto_input_layouts(enabled),
+        mock.patch.object(
+            benchmarking,
+            "compile_benchmark",
+            wraps=benchmarking.compile_benchmark,
+        ) as compile_benchmark,
+    ):
+      results = autotuner.Autotuner().autotune(
+          fn_factory, {1.0, 2.0}, jnp.ones((256, 512))
+      )
+    self.assertLen(results.prune_errors(), 2)
+    self.assertLen(compile_benchmark.call_args_list, 2)
+    expected = enabled and jax.default_backend() == "gpu"
+    for call in compile_benchmark.call_args_list:
+      self.assertEqual(call.kwargs["auto_input_layouts"], expected)
 
   def test_bound_args_to_from_json(self):
     if jax.default_backend() == "tpu":

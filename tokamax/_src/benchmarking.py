@@ -29,6 +29,7 @@ import time
 from typing import Any, Final, Literal, cast, overload
 
 import jax
+from jax.experimental import layout as jax_layout
 from jax.experimental.mosaic.gpu import profiler
 import numpy as np
 from tokamax._src import batching
@@ -562,18 +563,25 @@ def _is_concrete(x):
 
 
 def compile_benchmark[T](
-    f: Callable[[T], Any], x: T
+    f: Callable[[T], Any], x: T, *, auto_input_layouts: bool = False
 ) -> Callable[..., BenchmarkData]:
   """Compiles a function and returns a function to benchmark it.
 
   Args:
     f: A JITable function.
     x: Input to `f`
+    auto_input_layouts: Whether XLA chooses the input layouts, as it does for
+      the parameters of a compiled program. If so, the returned function lays
+      out its input to match before timing. Otherwise the inputs use the
+      default layouts, and any transposes `f` applies to them are timed.
 
   Returns:
     A function to run the benchmark and return a `BenchmarkData` object.
   """
-  f = jax.jit(f)
+  if auto_input_layouts:
+    f = jax.jit(f, in_shardings=jax_layout.Format(jax_layout.Layout.AUTO))
+  else:
+    f = jax.jit(f)
   start_time = time.perf_counter()
   lowered = f.lower(x)
   lowering_time = time.perf_counter() - start_time
@@ -583,6 +591,8 @@ def compile_benchmark[T](
 
   assert (memory_analysis := f_compiled.memory_analysis()) is not None
   peak_mem_mb = memory_analysis.peak_memory_in_bytes / 10**6
+  # `f` takes a single argument, so `input_formats` is `((x_formats,), {})`.
+  input_formats = f_compiled.input_formats[0][0] if auto_input_layouts else None
 
   def runner(
       x: T,
@@ -610,6 +620,8 @@ def compile_benchmark[T](
     Returns:
       A `BenchmarkData` object.
     """
+    if input_formats is not None:
+      x = jax.block_until_ready(jax.device_put(x, input_formats))
     concrete_inputs = [
         z
         for z in jax.tree.leaves(x)
