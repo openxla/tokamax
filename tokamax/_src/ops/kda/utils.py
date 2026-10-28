@@ -25,6 +25,7 @@ import os
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import config
 from tokamax._src import jaxtyping
 from tokamax._src.ops.kda.cp_utils import (
     ContextParallelMetadata,
@@ -45,7 +46,24 @@ def exp2(x):
 
 def get_interpret() -> bool:
   env = os.environ.get("PALLAS_INTERPRET", "")
-  return env.strip().lower() in ("1", "true")
+  return env.strip().lower() in ("1", "true") or jax.default_backend() == "cpu"
+
+
+def get_chain_precision() -> jax.lax.Precision:
+  """Precision for the two matmuls on the forward's serial recurrent chain.
+
+  Set by the `tokamax_kda_chain_precision` config option: `highest` (default),
+  `high` or `default`. The two matmuls are `w @ h` and `kg^T @ v_new` in
+  `pallas_mosaic_tpu_fwd_kernel`. Their operands are read from bf16 buffers,
+  so lower precision uses fewer MXU passes. `v_new` feeds the recurrent state,
+  so errors compound across chunks; validate accuracy on TPU (CPU interpret
+  mode does not model TPU matmul precision).
+  """
+  return {
+      "highest": jax.lax.Precision.HIGHEST,
+      "high": jax.lax.Precision.HIGH,
+      "default": jax.lax.Precision.DEFAULT,
+  }[config.kda_chain_precision.value]
 
 
 def cdiv(x, y: int):
@@ -268,7 +286,6 @@ def _align_seqs(
   )
 
 
-
 def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
   """Reverse _align_seqs: scatter aligned output back to original positions.
 
@@ -310,7 +327,6 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
   gather_idx = jnp.full(T_out, safe_default, dtype=jnp.int32)
   gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
   return o[:, :, gather_idx]
-
 
 
 def align_segment_ids(
@@ -525,4 +541,3 @@ def kda_gate_chunk_cumsum(
       scale=scale,
       output_dtype=output_dtype or jnp.float32,
   )
-

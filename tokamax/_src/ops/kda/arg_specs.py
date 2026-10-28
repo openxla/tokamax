@@ -14,7 +14,7 @@
 # ==============================================================================
 """Kimi Delta Attention argument specifications."""
 
-from typing import Final
+from typing import Any, Final
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -61,14 +61,12 @@ def _kimi_linear_48b_a3b_spec(
   dtype = jnp.bfloat16
   qkv_shape = (num_heads, batch_size, seq_len, head_dim)
 
-  args = {
+  args: dict[str, Any] = {
       "query": ShapeDtype(qkv_shape, dtype),
       "key": ShapeDtype(qkv_shape, dtype),
       "value": ShapeDtype(qkv_shape, dtype),
       "gate": ShapeDtype(qkv_shape, dtype),
-      "beta": numerics.RangedArrayInitializer(
-          shape=(num_heads, batch_size, seq_len), dtype=dtype, min=0.0, max=1.0
-      ),
+      "beta": ShapeDtype((num_heads, batch_size, seq_len), dtype),
       "a_log": ShapeDtype((num_heads,), jnp.float32),
       "delta_time_bias": ShapeDtype((num_heads * head_dim,), jnp.float32),
       "output_final_state": False,
@@ -92,6 +90,40 @@ def _kimi_linear_48b_a3b_spec(
   )
 
 
+# Per-chip Gated DeltaNet shapes for Qwen3.5-397B-A17B training: 32 value
+# heads with 128-dimensional key and value states.
+def _qwen3_5_397b_a17b_spec(*, name: str, seq_len: int) -> arg_spec.ArgSpec:
+  """Builds a scalar-gate (Gated DeltaNet) training workload."""
+  batch_size = 1
+  num_heads = 32
+  head_dim = 128
+  dtype = jnp.bfloat16
+  qkv_shape = (num_heads, batch_size, seq_len, head_dim)
+
+  args: dict[str, Any] = {
+      "query": ShapeDtype(qkv_shape, dtype),
+      "key": ShapeDtype(qkv_shape, dtype),
+      "value": ShapeDtype(qkv_shape, dtype),
+      # One pre-activated log-space decay per head and token.
+      "gate": numerics.FloatRangedArrayInitializer(
+          (num_heads, batch_size, seq_len, 1), dtype, minval=-5.0, maxval=0.0
+      ),
+      "beta": numerics.FloatRangedArrayInitializer(
+          (num_heads, batch_size, seq_len), dtype, minval=0.0, maxval=1.0
+      ),
+      "output_final_state": False,
+      "use_qk_l2norm": True,
+      "use_gate_in_kernel": False,
+      "per_channel_gate": False,
+  }
+  return arg_spec.ArgSpec(
+      args=args,
+      project="qwen3_5_397b_a17b",
+      name=name,
+      tags=("primary",),
+  )
+
+
 # Kimi Linear uses 32 KDA heads with 128-dimensional key and value states.
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     _kimi_linear_48b_a3b_spec(
@@ -102,5 +134,9 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         name="packed_training_b1_t8192_n25_bf16",
         seq_len=8192,
         num_segments=25,
+    ),
+    _qwen3_5_397b_a17b_spec(
+        name="gdn_fixed_training_b1_t8192_bf16",
+        seq_len=8192,
     ),
 )

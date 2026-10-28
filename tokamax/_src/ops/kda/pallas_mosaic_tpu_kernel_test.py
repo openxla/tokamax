@@ -17,6 +17,7 @@
 from collections.abc import Sequence
 import dataclasses
 import math
+from typing import Any
 
 from absl import logging
 import jax
@@ -99,6 +100,8 @@ def compare_tensor(
   max_value = np.max(np.abs(expected_np))
   max_relative_diff = np.max(diff / (np.abs(expected_np) + 1e-12))
   rms_error_ratio = None
+  ulp = None
+  tolerance = None
   if max_rms_error_ratio is not None:
     rms_error = np.sqrt(np.mean(np.square(diff)))
     reference_rms = np.sqrt(np.mean(np.square(expected_np)))
@@ -141,6 +144,7 @@ def compare_tensor(
       logging.error("    Diff            = %s", diff[index])
       return False
 
+    assert tolerance is not None and ulp is not None
     error_ratio = diff / (tolerance + 1e-12)
     index = np.unravel_index(np.argmax(error_ratio), error_ratio.shape)
     logging.error("  Max Mismatch details at index %s:", index)
@@ -180,6 +184,11 @@ class TestConfig:
   output_final_state: bool = False
   use_qk_l2norm: bool = False
   use_gate_in_kernel: bool = False
+  # False selects a scalar gate of shape [H, B, T, 1] (Gated DeltaNet).
+  per_channel_gate: bool = True
+  chunk_size: int | None = None
+  # Width of the fused depthwise causal conv1d on q/k/v; None disables it.
+  conv_width: int | None = None
   safe_gate: bool = True
   lower_bound: float | None = None
   disable_recompute: bool = True
@@ -237,6 +246,22 @@ class _Inputs:
   segment_ids: jax.Array | None
   dout: jax.Array
   dfinal_state: jax.Array | None
+  conv_weight_q: jax.Array | None = None
+  conv_weight_k: jax.Array | None = None
+  conv_weight_v: jax.Array | None = None
+  conv_bias_q: jax.Array | None = None
+  conv_bias_k: jax.Array | None = None
+  conv_bias_v: jax.Array | None = None
+
+
+_CONV_PARAM_NAMES = (
+    "conv_weight_q",
+    "conv_weight_k",
+    "conv_weight_v",
+    "conv_bias_q",
+    "conv_bias_k",
+    "conv_bias_v",
+)
 
 
 def make_test_config(
@@ -343,7 +368,7 @@ def _varlen_case(
   layouts = batch_seq_lens if batch_seq_lens is not None else (seq_lens,)
   assert layouts is not None
   if T is None:
-    T = max(sum(layout) for layout in layouts)
+    T = max(sum(layout) for layout in layouts if layout is not None)
   is_bf16 = dtype == jnp.bfloat16
   forward_atol = kwargs.pop("forward_atol", 0.05 if is_bf16 else 5e-4)
   forward_rtol = kwargs.pop("forward_rtol", 0.05 if is_bf16 else 5e-4)
@@ -407,7 +432,9 @@ def _cp_case(
       D=128,
       seq_lens=seq_lens,
       batch_seq_lens=batch_seq_lens,
-      max_num_segments_override=max(len(layout) for layout in layouts),
+      max_num_segments_override=max(
+          len(layout) for layout in layouts if layout is not None
+      ),
       cp_size=cp_size,
       dtype=dtype,
       input_profile=input_profile,
@@ -684,6 +711,320 @@ _CASES.extend([
     _varlen_case("varlen_empty_states_no_h0", seq_lens=(64, 128), T=256, N_pad=8, forward_check="empty_states"),
 ])
 
+
+def _gdn_case(name: str, **cfg) -> TestConfig:
+  """Builds a Gated DeltaNet (scalar, pre-activated log-space gate) case."""
+  return make_test_config(
+      f"gdn_{name}",
+      D=128,
+      input_profile="model",
+      per_channel_gate=False,
+      use_qk_l2norm=True,
+      **cfg,
+  )
+
+
+def _conv_case(name: str, **cfg) -> TestConfig:
+  """Builds a case with the depthwise causal conv1d fused into the kernel."""
+  cfg.setdefault("conv_width", 4)
+  return make_test_config(
+      f"conv_{name}",
+      D=128,
+      input_profile="model",
+      use_qk_l2norm=True,
+      **cfg,
+  )
+
+
+# Normalized RMS error limits, ||actual - expected|| / ||expected||, against
+# the XLA reference. The fp32 limits are FLA's KDA limits used by
+# `make_test_config`. The bf16 limits are looser because the kernel keeps
+# intermediates (Aqk, w, u, v_new) in bf16.
+_RMS_TOLERANCES_FP32 = dict(
+    forward_rms_error_ratio=5e-3,
+    backward_rms_error_ratio=8e-3,
+    backward_gate_rms_error_ratio=2e-2,
+)
+_RMS_TOLERANCES_BF16 = dict(
+    forward_rms_error_ratio=2e-2,
+    backward_rms_error_ratio=3e-2,
+    backward_gate_rms_error_ratio=6e-2,
+)
+
+# Scalar gate (Gated DeltaNet) at the default chunk size of 64.
+_CASES.extend([
+    _gdn_case(
+        "b1_t128_h2_fp32",
+        B=1,
+        T=128,
+        H=2,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _gdn_case(
+        "b1_t128_h2_bf16",
+        B=1,
+        T=128,
+        H=2,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+    _gdn_case(
+        "b2_t128_h8_h0_fp32",
+        B=2,
+        T=128,
+        H=8,
+        use_initial_state=True,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _gdn_case(
+        "b2_t128_h8_final_bf16",
+        B=2,
+        T=128,
+        H=8,
+        output_final_state=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+    _gdn_case(
+        "b1_t1024_h2_h0_final_fp32",
+        B=1,
+        T=1024,
+        H=2,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _gdn_case(
+        "b1_t1024_h2_h0_final_bf16",
+        B=1,
+        T=1024,
+        H=2,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+    _gdn_case(
+        "b2_t1024_h8_h0_final_fp32",
+        B=2,
+        T=1024,
+        H=8,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _gdn_case(
+        "b2_t1024_h8_h0_final_bf16",
+        B=2,
+        T=1024,
+        H=8,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+    _varlen_case(
+        "gdn_varlen_h0_fp32",
+        seq_lens=(45, 80, 20),
+        T=256,
+        use_initial_state=True,
+        per_channel_gate=False,
+        use_qk_l2norm=True,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _varlen_case(
+        "gdn_varlen_batch_h0_bf16",
+        batch_seq_lens=((64, 128), (30, 50)),
+        T=256,
+        use_initial_state=True,
+        per_channel_gate=False,
+        use_qk_l2norm=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+])
+
+# Scalar gate with non-default chunk sizes (per-channel gates require 64).
+_CASES.extend([
+    _gdn_case(
+        "chunk16_b1_t512_h2_h0_final_fp32",
+        B=1,
+        T=512,
+        H=2,
+        chunk_size=16,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _gdn_case(
+        "chunk16_b1_t512_h2_h0_final_bf16",
+        B=1,
+        T=512,
+        H=2,
+        chunk_size=16,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+    _gdn_case(
+        "chunk32_b1_t512_h2_h0_final_fp32",
+        B=1,
+        T=512,
+        H=2,
+        chunk_size=32,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _gdn_case(
+        "chunk32_b1_t512_h2_h0_final_bf16",
+        B=1,
+        T=512,
+        H=2,
+        chunk_size=32,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+    _gdn_case(
+        "chunk128_b1_t512_h2_h0_final_fp32",
+        B=1,
+        T=512,
+        H=2,
+        chunk_size=128,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _gdn_case(
+        "chunk128_b1_t512_h2_h0_final_bf16",
+        B=1,
+        T=512,
+        H=2,
+        chunk_size=128,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+    _gdn_case(
+        "chunk256_b1_t512_h2_h0_final_fp32",
+        B=1,
+        T=512,
+        H=2,
+        chunk_size=256,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _gdn_case(
+        "chunk256_b1_t512_h2_h0_final_bf16",
+        B=1,
+        T=512,
+        H=2,
+        chunk_size=256,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+])
+
+# Fused conv1d + SiLU on q/k/v with one conv filter per head
+# (H_Q == H_K == H). The backward also checks the conv weight and bias
+# gradients.
+_CASES.extend([
+    _conv_case(
+        "gdn_b1_t256_h2_fp32",
+        B=1,
+        T=256,
+        H=2,
+        per_channel_gate=False,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _conv_case(
+        "gdn_b1_t256_h2_bf16",
+        B=1,
+        T=256,
+        H=2,
+        per_channel_gate=False,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+    _conv_case(
+        "gdn_b2_t512_h4_h0_final_fp32",
+        B=2,
+        T=512,
+        H=4,
+        per_channel_gate=False,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _conv_case(
+        "gdn_b2_t512_h4_h0_final_bf16",
+        B=2,
+        T=512,
+        H=4,
+        per_channel_gate=False,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+    _conv_case(
+        "gdn_chunk128_b1_t512_h2_fp32",
+        B=1,
+        T=512,
+        H=2,
+        per_channel_gate=False,
+        chunk_size=128,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _conv_case(
+        "gdn_w8_b1_t256_h2_fp32",
+        B=1,
+        T=256,
+        H=2,
+        per_channel_gate=False,
+        conv_width=8,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _conv_case(
+        "kda_b1_t256_h2_fp32",
+        B=1,
+        T=256,
+        H=2,
+        dtype=jnp.float32,
+        **_RMS_TOLERANCES_FP32,
+    ),
+    _conv_case(
+        "kda_b1_t256_h2_h0_final_bf16",
+        B=1,
+        T=256,
+        H=2,
+        use_initial_state=True,
+        output_final_state=True,
+        dtype=jnp.bfloat16,
+        **_RMS_TOLERANCES_BF16,
+    ),
+])
+
 def _case_params(direction: str):
   if direction == "forward":
     cases = (case for case in _CASES if case.run_forward)
@@ -907,9 +1248,48 @@ def _make_inputs(case: TestConfig) -> _Inputs:
   else:
     raise ValueError(f"Unknown input profile: {profile}")
 
+  extra_keys = jax.random.split(keys[11], 1 + len(_CONV_PARAM_NAMES))
+  if not case.per_channel_gate:
+    if case.use_gate_in_kernel:
+      raise ValueError("Scalar gates must be pre-activated log-space values.")
+    # Gated DeltaNet: one log-space decay per head and token. The shift keeps
+    # most decays mild (mean log-decay about -0.2), so state carries across
+    # chunks; the clip mirrors the safe-gate range of the per-channel cases.
+    g = jnp.clip(
+        jax.nn.log_sigmoid(
+            jax.random.normal(
+                extra_keys[0],
+                (case.heads, case.batch, case.seq_len, 1),
+                dtype=jnp.float32,
+            )
+            + 2.0
+        ),
+        -5.0,
+        0.0,
+    )
+
+  conv_params = {}
+  if case.conv_width is not None:
+    # Matches PyTorch's default depthwise Conv1d init, U(-1/sqrt(W), 1/sqrt(W)).
+    bound = case.conv_width**-0.5
+    conv_shapes = (
+        (case.heads, case.conv_width, case.key_dim),
+        (case.heads, case.conv_width, case.key_dim),
+        (case.heads, case.conv_width, case.value_dim),
+        (case.heads, case.key_dim),
+        (case.heads, case.key_dim),
+        (case.heads, case.value_dim),
+    )
+    for param_key, name, shape in zip(
+        extra_keys[1:], _CONV_PARAM_NAMES, conv_shapes, strict=True
+    ):
+      conv_params[name] = jax.random.uniform(
+          param_key, shape, minval=-bound, maxval=bound
+      ).astype(case.dtype)
+
   if case.gate_mask_probability > 0:
     gate_mask = (
-        jax.random.uniform(keys[10], qk_shape, dtype=jnp.float32)
+        jax.random.uniform(keys[10], g.shape, dtype=jnp.float32)
         > case.gate_mask_probability
     )
     g = g * gate_mask
@@ -966,6 +1346,7 @@ def _make_inputs(case: TestConfig) -> _Inputs:
       segment_ids=segment_ids,
       dout=dout,
       dfinal_state=dfinal_state,
+      **conv_params,
   )
   if case.forward_check == "padding_tail":
     inputs = dataclasses.replace(
@@ -988,17 +1369,23 @@ def _make_inputs(case: TestConfig) -> _Inputs:
   return inputs
 
 
-def _attention_kwargs(case: TestConfig, inputs: _Inputs) -> dict[str, object]:
+def _attention_kwargs(case: TestConfig, inputs: _Inputs) -> dict[str, Any]:
   return dict(
       a_log=inputs.a_log if case.use_gate_in_kernel else None,
-      delta_time_bias=inputs.delta_time_bias if case.use_gate_in_kernel else None,
+      delta_time_bias=inputs.delta_time_bias
+      if case.use_gate_in_kernel
+      else None,
       scale=case.effective_scale,
       initial_state=inputs.initial_state,
       output_final_state=case.output_final_state,
       use_qk_l2norm=case.use_qk_l2norm,
       use_gate_in_kernel=case.use_gate_in_kernel,
+      per_channel_gate=case.per_channel_gate,
+      chunk_size=case.chunk_size,
       lower_bound=case.lower_bound,
       max_num_segments=case.max_num_segments,
+      use_conv1d_in_kernel=case.conv_width is not None,
+      **{name: getattr(inputs, name) for name in _CONV_PARAM_NAMES},
   )
 
 
@@ -1011,10 +1398,16 @@ def _call_attention(
 ):
   attention_kwargs = _attention_kwargs(case, inputs)
   if implementation == "mosaic":
+    config_kwargs = {}
+    if case.chunk_size is not None:
+      # The forward takes its chunk size from this explicit config, while the
+      # VJP derives it from the `chunk_size` argument; keep the two in sync.
+      config_kwargs["chunk_size"] = case.chunk_size
     attention = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention(
         config=pallas_mosaic_tpu.Config(
             safe_gate=case.safe_gate,
             rematerialize_for_backward=not case.disable_recompute,
+            **config_kwargs,
         )
     )
     return attention(
@@ -1158,7 +1551,10 @@ def _direct_backward(
     case: TestConfig,
     inputs: _Inputs,
 ) -> tuple[jax.Array, ...]:
-  def loss_fn(q, k, v, g, beta, initial_state, a_log, delta_time_bias):
+
+  def loss_fn(
+      q, k, v, g, beta, initial_state, a_log, delta_time_bias, conv_params
+  ):
     current_inputs = dataclasses.replace(
         inputs,
         q=q,
@@ -1169,6 +1565,7 @@ def _direct_backward(
         initial_state=initial_state,
         a_log=a_log,
         delta_time_bias=delta_time_bias,
+        **conv_params,
     )
     output, final_state = _call_attention(
         implementation, case, current_inputs
@@ -1183,7 +1580,9 @@ def _direct_backward(
   argnums = [0, 1, 2, 3, 4]
   if case.use_initial_state:
     argnums.append(5)
-  return jax.grad(loss_fn, argnums=tuple(argnums))(
+  if case.conv_width is not None:
+    argnums.append(8)
+  grads = jax.grad(loss_fn, argnums=tuple(argnums))(
       inputs.q,
       inputs.k,
       inputs.v,
@@ -1192,7 +1591,12 @@ def _direct_backward(
       inputs.initial_state,
       inputs.a_log,
       inputs.delta_time_bias,
+      {name: getattr(inputs, name) for name in _CONV_PARAM_NAMES},
   )
+  if case.conv_width is not None:
+    *grads, conv_grads = grads
+    grads = (*grads, *(conv_grads[name] for name in _CONV_PARAM_NAMES))
+  return tuple(grads)
 
 
 def _require_tpu(case: TestConfig) -> None:
@@ -1300,6 +1704,8 @@ def test_chunk_kda_backward(case: TestConfig):
   grad_names = ("dq", "dk", "dv", "dg", "dbeta")
   if case.use_initial_state:
     grad_names += ("dh0",)
+  if case.conv_width is not None:
+    grad_names += tuple(f"d{name}" for name in _CONV_PARAM_NAMES)
 
   if case.backward_check == "finite":
     output, _ = (
@@ -1349,5 +1755,134 @@ def test_chunk_kda_backward(case: TestConfig):
     ), f"Gradient mismatch for {name}"
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("scalar_gate", [True, False])
+def test_saved_v_new_vs_recomputed_v_new(dtype, scalar_gate):
+  if jax.default_backend() != "tpu":
+    pytest.skip("TPU required")
+  from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_kernel
+  from tokamax._src.ops.kda import pallas_mosaic_tpu_fwd_kernel
+
+  H, B, T, K, V = 4, 2, 256, 128, 128
+  chunk_size = 64
+  key = jax.random.PRNGKey(42)
+  k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
+  q = jax.random.normal(k1, (H, B, T, K), dtype=dtype) * 0.1
+  k = jax.random.normal(k2, (H, B, T, K), dtype=dtype) * 0.1
+  v = jax.random.normal(k3, (H, B, T, V), dtype=dtype) * 0.1
+  g_shape = (H, B, T, 1) if scalar_gate else (H, B, T, K)
+  g = -jnp.abs(jax.random.uniform(k4, g_shape, dtype=dtype)) * 0.5
+  beta = jax.random.uniform(k5, (H, B, T), dtype=dtype) * 0.5
+  do = jax.random.normal(k6, (H, B, T, V), dtype=dtype) * 0.1
+
+  (_, _), residuals = pallas_mosaic_tpu_fwd_kernel.chunk_kda_fwd_custom(
+      q=q,
+      k=k,
+      v=v,
+      g=g,
+      beta=beta,
+      scale=K**-0.5,
+      initial_state=None,
+      output_final_state=False,
+      use_gate_in_kernel=False,
+      a_log=None,
+      delta_time_bias=None,
+      safe_gate=True,
+      per_channel_gate=not scalar_gate,
+      lower_bound=None,
+      disable_recompute=True,
+      chunk_size=chunk_size,
+      return_residuals=True,
+  )
+  assert residuals is not None
+  assert (
+      residuals.v_new is not None
+  ), "Expected v_new to be saved in forward residuals"
+
+  grads_saved = pallas_mosaic_tpu_bwd_kernel.chunk_kda_bwd_custom(
+      scale=K**-0.5,
+      use_qk_l2norm=False,
+      use_gate_in_kernel=False,
+      disable_recompute=True,
+      lower_bound=None,
+      chunk_size=chunk_size,
+      max_num_segments=None,
+      has_initial_state=False,
+      per_channel_gate=not scalar_gate,
+      context_parallel_metadata=None,
+      residuals=residuals,
+      grad_outputs=(do, None),
+  )
+
+  residuals_recompute = dataclasses.replace(residuals, v_new=None)
+  grads_recomp = pallas_mosaic_tpu_bwd_kernel.chunk_kda_bwd_custom(
+      scale=K**-0.5,
+      use_qk_l2norm=False,
+      use_gate_in_kernel=False,
+      disable_recompute=True,
+      lower_bound=None,
+      chunk_size=chunk_size,
+      max_num_segments=None,
+      has_initial_state=False,
+      per_channel_gate=not scalar_gate,
+      context_parallel_metadata=None,
+      residuals=residuals_recompute,
+      grad_outputs=(do, None),
+  )
+
+  names = ("dq", "dk", "dv", "dg", "db")
+  for name, g_saved, g_recomp in zip(names, grads_saved[:5], grads_recomp[:5]):
+    a = np.asarray(g_saved, dtype=np.float64)
+    b = np.asarray(g_recomp, dtype=np.float64)
+    abs_diff = np.abs(a - b)
+    max_abs = float(np.max(abs_diff))
+    max_val = float(np.max(np.abs(b)))
+    rel_linf = max_abs / (max_val + 1e-12)
+    rel_l2 = float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12))
+    sig_mask = np.abs(b) > 0.01 * max_val
+    max_rel_sig = (
+        float(np.max(abs_diff[sig_mask] / np.abs(b[sig_mask])))
+        if np.any(sig_mask)
+        else 0.0
+    )
+    msg = (
+        f"[saved_vs_recomp dtype={dtype} scalar_gate={scalar_gate} {name}] "
+        f"max_abs_err={max_abs:.6e} rel_linf_err={rel_linf:.6e} "
+        f"rel_l2_err={rel_l2:.6e} max_rel_sig={max_rel_sig:.6e}"
+    )
+    logging.info(msg)
+    print(msg)
+    assert compare_tensor(
+        name,
+        g_recomp,
+        g_saved,
+        atol=1e-4 if dtype == jnp.bfloat16 else 1e-5,
+        rtol=1e-3 if dtype == jnp.bfloat16 else 1e-5,
+        dtype=dtype,
+    ), f"Mismatch in {name} between saved v_new and recomputed v_new"
+
+
+class _ShardPlugin:
+
+  def pytest_collection_modifyitems(self, items):
+    import os
+
+    status_file = os.environ.get("TEST_SHARD_STATUS_FILE")
+    if status_file:
+      with open(status_file, "w") as f:
+        f.write("")
+    total = int(os.environ.get("TEST_TOTAL_SHARDS", "1"))
+    idx = int(os.environ.get("TEST_SHARD_INDEX", "0"))
+    if total > 1:
+      items[:] = [item for i, item in enumerate(items) if i % total == idx]
+
+
 if __name__ == "__main__":
-  pytest.main([__file__, "-v"])
+  import sys
+  from absl import app
+
+  app.run(
+      lambda argv: sys.exit(
+          pytest.main([__file__, "-v"], plugins=[_ShardPlugin()])
+      )
+  )

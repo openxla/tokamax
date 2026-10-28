@@ -159,6 +159,18 @@ class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
     )
 
 
+class FloatRangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
+  """An abstract float array initialized uniformly in `[minval, maxval)`."""
+
+  def __init__(self, shape, dtype, minval: float, maxval: float):
+    jax.ShapeDtypeStruct.__init__(self, shape, dtype)
+    self.minval = minval
+    self.maxval = maxval
+
+  def __call__(self, rng: np.random.Generator) -> np.ndarray:
+    return rng.uniform(self.minval, self.maxval, self.shape).astype(self.dtype)
+
+
 # Threshold (in number of elements) above which arrays are initialized directly
 # on device via `jax.jit` + `jax.random` instead of on the host with NumPy.
 # Small arrays stay on the host path to avoid per-shape XLA compile overhead
