@@ -109,7 +109,7 @@ def _compute_stages(
     w_dtype: jax.typing.DTypeLike,
     ws_dtype: jax.typing.DTypeLike,
     xs_dtype: jax.typing.DTypeLike,
-    xsum_dtype: jax.typing.DTypeLike,
+    xsum_dtype: jax.typing.DTypeLike | None,
     acc_dtype: jax.typing.DTypeLike,
     out_dtype: jax.typing.DTypeLike,
     deq_wg: int,
@@ -140,7 +140,11 @@ def _compute_stages(
   w_smem_bytes = block_n * block_k * mgpu_lib.num_bits(w_dtype) // 8
   ws_smem_bytes = block_n * mgpu_lib.num_bits(ws_dtype) // 8
   xs_smem_bytes = cluster_size * block_m * mgpu_lib.num_bits(xs_dtype) // 8
-  xsum_smem_bytes = cluster_size * block_m * mgpu_lib.num_bits(xsum_dtype) // 8
+  if xsum_dtype is None:
+    xsum_smem_bytes = 0
+  else:
+    xsum_dtype_bits = mgpu_lib.num_bits(xsum_dtype)
+    xsum_smem_bytes = cluster_size * block_m * xsum_dtype_bits // 8
   xw_stages, smem_capacity = divmod(smem_capacity, x_smem_bytes + w_smem_bytes)
   xw_stages = (int(xw_stages) // deq_wg) * deq_wg
   scale_smem_bytes = ws_smem_bytes + xs_smem_bytes + xsum_smem_bytes
@@ -202,7 +206,7 @@ def _write_scales_to_gmem(
 
 
 @jaxtyping.jaxtyped
-def ragged_dot_gpu_fp8_quant_blackwell_kernel(
+def ragged_dot_gpu_quant_x8_blackwell_kernel(
     lhs: Float[qwix.QArray, "M K"],
     rhs: Float[qwix.QArray, "G K N"],
     group_sizes: Integer[Array, "G"],
@@ -294,9 +298,10 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
   if config.post_scale:
     raise NotImplementedError("post_scale is not supported.")
 
-  if lhs.qtype != jnp.float8_e4m3fn:
+  if lhs.qtype not in (jnp.float8_e4m3fn, jnp.int8):
     raise NotImplementedError(
-        f"Only supported lhs to be float8_e4m3fn, got: {lhs.dtype=}."
+        "Only float8_e4m3fn or int8 lhs supported, got:"
+        f" {lhs.qtype=} {lhs.dtype=}."
     )
 
   if rhs.qtype != jnp.int4:
@@ -304,8 +309,10 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         f"Only supported rhs to be int4, got: {rhs.dtype=}."
     )
 
-  # Optional fused output quantization (bf16 acc -> fp8 QArray). One CTA owns one
-  # `block_n` N-tile, so the output subchannel must equal `block_n`.
+  is_fp8 = lhs.qtype == jnp.float8_e4m3fn
+
+  # Optional fused output quantization (bf16 acc -> fp8 QArray). One CTA owns
+  # one `block_n` N-tile, so the output subchannel must equal `block_n`.
   epilogue_quant_subchannel_size = config.epilogue_quant_subchannel_size
   epilogue_quant_enabled = config.epilogue_quant_qtype is not None
   # Quantize the same bf16 values the unfused path would; scale stored in bf16.
@@ -317,6 +324,10 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         " together."
     )
   if epilogue_quant_subchannel_size is not None:
+    if not is_fp8:
+      raise NotImplementedError(
+          "Fused output quantization is only supported for fp8 lhs."
+      )
     if epilogue_quant_subchannel_size != block_n:
       raise NotImplementedError(
           "Fused output quantization requires subchannel == block_n"
@@ -337,6 +348,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
     raise NotImplementedError(
         f"tile_k must be multiple of block_k, got: {tile_k=} {block_k=}."
     )
+  acc_tmem_dtype = jnp.float32 if is_fp8 else jnp.int32
   data_stages, scale_stages, deq_stages, acc_stages = _compute_stages(
       block_m,
       block_n,
@@ -346,8 +358,8 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
       w_dtype=rhs.qtype,
       ws_dtype=rhs.scale.dtype,
       xs_dtype=lhs.scale.dtype,
-      xsum_dtype=jnp.float32,
-      acc_dtype=jnp.float32,
+      xsum_dtype=jnp.float32 if is_fp8 else None,
+      acc_dtype=acc_tmem_dtype,
       out_dtype=out_dtype,
       deq_wg=_DEQ_WG,
   )
@@ -380,16 +392,19 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
   x, scales = lhs.qvalue, lhs.scale
   expected_d = k_x // tile_k
 
-  if scales.shape[1] == 2 * expected_d:
+  if is_fp8 and scales.shape[1] == 2 * expected_d:
     tile_xk = k_x // expected_d
     scales = scales.mT
     x_scales, x_sum = jnp.split(scales, 2, axis=0)
   else:
     tile_xk = k_x // scales.shape[1]
     x_scales = scales.mT
-    x_sum = (
-        x.astype(jnp.float32).reshape(m, -1, tile_xk).sum(-1).swapaxes(-1, -2)
-    )
+    if is_fp8:
+      x_sum = (
+          x.astype(jnp.float32).reshape(m, -1, tile_xk).sum(-1).swapaxes(-1, -2)
+      )
+    else:
+      x_sum = None
 
   # The activation subchannel may be finer than the weight subchannel, as long as
   # it divides it and each block_k tile stays within one activation subchannel.
@@ -560,14 +575,15 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
                   xs_smem.at[slot],
                   xws_barrier.at[slot],
               )
-              plgpu.copy_gmem_to_smem(
-                  x_sum_gmem.at[
-                      lax.div(block_k * ki, tile_xk),
-                      pl.ds(block_start, max(cluster_block_m, 64)),
-                  ],
-                  x_sum_smem.at[slot],
-                  xws_barrier.at[slot],
-              )
+              if is_fp8:
+                plgpu.copy_gmem_to_smem(
+                    x_sum_gmem.at[
+                        lax.div(block_k * ki, tile_xk),
+                        pl.ds(block_start, max(cluster_block_m, 64)),
+                    ],
+                    x_sum_smem.at[slot],
+                    xws_barrier.at[slot],
+                )
 
             @pl.loop(0, num_k_iters)
             def _tma_ws_loop(ki):
@@ -647,9 +663,12 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
               plgpu.barrier_arrive(w_consumed_barrier.at[data_slot])
 
             with jax.named_scope("dequant"):
-              w = mgpu_lib.int4_as_biased_f8e4m3fn(
-                  w, _TMEM(8), offline_permuted=int4_to_fp8_offline_permute
-              )
+              if is_fp8:
+                w = mgpu_lib.int4_as_biased_f8e4m3fn(
+                    w, _TMEM(8), offline_permuted=int4_to_fp8_offline_permute
+                )
+              else:
+                w = w.astype(x_dtype)
             w = plgpu.layout_cast(w, _TMEM(4))
             if di == 0:
 
@@ -689,11 +708,13 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
                 xs_smem.at[scale_slot, pl.ds(0, cluster_block_m)],
                 layout=_TCGEN05_COL,
             ).astype(acc_dtype)
-
-            x_sum = plgpu.load(
-                x_sum_smem.at[scale_slot, pl.ds(0, cluster_block_m)],
-                layout=_TCGEN05_COL,
-            ).astype(acc_dtype)
+            if is_fp8:
+              x_sum = plgpu.load(
+                  x_sum_smem.at[scale_slot, pl.ds(0, cluster_block_m)],
+                  layout=_TCGEN05_COL,
+              ).astype(acc_dtype)
+            else:
+              x_sum = None
           mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(xws_consumed_barrier.at[scale_slot])
           with jax.named_scope("wait_acc_ready"):
@@ -705,24 +726,26 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
           plgpu.barrier_arrive(acc_consumed_barrier.at[acc_slot])
 
           with jax.named_scope("rescale_acc"):
-            k_iters_per_subchannel = tile_xk // block_k
-            apply_bias = (ki % k_iters_per_subchannel) == 0
-            apply_bias_coef = lax.broadcast_in_dim(
-                apply_bias.astype(x_sum.dtype), x_sum.shape, ()
-            )
-            bias_val = -8 * x_sum * apply_bias_coef
-            int_bias = plgpu.layout_cast(
-                lax.broadcast_in_dim(bias_val, acc.shape, [1]),
-                _TCGEN05,
-            )
-            acc = acc * 512 + int_bias
+            if is_fp8:
+              assert x_sum is not None
+              k_iters_per_subchannel = tile_xk // block_k
+              apply_bias = (ki % k_iters_per_subchannel) == 0
+              apply_bias_coef = lax.broadcast_in_dim(
+                  apply_bias.astype(x_sum.dtype), x_sum.shape, ()
+              )
+              bias_val = -8 * x_sum * apply_bias_coef
+              int_bias = plgpu.layout_cast(
+                  lax.broadcast_in_dim(bias_val, acc.shape, [1]),
+                  _TCGEN05,
+              )
+              acc = acc * 512 + int_bias
             ws = plgpu.layout_cast(
                 lax.broadcast_in_dim(ws, acc.shape, (0,)), _TCGEN05
             )
             x_scale = plgpu.layout_cast(
                 lax.broadcast_in_dim(x_scale, acc.shape, (1,)), _TCGEN05
             )
-            return acc_carry + acc * (ws * x_scale)
+            return acc_carry + acc.astype(acc_dtype) * (ws * x_scale)
 
         acc_carry = lax.fori_loop(0, num_k_iters, _loop_body, acc_carry)
         if activation is not None:
@@ -804,10 +827,12 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
         (scale_stages, max(cluster_block_m, 64)),
         dtype=x_scales.dtype,
     )
-    x_sum_smem = plgpu.SMEM(
-        (scale_stages, max(cluster_block_m, 64)),
-        dtype=x_sum.dtype,
-    )
+    if x_sum is None:
+      x_sum_smem = None
+    else:
+      x_sum_smem = plgpu.SMEM(
+          (scale_stages, max(cluster_block_m, 64)), x_sum.dtype
+      )
     out_smem_shape = (cluster_block_m, block_n)
     out_smem_dtype = epilogue_quant_dtype or out_dtype
     out_smem = common.tiled_swizzled_smem(
@@ -815,7 +840,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
     )
     acc_tmem = plgpu.TMEM(
         (block_n, acc_stages * cluster_block_m),
-        dtype=jnp.float32,
+        dtype=acc_tmem_dtype,
         collective=collective,
     )
     x_barrier = plgpu.Barrier(num_barriers=data_stages)
@@ -824,7 +849,9 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
     )
     w_barrier = plgpu.Barrier(num_barriers=data_stages)
     w_consumed_barrier = plgpu.Barrier(num_barriers=data_stages)
-    xws_barrier = plgpu.Barrier(num_barriers=scale_stages, num_arrivals=3)
+    xws_barrier = plgpu.Barrier(
+        num_barriers=scale_stages, num_arrivals=3 if is_fp8 else 2
+    )
     xws_consumed_barrier = plgpu.Barrier(num_barriers=scale_stages)
     w_tmem_consumed_barrier = plgpu.Barrier(
         num_barriers=deq_stages, orders_tensor_core=True
@@ -906,6 +933,15 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
   else:
     lowering_semantics = plgpu.LoweringSemantics.Lane
 
+  if epilogue_quant_enabled:
+    kernel_name = "ragged_dot_fp8_quant_fused_output_sm100"
+  elif is_fp8:
+    kernel_name = "ragged_dot_fp8_quant_sm100"
+  else:
+    kernel_name = "ragged_dot_i8_quant_sm100"
+  if int4_to_fp8_offline_permute:
+    kernel_name += "_offline_permute"
+
   f = plgpu.kernel(
       kernel_entry,
       out_type=out_type,
@@ -915,14 +951,7 @@ def ragged_dot_gpu_fp8_quant_blackwell_kernel(
       grid_names=("sm",),
       cluster=(1 + collective,),
       cluster_names=("x",),
-      kernel_name=(
-          (
-              "ragged_dot_fp8_quant_fused_output_sm100"
-              if epilogue_quant_enabled
-              else "ragged_dot_fp8_quant_sm100"
-          )
-          + ("_offline_permute" if int4_to_fp8_offline_permute else "")
-      ),
+      kernel_name=kernel_name,
       compiler_params=plgpu.CompilerParams(
           approx_math=True,
           unsafe_no_auto_barriers=True,
