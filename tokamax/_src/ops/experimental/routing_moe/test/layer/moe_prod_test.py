@@ -1,0 +1,102 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Production-shape numerics and XProf traces for the MoE layer."""
+
+from absl.testing import absltest
+from absl.testing import parameterized
+import jax
+from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
+from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
+from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_base
+from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_lib
+
+jax.config.parse_flags_with_absl()
+
+_NON_SHARED_EXPERT_CASES = tuple(
+    c for c in test_cases.PROD_CASES if not c.shape.has_shared_expert
+)
+_SHARED_EXPERT_CASES = tuple(
+    c for c in test_cases.PROD_CASES if c.shape.has_shared_expert
+)
+
+
+class MoEProdTest(moe_test_base.MoETestCase):
+
+  @parameterized.product(
+      case=_NON_SHARED_EXPERT_CASES,
+      use_ep=[True, False],
+      use_sp=[True, False],
+  )
+  def test_non_shared_expert_model(
+      self,
+      case: test_cases.Case,
+      use_ep: bool,
+      use_sp: bool,
+  ):
+    layout = moe_test_lib.WeightLayout(use_ep=use_ep, use_sp=use_sp)
+    self.check_case(case, layout, capture_xprof=True)
+
+  @parameterized.product(
+      case=_SHARED_EXPERT_CASES,
+      use_ep=[True, False],
+      use_sp=[True, False],
+      remote_scatter=[True, False],
+      fold_shared_expert=[True, False],
+  )
+  def test_shared_expert_model(
+      self,
+      case: test_cases.Case,
+      use_ep: bool,
+      use_sp: bool,
+      remote_scatter: bool,
+      fold_shared_expert: bool,
+  ):
+    if not use_ep and remote_scatter:
+      self.skipTest("Not a valid config.")
+    if fold_shared_expert and use_ep:
+      self.skipTest("fold_shared_expert is only supported under TP.")
+    layout = moe_test_lib.WeightLayout(
+        use_ep=use_ep, use_sp=use_sp, fold_shared_expert=fold_shared_expert
+    )
+    self.check_case(
+        case,
+        layout,
+        remote_scatter=remote_scatter,
+        reduce_output=remote_scatter,
+        capture_xprof=True,
+    )
+
+  @parameterized.product(
+      num_tokens=[1280, 10240],
+      use_sp=[True, False],
+      remote_scatter=[False, True],
+  )
+  def test_remote_scatter(
+      self,
+      num_tokens: int,
+      use_sp: bool,
+      remote_scatter: bool,
+  ):
+    case = test_cases.Case(
+        "remote_scatter", test_shapes.REMOTE_SCATTER, num_tokens, 4
+    )
+    layout = moe_test_lib.WeightLayout(use_ep=True, use_sp=use_sp)
+    self.check_case(
+        case, layout, remote_scatter=remote_scatter, capture_xprof=True
+    )
+
+
+if __name__ == "__main__":
+  absltest.main()

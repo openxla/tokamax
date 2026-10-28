@@ -623,13 +623,13 @@ SHARDS: ShardMap = {
         compat_minutes=1,
     ),
     # Unmeasured until now. Slow only on tpu7x, against well under a minute on
-    # h100 and tpu6e: 10m there (`gmm_test.py` 5.7m, `moe_test.py` 4.4m)
+    # h100 and tpu6e: 10m there (`gmm_prod_test.py` 5.7m, `moe_prod_test.py` 4.4m)
     # until the gmm-up/gmm-down fusion change of 2026-10-21, and 14-15m in
     # each of the three runs since.
     'experimental-routing-moe': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/routing_moe/test/gmm_test.py',
-            'tokamax/_src/ops/experimental/routing_moe/test/moe_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_prod_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_prod_test.py',
         ),
         minutes=15,
         compat_minutes=1,

@@ -43,6 +43,14 @@ routing_moe/
 │   ├── monolithic.py: Monolithic MoE entry point that computes routing and invokes modular MoE.
 │   └── plan.py: Tunable parameters for MoE layer execution that have no impact on outputs.
 └── test/
-    ├── gmm_test.py: Standalone test for grouped matrix multiplication.
-    └── moe_test.py: A test for entire single MoE layer.
+    ├── common/
+    │   ├── test_shapes.py: Static model configs (dims, experts, top-k, dtype).
+    │   ├── test_cases.py: Serving-time cases (model config + token/shard count).
+    │   ├── test_inputs.py: Shared input and routing tensor generators.
+    │   ├── test_reference.py: Pure-XLA reference implementations.
+    │   └── test_util.py: Feature-support checks and benchmarking helpers.
+    └── {gmm, io_relayout, layer}/
+        ├── *_test_lib.py: Case generation and reference validation helpers.
+        ├── *_unit_test.py: Synthetic edge-case and stress tests.
+        └── *_prod_test.py: Production model shapes and benchmarks.
 ```
