@@ -73,6 +73,7 @@ def _make_spec(
     group_sizes=None,
     project='',
     tags=(),
+    excluded_platforms=(),
 ) -> arg_spec.ArgSpec:
   """Make an argument spec for a ragged dot operation."""
   lhs = jax.ShapeDtypeStruct((m, k), lhs_dtype)
@@ -88,7 +89,13 @@ def _make_spec(
     )
 
   args = dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
-  return arg_spec.ArgSpec(name=name, args=args, project=project, tags=tags)
+  return arg_spec.ArgSpec(
+      name=name,
+      args=args,
+      project=project,
+      tags=tags,
+      excluded_platforms=excluded_platforms,
+  )
 
 
 def _make_maxtext_spec(
@@ -104,6 +111,8 @@ def _make_maxtext_spec(
       rhs_dtype=jnp.bfloat16,
       project='maxtext',
       tags=tags,
+      # MaxText ragged dot shapes are TPU workloads; skip them on GPU.
+      excluded_platforms=('gpu',),
   )
 
 
@@ -152,6 +161,8 @@ def _make_maxtext_gmm_v2_spec(
       args=args,
       project=project,
       tags=tags,
+      # MaxText ragged dot shapes are TPU workloads; skip them on GPU.
+      excluded_platforms=('gpu',),
   )
 
 
