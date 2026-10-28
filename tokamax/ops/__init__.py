@@ -39,6 +39,7 @@ from tokamax._src.ops.ragged_gather.api import ragged_gather as ragged_gather
 from tokamax._src.ops.ragged_gather_reduce.api import ragged_gather_reduce as ragged_gather_reduce
 from tokamax._src.ops.router_topk.api import router_topk as router_topk
 from tokamax._src.ops.sparse_mla.api import sparse_mla as sparse_mla
+from tokamax._src.ops.splash_attention.api import splash_attention as splash_attention
 from tokamax._src.ops.topk.api import top_k as top_k
 from tokamax._src.ops.triangle_multiplication.api import triangle_multiplication as triangle_multiplication
 from tokamax.ops import experimental as experimental
@@ -79,6 +80,7 @@ __all__ = (
     "ragged_paged_attention",
     "router_topk",
     "sparse_mla",
+    "splash_attention",
     "top_k",
     "tpu",
     "triangle_multiplication",
