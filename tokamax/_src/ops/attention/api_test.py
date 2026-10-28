@@ -161,10 +161,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       ],
   )
   def testDotProductAttentionMask(self, mask_mode):
-    # TODO: Fix test for 'xla_chunked' on TPU.
-    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
-      self.skipTest(f'{self.IMPL} not supported on TPU')
-
     if isinstance(mask_mode, str):
       mask_mode = (mask_mode,)
 
@@ -259,10 +255,6 @@ class DotProductAttentionTest(parameterized.TestCase):
 
   @parameterized.product(batch_size=[1, 16], use_vmap=[False, True])
   def test_dot_product_attention_bias_gradient(self, batch_size, use_vmap):
-    # TODO: Fix test for 'xla_chunked' on TPU.
-    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
-      self.skipTest(f'{self.IMPL} not supported on TPU')
-
     if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
       # TODO: Remove once a learnable bias is supported on Mosaic
       # TPU attention.
