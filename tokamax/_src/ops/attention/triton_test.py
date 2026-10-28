@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import sys
 from typing import override
 from unittest import mock
 import pytest
@@ -68,36 +67,15 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
     super()._run_test(q_shape, *args, **kwargs)
 
   @override
-  @absltest.skip("Not implemented yet.")
   def _test_quantized_int8(self, channelwise_axes, quantize_q):
-    expected_int8_dots = int(quantize_q and 3 not in channelwise_axes)
-    actual_int8_dots = 0
-
-    lax = sys.modules["jax._src.lax"]
-    orig_dot_general = lax.dot_general
-
-    def my_dot_general(
-        lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None
-    ):
-      nonlocal actual_int8_dots
-      a_dt, b_dt, acc_dt = lhs.dtype, rhs.dtype, preferred_element_type
-      is_int8 = a_dt == jnp.int8 and b_dt == jnp.int8 and acc_dt == jnp.int32
-      actual_int8_dots += int(is_int8)
-      return orig_dot_general(
-          lhs, rhs, dimension_numbers, precision, preferred_element_type
-      )
-
-    with mock.patch.object(lax, "dot_general", my_dot_general):
+    assert jt is not None
+    with mock.patch.object(jt, "triton_call", wraps=jt.triton_call) as call:
       super()._test_quantized_int8(channelwise_axes, quantize_q)
 
-    self.assertEqual(expected_int8_dots, actual_int8_dots)
+    expected = quantize_q and 3 not in channelwise_axes
+    actual = {c.kwargs["quantize_qk_dot"] for c in call.call_args_list}
+    self.assertEqual(actual, {expected})
 
-  @override
-  @absltest.skip("Not implemented yet.")
-  def _test_quantized_int4(self, subchannel_size):
-    super()._test_quantized_int4(subchannel_size)
-
-  @absltest.skip("Not implemented yet.")
   def test_block_d(self):
     """Tests `block_d != None` with quantization and different head_dim_out."""
     assert fa is not None
@@ -145,6 +123,40 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
         atol=5e-6,
         test_vjp=False,
     )
+
+  @parameterized.product(qtype=(jnp.int4, jnp.int8), quantize_q=(False, True))
+  def test_subchannel_quant_non_pow2_head_dim(self, qtype, quantize_q):
+    tiled_axes = {0: 1, 1: 1, 2: 1, 3: 32}
+    quantize = lambda x: qwix.quantize(x, qtype, tiled_axes=tiled_axes)
+    quant_dequant = lambda x: qwix.dequantize(quantize(x))
+
+    def impl(q, k, v, **kwargs):
+      q = quantize(q) if quantize_q else q
+      k, v = map(quantize, (k, v))
+      return self._attention_fn(q, k, v, **kwargs)
+
+    def ref_impl(q, k, v, **kwargs):
+      q = quant_dequant(q) if quantize_q else q
+      k, v = map(quant_dequant, (k, v))
+      return nn.dot_product_attention(q, k, v, **kwargs)
+
+    self._run_test(
+        (2, 128, 4, 96), impl=impl, ref_impl=ref_impl, test_vjp=False
+    )
+
+  def test_quantized_int8_small_head_dim(self):
+    quantize = lambda x: qwix.quantize(x, jnp.int8, channelwise_axes=(0, 1, 2))
+    quant_dequant = lambda x: qwix.dequantize(quantize(x))
+
+    def impl(q, k, v, **kwargs):
+      q, k, v = map(quantize, (q, k, v))
+      return self._attention_fn(q, k, v, **kwargs)
+
+    def ref_impl(q, k, v, **kwargs):
+      q, k, v = map(quant_dequant, (q, k, v))
+      return nn.dot_product_attention(q, k, v, **kwargs)
+
+    self._run_test((2, 64, 2, 5), impl=impl, ref_impl=ref_impl, test_vjp=False)
 
   @parameterized.parameters(1, 2)
   def test_small_block_q(self, block_q: int):
@@ -242,7 +254,6 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
     )
 
   @parameterized.parameters(2, 3, 4)
-  @absltest.skip("Not implemented yet.")
   def test_split_k(self, split_k):
     self.skipTest("Too slow for OSS")
     assert fa is not None

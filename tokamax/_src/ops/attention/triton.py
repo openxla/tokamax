@@ -65,12 +65,107 @@ def _load_2d(ptr, offs_r, bound_r, stride_r, start_c, bound_c, block_c):
 
 
 @triton.jit
+def _advance_scale_ptr(ptr, pid_b, batch_shape, batch_strides, pid_h, shape):
+  """Advances `ptr` to `scales[pid_b, 0, pid_h, 0]`.
+
+  `pid_b` is a flat index into the batch dims, and `shape` is the per-batch
+  `(T, H, D)` scales shape. If `H` is broadcast, `pid_h` is ignored.
+  """
+  ptr += triton_utils.batch_offset(pid_b, batch_shape, batch_strides)
+  return ptr if shape[1] == 1 else ptr + pid_h * shape[2]
+
+
+@triton.jit
+def _load_scales(ptr, offs_r, start_d, head_dim, block_d, shape):
+  """Loads the scales of tile `[offs_r, start_d : start_d + block_d]`.
+
+  `shape` is the per-batch `(T, H, D)` scales shape. `T` and `H` are either 1
+  or full, and `D` is 1 (a scale per row), `head_dim` (a scale per column) or
+  the number of subchannels.
+  """
+  rows: tl.constexpr = shape[0]
+  num_scales: tl.constexpr = shape[2]
+  row_stride: tl.constexpr = shape[1] * num_scales
+  zero = tl.zeros((1, 1), dtype=tl.int64)
+  r = zero if rows == 1 else offs_r[:, None].to(tl.int64) * row_stride
+  check_r: tl.constexpr = rows > 1 and rows % offs_r.shape[0] != 0
+  if num_scales == 1:
+    mask = offs_r[:, None] < rows if check_r else None
+    scale = tl.load(ptr + r, mask=mask, other=None if mask is None else 0.0)
+  else:
+    subchannel_size: tl.constexpr = head_dim // num_scales
+    # Load a scale per subchannel and repeat it, since software pipelining
+    # would otherwise stage a full tile of repeated scales in shared memory.
+    block_s: tl.constexpr = block_d // subchannel_size
+    offs_s = start_d // subchannel_size + tl.arange(0, block_s)
+    check_s: tl.constexpr = num_scales % block_s != 0
+    mask = triton_utils.mask_2d(
+        offs_r, rows, offs_s, num_scales, check_r, check_s
+    )
+    scale = tl.load(
+        ptr + r + offs_s[None, :],
+        mask=mask,
+        other=None if mask is None else 0.0,
+    )
+    if subchannel_size > 1:
+      scale_rows: tl.constexpr = scale.shape[0]
+      scale = tl.broadcast_to(
+          scale[:, :, None], (scale_rows, block_s, subchannel_size)
+      ).reshape(scale_rows, block_d)
+  return scale
+
+
+@triton.jit
+def _load_qarray(
+    ptr,
+    scale_ptr,
+    offs_r,
+    bound_r,
+    num_heads,
+    start_d,
+    head_dim,
+    block_d,
+    scale_shape,
+    is_int4,
+):
+  """Loads a 2D tile of values and, if `scale_ptr` is not `None`, scales."""
+  pack: tl.constexpr = tl.constexpr(2 if is_int4 else 1)
+  x = _load_2d(
+      ptr,
+      offs_r,
+      bound_r,
+      num_heads * head_dim // pack,
+      start_d // pack,
+      head_dim // pack,
+      block_d // pack,
+  )
+  if is_int4:
+    # Low nibbles hold even elements (see `_pack_int4`), and the shifts
+    # sign-extend each nibble.
+    x = tl.join((x << 4) >> 4, x >> 4).reshape(offs_r.shape[0], block_d)
+  if scale_ptr is None:
+    return x, None
+  else:
+    return x, _load_scales(
+        scale_ptr, offs_r, start_d, head_dim, block_d, scale_shape
+    )
+
+
+@triton.jit
+def _dequantize(x, scale):
+  return x if scale is None else x.to(scale.dtype) * scale
+
+
+@triton.jit
 def _fwd_kernel(
     q_start_ptr,
     q_end_ptr,
     q_ptr,
+    q_scale_ptr,
     k_ptr,
+    k_scale_ptr,
     v_ptr,
+    v_scale_ptr,
     bias_ptr,
     mask_ptr,
     dropout_mask_ptr,
@@ -91,6 +186,13 @@ def _fwd_kernel(
     block_k: tl.constexpr,
     block_d: tl.constexpr,
     block_d_out: tl.constexpr,
+    q_scale_shape: tl.constexpr,
+    k_scale_shape: tl.constexpr,
+    v_scale_shape: tl.constexpr,
+    q_is_int4: tl.constexpr,
+    k_is_int4: tl.constexpr,
+    v_is_int4: tl.constexpr,
+    quantize_qk_dot: tl.constexpr,
     bias_shape: tl.constexpr,
     mask_shape: tl.constexpr,
     dropout_shape: tl.constexpr,
@@ -139,8 +241,11 @@ def _fwd_kernel(
       stride_q_start_b,
       stride_q_end_b,
       stride_qb,
+      stride_q_scale_b,
       stride_kb,
+      stride_k_scale_b,
       stride_vb,
+      stride_v_scale_b,
       stride_bias_b,
       stride_mask_b,
       stride_dropout_b,
@@ -162,18 +267,43 @@ def _fwd_kernel(
     q_end = tl.load(q_end_ptr)
     skip_cond |= q_end <= start_m
 
+  stride_qh: tl.constexpr = head_dim // 2 if q_is_int4 else head_dim
+  stride_kh: tl.constexpr = head_dim // 2 if k_is_int4 else head_dim
+  stride_vh: tl.constexpr = head_dim_out // 2 if v_is_int4 else head_dim_out
   q_ptr += (
       triton_utils.batch_offset(pid_b, batch_shape, stride_qb)
-      + pid_h * head_dim
+      + pid_h * stride_qh
   )
   k_ptr += (
       triton_utils.batch_offset(pid_b, batch_shape, stride_kb)
-      + pid_h_kv * head_dim
+      + pid_h_kv * stride_kh
   )
   v_ptr += (
       triton_utils.batch_offset(pid_b, batch_shape, stride_vb)
-      + pid_h_kv * head_dim_out
+      + pid_h_kv * stride_vh
   )
+  if q_scale_ptr is not None:
+    q_scale_ptr = _advance_scale_ptr(
+        q_scale_ptr, pid_b, batch_shape, stride_q_scale_b, pid_h, q_scale_shape
+    )
+  if k_scale_ptr is not None:
+    k_scale_ptr = _advance_scale_ptr(
+        k_scale_ptr,
+        pid_b,
+        batch_shape,
+        stride_k_scale_b,
+        pid_h_kv,
+        k_scale_shape,
+    )
+  if v_scale_ptr is not None:
+    v_scale_ptr = _advance_scale_ptr(
+        v_scale_ptr,
+        pid_b,
+        batch_shape,
+        stride_v_scale_b,
+        pid_h_kv,
+        v_scale_shape,
+    )
 
   if bias_ptr is not None:
     bias_ptr = triton_utils.advance_bcast_ptr(
@@ -243,17 +373,25 @@ def _fwd_kernel(
 
   if not skip_cond:
     qs = ()
+    q_scales = ()
     for i_d in tl.static_range(split_d):
-      q = _load_2d(
+      q, q_scale = _load_qarray(
           q_ptr,
+          q_scale_ptr,
           span_m,
           seq_len_q,
-          num_heads_q * head_dim,
+          num_heads_q,
           i_d * block_d,
           head_dim,
           block_d,
+          q_scale_shape,
+          q_is_int4,
       )
-      qs += ((q * sm_scale).to(qk_dtype),)
+      if quantize_qk_dot:
+        qs += (q,)
+        q_scales += (q_scale * sm_scale,)
+      else:
+        qs += ((_dequantize(q, q_scale) * sm_scale).to(qk_dtype),)
 
     num_k_blocks = tl.cdiv(seq_len_k, block_k)
     # Rows past ``seq_len_q`` get fill values that are neutral for the min/max
@@ -297,18 +435,26 @@ def _fwd_kernel(
         span_k = start_k + tl.arange(0, block_k)
         s = tl.zeros((block_m, block_k), dtype=tl.float32)
         for i_d in tl.static_range(split_d):
-          k = _load_2d(
+          k, k_scale = _load_qarray(
               k_ptr,
+              k_scale_ptr,
               span_k,
               seq_len_k,
-              num_heads_k * head_dim,
+              num_heads_k,
               i_d * block_d,
               head_dim,
               block_d,
+              k_scale_shape,
+              k_is_int4,
           )
-          s += tl.dot(
-              qs[i_d], tl.trans(k.to(qk_dtype)), input_precision=qk_prec
-          )
+          if quantize_qk_dot:
+            qk_scale = q_scales[i_d] * tl.trans(k_scale)
+            s += tl.dot(qs[i_d], tl.trans(k)).to(tl.float32) * qk_scale
+          else:
+            k = _dequantize(k, k_scale)
+            s += tl.dot(
+                qs[i_d], tl.trans(k.to(qk_dtype)), input_precision=qk_prec
+            )
         s = s.to(logits_dtype)
 
         if bias_ptr is not None:
@@ -373,15 +519,19 @@ def _fwd_kernel(
         p = p.to(wv_dtype)
         new_accs = ()
         for i_o in tl.static_range(split_d_out):
-          v = _load_2d(
+          v, v_scale = _load_qarray(
               v_ptr,
+              v_scale_ptr,
               span_k,
               seq_len_k,
-              num_heads_k * head_dim_out,
+              num_heads_k,
               i_o * block_d_out,
               head_dim_out,
               block_d_out,
+              v_scale_shape,
+              v_is_int4,
           )
+          v = _dequantize(v, v_scale)
           acc = accs[i_o] + tl.dot(p, v.to(wv_dtype), input_precision=wv_prec)
           new_accs += (acc,)
         accs = new_accs
@@ -443,8 +593,9 @@ def _fwd(
 ) -> tuple[Float[Array, "T H d"], Residuals | None]:
   """Forward pass of Triton FlashAttention."""
   q, k, v = map(quantization.as_array_or_qarray_without_zero_point, (q, k, v))
-  if isinstance(q, QArray) or isinstance(k, QArray) or isinstance(v, QArray):
-    raise NotImplementedError("Quantized attention not supported yet.")
+  q_values, q_scale = _split_qarray(q)
+  k_values, k_scale = _split_qarray(k)
+  v_values, v_scale = _split_qarray(v)
 
   seq_len_q, num_heads_q, head_dim = q.shape
   seq_len_k, num_heads_k, head_dim_out = v.shape
@@ -465,6 +616,13 @@ def _fwd(
       triton.next_power_of_2(
           min(config.block_d_out or head_dim_out, head_dim_out)
       ),
+  )
+  quantize_qk_dot = (
+      q_scale is not None
+      and k_scale is not None
+      and q_scale.shape[-1] == k_scale.shape[-1] == 1
+      and q_values.dtype == k_values.dtype == jnp.int8
+      and block_d >= 32  # 8-bit `tl.dot` needs K >= 32.
   )
 
   qk_dtype, qk_prec = triton_utils.get_dot_dtype_and_precision(
@@ -523,6 +681,13 @@ def _fwd(
         block_k=block_k,
         block_d=block_d,
         block_d_out=block_d_out,
+        q_scale_shape=(1, 1, 1) if q_scale is None else q_scale.shape[-3:],
+        k_scale_shape=(1, 1, 1) if k_scale is None else k_scale.shape[-3:],
+        v_scale_shape=(1, 1, 1) if v_scale is None else v_scale.shape[-3:],
+        q_is_int4=q_values.dtype == jnp.int4,
+        k_is_int4=k_values.dtype == jnp.int4,
+        v_is_int4=v_values.dtype == jnp.int4,
+        quantize_qk_dot=quantize_qk_dot,
         bias_shape=(1, 1, 1) if bias is None else bias.shape[-3:],
         mask_shape=(1, 1, 1) if mask is None else mask.shape[-3:],
         dropout_shape=(
@@ -549,11 +714,51 @@ def _fwd(
     )
 
   out, l, m = fwd_call(
-      q_start, q_end, q, k, v, bias, mask, dropout_mask, k_start, k_end
+      q_start,
+      q_end,
+      _pack_int4(q_values),
+      q_scale,
+      _pack_int4(k_values),
+      k_scale,
+      _pack_int4(v_values),
+      v_scale,
+      bias,
+      mask,
+      dropout_mask,
+      k_start,
+      k_end,
   )
   if not return_residuals:
     return out, None
   return out, (jnp.zeros_like(l) if m is None else m, l)
+
+
+def _split_qarray(x):
+  """Returns the values and scales (or `None`) of a possibly quantized array."""
+  if not isinstance(x, QArray):
+    return x, None
+  if x.qvalue.dtype not in (jnp.int8, jnp.int4):
+    raise NotImplementedError(f"Unsupported quantized dtype: {x.qvalue.dtype}")
+  if any(s not in (1, d) for s, d in zip(x.scale.shape[:-1], x.shape[:-1])):
+    raise NotImplementedError(
+        "Subchannel quantization is only supported along the head dim."
+    )
+  subchannel_size = x.shape[-1] // x.scale.shape[-1]
+  if x.scale.shape[-1] > 1 and (
+      triton.next_power_of_2(subchannel_size) != subchannel_size
+  ):
+    raise NotImplementedError("Subchannel size must be a power of two.")
+  if x.qvalue.dtype == jnp.int4 and x.shape[-1] % 2 != 0:
+    raise NotImplementedError("int4 quantization requires an even head dim.")
+  return x.qvalue, x.scale
+
+
+def _pack_int4(x):
+  # Triton has no int4 type, so pairs of int4s are passed as int8s.
+  if x.dtype != jnp.int4:
+    return x
+  pairs = x.reshape(*x.shape[:-1], -1, 2)
+  return jax.lax.bitcast_convert_type(pairs, jnp.int8)
 
 
 def _broadcast_to_rank(x, rank):
