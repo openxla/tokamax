@@ -32,8 +32,8 @@ class MoEShape:
     activation: Gated activation function name.
     renormalize: Whether top-k routing weights are renormalized to sum to 1.
     w_dtype: Weight quantization dtype, or None for unquantized bfloat16.
-    quant_block_size: Sub-channel quantization block size, or None for
-      per-channel quantization.
+    w_quant_block_size: Weight sub-channel quantization block size along the
+      input dimension, or None for per-channel quantization.
     has_bias: Whether expert projections include bias terms.
     has_shared_expert: Whether the layer includes a shared expert.
   """
@@ -46,7 +46,7 @@ class MoEShape:
   activation: str = "silu"
   renormalize: bool = True
   w_dtype: jnp.dtype | None = None
-  quant_block_size: int | None = None
+  w_quant_block_size: int | None = None
   has_bias: bool = False
   has_shared_expert: bool = False
 
@@ -106,6 +106,6 @@ GPT_OSS_120 = MoEShape(
     3072,
     activation="swigluoai",
     w_dtype=jnp.dtype(jnp.float4_e2m1fn),
-    quant_block_size=512,
+    w_quant_block_size=512,
     has_bias=True,
 )

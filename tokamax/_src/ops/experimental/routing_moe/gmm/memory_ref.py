@@ -27,6 +27,7 @@ from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
@@ -695,9 +696,13 @@ class PipelineBlockSpecs:
         ),
     )
 
-  def get_scale_spec(self, tile_n: int) -> pl.BlockSpec:
+  def get_scale_spec(
+      self, w_spec: arg.WeightSpec, tile_k: int, tile_n: int
+  ) -> pl.BlockSpec:
     """Returns the BlockSpec for a quantization scale tensor."""
-    block_shape = (None, 1, 1, tile_n)
+    assert w_spec.quant is not None
+    num_blocks = tile_k // w_spec.quant.block_size
+    block_shape = (None, num_blocks, 1, tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.scale_index,
@@ -803,7 +808,7 @@ class PipelineAllocs:
 
     def _make_weight_bref(
         w_hbm_ref: AbstractWeightRef,
-        has_scale: bool,
+        w_spec: arg.WeightSpec,
         tile_k: int,
         tile_n: int,
         *,
@@ -811,10 +816,10 @@ class PipelineAllocs:
     ) -> AbstractWeightRef:
       assert isinstance(w_hbm_ref, SingleWeightRef)
       scale_bref = None
-      if has_scale:
+      if w_spec.has_scale:
         assert w_hbm_ref.scale is not None
         scale_bref = pltpu.BufferedRef.input(
-            spec=pipeline_block_specs.get_scale_spec(tile_n),
+            spec=pipeline_block_specs.get_scale_spec(w_spec, tile_k, tile_n),
             dtype_or_type=w_hbm_ref.scale.dtype,
             buffer_count=cfg.plan.num_w_buffers,
             use_lookahead=True,
@@ -835,7 +840,7 @@ class PipelineAllocs:
     w_tile_n = cfg.plan.tile_n if cfg.plan.tile_k2 is None else cfg.plan.tile_k2
     w_bref = _make_weight_bref(
         in_hbm_ref.w,
-        cfg.w.has_scale,
+        cfg.w,
         cfg.plan.tile_k,
         w_tile_n,
         fuse_act=cfg.fuse_act is not None,
@@ -845,7 +850,7 @@ class PipelineAllocs:
       assert in_hbm_ref.w2 is not None and cfg.plan.tile_k2 is not None
       w2_bref = _make_weight_bref(
           in_hbm_ref.w2,
-          cfg.w2.has_scale,
+          cfg.w2,
           cfg.plan.tile_k2,
           cfg.plan.tile_n,
       )

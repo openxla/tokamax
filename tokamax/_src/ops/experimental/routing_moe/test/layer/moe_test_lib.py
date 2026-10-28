@@ -150,7 +150,7 @@ def _make_raw_inputs(
   if layout.fold_shared_expert:
     moe = moe.fold_shared_expert()
   if shape.w_dtype is not None:
-    moe = moe.quantize(shape.w_dtype, shape.quant_block_size)
+    moe = moe.quantize(shape.w_dtype, shape.w_quant_block_size)
   return moe
 
 

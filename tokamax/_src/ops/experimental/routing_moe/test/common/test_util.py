@@ -46,10 +46,6 @@ def check_gmm_supported(
   """Skips the test if `case` uses features unsupported by `routing_gmm`."""
   if case.shape.has_bias:
     raise absltest.SkipTest("TODO: Support bias in routing_moe.")
-  if case.shape.quant_block_size is not None:
-    raise absltest.SkipTest(
-        "TODO: Support sub-channel quantization in routing_moe."
-    )
   if case.local_intermediate_size % 256 != 0:
     raise absltest.SkipTest(
         "TODO: Fix gmm/plan.py raising error if intermediate is not"

@@ -14,6 +14,8 @@
 # ==============================================================================
 """Unit tests for routing_gmm against the grouped matmul reference."""
 
+import dataclasses
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -117,6 +119,137 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         scatter=routing.scatter,
         fuse_act="silu",
         custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
+        **routing.kernel_kwargs,
+    )
+    expected = test_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.scattered_rows],
+        expected,
+        rtol=6e-2,
+        atol=6e-2,
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="w_lt_x",
+          size_k=4096,
+          size_n=2048,
+          w_q_block_size=256,
+          x_q_block_size=512,
+      ),
+      dict(
+          testcase_name="w_eq_x",
+          size_k=4096,
+          size_n=2048,
+          w_q_block_size=512,
+          x_q_block_size=512,
+      ),
+      dict(
+          testcase_name="w_gt_x",
+          size_k=4096,
+          size_n=2048,
+          w_q_block_size=1024,
+          x_q_block_size=512,
+      ),
+      # DeepSeek-V4 gate/up and down weights: hidden=7168, intermediate=2048.
+      dict(
+          testcase_name="dsv4_w1",
+          size_k=7168,
+          size_n=2 * 2048,
+          w_q_block_size=512,
+          x_q_block_size=512,
+      ),
+      dict(
+          testcase_name="dsv4_w2",
+          size_k=2048,
+          size_n=7168,
+          w_q_block_size=512,
+          x_q_block_size=512,
+      ),
+      # Per-channel weights whose K is not a multiple of the x block size.
+      dict(
+          testcase_name="per_channel_k_not_multiple_of_x",
+          size_k=768,
+          size_n=2048,
+          w_q_block_size=None,
+          x_q_block_size=512,
+      ),
+  )
+  def test_sub_channel_numerics(
+      self,
+      size_k: int,
+      size_n: int,
+      w_q_block_size: int | None,
+      x_q_block_size: int,
+  ):
+    # size_n is the fused gate/up width, i.e. 2 * intermediate_size.
+    shape = test_shapes.MoEShape(
+        "sub_channel",
+        num_experts=8,
+        top_k=2,
+        hidden_size=size_k,
+        intermediate_size=size_n // 2,
+        w_quant_block_size=w_q_block_size,
+    )
+    case = gmm_test_lib.GmmCase.make_case(
+        test_cases.Case("sub_channel_256", shape, 256), quant_w1=True
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        gather=routing.gather,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(x_quant_block_size=x_q_block_size),
+        **routing.kernel_kwargs,
+    )
+    expected = test_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        fuse_act="silu",
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.sorted_rows],
+        expected,
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+  @parameterized.product(
+      w_q_block_size=[256, 1024],
+      fuse_up_and_down=[None, True, False],
+  )
+  def test_sub_channel_gather_gmm_gmm_scatter(
+      self, w_q_block_size: int, fuse_up_and_down: bool | None
+  ):
+    # Covers sub-channel scales on both w1 (K=hidden) and w2 (K=intermediate).
+    case_spec = test_cases.PREFILL_8K
+    shape = dataclasses.replace(
+        case_spec.shape, w_quant_block_size=w_q_block_size
+    )
+    case = gmm_test_lib.GmmCase.make_case(
+        dataclasses.replace(case_spec, shape=shape),
+        quant_w1=True,
+        quant_w2=True,
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(
+            x_quant_block_size=512, fuse_up_and_down=fuse_up_and_down
+        ),
         **routing.kernel_kwargs,
     )
     expected = test_reference.reference_gmm(
