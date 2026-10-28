@@ -228,6 +228,7 @@ def flash_attention_kernel(
   block_kv = config.block_kv
   num_stages = config.num_stages
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
+  early_q_consumed = config.persistent and (bias is None or head_dim < 64)
 
   if bias is not None and bias.shape[-2] != 1:
     bias = shape_lib.pad_to_next_multiple_of(bias, 8, -2)
@@ -375,7 +376,14 @@ def flash_attention_kernel(
             lambda: (await_k(), plgpu.barrier_wait(q_produced)),
         )
 
-        schedule_barrier_arrive_and_wait(predicate=wg == 1)
+        if early_q_consumed:
+          schedule_barrier_pred = (wg == 1) | (loop_info.local_index > 0)
+          schedule_barrier_arrive_and_wait(predicate=schedule_barrier_pred)
+          mgpu_lib.bar_arrive(
+              q_consumed_barrier, num_threads=288, predicate=ub <= lb
+          )
+        else:
+          schedule_barrier_arrive_and_wait(predicate=wg == 1)
 
         def kv_loop(ki, carry, *, do_causal=False):
           acc, m_scale, m_i, l_i = carry
@@ -398,6 +406,10 @@ def flash_attention_kernel(
           acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
           s, bias, mask = pl.run_scoped(compute_qk, acc_type)
           mgpu_lib.bar_arrive(k_consumed_barrier + si, num_threads=288)
+          if early_q_consumed:
+            mgpu_lib.bar_arrive(
+                q_consumed_barrier, num_threads=288, predicate=ki == ub - 1
+            )
 
           scale = logits_scale
 
@@ -499,7 +511,9 @@ def flash_attention_kernel(
         else:
           acc, m_scale, m_i, l_i = lax.fori_loop(lb, ub, kv_loop, carry)
 
-        if config.persistent:
+        if early_q_consumed:
+          schedule_barrier_arrive()
+        elif config.persistent:
           # We must sync here to ensure that WG1 is finished with `q_smem`.
           mgpu_lib.bar_sync(
               schedule_barrier + 1, num_threads=256, predicate=wg == 0
@@ -603,7 +617,8 @@ def flash_attention_kernel(
             @pl.when((warp_id == 1) & (loop_info.local_index > 0))
             def tma_q_load_warp():
               plgpu.async_prefetch(q_gmem.at[qs, hi])
-              mgpu_lib.bar_sync(q_consumed_barrier, num_threads=160)
+              num_threads = 288 if early_q_consumed else 160
+              mgpu_lib.bar_sync(q_consumed_barrier, num_threads=num_threads)
               plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_produced)
 
         return lb, ub
