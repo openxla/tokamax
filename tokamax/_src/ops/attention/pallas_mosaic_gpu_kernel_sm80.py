@@ -756,7 +756,7 @@ def flash_attention_kernel(
     hi = lax.axis_index("heads")
     qi_raw = lax.axis_index("q_tiles")
     qi = (num_q_tiles - 1 - qi_raw) if is_causal else qi_raw
-    hi_kv = lax.div(hi, jnp.asarray(q_heads_per_kv, hi.dtype))
+    hi_kv = mgpu_lib.udiv(hi, q_heads_per_kv)
 
     cta_q_base = qi * block_q
     q_base = cta_q_base if v_split0 > 0 else (cta_q_base + wg * wg_q)
@@ -775,7 +775,7 @@ def flash_attention_kernel(
 
     eff_q_max = lax.min(cta_q_base + block_q, q_end_val)
     ub = (
-        lax.min(num_kv_blocks, pl.cdiv(lax.max(eff_q_max, 0), block_kv))
+        lax.min(num_kv_blocks, mgpu_lib.ucdiv(lax.max(eff_q_max, 0), block_kv))
         if is_causal
         else num_kv_blocks
     )
@@ -787,12 +787,12 @@ def flash_attention_kernel(
       k_start_min_gmem, k_start_max_gmem = k_start_minmax_gmems
       ks_min = common.load_bcast(k_start_min_gmem, (hi, qi), layout=None)
       k_start_max = common.load_bcast(k_start_max_gmem, (hi, qi), layout=None)
-      lb = lax.max(lb, lax.div(lax.max(ks_min, 0), block_kv))
+      lb = lax.max(lb, mgpu_lib.udiv(lax.max(ks_min, 0), block_kv))
     if k_end_minmax_gmems is not None:
       k_end_min_gmem, k_end_max_gmem = k_end_minmax_gmems
       k_end_min = common.load_bcast(k_end_min_gmem, (hi, qi), layout=None)
       ke_max = common.load_bcast(k_end_max_gmem, (hi, qi), layout=None)
-      ub = lax.min(ub, pl.cdiv(lax.max(ke_max, 0), block_kv))
+      ub = lax.min(ub, mgpu_lib.ucdiv(lax.max(ke_max, 0), block_kv))
 
     cta_q_valid = (cta_q_base + block_q > q_start_val) & (
         cta_q_base < q_end_val
@@ -914,16 +914,18 @@ def flash_attention_kernel(
         return lax.fori_loop(0, total_kv_steps, make_body(True), init_carry)
     else:
       ki_unmasked_lo = (
-          lax.max(lb, pl.cdiv(lax.max(k_start_max, 0), block_kv))
+          lax.max(lb, mgpu_lib.ucdiv(lax.max(k_start_max, 0), block_kv))
           if k_start_gmem is not None
           else lb
       )
       ki_unmasked_hi = ub
       if is_causal:
-        ki_unmasked_hi = lax.min(ki_unmasked_hi, lax.div(cta_q_base, block_kv))
+        ki_unmasked_hi = lax.min(
+            ki_unmasked_hi, mgpu_lib.udiv(cta_q_base, block_kv)
+        )
       if k_end_gmem is not None:
         ki_unmasked_hi = lax.min(
-            ki_unmasked_hi, lax.div(lax.max(k_end_min, 0), block_kv)
+            ki_unmasked_hi, mgpu_lib.udiv(lax.max(k_end_min, 0), block_kv)
         )
       ki_unmasked_lo = lax.clamp(lb, ki_unmasked_lo, ub)
       ki_unmasked_hi = lax.clamp(ki_unmasked_lo, ki_unmasked_hi, ub)
@@ -1058,9 +1060,11 @@ def flash_attention_kernel(
             def _staggered_body(step, carry):
               m_i, l_i, acc = carry
               ki = lb + step
-              k_slot = lax.rem(step, stages_k_smem)
-              v_slot = lax.rem(step, stages_v_smem)
-              v_prefetch_slot = lax.rem(step + stages_v_smem - 1, stages_v_smem)
+              k_slot = mgpu_lib.urem(step, stages_k_smem)
+              v_slot = mgpu_lib.urem(step, stages_v_smem)
+              v_prefetch_slot = mgpu_lib.urem(
+                  step + stages_v_smem - 1, stages_v_smem
+              )
 
               @pl.when(wg == 0)
               def _wait_k():
@@ -1175,8 +1179,8 @@ def flash_attention_kernel(
             def _staggered_1wg_body(step, carry):
               m_i, l_i, acc = carry
               ki = lb + step
-              slot = lax.rem(step, stages)
-              v_prefetch_slot = lax.rem(step + stages - 1, stages)
+              slot = mgpu_lib.urem(step, stages)
+              v_prefetch_slot = mgpu_lib.urem(step + stages - 1, stages)
 
               plgpu.wait_gmem_to_smem(2 * (stages - 1))
               next_v_ki = ki + stages - 1
@@ -1285,7 +1289,7 @@ def flash_attention_kernel(
             def _ring_body(step, carry):
               m_i, l_i, acc = carry
               ki = lb + step
-              slot = lax.rem(step, stages)
+              slot = mgpu_lib.urem(step, stages)
 
               plgpu.wait_gmem_to_smem((stages - 1) * copies_per_wg)
               _sync_cta()
@@ -1476,8 +1480,8 @@ def flash_attention_kernel(
           def loop_body(step, carry):
             m_i, l_i, acc = carry
             ki = lb + step
-            slot = lax.rem(step, stages)
-            p_slot = lax.rem(step, num_p_slots)
+            slot = mgpu_lib.urem(step, stages)
+            p_slot = mgpu_lib.urem(step, num_p_slots)
 
             @pl.when(step >= num_p_slots)
             def _wait_p_done():
@@ -1591,8 +1595,8 @@ def flash_attention_kernel(
 
         def loop_body(step, acc):
           ki = lb + step
-          slot = lax.rem(step, stages)
-          p_slot = lax.rem(step, num_p_slots)
+          slot = mgpu_lib.urem(step, stages)
+          p_slot = mgpu_lib.urem(step, num_p_slots)
           plgpu.barrier_wait(p_ready_barrier.at[p_slot])
           alpha = plgpu.load(al_smem.at[p_slot], layout=mma_row)
           plgpu.wait_gmem_to_smem(stages - 1)

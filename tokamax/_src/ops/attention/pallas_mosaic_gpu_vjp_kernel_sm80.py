@@ -677,7 +677,7 @@ def flash_attention_vjp_kernel(
     hi = lax.axis_index("heads")
     qi_raw = lax.axis_index("q_tiles")
     qi = (num_q_tiles_dq - 1 - qi_raw) if is_causal else qi_raw
-    hi_kv = lax.div(hi, jnp.asarray(q_heads_per_kv_head, hi.dtype))
+    hi_kv = mgpu_lib.udiv(hi, q_heads_per_kv_head)
 
     cta_q_base = qi * tile_q_dq
     q_base = cta_q_base + wg * block_q_dq
@@ -694,7 +694,9 @@ def flash_attention_vjp_kernel(
 
     eff_q_max = lax.min(cta_q_base + tile_q_dq, q_end_val)
     ub = (
-        lax.min(num_kv_tiles_dq, pl.cdiv(lax.max(eff_q_max, 0), block_kv_dq))
+        lax.min(
+            num_kv_tiles_dq, mgpu_lib.ucdiv(lax.max(eff_q_max, 0), block_kv_dq)
+        )
         if is_causal
         else num_kv_tiles_dq
     )
@@ -705,12 +707,12 @@ def flash_attention_vjp_kernel(
       ks_min_g, ks_max_g = k_start_minmax_gmems
       ks_min = common.load_bcast(ks_min_g, (hi, qi), layout=None)
       k_start_max = common.load_bcast(ks_max_g, (hi, qi), layout=None)
-      lb = lax.max(lb, lax.div(lax.max(ks_min, 0), block_kv_dq))
+      lb = lax.max(lb, mgpu_lib.udiv(lax.max(ks_min, 0), block_kv_dq))
     if k_end_minmax_gmems is not None:
       ke_min_g, ke_max_g = k_end_minmax_gmems
       k_end_min = common.load_bcast(ke_min_g, (hi, qi), layout=None)
       ke_max = common.load_bcast(ke_max_g, (hi, qi), layout=None)
-      ub = lax.min(ub, pl.cdiv(lax.max(ke_max, 0), block_kv_dq))
+      ub = lax.min(ub, mgpu_lib.ucdiv(lax.max(ke_max, 0), block_kv_dq))
 
     cta_q_valid = (cta_q_base + tile_q_dq > q_start_val) & (
         cta_q_base < q_end_val
@@ -856,7 +858,7 @@ def flash_attention_vjp_kernel(
           ki = lb + step
           k_base = ki * block_kv_dq
           ks = pl.ds(k_base, block_kv_dq)
-          slot = lax.rem(step, stages_dq)
+          slot = mgpu_lib.urem(step, stages_dq)
 
           plgpu.wait_gmem_to_smem((stages_dq - 1) * copies_per_wg)
           _sync_dq()
@@ -998,18 +1000,18 @@ def flash_attention_vjp_kernel(
         )
       else:
         ki_unmasked_lo = (
-            lax.max(lb, pl.cdiv(lax.max(k_start_max, 0), block_kv_dq))
+            lax.max(lb, mgpu_lib.ucdiv(lax.max(k_start_max, 0), block_kv_dq))
             if k_start_gmem is not None
             else lb
         )
         ki_unmasked_hi = ub
         if is_causal:
           ki_unmasked_hi = lax.min(
-              ki_unmasked_hi, lax.div(cta_q_base, block_kv_dq)
+              ki_unmasked_hi, mgpu_lib.udiv(cta_q_base, block_kv_dq)
           )
         if k_end_gmem is not None:
           ki_unmasked_hi = lax.min(
-              ki_unmasked_hi, lax.div(lax.max(k_end_min, 0), block_kv_dq)
+              ki_unmasked_hi, mgpu_lib.udiv(lax.max(k_end_min, 0), block_kv_dq)
           )
         ki_unmasked_lo = lax.clamp(lb, ki_unmasked_lo, ub)
         ki_unmasked_hi = lax.clamp(ki_unmasked_lo, ki_unmasked_hi, ub)
@@ -1285,7 +1287,7 @@ def flash_attention_vjp_kernel(
 
     # Q-loop bounds `[lb_q, ub_q)` from `is_causal` and `q_start`/`q_end`.
     lb_q = (
-        lax.min(num_q_tiles_dkv, lax.div(cta_kv_base, block_q_dkv))
+        lax.min(num_q_tiles_dkv, mgpu_lib.udiv(cta_kv_base, block_q_dkv))
         if is_causal
         else jnp.int32(0)
     )
@@ -1303,7 +1305,7 @@ def flash_attention_vjp_kernel(
           qs_min = lax.min(qs_min, val)
           qs_max = lax.max(qs_max, val)
       q_start_group_max = qs_max
-      lb_q = lax.max(lb_q, lax.div(lax.max(qs_min, 0), block_q_dkv))
+      lb_q = lax.max(lb_q, mgpu_lib.udiv(lax.max(qs_min, 0), block_q_dkv))
 
     if q_end_gmem is not None:
       if q_end_gmem.shape[0] == 1:
@@ -1317,7 +1319,9 @@ def flash_attention_vjp_kernel(
       q_end_group_min = lax.min(orig_q_seq_len, qe_min)
       ub_q = lax.min(
           ub_q,
-          pl.cdiv(lax.max(lax.min(qe_max, orig_q_seq_len), 0), block_q_dkv),
+          mgpu_lib.ucdiv(
+              lax.max(lax.min(qe_max, orig_q_seq_len), 0), block_q_dkv
+          ),
       )
 
     cta_active = kv_tile_valid & (ub_q > lb_q)
@@ -1394,8 +1398,8 @@ def flash_attention_vjp_kernel(
       def _step_to_qi_hi(step):
         if q_heads_per_kv_head == 1:
           return lb_q + step, hi_kv
-        q_idx = lax.div(step, q_heads_per_kv_head)
-        g_idx = lax.rem(step, q_heads_per_kv_head)
+        q_idx = mgpu_lib.udiv(step, q_heads_per_kv_head)
+        g_idx = mgpu_lib.urem(step, q_heads_per_kv_head)
         return lb_q + q_idx, hi_kv * q_heads_per_kv_head + g_idx
 
       def _reconstruct_pt(
@@ -1517,18 +1521,18 @@ def flash_attention_vjp_kernel(
         if is_causal:
           qi_unmasked_lo = lax.max(
               qi_unmasked_lo,
-              pl.cdiv(cta_kv_base + tile_kv_dkv, block_q_dkv),
+              mgpu_lib.ucdiv(cta_kv_base + tile_kv_dkv, block_q_dkv),
           )
         if q_start_gmem is not None:
           qi_unmasked_lo = lax.max(
               qi_unmasked_lo,
-              pl.cdiv(lax.max(q_start_group_max, 0), block_q_dkv),
+              mgpu_lib.ucdiv(lax.max(q_start_group_max, 0), block_q_dkv),
           )
         qi_unmasked_hi = ub_q
         if q_end_gmem is not None:
           qi_unmasked_hi = lax.min(
               qi_unmasked_hi,
-              lax.div(lax.max(q_end_group_min, 0), block_q_dkv),
+              mgpu_lib.udiv(lax.max(q_end_group_min, 0), block_q_dkv),
           )
         qi_unmasked_lo = lax.clamp(lb_q, qi_unmasked_lo, ub_q)
         qi_unmasked_hi = lax.clamp(qi_unmasked_lo, qi_unmasked_hi, ub_q)
@@ -1618,7 +1622,7 @@ def flash_attention_vjp_kernel(
             def _dk_body(step, dk_acc):
               qi, hi = _step_to_qi_hi(step)
               qs = pl.ds(qi * block_q_dkv, block_q_dkv)
-              slot = lax.rem(step, stages_dkv)
+              slot = mgpu_lib.urem(step, stages_dkv)
 
               plgpu.wait_gmem_to_smem((stages_dkv - 1) * wg0_copies)
               _cta_barrier()
@@ -1691,7 +1695,7 @@ def flash_attention_vjp_kernel(
             _issue_wg1_stage(s_idx, s_idx)
 
           def _dv_body(step, dv_acc):
-            slot = lax.rem(step, stages_dkv)
+            slot = mgpu_lib.urem(step, stages_dkv)
 
             plgpu.wait_gmem_to_smem((stages_dkv - 1) * wg1_copies)
             _cta_barrier()
@@ -1797,7 +1801,7 @@ def flash_attention_vjp_kernel(
           dk_acc, dv_acc = carry
           qi, hi = _step_to_qi_hi(step)
           qs = pl.ds(qi * block_q_dkv, block_q_dkv)
-          slot = lax.rem(step, stages_dkv)
+          slot = mgpu_lib.urem(step, stages_dkv)
 
           plgpu.wait_gmem_to_smem((stages_dkv - 1) * copies_per_wg)
           _sync_dkv()
