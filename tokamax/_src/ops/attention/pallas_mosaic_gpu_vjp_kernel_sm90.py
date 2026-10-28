@@ -290,7 +290,7 @@ def flash_attention_vjp_kernel(
     qi = lax.axis_index("q_tiles")
     hi = lax.axis_index("heads")
     wg = lax.axis_index("wg")
-    hi_kv = lax.div(hi, jnp.array(q_heads_per_kv_head, hi.dtype))
+    hi_kv = mgpu_lib.udiv(hi, q_heads_per_kv_head)
 
     tile_q = compute_wgs * block_q
     q_base = qi * tile_q + wg * block_q
@@ -299,7 +299,7 @@ def flash_attention_vjp_kernel(
     lb = 0
     ub = num_kv_tiles = pl.cdiv(kv_seq_len, block_kv_dq)
     if is_causal:
-      ub = lax.min(ub, pl.cdiv(qi * tile_q + tile_q, block_kv))
+      ub = lax.min(ub, mgpu_lib.ucdiv(qi * tile_q + tile_q, block_kv))
 
     k_gmem = k_gmem.at[:, hi_kv]
     v_gmem = v_gmem.at[:, hi_kv]
@@ -517,7 +517,7 @@ def flash_attention_vjp_kernel(
     kv_base = ki * tile_kv + wg * block_kv
     ks = cast(pl.Slice, pl.ds(kv_base, block_kv))
     ub = num_q_tiles = pl.cdiv(q_seq_len, block_q)
-    lb = lax.min(ub, lax.div(ki * tile_kv, block_q)) if is_causal else 0
+    lb = lax.min(ub, mgpu_lib.udiv(ki * tile_kv, block_q)) if is_causal else 0
 
     k_smem = k_smems.at[wg]
     v_smem = v_smems.at[wg]

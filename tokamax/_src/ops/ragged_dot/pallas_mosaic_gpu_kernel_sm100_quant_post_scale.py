@@ -89,6 +89,8 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
 
   (num_groups, n, k_w), (m, k_x) = w.shape, x.shape
   tile_k = k_w // w_scales.shape[1]
+  if tile_k % block_k != 0:
+    raise NotImplementedError(f"{tile_k=} must be a multiple of {block_k=}.")
   if k_w != k_x:
     raise ValueError(
         f"Contraction dim mismatch: weights.shape[1]={k_w}, x.shape[-1]={k_x}"
@@ -193,7 +195,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
               )
 
             def _iter_w(ki, _):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
 
               @pl.when((ki >= num_stages) | (carry > 0))
               def _():
@@ -220,7 +222,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
               )
 
             def _iter_x(ki, _):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
 
               @pl.when((ki >= num_stages) | (carry > 0))
               def _():
@@ -234,7 +236,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
           @pl.when((warp_id == _MMA_WARP) & is_lead_block)
           def mma_warp():
             def do_mma(ki, _):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
 
               with jax.named_scope("wait acc_consumed"):
 
@@ -273,7 +275,7 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
         @pl.when(wg == _DEQ_WG)
         def _():
           def _deq(ki, _):
-            slot = lax.rem(ki, num_stages)
+            slot = mgpu_lib.urem(ki, num_stages)
             with jax.named_scope("wait w"):
               plgpu.barrier_wait(w_tma_barrier.at[slot])
             # S -> T
@@ -310,11 +312,11 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
               _TCGEN05,
           )
           def _loop_body(ki, acc):
-            slot = lax.rem(ki, num_stages)
+            slot = mgpu_lib.urem(ki, num_stages)
             scale = plgpu.load(
                 w_scales_gmem.at[
                     group_id,
-                    lax.div((ki * block_k), tile_k),
+                    mgpu_lib.udiv(ki, tile_k // block_k),
                     slice_n,
                 ],
                 layout=_TCGEN05_ROW,

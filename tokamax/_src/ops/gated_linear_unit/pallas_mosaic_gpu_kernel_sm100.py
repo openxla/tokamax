@@ -134,7 +134,7 @@ def gated_linear_unit(
         block_m_index = m_index * config.cluster_size_m + cluster_idx
       elif config.cluster_size_n > 1:
         block_n_index = n_index * config.cluster_size_n + cluster_idx
-      acc_slot = lax.rem(local_index, jnp.int32(ACC_NUM_SLOTS))
+      acc_slot = mgpu_lib.urem(local_index, jnp.int32(ACC_NUM_SLOTS))
 
       slice_m = pl.ds(block_m_index * tile_m, tile_m)
 
@@ -153,7 +153,7 @@ def gated_linear_unit(
           def _loop_body(ki, _):
             slice_k = pl.ds(ki * tile_k, tile_k)
             slice_n = pl.ds(block_n_index * tile_n, tile_n)
-            slot = lax.rem(ki, max_concurrent_steps)
+            slot = mgpu_lib.urem(ki, max_concurrent_steps)
 
             def _wait_barrier(barrier):
               @pl.when(
@@ -192,7 +192,7 @@ def gated_linear_unit(
         @pl.when(jnp.logical_and(warp_id == 1, is_lead_block))
         def _mma_warp():
           def _loop_body(ki, _):
-            slot = lax.rem(ki, max_concurrent_steps)
+            slot = mgpu_lib.urem(ki, max_concurrent_steps)
             plgpu.barrier_wait(ab_tma_barrier.at[slot])
             # TODO: When tcgen05 supports reshapes with
             # transposes like wgmma we can avoid the dual

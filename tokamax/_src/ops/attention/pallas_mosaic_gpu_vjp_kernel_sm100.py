@@ -377,7 +377,7 @@ def _kernel_dq(
 
   # We assume MHA or simple mapping here to respect boundaries.
   q_heads_per_kv_head = q_gmem.shape[-2] // k_gmem.shape[-2]
-  hi_kv = lax.div(hi, jnp.array(q_heads_per_kv_head, hi.dtype))
+  hi_kv = mgpu_lib.udiv(hi, q_heads_per_kv_head)
 
   q_base = qi * block_q
   qs = cast(pl.Slice, pl.ds(q_base, block_q))
@@ -385,7 +385,7 @@ def _kernel_dq(
   lb = 0
   ub = num_kv_tiles = k_gmem.shape[-3] // block_kv
   if is_causal:
-    ub = lax.min(ub, pl.cdiv(q_base + block_q, block_kv))
+    ub = lax.min(ub, mgpu_lib.ucdiv(q_base + block_q, block_kv))
 
   dp_tmem, ds_tmem = dp_ds_tmems
 
@@ -406,14 +406,14 @@ def _kernel_dq(
       def tma_kv_warp():
         @pl.loop(lb, lax.min(lb + num_stages, ub))
         def prologue(ki):
-          si = lax.rem(ki - lb, num_stages)
+          si = mgpu_lib.urem(ki - lb, num_stages)
           ks = pl.ds(ki * block_kv, block_kv)
           cp(v_gmem.at[ks, hi_kv], v_smem, kv_produced, si)
           cp(k_gmem.at[ks, hi_kv], k_smem, kv_produced, si)
 
         @pl.loop(lb + num_stages, ub)
         def kv_loop(ki):
-          si = lax.rem(ki - lb, num_stages)
+          si = mgpu_lib.urem(ki - lb, num_stages)
           ks = pl.ds(ki * block_kv, block_kv)
           plgpu.barrier_wait(v_consumed.at[si])
           cp(v_gmem.at[ks, hi_kv], v_smem, kv_produced, si)
@@ -450,7 +450,7 @@ def _kernel_dq(
       def mma_warp():
 
         def q_k_mma(ki, wait_s_consumed=True):
-          si = lax.rem(ki - lb, num_stages)
+          si = mgpu_lib.urem(ki - lb, num_stages)
           plgpu.barrier_wait(kv_produced.at[si])
           if wait_s_consumed:
             plgpu.barrier_wait(s_consumed)
@@ -460,13 +460,13 @@ def _kernel_dq(
           plgpu.tcgen05_commit_arrive(s_produced)
 
         def do_v_mma(ki):
-          si = lax.rem(ki - lb, num_stages)
+          si = mgpu_lib.urem(ki - lb, num_stages)
           plgpu.tcgen05_mma(dp_tmem, do_smem, v_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(dp_produced)
           plgpu.tcgen05_commit_arrive(v_consumed.at[si])
 
         def ds_k_mma(ki):
-          si = lax.rem(ki - lb, num_stages)
+          si = mgpu_lib.urem(ki - lb, num_stages)
           plgpu.barrier_wait(ds_produced)
           plgpu.tcgen05_mma(dq_tmem, ds_tmem, k_smem.at[si], accumulate=ki > lb)
           plgpu.tcgen05_commit_arrive(k_consumed.at[si])
@@ -696,7 +696,7 @@ def _kernel_dkv(
   kv_base = ki * block_kv
   ks = pl.ds(kv_base, block_kv)
 
-  lb = lax.div(kv_base, block_q) if is_causal else 0
+  lb = mgpu_lib.udiv(kv_base, block_q) if is_causal else 0
   ub = q_gmem.shape[-3] // block_q
   num_q_tiles = ub - lb
   safe_num_q_tiles = lax.max(num_q_tiles, 1)
@@ -728,10 +728,12 @@ def _kernel_dkv(
 
         @pl.loop(0, total_steps)
         def q_loop(step):
-          si = lax.rem(step, residual_stages)
-          qi = lb + lax.rem(step, safe_num_q_tiles)
+          si = mgpu_lib.urem(step, residual_stages)
+          qi = lb + mgpu_lib.urem(step, safe_num_q_tiles)
           qs = pl.ds(qi * block_q, block_q)
-          hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
+          hi = hi_kv * q_heads_per_kv_head + mgpu_lib.udiv(
+              step, safe_num_q_tiles
+          )
 
           @pl.when(step >= residual_stages)
           def wait_res():
@@ -746,10 +748,12 @@ def _kernel_dkv(
       def tma_q_warp():
         @pl.loop(0, total_steps)
         def q_loop(step):
-          si = lax.rem(step, num_stages)
-          qi = lb + lax.rem(step, safe_num_q_tiles)
+          si = mgpu_lib.urem(step, num_stages)
+          qi = lb + mgpu_lib.urem(step, safe_num_q_tiles)
           qs = pl.ds(qi * block_q, block_q)
-          hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
+          hi = hi_kv * q_heads_per_kv_head + mgpu_lib.udiv(
+              step, safe_num_q_tiles
+          )
           do_wait = step >= num_stages
 
           pl.when(do_wait)(lambda: plgpu.barrier_wait(do_consumed.at[si]))
@@ -768,9 +772,11 @@ def _kernel_dkv(
 
           @pl.loop(0, total_steps)
           def q_loop(step):
-            qi = lb + lax.rem(step, safe_num_q_tiles)
+            qi = lb + mgpu_lib.urem(step, safe_num_q_tiles)
             qs = pl.ds(qi * block_q, block_q)
-            hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
+            hi = hi_kv * q_heads_per_kv_head + mgpu_lib.udiv(
+                step, safe_num_q_tiles
+            )
 
             if bias_smem is not None:
               plgpu.barrier_wait(bias_consumed)  # pyrefly: ignore[bad-argument-type]
@@ -791,7 +797,7 @@ def _kernel_dkv(
 
         @pl.loop(0, total_steps)
         def q_loop(step):
-          si = lax.rem(step, num_stages)
+          si = mgpu_lib.urem(step, num_stages)
           plgpu.barrier_wait(q_do_produced.at[si])
           mgpu_lib.tcgen05_fence_after_thread_sync()
           plgpu.tcgen05_mma(s_tmem, k_smem, q_smem.at[si].T, accumulate=False)
@@ -862,9 +868,9 @@ def _kernel_dkv(
 
     @pl.loop(0, total_steps)
     def q_loop(step):
-      si_res = lax.rem(step, residual_stages)
-      hi = hi_kv * q_heads_per_kv_head + lax.div(step, safe_num_q_tiles)
-      qi = lb + lax.rem(step, safe_num_q_tiles)
+      si_res = mgpu_lib.urem(step, residual_stages)
+      hi = hi_kv * q_heads_per_kv_head + mgpu_lib.udiv(step, safe_num_q_tiles)
+      qi = lb + mgpu_lib.urem(step, safe_num_q_tiles)
       q_base = qi * block_q
       qs = pl.ds(q_base, block_q)
       plgpu.barrier_wait(residual_produced.at[si_res])

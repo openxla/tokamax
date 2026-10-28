@@ -288,7 +288,7 @@ def flash_attention_kernel(
 
         if is_causal:
           q_max = (qi + 1) * (2 * block_q)
-          ub = lax.min(ub, pl.cdiv(q_max, block_kv))
+          ub = lax.min(ub, mgpu_lib.ucdiv(q_max, block_kv))
 
         load_k_minmax = lambda x: _load_bcast(x, (hi, qi), layout=None)
 
@@ -296,13 +296,13 @@ def flash_attention_kernel(
           k_start_max = None
         else:
           k_start_min, k_start_max = map(load_k_minmax, k_start_minmax_gmems)
-          lb = lax.max(lb, lax.div(k_start_min, block_kv))
+          lb = lax.max(lb, mgpu_lib.udiv(lax.max(k_start_min, 0), block_kv))
 
         if k_end_minmax_gmems is None:
           k_end_min = None
         else:
           k_end_min, k_end_max = map(load_k_minmax, k_end_minmax_gmems)
-          ub = lax.min(ub, pl.cdiv(k_end_max, block_kv))
+          ub = lax.min(ub, mgpu_lib.ucdiv(lax.max(k_end_max, 0), block_kv))
 
         return lb, ub, k_start_max, k_end_min
 
@@ -362,7 +362,7 @@ def flash_attention_kernel(
         def await_k():
           @pl.when(ub > lb)
           def _():
-            si = lax.rem(prev_iters, num_stages)
+            si = mgpu_lib.urem(prev_iters, num_stages)
             plgpu.barrier_wait(k_bias_produced.at[si])
 
         # If there is a k-range, we expect the first `k` load to be slower than
@@ -386,7 +386,7 @@ def flash_attention_kernel(
 
         def kv_loop(ki, carry, *, do_causal=False):
           acc, m_scale, m_i, l_i = carry
-          si = lax.rem(prev_iters + ki - lb, num_stages)
+          si = mgpu_lib.urem(prev_iters + ki - lb, num_stages)
           k_base = ki * block_kv
           ks = cast(pl.Slice, pl.ds(k_base, block_kv))
 
@@ -501,7 +501,7 @@ def flash_attention_kernel(
 
             @pl.when(ki + 1 < ub)
             def _():
-              si_next = lax.rem(prev_iters + ki + 1 - lb, num_stages)
+              si_next = mgpu_lib.urem(prev_iters + ki + 1 - lb, num_stages)
               plgpu.barrier_wait(k_bias_produced.at[si_next])
 
           acc, l_i = pl.run_state(compute_pv)((plgpu.ACC.init(acc), l_i))
@@ -512,7 +512,7 @@ def flash_attention_kernel(
 
         if is_causal:
           causal_loop_body = functools.partial(kv_loop, do_causal=True)
-          ub_no_causal = lax.min(ub, lax.div(q_base, block_kv))
+          ub_no_causal = lax.min(ub, mgpu_lib.udiv(q_base, block_kv))
           carry = lax.fori_loop(lb, ub_no_causal, kv_loop, carry)
           # TODO: This cond should be redundant, but without it we
           # hit a weird compiler bug.
@@ -566,7 +566,9 @@ def flash_attention_kernel(
         o_gmem_ = o_gmem.at[qs, hi]
         for qj in range(block_q // epi_tile_q):
           for dj in range(head_dim_out // epi_tile_d):
-            si = lax.rem(qj * (head_dim_out // epi_tile_d) + dj, num_epi_slots)
+            si = mgpu_lib.urem(
+                qj * (head_dim_out // epi_tile_d) + dj, num_epi_slots
+            )
             epi_qs = slice(qj * epi_tile_q, (qj + 1) * epi_tile_q)
             epi_ds = slice(dj * epi_tile_d, (dj + 1) * epi_tile_d)
             plgpu.wait_smem_to_gmem(num_epi_slots - 1, wait_read_only=True)
@@ -580,7 +582,7 @@ def flash_attention_kernel(
 
       def memory_wg():
         plgpu.set_max_registers(40, action="decrease")
-        hi_kv = lax.div(hi, q_heads_per_kv_head)
+        hi_kv = mgpu_lib.udiv(hi, q_heads_per_kv_head)
         qs = pl.ds(qi * (2 * block_q), 2 * block_q)
 
         if bias_smem is None:
@@ -609,7 +611,7 @@ def flash_attention_kernel(
 
             @pl.loop(lb, ub)
             def kv_loop(ki):
-              si = lax.rem(prev_iters + ki - lb, num_stages)
+              si = mgpu_lib.urem(prev_iters + ki - lb, num_stages)
               ks = pl.ds(ki * block_kv, block_kv)
               mgpu_lib.bar_sync(k_consumed_barrier + si, num_threads=288)
               cp(k_gmem.at[ks, hi_kv], k_smem, k_bias_produced, si)

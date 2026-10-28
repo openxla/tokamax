@@ -96,6 +96,8 @@ def ragged_dot_gpu_quant_blackwell_kernel(
     raise NotImplementedError(
         f"{tile_k=} must be greater than or equal to {block_k=}."
     )
+  if tile_k % block_k != 0:
+    raise NotImplementedError(f"{tile_k=} must be a multiple of {block_k=}.")
 
   if config.post_scale:
     raise ValueError("Post scale is not supported.")
@@ -213,7 +215,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
               plgpu.copy_gmem_to_smem(  # e,k//t,n
                   w_scales_gmem.at[
                       group_id,
-                      lax.div((ki * block_k), tile_k),
+                      mgpu_lib.udiv(ki, tile_k // block_k),
                       slice_n,
                   ],
                   w_scales_smem.at[slot],
@@ -221,7 +223,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
               )
 
             def _iter_w(ki, _):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
 
               @pl.when((ki >= num_stages) | (carry > 0))
               def _():
@@ -248,7 +250,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
               )
 
             def _iter_x(ki, _):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
 
               @pl.when((ki >= num_stages) | (carry > 0))
               def _():
@@ -262,7 +264,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           @pl.when((warp_id == _MMA_WARP) & is_lead_block)
           def mma_warp():
             def do_mma(ki, _):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
               is_last_iter = ki >= num_k_iters - 1
 
               with jax.named_scope("wait_wbf16"):
@@ -301,7 +303,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
         @pl.when(wg == _DEQ_WG)
         def _():
           def _deq(ki, _):
-            slot = lax.rem(ki, num_stages)
+            slot = mgpu_lib.urem(ki, num_stages)
             with jax.named_scope("tma-w"):
               plgpu.barrier_wait(w_tma_barrier.at[slot])
             # S -> T
