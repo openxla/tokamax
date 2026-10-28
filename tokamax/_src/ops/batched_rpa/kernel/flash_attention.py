@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from tokamax._src.ops.batched_rpa.kernel import configs, utils
+from tokamax._src.ops.batched_rpa.kernel.schedule import SmemWrapper
 
 
 def flash_attention_qk_softmax(
@@ -25,7 +26,7 @@ def flash_attention_qk_softmax(
     k: jax.Array,  # [B, KV, S, H] or [B, KV, H, S]
     m_prev: jax.Array,  # [KV, TQ, 128]
     l_prev: jax.Array,  # [KV, TQ, 128]
-    is_last_k: jax.Ref,  # [B]
+    is_last_k: SmemWrapper,  # [steps, B]
     *,
     custom_mask: jax.Array,
     cfgs: configs.RpaConfigs,
@@ -102,11 +103,22 @@ def flash_attention_qk_softmax(
     for b_idx in range(cfgs.block.batch_size):
         l_next_b = alpha_list[b_idx] * l_prev + p_rowsum[b_idx]
         l_next_list.append(l_next_b)
-        l_prev = l_next_b
+        if cfgs.fuse_accum:
+            # Reset with a select rather than relying on alpha == 0 (since
+            # 0 * NaN == NaN). Note: these NaNs are not produced by this kernel
+            # itself; they are observed mid-batch during decode when a corrupted
+            # MTP draft writes NaN into one sequence's KV cache, which would
+            # otherwise leak into every subsequent sequence in the batch. The
+            # normal/default prefill path (`not cfgs.fuse_accum`) is unaffected
+            # and skips this select to avoid extra vector ops across `bq_c`
+            # query chunks.
+            l_prev = jnp.where(is_last_k[step, b_idx], 0.0, l_next_b)
+        else:
+            l_prev = l_next_b
 
     l_next = jnp.stack(l_next_list, axis=0)
 
-    return p, alpha_list, m_next, l_next, m_prev
+    return p, alpha_list, m_next, l_next, m_prev, l_prev
 
 
 def flash_attention_pv(
@@ -114,6 +126,8 @@ def flash_attention_pv(
     v: jax.Array,  # [B, KV, S, H] or [B, KV, H, S]
     alpha_list: list[jax.Array],  # B * [KV, TQ, 128]
     o_prev: jax.Array,  # [KV, TQ, H]
+    step: jax.Array,
+    is_last_k: SmemWrapper,  # [steps, B]
     cfgs: configs.RpaConfigs,
     v_scale: jax.Array | None = None,  # [B, KV, S]
 ):
@@ -156,7 +170,11 @@ def flash_attention_pv(
         alpha_b = utils.broadcast_minor(alpha_list[b_idx], o_prev.shape)
         o_next_b = alpha_b * o_prev + pv[b_idx]
         o_next_list.append(o_next_b)
-        o_prev = o_next_b
+        if cfgs.fuse_accum:
+            # Same select reset as l_prev in flash_attention_qk_softmax.
+            o_prev = jnp.where(is_last_k[step, b_idx], 0.0, o_next_b)
+        else:
+            o_prev = o_next_b
     o_next = jnp.stack(o_next_list, axis=0)
 
-    return o_next
+    return o_next, o_prev

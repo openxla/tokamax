@@ -53,17 +53,16 @@ class _PallasMosaicTpuBatchedRpa(
   def deconstruct_config(  # pyrefly: ignore[bad-override]
       self, config: Config | None
   ) -> tuple[int, ...] | None:
-    """Deconstructs a Config object into a 7-int tuple for jax_op."""
+    """Deconstructs a Config object into a 6-int tuple for jax_op."""
     if config is None:
       return None
-    assert len(dataclasses.fields(config)) == 7, (
-        f"Expected 7 fields in Config, got {len(dataclasses.fields(config))}."
+    assert len(dataclasses.fields(config)) == 6, (
+        f"Expected 6 fields in Config, got {len(dataclasses.fields(config))}."
     )
     return (
         config.prefill_bq_sz,
         config.prefill_bq_c_sz,
         config.bkv_sz,
-        config.n_buffer,
         config.decode_batch_size,
         config.prefill_batch_size,
         _KV_LAYOUTS.index(config.kv_layout.upper()),
@@ -71,10 +70,10 @@ class _PallasMosaicTpuBatchedRpa(
 
   @override
   def reconstruct_config(self, *config_parts: Any) -> Config:
-    """Rebuilds the deconstructed 7-int tuple back into a Config."""
+    """Rebuilds the deconstructed 6-int tuple back into a Config."""
     config = config_parts[0]
     assert config is not None, "Forward config not set."
-    return Config(*config[:6], kv_layout=_KV_LAYOUTS[config[6]])
+    return Config(*config[:5], kv_layout=_KV_LAYOUTS[config[5]])
 
   @override
   def op_impl_call(

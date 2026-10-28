@@ -115,8 +115,15 @@ def _make_rpa_spec(
   values = jax.ShapeDtypeStruct(
       (total_q_len, num_kv_heads, head_dim), kv_cache_dtype
   )
+  kv_packing = 32 // jax.dtypes.itemsize_bits(kv_cache_dtype)
   kv_cache = jax.ShapeDtypeStruct(
-      (total_num_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+      (
+          total_num_pages,
+          page_size,
+          _cdiv(num_kv_heads * 2, kv_packing),
+          kv_packing,
+          head_dim_aligned,
+      ),
       kv_cache_dtype,
   )
 

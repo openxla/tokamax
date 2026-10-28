@@ -32,14 +32,12 @@ class BlockSizes:
         bq_c_sz: Query chunk block size for prefill.
         bkv_sz: Key/Value block size.
         batch_size: Batch size.
-        n_buffer: Number of buffers for pipelining.
     """
 
     bq_sz: int
     bq_c_sz: int
     bkv_sz: int
     batch_size: int
-    n_buffer: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,16 +94,18 @@ class KVLayout(enum.StrEnum):
     def symbol(self) -> str:
         match self:
             case KVLayout.HEAD_ALONG_SUBLANE:
-                return "nhs"
-            case KVLayout.SEQ_ALONG_LANE:
                 return "snh"
+            case KVLayout.SEQ_ALONG_LANE:
+                return "nhs"
 
 
 class RpaCase(enum.StrEnum):
     """Represents the different cases for Ragged Paged Attention.
 
     - DECODE: Sequences are in decode-only mode (q_len = 1).
-    - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
+    - PREFILL: Sequences are in prefill-only mode (q_len > 1, static). Note that
+        Batched RPA folds PREFILL into MIXED, but the enum value is kept because
+        distribution still has three entries and RPA v3 / MLA use it.
     - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
     """
 
@@ -124,7 +124,7 @@ class RpaCase(enum.StrEnum):
                 return "m"
 
     def get_range(
-            self, distribution: jax.Array
+        self, distribution: jax.Array
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
         assert distribution.shape == (3,)
         match self:
@@ -134,6 +134,17 @@ class RpaCase(enum.StrEnum):
                 return distribution[0], distribution[1]
             case RpaCase.MIXED:
                 return distribution[1], distribution[2]
+
+
+# Inputs need three slots. The fetch for a tile is issued throughout the
+# preceding tile rather than all at once at its start, so it cannot be waited
+# on right away -- it needs one extra tile in flight for the DMA to land.
+NUM_INPUT_SLOTS = 3
+
+# Outputs only need two. The writeback issued at step N is waited at the top of
+# step N + 2, which is exactly when slot N % 2 comes back around, so the DMA
+# still gets all of step N + 1 to land.
+NUM_OUTPUT_SLOTS = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,6 +171,15 @@ class ServingConfigs:
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
     skip_kv_update: bool = False
+    mask_invalid_v: bool | None = None
+
+    def __post_init__(self):
+        if self.mask_invalid_v is None:
+            object.__setattr__(
+                self,
+                "mask_invalid_v",
+                self.kv_layout == KVLayout.SEQ_ALONG_LANE,
+            )
 
     @property
     def max_decode_bkv_p_new(self) -> int:
@@ -195,7 +215,6 @@ class ServingConfigs:
         return 0
 
 
-
 @dataclasses.dataclass(frozen=True, eq=True)
 class RpaConfigs:
     block: BlockSizes
@@ -222,9 +241,19 @@ class RpaConfigs:
     def batch_size(self) -> int:
         return self.block.batch_size
 
-    @property
-    def n_buffer(self) -> int:
-        return self.block.n_buffer
+    def seq_range(
+        self, distribution: jax.Array | jax.Ref
+    ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+        """Sequences this kernel call schedules.
+
+        Batched RPA has no specialised prefill-only path, so MIXED also covers the
+        prefill-only segment [distribution[0], distribution[1]).
+        """
+        if self.mode == RpaCase.DECODE:
+            return 0, distribution[0]
+        if self.mode == RpaCase.MIXED:
+            return distribution[0], distribution[2]
+        raise ValueError(f"Batched RPA does not dispatch {self.mode}; use MIXED.")
 
     # Define derived values.
 
@@ -257,8 +286,9 @@ class RpaConfigs:
             28 + 12 * self.bkv_p_cache + 4 * self.dma_kv_new_size * self.bkv_p_new
         )
         bytes_per_step *= self.block.batch_size
-        # Add 20 bytes for the 5 total_wait fields (total_wait_kv_in, total_wait_kv_out,
-        # total_wait_q_in, total_wait_o_out, total_wait_lse_out) which are 1D arrays (not multiplied by batch_size).
+        # Add 20 bytes for the 5 total_wait fields (total_wait_kv_in,
+        # total_wait_kv_out, total_wait_q_in, total_wait_o_out, total_wait_lse_out)
+        # which are 1D arrays (not multiplied by batch_size).
         bytes_per_step += 20
 
         max_steps_ub = available_bytes // bytes_per_step
@@ -273,6 +303,8 @@ class RpaConfigs:
 
     @property
     def bkv_p_cache(self) -> int:
+        if self.mode == RpaCase.PREFILL:
+            return 0
         return self.bkv_p
 
     @property
@@ -399,6 +431,29 @@ class RpaConfigs:
         )
 
     @property
+    def kv_token_align(self) -> int:
+        """DMA token granularity: the 128-lane tile for SEQ_ALONG_LANE, else 1.
+
+        SEQ_ALONG_LANE packs tokens along the lane dim, so every DMA token count
+        must be a multiple of the 128-lane tile. HEAD_ALONG_SUBLANE puts tokens on
+        the sublane dim, where single tokens are addressable.
+        """
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            return pltpu.get_tpu_info().num_lanes
+        return 1
+
+    @property
+    def kv_vmem_lanes(self) -> int:
+        """Lane-dim size of the KV VMEM buffer; SEQ_ALONG_LANE only."""
+        # o = kv from cache, n = kv from new, - = pad. Each [] is a 128-lane cell:
+        #
+        #   want  [onnn][nnnn]
+        #   got   [o---][---n][nnnn][nn--]
+        #
+        # because we fetch at 128-lane boundary, we need 2 extra padding slots
+        return self.block.bkv_sz + 2 * self.kv_token_align
+
+    @property
     def kv_vmem_shape(self):
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return (
@@ -406,7 +461,7 @@ class RpaConfigs:
                 self.model.num_kv_heads * 2,
                 self.aligned_kv_head_dim // self.serve.packing_kv,
                 self.serve.packing_kv,
-                self.block.bkv_sz + 2 * self.serve.page_size,
+                self.kv_vmem_lanes,
             )
         return (
             self.block.batch_size,
@@ -569,6 +624,7 @@ class RpaConfigs:
             )
         if distribution.shape != (3,):
             raise ValueError(f"Expected {distribution.shape=} to be (3,).")
+
         # Context Parallel Support
         if self.serve.cp_group_size is not None:
             if self.serve.attention_scope == AttentionScope.FULL:

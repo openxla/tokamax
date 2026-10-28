@@ -13,7 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 import dataclasses
-import functools
+from collections.abc import Callable
+from typing import cast
 
 import jax
 import jax.experimental.pallas as pl
@@ -21,25 +22,22 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax import lax
 
-# yapf: disable
 from tokamax._src.ops.batched_rpa.kernel import (
     bref_override,
     configs,
     flash_attention,
+    pipeline,
     schedule,
     stitch_utils,
     utils,
 )
-
-# yapf: enable
-
-# Define inner kernel.
 
 
 def strided_load_bkv(
     kv_in_vref: jax.Ref,
     b_idx: int,
     start: int,
+    valid_mask: jax.Array | None = None,
     *,
     cfgs: configs.RpaConfigs,
 ) -> list[tuple[jax.Array, jax.Array]]:
@@ -47,6 +45,12 @@ def strided_load_bkv(
     start //= cfgs.serve.packing_kv
     kv_u32_ref = kv_in_vref.at[b_idx].bitcast(jnp.uint32)
     kv_ref = kv_u32_ref.reshape(-1, cfgs.aligned_kv_head_dim)
+
+    # kv_ref must be annotated with no_hazard_no_deps so XLA knows not to add a
+    # dependency between the HBM->VMEM DMA copy-in from stage n - 1 and the vld
+    # instructions for matmuls at stage n.
+    if jax.__version_info__ >= (0, 11, 2):
+        kv_ref = pltpu.annotate(kv_ref, no_hazard_no_deps=True)
 
     if cfgs.serve.packing_kv == 1:
         k = utils.strided_load(
@@ -63,11 +67,15 @@ def strided_load_bkv(
             cfgs.bkv_stride,
             dtype=cfgs.serve.dtype_kv,
         )
+        if valid_mask is not None:
+            v = jnp.where(valid_mask, v, jnp.zeros_like(v))
         return [(k, v)]
 
     kv = utils.strided_load(
         kv_ref, start, cfgs.bkv_sz * cfgs.bkv_stride, cfgs.bkv_stride
     )
+    if valid_mask is not None:
+        kv = jnp.where(valid_mask, kv, jnp.zeros_like(kv))
     bitwidth = jax.dtypes.itemsize_bits(cfgs.serve.dtype_kv)
 
     return utils.convert_to_target_bitwidth(
@@ -78,15 +86,15 @@ def strided_load_bkv(
 def calculate_and_store_out(
     step_idx: jax.Array,
     schedule_ref: schedule.RpaSchedule,
-    acc_list: list[jax.Array],
-    l_list: list[jax.Array],
-    m_list: list[jax.Array],
+    acc_list: jax.Array,
+    l_list: jax.Array,
+    m_list: jax.Array,
     o_vref: jax.Ref,
     lse_o_vref: jax.Ref | None,
     *,
     cfgs: configs.RpaConfigs,
 ):
-    def _accum(b_idx: jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
+    def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
@@ -107,10 +115,8 @@ def calculate_and_store_out(
         utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
 
     def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
+        assert lse_o_vref is not None
         lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
-        # Store through packed words, as for O. Keeping tokens separate in
-        # the buffer lets DMA copy complete token records even for small GQA
-        # groups, without padding the attention computation to eight heads.
         lse_u32 = lse_o_vref.at[b_idx].bitcast(jnp.uint32)
         lse_ref = lse_u32.reshape(-1, lse_o_vref.shape[-1])
         lse_val = pltpu.bitcast(
@@ -135,6 +141,7 @@ def calculate_and_store_out(
             jax.lax.cond(
                 is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val
             )
+
     if cfgs.serve.return_lse:
         for b in range(cfgs.batch_size):
             is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
@@ -177,6 +184,7 @@ def get_scale_factors(
     # second to last dimension, which is the head dimension, which is the same
     # as the scale_channels dimension, so this works out of the box.
     if scale_channels > 1:
+        assert cfgs.serve.per_token_scale_dtype is not None
         k_scale = pltpu.bitcast(k_scale_slice, cfgs.serve.per_token_scale_dtype)
         v_scale = pltpu.bitcast(v_scale_slice, cfgs.serve.per_token_scale_dtype)
 
@@ -207,34 +215,125 @@ def get_scale_factors(
     return k, v, k_scale, v_scale
 
 
+# The `pl.when` region in `rpa_body` is a basic block boundary, so splitting
+# these keeps the mask arithmetic isolated to the bodies that need it.
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class StepMetadata:
-    """Metadata and scalars extracted for the current execution step."""
+class StitchMetadata:
+    """Scalars needed to merge newly arrived KV into the cached KV window."""
 
-    causal_offset: list[jax.Array]
     bkv_sz_frm_cache: list[jax.Array]
     bkv_sz_frm_new: list[jax.Array]
     new_kv_len_start: list[jax.Array]
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class ComputeMetadata:
+    """Scalars needed to build the QK mask, but not needed by the stitch."""
+
+    causal_offset: list[jax.Array]
     local_k_start: list[jax.Array] | None = None
     local_k_end: list[jax.Array] | None = None
 
 
-def fetch_step_metadata(
+def _compute_valid_kv_mask(
+    token: jax.Array,
+    b_idx: int,
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+) -> jax.Array:
+    """Builds a boolean mask for valid token slices before PV."""
+    # PV reduces over the whole tile: zero probabilities do not isolate NaNs
+    # from stale VMEM or another request in a fetched new-KV page.
+    valid = token < (
+        stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+    )
+    if step_meta.local_k_start is not None:
+        valid &= token >= step_meta.local_k_start[b_idx]
+    if step_meta.local_k_end is not None:
+        valid &= token < step_meta.local_k_end[b_idx]
+    return valid
+
+
+def fetch_stitch_metadata(
     step: jax.Array,
     schedule_ref: schedule.RpaSchedule,
     cu_q_lens_ref: jax.Ref,
-    q_offsets_ref: jax.Ref,
     kv_cache_lens_ref: jax.Ref,
     kv_new_lens_ref: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
-) -> StepMetadata:
-    """Fetches metadata and handles scalar & mask interval values for the current step."""
-    causal_offset_list = []
+) -> StitchMetadata:
+    """Fetches the scalars consumed by the KV stitch.
+
+    Args:
+        step: Current pipeline step.
+        schedule_ref: Per-step sequence, query, and KV block indices.
+        cu_q_lens_ref: Cumulative query lengths, indexed by sequence.
+        kv_cache_lens_ref: Cached KV length per sequence.
+        kv_new_lens_ref: Newly arrived KV length per sequence.
+        cfgs: Kernel configs.
+
+    Returns:
+        The stitch boundaries for every batch element in this step.
+    """
     bkv_sz_frm_cache_list = []
     bkv_sz_frm_new_list = []
     new_kv_len_start_list = []
+
+    for b_idx in range(cfgs.batch_size):
+        s_idx = schedule_ref.s_idx[step, b_idx]
+        is_valid = s_idx != -1
+        k_idx = schedule_ref.k_idx[step, b_idx]
+        k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
+        kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
+        kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
+        q_end = jnp.where(is_valid, cu_q_lens_ref[s_idx + 1], 0)
+
+        # KV stitch boundaries: where the cached tokens end and the newly arrived
+        # tokens begin, which is what `stitch_utils.stitch_new_kv_lane` merges on.
+        total_kv_len = kv_cache_len_val + kv_new_len_val
+        kv_left = jnp.maximum(total_kv_len - k_id, 0)
+        if cfgs.serve.skip_kv_update:
+            kv_left_frm_cache = kv_left
+        else:
+            kv_left_frm_cache = jnp.maximum(kv_cache_len_val - k_id, 0)
+        kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
+        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
+        bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
+        bkv_sz_frm_new_list.append(jnp.minimum(kv_left, cfgs.bkv_sz) - bkv_sz_frm_cache)
+        new_kv_len_start_list.append(q_end - kv_left_frm_new)
+
+    return StitchMetadata(
+        bkv_sz_frm_cache=bkv_sz_frm_cache_list,
+        bkv_sz_frm_new=bkv_sz_frm_new_list,
+        new_kv_len_start=new_kv_len_start_list,
+    )
+
+
+def fetch_compute_metadata(
+    step: jax.Array,
+    schedule_ref: schedule.RpaSchedule,
+    q_offsets_ref: jax.Ref,
+    kv_cache_lens_ref: jax.Ref,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> ComputeMetadata:
+    """Fetches the scalars consumed by the QK mask.
+
+    Args:
+        step: Current pipeline step.
+        schedule_ref: Per-step sequence, query, and KV block indices.
+        q_offsets_ref: Query offset per sequence.
+        kv_cache_lens_ref: Cached KV length per sequence. Only read when the
+            attention scope needs `local_k_end`.
+        cfgs: Kernel configs.
+
+    Returns:
+        The mask intervals for every batch element in this step.
+    """
+    causal_offset_list = []
     local_k_start_list = (
         []
         if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY
@@ -243,52 +342,28 @@ def fetch_step_metadata(
     local_k_end_list = (
         [] if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY else None
     )
+
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
         q_idx = schedule_ref.q_idx[step, b_idx]
         k_idx = schedule_ref.k_idx[step, b_idx]
         k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
-        kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
-        kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
         q_offset = jnp.where(is_valid, q_offsets_ref[s_idx], 0)
-        q_end = jnp.where(is_valid, cu_q_lens_ref[s_idx + 1], 0)
-        total_kv_len = kv_cache_len_val + kv_new_len_val
+
         # Causal base offset: K_base - Q_base
         q_base = q_idx * cfgs.bq_sz + q_offset
         causal_offset = k_id - q_base
         causal_offset_list.append(causal_offset)
+
         if local_k_start_list is not None:
             local_k_start_list.append(q_offset - k_id)
         if local_k_end_list is not None:
+            kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
             local_k_end_list.append(kv_cache_len_val - k_id)
-        # Stitching metadata
-        kv_left = jnp.maximum(total_kv_len - k_id, 0)
-        if cfgs.serve.skip_kv_update:
-            # MUST mirror the identical branch in `schedule.py`'s `k_loop`.
-            # With KV sharing the schedule loads every token -- including the
-            # current step's, already written by the source layer -- from the
-            # cache region and fetches nothing new. If we kept the non-skip
-            # formula here, `bkv_sz_frm_cache` would come up short by
-            # `kv_new_len`, and `stitch_new_kv_lane` would splice unfetched
-            # garbage over the newest real token (and zero the lanes after
-            # it). That is invisible under HEAD_ALONG_SUBLANE, which never
-            # stitches, and silently costs ~24 points of MTP acceptance under
-            # SEQ_ALONG_LANE.
-            kv_left_frm_cache = kv_left
-        else:
-            kv_left_frm_cache = jnp.maximum(kv_cache_len_val - k_id, 0)
-        kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
-        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
-        new_kv_len_start = q_end - kv_left_frm_new
-        bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
-        bkv_sz_frm_new_list.append(jnp.minimum(kv_left, cfgs.bkv_sz) - bkv_sz_frm_cache)
-        new_kv_len_start_list.append(new_kv_len_start)
-    return StepMetadata(
+
+    return ComputeMetadata(
         causal_offset=causal_offset_list,
-        bkv_sz_frm_cache=bkv_sz_frm_cache_list,
-        bkv_sz_frm_new=bkv_sz_frm_new_list,
-        new_kv_len_start=new_kv_len_start_list,
         local_k_start=local_k_start_list,
         local_k_end=local_k_end_list,
     )
@@ -298,15 +373,17 @@ def generate_mask(
     shape: tuple[int, int, int, int],
     *,
     bq_start: int,
-    step_meta: StepMetadata,
+    step_meta: ComputeMetadata,
     cfgs: configs.RpaConfigs,
 ) -> jax.Array:
     """Generates causal, sliding window, and attention scope mask for QK computation."""
     b, k_heads, tq, s = shape
+
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
     q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
     q_iota //= cfgs.aligned_num_q_heads_per_kv_head
     q_kv_diff = q_iota - kv_iota
+
     masks = []
     for b_idx in range(b):
         # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
@@ -323,15 +400,20 @@ def generate_mask(
         mask_b = q_kv_diff >= offset
         if (sliding_window := cfgs.model.sliding_window) is not None:
             mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+
         if step_meta.local_k_start is not None:
             mask_b = jnp.logical_and(mask_b, kv_iota >= step_meta.local_k_start[b_idx])
         if step_meta.local_k_end is not None:
             mask_b = jnp.logical_and(mask_b, kv_iota < step_meta.local_k_end[b_idx])
+
         masks.append(mask_b)
+
     return masks
 
 
 def rpa_body(
+    step: jax.Array,
+    slot: int | jax.Array,
     # Inputs.
     q_vref: jax.Ref,
     kv_in_vref: jax.Ref,
@@ -351,20 +433,75 @@ def rpa_body(
     kv_new_lens_ref: jax.Ref,
     # Configs.
     cfgs: configs.RpaConfigs,
+    # DMA-issue hooks. Both only start copies; the matching waits live in
+    # `pipeline.py`
+    start_next_fetch: Callable[[], None],
+    start_kv_writeback: Callable[[], None],
 ):
-    step = pl.program_id(0)
+    del slot
 
-    # Step 1: Fetch metadata.
-    step_meta = fetch_step_metadata(
+    # pyrefly: ignore[bad-assignment]
+    if jax.__version_info__ >= (0, 11, 2):
+        kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
+
+    # Step 1: Fetch the metadata the stitch needs. Everything the mask needs is
+    # deferred until after the fence below, so it does not gate the writeback.
+    stitch_meta = fetch_stitch_metadata(
         step,
         schedule_ref,
         cu_q_lens_ref,
-        q_offsets_ref,
         kv_cache_lens_ref,
         kv_new_lens_ref,
         cfgs=cfgs,
     )
-    # Step 2: Fetch inputs.
+
+    always_true = kv_cache_lens_ref[0] >= 0
+
+    # This conditional always executes. We create a basic block boundary here so:
+    # 1. We force our KV writeback to be scheduled at the beginning of the
+    #    compute region (as soon as stitching completes).
+    # 2. We guarantee our stitching is correct: with `no_hazard_no_deps=True`, the
+    #    boundary ensures VMEM writes from stitching finish before subsequent
+    #    loads read the updated KV cache.
+
+    @pl.when(always_true)
+    @jax.named_scope("stitch_and_issue_writeback")
+    def _kv_store_fence():
+        if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            stitch_results = []
+            for b_idx in range(cfgs.batch_size):
+                res = stitch_utils.stitch_new_kv_lane(
+                    kv_in_vref,
+                    b_idx,
+                    stitch_meta.bkv_sz_frm_cache[b_idx],
+                    stitch_meta.new_kv_len_start[b_idx],
+                    stitch_meta.bkv_sz_frm_new[b_idx],
+                    cfgs=cfgs,
+                )
+                stitch_results.append(res)
+            for b_idx in range(cfgs.batch_size):
+                stitch_utils.store_new_kv_lane(
+                    kv_in_vref,
+                    b_idx,
+                    stitch_results[b_idx],
+                    cfgs=cfgs,
+                )
+
+        start_kv_writeback()
+
+    start_next_fetch()
+
+    # Step 2a: Fetch mask metadata after the fence to overlap with compute and
+    # in-flight writeback.
+    step_meta = fetch_compute_metadata(
+        step,
+        schedule_ref,
+        q_offsets_ref,
+        kv_cache_lens_ref,
+        cfgs=cfgs,
+    )
+
+    # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
     q_loaded = utils.strided_load(
@@ -390,38 +527,39 @@ def rpa_body(
     v_b = []
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        stitch_results = []
+        pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
+        token = (
+            lax.broadcasted_iota(jnp.int32, (pack_dim, cfgs.bkv_sz), 1)
+            if cfgs.serve.mask_invalid_v
+            else None
+        )
         for b_idx in range(cfgs.batch_size):
-            res = stitch_utils.stitch_new_kv_lane(
-                kv_in_vref,
-                b_idx,
-                step_meta.bkv_sz_frm_cache[b_idx],
-                step_meta.new_kv_len_start[b_idx],
-                step_meta.bkv_sz_frm_new[b_idx],
-                cfgs=cfgs,
+            valid = (
+                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
+                if token is not None
+                else None
             )
-            stitch_results.append(res)
-        for b_idx in range(cfgs.batch_size):
-            stitch_utils.store_new_kv_lane(
-                kv_in_vref,
-                b_idx,
-                stitch_results[b_idx],
-                cfgs=cfgs,
-            )
-        for b_idx in range(cfgs.batch_size):
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
                 k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
                 v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
-                target_shape = (-1, cfgs.bkv_sz + 2 * cfgs.serve.page_size)
+
+                target_shape = (-1, cfgs.kv_vmem_lanes)
                 k_head_ref = k_slice.reshape(target_shape)
                 v_head_ref = v_slice.reshape(target_shape)
-                pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
 
                 # Load as uint32 to avoid dtype conversion during strided load
                 k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
                 v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
+                if valid is not None:
+                    # HND packs channels of one token together. Mask the words
+                    # before unpacking, including any co-located V scale channels.
+                    v_head_u32 = jnp.where(
+                        valid,
+                        v_head_u32[:, : cfgs.bkv_sz],
+                        jnp.zeros_like(v_head_u32[:, : cfgs.bkv_sz]),
+                    )
 
                 if cfgs.serve.dtype_kv == jnp.uint8:
                     fp4 = jnp.float4_e2m1fn
@@ -436,10 +574,21 @@ def rpa_body(
                     v_head = v_head_loaded[:, : cfgs.bkv_sz]
                     ks.append(k_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
                     vs.append(v_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
+
             k_b.append(jnp.stack(ks, axis=0))
             v_b.append(jnp.stack(vs, axis=0))
     else:
+        token = None
+        if cfgs.serve.mask_invalid_v:
+            token = lax.broadcasted_iota(
+                jnp.int32, (cfgs.bkv_sz, cfgs.aligned_kv_head_dim), 0
+            )
         for b_idx in range(cfgs.batch_size):
+            valid = (
+                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
+                if token is not None
+                else None
+            )
             heads_per_load = pl.cdiv(cfgs.serve.packing_kv, 2)
             ks = []
             vs = []
@@ -448,6 +597,7 @@ def rpa_body(
                     kv_in_vref,
                     b_idx,
                     kv_head_start * 2,
+                    valid_mask=valid,
                     cfgs=cfgs,
                 )
                 ks.append(jnp.stack([k for k, _ in bkv_lst], axis=0))
@@ -460,6 +610,7 @@ def rpa_body(
             v = v[: cfgs.model.num_kv_heads]
             k_b.append(k)
             v_b.append(v)
+
     # Stack to (batch, num_heads, bkv_sz, num_lanes)
     k = jnp.stack(k_b, axis=0)
     v = jnp.stack(v_b, axis=0)
@@ -481,6 +632,7 @@ def rpa_body(
         q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
+
         custom_mask = generate_mask(
             shape=(
                 cfgs.batch_size,
@@ -492,7 +644,8 @@ def rpa_body(
             step_meta=step_meta,
             cfgs=cfgs,
         )
-        p, alpha_list, m_next, l_next, m_carry = (
+
+        p, alpha_list, m_next, l_next, m_carry, l_carry = (
             flash_attention.flash_attention_qk_softmax(
                 step,
                 q[:, :, q_slice],
@@ -507,21 +660,23 @@ def rpa_body(
             )
         )
         m_scratch_ref[:, q_slice] = m_carry
-        l_scratch_ref[:, q_slice] = l_next[-1]
+        l_scratch_ref[:, q_slice] = l_carry
         if cfgs.serve.return_lse:
             m_new_list.append(m_next)
         l_new_list.append(l_next)
 
         if prev_p is not None:
-            o_next = flash_attention.flash_attention_pv(
+            o_next, o_carry = flash_attention.flash_attention_pv(
                 prev_p,
                 v,
-                prev_alpha_list,
+                cast(list[jax.Array], prev_alpha_list),
                 acc_val[:, prev_q_slice],
+                step,
+                schedule_ref.is_last_k,
                 cfgs=cfgs,
                 v_scale=v_scale,
             )
-            acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+            acc_scratch_ref[:, prev_q_slice] = o_carry
             acc_new_list.append(o_next)
 
         prev_p = p
@@ -529,19 +684,20 @@ def rpa_body(
         prev_q_slice = q_slice
 
     assert prev_p is not None
-    o_next = flash_attention.flash_attention_pv(
+    o_next, o_carry = flash_attention.flash_attention_pv(
         prev_p,
         v,
-        prev_alpha_list,
+        cast(list[jax.Array], prev_alpha_list),
         acc_val[:, prev_q_slice],
+        step,
+        schedule_ref.is_last_k,
         cfgs=cfgs,
         v_scale=v_scale,
     )
-    acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+    acc_scratch_ref[:, prev_q_slice] = o_carry
     acc_new_list.append(o_next)
     if cfgs.serve.return_lse:
         m_next = jnp.concatenate(m_new_list, axis=2)
-
     l_next = jnp.concatenate(l_new_list, axis=2)
     acc_next = jnp.concatenate(acc_new_list, axis=2)
 
@@ -573,23 +729,27 @@ def create_allocs(
     bref_override.BatchingORef,
     bref_override.BatchingLSERef | None,
 ]:
+    # `use_lookahead` is disabled everywhere: slot rotation and prefetch depth are
+    # driven explicitly by `pipeline.run_manual_triple_buffer`.
+    in_slots = configs.NUM_INPUT_SLOTS
+    out_slots = configs.NUM_OUTPUT_SLOTS
     kv_cache_spec = pl.BlockSpec(
         block_shape=cfgs.kv_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,),
-        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
+        pipeline_mode=pl.Buffered(buffer_count=in_slots, use_lookahead=False),
     )
     q_spec = pl.BlockSpec(
         block_shape=cfgs.q_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,),
-        pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
+        pipeline_mode=pl.Buffered(buffer_count=in_slots, use_lookahead=False),
     )
     o_spec = pl.BlockSpec(
         block_shape=cfgs.q_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,),
-        pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
+        pipeline_mode=pl.Buffered(buffer_count=out_slots, use_lookahead=False),
     )
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
@@ -600,39 +760,41 @@ def create_allocs(
     kv_cache_alloc = kv_cache_alloc_cls.input_output(
         spec=kv_cache_spec,
         dtype_or_type=kv_cache_hbm_ref,
-        buffer_count=cfgs.n_buffer,
-        use_lookahead=True,
+        buffer_count=in_slots,
+        use_lookahead=False,
         cfgs=cfgs,
     )
     q_alloc = bref_override.BatchingQRef.input(
         spec=q_spec,
         dtype_or_type=o_hbm_ref,
-        buffer_count=cfgs.n_buffer,
-        use_lookahead=True,
+        buffer_count=in_slots,
+        use_lookahead=False,
         cfgs=cfgs,
     )
     o_alloc = bref_override.BatchingORef.output(
         spec=o_spec,
         dtype_or_type=o_hbm_ref,
-        buffer_count=2,
+        buffer_count=out_slots,
         use_lookahead=False,
         cfgs=cfgs,
     )
+
     lse_alloc = None
     if cfgs.serve.return_lse:
         lse_spec = pl.BlockSpec(
             block_shape=cfgs.lse_vmem_shape,
             memory_space=pltpu.VMEM,
             index_map=lambda i: (i,),
-            pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
+            pipeline_mode=pl.Buffered(buffer_count=out_slots, use_lookahead=False),
         )
         lse_alloc = bref_override.BatchingLSERef.output(
             spec=lse_spec,
             dtype_or_type=lse_hbm_ref,
-            buffer_count=2,
+            buffer_count=out_slots,
             use_lookahead=False,
             cfgs=cfgs,
         )
+
     return q_alloc, kv_cache_alloc, o_alloc, lse_alloc
 
 
@@ -674,6 +836,7 @@ def rpa_kernel(
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
+
     Args:
         cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
             length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
@@ -696,6 +859,7 @@ def rpa_kernel(
             concatenated along num kv heads dim.
         lse_hbm: pre-allocated buffer for LSE output. None when return_lse=False.
         cfgs: Configuration of the kernel.
+
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
         new_kv_cache: [num_pages, page_size, num_kv_heads // kv_packing, kv_packing,
@@ -725,9 +889,11 @@ def rpa_kernel(
         del o_kv_cache_hbm_ref
         if o_lse_hbm_ref is not None:
             del o_lse_hbm_ref
+
         q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
             kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
         )
+
         actual_steps = schedule_hbm_ref.actual_steps[0]
         num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
 
@@ -771,12 +937,12 @@ def rpa_kernel(
 
             scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
 
+            q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
+
             num_lanes = pltpu.get_tpu_info().num_lanes
-            q_ref_flat = (
-                final_allocs[0].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            )
-            kv_ref_flat = (
-                final_allocs[1].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
+            q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
+            kv_ref_flat = kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
+                -1, num_lanes
             )
 
             # Explicitly zero out scratches and Q/KV buffers.
@@ -811,26 +977,65 @@ def rpa_kernel(
                         dma_list.append(copy)
                 jax.tree.map(lambda x: x.wait(), dma_list)
 
-                pipeline_func = pltpu.emit_pipeline(
-                    body=functools.partial(
-                        rpa_body,
-                        cfgs=cfgs,
+                total_steps = num_steps + prefix_steps
+                kv_bound = kv_cache_alloc.bind(
+                    src_ref=(
+                        kv_cache_hbm_ref,
+                        new_kv_hbm_ref,
+                        schedule_ref,
+                        page_indices_ref,
+                    ),
+                    dst_ref=(
+                        kv_cache_hbm_ref,
+                        new_kv_hbm_ref,
+                        schedule_ref,
+                        page_indices_ref,
+                    ),
+                )
+                q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
+                o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
+                lse_bound = (
+                    lse_alloc.bind(dst_ref=(lse_hbm_ref, schedule_ref))
+                    if return_lse
+                    else None
+                )
+
+                def compute_fn(
+                    step,
+                    slot,
+                    total_steps,
+                    out_slot,
+                    start_next_fetch,
+                    start_kv_writeback,
+                ):
+                    del total_steps
+                    rpa_body(
+                        step,
+                        slot,
+                        q_alloc.window_ref.at[slot],
+                        kv_cache_alloc.window_ref.at[slot],
+                        o_alloc.window_ref.at[out_slot],
+                        lse_alloc.window_ref.at[out_slot] if return_lse else None,
+                        schedule_ref,
+                        scratches[0],
+                        scratches[1],
+                        scratches[2],
                         cu_q_lens_ref=cu_q_lens_ref,
                         q_offsets_ref=q_offsets_ref,
                         kv_cache_lens_ref=kv_cache_lens_ref,
                         kv_new_lens_ref=kv_new_lens_ref,
-                    ),
-                    grid=(num_steps + prefix_steps,),
-                    in_specs=(q_alloc.spec, kv_cache_alloc.spec),
-                    out_specs=(o_alloc.spec, lse_alloc.spec if return_lse else None),
-                )
-                pipeline_func(
-                    (q_hbm_ref, schedule_ref),
-                    (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref, page_indices_ref),
-                    (o_hbm_ref, schedule_ref),
-                    (lse_hbm_ref, schedule_ref) if return_lse else None,
-                    scratches=(schedule_ref,) + scratches,
-                    allocations=final_allocs,
+                        cfgs=cfgs,
+                        start_next_fetch=start_next_fetch,
+                        start_kv_writeback=start_kv_writeback,
+                    )
+
+                pipeline.run_manual_triple_buffer(
+                    total_steps,
+                    compute_fn,
+                    q_bound,
+                    o_bound,
+                    kv_bound,
+                    lse_bref=lse_bound,
                 )
 
             @pl.loop(0, num_safe_step_iterations)
@@ -840,6 +1045,7 @@ def rpa_kernel(
                 last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
                 is_last_step = step_idx == num_safe_step_iterations - 1
                 size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
+
                 execute_schedule_chunk(start, size)
 
         _run()
@@ -853,7 +1059,9 @@ def rpa_kernel(
     )
     num_scalar_prefetch = len(scalar_prefetches)
     num_active_scalers = len(scalar_prefetches)
+
     out_shape = [q_hbm, kv_cache_hbm, lse_hbm if return_lse else None]
+
     schedule_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
     input_output_aliases = {
         num_active_scalers + schedule_leaves: 0,
@@ -863,6 +1071,7 @@ def rpa_kernel(
         input_output_aliases[num_active_scalers + schedule_leaves + 3] = (
             2  # lse_hbm -> out[2]
         )
+
     return pl.pallas_call(
         ragged_paged_attention_pipeline,
         out_shape=out_shape,
@@ -884,6 +1093,9 @@ def rpa_kernel(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=cfgs.vmem_limit_bytes,
             disable_bounds_checks=True,
+            flags={
+                "XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True,
+            },
         ),
         input_output_aliases=input_output_aliases,
         name=get_kernel_name(cfgs),

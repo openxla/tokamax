@@ -35,7 +35,6 @@ _DECODE_BLOCKS = configs.BlockSizes(
     bq_c_sz=1,
     bkv_sz=256,
     batch_size=8,
-    n_buffer=3,
 )
 
 _LAYOUTS = (configs.KVLayout.HEAD_ALONG_SUBLANE,)

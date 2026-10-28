@@ -744,11 +744,9 @@ class RaggedPagedAttentionKernelTest(parameterized.TestCase):
     )
 
     rpa_bkv_sz = bkv_sz
-    rpa_n_buffer = 3
     rpa_batch_size = 2
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
       rpa_bkv_sz = max(bkv_sz, 128)
-      rpa_n_buffer = 2
       rpa_batch_size = 1
 
     decode_block_sizes = configs.BlockSizes(
@@ -756,14 +754,12 @@ class RaggedPagedAttentionKernelTest(parameterized.TestCase):
         bq_c_sz=bq_csz,
         bkv_sz=rpa_bkv_sz,
         batch_size=rpa_batch_size,
-        n_buffer=rpa_n_buffer,
     )
     prefill_block_sizes = configs.BlockSizes(
         bq_sz=bq_sz,
         bq_c_sz=bq_csz,
         bkv_sz=rpa_bkv_sz,
         batch_size=rpa_batch_size,
-        n_buffer=rpa_n_buffer,
     )
 
     output, updated_kv_cache = ragged_paged_attention(
