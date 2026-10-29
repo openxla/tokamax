@@ -16,6 +16,7 @@
 
 # pylint: disable=unused-import
 from tokamax._src.config import (
+    autotuning_auto_input_layouts as autotuning_auto_input_layouts,
     autotuning_cache_miss_fallback as autotuning_cache_miss_fallback,
     cross_compile as cross_compile,
     ignore_autotuning_cache as ignore_autotuning_cache,

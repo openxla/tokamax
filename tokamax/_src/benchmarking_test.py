@@ -170,6 +170,27 @@ class BenchmarkingTest(parameterized.TestCase):
     self.assertGreater(bench.lower_time_ms, 0.0)
     self.assertLen(bench.evaluation_times_ms, num_iters)
 
+  def test_compile_benchmark_auto_input_layouts(self):
+    if jax.default_backend() != 'gpu':
+      self.skipTest('Checks the input layout that XLA chooses on GPU.')
+
+    def f(x):
+      return jnp.sin(x.T)
+
+    f, x = benchmarking.standardize_function(f, jnp.ones((256, 512)))
+    with mock.patch.object(jax, 'device_put', wraps=jax.device_put) as put:
+      bench = benchmarking.compile_benchmark(f, x)(x)
+      put.assert_not_called()
+      bench_auto = benchmarking.compile_benchmark(
+          f, x, auto_input_layouts=True
+      )(x)
+    self.assertGreater(bench.median_evaluation_time_ms, 0.0)
+    self.assertGreater(bench_auto.median_evaluation_time_ms, 0.0)
+    put.assert_called_once()
+    (x_format,) = put.call_args.args[1]
+    # XLA stores `x` transposed, so `x.T` needs no transpose.
+    self.assertEqual(x_format.layout.major_to_minor, (1, 0))
+
   def test_benchmark_function_known_time(self):
     time_sleep_s = 0.5
 
