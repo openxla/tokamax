@@ -31,6 +31,14 @@ _IMPLEMENTATIONS: dict[str, Callable[..., Any]] = dict(
 )
 _DEFAULT_IMPLEMENTATIONS: tuple[Implementation, ...] = ("xla",)  # pylint: disable=invalid-name
 
+try:
+  from tokamax._src.ops.triangle_multiplication import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS["triton"] = triton.TritonTriangleMultiplication()
+  _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS  # pylint: disable=invalid-name
+except ImportError:
+  pass
+
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(_IMPLEMENTATIONS)
 )

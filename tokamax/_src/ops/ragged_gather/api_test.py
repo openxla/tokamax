@@ -33,7 +33,7 @@ class ApiTest(parameterized.TestCase):
       start_end=[(3, 338), (10, 422), (3, 28)],
       hidden_size=[128, 512],
       dtype=[jnp.bfloat16, jnp.float32],
-      impl=["xla", "mosaic", "mosaic_tpu", "mosaic_tpu_v2"],
+      impl=["xla", "mosaic"],
   )
   def test_basic_api(self, in_out_size, hidden_size, start_end, dtype, impl):
     if "mosaic" in impl and backend.get_default_device().device_kind != "TPU7x":
@@ -54,10 +54,12 @@ class ApiTest(parameterized.TestCase):
 
     @jax.jit
     def f(x, indices, start, end):
-      return api.ragged_gather(x, indices, start, end, implementation=impl)
+      return (
+          api.ragged_gather(x, indices, start, end, implementation=impl) + 1.0
+      )
 
     actual = f(x, indices, start_arr, end_arr)
-    desired = x[indices]
+    desired = np.asarray(x)[np.asarray(indices)] + 1.0
 
     with self.subTest("value"):
       np.testing.assert_allclose(
@@ -73,12 +75,6 @@ class ApiTest(parameterized.TestCase):
         self.assertEmpty(opspecs)
       else:
         expected = impl
-        if expected == "mosaic":
-          expected = (
-              "mosaic_tpu_v2"
-              if "mosaic_tpu_v2" in api.IMPLEMENTATIONS
-              else "mosaic_tpu"
-          )
         self.assertNotEmpty(opspecs)
         self.assertIsInstance(
             opspecs[0].op, type(api.IMPLEMENTATIONS[expected])

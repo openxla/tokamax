@@ -20,14 +20,14 @@ from collections.abc import Sequence
 import dataclasses
 from functools import wraps
 import inspect
-import logging
+import sys
 import types
-from typing import Any, Callable, Generic, Optional, TypeVar, overload
+from typing import Any, Callable, Generic, TypeVar
+from absl.testing import parameterized
 import jax
 from tokamax._src.ops import op as jax_tokamax_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch
-import torch_tpu._internal.pallas.pallas
 
 _Config = TypeVar("_Config")
 
@@ -415,9 +415,10 @@ class TorchOp(Generic[_Config]):
     assert self.jax_op_name, "Name not set."
     assert self.op_impl_jax is not None, "Forward class not set."
     assert self._torch_tokamax_op is None, "Forward op already registered."
+    torch_utils.inspect_for_no_self_attributes(self)
     torch_utils.inspect_for_attribute(self.op_impl_call, "op_impl_jax")
 
-    self._torch_tokamax_op = torch_tpu._internal.pallas.pallas.jax_op(
+    self._torch_tokamax_op = torch.tpu.pallas.jax_op(
         f"tokamax::{self.jax_op_name}",
         self.op_impl_call,
         donate_argnums=self.donate_argnums,
@@ -483,7 +484,7 @@ class TorchOp(Generic[_Config]):
   ) -> Any:
     """Sets up the config for the JAX Tokamax op."""
     if config is None:
-      config = dataclasses.astuple(
+      config = self.deconstruct_config(
           self.get_bound_args(*args, **kwargs).get_config(
               check_autotuning_cache=False,
           )

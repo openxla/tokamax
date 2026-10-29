@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from collections.abc import Callable, Mapping
 import functools
 import typing
 from typing import Final
@@ -25,18 +24,11 @@ import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
 from tokamax._src.ops.normalization import api
-from tokamax._src.ops.normalization import base
-from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.normalization import test_base
 
 _IMPLEMENTATIONS: Final[tuple[str | None, ...]] = typing.get_args(
     api.Implementation.__value__
 ) + (None,)
-
-_IMPLEMENTATIONS_VJP: Mapping[str, Callable[..., jax.Array]] = dict(
-    xla=base.NormalizationVjp(),
-    triton=pl_norm_vjp.PallasTritonNormalizationVjp(),
-)
 
 import sys
 from absl import flags
@@ -108,7 +100,9 @@ class LayerNormTest(parameterized.TestCase):
           include_xla_kernels=(implementation == "xla"),
       )
       triton_impl = type(api.IMPLEMENTATIONS.get("triton"))
-      triton_vjp_impl = type(_IMPLEMENTATIONS_VJP["triton"])
+      triton_vjp_impl = type(
+          getattr(api.IMPLEMENTATIONS.get("triton"), "vjp", None)
+      )
       match implementation:
         case "triton":
           self.assertIsInstance(opspecs[0].op, triton_impl)

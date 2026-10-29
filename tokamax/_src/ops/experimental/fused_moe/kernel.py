@@ -60,7 +60,7 @@ from .host import (
 
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
 # implementation, called here rather than copied.
-from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import (
+from tokamax._src.ops.gmm_v2.gmm_v2 import (
     silu_and_mul_with_clamp,
     swigluoai,
 )
@@ -471,12 +471,12 @@ def expert_ffn_int8(
     return acc2, None
 
 
-def _all_pairs_barrier(ep):
+def _all_pairs_barrier(ep, ep_axis_name="ep"):
     """Barrier over every shard: transport peers are not only neighbours."""
     barrier_sem = pltpu.get_barrier_semaphore()
     for i in range(ep):
         pl.semaphore_signal(
-            barrier_sem, inc=1, device_id=(jnp.int32(i),)
+            barrier_sem, inc=1, device_id={ep_axis_name: jnp.int32(i)}
         )
     pl.semaphore_wait(barrier_sem, ep)
 
@@ -484,7 +484,7 @@ def _all_pairs_barrier(ep):
     def _(second):
         for i in range(ep):
             pl.semaphore_signal(
-                second, inc=1, device_id=(jnp.int32(i),),
+                second, inc=1, device_id={ep_axis_name: jnp.int32(i)},
             )
         pl.semaphore_wait(second, ep)
 
@@ -535,6 +535,7 @@ def _build_fused_ep_moe_kernel(
     hidden,
     inter,
     ep,
+    ep_axis_name="ep",
     weight_format=host.WeightFormat.FP8,
     rhs_qb=QB4,
     ragged_rows_alloc=None,
@@ -963,7 +964,7 @@ def _build_fused_ep_moe_kernel(
                     weight_starts(visit_sm[b], b)
 
         prologue()
-        _all_pairs_barrier(ep)
+        _all_pairs_barrier(ep, ep_axis_name)
 
         def _start_next_gate_up(visit_i, slot, last_tile):
             """`() -> ()`: start the NEXT expert's gate/up slab, called from
@@ -1403,7 +1404,7 @@ def _build_fused_ep_moe_kernel(
                             dst_ref=recv_hbm.at[pl.ds(dst_row, true_here)],
                             send_sem=send_sems.at[parity],
                             recv_sem=recv_sem,
-                            device_id=(jnp.int32(d),),
+                            device_id={ep_axis_name: jnp.int32(d)},
                         ).start()
 
                     # The own-destination run needs no fabric, and it moves
@@ -1427,7 +1428,7 @@ def _build_fused_ep_moe_kernel(
                             dst_ref=rscl_hbm.at[pl.ds(dst_sub, 1)],
                             send_sem=send_scl_sems.at[parity],
                             recv_sem=recv_scl_sem,
-                            device_id=(jnp.int32(d),),
+                            device_id={ep_axis_name: jnp.int32(d)},
                         ).start()
 
                     @pl.when(_and_nonempty(is_me, overlap))
@@ -1752,7 +1753,7 @@ def _build_fused_ep_moe_kernel(
                 is_me = jnp.int32(d) == me
 
                 @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
-                def _():
+                def _(d=d):
                     # One expert per push, so the region IS expert e's run.
                     true_rows = true_rows_sm[e, d]
 
@@ -1767,7 +1768,7 @@ def _build_fused_ep_moe_kernel(
                             ],
                             send_sem=send_sem,
                             recv_sem=recv_sem,
-                            device_id=(jnp.int32(d),),
+                            device_id={ep_axis_name: jnp.int32(d)},
                             ).start()
 
                     # A nonempty region can hold an empty (e, d) run.
@@ -1781,7 +1782,7 @@ def _build_fused_ep_moe_kernel(
                         dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
                         send_sem=send_scl_sem,
                         recv_sem=recv_scl_sem,
-                        device_id=(jnp.int32(d),),
+                        device_id={ep_axis_name: jnp.int32(d)},
                     ).start()
 
                 # Safe to defer: recv is read only after the drain.
@@ -1843,7 +1844,7 @@ def _build_fused_ep_moe_kernel(
             _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
 
         drain_transport()
-        _all_pairs_barrier(ep)
+        _all_pairs_barrier(ep, ep_axis_name)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     # The VMEM buffers come from the same list the VMEM accounting sums, in

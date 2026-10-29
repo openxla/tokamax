@@ -1530,5 +1530,73 @@
       "metadata": {},
       "peak_memory_mb": 13815.004192
     }
+  },
+  "{\"lhs\":{\"value\":\"bf16[1280,4096]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,4096,2048]\",\"scale\":\"bf16[64,1,2048]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":[20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":\"silu\"}": {},
+  "{\"lhs\":{\"value\":\"bf16[1280,1024]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,1024,4096]\",\"scale\":\"bf16[64,1,4096]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":[20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {
+    "{\"tile_m\":128,\"tile_k\":1024,\"tile_n\":4096,\"input_buffer_count\":2,\"combine_scopes\":false}": {
+      "compile_time_ms": 6207.398438942619,
+      "lower_time_ms": 21993.12919995282,
+      "evaluation_times_ms": [
+        0.464,
+        0.464,
+        0.463,
+        0.463,
+        0.464
+      ],
+      "metadata": {},
+      "peak_memory_mb": 286.53312
+    }
+  },
+  "{\"lhs\":{\"value\":\"bf16[81920,4096]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f4_e2m1fn[64,4096,2048]\",\"scale\":\"bf16[64,64,2048]\",\"zero_point\":null,\"qtype\":\"float4_e2m1fn\"},\"group_sizes\":[1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":\"silu\"}": {},
+  "{\"lhs\":{\"value\":\"bf16[81920,1024]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f4_e2m1fn[64,1024,4096]\",\"scale\":\"bf16[64,16,4096]\",\"zero_point\":null,\"qtype\":\"float4_e2m1fn\"},\"group_sizes\":[1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {},
+  "{\"lhs\":{\"value\":\"bf16[1280,4096]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f4_e2m1fn[64,4096,2048]\",\"scale\":\"bf16[64,64,2048]\",\"zero_point\":null,\"qtype\":\"float4_e2m1fn\"},\"group_sizes\":[20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":\"silu\"}": {},
+  "{\"lhs\":{\"value\":\"bf16[1280,1024]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f4_e2m1fn[64,1024,4096]\",\"scale\":\"bf16[64,16,4096]\",\"zero_point\":null,\"qtype\":\"float4_e2m1fn\"},\"group_sizes\":[20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {},
+  "{\"lhs\":\"bf16[8,4096]\",\"rhs\":\"bf16[8,4096,4096]\",\"group_sizes\":[1,1,1,1,1,1,1,1],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {},
+  "{\"lhs\":\"bf16[8,4096]\",\"rhs\":\"bf16[8,4096]\",\"group_sizes\":[1,1,1,1,1,1,1,1],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {},
+  "{\"lhs\":{\"value\":\"bf16[8192,7168]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,7168,1024]\",\"scale\":\"bf16[64,28,1024]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":{\"num_groups\":64,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {
+    "{\"tile_m\":128,\"tile_k\":7168,\"tile_n\":512,\"input_buffer_count\":2,\"combine_scopes\":false}": {
+      "compile_time_ms": 6804.362594964914,
+      "lower_time_ms": 8187.888010987081,
+      "evaluation_times_ms": [
+        1.343,
+        1.344,
+        1.344,
+        1.343,
+        1.343
+      ],
+      "metadata": {},
+      "peak_memory_mb": 666.390528
+    }
+  },
+  "{\"lhs\":{\"value\":\"bf16[8192,7168]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,7168,1024]\",\"scale\":\"bf16[64,28,1024]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":{\"num_groups\":64,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":true,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {
+    "{\"tile_m\":128,\"tile_k\":7168,\"tile_n\":512,\"input_buffer_count\":2,\"combine_scopes\":false}": {
+      "compile_time_ms": 6226.443403051235,
+      "lower_time_ms": 5479.37182104215,
+      "evaluation_times_ms": [
+        1.356,
+        1.361,
+        1.355,
+        1.358,
+        1.358
+      ],
+      "metadata": {},
+      "peak_memory_mb": 683.167776
+    }
+  },
+  "{\"lhs\":{\"value\":\"bf16[81920,4096]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,4096,2048]\",\"scale\":\"bf16[64,1,2048]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":[1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":\"silu\"}": {},
+  "{\"lhs\":{\"value\":\"bf16[81920,1024]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,1024,4096]\",\"scale\":\"bf16[64,1,4096]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":[1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {
+    "{\"tile_m\":256,\"tile_k\":1024,\"tile_n\":4096,\"input_buffer_count\":2,\"combine_scopes\":false}": {
+      "compile_time_ms": 7269.071295973845,
+      "lower_time_ms": 19258.99477803614,
+      "evaluation_times_ms": [
+        3.405,
+        3.401,
+        3.403,
+        3.403,
+        3.402
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1195.923968
+    }
   }
 }

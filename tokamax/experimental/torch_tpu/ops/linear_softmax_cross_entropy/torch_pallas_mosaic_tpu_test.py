@@ -155,17 +155,20 @@ class PallasMosaicTpuTest(parameterized.TestCase):
     # # Assert
     torch.testing.assert_close(loss_tokamax, loss_ref, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(lse_tokamax, lse_ref, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(grad_x_tokamax, grad_x_ref, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(grad_w_tokamax, grad_w_ref, rtol=1e-5, atol=1e-5)
+    # For float32 matmul reduction over V=2048, allow up to 2e-5 absolute
+    # tolerance against native PyTorch autograd reference due to MXU
+    # accumulation order for both grad_x and grad_w.
+    torch.testing.assert_close(grad_x_tokamax, grad_x_ref, rtol=1e-5, atol=2e-5)
+    torch.testing.assert_close(grad_w_tokamax, grad_w_ref, rtol=1e-5, atol=2e-5)
 
     torch.testing.assert_close(
         loss_tokamax, loss_ref_as_torch, rtol=1e-5, atol=1e-5
     )
     torch.testing.assert_close(
-        grad_x_tokamax, grad_x_ref_as_torch, rtol=1e-5, atol=1e-5
+        grad_x_tokamax, grad_x_ref_as_torch, rtol=1e-5, atol=2e-5
     )
     torch.testing.assert_close(
-        grad_w_tokamax, grad_w_ref_as_torch, rtol=1e-5, atol=1e-5
+        grad_w_tokamax, grad_w_ref_as_torch, rtol=1e-5, atol=2e-5
     )
 
   def _generate_random_data(self, b_dim, h_dim, v_dim):
@@ -415,6 +418,56 @@ class PallasMosaicTpuTest(parameterized.TestCase):
     torch.testing.assert_close(lse, expected_lse)
     torch.testing.assert_close(x.grad, x_expected.grad)
     torch.testing.assert_close(w.grad, w_expected.grad)
+
+  def test_deconstruct_and_reconstruct_config_roundtrip(self):
+    fwd_op = (
+        torch_pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss
+    )
+    bwd_op = fwd_op.backward_op_torch
+    self.assertIsNotNone(bwd_op)
+
+    for op_instance in (fwd_op, bwd_op):
+      with self.subTest(op=op_instance.jax_op_name):
+        # 1. Config with tuple buffer_count (2, 3) -> 5-element flat tuple -> Config
+        cfg_tuple_bc = Config(1024, 512, 2048, buffer_count=(2, 3))
+        deconstructed_5 = op_instance.deconstruct_config(cfg_tuple_bc)
+        self.assertEqual(deconstructed_5, (1024, 512, 2048, 2, 3))
+        reconstructed_5 = op_instance.reconstruct_config(deconstructed_5)
+        self.assertEqual(reconstructed_5, cfg_tuple_bc)
+
+        # 2. Config with int buffer_count 2 -> 4-element flat tuple -> Config
+        cfg_int_bc = Config(1024, 512, 2048, buffer_count=2)
+        deconstructed_4 = op_instance.deconstruct_config(cfg_int_bc)
+        self.assertEqual(deconstructed_4, (1024, 512, 2048, 2))
+        reconstructed_4 = op_instance.reconstruct_config(deconstructed_4)
+        self.assertEqual(reconstructed_4, cfg_int_bc)
+
+        # 3. 3-element tuple -> reconstructs to Config(1024, 512, 2048)
+        raw_3 = (1024, 512, 2048)
+        reconstructed_3 = op_instance.reconstruct_config(raw_3)
+        self.assertEqual(reconstructed_3, Config(1024, 512, 2048))
+
+        # 4. Nested tuple with buffer_count tuple: (1024, 512, 2048, (2, 2))
+        nested_bc_tuple = (1024, 512, 2048, (2, 2))
+        reconstructed_nested = op_instance.reconstruct_config(nested_bc_tuple)
+        self.assertEqual(
+            reconstructed_nested,
+            Config(1024, 512, 2048, buffer_count=(2, 2)),
+        )
+
+        # 5. Direct unpack with nested buffer_count tuple: (1024, 512, 2048, (2, 2))
+        reconstructed_unpacked_nested = op_instance.reconstruct_config(
+            1024, 512, 2048, (2, 2)
+        )
+        self.assertEqual(
+            reconstructed_unpacked_nested,
+            Config(1024, 512, 2048, buffer_count=(2, 2)),
+        )
+
+        # 6. None -> deconstructs to None, reconstruct raises ValueError
+        self.assertIsNone(op_instance.deconstruct_config(None))
+        with self.assertRaises(ValueError):
+          op_instance.reconstruct_config(None)
 
 
 if __name__ == "__main__":

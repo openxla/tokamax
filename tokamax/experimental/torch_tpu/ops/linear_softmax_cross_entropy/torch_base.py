@@ -72,7 +72,7 @@ class _LinearSoftmaxCrossEntropyLossVjp[Config](torch_op.TorchOp[Config]):
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
-      config: tuple[int, int, int] | None = None,
+      config: tuple[int, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
     del config
     reduction = cast(Literal["mean", "none", "sum"], reduction)
@@ -172,8 +172,8 @@ class _LinearSoftmaxCrossEntropyLoss[Config](torch_op.TorchOp[Config]):
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
-      config: tuple[int, int, int] | None = None,
-      bwd_config: tuple[int, int, int] | None = None,
+      config: tuple[int, ...] | None = None,
+      bwd_config: tuple[int, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
     del config, bwd_config
     reduction = cast(Literal["mean", "none", "sum"], reduction)

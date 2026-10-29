@@ -22,12 +22,15 @@ from typing import Annotated, Any
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 import pydantic
+from tokamax._src import mosaic_gpu as mgpu_lib
 
 SMEM_CAPACITY_MAP = {
     "sm_120": (100 - 1) * 1024,
+    "sm_107": (228 - 1) * 1024,
     "sm_103": (228 - 1) * 1024,
     "sm_100": (228 - 1) * 1024,
     "sm_90": (228 - 1) * 1024,
@@ -151,14 +154,29 @@ class GroupInfo:
     )
 
 
+def tiled_swizzled_smem(
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike,
+    what: str = "",
+    *,
+    swizzle: int | None = None,
+    tiling_prefix: tuple[int, ...] = (8,),
+) -> pl.MemoryRef:
+  """Returns a tiled and swizzled SMEM reference."""
+  try:
+    return mgpu_lib.tiled_swizzled_smem(
+        shape, dtype, what, swizzle=swizzle, tiling_prefix=tiling_prefix
+    )
+  except ValueError as e:
+    raise NotImplementedError("No possible swizzle.") from e
+
+
 def get_smem_capacity() -> int:
   """Returns the shared memory capacity of the device."""
   device = backend.get_default_device()
 
   if device.platform != "gpu":
-    raise NotImplementedError(
-        f"Unsupported device platform: {device}"
-    )
+    raise NotImplementedError(f"Unsupported device platform: {device}")
   capacity = int(float(getattr(device, "compute_capability", 0)) * 10)
   sm_version = f"sm_{capacity}"
   if sm_version not in SMEM_CAPACITY_MAP:
@@ -166,6 +184,48 @@ def get_smem_capacity() -> int:
         f"Unsupported device compute capability: {device} {sm_version}"
     )
   return SMEM_CAPACITY_MAP[sm_version]
+
+
+def copy_ragged_smem_to_gmem(
+    out_smem: Any,
+    out_gmem: Any,
+    *,
+    block_start: jax.Array,
+    start_within_block: jax.Array,
+    actual_size: jax.Array,
+    ns: pl.Slice,
+    max_rows: int,
+    col_stride: int | None = None,
+) -> None:
+  """Copies `actual_size` rows from `out_smem` to `out_gmem` in power-of-2 steps."""
+  offset = start_within_block
+  size = 1 << (max_rows.bit_length() - 1)
+  while size > 0:
+
+    @pl.when((actual_size & size) != 0)
+    def _():
+      ms = pl.ds(block_start + offset, size)
+      if out_smem.ndim == 2:
+        plgpu.copy_smem_to_gmem(
+            out_smem.at[pl.ds(offset, size)],
+            out_gmem.at[ms, ns],
+            commit_group=False,
+        )
+      else:
+        num_tiles, _, tile_n = out_smem.shape
+        stride = tile_n if col_stride is None else col_stride
+        for i in range(num_tiles):
+          ns_ = pl.ds(ns.start + i * stride, ns.size)
+          plgpu.copy_smem_to_gmem(
+              out_smem.at[i, pl.ds(offset, size)],
+              out_gmem.at[ms, ns_],
+              commit_group=False,
+          )
+
+    offset += actual_size & size
+    size //= 2
+  plgpu.commit_smem_to_gmem_group()
+  plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 
 def check_bf16xbf16_or_f16xf16(lhs: jax.Array, rhs: jax.Array):
@@ -178,3 +238,4 @@ def check_bf16xbf16_or_f16xf16(lhs: jax.Array, rhs: jax.Array):
     raise NotImplementedError(
         f"Only bfloat16/float16 inputs are supported (got {lhs.dtype=})."
     )
+

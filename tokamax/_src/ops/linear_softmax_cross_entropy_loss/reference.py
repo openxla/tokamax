@@ -34,7 +34,7 @@ def linear_softmax_cross_entropy_loss_fwd_reference(
   log_probs = jax.nn.log_softmax(logits, axis=-1)
   labels_one_hot = jax.nn.one_hot(labels, num_classes=w.shape[1], dtype=x.dtype)
   loss = -labels_one_hot * log_probs
-  lse = jax.nn.logsumexp(logits, axis=-1)
+  lse = jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1)
   loss_per_sample = jnp.sum(loss, axis=-1, dtype=jnp.float32)
 
   if reduction == "sum":

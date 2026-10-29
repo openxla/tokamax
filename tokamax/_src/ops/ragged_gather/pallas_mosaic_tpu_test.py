@@ -27,6 +27,24 @@ class PallasTpuRaggedGatherTest(test_base.RaggedGatherTestBase):
   def __init__(self, *args):
     super().__init__(*args, gather_fn=pallas_mosaic_tpu.PallasTpuRaggedGather())
 
+  def check_sc_gather(
+      self, in_out_size, hidden_size, start_end, dtype, **kwargs
+  ):
+    for max_row_subchunks in [1, 4]:
+      for trim_rows in [True, False]:
+        with self.subTest(
+            max_row_subchunks=max_row_subchunks, trim_rows=trim_rows
+        ):
+          super().check_sc_gather(
+              in_out_size,
+              hidden_size,
+              start_end,
+              dtype,
+              max_row_subchunks=max_row_subchunks,
+              trim_rows=trim_rows,
+              **kwargs,
+          )
+
 
 if __name__ == "__main__":
   absltest.main()

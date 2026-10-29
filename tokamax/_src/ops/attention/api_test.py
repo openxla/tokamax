@@ -161,10 +161,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       ],
   )
   def testDotProductAttentionMask(self, mask_mode):
-    # TODO: Fix test for 'xla_chunked' on TPU.
-    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
-      self.skipTest(f'{self.IMPL} not supported on TPU')
-
     if isinstance(mask_mode, str):
       mask_mode = (mask_mode,)
 
@@ -259,10 +255,6 @@ class DotProductAttentionTest(parameterized.TestCase):
 
   @parameterized.product(batch_size=[1, 16], use_vmap=[False, True])
   def test_dot_product_attention_bias_gradient(self, batch_size, use_vmap):
-    # TODO: Fix test for 'xla_chunked' on TPU.
-    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
-      self.skipTest(f'{self.IMPL} not supported on TPU')
-
     if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
       # TODO: Remove once a learnable bias is supported on Mosaic
       # TPU attention.
@@ -443,6 +435,38 @@ class DotProductAttentionXlaTest(DotProductAttentionTest):
     out_2 = f(x, jax.lax.DotAlgorithmPreset.BF16_BF16_F32)
     equal = bool(jnp.array_equal(out_1, out_2))
     self.assertFalse(equal)
+
+  def test_no_batch_dim(self):
+    x = jax.ShapeDtypeStruct((1, 16, 2, 16), jnp.float32)
+    bias = jax.ShapeDtypeStruct((1, 2, 16, 16), jnp.float32)
+    mask = jax.ShapeDtypeStruct((1, 1, 16, 16), jnp.bool_)
+    q, k, v, dout, bias, mask = numerics.random_initialize(
+        (x, x, x, x, bias, mask)
+    )
+    q_seqlen = jnp.array([8])
+    kv_seqlen = jnp.array([12])
+    args = (q, k, v, bias, mask, q_seqlen, kv_seqlen)
+
+    fn = lambda q, k, v, b, m, qs, kvs: api.dot_product_attention(
+        q,
+        k,
+        v,
+        bias=b,
+        mask=m,
+        query_seq_lengths=qs,
+        key_value_seq_lengths=kvs,
+        precision=jax.lax.Precision.HIGHEST,
+        implementation='xla',
+    )
+    out_b, vjp_b = jax.vjp(fn, *args)
+    grads_b = vjp_b(dout)[:4]
+
+    squeeze = functools.partial(jnp.squeeze, axis=0)
+    out, vjp = jax.vjp(fn, *map(squeeze, args))
+    grads = vjp(squeeze(dout))[:4]
+
+    chex.assert_trees_all_close(out, squeeze(out_b))
+    chex.assert_trees_all_close(grads, tuple(map(squeeze, grads_b)))
 
 
 class DotProductAttentionXlaChunkedTest(DotProductAttentionTest):

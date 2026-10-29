@@ -17,6 +17,7 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import qwix
+from tokamax._src import gpu_utils
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
 from tokamax._src.ops.ragged_dot import test_base
@@ -43,10 +44,11 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
           lhs.shape[-1] % (128 // jnp.dtype(lhs.dtype).itemsize) == 0
       )
 
+      lhs_ = jax.eval_shape(quantization.as_array_or_qarray, lhs)
       rhs_ = jax.eval_shape(quantization.as_array_or_qarray, rhs)
 
       device_kind = jax.devices()[0].device_kind.lower()
-      if "b200" in device_kind:
+      if gpu_utils.is_sm100():
         if isinstance(rhs_, qwix.QArray):
           config = pallas_mosaic_gpu.Config(
               block_m=64,
@@ -61,6 +63,11 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
               or rhs_.scale_tile_shape[1] < config.block_k
               or rhs_.scale_tile_shape[2] != 1
               or rhs_.scale.shape[2] * rhs_.scale.dtype.itemsize <= 16
+              or (
+                  isinstance(lhs_, qwix.QArray)
+                  and lhs_.qtype == jnp.int8
+                  and not gpu_utils.has_tcgen05_int8_support()
+              )
           ):
             expect_supported = False
         else:
@@ -76,7 +83,7 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
           )
       elif "a100" in device_kind:
         has_custom_dims = "ragged_dot_dimension_numbers" in kwargs
-        if has_custom_dims or jax.__version_info__ < (0, 11, 0):
+        if has_custom_dims:
           expect_supported = False
         else:
           config = pallas_mosaic_gpu.Config(
@@ -124,7 +131,6 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
     configs = op._get_autotuning_configs(ba)
     self.assertIsNotNone(configs)
     self.assertNotEmpty(configs)
-
 
 
 if __name__ == "__main__":

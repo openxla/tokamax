@@ -43,6 +43,8 @@ class FusedMoe(op.Op[Any, jax.Array, None, _Config, Any]):
       topk: int = 2,
       renormalize: bool = True,
       act_fn: str = "silu",
+      mesh: jax.sharding.Mesh | None = None,
+      return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Binds arguments for Fused MoE operator."""
     return super().bind(
@@ -57,6 +59,8 @@ class FusedMoe(op.Op[Any, jax.Array, None, _Config, Any]):
         topk=topk,
         renormalize=renormalize,
         act_fn=act_fn,
+        mesh=mesh,
+        return_residuals=return_residuals,
     )
 
   @override
@@ -75,9 +79,11 @@ class FusedMoe(op.Op[Any, jax.Array, None, _Config, Any]):
       topk: int = 2,
       renormalize: bool = True,
       act_fn: str = "silu",
+      mesh: jax.sharding.Mesh | None = None,
+      return_residuals: bool = False,
       config: _Config | None = None,
   ) -> tuple[jax.Array, None]:
-    del config
+    del config, mesh, return_residuals
     return reference.fused_moe_reference(
         x=x,
         w1=w1,

@@ -125,28 +125,12 @@ def ragged_dot_gpu_quant_blackwell_kernel(
         f"Expected block_m ({block_m}) to be divisible by split_m ({split_m})"
     )
 
-  try:
-    swizzle = plgpu.find_swizzle(block_k * jnp.dtype(x.dtype).itemsize * 8)
-  except ValueError as e:
-    raise NotImplementedError("No possible swizzle.") from e
-
-  swizzle_elems = swizzle // jnp.dtype(x.dtype).itemsize
-
-  try:
-    transforms = (
-        plgpu.TilingTransform((8, swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle),
-    )
-  except ValueError as e:
-    raise NotImplementedError(
-        f"{swizzle=} {swizzle_elems=} unsupported."
-    ) from e
-
-  w_elem_bits = 4
-  w_swizzle = plgpu.find_swizzle(block_k * w_elem_bits)  # n,k
-  w_swizzle_elems = (w_swizzle * 8) // w_elem_bits
   # num_stages must be less than or equal to the number of blocks
   num_stages = min(num_stages, k_w // block_k)
+  x_smem_shape = (num_stages, tile_m, block_k)
+  w_smem_shape = (num_stages, tile_n, block_k)
+  x_smem = common.tiled_swizzled_smem(x_smem_shape, x.dtype, "x")
+  w_smem = common.tiled_swizzled_smem(w_smem_shape, w.dtype, "w")
 
   align_tile = 8
   group_info = common.GroupInfo.create_aligned(
@@ -361,10 +345,8 @@ def ragged_dot_gpu_quant_blackwell_kernel(
                 acc_tmem.at[:, pl.ds(mi * split_block_m, split_block_m)]
             )
             plgpu.wait_load_tmem()
-
-            @pl.when(mi == split_m - 1)
-            def _():
-              plgpu.barrier_arrive(acc_consumed_barrier)
+            is_last_iter = mi == split_m - 1
+            plgpu.barrier_arrive(acc_consumed_barrier, predicate=is_last_iter)
 
             # Apply activation function to the output in dtype of acc if
             # provided.
@@ -380,13 +362,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           with jax.named_scope("T->S"):
             lax.fori_loop(0, split_m, tmem_to_smem_loop_body, None)
 
-          # Write out the largest power of two rows first,
-          # then the next largest, etc.
-          # This allows us to coalesce writes as much as possible.
           def store_loop_body(index, _):
-            # Write out the largest power of two rows first,
-            # then the next largest, etc.
-            # This allows us to coalesce writes as much as possible.
             global_start = lax.max(start_within_block, index * split_block_m)
             global_end = lax.min(
                 start_within_block + actual_size,
@@ -395,29 +371,15 @@ def ragged_dot_gpu_quant_blackwell_kernel(
 
             @pl.when(global_end > global_start)
             def _():
-              length = global_end - global_start
-              local_start = global_start - index * split_block_m
-              offset = 0
-              size = 1 << (min(split_block_m, m).bit_length() - 1)
-              while size > 0:
-
-                @pl.when(length & size != 0)
-                def _():
-                  acc_smem_slice = out_smem.at[
-                      index, pl.ds(local_start + offset, size)
-                  ]
-                  o_gref_slice = out_gmem.at[
-                      pl.ds(block_start + global_start + offset, size),
-                      pl.ds(ni * block_n + cluster_idx * tile_n, tile_n),
-                  ]
-                  plgpu.copy_smem_to_gmem(
-                      acc_smem_slice, o_gref_slice, commit_group=False
-                  )
-
-                offset += length & size
-                size //= 2
-              plgpu.commit_smem_to_gmem_group()
-              plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+              common.copy_ragged_smem_to_gmem(
+                  out_smem.at[index],
+                  out_gmem,
+                  block_start=block_start + index * split_block_m,
+                  start_within_block=global_start - index * split_block_m,
+                  actual_size=global_end - global_start,
+                  ns=pl.ds(ni * block_n + cluster_idx * tile_n, tile_n),
+                  max_rows=min(split_block_m, m),
+              )
 
           with jax.named_scope("S->G"):
             lax.fori_loop(0, split_m, store_loop_body, None)
@@ -425,29 +387,9 @@ def ragged_dot_gpu_quant_blackwell_kernel(
       return carry + (actual_size > 0)
 
   def kernel_entry(*refs):
-    x_smem = plgpu.SMEM(
-        (num_stages, tile_m, block_k),
-        dtype=x.dtype,
-        transforms=transforms,
-    )
-    out_smem = plgpu.SMEM(
-        (split_m, block_m // split_m, tile_n),
-        dtype=out_dtype,
-        # workaround for ValueError: Dynamic slice base index (which is a
-        # dynamic value) cannot be statically proven to be divisible by
-        # the tiling (8)
-        transforms=(
-            plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
-            plgpu.SwizzleTransform(128),
-        ),
-    )
-    w_smem = plgpu.SMEM(
-        (num_stages, tile_n, block_k),
-        dtype=w.dtype,
-        transforms=(
-            plgpu.TilingTransform((8, w_swizzle_elems)),
-            plgpu.SwizzleTransform(w_swizzle),
-        ),
+    out_smem_shape = (split_m, block_m // split_m, tile_n)
+    out_smem = common.tiled_swizzled_smem(
+        out_smem_shape, out_dtype, "out", swizzle=128, tiling_prefix=(1,)
     )
     w_bf16_tmem = plgpu.TMEM(
         (tile_n, num_stages * block_k),

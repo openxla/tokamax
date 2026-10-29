@@ -107,28 +107,12 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
   if config.split_m != 1:
     raise ValueError("Only split_m = 1 is supported.")
 
-  try:
-    swizzle = plgpu.find_swizzle(block_k * jnp.dtype(x.dtype).itemsize * 8)
-  except ValueError as e:
-    raise NotImplementedError("No possible swizzle.") from e
-
-  swizzle_elems = swizzle // jnp.dtype(x.dtype).itemsize
-
-  try:
-    transforms = (
-        plgpu.TilingTransform((8, swizzle_elems)),
-        plgpu.SwizzleTransform(swizzle),
-    )
-  except ValueError as e:
-    raise NotImplementedError(
-        f"{swizzle=} {swizzle_elems=} unsupported."
-    ) from e
-
-  w_elem_bits = 4
-  w_swizzle = plgpu.find_swizzle(block_k * w_elem_bits)  # n,k
-  w_swizzle_elems = (w_swizzle * 8) // w_elem_bits
   # num_stages must be less than or equal to the number of blocks
   num_stages = min(num_stages, k_w // block_k)
+  x_smem_shape = (num_stages, tile_m, block_k)
+  w_smem_shape = (num_stages, tile_n, block_k)
+  x_smem = common.tiled_swizzled_smem(x_smem_shape, x.dtype, "x")
+  w_smem = common.tiled_swizzled_smem(w_smem_shape, w.dtype, "w")
 
   m_iters = pl.cdiv(m, block_m) + num_groups - 1
   n_iters = pl.cdiv(n, block_n)
@@ -365,54 +349,21 @@ def ragged_dot_gpu_quant_post_scale_blackwell_kernel(
             plgpu.commit_smem()
 
           with jax.named_scope("SMEM -> GMEM"):
-            # Write out the largest power of two rows first,
-            # then the next largest, etc.
-            # This allows us to coalesce writes as much as possible.
-            offset = start_within_block
-            size = 1 << (min(block_m, m).bit_length() - 1)
-            while size > 0:
-
-              @pl.when(actual_size & size != 0)
-              def _():
-                out_smem_slice = out_smem.at[pl.ds(offset, size)]
-                o_gref_slice = out_gmem.at[
-                    pl.ds(block_start + offset, size),
-                    pl.ds(ni * block_n + cluster_idx * tile_n, tile_n),
-                ]
-                plgpu.copy_smem_to_gmem(
-                    out_smem_slice, o_gref_slice, commit_group=False
-                )
-
-              offset += actual_size & size
-              size //= 2
-          plgpu.commit_smem_to_gmem_group()
-          plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            common.copy_ragged_smem_to_gmem(
+                out_smem,
+                out_gmem,
+                block_start=block_start,
+                start_within_block=start_within_block,
+                actual_size=actual_size,
+                ns=pl.ds(ni * block_n + cluster_idx * tile_n, tile_n),
+                max_rows=min(block_m, m),
+            )
       return carry + (actual_size > 0)
 
   def kernel_entry(*refs):
-    x_smem = plgpu.SMEM(
-        (num_stages, tile_m, block_k),
-        dtype=x.dtype,
-        transforms=transforms,
-    )
-    out_smem = plgpu.SMEM(
-        (block_m, tile_n),
-        dtype=out_dtype,
-        # workaround for ValueError: Dynamic slice base index (which is a
-        # dynamic value) cannot be statically proven to be divisible by
-        # the tiling (8)
-        transforms=(
-            plgpu.TilingTransform((1, 128 // jnp.dtype(out_dtype).itemsize)),
-            plgpu.SwizzleTransform(128),
-        ),
-    )
-    w_smem = plgpu.SMEM(
-        (num_stages, tile_n, block_k),
-        dtype=w.dtype,
-        transforms=(
-            plgpu.TilingTransform((8, w_swizzle_elems)),
-            plgpu.SwizzleTransform(w_swizzle),
-        ),
+    out_smem_shape = (block_m, tile_n)
+    out_smem = common.tiled_swizzled_smem(
+        out_smem_shape, out_dtype, "out", swizzle=128, tiling_prefix=(1,)
     )
     w_bf16_tmem = plgpu.TMEM(
         (tile_n, num_stages * block_k),
