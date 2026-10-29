@@ -15,6 +15,15 @@
 
 """PyTorch interface for RWKV-7 (DPLR Delta Rule) operator."""
 
+# Dimensions.
+#   B      batch size
+#   T      sequence length (nt * tt)
+#   H      number of attention heads
+#   K      key head dimension
+#   V      value head dimension
+#   tt     sequence chunk tile extent (chunk_size)
+#   nt     grid extent over T: nt = T // tt
+
 import math
 from typing import Any
 
@@ -51,6 +60,116 @@ class _FallbackTorchOp[Config]:
 _TorchOpBase = torch_op.TorchOp if torch_op is not None else _FallbackTorchOp
 
 
+def _rwkv7_cpu_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    gk: torch.Tensor,
+    chunk_size: int = 64,
+    scale: float | None = None,
+) -> torch.Tensor:
+  """Pure PyTorch reference implementation for RWKV-7."""
+  batch_size, seq_len, num_heads, key_dim = q.shape
+  _, _, _, val_dim = v.shape
+  num_chunks = seq_len // chunk_size
+  resolved_scale = (key_dim**-0.5) if scale is None else scale
+  outs = []
+
+  state = torch.zeros(
+      batch_size,
+      num_heads,
+      key_dim,
+      val_dim,
+      device=q.device,
+      dtype=torch.float32,
+  )
+
+  row_idx = torch.arange(chunk_size, device=q.device).unsqueeze(1)
+  col_idx = torch.arange(chunk_size, device=q.device).unsqueeze(0)
+  incl_causal = (col_idx <= row_idx).float()
+  strict_causal = (col_idx < row_idx).float()
+  eye = torch.eye(chunk_size, device=q.device, dtype=torch.float32)
+
+  for chunk_idx in range(num_chunks):
+    start_idx = chunk_idx * chunk_size
+    end_idx = (chunk_idx + 1) * chunk_size
+    q_c = q[:, start_idx:end_idx].permute(0, 2, 1, 3).float() * resolved_scale
+    k_c = k[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+    v_c = v[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+    alpha_c = alpha[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+    beta_c = beta[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+    gk_c = gk[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+
+    gk_cs = torch.cumsum(gk_c, dim=2)
+
+    diff_incl = torch.clamp(gk_cs.unsqueeze(3) - gk_cs.unsqueeze(2), max=0.0)
+    decay_incl = torch.exp(diff_incl)
+    aqk = (
+        torch.sum(q_c.unsqueeze(3) * k_c.unsqueeze(2) * decay_incl, dim=-1)
+        * incl_causal
+    )
+    aqb = (
+        torch.sum(q_c.unsqueeze(3) * beta_c.unsqueeze(2) * decay_incl, dim=-1)
+        * incl_causal
+    )
+
+    gk_excl = gk_cs - gk_c
+    diff_excl = torch.clamp(
+        gk_excl.unsqueeze(3) - gk_cs.unsqueeze(2), max=0.0
+    )
+    decay_excl = torch.exp(diff_excl)
+    a_ab = (
+        torch.sum(
+            alpha_c.unsqueeze(3) * beta_c.unsqueeze(2) * decay_excl, dim=-1
+        )
+        * strict_causal
+    )
+    a_ak = (
+        torch.sum(
+            alpha_c.unsqueeze(3) * k_c.unsqueeze(2) * decay_excl, dim=-1
+        )
+        * strict_causal
+    )
+
+    p_mat = eye + a_ab
+    curr = a_ab
+    num_doubling_steps = max(0, math.ceil(math.log2(chunk_size)) - 1)
+    for _ in range(num_doubling_steps):
+      curr = torch.matmul(curr, curr)
+      p_mat = torch.matmul(p_mat, eye + curr)
+    a_ab_inv = p_mat
+
+    ak_v = torch.matmul(a_ak, v_c)
+    decayed_alpha = torch.exp(torch.clamp(gk_excl, max=0.0)) * alpha_c
+    merged_rhs = torch.cat([ak_v, decayed_alpha], dim=-1)
+    merged_uw = torch.matmul(a_ab_inv, merged_rhs)
+    u_c = merged_uw[:, :, :, :val_dim]
+    w_c = merged_uw[:, :, :, val_dim:]
+
+    v2_c = u_c + torch.matmul(w_c, state.to(w_c.dtype))
+    o_1 = torch.matmul(aqk, v_c)
+    o_2 = torch.matmul(aqb, v2_c)
+    o_3 = torch.matmul(
+        q_c * torch.exp(torch.clamp(gk_cs, max=0.0)), state.to(q_c.dtype)
+    )
+    o_c = o_1 + o_2 + o_3
+    outs.append(o_c.permute(0, 2, 1, 3).to(q.dtype))
+
+    g_last = gk_cs[:, :, -1, :]
+    decay_last = torch.exp(
+        torch.clamp(g_last[:, :, None, :] - gk_cs, max=0.0)
+    )
+    state = (
+        state * torch.exp(torch.clamp(g_last, max=0.0))[:, :, :, None]
+        + torch.matmul((k_c * decay_last).transpose(-1, -2), v_c)
+        + torch.matmul((beta_c * decay_last).transpose(-1, -2), v2_c)
+    )
+
+  return torch.cat(outs, dim=1)
+
+
 class _RWKV7[Config](_TorchOpBase[Config]):
   """PyTorch wrapper for base RWKV-7 operator."""
 
@@ -83,9 +202,7 @@ class _RWKV7[Config](_TorchOpBase[Config]):
       gk: jax.Array,
       chunk_size: int = 64,
       scale: float | None = None,
-      config: Any = None,
   ) -> jax.Array:
-    del config
     assert self.op_impl_jax is not None, "Forward class not set."
     (out, _), _ = self.op_impl_jax._fwd(
         q, k, v, alpha, beta, gk, chunk_size=chunk_size, scale=scale
@@ -104,7 +221,7 @@ class _RWKV7[Config](_TorchOpBase[Config]):
       chunk_size: int = 64,
       scale: float | None = None,
   ) -> torch.Tensor:
-    seq_len = q.shape[1]
+    _, seq_len, _, _ = q.shape
     if chunk_size <= 0 or seq_len % chunk_size != 0:
       raise ValueError(
           f"Sequence length ({seq_len}) must be divisible by chunk_size"
@@ -115,122 +232,11 @@ class _RWKV7[Config](_TorchOpBase[Config]):
       return self._torch_tokamax_op(
           q, k, v, alpha, beta, gk, chunk_size=chunk_size, scale=scale
       )
-    return self._cpu_fallback(
+    return _rwkv7_cpu_fallback(
         q, k, v, alpha, beta, gk, chunk_size=chunk_size, scale=scale
     )
-
-  rwkv7_pallas_delta_rule = __call__
-
-  def _cpu_fallback(
-      self,
-      q: torch.Tensor,
-      k: torch.Tensor,
-      v: torch.Tensor,
-      alpha: torch.Tensor,
-      beta: torch.Tensor,
-      gk: torch.Tensor,
-      chunk_size: int = 64,
-      scale: float | None = None,
-  ) -> torch.Tensor:
-    """Pure PyTorch reference implementation for RWKV-7."""
-    batch_size, seq_len, num_heads, key_dim = q.shape
-    val_dim = v.shape[-1]
-    num_chunks = seq_len // chunk_size
-    resolved_scale = (key_dim**-0.5) if scale is None else scale
-    outs = []
-
-    state = torch.zeros(
-        batch_size,
-        num_heads,
-        key_dim,
-        val_dim,
-        device=q.device,
-        dtype=torch.float32,
-    )
-
-    row_idx = torch.arange(chunk_size, device=q.device).unsqueeze(1)
-    col_idx = torch.arange(chunk_size, device=q.device).unsqueeze(0)
-    incl_causal = (col_idx <= row_idx).float()
-    strict_causal = (col_idx < row_idx).float()
-    eye = torch.eye(chunk_size, device=q.device, dtype=torch.float32)
-
-    for chunk_idx in range(num_chunks):
-      start_idx = chunk_idx * chunk_size
-      end_idx = (chunk_idx + 1) * chunk_size
-      q_c = q[:, start_idx:end_idx].permute(0, 2, 1, 3).float() * resolved_scale
-      k_c = k[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-      v_c = v[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-      alpha_c = alpha[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-      beta_c = beta[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-      gk_c = gk[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-
-      gk_cs = torch.cumsum(gk_c, dim=2)
-
-      diff_incl = torch.clamp(gk_cs.unsqueeze(3) - gk_cs.unsqueeze(2), max=0.0)
-      decay_incl = torch.exp(diff_incl)
-      aqk = (
-          torch.sum(q_c.unsqueeze(3) * k_c.unsqueeze(2) * decay_incl, dim=-1)
-          * incl_causal
-      )
-      aqb = (
-          torch.sum(q_c.unsqueeze(3) * beta_c.unsqueeze(2) * decay_incl, dim=-1)
-          * incl_causal
-      )
-
-      gk_excl = gk_cs - gk_c
-      diff_excl = torch.clamp(
-          gk_excl.unsqueeze(3) - gk_cs.unsqueeze(2), max=0.0
-      )
-      decay_excl = torch.exp(diff_excl)
-      a_ab = (
-          torch.sum(
-              alpha_c.unsqueeze(3) * beta_c.unsqueeze(2) * decay_excl, dim=-1
-          )
-          * strict_causal
-      )
-      a_ak = (
-          torch.sum(
-              alpha_c.unsqueeze(3) * k_c.unsqueeze(2) * decay_excl, dim=-1
-          )
-          * strict_causal
-      )
-
-      p_mat = eye + a_ab
-      curr = a_ab
-      num_doubling_steps = max(0, math.ceil(math.log2(chunk_size)) - 1)
-      for _ in range(num_doubling_steps):
-        curr = torch.matmul(curr, curr)
-        p_mat = torch.matmul(p_mat, eye + curr)
-      a_ab_inv = p_mat
-
-      ak_v = torch.matmul(a_ak, v_c)
-      decayed_alpha = torch.exp(torch.clamp(gk_excl, max=0.0)) * alpha_c
-      merged_rhs = torch.cat([ak_v, decayed_alpha], dim=-1)
-      merged_uw = torch.matmul(a_ab_inv, merged_rhs)
-      u_c = merged_uw[:, :, :, :val_dim]
-      w_c = merged_uw[:, :, :, val_dim:]
-
-      v2_c = u_c + torch.matmul(w_c, state.to(w_c.dtype))
-      o_1 = torch.matmul(aqk, v_c)
-      o_2 = torch.matmul(aqb, v2_c)
-      o_3 = torch.matmul(
-          q_c * torch.exp(torch.clamp(gk_cs, max=0.0)), state.to(q_c.dtype)
-      )
-      o_c = o_1 + o_2 + o_3
-      outs.append(o_c.permute(0, 2, 1, 3).to(q.dtype))
-
-      g_last = gk_cs[:, :, -1, :]
-      decay_last = torch.exp(
-          torch.clamp(g_last[:, :, None, :] - gk_cs, max=0.0)
-      )
-      state = (
-          state * torch.exp(torch.clamp(g_last, max=0.0))[:, :, :, None]
-          + torch.matmul((k_c * decay_last).transpose(-1, -2), v_c)
-          + torch.matmul((beta_c * decay_last).transpose(-1, -2), v2_c)
-      )
-
-    return torch.cat(outs, dim=1)
 
 
 # Singleton instance for the base RWKV-7 operator.
 rwkv7_delta_rule = _RWKV7[Any]()
+object.__setattr__(rwkv7_delta_rule, "rwkv7_pallas_delta_rule", rwkv7_delta_rule)

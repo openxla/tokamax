@@ -12,8 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 """Base operator class for RWKV-7 (DPLR Delta Rule)."""
+
+# Dimensions.
+#   B      batch size
+#   T      sequence length (nt * tt)
+#   H      number of attention heads
+#   K      key head dimension
+#   V      value head dimension
+#   tt     sequence chunk tile extent (chunk_size)
+#   nt     grid extent over T: nt = T // tt
 
 import dataclasses
 import math
@@ -21,21 +29,25 @@ from typing import Any, TypeAlias
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from typing_extensions import override
 
-Output: TypeAlias = tuple[jax.Array, jax.Array | None]
+# pylint: disable=invalid-name
+
+Output: TypeAlias = tuple[
+    Float[Array, "B T H V"], Float[Array, "B H K V"] | None
+]
 Residuals: TypeAlias = Any
 
 _CHUNK_SIZE = 64
 
 
-def _chunkify(
-    x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int
-) -> jax.Array:
-  # (batch_size, seq_len, num_heads, ...) -> (batch_size, num_heads, num_chunks, chunk_size, ...)
-  rest = x.shape[3:]
-  x = x.reshape((batch_size, num_chunks, chunk_size, x.shape[2]) + rest)
+def _chunkify(x: jax.Array, B: int, nt: int, tt: int) -> jax.Array:
+  # [B, T, H, ...] -> [B, H, nt, tt, ...]
+  _, _, H, *rest = x.shape
+  x = x.reshape((B, nt, tt, H, *rest))
   perm = (0, 3, 1, 2) + tuple(range(4, x.ndim))
   return jnp.transpose(x, perm)
 
@@ -45,6 +57,8 @@ def _move_nt_front(x: jax.Array) -> jax.Array:
 
 
 def _mm(x: jax.Array, y: jax.Array) -> jax.Array:
+  # Pin HIGHEST precision on f32 contractions so TPU MXU does not downcast
+  # reference matmuls to bf16.
   return jnp.matmul(
       x,
       y,
@@ -81,9 +95,10 @@ def _intra_chunk_one_plain(
     gk_i: jax.Array,
     gk_cs_i: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-  bt = q_i.shape[0]
-  row_idx = jnp.arange(bt)[:, None]
-  col_idx = jnp.arange(bt)[None, :]
+  tt, _ = q_i.shape
+  _, V = v_i.shape
+  row_idx = jnp.arange(tt)[:, None]
+  col_idx = jnp.arange(tt)[None, :]
   incl_causal = (col_idx <= row_idx).astype(jnp.float32)
   strict_causal = (col_idx < row_idx).astype(jnp.float32)
 
@@ -112,23 +127,24 @@ def _intra_chunk_one_plain(
       * strict_causal
   )
 
-  eye = jnp.eye(bt, dtype=jnp.float32)
+  # Invert (I - A_ab) via Neumann series doubling since A_ab is strictly lower
+  # triangular (nilpotent with A_ab^tt = 0).
+  eye = jnp.eye(tt, dtype=jnp.float32)
   a_ab_f32 = a_ab.astype(jnp.float32)
   p = eye + a_ab_f32
   curr = a_ab_f32
-  num_doubling_steps = max(0, math.ceil(math.log2(bt)) - 1)
+  num_doubling_steps = max(0, math.ceil(math.log2(tt)) - 1)
   for _ in range(num_doubling_steps):
     curr = _mm(curr, curr)
     p = _mm(p, eye + curr)
   a_ab_inv = p
 
-  v_dim = v_i.shape[-1]
   ak_v = _mm(a_ak, v_i)
   decayed_alpha = jnp.exp(jnp.minimum(gk_excl, 0.0)) * alpha_i
   merged_rhs = jnp.concat([ak_v, decayed_alpha], axis=-1)
   merged_uw = _mm(a_ab_inv, merged_rhs)
-  u_i = merged_uw[:, :v_dim]
-  w_i = merged_uw[:, v_dim:]
+  u_i = merged_uw[:, :V]
+  w_i = merged_uw[:, V:]
 
   return (
       aqk.astype(q_i.dtype),
@@ -138,19 +154,20 @@ def _intra_chunk_one_plain(
   )
 
 
+@jaxtyping.jaxtyped
 def rwkv7_reference(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    alpha: jax.Array,
-    beta: jax.Array,
-    gk: jax.Array,
+    q: Float[Array, "B T H K"],
+    k: Float[Array, "B T H K"],
+    v: Float[Array, "B T H V"],
+    alpha: Float[Array, "B T H K"],
+    beta: Float[Array, "B T H K"],
+    gk: Float[Array, "B T H K"],
     *,
     chunk_size: int = _CHUNK_SIZE,
     scale: float | None = None,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "B H K V"] | None = None,
     output_final_state: bool = False,
-) -> tuple[jax.Array, jax.Array | None]:
+) -> tuple[Float[Array, "B T H V"], Float[Array, "B H K V"] | None]:
   """Reference implementation of RWKV-7 DPLR delta rule recurrence."""
   (out, final_state), _ = RWKV7()._fwd(
       q,
@@ -176,40 +193,42 @@ class RWKV7[C](op.Op[Any, Output, Residuals, C, None]):
 
   supports_symbolic_shapes = False
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      alpha: jax.Array,
-      beta: jax.Array,
-      gk: jax.Array,
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      v: Float[Array, "B T H V"],
+      alpha: Float[Array, "B T H K"],
+      beta: Float[Array, "B T H K"],
+      gk: Float[Array, "B T H K"],
       *,
       chunk_size: int = _CHUNK_SIZE,
       scale: float | None = None,
-      initial_state: jax.Array | None = None,
+      initial_state: Float[Array, "B H K V"] | None = None,
       output_final_state: bool = False,
       return_residuals: bool = False,
       config: C | None = None,
   ) -> tuple[Output, None]:
     del return_residuals, config
-    batch_size, seq_len, num_heads, key_dim = q.shape
-    if chunk_size <= 0 or seq_len % chunk_size != 0:
+    B, T, H, K = q.shape
+    _, _, _, V = v.shape
+    tt = chunk_size
+    if tt <= 0 or T % tt != 0:
       raise ValueError(
-          f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})."
+          f"seq_len ({T}) must be divisible by chunk_size ({tt})."
       )
-    val_dim = v.shape[-1]
-    num_chunks = seq_len // chunk_size
+    nt = T // tt
     if scale is None:
-      scale = key_dim**-0.5
+      scale = K**-0.5
 
-    q_c = _chunkify(q, batch_size, num_chunks, chunk_size) * scale
-    k_c = _chunkify(k, batch_size, num_chunks, chunk_size)
-    v_c = _chunkify(v, batch_size, num_chunks, chunk_size)
-    alpha_c = _chunkify(alpha, batch_size, num_chunks, chunk_size)
-    beta_c = _chunkify(beta, batch_size, num_chunks, chunk_size)
-    gk_c = _chunkify(gk, batch_size, num_chunks, chunk_size)
+    q_c = _chunkify(q, B, nt, tt) * scale
+    k_c = _chunkify(k, B, nt, tt)
+    v_c = _chunkify(v, B, nt, tt)
+    alpha_c = _chunkify(alpha, B, nt, tt)
+    beta_c = _chunkify(beta, B, nt, tt)
+    gk_c = _chunkify(gk, B, nt, tt)
     gk_cs_c = jnp.cumsum(gk_c, axis=-2)
 
     vmap_intra = jax.vmap(jax.vmap(jax.vmap(_intra_chunk_one_plain)))
@@ -222,9 +241,7 @@ class RWKV7[C](op.Op[Any, Output, Residuals, C, None]):
     scan_body_batched = jax.vmap(jax.vmap(_scan_body))
 
     if initial_state is None:
-      s0 = jnp.zeros(
-          (batch_size, num_heads, key_dim, val_dim), dtype=jnp.float32
-      )
+      s0 = jnp.zeros((B, H, K, V), dtype=jnp.float32)
     else:
       s0 = initial_state.astype(jnp.float32)
 
@@ -234,8 +251,6 @@ class RWKV7[C](op.Op[Any, Output, Residuals, C, None]):
         (q_s, k_s, v_s, beta_s, gk_cs_s, aqk_s, aqb_s, u_s, w_s),
     )
     o = jnp.moveaxis(o_stacked, 0, 2)
-    o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(
-        batch_size, seq_len, num_heads, val_dim
-    )
+    o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(B, T, H, V)
     final_state = s_final if output_final_state else None
     return (o, final_state), None

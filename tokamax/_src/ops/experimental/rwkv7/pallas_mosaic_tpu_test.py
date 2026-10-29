@@ -209,6 +209,8 @@ class PallasTpuRWKV7Test(absltest.TestCase):
     op_instance = pallas_mosaic_tpu.PallasTpuRWKV7()
     with self.assertRaises(ValueError):
       op_instance._fwd(q, q, q, q, q, q, chunk_size=64)
+    with self.assertRaises(ValueError):
+      pallas_mosaic_tpu.Config(chunk_size=48)
     with self.assertRaises(NotImplementedError):
       q128 = jnp.ones((1, 128, 2, 16), dtype=jnp.float32)
       op_instance._fwd(q128, q128, q128, q128, q128, q128, chunk_size=128)

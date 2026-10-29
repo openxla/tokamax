@@ -15,6 +15,15 @@
 
 """PyTorch interface for Pallas TPU RWKV-7 operator."""
 
+# Dimensions.
+#   B      batch size
+#   T      sequence length (nt * tt)
+#   H      number of attention heads
+#   K      key head dimension
+#   V      value head dimension
+#   tt     sequence chunk tile extent (chunk_size)
+#   nt     grid extent over T: nt = T // tt
+
 from collections.abc import Sequence
 from typing import Any
 
@@ -66,14 +75,14 @@ class _PallasTpuRWKV7Vjp(torch_base._TorchOpBase[Config]):  # pylint: disable=pr
     q_meta = abstract_argument_dict["q"]
     v_meta = abstract_argument_dict["v"]
     b_sz, seq_len, h_sz, k_dim = q_meta.shape
-    v_dim = v_meta.shape[-1]
-    bt = abstract_argument_dict.get("chunk_size", 64)
-    nt = seq_len // bt
+    _, _, _, v_dim = v_meta.shape
+    tt = abstract_argument_dict.get("chunk_size", 64)
+    nt = seq_len // tt
     return {
         "residuals": (
-            jax.ShapeDtypeStruct((b_sz, h_sz, nt, bt, bt), q_meta.dtype),
+            jax.ShapeDtypeStruct((b_sz, h_sz, nt, tt, tt), q_meta.dtype),
             jax.ShapeDtypeStruct(
-                (b_sz, h_sz, nt, bt, k_dim + v_dim), jnp.float32
+                (b_sz, h_sz, nt, tt, k_dim + v_dim), jnp.float32
             ),
             jax.ShapeDtypeStruct((b_sz, h_sz, nt, k_dim, v_dim), jnp.float32),
         ),
@@ -96,11 +105,9 @@ class _PallasTpuRWKV7Vjp(torch_base._TorchOpBase[Config]):  # pylint: disable=pr
       do: jax.Array,
       chunk_size: int = 64,
       scale: float | None = None,
-      config: Any = None,
   ) -> tuple[
       jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
   ]:
-    del config
     assert self.op_impl_jax is not None, "Backward class not set."
     dq, dk, dv, dalpha, dbeta, dgk, _ = (
         pallas_mosaic_tpu_bwd_kernel.rwkv7_pallas_bwd(
@@ -262,9 +269,7 @@ class _PallasTpuRWKV7(torch_base._RWKV7[Config]):  # pylint: disable=protected-a
       gk: jax.Array,
       chunk_size: int = 64,
       scale: float | None = None,
-      config: Any = None,
   ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    del config
     assert self.op_impl_jax is not None, "Forward class not set."
     (out, _), residuals = self.op_impl_jax._fwd(
         q,
@@ -292,7 +297,7 @@ class _PallasTpuRWKV7(torch_base._RWKV7[Config]):  # pylint: disable=protected-a
       chunk_size: int = 64,
       scale: float | None = None,
   ) -> torch.Tensor:
-    seq_len = q.shape[1]
+    _, seq_len, _, _ = q.shape
     if chunk_size <= 0 or seq_len % chunk_size != 0:
       raise ValueError(
           f"Sequence length ({seq_len}) must be divisible by chunk_size"
@@ -307,8 +312,6 @@ class _PallasTpuRWKV7(torch_base._RWKV7[Config]):  # pylint: disable=protected-a
     return _CpuPallasAutogradFn.apply(
         self, q, k, v, alpha, beta, gk, chunk_size, scale
     )
-
-  rwkv7_pallas_delta_rule = __call__
 
   def setup_context(
       self, ctx: Any, inputs: Sequence[Any], output: Any
@@ -348,3 +351,4 @@ class _PallasTpuRWKV7(torch_base._RWKV7[Config]):  # pylint: disable=protected-a
 
 # Singleton instance
 rwkv7 = _PallasTpuRWKV7()
+object.__setattr__(rwkv7, "rwkv7_pallas_delta_rule", rwkv7)
