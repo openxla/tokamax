@@ -171,6 +171,13 @@ table.ops-table code {
       <td align="center" style="text-align: center;">✅</td>
       <td>Two-stage bounded-slot linear attention with decoupled slot-axis and state-axis exponential decay, implementing <a href="https://arxiv.org/abs/2409.07146">Gated Slot Attention for Efficient Linear-Time Sequence Modeling</a>.</td>
     </tr>
+    <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/nsa"><code>nsa</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Hardware-aligned hierarchical sparse attention combining compressed-block, selected-block, and sliding-window branches, implementing <a href="https://arxiv.org/abs/2502.11089">Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention</a>.</td>
+    </tr>
   </tbody>
 </table>
 

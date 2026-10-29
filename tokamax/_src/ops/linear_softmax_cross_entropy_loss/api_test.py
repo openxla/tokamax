@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import itertools
+from typing import Any
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -128,6 +129,66 @@ class ApiTest(parameterized.TestCase):
     else:
       # CPU / GPU are using XLA implementation
       self.assertEmpty(opspecs)
+
+  def test_sequence_implementation_matches_string_implementation(self):
+    b_dim = 128
+    h_dim = 64
+    v_dim = 256
+    x_input, labels, weights = test_utils.generate_random_data(
+        jax.random.key(42), b_dim, h_dim, v_dim
+    )
+    result_seq = api.linear_softmax_cross_entropy_loss(
+        x_input, labels, weights, implementation=("xla",)
+    )
+    result_str = api.linear_softmax_cross_entropy_loss(
+        x_input, labels, weights, implementation="xla"
+    )
+    self.assertTrue(jnp.allclose(result_seq, result_str, atol=1e-4, rtol=1e-4))
+
+  def test_empty_sequence_implementation_raises_value_error(self):
+    b_dim = 128
+    h_dim = 64
+    v_dim = 256
+    x_input, labels, weights = test_utils.generate_random_data(
+        jax.random.key(42), b_dim, h_dim, v_dim
+    )
+    with self.assertRaises(ValueError):
+      api.linear_softmax_cross_entropy_loss(
+          x_input, labels, weights, implementation=()
+      )
+
+  def test_unsupported_implementation_raises_value_error(self):
+    b_dim = 128
+    h_dim = 64
+    v_dim = 256
+    x_input, labels, weights = test_utils.generate_random_data(
+        jax.random.key(42), b_dim, h_dim, v_dim
+    )
+    bad_impl: Any = "non_existent"
+    with self.assertRaises(ValueError):
+      api.linear_softmax_cross_entropy_loss(
+          x_input, labels, weights, implementation=bad_impl
+      )
+
+  def test_sequence_fallback_on_not_implemented_error(self):
+    b_dim = 128
+    h_dim = 64
+    v_dim = 256
+    x_input, labels, weights = test_utils.generate_random_data(
+        jax.random.key(42), b_dim, h_dim, v_dim
+    )
+
+    def failing_impl(x, labels, weights, *, reduction="sum"):
+      del x, labels, weights, reduction
+      raise NotImplementedError("Not implemented on this hardware.")
+
+    result = api.linear_softmax_cross_entropy_loss(
+        x_input, labels, weights, implementation=(failing_impl, "xla")
+    )
+    expected = api.linear_softmax_cross_entropy_loss(
+        x_input, labels, weights, implementation="xla"
+    )
+    self.assertTrue(jnp.allclose(result, expected, atol=1e-4, rtol=1e-4))
 
 
 if __name__ == "__main__":

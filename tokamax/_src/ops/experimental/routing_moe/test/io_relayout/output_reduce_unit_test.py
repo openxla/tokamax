@@ -85,6 +85,21 @@ class OutputReduceUnitTest(parameterized.TestCase):
     )
     self._assert_matches_reference(case_spec, out_dtype)
 
+  @parameterized.product(
+      num_tokens=[512, 16384],
+      top_k=[11, 16],
+      ep_size=[1, 8],
+  )
+  def test_stress_high_topk_and_large_tokens(
+      self, num_tokens: int, top_k: int, ep_size: int
+  ):
+    """Top-k > 10 and many tokens: the SMEM ring must not overflow or spill."""
+    shape = test_shapes.MoEShape("stress", 512, top_k, 1024, 1024)
+    case_spec = test_cases.Case(
+        "stress", shape, num_tokens, test_cases.MoESharding(ep=ep_size)
+    )
+    self._assert_matches_reference(case_spec, jnp.bfloat16)
+
   def test_ragged_sum(self):
     """Each shard reduces only its picks, so the shard outputs sum to all."""
     ep_size = 8
