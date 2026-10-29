@@ -79,7 +79,7 @@ class PallasTpuNativeSparseAttentionTest(absltest.TestCase):
         window=window,
         cmp_block_size=cmp_size,
     )
-    expected_out, _ = base.nsa_reference(
+    expected_out, _ = base.NativeSparseAttention()._fwd(
         q,
         k,
         v,
@@ -123,7 +123,7 @@ class PallasTpuNativeSparseAttentionTest(absltest.TestCase):
         window=window,
         cmp_block_size=cmp_size,
     )
-    expected_out, _ = base.nsa_reference(
+    expected_out, _ = base.NativeSparseAttention()._fwd(
         q,
         k,
         v,

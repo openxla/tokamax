@@ -13,11 +13,23 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Tokamax operator wrapper for Native Sparse Attention (NSA)."""
+"""Pallas/Mosaic TPU operator implementation for Native Sparse Attention (NSA)."""
 
-from typing import Annotated, ClassVar
+# Dimensions.
+#   B   batch size
+#   H   number of attention heads
+#   T   sequence length
+#   D   head dimension
+#   tt  query/KV block tile extent along T (chunk_size)
+#   tc  compression block tile extent along T (cmp_block_size)
+
+from typing import ClassVar
+
 import jax
+from jax.experimental.pallas import tpu as pltpu
+from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.nsa import base
 from tokamax._src.ops.experimental.nsa import pallas_mosaic_tpu_kernel
@@ -28,10 +40,17 @@ from typing_extensions import override
 class Config:
   """Autotuning and execution configuration for Pallas TPU NSA."""
 
-  chunk_size: Annotated[int, pydantic.Field(gt=0)] = 256
-  topk: Annotated[int, pydantic.Field(gt=0)] = 4
-  window: Annotated[int, pydantic.Field(gt=0)] = 128
-  cmp_block_size: Annotated[int, pydantic.Field(gt=0)] = 64
+  chunk_size: pydantic.PositiveInt = 256
+  topk: pydantic.PositiveInt = 4
+  window: pydantic.PositiveInt = 128
+  cmp_block_size: pydantic.PositiveInt = 64
+
+  def __post_init__(self):
+    if self.chunk_size < self.cmp_block_size:
+      raise ValueError(
+          f"chunk_size ({self.chunk_size}) must be at least cmp_block_size"
+          f" ({self.cmp_block_size})."
+      )
 
 
 class PallasTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
@@ -39,15 +58,16 @@ class PallasTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
 
   config_cls: ClassVar[type[Config]] = Config
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      g_cmp: jax.Array | None = None,
-      g_slc: jax.Array | None = None,
-      g_swa: jax.Array | None = None,
+      q: Float[Array, "B H T D"],
+      k: Float[Array, "B H T D"],
+      v: Float[Array, "B H T D"],
+      g_cmp: Float[Array, "B H T D"] | None = None,
+      g_slc: Float[Array, "B H T D"] | None = None,
+      g_swa: Float[Array, "B H T D"] | None = None,
       *,
       chunk_size: int = 256,
       topk: int = 4,
@@ -56,30 +76,22 @@ class PallasTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
       scale: float | None = None,
       config: Config | None = None,
       return_residuals: bool = False,
-  ) -> tuple[base.Output, None]:
+  ) -> tuple[Float[Array, "B H T D"], None]:
     del return_residuals
-    resolved_chunk_size = (
-        config.chunk_size if config is not None else chunk_size
-    )
+    tt = config.chunk_size if config is not None else chunk_size
     resolved_topk = config.topk if config is not None else topk
     resolved_window = config.window if config is not None else window
-    resolved_cmp_size = (
-        config.cmp_block_size if config is not None else cmp_block_size
-    )
-    if resolved_chunk_size <= 0:
-      raise NotImplementedError(
-          f"chunk_size must be positive, got {resolved_chunk_size}"
-      )
+    tc = config.cmp_block_size if config is not None else cmp_block_size
+    if tt <= 0:
+      raise NotImplementedError(f"chunk_size must be positive, got {tt}")
     if resolved_topk <= 0:
       raise NotImplementedError(f"topk must be positive, got {resolved_topk}")
     if resolved_window <= 0:
       raise NotImplementedError(
           f"window must be positive, got {resolved_window}"
       )
-    if resolved_cmp_size <= 0:
-      raise NotImplementedError(
-          f"cmp_block_size must be positive, got {resolved_cmp_size}"
-      )
+    if tc <= 0:
+      raise NotImplementedError(f"cmp_block_size must be positive, got {tc}")
 
     out, _ = pallas_mosaic_tpu_kernel.nsa_pallas_fwd(
         q,
@@ -88,10 +100,10 @@ class PallasTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
         g_cmp=g_cmp,
         g_slc=g_slc,
         g_swa=g_swa,
-        chunk_size=resolved_chunk_size,
+        chunk_size=tt,
         topk=resolved_topk,
         window=resolved_window,
-        cmp_block_size=resolved_cmp_size,
+        cmp_block_size=tc,
         scale=scale,
     )
     return out, None
@@ -107,7 +119,4 @@ class PallasTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    try:
-      return device.platform == "tpu"
-    except Exception:
-      return False
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5

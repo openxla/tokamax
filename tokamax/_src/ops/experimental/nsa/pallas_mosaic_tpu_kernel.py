@@ -13,22 +13,25 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Pallas TPU compute kernel for Native Sparse Attention (NSA)."""
+"""Pallas TPU compute kernels for Native Sparse Attention (NSA)."""
 
-# Dimensions:
-# B: batch_size
-# H: num_heads
-# T: seq_len
-# D: head_dim
-# NB: num_q_blocks (T // block_q)
-# BQ: block_q (chunk_size)
-# K_eff: effective_topk (min(topk, NB))
-# W: sliding window size
-# BC: cmp_block_size
+# Dimensions.
+#   B   batch size
+#   H   number of attention heads
+#   T   sequence length
+#   D   head dimension
+#   W   local causal sliding window size
+#   tt  query/KV block tile extent along T (chunk_size)
+#   nt  number of query/KV blocks along T (nt = T // tt)
+#   tc  compression block tile extent along T (cmp_block_size)
+#   nc  number of compressed blocks along T (nc = T // tc)
+#   tk  number of selected historical blocks (min(topk, nt))
+#   nk  selection grid extent per query block (nk = tk + 1)
+#   tw  number of preceding blocks spanned by sliding window
+#   nw  sliding-window grid extent per query block (nw = tw + 1)
 
 import functools
 import math
-from typing import Any
 
 import jax
 from jax.experimental import pallas as pl
@@ -46,20 +49,15 @@ def _compute_cmp_branch(
     k: jax.Array,
     v: jax.Array,
     scale: float,
-    bs_cmp: int = _CMP_BLOCK_SIZE,
+    cmp_block_size: int = _CMP_BLOCK_SIZE,
 ) -> jax.Array:
   """Computes coarse block-compression attention branch."""
-  batch_size, num_heads, seq_len, head_dim = q.shape
-  num_cmp_blocks = seq_len // bs_cmp
+  B, H, T, D = q.shape
+  tc = cmp_block_size
+  nc = T // tc
 
-  k_cmp = jnp.mean(
-      k.reshape(batch_size, num_heads, num_cmp_blocks, bs_cmp, head_dim),
-      axis=3,
-  )
-  v_cmp = jnp.mean(
-      v.reshape(batch_size, num_heads, num_cmp_blocks, bs_cmp, head_dim),
-      axis=3,
-  )
+  k_cmp = jnp.mean(k.reshape(B, H, nc, tc, D), axis=3)
+  v_cmp = jnp.mean(v.reshape(B, H, nc, tc, D), axis=3)
 
   logits = (
       jnp.einsum(
@@ -72,13 +70,13 @@ def _compute_cmp_branch(
       * scale
   )
 
-  q_pos = jnp.arange(seq_len)[:, None]
-  c_pos = (jnp.arange(num_cmp_blocks) * bs_cmp)[None, :]
-  causal_mask = (c_pos + bs_cmp - 1) <= q_pos
+  q_pos = jnp.arange(T)[:, None]
+  c_pos = (jnp.arange(nc) * tc)[None, :]
+  causal_mask = (c_pos + tc - 1) <= q_pos
 
   logits = jnp.where(causal_mask[None, None], logits, -1e9)
   weights = jax.nn.softmax(logits, axis=-1)
-  weights = jnp.where((q_pos >= bs_cmp - 1)[None, None], weights, 0.0)
+  weights = jnp.where((q_pos >= tc - 1)[None, None], weights, 0.0)
   return jnp.einsum(
       "bhtc,bhcd->bhtd",
       weights,
@@ -89,45 +87,47 @@ def _compute_cmp_branch(
 
 
 def _flash_slc_kernel(
-    # Scalar prefetch (SMEM).
-    topk_smem_ref,  # [B, H, NB, K_eff] int32
-    # Inputs (VMEM).
-    q_vmem_ref,  # [1, 1, 1, BQ, D] dtype
-    k_vmem_ref,  # [1, 1, 1, BQ, D] dtype
-    v_vmem_ref,  # [1, 1, 1, BQ, D] dtype
-    # Outputs (VMEM).
-    o_vmem_ref,  # [1, 1, 1, BQ, D] dtype
-    # Scratch (VMEM).
-    m_scratch_ref,  # [BQ, D] float32
-    l_scratch_ref,  # [BQ, D] float32
-    o_scratch_ref,  # [BQ, D] float32
+    # Inputs.
+    topk_smem_ref,  # [B, H, nt, tk] i32         full array in SMEM
+    q_vmem_ref,     # [1, 1, 1, tt, D] f32       one query block in VMEM
+    k_vmem_ref,     # [1, 1, 1, tt, D] f32       routed KV block in VMEM
+    v_vmem_ref,     # [1, 1, 1, tt, D] f32       routed KV block in VMEM
+    # Outputs.
+    o_vmem_ref,     # [1, 1, 1, tt, D] f32       one output block in VMEM
+    # Scratch.
+    m_scratch_ref,  # [tt, D] f32                running row-max across nk
+    l_scratch_ref,  # [tt, D] f32                running row-sum across nk
+    o_scratch_ref,  # [tt, D] f32                unnormalized output across nk
     *,
     scale: float,
+    nk: int,
 ) -> None:
-  # Dimensions.
-  q_idx = pl.program_id(2)
-  s_idx = pl.program_id(3)
-  block_q = q_vmem_ref.shape[3]
-  head_dim = q_vmem_ref.shape[4]
-  effective_topk = topk_smem_ref.shape[3]
+  del topk_smem_ref
+  q_i = pl.program_id(2)
+  s_i = pl.program_id(3)
+  _, _, _, tt, D = q_vmem_ref.shape
 
-  @pl.when(s_idx == 0)
-  def _init_diag():
-    q_i = q_vmem_ref[0, 0, 0].astype(jnp.float32)
-    k_j = k_vmem_ref[0, 0, 0].astype(jnp.float32)
-    v_j = v_vmem_ref[0, 0, 0].astype(jnp.float32)
+  # Step s_i == 0 processes the causal diagonal block (kv_block == q_i) to seed
+  # the online softmax accumulators without needing an extra zero-init pass.
+  @pl.when(s_i == 0)
+  def _():
+    q_tile = q_vmem_ref[0, 0, 0].astype(jnp.float32)
+    k_tile = k_vmem_ref[0, 0, 0].astype(jnp.float32)
+    v_tile = v_vmem_ref[0, 0, 0].astype(jnp.float32)
 
+    # Accumulate in f32 with HIGHEST precision so MXU bf16 rounding does not
+    # drift against the f32 reference across long block reductions.
     qk = (
         jnp.matmul(
-            q_i,
-            k_j.T,
+            q_tile,
+            k_tile.T,
             preferred_element_type=jnp.float32,
             precision=jax.lax.Precision.HIGHEST,
         )
         * scale
     )
-    row_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 0)
-    col_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 1)
+    row_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 0)
+    col_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 1)
     qk = jnp.where(col_idx <= row_idx, qk, -1e9)
 
     m_curr = jnp.max(qk, axis=-1, keepdims=True)
@@ -135,25 +135,29 @@ def _flash_slc_kernel(
     l_curr = jnp.sum(p, axis=-1, keepdims=True)
     o_curr = jnp.matmul(
         p,
-        v_j,
+        v_tile,
         preferred_element_type=jnp.float32,
         precision=jax.lax.Precision.HIGHEST,
     )
 
-    m_scratch_ref[...] = jnp.broadcast_to(m_curr, (block_q, head_dim))
-    l_scratch_ref[...] = jnp.broadcast_to(l_curr, (block_q, head_dim))
+    # Broadcast 1D row statistics across D so VMEM scratch buffers maintain
+    # 2D [sublane, lane] alignment without sublane relayout overhead.
+    m_scratch_ref[...] = jnp.broadcast_to(m_curr, (tt, D))
+    l_scratch_ref[...] = jnp.broadcast_to(l_curr, (tt, D))
     o_scratch_ref[...] = o_curr
 
-  @pl.when((s_idx > 0) & ((s_idx - 1) < q_idx))
-  def _acc_hist():
-    q_i = q_vmem_ref[0, 0, 0].astype(jnp.float32)
-    k_j = k_vmem_ref[0, 0, 0].astype(jnp.float32)
-    v_j = v_vmem_ref[0, 0, 0].astype(jnp.float32)
+  # Steps s_i > 0 stream the tk routed historical blocks; only blocks strictly
+  # preceding q_i (s_i - 1 < q_i) are causally valid.
+  @pl.when((s_i > 0) & ((s_i - 1) < q_i))
+  def _():
+    q_tile = q_vmem_ref[0, 0, 0].astype(jnp.float32)
+    k_tile = k_vmem_ref[0, 0, 0].astype(jnp.float32)
+    v_tile = v_vmem_ref[0, 0, 0].astype(jnp.float32)
 
     qk = (
         jnp.matmul(
-            q_i,
-            k_j.T,
+            q_tile,
+            k_tile.T,
             preferred_element_type=jnp.float32,
             precision=jax.lax.Precision.HIGHEST,
         )
@@ -163,19 +167,15 @@ def _flash_slc_kernel(
     l_prev = l_scratch_ref[...]
     o_prev = o_scratch_ref[...]
 
-    m_curr = jnp.broadcast_to(
-        jnp.max(qk, axis=-1, keepdims=True), (block_q, head_dim)
-    )
+    m_curr = jnp.broadcast_to(jnp.max(qk, axis=-1, keepdims=True), (tt, D))
     m_new = jnp.maximum(m_prev, m_curr)
     alpha = jnp.exp(m_prev - m_new)
     p = jnp.exp(qk - m_new[:, :1])
-    l_curr = jnp.broadcast_to(
-        jnp.sum(p, axis=-1, keepdims=True), (block_q, head_dim)
-    )
+    l_curr = jnp.broadcast_to(jnp.sum(p, axis=-1, keepdims=True), (tt, D))
     l_new = alpha * l_prev + l_curr
     o_new = alpha * o_prev + jnp.matmul(
         p,
-        v_j,
+        v_tile,
         preferred_element_type=jnp.float32,
         precision=jax.lax.Precision.HIGHEST,
     )
@@ -184,8 +184,8 @@ def _flash_slc_kernel(
     l_scratch_ref[...] = l_new
     o_scratch_ref[...] = o_new
 
-  @pl.when(s_idx == effective_topk)
-  def _finalize():
+  @pl.when(s_i == nk - 1)
+  def _():
     o_final = o_scratch_ref[...] / l_scratch_ref[...]
     o_vmem_ref[0, 0, 0] = o_final.astype(o_vmem_ref.dtype)
 
@@ -200,14 +200,15 @@ def _compute_slc_pallas(
     interpret: bool | None = None,
 ) -> jax.Array:
   """Computes fine-grained block selection branch via Pallas TPU kernel."""
-  batch_size, num_heads, seq_len, head_dim = q.shape
-  block_q = chunk_size
-  num_q_blocks = seq_len // block_q
-  effective_topk = min(topk, num_q_blocks)
+  B, H, T, D = q.shape
+  tt = chunk_size
+  nt = T // tt
+  tk = min(topk, nt)
+  nk = tk + 1
 
-  q_blocks = q.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
-  k_blocks = k.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
-  v_blocks = v.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
+  q_blocks = q.reshape(B, H, nt, tt, D)
+  k_blocks = k.reshape(B, H, nt, tt, D)
+  v_blocks = v.reshape(B, H, nt, tt, D)
 
   q_mean = jnp.mean(q_blocks, axis=3)
   k_mean = jnp.mean(k_blocks, axis=3)
@@ -221,35 +222,35 @@ def _compute_slc_pallas(
       )
       * scale
   )
-  q_idx = jnp.arange(num_q_blocks)[:, None]
-  k_idx = jnp.arange(num_q_blocks)[None, :]
+  q_idx = jnp.arange(nt)[:, None]
+  k_idx = jnp.arange(nt)[None, :]
   historical_mask = k_idx < q_idx
   masked_routing = jnp.where(
       historical_mask[None, None], routing_scores, -jnp.inf
   )
-  _, topk_idx = jax.lax.top_k(masked_routing, effective_topk)
+  _, topk_idx = jax.lax.top_k(masked_routing, tk)
   topk_idx = jax.lax.stop_gradient(topk_idx).astype(jnp.int32)
 
-  def _q_index_map(b_i, h_i, q_i, s_i, topk_ref):
-    del s_i, topk_ref
+  def _q_index_map(b_i, h_i, q_i, s_i, topk_smem_ref):
+    del s_i, topk_smem_ref
     return (b_i, h_i, q_i, 0, 0)
 
-  def _kv_index_map(b_i, h_i, q_i, s_i, topk_ref):
-    routed_idx = topk_ref[b_i, h_i, q_i, jnp.maximum(s_i - 1, 0)]
+  def _kv_index_map(b_i, h_i, q_i, s_i, topk_smem_ref):
+    routed_idx = topk_smem_ref[b_i, h_i, q_i, jnp.maximum(s_i - 1, 0)]
     kv_block_idx = jnp.where(s_i == 0, q_i, routed_idx)
     return (b_i, h_i, kv_block_idx, 0, 0)
 
-  q_spec = pl.BlockSpec((1, 1, 1, block_q, head_dim), _q_index_map)
-  kv_spec = pl.BlockSpec((1, 1, 1, block_q, head_dim), _kv_index_map)
-  scratch_shape = pltpu.VMEM((block_q, head_dim), jnp.float32)
+  q_spec = pl.BlockSpec((1, 1, 1, tt, D), _q_index_map)
+  kv_spec = pl.BlockSpec((1, 1, 1, tt, D), _kv_index_map)
+  scratch_shape = pltpu.VMEM((tt, D), jnp.float32)
 
   if interpret is None:
     interpret = jax.default_backend() != "tpu"
   out_blocks = pl.pallas_call(
-      functools.partial(_flash_slc_kernel, scale=scale),
+      functools.partial(_flash_slc_kernel, scale=scale, nk=nk),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=1,
-          grid=(batch_size, num_heads, num_q_blocks, effective_topk + 1),
+          grid=(B, H, nt, nk),
           in_specs=[q_spec, kv_spec, kv_spec],
           out_specs=q_spec,
           scratch_shapes=[scratch_shape, scratch_shape, scratch_shape],
@@ -257,54 +258,51 @@ def _compute_slc_pallas(
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "parallel", "parallel", "arbitrary"),
       ),
-      out_shape=jax.ShapeDtypeStruct(
-          (batch_size, num_heads, num_q_blocks, block_q, head_dim),
-          dtype=q.dtype,
-      ),
+      out_shape=jax.ShapeDtypeStruct((B, H, nt, tt, D), dtype=q.dtype),
       interpret=interpret,
   )(topk_idx, q_blocks, k_blocks, v_blocks)
-  return out_blocks.reshape(batch_size, num_heads, seq_len, head_dim)
+  return out_blocks.reshape(B, H, T, D)
 
 
 def _flash_swa_kernel(
-    # Inputs (VMEM).
-    q_vmem_ref,  # [1, 1, 1, BQ, D] dtype
-    k_vmem_ref,  # [1, 1, 1, BQ, D] dtype
-    v_vmem_ref,  # [1, 1, 1, BQ, D] dtype
-    # Outputs (VMEM).
-    o_vmem_ref,  # [1, 1, 1, BQ, D] dtype
-    # Scratch (VMEM).
-    m_scratch_ref,  # [BQ, D] float32
-    l_scratch_ref,  # [BQ, D] float32
-    o_scratch_ref,  # [BQ, D] float32
+    # Inputs.
+    q_ref,          # [1, 1, 1, tt, D] f32       one query block
+    k_ref,          # [1, 1, 1, tt, D] f32       window KV block at q_i - w_i
+    v_ref,          # [1, 1, 1, tt, D] f32       window KV block at q_i - w_i
+    # Outputs.
+    o_ref,          # [1, 1, 1, tt, D] f32       one output block
+    # Scratch.
+    m_scratch_ref,  # [tt, D] f32                running row-max across nw
+    l_scratch_ref,  # [tt, D] f32                running row-sum across nw
+    o_scratch_ref,  # [tt, D] f32                unnormalized output across nw
     *,
     scale: float,
     window: int,
-    num_win_blocks: int,
+    nw: int,
 ) -> None:
-  # Dimensions.
-  q_idx = pl.program_id(2)
-  w_step = pl.program_id(3)
-  block_q = q_vmem_ref.shape[3]
-  head_dim = q_vmem_ref.shape[4]
+  q_i = pl.program_id(2)
+  w_i = pl.program_id(3)
+  _, _, _, tt, D = q_ref.shape
 
-  @pl.when(w_step == 0)
-  def _init_diag():
-    q_i = q_vmem_ref[0, 0, 0].astype(jnp.float32)
-    k_j = k_vmem_ref[0, 0, 0].astype(jnp.float32)
-    v_j = v_vmem_ref[0, 0, 0].astype(jnp.float32)
+  # Step w_i == 0 processes the intra-block causal sliding window on the
+  # diagonal block and initializes the online softmax accumulators.
+  @pl.when(w_i == 0)
+  def _():
+    q_tile = q_ref[0, 0, 0].astype(jnp.float32)
+    k_tile = k_ref[0, 0, 0].astype(jnp.float32)
+    v_tile = v_ref[0, 0, 0].astype(jnp.float32)
 
     qk = (
         jnp.matmul(
-            q_i,
-            k_j.T,
+            q_tile,
+            k_tile.T,
             preferred_element_type=jnp.float32,
             precision=jax.lax.Precision.HIGHEST,
         )
         * scale
     )
-    row_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 0)
-    col_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 1)
+    row_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 0)
+    col_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 1)
     win_mask = (col_idx <= row_idx) & (col_idx >= row_idx - window)
     qk = jnp.where(win_mask, qk, -1e9)
 
@@ -313,33 +311,35 @@ def _flash_swa_kernel(
     l_curr = jnp.sum(p, axis=-1, keepdims=True)
     o_curr = jnp.matmul(
         p,
-        v_j,
+        v_tile,
         preferred_element_type=jnp.float32,
         precision=jax.lax.Precision.HIGHEST,
     )
 
-    m_scratch_ref[...] = jnp.broadcast_to(m_curr, (block_q, head_dim))
-    l_scratch_ref[...] = jnp.broadcast_to(l_curr, (block_q, head_dim))
+    m_scratch_ref[...] = jnp.broadcast_to(m_curr, (tt, D))
+    l_scratch_ref[...] = jnp.broadcast_to(l_curr, (tt, D))
     o_scratch_ref[...] = o_curr
 
-  @pl.when((w_step > 0) & (q_idx >= w_step))
-  def _acc_prev():
-    q_i = q_vmem_ref[0, 0, 0].astype(jnp.float32)
-    k_j = k_vmem_ref[0, 0, 0].astype(jnp.float32)
-    v_j = v_vmem_ref[0, 0, 0].astype(jnp.float32)
+  # Steps w_i > 0 accumulate the preceding blocks (q_i - w_i) overlapped by the
+  # causal sliding window of width W.
+  @pl.when((w_i > 0) & (q_i >= w_i))
+  def _():
+    q_tile = q_ref[0, 0, 0].astype(jnp.float32)
+    k_tile = k_ref[0, 0, 0].astype(jnp.float32)
+    v_tile = v_ref[0, 0, 0].astype(jnp.float32)
 
     qk = (
         jnp.matmul(
-            q_i,
-            k_j.T,
+            q_tile,
+            k_tile.T,
             preferred_element_type=jnp.float32,
             precision=jax.lax.Precision.HIGHEST,
         )
         * scale
     )
-    row_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 0)
-    col_idx = jax.lax.broadcasted_iota(jnp.int32, (block_q, block_q), 1)
-    dist = w_step * block_q + row_idx - col_idx
+    row_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 0)
+    col_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 1)
+    dist = w_i * tt + row_idx - col_idx
     win_mask = dist <= window
     qk = jnp.where(win_mask, qk, -1e9)
 
@@ -347,19 +347,15 @@ def _flash_swa_kernel(
     l_prev = l_scratch_ref[...]
     o_prev = o_scratch_ref[...]
 
-    m_curr = jnp.broadcast_to(
-        jnp.max(qk, axis=-1, keepdims=True), (block_q, head_dim)
-    )
+    m_curr = jnp.broadcast_to(jnp.max(qk, axis=-1, keepdims=True), (tt, D))
     m_new = jnp.maximum(m_prev, m_curr)
     alpha = jnp.exp(m_prev - m_new)
     p = jnp.where(win_mask, jnp.exp(qk - m_new[:, :1]), 0.0)
-    l_curr = jnp.broadcast_to(
-        jnp.sum(p, axis=-1, keepdims=True), (block_q, head_dim)
-    )
+    l_curr = jnp.broadcast_to(jnp.sum(p, axis=-1, keepdims=True), (tt, D))
     l_new = alpha * l_prev + l_curr
     o_new = alpha * o_prev + jnp.matmul(
         p,
-        v_j,
+        v_tile,
         preferred_element_type=jnp.float32,
         precision=jax.lax.Precision.HIGHEST,
     )
@@ -368,10 +364,10 @@ def _flash_swa_kernel(
     l_scratch_ref[...] = l_new
     o_scratch_ref[...] = o_new
 
-  @pl.when(w_step == num_win_blocks)
-  def _finalize():
+  @pl.when(w_i == nw - 1)
+  def _():
     o_final = o_scratch_ref[...] / l_scratch_ref[...]
-    o_vmem_ref[0, 0, 0] = o_final.astype(o_vmem_ref.dtype)
+    o_ref[0, 0, 0] = o_final.astype(o_ref.dtype)
 
 
 def _compute_swa_pallas(
@@ -384,26 +380,27 @@ def _compute_swa_pallas(
     interpret: bool | None = None,
 ) -> jax.Array:
   """Computes local sliding-window attention branch via Pallas TPU kernel."""
-  batch_size, num_heads, seq_len, head_dim = q.shape
-  block_q = chunk_size
-  num_q_blocks = seq_len // block_q
-  num_win_blocks = min(math.ceil(window / block_q), num_q_blocks - 1)
+  B, H, T, D = q.shape
+  tt = chunk_size
+  nt = T // tt
+  tw = min(math.ceil(window / tt), nt - 1)
+  nw = tw + 1
 
-  q_blocks = q.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
-  k_blocks = k.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
-  v_blocks = v.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
+  q_blocks = q.reshape(B, H, nt, tt, D)
+  k_blocks = k.reshape(B, H, nt, tt, D)
+  v_blocks = v.reshape(B, H, nt, tt, D)
 
-  def _q_index_map(b_i, h_i, q_i, w_step):
-    del w_step
+  def _q_index_map(b_i, h_i, q_i, w_i):
+    del w_i
     return (b_i, h_i, q_i, 0, 0)
 
-  def _kv_index_map(b_i, h_i, q_i, w_step):
-    kv_idx = jnp.maximum(q_i - w_step, 0)
+  def _kv_index_map(b_i, h_i, q_i, w_i):
+    kv_idx = jnp.maximum(q_i - w_i, 0)
     return (b_i, h_i, kv_idx, 0, 0)
 
-  q_spec = pl.BlockSpec((1, 1, 1, block_q, head_dim), _q_index_map)
-  kv_spec = pl.BlockSpec((1, 1, 1, block_q, head_dim), _kv_index_map)
-  scratch_shape = pltpu.VMEM((block_q, head_dim), jnp.float32)
+  q_spec = pl.BlockSpec((1, 1, 1, tt, D), _q_index_map)
+  kv_spec = pl.BlockSpec((1, 1, 1, tt, D), _kv_index_map)
+  scratch_shape = pltpu.VMEM((tt, D), jnp.float32)
 
   if interpret is None:
     interpret = jax.default_backend() != "tpu"
@@ -412,22 +409,19 @@ def _compute_swa_pallas(
           _flash_swa_kernel,
           scale=scale,
           window=window,
-          num_win_blocks=num_win_blocks,
+          nw=nw,
       ),
-      grid=(batch_size, num_heads, num_q_blocks, num_win_blocks + 1),
+      grid=(B, H, nt, nw),
       in_specs=[q_spec, kv_spec, kv_spec],
       out_specs=q_spec,
       scratch_shapes=[scratch_shape, scratch_shape, scratch_shape],
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "parallel", "parallel", "arbitrary"),
       ),
-      out_shape=jax.ShapeDtypeStruct(
-          (batch_size, num_heads, num_q_blocks, block_q, head_dim),
-          dtype=q.dtype,
-      ),
+      out_shape=jax.ShapeDtypeStruct((B, H, nt, tt, D), dtype=q.dtype),
       interpret=interpret,
   )(q_blocks, k_blocks, v_blocks)
-  return out_blocks.reshape(batch_size, num_heads, seq_len, head_dim)
+  return out_blocks.reshape(B, H, T, D)
 
 
 def nsa_pallas_fwd(
@@ -451,28 +445,28 @@ def nsa_pallas_fwd(
         f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape},"
         f" v={v.shape}"
     )
-  seq_len = q.shape[2]
-  if seq_len % chunk_size != 0:
+  _, _, T, D = q.shape
+  if T % chunk_size != 0:
     raise ValueError(
-        f"Sequence length ({seq_len}) must be divisible by chunk_size"
-        f" ({chunk_size})."
+        f"Sequence length ({T}) must be divisible by chunk_size ({chunk_size})."
     )
-  if seq_len % cmp_block_size != 0:
+  if T % cmp_block_size != 0:
     raise ValueError(
-        f"Sequence length ({seq_len}) must be divisible by cmp_block_size"
+        f"Sequence length ({T}) must be divisible by cmp_block_size"
         f" ({cmp_block_size})."
     )
 
   orig_dtype = q.dtype
   if scale is None:
-    head_dim = q.shape[-1]
-    scale = head_dim ** -0.5
+    scale = D ** -0.5
 
   q_f32 = q.astype(jnp.float32)
   k_f32 = k.astype(jnp.float32)
   v_f32 = v.astype(jnp.float32)
 
-  o_cmp = _compute_cmp_branch(q_f32, k_f32, v_f32, scale, bs_cmp=cmp_block_size)
+  o_cmp = _compute_cmp_branch(
+      q_f32, k_f32, v_f32, scale, cmp_block_size=cmp_block_size
+  )
   o_slc = _compute_slc_pallas(
       q_f32,
       k_f32,

@@ -15,6 +15,12 @@
 
 """Native Sparse Attention (NSA) API."""
 
+# Dimensions.
+#   B  batch size
+#   H  number of attention heads
+#   T  sequence length
+#   D  head dimension
+
 from collections.abc import Sequence
 from typing import Final, Literal, TypeAlias
 
@@ -86,14 +92,16 @@ def native_sparse_attention(
       device.
   """
   if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATIONS
+    implementations: Sequence[Implementation] = _DEFAULT_IMPLEMENTATIONS
   elif isinstance(implementation, str):
-    implementation = (implementation,)
+    implementations = (implementation,)
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
+  else:
+    implementations = implementation
 
   errors = []
-  for impl in implementation:
+  for impl in implementations:
     if impl == "mosaic":
       impl = "mosaic_tpu"
     if impl not in IMPLEMENTATIONS:
@@ -114,7 +122,7 @@ def native_sparse_attention(
           scale=scale,
       )
     except NotImplementedError as e:
-      if len(implementation) == 1:
+      if len(implementations) == 1:
         raise
       errors.append(e)
 

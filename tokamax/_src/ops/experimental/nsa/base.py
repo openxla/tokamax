@@ -15,11 +15,26 @@
 
 """Base operator class and reference for Native Sparse Attention (NSA)."""
 
+# Dimensions.
+#   B   batch size
+#   H   number of attention heads
+#   T   sequence length
+#   D   head dimension
+#   W   local causal sliding window size
+#   tt  query/KV block tile extent along T (chunk_size)
+#   nt  number of query/KV blocks along T (nt = T // tt)
+#   tc  compression block tile extent along T (cmp_block_size)
+#   nc  number of compressed blocks along T (nc = T // tc)
+#   tk  number of selected historical blocks (min(topk, nt))
+#   nk  selection block extent per query block (nk = tk + 1)
+
 import dataclasses
 from typing import Any, TypeAlias, TypeVar
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from typing_extensions import override
 
@@ -33,20 +48,15 @@ def _compute_cmp_reference(
     k: jax.Array,
     v: jax.Array,
     scale: float,
-    bs_cmp: int = 64,
+    cmp_block_size: int = 64,
 ) -> jax.Array:
   """Coarse block-compression attention branch."""
-  batch_size, num_heads, seq_len, head_dim = q.shape
-  num_cmp_blocks = seq_len // bs_cmp
+  B, H, T, D = q.shape
+  tc = cmp_block_size
+  nc = T // tc
 
-  k_cmp = jnp.mean(
-      k.reshape(batch_size, num_heads, num_cmp_blocks, bs_cmp, head_dim),
-      axis=3,
-  )
-  v_cmp = jnp.mean(
-      v.reshape(batch_size, num_heads, num_cmp_blocks, bs_cmp, head_dim),
-      axis=3,
-  )
+  k_cmp = jnp.mean(k.reshape(B, H, nc, tc, D), axis=3)
+  v_cmp = jnp.mean(v.reshape(B, H, nc, tc, D), axis=3)
 
   logits = (
       jnp.einsum(
@@ -59,13 +69,13 @@ def _compute_cmp_reference(
       * scale
   )
 
-  q_pos = jnp.arange(seq_len)[:, None]
-  c_pos = (jnp.arange(num_cmp_blocks) * bs_cmp)[None, :]
-  causal_mask = (c_pos + bs_cmp - 1) <= q_pos
+  q_pos = jnp.arange(T)[:, None]
+  c_pos = (jnp.arange(nc) * tc)[None, :]
+  causal_mask = (c_pos + tc - 1) <= q_pos
 
   logits = jnp.where(causal_mask[None, None], logits, -1e9)
   weights = jax.nn.softmax(logits, axis=-1)
-  weights = jnp.where((q_pos >= bs_cmp - 1)[None, None], weights, 0.0)
+  weights = jnp.where((q_pos >= tc - 1)[None, None], weights, 0.0)
   return jnp.einsum(
       "bhtc,bhcd->bhtd",
       weights,
@@ -84,15 +94,15 @@ def _compute_slc_reference(
     chunk_size: int = 256,
 ) -> jax.Array:
   """Fine-grained top-k block selection attention branch."""
-  batch_size, num_heads, seq_len, head_dim = q.shape
-  block_q = chunk_size
-  num_q_blocks = seq_len // block_q
-  effective_topk = min(topk, num_q_blocks)
-  block_k_sub = (effective_topk + 1) * block_q
+  B, H, T, D = q.shape
+  tt = chunk_size
+  nt = T // tt
+  tk = min(topk, nt)
+  nk = tk + 1
 
-  q_blocks = q.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
-  k_blocks = k.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
-  v_blocks = v.reshape(batch_size, num_heads, num_q_blocks, block_q, head_dim)
+  q_blocks = q.reshape(B, H, nt, tt, D)
+  k_blocks = k.reshape(B, H, nt, tt, D)
+  v_blocks = v.reshape(B, H, nt, tt, D)
 
   q_mean = jnp.mean(q_blocks, axis=3)
   k_mean = jnp.mean(k_blocks, axis=3)
@@ -107,37 +117,35 @@ def _compute_slc_reference(
       )
       * scale
   )
-  q_idx = jnp.arange(num_q_blocks)[:, None]
-  k_idx = jnp.arange(num_q_blocks)[None, :]
+  q_idx = jnp.arange(nt)[:, None]
+  k_idx = jnp.arange(nt)[None, :]
   historical_mask = k_idx < q_idx
   masked_routing = jnp.where(
       historical_mask[None, None], routing_scores, -jnp.inf
   )
-  _, topk_idx = jax.lax.top_k(masked_routing, effective_topk)
+  _, topk_idx = jax.lax.top_k(masked_routing, tk)
   topk_idx = jax.lax.stop_gradient(topk_idx)
 
   def gather_head(x_h: jax.Array, idx_h: jax.Array) -> jax.Array:
     diag = x_h[:, None, :, :]
     hist = x_h[idx_h]
-    return jnp.concatenate([diag, hist], axis=1).reshape(
-        num_q_blocks, block_k_sub, head_dim
-    )
+    return jnp.concatenate([diag, hist], axis=1).reshape(nt, nk * tt, D)
 
   gather_fn = jax.vmap(jax.vmap(gather_head))
   k_sub = gather_fn(k_blocks, topk_idx)
   v_sub = gather_fn(v_blocks, topk_idx)
 
-  causal_diag = jnp.tril(jnp.ones((block_q, block_q), dtype=bool))
-  ranks = jnp.arange(effective_topk)
+  causal_diag = jnp.tril(jnp.ones((tt, tt), dtype=bool))
+  ranks = jnp.arange(tk)
 
-  def make_mask_i(block_idx: int | Any) -> jax.Array:
+  def make_mask_i(q_i: int | Any) -> jax.Array:
     valid_hist = jnp.broadcast_to(
-        jnp.repeat(ranks < block_idx, block_q)[None, :],
-        (block_q, effective_topk * block_q),
+        jnp.repeat(ranks < q_i, tt)[None, :],
+        (tt, tk * tt),
     )
     return jnp.concatenate([causal_diag, valid_hist], axis=1)
 
-  mask_sub = jax.vmap(make_mask_i)(jnp.arange(num_q_blocks))
+  mask_sub = jax.vmap(make_mask_i)(jnp.arange(nt))
 
   logits = (
       jnp.einsum(
@@ -158,7 +166,7 @@ def _compute_slc_reference(
       preferred_element_type=jnp.float32,
       precision=jax.lax.Precision.HIGHEST,
   )
-  return out_blocks.reshape(batch_size, num_heads, seq_len, head_dim)
+  return out_blocks.reshape(B, H, T, D)
 
 
 def _compute_swa_reference(
@@ -169,7 +177,7 @@ def _compute_swa_reference(
     window: int = 128,
 ) -> jax.Array:
   """Local sliding-window attention branch."""
-  seq_len = q.shape[2]
+  _, _, T, _ = q.shape
   logits = (
       jnp.einsum(
           "bhtd,bhsd->bhts",
@@ -181,8 +189,8 @@ def _compute_swa_reference(
       * scale
   )
 
-  q_pos = jnp.arange(seq_len)[:, None]
-  k_pos = jnp.arange(seq_len)[None, :]
+  q_pos = jnp.arange(T)[:, None]
+  k_pos = jnp.arange(T)[None, :]
   win_mask = (k_pos <= q_pos) & (k_pos >= q_pos - window)
 
   logits = jnp.where(win_mask[None, None], logits, -1e9)
@@ -216,29 +224,36 @@ def nsa_reference(
         f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape},"
         f" v={v.shape}"
     )
-  seq_len = q.shape[2]
-  if seq_len % chunk_size != 0:
+  if chunk_size <= 0:
+    raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+  if topk <= 0:
+    raise ValueError(f"topk must be positive, got {topk}.")
+  if window <= 0:
+    raise ValueError(f"window must be positive, got {window}.")
+  if cmp_block_size <= 0:
+    raise ValueError(f"cmp_block_size must be positive, got {cmp_block_size}.")
+
+  _, _, T, D = q.shape
+  if T % chunk_size != 0:
     raise ValueError(
-        f"Sequence length ({seq_len}) must be divisible by chunk_size"
-        f" ({chunk_size})."
+        f"Sequence length ({T}) must be divisible by chunk_size ({chunk_size})."
     )
-  if seq_len % cmp_block_size != 0:
+  if T % cmp_block_size != 0:
     raise ValueError(
-        f"Sequence length ({seq_len}) must be divisible by cmp_block_size"
+        f"Sequence length ({T}) must be divisible by cmp_block_size"
         f" ({cmp_block_size})."
     )
 
   orig_dtype = q.dtype
   if scale is None:
-    head_dim = q.shape[-1]
-    scale = head_dim ** -0.5
+    scale = D ** -0.5
 
   q_f32 = q.astype(jnp.float32)
   k_f32 = k.astype(jnp.float32)
   v_f32 = v.astype(jnp.float32)
 
   o_cmp = _compute_cmp_reference(
-      q_f32, k_f32, v_f32, scale, bs_cmp=cmp_block_size
+      q_f32, k_f32, v_f32, scale, cmp_block_size=cmp_block_size
   )
   o_slc = _compute_slc_reference(
       q_f32, k_f32, v_f32, scale, topk=topk, chunk_size=chunk_size
@@ -272,15 +287,16 @@ class NativeSparseAttention[C](op.Op[Any, Output, Residuals, C, None]):
 
   supports_symbolic_shapes = False
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      g_cmp: jax.Array | None = None,
-      g_slc: jax.Array | None = None,
-      g_swa: jax.Array | None = None,
+      q: Float[Array, "B H T D"],
+      k: Float[Array, "B H T D"],
+      v: Float[Array, "B H T D"],
+      g_cmp: Float[Array, "B H T D"] | None = None,
+      g_slc: Float[Array, "B H T D"] | None = None,
+      g_swa: Float[Array, "B H T D"] | None = None,
       *,
       chunk_size: int = 256,
       topk: int = 4,
@@ -289,7 +305,7 @@ class NativeSparseAttention[C](op.Op[Any, Output, Residuals, C, None]):
       scale: float | None = None,
       config: C | None = None,
       return_residuals: bool = False,
-  ) -> tuple[Output, None]:
+  ) -> tuple[Float[Array, "B H T D"], None]:
     del config, return_residuals
     out, _ = nsa_reference(
         q,
