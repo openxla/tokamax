@@ -259,11 +259,14 @@ def custom_buffered_pallas_call(
       # bind smem and scratch to the pipeline body
       # specify dimension semantic from the scalar prefetch grid and emit
       pltpu.emit_pipeline(
-          lambda *args: kernel(*smem_refs, *args, *scratch_refs),
+          lambda step, *args: kernel(
+              step, grid, *smem_refs, *args, *scratch_refs
+          ),
           grid=grid,  # pyrefly: ignore[bad-argument-type]
           in_specs=in_specs_,
           out_specs=out_specs_,
           dimension_semantics=compiler_params.dimension_semantics,  # pyrefly: ignore[bad-argument-type]
+          _explicit_indices=True,
       )(*input_output_refs)
 
     bs_smem = pl.BlockSpec(memory_space=pltpu.SMEM)

@@ -468,6 +468,57 @@ class DotProductAttentionXlaTest(DotProductAttentionTest):
     chex.assert_trees_all_close(out, squeeze(out_b))
     chex.assert_trees_all_close(grads, tuple(map(squeeze, grads_b)))
 
+  def test_multidimensional_batch_seq_lengths(self):
+    batch_dim_0 = 2
+    batch_dim_1 = 3
+    seq_len = 16
+    num_heads = 2
+    head_dim = 32
+    total_batch = batch_dim_0 * batch_dim_1
+    shape_2d = (batch_dim_0, batch_dim_1, seq_len, num_heads, head_dim)
+    shape_1d = (total_batch, seq_len, num_heads, head_dim)
+
+    q_input = jax.random.normal(
+        jax.random.key(10), shape_2d, dtype=jnp.float32
+    )
+    k_input = jax.random.normal(
+        jax.random.key(11), shape_2d, dtype=jnp.float32
+    )
+    v_input = jax.random.normal(
+        jax.random.key(12), shape_2d, dtype=jnp.float32
+    )
+
+    query_seq_lengths = jnp.array([[4, 8, 12], [6, 10, 16]], dtype=jnp.int32)
+    kv_seq_lengths = jnp.array([[6, 10, 14], [8, 12, 16]], dtype=jnp.int32)
+
+    q_flat = jnp.reshape(q_input, shape_1d)
+    k_flat = jnp.reshape(k_input, shape_1d)
+    v_flat = jnp.reshape(v_input, shape_1d)
+    q_len_flat = jnp.reshape(query_seq_lengths, (total_batch,))
+    kv_len_flat = jnp.reshape(kv_seq_lengths, (total_batch,))
+
+    expected_out_flat = api.dot_product_attention(
+        q_flat,
+        k_flat,
+        v_flat,
+        query_seq_lengths=q_len_flat,
+        key_value_seq_lengths=kv_len_flat,
+        implementation="xla",
+    )
+    expected_out = jnp.reshape(expected_out_flat, shape_2d)
+
+    actual_out = api.dot_product_attention(
+        q_input,
+        k_input,
+        v_input,
+        query_seq_lengths=query_seq_lengths,
+        key_value_seq_lengths=kv_seq_lengths,
+        implementation="xla",
+    )
+    self.assertTrue(
+        jnp.allclose(actual_out, expected_out, atol=1e-3, rtol=1e-3)
+    )
+
 
 class DotProductAttentionXlaChunkedTest(DotProductAttentionTest):
   IMPL = 'xla_chunked'

@@ -298,6 +298,7 @@ def make_tgmm_configs(
 
 
 def tgmm_inner_kernel(
+    step: pltpu.PipelineStep,
     tiled_lhs_ref: jax.Array,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
     tiled_rhs_ref: OperandRef,
@@ -307,6 +308,7 @@ def tgmm_inner_kernel(
     acc_ref: jax.Array,
     metadata_ref: gmm_v2.MetadataRef,
     *,
+    num_gm: jax.Array,
     cfgs: gmm_v2.GmmConfigs,
 ):
   """Inner kernel for TGMM computation.
@@ -316,12 +318,14 @@ def tgmm_inner_kernel(
   and accumulation across different group-major tiles.
 
   Args:
+    step: Current pipeline step.
     tiled_lhs_ref: Reference to the tiled LHS data.
     tiled_rhs_ref: OperandRef bundling the tiled RHS data ('.value') and its
       optional per-N scale ('.scale', None when there is no scale).
     tiled_out_ref: Reference to the tiled output buffer [None, tile_k, tile_n].
     acc_ref: Scratch memory for accumulation [tile_k, tile_n].
     metadata_ref: Contains metadata like group offsets and group IDs.
+    num_gm: Total number of group-major tiles.
     cfgs: GmmConfigs object containing kernel configurations.
   """
   # NB: grid=(num_n, num_k, num_gm)
@@ -329,7 +333,7 @@ def tgmm_inner_kernel(
 
   tiled_lhs_ref = tiled_lhs_ref.reshape(-1, tiled_lhs_ref.shape[-1])
   tiled_rhs_ref = tiled_rhs_ref.value.reshape(-1, tiled_rhs_ref.value.shape[-1])
-  gm_id = pl.program_id(2)
+  gm_id = step.index[2]
 
   # Mask out invalid rows in the LHS/RHS tiles.
   # The DMA loads tiles aligned to sublane boundaries, but the actual group
@@ -386,7 +390,7 @@ def tgmm_inner_kernel(
   )
   new_group = jnp.logical_or(is_first_gm, group_id_changed)
 
-  is_last_gm = gm_id == (pl.num_programs(2) - 1)
+  is_last_gm = gm_id == (num_gm - 1)
   next_gm_id = jnp.where(is_last_gm, gm_id, gm_id + 1)
   next_group_id = metadata_ref.gm_id_to_group_id[next_gm_id]
   cur_group_id = metadata_ref.gm_id_to_group_id[gm_id]
@@ -633,12 +637,13 @@ def tgmm_kernel_main(
       else (pltpu.PARALLEL, pltpu.PARALLEL, pltpu.ARBITRARY)
   )
   pipeline_fn = pltpu.emit_pipeline(
-      functools.partial(tgmm_inner_kernel, cfgs=cfgs),
+      functools.partial(tgmm_inner_kernel, num_gm=num_gm, cfgs=cfgs),
       grid=(num_n, num_k, num_gm),
       in_specs=in_specs,
       out_specs=out_specs,
       core_axis_name=core_axis_name,
       dimension_semantics=dimension_semantics,
+      _explicit_indices=True,
   )
   lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
   rhs_value = rhs_ref.value

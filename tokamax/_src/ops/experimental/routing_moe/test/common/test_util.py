@@ -58,20 +58,11 @@ def check_gmm_supported(
     )
 
 
-def check_output_reduce_supported(case: test_cases.Case) -> None:
-  """Skips the test if `case` exceeds `output_reduce` SMEM limits."""
-  if case.num_tokens >= 65536:
-    raise absltest.SkipTest(
-        "TODO: Support SMEM streaming in output_reduce for 64k tokens."
-    )
-
-
 def check_moe_supported(
     case: test_cases.Case, *, remote_scatter: bool = False
 ) -> None:
   """Skips the test if `case` or the mesh layout is unsupported."""
   check_gmm_supported(case)
-  check_output_reduce_supported(case)
   if remote_scatter and case.sharding.ep > 1 and case.sharding.tp > 1:
     raise absltest.SkipTest(
         "TODO: Support remote_scatter with hybrid parallelism."

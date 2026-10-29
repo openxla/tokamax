@@ -271,6 +271,7 @@ def _fused_fp8_matmul_kernel(
   sxq_out_spec = pl.BlockSpec((bm, SX_LANES), lambda a, b, c: (a, 0))
 
   def _load_xq(
+      step: pltpu.PipelineStep,
       x_vmem: jax.Ref,
       xq_out_vmem: jax.Ref | None,
       sxq_out_vmem: jax.Ref | None,
@@ -291,6 +292,7 @@ def _fused_fp8_matmul_kernel(
     per grid step and cost ~235 us at (32768, 3072, 4096).
 
     Args:
+      step: Current pipeline step.
       x_vmem: The `(bm, bk)` activation block.
       xq_out_vmem: The `(bm, bk)` FP8 residual output block, if requested.
       sxq_out_vmem: The `(bm, SX_LANES)` scale residual output block, if
@@ -299,8 +301,8 @@ def _fused_fp8_matmul_kernel(
     Returns:
       `(xq, sx)`: the FP8 tile and its `(bm, 1)` float32 row scales.
     """
-    nind = pl.program_id(1)
-    cind = pl.program_id(2)
+    nind = step.index[1]
+    cind = step.index[2]
 
     if xq_out_vmem is not None and sxq_out_vmem is not None:
       xq_out, sxq_out = xq_out_vmem, sxq_out_vmem
@@ -326,29 +328,29 @@ def _fused_fp8_matmul_kernel(
 
     return xq_cache[cind], sx_cache[cind]
 
-  def body_single_k(x_vmem, w_vmem, sw_vmem, o_vmem, *res_vmem):
+  def body_single_k(step, x_vmem, w_vmem, sw_vmem, o_vmem, *res_vmem):
     """Direct pass when `bk == k`: no accumulator needed."""
     xq_vmem, sxq_vmem = res_vmem if res_vmem else (None, None)
-    xq, sx = _load_xq(x_vmem, xq_vmem, sxq_vmem)
+    xq, sx = _load_xq(step, x_vmem, xq_vmem, sxq_vmem)
     xw = jnp.matmul(xq, w_vmem[...], preferred_element_type=jnp.float32)
     o_vmem[...] = (xw * (sx * sw_vmem[...])).astype(o_vmem.dtype)
 
-  def body_multi_k(x_vmem, w_vmem, sw_vmem, o_vmem, *res_vmem):
+  def body_multi_k(step, x_vmem, w_vmem, sw_vmem, o_vmem, *res_vmem):
     """Pipelined reduction over k blocks when `bk < k`."""
     xq_vmem, sxq_vmem = res_vmem if res_vmem else (None, None)
-    kind = pl.program_id(2)
+    kind = step.index[2]
 
     @pl.when(kind == 0)
     def _init():
       accum_vmem[...] = jnp.zeros_like(accum_vmem)
 
-    xq, sx = _load_xq(x_vmem, xq_vmem, sxq_vmem)
+    xq, sx = _load_xq(step, x_vmem, xq_vmem, sxq_vmem)
     xw = jnp.matmul(xq, w_vmem[...], preferred_element_type=jnp.float32)
     # Each k block is quantized against its own absmax, so the partial product
     # must be rescaled before it is accumulated.
     accum_vmem[...] += xw * (sx * sw_vmem[...])
 
-    @pl.when(kind == pl.num_programs(2) - 1)
+    @pl.when(kind == grid[2] - 1)
     def _write():
       o_vmem[...] = accum_vmem[...].astype(o_vmem.dtype)
 
@@ -374,6 +376,7 @@ def _fused_fp8_matmul_kernel(
       out_specs=out_specs,
       core_axis_name=_CORE_AXIS_NAME,
       dimension_semantics=dimension_semantics,
+      _explicit_indices=True,
   )(x_hbm, w_hbm, sw_hbm, *out_refs)
 
 

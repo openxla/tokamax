@@ -454,7 +454,14 @@ def flash_attention_kernel(
 
           scale *= math.log2(math.e)
           if use_stable_softmax:
-            m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
+            if jax.__version_info__ >= (0, 12, 0):
+              max_ilp = block_q // 16
+              if block_q * block_kv <= 4096 and bias_gmem is None:
+                max_ilp *= 2
+              s_max = plgpu.max(s, axis=1, accumulator_ilp=max_ilp)
+            else:
+              s_max = s.max(axis=1)
+            m_i = jnp.maximum(m_i, s_max * scale)
             m_valid = (mask is None and not has_k_range) | (m_i != -jnp.inf)
             alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
             threshold_is_1 = rescale_threshold == 1.0
@@ -469,10 +476,15 @@ def flash_attention_kernel(
             p = jnp.exp2(s * scale)
           p_ = p.astype(v.dtype)
 
+          def p_sum():
+            if jax.__version_info__ >= (0, 12, 0):
+              return plgpu.sum(p, axis=1, accumulator_ilp=(block_q // 16) * 2)
+            return p.sum(axis=1)
+
           # Can't fully explain why, but empirically the ordering here
           # influences the performance of the final kernel quite significantly.
           if p_sum_before_barriers := (head_dim <= 128):
-            l_i += p.sum(axis=1)
+            l_i += p_sum()
             acc, p_ = lax.optimization_barrier((acc, p_))
             l_i, m_i, m_scale = lax.optimization_barrier((l_i, m_i, m_scale))
 
@@ -484,7 +496,7 @@ def flash_attention_kernel(
             plgpu.wgmma(acc, p_, v_smem.at[si])
 
             if not p_sum_before_barriers:
-              l_i[...] += p.sum(axis=1)
+              l_i[...] += p_sum()
 
             @pl.when(ki + 1 < ub)
             def _():

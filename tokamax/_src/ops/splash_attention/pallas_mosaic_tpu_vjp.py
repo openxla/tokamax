@@ -50,6 +50,9 @@ class Config:
   ) = None
   use_base2_exp: bool = True
   dq_reduction_steps: int | None = None
+  qk_diag_skip: bool = False
+  qk_diag_grid: int = 2
+  diag_band_skip: bool = False
 
   def __post_init__(self):
     if self.block_kv_dkv % self.block_kv_dkv_compute:
@@ -73,10 +76,27 @@ class Config:
           f"{self.block_kv_dkv_compute=} must be a multiple of"
           f" {self.dropout_block_kv=}."
       )
-    if self.dq_reduction_steps is not None and self.dq_reduction_steps != 3:
+    if self.dq_reduction_steps not in (None, 1, 3):
       raise ValueError(
-          f"dq_reduction_steps has value: {self.dq_reduction_steps}, only 3"
+          f"dq_reduction_steps has value: {self.dq_reduction_steps}, only 1, 3"
           " or None are supported."
+      )
+    if (self.qk_diag_skip or self.diag_band_skip) and not (
+        self.block_q_dkv == self.block_kv_dkv == self.block_kv_dkv_compute
+    ):
+      raise ValueError(
+          "qk_diag_skip and diag_band_skip require square backward blocks "
+          f"({self.block_q_dkv=}, {self.block_kv_dkv=},"
+          f" {self.block_kv_dkv_compute=})."
+      )
+    if self.diag_band_skip and not self.qk_diag_skip:
+      raise ValueError("diag_band_skip requires qk_diag_skip=True.")
+    if self.qk_diag_grid < 2 or (self.qk_diag_grid & (self.qk_diag_grid - 1)):
+      raise ValueError(f"{self.qk_diag_grid=} must be a power of 2 >= 2.")
+    if self.qk_diag_skip and self.block_kv_dkv_compute % self.qk_diag_grid:
+      raise ValueError(
+          f"{self.block_kv_dkv_compute=} must be a multiple of"
+          f" {self.qk_diag_grid=}."
       )
 
 
@@ -322,9 +342,21 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     q = ba.arguments["q"]
     k = ba.arguments["k"]
     is_mqa = ba.arguments.get("is_mqa", False)
+    mask = ba.arguments.get("mask")
     dropout_rate = ba.arguments.get("dropout_rate", 0.0)
     q_seq_len = q.shape[-2]
     kv_seq_len = k.shape[-2]
+
+    is_causal = False
+    if isinstance(mask, mask_lib.CausalMask) and mask.offset == 0:
+      is_causal = True
+    elif (
+        isinstance(mask, base.Mask)
+        and mask.is_causal
+        and mask.offset == 0
+        and mask.bool_mask is None
+    ):
+      is_causal = True
 
     tiles = [128, 256, 512, 1024, 2048]
     # TODO: Unify forward and VJP autotuning so that they use the
@@ -357,28 +389,69 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         continue
       if kv_seq_len >= 1024 and dbkv is not None and dbkv < min(1024, bkv_c):
         continue
+      q_steps = q_seq_len // bq
+      kv_steps = kv_seq_len // bkv
+      can_use_diag_skip_2048 = (
+          is_causal and bq == bkv == bkv_c and dropout_rate == 0.0
+      )
+      can_use_vmem_dq = can_use_diag_skip_2048 and (
+          q_steps <= 2 or kv_steps == 1
+      )
       # TODO: Make these conditions more configurable
-      if bkv_c > 1024:
+      if bkv_c > 1024 and not can_use_diag_skip_2048:
         continue
 
       if bq >= 4096 or bkv >= 4096:
         continue
 
-      kv_steps = kv_seq_len // bkv
       dq_reduction_steps = None
       if kv_steps > 3:
         dq_reduction_steps = 3
 
-      configs.add(
-          Config(
-              block_q_dkv=bq,
-              block_kv_dkv=bkv,
-              block_kv_dkv_compute=bkv_c,
-              dropout_block_q=dbq,
-              dropout_block_kv=dbkv,
-              dq_reduction_steps=dq_reduction_steps,
-          )
-      )
+      if bkv_c <= 1024:
+        configs.add(
+            Config(
+                block_q_dkv=bq,
+                block_kv_dkv=bkv,
+                block_kv_dkv_compute=bkv_c,
+                dropout_block_q=dbq,
+                dropout_block_kv=dbkv,
+                dq_reduction_steps=dq_reduction_steps,
+            )
+        )
+      if is_causal and bq == bkv == bkv_c:
+        if bkv_c >= 1024:
+          qk_diag_grid_sizes = [2, 4]
+        else:
+          qk_diag_grid_sizes = [2]
+        for qk_grid_size in qk_diag_grid_sizes:
+          if bkv_c <= 1024 or can_use_diag_skip_2048:
+            configs.add(
+                Config(
+                    block_q_dkv=bq,
+                    block_kv_dkv=bkv,
+                    block_kv_dkv_compute=bkv_c,
+                    dropout_block_q=dbq,
+                    dropout_block_kv=dbkv,
+                    dq_reduction_steps=dq_reduction_steps,
+                    qk_diag_skip=True,
+                    qk_diag_grid=qk_grid_size,
+                )
+            )
+          if can_use_vmem_dq and (bkv_c // qk_grid_size) % NUM_LANES == 0:
+            configs.add(
+                Config(
+                    block_q_dkv=bq,
+                    block_kv_dkv=bkv,
+                    block_kv_dkv_compute=bkv_c,
+                    dropout_block_q=dbq,
+                    dropout_block_kv=dbkv,
+                    dq_reduction_steps=1,
+                    qk_diag_skip=True,
+                    qk_diag_grid=qk_grid_size,
+                    diag_band_skip=True,
+                )
+            )
     if not configs:
       configs.add(self._get_heuristics_config(ba))
     return configs

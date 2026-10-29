@@ -205,13 +205,12 @@ def kernel(
     write_counts_ref[buf_idx_val] = num_valid_writes
 
   def inner_kernel(
+      step,
       tiled_wgate_ref,  # (tile_k, tile_m)
       tiled_hidden_states_ref,  # (tile_n, tile_k)
       tiled_positions_ref,  # (tile_n,)
   ):
-    n_idx = pl.program_id(0)
-    m_idx = pl.program_id(1)
-    k_idx = pl.program_id(2)
+    n_idx, m_idx, k_idx = step.index
     tile_idx = (
         n_idx * cfgs.num_m + m_idx
     )  # omit k_idx because we write to the same buffer, double buffer on k
@@ -339,6 +338,7 @@ def kernel(
           hidden_states_spec,
           positions_spec,
       ),
+      _explicit_indices=True,
   )
 
   pipeline_fn(
