@@ -53,6 +53,7 @@ def _make_rpa_spec(
     num_prefill_seqs: int = 0,
     prefill_seq_len: int = 2048,
     prefill_seq_lens: Sequence[int] | None = None,
+    prefill_kv_lens: Sequence[int] | None = None,
     q_dtype: jax.typing.DTypeLike = jnp.bfloat16,
     kv_cache_dtype: jax.typing.DTypeLike = jnp.float8_e4m3fn,
     project: str = "qwen3.5",
@@ -83,20 +84,32 @@ def _make_rpa_spec(
     page_count = num_seqs * pages_per_seq
   elif mode == "mixed":
     # `prefill_seq_lens`, if given, sets per-sequence prefill lengths and
-    # overrides `num_prefill_seqs` and `prefill_seq_len`.
+    # overrides `num_prefill_seqs` and `prefill_seq_len`. `prefill_kv_lens`, if
+    # given, sets each prefill sequence's final KV length (cached prefix plus
+    # the new chunk), so chunked prefill attends to more KV than it has queries.
     if prefill_seq_lens is None:
       prefill_lens = [prefill_seq_len] * num_prefill_seqs
     else:
       prefill_lens = list(prefill_seq_lens)
+    if prefill_kv_lens is None:
+      prefill_kvs = prefill_lens
+    else:
+      prefill_kvs = list(prefill_kv_lens)
+      if len(prefill_kvs) != len(prefill_lens) or any(
+          kv < q for q, kv in zip(prefill_lens, prefill_kvs)
+      ):
+        raise ValueError(
+            f"Invalid {prefill_kv_lens=} for prefill lengths {prefill_lens}."
+        )
     total_q_len = num_decode_seqs + sum(prefill_lens)
     cu_q_lens_list = list(range(num_decode_seqs + 1))
     for prefill_len in prefill_lens:
       cu_q_lens_list.append(cu_q_lens_list[-1] + prefill_len)
-    kv_lens_list = [decode_seq_len] * num_decode_seqs + prefill_lens
+    kv_lens_list = [decode_seq_len] * num_decode_seqs + prefill_kvs
     total_seqs = num_decode_seqs + len(prefill_lens)
     distribution_list = [num_decode_seqs, num_decode_seqs, total_seqs]
     seq_pages_list = [_cdiv(decode_seq_len, page_size)] * num_decode_seqs + [
-        _cdiv(prefill_len, page_size) for prefill_len in prefill_lens
+        _cdiv(prefill_kv, page_size) for prefill_kv in prefill_kvs
     ]
     pages_per_seq = max(seq_pages_list)
     page_indices_list = []
@@ -151,7 +164,9 @@ def _make_rpa_spec(
       ),
       project=project,
       name=name,
-      tags=tags,
+      # Batched RPA is inference-only and ignores `return_residuals`, so skip
+      # the derived residual and VJP variants.
+      tags=tuple(dict.fromkeys((*tags, "forward_only"))),
   )
 
 
@@ -290,74 +305,200 @@ _QWEN3_8_MAX_ARG_SPECS = (
 )
 
 
+# Qwen3.5-397B full-attention layers: 32 query heads, 2 KV heads, head_dim 256.
+# Shapes are per device with heads sharded over TP, so KV heads are replicated
+# when TP > 2. The serving workloads use DP8 attention (TP1 heads per device),
+# so each device holds ceil(concurrency / 8) sequences.
+_QWEN3_5_NUM_Q_HEADS = 32
+_QWEN3_5_NUM_KV_HEADS = 2
+_QWEN3_5_HEAD_DIM = 256
+_QWEN3_5_PAGE_SIZE = 256
+_QWEN3_5_DP = 8
+# Primary specs: the nightly benchmark set, one per workload type.
+_QWEN3_5_PRIMARY = frozenset({
+    "decode_bs16_tp1",
+    "decode_bs64_tp1",
+    "decode_bs256_tp1",
+    "prefill_q4096_tp1",
+    "isl8k_mixed_c64_dp8tp1",
+})
+_QWEN3_5_CI_TESTS = frozenset({"decode_bs16_tp1"})
+
+
+def _qwen3_5_tags(name: str) -> tuple[arg_spec.Tag, ...]:
+  if name in _QWEN3_5_CI_TESTS:
+    return ("primary", "ci_tests")
+  if name in _QWEN3_5_PRIMARY:
+    return ("primary",)
+  return ()
+
+
+def _qwen3_5_model_args(tp: int) -> dict[str, Any]:
+  """Returns the per-device Qwen3.5-397B `_make_rpa_spec` args for TP `tp`."""
+  return dict(
+      num_q_heads=_QWEN3_5_NUM_Q_HEADS // tp,
+      num_kv_heads=max(_QWEN3_5_NUM_KV_HEADS // tp, 1),
+      head_dim=_QWEN3_5_HEAD_DIM,
+      page_size=_QWEN3_5_PAGE_SIZE,
+      num_pages=0,  # Sized to fit the workload.
+      project="qwen3_5_397b",
+  )
+
+
+def _qwen3_5_decode(
+    name: str, *, num_seqs: int, context_len: int, tp: int = 1
+) -> arg_spec.ArgSpec:
+  return _make_rpa_spec(
+      name,
+      mode="decode",
+      num_seqs=num_seqs,
+      seq_len=context_len,
+      tags=_qwen3_5_tags(name),
+      **_qwen3_5_model_args(tp),
+  )
+
+
+def _qwen3_5_prefill(name: str, *, seq_len: int, tp: int) -> arg_spec.ArgSpec:
+  return _make_rpa_spec(
+      name,
+      mode="prefill",
+      num_seqs=1,
+      seq_len=seq_len,
+      tags=_qwen3_5_tags(name),
+      **_qwen3_5_model_args(tp),
+  )
+
+
+def _qwen3_5_chunked_prefill(
+    name: str,
+    *,
+    num_seqs: int,
+    chunk_len: int,
+    context_len: int,
+    num_decode_seqs: int = 0,
+    decode_context_len: int = 0,
+    tp: int = 1,
+) -> arg_spec.ArgSpec:
+  """Last prefill chunk of `chunk_len` tokens on a `context_len` KV context."""
+  return _make_rpa_spec(
+      name,
+      mode="mixed",
+      num_decode_seqs=num_decode_seqs,
+      decode_seq_len=decode_context_len,
+      prefill_seq_lens=[chunk_len] * num_seqs,
+      prefill_kv_lens=[context_len] * num_seqs,
+      tags=_qwen3_5_tags(name),
+      **_qwen3_5_model_args(tp),
+  )
+
+
+def _qwen3_5_isl8k_specs(concurrency: int) -> tuple[arg_spec.ArgSpec, ...]:
+  """8k-input / 1k-output serving at `concurrency`, with DP8 attention."""
+  num_seqs = _cdiv(concurrency, _QWEN3_5_DP)
+  label = f"c{concurrency}_dp8tp1"
+  return (
+      # Mixed step: decode sequences at 8k + 1k context, plus one sequence's
+      # last 1k prefill chunk on its 8k prompt.
+      _qwen3_5_chunked_prefill(
+          f"isl8k_mixed_{label}",
+          num_seqs=1,
+          chunk_len=1024,
+          context_len=8192,
+          num_decode_seqs=max(num_seqs - 1, 1),
+          decode_context_len=9216,
+      ),
+      # Pure decode (TPOT).
+      _qwen3_5_decode(
+          f"isl8k_decode_{label}", num_seqs=num_seqs, context_len=9216
+      ),
+      # Last prefill chunk (TTFT).
+      _qwen3_5_chunked_prefill(
+          f"isl8k_prefill_{label}",
+          num_seqs=num_seqs,
+          chunk_len=1024,
+          context_len=8192,
+      ),
+  )
+
+
+# Long-context batches are limited to these KV tokens per device, which bounds
+# the benchmark's HBM use.
+_QWEN3_5_LONGCTX_DECODE_KV_TOKENS = 2 * 1024 * 1024
+_QWEN3_5_LONGCTX_CHUNK_KV_TOKENS = 1024 * 1024
+
+
+def _qwen3_5_longctx_specs(
+    context_len: int, concurrency: int
+) -> tuple[arg_spec.ArgSpec, ...]:
+  """Multi-turn long context: decode and a 2k-token turn, with DP8 attention."""
+  num_seqs = concurrency // _QWEN3_5_DP
+  label = f"c{concurrency}_ctx{context_len // 1024}k_dp8tp1"
+  specs = []
+  if num_seqs * context_len <= _QWEN3_5_LONGCTX_DECODE_KV_TOKENS:
+    specs.append(
+        _qwen3_5_decode(
+            f"decode_{label}", num_seqs=num_seqs, context_len=context_len
+        )
+    )
+  if num_seqs * context_len <= _QWEN3_5_LONGCTX_CHUNK_KV_TOKENS:
+    specs.append(
+        _qwen3_5_chunked_prefill(
+            f"last_chunk_{label}",
+            num_seqs=num_seqs,
+            chunk_len=2048,
+            context_len=context_len,
+        )
+    )
+  return tuple(specs)
+
+
+_QWEN3_5_397B_ARG_SPECS = (
+    # Decode at a 4k context.
+    *(
+        _qwen3_5_decode(
+            f"decode_bs{num_seqs}_tp{tp}",
+            num_seqs=num_seqs,
+            context_len=4096,
+            tp=tp,
+        )
+        for num_seqs in (16, 64, 256, 512)
+        for tp in (1, 4, 8)
+    ),
+    # Full-prompt prefill.
+    *(
+        _qwen3_5_prefill(f"prefill_q{seq_len}_tp{tp}", seq_len=seq_len, tp=tp)
+        for seq_len in (1024, 2048, 4096, 8192)
+        for tp in (1, 4, 8)
+    ),
+    # 8k-input / 1k-output serving.
+    *(
+        spec
+        for concurrency in (4, 8, 16, 32, 64, 128, 256)
+        for spec in _qwen3_5_isl8k_specs(concurrency)
+    ),
+    # Last 1k prefill chunk on a 4k context.
+    *(
+        _qwen3_5_chunked_prefill(
+            f"last_chunk_c{num_seqs}_tp{tp}",
+            num_seqs=num_seqs,
+            chunk_len=1024,
+            context_len=4096,
+            tp=tp,
+        )
+        for num_seqs in (16, 64, 256, 512)
+        for tp in (1, 4, 8)
+    ),
+    # Long context (64k to 256k).
+    *(
+        spec
+        for context_len in (65536, 131072, 262144)
+        for concurrency in (16, 64, 256, 512)
+        for spec in _qwen3_5_longctx_specs(context_len, concurrency)
+    ),
+)
+
+
 ARG_SPECS = (
-    # Decode workloads.
-    _make_rpa_spec(
-        "qwen35_decode_bs16",
-        mode="decode",
-        num_seqs=16,
-        seq_len=4096,
-        num_q_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        page_size=256,
-        num_pages=512,
-        tags=("primary", "ci_tests"),
-    ),
-    _make_rpa_spec(
-        "qwen35_decode_bs64",
-        mode="decode",
-        num_seqs=64,
-        seq_len=4096,
-        num_q_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        page_size=256,
-        num_pages=2048,
-        tags=("primary",),
-    ),
-    _make_rpa_spec(
-        "qwen35_decode_bs256",
-        mode="decode",
-        num_seqs=256,
-        seq_len=4096,
-        num_q_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        page_size=256,
-        num_pages=8192,
-        tags=("primary",),
-    ),
-    # Prefill workloads.
-    _make_rpa_spec(
-        "qwen35_prefill_q4096",
-        mode="prefill",
-        num_seqs=1,
-        seq_len=4096,
-        num_q_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        page_size=256,
-        num_pages=256,
-        tags=("primary",),
-    ),
-    # Mixed workload (decode + prefill).
-    # TODO rgxu: How do we express input token q_len=1024 and final
-    # KV_len=8192 in this approach? We need to simulate a chunked prefill
-    # scenario.
-    _make_rpa_spec(
-        "qwen35_mixed_d8_p1",
-        mode="mixed",
-        num_decode_seqs=8,
-        decode_seq_len=4096,
-        num_prefill_seqs=1,
-        prefill_seq_len=2048,
-        num_q_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        page_size=256,
-        num_pages=1024,
-        tags=("primary",),
-    ),
+    *_QWEN3_5_397B_ARG_SPECS,
     *_QWEN3_8_MAX_ARG_SPECS,
 )
