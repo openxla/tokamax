@@ -1,0 +1,62 @@
+{
+  "{\"hidden_states\":\"bf16[128,7168]\",\"wkv_wgate\":\"bf16[7168,2048]\",\"ape\":\"bf16[4,1024]\",\"positions\":\"i32[128]\",\"slot_mapping\":\"i32[128]\",\"cache\":\"i32[128,256,128]\",\"compress_ratio\":4,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 913.0170530406758,
+      "lower_time_ms": 32.80681697651744,
+      "evaluation_times_ms": [
+        0.21,
+        0.211,
+        0.211,
+        0.211,
+        0.211
+      ],
+      "metadata": {},
+      "peak_memory_mb": 131.868672
+    }
+  },
+  "{\"hidden_states\":\"bf16[4096,7168]\",\"wkv_wgate\":\"bf16[7168,2048]\",\"ape\":\"bf16[4,1024]\",\"positions\":\"i32[4096]\",\"slot_mapping\":\"i32[4096]\",\"cache\":\"i32[256,256,128]\",\"compress_ratio\":4,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1347.5009130197577,
+      "lower_time_ms": 31.32186399307102,
+      "evaluation_times_ms": [
+        0.633,
+        0.632,
+        0.634,
+        0.63,
+        0.635
+      ],
+      "metadata": {},
+      "peak_memory_mb": 323.00288
+    }
+  },
+  "{\"hidden_states\":\"bf16[4096,7168]\",\"wkv_wgate\":\"bf16[7168,1024]\",\"ape\":\"bf16[128,512]\",\"positions\":\"i32[4096]\",\"slot_mapping\":\"i32[4096]\",\"cache\":\"u8[128,256,4,128]\",\"compress_ratio\":128,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1062.613467045594,
+      "lower_time_ms": 27.739289973396808,
+      "evaluation_times_ms": [
+        0.266,
+        0.267,
+        0.266,
+        0.266,
+        0.266
+      ],
+      "metadata": {},
+      "peak_memory_mb": 140.755456
+    }
+  },
+  "{\"hidden_states\":\"bf16[4096,7168]\",\"wkv_wgate\":\"bf16[7168,512]\",\"ape\":\"bf16[4,256]\",\"positions\":\"i32[4096]\",\"slot_mapping\":\"i32[4096]\",\"cache\":\"u8[256,32,4,256]\",\"compress_ratio\":4,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 885.2429499966092,
+      "lower_time_ms": 30.968838022090495,
+      "evaluation_times_ms": [
+        0.142,
+        0.141,
+        0.142,
+        0.142,
+        0.142
+      ],
+      "metadata": {},
+      "peak_memory_mb": 108.087808
+    }
+  }
+}

@@ -24,8 +24,8 @@ import jax
 import jax.numpy as jnp
 import tokamax
 from tokamax._src import numerics
-from tokamax._src.ops.experimental.kda import api as kda_api
-from tokamax._src.ops.experimental.kda import arg_specs as kda_specs
+from tokamax._src.ops.kda import api as kda_api
+from tokamax._src.ops.kda import arg_specs as kda_specs
 from tokamax.benchmarks import common
 
 
@@ -81,6 +81,10 @@ class KdaBenchmark(parameterized.TestCase):
       self.skipTest("Mosaic TPU implementation is only supported on TPU.")
 
     example = _make_example(args_spec_name, implementation)
+    if implementation == "xla_chunked" and not example.get(
+        "per_channel_gate", True
+    ):
+      self.skipTest("xla_chunked does not support scalar gates.")
     fn, args = tokamax.standardize_function(
         kda_api.kimi_delta_attention,
         kwargs=example,

@@ -15,6 +15,7 @@
 """Triton utilities."""
 
 from collections.abc import Callable
+import math
 
 import jax
 import jax.numpy as jnp
@@ -24,8 +25,47 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
-
 get_cheapest_grid_grouping = grid.get_cheapest_grid_grouping
+
+
+def vmap_kernel(launch_fn, batch_shape=(), batched=()):
+  """Wraps a kernel launch to support (nested) `jax.vmap`.
+
+  `launch_fn(batch_shape, batch_strides, *args)` must return outputs with
+  leading `batch_shape` dims. `batched[i][j]` is whether arg `j` is batched
+  along `batch_shape[i]`; unbatched args get a zero batch stride.
+  """
+
+  @jax.custom_batching.custom_vmap
+  def f(*args):
+    strides = []
+    for i, x in enumerate(args):
+      x_strides = (
+          iter(())
+          if x is None
+          else (math.prod(x.shape[d + 1 :]) for d in range(x.ndim))
+      )
+      strides.append(tuple(next(x_strides) if b[i] else 0 for b in batched))
+    return launch_fn(batch_shape, tuple(strides), *args)
+
+  @f.def_vmap
+  def _(axis_size, in_batched, *args):
+    out = vmap_kernel(
+        launch_fn, (axis_size, *batch_shape), (in_batched, *batched)
+    )(*args)
+    return out, jax.tree.map(lambda _: True, out)
+
+  return f
+
+
+@triton.jit
+def batch_offset(pid_b, batch_shape, batch_strides):
+  """Unravels `pid_b` over `batch_shape` and dots with `batch_strides`."""
+  offset = tl.full((), 0, tl.int64)
+  for i in tl.static_range(len(batch_shape) - 1, 0, -1):
+    offset += (pid_b % batch_shape[i]) * batch_strides[i]
+    pid_b //= batch_shape[i]
+  return offset if batch_shape == () else offset + pid_b * batch_strides[0]
 
 
 @triton.jit
@@ -168,3 +208,60 @@ def get_dot_dtype_and_precision(
   input_precision = get_input_precision(precision, dot_jnp_dtype)
   return jnp_to_tl_dtype(dot_jnp_dtype), input_precision
 
+
+@triton.jit
+def advance_bcast_ptr(
+    ptr, pid_b, batch_shape, batch_strides, pid_h, num_heads, shape
+):
+  """Advances `ptr` to the `(pid_b, pid_h)` slice of a broadcastable array.
+
+  `shape` is the per-batch shape, whose leading (head) dim is either `1` or a
+  divisor of `num_heads`.
+  """
+  ptr += batch_offset(pid_b, batch_shape, batch_strides)
+  if shape[0] != 1:
+    stride: tl.constexpr = shape[1] if len(shape) == 2 else shape[1] * shape[2]
+    ptr += pid_h // (num_heads // shape[0]) * stride
+  return ptr
+
+
+@triton.jit
+def mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c):
+  """Returns the in-bounds mask for a 2D block, or `None` if not needed."""
+  if check_r and check_c:
+    return (offs_r[:, None] < bound_r) & (offs_c[None, :] < bound_c)
+  elif check_r:
+    return offs_r[:, None] < bound_r
+  elif check_c:
+    return offs_c[None, :] < bound_c
+  else:
+    return None
+
+
+@triton.jit
+def load_1d_bcast(ptr, offs, shape, other=0):
+  """Loads a block from the trailing (broadcastable) dim of `shape`."""
+  bound: tl.constexpr = shape[1]
+  block: tl.constexpr = offs.shape[0]
+  if bound == 1:
+    offs = tl.zeros((1,), dtype=tl.int32)
+  check: tl.constexpr = bound > 1 and bound % block != 0
+  mask = offs < bound if check else None
+  return tl.load(ptr + offs, mask=mask, other=None if mask is None else other)
+
+
+@triton.jit
+def load_2d_bcast(ptr, offs_r, offs_c, shape, other=0.0):
+  """Loads a block from the trailing two (broadcastable) dims of `shape`."""
+  bound_r: tl.constexpr = shape[1]
+  bound_c: tl.constexpr = shape[2]
+  block_r: tl.constexpr = offs_r.shape[0]
+  block_c: tl.constexpr = offs_c.shape[0]
+  # Broadcast dims still get a size-1 axis, so callers can transpose the block.
+  zero = tl.zeros((1, 1), dtype=tl.int64)
+  r = zero if bound_r == 1 else offs_r[:, None].to(tl.int64) * bound_c
+  c = zero if bound_c == 1 else offs_c[None, :].to(tl.int64)
+  check_r: tl.constexpr = bound_r > 1 and bound_r % block_r != 0
+  check_c: tl.constexpr = bound_c > 1 and bound_c % block_c != 0
+  mask = mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c)
+  return tl.load(ptr + r + c, mask=mask, other=None if mask is None else other)

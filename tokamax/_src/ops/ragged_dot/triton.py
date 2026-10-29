@@ -49,25 +49,6 @@ class Config:
   num_stages: int
 
 
-def _vmap_kernel(launch_fn: Callable[..., jax.Array]):
-  def call(batch_size, in_batched, *args):
-    strides = [
-        () if x is None else (0,) * (not b) + jt.strides_from_shape(x.shape)
-        for x, b in zip(args, in_batched)
-    ]
-    return launch_fn(batch_size, strides, *args)
-
-  @jax.custom_batching.custom_vmap
-  def f(*args):
-    return call(1, [False] * len(args), *args)[0]
-
-  @f.def_vmap
-  def _f_vmap(axis_size, in_batched, *args):
-    return call(axis_size, in_batched, *args), True
-
-  return f
-
-
 @triton.jit
 def _ragged_dot_kernel(
     a_ptr,
@@ -76,14 +57,15 @@ def _ragged_dot_kernel(
     b_scales_ptr,
     cum_rows_ptr,
     out_ptr,
+    batch_shape: tl.constexpr,
     n: tl.constexpr,
     k: tl.constexpr,
     grid_m: tl.constexpr,
+    batch_strides: tl.constexpr,
     a_strides: tl.constexpr,
     a_scales_strides: tl.constexpr,
     b_strides: tl.constexpr,
     b_scales_strides: tl.constexpr,
-    cum_rows_strides: tl.constexpr,
     out_strides: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
@@ -99,15 +81,21 @@ def _ragged_dot_kernel(
     activation: tl.constexpr,
 ):
   """Triton ragged dot kernel."""
-  pid_b = (tl.program_id(0) // grid_m).to(tl.int64)
+  pid_b = (
+      tl.full((), 0, tl.int64)
+      if batch_shape == ()
+      else (tl.program_id(0) // grid_m).to(tl.int64)
+  )
   pid_m = tl.program_id(0) % grid_m
   pid_n = tl.program_id(1)
   pid_e = tl.program_id(2).to(tl.int64)
 
-  stride_cb, stride_ce = cum_rows_strides
-  cum_rows_ptr += pid_b * stride_cb + pid_e * stride_ce
+  stride_ab, stride_asb, stride_bb, stride_bsb, stride_cb = batch_strides
+  cum_rows_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, stride_cb) + pid_e
+  )
   lo = tl.load(cum_rows_ptr)
-  hi = tl.load(cum_rows_ptr + stride_ce)
+  hi = tl.load(cum_rows_ptr + 1)
 
   start_m = (lo + pid_m * block_m).to(tl.int64)
   if start_m >= hi:
@@ -122,26 +110,34 @@ def _ragged_dot_kernel(
   offs_k = tl.arange(0, block_k)
   offs_k_a = tl.arange(0, block_k // a_pack)
 
-  stride_ab, stride_am, stride_ak = a_strides
-  stride_bb, stride_be, stride_bk, stride_bn = b_strides
-  a_ptr += pid_b * stride_ab
-  b_ptr += pid_b * stride_bb + pid_e * stride_be
+  stride_am, stride_ak = a_strides
+  stride_be, stride_bk, stride_bn = b_strides
+  a_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_ab)
+  b_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, stride_bb)
+      + pid_e * stride_be
+  )
   a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k_a[None, :] * stride_ak
   b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n_b[None, :] * stride_bn
 
   if a_scales_ptr is not None:
-    stride_asb, stride_asm, _ = a_scales_strides
-    a_scales_ptr += pid_b * stride_asb + offs_m[:, None] * stride_asm
+    stride_asm, _ = a_scales_strides
+    a_scales_ptr += (
+        triton_utils.batch_offset(pid_b, batch_shape, stride_asb)
+        + offs_m[:, None] * stride_asm
+    )
 
   if b_scales_ptr is not None:
-    stride_bsb, stride_bse, _, stride_bsn = b_scales_strides
+    stride_bse, _, stride_bsn = b_scales_strides
     bs_offs_n = (
         start_n // b_tile_n
         if b_tile_n % block_n == 0
         else (offs_n // b_tile_n)[None, :]
     )
     b_scales_ptr += (
-        pid_b * stride_bsb + pid_e * stride_bse + bs_offs_n * stride_bsn
+        triton_utils.batch_offset(pid_b, batch_shape, stride_bsb)
+        + pid_e * stride_bse
+        + bs_offs_n * stride_bsn
     )
 
   m_mask = (offs_m < hi)[:, None]
@@ -173,7 +169,7 @@ def _ragged_dot_kernel(
 
     a_scales = None
     if a_scales_ptr is not None:
-      _, _, stride_ask = a_scales_strides
+      _, stride_ask = a_scales_strides
       as_offs_k = (
           start_k // a_tile_k
           if a_tile_k % block_k == 0
@@ -194,7 +190,7 @@ def _ragged_dot_kernel(
 
     b_scales = None
     if b_scales_ptr is not None:
-      _, _, stride_bsk, _ = b_scales_strides
+      _, stride_bsk, _ = b_scales_strides
       bs_offs_k = (
           start_k // b_tile_k
           if b_tile_k % block_k == 0
@@ -325,17 +321,18 @@ def _ragged_dot(
   triton_act = triton_utils.get_triton_activation(activation)
   grid_m = triton.cdiv(m, block_m)
   grid_n = triton.cdiv(n, block_n)
+  a_strides = jt.strides_from_shape(lhs.shape)
+  a_scales_strides = (
+      () if lhs_scales is None else jt.strides_from_shape(lhs_scales.shape)
+  )
+  b_strides = jt.strides_from_shape(rhs.shape)
+  b_scales_strides = (
+      () if rhs_scales is None else jt.strides_from_shape(rhs_scales.shape)
+  )
 
-  @_vmap_kernel
-  def f(batch_size, strides, lhs, lhs_scales, rhs, rhs_scales, cum_rows):
-    (
-        a_strides,
-        a_scales_strides,
-        b_strides,
-        b_scales_strides,
-        cum_rows_strides,
-    ) = strides
-    out_struct = jax.ShapeDtypeStruct((batch_size, m, n), out_dtype)
+  @triton_utils.vmap_kernel
+  def f(batch_shape, batch_strides, lhs, lhs_scales, rhs, rhs_scales, cum_rows):
+    out_struct = jax.ShapeDtypeStruct((*batch_shape, m, n), out_dtype)
     return jt.triton_call(
         lhs,
         lhs_scales,
@@ -344,19 +341,20 @@ def _ragged_dot(
         cum_rows,
         kernel=_ragged_dot_kernel,
         out_type=out_struct,
-        grid=(batch_size * grid_m, grid_n, num_groups),
+        grid=(math.prod(batch_shape) * grid_m, grid_n, num_groups),
         name="triton_ragged_dot",
         num_warps=config.num_warps,
         num_stages=config.num_stages,
+        batch_shape=batch_shape,
         n=n,
         k=k,
         grid_m=grid_m,
+        batch_strides=batch_strides,
         a_strides=a_strides,
         a_scales_strides=a_scales_strides,
         b_strides=b_strides,
         b_scales_strides=b_scales_strides,
-        cum_rows_strides=cum_rows_strides,
-        out_strides=jt.strides_from_shape(out_struct.shape),
+        out_strides=jt.strides_from_shape((1, m, n)),
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -380,12 +378,13 @@ def _ragged_contracting_dim_dot_kernel(
     b_ptr,
     cum_rows_ptr,
     out_ptr,
+    batch_shape: tl.constexpr,
     m: tl.constexpr,
     n: tl.constexpr,
     grid_m: tl.constexpr,
+    batch_strides: tl.constexpr,
     a_strides: tl.constexpr,
     b_strides: tl.constexpr,
-    cum_rows_strides: tl.constexpr,
     out_strides: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
@@ -395,24 +394,30 @@ def _ragged_contracting_dim_dot_kernel(
     activation: tl.constexpr,
 ):
   """Triton ragged dot kernel for ragged contracting dimension."""
-  pid_b = (tl.program_id(0) // grid_m).to(tl.int64)
+  pid_b = (
+      tl.full((), 0, tl.int64)
+      if batch_shape == ()
+      else (tl.program_id(0) // grid_m).to(tl.int64)
+  )
   pid_m = tl.program_id(0) % grid_m
   pid_n = tl.program_id(1)
   pid_e = tl.program_id(2).to(tl.int64)
 
-  stride_cb, stride_ce = cum_rows_strides
-  cum_rows_ptr += pid_b * stride_cb + pid_e * stride_ce
+  stride_ab, stride_bb, stride_cb = batch_strides
+  cum_rows_ptr += (
+      triton_utils.batch_offset(pid_b, batch_shape, stride_cb) + pid_e
+  )
   lo = tl.load(cum_rows_ptr)
-  hi = tl.load(cum_rows_ptr + stride_ce)
+  hi = tl.load(cum_rows_ptr + 1)
 
   offs_m = (pid_m * block_m).to(tl.int64) + tl.arange(0, block_m)
   offs_n = (pid_n * block_n).to(tl.int64) + tl.arange(0, block_n)
   offs_k = lo.to(tl.int64) + tl.arange(0, block_k)
 
-  stride_ab, stride_ak, stride_am = a_strides
-  stride_bb, stride_bk, stride_bn = b_strides
-  a_ptr += pid_b * stride_ab
-  b_ptr += pid_b * stride_bb
+  stride_ak, stride_am = a_strides
+  stride_bk, stride_bn = b_strides
+  a_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_ab)
+  b_ptr += triton_utils.batch_offset(pid_b, batch_shape, stride_bb)
   a_ptrs = a_ptr + offs_k[:, None] * stride_ak + offs_m[None, :] * stride_am
   b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
@@ -470,11 +475,14 @@ def _ragged_contracting_dim_dot(
   triton_act = triton_utils.get_triton_activation(activation)
   grid_m = triton.cdiv(m, block_m)
   grid_n = triton.cdiv(n, block_n)
+  a_strides = jt.strides_from_shape(lhs.shape)
+  b_strides = jt.strides_from_shape(rhs.shape)
 
-  @_vmap_kernel
-  def f(batch_size, strides, lhs, rhs, cum_rows):
-    a_strides, b_strides, cum_rows_strides = strides
-    out_struct = jax.ShapeDtypeStruct((batch_size, num_groups, m, n), out_dtype)
+  @triton_utils.vmap_kernel
+  def f(batch_shape, batch_strides, lhs, rhs, cum_rows):
+    out_struct = jax.ShapeDtypeStruct(
+        (*batch_shape, num_groups, m, n), out_dtype
+    )
 
     return jt.triton_call(
         lhs,
@@ -482,17 +490,18 @@ def _ragged_contracting_dim_dot(
         cum_rows,
         kernel=_ragged_contracting_dim_dot_kernel,
         out_type=out_struct,
-        grid=(batch_size * grid_m, grid_n, num_groups),
+        grid=(math.prod(batch_shape) * grid_m, grid_n, num_groups),
         name="triton_ragged_contracting_dim_dot",
         num_warps=config.num_warps,
         num_stages=config.num_stages,
+        batch_shape=batch_shape,
         m=m,
         n=n,
         grid_m=grid_m,
+        batch_strides=batch_strides,
         a_strides=a_strides,
         b_strides=b_strides,
-        cum_rows_strides=cum_rows_strides,
-        out_strides=jt.strides_from_shape(out_struct.shape),
+        out_strides=jt.strides_from_shape((1, num_groups, m, n)),
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -556,9 +565,7 @@ class TritonRaggedDot(base.RaggedDot[Config, None]):
       raise NotImplementedError("float8_e4m3fn is not supported on SM80.")
 
     if preferred_element_type is None:
-      out_dtype = jnp.promote_types(lhs.dtype, rhs.dtype)
-    else:
-      out_dtype = preferred_element_type
+      preferred_element_type = jnp.result_type(lhs, rhs)
 
     if ragged_dot_dimension_numbers == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS:
       rhs = rhs.mT  # TODO: Fuse transpose into kernel.
@@ -582,7 +589,7 @@ class TritonRaggedDot(base.RaggedDot[Config, None]):
         rhs,
         group_sizes=jnp.asarray(group_sizes),
         precision=precision,
-        out_dtype=out_dtype,
+        out_dtype=preferred_element_type,
         config=config,
         activation=None if return_residuals else activation,
     )

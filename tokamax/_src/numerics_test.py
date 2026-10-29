@@ -190,6 +190,20 @@ class NumericsTest(parameterized.TestCase):
 
     self.assertFalse(jnp.array_equal(a_random, a_random_2))
 
+  def test_random_initialize_multi_process(self):
+    spec = {
+        'a': jax.ShapeDtypeStruct((16,), jnp.float32),
+        'b': jax.ShapeDtypeStruct((16,), jnp.int32),
+    }
+    expected = numerics.random_initialize(spec, seed=0)
+    with (
+        mock.patch.object(jax, 'process_count', return_value=2),
+        mock.patch.object(numerics.futures, 'ThreadPoolExecutor') as mock_pool,
+    ):
+      actual = numerics.random_initialize(spec, seed=0)
+    mock_pool.assert_not_called()
+    chex.assert_trees_all_equal(actual, expected)
+
 
 if __name__ == '__main__':
   absltest.main()

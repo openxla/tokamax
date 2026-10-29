@@ -27,10 +27,9 @@ from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_fp8_quant as sm100_fp8_quant
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm100_i8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_x8 as sm100_quant_x8
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm80 as sm80
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
@@ -91,6 +90,10 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
   enable_fused_epilogue_quant: bool = False
+  # If True, int4 `rhs.qvalue` was permuted offline along K with
+  # `mosaic_gpu.apply_int4_to_fp8_offline_permute`. Only supported by the SM100
+  # fp8 x int4 kernel.
+  int4_to_fp8_offline_permute: bool = False
 
   def __post_init__(self):
     if self.vjp is None:
@@ -181,9 +184,13 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
       if isinstance(rhs, QArray):
         if isinstance(lhs, QArray):
           if lhs.qtype == jnp.int8:
-            fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
+            if not gpu_utils.has_tcgen05_int8_support():
+              raise NotImplementedError(
+                  "int8 x int4 MMA (.kind::i8) is not supported on sm103+."
+              )
+            fn = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel
           elif lhs.qtype == jnp.float8_e4m3fn:
-            fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+            fn = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel
             # make sure output is bfloat16 since we may want to store lhs.scale
             # as float32 to avoid in-kernel conversion.
             if (
@@ -221,17 +228,31 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     else:
       raise NotImplementedError("Unsupported GPU architecture.")
 
-    if isinstance(group_sizes, GroupSizes):
-      group_sizes = jnp.array(group_sizes)
-
-    if preferred_element_type is None:
-      preferred_element_type = jnp.promote_types(lhs.dtype, rhs.dtype)
-
     if fn is None:
       raise NotImplementedError(
           f"Unsupported config: {config=} {ragged_dot_dimension_numbers=}"
           f" {lhs.dtype=} {rhs.dtype=} {preferred_element_type=} {precision=}"
       )
+
+    if isinstance(group_sizes, GroupSizes):
+      group_sizes = jnp.array(group_sizes)
+
+    if preferred_element_type is None:
+      preferred_element_type = jnp.result_type(lhs, rhs)
+
+    if self.int4_to_fp8_offline_permute:
+      if (
+          fn is not sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel
+          or not isinstance(lhs, QArray)
+          or lhs.qtype != jnp.float8_e4m3fn
+          or not isinstance(rhs, QArray)
+          or rhs.qtype != jnp.int4
+      ):
+        raise NotImplementedError(
+            "`int4_to_fp8_offline_permute` is only supported by the SM100 fp8"
+            " x int4 kernel."
+        )
+      fn = partial(fn, int4_to_fp8_offline_permute=True)
 
     dot_out = fn(
         lhs,  # pyrefly: ignore[bad-argument-type]

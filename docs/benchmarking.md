@@ -45,14 +45,14 @@ execution time. This means the usual approach of timing
 underlying timing methodology used for benchmarking e.g. `benchmark(f_std, args,
 iterations=num_iters, method=method)`
 
-For TPU kernels, we strongly recommend `method=xprof_hermetic`, which invokes
+For TPU kernels, we strongly recommend `method='hermetic_xprof'`, which invokes
 the [XProf](openxla.org/xprof) profiler and measures execution time on the
 hardware. This method imposes almost no instrumentation overhead due to custom
 full-stack support including the hardware and the compiler.
 
-For GPU kernels, you may use `xprof_hermetic` as well; XProf in turn employs
+For GPU kernels, you may use `'hermetic_xprof'` as well; XProf in turn employs
 NVIDIA’s [CUPTI](https://docs.nvidia.com/cupti) APIs. You may also directly
-invoke a CUPTI timer with `method=cupti`. Either method does impose some
+invoke a CUPTI timer with `method='cupti'`. Either method does impose some
 variable overhead, typically up to 5%.
 
 #### Data Distribution

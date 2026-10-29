@@ -257,8 +257,6 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       (65536, 32768, 32768),
   )
   def test_heuristics_config(self, m, k, n):
-    if not jax.devices()[0].device_kind.startswith("TPU7x"):
-      self.skipTest("This test is only supported on TPU v7.")
     num_groups = 256
 
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()

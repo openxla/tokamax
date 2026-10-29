@@ -1,0 +1,152 @@
+{
+  "{\"x\":\"bf16[8192,4096]\",\"indices\":\"i32[81920]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1258.7948460131884,
+      "lower_time_ms": 10.797369061037898,
+      "evaluation_times_ms": [
+        0.907,
+        0.891,
+        0.898,
+        0.889,
+        0.887
+      ],
+      "metadata": {},
+      "peak_memory_mb": 738.853888
+    }
+  },
+  "{\"x\":\"bf16[8192,4096]\",\"indices\":\"i32[81920]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 1654.3318459989678,
+      "lower_time_ms": 15.777434000483481,
+      "evaluation_times_ms": [
+        0.905,
+        0.9,
+        0.911,
+        0.895,
+        0.9
+      ],
+      "metadata": {},
+      "peak_memory_mb": 738.853888
+    }
+  },
+  "{\"x\":\"bf16[512,512]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 59.60722401505336,
+      "lower_time_ms": 10.195787996053696,
+      "evaluation_times_ms": [
+        0.006,
+        0.006,
+        0.006,
+        0.006,
+        0.006
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2.106368
+    }
+  },
+  "{\"x\":\"bf16[512,512]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 59.99659502413124,
+      "lower_time_ms": 10.052536032162607,
+      "evaluation_times_ms": [
+        0.006,
+        0.006,
+        0.006,
+        0.006,
+        0.006
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2.106368
+    }
+  },
+  "{\"x\":\"bf16[512,8192]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 183.531367998512,
+      "lower_time_ms": 12.107057998946402,
+      "evaluation_times_ms": [
+        0.013,
+        0.014,
+        0.014,
+        0.014,
+        0.013
+      ],
+      "metadata": {},
+      "peak_memory_mb": 33.563648
+    }
+  },
+  "{\"x\":\"bf16[512,8192]\",\"indices\":\"i32[1024]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 181.59001300227828,
+      "lower_time_ms": 9.666982979979366,
+      "evaluation_times_ms": [
+        0.014,
+        0.014,
+        0.014,
+        0.014,
+        0.014
+      ],
+      "metadata": {},
+      "peak_memory_mb": 33.563648
+    }
+  },
+  "{\"x\":\"bf16[1024,8192]\",\"indices\":\"i32[2048]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 183.25879808980972,
+      "lower_time_ms": 10.315537918359041,
+      "evaluation_times_ms": [
+        0.024,
+        0.024,
+        0.025,
+        0.025,
+        0.024
+      ],
+      "metadata": {},
+      "peak_memory_mb": 67.126272
+    }
+  },
+  "{\"x\":\"bf16[1024,8192]\",\"indices\":\"i32[2048]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 181.47383606992662,
+      "lower_time_ms": 10.009556077420712,
+      "evaluation_times_ms": [
+        0.024,
+        0.025,
+        0.024,
+        0.024,
+        0.024
+      ],
+      "metadata": {},
+      "peak_memory_mb": 67.126272
+    }
+  },
+  "{\"x\":\"bf16[2048,8192]\",\"indices\":\"i32[4096]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1253.4935800358653,
+      "lower_time_ms": 11.025875923223794,
+      "evaluation_times_ms": [
+        0.111,
+        0.116,
+        0.112,
+        0.114,
+        0.114
+      ],
+      "metadata": {},
+      "peak_memory_mb": 100.697088
+    }
+  },
+  "{\"x\":\"bf16[2048,8192]\",\"indices\":\"i32[4096]\",\"start\":\"i32[1]\",\"end\":\"i32[1]\",\"return_residuals\":true}": {
+    "{}": {
+      "compile_time_ms": 1248.074188013561,
+      "lower_time_ms": 10.477992007508874,
+      "evaluation_times_ms": [
+        0.113,
+        0.115,
+        0.114,
+        0.116,
+        0.115
+      ],
+      "metadata": {},
+      "peak_memory_mb": 100.697088
+    }
+  }
+}

@@ -185,26 +185,15 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
             plgpu.commit_smem()
 
           with jax.named_scope("smem -> gmem"):
-            # Write out the largest power of two rows first,
-            # then the next largest, etc.
-            # This allows us to coalesce writes as much as possible.
-            offset = start_within_block
-            size = 1 << (min(cluster_block_m, m).bit_length() - 1)
-            while size > 0:
-              ns = pl.ds(ni * cluster_block_n + cluster_idx * block_n, block_n)
-
-              @pl.when(actual_size & size != 0)
-              def _():
-                ms = pl.ds(block_start + offset, size)
-                out_smem_slice = acc_smem.at[pl.ds(offset, size)]
-                plgpu.copy_smem_to_gmem(
-                    out_smem_slice, out_gmem.at[ms, ns], commit_group=False
-                )
-
-              offset += actual_size & size
-              size //= 2
-            plgpu.commit_smem_to_gmem_group()
-            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            common.copy_ragged_smem_to_gmem(
+                acc_smem,
+                out_gmem,
+                block_start=block_start,
+                start_within_block=start_within_block,
+                actual_size=actual_size,
+                ns=pl.ds(ni * cluster_block_n + cluster_idx * block_n, block_n),
+                max_rows=min(cluster_block_m, m),
+            )
 
       return carry + (actual_size > 0)
 
@@ -217,14 +206,15 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
         num_barriers=2, orders_tensor_core=True
     )
 
-  tiled_smem = mgpu_lib.tiled_swizzled_smem
+  x_smem_shape = (num_stages, block_m, block_k)
+  w_smem_shape = (num_stages, block_n, block_k)
   scratch_shapes = dict(
-      x_smem=tiled_smem((num_stages, block_m, block_k), lhs.dtype, "x"),
-      w_smem=tiled_smem((num_stages, block_n, block_k), rhs.dtype, "w"),
+      x_smem=common.tiled_swizzled_smem(x_smem_shape, lhs.dtype, "x"),
+      w_smem=common.tiled_swizzled_smem(w_smem_shape, rhs.dtype, "w"),
       acc_tmem=plgpu.TMEM(
           (block_n, cluster_block_m * 2), jnp.float32, collective=collective
       ),
-      acc_smem=tiled_smem(
+      acc_smem=common.tiled_swizzled_smem(
           (cluster_block_m, block_n), out_dtype, "acc", tiling_prefix=(1,)
       ),
       xw_barrier=plgpu.Barrier(num_arrivals=2, num_barriers=num_stages),

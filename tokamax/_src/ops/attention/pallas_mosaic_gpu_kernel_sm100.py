@@ -18,7 +18,7 @@ import dataclasses
 import functools
 import itertools
 import math
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import jax
 from jax import lax
@@ -65,11 +65,7 @@ _L_CONSUMED = 5
 _ALPHA_PRODUCED = 6  # There are two barriers for alpha.
 
 _load_bcast = common.load_bcast
-
-_MASK_PACK_DTYPE = jnp.int8
-_MASK_PACKED_BITS = mgpu_lib.num_bits(_MASK_PACK_DTYPE)
-_MIN_MASK_COLS = 128 // _MASK_PACKED_BITS
-
+_MASK_PACKED_BITS = common.MASK_PACKED_BITS
 _FORBID_EXTRA = pydantic.ConfigDict(extra="forbid")
 
 
@@ -88,7 +84,7 @@ class Config(common.ConfigBase):
 
   num_tma_splits: pydantic.PositiveInt = 1
   collective: pydantic.StrictBool = True
-  persistent: pydantic.StrictBool = False
+  persistent: pydantic.StrictBool | Literal["static"] = False
 
   def __post_init__(self):
     block_q_per_cta = self.block_q // 2 if self.collective else self.block_q
@@ -190,8 +186,8 @@ def _get_scratch_types(
     scratch["bias_consumed"] = plgpu.Barrier()
 
   if mask is not None and mask.shape[-2] != 1 and mask.shape[-1] != 1:
-    shape = (tile_q, max(block_kv // _MASK_PACKED_BITS, _MIN_MASK_COLS))
-    scratch["mask_smem"] = plgpu.SMEM(shape, _MASK_PACK_DTYPE)
+    shape = (tile_q, max(block_kv // _MASK_PACKED_BITS, common.MIN_MASK_COLS))
+    scratch["mask_smem"] = plgpu.SMEM(shape, common.MASK_PACK_DTYPE)
     scratch["mask_produced"] = plgpu.Barrier()
     scratch["mask_consumed"] = plgpu.Barrier()
 
@@ -273,7 +269,7 @@ def get_heuristics_config(
         q, k, v, bias, mask, out_dtype, config, normalize_output=norm
     )
     smem_bytes = mgpu_lib.estimate_smem_bytes(
-        scratch, uses_dynamic_scheduling_loop=config.persistent
+        scratch, uses_dynamic_scheduling_loop=config.persistent is True  # pylint: disable=g-bool-id-comparison
     )
     if smem_bytes <= 227 * 1024:
       return config
@@ -296,7 +292,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
         # TODO: Investigate why split_k=2 doesn't work with block_kv=128.
         for split_k in [1, 2] if block_kv == 64 else [1]:
           for collective in [False, True] if split_k == 1 else [False]:
-            for persistent in [False, True]:
+            for persistent in [False, True, "static"]:
               q, k, v, bias, mask = eval_in_shapes(
                   collective=collective, split_k=split_k
               )
@@ -321,7 +317,7 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
                   q, k, v, bias, mask, out_dtype, config, normalize_output=norm
               )
               smem_bytes = mgpu_lib.estimate_smem_bytes(
-                  scratch, uses_dynamic_scheduling_loop=persistent
+                  scratch, uses_dynamic_scheduling_loop=persistent is True  # pylint: disable=g-bool-id-comparison
               )
               if smem_bytes <= 227 * 1024:
                 configs.add(config)
@@ -378,19 +374,20 @@ def flash_attention_kernel(
   head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
 
+  if bias is not None and bias.shape[-2] != 1:
+    bias = shape_lib.pad_to_next_multiple_of(bias, 8, -2)
+
   if mask is not None:
     if mask.shape[-2] == 1 or mask.shape[-1] == 1:
       mask = mask.astype(jnp.int8)
     else:
-      mask = jnp.packbits(mask, axis=-1, bitorder="little")
-      mask = mask.view(_MASK_PACK_DTYPE)
-      mask = shape_lib.pad_to_next_multiple_of(mask, m=_MIN_MASK_COLS, axis=-1)
+      mask = common.pack_mask(mask)
 
   block_q = config.block_q
   block_kv = config.block_kv
   num_q_tiles = pl.cdiv(q_seq_len, block_q)
   mask_block_kv = block_kv // _MASK_PACKED_BITS
-  mask_block_size = max(mask_block_kv, _MIN_MASK_COLS)
+  mask_block_size = max(mask_block_kv, common.MIN_MASK_COLS)
   num_stages = config.num_stages
   num_tma_splits = config.num_tma_splits
 
@@ -434,6 +431,7 @@ def flash_attention_kernel(
 
     @grid_loop(init_carry=0)
     def grid_loop_body(gmems, loop_info: plgpu.NDLoopInfo, carry):
+      is_first_grid_iter = jnp.asarray(loop_info.local_index == 0)
       prev_iters = carry
       (
           q_gmem,
@@ -619,11 +617,7 @@ def flash_attention_kernel(
             @pl.when(warp_id == _MMA_WARP)
             def tma_load_q_mma_warp():
               assert q_consumed is not None
-
-              @pl.when(loop_info.local_index == 0)
-              def prologue():
-                plgpu.barrier_arrive(q_consumed)
-
+              plgpu.barrier_arrive(q_consumed, predicate=is_first_grid_iter)
               plgpu.async_prefetch(
                   q_gmem.at[qs_cluster, hi],
                   collective_axes=collective_axis,
@@ -671,14 +665,11 @@ def flash_attention_kernel(
       @pl.when(wg == _SOFTMAX_WG)
       def softmax_wg():
         plgpu.set_max_registers(256, action="increase")
-
-        @pl.when(loop_info.local_index == 0)
-        def prologue():
-          plgpu.barrier_arrive(s_consumed)
-          if bias_consumed is not None:
-            plgpu.barrier_arrive(bias_consumed)
-          if mask_consumed is not None:
-            plgpu.barrier_arrive(mask_consumed)
+        plgpu.barrier_arrive(s_consumed, predicate=is_first_grid_iter)
+        if bias_consumed is not None:
+          plgpu.barrier_arrive(bias_consumed, predicate=is_first_grid_iter)
+        if mask_consumed is not None:
+          plgpu.barrier_arrive(mask_consumed, predicate=is_first_grid_iter)
 
         @pl.when(ub > lb)
         def compute():
@@ -813,13 +804,16 @@ def flash_attention_kernel(
           # in 2CTA we have non square blocks hence we may need to process
           # M//N steps with a mask, for M=256, N=128 this means 2 steps
           causal_blocks = int(is_causal) * (block_q // block_kv)
-          carry = lax.fori_loop(
-              lb, ub - causal_blocks, kv_loop, (m_i, m_i, l_i)
-          )
+          # Never start the causal loop before `lb`: with fewer than
+          # `causal_blocks` KV blocks (e.g. 2CTA with a single KV block), we
+          # would otherwise run more iterations than the MMA warp, and wait on
+          # `s_produced` forever.
+          ub_no_causal = lax.max(lb, ub - causal_blocks)
+          carry = lax.fori_loop(lb, ub_no_causal, kv_loop, (m_i, m_i, l_i))
 
           if is_causal:
             causal_kv_loop = functools.partial(kv_loop, do_causal=True)
-            carry = lax.fori_loop(ub - causal_blocks, ub, causal_kv_loop, carry)
+            carry = lax.fori_loop(ub_no_causal, ub, causal_kv_loop, carry)
 
           m_scale, m_i, l_i = carry
 
@@ -854,10 +848,10 @@ def flash_attention_kernel(
         def prologue():
           mgpu_lib.bar_arrive(_L_CONSUMED, num_threads=256)
 
-        @pl.when(ub > lb)
-        def release_out_scaled_barriers():
-          for i in range(num_tma_splits):
-            plgpu.barrier_arrive(acc_produced.at[i])
+        for i in range(num_tma_splits):
+          plgpu.barrier_arrive(
+              acc_produced.at[i], predicate=jnp.asarray(ub > lb)
+          )
 
         def two_in_flight(iterable):
           for a, _ in itertools.pairwise(itertools.chain(iterable, [None])):
@@ -984,20 +978,8 @@ def flash_attention_kernel(
 
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-  def pre_reduce_k_range_per_qtile(range_ref):
-    if range_ref is None:
-      return None
-
-    def pad_reduce(pad_value: int):
-      k_range_ = shape_lib.pad_to_next_multiple_of(
-          range_ref, block_q, -1, pad_value
-      )
-      return shape_lib.einshape("...(bq)->...bq", q=block_q)(k_range_)
-
-    return (jnp.min(pad_reduce(kv_seq_len), -1), jnp.max(pad_reduce(0), -1))
-
-  k_start_minmax = pre_reduce_k_range_per_qtile(k_start)
-  k_end_minmax = pre_reduce_k_range_per_qtile(k_end)
+  k_start_minmax = common.k_range_block_minmax(k_start, kv_seq_len, block_q)
+  k_end_minmax = common.k_range_block_minmax(k_end, kv_seq_len, block_q)
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:
@@ -1017,7 +999,11 @@ def flash_attention_kernel(
       profile_dir="sponge" if profile else "",
   )
 
-  if config.persistent:
+  if config.persistent == "static":
+    maybe_persistent_kernel = mgpu_lib.static_scheduling_persistent_kernel
+  elif not isinstance(config.persistent, bool):
+    raise ValueError("config.persistent must be 'static' or True/False")
+  elif config.persistent:
     maybe_persistent_kernel = mgpu_lib.dynamic_scheduling_persistent_kernel
   else:
     maybe_persistent_kernel = mgpu_lib.not_persistent_grid_loop_kernel
