@@ -45,6 +45,12 @@ def tpu_mesh_context():
     yield
 
 
+def get_tpu_info() -> pltpu.TpuInfo:
+  """Returns the active TPU hardware info, using an abstract TPU mesh on CPU."""
+  with tpu_mesh_context():
+    return pltpu.get_tpu_info()
+
+
 HBM_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
 
 
@@ -67,13 +73,37 @@ class MHCContext:
 class MhcKernelConfig:
   """Compiler and tiling configuration for mHC Pallas kernels."""
 
-  block_size: int = 128
+  block_size: int | None = None
   fwd_pipeline_blocks: int = 2
-  bwd_block_size: int = 256
-  vmem_limit_bytes: int = 128 * 1024 * 1024
+  bwd_block_size: int | None = None
+  vmem_limit_bytes: int | None = None
   rms_epsilon: float = 1e-5
   pre_mapping_epsilon: float = 1e-6
   interpret: bool = False
+
+
+def resolve_config(config: MhcKernelConfig) -> MhcKernelConfig:
+  """Resolves `None` tiling and VMEM parameters using `get_tpu_info()`."""
+  tpu_info = get_tpu_info()
+  block_size = (
+      tpu_info.num_lanes if config.block_size is None else config.block_size
+  )
+  bwd_block_size = (
+      2 * tpu_info.num_lanes
+      if config.bwd_block_size is None
+      else config.bwd_block_size
+  )
+  vmem_limit_bytes = (
+      tpu_info.vmem_capacity_bytes
+      if config.vmem_limit_bytes is None
+      else config.vmem_limit_bytes
+  )
+  return dataclasses.replace(
+      config,
+      block_size=block_size,
+      bwd_block_size=bwd_block_size,
+      vmem_limit_bytes=vmem_limit_bytes,
+  )
 
 
 def pre_cost(
@@ -212,17 +242,22 @@ def token_block_spec(shape: tuple[int, ...], block_size: int) -> pl.BlockSpec:
 
 def fold_norm_scale(norm_scale, w_pre, w_post, w_res) -> jax.Array:
   """Folds the RMSNorm channel scale into the three projection matrices."""
-  weights = jnp.concatenate((w_pre, w_post, w_res), axis=-1).astype(jnp.float32)
-  return norm_scale.astype(jnp.float32)[:, None] * weights
+  with jax.named_scope("fold_norm_scale"):
+    weights = jnp.concatenate((w_pre, w_post, w_res), axis=-1).astype(
+        jnp.float32
+    )
+    return norm_scale.astype(jnp.float32)[:, None] * weights
 
 
 def validate_token_block_size(
     tokens: int, block_size: int, *, name: str = "block_size"
 ) -> None:
   """Validates a token-axis Pallas block size."""
-  if block_size < 8 or block_size % 8:
+  num_sublanes = get_tpu_info().num_sublanes
+  if block_size < num_sublanes or block_size % num_sublanes:
     raise UnsupportedInputError(
-        f"{name} must be a positive multiple of 8; got {block_size}."
+        f"Expected {name} to be a positive multiple of {num_sublanes}; got"
+        f" {block_size}."
     )
   if tokens % block_size:
     raise UnsupportedInputError(
@@ -233,7 +268,7 @@ def validate_token_block_size(
 
 def validate_inputs(
     x: jax.Array,
-    block_size: int,
+    block_size: int | None = None,
     permutations_shape: tuple[int, ...] | None = None,
     *,
     block_size_name: str = "block_size",
@@ -268,8 +303,11 @@ def validate_inputs(
         f" expansion rate 4 only; got x.shape={x.shape} and"
         f" permutations.shape={permutations_shape}."
     )
-  if embedding % 128:
+  tpu_info = get_tpu_info()
+  if embedding % tpu_info.num_lanes:
     raise UnsupportedInputError(
-        f"The embedding dimension must be divisible by 128; got {embedding}."
+        f"Expected embedding dim to be a multiple of {tpu_info.num_lanes}; got"
+        f" {embedding}."
     )
-  validate_token_block_size(tokens, block_size, name=block_size_name)
+  resolved_block_size = tpu_info.num_lanes if block_size is None else block_size
+  validate_token_block_size(tokens, resolved_block_size, name=block_size_name)
