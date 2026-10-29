@@ -19,8 +19,10 @@ import unittest
 from absl import logging
 from absl.testing import absltest
 import torch
-from tokamax.experimental.torch_tpu.ops.nsa import nsa as nsa_pallas
 from tokamax.experimental.torch_tpu.ops.nsa import torch_base
+from tokamax.experimental.torch_tpu.ops.nsa import torch_pallas_mosaic_tpu
+
+nsa_pallas = torch_pallas_mosaic_tpu.nsa
 
 
 class NSAPallasKernelTest(unittest.TestCase):
