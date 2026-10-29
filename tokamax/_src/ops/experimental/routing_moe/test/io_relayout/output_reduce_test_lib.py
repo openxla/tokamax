@@ -24,7 +24,6 @@ from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
 from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
-from tokamax._src.ops.experimental.routing_moe.test.common import test_util
 
 
 @dataclasses.dataclass(frozen=True)
@@ -85,7 +84,6 @@ class ReduceCase:
   @classmethod
   def make_case(cls, case: test_cases.Case, *, seed: int = 1234) -> Self:
     """Generates random gmm2 rows and the top-k routing of `case`."""
-    test_util.check_output_reduce_supported(case)
     shape = case.shape
     k_gate, k_rows = jax.random.split(jax.random.key(seed))
     gating_output = test_inputs.random_gating(

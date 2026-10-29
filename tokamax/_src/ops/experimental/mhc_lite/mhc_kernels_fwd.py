@@ -103,11 +103,12 @@ def _run_fwd_pipeline(
       jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in out_shapes_dtypes
   )
   kernel_main = pltpu.emit_pipeline(
-      body_fn,
+      lambda unused_step, *refs: body_fn(*refs),
       grid=(tokens // chunk_tokens,),
       in_specs=in_specs,
       out_specs=out_specs,
       dimension_semantics=(pltpu.PARALLEL,),
+      _explicit_indices=True,
   )
   with common.tpu_mesh_context():
     return pl.pallas_call(

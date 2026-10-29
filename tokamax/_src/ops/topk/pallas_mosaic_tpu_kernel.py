@@ -150,8 +150,8 @@ def _topk_body(
         body
     )  # pytype: disable=bad-argument-type
 
-  def pipeline_step(scores_vmem, len_slice_vmem, out_vmem, keys_vmem):
-    w = pl.program_id(0)
+  def pipeline_step(step, scores_vmem, len_slice_vmem, out_vmem, keys_vmem):
+    w = step.index[0]
     row = w * (num_sc_cores * num_subcores) + flat
     active = row < b
     eff_len = jnp.minimum(vec_at(len_slice_vmem, 0), n)
@@ -352,6 +352,7 @@ def _topk_body(
       grid=(num_waves,),
       in_specs=in_specs,
       out_specs=out_specs,
+      _explicit_indices=True,
   )(scores_hbm, lengths_hbm, out_hbm, keys_hbm)
 
 

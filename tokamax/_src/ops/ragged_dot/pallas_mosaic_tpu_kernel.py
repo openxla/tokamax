@@ -440,6 +440,8 @@ def gmm(
     return jax.tree.map(getter, x)
 
   def kernel(
+      step,
+      unused_grid,
       group_metadata,
       _,
       lhs_ref,
@@ -449,7 +451,7 @@ def gmm(
       *,
       subchannel_iters: int,
   ):
-    grid_id, k_i = pl.program_id(1), pl.program_id(2)
+    grid_id, k_i = step.index[1], step.index[2]
 
     @pl.when(k_i == 0)
     def _zero_acc():
@@ -736,6 +738,8 @@ def tgmm(
     )
 
   def kernel(
+      step,
+      grid,
       group_metadata,
       _,
       lhs_ref,
@@ -749,12 +753,12 @@ def tgmm(
       raise NotImplementedError(
           "subchannel_iters != 1 not supported yet in tgmm."
       )
-    grid_id = pl.program_id(2)
+    grid_id = step.index[2]
     group_offsets, group_ids, _ = group_metadata
     group = group_ids[grid_id]
     prev_group = group_ids[jnp.where(grid_id > 0, grid_id - 1, 0)]
     is_prologue = (grid_id == 0) | (group != prev_group)
-    is_end_of_grid = grid_id == (pl.num_programs(2) - 1)
+    is_end_of_grid = grid_id == (grid[2] - 1)
     next_group = group_ids[jnp.where(is_end_of_grid, grid_id, grid_id + 1)]
     is_epilogue = is_end_of_grid | (group != next_group)
     group_size = group_offsets[group + 1] - group_offsets[group]

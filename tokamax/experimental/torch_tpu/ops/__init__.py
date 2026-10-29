@@ -30,6 +30,7 @@ from tokamax.experimental.torch_tpu.ops.masked_dense_mla.torch_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops.mhc.torch_pallas_mosaic_tpu import PallasMosaicTpuMhcFusedPostPre as mhc_fused_post_pre
 from tokamax.experimental.torch_tpu.ops.mhc.torch_pallas_mosaic_tpu import PallasMosaicTpuMhcPost as mhc_post
 from tokamax.experimental.torch_tpu.ops.mhc.torch_pallas_mosaic_tpu import PallasMosaicTpuMhcPre as mhc_pre
+from tokamax.experimental.torch_tpu.ops.nsa.torch_pallas_mosaic_tpu import PallasMosaicTpuNativeSparseAttention as native_sparse_attention
 from tokamax.experimental.torch_tpu.ops.proj_and_save_state.torch_pallas_mosaic_tpu import PallasMosaicTpuProjAndSaveState as proj_and_save_state
 from tokamax.experimental.torch_tpu.ops.ragged_dot.torch_pallas_mosaic_tpu import PallasMosaicTpuRaggedDot as ragged_dot
 from tokamax.experimental.torch_tpu.ops.ragged_gather.torch_pallas_mosaic_tpu import PallasMosaicTpuRaggedGather as ragged_gather
