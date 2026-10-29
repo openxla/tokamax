@@ -117,39 +117,96 @@ class DotProductAttentionTest(parameterized.TestCase):
     self.assertIsInstance(args['k'], array_type)
     self.assertIsInstance(args['v'], array_type)
 
+  @parameterized.product(
+      group_num=[2, 4],
+      is_causal=[False, True],
+      has_bias=[False, True],
+  )
+  def test_dot_product_attention_gqa_mqa_multi_chunk(
+      self, group_num, is_causal, has_bias
+  ):
+    if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic' and has_bias:
+      # TODO: Remove once bias is supported on Mosaic TPU.
+      self.skipTest('Bias is not supported on Mosaic TPU attention.')
+
+    dtype = jnp.bfloat16
+    cudnn_bias = self.IMPL == 'cudnn' and has_bias
+    # Sequence length 1152 = 9 * 128 exceeds `_XLA_CHUNK_SIZE = (512, 1024)`
+    # with non-zero remainders on both Q and KV loops while staying 128-aligned.
+    B, S, T, N, H, G = (1 if cudnn_bias else 2), 1152, 1152, 4, 64, group_num
+    q = jax.ShapeDtypeStruct((B, T, N, H), dtype)
+    k = jax.ShapeDtypeStruct((B, S, N // G, H), dtype)
+    v = jax.ShapeDtypeStruct((B, S, N // G, H), dtype)
+    dout = jax.ShapeDtypeStruct((B, T, N, H), dtype)
+    bias = jax.ShapeDtypeStruct((1, N, T, S), dtype) if has_bias else None
+    (q, k, v, bias), dout = numerics.random_initialize(((q, k, v, bias), dout))
+
+    sdpa_ref = functools.partial(
+        jax.nn.dot_product_attention, is_causal=is_causal, implementation='xla'
+    )
+    sdpa_ans = functools.partial(
+        api.dot_product_attention, is_causal=is_causal, implementation=self.IMPL
+    )
+
+    with shape_lib.upcast_broadcast():
+      k_ref = jnp.repeat(k, G, axis=2)
+      v_ref = jnp.repeat(v, G, axis=2)
+
+    out_ref, sdpa_vjp_ref = jax.vjp(sdpa_ref, q, k_ref, v_ref, bias)
+    out_ans, sdpa_vjp_ans = jax.vjp(sdpa_ans, q, k, v, bias)
+
+    dQ_ref, dK_ref, dV_ref, dbias_ref = sdpa_vjp_ref(dout)
+    dQ_ans, dK_ans, dV_ans, dbias_ans = sdpa_vjp_ans(dout)
+    dK_ref = dK_ref.reshape(B, S, N // G, G, H).sum(axis=3)
+    dV_ref = dV_ref.reshape(B, S, N // G, G, H).sum(axis=3)
+
+    chex.assert_trees_all_close(out_ans, out_ref, atol=0.015, rtol=0.015)
+    chex.assert_trees_all_close(dQ_ans, dQ_ref, rtol=0.02, atol=0.02)
+    chex.assert_trees_all_close(dK_ans, dK_ref, rtol=0.03, atol=0.04)
+    chex.assert_trees_all_close(dV_ans, dV_ref, rtol=0.02, atol=0.03)
+    chex.assert_trees_all_close(dbias_ans, dbias_ref, rtol=0.05, atol=0.05)
+
   def test_symbolic_export(self):
     if self.IMPL != 'xla':
       self.skipTest('Symbolic export only supported for XLA.')
 
-    x = jax.ShapeDtypeStruct((2, 16, 4, 64), jnp.bfloat16)
-    batch, seq_len, num_heads, num_channels = x.shape
-    bias = jax.ShapeDtypeStruct((batch, num_heads, 1, seq_len), jnp.bfloat16)
-    x, bias = numerics.random_initialize((x, bias))
-
-    @jax.jit
-    def f(x, bias):
-      return api.dot_product_attention(x, x, x, bias=bias, implementation='xla')
-
-    out = f(x, bias)
-
-    b_symbolic, seq_symbolic = export.symbolic_shape('b,s')
-
-    x_shape = jax.ShapeDtypeStruct(
-        (b_symbolic, seq_symbolic, num_heads, num_channels), x.dtype
+    q_spec = jax.ShapeDtypeStruct((2, 16, 4, 64), jnp.bfloat16)
+    batch, seq_len, num_heads, num_channels = q_spec.shape
+    bias_spec = jax.ShapeDtypeStruct(
+        (batch, num_heads, 1, seq_len), jnp.bfloat16
     )
-    b_shape = jax.ShapeDtypeStruct(
+    q, bias = numerics.random_initialize((q_spec, bias_spec))
+    b_symbolic, seq_symbolic = export.symbolic_shape('b,s')
+    q_sym = jax.ShapeDtypeStruct(
+        (b_symbolic, seq_symbolic, num_heads, num_channels), q.dtype
+    )
+    b_sym = jax.ShapeDtypeStruct(
         (b_symbolic, num_heads, 1, seq_symbolic), bias.dtype
     )
 
-    # Disable jaxtyping to due to
-    # https://github.com/patrick-kidger/jaxtyping/issues/338
-    with jaxtyping.disable_jaxtyping():
-      exported = export.export(f)(x_shape, b_shape)
+    @jax.jit
+    def f(q, k, v, bias):
+      return api.dot_product_attention(q, k, v, bias=bias, implementation='xla')
 
-    serialized = exported.serialize()
-    f_roundtrip = export.deserialize(serialized)
-    out_roundtrip = jax.jit(f_roundtrip.call)(x, bias)
-    chex.assert_trees_all_close(out, out_roundtrip)
+    for num_kv_heads in (1, 2, num_heads):
+      kv_spec = jax.ShapeDtypeStruct(
+          (batch, seq_len, num_kv_heads, num_channels), jnp.bfloat16
+      )
+      k, v = numerics.random_initialize((kv_spec, kv_spec))
+      out = f(q, k, v, bias)
+      kv_sym = jax.ShapeDtypeStruct(
+          (b_symbolic, seq_symbolic, num_kv_heads, num_channels), q.dtype
+      )
+
+      # Disable jaxtyping to due to
+      # https://github.com/patrick-kidger/jaxtyping/issues/338
+      with jaxtyping.disable_jaxtyping():
+        exported = export.export(f)(q_sym, kv_sym, kv_sym, b_sym)
+
+      serialized = exported.serialize()
+      f_roundtrip = export.deserialize(serialized)
+      out_roundtrip = jax.jit(f_roundtrip.call)(q, k, v, bias)
+      chex.assert_trees_all_close(out, out_roundtrip)
 
   @parameterized.product(
       mask_mode=[
@@ -321,11 +378,6 @@ class DotProductAttentionTest(parameterized.TestCase):
     if self.IMPL in (None, 'cudnn'):
       self.skipTest(
           'Memory scaling guarantees not made for this implementation'
-      )
-    # TODO: Fwd+bwd pass for xla_chunked is O(N^2).
-    if self.IMPL == 'xla_chunked' and mode == 'fwd_bwd':
-      self.skipTest(
-          'Skip test. Memory scaling for fwd+bwd for xla_chunked is O(N^2).'
       )
     # TODO: Fwd+bwd pass for mosaic TPU is O(N^2).
     if (

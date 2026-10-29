@@ -110,11 +110,10 @@ def _run_test(
   if isinstance(mask := (impl_kwargs | kwargs).get("mask"), base.CausalMask):
     mask = base.Mask(causal_mask=mask)
   if isinstance(mask, base.Mask):
-    q_indices = impl_kwargs.get("q_indices", None)
-    k_indices = impl_kwargs.get("k_indices", None)
-    q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
-    k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
-    mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+    q_indices = (impl_kwargs | kwargs).get("q_indices", None)
+    k_indices = (impl_kwargs | kwargs).get("k_indices", None)
+    mask = base.mask_as_array(mask, q, k, q_indices, k_indices)
+    mask = base.repeat_kv_heads(mask, -3, q.shape[-2], k.shape[-2])
 
   if isinstance(mask, jax.Array):
     is_fully_masked = jnp.all(jnp.swapaxes(mask, -2, -3) == 0, axis=-1)
@@ -337,17 +336,26 @@ class AttentionTestBase(parameterized.TestCase):
         expect_supported=(seq_q == seq_kv or self._supports_cross_attention),
     )
 
-  def test_multi_query_attention(self):
+  @parameterized.parameters(jnp.float32, jnp.bfloat16)
+  def test_multi_query_attention(self, dtype):
     def ref_impl(q, k, v, **kwargs):
       k = jnp.broadcast_to(k, (*k.shape[:-2], q.shape[-2], k.shape[-1]))
       v = jnp.broadcast_to(v, (*v.shape[:-2], q.shape[-2], v.shape[-1]))
       return nn.dot_product_attention(q, k, v, **kwargs)
 
+    atol = {jnp.float32: 1e-6, jnp.bfloat16: 1e-2}[dtype]
+    atol_grads = {jnp.float32: None, jnp.bfloat16: 3e-2}[dtype]
     self._run_test(
-        q_shape=(2, 1024, 4, 64), kv_shape=(2, 1024, 1, 64), ref_impl=ref_impl
+        q_shape=(2, 1024, 4, 64),
+        kv_shape=(2, 1024, 1, 64),
+        dtype=dtype,
+        atol=atol,
+        atol_grads=atol_grads,
+        ref_impl=ref_impl,
     )
 
-  def test_grouped_query_attention(self):
+  @parameterized.parameters(jnp.float32, jnp.bfloat16)
+  def test_grouped_query_attention(self, dtype):
 
     def ref(q, k, v, **kwargs):
       repeats = q.shape[-2] // k.shape[-2]
@@ -355,7 +363,16 @@ class AttentionTestBase(parameterized.TestCase):
       v = jnp.repeat(v, repeats, axis=-2)
       return nn.dot_product_attention(q, k, v, **kwargs)
 
-    self._run_test((2, 1024, 16, 64), kv_shape=(2, 1024, 4, 64), ref_impl=ref)
+    atol = {jnp.float32: 1e-6, jnp.bfloat16: 1e-2}[dtype]
+    atol_grads = {jnp.float32: None, jnp.bfloat16: 3e-2}[dtype]
+    self._run_test(
+        (2, 1024, 16, 64),
+        kv_shape=(2, 1024, 4, 64),
+        dtype=dtype,
+        atol=atol,
+        atol_grads=atol_grads,
+        ref_impl=ref,
+    )
 
   def test_no_batch_dim(self):
     self._run_test((1024, 4, 64))

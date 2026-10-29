@@ -14,7 +14,9 @@
 # ==============================================================================
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import chex
+from flax import linen as nn
 import jax
 from jax import export
 import jax.numpy as jnp
@@ -153,6 +155,42 @@ class MaskTest(absltest.TestCase):
     )
     chex.assert_trees_all_equal(actual, expected)
 
+  def test_mask_as_array_gqa_per_kv_head(self):
+    q = jnp.zeros((2, 8, 8, 16))
+    k = jnp.zeros((2, 8, 2, 16))
+    k_start = jnp.array([[0], [2]])
+    k_end = jnp.array([[6], [8]])
+    mask = base.Mask(k_start=k_start, k_end=k_end)
+    arr = base.mask_as_array(mask, q, k, None, None)
+    assert arr is not None
+    self.assertEqual(arr.shape, (2, 1, 8))
+    arr_rep = base.repeat_kv_heads(arr, -3, 8, 2)
+    self.assertEqual(arr_rep.shape, (8, 1, 8))
+
+    q_start = jnp.arange(8)[:, None]
+    combined = base.Mask(q_start=q_start, k_start=k_start, k_end=k_end)
+    combined_arr = base.mask_as_array(combined, q, k, None, None)
+    expected = base.Mask(
+        q_start=q_start,
+        k_start=jnp.repeat(k_start, 4, axis=-2),
+        k_end=jnp.repeat(k_end, 4, axis=-2),
+    ).as_array(8, 8)
+    chex.assert_trees_all_equal(combined_arr, expected)
+
+  def test_bind_head_validation(self):
+    op = base.DotProductAttention()
+    q = jax.ShapeDtypeStruct((2, 16, 8, 32), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((2, 16, 2, 32), jnp.bfloat16)
+    v_mismatch = jax.ShapeDtypeStruct((2, 16, 4, 32), jnp.bfloat16)
+    with self.assertRaisesRegex(ValueError, "same number of heads"):
+      op.bind(q, k, v_mismatch)
+    k_zero = jax.ShapeDtypeStruct((2, 16, 0, 32), jnp.bfloat16)
+    with self.assertRaisesRegex(ValueError, "divisible"):
+      op.bind(q, k_zero, k_zero)
+    q_rank2 = jax.ShapeDtypeStruct((16, 32), jnp.bfloat16)
+    with self.assertRaisesRegex(ValueError, "at least 3 dimensions"):
+      op.bind(q_rank2, k, k)
+
 
 class DotProductAttentionTest(test_base.AttentionTestBase):
 
@@ -169,6 +207,61 @@ class DotProductAttentionTest(test_base.AttentionTestBase):
     super()._run_test(
         q_shape, *args, dtype=dtype, impl_kwargs=impl_kwargs, **kwargs
     )
+
+  @parameterized.product(
+      num_heads_kv=(1, 2),
+      dtype=(jnp.float32, jnp.bfloat16),
+  )
+  def test_mqa_and_gqa_with_masks_and_bias(self, num_heads_kv, dtype):
+    num_heads_q = 8
+    repeats = num_heads_q // num_heads_kv
+    seq_q, seq_k = 64, 96
+    k_start = jnp.arange(num_heads_kv, dtype=jnp.int32)[:, None] * 4
+    k_end = jnp.full((num_heads_kv, 1), seq_k - 4, dtype=jnp.int32)
+    q_start = jnp.arange(num_heads_q, dtype=jnp.int32)[:, None]
+    mask = base.Mask(
+        is_causal=True, q_start=q_start, k_start=k_start, k_end=k_end
+    )
+    ref_mask = base.Mask(
+        is_causal=True,
+        q_start=q_start,
+        k_start=jnp.repeat(k_start, repeats, axis=-2),
+        k_end=jnp.repeat(k_end, repeats, axis=-2),
+    ).as_array(seq_q, seq_k)
+
+    def ref_impl(q, k, v, **kwargs):
+      k = jnp.repeat(k, repeats, axis=-2)
+      v = jnp.repeat(v, repeats, axis=-2)
+      return nn.dot_product_attention(q, k, v, **kwargs)
+
+    atol = {jnp.float32: 2e-6, jnp.bfloat16: 1.5e-2}[dtype]
+    atol_grads = {jnp.float32: 1e-5, jnp.bfloat16: 4e-2}[dtype]
+    self._run_test(
+        q_shape=(2, seq_q, num_heads_q, 32),
+        kv_shape=(2, seq_k, num_heads_kv, 32),
+        bias_shape=(1, num_heads_q, 1, seq_k),
+        dtype=dtype,
+        impl_kwargs=dict(mask=mask),
+        ref_kwargs=dict(mask=ref_mask),
+        ref_impl=ref_impl,
+        atol=atol,
+        atol_grads=atol_grads,
+    )
+
+  @parameterized.parameters(1, 2)
+  def test_mqa_gqa_no_logits_transpose_or_kv_repeat_in_hlo(self, num_heads_kv):
+    q = jax.ShapeDtypeStruct((2, 64, 8, 32), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((2, 96, num_heads_kv, 32), jnp.bfloat16)
+    v = jax.ShapeDtypeStruct((2, 96, num_heads_kv, 32), jnp.bfloat16)
+    hlo_text = jax.jit(self._attention_fn).lower(q, k, v).as_text("hlo")
+    for line in hlo_text.splitlines():
+      if "transpose(" in line:
+        has_q_dim = any(d in line for d in ("64", "256", "512"))
+        self.assertFalse(
+            has_q_dim and "96" in line,
+            msg=f"Unexpected quadratic logits/weights transpose: {line}",
+        )
+      self.assertNotIn("bf16[2,96,8,32]", line)
 
 
 class DotProductAttentionWithExplicitVjpTest(DotProductAttentionTest):

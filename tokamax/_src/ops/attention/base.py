@@ -621,8 +621,20 @@ class DotProductAttention[C, K: Hashable](
     if (dropout_rate != 0.0) and (dropout_mask is None):
       raise ValueError("`dropout_mask` can't be None if `dropout_rate` != 0.0")
 
+    if q.ndim < 3 or k.ndim < 3 or v.ndim < 3:
+      raise ValueError("`q`, `k`, and `v` must have at least 3 dimensions.")
+
     if paging_info is None and k.shape[:-3] != q.shape[:-3]:
       raise ValueError("`k` batch size must be the same as `q`.")
+
+    if k.shape[-2] != v.shape[-2]:
+      raise ValueError("`k` and `v` must have the same number of heads.")
+
+    if k.shape[-2] == 0 or q.shape[-2] % k.shape[-2] != 0:
+      raise ValueError(
+          f"`q` number of heads ({q.shape[-2]}) must be divisible by `k`"
+          f" number of heads ({k.shape[-2]})."
+      )
 
     if not isinstance(precision, tuple):
       precision = (precision, precision)
@@ -694,12 +706,6 @@ class DotProductAttention[C, K: Hashable](
     del config  # Unused.
 
     q, k, v = map(quantization.as_array, (q, k, v))
-    if k.shape[-2] not in (1, q.shape[-2]):
-      repeats = q.shape[-2] // k.shape[-2]
-
-      with shape_lib.upcast_broadcast():
-        k = jnp.repeat(k, repeats, axis=-2)
-        v = jnp.repeat(v, repeats, axis=-2)
 
     q_k_dot_precision, weights_v_dot_precision = precision
     q_k_dot_precision = precision_lib.to_dot_algorithm_preset(
@@ -709,13 +715,8 @@ class DotProductAttention[C, K: Hashable](
         v.dtype, v.dtype, weights_v_dot_precision
     )
 
-    logits = jnp.einsum(
-        "...qhd,...khd->...hqk",
-        q,
-        k,
-        precision=q_k_dot_precision,
-        preferred_element_type=q_k_dot_precision.accumulation_type,
-    ).astype(logits_dtype)
+    num_heads_k = k.shape[-2]
+    logits = qk_dot(q, k, q_k_dot_precision, logits_dtype)
 
     logits *= logits_scale
 
@@ -725,29 +726,86 @@ class DotProductAttention[C, K: Hashable](
     if logits_soft_cap is not None:
       logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
-    q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
-    k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
-    mask: jax.Array | None = mask.as_array(q_len_or_indices, k_len_or_indices)
+    mask_arr = mask_as_array(mask, q, k, q_indices, k_indices)
+    mask_arr = repeat_kv_heads(mask_arr, -3, q.shape[-2], num_heads_k)
 
-    if mask is not None:
+    if mask_arr is not None:
       # This is not `-inf` as this can lead to `NaN`s when a full softmax row is
       # masked (with stable softmax). This is because the maximum value for the
       # row will be `-inf`, leading to `(-inf) - (-inf)` in the softmax.
-      logits = jnp.where(mask, logits, float(jnp.finfo(logits.dtype).min))
+      logits = jnp.where(mask_arr, logits, float(jnp.finfo(logits.dtype).min))
 
     weights, softmax_residuals = _softmax(logits, normalize_output)
 
     if dropout_mask is not None:
       weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
 
-    out = jnp.einsum(
+    out = wv_dot(weights, v, weights_v_dot_precision, q.dtype)
+    return out, (softmax_residuals if return_residuals else None)
+
+
+def qk_dot(
+    q: jax.Array,
+    k: jax.Array,
+    precision: jax.lax.DotAlgorithmPreset,
+    logits_dtype: DTypeLike,
+) -> jax.Array:
+  """Computes `q @ k.T` in shape `[*B, H, T, t]` without repeating `k`."""
+  num_heads_q, num_heads_k = q.shape[-2], k.shape[-2]
+  if num_heads_q == num_heads_k:
+    return jnp.einsum(
+        "...qhd,...khd->...hqk",
+        q,
+        k,
+        precision=precision,
+        preferred_element_type=precision.accumulation_type,
+    ).astype(logits_dtype)
+  q_grouped = shape_lib.einshape("...q(hg)d->...h(gq)d", h=num_heads_k)(q)
+  logits = jnp.einsum(
+      "...hpd,...khd->...hpk",
+      q_grouped,
+      k,
+      precision=precision,
+      preferred_element_type=precision.accumulation_type,
+  ).astype(logits_dtype)
+  return logits.reshape(
+      *logits.shape[:-3], num_heads_q, q.shape[-3], k.shape[-3]
+  )
+
+
+def wv_dot(
+    weights: jax.Array,
+    v: jax.Array,
+    precision: jax.lax.DotAlgorithmPreset,
+    out_dtype: DTypeLike,
+) -> jax.Array:
+  """Computes `weights @ v` in shape `[*B, T, H, d]` without repeating `v`."""
+  num_heads_q, num_heads_v = weights.shape[-3], v.shape[-2]
+  if num_heads_q == num_heads_v:
+    return jnp.einsum(
         "...hqk,...khd->...qhd",
         weights,
         v,
-        precision=weights_v_dot_precision,
-        preferred_element_type=weights_v_dot_precision.accumulation_type,
-    ).astype(q.dtype)
-    return out, (softmax_residuals if return_residuals else None)
+        precision=precision,
+        preferred_element_type=precision.accumulation_type,
+    ).astype(out_dtype)
+  num_groups = num_heads_q // num_heads_v
+  weights_grouped = weights.reshape(
+      *weights.shape[:-3],
+      num_heads_v,
+      num_groups * weights.shape[-2],
+      weights.shape[-1],
+  )
+  out = jnp.einsum(
+      "...hpk,...khd->...hpd",
+      weights_grouped,
+      v,
+      precision=precision,
+      preferred_element_type=precision.accumulation_type,
+  )
+  return shape_lib.einshape("...h(gq)d->...q(hg)d", g=num_groups)(out).astype(
+      out_dtype
+  )
 
 
 def needs_stable_softmax(
