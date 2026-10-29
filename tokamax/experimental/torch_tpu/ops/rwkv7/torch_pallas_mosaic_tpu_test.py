@@ -21,8 +21,10 @@ from absl import logging
 from absl.testing import absltest
 import torch
 import torch.nn.functional as F
-from tokamax.experimental.torch_tpu.ops.rwkv7 import rwkv7 as rwkv7_pallas
 from tokamax.experimental.torch_tpu.ops.rwkv7 import torch_base
+from tokamax.experimental.torch_tpu.ops.rwkv7 import torch_pallas_mosaic_tpu
+
+rwkv7_pallas = torch_pallas_mosaic_tpu.rwkv7
 
 
 class RWKV7PallasKernelTest(unittest.TestCase):
