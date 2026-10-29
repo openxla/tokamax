@@ -14,6 +14,8 @@
 # ==============================================================================
 
 import dataclasses
+import functools
+
 import pytest
 import random
 from typing import cast, override
@@ -21,9 +23,11 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import chex
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
+from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import test_base
 from tokamax._src.ops.attention import xla_chunked
 
@@ -64,6 +68,233 @@ class XlaChunkedAttentionTest(test_base.AttentionTestBase):
   def test_normalize_output(self):
     with test_base.override_test_args(atol_grads=3e-5):
       super().test_normalize_output()
+
+  @parameterized.product(
+      num_heads_kv=(1, 2),
+      dtype=(jnp.float32, jnp.bfloat16),
+      normalize_output=(True, False),
+  )
+  def test_consistency_with_unchunked_mqa_gqa(
+      self, num_heads_kv, dtype, normalize_output
+  ):
+    num_heads_q = 8
+    # Non-multiples of chunk_size=(48, 80) exercise both main loops and
+    # remainders on both Q and KV sequences.
+    seq_q, seq_k = 140, 210
+    chunked_op = xla_chunked.XlaChunkedDotProductAttention(chunk_size=(48, 80))
+    unchunked_op = base.DotProductAttention()
+
+    keys = jax.random.split(jax.random.PRNGKey(0), 6)
+    q = jax.random.normal(keys[0], (2, seq_q, num_heads_q, 32), dtype)
+    k = jax.random.normal(keys[1], (2, seq_k, num_heads_kv, 32), dtype)
+    v = jax.random.normal(keys[2], (2, seq_k, num_heads_kv, 24), dtype)
+    bias = jax.random.normal(keys[3], (1, num_heads_q, 1, seq_k), dtype)
+    dout = jax.random.normal(keys[4], (2, seq_q, num_heads_q, 24), dtype)
+    dropout_mask = jax.random.bernoulli(
+        keys[5], p=0.75, shape=(2, 1, seq_q, seq_k)
+    )
+
+    k_start = jnp.arange(num_heads_kv, dtype=jnp.int32)[:, None] * 3
+    k_end = jnp.full((num_heads_kv, 1), seq_k - 5, dtype=jnp.int32)
+    q_start = jnp.arange(num_heads_q, dtype=jnp.int32)[:, None]
+    mask = base.Mask(
+        is_causal=True, q_start=q_start, k_start=k_start, k_end=k_end
+    )
+    precision = (
+        jax.lax.Precision.HIGHEST
+        if dtype == jnp.float32
+        else jax.lax.Precision.DEFAULT
+    )
+    common_kwargs = dict(
+        mask=mask,
+        logits_soft_cap=15.0,
+        dropout_mask=dropout_mask,
+        dropout_rate=0.25,
+        normalize_output=normalize_output,
+        precision=precision,
+    )
+
+    out_chunked, vjp_chunked = jax.vjp(
+        lambda q, k, v, b: chunked_op(q, k, v, bias=b, **common_kwargs),
+        q,
+        k,
+        v,
+        bias,
+    )
+    out_unchunked, vjp_unchunked = jax.vjp(
+        lambda q, k, v, b: unchunked_op(q, k, v, bias=b, **common_kwargs),
+        q,
+        k,
+        v,
+        bias,
+    )
+    grads_chunked = vjp_chunked(dout)
+    grads_unchunked = vjp_unchunked(dout)
+
+    if dtype == jnp.float32:
+      atol = rtol = 1e-4
+      atol_grads = rtol_grads = 2e-4
+    elif normalize_output:
+      atol = rtol = 2e-2
+      atol_grads = rtol_grads = 5e-2
+    else:
+      atol = rtol = 4e-2
+      atol_grads = rtol_grads = 1e-1
+    chex.assert_trees_all_close(
+        out_chunked, out_unchunked, atol=atol, rtol=rtol
+    )
+    chex.assert_trees_all_close(
+        grads_chunked, grads_unchunked, atol=atol_grads, rtol=rtol_grads
+    )
+
+  @parameterized.parameters(1, 2)
+  def test_mqa_gqa_no_logits_transpose_or_kv_repeat_in_hlo(self, num_heads_kv):
+    q = jax.ShapeDtypeStruct((2, 64, 8, 32), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((2, 96, num_heads_kv, 32), jnp.bfloat16)
+    v = jax.ShapeDtypeStruct((2, 96, num_heads_kv, 32), jnp.bfloat16)
+    for op in (
+        self._attention_fn,
+        xla_chunked.XlaChunkedDotProductAttention(chunk_size=(32, 48)),
+    ):
+      hlo_text = jax.jit(op).lower(q, k, v).as_text("hlo")
+      for line in hlo_text.splitlines():
+        if "transpose(" in line:
+          has_q_dim = any(d in line for d in ("64", "256", "512"))
+          self.assertFalse(
+              has_q_dim and "96" in line,
+              msg=f"Unexpected quadratic logits/weights transpose: {line}",
+          )
+        self.assertNotIn("bf16[2,96,8,32]", line)
+        self.assertNotIn("bf16[2,48,8,32]", line)
+
+  @parameterized.product(
+      num_heads_kv=(1, 2, 8),
+      logits_dtype=(base.AUTO, jnp.bfloat16),
+      normalize_output=(True, False),
+  )
+  def test_no_bf16_reductions_in_bwd_hlo(
+      self, num_heads_kv, logits_dtype, normalize_output
+  ):
+    bias_shape = {
+        1: (1, 1, 1, 112),
+        2: (1, 8, 80, 1),
+        8: (1, 1, 112),
+    }[num_heads_kv]
+    chunked_op = xla_chunked.XlaChunkedDotProductAttention(chunk_size=(32, 48))
+    q = jax.ShapeDtypeStruct((2, 80, 8, 32), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((2, 112, num_heads_kv, 32), jnp.bfloat16)
+    v = jax.ShapeDtypeStruct((2, 112, num_heads_kv, 32), jnp.bfloat16)
+    bias = jax.ShapeDtypeStruct(bias_shape, jnp.bfloat16)
+    dout = jax.ShapeDtypeStruct((2, 80, 8, 32), jnp.bfloat16)
+
+    def bwd(q, k, v, bias, dout):
+      fn = lambda q, k, v, b: chunked_op(
+          q,
+          k,
+          v,
+          bias=b,
+          is_causal=True,
+          logits_dtype=logits_dtype,
+          normalize_output=normalize_output,
+      )
+      _, vjp_fn = jax.vjp(fn, q, k, v, bias)
+      return vjp_fn(dout)
+
+    lowered = jax.jit(bwd).lower(q, k, v, bias, dout)
+    self.assertEmpty(
+        test_base.find_low_precision_reductions(lowered.as_text("hlo"))
+    )
+    # XLA:TPU's BFloat16Propagation demotes f32 reductions between bf16 converts
+    # because TPU hardware accumulates bf16 reductions in f32.
+    if jax.default_backend() != "tpu":
+      compiled_hlo = lowered.compile().as_text()
+      if compiled_hlo is not None:
+        self.assertEmpty(test_base.find_low_precision_reductions(compiled_hlo))
+
+  @parameterized.parameters(
+      ((0, None, None, None),),
+      ((None, 0, 0, None),),
+      ((None, None, None, 0),),
+  )
+  def test_no_bf16_reductions_in_vmap_bwd_hlo(self, in_axes):
+    vmap_size = 3
+    chunked_op = xla_chunked.XlaChunkedDotProductAttention(chunk_size=(32, 48))
+    q_shape = (2, 80, 8, 32)
+    kv_shape = (2, 112, 2, 32)
+    bias_shape = (1, 8, 1, 112)
+    q = jax.ShapeDtypeStruct(
+        (vmap_size, *q_shape) if in_axes[0] == 0 else q_shape, jnp.bfloat16
+    )
+    k = jax.ShapeDtypeStruct(
+        (vmap_size, *kv_shape) if in_axes[1] == 0 else kv_shape, jnp.bfloat16
+    )
+    v = jax.ShapeDtypeStruct(
+        (vmap_size, *kv_shape) if in_axes[2] == 0 else kv_shape, jnp.bfloat16
+    )
+    bias = jax.ShapeDtypeStruct(
+        (vmap_size, *bias_shape) if in_axes[3] == 0 else bias_shape,
+        jnp.bfloat16,
+    )
+    dout = jax.ShapeDtypeStruct((vmap_size, *q_shape), jnp.bfloat16)
+
+    def bwd(q, k, v, bias, dout):
+      fn = jax.vmap(
+          lambda q, k, v, b: chunked_op(
+              q, k, v, bias=b, is_causal=True, logits_dtype=jnp.bfloat16
+          ),
+          in_axes=in_axes,
+      )
+      _, vjp_fn = jax.vjp(fn, q, k, v, bias)
+      return vjp_fn(dout)
+
+    lowered = jax.jit(bwd).lower(q, k, v, bias, dout)
+    self.assertEmpty(
+        test_base.find_low_precision_reductions(lowered.as_text("hlo"))
+    )
+    if jax.default_backend() != "tpu":
+      compiled_hlo = lowered.compile().as_text()
+      if compiled_hlo is not None:
+        self.assertEmpty(test_base.find_low_precision_reductions(compiled_hlo))
+
+  def test_bwd_broadcast_bias_cross_chunk_f32_accumulation(self):
+    # Chunk 0 contributes ~1.0 to dbias while each of chunks 1..64 contributes
+    # ~0.002 (~0.128 total). Accumulating across Q chunks in bfloat16 swamps
+    # every 0.002 increment (< bf16 ULP 0.0078125 at 1.0), yielding 1.0 instead
+    # of ~1.125.
+    seq_q, seq_k, head_dim = 65 * 16, 16, 16
+    chunked_op = xla_chunked.XlaChunkedDotProductAttention(chunk_size=16)
+    unchunked_op = base.DotProductAttention()
+
+    q = jnp.zeros((1, seq_q, 1, head_dim), jnp.bfloat16)
+    k = jnp.zeros((1, seq_k, 1, head_dim), jnp.bfloat16)
+    v = jnp.ones((1, seq_k, 1, head_dim), jnp.bfloat16) / head_dim
+    bias = jnp.zeros((1, 1, 1, seq_k), jnp.bfloat16)
+    dout = jnp.full((1, seq_q, 1, head_dim), 0.002, jnp.bfloat16)
+    dout = dout.at[:, :16].set(1.0 / 16.0)
+
+    def dbias_fn(op, q, k, v, b, dout):
+      _, vjp_fn = jax.vjp(
+          lambda b_: op(
+              q,
+              k,
+              v,
+              bias=b_,
+              logits_dtype=jnp.bfloat16,
+              normalize_output=False,
+          ),
+          b,
+      )
+      return vjp_fn(dout)[0]
+
+    dbias_chunked = jax.jit(functools.partial(dbias_fn, chunked_op))(
+        q, k, v, bias, dout
+    )
+    dbias_unchunked = jax.jit(functools.partial(dbias_fn, unchunked_op))(
+        q, k, v, bias, dout
+    )
+    chex.assert_trees_all_close(
+        dbias_chunked, dbias_unchunked, atol=1e-2, rtol=1e-2
+    )
 
 
 def _split_into_pages(unpadded_k, unpadded_v, max_num_pages, max_page_size):

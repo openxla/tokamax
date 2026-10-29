@@ -33,8 +33,11 @@ class ApiShardingTest(parameterized.TestCase):
   @parameterized.product(
       implementation=list(api.IMPLEMENTATIONS),
       shard_axis=[0, 2],
+      kv_heads_mode=['mha', 'gqa', 'mqa'],
   )
-  def test_dot_product_attention_sharding(self, implementation, shard_axis):
+  def test_dot_product_attention_sharding(
+      self, implementation, shard_axis, kv_heads_mode
+  ):
     if (
         implementation == 'mosaic_gpu'
         and not gpu_utils.has_mosaic_gpu_support()
@@ -58,10 +61,20 @@ class ApiShardingTest(parameterized.TestCase):
 
     dtype = jnp.bfloat16
     b, s, t, n, h = jax.device_count(), 512, 512, jax.device_count() * 2, 64
+    k_heads = {
+        'mha': n,
+        'gqa': jax.device_count(),
+        'mqa': 1,
+    }[kv_heads_mode]
+    k_spec = list(spec)
+    if k_heads == 1 and shard_axis == 2:
+      k_spec[2] = None
+    k_sharding = NamedSharding(mesh, PartitionSpec(*k_spec))
+
     keys = jax.random.split(jax.random.PRNGKey(0), 3)
     q = jax.random.normal(keys[0], (b, t, n, h), dtype)
-    k = jax.random.normal(keys[1], (b, s, n, h), dtype)
-    v = jax.random.normal(keys[2], (b, s, n, h), dtype)
+    k = jax.random.normal(keys[1], (b, s, k_heads, h), dtype)
+    v = jax.random.normal(keys[2], (b, s, k_heads, h), dtype)
 
     sdpa_ref = functools.partial(
         jax.nn.dot_product_attention, implementation='xla'
@@ -74,15 +87,15 @@ class ApiShardingTest(parameterized.TestCase):
 
     @functools.partial(
         jax.jit,
-        in_shardings=(sharding, sharding, sharding),
+        in_shardings=(sharding, k_sharding, k_sharding),
         out_shardings=sharding,
     )
     def f(q, k, v):
       return sdpa_ans(q, k, v, q_sharding=sharding)
 
     q_sharded = jax.device_put(q, sharding)
-    k_sharded = jax.device_put(k, sharding)
-    v_sharded = jax.device_put(v, sharding)
+    k_sharded = jax.device_put(k, k_sharding)
+    v_sharded = jax.device_put(v, k_sharding)
     out_ans = f(q_sharded, k_sharded, v_sharded)
     self.assertEqual(out_ans.sharding, sharding)
     chex.assert_trees_all_close(out_ans, out_ref, atol=0.01, rtol=0.01)
