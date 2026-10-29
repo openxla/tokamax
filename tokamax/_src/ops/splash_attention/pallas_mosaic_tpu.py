@@ -74,15 +74,27 @@ class Config:
           f"{self.block_kv_compute=} must be a multiple of"
           f" {self.dropout_block_kv=}."
       )
-    if (self.qk_diag_skip or self.sv_diag_skip) and not (
+    if self.qk_diag_skip and self.block_q != self.block_kv:
+      raise ValueError(
+          "qk_diag_skip requires block_q == block_kv "
+          f"({self.block_q=}, {self.block_kv=})."
+      )
+    if self.sv_diag_skip and not (
         self.block_q == self.block_kv == self.block_kv_compute
     ):
       raise ValueError(
-          "qk_diag_skip and sv_diag_skip require square forward blocks "
+          "sv_diag_skip requires square forward blocks "
           f"({self.block_q=}, {self.block_kv=}, {self.block_kv_compute=})."
       )
     if self.qk_diag_grid < 2 or (self.qk_diag_grid & (self.qk_diag_grid - 1)):
       raise ValueError(f"{self.qk_diag_grid=} must be a power of 2 >= 2.")
+    if (
+        self.qk_diag_skip or self.sv_diag_skip
+    ) and self.block_kv_compute % self.qk_diag_grid:
+      raise ValueError(
+          f"{self.block_kv_compute=} must be a multiple of"
+          f" {self.qk_diag_grid=}."
+      )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -357,8 +369,8 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
               use_experimental_scheduler=sched,
           )
       )
-      if is_causal and bq == bkv == bkv_c:
-        if bq >= 1024:
+      if is_causal and bq == bkv:
+        if bkv_c >= 1024:
           qk_diag_grid_sizes = [2, 4]
         else:
           qk_diag_grid_sizes = [2]
@@ -375,7 +387,7 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
                   v_layout=vl,
                   use_experimental_scheduler=sched,
                   qk_diag_skip=True,
-                  sv_diag_skip=True,
+                  sv_diag_skip=(bq == bkv == bkv_c),
                   qk_diag_grid=qk_grid_size,
               )
           )
