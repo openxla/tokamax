@@ -17,18 +17,111 @@
 
 from typing import Any, Optional
 import jax
-import torch
 from tokamax._src.ops.experimental.moba import base as jax_base
+import torch
+from typing_extensions import override
+
 try:
-  from tokamax.experimental.torch_tpu.ops import torch_op
+  from tokamax.experimental.torch_tpu.ops import torch_op  # pylint: disable=g-import-not-at-top
 except ImportError:
   torch_op = None
-from typing_extensions import override
 
 _CHUNK_SIZE = 256
 _TOPK = 4
 
 _BaseTorchOp = torch_op.TorchOp if torch_op is not None else object
+
+
+def _moba_cpu_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    chunk_size: int = _CHUNK_SIZE,
+    topk: int = _TOPK,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+  """Pure PyTorch vectorized fallback executing block-level MoBA attention."""
+  batch_size, num_heads, seq_len, head_dim = q.shape
+  scale = scale or (head_dim**-0.5)
+  num_blocks = seq_len // chunk_size
+  effective_topk = min(topk, num_blocks)
+  block_k_sub = (effective_topk + 1) * chunk_size
+
+  q_blocks = q.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
+  k_blocks = k.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
+  v_blocks = v.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
+
+  q_mean = q_blocks.mean(dim=3)
+  k_mean = k_blocks.mean(dim=3)
+
+  routing = torch.einsum("bhqd,bhnd->bhqn", q_mean, k_mean) * scale
+  q_idx = torch.arange(num_blocks, device=q.device).unsqueeze(1)
+  k_idx = torch.arange(num_blocks, device=q.device).unsqueeze(0)
+  hist_mask = k_idx < q_idx
+  routing = torch.where(
+      hist_mask.unsqueeze(0).unsqueeze(0), routing, -float("inf")
+  )
+  topk_idx = torch.topk(routing, effective_topk, dim=-1).indices
+
+  causal_diag = torch.tril(
+      torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool)
+  )
+
+  outs = []
+  for block_idx in range(num_blocks):
+    q_i = q_blocks[:, :, block_idx]
+    k_diag = k_blocks[:, :, block_idx : block_idx + 1]
+    v_diag = v_blocks[:, :, block_idx : block_idx + 1]
+
+    if effective_topk > 0:
+      slot_idx = topk_idx[:, :, block_idx, :][:, :, :, None, None]
+      k_hist = torch.gather(
+          k_blocks,
+          2,
+          slot_idx.expand(
+              batch_size, num_heads, effective_topk, chunk_size, head_dim
+          ),
+      )
+      v_hist = torch.gather(
+          v_blocks,
+          2,
+          slot_idx.expand(
+              batch_size, num_heads, effective_topk, chunk_size, head_dim
+          ),
+      )
+
+      k_sub = torch.cat([k_diag, k_hist], dim=2).view(
+          batch_size, num_heads, block_k_sub, head_dim
+      )
+      v_sub = torch.cat([v_diag, v_hist], dim=2).view(
+          batch_size, num_heads, block_k_sub, head_dim
+      )
+
+      ranks = torch.arange(effective_topk, device=q.device)
+      valid_hist = (
+          (ranks < block_idx)
+          .repeat_interleave(chunk_size)
+          .view(1, 1, 1, -1)
+          .expand(batch_size, num_heads, chunk_size, -1)
+      )
+      mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(
+          batch_size, num_heads, -1, -1
+      )
+      mask_sub = torch.cat([mask_diag, valid_hist], dim=-1)
+    else:
+      k_sub = k_diag.view(batch_size, num_heads, chunk_size, head_dim)
+      v_sub = v_diag.view(batch_size, num_heads, chunk_size, head_dim)
+      mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(
+          batch_size, num_heads, -1, -1
+      )
+
+    scores = torch.matmul(q_i, k_sub.transpose(-1, -2)) * scale
+    scores = torch.where(mask_sub, scores, -1e9)
+    weights = torch.softmax(scores, dim=-1)
+    o_i = torch.matmul(weights, v_sub)
+    outs.append(o_i)
+
+  return torch.cat(outs, dim=2)
 
 
 class _MixtureOfBlockAttention(_BaseTorchOp):
@@ -91,104 +184,9 @@ class _MixtureOfBlockAttention(_BaseTorchOp):
           q_t, k_t, v_t, topk=topk, chunk_size=chunk_size, scale=scale
       )
     else:
-      out = self._cpu_fallback(q_t, k_t, v_t, chunk_size, topk, scale)
+      out = _moba_cpu_fallback(q_t, k_t, v_t, chunk_size, topk, scale)
 
     return out.transpose(1, 2).contiguous()
-
-  moba_pallas_attention = __call__
-  flash_moba_pallas = __call__
-
-  def _cpu_fallback(
-      self,
-      q: torch.Tensor,
-      k: torch.Tensor,
-      v: torch.Tensor,
-      chunk_size: int = _CHUNK_SIZE,
-      topk: int = _TOPK,
-      scale: Optional[float] = None,
-  ) -> torch.Tensor:
-    """Pure PyTorch vectorized fallback executing block-level MoBA attention."""
-    batch_size, num_heads, seq_len, head_dim = q.shape
-    scale = scale or (head_dim ** -0.5)
-    num_blocks = seq_len // chunk_size
-    effective_topk = min(topk, num_blocks)
-    block_k_sub = (effective_topk + 1) * chunk_size
-
-    q_blocks = q.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
-    k_blocks = k.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
-    v_blocks = v.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
-
-    q_mean = q_blocks.mean(dim=3)
-    k_mean = k_blocks.mean(dim=3)
-
-    routing = torch.einsum("bhqd,bhnd->bhqn", q_mean, k_mean) * scale
-    q_idx = torch.arange(num_blocks, device=q.device).unsqueeze(1)
-    k_idx = torch.arange(num_blocks, device=q.device).unsqueeze(0)
-    hist_mask = k_idx < q_idx
-    routing = torch.where(
-        hist_mask.unsqueeze(0).unsqueeze(0), routing, -float("inf")
-    )
-    topk_idx = torch.topk(routing, effective_topk, dim=-1).indices
-
-    causal_diag = torch.tril(
-        torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool)
-    )
-
-    outs = []
-    for block_idx in range(num_blocks):
-      q_i = q_blocks[:, :, block_idx]
-      k_diag = k_blocks[:, :, block_idx : block_idx + 1]
-      v_diag = v_blocks[:, :, block_idx : block_idx + 1]
-
-      if effective_topk > 0:
-        slot_idx = topk_idx[:, :, block_idx, :][:, :, :, None, None]
-        k_hist = torch.gather(
-            k_blocks,
-            2,
-            slot_idx.expand(
-                batch_size, num_heads, effective_topk, chunk_size, head_dim
-            ),
-        )
-        v_hist = torch.gather(
-            v_blocks,
-            2,
-            slot_idx.expand(
-                batch_size, num_heads, effective_topk, chunk_size, head_dim
-            ),
-        )
-
-        k_sub = torch.cat([k_diag, k_hist], dim=2).view(
-            batch_size, num_heads, block_k_sub, head_dim
-        )
-        v_sub = torch.cat([v_diag, v_hist], dim=2).view(
-            batch_size, num_heads, block_k_sub, head_dim
-        )
-
-        ranks = torch.arange(effective_topk, device=q.device)
-        valid_hist = (
-            (ranks < block_idx)
-            .repeat_interleave(chunk_size)
-            .view(1, 1, 1, -1)
-            .expand(batch_size, num_heads, chunk_size, -1)
-        )
-        mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(
-            batch_size, num_heads, -1, -1
-        )
-        mask_sub = torch.cat([mask_diag, valid_hist], dim=-1)
-      else:
-        k_sub = k_diag.view(batch_size, num_heads, chunk_size, head_dim)
-        v_sub = v_diag.view(batch_size, num_heads, chunk_size, head_dim)
-        mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(
-            batch_size, num_heads, -1, -1
-        )
-
-      scores = torch.matmul(q_i, k_sub.transpose(-1, -2)) * scale
-      scores = torch.where(mask_sub, scores, -1e9)
-      weights = torch.softmax(scores, dim=-1)
-      o_i = torch.matmul(weights, v_sub)
-      outs.append(o_i)
-
-    return torch.cat(outs, dim=2)
 
 
 mixture_of_block_attention = _MixtureOfBlockAttention()

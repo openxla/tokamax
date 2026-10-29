@@ -15,10 +15,21 @@
 
 """Base operator class for Mixture of Block Attention (MoBA)."""
 
+# Dimensions.
+#   B      batch
+#   H      number of attention heads
+#   T      sequence length
+#   D      head dimension
+#   tt     query/key block chunk size (chunk_size)
+#   nt     grid extent over T: nt = T // tt
+#   K      effective number of routed historical blocks per query block
+
 import dataclasses
 from typing import Any, TypeAlias, TypeVar
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from typing_extensions import override
 
@@ -41,15 +52,15 @@ def _single_seq_moba(
   k_s = k_s.astype(jnp.float32)
   v_s = v_s.astype(jnp.float32)
 
-  num_heads, seq_len, head_dim = q_s.shape
-  block_q = chunk_size
-  num_q_blocks = seq_len // block_q
-  effective_topk = min(topk, num_q_blocks)
-  block_k_sub = (effective_topk + 1) * block_q
+  H, T, D = q_s.shape
+  tt = chunk_size
+  nt = T // tt
+  K = min(topk, nt)
+  tk_sub = (K + 1) * tt
 
-  q_blocks = q_s.reshape(num_heads, num_q_blocks, block_q, head_dim)
-  k_blocks = k_s.reshape(num_heads, num_q_blocks, block_q, head_dim)
-  v_blocks = v_s.reshape(num_heads, num_q_blocks, block_q, head_dim)
+  q_blocks = q_s.reshape(H, nt, tt, D)
+  k_blocks = k_s.reshape(H, nt, tt, D)
+  v_blocks = v_s.reshape(H, nt, tt, D)
 
   q_mean = jnp.mean(q_blocks, axis=2)
   k_mean = jnp.mean(k_blocks, axis=2)
@@ -63,15 +74,15 @@ def _single_seq_moba(
       )
       * scale
   )
-  q_idx = jnp.arange(num_q_blocks)[:, None]
-  k_idx = jnp.arange(num_q_blocks)[None, :]
+  q_idx = jnp.arange(nt)[:, None]
+  k_idx = jnp.arange(nt)[None, :]
   historical_mask = k_idx < q_idx
   masked_routing = jnp.where(historical_mask[None], routing_scores, -jnp.inf)
-  _, topk_idx = jax.lax.top_k(masked_routing, effective_topk)
+  _, topk_idx = jax.lax.top_k(masked_routing, K)
   topk_idx = jax.lax.stop_gradient(topk_idx)
 
-  causal_diag = jnp.tril(jnp.ones((block_q, block_q), dtype=bool))
-  ranks = jnp.arange(effective_topk)
+  causal_diag = jnp.tril(jnp.ones((tt, tt), dtype=bool))
+  ranks = jnp.arange(K)
 
   def head_fn(
       q_h: jax.Array, k_h: jax.Array, v_h: jax.Array, topk_h: jax.Array
@@ -82,16 +93,12 @@ def _single_seq_moba(
       v_diag = v_h[block_idx][None, :, :]
       k_hist = k_h[topk_h[block_idx]]
       v_hist = v_h[topk_h[block_idx]]
-      k_sub = jnp.concatenate([k_diag, k_hist], axis=0).reshape(
-          block_k_sub, head_dim
-      )
-      v_sub = jnp.concatenate([v_diag, v_hist], axis=0).reshape(
-          block_k_sub, head_dim
-      )
+      k_sub = jnp.concatenate([k_diag, k_hist], axis=0).reshape(tk_sub, D)
+      v_sub = jnp.concatenate([v_diag, v_hist], axis=0).reshape(tk_sub, D)
 
       valid_hist = jnp.broadcast_to(
-          jnp.repeat(ranks < block_idx, block_q)[None, :],
-          (block_q, effective_topk * block_q),
+          jnp.repeat(ranks < block_idx, tt)[None, :],
+          (tt, K * tt),
       )
       mask_sub = jnp.concatenate([causal_diag, valid_hist], axis=1)
 
@@ -102,38 +109,34 @@ def _single_seq_moba(
       weights = jax.nn.softmax(logits, axis=-1)
       return jnp.matmul(weights, v_sub, precision=jax.lax.Precision.HIGHEST)
 
-    return jax.vmap(block_fn)(jnp.arange(num_q_blocks)).reshape(
-        seq_len, head_dim
-    )
+    return jax.vmap(block_fn)(jnp.arange(nt)).reshape(T, D)
 
   out = jax.vmap(head_fn)(q_blocks, k_blocks, v_blocks, topk_idx)
   return out.astype(orig_dtype)
 
 
 def moba_reference(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
+    q: Float[Array, "B H T D"],
+    k: Float[Array, "B H T D"],
+    v: Float[Array, "B H T D"],
     *,
     topk: int = 4,
     chunk_size: int = 256,
     scale: float | None = None,
-) -> tuple[jax.Array, None]:
+) -> tuple[Float[Array, "B H T D"], None]:
   """Reference implementation of Mixture of Block Attention (MoBA)."""
   if q.shape != k.shape or q.shape != v.shape:
     raise ValueError(
         f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape},"
         f" v={v.shape}"
     )
-  seq_len = q.shape[2]
-  if seq_len % chunk_size != 0:
+  _, _, T, D = q.shape
+  if T % chunk_size != 0:
     raise ValueError(
-        f"Sequence length ({seq_len}) must be divisible by chunk_size"
-        f" ({chunk_size})."
+        f"Sequence length ({T}) must be divisible by chunk_size ({chunk_size})."
     )
   if scale is None:
-    head_dim = q.shape[-1]
-    scale = head_dim ** -0.5
+    scale = D**-0.5
 
   def batch_fn(q_b: jax.Array, k_b: jax.Array, v_b: jax.Array) -> jax.Array:
     return _single_seq_moba(q_b, k_b, v_b, scale, topk, chunk_size)
@@ -152,19 +155,20 @@ class MixtureOfBlockAttention[C](op.Op[Any, Output, Residuals, C, None]):
 
   supports_symbolic_shapes = False
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
+      q: Float[Array, "B H T D"],
+      k: Float[Array, "B H T D"],
+      v: Float[Array, "B H T D"],
       *,
       topk: int = 4,
       chunk_size: int = 256,
       scale: float | None = None,
       config: C | None = None,
       return_residuals: bool = False,
-  ) -> tuple[Output, None]:
+  ) -> tuple[Float[Array, "B H T D"], None]:
     del config, return_residuals
     out, _ = moba_reference(
         q,

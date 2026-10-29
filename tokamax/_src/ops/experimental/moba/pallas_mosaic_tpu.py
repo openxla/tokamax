@@ -15,9 +15,20 @@
 
 """Tokamax operator wrapper for Mixture of Block Attention (MoBA)."""
 
-from typing import Annotated, ClassVar
+# Dimensions.
+#   B      batch
+#   H      number of attention heads
+#   T      sequence length
+#   D      head dimension
+#   tt     query/key block chunk size (chunk_size)
+#   nt     grid extent over T: nt = T // tt
+#   K      effective number of routed historical blocks per query block
+
+from typing import ClassVar
 import jax
+from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.moba import base
 from tokamax._src.ops.experimental.moba import pallas_mosaic_tpu_kernel
@@ -28,8 +39,8 @@ from typing_extensions import override
 class Config:
   """Autotuning and execution configuration for Pallas TPU MoBA."""
 
-  chunk_size: Annotated[int, pydantic.Field(gt=0)] = 256
-  topk: Annotated[int, pydantic.Field(gt=0)] = 4
+  chunk_size: pydantic.PositiveInt = 256
+  topk: pydantic.PositiveInt = 4
 
 
 class PallasTpuMixtureOfBlockAttention(base.MixtureOfBlockAttention[Config]):
@@ -37,26 +48,27 @@ class PallasTpuMixtureOfBlockAttention(base.MixtureOfBlockAttention[Config]):
 
   config_cls: ClassVar[type[Config]] = Config
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
+      q: Float[Array, "B H T D"],
+      k: Float[Array, "B H T D"],
+      v: Float[Array, "B H T D"],
       *,
       topk: int = 4,
       chunk_size: int = 256,
       scale: float | None = None,
       config: Config | None = None,
       return_residuals: bool = False,
-  ) -> tuple[base.Output, None]:
+  ) -> tuple[Float[Array, "B H T D"], None]:
     del return_residuals
     if q.shape != k.shape or q.shape != v.shape:
       raise ValueError(
           f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape},"
           f" v={v.shape}"
       )
-    seq_len = q.shape[2]
+    _, _, T, _ = q.shape
     resolved_chunk_size = (
         config.chunk_size if config is not None else chunk_size
     )
@@ -67,9 +79,9 @@ class PallasTpuMixtureOfBlockAttention(base.MixtureOfBlockAttention[Config]):
       )
     if resolved_topk <= 0:
       raise NotImplementedError(f"topk must be positive, got {resolved_topk}")
-    if seq_len % resolved_chunk_size != 0:
+    if T % resolved_chunk_size != 0:
       raise ValueError(
-          f"Sequence length ({seq_len}) must be divisible by chunk_size"
+          f"Sequence length ({T}) must be divisible by chunk_size"
           f" ({resolved_chunk_size})."
       )
 

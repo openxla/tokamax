@@ -164,6 +164,13 @@ table.ops-table code {
       <td align="center" style="text-align: center;"></td>
       <td>Computes <a href="https://arxiv.org/abs/2405.04434">Multi-Head Latent Attention (MLA)</a> over compressed latent KV caches for DeepSeek-V2, DeepSeek-V3, and DeepSeek-R1 inference.</td>
     </tr>
+    <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/moba"><code>moba</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Block-mean routed sparse causal attention for long-context sequences, implementing <a href="https://arxiv.org/abs/2502.13189">MoBA: Mixture of Block Attention for Long-Context LLMs</a>.</td>
+    </tr>
   </tbody>
 </table>
 

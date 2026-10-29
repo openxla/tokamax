@@ -91,7 +91,7 @@ class MixtureOfBlockAttentionBaseTest(absltest.TestCase):
     k = jnp.zeros((1, 2, 256, 32))
     v = jnp.zeros((1, 2, 256, 16))
     op_instance = base.MixtureOfBlockAttention()
-    with self.assertRaisesRegex(ValueError, "Shapes of q, k, v must match"):
+    with self.assertRaises((ValueError, TypeError)):
       op_instance._fwd(q, k, v, chunk_size=256)
 
 

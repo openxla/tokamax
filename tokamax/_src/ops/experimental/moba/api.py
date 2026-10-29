@@ -15,6 +15,12 @@
 
 """Mixture of Block Attention (MoBA) API."""
 
+# Dimensions.
+#   B      batch
+#   H      number of attention heads
+#   T      sequence length
+#   D      head dimension
+
 from collections.abc import Sequence
 from typing import Final, Literal, TypeAlias
 
