@@ -219,34 +219,10 @@ def nsa_reference(
     scale: float | None = None,
 ) -> tuple[jax.Array, None]:
   """Reference implementation of Native Sparse Attention (NSA)."""
-  if q.shape != k.shape or q.shape != v.shape:
-    raise ValueError(
-        f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape},"
-        f" v={v.shape}"
-    )
-  if chunk_size <= 0:
-    raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
-  if topk <= 0:
-    raise ValueError(f"topk must be positive, got {topk}.")
-  if window <= 0:
-    raise ValueError(f"window must be positive, got {window}.")
-  if cmp_block_size <= 0:
-    raise ValueError(f"cmp_block_size must be positive, got {cmp_block_size}.")
-
-  _, _, T, D = q.shape
-  if T % chunk_size != 0:
-    raise ValueError(
-        f"Sequence length ({T}) must be divisible by chunk_size ({chunk_size})."
-    )
-  if T % cmp_block_size != 0:
-    raise ValueError(
-        f"Sequence length ({T}) must be divisible by cmp_block_size"
-        f" ({cmp_block_size})."
-    )
-
+  _, _, _, D = q.shape
   orig_dtype = q.dtype
   if scale is None:
-    scale = D ** -0.5
+    scale = D**-0.5
 
   q_f32 = q.astype(jnp.float32)
   k_f32 = k.astype(jnp.float32)
@@ -278,7 +254,66 @@ def nsa_reference(
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class NativeSparseAttention[C](op.Op[Any, Output, Residuals, C, None]):
+class NativeSparseAttentionVjp[C](op.Op[Any, Any, None, C, None]):
+  """Native Sparse Attention (NSA) VJP operator."""
+
+  supports_symbolic_shapes = False
+
+  @jaxtyping.jaxtyped
+  @override
+  def _fwd(
+      self,
+      residuals: Residuals,
+      out: Float[Array, "B H T D"],
+      dout: Float[Array, "B H T D"],
+      q: Float[Array, "B H T D"],
+      k: Float[Array, "B H T D"],
+      v: Float[Array, "B H T D"],
+      g_cmp: Float[Array, "B H T D"] | None = None,
+      g_slc: Float[Array, "B H T D"] | None = None,
+      g_swa: Float[Array, "B H T D"] | None = None,
+      *,
+      chunk_size: int = 256,
+      topk: int = 4,
+      window: int = 128,
+      cmp_block_size: int = 64,
+      scale: float | None = None,
+      config: C | None = None,
+      return_residuals: bool = False,
+  ) -> tuple[
+      tuple[
+          Float[Array, "B H T D"],
+          Float[Array, "B H T D"],
+          Float[Array, "B H T D"],
+          Float[Array, "B H T D"] | None,
+          Float[Array, "B H T D"] | None,
+          Float[Array, "B H T D"] | None,
+      ],
+      None,
+  ]:
+    del residuals, out, config, return_residuals
+
+    def fwd_fn(q_, k_, v_, gc_, gs_, gw_):
+      return nsa_reference(
+          q_,
+          k_,
+          v_,
+          g_cmp=gc_,
+          g_slc=gs_,
+          g_swa=gw_,
+          chunk_size=chunk_size,
+          topk=topk,
+          window=window,
+          cmp_block_size=cmp_block_size,
+          scale=scale,
+      )[0]
+
+    _, vjp_fn = jax.vjp(fwd_fn, q, k, v, g_cmp, g_slc, g_swa)
+    return vjp_fn(dout), None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class NativeSparseAttention[C](op.Op[Any, Output, Residuals, C, Any]):
   """Tokamax base operator for Native Sparse Attention (NSA).
 
   Fuses coarse compression, fine-grained top-k block selection, and sliding
@@ -286,6 +321,88 @@ class NativeSparseAttention[C](op.Op[Any, Output, Residuals, C, None]):
   """
 
   supports_symbolic_shapes = False
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(self, "vjp", NativeSparseAttentionVjp())
+
+  @override
+  def bind(
+      self,
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      g_cmp: jax.Array | None = None,
+      g_slc: jax.Array | None = None,
+      g_swa: jax.Array | None = None,
+      *,
+      chunk_size: int = 256,
+      topk: int = 4,
+      window: int = 128,
+      cmp_block_size: int = 64,
+      scale: float | None = None,
+      return_residuals: bool = False,
+  ) -> op.BoundArguments:
+    """Binds and validates arguments for Native Sparse Attention."""
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+      raise ValueError(
+          f"q, k, v must be 4D [B, H, T, D], got q={q.shape}, k={k.shape},"
+          f" v={v.shape}."
+      )
+    if q.shape != k.shape or q.shape != v.shape:
+      raise ValueError(
+          f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape},"
+          f" v={v.shape}"
+      )
+    for gate_name, gate in (
+        ("g_cmp", g_cmp),
+        ("g_slc", g_slc),
+        ("g_swa", g_swa),
+    ):
+      if gate is not None and gate.shape != q.shape:
+        raise ValueError(
+            f"Shape of {gate_name} must match q, got {gate_name}={gate.shape},"
+            f" q={q.shape}"
+        )
+    if chunk_size <= 0:
+      raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+    if topk <= 0:
+      raise ValueError(f"topk must be positive, got {topk}.")
+    if window <= 0:
+      raise ValueError(f"window must be positive, got {window}.")
+    if cmp_block_size <= 0:
+      raise ValueError(
+          f"cmp_block_size must be positive, got {cmp_block_size}."
+      )
+
+    _, _, T, D = q.shape
+    if T % chunk_size != 0:
+      raise ValueError(
+          f"Sequence length ({T}) must be divisible by chunk_size"
+          f" ({chunk_size})."
+      )
+    if T % cmp_block_size != 0:
+      raise ValueError(
+          f"Sequence length ({T}) must be divisible by cmp_block_size"
+          f" ({cmp_block_size})."
+      )
+    if scale is None:
+      scale = float(D**-0.5)
+
+    return super().bind(
+        q,
+        k,
+        v,
+        g_cmp,
+        g_slc,
+        g_swa,
+        chunk_size=chunk_size,
+        topk=topk,
+        window=window,
+        cmp_block_size=cmp_block_size,
+        scale=scale,
+        return_residuals=return_residuals,
+    )
 
   @jaxtyping.jaxtyped
   @override

@@ -28,7 +28,7 @@ from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-import
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.nsa import base
 
-Implementation: TypeAlias = Literal["xla", "mosaic", "mosaic_tpu"]
+Implementation: TypeAlias = Literal["xla", "mosaic"]
 
 IMPLEMENTATIONS = dict(
     xla=base.NativeSparseAttention(),
@@ -37,14 +37,14 @@ IMPLEMENTATIONS = dict(
 try:
   from tokamax._src.ops.experimental.nsa import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top
 
-  IMPLEMENTATIONS["mosaic_tpu"] = (
-      pallas_mosaic_tpu.PallasTpuNativeSparseAttention()
+  IMPLEMENTATIONS["mosaic"] = (
+      pallas_mosaic_tpu.PallasMosaicTpuNativeSparseAttention()
   )
 except ImportError:
   pass
 
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = (
-    ("mosaic_tpu", "xla") if "mosaic_tpu" in IMPLEMENTATIONS else ("xla",)
+    ("mosaic", "xla") if "mosaic" in IMPLEMENTATIONS else ("xla",)
 )
 
 
@@ -80,8 +80,8 @@ def native_sparse_attention(
     cmp_block_size: Block size for coarse compression branch. Sequence length
       must be a multiple of `cmp_block_size`.
     scale: Softmax scale factor. Defaults to `head_dim ** -0.5`.
-    implementation: Which implementation(s) to use, e.g. `"mosaic_tpu"`,
-      `"xla"`. If None, attempts TPU kernel first with fallback to XLA.
+    implementation: Which implementation(s) to use, e.g. `"mosaic"`, `"xla"`. If
+      None, attempts TPU kernel first with fallback to XLA.
 
   Returns:
     Output tensor with shape `[B, H, T, D]`.
@@ -102,8 +102,6 @@ def native_sparse_attention(
 
   errors = []
   for impl in implementations:
-    if impl == "mosaic":
-      impl = "mosaic_tpu"
     if impl not in IMPLEMENTATIONS:
       raise ValueError(f"Unknown implementation: {impl}")
 

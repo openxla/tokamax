@@ -23,7 +23,7 @@ from tokamax._src.ops.experimental.nsa import base
 from tokamax._src.ops.experimental.nsa import pallas_mosaic_tpu
 
 
-class PallasTpuNativeSparseAttentionTest(absltest.TestCase):
+class PallasMosaicTpuNativeSparseAttentionTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -64,7 +64,7 @@ class PallasTpuNativeSparseAttentionTest(absltest.TestCase):
         )
     )
 
-    op_instance = pallas_mosaic_tpu.PallasTpuNativeSparseAttention(
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuNativeSparseAttention(
         bypass_device_check=True
     )
     actual_out = op_instance(
@@ -79,7 +79,7 @@ class PallasTpuNativeSparseAttentionTest(absltest.TestCase):
         window=window,
         cmp_block_size=cmp_size,
     )
-    expected_out, _ = base.NativeSparseAttention()._fwd(
+    expected_out = base.NativeSparseAttention()(
         q,
         k,
         v,
@@ -113,8 +113,10 @@ class PallasTpuNativeSparseAttentionTest(absltest.TestCase):
         k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
     )
 
-    op_instance = pallas_mosaic_tpu.PallasTpuNativeSparseAttention()
-    actual_out, _ = op_instance._fwd(
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuNativeSparseAttention(
+        bypass_device_check=True
+    )
+    actual_out = op_instance(
         q,
         k,
         v,
@@ -123,7 +125,7 @@ class PallasTpuNativeSparseAttentionTest(absltest.TestCase):
         window=window,
         cmp_block_size=cmp_size,
     )
-    expected_out, _ = base.NativeSparseAttention()._fwd(
+    expected_out = base.NativeSparseAttention()(
         q,
         k,
         v,
@@ -147,7 +149,9 @@ class PallasTpuNativeSparseAttentionTest(absltest.TestCase):
                 window=32,
                 cmp_block_size=16,
                 interpret=False,
-            )[0]
+            )[
+                0
+            ]
         ),
         platforms=("tpu",),
     )(shape, shape, shape)

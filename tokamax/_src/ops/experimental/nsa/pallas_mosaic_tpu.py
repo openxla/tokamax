@@ -23,6 +23,7 @@
 #   tt  query/KV block tile extent along T (chunk_size)
 #   tc  compression block tile extent along T (cmp_block_size)
 
+import dataclasses
 from typing import ClassVar
 
 import jax
@@ -53,10 +54,39 @@ class Config:
       )
 
 
-class PallasTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PallasMosaicTpuNativeSparseAttentionVjp(
+    base.NativeSparseAttentionVjp[Config]
+):
+  """Pallas TPU VJP operator for Native Sparse Attention (NSA)."""
+
+  config_cls: ClassVar[type[Config]] = Config
+  supports_symbolic_shapes: ClassVar[bool] = False
+
+  @override
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    return Config(
+        chunk_size=ba.arguments.get("chunk_size", 256),
+        topk=ba.arguments.get("topk", 4),
+        window=ba.arguments.get("window", 128),
+        cmp_block_size=ba.arguments.get("cmp_block_size", 64),
+    )
+
+  @override
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PallasMosaicTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
   """Tokamax operator wrapper for NSA Pallas TPU kernel."""
 
   config_cls: ClassVar[type[Config]] = Config
+  supports_symbolic_shapes: ClassVar[bool] = False
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(self, "vjp", PallasMosaicTpuNativeSparseAttentionVjp())
 
   @jaxtyping.jaxtyped
   @override
@@ -82,16 +112,6 @@ class PallasTpuNativeSparseAttention(base.NativeSparseAttention[Config]):
     resolved_topk = config.topk if config is not None else topk
     resolved_window = config.window if config is not None else window
     tc = config.cmp_block_size if config is not None else cmp_block_size
-    if tt <= 0:
-      raise NotImplementedError(f"chunk_size must be positive, got {tt}")
-    if resolved_topk <= 0:
-      raise NotImplementedError(f"topk must be positive, got {resolved_topk}")
-    if resolved_window <= 0:
-      raise NotImplementedError(
-          f"window must be positive, got {resolved_window}"
-      )
-    if tc <= 0:
-      raise NotImplementedError(f"cmp_block_size must be positive, got {tc}")
 
     out, _ = pallas_mosaic_tpu_kernel.nsa_pallas_fwd(
         q,

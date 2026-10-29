@@ -89,11 +89,11 @@ def _compute_cmp_branch(
 def _flash_slc_kernel(
     # Inputs.
     topk_smem_ref,  # [B, H, nt, tk] i32         full array in SMEM
-    q_vmem_ref,     # [1, 1, 1, tt, D] f32       one query block in VMEM
-    k_vmem_ref,     # [1, 1, 1, tt, D] f32       routed KV block in VMEM
-    v_vmem_ref,     # [1, 1, 1, tt, D] f32       routed KV block in VMEM
+    q_vmem_ref,  # [1, 1, 1, tt, D] f32       one query block in VMEM
+    k_vmem_ref,  # [1, 1, 1, tt, D] f32       routed KV block in VMEM
+    v_vmem_ref,  # [1, 1, 1, tt, D] f32       routed KV block in VMEM
     # Outputs.
-    o_vmem_ref,     # [1, 1, 1, tt, D] f32       one output block in VMEM
+    o_vmem_ref,  # [1, 1, 1, tt, D] f32       one output block in VMEM
     # Scratch.
     m_scratch_ref,  # [tt, D] f32                running row-max across nk
     l_scratch_ref,  # [tt, D] f32                running row-sum across nk
@@ -266,11 +266,11 @@ def _compute_slc_pallas(
 
 def _flash_swa_kernel(
     # Inputs.
-    q_ref,          # [1, 1, 1, tt, D] f32       one query block
-    k_ref,          # [1, 1, 1, tt, D] f32       window KV block at q_i - w_i
-    v_ref,          # [1, 1, 1, tt, D] f32       window KV block at q_i - w_i
+    q_ref,  # [1, 1, 1, tt, D] f32       one query block
+    k_ref,  # [1, 1, 1, tt, D] f32       window KV block at q_i - w_i
+    v_ref,  # [1, 1, 1, tt, D] f32       window KV block at q_i - w_i
     # Outputs.
-    o_ref,          # [1, 1, 1, tt, D] f32       one output block
+    o_ref,  # [1, 1, 1, tt, D] f32       one output block
     # Scratch.
     m_scratch_ref,  # [tt, D] f32                running row-max across nw
     l_scratch_ref,  # [tt, D] f32                running row-sum across nw
@@ -440,25 +440,10 @@ def nsa_pallas_fwd(
     interpret: bool | None = None,
 ) -> tuple[jax.Array, None]:
   """Executes the 3-branch Native Sparse Attention forward pass."""
-  if q.shape != k.shape or q.shape != v.shape:
-    raise ValueError(
-        f"Shapes of q, k, v must match, got q={q.shape}, k={k.shape},"
-        f" v={v.shape}"
-    )
-  _, _, T, D = q.shape
-  if T % chunk_size != 0:
-    raise ValueError(
-        f"Sequence length ({T}) must be divisible by chunk_size ({chunk_size})."
-    )
-  if T % cmp_block_size != 0:
-    raise ValueError(
-        f"Sequence length ({T}) must be divisible by cmp_block_size"
-        f" ({cmp_block_size})."
-    )
-
+  _, _, _, D = q.shape
   orig_dtype = q.dtype
   if scale is None:
-    scale = D ** -0.5
+    scale = D**-0.5
 
   q_f32 = q.astype(jnp.float32)
   k_f32 = k.astype(jnp.float32)

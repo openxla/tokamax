@@ -27,14 +27,13 @@
 #   nc  number of compressed blocks along T (nc = T // tc)
 #   tk  number of selected historical blocks (min(topk, nt))
 
-from typing import Any, Optional
+from collections.abc import Sequence
+from typing import Any
 import jax
-import torch
+import jax.numpy as jnp
 from tokamax._src.ops.experimental.nsa import base as jax_base
-try:
-  from tokamax.experimental.torch_tpu.ops import torch_op
-except ImportError:
-  torch_op = None
+from tokamax.experimental.torch_tpu.ops import torch_op
+import torch
 from typing_extensions import override
 
 _CHUNK_SIZE = 256
@@ -42,154 +41,185 @@ _TOPK = 4
 _WINDOW = 128
 _CMP_BLOCK_SIZE = 64
 
-_BaseTorchOp = torch_op.TorchOp if torch_op is not None else object
+
+class _NativeSparseAttentionVjp[_Config](torch_op.TorchOp[_Config]):
+  """Native Sparse Attention (NSA) VJP Op in Torch."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.op_impl_jax = jax_base.NativeSparseAttentionVjp()
+    self.jax_op_name = "base_native_sparse_attention_vjp"
+    self.is_vjp = True
+    self.fake_impl = self._fake_impl
+
+  def _fake_impl(
+      self,
+      dout: torch.Tensor,
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      g_cmp: torch.Tensor,
+      g_slc: torch.Tensor,
+      g_swa: torch.Tensor,
+      chunk_size: int = _CHUNK_SIZE,
+      topk: int = _TOPK,
+      window: int = _WINDOW,
+      cmp_block_size: int = _CMP_BLOCK_SIZE,
+      scale: float | None = None,
+      config: Sequence[int] | None = None,
+  ) -> tuple[
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+  ]:
+    del dout, chunk_size, topk, window, cmp_block_size, scale, config
+    return (
+        torch.empty_like(q),
+        torch.empty_like(k),
+        torch.empty_like(v),
+        torch.empty_like(g_cmp),
+        torch.empty_like(g_slc),
+        torch.empty_like(g_swa),
+    )
+
+  @override
+  def derive_backward_shapes(
+      self, abstract_argument_dict: dict[str, Any]
+  ) -> dict[str, Any]:
+    if not abstract_argument_dict:
+      return {"residuals": None, "out": None, "dout": None}
+    q_meta = abstract_argument_dict["q"]
+    out_struct = jax.ShapeDtypeStruct(shape=q_meta.shape, dtype=q_meta.dtype)
+    return {
+        "residuals": None,
+        "out": out_struct,
+        "dout": out_struct,
+    }
+
+  @override
+  def __call__(
+      self,
+      dout: torch.Tensor,
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      g_cmp: torch.Tensor,
+      g_slc: torch.Tensor,
+      g_swa: torch.Tensor,
+      chunk_size: int = _CHUNK_SIZE,
+      topk: int = _TOPK,
+      window: int = _WINDOW,
+      cmp_block_size: int = _CMP_BLOCK_SIZE,
+      scale: float | None = None,
+      config: _Config | tuple[int, ...] | None = None,
+  ) -> tuple[
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+  ]:
+    assert self._torch_tokamax_op is not None, "Forward op not registered."
+    return self._torch_tokamax_op(
+        dout,
+        q,
+        k,
+        v,
+        g_cmp,
+        g_slc,
+        g_swa,
+        chunk_size=chunk_size,
+        topk=topk,
+        window=window,
+        cmp_block_size=cmp_block_size,
+        scale=scale,
+        config=self.deconstruct_config(config),
+    )
+
+  @override
+  def op_impl_call(
+      self,
+      dout: jax.Array,
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      g_cmp: jax.Array,
+      g_slc: jax.Array,
+      g_swa: jax.Array,
+      chunk_size: int = _CHUNK_SIZE,
+      topk: int = _TOPK,
+      window: int = _WINDOW,
+      cmp_block_size: int = _CMP_BLOCK_SIZE,
+      scale: float | None = None,
+      config: tuple[int, ...] | None = None,
+  ) -> tuple[
+      jax.Array,
+      jax.Array,
+      jax.Array,
+      jax.Array,
+      jax.Array,
+      jax.Array,
+  ]:
+    del config
+    assert self.op_impl_jax is not None, "Forward class not set."
+    out_dummy = jnp.zeros_like(q)
+    (dq, dk, dv, dg_cmp, dg_slc, dg_swa), _ = (
+        self.op_impl_jax._fwd(  # pylint: disable=protected-access
+            None,
+            out_dummy,
+            dout,
+            q,
+            k,
+            v,
+            g_cmp=g_cmp,
+            g_slc=g_slc,
+            g_swa=g_swa,
+            chunk_size=chunk_size,
+            topk=topk,
+            window=window,
+            cmp_block_size=cmp_block_size,
+            scale=scale,
+            config=None,
+            return_residuals=False,
+        )
+    )
+    assert dg_cmp is not None and dg_slc is not None and dg_swa is not None
+    return dq, dk, dv, dg_cmp, dg_slc, dg_swa
 
 
-def _nsa_cpu_fallback(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_cmp: torch.Tensor,
-    g_slc: torch.Tensor,
-    g_swa: torch.Tensor,
-    chunk_size: int = _CHUNK_SIZE,
-    topk: int = _TOPK,
-    window: int = _WINDOW,
-    cmp_block_size: int = _CMP_BLOCK_SIZE,
-    scale: Optional[float] = None,
-) -> torch.Tensor:
-  """Pure PyTorch fallback evaluating the three NSA branches."""
-  batch_size, num_heads, seq_len, head_dim = q.shape
-  scale = scale or (head_dim ** -0.5)
-
-  # 1. Coarse compression branch
-  num_cmp_blocks = seq_len // cmp_block_size
-  k_cmp = k.view(
-      batch_size, num_heads, num_cmp_blocks, cmp_block_size, head_dim
-  ).mean(dim=3)
-  v_cmp = v.view(
-      batch_size, num_heads, num_cmp_blocks, cmp_block_size, head_dim
-  ).mean(dim=3)
-  scores_cmp = torch.einsum("bhtd,bhcd->bhtc", q, k_cmp) * scale
-  q_pos = torch.arange(seq_len, device=q.device).unsqueeze(1)
-  c_pos = (
-      torch.arange(num_cmp_blocks, device=q.device) * cmp_block_size
-  ).unsqueeze(0)
-  mask_cmp = (c_pos + cmp_block_size - 1) <= q_pos
-  scores_cmp = torch.where(
-      mask_cmp.unsqueeze(0).unsqueeze(0), scores_cmp, -1e9
-  )
-  w_cmp = torch.softmax(scores_cmp, dim=-1)
-  w_cmp = torch.where(
-      (q_pos >= cmp_block_size - 1).unsqueeze(0).unsqueeze(0),
-      w_cmp,
-      torch.zeros_like(w_cmp),
-  )
-  o_cmp = torch.einsum("bhtc,bhcd->bhtd", w_cmp, v_cmp)
-
-  # 2. Fine-grained selection branch
-  num_blocks = seq_len // chunk_size
-  effective_topk = min(topk, num_blocks)
-  block_k_sub = (effective_topk + 1) * chunk_size
-  q_b = q.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
-  k_b = k.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
-  v_b = v.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
-  q_mean = q_b.mean(dim=3)
-  k_mean = k_b.mean(dim=3)
-  routing = torch.einsum("bhqd,bhnd->bhqn", q_mean, k_mean) * scale
-  q_idx = torch.arange(num_blocks, device=q.device).unsqueeze(1)
-  k_idx = torch.arange(num_blocks, device=q.device).unsqueeze(0)
-  routing = torch.where(
-      (k_idx < q_idx).unsqueeze(0).unsqueeze(0), routing, -float("inf")
-  )
-  topk_idx = torch.topk(routing, effective_topk, dim=-1).indices
-
-  causal_diag = torch.tril(
-      torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool)
-  )
-  slc_outs = []
-  for block_idx in range(num_blocks):
-    q_i = q_b[:, :, block_idx]
-    k_diag = k_b[:, :, block_idx : block_idx + 1]
-    v_diag = v_b[:, :, block_idx : block_idx + 1]
-
-    if effective_topk > 0:
-      slot_idx = topk_idx[:, :, block_idx, :][:, :, :, None, None]
-      k_hist = torch.gather(
-          k_b,
-          2,
-          slot_idx.expand(
-              batch_size, num_heads, effective_topk, chunk_size, head_dim
-          ),
-      )
-      v_hist = torch.gather(
-          v_b,
-          2,
-          slot_idx.expand(
-              batch_size, num_heads, effective_topk, chunk_size, head_dim
-          ),
-      )
-      k_sub = torch.cat([k_diag, k_hist], dim=2).view(
-          batch_size, num_heads, block_k_sub, head_dim
-      )
-      v_sub = torch.cat([v_diag, v_hist], dim=2).view(
-          batch_size, num_heads, block_k_sub, head_dim
-      )
-
-      ranks = torch.arange(effective_topk, device=q.device)
-      valid_hist = (
-          (ranks < block_idx)
-          .repeat_interleave(chunk_size)
-          .view(1, 1, 1, -1)
-          .expand(batch_size, num_heads, chunk_size, -1)
-      )
-      mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(
-          batch_size, num_heads, -1, -1
-      )
-      mask_sub = torch.cat([mask_diag, valid_hist], dim=-1)
-    else:
-      k_sub = k_diag.view(batch_size, num_heads, chunk_size, head_dim)
-      v_sub = v_diag.view(batch_size, num_heads, chunk_size, head_dim)
-      mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(
-          batch_size, num_heads, -1, -1
-      )
-
-    scores = torch.matmul(q_i, k_sub.transpose(-1, -2)) * scale
-    scores = torch.where(mask_sub, scores, -1e9)
-    w_slc = torch.softmax(scores, dim=-1)
-    slc_outs.append(torch.matmul(w_slc, v_sub))
-  o_slc = torch.cat(slc_outs, dim=2)
-
-  # 3. Sliding window branch
-  scores_swa = torch.einsum("bhtd,bhsd->bhts", q, k) * scale
-  s_pos = torch.arange(seq_len, device=q.device).unsqueeze(0)
-  mask_swa = (s_pos <= q_pos) & (s_pos >= q_pos - window)
-  scores_swa = torch.where(
-      mask_swa.unsqueeze(0).unsqueeze(0), scores_swa, -1e9
-  )
-  w_swa = torch.softmax(scores_swa, dim=-1)
-  o_swa = torch.einsum("bhts,bhsd->bhtd", w_swa, v)
-
-  return g_cmp * o_cmp + g_slc * o_slc + g_swa * o_swa
-
-
-class _NativeSparseAttention(_BaseTorchOp):
+class _NativeSparseAttention[_Config](torch_op.TorchOp[_Config]):
   """PyTorch wrapper for base Native Sparse Attention (NSA) operator."""
 
-  def __init__(
+  def __init__(self) -> None:
+    super().__init__()
+    self.op_impl_jax = jax_base.NativeSparseAttention()
+    self.backward_op_torch = _NativeSparseAttentionVjp()
+    self.jax_op_name = "base_native_sparse_attention"
+    self.fake_impl = self._fake_impl
+
+  def _fake_impl(
       self,
-      op_impl_jax: Any = None,
-      jax_op_name: str = "torch_base_nsa",
-  ):
-    if torch_op is not None:
-      super().__init__()
-    self.op_impl_jax = (
-        op_impl_jax
-        if op_impl_jax is not None
-        else jax_base.NativeSparseAttention()
-    )
-    self.jax_op_name = jax_op_name
-    self._torch_tokamax_op = None
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      g_cmp: torch.Tensor,
+      g_slc: torch.Tensor,
+      g_swa: torch.Tensor,
+      chunk_size: int = _CHUNK_SIZE,
+      topk: int = _TOPK,
+      window: int = _WINDOW,
+      cmp_block_size: int = _CMP_BLOCK_SIZE,
+      scale: float | None = None,
+      config: Sequence[int] | None = None,
+      bwd_config: Sequence[int] | None = None,
+  ) -> torch.Tensor:
+    del k, v, g_cmp, g_slc, g_swa, chunk_size, topk, window, cmp_block_size
+    del scale, config, bwd_config
+    return torch.empty_like(q)
 
   @override
   def op_impl_call(
@@ -197,16 +227,33 @@ class _NativeSparseAttention(_BaseTorchOp):
       q: jax.Array,
       k: jax.Array,
       v: jax.Array,
-      g_cmp: Optional[jax.Array] = None,
-      g_slc: Optional[jax.Array] = None,
-      g_swa: Optional[jax.Array] = None,
+      g_cmp: jax.Array,
+      g_slc: jax.Array,
+      g_swa: jax.Array,
       chunk_size: int = _CHUNK_SIZE,
       topk: int = _TOPK,
       window: int = _WINDOW,
       cmp_block_size: int = _CMP_BLOCK_SIZE,
-      scale: Optional[float] = None,
+      scale: float | None = None,
+      config: tuple[int, ...] | None = None,
+      bwd_config: tuple[int, ...] | None = None,
   ) -> jax.Array:
-    out, _ = self.op_impl_jax._fwd(
+    del config, bwd_config
+    assert self.op_impl_jax is not None, "Forward class not set."
+    self.op_impl_jax.bind(
+        q,
+        k,
+        v,
+        g_cmp,
+        g_slc,
+        g_swa,
+        chunk_size=chunk_size,
+        topk=topk,
+        window=window,
+        cmp_block_size=cmp_block_size,
+        scale=scale,
+    )
+    out, _ = self.op_impl_jax._fwd(  # pylint: disable=protected-access
         q,
         k,
         v,
@@ -218,6 +265,8 @@ class _NativeSparseAttention(_BaseTorchOp):
         window=window,
         cmp_block_size=cmp_block_size,
         scale=scale,
+        config=None,
+        return_residuals=False,
     )
     return out
 
@@ -227,28 +276,16 @@ class _NativeSparseAttention(_BaseTorchOp):
       q: torch.Tensor,
       k: torch.Tensor,
       v: torch.Tensor,
-      g_cmp: Optional[torch.Tensor] = None,
-      g_slc: Optional[torch.Tensor] = None,
-      g_swa: Optional[torch.Tensor] = None,
+      g_cmp: torch.Tensor | None = None,
+      g_slc: torch.Tensor | None = None,
+      g_swa: torch.Tensor | None = None,
       chunk_size: int = _CHUNK_SIZE,
       topk: int = _TOPK,
       window: int = _WINDOW,
       cmp_block_size: int = _CMP_BLOCK_SIZE,
-      scale: Optional[float] = None,
+      scale: float | None = None,
+      configs: tuple[_Config | None, _Config | None] | None = None,
   ) -> torch.Tensor:
-    batch_size, seq_len, num_heads, head_dim = q.shape
-    del batch_size, num_heads, head_dim
-    if seq_len % chunk_size != 0:
-      raise ValueError(
-          f"Sequence length ({seq_len}) must be divisible by chunk_size"
-          f" ({chunk_size})"
-      )
-    if seq_len % cmp_block_size != 0:
-      raise ValueError(
-          f"Sequence length ({seq_len}) must be divisible by cmp_block_size"
-          f" ({cmp_block_size})"
-      )
-
     if g_cmp is None:
       g_cmp = torch.full_like(q, 1.0 / 3.0)
     if g_slc is None:
@@ -263,42 +300,110 @@ class _NativeSparseAttention(_BaseTorchOp):
     gs_t = g_slc.transpose(1, 2).contiguous()
     gw_t = g_swa.transpose(1, 2).contiguous()
 
-    if self._torch_tokamax_op is not None and q.device.type in ("tpu", "xla"):
-      out = self._torch_tokamax_op(
-          q_t,
-          k_t,
-          v_t,
-          gc_t,
-          gs_t,
-          gw_t,
-          chunk_size=chunk_size,
-          topk=topk,
-          window=window,
-          cmp_block_size=cmp_block_size,
-          scale=scale,
-      )
-    else:
-      out = _nsa_cpu_fallback(
-          q_t,
-          k_t,
-          v_t,
-          gc_t,
-          gs_t,
-          gw_t,
-          chunk_size=chunk_size,
-          topk=topk,
-          window=window,
-          cmp_block_size=cmp_block_size,
-          scale=scale,
-      )
-
+    fwd_config, bwd_config = (None, None) if configs is None else configs
+    assert self._torch_tokamax_op is not None, "Forward op not registered."
+    assert self.backward_op_torch is not None, "Backward op not set."
+    out = self._torch_tokamax_op(
+        q_t,
+        k_t,
+        v_t,
+        gc_t,
+        gs_t,
+        gw_t,
+        chunk_size=chunk_size,
+        topk=topk,
+        window=window,
+        cmp_block_size=cmp_block_size,
+        scale=scale,
+        config=self.deconstruct_config(fwd_config),
+        bwd_config=self.backward_op_torch.deconstruct_config(bwd_config),
+    )
     return out.transpose(1, 2).contiguous()
 
+  @override
+  def setup_context(
+      self,
+      ctx: Any,
+      inputs: Sequence[Any],
+      output: torch.Tensor,
+  ) -> None:
+    del output
+    (
+        q,
+        k,
+        v,
+        g_cmp,
+        g_slc,
+        g_swa,
+        chunk_size,
+        topk,
+        window,
+        cmp_block_size,
+        scale,
+        _,
+        bwd_config,
+    ) = inputs
+    ctx.save_for_backward(q, k, v, g_cmp, g_slc, g_swa)
+    ctx.chunk_size = chunk_size
+    ctx.topk = topk
+    ctx.window = window
+    ctx.cmp_block_size = cmp_block_size
+    ctx.scale = scale
+    ctx.bwd_config = bwd_config
 
-native_sparse_attention = _NativeSparseAttention()
-object.__setattr__(
-    native_sparse_attention, "nsa_pallas_attention", native_sparse_attention
-)
-object.__setattr__(
-    native_sparse_attention, "flash_nsa_pallas", native_sparse_attention
-)
+  @override
+  def backward(
+      self,
+      ctx: Any,
+      dout: torch.Tensor,
+  ) -> tuple[
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+  ]:
+    assert self.backward_op_torch is not None, "Backward op not set."
+    q, k, v, g_cmp, g_slc, g_swa = ctx.saved_tensors
+    dq, dk, dv, dg_cmp, dg_slc, dg_swa = self.backward_op_torch(
+        dout,
+        q,
+        k,
+        v,
+        g_cmp,
+        g_slc,
+        g_swa,
+        chunk_size=ctx.chunk_size,
+        topk=ctx.topk,
+        window=ctx.window,
+        cmp_block_size=ctx.cmp_block_size,
+        scale=ctx.scale,
+        config=ctx.bwd_config,
+    )
+    return (
+        dq,
+        dk,
+        dv,
+        dg_cmp,
+        dg_slc,
+        dg_swa,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+# Singleton instance of the NativeSparseAttention op.
+NativeSparseAttention = _NativeSparseAttention[Any]()  # pylint: disable=invalid-name

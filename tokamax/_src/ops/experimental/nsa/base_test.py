@@ -60,7 +60,7 @@ class NativeSparseAttentionBaseTest(absltest.TestCase):
     )
 
     op_instance = base.NativeSparseAttention()
-    actual_out, _ = op_instance._fwd(
+    actual_out = op_instance(
         q,
         k,
         v,
@@ -133,13 +133,71 @@ class NativeSparseAttentionBaseTest(absltest.TestCase):
     v = jnp.zeros((1, 2, 300, 16))
     op_instance = base.NativeSparseAttention()
     with self.assertRaisesRegex(ValueError, "must be divisible by chunk_size"):
-      op_instance._fwd(q, k, v, chunk_size=256)
+      op_instance(q, k, v, chunk_size=256)
 
     q_cmp = jnp.zeros((1, 2, 256, 16))
     with self.assertRaisesRegex(
         ValueError, "must be divisible by cmp_block_size"
     ):
-      op_instance._fwd(q_cmp, q_cmp, q_cmp, chunk_size=64, cmp_block_size=48)
+      op_instance(q_cmp, q_cmp, q_cmp, chunk_size=64, cmp_block_size=48)
+
+    with self.assertRaisesRegex(ValueError, "chunk_size must be positive"):
+      op_instance(q_cmp, q_cmp, q_cmp, chunk_size=0)
+
+  def test_vjp_matches_reference(self):
+    key = jax.random.PRNGKey(7)
+    batch_size, num_heads, seq_len, head_dim = 1, 2, 128, 16
+    chunk_size, topk, window, cmp_size = 64, 2, 32, 16
+
+    k0, k1, k2, k3 = jax.random.split(key, 4)
+    q = jax.random.normal(
+        k0, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+    k = jax.random.normal(
+        k1, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+    v = jax.random.normal(
+        k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+    dout = jax.random.normal(
+        k3, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
+    )
+
+    op_instance = base.NativeSparseAttention()
+    _, vjp_fn = jax.vjp(
+        lambda q_, k_, v_: op_instance(
+            q_,
+            k_,
+            v_,
+            chunk_size=chunk_size,
+            topk=topk,
+            window=window,
+            cmp_block_size=cmp_size,
+        ),
+        q,
+        k,
+        v,
+    )
+    dq, dk, dv = vjp_fn(dout)
+
+    _, ref_vjp_fn = jax.vjp(
+        lambda q_, k_, v_: base.nsa_reference(
+            q_,
+            k_,
+            v_,
+            chunk_size=chunk_size,
+            topk=topk,
+            window=window,
+            cmp_block_size=cmp_size,
+        )[0],
+        q,
+        k,
+        v,
+    )
+    dq_ref, dk_ref, dv_ref = ref_vjp_fn(dout)
+    np.testing.assert_allclose(dq, dq_ref, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(dk, dk_ref, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(dv, dv_ref, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":
