@@ -97,7 +97,8 @@ def flash_attention_qk_softmax(
 
     m_next = jnp.stack(m_next_list, axis=0)
     p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
-    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
+    # pylint: disable-next=bad-indentation
+    p_rowsum = jnp.sum(p, axis=-1, keepdims=True).astype(cfgs.serve.dtype_out)
 
     l_next_list = []
     for b_idx in range(cfgs.block.batch_size):
