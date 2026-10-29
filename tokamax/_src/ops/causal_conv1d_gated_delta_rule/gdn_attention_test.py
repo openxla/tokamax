@@ -1162,7 +1162,7 @@ class GDNAttentionTest(parameterized.TestCase):
     np.testing.assert_allclose(rec_out[10], rec_ref[10], rtol=1e-5, atol=1e-5)
 
   def test_inner_kernel_explicit_p_id_matches_default(self):
-    """Explicit p_id in inner_kernel overrides pl.program_id(0)."""
+    """Explicit p_id in inner_kernel overrides step.index[0]."""
     metadata = wrapper.metadata
     pl = wrapper.pl
     kq_head_dim = 128
@@ -1262,7 +1262,7 @@ class GDNAttentionTest(parameterized.TestCase):
         read_offsets=jnp.zeros_like(state_indices),
     )
     # Place the valid tile record at index 1 and zero out index 0 so a kernel
-    # that ignores p_id=1 and reads pl.program_id(0)==0 sees r_size=0.
+    # that ignores p_id=1 and reads step.index[0]==0 sees r_size=0.
     s = memory_ref.PackedPIdRecord.STRUCT_SIZE
     shifted_records = (
         jnp.zeros((2 * s,), dtype=dma_meta.records.dtype)
@@ -1322,6 +1322,7 @@ class GDNAttentionTest(parameterized.TestCase):
               conv_out_a.spec,
               rec_out_a.spec,
           ),
+          _explicit_indices=True,
       )
 
       @pl.with_scoped(allocations=allocs)

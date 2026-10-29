@@ -190,6 +190,7 @@ def _rotate_gptj(x: jax.Array) -> jax.Array:
 
 
 def _rope_body(
+    unused_step: pltpu.PipelineStep,
     x_ref: jax.Ref,
     cos_sin_ref: jax.Ref,
     *out_refs: jax.Ref,
@@ -309,6 +310,7 @@ def _kernel(
       grid=(num_tiles,),
       in_specs=[x_spec, cos_sin_spec],
       out_specs=out_specs,
+      _explicit_indices=True,
   )
 
   @pl.with_scoped(allocations=(x_alloc, cos_sin_alloc, *out_allocs))
@@ -324,6 +326,7 @@ def _kernel(
 
 
 def _qnorm_rope_body(
+    unused_step: pltpu.PipelineStep,
     x_ref: jax.Ref,
     cos_sin_ref: jax.Ref,
     out_ref: jax.Ref,
@@ -401,6 +404,7 @@ def _qnorm_rope_kernel(
       grid=(num_tiles,),
       in_specs=[x_spec, cos_sin_spec],
       out_specs=[x_spec],
+      _explicit_indices=True,
   )
   allocations = (
       pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2),

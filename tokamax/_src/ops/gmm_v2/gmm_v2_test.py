@@ -49,6 +49,7 @@ def reference_gmm(
     group_sizes: jax.Array,  # [num_groups]
     rhs_scale: jax.Array | None = None,
     rhs_bias: jax.Array | None = None,
+    partial_sum: jax.Array | None = None,  # [m, n]
     group_offset: jax.Array | None = None,  # int32[1]
 ):
   num_tokens = lhs.shape[0]
@@ -94,6 +95,8 @@ def reference_gmm(
         out += acc
       if rhs_bias is not None:
         out = out + rhs_bias[group]
+      if partial_sum is not None:
+        out = out + partial_sum[start:end]
     else:
       out = jnp.zeros((group_size, out_size), dtype=lhs.dtype)
 
@@ -259,6 +262,209 @@ class GmmTest(parameterized.TestCase):
 
     self.assertEqual(actual.shape, (batch_size, out_size))
     assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      batch_size=[128],
+      in_size=[512],
+      out_size=[512],
+      num_groups=[16],
+      has_bias=[True],
+      group_offset=[0],
+  )
+  @pytest.mark.long
+  def test_gmm_partial_sum(
+      self, batch_size, in_size, out_size, num_groups, has_bias, group_offset
+  ):
+    """Tests the fused residual add, including its interaction with bias."""
+    num_local_groups = num_groups - group_offset
+    key = jax.random.key(0)
+    k0, k1, k2, k3 = jax.random.split(key, 4)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_local_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    rhs_bias = None
+    if has_bias:
+      rhs_bias = jax.random.normal(
+          k2, (num_local_groups, 1, out_size), dtype=jnp.bfloat16
+      )
+    partial_sum = jax.random.normal(
+        k3, (batch_size, out_size), dtype=jnp.bfloat16
+    )
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+    expected = reference_gmm(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_bias=rhs_bias,
+        partial_sum=partial_sum,
+        group_offset=group_offset,
+    )
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_bias=rhs_bias,
+        partial_sum=partial_sum,
+        group_offset=group_offset,
+    )
+
+    assert_arrays_all_close(actual, expected)
+
+  def test_gmm_partial_sum_matches_unfused_add(self):
+    """A partial sum must be equivalent to adding it after an unfused GMM."""
+    batch_size, in_size, out_size, num_groups = 128, 512, 512, 16
+    key = jax.random.key(0)
+    k0, k1, k2 = jax.random.split(key, 3)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    partial_sum = jax.random.normal(
+        k2, (batch_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    fused = gmm_v2.gmm_v2(lhs, rhs, group_sizes, partial_sum=partial_sum)
+    unfused = gmm_v2.gmm_v2(lhs, rhs, group_sizes) + partial_sum
+
+    assert_arrays_all_close(fused, unfused)
+
+  @parameterized.product(
+      batch_size=[73, 117],
+      out_size=[255, 512],
+  )
+  def test_gmm_partial_sum_unaligned(self, batch_size, out_size):
+    """Covers padding of the partial sum."""
+    in_size, num_groups = 512, 16
+    key = jax.random.key(0)
+    k0, k1, k2 = jax.random.split(key, 3)
+
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    partial_sum = jax.random.normal(
+        k2, (batch_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_gmm(lhs, rhs, group_sizes, partial_sum=partial_sum)
+    actual = gmm_v2.gmm_v2(lhs, rhs, group_sizes, partial_sum=partial_sum)
+
+    self.assertEqual(actual.shape, (batch_size, out_size))
+    assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      weight_dtype=[jnp.int8],
+      block_size=[256],
+      group_offset=[0],
+  )
+  def test_gmm_activation_weight_quantized_partial_sum(
+      self, weight_dtype, block_size, group_offset
+  ):
+    """Quantized weights and lhs, with a bf16 partial sum carried in."""
+    batch_size, in_size, out_size, num_groups = 256, 1024, 512, 16
+    num_local_groups = num_groups - group_offset
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+
+    lhs = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(
+        k1, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, weight_dtype, axis=1, block_size=block_size
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    partial_sum = jax.random.uniform(
+        k2, (batch_size, out_size), jnp.bfloat16, -1, 1
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    # Rows of non-local groups are zero, with or without a partial sum.
+    first_local_row = int(jnp.sum(group_sizes[:group_offset]))
+    is_local_row = jnp.arange(batch_size)[:, None] >= first_local_row
+    group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+    kwargs = dict(
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        maybe_quantize_lhs=True,
+        preferred_element_type=jnp.bfloat16,
+    )
+    fused = gmm_v2.gmm_v2(
+        lhs, rhs_q, group_sizes, partial_sum=partial_sum, **kwargs
+    )
+    unfused = gmm_v2.gmm_v2(lhs, rhs_q, group_sizes, **kwargs)
+    expected = jnp.where(is_local_row, unfused + partial_sum, 0)
+
+    assert_arrays_all_close(fused, expected)
+
+  def test_gmm_partial_sum_unsupported(self):
+    lhs = jnp.zeros((128, 512), jnp.bfloat16)
+    rhs = jnp.zeros((16, 512, 512), jnp.bfloat16)
+    group_sizes = get_group_sizes(128, 16)
+    partial_sum = jnp.zeros((128, 512), jnp.bfloat16)
+
+    with self.assertRaisesRegex(NotImplementedError, "fuse_act"):
+      gmm_v2.gmm_v2(
+          lhs,
+          jnp.zeros((16, 512, 1024), jnp.bfloat16),
+          group_sizes,
+          partial_sum=partial_sum,
+          fuse_act="silu",
+      )
+    with config.disable_multi_core_mode(True):
+      with self.assertRaisesRegex(
+          NotImplementedError, "disable_multi_core_mode"
+      ):
+        gmm_v2.gmm_v2(lhs, rhs, group_sizes, partial_sum=partial_sum)
+    with self.assertRaisesRegex(ValueError, "must match output dtype"):
+      gmm_v2.gmm_v2(
+          lhs, rhs, group_sizes, partial_sum=partial_sum.astype(jnp.float32)
+      )
+
+  def test_partial_sum_is_accumulated_in_place(self):
+    """The partial sum must be aliased to the output rather than copied.
+
+    Removing the extra HBM round-trip is the point of the feature. If the
+    aliasing silently stops being emitted the numerics still pass, so assert it
+    directly.
+    """
+    m, k, n, num_groups = 512, 512, 512, 8
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(k0, (m, k), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups, k, n), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(m, num_groups)
+    partial_sum = jnp.zeros((m, n), jnp.bfloat16)
+
+    fused = jax.jit(lambda l, r, g, p: gmm_v2.gmm_v2(l, r, g, partial_sum=p))
+    plain = jax.jit(gmm_v2.gmm_v2)
+
+    fused_text = (
+        fused.lower(lhs, rhs, group_sizes, partial_sum).compile().as_text()
+    )
+    plain_text = plain.lower(lhs, rhs, group_sizes).compile().as_text()
+    # `as_text` is typed as optional; an empty program would make the control
+    # below pass vacuously, so fail loudly instead of defaulting to "".
+    assert fused_text is not None and plain_text is not None
+
+    self.assertEqual(
+        plain_text.count("output_to_operand_aliasing"),
+        0,
+        "control failed: a GMM with no partial sum has nothing to alias, so "
+        "the counter is not measuring what this test claims",
+    )
+    self.assertGreater(
+        fused_text.count("output_to_operand_aliasing"),
+        0,
+        "the partial sum was not aliased to the output",
+    )
 
   @parameterized.product(
       batch_size=[128],

@@ -97,7 +97,7 @@ def _dlhs_kernel(
   sw_spec = pl.BlockSpec((bn,), lambda mi, ki, ni: (ni,))
   o_spec = pl.BlockSpec((bm, bk), lambda mi, ki, ni: (mi, ki))
 
-  def _load_gq(g_vmem: jax.Ref, sw_vmem: jax.Ref):
+  def _load_gq(step: pltpu.PipelineStep, g_vmem: jax.Ref, sw_vmem: jax.Ref):
     """Quantizes each `(bm, bn)` cotangent tile once and reuses it across k.
 
     `g_spec` does not depend on the k-block index `ki`, so a naive body would
@@ -108,6 +108,7 @@ def _dlhs_kernel(
     nothing to reuse and the cache is bypassed.
 
     Args:
+      step: Current pipeline step.
       g_vmem: The `(bm, bn)` cotangent block.
       sw_vmem: The `(bn,)` column scales.
 
@@ -117,8 +118,8 @@ def _dlhs_kernel(
     if single_k:
       return _quantize_g(g_vmem, sw_vmem)
 
-    kind = pl.program_id(1)
-    nind = pl.program_id(2)
+    kind = step.index[1]
+    nind = step.index[2]
 
     @pl.when(kind == 0)
     def _fill():
@@ -126,8 +127,13 @@ def _dlhs_kernel(
 
     return gq_cache[nind], sg_cache[nind]
 
-  def _partial(g_vmem: jax.Ref, w_vmem: jax.Ref, sw_vmem: jax.Ref):
-    gq, sg = _load_gq(g_vmem, sw_vmem)
+  def _partial(
+      step: pltpu.PipelineStep,
+      g_vmem: jax.Ref,
+      w_vmem: jax.Ref,
+      sw_vmem: jax.Ref,
+  ):
+    gq, sg = _load_gq(step, g_vmem, sw_vmem)
     gw = jax.lax.dot_general(
         gq,
         w_vmem[...],
@@ -136,13 +142,13 @@ def _dlhs_kernel(
     )
     return gw * sg  # `(bm, 1)` broadcasts along lanes for free.
 
-  def body_single_n(g_vmem, w_vmem, sw_vmem, o_vmem):
+  def body_single_n(step, g_vmem, w_vmem, sw_vmem, o_vmem):
     """Direct pass when `bn == n`: no accumulator needed."""
-    o_vmem[...] = _partial(g_vmem, w_vmem, sw_vmem).astype(o_vmem.dtype)
+    o_vmem[...] = _partial(step, g_vmem, w_vmem, sw_vmem).astype(o_vmem.dtype)
 
-  def body_multi_n(g_vmem, w_vmem, sw_vmem, o_vmem):
+  def body_multi_n(step, g_vmem, w_vmem, sw_vmem, o_vmem):
     """Pipelined reduction over n blocks when `bn < n`."""
-    nind = pl.program_id(2)
+    nind = step.index[2]
 
     @pl.when(nind == 0)
     def _init():
@@ -150,9 +156,9 @@ def _dlhs_kernel(
 
     # Each n block is quantized against its own row absmax, so the partial
     # product is already rescaled by `_partial` before it is accumulated.
-    accum_vmem[...] += _partial(g_vmem, w_vmem, sw_vmem)
+    accum_vmem[...] += _partial(step, g_vmem, w_vmem, sw_vmem)
 
-    @pl.when(nind == pl.num_programs(2) - 1)
+    @pl.when(nind == grid[2] - 1)
     def _write():
       o_vmem[...] = accum_vmem[...].astype(o_vmem.dtype)
 
@@ -167,6 +173,7 @@ def _dlhs_kernel(
           pltpu.PARALLEL,
           pltpu.PARALLEL if single_n else pltpu.ARBITRARY,
       ),
+      _explicit_indices=True,
   )(g_hbm, w_hbm, sw_hbm, o_hbm)
 
 
