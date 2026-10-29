@@ -28,7 +28,7 @@ from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-import
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.moba import base
 
-Implementation: TypeAlias = Literal["xla", "mosaic", "mosaic_tpu"]
+Implementation: TypeAlias = Literal["xla", "mosaic"]
 
 IMPLEMENTATIONS = dict(
     xla=base.MixtureOfBlockAttention(),
@@ -37,14 +37,14 @@ IMPLEMENTATIONS = dict(
 try:
   from tokamax._src.ops.experimental.moba import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top
 
-  IMPLEMENTATIONS["mosaic_tpu"] = (
-      pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention()
+  IMPLEMENTATIONS["mosaic"] = (
+      pallas_mosaic_tpu.PallasMosaicTpuMixtureOfBlockAttention()
   )
 except ImportError:
   pass
 
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = (
-    ("mosaic_tpu", "xla") if "mosaic_tpu" in IMPLEMENTATIONS else ("xla",)
+    ("mosaic", "xla") if "mosaic" in IMPLEMENTATIONS else ("xla",)
 )
 
 
@@ -69,7 +69,7 @@ def mixture_of_block_attention(
     chunk_size: Sequence chunk size per block. Sequence length must be a
       multiple of chunk_size.
     scale: Softmax scale factor. Defaults to `head_dim ** -0.5`.
-    implementation: Which implementation(s) to use, e.g. `"mosaic_tpu"`,
+    implementation: Which implementation(s) to use, e.g. `"mosaic"`,
       `"xla"`. If None, attempts TPU kernel first with fallback to XLA.
 
   Returns:
@@ -89,8 +89,6 @@ def mixture_of_block_attention(
 
   errors = []
   for impl in implementation:
-    if impl == "mosaic":
-      impl = "mosaic_tpu"
     if impl not in IMPLEMENTATIONS:
       raise ValueError(f"Unknown implementation: {impl}")
 

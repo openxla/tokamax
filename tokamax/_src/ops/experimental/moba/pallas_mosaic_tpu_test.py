@@ -23,7 +23,7 @@ from tokamax._src.ops.experimental.moba import base
 from tokamax._src.ops.experimental.moba import pallas_mosaic_tpu
 
 
-class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
+class PallasMosaicTpuMixtureOfBlockAttentionTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -47,7 +47,7 @@ class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
         k2, (batch_size, num_heads, seq_len, head_dim), dtype=jnp.float32
     )
 
-    op_instance = pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention(
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuMixtureOfBlockAttention(
         bypass_device_check=True
     )
     actual_out = op_instance(
@@ -63,7 +63,7 @@ class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
     q = jnp.zeros((1, 2, 300, 16))
     k = jnp.zeros((1, 2, 300, 16))
     v = jnp.zeros((1, 2, 300, 16))
-    op_instance = pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention()
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuMixtureOfBlockAttention()
     with self.assertRaisesRegex(ValueError, "must be divisible by chunk_size"):
       op_instance._fwd(q, k, v, chunk_size=256)
 
@@ -71,7 +71,7 @@ class PallasTpuMixtureOfBlockAttentionTest(absltest.TestCase):
     q = jnp.zeros((1, 2, 256, 16))
     k = jnp.zeros((1, 2, 256, 16))
     v = jnp.zeros((1, 2, 256, 16))
-    op_instance = pallas_mosaic_tpu.PallasTpuMixtureOfBlockAttention()
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuMixtureOfBlockAttention()
     with self.assertRaises(NotImplementedError):
       op_instance._fwd(
           q,

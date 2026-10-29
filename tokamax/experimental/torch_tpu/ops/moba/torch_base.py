@@ -15,132 +15,207 @@
 
 """PyTorch interface for Mixture of Block Attention (MoBA) base operator."""
 
-from typing import Any, Optional
+from collections.abc import Sequence
+from typing import Any, Optional, TypeVar
 import jax
+import jax.numpy as jnp
+import numpy as np
 from tokamax._src.ops.experimental.moba import base as jax_base
+from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 from typing_extensions import override
 
-try:
-  from tokamax.experimental.torch_tpu.ops import torch_op  # pylint: disable=g-import-not-at-top
-except ImportError:
-  torch_op = None
+_Config = TypeVar("_Config")
 
 _CHUNK_SIZE = 256
 _TOPK = 4
 
-_BaseTorchOp = torch_op.TorchOp if torch_op is not None else object
+
+def _torch_to_jax_cpu(tensor: torch.Tensor) -> jax.Array:
+  if tensor.dtype == torch.bfloat16:
+    return jnp.asarray(
+        tensor.detach().cpu().to(torch.float32).numpy(), dtype=jnp.bfloat16
+    )
+  return jnp.asarray(tensor.detach().cpu().numpy())
 
 
-def _moba_cpu_fallback(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    chunk_size: int = _CHUNK_SIZE,
-    topk: int = _TOPK,
-    scale: Optional[float] = None,
-) -> torch.Tensor:
-  """Pure PyTorch vectorized fallback executing block-level MoBA attention."""
-  batch_size, num_heads, seq_len, head_dim = q.shape
-  scale = scale or (head_dim**-0.5)
-  num_blocks = seq_len // chunk_size
-  effective_topk = min(topk, num_blocks)
-  block_k_sub = (effective_topk + 1) * chunk_size
-
-  q_blocks = q.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
-  k_blocks = k.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
-  v_blocks = v.view(batch_size, num_heads, num_blocks, chunk_size, head_dim)
-
-  q_mean = q_blocks.mean(dim=3)
-  k_mean = k_blocks.mean(dim=3)
-
-  routing = torch.einsum("bhqd,bhnd->bhqn", q_mean, k_mean) * scale
-  q_idx = torch.arange(num_blocks, device=q.device).unsqueeze(1)
-  k_idx = torch.arange(num_blocks, device=q.device).unsqueeze(0)
-  hist_mask = k_idx < q_idx
-  routing = torch.where(
-      hist_mask.unsqueeze(0).unsqueeze(0), routing, -float("inf")
-  )
-  topk_idx = torch.topk(routing, effective_topk, dim=-1).indices
-
-  causal_diag = torch.tril(
-      torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool)
+def _jax_to_torch_cpu(array: jax.Array, like: torch.Tensor) -> torch.Tensor:
+  if array.dtype == jnp.bfloat16:
+    return torch.as_tensor(
+        np.asarray(array, dtype=np.float32),
+        dtype=torch.bfloat16,
+        device=like.device,
+    )
+  return torch.as_tensor(
+      np.asarray(array), dtype=like.dtype, device=like.device
   )
 
-  outs = []
-  for block_idx in range(num_blocks):
-    q_i = q_blocks[:, :, block_idx]
-    k_diag = k_blocks[:, :, block_idx : block_idx + 1]
-    v_diag = v_blocks[:, :, block_idx : block_idx + 1]
 
-    if effective_topk > 0:
-      slot_idx = topk_idx[:, :, block_idx, :][:, :, :, None, None]
-      k_hist = torch.gather(
-          k_blocks,
-          2,
-          slot_idx.expand(
-              batch_size, num_heads, effective_topk, chunk_size, head_dim
-          ),
-      )
-      v_hist = torch.gather(
-          v_blocks,
-          2,
-          slot_idx.expand(
-              batch_size, num_heads, effective_topk, chunk_size, head_dim
-          ),
-      )
+def register_cpu_kernel(op: torch_op.TorchOp[Any]) -> None:
+  """Registers a CPU kernel on `op._torch_tokamax_op` delegating to `op.op_impl_call`."""
+  if op._torch_tokamax_op is None:  # pylint: disable=protected-access
+    return
 
-      k_sub = torch.cat([k_diag, k_hist], dim=2).view(
-          batch_size, num_heads, block_k_sub, head_dim
-      )
-      v_sub = torch.cat([v_diag, v_hist], dim=2).view(
-          batch_size, num_heads, block_k_sub, head_dim
-      )
+  def _cpu_kernel(*args: Any, **kwargs: Any) -> Any:
+    first_tensor = next(
+        a for a in (*args, *kwargs.values()) if isinstance(a, torch.Tensor)
+    )
+    jax_args = [
+        _torch_to_jax_cpu(a) if isinstance(a, torch.Tensor) else a
+        for a in args
+    ]
+    jax_kwargs = {
+        k: _torch_to_jax_cpu(v) if isinstance(v, torch.Tensor) else v
+        for k, v in kwargs.items()
+    }
+    res = op.op_impl_call(*jax_args, **jax_kwargs)
+    if isinstance(res, tuple):
+      return tuple(_jax_to_torch_cpu(r, first_tensor) for r in res)
+    return _jax_to_torch_cpu(res, first_tensor)
 
-      ranks = torch.arange(effective_topk, device=q.device)
-      valid_hist = (
-          (ranks < block_idx)
-          .repeat_interleave(chunk_size)
-          .view(1, 1, 1, -1)
-          .expand(batch_size, num_heads, chunk_size, -1)
-      )
-      mask_diag = causal_diag.unsqueeze(0).unsqueeze(0).expand(
-          batch_size, num_heads, -1, -1
-      )
-      mask_sub = torch.cat([mask_diag, valid_hist], dim=-1)
-    else:
-      k_sub = k_diag.view(batch_size, num_heads, chunk_size, head_dim)
-      v_sub = v_diag.view(batch_size, num_heads, chunk_size, head_dim)
-      mask_sub = causal_diag.unsqueeze(0).unsqueeze(0).expand(
-          batch_size, num_heads, -1, -1
-      )
-
-    scores = torch.matmul(q_i, k_sub.transpose(-1, -2)) * scale
-    scores = torch.where(mask_sub, scores, -1e9)
-    weights = torch.softmax(scores, dim=-1)
-    o_i = torch.matmul(weights, v_sub)
-    outs.append(o_i)
-
-  return torch.cat(outs, dim=2)
+  op._torch_tokamax_op.register_kernel("cpu")(_cpu_kernel)  # pylint: disable=protected-access
 
 
-class _MixtureOfBlockAttention(_BaseTorchOp):
+class _MixtureOfBlockAttentionVjp(torch_op.TorchOp[_Config]):
+  """PyTorch VJP wrapper for base Mixture of Block Attention (MoBA) operator."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.op_impl_jax = jax_base.MixtureOfBlockAttentionVjp()
+    self.jax_op_name = "base_moba_vjp"
+    self.is_vjp = True
+    self.fake_impl = self._fake_impl
+
+  def _fake_impl(
+      self,
+      out: torch.Tensor,
+      dout: torch.Tensor,
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      topk: int = _TOPK,
+      chunk_size: int = _CHUNK_SIZE,
+      scale: Optional[float] = None,
+      return_residuals: bool = False,
+      config: tuple[int, ...] | None = None,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del out, dout, topk, chunk_size, scale, return_residuals, config
+    return (
+        torch.empty_like(q),
+        torch.empty_like(k),
+        torch.empty_like(v),
+    )
+
+  @override
+  def derive_backward_shapes(
+      self, abstract_argument_dict: dict[str, Any]
+  ) -> dict[str, Any]:
+    if not abstract_argument_dict:
+      empty_struct = jax.ShapeDtypeStruct(shape=(), dtype=jnp.float32)
+      return {
+          "residuals": None,
+          "out": empty_struct,
+          "dout": empty_struct,
+      }
+    q = abstract_argument_dict["q"]
+    out_struct = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
+    return {
+        "residuals": None,
+        "out": out_struct,
+        "dout": out_struct,
+    }
+
+  @override
+  def __call__(
+      self,
+      out: torch.Tensor,
+      dout: torch.Tensor,
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      topk: int = _TOPK,
+      chunk_size: int = _CHUNK_SIZE,
+      scale: Optional[float] = None,
+      config: Any = None,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert (
+        self._torch_tokamax_op is not None
+    ), "Forward op not registered. This means that self.op_impl_jax is not set"
+    " in the constructor."
+    return self._torch_tokamax_op(
+        out,
+        dout,
+        q,
+        k,
+        v,
+        topk=topk,
+        chunk_size=chunk_size,
+        scale=scale,
+        return_residuals=False,
+        config=self.deconstruct_config(config),
+    )
+
+  @override
+  def op_impl_call(
+      self,
+      out: jax.Array,
+      dout: jax.Array,
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      topk: int = _TOPK,
+      chunk_size: int = _CHUNK_SIZE,
+      scale: Optional[float] = None,
+      return_residuals: bool = False,
+      config: tuple[int, ...] | None = None,
+  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    del config
+    assert self.op_impl_jax is not None, "Forward class not set."
+    grads, _ = self.op_impl_jax._fwd(  # pylint: disable=protected-access
+        None,
+        out,
+        dout,
+        q,
+        k,
+        v,
+        topk=topk,
+        chunk_size=chunk_size,
+        scale=scale,
+        config=None,
+        return_residuals=return_residuals,
+    )
+    return grads
+
+
+MixtureOfBlockAttentionVjp = _MixtureOfBlockAttentionVjp[Any]()
+register_cpu_kernel(MixtureOfBlockAttentionVjp)
+
+
+class _MixtureOfBlockAttention(torch_op.TorchOp[_Config]):
   """PyTorch wrapper for base Mixture of Block Attention (MoBA) operator."""
 
-  def __init__(
+  def __init__(self) -> None:
+    super().__init__()
+    self.op_impl_jax = jax_base.MixtureOfBlockAttention()
+    self.backward_op_torch = MixtureOfBlockAttentionVjp
+    self.jax_op_name = "base_moba"
+    self.is_vjp = False
+    self.fake_impl = self._fake_impl
+
+  def _fake_impl(
       self,
-      op_impl_jax: Any = None,
-      jax_op_name: str = "torch_base_moba",
-  ):
-    if torch_op is not None:
-      super().__init__()
-    self.op_impl_jax = (
-        op_impl_jax
-        if op_impl_jax is not None
-        else jax_base.MixtureOfBlockAttention()
-    )
-    self.jax_op_name = jax_op_name
-    self._torch_tokamax_op = None
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      topk: int = _TOPK,
+      chunk_size: int = _CHUNK_SIZE,
+      scale: Optional[float] = None,
+      return_residuals: bool = False,
+      config: tuple[int, ...] | None = None,
+      bwd_config: tuple[int, ...] | None = None,
+  ) -> torch.Tensor:
+    del k, v, topk, chunk_size, scale, return_residuals, config, bwd_config
+    return torch.empty_like(q)
 
   @override
   def op_impl_call(
@@ -151,9 +226,21 @@ class _MixtureOfBlockAttention(_BaseTorchOp):
       topk: int = _TOPK,
       chunk_size: int = _CHUNK_SIZE,
       scale: Optional[float] = None,
+      return_residuals: bool = False,
+      config: tuple[int, ...] | None = None,
+      bwd_config: tuple[int, ...] | None = None,
   ) -> jax.Array:
-    out, _ = self.op_impl_jax._fwd(
-        q, k, v, topk=topk, chunk_size=chunk_size, scale=scale
+    del config, bwd_config
+    assert self.op_impl_jax is not None, "Forward class not set."
+    out, _ = self.op_impl_jax._fwd(  # pylint: disable=protected-access
+        q,
+        k,
+        v,
+        topk=topk,
+        chunk_size=chunk_size,
+        scale=scale,
+        config=None,
+        return_residuals=return_residuals,
     )
     return out
 
@@ -166,27 +253,91 @@ class _MixtureOfBlockAttention(_BaseTorchOp):
       chunk_size: int = _CHUNK_SIZE,
       topk: int = _TOPK,
       scale: Optional[float] = None,
+      configs: tuple[_Config | None, _Config | None] | None = None,
   ) -> torch.Tensor:
+    fwd_config, bwd_config = (None, None) if configs is None else configs
     batch_size, seq_len, num_heads, head_dim = q.shape
     del batch_size, num_heads, head_dim
-    if seq_len % chunk_size != 0:
+    resolved_chunk_size = (
+        getattr(fwd_config, "chunk_size", chunk_size)
+        if fwd_config is not None
+        else chunk_size
+    )
+    if seq_len % resolved_chunk_size != 0:
       raise ValueError(
           f"Sequence length ({seq_len}) must be divisible by chunk_size"
-          f" ({chunk_size})"
+          f" ({resolved_chunk_size})"
       )
 
     q_t = q.transpose(1, 2).contiguous()
     k_t = k.transpose(1, 2).contiguous()
     v_t = v.transpose(1, 2).contiguous()
 
-    if self._torch_tokamax_op is not None and q.device.type in ("tpu", "xla"):
-      out = self._torch_tokamax_op(
-          q_t, k_t, v_t, topk=topk, chunk_size=chunk_size, scale=scale
-      )
-    else:
-      out = _moba_cpu_fallback(q_t, k_t, v_t, chunk_size, topk, scale)
-
+    assert (
+        self._torch_tokamax_op is not None
+    ), "Forward op not registered. This means that self.op_impl_jax is not set"
+    " in the constructor."
+    assert self.backward_op_torch is not None, "Backward op not set."
+    out = self._torch_tokamax_op(
+        q_t,
+        k_t,
+        v_t,
+        topk=topk,
+        chunk_size=chunk_size,
+        scale=scale,
+        return_residuals=False,
+        config=self.deconstruct_config(fwd_config),
+        bwd_config=self.backward_op_torch.deconstruct_config(bwd_config),
+    )
     return out.transpose(1, 2).contiguous()
 
+  @override
+  def setup_context(
+      self,
+      ctx: Any,
+      inputs: Sequence[Any],
+      output: Any,
+  ) -> None:
+    """Saves tensors and metadata to the context for the backward pass."""
+    q, k, v, topk, chunk_size, scale, _, _, bwd_config = inputs
+    ctx.save_for_backward(q, k, v, output)
+    ctx.topk = topk
+    ctx.chunk_size = chunk_size
+    ctx.scale = scale
+    ctx.bwd_config = bwd_config
 
-mixture_of_block_attention = _MixtureOfBlockAttention()
+  @override
+  def backward(
+      self,
+      ctx: Any,
+      dout: torch.Tensor,
+  ) -> tuple[
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+  ]:
+    """Callback for torch register_autograd."""
+    assert self.backward_op_torch is not None, "Backward op not set."
+    q, k, v, out = ctx.saved_tensors
+    dq, dk, dv = self.backward_op_torch(
+        out,
+        dout,
+        q,
+        k,
+        v,
+        topk=ctx.topk,
+        chunk_size=ctx.chunk_size,
+        scale=ctx.scale,
+        config=ctx.bwd_config,
+    )
+    return dq, dk, dv, None, None, None, None, None, None
+
+
+MixtureOfBlockAttention = _MixtureOfBlockAttention[Any]()
+register_cpu_kernel(MixtureOfBlockAttention)

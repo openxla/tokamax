@@ -84,7 +84,7 @@ class MixtureOfBlockAttentionBaseTest(absltest.TestCase):
     v = jnp.zeros((1, 2, 300, 16))
     op_instance = base.MixtureOfBlockAttention()
     with self.assertRaisesRegex(ValueError, "must be divisible by chunk_size"):
-      op_instance._fwd(q, k, v, chunk_size=256)
+      op_instance(q, k, v, chunk_size=256)
 
   def test_shape_mismatch_raises(self):
     q = jnp.zeros((1, 2, 256, 16))
@@ -92,7 +92,7 @@ class MixtureOfBlockAttentionBaseTest(absltest.TestCase):
     v = jnp.zeros((1, 2, 256, 16))
     op_instance = base.MixtureOfBlockAttention()
     with self.assertRaises((ValueError, TypeError)):
-      op_instance._fwd(q, k, v, chunk_size=256)
+      op_instance(q, k, v, chunk_size=256)
 
 
 if __name__ == "__main__":

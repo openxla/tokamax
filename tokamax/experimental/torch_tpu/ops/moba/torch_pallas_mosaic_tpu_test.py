@@ -19,35 +19,69 @@ import unittest
 from absl import logging
 from absl.testing import absltest
 import torch
+from tokamax._src.ops.experimental.moba import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.moba import torch_base
 from tokamax.experimental.torch_tpu.ops.moba import torch_pallas_mosaic_tpu
 
-moba_pallas = torch_pallas_mosaic_tpu.moba
+moba_pallas = torch_pallas_mosaic_tpu.PallasMosaicTpuMixtureOfBlockAttention
 
 
 class MoBAPallasKernelTest(unittest.TestCase):
   """Tests for MoBA PyTorch operator on TPU and fallback devices."""
 
   def test_forward_shape_and_parity(self):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
     chunk_size, topk = 64, 2
 
     torch.manual_seed(42)
     q = torch.randn(
-        batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.float32,
     )
     k = torch.randn(
-        batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.float32,
     )
     v = torch.randn(
-        batch_size, seq_len, num_heads, head_dim, device=device, dtype=torch.float32
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    configs = torch_utils.get_configs(
+        moba_pallas,
+        q,
+        k,
+        v,
+        chunk_size=chunk_size,
+        topk=topk,
+        from_autotuning_cache=False,
+    )
+    self.assertEqual(
+        configs,
+        (
+            jax_pallas_mosaic_tpu.Config(chunk_size=chunk_size, topk=topk),
+            jax_pallas_mosaic_tpu.Config(chunk_size=chunk_size, topk=topk),
+        ),
     )
 
     actual_out = moba_pallas(
-        q, k, v, chunk_size=chunk_size, topk=topk
+        q, k, v, chunk_size=chunk_size, topk=topk, configs=configs
     )
-    expected_out = torch_base.mixture_of_block_attention(
+    expected_out = torch_base.MixtureOfBlockAttention(
         q, k, v, chunk_size=chunk_size, topk=topk
     )
 
@@ -60,7 +94,7 @@ class MoBAPallasKernelTest(unittest.TestCase):
     logging.info("MoBA forward shape and parity test passed.")
 
   def test_chunk_size_validation(self):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     q = torch.randn(2, 100, 4, 16, device=device)
     k = torch.randn(2, 100, 4, 16, device=device)
     v = torch.randn(2, 100, 4, 16, device=device)
@@ -69,19 +103,34 @@ class MoBAPallasKernelTest(unittest.TestCase):
       moba_pallas(q, k, v, chunk_size=64)
 
   def test_backward_autograd(self):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     batch_size, seq_len, num_heads, head_dim = 2, 64, 4, 16
     chunk_size, topk = 64, 1
 
     torch.manual_seed(42)
     q = torch.randn(
-        batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        device=device,
+        requires_grad=True,
     )
     k = torch.randn(
-        batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        device=device,
+        requires_grad=True,
     )
     v = torch.randn(
-        batch_size, seq_len, num_heads, head_dim, device=device, requires_grad=True
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        device=device,
+        requires_grad=True,
     )
 
     out = moba_pallas(
