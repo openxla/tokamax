@@ -65,7 +65,8 @@ class Config:
   num_batches: int
   tokens_per_batch: int
   tpu_info: pltpu.TpuInfo
-  out_dtype: jnp.dtype = jnp.bfloat16.dtype
+  in_dtype: jnp.dtype
+  out_dtype: jnp.dtype
   acc_dtype: jnp.dtype = jnp.bfloat16.dtype
   max_tokens_per_batch: int = 128
   tile: int = 16
@@ -73,20 +74,33 @@ class Config:
   # buffer b % num_input_buffers while batch b + num_input_buffers - 1 is
   # fetched into its own buffer.
   num_input_buffers: int = 3
-  lanes: int = 128
-  packing: int = 2
+
+  @property
+  def in_packing(self) -> int:
+    return 4 // self.in_dtype.itemsize
+
+  @property
+  def acc_packing(self) -> int:
+    return 4 // self.acc_dtype.itemsize
+
+  @property
+  def lanes(self) -> int:
+    return self.tpu_info.num_lanes
 
   @classmethod
   def create(
       cls,
       *,
-      num_tokens: int,
-      topk: int,
-      chunks: int,
-      out_dtype: jax.typing.DTypeLike = jnp.bfloat16,
-      acc_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+      rows: jax.Array,
+      weights: jax.Array,
+      out_dtype: jax.typing.DTypeLike,
+      acc_dtype: jax.typing.DTypeLike,
+      tpu_info: pltpu.TpuInfo,
   ) -> Self:
     """Derives batching parameters and validates SMEM capacity."""
+    chunks = rows.shape[1]
+    num_tokens, topk = weights.shape
+    in_dtype = rows.dtype
     out_dtype = jnp.dtype(out_dtype)
     acc_dtype = jnp.dtype(acc_dtype)
     if acc_dtype != jnp.bfloat16:
@@ -106,8 +120,9 @@ class Config:
         chunks=chunks,
         num_batches=num_batches,
         tokens_per_batch=tokens_per_batch,
-        tpu_info=pltpu.get_tpu_info(),
+        tpu_info=tpu_info,
         out_dtype=out_dtype,
+        in_dtype=in_dtype,
         acc_dtype=acc_dtype,
     )
     if cfg.smem_allocation >= cfg.smem_threshold:
@@ -115,11 +130,30 @@ class Config:
           "Total number of SMEM allocation must be less than"
           f" {cfg.smem_threshold} to avoid OOM. Got {cfg.smem_allocation}"
       )
+
+    if (
+        rows.dtype != jnp.bfloat16
+        or rows.ndim != 4
+        or rows.shape[2:] != (2, cfg.lanes)
+    ):
+      raise ValueError(
+          "rows must be bf16[T * K, H / 256, 2, 128], got"
+          f" {rows.dtype}{rows.shape}"
+      )
+    if weights.ndim != 2:
+      raise ValueError(f"weights must be 2D [T, K], got {weights.shape}")
+
+    num_tokens, topk = weights.shape
+    if rows.shape[0] != num_tokens * topk:
+      raise ValueError(
+          f"weights must be [T, K] with T * K == {rows.shape[0]}, got"
+          f" {weights.shape}"
+      )
     return cfg
 
   @property
   def hidden_size(self) -> int:
-    return self.chunks * self.packing * self.lanes
+    return self.chunks * self.in_packing * self.lanes
 
   @property
   def pad_tokens(self) -> int:
@@ -127,8 +161,7 @@ class Config:
 
   @property
   def stride(self) -> int:
-    token_pairs = self.tokens_per_batch // self.packing
-    return layout_util.to_bank_conflict_aware_stride(token_pairs)
+    return layout_util.to_bank_conflict_aware_stride(self.chunks)
 
   @property
   def num_topk_weights_buffers(self) -> int:
@@ -169,7 +202,9 @@ class Config:
 
   @property
   def kernel_name(self) -> str:
-    return f"output_reduce-k_{self.topk}-h_{self.hidden_size}"
+    return (
+        f"output_reduce-t_{self.num_tokens}_k_{self.topk}-h_{self.hidden_size}"
+    )
 
   @property
   def kernel_metadata(self) -> dict[str, str]:
@@ -184,7 +219,7 @@ class Config:
 
     return {"xprof_metadata": json.dumps(self, default=to_json)}
 
-  def scratch_types(self, rows_dtype: jnp.dtype) -> dict[str, pl.MemoryRef]:
+  def scratch_types(self) -> dict[str, pl.MemoryRef]:
     """Scratch buffers of `_kernel`, keyed by its parameter names."""
     return dict(
         input_buffer=pltpu.VMEM(
@@ -193,17 +228,18 @@ class Config:
                 self.tokens_per_batch,
                 self.topk,
                 self.chunks,
-                self.packing,
+                self.in_packing,
                 self.lanes,
             ),
-            rows_dtype,
+            self.in_dtype,
         ),
         out_buffer=pltpu.VMEM(
             (self.num_input_buffers, self.tokens_per_batch, self.hidden_size),
             self.out_dtype,
         ),
         relayout_buffer=pltpu.VMEM(
-            (self.packing * self.chunks * self.stride, self.lanes), jnp.uint32
+            (self.tokens_per_batch, self.stride, self.acc_packing, self.lanes),
+            self.acc_dtype,
         ),
         topk_weights_smem=pltpu.SMEM(
             (self.num_topk_weights_buffers * self.topk_weights_size,),
@@ -212,9 +248,9 @@ class Config:
         num_rows_fetched_smem=pltpu.SMEM((self.num_input_buffers,), jnp.int32),
         input_sems=pltpu.SemaphoreType.DMA((self.num_input_buffers,)),
         out_sems=pltpu.SemaphoreType.DMA((self.num_input_buffers,)),
-        topk_weights_sems=pltpu.SemaphoreType.DMA(
-            (self.num_topk_weights_buffers,)
-        ),
+        topk_weights_sems=pltpu.SemaphoreType.DMA((
+            self.num_topk_weights_buffers,
+        )),
     )
 
 
@@ -227,14 +263,20 @@ def _reduce_token(
 ) -> jax.Array:
   """Weighted sum across a token's top-k picks, as packed bf16 words."""
   acc = None
+  input_rows_u32 = input_rows.bitcast(jnp.uint32).reshape(
+      cfg.tokens_per_batch, cfg.topk, -1, cfg.lanes
+  )
   for k in range(cfg.topk):
     weight = jnp.broadcast_to(token_weights.weight(k), (cfg.chunks, cfg.lanes))
-    weight = pltpu.bitcast(weight, jnp.bfloat16)
-    weighted_row = input_rows[token, k] * weight
+    weight = pltpu.bitcast(weight, cfg.in_dtype).astype(cfg.acc_dtype)
+    input_row = pltpu.bitcast(input_rows_u32[token, k], cfg.in_dtype).astype(
+        cfg.acc_dtype
+    )
+    weighted_row = input_row * weight
     weighted_row = jnp.where(weight != 0, weighted_row, 0)
     acc = weighted_row if acc is None else acc + weighted_row
   assert acc is not None
-  return pltpu.bitcast(acc, jnp.uint32)
+  return acc
 
 
 def _kernel(
@@ -255,20 +297,9 @@ def _kernel(
   """Reduces batch b from input_buffer[b % 3] while batch b + 2 is fetched."""
   input_buffer = pltpu.annotate(input_buffer, no_hazard_no_deps=True)
   out_buffer = pltpu.annotate(out_buffer, no_hazard_no_deps=True)
-  relayout_buffer = pltpu.annotate(relayout_buffer, no_hazard_no_deps=True)
-  rows = rows_hbm.reshape(
-      rows_hbm.shape[0] // cfg.topk,
-      cfg.topk,
-      cfg.chunks,
-      cfg.packing,
-      cfg.lanes,
-  )
+  rows = rows_hbm.reshape(-1, cfg.topk, cfg.chunks, cfg.in_packing, cfg.lanes)
   input_buffer_flat = input_buffer.reshape(
-      cfg.num_input_buffers,
-      cfg.tokens_per_batch * cfg.topk,
-      cfg.chunks,
-      cfg.packing,
-      cfg.lanes,
+      cfg.num_input_buffers, -1, cfg.chunks, cfg.in_packing, cfg.lanes
   )
 
   def fetch_topk_weights(
@@ -375,59 +406,30 @@ def _kernel(
     # Step 3: Reduce top-k picks for token pairs while issuing the fetch
     # batch's row DMAs, and pack transposed token pairs into relayout_buffer.
     input_rows = input_buffer.at[input_slot].reshape(
-        cfg.tokens_per_batch, cfg.topk, cfg.chunks * cfg.packing, cfg.lanes
+        cfg.tokens_per_batch, cfg.topk, cfg.chunks, cfg.in_packing, cfg.lanes
     )
     out_rows = out_buffer.at[input_slot]
     num_rows_fetched = 0
-    for token in range(0, cfg.tokens_per_batch, cfg.packing):
-      acc0_u32 = _reduce_token(
+    relayout_buffer_u32 = relayout_buffer.bitcast(jnp.uint32).reshape(
+        cfg.tokens_per_batch, -1, cfg.lanes
+    )
+    for token in range(cfg.tokens_per_batch):
+      acc = _reduce_token(
           input_rows, token_weights_at(weights_slot, token), token, cfg=cfg
       )
       num_rows_fetched += fetch_token_rows(
           fetch_batch, fetch_weights_slot, fetch_input_slot, token
       )
-      acc1_u32 = _reduce_token(
-          input_rows,
-          token_weights_at(weights_slot, token + 1),
-          token + 1,
-          cfg=cfg,
-      )
-      num_rows_fetched += fetch_token_rows(
-          fetch_batch, fetch_weights_slot, fetch_input_slot, token + 1
-      )
-
-      for j in range(cfg.packing):
-        u0 = pltpu.unpack_elementwise(
-            acc0_u32,
-            index=j,
-            packed_dtype=jnp.bfloat16,
-            unpacked_dtype=jnp.float32,
-        )
-        u1 = pltpu.unpack_elementwise(
-            acc1_u32,
-            index=j,
-            packed_dtype=jnp.bfloat16,
-            unpacked_dtype=jnp.float32,
-        )
-        off = j * cfg.chunks * cfg.stride + token // cfg.packing
-        relayout_buffer[off : off + cfg.chunks * cfg.stride : cfg.stride] = (
-            pltpu.pack_elementwise([u0, u1], packed_dtype=jnp.bfloat16)
-        )
+      acc_u32 = pltpu.bitcast(acc, jnp.uint32)
+      relayout_buffer_u32[token, : acc_u32.shape[0]] = acc_u32
     num_rows_fetched_smem[fetch_input_slot] = num_rows_fetched
 
     # Step 4: Unpack transposed chunks from relayout_buffer into the output
     # VMEM buffer, one 128-lane output column block at a time.
-    for col_block in range(cfg.chunks * cfg.packing):
-      c, j = divmod(col_block, cfg.packing)
-      batch_u32 = relayout_buffer[
-          pl.ds(
-              (j * cfg.chunks + c) * cfg.stride,
-              cfg.tokens_per_batch // cfg.packing,
-          )
-      ]
-      out_rows[:, pl.ds(col_block * cfg.lanes, cfg.lanes)] = pltpu.bitcast(
-          batch_u32, jnp.bfloat16
-      ).astype(cfg.out_dtype)
+    relayout_vreg = layout_util.load_compact_to_large(
+        relayout_buffer, cfg.hidden_size
+    )
+    out_rows[...] = relayout_vreg.astype(cfg.out_dtype)
 
     # Step 5: Start async output DMA from VMEM to HBM.
     pltpu.make_async_copy(
@@ -462,24 +464,14 @@ def output_reduce_unpack(
   if isinstance(rows, arg.ActivationWrapper):
     rows = rows.data
 
-  if (
-      rows.dtype != jnp.bfloat16
-      or rows.ndim != 4
-      or rows.shape[2:] != (2, Config.lanes)
-  ):
-    raise ValueError(
-        "rows must be bf16[T * K, H / 256, 2, 128], got"
-        f" {rows.dtype}{rows.shape}"
-    )
-  if weights.ndim != 2:
-    raise ValueError(f"weights must be 2D [T, K], got {weights.shape}")
+  cfg = Config.create(
+      rows=rows,
+      weights=weights,
+      out_dtype=out_dtype,
+      acc_dtype=acc_dtype,
+      tpu_info=pltpu.get_tpu_info(),
+  )
 
-  num_tokens, topk = weights.shape
-  if rows.shape[0] != num_tokens * topk:
-    raise ValueError(
-        f"weights must be [T, K] with T * K == {rows.shape[0]}, got"
-        f" {weights.shape}"
-    )
   if topk_indices is not None:
     if topk_indices.shape != weights.shape:
       raise ValueError(
@@ -497,13 +489,6 @@ def output_reduce_unpack(
     )
     weights = jnp.where(local, weights, 0)
 
-  cfg = Config.create(
-      num_tokens=num_tokens,
-      topk=topk,
-      chunks=rows.shape[1],
-      out_dtype=out_dtype,
-      acc_dtype=acc_dtype,
-  )
   # Pad tokens to whole batches, plus the `num_input_buffers - 1` batches the
   # kernel's prologue fetches past the last one; zero weights copy nothing.
   prologue_tokens = (cfg.num_input_buffers - 1) * cfg.tokens_per_batch
@@ -513,8 +498,8 @@ def output_reduce_unpack(
   # For each token, find the first and last non-zero pick [k_lo, k_hi] so
   # fetch_token_rows can issue a single contiguous DMA of length `span`.
   valid = w_padded != 0
-  k_idx = jnp.arange(topk, dtype=jnp.int32)
-  k_lo = jnp.min(jnp.where(valid, k_idx, topk), axis=1)
+  k_idx = jnp.arange(cfg.topk, dtype=jnp.int32)
+  k_lo = jnp.min(jnp.where(valid, k_idx, cfg.topk), axis=1)
   k_hi = jnp.max(jnp.where(valid, k_idx, -1), axis=1)
   span = jnp.maximum(k_hi - k_lo + 1, 0)
   k_lo = jnp.where(span > 0, k_lo, 0)
@@ -544,7 +529,7 @@ def output_reduce_unpack(
           cfg.out_dtype,
       ),
       mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=1),
-      scratch_types=cfg.scratch_types(rows.dtype),
+      scratch_types=cfg.scratch_types(),
       compiler_params=pltpu.CompilerParams(
           disable_bounds_checks=True,
           vmem_limit_bytes=cfg.tpu_info.vmem_capacity_bytes,
@@ -552,4 +537,4 @@ def output_reduce_unpack(
       name=cfg.kernel_name,
       metadata=cfg.kernel_metadata,
   )(topk_weights, rows)
-  return out[:num_tokens]
+  return out[: cfg.num_tokens]
