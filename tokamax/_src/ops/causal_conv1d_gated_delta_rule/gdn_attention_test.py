@@ -14,13 +14,33 @@
 # ==============================================================================
 """Tests for GDN kernel synced from tpu-inference."""
 
+import dataclasses
+import functools
+import sys
+
+from absl import flags
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import tiling
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import wrapper
+
+
+_RACE_REPEATS = flags.DEFINE_integer(
+    "race_repeats",
+    2,
+    "Number of repeated kernel launches in state-slot race parity tests.",
+)
+_DECODE_TILE = flags.DEFINE_integer(
+    "gdn_decode_tile_size",
+    0,
+    "Optional decode_tile_size override (0 uses tiling.get_tile_sizes).",
+)
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -1060,6 +1080,887 @@ class GDNAttentionTest(parameterized.TestCase):
         np.any(np.asarray(rec_after_b[write_slot]) != 0.0),
         "write_slot should hold the step's final recurrent state",
     )
+
+  def test_per_seq_rolls_read_offsets_with_start_seq(self):
+    """PER_SEQ continuation behind a decode sequence honors read_offsets."""
+    kq_head_dim = 128
+    v_head_dim = 128
+    n_kq = 2
+    n_v = 8
+    kernel_size = 4
+    conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+
+    # Seq 0: 1-token decode at slot 1 with read_offset=0.
+    # Seq 1: 32-token continuation prefill with base state_indices=10,
+    # read_offsets=2 (initial state lives at slot 12), writing final state to
+    # base slot 10.
+    num_blocks = 16
+    rngs = iter(jax.random.split(jax.random.key(31), 10))
+    qkv = jax.random.normal(next(rngs), (33, conv_dim))
+    b = jax.random.normal(next(rngs), (33, n_v))
+    a = jax.random.normal(next(rngs), (33, n_v))
+    conv_weight = jax.random.normal(next(rngs), (conv_dim, 1, kernel_size))
+    conv_bias = jax.random.normal(next(rngs), (conv_dim,))
+    a_log = jax.random.normal(next(rngs), (n_v,))
+    dt_bias = jax.random.normal(next(rngs), (n_v,))
+
+    conv_state = jax.random.normal(
+        next(rngs), (num_blocks, kernel_size - 1, conv_dim)
+    )
+    recurrent_state = jax.random.normal(
+        next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim)
+    )
+
+    common_static = dict(
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=kq_head_dim,
+        d_v=v_head_dim,
+        kernel_size=kernel_size,
+        # Same chunk schedule in both calls, so 1e-5 compares like for like.
+        mixed_tile_size=32,
+    )
+
+    (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_state=jnp.array(conv_state),
+        recurrent_state=jnp.array(recurrent_state),
+        query_start_loc=jnp.array([0, 1, 33], dtype=jnp.int32),
+        state_indices=jnp.array([1, 10], dtype=jnp.int32),
+        read_state_indices=jnp.array([1, 10], dtype=jnp.int32),
+        read_offsets=jnp.array([0, 2], dtype=jnp.int32),
+        distribution=jnp.array([1, 2, 2], dtype=jnp.int32),
+        seq_lens=jnp.array([10, 64], dtype=jnp.int32),
+        **common_static,
+    )
+
+    # Reference: run Seq 1 directly reading from slot 12 (10 + 2) and writing
+    # to slot 10 with read_offsets=0.
+    (conv_ref, rec_ref), out_ref = wrapper.fused_conv1d_gdn(
+        qkv=qkv[1:],
+        b=b[1:],
+        a=a[1:],
+        conv_state=jnp.array(conv_state),
+        recurrent_state=jnp.array(recurrent_state),
+        query_start_loc=jnp.array([0, 32], dtype=jnp.int32),
+        state_indices=jnp.array([10], dtype=jnp.int32),
+        read_state_indices=jnp.array([12], dtype=jnp.int32),
+        read_offsets=jnp.array([0], dtype=jnp.int32),
+        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+        seq_lens=jnp.array([64], dtype=jnp.int32),
+        **common_static,
+    )
+
+    np.testing.assert_allclose(out[1:], out_ref, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(conv_out[10], conv_ref[10], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(rec_out[10], rec_ref[10], rtol=1e-5, atol=1e-5)
+
+  def test_inner_kernel_explicit_p_id_matches_default(self):
+    """Explicit p_id in inner_kernel overrides pl.program_id(0)."""
+    metadata = wrapper.metadata
+    pl = wrapper.pl
+    kq_head_dim = 128
+    v_head_dim = 128
+    n_kq = 2
+    n_v = 8
+    kernel_size = 4
+    batch_size = 32
+    dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+    num_blocks = 4
+
+    rngs = iter(jax.random.split(jax.random.key(41), 10))
+    qkv = jax.random.normal(next(rngs), (batch_size, dim))
+    b = jax.random.normal(next(rngs), (batch_size, n_v))
+    a = jax.random.normal(next(rngs), (batch_size, n_v))
+    conv_weight = jax.random.normal(next(rngs), (dim, 1, kernel_size))
+    conv_bias = jax.random.normal(next(rngs), (dim,))
+    a_log = jax.random.normal(next(rngs), (n_v,))
+    dt_bias = jax.random.normal(next(rngs), (n_v,))
+    conv_state = jax.random.normal(
+        next(rngs), (num_blocks, kernel_size - 1, dim)
+    )
+    recurrent_state = jax.random.normal(
+        next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim)
+    )
+
+    query_start_loc = jnp.array([0, batch_size], dtype=jnp.int32)
+    state_indices = jnp.array([1], dtype=jnp.int32)
+    distribution = jnp.array([0, 1, 1], dtype=jnp.int32)
+    seq_lens = jnp.array([batch_size], dtype=jnp.int32)
+
+    (conv_ref, rec_ref), out_ref = wrapper.fused_conv1d_gdn(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_state=jnp.array(conv_state),
+        recurrent_state=jnp.array(recurrent_state),
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=query_start_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        seq_lens=seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=kq_head_dim,
+        d_v=v_head_dim,
+        kernel_size=kernel_size,
+        mixed_tile_size=batch_size,
+    )
+
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    aligned_num_v_heads = tiling.align_to(n_v, num_lanes)
+    num_v_pad = aligned_num_v_heads - n_v
+    qkv_3d = qkv.reshape(batch_size, 1, -1)
+    b_3d = jnp.pad(b, ((0, 0), (0, num_v_pad))).reshape(batch_size, 1, -1)
+    a_3d = jnp.pad(a, ((0, 0), (0, num_v_pad))).reshape(batch_size, 1, -1)
+    in_conv = jnp.array(conv_state).reshape(-1, kernel_size - 1, 1, dim)
+    in_rec = jnp.array(recurrent_state)
+    weights = memory_ref.WeightRefs(
+        conv=memory_ref.ConvWeightsRef(
+            weight=conv_weight.swapaxes(0, 2).astype(jnp.float32),
+            bias=conv_bias.astype(jnp.float32),
+        ),
+        gdn=memory_ref.GDNWeightsRef(a_log=a_log, dt_bias=dt_bias),
+    )
+
+    cfg = config.GDNConfig(
+        mode=config.GDNMode.PER_SEQ,
+        batch_size=batch_size,
+        kernel_size=kernel_size,
+        tile_size=batch_size,
+        window_size=1,
+        dim_size=dim,
+        num_kq_heads=n_kq,
+        num_v_heads=n_v,
+        kq_head_dim=kq_head_dim,
+        v_head_dim=v_head_dim,
+        dtypes=config.Dtypes(
+            act_in=qkv.dtype,
+            act_out=qkv.dtype,
+            compute=jnp.float32.dtype,
+            recurrent_state=in_rec.dtype,
+            conv_state=in_conv.dtype,
+        ),
+    )
+    dma_meta = metadata.compute_per_seq_metadata(
+        cfg=cfg,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        state_indices=state_indices,
+        start_seq=distribution[0],
+        end_seq=distribution[-1],
+        read_indices=state_indices,
+        read_offsets=jnp.zeros_like(state_indices),
+    )
+    # Place the valid tile record at index 1 and zero out index 0 so a kernel
+    # that ignores p_id=1 and reads pl.program_id(0)==0 sees r_size=0.
+    s = memory_ref.PackedPIdRecord.STRUCT_SIZE
+    shifted_records = (
+        jnp.zeros((2 * s,), dtype=dma_meta.records.dtype)
+        .at[s : 2 * s]
+        .set(dma_meta.records[:s])
+    )
+    inner_meta = dataclasses.replace(dma_meta, records=shifted_records)
+
+    def custom_outer(
+        dma_meta_ref,
+        inner_meta_ref,
+        qkv_ref,
+        b_ref,
+        a_ref,
+        conv_state_ref,
+        recurrent_state_ref,
+        _,
+        weights_ref,
+        out_ref,
+        conv_state_out_ref,
+        recurrent_state_out_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+    ):
+      allocs = memory_ref.create_allocs(
+          metadata_ref=dma_meta_ref,
+          qkv_ref=qkv_ref,
+          b_ref=b_ref,
+          a_ref=a_ref,
+          out_ref=out_ref,
+          cfg=cfg,
+      )
+      (
+          qkv_a,
+          b_a,
+          a_a,
+          conv_in_a,
+          rec_in_a,
+          out_a,
+          conv_out_a,
+          rec_out_a,
+      ) = allocs
+      pipeline_fn = pltpu.emit_pipeline(
+          body=functools.partial(
+              wrapper.inner_kernel, cfg=cfg, p_id=jnp.int32(1)
+          ),
+          grid=(dma_meta_ref.num_tiles[...],),
+          in_specs=(
+              qkv_a.spec,
+              b_a.spec,
+              a_a.spec,
+              conv_in_a.spec,
+              rec_in_a.spec,
+          ),
+          out_specs=(
+              out_a.spec,
+              conv_out_a.spec,
+              rec_out_a.spec,
+          ),
+      )
+
+      @pl.with_scoped(allocations=allocs)
+      def _run(allocations):
+        pipeline_fn(
+            qkv_ref,
+            b_ref,
+            a_ref,
+            conv_state_ref,
+            recurrent_state_ref,
+            out_ref,
+            conv_state_out_ref,
+            recurrent_state_out_ref,
+            scratches=(
+                inner_meta_ref,
+                weights_ref,
+                carry_conv_scratch_ref,
+                carry_recurrent_scratch_ref,
+            ),
+            allocations=allocations,
+        )
+
+      _run()
+
+    smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    meta_spec = jax.tree.map(lambda _: smem_spec, dma_meta)
+    weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
+    out_init = jnp.zeros_like(cfg.get_out_shape())
+    n_meta = 2 * len(dma_meta)
+    aliases = {n_meta + 3: 1, n_meta + 4: 2, n_meta + 5: 0}
+
+    out_act, conv_out, rec_out = pl.pallas_call(
+        custom_outer,
+        out_shape=(out_init, in_conv, in_rec),
+        in_specs=(
+            meta_spec,
+            meta_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            weights_spec,
+        ),
+        out_specs=(hbm_spec, hbm_spec, hbm_spec),
+        scratch_shapes=cfg.get_scratch_shape_dict(),
+        input_output_aliases=aliases,
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+            vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+        ),
+    )(
+        dma_meta,
+        inner_meta,
+        qkv_3d,
+        b_3d,
+        a_3d,
+        in_conv,
+        in_rec,
+        out_init,
+        weights,
+    )
+
+    out_act = out_act.reshape(batch_size, -1)
+    conv_out = conv_out.reshape(conv_state.shape)
+    np.testing.assert_array_equal(out_act, out_ref)
+    np.testing.assert_array_equal(conv_out[1], conv_ref[1])
+    np.testing.assert_array_equal(rec_out[1], rec_ref[1])
+
+  def test_state_pipeline_has_no_dma_race(self):
+    """Pallas interpret-mode vector-clock detector finds zero DMA races."""
+    n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
+    dim = 2 * n_kq * d_k + n_v * d_v
+    # 6 decode sequences, then 3 one-token prefill sequences (one PER_SEQ tile
+    # each), so both kernels reuse a slot two steps later.
+    num_decode = 6
+    num_seqs = 9
+    decode_tile = 2  # 3 pipeline steps: step 2 reuses step 0's slot.
+
+    rngs = iter(jax.random.split(jax.random.key(0), 9))
+    qkv = jax.random.normal(next(rngs), (num_seqs, dim), dtype=jnp.bfloat16)
+    b = jax.random.normal(next(rngs), (num_seqs, n_v), dtype=jnp.bfloat16)
+    a = jax.random.normal(next(rngs), (num_seqs, n_v), dtype=jnp.bfloat16)
+    conv_w = jax.random.normal(
+        next(rngs), (dim, 1, kernel_size), dtype=jnp.bfloat16
+    )
+    conv_b = jax.random.normal(next(rngs), (dim,), dtype=jnp.bfloat16)
+    a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+    dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+    init_conv = jax.random.normal(
+        next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.bfloat16
+    )
+    init_rec = jax.random.normal(
+        next(rngs), (num_seqs, n_v, d_k, d_v), dtype=jnp.float32
+    )
+
+    q_loc = jnp.arange(num_seqs + 1, dtype=jnp.int32)
+    state_indices = jnp.arange(num_seqs, dtype=jnp.int32)
+    distribution = jnp.array([num_decode, num_seqs, num_seqs], dtype=jnp.int32)
+    seq_lens = jnp.full((num_seqs,), 11, dtype=jnp.int32)
+
+    # OSS jax 0.11.x has no InterpretParams.on_race, so read the detector's
+    # verdict before each pallas_call clears the shared state.
+    mosaic_interpret = sys.modules[
+        pltpu.reset_tpu_interpret_mode_state.__module__
+    ]
+    races_per_call: list[bool] = []
+    orig_clear = getattr(mosaic_interpret, "_clear_shared_memory")
+
+    def _record_and_clear():
+      races = getattr(mosaic_interpret, "races", None)
+      if races is not None:
+        races_per_call.append(bool(races.races_found))
+      orig_clear()
+
+    pltpu.reset_tpu_interpret_mode_state()
+    setattr(mosaic_interpret, "_clear_shared_memory", _record_and_clear)
+    try:
+      with pltpu.force_tpu_interpret_mode(
+          pltpu.InterpretParams(
+              detect_races=True,
+              dma_execution_mode="eager",
+              skip_floating_point_ops=False,
+              vector_clock_size=128,
+          )
+      ):
+        (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_state=init_conv,
+            recurrent_state=init_rec,
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            decode_tile_size=decode_tile,
+            # CPU interpret mode does not support ref.reshape on the C > 1
+            # chunked prefill path; each 1-token prefill is one tile at C = 1.
+            mixed_tile_size=1,
+        )
+        jax.block_until_ready((conv_out, rec_out, out))
+      self.assertTrue(races_per_call)
+      self.assertFalse(
+          any(races_per_call),
+          f"DMA race detected across pallas_call phases: {races_per_call}",
+      )
+    finally:
+      setattr(mosaic_interpret, "_clear_shared_memory", orig_clear)
+      pltpu.reset_tpu_interpret_mode_state()
+
+  def _run_batched_decode_initial_state_parity(self, state_dtype: jnp.dtype):
+    """Multi-tile batched decode preserves per-sequence initial states."""
+    n_kq, n_v, d_k, d_v, kernel_size = 16, 64, 128, 128, 4
+    dim = 2 * n_kq * d_k + n_v * d_v
+    num_seqs = 256
+    if _DECODE_TILE.value > 0:
+      decode_tile = _DECODE_TILE.value
+    else:
+      decode_tile, _ = tiling.get_tile_sizes(
+          batch_size=num_seqs,
+          num_seqs=num_seqs,
+          padded_batch_size=num_seqs,
+          n_kq=n_kq,
+          n_v=n_v,
+          d_k=d_k,
+          d_v=d_v,
+          kernel_size=kernel_size,
+          conv_state_dim_size=dim,
+          act_out_dtype=jnp.dtype(jnp.bfloat16),
+          recurrent_state_dtype=state_dtype,
+          num_lanes=pltpu.get_tpu_info().num_lanes,
+          decode_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(1),
+          mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+      )
+    steps = num_seqs // decode_tile
+    self.assertGreaterEqual(steps, 4)
+
+    block_ids = jnp.arange(1, num_seqs + 1, dtype=jnp.float32)
+    init_conv = jnp.broadcast_to(
+        block_ids[:, None, None] * jnp.float32(1e-2),
+        (num_seqs, kernel_size - 1, dim),
+    ).astype(jnp.bfloat16)
+    init_rec = jnp.broadcast_to(
+        block_ids[:, None, None, None] * jnp.float32(1e-2),
+        (num_seqs, n_v, d_k, d_v),
+    ).astype(state_dtype)
+
+    qkv = jnp.zeros((num_seqs, dim), dtype=jnp.bfloat16)
+    b = jnp.full((num_seqs, n_v), -20.0, dtype=jnp.bfloat16)
+    a = jnp.full((num_seqs, n_v), -20.0, dtype=jnp.bfloat16)
+    conv_weight = jnp.zeros((dim, 1, kernel_size), dtype=jnp.bfloat16)
+    conv_bias = jnp.zeros((dim,), dtype=jnp.bfloat16)
+    a_log = jnp.full((n_v,), -20.0, dtype=jnp.float32)
+    dt_bias = jnp.full((n_v,), -20.0, dtype=jnp.float32)
+
+    q_loc = jnp.arange(num_seqs + 1, dtype=jnp.int32)
+    state_indices = jnp.arange(num_seqs, dtype=jnp.int32)
+    distribution = jnp.array([num_seqs, num_seqs, num_seqs], dtype=jnp.int32)
+    seq_lens = jnp.full((num_seqs,), 11, dtype=jnp.int32)
+
+    (conv_ref, rec_ref), out_ref = gdn_attention_ref(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_state=init_conv,
+        recurrent_state=init_rec,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=q_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        seq_lens=seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+    )
+
+    for rep in range(_RACE_REPEATS.value):
+      (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+          qkv=qkv,
+          b=b,
+          a=a,
+          conv_state=init_conv.copy(),
+          recurrent_state=init_rec.copy(),
+          conv_weight=conv_weight,
+          conv_bias=conv_bias,
+          a_log=a_log,
+          dt_bias=dt_bias,
+          query_start_loc=q_loc,
+          state_indices=state_indices,
+          distribution=distribution,
+          seq_lens=seq_lens,
+          n_kq=n_kq,
+          n_v=n_v,
+          d_k=d_k,
+          d_v=d_v,
+          kernel_size=kernel_size,
+          decode_tile_size=decode_tile,
+      )
+      block_err = jnp.max(
+          jnp.abs(rec_out.astype(jnp.float32) - rec_ref.astype(jnp.float32)),
+          axis=(1, 2, 3),
+      )
+      bad_blocks = np.where(np.asarray(block_err) > 1e-5)[0]
+      if bad_blocks.size > 0:
+        blk = int(bad_blocks[0])
+        src_blk = blk + 2 * decode_tile
+        rec_blk = np.asarray(rec_out[blk], dtype=np.float32)
+        ref_blk = np.asarray(rec_ref[blk], dtype=np.float32)
+        corrupted_mask = np.abs(rec_blk - ref_blk) > 1e-5
+        if src_blk < num_seqs and np.any(corrupted_mask):
+          hit = float(
+              np.mean(
+                  rec_blk[corrupted_mask]
+                  == np.asarray(init_rec[src_blk], np.float32)[corrupted_mask]
+              )
+          )
+        else:
+          hit = 0.0
+        self.fail(
+            f"rep={rep} state_dtype={state_dtype} tile={decode_tile}: "
+            f"{bad_blocks.size}/{num_seqs} blocks corrupted "
+            f"(blocks={bad_blocks.tolist()}); block {blk} matches "
+            f"init_rec[{src_blk}] on {hit:.1%} of corrupted elements "
+            f"({int(np.sum(corrupted_mask))} elements)."
+        )
+      np.testing.assert_allclose(conv_out, conv_ref, rtol=1e-5, atol=1e-5)
+      np.testing.assert_allclose(out, out_ref, rtol=1e-5, atol=1e-5)
+
+  def test_batched_decode_initial_state_parity_fp32(self):
+    self._run_batched_decode_initial_state_parity(jnp.dtype(jnp.float32))
+
+  def test_batched_decode_initial_state_parity_bf16(self):
+    self._run_batched_decode_initial_state_parity(jnp.dtype(jnp.bfloat16))
+
+  def test_spec_window_checkpoints_multi_tile(self):
+    """Multi-tile spec verify (W=4) matches reference across repeats."""
+    n_kq, n_v, d_k, d_v, kernel_size = 4, 8, 128, 128, 4
+    dim = 2 * n_kq * d_k + n_v * d_v
+    window = 4
+    num_seqs = 12
+    batch_size = num_seqs * window
+    num_blocks = num_seqs * window + 8
+
+    decode_tile, _ = tiling.get_tile_sizes(
+        batch_size=batch_size,
+        num_seqs=num_seqs,
+        padded_batch_size=batch_size,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        conv_state_dim_size=dim,
+        act_out_dtype=jnp.dtype(jnp.bfloat16),
+        recurrent_state_dtype=jnp.dtype(jnp.float32),
+        num_lanes=pltpu.get_tpu_info().num_lanes,
+        decode_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(window),
+        mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+        window_size=window,
+    )
+    self.assertGreaterEqual(decode_tile, 2)
+    self.assertGreaterEqual((num_seqs + decode_tile - 1) // decode_tile, 3)
+
+    rngs = iter(jax.random.split(jax.random.key(314), 10))
+    qkv = jax.random.normal(next(rngs), (batch_size, dim), dtype=jnp.bfloat16)
+    b = jax.random.normal(next(rngs), (batch_size, n_v), dtype=jnp.bfloat16)
+    a = jax.random.normal(next(rngs), (batch_size, n_v), dtype=jnp.bfloat16)
+    conv_w = jax.random.normal(
+        next(rngs), (dim, 1, kernel_size), dtype=jnp.bfloat16
+    )
+    conv_b = jax.random.normal(next(rngs), (dim,), dtype=jnp.bfloat16)
+    a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+    dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+    init_conv = jax.random.normal(
+        next(rngs), (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
+    )
+    init_rec = jax.random.normal(
+        next(rngs), (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
+    )
+
+    q_loc = jnp.arange(0, batch_size + 1, window, dtype=jnp.int32)
+    state_indices = jnp.arange(num_seqs, dtype=jnp.int32) * window
+    read_offsets = jnp.array(
+        [s % window for s in range(num_seqs)], dtype=jnp.int32
+    )
+    distribution = jnp.array([num_seqs, num_seqs, num_seqs], dtype=jnp.int32)
+    seq_lens = jnp.full((num_seqs,), window + 10, dtype=jnp.int32)
+
+    (conv_ref, rec_ref), out_ref = gdn_attention_spec_ref(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_state=init_conv,
+        recurrent_state=init_rec,
+        conv_weight=conv_w,
+        conv_bias=conv_b,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=q_loc,
+        state_indices=state_indices,
+        read_offsets=read_offsets,
+        num_spec_seqs=num_seqs,
+        seq_lens=seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+    )
+
+    for _ in range(3):
+      (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+          qkv=qkv,
+          b=b,
+          a=a,
+          conv_state=init_conv.copy(),
+          recurrent_state=init_rec.copy(),
+          conv_weight=conv_w,
+          conv_bias=conv_b,
+          a_log=a_log,
+          dt_bias=dt_bias,
+          query_start_loc=q_loc,
+          state_indices=state_indices,
+          distribution=distribution,
+          seq_lens=seq_lens,
+          read_offsets=read_offsets,
+          n_kq=n_kq,
+          n_v=n_v,
+          d_k=d_k,
+          d_v=d_v,
+          kernel_size=kernel_size,
+          num_spec_tokens=window - 1,
+      )
+      np.testing.assert_allclose(out, out_ref, rtol=1e-2, atol=1e-2)
+      for s in range(num_seqs):
+        base = int(state_indices[s])
+        np.testing.assert_allclose(
+            conv_out[base : base + window],
+            conv_ref[base : base + window],
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        np.testing.assert_allclose(
+            rec_out[base : base + window],
+            rec_ref[base : base + window],
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+  def test_per_seq_boundary_read_after_write(self):
+    """PER_SEQ multi-tile sequences preserve initial state and final writeback."""
+    n_kq, n_v, d_k, d_v, kernel_size = 4, 8, 128, 128, 4
+    dim = 2 * n_kq * d_k + n_v * d_v
+    # One-tile sequences between two-tile ones put a store at tile p and a
+    # load at tile p + 2 on the same slot of the old shared ring.
+    lengths = [64, 32, 64, 32, 64, 32]
+    num_seqs = len(lengths)
+    batch_size = sum(lengths)
+
+    rngs = iter(jax.random.split(jax.random.key(2718), 10))
+    qkv = jax.random.normal(next(rngs), (batch_size, dim), dtype=jnp.bfloat16)
+    b = jax.random.normal(next(rngs), (batch_size, n_v), dtype=jnp.bfloat16)
+    a = jax.random.normal(next(rngs), (batch_size, n_v), dtype=jnp.bfloat16)
+    conv_w = jax.random.normal(
+        next(rngs), (dim, 1, kernel_size), dtype=jnp.bfloat16
+    )
+    conv_b = jax.random.normal(next(rngs), (dim,), dtype=jnp.bfloat16)
+    a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+    dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+    init_conv = jax.random.normal(
+        next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.bfloat16
+    )
+    init_rec = jax.random.normal(
+        next(rngs), (num_seqs, n_v, d_k, d_v), dtype=jnp.float32
+    )
+
+    q_loc = jnp.array([0, *np.cumsum(lengths)], dtype=jnp.int32)
+    state_indices = jnp.arange(num_seqs, dtype=jnp.int32)
+    distribution = jnp.array([0, num_seqs, num_seqs], dtype=jnp.int32)
+    seq_lens = jnp.array(lengths, dtype=jnp.int32) + 10
+
+    (conv_ref, rec_ref), out_ref = gdn_attention_ref(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_state=init_conv,
+        recurrent_state=init_rec,
+        conv_weight=conv_w,
+        conv_bias=conv_b,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=q_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        seq_lens=seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+    )
+
+    for _ in range(3):
+      (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+          qkv=qkv,
+          b=b,
+          a=a,
+          conv_state=init_conv.copy(),
+          recurrent_state=init_rec.copy(),
+          conv_weight=conv_w,
+          conv_bias=conv_b,
+          a_log=a_log,
+          dt_bias=dt_bias,
+          query_start_loc=q_loc,
+          state_indices=state_indices,
+          distribution=distribution,
+          seq_lens=seq_lens,
+          n_kq=n_kq,
+          n_v=n_v,
+          d_k=d_k,
+          d_v=d_v,
+          kernel_size=kernel_size,
+          mixed_tile_size=32,
+      )
+      np.testing.assert_allclose(out, out_ref, rtol=1e-2, atol=1e-2)
+      np.testing.assert_allclose(conv_out, conv_ref, rtol=1e-2, atol=1e-2)
+      np.testing.assert_allclose(rec_out, rec_ref, rtol=1e-2, atol=1e-2)
+
+  def test_qwen3_5_397b_parallelism_tile_selection(self):
+    """Selects optimal (decode_tile, mixed_tile) across Qwen3.5-397B parallelisms."""
+    d_k, d_v, kernel_size = 128, 128, 4
+    f32 = jnp.dtype(jnp.float32)
+    bf16 = jnp.dtype(jnp.bfloat16)
+    # Use the 64 MiB TPU v7x VMEM budget (0.8 default, 0.9 windowed)
+    # so the expected tile table is identical across TPU test targets.
+    vmem_64m = 64 * 1024 * 1024
+    limit_w1 = int(config.GDNConfig.DEFAULT_VMEM_FRACTION * vmem_64m)
+    limit_w4 = int(config.GDNConfig.WINDOWED_VMEM_FRACTION * vmem_64m)
+
+    # (label, n_kq, n_v, batch_size, num_seqs, window_size, state_dtype, expected)
+    cases = [
+        # TP8 + DCP=4 (n_kq=2, n_v=8, W=4 for MTP=3): warmup & verify buckets
+        ("tp8_dcp4_c16_b4", 2, 8, 4, 16, 4, f32, (2, 4)),
+        ("tp8_dcp4_c16_b8", 2, 8, 8, 16, 4, f32, (4, 8)),
+        ("tp8_dcp4_c16_b16", 2, 8, 16, 16, 4, f32, (4, 16)),
+        ("tp8_dcp4_c16_b32", 2, 8, 32, 16, 4, f32, (4, 32)),
+        ("tp8_dcp4_c16_b64", 2, 8, 64, 16, 4, f32, (4, 64)),
+        ("tp8_dcp4_c32_b128", 2, 8, 128, 32, 4, f32, (8, 128)),
+        ("tp8_dcp4_c64_b256", 2, 8, 256, 64, 4, f32, (8, 128)),
+        # TP8 + DCP=1 (n_kq=2, n_v=8, W=1 and W=4) and padded slot table
+        ("tp8_dcp1_c8_mtp3_b32", 2, 8, 32, 8, 4, f32, (4, 32)),
+        ("tp8_dcp1_c32_b16", 2, 8, 16, 32, 1, f32, (4, 16)),
+        ("tp8_dcp1_c64_b64", 2, 8, 64, 64, 1, f32, (8, 64)),
+        ("tp8_padded_n512_b64", 2, 8, 64, 512, 1, bf16, (8, 64)),
+        # PCP8 + TP1 disagg prefill (n_kq=2, n_v=8, W=1)
+        ("pcp8_prefill_b4096", 2, 8, 4096, 16, 1, f32, (4, 128)),
+        # DP4 + TP2 + EP8 (n_kq=8, n_v=32, W=1 and W=4)
+        ("dp4tp2_c64_b8", 8, 32, 8, 32, 1, f32, (2, 8)),
+        ("dp4tp2_c64_b32", 8, 32, 32, 32, 1, f32, (4, 32)),
+        ("dp4tp2_c64_b2048", 8, 32, 2048, 32, 1, f32, (4, 128)),
+        ("dp4tp2_mtp3_c16_b64_f32", 8, 32, 64, 16, 4, f32, (2, 64)),
+        ("dp4tp2_mtp3_c32_b128_f32", 8, 32, 128, 32, 4, f32, (2, 128)),
+        ("dp4tp2_mtp3_c32_b128_bf16", 8, 32, 128, 32, 4, bf16, (4, 128)),
+        # DP8 + TP1 + EP8 (n_kq=16, n_v=64, W=1 and W=4)
+        ("dp8_c128_b8", 16, 64, 8, 16, 1, f32, (1, 8)),
+        ("dp8_c128_b16", 16, 64, 16, 16, 1, f32, (2, 16)),
+        ("dp8_c256_b32_f32", 16, 64, 32, 32, 1, f32, (2, 32)),
+        ("dp8_c256_b32_bf16", 16, 64, 32, 32, 1, bf16, (2, 32)),
+        ("dp8_c256_b320_f32", 16, 64, 320, 32, 1, f32, (2, 64)),
+        ("dp8_mtp3_c32_b128_f32", 16, 64, 128, 32, 4, f32, (1, 64)),
+        ("dp8_mtp3_c32_b128_bf16", 16, 64, 128, 32, 4, bf16, (2, 64)),
+    ]
+    for label, n_kq, n_v, b, n, w, state_dtype, expected in cases:
+      with self.subTest(label=label):
+        dim = 2 * n_kq * d_k + n_v * d_v
+        got = tiling.get_tile_sizes(
+            batch_size=b,
+            num_seqs=n,
+            padded_batch_size=b,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            conv_state_dim_size=dim,
+            act_out_dtype=bf16,
+            recurrent_state_dtype=state_dtype,
+            num_lanes=128,
+            decode_vmem_limit_bytes=limit_w4 if w > 1 else limit_w1,
+            mixed_vmem_limit_bytes=limit_w1,
+            window_size=w,
+        )
+        self.assertEqual(got, expected, msg=label)
+
+  def test_qwen3_5_397b_parallelism_execution(self):
+    """Executes default-tiled GDN across Qwen3.5-397B head splits and DCP=4."""
+    d_k, d_v, kernel_size = 128, 128, 4
+    rng = jax.random.key(42)
+
+    for n_kq, n_v, num_seqs, num_spec_tokens, prefill_len, num_decodes in [
+        (2, 8, 16, 3, 16, 0),  # TP8 DCP=4 c=16 MTP=3: 16-tok prefill in B=16
+        (2, 8, 16, 3, 0, 16),  # TP8 DCP=4 c=16 MTP=3 warmup: 16 decodes, B=16
+        (8, 32, 16, 0, 12, 4),  # DP4TP2: 4 decodes + 12-tok prefill in B=16
+        (16, 64, 16, 0, 12, 4),  # DP8: 4 decodes + 12-tok prefill in B=16
+    ]:
+      with self.subTest(
+          n_kq=n_kq,
+          n_v=n_v,
+          num_spec_tokens=num_spec_tokens,
+          prefill_len=prefill_len,
+          num_decodes=num_decodes,
+      ):
+        dim = 2 * n_kq * d_k + n_v * d_v
+        window = num_spec_tokens + 1
+        batch_size = num_decodes + prefill_len
+        num_blocks = num_seqs * window + 4
+        k1, k2, k3, k4, k5, k6, k7, k8, k9, rng = jax.random.split(rng, 10)
+        init_conv = jax.random.normal(
+            k8, (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
+        )
+        init_rec = jax.random.normal(
+            k9, (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
+        )
+        active_seqs = num_decodes + (1 if prefill_len > 0 else 0)
+        state_indices = jnp.arange(num_seqs, dtype=jnp.int32) * window
+        common_kwargs = dict(
+            qkv=jax.random.normal(k1, (batch_size, dim), dtype=jnp.bfloat16),
+            b=jax.random.normal(k2, (batch_size, n_v), dtype=jnp.bfloat16),
+            a=jax.random.normal(k3, (batch_size, n_v), dtype=jnp.bfloat16),
+            conv_weight=jax.random.normal(
+                k4, (dim, 1, kernel_size), dtype=jnp.bfloat16
+            ),
+            conv_bias=jax.random.normal(k5, (dim,), dtype=jnp.bfloat16),
+            a_log=jax.random.normal(k6, (n_v,), dtype=jnp.float32),
+            dt_bias=jax.random.normal(k7, (n_v,), dtype=jnp.float32),
+            query_start_loc=jnp.array(
+                list(range(num_decodes + 1))
+                + [batch_size] * (num_seqs - num_decodes),
+                dtype=jnp.int32,
+            ),
+            state_indices=state_indices,
+            distribution=jnp.array(
+                [num_decodes, num_decodes, active_seqs], dtype=jnp.int32
+            ),
+            seq_lens=jnp.array(
+                [10] * num_decodes
+                + ([prefill_len + 10] if prefill_len > 0 else [])
+                + [0] * (num_seqs - active_seqs),
+                dtype=jnp.int32,
+            ),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        (conv_ref, rec_ref), out_ref = gdn_attention_ref(
+            conv_state=init_conv,
+            recurrent_state=init_rec,
+            **common_kwargs,
+        )
+        (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+            conv_state=init_conv.copy(),
+            recurrent_state=init_rec.copy(),
+            read_offsets=(
+                jnp.zeros((num_seqs,), dtype=jnp.int32)
+                if num_spec_tokens > 0
+                else None
+            ),
+            num_spec_tokens=num_spec_tokens,
+            **common_kwargs,
+        )
+        np.testing.assert_allclose(out, out_ref, rtol=2e-2, atol=2e-2)
+        for s in range(active_seqs):
+          slot = int(state_indices[s])
+          np.testing.assert_allclose(
+              conv_out[slot], conv_ref[slot], rtol=2e-2, atol=2e-2
+          )
+          np.testing.assert_allclose(
+              rec_out[slot], rec_ref[slot], rtol=3e-2, atol=3e-2
+          )
 
 
 if __name__ == "__main__":

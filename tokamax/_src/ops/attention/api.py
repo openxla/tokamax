@@ -138,9 +138,9 @@ def dot_product_attention(
     raise ValueError("`implementation` must not be an empty sequence.")
 
   if query_seq_lengths is not None:
-    query_seq_lengths = query_seq_lengths[:, None, None]
+    query_seq_lengths = query_seq_lengths[..., None, None]
   if key_value_seq_lengths is not None:
-    key_value_seq_lengths = key_value_seq_lengths[:, None, None]
+    key_value_seq_lengths = key_value_seq_lengths[..., None, None]
 
   mask_ = base.Mask(
       mask,
@@ -153,9 +153,8 @@ def dot_product_attention(
     local_window_size = (local_window_size, local_window_size)
 
   if local_window_size is not None:
-    k_indices = jnp.arange(key.shape[-3])
     pre, post = local_window_size
-    mask_ &= base.Mask(k_start=k_indices - pre, k_end=k_indices + (post + 1))
+    mask_ &= base.CausalMask(offset=post, window_size=post + pre + 1)
 
   errors = []
   for impl in implementation:

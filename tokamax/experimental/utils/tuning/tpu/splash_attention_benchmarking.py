@@ -27,8 +27,8 @@ import jax
 from jax import random  # pylint: disable=g-importing-member
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 import tune_jax
 
 
@@ -171,7 +171,7 @@ def run_benchmark(
 
   tiles = [256, 512, 1024, 2048, 4096, 8192]
   layouts = [QKVLayout.HEAD_DIM_MINOR, QKVLayout.SEQ_MINOR]
-  hyperparams = {
+  hyperparams: dict[str, Any] = {
       "block_q": tiles,
       "block_kv": tiles,
       "block_kv_compute": tiles,

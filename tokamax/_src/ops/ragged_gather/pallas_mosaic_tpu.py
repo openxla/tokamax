@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pallas/Mosaic operator implementation for Ragged Gather on TPU."""
+"""Pallas/Mosaic operator implementation v2 for Ragged Gather on TPU."""
 
 from typing import override
 
@@ -20,12 +20,37 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Int, Shaped  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src.ops import op
 from tokamax._src.ops.ragged_gather import base
 from tokamax._src.ops.ragged_gather import pallas_mosaic_tpu_kernel
 
 
 class PallasTpuRaggedGather[C](base.RaggedGather[C]):
   """Tokamax operator invoking the Pallas kernel for Ragged Gather."""
+
+  @override
+  @jaxtyping.jaxtyped
+  def bind(
+      self,
+      x: Shaped[Array | base.AbstractArray, "in_size hidden_size"],
+      indices: Int[Array | base.AbstractArray, "out_size"],
+      start: Int[Array | base.AbstractArray, "1"],
+      end: Int[Array | base.AbstractArray, "1"],
+      *,
+      max_row_subchunks: int = 4,
+      trim_rows: bool = True,
+      return_residuals: bool = False,
+  ) -> op.BoundArguments:
+    return op.Op.bind(
+        self,
+        x=x,
+        indices=indices,
+        start=start,
+        end=end,
+        max_row_subchunks=max_row_subchunks,
+        trim_rows=trim_rows,
+        return_residuals=return_residuals,
+    )
 
   @override
   @jaxtyping.jaxtyped
@@ -36,11 +61,20 @@ class PallasTpuRaggedGather[C](base.RaggedGather[C]):
       start: Int[Array, "1"],
       end: Int[Array, "1"],
       *,
+      max_row_subchunks: int = 4,
+      trim_rows: bool = True,
       return_residuals: bool = False,
       config: C | None = None,
   ) -> tuple[jax.Array, None]:
     return (
-        pallas_mosaic_tpu_kernel.ragged_gather_pallas(x, indices, start, end),
+        pallas_mosaic_tpu_kernel.ragged_gather_pallas(
+            x,
+            indices,
+            start,
+            end,
+            max_row_subchunks=max_row_subchunks,
+            trim_rows=trim_rows,
+        ),
         None,
     )
 

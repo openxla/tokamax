@@ -18,6 +18,7 @@ import dataclasses
 from typing import Any, Optional
 
 import jax
+import jax.numpy as jnp
 from tokamax._src.ops import op
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import reference
 from typing_extensions import override
@@ -59,10 +60,19 @@ class CausalConv1dGatedDeltaRule[C](
       d_v: int,
       kernel_size: int,
       num_spec_tokens: int = 0,
+      compute_precision: jnp.dtype = jnp.float32.dtype,
+      kernel_act_dtype: jnp.dtype = jnp.float32.dtype,
+      kernel_conv_state_dtype: jnp.dtype = jnp.float32.dtype,
+      kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
       config: C = reference.GdnAttentionConfig(),
       return_residuals: bool = False,
   ) -> tuple[tuple[tuple[jax.Array, jax.Array], jax.Array], None]:
     del return_residuals, read_state_indices, read_offsets, num_spec_tokens
+    # Unused: Pallas kernel dtypes. This reference impl is the ground truth
+    # the kernel under test is measured against, so it must not adopt the
+    # kernel's dtypes and computes independently of them.
+    del compute_precision, kernel_act_dtype, kernel_conv_state_dtype
+    del kernel_conv_weight_dtype
     output = reference.run_jax_gdn_attention_local_ref(
         qkv=qkv,
         b=b,

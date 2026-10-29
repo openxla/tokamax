@@ -19,11 +19,10 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.batched_rpa import base as jax_base
+from tokamax._src.ops.batched_rpa import base as jax_base
 from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_base
 import torch
 import torch_tpu
-import torch_tpu._internal.pallas.pallas
 
 
 class BaseTest(parameterized.TestCase):
@@ -59,7 +58,7 @@ class BaseTest(parameterized.TestCase):
         device=device,
     )
     kv_cache = torch.zeros(
-        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=torch.bfloat16,
         device=device,
     )

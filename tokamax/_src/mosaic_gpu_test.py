@@ -106,7 +106,7 @@ class PallasMosaicGpuUtilsTest(parameterized.TestCase):
         plgpu.tcgen05_mma(
             acc_tmem,
             a_smem,
-            plgpu.transpose_ref(b_up_smem, (1, 0)),
+            b_up_smem.T,
             accumulate=False,
             barrier=barrier_ref,
         )

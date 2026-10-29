@@ -322,8 +322,5 @@ def gated_linear_unit(
       num_threads=3,
       thread_name="wg",
       scratch_types=scratch_shapes,
-      compiler_params=plgpu.CompilerParams(
-          lowering_semantics=plgpu.LoweringSemantics.Warpgroup
-      ),
   )
   return jnp.reshape(f(x, weights), (*orig_x_shape[:-1], n))

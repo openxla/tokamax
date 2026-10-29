@@ -811,9 +811,9 @@ Causality, segment boundaries, and padding are therefore fixed components of the
 
 Forward correctness is validated against implementations that do not use the Pallas TPU kernel decomposition:
 
-- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_kernel_test.py` compares the Pallas/Mosaic TPU result with the XLA implementation using identical inputs. It compares both `output` and `final_state` when a final state is requested. For CP, the Pallas path is sharded across the context mesh and is compared with the unsharded XLA result for the same global input.
-- `tokamax/_src/ops/experimental/kda/base_test.py` compares the public KDA API with a direct token-recurrent reference implementation. This independently checks the chunked formulation against the recurrence in Section 9.1.2 rather than against another use of the same chunk equations.
-- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_test.py` validates adapter-level input support and context-parallel contract checks before a kernel is traced.
+- `tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py` compares the Pallas/Mosaic TPU result with the XLA implementation using identical inputs. It compares both `output` and `final_state` when a final state is requested. For CP, the Pallas path is sharded across the context mesh and is compared with the unsharded XLA result for the same global input.
+- `tokamax/_src/ops/kda/base_test.py` compares the public KDA API with a direct token-recurrent reference implementation. This independently checks the chunked formulation against the recurrence in Section 9.1.2 rather than against another use of the same chunk equations.
+- `tokamax/_src/ops/kda/pallas_mosaic_tpu_test.py` validates adapter-level input support and context-parallel contract checks before a kernel is traced.
 - The parameterized Pallas TPU backward tests run the same case matrix and compare `dq`, `dk`, `dv`, `dg`, `dbeta`, and optional `dh0` with XLA. Although backward implementation details are outside the scope of this document, these tests validate that the forward residual and recomputation contracts provide the values required by the custom VJP.
 
 ### 6.2 Existing Forward Coverage

@@ -18,6 +18,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import compute_gdn
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import reference
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import test_base
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import wrapper
@@ -37,7 +38,7 @@ class GDNSecurityTest(test_base.CausalConv1dGatedDeltaRuleSecurityTestBase):
 
 
 class GDNReferenceL2NormTest(parameterized.TestCase):
-  """Tests for the `reference.py` l2norm helpers.
+  """Tests for the GDN l2norm helpers.
 
   These are implementation-independent, so they live here rather than in the
   shared suite in `test_base.py`.
@@ -50,6 +51,7 @@ class GDNReferenceL2NormTest(parameterized.TestCase):
   @parameterized.named_parameters(
       dict(testcase_name="chunked", l2norm_fn=reference.l2norm_chunked),
       dict(testcase_name="ref", l2norm_fn=reference.l2_normalize_ref),
+      dict(testcase_name="compute_gdn", l2norm_fn=compute_gdn.l2_norm),
   )
   def test_l2norm_fp32_internal_more_precise_than_bf16(self, l2norm_fn):
     """The l2norm helper must accumulate in fp32 even for bf16 input."""
@@ -83,6 +85,7 @@ class GDNReferenceL2NormTest(parameterized.TestCase):
   @parameterized.named_parameters(
       dict(testcase_name="chunked", l2norm_fn=reference.l2norm_chunked),
       dict(testcase_name="ref", l2norm_fn=reference.l2_normalize_ref),
+      dict(testcase_name="compute_gdn", l2norm_fn=compute_gdn.l2_norm),
   )
   def test_l2norm_returns_input_dtype(self, l2norm_fn):
     """The l2norm helpers must return the input dtype unchanged."""

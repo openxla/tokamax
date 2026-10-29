@@ -18,15 +18,15 @@ from collections.abc import Sequence
 import dataclasses
 from typing import Any, TypeVar, override
 import jax
-from tokamax._src.ops.experimental.batched_rpa import base as jax_base
-from tokamax._src.ops.experimental.batched_rpa.kernel import configs as jax_types
+from tokamax._src.ops.batched_rpa import base as jax_base
+from tokamax._src.ops.batched_rpa.kernel import configs as jax_types
 from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops import torch_utils
 import torch
 import torch_tpu
-import torch_tpu._internal.pallas.pallas
 
 _Config = TypeVar("_Config")
+BlockSizes = jax_types.BlockSizes
 
 
 def to_block_sizes(
@@ -77,7 +77,7 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
           norm_kwargs["prefill_block_sizes"]
       )
     if "out_dtype" in norm_kwargs:
-      norm_kwargs["out_dtype"] = torch_utils.str_to_jax_dtype(
+      norm_kwargs["out_dtype"] = torch_utils.to_jax_dtype(
           norm_kwargs["out_dtype"]
       )
     return super().get_bound_args(*args, **norm_kwargs)
@@ -105,19 +105,15 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
       k_scale: float | None = None,
       v_scale: float | None = None,
       chunk_prefill_size: int | None = None,
-      decode_block_sizes: jax_types.BlockSizes | Sequence[int] | None = None,
-      prefill_block_sizes: jax_types.BlockSizes | Sequence[int] | None = None,
+      decode_block_sizes: BlockSizes | Sequence[int] | None = None,
+      prefill_block_sizes: BlockSizes | Sequence[int] | None = None,
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
       skip_kv_update: bool = False,
-      kv_layout: (
-          jax_types.KVLayout | str
-      ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
-      attention_scope: (
-          jax_types.AttentionScope | str
-      ) = jax_types.AttentionScope.FULL,
+      attention_scope: str = "full",
       return_lse: bool = False,
       return_residuals: bool = False,
       config: _Config | None = None,
@@ -150,10 +146,10 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
         vmem_limit_bytes=vmem_limit_bytes,
         debug_mode=debug_mode,
         skip_kv_update=skip_kv_update,
-        kv_layout=str(kv_layout),
+        kv_layout=kv_layout,
         decode_query_size=decode_query_size,
         cp_group_size=cp_group_size,
-        attention_scope=str(attention_scope),
+        attention_scope=attention_scope,
         return_lse=return_lse,
         return_residuals=return_residuals,
     )
@@ -186,14 +182,10 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
       vmem_limit_bytes: int | None = None,
       debug_mode: bool = False,
       skip_kv_update: bool = False,
-      kv_layout: (
-          jax_types.KVLayout | str
-      ) = jax_types.KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: str = "head_along_sublane",
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
-      attention_scope: (
-          jax_types.AttentionScope | str
-      ) = jax_types.AttentionScope.FULL,
+      attention_scope: str = "full",
       return_lse: bool = False,
       return_residuals: bool = False,
   ) -> tuple[jax.Array, jax.Array]:
@@ -213,15 +205,15 @@ class _BatchedRpa(torch_op.TorchOp[_Config]):
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,
-        out_dtype=torch_utils.str_to_jax_dtype(out_dtype),
+        out_dtype=torch_utils.to_jax_dtype(out_dtype),
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
         decode_query_size=decode_query_size,
         skip_kv_update=skip_kv_update,
-        kv_layout=kv_layout,
+        kv_layout=jax_types.KVLayout(kv_layout),
         cp_group_size=cp_group_size,
-        attention_scope=attention_scope,
+        attention_scope=jax_types.AttentionScope(attention_scope),
         return_lse=return_lse,
         decode_block_sizes=to_block_sizes(decode_block_sizes),
         prefill_block_sizes=to_block_sizes(prefill_block_sizes),

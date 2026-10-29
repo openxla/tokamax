@@ -267,27 +267,15 @@ def ragged_dot_quantized_kernel(
               mgpu_lib.fence_async_shared_cta()  # Ensure store is complete.
 
               with jax.named_scope("store"):
-                # Write out the largest power of two rows first,
-                # then the next largest, etc. This allows us to coalesce
-                # writes as much as possible.
-                offset = start_within_block
-                size = 1 << (min(block_m, m).bit_length() - 1)
-                while size > 0:
-
-                  @pl.when(actual_size & size != 0)
-                  def _():
-                    for wg_ in range(_COMPUTE_WGS):
-                      ns = pl.ds((ni * _COMPUTE_WGS + wg_) * block_n, block_n)
-                      plgpu.copy_smem_to_gmem(
-                          o_smem.at[wg_, pl.ds(offset, size)],
-                          out_gmem.at[pl.ds(block_start + offset, size), ns],
-                          commit_group=False,
-                      )
-
-                  offset += actual_size & size
-                  size //= 2
-                plgpu.commit_smem_to_gmem_group()
-                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                common.copy_ragged_smem_to_gmem(
+                    o_smem,
+                    out_gmem,
+                    block_start=block_start,
+                    start_within_block=start_within_block,
+                    actual_size=actual_size,
+                    ns=pl.ds(ni * _COMPUTE_WGS * block_n, block_n),
+                    max_rows=min(block_m, m),
+                )
                 plgpu.barrier_arrive(o_consumed_barrier)
 
       return carry + (actual_size > 0)
@@ -315,17 +303,11 @@ def ragged_dot_quantized_kernel(
   if out_swizzle_elems != block_n:
     raise NotImplementedError(f"{out_swizzle_elems=} must equal {block_n=}")
 
-  def tiled_smem(*args):
-    try:
-      return mgpu_lib.tiled_swizzled_smem(*args)
-    except ValueError as e:
-      raise NotImplementedError from e
-
+  x_smem_shape = (num_stages, block_m, block_k)
+  w_smem_shape = (num_stages, _COMPUTE_WGS * block_n, block_k)
   scratch_shapes = dict(
-      x_smem=tiled_smem((num_stages, block_m, block_k), x.dtype, "x"),
-      w_smem=tiled_smem(
-          (num_stages, _COMPUTE_WGS * block_n, block_k), w.dtype, "w"
-      ),
+      x_smem=common.tiled_swizzled_smem(x_smem_shape, x.dtype, "x"),
+      w_smem=common.tiled_swizzled_smem(w_smem_shape, w.dtype, "w"),
       w_scales_smem=plgpu.SMEM(
           (num_stages, _COMPUTE_WGS * block_n), w_scales.dtype
       ),

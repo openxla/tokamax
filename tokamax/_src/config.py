@@ -113,3 +113,26 @@ ignore_autotuning_cache = _ConfigOption(
         " autotuning.",
     )
 )
+
+disable_multi_core_mode = _ConfigOption(
+    flags.DEFINE_bool(
+        "tokamax_disable_multi_core_mode",
+        False,
+        "Temporary flag to disable multi-core execution in GMM/TGMM v2 kernels"
+        " and fall back to the legacy pl.pallas_call path to unblock jax.vmap."
+        " TODO: Revert this flag once Tokamax updates its JAX"
+        " version.",
+    )
+)
+
+kda_chain_precision = _ConfigOption(
+    flags.DEFINE_enum(
+        "tokamax_kda_chain_precision",
+        "highest",
+        ("highest", "high", "default"),
+        "Matmul precision for the two matmuls on the serial recurrent chain of"
+        " the KDA Pallas Mosaic TPU forward kernel (`w @ h` and"
+        " `kg^T @ v_new`). Lower precision uses fewer MXU passes, but errors"
+        " compound across chunks, so validate accuracy on TPU.",
+    )
+)

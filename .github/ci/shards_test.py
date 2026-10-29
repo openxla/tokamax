@@ -25,11 +25,15 @@ Stdlib `unittest`, no third-party imports.
 
 from __future__ import annotations
 
+import ast
 import collections
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 import contextlib
 import io
 import os
+import re
+import shlex
+import subprocess
 import tempfile
 import textwrap
 from typing import NoReturn
@@ -39,12 +43,14 @@ from unittest import mock
 import deps
 import shards
 
-# Two private names, aliased once rather than reached for at each use: the
-# catch-all shard's key, and the glob helper the coverage checks are defined
-# in terms of.
+# Private names, aliased once rather than reached for at each use: the
+# catch-all shard's key, the glob helper the coverage checks are defined in
+# terms of, and the reader that takes the table out of a version of the file.
 # pylint: disable=protected-access
 CATCH_ALL = shards._CATCH_ALL_SHARD
+assigns_shards = shards._assigns_shards
 matches = shards._matches
+split_shards_table = shards._split_shards_table
 # pylint: enable=protected-access
 
 
@@ -492,9 +498,7 @@ class JaxVersionTest(unittest.TestCase):
           ('0.12.0', '0.11.10', '0.11.2', '0.11.0'),
       )
       self.assertEqual(shards.latest_jax(), '0.12.0')
-      self.assertEqual(
-          shards.older_jaxs(), ('0.11.10', '0.11.2', '0.11.0')
-      )
+      self.assertEqual(shards.older_jaxs(), ('0.11.10', '0.11.2', '0.11.0'))
       self.assertEqual(shards.oldest_jax(), '0.11.0')
 
   def test_bench_jax_pin_matches_latest_jax(self) -> None:
@@ -502,7 +506,9 @@ class JaxVersionTest(unittest.TestCase):
         os.path.dirname(__file__), '..', '..', 'pyproject.toml'
     )
     with open(pyproject_path, 'rb') as f:
-      bench_deps = shards.tomllib.load(f)['project']['optional-dependencies']['bench']
+      bench_deps = shards.tomllib.load(f)['project']['optional-dependencies'][
+          'bench'
+      ]
     self.assertIn(
         f'jax=={shards.latest_jax()}',
         bench_deps,
@@ -516,51 +522,142 @@ class JaxVersionTest(unittest.TestCase):
 
 class CompatMatrixTest(unittest.TestCase):
 
-  def matrix(self) -> list[shards.MatrixEntry]:
+  def resolved(self) -> shards.ShardMap:
     resolved, *_ = shards.resolve_shards()
-    return list(shards.build_matrix(resolved))
+    return resolved
 
-  def test_every_version_runs_every_shard(self) -> None:
-    shards_by_pin = collections.defaultdict(set)
-    runners_by_pin = collections.defaultdict(set)
-    for entry in self.matrix():
-      shards_by_pin[entry['jax_pin']].add(entry['shard_name'])
-      runners_by_pin[entry['jax_pin']].add(entry['runner'])
-    self.assertCountEqual(shards_by_pin, shards.JAX_VERSIONS)
-    for version in shards.older_jaxs():
-      self.assertEqual(
-          shards_by_pin[version], shards_by_pin[shards.latest_jax()]
-      )
-      self.assertCountEqual(runners_by_pin[version], shards.COMPAT_RUNNERS)
+  def test_primary_jobs_are_on_the_latest_jax_only(self) -> None:
+    pins = {e['jax_pin'] for e in shards.build_matrix(self.resolved())}
+    self.assertEqual(pins, {shards.latest_jax()})
+
+  def test_every_older_version_runs_every_bin_on_every_compat_runner(
+      self,
+  ) -> None:
+    resolved = self.resolved()
+    bins = shards.compat_bins(resolved)
+    jobs = shards.build_compat_matrix(resolved)
+    self.assertCountEqual(
+        [(j['runner'], j['jax_pin'], j['shard_name']) for j in jobs],
+        [
+            (runner, version, f'compat-{i}')
+            for runner in shards.COMPAT_RUNNERS
+            for version in shards.older_jaxs()
+            for i in range(1, len(bins) + 1)
+        ],
+    )
+
+  def test_every_shard_is_in_exactly_one_bin(self) -> None:
+    resolved = self.resolved()
+    binned = [n for names in shards.compat_bins(resolved) for n in names]
+    self.assertCountEqual(binned, list(resolved))
+
+  def test_a_bin_runs_all_of_its_shards_paths(self) -> None:
+    resolved = self.resolved()
+    for job in shards.build_compat_matrix(resolved):
+      expected = [
+          p for n in job['shards'].split() for p in resolved[n]['paths']
+      ]
+      self.assertEqual(shlex.split(job['test_paths']), expected)
 
   def test_job_names_are_unique(self) -> None:
-    jobs = [(e['runner_short'], e['shard_name']) for e in self.matrix()]
+    resolved = self.resolved()
+    jobs = [
+        (prefix, e['runner_short'], e['shard_name'])
+        for prefix, matrix in (
+            ('shard-tests', shards.build_matrix(resolved)),
+            ('compat-tests', shards.build_compat_matrix(resolved)),
+        )
+        for e in matrix
+    ]
     duplicates = [
         job for job, count in collections.Counter(jobs).items() if count > 1
     ]
     self.assertEqual(duplicates, [])
 
   def test_every_job_preserves_runner_device(self) -> None:
-    for entry in self.matrix():
+    resolved = self.resolved()
+    for entry in [
+        *shards.build_matrix(resolved),
+        *shards.build_compat_matrix(resolved),
+    ]:
       expected_device = shards.RUNNERS[entry['runner']][0]
       self.assertEqual(entry['device'], expected_device)
 
   def test_total_matrix_job_count(self) -> None:
-    resolved, *_ = shards.resolve_shards()
-    expected_per_shard = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
-        shards.COMPAT_RUNNERS
+    resolved = self.resolved()
+    self.assertEqual(
+        len(shards.build_matrix(resolved)), len(resolved) * len(shards.RUNNERS)
     )
-    self.assertEqual(len(self.matrix()), len(resolved) * expected_per_shard)
+    self.assertEqual(
+        len(shards.build_compat_matrix(resolved)),
+        len(shards.compat_bins(resolved))
+        * len(shards.older_jaxs())
+        * len(shards.COMPAT_RUNNERS),
+    )
 
   def test_matrix_with_only_filters_all_versions(self) -> None:
-    resolved, *_ = shards.resolve_shards()
+    resolved = self.resolved()
     only = {'core-api'}
     jobs = shards.build_matrix(resolved, only=only)
     self.assertTrue(all(j['shard_name'] == 'core-api' for j in jobs))
-    expected = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
-        shards.COMPAT_RUNNERS
+    self.assertEqual(len(jobs), len(shards.RUNNERS))
+    compat = shards.build_compat_matrix(resolved, only=only)
+    self.assertTrue(all(j['shards'] == 'core-api' for j in compat))
+    self.assertEqual(
+        len(compat), len(shards.older_jaxs()) * len(shards.COMPAT_RUNNERS)
     )
-    self.assertEqual(len(jobs), expected)
+
+
+class CompatBinTest(unittest.TestCase):
+  """Packing shards into compat bins, against a made-up table."""
+
+  def bins(self, **sizes: float | None) -> list[list[str]]:
+    table = {
+        name: (
+            dict(paths=(f'tokamax/{name}_test.py',))
+            | ({} if minutes is None else dict(minutes=minutes))
+        )
+        for name, minutes in sizes.items()
+    }
+    return shards.compat_bins(table)
+
+  def test_small_shards_share_a_bin(self) -> None:
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      self.assertEqual(self.bins(a=5, b=5, c=5), [['a', 'b', 'c']])
+
+  def test_no_bin_exceeds_the_budget_unless_one_shard_does(self) -> None:
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      bins = self.bins(big=45, a=12, b=9, c=8, d=7, e=3)
+    self.assertEqual(bins[0], ['big'])
+    sizes = dict(big=45, a=12, b=9, c=8, d=7, e=3)
+    for names in bins[1:]:
+      self.assertLessEqual(sum(sizes[n] for n in names), 20)
+
+  def test_an_unmeasured_shard_runs_alone(self) -> None:
+    # Absent is an unknown, not a zero: sharing a bin, it could be the job
+    # that sets the compat wall clock.
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      bins = self.bins(unknown=None, a=1, b=1)
+    self.assertIn(['unknown'], bins)
+
+  def test_compat_minutes_wins_over_minutes(self) -> None:
+    table = {
+        'slow': dict(
+            paths=('tokamax/slow_test.py',), minutes=40, compat_minutes=2
+        ),
+        'fast': dict(paths=('tokamax/fast_test.py',), minutes=3),
+    }
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      self.assertEqual(shards.compat_bins(table), [['fast', 'slow']])
+
+  def test_fullest_bin_comes_first(self) -> None:
+    with mock.patch.object(shards, 'COMPAT_BIN_MINUTES', 20):
+      bins = self.bins(a=4, b=18, c=19)
+    self.assertEqual(bins[0], ['c'])
+
+  def test_bad_compat_minutes_is_rejected(self) -> None:
+    errors = check({'s1': dict(paths=FILES, compat_minutes=0)})
+    self.assertIn('compat_minutes=0', ' '.join(errors))
 
 
 class JaxConsistencyTest(unittest.TestCase):
@@ -585,7 +682,8 @@ class JaxConsistencyTest(unittest.TestCase):
       self.assertTrue(
           any(
               'the JAX lower bound and the oldest JAX version the CI tests'
-              ' against have to be the same.' in e
+              ' against have to be the same.'
+              in e
               for e in errors
           )
       )
@@ -596,15 +694,14 @@ class JaxConsistencyTest(unittest.TestCase):
       self.assertTrue(
           any(
               'tokamax supports 2 latest JAX versions for backward'
-              ' compatibility.' in e
+              ' compatibility.'
+              in e
               for e in errors
           )
       )
 
   def test_duplicated_jax_version_is_caught(self) -> None:
-    with mock.patch.object(
-        shards, 'JAX_VERSIONS', ('0.11.0', '0.11.0')
-    ):
+    with mock.patch.object(shards, 'JAX_VERSIONS', ('0.11.0', '0.11.0')):
       errors = check({'s1': ('pkg/api_test.py',)}, files=('pkg/api_test.py',))
       self.assertTrue(any('Duplicated JAX version found' in e for e in errors))
 
@@ -652,8 +749,18 @@ class RealRepositoryTest(unittest.TestCase):
 
   def test_every_matrix_entry_has_paths(self) -> None:
     resolved, *_ = shards.resolve_shards()
-    for combo in shards.build_matrix(resolved):
+    for combo in [
+        *shards.build_matrix(resolved),
+        *shards.build_compat_matrix(resolved),
+    ]:
       self.assertTrue(combo['test_paths'], combo)
+
+  def test_whole_matrix_fits_githubs_job_limit(self) -> None:
+    # GitHub caps one job's matrix at 256 entries; a matrix past it fails to
+    # start rather than running a subset.
+    resolved, *_ = shards.resolve_shards()
+    self.assertLessEqual(len(shards.build_matrix(resolved)), 256)
+    self.assertLessEqual(len(shards.build_compat_matrix(resolved)), 256)
 
 
 class SelectionTest(unittest.TestCase):
@@ -705,10 +812,12 @@ class SelectionTest(unittest.TestCase):
     # An empty set is a real answer, not a failure: `None` means "run
     # everything" and these two must never be confused.
     resolved, *_ = shards.resolve_shards()
-    only, _ = shards.select(
-        resolved, shards.all_test_files(), self._changed('README.md')
-    )
-    self.assertEqual(only, set())
+    for path in ('README.md', 'docs/tokamax_ops.ipynb'):
+      with self.subTest(path=path):
+        only, _ = shards.select(
+            resolved, shards.all_test_files(), self._changed(path)
+        )
+        self.assertEqual(only, set())
 
   def test_a_test_file_selects_its_own_shard(self) -> None:
     files = shards.all_test_files()
@@ -813,16 +922,21 @@ class SelectionTest(unittest.TestCase):
     picked = sorted(resolved)[:2]
     combos = shards.build_matrix(resolved, only=picked)
     self.assertEqual({c['shard_name'] for c in combos}, set(picked))
-    # For the latest JAX version, it runs len(shards.RUNNERS) times.
-    num_runs_per_shards = len(shards.RUNNERS) + len(shards.older_jaxs()) * len(
-        shards.COMPAT_RUNNERS
-    )
-    self.assertEqual(len(combos), len(picked) * num_runs_per_shards)
+    self.assertEqual(len(combos), len(picked) * len(shards.RUNNERS))
+    # The compat check is narrowed by the same selection.
+    binned = {
+        name
+        for names in shards.compat_bins(resolved, only=picked)
+        for name in names
+    }
+    self.assertEqual(binned, set(picked))
 
   def test_matrix_with_no_shards_is_empty_not_everything(self) -> None:
     resolved, *_ = shards.resolve_shards()
     self.assertEqual(shards.build_matrix(resolved, only=set()), [])
     self.assertNotEqual(shards.build_matrix(resolved, only=None), [])
+    self.assertEqual(shards.build_compat_matrix(resolved, only=set()), [])
+    self.assertNotEqual(shards.build_compat_matrix(resolved, only=None), [])
 
   def test_reading_a_change_list_drops_the_trailing_empty(self) -> None:
     self.assertEqual(
@@ -928,6 +1042,646 @@ class ExplainTest(unittest.TestCase):
     )
 
 
+def _find_resplit(table: shards.ShardMap) -> tuple[str, str, str] | None:
+  """Finds `(src, node_id, dst)` for a file split by node ID across shards."""
+  split = collections.defaultdict(list)
+  for name, spec in sorted(table.items()):
+    if name == CATCH_ALL:
+      continue
+    for path in spec['paths']:
+      file, selector = shards.split_node_id(path)
+      if selector is not None:
+        split[file].append((name, path))
+  for entries in split.values():
+    names = sorted({n for n, _ in entries})
+    for src in names:
+      held = [p for n, p in entries if n == src]
+      dst = next((n for n in names if n != src), None)
+      if dst is not None and len(held) > 1 and len(table[src]['paths']) > 1:
+        return src, held[0], dst
+  return None
+
+
+class TableDiffTest(unittest.TestCase):
+  """Selection for an edit to `shards.py` itself.
+
+  Every case is an edit to the real file, resolved against the real tree,
+  because the thing under test is how real edits to this table read: the base
+  is the file as it is, the head is the file as someone might change it. git
+  is never run; the two versions are handed in or patched over the readers.
+
+  Table edits are made by shard name, on specs read back out of the file, and
+  the shards they touch are picked by what they hold rather than by name. So a
+  routine edit to `SHARDS` -- a retime, a new shard, a moved file -- does not
+  break these tests; only a table with no shard of the needed shape would, and
+  that fails `setUpClass` saying which shape is missing.
+  """
+
+  # A test file no shard names, so that resolving against a tree with it in
+  # leaves something in the catch-all.
+  UNCLAIMED = 'tokamax/_src/zz_unclaimed_test.py'
+
+  @classmethod
+  def setUpClass(cls) -> None:
+    super().setUpClass()
+    with open(shards.__file__, encoding='utf-8') as f:
+      cls.base = f.read()
+    cls.files = shards.all_test_files()
+    cls.resolved = shards.resolve_shards(cls.files)[0]
+    cls.table = split_shards_table(cls.base)[1]
+    # The tree without whatever the live catch-all holds, which is not always
+    # nothing. The catch-all cases pick its contents themselves, from this and
+    # `UNCLAIMED`, rather than inherit them from the repository.
+    caught = set(cls.resolved.get(CATCH_ALL, {}).get('paths', ()))
+    cls.claimed = [f for f in cls.files if f not in caught]
+
+    files = set(cls.files)
+    # Shards whose every path is a whole test file, the ones a file can be
+    # moved into or out of without touching a node ID split.
+    plain = sorted(
+        name
+        for name, spec in cls.table.items()
+        if name != CATCH_ALL
+        and all('::' not in p and p in files for p in spec['paths'])
+    )
+    sources = [n for n in plain if len(cls.table[n]['paths']) > 1]
+    if not sources or len(plain) < 3:
+      raise AssertionError('SHARDS needs three whole-file shards, one with 2+')
+    # Moves the last file of one shard into another: both are selected.
+    cls.move_from = sources[0]
+    cls.move_to = next(n for n in plain if n != cls.move_from)
+    cls.moved = cls.table[cls.move_from]['paths'][-1]
+    # A shard neither of those is, for the cases that drop or retime one.
+    cls.other = next(n for n in plain if n not in (cls.move_from, cls.move_to))
+    cls.resplit = _find_resplit(cls.table)
+
+  def entries(self, source: str) -> dict[str, tuple[int, int]]:
+    """Returns each shard's `[first, last)` line span in `source`."""
+    tree = ast.parse(source)
+    (statement,) = [node for node in tree.body if assigns_shards(node)]
+    assert isinstance(statement.value, ast.Dict)
+    return {
+        ast.literal_eval(key): (key.lineno - 1, value.end_lineno)
+        for key, value in zip(
+            statement.value.keys, statement.value.values, strict=True
+        )
+    }
+
+  def replace(
+      self, name: str, entry: str | None, source: str | None = None
+  ) -> str:
+    """Returns `source` with shard `name`'s entry replaced, or dropped."""
+    source = self.base if source is None else source
+    first, last = self.entries(source)[name]
+    lines = source.splitlines(keepends=True)
+    lines[first:last] = [] if entry is None else [f'    {entry},\n']
+    return ''.join(lines)
+
+  def respec(
+      self,
+      name: str,
+      source: str | None = None,
+      rename: str | None = None,
+      **changes: object,
+  ) -> str:
+    """Returns `source` with shard `name`'s spec updated by `changes`."""
+    source = self.base if source is None else source
+    spec = {**split_shards_table(source)[1][name], **changes}
+    keywords = ', '.join(f'{k}={v!r}' for k, v in spec.items())
+    return self.replace(name, f'{rename or name!r}: Spec({keywords})', source)
+
+  def move(self, source: str | None = None) -> str:
+    """Returns `source` with `moved` taken from `move_from` to `move_to`."""
+    source = self.base if source is None else source
+    table = split_shards_table(source)[1]
+    head = self.respec(
+        self.move_from,
+        source,
+        paths=tuple(
+            p for p in table[self.move_from]['paths'] if p != self.moved
+        ),
+    )
+    return self.respec(
+        self.move_to,
+        head,
+        paths=(*table[self.move_to]['paths'], self.moved),
+    )
+
+  def edit(self, *pairs: tuple[str, str], source: str | None = None) -> str:
+    """Returns the file with each `(old, new)` replaced, each exactly once."""
+    head = self.base if source is None else source
+    for old, new in pairs:
+      self.assertEqual(head.count(old), 1, old)
+      head = head.replace(old, new)
+    return head
+
+  def diff(
+      self,
+      head: str,
+      base: str | None = None,
+      files: Collection[str] | None = None,
+      class_reader: shards.Callable[[str], list[str]] = (
+          shards.declared_test_classes
+      ),
+  ) -> tuple[set[str] | None, str]:
+    """Runs `shards_from_table_diff` against `self.files` and `self.base`."""
+    return shards.shards_from_table_diff(
+        self.files if files is None else files,
+        self.base if base is None else base,
+        head,
+        class_reader=class_reader,
+    )
+
+  def _changed(self, *paths: str) -> str:
+    handle, name = tempfile.mkstemp()
+    with os.fdopen(handle, 'w') as f:
+      f.write(''.join(f'{p}\0' for p in paths))
+    self.addCleanup(os.unlink, name)
+    return name
+
+  @contextlib.contextmanager
+  def versions(self, head: str, base: str | None = None) -> Iterator[None]:
+    """Patches the readers `select` and `explain` go through."""
+    with (
+        mock.patch.object(
+            shards,
+            'read_base_shards',
+            autospec=True,
+            spec_set=True,
+            return_value=self.base if base is None else base,
+        ),
+        mock.patch.object(
+            shards,
+            'read_head_shards',
+            autospec=True,
+            spec_set=True,
+            return_value=head,
+        ),
+    ):
+      yield
+
+  def test_respec_round_trips(self) -> None:
+    # The helpers the rest lean on: rewriting a spec to itself, in the helper's
+    # own formatting, is not a change to the table.
+    head = self.respec(self.other)
+    self.assertNotEqual(head, self.base)
+    self.assertEqual(split_shards_table(head), split_shards_table(self.base))
+
+  def test_entries_accepts_an_unannotated_shards_assignment(self) -> None:
+    plain = self.edit(('SHARDS: ShardMap = {', 'SHARDS = {'))
+    self.assertEqual(
+        split_shards_table(plain)[1], split_shards_table(self.base)[1]
+    )
+    self.assertEqual(set(self.entries(plain)), set(self.table))
+
+  def test_find_resplit_skips_single_shard_node_ids(self) -> None:
+    # A file with 2+ node IDs in one shard and none in any other must not
+    # raise StopIteration.
+    only_one = {
+        'a': {'paths': ('pkg/t_test.py::A', 'pkg/t_test.py::B')},
+        CATCH_ALL: {'paths': None},
+    }
+    self.assertIsNone(_find_resplit(only_one))
+
+  def test_no_edit_selects_nothing(self) -> None:
+    names, reason = self.diff(self.base)
+    self.assertEqual(names, set())
+    self.assertIn('table-only change; 0 of', reason)
+
+  def test_a_minutes_only_edit_selects_nothing(self) -> None:
+    spec = self.table[self.other]
+    head = self.respec(
+        self.other,
+        minutes=spec.get('minutes', 1) + 1,
+        compat_minutes=spec.get('compat_minutes', 1) + 1,
+    )
+    self.assertEqual(self.diff(head)[0], set())
+
+  def test_a_renamed_shard_with_the_same_paths_selects_nothing(self) -> None:
+    head = self.respec(self.other, rename=f'{self.other}-renamed')
+    self.assertEqual(self.diff(head)[0], set())
+
+  def test_a_comment_or_formatting_edit_selects_nothing(self) -> None:
+    # Comments are not in the syntax tree, so even one inside a function is
+    # not a change to what the function does.
+    head = self.edit(
+        ('# Sibling module, same directory', '# Sibling module, same dir'),
+        (
+            "    if '__pycache__' in dirpath:\n",
+            "    if '__pycache__' in dirpath:  # bytecode\n",
+        ),
+    )
+    self.assertEqual(self.diff(head)[0], set())
+
+  def test_moving_a_file_selects_both_shards(self) -> None:
+    names, reason = self.diff(self.move())
+    # The shard it moved to gained a path, and the one it left lost one.
+    self.assertEqual(names, {self.move_from, self.move_to})
+    self.assertIn('table-only change; 2 of', reason)
+
+  def test_move_preserves_earlier_edits_in_source(self) -> None:
+    dropped = self.replace(self.other, None)
+    names, _ = self.diff(self.move(dropped), files=self.claimed)
+    self.assertEqual(names, {self.move_from, self.move_to, CATCH_ALL})
+
+  def test_a_new_shard_selects_it(self) -> None:
+    # 3f41997, replayed: the files were in the catch-all, and a new shard
+    # claims them. The catch-all is left empty and dropped from the head, so
+    # it is not selected.
+    names, _ = self.diff(
+        self.base, base=self.replace(self.other, None), files=self.claimed
+    )
+    self.assertEqual(names, {self.other})
+
+  def test_a_new_shard_selects_a_catch_all_it_leaves_nonempty(self) -> None:
+    # The same, with another file still in the catch-all: it is in the head,
+    # and it lost the new shard's files, so it is selected too.
+    files = [*self.claimed, self.UNCLAIMED]
+    names, _ = self.diff(
+        self.base, base=self.replace(self.other, None), files=files
+    )
+    self.assertEqual(names, {self.other, CATCH_ALL})
+
+  def test_an_unchanged_nonempty_catch_all_selects_nothing(self) -> None:
+    files = [*self.claimed, self.UNCLAIMED]
+    self.assertEqual(self.diff(self.base, files=files)[0], set())
+
+  def test_dropping_a_shard_selects_the_catch_all(self) -> None:
+    # Its files fall into the catch-all, which is the only head shard whose
+    # paths changed.
+    names, _ = self.diff(self.replace(self.other, None), files=self.claimed)
+    self.assertEqual(names, {CATCH_ALL})
+
+  def test_a_head_table_without_a_proper_catch_all_runs_everything(
+      self,
+  ) -> None:
+    edits = {
+        'missing': self.replace(CATCH_ALL, None),
+        'with paths': self.respec(CATCH_ALL, paths=(self.moved,)),
+    }
+    for what, head in edits.items():
+      with self.subTest(what=what):
+        names, reason = self.diff(head)
+        self.assertIsNone(names)
+        self.assertIn('could not resolve the SHARDS table', reason)
+        self.assertIn('paths=None', reason)
+
+  def test_a_class_resplit_selects_both_sides(self) -> None:
+    # Always exercise splitting a whole-file entry across two shards by
+    # `::Class`, plus the live table's node-ID split when one is present.
+    kept = tuple(
+        p for p in self.table[self.move_from]['paths'] if p != self.moved
+    )
+    head = self.respec(
+        self.move_from, paths=(*kept, f'{self.moved}::FirstTest')
+    )
+    head = self.respec(
+        self.move_to,
+        head,
+        paths=(*self.table[self.move_to]['paths'], f'{self.moved}::SecondTest'),
+    )
+    reader = lambda f: (
+        ['FirstTest', 'SecondTest']
+        if f == self.moved
+        else shards.declared_test_classes(f)
+    )
+    names, _ = self.diff(head, class_reader=reader)
+    self.assertEqual(names, {self.move_from, self.move_to})
+
+    if self.resplit is not None:
+      src, path, dst = self.resplit
+      head = self.respec(
+          src, paths=tuple(p for p in self.table[src]['paths'] if p != path)
+      )
+      head = self.respec(dst, head, paths=(*self.table[dst]['paths'], path))
+      names, _ = self.diff(head)
+      self.assertEqual(names, {src, dst})
+
+  def test_a_diff_over_max_diff_shards_runs_everything(self) -> None:
+    with mock.patch.object(shards, 'MAX_DIFF_SHARDS', 1):
+      names, reason = self.diff(self.move())
+    self.assertIsNone(names)
+    self.assertIn(
+        f'table diff touches 2 of {len(self.resolved)} shards, over the'
+        ' diff-aware bound',
+        reason,
+    )
+
+  def test_a_diff_over_max_diff_fraction_runs_everything(self) -> None:
+    # Two shards is over the fraction, and well under the count.
+    with mock.patch.object(
+        shards, 'MAX_DIFF_FRACTION', 1.5 / len(self.resolved)
+    ):
+      names, reason = self.diff(self.move())
+    self.assertIsNone(names)
+    self.assertIn('over the diff-aware bound', reason)
+
+  def test_the_bound_is_inclusive(self) -> None:
+    with (
+        mock.patch.object(shards, 'MAX_DIFF_SHARDS', 2),
+        mock.patch.object(shards, 'MAX_DIFF_FRACTION', 2 / len(self.resolved)),
+    ):
+      self.assertEqual(
+          self.diff(self.move())[0], {self.move_from, self.move_to}
+      )
+
+  def test_an_edit_outside_the_table_runs_everything(self) -> None:
+    minutes = shards.COMPAT_BIN_MINUTES
+    runner = next(iter(shards.RUNNERS.values()))
+    edits = {
+        'function': (
+            "    if '__pycache__' in dirpath:\n",
+            "    if '__pycache__' in dirpath or '.git' in dirpath:\n",
+        ),
+        'selection flag': (
+            "    '--ignore-glob=*/test_utils.py',\n",
+            "    '--ignore-glob=*/test_utils.py',\n    '-x',\n",
+        ),
+        'constant': (
+            f'COMPAT_BIN_MINUTES = {minutes}',
+            f'COMPAT_BIN_MINUTES = {minutes + 10}',
+        ),
+        'runner': (repr(runner), repr((runner[0], f'{runner[1]}-renamed'))),
+    }
+    for what, pair in edits.items():
+      with self.subTest(what=what):
+        names, reason = self.diff(self.edit(pair))
+        self.assertIsNone(names)
+        self.assertIn('changes outside the SHARDS table', reason)
+
+  def test_a_table_edit_with_a_function_edit_runs_everything(self) -> None:
+    head = self.edit(
+        ('return sorted_jax_versions()[0]', 'return sorted_jax_versions()[-1]'),
+        source=self.move(),
+    )
+    self.assertIsNone(self.diff(head)[0])
+
+  def test_read_base_shards_queries_the_merge_base(self) -> None:
+    def fake_run(
+        cmd: list[str], **_: object
+    ) -> subprocess.CompletedProcess[str]:
+      out = 'abc123\n' if cmd[1] == 'merge-base' else self.base
+      return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr='')
+
+    cases = (
+        ({'BASE_REF': 'release', 'GITHUB_BASE_REF': 'pr-base'}, 'release'),
+        ({'BASE_REF': '', 'GITHUB_BASE_REF': 'pr-base'}, 'pr-base'),
+        ({'BASE_REF': '', 'GITHUB_BASE_REF': ''}, 'main'),
+    )
+    for env, branch in cases:
+      with self.subTest(branch=branch):
+        with (
+            mock.patch.dict(os.environ, env, clear=False),
+            mock.patch.object(
+                shards.subprocess,
+                'run',
+                autospec=True,
+                spec_set=True,
+                side_effect=fake_run,
+            ) as run,
+        ):
+          self.assertEqual(shards.read_base_shards(), self.base)
+        self.assertEqual(
+            [c.args[0] for c in run.call_args_list],
+            [
+                ['git', 'merge-base', f'origin/{branch}', 'HEAD'],
+                ['git', 'show', f'abc123:{shards.SHARDS_PATH}'],
+            ],
+        )
+
+  def test_a_base_version_that_fails_to_load_runs_everything(self) -> None:
+    error = subprocess.CalledProcessError(128, ['git', 'show'])
+    with mock.patch.object(
+        shards,
+        'read_base_shards',
+        autospec=True,
+        spec_set=True,
+        side_effect=error,
+    ):
+      names, reason = shards.shards_from_table_diff(
+          self.files, head_source=self.base
+      )
+    self.assertIsNone(names)
+    self.assertIn('could not load the base version', reason)
+
+  def test_a_head_version_that_fails_to_load_runs_everything(self) -> None:
+    with mock.patch.object(
+        shards,
+        'read_head_shards',
+        autospec=True,
+        spec_set=True,
+        side_effect=OSError('unreadable'),
+    ):
+      names, reason = shards.shards_from_table_diff(
+          self.files, base_source=self.base
+      )
+    self.assertIsNone(names)
+    self.assertIn('could not load the head version', reason)
+
+  def test_a_missing_git_runs_everything(self) -> None:
+    with mock.patch.object(
+        shards.subprocess,
+        'run',
+        autospec=True,
+        spec_set=True,
+        side_effect=FileNotFoundError('git'),
+    ):
+      names, reason = shards.shards_from_table_diff(
+          self.files, head_source=self.base
+      )
+    self.assertIsNone(names)
+    self.assertIn('could not load the base version', reason)
+
+  def test_a_base_version_that_does_not_parse_runs_everything(self) -> None:
+    cases = {
+        'syntax error': ('SHARDS = {', 'could not read the SHARDS table'),
+        'missing SHARDS': ('X = 1\n', '0 assignments to SHARDS, expected 1'),
+        'not a dict display': (
+            'SHARDS = dict(a=1)\n',
+            'SHARDS is not a dict display',
+        ),
+        'dict unpacking': (
+            'SHARDS = {**OTHER}\n',
+            'SHARDS unpacks another mapping',
+        ),
+        'non-string key': (
+            "SHARDS = {1: Spec(paths=('a_test.py',))}\n",
+            'shard name is not a string',
+        ),
+        'unhashable key': (
+            "SHARDS = {['a']: Spec(paths=('a_test.py',))}\n",
+            'shard name is not a string',
+        ),
+        'repeated keyword': (
+            (
+                "SHARDS = {'a': Spec(paths=('a_test.py',), minutes=1,"
+                ' minutes=2)}\n'
+            ),
+            'a shard spec repeats a keyword',
+        ),
+        'unhashable spec literal': (
+            "SHARDS = {'a': Spec(paths=({['x']: 1},))}\n",
+            'not a literal shard spec',
+        ),
+        'missing paths': (
+            "SHARDS = {'a': Spec(minutes=1)}\n",
+            'shard spec has no paths',
+        ),
+        'non-tuple paths': (
+            "SHARDS = {'a': Spec(paths=['a_test.py'])}\n",
+            'shard paths is not a tuple of strings',
+        ),
+        'non-catch-all paths=None': (
+            "SHARDS = {'a': Spec(paths=None), 'catch-all': Spec(paths=None)}\n",
+            "shard 'a' must not have paths=None",
+        ),
+    }
+    for what, (base, expected) in cases.items():
+      with self.subTest(what=what):
+        names, reason = self.diff(self.base, base=base)
+        self.assertIsNone(names)
+        self.assertIn(expected, reason)
+
+  def test_a_shard_declared_twice_runs_everything(self) -> None:
+    # Python would keep the second silently, hiding the first from every check.
+    head = self.respec(self.other, rename=self.move_to)
+    names, reason = self.diff(head)
+    self.assertIsNone(names)
+    self.assertIn('declared twice', reason)
+
+  def test_a_spec_that_is_not_a_literal_runs_everything(self) -> None:
+    paths = self.table[self.other]['paths']
+    head = self.replace(
+        self.other, f'{self.other!r}: Spec(paths={paths!r}, minutes=max(1, 2))'
+    )
+    names, reason = self.diff(head)
+    self.assertIsNone(names)
+    self.assertIn('could not read the SHARDS table', reason)
+
+  def test_a_head_table_failing_check_consistency_runs_everything(
+      self,
+  ) -> None:
+    gone = 'tokamax/_src/gone_test.py'
+    head = self.respec(
+        self.other, paths=(*self.table[self.other]['paths'], gone)
+    )
+    names, reason = self.diff(head)
+    self.assertIsNone(names)
+    self.assertIn('head table fails check_consistency', reason)
+    self.assertIn(gone, reason)
+
+  def test_select_runs_only_the_table_diff(self) -> None:
+    with self.versions(self.move()):
+      only, reason = shards.select(
+          self.resolved, self.files, self._changed(shards.SHARDS_PATH)
+      )
+    self.assertEqual(only, {self.move_from, self.move_to})
+    self.assertIn('table-only change; 2 of', reason)
+
+  def test_select_after_a_minutes_only_edit_runs_nothing(self) -> None:
+    minutes = self.table[self.other].get('minutes', 1) + 1
+    with self.versions(self.respec(self.other, minutes=minutes)):
+      only, _ = shards.select(
+          self.resolved, self.files, self._changed(shards.SHARDS_PATH)
+      )
+    self.assertEqual(only, set())
+
+  def test_select_fails_open_with_the_reason(self) -> None:
+    error = subprocess.CalledProcessError(128, ['git', 'show'])
+    with mock.patch.object(
+        shards,
+        'read_base_shards',
+        autospec=True,
+        spec_set=True,
+        side_effect=error,
+    ):
+      only, reason = shards.select(
+          self.resolved, self.files, self._changed(shards.SHARDS_PATH)
+      )
+    self.assertIsNone(only)
+    self.assertEqual(
+        reason, 'every shard runs: shards.py: could not load the base version'
+    )
+
+  def test_select_fails_open_when_table_diff_names_an_unknown_shard(
+      self,
+  ) -> None:
+    without_move_to = {
+        k: v for k, v in self.resolved.items() if k != self.move_to
+    }
+    with self.versions(self.move()):
+      only, reason = shards.select(
+          without_move_to, self.files, self._changed(shards.SHARDS_PATH)
+      )
+    self.assertIsNone(only)
+    self.assertEqual(
+        reason,
+        'every shard runs: shards.py: table diff names unknown shard'
+        f' {self.move_to}',
+    )
+
+  def test_select_unions_the_table_diff_with_the_rest_of_the_change(
+      self,
+  ) -> None:
+    test = 'tokamax/tokamax_test.py'
+    reached, _ = shards.select(self.resolved, self.files, self._changed(test))
+    self.assertTrue(reached)
+    with self.versions(self.move()):
+      only, _ = shards.select(
+          self.resolved, self.files, self._changed(shards.SHARDS_PATH, test)
+      )
+    self.assertEqual(only, {self.move_from, self.move_to} | reached)
+
+  def test_any_other_path_outside_the_package_still_runs_everything(
+      self,
+  ) -> None:
+    for other in ('.github/ci/deps.py', 'pyproject.toml'):
+      with self.subTest(other=other):
+        with self.versions(self.move()):
+          only, reason = shards.select(
+              self.resolved,
+              self.files,
+              self._changed(shards.SHARDS_PATH, other),
+          )
+        self.assertIsNone(only)
+        self.assertIn(f'{other} is outside tokamax/', reason)
+
+  def test_explain_says_why(self) -> None:
+    with self.versions(self.move()):
+      body = '\n'.join(
+          shards.explain(
+              self.resolved, self.files, self._changed(shards.SHARDS_PATH)
+          )
+      )
+    self.assertIn(
+        f"shards.py: table-only change; 2 of {len(self.resolved)} shards'"
+        ' test paths changed',
+        body,
+    )
+    for name in (self.move_from, self.move_to):
+      self.assertRegex(
+          body,
+          rf'(?m)^  {re.escape(name)}\s+.*\n'
+          r'      table   test paths changed in \.github/ci/shards\.py$',
+      )
+    self.assertNotIn(f'  {self.other:32s} ', body)
+
+  def test_explain_fails_open_with_the_reason(self) -> None:
+    minutes = shards.COMPAT_BIN_MINUTES
+    with self.versions(
+        self.edit((
+            f'COMPAT_BIN_MINUTES = {minutes}',
+            f'COMPAT_BIN_MINUTES = {minutes + 10}',
+        ))
+    ):
+      body = shards.explain(
+          self.resolved, self.files, self._changed(shards.SHARDS_PATH)
+      )
+    self.assertEqual(
+        body, ['every shard runs: shards.py: changes outside the SHARDS table']
+    )
+
+
 class DryRunTest(unittest.TestCase):
   """`--dry-run`, which is how selection is landed without it deciding.
 
@@ -969,6 +1723,8 @@ class DryRunTest(unittest.TestCase):
     # half of this test would pass for the wrong reason.
     self.assertNotEqual(live['include'], full['include'])
     self.assertEqual(dry['include'], full['include'])
+    self.assertNotEqual(live['compat_include'], full['compat_include'])
+    self.assertEqual(dry['compat_include'], full['compat_include'])
     # The reason reaches the run summary through this line only.
     self.assertIn('DRY RUN', log.partition('\n')[0])
     self.assertIn('would select', log)
@@ -989,6 +1745,12 @@ class DryRunTest(unittest.TestCase):
     # A documentation-only change selects nothing, and `include` being `[]`
     # is what skips `shard-tests`. A dry run must not trip that path.
     self.assertNotEqual(dry['include'], '[]')
+    self.assertNotEqual(dry['compat_include'], '[]')
+
+  def test_documentation_selects_no_compat_bin_either(self) -> None:
+    live, _ = self._matrix('--changed-from', self._changed('README.md'))
+    self.assertEqual(live['include'], '[]')
+    self.assertEqual(live['compat_include'], '[]')
 
 
 if __name__ == '__main__':

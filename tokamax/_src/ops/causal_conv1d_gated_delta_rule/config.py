@@ -15,7 +15,7 @@
 
 import dataclasses
 import enum
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 from jax.experimental import pallas as pl
@@ -23,7 +23,12 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
 
-DEFAULT_VMEM_LIMIT_FACTOR: float = 0.80
+class AttentionMode(enum.StrEnum):
+  # Gated Delta Net: one scalar gate per value head.
+  GDN = enum.auto()
+  # Kimi Delta Attention: the gate is per-channel, so it carries
+  # `kq_head_dim` values per value head instead of one.
+  KDA = enum.auto()
 
 
 class GDNMode(enum.StrEnum):
@@ -51,14 +56,6 @@ class Dtypes:
   conv_state: jnp.dtype
 
 
-def get_vmem_limit_bytes(
-    vmem_limit_factor: float = DEFAULT_VMEM_LIMIT_FACTOR,
-) -> int:
-  """Returns the maximum allowable VMEM capacity budget in bytes."""
-  tpu_info = pltpu.get_tpu_info()
-  return int(vmem_limit_factor * tpu_info.vmem_capacity_bytes)
-
-
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class GDNConfig:
@@ -72,6 +69,10 @@ class GDNConfig:
   num_v_heads: int
   kq_head_dim: int
   v_head_dim: int
+  attention_mode: AttentionMode = AttentionMode.GDN
+  # KDA only, and must be negative. Selects the bounded gate form over the
+  # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
+  gate_lower_bound: float | None = None
   num_buffers: int = 2
   # Max tokens per speculative verify window (= num_speculative_tokens + 1),
   # which is also the number of state checkpoints kept per sequence. The
@@ -131,7 +132,19 @@ class GDNConfig:
 
   @property
   def is_kda(self) -> bool:
-    return getattr(self, "attention_mode", None) == "kda"
+    return self.attention_mode == AttentionMode.KDA
+
+  @property
+  def gate_dim(self) -> int:
+    """Width of the gate activation `a`, in elements per token."""
+    if self.is_kda:
+      return self.num_v_heads * self.kq_head_dim
+    return self.num_v_heads
+
+  @property
+  def aligned_gate_dim(self) -> int:
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    return pl.cdiv(self.gate_dim, num_lanes) * num_lanes
 
   @property
   def triangular_block_size(self) -> int:
@@ -156,9 +169,11 @@ class GDNConfig:
     # Windows of different sizes compile to different kernels; keep them
     # distinguishable in profiles.
     suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
+    if self.is_kda and self.gate_lower_bound is not None:
+      suffix += "_bounded"
     return (
-        f"fused_conv1d_gdn_{self.mode.value}_b{self.seq_tile_size}"
-        f"_c{self.chunk_size}{suffix}"
+        f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
+        f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
     )
 
   def get_metadata(self) -> dict[str, str | int | float]:
@@ -181,17 +196,22 @@ class GDNConfig:
   # state checkpoint per position in VMEM, so for large-head models the
   # default 0.80 budget is not enough; those get a higher limit and the
   # wrapper sizes the tile against the same factor.
-  DEFAULT_VMEM_FRACTION = 0.80
-  WINDOWED_VMEM_FRACTION = 0.9
+  DEFAULT_VMEM_FRACTION: ClassVar[float] = 0.80
+  WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
+  # Cap decode tiles at 16 sequences: larger tiles increase per-slot state DMA
+  # descriptors and register spills without reducing per-slot compute.
+  DECODE_TILE_SIZES: ClassVar[tuple[int, ...]] = (16, 8, 4, 2, 1)
+  MIXED_TILE_SIZES: ClassVar[tuple[int, ...]] = (128, 64, 32, 16, 8, 4, 2, 1)
 
-  def get_vmem_limit_bytes(self) -> int:
-    tpu_info = pltpu.get_tpu_info()
+  @classmethod
+  def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+    """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
     fraction = (
-        self.WINDOWED_VMEM_FRACTION
-        if self.window_size > 1
-        else self.DEFAULT_VMEM_FRACTION
+        cls.WINDOWED_VMEM_FRACTION
+        if window_size > 1
+        else cls.DEFAULT_VMEM_FRACTION
     )
-    return int(fraction * tpu_info.vmem_capacity_bytes)
+    return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
 
   def get_scratch_shape_dict(self) -> dict[str, Any]:
     conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)

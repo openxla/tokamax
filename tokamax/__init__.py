@@ -18,6 +18,7 @@
 from tokamax import autotuning as autotuning
 from tokamax import benchmarking as benchmarking
 from tokamax import config as config
+from tokamax import ops as ops
 from tokamax._src.autotuning.api import autotune as autotune
 from tokamax._src.autotuning.api import AutotuningResult as AutotuningResult
 from tokamax._src.batching import BatchedShapeDtype as BatchedShapeDtype
