@@ -1101,6 +1101,7 @@ def compute_forward_cumsum_g(g_raw):
 
 
 def _fused_dhu_wy_intra_cumsum_kernel(
+    step,
     # Inputs. All refs except the first are single VMEM blocks from
     # emit_pipeline; optional inputs absent from the pipeline arrive as None.
     chunk_seg_ids_smem_ref,  # [B, NT] i32  full array, SMEM scalar prefetch
@@ -1145,9 +1146,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     native_state_layout=False,
 ):
   """Fuse Dhu, WY, intra backward, and reverse cumsum for one chunk tile."""
-  head_group = pl.program_id(0)
-  batch_idx = pl.program_id(1)
-  rev_c = pl.program_id(2)
+  _, batch_idx, rev_c = step.index
   chunk_id = NT - 1 - rev_c
   _, seq_idx, _, is_first_chunk, is_last_chunk = _chunk_segment_metadata(
       chunk_seg_ids_smem_ref,
@@ -1702,16 +1701,17 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     out_hbm_refs = refs[num_in : num_in + num_out]
     scratch_vmem_refs = refs[num_in + num_out :]
 
-    def body(*block_vmem_refs):
+    def body(step, *block_vmem_refs):
       blocks = iter(block_vmem_refs[:num_in])
       kernel_inputs = [next(blocks) if p else None for p in present]
-      kernel(seg_ids_smem_ref, *kernel_inputs, *block_vmem_refs[num_in:])
+      kernel(step, seg_ids_smem_ref, *kernel_inputs, *block_vmem_refs[num_in:])
 
     pltpu.emit_pipeline(
         body,
         grid=(H // MB, B, NT),
         in_specs=[bind_seg_ids(s, seg_ids_smem_ref) for s in in_specs],
         out_specs=[bind_seg_ids(s, seg_ids_smem_ref) for s in out_specs],
+        _explicit_indices=True,
     )(*in_hbm_refs, *out_hbm_refs, scratches=tuple(scratch_vmem_refs))
 
   # Operands stay in HBM. Inside a single kernel invocation, emit_pipeline

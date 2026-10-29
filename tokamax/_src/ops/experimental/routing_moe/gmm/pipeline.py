@@ -30,6 +30,7 @@ from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 
 
 def inner_pipeline(
+    step: pltpu.PipelineStep,
     in_ref: memory_ref.PipelineInputs,
     out_ref: hijax.TransformedRef,
     *,
@@ -43,6 +44,7 @@ def inner_pipeline(
   """Orchestrates DMA and computation for a single pipeline step.
 
   Args:
+    step: Current pipeline step.
     in_ref: Current VMEM slot references for the pipelined inputs.
     out_ref: Current VMEM slot reference for the output activation.
     x_bref: BufferedRef for the input activation used for manual DMA scheduling.
@@ -54,7 +56,7 @@ def inner_pipeline(
     cfg: Static configuration for the routing GMM kernel.
   """
 
-  n_id, gm_id, k_id = pl.program_id(0), pl.program_id(1), pl.program_id(2)
+  n_id, gm_id, k_id = step.index
   num_xo_buffers = cfg.plan.num_xo_buffers
 
   def _at(gm_offset: int) -> memory_ref.GridIndices:
@@ -183,6 +185,7 @@ def outer_pipeline(
         in_specs=(allocs.in_specs,),
         out_specs=allocs.out_spec,
         grid=(cfg.num_n, num_gm, cfg.num_k),
+        _explicit_indices=True,
     )(in_hbm_ref, out_hbm_ref, allocations=final_allocs.all_tree)
 
     last_n = cfg.num_n - 1

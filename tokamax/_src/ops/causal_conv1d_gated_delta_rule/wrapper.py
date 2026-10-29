@@ -30,6 +30,7 @@ from tokamax._src.ops.causal_conv1d_gated_delta_rule import vmem_ldst
 
 
 def inner_kernel(
+    step: pltpu.PipelineStep,
     # Inputs.
     qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
     b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
@@ -57,6 +58,7 @@ def inner_kernel(
   invokes compute_conv1d and compute_gdn for actual compute.
 
   Args:
+    step: Current pipeline step.
     qkv_slot_ref: qkv VMEM ref that stores data loaded from HBM.
     b_slot_ref: b VMEM ref that stores data loaded from HBM.
     a_slot_ref: a VMEM ref that stores data loaded from HBM.
@@ -78,7 +80,7 @@ def inner_kernel(
   """
 
   if p_id is None:
-    p_id = pl.program_id(0)
+    p_id = step.index[0]
 
   # Prepare states.
   real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -273,6 +275,7 @@ def outer_kernel(
           conv_out_alloc.spec,
           recurrent_out_alloc.spec,
       ),
+      _explicit_indices=True,
   )
 
   @pl.with_scoped(

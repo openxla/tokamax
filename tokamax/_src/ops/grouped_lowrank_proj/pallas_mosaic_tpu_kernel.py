@@ -48,6 +48,7 @@ def _largest_divisor(x: int, cap: int) -> int:
 
 
 def _cos_sin_body(
+    unused_step: pltpu.PipelineStep,
     cos_sin_ref: jax.Ref,
     out_ref: jax.Ref,
     *,
@@ -102,6 +103,7 @@ def _cos_sin_kernel(
       grid=(num_tiles,),
       in_specs=[cos_sin_spec],
       out_specs=[out_spec],
+      _explicit_indices=True,
   )
   allocations = (
       cos_sin_alloc,

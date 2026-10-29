@@ -218,6 +218,7 @@ def _pre_bwd_core(
     embedding: int,
     config: common.MhcKernelConfig,
     block_tokens: int,
+    step: jax.Array,
     x_ref,
     phi_ref,
     gate_ab_ref,
@@ -240,7 +241,6 @@ def _pre_bwd_core(
     `w_res = softmax(Z[:, 2S:])`, `H_res = w_res @ P`
     `L_in[t, e] = sum_i h_pre[t, i] * X[t, i, e]`
   """
-  step = pl.program_id(1)
   pl.when(step == 0)(
       functools.partial(_zero_pre_bwd_accumulators, d_phi_ref, d_ab_ref)
   )
@@ -352,6 +352,7 @@ def _pre_bwd_fused_body(
     embedding: int,
     config: common.MhcKernelConfig,
     block_tokens: int,
+    step: pltpu.PipelineStep,
     x_ref,
     phi_ref,
     gate_ab_ref,
@@ -377,6 +378,7 @@ def _pre_bwd_fused_body(
           embedding,
           config,
           block_tokens,
+          step.index[1],
           x_ref,
           phi_ref,
           gate_ab_ref,
@@ -556,6 +558,7 @@ def _run_bwd_chunk_pipeline(
         in_specs=in_specs,
         out_specs=out_specs,
         dimension_semantics=(pltpu.PARALLEL, pltpu.ARBITRARY),
+        _explicit_indices=True,
     )
     with common.tpu_mesh_context():
       *token_outs, d_phi_chunks, d_ab_chunks = pl.pallas_call(
@@ -582,6 +585,7 @@ def _post_and_pre_bwd_fused_body(
     block_tokens: int,
     sub_tokens: int,
     num_subtiles: int,
+    step: pltpu.PipelineStep,
     x_next_ref,
     phi_ref,
     gate_ab_ref,
@@ -621,6 +625,7 @@ def _post_and_pre_bwd_fused_body(
       embedding,
       config,
       block_tokens,
+      step.index[1],
       x_next_ref,
       phi_ref,
       gate_ab_ref,
@@ -750,12 +755,12 @@ def post_bwd(
         (tokens, streams * streams), block_tokens
     )
     kernel_main = pltpu.emit_pipeline(
-        functools.partial(
-            _post_apply_bwd_2d_mxu_body,
+        lambda unused_step, *refs: _post_apply_bwd_2d_mxu_body(
             streams,
             embedding,
             sub_tokens,
             num_subtiles,
+            *refs,
         ),
         grid=(tokens // block_tokens,),
         in_specs=(
@@ -772,6 +777,7 @@ def post_bwd(
             spec_residual_2d,
         ),
         dimension_semantics=(pltpu.PARALLEL,),
+        _explicit_indices=True,
     )
     with common.tpu_mesh_context():
       d_x, d_layer_output, d_h_post, d_residual = pl.pallas_call(
