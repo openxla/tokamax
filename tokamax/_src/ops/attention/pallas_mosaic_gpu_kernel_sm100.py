@@ -772,7 +772,12 @@ def flash_attention_kernel(
                   lambda: s,
               )
               scale *= math.log2(math.e)
-              m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
+              if jax.__version_info__ >= (0, 12, 0):
+                max_ilp = (tile_q // 64) * (4 if bias_gmem is None else 2)
+                s_max = plgpu.max(s, axis=1, accumulator_ilp=max_ilp)
+              else:
+                s_max = s.max(axis=1)
+              m_i = jnp.maximum(m_i, s_max * scale)
               cannot_be_inf = mask_gmem is None and not has_k_range
               m_valid = cannot_be_inf | (m_i != -jnp.inf)
               alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
@@ -790,7 +795,14 @@ def flash_attention_kernel(
               m_scale = jnp.where(needs_rescale, m_i, m_scale)
               bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
               p = jnp.exp2(s * scale - bcast(jnp.where(m_valid, m_scale, 0.0)))
-              l_i = jnp.where(needs_rescale, l_i * alpha, l_i) + p.sum(axis=1)
+              l_i = jnp.where(needs_rescale, l_i * alpha, l_i)
+              if jax.__version_info__ >= (0, 12, 0):
+                sum_ilp = (tile_q // 64) * 4
+                if bias_gmem is None and block_kv > 64:
+                  sum_ilp *= 2
+                l_i += plgpu.sum(p, axis=1, accumulator_ilp=sum_ilp)
+              else:
+                l_i += p.sum(axis=1)
 
               with jax.named_scope("write qk_tmem"):
                 plgpu.async_store_tmem(p_tmem.at[si], p.astype(p_tmem.dtype))
