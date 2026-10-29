@@ -399,6 +399,48 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         atol=6e-2,
     )
 
+  @parameterized.product(fuse_up_and_down=[None, False])
+  def test_w4a8(self, fuse_up_and_down: bool | None):
+    # We pass bf16 activations to the kernel. The kernel sees that matmul_dtype
+    # != x.dtype and quantizes the activations to matmul_dtype (fp8)
+    # dynamically.
+    shape = test_shapes.MoEShape(
+        "dsv4_fp4",
+        num_experts=8,
+        top_k=2,
+        hidden_size=7168,
+        intermediate_size=2048,
+        w_dtype=jnp.dtype(jnp.float4_e2m1fn),
+        w_quant_block_size=512,
+    )
+    case = gmm_test_lib.GmmCase.make_case(
+        test_cases.Case("dsv4_fp4_256", shape, 256)
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
+        **routing.kernel_kwargs,
+    )
+    expected = test_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.scattered_rows],
+        expected,
+        rtol=1.5e-1,
+        atol=1.5e-1,
+    )
+
   def test_fuse_up_and_down_without_w2_raises(self):
     case = gmm_test_lib.GmmCase.make_case(test_cases.DECODE_16)
     with self.assertRaisesRegex(ValueError, "fuse_up_and_down"):
