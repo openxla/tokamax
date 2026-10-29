@@ -165,6 +165,13 @@ table.ops-table code {
       <td>Computes <a href="https://arxiv.org/abs/2405.04434">Multi-Head Latent Attention (MLA)</a> over compressed latent KV caches for DeepSeek-V2, DeepSeek-V3, and DeepSeek-R1 inference.</td>
     </tr>
     <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/gdn2"><code>gdn2</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Chunkwise parallel gated delta-rule linear attention with decoupled write gating, implementing <a href="https://arxiv.org/abs/2412.06464">Gated Delta Networks: Improving Mamba2 with Delta Rule</a>.</td>
+    </tr>
+    <tr>
       <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/nsa"><code>nsa</code></a> (experimental)</td>
       <td>TPU</td>
       <td align="center" style="text-align: center;">✅</td>
