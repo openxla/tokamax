@@ -19,8 +19,11 @@ import unittest
 from absl import logging
 from absl.testing import absltest
 import torch
-from tokamax.experimental.torch_tpu.ops.raven import raven_base_gsa
-from tokamax.experimental.torch_tpu.ops.raven import raven_gsa as raven_pallas
+from tokamax.experimental.torch_tpu.ops.raven import torch_base
+from tokamax.experimental.torch_tpu.ops.raven import torch_pallas_mosaic_tpu
+
+raven_base_gsa = torch_base.raven_gsa
+raven_pallas = torch_pallas_mosaic_tpu.raven_gsa
 
 
 class RavenPallasKernelTest(unittest.TestCase):
