@@ -23,7 +23,7 @@ from tokamax._src.ops.experimental.rwkv7 import base
 from tokamax._src.ops.experimental.rwkv7 import pallas_mosaic_tpu
 
 
-class PallasTpuRWKV7Test(absltest.TestCase):
+class PallasMosaicTpuRwkv7Test(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -57,7 +57,7 @@ class PallasTpuRWKV7Test(absltest.TestCase):
         )
     )
 
-    op_instance = pallas_mosaic_tpu.PallasTpuRWKV7()
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuRwkv7()
     (actual_out, actual_s), _ = op_instance._fwd(
         q,
         k,
@@ -121,7 +121,7 @@ class PallasTpuRWKV7Test(absltest.TestCase):
         k8, (batch_size, num_heads, key_dim, val_dim), dtype=jnp.float32
     )
 
-    op_instance = pallas_mosaic_tpu.PallasTpuRWKV7()
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuRwkv7()
     (actual_out, _), residuals = op_instance._fwd(
         q,
         k,
@@ -136,7 +136,7 @@ class PallasTpuRWKV7Test(absltest.TestCase):
         return_residuals=True,
     )
 
-    vjp_op = pallas_mosaic_tpu.PallasTpuRWKV7Vjp()
+    vjp_op = pallas_mosaic_tpu.PallasMosaicTpuRwkv7Vjp()
     actual_grads, _ = vjp_op._fwd(
         residuals,
         actual_out,
@@ -206,9 +206,9 @@ class PallasTpuRWKV7Test(absltest.TestCase):
 
   def test_invalid_chunk_size_raises(self):
     q = jnp.ones((1, 100, 2, 16), dtype=jnp.float32)
-    op_instance = pallas_mosaic_tpu.PallasTpuRWKV7()
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuRwkv7()
     with self.assertRaises(ValueError):
-      op_instance._fwd(q, q, q, q, q, q, chunk_size=64)
+      op_instance.bind(q, q, q, q, q, q, chunk_size=64)
     with self.assertRaises(ValueError):
       pallas_mosaic_tpu.Config(chunk_size=48)
     with self.assertRaises(NotImplementedError):

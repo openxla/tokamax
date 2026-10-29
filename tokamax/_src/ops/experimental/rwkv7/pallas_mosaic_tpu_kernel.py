@@ -279,10 +279,6 @@ def rwkv7_pallas_fwd(
   B, T, H, K = q.shape
   _, _, _, V = v.shape
   tt = chunk_size
-  if tt <= 0 or T % tt != 0:
-    raise ValueError(
-        f"seq_len ({T}) must be divisible by chunk_size ({tt})."
-    )
   if tt > 64:
     raise NotImplementedError(
         f"chunk_size must be <= 64 for TPU VMEM layout, got {tt}."

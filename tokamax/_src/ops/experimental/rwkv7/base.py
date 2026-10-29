@@ -36,10 +36,18 @@ from typing_extensions import override
 
 # pylint: disable=invalid-name
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 Output: TypeAlias = tuple[
     Float[Array, "B T H V"], Float[Array, "B H K V"] | None
 ]
-Residuals: TypeAlias = Any
+Residuals: TypeAlias = (
+    tuple[
+        Float[Array, "B H nt tt tt"],
+        Float[Array, "B H nt tt KV"],
+        Float[Array, "B H nt K V"],
+    ]
+    | None
+)
 
 _CHUNK_SIZE = 64
 
@@ -169,7 +177,7 @@ def rwkv7_reference(
     output_final_state: bool = False,
 ) -> tuple[Float[Array, "B T H V"], Float[Array, "B H K V"] | None]:
   """Reference implementation of RWKV-7 DPLR delta rule recurrence."""
-  (out, final_state), _ = RWKV7()._fwd(
+  return Rwkv7()(
       q,
       k,
       v,
@@ -181,17 +189,182 @@ def rwkv7_reference(
       initial_state=initial_state,
       output_final_state=output_final_state,
   )
-  return out, final_state
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class RWKV7[C](op.Op[Any, Output, Residuals, C, None]):
+class Rwkv7Vjp[C](op.Op[Any, dict[str, Any], None, C, None]):
+  """Reference VJP operator for RWKV-7."""
+
+  supports_symbolic_shapes = False
+
+  @override
+  def _fwd(
+      self,
+      residuals: Residuals,
+      out: Output | Float[Array, "B T H V"],
+      dout: Output | Float[Array, "B T H V"],
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      v: Float[Array, "B T H V"],
+      alpha: Float[Array, "B T H K"],
+      beta: Float[Array, "B T H K"],
+      gk: Float[Array, "B T H K"],
+      *,
+      chunk_size: int = _CHUNK_SIZE,
+      scale: float | None = None,
+      initial_state: Float[Array, "B H K V"] | None = None,
+      output_final_state: bool = False,
+      return_residuals: bool = False,
+      config: C | None = None,
+  ) -> tuple[dict[str, Any], None]:
+    del residuals, out, return_residuals, config
+    if isinstance(dout, tuple):
+      grad_out, grad_final_state = dout
+    else:
+      grad_out, grad_final_state = dout, None
+
+    base_op = Rwkv7(vjp=None)
+    if initial_state is not None:
+
+      def fwd_with_state(q_, k_, v_, alpha_, beta_, gk_, s0_):
+        (o, s_final), _ = base_op._fwd(
+            q_,
+            k_,
+            v_,
+            alpha_,
+            beta_,
+            gk_,
+            chunk_size=chunk_size,
+            scale=scale,
+            initial_state=s0_,
+            output_final_state=output_final_state,
+            return_residuals=False,
+        )
+        return o, s_final
+
+      (_, s_final_out), vjp_fn = jax.vjp(
+          fwd_with_state, q, k, v, alpha, beta, gk, initial_state
+      )
+      cotangent_s = (
+          grad_final_state
+          if (output_final_state and grad_final_state is not None)
+          else (jnp.zeros_like(s_final_out) if output_final_state else None)
+      )
+      dq, dk, dv, dalpha, dbeta, dgk, d_s0 = vjp_fn((grad_out, cotangent_s))
+      return {
+          "q": dq,
+          "k": dk,
+          "v": dv,
+          "alpha": dalpha,
+          "beta": dbeta,
+          "gk": dgk,
+          "initial_state": d_s0,
+      }, None
+
+    def fwd_no_state(q_, k_, v_, alpha_, beta_, gk_):
+      (o, s_final), _ = base_op._fwd(
+          q_,
+          k_,
+          v_,
+          alpha_,
+          beta_,
+          gk_,
+          chunk_size=chunk_size,
+          scale=scale,
+          initial_state=None,
+          output_final_state=output_final_state,
+          return_residuals=False,
+      )
+      return o, s_final
+
+    (_, s_final_out), vjp_fn = jax.vjp(fwd_no_state, q, k, v, alpha, beta, gk)
+    cotangent_s = (
+        grad_final_state
+        if (output_final_state and grad_final_state is not None)
+        else (jnp.zeros_like(s_final_out) if output_final_state else None)
+    )
+    dq, dk, dv, dalpha, dbeta, dgk = vjp_fn((grad_out, cotangent_s))
+    return {
+        "q": dq,
+        "k": dk,
+        "v": dv,
+        "alpha": dalpha,
+        "beta": dbeta,
+        "gk": dgk,
+    }, None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Rwkv7[C](op.Op[Any, Output, Residuals, C, None]):
   """Tokamax base operator for RWKV-7 (DPLR Delta Rule).
 
   Evaluates Diagonal Plus Low-Rank (DPLR) recurrent state transitions.
   """
 
   supports_symbolic_shapes = False
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(self, "vjp", Rwkv7Vjp())
+
+  @override
+  def bind(
+      self,
+      q: Float[Array | AbstractArray, "B T H K"],
+      k: Float[Array | AbstractArray, "B T H K"],
+      v: Float[Array | AbstractArray, "B T H V"],
+      alpha: Float[Array | AbstractArray, "B T H K"],
+      beta: Float[Array | AbstractArray, "B T H K"],
+      gk: Float[Array | AbstractArray, "B T H K"],
+      *,
+      chunk_size: int = _CHUNK_SIZE,
+      scale: float | None = None,
+      initial_state: Float[Array | AbstractArray, "B H K V"] | None = None,
+      output_final_state: bool = False,
+      return_residuals: bool = False,
+  ) -> op.BoundArguments:
+    if q.ndim != 4:
+      raise ValueError(f"`q` must be rank 4 [B, T, H, K], got shape {q.shape}.")
+    B, T, H, K = q.shape
+    for name, tensor in (
+        ("k", k),
+        ("alpha", alpha),
+        ("beta", beta),
+        ("gk", gk),
+    ):
+      if tensor.shape != (B, T, H, K):
+        raise ValueError(
+            f"`{name}` must have shape {(B, T, H, K)}, got {tensor.shape}."
+        )
+    if v.ndim != 4 or v.shape[:3] != (B, T, H):
+      raise ValueError(
+          f"`v` must have shape ({B}, {T}, {H}, V), got {v.shape}."
+      )
+    V = v.shape[3]
+    if initial_state is not None and initial_state.shape != (B, H, K, V):
+      raise ValueError(
+          f"`initial_state` must have shape {(B, H, K, V)}, got"
+          f" {initial_state.shape}."
+      )
+    if chunk_size <= 0 or T % chunk_size != 0:
+      raise ValueError(
+          f"seq_len ({T}) must be divisible by chunk_size ({chunk_size})."
+      )
+    if scale is None:
+      scale = float(K**-0.5)
+    return super().bind(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        gk,
+        chunk_size=chunk_size,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        return_residuals=return_residuals,
+    )
 
   @jaxtyping.jaxtyped
   @override
@@ -210,18 +383,14 @@ class RWKV7[C](op.Op[Any, Output, Residuals, C, None]):
       output_final_state: bool = False,
       return_residuals: bool = False,
       config: C | None = None,
-  ) -> tuple[Output, None]:
-    del return_residuals, config
+  ) -> tuple[Output, Residuals]:
+    del config
     B, T, H, K = q.shape
     _, _, _, V = v.shape
     tt = chunk_size
-    if tt <= 0 or T % tt != 0:
-      raise ValueError(
-          f"seq_len ({T}) must be divisible by chunk_size ({tt})."
-      )
     nt = T // tt
     if scale is None:
-      scale = K**-0.5
+      scale = float(K**-0.5)
 
     q_c = _chunkify(q, B, nt, tt) * scale
     k_c = _chunkify(k, B, nt, tt)
@@ -253,4 +422,11 @@ class RWKV7[C](op.Op[Any, Output, Residuals, C, None]):
     o = jnp.moveaxis(o_stacked, 0, 2)
     o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(B, T, H, V)
     final_state = s_final if output_final_state else None
+    if return_residuals:
+      residuals = (
+          jnp.zeros((B, H, nt, tt, tt), dtype=q.dtype),
+          jnp.zeros((B, H, nt, tt, K + V), dtype=jnp.float32),
+          jnp.zeros((B, H, nt, K, V), dtype=jnp.float32),
+      )
+      return (o, final_state), residuals
     return (o, final_state), None

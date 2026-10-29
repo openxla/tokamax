@@ -15,19 +15,71 @@
 
 """Unit tests for RWKV-7 PyTorch Pallas operator."""
 
+from typing import Any
 import unittest
 
 from absl import logging
 from absl.testing import absltest
+import jax
 import torch
+from torch._subclasses import fake_tensor
 import torch.nn.functional as F
+import torch_tpu  # pylint: disable=unused-import
+from tokamax.experimental.torch_tpu.ops import torch_op
+from tokamax.experimental.torch_tpu.ops import torch_test_utils
+from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.rwkv7 import torch_base
 from tokamax.experimental.torch_tpu.ops.rwkv7 import torch_pallas_mosaic_tpu
 
-rwkv7_pallas = torch_pallas_mosaic_tpu.rwkv7
+Config = torch_pallas_mosaic_tpu.Config
 
 
-class RWKV7PallasKernelTest(unittest.TestCase):
+def _register_cpu_kernel(op_obj: torch_op.TorchOp[Any]) -> None:
+  """Registers a CPU test kernel delegating to `op_obj.op_impl_call`."""
+  custom_op = op_obj._torch_tokamax_op  # pylint: disable=protected-access
+  assert custom_op is not None
+
+  def _cpu_kernel(*args: Any, **kwargs: Any) -> Any:
+    jax_args = jax.tree.map(
+        lambda x: (
+            torch_test_utils.torch_to_jax(x)
+            if isinstance(x, torch.Tensor)
+            else x
+        ),
+        args,
+    )
+    jax_kwargs = jax.tree.map(
+        lambda x: (
+            torch_test_utils.torch_to_jax(x)
+            if isinstance(x, torch.Tensor)
+            else x
+        ),
+        kwargs,
+    )
+    jax_out = op_obj.op_impl_call(*jax_args, **jax_kwargs)
+    return jax.tree.map(
+        lambda x: (
+            torch_test_utils.jax_to_torch(x, device="cpu")
+            if isinstance(x, jax.Array)
+            else x
+        ),
+        jax_out,
+    )
+
+  custom_op.register_kernel("cpu")(_cpu_kernel)
+
+
+for _op in (
+    torch_base.Rwkv7,
+    torch_base.Rwkv7.backward_op_torch,
+    torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7,
+    torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7.backward_op_torch,
+):
+  if _op is not None:
+    _register_cpu_kernel(_op)
+
+
+class PallasMosaicTpuRwkv7Test(unittest.TestCase):
   """Tests for RWKV-7 Pallas operator against base reference."""
 
   def _get_device(self) -> str:
@@ -101,8 +153,28 @@ class RWKV7PallasKernelTest(unittest.TestCase):
           torch.randn(batch_size, seq_len, num_heads, head_dim, device=device)
       )
 
-      actual = rwkv7_pallas(q, k, v, alpha, beta, gk, chunk_size=chunk_size)
-      expected = torch_base.rwkv7_delta_rule(
+      configs = torch_utils.get_configs(
+          torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7,
+          q,
+          k,
+          v,
+          alpha,
+          beta,
+          gk,
+          chunk_size=chunk_size,
+          from_autotuning_cache=False,
+      )
+      actual = torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7(
+          q,
+          k,
+          v,
+          alpha,
+          beta,
+          gk,
+          chunk_size=chunk_size,
+          configs=configs,
+      )
+      expected = torch_base.Rwkv7(
           q, k, v, alpha, beta, gk, chunk_size=chunk_size
       )
 
@@ -124,7 +196,9 @@ class RWKV7PallasKernelTest(unittest.TestCase):
     gk = torch.randn(2, 100, 4, 16, device=device)
 
     with self.assertRaises(ValueError):
-      rwkv7_pallas(q, k, v, alpha, beta, gk, chunk_size=64)
+      torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7(
+          q, k, v, alpha, beta, gk, chunk_size=64
+      )
 
   def test_backward_autograd_matches_reference(self):
     device = self._get_device()
@@ -162,7 +236,7 @@ class RWKV7PallasKernelTest(unittest.TestCase):
     beta_pal = beta0.clone().detach().requires_grad_(True)
     gk_pal = gk0.clone().detach().requires_grad_(True)
 
-    out_pal = rwkv7_pallas(
+    out_pal = torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7(
         q_pal, k_pal, v_pal, alpha_pal, beta_pal, gk_pal, chunk_size=chunk_size
     )
     (out_pal * do).sum().backward()
@@ -174,7 +248,7 @@ class RWKV7PallasKernelTest(unittest.TestCase):
     beta_ref = beta0.clone().detach().requires_grad_(True)
     gk_ref = gk0.clone().detach().requires_grad_(True)
 
-    out_ref = torch_base.rwkv7_delta_rule(
+    out_ref = torch_base.Rwkv7(
         q_ref, k_ref, v_ref, alpha_ref, beta_ref, gk_ref, chunk_size=chunk_size
     )
     (out_ref * do).sum().backward()
@@ -196,6 +270,31 @@ class RWKV7PallasKernelTest(unittest.TestCase):
           msg=f"Gradient mismatch for {name}",
       )
     logging.info("RWKV-7 backward autograd parity test passed.")
+
+  def test_fake_impl(self):
+    with fake_tensor.FakeTensorMode():
+      q = torch.empty((2, 128, 4, 16), dtype=torch.float32)
+      k = torch.empty((2, 128, 4, 16), dtype=torch.float32)
+      v = torch.empty((2, 128, 4, 16), dtype=torch.float32)
+      alpha = torch.empty((2, 128, 4, 16), dtype=torch.float32)
+      beta = torch.empty((2, 128, 4, 16), dtype=torch.float32)
+      gk = torch.empty((2, 128, 4, 16), dtype=torch.float32)
+      out = torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7(
+          q, k, v, alpha, beta, gk, chunk_size=64
+      )
+      self.assertEqual(out.shape, (2, 128, 4, 16))
+      self.assertEqual(out.dtype, torch.float32)
+
+  def test_deconstruct_and_reconstruct_config_roundtrip(self):
+    fwd_op = torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7
+    bwd_op = fwd_op.backward_op_torch
+    self.assertIsNotNone(bwd_op)
+    for op_instance in (fwd_op, bwd_op):
+      cfg = Config(chunk_size=64)
+      deconstructed = op_instance.deconstruct_config(cfg)
+      self.assertEqual(deconstructed, (64,))
+      reconstructed = op_instance.reconstruct_config(deconstructed)
+      self.assertEqual(reconstructed, cfg)
 
 
 if __name__ == "__main__":

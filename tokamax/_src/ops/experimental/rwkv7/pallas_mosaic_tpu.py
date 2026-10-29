@@ -27,6 +27,7 @@ import dataclasses
 from typing import Any, ClassVar
 
 import jax
+from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
@@ -37,7 +38,7 @@ from tokamax._src.ops.experimental.rwkv7 import pallas_mosaic_tpu_kernel
 from typing_extensions import override
 
 
-@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+@pydantic.dataclasses.dataclass(frozen=True, slots=True)
 class Config:
   """Autotuning and execution configuration for Pallas TPU RWKV-7."""
 
@@ -50,8 +51,8 @@ class Config:
       )
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class PallasTpuRWKV7Vjp(op.Op[Any, dict[str, Any], None, Config, None]):
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PallasMosaicTpuRwkv7Vjp(base.Rwkv7Vjp[Config]):
   """Analytical Pallas TPU VJP operator for RWKV-7."""
 
   config_cls: ClassVar[type[Config]] = Config
@@ -61,18 +62,18 @@ class PallasTpuRWKV7Vjp(op.Op[Any, dict[str, Any], None, Config, None]):
   def _fwd(
       self,
       residuals: base.Residuals,
-      out: Any,
-      dout: Any,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      alpha: jax.Array,
-      beta: jax.Array,
-      gk: jax.Array,
+      out: base.Output | Float[Array, "B T H V"],
+      dout: base.Output | Float[Array, "B T H V"],
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      v: Float[Array, "B T H V"],
+      alpha: Float[Array, "B T H K"],
+      beta: Float[Array, "B T H K"],
+      gk: Float[Array, "B T H K"],
       *,
       chunk_size: int = 64,
       scale: float | None = None,
-      initial_state: jax.Array | None = None,
+      initial_state: Float[Array, "B H K V"] | None = None,
       output_final_state: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
@@ -89,7 +90,9 @@ class PallasTpuRWKV7Vjp(op.Op[Any, dict[str, Any], None, Config, None]):
     a_ab_inv = None
     merged_out = None
     s_in = None
-    if isinstance(residuals, tuple) and len(residuals) == 9:
+    if isinstance(residuals, tuple) and len(residuals) == 3:
+      a_ab_inv, merged_out, s_in = residuals
+    elif isinstance(residuals, tuple) and len(residuals) == 9:
       q, k, v, alpha, beta, gk, a_ab_inv, merged_out, s_in = residuals
     elif isinstance(residuals, tuple) and len(residuals) == 7:
       q, k, v, alpha, beta, gk, s_in = residuals
@@ -131,21 +134,20 @@ class PallasTpuRWKV7Vjp(op.Op[Any, dict[str, Any], None, Config, None]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu"
-
-
-PallasTpuRwkv7Vjp = PallasTpuRWKV7Vjp
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PallasTpuRWKV7(base.RWKV7[Config]):
+class PallasMosaicTpuRwkv7(base.Rwkv7[Config]):
   """Tokamax operator wrapper for RWKV-7 Pallas TPU kernel."""
 
   config_cls: ClassVar[type[Config]] = Config
 
   def __post_init__(self):
     if self.vjp is None:
-      object.__setattr__(self, "vjp", PallasTpuRWKV7Vjp())
+      object.__setattr__(
+          self, "vjp", PallasMosaicTpuRwkv7Vjp(config=self.config)
+      )
 
   @jaxtyping.jaxtyped
   @override
@@ -188,17 +190,7 @@ class PallasTpuRWKV7(base.RWKV7[Config]):
           output_final_state=output_final_state,
           return_residuals=True,
       )
-      return (out, final_state), (
-          q,
-          k,
-          v,
-          alpha,
-          beta,
-          gk,
-          a_ab_inv,
-          merged_out,
-          s_in,
-      )
+      return (out, final_state), (a_ab_inv, merged_out, s_in)
 
     out, final_state = pallas_mosaic_tpu_kernel.rwkv7_pallas_fwd(
         q,
@@ -222,4 +214,4 @@ class PallasTpuRWKV7(base.RWKV7[Config]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu"
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5

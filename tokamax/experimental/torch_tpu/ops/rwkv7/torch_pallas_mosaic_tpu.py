@@ -28,104 +28,140 @@ from collections.abc import Sequence
 from typing import Any
 
 import jax
-import jax.numpy as jnp
-import numpy as np
-import torch
-from tokamax._src.ops.experimental.rwkv7 import pallas_mosaic_tpu as jax_pallas
-from tokamax._src.ops.experimental.rwkv7 import pallas_mosaic_tpu_bwd_kernel
+from tokamax._src.ops.experimental.rwkv7 import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops.rwkv7 import torch_base
+import torch
 from typing_extensions import override
 
-Config = jax_pallas.Config
+Config = jax_pallas_mosaic_tpu.Config
 
 
-def _torch_to_jax(t: torch.Tensor) -> jax.Array:
-  t_cpu = t.detach().cpu()
-  if t_cpu.dtype == torch.bfloat16:
-    return jnp.asarray(t_cpu.float().numpy()).astype(jnp.bfloat16)
-  return jnp.asarray(t_cpu.numpy())
-
-
-def _jax_to_torch(
-    arr: jax.Array, device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-  if arr.dtype == jnp.bfloat16:
-    np_arr = np.array(arr.astype(jnp.float32), copy=True)
-    return torch.from_numpy(np_arr).to(device=device, dtype=dtype)
-  return torch.from_numpy(np.array(arr, copy=True)).to(
-      device=device, dtype=dtype
-  )
-
-
-class _PallasTpuRWKV7Vjp(torch_base._TorchOpBase[Config]):  # pylint: disable=protected-access
-  """PyTorch VJP wrapper for Pallas TPU RWKV-7 operator."""
+class _PallasMosaicTpuRwkv7Vjp(
+    torch_base._Rwkv7Vjp[Config]  # pylint: disable=protected-access
+):
+  """PyTorch VJP wrapper for Pallas Mosaic TPU RWKV-7 operator."""
 
   def __init__(self) -> None:
     super().__init__()
-    self.op_impl_jax = jax_pallas.PallasTpuRWKV7Vjp()
-    self.jax_op_name = "torch_tpu_pallas_rwkv7_vjp"
+    self.op_impl_jax = jax_pallas_mosaic_tpu.PallasMosaicTpuRwkv7Vjp()
+    self.jax_op_name = "pallas_mosaic_tpu_rwkv7_vjp"
     self.is_vjp = True
+    self.fake_impl = self._fake_impl
 
-  def derive_backward_shapes(
-      self, abstract_argument_dict: dict[str, Any]
-  ) -> dict[str, Any]:
-    if not abstract_argument_dict:
-      empty = jax.ShapeDtypeStruct(shape=(), dtype=jnp.float32)
-      return {"residuals": (empty, empty, empty), "out": empty, "dout": empty}
-    q_meta = abstract_argument_dict["q"]
-    v_meta = abstract_argument_dict["v"]
-    b_sz, seq_len, h_sz, k_dim = q_meta.shape
-    _, _, _, v_dim = v_meta.shape
-    tt = abstract_argument_dict.get("chunk_size", 64)
-    nt = seq_len // tt
-    return {
-        "residuals": (
-            jax.ShapeDtypeStruct((b_sz, h_sz, nt, tt, tt), q_meta.dtype),
-            jax.ShapeDtypeStruct(
-                (b_sz, h_sz, nt, tt, k_dim + v_dim), jnp.float32
-            ),
-            jax.ShapeDtypeStruct((b_sz, h_sz, nt, k_dim, v_dim), jnp.float32),
-        ),
-        "out": (v_meta, None),
-        "dout": (v_meta, None),
-    }
+  @override
+  def __call__(
+      self,
+      a_ab_inv: torch.Tensor,
+      merged_out: torch.Tensor,
+      s_in: torch.Tensor,
+      out: torch.Tensor,
+      dout: torch.Tensor,
+      q: torch.Tensor,
+      k: torch.Tensor,
+      v: torch.Tensor,
+      alpha: torch.Tensor,
+      beta: torch.Tensor,
+      gk: torch.Tensor,
+      chunk_size: int = 64,
+      scale: float | None = None,
+      config: Config | tuple[int, ...] | list[int] | None = None,
+  ) -> tuple[
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+  ]:
+    assert self._torch_tokamax_op is not None, (
+        "Forward op not registered. This means that self.op_impl_jax is not set"
+        " in the constructor."
+    )
+    return self._torch_tokamax_op(
+        a_ab_inv,
+        merged_out,
+        s_in,
+        out,
+        dout,
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        gk,
+        chunk_size=chunk_size,
+        scale=scale,
+        return_residuals=False,
+        config=self.deconstruct_config(config),
+    )
 
   @override
   def op_impl_call(
       self,
+      a_ab_inv: jax.Array,
+      merged_out: jax.Array,
+      s_in: jax.Array,
+      out: jax.Array,
+      dout: jax.Array,
       q: jax.Array,
       k: jax.Array,
       v: jax.Array,
       alpha: jax.Array,
       beta: jax.Array,
       gk: jax.Array,
-      a_ab_inv: jax.Array,
-      merged_out: jax.Array,
-      s_in: jax.Array,
-      do: jax.Array,
       chunk_size: int = 64,
       scale: float | None = None,
+      return_residuals: bool = False,
+      config: tuple[int, ...] | None = None,
   ) -> tuple[
       jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
   ]:
-    assert self.op_impl_jax is not None, "Backward class not set."
-    dq, dk, dv, dalpha, dbeta, dgk, _ = (
-        pallas_mosaic_tpu_bwd_kernel.rwkv7_pallas_bwd(
-            q,
-            k,
-            v,
-            alpha,
-            beta,
-            gk,
-            do,
-            chunk_size=chunk_size,
-            scale=scale,
-            a_ab_inv=a_ab_inv,
-            merged_out=merged_out,
-            s_in=s_in,
-        )
+    assert self.op_impl_jax is not None, "Forward class not set."
+    assert config is not None, "Backward config not set."
+    kernel_config = self.reconstruct_config(config)
+    grads, _ = self.op_impl_jax._fwd(  # pylint: disable=protected-access
+        (a_ab_inv, merged_out, s_in),
+        (out, None),
+        (dout, None),
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        gk,
+        chunk_size=chunk_size,
+        scale=scale,
+        return_residuals=return_residuals,
+        config=kernel_config,
     )
-    return dq, dk, dv, dalpha, dbeta, dgk
+    return (
+        grads["q"],
+        grads["k"],
+        grads["v"],
+        grads["alpha"],
+        grads["beta"],
+        grads["gk"],
+    )
+
+
+# Singleton instance of Pallas Mosaic TPU RWKV-7 VJP.
+PallasMosaicTpuRwkv7Vjp = (  # pylint: disable=invalid-name
+    _PallasMosaicTpuRwkv7Vjp()
+)
+
+
+class _PallasMosaicTpuRwkv7(
+    torch_base._Rwkv7[Config]  # pylint: disable=protected-access
+):
+  """PyTorch wrapper for Pallas Mosaic TPU RWKV-7 operator."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.op_impl_jax = jax_pallas_mosaic_tpu.PallasMosaicTpuRwkv7()
+    self.backward_op_torch = PallasMosaicTpuRwkv7Vjp
+    self.jax_op_name = "pallas_mosaic_tpu_rwkv7"
+    self.is_vjp = False
+    self.fake_impl = self._fake_impl
 
   @override
   def __call__(
@@ -136,142 +172,17 @@ class _PallasTpuRWKV7Vjp(torch_base._TorchOpBase[Config]):  # pylint: disable=pr
       alpha: torch.Tensor,
       beta: torch.Tensor,
       gk: torch.Tensor,
-      a_ab_inv: torch.Tensor,
-      merged_out: torch.Tensor,
-      s_in: torch.Tensor,
-      do: torch.Tensor,
       chunk_size: int = 64,
       scale: float | None = None,
-  ) -> tuple[
-      torch.Tensor,
-      torch.Tensor,
-      torch.Tensor,
-      torch.Tensor,
-      torch.Tensor,
-      torch.Tensor,
-  ]:
-    if self._torch_tokamax_op is not None and q.device.type in ("tpu", "xla"):
-      return self._torch_tokamax_op(
-          q,
-          k,
-          v,
-          alpha,
-          beta,
-          gk,
-          a_ab_inv,
-          merged_out,
-          s_in,
-          do,
-          chunk_size=chunk_size,
-          scale=scale,
-      )
-    grads_jax = self.op_impl_call(
-        _torch_to_jax(q),
-        _torch_to_jax(k),
-        _torch_to_jax(v),
-        _torch_to_jax(alpha),
-        _torch_to_jax(beta),
-        _torch_to_jax(gk),
-        _torch_to_jax(a_ab_inv),
-        _torch_to_jax(merged_out),
-        _torch_to_jax(s_in),
-        _torch_to_jax(do),
-        chunk_size=chunk_size,
-        scale=scale,
-    )
-    return (
-        _jax_to_torch(grads_jax[0], q.device, q.dtype),
-        _jax_to_torch(grads_jax[1], k.device, k.dtype),
-        _jax_to_torch(grads_jax[2], v.device, v.dtype),
-        _jax_to_torch(grads_jax[3], alpha.device, alpha.dtype),
-        _jax_to_torch(grads_jax[4], beta.device, beta.dtype),
-        _jax_to_torch(grads_jax[5], gk.device, gk.dtype),
-    )
-
-
-class _CpuPallasAutogradFn(torch.autograd.Function):
-  """Routes CPU execution through `op_impl_call` and `backward_op_torch`."""
-
-  @staticmethod
-  def forward(
-      ctx: Any,
-      op_self: Any,
-      q: torch.Tensor,
-      k: torch.Tensor,
-      v: torch.Tensor,
-      alpha: torch.Tensor,
-      beta: torch.Tensor,
-      gk: torch.Tensor,
-      chunk_size: int,
-      scale: float | None,
+      configs: tuple[Config | None, Config | None] | None = None,
   ) -> torch.Tensor:
-    out_jax, a_ab_inv_jax, merged_out_jax, s_in_jax = op_self.op_impl_call(
-        _torch_to_jax(q),
-        _torch_to_jax(k),
-        _torch_to_jax(v),
-        _torch_to_jax(alpha),
-        _torch_to_jax(beta),
-        _torch_to_jax(gk),
-        chunk_size=chunk_size,
-        scale=scale,
+    fwd_config, bwd_config = (None, None) if configs is None else configs
+    assert self._torch_tokamax_op is not None, (
+        "Forward op not registered. This means that self.op_impl_jax is not set"
+        " in the constructor."
     )
-    out = _jax_to_torch(out_jax, q.device, q.dtype)
-    a_ab_inv_t = _jax_to_torch(a_ab_inv_jax, q.device, q.dtype)
-    merged_out_t = _jax_to_torch(merged_out_jax, q.device, torch.float32)
-    s_in_t = _jax_to_torch(s_in_jax, q.device, torch.float32)
-    ctx.save_for_backward(
-        q, k, v, alpha, beta, gk, a_ab_inv_t, merged_out_t, s_in_t
-    )
-    ctx.op_self = op_self
-    ctx.chunk_size = chunk_size
-    ctx.scale = scale
-    return out
-
-  @staticmethod
-  def backward(ctx: Any, do: torch.Tensor) -> tuple[Any, ...]:
-    q, k, v, alpha, beta, gk, a_ab_inv_t, merged_out_t, s_in_t = (
-        ctx.saved_tensors
-    )
-    dq, dk, dv, dalpha, dbeta, dgk = ctx.op_self.backward_op_torch(
-        q,
-        k,
-        v,
-        alpha,
-        beta,
-        gk,
-        a_ab_inv_t,
-        merged_out_t,
-        s_in_t,
-        do,
-        chunk_size=ctx.chunk_size,
-        scale=ctx.scale,
-    )
-    return None, dq, dk, dv, dalpha, dbeta, dgk, None, None
-
-
-class _PallasTpuRWKV7(torch_base._RWKV7[Config]):  # pylint: disable=protected-access
-  """PyTorch wrapper for Pallas TPU RWKV-7 operator."""
-
-  def __init__(self) -> None:
-    super().__init__()
-    self.op_impl_jax = jax_pallas.PallasTpuRWKV7()
-    self.backward_op_torch = _PallasTpuRWKV7Vjp()
-    self.jax_op_name = "torch_tpu_pallas_rwkv7"
-
-  @override
-  def op_impl_call(
-      self,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      alpha: jax.Array,
-      beta: jax.Array,
-      gk: jax.Array,
-      chunk_size: int = 64,
-      scale: float | None = None,
-  ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    assert self.op_impl_jax is not None, "Forward class not set."
-    (out, _), residuals = self.op_impl_jax._fwd(
+    assert self.backward_op_torch is not None, "Backward op not set."
+    out, _, _, _ = self._torch_tokamax_op(
         q,
         k,
         v,
@@ -281,74 +192,126 @@ class _PallasTpuRWKV7(torch_base._RWKV7[Config]):  # pylint: disable=protected-a
         chunk_size=chunk_size,
         scale=scale,
         return_residuals=True,
+        config=self.deconstruct_config(fwd_config),
+        bwd_config=self.backward_op_torch.deconstruct_config(bwd_config),
     )
-    _, _, _, _, _, _, a_ab_inv, merged_out, s_in = residuals
-    return out, a_ab_inv, merged_out, s_in
+    return out
 
   @override
-  def __call__(
+  def op_impl_call(
       self,
-      q: torch.Tensor,
-      k: torch.Tensor,
-      v: torch.Tensor,
-      alpha: torch.Tensor,
-      beta: torch.Tensor,
-      gk: torch.Tensor,
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      alpha: jax.Array,
+      beta: jax.Array,
+      gk: jax.Array,
       chunk_size: int = 64,
       scale: float | None = None,
-  ) -> torch.Tensor:
-    _, seq_len, _, _ = q.shape
-    if chunk_size <= 0 or seq_len % chunk_size != 0:
-      raise ValueError(
-          f"Sequence length ({seq_len}) must be divisible by chunk_size"
-          f" ({chunk_size})"
-      )
-
-    if self._torch_tokamax_op is not None and q.device.type in ("tpu", "xla"):
-      out, _a_ab_inv, _merged_out, _s_in = self._torch_tokamax_op(
-          q, k, v, alpha, beta, gk, chunk_size=chunk_size, scale=scale
-      )
-      return out
-    return _CpuPallasAutogradFn.apply(
-        self, q, k, v, alpha, beta, gk, chunk_size, scale
-    )
-
-  def setup_context(
-      self, ctx: Any, inputs: Sequence[Any], output: Any
-  ) -> None:
-    out, a_ab_inv, merged_out, s_in = output
-    del out
-    ctx.save_for_backward(*inputs[:6], a_ab_inv, merged_out, s_in)
-    ctx.chunk_size = inputs[6] if len(inputs) > 6 else 64
-    ctx.scale = inputs[7] if len(inputs) > 7 else None
-
-  def backward(
-      self,
-      ctx: Any,
-      do: torch.Tensor,
-      _d_a_ab_inv: Any = None,
-      _d_merged_out: Any = None,
-      _d_s_in: Any = None,
-  ) -> tuple[Any, ...]:
-    assert self.backward_op_torch is not None, "Backward op not set."
-    q, k, v, alpha, beta, gk, a_ab_inv, merged_out, s_in = ctx.saved_tensors
-    grads = self.backward_op_torch(
+      return_residuals: bool = True,
+      config: tuple[int, ...] | None = None,
+      bwd_config: tuple[int, ...] | None = None,
+  ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    del bwd_config
+    assert self.op_impl_jax is not None, "Forward class not set."
+    assert config is not None, "Forward config not set."
+    kernel_config = self.reconstruct_config(config)
+    self.op_impl_jax.bind(
         q,
         k,
         v,
         alpha,
         beta,
         gk,
+        chunk_size=chunk_size,
+        scale=scale,
+        return_residuals=return_residuals,
+    )
+    (out, _), (a_ab_inv, merged_out, s_in) = self.op_impl_jax._fwd(  # pylint: disable=protected-access
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        gk,
+        chunk_size=chunk_size,
+        scale=scale,
+        return_residuals=return_residuals,
+        config=kernel_config,
+    )
+    return out, a_ab_inv, merged_out, s_in
+
+  @override
+  def setup_context(
+      self,
+      ctx: Any,
+      inputs: Sequence[Any],
+      output: Any,
+  ) -> None:
+    """Callback for torch register_autograd."""
+    super().setup_context(ctx, inputs, output)
+
+  @override
+  def backward(
+      self,
+      ctx: Any,
+      dout: torch.Tensor,
+      d_a_ab_inv: torch.Tensor,
+      d_merged_out: torch.Tensor,
+      d_s_in: torch.Tensor,
+  ) -> tuple[
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      torch.Tensor,
+      None,
+      None,
+      None,
+      None,
+      None,
+  ]:
+    """Callback for torch register_autograd."""
+    del d_a_ab_inv, d_merged_out, d_s_in
+    assert self.backward_op_torch is not None, "Backward op not set."
+    (
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        gk,
+        out,
         a_ab_inv,
         merged_out,
         s_in,
-        do,
+    ) = ctx.saved_tensors
+    bwd_config = (
+        None
+        if ctx.bwd_config is None
+        else self.backward_op_torch.reconstruct_config(ctx.bwd_config)
+    )
+    dq, dk, dv, dalpha, dbeta, dgk = self.backward_op_torch(
+        a_ab_inv,
+        merged_out,
+        s_in,
+        out,
+        dout,
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        gk,
         chunk_size=ctx.chunk_size,
         scale=ctx.scale,
+        config=bwd_config,
     )
-    return (*grads, None, None)
+    return (dq, dk, dv, dalpha, dbeta, dgk, None, None, None, None, None)
 
 
-# Singleton instance
-rwkv7 = _PallasTpuRWKV7()
-object.__setattr__(rwkv7, "rwkv7_pallas_delta_rule", rwkv7)
+# Singleton instance of Pallas Mosaic TPU RWKV-7.
+PallasMosaicTpuRwkv7 = (  # pylint: disable=invalid-name
+    _PallasMosaicTpuRwkv7()
+)

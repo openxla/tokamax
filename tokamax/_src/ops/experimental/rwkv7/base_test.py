@@ -22,7 +22,7 @@ import numpy as np
 from tokamax._src.ops.experimental.rwkv7 import api, base
 
 
-class RWKV7BaseTest(absltest.TestCase):
+class Rwkv7BaseTest(absltest.TestCase):
 
   def test_base_and_api_match_reference(self):
     key = jax.random.PRNGKey(42)
@@ -51,8 +51,8 @@ class RWKV7BaseTest(absltest.TestCase):
         )
     )
 
-    op_instance = base.RWKV7()
-    (actual_out, actual_s), _ = op_instance._fwd(
+    op_instance = base.Rwkv7()
+    actual_out, actual_s = op_instance(
         q,
         k,
         v,
